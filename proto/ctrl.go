@@ -10,13 +10,43 @@ import (
 type CtrlCode uint8
 
 const (
-	CtrlHello         CtrlCode = 0x01
-	CtrlMigrateNotify CtrlCode = 0x02
-	CtrlPathQuality   CtrlCode = 0x03
-	CtrlHeartbeat     CtrlCode = 0x04
-	CtrlBye           CtrlCode = 0x05
-	CtrlBridgeTag     CtrlCode = 0x10
+	CtrlHello          CtrlCode = 0x01
+	CtrlMigrateNotify  CtrlCode = 0x02
+	CtrlPathQuality    CtrlCode = 0x03
+	CtrlHeartbeat      CtrlCode = 0x04
+	CtrlBye            CtrlCode = 0x05
+	CtrlPathProbe      CtrlCode = 0x06
+	CtrlPathProbeReply CtrlCode = 0x07
+	CtrlBridgeTag      CtrlCode = 0x10
 )
+
+// ProbePayload carries timestamps for per-path RTT measurement.
+// Probe frames are intentionally out-of-band of the SEQ reorder
+// buffer: the engine handles them directly in the per-path reader
+// and never delivers them to the application stream.
+type ProbePayload struct {
+	TS uint64 // sender's monotonic ns at issue time
+	ID uint64 // random probe id so the reply can be matched
+}
+
+const ProbePayloadSize = 16
+
+func (p ProbePayload) Encode() []byte {
+	b := make([]byte, ProbePayloadSize)
+	binary.BigEndian.PutUint64(b[0:8], p.TS)
+	binary.BigEndian.PutUint64(b[8:16], p.ID)
+	return b
+}
+
+func DecodeProbe(b []byte) (ProbePayload, error) {
+	var p ProbePayload
+	if len(b) < ProbePayloadSize {
+		return p, fmt.Errorf("proto: probe payload too short: %d < %d", len(b), ProbePayloadSize)
+	}
+	p.TS = binary.BigEndian.Uint64(b[0:8])
+	p.ID = binary.BigEndian.Uint64(b[8:16])
+	return p, nil
+}
 
 func (c CtrlCode) String() string {
 	switch c {
@@ -30,6 +60,10 @@ func (c CtrlCode) String() string {
 		return "HEARTBEAT"
 	case CtrlBye:
 		return "BYE"
+	case CtrlPathProbe:
+		return "PATH_PROBE"
+	case CtrlPathProbeReply:
+		return "PATH_PROBE_REPLY"
 	case CtrlBridgeTag:
 		return "BRIDGE_TAG"
 	default:

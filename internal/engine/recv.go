@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 )
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
@@ -75,7 +76,82 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		}
 		payload := append([]byte(nil), buf[proto.HeaderSize:n]...)
 
+		// Per-path probes are handled before the SEQ-aware reorder
+		// path so they never stall the application stream. Probe
+		// frames intentionally do not consume a SEQ slot - the peer
+		// can pick any value (we use 0) and we filter on type+code.
+		if hdr.Type == proto.FrameCtrl {
+			code := proto.CtrlCodeFromFlags(hdr.Flags)
+			if code == proto.CtrlPathProbe {
+				e.handlePathProbeRequest(slot, payload)
+				continue
+			}
+			if code == proto.CtrlPathProbeReply {
+				e.handlePathProbeReply(slot, payload)
+				continue
+			}
+		}
+
 		e.onFrameRecv(slot, hdr, payload)
+	}
+}
+
+// handlePathProbeRequest echoes the probe back on the same path so
+// the peer can compute its RTT. Best-effort; a failed write just
+// degrades quality measurement, it does not affect the application.
+func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
+	hdr := proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlPathProbeReply),
+		Seq:     0, // probes are out-of-band of the SEQ stream
+	}
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		return
+	}
+	copy(frame[proto.HeaderSize:], payload)
+	_, _ = slot.conn.Write(frame)
+}
+
+// handlePathProbeReply matches the reply against an outstanding
+// probe and, if found, updates the path's quality with the measured
+// RTT.
+func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
+	p, err := proto.DecodeProbe(payload)
+	if err != nil {
+		return
+	}
+	e.probeMu.Lock()
+	t0, ok := e.probeOutstanding[p.ID]
+	if ok {
+		delete(e.probeOutstanding, p.ID)
+	}
+	e.probeMu.Unlock()
+	if !ok {
+		return
+	}
+	rtt := nowFn().Sub(t0)
+	if setter, ok := slot.conn.(interface {
+		SetQuality(transport.PathQuality)
+		Quality() transport.PathQuality
+	}); ok {
+		prev := setter.Quality()
+		// Light jitter estimate: |new - prev| smoothed.
+		jit := prev.Jitter
+		if prev.RTT != 0 {
+			diff := rtt - prev.RTT
+			if diff < 0 {
+				diff = -diff
+			}
+			jit = (jit*3 + diff) / 4
+		}
+		setter.SetQuality(transport.PathQuality{
+			RTT:    rtt,
+			Jitter: jit,
+			LossPP: prev.LossPP,
+			At:     nowFn(),
+		})
 	}
 }
 

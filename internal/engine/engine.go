@@ -70,6 +70,13 @@ type Engine struct {
 	primeMu sync.Mutex
 	prime   *prime
 
+	// Per-path RTT probe state. Keys are probe_id, values are the
+	// monotonic time at issue. handlePathProbeReply consumes them.
+	probeMu               sync.Mutex
+	probeOutstanding      map[uint64]time.Time
+	probeNextID           uint64
+	probeIntervalOverride time.Duration // 0 = default 1s; tests can shorten
+
 	// Lifecycle.
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -101,14 +108,15 @@ func (s *pathSlot) closeQuit() {
 // server side it should be copied from the inbound HELLO.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
-		side:       side,
-		flowID:     flowID,
-		limits:     limits.Clamp(),
-		created:    time.Now(),
-		paths:      make(map[uint32]*pathSlot),
-		recvQueue:  make(map[uint64]recvItem),
-		zombieLeft: limits.Clamp().ZombieMaxMigrations,
-		closed:     make(chan struct{}),
+		side:             side,
+		flowID:           flowID,
+		limits:           limits.Clamp(),
+		created:          time.Now(),
+		paths:            make(map[uint32]*pathSlot),
+		recvQueue:        make(map[uint64]recvItem),
+		zombieLeft:       limits.Clamp().ZombieMaxMigrations,
+		probeOutstanding: make(map[uint64]time.Time),
+		closed:           make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))
@@ -183,7 +191,61 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 	}
 
 	go e.readerLoop(slot)
+	go e.proberLoop(slot)
 	return id, nil
+}
+
+// proberLoop sends a CtrlPathProbe on slot.conn every 1s and
+// records the issue time so handlePathProbeReply can compute RTT.
+//
+// Per CLAUDE.md hard rule #3 ("默认不安装主动迁移触发器"), the
+// prober only OBSERVES quality - it does not itself trigger
+// migration. Prime-mode scoring decides migration via the
+// independent scheduler in prime.go.
+func (e *Engine) proberLoop(slot *pathSlot) {
+	t := time.NewTicker(e.probeInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-slot.quit:
+			return
+		case <-e.closed:
+			return
+		case <-t.C:
+			e.probeMu.Lock()
+			e.probeNextID++
+			id := e.probeNextID
+			e.probeOutstanding[id] = nowFn()
+			e.probeMu.Unlock()
+
+			payload := proto.ProbePayload{
+				TS: uint64(nowFn().UnixNano()),
+				ID: id,
+			}.Encode()
+			hdr := proto.Header{
+				Version: proto.Version,
+				Type:    proto.FrameCtrl,
+				Flags:   proto.FlagsForCtrl(proto.CtrlPathProbe),
+				Seq:     0,
+			}
+			frame := make([]byte, proto.HeaderSize+len(payload))
+			_ = hdr.Encode(frame[:proto.HeaderSize])
+			copy(frame[proto.HeaderSize:], payload)
+			// Best-effort write; failure means the path is dying and
+			// OnDeath will fire from the read side soon enough.
+			_, _ = slot.conn.Write(frame)
+
+			// GC stale probes older than 30 s so the map cannot grow.
+			e.probeMu.Lock()
+			cutoff := nowFn().Add(-30 * time.Second)
+			for k, t := range e.probeOutstanding {
+				if t.Before(cutoff) {
+					delete(e.probeOutstanding, k)
+				}
+			}
+			e.probeMu.Unlock()
+		}
+	}
 }
 
 // ActivePath returns the currently-active path id, or 0 if none.
@@ -264,6 +326,20 @@ func (e *Engine) isClosed() bool {
 // IsClosed is the exported form of isClosed for the public Conn
 // wrapper, which uses it to gate the BYE on local Close.
 func (e *Engine) IsClosed() bool { return e.isClosed() }
+
+// probeInterval lets tests override the prober cadence. Default 1s.
+func (e *Engine) probeInterval() time.Duration {
+	if e.probeIntervalOverride > 0 {
+		return e.probeIntervalOverride
+	}
+	return 1 * time.Second
+}
+
+// SetProbeIntervalForTest is a backdoor for tests that want a
+// shorter prober cadence; not part of the API.
+func (e *Engine) SetProbeIntervalForTest(d time.Duration) {
+	e.probeIntervalOverride = d
+}
 
 // Close tears down the engine, closing all attached paths.
 func (e *Engine) Close() error {

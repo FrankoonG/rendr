@@ -898,6 +898,65 @@ func TestM1G2Sketch(t *testing.T) {
 	}
 }
 
+// TestM6PathRTTProbeRecords: after a fresh dial, the per-path
+// prober loop sends CtrlPathProbe every 1s; the peer echoes it
+// back; the engine writes the measured RTT into PathConn.Quality().
+// On loopback the RTT is single-digit microseconds.
+func TestM6PathRTTProbeRecords(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:          ModePrime,
+		Paths:         []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+		ProbeInterval: 100 * time.Millisecond,
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	var rtt time.Duration
+	for time.Now().Before(deadline) {
+		for _, p := range client.Paths() {
+			if p.Quality.RTT > 0 {
+				rtt = p.Quality.RTT
+				break
+			}
+		}
+		if rtt > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if rtt == 0 {
+		t.Fatal("no RTT recorded within deadline")
+	}
+	if rtt > 100*time.Millisecond {
+		t.Errorf("loopback RTT %s suspiciously high", rtt)
+	}
+	t.Logf("loopback RTT measured = %s", rtt)
+}
+
 // TestM6PrimeAutoMigrateOnQualityChange: with prime-mode quality
 // scheduler armed, when path 2 becomes substantially better than
 // the current path 1 (10x lower RTT), the engine must migrate to

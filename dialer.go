@@ -41,6 +41,10 @@ type Dialer struct {
 	// CLAUDE.md hard rule #4. Lower values are allowed; higher ones
 	// will be clamped to 90s.
 	MigrationBudget time.Duration
+
+	// ProbeInterval is how often each attached path issues a
+	// CtrlPathProbe to measure RTT. 0 = default 1s.
+	ProbeInterval time.Duration
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -71,6 +75,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		PrimeDwell:      d.Dwell,
 		PrimeCooldown:   d.Cooldown,
 	})
+	if d.ProbeInterval > 0 {
+		e.SetProbeIntervalForTest(d.ProbeInterval)
+	}
 
 	// Dial the first path and run HELLO.
 	first := d.Paths[0]
