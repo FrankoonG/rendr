@@ -256,6 +256,10 @@ func (e *Engine) isClosed() bool {
 	}
 }
 
+// IsClosed is the exported form of isClosed for the public Conn
+// wrapper, which uses it to gate the BYE on local Close.
+func (e *Engine) IsClosed() bool { return e.isClosed() }
+
 // Close tears down the engine, closing all attached paths.
 func (e *Engine) Close() error {
 	var firstErr error
@@ -292,9 +296,11 @@ func (e *Engine) CloseErr() error {
 func (e *Engine) Closed() <-chan struct{} { return e.closed }
 
 // ForceKillPathForTest is a backdoor for tests that need to simulate
-// a sudden network death on a specific attached path. It synthesises
-// a transport-error close on the path so the engine's normal
-// migration / budget machinery fires.
+// a sudden network death on a specific attached path. It closes the
+// socket AND synthesises an onPathDeath(TransportError) so the
+// engine's normal migration / budget machinery fires; without the
+// second step, local PathConn.Close would silently leave the engine
+// thinking the path is still attached.
 //
 // Not part of the API; gated by an obvious name to discourage misuse.
 func (e *Engine) ForceKillPathForTest(id uint32) error {
@@ -304,7 +310,9 @@ func (e *Engine) ForceKillPathForTest(id uint32) error {
 	if !ok {
 		return fmt.Errorf("engine: kill unknown path %d", id)
 	}
-	return slot.conn.Close()
+	err := slot.conn.Close()
+	e.onPathDeath(id, transport.CauseTransportError, err)
+	return err
 }
 
 func (e *Engine) setCloseErr(err error) {

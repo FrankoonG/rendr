@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -436,10 +437,13 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 		t.Fatalf("initial read: %v", err)
 	}
 
-	// Now violently break the server's only path: close its socket
-	// directly via the engine. This simulates G4 (sudden path
-	// death) on a connection that has nowhere to migrate.
-	server.Close()
+	// Now violently break the server's only path: ForceKill so the
+	// engine sees a TransportError (NOT a BYE - we are simulating
+	// G4 "path真死亡", not a clean teardown).
+	sc := server.(*engineBackedConn)
+	for _, p := range sc.Paths() {
+		_ = sc.Engine().ForceKillPathForTest(p.ID)
+	}
 
 	readErr := make(chan error, 1)
 	go func() {
@@ -546,6 +550,198 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 	if string(buf2) != reply {
 		t.Fatalf("post-failover payload: got %q want %q", buf2, reply)
 	}
+}
+
+// TestM1CleanCloseEOF: local Close on one end must surface as io.EOF
+// on the peer (not ErrMigrationBudgetExceeded or a transport-class
+// error). This is the BYE wiring contract.
+func TestM1CleanCloseEOF(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	defer server.Close()
+
+	greet := []byte("ping")
+	if _, err := client.Write(greet); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(greet))
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Local Close on the client. Peer (server) must observe io.EOF.
+	if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("client.Close: %v", err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		b := make([]byte, 16)
+		_, err := server.Read(b)
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("peer Read after Close: got %v want io.EOF", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer Read did not surface io.EOF within 3s")
+	}
+}
+
+// TestM1G1Sketch: 32 MiB stream + 3 forced migrations + SHA-256
+// integrity. Functionally minified G1: real G1 demands ≥1 GiB and
+// runs in the chaos harness (gitignored test/); this version fits
+// the unit-test budget while exercising the same invariants:
+//   - migration is transparent to the application Conn
+//   - byte stream is contiguous and order-preserving
+//   - hash matches end-to-end
+func TestM1G1Sketch(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("only %d paths attached on client", len(client.Paths()))
+	}
+
+	const total = 32 * 1024 * 1024
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i*17 + 3)
+	}
+	wantSum := sha256.Sum256(want)
+
+	var rxSum [32]byte
+	done := make(chan error, 1)
+	go func() {
+		h := sha256.New()
+		buf := make([]byte, 128*1024)
+		got := 0
+		for got < total {
+			n, err := server.Read(buf)
+			if err != nil {
+				done <- err
+				return
+			}
+			h.Write(buf[:n])
+			got += n
+		}
+		copy(rxSum[:], h.Sum(nil))
+		done <- nil
+	}()
+
+	bc := client.(*engineBackedConn)
+
+	// 3 migrations at ~30%, ~50%, ~70%.
+	migrateAt := []int{total * 3 / 10, total * 5 / 10, total * 7 / 10}
+	wstart := time.Now()
+	written := 0
+	mi := 0
+	chunk := 64 * 1024
+	for written < total {
+		end := written + chunk
+		if end > total {
+			end = total
+		}
+		n, err := client.Write(want[written:end])
+		if err != nil {
+			t.Fatalf("write at %d: %v", written, err)
+		}
+		written += n
+		// Time-bounded migration trigger.
+		for mi < len(migrateAt) && written >= migrateAt[mi] {
+			cur := bc.Engine().ActivePath()
+			var other uint32
+			for _, p := range bc.Paths() {
+				if p.ID != cur {
+					other = p.ID
+					break
+				}
+			}
+			if other != 0 {
+				if err := bc.Engine().Migrate(other); err != nil {
+					t.Fatalf("migrate %d: %v", mi, err)
+				}
+				t.Logf("migrate %d at %d bytes -> path %d", mi, written, other)
+			}
+			mi++
+		}
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("recv timed out")
+	}
+
+	if rxSum != wantSum {
+		t.Fatalf("sha256 mismatch:\ngot %x\nwant %x", rxSum, wantSum)
+	}
+	t.Logf("32 MiB + 3 migrations in %s, sha256 verified", time.Since(wstart))
 }
 
 // killServerPath reaches into the engine and slams a path closed,

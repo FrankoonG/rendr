@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"io"
 	"net"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -112,8 +113,8 @@ func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {
 		} else {
 			e.recvDeliver = append(e.recvDeliver, item.payload...)
 			wokeReader = true
+			e.markPayloadLocked()
 		}
-		e.markPayloadLocked()
 	}
 	if wokeReader || e.isClosed() {
 		e.recvCond.Broadcast()
@@ -129,13 +130,14 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 	code := proto.CtrlCodeFromFlags(flags)
 	switch code {
 	case proto.CtrlBye:
-		// Peer-initiated teardown.
+		// Peer-initiated teardown -> clean close. Record io.EOF as the
+		// close cause so the local application's Read picks up EOF.
 		if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
 			pc.MarkByeSeen()
 		}
 		// Schedule Close in a goroutine so we do not re-enter recvMu.
 		go func() {
-			e.setCloseErr(nil) // clean close -> io.EOF surfaced from Recv()
+			e.setCloseErr(io.EOF)
 			_ = e.Close()
 		}()
 

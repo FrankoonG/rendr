@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/proto"
 )
 
 // engineBackedConn is the concrete rendr.Conn returned by Dial and
@@ -15,7 +16,8 @@ type engineBackedConn struct {
 	e    *engine.Engine
 	conn *engine.Conn
 
-	mode atomic.Uint32 // Mode
+	mode    atomic.Uint32 // Mode
+	closing atomic.Bool   // local-Close in flight; gates BYE send
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -26,9 +28,20 @@ func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBac
 
 func (c *engineBackedConn) Read(p []byte) (int, error)  { return c.conn.Read(p) }
 func (c *engineBackedConn) Write(p []byte) (int, error) { return c.conn.Write(p) }
-func (c *engineBackedConn) Close() error                { return c.conn.Close() }
-func (c *engineBackedConn) LocalAddr() net.Addr         { return c.conn.LocalAddr() }
-func (c *engineBackedConn) RemoteAddr() net.Addr        { return c.conn.RemoteAddr() }
+
+// Close sends a CTRL_BYE on the active path so the peer surfaces a
+// clean io.EOF rather than tripping its migration machinery, then
+// tears the engine down. BYE failure is non-fatal: if the active
+// path is already dead the peer will see ordinary transport silence
+// up to its migration budget.
+func (c *engineBackedConn) Close() error {
+	if !c.closing.Swap(true) && !c.e.IsClosed() {
+		_ = c.e.SendBye(proto.ByeNormal)
+	}
+	return c.conn.Close()
+}
+func (c *engineBackedConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
+func (c *engineBackedConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
 func (c *engineBackedConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
 func (c *engineBackedConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
