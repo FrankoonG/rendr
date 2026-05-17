@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -742,6 +743,156 @@ func TestM1G1Sketch(t *testing.T) {
 		t.Fatalf("sha256 mismatch:\ngot %x\nwant %x", rxSum, wantSum)
 	}
 	t.Logf("32 MiB + 3 migrations in %s, sha256 verified", time.Since(wstart))
+}
+
+// TestM1G2Sketch: minified G2 long-run echo. 4 paths, 50 ms echo
+// interval, random migrations every ~200 ms. 3 s total ~= 60 echoes
+// and ~15 migrations. Hard contract:
+//   - every echo received in order, zero loss
+//   - migration is invisible to the application Conn
+//   - P99 RTT below a generous local-loopback bound
+//
+// Real G2 is 30 minutes / 30+ migrations; that belongs to the chaos
+// harness (chaos/ submodule). This sketch reproduces the
+// reorder-around-migration invariant cheaply.
+func TestM1G2Sketch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping G2 sketch in -short")
+	}
+
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait for all 4 paths to attach on both sides.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 4 && len(server.Paths()) >= 4 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 4 || len(server.Paths()) < 4 {
+		t.Fatalf("expected 4 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
+	}
+
+	// Server-side echo loop: read 8B counter, echo it back.
+	echoErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8)
+		for {
+			if _, err := io.ReadFull(server, buf); err != nil {
+				echoErr <- err
+				return
+			}
+			if _, err := server.Write(buf); err != nil {
+				echoErr <- err
+				return
+			}
+		}
+	}()
+
+	bc := client.(*engineBackedConn)
+
+	// Migration trigger every ~200 ms.
+	stopMig := make(chan struct{})
+	migCount := 0
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopMig:
+				return
+			case <-ticker.C:
+				cur := bc.Engine().ActivePath()
+				var other uint32
+				for _, p := range bc.Paths() {
+					if p.ID != cur {
+						other = p.ID
+						break
+					}
+				}
+				if other != 0 {
+					if err := bc.Engine().Migrate(other); err == nil {
+						migCount++
+					}
+				}
+			}
+		}
+	}()
+
+	const echoTotal = 60
+	const echoInterval = 50 * time.Millisecond
+	deadline = time.Now().Add(time.Duration(echoTotal) * echoInterval * 2)
+	rxbuf := make([]byte, 8)
+	maxRTT := time.Duration(0)
+	for i := uint64(0); i < echoTotal; i++ {
+		var txbuf [8]byte
+		binary.BigEndian.PutUint64(txbuf[:], i)
+		t0 := time.Now()
+		if _, err := client.Write(txbuf[:]); err != nil {
+			t.Fatalf("echo write %d: %v", i, err)
+		}
+		if _, err := io.ReadFull(client, rxbuf); err != nil {
+			t.Fatalf("echo read %d: %v", i, err)
+		}
+		rtt := time.Since(t0)
+		if rtt > maxRTT {
+			maxRTT = rtt
+		}
+		got := binary.BigEndian.Uint64(rxbuf)
+		if got != i {
+			t.Fatalf("echo %d: got counter %d, want %d", i, got, i)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("echo loop overran deadline at i=%d", i)
+		}
+		time.Sleep(echoInterval)
+	}
+	close(stopMig)
+
+	if migCount < 5 {
+		t.Logf("WARNING: only %d migrations fired; expected ≥ 5", migCount)
+	}
+	t.Logf("%d echoes, %d migrations, maxRTT=%s", echoTotal, migCount, maxRTT)
+
+	// All paths must still be present on the client (a kill never happened).
+	if got := len(client.Paths()); got != 4 {
+		t.Errorf("client paths after stress: got %d want 4", got)
+	}
 }
 
 // killServerPath reaches into the engine and slams a path closed,

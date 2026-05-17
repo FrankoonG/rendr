@@ -85,3 +85,11 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 // Engine returns the underlying engine for in-package tests and the
 // listener-side path attach logic. Not part of the public API.
 func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
+
+// Migrate switches the active path to id. Exposed to external admin
+// surfaces (chaos harness, runtime balancers) via the AdminConn
+// interface assertion.
+func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
+
+// ActivePath returns the currently-active path id.
+func (c *engineBackedConn) ActivePath() uint32 { return c.e.ActivePath() }

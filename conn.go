@@ -38,3 +38,17 @@ type PacketConn interface {
 	SetMode(Mode) error
 	FlowID() [16]byte
 }
+
+// AdminConn extends Conn with operations that are not part of the
+// normal application surface: explicit path migration and active-path
+// introspection. Tools that drive migration externally (chaos
+// harness, runtime balancers, debug UIs) assert to this interface.
+//
+// Application code should NOT depend on AdminConn; the engine
+// reserves the right to migrate on its own and an external migrate
+// can race with internal scheduling.
+type AdminConn interface {
+	Conn
+	Migrate(pathID uint32) error
+	ActivePath() uint32
+}
