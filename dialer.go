@@ -63,8 +63,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	if !mode.Valid() {
 		mode = ModePrime
 	}
-	if mode != ModePrime {
-		// M1 only implements prime.
+	// Bond is still M8-pending. Prime and race are wired through the
+	// engine dispatcher.
+	if mode == ModeBond {
 		return nil, ErrNotImplemented
 	}
 

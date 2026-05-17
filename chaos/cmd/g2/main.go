@@ -30,6 +30,7 @@ import (
 
 type report struct {
 	Transport       string        `json:"transport"`
+	Mode            string        `json:"mode"`
 	DurationSeconds float64       `json:"duration_seconds"`
 	Echoes          int           `json:"echoes"`
 	Migrations      int           `json:"migrations"`
@@ -48,6 +49,7 @@ func main() {
 		migrations    = flag.Int("migrations", 10, "approximate number of migrations to trigger")
 		paths         = flag.Int("paths", 4, "number of paths to attach")
 		transportArg  = flag.String("transport", "tcp", "transport for all paths: tcp | quic")
+		modeArg       = flag.String("mode", "prime", "operating mode: prime | race")
 		echoInterval  = flag.Duration("interval", 100*time.Millisecond, "echo cadence")
 		reportPath    = flag.String("report", "", "write JSON report to this path")
 		p99CeilingMs  = flag.Int("p99-ms-ceiling", 200, "fail if P99 RTT exceeds this (ms)")
@@ -60,17 +62,31 @@ func main() {
 		log.Fatalf("g2 needs paths >= 2 for migrations to be possible")
 	}
 
-	r, err := run(*duration, *migrations, *paths, *echoInterval, *transportArg)
+	mode := rendr.ModePrime
+	switch *modeArg {
+	case "prime":
+		mode = rendr.ModePrime
+	case "race":
+		mode = rendr.ModeRace
+		// race rarely fires manual migrations (every frame already
+		// fans out to every path), so do not require any.
+		*failOnNoMigs = false
+	default:
+		log.Fatalf("unknown mode %q (want prime|race)", *modeArg)
+	}
+
+	r, err := run(*duration, *migrations, *paths, *echoInterval, *transportArg, mode)
 	if err != nil {
 		log.Fatal(err)
 	}
+	r.Mode = *modeArg
 
 	r.Pass = r.Lost <= *lossTolerated &&
 		r.P99RTT.Milliseconds() <= int64(*p99CeilingMs) &&
 		(!*failOnNoMigs || r.Migrations > 0)
 
-	fmt.Printf("G2: transport=%s, duration=%s, echoes=%d, migrations=%d, P50=%s P99=%s max=%s, lost=%d, pass=%v\n",
-		*transportArg, *duration, r.Echoes, r.Migrations, r.P50RTT, r.P99RTT, r.MaxRTT, r.Lost, r.Pass)
+	fmt.Printf("G2: transport=%s, mode=%s, duration=%s, echoes=%d, migrations=%d, P50=%s P99=%s max=%s, lost=%d, pass=%v\n",
+		*transportArg, *modeArg, *duration, r.Echoes, r.Migrations, r.P50RTT, r.P99RTT, r.MaxRTT, r.Lost, r.Pass)
 
 	if *reportPath != "" {
 		if err := writeJSON(*reportPath, r); err != nil {
@@ -82,7 +98,7 @@ func main() {
 	}
 }
 
-func run(duration time.Duration, migrations, paths int, echoInterval time.Duration, transportName string) (*report, error) {
+func run(duration time.Duration, migrations, paths int, echoInterval time.Duration, transportName string, mode rendr.Mode) (*report, error) {
 	var ln rendr.Listener
 	var err error
 	switch transportName {
@@ -114,7 +130,7 @@ func run(duration time.Duration, migrations, paths int, echoInterval time.Durati
 	for i := range specs {
 		specs[i] = rendr.PathSpec{Transport: transportName, Address: ln.Addr().String()}
 	}
-	d := &rendr.Dialer{Mode: rendr.ModePrime, Paths: specs}
+	d := &rendr.Dialer{Mode: mode, Paths: specs}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		return nil, err
