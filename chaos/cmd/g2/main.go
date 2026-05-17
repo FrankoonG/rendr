@@ -29,6 +29,7 @@ import (
 )
 
 type report struct {
+	Transport       string        `json:"transport"`
 	DurationSeconds float64       `json:"duration_seconds"`
 	Echoes          int           `json:"echoes"`
 	Migrations      int           `json:"migrations"`
@@ -45,7 +46,8 @@ func main() {
 	var (
 		duration      = flag.Duration("duration", 30*time.Second, "echo run length")
 		migrations    = flag.Int("migrations", 10, "approximate number of migrations to trigger")
-		paths         = flag.Int("paths", 4, "number of TCP paths to attach")
+		paths         = flag.Int("paths", 4, "number of paths to attach")
+		transportArg  = flag.String("transport", "tcp", "transport for all paths: tcp | quic")
 		echoInterval  = flag.Duration("interval", 100*time.Millisecond, "echo cadence")
 		reportPath    = flag.String("report", "", "write JSON report to this path")
 		p99CeilingMs  = flag.Int("p99-ms-ceiling", 200, "fail if P99 RTT exceeds this (ms)")
@@ -58,7 +60,7 @@ func main() {
 		log.Fatalf("g2 needs paths >= 2 for migrations to be possible")
 	}
 
-	r, err := run(*duration, *migrations, *paths, *echoInterval)
+	r, err := run(*duration, *migrations, *paths, *echoInterval, *transportArg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,8 +69,8 @@ func main() {
 		r.P99RTT.Milliseconds() <= int64(*p99CeilingMs) &&
 		(!*failOnNoMigs || r.Migrations > 0)
 
-	fmt.Printf("G2: duration=%s, echoes=%d, migrations=%d, P50=%s P99=%s max=%s, lost=%d, pass=%v\n",
-		*duration, r.Echoes, r.Migrations, r.P50RTT, r.P99RTT, r.MaxRTT, r.Lost, r.Pass)
+	fmt.Printf("G2: transport=%s, duration=%s, echoes=%d, migrations=%d, P50=%s P99=%s max=%s, lost=%d, pass=%v\n",
+		*transportArg, *duration, r.Echoes, r.Migrations, r.P50RTT, r.P99RTT, r.MaxRTT, r.Lost, r.Pass)
 
 	if *reportPath != "" {
 		if err := writeJSON(*reportPath, r); err != nil {
@@ -80,8 +82,17 @@ func main() {
 	}
 }
 
-func run(duration time.Duration, migrations, paths int, echoInterval time.Duration) (*report, error) {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
+func run(duration time.Duration, migrations, paths int, echoInterval time.Duration, transportName string) (*report, error) {
+	var ln rendr.Listener
+	var err error
+	switch transportName {
+	case "tcp":
+		ln, err = rendr.ListenTCP("127.0.0.1:0")
+	case "quic":
+		ln, err = rendr.ListenQUIC("127.0.0.1:0", nil)
+	default:
+		return nil, fmt.Errorf("unknown transport %q", transportName)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +112,7 @@ func run(duration time.Duration, migrations, paths int, echoInterval time.Durati
 
 	specs := make([]rendr.PathSpec, paths)
 	for i := range specs {
-		specs[i] = rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}
+		specs[i] = rendr.PathSpec{Transport: transportName, Address: ln.Addr().String()}
 	}
 	d := &rendr.Dialer{Mode: rendr.ModePrime, Paths: specs}
 	client, err := d.Dial(context.Background())
@@ -212,6 +223,7 @@ func run(duration time.Duration, migrations, paths int, echoInterval time.Durati
 	}
 
 	r := &report{
+		Transport:       transportName,
 		DurationSeconds: duration.Seconds(),
 		Echoes:          len(rtts),
 		Migrations:      migCount,
