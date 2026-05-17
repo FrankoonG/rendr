@@ -54,7 +54,7 @@ type Engine struct {
 	// next SEQ the application should observe.
 	recvMu          sync.Mutex
 	recvCond        *sync.Cond
-	recvQueue       map[uint64][]byte
+	recvQueue       map[uint64]recvItem
 	expectedRecvSeq uint64
 	recvDeliver     []byte // pending bytes for the next Read
 
@@ -100,7 +100,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		limits:               limits.Clamp(),
 		created:              time.Now(),
 		paths:                make(map[uint32]*pathSlot),
-		recvQueue:            make(map[uint64][]byte),
+		recvQueue:            make(map[uint64]recvItem),
 		zombieMigrationsLeft: limits.Clamp().ZombieMaxMigrations,
 		lastPayloadAt:        time.Now(),
 		closed:               make(chan struct{}),
@@ -290,6 +290,22 @@ func (e *Engine) CloseErr() error {
 // Closed returns a channel that is closed when the engine has fully
 // shut down. Useful for downstream cleanup goroutines.
 func (e *Engine) Closed() <-chan struct{} { return e.closed }
+
+// ForceKillPathForTest is a backdoor for tests that need to simulate
+// a sudden network death on a specific attached path. It synthesises
+// a transport-error close on the path so the engine's normal
+// migration / budget machinery fires.
+//
+// Not part of the API; gated by an obvious name to discourage misuse.
+func (e *Engine) ForceKillPathForTest(id uint32) error {
+	e.pathsMu.RLock()
+	slot, ok := e.paths[id]
+	e.pathsMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("engine: kill unknown path %d", id)
+	}
+	return slot.conn.Close()
+}
 
 func (e *Engine) setCloseErr(err error) {
 	e.closeMu.Lock()

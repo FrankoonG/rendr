@@ -194,4 +194,3 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 func specFromAddr(addr string) PathSpec {
 	return PathSpec{Transport: "tcp", Address: addr}
 }
-

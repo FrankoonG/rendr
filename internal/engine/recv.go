@@ -1,12 +1,19 @@
 package engine
 
 import (
-	"io"
 	"net"
 
 	"github.com/FrankoonG/rendr/proto"
-	"github.com/FrankoonG/rendr/transport"
 )
+
+// recvItem is one frame waiting in the reorder buffer. Data frames
+// hold the payload bytes; ctrl frames hold the flags so the in-order
+// drainer can dispatch them after the SEQ space catches up.
+type recvItem struct {
+	isCtrl  bool
+	flags   uint16
+	payload []byte
+}
 
 // Recv reads up to len(buf) bytes from the engine into buf, blocking
 // until at least one byte is available or the engine is dead.
@@ -36,11 +43,7 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 	}
 }
 
-// readerLoop is one goroutine per attached PathConn. It pulls
-// length-prefixed framed units off the path (the transport adapter
-// gives us complete header+payload buffers via Read), decodes the
-// header, and dispatches data to the reorder buffer or hands a
-// control frame to the engine.
+// readerLoop is one goroutine per attached PathConn.
 func (e *Engine) readerLoop(slot *pathSlot) {
 	defer close(slot.doneR)
 
@@ -54,12 +57,9 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 
 		n, err := slot.conn.Read(buf)
 		if err != nil {
-			// Path adapter has already invoked OnDeath; just exit.
 			return
 		}
 		if n < proto.HeaderSize {
-			// Malformed; treat as path death (transport adapter
-			// already classified; OnDeath fires elsewhere).
 			return
 		}
 		hdr, err := proto.DecodeHeader(buf[:proto.HeaderSize])
@@ -67,108 +67,95 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 			return
 		}
 		if hdr.Version != proto.Version {
-			e.setCloseErr(errVersionMismatch)
+			e.setCloseErr(ErrPeerProtoVersion)
 			_ = e.Close()
 			return
 		}
 		payload := append([]byte(nil), buf[proto.HeaderSize:n]...)
 
-		switch hdr.Type {
-		case proto.FrameData:
-			e.deliverData(hdr.Seq, payload)
-		case proto.FrameCtrl:
-			e.handleCtrl(slot, hdr, payload)
-		}
+		e.onFrameRecv(slot, hdr, payload)
 	}
 }
 
-// deliverData places a data frame into the reorder buffer and
-// flushes any in-order suffix into recvDeliver.
-func (e *Engine) deliverData(seq uint64, payload []byte) {
+// onFrameRecv inserts a frame into the reorder buffer and drains
+// any in-order suffix.
+//
+// The SEQ namespace is shared between data and ctrl frames (see
+// docs/architecture.md "不变量 #2"); both consume one SEQ. The
+// drainer dispatches each in turn so the application stream remains
+// contiguous regardless of how ctrl frames are interleaved.
+func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
 
-	if seq < e.expectedRecvSeq {
-		// Duplicate from race/redistribute; drop.
+	if hdr.Seq < e.expectedRecvSeq {
+		// Duplicate (race / redistribute) or out-of-window.
 		return
 	}
-	if seq == e.expectedRecvSeq {
-		e.recvDeliver = append(e.recvDeliver, payload...)
-		e.expectedRecvSeq++
-		// Drain any cached contiguous suffix.
-		for {
-			p, ok := e.recvQueue[e.expectedRecvSeq]
-			if !ok {
-				break
-			}
-			delete(e.recvQueue, e.expectedRecvSeq)
-			e.recvDeliver = append(e.recvDeliver, p...)
-			e.expectedRecvSeq++
+
+	e.recvQueue[hdr.Seq] = recvItem{
+		isCtrl:  hdr.Type == proto.FrameCtrl,
+		flags:   hdr.Flags,
+		payload: payload,
+	}
+
+	wokeReader := false
+	for {
+		item, ok := e.recvQueue[e.expectedRecvSeq]
+		if !ok {
+			break
 		}
-		e.markPayload()
-		e.recvCond.Broadcast()
-		return
+		delete(e.recvQueue, e.expectedRecvSeq)
+		e.expectedRecvSeq++
+		if item.isCtrl {
+			e.applyCtrlLocked(slot, item.flags, item.payload)
+		} else {
+			e.recvDeliver = append(e.recvDeliver, item.payload...)
+			wokeReader = true
+		}
+		e.markPayloadLocked()
 	}
-	// Future SEQ: cache.
-	e.recvQueue[seq] = payload
+	if wokeReader || e.isClosed() {
+		e.recvCond.Broadcast()
+	}
 }
 
-// handleCtrl processes a control frame on the receiver side.
-func (e *Engine) handleCtrl(slot *pathSlot, hdr proto.Header, payload []byte) {
-	code := proto.CtrlCodeFromFlags(hdr.Flags)
+// applyCtrlLocked dispatches a control frame whose SEQ has reached
+// the head of the reorder window. Caller holds recvMu.
+//
+// To avoid deadlocks against Close (which itself broadcasts the recv
+// cond), heavyweight teardown work fires in a goroutine.
+func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
+	code := proto.CtrlCodeFromFlags(flags)
 	switch code {
 	case proto.CtrlBye:
-		// Peer-initiated teardown: mark the path so EOF maps to
-		// CleanClose, then surface EOF to the application.
+		// Peer-initiated teardown.
 		if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
 			pc.MarkByeSeen()
 		}
-		e.recvMu.Lock()
-		e.recvCond.Broadcast()
-		e.recvMu.Unlock()
-		e.setCloseErr(io.EOF)
-		_ = e.Close()
+		// Schedule Close in a goroutine so we do not re-enter recvMu.
+		go func() {
+			e.setCloseErr(nil) // clean close -> io.EOF surfaced from Recv()
+			_ = e.Close()
+		}()
 
-	case proto.CtrlMigrateNotify:
-		// Peer told us its new active path. M1 single-active-path
-		// engines just record the fact; the reorder buffer doesn't
-		// care which path delivered which SEQ.
-		_ = payload
-
-	case proto.CtrlHeartbeat,
+	case proto.CtrlMigrateNotify,
+		proto.CtrlHeartbeat,
 		proto.CtrlPathQuality,
 		proto.CtrlBridgeTag,
 		proto.CtrlHello:
-		// M1 ignores these on the read side; handshake / quality
-		// flows are wired up in subsequent commits.
+		// M1 ignores these on the read side; they consume a SEQ slot
+		// purely to keep the reorder window contiguous.
 		_ = payload
 	}
 }
 
-func (e *Engine) markPayload() {
+// markPayloadLocked refreshes the zombie counter when payload makes
+// it through. Caller holds recvMu (and we serialise zombie counter
+// access via zombieMu separately).
+func (e *Engine) markPayloadLocked() {
 	e.zombieMu.Lock()
-	// Reset zombie budget on successful payload arrival.
 	e.zombieMigrationsLeft = e.limits.ZombieMaxMigrations
 	e.lastPayloadAt = nowFn()
 	e.zombieMu.Unlock()
 }
-
-// errVersionMismatch is the internal close cause for a peer
-// announcing an incompatible proto.Version.
-var errVersionMismatch = &engineError{msg: "rendr: peer protocol version mismatch"}
-
-type engineError struct{ msg string }
-
-func (e *engineError) Error() string { return e.msg }
-
-// Wire it to the public sentinel: rendr.ErrPeerProtoVersion via
-// errors.Is when called from the outside.
-func (e *engineError) Is(target error) bool {
-	if target == nil {
-		return false
-	}
-	return target.Error() == "rendr: incompatible protocol version"
-}
-
-// Ensure unused-import elimination if transport ends up unused later.
-var _ transport.DeathCause = transport.CauseUnknown
