@@ -896,6 +896,132 @@ func TestM1G2Sketch(t *testing.T) {
 	}
 }
 
+// TestM2G1SketchQUIC: G1 invariants over QUIC paths.
+// 16 MiB stream (smaller than the TCP sketch because QUIC handshake
+// + crypto cost dominate small loopback runs; the invariant we are
+// testing is "byte-stream over migration", not raw throughput) + 3
+// forced migrations between two QUIC paths + SHA-256 verified.
+func TestM2G1SketchQUIC(t *testing.T) {
+	ln, err := ListenQUIC("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "quic", Address: ln.Addr().String()},
+			{Transport: "quic", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("client only has %d paths", len(client.Paths()))
+	}
+
+	const total = 16 * 1024 * 1024
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i*17 + 3)
+	}
+	wantSum := sha256.Sum256(want)
+
+	var rxSum [32]byte
+	done := make(chan error, 1)
+	go func() {
+		h := sha256.New()
+		buf := make([]byte, 128*1024)
+		got := 0
+		for got < total {
+			n, err := server.Read(buf)
+			if err != nil {
+				done <- err
+				return
+			}
+			h.Write(buf[:n])
+			got += n
+		}
+		copy(rxSum[:], h.Sum(nil))
+		done <- nil
+	}()
+
+	bc := client.(*engineBackedConn)
+	migrateAt := []int{total * 3 / 10, total * 5 / 10, total * 7 / 10}
+	t0 := time.Now()
+	written := 0
+	mi := 0
+	chunk := 64 * 1024
+	for written < total {
+		end := written + chunk
+		if end > total {
+			end = total
+		}
+		n, err := client.Write(want[written:end])
+		if err != nil {
+			t.Fatalf("write at %d: %v", written, err)
+		}
+		written += n
+		for mi < len(migrateAt) && written >= migrateAt[mi] {
+			cur := bc.Engine().ActivePath()
+			var other uint32
+			for _, p := range bc.Paths() {
+				if p.ID != cur {
+					other = p.ID
+					break
+				}
+			}
+			if other != 0 {
+				if err := bc.Engine().Migrate(other); err != nil {
+					t.Fatalf("migrate %d: %v", mi, err)
+				}
+				t.Logf("quic-migrate %d at %d bytes -> path %d", mi, written, other)
+			}
+			mi++
+		}
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("recv timed out")
+	}
+
+	if rxSum != wantSum {
+		t.Fatalf("sha256 mismatch:\n got=%x\nwant=%x", rxSum, wantSum)
+	}
+	t.Logf("16 MiB over QUIC + 3 migrations in %s, sha256 verified", time.Since(t0))
+}
+
 // TestM2QUICRoundTrip: Dialer over QUIC path + ListenQUIC accept;
 // public rendr.Conn round-trips bytes through one QUIC connection
 // per path. Matches the M1 TCP smoke test but over the QUIC adapter.

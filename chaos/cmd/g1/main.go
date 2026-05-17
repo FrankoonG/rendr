@@ -28,6 +28,7 @@ import (
 )
 
 type report struct {
+	Transport      string        `json:"transport"`
 	Size           int64         `json:"size"`
 	Migrations     int           `json:"migrations"`
 	Paths          int           `json:"paths"`
@@ -44,7 +45,8 @@ func main() {
 	var (
 		sizeArg      = flag.String("size", "1GiB", "transfer size, e.g. 256MiB, 1GiB, 4GiB")
 		migrations   = flag.Int("migrations", 3, "number of planned migrations")
-		paths        = flag.Int("paths", 2, "number of TCP paths to attach")
+		paths        = flag.Int("paths", 2, "number of paths to attach")
+		transportArg = flag.String("transport", "tcp", "transport for all paths: tcp | quic")
 		reportPath   = flag.String("report", "", "write JSON report to this path (optional)")
 		baselineSecs = flag.Float64("baseline-seconds", 0, "if >0, fail when elapsed > baseline*1.1")
 	)
@@ -64,7 +66,7 @@ func main() {
 		log.Fatalf("migrations require paths >= 2")
 	}
 
-	r, err := run(size, *migrations, *paths)
+	r, err := run(size, *migrations, *paths, *transportArg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,8 +77,8 @@ func main() {
 		}
 	}
 
-	fmt.Printf("G1: size=%s, paths=%d, migrations=%d, elapsed=%.2fs (%.1f MB/s), sha256_ok=%v, pass=%v\n",
-		*sizeArg, *paths, *migrations, r.ElapsedSeconds, r.ThroughputMBs,
+	fmt.Printf("G1: transport=%s, size=%s, paths=%d, migrations=%d, elapsed=%.2fs (%.1f MB/s), sha256_ok=%v, pass=%v\n",
+		*transportArg, *sizeArg, *paths, *migrations, r.ElapsedSeconds, r.ThroughputMBs,
 		r.SHA256Sent == r.SHA256Recv, r.Pass)
 
 	if *reportPath != "" {
@@ -89,8 +91,17 @@ func main() {
 	}
 }
 
-func run(size int64, migrations, paths int) (*report, error) {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
+func run(size int64, migrations, paths int, transportName string) (*report, error) {
+	var ln rendr.Listener
+	var err error
+	switch transportName {
+	case "tcp":
+		ln, err = rendr.ListenTCP("127.0.0.1:0")
+	case "quic":
+		ln, err = rendr.ListenQUIC("127.0.0.1:0", nil)
+	default:
+		return nil, fmt.Errorf("unknown transport %q", transportName)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +121,7 @@ func run(size int64, migrations, paths int) (*report, error) {
 
 	specs := make([]rendr.PathSpec, paths)
 	for i := range specs {
-		specs[i] = rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}
+		specs[i] = rendr.PathSpec{Transport: transportName, Address: ln.Addr().String()}
 	}
 	d := &rendr.Dialer{Mode: rendr.ModePrime, Paths: specs}
 	client, err := d.Dial(context.Background())
@@ -204,6 +215,7 @@ func run(size int64, migrations, paths int) (*report, error) {
 	recvHex := fmt.Sprintf("%x", hRecv.Sum(nil))
 
 	r := &report{
+		Transport:      transportName,
 		Size:           size,
 		Migrations:     migrations,
 		Paths:          paths,
