@@ -1,6 +1,9 @@
 # Build outputs
 /bin/
 /dist/
+# Chaos harness binaries (go build artefacts)
+/chaos/*.exe
+/chaos/cmd/*/*.exe
 
 # Local tooling
 /.tools/
