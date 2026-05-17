@@ -898,6 +898,100 @@ func TestM1G2Sketch(t *testing.T) {
 	}
 }
 
+// TestM7RaceWritesAllPaths: in race mode, each application Write
+// must produce a wire frame on EVERY attached path. Verifies via
+// tcp.PathConn.Writes() per-path counters.
+func TestM7RaceWritesAllPaths(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime, // start prime then flip; SetMode flow lives here.
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 client paths, got %d", len(client.Paths()))
+	}
+
+	// Capture per-path Writes() baseline.
+	bc := client.(*engineBackedConn)
+	type pathProbe struct {
+		id     uint32
+		writer interface{ Writes() uint64 }
+		base   uint64
+	}
+	var probes []pathProbe
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pathProbe{id: id, writer: w, base: w.Writes()})
+		}
+	})
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+
+	if err := client.SetMode(ModeRace); err != nil {
+		t.Fatal(err)
+	}
+
+	const N = 8
+	payload := []byte("race-frame")
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Drain server side so SEQ progresses on both endpoints.
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatalf("server drain: %v", err)
+	}
+
+	for _, p := range probes {
+		got := p.writer.Writes() - p.base
+		// Race must put at least N frames on each path; >= because
+		// the engine may also have sent ctrl frames (probe etc) that
+		// flow on a single path.
+		if got < uint64(N) {
+			t.Errorf("path %d saw %d writes, want >= %d", p.id, got, N)
+		}
+	}
+}
+
 // TestM6PathRTTProbeRecords: after a fresh dial, the per-path
 // prober loop sends CtrlPathProbe every 1s; the peer echoes it
 // back; the engine writes the measured RTT into PathConn.Quality().

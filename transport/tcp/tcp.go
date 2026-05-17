@@ -100,7 +100,19 @@ type PathConn struct {
 	deathMu  sync.Mutex
 	deathFn  func(cause transport.DeathCause, err error)
 	deathErr error
+
+	// Frame counters for diagnostics / race-mode tests.
+	writes atomic.Uint64
+	reads  atomic.Uint64
 }
+
+// Writes returns the cumulative count of successful Write calls
+// that put a framed unit on the wire.
+func (p *PathConn) Writes() uint64 { return p.writes.Load() }
+
+// Reads returns the cumulative count of successful Read calls
+// (one per inbound framed unit).
+func (p *PathConn) Reads() uint64 { return p.reads.Load() }
 
 // Read returns one framed payload+header concatenated. Callers parse
 // the first 8 bytes as a proto.Header and the rest as payload.
@@ -135,6 +147,7 @@ func (p *PathConn) Read(buf []byte) (int, error) {
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
+	p.reads.Add(1)
 	return n, nil
 }
 
@@ -163,6 +176,7 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 		p.declareDeath(err)
 		return n, p.swallow(err)
 	}
+	p.writes.Add(1)
 	return n, nil
 }
 

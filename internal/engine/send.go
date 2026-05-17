@@ -105,9 +105,25 @@ func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) erro
 	return e.dispatch(frame)
 }
 
-// dispatch writes a fully-built frame on the currently-active path,
-// reselecting if the active one dies mid-write.
+// dispatch writes a fully-built frame on the path(s) appropriate to
+// the current Mode:
+//
+//	prime / 0 (default) - write on the single active path
+//	race                - write on every attached path
+//	bond                - prime semantics until M8 plumbs the splitter
+//
+// The race path returns nil as long as at least one path succeeded
+// (receiver dedup handles duplicates). It returns
+// ErrMigrationBudgetExceeded only when there are no usable paths
+// after the budget.
 func (e *Engine) dispatch(frame []byte) error {
+	if e.mode.Load() == dispatchRace {
+		return e.dispatchRace(frame)
+	}
+	return e.dispatchSingle(frame)
+}
+
+func (e *Engine) dispatchSingle(frame []byte) error {
 	for {
 		if e.isClosed() {
 			return net.ErrClosed
@@ -123,8 +139,6 @@ func (e *Engine) dispatch(frame []byte) error {
 		e.pathsMu.RUnlock()
 
 		if pc == nil {
-			// No active path. Wait inside the migration budget for a
-			// new path to attach, or surface ErrMigrationBudgetExceeded.
 			if err := e.waitForPath(); err != nil {
 				return err
 			}
@@ -132,15 +146,46 @@ func (e *Engine) dispatch(frame []byte) error {
 		}
 
 		if _, err := pc.Write(frame); err != nil {
-			// Path is dying. The OnDeath callback (or Engine.Close)
-			// will remove it from e.paths shortly; loop back to pick
-			// up the next active path, bailing if the engine itself
-			// has closed.
 			if errors.Is(err, net.ErrClosed) {
 				continue
 			}
 			return err
 		}
 		return nil
+	}
+}
+
+// dispatchRace writes the same frame on every attached path.
+// At least one success is required; if every path errors, the
+// engine waits inside the migration budget for a fresh path.
+func (e *Engine) dispatchRace(frame []byte) error {
+	for {
+		if e.isClosed() {
+			return net.ErrClosed
+		}
+		e.pathsMu.RLock()
+		conns := make([]transport.PathConn, 0, len(e.paths))
+		for _, s := range e.paths {
+			conns = append(conns, s.conn)
+		}
+		e.pathsMu.RUnlock()
+
+		if len(conns) == 0 {
+			if err := e.waitForPath(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		anyOk := false
+		for _, pc := range conns {
+			if _, err := pc.Write(frame); err == nil {
+				anyOk = true
+			}
+		}
+		if anyOk {
+			return nil
+		}
+		// All paths failed. Loop and let waitForPath enforce budget.
 	}
 }

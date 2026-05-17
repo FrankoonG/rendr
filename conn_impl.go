@@ -23,6 +23,7 @@ type engineBackedConn struct {
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
 	bc := &engineBackedConn{e: e, conn: c}
 	bc.mode.Store(uint32(mode))
+	e.SetMode(uint32(mode))
 	return bc
 }
 
@@ -73,12 +74,12 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 	if cur == ModeBond && m == ModeRace {
 		return ErrModeSwitchIllegal
 	}
-	// M1 only implements prime; allow setting to/from anything but
-	// reject bond/race entirely until M7/M8 land.
-	if m != ModePrime {
+	// Bond is M8; reject for now. Prime and Race are wired.
+	if m == ModeBond {
 		return ErrNotImplemented
 	}
 	c.mode.Store(uint32(m))
+	c.e.SetMode(uint32(m))
 	return nil
 }
 

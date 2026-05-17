@@ -38,6 +38,10 @@ type Engine struct {
 	state   atomic.Uint32 // BridgeState
 	created time.Time
 
+	// Mode is the dispatcher selector: 1=prime, 2=bond, 3=race.
+	// Loaded by dispatch() to decide single-path vs all-paths send.
+	mode atomic.Uint32
+
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
 	paths      map[uint32]*pathSlot
@@ -327,6 +331,25 @@ func (e *Engine) isClosed() bool {
 // wrapper, which uses it to gate the BYE on local Close.
 func (e *Engine) IsClosed() bool { return e.isClosed() }
 
+// ModeRace / ModeBond / ModePrime values used by SetMode. These
+// mirror the public rendr.Mode values; the engine duplicates them
+// to avoid an import cycle.
+const (
+	dispatchPrime uint32 = 1
+	dispatchBond  uint32 = 2
+	dispatchRace  uint32 = 3
+)
+
+// SetMode updates the dispatcher mode. Called by the public
+// engineBackedConn wrapper after the application-level SetMode
+// validates the transition.
+func (e *Engine) SetMode(mode uint32) {
+	e.mode.Store(mode)
+}
+
+// Mode returns the current dispatcher mode.
+func (e *Engine) Mode() uint32 { return e.mode.Load() }
+
 // probeInterval lets tests override the prober cadence. Default 1s.
 func (e *Engine) probeInterval() time.Duration {
 	if e.probeIntervalOverride > 0 {
@@ -375,6 +398,18 @@ func (e *Engine) CloseErr() error {
 // Closed returns a channel that is closed when the engine has fully
 // shut down. Useful for downstream cleanup goroutines.
 func (e *Engine) Closed() <-chan struct{} { return e.closed }
+
+// WalkPathsForTest invokes fn for every attached path. fn receives
+// the path id and the underlying PathConn as a bare any so tests can
+// type-assert to transport-specific diagnostic interfaces (e.g.
+// tcp.PathConn.Writes()).
+func (e *Engine) WalkPathsForTest(fn func(id uint32, pc interface{})) {
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	for id, s := range e.paths {
+		fn(id, s.conn)
+	}
+}
 
 // ForceKillPathForTest is a backdoor for tests that need to simulate
 // a sudden network death on a specific attached path. It closes the
