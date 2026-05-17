@@ -1,0 +1,13 @@
+# Build outputs
+/bin/
+/dist/
+
+# Local tooling
+/.tools/
+
+# Reproducible test artifacts live here per CLAUDE.md; do not check in
+/test/
+
+# Go test cache and coverage
+/coverage.out
+/coverage.html

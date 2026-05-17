@@ -1,0 +1,71 @@
+package transport
+
+import (
+	"context"
+	"io"
+
+	"github.com/FrankoonG/rendr"
+)
+
+// Transport is the factory for one kind of underlying network
+// path. Implementations are registered globally (or attached to a
+// Dialer/Listener) and looked up by Name().
+type Transport interface {
+	// Name is the identifier the embedder uses in PathSpec.Transport.
+	Name() string
+
+	// DialPath establishes a single PathConn for spec. The returned
+	// PathConn is already past any TLS/handshake stage; if the
+	// handshake itself fails, DialPath returns the error and no
+	// PathConn.
+	DialPath(ctx context.Context, spec rendr.PathSpec) (PathConn, error)
+
+	// Probe returns the best estimate of path quality without
+	// promoting the path to the active set. Implementations may
+	// short-circuit by dialing and immediately closing if the
+	// transport has no cheap probe primitive.
+	Probe(ctx context.Context, spec rendr.PathSpec) (rendr.PathQuality, error)
+}
+
+// DeathCause classifies why a PathConn went down. See package doc
+// for the strict semantic contract.
+type DeathCause uint8
+
+const (
+	// CauseUnknown should be used only at the boundary, before any
+	// classification has happened. It is never the final cause.
+	CauseUnknown DeathCause = 0
+
+	// CauseCleanClose means the remote side issued an orderly BYE
+	// or the stream reached an application-visible EOF. The engine
+	// does NOT migrate; it propagates EOF to the application.
+	CauseCleanClose DeathCause = 1
+
+	// CauseTransportError covers everything else: timeouts, RST,
+	// quic.IdleTimeoutError, HandshakeTimeoutError, ApplicationError,
+	// TransportError, "the underlying socket suddenly returned 0
+	// bytes for no reason". The engine MUST migrate, not propagate.
+	CauseTransportError DeathCause = 2
+)
+
+// PathConn is one live path. It MUST NOT surface migration-class
+// errors via Read/Write; use OnDeath instead.
+type PathConn interface {
+	io.ReadWriteCloser
+
+	// Quality returns the latest measurement. May return a zero
+	// PathQuality if the transport has not yet probed.
+	Quality() rendr.PathQuality
+
+	// OnDeath registers a callback the transport invokes exactly
+	// once when the path is no longer usable. The cause MUST be
+	// CleanClose or TransportError - CauseUnknown is forbidden as a
+	// final value. fn may be called from any goroutine.
+	OnDeath(fn func(cause DeathCause, err error))
+
+	// LocalAddr / RemoteAddr forward the underlying transport's
+	// addresses for diagnostics. They are advisory; the engine does
+	// not key off them.
+	LocalAddr() string
+	RemoteAddr() string
+}
