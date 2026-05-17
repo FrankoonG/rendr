@@ -3,6 +3,7 @@ package engine
 import (
 	"io"
 	"net"
+	"time"
 
 	"github.com/FrankoonG/rendr/proto"
 )
@@ -155,9 +156,13 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 // markPayloadLocked refreshes the zombie counter when payload makes
 // it through. Caller holds recvMu (and we serialise zombie counter
 // access via zombieMu separately).
+//
+// Resetting zombieLastMig to zero is intentional: after payload, the
+// NEXT migration will compute "cooldown expired" as false and start
+// from a fresh full counter.
 func (e *Engine) markPayloadLocked() {
 	e.zombieMu.Lock()
-	e.zombieMigrationsLeft = e.limits.ZombieMaxMigrations
-	e.lastPayloadAt = nowFn()
+	e.zombieLeft = e.limits.ZombieMaxMigrations
+	e.zombieLastMig = time.Time{}
 	e.zombieMu.Unlock()
 }

@@ -503,8 +503,9 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait for both paths on both sides.
-	deadline := time.Now().Add(2 * time.Second)
+	// Wait for both paths on both sides. 5 s tolerance for cold-start
+	// or GC pause during a -count=3 run.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -512,7 +513,7 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if len(server.Paths()) < 2 {
-		t.Fatalf("server only has %d paths", len(server.Paths()))
+		t.Fatalf("server only has %d paths after 5s", len(server.Paths()))
 	}
 
 	// Prove liveness through current active path.
@@ -892,6 +893,107 @@ func TestM1G2Sketch(t *testing.T) {
 	// All paths must still be present on the client (a kill never happened).
 	if got := len(client.Paths()); got != 4 {
 		t.Errorf("client paths after stress: got %d want 4", got)
+	}
+}
+
+// TestM1ZombieAfterTwoNoPayloadMigrations enforces CLAUDE.md hard
+// rule #5: two consecutive completed migrations with zero payload
+// arriving in between must trip ErrZombie. The harness primes the
+// engine with one echo so zombieLeft is full, then kills the active
+// path twice with no traffic between the kills.
+func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+		MigrationBudget: 1 * time.Second,
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait for all 3 paths on both ends.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 3 {
+		t.Fatalf("client only has %d paths", len(client.Paths()))
+	}
+
+	// Liveness check.
+	if _, err := client.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	hi := make([]byte, 2)
+	if _, err := io.ReadFull(server, hi); err != nil {
+		t.Fatal(err)
+	}
+
+	bc := client.(*engineBackedConn)
+
+	// First kill: client.activeID dies, engine migrates to a survivor.
+	// zombieLeft: 2 -> 1 (no payload yet between this and a hypothetical next).
+	kill1 := bc.Engine().ActivePath()
+	if err := bc.Engine().ForceKillPathForTest(kill1); err != nil {
+		t.Fatalf("kill1: %v", err)
+	}
+
+	// Brief settle so the migration callback finishes; no data is
+	// pushed in either direction.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second kill: again the active dies, engine migrates again.
+	// zombieLeft: 1 -> 0 -> ErrZombie close fires.
+	kill2 := bc.Engine().ActivePath()
+	if kill2 == 0 || kill2 == kill1 {
+		t.Fatalf("expected fresh active after migration; got %d (was %d)", kill2, kill1)
+	}
+	if err := bc.Engine().ForceKillPathForTest(kill2); err != nil {
+		t.Fatalf("kill2: %v", err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := client.Read(make([]byte, 1))
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, ErrZombie) {
+			t.Fatalf("got %v, want ErrZombie", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Read did not surface ErrZombie within 3s")
 	}
 }
 

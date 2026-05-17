@@ -58,11 +58,13 @@ type Engine struct {
 	expectedRecvSeq uint64
 	recvDeliver     []byte // pending bytes for the next Read
 
-	// Zombie state.
-	zombieMu             sync.Mutex
-	zombieMigrationsLeft int
-	lastPayloadAt        time.Time
-	zombieCooldownUntil  time.Time
+	// Zombie state. The counter decrements on each migration that
+	// completes (death -> new active path) and resets on payload
+	// arrival OR if the cooldown window has elapsed since the last
+	// migration (CLAUDE.md hard rule #5).
+	zombieMu      sync.Mutex
+	zombieLeft    int
+	zombieLastMig time.Time
 
 	// Lifecycle.
 	closeOnce sync.Once
@@ -95,15 +97,14 @@ func (s *pathSlot) closeQuit() {
 // server side it should be copied from the inbound HELLO.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
-		side:                 side,
-		flowID:               flowID,
-		limits:               limits.Clamp(),
-		created:              time.Now(),
-		paths:                make(map[uint32]*pathSlot),
-		recvQueue:            make(map[uint64]recvItem),
-		zombieMigrationsLeft: limits.Clamp().ZombieMaxMigrations,
-		lastPayloadAt:        time.Now(),
-		closed:               make(chan struct{}),
+		side:       side,
+		flowID:     flowID,
+		limits:     limits.Clamp(),
+		created:    time.Now(),
+		paths:      make(map[uint32]*pathSlot),
+		recvQueue:  make(map[uint64]recvItem),
+		zombieLeft: limits.Clamp().ZombieMaxMigrations,
+		closed:     make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))

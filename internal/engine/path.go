@@ -22,10 +22,13 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 	slot.closeQuit()
 	delete(e.paths, id)
 	wasActive := e.activeID == id
+	migratedOk := false
 	if wasActive {
 		e.activeID = e.pickAnyActive()
 		if e.activeID == 0 {
 			e.setState(BridgeMigrating)
+		} else {
+			migratedOk = true
 		}
 	}
 	hasPaths := len(e.paths) > 0
@@ -42,10 +45,41 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 			_ = e.Close()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		// Migration needed. With no surviving paths, schedule budget.
+		// Successful death-driven migration counts for zombie
+		// accounting. Without a fresh path, fall through to budget.
+		if migratedOk {
+			e.recordMigration()
+		}
 		if !hasPaths {
 			go e.startMigrationBudget(err)
 		}
+	}
+}
+
+// recordMigration decrements the zombie counter and triggers
+// zombie protection when it hits zero. Cooldown semantics: if the
+// gap since the last migration exceeds ZombieCooldown, the counter
+// is refreshed to ZombieMaxMigrations before being decremented;
+// this prevents long-lived connections with infrequent but legit
+// migrations from accumulating into zombie territory.
+//
+// Must NOT be called with pathsMu held: the zombie close path
+// goes through Engine.Close which itself takes pathsMu.
+func (e *Engine) recordMigration() {
+	e.zombieMu.Lock()
+	if !e.zombieLastMig.IsZero() && nowFn().Sub(e.zombieLastMig) > e.limits.ZombieCooldown {
+		e.zombieLeft = e.limits.ZombieMaxMigrations
+	}
+	e.zombieLeft--
+	e.zombieLastMig = nowFn()
+	trip := e.zombieLeft <= 0
+	e.zombieMu.Unlock()
+
+	if trip {
+		go func() {
+			e.setCloseErr(ErrZombie)
+			_ = e.Close()
+		}()
 	}
 }
 
