@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/transport"
 )
 
 // TestM1DialAcceptRoundTrip is the minimal end-to-end demo for M1:
@@ -893,6 +895,97 @@ func TestM1G2Sketch(t *testing.T) {
 	// All paths must still be present on the client (a kill never happened).
 	if got := len(client.Paths()); got != 4 {
 		t.Errorf("client paths after stress: got %d want 4", got)
+	}
+}
+
+// TestM6PrimeAutoMigrateOnQualityChange: with prime-mode quality
+// scheduler armed, when path 2 becomes substantially better than
+// the current path 1 (10x lower RTT), the engine must migrate to
+// it after dwell + cooldown without the test calling Migrate.
+//
+// Uses SetPathQualityForTest to inject scores; the production
+// RTT/jitter/loss probe lands in M6(2/n).
+func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+		Hysteresis: 0.1,
+		Dwell:      50 * time.Millisecond,
+		Cooldown:   100 * time.Millisecond,
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("only %d paths attached", len(client.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	pathsInfo := bc.Paths()
+	p1ID, p2ID := pathsInfo[0].ID, pathsInfo[1].ID
+
+	startActive := bc.Engine().ActivePath()
+	// Inject qualities: current is mediocre, the other is much better.
+	bc.Engine().SetPathQualityForTest(startActive, transport.PathQuality{
+		RTT: 100 * time.Millisecond,
+	})
+	var otherID uint32
+	if startActive == p1ID {
+		otherID = p2ID
+	} else {
+		otherID = p1ID
+	}
+	bc.Engine().SetPathQualityForTest(otherID, transport.PathQuality{
+		RTT: 10 * time.Millisecond,
+	})
+
+	// Wait at most dwell + cooldown + tick slack for the prime
+	// scheduler to fire.
+	migrated := false
+	waitUntil := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitUntil) {
+		if bc.Engine().ActivePath() == otherID {
+			migrated = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !migrated {
+		t.Fatalf("prime scheduler did not migrate to better path within 2s (active still %d, wanted %d)",
+			bc.Engine().ActivePath(), otherID)
 	}
 }
 

@@ -67,6 +67,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	flowID := engine.NewClientFlowID()
 	e := engine.New(engine.SideClient, flowID, engine.Limits{
 		MigrationBudget: d.MigrationBudget,
+		PrimeHysteresis: d.Hysteresis,
+		PrimeDwell:      d.Dwell,
+		PrimeCooldown:   d.Cooldown,
 	})
 
 	// Dial the first path and run HELLO.
@@ -111,7 +114,16 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		LAddr: addrFromString("rendr-client"),
 		RAddr: addrFromString(first.Address),
 	}
-	return newEngineBackedConn(e, c, mode), nil
+	bc := newEngineBackedConn(e, c, mode)
+
+	// Arm the prime scheduler now that all initial paths are
+	// attached. CLAUDE.md hard rule #3 keeps active migration
+	// triggers opt-in; here it is opt-in because the embedder
+	// explicitly chose Mode == ModePrime.
+	if mode == ModePrime {
+		e.StartPrime(nil, 0)
+	}
+	return bc, nil
 }
 
 func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {

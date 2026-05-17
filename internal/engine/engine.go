@@ -66,6 +66,10 @@ type Engine struct {
 	zombieLeft    int
 	zombieLastMig time.Time
 
+	// Prime-mode scheduler. nil until StartPrime is called.
+	primeMu sync.Mutex
+	prime   *prime
+
 	// Lifecycle.
 	closeOnce sync.Once
 	closed    chan struct{}
