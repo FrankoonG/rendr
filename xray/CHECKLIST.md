@@ -46,3 +46,13 @@
 ## 验收
 
 M0 阶段不要求任何一项是 ✓。M0 要求的是：**这张表上每一项都能被 rendr 团队具体说出"将来怎么验证"**，而不是含糊地"应该能行"。
+
+## M9 阶段进度（X1-X7）
+
+- [x] X1 rendr 作为 xray 模块构建（`github.com/FrankoonG/rendr/xray`）
+- [x] X2 Config / PathSpec / Mode 三件套（待 xray-core 上游 proto 注册时映射到 `transport_settings.rendr`）
+- [x] X3 `Dialer.DialContext` + `Listener.{AcceptContext, Close, Addr}` 满足 xray internet.Dialer / Listener 形状（无 xray-core 依赖；上游适配在 X5 接入）
+- [ ] X4 path 子配置嵌套 xray 已有 transport（ws/grpc/mkcp/h2/reality 注入）
+- [ ] X5 端到端 vmess-over-rendr-over-(tcp+quic) 验证
+- [ ] X6 BalancerObject 对接（Adapter 模式）
+- [ ] X7 xray 主线回归（vmess/vless/trojan/ss over rendr）
