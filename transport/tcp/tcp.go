@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -30,11 +29,18 @@ type Transport struct{}
 // New returns a Transport ready for use.
 func New() *Transport { return &Transport{} }
 
+func init() {
+	if err := transport.Default.Register(New()); err != nil {
+		// Duplicate registration is a programming error in init() chains.
+		panic(err)
+	}
+}
+
 // Name implements transport.Transport.
 func (*Transport) Name() string { return "tcp" }
 
 // DialPath dials a TCP socket and wraps it in a PathConn.
-func (*Transport) DialPath(ctx context.Context, spec rendr.PathSpec) (transport.PathConn, error) {
+func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
 	d := net.Dialer{}
 	if spec.Local != "" {
 		la, err := net.ResolveTCPAddr("tcp", spec.Local)
@@ -52,15 +58,15 @@ func (*Transport) DialPath(ctx context.Context, spec rendr.PathSpec) (transport.
 
 // Probe dials, captures handshake RTT, and closes. M1 placeholder;
 // M6 will swap this for a cheap echo.
-func (t *Transport) Probe(ctx context.Context, spec rendr.PathSpec) (rendr.PathQuality, error) {
+func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transport.PathQuality, error) {
 	start := time.Now()
 	pc, err := t.DialPath(ctx, spec)
 	if err != nil {
-		return rendr.PathQuality{}, err
+		return transport.PathQuality{}, err
 	}
 	rtt := time.Since(start)
 	_ = pc.Close()
-	return rendr.PathQuality{RTT: rtt, At: time.Now()}, nil
+	return transport.PathQuality{RTT: rtt, At: time.Now()}, nil
 }
 
 // Wrap promotes an existing net.Conn (e.g. accepted from a listener)
@@ -80,7 +86,7 @@ type PathConn struct {
 
 	// quality is set by the engine via SetQuality; M1 keeps it static.
 	qualityMu sync.RWMutex
-	quality   rendr.PathQuality
+	quality   transport.PathQuality
 
 	// dead is set the first time the path is declared dead.
 	dead atomic.Bool
@@ -180,7 +186,7 @@ func (p *PathConn) Close() error {
 }
 
 // Quality returns the most recent measurement.
-func (p *PathConn) Quality() rendr.PathQuality {
+func (p *PathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
@@ -188,7 +194,7 @@ func (p *PathConn) Quality() rendr.PathQuality {
 
 // SetQuality is invoked by the engine when a new measurement is
 // available. M1 only writes static values here; M6 will probe.
-func (p *PathConn) SetQuality(q rendr.PathQuality) {
+func (p *PathConn) SetQuality(q transport.PathQuality) {
 	p.qualityMu.Lock()
 	p.quality = q
 	p.qualityMu.Unlock()

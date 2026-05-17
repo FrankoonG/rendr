@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -74,13 +73,21 @@ type Engine struct {
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
-	id      uint32
-	conn    transport.PathConn
-	spec    rendr.PathSpec
+	id       uint32
+	conn     transport.PathConn
+	spec     transport.PathSpec
 	attached time.Time
 
-	quit  chan struct{}
-	doneR chan struct{} // closed when reader goroutine exits
+	quit     chan struct{}
+	quitOnce sync.Once
+	doneR    chan struct{} // closed when reader goroutine exits
+}
+
+// closeQuit is idempotent: multiple paths into the engine
+// (Engine.Close, onPathDeath, an explicit migration tear-down) can
+// all signal a slot to exit without panicking on a double close.
+func (s *pathSlot) closeQuit() {
+	s.quitOnce.Do(func() { close(s.quit) })
 }
 
 // New constructs an engine. flowID is the connection identifier; on
@@ -130,7 +137,7 @@ func (e *Engine) setState(s BridgeState) { e.state.Store(uint32(s)) }
 // AttachPath registers a freshly-dialed PathConn with the engine.
 // If no path was previously active, the new path becomes active.
 // AttachPath spawns the per-path reader goroutine.
-func (e *Engine) AttachPath(pc transport.PathConn, spec rendr.PathSpec) (uint32, error) {
+func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uint32, error) {
 	if pc == nil {
 		return 0, errors.New("engine: nil PathConn")
 	}
@@ -182,12 +189,12 @@ func (e *Engine) ActivePath() uint32 {
 }
 
 // Paths returns a snapshot of all attached paths.
-func (e *Engine) Paths() []rendr.PathInfo {
+func (e *Engine) Paths() []transport.PathInfo {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
-	out := make([]rendr.PathInfo, 0, len(e.paths))
+	out := make([]transport.PathInfo, 0, len(e.paths))
 	for _, s := range e.paths {
-		out = append(out, rendr.PathInfo{
+		out = append(out, transport.PathInfo{
 			ID:      s.id,
 			Spec:    s.spec,
 			Quality: s.conn.Quality(),
@@ -256,7 +263,7 @@ func (e *Engine) Close() error {
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
 		for _, s := range e.paths {
-			close(s.quit)
+			s.closeQuit()
 			if err := s.conn.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -279,6 +286,10 @@ func (e *Engine) CloseErr() error {
 	defer e.closeMu.Unlock()
 	return e.closeErr
 }
+
+// Closed returns a channel that is closed when the engine has fully
+// shut down. Useful for downstream cleanup goroutines.
+func (e *Engine) Closed() <-chan struct{} { return e.closed }
 
 func (e *Engine) setCloseErr(err error) {
 	e.closeMu.Lock()

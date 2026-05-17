@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -36,7 +35,7 @@ func newPair(t *testing.T) (*PathConn, *PathConn) {
 	}()
 
 	tp := New()
-	pc, err := tp.DialPath(context.Background(), rendr.PathSpec{Address: ln.Addr().String()})
+	pc, err := tp.DialPath(context.Background(), transport.PathSpec{Address: ln.Addr().String()})
 	if err != nil {
 		t.Fatal(err)
 	}

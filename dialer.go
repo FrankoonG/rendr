@@ -2,7 +2,12 @@ package rendr
 
 import (
 	"context"
+	"errors"
+	"net"
 	"time"
+
+	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/transport"
 )
 
 // Dialer is the entry point for constructing a rendr Conn.
@@ -39,15 +44,95 @@ type Dialer struct {
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
-// performs the HELLO handshake on the first path and then attaches
-// remaining Paths according to Mode.
+// performs the HELLO handshake on the first path; subsequent paths
+// (attached during the same Dial call or later via the migration
+// API) send BRIDGE_TAG carrying the same flow_id.
 //
-// The implementation lives in the engine and transport sub-packages.
-// This stub is unimplemented in M0; M1 wires it up against the
-// double-ended TCP termination path.
+// M1 limits: prime mode only; the first path in d.Paths becomes the
+// active path, the remainder are attached but kept idle until a
+// migration trigger fires.
 func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
-	return nil, ErrNotImplemented
+	if len(d.Paths) == 0 {
+		return nil, errNoPaths
+	}
+	mode := d.Mode
+	if !mode.Valid() {
+		mode = ModePrime
+	}
+	if mode != ModePrime {
+		// M1 only implements prime.
+		return nil, ErrNotImplemented
+	}
+
+	flowID := engine.NewClientFlowID()
+	e := engine.New(engine.SideClient, flowID, engine.Limits{
+		MigrationBudget: d.MigrationBudget,
+	})
+
+	// Dial the first path and run HELLO.
+	first := d.Paths[0]
+	pc, err := dialPath(ctx, first)
+	if err != nil {
+		_ = e.Close()
+		return nil, err
+	}
+	if err := engine.PerformClientHello(pc, flowID, 0); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return nil, err
+	}
+	if _, err := e.AttachPath(pc, first); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return nil, err
+	}
+
+	// Attach any additional paths as bridge-tagged add-ons. They sit
+	// idle until Migrate switches to them or the active path dies.
+	for _, ps := range d.Paths[1:] {
+		spc, err := dialPath(ctx, ps)
+		if err != nil {
+			// One bad extra path is not fatal for the Conn; warn
+			// silently and continue.
+			continue
+		}
+		if err := engine.PerformClientBridgeTag(spc, flowID); err != nil {
+			_ = spc.Close()
+			continue
+		}
+		if _, err := e.AttachPath(spc, ps); err != nil {
+			_ = spc.Close()
+			continue
+		}
+	}
+
+	c := &engine.Conn{
+		E:     e,
+		LAddr: addrFromString("rendr-client"),
+		RAddr: addrFromString(first.Address),
+	}
+	return newEngineBackedConn(e, c, mode), nil
 }
+
+func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
+	tp, err := transport.Default.Lookup(spec.Transport)
+	if err != nil {
+		return nil, err
+	}
+	return tp.DialPath(ctx, spec)
+}
+
+var errNoPaths = errors.New("rendr: Dialer has no Paths")
+
+// stringAddr is a trivial net.Addr for the application-facing
+// LocalAddr/RemoteAddr; M1 does not synthesise OS sockets so the
+// addresses are descriptive strings only.
+type stringAddr string
+
+func (s stringAddr) Network() string { return "rendr" }
+func (s stringAddr) String() string  { return string(s) }
+
+func addrFromString(s string) stringAddr { return stringAddr(s) }
 
 // Listener accepts inbound rendr Conns. The set of acceptable
 // transports is determined by registering transport adapters on the
@@ -55,6 +140,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 type Listener interface {
 	Accept(ctx context.Context) (Conn, error)
 	Close() error
+	// Addr returns the listener's local network address, useful for
+	// tests that bind ":0" and need to discover the chosen port.
+	Addr() net.Addr
 	// FlowIDs returns the live flow_id set for diagnostics.
 	FlowIDs() [][16]byte
 }

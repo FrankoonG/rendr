@@ -3,8 +3,6 @@ package transport
 import (
 	"context"
 	"io"
-
-	"github.com/FrankoonG/rendr"
 )
 
 // Transport is the factory for one kind of underlying network
@@ -18,13 +16,13 @@ type Transport interface {
 	// PathConn is already past any TLS/handshake stage; if the
 	// handshake itself fails, DialPath returns the error and no
 	// PathConn.
-	DialPath(ctx context.Context, spec rendr.PathSpec) (PathConn, error)
+	DialPath(ctx context.Context, spec PathSpec) (PathConn, error)
 
 	// Probe returns the best estimate of path quality without
 	// promoting the path to the active set. Implementations may
 	// short-circuit by dialing and immediately closing if the
 	// transport has no cheap probe primitive.
-	Probe(ctx context.Context, spec rendr.PathSpec) (rendr.PathQuality, error)
+	Probe(ctx context.Context, spec PathSpec) (PathQuality, error)
 }
 
 // DeathCause classifies why a PathConn went down. See package doc
@@ -55,7 +53,7 @@ type PathConn interface {
 
 	// Quality returns the latest measurement. May return a zero
 	// PathQuality if the transport has not yet probed.
-	Quality() rendr.PathQuality
+	Quality() PathQuality
 
 	// OnDeath registers a callback the transport invokes exactly
 	// once when the path is no longer usable. The cause MUST be

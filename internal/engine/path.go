@@ -3,7 +3,6 @@ package engine
 import (
 	"time"
 
-	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -20,7 +19,7 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 		e.pathsMu.Unlock()
 		return
 	}
-	close(slot.quit)
+	slot.closeQuit()
 	delete(e.paths, id)
 	wasActive := e.activeID == id
 	if wasActive {
@@ -78,7 +77,7 @@ func (e *Engine) startMigrationBudget(reason error) {
 				return
 			}
 			if nowFn().After(deadline) {
-				e.setCloseErr(rendr.ErrMigrationBudgetExceeded)
+				e.setCloseErr(ErrMigrationBudgetExceeded)
 				_ = e.Close()
 				return
 			}
@@ -107,9 +106,9 @@ func (e *Engine) waitForPath() error {
 				return nil
 			}
 			if nowFn().After(deadline) {
-				e.setCloseErr(rendr.ErrMigrationBudgetExceeded)
+				e.setCloseErr(ErrMigrationBudgetExceeded)
 				_ = e.Close()
-				return rendr.ErrMigrationBudgetExceeded
+				return ErrMigrationBudgetExceeded
 			}
 		}
 	}
