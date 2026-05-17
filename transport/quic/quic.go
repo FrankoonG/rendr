@@ -37,6 +37,12 @@ func New() *Transport {
 	return &Transport{ClientTLS: ct}
 }
 
+func init() {
+	if err := transport.Default.Register(New()); err != nil {
+		panic(err)
+	}
+}
+
 // Name implements transport.Transport.
 func (*Transport) Name() string { return "quic" }
 
