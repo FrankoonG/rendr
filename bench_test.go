@@ -30,96 +30,13 @@ func BenchmarkStreamThroughputTCPWithMigration(b *testing.B) {
 	benchStream(b, 2, 512*1024, chunk)
 }
 
-// BenchmarkPacketPPSQUICDatagram measures sustained packets-per-second
-// over the QUIC DATAGRAM packet-mode path. Drives 1 KiB payloads
-// (~typical opaque-UDP MTU) through a loopback rendr packet-mode
-// connection. Reports MB/s + N (the packet count) so callers can
-// derive pps as N / benchtime.
-//
-// G3 contract target: 100k pps. b.SetBytes is set to chunk so the
-// "MB/s" column doubles as the bandwidth. On Linux loopback expect
-// this to clear 100k pps comfortably; on Windows expect significant
-// jitter from UDP loopback scheduling.
-//
-//	go test -bench=BenchmarkPacketPPSQUICDatagram -benchtime=3s
-func BenchmarkPacketPPSQUICDatagram(b *testing.B) {
-	const chunk = 1024
-	benchPacketQUICDatagram(b, chunk)
-}
-
-// benchPacketQUICDatagram drives one-way packet flow over a single
-// QUIC DATAGRAM path. A goroutine drains on the server side; sender
-// throttles only by socket backpressure, which on QUIC DATAGRAM
-// means the kernel/quic-go SendDatagram queue.
-func benchPacketQUICDatagram(b *testing.B, chunk int) {
-	ln, err := ListenQUICDatagram("127.0.0.1:0", nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer ln.Close()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var serverConn PacketConn
-	go func() {
-		defer wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c, err := ln.AcceptPacket(ctx)
-		if err != nil {
-			b.Errorf("accept: %v", err)
-			return
-		}
-		serverConn = c
-	}()
-
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{{
-			Transport: "quic",
-			Address:   ln.Addr().String(),
-			Opts:      map[string]string{"mode": "datagram"},
-		}},
-	}
-	client, err := d.DialPacket(context.Background())
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer client.Close()
-	wg.Wait()
-	defer serverConn.Close()
-
-	drainErr := make(chan error, 1)
-	go func() {
-		buf := make([]byte, chunk*2)
-		for i := 0; i < b.N; i++ {
-			if _, _, err := serverConn.ReadFrom(buf); err != nil {
-				drainErr <- err
-				return
-			}
-		}
-		drainErr <- nil
-	}()
-
-	payload := make([]byte, chunk)
-	for i := range payload {
-		payload[i] = byte(i & 0xFF)
-	}
-
-	b.SetBytes(int64(chunk))
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		if _, err := client.WriteTo(payload, nil); err != nil {
-			b.Fatalf("WriteTo: %v", err)
-		}
-	}
-
-	b.StopTimer()
-	if err := <-drainErr; err != nil && err != io.EOF {
-		b.Fatalf("drainer: %v", err)
-	}
-}
+// G3 100k pps long-run benchmark intentionally NOT here:
+// QUIC DATAGRAM has no flow-control on loopback, so a one-sender
+// one-drainer Go benchmark either runs at sender speed and drops
+// frames on the drainer, or runs at drainer speed and starves the
+// sender. A proper G3 validation needs a fixed-duration model with
+// separate sent/delivered metrics + sender pacing, which doesn't fit
+// the testing.B contract. Live in chaos/ on the Linux host instead.
 
 // benchStream drives b.N write/read pairs of `chunk` bytes between
 // loopback rendr Conns. nPaths sets how many TCP paths the client
