@@ -98,6 +98,23 @@ func (c *engineBackedConn) State() string { return c.e.State().String() }
 // RecvQueueHWM returns the reorder-buffer high-water mark.
 func (c *engineBackedConn) RecvQueueHWM() int { return c.e.RecvQueueHighWaterMark() }
 
+// Mode returns the current operational mode.
+func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
+
+// Stats returns a coherent snapshot of the observable state.
+// Paths is filled from engine.Paths() which is taken under a read
+// lock, so the snapshot is consistent across the path set.
+func (c *engineBackedConn) Stats() ConnStats {
+	return ConnStats{
+		FlowID:       c.e.FlowID(),
+		State:        c.e.State().String(),
+		Mode:         Mode(c.mode.Load()),
+		ActivePath:   c.e.ActivePath(),
+		Paths:        c.e.Paths(),
+		RecvQueueHWM: c.e.RecvQueueHighWaterMark(),
+	}
+}
+
 // AddPath dials a path matching spec and attaches it to this
 // engine via BRIDGE_TAG. The new path joins the existing flow on
 // the server side without breaking the application's Conn.

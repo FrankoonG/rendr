@@ -1012,6 +1012,100 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
 }
 
+// TestAdminConnStatsSnapshot: Stats() returns a coherent view of
+// flow id, mode, state, active path, the path list, and recv-queue
+// HWM in one call. Fields must be internally consistent (same
+// flow id everywhere, ActivePath in Paths if non-zero, Mode
+// reflecting the most recent SetMode).
+func TestAdminConnStatsSnapshot(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	adm := client.(AdminConn)
+	s := adm.Stats()
+
+	if s.FlowID != client.FlowID() {
+		t.Errorf("Stats.FlowID mismatch: %x vs %x", s.FlowID, client.FlowID())
+	}
+	if s.State != "active" {
+		t.Errorf("Stats.State: got %q want %q", s.State, "active")
+	}
+	if s.Mode != ModePrime {
+		t.Errorf("Stats.Mode: got %v want %v", s.Mode, ModePrime)
+	}
+	if s.ActivePath == 0 {
+		t.Error("Stats.ActivePath should be non-zero after dial")
+	}
+	if len(s.Paths) < 2 {
+		t.Errorf("Stats.Paths: got %d want >=2", len(s.Paths))
+	}
+	// ActivePath must appear in Paths.
+	found := false
+	for _, p := range s.Paths {
+		if p.ID == s.ActivePath {
+			found = true
+			if !p.Active {
+				t.Errorf("Stats.Paths[%d].Active=false but ActivePath=%d", p.ID, s.ActivePath)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("Stats.ActivePath %d not in Paths", s.ActivePath)
+	}
+	if s.RecvQueueHWM < 0 {
+		t.Errorf("Stats.RecvQueueHWM negative: %d", s.RecvQueueHWM)
+	}
+
+	// Mode read should track SetMode write.
+	if err := client.SetMode(ModeRace); err != nil {
+		t.Fatal(err)
+	}
+	if got := adm.Mode(); got != ModeRace {
+		t.Errorf("Mode() after SetMode(Race): got %v want %v", got, ModeRace)
+	}
+	if got := adm.Stats().Mode; got != ModeRace {
+		t.Errorf("Stats.Mode after SetMode(Race): got %v want %v", got, ModeRace)
+	}
+}
+
 // TestAdminConnStateAndHWM: State() reports the bridge lifecycle
 // transitions and RecvQueueHWM exposes the dedup-buffer
 // observability hook required by docs/modes.md.

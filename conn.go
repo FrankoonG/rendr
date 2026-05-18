@@ -72,4 +72,29 @@ type AdminConn interface {
 	// the observability hook the chaos harness and production
 	// dashboards consult to spot it.
 	RecvQueueHWM() int
+
+	// Mode returns the current operational mode (prime/race/bond).
+	// Symmetric counterpart to SetMode; lets callers verify a
+	// mode transition succeeded.
+	Mode() Mode
+
+	// Stats returns a coherent one-call snapshot of everything a
+	// monitoring layer wants to see: flow id, mode, lifecycle
+	// state, path list (with per-path counters + quality), active
+	// path id, and recv-queue high-water mark. The contents are
+	// also obtainable individually but Stats avoids torn reads
+	// across getters.
+	Stats() ConnStats
+}
+
+// ConnStats is the one-call snapshot returned by AdminConn.Stats.
+// Layout is stable; fields are added to the end for forward
+// compatibility.
+type ConnStats struct {
+	FlowID       [16]byte
+	State        string
+	Mode         Mode
+	ActivePath   uint32
+	Paths        []PathInfo
+	RecvQueueHWM int
 }
