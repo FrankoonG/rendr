@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"errors"
+	"net"
 
 	"github.com/FrankoonG/rendr/internal/engine"
 )
@@ -20,6 +21,13 @@ var (
 	ErrZombie                  = engine.ErrZombie
 	ErrPeerProtoVersion        = engine.ErrPeerProtoVersion
 	ErrLastPath                = engine.ErrLastPath
+	ErrPacketTooLarge          = engine.ErrPacketTooLarge
+
+	// ErrReadDeadlineExceeded is the sentinel returned by Read /
+	// ReadFrom when a SetReadDeadline-set deadline elapses before
+	// payload is ready. Implements net.Error with Timeout()==true so
+	// idiomatic timeout checks via errors.As work transparently.
+	ErrReadDeadlineExceeded net.Error = engine.ErrReadDeadlineExceeded
 
 	// ErrModeSwitchIllegal is returned by Conn.SetMode for transitions
 	// that the engine refuses (e.g. race -> bond).

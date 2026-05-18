@@ -1,5 +1,8 @@
 # rendr
 
+[![Go](https://github.com/FrankoonG/rendr/actions/workflows/go.yml/badge.svg?branch=v0.1.0)](https://github.com/FrankoonG/rendr/actions/workflows/go.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/FrankoonG/rendr.svg)](https://pkg.go.dev/github.com/FrankoonG/rendr)
+
 A connection-migration framework for Go. An application holds a stable
 `net.Conn` whose underlying network path rendr can swap — TCP socket,
 QUIC connection, or opaque-UDP flow — without surfacing any reset,

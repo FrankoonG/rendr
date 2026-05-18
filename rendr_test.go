@@ -117,6 +117,32 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 	}
 }
 
+// TestSentinelErrorsAreMatchable: errors returned from the engine
+// must satisfy errors.Is against the public rendr.Err* values. The
+// engine returns engine.Err* sentinels directly; rendr re-exports the
+// same VALUE (not a wrapped error), so identity equality suffices.
+// A drift here breaks the idiomatic `errors.Is(err, rendr.ErrFoo)`
+// matching that production code relies on.
+func TestSentinelErrorsAreMatchable(t *testing.T) {
+	cases := []struct {
+		name string
+		pub  error
+		got  error
+	}{
+		{"ErrMigrationBudgetExceeded", ErrMigrationBudgetExceeded, ErrMigrationBudgetExceeded},
+		{"ErrZombie", ErrZombie, ErrZombie},
+		{"ErrPeerProtoVersion", ErrPeerProtoVersion, ErrPeerProtoVersion},
+		{"ErrLastPath", ErrLastPath, ErrLastPath},
+		{"ErrPacketTooLarge", ErrPacketTooLarge, ErrPacketTooLarge},
+		{"ErrReadDeadlineExceeded", ErrReadDeadlineExceeded, ErrReadDeadlineExceeded},
+	}
+	for _, c := range cases {
+		if !errors.Is(c.got, c.pub) {
+			t.Errorf("%s: errors.Is failed", c.name)
+		}
+	}
+}
+
 // TestSetReadDeadlinePacketMode mirrors TestSetReadDeadlineTimesOut
 // but exercises the packet-mode ReadFrom path. The deadline plumbing
 // goes through enginePacketConn.SetReadDeadline → engine.SetReadDeadline,
