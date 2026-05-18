@@ -90,6 +90,68 @@ func (c *enginePacketConn) SetMode(m Mode) error {
 	return nil
 }
 
+// Admin-style methods on enginePacketConn mirror the AdminConn
+// surface on stream-mode connections. Applications that need them
+// type-assert to AdminPacketConn (or its individual interfaces).
+func (c *enginePacketConn) Migrate(id uint32) error    { return c.e.Migrate(id) }
+func (c *enginePacketConn) ActivePath() uint32         { return c.e.ActivePath() }
+func (c *enginePacketConn) State() string              { return c.e.State().String() }
+func (c *enginePacketConn) RecvQueueHWM() int          { return c.e.RecvQueueHighWaterMark() }
+func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
+func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
+func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
+
+// AddPath dials and attaches a fresh path matching spec. Same
+// semantics as AdminConn.AddPath on stream mode.
+func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pc, err := dialPath(ctx, spec)
+	if err != nil {
+		return 0, err
+	}
+	if err := engine.PerformClientBridgeTag(pc, c.e.FlowID()); err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	id, err := c.e.AttachPath(pc, spec)
+	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	return id, nil
+}
+
+// Stats returns the same coherent snapshot as AdminConn.Stats does
+// for stream-mode Conn.
+func (c *enginePacketConn) Stats() ConnStats {
+	return ConnStats{
+		FlowID:       c.e.FlowID(),
+		State:        c.e.State().String(),
+		Mode:         Mode(c.mode.Load()),
+		ActivePath:   c.e.ActivePath(),
+		Paths:        c.e.Paths(),
+		RecvQueueHWM: c.e.RecvQueueHighWaterMark(),
+		RecvDups:     c.e.RecvDups(),
+	}
+}
+
+// AdminPacketConn is the AdminConn analogue for packet-mode. It
+// extends PacketConn with the same migration/observability surface
+// stream-mode AdminConn exposes.
+type AdminPacketConn interface {
+	PacketConn
+	Migrate(pathID uint32) error
+	ActivePath() uint32
+	AddPath(spec PathSpec) (uint32, error)
+	RemovePath(pathID uint32) error
+	State() string
+	RecvQueueHWM() int
+	RecvDups() uint64
+	Mode() Mode
+	Stats() ConnStats
+}
+
 // PacketListener accepts inbound rendr PacketConns. The udpflow
 // listener implements both Listener and PacketListener: HELLO with
 // CapsPacketMode routes to AcceptPacket, otherwise to Accept. A

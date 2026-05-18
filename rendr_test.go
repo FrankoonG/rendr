@@ -2447,6 +2447,225 @@ func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
 	}
 }
 
+// TestM5PacketStreamUnderMigration: stress test of packet-mode with
+// 1000 sequenced packets and several mid-stream migrations. Each
+// packet carries an 8-byte BigEndian counter; the server verifies
+// the counters arrive in order with no gap. Validates that the
+// reorder buffer and the migration machinery do not corrupt or drop
+// packets under sustained load.
+func TestM5PacketStreamUnderMigration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping packet-mode stress in -short")
+	}
+
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait all 3 paths attached.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(client.Paths()) < 3 {
+		t.Fatalf("expected 3 paths, got %d", len(client.Paths()))
+	}
+
+	bc := client.(*enginePacketConn)
+
+	const N = 1000
+	const migEvery = 250
+
+	// Receiver: pull N packets, verify counter order.
+	recvErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 32)
+		for i := uint64(0); i < N; i++ {
+			n, _, err := server.ReadFrom(buf)
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			if n != 8 {
+				recvErr <- nil
+				t.Errorf("packet %d: got n=%d want 8", i, n)
+				return
+			}
+			got := binary.BigEndian.Uint64(buf[:8])
+			if got != i {
+				recvErr <- nil
+				t.Errorf("packet %d: counter %d != expected %d", i, got, i)
+				return
+			}
+		}
+		recvErr <- nil
+	}()
+
+	// Sender: emit N packets; every migEvery, migrate to next path.
+	var pkt [8]byte
+	for i := uint64(0); i < N; i++ {
+		binary.BigEndian.PutUint64(pkt[:], i)
+		if _, err := client.WriteTo(pkt[:], nil); err != nil {
+			t.Fatalf("WriteTo %d: %v", i, err)
+		}
+		if i > 0 && i%migEvery == 0 {
+			cur := bc.e.ActivePath()
+			var other uint32
+			for _, p := range bc.Paths() {
+				if p.ID != cur {
+					other = p.ID
+					break
+				}
+			}
+			if other != 0 {
+				_ = bc.e.Migrate(other)
+			}
+		}
+	}
+
+	select {
+	case err := <-recvErr:
+		if err != nil {
+			t.Fatalf("receiver: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("receiver deadline; packet-mode stress hung")
+	}
+}
+
+// TestM5PacketRaceModeDuplicates: race mode duplicates each frame
+// across all attached paths. In packet mode the receiver must
+// deliver exactly ONE copy of each application packet (the second
+// copy lands in RecvDups). Validates the dispatcher's mode-agnostic
+// behaviour against the new packet-boundary drainer.
+func TestM5PacketRaceModeDuplicates(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := client.SetMode(ModeRace); err != nil {
+		t.Fatalf("SetMode race: %v", err)
+	}
+
+	// Warmup: send a couple of packets before counting so the
+	// second path's server-side reader goroutine has definitely
+	// started consuming. Without this, under -count=1 load the
+	// second path may be attached but not yet draining, so the
+	// first race write loses its second copy.
+	buf := make([]byte, 32)
+	for i := 0; i < 2; i++ {
+		if _, err := client.WriteTo([]byte{0xFF}, nil); err != nil {
+			t.Fatalf("warmup WriteTo: %v", err)
+		}
+		if _, _, err := server.ReadFrom(buf); err != nil {
+			t.Fatalf("warmup ReadFrom: %v", err)
+		}
+	}
+	baseDups := server.(interface{ RecvDups() uint64 }).RecvDups()
+
+	const N = 32
+	for i := 0; i < N; i++ {
+		pkt := []byte{byte(i)}
+		if _, err := client.WriteTo(pkt, nil); err != nil {
+			t.Fatalf("WriteTo %d: %v", i, err)
+		}
+	}
+
+	for i := 0; i < N; i++ {
+		n, _, err := server.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom %d: %v", i, err)
+		}
+		if n != 1 || buf[0] != byte(i) {
+			t.Fatalf("packet %d: got n=%d b=%d want byte(%d)", i, n, buf[0], i)
+		}
+	}
+
+	// Server side: with 2 paths in race we expect roughly N
+	// additional dedupe events (the second copy of each counted
+	// frame). UDP loopback can drop occasional datagrams on either
+	// path under burst load - which is exactly what race mode is
+	// designed to mask - so allow up to ~25% loss on the dup count
+	// without failing. The strict-zero-loss check is on the data
+	// channel above (every packet i was received in order).
+	dups := server.(interface{ RecvDups() uint64 }).RecvDups() - baseDups
+	if dups < uint64(N*3/4) {
+		t.Fatalf("dups=%d, expected >= 75%% of N=%d after warmup; race may be falling back to single-path",
+			dups, N)
+	}
+	t.Logf("race+packet: %d application packets, %d dedupe events (post-warmup)", N, dups)
+}
+
 // TestM6PathRTTProbeRecords: after a fresh dial, the per-path
 // prober loop sends CtrlPathProbe every 1s; the peer echoes it
 // back; the engine writes the measured RTT into PathConn.Quality().
