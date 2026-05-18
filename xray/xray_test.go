@@ -174,3 +174,100 @@ func TestM9DialerPacketRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestM9AdminSurfaceThroughXrayWrap: the net.Conn / net.PacketConn
+// values returned by xray.Dialer must still satisfy rendr.AdminConn /
+// rendr.AdminPacketConn so embedders can plumb migration metrics and
+// path-set control into their xray-side observability without
+// reaching past the xray wrapper.
+func TestM9AdminSurfaceThroughXrayWrap(t *testing.T) {
+	t.Run("stream", func(t *testing.T) {
+		ln, err := ListenTCP("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err := ln.AcceptContext(ctx)
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}()
+
+		d, err := NewDialer(&Config{
+			Mode:  ModePrime,
+			Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := d.DialContext(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		<-accepted
+
+		adm, ok := c.(rendr.AdminConn)
+		if !ok {
+			t.Fatal("xray-side net.Conn is not rendr.AdminConn")
+		}
+		if adm.State() != "active" {
+			t.Fatalf("State=%q want active", adm.State())
+		}
+		s := adm.Stats()
+		if s.Mode != rendr.ModePrime || len(s.Paths) != 1 {
+			t.Fatalf("Stats unexpected: %+v", s)
+		}
+	})
+
+	t.Run("packet", func(t *testing.T) {
+		ln, err := ListenUDPFlow("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		accepted := make(chan net.PacketConn, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err := ln.AcceptPacketContext(ctx)
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}()
+
+		d, err := NewDialer(&Config{
+			Mode:  ModePrime,
+			Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := d.DialPacketContext(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		<-accepted
+
+		adm, ok := c.(rendr.AdminPacketConn)
+		if !ok {
+			t.Fatal("xray-side net.PacketConn is not rendr.AdminPacketConn")
+		}
+		if adm.State() != "active" {
+			t.Fatalf("State=%q want active", adm.State())
+		}
+		s := adm.Stats()
+		if s.Mode != rendr.ModePrime || len(s.Paths) != 1 {
+			t.Fatalf("Stats unexpected: %+v", s)
+		}
+	})
+}
