@@ -151,9 +151,11 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 		e.pathsMu.RLock()
 		id := e.activeID
 		var pc transport.PathConn
+		var slot *pathSlot
 		if id != 0 {
 			if s, ok := e.paths[id]; ok {
 				pc = s.conn
+				slot = s
 			}
 		}
 		e.pathsMu.RUnlock()
@@ -170,6 +172,9 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 				continue
 			}
 			return err
+		}
+		if slot != nil {
+			slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		}
 		return nil
 	}
@@ -252,7 +257,8 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			e.bondPinLeft = pin
 		}
 		e.bondPinLeft--
-		pc := e.paths[ids[idx]].conn
+		slot := e.paths[ids[idx]]
+		pc := slot.conn
 		e.pathsMu.Unlock()
 
 		if _, err := pc.Write(frame); err != nil {
@@ -262,6 +268,7 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			}
 			return err
 		}
+		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		return nil
 	}
 }
@@ -309,13 +316,13 @@ func (e *Engine) dispatchRace(frame []byte) error {
 			return net.ErrClosed
 		}
 		e.pathsMu.RLock()
-		conns := make([]transport.PathConn, 0, len(e.paths))
+		slots := make([]*pathSlot, 0, len(e.paths))
 		for _, s := range e.paths {
-			conns = append(conns, s.conn)
+			slots = append(slots, s)
 		}
 		e.pathsMu.RUnlock()
 
-		if len(conns) == 0 {
+		if len(slots) == 0 {
 			if err := e.waitForPath(); err != nil {
 				return err
 			}
@@ -323,9 +330,11 @@ func (e *Engine) dispatchRace(frame []byte) error {
 		}
 
 		anyOk := false
-		for _, pc := range conns {
-			if _, err := pc.Write(frame); err == nil {
+		now := nowFn().UnixNano()
+		for _, s := range slots {
+			if _, err := s.conn.Write(frame); err == nil {
 				anyOk = true
+				s.lastSendUnixNano.Store(now)
 			}
 		}
 		if anyOk {

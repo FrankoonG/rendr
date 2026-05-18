@@ -47,6 +47,11 @@ type PathInfo struct {
 	// surfaces "path is genuinely idle" as opposed to "probe-fresh
 	// but no traffic" so monitoring can flag NAT keepalive timeouts.
 	LastRecvAt time.Time
+	// LastSendAt is the wall-clock time at which a frame was last
+	// successfully written to this path's socket. Pair with
+	// LastRecvAt to distinguish "I'm sending but peer is silent"
+	// from "peer is sending but I'm idle".
+	LastSendAt time.Time
 }
 
 // PathQuality is the most recent measurement of one path.

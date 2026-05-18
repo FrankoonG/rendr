@@ -175,6 +175,17 @@ func TestPathInfoLastRecvAt(t *testing.T) {
 	if age := time.Since(after); age > 5*time.Second {
 		t.Errorf("LastRecvAt stale: age=%s", age)
 	}
+
+	// Symmetric check on the client side: the client just wrote a
+	// data frame so its LastSendAt for the active path must be
+	// populated and recent.
+	clientSend := client.Paths()[0].LastSendAt
+	if clientSend.IsZero() {
+		t.Fatal("client LastSendAt zero after Write")
+	}
+	if age := time.Since(clientSend); age > 5*time.Second {
+		t.Errorf("client LastSendAt stale: age=%s", age)
+	}
 }
 
 // TestDialerCustomLimitsApplied: setting ZombieMaxMigrations on the

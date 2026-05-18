@@ -154,6 +154,12 @@ type pathSlot struct {
 	// before the first frame. Atomic for the same reason as recvDups.
 	lastRecvUnixNano atomic.Int64
 
+	// lastSendUnixNano mirrors lastRecvUnixNano on the send side:
+	// stamped after a successful dispatch write to this slot's
+	// socket. Engine-level (not probe-level): both data and ctrl
+	// writes bump it.
+	lastSendUnixNano atomic.Int64
+
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits
@@ -349,6 +355,9 @@ func (e *Engine) Paths() []transport.PathInfo {
 		pi.RecvDups = s.recvDups.Load()
 		if ns := s.lastRecvUnixNano.Load(); ns > 0 {
 			pi.LastRecvAt = time.Unix(0, ns)
+		}
+		if ns := s.lastSendUnixNano.Load(); ns > 0 {
+			pi.LastSendAt = time.Unix(0, ns)
 		}
 		out = append(out, pi)
 	}
