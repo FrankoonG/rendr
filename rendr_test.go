@@ -992,6 +992,198 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 }
 
+// TestM5UDPFlowPlannedMigration: 2 udpflow paths, hot-swap active
+// path via engine.Migrate mid-stream. Confirms M5 paths plug into
+// the same engine migration primitive that TCP / QUIC use.
+func TestM5UDPFlowPlannedMigration(t *testing.T) {
+	ln, err := ListenUDPFlow("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait both sides see 2 paths.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(server.Paths()) < 2 {
+		t.Fatalf("server only has %d paths", len(server.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	cur := bc.Engine().ActivePath()
+	var other uint32
+	for _, p := range bc.Paths() {
+		if p.ID != cur {
+			other = p.ID
+			break
+		}
+	}
+	if other == 0 {
+		t.Fatal("no non-active path")
+	}
+
+	// Stream payload in 8 chunks; migrate after the 4th.
+	const chunkSize = 256
+	const chunks = 8
+	want := make([]byte, 0, chunks*chunkSize)
+	for i := 0; i < chunks; i++ {
+		buf := make([]byte, chunkSize)
+		for j := range buf {
+			buf[j] = byte(i*37 + j)
+		}
+		want = append(want, buf...)
+	}
+
+	got := make([]byte, len(want))
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(server, got)
+		readDone <- err
+	}()
+
+	half := len(want) / 2
+	if _, err := client.Write(want[:half]); err != nil {
+		t.Fatalf("write first half: %v", err)
+	}
+	if err := bc.Engine().Migrate(other); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if _, err := client.Write(want[half:]); err != nil {
+		t.Fatalf("write second half: %v", err)
+	}
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("server read: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server read timed out across migration")
+	}
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload mismatch")
+	}
+	if bc.Engine().ActivePath() != other {
+		t.Errorf("active path after migrate: got %d want %d", bc.Engine().ActivePath(), other)
+	}
+}
+
+// TestM5UDPFlowFailoverToSurvivingPath: 2 udpflow paths, force-kill
+// the server-side active path so the client observes a
+// TransportError; engine fails over to the survivor without
+// surfacing an app-level error.
+func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
+	ln, err := ListenUDPFlow("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+		MigrationBudget: 3 * time.Second,
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(server.Paths()) < 2 {
+		t.Fatalf("server only has %d paths", len(server.Paths()))
+	}
+
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	pre := make([]byte, 5)
+	if _, err := io.ReadFull(server, pre); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opaque UDP is connection-less: the server-side ServerPathConn
+	// shares the listener's single UDP socket, so closing it does
+	// NOT inform the peer the way a TCP RST would. The realistic
+	// failure signal is on the client side - the OS UDP socket
+	// closes, the engine's readerLoop on that path observes
+	// transport error, onPathDeath fires, and the engine fails over.
+	bc := client.(*engineBackedConn)
+	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	const tail = "post-udp-failover"
+	if _, err := client.Write([]byte(tail)); err != nil {
+		t.Fatalf("post-failover write: %v", err)
+	}
+	buf := make([]byte, len(tail))
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatalf("post-failover read: %v", err)
+	}
+	if string(buf) != tail {
+		t.Fatalf("post-failover payload: got %q want %q", buf, tail)
+	}
+}
+
 // TestM5UDPFlowDialAcceptRoundTrip: Dialer over udpflow path +
 // ListenUDPFlow accept; data flows in both directions over an
 // opaque UDP datagram pair. Migration test (path swap on the same
