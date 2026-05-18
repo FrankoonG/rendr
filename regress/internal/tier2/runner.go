@@ -3,39 +3,56 @@
 // to fit in <8 min, large enough to catch engine-layer regressions
 // before phase 2 burns CI time.
 //
-// Status: placeholder. T2 cases are still being migrated from
-// chaos/cmd/{g1,g2,g4}/main.go per docs/regression-suite.md §14
-// step 3. Until that lands, tier2.Run reports each case as skipped
-// with reason "T2 migration pending". Phase 1 still passes; the
-// skips show up in reports so the gap is visible.
+// Status:
+//   - G1-smoke: cross-platform, implemented.
+//   - G2-smoke: cross-platform, implemented.
+//   - G3-smoke: Linux-only (needs net.core.rmem_max=8MiB for QUIC
+//     DATAGRAM at 30k pps), pending.
+//   - G4 / G5: Linux-only (iptables -j DROP for forced path death),
+//     pending.
+//
+// Linux-only cases SKIP on non-Linux runners with a clear reason so
+// the gap is visible in reports.
 package tier2
 
 import (
 	"context"
+	"runtime"
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
-// Run records every T2 case as skipped until the chaos→smoke
-// migration commit lands.
-func Run(_ context.Context, suite *report.Suite, _ string) {
-	pending := []string{
-		"G1-smoke",
-		"G2-smoke",
-		"G3-smoke",
-		"G4",
-		"G5",
+// Run executes all T2 cases and records them on suite.
+func Run(ctx context.Context, suite *report.Suite, _ string) {
+	addRun(suite, "G1-smoke", "T2", func() smoke.Result {
+		return smoke.RunG1(ctx, smoke.G1Opts{})
+	})
+	addRun(suite, "G2-smoke", "T2", func() smoke.Result {
+		return smoke.RunG2(ctx, smoke.G2Opts{})
+	})
+
+	linuxPending := []string{"G3-smoke", "G4", "G5"}
+	for _, name := range linuxPending {
+		c := report.Case{Name: name, Tier: "T2"}
+		if runtime.GOOS != "linux" {
+			c.SkipReason = "Linux only (iptables / sysctl rmem_max)"
+		} else {
+			c.SkipReason = "T2 implementation pending (regression-suite §14 step 3)"
+		}
+		suite.Add(c)
 	}
-	for _, name := range pending {
-		suite.Add(report.Case{
-			Name:       name,
-			Tier:       "T2",
-			SkipReason: "T2 smoke migration pending (regression-suite §14 step 3)",
-			Duration:   0,
-		})
-	}
-	// Touch the time import to keep gofmt happy if we later use time
-	// without re-adding the import.
-	_ = time.Duration(0)
+}
+
+func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
+	start := time.Now()
+	r := fn()
+	suite.Add(report.Case{
+		Name:     name,
+		Tier:     tier,
+		Duration: r.Duration,
+		Failure:  r.Failure,
+	})
+	_ = start // start is captured inside fn via smoke; kept for symmetry if fn ignores time
 }
