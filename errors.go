@@ -19,6 +19,7 @@ var (
 	ErrMigrationBudgetExceeded = engine.ErrMigrationBudgetExceeded
 	ErrZombie                  = engine.ErrZombie
 	ErrPeerProtoVersion        = engine.ErrPeerProtoVersion
+	ErrLastPath                = engine.ErrLastPath
 
 	// ErrModeSwitchIllegal is returned by Conn.SetMode for transitions
 	// that the engine refuses (e.g. race -> bond).

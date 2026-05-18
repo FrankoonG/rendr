@@ -478,6 +478,38 @@ func (e *Engine) WalkPathsForTest(fn func(id uint32, pc interface{})) {
 	}
 }
 
+// RemovePath gracefully detaches path id from the engine. The
+// underlying socket is closed and a clean-close OnDeath fires, which
+// (since CauseCleanClose on a non-last path is a no-op) just drops
+// the slot from the path set. If id was the active path the engine
+// failovers to any other attached path before returning.
+//
+// Returns ErrLastPath if id is the only attached path; in that case
+// callers who want full teardown should call Close on the rendr.Conn
+// instead. Returns a generic "unknown path" error if id is not in
+// the engine's path set.
+func (e *Engine) RemovePath(id uint32) error {
+	e.pathsMu.Lock()
+	slot, ok := e.paths[id]
+	if !ok {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: remove unknown path %d", id)
+	}
+	if len(e.paths) <= 1 {
+		e.pathsMu.Unlock()
+		return ErrLastPath
+	}
+	e.pathsMu.Unlock()
+	// Close the socket so the per-path reader exits, then synthesise
+	// a clean-close OnDeath. We avoid relying on the transport's own
+	// OnDeath firing because some adapters (e.g. udpflow ServerPathConn)
+	// route death through the listener fanout and only emit it on
+	// hard transport errors, not on local close.
+	_ = slot.conn.Close()
+	e.onPathDeath(id, transport.CauseCleanClose, nil)
+	return nil
+}
+
 // ForceKillPathForTest is a backdoor for tests that need to simulate
 // a sudden network death on a specific attached path. It closes the
 // socket AND synthesises an onPathDeath(TransportError) so the

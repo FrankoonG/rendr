@@ -60,6 +60,14 @@ type AdminConn interface {
 	// to bring the path set back to its original cardinality.
 	AddPath(spec PathSpec) (uint32, error)
 
+	// RemovePath gracefully detaches the named path. If it is the
+	// active path, the engine first failovers to another attached
+	// path. Returns ErrLastPath if id is the only attached path;
+	// in that case callers who want full teardown should call Close.
+	// AddPath/RemovePath are the symmetric primitives for runtime
+	// path-set management; the engine itself never calls RemovePath.
+	RemovePath(pathID uint32) error
+
 	// State returns the bridge lifecycle stage as a short string:
 	// "init", "handshaking", "active", "migrating", "closing",
 	// "dead". Production monitoring uses this for a liveness

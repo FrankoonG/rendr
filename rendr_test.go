@@ -1343,6 +1343,175 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 	}
 }
 
+// TestAdminConnRemovePath: RemovePath drops a non-active path
+// without disrupting the stream, refuses to drop the only attached
+// path (ErrLastPath), and rejects unknown ids. If RemovePath drops
+// the active path it must failover before returning.
+func TestAdminConnRemovePath(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
+	}
+
+	adm := client.(AdminConn)
+
+	// 1. Drop a NON-active path. The active path's id is bc.ActivePath();
+	// pick any other.
+	var victim uint32
+	for _, p := range adm.Paths() {
+		if p.ID != adm.ActivePath() {
+			victim = p.ID
+			break
+		}
+	}
+	if victim == 0 {
+		t.Fatal("no non-active path to drop")
+	}
+	if err := adm.RemovePath(victim); err != nil {
+		t.Fatalf("RemovePath(victim): %v", err)
+	}
+	if got := len(adm.Paths()); got != 1 {
+		t.Fatalf("after RemovePath: paths=%d want 1", got)
+	}
+	// Stream is still healthy.
+	if _, err := client.Write([]byte("after-remove")); err != nil {
+		t.Fatalf("write after RemovePath: %v", err)
+	}
+	buf := make([]byte, len("after-remove"))
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatalf("server read after RemovePath: %v", err)
+	}
+	if string(buf) != "after-remove" {
+		t.Fatalf("payload mismatch after RemovePath: %q", buf)
+	}
+
+	// 2. Attempting to remove the only remaining path returns ErrLastPath.
+	onlyID := adm.ActivePath()
+	if err := adm.RemovePath(onlyID); !errors.Is(err, ErrLastPath) {
+		t.Fatalf("RemovePath last-path: got %v want ErrLastPath", err)
+	}
+	if got := len(adm.Paths()); got != 1 {
+		t.Fatalf("paths after rejected RemovePath: %d want 1", got)
+	}
+
+	// 3. Unknown id errors.
+	if err := adm.RemovePath(999999); err == nil {
+		t.Fatal("RemovePath(unknown): expected error, got nil")
+	}
+}
+
+// TestAdminConnRemoveActivePathFailovers: RemovePath on the active
+// path triggers automatic failover to a surviving path before
+// returning; the application Write/Read after the call must succeed.
+func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
+	}
+
+	adm := client.(AdminConn)
+	wasActive := adm.ActivePath()
+	if err := adm.RemovePath(wasActive); err != nil {
+		t.Fatalf("RemovePath(active): %v", err)
+	}
+	if adm.ActivePath() == 0 {
+		t.Fatal("active path is 0 after RemovePath; no failover")
+	}
+	if adm.ActivePath() == wasActive {
+		t.Fatalf("active path %d unchanged after RemovePath", wasActive)
+	}
+
+	payload := []byte("failover-write")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write post-failover: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("server read post-failover: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("post-failover payload: got %q want %q", got, payload)
+	}
+}
+
 // TestM7DedupWindowBoundedOnLoopback: race mode on loopback should
 // never grow the reorder buffer beyond a small number; on a fast
 // path-pair both copies of each frame arrive within microseconds,

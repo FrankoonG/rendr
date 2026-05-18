@@ -115,6 +115,11 @@ func (c *engineBackedConn) Stats() ConnStats {
 	}
 }
 
+// RemovePath gracefully detaches path id from the engine.
+func (c *engineBackedConn) RemovePath(id uint32) error {
+	return c.e.RemovePath(id)
+}
+
 // AddPath dials a path matching spec and attaches it to this
 // engine via BRIDGE_TAG. The new path joins the existing flow on
 // the server side without breaking the application's Conn.

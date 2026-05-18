@@ -10,4 +10,9 @@ var (
 	ErrMigrationBudgetExceeded = errors.New("rendr: migration budget exceeded")
 	ErrZombie                  = errors.New("rendr: zombie connection detected")
 	ErrPeerProtoVersion        = errors.New("rendr: incompatible protocol version")
+
+	// ErrLastPath is returned by RemovePath when the named path is
+	// the only attached path. Callers who want to fully tear down
+	// the connection should call Close instead.
+	ErrLastPath = errors.New("rendr: cannot remove the only attached path")
 )
