@@ -67,6 +67,19 @@ type Config struct {
 
 	// ProbeInterval: per-path RTT probe cadence. 0 = engine default 1s.
 	ProbeInterval time.Duration
+
+	// ZombieMaxMigrations: consecutive completed migrations with no
+	// payload between them before the engine declares the peer dead.
+	// 0 = engine default 2.
+	ZombieMaxMigrations int
+
+	// ZombieCooldown: zombie counter reset window. 0 = engine default 30s.
+	ZombieCooldown time.Duration
+
+	// BondStuckRTTMultiplier (bond only): a path whose RTT exceeds
+	// best_rtt * Multiplier is bypassed in bond round-robin.
+	// 0 = engine default 3.0.
+	BondStuckRTTMultiplier float64
 }
 
 // Validate runs cheap structural checks. Embedders should call this

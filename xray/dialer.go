@@ -42,21 +42,28 @@ func NewDialer(cfg *Config) (*Dialer, error) {
 // net.Destination at this point). For now it is ignored - the
 // destination is implicit in each PathSpec's Address.
 func (d *Dialer) DialContext(ctx context.Context, dest net.Addr) (net.Conn, error) {
+	return d.rendrDialer().Dial(ctx)
+}
+
+// rendrDialer packs the xray-side Config into a rendr.Dialer. Shared
+// by DialContext and DialPacketContext.
+func (d *Dialer) rendrDialer() *rendr.Dialer {
 	mode := rendr.Mode(d.cfg.Mode)
 	if mode == 0 {
 		mode = rendr.ModePrime
 	}
-
-	rd := &rendr.Dialer{
-		Mode:            mode,
-		Paths:           toPathSpecs(d.cfg.Paths),
-		Hysteresis:      d.cfg.Hysteresis,
-		Dwell:           d.cfg.Dwell,
-		Cooldown:        d.cfg.Cooldown,
-		MigrationBudget: d.cfg.MigrationBudget,
-		ProbeInterval:   d.cfg.ProbeInterval,
+	return &rendr.Dialer{
+		Mode:                   mode,
+		Paths:                  toPathSpecs(d.cfg.Paths),
+		Hysteresis:             d.cfg.Hysteresis,
+		Dwell:                  d.cfg.Dwell,
+		Cooldown:               d.cfg.Cooldown,
+		MigrationBudget:        d.cfg.MigrationBudget,
+		ProbeInterval:          d.cfg.ProbeInterval,
+		ZombieMaxMigrations:    d.cfg.ZombieMaxMigrations,
+		ZombieCooldown:         d.cfg.ZombieCooldown,
+		BondStuckRTTMultiplier: d.cfg.BondStuckRTTMultiplier,
 	}
-	return rd.Dial(ctx)
 }
 
 // DialPacketContext mirrors DialContext but produces a net.PacketConn
@@ -69,21 +76,7 @@ func (d *Dialer) DialContext(ctx context.Context, dest net.Addr) (net.Conn, erro
 // xray.ListenUDPFlow / rendr.ListenUDPFlowPacket). Stream-mode
 // listeners reject this dial with a HELLO-caps mismatch.
 func (d *Dialer) DialPacketContext(ctx context.Context, dest net.Addr) (net.PacketConn, error) {
-	mode := rendr.Mode(d.cfg.Mode)
-	if mode == 0 {
-		mode = rendr.ModePrime
-	}
-
-	rd := &rendr.Dialer{
-		Mode:            mode,
-		Paths:           toPathSpecs(d.cfg.Paths),
-		Hysteresis:      d.cfg.Hysteresis,
-		Dwell:           d.cfg.Dwell,
-		Cooldown:        d.cfg.Cooldown,
-		MigrationBudget: d.cfg.MigrationBudget,
-		ProbeInterval:   d.cfg.ProbeInterval,
-	}
-	return rd.DialPacket(ctx)
+	return d.rendrDialer().DialPacket(ctx)
 }
 
 // toPathSpecs converts the xray-side Config.PathSpec into the
