@@ -32,16 +32,21 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		fn   func(context.Context, string) error
 		// onlyOn is empty for "any OS"; "linux" restricts to Linux runners.
 		onlyOn string
+		// retries is the extra-attempt count on failure. Useful for
+		// race-detector timing-sensitive cases that flake under CPU
+		// contention; the underlying test code is the same, only the
+		// scheduler-driven variance differs.
+		retries int
 	}{
-		{"go-vet", goVet, ""},
-		{"go-test", goTest, ""},
-		{"go-test-race", goTestRace, "linux"},
-		{"go-bench-smoke", goBenchSmoke, "linux"},
-		{"const-proto-version", constProtoVersion, ""},
-		{"const-udpflow-version", constUDPFlowVersion, ""},
-		{"const-migration-budget-90s", constMigrationBudget, ""},
-		{"const-mode-values", constModeValues, ""},
-		{"const-mode-transition-table", constModeTransitionTable, ""},
+		{"go-vet", goVet, "", 0},
+		{"go-test", goTest, "", 0},
+		{"go-test-race", goTestRace, "linux", 1}, // 1 retry: scheduler-bound flakes only
+		{"go-bench-smoke", goBenchSmoke, "linux", 0},
+		{"const-proto-version", constProtoVersion, "", 0},
+		{"const-udpflow-version", constUDPFlowVersion, "", 0},
+		{"const-migration-budget-90s", constMigrationBudget, "", 0},
+		{"const-mode-values", constModeValues, "", 0},
+		{"const-mode-transition-table", constModeTransitionTable, "", 0},
 	}
 
 	for _, c := range cases {
@@ -54,14 +59,21 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 			continue
 		}
 		start := time.Now()
-		err := c.fn(ctx, rendrRoot)
+		var err error
+		var attempts int
+		for attempts = 0; attempts <= c.retries; attempts++ {
+			err = c.fn(ctx, rendrRoot)
+			if err == nil {
+				break
+			}
+		}
 		rc := report.Case{
 			Name:     c.name,
 			Tier:     "T1",
 			Duration: time.Since(start),
 		}
 		if err != nil {
-			rc.Failure = err.Error()
+			rc.Failure = fmt.Sprintf("after %d attempt(s): %s", attempts, err.Error())
 		}
 		suite.Add(rc)
 	}

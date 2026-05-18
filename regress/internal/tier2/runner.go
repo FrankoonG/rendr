@@ -28,15 +28,17 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		return smoke.RunG2(ctx, smoke.G2Opts{})
 	})
 
-	// G3-smoke: QUIC DATAGRAM 30k pps + ConnID migration. Pending
-	// implementation. On Linux the future call site will be
-	// smoke.RunG3(...); for now SKIP so phase 1 isn't gated on it.
-	g3Skip := "implementation pending (regression-suite §14 step 7 equivalent for smoke; validate on Linux test host)"
-	if runtime.GOOS != "linux" {
-		g3Skip = "Linux only (sysctl net.core.rmem_max for 30k pps QUIC DATAGRAM) — " + g3Skip
+	if runtime.GOOS == "linux" {
+		addRun(suite, "G3-smoke", "T2", func() smoke.Result {
+			return smoke.RunG3(ctx, smoke.G3Opts{})
+		})
+	} else {
+		suite.Add(report.Case{
+			Name:       "G3-smoke",
+			Tier:       "T2",
+			SkipReason: "Linux only (sysctl net.core.rmem_max=8MiB for 30k pps QUIC DATAGRAM)",
+		})
 	}
-	suite.Add(report.Case{Name: "G3-smoke", Tier: "T2", SkipReason: g3Skip})
-	_ = smoke.G3Opts{} // keep the type referenced for the next commit
 
 	addRun(suite, "G4", "T2", func() smoke.Result {
 		return smoke.RunG4(ctx, smoke.G4Opts{})

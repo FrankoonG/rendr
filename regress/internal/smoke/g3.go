@@ -2,22 +2,36 @@ package smoke
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"sort"
+	"sync/atomic"
 	"time"
+
+	"github.com/FrankoonG/rendr"
 )
 
-// G3Opts configures one G3-smoke case (QUIC DATAGRAM 30k pps + ConnID
-// migration). Defaults match docs/regression-suite.md §6.
+// G3Opts configures one G3-smoke case (QUIC DATAGRAM at high pps +
+// ConnID migrations). Defaults match docs/regression-suite.md §6:
+// 30k pps × ~6s with ≥3 migrations. Needs Linux + sysctl
+// net.core.rmem_max=8MiB; the tier2 dispatch already SKIPs on
+// non-Linux.
 type G3Opts struct {
-	Duration   time.Duration // default 10s
+	Duration   time.Duration // default 6s
 	PPS        int           // default 30000
-	PayloadLen int           // default 1024
+	PayloadLen int           // default 1024 bytes (sub-MTU; rendr adds 8B flow-id)
 	Migrations int           // default 3
+	Paths      int           // default 4 (bond mode for pps headroom)
+	// P95CeilingMs caps the recv-time-after-send histogram. Default
+	// 50ms — generous for loopback bond. Phase-1 smoke; T4 tightens.
+	P95CeilingMs int
+	// LossPct allows N% application loss; default 0 (strict).
+	LossPct float64
 }
 
 func (o *G3Opts) withDefaults() {
 	if o.Duration <= 0 {
-		o.Duration = 10 * time.Second
+		o.Duration = 6 * time.Second
 	}
 	if o.PPS <= 0 {
 		o.PPS = 30000
@@ -31,18 +45,239 @@ func (o *G3Opts) withDefaults() {
 	if o.Migrations == 0 {
 		o.Migrations = 3
 	}
+	if o.Paths < 1 {
+		o.Paths = 4
+	}
+	if o.P95CeilingMs <= 0 {
+		o.P95CeilingMs = 50
+	}
+	if o.LossPct < 0 {
+		o.LossPct = 0
+	}
 }
 
-// RunG3 is the QUIC DATAGRAM packet-mode smoke. Implementation lands
-// in a follow-up commit on the Linux test host; current state is a
-// gated stub that fails noisily so we can't accidentally ship a
-// silent skip from a Linux runner.
-func RunG3(_ context.Context, opts G3Opts) Result {
+// RunG3 drives one G3-smoke case end-to-end. The wire shape is
+// rendr packet-mode over QUIC DATAGRAM paths (multi-path bond),
+// each application packet = 8B seq prefix + payload. Asserts:
+//   - application-visible loss ≤ LossPct (default 0)
+//   - P95 (recv-time - send-time) under ceiling (default 50ms)
+//   - MigrationCount() ≥ Migrations
+//
+// Detail keys:
+//
+//	pps_sent          float64
+//	pps_received      float64
+//	sent              int64
+//	received          int64
+//	loss_pct          float64
+//	migrations        uint64
+//	p50_ms            float64
+//	p95_ms            float64
+//	p99_ms            float64
+//	max_ms            float64
+func RunG3(ctx context.Context, opts G3Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
-	return Result{
-		Name:     fmt.Sprintf("G3-smoke (%d pps, %s, %d migrations)", opts.PPS, opts.Duration, opts.Migrations),
-		Duration: time.Since(t0),
-		Failure:  "G3-smoke implementation pending (Linux host validation; regression-suite §14 step 7-equivalent for smoke)",
+	name := fmt.Sprintf("G3-smoke (%d pps, %s, %d paths bond, %d migrations)",
+		opts.PPS, opts.Duration, opts.Paths, opts.Migrations)
+
+	ln, err := rendr.ListenQUICDatagram("127.0.0.1:0", nil)
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("ListenQUICDatagram: %w", err))
 	}
+	defer ln.Close()
+
+	accepted := make(chan rendr.PacketConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(actx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	specs := make([]rendr.PathSpec, opts.Paths)
+	for i := range specs {
+		specs[i] = rendr.PathSpec{
+			Transport: "quic",
+			Address:   ln.Addr().String(),
+			Opts:      map[string]string{"mode": "datagram"},
+		}
+	}
+	client, err := (&rendr.Dialer{Mode: rendr.ModeBond, Paths: specs}).DialPacket(ctx)
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("DialPacket: %w", err))
+	}
+	defer client.Close()
+
+	var server rendr.PacketConn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		return FromError(name, time.Since(t0), fmt.Errorf("accept: %w", err))
+	case <-time.After(15 * time.Second):
+		return FromError(name, time.Since(t0), fmt.Errorf("accept timeout"))
+	}
+	defer server.Close()
+
+	// Wait for all paths to attach.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= opts.Paths && len(server.Paths()) >= opts.Paths {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	admin, ok := client.(rendr.AdminPacketConn)
+	if !ok {
+		return FromError(name, time.Since(t0), fmt.Errorf("client is not rendr.AdminPacketConn"))
+	}
+
+	// Server receiver: collect (seq, recv_ns) until either client
+	// signals done or duration deadline expires.
+	type rxRec struct {
+		seq      uint64
+		latencyN int64
+	}
+	recvCh := make(chan rxRec, opts.PPS*2)
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		buf := make([]byte, opts.PayloadLen+8)
+		readDeadline := time.Now().Add(opts.Duration + 5*time.Second)
+		_ = server.SetReadDeadline(readDeadline)
+		for {
+			n, _, err := server.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 16 {
+				continue
+			}
+			seq := binary.BigEndian.Uint64(buf[:8])
+			sentNs := int64(binary.BigEndian.Uint64(buf[8:16]))
+			recvCh <- rxRec{seq: seq, latencyN: time.Now().UnixNano() - sentNs}
+		}
+	}()
+
+	// Migration scheduler: trigger Migrations spread evenly.
+	migInterval := opts.Duration / time.Duration(opts.Migrations+1)
+	migTicker := time.NewTicker(migInterval)
+	defer migTicker.Stop()
+
+	// Sender: paced loop.
+	pktInterval := time.Second / time.Duration(opts.PPS)
+	payload := make([]byte, opts.PayloadLen)
+	pkt := make([]byte, opts.PayloadLen+8)
+	copy(pkt[16:], payload[8:]) // keep 16B header (seq + send_ns), rest payload
+
+	var sent int64
+	startMig := admin.MigrationCount()
+	endAt := time.Now().Add(opts.Duration)
+	nextTick := time.Now()
+
+	for time.Now().Before(endAt) {
+		select {
+		case <-migTicker.C:
+			cur := admin.ActivePath()
+			for _, p := range client.Paths() {
+				if p.ID != cur {
+					_ = admin.Migrate(p.ID)
+					break
+				}
+			}
+		default:
+		}
+		now := time.Now()
+		if now.Before(nextTick) {
+			time.Sleep(nextTick.Sub(now))
+		}
+		nextTick = nextTick.Add(pktInterval)
+		binary.BigEndian.PutUint64(pkt[:8], uint64(sent))
+		binary.BigEndian.PutUint64(pkt[8:16], uint64(time.Now().UnixNano()))
+		if _, err := client.WriteTo(pkt, nil); err != nil {
+			// Buffer exhausted on the sender side or socket gone.
+			// Treat as test failure since the contract says no
+			// application-visible error during migration.
+			return FromError(name, time.Since(t0), fmt.Errorf("WriteTo at seq %d: %w", sent, err))
+		}
+		atomic.AddInt64(&sent, 1)
+	}
+
+	// Give receiver a moment to drain in-flight datagrams.
+	time.Sleep(500 * time.Millisecond)
+	_ = server.SetReadDeadline(time.Now())
+	<-recvDone
+	close(recvCh)
+
+	received := map[uint64]struct{}{}
+	latNs := make([]int64, 0, int(sent))
+	for r := range recvCh {
+		received[r.seq] = struct{}{}
+		latNs = append(latNs, r.latencyN)
+	}
+	dur := time.Since(t0)
+	lost := int64(0)
+	for s := int64(0); s < sent; s++ {
+		if _, ok := received[uint64(s)]; !ok {
+			lost++
+		}
+	}
+	lossPct := float64(lost) / float64(sent) * 100
+
+	sort.Slice(latNs, func(i, j int) bool { return latNs[i] < latNs[j] })
+	idx := func(p int) int64 {
+		if len(latNs) == 0 {
+			return 0
+		}
+		i := len(latNs) * p / 100
+		if i >= len(latNs) {
+			i = len(latNs) - 1
+		}
+		return latNs[i]
+	}
+	p50 := idx(50)
+	p95 := idx(95)
+	p99 := idx(99)
+	maxN := int64(0)
+	if len(latNs) > 0 {
+		maxN = latNs[len(latNs)-1]
+	}
+	migrations := admin.MigrationCount() - startMig
+
+	r := Result{
+		Name:     name,
+		Duration: dur,
+		Detail: map[string]any{
+			"pps_sent":     float64(sent) / dur.Seconds(),
+			"pps_received": float64(len(received)) / dur.Seconds(),
+			"sent":         sent,
+			"received":     int64(len(received)),
+			"loss_pct":     lossPct,
+			"migrations":   migrations,
+			"p50_ms":       float64(p50) / float64(time.Millisecond),
+			"p95_ms":       float64(p95) / float64(time.Millisecond),
+			"p99_ms":       float64(p99) / float64(time.Millisecond),
+			"max_ms":       float64(maxN) / float64(time.Millisecond),
+		},
+	}
+	if lossPct > opts.LossPct {
+		r.Failure = fmt.Sprintf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.LossPct)
+		return r
+	}
+	if int(p95/int64(time.Millisecond)) > opts.P95CeilingMs {
+		r.Failure = fmt.Sprintf("P95 %.1fms exceeds ceiling %dms",
+			float64(p95)/float64(time.Millisecond), opts.P95CeilingMs)
+		return r
+	}
+	if opts.Migrations > 0 && migrations < uint64(opts.Migrations) {
+		r.Failure = fmt.Sprintf("MigrationCount=%d, want >= %d", migrations, opts.Migrations)
+		return r
+	}
+	return r
 }
