@@ -72,6 +72,13 @@ type Engine struct {
 	expectedRecvSeq uint64
 	recvDeliver     []byte // pending bytes for the next Read
 
+	// recvQueueHWM is the maximum size the reorder buffer reached
+	// during this Conn's lifetime. Exposed for diagnostics so race-
+	// mode chaos / bond tests can spot 'dedup window overflow' that
+	// docs/modes.md flags as a hard race-mode bug. Pure observer;
+	// the engine does not act on it.
+	recvQueueHWM int
+
 	// Zombie state. The counter decrements on each migration that
 	// completes (death -> new active path) and resets on payload
 	// arrival OR if the cooldown window has elapsed since the last
@@ -429,6 +436,23 @@ func (e *Engine) CloseErr() error {
 // Closed returns a channel that is closed when the engine has fully
 // shut down. Useful for downstream cleanup goroutines.
 func (e *Engine) Closed() <-chan struct{} { return e.closed }
+
+// RecvQueueHighWaterMark returns the maximum reorder-buffer size
+// the engine has ever observed for this Conn. Useful for race-mode
+// chaos to verify the dedup window does not grow without bound
+// when paths have RTT skew.
+func (e *Engine) RecvQueueHighWaterMark() int {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	return e.recvQueueHWM
+}
+
+// RecvQueueLen returns the current reorder-buffer size.
+func (e *Engine) RecvQueueLen() int {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	return len(e.recvQueue)
+}
 
 // WalkPathsForTest invokes fn for every attached path. fn receives
 // the path id and the underlying PathConn as a bare any so tests can

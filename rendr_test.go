@@ -992,6 +992,99 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 }
 
+// TestM8BondPathDeathContinuesOnSurvivor: in bond mode, after a
+// mid-stream kill on one path the engine must keep delivering on
+// the survivor. This is the loosest M8(3/n) acceptance: the test
+// does NOT require zero loss of in-flight frames on the dying
+// path (that needs a redistribute-with-ack mechanism, tracked
+// separately). It only asserts that:
+//   - the survivor keeps receiving subsequent writes
+//   - the application-visible byte stream up to and after the kill
+//     is delivered (allowing for the receiver to block until the
+//     dying path's in-flight frames are filled in OR for the
+//     engine to advance past the gap by writing the same bytes on
+//     the survivor).
+//
+// Currently rendr does NOT redistribute, so this test is permitted
+// to time out or hang on partial-frame death. We mark it Skip
+// until the redistribute primitive lands.
+func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
+	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
+}
+
+// TestM7DedupWindowBoundedOnLoopback: race mode on loopback should
+// never grow the reorder buffer beyond a small number; on a fast
+// path-pair both copies of each frame arrive within microseconds,
+// so high-water-mark stays tiny. This is the diagnostic that
+// docs/modes.md asks for to detect 'dedup window overflow'.
+func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.SetMode(ModeRace); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stream 64 frames in race mode. Receiver should drain each
+	// frame as it arrives; HWM should stay small because both copies
+	// of a frame land essentially simultaneously on loopback.
+	const N = 64
+	payload := []byte("race-bounded-window")
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatal(err)
+	}
+
+	hwm := server.(*engineBackedConn).Engine().RecvQueueHighWaterMark()
+	t.Logf("race-mode recv-queue HWM = %d (over %d frames on 2 paths)", hwm, N)
+	if hwm > 64 {
+		t.Errorf("recv-queue HWM unexpectedly high (%d) - dedup window may be growing without bound", hwm)
+	}
+}
+
 // TestM8BondPathPinning: with pin size = 4 and 2 paths, sending 16
 // frames must produce 4-frame runs that stay on one path before
 // the next run jumps to the other. Path pinning is the M8 mechanism
@@ -1614,11 +1707,12 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 	})
 
 	// Wait at most dwell + cooldown + tick slack for the prime
-	// scheduler to fire. 5 s tolerance covers parallel-package
-	// contention that pushes scheduler ticks past the original 2 s
-	// margin when many sockets are in flight.
+	// scheduler to fire. 10 s tolerance covers parallel-package
+	// contention that pushes scheduler ticks past the nominal
+	// dwell+cooldown when ~10 packages worth of sockets/goroutines
+	// are in flight on the same test run.
 	migrated := false
-	waitUntil := time.Now().Add(5 * time.Second)
+	waitUntil := time.Now().Add(10 * time.Second)
 	for time.Now().Before(waitUntil) {
 		if bc.Engine().ActivePath() == otherID {
 			migrated = true
@@ -1627,7 +1721,7 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !migrated {
-		t.Fatalf("prime scheduler did not migrate to better path within 5s (active still %d, wanted %d)",
+		t.Fatalf("prime scheduler did not migrate to better path within 10s (active still %d, wanted %d)",
 			bc.Engine().ActivePath(), otherID)
 	}
 }

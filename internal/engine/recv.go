@@ -176,6 +176,9 @@ func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {
 		flags:   hdr.Flags,
 		payload: payload,
 	}
+	if n := len(e.recvQueue); n > e.recvQueueHWM {
+		e.recvQueueHWM = n
+	}
 
 	wokeReader := false
 	for {
