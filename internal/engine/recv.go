@@ -168,6 +168,14 @@ func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {
 
 	if hdr.Seq < e.expectedRecvSeq {
 		// Duplicate (race / redistribute) or out-of-window.
+		e.recvDups++
+		return
+	}
+
+	if _, exists := e.recvQueue[hdr.Seq]; exists {
+		// Same SEQ already buffered (race-mode in-flight duplicate):
+		// keep the first copy, count the second.
+		e.recvDups++
 		return
 	}
 

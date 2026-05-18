@@ -81,6 +81,13 @@ type AdminConn interface {
 	// dashboards consult to spot it.
 	RecvQueueHWM() int
 
+	// RecvDups returns the cumulative count of frames whose SEQ
+	// had already been delivered (or was already buffered in the
+	// reorder window). For race mode this is the duplicate-frames-
+	// reaped counter; for any mode it surfaces accidental
+	// retransmits.
+	RecvDups() uint64
+
 	// Mode returns the current operational mode (prime/race/bond).
 	// Symmetric counterpart to SetMode; lets callers verify a
 	// mode transition succeeded.
@@ -105,4 +112,5 @@ type ConnStats struct {
 	ActivePath   uint32
 	Paths        []PathInfo
 	RecvQueueHWM int
+	RecvDups     uint64
 }

@@ -98,6 +98,9 @@ func (c *engineBackedConn) State() string { return c.e.State().String() }
 // RecvQueueHWM returns the reorder-buffer high-water mark.
 func (c *engineBackedConn) RecvQueueHWM() int { return c.e.RecvQueueHighWaterMark() }
 
+// RecvDups returns the cumulative count of duplicate frames reaped.
+func (c *engineBackedConn) RecvDups() uint64 { return c.e.RecvDups() }
+
 // Mode returns the current operational mode.
 func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 
@@ -112,6 +115,7 @@ func (c *engineBackedConn) Stats() ConnStats {
 		ActivePath:   c.e.ActivePath(),
 		Paths:        c.e.Paths(),
 		RecvQueueHWM: c.e.RecvQueueHighWaterMark(),
+		RecvDups:     c.e.RecvDups(),
 	}
 }
 

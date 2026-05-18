@@ -1583,6 +1583,21 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	if hwm > 64 {
 		t.Errorf("recv-queue HWM unexpectedly high (%d) - dedup window may be growing without bound", hwm)
 	}
+
+	// Race emits ONE frame per Write per attached path; the receiver
+	// keeps the first copy and tallies the rest as RecvDups. With 2
+	// paths and N application writes, the dup count must be >= N
+	// (the second copy of every data frame). Drain via the public
+	// AdminConn surface to catch breakage in the wiring.
+	srvAdm := server.(AdminConn)
+	dups := srvAdm.RecvDups()
+	t.Logf("race-mode RecvDups = %d (over %d frames on 2 paths)", dups, N)
+	if dups < uint64(N) {
+		t.Errorf("RecvDups=%d < N=%d: race-mode dedup not counted", dups, N)
+	}
+	if got := srvAdm.Stats().RecvDups; got != dups {
+		t.Errorf("Stats().RecvDups=%d disagrees with RecvDups()=%d", got, dups)
+	}
 }
 
 // TestM8BondPathPinning: with pin size = 4 and 2 paths, sending 16

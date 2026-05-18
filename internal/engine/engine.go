@@ -79,6 +79,12 @@ type Engine struct {
 	// the engine does not act on it.
 	recvQueueHWM int
 
+	// recvDups counts incoming frames whose SEQ has already been
+	// delivered (race-mode duplicates, retransmits-on-redistribute).
+	// Pure observability hook so users can verify race is actually
+	// reaping duplicates rather than racing one path only.
+	recvDups uint64
+
 	// Zombie state. The counter decrements on each migration that
 	// completes (death -> new active path) and resets on payload
 	// arrival OR if the cooldown window has elapsed since the last
@@ -464,6 +470,16 @@ func (e *Engine) RecvQueueLen() int {
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
 	return len(e.recvQueue)
+}
+
+// RecvDups returns the cumulative count of incoming frames whose
+// SEQ had already been delivered (or was already in the reorder
+// buffer). For race mode this is the duplicate-frames-reaped
+// counter; for any mode it surfaces accidental retransmits.
+func (e *Engine) RecvDups() uint64 {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	return e.recvDups
 }
 
 // WalkPathsForTest invokes fn for every attached path. fn receives
