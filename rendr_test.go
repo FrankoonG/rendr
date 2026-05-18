@@ -1646,6 +1646,126 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 	}
 }
 
+// TestM8BondSkipsStuckPath: bond mode must not round-robin frames
+// onto a path whose latest probe RTT is >= BondStuckRTTMultiplier x
+// the best path's RTT. Without this, a single slow path balloons
+// the receiver's reorder window and tanks effective bond bandwidth.
+//
+// We synthesise the RTT skew by injecting fake quality readings
+// via Engine.SetPathQualityForTest (real probes won't have measured
+// loopback paths as 100ms apart). The test then writes N data
+// frames and checks that the stuck path absorbed zero of them.
+func TestM8BondSkipsStuckPath(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	type pp struct {
+		id     uint32
+		writer interface{ Writes() uint64 }
+		base   uint64
+	}
+	var probes []pp
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pp{id: id, writer: w})
+		}
+	})
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+	// Inject quality: probes[0]=1ms (fast), probes[1]=100ms (stuck @ 100x).
+	bc.Engine().SetPathQualityForTest(probes[0].id, transport.PathQuality{
+		RTT: 1 * time.Millisecond,
+	})
+	bc.Engine().SetPathQualityForTest(probes[1].id, transport.PathQuality{
+		RTT: 100 * time.Millisecond,
+	})
+
+	// Capture baseline Writes() AFTER injection so any prior probe /
+	// ctrl traffic does not count against us. Pin size doesn't matter
+	// here: stuck-skip should bypass the slow path regardless.
+	for i := range probes {
+		probes[i].base = probes[i].writer.Writes()
+	}
+
+	if err := client.SetMode(ModeBond); err != nil {
+		t.Fatalf("SetMode(bond): %v", err)
+	}
+
+	const N = 20
+	payload := []byte("stuckpath")
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatalf("server drain: %v", err)
+	}
+	if !bytes.Equal(rxbuf, bytes.Repeat(payload, N)) {
+		t.Fatalf("byte-stream mismatch under bond+stuck-skip")
+	}
+
+	fastDelta := probes[0].writer.Writes() - probes[0].base
+	stuckDelta := probes[1].writer.Writes() - probes[1].base
+	t.Logf("fast path %d writes; stuck path %d writes", fastDelta, stuckDelta)
+
+	if fastDelta < N {
+		t.Fatalf("fast path absorbed %d writes; expected >= %d (all data + ctrl)",
+			fastDelta, N)
+	}
+	// Stuck path must absorb zero DATA frames. We allow up to 2 ctrl
+	// frames as noise (one MIGRATE_NOTIFY from a hypothetical prior
+	// migration; nothing else is expected to slip through).
+	if stuckDelta > 2 {
+		t.Fatalf("stuck path absorbed %d writes; expected <= 2", stuckDelta)
+	}
+}
+
 // TestM5UDPFlowPlannedMigration: 2 udpflow paths, hot-swap active
 // path via engine.Migrate mid-stream. Confirms M5 paths plug into
 // the same engine migration primitive that TCP / QUIC use.

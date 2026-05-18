@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
@@ -164,9 +165,15 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // before bondCursor advances. This bounds reorder-window growth
 // under RTT skew between paths (docs/modes.md "path pinning").
 //
-// Minimum-viable: deterministic id-sorted round-robin, no weighted
-// distribution, no stuck-path bypass, no redistribute-on-death.
-// Those are M8(3..n) follow-ups.
+// A path whose latest probe RTT exceeds best_rtt *
+// BondStuckRTTMultiplier (default 3x) is skipped on round-robin;
+// if the currently-pinned path goes stuck mid-window, the pin is
+// broken early and the cursor advances. Paths with zero RTT
+// (unmeasured: fresh attach, no probe reply yet) are never
+// considered stuck.
+//
+// Still TODO at M8: weighted distribution by capacity and
+// redistribute-on-death (the latter requires an ACK protocol).
 func (e *Engine) dispatchBond(frame []byte) error {
 	for {
 		if e.isClosed() {
@@ -185,27 +192,46 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		for id := range e.paths {
 			ids = append(ids, id)
 		}
-		// Insertion sort on small N - cheaper than sort.Slice for
-		// the typical <= 8 paths bond cares about.
 		for i := 1; i < len(ids); i++ {
 			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
 				ids[j-1], ids[j] = ids[j], ids[j-1]
 			}
 		}
-		// Refill the pin window when it runs out, then advance the
-		// cursor. Cursor advances on the FIRST frame of a window,
-		// not in the middle, so all frames in a window land on the
-		// same path id.
-		if e.bondPinLeft <= 0 {
+		stuck := e.computeBondStuckMask(ids)
+
+		// If pin window still has frames AND current path is not
+		// stuck, keep using it.
+		idx := -1
+		if e.bondPinLeft > 0 {
+			cur := int(e.bondCursor % uint64(len(ids)))
+			if !stuck[cur] {
+				idx = cur
+			}
+		}
+		if idx < 0 {
+			// Pin expired OR current went stuck. Advance until we
+			// land on a non-stuck path, or give up after one full
+			// rotation (all paths stuck).
 			pin := e.bondPinSize
 			if pin <= 0 {
 				pin = defaultBondPinSize
 			}
+			chosen := -1
+			for i := 0; i < len(ids); i++ {
+				e.bondCursor++
+				j := int(e.bondCursor % uint64(len(ids)))
+				if !stuck[j] {
+					chosen = j
+					break
+				}
+			}
+			if chosen < 0 {
+				chosen = int(e.bondCursor % uint64(len(ids)))
+			}
+			idx = chosen
 			e.bondPinLeft = pin
-			e.bondCursor++
 		}
 		e.bondPinLeft--
-		idx := int(e.bondCursor % uint64(len(ids)))
 		pc := e.paths[ids[idx]].conn
 		e.pathsMu.Unlock()
 
@@ -218,6 +244,40 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		}
 		return nil
 	}
+}
+
+// computeBondStuckMask returns, for each id in ids (in order), true
+// if that path's latest probe RTT exceeds best_rtt * multiplier.
+// Caller must hold e.pathsMu in read or write mode.
+//
+// Paths with zero RTT (no probe reply yet) are never stuck; if no
+// path has any positive RTT reading the mask is all-false.
+func (e *Engine) computeBondStuckMask(ids []uint32) []bool {
+	mask := make([]bool, len(ids))
+	var best time.Duration
+	rtts := make([]time.Duration, len(ids))
+	for i, id := range ids {
+		if s, ok := e.paths[id]; ok {
+			rtts[i] = s.conn.Quality().RTT
+			if rtts[i] > 0 && (best == 0 || rtts[i] < best) {
+				best = rtts[i]
+			}
+		}
+	}
+	if best == 0 {
+		return mask
+	}
+	mult := e.limits.BondStuckRTTMultiplier
+	if mult <= 1.0 {
+		mult = 3.0
+	}
+	threshold := time.Duration(float64(best) * mult)
+	for i, r := range rtts {
+		if r > 0 && r > threshold {
+			mask[i] = true
+		}
+	}
+	return mask
 }
 
 // dispatchRace writes the same frame on every attached path.

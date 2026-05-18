@@ -66,6 +66,13 @@ type Limits struct {
 	// PrimeCooldown: minimum gap between two successive prime-mode
 	// migrations regardless of score. Default 30s.
 	PrimeCooldown time.Duration
+
+	// BondStuckRTTMultiplier: in bond mode, a path whose latest
+	// probe-measured RTT exceeds best_path_rtt * Multiplier is
+	// skipped on round-robin to keep its slow frames from inflating
+	// the receiver's reorder window. Default 3.0. A path with zero
+	// RTT reading (unmeasured) is never considered stuck.
+	BondStuckRTTMultiplier float64
 }
 
 // DefaultLimits returns the project-mandated default limits.
@@ -75,9 +82,10 @@ func DefaultLimits() Limits {
 		MigrationBudget:     90 * time.Second,
 		ZombieMaxMigrations: 2,
 		ZombieCooldown:      30 * time.Second,
-		PrimeHysteresis:     0.25,
-		PrimeDwell:          5 * time.Second,
-		PrimeCooldown:       30 * time.Second,
+		PrimeHysteresis:        0.25,
+		PrimeDwell:             5 * time.Second,
+		PrimeCooldown:          30 * time.Second,
+		BondStuckRTTMultiplier: 3.0,
 	}
 }
 
@@ -105,6 +113,9 @@ func (l Limits) Clamp() Limits {
 	}
 	if l.PrimeCooldown <= 0 {
 		l.PrimeCooldown = def.PrimeCooldown
+	}
+	if l.BondStuckRTTMultiplier <= 1.0 {
+		l.BondStuckRTTMultiplier = def.BondStuckRTTMultiplier
 	}
 	return l
 }
