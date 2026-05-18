@@ -149,6 +149,11 @@ type pathSlot struct {
 	// path under recvMu, but readers via Paths() may run concurrently.
 	recvDups atomic.Uint64
 
+	// lastRecvUnixNano is the most recent wall-clock instant
+	// (UnixNano) at which a frame was received on this path. Zero
+	// before the first frame. Atomic for the same reason as recvDups.
+	lastRecvUnixNano atomic.Int64
+
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits
@@ -342,6 +347,9 @@ func (e *Engine) Paths() []transport.PathInfo {
 			pi.Writes = rw.Writes()
 		}
 		pi.RecvDups = s.recvDups.Load()
+		if ns := s.lastRecvUnixNano.Load(); ns > 0 {
+			pi.LastRecvAt = time.Unix(0, ns)
+		}
 		out = append(out, pi)
 	}
 	return out

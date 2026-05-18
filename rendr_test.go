@@ -117,6 +117,66 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 	}
 }
 
+// TestPathInfoLastRecvAt: after a round-trip, the server's PathInfo
+// must show LastRecvAt set to roughly "now". Validates the timestamp
+// is wired up so monitoring can distinguish probe-fresh paths from
+// genuinely-idle paths under NAT-keepalive scenarios.
+func TestPathInfoLastRecvAt(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Pre-traffic the server's path may have already received HELLO,
+	// so LastRecvAt is likely already set. Snapshot it.
+	before := server.Paths()[0].LastRecvAt
+
+	// Drive a fresh data frame.
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+
+	after := server.Paths()[0].LastRecvAt
+	if after.IsZero() {
+		t.Fatal("LastRecvAt zero after data frame")
+	}
+	if !after.After(before) && !before.IsZero() {
+		t.Errorf("LastRecvAt did not advance: before=%s after=%s", before, after)
+	}
+	if age := time.Since(after); age > 5*time.Second {
+		t.Errorf("LastRecvAt stale: age=%s", age)
+	}
+}
+
 // TestDialerCustomLimitsApplied: setting ZombieMaxMigrations on the
 // Dialer must reach the engine. We construct a Dialer with the
 // minimum-zombie value (1) and run a single death-driven failover;

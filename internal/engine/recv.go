@@ -96,6 +96,10 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		if err != nil {
 			return
 		}
+		// Stamp last-recv after a successful read but before any
+		// version / framing rejection: from the path's perspective,
+		// "something arrived" is the signal monitoring cares about.
+		slot.lastRecvUnixNano.Store(nowFn().UnixNano())
 		if n < proto.HeaderSize {
 			return
 		}

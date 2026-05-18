@@ -40,6 +40,13 @@ type PathInfo struct {
 	// delivered or buffered (race-mode duplicates, accidental
 	// retransmits). Sum across all paths equals ConnStats.RecvDups.
 	RecvDups uint64
+	// LastRecvAt is the wall-clock time at which a frame was last
+	// successfully received on this path (any type: data, ctrl,
+	// probe). Zero if no frame has arrived. Distinct from
+	// Quality.At which only updates on probe replies; LastRecvAt
+	// surfaces "path is genuinely idle" as opposed to "probe-fresh
+	// but no traffic" so monitoring can flag NAT keepalive timeouts.
+	LastRecvAt time.Time
 }
 
 // PathQuality is the most recent measurement of one path.
