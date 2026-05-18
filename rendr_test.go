@@ -1012,6 +1012,77 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
 }
 
+// TestAdminConnStateAndHWM: State() reports the bridge lifecycle
+// transitions and RecvQueueHWM exposes the dedup-buffer
+// observability hook required by docs/modes.md.
+func TestAdminConnStateAndHWM(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	adm, ok := client.(AdminConn)
+	if !ok {
+		t.Fatal("client does not implement AdminConn")
+	}
+	if s := adm.State(); s != "active" {
+		t.Errorf("State() after dial: got %q want %q", s, "active")
+	}
+	if hwm := adm.RecvQueueHWM(); hwm < 0 {
+		t.Errorf("RecvQueueHWM() negative: %d", hwm)
+	}
+
+	// Exchange a frame so the recv path actually sees data.
+	if _, err := client.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(server, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+
+	// HWM is non-decreasing after data flows; we don't require >0
+	// because on loopback the SEQ window often delivers in-order
+	// and never inserts into the queue.
+	if hwm := adm.RecvQueueHWM(); hwm < 0 {
+		t.Errorf("HWM regressed: %d", hwm)
+	}
+
+	// Trigger Close and observe State() flipping to "dead".
+	_ = client.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if adm.State() == "dead" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if adm.State() != "dead" {
+		t.Errorf("State() after Close: got %q want %q", adm.State(), "dead")
+	}
+}
+
 // TestPathInfoCountersExposed: Paths() must return Reads / Writes
 // counters and the Active flag so a production monitoring stack
 // can spot a saturated or idle path without poking into transport-

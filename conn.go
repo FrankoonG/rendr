@@ -59,4 +59,17 @@ type AdminConn interface {
 	// path death, dial a fresh replacement (typically same spec)
 	// to bring the path set back to its original cardinality.
 	AddPath(spec PathSpec) (uint32, error)
+
+	// State returns the bridge lifecycle stage as a short string:
+	// "init", "handshaking", "active", "migrating", "closing",
+	// "dead". Production monitoring uses this for a liveness
+	// check that doesn't require sending traffic.
+	State() string
+
+	// RecvQueueHWM returns the high-water mark of the reorder
+	// buffer over this Conn's lifetime. docs/modes.md flags
+	// "dedup window overflow" as a hard race-mode bug; this is
+	// the observability hook the chaos harness and production
+	// dashboards consult to spot it.
+	RecvQueueHWM() int
 }

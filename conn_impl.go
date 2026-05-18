@@ -92,6 +92,12 @@ func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
 // ActivePath returns the currently-active path id.
 func (c *engineBackedConn) ActivePath() uint32 { return c.e.ActivePath() }
 
+// State returns the bridge lifecycle stage as a short string.
+func (c *engineBackedConn) State() string { return c.e.State().String() }
+
+// RecvQueueHWM returns the reorder-buffer high-water mark.
+func (c *engineBackedConn) RecvQueueHWM() int { return c.e.RecvQueueHighWaterMark() }
+
 // AddPath dials a path matching spec and attaches it to this
 // engine via BRIDGE_TAG. The new path joins the existing flow on
 // the server side without breaking the application's Conn.
