@@ -50,12 +50,7 @@ func TestT3SS2022xSS2022(t *testing.T) {
 	// Pick a free port for the SS inbound (loopback only).
 	ssServerPort := pickFreePort(t)
 
-	// 16-byte key, base64-encoded, for 2022-blake3-aes-128-gcm.
-	key := make([]byte, 16)
-	if _, err := rand.Read(key); err != nil {
-		t.Fatal(err)
-	}
-	keyB64 := base64.StdEncoding.EncodeToString(key)
+	keyB64 := randomSSKey(t)
 	const method = "2022-blake3-aes-128-gcm"
 
 	ssServerInst := startSSServer(t, ssServerPort, method, keyB64)
@@ -184,4 +179,15 @@ func pickFreePort(t *testing.T) int {
 	}
 	_ = fmt.Sprint // keep fmt import alive in case helpers grow
 	return p
+}
+
+// randomSSKey returns a base64-encoded 16-byte key suitable for the
+// "2022-blake3-aes-128-gcm" cipher. Shared across SS-2022 cases.
+func randomSSKey(t *testing.T) string {
+	t.Helper()
+	key := make([]byte, 16)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(key)
 }
