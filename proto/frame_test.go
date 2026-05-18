@@ -57,6 +57,20 @@ func TestHeaderRejectsShortBuf(t *testing.T) {
 	}
 }
 
+// TestVersionConstants pins the wire-protocol version constants. A
+// drift here without an accompanying review of every byte-stability
+// test in this package would violate hard rule #7 (versioned wire
+// format). Either bump these intentionally (and update the byte
+// tests in lockstep) or do not change them.
+func TestVersionConstants(t *testing.T) {
+	if Version != 0 {
+		t.Errorf("proto.Version drifted: got %d want 0", Version)
+	}
+	if UDPFlowVersion != 0 {
+		t.Errorf("proto.UDPFlowVersion drifted: got %d want 0", UDPFlowVersion)
+	}
+}
+
 // TestHeaderWireStability pins the byte layout. If this test fails
 // without an accompanying Version bump, the change violates CLAUDE.md
 // hard rule #7.
