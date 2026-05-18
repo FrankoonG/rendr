@@ -1,0 +1,160 @@
+// Command regress is the one-button rendr regression suite entry
+// point. It enforces the two-phase contract from
+// docs/regression-suite.md §4: phase 1 (T1+T2 rendr self-check)
+// must be green before phase 2 (T3+T4+T5 integration) is allowed
+// to run. Default invocation runs phase 1 then phase 2 T3; phase 1
+// failure exits without touching phase 2.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/FrankoonG/rendr/regress/internal/gate"
+	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/regress/internal/tier1"
+	"github.com/FrankoonG/rendr/regress/internal/tier2"
+)
+
+// Exit codes match docs/regression-suite.md §10.
+const (
+	exitOK          = 0
+	exitT1Fail      = 10
+	exitT2Fail      = 11
+	exitT3Fail      = 20
+	exitT4Fail      = 21
+	exitT5Fail      = 22
+	exitEnvError    = 50
+	exitPhase1Stale = 51
+)
+
+type runFlags struct {
+	phase        string
+	tier         string
+	forcePhase2  bool
+	profile      string
+	caseID       string
+	reportDir    string
+	rendrRoot    string
+}
+
+func parseFlags() runFlags {
+	var f runFlags
+	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
+	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5")
+	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
+	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
+	flag.StringVar(&f.caseID, "case", "", "specific case id to run")
+	flag.StringVar(&f.reportDir, "report-dir", "reports", "directory to write JUnit + Markdown summary into")
+	flag.StringVar(&f.rendrRoot, "rendr-root", "..", "path to the rendr repo root (where the parent go.mod lives)")
+	flag.Parse()
+	return f
+}
+
+func main() {
+	cfg := parseFlags()
+	if err := tier1.VerifyRoot(cfg.rendrRoot); err != nil {
+		fmt.Fprintln(os.Stderr, "regress: rendr-root invalid:", err)
+		os.Exit(exitEnvError)
+	}
+	absRoot, err := filepath.Abs(cfg.rendrRoot)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "regress: cannot resolve rendr-root:", err)
+		os.Exit(exitEnvError)
+	}
+	cfg.rendrRoot = absRoot
+
+	suite := report.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runP1, runP2 := decidePhases(cfg)
+
+	if runP1 {
+		fmt.Println("== phase 1: rendr self-check (T1+T2) ==")
+		tier1.Run(ctx, suite, cfg.rendrRoot)
+		tier2.Run(ctx, suite, cfg.rendrRoot)
+		writeReports(suite, cfg.reportDir)
+		state := gate.State{
+			CommitSHA: gate.HeadCommit(),
+			Status:    "green",
+			At:        time.Now(),
+		}
+		if suite.AnyFailedAt("T1") {
+			state.Status = "red"
+			_ = gate.Write(cfg.reportDir, state)
+			fmt.Fprintln(os.Stderr, "phase 1: T1 FAILED — phase 2 NOT entered")
+			os.Exit(exitT1Fail)
+		}
+		if suite.AnyFailedAt("T2") {
+			state.Status = "red"
+			_ = gate.Write(cfg.reportDir, state)
+			fmt.Fprintln(os.Stderr, "phase 1: T2 FAILED — phase 2 NOT entered")
+			os.Exit(exitT2Fail)
+		}
+		if err := gate.Write(cfg.reportDir, state); err != nil {
+			fmt.Fprintln(os.Stderr, "regress: cannot persist phase 1 state:", err)
+			os.Exit(exitEnvError)
+		}
+		fmt.Println("phase 1: GREEN")
+	}
+
+	if runP2 {
+		if !runP1 && !cfg.forcePhase2 {
+			if err := gate.CheckPhase2Allowed(cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: phase 2 not allowed:", err)
+				fmt.Fprintln(os.Stderr, "  → run `regress --phase=1` first, or pass --force-phase2 (local debug only)")
+				os.Exit(exitPhase1Stale)
+			}
+		}
+		fmt.Println("== phase 2: integration (T3/T4/T5) — not implemented yet ==")
+		// Phase 2 implementation is gated on:
+		//   - M9 X5 (PathFactory API) for T3 + T4
+		//   - M3-prod or M4 for T5
+		// Until those land, phase 2 is a no-op that exits 0. The
+		// gate logic above still enforces the contract so when
+		// phase 2 fills in, CI scripts already do the right thing.
+		writeReports(suite, cfg.reportDir)
+	}
+
+	if !runP1 && !runP2 {
+		fmt.Fprintln(os.Stderr, "regress: no phase selected; use --phase=1 or --phase=2")
+		os.Exit(exitEnvError)
+	}
+
+	if suite.AnyFailed() {
+		os.Exit(exitT1Fail) // shouldn't reach here because P1 fails exit earlier; safeguard
+	}
+	os.Exit(exitOK)
+}
+
+// decidePhases interprets --phase / --tier / default to pick which
+// phases run. See docs/regression-suite.md §10.
+func decidePhases(cfg runFlags) (runP1, runP2 bool) {
+	switch {
+	case cfg.phase == "1":
+		return true, false
+	case cfg.phase == "2":
+		return false, true
+	case cfg.tier != "":
+		return false, true
+	default:
+		return true, true
+	}
+}
+
+func writeReports(suite *report.Suite, dir string) {
+	junit := filepath.Join(dir, "junit.xml")
+	md := filepath.Join(dir, "SUMMARY.md")
+	if err := suite.WriteJUnit(junit); err != nil && !errors.Is(err, os.ErrPermission) {
+		fmt.Fprintln(os.Stderr, "regress: cannot write JUnit:", err)
+	}
+	if err := suite.WriteMarkdown(md); err != nil && !errors.Is(err, os.ErrPermission) {
+		fmt.Fprintln(os.Stderr, "regress: cannot write SUMMARY.md:", err)
+	}
+}

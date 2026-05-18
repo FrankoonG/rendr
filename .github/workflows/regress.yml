@@ -1,0 +1,33 @@
+name: regress
+
+on:
+  push:
+    branches: [main, "v0.1.*"]
+  pull_request:
+    branches: [main, "v0.1.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  phase1:
+    name: phase 1 self-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: phase 1 (T1 unit/contract + T2 smoke)
+        working-directory: regress
+        run: go run ./cmd/regress --phase=1 --report-dir=../reports
+
+      - name: upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-phase1
+          path: reports/

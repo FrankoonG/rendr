@@ -26,3 +26,10 @@
 # Go test cache and coverage
 /coverage.out
 /coverage.html
+
+# regress suite outputs (junit.xml / SUMMARY.md / raw / last_phase1.json
+# are produced per-run and not versioned)
+/reports/
+
+# xray-core source clone for code research; ad-hoc local-only
+/.xray-research/
