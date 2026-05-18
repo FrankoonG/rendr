@@ -117,6 +117,76 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 	}
 }
 
+// TestSetReadDeadlinePacketMode mirrors TestSetReadDeadlineTimesOut
+// but exercises the packet-mode ReadFrom path. The deadline plumbing
+// goes through enginePacketConn.SetReadDeadline → engine.SetReadDeadline,
+// and Engine.RecvPacket honors the deadline the same way Recv does.
+func TestSetReadDeadlinePacketMode(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if err := server.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	t0 := time.Now()
+	buf := make([]byte, 64)
+	_, _, err = server.ReadFrom(buf)
+	elapsed := time.Since(t0)
+	if err == nil {
+		t.Fatal("ReadFrom: got nil error, want timeout")
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("ReadFrom: got %v, want net.Error with Timeout()==true", err)
+	}
+	if elapsed < 150*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("ReadFrom deadline imprecise: elapsed=%s", elapsed)
+	}
+
+	// Clear deadline + verify normal delivery resumes.
+	if err := server.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear deadline: %v", err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = client.WriteTo([]byte("ok"), nil)
+	}()
+	n, _, err := server.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom after clearing deadline: %v", err)
+	}
+	if string(buf[:n]) != "ok" {
+		t.Fatalf("payload after clear: got %q", buf[:n])
+	}
+}
+
 // TestModeConstants pins the integer values of the public Mode enum.
 // The values must match internal/engine.dispatchPrime/Bond/Race
 // because (*engineBackedConn).SetMode passes uint32(rendr.Mode) to
