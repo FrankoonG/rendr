@@ -347,6 +347,121 @@ func TestM9XrayListenerFlowIDs(t *testing.T) {
 	})
 }
 
+// TestM9MigrationUnderLoadThroughXrayWrap drives sustained writes
+// while explicitly migrating through the xray-wrapped Conn. The
+// contract from CLAUDE.md hard rule #1 (migration never surfaces an
+// error to the application) and the framework G1 contract (bytes
+// identical after mid-stream migration) must both hold through the
+// xray adapter layer - otherwise an xray embedder gets a different
+// guarantee than a bare-rendr embedder, which violates the "xray
+// surface is just a thin wrap" promise.
+func TestM9MigrationUnderLoadThroughXrayWrap(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const chunk = 4096
+	const chunks = 256
+	total := int64(chunk) * int64(chunks)
+
+	srvErr := make(chan error, 1)
+	srvDone := make(chan int64, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s, err := ln.AcceptContext(ctx)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		defer s.Close()
+		buf := make([]byte, chunk)
+		var got int64
+		for got < total {
+			n, err := io.ReadFull(s, buf)
+			if err != nil {
+				srvErr <- err
+				return
+			}
+			for i, b := range buf[:n] {
+				if b != byte((int64(i)+got)&0xFF) {
+					srvErr <- io.ErrUnexpectedEOF
+					return
+				}
+			}
+			got += int64(n)
+		}
+		srvDone <- got
+	}()
+
+	d, err := NewDialer(&Config{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := d.DialContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	adm, ok := c.(rendr.AdminConn)
+	if !ok {
+		t.Fatal("xray-side net.Conn is not rendr.AdminConn (migration plumbing unreachable)")
+	}
+	startMigrations := adm.MigrationCount()
+
+	payload := make([]byte, chunk)
+	var sent int64
+	for i := 0; i < chunks; i++ {
+		for j := range payload {
+			payload[j] = byte((int64(j) + sent) & 0xFF)
+		}
+		if _, err := c.Write(payload); err != nil {
+			t.Fatalf("Write chunk %d: %v (migration must not surface as error)", i, err)
+		}
+		sent += int64(len(payload))
+
+		// Migrate every 32 chunks to a different path id.
+		if i > 0 && i%32 == 0 {
+			cur := adm.ActivePath()
+			for _, p := range adm.Paths() {
+				if p.ID != cur {
+					if err := adm.Migrate(p.ID); err != nil {
+						t.Fatalf("Migrate chunk %d: %v", i, err)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	select {
+	case err := <-srvErr:
+		t.Fatalf("server side: %v", err)
+	case got := <-srvDone:
+		if got != total {
+			t.Fatalf("server got %d bytes, want %d", got, total)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("server side did not finish in 30s")
+	}
+
+	endMigrations := adm.MigrationCount()
+	migrated := endMigrations - startMigrations
+	if migrated == 0 {
+		t.Fatalf("no migrations happened; MigrationCount unchanged at %d", endMigrations)
+	}
+	t.Logf("xray wrap: %d migrations across %d chunks, %d bytes intact", migrated, chunks, total)
+}
+
 // TestM9AdminSurfaceThroughXrayWrap: the net.Conn / net.PacketConn
 // values returned by xray.Dialer must still satisfy rendr.AdminConn /
 // rendr.AdminPacketConn so embedders can plumb migration metrics and
