@@ -4,21 +4,16 @@
 // before phase 2 burns CI time.
 //
 // Status:
-//   - G1-smoke: cross-platform, implemented.
-//   - G2-smoke: cross-platform, implemented.
-//   - G3-smoke: Linux-only (needs net.core.rmem_max=8MiB for QUIC
-//     DATAGRAM at 30k pps), pending.
-//   - G4 / G5: Linux-only (iptables -j DROP for forced path death),
-//     pending.
-//
-// Linux-only cases SKIP on non-Linux runners with a clear reason so
-// the gap is visible in reports.
+//   - G1-smoke / G2-smoke / G4 / G5: cross-platform via the
+//     ForceKillPathForTest engine backdoor and AddPath. Implemented.
+//   - G3-smoke: Linux-only (QUIC DATAGRAM at 30k pps needs
+//     sysctl net.core.rmem_max=8MiB; Windows / macOS UDP loopback
+//     does not have a comparable knob). Skipped elsewhere.
 package tier2
 
 import (
 	"context"
 	"runtime"
-	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
@@ -33,20 +28,25 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		return smoke.RunG2(ctx, smoke.G2Opts{})
 	})
 
-	linuxPending := []string{"G3-smoke", "G4", "G5"}
-	for _, name := range linuxPending {
-		c := report.Case{Name: name, Tier: "T2"}
-		if runtime.GOOS != "linux" {
-			c.SkipReason = "Linux only (iptables / sysctl rmem_max)"
-		} else {
-			c.SkipReason = "T2 implementation pending (regression-suite §14 step 3)"
-		}
-		suite.Add(c)
+	// G3-smoke: QUIC DATAGRAM 30k pps + ConnID migration. Pending
+	// implementation. On Linux the future call site will be
+	// smoke.RunG3(...); for now SKIP so phase 1 isn't gated on it.
+	g3Skip := "implementation pending (regression-suite §14 step 7 equivalent for smoke; validate on Linux test host)"
+	if runtime.GOOS != "linux" {
+		g3Skip = "Linux only (sysctl net.core.rmem_max for 30k pps QUIC DATAGRAM) — " + g3Skip
 	}
+	suite.Add(report.Case{Name: "G3-smoke", Tier: "T2", SkipReason: g3Skip})
+	_ = smoke.G3Opts{} // keep the type referenced for the next commit
+
+	addRun(suite, "G4", "T2", func() smoke.Result {
+		return smoke.RunG4(ctx, smoke.G4Opts{})
+	})
+	addRun(suite, "G5", "T2", func() smoke.Result {
+		return smoke.RunG5(ctx, smoke.G5Opts{})
+	})
 }
 
 func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
-	start := time.Now()
 	r := fn()
 	suite.Add(report.Case{
 		Name:     name,
@@ -54,5 +54,4 @@ func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
 		Duration: r.Duration,
 		Failure:  r.Failure,
 	})
-	_ = start // start is captured inside fn via smoke; kept for symmetry if fn ignores time
 }
