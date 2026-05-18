@@ -74,10 +74,6 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 	if cur == ModeBond && m == ModeRace {
 		return ErrModeSwitchIllegal
 	}
-	// Bond is M8; reject for now. Prime and Race are wired.
-	if m == ModeBond {
-		return ErrNotImplemented
-	}
 	c.mode.Store(uint32(m))
 	c.e.SetMode(uint32(m))
 	return nil

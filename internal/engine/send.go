@@ -110,17 +110,21 @@ func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) erro
 //
 //	prime / 0 (default) - write on the single active path
 //	race                - write on every attached path
-//	bond                - prime semantics until M8 plumbs the splitter
+//	bond                - round-robin frame-level across all paths
 //
 // The race path returns nil as long as at least one path succeeded
 // (receiver dedup handles duplicates). It returns
 // ErrMigrationBudgetExceeded only when there are no usable paths
 // after the budget.
 func (e *Engine) dispatch(frame []byte) error {
-	if e.mode.Load() == dispatchRace {
+	switch e.mode.Load() {
+	case dispatchRace:
 		return e.dispatchRace(frame)
+	case dispatchBond:
+		return e.dispatchBond(frame)
+	default:
+		return e.dispatchSingle(frame)
 	}
-	return e.dispatchSingle(frame)
 }
 
 func (e *Engine) dispatchSingle(frame []byte) error {
@@ -147,6 +151,55 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 
 		if _, err := pc.Write(frame); err != nil {
 			if errors.Is(err, net.ErrClosed) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+// dispatchBond picks one path per frame in deterministic round-robin
+// order across the currently-attached path set. Receiver-side
+// reorder reassembles the byte stream via SEQ.
+//
+// Minimum-viable: no path-pinning, no per-path weights, no
+// stuck-path bypass. docs/modes.md flags those as the hard bond
+// failure modes ('bond 是 bug 工厂') so they get their own
+// commits (M8(2..n)) gated on prime + race chaos passing 10/10.
+func (e *Engine) dispatchBond(frame []byte) error {
+	for {
+		if e.isClosed() {
+			return net.ErrClosed
+		}
+		e.pathsMu.Lock()
+		if len(e.paths) == 0 {
+			e.pathsMu.Unlock()
+			if err := e.waitForPath(); err != nil {
+				return err
+			}
+			continue
+		}
+		// Stable order so round-robin is deterministic across paths.
+		ids := make([]uint32, 0, len(e.paths))
+		for id := range e.paths {
+			ids = append(ids, id)
+		}
+		// Insertion sort on small N - cheaper than sort.Slice for
+		// the typical <= 8 paths bond cares about.
+		for i := 1; i < len(ids); i++ {
+			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
+				ids[j-1], ids[j] = ids[j], ids[j-1]
+			}
+		}
+		idx := int(e.bondCursor % uint64(len(ids)))
+		e.bondCursor++
+		pc := e.paths[ids[idx]].conn
+		e.pathsMu.Unlock()
+
+		if _, err := pc.Write(frame); err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				// Path died mid-write; pick again.
 				continue
 			}
 			return err

@@ -992,6 +992,107 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 }
 
+// TestM8BondRoundRobinAcrossPaths: with bond mode, N application
+// Writes round-robin onto attached paths so each path observes
+// roughly N/PathCount frames. Bond is "frame-level aggregation
+// not duplication", so unlike race each path sees a strict subset.
+// Receiver-side reorder reassembles into the original byte stream.
+func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	// Capture per-path Writes() before flipping mode.
+	type pp struct {
+		id     uint32
+		writer interface{ Writes() uint64 }
+		base   uint64
+	}
+	var probes []pp
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pp{id: id, writer: w, base: w.Writes()})
+		}
+	})
+
+	if err := client.SetMode(ModeBond); err != nil {
+		t.Fatalf("SetMode(bond): %v", err)
+	}
+
+	// Send N small frames; each engine.SendData call produces one
+	// data frame (the payload is < MaxPayload).
+	const N = 16
+	payload := []byte("bond-frame")
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Drain server side so reorder buffer fully processes.
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatalf("server drain: %v", err)
+	}
+	if !bytes.Equal(rxbuf, bytes.Repeat(payload, N)) {
+		t.Fatalf("server byte-stream mismatch under bond")
+	}
+
+	// Bond should distribute roughly evenly. Each path should see
+	// >= 1 data write (we allow asymmetry for ctrl frames that
+	// went on whichever path was active before SetMode).
+	var totals []uint64
+	for _, p := range probes {
+		got := p.writer.Writes() - p.base
+		totals = append(totals, got)
+		t.Logf("path %d saw %d wire writes after bond switch", p.id, got)
+	}
+	if totals[0] == 0 || totals[1] == 0 {
+		t.Fatalf("bond did not exercise both paths: %v", totals)
+	}
+}
+
 // TestM5UDPFlowPlannedMigration: 2 udpflow paths, hot-swap active
 // path via engine.Migrate mid-stream. Confirms M5 paths plug into
 // the same engine migration primitive that TCP / QUIC use.

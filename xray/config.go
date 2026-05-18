@@ -79,9 +79,7 @@ func (c *Config) Validate() error {
 		return errNoPaths
 	}
 	switch c.Mode {
-	case ModeUnset, ModePrime, ModeRace:
-	case ModeBond:
-		return errBondNotYetSupported
+	case ModeUnset, ModePrime, ModeRace, ModeBond:
 	default:
 		return errUnknownMode
 	}

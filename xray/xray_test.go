@@ -22,7 +22,7 @@ func TestM9ConfigValidate(t *testing.T) {
 		{"nil", nil, false},
 		{"no paths", &Config{}, false},
 		{"unknown mode", &Config{Mode: 99, Paths: []PathSpec{{Transport: "tcp", Address: "x:1"}}}, false},
-		{"bond not yet", &Config{Mode: ModeBond, Paths: []PathSpec{{Transport: "tcp", Address: "x:1"}}}, false},
+		{"bond ok now", &Config{Mode: ModeBond, Paths: []PathSpec{{Transport: "tcp", Address: "x:1"}}}, true},
 		{"missing transport", &Config{Paths: []PathSpec{{Address: "x:1"}}}, false},
 		{"missing address", &Config{Paths: []PathSpec{{Transport: "tcp"}}}, false},
 		{"valid prime tcp", &Config{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: "x:1"}}}, true},

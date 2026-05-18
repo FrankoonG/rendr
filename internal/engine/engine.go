@@ -42,6 +42,12 @@ type Engine struct {
 	// Loaded by dispatch() to decide single-path vs all-paths send.
 	mode atomic.Uint32
 
+	// bondCursor is the round-robin index for bond dispatch. Bumped
+	// (mod len(paths)) every frame to spread the load. Path pinning
+	// / weighted distribution / stuck-path detection are TODO; this
+	// is the minimum-viable bond from docs/modes.md.
+	bondCursor uint64
+
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
 	paths      map[uint32]*pathSlot

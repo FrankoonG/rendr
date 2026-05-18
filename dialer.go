@@ -63,11 +63,6 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	if !mode.Valid() {
 		mode = ModePrime
 	}
-	// Bond is still M8-pending. Prime and race are wired through the
-	// engine dispatcher.
-	if mode == ModeBond {
-		return nil, ErrNotImplemented
-	}
 
 	flowID := engine.NewClientFlowID()
 	e := engine.New(engine.SideClient, flowID, engine.Limits{
