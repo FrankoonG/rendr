@@ -42,11 +42,15 @@ type Engine struct {
 	// Loaded by dispatch() to decide single-path vs all-paths send.
 	mode atomic.Uint32
 
-	// bondCursor is the round-robin index for bond dispatch. Bumped
-	// (mod len(paths)) every frame to spread the load. Path pinning
-	// / weighted distribution / stuck-path detection are TODO; this
-	// is the minimum-viable bond from docs/modes.md.
-	bondCursor uint64
+	// bondCursor is the round-robin index for bond dispatch.
+	// bondPinLeft is how many more consecutive frames must stay on
+	// the current path before bondCursor advances. Path pinning is
+	// the M8 mitigation for reorder-window blow-up under RTT skew
+	// (docs/modes.md "1. path pinning"). When bondPinLeft hits 0 we
+	// bump bondCursor and refill bondPinLeft from bondPinSize.
+	bondCursor  uint64
+	bondPinLeft int
+	bondPinSize int // 0 = use defaultBondPinSize
 
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
@@ -355,6 +359,27 @@ func (e *Engine) SetMode(mode uint32) {
 
 // Mode returns the current dispatcher mode.
 func (e *Engine) Mode() uint32 { return e.mode.Load() }
+
+// defaultBondPinSize is the number of consecutive frames bond
+// dispatch keeps on one path before moving to the next. 8 is a
+// trade-off between "small enough to keep aggregate bandwidth ~
+// sum-of-paths" and "large enough to amortise the reorder cost
+// from RTT skew between paths".
+const defaultBondPinSize = 8
+
+// SetBondPinSizeForTest is a backdoor for tests that want to
+// observe pinning without sending 64+ frames. Not part of the API.
+func (e *Engine) SetBondPinSizeForTest(n int) {
+	if n <= 0 {
+		return
+	}
+	e.pathsMu.Lock()
+	e.bondPinSize = n
+	// Reset the current pin so the change takes effect on the next
+	// frame rather than waiting out the residual count.
+	e.bondPinLeft = 0
+	e.pathsMu.Unlock()
+}
 
 // probeInterval lets tests override the prober cadence. Default 1s.
 func (e *Engine) probeInterval() time.Duration {

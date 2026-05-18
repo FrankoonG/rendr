@@ -992,6 +992,135 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 }
 
+// TestM8BondPathPinning: with pin size = 4 and 2 paths, sending 16
+// frames must produce 4-frame runs that stay on one path before
+// the next run jumps to the other. Path pinning is the M8 mechanism
+// to bound reorder-window growth under RTT skew between paths.
+func TestM8BondPathPinning(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	bc := client.(*engineBackedConn)
+
+	type pp struct {
+		id     uint32
+		writer interface{ Writes() uint64 }
+	}
+	var probes []pp
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pp{id: id, writer: w})
+		}
+	})
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+
+	// Pin size 4 so 16 frames -> 4 runs of 4.
+	bc.Engine().SetBondPinSizeForTest(4)
+	if err := client.SetMode(ModeBond); err != nil {
+		t.Fatalf("SetMode bond: %v", err)
+	}
+
+	const N = 16
+	payload := []byte("pinframe")
+	pathPerFrame := make([]uint32, 0, N)
+	prevA := probes[0].writer.Writes()
+	prevB := probes[1].writer.Writes()
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		// Whichever path's Writes() advanced this iteration is the
+		// path the engine chose for this frame.
+		curA := probes[0].writer.Writes()
+		curB := probes[1].writer.Writes()
+		if curA > prevA {
+			pathPerFrame = append(pathPerFrame, probes[0].id)
+		} else if curB > prevB {
+			pathPerFrame = append(pathPerFrame, probes[1].id)
+		} else {
+			t.Fatalf("frame %d: neither path's Writes() advanced (a=%d b=%d)",
+				i, curA, curB)
+		}
+		prevA = curA
+		prevB = curB
+	}
+
+	// Drain server.
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatalf("server drain: %v", err)
+	}
+
+	t.Logf("path-per-frame: %v", pathPerFrame)
+
+	// Verify pinning: count the number of times consecutive frames
+	// switched paths. With pin=4 and 16 frames we should see at
+	// most ceil(16/4)-1 = 3 switches.
+	switches := 0
+	for i := 1; i < len(pathPerFrame); i++ {
+		if pathPerFrame[i] != pathPerFrame[i-1] {
+			switches++
+		}
+	}
+	if switches > 3 {
+		t.Fatalf("path pinning broken: %d switches across %d frames (expected <= 3 with pin=4)",
+			switches, N)
+	}
+
+	// Sanity: both paths got >=1 frame.
+	var aN, bN int
+	for _, p := range pathPerFrame {
+		if p == probes[0].id {
+			aN++
+		} else if p == probes[1].id {
+			bN++
+		}
+	}
+	if aN == 0 || bN == 0 {
+		t.Fatalf("one path saw no frames: %v", pathPerFrame)
+	}
+}
+
 // TestM8BondRoundRobinAcrossPaths: with bond mode, N application
 // Writes round-robin onto attached paths so each path observes
 // roughly N/PathCount frames. Bond is "frame-level aggregation

@@ -159,14 +159,14 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 	}
 }
 
-// dispatchBond picks one path per frame in deterministic round-robin
-// order across the currently-attached path set. Receiver-side
-// reorder reassembles the byte stream via SEQ.
+// dispatchBond writes one frame to one path, with path-pinning:
+// after picking a path, the next bondPinSize-1 frames stay on it
+// before bondCursor advances. This bounds reorder-window growth
+// under RTT skew between paths (docs/modes.md "path pinning").
 //
-// Minimum-viable: no path-pinning, no per-path weights, no
-// stuck-path bypass. docs/modes.md flags those as the hard bond
-// failure modes ('bond 是 bug 工厂') so they get their own
-// commits (M8(2..n)) gated on prime + race chaos passing 10/10.
+// Minimum-viable: deterministic id-sorted round-robin, no weighted
+// distribution, no stuck-path bypass, no redistribute-on-death.
+// Those are M8(3..n) follow-ups.
 func (e *Engine) dispatchBond(frame []byte) error {
 	for {
 		if e.isClosed() {
@@ -192,8 +192,20 @@ func (e *Engine) dispatchBond(frame []byte) error {
 				ids[j-1], ids[j] = ids[j], ids[j-1]
 			}
 		}
+		// Refill the pin window when it runs out, then advance the
+		// cursor. Cursor advances on the FIRST frame of a window,
+		// not in the middle, so all frames in a window land on the
+		// same path id.
+		if e.bondPinLeft <= 0 {
+			pin := e.bondPinSize
+			if pin <= 0 {
+				pin = defaultBondPinSize
+			}
+			e.bondPinLeft = pin
+			e.bondCursor++
+		}
+		e.bondPinLeft--
 		idx := int(e.bondCursor % uint64(len(ids)))
-		e.bondCursor++
 		pc := e.paths[ids[idx]].conn
 		e.pathsMu.Unlock()
 
