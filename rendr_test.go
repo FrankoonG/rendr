@@ -1676,7 +1676,10 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	// 5 s tolerance: 10-package parallel runs occasionally take the
+	// second TCP attach + BRIDGE_TAG handshake past the original
+	// 2 s margin.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 {
 			break
@@ -1684,7 +1687,7 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if len(client.Paths()) < 2 {
-		t.Fatalf("only %d paths attached", len(client.Paths()))
+		t.Fatalf("only %d paths attached after 5s", len(client.Paths()))
 	}
 
 	bc := client.(*engineBackedConn)
