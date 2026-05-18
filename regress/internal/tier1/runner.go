@@ -98,6 +98,15 @@ func runGo(ctx context.Context, rendrRoot string, args ...string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
+	// WaitDelay (Go 1.20+) is the critical knob: when ctx fires,
+	// CommandContext SIGKILLs `go`, but `go test` has already
+	// forked a compiled test binary which inherits the pipe. Without
+	// WaitDelay, cmd.Wait blocks indefinitely waiting for the orphan
+	// to close stdout — which is exactly the deadlock we observed
+	// on the Linux test host (30+min hang on go-test-race with
+	// only 18s CPU). 10s after Kill, the runtime force-closes I/O
+	// and Wait returns.
+	cmd.WaitDelay = 10 * time.Second
 	if err := cmd.Run(); err != nil {
 		excerpt := strings.TrimSpace(stderr.String())
 		if len(excerpt) > 4000 {
