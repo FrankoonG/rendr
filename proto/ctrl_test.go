@@ -112,11 +112,91 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlPathQuality, 0x03},
 		{CtrlHeartbeat, 0x04},
 		{CtrlBye, 0x05},
+		{CtrlPathProbe, 0x06},
+		{CtrlPathProbeReply, 0x07},
 		{CtrlBridgeTag, 0x10},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
 			t.Errorf("%s drifted: got 0x%02x want 0x%02x (bump proto.Version if intentional)", c.code, byte(c.code), c.want)
+		}
+	}
+}
+
+func TestCapsBitStability(t *testing.T) {
+	if CapsPacketMode != 0x00000001 {
+		t.Errorf("CapsPacketMode drifted: got 0x%08x want 0x00000001 (bump proto.Version if intentional)",
+			CapsPacketMode)
+	}
+}
+
+func TestProbeWireStability(t *testing.T) {
+	p := ProbePayload{TS: 0x1122334455667788, ID: 0x99AABBCCDDEEFF00}
+	want := []byte{
+		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+		0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+	}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("probe wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
+func TestBridgeTagWireStability(t *testing.T) {
+	p := BridgeTagPayload{BridgeID: [16]byte{
+		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	}}
+	want := []byte{
+		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("bridge_tag wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
+func TestMigrateNotifyWireStability(t *testing.T) {
+	p := MigrateNotifyPayload{NewPathID: 0xDEADBEEF}
+	want := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("migrate_notify wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
+func TestPathQualityWireStability(t *testing.T) {
+	p := PathQualityPayload{RTTus: 0x11223344, JitterUs: 0x55667788, LossPP: 0x99AA}
+	want := []byte{
+		0x11, 0x22, 0x33, 0x44,
+		0x55, 0x66, 0x77, 0x88,
+		0x99, 0xAA,
+	}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("path_quality wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
+func TestHeartbeatWireStability(t *testing.T) {
+	p := HeartbeatPayload{Timestamp: 0x0102030405060708}
+	want := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("heartbeat wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
+func TestByeWireStability(t *testing.T) {
+	cases := []struct {
+		reason ByeReason
+		want   byte
+	}{
+		{ByeNormal, 0x00},
+		{ByeMigBudget, 0x01},
+		{ByeProtoVer, 0x03},
+	}
+	for _, c := range cases {
+		p := ByePayload{Reason: c.reason}
+		enc := p.Encode()
+		if len(enc) != 1 || enc[0] != c.want {
+			t.Errorf("bye(%v) wire drift: got %x want %02x", c.reason, enc, c.want)
 		}
 	}
 }
