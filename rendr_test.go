@@ -254,6 +254,81 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 	t.Fatal("Read never returned within 3s after zombie kill")
 }
 
+// TestM2QUICDatagramPacketRoundTrip exercises the full DATAGRAM
+// stack through the rendr public surface: rendr.ListenQUICDatagram
+// on the server + Dialer.DialPacket with PathSpec.Opts["mode"]=
+// "datagram" on the client. Confirms the wire-level QUIC DATAGRAM
+// support (commit 690fa60) integrates correctly through engine
+// packet mode.
+func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
+	ln, err := ListenQUICDatagram("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("AcceptPacket: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{{
+			Transport: "quic",
+			Address:   ln.Addr().String(),
+			Opts:      map[string]string{"mode": "datagram"},
+		}},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Two packets in each direction; boundaries must be preserved
+	// because DATAGRAM == one frame per datagram.
+	for i, p := range [][]byte{[]byte("alpha"), []byte("beta-beta-beta")} {
+		if _, err := client.WriteTo(p, nil); err != nil {
+			t.Fatalf("client WriteTo %d: %v", i, err)
+		}
+	}
+	buf := make([]byte, 256)
+	for i, want := range [][]byte{[]byte("alpha"), []byte("beta-beta-beta")} {
+		n, _, err := server.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("server ReadFrom %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(want) {
+			t.Fatalf("packet %d: got %q want %q", i, buf[:n], want)
+		}
+	}
+
+	if _, err := server.WriteTo([]byte("ack"), nil); err != nil {
+		t.Fatalf("server WriteTo: %v", err)
+	}
+	n, _, err := client.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("client ReadFrom: %v", err)
+	}
+	if string(buf[:n]) != "ack" {
+		t.Fatalf("reply: got %q want ack", buf[:n])
+	}
+
+	if client.FlowID() != server.FlowID() {
+		t.Fatalf("flow_id mismatch through QUIC DATAGRAM wrap")
+	}
+}
+
 // TestSentinelErrorsAreMatchable: errors returned from the engine
 // must satisfy errors.Is against the public rendr.Err* values. The
 // engine returns engine.Err* sentinels directly; rendr re-exports the
