@@ -14,11 +14,17 @@ import (
 // a ready-to-use rendr PathConn rather than a bare QUIC connection.
 type Listener struct {
 	ln *qg.Listener
+	tr *qg.Transport
 }
 
 // Listen binds a UDP socket at addr and waits for inbound QUIC
 // connections. If tlsCfg is nil, an ephemeral self-signed dev cert
 // is used (do NOT ship that in production).
+//
+// The underlying UDP socket is opened with SO_RCVBUF/SO_SNDBUF set
+// to DefaultUDPBufferBytes (8 MiB). Production deployments serving
+// DATAGRAM-mode at >50k pps should raise the Linux kernel cap with
+// `sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`.
 func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	if tlsCfg == nil {
 		st, _, err := devTLSConfig()
@@ -27,6 +33,15 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 		}
 		tlsCfg = st
 	}
+	laddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	udpConn, err := udpConnWithBuffers(laddr)
+	if err != nil {
+		return nil, err
+	}
+	tr := &qg.Transport{Conn: udpConn}
 	cfg := &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
@@ -35,18 +50,26 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 		// datagram-mode clients on the same UDP port.
 		EnableDatagrams: true,
 	}
-	ln, err := qg.ListenAddr(addr, tlsCfg, cfg)
+	ln, err := tr.Listen(tlsCfg, cfg)
 	if err != nil {
+		_ = tr.Close()
 		return nil, err
 	}
-	return &Listener{ln: ln}, nil
+	return &Listener{ln: ln, tr: tr}, nil
 }
 
 // Addr returns the underlying UDP address.
 func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
 
-// Close shuts the listener. Already-accepted connections live on.
-func (l *Listener) Close() error { return l.ln.Close() }
+// Close shuts the listener. Already-accepted connections live on
+// until they finish naturally or are explicitly closed.
+func (l *Listener) Close() error {
+	err := l.ln.Close()
+	if l.tr != nil {
+		_ = l.tr.Close()
+	}
+	return err
+}
 
 // Accept blocks until a new QUIC connection arrives and its first
 // bidirectional stream has been opened by the peer. Returns the

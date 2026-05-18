@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,9 +47,40 @@ func init() {
 // Name implements transport.Transport.
 func (*Transport) Name() string { return "quic" }
 
+// DefaultUDPBufferBytes is the SO_RCVBUF / SO_SNDBUF target the QUIC
+// adapter applies to every UDP socket it opens. 8 MiB is what
+// G3 100k-pps DATAGRAM validation needed on Linux; smaller defaults
+// (e.g. 208 KiB on stock Ubuntu) drop frames under high pps load.
+// The set is best-effort: the kernel may clamp to net.core.rmem_max,
+// and on platforms without setsockopt buffer support the calls
+// silently no-op. To raise the kernel cap on Linux:
+//
+//	sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+const DefaultUDPBufferBytes = 8 * 1024 * 1024
+
+// udpConnWithBuffers opens a UDP socket bound to local (laddr may be
+// nil for an ephemeral port) and sets large send/recv buffers. The
+// returned *net.UDPConn is suitable for handing to qg.Transport.
+func udpConnWithBuffers(laddr *net.UDPAddr) (*net.UDPConn, error) {
+	if laddr == nil {
+		laddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	c, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+	_ = c.SetReadBuffer(DefaultUDPBufferBytes)
+	_ = c.SetWriteBuffer(DefaultUDPBufferBytes)
+	return c, nil
+}
+
 // DialPath connects to spec.Address (host:port), completes the QUIC
 // handshake, and opens a single bidirectional stream to carry rendr
 // frames. The returned PathConn is the (Connection, Stream) pair.
+//
+// The adapter sets SO_RCVBUF/SO_SNDBUF on the underlying UDP socket
+// to DefaultUDPBufferBytes (8 MiB) so the QUIC DATAGRAM receive
+// queue can absorb burst loads (G3 100k-pps validation requirement).
 //
 // spec.Opts recognised keys:
 //
@@ -76,14 +108,22 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 	}
 
 	useDatagram := spec.Opts["mode"] == "datagram"
-	conn, err := qg.DialAddr(ctx, spec.Address, cfg, &qg.Config{
-		// Long enough to survive a brief migration window; engine
-		// MigrationBudget is the higher-level cap.
+	raddr, err := net.ResolveUDPAddr("udp", spec.Address)
+	if err != nil {
+		return nil, fmt.Errorf("quic: resolve %s: %w", spec.Address, err)
+	}
+	udpConn, err := udpConnWithBuffers(nil)
+	if err != nil {
+		return nil, fmt.Errorf("quic: udp listen: %w", err)
+	}
+	tr := &qg.Transport{Conn: udpConn}
+	conn, err := tr.Dial(ctx, raddr, cfg, &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
 		EnableDatagrams: useDatagram,
 	})
 	if err != nil {
+		_ = udpConn.Close()
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
 	}
 	if useDatagram {
