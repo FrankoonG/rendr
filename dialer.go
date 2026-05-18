@@ -46,6 +46,24 @@ type Dialer struct {
 	// ProbeInterval is how often each attached path issues a
 	// CtrlPathProbe to measure RTT. 0 = default 1s.
 	ProbeInterval time.Duration
+
+	// ZombieMaxMigrations: number of consecutive completed migrations
+	// with zero application payload between them before the engine
+	// declares the peer a zombie and tears down (CLAUDE.md hard rule
+	// #5). Default 2; lower values trip earlier.
+	ZombieMaxMigrations int
+
+	// ZombieCooldown: how long the engine waits between zombie-
+	// counter decrements. After ZombieCooldown elapsed since the
+	// last migration, the counter resets to ZombieMaxMigrations.
+	// Default 30s.
+	ZombieCooldown time.Duration
+
+	// BondStuckRTTMultiplier (bond only): a path whose latest probe
+	// RTT exceeds best_path_rtt * Multiplier is skipped on bond
+	// round-robin. Default 3.0. Set lower to be more aggressive
+	// about bypassing slow paths.
+	BondStuckRTTMultiplier float64
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -66,12 +84,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	}
 
 	flowID := engine.NewClientFlowID()
-	e := engine.New(engine.SideClient, flowID, engine.Limits{
-		MigrationBudget: d.MigrationBudget,
-		PrimeHysteresis: d.Hysteresis,
-		PrimeDwell:      d.Dwell,
-		PrimeCooldown:   d.Cooldown,
-	})
+	e := engine.New(engine.SideClient, flowID, d.engineLimits())
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
@@ -149,12 +162,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 
 	flowID := engine.NewClientFlowID()
-	e := engine.New(engine.SideClient, flowID, engine.Limits{
-		MigrationBudget: d.MigrationBudget,
-		PrimeHysteresis: d.Hysteresis,
-		PrimeDwell:      d.Dwell,
-		PrimeCooldown:   d.Cooldown,
-	})
+	e := engine.New(engine.SideClient, flowID, d.engineLimits())
 	e.SetPacketMode()
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
@@ -200,6 +208,21 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		e.StartPrime(nil, 0)
 	}
 	return bc, nil
+}
+
+// engineLimits packs the Dialer-side knobs into engine.Limits. The
+// engine clamps unset / out-of-range values back to project defaults
+// (90 s migration budget, 2 zombie migrations, 30 s cooldown, etc.).
+func (d *Dialer) engineLimits() engine.Limits {
+	return engine.Limits{
+		MigrationBudget:        d.MigrationBudget,
+		PrimeHysteresis:        d.Hysteresis,
+		PrimeDwell:             d.Dwell,
+		PrimeCooldown:          d.Cooldown,
+		ZombieMaxMigrations:    d.ZombieMaxMigrations,
+		ZombieCooldown:         d.ZombieCooldown,
+		BondStuckRTTMultiplier: d.BondStuckRTTMultiplier,
+	}
 }
 
 func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {

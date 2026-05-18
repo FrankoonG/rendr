@@ -117,6 +117,72 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 	}
 }
 
+// TestDialerCustomLimitsApplied: setting ZombieMaxMigrations on the
+// Dialer must reach the engine. We construct a Dialer with the
+// minimum-zombie value (1) and run a single death-driven failover;
+// the engine should trip zombie protection after that one event
+// (which would not trigger under the default 2). This validates that
+// the Dialer→engine.Limits plumbing actually carries the field.
+func TestDialerCustomLimitsApplied(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+		ZombieMaxMigrations: 1,
+		ZombieCooldown:      30 * time.Second,
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Skipf("could not stabilize 2 paths each; environment too noisy")
+	}
+
+	// Kill the active path. With ZombieMax=1 the engine trips on this
+	// single death-driven failover (no payload between migrations).
+	bc := client.(*engineBackedConn)
+	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
+		t.Fatalf("ForceKillPathForTest: %v", err)
+	}
+
+	// Subsequent Read should surface ErrZombie within the budget.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := client.Read(make([]byte, 1))
+		if err != nil {
+			if !errors.Is(err, ErrZombie) {
+				t.Fatalf("Read after kill: got %v want ErrZombie", err)
+			}
+			return // success
+		}
+	}
+	t.Fatal("Read never returned within 3s after zombie kill")
+}
+
 // TestSentinelErrorsAreMatchable: errors returned from the engine
 // must satisfy errors.Is against the public rendr.Err* values. The
 // engine returns engine.Err* sentinels directly; rendr re-exports the
