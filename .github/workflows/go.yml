@@ -1,0 +1,45 @@
+name: go
+
+on:
+  push:
+    branches: [main, "v0.1.*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1 -timeout 180s
+
+      - name: go test -race
+        # -race is heavier; run only on linux to keep matrix time
+        # reasonable (Windows runners are already slower).
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./... -count=1 -race -timeout 240s
+
+      - name: go test -bench (smoke)
+        # Benchmarks compile + run a single iteration. Catches
+        # regressions in benchmark code without burning runner time
+        # on actual measurement.
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -run=^$ -bench=. -benchtime=1x -timeout 60s ./...
