@@ -37,16 +37,21 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		// contention; the underlying test code is the same, only the
 		// scheduler-driven variance differs.
 		retries int
+		// budget caps the per-attempt wall clock. `go test -timeout`
+		// is per-package, not global, so a hung package can stall
+		// indefinitely; a context deadline is the only reliable cap.
+		// Zero disables (used for trivial const-greps).
+		budget time.Duration
 	}{
-		{"go-vet", goVet, "", 0},
-		{"go-test", goTest, "", 0},
-		{"go-test-race", goTestRace, "linux", 1}, // 1 retry: scheduler-bound flakes only
-		{"go-bench-smoke", goBenchSmoke, "linux", 0},
-		{"const-proto-version", constProtoVersion, "", 0},
-		{"const-udpflow-version", constUDPFlowVersion, "", 0},
-		{"const-migration-budget-90s", constMigrationBudget, "", 0},
-		{"const-mode-values", constModeValues, "", 0},
-		{"const-mode-transition-table", constModeTransitionTable, "", 0},
+		{"go-vet", goVet, "", 0, 60 * time.Second},
+		{"go-test", goTest, "", 0, 5 * time.Minute},
+		{"go-test-race", goTestRace, "linux", 1, 6 * time.Minute},
+		{"go-bench-smoke", goBenchSmoke, "linux", 0, 90 * time.Second},
+		{"const-proto-version", constProtoVersion, "", 0, 0},
+		{"const-udpflow-version", constUDPFlowVersion, "", 0, 0},
+		{"const-migration-budget-90s", constMigrationBudget, "", 0, 0},
+		{"const-mode-values", constModeValues, "", 0, 0},
+		{"const-mode-transition-table", constModeTransitionTable, "", 0, 0},
 	}
 
 	for _, c := range cases {
@@ -62,7 +67,15 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		var err error
 		var attempts int
 		for attempts = 0; attempts <= c.retries; attempts++ {
-			err = c.fn(ctx, rendrRoot)
+			attemptCtx := ctx
+			var cancel context.CancelFunc
+			if c.budget > 0 {
+				attemptCtx, cancel = context.WithTimeout(ctx, c.budget)
+			}
+			err = c.fn(attemptCtx, rendrRoot)
+			if cancel != nil {
+				cancel()
+			}
 			if err == nil {
 				break
 			}
