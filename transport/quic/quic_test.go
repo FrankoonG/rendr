@@ -120,6 +120,127 @@ func TestQUICRoundTrip(t *testing.T) {
 	}
 }
 
+// TestQUICDatagramRoundTrip exercises the DATAGRAM-mode adapter:
+// client dials with Opts["mode"]="datagram", server accepts via the
+// Listener.AcceptDatagram path, both sides exchange a sub-MTU frame.
+// Validates SendDatagram / ReceiveDatagram plumbing end-to-end.
+func TestQUICDatagramRoundTrip(t *testing.T) {
+	srvTLS, cliTLS, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", srvTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvCh := make(chan *datagramPathConn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pc, err := ln.AcceptDatagram(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		srvCh <- pc
+	}()
+
+	tp := &Transport{ClientTLS: cliTLS}
+	cliPath, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"mode": "datagram"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := cliPath.(*datagramPathConn)
+	defer client.Close()
+
+	frame := bytes.Repeat([]byte{0xCD}, 500)
+	if _, err := client.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+
+	var server *datagramPathConn
+	select {
+	case server = <-srvCh:
+	case err := <-errCh:
+		t.Fatalf("accept: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server accept timed out")
+	}
+	defer server.Close()
+
+	buf := make([]byte, 1500)
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], frame) {
+		t.Fatalf("payload mismatch: got %d bytes, want %d", n, len(frame))
+	}
+
+	// Reverse direction.
+	rep := []byte("server-says-hi")
+	if _, err := server.Write(rep); err != nil {
+		t.Fatal(err)
+	}
+	n, err = client.Read(buf)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], rep) {
+		t.Fatalf("reply mismatch: got %q want %q", buf[:n], rep)
+	}
+
+	// Counter sanity.
+	if server.Reads() < 1 || client.Reads() < 1 {
+		t.Errorf("reads not counted: server=%d client=%d", server.Reads(), client.Reads())
+	}
+	if server.Writes() < 1 || client.Writes() < 1 {
+		t.Errorf("writes not counted: server=%d client=%d", server.Writes(), client.Writes())
+	}
+}
+
+// TestQUICDatagramOversizeRejected: SendDatagram with a frame larger
+// than MaxDatagramFrame must return an error without crashing.
+func TestQUICDatagramOversizeRejected(t *testing.T) {
+	srvTLS, cliTLS, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", srvTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = ln.AcceptDatagram(ctx)
+	}()
+
+	tp := &Transport{ClientTLS: cliTLS}
+	cliPath, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"mode": "datagram"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cliPath.Close()
+	client := cliPath.(*datagramPathConn)
+
+	huge := make([]byte, MaxDatagramFrame+1)
+	if _, err := client.Write(huge); err == nil {
+		t.Fatal("expected error for oversize DATAGRAM frame")
+	}
+}
+
 func TestQUICOversizeRejected(t *testing.T) {
 	p := newPair(t)
 	huge := make([]byte, MaxFrameSize+1)

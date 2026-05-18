@@ -50,12 +50,17 @@ func (*Transport) Name() string { return "quic" }
 // handshake, and opens a single bidirectional stream to carry rendr
 // frames. The returned PathConn is the (Connection, Stream) pair.
 //
-// spec.Opts recognised keys (M9 X4 path sub-config):
+// spec.Opts recognised keys:
 //
 //	server_name    TLS SNI override
 //	alpn           comma-separated ALPN list override
 //	insecure       "true" -> tls.Config.InsecureSkipVerify (dev only)
 //	ca_pem         inline PEM root certificate bundle
+//	mode           "datagram" -> use QUIC DATAGRAM frames instead
+//	               of a bidi stream (RFC 9221). Per-frame ceiling is
+//	               quic.MaxDatagramFrame. Pair with engine packet
+//	               mode for opaque-UDP-style apps; not suitable for
+//	               stream-mode rendr.
 func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
 	base := t.ClientTLS
 	if base == nil {
@@ -70,15 +75,19 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 		return nil, err
 	}
 
+	useDatagram := spec.Opts["mode"] == "datagram"
 	conn, err := qg.DialAddr(ctx, spec.Address, cfg, &qg.Config{
 		// Long enough to survive a brief migration window; engine
 		// MigrationBudget is the higher-level cap.
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
-		EnableDatagrams: false,
+		EnableDatagrams: useDatagram,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
+	}
+	if useDatagram {
+		return wrapDatagram(conn, false), nil
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {

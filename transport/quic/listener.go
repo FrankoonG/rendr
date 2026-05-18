@@ -30,6 +30,10 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	cfg := &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
+		// Always advertise DATAGRAM support; stream-mode peers
+		// ignore it. Lets the listener serve both stream- and
+		// datagram-mode clients on the same UDP port.
+		EnableDatagrams: true,
 	}
 	ln, err := qg.ListenAddr(addr, tlsCfg, cfg)
 	if err != nil {
@@ -63,4 +67,17 @@ func (l *Listener) Accept(ctx context.Context) (*PathConn, error) {
 		return nil, err
 	}
 	return wrap(conn, stream, true), nil
+}
+
+// AcceptDatagram blocks until a new QUIC connection arrives and
+// wraps it as a DATAGRAM-mode PathConn. Use when the client dialed
+// with PathSpec.Opts["mode"]="datagram". Unlike Accept, no stream is
+// opened; the connection is ready for SendDatagram / ReceiveDatagram
+// immediately.
+func (l *Listener) AcceptDatagram(ctx context.Context) (*datagramPathConn, error) {
+	conn, err := l.ln.Accept(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return wrapDatagram(conn, true), nil
 }
