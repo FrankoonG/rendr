@@ -5,6 +5,10 @@
 /chaos/*.exe
 /chaos/cmd/*/*.exe
 
+# IDE state
+/.idea/
+/.vscode/
+
 # Local tooling
 /.tools/
 
