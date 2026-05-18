@@ -59,6 +59,33 @@ func (d *Dialer) DialContext(ctx context.Context, dest net.Addr) (net.Conn, erro
 	return rd.Dial(ctx)
 }
 
+// DialPacketContext mirrors DialContext but produces a net.PacketConn
+// in packet-boundary mode. Each application WriteTo becomes exactly
+// one rendr frame; each ReadFrom returns one frame's payload. Use
+// this for xray protocols whose wire format is datagram-oriented
+// (e.g. Hysteria UDP, WireGuard relay, Shadowsocks UDP-over-TCP).
+//
+// The peer must accept via a rendr packet-mode listener (see
+// xray.ListenUDPFlow / rendr.ListenUDPFlowPacket). Stream-mode
+// listeners reject this dial with a HELLO-caps mismatch.
+func (d *Dialer) DialPacketContext(ctx context.Context, dest net.Addr) (net.PacketConn, error) {
+	mode := rendr.Mode(d.cfg.Mode)
+	if mode == 0 {
+		mode = rendr.ModePrime
+	}
+
+	rd := &rendr.Dialer{
+		Mode:            mode,
+		Paths:           toPathSpecs(d.cfg.Paths),
+		Hysteresis:      d.cfg.Hysteresis,
+		Dwell:           d.cfg.Dwell,
+		Cooldown:        d.cfg.Cooldown,
+		MigrationBudget: d.cfg.MigrationBudget,
+		ProbeInterval:   d.cfg.ProbeInterval,
+	}
+	return rd.DialPacket(ctx)
+}
+
 // toPathSpecs converts the xray-side Config.PathSpec into the
 // transport-package PathSpec the rendr Dialer consumes. The two
 // structs intentionally have the same layout; they live in

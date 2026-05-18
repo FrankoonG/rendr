@@ -102,3 +102,75 @@ func TestM9DialerRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestM9DialerPacketRoundTrip is the packet-mode analogue of
+// TestM9DialerRoundTrip. xray.ListenUDPFlow + Dialer.DialPacketContext
+// establish a rendr packet-mode connection without involving xray-core
+// proper; each application WriteTo lands as one ReadFrom on the peer
+// with byte-identical payload and a stable FlowID through the wrap.
+func TestM9DialerPacketRoundTrip(t *testing.T) {
+	ln, err := ListenUDPFlow("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacketContext(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d, err := NewDialer(&Config{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.DialPacketContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Two distinct packets - boundaries must survive the xray wrap.
+	pkts := [][]byte{
+		[]byte("hello-packet"),
+		[]byte("second one with different length"),
+	}
+	for _, p := range pkts {
+		if _, err := client.WriteTo(p, nil); err != nil {
+			t.Fatalf("WriteTo: %v", err)
+		}
+	}
+	buf := make([]byte, 256)
+	for i, want := range pkts {
+		n, _, err := server.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatalf("packet %d: got %q want %q", i, buf[:n], want)
+		}
+	}
+
+	// FlowID symmetry survives the xray packet wrap too.
+	if cli, ok := client.(rendr.PacketConn); ok {
+		if srv, ok := server.(rendr.PacketConn); ok {
+			if cli.FlowID() != srv.FlowID() {
+				t.Fatalf("flow_id mismatch: client=%x server=%x", cli.FlowID(), srv.FlowID())
+			}
+		}
+	}
+}
