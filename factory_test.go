@@ -90,11 +90,31 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 // the Dialer, the factory wins. Conversely, an unregistered factory
 // name falls through to the global registry without error.
 func TestM9X5StreamFactoryFallback(t *testing.T) {
+	// Part 1: unknown transport name returns an error and does NOT
+	// touch any listener. Use a closed listener to source an address
+	// for shape; never dial against it.
+	probe, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeAddr := probe.Addr().String()
+	probe.Close()
+	d := &Dialer{Paths: []PathSpec{{Transport: "no-such-transport", Address: probeAddr}}}
+	if _, err := d.Dial(context.Background()); err == nil {
+		t.Fatal("expected dial error for unknown transport")
+	}
+
+	// Part 2: "tcp" used without a factory -> falls back to the
+	// global transport.Default registry. Wait for the accept-side
+	// HELLO to fully complete before closing the listener to avoid
+	// racing with listener.handleHello on teardown.
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -102,22 +122,17 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 		if err != nil {
 			return
 		}
-		c.Close()
+		accepted <- c
 	}()
 
-	// 1) Unregistered transport name -> errors out (no fallback shadow)
-	d := &Dialer{Paths: []PathSpec{{Transport: "no-such-transport", Address: ln.Addr().String()}}}
-	if _, err := d.Dial(context.Background()); err == nil {
-		t.Fatal("expected dial error for unknown transport")
-	}
-
-	// 2) "tcp" used without registering a factory -> uses global registry
 	d2 := &Dialer{Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
 	c, err := d2.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial via global tcp: %v", err)
 	}
+	srv := <-accepted
 	c.Close()
+	srv.Close()
 }
 
 // TestM9X5AddStreamFactoryValidation covers the API guard rails:
