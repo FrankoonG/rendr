@@ -36,6 +36,10 @@ type PathInfo struct {
 	Reads   uint64
 	Writes  uint64
 	Active  bool
+	// RecvDups: inbound frames on this path whose SEQ was already
+	// delivered or buffered (race-mode duplicates, accidental
+	// retransmits). Sum across all paths equals ConnStats.RecvDups.
+	RecvDups uint64
 }
 
 // PathQuality is the most recent measurement of one path.

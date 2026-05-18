@@ -2098,6 +2098,16 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	if got := srvAdm.Stats().RecvDups; got != dups {
 		t.Errorf("Stats().RecvDups=%d disagrees with RecvDups()=%d", got, dups)
 	}
+
+	// Per-path RecvDups must sum to the engine-wide total. Confirms
+	// the attribution wiring works under race-mode fan-out.
+	var perPathSum uint64
+	for _, p := range srvAdm.Paths() {
+		perPathSum += p.RecvDups
+	}
+	if perPathSum != dups {
+		t.Errorf("sum of PathInfo.RecvDups = %d, Stats.RecvDups = %d", perPathSum, dups)
+	}
 }
 
 // TestM8BondPathPinning: with pin size = 4 and 2 paths, sending 16

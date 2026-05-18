@@ -142,6 +142,13 @@ type pathSlot struct {
 	spec     transport.PathSpec
 	attached time.Time
 
+	// recvDups counts inbound frames on THIS path whose SEQ had
+	// already been delivered or buffered. Used per-path so monitoring
+	// can identify which path is contributing duplicates under race
+	// or accidental retransmits. Atomic - touched from the receive
+	// path under recvMu, but readers via Paths() may run concurrently.
+	recvDups atomic.Uint64
+
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits
@@ -334,6 +341,7 @@ func (e *Engine) Paths() []transport.PathInfo {
 			pi.Reads = rw.Reads()
 			pi.Writes = rw.Writes()
 		}
+		pi.RecvDups = s.recvDups.Load()
 		out = append(out, pi)
 	}
 	return out
