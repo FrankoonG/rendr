@@ -89,6 +89,13 @@ type Engine struct {
 	recvPackets     [][]byte // pending packets for the next RecvPacket
 	packetized      bool     // when true, drainer routes payload to recvPackets
 
+	// recvDeadline is the application-set read deadline (zero = none).
+	// When non-zero, Recv / RecvPacket return a timeout error if no
+	// payload is available by the deadline. recvDeadlineTimer wakes
+	// the recvCond at deadline expiry.
+	recvDeadline      time.Time
+	recvDeadlineTimer *time.Timer
+
 	// recvQueueHWM is the maximum size the reorder buffer reached
 	// during this Conn's lifetime. Exposed for diagnostics so race-
 	// mode chaos / bond tests can spot 'dedup window overflow' that
@@ -410,6 +417,55 @@ func (e *Engine) SetMode(mode uint32) {
 
 // Mode returns the current dispatcher mode.
 func (e *Engine) Mode() uint32 { return e.mode.Load() }
+
+// SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
+// returns a timeout error (net.Error with Timeout()==true). The zero
+// time clears the deadline. Replaces any previously-set deadline.
+//
+// Hard rule #1 still applies: a timeout from a deadline is an
+// application-level error surface, not a migration-class error. The
+// engine's path machinery is unaffected.
+func (e *Engine) SetReadDeadline(t time.Time) error {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	if e.recvDeadlineTimer != nil {
+		e.recvDeadlineTimer.Stop()
+		e.recvDeadlineTimer = nil
+	}
+	e.recvDeadline = t
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		e.recvCond.Broadcast()
+		return nil
+	}
+	e.recvDeadlineTimer = time.AfterFunc(d, func() {
+		e.recvMu.Lock()
+		e.recvCond.Broadcast()
+		e.recvMu.Unlock()
+	})
+	return nil
+}
+
+// timeoutError implements net.Error with Timeout()==true.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "rendr: read deadline exceeded" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// ErrReadDeadlineExceeded is the sentinel returned by Recv/RecvPacket
+// when SetReadDeadline's deadline elapses before payload is ready.
+// Implements net.Error.
+var ErrReadDeadlineExceeded net.Error = timeoutError{}
+
+// recvDeadlineExceededLocked reports whether the read deadline has
+// elapsed. Caller holds recvMu.
+func (e *Engine) recvDeadlineExceededLocked() bool {
+	return !e.recvDeadline.IsZero() && !time.Now().Before(e.recvDeadline)
+}
 
 // SetPacketMode flips the engine's receive drainer to packet-boundary
 // delivery. Each DATA frame becomes one entry on the packet queue

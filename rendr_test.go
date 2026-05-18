@@ -43,6 +43,80 @@ func waitForNPaths(t *testing.T, client Conn, server Conn, transport, addr strin
 	return len(client.Paths()) >= n && len(server.Paths()) >= n
 }
 
+// TestSetReadDeadlineTimesOut: SetReadDeadline causes a subsequent
+// idle Read to return a net.Error with Timeout()==true once the
+// deadline elapses. Clearing the deadline (zero time) restores the
+// blocking behaviour. Validates that idle reads can be cancelled
+// without resorting to Close.
+func TestSetReadDeadlineTimesOut(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// 200 ms deadline; with no traffic Read should time out.
+	if err := server.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	t0 := time.Now()
+	buf := make([]byte, 16)
+	_, err = server.Read(buf)
+	elapsed := time.Since(t0)
+	if err == nil {
+		t.Fatal("Read: got nil error, want timeout")
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("Read: got %v, want net.Error with Timeout()==true", err)
+	}
+	if elapsed < 150*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("Read deadline imprecise: elapsed=%s, expected ~200 ms", elapsed)
+	}
+
+	// Clear the deadline. Read should now block again. We verify the
+	// blocking behaviour by writing from the client and seeing the
+	// Read complete with no timeout.
+	if err := server.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear deadline: %v", err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = client.Write([]byte("alive"))
+	}()
+	n, err := server.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after clearing deadline: %v", err)
+	}
+	if string(buf[:n]) != "alive" {
+		t.Fatalf("payload after clear: got %q", buf[:n])
+	}
+}
+
 // TestModeConstants pins the integer values of the public Mode enum.
 // The values must match internal/engine.dispatchPrime/Bond/Race
 // because (*engineBackedConn).SetMode passes uint32(rendr.Mode) to

@@ -43,10 +43,22 @@ func (c *Conn) Close() error { return c.E.Close() }
 func (c *Conn) LocalAddr() net.Addr  { return c.LAddr }
 func (c *Conn) RemoteAddr() net.Addr { return c.RAddr }
 
-// SetDeadline / SetReadDeadline / SetWriteDeadline are required by
-// net.Conn. M1 implements them as no-ops; future commits will plumb
-// them through the recv condvar. Applications that rely on deadlines
-// during M1 should not depend on cancellation precision.
-func (c *Conn) SetDeadline(t time.Time) error      { return nil }
-func (c *Conn) SetReadDeadline(t time.Time) error  { return nil }
+// SetDeadline sets both the read and write deadlines. The write
+// deadline is currently a no-op; the read deadline is honored by
+// Recv/RecvPacket and returns ErrReadDeadlineExceeded when elapsed.
+func (c *Conn) SetDeadline(t time.Time) error {
+	_ = c.SetWriteDeadline(t)
+	return c.SetReadDeadline(t)
+}
+
+// SetReadDeadline routes through to the engine's deadline tracker.
+// The zero time clears the deadline. Returned errors come from the
+// engine; the call itself currently never fails.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.E.SetReadDeadline(t) }
+
+// SetWriteDeadline is a no-op: rendr Writes never block on receive
+// data, only on path availability inside the migration budget, which
+// is a separate timeout. Honoring an application-level write deadline
+// would require interleaving with the dispatch loop and is deferred
+// until a concrete use case shows up.
 func (c *Conn) SetWriteDeadline(t time.Time) error { return nil }

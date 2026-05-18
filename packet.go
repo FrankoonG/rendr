@@ -64,8 +64,13 @@ func (c *enginePacketConn) Close() error {
 
 func (c *enginePacketConn) LocalAddr() net.Addr { return c.lAddr }
 
-func (c *enginePacketConn) SetDeadline(t time.Time) error      { return nil }
-func (c *enginePacketConn) SetReadDeadline(t time.Time) error  { return nil }
+// SetDeadline / SetReadDeadline route through to the engine. Write
+// deadline is currently a no-op; see engineBackedConn.SetWriteDeadline.
+func (c *enginePacketConn) SetDeadline(t time.Time) error {
+	_ = c.SetWriteDeadline(t)
+	return c.SetReadDeadline(t)
+}
+func (c *enginePacketConn) SetReadDeadline(t time.Time) error  { return c.e.SetReadDeadline(t) }
 func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }

@@ -42,6 +42,9 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 			}
 			return 0, net.ErrClosed
 		}
+		if e.recvDeadlineExceededLocked() {
+			return 0, ErrReadDeadlineExceeded
+		}
 		e.recvCond.Wait()
 	}
 }
@@ -69,6 +72,9 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 				return nil, err
 			}
 			return nil, net.ErrClosed
+		}
+		if e.recvDeadlineExceededLocked() {
+			return nil, ErrReadDeadlineExceeded
 		}
 		e.recvCond.Wait()
 	}
