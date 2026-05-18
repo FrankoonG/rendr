@@ -11,10 +11,10 @@ import (
 //
 //	score = rtt + JitterCoef*jitter + LossCoef*loss_per_1000
 //
-// Default coefficients align with docs/modes.md "综合分".
+// Default coefficients: rtt + jitter + 10ms per loss percent.
 type ScoreFn func(transport.PathQuality) float64
 
-// DefaultScoreFn implements docs/modes.md scoring with α=1.0 and
+// DefaultScoreFn implements the prime scoring with α=1.0 and
 // β=10ms per percent loss. β was picked so 5% loss adds 50 ms of
 // "effective RTT" - i.e. a 5% loss path is treated about as bad as
 // 50 ms of extra latency. Embedders that want a different curve can

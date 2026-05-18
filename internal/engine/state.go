@@ -56,7 +56,7 @@ type Limits struct {
 
 	// PrimeHysteresis: prime mode requires score(primary) >
 	// score(other) * (1 + Hysteresis) for the dwell window before
-	// switching. Default 0.25, per docs/modes.md.
+	// switching. Default 0.25.
 	PrimeHysteresis float64
 
 	// PrimeDwell: minimum duration a candidate must remain the

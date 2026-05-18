@@ -46,7 +46,7 @@ type Engine struct {
 	// bondPinLeft is how many more consecutive frames must stay on
 	// the current path before bondCursor advances. Path pinning is
 	// the M8 mitigation for reorder-window blow-up under RTT skew
-	// (docs/modes.md "1. path pinning"). When bondPinLeft hits 0 we
+	// (path pinning, see dispatchBond). When bondPinLeft hits 0 we
 	// bump bondCursor and refill bondPinLeft from bondPinSize.
 	bondCursor     uint64
 	bondPinLeft    int
@@ -99,7 +99,7 @@ type Engine struct {
 	// recvQueueHWM is the maximum size the reorder buffer reached
 	// during this Conn's lifetime. Exposed for diagnostics so race-
 	// mode chaos / bond tests can spot 'dedup window overflow' that
-	// docs/modes.md flags as a hard race-mode bug. Pure observer;
+	// is a hard race-mode bug to detect. Pure observer;
 	// the engine does not act on it.
 	recvQueueHWM int
 

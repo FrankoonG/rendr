@@ -2,11 +2,11 @@
 //
 // rendr is a transport-of-transports: it does not define a new wire
 // protocol; it wraps existing xray transports (tcp / quic / mkcp /
-// ws / grpc / h2) and adds the migration layer on top. See
-// docs/xray-integration.md for the protobuf shape and X1-X7 sub-stages.
+// ws / grpc / h2) and adds the migration layer on top.
 //
-// M0 deliverable: an empty Go package and a checklist
-// (xray/CHECKLIST.md) documenting every assumption the rendr core
-// makes about the xray transport contract. The implementation lands
-// no earlier than M9.
+// The package exposes Config + Dialer + Listener (stream) and
+// PacketListener (datagram) so embedders that import xray-core can
+// wire rendr into the transport.internet.Dialer contract, and
+// standalone embedders can use the API directly without an
+// xray-core dependency.
 package xray

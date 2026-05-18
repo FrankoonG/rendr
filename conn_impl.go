@@ -55,12 +55,11 @@ func (c *engineBackedConn) Paths() []PathInfo {
 
 func (c *engineBackedConn) FlowID() [16]byte { return c.e.FlowID() }
 
-// SetMode enforces the legal transitions documented in docs/modes.md.
-//   - prime ↔ race: allowed
-//   - prime → bond: allowed (M8+ only; for now stub rejects bond)
-//   - bond → prime: allowed
-//   - race → bond: forbidden (race has no per-path order; bond needs it)
-//   - bond → race: forbidden
+// SetMode enforces the legal mode transitions:
+//   - prime <-> race: allowed
+//   - prime <-> bond: allowed
+//   - race <-> bond: forbidden (race has no per-path order; bond
+//     requires it for reorder window bounding)
 func (c *engineBackedConn) SetMode(m Mode) error {
 	if !m.Valid() {
 		return ErrModeSwitchIllegal
@@ -85,7 +84,7 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
 
 // Migrate switches the active path to id. Exposed to external admin
-// surfaces (chaos harness, runtime balancers) via the AdminConn
+// surfaces (runtime balancers, monitoring panels) via the AdminConn
 // interface assertion.
 func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
 

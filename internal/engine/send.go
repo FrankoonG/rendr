@@ -183,7 +183,7 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // dispatchBond writes one frame to one path, with path-pinning:
 // after picking a path, the next bondPinSize-1 frames stay on it
 // before bondCursor advances. This bounds reorder-window growth
-// under RTT skew between paths (docs/modes.md "path pinning").
+// under RTT skew between paths.
 //
 // A path whose latest probe RTT exceeds best_rtt *
 // BondStuckRTTMultiplier (default 3x) is skipped on round-robin;

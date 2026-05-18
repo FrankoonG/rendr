@@ -197,7 +197,7 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 // any in-order suffix.
 //
 // The SEQ namespace is shared between data and ctrl frames (see
-// docs/architecture.md "不变量 #2"); both consume one SEQ. The
+// each consumes one SEQ for the contiguous-stream invariant). The
 // drainer dispatches each in turn so the application stream remains
 // contiguous regardless of how ctrl frames are interleaved.
 func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {

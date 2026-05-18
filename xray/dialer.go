@@ -11,9 +11,8 @@ import (
 // Dialer wraps a Config and dials a rendr.Conn (which is a net.Conn)
 // per call. It is the integration anchor for xray's
 // transport.internet.Dialer contract: an embedder that imports
-// xray-core wires this into the appropriate adapter (see X3 in
-// docs/xray-integration.md). Standalone embedders can use it
-// directly without any xray-core dependency.
+// xray-core wires this into the appropriate adapter. Standalone
+// embedders can use it directly without any xray-core dependency.
 type Dialer struct {
 	cfg *Config
 

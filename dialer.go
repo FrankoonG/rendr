@@ -13,10 +13,10 @@ import (
 
 // Dialer is the entry point for constructing a rendr Conn.
 //
-// Dialer is intentionally minimal: the path set is fixed at dial time.
-// The engine will not discover paths on its own; the embedder feeds
-// candidate PathSpecs and the engine decides when to actually attach
-// each (see docs/modes.md).
+// Dialer is intentionally minimal: the path set is fixed at dial
+// time. The engine will not discover paths on its own; the embedder
+// feeds candidate PathSpecs. Use AddPath / RemovePath on the
+// returned AdminConn to mutate the path set after dial.
 type Dialer struct {
 	// Mode is the initial operational mode.
 	Mode Mode

@@ -975,9 +975,9 @@ func TestM1CleanCloseEOF(t *testing.T) {
 }
 
 // TestM1G1Sketch: 32 MiB stream + 3 forced migrations + SHA-256
-// integrity. Functionally minified G1: real G1 demands â‰¥1 GiB and
-// runs in the chaos harness (gitignored test/); this version fits
-// the unit-test budget while exercising the same invariants:
+// integrity. Functionally minified G1: real G1 demands >= 1 GiB
+// (validated out-of-band); this version fits the unit-test budget
+// while exercising the same invariants:
 //   - migration is transparent to the application Conn
 //   - byte stream is contiguous and order-preserving
 //   - hash matches end-to-end
@@ -1112,9 +1112,9 @@ func TestM1G1Sketch(t *testing.T) {
 //   - migration is invisible to the application Conn
 //   - P99 RTT below a generous local-loopback bound
 //
-// Real G2 is 30 minutes / 30+ migrations; that belongs to the chaos
-// harness (chaos/ submodule). This sketch reproduces the
-// reorder-around-migration invariant cheaply.
+// Real G2 is 30 minutes / 30+ migrations and is validated
+// out-of-band. This sketch reproduces the reorder-around-migration
+// invariant cheaply.
 func TestM1G2Sketch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping G2 sketch in -short")
@@ -1468,8 +1468,8 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 }
 
 // TestAdminConnStateAndHWM: State() reports the bridge lifecycle
-// transitions and RecvQueueHWM exposes the dedup-buffer
-// observability hook required by docs/modes.md.
+// transitions and RecvQueueHWM exposes the dedup-buffer high-water
+// mark used to detect race-mode reorder window overflow.
 func TestAdminConnStateAndHWM(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
@@ -2082,8 +2082,9 @@ func TestAdminConnMigrationCount(t *testing.T) {
 // TestM7DedupWindowBoundedOnLoopback: race mode on loopback should
 // never grow the reorder buffer beyond a small number; on a fast
 // path-pair both copies of each frame arrive within microseconds,
-// so high-water-mark stays tiny. This is the diagnostic that
-// docs/modes.md asks for to detect 'dedup window overflow'.
+// so high-water-mark stays tiny. This diagnoses race-mode 'dedup
+// window overflow' - a hard race-mode bug when path RTT skew is
+// large enough to outrun the receiver's reorder window.
 func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {

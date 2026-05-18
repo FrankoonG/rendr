@@ -1,7 +1,7 @@
 // Package quic is the QUIC transport adapter.
 //
-// Per docs/udp-quic-migration.md: one QUIC connection corresponds to
-// exactly one rendr PathConn. The adapter opens a single bidirectional
+// One QUIC connection corresponds to exactly one rendr PathConn.
+// The adapter opens a single bidirectional
 // stream on the QUIC connection and carries length-prefixed rendr
 // frames over that stream (same framing as the TCP adapter). Stream
 // boundaries from QUIC are NOT used for rendr frame boundaries -

@@ -27,9 +27,9 @@ type Conn interface {
 	// an error describing the rejection cause.
 	SetMode(Mode) error
 
-	// FlowID returns the 16-byte flow identifier assigned at handshake.
-	// It is invariant for the Conn's lifetime (see docs/architecture.md
-	// "不变量").
+	// FlowID returns the 16-byte flow identifier assigned at
+	// handshake. It is invariant for the Conn's lifetime and serves
+	// as the demux key on the server side across path migration.
 	FlowID() [16]byte
 }
 
@@ -45,8 +45,8 @@ type PacketConn interface {
 // AdminConn extends Conn with operations that are not part of the
 // normal application surface: explicit path migration, active-path
 // introspection, and dynamic path attach. Tools that drive
-// migration externally (chaos harness, runtime balancers, debug
-// UIs) assert to this interface.
+// migration externally (runtime balancers, monitoring panels,
+// integration tests) assert to this interface.
 //
 // Application code should NOT depend on AdminConn; the engine
 // reserves the right to migrate on its own and an external migrate
@@ -78,10 +78,11 @@ type AdminConn interface {
 	State() string
 
 	// RecvQueueHWM returns the high-water mark of the reorder
-	// buffer over this Conn's lifetime. docs/modes.md flags
-	// "dedup window overflow" as a hard race-mode bug; this is
-	// the observability hook the chaos harness and production
-	// dashboards consult to spot it.
+	// buffer over this Conn's lifetime. A consistently-growing HWM
+	// in race mode indicates "dedup window overflow" - the receiver
+	// is buffering more out-of-order frames than the path RTT skew
+	// should produce, suggesting a path is dropping or stuck.
+	// Production dashboards consult this to spot the condition.
 	RecvQueueHWM() int
 
 	// RecvDups returns the cumulative count of frames whose SEQ
