@@ -1,13 +1,21 @@
 # Build outputs
 /bin/
 /dist/
-# Chaos harness binaries (go build artefacts)
-/chaos/*.exe
-/chaos/cmd/*/*.exe
 
 # IDE state
 /.idea/
 /.vscode/
+
+# Internal-only files kept out of the public repo.
+# These contain design notes, lessons from prior projects, test
+# methodology, operational inventory, and a chaos harness whose
+# contents reveal internal test approach. The Go library code is
+# public; the prose + harness layer is not.
+/CLAUDE.md
+/AGENTS.md
+/docs/
+/chaos/
+/xray/CHECKLIST.md
 
 # Local tooling
 /.tools/
