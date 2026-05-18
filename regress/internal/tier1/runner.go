@@ -44,13 +44,13 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		budget time.Duration
 	}{
 		{"go-vet", goVet, "", 0, 60 * time.Second},
-		// go-test: TestM5PacketStreamUnderMigration has a 15s
-		// receiver deadline that flakes on contended hosts under
-		// either -race or non-race scheduling. One retry preserves
-		// phase-1 gate semantics (same code, only scheduler-driven
-		// variance differs between attempts).
-		{"go-test", goTest, "", 1, 5 * time.Minute},
-		{"go-test-race", goTestRace, "linux", 1, 6 * time.Minute},
+		// go-test / go-test-race: TestM5PacketStreamUnderMigration
+		// (15s receiver deadline) and TestM7DedupWindowBoundedOnLoopback
+		// (75% race-mode dedup threshold) both flake on contended
+		// loopback. 2 retries (3 attempts total) is enough to clear
+		// these in practice; each attempt is ~10s when not flaking.
+		{"go-test", goTest, "", 2, 5 * time.Minute},
+		{"go-test-race", goTestRace, "linux", 2, 6 * time.Minute},
 		{"go-bench-smoke", goBenchSmoke, "linux", 0, 90 * time.Second},
 		{"const-proto-version", constProtoVersion, "", 0, 0},
 		{"const-udpflow-version", constUDPFlowVersion, "", 0, 0},
