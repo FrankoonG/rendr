@@ -19,16 +19,20 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const lengthPrefix = 2
 
 // Proxy forwards TCP byte streams that carry length-prefixed rendr
-// frames. Each direction can drop a percentage of frames.
+// frames. Each direction can drop a percentage of frames and add a
+// fixed per-frame delay.
 type Proxy struct {
 	UpstreamAddr   string
-	DropPctForward int // 0..100, drops frames from client toward server
-	DropPctReverse int // 0..100, drops frames from server toward client
+	DropPctForward int           // 0..100, drops frames from client toward server
+	DropPctReverse int           // 0..100, drops frames from server toward client
+	LatencyForward time.Duration // sleep before forwarding each frame, client -> server
+	LatencyReverse time.Duration // sleep before forwarding each frame, server -> client
 	Seed           int64
 
 	ln net.Listener
@@ -95,7 +99,7 @@ func (p *Proxy) handle(client net.Conn) {
 	rng := rand.New(src)
 	var rngMu sync.Mutex
 
-	pump := func(dir string, in net.Conn, out net.Conn, dropPct int) {
+	pump := func(dir string, in net.Conn, out net.Conn, dropPct int, latency time.Duration) {
 		defer in.Close()
 		defer out.Close()
 		buf := make([]byte, 1<<16)
@@ -133,6 +137,9 @@ func (p *Proxy) handle(client net.Conn) {
 				_ = dir
 				continue
 			}
+			if latency > 0 {
+				time.Sleep(latency)
+			}
 			if _, err := out.Write(lp); err != nil {
 				return
 			}
@@ -145,7 +152,7 @@ func (p *Proxy) handle(client net.Conn) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); pump("c->s", client, server, p.DropPctForward) }()
-	go func() { defer wg.Done(); pump("s->c", server, client, p.DropPctReverse) }()
+	go func() { defer wg.Done(); pump("c->s", client, server, p.DropPctForward, p.LatencyForward) }()
+	go func() { defer wg.Done(); pump("s->c", server, client, p.DropPctReverse, p.LatencyReverse) }()
 	wg.Wait()
 }
