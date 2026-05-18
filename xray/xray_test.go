@@ -175,6 +175,102 @@ func TestM9DialerPacketRoundTrip(t *testing.T) {
 	}
 }
 
+// TestM9XrayListenerFlowIDs: the xray.Listener / PacketListener
+// wrappers must pass-through FlowIDs() so production monitoring can
+// enumerate live flow_ids without unwrapping. After a successful
+// dial the returned set must contain exactly the dialed flow.
+func TestM9XrayListenerFlowIDs(t *testing.T) {
+	t.Run("stream", func(t *testing.T) {
+		ln, err := ListenTCP("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		if got := len(ln.FlowIDs()); got != 0 {
+			t.Errorf("pre-dial FlowIDs: got %d want 0", got)
+		}
+
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err := ln.AcceptContext(ctx)
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}()
+
+		d, err := NewDialer(&Config{
+			Mode:  ModePrime,
+			Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := d.DialContext(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		srv := <-accepted
+		defer srv.Close()
+
+		ids := ln.FlowIDs()
+		if len(ids) != 1 {
+			t.Fatalf("post-dial FlowIDs: got %d want 1", len(ids))
+		}
+		want := c.(rendr.Conn).FlowID()
+		if ids[0] != want {
+			t.Errorf("FlowIDs[0]: got %x want %x", ids[0], want)
+		}
+	})
+
+	t.Run("packet", func(t *testing.T) {
+		ln, err := ListenUDPFlow("127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		accepted := make(chan net.PacketConn, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err := ln.AcceptPacketContext(ctx)
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}()
+
+		d, err := NewDialer(&Config{
+			Mode:  ModePrime,
+			Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := d.DialPacketContext(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		srv := <-accepted
+		defer srv.Close()
+
+		ids := ln.FlowIDs()
+		if len(ids) != 1 {
+			t.Fatalf("post-dial FlowIDs: got %d want 1", len(ids))
+		}
+		want := c.(rendr.PacketConn).FlowID()
+		if ids[0] != want {
+			t.Errorf("FlowIDs[0]: got %x want %x", ids[0], want)
+		}
+	})
+}
+
 // TestM9AdminSurfaceThroughXrayWrap: the net.Conn / net.PacketConn
 // values returned by xray.Dialer must still satisfy rendr.AdminConn /
 // rendr.AdminPacketConn so embedders can plumb migration metrics and

@@ -48,3 +48,7 @@ func (l *PacketListener) Close() error { return l.inner.Close() }
 
 // Addr reports the local network address.
 func (l *PacketListener) Addr() net.Addr { return l.inner.Addr() }
+
+// FlowIDs returns the set of live flow_ids the packet listener is
+// serving. Symmetric with xray.Listener.FlowIDs.
+func (l *PacketListener) FlowIDs() [][16]byte { return l.inner.FlowIDs() }

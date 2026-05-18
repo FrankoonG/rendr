@@ -60,3 +60,8 @@ func (l *Listener) Close() error { return l.inner.Close() }
 
 // Addr reports the local network address.
 func (l *Listener) Addr() net.Addr { return l.inner.Addr() }
+
+// FlowIDs returns the set of live flow_ids the listener is serving.
+// Useful for monitoring panels that want to enumerate active rendr
+// connections without inspecting each accepted net.Conn.
+func (l *Listener) FlowIDs() [][16]byte { return l.inner.FlowIDs() }
