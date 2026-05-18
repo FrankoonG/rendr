@@ -1,6 +1,9 @@
 package rendr
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 // Conn is a stream-oriented rendr connection. It is a net.Conn that
 // survives underlying path changes.
@@ -136,4 +139,8 @@ type ConnStats struct {
 	RecvDups       uint64
 	BondStuckSkips uint64
 	MigrationCount uint64
+	// CreatedAt is the wall-clock time at which this connection's
+	// engine was constructed. Use time.Since(s.CreatedAt) to compute
+	// connection age.
+	CreatedAt time.Time
 }

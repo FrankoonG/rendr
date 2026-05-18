@@ -193,6 +193,11 @@ func NewClientFlowID() [16]byte {
 // FlowID returns the engine's flow identifier.
 func (e *Engine) FlowID() [16]byte { return e.flowID }
 
+// CreatedAt returns the monotonic wall-clock time at which this
+// engine was constructed. Production monitoring uses this to compute
+// connection age without polling Stats() at known intervals.
+func (e *Engine) CreatedAt() time.Time { return e.created }
+
 // State returns the current bridge state.
 func (e *Engine) State() BridgeState { return BridgeState(e.state.Load()) }
 

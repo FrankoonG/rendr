@@ -1309,6 +1309,15 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 		t.Errorf("Stats.RecvQueueHWM negative: %d", s.RecvQueueHWM)
 	}
 
+	// CreatedAt should be populated and reasonable: not zero,
+	// not in the future, and very recent (this test just dialed).
+	if s.CreatedAt.IsZero() {
+		t.Error("Stats.CreatedAt is zero; should be populated at dial")
+	}
+	if age := time.Since(s.CreatedAt); age < 0 || age > 30*time.Second {
+		t.Errorf("Stats.CreatedAt unreasonable: age=%s", age)
+	}
+
 	// Mode read should track SetMode write.
 	if err := client.SetMode(ModeRace); err != nil {
 		t.Fatal(err)
