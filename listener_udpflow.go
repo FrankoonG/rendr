@@ -28,13 +28,26 @@ func ListenUDPFlow(addr string) (Listener, error) {
 		return nil, err
 	}
 	l := &udpFlowListener{
-		ln:      ln,
-		bridges: engine.NewBridgeTable(),
-		accept:  make(chan *engineBackedConn, 16),
-		closed:  make(chan struct{}),
+		ln:           ln,
+		bridges:      engine.NewBridgeTable(),
+		accept:       make(chan *engineBackedConn, 16),
+		acceptPacket: make(chan *enginePacketConn, 16),
+		closed:       make(chan struct{}),
 	}
 	go l.acceptLoop()
 	return l, nil
+}
+
+// ListenUDPFlowPacket is a convenience constructor returning the same
+// listener cast to PacketListener. Stream and packet acceptors share
+// the same socket; HELLO caps decide which channel each connection
+// lands on.
+func ListenUDPFlowPacket(addr string) (PacketListener, error) {
+	ln, err := ListenUDPFlow(addr)
+	if err != nil {
+		return nil, err
+	}
+	return ln.(PacketListener), nil
 }
 
 type udpFlowListener struct {
@@ -42,9 +55,10 @@ type udpFlowListener struct {
 
 	bridges *engine.BridgeTable
 
-	accept    chan *engineBackedConn
-	acceptMu  sync.Mutex
-	acceptErr error
+	accept       chan *engineBackedConn
+	acceptPacket chan *enginePacketConn
+	acceptMu     sync.Mutex
+	acceptErr    error
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -55,6 +69,29 @@ func (l *udpFlowListener) Accept(ctx context.Context) (Conn, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case c, ok := <-l.accept:
+		if !ok {
+			l.acceptMu.Lock()
+			err := l.acceptErr
+			l.acceptMu.Unlock()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			return nil, err
+		}
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+// AcceptPacket blocks until a packet-mode HELLO arrives. A peer that
+// did not set proto.CapsPacketMode is routed to the stream-mode
+// Accept channel instead, not to AcceptPacket.
+func (l *udpFlowListener) AcceptPacket(ctx context.Context) (PacketConn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case c, ok := <-l.acceptPacket:
 		if !ok {
 			l.acceptMu.Lock()
 			err := l.acceptErr
@@ -101,6 +138,7 @@ func (l *udpFlowListener) acceptLoop() {
 			l.acceptErr = err
 			l.acceptMu.Unlock()
 			close(l.accept)
+			close(l.acceptPacket)
 			return
 		}
 		go l.serveIncoming(pc)
@@ -135,6 +173,10 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	packetMode := p.Caps&proto.CapsPacketMode != 0
+	if packetMode {
+		e.SetPacketMode()
+	}
 	if !l.bridges.Put(p.FlowID, e) {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()
@@ -150,10 +192,27 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 		return
 	}
 
+	lAddr := addrFromString(pc.LocalAddr())
+	rAddr := addrFromString(pc.RemoteAddr())
+
+	if packetMode {
+		bp := newEnginePacketConn(e, ModePrime, lAddr, rAddr)
+		go func(flowID [16]byte) {
+			<-bp.e.Closed()
+			l.bridges.Remove(flowID)
+		}(p.FlowID)
+		select {
+		case l.acceptPacket <- bp:
+		case <-l.closed:
+			_ = bp.Close()
+		}
+		return
+	}
+
 	c := &engine.Conn{
 		E:     e,
-		LAddr: addrFromString(pc.LocalAddr()),
-		RAddr: addrFromString(pc.RemoteAddr()),
+		LAddr: lAddr,
+		RAddr: rAddr,
 	}
 	bc := newEngineBackedConn(e, c, ModePrime)
 

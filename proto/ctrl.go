@@ -83,6 +83,16 @@ func FlagsForCtrl(c CtrlCode) uint16 {
 	return uint16(c) & 0xFF
 }
 
+// Caps bits negotiated in the HELLO payload. The set is forward-
+// extensible: a peer that does not understand a bit must ignore it.
+const (
+	// CapsPacketMode: client requests packet-boundary semantics
+	// (one frame -> one packet). The server's engine switches its
+	// receive drainer to deliver per-frame packets rather than
+	// concatenated byte stream. Stream-mode peers ignore this bit.
+	CapsPacketMode uint32 = 1 << 0
+)
+
 // HelloPayload: flow_id (16B) + caps (4B). 20 bytes on the wire.
 type HelloPayload struct {
 	FlowID [16]byte

@@ -34,6 +34,21 @@ func (e *Engine) SendData(buf []byte) (int, error) {
 	return sent, nil
 }
 
+// SendPacket emits exactly one DATA frame carrying buf as payload.
+// Returns ErrPacketTooLarge if len(buf) > MaxPayload. Unlike SendData,
+// this never fragments: packet-boundary semantics require the receiver
+// see the same byte boundary the sender drew. Zero-length buf is
+// legal and produces a zero-payload DATA frame (keepalive shape).
+//
+// Hard rule #1 still applies: a migration in flight blocks SendPacket
+// but never surfaces a migration-class error.
+func (e *Engine) SendPacket(buf []byte) error {
+	if len(buf) > MaxPayload {
+		return ErrPacketTooLarge
+	}
+	return e.sendFrame(proto.FrameData, 0, buf)
+}
+
 // SendBye emits a CTRL_BYE frame on the active path. Best-effort
 // and explicitly non-retrying: if the active path is dead or
 // missing, the call returns immediately with net.ErrClosed instead

@@ -15,4 +15,11 @@ var (
 	// the only attached path. Callers who want to fully tear down
 	// the connection should call Close instead.
 	ErrLastPath = errors.New("rendr: cannot remove the only attached path")
+
+	// ErrPacketTooLarge is returned by SendPacket when len(payload)
+	// exceeds engine.MaxPayload. The wire format caps a single DATA
+	// frame at MaxPayload; packet mode preserves boundaries 1-to-1
+	// and so a packet that does not fit is rejected rather than
+	// silently fragmented.
+	ErrPacketTooLarge = errors.New("rendr: packet exceeds MaxPayload")
 )

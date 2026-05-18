@@ -46,6 +46,34 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 	}
 }
 
+// RecvPacket pops the oldest pending packet from the engine's packet
+// queue. Blocks until at least one packet is available or the engine
+// is dead. Only valid when SetPacketMode was called; callers using
+// Recv on a packet-mode engine will deadlock because the drainer
+// never appends to recvDeliver.
+//
+// If the engine closes during the wait, RecvPacket returns
+// (nil, io.EOF) for a peer BYE or (nil, ErrMigrationBudgetExceeded)
+// for a budget exhaustion - same shape as Recv.
+func (e *Engine) RecvPacket() ([]byte, error) {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	for {
+		if len(e.recvPackets) > 0 {
+			p := e.recvPackets[0]
+			e.recvPackets = e.recvPackets[1:]
+			return p, nil
+		}
+		if e.isClosed() {
+			if err := e.CloseErr(); err != nil {
+				return nil, err
+			}
+			return nil, net.ErrClosed
+		}
+		e.recvCond.Wait()
+	}
+}
+
 // readerLoop is one goroutine per attached PathConn.
 func (e *Engine) readerLoop(slot *pathSlot) {
 	defer close(slot.doneR)
@@ -199,7 +227,14 @@ func (e *Engine) onFrameRecv(slot *pathSlot, hdr proto.Header, payload []byte) {
 		if item.isCtrl {
 			e.applyCtrlLocked(slot, item.flags, item.payload)
 		} else {
-			e.recvDeliver = append(e.recvDeliver, item.payload...)
+			if e.packetized {
+				// Packet mode: one frame -> one entry on the queue.
+				// Empty payload is preserved (some peer protocols
+				// emit zero-length keepalive packets).
+				e.recvPackets = append(e.recvPackets, item.payload)
+			} else {
+				e.recvDeliver = append(e.recvDeliver, item.payload...)
+			}
 			wokeReader = true
 			e.markPayloadLocked()
 		}

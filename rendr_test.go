@@ -2206,6 +2206,247 @@ func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
 	}
 }
 
+// TestM5PacketBoundariesPreserved: DialPacket / AcceptPacket negotiate
+// packet-boundary mode through HELLO caps. Each application WriteTo
+// becomes one frame on the wire, each ReadFrom returns one frame's
+// payload. Concatenated stream-mode behaviour is the failure case
+// this test guards against.
+func TestM5PacketBoundariesPreserved(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Send three packets of distinct sizes. If boundaries were lost
+	// the server would see them concatenated as one or more byte
+	// sequences with no separator.
+	packets := [][]byte{
+		[]byte("alpha"),
+		[]byte("bravo-bravo"),
+		bytes.Repeat([]byte("c"), 257),
+	}
+	for i, p := range packets {
+		if _, err := client.WriteTo(p, nil); err != nil {
+			t.Fatalf("WriteTo %d: %v", i, err)
+		}
+	}
+
+	buf := make([]byte, 1500)
+	for i, want := range packets {
+		n, addr, err := server.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom %d: %v", i, err)
+		}
+		if n != len(want) {
+			t.Fatalf("packet %d: got n=%d want %d", i, n, len(want))
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatalf("packet %d: payload mismatch", i)
+		}
+		if addr == nil {
+			t.Fatalf("packet %d: addr is nil", i)
+		}
+	}
+
+	// Reverse direction. Server emits two packets; client receives
+	// them as discrete entries.
+	rep := [][]byte{[]byte("ok"), []byte("seen-3")}
+	for _, r := range rep {
+		if _, err := server.WriteTo(r, nil); err != nil {
+			t.Fatalf("server WriteTo: %v", err)
+		}
+	}
+	for i, want := range rep {
+		n, _, err := client.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("client ReadFrom %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatalf("reply %d: payload mismatch", i)
+		}
+	}
+
+	if client.FlowID() != server.FlowID() {
+		t.Fatalf("flow_id mismatch")
+	}
+}
+
+// TestM5PacketRejectOversize: SendPacket / WriteTo with a payload
+// larger than engine.MaxPayload returns ErrPacketTooLarge and the
+// connection stays healthy for subsequent legal writes.
+func TestM5PacketRejectOversize(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// engine.MaxPayload is 32 KiB.
+	oversize := bytes.Repeat([]byte{0xAA}, 32*1024+1)
+	if _, err := client.WriteTo(oversize, nil); err == nil {
+		t.Fatal("oversize WriteTo: expected error, got nil")
+	}
+
+	// Healthy small write still succeeds.
+	small := []byte("ok")
+	if _, err := client.WriteTo(small, nil); err != nil {
+		t.Fatalf("legal WriteTo: %v", err)
+	}
+	buf := make([]byte, 32)
+	n, _, err := server.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("server ReadFrom: %v", err)
+	}
+	if !bytes.Equal(buf[:n], small) {
+		t.Fatalf("after oversize: payload mismatch %q", buf[:n])
+	}
+}
+
+// TestM5PacketSurvivesPlannedMigration: packet mode preserves
+// boundaries through an explicit Migrate() between two attached
+// udpflow paths. The application observes the same packet sequence
+// in spite of the wire swapping mid-stream.
+func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "udpflow", Address: ln.Addr().String()},
+			{Transport: "udpflow", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait both sides see 2 paths.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("expected 2 client paths, got %d", len(client.Paths()))
+	}
+
+	// Send 4 packets, migrate, send 4 more.
+	bc := client.(*enginePacketConn)
+	send := func(prefix string, n int) {
+		for i := 0; i < n; i++ {
+			pkt := []byte(prefix + string(rune('0'+i)))
+			if _, err := client.WriteTo(pkt, nil); err != nil {
+				t.Fatalf("WriteTo: %v", err)
+			}
+		}
+	}
+
+	send("pre-", 4)
+
+	// Switch to the other path.
+	cur := bc.e.ActivePath()
+	var other uint32
+	for _, p := range bc.Paths() {
+		if p.ID != cur {
+			other = p.ID
+			break
+		}
+	}
+	if other == 0 {
+		t.Fatal("no other path to migrate to")
+	}
+	if err := bc.e.Migrate(other); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	send("post", 4)
+
+	buf := make([]byte, 64)
+	want := []string{
+		"pre-0", "pre-1", "pre-2", "pre-3",
+		"post0", "post1", "post2", "post3",
+	}
+	for i, w := range want {
+		n, _, err := server.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom %d: %v", i, err)
+		}
+		if string(buf[:n]) != w {
+			t.Fatalf("packet %d: got %q want %q", i, buf[:n], w)
+		}
+	}
+}
+
 // TestM6PathRTTProbeRecords: after a fresh dial, the per-path
 // prober loop sends CtrlPathProbe every 1s; the peer echoes it
 // back; the engine writes the measured RTT into PathConn.Quality().

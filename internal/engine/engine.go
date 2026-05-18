@@ -70,7 +70,9 @@ type Engine struct {
 	recvCond        *sync.Cond
 	recvQueue       map[uint64]recvItem
 	expectedRecvSeq uint64
-	recvDeliver     []byte // pending bytes for the next Read
+	recvDeliver     []byte   // pending bytes for the next Read (stream)
+	recvPackets     [][]byte // pending packets for the next RecvPacket
+	packetized      bool     // when true, drainer routes payload to recvPackets
 
 	// recvQueueHWM is the maximum size the reorder buffer reached
 	// during this Conn's lifetime. Exposed for diagnostics so race-
@@ -384,6 +386,28 @@ func (e *Engine) SetMode(mode uint32) {
 
 // Mode returns the current dispatcher mode.
 func (e *Engine) Mode() uint32 { return e.mode.Load() }
+
+// SetPacketMode flips the engine's receive drainer to packet-boundary
+// delivery. Each DATA frame becomes one entry on the packet queue
+// drained by RecvPacket; SendPacket emits exactly one frame per call
+// (no chunking). Must be called BEFORE any frames flow on the engine;
+// once called, the engine is in packet mode for the rest of its life.
+// Stream and packet modes share the same wire format - the choice is
+// purely about receive-side semantics - so a stream-mode peer can
+// talk to a packet-mode peer as long as both agree at HELLO time
+// (negotiated via proto.CapsPacketMode).
+func (e *Engine) SetPacketMode() {
+	e.recvMu.Lock()
+	e.packetized = true
+	e.recvMu.Unlock()
+}
+
+// Packetized reports whether the engine is in packet-boundary mode.
+func (e *Engine) Packetized() bool {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	return e.packetized
+}
 
 // defaultBondPinSize is the number of consecutive frames bond
 // dispatch keeps on one path before moving to the next. 8 is a
