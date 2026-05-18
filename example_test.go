@@ -91,3 +91,41 @@ func ExampleAdminConn() {
 	// mode: prime
 	// paths: 1
 }
+
+// ExampleDialer_DialPacket demonstrates packet-boundary mode over
+// opaque UDP. Each WriteTo becomes one frame; each ReadFrom returns
+// one frame's payload. Use this for datagram-oriented protocols
+// (WireGuard, custom UDP echo) where boundaries must be preserved.
+func ExampleDialer_DialPacket() {
+	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvDone := make(chan struct{})
+	go func() {
+		defer close(srvDone)
+		c, err := ln.AcceptPacket(context.Background())
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 64)
+		n, _, _ := c.ReadFrom(buf)
+		fmt.Println("server got:", string(buf[:n]))
+	}()
+
+	d := &rendr.Dialer{
+		Mode:  rendr.ModePrime,
+		Paths: []rendr.PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+	}
+	c, err := d.DialPacket(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = c.WriteTo([]byte("hello packets"), nil)
+	<-srvDone
+	// Output: server got: hello packets
+}

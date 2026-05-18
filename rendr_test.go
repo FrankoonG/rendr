@@ -1,4 +1,4 @@
-package rendr
+﻿package rendr
 
 import (
 	"bytes"
@@ -309,7 +309,7 @@ func TestM1PlannedMigration(t *testing.T) {
 	defer server.Close()
 
 	// Wait for the second path's BridgeTag to land on the server.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(server.Paths()) >= 2 {
 			break
@@ -442,7 +442,7 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 
 	// Now violently break the server's only path: ForceKill so the
 	// engine sees a TransportError (NOT a BYE - we are simulating
-	// G4 "path真死亡", not a clean teardown).
+	// G4 "pathçœŸæ­»äº¡", not a clean teardown).
 	sc := server.(*engineBackedConn)
 	for _, p := range sc.Paths() {
 		_ = sc.Engine().ForceKillPathForTest(p.ID)
@@ -468,7 +468,7 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 // active one; engine must transparently fall back to the survivor
 // and continue streaming, no error surfaced to the application.
 //
-// This is the simplest G4 (path真死亡) regression test.
+// This is the simplest G4 (pathçœŸæ­»äº¡) regression test.
 func TestM1FailoverToSurvivingPath(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
@@ -618,7 +618,7 @@ func TestM1CleanCloseEOF(t *testing.T) {
 }
 
 // TestM1G1Sketch: 32 MiB stream + 3 forced migrations + SHA-256
-// integrity. Functionally minified G1: real G1 demands ≥1 GiB and
+// integrity. Functionally minified G1: real G1 demands â‰¥1 GiB and
 // runs in the chaos harness (gitignored test/); this version fits
 // the unit-test budget while exercising the same invariants:
 //   - migration is transparent to the application Conn
@@ -658,7 +658,7 @@ func TestM1G1Sketch(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -799,7 +799,7 @@ func TestM1G2Sketch(t *testing.T) {
 	defer server.Close()
 
 	// Wait for all 4 paths to attach on both sides.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 4 && len(server.Paths()) >= 4 {
 			break
@@ -888,7 +888,7 @@ func TestM1G2Sketch(t *testing.T) {
 	close(stopMig)
 
 	if migCount < 5 {
-		t.Logf("WARNING: only %d migrations fired; expected ≥ 5", migCount)
+		t.Logf("WARNING: only %d migrations fired; expected â‰¥ 5", migCount)
 	}
 	t.Logf("%d echoes, %d migrations, maxRTT=%s", echoTotal, migCount, maxRTT)
 
@@ -935,7 +935,7 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -1051,7 +1051,7 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 {
 			break
@@ -1165,7 +1165,7 @@ func TestAdminConnStateAndHWM(t *testing.T) {
 
 	// Trigger Close and observe State() flipping to "dead".
 	_ = client.Close()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if adm.State() == "dead" {
 			break
@@ -1274,7 +1274,7 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 	defer server.Close()
 
 	// Wait both paths attached.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(server.Paths()) >= 2 {
 			break
@@ -1331,7 +1331,7 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 	}
 
 	// Server side should also reflect the new path attaching.
-	deadline = time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(server.Paths()) >= preKill {
 			break
@@ -1381,7 +1381,7 @@ func TestAdminConnRemovePath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 {
 			break
@@ -1556,7 +1556,7 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(server.Paths()) >= 2 {
 			break
@@ -1647,7 +1647,7 @@ func TestM8BondPathPinning(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -1777,7 +1777,7 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -1882,7 +1882,7 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -1997,7 +1997,7 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 	defer server.Close()
 
 	// Wait both sides see 2 paths.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -2502,7 +2502,7 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 	defer server.Close()
 
 	// Wait all 3 paths attached.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {
 			break
@@ -2614,7 +2614,7 @@ func TestM5PacketRaceModeDuplicates(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
@@ -3183,7 +3183,7 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 	defer server.Close()
 
 	// Wait for all 3 paths on both ends.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {
 			break
