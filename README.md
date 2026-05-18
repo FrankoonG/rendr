@@ -1,10 +1,118 @@
 # rendr
 
-连接（tcp和udp）无损迁移框架，独立项目
+A connection-migration framework for Go. An application holds a stable
+`net.Conn` whose underlying network path rendr can swap — TCP socket,
+QUIC connection, or opaque-UDP flow — without surfacing any reset,
+EOF, or read-zero to the application.
 
-prime：稳定性优先！选取多路径中延迟和抖动最小的路径。xray-core具有类似算法（BalancerObject）
-bond：速度优先！多路径聚合带宽叠加，单连接高吞吐。
-race：不惜一切代价稳定！同时多路径发包到目的，先到哪个包用哪个。
+rendr does only this. Proxy protocols, peer discovery, configuration
+management, and detailed path-quality policies belong to the embedder.
 
-核心在于tcp与tcp，以及udp（quic）与udp之间进行无损连接迁移，可以不强求tcp和udp之间无损迁移
-其中tcp无损迁移难点在于可能需要先研究TCP_REPAIR/CRIU在linux下的实现方案，fallback方案可以是gvisor内实现tcp无损迁移
+```
+go get github.com/FrankoonG/rendr
+```
+
+## Quickstart
+
+Server:
+
+```go
+ln, err := rendr.ListenTCP("0.0.0.0:5555")
+if err != nil { log.Fatal(err) }
+for {
+    c, err := ln.Accept(context.Background())
+    if err != nil { return }
+    go handle(c) // c implements net.Conn
+}
+```
+
+Client:
+
+```go
+d := &rendr.Dialer{
+    Mode: rendr.ModePrime,
+    Paths: []rendr.PathSpec{
+        {Transport: "tcp",  Address: "h1:5555"},
+        {Transport: "quic", Address: "h2:5555"},
+    },
+}
+c, err := d.Dial(context.Background())
+// c.Read / c.Write survive a path swap.
+// c.FlowID() stays constant for the connection's lifetime.
+```
+
+Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`.
+
+Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`.
+
+## Modes
+
+| Mode    | Bandwidth          | Latency           | Use for                          |
+|---------|--------------------|-------------------|----------------------------------|
+| `prime` | best single path   | best single path  | SSH, RDP, control channels       |
+| `race`  | best single path   | min across paths  | trading, low-jitter UDP control  |
+| `bond`  | sum of paths       | mid               | large file, video, multi-link    |
+
+Set via `Dialer.Mode` or runtime `Conn.SetMode`. Legal transitions:
+`prime ↔ race`, `prime ↔ bond`. `race ↔ bond` is forbidden because
+race has no per-path SEQ ordering and bond requires it.
+
+## Migration is invisible
+
+The hard contract is that a path swap does **not** surface as an
+error from the application's `Read` or `Write`. If every path dies
+and no new one becomes available within the migration budget
+(default 90 s), `Read` returns `rendr.ErrMigrationBudgetExceeded`.
+Clean peer teardown surfaces as `io.EOF`.
+
+Transport-layer errors (TCP RST, QUIC idle timeout, UDP socket
+gone) are NEVER conflated with application EOF; they trigger
+migration silently.
+
+## Observability and control
+
+The `Conn` returned by `Dial` / `Accept` also implements
+`AdminConn`. Assert when you need it:
+
+```go
+adm := c.(rendr.AdminConn)
+s := adm.Stats()
+log.Printf("flow=%x state=%s mode=%s paths=%d hwm=%d",
+    s.FlowID, s.State, s.Mode, len(s.Paths), s.RecvQueueHWM)
+
+// Explicit migration:
+if newID, err := adm.AddPath(rendr.PathSpec{Transport: "tcp", Address: "h3:5555"}); err == nil {
+    _ = adm.Migrate(newID)
+}
+```
+
+`AdminConn` surface: `Migrate`, `ActivePath`, `AddPath`, `State`,
+`Mode`, `RecvQueueHWM`, `Stats`.
+
+## Acceptance contracts
+
+rendr is gated on five invariants — the implementation is not
+considered done until all five hold under chaos-scale tests:
+
+- **G1** Large file (≥1 GiB) with forced mid-stream migrations
+  finishes with identical SHA-256 and <10% baseline throughput
+  regression.
+- **G2** 30-minute echo loop with 30+ migrations, zero loss,
+  P99 RTT < baseline × 2.
+- **G3** 100k pps QUIC datagrams + 10 ConnID migrations, zero
+  application loss, P95 RTT < baseline × 2.
+- **G4** Path A force-killed (network DROP) with path B intact;
+  app sees no error; failover ≤ 5 s; in-flight data reaches the
+  peer via path B.
+- **G5** After G4, recover path A (via `AdminConn.AddPath`); it
+  re-joins the path set without spurious reorder.
+
+## Status
+
+In active development under tag prefix `v0.1.x`. Public API may
+still shift before `v1.0`; modes, AdminConn surface, and wire
+format v0 are pinned by tests against drift.
+
+## License
+
+See [LICENSE](./LICENSE).
