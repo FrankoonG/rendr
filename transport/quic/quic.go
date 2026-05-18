@@ -49,14 +49,25 @@ func (*Transport) Name() string { return "quic" }
 // DialPath connects to spec.Address (host:port), completes the QUIC
 // handshake, and opens a single bidirectional stream to carry rendr
 // frames. The returned PathConn is the (Connection, Stream) pair.
+//
+// spec.Opts recognised keys (M9 X4 path sub-config):
+//
+//	server_name    TLS SNI override
+//	alpn           comma-separated ALPN list override
+//	insecure       "true" -> tls.Config.InsecureSkipVerify (dev only)
+//	ca_pem         inline PEM root certificate bundle
 func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
-	cfg := t.ClientTLS
-	if cfg == nil {
+	base := t.ClientTLS
+	if base == nil {
 		_, ct, err := devTLSConfig()
 		if err != nil {
 			return nil, err
 		}
-		cfg = ct
+		base = ct
+	}
+	cfg, err := applyOptsToTLS(base, spec.Opts)
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := qg.DialAddr(ctx, spec.Address, cfg, &qg.Config{

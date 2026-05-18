@@ -8,9 +8,53 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"net"
+	"strings"
 	"time"
 )
+
+// applyOptsToTLS clones base and applies any path-spec overrides
+// (server_name, alpn, insecure, ca_pem). Returning a fresh clone
+// every call keeps concurrent DialPath calls from racing on the
+// shared base.
+func applyOptsToTLS(base *tls.Config, opts map[string]string) (*tls.Config, error) {
+	out := base.Clone()
+	if v, ok := opts["server_name"]; ok && v != "" {
+		out.ServerName = v
+	}
+	if v, ok := opts["alpn"]; ok && v != "" {
+		parts := strings.Split(v, ",")
+		out.NextProtos = parts
+		// Force the rendr ALPN to appear in the list - even if the
+		// embedder forgot it - because the server side advertises it.
+		hasRendr := false
+		for _, p := range parts {
+			if strings.TrimSpace(p) == ALPN {
+				hasRendr = true
+				break
+			}
+		}
+		if !hasRendr {
+			out.NextProtos = append(out.NextProtos, ALPN)
+		}
+	}
+	if v, ok := opts["insecure"]; ok && v == "true" {
+		out.InsecureSkipVerify = true //nolint:gosec // opt-in
+	}
+	if v, ok := opts["ca_pem"]; ok && v != "" {
+		pool := out.RootCAs
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM([]byte(v)) {
+			return nil, fmt.Errorf("quic: ca_pem did not contain any parseable certificate")
+		}
+		out.RootCAs = pool
+	}
+	return out, nil
+}
 
 // ALPN is the protocol identifier rendr advertises in QUIC TLS.
 // Embedders that want a custom ALPN must override via the Transport
@@ -32,6 +76,8 @@ func devTLSConfig() (server *tls.Config, client *tls.Config, err error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "rendr-dev"},
+		DNSNames:     []string{"rendr-dev", "localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
