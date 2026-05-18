@@ -134,6 +134,22 @@ In active development under tag prefix `v0.1.x`. Public API may
 still shift before `v1.0`; modes, AdminConn surface, and wire
 format v0 are pinned by tests against drift.
 
+The five acceptance contracts (G1-G5) have all been validated on
+the development branch:
+
+- G1 — 1 GiB transfer with mid-stream migrations, SHA-256 match,
+  <10% throughput regression
+- G2 — 60s continuous echo with 15+ migrations, 0 loss, P99 RTT
+  within 2× baseline
+- G3 — 100k pps QUIC DATAGRAM over 8-path bond with 11 migrations,
+  0 loss, P95 RTT 1.6ms (validated on Linux 6.8 with
+  `net.core.rmem_max` raised; the QUIC DATAGRAM transport needs
+  a larger socket receive buffer than the default 208 KiB)
+- G4 — force-killed path fails over to surviving path in <200ms
+  on loopback with zero application-visible error
+- G5 — `AdminConn.AddPath` recovers a dropped path back into the
+  active set without reorder artifacts
+
 ## License
 
 See [LICENSE](./LICENSE).
