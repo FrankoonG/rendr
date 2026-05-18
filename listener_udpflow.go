@@ -1,0 +1,188 @@
+package rendr
+
+import (
+	"context"
+	"net"
+	"sync"
+
+	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/proto"
+	uflow "github.com/FrankoonG/rendr/transport/udpflow"
+)
+
+// ListenUDPFlow starts an opaque-UDP rendr listener bound to addr.
+// It mirrors ListenTCP / ListenQUIC: inbound flows are demuxed by
+// their first ctrl frame (HELLO -> new engine / BRIDGE_TAG ->
+// attach path to existing engine), and the engine sees a
+// transport.PathConn that hides the UDP demux machinery entirely.
+//
+// Migration over opaque UDP is implicit at the transport layer: a
+// datagram arriving from a fresh 4-tuple but carrying a known
+// flow_id updates the corresponding ServerPathConn's RemoteAddr
+// without firing any engine-level migration. Engine-driven
+// migration (Engine.Migrate / prime / race) layers on top of that
+// and remains transport-agnostic.
+func ListenUDPFlow(addr string) (Listener, error) {
+	ln, err := uflow.Listen(addr)
+	if err != nil {
+		return nil, err
+	}
+	l := &udpFlowListener{
+		ln:      ln,
+		bridges: engine.NewBridgeTable(),
+		accept:  make(chan *engineBackedConn, 16),
+		closed:  make(chan struct{}),
+	}
+	go l.acceptLoop()
+	return l, nil
+}
+
+type udpFlowListener struct {
+	ln *uflow.Listener
+
+	bridges *engine.BridgeTable
+
+	accept    chan *engineBackedConn
+	acceptMu  sync.Mutex
+	acceptErr error
+
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (l *udpFlowListener) Accept(ctx context.Context) (Conn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case c, ok := <-l.accept:
+		if !ok {
+			l.acceptMu.Lock()
+			err := l.acceptErr
+			l.acceptMu.Unlock()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			return nil, err
+		}
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *udpFlowListener) Close() error {
+	var err error
+	l.closeOnce.Do(func() {
+		err = l.ln.Close()
+		close(l.closed)
+	})
+	return err
+}
+
+func (l *udpFlowListener) Addr() net.Addr      { return l.ln.Addr() }
+func (l *udpFlowListener) FlowIDs() [][16]byte { return l.bridges.Snapshot() }
+
+func (l *udpFlowListener) acceptLoop() {
+	for {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-l.closed
+			cancel()
+		}()
+		pc, err := l.ln.Accept(ctx)
+		cancel()
+		if err != nil {
+			select {
+			case <-l.closed:
+				return
+			default:
+			}
+			l.acceptMu.Lock()
+			l.acceptErr = err
+			l.acceptMu.Unlock()
+			close(l.accept)
+			return
+		}
+		go l.serveIncoming(pc)
+	}
+}
+
+func (l *udpFlowListener) serveIncoming(pc *uflow.ServerPathConn) {
+	hdr, payload, err := engine.ReadFirstFrame(pc)
+	if err != nil {
+		_ = pc.Close()
+		return
+	}
+	if hdr.Type != proto.FrameCtrl {
+		_ = pc.Close()
+		return
+	}
+	switch proto.CtrlCodeFromFlags(hdr.Flags) {
+	case proto.CtrlHello:
+		l.handleHello(pc, payload)
+	case proto.CtrlBridgeTag:
+		l.handleBridgeTag(pc, payload)
+	default:
+		_ = pc.Close()
+	}
+}
+
+func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) {
+	p, err := proto.DecodeHello(payload)
+	if err != nil {
+		_ = pc.Close()
+		return
+	}
+
+	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	if !l.bridges.Put(p.FlowID, e) {
+		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+
+	spec := PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}
+	if _, err := e.AttachPath(pc, spec); err != nil {
+		l.bridges.Remove(p.FlowID)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+
+	c := &engine.Conn{
+		E:     e,
+		LAddr: addrFromString(pc.LocalAddr()),
+		RAddr: addrFromString(pc.RemoteAddr()),
+	}
+	bc := newEngineBackedConn(e, c, ModePrime)
+
+	go func(flowID [16]byte) {
+		<-bc.e.Closed()
+		l.bridges.Remove(flowID)
+	}(p.FlowID)
+
+	select {
+	case l.accept <- bc:
+	case <-l.closed:
+		_ = bc.Close()
+	}
+}
+
+func (l *udpFlowListener) handleBridgeTag(pc *uflow.ServerPathConn, payload []byte) {
+	p, err := proto.DecodeBridgeTag(payload)
+	if err != nil {
+		_ = pc.Close()
+		return
+	}
+	e, ok := l.bridges.Get(p.BridgeID)
+	if !ok {
+		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = pc.Close()
+		return
+	}
+	spec := PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}
+	if _, err := e.AttachPath(pc, spec); err != nil {
+		_ = pc.Close()
+	}
+}

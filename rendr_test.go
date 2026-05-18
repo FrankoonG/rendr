@@ -992,6 +992,70 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 }
 
+// TestM5UDPFlowDialAcceptRoundTrip: Dialer over udpflow path +
+// ListenUDPFlow accept; data flows in both directions over an
+// opaque UDP datagram pair. Migration test (path swap on the same
+// flow_id) belongs to a chaos run; this just proves wire+API.
+func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
+	ln, err := ListenUDPFlow("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	want := []byte("rendr over opaque-udp")
+	if _, err := client.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload mismatch")
+	}
+
+	reply := []byte("ack from server")
+	if _, err := server.Write(reply); err != nil {
+		t.Fatal(err)
+	}
+	got2 := make([]byte, len(reply))
+	if _, err := io.ReadFull(client, got2); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got2, reply) {
+		t.Fatalf("reply mismatch")
+	}
+
+	if client.FlowID() != server.FlowID() {
+		t.Fatalf("flow_id mismatch")
+	}
+}
+
 // TestM6PathRTTProbeRecords: after a fresh dial, the per-path
 // prober loop sends CtrlPathProbe every 1s; the peer echoes it
 // back; the engine writes the measured RTT into PathConn.Quality().

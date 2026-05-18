@@ -201,7 +201,15 @@ func (p *ServerPathConn) observe(src *net.UDPAddr) {
 // deliver pushes an inbound rendr-frame payload to the inbox. If
 // the inbox is full the datagram is dropped on the floor - opaque
 // UDP is best-effort, dedup belongs in the engine layer.
+//
+// dead-flag check + recover guards against the natural race where
+// the listener's readLoop is still calling deliver after Close has
+// closed the inbox channel.
 func (p *ServerPathConn) deliver(payload []byte) {
+	if p.dead.Load() {
+		return
+	}
+	defer func() { _ = recover() }()
 	select {
 	case p.inbox <- payload:
 	default:
