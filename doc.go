@@ -32,6 +32,25 @@
 //	// c.Read / c.Write survive a path swap; c.FlowID() stays
 //	// constant for the connection's lifetime.
 //
+// # Packet-boundary mode (PacketConn)
+//
+// For datagram-oriented applications (WireGuard, opaque UDP echo,
+// any protocol that owns its own framing) use DialPacket /
+// ListenUDPFlowPacket. The wire format is identical; only the
+// receive side changes: each rendr DATA frame becomes one packet,
+// boundaries are preserved 1-to-1 with WriteTo / ReadFrom.
+//
+//	ln, _ := rendr.ListenUDPFlowPacket("0.0.0.0:5555")
+//	d := &rendr.Dialer{Mode: rendr.ModePrime,
+//	    Paths: []rendr.PathSpec{{Transport: "udpflow", Address: "h1:5555"}}}
+//	pc, _ := d.DialPacket(context.Background())
+//	_, _ = pc.WriteTo(packet, nil)  // one packet -> one frame
+//
+// Packet-mode negotiation happens in HELLO via proto.CapsPacketMode;
+// a stream-mode peer connecting to a packet listener is routed to
+// the regular Accept channel instead. The two modes can coexist on
+// one listener port.
+//
 // # Operational modes
 //
 // Three modes share the same migration engine. Set on Dialer.Mode
@@ -77,11 +96,18 @@
 // # AdminConn observability and control
 //
 // The public Conn returned by Dial / Accept also implements
-// AdminConn (assert if you need it). AdminConn exposes path
-// migration (Migrate, AddPath, ActivePath), mode read/write
-// (Mode, inherited SetMode), lifecycle (State), and a one-call
-// monitoring snapshot (Stats), plus the recv-queue HWM diagnostic
-// (RecvQueueHWM) that flags race-mode dedup-window overflow.
+// AdminConn (assert if you need it). PacketConn returned by
+// DialPacket / AcceptPacket implements AdminPacketConn with the
+// same surface. Both expose:
+//
+//   - Path-set management: Migrate, ActivePath, AddPath, RemovePath
+//   - Mode read/write: Mode, inherited SetMode
+//   - Lifecycle: State
+//   - Diagnostic counters: RecvQueueHWM (race-mode dedup window),
+//     RecvDups (race-mode dedup events), BondStuckSkips (bond stuck-
+//     path bypass count), MigrationCount (active-path changes)
+//   - One-call monitoring snapshot: Stats (returns ConnStats with
+//     all the above plus per-path PathInfo and FlowID)
 //
 // # Hard rules
 //

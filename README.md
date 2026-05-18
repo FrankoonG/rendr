@@ -45,6 +45,22 @@ Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`.
 
 Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`.
 
+## Packet mode
+
+For datagram-oriented applications, use `DialPacket` and
+`ListenUDPFlowPacket`. Each `WriteTo` becomes one wire frame; each
+`ReadFrom` returns one frame's payload. The wire format is identical
+to stream mode; the two are negotiated in HELLO.
+
+```go
+ln, _ := rendr.ListenUDPFlowPacket("0.0.0.0:5555")
+pc, _ := (&rendr.Dialer{
+    Mode: rendr.ModePrime,
+    Paths: []rendr.PathSpec{{Transport: "udpflow", Address: "h1:5555"}},
+}).DialPacket(context.Background())
+// pc implements net.PacketConn; boundaries preserved 1-to-1.
+```
+
 ## Modes
 
 | Mode    | Bandwidth          | Latency           | Use for                          |
@@ -86,8 +102,10 @@ if newID, err := adm.AddPath(rendr.PathSpec{Transport: "tcp", Address: "h3:5555"
 }
 ```
 
-`AdminConn` surface: `Migrate`, `ActivePath`, `AddPath`, `State`,
-`Mode`, `RecvQueueHWM`, `Stats`.
+`AdminConn` surface: `Migrate`, `ActivePath`, `AddPath`, `RemovePath`,
+`State`, `Mode`, `RecvQueueHWM`, `RecvDups`, `BondStuckSkips`,
+`MigrationCount`, `Stats`. Packet-mode connections expose the same
+methods via `AdminPacketConn`.
 
 ## Acceptance contracts
 
