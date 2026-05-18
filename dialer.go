@@ -9,6 +9,7 @@ import (
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
+	"github.com/FrankoonG/rendr/transport/tcp"
 )
 
 // Dialer is the entry point for constructing a rendr Conn.
@@ -64,6 +65,13 @@ type Dialer struct {
 	// round-robin. Default 3.0. Set lower to be more aggressive
 	// about bypassing slow paths.
 	BondStuckRTTMultiplier float64
+
+	// streamFactories / packetFactories are populated via
+	// AddStreamPathFactory / AddPacketPathFactory. They override
+	// transport.Default lookup for PathSpec.Transport names that
+	// match a registered factory. See factory.go for the API.
+	streamFactories map[string]StreamPathFactory
+	packetFactories map[string]PacketPathFactory
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -91,7 +99,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 
 	// Dial the first path and run HELLO.
 	first := d.Paths[0]
-	pc, err := dialPath(ctx, first)
+	pc, err := d.dialPathWithFactories(ctx, first)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -110,7 +118,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	// Attach any additional paths as bridge-tagged add-ons. They sit
 	// idle until Migrate switches to them or the active path dies.
 	for _, ps := range d.Paths[1:] {
-		spc, err := dialPath(ctx, ps)
+		spc, err := d.dialPathWithFactories(ctx, ps)
 		if err != nil {
 			// One bad extra path is not fatal for the Conn; warn
 			// silently and continue.
@@ -169,7 +177,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 
 	first := d.Paths[0]
-	pc, err := dialPath(ctx, first)
+	pc, err := d.dialPathWithFactories(ctx, first)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -186,7 +194,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 
 	for _, ps := range d.Paths[1:] {
-		spc, err := dialPath(ctx, ps)
+		spc, err := d.dialPathWithFactories(ctx, ps)
 		if err != nil {
 			continue
 		}
@@ -225,12 +233,34 @@ func (d *Dialer) engineLimits() engine.Limits {
 	}
 }
 
+// dialPath resolves spec to a transport.PathConn via the global
+// transport.Default registry. Used by post-dial paths (AddPath) that
+// don't have access to the originating Dialer's factory maps.
 func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 	tp, err := transport.Default.Lookup(spec.Transport)
 	if err != nil {
 		return nil, err
 	}
 	return tp.DialPath(ctx, spec)
+}
+
+// dialPathWithFactories is the Dialer-side variant. Consults the
+// Dialer's per-instance factory maps first (M9 X5 stage 1: stream
+// only), then falls back to dialPath. Stream factories wrap the
+// returned net.Conn via tcp.Wrap (the length-prefix-framing wrapper
+// shared with the tcp adapter and the Listener side).
+func (d *Dialer) dialPathWithFactories(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
+	if f, ok := d.streamFactories[spec.Transport]; ok {
+		conn, err := f(ctx, spec.Address)
+		if err != nil {
+			return nil, err
+		}
+		return tcp.Wrap(conn), nil
+	}
+	if _, ok := d.packetFactories[spec.Transport]; ok {
+		return nil, ErrPacketFactoryStage2
+	}
+	return dialPath(ctx, spec)
 }
 
 var errNoPaths = errors.New("rendr: Dialer has no Paths")

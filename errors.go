@@ -36,4 +36,10 @@ var (
 	// ErrNotImplemented is a build-stage placeholder used by API
 	// surfaces whose implementations land in later milestones.
 	ErrNotImplemented = errors.New("rendr: not implemented in this milestone")
+
+	// ErrPacketFactoryStage2 is returned by Dialer.AddPacketPathFactory
+	// in M9 X5 stage 1. Packet-mode factory support lands in stage 2
+	// once transport/udpflow's PathConn is refactored to accept any
+	// net.PacketConn (currently coupled to *net.UDPConn).
+	ErrPacketFactoryStage2 = errors.New("rendr: PacketPathFactory pending M9 X5 stage 2 (udpflow refactor)")
 )
