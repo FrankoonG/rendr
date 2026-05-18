@@ -48,9 +48,10 @@ type Engine struct {
 	// the M8 mitigation for reorder-window blow-up under RTT skew
 	// (docs/modes.md "1. path pinning"). When bondPinLeft hits 0 we
 	// bump bondCursor and refill bondPinLeft from bondPinSize.
-	bondCursor  uint64
-	bondPinLeft int
-	bondPinSize int // 0 = use defaultBondPinSize
+	bondCursor     uint64
+	bondPinLeft    int
+	bondPinSize    int    // 0 = use defaultBondPinSize
+	bondStuckSkips uint64 // count of round-robin slots bypassed for RTT
 
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
@@ -415,6 +416,17 @@ func (e *Engine) Packetized() bool {
 // sum-of-paths" and "large enough to amortise the reorder cost
 // from RTT skew between paths".
 const defaultBondPinSize = 8
+
+// BondStuckSkips returns the cumulative number of times bond
+// dispatch bypassed a path because its probe-measured RTT exceeded
+// best_path_rtt * BondStuckRTTMultiplier. Pure observability counter;
+// useful for verifying that the stuck-skip protection is actually
+// firing in production.
+func (e *Engine) BondStuckSkips() uint64 {
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	return e.bondStuckSkips
+}
 
 // SetBondPinSizeForTest is a backdoor for tests that want to
 // observe pinning without sending 64+ frames. Not part of the API.

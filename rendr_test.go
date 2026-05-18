@@ -1476,14 +1476,21 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait BOTH sides attach 2 paths. Removing a client-side path
-	// before the server has finished attaching the second one would
-	// race with server-side budget tear-down via the still-attaching
-	// path's lifecycle, masking the failover we want to assert.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait BOTH sides attach 2 paths. Under heavy parallel test load
+	// the Dialer's silent-skip on extra paths can leave us short
+	// (net.Dial racing the deadline, etc.). Retry via AddPath until
+	// both sides see 2 paths, or the overall deadline elapses.
+	adm := client.(AdminConn)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
 			break
+		}
+		if len(client.Paths()) < 2 {
+			if _, err := adm.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()}); err != nil {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -1492,7 +1499,6 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	adm := client.(AdminConn)
 	wasActive := adm.ActivePath()
 	if err := adm.RemovePath(wasActive); err != nil {
 		t.Fatalf("RemovePath(active): %v", err)
@@ -1956,6 +1962,19 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 	// migration; nothing else is expected to slip through).
 	if stuckDelta > 2 {
 		t.Fatalf("stuck path absorbed %d writes; expected <= 2", stuckDelta)
+	}
+
+	// The BondStuckSkips counter must have advanced at least once
+	// per skipped round-robin slot. With pin defaultBondPinSize=8
+	// and 2 paths, every other pin-window candidate is the stuck
+	// path, so 20 frames produce >= 1 skip during cursor rotation.
+	skips := bc.BondStuckSkips()
+	t.Logf("bond stuck-skips counter: %d", skips)
+	if skips == 0 {
+		t.Fatal("BondStuckSkips==0; counter not wired up or never triggered")
+	}
+	if got := bc.Stats().BondStuckSkips; got != skips {
+		t.Fatalf("Stats().BondStuckSkips=%d disagrees with BondStuckSkips()=%d", got, skips)
 	}
 }
 

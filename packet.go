@@ -98,6 +98,7 @@ func (c *enginePacketConn) ActivePath() uint32         { return c.e.ActivePath()
 func (c *enginePacketConn) State() string              { return c.e.State().String() }
 func (c *enginePacketConn) RecvQueueHWM() int          { return c.e.RecvQueueHighWaterMark() }
 func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
+func (c *enginePacketConn) BondStuckSkips() uint64     { return c.e.BondStuckSkips() }
 func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
@@ -126,13 +127,14 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 // for stream-mode Conn.
 func (c *enginePacketConn) Stats() ConnStats {
 	return ConnStats{
-		FlowID:       c.e.FlowID(),
-		State:        c.e.State().String(),
-		Mode:         Mode(c.mode.Load()),
-		ActivePath:   c.e.ActivePath(),
-		Paths:        c.e.Paths(),
-		RecvQueueHWM: c.e.RecvQueueHighWaterMark(),
-		RecvDups:     c.e.RecvDups(),
+		FlowID:         c.e.FlowID(),
+		State:          c.e.State().String(),
+		Mode:           Mode(c.mode.Load()),
+		ActivePath:     c.e.ActivePath(),
+		Paths:          c.e.Paths(),
+		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
+		RecvDups:       c.e.RecvDups(),
+		BondStuckSkips: c.e.BondStuckSkips(),
 	}
 }
 
@@ -148,6 +150,7 @@ type AdminPacketConn interface {
 	State() string
 	RecvQueueHWM() int
 	RecvDups() uint64
+	BondStuckSkips() uint64
 	Mode() Mode
 	Stats() ConnStats
 }

@@ -221,6 +221,9 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			cur := int(e.bondCursor % uint64(len(ids)))
 			if !stuck[cur] {
 				idx = cur
+			} else {
+				// Mid-pin: pinned path went stuck, force re-pick.
+				e.bondStuckSkips++
 			}
 		}
 		if idx < 0 {
@@ -239,6 +242,8 @@ func (e *Engine) dispatchBond(frame []byte) error {
 					chosen = j
 					break
 				}
+				// Path skipped because it is stuck.
+				e.bondStuckSkips++
 			}
 			if chosen < 0 {
 				chosen = int(e.bondCursor % uint64(len(ids)))

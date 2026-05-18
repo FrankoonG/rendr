@@ -88,6 +88,12 @@ type AdminConn interface {
 	// retransmits.
 	RecvDups() uint64
 
+	// BondStuckSkips returns the cumulative count of round-robin
+	// slots that bond dispatch bypassed because the candidate
+	// path's probe-measured RTT exceeded best_rtt *
+	// BondStuckRTTMultiplier. Always zero outside bond mode.
+	BondStuckSkips() uint64
+
 	// Mode returns the current operational mode (prime/race/bond).
 	// Symmetric counterpart to SetMode; lets callers verify a
 	// mode transition succeeded.
@@ -106,11 +112,12 @@ type AdminConn interface {
 // Layout is stable; fields are added to the end for forward
 // compatibility.
 type ConnStats struct {
-	FlowID       [16]byte
-	State        string
-	Mode         Mode
-	ActivePath   uint32
-	Paths        []PathInfo
-	RecvQueueHWM int
-	RecvDups     uint64
+	FlowID         [16]byte
+	State          string
+	Mode           Mode
+	ActivePath     uint32
+	Paths          []PathInfo
+	RecvQueueHWM   int
+	RecvDups       uint64
+	BondStuckSkips uint64
 }

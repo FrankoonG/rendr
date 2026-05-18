@@ -101,6 +101,9 @@ func (c *engineBackedConn) RecvQueueHWM() int { return c.e.RecvQueueHighWaterMar
 // RecvDups returns the cumulative count of duplicate frames reaped.
 func (c *engineBackedConn) RecvDups() uint64 { return c.e.RecvDups() }
 
+// BondStuckSkips returns the cumulative bond stuck-skip count.
+func (c *engineBackedConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips() }
+
 // Mode returns the current operational mode.
 func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 
@@ -109,13 +112,14 @@ func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 // lock, so the snapshot is consistent across the path set.
 func (c *engineBackedConn) Stats() ConnStats {
 	return ConnStats{
-		FlowID:       c.e.FlowID(),
-		State:        c.e.State().String(),
-		Mode:         Mode(c.mode.Load()),
-		ActivePath:   c.e.ActivePath(),
-		Paths:        c.e.Paths(),
-		RecvQueueHWM: c.e.RecvQueueHighWaterMark(),
-		RecvDups:     c.e.RecvDups(),
+		FlowID:         c.e.FlowID(),
+		State:          c.e.State().String(),
+		Mode:           Mode(c.mode.Load()),
+		ActivePath:     c.e.ActivePath(),
+		Paths:          c.e.Paths(),
+		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
+		RecvDups:       c.e.RecvDups(),
+		BondStuckSkips: c.e.BondStuckSkips(),
 	}
 }
 
