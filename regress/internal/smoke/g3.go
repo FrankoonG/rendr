@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -150,13 +151,18 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		return FromError(name, time.Since(t0), fmt.Errorf("client is not rendr.AdminPacketConn"))
 	}
 
-	// Server receiver: collect (seq, recv_ns) until either client
-	// signals done or duration deadline expires.
-	type rxRec struct {
-		seq      uint64
-		latencyN int64
+	// Server receiver: write directly to pre-sized slices guarded
+	// by a mutex. A buffered channel would block the receiver
+	// goroutine the moment buffer fills, deadlocking against the
+	// main loop's later drain (observed: goroutine stuck for 9min
+	// on chan send because PPS*Duration > buffer of PPS*2).
+	expected := int(opts.PPS) * int(opts.Duration.Seconds()*2) // 2x headroom
+	if expected < 1000 {
+		expected = 1000
 	}
-	recvCh := make(chan rxRec, opts.PPS*2)
+	var rxMu sync.Mutex
+	recvSeqs := make(map[uint64]struct{}, expected)
+	latNs := make([]int64, 0, expected)
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
@@ -173,7 +179,11 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 			}
 			seq := binary.BigEndian.Uint64(buf[:8])
 			sentNs := int64(binary.BigEndian.Uint64(buf[8:16]))
-			recvCh <- rxRec{seq: seq, latencyN: time.Now().UnixNano() - sentNs}
+			latency := time.Now().UnixNano() - sentNs
+			rxMu.Lock()
+			recvSeqs[seq] = struct{}{}
+			latNs = append(latNs, latency)
+			rxMu.Unlock()
 		}
 	}()
 
@@ -221,18 +231,17 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		atomic.AddInt64(&sent, 1)
 	}
 
-	// Give receiver a moment to drain in-flight datagrams.
+	// Give receiver a moment to drain in-flight datagrams, then
+	// force its ReadFrom to return via the deadline.
 	time.Sleep(500 * time.Millisecond)
 	_ = server.SetReadDeadline(time.Now())
 	<-recvDone
-	close(recvCh)
 
-	received := map[uint64]struct{}{}
-	latNs := make([]int64, 0, int(sent))
-	for r := range recvCh {
-		received[r.seq] = struct{}{}
-		latNs = append(latNs, r.latencyN)
-	}
+	rxMu.Lock()
+	received := recvSeqs
+	gotLat := latNs
+	rxMu.Unlock()
+
 	dur := time.Since(t0)
 	lost := int64(0)
 	for s := int64(0); s < sent; s++ {
@@ -242,23 +251,23 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 	}
 	lossPct := float64(lost) / float64(sent) * 100
 
-	sort.Slice(latNs, func(i, j int) bool { return latNs[i] < latNs[j] })
+	sort.Slice(gotLat, func(i, j int) bool { return gotLat[i] < gotLat[j] })
 	idx := func(p int) int64 {
-		if len(latNs) == 0 {
+		if len(gotLat) == 0 {
 			return 0
 		}
-		i := len(latNs) * p / 100
-		if i >= len(latNs) {
-			i = len(latNs) - 1
+		i := len(gotLat) * p / 100
+		if i >= len(gotLat) {
+			i = len(gotLat) - 1
 		}
-		return latNs[i]
+		return gotLat[i]
 	}
 	p50 := idx(50)
 	p95 := idx(95)
 	p99 := idx(99)
 	maxN := int64(0)
-	if len(latNs) > 0 {
-		maxN = latNs[len(latNs)-1]
+	if len(gotLat) > 0 {
+		maxN = gotLat[len(gotLat)-1]
 	}
 	migrations := admin.MigrationCount() - startMig
 
