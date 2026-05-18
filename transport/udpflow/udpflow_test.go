@@ -133,6 +133,125 @@ func TestUDPFlowOversizeRejected(t *testing.T) {
 	}
 }
 
+// TestUDPFlowListenerRoundTrip: Listen + Dial via the udpflow
+// adapter exchange a single rendr frame each direction. Confirms
+// the listener demux from a shared UDP socket and the server-side
+// ServerPathConn.Write back-channel.
+func TestUDPFlowListenerRoundTrip(t *testing.T) {
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	tp := New()
+	cliRaw, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"flow_id_hex": "01020304050607"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := cliRaw.(*PathConn)
+	defer cli.Close()
+
+	frame := []byte("client->server")
+	if _, err := cli.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv, err := ln.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	got := make([]byte, 1024)
+	n, err := srv.Read(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[:n], frame) {
+		t.Fatalf("server got %x want %x", got[:n], frame)
+	}
+
+	reply := []byte("server->client")
+	if _, err := srv.Write(reply); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cli.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got2 := make([]byte, 1024)
+	rn, err := cli.Read(got2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got2[:rn], reply) {
+		t.Fatalf("client got %x want %x", got2[:rn], reply)
+	}
+}
+
+// TestUDPFlowMigrationSameFlowFromNewTuple: send a datagram with
+// the established flow_id from a fresh UDP socket. The listener
+// should re-route to the existing ServerPathConn and update its
+// RemoteAddr - the engine / application sees no event.
+func TestUDPFlowMigrationSameFlowFromNewTuple(t *testing.T) {
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	tp := New()
+	cli, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"flow_id_hex": "deadbeefcafe00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv, err := ln.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := srv.RemoteAddr()
+	buf := make([]byte, 64)
+	if _, err := srv.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = cli.Close()
+
+	// New 4-tuple: hand-construct a UDP datagram with same flow_id.
+	cli2, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"flow_id_hex": "deadbeefcafe00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli2.Close()
+	if _, err := cli2.Write([]byte("migrated")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	second := srv.RemoteAddr()
+	if first == second {
+		t.Fatalf("expected migrated remote addr; both are %s", first)
+	}
+}
+
 func TestUDPFlowRandomFlowID(t *testing.T) {
 	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {

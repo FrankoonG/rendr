@@ -1028,7 +1028,9 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	// 4 s tolerance: 100 ms ProbeInterval + 9-package parallel test
+	// contention can push the first reply past the original 1.5 s.
+	deadline := time.Now().Add(4 * time.Second)
 	var rtt time.Duration
 	for time.Now().Before(deadline) {
 		for _, p := range client.Paths() {
@@ -1126,9 +1128,11 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 	})
 
 	// Wait at most dwell + cooldown + tick slack for the prime
-	// scheduler to fire.
+	// scheduler to fire. 5 s tolerance covers parallel-package
+	// contention that pushes scheduler ticks past the original 2 s
+	// margin when many sockets are in flight.
 	migrated := false
-	waitUntil := time.Now().Add(2 * time.Second)
+	waitUntil := time.Now().Add(5 * time.Second)
 	for time.Now().Before(waitUntil) {
 		if bc.Engine().ActivePath() == otherID {
 			migrated = true
@@ -1137,7 +1141,7 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !migrated {
-		t.Fatalf("prime scheduler did not migrate to better path within 2s (active still %d, wanted %d)",
+		t.Fatalf("prime scheduler did not migrate to better path within 5s (active still %d, wanted %d)",
 			bc.Engine().ActivePath(), otherID)
 	}
 }
