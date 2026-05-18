@@ -19,6 +19,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/tier1"
 	"github.com/FrankoonG/rendr/regress/internal/tier2"
+	"github.com/FrankoonG/rendr/regress/internal/tier3"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -112,14 +113,25 @@ func main() {
 				os.Exit(exitPhase1Stale)
 			}
 		}
-		fmt.Println("== phase 2: integration (T3/T4/T5) — not implemented yet ==")
-		// Phase 2 implementation is gated on:
-		//   - M9 X5 (PathFactory API) for T3 + T4
-		//   - M3-prod or M4 for T5
-		// Until those land, phase 2 is a no-op that exits 0. The
-		// gate logic above still enforces the contract so when
-		// phase 2 fills in, CI scripts already do the right thing.
-		writeReports(suite, cfg.reportDir)
+		// Default phase-2 invocation runs T3 (path-factory matrix).
+		// T4 long-run and T5 fallback are opt-in via --tier=4/5.
+		if cfg.tier == "" || cfg.tier == "3" {
+			fmt.Println("== phase 2 / T3: PathFactory × xray outbound matrix ==")
+			tier3.Run(ctx, suite, cfg.rendrRoot)
+			writeReports(suite, cfg.reportDir)
+			if suite.AnyFailedAt("T3") {
+				fmt.Fprintln(os.Stderr, "phase 2 / T3: FAILED")
+				os.Exit(exitT3Fail)
+			}
+			fmt.Println("phase 2 / T3: GREEN")
+		}
+		// T4 / T5 stubs (no-op until those impls land).
+		if cfg.tier == "4" {
+			fmt.Println("== phase 2 / T4: long-run — implementation pending ==")
+		}
+		if cfg.tier == "5" {
+			fmt.Println("== phase 2 / T5: TCP fallback — implementation pending (M3-prod/M4) ==")
+		}
 	}
 
 	if !runP1 && !runP2 {
