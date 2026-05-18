@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
@@ -235,6 +236,9 @@ func (l *udpFlowListener) handleBridgeTag(pc *uflow.ServerPathConn, payload []by
 		return
 	}
 	e, ok := l.bridges.Get(p.BridgeID)
+	if !ok {
+		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
+	}
 	if !ok {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()

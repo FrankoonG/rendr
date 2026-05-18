@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
@@ -178,9 +179,15 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		_ = pc.Close()
 		return
 	}
+	// Brief retry: under high concurrent dial pressure the BRIDGE_TAG
+	// goroutine can run before the corresponding HELLO has finished
+	// Put-ing the engine into the bridge table. Wait briefly for the
+	// flow_id to land before declaring it unknown.
 	e, ok := l.bridges.Get(p.BridgeID)
 	if !ok {
-		// Unknown bridge_id: BYE.
+		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
+	}
+	if !ok {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()
 		return
@@ -189,6 +196,20 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}
+}
+
+// waitBridgeArrival polls the bridge table for flow_id up to total,
+// returning the engine once present. Caller handles the not-found
+// branch (BYE + close) when total elapses.
+func waitBridgeArrival(bridges *engine.BridgeTable, flowID [16]byte, total time.Duration) (*engine.Engine, bool) {
+	deadline := time.Now().Add(total)
+	for time.Now().Before(deadline) {
+		if e, ok := bridges.Get(flowID); ok {
+			return e, true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, false
 }
 
 func specFromAddr(addr string) PathSpec {

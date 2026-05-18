@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
@@ -173,6 +174,9 @@ func (l *quicListener) handleBridgeTag(pc *qadapter.PathConn, payload []byte) {
 		return
 	}
 	e, ok := l.bridges.Get(p.BridgeID)
+	if !ok {
+		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
+	}
 	if !ok {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()

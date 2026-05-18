@@ -358,19 +358,9 @@ func TestM1PlannedMigration(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait for the second path's BridgeTag to land on the server.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(server.Paths()) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := len(client.Paths()); got != 2 {
-		t.Fatalf("client: %d paths, want 2", got)
-	}
-	if got := len(server.Paths()); got != 2 {
-		t.Fatalf("server: %d paths, want 2", got)
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
 	}
 
 	bc, ok := client.(*engineBackedConn)
@@ -2259,16 +2249,9 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait both sides see 2 paths.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if len(server.Paths()) < 2 {
-		t.Fatalf("server only has %d paths", len(server.Paths()))
+	if !waitForNPaths(t, client, server, "udpflow", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
 	}
 
 	bc := client.(*engineBackedConn)
