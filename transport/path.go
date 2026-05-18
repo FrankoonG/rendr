@@ -21,11 +21,21 @@ type PathSpec struct {
 }
 
 // PathInfo is the engine's read-only snapshot of one attached path.
+//
+// Reads / Writes are cumulative frame counters; transports that
+// don't instrument framing leave them at 0. Active is true iff this
+// path is the current send target under prime mode (always one
+// active path); under race/bond, Active flags the first path
+// returned by dispatch's iteration order and should not be used
+// for routing decisions.
 type PathInfo struct {
 	ID      uint32
 	Spec    PathSpec
 	Quality PathQuality
 	Since   time.Time
+	Reads   uint64
+	Writes  uint64
+	Active  bool
 }
 
 // PathQuality is the most recent measurement of one path.

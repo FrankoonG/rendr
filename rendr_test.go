@@ -1012,6 +1012,63 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
 }
 
+// TestPathInfoCountersExposed: Paths() must return Reads / Writes
+// counters and the Active flag so a production monitoring stack
+// can spot a saturated or idle path without poking into transport-
+// private types.
+func TestPathInfoCountersExposed(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Initially the path is active with at least HELLO written.
+	infos := client.Paths()
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 path, got %d", len(infos))
+	}
+	if !infos[0].Active {
+		t.Error("Active flag should be true on the single attached path")
+	}
+	preWrites := infos[0].Writes
+
+	// One application write -> at least one more frame on the wire.
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+
+	infos = client.Paths()
+	if infos[0].Writes <= preWrites {
+		t.Errorf("Writes did not advance after app write: %d -> %d", preWrites, infos[0].Writes)
+	}
+}
+
 // TestG5PathRecoveryViaAddPath: 2 paths, kill one, AddPath a
 // replacement (same spec); verify the new path attaches to the
 // existing engine via BRIDGE_TAG and the stream continues without

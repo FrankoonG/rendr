@@ -276,18 +276,30 @@ func (e *Engine) ActivePath() uint32 {
 	return e.activeID
 }
 
-// Paths returns a snapshot of all attached paths.
+// Paths returns a snapshot of all attached paths. Reads / Writes
+// counters are populated when the path adapter implements the
+// optional `interface{ Reads() uint64; Writes() uint64 }` shape
+// (all in-tree adapters do).
 func (e *Engine) Paths() []transport.PathInfo {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	out := make([]transport.PathInfo, 0, len(e.paths))
 	for _, s := range e.paths {
-		out = append(out, transport.PathInfo{
+		pi := transport.PathInfo{
 			ID:      s.id,
 			Spec:    s.spec,
 			Quality: s.conn.Quality(),
 			Since:   s.attached,
-		})
+			Active:  s.id == e.activeID,
+		}
+		if rw, ok := s.conn.(interface {
+			Reads() uint64
+			Writes() uint64
+		}); ok {
+			pi.Reads = rw.Reads()
+			pi.Writes = rw.Writes()
+		}
+		out = append(out, pi)
 	}
 	return out
 }
