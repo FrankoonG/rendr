@@ -1532,6 +1532,123 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 	}
 }
 
+// TestAdminConnOnMigrate: OnMigrate hooks must fire for both
+// explicit Migrate and death-driven failover. The cause field
+// distinguishes the two paths. Cancel must stop further events.
+func TestAdminConnOnMigrate(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 3, 8*time.Second) {
+		t.Fatalf("expected 3 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
+	}
+
+	adm := client.(AdminConn)
+
+	// Collect events via a channel so the test can verify cause + ids.
+	type ev struct {
+		oldID, newID uint32
+		cause        string
+	}
+	events := make(chan ev, 8)
+	cancel := adm.OnMigrate(func(o, n uint32, cause string) {
+		events <- ev{o, n, cause}
+	})
+
+	// 1. Explicit Migrate fires the hook with cause="explicit".
+	cur := adm.ActivePath()
+	var next uint32
+	for _, p := range adm.Paths() {
+		if p.ID != cur {
+			next = p.ID
+			break
+		}
+	}
+	if err := adm.Migrate(next); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	select {
+	case e := <-events:
+		if e.cause != "explicit" || e.oldID != cur || e.newID != next {
+			t.Fatalf("explicit hook: got %+v want {old=%d new=%d cause=explicit}", e, cur, next)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("explicit Migrate did not fire OnMigrate hook")
+	}
+
+	// 2. Death-driven failover fires with cause="death".
+	bc := client.(*engineBackedConn)
+	if err := bc.Engine().ForceKillPathForTest(adm.ActivePath()); err != nil {
+		t.Fatalf("ForceKillPathForTest: %v", err)
+	}
+	select {
+	case e := <-events:
+		if e.cause != "death" {
+			t.Fatalf("death hook: got cause=%s want death", e.cause)
+		}
+		if e.newID == 0 {
+			t.Fatal("death hook: newID=0; failover failed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("death failover did not fire OnMigrate hook")
+	}
+
+	// 3. Cancel; subsequent migration produces no events.
+	cancel()
+	cur = adm.ActivePath()
+	var third uint32
+	for _, p := range adm.Paths() {
+		if p.ID != cur {
+			third = p.ID
+			break
+		}
+	}
+	if third == 0 {
+		t.Skip("only one path remains; cannot test cancel branch")
+	}
+	if err := adm.Migrate(third); err != nil {
+		t.Fatalf("Migrate post-cancel: %v", err)
+	}
+	select {
+	case e := <-events:
+		t.Fatalf("hook fired after cancel: %+v", e)
+	case <-time.After(200 * time.Millisecond):
+		// expected: no event
+	}
+}
+
 // TestAdminConnMigrationCount: MigrationCount must reflect both
 // explicit Migrate calls and death-driven failover, but not count
 // the initial active-path assignment at Dial time.

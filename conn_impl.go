@@ -107,6 +107,11 @@ func (c *engineBackedConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips()
 // MigrationCount returns the cumulative active-path-change count.
 func (c *engineBackedConn) MigrationCount() uint64 { return c.e.MigrationCount() }
 
+// OnMigrate registers a callback fired on every active-path change.
+func (c *engineBackedConn) OnMigrate(fn func(uint32, uint32, string)) func() {
+	return c.e.OnMigrate(fn)
+}
+
 // Mode returns the current operational mode.
 func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 

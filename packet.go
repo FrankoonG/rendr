@@ -100,6 +100,11 @@ func (c *enginePacketConn) RecvQueueHWM() int          { return c.e.RecvQueueHig
 func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
 func (c *enginePacketConn) BondStuckSkips() uint64     { return c.e.BondStuckSkips() }
 func (c *enginePacketConn) MigrationCount() uint64     { return c.e.MigrationCount() }
+
+// OnMigrate registers a callback fired on every active-path change.
+func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
+	return c.e.OnMigrate(fn)
+}
 func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
@@ -154,6 +159,7 @@ type AdminPacketConn interface {
 	RecvDups() uint64
 	BondStuckSkips() uint64
 	MigrationCount() uint64
+	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
 	Mode() Mode
 	Stats() ConnStats
 }

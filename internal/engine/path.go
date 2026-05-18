@@ -23,8 +23,10 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 	delete(e.paths, id)
 	wasActive := e.activeID == id
 	migratedOk := false
+	var newActive uint32
 	if wasActive {
 		e.activeID = e.pickAnyActive()
+		newActive = e.activeID
 		if e.activeID == 0 {
 			e.setState(BridgeMigrating)
 		} else {
@@ -34,6 +36,10 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 	}
 	hasPaths := len(e.paths) > 0
 	e.pathsMu.Unlock()
+
+	if migratedOk {
+		e.fireMigrateHooks(id, newActive, "death")
+	}
 
 	switch cause {
 	case transport.CauseCleanClose:

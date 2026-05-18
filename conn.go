@@ -101,6 +101,14 @@ type AdminConn interface {
 	// to detect churn that may need human attention.
 	MigrationCount() uint64
 
+	// OnMigrate registers fn to fire (in its own goroutine) on every
+	// active-path change. cause is "explicit" for Migrate-driven
+	// transitions and "death" for failover via onPathDeath. The
+	// returned cancel function unsubscribes. Use this instead of
+	// polling MigrationCount when you want push-based notification
+	// (e.g. metrics, structured logs).
+	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
+
 	// Mode returns the current operational mode (prime/race/bond).
 	// Symmetric counterpart to SetMode; lets callers verify a
 	// mode transition succeeded.

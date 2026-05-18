@@ -60,6 +60,13 @@ type Engine struct {
 	// onPathDeath increment it. Read under pathsMu.
 	migrationCount uint64
 
+	// migrateHooks is the list of subscriber callbacks invoked
+	// (each in its own goroutine) when activeID changes. Registered
+	// via OnMigrate; cancelled via the returned cancel function.
+	// Held under pathsMu - same as migrationCount.
+	migrateHooks   map[uint64]func(oldID, newID uint32, cause string)
+	migrateHookID  uint64
+
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
 	paths      map[uint32]*pathSlot
@@ -330,22 +337,22 @@ func (e *Engine) Paths() []transport.PathInfo {
 // loss-safe).
 func (e *Engine) Migrate(id uint32) error {
 	e.pathsMu.Lock()
-	defer e.pathsMu.Unlock()
-
 	slot, ok := e.paths[id]
 	if !ok {
+		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: migrate to unknown path %d", id)
 	}
 	if e.activeID == id {
+		e.pathsMu.Unlock()
 		return nil
 	}
+	oldID := e.activeID
 	e.activeID = id
 	e.migrationCount++
 	e.setState(BridgeActive)
 
-	// Issue MIGRATE_NOTIFY on the new path so the peer can update its
-	// own view. Send is best-effort; if it fails, onPathDeath will
-	// trigger another migration.
+	// Build the MIGRATE_NOTIFY frame while still under the lock so
+	// sendSeq is serialised consistently with other ctrl emissions.
 	hdr := proto.Header{
 		Version: proto.Version,
 		Type:    proto.FrameCtrl,
@@ -356,9 +363,17 @@ func (e *Engine) Migrate(id uint32) error {
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	_ = hdr.Encode(frame[:proto.HeaderSize])
 	copy(frame[proto.HeaderSize:], payload)
-	// Write without holding pathsMu's full lock: the slot ref is captured.
+	pc := slot.conn
+	e.pathsMu.Unlock()
+
+	// Hook fan-out and the MIGRATE_NOTIFY send happen AFTER unlock so
+	// fireMigrateHooks can safely RLock pathsMu and hook callbacks
+	// can call back into AdminConn methods without deadlocking. If
+	// the captured pc has closed concurrently, the Write fails and
+	// onPathDeath will pick up the slack.
+	e.fireMigrateHooks(oldID, id, "explicit")
 	go func() {
-		_, _ = slot.conn.Write(frame)
+		_, _ = pc.Write(frame)
 	}()
 	return nil
 }
@@ -445,6 +460,50 @@ func (e *Engine) MigrationCount() uint64 {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	return e.migrationCount
+}
+
+// OnMigrate registers fn to be invoked (in a fresh goroutine) every
+// time the engine's active path changes. cause is one of "explicit"
+// (Migrate called by app) or "death" (onPathDeath promoting another
+// path). The returned function cancels the subscription.
+//
+// Hooks run after pathsMu has been released, so fn may safely call
+// back into AdminConn methods.
+func (e *Engine) OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func()) {
+	if fn == nil {
+		return func() {}
+	}
+	e.pathsMu.Lock()
+	if e.migrateHooks == nil {
+		e.migrateHooks = make(map[uint64]func(uint32, uint32, string))
+	}
+	e.migrateHookID++
+	id := e.migrateHookID
+	e.migrateHooks[id] = fn
+	e.pathsMu.Unlock()
+	return func() {
+		e.pathsMu.Lock()
+		delete(e.migrateHooks, id)
+		e.pathsMu.Unlock()
+	}
+}
+
+// fireMigrateHooks snapshots the hook set and invokes each fn in its
+// own goroutine. Caller must NOT hold pathsMu.
+func (e *Engine) fireMigrateHooks(oldID, newID uint32, cause string) {
+	e.pathsMu.RLock()
+	if len(e.migrateHooks) == 0 {
+		e.pathsMu.RUnlock()
+		return
+	}
+	hooks := make([]func(uint32, uint32, string), 0, len(e.migrateHooks))
+	for _, fn := range e.migrateHooks {
+		hooks = append(hooks, fn)
+	}
+	e.pathsMu.RUnlock()
+	for _, fn := range hooks {
+		go fn(oldID, newID, cause)
+	}
 }
 
 // SetBondPinSizeForTest is a backdoor for tests that want to
