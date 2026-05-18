@@ -175,6 +175,82 @@ func TestM9DialerPacketRoundTrip(t *testing.T) {
 	}
 }
 
+// TestM9XrayQUICDatagramRoundTrip: parallel to TestM9DialerPacketRoundTrip
+// but exercises QUIC DATAGRAM (RFC 9221) as the transport. Client
+// uses DialPacketContext with PathSpec.Opts["mode"]="datagram";
+// server uses xray.ListenQUICDatagram. Validates that the xray
+// PacketListener wrapper composes uniformly over QUIC DATAGRAM and
+// udpflow (same surface, swap constructor).
+func TestM9XrayQUICDatagramRoundTrip(t *testing.T) {
+	ln, err := ListenQUICDatagram("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacketContext(ctx)
+		if err != nil {
+			t.Errorf("AcceptPacketContext: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d, err := NewDialer(&Config{
+		Mode: ModePrime,
+		Paths: []PathSpec{{
+			Transport: "quic",
+			Address:   ln.Addr().String(),
+			Opts:      map[string]string{"mode": "datagram"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := d.DialPacketContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	srv := <-accepted
+	defer srv.Close()
+
+	pkts := [][]byte{[]byte("quic-dg-1"), []byte("quic-dg-second-message")}
+	for _, p := range pkts {
+		if _, err := c.WriteTo(p, nil); err != nil {
+			t.Fatalf("WriteTo: %v", err)
+		}
+	}
+	buf := make([]byte, 256)
+	for i, want := range pkts {
+		n, _, err := srv.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatalf("packet %d: got %q want %q", i, buf[:n], want)
+		}
+	}
+
+	if cli, ok := c.(rendr.PacketConn); ok {
+		if s, ok := srv.(rendr.PacketConn); ok {
+			if cli.FlowID() != s.FlowID() {
+				t.Fatalf("flow_id mismatch through xray QUIC DATAGRAM wrap")
+			}
+		}
+	}
+
+	// xray-side FlowIDs() pass-through still works for the new
+	// constructor.
+	if ids := ln.FlowIDs(); len(ids) != 1 {
+		t.Fatalf("FlowIDs post-dial: got %d want 1", len(ids))
+	}
+}
+
 // TestM9XrayListenerFlowIDs: the xray.Listener / PacketListener
 // wrappers must pass-through FlowIDs() so production monitoring can
 // enumerate live flow_ids without unwrapping. After a successful

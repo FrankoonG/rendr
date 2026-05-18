@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 
 	"github.com/FrankoonG/rendr"
@@ -24,6 +25,22 @@ type PacketListener struct {
 // only yields packet-mode HELLOs.
 func ListenUDPFlow(addr string) (*PacketListener, error) {
 	ln, err := rendr.ListenUDPFlowPacket(addr)
+	if err != nil {
+		return nil, err
+	}
+	return &PacketListener{inner: ln}, nil
+}
+
+// ListenQUICDatagram starts a QUIC listener that accepts incoming
+// connections in DATAGRAM mode (RFC 9221). One DATAGRAM == one rendr
+// frame; the engine runs in packet mode automatically. Pair with a
+// client dialer that uses Dialer.DialPacketContext + PathSpec
+// Opts["mode"]="datagram" on a QUIC path.
+//
+// tlsCfg may be nil during local development; production embedders
+// MUST supply a real *tls.Config.
+func ListenQUICDatagram(addr string, tlsCfg *tls.Config) (*PacketListener, error) {
+	ln, err := rendr.ListenQUICDatagram(addr, tlsCfg)
 	if err != nil {
 		return nil, err
 	}
