@@ -1012,6 +1012,115 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
 }
 
+// TestG5PathRecoveryViaAddPath: 2 paths, kill one, AddPath a
+// replacement (same spec); verify the new path attaches to the
+// existing engine via BRIDGE_TAG and the stream continues without
+// any application-visible error. This is the G5 acceptance
+// minimum: "path A recovers and re-joins the available set."
+func TestG5PathRecoveryViaAddPath(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	// Wait both paths attached.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(server.Paths()) < 2 {
+		t.Fatalf("server only has %d paths", len(server.Paths()))
+	}
+
+	// Sanity exchange.
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill one client path.
+	bc := client.(*engineBackedConn)
+	preKill := len(bc.Paths())
+	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if len(bc.Paths()) != preKill-1 {
+		t.Fatalf("after kill: paths=%d want %d", len(bc.Paths()), preKill-1)
+	}
+
+	// Recover: AddPath a fresh socket to the same listener.
+	newID, err := bc.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()})
+	if err != nil {
+		t.Fatalf("AddPath: %v", err)
+	}
+	if newID == 0 {
+		t.Fatal("AddPath returned 0 id")
+	}
+	if len(bc.Paths()) != preKill {
+		t.Fatalf("after AddPath: paths=%d want %d", len(bc.Paths()), preKill)
+	}
+
+	// Drive traffic on the recovered conn.
+	post := []byte("post-recovery")
+	if _, err := client.Write(post); err != nil {
+		t.Fatalf("write post-recovery: %v", err)
+	}
+	got := make([]byte, len(post))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("read post-recovery: %v", err)
+	}
+	if string(got) != string(post) {
+		t.Fatalf("post-recovery payload: got %q want %q", got, post)
+	}
+
+	// Server side should also reflect the new path attaching.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(server.Paths()) >= preKill {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(server.Paths()) < preKill {
+		t.Fatalf("server didn't see new BRIDGE_TAG: paths=%d want %d", len(server.Paths()), preKill)
+	}
+}
+
 // TestM7DedupWindowBoundedOnLoopback: race mode on loopback should
 // never grow the reorder buffer beyond a small number; on a fast
 // path-pair both copies of each frame arrive within microseconds,

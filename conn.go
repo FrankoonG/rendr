@@ -40,9 +40,10 @@ type PacketConn interface {
 }
 
 // AdminConn extends Conn with operations that are not part of the
-// normal application surface: explicit path migration and active-path
-// introspection. Tools that drive migration externally (chaos
-// harness, runtime balancers, debug UIs) assert to this interface.
+// normal application surface: explicit path migration, active-path
+// introspection, and dynamic path attach. Tools that drive
+// migration externally (chaos harness, runtime balancers, debug
+// UIs) assert to this interface.
 //
 // Application code should NOT depend on AdminConn; the engine
 // reserves the right to migrate on its own and an external migrate
@@ -51,4 +52,11 @@ type AdminConn interface {
 	Conn
 	Migrate(pathID uint32) error
 	ActivePath() uint32
+
+	// AddPath dials a new path matching spec and joins it to the
+	// existing engine via BRIDGE_TAG. Returns the new path id on
+	// success. This is the G5 "path recovery" primitive: after a
+	// path death, dial a fresh replacement (typically same spec)
+	// to bring the path set back to its original cardinality.
+	AddPath(spec PathSpec) (uint32, error)
 }

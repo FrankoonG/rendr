@@ -1,6 +1,7 @@
 package rendr
 
 import (
+	"context"
 	"net"
 	"sync/atomic"
 	"time"
@@ -90,3 +91,25 @@ func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
 
 // ActivePath returns the currently-active path id.
 func (c *engineBackedConn) ActivePath() uint32 { return c.e.ActivePath() }
+
+// AddPath dials a path matching spec and attaches it to this
+// engine via BRIDGE_TAG. The new path joins the existing flow on
+// the server side without breaking the application's Conn.
+func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pc, err := dialPath(ctx, spec)
+	if err != nil {
+		return 0, err
+	}
+	if err := engine.PerformClientBridgeTag(pc, c.e.FlowID()); err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	id, err := c.e.AttachPath(pc, spec)
+	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	return id, nil
+}
