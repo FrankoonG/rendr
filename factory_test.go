@@ -156,13 +156,100 @@ func TestM9X5AddStreamFactoryValidation(t *testing.T) {
 	}
 }
 
-// TestM9X5PacketFactoryStage2 confirms stage 1 returns the sentinel
-// error so embedders can errors.Is on it (and switch to a real
-// implementation when stage 2 lands).
-func TestM9X5PacketFactoryStage2(t *testing.T) {
+// TestM9X5PacketPathFactoryRoundTrip drives a packet-mode Dialer
+// entirely through an AddPacketPathFactory-registered source. The
+// factory returns a *net.UDPConn produced by net.ListenUDP (which
+// satisfies net.PacketConn). rendr's udpflow.WrapFromSpec then
+// resolves spec.Address as the peer for WriteTo and generates a
+// random flow_id. Asserts:
+//   - DialPacket succeeds via factory-supplied PacketConn
+//   - WriteTo / ReadFrom round-trip with rendr packet-mode framing
+//   - factory is invoked exactly once (single path)
+//   - flow_id symmetry between client and server
+func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptPacket(ctx)
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+
+	var dials atomic.Int32
+	factory := func(ctx context.Context, addr string) (net.PacketConn, error) {
+		dials.Add(1)
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+
+	d := &Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "factory-udp", Address: ln.Addr().String()}},
+	}
+	if err := d.AddPacketPathFactory("factory-udp", factory); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatalf("DialPacket: %v", err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	want := []byte("packet-factory round trip")
+	if _, err := client.WriteTo(want, nil); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 256)
+	if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := server.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != string(want) {
+		t.Fatalf("payload: got %q want %q", buf[:n], want)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("factory invoked %d times, want 1", dials.Load())
+	}
+	if client.(PacketConn).FlowID() != server.(PacketConn).FlowID() {
+		t.Fatalf("flow_id mismatch through packet factory wrap")
+	}
+}
+
+// TestM9X5AddPacketFactoryValidation: API guard rails for packet
+// factories — empty name, nil factory, duplicate registration,
+// shadow conflict with stream factory of the same name.
+func TestM9X5AddPacketFactoryValidation(t *testing.T) {
 	d := &Dialer{}
-	err := d.AddPacketPathFactory("dummy", func(context.Context, string) (net.PacketConn, error) { return nil, nil })
-	if !errors.Is(err, ErrPacketFactoryStage2) {
-		t.Fatalf("got %v, want ErrPacketFactoryStage2", err)
+	dummy := func(context.Context, string) (net.PacketConn, error) { return nil, nil }
+	if err := d.AddPacketPathFactory("", dummy); err == nil {
+		t.Fatal("empty name should error")
+	}
+	if err := d.AddPacketPathFactory("ok", nil); err == nil {
+		t.Fatal("nil factory should error")
+	}
+	if err := d.AddPacketPathFactory("p", dummy); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AddPacketPathFactory("p", dummy); err == nil || !strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("duplicate packet factory: %v", err)
+	}
+	// Cross-map shadow conflict: registering stream factory with same name.
+	streamFn := func(context.Context, string) (net.Conn, error) { return nil, nil }
+	if err := d.AddStreamPathFactory("p", streamFn); err == nil || !strings.Contains(err.Error(), "PacketPathFactory") {
+		t.Fatalf("expected stream-shadow-packet error, got %v", err)
 	}
 }

@@ -77,9 +77,13 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 	return transport.PathQuality{RTT: time.Since(start), At: time.Now()}, nil
 }
 
-// PathConn implements transport.PathConn over a connected UDP socket.
+// PathConn implements transport.PathConn over a connected datagram
+// socket. The conn field is typed net.Conn (not *net.UDPConn) so the
+// same struct can carry datagrams sourced from a vanilla UDP dial AND
+// from a user-supplied PacketPathFactory (which provides a
+// net.PacketConn; we wrap it with packetAsConn into net.Conn shape).
 type PathConn struct {
-	conn   *net.UDPConn
+	conn   net.Conn
 	flowID [proto.UDPFlowIDSize]byte
 
 	writeMu sync.Mutex
@@ -311,3 +315,73 @@ func init() {
 		panic(err)
 	}
 }
+
+// Wrap promotes an external net.PacketConn into an udpflow PathConn.
+// peer is the single remote endpoint that every outbound datagram is
+// targeted at (WriteTo) and every inbound datagram MUST come from
+// (mismatched sources are dropped, mirroring the connected-UDP-socket
+// behavior of DialPath).
+//
+// flowID is the 7-byte rendr UDP flow identifier embedded in every
+// outgoing datagram and validated on every inbound. The caller is
+// responsible for negotiating it out-of-band; the Dialer-side
+// PacketPathFactory codepath generates a random flow_id at session
+// start and passes it through here.
+//
+// Used by rendr.Dialer to back PacketPathFactory paths. Production
+// embedders MUST guarantee the returned net.PacketConn preserves
+// datagram boundaries and has an MTU sufficient for the rendr 8B
+// flow-id header plus expected payload (C2 packet-mode contract).
+func Wrap(pc net.PacketConn, peer net.Addr, flowID [proto.UDPFlowIDSize]byte) *PathConn {
+	return &PathConn{
+		conn:   &packetAsConn{pc: pc, peer: peer},
+		flowID: flowID,
+	}
+}
+
+// WrapFromSpec is the common Dialer call site: resolve the peer addr
+// from spec.Address (must be host:port for UDP), pick or generate the
+// flow_id according to spec.Opts (same semantics as DialPath), and
+// hand back a ready-to-attach PathConn. The supplied net.PacketConn
+// has its lifetime taken over by the PathConn (Close closes the pc).
+func WrapFromSpec(pc net.PacketConn, spec transport.PathSpec) (*PathConn, error) {
+	peer, err := net.ResolveUDPAddr("udp", spec.Address)
+	if err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("udpflow: resolve %s: %w", spec.Address, err)
+	}
+	flowID, err := parseOrRandomFlowID(spec.Opts)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	return Wrap(pc, peer, flowID), nil
+}
+
+// packetAsConn adapts a net.PacketConn pinned to a single peer into
+// the net.Conn shape PathConn consumes. Read/Write delegate to
+// ReadFrom/WriteTo with the pinned peer; deadlines and addresses
+// pass through. ReadFrom-returned source addresses are NOT compared
+// against peer here — the upper-layer flow_id check in PathConn.Read
+// is the authoritative drop gate (matches the existing wrong-flow
+// drop on the *net.UDPConn path).
+type packetAsConn struct {
+	pc   net.PacketConn
+	peer net.Addr
+}
+
+func (c *packetAsConn) Read(b []byte) (int, error) {
+	n, _, err := c.pc.ReadFrom(b)
+	return n, err
+}
+
+func (c *packetAsConn) Write(b []byte) (int, error) {
+	return c.pc.WriteTo(b, c.peer)
+}
+
+func (c *packetAsConn) Close() error                       { return c.pc.Close() }
+func (c *packetAsConn) LocalAddr() net.Addr                { return c.pc.LocalAddr() }
+func (c *packetAsConn) RemoteAddr() net.Addr               { return c.peer }
+func (c *packetAsConn) SetDeadline(t time.Time) error      { return c.pc.SetDeadline(t) }
+func (c *packetAsConn) SetReadDeadline(t time.Time) error  { return c.pc.SetReadDeadline(t) }
+func (c *packetAsConn) SetWriteDeadline(t time.Time) error { return c.pc.SetWriteDeadline(t) }

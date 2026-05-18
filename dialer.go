@@ -10,6 +10,7 @@ import (
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 	"github.com/FrankoonG/rendr/transport/tcp"
+	"github.com/FrankoonG/rendr/transport/udpflow"
 )
 
 // Dialer is the entry point for constructing a rendr Conn.
@@ -245,10 +246,12 @@ func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 }
 
 // dialPathWithFactories is the Dialer-side variant. Consults the
-// Dialer's per-instance factory maps first (M9 X5 stage 1: stream
-// only), then falls back to dialPath. Stream factories wrap the
-// returned net.Conn via tcp.Wrap (the length-prefix-framing wrapper
-// shared with the tcp adapter and the Listener side).
+// Dialer's per-instance factory maps first, then falls back to
+// dialPath. Stream factories wrap the returned net.Conn via tcp.Wrap;
+// packet factories wrap the returned net.PacketConn via
+// udpflow.WrapFromSpec (which resolves peer addr + flow_id from
+// spec). Both wrappers reuse the same on-wire framing as the built-
+// in tcp / udpflow adapters.
 func (d *Dialer) dialPathWithFactories(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 	if f, ok := d.streamFactories[spec.Transport]; ok {
 		conn, err := f(ctx, spec.Address)
@@ -257,8 +260,12 @@ func (d *Dialer) dialPathWithFactories(ctx context.Context, spec PathSpec) (tran
 		}
 		return tcp.Wrap(conn), nil
 	}
-	if _, ok := d.packetFactories[spec.Transport]; ok {
-		return nil, ErrPacketFactoryStage2
+	if f, ok := d.packetFactories[spec.Transport]; ok {
+		pc, err := f(ctx, spec.Address)
+		if err != nil {
+			return nil, err
+		}
+		return udpflow.WrapFromSpec(pc, spec)
 	}
 	return dialPath(ctx, spec)
 }

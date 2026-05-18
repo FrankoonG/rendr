@@ -28,9 +28,17 @@ import (
 // dial cancellation.
 type StreamPathFactory func(ctx context.Context, addr string) (net.Conn, error)
 
-// PacketPathFactory will play the same role for packet-mode paths
-// (rendr's flow-id-framed datagrams). Reserved for M9 X5 stage 2;
-// adding a factory raises ErrPacketFactoryStage2.
+// PacketPathFactory mirrors StreamPathFactory for packet-mode paths.
+// The returned net.PacketConn MUST preserve datagram boundaries
+// (single WriteTo == single peer ReadFrom) and have MTU sufficient
+// for the rendr 8-byte flow-id header plus expected payload.
+//
+// rendr-side wraps the returned net.PacketConn with
+// transport/udpflow.WrapFromSpec — the same flow-id framing layer
+// that backs the built-in udpflow transport. The factory does NOT
+// have to produce a "connected" socket: udpflow's WrapFromSpec
+// resolves PathSpec.Address as the WriteTo peer and validates
+// incoming flow_ids regardless of source-addr.
 type PacketPathFactory func(ctx context.Context, addr string) (net.PacketConn, error)
 
 // AddStreamPathFactory registers a stream factory under name. Any
@@ -63,9 +71,39 @@ func (d *Dialer) AddStreamPathFactory(name string, f StreamPathFactory) error {
 	return nil
 }
 
-// AddPacketPathFactory mirrors AddStreamPathFactory for packet-mode
-// paths. Currently returns ErrPacketFactoryStage2 — packet factory
-// support lands in M9 X5 stage 2 after the udpflow PathConn refactor.
+// AddPacketPathFactory registers a packet factory under name. Any
+// PathSpec in d.Paths whose Transport equals name is dialed via this
+// factory instead of transport.Default, used only by DialPacket()
+// (packet-mode sessions). The contract:
+//
+//   - The returned net.PacketConn MUST preserve datagram boundaries
+//     (one WriteTo == one peer ReadFrom).
+//   - MTU MUST be sufficient for the rendr 8B flow-id header plus
+//     expected payload.
+//   - PathSpec.Address (or PathSpec.Opts["peer_addr"] if you need to
+//     decouple "dial target" from "datagram peer") is resolved as
+//     net.ResolveUDPAddr and used as the WriteTo destination on every
+//     outgoing datagram.
+//   - PathSpec.Opts["flow_id_hex"] (14 hex digits = 7 bytes) overrides
+//     the random flow_id; otherwise crypto/rand picks one.
+//
+// Names are unique per Dialer across both stream and packet maps.
 func (d *Dialer) AddPacketPathFactory(name string, f PacketPathFactory) error {
-	return ErrPacketFactoryStage2
+	if name == "" {
+		return fmt.Errorf("rendr: empty PacketPathFactory name")
+	}
+	if f == nil {
+		return fmt.Errorf("rendr: nil PacketPathFactory %q", name)
+	}
+	if d.packetFactories == nil {
+		d.packetFactories = map[string]PacketPathFactory{}
+	}
+	if _, dup := d.packetFactories[name]; dup {
+		return fmt.Errorf("rendr: packet factory %q already registered on this Dialer", name)
+	}
+	if _, dup := d.streamFactories[name]; dup {
+		return fmt.Errorf("rendr: %q already registered as StreamPathFactory on this Dialer", name)
+	}
+	d.packetFactories[name] = f
+	return nil
 }
