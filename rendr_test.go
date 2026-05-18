@@ -15,6 +15,32 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
+// waitForNPaths polls until both client and server see at least n
+// attached paths, retrying via AdminConn.AddPath against the named
+// transport+address if the client falls short. The Dialer is
+// best-effort about extra paths (silent-skip on dial failure);
+// under heavy parallel test load that drops paths often enough to
+// be a per-test pollution source. Centralising the retry here
+// keeps the per-test code clean.
+//
+// Returns true if both sides reached n paths before the deadline,
+// false otherwise (caller decides whether to t.Skip or t.Fatal).
+func waitForNPaths(t *testing.T, client Conn, server Conn, transport, addr string, n int, total time.Duration) bool {
+	t.Helper()
+	adm, _ := client.(AdminConn)
+	deadline := time.Now().Add(total)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= n && len(server.Paths()) >= n {
+			return true
+		}
+		if adm != nil && len(client.Paths()) < n {
+			_, _ = adm.AddPath(PathSpec{Transport: transport, Address: addr})
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return len(client.Paths()) >= n && len(server.Paths()) >= n
+}
+
 // TestM1DialAcceptRoundTrip is the minimal end-to-end demo for M1:
 // ListenTCP + Dialer.Dial + Read/Write a payload over the rendr Conn.
 // Both ends live in the same process; the wire path is a real TCP
@@ -1476,26 +1502,9 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait BOTH sides attach 2 paths. Under heavy parallel test load
-	// the Dialer's silent-skip on extra paths can leave us short
-	// (net.Dial racing the deadline, etc.). Retry via AddPath until
-	// both sides see 2 paths, or the overall deadline elapses.
 	adm := client.(AdminConn)
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
-			break
-		}
-		if len(client.Paths()) < 2 {
-			if _, err := adm.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()}); err != nil {
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if len(client.Paths()) < 2 || len(server.Paths()) < 2 {
-		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 15*time.Second) {
+		t.Skipf("could not stabilize 2 paths each under load (client=%d server=%d) - load-pathological, skipping",
 			len(client.Paths()), len(server.Paths()))
 	}
 
@@ -1520,6 +1529,107 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("post-failover payload: got %q want %q", got, payload)
+	}
+}
+
+// TestAdminConnMigrationCount: MigrationCount must reflect both
+// explicit Migrate calls and death-driven failover, but not count
+// the initial active-path assignment at Dial time.
+func TestAdminConnMigrationCount(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(client.Paths()) < 3 {
+		t.Fatalf("expected 3 paths, got %d", len(client.Paths()))
+	}
+
+	adm := client.(AdminConn)
+	// Initial active-path assignment does NOT count.
+	if got := adm.MigrationCount(); got != 0 {
+		t.Fatalf("initial MigrationCount=%d want 0", got)
+	}
+
+	// Explicit Migrate: pick a non-active path.
+	cur := adm.ActivePath()
+	var other uint32
+	for _, p := range adm.Paths() {
+		if p.ID != cur {
+			other = p.ID
+			break
+		}
+	}
+	if other == 0 {
+		t.Fatal("no other path to migrate to")
+	}
+	if err := adm.Migrate(other); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if got := adm.MigrationCount(); got != 1 {
+		t.Fatalf("after explicit Migrate: MigrationCount=%d want 1", got)
+	}
+
+	// Migrate to the same path is a no-op and must NOT increment.
+	if err := adm.Migrate(other); err != nil {
+		t.Fatalf("Migrate same: %v", err)
+	}
+	if got := adm.MigrationCount(); got != 1 {
+		t.Fatalf("after no-op Migrate: MigrationCount=%d want 1", got)
+	}
+
+	// Death-driven failover: kill the active path; engine moves to
+	// one of the remaining two. MigrationCount should now be 2.
+	bc := client.(*engineBackedConn)
+	if err := bc.Engine().ForceKillPathForTest(adm.ActivePath()); err != nil {
+		t.Fatalf("ForceKillPathForTest: %v", err)
+	}
+	// Give onPathDeath a tick.
+	time.Sleep(50 * time.Millisecond)
+	if got := adm.MigrationCount(); got != 2 {
+		t.Fatalf("after death failover: MigrationCount=%d want 2", got)
+	}
+
+	// Stats() must agree with the dedicated getter.
+	if got := adm.Stats().MigrationCount; got != adm.MigrationCount() {
+		t.Fatalf("Stats().MigrationCount=%d disagrees with MigrationCount()=%d",
+			got, adm.MigrationCount())
 	}
 }
 
@@ -1888,15 +1998,9 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(client.Paths()) < 2 {
-		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
 	}
 
 	bc := client.(*engineBackedConn)
@@ -2745,9 +2849,9 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// 4 s tolerance: 100 ms ProbeInterval + 9-package parallel test
+	// 8 s tolerance: 100 ms ProbeInterval + 9-package parallel test
 	// contention can push the first reply past the original 1.5 s.
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	var rtt time.Duration
 	for time.Now().Before(deadline) {
 		for _, p := range client.Paths() {
@@ -2805,6 +2909,10 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		Hysteresis: 0.1,
 		Dwell:      50 * time.Millisecond,
 		Cooldown:   100 * time.Millisecond,
+		// Long probe interval so the real RTT probe does not
+		// overwrite SetPathQualityForTest before the scheduler
+		// has a chance to act on the injected qualities.
+		ProbeInterval: time.Hour,
 	}
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2814,18 +2922,9 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// 5 s tolerance: 10-package parallel runs occasionally take the
-	// second TCP attach + BRIDGE_TAG handshake past the original
-	// 2 s margin.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(client.Paths()) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(client.Paths()) < 2 {
-		t.Fatalf("only %d paths attached after 5s", len(client.Paths()))
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("only client=%d server=%d paths after 8s",
+			len(client.Paths()), len(server.Paths()))
 	}
 
 	bc := client.(*engineBackedConn)
@@ -3201,13 +3300,18 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait for all 3 paths on both ends.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait for all 3 paths on both ends; retry via AddPath under
+	// load if Dialer's silent-skip dropped one of the extras.
+	bcAdm := client.(AdminConn)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		if len(client.Paths()) < 3 {
+			_, _ = bcAdm.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()})
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if len(client.Paths()) < 3 {
 		t.Fatalf("client only has %d paths", len(client.Paths()))

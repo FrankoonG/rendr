@@ -104,6 +104,9 @@ func (c *engineBackedConn) RecvDups() uint64 { return c.e.RecvDups() }
 // BondStuckSkips returns the cumulative bond stuck-skip count.
 func (c *engineBackedConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips() }
 
+// MigrationCount returns the cumulative active-path-change count.
+func (c *engineBackedConn) MigrationCount() uint64 { return c.e.MigrationCount() }
+
 // Mode returns the current operational mode.
 func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 
@@ -120,6 +123,7 @@ func (c *engineBackedConn) Stats() ConnStats {
 		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
 		RecvDups:       c.e.RecvDups(),
 		BondStuckSkips: c.e.BondStuckSkips(),
+		MigrationCount: c.e.MigrationCount(),
 	}
 }
 

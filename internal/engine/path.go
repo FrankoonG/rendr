@@ -29,6 +29,7 @@ func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
 			e.setState(BridgeMigrating)
 		} else {
 			migratedOk = true
+			e.migrationCount++
 		}
 	}
 	hasPaths := len(e.paths) > 0

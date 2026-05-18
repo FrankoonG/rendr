@@ -94,6 +94,13 @@ type AdminConn interface {
 	// BondStuckRTTMultiplier. Always zero outside bond mode.
 	BondStuckSkips() uint64
 
+	// MigrationCount returns the cumulative number of active-path
+	// changes since this Conn was established (initial activation
+	// is not counted). Both explicit Migrate calls and death-
+	// driven failover contribute. Production dashboards use this
+	// to detect churn that may need human attention.
+	MigrationCount() uint64
+
 	// Mode returns the current operational mode (prime/race/bond).
 	// Symmetric counterpart to SetMode; lets callers verify a
 	// mode transition succeeded.
@@ -120,4 +127,5 @@ type ConnStats struct {
 	RecvQueueHWM   int
 	RecvDups       uint64
 	BondStuckSkips uint64
+	MigrationCount uint64
 }

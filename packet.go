@@ -99,6 +99,7 @@ func (c *enginePacketConn) State() string              { return c.e.State().Stri
 func (c *enginePacketConn) RecvQueueHWM() int          { return c.e.RecvQueueHighWaterMark() }
 func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
 func (c *enginePacketConn) BondStuckSkips() uint64     { return c.e.BondStuckSkips() }
+func (c *enginePacketConn) MigrationCount() uint64     { return c.e.MigrationCount() }
 func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
@@ -135,6 +136,7 @@ func (c *enginePacketConn) Stats() ConnStats {
 		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
 		RecvDups:       c.e.RecvDups(),
 		BondStuckSkips: c.e.BondStuckSkips(),
+		MigrationCount: c.e.MigrationCount(),
 	}
 }
 
@@ -151,6 +153,7 @@ type AdminPacketConn interface {
 	RecvQueueHWM() int
 	RecvDups() uint64
 	BondStuckSkips() uint64
+	MigrationCount() uint64
 	Mode() Mode
 	Stats() ConnStats
 }

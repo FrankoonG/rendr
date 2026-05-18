@@ -53,6 +53,13 @@ type Engine struct {
 	bondPinSize    int    // 0 = use defaultBondPinSize
 	bondStuckSkips uint64 // count of round-robin slots bypassed for RTT
 
+	// migrationCount tracks the number of active-path changes that
+	// happened AFTER the engine first became Active. The initial
+	// assignment of activeID at AttachPath time is not counted.
+	// Both explicit Migrate() and death-driven failover via
+	// onPathDeath increment it. Read under pathsMu.
+	migrationCount uint64
+
 	// Path management. activeID == 0 means "no active path".
 	pathsMu    sync.RWMutex
 	paths      map[uint32]*pathSlot
@@ -333,6 +340,7 @@ func (e *Engine) Migrate(id uint32) error {
 		return nil
 	}
 	e.activeID = id
+	e.migrationCount++
 	e.setState(BridgeActive)
 
 	// Issue MIGRATE_NOTIFY on the new path so the peer can update its
@@ -426,6 +434,17 @@ func (e *Engine) BondStuckSkips() uint64 {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	return e.bondStuckSkips
+}
+
+// MigrationCount returns the cumulative number of active-path
+// changes since this engine was created, excluding the initial
+// active-path assignment. Both explicit Migrate() calls and
+// death-driven failover via onPathDeath contribute. Production
+// dashboards can use this to gauge churn on a flow.
+func (e *Engine) MigrationCount() uint64 {
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	return e.migrationCount
 }
 
 // SetBondPinSizeForTest is a backdoor for tests that want to
