@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/gate"
@@ -35,13 +36,14 @@ const (
 )
 
 type runFlags struct {
-	phase        string
-	tier         string
-	forcePhase2  bool
-	profile      string
-	caseID       string
-	reportDir    string
-	rendrRoot    string
+	phase          string
+	tier           string
+	forcePhase2    bool
+	allowNonLinux  bool
+	profile        string
+	caseID         string
+	reportDir      string
+	rendrRoot      string
 }
 
 func parseFlags() runFlags {
@@ -49,6 +51,7 @@ func parseFlags() runFlags {
 	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
 	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5")
 	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
+	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
 	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
 	flag.StringVar(&f.caseID, "case", "", "specific case id to run")
 	flag.StringVar(&f.reportDir, "report-dir", "reports", "directory to write JUnit + Markdown summary into")
@@ -59,6 +62,17 @@ func parseFlags() runFlags {
 
 func main() {
 	cfg := parseFlags()
+	// Linux-only safety check. docs/regression-suite.md §3 specifies
+	// the suite runs in a Linux container (iptables / tc / netns /
+	// -race). Running on Windows / macOS hosts can mask real
+	// regressions that only surface under Linux scheduling.
+	if runtime.GOOS != "linux" && !cfg.allowNonLinux {
+		fmt.Fprintf(os.Stderr,
+			"regress: refusing to run on %s — the suite is designed for Linux.\n", runtime.GOOS)
+		fmt.Fprintln(os.Stderr, "  Use scripts/regress.sh to run inside the docker container.")
+		fmt.Fprintln(os.Stderr, "  For dev iteration only, pass --allow-non-linux to bypass.")
+		os.Exit(exitEnvError)
+	}
 	if err := tier1.VerifyRoot(cfg.rendrRoot); err != nil {
 		fmt.Fprintln(os.Stderr, "regress: rendr-root invalid:", err)
 		os.Exit(exitEnvError)
