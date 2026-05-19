@@ -145,12 +145,18 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	tick := time.NewTicker(opts.Interval)
 	defer tick.Stop()
 
-	// Receiver: collect echoes by seq, compute RTT.
+	// Receiver: collect echoes into a slice owned by the goroutine.
+	// The previous implementation used `make(chan echo, 1024)` which
+	// deadlocked any run that emitted >1024 echoes: recv blocks on
+	// chan-send, main blocks on <-doneRecv, no one drains the chan.
+	// Smoke (300 echoes) stayed under the buffer; T4 (18000 echoes
+	// at 30min) hit it at echo 1024 and the run hung indefinitely.
+	// Single-writer slice + close(recvDone) is the happens-before fence.
 	type echo struct {
 		seq int32
 		rtt time.Duration
 	}
-	echoes := make(chan echo, 1024)
+	echoBuf := make([]echo, 0, int(opts.Duration/opts.Interval)+128)
 	doneRecv := make(chan struct{})
 	go func() {
 		defer close(doneRecv)
@@ -165,7 +171,7 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 			seq := int32(binary.BigEndian.Uint32(buf[:4]))
 			sentNs := int64(binary.BigEndian.Uint64(buf[4:]))
 			rtt := time.Duration(time.Now().UnixNano() - sentNs)
-			echoes <- echo{seq: seq, rtt: rtt}
+			echoBuf = append(echoBuf, echo{seq: seq, rtt: rtt})
 		}
 	}()
 
@@ -210,14 +216,14 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 		}
 	}
 
-	// Give the receiver a moment to drain in-flight echoes.
+	// Give the receiver a moment to drain in-flight echoes, then
+	// force its ReadFull to return via the read deadline.
 	time.Sleep(500 * time.Millisecond)
 	_ = client.SetReadDeadline(time.Now())
 	<-doneRecv
-	close(echoes)
 
 	received := map[int32]time.Duration{}
-	for e := range echoes {
+	for _, e := range echoBuf {
 		received[e.seq] = e.rtt
 		rtts = append(rtts, e.rtt)
 	}
