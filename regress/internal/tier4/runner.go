@@ -1,23 +1,10 @@
 // Package tier4 implements the long-run regression tier — the
-// release-tag verification path. T4 re-uses the smoke G1/G2/G3
-// implementations with the contract-literal values from
-// docs/success-criteria.md §G1-§G3:
-//
-//   - G1-T4: 1 GiB stream, 10 forced migrations, SHA-256 verify
-//   - G2-T4: 30-min sustained echo with periodic migrations
-//   - G3-T4: 30 s × 100 000 pps QUIC DATAGRAM under bond, 10 migrations
-//
-// Smoke (T2) provides headline coverage; T4 proves the same contracts
-// at production scale. T4 is opt-in via `--tier=4` — the default
-// regress run does not pay the ~35-minute cost.
-//
-// All cases are Linux-only (G3 needs sysctl net.core.rmem_max=8MiB
-// at host level; the regress driver already refuses non-Linux at
-// boot unless --allow-non-linux is passed).
+// release-tag verification path. T4 is opt-in via --tier=4.
 package tier4
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -25,14 +12,11 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
-// Run executes T4 cases with per-case context budgets. Without
-// the per-case timeout, a deadlocked engine path (e.g. writer
-// blocked on a full buffer mid-migration) would hang the whole T4
-// run indefinitely — observed on commit 13b5464.
+// Run executes T4 cases with per-case budgets enforced by select.
 func Run(ctx context.Context, suite *report.Suite, _ string) {
 	runCase(ctx, suite, "G1-T4", 5*time.Minute, func(c context.Context) smoke.Result {
 		return smoke.RunG1(c, smoke.G1Opts{
-			Size:       1 << 30, // 1 GiB
+			Size:       1 << 30,
 			Migrations: 10,
 			Paths:      2,
 			Transport:  "tcp",
@@ -79,26 +63,37 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	}
 }
 
-// runCase wraps a smoke.Run* with a per-case context.WithTimeout and
-// promotes a budget-exceeded ctx to a regress failure (the smoke fn
-// itself only sees Err() through reads/writes; without the wrap, a
-// deadlock would return Result{Failure: ""} and look like a pass).
+// runCase enforces the per-case budget via select-on-Done. Smoke.RunG1
+// /G2/G3 only honor ctx at Accept() and path-attach; the hot loop
+// blocks on rendr.Conn which won't unblock from ctx if the engine
+// deadlocks. select guarantees forward progress: smoke goroutine
+// leaks but container teardown bounds the leak. Also prints
+// per-case start/end so a stuck case is visible in real-time stdout.
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) smoke.Result) {
+	fmt.Printf("  > T4/%s (budget %s) — start\n", name, budget)
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	start := time.Now()
-	r := fn(cctx)
-	rc := report.Case{
-		Name:     name,
-		Tier:     "T4",
-		Duration: r.Duration,
-		Failure:  r.Failure,
-	}
-	if rc.Duration == 0 {
+	done := make(chan smoke.Result, 1)
+	go func() {
+		done <- fn(cctx)
+	}()
+	rc := report.Case{Name: name, Tier: "T4"}
+	select {
+	case r := <-done:
+		rc.Duration = r.Duration
+		rc.Failure = r.Failure
+		if rc.Duration == 0 {
+			rc.Duration = time.Since(start)
+		}
+	case <-cctx.Done():
 		rc.Duration = time.Since(start)
-	}
-	if rc.Failure == "" && cctx.Err() != nil {
 		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
+	}
+	if rc.Failure != "" {
+		fmt.Printf("  > T4/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
+	} else {
+		fmt.Printf("  > T4/%s (took %s) — OK\n", name, rc.Duration)
 	}
 	suite.Add(rc)
 }
