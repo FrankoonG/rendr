@@ -25,18 +25,21 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
-// Run executes all T4 cases and records them on suite.
+// Run executes T4 cases with per-case context budgets. Without
+// the per-case timeout, a deadlocked engine path (e.g. writer
+// blocked on a full buffer mid-migration) would hang the whole T4
+// run indefinitely — observed on commit 13b5464.
 func Run(ctx context.Context, suite *report.Suite, _ string) {
-	addRun(suite, "G1-T4", func() smoke.Result {
-		return smoke.RunG1(ctx, smoke.G1Opts{
+	runCase(ctx, suite, "G1-T4", 5*time.Minute, func(c context.Context) smoke.Result {
+		return smoke.RunG1(c, smoke.G1Opts{
 			Size:       1 << 30, // 1 GiB
 			Migrations: 10,
 			Paths:      2,
 			Transport:  "tcp",
 		})
 	})
-	addRun(suite, "G1-T4-quic", func() smoke.Result {
-		return smoke.RunG1(ctx, smoke.G1Opts{
+	runCase(ctx, suite, "G1-T4-quic", 5*time.Minute, func(c context.Context) smoke.Result {
+		return smoke.RunG1(c, smoke.G1Opts{
 			Size:       1 << 30,
 			Migrations: 10,
 			Paths:      2,
@@ -44,27 +47,27 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		})
 	})
 
-	addRun(suite, "G2-T4", func() smoke.Result {
-		return smoke.RunG2(ctx, smoke.G2Opts{
+	runCase(ctx, suite, "G2-T4", 33*time.Minute, func(c context.Context) smoke.Result {
+		return smoke.RunG2(c, smoke.G2Opts{
 			Duration:     30 * time.Minute,
 			Migrations:   30,
 			Paths:        2,
 			Transport:    "tcp",
 			Interval:     100 * time.Millisecond,
-			P99CeilingMs: 50, // T4 tightens vs smoke's 200ms
+			P99CeilingMs: 50,
 		})
 	})
 
 	if runtime.GOOS == "linux" {
-		addRun(suite, "G3-T4", func() smoke.Result {
-			return smoke.RunG3(ctx, smoke.G3Opts{
+		runCase(ctx, suite, "G3-T4", 3*time.Minute, func(c context.Context) smoke.Result {
+			return smoke.RunG3(c, smoke.G3Opts{
 				Duration:     30 * time.Second,
 				PPS:          100_000,
 				PayloadLen:   1024,
 				Migrations:   10,
 				Paths:        4,
-				P95CeilingMs: 20, // tighter than smoke's 50ms
-				LossPct:      0,  // T4 strict; smoke tolerates 0.5%
+				P95CeilingMs: 20,
+				LossPct:      0,
 			})
 		})
 	} else {
@@ -76,12 +79,26 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	}
 }
 
-func addRun(suite *report.Suite, name string, fn func() smoke.Result) {
-	r := fn()
-	suite.Add(report.Case{
+// runCase wraps a smoke.Run* with a per-case context.WithTimeout and
+// promotes a budget-exceeded ctx to a regress failure (the smoke fn
+// itself only sees Err() through reads/writes; without the wrap, a
+// deadlock would return Result{Failure: ""} and look like a pass).
+func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) smoke.Result) {
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	start := time.Now()
+	r := fn(cctx)
+	rc := report.Case{
 		Name:     name,
 		Tier:     "T4",
 		Duration: r.Duration,
 		Failure:  r.Failure,
-	})
+	}
+	if rc.Duration == 0 {
+		rc.Duration = time.Since(start)
+	}
+	if rc.Failure == "" && cctx.Err() != nil {
+		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
+	}
+	suite.Add(rc)
 }
