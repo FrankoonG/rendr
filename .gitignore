@@ -34,6 +34,8 @@
 # xray-core source clone for code research; ad-hoc local-only
 /.xray-research/
 
-# Local-only helper scripts. Will be replaced by docs/regression-suite.md
-# §13's official scripts/regress.sh entrypoint when REG-Phase2 lands.
-/scripts/
+# scripts/ is mostly local-only bypass utilities used during
+# development on Windows; the only file checked in is the official
+# regress.sh entrypoint per docs/regression-suite.md §13.
+/scripts/*
+!/scripts/regress.sh
