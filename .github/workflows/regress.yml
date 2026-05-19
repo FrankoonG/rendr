@@ -31,3 +31,35 @@ jobs:
         with:
           name: regress-phase1
           path: reports/
+
+  phase2_t3:
+    name: phase 2 / T3 PathFactory matrix
+    needs: phase1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # regress/go.mod pins xray-core and pulls a deeper dep
+          # graph than root rendr; use the submodule's go.mod for
+          # the toolchain version so the cache key tracks correctly.
+          go-version-file: regress/go.mod
+          cache: true
+          cache-dependency-path: regress/go.sum
+
+      # Phase 2 normally refuses to run without a fresh phase-1
+      # state on disk. CI runs both phases on the same workflow run
+      # but in separate jobs; --force-phase2 skips the state check
+      # (phase1 job ran above against the same commit so any real
+      # phase-1 regression already failed the job).
+      - name: phase 2 / T3 (xray protocol matrix)
+        working-directory: regress
+        run: go run ./cmd/regress --phase=2 --tier=3 --force-phase2 --report-dir=../reports
+
+      - name: upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-phase2-t3
+          path: reports/
