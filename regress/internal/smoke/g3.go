@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -151,24 +150,27 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		return FromError(name, time.Since(t0), fmt.Errorf("client is not rendr.AdminPacketConn"))
 	}
 
-	// Server receiver: write directly to pre-sized slices guarded
-	// by a mutex. A buffered channel would block the receiver
-	// goroutine the moment buffer fills, deadlocking against the
-	// main loop's later drain (observed: goroutine stuck for 9min
-	// on chan send because PPS*Duration > buffer of PPS*2).
-	expected := int(opts.PPS) * int(opts.Duration.Seconds()*2) // 2x headroom
+	// Server receiver: single-writer, lock-free. The mutex+map
+	// approach used previously bottlenecked at ~5k pps recv (map
+	// hash + sync.Mutex Lock/Unlock cost ~5-10µs per packet),
+	// causing 96 % loss at 100k pps. For T4-scale we use a flat
+	// byte slice as a presence bitmap and sample latencies every N.
+	// The recv goroutine is the sole writer; main reads after
+	// close(recvDone) which provides the happens-before barrier.
+	expected := int(opts.PPS) * int(opts.Duration.Seconds()*2)
 	if expected < 1000 {
 		expected = 1000
 	}
-	var rxMu sync.Mutex
-	recvSeqs := make(map[uint64]struct{}, expected)
-	latNs := make([]int64, 0, expected)
+	recvBmp := make([]uint8, expected)
+	const latSampleEvery = 100
+	latNs := make([]int64, 0, expected/latSampleEvery+8)
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, opts.PayloadLen+8)
 		readDeadline := time.Now().Add(opts.Duration + 5*time.Second)
 		_ = server.SetReadDeadline(readDeadline)
+		var rxCount int64
 		for {
 			n, _, err := server.ReadFrom(buf)
 			if err != nil {
@@ -178,12 +180,15 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 				continue
 			}
 			seq := binary.BigEndian.Uint64(buf[:8])
-			sentNs := int64(binary.BigEndian.Uint64(buf[8:16]))
-			latency := time.Now().UnixNano() - sentNs
-			rxMu.Lock()
-			recvSeqs[seq] = struct{}{}
-			latNs = append(latNs, latency)
-			rxMu.Unlock()
+			if seq < uint64(len(recvBmp)) {
+				recvBmp[seq] = 1
+			}
+			if rxCount%latSampleEvery == 0 {
+				sentNs := int64(binary.BigEndian.Uint64(buf[8:16]))
+				latency := time.Now().UnixNano() - sentNs
+				latNs = append(latNs, latency)
+			}
+			rxCount++
 		}
 	}()
 
@@ -237,17 +242,27 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 	_ = server.SetReadDeadline(time.Now())
 	<-recvDone
 
-	rxMu.Lock()
-	received := recvSeqs
+	// recvBmp / latNs were written exclusively by the recv goroutine;
+	// close(recvDone) is the happens-before fence that lets us read
+	// here without a lock.
 	gotLat := latNs
-	rxMu.Unlock()
 
 	dur := time.Since(t0)
 	lost := int64(0)
-	for s := int64(0); s < sent; s++ {
-		if _, ok := received[uint64(s)]; !ok {
+	cap := int64(len(recvBmp))
+	limit := sent
+	if limit > cap {
+		limit = cap
+	}
+	for s := int64(0); s < limit; s++ {
+		if recvBmp[s] == 0 {
 			lost++
 		}
+	}
+	// Any seqs beyond recvBmp's capacity are counted as lost (would
+	// indicate sender PPS exceeded the 2x preallocated headroom).
+	if sent > cap {
+		lost += sent - cap
 	}
 	lossPct := float64(lost) / float64(sent) * 100
 
@@ -270,15 +285,16 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		maxN = gotLat[len(gotLat)-1]
 	}
 	migrations := admin.MigrationCount() - startMig
+	received := sent - lost
 
 	r := Result{
 		Name:     name,
 		Duration: dur,
 		Detail: map[string]any{
 			"pps_sent":     float64(sent) / dur.Seconds(),
-			"pps_received": float64(len(received)) / dur.Seconds(),
+			"pps_received": float64(received) / dur.Seconds(),
 			"sent":         sent,
-			"received":     int64(len(received)),
+			"received":     received,
 			"loss_pct":     lossPct,
 			"migrations":   migrations,
 			"p50_ms":       float64(p50) / float64(time.Millisecond),
