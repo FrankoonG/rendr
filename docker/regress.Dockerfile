@@ -48,7 +48,9 @@ RUN apt-get update && \
         iptables \
         procps \
         coreutils \
-        ca-certificates && \
+        ca-certificates \
+        gcc \
+        libc6-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the regress binary AND the rendr source tree the binary
