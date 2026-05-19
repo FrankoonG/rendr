@@ -81,6 +81,59 @@ func TestT3StreamDirectXRelay(t *testing.T) {
 	t.Logf("PASS: %s elapsed=%s migrations=%d", r.Name, r.Elapsed, r.MigrationsDone)
 }
 
+// TestT3StreamSS2022ViaRelay — PYS-R-2: Shadowsocks-2022 paths
+// routed through a transparent dokodemo-door relay. The relay sees
+// only encrypted SS-2022 bytes (no protocol decode); the SS-server
+// decrypts at the other end and freedom-forwards to the rendr
+// server. Both rendr paths share the same ssClient -> relay -> ssServer
+// chain, so each is an independent AEAD session through the same
+// relay hop.
+func TestT3StreamSS2022ViaRelay(t *testing.T) {
+	ssPort := pickFreePort(t)
+	relayPort := pickFreePort(t)
+	ssKey := randomSSKey(t)
+	const method = "2022-blake3-aes-128-gcm"
+
+	ssServer := startSSServer(t, ssPort, method, ssKey)
+	defer ssServer.Close()
+
+	// Relay forwards plaintext-looking but actually-encrypted SS
+	// bytes from relayPort to ssPort. dokodemo doesn't decode SS,
+	// it just port-forwards the TCP stream.
+	relayInst := startTransparentRelay(t, relayPort, "127.0.0.1:"+portStr(ssPort))
+	defer relayInst.Close()
+
+	// Client points its SS outbound at the RELAY (not the SS
+	// server). SS encryption still happens at this client; the SS
+	// server still decrypts at the other end; the relay is a TCP
+	// hop in between.
+	ssClient := startSSClient(t, relayPort, method, ssKey)
+	defer ssClient.Close()
+
+	factory := xrayglue.XrayInstanceAsStreamFactory(ssClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	r := driver.RunFileXfer(ctx, driver.FileXferOpts{
+		CaseName: "T3.stream.ss2022-via-relay × itself",
+		Paths: []rendr.PathSpec{
+			{Transport: "xray-ss2022-relay"},
+			{Transport: "xray-ss2022-relay"},
+		},
+		Factories: []driver.NamedFactory{
+			{Name: "xray-ss2022-relay", Stream: factory},
+		},
+	})
+	if r.Failure != "" {
+		t.Fatalf("case failed: %s", r.Failure)
+	}
+	if !r.SHA256Match || r.MigrationsDone == 0 {
+		t.Fatalf("ss-via-relay: sha=%v migs=%d", r.SHA256Match, r.MigrationsDone)
+	}
+	t.Logf("PASS: %s elapsed=%s migrations=%d", r.Name, r.Elapsed, r.MigrationsDone)
+}
+
 // startTransparentRelay runs an xray Instance with one dokodemo-door
 // inbound on relayPort and a freedom outbound. dokodemo rewrites
 // every incoming TCP connection's destination to downstreamAddr so
