@@ -21,6 +21,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier1"
 	"github.com/FrankoonG/rendr/regress/internal/tier2"
 	"github.com/FrankoonG/rendr/regress/internal/tier3"
+	"github.com/FrankoonG/rendr/regress/internal/tier4"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -139,10 +140,17 @@ func main() {
 			}
 			fmt.Println("phase 2 / T3: GREEN")
 		}
-		// T4 / T5 stubs (no-op until those impls land).
 		if cfg.tier == "4" {
-			fmt.Println("== phase 2 / T4: long-run — implementation pending ==")
+			fmt.Println("== phase 2 / T4: long-run (1 GiB / 30 min / 100k pps) ==")
+			tier4.Run(ctx, suite, cfg.rendrRoot)
+			writeReports(suite, cfg.reportDir)
+			if suite.AnyFailedAt("T4") {
+				fmt.Fprintln(os.Stderr, "phase 2 / T4: FAILED")
+				os.Exit(exitT4Fail)
+			}
+			fmt.Println("phase 2 / T4: GREEN")
 		}
+		// T5 stub (no-op until TCP-fallback adapter lands).
 		if cfg.tier == "5" {
 			fmt.Println("== phase 2 / T5: TCP fallback — implementation pending (M3-prod/M4) ==")
 		}
