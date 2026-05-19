@@ -72,10 +72,13 @@ if [ "$needs_build" = "1" ]; then
 fi
 
 echo "==> docker run $IMAGE_TAG ${passthrough[*]}"
+# Note: --sysctl net.core.rmem_max= is NOT passed here. Different
+# kernels/docker versions reject it as "unsafe procfs"; the suite
+# relies on the host having sysctl net.core.{r,w}mem_max=8388608
+# applied (G3 QUIC DATAGRAM at 30k pps needs this). The container's
+# bridge network namespace inherits the host sysctl values.
 exec docker run --rm \
     --cap-add=NET_ADMIN \
-    --sysctl net.core.rmem_max=8388608 \
-    --sysctl net.core.wmem_max=8388608 \
     -v "$ROOT/reports":/out \
     "$IMAGE_TAG" \
     "${passthrough[@]}"
