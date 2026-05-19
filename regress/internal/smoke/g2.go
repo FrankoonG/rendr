@@ -169,8 +169,14 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 		}
 	}()
 
+	// Per-write deadline so a wedged engine surfaces as a concrete
+	// "write seq N timed out" failure rather than hanging the whole
+	// goroutine. 30 s is generous on loopback (writes normally < 1ms);
+	// long enough that a slow migration doesn't trip the deadline.
+	const writeDeadline = 30 * time.Second
 	var seq int32
 	sent := map[int32]struct{}{}
+	lastProgress := time.Now()
 	for time.Now().Before(deadline) {
 		select {
 		case <-tick.C:
@@ -178,10 +184,19 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 			buf := make([]byte, 12)
 			binary.BigEndian.PutUint32(buf[:4], uint32(seq))
 			binary.BigEndian.PutUint64(buf[4:], uint64(time.Now().UnixNano()))
+			_ = client.SetWriteDeadline(time.Now().Add(writeDeadline))
 			if _, err := client.Write(buf); err != nil {
 				return FromError(name, time.Since(t0), fmt.Errorf("write seq %d: %w", seq, err))
 			}
+			_ = client.SetWriteDeadline(time.Time{})
 			sent[seq] = struct{}{}
+			// Coarse progress beacon for T4-scale long runs.
+			if opts.Duration > 60*time.Second && time.Since(lastProgress) >= 30*time.Second {
+				lastProgress = time.Now()
+				fmt.Printf("    G2 progress: t=%s seq=%d sent=%d migrations=%d\n",
+					time.Since(t0).Truncate(time.Second), seq, len(sent),
+					admin.MigrationCount()-startMigCount)
+			}
 		case <-migTickerChan(migTicker):
 			cur := admin.ActivePath()
 			for _, p := range client.Paths() {
