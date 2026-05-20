@@ -15,6 +15,7 @@ import (
 	"context"
 	"runtime"
 
+	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
@@ -26,6 +27,20 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	})
 	addRun(suite, "G2-smoke", "T2", func() smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{})
+	})
+	// Matrix coverage at smoke scale: race + bond modes on TCP.
+	// Race mode dispatches each frame to every path, so migrations
+	// are semantically moot — set Migrations=0 to skip the
+	// "migrations actually fired" assertion. Bond keeps the
+	// default migration cadence to exercise active-path swap.
+	addRun(suite, "G2-race-tcp-smoke", "T2", func() smoke.Result {
+		return smoke.RunG2(ctx, smoke.G2Opts{
+			Mode:       rendr.ModeRace,
+			Migrations: 0,
+		})
+	})
+	addRun(suite, "G2-bond-tcp-smoke", "T2", func() smoke.Result {
+		return smoke.RunG2(ctx, smoke.G2Opts{Mode: rendr.ModeBond})
 	})
 
 	if runtime.GOOS == "linux" {

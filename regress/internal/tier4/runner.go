@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
@@ -37,6 +38,34 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			Migrations:   30,
 			Paths:        2,
 			Transport:    "tcp",
+			Mode:         rendr.ModePrime,
+			Interval:     100 * time.Millisecond,
+			P99CeilingMs: 50,
+		})
+	})
+	// Mode-matrix long-run coverage: race + bond on TCP.
+	// Race dispatches every frame to every path, so migrations
+	// are skipped (would be semantically moot). Bond uses the
+	// same migration cadence as prime to exercise active-path
+	// swap under aggregation.
+	runCase(ctx, suite, "G2-T4-race-tcp", 33*time.Minute, func(c context.Context) smoke.Result {
+		return smoke.RunG2(c, smoke.G2Opts{
+			Duration:     30 * time.Minute,
+			Migrations:   0,
+			Paths:        2,
+			Transport:    "tcp",
+			Mode:         rendr.ModeRace,
+			Interval:     100 * time.Millisecond,
+			P99CeilingMs: 50,
+		})
+	})
+	runCase(ctx, suite, "G2-T4-bond-tcp", 33*time.Minute, func(c context.Context) smoke.Result {
+		return smoke.RunG2(c, smoke.G2Opts{
+			Duration:     30 * time.Minute,
+			Migrations:   30,
+			Paths:        2,
+			Transport:    "tcp",
+			Mode:         rendr.ModeBond,
 			Interval:     100 * time.Millisecond,
 			P99CeilingMs: 50,
 		})

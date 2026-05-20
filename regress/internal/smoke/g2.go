@@ -13,12 +13,13 @@ import (
 )
 
 // G2Opts configures one G2-smoke run. Defaults (30s / 5 migrations /
-// 2 paths / tcp / 100 ms cadence) match docs/regression-suite.md §6.
+// 2 paths / tcp / prime / 100 ms cadence) match docs/regression-suite.md §6.
 type G2Opts struct {
 	Duration   time.Duration // default 30s
 	Migrations int           // approx migrations to trigger; default 5
 	Paths      int           // default 2
 	Transport  string        // default "tcp"
+	Mode       rendr.Mode    // default ModePrime; ModeRace / ModeBond for matrix coverage
 	Interval   time.Duration // echo cadence; default 100ms
 	// P99CeilingMs caps P99 RTT. Default 200ms — generous for
 	// loopback + Windows scheduler noise; CI Linux usually < 5ms.
@@ -37,6 +38,9 @@ func (o *G2Opts) withDefaults() {
 	}
 	if o.Transport == "" {
 		o.Transport = "tcp"
+	}
+	if o.Mode == 0 {
+		o.Mode = rendr.ModePrime
 	}
 	if o.Interval <= 0 {
 		o.Interval = 100 * time.Millisecond
@@ -60,8 +64,8 @@ func (o *G2Opts) withDefaults() {
 func RunG2(ctx context.Context, opts G2Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
-	name := fmt.Sprintf("G2-smoke (%s, %s, %d paths, ~%d migrations)",
-		opts.Transport, opts.Duration, opts.Paths, opts.Migrations)
+	name := fmt.Sprintf("G2-smoke (%s/%s, %s, %d paths, ~%d migrations)",
+		opts.Transport, modeName(opts.Mode), opts.Duration, opts.Paths, opts.Migrations)
 
 	ln, err := listenForTransport(opts.Transport)
 	if err != nil {
@@ -86,7 +90,7 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	for i := range specs {
 		specs[i] = rendr.PathSpec{Transport: opts.Transport, Address: ln.Addr().String()}
 	}
-	client, err := (&rendr.Dialer{Mode: rendr.ModePrime, Paths: specs}).Dial(ctx)
+	client, err := (&rendr.Dialer{Mode: opts.Mode, Paths: specs}).Dial(ctx)
 	if err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("dial: %w", err))
 	}
@@ -283,4 +287,18 @@ func migTickerChan(t *time.Ticker) <-chan time.Time {
 		return nil
 	}
 	return t.C
+}
+
+// modeName returns a short string suitable for the case-name suffix.
+func modeName(m rendr.Mode) string {
+	switch m {
+	case rendr.ModePrime:
+		return "prime"
+	case rendr.ModeBond:
+		return "bond"
+	case rendr.ModeRace:
+		return "race"
+	default:
+		return fmt.Sprintf("mode%d", m)
+	}
 }
