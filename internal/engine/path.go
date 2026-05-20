@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/FrankoonG/rendr/transport"
@@ -9,10 +11,20 @@ import (
 // nowFn is overridable in tests; production calls time.Now.
 var nowFn = time.Now
 
+// debugPathDeath gates a diagnostic stderr line inside onPathDeath.
+// Enabled via RENDR_DEBUG_PATH_DEATH=1; used to bisect chaos-induced
+// TCP failures (currently REG-T4 G1-T4-tcp at ~10 MiB under 50 Mbps
+// tbf shaping where both paths die near-simultaneously and the
+// migration budget exhausts).
+var debugPathDeath = os.Getenv("RENDR_DEBUG_PATH_DEATH") != ""
+
 // onPathDeath is the OnDeath callback installed on every attached
 // PathConn. It runs on the transport adapter's goroutine, so it
 // keeps work brief and never blocks on locks held by the send path.
 func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
+	if debugPathDeath {
+		fmt.Fprintf(os.Stderr, "[rendr-engine] path %d died: cause=%v err=%v\n", id, cause, err)
+	}
 	e.pathsMu.Lock()
 	slot, ok := e.paths[id]
 	if !ok {
