@@ -359,9 +359,6 @@ func (e *Engine) Paths() []transport.PathInfo {
 		if ns := s.lastSendUnixNano.Load(); ns > 0 {
 			pi.LastSendAt = time.Unix(0, ns)
 		}
-		if la, ok := s.conn.(interface{ LocalAddr() string }); ok {
-			pi.LocalAddr = la.LocalAddr()
-		}
 		out = append(out, pi)
 	}
 	return out

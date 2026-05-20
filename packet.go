@@ -106,6 +106,14 @@ func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
 func (c *enginePacketConn) BondStuckSkips() uint64     { return c.e.BondStuckSkips() }
 func (c *enginePacketConn) MigrationCount() uint64     { return c.e.MigrationCount() }
 
+// ForceKillPathForTest mirrors engineBackedConn's backdoor for the
+// packet-mode side: external test harnesses duck-type-assert on
+// interface{ ForceKillPathForTest(uint32) error } and the engine
+// synthesises a transport-death so failover machinery fires.
+func (c *enginePacketConn) ForceKillPathForTest(id uint32) error {
+	return c.e.ForceKillPathForTest(id)
+}
+
 // OnMigrate registers a callback fired on every active-path change.
 func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
