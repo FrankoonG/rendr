@@ -140,7 +140,21 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 		}
 		n, err := client.Write(payload[written:end])
 		if err != nil {
-			return FromError(name, time.Since(t0), fmt.Errorf("write at %d: %w", written, err))
+			// Capture per-path state at the failure boundary so the
+			// regress report has something to bisect on. Particularly
+			// useful for chaos-baseline failures where we want to see
+			// whether the paths are "all dead" or "one alive, one dying".
+			var pathDbg string
+			for _, p := range client.Paths() {
+				ra := time.Since(p.LastRecvAt).Round(time.Millisecond)
+				sa := time.Since(p.LastSendAt).Round(time.Millisecond)
+				pathDbg += fmt.Sprintf(" p%d{r=%d w=%d recvAgo=%s sendAgo=%s rtt=%s}",
+					p.ID, p.Reads, p.Writes, ra, sa,
+					p.Quality.RTT.Round(time.Millisecond))
+			}
+			return FromError(name, time.Since(t0),
+				fmt.Errorf("write at %d: %w | active=%d paths:%s",
+					written, err, admin.ActivePath(), pathDbg))
 		}
 		written += int64(n)
 		for migIdx < len(migPts) && written >= migPts[migIdx] {
