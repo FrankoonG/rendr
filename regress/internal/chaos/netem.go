@@ -71,9 +71,17 @@ func Apply(p Profile) (cleanup func() error, err error) {
 	_ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root").Run()
 
 	if p.Bandwidth > 0 {
-		// tbf params: rate, burst, latency. Burst sized to 1/100 of
-		// rate (one tick at HZ=100); latency 50ms gives the tbf a
-		// small queue so we don't spuriously drop bursts.
+		// tbf params: rate, burst, latency. Latency=1s deliberately
+		// gives the tbf queue ≈ rate*1s of headroom (6 MB at 50 Mbps).
+		// 50ms (the first attempt) was way too tight: it produced a
+		// 39 KB queue, and Linux TCP's 4 MB default send buffer
+		// flooded that almost instantly, triggering TBF drops →
+		// TCP retransmits → RTO → socket abort → engine sees the
+		// path as dead. Observed at HEAD a8dafa0: G1-T4 hit
+		// "migration budget exceeded" at 10 MB into a 1 GiB
+		// transfer because both TCP paths' send buffers smashed
+		// the tbf queue simultaneously. QUIC paced internally and
+		// did not exhibit the failure.
 		burst := p.Bandwidth / 800 // bytes ≈ rate-bits / 8 / 100
 		if burst < 1500 {
 			burst = 1500
@@ -82,7 +90,7 @@ func Apply(p Profile) (cleanup func() error, err error) {
 			"tbf",
 			"rate", fmt.Sprintf("%dbit", p.Bandwidth),
 			"burst", strconv.FormatInt(burst, 10),
-			"latency", "50ms",
+			"latency", "1s",
 		}
 		if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("tc tbf: %w (%s)", err, out)
