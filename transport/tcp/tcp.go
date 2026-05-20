@@ -68,6 +68,12 @@ func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transp
 	if err != nil {
 		return nil, fmt.Errorf("tcp: dial %s: %w", spec.Address, err)
 	}
+	// Belt-and-suspenders: hard-disable keepalive on the dialed socket.
+	// Dialer.KeepAlive=-1 SHOULD suppress it but Go version behavior
+	// has surprised us before.
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(false)
+	}
 	return Wrap(c), nil
 }
 
