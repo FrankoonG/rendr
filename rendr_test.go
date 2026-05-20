@@ -2194,12 +2194,22 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
+	// Wait for BOTH sides to see 2 attached paths before SetMode.
+	// Previous version only checked server.Paths() >= 2; if the
+	// client side was still finishing path-2 attach when SetMode
+	// fired, race-mode dispatch would target only the single
+	// already-attached path and emit no duplicates. Result:
+	// RecvDups=0 (test fails) and HWM=1 (no concurrent arrivals).
+	// Diagnosed from the M7 failure on HEAD 13b5464 in REG-T4.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(server.Paths()) >= 2 {
+		if len(server.Paths()) >= 2 && len(client.Paths()) >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 {
+		t.Fatalf("M7 setup: client only sees %d paths after 5s; race-mode dispatch needs ≥2", len(client.Paths()))
 	}
 
 	if err := client.SetMode(ModeRace); err != nil {
