@@ -52,6 +52,13 @@ type PathInfo struct {
 	// LastRecvAt to distinguish "I'm sending but peer is silent"
 	// from "peer is sending but I'm idle".
 	LastSendAt time.Time
+	// LocalAddr is the local-side endpoint of this path's transport
+	// socket (e.g. "127.0.0.1:54321" for TCP; the UDP source for
+	// QUIC paths). Empty if the transport adapter does not expose
+	// LocalAddr(). Used by test harnesses to target a specific path
+	// with iptables / tc rules (G4 / G5 chaos suites). Stable for
+	// the lifetime of the path.
+	LocalAddr string
 }
 
 // PathQuality is the most recent measurement of one path.

@@ -83,18 +83,6 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 // listener-side path attach logic. Not part of the public API.
 func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
 
-// ForceKillPathForTest is a method-set backdoor that lets external
-// test harnesses (regress/internal/smoke, chaos/cmd/g4) simulate a
-// sudden death on path id by duck-typed interface assertion:
-//
-//	if k, ok := c.(interface{ ForceKillPathForTest(uint32) error }); ok { ... }
-//
-// Not part of the public API. Production code that wants to drop a
-// path cleanly should use AdminConn.RemovePath instead.
-func (c *engineBackedConn) ForceKillPathForTest(id uint32) error {
-	return c.e.ForceKillPathForTest(id)
-}
-
 // Migrate switches the active path to id. Exposed to external admin
 // surfaces (runtime balancers, monitoring panels) via the AdminConn
 // interface assertion.

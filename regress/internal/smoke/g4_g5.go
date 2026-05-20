@@ -5,21 +5,29 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
 	"time"
 
 	"github.com/FrankoonG/rendr"
 )
 
 // G4Opts configures one G4 case (path-A force-kill, verify B picks
-// up < 5s, app sees no error). Cross-platform: uses rendr's
-// ForceKillPathForTest engine backdoor, not iptables.
+// up < 5s, app sees no error). Linux-only: drops the active path's
+// outbound TCP via `iptables -A OUTPUT -p tcp --sport <port> -j DROP`
+// after grabbing PathInfo.LocalAddr. Requires CAP_NET_ADMIN (provided
+// by scripts/regress.sh's `docker --cap-add=NET_ADMIN`).
+//
+// Cross-platform unit-test coverage of the same engine code path lives
+// in rendr_test.go (TestM6PathDeath* etc.), which reaches into the
+// engine via the bc.Engine().ForceKillPathForTest() internal accessor.
+// The regress smoke G4 is the integration-level proof.
 type G4Opts struct {
 	Duration  time.Duration // default 6s
 	KillAt    time.Duration // default 2s
 	EchoInt   time.Duration // default 10ms
 	Paths     int           // default 2
 	BudgetMs  int           // failover ceiling; default 5000
-	Transport string        // "tcp" | "quic"; default "tcp"
+	Transport string        // "tcp" only — iptables filters TCP sport
 }
 
 func (o *G4Opts) withDefaults() {
@@ -52,7 +60,18 @@ func (o *G4Opts) withDefaults() {
 func RunG4(ctx context.Context, opts G4Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
-	name := fmt.Sprintf("G4 (%s, kill@%s, budget %dms)", opts.Transport, opts.KillAt, opts.BudgetMs)
+	name := fmt.Sprintf("G4 (%s, iptables-kill@%s, budget %dms)", opts.Transport, opts.KillAt, opts.BudgetMs)
+
+	if runtime.GOOS != "linux" {
+		return Result{
+			Name:     name,
+			Duration: time.Since(t0),
+			Failure:  "G4 requires Linux iptables (run inside docker container with --cap-add=NET_ADMIN)",
+		}
+	}
+	if opts.Transport != "tcp" {
+		return FromError(name, time.Since(t0), fmt.Errorf("G4 iptables variant only supports TCP, got %q", opts.Transport))
+	}
 
 	ln, err := listenForTransport(opts.Transport)
 	if err != nil {
@@ -121,25 +140,47 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		return FromError(name, time.Since(t0), fmt.Errorf("client conn is not rendr.AdminConn"))
 	}
 
-	killer, ok := client.(interface {
-		ForceKillPathForTest(id uint32) error
-	})
-	if !ok {
-		return FromError(name, time.Since(t0), fmt.Errorf("rendr.Conn lacks ForceKillPathForTest test hook"))
-	}
-
+	// Scheduled kill: at KillAt, find the active path's local TCP
+	// source port, drop it via iptables.
 	killDone := make(chan time.Time, 1)
+	killErr := make(chan error, 1)
+	var deferredCleanup func() error
 	go func() {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(opts.KillAt):
 		}
-		cur := admin.ActivePath()
-		if cur != 0 {
-			_ = killer.ForceKillPathForTest(cur)
+		curID := admin.ActivePath()
+		var localAddr string
+		for _, p := range client.Paths() {
+			if p.ID == curID {
+				localAddr = p.LocalAddr
+				break
+			}
 		}
+		if localAddr == "" {
+			killErr <- fmt.Errorf("active path %d has no LocalAddr", curID)
+			return
+		}
+		port, err := portFromAddr(localAddr)
+		if err != nil {
+			killErr <- fmt.Errorf("parse local addr %q: %w", localAddr, err)
+			return
+		}
+		cleanup, err := iptablesDropSrcPort(port)
+		if err != nil {
+			killErr <- err
+			return
+		}
+		deferredCleanup = cleanup
 		killDone <- time.Now()
+	}()
+	// Ensure cleanup fires even on early return.
+	defer func() {
+		if deferredCleanup != nil {
+			_ = deferredCleanup()
+		}
 	}()
 
 	start := time.Now()
@@ -174,7 +215,13 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		case s := <-killDone:
 			killStamp = s
 			killDone = nil
+		case e := <-killErr:
+			cause = fmt.Sprintf("kill: %v", e)
+			killErr = nil
 		default:
+		}
+		if cause != "" {
+			break
 		}
 		if !killStamp.IsZero() && firstPostKill.IsZero() && time.Now().After(killStamp) {
 			firstPostKill = time.Now()
@@ -224,11 +271,15 @@ type G5Opts struct {
 	PostAddBytes int64 // default 256 KiB
 }
 
-// RunG5 runs G4-style failover, then AddPath the killed transport
-// back and writes PostAddBytes more bytes. Asserts:
+// RunG5 kills the active path via iptables, then AddPath() with the
+// same transport spec to verify the engine can re-attach a fresh path
+// and exchange bytes without spurious dups. Asserts:
 //   - AddPath returns a fresh id
 //   - RecvDups stays 0 (no reorder artifacts)
 //   - bytes round-trip intact
+//
+// Linux-only (uses iptables); see G4 docstring for the cross-platform
+// unit-test note.
 func RunG5(ctx context.Context, opts G5Opts) Result {
 	o := opts.G4
 	o.withDefaults()
@@ -237,6 +288,17 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 	}
 	t0 := time.Now()
 	name := fmt.Sprintf("G5 (after G4: AddPath + %d byte exchange)", opts.PostAddBytes)
+
+	if runtime.GOOS != "linux" {
+		return Result{
+			Name:     name,
+			Duration: time.Since(t0),
+			Failure:  "G5 requires Linux iptables (run inside docker container with --cap-add=NET_ADMIN)",
+		}
+	}
+	if o.Transport != "tcp" {
+		return FromError(name, time.Since(t0), fmt.Errorf("G5 iptables variant only supports TCP, got %q", o.Transport))
+	}
 
 	ln, err := listenForTransport(o.Transport)
 	if err != nil {
@@ -289,18 +351,28 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 	if !ok {
 		return FromError(name, time.Since(t0), fmt.Errorf("client conn is not rendr.AdminConn"))
 	}
-	killer, ok := client.(interface {
-		ForceKillPathForTest(id uint32) error
-	})
-	if !ok {
-		return FromError(name, time.Since(t0), fmt.Errorf("rendr.Conn lacks ForceKillPathForTest test hook"))
-	}
 
-	// Kill the active path immediately.
-	cur := admin.ActivePath()
-	if err := killer.ForceKillPathForTest(cur); err != nil {
-		return FromError(name, time.Since(t0), fmt.Errorf("kill active: %w", err))
+	// Find active path's local TCP source port and iptables-drop it.
+	curID := admin.ActivePath()
+	var localAddr string
+	for _, p := range client.Paths() {
+		if p.ID == curID {
+			localAddr = p.LocalAddr
+			break
+		}
 	}
+	if localAddr == "" {
+		return FromError(name, time.Since(t0), fmt.Errorf("active path %d has no LocalAddr", curID))
+	}
+	port, err := portFromAddr(localAddr)
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("parse %q: %w", localAddr, err))
+	}
+	cleanup, err := iptablesDropSrcPort(port)
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("iptables drop sport=%d: %w", port, err))
+	}
+	defer func() { _ = cleanup() }()
 
 	// Server echo loop.
 	echoErr := make(chan error, 1)
@@ -359,10 +431,10 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 		Name:     name,
 		Duration: time.Since(t0),
 		Detail: map[string]any{
-			"new_path_id":    newID,
-			"recv_dups":      stats.RecvDups,
+			"new_path_id":     newID,
+			"recv_dups":       stats.RecvDups,
 			"migration_count": stats.MigrationCount,
-			"post_add_bytes": written,
+			"post_add_bytes":  written,
 		},
 	}
 	if stats.RecvDups > 0 {
