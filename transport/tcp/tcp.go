@@ -40,8 +40,23 @@ func init() {
 func (*Transport) Name() string { return "tcp" }
 
 // DialPath dials a TCP socket and wraps it in a PathConn.
+//
+// Disables Go's default 15-second TCP keepalive (Dialer.KeepAlive < 0).
+// Go since 1.13 calls SetKeepAlive(true)+SetKeepAlivePeriod(15s)
+// after dial; on Linux that sets TCP_KEEPIDLE/INTVL to 15s, and
+// combined with tcp_keepalive_probes=9 the kernel kills the socket
+// after ~150s if keepalive ACKs aren't seen. Under bandwidth
+// shaping (REG-T4 chaos baseline at 50 Mbps tbf) the ACKs queue
+// behind data, the kernel falsely declares the socket dead at
+// that exact mark, both paths die simultaneously, and the engine
+// surfaces "migration budget exceeded" — a direct CLAUDE.md hard
+// rule #1 violation. HEAD 1f89fc3 stderr trace confirmed this with
+// "write tcp ... write: connection timed out" at ~2m17s.
+//
+// rendr's engine has its own protocol-layer liveness via PathProbe;
+// kernel TCP keepalive is both redundant and harmful here.
 func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
-	d := net.Dialer{}
+	d := net.Dialer{KeepAlive: -1}
 	if spec.Local != "" {
 		la, err := net.ResolveTCPAddr("tcp", spec.Local)
 		if err != nil {
