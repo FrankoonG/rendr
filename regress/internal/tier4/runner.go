@@ -135,6 +135,26 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 			SkipReason: "Linux only (wireguard-go UDP endpoint smoke is validated on Linux regress hosts)",
 		})
 	}
+	if runtime.GOOS == "linux" && smoke.HysteriaAvailable() {
+		run("M11-hysteria2-relay-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+			return smoke.RunHysteriaRelay(c, smoke.HysteriaRelayOpts{
+				Paths:      2,
+				Migrations: 3,
+				DataSize:   8 << 20,
+			})
+		})
+	} else if caseMatches(opts.Case, "M11-hysteria2-relay-T4") {
+		matched = true
+		reason := "Linux only (Hysteria 2 relay smoke is validated on Linux regress hosts)"
+		if runtime.GOOS == "linux" {
+			reason = "hysteria binary not found"
+		}
+		suite.Add(report.Case{
+			Name:       "M11-hysteria2-relay-T4",
+			Tier:       "T4",
+			SkipReason: reason,
+		})
+	}
 
 	if runtime.GOOS == "linux" {
 		// G3-T4 deliberately runs without any chaos profile (Profile{})
