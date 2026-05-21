@@ -227,6 +227,16 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 				e.handlePathProbeReply(slot, payload)
 				continue
 			}
+			if code == proto.CtrlBye {
+				// BYE is still delivered through the SEQ-aware reorder
+				// path below, but mark the transport immediately. A peer
+				// can close its TCP write side right after sending BYE; if
+				// the resulting EOF wins the race against recvLoop draining
+				// slot.recvQ, OnDeath must still classify it as clean.
+				if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
+					pc.MarkByeSeen()
+				}
+			}
 		}
 
 		if !e.enqueueRecvFrame(slot, hdr, payload) {

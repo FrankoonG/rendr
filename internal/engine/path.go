@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -68,7 +69,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 		// non-final path are a no-op (the engine continues on
 		// remaining paths).
 		if !hasPaths {
-			e.setCloseErr(nil)
+			e.setCloseErr(io.EOF)
 			_ = e.Close()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
