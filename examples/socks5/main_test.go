@@ -52,6 +52,9 @@ func TestSOCKS5OverRendr(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	socksConnect(t, client, echoAddr)
 
 	payload := []byte("hello through rendr socks")
@@ -82,16 +85,12 @@ func startTCPEcho(t *testing.T) (string, func()) {
 		}
 		defer c.Close()
 		buf := make([]byte, 32*1024)
-		for {
-			n, err := c.Read(buf)
-			if n > 0 {
-				if _, werr := c.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
+		n, err := c.Read(buf)
+		if n > 0 {
+			_, _ = c.Write(buf[:n])
+		}
+		if err != nil {
+			return
 		}
 	}()
 	return ln.Addr().String(), func() {
