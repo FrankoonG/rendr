@@ -173,6 +173,16 @@ type pathSlot struct {
 	// writes bump it.
 	lastSendUnixNano atomic.Int64
 
+	// bondSendHistory keeps a bounded ring of fully encoded frames
+	// successfully written through this path in bond mode. If the
+	// path dies asynchronously, the engine can replay these exact
+	// SEQs on surviving paths; recv-side dedup makes already-arrived
+	// frames harmless while filling gaps left on the dead path.
+	bondSendMu   sync.Mutex
+	bondSendRing [][]byte
+	bondSendNext int
+	bondSendFull bool
+
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits

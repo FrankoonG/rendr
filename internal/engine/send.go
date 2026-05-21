@@ -193,7 +193,9 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // considered stuck.
 //
 // Still TODO at M8: weighted distribution by capacity and
-// redistribute-on-death (the latter requires an ACK protocol).
+// ACK-tight resend trimming. Redistribute-on-death is intentionally
+// conservative: it replays a bounded recent window and relies on
+// receiver SEQ dedup to discard frames that arrived before death.
 func (e *Engine) dispatchBond(frame []byte) error {
 	for {
 		if e.isClosed() {
@@ -279,7 +281,58 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			return err
 		}
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
+		slot.rememberBondFrame(frame)
 		return nil
+	}
+}
+
+func (e *Engine) redistributeBondFrames(frames [][]byte) {
+	if len(frames) == 0 || e.isClosed() {
+		return
+	}
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+
+	for _, frame := range frames {
+		if e.isClosed() {
+			return
+		}
+		_ = e.dispatchRedistributedBondFrame(frame)
+	}
+}
+
+func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
+	for {
+		e.pathsMu.Lock()
+		if len(e.paths) == 0 {
+			e.pathsMu.Unlock()
+			return net.ErrClosed
+		}
+		ids := make([]uint32, 0, len(e.paths))
+		for id := range e.paths {
+			ids = append(ids, id)
+		}
+		for i := 1; i < len(ids); i++ {
+			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
+				ids[j-1], ids[j] = ids[j], ids[j-1]
+			}
+		}
+		start := int(e.bondCursor % uint64(len(ids)))
+		e.bondCursor++
+		slots := make([]*pathSlot, 0, len(ids))
+		for i := 0; i < len(ids); i++ {
+			slots = append(slots, e.paths[ids[(start+i)%len(ids)]])
+		}
+		e.pathsMu.Unlock()
+
+		now := nowFn().UnixNano()
+		for _, slot := range slots {
+			if _, err := slot.conn.Write(frame); err == nil {
+				slot.lastSendUnixNano.Store(now)
+				return nil
+			}
+		}
+		return net.ErrClosed
 	}
 }
 

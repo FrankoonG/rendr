@@ -1494,22 +1494,147 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 
 // TestM8BondPathDeathContinuesOnSurvivor: in bond mode, after a
 // mid-stream kill on one path the engine must keep delivering on
-// the survivor. This is the loosest M8(3/n) acceptance: the test
-// does NOT require zero loss of in-flight frames on the dying
-// path (that needs a redistribute-with-ack mechanism, tracked
-// separately). It only asserts that:
+// the survivor. The engine replays a bounded recent send window from
+// the dead path, so frames that were accepted by that path but lost
+// before reaching the peer can fill the receiver's SEQ gap. This test
+// asserts that:
 //   - the survivor keeps receiving subsequent writes
-//   - the application-visible byte stream up to and after the kill
-//     is delivered (allowing for the receiver to block until the
-//     dying path's in-flight frames are filled in OR for the
-//     engine to advance past the gap by writing the same bytes on
-//     the survivor).
-//
-// Currently rendr does NOT redistribute, so this test is permitted
-// to time out or hang on partial-frame death. We mark it Skip
-// until the redistribute primitive lands.
+//   - the application-visible byte stream before and after the kill
+//     is delivered in order.
 func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
-	t.Skip("M8 redistribute-on-death not implemented; bond + mid-stream path kill can leak frames. Tracked for M8(3/n).")
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String()},
+			{Transport: "tcp", Address: ln.Addr().String()},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	type pp struct {
+		id     uint32
+		writer interface{ Writes() uint64 }
+		base   uint64
+	}
+	var probes []pp
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pp{id: id, writer: w})
+		}
+	})
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+
+	bc.Engine().SetBondPinSizeForTest(1)
+	if err := client.SetMode(ModeBond); err != nil {
+		t.Fatalf("SetMode(bond): %v", err)
+	}
+	for i := range probes {
+		probes[i].base = probes[i].writer.Writes()
+	}
+
+	const preN = 16
+	pre := []byte("pre-bond-frame-")
+	for i := 0; i < preN; i++ {
+		if _, err := client.Write(pre); err != nil {
+			t.Fatalf("pre write %d: %v", i, err)
+		}
+	}
+
+	killID := uint32(0)
+	var survivorBase uint64
+	for _, p := range probes {
+		if p.writer.Writes() > p.base {
+			killID = p.id
+			break
+		}
+	}
+	if killID == 0 {
+		t.Fatal("bond did not write on either probed path")
+	}
+	for _, p := range probes {
+		if p.id != killID {
+			survivorBase = p.writer.Writes()
+			break
+		}
+	}
+
+	if err := bc.Engine().ForceKillPathForTest(killID); err != nil {
+		t.Fatalf("ForceKillPathForTest(%d): %v", killID, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) != 1 {
+		t.Fatalf("expected one survivor after kill, got %d paths", len(client.Paths()))
+	}
+
+	const postN = 8
+	post := []byte("post-survivor-")
+	for i := 0; i < postN; i++ {
+		if _, err := client.Write(post); err != nil {
+			t.Fatalf("post write %d: %v", i, err)
+		}
+	}
+
+	expected := append(bytes.Repeat(pre, preN), bytes.Repeat(post, postN)...)
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	got := make([]byte, len(expected))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("server drain after bond path death: %v", err)
+	}
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("server byte-stream mismatch after bond path death")
+	}
+
+	var survivorWrites uint64
+	for _, p := range probes {
+		if p.id != killID {
+			survivorWrites = p.writer.Writes()
+			break
+		}
+	}
+	if survivorWrites <= survivorBase {
+		t.Fatalf("survivor path did not receive post-kill writes: %d -> %d",
+			survivorBase, survivorWrites)
+	}
 }
 
 // TestAdminConnStatsSnapshot: Stats() returns a coherent view of
