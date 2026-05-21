@@ -347,6 +347,89 @@ func TestM9XrayListenerFlowIDs(t *testing.T) {
 	})
 }
 
+func TestM9XrayMixedTCPQUICListener(t *testing.T) {
+	ln, err := Listen(&ListenConfig{
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: "127.0.0.1:0"},
+			{Transport: "quic", Address: "127.0.0.1:0"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addrs := ln.Addrs()
+	if len(addrs) != 2 {
+		t.Fatalf("Addrs len=%d want 2", len(addrs))
+	}
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.AcceptContext(ctx)
+		if err != nil {
+			t.Errorf("AcceptContext: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d, err := NewDialer(&Config{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: addrs[0].String()},
+			{Transport: "quic", Address: addrs[1].String()},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.DialContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	adm := client.(rendr.AdminConn)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(adm.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var quicPath uint32
+	for _, p := range adm.Paths() {
+		if p.Spec.Transport == "quic" {
+			quicPath = p.ID
+			break
+		}
+	}
+	if quicPath == 0 {
+		t.Fatalf("quic path not attached: %+v", adm.Paths())
+	}
+
+	if _, err := client.Write([]byte("tcp-half")); err != nil {
+		t.Fatal(err)
+	}
+	if err := adm.Migrate(quicPath); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := client.Write([]byte("quic-half")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len("tcp-halfquic-half"))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tcp-halfquic-half" {
+		t.Fatalf("payload got %q", got)
+	}
+}
+
 // TestM9MigrationUnderLoadThroughXrayWrap drives sustained writes
 // while explicitly migrating through the xray-wrapped Conn. The
 // contract from CLAUDE.md hard rule #1 (migration never surfaces an

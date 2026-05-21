@@ -6,9 +6,11 @@ import (
 )
 
 var (
-	errNilConfig   = errors.New("rendr/xray: nil Config")
-	errNoPaths     = errors.New("rendr/xray: Config has no Paths")
-	errUnknownMode = errors.New("rendr/xray: unknown Mode")
+	errNilConfig       = errors.New("rendr/xray: nil Config")
+	errNoPaths         = errors.New("rendr/xray: Config has no Paths")
+	errUnknownMode     = errors.New("rendr/xray: unknown Mode")
+	errNilListenConfig = errors.New("rendr/xray: nil ListenConfig")
+	errNoListenPaths   = errors.New("rendr/xray: ListenConfig has no Paths")
 )
 
 func errPathNoTransport(i int) error {
