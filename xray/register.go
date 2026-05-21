@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	xnet "github.com/xtls/xray-core/common/net"
 	xinternet "github.com/xtls/xray-core/transport/internet"
@@ -14,6 +15,14 @@ import (
 // DefaultTransportName is the xray streamSettings.network value used
 // by the default registration helpers.
 const DefaultTransportName = "rendr"
+
+var registeredProtocolConfigs sync.Map
+
+// TransportSettings is the placeholder settings object xray-core
+// stores in MemoryStreamConfig.ProtocolSettings for rendr transports.
+// The actual rendr path configuration is supplied at registration
+// time via Config / ListenConfig.
+type TransportSettings struct{}
 
 // RegisterRendrAsXrayTransport registers the default "rendr" xray
 // transport dialer. After this succeeds, xray-core stream settings
@@ -39,6 +48,9 @@ func RegisterRendrTransportDialer(name string, cfg *Config) error {
 	if name == "" {
 		name = DefaultTransportName
 	}
+	if err := ensureProtocolConfig(name); err != nil {
+		return err
+	}
 	d, err := NewDialer(cfg)
 	if err != nil {
 		return err
@@ -60,6 +72,9 @@ func RegisterRendrTransportListener(name string, cfg *ListenConfig) error {
 	if name == "" {
 		name = DefaultTransportName
 	}
+	if err := ensureProtocolConfig(name); err != nil {
+		return err
+	}
 	return xinternet.RegisterTransportListener(name, func(ctx context.Context, address xnet.Address, port xnet.Port, settings *xinternet.MemoryStreamConfig, handler xinternet.ConnHandler) (xinternet.Listener, error) {
 		ln, err := listenFromXray(ctx, address, port, cfg)
 		if err != nil {
@@ -76,6 +91,22 @@ func RegisterRendrTransportListener(name string, cfg *ListenConfig) error {
 	})
 }
 
+func ensureProtocolConfig(name string) error {
+	if _, ok := registeredProtocolConfigs.Load(name); ok {
+		return nil
+	}
+	if err := xinternet.RegisterProtocolConfigCreator(name, func() interface{} {
+		return &TransportSettings{}
+	}); err != nil {
+		if _, loaded := registeredProtocolConfigs.LoadOrStore(name, struct{}{}); loaded {
+			return nil
+		}
+		return err
+	}
+	registeredProtocolConfigs.Store(name, struct{}{})
+	return nil
+}
+
 type registeredListener struct {
 	ctx    context.Context
 	inner  *Listener
@@ -90,7 +121,11 @@ func (l *registeredListener) acceptLoop() {
 		if err != nil {
 			return
 		}
-		l.handle(conn)
+		l.handle(&xrayAddrConn{
+			Conn:   conn,
+			local:  tcpAddrOrLoopback(conn.LocalAddr()),
+			remote: tcpAddrOrLoopback(conn.RemoteAddr()),
+		})
 	}
 }
 
@@ -124,4 +159,31 @@ func joinXrayHostPort(address xnet.Address, port xnet.Port) string {
 		host = host[1 : len(host)-1]
 	}
 	return net.JoinHostPort(host, strconv.Itoa(int(port)))
+}
+
+type xrayAddrConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (c *xrayAddrConn) LocalAddr() net.Addr {
+	return c.local
+}
+
+func (c *xrayAddrConn) RemoteAddr() net.Addr {
+	return c.remote
+}
+
+func tcpAddrOrLoopback(addr net.Addr) net.Addr {
+	if addr == nil {
+		return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	}
+	if _, ok := addr.(*net.TCPAddr); ok {
+		return addr
+	}
+	if tcpAddr, err := net.ResolveTCPAddr("tcp", addr.String()); err == nil {
+		return tcpAddr
+	}
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
 }
