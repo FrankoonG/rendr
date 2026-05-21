@@ -43,7 +43,7 @@ func TestSOCKS5OverRendr(t *testing.T) {
 			return
 		}
 		_ = serveSOCKSConn(ctx, raw, func(ctx context.Context) (rendr.Conn, error) {
-			return dialRendr(ctx, rendrLn.Addr().String(), rendrLn.Addr().String()+","+rendrLn.Addr().String())
+			return dialRendr(ctx, rendrLn.Addr().String(), rendrLn.Addr().String())
 		})
 	}()
 
