@@ -40,6 +40,7 @@ const (
 type runFlags struct {
 	phase         string
 	tier          string
+	full          bool
 	forcePhase2   bool
 	allowNonLinux bool
 	profile       string
@@ -52,6 +53,7 @@ func parseFlags() runFlags {
 	var f runFlags
 	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
 	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5")
+	flag.BoolVar(&f.full, "full", false, "run phase 1 and all phase-2 tiers (T3+T4+T5)")
 	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
 	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
 	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
@@ -130,8 +132,14 @@ func main() {
 			}
 		}
 		// Default phase-2 invocation runs T3 (path-factory matrix).
-		// T4 long-run and T5 fallback are opt-in via --tier=4/5.
-		if cfg.tier == "" || cfg.tier == "3" {
+		// T4 long-run and T5 fallback are opt-in via --tier=4/5
+		// or included together via --full.
+		runT3, runT4, runT5 := selectedTiers(cfg)
+		if !runT3 && !runT4 && !runT5 {
+			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, or --full")
+			os.Exit(exitEnvError)
+		}
+		if runT3 {
 			fmt.Println("== phase 2 / T3: PathFactory × xray outbound matrix ==")
 			tier3.Run(ctx, suite, cfg.rendrRoot)
 			writeReports(suite, cfg.reportDir)
@@ -141,7 +149,7 @@ func main() {
 			}
 			fmt.Println("phase 2 / T3: GREEN")
 		}
-		if cfg.tier == "4" {
+		if runT4 {
 			fmt.Println("== phase 2 / T4: long-run (1 GiB / 30 min / 100k pps) ==")
 			tier4.Run(ctx, suite, cfg.rendrRoot)
 			writeReports(suite, cfg.reportDir)
@@ -151,7 +159,7 @@ func main() {
 			}
 			fmt.Println("phase 2 / T4: GREEN")
 		}
-		if cfg.tier == "5" {
+		if runT5 {
 			fmt.Println("== phase 2 / T5: TCP fallback / adapter verification ==")
 			tier5.Run(ctx, suite, cfg.rendrRoot)
 			writeReports(suite, cfg.reportDir)
@@ -178,6 +186,8 @@ func main() {
 // phases run. See docs/regression-suite.md §10.
 func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 	switch {
+	case cfg.full:
+		return true, true
 	case cfg.phase == "1":
 		return true, false
 	case cfg.phase == "2":
@@ -186,6 +196,22 @@ func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 		return false, true
 	default:
 		return true, true
+	}
+}
+
+func selectedTiers(cfg runFlags) (runT3, runT4, runT5 bool) {
+	if cfg.full {
+		return true, true, true
+	}
+	switch cfg.tier {
+	case "", "3":
+		return true, false, false
+	case "4":
+		return false, true, false
+	case "5":
+		return false, false, true
+	default:
+		return false, false, false
 	}
 }
 
