@@ -483,9 +483,9 @@ xray-core 主线（v26.5.9 已确认）的扩展点：
 | X2 | rendr/xray 暴露 Config / Dialer / Listener 形态 | 已完成 |
 | X3 | xray.Dialer.DialContext / xray.Listener.AcceptContext 满足 xray internet.Dialer/Listener 形状 | 已完成 |
 | X4 | path 子配置 Opts 透传（server_name / alpn / insecure / ca_pem 等） | 已完成 |
-| **X5** | **rendr 公共 API 加 `Add{Stream,Packet}PathFactory(name, factory) error`** + 胶水 B 实现 | **下一步** |
-| X6 | BalancerObject 对接（Adapter 模式：rendr 是一个 outbound，内部多 path） | 延后 |
-| X7 | xray 自身回归套件 over rendr（vmess / vless / trojan / ss + TLS / REALITY / MLKEM 全覆盖） | 延后 |
+| **X5** | **rendr 公共 API 加 `Add{Stream,Packet}PathFactory(name, factory) error`** + 胶水 B 实现 | 已完成（公共 API、`rendr/xray`、`regress/internal/xrayglue`、T3） |
+| X6 | BalancerObject 对接（Adapter 模式：rendr 是一个 outbound，内部多 path） | 已完成（`xray/balancer.go` + stream/packet T3 balancer cases） |
+| X7 | xray 自身回归套件 over rendr（vmess / vless / trojan / ss + TLS / REALITY / MLKEM 全覆盖） | 已完成为 T3 矩阵；release 门禁继续跑完整 regress |
 
 ### X5 详细规约
 
@@ -539,6 +539,11 @@ wire shape 选用对应 helper。胶水内部不窥探 chain 配置，纯壳。
 **判退**：X5 测试通不过 → 回头修订 PathFactory 契约或胶水实现。
 **不允许"X5 没完全跑通但先做 X6"**。
 
+**当前状态**：X5-X7 已落地。T3 覆盖 freedom、VMess、VLESS+Vision+TLS、
+Trojan+TLS、SS-2022、REALITY、MLKEM、nested、reverse、bare/xray 混合、
+packet udpflow/quic-datagram/xray UDP、以及 xray balancer 的 stream/packet
+factory 形态。
+
 ## M10 — 参考 demo：基于 rendr 的 SOCKS5
 
 最小可读的完整 example。给上层开发者一个嵌入示范。**不算独立 milestone，作为 docs / example 维护**。
@@ -566,17 +571,18 @@ wire shape 选用对应 helper。胶水内部不窥探 chain 配置，纯壳。
             path A  path B  path C   (任意 transport: tcp/quic/udpflow)
 ```
 
-**接口（拟）**：
+**接口（已实现）**：
 
 ```go
 // rendr/udprelay
 type Relay struct{}
 
-// Start binds a local loopback UDP port; any datagram sent to it
-// is forwarded over a rendr packet-mode Conn (with migration) to
-// the remote relay peer. Returns the local addr the application
-// should point its self-managed UDP socket at.
-func Start(ctx context.Context, cfg Config) (localAddr *net.UDPAddr, c *rendr.PacketConn, err error)
+// Listen starts a server that accepts packet-mode rendr carriers and
+// creates one UDP relay per accepted client. Dial starts the client-side
+// loopback relay. Start wraps an already-created rendr PacketConn.
+func Listen(ctx context.Context, cfg ServeConfig) (*Server, error)
+func Dial(ctx context.Context, cfg DialConfig) (*Relay, error)
+func Start(ctx context.Context, cfg Config) (*Relay, error)
 ```
 
 **关键不变量**：

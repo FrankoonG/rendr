@@ -7,12 +7,13 @@
 > - M11 self-managed UDP is now in T4 via `M11-wireguard-relay-T4` and
 >   `M11-hysteria2-relay-T4`.
 > - T5 now exercises both `tcprepair` and `gvisor`, including the explicit
->   unprivileged `tcprepair -> gvisor fallback` path.
+>   unprivileged `tcprepair -> gvisor fallback` path and the external
+>   `ListenGVisorPacket` packet-carrier fallback.
 > - The xray T3 matrix now includes REALITY, MLKEM, nested, reverse, stream and
 >   packet balancer, plus Glue A migration cases for VMess / VLESS+TLS /
 >   Trojan+TLS / SS2022.
 
-> 状态：**未实现**，设计已对齐 `docs/plan.md` v0.1.0 项目定位 + M9 X5
+> 状态：**已实现并持续回归**，设计已对齐 `docs/plan.md` v0.1.0 项目定位 + M9 X5
 > PathFactory API + 双向胶水。v3 的关键变化：
 >
 > 1. T3 主轴从"协议 × 裸传输"改为 **PathFactory 维度**（每条 path 是一份
@@ -71,10 +72,12 @@ C1-C3 是 rendr engine 的不变量，**所有 T3 用例隐含验证**——任�
 
 ### 2.2 显式不覆盖
 
-- **M3 TCP_REPAIR 单端迁移**：spike 已通过、未工程化为 transport 适配器
+- **M3/M4 TCP 单端迁移**：由 T5 覆盖；包含 `tcprepair`、`gvisor`
+  进程内路径、`tcprepair -> gvisor` fallback、以及 `ListenGVisorPacket`
+  外部 packet-carrier
 - **真实跨地域链路质量**：依赖 `docs/test-hosts.md` 真机，留给 release-tag 前手工跑（见 `success-criteria.md`）
 - **xray 自身协议层 bug**：套件只验证"经 rendr 迁移后端到端仍可用"，xray 协议本身的正确性是 xray-core 自己的 CI 范围
-- **WireGuard / Hysteria 2 等自管 UDP 协议**：等 M11（rendr UDP-relay 端点）落地后再扩矩阵
+- **WireGuard / Hysteria 2 等自管 UDP 协议**：M11 已落地，归 T4 长驻矩阵覆盖
 
 ## 3. 容器与权限要求
 
@@ -409,8 +412,8 @@ T4 **只在 release tag 触发**，不进每日 schedule。本地 `--full` 也�
 **关键判据**：
 
 - T5.3 必须**显式报错**而非静默退化，否则嵌入者不知道自己在用慢路径
-- T5.1 / T5.2 / T5.4 各自跑 G1 mini 通过
-- T5.2 + T5.4 性能记录到 reports/raw/T5.gvisor.json，gvisor 实测吞吐
+- T5.1 / T5.2 / T5.4 / T5.5 / T5.6 各自跑 G1 mini 通过
+- T5.2 + T5.4 + T5.6 性能记录到 reports/raw/T5.gvisor.json，gvisor 实测吞吐
   应在 1-3 Gbps 范围（vs T5.1 内核 TCP 5-10 Gbps），偏离 ±50% 视为回归
 
 **容器形态**：
