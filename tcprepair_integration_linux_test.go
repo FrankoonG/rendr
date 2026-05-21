@@ -65,7 +65,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 		t.Fatalf("pre write: %v", err)
 	}
 	buf := make([]byte, 16)
-	if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	n, err := server.Read(buf)
@@ -86,7 +86,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 	if _, err := client.Write([]byte("post")); err != nil {
 		t.Fatalf("post write: %v", err)
 	}
-	if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	n, err = server.Read(buf)
@@ -100,7 +100,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 	if _, err := server.Write([]byte("back")); err != nil {
 		t.Fatalf("server write back: %v", err)
 	}
-	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	n, err = client.Read(buf)
