@@ -22,18 +22,12 @@ import (
 func Run(ctx context.Context, suite *report.Suite, _ string) {
 	const T4Budget = 33 * time.Minute
 
-	// G1-T4 uses a 200 Mbps profile rather than the project-default
-	// 50 Mbps. Rationale: under 50 Mbps tbf shaping, 1 GiB / 6.25 MB/s
-	// runs ~170 s — long enough to hit a Linux TCP timeout we
-	// haven't fully diagnosed (G1-T4 fails at ~2m17s with
-	// ETIMEDOUT on both paths even after explicitly disabling
-	// keepalive; tcp_retries2 / user_timeout / fin_timeout all
-	// at default; QUIC is unaffected). 200 Mbps still constrains
-	// the link enough to surface bandwidth-related bugs but lets
-	// the bulk transfer complete in ~40 s, well clear of the
-	// 2m17s mystery timer. The strict 50 Mbps profile remains the
-	// baseline for G2 cases where bandwidth is bandwidth-trivial.
-	g1ChaosProf := chaos.Profile{Bandwidth: 200_000_000}
+	// G1-T4 runs at the same 50 Mbps baseline as the long-lived G2
+	// cases. The prior 200 Mbps workaround was only needed while the
+	// tbf burst was too small for loopback/GSO-shaped TCP and caused
+	// qdisc-induced ETIMEDOUT; chaos.Realistic50M now uses a larger
+	// burst floor while preserving the steady-state 50 Mbps cap.
+	g1ChaosProf := chaos.Realistic50M
 	runCase(ctx, suite, "G1-T4", 7*time.Minute, g1ChaosProf, func(c context.Context) smoke.Result {
 		return smoke.RunG1(c, smoke.G1Opts{
 			Size:       1 << 30,

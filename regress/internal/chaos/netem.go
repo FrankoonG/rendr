@@ -6,8 +6,8 @@
 // jitter) instead of the docker default "infinite bandwidth zero
 // latency" loopback that CLAUDE.md warns about:
 //
-//   "带宽限速是 resilience / recovery 类测试的必备前置——docker
-//    默认网络太快，跑出来的数据没意义"
+//	"带宽限速是 resilience / recovery 类测试的必备前置——docker
+//	 默认网络太快，跑出来的数据没意义"
 //
 // Profile is the declarative shape (bandwidth bits/sec, loss percent,
 // delay base+jitter). Apply installs a tc tbf+netem qdisc stack on
@@ -72,19 +72,22 @@ func Apply(p Profile) (cleanup func() error, err error) {
 
 	if p.Bandwidth > 0 {
 		// tbf params: rate, burst, latency. Latency=1s deliberately
-		// gives the tbf queue ≈ rate*1s of headroom (6 MB at 50 Mbps).
-		// 50ms (the first attempt) was way too tight: it produced a
-		// 39 KB queue, and Linux TCP's 4 MB default send buffer
-		// flooded that almost instantly, triggering TBF drops →
-		// TCP retransmits → RTO → socket abort → engine sees the
-		// path as dead. Observed at HEAD a8dafa0: G1-T4 hit
-		// "migration budget exceeded" at 10 MB into a 1 GiB
-		// transfer because both TCP paths' send buffers smashed
-		// the tbf queue simultaneously. QUIC paced internally and
-		// did not exhibit the failure.
+		// gives the tbf queue about rate*1s of headroom (6 MB at
+		// 50 Mbps). At the 50 Mbps regression baseline and above,
+		// burst must also be large enough for loopback/GSO-shaped TCP:
+		// the original rate/100 burst (62.5 KB at 50 Mbps) consistently
+		// manufactured TCP loss on lo and made G1-T4 abort at ~2m17s
+		// with ETIMEDOUT after only ~10 MiB written. A 4 MiB floor at
+		// 50 Mbps+ preserves the steady-state cap while avoiding
+		// qdisc-induced drops that do not model a clean broadband
+		// bottleneck. Lower-rate unit tests keep the small burst so
+		// short samples still observe shaping.
 		burst := p.Bandwidth / 800 // bytes ≈ rate-bits / 8 / 100
-		if burst < 1500 {
-			burst = 1500
+		if p.Bandwidth >= 50_000_000 && burst < 4<<20 {
+			burst = 4 << 20
+		}
+		if burst < 128<<10 {
+			burst = 128 << 10
 		}
 		args := []string{"qdisc", "add", "dev", "lo", "root", "handle", "1:",
 			"tbf",
