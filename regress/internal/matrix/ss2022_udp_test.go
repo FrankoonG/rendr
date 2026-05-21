@@ -18,38 +18,57 @@ import (
 	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 )
 
-// TestT3PacketSS2022UDPxUDPFlow — DEFERRED.
+// TestT3PacketSS2022UDPxUDPFlow covers SS-2022 UDP as a low-rate
+// packet-mode protocol path. The high-PPS packet contract remains on
+// rendr udpflow and QUIC DATAGRAM; this case only proves that xray's
+// SS-2022 UDP outbound/inbound chain can serve as a PacketPathFactory
+// and migrate against a plain udpflow path without violating packet
+// boundaries.
 //
 // Architecturally this should work the same way the SS-2022 stream
 // case does: xray SS-2022 UDP outbound encrypts each datagram and
 // forwards to the SS-2022 server, which decrypts and freedom-UDP-
-// dials the embedded target (rendr-server addr). In practice a
-// straight build of this case loses ~96% of datagrams at 2k pps on
-// loopback — observable in xray's "dispatch request" debug logs
-// firing for every send but only a handful reaching the rendr
-// listener. The xray-server-side freedom UDP forwarder appears to
-// open a fresh UDP socket per dispatch and its session table /
-// inbound demux drops most return paths.
-//
-// This is fundamentally an xray-core UDP path concern (xray's own
-// scenarios test SS-UDP at much lower pps and with shorter runs).
-// Not a rendr issue: rendr's PacketPathFactory + udpflow.WrapFromSpec
-// wiring is proven by the freedom-UDP × udpflow case in
-// packet_xray_test.go.
-//
-// Leaving the test code in place (commented as t.Skip) so the
-// shape is preserved for when xray-core hardens its UDP relay path
-// or when we add a different demux strategy (e.g. dedicated rendr
-// UDP inbound that handles SS UDP framing directly).
+// dials the embedded target (rendr-server addr). Earlier 2k pps
+// attempts lost most datagrams in xray's UDP relay path, so this
+// stays deliberately small and does not replace the high-rate G3
+// gates.
 func TestT3PacketSS2022UDPxUDPFlow(t *testing.T) {
-	t.Skip("xray-core SS-2022 UDP relay has high loss at sustained pps; tracked but not gating regress")
-	_ = startSSUDPServer
-	_ = startSSUDPClient
-	_ = xrayglue.XrayInstanceAsPacketFactory
-	_ = rendr.PathSpec{}
-	_ = driver.UDPEchoOpts{}
-	_ = context.Background
-	_ = time.Second
+	ssPort := pickFreePort(t)
+	ssKey := randomSSKey(t)
+	const method = "2022-blake3-aes-128-gcm"
+
+	ssServer := startSSUDPServer(t, ssPort, method, ssKey)
+	defer ssServer.Close()
+	ssClient := startSSUDPClient(t, ssPort, method, ssKey)
+	defer ssClient.Close()
+
+	factory := xrayglue.XrayInstanceAsPacketFactory(ssClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	r := driver.RunUDPEcho(ctx, driver.UDPEchoOpts{
+		CaseName:     "T3.packet.ss2022-udp × udpflow",
+		AcceptListen: "udpflow",
+		Paths: []rendr.PathSpec{
+			{Transport: "xray-ss2022-udp"},
+			{Transport: "udpflow"},
+		},
+		Factories: []driver.NamedFactory{
+			{Name: "xray-ss2022-udp", Packet: factory},
+		},
+		PPS:          100,
+		Duration:     3 * time.Second,
+		PayloadLen:   512,
+		Migrations:   3,
+		LossPct:      5.0,
+		P95CeilingMs: 100,
+	})
+	if r.Failure != "" {
+		t.Fatalf("case failed: %s", r.Failure)
+	}
+	t.Logf("PASS: %s sent=%d recv=%d loss=%.2f%% p95=%.1fms migrations=%d",
+		r.Name, r.Sent, r.Received, r.LossPct, r.P95ms, r.MigrationsDone)
 }
 
 // startSSUDPServer: SS-2022 inbound configured to handle UDP +
