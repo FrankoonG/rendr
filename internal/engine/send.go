@@ -192,10 +192,11 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // (unmeasured: fresh attach, no probe reply yet) are never
 // considered stuck.
 //
-// Still TODO at M8: weighted distribution by capacity and
-// ACK-tight resend trimming. Redistribute-on-death is intentionally
-// conservative: it replays a bounded recent window and relies on
-// receiver SEQ dedup to discard frames that arrived before death.
+// PathSpec.Weight controls each path's share of pin windows. A zero
+// weight means 1. Still TODO at M8: ACK-tight resend trimming.
+// Redistribute-on-death is intentionally conservative: it replays a
+// bounded recent window and relies on receiver SEQ dedup to discard
+// frames that arrived before death.
 func (e *Engine) dispatchBond(frame []byte) error {
 	for {
 		if e.isClosed() {
@@ -219,13 +220,14 @@ func (e *Engine) dispatchBond(frame []byte) error {
 				ids[j-1], ids[j] = ids[j], ids[j-1]
 			}
 		}
+		weights, totalWeight := e.bondWeightsLocked(ids)
 		stuck := e.computeBondStuckMask(ids)
 
 		// If pin window still has frames AND current path is not
 		// stuck, keep using it.
 		idx := -1
 		if e.bondPinLeft > 0 {
-			cur := int(e.bondCursor % uint64(len(ids)))
+			cur := bondWeightedIndex(weights, totalWeight, e.bondCursor)
 			if !stuck[cur] {
 				idx = cur
 			} else {
@@ -252,9 +254,9 @@ func (e *Engine) dispatchBond(frame []byte) error {
 				pin = 1
 			}
 			chosen := -1
-			for i := 0; i < len(ids); i++ {
+			for i := uint64(0); i < totalWeight; i++ {
 				e.bondCursor++
-				j := int(e.bondCursor % uint64(len(ids)))
+				j := bondWeightedIndex(weights, totalWeight, e.bondCursor)
 				if !stuck[j] {
 					chosen = j
 					break
@@ -263,7 +265,7 @@ func (e *Engine) dispatchBond(frame []byte) error {
 				e.bondStuckSkips++
 			}
 			if chosen < 0 {
-				chosen = int(e.bondCursor % uint64(len(ids)))
+				chosen = bondWeightedIndex(weights, totalWeight, e.bondCursor)
 			}
 			idx = chosen
 			e.bondPinLeft = pin
@@ -317,7 +319,8 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 				ids[j-1], ids[j] = ids[j], ids[j-1]
 			}
 		}
-		start := int(e.bondCursor % uint64(len(ids)))
+		weights, totalWeight := e.bondWeightsLocked(ids)
+		start := bondWeightedIndex(weights, totalWeight, e.bondCursor)
 		e.bondCursor++
 		slots := make([]*pathSlot, 0, len(ids))
 		for i := 0; i < len(ids); i++ {
@@ -334,6 +337,41 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 		}
 		return net.ErrClosed
 	}
+}
+
+func (e *Engine) bondWeightsLocked(ids []uint32) ([]uint16, uint64) {
+	weights := make([]uint16, len(ids))
+	var total uint64
+	for i, id := range ids {
+		w := uint16(1)
+		if s, ok := e.paths[id]; ok && s.spec.Weight > 0 {
+			w = s.spec.Weight
+		}
+		weights[i] = w
+		total += uint64(w)
+	}
+	if total == 0 {
+		return weights, uint64(len(ids))
+	}
+	return weights, total
+}
+
+func bondWeightedIndex(weights []uint16, total uint64, cursor uint64) int {
+	if len(weights) == 0 {
+		return 0
+	}
+	if total == 0 {
+		return int(cursor % uint64(len(weights)))
+	}
+	slot := cursor % total
+	var acc uint64
+	for i, w := range weights {
+		acc += uint64(w)
+		if slot < acc {
+			return i
+		}
+	}
+	return len(weights) - 1
 }
 
 // computeBondStuckMask returns, for each id in ids (in order), true

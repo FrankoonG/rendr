@@ -2724,6 +2724,104 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 	}
 }
 
+// TestM8BondHonorsPathWeights verifies PathSpec.Weight controls the
+// relative share of bond pin windows. With pin=1 and weights 3:1,
+// 16 single-frame writes should route 12 frames to the heavier path
+// and 4 to the lighter path.
+func TestM8BondHonorsPathWeights(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode:          ModePrime,
+		ProbeInterval: time.Hour,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: ln.Addr().String(), Weight: 3},
+			{Transport: "tcp", Address: ln.Addr().String(), Weight: 1},
+		},
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("expected 2 paths each, got client=%d server=%d",
+			len(client.Paths()), len(server.Paths()))
+	}
+
+	bc := client.(*engineBackedConn)
+	type pp struct {
+		id     uint32
+		weight uint16
+		writer interface{ Writes() uint64 }
+		base   uint64
+	}
+	var probes []pp
+	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
+		if w, ok := pc.(interface{ Writes() uint64 }); ok {
+			probes = append(probes, pp{id: id, writer: w})
+		}
+	})
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+	for _, path := range client.Paths() {
+		for i := range probes {
+			if probes[i].id == path.ID {
+				probes[i].weight = path.Spec.Weight
+			}
+		}
+	}
+
+	bc.Engine().SetBondPinSizeForTest(1)
+	if err := client.SetMode(ModeBond); err != nil {
+		t.Fatalf("SetMode(bond): %v", err)
+	}
+	for i := range probes {
+		probes[i].base = probes[i].writer.Writes()
+	}
+
+	const N = 16
+	payload := []byte("weighted")
+	for i := 0; i < N; i++ {
+		if _, err := client.Write(payload); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	rxbuf := make([]byte, len(payload)*N)
+	if _, err := io.ReadFull(server, rxbuf); err != nil {
+		t.Fatalf("server drain: %v", err)
+	}
+
+	counts := map[uint16]uint64{}
+	for _, p := range probes {
+		counts[p.weight] += p.writer.Writes() - p.base
+	}
+	if counts[3] != 12 || counts[1] != 4 {
+		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, want 12/4", counts[3], counts[1])
+	}
+}
+
 // TestM8BondSkipsStuckPath: bond mode must not round-robin frames
 // onto a path whose latest probe RTT is >= BondStuckRTTMultiplier x
 // the best path's RTT. Without this, a single slow path balloons
