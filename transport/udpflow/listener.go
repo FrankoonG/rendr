@@ -124,6 +124,10 @@ func (l *Listener) readLoop() {
 		copy(payload, buf[proto.UDPFlowHeaderSize:n])
 
 		l.mu.Lock()
+		if l.flows == nil {
+			l.mu.Unlock()
+			return
+		}
 		pc, exists := l.flows[hdr.FlowID]
 		if !exists {
 			pc = newServerPathConn(l.conn, hdr.FlowID, src)

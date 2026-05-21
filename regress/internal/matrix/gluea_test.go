@@ -169,6 +169,73 @@ func TestT3GlueAVLESSTLSOverRendrTransport(t *testing.T) {
 	}
 }
 
+func TestT3GlueAVLESSTLSMLKEMOverRendrTransport(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		c, err := echo.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+
+	rendrPort := pickFreePort(t)
+	transportName := "rendr-gluea-vless-mlkem-" + strconv.Itoa(rendrPort)
+	rendrAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(rendrPort))
+	if err := rendrxray.RegisterRendrTransportListener(transportName, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := rendrxray.RegisterRendrTransportDialer(transportName, &rendrxray.Config{
+		Mode: rendrxray.ModePrime,
+		Paths: []rendrxray.PathSpec{
+			{Transport: "tcp", Address: rendrAddr},
+			{Transport: "tcp", Address: rendrAddr},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	userID := protocol.NewID(uuid.New()).String()
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	curves := []string{"x25519mlkem768", "x25519"}
+	server := startVLESSTLSServerOverRendrTransportCurves(t, rendrPort, userID, transportName, ct, curves)
+	defer server.Close()
+	client := startVLESSTLSClientOverRendrTransportCurves(t, rendrPort, userID, transportName, ctHash, curves)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dest, err := xnet.ParseDestination("tcp:" + echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := core.Dial(ctx, client, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	want := []byte("vless tls mlkem over xray streamSettings.network=rendr")
+	if _, err := c.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("payload got %q want %q", got, want)
+	}
+}
+
 func TestT3GlueATrojanTLSOverRendrTransport(t *testing.T) {
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -375,6 +442,11 @@ func startVMessClientOverRendrTransport(t *testing.T, port int, userID, transpor
 
 func startVLESSTLSServerOverRendrTransport(t *testing.T, port int, userID, transportName string, srvCert *cert.Certificate) *core.Instance {
 	t.Helper()
+	return startVLESSTLSServerOverRendrTransportCurves(t, port, userID, transportName, srvCert, nil)
+}
+
+func startVLESSTLSServerOverRendrTransportCurves(t *testing.T, port int, userID, transportName string, srvCert *cert.Certificate, curves []string) *core.Instance {
+	t.Helper()
 	cfg := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -391,7 +463,8 @@ func startVLESSTLSServerOverRendrTransport(t *testing.T, port int, userID, trans
 						SecurityType: serial.GetMessageType(&tls.Config{}),
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
-								Certificate: []*tls.Certificate{tls.ParseCertificate(srvCert)},
+								Certificate:      []*tls.Certificate{tls.ParseCertificate(srvCert)},
+								CurvePreferences: curves,
 							}),
 						},
 					},
@@ -420,6 +493,11 @@ func startVLESSTLSServerOverRendrTransport(t *testing.T, port int, userID, trans
 
 func startVLESSTLSClientOverRendrTransport(t *testing.T, port int, userID, transportName string, srvCertHash [32]byte) *core.Instance {
 	t.Helper()
+	return startVLESSTLSClientOverRendrTransportCurves(t, port, userID, transportName, srvCertHash, nil)
+}
+
+func startVLESSTLSClientOverRendrTransportCurves(t *testing.T, port int, userID, transportName string, srvCertHash [32]byte, curves []string) *core.Instance {
+	t.Helper()
 	cfg := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -446,6 +524,7 @@ func startVLESSTLSClientOverRendrTransport(t *testing.T, port int, userID, trans
 						SecuritySettings: []*serial.TypedMessage{
 							serial.ToTypedMessage(&tls.Config{
 								PinnedPeerCertSha256: [][]byte{srvCertHash[:]},
+								CurvePreferences:     curves,
 							}),
 						},
 					},
