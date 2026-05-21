@@ -48,6 +48,14 @@ Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`.
 
 Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`.
 
+## Embedder example
+
+`examples/socks5` is a small reference embedder: a local SOCKS5
+CONNECT endpoint opens one rendr `Conn` per proxied TCP connection,
+then a rendr-side server dials the requested target. It is an example
+of layering an application protocol on top of rendr, not a built-in
+proxy protocol.
+
 ## Packet mode
 
 For datagram-oriented applications, use `DialPacket` and
