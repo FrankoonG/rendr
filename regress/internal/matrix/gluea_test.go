@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
 	vlessinbound "github.com/xtls/xray-core/proxy/vless/inbound"
 	vlessoutbound "github.com/xtls/xray-core/proxy/vless/outbound"
@@ -27,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 
+	_ "github.com/xtls/xray-core/proxy/trojan"
 	_ "github.com/xtls/xray-core/proxy/vless/inbound"
 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
 	_ "github.com/xtls/xray-core/proxy/vmess/inbound"
@@ -150,6 +152,72 @@ func TestT3GlueAVLESSTLSOverRendrTransport(t *testing.T) {
 	defer c.Close()
 
 	want := []byte("vless tls over xray streamSettings.network=rendr")
+	if _, err := c.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("payload got %q want %q", got, want)
+	}
+}
+
+func TestT3GlueATrojanTLSOverRendrTransport(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		c, err := echo.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+
+	rendrPort := pickFreePort(t)
+	transportName := "rendr-gluea-trojan-" + strconv.Itoa(rendrPort)
+	rendrAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(rendrPort))
+	if err := rendrxray.RegisterRendrTransportListener(transportName, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := rendrxray.RegisterRendrTransportDialer(transportName, &rendrxray.Config{
+		Mode: rendrxray.ModePrime,
+		Paths: []rendrxray.PathSpec{
+			{Transport: "tcp", Address: rendrAddr},
+			{Transport: "tcp", Address: rendrAddr},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	password := randomTrojanPassword(t)
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	server := startTrojanTLSServerOverRendrTransport(t, rendrPort, password, transportName, ct)
+	defer server.Close()
+	client := startTrojanTLSClientOverRendrTransport(t, rendrPort, password, transportName, ctHash)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dest, err := xnet.ParseDestination("tcp:" + echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := core.Dial(ctx, client, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	want := []byte("trojan tls over xray streamSettings.network=rendr")
 	if _, err := c.Write(want); err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +368,85 @@ func startVLESSTLSClientOverRendrTransport(t *testing.T, port int, userID, trans
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id: userID,
 							}),
+						},
+					},
+				}),
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+					StreamSettings: &internet.StreamConfig{
+						ProtocolName: transportName,
+						SecurityType: serial.GetMessageType(&tls.Config{}),
+						SecuritySettings: []*serial.TypedMessage{
+							serial.ToTypedMessage(&tls.Config{
+								PinnedPeerCertSha256: [][]byte{srvCertHash[:]},
+							}),
+						},
+					},
+				}),
+			},
+		},
+	}
+	return mustStartInstance(t, cfg)
+}
+
+func startTrojanTLSServerOverRendrTransport(t *testing.T, port int, password, transportName string, srvCert *cert.Certificate) *core.Instance {
+	t.Helper()
+	cfg := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(port))}},
+					Listen:   xnet.NewIPOrDomain(xnet.LocalHostIP),
+					StreamSettings: &internet.StreamConfig{
+						ProtocolName: transportName,
+						SecurityType: serial.GetMessageType(&tls.Config{}),
+						SecuritySettings: []*serial.TypedMessage{
+							serial.ToTypedMessage(&tls.Config{
+								Certificate: []*tls.Certificate{tls.ParseCertificate(srvCert)},
+							}),
+						},
+					},
+				}),
+				ProxySettings: serial.ToTypedMessage(&trojan.ServerConfig{
+					Users: []*protocol.User{
+						{
+							Account: serial.ToTypedMessage(&trojan.Account{Password: password}),
+						},
+					},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
+			},
+		},
+	}
+	return mustStartInstance(t, cfg)
+}
+
+func startTrojanTLSClientOverRendrTransport(t *testing.T, port int, password, transportName string, srvCertHash [32]byte) *core.Instance {
+	t.Helper()
+	cfg := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&trojan.ClientConfig{
+					Server: &protocol.ServerEndpoint{
+						Address: xnet.NewIPOrDomain(xnet.LocalHostIP),
+						Port:    uint32(port),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&trojan.Account{Password: password}),
 						},
 					},
 				}),
