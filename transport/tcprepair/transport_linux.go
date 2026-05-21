@@ -37,6 +37,9 @@ func (*Transport) Name() string { return "tcprepair" }
 // is reported with an explicit CAP_NET_ADMIN hint so embedders can
 // fall back to gvisor cleanly.
 func Available() error {
+	if err := requireTCPRepairWindowKernel(); err != nil {
+		return err
+	}
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
 	if err != nil {
 		return fmt.Errorf("tcprepair: probe socket: %w", err)

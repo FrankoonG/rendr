@@ -129,7 +129,7 @@ func Snapshot(c *net.TCPConn) (*State, error) {
 		s.Timestamp = uint32(ts)
 		wbuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Window)), int(unsafe.Sizeof(s.Window)))
 		if _, err := getRaw(fd, tcpRepairWindow, wbuf); err != nil {
-			return fmt.Errorf("get repair_window: %w", err)
+			return repairWindowError("get repair_window", err)
 		}
 		return nil
 	})
@@ -234,7 +234,7 @@ func Restore(s *State) (int, error) {
 
 	wbuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Window)), int(unsafe.Sizeof(s.Window)))
 	if err := setRaw(fd, tcpRepairWindow, wbuf); err != nil {
-		return -1, fmt.Errorf("set repair_window: %w", err)
+		return -1, repairWindowError("set repair_window", err)
 	}
 
 	// TCP_TIMESTAMP may soft-fail on some kernels; tolerate.
@@ -249,6 +249,13 @@ func Restore(s *State) (int, error) {
 
 	cleanup = false
 	return fd, nil
+}
+
+func repairWindowError(op string, err error) error {
+	if errors.Is(err, syscall.ENOPROTOOPT) || errors.Is(err, syscall.EOPNOTSUPP) {
+		return fmt.Errorf("%s: %w (TCP_REPAIR_WINDOW requires Linux >= 4.5; use gvisor fallback)", op, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 func sockaddrIPv4(addr *net.TCPAddr) *syscall.SockaddrInet4 {

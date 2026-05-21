@@ -33,7 +33,8 @@
 //     server-process crash needs persistence to disk + a recovery
 //     handshake. Out of scope.
 //
-// Requires Linux ≥ 3.5 (TCP_REPAIR was added in kernel 3.5). Caller
-// must hold CAP_NET_ADMIN (scripts/regress.sh's docker
-// --cap-add=NET_ADMIN provides it).
+// Requires Linux >= 4.5 for full TCP_REPAIR_WINDOW support (base
+// TCP_REPAIR was added in kernel 3.5). Caller must hold
+// CAP_NET_ADMIN (scripts/regress.sh's docker --cap-add=NET_ADMIN
+// provides it).
 package tcprepair
