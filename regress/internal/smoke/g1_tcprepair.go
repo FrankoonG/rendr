@@ -83,6 +83,7 @@ func RunG1TCPRepairSameTuple(ctx context.Context, opts G1TCPRepairOpts) Result {
 	hSent := sha256.Sum256(payload)
 
 	recvErr := make(chan error, 1)
+	progress := make(chan int64, 64)
 	hRecv := sha256.New()
 	go func() {
 		buf := make([]byte, 256*1024)
@@ -95,6 +96,7 @@ func RunG1TCPRepairSameTuple(ctx context.Context, opts G1TCPRepairOpts) Result {
 			}
 			hRecv.Write(buf[:n])
 			got += int64(n)
+			publishTCPRepairProgress(progress, got)
 		}
 		recvErr <- nil
 	}()
@@ -116,7 +118,18 @@ func RunG1TCPRepairSameTuple(ctx context.Context, opts G1TCPRepairOpts) Result {
 	const chunk = int64(64 * 1024)
 	var written int64
 	var migIdx int
+	var serverGot int64
 	for written < opts.Size {
+		select {
+		case err := <-recvErr:
+			if err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("recv before write complete: %w", err))
+			}
+			return FromError(name, time.Since(t0), fmt.Errorf("receiver finished after %d/%d bytes", written, opts.Size))
+		case <-ctx.Done():
+			return FromError(name, time.Since(t0), fmt.Errorf("context before write complete: %w", ctx.Err()))
+		default:
+		}
 		end := written + chunk
 		if end > opts.Size {
 			end = opts.Size
@@ -127,18 +140,21 @@ func RunG1TCPRepairSameTuple(ctx context.Context, opts G1TCPRepairOpts) Result {
 		}
 		written += int64(n)
 		for migIdx < len(migPts) && written >= migPts[migIdx] {
-			// Give the peer a brief chance to drain the in-flight TCP
-			// queue before snapshotting. Same-tuple TCP_REPAIR rebuilds
-			// work with queued bytes, but a smaller queue keeps the smoke
-			// case fast and stable.
-			time.Sleep(10 * time.Millisecond)
+			// Keep this same-tuple gate focused on clean TCP_REPAIR
+			// socket rebuilds. Cross-queue active-stream repair remains
+			// covered by lower-level snapshot tests and future migration
+			// work; the phase-2 gate should fail clearly instead of
+			// hanging on an in-flight queue stall.
+			if err := waitTCPRepairProgress(ctx, recvErr, progress, &serverGot, written); err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("wait before same-tuple rebuild %d: %w", migIdx, err))
+			}
 			if err := admin.MigratePathLocalAddr(pathID, ""); err != nil {
 				return FromError(name, time.Since(t0), fmt.Errorf("same-tuple rebuild %d: %w", migIdx, err))
 			}
 			migIdx++
 		}
 	}
-	if err := <-recvErr; err != nil {
+	if err := waitTCPRepairProgress(ctx, recvErr, progress, &serverGot, opts.Size); err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("recv: %w", err))
 	}
 
@@ -164,4 +180,39 @@ func RunG1TCPRepairSameTuple(ctx context.Context, opts G1TCPRepairOpts) Result {
 		return r
 	}
 	return r
+}
+
+func publishTCPRepairProgress(ch chan int64, got int64) {
+	select {
+	case ch <- got:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- got:
+	default:
+	}
+}
+
+func waitTCPRepairProgress(ctx context.Context, recvErr <-chan error, progress <-chan int64, current *int64, want int64) error {
+	for *current < want {
+		select {
+		case got := <-progress:
+			if got > *current {
+				*current = got
+			}
+		case err := <-recvErr:
+			if err != nil {
+				return err
+			}
+			*current = want
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
