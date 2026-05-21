@@ -51,6 +51,10 @@
 // the regular Accept channel instead. The two modes can coexist on
 // one listener port.
 //
+// Package github.com/FrankoonG/rendr/udprelay builds on PacketConn
+// for applications that already own UDP sockets: it exposes a local
+// UDP endpoint and carries packets over rendr underneath.
+//
 // # Operational modes
 //
 // Three modes share the same migration engine. Set on Dialer.Mode

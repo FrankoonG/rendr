@@ -64,6 +64,11 @@ pc, _ := (&rendr.Dialer{
 // pc implements net.PacketConn; boundaries preserved 1-to-1.
 ```
 
+For applications that already own a UDP socket, package
+`github.com/FrankoonG/rendr/udprelay` exposes a local UDP relay over a
+rendr `PacketConn`. Point the application at `Relay.LocalAddr()` and
+use `Relay.PacketConn()` for migration control.
+
 ## Modes
 
 | Mode    | Bandwidth          | Latency           | Use for                          |
