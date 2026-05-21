@@ -16,6 +16,7 @@ type G1Opts struct {
 	Migrations int    // forced migrations; default 3
 	Paths      int    // number of paths; default 2
 	Transport  string // "tcp" | "quic"; default "tcp"
+	Transports []string
 }
 
 func (o *G1Opts) withDefaults() {
@@ -30,6 +31,14 @@ func (o *G1Opts) withDefaults() {
 	}
 	if o.Transport == "" {
 		o.Transport = "tcp"
+	}
+	if len(o.Transports) == 0 {
+		o.Transports = make([]string, o.Paths)
+		for i := range o.Transports {
+			o.Transports[i] = o.Transport
+		}
+	} else {
+		o.Paths = len(o.Transports)
 	}
 }
 
@@ -46,9 +55,9 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
 	name := fmt.Sprintf("G1-smoke (%s, %dMiB, %d paths, %d migrations)",
-		opts.Transport, opts.Size>>20, opts.Paths, opts.Migrations)
+		transportDesc(opts.Transports), opts.Size>>20, opts.Paths, opts.Migrations)
 
-	ln, err := listenForTransport(opts.Transport)
+	ln, specs, err := listenAndSpecsForTransports(opts.Transports)
 	if err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("listen: %w", err))
 	}
@@ -67,10 +76,6 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 		accepted <- c
 	}()
 
-	specs := make([]rendr.PathSpec, opts.Paths)
-	for i := range specs {
-		specs[i] = rendr.PathSpec{Transport: opts.Transport, Address: ln.Addr().String()}
-	}
 	client, err := (&rendr.Dialer{Mode: rendr.ModePrime, Paths: specs}).Dial(ctx)
 	if err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("dial: %w", err))
@@ -213,4 +218,54 @@ func listenForTransport(name string) (rendr.Listener, error) {
 	default:
 		return nil, fmt.Errorf("unknown transport %q", name)
 	}
+}
+
+func listenAndSpecsForTransports(transports []string) (rendr.Listener, []rendr.PathSpec, error) {
+	if len(transports) == 0 {
+		return nil, nil, fmt.Errorf("no transports")
+	}
+	allSame := true
+	for _, t := range transports[1:] {
+		if t != transports[0] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		ln, err := listenForTransport(transports[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		specs := make([]rendr.PathSpec, len(transports))
+		for i := range specs {
+			specs[i] = rendr.PathSpec{Transport: transports[0], Address: ln.Addr().String()}
+		}
+		return ln, specs, nil
+	}
+
+	listenSpecs := make([]rendr.ListenSpec, len(transports))
+	for i, name := range transports {
+		listenSpecs[i] = rendr.ListenSpec{Transport: name, Address: "127.0.0.1:0"}
+	}
+	ln, err := rendr.Listen(listenSpecs...)
+	if err != nil {
+		return nil, nil, err
+	}
+	addrs := ln.Addrs()
+	specs := make([]rendr.PathSpec, len(transports))
+	for i, name := range transports {
+		specs[i] = rendr.PathSpec{Transport: name, Address: addrs[i].String()}
+	}
+	return ln, specs, nil
+}
+
+func transportDesc(transports []string) string {
+	if len(transports) == 0 {
+		return ""
+	}
+	s := transports[0]
+	for _, t := range transports[1:] {
+		s += "+" + t
+	}
+	return s
 }

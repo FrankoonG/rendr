@@ -25,6 +25,16 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	addRun(suite, "G1-smoke", "T2", func() smoke.Result {
 		return smoke.RunG1(ctx, smoke.G1Opts{})
 	})
+	addRun(suite, "G1-mixed-tcp-quic-smoke", "T2", func() smoke.Result {
+		return smoke.RunG1(ctx, smoke.G1Opts{
+			Size:       8 << 20,
+			Migrations: 1,
+			Transports: []string{
+				"tcp",
+				"quic",
+			},
+		})
+	})
 	addRun(suite, "G2-smoke", "T2", func() smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{})
 	})
