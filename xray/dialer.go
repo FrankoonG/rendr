@@ -41,7 +41,14 @@ func NewDialer(cfg *Config) (*Dialer, error) {
 // net.Destination at this point). For now it is ignored - the
 // destination is implicit in each PathSpec's Address.
 func (d *Dialer) DialContext(ctx context.Context, dest net.Addr) (net.Conn, error) {
-	return d.rendrDialer().Dial(ctx)
+	conn, err := d.rendrDialer().Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d.cfg.OnConn != nil {
+		d.cfg.OnConn(conn)
+	}
+	return conn, nil
 }
 
 // rendrDialer packs the xray-side Config into a rendr.Dialer. Shared

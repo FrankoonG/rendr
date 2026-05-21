@@ -1,6 +1,9 @@
 package xray
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // Mode mirrors rendr.Mode but is duplicated here so xray-side
 // configuration can be marshalled without importing the parent
@@ -80,6 +83,13 @@ type Config struct {
 	// best_rtt * Multiplier is bypassed in bond round-robin.
 	// 0 = engine default 3.0.
 	BondStuckRTTMultiplier float64
+
+	// OnConn, when non-nil, is called after the xray transport dialer
+	// creates the underlying rendr net.Conn and before it is returned
+	// to xray-core. Tests and embedders can type-assert the value to
+	// rendr.AdminConn to observe or trigger migrations without changing
+	// xray's protocol-level connection.
+	OnConn func(net.Conn)
 }
 
 // Validate runs cheap structural checks. Embedders should call this

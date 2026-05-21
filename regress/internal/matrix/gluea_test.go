@@ -1,13 +1,16 @@
 package matrix
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"io"
 	"net"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr"
 	rendrxray "github.com/FrankoonG/rendr/xray"
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
@@ -101,6 +104,111 @@ func TestT3GlueAVMessOverRendrTransport(t *testing.T) {
 	if string(got) != string(want) {
 		t.Fatalf("payload got %q want %q", got, want)
 	}
+}
+
+func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go serveOneExplicitTCPEcho(echo)
+
+	rendrPort := pickFreePort(t)
+	transportName := "rendr-gluea-vmess-migrate-" + strconv.Itoa(rendrPort)
+	rendrAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(rendrPort))
+	if err := rendrxray.RegisterRendrTransportListener(transportName, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	adminCh := make(chan rendr.AdminConn, 1)
+	if err := rendrxray.RegisterRendrTransportDialer(transportName, &rendrxray.Config{
+		Mode: rendrxray.ModePrime,
+		Paths: []rendrxray.PathSpec{
+			{Transport: "tcp", Address: rendrAddr},
+			{Transport: "tcp", Address: rendrAddr},
+		},
+		OnConn: func(c net.Conn) {
+			if admin, ok := c.(rendr.AdminConn); ok {
+				select {
+				case adminCh <- admin:
+				default:
+				}
+			}
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	userID := protocol.NewID(uuid.New()).String()
+	server := startVMessServerOverRendrTransport(t, rendrPort, userID, transportName)
+	defer server.Close()
+	client := startVMessClientOverRendrTransport(t, rendrPort, userID, transportName)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dest, err := xnet.ParseDestination("tcp:" + echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := core.Dial(ctx, client, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var admin rendr.AdminConn
+	select {
+	case admin = <-adminCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rendr transport conn was not observed")
+	}
+	waitGlueAPaths(t, admin, 2)
+
+	const total = 8 << 20
+	payload := make([]byte, total)
+	for i := range payload {
+		payload[i] = byte((i*19 + 11) & 0xff)
+	}
+	wantHash := sha256.Sum256(payload)
+	gotHash := sha256.New()
+
+	migrateAt := map[int]struct{}{
+		total * 1 / 4: {},
+		total * 1 / 2: {},
+		total * 3 / 4: {},
+	}
+	const chunk = 64 << 10
+	startMigrations := admin.MigrationCount()
+	buf := make([]byte, chunk)
+	for off := 0; off < total; off += chunk {
+		end := off + chunk
+		if end > total {
+			end = total
+		}
+		if _, err := c.Write(payload[off:end]); err != nil {
+			t.Fatalf("write at %d: %v", off, err)
+		}
+		if err := readFullWithDeadline(c, buf[:end-off]); err != nil {
+			t.Fatalf("read echo at %d: %v", off, err)
+		}
+		gotHash.Write(buf[:end-off])
+		if !bytes.Equal(buf[:end-off], payload[off:end]) {
+			t.Fatalf("echo payload mismatch at %d", off)
+		}
+		if _, ok := migrateAt[end]; ok {
+			migrateGlueA(t, admin)
+		}
+	}
+	if got := admin.MigrationCount() - startMigrations; got < 3 {
+		t.Fatalf("migrations=%d want >=3", got)
+	}
+	if !bytes.Equal(gotHash.Sum(nil), wantHash[:]) {
+		t.Fatalf("sha256 mismatch: got %x want %x", gotHash.Sum(nil), wantHash[:])
+	}
+	t.Logf("PASS: T3.glueA.vmess-rendr-transport-migrate bytes=%d migrations=%d",
+		total, admin.MigrationCount()-startMigrations)
 }
 
 func TestT3GlueAVLESSTLSOverRendrTransport(t *testing.T) {
@@ -403,6 +511,61 @@ func startVMessServerOverRendrTransport(t *testing.T, port int, userID, transpor
 		},
 	}
 	return mustStartInstance(t, cfg)
+}
+
+func serveOneExplicitTCPEcho(ln net.Listener) {
+	c, err := ln.Accept()
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			if _, werr := c.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func waitGlueAPaths(t *testing.T, admin rendr.AdminConn, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(admin.Paths()) >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("rendr transport paths=%d want >=%d", len(admin.Paths()), want)
+}
+
+func migrateGlueA(t *testing.T, admin rendr.AdminConn) {
+	t.Helper()
+	cur := admin.ActivePath()
+	for _, p := range admin.Paths() {
+		if p.ID != cur {
+			if err := admin.Migrate(p.ID); err != nil {
+				t.Fatalf("migrate to path %d: %v", p.ID, err)
+			}
+			return
+		}
+	}
+	t.Fatalf("no alternate path from active=%d", cur)
+}
+
+func readFullWithDeadline(c net.Conn, buf []byte) error {
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	defer c.SetReadDeadline(time.Time{})
+	_, err := io.ReadFull(c, buf)
+	return err
 }
 
 func startVMessClientOverRendrTransport(t *testing.T, port int, userID, transportName string) *core.Instance {
