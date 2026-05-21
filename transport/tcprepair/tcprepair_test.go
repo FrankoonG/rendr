@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 )
@@ -78,21 +77,16 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 		t.Fatalf("recv-queue content mismatch: got %q want %q", snap.RecvQueue, unread)
 	}
 
-	// Install iptables DROP on the 5-tuple to suppress any RST in
-	// the migration window. The drop is on INPUT (incoming to host)
-	// for loopback because we're targeting client→server traffic.
-	dropArgs := []string{"-I", "INPUT", "-i", "lo", "-p", "tcp",
-		"-s", cliAddr.IP.String(), "--sport", numStr(cliAddr.Port),
-		"-d", srvAddr.IP.String(), "--dport", numStr(srvAddr.Port),
-		"-j", "DROP"}
-	delArgs := append([]string{"-D"}, dropArgs[1:]...)
-	if out, err := exec.Command("iptables", dropArgs...).CombinedOutput(); err != nil {
-		t.Fatalf("iptables drop: %v (%s)", err, out)
+	// Suppress RSTs during the migration window using the same
+	// netfilter abstraction as PathConn.MigratePathLocalAddr.
+	cleanupDrop, err := installDropRules(srvAddr, cliAddr)
+	if err != nil {
+		t.Fatalf("iptables drop: %v", err)
 	}
 	dropInstalled := true
 	defer func() {
 		if dropInstalled {
-			_ = exec.Command("iptables", delArgs...).Run()
+			cleanupDrop()
 		}
 	}()
 
@@ -114,9 +108,7 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 	defer newSrv.Close()
 	newSrvTCP := newSrv.(*net.TCPConn)
 
-	if out, err := exec.Command("iptables", delArgs...).CombinedOutput(); err != nil {
-		t.Fatalf("iptables remove: %v (%s)", err, out)
-	}
+	cleanupDrop()
 	dropInstalled = false
 
 	// Replay: the unread bytes should be drainable from the new fd.
@@ -156,27 +148,4 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 			t.Fatalf("client side saw non-timeout error: %v", err)
 		}
 	}
-}
-
-func numStr(n int) string {
-	const digits = "0123456789"
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = digits[n%10]
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

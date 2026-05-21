@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -171,32 +169,3 @@ func (p *PathConn) MarkByeSeen()                                           { p.b
 func (p *PathConn) MarkQuiesced()                                          { p.base.MarkQuiesced() }
 func (p *PathConn) Writes() uint64                                         { return p.base.Writes() }
 func (p *PathConn) Reads() uint64                                          { return p.base.Reads() }
-
-func installDropRules(local, remote *net.TCPAddr) (func(), error) {
-	if local == nil || remote == nil {
-		return nil, errors.New("tcprepair: nil local/remote addr")
-	}
-	localIP := local.IP.String()
-	remoteIP := remote.IP.String()
-	localPort := strconv.Itoa(local.Port)
-	remotePort := strconv.Itoa(remote.Port)
-
-	rules := [][]string{
-		{"-I", "INPUT", "-p", "tcp", "-s", remoteIP, "--sport", remotePort, "-d", localIP, "--dport", localPort, "-j", "DROP"},
-		{"-I", "OUTPUT", "-p", "tcp", "-s", localIP, "--sport", localPort, "-d", remoteIP, "--dport", remotePort, "-j", "DROP"},
-	}
-	cleanup := func() {
-		for i := len(rules) - 1; i >= 0; i-- {
-			rule := append([]string(nil), rules[i]...)
-			rule[0] = "-D"
-			_ = exec.Command("iptables", rule...).Run()
-		}
-	}
-	for i, rule := range rules {
-		if out, err := exec.Command("iptables", rule...).CombinedOutput(); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("tcprepair: iptables rule %d failed: %v (%s)", i, err, out)
-		}
-	}
-	return cleanup, nil
-}
