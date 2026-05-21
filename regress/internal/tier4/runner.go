@@ -118,6 +118,23 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 			PortHops:   8,
 		})
 	})
+	if runtime.GOOS == "linux" {
+		run("M11-wireguard-relay-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+			return smoke.RunWireGuardRelay(c, smoke.WireGuardRelayOpts{
+				Messages:    512,
+				MessageSize: 512,
+				Paths:       2,
+				Migrations:  3,
+			})
+		})
+	} else if caseMatches(opts.Case, "M11-wireguard-relay-T4") {
+		matched = true
+		suite.Add(report.Case{
+			Name:       "M11-wireguard-relay-T4",
+			Tier:       "T4",
+			SkipReason: "Linux only (wireguard-go UDP endpoint smoke is validated on Linux regress hosts)",
+		})
+	}
 
 	if runtime.GOOS == "linux" {
 		// G3-T4 deliberately runs without any chaos profile (Profile{})
