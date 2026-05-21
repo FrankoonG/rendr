@@ -239,6 +239,16 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			if pin <= 0 {
 				pin = defaultBondPinSize
 			}
+			if e.Packetized() {
+				// Packet-mode bond on QUIC DATAGRAM is the G3 hot
+				// path: per-path 8-frame pinning creates avoidable
+				// microbursts that can overflow datagram queues and
+				// manifest as one missing SEQ that stalls the strict
+				// reorder window behind it. Stream-mode keeps the
+				// default pinning; packet-mode smooths to frame-by-
+				// frame round-robin.
+				pin = 1
+			}
 			chosen := -1
 			for i := 0; i < len(ids); i++ {
 				e.bondCursor++

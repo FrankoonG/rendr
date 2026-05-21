@@ -21,13 +21,17 @@ var debugPathDeath = os.Getenv("RENDR_DEBUG_PATH_DEATH") != ""
 // onPathDeath is the OnDeath callback installed on every attached
 // PathConn. It runs on the transport adapter's goroutine, so it
 // keeps work brief and never blocks on locks held by the send path.
-func (e *Engine) onPathDeath(id uint32, cause transport.DeathCause, err error) {
+func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, err error) {
 	if debugPathDeath {
 		fmt.Fprintf(os.Stderr, "[rendr-engine] path %d died: cause=%v err=%v\n", id, cause, err)
 	}
 	e.pathsMu.Lock()
 	slot, ok := e.paths[id]
 	if !ok {
+		e.pathsMu.Unlock()
+		return
+	}
+	if slot.gen != gen || slot.maintenance.Load() {
 		e.pathsMu.Unlock()
 		return
 	}

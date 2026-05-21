@@ -22,6 +22,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier2"
 	"github.com/FrankoonG/rendr/regress/internal/tier3"
 	"github.com/FrankoonG/rendr/regress/internal/tier4"
+	"github.com/FrankoonG/rendr/regress/internal/tier5"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -37,14 +38,14 @@ const (
 )
 
 type runFlags struct {
-	phase          string
-	tier           string
-	forcePhase2    bool
-	allowNonLinux  bool
-	profile        string
-	caseID         string
-	reportDir      string
-	rendrRoot      string
+	phase         string
+	tier          string
+	forcePhase2   bool
+	allowNonLinux bool
+	profile       string
+	caseID        string
+	reportDir     string
+	rendrRoot     string
 }
 
 func parseFlags() runFlags {
@@ -150,9 +151,15 @@ func main() {
 			}
 			fmt.Println("phase 2 / T4: GREEN")
 		}
-		// T5 stub (no-op until TCP-fallback adapter lands).
 		if cfg.tier == "5" {
-			fmt.Println("== phase 2 / T5: TCP fallback — implementation pending (M3-prod/M4) ==")
+			fmt.Println("== phase 2 / T5: TCP fallback / adapter verification ==")
+			tier5.Run(ctx, suite, cfg.rendrRoot)
+			writeReports(suite, cfg.reportDir)
+			if suite.AnyFailedAt("T5") {
+				fmt.Fprintln(os.Stderr, "phase 2 / T5: FAILED")
+				os.Exit(exitT5Fail)
+			}
+			fmt.Println("phase 2 / T5: GREEN")
 		}
 	}
 

@@ -27,6 +27,14 @@ import (
 // uses 30 MiB too); T4 long-run cases bump this to 100 MiB or more.
 const FixtureSize = 30 << 20
 
+const (
+	migrationWaitStep    = 20 * time.Millisecond
+	migrationWaitBudget  = 1 * time.Second
+	migrationSettleDelay = 50 * time.Millisecond
+	responseChunkSize    = 64 * 1024
+	responseChunkDelay   = 2 * time.Millisecond
+)
+
 // FileXferOpts configures one case.
 type FileXferOpts struct {
 	// Paths is the rendr-client side path config. At least one path
@@ -54,9 +62,9 @@ type FileXferOpts struct {
 // NamedFactory packages a factory + name for registration. Exactly
 // one of Stream or Packet is non-nil per entry.
 type NamedFactory struct {
-	Name    string
-	Stream  rendr.StreamPathFactory
-	Packet  rendr.PacketPathFactory
+	Name   string
+	Stream rendr.StreamPathFactory
+	Packet rendr.PacketPathFactory
 }
 
 // FileXferResult captures the per-case judgment.
@@ -73,18 +81,18 @@ type FileXferResult struct {
 // RunFileXfer executes one case end-to-end.
 //
 // Setup:
-//   1. rendr.ListenTCP on ListenAddr; the accepted Conn becomes the
-//      HTTP server side. http.Serve runs on a net.Listener adapter
-//      that hands back the single accepted Conn.
-//   2. Generate FixtureSize bytes of deterministic payload; SHA-256
-//      it both ends.
-//   3. rendr.Dialer with Paths + Factories. dial -> rendr.Conn.
-//   4. Wrap the client-side rendr.Conn as the sole transport for an
-//      http.Client; GET / on the server.
-//   5. While reading the response body, count bytes; at each
-//      MigrationFraction * FixtureSize, call AdminConn.Migrate to
-//      switch to a different path.
-//   6. Compare SHA-256 of received bytes against source.
+//  1. rendr.ListenTCP on ListenAddr; the accepted Conn becomes the
+//     HTTP server side. http.Serve runs on a net.Listener adapter
+//     that hands back the single accepted Conn.
+//  2. Generate FixtureSize bytes of deterministic payload; SHA-256
+//     it both ends.
+//  3. rendr.Dialer with Paths + Factories. dial -> rendr.Conn.
+//  4. Wrap the client-side rendr.Conn as the sole transport for an
+//     http.Client; GET / on the server.
+//  5. While reading the response body, count bytes; at each
+//     MigrationFraction * FixtureSize, call AdminConn.Migrate to
+//     switch to a different path.
+//  6. Compare SHA-256 of received bytes against source.
 func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 	if opts.ListenAddr == "" {
 		opts.ListenAddr = "127.0.0.1:0"
@@ -166,6 +174,19 @@ func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 	}
 	defer server.Close()
 
+	// Like G1-smoke, give extra paths a brief chance to attach before
+	// starting the transfer. On loopback a 30 MiB file can complete in
+	// well under a second; without this wait, some T3 cases finish
+	// before the second path exists, so MigrationCount stays zero and
+	// late-path EOFs look like false regressions.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= len(opts.Paths) && len(server.Paths()) >= len(opts.Paths) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
 	// HTTP server on the accepted rendr.Conn (single connection).
 	httpDone := make(chan error, 1)
 	go func() {
@@ -173,6 +194,20 @@ func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 		mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+			if flusher, ok := w.(http.Flusher); ok {
+				for off := 0; off < len(payload); off += responseChunkSize {
+					end := off + responseChunkSize
+					if end > len(payload) {
+						end = len(payload)
+					}
+					if _, err := w.Write(payload[off:end]); err != nil {
+						return
+					}
+					flusher.Flush()
+					time.Sleep(responseChunkDelay)
+				}
+				return
+			}
 			_, _ = w.Write(payload)
 		})
 		srv := &http.Server{Handler: mux}
@@ -194,7 +229,7 @@ func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 		ResponseHeaderTimeout: 15 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 	}
-	hc := &http.Client{Transport: transport, Timeout: 90 * time.Second}
+	hc := &http.Client{Transport: transport, Timeout: 180 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://rendr-server/", nil)
 	if err != nil {
 		r.Failure = fmt.Sprintf("new request: %v", err)
@@ -230,8 +265,13 @@ func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 			hash.Write(buf[:n])
 			atomic.AddInt64(&received, int64(n))
 			for nextMig < len(migTriggers) && received >= migTriggers[nextMig] {
-				triggerMigration(admin, client)
+				if err := triggerMigration(admin, client); err != nil {
+					r.Failure = fmt.Sprintf("migrate %d at %d/%d: %v",
+						nextMig, received, FixtureSize, err)
+					return r
+				}
 				nextMig++
+				time.Sleep(migrationSettleDelay)
 			}
 		}
 		if err == io.EOF {
@@ -274,13 +314,19 @@ func RunFileXfer(ctx context.Context, opts FileXferOpts) FileXferResult {
 	return r
 }
 
-func triggerMigration(admin rendr.AdminConn, client rendr.Conn) {
-	cur := admin.ActivePath()
-	for _, p := range client.Paths() {
-		if p.ID != cur {
-			_ = admin.Migrate(p.ID)
-			return
+func triggerMigration(admin rendr.AdminConn, client rendr.Conn) error {
+	deadline := time.Now().Add(migrationWaitBudget)
+	for {
+		cur := admin.ActivePath()
+		for _, p := range client.Paths() {
+			if p.ID != cur {
+				return admin.Migrate(p.ID)
+			}
 		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no alternate path available from active=%d", cur)
+		}
+		time.Sleep(migrationWaitStep)
 	}
 }
 

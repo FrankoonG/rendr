@@ -71,6 +71,12 @@ type AdminConn interface {
 	// path-set management; the engine itself never calls RemovePath.
 	RemovePath(pathID uint32) error
 
+	// MigratePathLocalAddr asks the named path transport to rebuild its
+	// underlying socket while preserving the logical path id. This is
+	// currently used by TCP_REPAIR-style transports; unsupported
+	// transports return an error.
+	MigratePathLocalAddr(pathID uint32, newLocal string) error
+
 	// State returns the bridge lifecycle stage as a short string:
 	// "init", "handshaking", "active", "migrating", "closing",
 	// "dead". Production monitoring uses this for a liveness

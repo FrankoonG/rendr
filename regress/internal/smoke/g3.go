@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -165,16 +166,27 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 	const latSampleEvery = 100
 	latNs := make([]int64, 0, expected/latSampleEvery+8)
 	recvDone := make(chan struct{})
+	sendDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, opts.PayloadLen+8)
-		readDeadline := time.Now().Add(opts.Duration + 5*time.Second)
-		_ = server.SetReadDeadline(readDeadline)
+		idleDeadline := time.Now().Add(opts.Duration + 5*time.Second)
+		_ = server.SetReadDeadline(idleDeadline)
 		var rxCount int64
 		for {
 			n, _, err := server.ReadFrom(buf)
 			if err != nil {
 				return
+			}
+			select {
+			case <-sendDone:
+				// After the sender stops, keep draining until we hit a
+				// short idle gap. Setting the deadline to "now" drops
+				// packets still queued in rendr/quic-go and overstates
+				// application loss at the tail.
+				idleDeadline = time.Now().Add(5 * time.Second)
+				_ = server.SetReadDeadline(idleDeadline)
+			default:
 			}
 			if n < 16 {
 				continue
@@ -220,10 +232,7 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 			}
 		default:
 		}
-		now := time.Now()
-		if now.Before(nextTick) {
-			time.Sleep(nextTick.Sub(now))
-		}
+		paceUntil(nextTick)
 		nextTick = nextTick.Add(pktInterval)
 		binary.BigEndian.PutUint64(pkt[:8], uint64(sent))
 		binary.BigEndian.PutUint64(pkt[8:16], uint64(time.Now().UnixNano()))
@@ -235,11 +244,8 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		}
 		atomic.AddInt64(&sent, 1)
 	}
-
-	// Give receiver a moment to drain in-flight datagrams, then
-	// force its ReadFrom to return via the deadline.
-	time.Sleep(500 * time.Millisecond)
-	_ = server.SetReadDeadline(time.Now())
+	close(sendDone)
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
 	<-recvDone
 
 	// recvBmp / latNs were written exclusively by the recv goroutine;
@@ -317,4 +323,27 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		return r
 	}
 	return r
+}
+
+// paceUntil smooths the sender cadence for sub-millisecond packet
+// rates. A raw time.Sleep(10µs) loop tends to wake in scheduler-sized
+// bursts, which injects artificial microbursts into G3 and causes a
+// handful of real DATAGRAM drops that then stall the strict reorder
+// window behind one missing SEQ. Sleep the coarse part, then yield/
+// spin for the final slice to keep pacing closer to the target PPS.
+func paceUntil(target time.Time) {
+	for {
+		now := time.Now()
+		if !now.Before(target) {
+			return
+		}
+		remaining := target.Sub(now)
+		switch {
+		case remaining > 250*time.Microsecond:
+			time.Sleep(remaining - 100*time.Microsecond)
+		case remaining > 50*time.Microsecond:
+			runtime.Gosched()
+		default:
+		}
+	}
 }

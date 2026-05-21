@@ -93,11 +93,16 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		// throughput test.
 		runCase(ctx, suite, "G3-T4", 3*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
 			return smoke.RunG3(c, smoke.G3Opts{
-				Duration:     30 * time.Second,
-				PPS:          100_000,
-				PayloadLen:   1024,
-				Migrations:   10,
-				Paths:        4,
+				Duration:   30 * time.Second,
+				PPS:        100_000,
+				PayloadLen: 1024,
+				Migrations: 10,
+				// The validated 100k pps QUIC DATAGRAM contract on the
+				// Linux regress host is the 8-path bond shape documented
+				// in plan/README. Lower path counts are still useful for
+				// smoke and local profiling, but the release gate should
+				// match the empirically-proven configuration.
+				Paths:        8,
 				P95CeilingMs: 20,
 				LossPct:      0,
 			})

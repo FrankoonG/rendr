@@ -64,14 +64,15 @@ type Engine struct {
 	// (each in its own goroutine) when activeID changes. Registered
 	// via OnMigrate; cancelled via the returned cancel function.
 	// Held under pathsMu - same as migrationCount.
-	migrateHooks   map[uint64]func(oldID, newID uint32, cause string)
-	migrateHookID  uint64
+	migrateHooks  map[uint64]func(oldID, newID uint32, cause string)
+	migrateHookID uint64
 
 	// Path management. activeID == 0 means "no active path".
-	pathsMu    sync.RWMutex
-	paths      map[uint32]*pathSlot
-	nextPathID uint32
-	activeID   uint32
+	pathsMu     sync.RWMutex
+	paths       map[uint32]*pathSlot
+	nextPathID  uint32
+	nextPathGen uint64
+	activeID    uint32
 
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
@@ -83,11 +84,17 @@ type Engine struct {
 	// next SEQ the application should observe.
 	recvMu          sync.Mutex
 	recvCond        *sync.Cond
+	recvPacketCh    chan []byte
+	recvPacketWake  chan struct{}
+	recvWake        chan struct{}
 	recvQueue       map[uint64]recvItem
 	expectedRecvSeq uint64
-	recvDeliver     []byte   // pending bytes for the next Read (stream)
-	recvPackets     [][]byte // pending packets for the next RecvPacket
-	packetized      bool     // when true, drainer routes payload to recvPackets
+	recvDeliver     []byte // pending bytes for the next Read (stream)
+	packetized      bool   // when true, drainer routes payload to recvPacketCh
+	recvPathCursor  uint64
+	recvSeenBits    []uint64
+	recvSeenHead    uint64
+	recvPacketMarks int
 
 	// recvDeadline is the application-set read deadline (zero = none).
 	// When non-zero, Recv / RecvPacket return a timeout error if no
@@ -138,9 +145,14 @@ type Engine struct {
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
 	id       uint32
+	gen      uint64
 	conn     transport.PathConn
 	spec     transport.PathSpec
 	attached time.Time
+	// maintenance marks a slot as being intentionally torn down and
+	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
+	// socket are ignored while this is true.
+	maintenance atomic.Bool
 
 	// recvDups counts inbound frames on THIS path whose SEQ had
 	// already been delivered or buffered. Used per-path so monitoring
@@ -148,6 +160,7 @@ type pathSlot struct {
 	// or accidental retransmits. Atomic - touched from the receive
 	// path under recvMu, but readers via Paths() may run concurrently.
 	recvDups atomic.Uint64
+	recvQ    chan recvFrame
 
 	// lastRecvUnixNano is the most recent wall-clock instant
 	// (UnixNano) at which a frame was received on this path. Zero
@@ -182,6 +195,9 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		limits:           limits.Clamp(),
 		created:          time.Now(),
 		paths:            make(map[uint32]*pathSlot),
+		recvPacketCh:     make(chan []byte, 16384),
+		recvPacketWake:   make(chan struct{}, 1),
+		recvWake:         make(chan struct{}, 1),
 		recvQueue:        make(map[uint64]recvItem),
 		zombieLeft:       limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding: make(map[uint64]time.Time),
@@ -189,6 +205,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))
+	go e.recvLoop()
 	return e
 }
 
@@ -245,16 +262,19 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 	}
 	slot := &pathSlot{
 		id:       id,
+		gen:      e.nextPathGenerationLocked(),
 		conn:     pc,
 		spec:     spec,
 		attached: time.Now(),
+		recvQ:    make(chan recvFrame, 64),
 		quit:     make(chan struct{}),
 		doneR:    make(chan struct{}),
 	}
 	e.paths[id] = slot
 
+	gen := slot.gen
 	pc.OnDeath(func(cause transport.DeathCause, err error) {
-		e.onPathDeath(id, cause, err)
+		e.onPathDeath(id, gen, cause, err)
 	})
 
 	if e.activeID == 0 {
@@ -267,6 +287,11 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 	go e.readerLoop(slot)
 	go e.proberLoop(slot)
 	return id, nil
+}
+
+func (e *Engine) nextPathGenerationLocked() uint64 {
+	e.nextPathGen++
+	return e.nextPathGen
 }
 
 // proberLoop sends a CtrlPathProbe on slot.conn every 1s and
@@ -464,18 +489,34 @@ func (e *Engine) SetReadDeadline(t time.Time) error {
 	}
 	e.recvDeadline = t
 	if t.IsZero() {
+		select {
+		case e.recvPacketWake <- struct{}{}:
+		default:
+		}
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		e.recvCond.Broadcast()
+		select {
+		case e.recvPacketWake <- struct{}{}:
+		default:
+		}
 		return nil
 	}
 	e.recvDeadlineTimer = time.AfterFunc(d, func() {
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()
 		e.recvMu.Unlock()
+		select {
+		case e.recvPacketWake <- struct{}{}:
+		default:
+		}
 	})
+	select {
+	case e.recvPacketWake <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -509,6 +550,9 @@ func (e *Engine) recvDeadlineExceededLocked() bool {
 func (e *Engine) SetPacketMode() {
 	e.recvMu.Lock()
 	e.packetized = true
+	if e.recvSeenBits == nil {
+		e.recvSeenBits = make([]uint64, packetRecvWindowBits/64)
+	}
 	e.recvMu.Unlock()
 }
 
@@ -669,7 +713,7 @@ func (e *Engine) RecvQueueHighWaterMark() int {
 func (e *Engine) RecvQueueLen() int {
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
-	return len(e.recvQueue)
+	return len(e.recvQueue) + e.recvPacketMarks
 }
 
 // RecvDups returns the cumulative count of incoming frames whose
@@ -722,7 +766,7 @@ func (e *Engine) RemovePath(id uint32) error {
 	// route death through the listener fanout and only emit it on
 	// hard transport errors, not on local close.
 	_ = slot.conn.Close()
-	e.onPathDeath(id, transport.CauseCleanClose, nil)
+	e.onPathDeath(id, slot.gen, transport.CauseCleanClose, nil)
 	return nil
 }
 
@@ -742,7 +786,7 @@ func (e *Engine) ForceKillPathForTest(id uint32) error {
 		return fmt.Errorf("engine: kill unknown path %d", id)
 	}
 	err := slot.conn.Close()
-	e.onPathDeath(id, transport.CauseTransportError, err)
+	e.onPathDeath(id, slot.gen, transport.CauseTransportError, err)
 	return err
 }
 

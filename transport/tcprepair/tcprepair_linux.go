@@ -14,17 +14,18 @@ import (
 // imported because golang.org/x/sys/unix doesn't (as of writing)
 // surface TCP_REPAIR_WINDOW with a stable name across versions.
 const (
-	tcpRepair        = 19
-	tcpRepairQueue   = 20
-	tcpQueueSeq      = 21
-	tcpRepairOpts    = 22
-	tcpTimestamp     = 24
-	tcpRepairWindow  = 29
-	tcpInfoOpt       = 11
-	tcpNoQueue       = 0
-	tcpRecvQueue     = 1
-	tcpSendQueue     = 2
-	tcpDumpQueueCap  = 65536 // max bytes per queue dump in Snapshot
+	tcpRepair       = 19
+	tcpRepairQueue  = 20
+	tcpQueueSeq     = 21
+	tcpRepairOpts   = 22
+	tcpTimestamp    = 24
+	tcpRepairWindow = 29
+	tcpInfoOpt      = 11
+	tcpNoQueue      = 0
+	tcpRecvQueue    = 1
+	tcpSendQueue    = 2
+	tcpDumpQueueCap = 65536 // initial bytes per queue dump in Snapshot
+	tcpDumpQueueMax = 64 << 20
 )
 
 // State is the immutable snapshot of one server-side TCP connection's
@@ -95,13 +96,9 @@ func Snapshot(c *net.TCPConn) (*State, error) {
 			return fmt.Errorf("get send_seq: %w", err)
 		}
 		s.SendSeq = uint32(ss)
-		sbuf := make([]byte, tcpDumpQueueCap)
-		n, _, err := syscall.Recvfrom(fd, sbuf, syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
-		if err != nil && !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+		s.SendQueue, err = dumpQueue(fd)
+		if err != nil {
 			return fmt.Errorf("dump send queue: %w", err)
-		}
-		if n > 0 {
-			s.SendQueue = append(s.SendQueue, sbuf[:n]...)
 		}
 
 		if err := setInt(fd, tcpRepairQueue, tcpRecvQueue); err != nil {
@@ -112,13 +109,9 @@ func Snapshot(c *net.TCPConn) (*State, error) {
 			return fmt.Errorf("get recv_seq: %w", err)
 		}
 		s.RecvSeq = uint32(rs)
-		rbuf := make([]byte, tcpDumpQueueCap)
-		n, _, err = syscall.Recvfrom(fd, rbuf, syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
-		if err != nil && !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+		s.RecvQueue, err = dumpQueue(fd)
+		if err != nil {
 			return fmt.Errorf("dump recv queue: %w", err)
-		}
-		if n > 0 {
-			s.RecvQueue = append(s.RecvQueue, rbuf[:n]...)
 		}
 
 		if err := setInt(fd, tcpRepairQueue, tcpNoQueue); err != nil {
@@ -312,4 +305,28 @@ func setRaw(fd, opt int, buf []byte) error {
 		return errno
 	}
 	return nil
+}
+
+func dumpQueue(fd int) ([]byte, error) {
+	capacity := tcpDumpQueueCap
+	for {
+		buf := make([]byte, capacity)
+		n, _, err := syscall.Recvfrom(fd, buf, syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if n < len(buf) {
+			return append([]byte(nil), buf[:n]...), nil
+		}
+		if capacity >= tcpDumpQueueMax {
+			return nil, fmt.Errorf("queue dump exceeded %d bytes", tcpDumpQueueMax)
+		}
+		capacity *= 2
+		if capacity > tcpDumpQueueMax {
+			capacity = tcpDumpQueueMax
+		}
+	}
 }
