@@ -213,6 +213,8 @@ func listenForTransport(name string) (rendr.Listener, error) {
 	switch name {
 	case "tcp":
 		return rendr.ListenTCP("127.0.0.1:0")
+	case "gvisor":
+		return rendr.ListenGVisor("")
 	case "quic":
 		return rendr.ListenQUIC("127.0.0.1:0", nil)
 	default:

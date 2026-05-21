@@ -1,10 +1,9 @@
 // Package tier5 implements the TCP fallback / adapter verification
-// tier. With tcprepair available but gvisor still absent, the current
-// matrix is:
+// tier. The current matrix is:
 //   - T5.1 privileged tcprepair same-tuple rebuild G1 gate
-//   - T5.2 skipped (gvisor unavailable)
+//   - T5.2 privileged gvisor netstack G1 gate
 //   - T5.3 unprivileged tcprepair capability probe must fail clearly
-//   - T5.4 skipped (gvisor unavailable)
+//   - T5.4 unprivileged gvisor netstack G1 gate
 package tier5
 
 import (
@@ -18,6 +17,7 @@ import (
 
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
+	"github.com/FrankoonG/rendr/transport/gvisor"
 	"github.com/FrankoonG/rendr/transport/tcprepair"
 )
 
@@ -72,20 +72,25 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
 	})
 
-	add(report.Case{
-		Name:       "T5.2-gvisor-privileged",
-		Tier:       "T5",
-		SkipReason: "gvisor adapter unavailable",
+	run("T5.2-gvisor-privileged", 2*time.Minute, func(c context.Context) report.Case {
+		if err := gvisor.Available(); err != nil {
+			return report.Case{Name: "T5.2-gvisor-privileged", Tier: "T5", Failure: err.Error()}
+		}
+		r := smoke.RunG1(c, smoke.G1Opts{
+			Size:       30 << 20,
+			Migrations: 3,
+			Paths:      2,
+			Transport:  "gvisor",
+		})
+		return report.Case{Name: "T5.2-gvisor-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
 	})
 
 	run("T5.3-tcprepair-unprivileged", 2*time.Minute, func(context.Context) report.Case {
 		return probeUnprivileged(rendrRoot)
 	})
 
-	add(report.Case{
-		Name:       "T5.4-gvisor-unprivileged",
-		Tier:       "T5",
-		SkipReason: "gvisor adapter unavailable",
+	run("T5.4-gvisor-unprivileged", 2*time.Minute, func(context.Context) report.Case {
+		return probeGVisorUnprivileged(rendrRoot)
 	})
 }
 
@@ -144,6 +149,33 @@ func probeUnprivileged(rendrRoot string) report.Case {
 		"RENDR_EXPECT_TCPREPAIR=unavailable",
 		"GOCACHE=/tmp/go-build-nocap",
 		"GOMODCACHE=/tmp/go-mod-nocap",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
+	}
+	return report.Case{Name: name, Tier: "T5"}
+}
+
+func probeGVisorUnprivileged(rendrRoot string) report.Case {
+	const name = "T5.4-gvisor-unprivileged"
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
+	}
+	if _, err := os.Stat(rendrRoot); err != nil {
+		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
+	}
+	cmd := exec.Command(
+		"setpriv",
+		"--bounding-set=-net_admin",
+		"--inh-caps=-net_admin",
+		"--ambient-caps=-net_admin",
+		"bash", "-lc",
+		fmt.Sprintf("cd %s/regress && /usr/local/go/bin/go test ./internal/smoke -run TestRunG1GVisor -count=1", rendrRoot),
+	)
+	cmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/go-build-gvisor-nocap",
+		"GOMODCACHE=/tmp/go-mod-gvisor-nocap",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
