@@ -58,6 +58,8 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	hasPaths := len(e.paths) > 0
 	e.pathsMu.Unlock()
 
+	e.drainDeadSlot(slot)
+
 	if migratedOk {
 		e.fireMigrateHooks(id, newActive, "death")
 	}
@@ -83,6 +85,28 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 		}
 		if !hasPaths {
 			go e.startMigrationBudget(err)
+		}
+	}
+}
+
+func (e *Engine) drainDeadSlot(slot *pathSlot) {
+	if slot == nil {
+		return
+	}
+	batch := make([]recvFrame, 0, recvBatchSize)
+	for {
+		select {
+		case frame := <-slot.recvQ:
+			batch = append(batch, frame)
+			if len(batch) == cap(batch) {
+				e.onRecvBatch(batch)
+				batch = batch[:0]
+			}
+		default:
+			if len(batch) > 0 {
+				e.onRecvBatch(batch)
+			}
+			return
 		}
 	}
 }
