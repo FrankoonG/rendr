@@ -163,6 +163,7 @@ func (p *PathConn) MigratePathLocalAddr(newLocal string) (transport.PathConn, er
 func (p *PathConn) Read(buf []byte) (int, error)                           { return p.base.Read(buf) }
 func (p *PathConn) Write(frame []byte) (int, error)                        { return p.base.Write(frame) }
 func (p *PathConn) Close() error                                           { return p.base.Close() }
+func (p *PathConn) CloseWrite() error                                      { return p.base.CloseWrite() }
 func (p *PathConn) Quality() transport.PathQuality                         { return p.base.Quality() }
 func (p *PathConn) OnDeath(fn func(cause transport.DeathCause, err error)) { p.base.OnDeath(fn) }
 func (p *PathConn) LocalAddr() string                                      { return p.base.LocalAddr() }

@@ -220,6 +220,16 @@ func (p *PathConn) Close() error {
 	return nil
 }
 
+// CloseWrite half-closes the underlying TCP write side when available.
+// It intentionally does not mark the path dead: the read side may still
+// need to consume peer control frames during graceful rendr shutdown.
+func (p *PathConn) CloseWrite() error {
+	if cw, ok := p.c.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 // Quality returns the most recent measurement.
 func (p *PathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()

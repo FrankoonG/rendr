@@ -39,6 +39,8 @@ func (c *engineBackedConn) Write(p []byte) (int, error) { return c.conn.Write(p)
 func (c *engineBackedConn) Close() error {
 	if !c.closing.Swap(true) && !c.e.IsClosed() {
 		_ = c.e.SendBye(proto.ByeNormal)
+		c.e.QuiesceActivePath()
+		time.Sleep(10 * time.Millisecond)
 	}
 	return c.conn.Close()
 }

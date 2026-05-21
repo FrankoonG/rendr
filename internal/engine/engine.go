@@ -711,6 +711,25 @@ func (e *Engine) CloseErr() error {
 // shut down. Useful for downstream cleanup goroutines.
 func (e *Engine) Closed() <-chan struct{} { return e.closed }
 
+// QuiesceActivePath half-closes the active transport, when supported,
+// after the local side has sent BYE. This gives TCP peers a chance to
+// read the BYE as an orderly FIN path instead of racing a full socket
+// close that can turn into RST when local control frames are unread.
+func (e *Engine) QuiesceActivePath() {
+	e.pathsMu.RLock()
+	slot := e.paths[e.activeID]
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		return
+	}
+	if q, ok := slot.conn.(interface{ MarkQuiesced() }); ok {
+		q.MarkQuiesced()
+	}
+	if cw, ok := slot.conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 // RecvQueueHighWaterMark returns the maximum reorder-buffer size
 // the engine has ever observed for this Conn. Useful for race-mode
 // chaos to verify the dedup window does not grow without bound
