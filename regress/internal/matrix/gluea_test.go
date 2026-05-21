@@ -107,6 +107,43 @@ func TestT3GlueAVMessOverRendrTransport(t *testing.T) {
 }
 
 func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
+	userID := protocol.NewID(uuid.New()).String()
+	runGlueAMigratingEcho(t, "vmess", func(port int, transportName string) (*core.Instance, *core.Instance) {
+		return startVMessServerOverRendrTransport(t, port, userID, transportName),
+			startVMessClientOverRendrTransport(t, port, userID, transportName)
+	})
+}
+
+func TestT3GlueAVLESSTLSOverRendrTransportMigrates(t *testing.T) {
+	userID := protocol.NewID(uuid.New()).String()
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	runGlueAMigratingEcho(t, "vless-tls", func(port int, transportName string) (*core.Instance, *core.Instance) {
+		return startVLESSTLSServerOverRendrTransport(t, port, userID, transportName, ct),
+			startVLESSTLSClientOverRendrTransport(t, port, userID, transportName, ctHash)
+	})
+}
+
+func TestT3GlueATrojanTLSOverRendrTransportMigrates(t *testing.T) {
+	password := randomTrojanPassword(t)
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	runGlueAMigratingEcho(t, "trojan-tls", func(port int, transportName string) (*core.Instance, *core.Instance) {
+		return startTrojanTLSServerOverRendrTransport(t, port, password, transportName, ct),
+			startTrojanTLSClientOverRendrTransport(t, port, password, transportName, ctHash)
+	})
+}
+
+func TestT3GlueASS2022OverRendrTransportMigrates(t *testing.T) {
+	const method = "2022-blake3-aes-128-gcm"
+	keyB64 := randomSSKey(t)
+	runGlueAMigratingEcho(t, "ss2022", func(port int, transportName string) (*core.Instance, *core.Instance) {
+		return startSS2022ServerOverRendrTransport(t, port, method, keyB64, transportName),
+			startSS2022ClientOverRendrTransport(t, port, method, keyB64, transportName)
+	})
+}
+
+func runGlueAMigratingEcho(t *testing.T, label string, start func(port int, transportName string) (*core.Instance, *core.Instance)) {
+	t.Helper()
+
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +152,7 @@ func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
 	go serveOneExplicitTCPEcho(echo)
 
 	rendrPort := pickFreePort(t)
-	transportName := "rendr-gluea-vmess-migrate-" + strconv.Itoa(rendrPort)
+	transportName := "rendr-gluea-" + label + "-migrate-" + strconv.Itoa(rendrPort)
 	rendrAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(rendrPort))
 	if err := rendrxray.RegisterRendrTransportListener(transportName, nil); err != nil {
 		t.Fatal(err)
@@ -140,10 +177,8 @@ func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	userID := protocol.NewID(uuid.New()).String()
-	server := startVMessServerOverRendrTransport(t, rendrPort, userID, transportName)
+	server, client := start(rendrPort, transportName)
 	defer server.Close()
-	client := startVMessClientOverRendrTransport(t, rendrPort, userID, transportName)
 	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -174,16 +209,17 @@ func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
 	wantHash := sha256.Sum256(payload)
 	gotHash := sha256.New()
 
-	migrateAt := map[int]struct{}{
-		total * 1 / 4: {},
-		total * 1 / 2: {},
-		total * 3 / 4: {},
-	}
-	const chunk = 64 << 10
+	migrateAt := []int{total * 1 / 4, total * 1 / 2, total * 3 / 4}
+	const chunk = 8 << 10
 	startMigrations := admin.MigrationCount()
 	buf := make([]byte, chunk)
-	for off := 0; off < total; off += chunk {
-		end := off + chunk
+	nextMig := 0
+	for off := 0; off < total; {
+		step := chunk
+		if off == 0 {
+			step = 512
+		}
+		end := off + step
 		if end > total {
 			end = total
 		}
@@ -197,8 +233,10 @@ func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
 		if !bytes.Equal(buf[:end-off], payload[off:end]) {
 			t.Fatalf("echo payload mismatch at %d", off)
 		}
-		if _, ok := migrateAt[end]; ok {
+		off = end
+		if nextMig < len(migrateAt) && off >= migrateAt[nextMig] {
 			migrateGlueA(t, admin)
+			nextMig++
 		}
 	}
 	if got := admin.MigrationCount() - startMigrations; got < 3 {
@@ -207,8 +245,8 @@ func TestT3GlueAVMessOverRendrTransportMigrates(t *testing.T) {
 	if !bytes.Equal(gotHash.Sum(nil), wantHash[:]) {
 		t.Fatalf("sha256 mismatch: got %x want %x", gotHash.Sum(nil), wantHash[:])
 	}
-	t.Logf("PASS: T3.glueA.vmess-rendr-transport-migrate bytes=%d migrations=%d",
-		total, admin.MigrationCount()-startMigrations)
+	t.Logf("PASS: T3.glueA.%s-rendr-transport-migrate bytes=%d migrations=%d",
+		label, total, admin.MigrationCount()-startMigrations)
 }
 
 func TestT3GlueAVLESSTLSOverRendrTransport(t *testing.T) {
