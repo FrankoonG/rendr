@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy/freedom"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
 	vlessinbound "github.com/xtls/xray-core/proxy/vless/inbound"
@@ -28,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 
+	_ "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	_ "github.com/xtls/xray-core/proxy/trojan"
 	_ "github.com/xtls/xray-core/proxy/vless/inbound"
 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
@@ -218,6 +220,72 @@ func TestT3GlueATrojanTLSOverRendrTransport(t *testing.T) {
 	defer c.Close()
 
 	want := []byte("trojan tls over xray streamSettings.network=rendr")
+	if _, err := c.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("payload got %q want %q", got, want)
+	}
+}
+
+func TestT3GlueASS2022OverRendrTransport(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		c, err := echo.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+
+	rendrPort := pickFreePort(t)
+	transportName := "rendr-gluea-ss2022-" + strconv.Itoa(rendrPort)
+	rendrAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(rendrPort))
+	if err := rendrxray.RegisterRendrTransportListener(transportName, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := rendrxray.RegisterRendrTransportDialer(transportName, &rendrxray.Config{
+		Mode: rendrxray.ModePrime,
+		Paths: []rendrxray.PathSpec{
+			{Transport: "tcp", Address: rendrAddr},
+			{Transport: "tcp", Address: rendrAddr},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const method = "2022-blake3-aes-128-gcm"
+	keyB64 := randomSSKey(t)
+	server := startSS2022ServerOverRendrTransport(t, rendrPort, method, keyB64, transportName)
+	defer server.Close()
+	client := startSS2022ClientOverRendrTransport(t, rendrPort, method, keyB64, transportName)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dest, err := xnet.ParseDestination("tcp:" + echo.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := core.Dial(ctx, client, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	want := []byte("ss2022 over xray streamSettings.network=rendr")
 	if _, err := c.Write(want); err != nil {
 		t.Fatal(err)
 	}
@@ -459,6 +527,68 @@ func startTrojanTLSClientOverRendrTransport(t *testing.T, port int, password, tr
 								PinnedPeerCertSha256: [][]byte{srvCertHash[:]},
 							}),
 						},
+					},
+				}),
+			},
+		},
+	}
+	return mustStartInstance(t, cfg)
+}
+
+func startSS2022ServerOverRendrTransport(t *testing.T, port int, method, keyB64, transportName string) *core.Instance {
+	t.Helper()
+	cfg := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(port))}},
+					Listen:   xnet.NewIPOrDomain(xnet.LocalHostIP),
+					StreamSettings: &internet.StreamConfig{
+						ProtocolName: transportName,
+					},
+				}),
+				ProxySettings: serial.ToTypedMessage(&ss2022.ServerConfig{
+					Method:  method,
+					Key:     keyB64,
+					Network: []xnet.Network{xnet.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
+			},
+		},
+	}
+	return mustStartInstance(t, cfg)
+}
+
+func startSS2022ClientOverRendrTransport(t *testing.T, port int, method, keyB64, transportName string) *core.Instance {
+	t.Helper()
+	cfg := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&ss2022.ClientConfig{
+					Address: xnet.NewIPOrDomain(xnet.LocalHostIP),
+					Port:    uint32(port),
+					Method:  method,
+					Key:     keyB64,
+				}),
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+					StreamSettings: &internet.StreamConfig{
+						ProtocolName: transportName,
 					},
 				}),
 			},
