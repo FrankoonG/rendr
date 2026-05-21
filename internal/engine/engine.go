@@ -77,8 +77,9 @@ type Engine struct {
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
 	// active at the time.
-	sendMu  sync.Mutex
-	sendSeq uint64
+	sendMu      sync.Mutex
+	sendSeq     uint64
+	sendAckNext atomic.Uint64
 
 	// Recv state: reorder buffer keyed by SEQ. expectedRecvSeq is the
 	// next SEQ the application should observe.
@@ -89,6 +90,7 @@ type Engine struct {
 	recvWake        chan struct{}
 	recvQueue       map[uint64]recvItem
 	expectedRecvSeq uint64
+	recvAckSent     uint64
 	recvDeliver     []byte // pending bytes for the next Read (stream)
 	packetized      bool   // when true, drainer routes payload to recvPacketCh
 	recvPathCursor  uint64

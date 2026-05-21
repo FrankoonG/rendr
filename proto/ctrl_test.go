@@ -141,6 +141,32 @@ func TestProbeWireStability(t *testing.T) {
 	}
 }
 
+func TestAckPayloadRoundTrip(t *testing.T) {
+	want := AckPayload{NextSeq: 0x0102030405060708}
+	got, ok := DecodeAck(want.Encode())
+	if !ok {
+		t.Fatal("DecodeAck rejected encoded ack")
+	}
+	if got != want {
+		t.Fatalf("ack: got %+v want %+v", got, want)
+	}
+	if _, ok := DecodeAck(ProbePayload{TS: 1, ID: 2}.Encode()); ok {
+		t.Fatal("DecodeAck accepted ordinary probe payload")
+	}
+}
+
+func TestAckPayloadWireStability(t *testing.T) {
+	p := AckPayload{NextSeq: 0x0102030405060708}
+	want := []byte{
+		0x52, 0x45, 0x4e, 0x44, 0x52, 0x5f, 0x41, 0x43,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	}
+	if !bytes.Equal(p.Encode(), want) {
+		t.Fatalf("ack wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	}
+}
+
 func TestBridgeTagWireStability(t *testing.T) {
 	p := BridgeTagPayload{BridgeID: [16]byte{
 		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,

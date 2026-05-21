@@ -193,10 +193,9 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // considered stuck.
 //
 // PathSpec.Weight controls each path's share of pin windows. A zero
-// weight means 1. Still TODO at M8: ACK-tight resend trimming.
-// Redistribute-on-death is intentionally conservative: it replays a
-// bounded recent window and relies on receiver SEQ dedup to discard
-// frames that arrived before death.
+// weight means 1. Redistribute-on-death replays only frames newer
+// than the peer's latest cumulative ACK, with the bounded recent
+// window as the conservative fallback when no ACK has arrived yet.
 func (e *Engine) dispatchBond(frame []byte) error {
 	for {
 		if e.isClosed() {

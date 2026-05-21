@@ -257,6 +257,10 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 // probe and, if found, updates the path's quality with the measured
 // RTT.
 func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
+	if ack, ok := proto.DecodeAck(payload); ok {
+		e.notePeerAck(ack.NextSeq)
+		return
+	}
 	p, err := proto.DecodeProbe(payload)
 	if err != nil {
 		return
@@ -292,6 +296,44 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 			At:     nowFn(),
 		})
 	}
+}
+
+func (e *Engine) notePeerAck(nextSeq uint64) {
+	for {
+		cur := e.sendAckNext.Load()
+		if nextSeq <= cur {
+			return
+		}
+		if e.sendAckNext.CompareAndSwap(cur, nextSeq) {
+			return
+		}
+	}
+}
+
+func (e *Engine) sendAck(nextSeq uint64) {
+	if nextSeq == 0 || e.isClosed() {
+		return
+	}
+	payload := proto.AckPayload{NextSeq: nextSeq}.Encode()
+	hdr := proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlPathProbeReply),
+		Seq:     0,
+	}
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		return
+	}
+	copy(frame[proto.HeaderSize:], payload)
+
+	e.pathsMu.RLock()
+	slot := e.paths[e.activeID]
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		return
+	}
+	_, _ = slot.conn.Write(frame)
 }
 
 // enqueueRecvFrame hands one fully-decoded frame to the per-path recv
@@ -402,10 +444,18 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 			wokeReader = true
 		}
 	}
+	ackNext := uint64(0)
+	if e.expectedRecvSeq > e.recvAckSent {
+		e.recvAckSent = e.expectedRecvSeq
+		ackNext = e.expectedRecvSeq
+	}
 	if wokeReader || e.isClosed() {
 		e.recvCond.Broadcast()
 	}
 	e.recvMu.Unlock()
+	if ackNext != 0 {
+		e.sendAck(ackNext)
+	}
 	for _, pkt := range deliverPackets {
 		select {
 		case e.recvPacketCh <- pkt:

@@ -30,6 +30,7 @@ type ProbePayload struct {
 }
 
 const ProbePayloadSize = 16
+const ackProbeReplyMagic uint64 = 0x52454e44525f4143 // "RENDR_AC" prefix
 
 func (p ProbePayload) Encode() []byte {
 	b := make([]byte, ProbePayloadSize)
@@ -46,6 +47,41 @@ func DecodeProbe(b []byte) (ProbePayload, error) {
 	p.TS = binary.BigEndian.Uint64(b[0:8])
 	p.ID = binary.BigEndian.Uint64(b[8:16])
 	return p, nil
+}
+
+// AckPayload carries the receiver's cumulative SEQ floor. NextSeq is
+// the first frame SEQ not yet contiguously received, so all frames
+// with SEQ < NextSeq are safe to trim from resend windows.
+//
+// ACKs are encoded as a PATH_PROBE_REPLY extension rather than as a
+// new control code. Older peers decode the first 16 bytes as an
+// unmatched probe reply with ID=0 and ignore it; newer peers recognize
+// the magic and consume it out of band.
+type AckPayload struct {
+	NextSeq uint64
+}
+
+const AckPayloadSize = ProbePayloadSize + 8
+
+func (p AckPayload) Encode() []byte {
+	b := make([]byte, AckPayloadSize)
+	binary.BigEndian.PutUint64(b[0:8], ackProbeReplyMagic)
+	binary.BigEndian.PutUint64(b[8:16], 0)
+	binary.BigEndian.PutUint64(b[16:24], p.NextSeq)
+	return b
+}
+
+func DecodeAck(b []byte) (AckPayload, bool) {
+	if len(b) < AckPayloadSize {
+		return AckPayload{}, false
+	}
+	if binary.BigEndian.Uint64(b[0:8]) != ackProbeReplyMagic {
+		return AckPayload{}, false
+	}
+	if binary.BigEndian.Uint64(b[8:16]) != 0 {
+		return AckPayload{}, false
+	}
+	return AckPayload{NextSeq: binary.BigEndian.Uint64(b[16:24])}, true
 }
 
 func (c CtrlCode) String() string {
