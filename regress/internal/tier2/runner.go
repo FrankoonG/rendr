@@ -61,6 +61,9 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	addRun(suite, "G5", "T2", func() smoke.Result {
 		return smoke.RunG5(ctx, smoke.G5Opts{})
 	})
+	addRun(suite, "M11-udp-relay-smoke", "T2", func() smoke.Result {
+		return smoke.RunUDPRelay(ctx, smoke.UDPRelayOpts{})
+	})
 }
 
 func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
