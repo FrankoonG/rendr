@@ -603,6 +603,58 @@ func TestM1DialAcceptRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
+	ln, err := ListenGVisorPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	client, err := (&Dialer{
+		Mode:  ModePrime,
+		Paths: []PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}},
+	}).Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		t.Fatalf("accept: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("accept timeout")
+	}
+	defer server.Close()
+
+	payload := []byte("hello over rendr gvisor packet carrier")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch: got %q want %q", got, payload)
+	}
+}
+
 // TestM1LargePayload exercises the framing layer with a payload that
 // exceeds MaxPayload, so multiple frames flow per logical write.
 // This is the smallest building block for G1.

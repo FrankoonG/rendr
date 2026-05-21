@@ -20,7 +20,9 @@
 //	}
 //
 // Use Listen with multiple ListenSpecs when one server should accept
-// several stream path transports into the same bridge table.
+// several stream path transports into the same bridge table. Use
+// ListenGVisorPacket when an unprivileged user-space TCP path should
+// span processes or hosts over an outer UDP packet carrier.
 //
 // Client:
 //

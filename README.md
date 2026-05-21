@@ -44,12 +44,14 @@ c, err := d.Dial(context.Background())
 // c.FlowID() stays constant for the connection's lifetime.
 ```
 
-Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`.
+Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`,
+`ListenGVisorPacket`.
 For stream servers that accept multiple path transports into one
 bridge table, use `Listen(ListenSpec{Transport: "tcp", ...},
 ListenSpec{Transport: "quic", ...})`.
 
-Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`.
+Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`,
+`"gvisor"`.
 
 ## Embedder example
 
@@ -79,6 +81,14 @@ For applications that already own a UDP socket, package
 `github.com/FrankoonG/rendr/udprelay` exposes a local UDP relay over a
 rendr `PacketConn`. Point the application at `Relay.LocalAddr()` and
 use `Relay.PacketConn()` for migration control.
+
+## gVisor TCP Fallback
+
+`ListenGVisorPacket("host:port")` runs a user-space gVisor TCP stack
+over an outer UDP packet carrier. Clients dial it with
+`PathSpec{Transport: "gvisor", Address: ln.Addr().String()}`. This is
+the no-CAP_NET_ADMIN fallback path for environments where Linux
+`TCP_REPAIR` is unavailable.
 
 ## Modes
 

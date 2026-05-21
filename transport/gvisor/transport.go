@@ -1,11 +1,13 @@
 // Package gvisor provides a user-space TCP transport backed by gVisor
 // netstack. It is the M4 no-CAP_NET_ADMIN companion to tcprepair:
-// no kernel TCP_REPAIR sockopts are needed, and steady-state bytes are
-// carried by gVisor TCP endpoints over an in-process virtual link.
+// no kernel TCP_REPAIR sockopts are needed. It supports both an
+// in-process virtual link for cheap tests and an outer UDP
+// packet-carrier link for real process/host boundaries.
 package gvisor
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -15,9 +17,11 @@ import (
 
 	"github.com/FrankoonG/rendr/transport"
 	basetcp "github.com/FrankoonG/rendr/transport/tcp"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -67,7 +71,7 @@ func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transp
 	l := registry[spec.Address]
 	regMu.RUnlock()
 	if l == nil {
-		return nil, fmt.Errorf("gvisor: listener %q not found", spec.Address)
+		return dialPacketCarrier(ctx, spec.Address)
 	}
 	return l.dial(ctx)
 }
@@ -86,15 +90,22 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 
 // Listener accepts gVisor TCP paths for one virtual network.
 type Listener struct {
-	addr string
+	addr    string
+	netAddr net.Addr
 
 	client *stack.Stack
 	server *stack.Stack
 	ln     *gonet.TCPListener
+	ep     *channel.Endpoint
+	wire   net.PacketConn
 
 	closeOnce sync.Once
 	closed    chan struct{}
 	acceptCh  chan acceptResult
+
+	remoteMu sync.RWMutex
+	remote   net.Addr
+	remotes  map[uint16]net.Addr
 }
 
 type acceptResult struct {
@@ -149,6 +160,54 @@ func Listen(addr string) (*Listener, error) {
 	regMu.Lock()
 	registry[addr] = l
 	regMu.Unlock()
+	go l.acceptLoop()
+	return l, nil
+}
+
+// ListenPacket creates a gVisor TCP listener whose virtual link is
+// carried by outer UDP datagrams. Unlike Listen, addr is a real OS UDP
+// listen address, so the transport can span processes or hosts while
+// remaining unprivileged.
+func ListenPacket(addr string) (*Listener, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("gvisor: resolve udp %q: %w", addr, err)
+	}
+	pc, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("gvisor: listen udp %s: %w", addr, err)
+	}
+	ep := channel.New(1024, mtu, "")
+	serverStack, err := newStack(serverIP, ep)
+	if err != nil {
+		_ = pc.Close()
+		ep.Close()
+		return nil, err
+	}
+	ln, err := gonet.ListenTCP(serverStack, tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: serverIP,
+		Port: listenPort,
+	}, header.IPv4ProtocolNumber)
+	if err != nil {
+		_ = pc.Close()
+		ep.Close()
+		serverStack.Close()
+		return nil, fmt.Errorf("gvisor: listen tcp: %w", err)
+	}
+	l := &Listener{
+		addr:     pc.LocalAddr().String(),
+		netAddr:  pc.LocalAddr(),
+		server:   serverStack,
+		ln:       ln,
+		ep:       ep,
+		wire:     pc,
+		closed:   make(chan struct{}),
+		acceptCh: make(chan acceptResult, 1),
+		remotes:  make(map[uint16]net.Addr),
+	}
+	go l.pumpInbound()
+	go l.pumpOutbound()
 	go l.acceptLoop()
 	return l, nil
 }
@@ -223,16 +282,31 @@ func (l *Listener) Close() error {
 		}
 		regMu.Unlock()
 		close(l.closed)
+		if l.wire != nil {
+			_ = l.wire.Close()
+		}
+		if l.ep != nil {
+			l.ep.Close()
+		}
 		l.ln.Shutdown()
 		err = l.ln.Close()
-		l.client.Close()
-		l.server.Close()
+		if l.client != nil {
+			l.client.Close()
+		}
+		if l.server != nil {
+			l.server.Close()
+		}
 	})
 	return err
 }
 
 // Addr returns the process-local registry address.
-func (l *Listener) Addr() net.Addr { return addr(l.addr) }
+func (l *Listener) Addr() net.Addr {
+	if l.netAddr != nil {
+		return l.netAddr
+	}
+	return addr(l.addr)
+}
 
 func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
 	select {
@@ -254,7 +328,174 @@ func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
 	return basetcp.Wrap(c), nil
 }
 
+func dialPacketCarrier(ctx context.Context, remote string) (transport.PathConn, error) {
+	raddr, err := net.ResolveUDPAddr("udp", remote)
+	if err != nil {
+		return nil, fmt.Errorf("gvisor: resolve udp %q: %w", remote, err)
+	}
+	pc, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, fmt.Errorf("gvisor: listen udp client: %w", err)
+	}
+	ep := channel.New(1024, mtu, "")
+	clientStack, err := newStack(clientIP, ep)
+	if err != nil {
+		_ = pc.Close()
+		ep.Close()
+		return nil, err
+	}
+	link := &packetLink{ep: ep, wire: pc, remote: raddr}
+	go link.pumpInbound()
+	go link.pumpOutbound()
+	c, err := gonet.DialContextTCP(ctx, clientStack, tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: serverIP,
+		Port: listenPort,
+	}, header.IPv4ProtocolNumber)
+	if err != nil {
+		link.close()
+		clientStack.Close()
+		return nil, fmt.Errorf("gvisor: dial packet-carrier tcp: %w", err)
+	}
+	return &managedPathConn{
+		PathConn: basetcp.Wrap(c),
+		cleanup: func() {
+			link.close()
+			clientStack.Close()
+		},
+	}, nil
+}
+
+type managedPathConn struct {
+	transport.PathConn
+	once    sync.Once
+	cleanup func()
+}
+
+func (p *managedPathConn) Close() error {
+	err := p.PathConn.Close()
+	p.once.Do(p.cleanup)
+	return err
+}
+
+func (l *Listener) pumpInbound() {
+	buf := make([]byte, mtu)
+	for {
+		n, addr, err := l.wire.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		l.remoteMu.Lock()
+		l.remote = addr
+		if port, ok := tcpSrcPort(buf[:n]); ok {
+			l.remotes[port] = addr
+		}
+		l.remoteMu.Unlock()
+		injectIPv4(l.ep, buf[:n])
+	}
+}
+
+func (l *Listener) pumpOutbound() {
+	for {
+		pkt := l.ep.ReadContext(context.Background())
+		if pkt == nil {
+			return
+		}
+		view := pkt.ToView()
+		pkt.DecRef()
+		packet := append([]byte(nil), view.AsSlice()...)
+		view.Release()
+		var remote net.Addr
+		if port, ok := tcpDstPort(packet); ok {
+			l.remoteMu.RLock()
+			remote = l.remotes[port]
+			l.remoteMu.RUnlock()
+		}
+		l.remoteMu.RLock()
+		if remote == nil {
+			remote = l.remote
+		}
+		l.remoteMu.RUnlock()
+		if remote == nil {
+			continue
+		}
+		if _, err := l.wire.WriteTo(packet, remote); err != nil {
+			return
+		}
+	}
+}
+
+type packetLink struct {
+	ep     *channel.Endpoint
+	wire   net.PacketConn
+	remote net.Addr
+	once   sync.Once
+}
+
+func (l *packetLink) pumpInbound() {
+	buf := make([]byte, mtu)
+	for {
+		n, _, err := l.wire.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		injectIPv4(l.ep, buf[:n])
+	}
+}
+
+func (l *packetLink) pumpOutbound() {
+	for {
+		pkt := l.ep.ReadContext(context.Background())
+		if pkt == nil {
+			return
+		}
+		view := pkt.ToView()
+		pkt.DecRef()
+		packet := append([]byte(nil), view.AsSlice()...)
+		view.Release()
+		if _, err := l.wire.WriteTo(packet, l.remote); err != nil {
+			return
+		}
+	}
+}
+
+func (l *packetLink) close() {
+	l.once.Do(func() {
+		_ = l.wire.Close()
+		l.ep.Close()
+	})
+}
+
 type addr string
 
 func (a addr) Network() string { return "gvisor" }
 func (a addr) String() string  { return string(a) }
+
+func injectIPv4(ep *channel.Endpoint, packet []byte) {
+	if len(packet) == 0 || packet[0]>>4 != 4 {
+		return
+	}
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(packet),
+	})
+	ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
+}
+
+func tcpSrcPort(packet []byte) (uint16, bool) {
+	return tcpPort(packet, 0)
+}
+
+func tcpDstPort(packet []byte) (uint16, bool) {
+	return tcpPort(packet, 2)
+}
+
+func tcpPort(packet []byte, off int) (uint16, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 || packet[9] != 6 {
+		return 0, false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+4 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(packet[ihl+off : ihl+off+2]), true
+}

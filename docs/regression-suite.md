@@ -403,6 +403,8 @@ T4 **只在 release tag 触发**，不进每日 schedule。本地 `--full` 也�
 | T5.2 | 同上 | gvisor | ✓ 跑通 G1 mini（即使有 NET_ADMIN，gvisor 仍然要能跑） |
 | T5.3 | **无 NET_ADMIN**（unprivileged 容器） | tcprepair | ✓ adapter 初始化时探测 `setsockopt(TCP_REPAIR)` 返回 EPERM，**明确报错** `tcprepair: CAP_NET_ADMIN required, use gvisor fallback` |
 | T5.4 | 同 T5.3 | gvisor | ✓ 跑通 G1 mini（这是 fallback 实战） |
+| T5.5 | 同 T5.3 | tcprepair -> gvisor | ✓ tcprepair probe 明确失败后，gvisor G1 mini 跑通 |
+| T5.6 | 同 T5.3 | gvisor packet-carrier | ✓ `ListenGVisorPacket` 外层 UDP 承载的 gVisor TCP 跑通 G1 mini |
 
 **关键判据**：
 

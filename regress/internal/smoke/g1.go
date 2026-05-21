@@ -215,11 +215,20 @@ func listenForTransport(name string) (rendr.Listener, error) {
 		return rendr.ListenTCP("127.0.0.1:0")
 	case "gvisor":
 		return rendr.ListenGVisor("")
+	case "gvisor-packet":
+		return rendr.ListenGVisorPacket("127.0.0.1:0")
 	case "quic":
 		return rendr.ListenQUIC("127.0.0.1:0", nil)
 	default:
 		return nil, fmt.Errorf("unknown transport %q", name)
 	}
+}
+
+func dialTransportName(name string) string {
+	if name == "gvisor-packet" {
+		return "gvisor"
+	}
+	return name
 }
 
 func listenAndSpecsForTransports(transports []string) (rendr.Listener, []rendr.PathSpec, error) {
@@ -240,7 +249,7 @@ func listenAndSpecsForTransports(transports []string) (rendr.Listener, []rendr.P
 		}
 		specs := make([]rendr.PathSpec, len(transports))
 		for i := range specs {
-			specs[i] = rendr.PathSpec{Transport: transports[0], Address: ln.Addr().String()}
+			specs[i] = rendr.PathSpec{Transport: dialTransportName(transports[0]), Address: ln.Addr().String()}
 		}
 		return ln, specs, nil
 	}
@@ -256,7 +265,7 @@ func listenAndSpecsForTransports(transports []string) (rendr.Listener, []rendr.P
 	addrs := ln.Addrs()
 	specs := make([]rendr.PathSpec, len(transports))
 	for i, name := range transports {
-		specs[i] = rendr.PathSpec{Transport: name, Address: addrs[i].String()}
+		specs[i] = rendr.PathSpec{Transport: dialTransportName(name), Address: addrs[i].String()}
 	}
 	return ln, specs, nil
 }

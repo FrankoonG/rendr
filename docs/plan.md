@@ -9,6 +9,10 @@
 >   `tcprepair` unavailable / EPERM / unsupported-kernel errors explicitly say
 >   `use gvisor fallback`, and T5.5 validates that fallback by running gVisor G1
 >   after an unprivileged TCP_REPAIR probe.
+> - M4 now has two levels: the in-process virtual link used by fast tests, and
+>   the external `ListenGVisorPacket` / `Transport: "gvisor"` packet-carrier
+>   path over outer UDP. The latter is the concrete no-CAP_NET_ADMIN fallback
+>   when kernel TCP_REPAIR cannot be used.
 > - M11 is now covered in T4: real `wireguard-go` userspace over
 >   `rendr-udp-relay`, and real Hysteria 2 CLI speedtest over `rendr-udp-relay`,
 >   both on a 2-path packet carrier with explicit migrations. The Hysteria case
@@ -368,8 +372,13 @@ rendr 框架不强制 fallback——由嵌入者按返回值决定。
 **实现**：
 
 - gvisor `pkg/tcpip` 嵌入，rendr 不从源码 fork、直接 import
-- TCB 状态在 path 切换时通过 gvisor 的 `Endpoint` 序列化 / 反序列化
-- 包注入：用 channel-based `tcpip.LinkEndpoint` 或 TUN，嵌入者按场景选
+- 当前产品化层：用 channel-based `tcpip.LinkEndpoint` 承载 gVisor TCP，并通过
+  `ListenGVisorPacket("host:port")` 把虚拟 IP 包封装进外层 UDP datagram；客户端
+  继续使用 `PathSpec{Transport: "gvisor", Address: ...}`。这条路径不需要
+  `CAP_NET_ADMIN`，是 TCP_REPAIR 不可用时的明确 fallback。
+- 后续增强层：如果需要在单个 gVisor TCP endpoint 内做更细粒度搬迁，再研究
+  gvisor `Endpoint` TCB 序列化 / 反序列化或 TUN 形态；这不是当前 fallback
+  可用性的前置条件。
 - 注册：`transport.Default.Register("gvisor", ...)` 或 PathFactory
 
 **能力探测**：
