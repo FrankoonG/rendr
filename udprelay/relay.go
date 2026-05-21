@@ -32,6 +32,23 @@ type Config struct {
 	BufferSize int
 }
 
+// DialConfig creates a client-side relay and dials the rendr
+// packet-mode carrier for it.
+type DialConfig struct {
+	Dialer     *rendr.Dialer
+	LocalAddr  string
+	BufferSize int
+}
+
+// ServeConfig creates a server-side relay from an accepted rendr
+// packet-mode carrier.
+type ServeConfig struct {
+	Listener   rendr.PacketListener
+	LocalAddr  string
+	TargetAddr string
+	BufferSize int
+}
+
 // Relay bridges one local UDP socket to one rendr PacketConn.
 type Relay struct {
 	pc     rendr.PacketConn
@@ -43,6 +60,54 @@ type Relay struct {
 
 	peerMu sync.RWMutex
 	peer   net.Addr
+}
+
+// Dial dials a rendr PacketConn and starts a client-side local UDP
+// relay for a self-managed UDP application.
+func Dial(ctx context.Context, cfg DialConfig) (*Relay, error) {
+	if cfg.Dialer == nil {
+		return nil, errors.New("udprelay: Dialer is required")
+	}
+	pc, err := cfg.Dialer.DialPacket(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("udprelay: dial packet carrier: %w", err)
+	}
+	r, err := Start(ctx, Config{
+		PacketConn: pc,
+		LocalAddr:  cfg.LocalAddr,
+		BufferSize: cfg.BufferSize,
+	})
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// Serve accepts one rendr PacketConn and starts a server-side UDP
+// relay to TargetAddr. Call Serve once per accepted remote relay.
+func Serve(ctx context.Context, cfg ServeConfig) (*Relay, error) {
+	if cfg.Listener == nil {
+		return nil, errors.New("udprelay: Listener is required")
+	}
+	if cfg.TargetAddr == "" {
+		return nil, errors.New("udprelay: TargetAddr is required")
+	}
+	pc, err := cfg.Listener.AcceptPacket(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("udprelay: accept packet carrier: %w", err)
+	}
+	r, err := Start(ctx, Config{
+		PacketConn: pc,
+		LocalAddr:  cfg.LocalAddr,
+		TargetAddr: cfg.TargetAddr,
+		BufferSize: cfg.BufferSize,
+	})
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	return r, nil
 }
 
 // Start creates and starts a UDP relay endpoint.

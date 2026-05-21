@@ -103,6 +103,70 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 	}
 }
 
+func TestDialAndServeRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	echo, echoAddr := startUDPEcho(t)
+	defer echo.Close()
+
+	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverReady := make(chan *Relay, 1)
+	go func() {
+		r, err := Serve(ctx, ServeConfig{
+			Listener:   ln,
+			LocalAddr:  "127.0.0.1:0",
+			TargetAddr: echoAddr.String(),
+		})
+		if err != nil {
+			t.Errorf("serve relay: %v", err)
+			return
+		}
+		serverReady <- r
+	}()
+
+	clientRelay, err := Dial(ctx, DialConfig{
+		Dialer: &rendr.Dialer{
+			Mode: rendr.ModePrime,
+			Paths: []rendr.PathSpec{
+				{Transport: "udpflow", Address: ln.Addr().String()},
+				{Transport: "udpflow", Address: ln.Addr().String()},
+			},
+		},
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientRelay.Close()
+
+	var serverRelay *Relay
+	select {
+	case serverRelay = <-serverReady:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer serverRelay.Close()
+
+	waitPacketPaths(t, clientRelay.PacketConn(), serverRelay.PacketConn(), 2)
+
+	app, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("dial-serve-before"))
+	admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
+	migrateToAlternate(t, admin)
+	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("dial-serve-after"))
+}
+
 func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -134,6 +198,24 @@ func waitPacketPaths(t *testing.T, client, server rendr.PacketConn, want int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("paths did not attach: client=%d server=%d want=%d", len(ca.Paths()), len(sa.Paths()), want)
+}
+
+func migrateToAlternate(t *testing.T, admin rendr.AdminPacketConn) {
+	t.Helper()
+	cur := admin.ActivePath()
+	var next uint32
+	for _, p := range admin.Paths() {
+		if p.ID != cur {
+			next = p.ID
+			break
+		}
+	}
+	if next == 0 {
+		t.Fatal("no alternate packet path")
+	}
+	if err := admin.Migrate(next); err != nil {
+		t.Fatalf("migrate packet path: %v", err)
+	}
 }
 
 func sendAndExpect(t *testing.T, app net.PacketConn, relayAddr net.Addr, payload []byte) {

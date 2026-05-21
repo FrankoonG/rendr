@@ -12,4 +12,7 @@
 // sockets, such as tunnels or custom datagram protocols: point the
 // application at Relay.LocalAddr(), and let rendr migrate the
 // PacketConn paths underneath.
+//
+// Dial and Serve are the high-level entry points. Start is the lower
+// level adapter for callers that already created the rendr PacketConn.
 package udprelay
