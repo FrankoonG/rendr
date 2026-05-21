@@ -88,13 +88,15 @@ func serveRendrConn(ctx context.Context, c rendr.Conn) error {
 	dialer := net.Dialer{}
 	upstream, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
+		_, _ = io.WriteString(c, "ERR\n")
 		return err
 	}
 	defer upstream.Close()
-	if buffered := br.Buffered(); buffered > 0 {
-		if _, err := io.CopyN(upstream, br, int64(buffered)); err != nil {
-			return err
-		}
+	if _, err := io.WriteString(c, "OK\n"); err != nil {
+		return err
+	}
+	if err := copyBuffered(upstream, br); err != nil {
+		return err
 	}
 	proxy(c, upstream)
 	return nil
@@ -136,10 +138,31 @@ func serveSOCKSConn(ctx context.Context, raw net.Conn, dial func(context.Context
 		_ = writeSOCKSReply(raw, 0x05)
 		return err
 	}
+	br := bufio.NewReader(rc)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		_ = writeSOCKSReply(raw, 0x05)
+		return err
+	}
+	if strings.TrimSpace(status) != "OK" {
+		_ = writeSOCKSReply(raw, 0x05)
+		return fmt.Errorf("rendr server failed to connect target: %s", strings.TrimSpace(status))
+	}
 	if err := writeSOCKSReply(raw, 0x00); err != nil {
 		return err
 	}
+	if err := copyBuffered(raw, br); err != nil {
+		return err
+	}
 	proxy(raw, rc)
+	return nil
+}
+
+func copyBuffered(dst io.Writer, br *bufio.Reader) error {
+	if buffered := br.Buffered(); buffered > 0 {
+		_, err := io.CopyN(dst, br, int64(buffered))
+		return err
+	}
 	return nil
 }
 
