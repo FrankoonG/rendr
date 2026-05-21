@@ -141,7 +141,7 @@ func main() {
 		}
 		if runT3 {
 			fmt.Println("== phase 2 / T3: PathFactory × xray outbound matrix ==")
-			tier3.Run(ctx, suite, cfg.rendrRoot)
+			tier3.Run(ctx, suite, cfg.rendrRoot, tier3.Options{Case: cfg.caseID})
 			writeReports(suite, cfg.reportDir)
 			if suite.AnyFailedAt("T3") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T3: FAILED")

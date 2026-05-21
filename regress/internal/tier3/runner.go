@@ -20,17 +20,23 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
+// Options filters the tier3 matrix execution.
+type Options struct {
+	Case string
+}
+
 // Run shells out to `go test -json ./internal/matrix/...` under the
 // regress submodule and translates each top-level test outcome into
 // a tier3 report.Case. rendrRoot is the rendr repo root; the
 // regress submodule lives at <rendrRoot>/regress.
-func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
+func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
 	regressDir := filepath.Join(rendrRoot, "regress")
 	start := time.Now()
 
@@ -39,10 +45,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, "go", "test",
-		"-json", "-count=1", "-timeout", "6m",
-		"./internal/matrix/...",
-	)
+	cmd := exec.CommandContext(cctx, "go", buildGoTestArgs(opts)...)
 	cmd.Dir = regressDir
 	cmd.WaitDelay = 15 * time.Second
 	stdout, err := cmd.StdoutPipe()
@@ -144,6 +147,21 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 	}
 }
 
+func buildGoTestArgs(opts Options) []string {
+	args := []string{
+		"test",
+		"-json",
+		"-count=1",
+		"-timeout",
+		"6m",
+	}
+	if opts.Case != "" {
+		args = append(args, "-run", "^"+regexp.QuoteMeta(opts.Case)+"$")
+	}
+	args = append(args, "./internal/matrix/...")
+	return args
+}
+
 type event struct {
 	Time    time.Time `json:"Time"`
 	Action  string    `json:"Action"`
@@ -154,10 +172,10 @@ type event struct {
 }
 
 type testRec struct {
-	name             string
-	started          time.Time
-	finished         time.Time
-	elapsed          time.Duration
-	result           string // "pass" | "fail" | "skip" | ""
-	output           string
+	name     string
+	started  time.Time
+	finished time.Time
+	elapsed  time.Duration
+	result   string // "pass" | "fail" | "skip" | ""
+	output   string
 }
