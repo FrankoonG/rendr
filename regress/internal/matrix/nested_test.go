@@ -1,43 +1,90 @@
 package matrix
 
 import (
+	"context"
 	"testing"
+	"time"
+
+	"github.com/FrankoonG/rendr"
+	"github.com/FrankoonG/rendr/regress/internal/matrix/driver"
+	"github.com/FrankoonG/rendr/regress/internal/xrayglue"
+
+	"github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/app/proxyman"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/protocol/tls/cert"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/uuid"
+	"github.com/xtls/xray-core/core"
+	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
+	"github.com/xtls/xray-core/proxy/vless"
+	vlessoutbound "github.com/xtls/xray-core/proxy/vless/outbound"
+	"github.com/xtls/xray-core/transport/internet"
+	transtcp "github.com/xtls/xray-core/transport/internet/tcp"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 // TestT3StreamNestedTwoLayer — PYS-N-1 (nested 2-layer chain).
 //
-// DEFERRED.
-//
-// xray supports proxy chaining via SenderConfig.ProxySettings.Tag:
-// outbound A's dial path can be redirected to outbound B's
-// Dispatch, layering protocol B around protocol A. The mechanism
-// is in app/proxyman/outbound/handler.go:274 (handler.Dial:
-// "if h.senderSettings.ProxySettings.HasTag()") and is part of the
-// public xray-core surface — but the tagged-chain pattern is
-// configured via JSON in real deployments, with tag references
-// resolved by the outbound manager at startup. No programmatic
-// scenario test in xray-core upstream exercises it; the protobuf
-// shape works (ProxyConfig{Tag: ...}) but the inner-vs-outer
-// target plumbing has non-obvious semantics (inner outbound's
-// protocol target is what the outer protocol's encoded "next hop"
-// becomes; the outer's Vnext-style address is what the wire
-// actually dials).
-//
-// Writing a verified 2-layer SS-2022 / VLESS chain end-to-end with
-// rendr migration on top is its own ~150-LOC effort with a real
-// risk of false-positives if the inner/outer relationship is
-// mis-encoded. Defer until a JSON-equivalent reference is
-// available or until the docs/regression-suite.md author chooses
-// to land it.
-//
 // rendr-side note: rendr's PathFactory wraps the final net.Conn
 // from xray, so nesting depth is transparent to rendr's migration
-// engine. This case is about exercising xray's chain plumbing
-// itself, not about a different rendr code path. The
-// stream.ss2022-via-relay case already covers
-// rendr-over-encrypted-protocol-via-intermediate-hop in spirit.
+// engine. This case uses two real xray protocol layers:
+//
+//	rendr path factory
+//	  -> SS-2022 client outbound
+//	  -> SS-2022 middle inbound
+//	  -> VLESS+Vision+TLS middle outbound
+//	  -> VLESS+Vision+TLS server inbound
+//	  -> freedom
+//	  -> rendr server
+//
+// The target rendr-server address is carried through both protocol
+// handshakes. Migration then moves the in-flight file transfer across
+// two independent nested sessions.
 func TestT3StreamNestedTwoLayer(t *testing.T) {
-	t.Skip("xray-core proxy chain (SenderConfig.ProxySettings.Tag) needs reference encoding; tracked, not gating")
+	vlessPort := pickFreePort(t)
+	ssMiddlePort := pickFreePort(t)
+
+	userID := protocol.NewID(uuid.New()).String()
+	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+	vlessServer := startVlessVisionServer(t, vlessPort, userID, ct)
+	defer vlessServer.Close()
+
+	const ssMethod = "2022-blake3-aes-128-gcm"
+	ssKey := randomSSKey(t)
+	middle := startSSInboundToVLESSOutbound(t, ssMiddlePort, ssMethod, ssKey, vlessPort, userID, ctHash)
+	defer middle.Close()
+
+	ssClient := startSSClient(t, ssMiddlePort, ssMethod, ssKey)
+	defer ssClient.Close()
+
+	factory := xrayglue.XrayInstanceAsStreamFactory(ssClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	r := driver.RunFileXfer(ctx, driver.FileXferOpts{
+		CaseName: "T3.stream.nested.ss2022-to-vless+vision+tls × itself",
+		Paths: []rendr.PathSpec{
+			{Transport: "xray-nested-ss-vless"},
+			{Transport: "xray-nested-ss-vless"},
+		},
+		Factories: []driver.NamedFactory{
+			{Name: "xray-nested-ss-vless", Stream: factory},
+		},
+	})
+	if r.Failure != "" {
+		t.Fatalf("case failed: %s", r.Failure)
+	}
+	if !r.SHA256Match {
+		t.Fatal("sha256 mismatch")
+	}
+	if r.MigrationsDone == 0 {
+		t.Fatal("zero migrations fired")
+	}
+	t.Logf("PASS: %s elapsed=%s bytes=%d migrations=%d/%d",
+		r.Name, r.Elapsed, r.BytesReceived, r.MigrationsDone, r.MigrationsAsked)
 }
 
 // TestT3StreamReverseOutbound — PYS-V-1 (reverse).
@@ -59,4 +106,62 @@ func TestT3StreamNestedTwoLayer(t *testing.T) {
 // works through a multi-hop path. Defer reverse until needed.
 func TestT3StreamReverseOutbound(t *testing.T) {
 	t.Skip("xray reverse outbound is configurable but needs reference encoding; tracked, not gating")
+}
+
+func startSSInboundToVLESSOutbound(t *testing.T, ssPort int, ssMethod, ssKey string, vlessPort int, userID string, srvCertHash [32]byte) *core.Instance {
+	t.Helper()
+	cfg := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(ssPort))}},
+					Listen:   xnet.NewIPOrDomain(xnet.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&ss2022.ServerConfig{
+					Method:  ssMethod,
+					Key:     ssKey,
+					Network: []xnet.Network{xnet.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&vlessoutbound.Config{
+					Vnext: &protocol.ServerEndpoint{
+						Address: xnet.NewIPOrDomain(xnet.LocalHostIP),
+						Port:    uint32(vlessPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&vless.Account{
+								Id:   userID,
+								Flow: vless.XRV,
+							}),
+						},
+					},
+				}),
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+					StreamSettings: &internet.StreamConfig{
+						ProtocolName: "tcp",
+						TransportSettings: []*internet.TransportConfig{
+							{
+								ProtocolName: "tcp",
+								Settings:     serial.ToTypedMessage(&transtcp.Config{}),
+							},
+						},
+						SecurityType: serial.GetMessageType(&tls.Config{}),
+						SecuritySettings: []*serial.TypedMessage{
+							serial.ToTypedMessage(&tls.Config{
+								PinnedPeerCertSha256: [][]byte{srvCertHash[:]},
+							}),
+						},
+					},
+				}),
+			},
+		},
+	}
+	return mustStartInstance(t, cfg)
 }
