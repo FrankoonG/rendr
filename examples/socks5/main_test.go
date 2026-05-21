@@ -81,7 +81,18 @@ func startTCPEcho(t *testing.T) (string, func()) {
 			return
 		}
 		defer c.Close()
-		_, _ = io.Copy(c, c)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := c.Read(buf)
+			if n > 0 {
+				if _, werr := c.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
 	return ln.Addr().String(), func() {
 		_ = ln.Close()

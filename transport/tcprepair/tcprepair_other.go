@@ -21,10 +21,10 @@ type State struct {
 
 // Snapshot returns an error on non-Linux; TCP_REPAIR is Linux-only.
 func Snapshot(_ *net.TCPConn) (*State, error) {
-	return nil, errors.New("tcprepair: TCP_REPAIR only supported on Linux")
+	return nil, errors.New("tcprepair: TCP_REPAIR only supported on Linux, use gvisor fallback")
 }
 
 // Restore returns an error on non-Linux; TCP_REPAIR is Linux-only.
 func Restore(_ *State) (int, error) {
-	return -1, errors.New("tcprepair: TCP_REPAIR only supported on Linux")
+	return -1, errors.New("tcprepair: TCP_REPAIR only supported on Linux, use gvisor fallback")
 }

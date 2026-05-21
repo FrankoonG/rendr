@@ -4,6 +4,7 @@
 //   - T5.2 privileged gvisor netstack G1 gate
 //   - T5.3 unprivileged tcprepair capability probe must fail clearly
 //   - T5.4 unprivileged gvisor netstack G1 gate
+//   - T5.5 unprivileged tcprepair-unavailable then gvisor fallback G1 gate
 package tier5
 
 import (
@@ -92,6 +93,10 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T5.4-gvisor-unprivileged", 2*time.Minute, func(context.Context) report.Case {
 		return probeGVisorUnprivileged(rendrRoot)
 	})
+
+	run("T5.5-tcprepair-gvisor-fallback-unprivileged", 2*time.Minute, func(context.Context) report.Case {
+		return probeTCPRepairGVisorFallbackUnprivileged(rendrRoot)
+	})
 }
 
 func caseMatches(filter, name string) bool {
@@ -176,6 +181,33 @@ func probeGVisorUnprivileged(rendrRoot string) report.Case {
 	cmd.Env = append(os.Environ(),
 		"GOCACHE=/tmp/go-build-gvisor-nocap",
 		"GOMODCACHE=/tmp/go-mod-gvisor-nocap",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
+	}
+	return report.Case{Name: name, Tier: "T5"}
+}
+
+func probeTCPRepairGVisorFallbackUnprivileged(rendrRoot string) report.Case {
+	const name = "T5.5-tcprepair-gvisor-fallback-unprivileged"
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
+	}
+	if _, err := os.Stat(rendrRoot); err != nil {
+		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
+	}
+	cmd := exec.Command(
+		"setpriv",
+		"--bounding-set=-net_admin",
+		"--inh-caps=-net_admin",
+		"--ambient-caps=-net_admin",
+		"bash", "-lc",
+		fmt.Sprintf("cd %s/regress && /usr/local/go/bin/go test ./internal/smoke -run TestTCPRepairUnavailableFallsBackToGVisor -count=1", rendrRoot),
+	)
+	cmd.Env = append(os.Environ(),
+		"GOCACHE=/tmp/go-build-tcprepair-gvisor-fallback-nocap",
+		"GOMODCACHE=/tmp/go-mod-tcprepair-gvisor-fallback-nocap",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -25,7 +25,7 @@ func (*Transport) Name() string { return "tcprepair" }
 
 // Available reports the platform limitation on non-Linux builds.
 func Available() error {
-	return errors.New("tcprepair: TCP_REPAIR only supported on Linux")
+	return errors.New("tcprepair: TCP_REPAIR only supported on Linux, use gvisor fallback")
 }
 
 func (*Transport) DialPath(context.Context, transport.PathSpec) (transport.PathConn, error) {
