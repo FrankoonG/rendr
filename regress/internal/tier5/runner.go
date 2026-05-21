@@ -1,7 +1,7 @@
 // Package tier5 implements the TCP fallback / adapter verification
 // tier. With tcprepair available but gvisor still absent, the current
 // matrix is:
-//   - T5.1 privileged tcprepair same-tuple rebuild smoke
+//   - T5.1 privileged tcprepair same-tuple rebuild G1 gate
 //   - T5.2 skipped (gvisor unavailable)
 //   - T5.3 unprivileged tcprepair capability probe must fail clearly
 //   - T5.4 skipped (gvisor unavailable)
@@ -66,7 +66,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 			return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Failure: err.Error()}
 		}
 		r := smoke.RunG1TCPRepairSameTuple(c, smoke.G1TCPRepairOpts{
-			Size:       30 << 20,
+			Size:       100 << 20,
 			Migrations: 3,
 		})
 		return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
