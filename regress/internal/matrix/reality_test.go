@@ -3,7 +3,8 @@ package matrix
 import (
 	"context"
 	"crypto/ecdh"
-	"crypto/ed25519"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	cryptotls "crypto/tls"
 	"crypto/x509"
@@ -36,46 +37,53 @@ import (
 	_ "github.com/xtls/xray-core/transport/internet/reality"
 )
 
-// TestT3VlessVisionRealityXItself — DEFERRED.
-//
-// REALITY is designed to look indistinguishable from a real HTTPS
-// server even to an active probe. Its authentication path requires
-// the configured Dest (fallback target) to respond to TLS probes
-// the way a real-world site like google.com:443 would — specific
-// cipher suite selection, ALPN behavior, and certificate validation
-// path that a stock crypto/tls listener doesn't satisfy. uTLS-chrome
-// on the client side compounds the mismatch.
-//
-// xray-core's own REALITY tests deliberately use a real internet
-// host (commented "may fail in some region") because the upstream
-// test infra has no local equivalent. Replicating that in-process
-// requires either:
-//   - running a uTLS-fingerprint-matching Go server (no off-the-
-//     shelf library does this; xray-core itself bundles parts of
-//     refraction-networking/utls but it's tightly integrated)
-//   - or a small standalone fake-Chrome TLS server in our test
-//     package
-//
-// Either is its own ~200-LOC piece, larger than the existing case
-// shape. Skip for now and surface the gap in the report so it's
-// visible. The other VLESS+Vision+TLS variants (plain TLS,
-// TLS+MLKEM) already cover the bulk of the protocol+rendr-migration
-// interaction; REALITY adds resistance-to-probing semantics that
-// rendr is transparent to.
+// TestT3VlessVisionRealityXItself — PYS-D-5: VLESS + Vision +
+// REALITY. xray-core's upstream scenario points REALITY at a public
+// HTTPS site; this matrix keeps the case deterministic by running a
+// local Go TLS fallback with a P-256 ECDSA certificate, which satisfies
+// the Chrome uTLS probe path well enough for authenticated REALITY
+// clients. rendr still sees only the post-handshake net.Conn.
 func TestT3VlessVisionRealityXItself(t *testing.T) {
-	t.Skip("REALITY needs a real-internet-like TLS Dest (uTLS fingerprint+cipher match); see test source for the longer note")
-	_ = mustGenerateX25519
-	_ = startTLSFallback
-	_ = startVlessRealityServer
-	_ = startVlessRealityClient
-	_ = xrayglue.XrayInstanceAsStreamFactory
-	_ = rendr.PathSpec{}
-	_ = driver.FileXferOpts{}
-	_ = context.Background
-	_ = time.Second
-	_ = protocol.NewID
-	_ = uuid.New
-	_ = hex.DecodeString
+	realityPort := pickFreePort(t)
+	userID := protocol.NewID(uuid.New()).String()
+	priv, pub := mustGenerateX25519(t)
+	shortID, err := hex.DecodeString("0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	destAddr := startTLSFallback(t)
+
+	srv := startVlessRealityServer(t, realityPort, userID, destAddr, priv, [][]byte{shortID})
+	defer srv.Close()
+	cli := startVlessRealityClient(t, realityPort, userID, pub, shortID)
+	defer cli.Close()
+
+	factory := xrayglue.XrayInstanceAsStreamFactory(cli)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	r := driver.RunFileXfer(ctx, driver.FileXferOpts{
+		CaseName: "T3.stream.vless+vision+reality × itself",
+		Paths: []rendr.PathSpec{
+			{Transport: "xray-vless-reality"},
+			{Transport: "xray-vless-reality"},
+		},
+		Factories: []driver.NamedFactory{
+			{Name: "xray-vless-reality", Stream: factory},
+		},
+	})
+	if r.Failure != "" {
+		t.Fatalf("case failed: %s", r.Failure)
+	}
+	if !r.SHA256Match {
+		t.Fatal("sha256 mismatch")
+	}
+	if r.MigrationsDone == 0 {
+		t.Fatal("zero migrations fired")
+	}
+	t.Logf("PASS: %s elapsed=%s bytes=%d migrations=%d/%d",
+		r.Name, r.Elapsed, r.BytesReceived, r.MigrationsDone, r.MigrationsAsked)
 }
 
 func mustGenerateX25519(t *testing.T) (privBytes, pubBytes []byte) {
@@ -89,16 +97,17 @@ func mustGenerateX25519(t *testing.T) (privBytes, pubBytes []byte) {
 }
 
 // startTLSFallback runs a minimal TLS listener that accepts + closes
-// every incoming connection. It exists only so REALITY has a Dest
-// to forward unauthenticated probe traffic to (test clients always
-// authenticate, so this codepath isn't exercised, but REALITY's
-// config validation requires a reachable Dest).
+// every incoming connection. REALITY's authenticated clients use
+// probe-derived target traits even though successful test traffic
+// stays inside the REALITY connection; P-256 ECDSA keeps the local
+// fallback compatible with xray-core's Chrome uTLS path.
 func startTLSFallback(t *testing.T) string {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	pub := priv.Public()
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "localhost"},
