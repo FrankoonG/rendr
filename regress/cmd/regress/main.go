@@ -161,7 +161,7 @@ func main() {
 		}
 		if runT5 {
 			fmt.Println("== phase 2 / T5: TCP fallback / adapter verification ==")
-			tier5.Run(ctx, suite, cfg.rendrRoot)
+			tier5.Run(ctx, suite, cfg.rendrRoot, tier5.Options{Case: cfg.caseID})
 			writeReports(suite, cfg.reportDir)
 			if suite.AnyFailedAt("T5") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T5: FAILED")

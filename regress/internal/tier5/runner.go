@@ -21,9 +21,39 @@ import (
 	"github.com/FrankoonG/rendr/transport/tcprepair"
 )
 
-func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
+// Options filters the tier5 adapter matrix.
+type Options struct {
+	Case string
+}
+
+func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
+	matched := false
+	add := func(c report.Case) {
+		if !caseMatches(opts.Case, c.Name) {
+			return
+		}
+		matched = true
+		suite.Add(c)
+	}
+	run := func(name string, budget time.Duration, fn func(context.Context) report.Case) {
+		if !caseMatches(opts.Case, name) {
+			return
+		}
+		matched = true
+		runCase(ctx, suite, name, budget, fn)
+	}
+	defer func() {
+		if opts.Case != "" && !matched {
+			suite.Add(report.Case{
+				Name:    "T5-case-filter",
+				Tier:    "T5",
+				Failure: fmt.Sprintf("no T5 case matched %q", opts.Case),
+			})
+		}
+	}()
+
 	if runtime.GOOS != "linux" {
-		suite.Add(report.Case{
+		add(report.Case{
 			Name:       "T5.1-tcprepair-privileged",
 			Tier:       "T5",
 			SkipReason: "Linux only",
@@ -31,7 +61,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		return
 	}
 
-	runCase(ctx, suite, "T5.1-tcprepair-privileged", 3*time.Minute, func(c context.Context) report.Case {
+	run("T5.1-tcprepair-privileged", 3*time.Minute, func(c context.Context) report.Case {
 		if err := tcprepair.Available(); err != nil {
 			return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Failure: err.Error()}
 		}
@@ -42,21 +72,25 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string) {
 		return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
 	})
 
-	suite.Add(report.Case{
+	add(report.Case{
 		Name:       "T5.2-gvisor-privileged",
 		Tier:       "T5",
 		SkipReason: "gvisor adapter unavailable",
 	})
 
-	runCase(ctx, suite, "T5.3-tcprepair-unprivileged", 2*time.Minute, func(context.Context) report.Case {
+	run("T5.3-tcprepair-unprivileged", 2*time.Minute, func(context.Context) report.Case {
 		return probeUnprivileged(rendrRoot)
 	})
 
-	suite.Add(report.Case{
+	add(report.Case{
 		Name:       "T5.4-gvisor-unprivileged",
 		Tier:       "T5",
 		SkipReason: "gvisor adapter unavailable",
 	})
+}
+
+func caseMatches(filter, name string) bool {
+	return filter == "" || filter == name
 }
 
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
