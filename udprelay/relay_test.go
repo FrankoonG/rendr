@@ -167,6 +167,57 @@ func TestDialAndServeRoundTrip(t *testing.T) {
 	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("dial-serve-after"))
 }
 
+func TestServerAcceptsMultipleClients(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	echo, echoAddr := startUDPEcho(t)
+	defer echo.Close()
+
+	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := Listen(ctx, ServeConfig{
+		Listener:   ln,
+		LocalAddr:  "127.0.0.1:0",
+		TargetAddr: echoAddr.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		clientRelay, err := Dial(ctx, DialConfig{
+			Dialer: &rendr.Dialer{
+				Mode: rendr.ModePrime,
+				Paths: []rendr.PathSpec{
+					{Transport: "udpflow", Address: ln.Addr().String()},
+					{Transport: "udpflow", Address: ln.Addr().String()},
+				},
+			},
+			LocalAddr: "127.0.0.1:0",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clientRelay.Close()
+		waitServerRelays(t, server, i+1)
+
+		app, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sendAndExpect(t, app, clientRelay.LocalAddr(), []byte(fmt.Sprintf("server-client-%d-before", i)))
+		admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
+		migrateToAlternate(t, admin)
+		sendAndExpect(t, app, clientRelay.LocalAddr(), []byte(fmt.Sprintf("server-client-%d-after", i)))
+		_ = app.Close()
+	}
+}
+
 func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -198,6 +249,18 @@ func waitPacketPaths(t *testing.T, client, server rendr.PacketConn, want int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("paths did not attach: client=%d server=%d want=%d", len(ca.Paths()), len(sa.Paths()), want)
+}
+
+func waitServerRelays(t *testing.T, server *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if server.Relays() >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("server relays=%d want >=%d", server.Relays(), want)
 }
 
 func migrateToAlternate(t *testing.T, admin rendr.AdminPacketConn) {

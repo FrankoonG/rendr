@@ -49,6 +49,21 @@ type ServeConfig struct {
 	BufferSize int
 }
 
+// Server accepts rendr packet-mode connections and starts one
+// server-side Relay for each accepted client.
+type Server struct {
+	listener   rendr.PacketListener
+	localAddr  string
+	targetAddr string
+	bufferSize int
+
+	closeOnce sync.Once
+	done      chan struct{}
+
+	relaysMu sync.Mutex
+	relays   map[*Relay]struct{}
+}
+
 // Relay bridges one local UDP socket to one rendr PacketConn.
 type Relay struct {
 	pc     rendr.PacketConn
@@ -110,6 +125,111 @@ func Serve(ctx context.Context, cfg ServeConfig) (*Relay, error) {
 	return r, nil
 }
 
+// Listen starts a multi-client UDP relay server. The server accepts
+// packet-mode rendr connections until ctx is cancelled or Close is
+// called.
+func Listen(ctx context.Context, cfg ServeConfig) (*Server, error) {
+	if cfg.Listener == nil {
+		return nil, errors.New("udprelay: Listener is required")
+	}
+	if cfg.TargetAddr == "" {
+		return nil, errors.New("udprelay: TargetAddr is required")
+	}
+	s := &Server{
+		listener:   cfg.Listener,
+		localAddr:  cfg.LocalAddr,
+		targetAddr: cfg.TargetAddr,
+		bufferSize: cfg.BufferSize,
+		done:       make(chan struct{}),
+		relays:     make(map[*Relay]struct{}),
+	}
+	go s.acceptLoop(ctx)
+	return s, nil
+}
+
+// Close stops accepting new clients and closes all active relays.
+func (s *Server) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if e := s.listener.Close(); e != nil {
+			err = e
+		}
+		s.relaysMu.Lock()
+		for r := range s.relays {
+			if e := r.Close(); err == nil && e != nil {
+				err = e
+			}
+		}
+		s.relays = nil
+		s.relaysMu.Unlock()
+	})
+	return err
+}
+
+// Relays returns the current active relay count.
+func (s *Server) Relays() int {
+	s.relaysMu.Lock()
+	defer s.relaysMu.Unlock()
+	return len(s.relays)
+}
+
+func (s *Server) acceptLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			_ = s.Close()
+			return
+		case <-s.done:
+			return
+		default:
+		}
+
+		pc, err := s.listener.AcceptPacket(ctx)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				_ = s.Close()
+			case <-s.done:
+			default:
+				_ = s.Close()
+			}
+			return
+		}
+		r, err := Start(ctx, Config{
+			PacketConn: pc,
+			LocalAddr:  s.localAddr,
+			TargetAddr: s.targetAddr,
+			BufferSize: s.bufferSize,
+		})
+		if err != nil {
+			_ = pc.Close()
+			continue
+		}
+		s.addRelay(r)
+	}
+}
+
+func (s *Server) addRelay(r *Relay) {
+	s.relaysMu.Lock()
+	if s.relays == nil {
+		s.relaysMu.Unlock()
+		_ = r.Close()
+		return
+	}
+	s.relays[r] = struct{}{}
+	s.relaysMu.Unlock()
+
+	go func() {
+		<-r.Done()
+		s.relaysMu.Lock()
+		if s.relays != nil {
+			delete(s.relays, r)
+		}
+		s.relaysMu.Unlock()
+	}()
+}
+
 // Start creates and starts a UDP relay endpoint.
 func Start(ctx context.Context, cfg Config) (*Relay, error) {
 	if cfg.PacketConn == nil {
@@ -155,6 +275,9 @@ func (r *Relay) LocalAddr() net.Addr { return r.udp.LocalAddr() }
 // type-assert it to rendr.AdminPacketConn to add paths or trigger
 // explicit migrations.
 func (r *Relay) PacketConn() rendr.PacketConn { return r.pc }
+
+// Done is closed when the relay is stopped.
+func (r *Relay) Done() <-chan struct{} { return r.done }
 
 // Close stops the relay and closes both the UDP socket and rendr
 // PacketConn.

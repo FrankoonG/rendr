@@ -13,6 +13,8 @@
 // application at Relay.LocalAddr(), and let rendr migrate the
 // PacketConn paths underneath.
 //
-// Dial and Serve are the high-level entry points. Start is the lower
-// level adapter for callers that already created the rendr PacketConn.
+// Dial and Listen are the high-level client/server entry points.
+// Serve accepts a single carrier for simple integrations. Start is
+// the lower level adapter for callers that already created the rendr
+// PacketConn.
 package udprelay
