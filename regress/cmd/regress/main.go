@@ -151,7 +151,7 @@ func main() {
 		}
 		if runT4 {
 			fmt.Println("== phase 2 / T4: long-run (1 GiB / 30 min / 100k pps) ==")
-			tier4.Run(ctx, suite, cfg.rendrRoot)
+			tier4.Run(ctx, suite, cfg.rendrRoot, tier4.Options{Case: cfg.caseID})
 			writeReports(suite, cfg.reportDir)
 			if suite.AnyFailedAt("T4") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T4: FAILED")

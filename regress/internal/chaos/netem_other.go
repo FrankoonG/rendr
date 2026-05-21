@@ -20,6 +20,9 @@ type Profile struct {
 var Realistic50M = Profile{Bandwidth: 50_000_000}
 var LossyWAN = Profile{Bandwidth: 50_000_000, LossPct: 1.0, Delay: 80 * time.Millisecond, Jitter: 20 * time.Millisecond}
 
-func Apply(_ Profile) (func() error, error) {
+func Apply(p Profile) (func() error, error) {
+	if p.Bandwidth <= 0 && p.LossPct <= 0 && p.Delay <= 0 {
+		return func() error { return nil }, nil
+	}
 	return nil, errors.New("chaos.Apply: tc netem only supported on Linux")
 }

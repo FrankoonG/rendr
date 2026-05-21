@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/FrankoonG/rendr"
@@ -14,13 +15,35 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
+// Options filters the long-run matrix for targeted debug runs.
+type Options struct {
+	Case string
+}
+
 // Run executes T4 cases with per-case budgets enforced by select.
 // Default chaos profile is Realistic50M (50 Mbps baseline) per the
 // project-wide bandwidth policy; G3-T4 opts out because it tests
 // raw packet throughput at 100k pps × 1 KB = 800 Mbps which is well
 // above any realistic link.
-func Run(ctx context.Context, suite *report.Suite, _ string) {
+func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 	const T4Budget = 33 * time.Minute
+	matched := false
+	run := func(name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) {
+		if !caseMatches(opts.Case, name) {
+			return
+		}
+		matched = true
+		runCase(ctx, suite, name, budget, prof, fn)
+	}
+	defer func() {
+		if opts.Case != "" && !matched {
+			suite.Add(report.Case{
+				Name:    "T4-case-filter",
+				Tier:    "T4",
+				Failure: fmt.Sprintf("no T4 case matched %q", opts.Case),
+			})
+		}
+	}()
 
 	// G1-T4 runs at the same 50 Mbps baseline as the long-lived G2
 	// cases. The prior 200 Mbps workaround was only needed while the
@@ -28,7 +51,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	// qdisc-induced ETIMEDOUT; chaos.Realistic50M now uses a larger
 	// burst floor while preserving the steady-state 50 Mbps cap.
 	g1ChaosProf := chaos.Realistic50M
-	runCase(ctx, suite, "G1-T4", 7*time.Minute, g1ChaosProf, func(c context.Context) smoke.Result {
+	run("G1-T4", 7*time.Minute, g1ChaosProf, func(c context.Context) smoke.Result {
 		return smoke.RunG1(c, smoke.G1Opts{
 			Size:       1 << 30,
 			Migrations: 10,
@@ -36,7 +59,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			Transport:  "tcp",
 		})
 	})
-	runCase(ctx, suite, "G1-T4-quic", 7*time.Minute, g1ChaosProf, func(c context.Context) smoke.Result {
+	run("G1-T4-quic", 7*time.Minute, g1ChaosProf, func(c context.Context) smoke.Result {
 		return smoke.RunG1(c, smoke.G1Opts{
 			Size:       1 << 30,
 			Migrations: 10,
@@ -45,7 +68,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		})
 	})
 
-	runCase(ctx, suite, "G2-T4", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
+	run("G2-T4", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
 		return smoke.RunG2(c, smoke.G2Opts{
 			Duration:     30 * time.Minute,
 			Migrations:   30,
@@ -57,7 +80,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		})
 	})
 	// Mode-matrix long-run coverage: race + bond on TCP.
-	runCase(ctx, suite, "G2-T4-race-tcp", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
+	run("G2-T4-race-tcp", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
 		return smoke.RunG2(c, smoke.G2Opts{
 			Duration:     30 * time.Minute,
 			Migrations:   0,
@@ -68,7 +91,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			P99CeilingMs: 200,
 		})
 	})
-	runCase(ctx, suite, "G2-T4-bond-tcp", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
+	run("G2-T4-bond-tcp", T4Budget, chaos.Realistic50M, func(c context.Context) smoke.Result {
 		return smoke.RunG2(c, smoke.G2Opts{
 			Duration:     30 * time.Minute,
 			Migrations:   30,
@@ -79,12 +102,20 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			P99CeilingMs: 200,
 		})
 	})
-	runCase(ctx, suite, "M11-udp-relay-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+	run("M11-udp-relay-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
 		return smoke.RunUDPRelay(c, smoke.UDPRelayOpts{
 			Packets:    10_000,
 			Paths:      2,
 			Migrations: 3,
 			Server:     true,
+		})
+	})
+	run("M11-udp-relay-porthop-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+		return smoke.RunUDPRelayPortHop(c, smoke.UDPRelayOpts{
+			Packets:    10_000,
+			Paths:      2,
+			Migrations: 3,
+			PortHops:   8,
 		})
 	})
 
@@ -93,7 +124,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 		// because 100k pps × 1 KB ≈ 800 Mbps would be 16× over the
 		// 50 Mbps baseline — that's a bandwidth saturation test, not a
 		// throughput test.
-		runCase(ctx, suite, "G3-T4", 3*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+		run("G3-T4", 3*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
 			return smoke.RunG3(c, smoke.G3Opts{
 				Duration:   30 * time.Second,
 				PPS:        100_000,
@@ -110,12 +141,19 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			})
 		})
 	} else {
-		suite.Add(report.Case{
-			Name:       "G3-T4",
-			Tier:       "T4",
-			SkipReason: "Linux only (100k pps QUIC DATAGRAM needs net.core.rmem_max=8MiB)",
-		})
+		if caseMatches(opts.Case, "G3-T4") {
+			matched = true
+			suite.Add(report.Case{
+				Name:       "G3-T4",
+				Tier:       "T4",
+				SkipReason: "Linux only (100k pps QUIC DATAGRAM needs net.core.rmem_max=8MiB)",
+			})
+		}
 	}
+}
+
+func caseMatches(filter, name string) bool {
+	return filter == "" || filter == name || strings.EqualFold(filter, name)
 }
 
 // runCase enforces the per-case budget via select-on-Done. Smoke.RunG1

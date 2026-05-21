@@ -16,6 +16,7 @@ type UDPRelayOpts struct {
 	Packets    int
 	Paths      int
 	Migrations int
+	PortHops   int
 	Server     bool
 }
 
@@ -31,6 +32,12 @@ func (o *UDPRelayOpts) withDefaults() {
 	}
 	if o.Migrations > o.Packets {
 		o.Migrations = o.Packets
+	}
+	if o.PortHops < 0 {
+		o.PortHops = 0
+	}
+	if o.PortHops > o.Packets {
+		o.PortHops = o.Packets
 	}
 }
 
@@ -157,6 +164,128 @@ func RunUDPRelay(ctx context.Context, opts UDPRelayOpts) Result {
 			"requested_migs":  opts.Migrations,
 			"server":          opts.Server,
 			"migration_count": admin.MigrationCount(),
+			"elapsed_seconds": elapsed.Seconds(),
+			"packets_per_sec": float64(opts.Packets) / elapsed.Seconds(),
+		},
+	}
+}
+
+// RunUDPRelayPortHop verifies the M11 "self-managed UDP protocol"
+// invariant that the application can replace its own UDP socket while
+// the local pseudo-remote relay address stays stable. This models
+// Hysteria-style port hopping at the API boundary rendr actually
+// owns: rendr keeps migrating paths underneath, while the UDP app
+// keeps sending to the same loopback relay endpoint from fresh local
+// ports.
+func RunUDPRelayPortHop(ctx context.Context, opts UDPRelayOpts) Result {
+	opts.withDefaults()
+	if opts.PortHops == 0 {
+		opts.PortHops = 3
+	}
+	if opts.PortHops >= opts.Packets {
+		opts.PortHops = opts.Packets - 1
+	}
+	if opts.PortHops < 0 {
+		opts.PortHops = 0
+	}
+	t0 := time.Now()
+	name := fmt.Sprintf("UDP-relay-porthop (%d packets, %d paths, %d migrations, %d hops)", opts.Packets, opts.Paths, opts.Migrations, opts.PortHops)
+
+	echo, echoAddr, err := startUDPEcho()
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("echo listen: %w", err))
+	}
+	defer echo.Close()
+
+	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("rendr listen: %w", err))
+	}
+	defer ln.Close()
+
+	server, err := udprelay.Listen(ctx, udprelay.ServeConfig{
+		Listener:   ln,
+		LocalAddr:  "127.0.0.1:0",
+		TargetAddr: echoAddr.String(),
+	})
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("relay listen: %w", err))
+	}
+	defer server.Close()
+
+	paths := make([]rendr.PathSpec, opts.Paths)
+	for i := range paths {
+		paths[i] = rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}
+	}
+	clientRelay, err := udprelay.Dial(ctx, udprelay.DialConfig{
+		Dialer: &rendr.Dialer{
+			Mode:  rendr.ModePrime,
+			Paths: paths,
+		},
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("relay dial: %w", err))
+	}
+	defer clientRelay.Close()
+
+	if err := waitServerRelay(clientRelay.PacketConn(), server, opts.Paths); err != nil {
+		return FromError(name, time.Since(t0), err)
+	}
+
+	app, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("app listen: %w", err))
+	}
+	defer app.Close()
+	seenPorts := map[string]struct{}{app.LocalAddr().String(): {}}
+
+	admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
+	migrateAt := migrationPoints(opts.Packets, opts.Migrations)
+	hopAt := migrationPoints(opts.Packets, opts.PortHops)
+	hopsDone := 0
+	for i := 0; i < opts.Packets; i++ {
+		if _, ok := hopAt[i]; ok && i > 0 {
+			_ = app.Close()
+			app, err = net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("app port hop %d: %w", hopsDone, err))
+			}
+			defer app.Close()
+			seenPorts[app.LocalAddr().String()] = struct{}{}
+			hopsDone++
+		}
+		payload := []byte(fmt.Sprintf("udp-relay-porthop-%04d-from-%s", i, app.LocalAddr()))
+		if err := relayRoundTrip(app, clientRelay.LocalAddr(), payload); err != nil {
+			return FromError(name, time.Since(t0), fmt.Errorf("packet %d: %w", i, err))
+		}
+		if _, ok := migrateAt[i]; ok {
+			if err := migrateRelay(admin); err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("migrate: %w", err))
+			}
+		}
+	}
+	if got := admin.MigrationCount(); got < uint64(opts.Migrations) {
+		return FromError(name, time.Since(t0), fmt.Errorf("migration count=%d want >=%d", got, opts.Migrations))
+	}
+	if hopsDone < opts.PortHops {
+		return FromError(name, time.Since(t0), fmt.Errorf("port hops=%d want >=%d", hopsDone, opts.PortHops))
+	}
+	if len(seenPorts) < opts.PortHops+1 {
+		return FromError(name, time.Since(t0), fmt.Errorf("unique app ports=%d want >=%d", len(seenPorts), opts.PortHops+1))
+	}
+
+	elapsed := time.Since(t0)
+	return Result{
+		Name:     name,
+		Duration: elapsed,
+		Detail: map[string]any{
+			"packets":         opts.Packets,
+			"paths":           opts.Paths,
+			"requested_migs":  opts.Migrations,
+			"migration_count": admin.MigrationCount(),
+			"port_hops":       hopsDone,
+			"unique_ports":    len(seenPorts),
 			"elapsed_seconds": elapsed.Seconds(),
 			"packets_per_sec": float64(opts.Packets) / elapsed.Seconds(),
 		},

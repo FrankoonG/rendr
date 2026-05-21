@@ -74,6 +74,14 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 	addRun(suite, "M11-udp-relay-smoke", "T2", func() smoke.Result {
 		return smoke.RunUDPRelay(ctx, smoke.UDPRelayOpts{})
 	})
+	addRun(suite, "M11-udp-relay-porthop-smoke", "T2", func() smoke.Result {
+		return smoke.RunUDPRelayPortHop(ctx, smoke.UDPRelayOpts{
+			Packets:    128,
+			Paths:      2,
+			Migrations: 2,
+			PortHops:   3,
+		})
+	})
 }
 
 func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
