@@ -93,6 +93,9 @@ func TestAvailableExpectation(t *testing.T) {
 		if !strings.Contains(err.Error(), "CAP_NET_ADMIN required") {
 			t.Fatalf("unexpected unavailable error: %v", err)
 		}
+		if !strings.Contains(err.Error(), "gvisor fallback") {
+			t.Fatalf("unavailable error does not name gvisor fallback: %v", err)
+		}
 	default:
 		t.Fatalf("unknown expectation %q", expect)
 	}
