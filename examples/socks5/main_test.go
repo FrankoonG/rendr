@@ -24,12 +24,14 @@ func TestSOCKS5OverRendr(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rendrLn.Close()
+	rendrDone := make(chan error, 1)
 	go func() {
 		c, err := rendrLn.Accept(ctx)
 		if err != nil {
+			rendrDone <- err
 			return
 		}
-		_ = serveRendrConn(ctx, c)
+		rendrDone <- serveRendrConn(ctx, c)
 	}()
 
 	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -37,12 +39,14 @@ func TestSOCKS5OverRendr(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer socksLn.Close()
+	socksDone := make(chan error, 1)
 	go func() {
 		raw, err := socksLn.Accept()
 		if err != nil {
+			socksDone <- err
 			return
 		}
-		_ = serveSOCKSConn(ctx, raw, func(ctx context.Context) (rendr.Conn, error) {
+		socksDone <- serveSOCKSConn(ctx, raw, func(ctx context.Context) (rendr.Conn, error) {
 			return dialRendr(ctx, rendrLn.Addr().String(), rendrLn.Addr().String())
 		})
 	}()
@@ -68,6 +72,11 @@ func TestSOCKS5OverRendr(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("echo mismatch: got %q want %q", got, payload)
 	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitServeDone(t, "socks", socksDone)
+	waitServeDone(t, "rendr", rendrDone)
 }
 
 func startTCPEcho(t *testing.T) (string, func()) {
@@ -96,6 +105,18 @@ func startTCPEcho(t *testing.T) (string, func()) {
 	return ln.Addr().String(), func() {
 		_ = ln.Close()
 		<-done
+	}
+}
+
+func waitServeDone(t *testing.T, name string, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s serve: %v", name, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s serve did not stop", name)
 	}
 }
 
