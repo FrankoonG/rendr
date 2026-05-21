@@ -45,6 +45,9 @@ c, err := d.Dial(context.Background())
 ```
 
 Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`.
+For stream servers that accept multiple path transports into one
+bridge table, use `Listen(ListenSpec{Transport: "tcp", ...},
+ListenSpec{Transport: "quic", ...})`.
 
 Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`.
 

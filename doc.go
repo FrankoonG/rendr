@@ -19,6 +19,9 @@
 //	    go handle(c) // c implements net.Conn
 //	}
 //
+// Use Listen with multiple ListenSpecs when one server should accept
+// several stream path transports into the same bridge table.
+//
 // Client:
 //
 //	d := &rendr.Dialer{

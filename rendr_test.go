@@ -3823,35 +3823,112 @@ func TestM2QUICRoundTrip(t *testing.T) {
 // symmetrically (same proto.Frame envelope, same DeathCause
 // taxonomy, same migration semantics).
 func TestM2MixedTCPQUICMigration(t *testing.T) {
-	// Need both a TCP listener AND a QUIC listener that resolve to
-	// the same engine bridge. Easiest: one TCP listener for the
-	// HELLO path, then add a QUIC path via BRIDGE_TAG. The bridge
-	// table is keyed by flow_id and is shared per-listener, so we
-	// need a unified server. M1's bridges are per-listener; do the
-	// cross-transport bridge by hand below.
-
-	tcpLn, err := ListenTCP("127.0.0.1:0")
+	ln, err := Listen(
+		ListenSpec{Transport: "tcp", Address: "127.0.0.1:0"},
+		ListenSpec{Transport: "quic", Address: "127.0.0.1:0"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tcpLn.Close()
+	defer ln.Close()
+	addrs := ln.Addrs()
+	if len(addrs) != 2 {
+		t.Fatalf("Addrs len=%d want 2", len(addrs))
+	}
 
-	quicLn, err := ListenQUIC("127.0.0.1:0", nil)
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	d := &Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: addrs[0].String()},
+			{Transport: "quic", Address: addrs[1].String()},
+		},
+		MigrationBudget: 3 * time.Second,
+	}
+	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer quicLn.Close()
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
 
-	// Both listeners maintain their own bridge tables. For this
-	// test the simpler path is to NOT cross bridges, but instead
-	// dial just QUIC + QUIC and just TCP + TCP separately. The
-	// "mixed" property we're actually proving here is that the
-	// engine accepts BOTH a TCP and a QUIC path on the same
-	// rendr.Conn when the listener that demuxed HELLO knows about
-	// both transports. M9 will deliver a unified Listen() that
-	// accepts both transport kinds in one bridge table; until then,
-	// the cross-transport case is not in scope for M2.
-	t.Skip("cross-transport bridge unification deferred to M9 (multi-transport listener)")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= 2 && len(server.Paths()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(client.Paths()) < 2 || len(server.Paths()) < 2 {
+		t.Fatalf("paths did not attach: client=%d server=%d", len(client.Paths()), len(server.Paths()))
+	}
+
+	var quicPath uint32
+	for _, p := range client.Paths() {
+		if p.Spec.Transport == "quic" {
+			quicPath = p.ID
+			break
+		}
+	}
+	if quicPath == 0 {
+		t.Fatalf("no quic path in client paths: %+v", client.Paths())
+	}
+	admin := client.(AdminConn)
+
+	want := bytes.Repeat([]byte("tcp-to-quic-mixed-"), 64*1024)
+	got := make([]byte, len(want))
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(server, got)
+		done <- err
+	}()
+
+	half := len(want) / 2
+	if _, err := client.Write(want[:half]); err != nil {
+		t.Fatalf("write tcp half: %v", err)
+	}
+	if err := admin.Migrate(quicPath); err != nil {
+		t.Fatalf("migrate to quic path: %v", err)
+	}
+	if _, err := client.Write(want[half:]); err != nil {
+		t.Fatalf("write quic half: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server read: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server read timed out")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("mixed TCP+QUIC payload mismatch")
+	}
+	if client.FlowID() != server.FlowID() {
+		t.Fatalf("flow_id mismatch: client=%x server=%x", client.FlowID(), server.FlowID())
+	}
+}
+
+func TestListenMultiValidation(t *testing.T) {
+	if _, err := Listen(); err == nil {
+		t.Fatal("Listen with no specs unexpectedly succeeded")
+	}
+	if _, err := Listen(ListenSpec{Transport: "udpflow", Address: "127.0.0.1:0"}); err == nil {
+		t.Fatal("Listen with unsupported stream transport unexpectedly succeeded")
+	}
 }
 
 // TestM2QUICDeathTriggersMigration: with two QUIC paths attached,
