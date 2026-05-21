@@ -85,6 +85,14 @@ func Run(ctx context.Context, suite *report.Suite, _ string) {
 			P99CeilingMs: 200,
 		})
 	})
+	runCase(ctx, suite, "M11-udp-relay-T4", 5*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+		return smoke.RunUDPRelay(c, smoke.UDPRelayOpts{
+			Packets:    10_000,
+			Paths:      2,
+			Migrations: 3,
+			Server:     true,
+		})
+	})
 
 	if runtime.GOOS == "linux" {
 		// G3-T4 deliberately runs without any chaos profile (Profile{})
