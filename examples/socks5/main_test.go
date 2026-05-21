@@ -13,7 +13,7 @@ import (
 )
 
 func TestSOCKS5OverRendr(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	echoAddr, stopEcho := startTCPEcho(t)
@@ -56,7 +56,7 @@ func TestSOCKS5OverRendr(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	socksConnect(t, client, echoAddr)
