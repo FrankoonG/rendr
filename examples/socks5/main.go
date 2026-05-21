@@ -76,7 +76,8 @@ func runServer(ctx context.Context, addr string) error {
 
 func serveRendrConn(ctx context.Context, c rendr.Conn) error {
 	defer c.Close()
-	target, err := bufio.NewReader(c).ReadString('\n')
+	br := bufio.NewReader(c)
+	target, err := br.ReadString('\n')
 	if err != nil {
 		return err
 	}
@@ -90,6 +91,11 @@ func serveRendrConn(ctx context.Context, c rendr.Conn) error {
 		return err
 	}
 	defer upstream.Close()
+	if buffered := br.Buffered(); buffered > 0 {
+		if _, err := io.CopyN(upstream, br, int64(buffered)); err != nil {
+			return err
+		}
+	}
 	proxy(c, upstream)
 	return nil
 }
