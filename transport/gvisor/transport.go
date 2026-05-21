@@ -94,6 +94,12 @@ type Listener struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	acceptCh  chan acceptResult
+}
+
+type acceptResult struct {
+	pc  transport.PathConn
+	err error
 }
 
 // Listen creates a process-local gVisor TCP listener. If addr is
@@ -133,15 +139,17 @@ func Listen(addr string) (*Listener, error) {
 	}
 
 	l := &Listener{
-		addr:   addr,
-		client: clientStack,
-		server: serverStack,
-		ln:     ln,
-		closed: make(chan struct{}),
+		addr:     addr,
+		client:   clientStack,
+		server:   serverStack,
+		ln:       ln,
+		closed:   make(chan struct{}),
+		acceptCh: make(chan acceptResult, 1),
 	}
 	regMu.Lock()
 	registry[addr] = l
 	regMu.Unlock()
+	go l.acceptLoop()
 	return l, nil
 }
 
@@ -172,25 +180,36 @@ func newStack(addr tcpip.Address, ep stack.LinkEndpoint) (*stack.Stack, error) {
 // Accept accepts one inbound gVisor TCP path and wraps it in rendr's
 // standard length-prefixed PathConn framing.
 func (l *Listener) Accept(ctx context.Context) (transport.PathConn, error) {
-	type result struct {
-		c   net.Conn
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		c, err := l.ln.Accept()
-		done <- result{c: c, err: err}
-	}()
 	select {
-	case r := <-done:
-		if r.err != nil {
-			return nil, r.err
-		}
-		return basetcp.Wrap(r.c), nil
+	case r := <-l.acceptCh:
+		return r.pc, r.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-l.closed:
 		return nil, net.ErrClosed
+	}
+}
+
+func (l *Listener) acceptLoop() {
+	for {
+		c, err := l.ln.Accept()
+		var r acceptResult
+		if err != nil {
+			r.err = err
+		} else {
+			r.pc = basetcp.Wrap(c)
+		}
+		select {
+		case l.acceptCh <- r:
+		case <-l.closed:
+			if r.pc != nil {
+				_ = r.pc.Close()
+			}
+			return
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -204,6 +223,7 @@ func (l *Listener) Close() error {
 		}
 		regMu.Unlock()
 		close(l.closed)
+		l.ln.Shutdown()
 		err = l.ln.Close()
 		l.client.Close()
 		l.server.Close()
