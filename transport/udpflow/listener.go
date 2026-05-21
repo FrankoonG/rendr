@@ -164,6 +164,10 @@ type ServerPathConn struct {
 	remote   *net.UDPAddr
 
 	inbox chan []byte
+	// inboxMu serializes sends with channel close. A dead-flag check
+	// alone is not enough for the race detector: Close can close inbox
+	// between deliver's dead check and send.
+	inboxMu sync.RWMutex
 
 	qualityMu sync.RWMutex
 	quality   transport.PathQuality
@@ -205,15 +209,12 @@ func (p *ServerPathConn) observe(src *net.UDPAddr) {
 // deliver pushes an inbound rendr-frame payload to the inbox. If
 // the inbox is full the datagram is dropped on the floor - opaque
 // UDP is best-effort, dedup belongs in the engine layer.
-//
-// dead-flag check + recover guards against the natural race where
-// the listener's readLoop is still calling deliver after Close has
-// closed the inbox channel.
 func (p *ServerPathConn) deliver(payload []byte) {
+	p.inboxMu.RLock()
+	defer p.inboxMu.RUnlock()
 	if p.dead.Load() {
 		return
 	}
-	defer func() { _ = recover() }()
 	select {
 	case p.inbox <- payload:
 	default:
@@ -278,7 +279,9 @@ func (p *ServerPathConn) Close() error {
 		return nil
 	}
 	// Drain inbox so any blocked Read sees a clean close.
+	p.inboxMu.Lock()
 	close(p.inbox)
+	p.inboxMu.Unlock()
 	return nil
 }
 
@@ -332,7 +335,9 @@ func (p *ServerPathConn) declareDeath(err error) {
 	fn := p.deathFn
 	p.deathFn = nil
 	p.deathMu.Unlock()
+	p.inboxMu.Lock()
 	close(p.inbox)
+	p.inboxMu.Unlock()
 	if fn != nil {
 		fn(transport.Classify(err, p.quiesced.Load(), p.byeSeen.Load()), err)
 	}
