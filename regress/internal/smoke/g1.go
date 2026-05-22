@@ -102,12 +102,6 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	payload := make([]byte, opts.Size)
-	for i := range payload {
-		payload[i] = byte(i*17 + 3)
-	}
-	hSent := sha256.Sum256(payload)
-
 	recvErr := make(chan error, 1)
 	hRecv := sha256.New()
 	go func() {
@@ -136,6 +130,8 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 	}
 
 	const chunk = int64(256 * 1024)
+	sendBuf := make([]byte, chunk)
+	hSent := sha256.New()
 	var written int64
 	var migIdx int
 	for written < opts.Size {
@@ -143,7 +139,8 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 		if end > opts.Size {
 			end = opts.Size
 		}
-		n, err := client.Write(payload[written:end])
+		fillG1Pattern(sendBuf[:end-written], written)
+		n, err := client.Write(sendBuf[:end-written])
 		if err != nil {
 			// Capture per-path state at the failure boundary so the
 			// regress report has something to bisect on. Particularly
@@ -161,6 +158,7 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 				fmt.Errorf("write at %d: %w | active=%d paths:%s",
 					written, err, admin.ActivePath(), pathDbg))
 		}
+		hSent.Write(sendBuf[:n])
 		written += int64(n)
 		for migIdx < len(migPts) && written >= migPts[migIdx] {
 			cur := admin.ActivePath()
@@ -184,7 +182,7 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 	}
 
 	elapsed := time.Since(t0)
-	sentHex := fmt.Sprintf("%x", hSent[:])
+	sentHex := fmt.Sprintf("%x", hSent.Sum(nil))
 	recvHex := fmt.Sprintf("%x", hRecv.Sum(nil))
 	migCount := admin.MigrationCount()
 
@@ -207,6 +205,12 @@ func RunG1(ctx context.Context, opts G1Opts) Result {
 		return r
 	}
 	return r
+}
+
+func fillG1Pattern(buf []byte, offset int64) {
+	for i := range buf {
+		buf[i] = byte((offset+int64(i))*17 + 3)
+	}
 }
 
 func listenForTransport(name string) (rendr.Listener, error) {
