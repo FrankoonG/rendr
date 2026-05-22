@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -33,6 +34,10 @@ import (
 // stays deliberately small and does not replace the high-rate G3
 // gates.
 func TestT3PacketSS2022UDPxUDPFlow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows loopback UDP port policy is flaky for this xray packet matrix; covered by Linux regress hosts")
+	}
+
 	ssPort := pickFreePort(t)
 	ssKey := randomSSKey(t)
 	const method = "2022-blake3-aes-128-gcm"

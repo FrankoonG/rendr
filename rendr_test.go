@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -4194,6 +4195,152 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 	}
 	if client.FlowID() != server.FlowID() {
 		t.Fatalf("flow_id mismatch: client=%x server=%x", client.FlowID(), server.FlowID())
+	}
+}
+
+// TestM2TCPPathDeathFailsOverToUDPBackedStream is the focused
+// regression for cross-carrier stream migration: a TCP-based stream
+// path carries the first part of a file transfer, then dies abruptly;
+// the same rendr Conn must continue losslessly over a QUIC stream path
+// (UDP-backed, but still reliable and ordered).
+func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
+	ln, err := Listen(
+		ListenSpec{Transport: "tcp", Address: "127.0.0.1:0"},
+		ListenSpec{Transport: "quic", Address: "127.0.0.1:0"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addrs := ln.Addrs()
+	if len(addrs) != 2 {
+		t.Fatalf("Addrs len=%d want 2", len(addrs))
+	}
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+	}()
+
+	client, err := (&Dialer{
+		Mode: ModePrime,
+		Paths: []PathSpec{
+			{Transport: "tcp", Address: addrs[0].String()},
+			{Transport: "quic", Address: addrs[1].String()},
+		},
+		MigrationBudget: 5 * time.Second,
+	}).Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	server := <-accepted
+	defer server.Close()
+	if !waitForNPaths(t, client, server, "quic", addrs[1].String(), 2, 5*time.Second) {
+		t.Fatalf("paths did not attach: client=%d server=%d", len(client.Paths()), len(server.Paths()))
+	}
+
+	admin := client.(AdminConn)
+	clientEngine := client.(*engineBackedConn)
+	var tcpPath, quicPath uint32
+	for _, p := range client.Paths() {
+		switch p.Spec.Transport {
+		case "tcp":
+			tcpPath = p.ID
+		case "quic":
+			quicPath = p.ID
+		}
+	}
+	if tcpPath == 0 || quicPath == 0 {
+		t.Fatalf("missing mixed paths: tcp=%d quic=%d paths=%+v", tcpPath, quicPath, client.Paths())
+	}
+	if admin.ActivePath() != tcpPath {
+		if err := admin.Migrate(tcpPath); err != nil {
+			t.Fatalf("prime tcp path: %v", err)
+		}
+	}
+
+	const size = 8 << 20
+	const chunk = 64 << 10
+	const killAt = 2 << 20
+	recvHash := sha256.New()
+	recvDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, chunk)
+		var got int64
+		for got < size {
+			n, err := server.Read(buf)
+			if err != nil {
+				recvDone <- err
+				return
+			}
+			recvHash.Write(buf[:n])
+			got += int64(n)
+		}
+		recvDone <- nil
+	}()
+
+	sendHash := sha256.New()
+	buf := make([]byte, chunk)
+	var sent int64
+	killed := false
+	startMig := admin.MigrationCount()
+	for sent < size {
+		n := int64(len(buf))
+		if rem := int64(size) - sent; rem < n {
+			n = rem
+		}
+		fillDeterministic(buf[:n], sent)
+		if _, err := client.Write(buf[:n]); err != nil {
+			t.Fatalf("write at %d after killed=%v active=%d: %v", sent, killed, admin.ActivePath(), err)
+		}
+		sendHash.Write(buf[:n])
+		sent += n
+		if !killed && sent >= killAt {
+			if err := clientEngine.ForceKillPathForTest(tcpPath); err != nil {
+				t.Fatalf("force-kill tcp path: %v", err)
+			}
+			killed = true
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && admin.ActivePath() != quicPath {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := admin.ActivePath(); got != quicPath {
+				t.Fatalf("active path after tcp death=%d, want quic path %d", got, quicPath)
+			}
+		}
+	}
+
+	select {
+	case err := <-recvDone:
+		if err != nil {
+			t.Fatalf("server read: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server read timed out")
+	}
+	if got, want := fmt.Sprintf("%x", recvHash.Sum(nil)), fmt.Sprintf("%x", sendHash.Sum(nil)); got != want {
+		t.Fatalf("hash mismatch after TCP->UDP-backed stream failover: got=%s want=%s", got, want)
+	}
+	if migs := admin.MigrationCount() - startMig; migs == 0 {
+		t.Fatal("TCP path death did not record a migration")
+	}
+	if client.FlowID() != server.FlowID() {
+		t.Fatalf("flow_id mismatch: client=%x server=%x", client.FlowID(), server.FlowID())
+	}
+}
+
+func fillDeterministic(buf []byte, offset int64) {
+	for i := range buf {
+		buf[i] = byte((offset+int64(i))*31 + 7)
 	}
 }
 
