@@ -19,6 +19,9 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root for TCP_REPAIR + iptables")
 	}
+	if raceDetectorEnabled {
+		t.Skip("TCP_REPAIR integration is timing-sensitive under -race; covered by T5")
+	}
 	if err := tcprepair.Available(); err != nil {
 		t.Skipf("tcprepair unavailable: %v", err)
 	}
