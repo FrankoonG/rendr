@@ -161,9 +161,9 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 		// because 100k pps × 1 KB ≈ 800 Mbps would be 16× over the
 		// 50 Mbps baseline — that's a bandwidth saturation test, not a
 		// throughput test.
-		run("G3-T4", 3*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
+		run("G3-T4", 8*time.Minute, chaos.Profile{}, func(c context.Context) smoke.Result {
 			return smoke.RunG3(c, smoke.G3Opts{
-				Duration:   30 * time.Second,
+				Duration:   5 * time.Minute,
 				PPS:        100_000,
 				PayloadLen: 1024,
 				Migrations: 10,
