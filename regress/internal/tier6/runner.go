@@ -40,7 +40,10 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		return runRootTargetGraphTests(c, rendrRoot, "T6.graph.compat-mode", "TestTargetConstructors|TestLegacy|TestDialerCompile|TestDialerRoot")
 	})
 	run("T6.peak.A-to-bulk-bond", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.A-to-bulk-bond", "TestSelectorPeakTransfer")
+		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.A-to-bulk-bond", "^TestSelectorPeakTransferRuntimePromotesToBond$")
+	})
+	run("T6.peak.nested-normal-to-C", 2*time.Minute, func(c context.Context) report.Case {
+		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.nested-normal-to-C", "^TestSelectorPeakTransferNormalSelectorUsesQuality$")
 	})
 }
 

@@ -272,6 +272,85 @@ func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
 	}
 }
 
+func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Selector("normal", []Target{
+				Path("A", spec("A")),
+				Path("B", spec("B")),
+			}),
+			Path("C", spec("C")),
+		},
+		PeakTransfer{
+			Targets:         []string{"C"},
+			SaturationFor:   10 * time.Second,
+			SaturationRatio: 0.99,
+		},
+	)
+	client, err := (&Dialer{
+		Root:       root,
+		Hysteresis: 0.05,
+		Dwell:      100 * time.Millisecond,
+		Cooldown:   100 * time.Millisecond,
+	}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	ids := idsByName(client.Paths())
+	if ids["A"] == 0 || ids["B"] == 0 || ids["C"] == 0 {
+		t.Fatalf("idsByName=%v", ids)
+	}
+	ebc := client.(*engineBackedConn)
+	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 250 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 50 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["C"], PathQuality{RTT: 1 * time.Millisecond, At: time.Now()})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.(AdminConn).ActivePath() == ids["B"] {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("active path=%d want B=%d; peak C=%d must stay out of normal quality selector",
+		client.(AdminConn).ActivePath(), ids["B"], ids["C"])
+}
+
 func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
@@ -291,6 +370,14 @@ func writesByName(paths []PathInfo) map[string]uint64 {
 	out := make(map[string]uint64, len(paths))
 	for _, p := range paths {
 		out[p.Spec.Opts["name"]] = p.Writes
+	}
+	return out
+}
+
+func idsByName(paths []PathInfo) map[string]uint32 {
+	out := make(map[string]uint32, len(paths))
+	for _, p := range paths {
+		out[p.Spec.Opts["name"]] = p.ID
 	}
 	return out
 }

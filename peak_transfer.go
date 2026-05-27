@@ -70,6 +70,7 @@ func (c *peakTransferController) start() {
 		return
 	}
 	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "selector")
+	c.e.StartPrime(nil, 0)
 	go c.loop()
 }
 

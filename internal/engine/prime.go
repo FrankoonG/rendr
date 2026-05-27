@@ -99,12 +99,18 @@ func (p *prime) loop(e *Engine, tick time.Duration) {
 
 // evaluate runs one tick of the scheduler.
 func (p *prime) evaluate(e *Engine) {
+	if e.mode.Load() != dispatchPrime {
+		return
+	}
 	now := nowFn()
 
 	e.pathsMu.RLock()
 	current := e.activeID
 	candidates := make(map[uint32]transport.PathQuality, len(e.paths))
 	for id, s := range e.paths {
+		if !e.dispatchScopeAllowsLocked(id) {
+			continue
+		}
 		candidates[id] = s.conn.Quality()
 	}
 	e.pathsMu.RUnlock()
