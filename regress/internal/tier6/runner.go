@@ -45,6 +45,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T6.peak.nested-normal-to-C", 2*time.Minute, func(c context.Context) report.Case {
 		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.nested-normal-to-C", "^TestSelectorPeakTransferNormalSelectorUsesQuality$")
 	})
+	run("T6.failover.hot-standby", 2*time.Minute, func(c context.Context) report.Case {
+		return runRootTargetGraphTests(c, rendrRoot, "T6.failover.hot-standby", "^TestSelectorHotStandbyFailover$")
+	})
 }
 
 func caseMatches(filter, name string) bool {

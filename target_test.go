@@ -351,6 +351,90 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 		client.(AdminConn).ActivePath(), ids["B"], ids["C"])
 }
 
+func TestSelectorHotStandbyFailover(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root", []Target{
+		Path("A", spec("A")),
+		Path("B", spec("B")),
+	})
+	client, err := (&Dialer{
+		Root:       root,
+		Hysteresis: 0.05,
+		Dwell:      100 * time.Millisecond,
+		Cooldown:   100 * time.Millisecond,
+	}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	ids := idsByName(client.Paths())
+	if ids["A"] == 0 || ids["B"] == 0 {
+		t.Fatalf("idsByName=%v", ids)
+	}
+	ebc := client.(*engineBackedConn)
+	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 30 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 50 * time.Millisecond, At: time.Now()})
+	if got := client.(AdminConn).ActivePath(); got != ids["A"] {
+		t.Fatalf("initial active=%d want A=%d", got, ids["A"])
+	}
+	if err := ebc.ForceKillPathForTest(ids["A"]); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.(AdminConn).ActivePath() == ids["B"] {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := client.(AdminConn).ActivePath(); got != ids["B"] {
+		t.Fatalf("active after A death=%d want B=%d", got, ids["B"])
+	}
+	if _, err := client.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "ok" {
+		t.Fatalf("payload=%q", string(buf))
+	}
+}
+
 func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)

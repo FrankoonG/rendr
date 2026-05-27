@@ -18,4 +18,7 @@ func TestCaseMatches(t *testing.T) {
 	if !caseMatches("T6.peak.nested-normal-to-C", "T6.peak.nested-normal-to-C") {
 		t.Fatal("nested normal case should match")
 	}
+	if !caseMatches("T6.failover.hot-standby", "T6.failover.hot-standby") {
+		t.Fatal("hot standby case should match")
+	}
 }
