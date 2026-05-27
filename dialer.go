@@ -90,10 +90,11 @@ type Dialer struct {
 // active path, the remainder are attached but kept idle until a
 // migration trigger fires.
 func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
-	mode, paths, peakTransfer, err := d.compileDialPlan()
+	plan, err := d.compileDialPlan()
 	if err != nil {
 		return nil, err
 	}
+	mode, paths := plan.mode, plan.paths
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
@@ -116,11 +117,13 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if _, err := e.AttachPath(pc, first); err != nil {
+	firstID, err := e.AttachPath(pc, first)
+	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
 	}
+	pathIDs := []uint32{firstID}
 
 	// Attach any additional paths as bridge-tagged add-ons. They sit
 	// idle until Migrate switches to them or the active path dies.
@@ -135,10 +138,12 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 			_ = spc.Close()
 			continue
 		}
-		if _, err := e.AttachPath(spc, ps); err != nil {
+		id, err := e.AttachPath(spc, ps)
+		if err != nil {
 			_ = spc.Close()
 			continue
 		}
+		pathIDs = append(pathIDs, id)
 	}
 
 	c := &engine.Conn{
@@ -152,7 +157,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	// attached. CLAUDE.md hard rule #3 keeps active migration
 	// triggers opt-in; here it is opt-in because the embedder
 	// explicitly chose Mode == ModePrime.
-	if mode == ModePrime && !peakTransfer {
+	if plan.peakTransfer {
+		bc.startPeakTransfer(plan, pathIDs)
+	} else if mode == ModePrime {
 		e.StartPrime(nil, 0)
 	}
 	return bc, nil
@@ -168,10 +175,11 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 // identically to packet-mode connections; the underlying engine and
 // path machinery are the same.
 func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
-	mode, paths, peakTransfer, err := d.compileDialPlan()
+	plan, err := d.compileDialPlan()
 	if err != nil {
 		return nil, err
 	}
+	mode, paths := plan.mode, plan.paths
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
@@ -194,11 +202,13 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if _, err := e.AttachPath(pc, first); err != nil {
+	firstID, err := e.AttachPath(pc, first)
+	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
 	}
+	pathIDs := []uint32{firstID}
 
 	for _, ps := range paths[1:] {
 		spc, err := d.dialPathWithFactories(ctx, ps)
@@ -209,32 +219,36 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 			_ = spc.Close()
 			continue
 		}
-		if _, err := e.AttachPath(spc, ps); err != nil {
+		id, err := e.AttachPath(spc, ps)
+		if err != nil {
 			_ = spc.Close()
 			continue
 		}
+		pathIDs = append(pathIDs, id)
 	}
 
 	lAddr := addrFromString("rendr-client")
 	rAddr := addrFromString(first.Address)
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
 
-	if mode == ModePrime && !peakTransfer {
+	if plan.peakTransfer {
+		bc.startPeakTransfer(plan, pathIDs)
+	} else if mode == ModePrime {
 		e.StartPrime(nil, 0)
 	}
 	return bc, nil
 }
 
-func (d *Dialer) compileDialPlan() (Mode, []PathSpec, bool, error) {
+func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 	if d.Root != nil {
 		ct, err := compileTargetForDial(d.Root)
 		if err != nil {
-			return 0, nil, false, err
+			return compiledTarget{}, err
 		}
-		return ct.mode, ct.paths, ct.peakTransfer, nil
+		return ct, nil
 	}
 	if len(d.Paths) == 0 {
-		return 0, nil, false, errNoPaths
+		return compiledTarget{}, errNoPaths
 	}
 	mode := d.Mode
 	if !mode.Valid() {
@@ -242,9 +256,9 @@ func (d *Dialer) compileDialPlan() (Mode, []PathSpec, bool, error) {
 	}
 	ct, err := compileTargetForDial(legacyRootTarget(mode, d.Paths))
 	if err != nil {
-		return 0, nil, false, err
+		return compiledTarget{}, err
 	}
-	return ct.mode, ct.paths, ct.peakTransfer, nil
+	return ct, nil
 }
 
 // engineLimits packs the Dialer-side knobs into engine.Limits. The

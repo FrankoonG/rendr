@@ -73,6 +73,9 @@ type Engine struct {
 	nextPathID  uint32
 	nextPathGen uint64
 	activeID    uint32
+	// dispatchScope optionally limits race/bond dispatch and death
+	// failover to a policy-selected target group. nil means all paths.
+	dispatchScope map[uint32]bool
 
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
@@ -422,6 +425,7 @@ func (e *Engine) Migrate(id uint32) error {
 	}
 	oldID := e.activeID
 	e.activeID = id
+	e.dispatchScope = nil
 	e.migrationCount++
 	e.setState(BridgeActive)
 
@@ -479,11 +483,69 @@ const (
 // engineBackedConn wrapper after the application-level SetMode
 // validates the transition.
 func (e *Engine) SetMode(mode uint32) {
+	e.pathsMu.Lock()
+	e.dispatchScope = nil
+	e.pathsMu.Unlock()
 	e.mode.Store(mode)
 }
 
 // Mode returns the current dispatcher mode.
 func (e *Engine) Mode() uint32 { return e.mode.Load() }
+
+// SetDispatchPolicy updates the sender's mode and optionally limits
+// dispatch to a policy-selected path group. It is used by the policy
+// graph layer for selector -> bond/race target changes.
+func (e *Engine) SetDispatchPolicy(mode uint32, active uint32, scope []uint32, cause string) error {
+	if mode != dispatchPrime && mode != dispatchBond && mode != dispatchRace {
+		mode = dispatchPrime
+	}
+	e.pathsMu.Lock()
+	if len(scope) > 0 {
+		for _, id := range scope {
+			if _, ok := e.paths[id]; !ok {
+				e.pathsMu.Unlock()
+				return fmt.Errorf("engine: policy references unknown path %d", id)
+			}
+		}
+	}
+	if active != 0 {
+		if _, ok := e.paths[active]; !ok {
+			e.pathsMu.Unlock()
+			return fmt.Errorf("engine: policy activates unknown path %d", active)
+		}
+	}
+	oldID := e.activeID
+	if active == 0 {
+		active = e.pickAnyActiveFromScopeLocked(scope)
+	}
+	if active != 0 {
+		e.activeID = active
+		e.setState(BridgeActive)
+	}
+	if len(scope) == 0 {
+		e.dispatchScope = nil
+	} else {
+		next := make(map[uint32]bool, len(scope))
+		for _, id := range scope {
+			next[id] = true
+		}
+		e.dispatchScope = next
+	}
+	changed := oldID != e.activeID && e.activeID != 0
+	if changed {
+		e.migrationCount++
+	}
+	e.mode.Store(mode)
+	newID := e.activeID
+	e.pathsMu.Unlock()
+	if changed {
+		if cause == "" {
+			cause = "policy"
+		}
+		e.fireMigrateHooks(oldID, newID, cause)
+	}
+	return nil
+}
 
 // SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
 // returns a timeout error (net.Error with Timeout()==true). The zero

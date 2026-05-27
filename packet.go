@@ -24,6 +24,7 @@ import (
 type enginePacketConn struct {
 	e    *engine.Engine
 	mode atomic.Uint32
+	peak *peakTransferController
 
 	lAddr   net.Addr
 	rAddr   net.Addr
@@ -52,10 +53,16 @@ func (c *enginePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if err := c.e.SendPacket(p); err != nil {
 		return 0, err
 	}
+	if c.peak != nil {
+		c.peak.observeWrite(len(p))
+	}
 	return len(p), nil
 }
 
 func (c *enginePacketConn) Close() error {
+	if c.peak != nil {
+		c.peak.stopLoop()
+	}
 	if !c.closing.Swap(true) && !c.e.IsClosed() {
 		_ = c.e.SendBye(proto.ByeNormal)
 	}
@@ -95,16 +102,23 @@ func (c *enginePacketConn) SetMode(m Mode) error {
 	return nil
 }
 
+func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
+	c.peak = newPeakTransferController(c.e, func(m Mode) {
+		c.mode.Store(uint32(m))
+	}, plan, pathIDs)
+	c.peak.start()
+}
+
 // Admin-style methods on enginePacketConn mirror the AdminConn
 // surface on stream-mode connections. Applications that need them
 // type-assert to AdminPacketConn (or its individual interfaces).
-func (c *enginePacketConn) Migrate(id uint32) error    { return c.e.Migrate(id) }
-func (c *enginePacketConn) ActivePath() uint32         { return c.e.ActivePath() }
-func (c *enginePacketConn) State() string              { return c.e.State().String() }
-func (c *enginePacketConn) RecvQueueHWM() int          { return c.e.RecvQueueHighWaterMark() }
-func (c *enginePacketConn) RecvDups() uint64           { return c.e.RecvDups() }
-func (c *enginePacketConn) BondStuckSkips() uint64     { return c.e.BondStuckSkips() }
-func (c *enginePacketConn) MigrationCount() uint64     { return c.e.MigrationCount() }
+func (c *enginePacketConn) Migrate(id uint32) error { return c.e.Migrate(id) }
+func (c *enginePacketConn) ActivePath() uint32      { return c.e.ActivePath() }
+func (c *enginePacketConn) State() string           { return c.e.State().String() }
+func (c *enginePacketConn) RecvQueueHWM() int       { return c.e.RecvQueueHighWaterMark() }
+func (c *enginePacketConn) RecvDups() uint64        { return c.e.RecvDups() }
+func (c *enginePacketConn) BondStuckSkips() uint64  { return c.e.BondStuckSkips() }
+func (c *enginePacketConn) MigrationCount() uint64  { return c.e.MigrationCount() }
 
 // ForceKillPathForTest mirrors engineBackedConn's backdoor for the
 // packet-mode side: external test harnesses duck-type-assert on

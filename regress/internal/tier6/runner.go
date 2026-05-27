@@ -37,7 +37,10 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	}()
 
 	run("T6.graph.compat-mode", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot)
+		return runRootTargetGraphTests(c, rendrRoot, "T6.graph.compat-mode", "TestTargetConstructors|TestLegacy|TestDialerCompile|TestDialerRoot")
+	})
+	run("T6.peak.A-to-bulk-bond", 2*time.Minute, func(c context.Context) report.Case {
+		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.A-to-bulk-bond", "TestSelectorPeakTransfer")
 	})
 }
 
@@ -76,8 +79,7 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	suite.Add(rc)
 }
 
-func runRootTargetGraphTests(ctx context.Context, rendrRoot string) report.Case {
-	const name = "T6.graph.compat-mode"
+func runRootTargetGraphTests(ctx context.Context, rendrRoot, name, pattern string) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T6", Failure: "bad rendr root: " + err.Error()}
 	}
@@ -87,7 +89,7 @@ func runRootTargetGraphTests(ctx context.Context, rendrRoot string) report.Case 
 		"test",
 		".",
 		"-run",
-		"TestTarget|TestLegacy|TestDialerCompile|TestDialerRoot",
+		pattern,
 		"-count=1",
 	)
 	cmd.Dir = rendrRoot

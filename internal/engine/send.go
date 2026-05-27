@@ -212,7 +212,17 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		// Stable order so round-robin is deterministic across paths.
 		ids := make([]uint32, 0, len(e.paths))
 		for id := range e.paths {
+			if !e.dispatchScopeAllowsLocked(id) {
+				continue
+			}
 			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			e.pathsMu.Unlock()
+			if err := e.waitForPath(); err != nil {
+				return err
+			}
+			continue
 		}
 		for i := 1; i < len(ids); i++ {
 			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
@@ -311,7 +321,14 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 		}
 		ids := make([]uint32, 0, len(e.paths))
 		for id := range e.paths {
+			if !e.dispatchScopeAllowsLocked(id) {
+				continue
+			}
 			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			e.pathsMu.Unlock()
+			return net.ErrClosed
 		}
 		for i := 1; i < len(ids); i++ {
 			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
@@ -418,6 +435,9 @@ func (e *Engine) dispatchRace(frame []byte) error {
 		e.pathsMu.RLock()
 		slots := make([]*pathSlot, 0, len(e.paths))
 		for _, s := range e.paths {
+			if !e.dispatchScopeAllowsLocked(s.id) {
+				continue
+			}
 			slots = append(slots, s)
 		}
 		e.pathsMu.RUnlock()
@@ -442,4 +462,8 @@ func (e *Engine) dispatchRace(frame []byte) error {
 		}
 		// All paths failed. Loop and let waitForPath enforce budget.
 	}
+}
+
+func (e *Engine) dispatchScopeAllowsLocked(id uint32) bool {
+	return len(e.dispatchScope) == 0 || e.dispatchScope[id]
 }

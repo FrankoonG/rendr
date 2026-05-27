@@ -12,4 +12,7 @@ func TestCaseMatches(t *testing.T) {
 	if caseMatches("T6.peak.A-to-bulk-bond", "T6.graph.compat-mode") {
 		t.Fatal("different case should not match")
 	}
+	if !caseMatches("T6.peak.A-to-bulk-bond", "T6.peak.A-to-bulk-bond") {
+		t.Fatal("peak transfer case should match")
+	}
 }

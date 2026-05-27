@@ -19,6 +19,7 @@ type engineBackedConn struct {
 
 	mode    atomic.Uint32 // Mode
 	closing atomic.Bool   // local-Close in flight; gates BYE send
+	peak    *peakTransferController
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -28,8 +29,14 @@ func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBac
 	return bc
 }
 
-func (c *engineBackedConn) Read(p []byte) (int, error)  { return c.conn.Read(p) }
-func (c *engineBackedConn) Write(p []byte) (int, error) { return c.conn.Write(p) }
+func (c *engineBackedConn) Read(p []byte) (int, error) { return c.conn.Read(p) }
+func (c *engineBackedConn) Write(p []byte) (int, error) {
+	n, err := c.conn.Write(p)
+	if n > 0 && c.peak != nil {
+		c.peak.observeWrite(n)
+	}
+	return n, err
+}
 
 // Close sends a CTRL_BYE on the active path so the peer surfaces a
 // clean io.EOF rather than tripping its migration machinery, then
@@ -37,6 +44,9 @@ func (c *engineBackedConn) Write(p []byte) (int, error) { return c.conn.Write(p)
 // path is already dead the peer will see ordinary transport silence
 // up to its migration budget.
 func (c *engineBackedConn) Close() error {
+	if c.peak != nil {
+		c.peak.stopLoop()
+	}
 	if !c.closing.Swap(true) && !c.e.IsClosed() {
 		_ = c.e.SendBye(proto.ByeNormal)
 		c.e.QuiesceActivePath()
@@ -79,6 +89,13 @@ func (c *engineBackedConn) SetMode(m Mode) error {
 	c.mode.Store(uint32(m))
 	c.e.SetMode(uint32(m))
 	return nil
+}
+
+func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
+	c.peak = newPeakTransferController(c.e, func(m Mode) {
+		c.mode.Store(uint32(m))
+	}, plan, pathIDs)
+	c.peak.start()
 }
 
 // Engine returns the underlying engine for in-package tests and the

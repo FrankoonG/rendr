@@ -141,6 +141,35 @@ func (e *Engine) recordMigration() {
 // pickAnyActive returns any remaining path id, or 0 if none.
 // Caller must hold pathsMu.
 func (e *Engine) pickAnyActive() uint32 {
+	if id := e.pickAnyActiveFromScopeLocked(nil); id != 0 {
+		return id
+	}
+	// If the selected policy group is exhausted but other paths remain,
+	// fall back immediately. Death failover must never wait for dwell or
+	// policy cooldown.
+	for id := range e.paths {
+		return id
+	}
+	return 0
+}
+
+func (e *Engine) pickAnyActiveFromScopeLocked(scope []uint32) uint32 {
+	if len(scope) > 0 {
+		for _, id := range scope {
+			if _, ok := e.paths[id]; ok {
+				return id
+			}
+		}
+		return 0
+	}
+	if len(e.dispatchScope) > 0 {
+		for id := range e.dispatchScope {
+			if _, ok := e.paths[id]; ok {
+				return id
+			}
+		}
+		return 0
+	}
 	for id := range e.paths {
 		return id
 	}

@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 )
@@ -61,6 +62,12 @@ func TestSelectorPeakTransferOrdersPeakTargetsLast(t *testing.T) {
 	if !ct.runtimeNested {
 		t.Fatal("runtimeNested=false for child bond")
 	}
+	if ct.peakMode != ModeBond {
+		t.Fatalf("peakMode=%v want %v", ct.peakMode, ModeBond)
+	}
+	if got := ct.pathPeak; len(got) != 3 || got[0] || !got[1] || !got[2] {
+		t.Fatalf("pathPeak=%v want [false true true]", got)
+	}
 	got := []string{ct.paths[0].Address, ct.paths[1].Address, ct.paths[2].Address}
 	want := []string{"a", "b", "c"}
 	for i := range want {
@@ -104,18 +111,18 @@ func TestDialerCompileDialPlanUsesRoot(t *testing.T) {
 			Path("root-path", PathSpec{Transport: "tcp", Address: "root"}),
 		}),
 	}
-	mode, paths, peak, err := d.compileDialPlan()
+	plan, err := d.compileDialPlan()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mode != ModePrime {
-		t.Fatalf("mode=%v want %v", mode, ModePrime)
+	if plan.mode != ModePrime {
+		t.Fatalf("mode=%v want %v", plan.mode, ModePrime)
 	}
-	if peak {
+	if plan.peakTransfer {
 		t.Fatal("peak=true")
 	}
-	if len(paths) != 1 || paths[0].Address != "root" {
-		t.Fatalf("paths=%+v; root should take precedence over legacy Paths", paths)
+	if len(plan.paths) != 1 || plan.paths[0].Address != "root" {
+		t.Fatalf("paths=%+v; root should take precedence over legacy Paths", plan.paths)
 	}
 }
 
@@ -173,4 +180,117 @@ func TestDialerRootSelectorDialSmoke(t *testing.T) {
 	if string(buf) != "ok" {
 		t.Fatalf("payload=%q", string(buf))
 	}
+}
+
+func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Path("A", spec("A")),
+			Bond("bulk", []Target{
+				Path("B", spec("B")),
+				Path("C", spec("C")),
+			}),
+		},
+		PeakTransfer{
+			Targets:         []string{"bulk"},
+			SaturationFor:   200 * time.Millisecond,
+			ReturnFor:       200 * time.Millisecond,
+			SaturationRatio: 0.8,
+			ReturnRatio:     0.2,
+		},
+	)
+	client, err := (&Dialer{Root: root}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+	drainDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, server)
+		close(drainDone)
+	}()
+
+	chunk := make([]byte, 32<<10)
+	for i := 0; i < 32; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitForMode(t, client, ModeBond, 3*time.Second)
+
+	before := writesByName(client.Paths())
+	for i := 0; i < 24; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := writesByName(client.Paths())
+	if after["B"] <= before["B"] || after["C"] <= before["C"] {
+		t.Fatalf("peak bond did not dispatch on both peak paths: before=%v after=%v", before, after)
+	}
+
+	waitForMode(t, client, ModePrime, 3*time.Second)
+	_ = client.Close()
+	select {
+	case <-drainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server drain did not finish")
+	}
+}
+
+func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if m, ok := c.(interface{ Mode() Mode }); ok && m.Mode() == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if m, ok := c.(interface{ Mode() Mode }); ok {
+		t.Fatalf("mode=%v want %v", m.Mode(), want)
+	}
+	t.Fatalf("connection does not expose Mode(); want %v", want)
+}
+
+func writesByName(paths []PathInfo) map[string]uint64 {
+	out := make(map[string]uint64, len(paths))
+	for _, p := range paths {
+		out[p.Spec.Opts["name"]] = p.Writes
+	}
+	return out
 }

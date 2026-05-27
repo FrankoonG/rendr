@@ -124,7 +124,10 @@ func (p PeakTransfer) applySelector(g *GroupTarget) {
 type compiledTarget struct {
 	mode          Mode
 	paths         []PathSpec
+	pathPeak      []bool
 	peakTransfer  bool
+	peakMode      Mode
+	peakOptions   PeakTransfer
 	runtimeNested bool
 }
 
@@ -161,12 +164,12 @@ func compileTargetForDial(root Target) (compiledTarget, error) {
 func compileTargetNode(t Target, root bool) (compiledTarget, error) {
 	switch v := t.(type) {
 	case PathTarget:
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}}, nil
+		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}, pathPeak: []bool{false}}, nil
 	case *PathTarget:
 		if v == nil {
 			return compiledTarget{}, errNilTarget
 		}
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}}, nil
+		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}, pathPeak: []bool{false}}, nil
 	case GroupTarget:
 		return compileGroupTarget(v, root)
 	case *GroupTarget:
@@ -195,6 +198,10 @@ func compileGroupTarget(g GroupTarget, root bool) (compiledTarget, error) {
 		return compiledTarget{}, fmt.Errorf("rendr: unknown target kind %q", g.Kind)
 	}
 	out.peakTransfer = g.Peak != nil
+	if g.Peak != nil {
+		out.peakOptions = *g.Peak
+		out.peakOptions.Targets = append([]string(nil), g.Peak.Targets...)
+	}
 	peakSet := map[string]bool{}
 	if g.Peak != nil {
 		for _, name := range g.Peak.Targets {
@@ -202,6 +209,7 @@ func compileGroupTarget(g GroupTarget, root bool) (compiledTarget, error) {
 		}
 	}
 	for _, child := range orderedChildren(g.Children, peakSet) {
+		childPeak := child != nil && peakSet[child.Name()]
 		ct, err := compileTargetNode(child, false)
 		if err != nil {
 			return compiledTarget{}, err
@@ -210,11 +218,26 @@ func compileGroupTarget(g GroupTarget, root bool) (compiledTarget, error) {
 			out.runtimeNested = true
 		}
 		out.paths = append(out.paths, ct.paths...)
+		for _, peak := range ct.pathPeak {
+			out.pathPeak = append(out.pathPeak, peak || childPeak)
+		}
 		out.peakTransfer = out.peakTransfer || ct.peakTransfer
+		if childPeak && out.peakMode == 0 {
+			out.peakMode = ct.mode
+		}
+		if out.peakMode == 0 && ct.peakMode != 0 {
+			out.peakMode = ct.peakMode
+		}
 		out.runtimeNested = out.runtimeNested || ct.runtimeNested
 	}
 	if len(out.paths) == 0 {
 		return compiledTarget{}, errEmptyGroupTarget
+	}
+	if len(out.pathPeak) != len(out.paths) {
+		out.pathPeak = make([]bool, len(out.paths))
+	}
+	if out.peakTransfer && out.peakMode == 0 {
+		out.peakMode = ModePrime
 	}
 	return out, nil
 }
