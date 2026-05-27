@@ -20,6 +20,12 @@ import (
 // feeds candidate PathSpecs. Use AddPath / RemovePath on the
 // returned AdminConn to mutate the path set after dial.
 type Dialer struct {
+	// Root is the v0.4 policy graph entry point. When set, it replaces
+	// Mode+Paths for the initial dial. Selector/Race/Bond all compile
+	// down to the current engine mode layer until the full nested runtime
+	// policy executor lands.
+	Root Target
+
 	// Mode is the initial operational mode.
 	Mode Mode
 
@@ -84,12 +90,12 @@ type Dialer struct {
 // active path, the remainder are attached but kept idle until a
 // migration trigger fires.
 func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
-	if len(d.Paths) == 0 {
-		return nil, errNoPaths
+	mode, paths, peakTransfer, err := d.compileDialPlan()
+	if err != nil {
+		return nil, err
 	}
-	mode := d.Mode
-	if !mode.Valid() {
-		mode = ModePrime
+	if len(paths) == 0 {
+		return nil, errNoPaths
 	}
 
 	flowID := engine.NewClientFlowID()
@@ -99,7 +105,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	}
 
 	// Dial the first path and run HELLO.
-	first := d.Paths[0]
+	first := paths[0]
 	pc, err := d.dialPathWithFactories(ctx, first)
 	if err != nil {
 		_ = e.Close()
@@ -118,7 +124,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 
 	// Attach any additional paths as bridge-tagged add-ons. They sit
 	// idle until Migrate switches to them or the active path dies.
-	for _, ps := range d.Paths[1:] {
+	for _, ps := range paths[1:] {
 		spc, err := d.dialPathWithFactories(ctx, ps)
 		if err != nil {
 			// One bad extra path is not fatal for the Conn; warn
@@ -146,7 +152,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	// attached. CLAUDE.md hard rule #3 keeps active migration
 	// triggers opt-in; here it is opt-in because the embedder
 	// explicitly chose Mode == ModePrime.
-	if mode == ModePrime {
+	if mode == ModePrime && !peakTransfer {
 		e.StartPrime(nil, 0)
 	}
 	return bc, nil
@@ -162,12 +168,12 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 // identically to packet-mode connections; the underlying engine and
 // path machinery are the same.
 func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
-	if len(d.Paths) == 0 {
-		return nil, errNoPaths
+	mode, paths, peakTransfer, err := d.compileDialPlan()
+	if err != nil {
+		return nil, err
 	}
-	mode := d.Mode
-	if !mode.Valid() {
-		mode = ModePrime
+	if len(paths) == 0 {
+		return nil, errNoPaths
 	}
 
 	flowID := engine.NewClientFlowID()
@@ -177,7 +183,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first := d.Paths[0]
+	first := paths[0]
 	pc, err := d.dialPathWithFactories(ctx, first)
 	if err != nil {
 		_ = e.Close()
@@ -194,7 +200,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		return nil, err
 	}
 
-	for _, ps := range d.Paths[1:] {
+	for _, ps := range paths[1:] {
 		spc, err := d.dialPathWithFactories(ctx, ps)
 		if err != nil {
 			continue
@@ -213,10 +219,32 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	rAddr := addrFromString(first.Address)
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
 
-	if mode == ModePrime {
+	if mode == ModePrime && !peakTransfer {
 		e.StartPrime(nil, 0)
 	}
 	return bc, nil
+}
+
+func (d *Dialer) compileDialPlan() (Mode, []PathSpec, bool, error) {
+	if d.Root != nil {
+		ct, err := compileTargetForDial(d.Root)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		return ct.mode, ct.paths, ct.peakTransfer, nil
+	}
+	if len(d.Paths) == 0 {
+		return 0, nil, false, errNoPaths
+	}
+	mode := d.Mode
+	if !mode.Valid() {
+		mode = ModePrime
+	}
+	ct, err := compileTargetForDial(legacyRootTarget(mode, d.Paths))
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return ct.mode, ct.paths, ct.peakTransfer, nil
 }
 
 // engineLimits packs the Dialer-side knobs into engine.Limits. The
