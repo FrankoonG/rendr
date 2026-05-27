@@ -193,7 +193,9 @@ func (c *peakTransferController) peakHealthy() bool {
 	const (
 		maxLossPP = 50 // 5%
 		maxJitter = 200 * time.Millisecond
+		maxAge    = 5 * time.Second
 	)
+	now := time.Now()
 	stats := c.e.Paths()
 	peak := make(map[uint32]bool, len(c.peakIDs))
 	for _, id := range c.peakIDs {
@@ -209,6 +211,9 @@ func (c *peakTransferController) peakHealthy() bool {
 			return true
 		}
 		seenMeasured = true
+		if !q.At.IsZero() && now.Sub(q.At) > maxAge {
+			continue
+		}
 		if q.LossPP <= maxLossPP && q.Jitter <= maxJitter {
 			return true
 		}
