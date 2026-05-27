@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,8 +12,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 )
 
@@ -63,6 +66,8 @@ type config struct {
 	trickleDur     time.Duration
 	trickleBurst   int64
 	trickleEvery   time.Duration
+	liveSize       int64
+	livePromotePct float64
 	timeout        time.Duration
 	jsonl          bool
 }
@@ -80,6 +85,13 @@ type result struct {
 	ElapsedMS      int64   `json:"elapsed_ms"`
 	AppBytes       int64   `json:"app_bytes"`
 	ProbeBytes     int64   `json:"probe_bytes"`
+	AppThroughput  float64 `json:"app_throughput_mib_s,omitempty"`
+	SHA256Match    bool    `json:"app_sha256_match,omitempty"`
+	Migrations     uint64  `json:"app_migrations,omitempty"`
+	RecvGapP50MS   int64   `json:"app_recv_gap_p50_ms,omitempty"`
+	RecvGapP95MS   int64   `json:"app_recv_gap_p95_ms,omitempty"`
+	RecvGapP99MS   int64   `json:"app_recv_gap_p99_ms,omitempty"`
+	MaxRecvGapMS   int64   `json:"app_recv_gap_max_ms,omitempty"`
 	SelectedTarget string  `json:"selected_target,omitempty"`
 	Promoted       bool    `json:"promoted,omitempty"`
 	FalsePromotion bool    `json:"false_promotion,omitempty"`
@@ -99,7 +111,7 @@ type sample struct {
 
 func main() {
 	var (
-		cases           = flag.String("case", "cp1,cp2", "comma-separated cases: cp1,cp2,cp3,cp4,cp5,cp6,cp7,all")
+		cases           = flag.String("case", "cp1,cp2", "comma-separated cases: cp1,cp2,cp3,cp4,cp5,cp6,cp7,cp3live,all")
 		estimators      = flag.String("estimators", "passive,bounded,adaptive,trickle,calibration", "comma-separated estimators")
 		profileNames    = flag.String("profiles", "A-lowlat-5M,B-bulk-50M,C-bulk-50M,B-evening,C-evening,bad-candidate", "comma-separated profile names")
 		repeats         = flag.Int("repeats", 1, "repeats per case/profile/estimator")
@@ -113,6 +125,8 @@ func main() {
 		trickleDur      = flag.Duration("trickle-duration", 5*time.Second, "total trickle estimator duration")
 		trickleBurstKiB = flag.Int64("trickle-burst-kib", 256, "bytes per trickle sample in KiB")
 		trickleEvery    = flag.Duration("trickle-every", 750*time.Millisecond, "delay between trickle samples")
+		liveSizeMiB     = flag.Int64("live-size-mib", 64, "CP3 live payload size in MiB")
+		livePromotePct  = flag.Float64("live-promote-pct", 30, "CP3 live percentage of bytes after which a positive selector decision migrates")
 		timeout         = flag.Duration("timeout", 2*time.Minute, "timeout per profile")
 		jsonl           = flag.Bool("jsonl", true, "print one JSON object per run")
 	)
@@ -131,6 +145,8 @@ func main() {
 		trickleDur:     *trickleDur,
 		trickleBurst:   *trickleBurstKiB << 10,
 		trickleEvery:   *trickleEvery,
+		liveSize:       *liveSizeMiB << 20,
+		livePromotePct: *livePromotePct / 100,
 		timeout:        *timeout,
 		jsonl:          *jsonl,
 	}, *profileNames, *passiveRates)
@@ -163,7 +179,7 @@ func buildConfig(cfg config, profileCSV, rateCSV string) (config, error) {
 		switch c {
 		case "all":
 			cases = append(cases, "cp1", "cp2", "cp3", "cp4", "cp5", "cp6", "cp7")
-		case "cp1", "cp2", "cp3", "cp4", "cp5", "cp6", "cp7":
+		case "cp1", "cp2", "cp3", "cp4", "cp5", "cp6", "cp7", "cp3live":
 			cases = append(cases, c)
 		default:
 			return cfg, fmt.Errorf("unknown case %q", c)
@@ -207,6 +223,12 @@ func buildConfig(cfg config, profileCSV, rateCSV string) (config, error) {
 	if cfg.repeats <= 0 {
 		cfg.repeats = 1
 	}
+	if cfg.liveSize <= 0 {
+		cfg.liveSize = 64 << 20
+	}
+	if cfg.livePromotePct <= 0 || cfg.livePromotePct >= 1 {
+		cfg.livePromotePct = 0.30
+	}
 	return cfg, nil
 }
 
@@ -216,6 +238,8 @@ func runAll(ctx context.Context, cfg config) []result {
 		switch c {
 		case "cp3", "cp4", "cp5", "cp6", "cp7":
 			results = append(results, runSelectorSim(cfg, c)...)
+		case "cp3live":
+			results = append(results, runCP3Live(ctx, cfg)...)
 		}
 	}
 	if !contains(cfg.cases, "cp1") && !contains(cfg.cases, "cp2") {
@@ -298,6 +322,215 @@ func runSelectorSim(cfg config, caseName string) []result {
 		}
 	}
 	return out
+}
+
+func runCP3Live(ctx context.Context, cfg config) []result {
+	var out []result
+	for _, est := range cfg.estimators {
+		for i := 1; i <= cfg.repeats; i++ {
+			out = append(out, runCP3LiveOnce(ctx, cfg, est, i))
+		}
+	}
+	return out
+}
+
+func runCP3LiveOnce(ctx context.Context, cfg config, estimator string, repeat int) result {
+	decision := simulateSelector(cfg, "cp3", estimator, repeat)
+	r := result{
+		Case:           "cp3live",
+		Estimator:      estimator,
+		Profile:        "live:A-lowlat-5M+B-bulk-50M+C-bulk-50M",
+		Repeat:         repeat,
+		GroundTruthBPS: decision.GroundTruthBPS,
+		EstimateBPS:    decision.EstimateBPS,
+		Confidence:     decision.Confidence,
+		ErrorPct:       decision.ErrorPct,
+		ProbeBytes:     decision.ProbeBytes,
+		SelectedTarget: decision.SelectedTarget,
+		Promoted:       decision.Promoted,
+		FalsePromotion: decision.FalsePromotion,
+		FalseDemotion:  decision.FalseDemotion,
+		Notes:          decision.Notes,
+	}
+	if decision.Error != "" {
+		r.Error = "selector: " + decision.Error
+		return r
+	}
+
+	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		r.Error = "listen: " + err.Error()
+		return r
+	}
+	defer ln.Close()
+
+	specs := []rendr.PathSpec{
+		{Transport: "tcp", Address: ln.Addr().String()},
+		{Transport: "tcp", Address: ln.Addr().String()},
+		{Transport: "tcp", Address: ln.Addr().String()},
+	}
+	accepted := make(chan rendr.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	client, err := (&rendr.Dialer{
+		Mode:            rendr.ModePrime,
+		Paths:           specs,
+		MigrationBudget: 10 * time.Second,
+	}).Dial(ctx)
+	if err != nil {
+		r.Error = "dial: " + err.Error()
+		return r
+	}
+	defer client.Close()
+
+	var server rendr.Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		r.Error = "accept: " + err.Error()
+		return r
+	case <-ctx.Done():
+		r.Error = "accept: " + ctx.Err().Error()
+		return r
+	}
+	defer server.Close()
+
+	if err := waitRendrPaths(ctx, client, server, len(specs)); err != nil {
+		r.Error = err.Error()
+		return r
+	}
+
+	admin, ok := client.(rendr.AdminConn)
+	if !ok {
+		r.Error = "client does not implement AdminConn"
+		return r
+	}
+	size := cfg.liveSize
+	if size <= 0 {
+		size = 64 << 20
+	}
+	promoteAt := int64(float64(size) * cfg.livePromotePct)
+	if promoteAt <= 0 || promoteAt >= size {
+		promoteAt = size / 3
+	}
+	targetID := alternatePath(client, admin.ActivePath())
+
+	recv := &liveRecvMeter{last: time.Now()}
+	recvHash := sha256.New()
+	recvErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 256<<10)
+		var got int64
+		for got < size {
+			n, err := server.Read(buf)
+			if n > 0 {
+				recvHash.Write(buf[:n])
+				got += int64(n)
+				recv.note()
+			}
+			if err != nil {
+				if err == io.EOF && got >= size {
+					recvErr <- nil
+					return
+				}
+				recvErr <- err
+				return
+			}
+		}
+		recvErr <- nil
+	}()
+
+	sendHash := sha256.New()
+	buf := make([]byte, 256<<10)
+	start := time.Now()
+	recv.reset(start)
+	var sent int64
+	migrated := false
+	for sent < size {
+		select {
+		case <-ctx.Done():
+			r.Error = "send: " + ctx.Err().Error()
+			return r
+		default:
+		}
+		n := int64(len(buf))
+		if rem := size - sent; rem < n {
+			n = rem
+		}
+		fillLive(buf[:n], sent)
+		w, err := client.Write(buf[:n])
+		if w > 0 {
+			sendHash.Write(buf[:w])
+			sent += int64(w)
+		}
+		if err != nil {
+			r.Error = fmt.Sprintf("write at %d: %v", sent, err)
+			return r
+		}
+		if !migrated && sent >= promoteAt {
+			migrated = true
+			if decision.Promoted {
+				if targetID == 0 {
+					r.Error = "no alternate path for live migration"
+					return r
+				}
+				if err := admin.Migrate(targetID); err != nil {
+					r.Error = "migrate: " + err.Error()
+					return r
+				}
+			}
+		}
+	}
+
+	select {
+	case err := <-recvErr:
+		if err != nil {
+			r.Error = "recv: " + err.Error()
+			return r
+		}
+	case <-ctx.Done():
+		r.Error = "recv: " + ctx.Err().Error()
+		return r
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	stats := admin.Stats()
+	p50, p95, p99, maxGap := recv.summary()
+	r.ElapsedMS = elapsed.Milliseconds()
+	r.AppBytes = size
+	r.AppThroughput = float64(size) / elapsed.Seconds() / (1 << 20)
+	r.SHA256Match = fmt.Sprintf("%x", sendHash.Sum(nil)) == fmt.Sprintf("%x", recvHash.Sum(nil))
+	r.Migrations = stats.MigrationCount
+	r.RecvGapP50MS = p50.Milliseconds()
+	r.RecvGapP95MS = p95.Milliseconds()
+	r.RecvGapP99MS = p99.Milliseconds()
+	r.MaxRecvGapMS = maxGap.Milliseconds()
+	if !r.SHA256Match {
+		r.Error = "sha256 mismatch"
+		return r
+	}
+	if decision.Promoted && r.Migrations == 0 {
+		r.Error = "selector promoted but live migration count is zero"
+		return r
+	}
+	if r.Notes == "" {
+		r.Notes = "live selector-to-rendr migration smoke"
+	} else {
+		r.Notes += "; live selector-to-rendr migration smoke"
+	}
+	r.Notes += "; current live case migrates to one alternate path because group(B,C) scheduling is not yet public API"
+	return r
 }
 
 func simulateSelector(cfg config, caseName, estimator string, repeat int) result {
@@ -823,6 +1056,86 @@ func transfer(ctx context.Context, totalBytes int64, paceBPS int64) (sample, err
 	case <-ctx.Done():
 		return sample{}, ctx.Err()
 	}
+}
+
+func waitRendrPaths(ctx context.Context, client, server rendr.Conn, want int) error {
+	t := time.NewTimer(5 * time.Second)
+	defer t.Stop()
+	for {
+		if len(client.Paths()) >= want && len(server.Paths()) >= want {
+			return nil
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-t.C:
+			return fmt.Errorf("path attach timeout: client=%d server=%d want=%d", len(client.Paths()), len(server.Paths()), want)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func alternatePath(c rendr.Conn, active uint32) uint32 {
+	for _, p := range c.Paths() {
+		if p.ID != active {
+			return p.ID
+		}
+	}
+	return 0
+}
+
+func fillLive(buf []byte, offset int64) {
+	for i := range buf {
+		buf[i] = byte((offset+int64(i))*31 + 7)
+	}
+}
+
+type liveRecvMeter struct {
+	mu   sync.Mutex
+	last time.Time
+	gaps []time.Duration
+}
+
+func (m *liveRecvMeter) reset(t time.Time) {
+	m.mu.Lock()
+	m.last = t
+	m.gaps = m.gaps[:0]
+	m.mu.Unlock()
+}
+
+func (m *liveRecvMeter) note() {
+	now := time.Now()
+	m.mu.Lock()
+	if !m.last.IsZero() {
+		m.gaps = append(m.gaps, now.Sub(m.last))
+	}
+	m.last = now
+	m.mu.Unlock()
+}
+
+func (m *liveRecvMeter) summary() (p50, p95, p99, max time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.gaps) == 0 {
+		return 0, 0, 0, 0
+	}
+	gaps := append([]time.Duration(nil), m.gaps...)
+	sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+	return percentileDuration(gaps, 0.50), percentileDuration(gaps, 0.95), percentileDuration(gaps, 0.99), gaps[len(gaps)-1]
+}
+
+func percentileDuration(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	idx := int(float64(len(sorted)-1) * p)
+	return sorted[idx]
 }
 
 func trickle(ctx context.Context, cfg config) (sample, int64, error) {
