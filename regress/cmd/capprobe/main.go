@@ -80,6 +80,11 @@ type result struct {
 	ElapsedMS      int64   `json:"elapsed_ms"`
 	AppBytes       int64   `json:"app_bytes"`
 	ProbeBytes     int64   `json:"probe_bytes"`
+	SelectedTarget string  `json:"selected_target,omitempty"`
+	Promoted       bool    `json:"promoted,omitempty"`
+	FalsePromotion bool    `json:"false_promotion,omitempty"`
+	FalseDemotion  bool    `json:"false_demotion,omitempty"`
+	FlapCount      int     `json:"flap_count,omitempty"`
 	UserCPUMS      int64   `json:"user_cpu_ms,omitempty"`
 	SysCPUMS       int64   `json:"sys_cpu_ms,omitempty"`
 	CPUPct         float64 `json:"cpu_pct,omitempty"`
@@ -94,7 +99,7 @@ type sample struct {
 
 func main() {
 	var (
-		cases           = flag.String("case", "cp1,cp2", "comma-separated cases: cp1,cp2,all")
+		cases           = flag.String("case", "cp1,cp2", "comma-separated cases: cp1,cp2,cp3,cp4,cp5,cp6,cp7,all")
 		estimators      = flag.String("estimators", "passive,bounded,adaptive,trickle,calibration", "comma-separated estimators")
 		profileNames    = flag.String("profiles", "A-lowlat-5M,B-bulk-50M,C-bulk-50M,B-evening,C-evening,bad-candidate", "comma-separated profile names")
 		repeats         = flag.Int("repeats", 1, "repeats per case/profile/estimator")
@@ -157,8 +162,8 @@ func buildConfig(cfg config, profileCSV, rateCSV string) (config, error) {
 	for _, c := range cfg.cases {
 		switch c {
 		case "all":
-			cases = append(cases, "cp1", "cp2")
-		case "cp1", "cp2":
+			cases = append(cases, "cp1", "cp2", "cp3", "cp4", "cp5", "cp6", "cp7")
+		case "cp1", "cp2", "cp3", "cp4", "cp5", "cp6", "cp7":
 			cases = append(cases, c)
 		default:
 			return cfg, fmt.Errorf("unknown case %q", c)
@@ -207,6 +212,20 @@ func buildConfig(cfg config, profileCSV, rateCSV string) (config, error) {
 
 func runAll(ctx context.Context, cfg config) []result {
 	var results []result
+	for _, c := range cfg.cases {
+		switch c {
+		case "cp3", "cp4", "cp5", "cp6", "cp7":
+			results = append(results, runSelectorSim(cfg, c)...)
+		}
+	}
+	if !contains(cfg.cases, "cp1") && !contains(cfg.cases, "cp2") {
+		if cfg.jsonl {
+			for _, r := range results {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			}
+		}
+		return results
+	}
 	for _, p := range cfg.profiles {
 		profileCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 		cleanup, err := chaos.Apply(p.Prof)
@@ -228,6 +247,8 @@ func runAll(ctx context.Context, cfg config) []result {
 				results = append(results, runCP1(profileCtx, cfg, p)...)
 			case "cp2":
 				results = append(results, runCP2(profileCtx, cfg, p)...)
+			case "cp3", "cp4", "cp5", "cp6", "cp7":
+				continue
 			}
 		}
 		if err := cleanup(); err != nil {
@@ -265,6 +286,363 @@ func runCP2(ctx context.Context, cfg config, p profileSpec) []result {
 		for i := 1; i <= cfg.repeats; i++ {
 			out = append(out, runEstimator(ctx, cfg, p, "cp2", "passive", i, rate))
 		}
+	}
+	return out
+}
+
+func runSelectorSim(cfg config, caseName string) []result {
+	var out []result
+	for _, est := range cfg.estimators {
+		for i := 1; i <= cfg.repeats; i++ {
+			out = append(out, simulateSelector(cfg, caseName, est, i))
+		}
+	}
+	return out
+}
+
+func simulateSelector(cfg config, caseName, estimator string, repeat int) result {
+	r := result{
+		Case:      caseName,
+		Estimator: estimator,
+		Repeat:    repeat,
+	}
+	active := profiles["A-lowlat-5M"]
+	activeUseful := effectiveCapacity(active.Prof)
+	bulk := true
+	candidates := []profileSpec{profiles["B-bulk-50M"], profiles["C-bulk-50M"]}
+	topK := 2
+	switch caseName {
+	case "cp3":
+		r.Profile = "A-lowlat-5M+B-bulk-50M+C-bulk-50M"
+	case "cp4":
+		r.Profile = "interactive:A-lowlat-5M+B-bulk-50M+C-bulk-50M"
+		bulk = false
+	case "cp5":
+		r.Profile = "A-lowlat-5M+stale(B,C)->evening"
+		candidates = []profileSpec{profiles["B-evening"], profiles["C-evening"]}
+	case "cp6":
+		r.Profile = "A-lowlat-5M+bad-candidate"
+		candidates = []profileSpec{profiles["bad-candidate"]}
+	case "cp7":
+		r.Profile = "A-lowlat-5M+10-candidates"
+		candidates = manyCandidates()
+		topK = 2
+	default:
+		r.Error = "unknown selector sim case"
+		return r
+	}
+
+	var estimates []pathEstimate
+	if estimator == "passive" {
+		if caseName == "cp5" {
+			r.Notes = "passive-only: stale high-capacity hints are low-confidence"
+		} else {
+			r.Notes = "passive-only: idle candidates remain low-confidence"
+		}
+	} else if !bulk {
+		r.Notes = "interactive: capacity probes suppressed"
+	} else {
+		ordered := rankCandidates(candidates)
+		if len(ordered) > topK {
+			ordered = ordered[:topK]
+		}
+		for _, p := range ordered {
+			pe := simulateEstimate(cfg, estimator, p)
+			estimates = append(estimates, pe)
+			r.ProbeBytes += pe.ProbeBytes
+			r.ElapsedMS += pe.ElapsedMS
+		}
+	}
+
+	estBPS, conf := aggregateCandidate(estimates)
+	r.EstimateBPS = estBPS
+	r.Confidence = conf
+	r.GroundTruthBPS = int64(aggregateTruth(candidates))
+	if r.GroundTruthBPS > 0 && r.EstimateBPS > 0 {
+		r.ErrorPct = absPct(r.EstimateBPS, float64(r.GroundTruthBPS))
+	}
+	decision := pickTarget(bulk, activeUseful, estimates)
+	if bulk && len(estimates) == 0 && aggregateTruth(candidates) > activeUseful*1.5 {
+		decision.FalseDemotion = true
+	}
+	r.SelectedTarget = decision.Target
+	r.Promoted = decision.Promote
+	r.FalsePromotion = decision.FalsePromotion
+	r.FalseDemotion = decision.FalseDemotion
+	r.FlapCount = decision.FlapCount
+	if r.Notes == "" {
+		r.Notes = decision.Reason
+	} else {
+		r.Notes += "; " + decision.Reason
+	}
+	return r
+}
+
+type pathEstimate struct {
+	Name       string
+	Estimate   float64
+	Truth      float64
+	Confidence float64
+	ProbeBytes int64
+	ElapsedMS  int64
+	QualityOK  bool
+}
+
+type selectorDecision struct {
+	Target         string
+	Promote        bool
+	FalsePromotion bool
+	FalseDemotion  bool
+	FlapCount      int
+	Reason         string
+}
+
+func simulateEstimate(cfg config, estimator string, p profileSpec) pathEstimate {
+	truth := effectiveCapacity(p.Prof)
+	pe := pathEstimate{
+		Name:      p.Name,
+		Truth:     truth,
+		QualityOK: qualityOK(p.Prof),
+	}
+	switch estimator {
+	case "bounded":
+		pe.ProbeBytes = cfg.boundedBytes
+		if pe.ProbeBytes <= 0 {
+			pe.ProbeBytes = 1024 << 10
+		}
+		pe.Estimate = boundedModel(p.Prof, pe.ProbeBytes)
+		pe.Confidence = confidenceFor(sample{bytes: pe.ProbeBytes, elapsed: time.Duration(pe.ProbeBytes*8) * time.Second / time.Duration(maxInt64(1, int64(pe.Estimate)))}, pe.ProbeBytes, true)
+	case "adaptive":
+		pe.Estimate, pe.ProbeBytes, pe.Confidence = adaptiveModel(cfg, p.Prof)
+	case "trickle":
+		pe.ProbeBytes = maxInt64(cfg.trickleBurst, 256<<10) * maxInt64(1, int64(cfg.trickleDur/maxDuration(cfg.trickleEvery, time.Millisecond)))
+		pe.Estimate = trickleModel(p.Prof)
+		pe.Confidence = 0.45
+	case "calibration":
+		pe.ProbeBytes = cfg.calibrateBytes
+		if pe.ProbeBytes <= 0 {
+			pe.ProbeBytes = 16 << 20
+		}
+		pe.Estimate = calibrationModel(p.Prof, pe.ProbeBytes)
+		pe.Confidence = confidenceFor(sample{bytes: pe.ProbeBytes, elapsed: time.Duration(pe.ProbeBytes*8) * time.Second / time.Duration(maxInt64(1, int64(pe.Estimate)))}, pe.ProbeBytes, false)
+	case "passive":
+		pe.Estimate = 0
+		pe.Confidence = 0.10
+	default:
+		pe.Estimate = 0
+		pe.Confidence = 0
+	}
+	pe.Estimate = applyQualityPenalty(pe.Estimate, p.Prof)
+	if !pe.QualityOK {
+		pe.Confidence *= 0.55
+	}
+	pe.ElapsedMS = int64(float64(pe.ProbeBytes*8) / maxFloat(1, pe.Estimate) * 1000)
+	if pe.ElapsedMS == 0 && pe.ProbeBytes > 0 {
+		pe.ElapsedMS = 1
+	}
+	return pe
+}
+
+func boundedModel(p chaos.Profile, bytes int64) float64 {
+	truth := effectiveCapacity(p)
+	if truth <= 0 {
+		return 0
+	}
+	bdp := truth * maxFloat(0.001, p.Delay.Seconds()*2) / 8
+	if bdp < 256<<10 {
+		bdp = 256 << 10
+	}
+	fill := clamp(float64(bytes) / (bdp * 1.5))
+	return truth * (0.10 + 0.90*fill)
+}
+
+func trickleModel(p chaos.Profile) float64 {
+	truth := effectiveCapacity(p)
+	if truth <= 0 {
+		return 0
+	}
+	if p.Bandwidth <= 8_000_000 && p.Delay <= 20*time.Millisecond {
+		return truth * 1.8
+	}
+	bdp := truth * maxFloat(0.001, p.Delay.Seconds()*2) / 8
+	if bdp > 512<<10 {
+		return truth * 0.25
+	}
+	return truth * 0.60
+}
+
+func calibrationModel(p chaos.Profile, bytes int64) float64 {
+	truth := effectiveCapacity(p)
+	if truth <= 0 {
+		return 0
+	}
+	bdp := truth * maxFloat(0.001, p.Delay.Seconds()*2) / 8
+	if bdp <= 0 {
+		return truth
+	}
+	fill := clamp(float64(bytes) / (bdp * 2))
+	return truth * (0.55 + 0.45*fill)
+}
+
+func adaptiveModel(cfg config, p chaos.Profile) (estimate float64, probeBytes int64, confidence float64) {
+	size := cfg.adaptiveMin
+	if size <= 0 {
+		size = 256 << 10
+	}
+	maxSize := cfg.adaptiveMax
+	if maxSize < size {
+		maxSize = size
+	}
+	truth := effectiveCapacity(p)
+	var prev float64
+	var rates []float64
+	for size <= maxSize {
+		cur := boundedModel(p, size)
+		rates = append(rates, cur)
+		probeBytes += size
+		estimate = cur
+		if prev > 0 && relChange(prev, cur) <= maxFloat(0.05, cfg.adaptiveEps) && size >= 1024<<10 {
+			break
+		}
+		prev = cur
+		if size == maxSize {
+			break
+		}
+		size *= 2
+		if size > maxSize {
+			size = maxSize
+		}
+	}
+	if truth > 0 && estimate > truth*1.10 {
+		estimate = truth * 1.10
+	}
+	confidence = adaptiveConfidence(sample{bytes: probeBytes, elapsed: time.Duration(probeBytes*8) * time.Second / time.Duration(maxInt64(1, int64(maxFloat(1, estimate))))}, probeBytes, rates)
+	return estimate, probeBytes, confidence
+}
+
+func effectiveCapacity(p chaos.Profile) float64 {
+	capacity := float64(p.Bandwidth)
+	if capacity <= 0 {
+		return 0
+	}
+	lossPenalty := 1 - p.LossPct/100*8
+	if lossPenalty < 0.05 {
+		lossPenalty = 0.05
+	}
+	jitterPenalty := 1.0
+	if p.Jitter > 0 {
+		jitterPenalty -= p.Jitter.Seconds() / 0.5
+		if jitterPenalty < 0.35 {
+			jitterPenalty = 0.35
+		}
+	}
+	return capacity * lossPenalty * jitterPenalty
+}
+
+func applyQualityPenalty(v float64, p chaos.Profile) float64 {
+	if p.LossPct >= 2.0 {
+		v *= 0.65
+	}
+	if p.Jitter >= 50*time.Millisecond {
+		v *= 0.75
+	}
+	return v
+}
+
+func qualityOK(p chaos.Profile) bool {
+	return p.LossPct < 2.0 && p.Jitter < 50*time.Millisecond && p.Delay < 180*time.Millisecond
+}
+
+func aggregateCandidate(estimates []pathEstimate) (float64, float64) {
+	if len(estimates) == 0 {
+		return 0, 0
+	}
+	var total, conf float64
+	for _, e := range estimates {
+		if e.QualityOK {
+			total += e.Estimate
+		}
+		conf += e.Confidence
+	}
+	return total, conf / float64(len(estimates))
+}
+
+func aggregateTruth(candidates []profileSpec) float64 {
+	var total float64
+	for _, c := range candidates {
+		if qualityOK(c.Prof) {
+			total += effectiveCapacity(c.Prof)
+		}
+	}
+	return total
+}
+
+func pickTarget(bulk bool, activeUseful float64, estimates []pathEstimate) selectorDecision {
+	if !bulk {
+		return selectorDecision{Target: "A", Reason: "interactive flow stays on low-latency active path"}
+	}
+	est, conf := aggregateCandidate(estimates)
+	truth := 0.0
+	names := make([]string, 0, len(estimates))
+	for _, e := range estimates {
+		if e.QualityOK {
+			truth += e.Truth
+			names = append(names, e.Name)
+		}
+	}
+	if len(estimates) == 0 {
+		return selectorDecision{
+			Target:        "A",
+			FalseDemotion: truth > activeUseful*1.5,
+			Reason:        "no candidate capacity evidence",
+		}
+	}
+	enoughConfidence := conf >= 0.60 || (conf >= 0.50 && est >= activeUseful*4)
+	if enoughConfidence && est >= activeUseful*1.5 && len(names) > 0 {
+		falsePromotion := truth < activeUseful*0.90
+		return selectorDecision{
+			Target:         strings.Join(names, "+"),
+			Promote:        true,
+			FalsePromotion: falsePromotion,
+			Reason:         fmt.Sprintf("promote: estimate %.1fM confidence %.2f", est/1_000_000, conf),
+		}
+	}
+	return selectorDecision{
+		Target:        "A",
+		FalseDemotion: truth > activeUseful*1.5,
+		Reason:        fmt.Sprintf("stay: estimate %.1fM confidence %.2f", est/1_000_000, conf),
+	}
+}
+
+func rankCandidates(in []profileSpec) []profileSpec {
+	out := append([]profileSpec(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		if qualityOK(out[i].Prof) != qualityOK(out[j].Prof) {
+			return qualityOK(out[i].Prof)
+		}
+		return effectiveCapacity(out[i].Prof) > effectiveCapacity(out[j].Prof)
+	})
+	return out
+}
+
+func manyCandidates() []profileSpec {
+	out := []profileSpec{
+		profiles["B-bulk-50M"],
+		profiles["C-bulk-50M"],
+		profiles["B-evening"],
+		profiles["C-evening"],
+		profiles["bad-candidate"],
+	}
+	for i := 0; i < 5; i++ {
+		out = append(out, profileSpec{
+			Name: fmt.Sprintf("low-priority-%d", i+1),
+			Prof: chaos.Profile{
+				Bandwidth: 3_000_000 + int64(i)*1_000_000,
+				Delay:     time.Duration(40+i*15) * time.Millisecond,
+				Jitter:    time.Duration(5+i*5) * time.Millisecond,
+				LossPct:   float64(i) * 0.2,
+			},
+		})
 	}
 	return out
 }
@@ -657,20 +1035,41 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func printSummary(results []result) {
 	fmt.Println()
 	fmt.Println("capacity probe summary")
-	fmt.Println("case  profile         estimator    app_bps   est_mbps  truth_mbps  err%    conf  probe_kib  app_kib  elapsed_ms  note/error")
+	fmt.Println("case  profile         estimator    app_bps   est_mbps  truth_mbps  err%    conf  probe_kib  app_kib  elapsed_ms  selected         fp  fd  note/error")
 	for _, r := range results {
 		note := r.Notes
 		if r.Error != "" {
 			note = r.Error
 		}
-		fmt.Printf("%-5s %-15s %-12s %-9d %-9.2f %-11.2f %-7.1f %-5.2f %-10.1f %-8.1f %-11d %s\n",
+		fmt.Printf("%-5s %-15s %-12s %-9d %-9.2f %-11.2f %-7.1f %-5.2f %-10.1f %-8.1f %-11d %-16s %-3t %-3t %s\n",
 			r.Case, r.Profile, r.Estimator, r.AppRateBPS,
 			r.EstimateBPS/1_000_000, float64(r.GroundTruthBPS)/1_000_000,
 			r.ErrorPct, r.Confidence, float64(r.ProbeBytes)/1024,
-			float64(r.AppBytes)/1024, r.ElapsedMS, note)
+			float64(r.AppBytes)/1024, r.ElapsedMS, r.SelectedTarget, r.FalsePromotion, r.FalseDemotion, note)
 	}
 
 	type key struct {
