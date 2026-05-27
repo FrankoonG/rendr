@@ -30,4 +30,7 @@ func TestCaseMatches(t *testing.T) {
 	if !caseMatches("T6.peak.stale-speed", "T6.peak.stale-speed") {
 		t.Fatal("stale speed case should match")
 	}
+	if !caseMatches("T6.peak.probe-budget", "T6.peak.probe-budget") {
+		t.Fatal("probe budget case should match")
+	}
 }

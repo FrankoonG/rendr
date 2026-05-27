@@ -673,6 +673,95 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	}
 }
 
+func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Path("A", spec("A")),
+			Path("P1", spec("P1")),
+			Path("P2", spec("P2")),
+			Path("P3", spec("P3")),
+		},
+		PeakTransfer{
+			Targets:         []string{"P1", "P2", "P3"},
+			SaturationFor:   200 * time.Millisecond,
+			SaturationRatio: 0.8,
+			ProbeBudget:     64 << 10,
+		},
+	)
+	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+	go io.Copy(io.Discard, server)
+
+	chunk := make([]byte, 32<<10)
+	for i := 0; i < 32; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	ids := idsByName(client.Paths())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.(AdminConn).ActivePath() == ids["P1"] {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := client.(AdminConn).ActivePath(); got != ids["P1"] {
+		t.Fatalf("active after peak promotion=%d want P1", got)
+	}
+
+	before := writesByName(client.Paths())
+	for i := 0; i < 16; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := writesByName(client.Paths())
+	if after["P1"] <= before["P1"] {
+		t.Fatalf("selected peak P1 did not receive writes: before=%v after=%v", before, after)
+	}
+	if after["P2"] != before["P2"] || after["P3"] != before["P3"] {
+		t.Fatalf("unselected peak candidates received writes: before=%v after=%v", before, after)
+	}
+}
+
 func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
