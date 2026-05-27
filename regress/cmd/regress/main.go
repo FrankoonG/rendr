@@ -23,6 +23,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier3"
 	"github.com/FrankoonG/rendr/regress/internal/tier4"
 	"github.com/FrankoonG/rendr/regress/internal/tier5"
+	"github.com/FrankoonG/rendr/regress/internal/tier6"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -33,6 +34,7 @@ const (
 	exitT3Fail      = 20
 	exitT4Fail      = 21
 	exitT5Fail      = 22
+	exitT6Fail      = 23
 	exitEnvError    = 50
 	exitPhase1Stale = 51
 )
@@ -52,8 +54,8 @@ type runFlags struct {
 func parseFlags() runFlags {
 	var f runFlags
 	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
-	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5")
-	flag.BoolVar(&f.full, "full", false, "run phase 1 and all phase-2 tiers (T3+T4+T5)")
+	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5 | 6")
+	flag.BoolVar(&f.full, "full", false, "run phase 1 and all phase-2 tiers (T3+T4+T5+T6)")
 	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
 	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
 	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
@@ -132,11 +134,11 @@ func main() {
 			}
 		}
 		// Default phase-2 invocation runs T3 (path-factory matrix).
-		// T4 long-run and T5 fallback are opt-in via --tier=4/5
+		// T4 long-run, T5 fallback, and T6 selector graph are opt-in via --tier=4/5/6
 		// or included together via --full.
-		runT3, runT4, runT5 := selectedTiers(cfg)
-		if !runT3 && !runT4 && !runT5 {
-			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, or --full")
+		runT3, runT4, runT5, runT6 := selectedTiers(cfg)
+		if !runT3 && !runT4 && !runT5 && !runT6 {
+			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, --tier=6, or --full")
 			os.Exit(exitEnvError)
 		}
 		if runT3 {
@@ -169,6 +171,16 @@ func main() {
 			}
 			fmt.Println("phase 2 / T5: GREEN")
 		}
+		if runT6 {
+			fmt.Println("== phase 2 / T6: selector target graph / peak transfer ==")
+			tier6.Run(ctx, suite, cfg.rendrRoot, tier6.Options{Case: cfg.caseID})
+			writeReports(suite, cfg.reportDir)
+			if suite.AnyFailedAt("T6") {
+				fmt.Fprintln(os.Stderr, "phase 2 / T6: FAILED")
+				os.Exit(exitT6Fail)
+			}
+			fmt.Println("phase 2 / T6: GREEN")
+		}
 	}
 
 	if !runP1 && !runP2 {
@@ -199,19 +211,21 @@ func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 	}
 }
 
-func selectedTiers(cfg runFlags) (runT3, runT4, runT5 bool) {
+func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6 bool) {
 	if cfg.full {
-		return true, true, true
+		return true, true, true, true
 	}
 	switch cfg.tier {
 	case "", "3":
-		return true, false, false
+		return true, false, false, false
 	case "4":
-		return false, true, false
+		return false, true, false, false
 	case "5":
-		return false, false, true
+		return false, false, true, false
+	case "6":
+		return false, false, false, true
 	default:
-		return false, false, false
+		return false, false, false, false
 	}
 }
 
