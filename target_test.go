@@ -435,6 +435,171 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 	}
 }
 
+func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Selector("normal", []Target{
+				Selector("ab", []Target{
+					Path("A", spec("A")),
+					Path("B", spec("B")),
+				}),
+				Path("C", spec("C")),
+			}),
+			Path("D", spec("D")),
+		},
+		PeakTransfer{Targets: []string{"D"}, SaturationFor: 10 * time.Second},
+	)
+	client, err := (&Dialer{
+		Root:       root,
+		Hysteresis: 0.05,
+		Dwell:      100 * time.Millisecond,
+		Cooldown:   100 * time.Millisecond,
+	}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	ids := idsByName(client.Paths())
+	ebc := client.(*engineBackedConn)
+	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 150 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 140 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["C"], PathQuality{RTT: 80 * time.Millisecond, At: time.Now()})
+	ebc.Engine().SetPathQualityForTest(ids["D"], PathQuality{RTT: 1 * time.Millisecond, At: time.Now()})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.(AdminConn).ActivePath() == ids["C"] {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := client.(AdminConn).ActivePath(); got != ids["C"] {
+		t.Fatalf("active=%d want C=%d before death", got, ids["C"])
+	}
+	if err := ebc.ForceKillPathForTest(ids["C"]); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		got := client.(AdminConn).ActivePath()
+		if got == ids["A"] || got == ids["B"] {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("active after C death=%d; wanted A or B, not peak D=%d",
+		client.(AdminConn).ActivePath(), ids["D"])
+}
+
+func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Path("A", spec("A")),
+			Path("C", spec("C")),
+		},
+		PeakTransfer{
+			Targets:         []string{"C"},
+			SaturationFor:   200 * time.Millisecond,
+			SaturationRatio: 0.8,
+		},
+	)
+	client, err := (&Dialer{Root: root}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+	go io.Copy(io.Discard, server)
+
+	ids := idsByName(client.Paths())
+	client.(*engineBackedConn).Engine().SetPathQualityForTest(ids["C"], PathQuality{
+		RTT:    100 * time.Millisecond,
+		Jitter: 250 * time.Millisecond,
+		LossPP: 500,
+		At:     time.Now(),
+	})
+	chunk := make([]byte, 32<<10)
+	for i := 0; i < 48; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := client.(interface{ Mode() Mode }).Mode(); got != ModePrime {
+		t.Fatalf("mode=%v want prime; bad peak quality should block promotion", got)
+	}
+	if got := client.(AdminConn).ActivePath(); got == ids["C"] {
+		t.Fatalf("active path promoted to bad peak C=%d", ids["C"])
+	}
+}
+
 func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)

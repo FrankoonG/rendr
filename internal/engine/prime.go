@@ -171,7 +171,7 @@ func (p *prime) evaluate(e *Engine) {
 		return
 	}
 	// Fire migration.
-	if err := e.Migrate(bestID); err == nil {
+	if err := e.migrate(bestID, false, "quality"); err == nil {
 		p.lastMig = now
 	}
 	// Reset candidate tracking after a migration.

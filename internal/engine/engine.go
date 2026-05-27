@@ -413,6 +413,10 @@ func (e *Engine) Paths() []transport.PathInfo {
 // commit; the test harness uses planned migration which is
 // loss-safe).
 func (e *Engine) Migrate(id uint32) error {
+	return e.migrate(id, true, "explicit")
+}
+
+func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 	e.pathsMu.Lock()
 	slot, ok := e.paths[id]
 	if !ok {
@@ -425,7 +429,9 @@ func (e *Engine) Migrate(id uint32) error {
 	}
 	oldID := e.activeID
 	e.activeID = id
-	e.dispatchScope = nil
+	if clearScope {
+		e.dispatchScope = nil
+	}
 	e.migrationCount++
 	e.setState(BridgeActive)
 
@@ -449,7 +455,10 @@ func (e *Engine) Migrate(id uint32) error {
 	// can call back into AdminConn methods without deadlocking. If
 	// the captured pc has closed concurrently, the Write fails and
 	// onPathDeath will pick up the slack.
-	e.fireMigrateHooks(oldID, id, "explicit")
+	if cause == "" {
+		cause = "explicit"
+	}
+	e.fireMigrateHooks(oldID, id, cause)
 	go func() {
 		_, _ = pc.Write(frame)
 	}()

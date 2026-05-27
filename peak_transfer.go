@@ -147,6 +147,10 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		if now.Sub(c.saturatedSince) < needFor {
 			return
 		}
+		if !c.peakHealthy() {
+			c.saturatedSince = time.Time{}
+			return
+		}
 		c.onPeak = true
 		c.saturatedSince = time.Time{}
 		c.returnSince = time.Time{}
@@ -183,4 +187,31 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "peak-return")
 	c.setMode(ModePrime)
 	c.mu.Lock()
+}
+
+func (c *peakTransferController) peakHealthy() bool {
+	const (
+		maxLossPP = 50 // 5%
+		maxJitter = 200 * time.Millisecond
+	)
+	stats := c.e.Paths()
+	peak := make(map[uint32]bool, len(c.peakIDs))
+	for _, id := range c.peakIDs {
+		peak[id] = true
+	}
+	seenMeasured := false
+	for _, p := range stats {
+		if !peak[p.ID] {
+			continue
+		}
+		q := p.Quality
+		if q.At.IsZero() && q.RTT == 0 && q.Jitter == 0 && q.LossPP == 0 {
+			return true
+		}
+		seenMeasured = true
+		if q.LossPP <= maxLossPP && q.Jitter <= maxJitter {
+			return true
+		}
+	}
+	return !seenMeasured
 }

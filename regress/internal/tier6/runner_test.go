@@ -21,4 +21,10 @@ func TestCaseMatches(t *testing.T) {
 	if !caseMatches("T6.failover.hot-standby", "T6.failover.hot-standby") {
 		t.Fatal("hot standby case should match")
 	}
+	if !caseMatches("T6.peak.composite-normal", "T6.peak.composite-normal") {
+		t.Fatal("composite normal case should match")
+	}
+	if !caseMatches("T6.peak.bad-speed", "T6.peak.bad-speed") {
+		t.Fatal("bad speed case should match")
+	}
 }
