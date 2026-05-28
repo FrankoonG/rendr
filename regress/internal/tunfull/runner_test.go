@@ -44,6 +44,31 @@ func TestRunG2SmokeShort(t *testing.T) {
 	}
 }
 
+func TestRunG4PathDeathShort(t *testing.T) {
+	c := runG4PathDeath(context.Background(), g4Options{
+		name:     "TUN-full.G4-path-death",
+		duration: 600 * time.Millisecond,
+		killAt:   100 * time.Millisecond,
+		echoInt:  20 * time.Millisecond,
+		paths:    2,
+		budget:   time.Second,
+	})
+	if c.Name != "TUN-full.G4-path-death" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad G4 case: %+v", c)
+	}
+}
+
+func TestRunG5PathRecoveryShort(t *testing.T) {
+	c := runG5PathRecovery(context.Background(), g5Options{
+		name:         "TUN-full.G5-path-recovery",
+		paths:        2,
+		postAddBytes: 32 << 10,
+	})
+	if c.Name != "TUN-full.G5-path-recovery" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad G5 case: %+v", c)
+	}
+}
+
 func TestRunTunFullCaseFilterMiss(t *testing.T) {
 	suite := report.New()
 	Run(context.Background(), suite, ".", Options{Case: "missing"})

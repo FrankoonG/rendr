@@ -80,6 +80,21 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:      2,
 			migrations: 5,
 		})
+	case "TUN-full.G4-path-death":
+		return runG4PathDeath(ctx, g4Options{
+			name:     name,
+			duration: 6 * time.Second,
+			killAt:   2 * time.Second,
+			echoInt:  10 * time.Millisecond,
+			paths:    2,
+			budget:   5 * time.Second,
+		})
+	case "TUN-full.G5-path-recovery":
+		return runG5PathRecovery(ctx, g5Options{
+			name:         name,
+			paths:        2,
+			postAddBytes: 256 << 10,
+		})
 	default:
 		return UnimplementedCase(name)
 	}
@@ -116,6 +131,21 @@ type g2SmokeOptions struct {
 	interval   time.Duration
 	paths      int
 	migrations int
+}
+
+type g4Options struct {
+	name     string
+	duration time.Duration
+	killAt   time.Duration
+	echoInt  time.Duration
+	paths    int
+	budget   time.Duration
+}
+
+type g5Options struct {
+	name         string
+	paths        int
+	postAddBytes int64
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
@@ -539,4 +569,339 @@ func percentile(sorted []time.Duration, q float64) time.Duration {
 
 func isClosedRelayErr(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
+}
+
+func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.G4-path-death"
+	}
+	if opts.duration <= 0 {
+		opts.duration = 6 * time.Second
+	}
+	if opts.killAt <= 0 {
+		opts.killAt = 2 * time.Second
+	}
+	if opts.echoInt <= 0 {
+		opts.echoInt = 10 * time.Millisecond
+	}
+	if opts.paths < 2 {
+		opts.paths = 2
+	}
+	if opts.budget <= 0 {
+		opts.budget = 5 * time.Second
+	}
+
+	env, err := startTUNStream(ctx, opts.paths)
+	if err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	defer env.close()
+
+	killer, ok := env.admin.(interface {
+		ForceKillPathForTest(id uint32) error
+	})
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("session conn lacks ForceKillPathForTest test hook"))
+	}
+	echoErr := startStreamEcho(env.server, 8)
+
+	killDone := make(chan time.Time, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(opts.killAt):
+		}
+		cur := env.admin.ActivePath()
+		if cur != 0 {
+			_ = killer.ForceKillPathForTest(cur)
+		}
+		killDone <- time.Now()
+	}()
+
+	endAt := time.Now().Add(opts.duration)
+	var seq uint64
+	var lost int
+	var maxRTT time.Duration
+	var killStamp time.Time
+	var firstPostKill time.Time
+	for time.Now().Before(endAt) {
+		var tx [8]byte
+		binary.BigEndian.PutUint64(tx[:], seq)
+		echoStart := time.Now()
+		if err := writeAll(env.app, tx[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("write seq %d: %w", seq, err))
+		}
+		var rx [8]byte
+		if err := readAll(env.app, rx[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("read seq %d: %w", seq, err))
+		}
+		if binary.BigEndian.Uint64(rx[:]) != seq {
+			lost++
+		}
+		if rtt := time.Since(echoStart); rtt > maxRTT {
+			maxRTT = rtt
+		}
+		select {
+		case s := <-killDone:
+			killStamp = s
+			killDone = nil
+		default:
+		}
+		if !killStamp.IsZero() && firstPostKill.IsZero() && time.Now().After(killStamp) {
+			firstPostKill = time.Now()
+		}
+		seq++
+		select {
+		case <-ctx.Done():
+			return failedCase(opts.name, start, ctx.Err())
+		case <-time.After(opts.echoInt):
+		}
+	}
+
+	if lost > 0 {
+		return failedCase(opts.name, start, fmt.Errorf("application-visible echo loss: %d", lost))
+	}
+	if killStamp.IsZero() {
+		return failedCase(opts.name, start, fmt.Errorf("path kill did not run"))
+	}
+	if firstPostKill.IsZero() {
+		return failedCase(opts.name, start, fmt.Errorf("no echo completed after path kill"))
+	}
+	if failover := firstPostKill.Sub(killStamp); failover > opts.budget {
+		return failedCase(opts.name, start, fmt.Errorf("failover %s exceeds %s budget", failover, opts.budget))
+	}
+	_ = env.app.Close()
+	if err := env.waitRelay(5 * time.Second); err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	select {
+	case err := <-echoErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("echo: %w", err))
+		}
+	default:
+	}
+	_ = maxRTT
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.G5-path-recovery"
+	}
+	if opts.paths < 2 {
+		opts.paths = 2
+	}
+	if opts.postAddBytes <= 0 {
+		opts.postAddBytes = 256 << 10
+	}
+
+	env, err := startTUNStream(ctx, opts.paths)
+	if err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	defer env.close()
+
+	killer, ok := env.admin.(interface {
+		ForceKillPathForTest(id uint32) error
+	})
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("session conn lacks ForceKillPathForTest test hook"))
+	}
+	cur := env.admin.ActivePath()
+	if cur == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("no active path"))
+	}
+	if err := killer.ForceKillPathForTest(cur); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("kill active: %w", err))
+	}
+	echoErr := startStreamEcho(env.server, 4096)
+	time.Sleep(300 * time.Millisecond)
+
+	newID, err := env.admin.AddPath(rendr.PathSpec{Transport: "tcp", Address: env.addr})
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("AddPath: %w", err))
+	}
+	if newID == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("AddPath returned id=0"))
+	}
+
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	rx := make([]byte, 4096)
+	var written int64
+	for written < opts.postAddBytes {
+		toWrite := opts.postAddBytes - written
+		if toWrite > int64(len(payload)) {
+			toWrite = int64(len(payload))
+		}
+		chunk := payload[:toWrite]
+		if err := writeAll(env.app, chunk); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("post-add write: %w", err))
+		}
+		got := int64(0)
+		for got < toWrite {
+			n, err := env.app.Read(rx[got:toWrite])
+			if err != nil {
+				return failedCase(opts.name, start, fmt.Errorf("post-add read: %w", err))
+			}
+			got += int64(n)
+		}
+		if string(rx[:toWrite]) != string(chunk) {
+			return failedCase(opts.name, start, fmt.Errorf("post-add payload mismatch at byte %d", written))
+		}
+		written += toWrite
+	}
+	if stats := env.admin.Stats(); stats.RecvDups > 0 {
+		return failedCase(opts.name, start, fmt.Errorf("RecvDups=%d after path re-add (expected 0)", stats.RecvDups))
+	}
+
+	_ = env.app.Close()
+	if err := env.waitRelay(5 * time.Second); err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	select {
+	case err := <-echoErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("echo: %w", err))
+		}
+	default:
+	}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+type tunStreamEnv struct {
+	ln       rendr.Listener
+	server   rendr.Conn
+	app      net.Conn
+	admin    rendr.AdminConn
+	addr     string
+	relayErr chan error
+}
+
+func startTUNStream(ctx context.Context, paths int) (*tunStreamEnv, error) {
+	if paths < 2 {
+		paths = 2
+	}
+	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+
+	accepted := make(chan rendr.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		c, err := ln.Accept(actx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	id := g1Identity()
+	root := g1Root(ln.Addr().String(), paths)
+	manager := &l3session.Manager{}
+	relay := &l3session.TCPRelay{Manager: manager}
+	app, endpoint := net.Pipe()
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Serve(ctx, g1Event(id, root), endpoint)
+	}()
+
+	var server rendr.Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		_ = app.Close()
+		_ = ln.Close()
+		return nil, fmt.Errorf("accept: %w", err)
+	case <-time.After(15 * time.Second):
+		_ = app.Close()
+		_ = ln.Close()
+		return nil, fmt.Errorf("accept timeout")
+	}
+
+	sess, err := waitStreamSession(ctx, manager, id)
+	if err != nil {
+		_ = app.Close()
+		_ = server.Close()
+		_ = ln.Close()
+		return nil, err
+	}
+	admin, ok := sess.Conn.(rendr.AdminConn)
+	if !ok {
+		_ = app.Close()
+		_ = server.Close()
+		_ = ln.Close()
+		return nil, fmt.Errorf("session conn is not rendr.AdminConn")
+	}
+	waitPaths(ctx, admin, paths)
+	return &tunStreamEnv{
+		ln:       ln,
+		server:   server,
+		app:      app,
+		admin:    admin,
+		addr:     ln.Addr().String(),
+		relayErr: relayErr,
+	}, nil
+}
+
+func (e *tunStreamEnv) close() {
+	if e == nil {
+		return
+	}
+	if e.app != nil {
+		_ = e.app.Close()
+	}
+	if e.server != nil {
+		_ = e.server.Close()
+	}
+	if e.ln != nil {
+		_ = e.ln.Close()
+	}
+}
+
+func (e *tunStreamEnv) waitRelay(timeout time.Duration) error {
+	if e == nil || e.relayErr == nil {
+		return nil
+	}
+	select {
+	case err := <-e.relayErr:
+		if err != nil {
+			return fmt.Errorf("relay: %w", err)
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("relay shutdown timeout")
+	}
+}
+
+func startStreamEcho(c net.Conn, bufferSize int) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if bufferSize <= 0 {
+			bufferSize = 4096
+		}
+		buf := make([]byte, bufferSize)
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := writeAll(c, buf[:n]); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	return errCh
 }
