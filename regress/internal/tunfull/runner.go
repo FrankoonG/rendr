@@ -13,12 +13,14 @@ import (
 	"net/netip"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/l3session"
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/transport/tcprepair"
 )
 
 // Options filters the TUN full baseline matrix.
@@ -107,6 +109,10 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:        2,
 			postAddBytes: 256 << 10,
 		})
+	case "TUN-full.T5-fallback":
+		return runT5Fallback(ctx, t5FallbackOptions{
+			name: name,
+		})
 	case "TUN-full.T6-selector":
 		return runT6Selector(ctx, t6SelectorOptions{
 			name: name,
@@ -179,6 +185,12 @@ type t6SelectorOptions struct {
 	name           string
 	bulkWarmWrites int
 	bulkBondWrites int
+}
+
+type t5FallbackOptions struct {
+	name       string
+	size       int64
+	migrations int
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
@@ -808,6 +820,55 @@ func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
 	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
 }
 
+func runT5Fallback(ctx context.Context, opts t5FallbackOptions) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.T5-fallback"
+	}
+	if opts.size <= 0 {
+		opts.size = 8 << 20
+	}
+	if opts.migrations <= 0 {
+		opts.migrations = 2
+	}
+
+	if err := tcprepair.Available(); err == nil {
+		ln, err := rendr.ListenTCP("127.0.0.1:0")
+		if err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("tcprepair listen: %w", err))
+		}
+		if err := runTUNStreamTransfer(ctx, ln, t5Root(ln.Addr().String(), "tcprepair", "tun-t5-tcprepair", 2), t5Identity(44000), opts.size, 1); err != nil {
+			_ = ln.Close()
+			return failedCase(opts.name, start, fmt.Errorf("tcprepair path: %w", err))
+		}
+		_ = ln.Close()
+	} else if !strings.Contains(err.Error(), "gvisor fallback") {
+		return failedCase(opts.name, start, fmt.Errorf("tcprepair unavailable error does not name gvisor fallback: %w", err))
+	}
+
+	ln, err := rendr.ListenGVisor("")
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("gvisor listen: %w", err))
+	}
+	if err := runTUNStreamTransfer(ctx, ln, t5Root(ln.Addr().String(), "gvisor", "tun-t5-gvisor", 2), t5Identity(45000), opts.size, opts.migrations); err != nil {
+		_ = ln.Close()
+		return failedCase(opts.name, start, fmt.Errorf("gvisor path: %w", err))
+	}
+	_ = ln.Close()
+
+	packetLn, err := rendr.ListenGVisorPacket("127.0.0.1:0")
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("gvisor packet listen: %w", err))
+	}
+	if err := runTUNStreamTransfer(ctx, packetLn, t5Root(packetLn.Addr().String(), "gvisor", "tun-t5-gvisor-packet", 2), t5Identity(46000), opts.size, opts.migrations); err != nil {
+		_ = packetLn.Close()
+		return failedCase(opts.name, start, fmt.Errorf("gvisor packet path: %w", err))
+	}
+	_ = packetLn.Close()
+
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
 func runT6Selector(ctx context.Context, opts t6SelectorOptions) report.Case {
 	start := time.Now()
 	if opts.name == "" {
@@ -1123,6 +1184,125 @@ func startStreamEcho(c net.Conn, bufferSize int) <-chan error {
 		}
 	}()
 	return errCh
+}
+
+func runTUNStreamTransfer(ctx context.Context, ln rendr.Listener, root rendr.Target, id l3ingress.L3Identity, size int64, migrations int) error {
+	if size <= 0 {
+		size = 8 << 20
+	}
+	if migrations < 0 {
+		migrations = 0
+	}
+	manager := &l3session.Manager{}
+	relay := &l3session.TCPRelay{Manager: manager, BufferSize: 64 << 10}
+	app, endpoint := net.Pipe()
+	defer app.Close()
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Serve(ctx, g1Event(id, root), endpoint)
+	}()
+
+	server, err := acceptOneStream(ctx, ln)
+	if err != nil {
+		return fmt.Errorf("accept: %w", err)
+	}
+	defer server.Close()
+
+	sess, err := waitStreamSession(ctx, manager, id)
+	if err != nil {
+		return err
+	}
+	admin, ok := sess.Conn.(rendr.AdminConn)
+	if !ok {
+		return fmt.Errorf("session conn is not rendr.AdminConn")
+	}
+	waitPaths(ctx, admin, 2)
+
+	recvErr := make(chan error, 1)
+	hRecv := sha256.New()
+	go func() {
+		buf := make([]byte, 128*1024)
+		var got int64
+		for got < size {
+			n, err := server.Read(buf)
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			hRecv.Write(buf[:n])
+			got += int64(n)
+		}
+		recvErr <- nil
+	}()
+
+	migPts := make([]int64, migrations)
+	for i := 0; i < migrations; i++ {
+		migPts[i] = size * int64(i+1) / int64(migrations+1)
+	}
+	hSent := sha256.New()
+	buf := make([]byte, 128*1024)
+	var written int64
+	var migIdx int
+	for written < size {
+		end := written + int64(len(buf))
+		if end > size {
+			end = size
+		}
+		chunk := buf[:end-written]
+		fillPattern(chunk, written)
+		if err := writeAll(app, chunk); err != nil {
+			return fmt.Errorf("write at %d: %w", written, err)
+		}
+		hSent.Write(chunk)
+		written += int64(len(chunk))
+		for migIdx < len(migPts) && written >= migPts[migIdx] {
+			next := nextPath(admin)
+			if next != 0 {
+				if err := admin.Migrate(next); err != nil {
+					return fmt.Errorf("migrate %d: %w", migIdx, err)
+				}
+			}
+			migIdx++
+		}
+	}
+	if err := <-recvErr; err != nil {
+		return fmt.Errorf("recv: %w", err)
+	}
+	if sentHex, recvHex := fmt.Sprintf("%x", hSent.Sum(nil)), fmt.Sprintf("%x", hRecv.Sum(nil)); sentHex != recvHex {
+		return fmt.Errorf("SHA-256 mismatch: sent=%s recv=%s", sentHex, recvHex)
+	}
+	if migrations > 0 && admin.MigrationCount() < uint64(migrations) {
+		return fmt.Errorf("MigrationCount=%d, want >= %d", admin.MigrationCount(), migrations)
+	}
+	_ = app.Close()
+	if err := waitRelayErr(relayErr, 5*time.Second); err != nil {
+		return err
+	}
+	return nil
+}
+
+func t5Root(addr, transportName, prefix string, paths int) rendr.Target {
+	children := make([]rendr.Target, 0, paths)
+	for i := 0; i < paths; i++ {
+		name := fmt.Sprintf("%s-%d", prefix, i+1)
+		children = append(children, rendr.Path(name, rendr.PathSpec{
+			Transport: transportName,
+			Address:   addr,
+			Opts:      map[string]string{"name": name},
+		}))
+	}
+	return rendr.Selector(prefix+"-root", children)
+}
+
+func t5Identity(srcPort uint16) l3ingress.L3Identity {
+	return l3ingress.L3Identity{
+		Proto:   l3ingress.ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.2"),
+		SrcPort: srcPort,
+		DstIP:   netip.MustParseAddr("198.51.100.50"),
+		DstPort: 443,
+	}
 }
 
 func startStreamDrain(c net.Conn) <-chan error {

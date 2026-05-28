@@ -85,6 +85,17 @@ func TestRunG5PathRecoveryShort(t *testing.T) {
 	}
 }
 
+func TestRunT5FallbackShort(t *testing.T) {
+	c := runT5Fallback(context.Background(), t5FallbackOptions{
+		name:       "TUN-full.T5-fallback",
+		size:       512 << 10,
+		migrations: 1,
+	})
+	if c.Name != "TUN-full.T5-fallback" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad T5 fallback case: %+v", c)
+	}
+}
+
 func TestRunT6SelectorShort(t *testing.T) {
 	c := runT6Selector(context.Background(), t6SelectorOptions{
 		name:           "TUN-full.T6-selector",
