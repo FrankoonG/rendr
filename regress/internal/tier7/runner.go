@@ -64,6 +64,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.flow.lifecycle-stats", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.flow.lifecycle-stats", "./l3ingress", "^TestFlowTableCachesDecisionAndStats|TestFlowTableCloseSnapshot|TestPumpUsesProvidedFlowTable$")
 	})
+	run("T7.peer-egress-hook", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.peer-egress-hook", "./l3ingress", "^TestEgressRegistryDispatchesIdentity|TestEgressRegistryMachineReadableErrors$")
+	})
 	run("T7.l3.parse-error-skip", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.l3.parse-error-skip", "./l3ingress", "^TestPumpSkipsParseErrors$")
 	})
