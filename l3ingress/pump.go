@@ -126,6 +126,14 @@ func (p *Pump) Run(ctx context.Context) error {
 			ev.Decided = snapshot.Decided
 			ev.Flow = snapshot.Flow
 		}
+		if ev.Decision.Deny {
+			if table != nil {
+				if reason, ok := TCPFlowCloseReason(meta); ok {
+					table.Close(meta.Identity, reason)
+				}
+			}
+			continue
+		}
 		if err := p.Handler.HandlePacket(ctx, ev); err != nil {
 			return err
 		}

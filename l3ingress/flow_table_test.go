@@ -99,3 +99,41 @@ func TestFlowTableCloseSnapshot(t *testing.T) {
 		t.Fatalf("stored closed snapshot=%+v ok=%v", stored, ok)
 	}
 }
+
+func TestFlowTableCachesDeniedDecision(t *testing.T) {
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("10.0.0.3"),
+		SrcPort: 1234,
+		DstIP:   netip.MustParseAddr("203.0.113.3"),
+		DstPort: 53,
+	}
+	var calls int
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		calls++
+		return FlowDecision{Deny: true, DenyReason: "policy_blocked"}, nil
+	}, FlowTableOptions{})
+	decision, created, snapshot, err := table.Resolve(context.Background(), FlowMeta{
+		L3Identity: id,
+		Direction:  DirectionIngress,
+	}, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || !decision.Deny || decision.DenyReason != "policy_blocked" || !snapshot.Decision.Deny {
+		t.Fatalf("first denied decision=%+v created=%v snapshot=%+v", decision, created, snapshot)
+	}
+	decision, created, snapshot, err = table.Resolve(context.Background(), FlowMeta{
+		L3Identity: id,
+		Direction:  DirectionIngress,
+	}, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || calls != 1 {
+		t.Fatalf("denied decision was not cached created=%v calls=%d", created, calls)
+	}
+	if !decision.Deny || snapshot.Packets != 2 || snapshot.Bytes != 60 {
+		t.Fatalf("cached denied decision=%+v snapshot=%+v", decision, snapshot)
+	}
+}

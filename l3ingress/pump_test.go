@@ -192,6 +192,45 @@ func TestPumpClosesFlowTableOnTCPReset(t *testing.T) {
 	}
 }
 
+func TestPumpSkipsDeniedFlow(t *testing.T) {
+	packet := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 5353, 53000)
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("192.0.2.1"),
+		SrcPort: 5353,
+		DstIP:   netip.MustParseAddr("192.0.2.2"),
+		DstPort: 53000,
+	}
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		return FlowDecision{Deny: true, DenyReason: "cidr_blocked"}, nil
+	}, FlowTableOptions{})
+	var handled int
+	p := &Pump{
+		Device:    &fakeDevice{packets: [][]byte{packet, packet}},
+		FlowTable: table,
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			handled++
+			return nil
+		}),
+	}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if handled != 0 {
+		t.Fatalf("handled=%d want 0", handled)
+	}
+	snapshot, ok := table.Snapshot(id)
+	if !ok {
+		t.Fatal("denied flow was not tracked")
+	}
+	if !snapshot.Decision.Deny || snapshot.Decision.DenyReason != "cidr_blocked" {
+		t.Fatalf("snapshot decision=%+v", snapshot.Decision)
+	}
+	if snapshot.Packets != 2 {
+		t.Fatalf("snapshot packets=%d want 2", snapshot.Packets)
+	}
+}
+
 func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	if err := (&Pump{}).Run(context.Background()); err == nil {
 		t.Fatal("nil device accepted")

@@ -61,6 +61,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.router.per-flow-cache", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.router.per-flow-cache", "./l3ingress", "^TestPumpCachesRouterDecisionPerFlow$")
 	})
+	run("T7.router.flow-deny", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.router.flow-deny", "./l3ingress", "^TestFlowTableCachesDeniedDecision|TestPumpSkipsDeniedFlow$")
+	})
 	run("T7.flow.lifecycle-stats", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.flow.lifecycle-stats", "./l3ingress", "^TestFlowTableCachesDecisionAndStats|TestFlowTableCloseSnapshot|TestPumpUsesProvidedFlowTable$")
 	})

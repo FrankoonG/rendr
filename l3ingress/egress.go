@@ -160,10 +160,12 @@ type FlowMeta struct {
 // opaque in this package so l3ingress stays below the root target graph
 // and avoids importing the top-level rendr package.
 type FlowDecision struct {
-	Peer   string
-	Root   any
-	Egress string
-	Labels map[string]string
+	Peer       string
+	Root       any
+	Egress     string
+	Labels     map[string]string
+	Deny       bool
+	DenyReason string
 }
 
 // FlowDecisionFunc lets embedders reuse TUN/l3ingress while keeping
