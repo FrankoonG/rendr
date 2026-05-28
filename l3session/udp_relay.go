@@ -24,6 +24,7 @@ type UDPRelay struct {
 	mu       sync.Mutex
 	owned    *Manager
 	sessions map[l3ingress.L3Identity]context.CancelFunc
+	packets  map[l3ingress.L3Identity]*Session
 }
 
 // HandlePacket implements l3ingress.PacketHandler for UDP ingress flows.
@@ -38,15 +39,21 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 	if err != nil {
 		return err
 	}
-	manager := r.manager()
-	if err := manager.HandlePacket(ctx, ev); err != nil {
-		return err
+	id := ev.Meta.Identity
+	sess := r.packetSession(id)
+	if sess == nil {
+		manager := r.manager()
+		if err := manager.HandlePacket(ctx, ev); err != nil {
+			return err
+		}
+		var ok bool
+		sess, ok = manager.Session(id)
+		if !ok || sess.PacketConn == nil {
+			return errors.New("l3session: UDP relay missing packet session")
+		}
+		r.setPacketSession(id, sess)
+		r.startReplyLoop(ctx, id, sess)
 	}
-	sess, ok := manager.Session(ev.Meta.Identity)
-	if !ok || sess.PacketConn == nil {
-		return errors.New("l3session: UDP relay missing packet session")
-	}
-	r.startReplyLoop(ctx, ev.Meta.Identity, sess)
 	_, err = sess.PacketConn.WriteTo(payload, packetAddr("rendr-peer"))
 	return err
 }
@@ -68,6 +75,7 @@ func (r *UDPRelay) CloseFlow(id l3ingress.L3Identity) bool {
 	if cancel != nil {
 		delete(r.sessions, id)
 	}
+	delete(r.packets, id)
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -82,6 +90,9 @@ func (r *UDPRelay) Close() error {
 	for id, cancel := range r.sessions {
 		cancels = append(cancels, cancel)
 		delete(r.sessions, id)
+	}
+	for id := range r.packets {
+		delete(r.packets, id)
 	}
 	r.mu.Unlock()
 	for _, cancel := range cancels {
@@ -115,6 +126,21 @@ func (r *UDPRelay) startReplyLoop(ctx context.Context, id l3ingress.L3Identity, 
 	r.sessions[id] = cancel
 	r.mu.Unlock()
 	go r.readReplies(loopCtx, id, sess)
+}
+
+func (r *UDPRelay) packetSession(id l3ingress.L3Identity) *Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.packets[id]
+}
+
+func (r *UDPRelay) setPacketSession(id l3ingress.L3Identity, sess *Session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.packets == nil {
+		r.packets = make(map[l3ingress.L3Identity]*Session)
+	}
+	r.packets[id] = sess
 }
 
 func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, sess *Session) {
@@ -151,6 +177,7 @@ func (r *UDPRelay) forgetSession(id l3ingress.L3Identity) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.sessions, id)
+	delete(r.packets, id)
 }
 
 type packetAddr string
