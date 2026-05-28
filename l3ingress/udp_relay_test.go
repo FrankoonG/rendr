@@ -99,6 +99,53 @@ func TestUDPFlowRelayRequiresDecision(t *testing.T) {
 	}
 }
 
+func TestUDPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("10.0.0.2"),
+		SrcPort: 40000,
+		DstIP:   netip.MustParseAddr("198.51.100.53"),
+		DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egress := &countingUDPEgress{remote: netip.MustParseAddrPort("198.51.100.53:53")}
+	reg := NewEgressRegistry()
+	if err := reg.Register("dns-egress", egress); err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPFlowRelay{Device: &writeCaptureDevice{}, Egresses: reg}
+	defer relay.Close()
+	ev := PacketEvent{
+		Packet:   packet,
+		Meta:     meta,
+		Flow:     FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"},
+		Decided:  true,
+	}
+	if err := relay.HandlePacket(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if egress.dials != 1 {
+		t.Fatalf("dials=%d want 1", egress.dials)
+	}
+	if !relay.CloseFlow(id) {
+		t.Fatal("CloseFlow returned false")
+	}
+	if !egress.lastClosed() {
+		t.Fatal("packet conn was not closed")
+	}
+	if err := relay.HandlePacket(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if egress.dials != 2 {
+		t.Fatalf("dials=%d want 2 after reopen", egress.dials)
+	}
+}
+
 type udpRelayEgress struct {
 	id     L3Identity
 	pc     net.PacketConn
@@ -175,3 +222,58 @@ func (d *writeCaptureDevice) Write(p []byte) (int, error) {
 func (d *writeCaptureDevice) Close() error { return nil }
 func (d *writeCaptureDevice) Name() string { return "capture0" }
 func (d *writeCaptureDevice) MTU() int     { return 1500 }
+
+type countingUDPEgress struct {
+	dials  int
+	remote netip.AddrPort
+	last   *idlePacketConn
+}
+
+func (e *countingUDPEgress) DialTCP(context.Context, L3Identity) (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (e *countingUDPEgress) DialUDP(context.Context, L3Identity) (net.PacketConn, netip.AddrPort, error) {
+	e.dials++
+	e.last = newIdlePacketConn()
+	return e.last, e.remote, nil
+}
+
+func (e *countingUDPEgress) lastClosed() bool {
+	if e.last == nil {
+		return false
+	}
+	e.last.mu.Lock()
+	defer e.last.mu.Unlock()
+	return e.last.closed
+}
+
+type idlePacketConn struct {
+	mu       sync.Mutex
+	closed   bool
+	closedCh chan struct{}
+}
+
+func newIdlePacketConn() *idlePacketConn {
+	return &idlePacketConn{closedCh: make(chan struct{})}
+}
+
+func (c *idlePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	<-c.closedCh
+	return 0, nil, io.EOF
+}
+
+func (c *idlePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (c *idlePacketConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.closed = true
+		close(c.closedCh)
+	}
+	return nil
+}
+func (c *idlePacketConn) LocalAddr() net.Addr              { return fakeAddr("idle") }
+func (c *idlePacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *idlePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *idlePacketConn) SetWriteDeadline(time.Time) error { return nil }

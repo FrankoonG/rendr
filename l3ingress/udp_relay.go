@@ -68,6 +68,22 @@ func (r *UDPFlowRelay) Close() error {
 	return firstErr
 }
 
+// CloseFlow closes one active UDP relay session.
+func (r *UDPFlowRelay) CloseFlow(id L3Identity) bool {
+	r.mu.Lock()
+	session := r.sessions[id]
+	if session != nil {
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+	if session == nil {
+		return false
+	}
+	session.cancel()
+	_ = session.pc.Close()
+	return true
+}
+
 func (r *UDPFlowRelay) session(ctx context.Context, ev PacketEvent) (*udpFlowSession, error) {
 	id := ev.Meta.Identity
 	r.mu.Lock()
@@ -101,6 +117,7 @@ func (r *UDPFlowRelay) session(ctx context.Context, ev PacketEvent) (*udpFlowSes
 }
 
 func (r *UDPFlowRelay) readReplies(ctx context.Context, session *udpFlowSession) {
+	defer r.forgetSession(session)
 	buf := make([]byte, 64<<10)
 	for {
 		select {
@@ -122,5 +139,13 @@ func (r *UDPFlowRelay) readReplies(ctx context.Context, session *udpFlowSession)
 		if _, err := r.Device.Write(packet); err != nil {
 			return
 		}
+	}
+}
+
+func (r *UDPFlowRelay) forgetSession(session *udpFlowSession) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sessions[session.id] == session {
+		delete(r.sessions, session.id)
 	}
 }

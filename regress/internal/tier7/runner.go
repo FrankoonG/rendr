@@ -68,7 +68,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		return runGoTests(c, rendrRoot, "T7.peer-egress-hook", "./l3ingress", "^TestEgressRegistryDispatchesIdentity|TestEgressRegistryMachineReadableErrors$")
 	})
 	run("T7.udp.identity-smoke", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.udp.identity-smoke", "./l3ingress", "^TestUDPPayloadExtractsData|TestBuildUDPPacketRoundTripIPv4|TestBuildUDPPacketRoundTripIPv6|TestUDPFlowRelayDispatchesPayloadAndWritesReply$")
+		return runGoTests(c, rendrRoot, "T7.udp.identity-smoke", "./l3ingress", "^TestUDPPayloadExtractsData|TestBuildUDPPacketRoundTripIPv4|TestBuildUDPPacketRoundTripIPv6|TestUDPFlowRelayDispatchesPayloadAndWritesReply|TestUDPFlowRelayCloseFlowAllowsReopen$")
 	})
 	run("T7.tcp.lifecycle-flags", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.tcp.lifecycle-flags", "./l3ingress", "^TestParseTCPCloseFlags|TestPumpClosesFlowTableOnTCPReset$")
