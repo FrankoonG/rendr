@@ -364,14 +364,7 @@ func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
 
 	id := g1Identity()
 	root := g1Root(ln.Addr().String(), opts.paths)
-	manager := &l3session.Manager{
-		Starter: l3session.Starter{Options: []l3session.DialerOption{
-			func(_ l3ingress.SessionRequest, d *rendr.Dialer) error {
-				d.BondStuckRTTMultiplier = 1_000_000
-				return nil
-			},
-		}},
-	}
+	manager := &l3session.Manager{}
 	relay := &l3session.TCPRelay{Manager: manager}
 	app, endpoint := net.Pipe()
 	defer app.Close()
@@ -1630,7 +1623,14 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		DstPort: 53,
 	}
 	root := g3Root(ln.Addr().String(), opts.paths)
-	manager := &l3session.Manager{}
+	manager := &l3session.Manager{
+		Starter: l3session.Starter{Options: []l3session.DialerOption{
+			func(_ l3ingress.SessionRequest, d *rendr.Dialer) error {
+				d.BondStuckRTTMultiplier = 1_000_000
+				return nil
+			},
+		}},
+	}
 	dev := &captureDevice{}
 	relay := &l3session.UDPRelay{Device: dev, Manager: manager, BufferSize: opts.payloadLen + 64}
 	defer relay.Close()
