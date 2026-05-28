@@ -22,6 +22,7 @@ import (
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/l3session"
+	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/transport/tcprepair"
 )
@@ -42,7 +43,9 @@ var plannedCases = []string{
 	"TUN-full.G4-path-death",
 	"TUN-full.G5-path-recovery",
 	"TUN-full.T3-xray-matrix",
-	"TUN-full.T4-long-run",
+	"TUN-full.T4-G1-1GiB-tcp",
+	"TUN-full.T4-G2-30m-prime",
+	"TUN-full.T4-G3-100k-pps",
 	"TUN-full.T5-fallback",
 	"TUN-full.T6-selector",
 }
@@ -53,6 +56,12 @@ var plannedCases = []string{
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
 	if opts.Case == "TUN-full.T3-xray-stream-smoke" {
 		suite.Add(runT3XrayStreamSmoke(ctx, rendrRoot, opts.Case))
+		return
+	}
+	if opts.Case == "TUN-full.T4-long-run" {
+		for _, name := range t4LongRunCases {
+			suite.Add(runPlannedCase(ctx, rendrRoot, name))
+		}
 		return
 	}
 	matched := false
@@ -120,6 +129,38 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 		return runT3XrayStreamSmoke(ctx, rendrRoot, name)
 	case "TUN-full.T3-xray-matrix":
 		return runT3XrayMatrix(ctx, rendrRoot, name)
+	case "TUN-full.T4-G1-1GiB-tcp":
+		return runT4WithBudget(ctx, name, 7*time.Minute, chaos.Realistic50M, func(c context.Context) report.Case {
+			return runG1Smoke(c, g1SmokeOptions{
+				name:       name,
+				size:       1 << 30,
+				paths:      2,
+				migrations: 10,
+			})
+		})
+	case "TUN-full.T4-G2-30m-prime":
+		return runT4WithBudget(ctx, name, 33*time.Minute, chaos.Realistic50M, func(c context.Context) report.Case {
+			return runG2Smoke(c, g2SmokeOptions{
+				name:       name,
+				duration:   30 * time.Minute,
+				interval:   100 * time.Millisecond,
+				paths:      2,
+				migrations: 30,
+			})
+		})
+	case "TUN-full.T4-G3-100k-pps":
+		return runT4WithBudget(ctx, name, 8*time.Minute, chaos.Profile{}, func(c context.Context) report.Case {
+			return runG3Smoke(c, g3Options{
+				name:       name,
+				duration:   5 * time.Minute,
+				pps:        100_000,
+				payloadLen: 1024,
+				paths:      8,
+				migrations: 10,
+				lossPct:    -1,
+				p95Ceiling: 20 * time.Millisecond,
+			})
+		})
 	case "TUN-full.T5-fallback":
 		return runT5Fallback(ctx, t5FallbackOptions{
 			name: name,
@@ -131,6 +172,12 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 	default:
 		return UnimplementedCase(name)
 	}
+}
+
+var t4LongRunCases = []string{
+	"TUN-full.T4-G1-1GiB-tcp",
+	"TUN-full.T4-G2-30m-prime",
+	"TUN-full.T4-G3-100k-pps",
 }
 
 // UnimplementedCase returns the explicit guard case used until real
@@ -149,6 +196,40 @@ func UnimplementedCase(name string) report.Case {
 
 func caseMatches(filter, name string) bool {
 	return filter == "" || filter == name
+}
+
+func runT4WithBudget(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) report.Case) report.Case {
+	start := time.Now()
+	cleanup, err := chaos.Apply(prof)
+	if err != nil {
+		return failedCase(name, start, fmt.Errorf("chaos.Apply: %w", err))
+	}
+	defer func() {
+		if cleanup != nil {
+			_ = cleanup()
+		}
+	}()
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	done := make(chan report.Case, 1)
+	go func() {
+		done <- fn(cctx)
+	}()
+	select {
+	case c := <-done:
+		if c.Name == "" {
+			c.Name = name
+		}
+		if c.Tier == "" {
+			c.Tier = "T7"
+		}
+		if c.Duration == 0 {
+			c.Duration = time.Since(start)
+		}
+		return c
+	case <-cctx.Done():
+		return failedCase(name, start, fmt.Errorf("case exceeded T4 budget %s: %w", budget, cctx.Err()))
+	}
 }
 
 type g1SmokeOptions struct {
@@ -1506,7 +1587,9 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if opts.migrations == 0 {
 		opts.migrations = 3
 	}
-	if opts.lossPct <= 0 {
+	if opts.lossPct < 0 {
+		opts.lossPct = 0
+	} else if opts.lossPct == 0 {
 		opts.lossPct = 0.5
 	}
 	if opts.p95Ceiling <= 0 {

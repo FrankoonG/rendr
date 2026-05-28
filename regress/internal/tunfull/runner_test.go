@@ -20,14 +20,21 @@ func TestRunTunFullCaseFilter(t *testing.T) {
 	}
 }
 
-func TestRunTunFullDefaultStillGuardsUnimplementedCases(t *testing.T) {
-	suite := report.New()
-	Run(context.Background(), suite, ".", Options{Case: "TUN-full.T4-long-run"})
-	if len(suite.Cases) != 1 {
-		t.Fatalf("cases=%d want 1", len(suite.Cases))
+func TestRunTunFullDefaultIncludesT4LongRunCases(t *testing.T) {
+	want := map[string]bool{
+		"TUN-full.T4-G1-1GiB-tcp":  false,
+		"TUN-full.T4-G2-30m-prime": false,
+		"TUN-full.T4-G3-100k-pps":  false,
 	}
-	if !suite.AnyFailedAt("T7") {
-		t.Fatal("unimplemented tun-full case unexpectedly has no guard failure")
+	for _, name := range plannedCases {
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+	}
+	for name, got := range want {
+		if !got {
+			t.Fatalf("plannedCases missing %s", name)
+		}
 	}
 }
 
