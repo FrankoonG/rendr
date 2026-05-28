@@ -140,6 +140,14 @@ func main() {
 		// Default phase-2 invocation runs T3 (path-factory matrix).
 		// T4 long-run, T5 fallback, and T6 selector graph are opt-in via --tier=4/5/6
 		// or included together via --full.
+		if cfg.tunFull {
+			fmt.Println("== phase 2 / TUN full baseline ==")
+			c := tunFullUnimplementedCase()
+			suite.Add(c)
+			writeReports(suite, cfg.reportDir)
+			fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
+			os.Exit(exitT7Fail)
+		}
 		runT3, runT4, runT5, runT6, runT7 := selectedTiers(cfg)
 		if !runT3 && !runT4 && !runT5 && !runT6 && !runT7 {
 			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, --tier=6, --tier=7, --tun-full, or --full")
@@ -229,7 +237,7 @@ func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 
 func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7 bool) {
 	if cfg.tunFull {
-		return false, false, false, false, true
+		return false, false, false, false, false
 	}
 	if cfg.full {
 		return true, true, true, true, false
@@ -247,6 +255,14 @@ func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7 bool) {
 		return false, false, false, false, true
 	default:
 		return false, false, false, false, false
+	}
+}
+
+func tunFullUnimplementedCase() report.Case {
+	return report.Case{
+		Name:    "TUN-full-not-implemented",
+		Tier:    "T7",
+		Failure: "--tun-full baseline is not implemented yet; T7 feature tests are not a full TUN regression",
 	}
 }
 

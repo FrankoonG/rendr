@@ -24,7 +24,7 @@ func TestSelectedTiers(t *testing.T) {
 		{name: "tier5", cfg: runFlags{tier: "5"}, wantT5: true},
 		{name: "tier6", cfg: runFlags{tier: "6"}, wantT6: true},
 		{name: "tier7", cfg: runFlags{tier: "7"}, wantT7: true},
-		{name: "tun-full", cfg: runFlags{tunFull: true}, wantT7: true},
+		{name: "tun-full-handled-before-tier-selection", cfg: runFlags{tunFull: true}},
 		{name: "full", cfg: runFlags{full: true}, wantT3: true, wantT4: true, wantT5: true, wantT6: true},
 	}
 	for _, tt := range tests {
@@ -36,5 +36,12 @@ func TestSelectedTiers(t *testing.T) {
 					tt.wantT3, tt.wantT4, tt.wantT5, tt.wantT6, tt.wantT7)
 			}
 		})
+	}
+}
+
+func TestTunFullUnimplementedCaseFails(t *testing.T) {
+	c := tunFullUnimplementedCase()
+	if c.Name != "TUN-full-not-implemented" || c.Tier != "T7" || c.Failure == "" {
+		t.Fatalf("bad tun-full guard case: %+v", c)
 	}
 }
