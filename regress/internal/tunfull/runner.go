@@ -155,7 +155,7 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 				duration:   5 * time.Minute,
 				pps:        100_000,
 				payloadLen: 1024,
-				paths:      12,
+				paths:      16,
 				migrations: 10,
 				lossPct:    -1,
 				p95Ceiling: 20 * time.Millisecond,
@@ -1721,16 +1721,6 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 			rx++
 		}
 	}()
-
-	for i := 0; i < 1000; i++ {
-		binary.BigEndian.PutUint64(payload[:8], ^uint64(0))
-		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
-		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
-		if err := relay.HandlePacket(ctx, event); err != nil {
-			return failedCase(opts.name, start, fmt.Errorf("warmup packet %d: %w", i, err))
-		}
-	}
-	time.Sleep(100 * time.Millisecond)
 
 	startMig := admin.MigrationCount()
 	migInterval := opts.duration / time.Duration(opts.migrations+1)
