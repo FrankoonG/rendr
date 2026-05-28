@@ -41,7 +41,6 @@ var plannedCases = []string{
 	"TUN-full.G3-smoke",
 	"TUN-full.G4-path-death",
 	"TUN-full.G5-path-recovery",
-	"TUN-full.T3-xray-stream-smoke",
 	"TUN-full.T3-xray-matrix",
 	"TUN-full.T4-long-run",
 	"TUN-full.T5-fallback",
@@ -52,6 +51,10 @@ var plannedCases = []string{
 // TUN/per-flow baselines; remaining planned cases stay as explicit guard
 // failures so --tun-full cannot report a false green.
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
+	if opts.Case == "TUN-full.T3-xray-stream-smoke" {
+		suite.Add(runT3XrayStreamSmoke(ctx, rendrRoot, opts.Case))
+		return
+	}
 	matched := false
 	for _, name := range plannedCases {
 		if !caseMatches(opts.Case, name) {
