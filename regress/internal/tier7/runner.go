@@ -55,6 +55,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.capability.peer-denied", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.capability.peer-denied", "./l3ingress", "^TestRequirePeerL3Identity|TestRequirePeerEgress$")
 	})
+	run("T7.capability.peer-advertise", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.capability.peer-advertise", ".", "^TestDialerAdvertisesL3IdentityCapability|TestDialPacketAdvertisesL3IdentityAndPacketMode$")
+	})
 	run("T7.router.per-flow-hook", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.router.per-flow-hook", "./l3ingress", "^TestPumpRoutesParsedPackets$")
 	})

@@ -216,6 +216,7 @@ func (l *MultiListener) handleHello(pc transport.PathConn, transportName string,
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetPeerCaps(p.Caps)
 	if !l.bridges.Put(p.FlowID, e) {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()

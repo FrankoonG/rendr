@@ -32,11 +32,12 @@ const (
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side    Side
-	flowID  [16]byte
-	limits  Limits
-	state   atomic.Uint32 // BridgeState
-	created time.Time
+	side     Side
+	flowID   [16]byte
+	limits   Limits
+	peerCaps atomic.Uint32
+	state    atomic.Uint32 // BridgeState
+	created  time.Time
 
 	// Mode is the dispatcher selector: 1=prime, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
@@ -242,6 +243,12 @@ func NewClientFlowID() [16]byte {
 
 // FlowID returns the engine's flow identifier.
 func (e *Engine) FlowID() [16]byte { return e.flowID }
+
+// SetPeerCaps records capability bits advertised by the peer's HELLO.
+func (e *Engine) SetPeerCaps(caps uint32) { e.peerCaps.Store(caps) }
+
+// PeerCaps returns the capability bits advertised by the peer's HELLO.
+func (e *Engine) PeerCaps() uint32 { return e.peerCaps.Load() }
 
 // CreatedAt returns the monotonic wall-clock time at which this
 // engine was constructed. Production monitoring uses this to compute

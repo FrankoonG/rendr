@@ -138,6 +138,7 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetPeerCaps(p.Caps)
 	// DATAGRAM-mode peer implies packet boundaries regardless of
 	// whether CapsPacketMode was set; force it.
 	e.SetPacketMode()

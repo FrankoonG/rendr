@@ -141,6 +141,7 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetPeerCaps(p.Caps)
 	if !l.bridges.Put(p.FlowID, e) {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()

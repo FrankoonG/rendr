@@ -137,6 +137,7 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetPeerCaps(p.Caps)
 	if !l.bridges.Put(p.FlowID, e) {
 		// Collision: BYE and drop.
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)

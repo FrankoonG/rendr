@@ -166,6 +166,7 @@ func (c *engineBackedConn) Stats() ConnStats {
 		BondStuckSkips: c.e.BondStuckSkips(),
 		MigrationCount: c.e.MigrationCount(),
 		CreatedAt:      c.e.CreatedAt(),
+		PeerCaps:       c.e.PeerCaps(),
 	}
 }
 

@@ -150,4 +150,8 @@ type ConnStats struct {
 	// engine was constructed. Use time.Since(s.CreatedAt) to compute
 	// connection age.
 	CreatedAt time.Time
+	// PeerCaps are the proto.Caps* bits advertised by the peer's
+	// initial HELLO. TUN/l3ingress uses this to reject
+	// PreserveL3Identity flows before silently losing L3 metadata.
+	PeerCaps uint32
 }

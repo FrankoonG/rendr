@@ -73,6 +73,12 @@ type Dialer struct {
 	// about bypassing slow paths.
 	BondStuckRTTMultiplier float64
 
+	// PreserveL3Identity advertises proto.CapsL3Identity in HELLO for
+	// TUN/l3ingress flows that must carry original src/dst IP:port
+	// metadata to peer-side egress hooks. It does not create a TUN
+	// device by itself; ingress setup remains owned by the embedder.
+	PreserveL3Identity bool
+
 	// streamFactories / packetFactories are populated via
 	// AddStreamPathFactory / AddPacketPathFactory. They override
 	// transport.Default lookup for PathSpec.Transport names that
@@ -112,7 +118,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHelloWithPathName(pc, flowID, 0, pathSpecName(first)); err != nil {
+	if err := engine.PerformClientHelloWithPathName(pc, flowID, d.helloCaps(false), pathSpecName(first)); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
@@ -197,7 +203,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHelloWithPathName(pc, flowID, proto.CapsPacketMode, pathSpecName(first)); err != nil {
+	if err := engine.PerformClientHelloWithPathName(pc, flowID, d.helloCaps(true), pathSpecName(first)); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
@@ -259,6 +265,17 @@ func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 		return compiledTarget{}, err
 	}
 	return ct, nil
+}
+
+func (d *Dialer) helloCaps(packetMode bool) uint32 {
+	var caps uint32
+	if packetMode {
+		caps |= proto.CapsPacketMode
+	}
+	if d.PreserveL3Identity {
+		caps |= proto.CapsL3Identity
+	}
+	return caps
 }
 
 // engineLimits packs the Dialer-side knobs into engine.Limits. The

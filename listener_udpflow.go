@@ -174,6 +174,7 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetPeerCaps(p.Caps)
 	packetMode := p.Caps&proto.CapsPacketMode != 0
 	if packetMode {
 		e.SetPacketMode()
