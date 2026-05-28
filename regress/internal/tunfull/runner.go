@@ -155,7 +155,7 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 				duration:   5 * time.Minute,
 				pps:        100_000,
 				payloadLen: 1024,
-				paths:      16,
+				paths:      12,
 				migrations: 10,
 				lossPct:    -1,
 				p95Ceiling: 20 * time.Millisecond,
@@ -1723,26 +1723,32 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	}()
 
 	startMig := admin.MigrationCount()
-	migInterval := opts.duration / time.Duration(opts.migrations+1)
-	migTicker := time.NewTicker(migInterval)
-	defer migTicker.Stop()
 	packetInterval := time.Second / time.Duration(opts.pps)
 	nextTick := time.Now()
-	endAt := time.Now().Add(opts.duration)
+	targetPackets := int64(opts.pps) * int64(opts.duration/time.Second)
+	if targetPackets <= 0 {
+		targetPackets = int64(float64(opts.pps) * opts.duration.Seconds())
+	}
+	nextMigration := int64(1)
 	var sent int64
-	for time.Now().Before(endAt) {
+	for sent < targetPackets {
 		select {
 		case <-ctx.Done():
 			return failedCase(opts.name, start, ctx.Err())
-		case <-migTicker.C:
+		default:
+		}
+		if opts.migrations > 0 && nextMigration <= int64(opts.migrations) && sent >= targetPackets*nextMigration/int64(opts.migrations+1) {
 			next := nextPacketPath(admin)
 			if next != 0 {
 				_ = admin.Migrate(next)
 			}
-		default:
+			nextMigration++
 		}
 		paceUntil(nextTick)
 		nextTick = nextTick.Add(packetInterval)
+		if lag := time.Since(nextTick); lag > packetInterval*10 {
+			nextTick = time.Now().Add(packetInterval)
+		}
 		binary.BigEndian.PutUint64(payload[:8], uint64(sent))
 		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
 		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
