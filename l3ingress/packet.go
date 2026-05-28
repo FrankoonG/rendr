@@ -18,6 +18,15 @@ const (
 	ReasonIPv6ExtensionLoop    ParseReason = "ipv6_extension_loop"
 )
 
+const (
+	TCPFlagFIN uint8 = 0x01
+	TCPFlagSYN uint8 = 0x02
+	TCPFlagRST uint8 = 0x04
+	TCPFlagPSH uint8 = 0x08
+	TCPFlagACK uint8 = 0x10
+	TCPFlagURG uint8 = 0x20
+)
+
 // ParseError keeps TUN/l3ingress failures inspectable without forcing
 // callers to scrape error strings.
 type ParseError struct {
@@ -43,6 +52,7 @@ type PacketMeta struct {
 	Fragmented     bool
 	MoreFragments  bool
 	FragmentOffset int
+	TCPFlags       uint8
 }
 
 // ParsePacket classifies one raw IP packet as read from a TUN device.
@@ -183,7 +193,15 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 
 func fillPorts(packet []byte, meta *PacketMeta, off int) error {
 	switch meta.Identity.Proto {
-	case ProtocolTCP, ProtocolUDP:
+	case ProtocolTCP:
+		if len(packet) < off+14 {
+			return parseErr(ReasonShortPacket, "tcp header flags")
+		}
+		meta.Identity.SrcPort = binary.BigEndian.Uint16(packet[off : off+2])
+		meta.Identity.DstPort = binary.BigEndian.Uint16(packet[off+2 : off+4])
+		meta.TCPFlags = packet[off+13]
+		return nil
+	case ProtocolUDP:
 		if len(packet) < off+4 {
 			return parseErr(ReasonShortPacket, fmt.Sprintf("%s header ports", meta.Identity.Proto))
 		}
@@ -195,6 +213,21 @@ func fillPorts(packet []byte, meta *PacketMeta, off int) error {
 	default:
 		return parseErr(ReasonUnsupportedProtocol, meta.Identity.Proto.String())
 	}
+}
+
+// TCPFlowCloseReason reports whether a TCP packet carries a lifecycle
+// signal that should close the corresponding ingress flow tracker.
+func TCPFlowCloseReason(meta PacketMeta) (FlowCloseReason, bool) {
+	if meta.Identity.Proto != ProtocolTCP {
+		return "", false
+	}
+	if meta.TCPFlags&TCPFlagRST != 0 {
+		return FlowCloseTCPRST, true
+	}
+	if meta.TCPFlags&TCPFlagFIN != 0 {
+		return FlowCloseTCPFIN, true
+	}
+	return "", false
 }
 
 func isIPv6Extension(next byte) bool {

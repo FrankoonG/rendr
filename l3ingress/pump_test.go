@@ -151,6 +151,47 @@ func TestPumpUsesProvidedFlowTable(t *testing.T) {
 	}
 }
 
+func TestPumpClosesFlowTableOnTCPReset(t *testing.T) {
+	packet := ipv4Packet(6, [4]byte{10, 0, 0, 1}, [4]byte{198, 51, 100, 9}, 1234, 443)
+	reset := append([]byte(nil), packet...)
+	reset[33] = TCPFlagRST
+	id := L3Identity{
+		Proto:   ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.1"),
+		SrcPort: 1234,
+		DstIP:   netip.MustParseAddr("198.51.100.9"),
+		DstPort: 443,
+	}
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		return FlowDecision{Peer: "peer-a"}, nil
+	}, FlowTableOptions{})
+	var handled int
+	p := &Pump{
+		Device:    &fakeDevice{packets: [][]byte{packet, reset}},
+		FlowTable: table,
+		Handler: PacketHandlerFunc(func(_ context.Context, ev PacketEvent) error {
+			handled++
+			return nil
+		}),
+	}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if handled != 2 {
+		t.Fatalf("handled=%d want 2", handled)
+	}
+	if _, ok := table.Snapshot(id); ok {
+		t.Fatal("reset flow still active")
+	}
+	closed, ok := table.ClosedSnapshot(id)
+	if !ok {
+		t.Fatal("reset flow not closed")
+	}
+	if closed.CloseReason != FlowCloseTCPRST || closed.Packets != 2 {
+		t.Fatalf("closed snapshot=%+v", closed)
+	}
+}
+
 func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	if err := (&Pump{}).Run(context.Background()); err == nil {
 		t.Fatal("nil device accepted")

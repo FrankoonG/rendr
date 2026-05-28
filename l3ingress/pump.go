@@ -129,5 +129,10 @@ func (p *Pump) Run(ctx context.Context) error {
 		if err := p.Handler.HandlePacket(ctx, ev); err != nil {
 			return err
 		}
+		if table != nil {
+			if reason, ok := TCPFlowCloseReason(meta); ok {
+				table.Close(meta.Identity, reason)
+			}
+		}
 	}
 }

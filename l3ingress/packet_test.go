@@ -9,6 +9,7 @@ import (
 
 func TestParseIPv4TCPIdentity(t *testing.T) {
 	pkt := ipv4Packet(6, [4]byte{10, 0, 0, 1}, [4]byte{203, 0, 113, 9}, 12345, 443)
+	pkt[33] = TCPFlagSYN | TCPFlagACK
 	meta, err := ParsePacket(pkt)
 	if err != nil {
 		t.Fatal(err)
@@ -28,6 +29,32 @@ func TestParseIPv4TCPIdentity(t *testing.T) {
 	}
 	if got := want.Reverse(); got.SrcPort != 443 || got.DstPort != 12345 {
 		t.Fatalf("reverse ports: %+v", got)
+	}
+	if meta.TCPFlags != TCPFlagSYN|TCPFlagACK {
+		t.Fatalf("tcp flags=%02x", meta.TCPFlags)
+	}
+	if reason, ok := TCPFlowCloseReason(meta); ok || reason != "" {
+		t.Fatalf("unexpected close reason=%q ok=%v", reason, ok)
+	}
+}
+
+func TestParseTCPCloseFlags(t *testing.T) {
+	pkt := ipv4Packet(6, [4]byte{10, 0, 0, 1}, [4]byte{203, 0, 113, 9}, 12345, 443)
+	pkt[33] = TCPFlagFIN
+	meta, err := ParsePacket(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason, ok := TCPFlowCloseReason(meta); !ok || reason != FlowCloseTCPFIN {
+		t.Fatalf("fin reason=%q ok=%v", reason, ok)
+	}
+	pkt[33] = TCPFlagRST
+	meta, err = ParsePacket(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason, ok := TCPFlowCloseReason(meta); !ok || reason != FlowCloseTCPRST {
+		t.Fatalf("rst reason=%q ok=%v", reason, ok)
 	}
 }
 

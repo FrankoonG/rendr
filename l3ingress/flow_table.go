@@ -14,6 +14,8 @@ const (
 	FlowCloseManual       FlowCloseReason = "manual"
 	FlowCloseIdle         FlowCloseReason = "idle"
 	FlowCloseDeviceClosed FlowCloseReason = "device_closed"
+	FlowCloseTCPFIN       FlowCloseReason = "tcp_fin"
+	FlowCloseTCPRST       FlowCloseReason = "tcp_rst"
 )
 
 // FlowTableOptions configures a FlowTable.
