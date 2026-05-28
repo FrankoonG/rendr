@@ -60,6 +60,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T6.peak.probe-budget", 2*time.Minute, func(c context.Context) report.Case {
 		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.probe-budget", "^TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate$")
 	})
+	run("T6.peak.slow-peak-revert", 2*time.Minute, func(c context.Context) report.Case {
+		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.slow-peak-revert", "^TestSelectorPeakTransferSlowPeakRevertsAndSuppresses$")
+	})
 }
 
 func caseMatches(filter, name string) bool {

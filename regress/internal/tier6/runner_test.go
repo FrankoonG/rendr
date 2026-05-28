@@ -33,4 +33,7 @@ func TestCaseMatches(t *testing.T) {
 	if !caseMatches("T6.peak.probe-budget", "T6.peak.probe-budget") {
 		t.Fatal("probe budget case should match")
 	}
+	if !caseMatches("T6.peak.slow-peak-revert", "T6.peak.slow-peak-revert") {
+		t.Fatal("slow peak revert case should match")
+	}
 }

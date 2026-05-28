@@ -12,8 +12,11 @@ const (
 	defaultPeakWindow        = 200 * time.Millisecond
 	defaultPeakSaturationFor = 600 * time.Millisecond
 	defaultPeakReturnFor     = 800 * time.Millisecond
+	defaultPeakVerifyFor     = 800 * time.Millisecond
+	defaultPeakSuppressFor   = 5 * time.Second
 	defaultPeakSaturation    = 0.95
 	defaultPeakReturn        = 0.50
+	defaultPeakMinGain       = 0.90
 	defaultPeakMinBytes      = 256 << 10
 )
 
@@ -32,6 +35,9 @@ type peakTransferController struct {
 	onPeak         bool
 	normalPeakBps  float64
 	normalBytes    uint64
+	peakStarted    time.Time
+	peakBytes      uint64
+	suppressUntil  time.Time
 	saturatedSince time.Time
 	returnSince    time.Time
 
@@ -147,11 +153,17 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		if now.Sub(c.saturatedSince) < needFor {
 			return
 		}
+		if now.Before(c.suppressUntil) {
+			c.saturatedSince = time.Time{}
+			return
+		}
 		if !c.peakHealthy() {
 			c.saturatedSince = time.Time{}
 			return
 		}
 		c.onPeak = true
+		c.peakStarted = now
+		c.peakBytes = 0
 		c.saturatedSince = time.Time{}
 		c.returnSince = time.Time{}
 		c.mu.Unlock()
@@ -159,6 +171,29 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		c.setMode(c.peakMode)
 		c.mu.Lock()
 		return
+	}
+
+	c.peakBytes += bytes
+	if c.peakStarted.IsZero() {
+		c.peakStarted = now
+	}
+	verifyFor := defaultPeakVerifyFor
+	if elapsed := now.Sub(c.peakStarted); elapsed >= verifyFor && c.normalPeakBps > 0 {
+		peakBps := float64(c.peakBytes*8) / elapsed.Seconds()
+		if peakBps < c.normalPeakBps*defaultPeakMinGain {
+			c.onPeak = false
+			c.peakStarted = time.Time{}
+			c.peakBytes = 0
+			c.returnSince = time.Time{}
+			c.suppressUntil = now.Add(defaultPeakSuppressFor)
+			c.mu.Unlock()
+			_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "peak-verify-failed")
+			c.setMode(ModePrime)
+			c.mu.Lock()
+			return
+		}
+		c.peakStarted = time.Time{}
+		c.peakBytes = 0
 	}
 
 	ratio := c.opts.ReturnRatio
@@ -182,6 +217,8 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		return
 	}
 	c.onPeak = false
+	c.peakStarted = time.Time{}
+	c.peakBytes = 0
 	c.returnSince = time.Time{}
 	c.mu.Unlock()
 	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "peak-return")

@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"io"
+	"net"
 	"testing"
 	"time"
 )
@@ -762,6 +763,104 @@ func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
 	}
 }
 
+func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name, transport string) PathSpec {
+		return PathSpec{Transport: transport, Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Path("A", spec("A", "tcp")),
+			Path("B", spec("B", "slow-tcp")),
+		},
+		PeakTransfer{
+			Targets:         []string{"B"},
+			SaturationFor:   200 * time.Millisecond,
+			ReturnFor:       200 * time.Millisecond,
+			SaturationRatio: 0.8,
+			ReturnRatio:     0.2,
+		},
+	)
+	d := &Dialer{Root: root, ProbeInterval: time.Hour}
+	if err := d.AddStreamPathFactory("slow-tcp", func(ctx context.Context, addr string) (net.Conn, error) {
+		var nd net.Dialer
+		c, err := nd.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &slowWriteConn{Conn: c, delay: 30 * time.Millisecond}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+	go io.Copy(io.Discard, server)
+
+	ids := idsByName(client.Paths())
+	if ids["A"] == 0 || ids["B"] == 0 {
+		t.Fatalf("idsByName=%v", ids)
+	}
+
+	chunk := make([]byte, 32<<10)
+	for i := 0; i < 32; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitForActivePath(t, client, ids["B"], 3*time.Second)
+
+	for i := 0; i < 48; i++ {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForActivePath(t, client, ids["A"], 3*time.Second)
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := client.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if got := client.(AdminConn).ActivePath(); got != ids["A"] {
+			t.Fatalf("active path=%d want A=%d while slow peak is suppressed", got, ids["A"])
+		}
+	}
+}
+
 func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
@@ -775,6 +874,22 @@ func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 		t.Fatalf("mode=%v want %v", m.Mode(), want)
 	}
 	t.Fatalf("connection does not expose Mode(); want %v", want)
+}
+
+func waitForActivePath(t *testing.T, c Conn, want uint32, within time.Duration) {
+	t.Helper()
+	admin, ok := c.(AdminConn)
+	if !ok {
+		t.Fatalf("connection does not expose AdminConn; want active path %d", want)
+	}
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if admin.ActivePath() == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("active path=%d want %d", admin.ActivePath(), want)
 }
 
 func writesByName(paths []PathInfo) map[string]uint64 {
@@ -791,4 +906,16 @@ func idsByName(paths []PathInfo) map[string]uint32 {
 		out[p.Spec.Opts["name"]] = p.ID
 	}
 	return out
+}
+
+type slowWriteConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c *slowWriteConn) Write(p []byte) (int, error) {
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
+	return c.Conn.Write(p)
 }
