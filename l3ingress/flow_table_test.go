@@ -237,3 +237,99 @@ func TestFlowTableRecordsPathSelectionAndMigrations(t *testing.T) {
 		t.Fatalf("observer migration snapshot=%+v", snapshots[2])
 	}
 }
+
+func TestFlowTableTracksIndependentSelectorFlows(t *testing.T) {
+	interactive := L3Identity{
+		Proto:   ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.10"),
+		SrcPort: 42000,
+		DstIP:   netip.MustParseAddr("203.0.113.10"),
+		DstPort: 22,
+	}
+	bulk := L3Identity{
+		Proto:   ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.11"),
+		SrcPort: 43000,
+		DstIP:   netip.MustParseAddr("203.0.113.11"),
+		DstPort: 443,
+	}
+	calls := map[L3Identity]int{}
+	table := NewFlowTable(func(_ context.Context, flow FlowMeta) (FlowDecision, error) {
+		calls[flow.L3Identity]++
+		switch flow.L3Identity {
+		case interactive:
+			return FlowDecision{
+				Peer:   "peer-low",
+				Egress: "direct",
+				Labels: map[string]string{"class": "interactive"},
+			}, nil
+		case bulk:
+			return FlowDecision{
+				Peer:   "peer-bulk",
+				Egress: "bond-egress",
+				Labels: map[string]string{"class": "bulk"},
+			}, nil
+		default:
+			t.Fatalf("unexpected flow identity: %+v", flow.L3Identity)
+			return FlowDecision{}, nil
+		}
+	}, FlowTableOptions{})
+
+	if _, created, _, err := table.Resolve(context.Background(), FlowMeta{
+		L3Identity: interactive,
+		Direction:  DirectionIngress,
+	}, 64); err != nil || !created {
+		t.Fatalf("interactive resolve created=%v err=%v", created, err)
+	}
+	if _, created, _, err := table.Resolve(context.Background(), FlowMeta{
+		L3Identity: bulk,
+		Direction:  DirectionIngress,
+	}, 512); err != nil || !created {
+		t.Fatalf("bulk resolve created=%v err=%v", created, err)
+	}
+
+	if _, ok := table.RecordPathSelection(interactive, []string{"path-a-low"}); !ok {
+		t.Fatal("interactive path selection returned false")
+	}
+	if _, ok := table.RecordPathSelection(bulk, []string{"path-a-low"}); !ok {
+		t.Fatal("bulk path selection returned false")
+	}
+	peakPaths := []string{"path-bulk-b", "path-bulk-c"}
+	if _, ok := table.RecordMigration(bulk, peakPaths); !ok {
+		t.Fatal("bulk migration returned false")
+	}
+	peakPaths[0] = "mutated"
+
+	interactiveSnap, ok := table.Snapshot(interactive)
+	if !ok {
+		t.Fatal("interactive snapshot missing")
+	}
+	bulkSnap, ok := table.Snapshot(bulk)
+	if !ok {
+		t.Fatal("bulk snapshot missing")
+	}
+	if calls[interactive] != 1 || calls[bulk] != 1 {
+		t.Fatalf("router calls interactive=%d bulk=%d want 1/1", calls[interactive], calls[bulk])
+	}
+	if interactiveSnap.Decision.Labels["class"] != "interactive" || interactiveSnap.Decision.Egress != "direct" {
+		t.Fatalf("interactive decision leaked or changed: %+v", interactiveSnap.Decision)
+	}
+	if bulkSnap.Decision.Labels["class"] != "bulk" || bulkSnap.Decision.Egress != "bond-egress" {
+		t.Fatalf("bulk decision leaked or changed: %+v", bulkSnap.Decision)
+	}
+	if interactiveSnap.MigrationCount != 0 || len(interactiveSnap.SelectedPaths) != 1 || interactiveSnap.SelectedPaths[0] != "path-a-low" {
+		t.Fatalf("interactive selection changed by bulk migration: %+v", interactiveSnap)
+	}
+	if bulkSnap.MigrationCount != 1 || len(bulkSnap.SelectedPaths) != 2 || bulkSnap.SelectedPaths[0] != "path-bulk-b" || bulkSnap.SelectedPaths[1] != "path-bulk-c" {
+		t.Fatalf("bulk migration not tracked independently: %+v", bulkSnap)
+	}
+
+	bulkSnap.SelectedPaths[0] = "mutated-again"
+	storedBulk, ok := table.Snapshot(bulk)
+	if !ok {
+		t.Fatal("stored bulk snapshot missing")
+	}
+	if storedBulk.SelectedPaths[0] != "path-bulk-b" {
+		t.Fatalf("bulk selected paths were not isolated: %+v", storedBulk.SelectedPaths)
+	}
+}

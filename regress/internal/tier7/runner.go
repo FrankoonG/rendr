@@ -70,6 +70,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.flow.observe", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.flow.observe", "./l3ingress", "^TestFlowTableObserverReceivesLifecycleSnapshots|TestFlowTableRecordsPathSelectionAndMigrations$")
 	})
+	run("T7.selector.per-flow", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.selector.per-flow", "./l3ingress", "^TestFlowTableTracksIndependentSelectorFlows$")
+	})
 	run("T7.peer-egress-hook", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.peer-egress-hook", "./l3ingress", "^TestEgressRegistryDispatchesIdentity|TestEgressRegistryMachineReadableErrors$")
 	})
