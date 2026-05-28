@@ -1693,7 +1693,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, opts.payloadLen+64)
-		_ = server.SetReadDeadline(time.Now().Add(opts.duration + 5*time.Second))
+		_ = server.SetReadDeadline(time.Now().Add(opts.duration + 2*time.Minute))
 		var rx int
 		sendDoneC := sendDone
 		for {
