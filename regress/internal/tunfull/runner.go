@@ -11,6 +11,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -38,6 +41,7 @@ var plannedCases = []string{
 	"TUN-full.G3-smoke",
 	"TUN-full.G4-path-death",
 	"TUN-full.G5-path-recovery",
+	"TUN-full.T3-xray-stream-smoke",
 	"TUN-full.T3-xray-matrix",
 	"TUN-full.T4-long-run",
 	"TUN-full.T5-fallback",
@@ -47,14 +51,14 @@ var plannedCases = []string{
 // Run records the TUN full baseline status. Implemented cases run as real
 // TUN/per-flow baselines; remaining planned cases stay as explicit guard
 // failures so --tun-full cannot report a false green.
-func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
+func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
 	matched := false
 	for _, name := range plannedCases {
 		if !caseMatches(opts.Case, name) {
 			continue
 		}
 		matched = true
-		suite.Add(runPlannedCase(ctx, name))
+		suite.Add(runPlannedCase(ctx, rendrRoot, name))
 	}
 	if opts.Case != "" && !matched {
 		suite.Add(report.Case{
@@ -66,7 +70,7 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 	}
 }
 
-func runPlannedCase(ctx context.Context, name string) report.Case {
+func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 	switch name {
 	case "TUN-full.G1-smoke":
 		return runG1Smoke(ctx, g1SmokeOptions{
@@ -109,6 +113,8 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:        2,
 			postAddBytes: 256 << 10,
 		})
+	case "TUN-full.T3-xray-stream-smoke":
+		return runT3XrayStreamSmoke(ctx, rendrRoot, name)
 	case "TUN-full.T5-fallback":
 		return runT5Fallback(ctx, t5FallbackOptions{
 			name: name,
@@ -191,6 +197,42 @@ type t5FallbackOptions struct {
 	name       string
 	size       int64
 	migrations int
+}
+
+func runT3XrayStreamSmoke(ctx context.Context, rendrRoot, name string) report.Case {
+	start := time.Now()
+	if name == "" {
+		name = "TUN-full.T3-xray-stream-smoke"
+	}
+	if _, err := os.Stat(rendrRoot); err != nil {
+		return failedCase(name, start, fmt.Errorf("bad rendr root: %w", err))
+	}
+	regressDir := filepath.Join(rendrRoot, "regress")
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(
+		cctx,
+		"go",
+		"test",
+		"./internal/matrix",
+		"-run",
+		"^TestTUNT3",
+		"-count=1",
+		"-timeout",
+		"6m",
+	)
+	cmd.Dir = regressDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		} else {
+			msg = fmt.Sprintf("%v (%s)", err, msg)
+		}
+		return report.Case{Name: name, Tier: "T7", Duration: time.Since(start), Failure: msg}
+	}
+	return report.Case{Name: name, Tier: "T7", Duration: time.Since(start)}
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
