@@ -70,6 +70,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.session.start", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.session.start", "./l3session", "^TestStarterStreamSessionPreservesL3Capability|TestStarterPacketSessionPreservesL3Capability|TestStarterRejectsUnsupportedRequest$")
 	})
+	run("T7.session.manager", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.session.manager", "./l3session", "^TestManagerStartsOneSessionPerFlow|TestManagerPropagatesPlanningErrors$")
+	})
 	run("T7.router.flow-deny", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.router.flow-deny", "./l3ingress", "^TestFlowTableCachesDeniedDecision|TestPumpSkipsDeniedFlow$")
 	})
