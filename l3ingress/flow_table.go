@@ -20,7 +20,8 @@ const (
 
 // FlowTableOptions configures a FlowTable.
 type FlowTableOptions struct {
-	Now func() time.Time
+	Now      func() time.Time
+	Observer FlowObserver
 }
 
 // FlowSnapshot is a stable copy of one flow table entry.
@@ -37,14 +38,28 @@ type FlowSnapshot struct {
 	CloseReason FlowCloseReason
 }
 
+// FlowObserver receives stable lifecycle/stat snapshots as flows are
+// created, updated, and closed.
+type FlowObserver interface {
+	ObserveFlow(FlowSnapshot)
+}
+
+// FlowObserverFunc adapts a function into FlowObserver.
+type FlowObserverFunc func(FlowSnapshot)
+
+func (f FlowObserverFunc) ObserveFlow(snapshot FlowSnapshot) {
+	f(snapshot)
+}
+
 // FlowTable caches the external routing decision for each L3 flow and
 // keeps basic lifecycle counters for later TUN adapters and embedders.
 type FlowTable struct {
-	mu     sync.Mutex
-	router FlowDecisionFunc
-	now    func() time.Time
-	active map[L3Identity]*flowRecord
-	closed map[L3Identity]FlowSnapshot
+	mu       sync.Mutex
+	router   FlowDecisionFunc
+	now      func() time.Time
+	observer FlowObserver
+	active   map[L3Identity]*flowRecord
+	closed   map[L3Identity]FlowSnapshot
 }
 
 type flowRecord struct {
@@ -65,10 +80,11 @@ func NewFlowTable(router FlowDecisionFunc, opts FlowTableOptions) *FlowTable {
 		now = time.Now
 	}
 	return &FlowTable{
-		router: router,
-		now:    now,
-		active: make(map[L3Identity]*flowRecord),
-		closed: make(map[L3Identity]FlowSnapshot),
+		router:   router,
+		now:      now,
+		observer: opts.Observer,
+		active:   make(map[L3Identity]*flowRecord),
+		closed:   make(map[L3Identity]FlowSnapshot),
 	}
 }
 
@@ -89,6 +105,7 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		rec.lastSeen = t.now()
 		snap := rec.snapshot()
 		t.mu.Unlock()
+		t.observe(snap)
 		return cloneDecision(rec.decision), false, snap, nil
 	}
 	t.mu.Unlock()
@@ -126,11 +143,13 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		existing.lastSeen = t.now()
 		snap := existing.snapshot()
 		t.mu.Unlock()
+		t.observe(snap)
 		return cloneDecision(existing.decision), false, snap, nil
 	}
 	t.active[id] = rec
 	snap := rec.snapshot()
 	t.mu.Unlock()
+	t.observe(snap)
 	return cloneDecision(decision), true, snap, nil
 }
 
@@ -182,9 +201,9 @@ func (t *FlowTable) Close(id L3Identity, reason FlowCloseReason) (FlowSnapshot, 
 		return FlowSnapshot{}, false
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	rec := t.active[id]
 	if rec == nil {
+		t.mu.Unlock()
 		return FlowSnapshot{}, false
 	}
 	delete(t.active, id)
@@ -193,7 +212,16 @@ func (t *FlowTable) Close(id L3Identity, reason FlowCloseReason) (FlowSnapshot, 
 	snap.ClosedAt = t.now()
 	snap.CloseReason = reason
 	t.closed[id] = cloneSnapshot(snap)
+	t.mu.Unlock()
+	t.observe(snap)
 	return snap, true
+}
+
+func (t *FlowTable) observe(snapshot FlowSnapshot) {
+	if t == nil || t.observer == nil {
+		return
+	}
+	t.observer.ObserveFlow(cloneSnapshot(snapshot))
 }
 
 func (r *flowRecord) snapshot() FlowSnapshot {

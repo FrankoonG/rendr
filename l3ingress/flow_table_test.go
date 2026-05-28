@@ -137,3 +137,50 @@ func TestFlowTableCachesDeniedDecision(t *testing.T) {
 		t.Fatalf("cached denied decision=%+v snapshot=%+v", decision, snapshot)
 	}
 }
+
+func TestFlowTableObserverReceivesLifecycleSnapshots(t *testing.T) {
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("10.0.0.4"),
+		SrcPort: 1111,
+		DstIP:   netip.MustParseAddr("203.0.113.4"),
+		DstPort: 2222,
+	}
+	var snapshots []FlowSnapshot
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		return FlowDecision{Peer: "peer-a", Labels: map[string]string{"route": "fast"}}, nil
+	}, FlowTableOptions{
+		Observer: FlowObserverFunc(func(snapshot FlowSnapshot) {
+			snapshots = append(snapshots, snapshot)
+		}),
+	})
+	if _, _, _, err := table.Resolve(context.Background(), FlowMeta{L3Identity: id, Direction: DirectionIngress}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := table.Resolve(context.Background(), FlowMeta{L3Identity: id, Direction: DirectionIngress}, 15); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := table.Close(id, FlowCloseIdle); !ok {
+		t.Fatal("Close returned false")
+	}
+	if len(snapshots) != 3 {
+		t.Fatalf("snapshots=%d want 3: %+v", len(snapshots), snapshots)
+	}
+	if snapshots[0].Packets != 1 || snapshots[0].Bytes != 10 || snapshots[0].Closed {
+		t.Fatalf("created snapshot=%+v", snapshots[0])
+	}
+	if snapshots[1].Packets != 2 || snapshots[1].Bytes != 25 || snapshots[1].Closed {
+		t.Fatalf("updated snapshot=%+v", snapshots[1])
+	}
+	if !snapshots[2].Closed || snapshots[2].CloseReason != FlowCloseIdle || snapshots[2].Packets != 2 {
+		t.Fatalf("closed snapshot=%+v", snapshots[2])
+	}
+	snapshots[0].Decision.Labels["route"] = "mutated"
+	stored, ok := table.ClosedSnapshot(id)
+	if !ok {
+		t.Fatal("closed snapshot missing")
+	}
+	if stored.Decision.Labels["route"] != "fast" {
+		t.Fatalf("observer snapshot mutated table storage: %+v", stored.Decision.Labels)
+	}
+}
