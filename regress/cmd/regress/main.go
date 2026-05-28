@@ -25,6 +25,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier5"
 	"github.com/FrankoonG/rendr/regress/internal/tier6"
 	"github.com/FrankoonG/rendr/regress/internal/tier7"
+	"github.com/FrankoonG/rendr/regress/internal/tunfull"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -142,8 +143,7 @@ func main() {
 		// or included together via --full.
 		if cfg.tunFull {
 			fmt.Println("== phase 2 / TUN full baseline ==")
-			c := tunFullUnimplementedCase()
-			suite.Add(c)
+			tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: cfg.caseID})
 			writeReports(suite, cfg.reportDir)
 			fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
 			os.Exit(exitT7Fail)
@@ -259,11 +259,7 @@ func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7 bool) {
 }
 
 func tunFullUnimplementedCase() report.Case {
-	return report.Case{
-		Name:    "TUN-full-not-implemented",
-		Tier:    "T7",
-		Failure: "--tun-full baseline is not implemented yet; T7 feature tests are not a full TUN regression",
-	}
+	return tunfull.UnimplementedCase("")
 }
 
 func writeReports(suite *report.Suite, dir string) {
