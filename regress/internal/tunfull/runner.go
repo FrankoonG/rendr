@@ -364,7 +364,14 @@ func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
 
 	id := g1Identity()
 	root := g1Root(ln.Addr().String(), opts.paths)
-	manager := &l3session.Manager{}
+	manager := &l3session.Manager{
+		Starter: l3session.Starter{Options: []l3session.DialerOption{
+			func(_ l3ingress.SessionRequest, d *rendr.Dialer) error {
+				d.BondStuckRTTMultiplier = 1_000_000
+				return nil
+			},
+		}},
+	}
 	relay := &l3session.TCPRelay{Manager: manager}
 	app, endpoint := net.Pipe()
 	defer app.Close()
@@ -1786,7 +1793,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	p95 := percentile(latencies, 0.95)
 	migrations := admin.MigrationCount() - startMig
 	if lossPct > opts.lossPct {
-		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%% (sent=%d lost=%d migrations=%d p95=%s first_missing=%v missing_buckets=%v)", lossPct, opts.lossPct, sent, lost, migrations, p95, firstMissing, missingBuckets))
+		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%% (sent=%d lost=%d migrations=%d bond_stuck_skips=%d p95=%s first_missing=%v missing_buckets=%v)", lossPct, opts.lossPct, sent, lost, migrations, admin.BondStuckSkips(), p95, firstMissing, missingBuckets))
 	}
 	if p95 > opts.p95Ceiling {
 		return failedCase(opts.name, start, fmt.Errorf("P95 %s exceeds ceiling %s", p95, opts.p95Ceiling))
