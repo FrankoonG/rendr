@@ -78,6 +78,79 @@ func TestPumpSkipsParseErrors(t *testing.T) {
 	}
 }
 
+func TestPumpCachesRouterDecisionPerFlow(t *testing.T) {
+	packet := ipv4Packet(6, [4]byte{10, 0, 0, 1}, [4]byte{198, 51, 100, 9}, 1234, 443)
+	dev := &fakeDevice{packets: [][]byte{packet, packet}}
+	fixed := time.Unix(100, 0)
+	var routerCalls int
+	var handled []PacketEvent
+	p := &Pump{
+		Device: dev,
+		Now:    func() time.Time { return fixed },
+		Router: func(_ context.Context, flow FlowMeta) (FlowDecision, error) {
+			routerCalls++
+			return FlowDecision{Peer: "peer-a"}, nil
+		},
+		Handler: PacketHandlerFunc(func(_ context.Context, ev PacketEvent) error {
+			handled = append(handled, ev)
+			return nil
+		}),
+	}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if routerCalls != 1 {
+		t.Fatalf("routerCalls=%d want 1", routerCalls)
+	}
+	if len(handled) != 2 {
+		t.Fatalf("handled=%d want 2", len(handled))
+	}
+	if !handled[0].Flow.CreatedAt.Equal(fixed) || !handled[1].Flow.CreatedAt.Equal(fixed) {
+		t.Fatalf("flow CreatedAt not stable: %+v %+v", handled[0].Flow, handled[1].Flow)
+	}
+	if !handled[0].Decided || !handled[1].Decided || handled[1].Decision.Peer != "peer-a" {
+		t.Fatalf("events not decided from cache: %+v", handled)
+	}
+}
+
+func TestPumpUsesProvidedFlowTable(t *testing.T) {
+	packet := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 5353, 53000)
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("192.0.2.1"),
+		SrcPort: 5353,
+		DstIP:   netip.MustParseAddr("192.0.2.2"),
+		DstPort: 53000,
+	}
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		return FlowDecision{Peer: "peer-b", Egress: "vpn"}, nil
+	}, FlowTableOptions{})
+	p := &Pump{
+		Device:    &fakeDevice{packets: [][]byte{packet}},
+		FlowTable: table,
+		Router: func(context.Context, FlowMeta) (FlowDecision, error) {
+			t.Fatal("Pump Router should not run when FlowTable is provided")
+			return FlowDecision{}, nil
+		},
+		Handler: PacketHandlerFunc(func(_ context.Context, ev PacketEvent) error {
+			if ev.Decision.Peer != "peer-b" || ev.Decision.Egress != "vpn" {
+				t.Fatalf("event decision=%+v", ev.Decision)
+			}
+			return nil
+		}),
+	}
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := table.Snapshot(id)
+	if !ok {
+		t.Fatal("flow not tracked")
+	}
+	if snapshot.Packets != 1 || snapshot.Bytes != uint64(len(packet)) {
+		t.Fatalf("snapshot stats=%+v", snapshot)
+	}
+}
+
 func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	if err := (&Pump{}).Run(context.Background()); err == nil {
 		t.Fatal("nil device accepted")

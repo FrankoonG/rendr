@@ -43,6 +43,7 @@ type ParseErrorHandler func(packet []byte, err error)
 type Pump struct {
 	Device       virtualif.Device
 	Direction    Direction
+	FlowTable    *FlowTable
 	Router       FlowDecisionFunc
 	Handler      PacketHandler
 	OnParseError ParseErrorHandler
@@ -76,6 +77,10 @@ func (p *Pump) Run(ctx context.Context) error {
 	direction := p.Direction
 	if direction == 0 {
 		direction = DirectionIngress
+	}
+	table := p.FlowTable
+	if table == nil && p.Router != nil {
+		table = NewFlowTable(p.Router, FlowTableOptions{Now: now})
 	}
 	buf := make([]byte, bufSize)
 	for {
@@ -112,13 +117,14 @@ func (p *Pump) Run(ctx context.Context) error {
 			Meta:   meta,
 			Flow:   flow,
 		}
-		if p.Router != nil {
-			decision, err := p.Router(ctx, flow)
+		if table != nil {
+			decision, _, snapshot, err := table.Resolve(ctx, flow, len(packet))
 			if err != nil {
 				return err
 			}
 			ev.Decision = decision
-			ev.Decided = true
+			ev.Decided = snapshot.Decided
+			ev.Flow = snapshot.Flow
 		}
 		if err := p.Handler.HandlePacket(ctx, ev); err != nil {
 			return err
