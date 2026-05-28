@@ -1629,13 +1629,14 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	relay := &l3session.UDPRelay{Device: dev, Manager: manager, BufferSize: opts.payloadLen + 64}
 	defer relay.Close()
 
-	firstPacket, firstMeta, err := udpPacketEventParts(id, make([]byte, opts.payloadLen))
+	payload := make([]byte, opts.payloadLen)
+	packet, meta, err := udpPacketEventParts(id, payload)
 	if err != nil {
 		return failedCase(opts.name, start, err)
 	}
-	if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
-		Packet: firstPacket,
-		Meta:   firstMeta,
+	event := l3ingress.PacketEvent{
+		Packet: packet,
+		Meta:   meta,
 		Flow:   l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
 		Decision: l3ingress.FlowDecision{
 			Peer:   "peer-a",
@@ -1643,6 +1644,17 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 			Egress: "direct",
 		},
 		Decided: true,
+	}
+	if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
+		Packet: event.Packet,
+		Meta:   event.Meta,
+		Flow:   event.Flow,
+		Decision: l3ingress.FlowDecision{
+			Peer:   event.Decision.Peer,
+			Root:   event.Decision.Root,
+			Egress: event.Decision.Egress,
+		},
+		Decided: event.Decided,
 	}); err != nil {
 		return failedCase(opts.name, start, fmt.Errorf("start relay: %w", err))
 	}
@@ -1672,6 +1684,8 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	latencies := make([]time.Duration, 0, expected/100+1)
 	recvDone := make(chan struct{})
 	sendDone := make(chan struct{})
+	replyMeta := meta
+	replyMeta.Identity = id.Reverse()
 	go func() {
 		defer close(recvDone)
 		idle := time.NewTimer(opts.duration + 5*time.Second)
@@ -1688,11 +1702,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 					}
 				}
 				idle.Reset(5 * time.Second)
-				meta, err := l3ingress.ParsePacket(packet)
-				if err != nil {
-					continue
-				}
-				payload, err := l3ingress.UDPPayload(packet, meta)
+				payload, err := l3ingress.UDPPayload(packet, replyMeta)
 				if err != nil || len(payload) < 16 {
 					continue
 				}
@@ -1721,8 +1731,8 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	packetInterval := time.Second / time.Duration(opts.pps)
 	nextTick := time.Now()
 	endAt := time.Now().Add(opts.duration)
-	payload := make([]byte, opts.payloadLen)
 	var sent int64
+	payloadOffset := meta.PayloadOffset + 8
 	for time.Now().Before(endAt) {
 		select {
 		case <-ctx.Done():
@@ -1738,21 +1748,8 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		nextTick = nextTick.Add(packetInterval)
 		binary.BigEndian.PutUint64(payload[:8], uint64(sent))
 		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
-		packet, meta, err := udpPacketEventParts(id, payload)
-		if err != nil {
-			return failedCase(opts.name, start, err)
-		}
-		if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
-			Packet: packet,
-			Meta:   meta,
-			Flow:   l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
-			Decision: l3ingress.FlowDecision{
-				Peer:   "peer-a",
-				Root:   root,
-				Egress: "direct",
-			},
-			Decided: true,
-		}); err != nil {
+		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
+		if err := relay.HandlePacket(ctx, event); err != nil {
 			return failedCase(opts.name, start, fmt.Errorf("send seq %d: %w", sent, err))
 		}
 		sent++
