@@ -14,8 +14,19 @@ func TestRunTunFullCaseFilter(t *testing.T) {
 		t.Fatalf("cases=%d want 1", len(suite.Cases))
 	}
 	c := suite.Cases[0]
-	if c.Name != "TUN-full.G1-smoke" || c.Tier != "T7" || c.Failure == "" {
+	if c.Name != "TUN-full.G1-smoke" || c.Tier != "T7" || c.Failure != "" {
 		t.Fatalf("bad filtered case: %+v", c)
+	}
+}
+
+func TestRunTunFullDefaultStillGuardsUnimplementedCases(t *testing.T) {
+	suite := report.New()
+	Run(context.Background(), suite, ".", Options{})
+	if len(suite.Cases) != len(plannedCases) {
+		t.Fatalf("cases=%d want %d", len(suite.Cases), len(plannedCases))
+	}
+	if !suite.AnyFailedAt("T7") {
+		t.Fatal("default tun-full unexpectedly has no guard failure")
 	}
 }
 

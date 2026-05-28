@@ -4,9 +4,15 @@ package tunfull
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"net"
+	"net/netip"
 	"time"
 
+	rendr "github.com/FrankoonG/rendr"
+	"github.com/FrankoonG/rendr/l3ingress"
+	"github.com/FrankoonG/rendr/l3session"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
@@ -31,17 +37,17 @@ var plannedCases = []string{
 	"TUN-full.T6-selector",
 }
 
-// Run records the TUN full baseline status. For now this is a
-// structured, case-addressable guard: individual cases can be targeted
-// with --case, but they remain failing until implemented.
-func Run(_ context.Context, suite *report.Suite, _ string, opts Options) {
+// Run records the TUN full baseline status. Implemented cases run as real
+// TUN/per-flow baselines; remaining planned cases stay as explicit guard
+// failures so --tun-full cannot report a false green.
+func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 	matched := false
 	for _, name := range plannedCases {
 		if !caseMatches(opts.Case, name) {
 			continue
 		}
 		matched = true
-		suite.Add(UnimplementedCase(name))
+		suite.Add(runPlannedCase(ctx, name))
 	}
 	if opts.Case != "" && !matched {
 		suite.Add(report.Case{
@@ -51,8 +57,19 @@ func Run(_ context.Context, suite *report.Suite, _ string, opts Options) {
 		})
 		return
 	}
-	if opts.Case == "" {
-		suite.Add(UnimplementedCase("TUN-full-not-implemented"))
+}
+
+func runPlannedCase(ctx context.Context, name string) report.Case {
+	switch name {
+	case "TUN-full.G1-smoke":
+		return runG1Smoke(ctx, g1SmokeOptions{
+			name:       name,
+			size:       30 << 20,
+			paths:      2,
+			migrations: 3,
+		})
+	default:
+		return UnimplementedCase(name)
 	}
 }
 
@@ -72,4 +89,247 @@ func UnimplementedCase(name string) report.Case {
 
 func caseMatches(filter, name string) bool {
 	return filter == "" || filter == name
+}
+
+type g1SmokeOptions struct {
+	name       string
+	size       int64
+	paths      int
+	migrations int
+}
+
+func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.G1-smoke"
+	}
+	if opts.size <= 0 {
+		opts.size = 30 << 20
+	}
+	if opts.paths < 2 {
+		opts.paths = 2
+	}
+	if opts.migrations < 0 {
+		opts.migrations = 0
+	}
+	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("listen: %w", err))
+	}
+	defer ln.Close()
+
+	accepted := make(chan rendr.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		c, err := ln.Accept(actx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	id := g1Identity()
+	root := g1Root(ln.Addr().String(), opts.paths)
+	manager := &l3session.Manager{}
+	relay := &l3session.TCPRelay{Manager: manager}
+	app, endpoint := net.Pipe()
+	defer app.Close()
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Serve(ctx, g1Event(id, root), endpoint)
+	}()
+
+	var server rendr.Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		return failedCase(opts.name, start, fmt.Errorf("accept: %w", err))
+	case <-time.After(15 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("accept timeout"))
+	}
+	defer server.Close()
+
+	sess, err := waitStreamSession(ctx, manager, id)
+	if err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	admin, ok := sess.Conn.(rendr.AdminConn)
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("session conn is not rendr.AdminConn"))
+	}
+	waitPaths(ctx, admin, opts.paths)
+
+	recvErr := make(chan error, 1)
+	hRecv := sha256.New()
+	go func() {
+		buf := make([]byte, 256*1024)
+		var got int64
+		for got < opts.size {
+			n, err := server.Read(buf)
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			hRecv.Write(buf[:n])
+			got += int64(n)
+		}
+		recvErr <- nil
+	}()
+
+	migPts := make([]int64, opts.migrations)
+	for i := 0; i < opts.migrations; i++ {
+		migPts[i] = opts.size * int64(i+1) / int64(opts.migrations+1)
+	}
+	hSent := sha256.New()
+	buf := make([]byte, 256*1024)
+	var written int64
+	var migIdx int
+	for written < opts.size {
+		end := written + int64(len(buf))
+		if end > opts.size {
+			end = opts.size
+		}
+		chunk := buf[:end-written]
+		fillPattern(chunk, written)
+		if err := writeAll(app, chunk); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("write at %d: %w", written, err))
+		}
+		hSent.Write(chunk)
+		written += int64(len(chunk))
+		for migIdx < len(migPts) && written >= migPts[migIdx] {
+			next := nextPath(admin)
+			if next != 0 {
+				if err := admin.Migrate(next); err != nil {
+					return failedCase(opts.name, start, fmt.Errorf("migrate %d: %w", migIdx, err))
+				}
+			}
+			migIdx++
+		}
+	}
+
+	if err := <-recvErr; err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("recv: %w", err))
+	}
+	_ = app.Close()
+	select {
+	case err := <-relayErr:
+		if err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("relay: %w", err))
+		}
+	case <-time.After(5 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("relay shutdown timeout"))
+	}
+
+	sentHex := fmt.Sprintf("%x", hSent.Sum(nil))
+	recvHex := fmt.Sprintf("%x", hRecv.Sum(nil))
+	if sentHex != recvHex {
+		return failedCase(opts.name, start, fmt.Errorf("SHA-256 mismatch: sent=%s recv=%s", sentHex, recvHex))
+	}
+	if opts.migrations > 0 && admin.MigrationCount() < uint64(opts.migrations) {
+		return failedCase(opts.name, start, fmt.Errorf("MigrationCount=%d, want >= %d", admin.MigrationCount(), opts.migrations))
+	}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+func failedCase(name string, start time.Time, err error) report.Case {
+	return report.Case{Name: name, Tier: "T7", Duration: time.Since(start), Failure: err.Error()}
+}
+
+func g1Identity() l3ingress.L3Identity {
+	return l3ingress.L3Identity{
+		Proto:   l3ingress.ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.2"),
+		SrcPort: 40000,
+		DstIP:   netip.MustParseAddr("198.51.100.20"),
+		DstPort: 443,
+	}
+}
+
+func g1Root(addr string, paths int) rendr.Target {
+	children := make([]rendr.Target, 0, paths)
+	for i := 0; i < paths; i++ {
+		name := fmt.Sprintf("tun-g1-%d", i+1)
+		children = append(children, rendr.Path(name, rendr.PathSpec{Transport: "tcp", Address: addr}))
+	}
+	return rendr.Selector("tun-full-g1", children)
+}
+
+func g1Event(id l3ingress.L3Identity, root rendr.Target) l3ingress.PacketEvent {
+	return l3ingress.PacketEvent{
+		Meta: l3ingress.PacketMeta{Identity: id},
+		Flow: l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
+		Decision: l3ingress.FlowDecision{
+			Peer:   "peer-a",
+			Root:   root,
+			Egress: "direct",
+		},
+		Decided: true,
+	}
+}
+
+func waitStreamSession(ctx context.Context, manager *l3session.Manager, id l3ingress.L3Identity) (*l3session.Session, error) {
+	deadline := time.After(15 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if sess, ok := manager.Session(id); ok && sess.Conn != nil {
+			return sess, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline:
+			return nil, fmt.Errorf("stream session timeout")
+		case <-tick.C:
+		}
+	}
+}
+
+func waitPaths(ctx context.Context, admin rendr.AdminConn, want int) {
+	deadline := time.After(5 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for len(admin.Paths()) < want {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+func nextPath(admin rendr.AdminConn) uint32 {
+	cur := admin.ActivePath()
+	for _, p := range admin.Paths() {
+		if p.ID != cur {
+			return p.ID
+		}
+	}
+	return 0
+}
+
+func fillPattern(buf []byte, offset int64) {
+	for i := range buf {
+		buf[i] = byte((offset+int64(i))*17 + 3)
+	}
+}
+
+func writeAll(w net.Conn, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("short write")
+		}
+		buf = buf[n:]
+	}
+	return nil
 }
