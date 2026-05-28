@@ -1725,30 +1725,24 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	startMig := admin.MigrationCount()
 	packetInterval := time.Second / time.Duration(opts.pps)
 	nextTick := time.Now()
-	targetPackets := int64(opts.pps) * int64(opts.duration/time.Second)
-	if targetPackets <= 0 {
-		targetPackets = int64(float64(opts.pps) * opts.duration.Seconds())
-	}
-	nextMigration := int64(1)
+	endAt := time.Now().Add(opts.duration)
+	migInterval := opts.duration / time.Duration(opts.migrations+1)
+	migTicker := time.NewTicker(migInterval)
+	defer migTicker.Stop()
 	var sent int64
-	for sent < targetPackets {
+	for time.Now().Before(endAt) {
 		select {
 		case <-ctx.Done():
 			return failedCase(opts.name, start, ctx.Err())
-		default:
-		}
-		if opts.migrations > 0 && nextMigration <= int64(opts.migrations) && sent >= targetPackets*nextMigration/int64(opts.migrations+1) {
+		case <-migTicker.C:
 			next := nextPacketPath(admin)
 			if next != 0 {
 				_ = admin.Migrate(next)
 			}
-			nextMigration++
+		default:
 		}
 		paceUntil(nextTick)
 		nextTick = nextTick.Add(packetInterval)
-		if lag := time.Since(nextTick); lag > packetInterval*10 {
-			nextTick = time.Now().Add(packetInterval)
-		}
 		binary.BigEndian.PutUint64(payload[:8], uint64(sent))
 		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
 		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
