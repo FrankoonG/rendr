@@ -85,6 +85,17 @@ func TestRunG5PathRecoveryShort(t *testing.T) {
 	}
 }
 
+func TestRunT6SelectorShort(t *testing.T) {
+	c := runT6Selector(context.Background(), t6SelectorOptions{
+		name:           "TUN-full.T6-selector",
+		bulkWarmWrites: 28,
+		bulkBondWrites: 16,
+	})
+	if c.Name != "TUN-full.T6-selector" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad T6 selector case: %+v", c)
+	}
+}
+
 func TestRunTunFullCaseFilterMiss(t *testing.T) {
 	suite := report.New()
 	Run(context.Background(), suite, ".", Options{Case: "missing"})

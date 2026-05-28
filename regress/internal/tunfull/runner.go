@@ -107,6 +107,10 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:        2,
 			postAddBytes: 256 << 10,
 		})
+	case "TUN-full.T6-selector":
+		return runT6Selector(ctx, t6SelectorOptions{
+			name: name,
+		})
 	default:
 		return UnimplementedCase(name)
 	}
@@ -169,6 +173,12 @@ type g3Options struct {
 	migrations int
 	lossPct    float64
 	p95Ceiling time.Duration
+}
+
+type t6SelectorOptions struct {
+	name           string
+	bulkWarmWrites int
+	bulkBondWrites int
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
@@ -798,6 +808,192 @@ func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
 	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
 }
 
+func runT6Selector(ctx context.Context, opts t6SelectorOptions) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.T6-selector"
+	}
+	if opts.bulkWarmWrites <= 0 {
+		opts.bulkWarmWrites = 36
+	}
+	if opts.bulkBondWrites <= 0 {
+		opts.bulkBondWrites = 24
+	}
+
+	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("listen: %w", err))
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+	interactiveID := t6Identity(42000, 22)
+	bulkID := t6Identity(43000, 443)
+	interactiveRoot := t6SelectorRoot(addr, "tun-t6-int")
+	bulkRoot := t6SelectorRoot(addr, "tun-t6-bulk")
+	table := l3ingress.NewFlowTable(func(_ context.Context, flow l3ingress.FlowMeta) (l3ingress.FlowDecision, error) {
+		switch flow.L3Identity {
+		case interactiveID:
+			return l3ingress.FlowDecision{
+				Peer:   "peer-low",
+				Root:   interactiveRoot,
+				Egress: "direct",
+				Labels: map[string]string{"class": "interactive"},
+			}, nil
+		case bulkID:
+			return l3ingress.FlowDecision{
+				Peer:   "peer-bulk",
+				Root:   bulkRoot,
+				Egress: "bond",
+				Labels: map[string]string{"class": "bulk"},
+			}, nil
+		default:
+			return l3ingress.FlowDecision{}, fmt.Errorf("unexpected flow identity: %+v", flow.L3Identity)
+		}
+	}, l3ingress.FlowTableOptions{})
+	manager := &l3session.Manager{
+		FlowTable: table,
+		Starter: l3session.Starter{Options: []l3session.DialerOption{
+			func(_ l3ingress.SessionRequest, d *rendr.Dialer) error {
+				d.ProbeInterval = time.Hour
+				return nil
+			},
+		}},
+	}
+	relay := &l3session.TCPRelay{Manager: manager, BufferSize: 64 << 10}
+
+	intApp, intEndpoint := net.Pipe()
+	defer intApp.Close()
+	intRelayErr := make(chan error, 1)
+	if err := startT6Flow(ctx, table, relay, interactiveID, intEndpoint, intRelayErr); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("interactive flow: %w", err))
+	}
+	intServer, err := acceptOneStream(ctx, ln)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("accept interactive: %w", err))
+	}
+	defer intServer.Close()
+	intEchoErr := startStreamEcho(intServer, 1024)
+	intSess, err := waitStreamSession(ctx, manager, interactiveID)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("interactive session: %w", err))
+	}
+	intAdmin, ok := intSess.Conn.(rendr.AdminConn)
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("interactive session conn is not rendr.AdminConn"))
+	}
+	waitPaths(ctx, intAdmin, 3)
+	intIDs := idsByPathName(intAdmin.Paths())
+	if intIDs["tun-t6-int-A"] == 0 || intIDs["tun-t6-int-B"] == 0 || intIDs["tun-t6-int-C"] == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("interactive path names missing: %v", intIDs))
+	}
+
+	bulkApp, bulkEndpoint := net.Pipe()
+	defer bulkApp.Close()
+	bulkRelayErr := make(chan error, 1)
+	if err := startT6Flow(ctx, table, relay, bulkID, bulkEndpoint, bulkRelayErr); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("bulk flow: %w", err))
+	}
+	bulkServer, err := acceptOneStream(ctx, ln)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("accept bulk: %w", err))
+	}
+	defer bulkServer.Close()
+	bulkDrainErr := startStreamDrain(bulkServer)
+	bulkSess, err := waitStreamSession(ctx, manager, bulkID)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("bulk session: %w", err))
+	}
+	bulkAdmin, ok := bulkSess.Conn.(rendr.AdminConn)
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("bulk session conn is not rendr.AdminConn"))
+	}
+	waitPaths(ctx, bulkAdmin, 3)
+	bulkIDs := idsByPathName(bulkAdmin.Paths())
+	if bulkIDs["tun-t6-bulk-A"] == 0 || bulkIDs["tun-t6-bulk-B"] == 0 || bulkIDs["tun-t6-bulk-C"] == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("bulk path names missing: %v", bulkIDs))
+	}
+
+	for i := 0; i < 8; i++ {
+		var msg [8]byte
+		binary.BigEndian.PutUint64(msg[:], uint64(i))
+		if err := writeAll(intApp, msg[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("interactive write: %w", err))
+		}
+		var got [8]byte
+		if err := readAll(intApp, got[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("interactive read: %w", err))
+		}
+		if got != msg {
+			return failedCase(opts.name, start, fmt.Errorf("interactive echo mismatch"))
+		}
+	}
+	if got := intAdmin.Mode(); got != rendr.ModePrime {
+		return failedCase(opts.name, start, fmt.Errorf("interactive mode=%v want prime", got))
+	}
+	if got := intAdmin.ActivePath(); got != intIDs["tun-t6-int-A"] {
+		return failedCase(opts.name, start, fmt.Errorf("interactive active=%d want A=%d", got, intIDs["tun-t6-int-A"]))
+	}
+
+	chunk := make([]byte, 32<<10)
+	for i := 0; i < opts.bulkWarmWrites; i++ {
+		fillPattern(chunk, int64(i*len(chunk)))
+		if err := writeAll(bulkApp, chunk); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("bulk warm write %d: %w", i, err))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := waitForAdminMode(bulkAdmin, rendr.ModeBond, 3*time.Second); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("bulk peak transfer: %w", err))
+	}
+	before := writesByPathName(bulkAdmin.Paths())
+	for i := 0; i < opts.bulkBondWrites; i++ {
+		fillPattern(chunk, int64((opts.bulkWarmWrites+i)*len(chunk)))
+		if err := writeAll(bulkApp, chunk); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("bulk bond write %d: %w", i, err))
+		}
+	}
+	after := writesByPathName(bulkAdmin.Paths())
+	if after["tun-t6-bulk-B"] <= before["tun-t6-bulk-B"] || after["tun-t6-bulk-C"] <= before["tun-t6-bulk-C"] {
+		return failedCase(opts.name, start, fmt.Errorf("bulk bond did not use both peak paths: before=%v after=%v", before, after))
+	}
+
+	if snap, ok := table.Snapshot(interactiveID); !ok {
+		return failedCase(opts.name, start, fmt.Errorf("missing interactive flow snapshot"))
+	} else if snap.MigrationCount != 0 || snap.Decision.Labels["class"] != "interactive" {
+		return failedCase(opts.name, start, fmt.Errorf("interactive flow was polluted by bulk selector: %+v", snap))
+	}
+	if snap, ok := table.Snapshot(bulkID); !ok {
+		return failedCase(opts.name, start, fmt.Errorf("missing bulk flow snapshot"))
+	} else if snap.MigrationCount == 0 || snap.Decision.Labels["class"] != "bulk" {
+		return failedCase(opts.name, start, fmt.Errorf("bulk flow did not record selector migration: %+v", snap))
+	}
+
+	_ = intApp.Close()
+	_ = bulkApp.Close()
+	if err := waitRelayErr(intRelayErr, 5*time.Second); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("interactive relay: %w", err))
+	}
+	if err := waitRelayErr(bulkRelayErr, 5*time.Second); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("bulk relay: %w", err))
+	}
+	select {
+	case err := <-intEchoErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("interactive echo: %w", err))
+		}
+	default:
+	}
+	select {
+	case err := <-bulkDrainErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("bulk drain: %w", err))
+		}
+	default:
+	}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
 type tunStreamEnv struct {
 	ln       rendr.Listener
 	server   rendr.Conn
@@ -927,6 +1123,129 @@ func startStreamEcho(c net.Conn, bufferSize int) <-chan error {
 		}
 	}()
 	return errCh
+}
+
+func startStreamDrain(c net.Conn) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, c)
+		errCh <- err
+	}()
+	return errCh
+}
+
+func startT6Flow(ctx context.Context, table *l3ingress.FlowTable, relay *l3session.TCPRelay, id l3ingress.L3Identity, endpoint net.Conn, relayErr chan<- error) error {
+	decision, _, _, err := table.Resolve(ctx, l3ingress.FlowMeta{
+		L3Identity: id,
+		Direction:  l3ingress.DirectionIngress,
+	}, 1)
+	if err != nil {
+		_ = endpoint.Close()
+		return err
+	}
+	ev := l3ingress.PacketEvent{
+		Meta: l3ingress.PacketMeta{Identity: id},
+		Flow: l3ingress.FlowMeta{
+			L3Identity: id,
+			Direction:  l3ingress.DirectionIngress,
+		},
+		Decision: decision,
+		Decided:  true,
+	}
+	go func() {
+		relayErr <- relay.Serve(ctx, ev, endpoint)
+	}()
+	return nil
+}
+
+func acceptOneStream(ctx context.Context, ln rendr.Listener) (rendr.Conn, error) {
+	actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return ln.Accept(actx)
+}
+
+func t6Identity(srcPort, dstPort uint16) l3ingress.L3Identity {
+	return l3ingress.L3Identity{
+		Proto:   l3ingress.ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.2"),
+		SrcPort: srcPort,
+		DstIP:   netip.MustParseAddr("198.51.100.60"),
+		DstPort: dstPort,
+	}
+}
+
+func t6SelectorRoot(addr, prefix string) rendr.Target {
+	spec := func(name string) rendr.PathSpec {
+		return rendr.PathSpec{
+			Transport: "tcp",
+			Address:   addr,
+			Opts:      map[string]string{"name": name},
+		}
+	}
+	bulk := rendr.Bond(prefix+"-bulk", []rendr.Target{
+		rendr.Path(prefix+"-B", spec(prefix+"-B")),
+		rendr.Path(prefix+"-C", spec(prefix+"-C")),
+	})
+	return rendr.Selector(prefix+"-root", []rendr.Target{
+		rendr.Path(prefix+"-A", spec(prefix+"-A")),
+		bulk,
+	}, rendr.PeakTransfer{
+		Targets:         []string{prefix + "-bulk"},
+		SaturationFor:   200 * time.Millisecond,
+		ReturnFor:       2 * time.Second,
+		SaturationRatio: 0.8,
+		ReturnRatio:     0.2,
+	})
+}
+
+func idsByPathName(paths []rendr.PathInfo) map[string]uint32 {
+	out := make(map[string]uint32, len(paths))
+	for _, p := range paths {
+		if name := pathInfoName(p); name != "" {
+			out[name] = p.ID
+		}
+	}
+	return out
+}
+
+func writesByPathName(paths []rendr.PathInfo) map[string]uint64 {
+	out := make(map[string]uint64, len(paths))
+	for _, p := range paths {
+		if name := pathInfoName(p); name != "" {
+			out[name] = p.Writes
+		}
+	}
+	return out
+}
+
+func pathInfoName(p rendr.PathInfo) string {
+	if p.Spec.Opts == nil {
+		return ""
+	}
+	return p.Spec.Opts["name"]
+}
+
+func waitForAdminMode(admin rendr.AdminConn, want rendr.Mode, within time.Duration) error {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if admin.Mode() == want {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return fmt.Errorf("mode=%v want %v", admin.Mode(), want)
+}
+
+func waitRelayErr(ch <-chan error, timeout time.Duration) error {
+	select {
+	case err := <-ch:
+		if err != nil && !isClosedRelayErr(err) {
+			return err
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("relay shutdown timeout")
+	}
 }
 
 func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
