@@ -787,7 +787,7 @@ type tunT3CaptureDevice struct {
 func (d *tunT3CaptureDevice) Read([]byte) (int, error) { return 0, io.EOF }
 func (d *tunT3CaptureDevice) Write(p []byte) (int, error) {
 	if d.writes != nil {
-		d.writes <- append([]byte(nil), p...)
+		d.writes <- p
 	}
 	return len(p), nil
 }

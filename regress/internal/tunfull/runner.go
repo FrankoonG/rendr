@@ -1875,7 +1875,7 @@ type captureDevice struct {
 func (d *captureDevice) Read([]byte) (int, error) { return 0, io.EOF }
 func (d *captureDevice) Write(p []byte) (int, error) {
 	if d.writes != nil {
-		d.writes <- append([]byte(nil), p...)
+		d.writes <- p
 	}
 	return len(p), nil
 }
