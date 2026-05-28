@@ -24,6 +24,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier4"
 	"github.com/FrankoonG/rendr/regress/internal/tier5"
 	"github.com/FrankoonG/rendr/regress/internal/tier6"
+	"github.com/FrankoonG/rendr/regress/internal/tier7"
 )
 
 // Exit codes match docs/regression-suite.md §10.
@@ -35,6 +36,7 @@ const (
 	exitT4Fail      = 21
 	exitT5Fail      = 22
 	exitT6Fail      = 23
+	exitT7Fail      = 24
 	exitEnvError    = 50
 	exitPhase1Stale = 51
 )
@@ -43,6 +45,7 @@ type runFlags struct {
 	phase         string
 	tier          string
 	full          bool
+	tunFull       bool
 	forcePhase2   bool
 	allowNonLinux bool
 	profile       string
@@ -54,8 +57,9 @@ type runFlags struct {
 func parseFlags() runFlags {
 	var f runFlags
 	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
-	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5 | 6")
-	flag.BoolVar(&f.full, "full", false, "run phase 1 and all phase-2 tiers (T3+T4+T5+T6)")
+	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5 | 6 | 7")
+	flag.BoolVar(&f.full, "full", false, "run phase 1 and all existing non-TUN phase-2 tiers (T3+T4+T5+T6)")
+	flag.BoolVar(&f.tunFull, "tun-full", false, "run TUN baseline/full regression subset")
 	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
 	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
 	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
@@ -136,9 +140,9 @@ func main() {
 		// Default phase-2 invocation runs T3 (path-factory matrix).
 		// T4 long-run, T5 fallback, and T6 selector graph are opt-in via --tier=4/5/6
 		// or included together via --full.
-		runT3, runT4, runT5, runT6 := selectedTiers(cfg)
-		if !runT3 && !runT4 && !runT5 && !runT6 {
-			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, --tier=6, or --full")
+		runT3, runT4, runT5, runT6, runT7 := selectedTiers(cfg)
+		if !runT3 && !runT4 && !runT5 && !runT6 && !runT7 {
+			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, --tier=6, --tier=7, --tun-full, or --full")
 			os.Exit(exitEnvError)
 		}
 		if runT3 {
@@ -181,6 +185,16 @@ func main() {
 			}
 			fmt.Println("phase 2 / T6: GREEN")
 		}
+		if runT7 {
+			fmt.Println("== phase 2 / T7: TUN ingress / L3 identity ==")
+			tier7.Run(ctx, suite, cfg.rendrRoot, tier7.Options{Case: cfg.caseID})
+			writeReports(suite, cfg.reportDir)
+			if suite.AnyFailedAt("T7") {
+				fmt.Fprintln(os.Stderr, "phase 2 / T7: FAILED")
+				os.Exit(exitT7Fail)
+			}
+			fmt.Println("phase 2 / T7: GREEN")
+		}
 	}
 
 	if !runP1 && !runP2 {
@@ -198,6 +212,8 @@ func main() {
 // phases run. See docs/regression-suite.md §10.
 func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 	switch {
+	case cfg.tunFull:
+		return false, true
 	case cfg.full:
 		return true, true
 	case cfg.phase == "1":
@@ -211,21 +227,26 @@ func decidePhases(cfg runFlags) (runP1, runP2 bool) {
 	}
 }
 
-func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6 bool) {
+func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7 bool) {
+	if cfg.tunFull {
+		return false, false, false, false, true
+	}
 	if cfg.full {
-		return true, true, true, true
+		return true, true, true, true, false
 	}
 	switch cfg.tier {
 	case "", "3":
-		return true, false, false, false
+		return true, false, false, false, false
 	case "4":
-		return false, true, false, false
+		return false, true, false, false, false
 	case "5":
-		return false, false, true, false
+		return false, false, true, false, false
 	case "6":
-		return false, false, false, true
+		return false, false, false, true, false
+	case "7":
+		return false, false, false, false, true
 	default:
-		return false, false, false, false
+		return false, false, false, false, false
 	}
 }
 

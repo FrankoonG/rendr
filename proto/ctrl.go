@@ -130,6 +130,10 @@ const (
 	// receive drainer to deliver per-frame packets rather than
 	// concatenated byte stream. Stream-mode peers ignore this bit.
 	CapsPacketMode uint32 = 1 << 0
+
+	// CapsL3Identity: peer can carry original L3/L4 identity metadata
+	// for TUN/l3ingress flows and expose it to peer-side egress hooks.
+	CapsL3Identity uint32 = 1 << 1
 )
 
 // HelloPayload: flow_id (16B) + caps (4B). 20 bytes on the wire.

@@ -173,6 +173,10 @@ func TestCapsBitStability(t *testing.T) {
 		t.Errorf("CapsPacketMode drifted: got 0x%08x want 0x00000001 (bump proto.Version if intentional)",
 			CapsPacketMode)
 	}
+	if CapsL3Identity != 0x00000002 {
+		t.Errorf("CapsL3Identity drifted: got 0x%08x want 0x00000002 (bump proto.Version if intentional)",
+			CapsL3Identity)
+	}
 }
 
 func TestProbeWireStability(t *testing.T) {
