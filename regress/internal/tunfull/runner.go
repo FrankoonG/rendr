@@ -1629,7 +1629,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	defer relay.Close()
 
 	payload := make([]byte, opts.payloadLen)
-	binary.BigEndian.PutUint64(payload[:8], 0)
+	binary.BigEndian.PutUint64(payload[:8], ^uint64(0))
 	binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
 	packet, meta, err := udpPacketEventParts(id, payload)
 	if err != nil {
@@ -1682,12 +1682,14 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if serverAdmin, ok := server.(rendr.AdminPacketConn); ok {
 		waitPacketPaths(ctx, serverAdmin, opts.paths)
 	}
+	time.Sleep(500 * time.Millisecond)
 
 	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
 	recvBmp := make([]uint8, expected+opts.pps)
 	latencies := make([]time.Duration, 0, expected/100+1)
 	recvDone := make(chan struct{})
 	sendDone := make(chan struct{})
+	payloadOffset := meta.PayloadOffset + 8
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, opts.payloadLen+64)
@@ -1720,6 +1722,16 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		}
 	}()
 
+	for i := 0; i < 1000; i++ {
+		binary.BigEndian.PutUint64(payload[:8], ^uint64(0))
+		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
+		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
+		if err := relay.HandlePacket(ctx, event); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("warmup packet %d: %w", i, err))
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
 	startMig := admin.MigrationCount()
 	migInterval := opts.duration / time.Duration(opts.migrations+1)
 	migTicker := time.NewTicker(migInterval)
@@ -1727,8 +1739,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	packetInterval := time.Second / time.Duration(opts.pps)
 	nextTick := time.Now()
 	endAt := time.Now().Add(opts.duration)
-	var sent int64 = 1
-	payloadOffset := meta.PayloadOffset + 8
+	var sent int64
 	for time.Now().Before(endAt) {
 		select {
 		case <-ctx.Done():
