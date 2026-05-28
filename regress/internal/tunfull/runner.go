@@ -115,6 +115,8 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 		})
 	case "TUN-full.T3-xray-stream-smoke":
 		return runT3XrayStreamSmoke(ctx, rendrRoot, name)
+	case "TUN-full.T3-xray-matrix":
+		return runT3XrayMatrix(ctx, rendrRoot, name)
 	case "TUN-full.T5-fallback":
 		return runT5Fallback(ctx, t5FallbackOptions{
 			name: name,
@@ -200,15 +202,23 @@ type t5FallbackOptions struct {
 }
 
 func runT3XrayStreamSmoke(ctx context.Context, rendrRoot, name string) report.Case {
+	return runT3XrayGoTest(ctx, rendrRoot, name, "^TestTUNT3(SS2022StreamOverTUN|VMessStreamOverTUN|VLESSVisionTLSStreamOverTUN|MixedSS2022VMessStreamOverTUN)$", 8*time.Minute, "6m")
+}
+
+func runT3XrayMatrix(ctx context.Context, rendrRoot, name string) report.Case {
+	return runT3XrayGoTest(ctx, rendrRoot, name, "^TestTUNT3", 12*time.Minute, "10m")
+}
+
+func runT3XrayGoTest(ctx context.Context, rendrRoot, name, pattern string, budget time.Duration, testTimeout string) report.Case {
 	start := time.Now()
 	if name == "" {
-		name = "TUN-full.T3-xray-stream-smoke"
+		name = "TUN-full.T3-xray-go-test"
 	}
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return failedCase(name, start, fmt.Errorf("bad rendr root: %w", err))
 	}
 	regressDir := filepath.Join(rendrRoot, "regress")
-	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	cmd := exec.CommandContext(
 		cctx,
@@ -216,10 +226,10 @@ func runT3XrayStreamSmoke(ctx context.Context, rendrRoot, name string) report.Ca
 		"test",
 		"./internal/matrix",
 		"-run",
-		"^TestTUNT3",
+		pattern,
 		"-count=1",
 		"-timeout",
-		"6m",
+		testTimeout,
 	)
 	cmd.Dir = regressDir
 	out, err := cmd.CombinedOutput()

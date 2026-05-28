@@ -22,7 +22,7 @@ func TestRunTunFullCaseFilter(t *testing.T) {
 
 func TestRunTunFullDefaultStillGuardsUnimplementedCases(t *testing.T) {
 	suite := report.New()
-	Run(context.Background(), suite, ".", Options{Case: "TUN-full.T3-xray-matrix"})
+	Run(context.Background(), suite, ".", Options{Case: "TUN-full.T4-long-run"})
 	if len(suite.Cases) != 1 {
 		t.Fatalf("cases=%d want 1", len(suite.Cases))
 	}
