@@ -155,7 +155,7 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 				duration:   5 * time.Minute,
 				pps:        100_000,
 				payloadLen: 1024,
-				paths:      8,
+				paths:      12,
 				migrations: 10,
 				lossPct:    -1,
 				p95Ceiling: 20 * time.Millisecond,
@@ -1679,6 +1679,9 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		return failedCase(opts.name, start, fmt.Errorf("session packet conn is not rendr.AdminPacketConn"))
 	}
 	waitPacketPaths(ctx, admin, opts.paths)
+	if serverAdmin, ok := server.(rendr.AdminPacketConn); ok {
+		waitPacketPaths(ctx, serverAdmin, opts.paths)
+	}
 
 	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
 	recvBmp := make([]uint8, expected+opts.pps)
@@ -1770,7 +1773,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	p95 := percentile(latencies, 0.95)
 	migrations := admin.MigrationCount() - startMig
 	if lossPct > opts.lossPct {
-		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.lossPct))
+		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%% (sent=%d lost=%d migrations=%d p95=%s)", lossPct, opts.lossPct, sent, lost, migrations, p95))
 	}
 	if p95 > opts.p95Ceiling {
 		return failedCase(opts.name, start, fmt.Errorf("P95 %s exceeds ceiling %s", p95, opts.p95Ceiling))
