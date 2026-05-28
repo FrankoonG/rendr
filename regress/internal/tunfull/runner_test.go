@@ -22,7 +22,7 @@ func TestRunTunFullCaseFilter(t *testing.T) {
 
 func TestRunTunFullDefaultStillGuardsUnimplementedCases(t *testing.T) {
 	suite := report.New()
-	Run(context.Background(), suite, ".", Options{Case: "TUN-full.G3-smoke"})
+	Run(context.Background(), suite, ".", Options{Case: "TUN-full.T3-xray-matrix"})
 	if len(suite.Cases) != 1 {
 		t.Fatalf("cases=%d want 1", len(suite.Cases))
 	}
@@ -41,6 +41,22 @@ func TestRunG2SmokeShort(t *testing.T) {
 	})
 	if c.Name != "TUN-full.G2-smoke" || c.Tier != "T7" || c.Failure != "" {
 		t.Fatalf("bad G2 smoke case: %+v", c)
+	}
+}
+
+func TestRunG3SmokeShort(t *testing.T) {
+	c := runG3Smoke(context.Background(), g3Options{
+		name:       "TUN-full.G3-smoke",
+		duration:   300 * time.Millisecond,
+		pps:        500,
+		payloadLen: 256,
+		paths:      2,
+		migrations: 1,
+		lossPct:    5,
+		p95Ceiling: 200 * time.Millisecond,
+	})
+	if c.Name != "TUN-full.G3-smoke" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad G3 case: %+v", c)
 	}
 }
 

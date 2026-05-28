@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"sort"
 	"time"
 
@@ -80,6 +81,17 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:      2,
 			migrations: 5,
 		})
+	case "TUN-full.G3-smoke":
+		return runG3Smoke(ctx, g3Options{
+			name:       name,
+			duration:   5 * time.Second,
+			pps:        5000,
+			payloadLen: 1024,
+			paths:      4,
+			migrations: 3,
+			lossPct:    0.5,
+			p95Ceiling: 50 * time.Millisecond,
+		})
 	case "TUN-full.G4-path-death":
 		return runG4PathDeath(ctx, g4Options{
 			name:     name,
@@ -146,6 +158,17 @@ type g5Options struct {
 	name         string
 	paths        int
 	postAddBytes int64
+}
+
+type g3Options struct {
+	name       string
+	duration   time.Duration
+	pps        int
+	payloadLen int
+	paths      int
+	migrations int
+	lossPct    float64
+	p95Ceiling time.Duration
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
@@ -904,4 +927,338 @@ func startStreamEcho(c net.Conn, bufferSize int) <-chan error {
 		}
 	}()
 	return errCh
+}
+
+func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.G3-smoke"
+	}
+	if opts.duration <= 0 {
+		opts.duration = 5 * time.Second
+	}
+	if opts.pps <= 0 {
+		opts.pps = 5000
+	}
+	if opts.payloadLen <= 16 {
+		opts.payloadLen = 1024
+	}
+	if opts.paths < 1 {
+		opts.paths = 4
+	}
+	if opts.migrations < 0 {
+		opts.migrations = 0
+	}
+	if opts.migrations == 0 {
+		opts.migrations = 3
+	}
+	if opts.lossPct <= 0 {
+		opts.lossPct = 0.5
+	}
+	if opts.p95Ceiling <= 0 {
+		opts.p95Ceiling = 50 * time.Millisecond
+	}
+
+	ln, err := rendr.ListenQUICDatagram("127.0.0.1:0", nil)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("ListenQUICDatagram: %w", err))
+	}
+	defer ln.Close()
+
+	accepted := make(chan rendr.PacketConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		pc, err := ln.AcceptPacket(actx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- pc
+	}()
+
+	id := l3ingress.L3Identity{
+		Proto:   l3ingress.ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("10.0.0.2"),
+		SrcPort: 40000,
+		DstIP:   netip.MustParseAddr("198.51.100.53"),
+		DstPort: 53,
+	}
+	root := g3Root(ln.Addr().String(), opts.paths)
+	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
+	dev := &captureDevice{writes: make(chan []byte, expected)}
+	manager := &l3session.Manager{}
+	relay := &l3session.UDPRelay{Device: dev, Manager: manager, BufferSize: opts.payloadLen + 64}
+	defer relay.Close()
+
+	firstPacket, firstMeta, err := udpPacketEventParts(id, make([]byte, opts.payloadLen))
+	if err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
+		Packet: firstPacket,
+		Meta:   firstMeta,
+		Flow:   l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
+		Decision: l3ingress.FlowDecision{
+			Peer:   "peer-a",
+			Root:   root,
+			Egress: "direct",
+		},
+		Decided: true,
+	}); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("start relay: %w", err))
+	}
+
+	var server rendr.PacketConn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		return failedCase(opts.name, start, fmt.Errorf("accept: %w", err))
+	case <-time.After(15 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("accept timeout"))
+	}
+	defer server.Close()
+
+	echoErr := startPacketEcho(server, opts.payloadLen+64)
+	sess, ok := manager.Session(id)
+	if !ok || sess.PacketConn == nil {
+		return failedCase(opts.name, start, fmt.Errorf("missing packet session"))
+	}
+	admin, ok := sess.PacketConn.(rendr.AdminPacketConn)
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("session packet conn is not rendr.AdminPacketConn"))
+	}
+	waitPacketPaths(ctx, admin, opts.paths)
+
+	recvBmp := make([]uint8, expected+opts.pps)
+	latencies := make([]time.Duration, 0, expected/100+1)
+	recvDone := make(chan struct{})
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		idle := time.NewTimer(opts.duration + 5*time.Second)
+		defer idle.Stop()
+		var rx int
+		sendDoneC := sendDone
+		for {
+			select {
+			case packet := <-dev.writes:
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(5 * time.Second)
+				meta, err := l3ingress.ParsePacket(packet)
+				if err != nil {
+					continue
+				}
+				payload, err := l3ingress.UDPPayload(packet, meta)
+				if err != nil || len(payload) < 16 {
+					continue
+				}
+				seq := binary.BigEndian.Uint64(payload[:8])
+				if seq < uint64(len(recvBmp)) {
+					recvBmp[seq] = 1
+				}
+				if rx%100 == 0 {
+					sentNS := int64(binary.BigEndian.Uint64(payload[8:16]))
+					latencies = append(latencies, time.Since(time.Unix(0, sentNS)))
+				}
+				rx++
+			case <-sendDoneC:
+				sendDoneC = nil
+				idle.Reset(500 * time.Millisecond)
+			case <-idle.C:
+				return
+			}
+		}
+	}()
+
+	startMig := admin.MigrationCount()
+	migInterval := opts.duration / time.Duration(opts.migrations+1)
+	migTicker := time.NewTicker(migInterval)
+	defer migTicker.Stop()
+	packetInterval := time.Second / time.Duration(opts.pps)
+	nextTick := time.Now()
+	endAt := time.Now().Add(opts.duration)
+	payload := make([]byte, opts.payloadLen)
+	var sent int64
+	for time.Now().Before(endAt) {
+		select {
+		case <-ctx.Done():
+			return failedCase(opts.name, start, ctx.Err())
+		case <-migTicker.C:
+			next := nextPacketPath(admin)
+			if next != 0 {
+				_ = admin.Migrate(next)
+			}
+		default:
+		}
+		paceUntil(nextTick)
+		nextTick = nextTick.Add(packetInterval)
+		binary.BigEndian.PutUint64(payload[:8], uint64(sent))
+		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
+		packet, meta, err := udpPacketEventParts(id, payload)
+		if err != nil {
+			return failedCase(opts.name, start, err)
+		}
+		if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
+			Packet: packet,
+			Meta:   meta,
+			Flow:   l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
+			Decision: l3ingress.FlowDecision{
+				Peer:   "peer-a",
+				Root:   root,
+				Egress: "direct",
+			},
+			Decided: true,
+		}); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("send seq %d: %w", sent, err))
+		}
+		sent++
+	}
+	close(sendDone)
+	<-recvDone
+
+	lost := int64(0)
+	limit := sent
+	if limit > int64(len(recvBmp)) {
+		limit = int64(len(recvBmp))
+	}
+	for seq := int64(0); seq < limit; seq++ {
+		if recvBmp[seq] == 0 {
+			lost++
+		}
+	}
+	if sent > int64(len(recvBmp)) {
+		lost += sent - int64(len(recvBmp))
+	}
+	lossPct := float64(lost) / float64(sent) * 100
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p95 := percentile(latencies, 0.95)
+	migrations := admin.MigrationCount() - startMig
+	if lossPct > opts.lossPct {
+		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.lossPct))
+	}
+	if p95 > opts.p95Ceiling {
+		return failedCase(opts.name, start, fmt.Errorf("P95 %s exceeds ceiling %s", p95, opts.p95Ceiling))
+	}
+	if migrations < uint64(opts.migrations) {
+		return failedCase(opts.name, start, fmt.Errorf("MigrationCount=%d, want >= %d", migrations, opts.migrations))
+	}
+	relay.CloseFlow(id)
+	select {
+	case err := <-echoErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("echo: %w", err))
+		}
+	default:
+	}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+func g3Root(addr string, paths int) rendr.Target {
+	children := make([]rendr.Target, 0, paths)
+	for i := 0; i < paths; i++ {
+		children = append(children, rendr.Path(fmt.Sprintf("tun-g3-%d", i+1), rendr.PathSpec{
+			Transport: "quic",
+			Address:   addr,
+			Opts:      map[string]string{"mode": "datagram"},
+		}))
+	}
+	return rendr.Bond("tun-full-g3", children)
+}
+
+func udpPacketEventParts(id l3ingress.L3Identity, payload []byte) ([]byte, l3ingress.PacketMeta, error) {
+	packet, err := l3ingress.BuildUDPPacket(id, payload)
+	if err != nil {
+		return nil, l3ingress.PacketMeta{}, fmt.Errorf("build UDP packet: %w", err)
+	}
+	meta, err := l3ingress.ParsePacket(packet)
+	if err != nil {
+		return nil, l3ingress.PacketMeta{}, fmt.Errorf("parse UDP packet: %w", err)
+	}
+	return packet, meta, nil
+}
+
+func waitPacketPaths(ctx context.Context, admin rendr.AdminPacketConn, want int) {
+	deadline := time.After(5 * time.Second)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for len(admin.Paths()) < want {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+func nextPacketPath(admin rendr.AdminPacketConn) uint32 {
+	cur := admin.ActivePath()
+	for _, p := range admin.Paths() {
+		if p.ID != cur {
+			return p.ID
+		}
+	}
+	return 0
+}
+
+func startPacketEcho(pc rendr.PacketConn, bufferSize int) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if bufferSize <= 0 {
+			bufferSize = 2048
+		}
+		buf := make([]byte, bufferSize)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if _, err := pc.WriteTo(buf[:n], addr); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	return errCh
+}
+
+type captureDevice struct {
+	writes chan []byte
+}
+
+func (d *captureDevice) Read([]byte) (int, error) { return 0, io.EOF }
+func (d *captureDevice) Write(p []byte) (int, error) {
+	if d.writes != nil {
+		d.writes <- append([]byte(nil), p...)
+	}
+	return len(p), nil
+}
+func (d *captureDevice) Close() error { return nil }
+func (d *captureDevice) Name() string { return "tun-full-capture0" }
+func (d *captureDevice) MTU() int     { return 1500 }
+
+func paceUntil(target time.Time) {
+	for {
+		now := time.Now()
+		if !now.Before(target) {
+			return
+		}
+		remaining := target.Sub(now)
+		switch {
+		case remaining > 250*time.Microsecond:
+			time.Sleep(remaining - 100*time.Microsecond)
+		case remaining > 50*time.Microsecond:
+			runtime.Gosched()
+		default:
+		}
+	}
 }
