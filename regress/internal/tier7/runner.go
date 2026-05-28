@@ -103,6 +103,12 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.udp.migration", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.udp.migration", "./l3session", "^TestUDPRelayPreservesFlowAcrossPacketMigration$")
 	})
+	run("T7.tcp.rendr-relay", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.tcp.rendr-relay", "./l3session", "^TestTCPRelayBridgesEndpointThroughRendrStreamSession$")
+	})
+	run("T7.tcp.migration", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.tcp.migration", "./l3session", "^TestTCPRelayPreservesFlowAcrossStreamMigration$")
+	})
 	run("T7.tcp.lifecycle-flags", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.tcp.lifecycle-flags", "./l3ingress", "^TestParseTCPCloseFlags|TestPumpClosesFlowTableOnTCPReset$")
 	})
