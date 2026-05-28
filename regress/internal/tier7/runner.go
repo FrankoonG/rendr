@@ -49,6 +49,12 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.l3.identity-smoke", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.l3.identity-smoke", "./l3ingress", "^TestParseIPv4TCPIdentity|TestParseIPv6UDPIdentity$")
 	})
+	run("T7.l3.identity-wire", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.l3.identity-wire", "./l3ingress", "^TestIdentityWireRoundTripIPv4|TestIdentityWireRoundTripIPv6|TestIdentityWireRejectsMixedFamilies$")
+	})
+	run("T7.capability.peer-denied", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.capability.peer-denied", "./l3ingress", "^TestRequirePeerL3Identity|TestRequirePeerEgress$")
+	})
 	run("T7.l3.fragment-boundary", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.l3.fragment-boundary", "./l3ingress", "^TestParseIPv4UDPMoreFragmentFirstFragment|TestParseRejectsIPv4NonInitialFragment$")
 	})
