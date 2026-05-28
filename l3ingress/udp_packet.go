@@ -26,57 +26,88 @@ func UDPPayload(packet []byte, meta PacketMeta) ([]byte, error) {
 
 // BuildUDPPacket builds a raw IP packet carrying one UDP datagram.
 func BuildUDPPacket(id L3Identity, payload []byte) ([]byte, error) {
+	return AppendUDPPacket(nil, id, payload)
+}
+
+// AppendUDPPacket appends a raw IP packet carrying one UDP datagram to dst.
+// The returned packet does not retain payload, so callers may reuse payload
+// after the call returns.
+func AppendUDPPacket(out []byte, id L3Identity, payload []byte) ([]byte, error) {
 	if id.Proto != ProtocolUDP {
 		return nil, fmt.Errorf("l3ingress: %s is not udp", id.Proto)
 	}
 	if !id.SrcIP.IsValid() || !id.DstIP.IsValid() {
 		return nil, parseErr(ReasonInvalidHeader, "invalid udp endpoint address")
 	}
+	if len(payload) > 0xffff-8 {
+		return nil, parseErr(ReasonInvalidHeader, fmt.Sprintf("udp payload too large: %d", len(payload)))
+	}
 	if id.SrcIP.Is4() && id.DstIP.Is4() {
-		return buildIPv4UDPPacket(id, payload), nil
+		return appendIPv4UDPPacket(out, id, payload), nil
 	}
 	if id.SrcIP.Is6() && id.DstIP.Is6() {
-		return buildIPv6UDPPacket(id, payload), nil
+		return appendIPv6UDPPacket(out, id, payload), nil
 	}
 	return nil, parseErr(ReasonInvalidHeader, "mixed udp address families")
 }
 
-func buildIPv4UDPPacket(id L3Identity, payload []byte) []byte {
+func appendIPv4UDPPacket(dst []byte, id L3Identity, payload []byte) []byte {
 	totalLen := 20 + 8 + len(payload)
-	pkt := make([]byte, totalLen)
+	oldLen := len(dst)
+	dst = appendZeroed(dst, totalLen)
+	pkt := dst[oldLen:]
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
 	pkt[8] = 64
 	pkt[9] = byte(ProtocolUDP)
 	src := id.SrcIP.As4()
-	dst := id.DstIP.As4()
+	dstIP := id.DstIP.As4()
 	copy(pkt[12:16], src[:])
-	copy(pkt[16:20], dst[:])
+	copy(pkt[16:20], dstIP[:])
 	binary.BigEndian.PutUint16(pkt[20:22], id.SrcPort)
 	binary.BigEndian.PutUint16(pkt[22:24], id.DstPort)
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(8+len(payload)))
 	copy(pkt[28:], payload)
 	binary.BigEndian.PutUint16(pkt[10:12], checksum(pkt[:20]))
-	return pkt
+	return dst
 }
 
-func buildIPv6UDPPacket(id L3Identity, payload []byte) []byte {
+func appendIPv6UDPPacket(dst []byte, id L3Identity, payload []byte) []byte {
 	payloadLen := 8 + len(payload)
-	pkt := make([]byte, 40+payloadLen)
+	oldLen := len(dst)
+	dst = appendZeroed(dst, 40+payloadLen)
+	pkt := dst[oldLen:]
 	pkt[0] = 0x60
 	binary.BigEndian.PutUint16(pkt[4:6], uint16(payloadLen))
 	pkt[6] = byte(ProtocolUDP)
 	pkt[7] = 64
 	src := id.SrcIP.As16()
-	dst := id.DstIP.As16()
+	dstIP := id.DstIP.As16()
 	copy(pkt[8:24], src[:])
-	copy(pkt[24:40], dst[:])
+	copy(pkt[24:40], dstIP[:])
 	binary.BigEndian.PutUint16(pkt[40:42], id.SrcPort)
 	binary.BigEndian.PutUint16(pkt[42:44], id.DstPort)
 	binary.BigEndian.PutUint16(pkt[44:46], uint16(payloadLen))
 	copy(pkt[48:], payload)
 	binary.BigEndian.PutUint16(pkt[46:48], udpIPv6Checksum(pkt, payloadLen))
-	return pkt
+	return dst
+}
+
+func appendZeroed(dst []byte, n int) []byte {
+	oldLen := len(dst)
+	need := oldLen + n
+	if cap(dst) < need {
+		nextCap := need
+		if doubled := cap(dst) * 2; doubled > nextCap {
+			nextCap = doubled
+		}
+		buf := make([]byte, oldLen, nextCap)
+		copy(buf, dst)
+		dst = buf
+	}
+	dst = dst[:need]
+	clear(dst[oldLen:need])
+	return dst
 }
 
 func udpIPv6Checksum(pkt []byte, udpLen int) uint16 {

@@ -150,6 +150,8 @@ func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, ses
 		size = 64 << 10
 	}
 	buf := make([]byte, size)
+	replyID := id.Reverse()
+	packet := make([]byte, 0, size+28)
 	for {
 		select {
 		case <-ctx.Done():
@@ -163,7 +165,8 @@ func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, ses
 			}
 			return
 		}
-		packet, err := l3ingress.BuildUDPPacket(id.Reverse(), append([]byte(nil), buf[:n]...))
+		packet = packet[:0]
+		packet, err = l3ingress.AppendUDPPacket(packet, replyID, buf[:n])
 		if err != nil {
 			return
 		}

@@ -119,6 +119,8 @@ func (r *UDPFlowRelay) session(ctx context.Context, ev PacketEvent) (*udpFlowSes
 func (r *UDPFlowRelay) readReplies(ctx context.Context, session *udpFlowSession) {
 	defer r.forgetSession(session)
 	buf := make([]byte, 64<<10)
+	replyID := session.id.Reverse()
+	packet := make([]byte, 0, len(buf)+28)
 	for {
 		select {
 		case <-ctx.Done():
@@ -132,7 +134,8 @@ func (r *UDPFlowRelay) readReplies(ctx context.Context, session *udpFlowSession)
 			}
 			return
 		}
-		packet, err := BuildUDPPacket(session.id.Reverse(), append([]byte(nil), buf[:n]...))
+		packet = packet[:0]
+		packet, err = AppendUDPPacket(packet, replyID, buf[:n])
 		if err != nil {
 			return
 		}

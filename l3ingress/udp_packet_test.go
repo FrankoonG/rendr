@@ -52,6 +52,40 @@ func TestBuildUDPPacketRoundTripIPv4(t *testing.T) {
 	}
 }
 
+func TestAppendUDPPacketReusesBuffer(t *testing.T) {
+	id := L3Identity{
+		Proto:   ProtocolUDP,
+		SrcIP:   netip.MustParseAddr("192.0.2.10"),
+		SrcPort: 5353,
+		DstIP:   netip.MustParseAddr("192.0.2.20"),
+		DstPort: 53000,
+	}
+	buf := make([]byte, 0, 1500)
+	first, err := AppendUDPPacket(buf, id, []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCap := cap(first)
+	second, err := AppendUDPPacket(first[:0], id, []byte("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(second) != firstCap {
+		t.Fatalf("cap changed from %d to %d", firstCap, cap(second))
+	}
+	meta, err := ParsePacket(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := UDPPayload(second, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, []byte("two")) {
+		t.Fatalf("payload=%q", payload)
+	}
+}
+
 func TestBuildUDPPacketRoundTripIPv6(t *testing.T) {
 	id := L3Identity{
 		Proto:   ProtocolUDP,

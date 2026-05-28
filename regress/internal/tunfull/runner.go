@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr"
@@ -1624,8 +1626,33 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	}
 	root := g3Root(ln.Addr().String(), opts.paths)
 	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
-	dev := &captureDevice{writes: make(chan []byte, expected)}
 	manager := &l3session.Manager{}
+	recvBmp := make([]uint8, expected+opts.pps)
+	latencies := make([]time.Duration, 0, expected/100+1)
+	var recvMu sync.Mutex
+	var received int64
+	var lastReceiveNS int64
+	replyMeta := l3ingress.PacketMeta{Identity: id.Reverse(), PayloadOffset: 20}
+	dev := &captureDevice{
+		onWrite: func(packet []byte) {
+			payload, err := l3ingress.UDPPayload(packet, replyMeta)
+			if err != nil || len(payload) < 16 {
+				return
+			}
+			seq := binary.BigEndian.Uint64(payload[:8])
+			n := atomic.AddInt64(&received, 1) - 1
+			atomic.StoreInt64(&lastReceiveNS, time.Now().UnixNano())
+			recvMu.Lock()
+			if seq < uint64(len(recvBmp)) {
+				recvBmp[seq] = 1
+			}
+			if n%100 == 0 {
+				sentNS := int64(binary.BigEndian.Uint64(payload[8:16]))
+				latencies = append(latencies, time.Since(time.Unix(0, sentNS)))
+			}
+			recvMu.Unlock()
+		},
+	}
 	relay := &l3session.UDPRelay{Device: dev, Manager: manager, BufferSize: opts.payloadLen + 64}
 	defer relay.Close()
 
@@ -1680,50 +1707,6 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	}
 	waitPacketPaths(ctx, admin, opts.paths)
 
-	recvBmp := make([]uint8, expected+opts.pps)
-	latencies := make([]time.Duration, 0, expected/100+1)
-	recvDone := make(chan struct{})
-	sendDone := make(chan struct{})
-	replyMeta := meta
-	replyMeta.Identity = id.Reverse()
-	go func() {
-		defer close(recvDone)
-		idle := time.NewTimer(opts.duration + 5*time.Second)
-		defer idle.Stop()
-		var rx int
-		sendDoneC := sendDone
-		for {
-			select {
-			case packet := <-dev.writes:
-				if !idle.Stop() {
-					select {
-					case <-idle.C:
-					default:
-					}
-				}
-				idle.Reset(5 * time.Second)
-				payload, err := l3ingress.UDPPayload(packet, replyMeta)
-				if err != nil || len(payload) < 16 {
-					continue
-				}
-				seq := binary.BigEndian.Uint64(payload[:8])
-				if seq < uint64(len(recvBmp)) {
-					recvBmp[seq] = 1
-				}
-				if rx%100 == 0 {
-					sentNS := int64(binary.BigEndian.Uint64(payload[8:16]))
-					latencies = append(latencies, time.Since(time.Unix(0, sentNS)))
-				}
-				rx++
-			case <-sendDoneC:
-				sendDoneC = nil
-				idle.Reset(500 * time.Millisecond)
-			case <-idle.C:
-				return
-			}
-		}
-	}()
-
 	startMig := admin.MigrationCount()
 	migInterval := opts.duration / time.Duration(opts.migrations+1)
 	migTicker := time.NewTicker(migInterval)
@@ -1754,14 +1737,15 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		}
 		sent++
 	}
-	close(sendDone)
-	<-recvDone
+	waitForPacketQuiescence(&received, &lastReceiveNS, 500*time.Millisecond, 5*time.Second)
+	relay.CloseFlow(id)
 
 	lost := int64(0)
 	limit := sent
 	if limit > int64(len(recvBmp)) {
 		limit = int64(len(recvBmp))
 	}
+	recvMu.Lock()
 	for seq := int64(0); seq < limit; seq++ {
 		if recvBmp[seq] == 0 {
 			lost++
@@ -1773,6 +1757,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	lossPct := float64(lost) / float64(sent) * 100
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	p95 := percentile(latencies, 0.95)
+	recvMu.Unlock()
 	migrations := admin.MigrationCount() - startMig
 	if lossPct > opts.lossPct {
 		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.lossPct))
@@ -1783,7 +1768,6 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if migrations < uint64(opts.migrations) {
 		return failedCase(opts.name, start, fmt.Errorf("MigrationCount=%d, want >= %d", migrations, opts.migrations))
 	}
-	relay.CloseFlow(id)
 	select {
 	case err := <-echoErr:
 		if err != nil && !isClosedRelayErr(err) {
@@ -1792,6 +1776,21 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	default:
 	}
 	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+func waitForPacketQuiescence(received *int64, lastReceiveNS *int64, quietFor, maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(received) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		last := atomic.LoadInt64(lastReceiveNS)
+		if last > 0 && time.Since(time.Unix(0, last)) >= quietFor {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func g3Root(addr string, paths int) rendr.Target {
@@ -1866,13 +1865,18 @@ func startPacketEcho(pc rendr.PacketConn, bufferSize int) <-chan error {
 }
 
 type captureDevice struct {
-	writes chan []byte
+	writes  chan []byte
+	onWrite func([]byte)
 }
 
 func (d *captureDevice) Read([]byte) (int, error) { return 0, io.EOF }
 func (d *captureDevice) Write(p []byte) (int, error) {
+	if d.onWrite != nil {
+		d.onWrite(p)
+		return len(p), nil
+	}
 	if d.writes != nil {
-		d.writes <- p
+		d.writes <- append([]byte(nil), p...)
 	}
 	return len(p), nil
 }
