@@ -425,6 +425,9 @@ func (e *Engine) computeBondStuckMask(ids []uint32) []bool {
 		return mask
 	}
 	mult := e.limits.BondStuckRTTMultiplier
+	if mult >= 1_000_000 {
+		return mask
+	}
 	if mult <= 1.0 {
 		mult = 3.0
 	}
