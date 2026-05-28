@@ -184,3 +184,56 @@ func TestFlowTableObserverReceivesLifecycleSnapshots(t *testing.T) {
 		t.Fatalf("observer snapshot mutated table storage: %+v", stored.Decision.Labels)
 	}
 }
+
+func TestFlowTableRecordsPathSelectionAndMigrations(t *testing.T) {
+	id := L3Identity{
+		Proto:   ProtocolTCP,
+		SrcIP:   netip.MustParseAddr("10.0.0.5"),
+		SrcPort: 1111,
+		DstIP:   netip.MustParseAddr("203.0.113.5"),
+		DstPort: 443,
+	}
+	var snapshots []FlowSnapshot
+	table := NewFlowTable(nil, FlowTableOptions{
+		Observer: FlowObserverFunc(func(snapshot FlowSnapshot) {
+			snapshots = append(snapshots, snapshot)
+		}),
+	})
+	if _, _, _, err := table.Resolve(context.Background(), FlowMeta{L3Identity: id, Direction: DirectionIngress}, 10); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := table.RecordPathSelection(id, []string{"low-latency"})
+	if !ok {
+		t.Fatal("RecordPathSelection returned false")
+	}
+	if snapshot.MigrationCount != 0 || len(snapshot.SelectedPaths) != 1 || snapshot.SelectedPaths[0] != "low-latency" {
+		t.Fatalf("selection snapshot=%+v", snapshot)
+	}
+	paths := []string{"bulk-a", "bulk-b"}
+	snapshot, ok = table.RecordMigration(id, paths)
+	if !ok {
+		t.Fatal("RecordMigration returned false")
+	}
+	paths[0] = "mutated"
+	if snapshot.MigrationCount != 1 || len(snapshot.SelectedPaths) != 2 || snapshot.SelectedPaths[0] != "bulk-a" {
+		t.Fatalf("migration snapshot=%+v", snapshot)
+	}
+	stored, ok := table.Snapshot(id)
+	if !ok {
+		t.Fatal("active snapshot missing")
+	}
+	if stored.MigrationCount != 1 || stored.SelectedPaths[0] != "bulk-a" {
+		t.Fatalf("stored snapshot=%+v", stored)
+	}
+	stored.SelectedPaths[0] = "mutated-again"
+	stored, _ = table.Snapshot(id)
+	if stored.SelectedPaths[0] != "bulk-a" {
+		t.Fatalf("path selection was not isolated: %+v", stored.SelectedPaths)
+	}
+	if len(snapshots) != 3 {
+		t.Fatalf("observer snapshots=%d want 3", len(snapshots))
+	}
+	if snapshots[2].MigrationCount != 1 || snapshots[2].SelectedPaths[1] != "bulk-b" {
+		t.Fatalf("observer migration snapshot=%+v", snapshots[2])
+	}
+}

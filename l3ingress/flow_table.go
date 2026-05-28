@@ -26,16 +26,18 @@ type FlowTableOptions struct {
 
 // FlowSnapshot is a stable copy of one flow table entry.
 type FlowSnapshot struct {
-	Flow        FlowMeta
-	Decision    FlowDecision
-	Decided     bool
-	Packets     uint64
-	Bytes       uint64
-	FirstSeen   time.Time
-	LastSeen    time.Time
-	Closed      bool
-	ClosedAt    time.Time
-	CloseReason FlowCloseReason
+	Flow           FlowMeta
+	Decision       FlowDecision
+	Decided        bool
+	Packets        uint64
+	Bytes          uint64
+	FirstSeen      time.Time
+	LastSeen       time.Time
+	Closed         bool
+	ClosedAt       time.Time
+	CloseReason    FlowCloseReason
+	SelectedPaths  []string
+	MigrationCount uint64
 }
 
 // FlowObserver receives stable lifecycle/stat snapshots as flows are
@@ -63,13 +65,15 @@ type FlowTable struct {
 }
 
 type flowRecord struct {
-	flow      FlowMeta
-	decision  FlowDecision
-	decided   bool
-	packets   uint64
-	bytes     uint64
-	firstSeen time.Time
-	lastSeen  time.Time
+	flow           FlowMeta
+	decision       FlowDecision
+	decided        bool
+	packets        uint64
+	bytes          uint64
+	firstSeen      time.Time
+	lastSeen       time.Time
+	selectedPaths  []string
+	migrationCount uint64
 }
 
 // NewFlowTable creates a per-flow decision cache. A nil router is valid
@@ -217,6 +221,36 @@ func (t *FlowTable) Close(id L3Identity, reason FlowCloseReason) (FlowSnapshot, 
 	return snap, true
 }
 
+// RecordPathSelection records the currently selected underlying path names.
+func (t *FlowTable) RecordPathSelection(id L3Identity, paths []string) (FlowSnapshot, bool) {
+	return t.recordPaths(id, paths, false)
+}
+
+// RecordMigration records that a flow migrated to the given path names.
+func (t *FlowTable) RecordMigration(id L3Identity, paths []string) (FlowSnapshot, bool) {
+	return t.recordPaths(id, paths, true)
+}
+
+func (t *FlowTable) recordPaths(id L3Identity, paths []string, migrated bool) (FlowSnapshot, bool) {
+	if t == nil {
+		return FlowSnapshot{}, false
+	}
+	t.mu.Lock()
+	rec := t.active[id]
+	if rec == nil {
+		t.mu.Unlock()
+		return FlowSnapshot{}, false
+	}
+	rec.selectedPaths = cloneStringSlice(paths)
+	if migrated {
+		rec.migrationCount++
+	}
+	snap := rec.snapshot()
+	t.mu.Unlock()
+	t.observe(snap)
+	return snap, true
+}
+
 func (t *FlowTable) observe(snapshot FlowSnapshot) {
 	if t == nil || t.observer == nil {
 		return
@@ -226,19 +260,22 @@ func (t *FlowTable) observe(snapshot FlowSnapshot) {
 
 func (r *flowRecord) snapshot() FlowSnapshot {
 	return FlowSnapshot{
-		Flow:      cloneFlowMeta(r.flow),
-		Decision:  cloneDecision(r.decision),
-		Decided:   r.decided,
-		Packets:   r.packets,
-		Bytes:     r.bytes,
-		FirstSeen: r.firstSeen,
-		LastSeen:  r.lastSeen,
+		Flow:           cloneFlowMeta(r.flow),
+		Decision:       cloneDecision(r.decision),
+		Decided:        r.decided,
+		Packets:        r.packets,
+		Bytes:          r.bytes,
+		FirstSeen:      r.firstSeen,
+		LastSeen:       r.lastSeen,
+		SelectedPaths:  cloneStringSlice(r.selectedPaths),
+		MigrationCount: r.migrationCount,
 	}
 }
 
 func cloneSnapshot(s FlowSnapshot) FlowSnapshot {
 	s.Flow = cloneFlowMeta(s.Flow)
 	s.Decision = cloneDecision(s.Decision)
+	s.SelectedPaths = cloneStringSlice(s.SelectedPaths)
 	return s
 }
 
@@ -260,5 +297,14 @@ func cloneStringMap(in map[string]string) map[string]string {
 	for k, v := range in {
 		out[k] = v
 	}
+	return out
+}
+
+func cloneStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
 	return out
 }
