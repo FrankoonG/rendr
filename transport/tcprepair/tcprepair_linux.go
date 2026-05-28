@@ -252,7 +252,7 @@ func Restore(s *State) (int, error) {
 }
 
 func repairWindowError(op string, err error) error {
-	if errors.Is(err, syscall.ENOPROTOOPT) || errors.Is(err, syscall.EOPNOTSUPP) {
+	if errors.Is(err, syscall.ENOPROTOOPT) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) {
 		return fmt.Errorf("%s: %w (TCP_REPAIR_WINDOW requires Linux >= 4.5; use gvisor fallback)", op, err)
 	}
 	return fmt.Errorf("%s: %w", op, err)
