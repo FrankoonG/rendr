@@ -17,6 +17,7 @@ const (
 	CtrlBye            CtrlCode = 0x05
 	CtrlPathProbe      CtrlCode = 0x06
 	CtrlPathProbeReply CtrlCode = 0x07
+	CtrlPolicyRequest  CtrlCode = 0x08
 	CtrlBridgeTag      CtrlCode = 0x10
 )
 
@@ -100,6 +101,8 @@ func (c CtrlCode) String() string {
 		return "PATH_PROBE"
 	case CtrlPathProbeReply:
 		return "PATH_PROBE_REPLY"
+	case CtrlPolicyRequest:
+		return "POLICY_REQUEST"
 	case CtrlBridgeTag:
 		return "BRIDGE_TAG"
 	default:
@@ -131,8 +134,9 @@ const (
 
 // HelloPayload: flow_id (16B) + caps (4B). 20 bytes on the wire.
 type HelloPayload struct {
-	FlowID [16]byte
-	Caps   uint32
+	FlowID   [16]byte
+	Caps     uint32
+	PathName string
 }
 
 const HelloPayloadSize = 20
@@ -141,6 +145,9 @@ func (p HelloPayload) Encode() []byte {
 	b := make([]byte, HelloPayloadSize)
 	copy(b[0:16], p.FlowID[:])
 	binary.BigEndian.PutUint32(b[16:20], p.Caps)
+	if p.PathName != "" {
+		b = appendPathName(b, p.PathName)
+	}
 	return b
 }
 
@@ -151,7 +158,13 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 	}
 	copy(p.FlowID[:], b[0:16])
 	p.Caps = binary.BigEndian.Uint32(b[16:20])
+	p.PathName, _ = decodePathName(b[HelloPayloadSize:])
 	return p, nil
+}
+
+func (p HelloPayload) EncodeWithPathName(name string) []byte {
+	p.PathName = name
+	return p.Encode()
 }
 
 // MigrateNotifyPayload: new_path_id (4B).
@@ -261,6 +274,7 @@ func DecodeBye(b []byte) (ByePayload, error) {
 // correct Conn.
 type BridgeTagPayload struct {
 	BridgeID [16]byte
+	PathName string
 }
 
 const BridgeTagPayloadSize = 16
@@ -268,6 +282,9 @@ const BridgeTagPayloadSize = 16
 func (p BridgeTagPayload) Encode() []byte {
 	b := make([]byte, BridgeTagPayloadSize)
 	copy(b, p.BridgeID[:])
+	if p.PathName != "" {
+		b = appendPathName(b, p.PathName)
+	}
 	return b
 }
 
@@ -277,5 +294,88 @@ func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
 	}
 	var p BridgeTagPayload
 	copy(p.BridgeID[:], b[0:16])
+	p.PathName, _ = decodePathName(b[BridgeTagPayloadSize:])
 	return p, nil
+}
+
+func (p BridgeTagPayload) EncodeWithPathName(name string) []byte {
+	p.PathName = name
+	return p.Encode()
+}
+
+// PolicyRequestPayload asks the peer to update its local sender policy for
+// this flow. It is used by receive-side selector decisions: the receiver can
+// observe RX saturation, but the peer owns the corresponding TX dispatch.
+type PolicyRequestPayload struct {
+	Mode       uint8
+	ActiveName string
+	ScopeNames []string
+	Cause      string
+}
+
+func (p PolicyRequestPayload) Encode() []byte {
+	b := []byte{p.Mode, 0, 0, 0}
+	b[1] = byte(len(p.ScopeNames))
+	b = appendString8(b, p.ActiveName)
+	for _, name := range p.ScopeNames {
+		b = appendString8(b, name)
+	}
+	b = appendString8(b, p.Cause)
+	return b
+}
+
+func DecodePolicyRequest(b []byte) (PolicyRequestPayload, error) {
+	if len(b) < 4 {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request payload too short: %d < 4", len(b))
+	}
+	p := PolicyRequestPayload{Mode: b[0]}
+	count := int(b[1])
+	rest := b[4:]
+	var ok bool
+	p.ActiveName, rest, ok = readString8(rest)
+	if !ok {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing active name")
+	}
+	p.ScopeNames = make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		var name string
+		name, rest, ok = readString8(rest)
+		if !ok {
+			return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing scope name %d", i)
+		}
+		p.ScopeNames = append(p.ScopeNames, name)
+	}
+	p.Cause, _, ok = readString8(rest)
+	if !ok {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing cause")
+	}
+	return p, nil
+}
+
+func appendPathName(b []byte, name string) []byte {
+	return appendString8(b, name)
+}
+
+func decodePathName(b []byte) (string, bool) {
+	name, _, ok := readString8(b)
+	return name, ok
+}
+
+func appendString8(b []byte, s string) []byte {
+	if len(s) > 255 {
+		s = s[:255]
+	}
+	b = append(b, byte(len(s)))
+	return append(b, s...)
+}
+
+func readString8(b []byte) (string, []byte, bool) {
+	if len(b) < 1 {
+		return "", b, false
+	}
+	n := int(b[0])
+	if len(b) < 1+n {
+		return "", b, false
+	}
+	return string(b[1 : 1+n]), b[1+n:], true
 }

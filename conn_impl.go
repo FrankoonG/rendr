@@ -29,7 +29,13 @@ func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBac
 	return bc
 }
 
-func (c *engineBackedConn) Read(p []byte) (int, error) { return c.conn.Read(p) }
+func (c *engineBackedConn) Read(p []byte) (int, error) {
+	n, err := c.conn.Read(p)
+	if n > 0 && c.peak != nil {
+		c.peak.observeRead(n)
+	}
+	return n, err
+}
 func (c *engineBackedConn) Write(p []byte) (int, error) {
 	n, err := c.conn.Write(p)
 	if n > 0 && c.peak != nil {
@@ -183,7 +189,7 @@ func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := engine.PerformClientBridgeTag(pc, c.e.FlowID()); err != nil {
+	if err := engine.PerformClientBridgeTagWithPathName(pc, c.e.FlowID(), pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}

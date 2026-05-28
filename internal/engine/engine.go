@@ -556,6 +556,46 @@ func (e *Engine) SetDispatchPolicy(mode uint32, active uint32, scope []uint32, c
 	return nil
 }
 
+// SetDispatchPolicyByName is the peer-control counterpart to
+// SetDispatchPolicy. Receive-side selectors send target/path names because path
+// ids are local to each peer; this method resolves those names against the
+// local path slots and then applies the ordinary sender policy.
+func (e *Engine) SetDispatchPolicyByName(mode uint32, activeName string, scopeNames []string, cause string) error {
+	e.pathsMu.RLock()
+	byName := make(map[string]uint32, len(e.paths))
+	for id, slot := range e.paths {
+		if name := pathSlotName(slot); name != "" {
+			byName[name] = id
+		}
+	}
+	e.pathsMu.RUnlock()
+
+	scope := make([]uint32, 0, len(scopeNames))
+	for _, name := range scopeNames {
+		id, ok := byName[name]
+		if !ok {
+			return fmt.Errorf("engine: policy references unknown path name %q", name)
+		}
+		scope = append(scope, id)
+	}
+	var active uint32
+	if activeName != "" {
+		id, ok := byName[activeName]
+		if !ok {
+			return fmt.Errorf("engine: policy activates unknown path name %q", activeName)
+		}
+		active = id
+	}
+	return e.SetDispatchPolicy(mode, active, scope, cause)
+}
+
+func pathSlotName(slot *pathSlot) string {
+	if slot == nil || slot.spec.Opts == nil {
+		return ""
+	}
+	return slot.spec.Opts["name"]
+}
+
 // SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
 // returns a timeout error (net.Error with Timeout()==true). The zero
 // time clears the deadline. Replaces any previously-set deadline.

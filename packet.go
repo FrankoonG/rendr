@@ -44,6 +44,9 @@ func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return 0, nil, err
 	}
 	n := copy(p, pkt)
+	if n > 0 && c.peak != nil {
+		c.peak.observeRead(n)
+	}
 	return n, c.rAddr, nil
 }
 
@@ -144,7 +147,7 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := engine.PerformClientBridgeTag(pc, c.e.FlowID()); err != nil {
+	if err := engine.PerformClientBridgeTagWithPathName(pc, c.e.FlowID(), pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}

@@ -36,4 +36,7 @@ func TestCaseMatches(t *testing.T) {
 	if !caseMatches("T6.peak.slow-peak-revert", "T6.peak.slow-peak-revert") {
 		t.Fatal("slow peak revert case should match")
 	}
+	if !caseMatches("T6.peak.rx-peer-policy", "T6.peak.rx-peer-policy") {
+		t.Fatal("rx peer policy case should match")
+	}
 }

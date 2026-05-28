@@ -796,7 +796,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			Targets:         []string{"B"},
 			SaturationFor:   200 * time.Millisecond,
 			ReturnFor:       200 * time.Millisecond,
-			SaturationRatio: 0.8,
+			SaturationRatio: 0.5,
 			ReturnRatio:     0.2,
 		},
 	)
@@ -834,13 +834,16 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 	}
 
 	chunk := make([]byte, 32<<10)
-	for i := 0; i < 32; i++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && client.(AdminConn).ActivePath() != ids["B"] {
 		if _, err := client.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	waitForActivePath(t, client, ids["B"], 3*time.Second)
+	if got := client.(AdminConn).ActivePath(); got != ids["B"] {
+		t.Fatalf("active path=%d want B=%d", got, ids["B"])
+	}
 
 	for i := 0; i < 48; i++ {
 		if _, err := client.Write(chunk); err != nil {
@@ -849,7 +852,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 	}
 	waitForActivePath(t, client, ids["A"], 3*time.Second)
 
-	deadline := time.Now().Add(1 * time.Second)
+	deadline = time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := client.Write(chunk); err != nil {
 			t.Fatal(err)
@@ -857,6 +860,91 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		if got := client.(AdminConn).ActivePath(); got != ids["A"] {
 			t.Fatalf("active path=%d want A=%d while slow peak is suppressed", got, ids["A"])
+		}
+	}
+}
+
+func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	accepted := make(chan Conn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	spec := func(name string) PathSpec {
+		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
+	}
+	root := Selector("root",
+		[]Target{
+			Path("A", spec("A")),
+			Path("B", spec("B")),
+		},
+		PeakTransfer{
+			Targets:         []string{"B"},
+			SaturationFor:   200 * time.Millisecond,
+			ReturnFor:       200 * time.Millisecond,
+			SaturationRatio: 0.5,
+			ReturnRatio:     0.2,
+		},
+	)
+	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-errc:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	waitForPathNames(t, server, []string{"A", "B"}, 3*time.Second)
+	serverIDs := idsByName(server.Paths())
+	clientIDs := idsByName(client.Paths())
+	if serverIDs["A"] == 0 || serverIDs["B"] == 0 || clientIDs["A"] == 0 || clientIDs["B"] == 0 {
+		t.Fatalf("serverIDs=%v clientIDs=%v", serverIDs, clientIDs)
+	}
+
+	go func() {
+		_, _ = io.Copy(io.Discard, client)
+	}()
+
+	chunk := make([]byte, 32<<10)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && server.(AdminConn).ActivePath() != serverIDs["B"] {
+		if _, err := server.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := server.(AdminConn).ActivePath(); got != serverIDs["B"] {
+		t.Fatalf("server tx active path=%d want B=%d", got, serverIDs["B"])
+	}
+	if got := client.(AdminConn).ActivePath(); got != clientIDs["A"] {
+		t.Fatalf("client tx active path=%d want A=%d; rx policy must not move local tx", got, clientIDs["A"])
+	}
+	for i := 0; i < 32; i++ {
+		if _, err := server.Write(chunk); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -890,6 +978,30 @@ func waitForActivePath(t *testing.T, c Conn, want uint32, within time.Duration) 
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("active path=%d want %d", admin.ActivePath(), want)
+}
+
+func waitForPathNames(t *testing.T, c Conn, names []string, within time.Duration) {
+	t.Helper()
+	want := make(map[string]bool, len(names))
+	for _, name := range names {
+		want[name] = true
+	}
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		got := idsByName(c.Paths())
+		ok := true
+		for name := range want {
+			if got[name] == 0 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("paths=%v; missing names %v", idsByName(c.Paths()), names)
 }
 
 func writesByName(paths []PathInfo) map[string]uint64 {

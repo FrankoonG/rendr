@@ -49,6 +49,19 @@ func (e *Engine) SendPacket(buf []byte) error {
 	return e.sendFrame(proto.FrameData, 0, buf)
 }
 
+// SendPolicyRequest asks the peer to update its sender policy for this flow.
+// It is intentionally just another sequenced control frame: the peer applies
+// it after earlier DATA/CTRL frames reach the reorder head.
+func (e *Engine) SendPolicyRequest(mode uint32, activeName string, scopeNames []string, cause string) error {
+	names := append([]string(nil), scopeNames...)
+	return e.sendFrame(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyRequest), proto.PolicyRequestPayload{
+		Mode:       uint8(mode),
+		ActiveName: activeName,
+		ScopeNames: names,
+		Cause:      cause,
+	}.Encode())
+}
+
 // SendBye emits a CTRL_BYE frame on the active path. Best-effort
 // and explicitly non-retrying: if the active path is dead or
 // missing, the call returns immediately with net.ErrClosed instead

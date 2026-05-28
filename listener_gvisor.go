@@ -148,7 +148,7 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 		return
 	}
 
-	spec := PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -190,7 +190,7 @@ func (l *gvisorListener) handleBridgeTag(pc transport.PathConn, payload []byte) 
 		_ = pc.Close()
 		return
 	}
-	spec := PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}

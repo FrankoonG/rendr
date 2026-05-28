@@ -223,7 +223,7 @@ func (l *MultiListener) handleHello(pc transport.PathConn, transportName string,
 		return
 	}
 
-	spec := PathSpec{Transport: transportName, Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -265,7 +265,7 @@ func (l *MultiListener) handleBridgeTag(pc transport.PathConn, transportName str
 		_ = pc.Close()
 		return
 	}
-	spec := PathSpec{Transport: transportName, Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}

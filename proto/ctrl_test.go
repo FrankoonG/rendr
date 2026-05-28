@@ -80,6 +80,47 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHelloPathNameRoundTrip(t *testing.T) {
+	want := HelloPayload{FlowID: [16]byte{1, 2, 3, 4}, Caps: CapsPacketMode, PathName: "A"}
+	got, err := DecodeHello(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("hello path name: got %+v want %+v", got, want)
+	}
+}
+
+func TestBridgeTagPathNameRoundTrip(t *testing.T) {
+	want := BridgeTagPayload{BridgeID: [16]byte{0xFE, 0xED}, PathName: "B"}
+	got, err := DecodeBridgeTag(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("bridge tag path name: got %+v want %+v", got, want)
+	}
+}
+
+func TestPolicyRequestRoundTrip(t *testing.T) {
+	want := PolicyRequestPayload{
+		Mode:       2,
+		ActiveName: "B",
+		ScopeNames: []string{"B", "C"},
+		Cause:      "peak-transfer-rx",
+	}
+	got, err := DecodePolicyRequest(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != want.Mode || got.ActiveName != want.ActiveName || got.Cause != want.Cause {
+		t.Fatalf("policy request: got %+v want %+v", got, want)
+	}
+	if len(got.ScopeNames) != 2 || got.ScopeNames[0] != "B" || got.ScopeNames[1] != "C" {
+		t.Fatalf("policy request scope names=%v", got.ScopeNames)
+	}
+}
+
 func TestRejectShortPayloads(t *testing.T) {
 	short := []byte{0}
 	if _, err := DecodeHello(short); err == nil {
@@ -96,6 +137,9 @@ func TestRejectShortPayloads(t *testing.T) {
 	}
 	if _, err := DecodeBridgeTag(short); err == nil {
 		t.Error("bridge_tag accepted short input")
+	}
+	if _, err := DecodePolicyRequest(short); err == nil {
+		t.Error("policy_request accepted short input")
 	}
 	if _, err := DecodeBye(nil); err == nil {
 		t.Error("bye accepted nil input")
@@ -114,6 +158,7 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlBye, 0x05},
 		{CtrlPathProbe, 0x06},
 		{CtrlPathProbeReply, 0x07},
+		{CtrlPolicyRequest, 0x08},
 		{CtrlBridgeTag, 0x10},
 	}
 	for _, c := range cases {

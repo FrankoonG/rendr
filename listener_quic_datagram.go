@@ -153,6 +153,7 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 		Address:   pc.RemoteAddr(),
 		Opts:      map[string]string{"mode": "datagram"},
 	}
+	spec = specWithTargetName(spec, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -196,6 +197,7 @@ func (l *quicDatagramListener) handleBridgeTag(pc transport.PathConn, payload []
 		Address:   pc.RemoteAddr(),
 		Opts:      map[string]string{"mode": "datagram"},
 	}
+	spec = specWithTargetName(spec, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}

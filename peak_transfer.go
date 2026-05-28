@@ -24,14 +24,24 @@ type peakTransferController struct {
 	e       *engine.Engine
 	setMode func(Mode)
 
-	normalIDs []uint32
-	peakIDs   []uint32
-	peakMode  Mode
-	opts      PeakTransfer
+	normalIDs   []uint32
+	peakIDs     []uint32
+	normalNames []string
+	peakNames   []string
+	peakMode    Mode
+	opts        PeakTransfer
 
-	bytes atomic.Uint64
+	writeBytes atomic.Uint64
+	readBytes  atomic.Uint64
 
-	mu             sync.Mutex
+	mu sync.Mutex
+	tx peakTransferDirection
+	rx peakTransferDirection
+
+	stop chan struct{}
+}
+
+type peakTransferDirection struct {
 	onPeak         bool
 	normalPeakBps  float64
 	normalBytes    uint64
@@ -40,8 +50,6 @@ type peakTransferController struct {
 	suppressUntil  time.Time
 	saturatedSince time.Time
 	returnSince    time.Time
-
-	stop chan struct{}
 }
 
 func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compiledTarget, pathIDs []uint32) *peakTransferController {
@@ -56,17 +64,29 @@ func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compil
 		c.peakMode = ModePrime
 	}
 	for i, id := range pathIDs {
+		name := ""
+		if i < len(plan.paths) {
+			name = pathSpecName(plan.paths[i])
+		}
 		if i < len(plan.pathPeak) && plan.pathPeak[i] {
 			c.peakIDs = append(c.peakIDs, id)
+			c.peakNames = append(c.peakNames, name)
 		} else {
 			c.normalIDs = append(c.normalIDs, id)
+			c.normalNames = append(c.normalNames, name)
 		}
 	}
 	if len(c.normalIDs) == 0 && len(pathIDs) > 0 {
 		c.normalIDs = append(c.normalIDs, pathIDs[0])
+		if len(plan.paths) > 0 {
+			c.normalNames = append(c.normalNames, pathSpecName(plan.paths[0]))
+		}
 	}
 	if len(c.peakIDs) == 0 && len(pathIDs) > 1 {
 		c.peakIDs = append(c.peakIDs, pathIDs[1:]...)
+		for _, ps := range plan.paths[1:] {
+			c.peakNames = append(c.peakNames, pathSpecName(ps))
+		}
 	}
 	return c
 }
@@ -76,6 +96,7 @@ func (c *peakTransferController) start() {
 		return
 	}
 	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "selector")
+	_ = c.e.SendPolicyRequest(uint32(ModePrime), firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "selector-rx")
 	c.e.StartPrime(nil, 0)
 	go c.loop()
 }
@@ -95,7 +116,14 @@ func (c *peakTransferController) observeWrite(n int) {
 	if c == nil || n <= 0 {
 		return
 	}
-	c.bytes.Add(uint64(n))
+	c.writeBytes.Add(uint64(n))
+}
+
+func (c *peakTransferController) observeRead(n int) {
+	if c == nil || n <= 0 {
+		return
+	}
+	c.readBytes.Add(uint64(n))
 }
 
 func (c *peakTransferController) loop() {
@@ -114,23 +142,30 @@ func (c *peakTransferController) loop() {
 			if elapsed <= 0 {
 				elapsed = defaultPeakWindow
 			}
-			bytes := c.bytes.Swap(0)
-			bps := float64(bytes*8) / elapsed.Seconds()
-			c.evaluate(now, bytes, bps)
+			writeBytes := c.writeBytes.Swap(0)
+			writeBps := float64(writeBytes*8) / elapsed.Seconds()
+			c.evaluate(now, writeBytes, writeBps, false)
+			readBytes := c.readBytes.Swap(0)
+			readBps := float64(readBytes*8) / elapsed.Seconds()
+			c.evaluate(now, readBytes, readBps, true)
 		}
 	}
 }
 
-func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float64) {
+func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float64, rx bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	st := &c.tx
+	if rx {
+		st = &c.rx
+	}
 
-	if !c.onPeak {
-		c.normalBytes += bytes
-		if bps > c.normalPeakBps {
-			c.normalPeakBps = bps
+	if !st.onPeak {
+		st.normalBytes += bytes
+		if bps > st.normalPeakBps {
+			st.normalPeakBps = bps
 		}
-		if c.normalBytes < defaultPeakMinBytes || c.normalPeakBps <= 0 {
+		if st.normalBytes < defaultPeakMinBytes || st.normalPeakBps <= 0 {
 			return
 		}
 		ratio := c.opts.SaturationRatio
@@ -141,59 +176,57 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		if needFor <= 0 {
 			needFor = defaultPeakSaturationFor
 		}
-		saturated := bps > 0 && bps >= c.normalPeakBps*ratio
+		saturated := bps > 0 && bps >= st.normalPeakBps*ratio
 		if !saturated {
-			c.saturatedSince = time.Time{}
+			st.saturatedSince = time.Time{}
 			return
 		}
-		if c.saturatedSince.IsZero() {
-			c.saturatedSince = now
+		if st.saturatedSince.IsZero() {
+			st.saturatedSince = now
 			return
 		}
-		if now.Sub(c.saturatedSince) < needFor {
+		if now.Sub(st.saturatedSince) < needFor {
 			return
 		}
-		if now.Before(c.suppressUntil) {
-			c.saturatedSince = time.Time{}
+		if now.Before(st.suppressUntil) {
+			st.saturatedSince = time.Time{}
 			return
 		}
 		if !c.peakHealthy() {
-			c.saturatedSince = time.Time{}
+			st.saturatedSince = time.Time{}
 			return
 		}
-		c.onPeak = true
-		c.peakStarted = now
-		c.peakBytes = 0
-		c.saturatedSince = time.Time{}
-		c.returnSince = time.Time{}
+		st.onPeak = true
+		st.peakStarted = now
+		st.peakBytes = 0
+		st.saturatedSince = time.Time{}
+		st.returnSince = time.Time{}
 		c.mu.Unlock()
-		_ = c.e.SetDispatchPolicy(uint32(c.peakMode), c.peakIDs[0], c.peakIDs, "peak-transfer")
-		c.setMode(c.peakMode)
+		c.applyPolicy(rx, uint32(c.peakMode), c.peakIDs[0], c.peakIDs, firstNonEmpty(c.peakNames), nonEmptyNames(c.peakNames), "peak-transfer")
 		c.mu.Lock()
 		return
 	}
 
-	c.peakBytes += bytes
-	if c.peakStarted.IsZero() {
-		c.peakStarted = now
+	st.peakBytes += bytes
+	if st.peakStarted.IsZero() {
+		st.peakStarted = now
 	}
 	verifyFor := defaultPeakVerifyFor
-	if elapsed := now.Sub(c.peakStarted); elapsed >= verifyFor && c.normalPeakBps > 0 {
-		peakBps := float64(c.peakBytes*8) / elapsed.Seconds()
-		if peakBps < c.normalPeakBps*defaultPeakMinGain {
-			c.onPeak = false
-			c.peakStarted = time.Time{}
-			c.peakBytes = 0
-			c.returnSince = time.Time{}
-			c.suppressUntil = now.Add(defaultPeakSuppressFor)
+	if elapsed := now.Sub(st.peakStarted); elapsed >= verifyFor && st.normalPeakBps > 0 {
+		peakBps := float64(st.peakBytes*8) / elapsed.Seconds()
+		if peakBps < st.normalPeakBps*defaultPeakMinGain {
+			st.onPeak = false
+			st.peakStarted = time.Time{}
+			st.peakBytes = 0
+			st.returnSince = time.Time{}
+			st.suppressUntil = now.Add(defaultPeakSuppressFor)
 			c.mu.Unlock()
-			_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "peak-verify-failed")
-			c.setMode(ModePrime)
+			c.applyPolicy(rx, uint32(ModePrime), c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-verify-failed")
 			c.mu.Lock()
 			return
 		}
-		c.peakStarted = time.Time{}
-		c.peakBytes = 0
+		st.peakStarted = time.Time{}
+		st.peakBytes = 0
 	}
 
 	ratio := c.opts.ReturnRatio
@@ -204,26 +237,37 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	if needFor <= 0 {
 		needFor = defaultPeakReturnFor
 	}
-	low := c.normalPeakBps > 0 && bps < c.normalPeakBps*ratio
+	low := st.normalPeakBps > 0 && bps < st.normalPeakBps*ratio
 	if !low {
-		c.returnSince = time.Time{}
+		st.returnSince = time.Time{}
 		return
 	}
-	if c.returnSince.IsZero() {
-		c.returnSince = now
+	if st.returnSince.IsZero() {
+		st.returnSince = now
 		return
 	}
-	if now.Sub(c.returnSince) < needFor {
+	if now.Sub(st.returnSince) < needFor {
 		return
 	}
-	c.onPeak = false
-	c.peakStarted = time.Time{}
-	c.peakBytes = 0
-	c.returnSince = time.Time{}
+	st.onPeak = false
+	st.peakStarted = time.Time{}
+	st.peakBytes = 0
+	st.returnSince = time.Time{}
 	c.mu.Unlock()
-	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "peak-return")
-	c.setMode(ModePrime)
+	c.applyPolicy(rx, uint32(ModePrime), c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-return")
 	c.mu.Lock()
+}
+
+func (c *peakTransferController) applyPolicy(rx bool, mode uint32, activeID uint32, scopeIDs []uint32, activeName string, scopeNames []string, cause string) {
+	if rx {
+		if activeName == "" || len(scopeNames) == 0 {
+			return
+		}
+		_ = c.e.SendPolicyRequest(mode, activeName, scopeNames, cause+"-rx")
+		return
+	}
+	_ = c.e.SetDispatchPolicy(mode, activeID, scopeIDs, cause)
+	c.setMode(Mode(mode))
 }
 
 func (c *peakTransferController) peakHealthy() bool {
@@ -256,4 +300,23 @@ func (c *peakTransferController) peakHealthy() bool {
 		}
 	}
 	return !seenMeasured
+}
+
+func nonEmptyNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func firstNonEmpty(names []string) string {
+	for _, name := range names {
+		if name != "" {
+			return name
+		}
+	}
+	return ""
 }

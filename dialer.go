@@ -112,7 +112,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHello(pc, flowID, 0); err != nil {
+	if err := engine.PerformClientHelloWithPathName(pc, flowID, 0, pathSpecName(first)); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
@@ -134,7 +134,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 			// silently and continue.
 			continue
 		}
-		if err := engine.PerformClientBridgeTag(spc, flowID); err != nil {
+		if err := engine.PerformClientBridgeTagWithPathName(spc, flowID, pathSpecName(ps)); err != nil {
 			_ = spc.Close()
 			continue
 		}
@@ -197,7 +197,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHello(pc, flowID, proto.CapsPacketMode); err != nil {
+	if err := engine.PerformClientHelloWithPathName(pc, flowID, proto.CapsPacketMode, pathSpecName(first)); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
@@ -215,7 +215,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		if err != nil {
 			continue
 		}
-		if err := engine.PerformClientBridgeTag(spc, flowID); err != nil {
+		if err := engine.PerformClientBridgeTagWithPathName(spc, flowID, pathSpecName(ps)); err != nil {
 			_ = spc.Close()
 			continue
 		}

@@ -140,7 +140,7 @@ func (l *quicListener) handleHello(pc *qadapter.PathConn, payload []byte) {
 		return
 	}
 
-	spec := PathSpec{Transport: "quic", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "quic", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -182,7 +182,7 @@ func (l *quicListener) handleBridgeTag(pc *qadapter.PathConn, payload []byte) {
 		_ = pc.Close()
 		return
 	}
-	spec := PathSpec{Transport: "quic", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "quic", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}

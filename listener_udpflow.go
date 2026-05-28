@@ -185,7 +185,7 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 		return
 	}
 
-	spec := PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -244,7 +244,7 @@ func (l *udpFlowListener) handleBridgeTag(pc *uflow.ServerPathConn, payload []by
 		_ = pc.Close()
 		return
 	}
-	spec := PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}
+	spec := specWithTargetName(PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}

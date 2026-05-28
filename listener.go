@@ -145,7 +145,7 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 		return
 	}
 
-	spec := specFromAddr(pc.RemoteAddr())
+	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
@@ -192,7 +192,7 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		_ = pc.Close()
 		return
 	}
-	spec := specFromAddr(pc.RemoteAddr())
+	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = pc.Close()
 	}
@@ -214,4 +214,12 @@ func waitBridgeArrival(bridges *engine.BridgeTable, flowID [16]byte, total time.
 
 func specFromAddr(addr string) PathSpec {
 	return PathSpec{Transport: "tcp", Address: addr}
+}
+
+func specFromAddrName(addr, name string) PathSpec {
+	spec := specFromAddr(addr)
+	if name != "" {
+		spec.Opts = map[string]string{"name": name}
+	}
+	return spec
 }

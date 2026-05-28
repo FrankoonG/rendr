@@ -8,7 +8,7 @@ import (
 
 // Version is the current rendr wire-protocol version. CLAUDE.md
 // hard rule #7: any wire change MUST bump this.
-const Version uint8 = 0
+const Version uint8 = 1
 
 // HeaderSize is the fixed wire size of the frame header.
 const HeaderSize = 8

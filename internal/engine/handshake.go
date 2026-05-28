@@ -15,10 +15,20 @@ func PerformClientHello(pc transport.PathConn, flowID [16]byte, caps uint32) err
 	return writeCtrl(pc, proto.CtrlHello, 0, payload, 0)
 }
 
+func PerformClientHelloWithPathName(pc transport.PathConn, flowID [16]byte, caps uint32, name string) error {
+	payload := proto.HelloPayload{FlowID: flowID, Caps: caps}.EncodeWithPathName(name)
+	return writeCtrl(pc, proto.CtrlHello, 0, payload, 0)
+}
+
 // PerformClientBridgeTag sends BRIDGE_TAG so the server attaches
 // this new path to an existing bridge identified by bridgeID.
 func PerformClientBridgeTag(pc transport.PathConn, bridgeID [16]byte) error {
 	payload := proto.BridgeTagPayload{BridgeID: bridgeID}.Encode()
+	return writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0)
+}
+
+func PerformClientBridgeTagWithPathName(pc transport.PathConn, bridgeID [16]byte, name string) error {
+	payload := proto.BridgeTagPayload{BridgeID: bridgeID}.EncodeWithPathName(name)
 	return writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0)
 }
 

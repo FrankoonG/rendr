@@ -164,12 +164,12 @@ func compileTargetForDial(root Target) (compiledTarget, error) {
 func compileTargetNode(t Target, root bool) (compiledTarget, error) {
 	switch v := t.(type) {
 	case PathTarget:
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}, pathPeak: []bool{false}}, nil
+		return compiledTarget{mode: ModePrime, paths: []PathSpec{specWithTargetName(v.Spec, v.TargetName)}, pathPeak: []bool{false}}, nil
 	case *PathTarget:
 		if v == nil {
 			return compiledTarget{}, errNilTarget
 		}
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{v.Spec}, pathPeak: []bool{false}}, nil
+		return compiledTarget{mode: ModePrime, paths: []PathSpec{specWithTargetName(v.Spec, v.TargetName)}, pathPeak: []bool{false}}, nil
 	case GroupTarget:
 		return compileGroupTarget(v, root)
 	case *GroupTarget:
@@ -267,4 +267,30 @@ func isPathOnly(t Target) bool {
 	default:
 		return false
 	}
+}
+
+func specWithTargetName(spec PathSpec, name string) PathSpec {
+	if name == "" {
+		return spec
+	}
+	if spec.Opts == nil {
+		spec.Opts = map[string]string{"name": name}
+		return spec
+	}
+	if spec.Opts["name"] == "" {
+		cp := make(map[string]string, len(spec.Opts)+1)
+		for k, v := range spec.Opts {
+			cp[k] = v
+		}
+		cp["name"] = name
+		spec.Opts = cp
+	}
+	return spec
+}
+
+func pathSpecName(spec PathSpec) string {
+	if spec.Opts != nil {
+		return spec.Opts["name"]
+	}
+	return ""
 }

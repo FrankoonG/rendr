@@ -63,6 +63,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T6.peak.slow-peak-revert", 2*time.Minute, func(c context.Context) report.Case {
 		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.slow-peak-revert", "^TestSelectorPeakTransferSlowPeakRevertsAndSuppresses$")
 	})
+	run("T6.peak.rx-peer-policy", 2*time.Minute, func(c context.Context) report.Case {
+		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.rx-peer-policy", "^TestSelectorPeakTransferRxPromotesPeerSenderOnly$")
+	})
 }
 
 func caseMatches(filter, name string) bool {

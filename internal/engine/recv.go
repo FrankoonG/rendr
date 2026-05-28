@@ -632,6 +632,13 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 			_ = e.Close()
 		}()
 
+	case proto.CtrlPolicyRequest:
+		if p, err := proto.DecodePolicyRequest(payload); err == nil {
+			go func() {
+				_ = e.SetDispatchPolicyByName(uint32(p.Mode), p.ActiveName, p.ScopeNames, p.Cause)
+			}()
+		}
+
 	case proto.CtrlMigrateNotify,
 		proto.CtrlHeartbeat,
 		proto.CtrlPathQuality,
