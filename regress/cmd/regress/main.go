@@ -145,8 +145,12 @@ func main() {
 			fmt.Println("== phase 2 / TUN full baseline ==")
 			tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: cfg.caseID})
 			writeReports(suite, cfg.reportDir)
-			fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
-			os.Exit(exitT7Fail)
+			if suite.AnyFailedAt("T7") {
+				fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
+				os.Exit(exitT7Fail)
+			}
+			fmt.Println("phase 2 / TUN full: GREEN")
+			os.Exit(exitOK)
 		}
 		runT3, runT4, runT5, runT6, runT7 := selectedTiers(cfg)
 		if !runT3 && !runT4 && !runT5 && !runT6 && !runT7 {
