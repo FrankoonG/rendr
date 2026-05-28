@@ -3,6 +3,7 @@ package l3session
 import (
 	"context"
 	"errors"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,3 +87,59 @@ func TestManagerPropagatesPlanningErrors(t *testing.T) {
 		t.Fatalf("reason=%q want %q", planning.Reason, l3ingress.ReasonSessionUndecided)
 	}
 }
+
+func TestManagerClosesSessionOnFlowClose(t *testing.T) {
+	id := testIdentity(l3ingress.ProtocolTCP)
+	conn := &fakeConn{}
+	manager := &Manager{}
+	if !manager.add(id, &Session{Conn: conn}) {
+		t.Fatal("add failed")
+	}
+
+	manager.ObserveFlow(l3ingress.FlowSnapshot{
+		Flow: l3ingress.FlowMeta{L3Identity: id},
+	})
+	if got := conn.closed.Load(); got != 0 {
+		t.Fatalf("close count after active snapshot=%d want 0", got)
+	}
+	if _, ok := manager.Session(id); !ok {
+		t.Fatal("session was removed by active snapshot")
+	}
+
+	manager.ObserveFlow(l3ingress.FlowSnapshot{
+		Flow:        l3ingress.FlowMeta{L3Identity: id},
+		Closed:      true,
+		CloseReason: l3ingress.FlowCloseTCPFIN,
+	})
+	if got := conn.closed.Load(); got != 1 {
+		t.Fatalf("close count=%d want 1", got)
+	}
+	if _, ok := manager.Session(id); ok {
+		t.Fatal("session remained cached after closed snapshot")
+	}
+
+	manager.ObserveFlow(l3ingress.FlowSnapshot{
+		Flow:        l3ingress.FlowMeta{L3Identity: id},
+		Closed:      true,
+		CloseReason: l3ingress.FlowCloseTCPFIN,
+	})
+	if got := conn.closed.Load(); got != 1 {
+		t.Fatalf("close count after duplicate close=%d want 1", got)
+	}
+}
+
+type fakeConn struct {
+	closed atomic.Int32
+}
+
+func (f *fakeConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
+func (f *fakeConn) Write([]byte) (int, error)        { return 0, net.ErrClosed }
+func (f *fakeConn) Close() error                     { f.closed.Add(1); return nil }
+func (f *fakeConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (f *fakeConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (f *fakeConn) SetDeadline(time.Time) error      { return nil }
+func (f *fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
+func (f *fakeConn) Paths() []rendr.PathInfo          { return nil }
+func (f *fakeConn) SetMode(rendr.Mode) error         { return nil }
+func (f *fakeConn) FlowID() [16]byte                 { return [16]byte{} }

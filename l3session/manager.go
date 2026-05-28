@@ -51,6 +51,16 @@ func (m *Manager) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) er
 	return nil
 }
 
+// ObserveFlow implements l3ingress.FlowObserver. Closed flow snapshots close
+// and forget the matching rendr session so TCP FIN/RST and explicit FlowTable
+// closes do not leave orphan sessions behind.
+func (m *Manager) ObserveFlow(snapshot l3ingress.FlowSnapshot) {
+	if !snapshot.Closed {
+		return
+	}
+	_ = m.Close(snapshot.Flow.L3Identity)
+}
+
 // Session returns the cached session for id, if present.
 func (m *Manager) Session(id l3ingress.L3Identity) (*Session, bool) {
 	m.mu.Lock()
