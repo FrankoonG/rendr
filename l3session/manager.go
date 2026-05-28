@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 
+	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
 )
 
@@ -18,6 +19,9 @@ type OnStartFunc func(context.Context, *Session) error
 type Manager struct {
 	Starter Starter
 	OnStart OnStartFunc
+	// FlowTable receives selected-path and migration observations for
+	// sessions started by this manager. A nil FlowTable is valid.
+	FlowTable *l3ingress.FlowTable
 
 	mu       sync.Mutex
 	sessions map[l3ingress.L3Identity]*Session
@@ -42,6 +46,7 @@ func (m *Manager) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) er
 		_ = sess.Close()
 		return nil
 	}
+	m.observeSessionPaths(req.Identity, sess)
 	if m.OnStart != nil {
 		if err := m.OnStart(ctx, sess); err != nil {
 			_ = m.Close(req.Identity)
@@ -111,4 +116,85 @@ func (m *Manager) add(id l3ingress.L3Identity, sess *Session) bool {
 	}
 	m.sessions[id] = sess
 	return true
+}
+
+func (m *Manager) observeSessionPaths(id l3ingress.L3Identity, sess *Session) {
+	if m.FlowTable == nil || sess == nil {
+		return
+	}
+	m.FlowTable.RecordPathSelection(id, sessionPathNames(sess))
+	if h := sessionMigrateHook(sess); h != nil {
+		cancel := h.OnMigrate(func(_, _ uint32, _ string) {
+			m.FlowTable.RecordMigration(id, sessionPathNames(sess))
+		})
+		sess.onClose = append(sess.onClose, cancel)
+	}
+}
+
+type migrateHook interface {
+	OnMigrate(func(oldID, newID uint32, cause string)) (cancel func())
+}
+
+func sessionMigrateHook(sess *Session) migrateHook {
+	if sess.Conn != nil {
+		if h, ok := sess.Conn.(migrateHook); ok {
+			return h
+		}
+	}
+	if sess.PacketConn != nil {
+		if h, ok := sess.PacketConn.(migrateHook); ok {
+			return h
+		}
+	}
+	return nil
+}
+
+func sessionPathNames(sess *Session) []string {
+	if sess == nil {
+		return nil
+	}
+	if sess.Conn != nil {
+		if c, ok := sess.Conn.(rendr.AdminConn); ok {
+			return selectedPathNames(c.Stats())
+		}
+		return pathNames(sess.Conn.Paths())
+	}
+	if sess.PacketConn != nil {
+		if c, ok := sess.PacketConn.(rendr.AdminPacketConn); ok {
+			return selectedPathNames(c.Stats())
+		}
+		return pathNames(sess.PacketConn.Paths())
+	}
+	return nil
+}
+
+func selectedPathNames(stats rendr.ConnStats) []string {
+	if stats.Mode == rendr.ModeBond || stats.Mode == rendr.ModeRace {
+		return pathNames(stats.Paths)
+	}
+	active := make([]rendr.PathInfo, 0, 1)
+	for _, p := range stats.Paths {
+		if p.Active || p.ID == stats.ActivePath {
+			active = append(active, p)
+		}
+	}
+	if len(active) == 0 {
+		return pathNames(stats.Paths)
+	}
+	return pathNames(active)
+}
+
+func pathNames(paths []rendr.PathInfo) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		name := ""
+		if p.Spec.Opts != nil {
+			name = p.Spec.Opts["name"]
+		}
+		if name == "" {
+			name = p.Spec.Transport + ":" + p.Spec.Address
+		}
+		out = append(out, name)
+	}
+	return out
 }

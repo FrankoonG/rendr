@@ -38,12 +38,19 @@ type Session struct {
 	Request    l3ingress.SessionRequest
 	Conn       rendr.Conn
 	PacketConn rendr.PacketConn
+
+	onClose []func()
 }
 
 // Close closes the underlying rendr session.
 func (s *Session) Close() error {
 	if s == nil {
 		return nil
+	}
+	for _, fn := range s.onClose {
+		if fn != nil {
+			fn()
+		}
 	}
 	if s.Conn != nil {
 		return s.Conn.Close()
