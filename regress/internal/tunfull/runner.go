@@ -5,9 +5,13 @@ package tunfull
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"sort"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr"
@@ -68,6 +72,14 @@ func runPlannedCase(ctx context.Context, name string) report.Case {
 			paths:      2,
 			migrations: 3,
 		})
+	case "TUN-full.G2-smoke":
+		return runG2Smoke(ctx, g2SmokeOptions{
+			name:       name,
+			duration:   30 * time.Second,
+			interval:   100 * time.Millisecond,
+			paths:      2,
+			migrations: 5,
+		})
 	default:
 		return UnimplementedCase(name)
 	}
@@ -94,6 +106,14 @@ func caseMatches(filter, name string) bool {
 type g1SmokeOptions struct {
 	name       string
 	size       int64
+	paths      int
+	migrations int
+}
+
+type g2SmokeOptions struct {
+	name       string
+	duration   time.Duration
+	interval   time.Duration
 	paths      int
 	migrations int
 }
@@ -332,4 +352,191 @@ func writeAll(w net.Conn, buf []byte) error {
 		buf = buf[n:]
 	}
 	return nil
+}
+
+func runG2Smoke(ctx context.Context, opts g2SmokeOptions) report.Case {
+	start := time.Now()
+	if opts.name == "" {
+		opts.name = "TUN-full.G2-smoke"
+	}
+	if opts.duration <= 0 {
+		opts.duration = 30 * time.Second
+	}
+	if opts.interval <= 0 {
+		opts.interval = 100 * time.Millisecond
+	}
+	if opts.paths < 2 {
+		opts.paths = 2
+	}
+	if opts.migrations < 0 {
+		opts.migrations = 0
+	}
+
+	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("listen: %w", err))
+	}
+	defer ln.Close()
+
+	accepted := make(chan rendr.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		c, err := ln.Accept(actx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	id := g1Identity()
+	root := g1Root(ln.Addr().String(), opts.paths)
+	manager := &l3session.Manager{}
+	relay := &l3session.TCPRelay{Manager: manager}
+	app, endpoint := net.Pipe()
+	defer app.Close()
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Serve(ctx, g1Event(id, root), endpoint)
+	}()
+
+	var server rendr.Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		return failedCase(opts.name, start, fmt.Errorf("accept: %w", err))
+	case <-time.After(15 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("accept timeout"))
+	}
+	defer server.Close()
+
+	sess, err := waitStreamSession(ctx, manager, id)
+	if err != nil {
+		return failedCase(opts.name, start, err)
+	}
+	admin, ok := sess.Conn.(rendr.AdminConn)
+	if !ok {
+		return failedCase(opts.name, start, fmt.Errorf("session conn is not rendr.AdminConn"))
+	}
+	waitPaths(ctx, admin, opts.paths)
+
+	echoErr := make(chan error, 1)
+	go func() {
+		var msg [8]byte
+		for {
+			if err := readAll(server, msg[:]); err != nil {
+				echoErr <- err
+				return
+			}
+			if err := writeAll(server, msg[:]); err != nil {
+				echoErr <- err
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(opts.duration)
+	nextMig := make([]time.Time, opts.migrations)
+	for i := range nextMig {
+		nextMig[i] = start.Add(opts.duration * time.Duration(i+1) / time.Duration(opts.migrations+1))
+	}
+	var migIdx int
+	var seq uint64
+	rtts := make([]time.Duration, 0, int(opts.duration/opts.interval)+1)
+	ticker := time.NewTicker(opts.interval)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return failedCase(opts.name, start, ctx.Err())
+		case <-ticker.C:
+		}
+		var msg [8]byte
+		binary.BigEndian.PutUint64(msg[:], seq)
+		sentAt := time.Now()
+		if err := writeAll(app, msg[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("write seq %d: %w", seq, err))
+		}
+		var got [8]byte
+		if err := readAll(app, got[:]); err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("read seq %d: %w", seq, err))
+		}
+		if binary.BigEndian.Uint64(got[:]) != seq {
+			return failedCase(opts.name, start, fmt.Errorf("echo seq mismatch: got %d want %d", binary.BigEndian.Uint64(got[:]), seq))
+		}
+		rtts = append(rtts, time.Since(sentAt))
+		seq++
+		for migIdx < len(nextMig) && time.Now().After(nextMig[migIdx]) {
+			next := nextPath(admin)
+			if next != 0 {
+				if err := admin.Migrate(next); err != nil {
+					return failedCase(opts.name, start, fmt.Errorf("migrate %d: %w", migIdx, err))
+				}
+			}
+			migIdx++
+		}
+	}
+	if len(rtts) == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("no echoes completed"))
+	}
+	if opts.migrations > 0 && admin.MigrationCount() < uint64(opts.migrations) {
+		return failedCase(opts.name, start, fmt.Errorf("MigrationCount=%d, want >= %d", admin.MigrationCount(), opts.migrations))
+	}
+	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+	if p99 := percentile(rtts, 0.99); p99 > time.Second {
+		return failedCase(opts.name, start, fmt.Errorf("P99 RTT %s exceeds 1s", p99))
+	}
+
+	_ = app.Close()
+	select {
+	case err := <-relayErr:
+		if err != nil {
+			return failedCase(opts.name, start, fmt.Errorf("relay: %w", err))
+		}
+	case <-time.After(5 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("relay shutdown timeout"))
+	}
+	select {
+	case err := <-echoErr:
+		if err != nil && !isClosedRelayErr(err) {
+			return failedCase(opts.name, start, fmt.Errorf("echo: %w", err))
+		}
+	default:
+	}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+}
+
+func readAll(r net.Conn, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := r.Read(buf)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("short read")
+		}
+		buf = buf[n:]
+	}
+	return nil
+}
+
+func percentile(sorted []time.Duration, q float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)-1) * q)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func isClosedRelayErr(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
 }

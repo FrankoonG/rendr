@@ -3,6 +3,7 @@ package tunfull
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -21,12 +22,25 @@ func TestRunTunFullCaseFilter(t *testing.T) {
 
 func TestRunTunFullDefaultStillGuardsUnimplementedCases(t *testing.T) {
 	suite := report.New()
-	Run(context.Background(), suite, ".", Options{})
-	if len(suite.Cases) != len(plannedCases) {
-		t.Fatalf("cases=%d want %d", len(suite.Cases), len(plannedCases))
+	Run(context.Background(), suite, ".", Options{Case: "TUN-full.G3-smoke"})
+	if len(suite.Cases) != 1 {
+		t.Fatalf("cases=%d want 1", len(suite.Cases))
 	}
 	if !suite.AnyFailedAt("T7") {
-		t.Fatal("default tun-full unexpectedly has no guard failure")
+		t.Fatal("unimplemented tun-full case unexpectedly has no guard failure")
+	}
+}
+
+func TestRunG2SmokeShort(t *testing.T) {
+	c := runG2Smoke(context.Background(), g2SmokeOptions{
+		name:       "TUN-full.G2-smoke",
+		duration:   300 * time.Millisecond,
+		interval:   25 * time.Millisecond,
+		paths:      2,
+		migrations: 1,
+	})
+	if c.Name != "TUN-full.G2-smoke" || c.Tier != "T7" || c.Failure != "" {
+		t.Fatalf("bad G2 smoke case: %+v", c)
 	}
 }
 
