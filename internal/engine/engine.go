@@ -282,13 +282,17 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 		e.nextPathID++
 		id = e.nextPathID
 	}
+	recvQSize := 64
+	if e.Packetized() {
+		recvQSize = 1024
+	}
 	slot := &pathSlot{
 		id:       id,
 		gen:      e.nextPathGenerationLocked(),
 		conn:     pc,
 		spec:     spec,
 		attached: time.Now(),
-		recvQ:    make(chan recvFrame, 64),
+		recvQ:    make(chan recvFrame, recvQSize),
 		quit:     make(chan struct{}),
 		doneR:    make(chan struct{}),
 	}
