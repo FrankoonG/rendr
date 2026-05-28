@@ -40,6 +40,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.capability.local-probe", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.capability.local-probe", "./tun", "^TestProbeReturnsMachineReadableCapability$")
 	})
+	run("T7.tun.open-smoke", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.tun.open-smoke", "./tun", "^TestOpenCreatesEphemeralDeviceWhenAvailable$")
+	})
 	run("T7.config.invalid-mtu", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.config.invalid-mtu", "./tun", "^TestConfigValidateRejectsSmallMTU$")
 	})
