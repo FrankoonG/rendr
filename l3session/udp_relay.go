@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/virtualif"
@@ -25,6 +26,12 @@ type UDPRelay struct {
 	owned    *Manager
 	sessions map[l3ingress.L3Identity]context.CancelFunc
 	packets  map[l3ingress.L3Identity]*Session
+	fast     atomic.Pointer[packetSessionCache]
+}
+
+type packetSessionCache struct {
+	id   l3ingress.L3Identity
+	sess *Session
 }
 
 // HandlePacket implements l3ingress.PacketHandler for UDP ingress flows.
@@ -40,7 +47,12 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 		return err
 	}
 	id := ev.Meta.Identity
-	sess := r.packetSession(id)
+	var sess *Session
+	if cached := r.fast.Load(); cached != nil && cached.id == id {
+		sess = cached.sess
+	} else {
+		sess = r.packetSession(id)
+	}
 	if sess == nil {
 		manager := r.manager()
 		if err := manager.HandlePacket(ctx, ev); err != nil {
@@ -54,7 +66,7 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 		r.setPacketSession(id, sess)
 		r.startReplyLoop(ctx, id, sess)
 	}
-	_, err = sess.PacketConn.WriteTo(payload, packetAddr("rendr-peer"))
+	_, err = sess.PacketConn.WriteTo(payload, rendrPeerAddr)
 	return err
 }
 
@@ -76,6 +88,7 @@ func (r *UDPRelay) CloseFlow(id l3ingress.L3Identity) bool {
 		delete(r.sessions, id)
 	}
 	delete(r.packets, id)
+	r.clearFastSessionLocked(id)
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -94,6 +107,7 @@ func (r *UDPRelay) Close() error {
 	for id := range r.packets {
 		delete(r.packets, id)
 	}
+	r.fast.Store(nil)
 	r.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -141,6 +155,7 @@ func (r *UDPRelay) setPacketSession(id l3ingress.L3Identity, sess *Session) {
 		r.packets = make(map[l3ingress.L3Identity]*Session)
 	}
 	r.packets[id] = sess
+	r.fast.Store(&packetSessionCache{id: id, sess: sess})
 }
 
 func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, sess *Session) {
@@ -181,9 +196,18 @@ func (r *UDPRelay) forgetSession(id l3ingress.L3Identity) {
 	defer r.mu.Unlock()
 	delete(r.sessions, id)
 	delete(r.packets, id)
+	r.clearFastSessionLocked(id)
+}
+
+func (r *UDPRelay) clearFastSessionLocked(id l3ingress.L3Identity) {
+	if cached := r.fast.Load(); cached != nil && cached.id == id {
+		r.fast.Store(nil)
+	}
 }
 
 type packetAddr string
 
 func (a packetAddr) Network() string { return "rendr" }
 func (a packetAddr) String() string  { return string(a) }
+
+var rendrPeerAddr packetAddr = "rendr-peer"
