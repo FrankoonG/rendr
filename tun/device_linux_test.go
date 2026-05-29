@@ -65,7 +65,7 @@ func TestDeviceReadsKernelRoutedIPv4Packet(t *testing.T) {
 	buf := make([]byte, 1500)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		n, err := dev.Read(buf)
+		n, err := syscall.Read(int(dev.file.Fd()), buf)
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 				time.Sleep(10 * time.Millisecond)
