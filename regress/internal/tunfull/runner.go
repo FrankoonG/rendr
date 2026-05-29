@@ -155,7 +155,7 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 				duration:   5 * time.Minute,
 				pps:        100_000,
 				payloadLen: 1024,
-				paths:      16,
+				paths:      32,
 				migrations: 10,
 				lossPct:    -1,
 				p95Ceiling: 20 * time.Millisecond,
@@ -1689,7 +1689,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if serverAdmin, ok := server.(rendr.AdminPacketConn); ok {
 		waitPacketPaths(ctx, serverAdmin, opts.paths)
 	}
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
 	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
 	recvBmp := make([]uint8, expected+opts.pps)
