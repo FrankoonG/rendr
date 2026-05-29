@@ -155,7 +155,7 @@ func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
 				duration:   5 * time.Minute,
 				pps:        100_000,
 				payloadLen: 1024,
-				paths:      12,
+				paths:      16,
 				migrations: 10,
 				lossPct:    -1,
 				p95Ceiling: 20 * time.Millisecond,
