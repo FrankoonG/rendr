@@ -127,6 +127,173 @@ func TestDialerCompileDialPlanUsesRoot(t *testing.T) {
 	}
 }
 
+func TestDialerPrimaryExplicitPathReordersPlan(t *testing.T) {
+	root := Selector("root", []Target{
+		Path("A", PathSpec{Transport: "tcp", Address: "a"}),
+		Path("B", PathSpec{Transport: "tcp", Address: "b"}),
+	})
+	plan, err := (&Dialer{Root: root, Primary: "B"}).compileDialPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.primaryName != "B" {
+		t.Fatalf("primary=%q want B", plan.primaryName)
+	}
+	if got := pathSpecName(plan.paths[0]); got != "B" {
+		t.Fatalf("first path=%q want B", got)
+	}
+}
+
+func TestDialerPrimaryExplicitGroupResolvesLeaf(t *testing.T) {
+	bulk := Bond("bulk", []Target{
+		Path("B", PathSpec{Transport: "tcp", Address: "b"}),
+		Path("C", PathSpec{Transport: "tcp", Address: "c"}),
+	})
+	root := Selector("root", []Target{
+		Path("A", PathSpec{Transport: "tcp", Address: "a"}),
+		bulk,
+	})
+	plan, err := (&Dialer{Root: root, Primary: "bulk"}).compileDialPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.primaryName != "B" {
+		t.Fatalf("primary=%q want B", plan.primaryName)
+	}
+	if got := pathSpecName(plan.paths[0]); got != "B" {
+		t.Fatalf("first path=%q want B", got)
+	}
+}
+
+func TestDialerStatusPeerRendr(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted := make(chan Conn, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	client, err := (&Dialer{
+		Root: Selector("root", []Target{
+			Path("A", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+		}),
+	}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var server Conn
+	select {
+	case server = <-accepted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	st := client.Status()
+	if st.Peer.Kind != PeerRendr {
+		t.Fatalf("peer kind=%q want %q", st.Peer.Kind, PeerRendr)
+	}
+	if st.Peer.InstanceID == (InstanceID{}) {
+		t.Fatal("peer instance id is zero")
+	}
+	if len(st.Paths) != 1 || st.Paths[0].State != PathAttached || !st.Paths[0].Primary {
+		t.Fatalf("paths=%+v want one attached primary path", st.Paths)
+	}
+}
+
+func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
+	good, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer good.Close()
+
+	bad, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badAddr := bad.Addr().String()
+	_ = bad.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted := make(chan Conn, 1)
+	go func() {
+		c, err := good.Accept(ctx)
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	root := Selector("root", []Target{
+		Path("A", PathSpec{Transport: "tcp", Address: badAddr}),
+		Path("B", PathSpec{Transport: "tcp", Address: good.Addr().String()}),
+	})
+	client, err := (&Dialer{Root: root, Primary: "A"}).Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var server Conn
+	select {
+	case server = <-accepted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer server.Close()
+
+	st := client.Status()
+	if st.Peer.Kind != PeerRendr {
+		t.Fatalf("peer kind=%q want %q", st.Peer.Kind, PeerRendr)
+	}
+	if len(st.Paths) != 2 {
+		t.Fatalf("paths=%d want 2: %+v", len(st.Paths), st.Paths)
+	}
+	if !st.Paths[0].Primary || st.Paths[0].State != PathPending && st.Paths[0].State != PathUnavailable {
+		t.Fatalf("primary status=%+v want pending/unavailable", st.Paths[0])
+	}
+	if st.Paths[1].Name != "B" || st.Paths[1].State != PathAttached || !st.Paths[1].Active {
+		t.Fatalf("fallback status=%+v want active attached B", st.Paths[1])
+	}
+}
+
+func TestDialerPrimaryRequireFails(t *testing.T) {
+	good, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer good.Close()
+
+	bad, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badAddr := bad.Addr().String()
+	_ = bad.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	root := Selector("root", []Target{
+		Path("A", PathSpec{Transport: "tcp", Address: badAddr}),
+		Path("B", PathSpec{Transport: "tcp", Address: good.Addr().String()}),
+	})
+	client, err := (&Dialer{Root: root, Primary: "A", PrimaryPolicy: PrimaryRequire}).Dial(ctx)
+	if err == nil {
+		client.Close()
+		t.Fatal("Dial succeeded with unavailable required primary")
+	}
+}
+
 func TestDialerRootSelectorDialSmoke(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {

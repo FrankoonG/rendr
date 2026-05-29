@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -25,6 +26,10 @@ type Dialer struct {
 	// down to the current engine mode layer until the full nested runtime
 	// policy executor lands.
 	Root Target
+
+	// RootConfig is the structured v0.4+ root entry point. When set,
+	// it overrides Root, Primary, and PrimaryPolicy.
+	RootConfig *RootConfig
 
 	// Mode is the initial operational mode.
 	Mode Mode
@@ -79,6 +84,27 @@ type Dialer struct {
 	// device by itself; ingress setup remains owned by the embedder.
 	PreserveL3Identity bool
 
+	// InstanceID identifies this runtime during HELLO/BRIDGE attach.
+	// Zero means generate a fresh ephemeral runtime id for this Dialer.
+	InstanceID InstanceID
+
+	// Runtime controls ingress capability preferences. Zero value is
+	// interpreted as IngressTUN with fallback allowed; current L7
+	// Dial/DialPacket paths use it only for status/API compatibility.
+	Runtime RuntimeConfig
+
+	// Primary names the path or group that should be used for the
+	// initial HELLO. Empty means the first expanded leaf path.
+	Primary string
+
+	// PrimaryPolicy controls whether primary failure can fall back to
+	// another path. Zero value is PrimaryPrefer.
+	PrimaryPolicy PrimaryPolicy
+
+	// Retry controls background retry of optional failed paths. Zero
+	// value enables bounded retry with conservative defaults.
+	Retry RetryPolicy
+
 	// streamFactories / packetFactories are populated via
 	// AddStreamPathFactory / AddPacketPathFactory. They override
 	// transport.Default lookup for PathSpec.Transport names that
@@ -104,49 +130,42 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
+	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	flowID := engine.NewClientFlowID()
+	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
+	e.SetLocalInstanceID(instanceID)
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	// Dial the first path and run HELLO.
-	first := paths[0]
-	pc, err := d.dialPathWithFactories(ctx, first)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, false)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHelloWithPathName(pc, flowID, d.helloCaps(false), pathSpecName(first)); err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerCaps(ack.Caps)
+	e.SetPeerInstanceID(ack.InstanceID)
 	firstID, err := e.AttachPath(pc, first)
 	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
 	}
+	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
 	// Attach any additional paths as bridge-tagged add-ons. They sit
 	// idle until Migrate switches to them or the active path dies.
-	for _, ps := range paths[1:] {
-		spc, err := d.dialPathWithFactories(ctx, ps)
-		if err != nil {
-			// One bad extra path is not fatal for the Conn; warn
-			// silently and continue.
+	for i, ps := range paths {
+		if i == firstIndex {
 			continue
 		}
-		if err := engine.PerformClientBridgeTagWithPathName(spc, flowID, pathSpecName(ps)); err != nil {
-			_ = spc.Close()
-			continue
-		}
-		id, err := e.AttachPath(spc, ps)
+		id, err := d.attachExtraPath(ctx, e, ps, i, tracker)
 		if err != nil {
-			_ = spc.Close()
+			d.startRetry(e, ps, i, tracker)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -158,6 +177,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		RAddr: addrFromString(first.Address),
 	}
 	bc := newEngineBackedConn(e, c, mode)
+	bc.status = tracker
 
 	// Arm the prime scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
@@ -189,45 +209,41 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
+	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	flowID := engine.NewClientFlowID()
+	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
+	e.SetLocalInstanceID(instanceID)
 	e.SetPacketMode()
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first := paths[0]
-	pc, err := d.dialPathWithFactories(ctx, first)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, true)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
 	}
-	if err := engine.PerformClientHelloWithPathName(pc, flowID, d.helloCaps(true), pathSpecName(first)); err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerCaps(ack.Caps)
+	e.SetPeerInstanceID(ack.InstanceID)
 	firstID, err := e.AttachPath(pc, first)
 	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return nil, err
 	}
+	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
-	for _, ps := range paths[1:] {
-		spc, err := d.dialPathWithFactories(ctx, ps)
-		if err != nil {
+	for i, ps := range paths {
+		if i == firstIndex {
 			continue
 		}
-		if err := engine.PerformClientBridgeTagWithPathName(spc, flowID, pathSpecName(ps)); err != nil {
-			_ = spc.Close()
-			continue
-		}
-		id, err := e.AttachPath(spc, ps)
+		id, err := d.attachExtraPath(ctx, e, ps, i, tracker)
 		if err != nil {
-			_ = spc.Close()
+			d.startRetry(e, ps, i, tracker)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -236,6 +252,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	lAddr := addrFromString("rendr-client")
 	rAddr := addrFromString(first.Address)
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
+	bc.status = tracker
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)
@@ -245,13 +262,28 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	return bc, nil
 }
 
+func (d *Dialer) instanceID() InstanceID {
+	if d.InstanceID != (InstanceID{}) {
+		return d.InstanceID
+	}
+	return engine.NewInstanceID()
+}
+
 func (d *Dialer) compileDialPlan() (compiledTarget, error) {
-	if d.Root != nil {
-		ct, err := compileTargetForDial(d.Root)
+	root := d.Root
+	primary := d.Primary
+	if d.RootConfig != nil {
+		root = d.RootConfig.Target
+		if d.RootConfig.Primary != "" {
+			primary = d.RootConfig.Primary
+		}
+	}
+	if root != nil {
+		ct, err := compileTargetForDial(root)
 		if err != nil {
 			return compiledTarget{}, err
 		}
-		return ct, nil
+		return d.applyPrimary(ct, root, primary)
 	}
 	if len(d.Paths) == 0 {
 		return compiledTarget{}, errNoPaths
@@ -264,7 +296,167 @@ func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 	if err != nil {
 		return compiledTarget{}, err
 	}
+	return d.applyPrimary(ct, legacyRootTarget(mode, d.Paths), primary)
+}
+
+func (d *Dialer) applyPrimary(ct compiledTarget, root Target, primary string) (compiledTarget, error) {
+	if len(ct.paths) == 0 {
+		return ct, nil
+	}
+	if primary == "" {
+		ct.primaryName = pathSpecName(ct.paths[0])
+		return ct, nil
+	}
+	leaf, ok := targetPrimaryLeafName(root, primary)
+	if !ok {
+		leaf = primary
+	}
+	idx := -1
+	for i, ps := range ct.paths {
+		if pathSpecName(ps) == leaf {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return compiledTarget{}, fmt.Errorf("rendr: primary target %q not found", primary)
+	}
+	ct.primaryName = leaf
+	if idx == 0 {
+		return ct, nil
+	}
+	ps := ct.paths[idx]
+	copy(ct.paths[1:idx+1], ct.paths[0:idx])
+	ct.paths[0] = ps
+	if len(ct.pathPeak) == len(ct.paths) {
+		peak := ct.pathPeak[idx]
+		copy(ct.pathPeak[1:idx+1], ct.pathPeak[0:idx])
+		ct.pathPeak[0] = peak
+	}
 	return ct, nil
+}
+
+func (d *Dialer) effectivePrimaryPolicy() PrimaryPolicy {
+	if d.RootConfig != nil && d.RootConfig.PrimaryPolicy != "" {
+		return d.RootConfig.PrimaryPolicy
+	}
+	if d.PrimaryPolicy == PrimaryRequire {
+		return PrimaryRequire
+	}
+	return PrimaryPrefer
+}
+
+func (d *Dialer) dialInitialPath(
+	ctx context.Context,
+	e *engine.Engine,
+	flowID [16]byte,
+	instanceID InstanceID,
+	paths []PathSpec,
+	plan compiledTarget,
+	tracker *pathStatusTracker,
+	packetMode bool,
+) (PathSpec, int, transport.PathConn, proto.HelloAckPayload, error) {
+	var lastErr error
+	primaryPolicy := d.effectivePrimaryPolicy()
+	for i, ps := range paths {
+		tracker.set(i, PathDialing, nil)
+		pc, err := d.dialPathWithFactories(ctx, ps)
+		if err != nil {
+			tracker.set(i, PathUnavailable, err)
+			lastErr = err
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
+			}
+			continue
+		}
+		tracker.set(i, PathHandshaking, nil)
+		ack, err := engine.PerformClientHelloAck(pc, flowID, instanceID, d.helloCaps(packetMode), pathSpecName(ps))
+		if err != nil {
+			_ = pc.Close()
+			state := pathStateForHandshakeError(err)
+			tracker.set(i, state, err)
+			lastErr = err
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
+			}
+			continue
+		}
+		return ps, i, pc, ack, nil
+	}
+	if lastErr != nil {
+		return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: no usable path: %w", lastErr)
+	}
+	return PathSpec{}, -1, nil, proto.HelloAckPayload{}, errNoPaths
+}
+
+func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker) (uint32, error) {
+	tracker.set(index, PathDialing, nil)
+	spc, err := d.dialPathWithFactories(ctx, ps)
+	if err != nil {
+		tracker.set(index, PathUnavailable, err)
+		return 0, err
+	}
+	tracker.set(index, PathHandshaking, nil)
+	if _, err := engine.PerformClientBridgeTagAck(spc, e.FlowID(), e.LocalInstanceID(), e.PeerInstanceID(), pathSpecName(ps)); err != nil {
+		_ = spc.Close()
+		tracker.set(index, pathStateForHandshakeError(err), err)
+		return 0, err
+	}
+	id, err := e.AttachPath(spc, ps)
+	if err != nil {
+		_ = spc.Close()
+		tracker.set(index, PathUnavailable, err)
+		return 0, err
+	}
+	tracker.set(index, PathAttached, nil)
+	return id, nil
+}
+
+func pathStateForHandshakeError(err error) PathState {
+	if err == nil {
+		return PathAttached
+	}
+	return PathNative
+}
+
+func (d *Dialer) startRetry(e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker) {
+	if tracker == nil {
+		return
+	}
+	minBackoff := d.Retry.MinBackoff
+	if minBackoff <= 0 {
+		minBackoff = 500 * time.Millisecond
+	}
+	maxBackoff := d.Retry.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 5 * time.Second
+	}
+	if maxBackoff < minBackoff {
+		maxBackoff = minBackoff
+	}
+	go func() {
+		backoff := minBackoff
+		for {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-e.Closed():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, err := d.attachExtraPath(ctx, e, ps, index, tracker)
+			cancel()
+			if err == nil {
+				return
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			tracker.set(index, PathPending, err)
+		}
+	}()
 }
 
 func (d *Dialer) helloCaps(packetMode bool) uint32 {

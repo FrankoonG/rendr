@@ -29,15 +29,26 @@ const (
 	SideServer Side = 1
 )
 
+type PeerKind uint32
+
+const (
+	PeerUnknown PeerKind = iota
+	PeerNative
+	PeerRendr
+)
+
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side     Side
-	flowID   [16]byte
-	limits   Limits
-	peerCaps atomic.Uint32
-	state    atomic.Uint32 // BridgeState
-	created  time.Time
+	side          Side
+	flowID        [16]byte
+	limits        Limits
+	peerCaps      atomic.Uint32
+	localInstance proto.InstanceID
+	peerInstance  proto.InstanceID
+	peerKind      atomic.Uint32
+	state         atomic.Uint32 // BridgeState
+	created       time.Time
 
 	// Mode is the dispatcher selector: 1=prime, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
@@ -241,8 +252,31 @@ func NewClientFlowID() [16]byte {
 	return f
 }
 
+func NewInstanceID() proto.InstanceID {
+	var id proto.InstanceID
+	if _, err := rand.Read(id[:]); err != nil {
+		t := time.Now().UnixNano()
+		for i := 0; i < 8; i++ {
+			id[i] = byte(t >> (i * 8))
+		}
+	}
+	return id
+}
+
 // FlowID returns the engine's flow identifier.
 func (e *Engine) FlowID() [16]byte { return e.flowID }
+
+func (e *Engine) SetLocalInstanceID(id proto.InstanceID) { e.localInstance = id }
+
+func (e *Engine) LocalInstanceID() proto.InstanceID { return e.localInstance }
+
+func (e *Engine) SetPeerInstanceID(id proto.InstanceID) { e.peerInstance = id }
+
+func (e *Engine) PeerInstanceID() proto.InstanceID { return e.peerInstance }
+
+func (e *Engine) SetPeerKind(kind PeerKind) { e.peerKind.Store(uint32(kind)) }
+
+func (e *Engine) PeerKind() PeerKind { return PeerKind(e.peerKind.Load()) }
 
 // SetPeerCaps records capability bits advertised by the peer's HELLO.
 func (e *Engine) SetPeerCaps(caps uint32) { e.peerCaps.Store(caps) }

@@ -23,17 +23,19 @@ func ListenTCP(addr string) (Listener, error) {
 		return nil, err
 	}
 	l := &tcpListener{
-		ln:      ln,
-		bridges: engine.NewBridgeTable(),
-		accept:  make(chan *engineBackedConn, 16),
-		closed:  make(chan struct{}),
+		ln:         ln,
+		instanceID: engine.NewInstanceID(),
+		bridges:    engine.NewBridgeTable(),
+		accept:     make(chan *engineBackedConn, 16),
+		closed:     make(chan struct{}),
 	}
 	go l.acceptLoop()
 	return l, nil
 }
 
 type tcpListener struct {
-	ln net.Listener
+	ln         net.Listener
+	instanceID proto.InstanceID
 
 	bridges *engine.BridgeTable
 
@@ -137,6 +139,9 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetLocalInstanceID(l.instanceID)
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerInstanceID(p.InstanceID)
 	e.SetPeerCaps(p.Caps)
 	if !l.bridges.Put(p.FlowID, e) {
 		// Collision: BYE and drop.
@@ -148,6 +153,12 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 
 	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		l.bridges.Remove(p.FlowID)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -189,14 +200,22 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = pc.Close()
+		return
+	}
+	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "peer instance mismatch")
 		_ = pc.Close()
 		return
 	}
 	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
+		return
 	}
+	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
 }
 
 // waitBridgeArrival polls the bridge table for flow_id up to total,
@@ -223,4 +242,15 @@ func specFromAddrName(addr, name string) PathSpec {
 		spec.Opts = map[string]string{"name": name}
 	}
 	return spec
+}
+
+func eLocalCaps(e *engine.Engine) uint32 {
+	var caps uint32
+	if e.Packetized() {
+		caps |= proto.CapsPacketMode
+	}
+	if e.PeerCaps()&proto.CapsL3Identity != 0 {
+		caps |= proto.CapsL3Identity
+	}
+	return caps
 }
