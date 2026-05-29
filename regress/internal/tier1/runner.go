@@ -158,15 +158,15 @@ func grepFile(root, rel string, want *regexp.Regexp, label string) error {
 }
 
 var (
-	rxProtoVersion       = regexp.MustCompile(`const\s+Version\s+uint8\s*=\s*0\b`)
-	rxUDPFlowVersion     = regexp.MustCompile(`const\s+UDPFlowVersion\s+uint8\s*=\s*0\b`)
-	rxMigrationBudget    = regexp.MustCompile(`MigrationBudget:\s*90\s*\*\s*time\.Second`)
-	rxModeValues         = regexp.MustCompile(`(?s)ModePrime\s+Mode\s*=\s*1.*?ModeBond\s+Mode\s*=\s*2.*?ModeRace\s+Mode\s*=\s*3`)
+	rxProtoVersion        = regexp.MustCompile(`const\s+Version\s+uint8\s*=\s*2\b`)
+	rxUDPFlowVersion      = regexp.MustCompile(`const\s+UDPFlowVersion\s+uint8\s*=\s*0\b`)
+	rxMigrationBudget     = regexp.MustCompile(`MigrationBudget:\s*90\s*\*\s*time\.Second`)
+	rxModeValues          = regexp.MustCompile(`(?s)ModePrime\s+Mode\s*=\s*1.*?ModeBond\s+Mode\s*=\s*2.*?ModeRace\s+Mode\s*=\s*3`)
 	rxModeTransitionTable = regexp.MustCompile(`(?s)cur\s*==\s*ModeRace\s*&&\s*m\s*==\s*ModeBond.*?cur\s*==\s*ModeBond\s*&&\s*m\s*==\s*ModeRace`)
 )
 
 func constProtoVersion(_ context.Context, root string) error {
-	return grepFile(root, "proto/frame.go", rxProtoVersion, "proto.Version must be 0 (wire protocol v0)")
+	return grepFile(root, "proto/frame.go", rxProtoVersion, "proto.Version must be 2 (wire protocol v2)")
 }
 
 func constUDPFlowVersion(_ context.Context, root string) error {

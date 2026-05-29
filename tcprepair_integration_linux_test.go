@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +81,9 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 	}
 
 	if err := adm.MigratePathLocalAddr(pathID, ""); err != nil {
+		if strings.Contains(err.Error(), "use gvisor fallback") {
+			t.Skipf("tcprepair same-tuple rebuild unsupported on this kernel: %v", err)
+		}
 		t.Fatalf("MigratePathLocalAddr: %v", err)
 	}
 	if got := adm.ActivePath(); got != pathID {

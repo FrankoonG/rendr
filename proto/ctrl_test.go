@@ -12,6 +12,9 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlBridgeTag)); got != CtrlBridgeTag {
 		t.Fatalf("bridge_tag round-trip: got %v want %v", got, CtrlBridgeTag)
 	}
+	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlBridgeAck)); got != CtrlBridgeAck {
+		t.Fatalf("bridge_ack round-trip: got %v want %v", got, CtrlBridgeAck)
+	}
 }
 
 func TestHelloRoundTrip(t *testing.T) {
@@ -80,6 +83,37 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHelloAckRoundTrip(t *testing.T) {
+	want := HelloAckPayload{
+		FlowID:     [16]byte{1, 2, 3, 4},
+		InstanceID: InstanceID{5, 6, 7, 8},
+		Caps:       0xAABB_CCDD,
+	}
+	got, err := DecodeHelloAck(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("hello_ack: got %+v want %+v", got, want)
+	}
+}
+
+func TestBridgeAckRoundTrip(t *testing.T) {
+	want := BridgeAckPayload{
+		BridgeID:   [16]byte{0xFE, 0xED},
+		InstanceID: InstanceID{1, 2, 3, 4},
+		Code:       AckRejectInstance,
+		Reason:     "instance mismatch",
+	}
+	got, err := DecodeBridgeAck(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("bridge_ack: got %+v want %+v", got, want)
+	}
+}
+
 func TestHelloPathNameRoundTrip(t *testing.T) {
 	want := HelloPayload{FlowID: [16]byte{1, 2, 3, 4}, Caps: CapsPacketMode, PathName: "A"}
 	got, err := DecodeHello(want.Encode())
@@ -138,6 +172,12 @@ func TestRejectShortPayloads(t *testing.T) {
 	if _, err := DecodeBridgeTag(short); err == nil {
 		t.Error("bridge_tag accepted short input")
 	}
+	if _, err := DecodeHelloAck(short); err == nil {
+		t.Error("hello_ack accepted short input")
+	}
+	if _, err := DecodeBridgeAck(short); err == nil {
+		t.Error("bridge_ack accepted short input")
+	}
 	if _, err := DecodePolicyRequest(short); err == nil {
 		t.Error("policy_request accepted short input")
 	}
@@ -159,7 +199,9 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlPathProbe, 0x06},
 		{CtrlPathProbeReply, 0x07},
 		{CtrlPolicyRequest, 0x08},
+		{CtrlHelloAck, 0x09},
 		{CtrlBridgeTag, 0x10},
+		{CtrlBridgeAck, 0x11},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -172,6 +214,10 @@ func TestCapsBitStability(t *testing.T) {
 	if CapsPacketMode != 0x00000001 {
 		t.Errorf("CapsPacketMode drifted: got 0x%08x want 0x00000001 (bump proto.Version if intentional)",
 			CapsPacketMode)
+	}
+	if CapsL3Identity != 0x00000002 {
+		t.Errorf("CapsL3Identity drifted: got 0x%08x want 0x00000002 (bump proto.Version if intentional)",
+			CapsL3Identity)
 	}
 }
 
@@ -213,13 +259,21 @@ func TestAckPayloadWireStability(t *testing.T) {
 }
 
 func TestBridgeTagWireStability(t *testing.T) {
-	p := BridgeTagPayload{BridgeID: [16]byte{
-		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
-		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-	}}
+	p := BridgeTagPayload{
+		BridgeID: [16]byte{
+			0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		},
+		InstanceID:             InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
+		ExpectedPeerInstanceID: InstanceID{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F},
+	}
 	want := []byte{
 		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+		0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+		0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
 	}
 	if !bytes.Equal(p.Encode(), want) {
 		t.Fatalf("bridge_tag wire drift:\n got=%x\nwant=%x", p.Encode(), want)
@@ -274,12 +328,15 @@ func TestByeWireStability(t *testing.T) {
 
 func TestHelloWireStability(t *testing.T) {
 	p := HelloPayload{
-		FlowID: [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
-		Caps:   0x01020304,
+		FlowID:     [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+		InstanceID: InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
+		Caps:       0x01020304,
 	}
 	want := []byte{
 		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
 		0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
 		0x01, 0x02, 0x03, 0x04,
 	}
 	if !bytes.Equal(p.Encode(), want) {

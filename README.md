@@ -1,180 +1,95 @@
 # rendr
 
-[![Go](https://github.com/FrankoonG/rendr/actions/workflows/go.yml/badge.svg?branch=v0.1.0)](https://github.com/FrankoonG/rendr/actions/workflows/go.yml)
+[![Go](https://github.com/FrankoonG/rendr/actions/workflows/go.yml/badge.svg)](https://github.com/FrankoonG/rendr/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/FrankoonG/rendr.svg)](https://pkg.go.dev/github.com/FrankoonG/rendr)
 
-A connection-migration framework for Go. An application holds a stable
-`net.Conn` whose underlying network path rendr can swap — TCP socket,
-QUIC connection, or opaque-UDP flow — without surfacing any reset,
-EOF, or read-zero to the application.
+rendr is a Go framework for lossless connection migration. An embedder
+gets a stable `net.Conn` or `net.PacketConn`; rendr manages the
+underlying network paths and can move traffic between them without
+turning path loss into an application-visible reset or EOF.
 
-rendr does only this. Proxy protocols, peer discovery, configuration
-management, and detailed path-quality policies belong to the embedder.
+The project is intentionally narrow: it is a migration layer, not a
+proxy product. Proxy protocols, peer discovery, mesh topology,
+configuration management, UI, and routing policy belong to the
+embedding program.
 
-```
-go get github.com/FrankoonG/rendr
-```
+## Model
 
-## Quickstart
+Each application flow has a stable `flow_id`. Multiple underlying
+paths can attach to that flow, and rendr decides which path or paths
+carry frames at a given moment.
 
-Server:
+The core policy shapes are:
 
-```go
-ln, err := rendr.ListenTCP("0.0.0.0:5555")
-if err != nil { log.Fatal(err) }
-for {
-    c, err := ln.Accept(context.Background())
-    if err != nil { return }
-    go handle(c) // c implements net.Conn
-}
-```
+- `prime` / selector: use the best single path and migrate when
+  quality justifies it.
+- `race`: duplicate frames across paths and keep the first valid
+  arrival.
+- `bond`: distribute frames across paths to aggregate throughput.
 
-Client:
+These policies share the same migration engine and path-quality layer.
+They can be used over stream or packet-shaped carriers depending on
+the embedder's application protocol.
 
-```go
-d := &rendr.Dialer{
-    Mode: rendr.ModePrime,
-    Paths: []rendr.PathSpec{
-        {Transport: "tcp",  Address: "h1:5555"},
-        {Transport: "quic", Address: "h2:5555"},
-    },
-}
-c, err := d.Dial(context.Background())
-// c.Read / c.Write survive a path swap.
-// c.FlowID() stays constant for the connection's lifetime.
-```
+## Architecture Overview
 
-Listeners: `ListenTCP`, `ListenQUIC(addr, *tls.Config)`, `ListenUDPFlow`,
-`ListenGVisorPacket`.
-For stream servers that accept multiple path transports into one
-bridge table, use `Listen(ListenSpec{Transport: "tcp", ...},
-ListenSpec{Transport: "quic", ...})`.
+![rendr architecture overview](./assets/architecture-overview.svg)
 
-Transport adapters auto-register: `"tcp"`, `"quic"`, `"udpflow"`,
-`"gvisor"`.
+## Definitions
 
-## Embedder example
+| Term | Meaning |
+|------|---------|
+| Application flow | One logical application conversation carried by rendr. In stream mode this maps to one stable `net.Conn`; in packet mode it maps to one stable `net.PacketConn`. |
+| `flow_id` | The stable per-flow identifier used by rendr peers to attach new paths to the same logical flow. |
+| Path | One concrete underlying route between two rendr peers, such as a TCP connection, QUIC connection, UDP flow, gVisor carrier, or embedder-provided tunnel. |
+| Transport | The adapter that creates a path from a `PathSpec`. Built-in examples include `tcp`, `quic`, `udpflow`, and `gvisor`. |
+| Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, xray-backed, or custom. |
+| Target | A node in the policy graph. A target can be a leaf `Path`, a `Selector`, a `Race`, or a `Bond`. |
+| Root target | The policy graph entry point supplied to a `Dialer`. It replaces the older flat `Mode + Paths` shape for new integrations. |
+| Selector / prime | The single-target quality policy. It chooses one child target at a time, favoring latency, jitter, loss, and stability. |
+| Race | A redundancy policy that sends frames on multiple paths and accepts the first valid arrival. |
+| Bond | An aggregation policy that distributes frames across paths to combine throughput. |
+| Mixed carrier graph | A flow whose available paths may use different carrier families, for example TCP and UDP-backed paths. |
+| Stream mode | rendr presents a `net.Conn`; byte order is preserved. |
+| Packet mode | rendr presents a `net.PacketConn`; each write maps to one packet-shaped frame. |
+| `InstanceID` | An ephemeral identifier for one running rendr runtime. It lets a client verify that additional paths attach to the same peer instance. |
+| Capability | A string identifier exposed through status APIs, such as `rendr`, `l7`, `tun`, `l3_identity`, `tcp_repair`, `gvisor`, `mixed`, `packet_mode`, or `quic_datagram`. |
+| Status | A runtime snapshot of local capabilities, peer kind, peer capabilities, and leaf path states. |
+| Primary path / target | The preferred initial path or target used to establish the first handshake. Later traffic can still migrate according to policy. |
+| TUN ingress | An L3 ingress layer that captures OS IP packets and turns flows into rendr sessions. It is not itself a path policy. |
+| L3 identity | The original logical source/destination IP and port tuple carried with a flow for peer-side egress decisions. |
+| Egress hook | Embedder-owned code that decides how peer-side traffic lands after rendr has migrated the flow. |
+| xray glue | Integration code that lets rendr either appear as an xray transport or consume xray outbound chains as rendr paths. |
+| TCP_REPAIR | A Linux kernel mechanism explored for native TCP state migration. |
+| gVisor fallback | A user-space TCP path used when kernel TCP migration support is unavailable or not permitted. |
 
-`examples/socks5` is a small reference embedder: a local SOCKS5
-CONNECT endpoint opens one rendr `Conn` per proxied TCP connection,
-then a rendr-side server dials the requested target. It is an example
-of layering an application protocol on top of rendr, not a built-in
-proxy protocol.
+## Scope
 
-## Packet mode
+rendr provides:
 
-For datagram-oriented applications, use `DialPacket` and
-`ListenUDPFlowPacket`. Each `WriteTo` becomes one wire frame; each
-`ReadFrom` returns one frame's payload. The wire format is identical
-to stream mode; the two are negotiated in HELLO.
+- Stable stream and packet connection surfaces for Go embedders.
+- Path attach, path death classification, failover, recovery, and
+  migration control.
+- TCP, QUIC, opaque-UDP, and gVisor-backed carrier building blocks.
+- Integration surfaces for custom transports and xray-based embedders.
+- TUN/L3 identity building blocks for programs that need per-flow
+  migration below an OS network stack.
 
-```go
-ln, _ := rendr.ListenUDPFlowPacket("0.0.0.0:5555")
-pc, _ := (&rendr.Dialer{
-    Mode: rendr.ModePrime,
-    Paths: []rendr.PathSpec{{Transport: "udpflow", Address: "h1:5555"}},
-}).DialPacket(context.Background())
-// pc implements net.PacketConn; boundaries preserved 1-to-1.
-```
+rendr does not provide:
 
-For applications that already own a UDP socket, package
-`github.com/FrankoonG/rendr/udprelay` exposes a local UDP relay over a
-rendr `PacketConn`. Point the application at `Relay.LocalAddr()` and
-use `Relay.PacketConn()` for migration control.
-
-## gVisor TCP Fallback
-
-`ListenGVisorPacket("host:port")` runs a user-space gVisor TCP stack
-over an outer UDP packet carrier. Clients dial it with
-`PathSpec{Transport: "gvisor", Address: ln.Addr().String()}`. This is
-the no-CAP_NET_ADMIN fallback path for environments where Linux
-`TCP_REPAIR` is unavailable.
-
-## Modes
-
-| Mode    | Bandwidth          | Latency           | Use for                          |
-|---------|--------------------|-------------------|----------------------------------|
-| `prime` | best single path   | best single path  | SSH, RDP, control channels       |
-| `race`  | best single path   | min across paths  | trading, low-jitter UDP control  |
-| `bond`  | sum of paths       | mid               | large file, video, multi-link    |
-
-Set via `Dialer.Mode` or runtime `Conn.SetMode`. Legal transitions:
-`prime ↔ race`, `prime ↔ bond`. `race ↔ bond` is forbidden because
-race has no per-path SEQ ordering and bond requires it.
-
-## Migration is invisible
-
-The hard contract is that a path swap does **not** surface as an
-error from the application's `Read` or `Write`. If every path dies
-and no new one becomes available within the migration budget
-(default 90 s), `Read` returns `rendr.ErrMigrationBudgetExceeded`.
-Clean peer teardown surfaces as `io.EOF`.
-
-Transport-layer errors (TCP RST, QUIC idle timeout, UDP socket
-gone) are NEVER conflated with application EOF; they trigger
-migration silently.
-
-## Observability and control
-
-The `Conn` returned by `Dial` / `Accept` also implements
-`AdminConn`. Assert when you need it:
-
-```go
-adm := c.(rendr.AdminConn)
-s := adm.Stats()
-log.Printf("flow=%x state=%s mode=%s paths=%d hwm=%d",
-    s.FlowID, s.State, s.Mode, len(s.Paths), s.RecvQueueHWM)
-
-// Explicit migration:
-if newID, err := adm.AddPath(rendr.PathSpec{Transport: "tcp", Address: "h3:5555"}); err == nil {
-    _ = adm.Migrate(newID)
-}
-```
-
-`AdminConn` surface: `Migrate`, `ActivePath`, `AddPath`, `RemovePath`,
-`State`, `Mode`, `RecvQueueHWM`, `RecvDups`, `BondStuckSkips`,
-`MigrationCount`, `Stats`. Packet-mode connections expose the same
-methods via `AdminPacketConn`.
-
-## Acceptance contracts
-
-rendr is gated on five invariants — the implementation is not
-considered done until all five hold under chaos-scale tests:
-
-- **G1** Large file (≥1 GiB) with forced mid-stream migrations
-  finishes with identical SHA-256 and <10% baseline throughput
-  regression.
-- **G2** 30-minute echo loop with 30+ migrations, zero loss,
-  P99 RTT < baseline × 2.
-- **G3** 100k pps QUIC datagrams + 10 ConnID migrations, zero
-  application loss, P95 RTT < baseline × 2.
-- **G4** Path A force-killed (network DROP) with path B intact;
-  app sees no error; failover ≤ 5 s; in-flight data reaches the
-  peer via path B.
-- **G5** After G4, recover path A (via `AdminConn.AddPath`); it
-  re-joins the path set without spurious reorder.
+- Built-in proxy protocols such as Shadowsocks, Trojan, VLESS, or
+  Hysteria.
+- Peer discovery, mesh routing, NAT traversal, or topology control.
+- Domain/CIDR policy routing or configuration management.
+- A Web UI or operations panel.
+- A default guarantee that the final destination server sees the
+  original source IP.
 
 ## Status
 
-In active development under tag prefix `v0.1.x`. Public API may
-still shift before `v1.0`; modes, AdminConn surface, and wire
-format v0 are pinned by tests against drift.
-
-The five acceptance contracts (G1-G5) have all been validated on
-the development branch:
-
-- G1 — 1 GiB transfer with mid-stream migrations, SHA-256 match,
-  <10% throughput regression
-- G2 — 60s continuous echo with 15+ migrations, 0 loss, P99 RTT
-  within 2× baseline
-- G3 — 100k pps QUIC DATAGRAM over 8-path bond with 11 migrations,
-  0 loss, P95 RTT 1.6ms (validated on Linux 6.8 with
-  `net.core.rmem_max` raised; the QUIC DATAGRAM transport needs
-  a larger socket receive buffer than the default 208 KiB)
-- G4 — force-killed path fails over to surviving path in <200ms
-  on loopback with zero application-visible error
-- G5 — `AdminConn.AddPath` recovers a dropped path back into the
-  active set without reorder artifacts
+rendr is in active pre-`v1.0` development. The API is usable for
+experimentation and internal integration, but policy graph, TUN, and
+xray glue surfaces may still evolve as the migration model is hardened.
 
 ## License
 

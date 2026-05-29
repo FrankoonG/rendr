@@ -18,8 +18,12 @@ const (
 	CtrlPathProbe      CtrlCode = 0x06
 	CtrlPathProbeReply CtrlCode = 0x07
 	CtrlPolicyRequest  CtrlCode = 0x08
+	CtrlHelloAck       CtrlCode = 0x09
 	CtrlBridgeTag      CtrlCode = 0x10
+	CtrlBridgeAck      CtrlCode = 0x11
 )
+
+type InstanceID [16]byte
 
 // ProbePayload carries timestamps for per-path RTT measurement.
 // Probe frames are intentionally out-of-band of the SEQ reorder
@@ -103,8 +107,12 @@ func (c CtrlCode) String() string {
 		return "PATH_PROBE_REPLY"
 	case CtrlPolicyRequest:
 		return "POLICY_REQUEST"
+	case CtrlHelloAck:
+		return "HELLO_ACK"
 	case CtrlBridgeTag:
 		return "BRIDGE_TAG"
+	case CtrlBridgeAck:
+		return "BRIDGE_ACK"
 	default:
 		return fmt.Sprintf("ctrl(0x%02x)", uint8(c))
 	}
@@ -130,21 +138,30 @@ const (
 	// receive drainer to deliver per-frame packets rather than
 	// concatenated byte stream. Stream-mode peers ignore this bit.
 	CapsPacketMode uint32 = 1 << 0
+
+	// CapsL3Identity: peer can carry original L3/L4 identity metadata
+	// for TUN/l3ingress flows and expose it to peer-side egress hooks.
+	CapsL3Identity uint32 = 1 << 1
 )
 
-// HelloPayload: flow_id (16B) + caps (4B). 20 bytes on the wire.
+// HelloPayload: flow_id (16B) + instance_id (16B) + caps (4B).
 type HelloPayload struct {
-	FlowID   [16]byte
-	Caps     uint32
-	PathName string
+	FlowID     [16]byte
+	InstanceID InstanceID
+	Caps       uint32
+	PathName   string
 }
 
-const HelloPayloadSize = 20
+const (
+	HelloPayloadLegacySize = 20
+	HelloPayloadSize       = 36
+)
 
 func (p HelloPayload) Encode() []byte {
 	b := make([]byte, HelloPayloadSize)
 	copy(b[0:16], p.FlowID[:])
-	binary.BigEndian.PutUint32(b[16:20], p.Caps)
+	copy(b[16:32], p.InstanceID[:])
+	binary.BigEndian.PutUint32(b[32:36], p.Caps)
 	if p.PathName != "" {
 		b = appendPathName(b, p.PathName)
 	}
@@ -153,18 +170,51 @@ func (p HelloPayload) Encode() []byte {
 
 func DecodeHello(b []byte) (HelloPayload, error) {
 	var p HelloPayload
-	if len(b) < HelloPayloadSize {
-		return p, fmt.Errorf("proto: hello payload too short: %d < %d", len(b), HelloPayloadSize)
+	if len(b) < HelloPayloadLegacySize {
+		return p, fmt.Errorf("proto: hello payload too short: %d < %d", len(b), HelloPayloadLegacySize)
 	}
 	copy(p.FlowID[:], b[0:16])
+	if len(b) >= HelloPayloadSize {
+		copy(p.InstanceID[:], b[16:32])
+		p.Caps = binary.BigEndian.Uint32(b[32:36])
+		p.PathName, _ = decodePathName(b[HelloPayloadSize:])
+		return p, nil
+	}
 	p.Caps = binary.BigEndian.Uint32(b[16:20])
-	p.PathName, _ = decodePathName(b[HelloPayloadSize:])
+	p.PathName, _ = decodePathName(b[HelloPayloadLegacySize:])
 	return p, nil
 }
 
 func (p HelloPayload) EncodeWithPathName(name string) []byte {
 	p.PathName = name
 	return p.Encode()
+}
+
+type HelloAckPayload struct {
+	FlowID     [16]byte
+	InstanceID InstanceID
+	Caps       uint32
+}
+
+const HelloAckPayloadSize = 36
+
+func (p HelloAckPayload) Encode() []byte {
+	b := make([]byte, HelloAckPayloadSize)
+	copy(b[0:16], p.FlowID[:])
+	copy(b[16:32], p.InstanceID[:])
+	binary.BigEndian.PutUint32(b[32:36], p.Caps)
+	return b
+}
+
+func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
+	var p HelloAckPayload
+	if len(b) < HelloAckPayloadSize {
+		return p, fmt.Errorf("proto: hello_ack payload too short: %d < %d", len(b), HelloAckPayloadSize)
+	}
+	copy(p.FlowID[:], b[0:16])
+	copy(p.InstanceID[:], b[16:32])
+	p.Caps = binary.BigEndian.Uint32(b[32:36])
+	return p, nil
 }
 
 // MigrateNotifyPayload: new_path_id (4B).
@@ -269,19 +319,25 @@ func DecodeBye(b []byte) (ByePayload, error) {
 	return ByePayload{Reason: ByeReason(b[0])}, nil
 }
 
-// BridgeTagPayload: bridge_id (16B). Sent only on path bring-up so
-// the server-side bridge table can attach the new PathConn to the
-// correct Conn.
+// BridgeTagPayload is sent only on path bring-up so the server-side
+// bridge table can attach the new PathConn to the correct Conn.
 type BridgeTagPayload struct {
-	BridgeID [16]byte
-	PathName string
+	BridgeID               [16]byte
+	InstanceID             InstanceID
+	ExpectedPeerInstanceID InstanceID
+	PathName               string
 }
 
-const BridgeTagPayloadSize = 16
+const (
+	BridgeTagPayloadLegacySize = 16
+	BridgeTagPayloadSize       = 48
+)
 
 func (p BridgeTagPayload) Encode() []byte {
 	b := make([]byte, BridgeTagPayloadSize)
-	copy(b, p.BridgeID[:])
+	copy(b[0:16], p.BridgeID[:])
+	copy(b[16:32], p.InstanceID[:])
+	copy(b[32:48], p.ExpectedPeerInstanceID[:])
 	if p.PathName != "" {
 		b = appendPathName(b, p.PathName)
 	}
@@ -289,18 +345,91 @@ func (p BridgeTagPayload) Encode() []byte {
 }
 
 func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
-	if len(b) < BridgeTagPayloadSize {
-		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag payload too short: %d < %d", len(b), BridgeTagPayloadSize)
+	if len(b) < BridgeTagPayloadLegacySize {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag payload too short: %d < %d", len(b), BridgeTagPayloadLegacySize)
 	}
 	var p BridgeTagPayload
 	copy(p.BridgeID[:], b[0:16])
-	p.PathName, _ = decodePathName(b[BridgeTagPayloadSize:])
+	if len(b) >= BridgeTagPayloadSize {
+		copy(p.InstanceID[:], b[16:32])
+		copy(p.ExpectedPeerInstanceID[:], b[32:48])
+		p.PathName, _ = decodePathName(b[BridgeTagPayloadSize:])
+		return p, nil
+	}
+	p.PathName, _ = decodePathName(b[BridgeTagPayloadLegacySize:])
 	return p, nil
 }
 
 func (p BridgeTagPayload) EncodeWithPathName(name string) []byte {
 	p.PathName = name
 	return p.Encode()
+}
+
+type AckCode uint8
+
+const (
+	AckOK               AckCode = 0x00
+	AckRejectUnknown    AckCode = 0x01
+	AckRejectInstance   AckCode = 0x02
+	AckRejectAttach     AckCode = 0x03
+	AckRejectMalformed  AckCode = 0x04
+	AckRejectDuplicate  AckCode = 0x05
+	AckRejectProtoState AckCode = 0x06
+)
+
+func (c AckCode) OK() bool { return c == AckOK }
+
+func (c AckCode) String() string {
+	switch c {
+	case AckOK:
+		return "ok"
+	case AckRejectUnknown:
+		return "unknown_flow"
+	case AckRejectInstance:
+		return "instance_mismatch"
+	case AckRejectAttach:
+		return "attach_failed"
+	case AckRejectMalformed:
+		return "malformed"
+	case AckRejectDuplicate:
+		return "duplicate"
+	case AckRejectProtoState:
+		return "proto_state"
+	default:
+		return fmt.Sprintf("ack(0x%02x)", uint8(c))
+	}
+}
+
+type BridgeAckPayload struct {
+	BridgeID   [16]byte
+	InstanceID InstanceID
+	Code       AckCode
+	Reason     string
+}
+
+const BridgeAckPayloadSize = 33
+
+func (p BridgeAckPayload) Encode() []byte {
+	b := make([]byte, BridgeAckPayloadSize)
+	copy(b[0:16], p.BridgeID[:])
+	copy(b[16:32], p.InstanceID[:])
+	b[32] = byte(p.Code)
+	if p.Reason != "" {
+		b = appendString8(b, p.Reason)
+	}
+	return b
+}
+
+func DecodeBridgeAck(b []byte) (BridgeAckPayload, error) {
+	var p BridgeAckPayload
+	if len(b) < BridgeAckPayloadSize {
+		return p, fmt.Errorf("proto: bridge_ack payload too short: %d < %d", len(b), BridgeAckPayloadSize)
+	}
+	copy(p.BridgeID[:], b[0:16])
+	copy(p.InstanceID[:], b[16:32])
+	p.Code = AckCode(b[32])
+	p.Reason, _ = decodePathName(b[BridgeAckPayloadSize:])
+	return p, nil
 }
 
 // PolicyRequestPayload asks the peer to update its local sender policy for

@@ -22,9 +22,10 @@ import (
 // preservation to hold; this is negotiated in HELLO via
 // proto.CapsPacketMode.
 type enginePacketConn struct {
-	e    *engine.Engine
-	mode atomic.Uint32
-	peak *peakTransferController
+	e      *engine.Engine
+	mode   atomic.Uint32
+	peak   *peakTransferController
+	status *pathStatusTracker
 
 	lAddr   net.Addr
 	rAddr   net.Addr
@@ -85,6 +86,9 @@ func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }
 func (c *enginePacketConn) FlowID() [16]byte  { return c.e.FlowID() }
+func (c *enginePacketConn) Status() Status {
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
+}
 
 func (c *enginePacketConn) SetMode(m Mode) error {
 	if !m.Valid() {
@@ -147,7 +151,7 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := engine.PerformClientBridgeTagWithPathName(pc, c.e.FlowID(), pathSpecName(spec)); err != nil {
+	if _, err := engine.PerformClientBridgeTagAck(pc, c.e.FlowID(), c.e.LocalInstanceID(), c.e.PeerInstanceID(), pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
@@ -173,6 +177,8 @@ func (c *enginePacketConn) Stats() ConnStats {
 		BondStuckSkips: c.e.BondStuckSkips(),
 		MigrationCount: c.e.MigrationCount(),
 		CreatedAt:      c.e.CreatedAt(),
+		PeerCaps:       c.e.PeerCaps(),
+		PeerInstanceID: c.e.PeerInstanceID(),
 	}
 }
 

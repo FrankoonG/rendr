@@ -32,6 +32,7 @@ func ListenQUICDatagram(addr string, tlsCfg *tls.Config) (PacketListener, error)
 	}
 	l := &quicDatagramListener{
 		ln:           ln,
+		instanceID:   engine.NewInstanceID(),
 		bridges:      engine.NewBridgeTable(),
 		acceptPacket: make(chan *enginePacketConn, 16),
 		closed:       make(chan struct{}),
@@ -41,7 +42,8 @@ func ListenQUICDatagram(addr string, tlsCfg *tls.Config) (PacketListener, error)
 }
 
 type quicDatagramListener struct {
-	ln *qadapter.Listener
+	ln         *qadapter.Listener
+	instanceID proto.InstanceID
 
 	bridges *engine.BridgeTable
 
@@ -138,6 +140,10 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetLocalInstanceID(l.instanceID)
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerInstanceID(p.InstanceID)
+	e.SetPeerCaps(p.Caps)
 	// DATAGRAM-mode peer implies packet boundaries regardless of
 	// whether CapsPacketMode was set; force it.
 	e.SetPacketMode()
@@ -155,6 +161,12 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 	}
 	spec = specWithTargetName(spec, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		l.bridges.Remove(p.FlowID)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -188,7 +200,12 @@ func (l *quicDatagramListener) handleBridgeTag(pc transport.PathConn, payload []
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = pc.Close()
+		return
+	}
+	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "instance mismatch")
 		_ = pc.Close()
 		return
 	}
@@ -199,6 +216,9 @@ func (l *quicDatagramListener) handleBridgeTag(pc transport.PathConn, payload []
 	}
 	spec = specWithTargetName(spec, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
+		return
 	}
+	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
 }

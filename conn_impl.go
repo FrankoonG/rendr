@@ -20,6 +20,7 @@ type engineBackedConn struct {
 	mode    atomic.Uint32 // Mode
 	closing atomic.Bool   // local-Close in flight; gates BYE send
 	peak    *peakTransferController
+	status  *pathStatusTracker
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -72,6 +73,10 @@ func (c *engineBackedConn) Paths() []PathInfo {
 }
 
 func (c *engineBackedConn) FlowID() [16]byte { return c.e.FlowID() }
+
+func (c *engineBackedConn) Status() Status {
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
+}
 
 // SetMode enforces the legal mode transitions:
 //   - prime <-> race: allowed
@@ -166,6 +171,8 @@ func (c *engineBackedConn) Stats() ConnStats {
 		BondStuckSkips: c.e.BondStuckSkips(),
 		MigrationCount: c.e.MigrationCount(),
 		CreatedAt:      c.e.CreatedAt(),
+		PeerCaps:       c.e.PeerCaps(),
+		PeerInstanceID: c.e.PeerInstanceID(),
 	}
 }
 
@@ -189,7 +196,7 @@ func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := engine.PerformClientBridgeTagWithPathName(pc, c.e.FlowID(), pathSpecName(spec)); err != nil {
+	if _, err := engine.PerformClientBridgeTagAck(pc, c.e.FlowID(), c.e.LocalInstanceID(), c.e.PeerInstanceID(), pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}

@@ -125,6 +125,7 @@ type compiledTarget struct {
 	mode          Mode
 	paths         []PathSpec
 	pathPeak      []bool
+	primaryName   string
 	peakTransfer  bool
 	peakMode      Mode
 	peakOptions   PeakTransfer
@@ -293,4 +294,68 @@ func pathSpecName(spec PathSpec) string {
 		return spec.Opts["name"]
 	}
 	return ""
+}
+
+func targetPrimaryLeafName(root Target, name string) (string, bool) {
+	if root == nil || name == "" {
+		return "", false
+	}
+	return targetPrimaryLeafNameNode(root, name)
+}
+
+func targetPrimaryLeafNameNode(t Target, name string) (string, bool) {
+	switch v := t.(type) {
+	case PathTarget:
+		if v.Name() == name {
+			return v.Name(), true
+		}
+		return "", false
+	case *PathTarget:
+		if v == nil {
+			return "", false
+		}
+		if v.Name() == name {
+			return v.Name(), true
+		}
+		return "", false
+	case GroupTarget:
+		if v.Name() == name {
+			return firstLeafName(v.Children)
+		}
+		for _, child := range v.Children {
+			if got, ok := targetPrimaryLeafNameNode(child, name); ok {
+				return got, true
+			}
+		}
+	case *GroupTarget:
+		if v == nil {
+			return "", false
+		}
+		return targetPrimaryLeafNameNode(*v, name)
+	}
+	return "", false
+}
+
+func firstLeafName(children []Target) (string, bool) {
+	for _, child := range children {
+		switch v := child.(type) {
+		case PathTarget:
+			return v.Name(), true
+		case *PathTarget:
+			if v != nil {
+				return v.Name(), true
+			}
+		case GroupTarget:
+			if got, ok := firstLeafName(v.Children); ok {
+				return got, true
+			}
+		case *GroupTarget:
+			if v != nil {
+				if got, ok := firstLeafName(v.Children); ok {
+					return got, true
+				}
+			}
+		}
+	}
+	return "", false
 }

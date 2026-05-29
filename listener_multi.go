@@ -30,6 +30,8 @@ type ListenSpec struct {
 // MultiListener is a stream Listener backed by multiple transport
 // sockets that share one bridge table.
 type MultiListener struct {
+	instanceID proto.InstanceID
+
 	bridges *engine.BridgeTable
 
 	accept    chan *engineBackedConn
@@ -53,9 +55,10 @@ func Listen(specs ...ListenSpec) (*MultiListener, error) {
 		return nil, fmt.Errorf("rendr: Listen requires at least one ListenSpec")
 	}
 	l := &MultiListener{
-		bridges: engine.NewBridgeTable(),
-		accept:  make(chan *engineBackedConn, 16),
-		closed:  make(chan struct{}),
+		instanceID: engine.NewInstanceID(),
+		bridges:    engine.NewBridgeTable(),
+		accept:     make(chan *engineBackedConn, 16),
+		closed:     make(chan struct{}),
 	}
 	for _, spec := range specs {
 		if err := l.start(spec); err != nil {
@@ -216,6 +219,10 @@ func (l *MultiListener) handleHello(pc transport.PathConn, transportName string,
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetLocalInstanceID(l.instanceID)
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerInstanceID(p.InstanceID)
+	e.SetPeerCaps(p.Caps)
 	if !l.bridges.Put(p.FlowID, e) {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 		_ = pc.Close()
@@ -225,6 +232,12 @@ func (l *MultiListener) handleHello(pc transport.PathConn, transportName string,
 
 	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		l.bridges.Remove(p.FlowID)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -261,12 +274,20 @@ func (l *MultiListener) handleBridgeTag(pc transport.PathConn, transportName str
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = pc.Close()
+		return
+	}
+	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "instance mismatch")
 		_ = pc.Close()
 		return
 	}
 	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
+		return
 	}
+	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
 }

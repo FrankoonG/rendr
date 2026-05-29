@@ -30,6 +30,7 @@ func ListenUDPFlow(addr string) (Listener, error) {
 	}
 	l := &udpFlowListener{
 		ln:           ln,
+		instanceID:   engine.NewInstanceID(),
 		bridges:      engine.NewBridgeTable(),
 		accept:       make(chan *engineBackedConn, 16),
 		acceptPacket: make(chan *enginePacketConn, 16),
@@ -52,7 +53,8 @@ func ListenUDPFlowPacket(addr string) (PacketListener, error) {
 }
 
 type udpFlowListener struct {
-	ln *uflow.Listener
+	ln         *uflow.Listener
+	instanceID proto.InstanceID
 
 	bridges *engine.BridgeTable
 
@@ -174,6 +176,10 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	e.SetLocalInstanceID(l.instanceID)
+	e.SetPeerKind(engine.PeerRendr)
+	e.SetPeerInstanceID(p.InstanceID)
+	e.SetPeerCaps(p.Caps)
 	packetMode := p.Caps&proto.CapsPacketMode != 0
 	if packetMode {
 		e.SetPacketMode()
@@ -187,6 +193,12 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 
 	spec := specWithTargetName(PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		l.bridges.Remove(p.FlowID)
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -240,12 +252,20 @@ func (l *udpFlowListener) handleBridgeTag(pc *uflow.ServerPathConn, payload []by
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = pc.Close()
+		return
+	}
+	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "peer instance mismatch")
 		_ = pc.Close()
 		return
 	}
 	spec := specWithTargetName(PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
+		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
+		return
 	}
+	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
 }
