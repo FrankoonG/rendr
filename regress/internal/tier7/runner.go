@@ -43,6 +43,9 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	run("T7.tun.open-smoke", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.tun.open-smoke", "./tun", "^TestOpenCreatesEphemeralDeviceWhenAvailable$")
 	})
+	run("T7.tun.packet-io", 30*time.Second, func(c context.Context) report.Case {
+		return runGoTests(c, rendrRoot, "T7.tun.packet-io", "./tun", "^TestDeviceReadsKernelRoutedIPv4Packet$")
+	})
 	run("T7.config.invalid-mtu", 30*time.Second, func(c context.Context) report.Case {
 		return runGoTests(c, rendrRoot, "T7.config.invalid-mtu", "./tun", "^TestConfigValidateRejectsSmallMTU$")
 	})
