@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="660" viewBox="0 0 1200 660" role="img" aria-labelledby="title desc">
+  <title id="title">rendr architecture overview</title>
+  <desc id="desc">Architecture of rendr. An embedder application uses a stable net.Conn or net.PacketConn surface from a local rendr runtime. The runtime exposes a session and flow surface, a policy graph composed of selector, race, and bond targets, and a migration engine. A path fabric of TCP, QUIC, opaque UDP, and gVisor or custom carriers connects the local runtime to a peer rendr runtime, which delivers traffic to an embedder owned egress. TUN ingress and per flow L3 identity are shown as optional capabilities.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .h1 { font: 700 26px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; fill: #0f172a; }
+      .sub { font: 400 13.5px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+      .pt { font: 600 14px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .st { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #475569; letter-spacing: 0.14em; }
+      .body { font: 400 13px ui-sans-serif, system-ui, sans-serif; fill: #334155; }
+      .mu { font: 400 12px ui-sans-serif, system-ui, sans-serif; fill: #64748b; }
+      .mono { font: 500 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1e293b; }
+      .pill { fill: #ffffff; stroke: #cbd5e1; }
+      .pillt { font: 500 12px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+      .panel-strong { fill: #ffffff; stroke: #1f2937; stroke-width: 1.2; }
+      .runtime { fill: #f8fafc; stroke: #1f2937; stroke-width: 1.2; }
+      .acc { fill: #0f172a; }
+      .div { stroke: #e2e8f0; stroke-width: 1; }
+      .data { stroke: #334155; stroke-width: 1.75; fill: none; }
+      .ctl { stroke: #64748b; stroke-width: 1.5; fill: none; stroke-dasharray: 6 4; }
+      .port { fill: #ffffff; stroke: #334155; stroke-width: 1.5; }
+      .lg { font: 400 12px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+    </style>
+    <marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 z" fill="#334155" />
+    </marker>
+    <marker id="ahc" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="660" />
+
+  <!-- HEADER -->
+  <text class="h1" x="40" y="46">rendr architecture</text>
+  <text class="sub" x="40" y="70">Lossless multipath connection migration. A stable net.Conn or net.PacketConn for embedders; the paths underneath can change without surfacing a reset or EOF.</text>
+  <line x1="40" y1="92" x2="1160" y2="92" stroke="#e2e8f0" stroke-width="1" />
+
+  <!-- LEGEND -->
+  <g transform="translate(940,46)">
+    <line x1="0" y1="0" x2="26" y2="0" class="data" />
+    <text class="lg" x="34" y="4">data plane</text>
+    <line x1="130" y1="0" x2="156" y2="0" class="ctl" />
+    <text class="lg" x="164" y="4">control plane</text>
+  </g>
+
+  <!-- ROW 1: embedder surfaces -->
+
+  <rect class="panel-strong" x="40" y="112" width="300" height="84" rx="6" />
+  <text class="pt" x="56" y="136">Embedder application</text>
+  <text class="mu" x="56" y="154">holds rendr supplied connection surface</text>
+  <g transform="translate(56,164)">
+    <rect class="pill" x="0" y="0" width="96" height="22" rx="11" />
+    <text class="pillt" x="48" y="15" text-anchor="middle">net.Conn</text>
+    <rect class="pill" x="106" y="0" width="138" height="22" rx="11" />
+    <text class="pillt" x="175" y="15" text-anchor="middle">net.PacketConn</text>
+  </g>
+
+  <rect class="panel-strong" x="860" y="112" width="300" height="84" rx="6" />
+  <text class="pt" x="876" y="136">Embedder owned egress</text>
+  <text class="mu" x="876" y="154">decides peer side landing for delivered frames</text>
+  <g transform="translate(876,164)">
+    <rect class="pill" x="0" y="0" width="86" height="22" rx="11" />
+    <text class="pillt" x="43" y="15" text-anchor="middle">direct socket</text>
+    <rect class="pill" x="96" y="0" width="92" height="22" rx="11" />
+    <text class="pillt" x="142" y="15" text-anchor="middle">xray outbound</text>
+    <rect class="pill" x="198" y="0" width="70" height="22" rx="11" />
+    <text class="pillt" x="233" y="15" text-anchor="middle">VPN / tun</text>
+  </g>
+
+  <!-- vertical data connectors between row 1 and row 2 -->
+  <line x1="190" y1="196" x2="190" y2="214" class="data" marker-end="url(#ah)" />
+  <line x1="1010" y1="216" x2="1010" y2="198" class="data" marker-end="url(#ah)" />
+
+  <!-- ROW 2: runtime panels and path fabric -->
+
+  <!-- Local rendr runtime -->
+  <rect class="runtime" x="40" y="216" width="300" height="252" rx="6" />
+  <rect class="acc" x="40" y="216" width="4" height="252" />
+  <text class="pt" x="56" y="240">Local rendr runtime</text>
+
+  <text class="st" x="56" y="266">SESSION AND FLOW</text>
+  <text class="mono" x="56" y="286">flow_id</text>
+  <text class="mono" x="140" y="286">InstanceID</text>
+
+  <line x1="56" y1="306" x2="324" y2="306" class="div" />
+
+  <text class="st" x="56" y="326">POLICY GRAPH</text>
+  <g transform="translate(56,336)">
+    <rect class="pill" x="0" y="0" width="80" height="24" rx="12" />
+    <text class="pillt" x="40" y="16" text-anchor="middle">selector</text>
+    <rect class="pill" x="90" y="0" width="60" height="24" rx="12" />
+    <text class="pillt" x="120" y="16" text-anchor="middle">race</text>
+    <rect class="pill" x="160" y="0" width="64" height="24" rx="12" />
+    <text class="pillt" x="192" y="16" text-anchor="middle">bond</text>
+  </g>
+  <text class="mu" x="56" y="384">root target composes one or more targets</text>
+
+  <line x1="56" y1="400" x2="324" y2="400" class="div" />
+
+  <text class="st" x="56" y="420">MIGRATION ENGINE</text>
+  <text class="body" x="56" y="440">attach . death . failover . recovery</text>
+  <text class="mu" x="56" y="458">90s migration budget . zombie protection</text>
+
+  <!-- Peer rendr runtime -->
+  <rect class="runtime" x="860" y="216" width="300" height="252" rx="6" />
+  <rect class="acc" x="860" y="216" width="4" height="252" />
+  <text class="pt" x="876" y="240">Peer rendr runtime</text>
+
+  <text class="st" x="876" y="266">SESSION AND FLOW</text>
+  <text class="mono" x="876" y="286">same flow_id</text>
+  <text class="mono" x="996" y="286">same InstanceID</text>
+
+  <line x1="876" y1="306" x2="1144" y2="306" class="div" />
+
+  <text class="st" x="876" y="326">CAPABILITIES</text>
+  <text class="body" x="876" y="346">l7 . tcp_repair . gvisor . mixed</text>
+  <text class="body" x="876" y="364">packet_mode . quic_datagram</text>
+  <text class="body" x="876" y="382">tun . l3_identity</text>
+
+  <line x1="876" y1="400" x2="1144" y2="400" class="div" />
+
+  <text class="st" x="876" y="420">PEER ROLE</text>
+  <text class="body" x="876" y="440">restores frame order across migrations</text>
+  <text class="mu" x="876" y="458">hands payload to embedder egress</text>
+
+  <!-- PATH FABRIC -->
+  <text class="st" x="600" y="240" text-anchor="middle">PATH FABRIC</text>
+
+  <line x1="340" y1="268" x2="860" y2="268" class="ctl" />
+  <text class="mu" x="600" y="262" text-anchor="middle">control plane: HELLO . MIGRATE_NOTIFY . PATH_QUALITY . BYE</text>
+
+  <line x1="340" y1="310" x2="860" y2="310" class="data" />
+  <circle class="port" cx="340" cy="310" r="3.5" />
+  <circle class="port" cx="860" cy="310" r="3.5" />
+  <text class="mu" x="600" y="304" text-anchor="middle">TCP stream carrier</text>
+
+  <line x1="340" y1="350" x2="860" y2="350" class="data" />
+  <circle class="port" cx="340" cy="350" r="3.5" />
+  <circle class="port" cx="860" cy="350" r="3.5" />
+  <text class="mu" x="600" y="344" text-anchor="middle">QUIC stream or datagram</text>
+
+  <line x1="340" y1="390" x2="860" y2="390" class="data" />
+  <circle class="port" cx="340" cy="390" r="3.5" />
+  <circle class="port" cx="860" cy="390" r="3.5" />
+  <text class="mu" x="600" y="384" text-anchor="middle">opaque UDP flow (8 byte flow_id header)</text>
+
+  <line x1="340" y1="430" x2="860" y2="430" class="data" />
+  <circle class="port" cx="340" cy="430" r="3.5" />
+  <circle class="port" cx="860" cy="430" r="3.5" />
+  <text class="mu" x="600" y="424" text-anchor="middle">gVisor or embedder supplied carrier</text>
+
+  <!-- ROW 3: optional ingress, runtime status, identity -->
+
+  <rect class="panel" x="40" y="492" width="300" height="88" rx="6" />
+  <text class="pt" x="56" y="516">TUN ingress (optional)</text>
+  <text class="mu" x="56" y="536">captures OS IP packets and presents flows</text>
+  <text class="mu" x="56" y="554">not a path policy; coexists with native surface</text>
+
+  <rect class="panel" x="360" y="492" width="480" height="88" rx="6" />
+  <text class="pt" x="376" y="516">Runtime status</text>
+  <g transform="translate(376,527)">
+    <text class="body" x="0" y="14">leaf state</text>
+    <text class="body" x="110" y="14">peer kind</text>
+    <text class="body" x="220" y="14">capability list</text>
+    <text class="body" x="340" y="14">migration counters</text>
+  </g>
+  <text class="mu" x="376" y="568">exposed symmetrically for identity recovery and policy reconciliation</text>
+
+  <rect class="panel" x="860" y="492" width="300" height="88" rx="6" />
+  <text class="pt" x="876" y="516">L3 identity and egress hook</text>
+  <text class="mu" x="876" y="536">optional per flow src and dst tuple</text>
+  <text class="mu" x="876" y="554">egress program owned by the embedder</text>
+
+  <!-- soft connectors from row 3 panels up to runtimes -->
+  <line x1="190" y1="492" x2="190" y2="470" class="ctl" marker-end="url(#ahc)" />
+  <line x1="1010" y1="492" x2="1010" y2="470" class="ctl" marker-end="url(#ahc)" />
+
+  <!-- FOOTER -->
+  <text class="mu" x="40" y="624">Embedders own application protocols, peer discovery, and routing. rendr handles only path lifecycle and migration semantics.</text>
+
+</svg>

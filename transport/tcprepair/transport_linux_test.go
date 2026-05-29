@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/FrankoonG/rendr/transport"
@@ -16,39 +15,46 @@ import (
 
 func newTransportPair(t *testing.T) (*PathConn, *PathConn) {
 	t.Helper()
+	if err := Available(); err != nil {
+		t.Skipf("tcprepair unavailable: %v", err)
+	}
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	var server *PathConn
-	var wg sync.WaitGroup
-	wg.Add(1)
+	type acceptResult struct {
+		conn *PathConn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
 	go func() {
-		defer wg.Done()
 		c, err := ln.Accept()
 		if err != nil {
-			t.Errorf("accept: %v", err)
+			accepted <- acceptResult{err: err}
 			return
 		}
-		server = Wrap(c.(*net.TCPConn))
+		accepted <- acceptResult{conn: Wrap(c.(*net.TCPConn))}
 	}()
 
 	tp := New()
 	pc, err := tp.DialPath(context.Background(), transport.PathSpec{Address: ln.Addr().String()})
 	if err != nil {
+		_ = ln.Close()
+		<-accepted
 		t.Fatal(err)
 	}
-	wg.Wait()
-	if server == nil {
-		t.Fatal("server side never bound")
+	res := <-accepted
+	if res.err != nil {
+		_ = pc.Close()
+		t.Fatalf("accept: %v", res.err)
 	}
 	t.Cleanup(func() {
 		_ = pc.Close()
-		_ = server.Close()
+		_ = res.conn.Close()
 	})
-	return pc.(*PathConn), server
+	return pc.(*PathConn), res.conn
 }
 
 func TestTransportRoundTrip(t *testing.T) {
