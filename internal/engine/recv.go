@@ -3,6 +3,7 @@ package engine
 import (
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -11,11 +12,14 @@ import (
 
 const recvBatchSize = 64
 
+const recvReorderWindowLimit = 16 * 1024
+
 // packetRecvWindowBits bounds the amount of out-of-order packet-mode
-// state we keep as a bitmap instead of one map entry per SEQ. 4 Mi
-// bits ≈ 512 KiB and covers ~42 s at 100k pps, which is comfortably
-// above G3-T4's 30 s runtime.
-const packetRecvWindowBits = 4 << 20
+// state we keep as a bitmap instead of one map entry per SEQ. 32 Mi
+// bits = 4 MiB and covers ~335 s at 100k pps, enough for the 5 min
+// G3-T4 gate plus tail drain without falling back to recvQueue map
+// growth when one packet gap pins expectedRecvSeq.
+const packetRecvWindowBits = 32 << 20
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
 // hold the payload bytes; ctrl frames hold the flags so the in-order
@@ -309,12 +313,16 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 }
 
 func (e *Engine) notePeerAck(nextSeq uint64) {
+	if nextSeq > atomic.LoadUint64(&e.sendSeq) {
+		return
+	}
 	for {
 		cur := e.sendAckNext.Load()
 		if nextSeq <= cur {
 			return
 		}
 		if e.sendAckNext.CompareAndSwap(cur, nextSeq) {
+			e.markPayload()
 			return
 		}
 	}
@@ -554,6 +562,14 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		return false
 	}
 
+	if hdr.Seq != e.expectedRecvSeq && len(e.recvQueue) >= recvReorderWindowLimit {
+		go func() {
+			e.setCloseErr(ErrRecvWindowExceeded)
+			_ = e.Close()
+		}()
+		return false
+	}
+
 	e.recvQueue[hdr.Seq] = recvItem{
 		isCtrl:  hdr.Type == proto.FrameCtrl,
 		flags:   hdr.Flags,
@@ -650,16 +666,20 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 	}
 }
 
+func (e *Engine) markPayload() {
+	e.zombieMu.Lock()
+	e.zombieLeft = e.limits.ZombieMaxMigrations
+	e.zombieLastMig = time.Time{}
+	e.zombieMu.Unlock()
+}
+
 // markPayloadLocked refreshes the zombie counter when payload makes
-// it through. Caller holds recvMu (and we serialise zombie counter
-// access via zombieMu separately).
+// it through. Caller holds recvMu for receive-order state; zombie
+// state remains independently serialised by zombieMu.
 //
 // Resetting zombieLastMig to zero is intentional: after payload, the
 // NEXT migration will compute "cooldown expired" as false and start
 // from a fresh full counter.
 func (e *Engine) markPayloadLocked() {
-	e.zombieMu.Lock()
-	e.zombieLeft = e.limits.ZombieMaxMigrations
-	e.zombieLastMig = time.Time{}
-	e.zombieMu.Unlock()
+	e.markPayload()
 }

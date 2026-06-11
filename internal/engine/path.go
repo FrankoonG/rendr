@@ -37,8 +37,8 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 		return
 	}
 	var redistribute [][]byte
-	if e.mode.Load() == dispatchBond && cause != transport.CauseCleanClose {
-		redistribute = slot.bondSendHistorySnapshot(e.sendAckNext.Load())
+	if cause != transport.CauseCleanClose && !e.Packetized() {
+		redistribute = e.sendHistorySnapshot(e.sendAckNext.Load())
 	}
 	slot.closeQuit()
 	delete(e.paths, id)

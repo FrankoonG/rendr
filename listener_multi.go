@@ -96,21 +96,20 @@ func (l *MultiListener) start(spec ListenSpec) error {
 
 func (l *MultiListener) Accept(ctx context.Context) (Conn, error) {
 	select {
+	case <-l.closed:
+		return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
+	default:
+	}
+	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case c, ok := <-l.accept:
 		if !ok {
-			l.acceptMu.Lock()
-			err := l.acceptErr
-			l.acceptMu.Unlock()
-			if err == nil {
-				err = net.ErrClosed
-			}
-			return nil, err
+			return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
 		}
 		return c, nil
 	case <-l.closed:
-		return nil, net.ErrClosed
+		return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
 	}
 }
 

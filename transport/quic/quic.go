@@ -222,19 +222,19 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	if p.dead.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, net.ErrClosed
 	}
 
 	var lp [LengthPrefixSize]byte
 	binary.BigEndian.PutUint16(lp[:], uint16(len(frame)))
 	if _, err := p.stream.Write(lp[:]); err != nil {
 		p.declareDeath(err)
-		return 0, io.ErrClosedPipe
+		return 0, net.ErrClosed
 	}
 	n, err := p.stream.Write(frame)
 	if err != nil {
 		p.declareDeath(err)
-		return n, io.ErrClosedPipe
+		return n, net.ErrClosed
 	}
 	return n, nil
 }
@@ -297,7 +297,7 @@ func (p *PathConn) RemoteAddr() string {
 // the engine can migrate.
 func (p *PathConn) watchConn() {
 	<-p.conn.Context().Done()
-	cause := p.conn.Context().Err()
+	cause := context.Cause(p.conn.Context())
 	if cause == context.Canceled {
 		cause = nil
 	}
@@ -328,5 +328,5 @@ func (p *PathConn) swallow(err error) error {
 	if errors.Is(err, io.EOF) && p.byeSeen.Load() {
 		return io.EOF
 	}
-	return io.ErrClosedPipe
+	return net.ErrClosed
 }

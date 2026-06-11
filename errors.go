@@ -22,6 +22,7 @@ var (
 	ErrPeerProtoVersion        = engine.ErrPeerProtoVersion
 	ErrLastPath                = engine.ErrLastPath
 	ErrPacketTooLarge          = engine.ErrPacketTooLarge
+	ErrRecvWindowExceeded      = engine.ErrRecvWindowExceeded
 
 	// ErrReadDeadlineExceeded is the sentinel returned by Read /
 	// ReadFrom when a SetReadDeadline-set deadline elapses before
@@ -36,5 +37,4 @@ var (
 	// ErrNotImplemented is a build-stage placeholder used by API
 	// surfaces whose implementations land in later milestones.
 	ErrNotImplemented = errors.New("rendr: not implemented in this milestone")
-
 )

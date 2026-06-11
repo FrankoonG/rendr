@@ -95,6 +95,8 @@ type Engine struct {
 	sendMu      sync.Mutex
 	sendSeq     uint64
 	sendAckNext atomic.Uint64
+	sendHistMu  sync.Mutex
+	sendHist    sendHistory
 
 	// Recv state: reorder buffer keyed by SEQ. expectedRecvSeq is the
 	// next SEQ the application should observe.
@@ -451,12 +453,9 @@ func (e *Engine) Paths() []transport.PathInfo {
 
 // Migrate switches the active path to id. Returns an error if id is
 // unknown or already dead. The new path becomes the destination of
-// all subsequent sends. In-flight frames on the previous path are
-// not retransmitted here; loss-tolerant paths (e.g. mid-stream
-// migrations on G4) are handled by the recv-side reorder buffer
-// requesting any missing SEQs separately (M1 leaves that to a future
-// commit; the test harness uses planned migration which is
-// loss-safe).
+// all subsequent sends. Unacked frames from the bounded send history
+// are replayed on the new active path; recv-side dedup makes already
+// delivered frames harmless while filling gaps left on the old path.
 func (e *Engine) Migrate(id uint32) error {
 	return e.migrate(id, true, "explicit")
 }
@@ -493,6 +492,10 @@ func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 	_ = hdr.Encode(frame[:proto.HeaderSize])
 	copy(frame[proto.HeaderSize:], payload)
 	pc := slot.conn
+	var replay [][]byte
+	if !e.Packetized() {
+		replay = e.sendHistorySnapshot(e.sendAckNext.Load())
+	}
 	e.pathsMu.Unlock()
 
 	// Hook fan-out and the MIGRATE_NOTIFY send happen AFTER unlock so
@@ -505,7 +508,12 @@ func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 	}
 	e.fireMigrateHooks(oldID, id, cause)
 	go func() {
-		_, _ = pc.Write(frame)
+		if _, err := pc.Write(frame); err == nil && !e.Packetized() {
+			e.rememberSendFrame(frame)
+		}
+		if len(replay) > 0 {
+			e.redistributeFrames(replay)
+		}
 	}()
 	return nil
 }
@@ -981,6 +989,9 @@ func (e *Engine) setCloseErr(err error) {
 	e.closeMu.Lock()
 	if e.closeErr == nil {
 		e.closeErr = err
+		if debugPathDeath {
+			fmt.Printf("[rendr-engine] closeErr side=%v flow=%x err=%v\n", e.side, e.flowID, err)
+		}
 	}
 	e.closeMu.Unlock()
 }

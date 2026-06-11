@@ -46,7 +46,7 @@ func (e *Engine) SendPacket(buf []byte) error {
 	if len(buf) > MaxPayload {
 		return ErrPacketTooLarge
 	}
-	return e.sendFrame(proto.FrameData, 0, buf)
+	return e.sendFrameWithHistory(proto.FrameData, 0, buf, false)
 }
 
 // SendPolicyRequest asks the peer to update its sender policy for this flow.
@@ -71,7 +71,9 @@ func (e *Engine) SendPolicyRequest(mode uint32, activeName string, scopeNames []
 func (e *Engine) SendBye(reason proto.ByeReason) error {
 	payload := proto.ByePayload{Reason: reason}.Encode()
 
-	e.sendMu.Lock()
+	if !e.sendMu.TryLock() {
+		return net.ErrClosed
+	}
 	defer e.sendMu.Unlock()
 
 	if e.isClosed() {
@@ -111,6 +113,10 @@ func (e *Engine) SendBye(reason proto.ByeReason) error {
 // path. Frame type may be Data or Ctrl; for Ctrl, flags encodes the
 // CtrlCode in its low 8 bits.
 func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) error {
+	return e.sendFrameWithHistory(t, flags, payload, true)
+}
+
+func (e *Engine) sendFrameWithHistory(t proto.FrameType, flags uint16, payload []byte, remember bool) error {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
@@ -131,7 +137,13 @@ func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) erro
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
-	return e.dispatch(frame)
+	if err := e.dispatch(frame); err != nil {
+		return err
+	}
+	if remember {
+		e.rememberSendFrame(frame)
+	}
+	return nil
 }
 
 // dispatch writes a fully-built frame on the path(s) appropriate to
@@ -310,7 +322,7 @@ func (e *Engine) dispatchBond(frame []byte) error {
 	}
 }
 
-func (e *Engine) redistributeBondFrames(frames [][]byte) {
+func (e *Engine) redistributeFrames(frames [][]byte) {
 	if len(frames) == 0 || e.isClosed() {
 		return
 	}
@@ -325,6 +337,10 @@ func (e *Engine) redistributeBondFrames(frames [][]byte) {
 	}
 }
 
+func (e *Engine) redistributeBondFrames(frames [][]byte) {
+	e.redistributeFrames(frames)
+}
+
 func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 	for {
 		e.pathsMu.Lock()
@@ -332,6 +348,7 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 			e.pathsMu.Unlock()
 			return net.ErrClosed
 		}
+		activeID := e.activeID
 		ids := make([]uint32, 0, len(e.paths))
 		for id := range e.paths {
 			if !e.dispatchScopeAllowsLocked(id) {
@@ -348,12 +365,18 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 				ids[j-1], ids[j] = ids[j], ids[j-1]
 			}
 		}
-		weights, totalWeight := e.bondWeightsLocked(ids)
-		start := bondWeightedIndex(weights, totalWeight, e.bondCursor)
-		e.bondCursor++
+		if activeID != 0 {
+			for i, id := range ids {
+				if id == activeID {
+					copy(ids[1:i+1], ids[:i])
+					ids[0] = id
+					break
+				}
+			}
+		}
 		slots := make([]*pathSlot, 0, len(ids))
-		for i := 0; i < len(ids); i++ {
-			slots = append(slots, e.paths[ids[(start+i)%len(ids)]])
+		for _, id := range ids {
+			slots = append(slots, e.paths[id])
 		}
 		e.pathsMu.Unlock()
 

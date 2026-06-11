@@ -347,6 +347,7 @@ func TestSentinelErrorsAreMatchable(t *testing.T) {
 		{"ErrPeerProtoVersion", ErrPeerProtoVersion, ErrPeerProtoVersion},
 		{"ErrLastPath", ErrLastPath, ErrLastPath},
 		{"ErrPacketTooLarge", ErrPacketTooLarge, ErrPacketTooLarge},
+		{"ErrRecvWindowExceeded", ErrRecvWindowExceeded, ErrRecvWindowExceeded},
 		{"ErrReadDeadlineExceeded", ErrReadDeadlineExceeded, ErrReadDeadlineExceeded},
 	}
 	for _, c := range cases {

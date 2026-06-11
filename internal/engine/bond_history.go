@@ -4,6 +4,54 @@ import "github.com/FrankoonG/rendr/proto"
 
 const bondRedistributeWindow = 256
 
+const sendHistoryWindow = 256
+
+type sendHistory struct {
+	ring [][]byte
+	next int
+	full bool
+}
+
+func (e *Engine) rememberSendFrame(frame []byte) {
+	cp := append([]byte(nil), frame...)
+
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+
+	if len(e.sendHist.ring) < sendHistoryWindow {
+		e.sendHist.ring = append(e.sendHist.ring, cp)
+		return
+	}
+	e.sendHist.ring[e.sendHist.next] = cp
+	e.sendHist.next = (e.sendHist.next + 1) % sendHistoryWindow
+	e.sendHist.full = true
+}
+
+func (e *Engine) sendHistorySnapshot(ackNext uint64) [][]byte {
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+
+	if len(e.sendHist.ring) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(e.sendHist.ring))
+	if !e.sendHist.full {
+		for _, frame := range e.sendHist.ring {
+			if !bondFrameAcked(frame, ackNext) {
+				out = append(out, append([]byte(nil), frame...))
+			}
+		}
+		return out
+	}
+	for i := 0; i < len(e.sendHist.ring); i++ {
+		idx := (e.sendHist.next + i) % len(e.sendHist.ring)
+		if !bondFrameAcked(e.sendHist.ring[idx], ackNext) {
+			out = append(out, append([]byte(nil), e.sendHist.ring[idx]...))
+		}
+	}
+	return out
+}
+
 func (s *pathSlot) rememberBondFrame(frame []byte) {
 	cp := append([]byte(nil), frame...)
 

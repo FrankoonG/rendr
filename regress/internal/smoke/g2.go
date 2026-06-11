@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"time"
 
@@ -114,7 +115,7 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 		buf := make([]byte, 12)
 		for {
 			if _, err := io.ReadFull(server, buf); err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 					echoErr <- nil
 					return
 				}

@@ -69,7 +69,7 @@ func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
 // semantics) and io.ErrShortBuffer is returned.
 func (p *datagramPathConn) Read(buf []byte) (int, error) {
 	if p.dead.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, net.ErrClosed
 	}
 	data, err := p.conn.ReceiveDatagram(context.Background())
 	if err != nil {
@@ -94,7 +94,7 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	if p.dead.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, net.ErrClosed
 	}
 	if err := p.conn.SendDatagram(frame); err != nil {
 		p.declareDeath(err)
@@ -160,7 +160,7 @@ func (p *datagramPathConn) RemoteAddr() string {
 
 func (p *datagramPathConn) watchConn() {
 	<-p.conn.Context().Done()
-	cause := p.conn.Context().Err()
+	cause := context.Cause(p.conn.Context())
 	if cause == context.Canceled {
 		cause = nil
 	}

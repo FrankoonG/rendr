@@ -66,21 +66,20 @@ type gvisorListener struct {
 
 func (l *gvisorListener) Accept(ctx context.Context) (Conn, error) {
 	select {
+	case <-l.closed:
+		return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
+	default:
+	}
+	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case c, ok := <-l.accept:
 		if !ok {
-			l.acceptMu.Lock()
-			err := l.acceptErr
-			l.acceptMu.Unlock()
-			if err == nil {
-				err = net.ErrClosed
-			}
-			return nil, err
+			return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
 		}
 		return c, nil
 	case <-l.closed:
-		return nil, net.ErrClosed
+		return nil, listenerAcceptErr(&l.acceptMu, &l.acceptErr)
 	}
 }
 
@@ -106,14 +105,20 @@ func (l *gvisorListener) acceptLoop() {
 				return
 			default:
 			}
-			l.acceptMu.Lock()
-			l.acceptErr = err
-			l.acceptMu.Unlock()
-			close(l.accept)
+			l.fail(err)
 			return
 		}
 		go l.serveIncoming(pc)
 	}
+}
+
+func (l *gvisorListener) fail(err error) {
+	l.acceptMu.Lock()
+	if l.acceptErr == nil {
+		l.acceptErr = err
+	}
+	l.acceptMu.Unlock()
+	_ = l.Close()
 }
 
 func (l *gvisorListener) serveIncoming(pc transport.PathConn) {

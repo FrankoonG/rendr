@@ -22,4 +22,9 @@ var (
 	// and so a packet that does not fit is rejected rather than
 	// silently fragmented.
 	ErrPacketTooLarge = errors.New("rendr: packet exceeds MaxPayload")
+
+	// ErrRecvWindowExceeded is recorded when the peer sends frames so
+	// far ahead of the current receive head that the bounded reorder
+	// buffer would otherwise grow without limit.
+	ErrRecvWindowExceeded = errors.New("rendr: receive reorder window exceeded")
 )
