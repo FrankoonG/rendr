@@ -146,11 +146,11 @@ func validateContracts(contracts []packageContract) error {
 }
 
 func listPackages(ctx context.Context, dir string) ([]string, error) {
-	out, err := runCommandCapture(ctx, dir, "go", "list", "./...")
+	stdout, stderr, err := runCommandOutput(ctx, dir, "go", "list", "./...")
 	if err != nil {
-		return nil, fmt.Errorf("go list ./...: %w\n%s", err, outputExcerpt(out))
+		return nil, fmt.Errorf("go list ./...: %w\n%s", err, outputExcerpt(stderr))
 	}
-	return strings.Fields(string(out)), nil
+	return strings.Fields(string(stdout)), nil
 }
 
 func listPackageTests(ctx context.Context, dir, packageArgument string, race bool) ([]string, error) {
@@ -506,6 +506,25 @@ func runCommandCapture(ctx context.Context, dir, name string, args ...string) ([
 		}
 	}
 	return buffer.Bytes(), err
+}
+
+func runCommandOutput(ctx context.Context, dir, name string, args ...string) ([]byte, []byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.WaitDelay = 10 * time.Second
+	stdout := &limitedBuffer{limit: maxOracleOutputBytes}
+	stderr := &limitedBuffer{limit: maxOracleOutputBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stdout.truncated || stderr.truncated {
+		if err == nil {
+			err = fmt.Errorf("command output exceeded %d bytes", maxOracleOutputBytes)
+		} else {
+			err = fmt.Errorf("%w; command output exceeded %d bytes", err, maxOracleOutputBytes)
+		}
+	}
+	return stdout.Bytes(), stderr.Bytes(), err
 }
 
 type limitedBuffer struct {

@@ -1,7 +1,9 @@
 package tier1
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -86,6 +88,12 @@ func TestRegressUnitRunsOnlyFastSmokeOracles(t *testing.T) {
 }
 
 func TestValidateTestInventoryRejectsNonexistentAndRenamedTests(t *testing.T) {
+	if os.Getenv("RENDR_TIER1_STDERR_HELPER") == "1" {
+		fmt.Fprintln(os.Stdout, "example/module/package")
+		fmt.Fprintln(os.Stderr, "go: downloading example/dependency")
+		return
+	}
+
 	tests := []struct {
 		name     string
 		expected []string
@@ -104,6 +112,25 @@ func TestValidateTestInventoryRejectsNonexistentAndRenamedTests(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("command stdout is isolated from diagnostics", func(t *testing.T) {
+		t.Setenv("RENDR_TIER1_STDERR_HELPER", "1")
+		stdout, stderr, err := runCommandOutput(
+			context.Background(),
+			"",
+			os.Args[0],
+			"-test.run=^TestValidateTestInventoryRejectsNonexistentAndRenamedTests$",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(stdout); !strings.Contains(got, "example/module/package") || strings.Contains(got, "go: downloading") {
+			t.Fatalf("stdout=%q", strings.TrimSpace(got))
+		}
+		if got := strings.TrimSpace(string(stderr)); got != "go: downloading example/dependency" {
+			t.Fatalf("stderr=%q", got)
+		}
+	})
 }
 
 func TestExpectedTestSkipIsNotPass(t *testing.T) {
