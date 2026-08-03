@@ -8,6 +8,7 @@ import (
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
 var orderedCaseIDs = []string{
@@ -117,6 +118,21 @@ func TestSelectCaseDefs(t *testing.T) {
 				t.Fatalf("selected IDs = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSmokeReportCasePreservesInvalidAndEvidence(t *testing.T) {
+	rc := smokeReportCase("T5.synthetic", smoke.Result{
+		Duration:      time.Second,
+		InvalidReason: "stimulus missing",
+		Detail:        map[string]any{"migrations": 0, "sha256_match": false},
+	})
+	if rc.InvalidReason != "stimulus missing" || rc.Failure != "" {
+		t.Fatalf("outcome=%+v want invalid-only", rc)
+	}
+	want := map[string]string{"migrations": "0", "sha256_match": "false"}
+	if !reflect.DeepEqual(rc.Evidence, want) {
+		t.Fatalf("evidence=%v want=%v", rc.Evidence, want)
 	}
 }
 

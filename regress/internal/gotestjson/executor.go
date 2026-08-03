@@ -27,6 +27,11 @@ type Request struct {
 	Expected    []Expectation
 	TestTimeout time.Duration
 	Env         []string
+	// CommandPrefix wraps the go invocation without a shell. For example,
+	// []string{"setpriv", "--bounding-set=-net_admin"} executes
+	// "setpriv ... go test -json ..." while preserving JSON validation and
+	// process-group cancellation.
+	CommandPrefix []string
 }
 
 // Executor runs go test and parses its JSON stream. Zero-valued fields use
@@ -60,7 +65,10 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		binary = "go"
 	}
 	args := buildArgs(request)
-	command := append([]string{binary}, args...)
+	command := make([]string, 0, len(request.CommandPrefix)+1+len(args))
+	command = append(command, request.CommandPrefix...)
+	command = append(command, binary)
+	command = append(command, args...)
 	maxJSONBytes := valueOrDefault(e.MaxJSONBytes, DefaultMaxJSONBytes)
 	waitDelay := e.WaitDelay
 	if waitDelay == 0 {
@@ -71,7 +79,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 	if factory == nil {
 		factory = exec.CommandContext
 	}
-	cmd := factory(ctx, binary, args...)
+	cmd := factory(ctx, command[0], command[1:]...)
 	cmd.Dir = request.Dir
 	if request.Env != nil {
 		cmd.Env = append(os.Environ(), request.Env...)
@@ -134,6 +142,11 @@ func validateRequest(ctx context.Context, request Request, executor Executor) []
 	for _, env := range request.Env {
 		if index := strings.IndexByte(env, '='); index <= 0 {
 			issues = append(issues, Issue{Code: IssueInvalidConfig, Detail: fmt.Sprintf("invalid environment entry %q", env)})
+		}
+	}
+	for _, arg := range request.CommandPrefix {
+		if strings.TrimSpace(arg) == "" {
+			issues = append(issues, Issue{Code: IssueInvalidConfig, Detail: "CommandPrefix entries must not be empty"})
 		}
 	}
 	issues = append(issues, validateParserInput(strings.NewReader(""), request.Expected, executor.Parser)...)

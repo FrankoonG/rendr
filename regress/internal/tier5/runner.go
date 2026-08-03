@@ -4,10 +4,7 @@ package tier5
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
@@ -37,7 +34,7 @@ var caseDefs = []caseDef{
 				return report.Case{Name: name, Tier: "T5", Failure: err.Error()}
 			}
 			r := smoke.RunG1TCPRepairSameTuple(ctx, smoke.G1TCPRepairOpts{Size: 100 << 20, Migrations: 3})
-			return report.Case{Name: name, Tier: "T5", Duration: r.Duration, Failure: r.Failure}
+			return smokeReportCase(name, r)
 		},
 	},
 	{
@@ -48,7 +45,7 @@ var caseDefs = []caseDef{
 				return report.Case{Name: name, Tier: "T5", Failure: err.Error()}
 			}
 			r := smoke.RunG1(ctx, smoke.G1Opts{Size: 30 << 20, Migrations: 3, Paths: 2, Transport: "gvisor"})
-			return report.Case{Name: name, Tier: "T5", Duration: r.Duration, Failure: r.Failure}
+			return smokeReportCase(name, r)
 		},
 	},
 	{spec: manifest.RequiredWithBudget("T5.3-tcprepair-unprivileged", "T5", 2*time.Minute), run: probeUnprivileged},
@@ -109,6 +106,24 @@ func addLinuxOnlySkip(suite *report.Suite, def caseDef) {
 	suite.Add(report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: "Linux only"})
 }
 
+func smokeReportCase(name string, result smoke.Result) report.Case {
+	evidence := make(map[string]string, len(result.Detail))
+	for key, value := range result.Detail {
+		evidence[key] = fmt.Sprint(value)
+	}
+	if len(evidence) == 0 {
+		evidence = nil
+	}
+	return report.Case{
+		Name:          name,
+		Tier:          "T5",
+		Duration:      result.Duration,
+		Failure:       result.Failure,
+		InvalidReason: result.InvalidReason,
+		Evidence:      evidence,
+	}
+}
+
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
 	fmt.Printf("  > T5/%s (budget %s) — start\n", name, budget)
 	cctx, cancel := context.WithTimeout(ctx, budget)
@@ -130,7 +145,9 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 			Failure:  "case exceeded T5 budget: " + cctx.Err().Error(),
 		}
 	}
-	if rc.Failure != "" {
+	if rc.InvalidReason != "" {
+		fmt.Printf("  > T5/%s (took %s) — INVALID: %s\n", name, rc.Duration, rc.InvalidReason)
+	} else if rc.Failure != "" {
 		fmt.Printf("  > T5/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
 	} else if rc.SkipReason != "" {
 		fmt.Printf("  > T5/%s — SKIP: %s\n", name, rc.SkipReason)
@@ -138,117 +155,4 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 		fmt.Printf("  > T5/%s (took %s) — OK\n", name, rc.Duration)
 	}
 	suite.Add(rc)
-}
-
-func probeUnprivileged(ctx context.Context, rendrRoot string) report.Case {
-	const name = "T5.3-tcprepair-unprivileged"
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
-	}
-	if _, err := os.Stat(rendrRoot); err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
-	}
-	cmd := exec.CommandContext(
-		ctx,
-		"setpriv",
-		"--bounding-set=-net_admin",
-		"--inh-caps=-net_admin",
-		"--ambient-caps=-net_admin",
-		"bash", "-lc",
-		fmt.Sprintf("cd %s && /usr/local/go/bin/go test ./transport/tcprepair -run TestAvailableExpectation -count=1", rendrRoot),
-	)
-	cmd.Env = append(os.Environ(),
-		"RENDR_EXPECT_TCPREPAIR=unavailable",
-		"GOCACHE=/tmp/go-build-nocap",
-		"GOMODCACHE=/tmp/go-mod-nocap",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
-	}
-	return report.Case{Name: name, Tier: "T5"}
-}
-
-func probeGVisorUnprivileged(ctx context.Context, rendrRoot string) report.Case {
-	const name = "T5.4-gvisor-unprivileged"
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
-	}
-	if _, err := os.Stat(rendrRoot); err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
-	}
-	cmd := exec.CommandContext(
-		ctx,
-		"setpriv",
-		"--bounding-set=-net_admin",
-		"--inh-caps=-net_admin",
-		"--ambient-caps=-net_admin",
-		"bash", "-lc",
-		fmt.Sprintf("cd %s/regress && /usr/local/go/bin/go test ./internal/smoke -run TestRunG1GVisor -count=1", rendrRoot),
-	)
-	cmd.Env = append(os.Environ(),
-		"GOCACHE=/tmp/go-build-gvisor-nocap",
-		"GOMODCACHE=/tmp/go-mod-gvisor-nocap",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
-	}
-	return report.Case{Name: name, Tier: "T5"}
-}
-
-func probeTCPRepairGVisorFallbackUnprivileged(ctx context.Context, rendrRoot string) report.Case {
-	const name = "T5.5-tcprepair-gvisor-fallback-unprivileged"
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
-	}
-	if _, err := os.Stat(rendrRoot); err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
-	}
-	cmd := exec.CommandContext(
-		ctx,
-		"setpriv",
-		"--bounding-set=-net_admin",
-		"--inh-caps=-net_admin",
-		"--ambient-caps=-net_admin",
-		"bash", "-lc",
-		fmt.Sprintf("cd %s/regress && /usr/local/go/bin/go test ./internal/smoke -run TestTCPRepairUnavailableFallsBackToGVisor -count=1", rendrRoot),
-	)
-	cmd.Env = append(os.Environ(),
-		"GOCACHE=/tmp/go-build-tcprepair-gvisor-fallback-nocap",
-		"GOMODCACHE=/tmp/go-mod-tcprepair-gvisor-fallback-nocap",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
-	}
-	return report.Case{Name: name, Tier: "T5"}
-}
-
-func probeGVisorPacketCarrierUnprivileged(ctx context.Context, rendrRoot string) report.Case {
-	const name = "T5.6-gvisor-packet-carrier-unprivileged"
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
-	}
-	if _, err := os.Stat(rendrRoot); err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
-	}
-	cmd := exec.CommandContext(
-		ctx,
-		"setpriv",
-		"--bounding-set=-net_admin",
-		"--inh-caps=-net_admin",
-		"--ambient-caps=-net_admin",
-		"bash", "-lc",
-		fmt.Sprintf("cd %s/regress && /usr/local/go/bin/go test ./internal/smoke -run TestRunG1GVisorPacketCarrier -count=1", rendrRoot),
-	)
-	cmd.Env = append(os.Environ(),
-		"GOCACHE=/tmp/go-build-gvisor-packet-nocap",
-		"GOMODCACHE=/tmp/go-mod-gvisor-packet-nocap",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return report.Case{Name: name, Tier: "T5", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
-	}
-	return report.Case{Name: name, Tier: "T5"}
 }
