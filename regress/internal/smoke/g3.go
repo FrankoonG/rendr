@@ -465,7 +465,21 @@ sendLoop:
 	migrations := admin.MigrationCount() - startMig
 	pathWriters := 0
 	var wireWrites uint64
+	var ingressQueueHWMMax uint64
+	var ingressQueueCapacityMin uint64
+	ingressQueueSaturatedPaths := 0
 	for _, path := range admin.Stats().Paths {
+		if queue := path.IngressQueue; queue.Capacity > 0 {
+			if queue.HighWater > ingressQueueHWMMax {
+				ingressQueueHWMMax = queue.HighWater
+			}
+			if ingressQueueCapacityMin == 0 || queue.Capacity < ingressQueueCapacityMin {
+				ingressQueueCapacityMin = queue.Capacity
+			}
+			if queue.HighWater >= queue.Capacity {
+				ingressQueueSaturatedPaths++
+			}
+		}
 		before := pathWritesBefore[path.ID]
 		if path.Writes <= before {
 			continue
@@ -483,33 +497,36 @@ sendLoop:
 	missing := summarizeG3Missing(recvBmp, sent, migrationSequences, opts.PPS)
 
 	detail := map[string]any{
-		"target_pps":            opts.PPS,
-		"pps_sent":              ppsSent,
-		"pps_received":          ppsReceived,
-		"send_elapsed_ms":       float64(sendElapsed) / float64(time.Millisecond),
-		"sent":                  sent,
-		"received":              received,
-		"loss_pct":              lossPct,
-		"loss_budget_pct":       opts.LossPct,
-		"migration_attempts":    migrationAttempts,
-		"migration_errors":      migrationErrors,
-		"migration_sequences":   formatG3Sequences(migrationSequences),
-		"migrations":            migrations,
-		"latency_samples":       len(gotLat),
-		"p50_ms":                float64(p50) / float64(time.Millisecond),
-		"p95_ms":                float64(p95) / float64(time.Millisecond),
-		"p99_ms":                float64(p99) / float64(time.Millisecond),
-		"max_ms":                float64(maxN) / float64(time.Millisecond),
-		"malformed_packets":     receivedOutcome.malformedPackets,
-		"corrupt_packets":       receivedOutcome.corruptPackets,
-		"duplicate_packets":     receivedOutcome.duplicatePackets,
-		"out_of_range_packets":  receivedOutcome.outOfRangePackets,
-		"path_writers":          pathWriters,
-		"wire_writes":           wireWrites,
-		"missing_packets":       missing.Count,
-		"missing_range_count":   missing.RangeCount,
-		"missing_range_sample":  missing.RangeSample,
-		"missing_range_omitted": missing.OmittedRanges,
+		"target_pps":                    opts.PPS,
+		"pps_sent":                      ppsSent,
+		"pps_received":                  ppsReceived,
+		"send_elapsed_ms":               float64(sendElapsed) / float64(time.Millisecond),
+		"sent":                          sent,
+		"received":                      received,
+		"loss_pct":                      lossPct,
+		"loss_budget_pct":               opts.LossPct,
+		"migration_attempts":            migrationAttempts,
+		"migration_errors":              migrationErrors,
+		"migration_sequences":           formatG3Sequences(migrationSequences),
+		"migrations":                    migrations,
+		"latency_samples":               len(gotLat),
+		"p50_ms":                        float64(p50) / float64(time.Millisecond),
+		"p95_ms":                        float64(p95) / float64(time.Millisecond),
+		"p99_ms":                        float64(p99) / float64(time.Millisecond),
+		"max_ms":                        float64(maxN) / float64(time.Millisecond),
+		"malformed_packets":             receivedOutcome.malformedPackets,
+		"corrupt_packets":               receivedOutcome.corruptPackets,
+		"duplicate_packets":             receivedOutcome.duplicatePackets,
+		"out_of_range_packets":          receivedOutcome.outOfRangePackets,
+		"path_writers":                  pathWriters,
+		"wire_writes":                   wireWrites,
+		"ingress_queue_hwm_max":         ingressQueueHWMMax,
+		"ingress_queue_capacity_min":    ingressQueueCapacityMin,
+		"ingress_queue_saturated_paths": ingressQueueSaturatedPaths,
+		"missing_packets":               missing.Count,
+		"missing_range_count":           missing.RangeCount,
+		"missing_range_sample":          missing.RangeSample,
+		"missing_range_omitted":         missing.OmittedRanges,
 		"missing_nearest_migration_distance_packets": missing.NearestMigrationDistancePackets,
 		"missing_nearest_migration_offset_packets":   missing.NearestMigrationOffsetPackets,
 		"missing_before_migration_window_packets":    missing.BeforeMigrationWindowPackets,

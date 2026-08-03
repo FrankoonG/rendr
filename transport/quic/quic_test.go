@@ -249,6 +249,10 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 	if !bytes.Equal(ownedFrame, ownedPayload) {
 		t.Fatalf("owned frame mismatch: got %q want %q", ownedFrame, ownedPayload)
 	}
+	queue := server.IngressQueueStats()
+	if queue.Capacity != datagramIngressQueueLen || queue.HighWater == 0 || queue.HighWater > queue.Capacity {
+		t.Fatalf("ingress queue stats = %+v", queue)
+	}
 
 	// Counter sanity.
 	if server.Reads() < 1 || client.Reads() < 1 {

@@ -52,6 +52,10 @@ type PathInfo struct {
 	// LastRecvAt to distinguish "I'm sending but peer is silent"
 	// from "peer is sending but I'm idle".
 	LastSendAt time.Time
+	// IngressQueue reports a transport-owned receive queue when the path
+	// implements IngressQueueObserver. It is zero for transports without a
+	// distinct observable ingress queue.
+	IngressQueue IngressQueueStats
 }
 
 // PathQuality is the most recent measurement of one path.

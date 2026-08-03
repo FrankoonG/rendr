@@ -47,8 +47,9 @@ type datagramPathConn struct {
 	qualityMu sync.RWMutex
 	quality   transport.PathQuality
 
-	reads  atomic.Uint64
-	writes atomic.Uint64
+	reads   atomic.Uint64
+	writes  atomic.Uint64
+	recvHWM atomic.Uint64
 
 	dead     atomic.Bool
 	byeSeen  atomic.Bool
@@ -121,7 +122,24 @@ func (p *datagramPathConn) pumpDatagrams() {
 		}
 		select {
 		case p.recvQ <- data:
+			updateAtomicMax(&p.recvHWM, uint64(len(p.recvQ)))
 		case <-p.conn.Context().Done():
+			return
+		}
+	}
+}
+
+func (p *datagramPathConn) IngressQueueStats() transport.IngressQueueStats {
+	return transport.IngressQueueStats{
+		Depth:     uint64(len(p.recvQ)),
+		HighWater: p.recvHWM.Load(),
+		Capacity:  uint64(cap(p.recvQ)),
+	}
+}
+
+func updateAtomicMax(value *atomic.Uint64, candidate uint64) {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
 			return
 		}
 	}

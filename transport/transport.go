@@ -79,3 +79,18 @@ type PathConn interface {
 type OwnedFrameReader interface {
 	ReadOwnedFrame() ([]byte, error)
 }
+
+// IngressQueueStats is a transport-owned receive queue snapshot. A zero
+// Capacity means the transport has no observable ingress queue.
+type IngressQueueStats struct {
+	Depth     uint64
+	HighWater uint64
+	Capacity  uint64
+}
+
+// IngressQueueObserver is an optional PathConn observability extension used
+// to distinguish transport ingress saturation from engine or application
+// loss. It must be safe to call concurrently with Read and Close.
+type IngressQueueObserver interface {
+	IngressQueueStats() IngressQueueStats
+}

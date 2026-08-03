@@ -439,6 +439,9 @@ func (e *Engine) Paths() []transport.PathInfo {
 			pi.Reads = rw.Reads()
 			pi.Writes = rw.Writes()
 		}
+		if observer, ok := s.conn.(transport.IngressQueueObserver); ok {
+			pi.IngressQueue = observer.IngressQueueStats()
+		}
 		pi.RecvDups = s.recvDups.Load()
 		if ns := s.lastRecvUnixNano.Load(); ns > 0 {
 			pi.LastRecvAt = time.Unix(0, ns)
