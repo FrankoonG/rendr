@@ -15,7 +15,7 @@ const (
 	// DefaultWaitDelay bounds waiting for I/O pipes after cancellation or
 	// process exit. See os/exec.Cmd.WaitDelay.
 	DefaultWaitDelay = 5 * time.Second
-	// DefaultMaxJSONBytes bounds the combined JSON stdout/stderr capture.
+	// DefaultMaxJSONBytes bounds each JSON stdout and diagnostic stderr capture.
 	DefaultMaxJSONBytes = 32 << 20
 )
 
@@ -89,23 +89,26 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 	cmd.WaitDelay = waitDelay
 	configureProcessGroup(cmd)
 
-	capture := &boundedBuffer{limit: maxJSONBytes}
-	cmd.Stdout = capture
-	cmd.Stderr = capture
+	jsonCapture := &boundedBuffer{limit: maxJSONBytes}
+	stderrCapture := &boundedBuffer{limit: maxJSONBytes}
+	cmd.Stdout = jsonCapture
+	cmd.Stderr = stderrCapture
 	started := time.Now()
 	runErr := cmd.Run()
 	duration := time.Since(started)
 
-	result, _ := e.Parser.Parse(bytes.NewReader(capture.Bytes()), request.Expected)
+	result, _ := e.Parser.Parse(bytes.NewReader(jsonCapture.Bytes()), request.Expected)
 	result.Command = command
 	result.Duration = duration
+	result.CommandOutput = joinCommandDiagnostics(result.CommandOutput, stderrCapture.Bytes())
+	result.CommandOutputTruncated = result.CommandOutputTruncated || stderrCapture.Truncated()
 	issues := append([]Issue(nil), result.Issues...)
 
-	if capture.Truncated() {
+	if jsonCapture.Truncated() || stderrCapture.Truncated() {
 		result.CaptureTruncated = true
 		issues = append(issues, Issue{
 			Code:   IssueCaptureLimit,
-			Detail: fmt.Sprintf("combined go test JSON exceeded %d bytes", maxJSONBytes),
+			Detail: fmt.Sprintf("go test JSON or stderr exceeded %d bytes", maxJSONBytes),
 		})
 	}
 	if runErr != nil {
@@ -113,12 +116,30 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		case ctx.Err() != nil:
 			issues = append(issues, Issue{Code: IssueCommandCanceled, Detail: ctx.Err().Error()})
 		case !hasRepresentedTestFailure(result.Tests):
-			issues = append(issues, Issue{Code: IssueCommandFailed, Detail: runErr.Error()})
+			detail := runErr.Error()
+			if diagnostic := strings.TrimSpace(string(stderrCapture.Bytes())); diagnostic != "" {
+				detail += ": " + diagnostic
+			}
+			issues = append(issues, Issue{Code: IssueCommandFailed, Detail: detail})
 		}
 	}
 
 	result.Issues = issues
 	return result, resultError(issues)
+}
+
+func joinCommandDiagnostics(commandOutput string, stderr []byte) string {
+	diagnostic := strings.TrimSpace(string(stderr))
+	if diagnostic == "" {
+		return commandOutput
+	}
+	if commandOutput == "" {
+		return diagnostic
+	}
+	if strings.HasSuffix(commandOutput, "\n") {
+		return commandOutput + diagnostic
+	}
+	return commandOutput + "\n" + diagnostic
 }
 
 func validateRequest(ctx context.Context, request Request, executor Executor) []Issue {

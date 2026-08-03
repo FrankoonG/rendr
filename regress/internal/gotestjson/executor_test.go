@@ -46,6 +46,14 @@ func TestExecutorReturnsOrderedSyntheticResults(t *testing.T) {
 	if result.Duration <= 0 {
 		t.Fatalf("Duration=%s, want positive", result.Duration)
 	}
+
+	result, err = syntheticExecutor().Run(context.Background(), syntheticRequest(t, "stderr-pass", required("TestOne")))
+	if err != nil || !result.Passed() {
+		t.Fatalf("stderr diagnostics invalidated JSON: result=%+v err=%v", result, err)
+	}
+	if result.HasIssue(IssueMalformedJSON) || !strings.Contains(result.CommandOutput, "go: downloading synthetic/dependency") {
+		t.Fatalf("stderr result=%+v", result)
+	}
 }
 
 func TestExecutorClassifiesNonzeroExitByRepresentedFailure(t *testing.T) {
@@ -163,6 +171,11 @@ func TestExecutorHelperProcess(t *testing.T) {
 		emit(testEvent{Action: "run", Package: "synthetic/pkg", Test: "TestFirst"})
 		emit(testEvent{Action: "output", Package: "synthetic/pkg", Test: "TestFirst", Output: "first output\n"})
 		emit(testEvent{Action: "pass", Package: "synthetic/pkg", Test: "TestFirst", Elapsed: 0.1})
+		os.Exit(0)
+	case "stderr-pass":
+		_, _ = os.Stderr.WriteString("go: downloading synthetic/dependency\n")
+		emit(testEvent{Action: "run", Test: "TestOne"})
+		emit(testEvent{Action: "pass", Test: "TestOne", Elapsed: 0.01})
 		os.Exit(0)
 	case "test-fail":
 		emit(testEvent{Action: "run", Test: "TestOne"})
