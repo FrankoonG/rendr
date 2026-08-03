@@ -58,6 +58,7 @@ func TestMandatorySkipAndInvalidAreJUnitFailures(t *testing.T) {
 func TestEvidenceIsDeterministicInJUnitAndMarkdown(t *testing.T) {
 	s := New()
 	s.Complete = true
+	s.Invocation = validTestInvocation(1)
 	s.Add(Case{
 		Name: "evidence|case",
 		Tier: "T",
@@ -93,6 +94,15 @@ func TestEvidenceIsDeterministicInJUnitAndMarkdown(t *testing.T) {
 
 func TestIncompleteGreenReportIsPartial(t *testing.T) {
 	s := New()
+	s.Invocation = Invocation{
+		SchemaVersion:  1,
+		Suite:          "normal",
+		Scope:          "exact",
+		Case:           "green",
+		ManifestDigest: "sha256:" + strings.Repeat("a", 64),
+		SelectedCases:  1,
+		RevisionStart:  Revision{CommitSHA: "commit", WorktreeSHA: "tree"},
+	}
 	s.Add(Case{Name: "green", Tier: "T"})
 	dir := t.TempDir()
 	junitPath := filepath.Join(dir, "junit.xml")
@@ -105,20 +115,143 @@ func TestIncompleteGreenReportIsPartial(t *testing.T) {
 	}
 	junit, _ := os.ReadFile(junitPath)
 	markdown, _ := os.ReadFile(markdownPath)
-	if !strings.Contains(string(junit), `state="partial"`) {
-		t.Fatalf("JUnit missing partial state:\n%s", junit)
+	for _, want := range []string{
+		`state="partial"`,
+		`complete="false"`,
+		`failures="1"`,
+		`name="invocation-complete"`,
+		`selected manifest did not complete`,
+	} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, junit)
+		}
 	}
 	if !strings.Contains(string(markdown), "**OVERALL: PARTIAL**") || strings.Contains(string(markdown), "**OVERALL: PASS**") {
 		t.Fatalf("Markdown partial state is wrong:\n%s", markdown)
 	}
+	if !strings.Contains(string(markdown), "- Complete: `false`") {
+		t.Fatalf("Markdown hides incomplete invocation:\n%s", markdown)
+	}
 
 	s.Complete = true
+	s.Invocation.RevisionEnd = s.Invocation.RevisionStart
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.WriteMarkdown(markdownPath); err != nil {
 		t.Fatal(err)
+	}
+	junit, _ = os.ReadFile(junitPath)
+	if strings.Contains(string(junit), `name="invocation-complete"`) || !strings.Contains(string(junit), `failures="0"`) {
+		t.Fatalf("complete JUnit retained the partial failure:\n%s", junit)
 	}
 	markdown, _ = os.ReadFile(markdownPath)
 	if !strings.Contains(string(markdown), "**OVERALL: PASS**") {
 		t.Fatalf("complete report did not pass:\n%s", markdown)
+	}
+}
+
+func TestInvocationIdentityIsRecordedInJUnitAndMarkdown(t *testing.T) {
+	s := New()
+	s.Complete = true
+	s.Invocation = Invocation{
+		SchemaVersion:  1,
+		Suite:          "tun-full",
+		Scope:          "from-case",
+		FromCase:       "TUN.case.two",
+		Forced:         true,
+		ManifestDigest: "sha256:" + strings.Repeat("b", 64),
+		SelectedCases:  2,
+		RevisionStart:  Revision{CommitSHA: "start-commit", WorktreeSHA: "start-tree"},
+		RevisionEnd:    Revision{CommitSHA: "start-commit", WorktreeSHA: "start-tree"},
+	}
+	s.Add(Case{Name: "TUN.case.two", Tier: "T7"})
+
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`name="rendr-regression/tun-full/from-case"`,
+		`complete="true"`,
+		`invocation_suite="tun-full"`,
+		`invocation_scope="from-case"`,
+		`invocation_from_case="TUN.case.two"`,
+		`invocation_forced="true"`,
+		`manifest_digest="sha256:` + strings.Repeat("b", 64) + `"`,
+		`revision_start_commit="start-commit"`,
+		`revision_end_worktree="start-tree"`,
+	} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, junit)
+		}
+	}
+	for _, want := range []string{
+		"- Suite: `tun-full`",
+		"- Scope: `from-case`",
+		"- From case: `TUN.case.two`",
+		"- Forced: `true`",
+		"- Manifest digest: `sha256:" + strings.Repeat("b", 64) + "`",
+		"- Complete: `true`",
+	} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("Markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestRunFailureIsAStandardJUnitFailure(t *testing.T) {
+	s := New()
+	s.Complete = true
+	s.Invocation = validTestInvocation(1)
+	s.Add(Case{Name: "green", Tier: "T"})
+	s.FailRun("worktree changed during invocation")
+	path := filepath.Join(t.TempDir(), "junit.xml")
+	if err := s.WriteJUnit(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	for _, want := range []string{`state="fail"`, `failures="1"`, `name="invocation-complete"`, "worktree changed during invocation"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestCompleteReportWithoutInvocationIdentityFailsClosed(t *testing.T) {
+	s := New()
+	s.Complete = true
+	s.Add(Case{Name: "green", Tier: "T"})
+	path := filepath.Join(t.TempDir(), "junit.xml")
+	if err := s.WriteJUnit(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	for _, want := range []string{`state="fail"`, `failures="1"`, "invocation schema is missing", "start revision is incomplete"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, text)
+		}
 	}
 }
 
@@ -136,5 +269,18 @@ func TestAtomicWriteReplacesExistingFile(t *testing.T) {
 	}
 	if string(got) != "complete" {
 		t.Fatalf("contents=%q want complete", got)
+	}
+}
+
+func validTestInvocation(selected int) Invocation {
+	revision := Revision{CommitSHA: "commit", WorktreeSHA: "worktree"}
+	return Invocation{
+		SchemaVersion:  1,
+		Suite:          "normal",
+		Scope:          "full",
+		ManifestDigest: "sha256:" + strings.Repeat("a", 64),
+		SelectedCases:  selected,
+		RevisionStart:  revision,
+		RevisionEnd:    revision,
 	}
 }

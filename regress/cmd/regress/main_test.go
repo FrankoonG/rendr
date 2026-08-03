@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -186,10 +189,11 @@ func TestBuildPhase1StateUsesExactRendrRoot(t *testing.T) {
 	}
 }
 
-func TestVerifyPhase1RevisionRejectsConcurrentChanges(t *testing.T) {
+func TestUpdateInvocationRevisionRejectsConcurrentChanges(t *testing.T) {
 	wantRoot := "/exact/root"
 	before := gate.Revision{CommitSHA: "commit", WorktreeSHA: "before"}
-	if err := verifyPhase1Revision(wantRoot, before, func(root string) (gate.Revision, error) {
+	suite := report.New()
+	if err := updateInvocationRevision(suite, wantRoot, before, func(root string) (gate.Revision, error) {
 		if root != wantRoot {
 			t.Fatalf("root=%q want %q", root, wantRoot)
 		}
@@ -197,19 +201,261 @@ func TestVerifyPhase1RevisionRejectsConcurrentChanges(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stable revision: %v", err)
 	}
-
-	err := verifyPhase1Revision(wantRoot, before, func(string) (gate.Revision, error) {
-		return gate.Revision{CommitSHA: "commit", WorktreeSHA: "after"}, nil
-	})
-	if err == nil || !strings.Contains(err.Error(), "changed during phase 1") {
-		t.Fatalf("changed revision err=%v", err)
+	if suite.Invocation.RevisionEnd != (report.Revision{CommitSHA: "commit", WorktreeSHA: "before"}) {
+		t.Fatalf("revision end=%+v", suite.Invocation.RevisionEnd)
 	}
 
-	err = verifyPhase1Revision(wantRoot, before, func(string) (gate.Revision, error) {
+	err := updateInvocationRevision(suite, wantRoot, before, func(string) (gate.Revision, error) {
+		return gate.Revision{CommitSHA: "commit", WorktreeSHA: "after"}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed during regression invocation") {
+		t.Fatalf("changed revision err=%v", err)
+	}
+	if suite.Invocation.RevisionEnd.WorktreeSHA != "after" {
+		t.Fatalf("drifted revision was not recorded: %+v", suite.Invocation.RevisionEnd)
+	}
+
+	err = updateInvocationRevision(suite, wantRoot, before, func(string) (gate.Revision, error) {
 		return gate.Revision{}, errors.New("git failed")
 	})
 	if err == nil || !strings.Contains(err.Error(), "git failed") {
 		t.Fatalf("fingerprint err=%v", err)
+	}
+}
+
+func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := os.WriteFile(junitPath, []byte(`<testsuites state="pass" failures="0">STALE-FULL-PASS</testsuites>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markdownPath, []byte("**OVERALL: PASS**\nSTALE-FULL-PASS\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := manifest.Required("synthetic.one", "T1")
+	cfg := runFlags{caseID: spec.ID, reportDir: dir, rendrRoot: "/exact/root"}
+	suite, revision, err := beginInvocation(
+		cfg,
+		manifest.SuiteNormal,
+		[]manifest.Spec{spec},
+		func(root string) (gate.Revision, error) {
+			if root != cfg.rendrRoot {
+				t.Fatalf("root=%q want %q", root, cfg.rendrRoot)
+			}
+			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
+		},
+		writeReports,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.CommitSHA != "commit" || suite.Complete {
+		t.Fatalf("suite=%+v revision=%+v", suite, revision)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{"JUnit": string(junit), "Markdown": string(markdown)} {
+		if strings.Contains(contents, "STALE-FULL-PASS") {
+			t.Fatalf("%s retained stale PASS:\n%s", name, contents)
+		}
+	}
+	for _, want := range []string{`state="partial"`, `failures="1"`, `invocation_scope="exact"`, `invocation_case="synthetic.one"`} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("invalidated JUnit missing %q:\n%s", want, junit)
+		}
+	}
+	if strings.Contains(string(markdown), "**OVERALL: PASS**") || !strings.Contains(string(markdown), "**OVERALL: PARTIAL**") {
+		t.Fatalf("invalidated Markdown is green:\n%s", markdown)
+	}
+}
+
+func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{junitReportFileName, markdownReportFileName} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("STALE-PASS"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writerCalled := false
+	_, _, err := beginInvocation(
+		runFlags{reportDir: dir, rendrRoot: "/exact/root"},
+		manifest.SuiteNormal,
+		[]manifest.Spec{manifest.Required("one", "T1")},
+		func(string) (gate.Revision, error) {
+			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
+		},
+		func(*report.Suite, string) error {
+			writerCalled = true
+			for _, name := range []string{junitReportFileName, markdownReportFileName} {
+				if _, statErr := os.Stat(filepath.Join(dir, name)); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("stale %s still exists before replacement write: %v", name, statErr)
+				}
+			}
+			return errors.New("synthetic writer failure")
+		},
+	)
+	if !writerCalled || err == nil || !strings.Contains(err.Error(), "synthetic writer failure") {
+		t.Fatalf("writerCalled=%v err=%v", writerCalled, err)
+	}
+}
+
+func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
+	all := []manifest.Spec{
+		manifest.Required("one", "T1"),
+		manifest.Required("two", "T1"),
+	}
+	full, err := buildInvocationIdentity(runFlags{full: true}, manifest.SuiteNormal, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := buildInvocationIdentity(runFlags{caseID: "two", forcePhase2: true}, manifest.SuiteNormal, all[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.Scope != "full" || full.Forced || full.SelectedCases != 2 {
+		t.Fatalf("full identity=%+v", full)
+	}
+	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 {
+		t.Fatalf("exact identity=%+v", exact)
+	}
+	if full.ManifestDigest == exact.ManifestDigest {
+		t.Fatalf("full and exact manifests share digest %q", full.ManifestDigest)
+	}
+	if full.ManifestDigest == "" || !strings.HasPrefix(full.ManifestDigest, "sha256:") {
+		t.Fatalf("invalid full manifest digest %q", full.ManifestDigest)
+	}
+	reversed, err := selectedManifestDigest([]manifest.Spec{all[1], all[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reversed == full.ManifestDigest {
+		t.Fatal("manifest digest does not bind exact execution order")
+	}
+	tun, err := buildInvocationIdentity(runFlags{tunFull: true, forcePhase2: true}, manifest.SuiteTUN, all[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tun.Suite != manifest.SuiteTUN || tun.Scope != "full" || !tun.Forced {
+		t.Fatalf("TUN/forced identity=%+v", tun)
+	}
+}
+
+func TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen(t *testing.T) {
+	resumed, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed.HasPhase2() || !containsSelectedPhase1(resumed) {
+		t.Fatalf("resume plan does not bridge phase 1 to phase 2: %+v", resumed)
+	}
+	if requiresExistingPhase1Gate(resumed) {
+		t.Fatal("phase-1 resume incorrectly requires the pre-existing green gate")
+	}
+	if shouldWriteGreenPhase1Gate(resumed) {
+		t.Fatal("partial phase-1 resume can mint a complete green gate")
+	}
+
+	phase2Only, err := runplan.Build(runplan.Request{Full: true, FromCase: "T5.4-gvisor-unprivileged"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !requiresExistingPhase1Gate(phase2Only) {
+		t.Fatal("phase-2-only resume bypasses the phase-1 gate")
+	}
+
+	complete, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-vet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requiresExistingPhase1Gate(complete) || !shouldWriteGreenPhase1Gate(complete) {
+		t.Fatalf("complete phase-1 resume gate policy is wrong: %+v", complete)
+	}
+}
+
+func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) {
+	root := newMainTestRepo(t)
+	reportDir := t.TempDir()
+	red := gate.State{CommitSHA: "old", WorktreeSHA: "old", Status: "red", At: time.Unix(1, 0)}
+	if err := gate.Write(reportDir, red); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := installSyntheticTierCommands(t)
+	defer restore()
+	plan, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := runFlags{full: true, fromCaseID: "go-test", reportDir: reportDir, rendrRoot: root}
+	var stdout, stderr bytes.Buffer
+	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitOK {
+		t.Fatalf("code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "phase 1: PARTIAL (green gate unchanged)") {
+		t.Fatalf("resume did not report partial phase 1:\n%s", stdout.String())
+	}
+	state, err := gate.Read(reportDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *state != red {
+		t.Fatalf("partial resume changed gate: got %+v want %+v", *state, red)
+	}
+	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`state="pass"`, `complete="true"`, `invocation_scope="from-case"`, `invocation_from_case="go-test"`} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("resume JUnit missing %q:\n%s", want, junit)
+		}
+	}
+}
+
+func TestExecuteNormalRevisionDriftFailsAndPersistsEvidence(t *testing.T) {
+	root := newMainTestRepo(t)
+	reportDir := t.TempDir()
+	original := tierCommands["T1"]
+	command := original
+	command.run = func(_ context.Context, suite *report.Suite, _ string, _ tierSelection) {
+		suite.Add(report.Case{Name: "go-vet", Tier: "T1"})
+		if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("changed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tierCommands["T1"] = command
+	defer func() { tierCommands["T1"] = original }()
+
+	plan, err := runplan.Build(runplan.Request{Case: "go-vet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := runFlags{caseID: "go-vet", reportDir: reportDir, rendrRoot: root}
+	var stdout, stderr bytes.Buffer
+	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitPhase1Stale {
+		t.Fatalf("code=%d want %d stderr=%s", code, exitPhase1Stale, stderr.String())
+	}
+	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`state="fail"`,
+		`complete="false"`,
+		`name="invocation-complete"`,
+		"worktree changed during regression invocation",
+	} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("drift JUnit missing %q:\n%s", want, junit)
+		}
 	}
 }
 
@@ -383,6 +629,7 @@ func TestReconcileReportRowsFailsClosed(t *testing.T) {
 		{name: "duplicate", actual: []report.Case{{Name: "one", Tier: "T1"}, {Name: "one", Tier: "T1"}}, want: "duplicate"},
 		{name: "wrong order", actual: []report.Case{{Name: "two", Tier: "T1"}, {Name: "one", Tier: "T1"}}, want: "ID mismatch"},
 		{name: "wrong tier", actual: []report.Case{{Name: "one", Tier: "T2"}, {Name: "two", Tier: "T1"}}, want: "tier mismatch"},
+		{name: "mandatory downgraded", actual: []report.Case{{Name: "one", Tier: "T1", Optional: true}, {Name: "two", Tier: "T1"}}, want: "downgraded to optional"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -441,4 +688,52 @@ func specIDs(specs []manifest.Spec) []string {
 		ids[i] = spec.ID
 	}
 	return ids
+}
+
+func installSyntheticTierCommands(t *testing.T) func() {
+	t.Helper()
+	originals := make(map[string]tierCommand, len(tierCommands))
+	for tier, original := range tierCommands {
+		originals[tier] = original
+		tier := tier
+		command := original
+		command.run = func(_ context.Context, suite *report.Suite, _ string, selection tierSelection) {
+			selected, err := manifest.Select(catalog.ByTier(tier), selection.Case, selection.FromCase)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, spec := range selected {
+				suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier})
+			}
+		}
+		tierCommands[tier] = command
+	}
+	return func() {
+		for tier, original := range originals {
+			tierCommands[tier] = original
+		}
+	}
+}
+
+func newMainTestRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	runMainTestGit(t, root, "init", "--quiet")
+	runMainTestGit(t, root, "config", "user.name", "rendr regression test")
+	runMainTestGit(t, root, "config", "user.email", "regress@example.invalid")
+	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runMainTestGit(t, root, "add", "tracked.txt")
+	runMainTestGit(t, root, "commit", "--quiet", "-m", "initial")
+	return root
+}
+
+func runMainTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v (%s)", args, err, strings.TrimSpace(string(out)))
+	}
 }

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -46,7 +47,12 @@ const (
 	exitPhase1Stale = 51
 )
 
-const listSchemaVersion = 1
+const (
+	listSchemaVersion       = 1
+	invocationSchemaVersion = 1
+	junitReportFileName     = "junit.xml"
+	markdownReportFileName  = "SUMMARY.md"
+)
 
 type runFlags struct {
 	phase         string
@@ -301,29 +307,40 @@ var tierCommands = map[string]tierCommand{
 }
 
 func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout, stderr io.Writer) int {
-	if plan.HasPhase2() && !plan.CompletePhase1 && !cfg.forcePhase2 {
+	selected, err := specsForPlan(plan, catalog.ByTier)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: cannot resolve selected manifest:", err)
+		return exitEnvError
+	}
+	suite, revisionStart, err := beginInvocation(
+		cfg,
+		manifest.SuiteNormal,
+		selected,
+		gate.CurrentRevision,
+		writeReports,
+	)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: cannot initialize invocation report:", err)
+		return exitEnvError
+	}
+
+	if requiresExistingPhase1Gate(plan) && !cfg.forcePhase2 {
 		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
+			persistInvocationFailure(suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, stderr)
 			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
 			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
 			return exitPhase1Stale
 		}
 	}
 
-	var phase1Start *gate.Revision
 	if plan.CompletePhase1 {
-		revision, err := gate.CurrentRevision(cfg.rendrRoot)
-		if err != nil {
-			fmt.Fprintln(stderr, "regress: cannot fingerprint phase 1 start:", err)
-			return exitEnvError
-		}
-		if err := writeKnownPhase1Gate(cfg.reportDir, revision, "running", time.Now()); err != nil {
+		if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "running", time.Now()); err != nil {
+			persistInvocationFailure(suite, cfg, revisionStart, "cannot invalidate prior phase 1 gate: "+err.Error(), gate.CurrentRevision, stderr)
 			fmt.Fprintln(stderr, "regress: cannot invalidate prior phase 1 gate:", err)
 			return exitEnvError
 		}
-		phase1Start = &revision
 	}
 
-	suite := report.New()
 	for i, run := range plan.Runs {
 		command, ok := tierCommands[run.Tier]
 		if !ok {
@@ -338,20 +355,27 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 		}
 		before := len(suite.Cases)
 		command.run(ctx, suite, cfg.rendrRoot, tierSelection{Case: run.Case, FromCase: run.FromCase})
-		if err := reconcileReportRows(expected, suite.Cases[before:]); err != nil {
-			suite.Add(report.Case{Name: run.Tier + "-manifest-reconcile", Tier: run.Tier, Failure: err.Error()})
+		reconcileErr := reconcileReportRows(expected, suite.Cases[before:])
+		if reconcileErr != nil {
+			suite.FailRun(run.Tier + " manifest reconciliation failed: " + reconcileErr.Error())
 		}
-		if isLastPhase1Run(plan.Runs, i) && plan.CompletePhase1 {
-			if err := verifyPhase1Revision(cfg.rendrRoot, *phase1Start, gate.CurrentRevision); err != nil {
-				suite.Add(report.Case{Name: "phase1-revision-stable", Tier: run.Tier, Failure: err.Error()})
-			}
+		revisionErr := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, gate.CurrentRevision)
+		if revisionErr != nil {
+			suite.FailRun(revisionErr.Error())
 		}
-		suite.Complete = i == len(plan.Runs)-1
+		suite.Complete = i == len(plan.Runs)-1 && reconcileErr == nil && revisionErr == nil
 		if err := writeReports(suite, cfg.reportDir); err != nil {
 			fmt.Fprintf(stderr, "regress: cannot write %s reports: %v\n", run.Tier, err)
 			return exitEnvError
 		}
-		if suite.AnyFailedAt(run.Tier) {
+		if revisionErr != nil {
+			if isPhase1Tier(run.Tier) {
+				writeRedPhase1Gate(cfg, stderr)
+			}
+			fmt.Fprintln(stderr, "regress: invocation revision changed:", revisionErr)
+			return exitPhase1Stale
+		}
+		if reconcileErr != nil || suite.AnyFailedAt(run.Tier) {
 			if isPhase1Tier(run.Tier) {
 				writeRedPhase1Gate(cfg, stderr)
 			}
@@ -362,7 +386,12 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 
 		if isLastPhase1Run(plan.Runs, i) {
 			if shouldWriteGreenPhase1Gate(plan) {
-				if err := writeKnownPhase1Gate(cfg.reportDir, *phase1Start, "green", time.Now()); err != nil {
+				if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "green", time.Now()); err != nil {
+					suite.Complete = false
+					suite.FailRun("cannot persist phase 1 state: " + err.Error())
+					if reportErr := writeReports(suite, cfg.reportDir); reportErr != nil {
+						fmt.Fprintln(stderr, "regress: cannot persist invocation failure report:", reportErr)
+					}
 					fmt.Fprintln(stderr, "regress: cannot persist phase 1 state:", err)
 					return exitEnvError
 				}
@@ -376,33 +405,53 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 }
 
 func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdout, stderr io.Writer) int {
+	expected, err := tunSpecsForRunOrder(tunfull.Specs(), selection.runOrder)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: invalid prepared TUN plan:", err)
+		return exitEnvError
+	}
+	suite, revisionStart, err := beginInvocation(
+		cfg,
+		manifest.SuiteTUN,
+		expected,
+		gate.CurrentRevision,
+		writeReports,
+	)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: cannot initialize TUN invocation report:", err)
+		return exitEnvError
+	}
 	if !cfg.forcePhase2 {
 		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
+			persistInvocationFailure(suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, stderr)
 			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
 			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
 			return exitPhase1Stale
 		}
 	}
 
-	expected, err := tunSpecsForRunOrder(tunfull.Specs(), selection.runOrder)
-	if err != nil {
-		fmt.Fprintln(stderr, "regress: invalid prepared TUN plan:", err)
-		return exitEnvError
-	}
-	suite := report.New()
 	for i, spec := range expected {
 		fmt.Fprintf(stdout, "== phase 2 / TUN: %s ==\n", spec.ID)
 		before := len(suite.Cases)
 		tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: spec.ID})
-		if err := reconcileReportRows([]manifest.Spec{spec}, suite.Cases[before:]); err != nil {
-			suite.Add(report.Case{Name: "TUN-full-manifest-reconcile", Tier: "T7", Failure: err.Error()})
+		reconcileErr := reconcileReportRows([]manifest.Spec{spec}, suite.Cases[before:])
+		if reconcileErr != nil {
+			suite.FailRun("TUN manifest reconciliation failed: " + reconcileErr.Error())
 		}
-		suite.Complete = i == len(expected)-1
+		revisionErr := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, gate.CurrentRevision)
+		if revisionErr != nil {
+			suite.FailRun(revisionErr.Error())
+		}
+		suite.Complete = i == len(expected)-1 && reconcileErr == nil && revisionErr == nil
 		if err := writeReports(suite, cfg.reportDir); err != nil {
 			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", err)
 			return exitEnvError
 		}
-		if suite.AnyFailedAt("T7") {
+		if revisionErr != nil {
+			fmt.Fprintln(stderr, "regress: TUN invocation revision changed:", revisionErr)
+			return exitPhase1Stale
+		}
+		if reconcileErr != nil || suite.AnyFailedAt("T7") {
 			fmt.Fprintln(stderr, "phase 2 / TUN full: FAILED")
 			return exitT7Fail
 		}
@@ -424,6 +473,19 @@ func isLastPhase1Run(runs []runplan.TierRun, index int) bool {
 
 func shouldWriteGreenPhase1Gate(plan runplan.Plan) bool {
 	return plan.CompletePhase1
+}
+
+func containsSelectedPhase1(plan runplan.Plan) bool {
+	for _, run := range plan.Runs {
+		if isPhase1Tier(run.Tier) {
+			return true
+		}
+	}
+	return false
+}
+
+func requiresExistingPhase1Gate(plan runplan.Plan) bool {
+	return plan.HasPhase2() && !plan.CompletePhase1 && !containsSelectedPhase1(plan)
 }
 
 func writeRedPhase1Gate(cfg runFlags, stderr io.Writer) {
@@ -453,22 +515,142 @@ func writeKnownPhase1Gate(reportDir string, revision gate.Revision, status strin
 	})
 }
 
-func verifyPhase1Revision(
+func beginInvocation(
+	cfg runFlags,
+	suiteName string,
+	selected []manifest.Spec,
+	currentRevision func(string) (gate.Revision, error),
+	writer func(*report.Suite, string) error,
+) (*report.Suite, gate.Revision, error) {
+	identity, err := buildInvocationIdentity(cfg, suiteName, selected)
+	if err != nil {
+		return nil, gate.Revision{}, err
+	}
+	suite := report.New()
+	suite.Invocation = identity
+	if err := invalidateFixedReports(cfg.reportDir); err != nil {
+		suite.FailRun("cannot invalidate stale reports: " + err.Error())
+		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+			return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %v; write failure report: %w", err, writeErr)
+		}
+		return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %w", err)
+	}
+
+	revision, revisionErr := currentRevision(cfg.rendrRoot)
+	if revisionErr != nil {
+		suite.FailRun("cannot fingerprint invocation start: " + revisionErr.Error())
+		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+			return suite, gate.Revision{}, fmt.Errorf("fingerprint invocation start: %v; invalidate stale reports: %w", revisionErr, writeErr)
+		}
+		return suite, gate.Revision{}, fmt.Errorf("fingerprint invocation start: %w", revisionErr)
+	}
+	suite.Invocation.RevisionStart = reportRevision(revision)
+	if err := writer(suite, cfg.reportDir); err != nil {
+		return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %w", err)
+	}
+	return suite, revision, nil
+}
+
+func invalidateFixedReports(dir string) error {
+	var removeErrors []error
+	for _, name := range []string{junitReportFileName, markdownReportFileName} {
+		path := filepath.Join(dir, name)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+	return errors.Join(removeErrors...)
+}
+
+func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest.Spec) (report.Invocation, error) {
+	digest, err := selectedManifestDigest(selected)
+	if err != nil {
+		return report.Invocation{}, err
+	}
+	return report.Invocation{
+		SchemaVersion:  invocationSchemaVersion,
+		Suite:          suiteName,
+		Scope:          invocationScope(cfg),
+		Case:           cfg.caseID,
+		FromCase:       cfg.fromCaseID,
+		Forced:         cfg.forcePhase2,
+		ManifestDigest: digest,
+		SelectedCases:  len(selected),
+	}, nil
+}
+
+func invocationScope(cfg runFlags) string {
+	switch {
+	case cfg.caseID != "":
+		return "exact"
+	case cfg.fromCaseID != "":
+		return "from-case"
+	case cfg.full || cfg.tunFull:
+		return "full"
+	case cfg.tier != "":
+		return "tier-" + cfg.tier
+	case cfg.phase != "":
+		return "phase-" + cfg.phase
+	default:
+		return "default"
+	}
+}
+
+func selectedManifestDigest(selected []manifest.Spec) (string, error) {
+	if len(selected) == 0 {
+		return "", errors.New("selected manifest is empty")
+	}
+	if err := manifest.Validate(selected); err != nil {
+		return "", fmt.Errorf("selected manifest is invalid: %w", err)
+	}
+	b, err := json.Marshal(selected)
+	if err != nil {
+		return "", fmt.Errorf("encode selected manifest: %w", err)
+	}
+	digest := sha256.Sum256(b)
+	return fmt.Sprintf("sha256:%x", digest[:]), nil
+}
+
+func reportRevision(revision gate.Revision) report.Revision {
+	return report.Revision{CommitSHA: revision.CommitSHA, WorktreeSHA: revision.WorktreeSHA}
+}
+
+func updateInvocationRevision(
+	suite *report.Suite,
 	rendrRoot string,
 	before gate.Revision,
 	currentRevision func(string) (gate.Revision, error),
 ) error {
 	after, err := currentRevision(rendrRoot)
 	if err != nil {
-		return fmt.Errorf("fingerprint phase 1 completion: %w", err)
+		return fmt.Errorf("fingerprint regression invocation: %w", err)
 	}
+	suite.Invocation.RevisionEnd = reportRevision(after)
 	if before != after {
 		return fmt.Errorf(
-			"worktree changed during phase 1: before commit=%s worktree=%s, after commit=%s worktree=%s",
+			"worktree changed during regression invocation: before commit=%s worktree=%s, after commit=%s worktree=%s",
 			before.CommitSHA, before.WorktreeSHA, after.CommitSHA, after.WorktreeSHA,
 		)
 	}
 	return nil
+}
+
+func persistInvocationFailure(
+	suite *report.Suite,
+	cfg runFlags,
+	revisionStart gate.Revision,
+	reason string,
+	currentRevision func(string) (gate.Revision, error),
+	stderr io.Writer,
+) {
+	suite.Complete = false
+	suite.FailRun(reason)
+	if err := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, currentRevision); err != nil {
+		suite.FailRun(err.Error())
+	}
+	if err := writeReports(suite, cfg.reportDir); err != nil {
+		fmt.Fprintln(stderr, "regress: warning: cannot persist invocation failure report:", err)
+	}
 }
 
 func buildPhase1State(
@@ -789,6 +971,9 @@ func reconcileReportRows(expected []manifest.Spec, actual []report.Case) error {
 		if got.Tier != want.Tier {
 			return fmt.Errorf("manifest/report tier mismatch for %q: got %q, want %q", want.ID, got.Tier, want.Tier)
 		}
+		if want.Mandatory && got.Optional {
+			return fmt.Errorf("manifest/report mandatory case %q was downgraded to optional", want.ID)
+		}
 	}
 	return nil
 }
@@ -852,8 +1037,8 @@ func tunFullUnimplementedCase() report.Case {
 }
 
 func writeReports(suite *report.Suite, dir string) error {
-	junit := filepath.Join(dir, "junit.xml")
-	md := filepath.Join(dir, "SUMMARY.md")
+	junit := filepath.Join(dir, junitReportFileName)
+	md := filepath.Join(dir, markdownReportFileName)
 	if err := suite.WriteJUnit(junit); err != nil {
 		return fmt.Errorf("write JUnit: %w", err)
 	}
