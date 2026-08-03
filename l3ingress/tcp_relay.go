@@ -64,6 +64,9 @@ func (r *TCPFlowRelay) Serve(ctx context.Context, ev PacketEvent, endpoint net.C
 	case err := <-errCh:
 		_ = endpoint.Close()
 		_ = egress.Close()
+		if ctxErr := sessionCtx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 		return streamRelayError(err)
 	case <-sessionCtx.Done():
 		_ = endpoint.Close()

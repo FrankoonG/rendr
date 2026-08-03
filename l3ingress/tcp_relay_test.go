@@ -76,14 +76,14 @@ func TestTCPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 	relay := &TCPFlowRelay{Egresses: reg}
 
 	app, endpoint := net.Pipe()
-	errCh := make(chan error, 1)
-	go func() { errCh <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint) }()
+	errCh1 := make(chan error, 1)
+	go func() { errCh1 <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint) }()
 	egressSide := egress.waitConn(t)
 	closeActiveFlow(t, relay, id)
 	_ = app.Close()
 	_ = egressSide.Close()
 	select {
-	case err := <-errCh:
+	case err := <-errCh1:
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -93,16 +93,35 @@ func TestTCPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 
 	app2, endpoint2 := net.Pipe()
 	defer app2.Close()
-	errCh = make(chan error, 1)
-	go func() { errCh <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint2) }()
+	errCh2 := make(chan error, 1)
+	go func() { errCh2 <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint2) }()
 	egressSide2 := egress.waitConn(t)
 	defer egressSide2.Close()
 	if egress.count() != 2 {
 		t.Fatalf("egress dial count=%d want 2", egress.count())
 	}
+	payload := []byte("reopened")
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := app2.Write(payload)
+		writeErr <- err
+	}()
+	if err := egressSide2.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(egressSide2, got); err != nil {
+		t.Fatalf("reopened relay read: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("reopened relay read %q want %q", got, payload)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("reopened relay write: %v", err)
+	}
 	_ = relay.Close()
 	select {
-	case err := <-errCh:
+	case err := <-errCh2:
 		if err != nil {
 			t.Fatal(err)
 		}
