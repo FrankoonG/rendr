@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -606,7 +608,33 @@ func runTUNXrayPacketEcho(t *testing.T, label string, paths []rendr.PathSpec, fa
 		t.Fatal("packet accept timeout")
 	}
 	defer server.Close()
-	echoErr := startTUNXrayPacketEcho(server)
+
+	echoConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoConn.Close()
+	echoRemote, err := netip.ParseAddrPort(echoConn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoErr := startTUNXrayUDPEcho(echoConn)
+	peerEgress := &tunT3UDPEgress{remote: echoRemote}
+	egresses := l3ingress.NewEgressRegistry()
+	if err := egresses.Register("xray", peerEgress); err != nil {
+		t.Fatal(err)
+	}
+	peerCtx, peerCancel := context.WithCancel(ctx)
+	defer peerCancel()
+	peerErr := make(chan error, 1)
+	go func() {
+		peerErr <- (&l3session.UDPPeerRelay{
+			PacketConn: server,
+			Egresses:   egresses,
+			BufferSize: 2048,
+		}).Run(peerCtx)
+	}()
+
 	session, err := waitTUNXrayPacketSession(ctx, manager, id)
 	if err != nil {
 		t.Fatal(err)
@@ -689,13 +717,29 @@ func runTUNXrayPacketEcho(t *testing.T, label string, paths []rendr.PathSpec, fa
 	if admin.MigrationCount() == startMigrations {
 		t.Fatalf("zero packet migrations for %s", label)
 	}
+	peerDials, peerIdentity := peerEgress.snapshot()
+	if peerDials != 1 || peerIdentity != id {
+		t.Fatalf("peer egress dispatch for %s: dials=%d identity=%s want dials=1 identity=%s",
+			label, peerDials, peerIdentity, id)
+	}
+	peerCancel()
+	select {
+	case err := <-peerErr:
+		if err != nil {
+			t.Fatalf("peer relay for %s: %v", label, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("peer relay shutdown timeout for %s", label)
+	}
 	relay.CloseFlow(id)
+	_ = echoConn.Close()
 	select {
 	case err := <-echoErr:
-		if err != nil && err != io.EOF && !isNetClosed(err) {
+		if err != nil && !errors.Is(err, io.EOF) && !isNetClosed(err) {
 			t.Fatal(err)
 		}
-	default:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("UDP echo shutdown timeout for %s", label)
 	}
 }
 
@@ -761,7 +805,7 @@ func migrateTUNXrayPacket(admin rendr.AdminPacketConn) error {
 	return fmt.Errorf("no alternate packet path from active=%d", cur)
 }
 
-func startTUNXrayPacketEcho(pc rendr.PacketConn) <-chan error {
+func startTUNXrayUDPEcho(pc net.PacketConn) <-chan error {
 	errCh := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 2048)
@@ -779,6 +823,40 @@ func startTUNXrayPacketEcho(pc rendr.PacketConn) <-chan error {
 	}()
 	return errCh
 }
+
+type tunT3UDPEgress struct {
+	mu       sync.Mutex
+	remote   netip.AddrPort
+	dials    int
+	identity l3ingress.L3Identity
+}
+
+func (e *tunT3UDPEgress) DialTCP(context.Context, l3ingress.L3Identity) (net.Conn, error) {
+	return nil, errors.New("matrix: TUN T3 UDP egress does not support TCP")
+}
+
+func (e *tunT3UDPEgress) DialUDP(
+	_ context.Context,
+	id l3ingress.L3Identity,
+) (net.PacketConn, netip.AddrPort, error) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	e.mu.Lock()
+	e.dials++
+	e.identity = id
+	e.mu.Unlock()
+	return conn, e.remote, nil
+}
+
+func (e *tunT3UDPEgress) snapshot() (int, l3ingress.L3Identity) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.dials, e.identity
+}
+
+var _ l3ingress.Egress = (*tunT3UDPEgress)(nil)
 
 type tunT3CaptureDevice struct {
 	writes chan []byte
