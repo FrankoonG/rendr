@@ -389,7 +389,8 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestSpecsOrder", "TestSelectCaseDefsExact", "TestSelectCaseDefsInclusiveResume",
 			"TestRunWithOptionsMissingFilter", "TestRunCaseDefPreservesRecoveredFailure",
 			"TestRunCaseDefUsesOneBudgetAcrossRetries", "TestRunCaseDefCleanFirstPass",
-			"TestRunCaseDefsFailFastKeepsManifestRows", "TestFilterRegressUnitPackages",
+			"TestRunCaseDefsFailFastKeepsManifestRows", "TestRunCaseDefsUnsafeProcessTeardownStopsWithoutRetry",
+			"TestCommandTeardownFitsCaseJoinLimit", "TestFilterRegressUnitPackages",
 			"TestContractsHaveDeterministicNonzeroCoverage", "TestRegressUnitRunsOnlyFastSmokeOracles",
 			"TestValidateTestInventoryRejectsNonexistentAndRenamedTests",
 			"TestExpectedTestSkipIsNotPass",
@@ -465,6 +466,11 @@ func regressUnitContracts(goos string) []packageContract {
 	if goos == "linux" {
 		chaos := contractByImportPath(contracts, regressModule+"/internal/chaos")
 		chaos.Inventory = []string{"TestApplyAndCleanup", "TestApplyShapesBandwidth"}
+		tier1 := contractByImportPath(contracts, regressModule+"/internal/tier1")
+		tier1.Inventory = append(tier1.Inventory,
+			"TestRunGoCancellationKillsCompiledTestProcessTree",
+			"TestGoTestExecutorCancellationKillsCompiledTestProcessTree",
+		)
 		tier5 := contractByImportPath(contracts, regressModule+"/internal/tier5")
 		tier5.Inventory = append(tier5.Inventory,
 			"TestTier5TCPRepairUnprivilegedPreflight",

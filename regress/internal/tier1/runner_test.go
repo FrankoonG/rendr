@@ -3,6 +3,7 @@ package tier1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
@@ -255,6 +256,48 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunCaseDefsUnsafeProcessTeardownStopsWithoutRetry(t *testing.T) {
+	firstCalls := 0
+	laterCalls := 0
+	unsafeSpec := manifest.RequiredWithBudget("unsafe", "T1", time.Second)
+	unsafeSpec.Mandatory = false
+	defs := []caseDef{
+		{
+			spec:    unsafeSpec,
+			retries: 3,
+			fn: func(context.Context, string) error {
+				firstCalls++
+				return fmt.Errorf("synthetic cleanup failure: %w", errUnsafeProcessTeardown)
+			},
+		},
+		{
+			spec: manifest.RequiredWithBudget("later", "T1", time.Second),
+			fn: func(context.Context, string) error {
+				laterCalls++
+				return nil
+			},
+		},
+	}
+
+	suite := report.New()
+	runCaseDefs(context.Background(), suite, "", defs)
+	if firstCalls != 1 {
+		t.Fatalf("unsafe command attempts = %d, want 1", firstCalls)
+	}
+	if laterCalls != 0 {
+		t.Fatalf("later executor calls = %d, want 0", laterCalls)
+	}
+	if got := suite.Cases[0].Evidence[processTeardownEvidence]; got != "unsafe" {
+		t.Fatalf("process teardown evidence = %q, want unsafe", got)
+	}
+	if suite.Cases[0].Failure != "" || !strings.Contains(suite.Cases[0].InvalidReason, "unsafe process teardown") {
+		t.Fatalf("unsafe teardown row = %+v, want INVALID", suite.Cases[0])
+	}
+	if got := suite.Cases[1].InvalidReason; got != "not run after unsafe failed" {
+		t.Fatalf("later case invalid reason = %q", got)
 	}
 }
 

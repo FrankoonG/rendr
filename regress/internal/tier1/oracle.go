@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,7 +21,7 @@ import (
 const maxOracleOutputBytes = 8 << 20
 
 var tier1GoTestExecutor = gotestjson.Executor{
-	WaitDelay: 10 * time.Second,
+	WaitDelay: tier1CommandWaitDelay,
 	Parser:    gotestjson.Parser{MaxOutputBytes: 16 << 10},
 }
 
@@ -325,7 +324,7 @@ func runBenchmarkContract(ctx context.Context, root string) error {
 	validationErr := validateBenchmarkJSON(bytes.NewReader(out), rendrModule, benchmarkContract)
 	switch {
 	case runErr != nil && validationErr != nil:
-		return fmt.Errorf("go benchmark command failed: %v; oracle: %v\n%s", runErr, validationErr, outputExcerpt(out))
+		return fmt.Errorf("go benchmark command failed: %w; oracle: %v\n%s", runErr, validationErr, outputExcerpt(out))
 	case runErr != nil:
 		return fmt.Errorf("go benchmark command failed: %w\n%s", runErr, outputExcerpt(out))
 	case validationErr != nil:
@@ -491,13 +490,12 @@ func benchmarkResultNameMatches(got, expected string) bool {
 }
 
 func runCommandCapture(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd, tree := newTier1Command(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.WaitDelay = 10 * time.Second
 	buffer := &limitedBuffer{limit: maxOracleOutputBytes}
 	cmd.Stdout = buffer
 	cmd.Stderr = buffer
-	err := cmd.Run()
+	err := runTier1Command(cmd, tree)
 	if buffer.truncated {
 		if err == nil {
 			err = fmt.Errorf("command output exceeded %d bytes", maxOracleOutputBytes)
@@ -509,14 +507,13 @@ func runCommandCapture(ctx context.Context, dir, name string, args ...string) ([
 }
 
 func runCommandOutput(ctx context.Context, dir, name string, args ...string) ([]byte, []byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd, tree := newTier1Command(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.WaitDelay = 10 * time.Second
 	stdout := &limitedBuffer{limit: maxOracleOutputBytes}
 	stderr := &limitedBuffer{limit: maxOracleOutputBytes}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	err := cmd.Run()
+	err := runTier1Command(cmd, tree)
 	if stdout.truncated || stderr.truncated {
 		if err == nil {
 			err = fmt.Errorf("command output exceeded %d bytes", maxOracleOutputBytes)

@@ -12,14 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -126,18 +127,19 @@ func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, def
 			continue
 		}
 
-		var rc report.Case
+		var outcome caseexec.Outcome
 		if c.onlyOn != "" && c.onlyOn != runtime.GOOS {
-			rc = report.Case{
+			outcome.Case = report.Case{
 				Name:       c.spec.ID,
 				Tier:       c.spec.Tier,
 				SkipReason: fmt.Sprintf("only runs on %s", c.onlyOn),
 			}
 		} else {
-			rc = runCaseDef(ctx, rendrRoot, c)
+			outcome = runCaseDefOutcome(ctx, rendrRoot, c)
 		}
+		rc := outcome.Case
 		suite.Add(rc)
-		if mandatoryCaseFailed(c.spec, rc) {
+		if outcome.MustStop || mandatoryCaseFailed(c.spec, rc) {
 			failedCaseID = c.spec.ID
 		}
 	}
@@ -156,14 +158,35 @@ func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 }
 
 func runCaseDef(ctx context.Context, rendrRoot string, c caseDef) report.Case {
-	start := time.Now()
-	caseCtx := ctx
-	var cancel context.CancelFunc
-	if c.spec.Budget > 0 {
-		caseCtx, cancel = context.WithTimeout(ctx, c.spec.Budget)
-		defer cancel()
-	}
+	return runCaseDefOutcome(ctx, rendrRoot, c).Case
+}
 
+func runCaseDefOutcome(ctx context.Context, rendrRoot string, c caseDef) caseexec.Outcome {
+	var unsafeTeardown atomic.Bool
+	var workload func(context.Context) report.Case
+	if c.fn != nil {
+		workload = func(caseCtx context.Context) report.Case {
+			return runCaseAttempts(caseCtx, rendrRoot, c, &unsafeTeardown)
+		}
+	}
+	outcome := caseexec.Run(ctx, caseexec.Config{
+		Name:        c.spec.ID,
+		Tier:        c.spec.Tier,
+		Budget:      c.spec.Budget,
+		JoinTimeout: caseexec.DefaultJoinTimeout,
+	}, workload)
+	if unsafeTeardown.Load() {
+		outcome.MustStop = true
+		if outcome.Case.Evidence == nil {
+			outcome.Case.Evidence = make(map[string]string)
+		}
+		outcome.Case.Evidence[processTeardownEvidence] = "unsafe"
+	}
+	return outcome
+}
+
+func runCaseAttempts(ctx context.Context, rendrRoot string, c caseDef, unsafeTeardown *atomic.Bool) report.Case {
+	start := time.Now()
 	var (
 		lastErr  error
 		failures []string
@@ -171,18 +194,24 @@ func runCaseDef(ctx context.Context, rendrRoot string, c caseDef) report.Case {
 	)
 	for attempt := 1; attempt <= c.retries+1; attempt++ {
 		attempts = attempt
-		lastErr = c.fn(caseCtx, rendrRoot)
+		lastErr = c.fn(ctx, rendrRoot)
 		if lastErr == nil {
 			break
 		}
 		failures = append(failures, fmt.Sprintf("attempt %d: %v", attempt, lastErr))
-		if caseCtx.Err() != nil {
+		if errors.Is(lastErr, errUnsafeProcessTeardown) {
+			unsafeTeardown.Store(true)
+			break
+		}
+		if ctx.Err() != nil {
 			break
 		}
 	}
 
 	rc := report.Case{Name: c.spec.ID, Tier: c.spec.Tier, Duration: time.Since(start)}
 	switch {
+	case lastErr != nil && unsafeTeardown.Load():
+		rc.InvalidReason = fmt.Sprintf("unsafe process teardown after %d attempt(s): %s", attempts, strings.Join(failures, "\n"))
 	case lastErr != nil:
 		rc.Failure = fmt.Sprintf("failed after %d attempt(s): %s", attempts, strings.Join(failures, "\n"))
 	case len(failures) > 0:
@@ -192,26 +221,17 @@ func runCaseDef(ctx context.Context, rendrRoot string, c caseDef) report.Case {
 }
 
 func runGo(ctx context.Context, rendrRoot string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd, tree := newTier1Command(ctx, "go", args...)
 	cmd.Dir = rendrRoot
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
-	// WaitDelay (Go 1.20+) is the critical knob: when ctx fires,
-	// CommandContext SIGKILLs `go`, but `go test` has already
-	// forked a compiled test binary which inherits the pipe. Without
-	// WaitDelay, cmd.Wait blocks indefinitely waiting for the orphan
-	// to close stdout — which is exactly the deadlock we observed
-	// on the Linux test host (30+min hang on go-test-race with
-	// only 18s CPU). 10s after Kill, the runtime force-closes I/O
-	// and Wait returns.
-	cmd.WaitDelay = 10 * time.Second
-	if err := cmd.Run(); err != nil {
+	if err := runTier1Command(cmd, tree); err != nil {
 		excerpt := strings.TrimSpace(stderr.String())
 		if len(excerpt) > 4000 {
 			excerpt = excerpt[len(excerpt)-4000:]
 		}
-		return fmt.Errorf("go %s: %v\n%s", strings.Join(args, " "), err, excerpt)
+		return fmt.Errorf("go %s: %w\n%s", strings.Join(args, " "), err, excerpt)
 	}
 	return nil
 }
