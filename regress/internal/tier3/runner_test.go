@@ -1,13 +1,12 @@
 package tier3
 
 import (
-	"bytes"
-	"encoding/json"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/FrankoonG/rendr/regress/internal/gotestjson"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -19,7 +18,7 @@ func TestSpecsFreezeCurrentMatrix(t *testing.T) {
 	}
 
 	var t3, tunT3 int
-	for _, spec := range specs {
+	for i, spec := range specs {
 		switch {
 		case strings.HasPrefix(spec.ID, "TestTUNT3"):
 			tunT3++
@@ -33,6 +32,9 @@ func TestSpecsFreezeCurrentMatrix(t *testing.T) {
 		}
 		if spec.Suite != manifest.SuiteNormal || !spec.Mandatory || spec.Budget != matrixTestBudget {
 			t.Fatalf("spec %q has invalid release metadata: %+v", spec.ID, spec)
+		}
+		if got := caseDefs[i].expected; !reflect.DeepEqual(got, []string{spec.ID}) {
+			t.Fatalf("case %q expected tests=%v, want [%s]", spec.ID, got, spec.ID)
 		}
 	}
 	if t3 != 30 || tunT3 != 14 {
@@ -91,11 +93,11 @@ func TestSelectSpecs(t *testing.T) {
 	})
 }
 
-func TestBuildRunPatternIsAnchoredAndQuoted(t *testing.T) {
-	specs := []manifest.Spec{manifest.Required("TestA[1]", "T3"), manifest.Required("TestB+", "T3")}
-	pattern := buildRunPattern(specs)
+func TestExactTestPatternIsAnchoredAndQuoted(t *testing.T) {
+	names := []string{"TestA[1]", "TestB+"}
+	pattern := exactTestPattern(names)
 	re := regexp.MustCompile(pattern)
-	for _, name := range []string{"TestA[1]", "TestB+"} {
+	for _, name := range names {
 		if !re.MatchString(name) {
 			t.Errorf("pattern %q does not match selected %q", pattern, name)
 		}
@@ -104,18 +106,6 @@ func TestBuildRunPatternIsAnchoredAndQuoted(t *testing.T) {
 		if re.MatchString(name) {
 			t.Errorf("pattern %q unexpectedly matches %q", pattern, name)
 		}
-	}
-}
-
-func TestBuildGoTestArgsUsesOnlySelectedNames(t *testing.T) {
-	selected := []manifest.Spec{manifest.Required("TestOne", "T3"), manifest.Required("TestTwo", "T3")}
-	got := buildGoTestArgs(selected)
-	want := []string{
-		"test", "-json", "-count=1", "-timeout", "6m",
-		"-run", "^(?:TestOne|TestTwo)$", "./internal/matrix/...",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("args=%#v, want %#v", got, want)
 	}
 }
 
@@ -129,14 +119,14 @@ func TestFilteredRunPatternMatchesOnlySelection(t *testing.T) {
 		{name: "inclusive from-case", opts: Options{FromCase: all[40].ID}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			selected, err := selectSpecs(tc.opts)
+			selected, err := selectCaseDefs(tc.opts)
 			if err != nil {
 				t.Fatal(err)
 			}
-			pattern := regexp.MustCompile(buildRunPattern(selected))
+			pattern := regexp.MustCompile(exactTestPattern(expectedTestNames(selected)))
 			selectedIDs := make(map[string]bool, len(selected))
-			for _, spec := range selected {
-				selectedIDs[spec.ID] = true
+			for _, def := range selected {
+				selectedIDs[def.spec.ID] = true
 			}
 			for _, spec := range all {
 				if got, want := pattern.MatchString(spec.ID), selectedIDs[spec.ID]; got != want {
@@ -147,95 +137,125 @@ func TestFilteredRunPatternMatchesOnlySelection(t *testing.T) {
 	}
 }
 
-func TestParseTestEventsUsesDefinitionOrder(t *testing.T) {
-	selected := syntheticSpecs("TestFirst", "TestSecond")
-	stream := eventStream(t,
-		event{Action: "run", Test: "TestSecond"},
-		event{Action: "pass", Test: "TestSecond", Elapsed: 0.2},
-		event{Action: "run", Test: "TestFirst"},
-		event{Action: "pass", Test: "TestFirst", Elapsed: 0.1},
-	)
+func TestGoTestReportCasesUseDefinitionOrder(t *testing.T) {
+	defs := []caseDef{matrixCase("TestFirst"), matrixCase("TestSecond")}
+	result := gotestjson.Result{Tests: []gotestjson.TestResult{
+		{Name: "TestSecond", Status: gotestjson.StatusPassed},
+		{Name: "TestFirst", Status: gotestjson.StatusPassed},
+	}}
 
-	cases, err := parseTestEvents(stream, selected)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cases := goTestReportCases(defs, result)
 	if got := caseNames(cases); !reflect.DeepEqual(got, []string{"TestFirst", "TestSecond"}) {
 		t.Fatalf("report order=%v", got)
 	}
-	for _, c := range cases {
-		if c.Failure != "" || c.SkipReason != "" {
-			t.Fatalf("case %q unexpectedly non-pass: %+v", c.Name, c)
-		}
+	for _, testCase := range cases {
+		assertCasePasses(t, testCase)
 	}
 }
 
-func TestParseTestEventsFailsAbsentSelectedTest(t *testing.T) {
-	selected := syntheticSpecs("TestPresent", "TestAbsent")
-	stream := eventStream(t,
-		event{Action: "run", Test: "TestPresent"},
-		event{Action: "pass", Test: "TestPresent"},
-	)
-
-	cases, err := parseTestEvents(stream, selected)
-	if err != nil {
-		t.Fatal(err)
+func TestGoTestReportCasesFailClosed(t *testing.T) {
+	const name = "TestExpected"
+	tests := []struct {
+		name       string
+		result     gotestjson.Result
+		wantField  string
+		wantDetail string
+	}{
+		{
+			name: "zero tests",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusNotRun}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueZeroTests, Detail: "no run events"}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueZeroTests),
+		},
+		{
+			name: "malformed JSON",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusNotRun}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueMalformedJSON, Detail: "truncated object"}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueMalformedJSON),
+		},
+		{
+			name: "truncated capture",
+			result: gotestjson.Result{
+				Tests:            []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusIncomplete}},
+				CaptureTruncated: true,
+				Issues:           []gotestjson.Issue{{Code: gotestjson.IssueCaptureLimit, Detail: "capture full"}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueCaptureLimit),
+		},
+		{
+			name: "missing terminal event",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusIncomplete}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueNoTerminal, Test: name}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueNoTerminal),
+		},
+		{
+			name: "mandatory skip",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusSkipped}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueMandatorySkip, Test: name}},
+			},
+			wantField: "skip", wantDetail: "mandatory top-level test",
+		},
+		{
+			name: "unexpected test",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusPassed}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueUnexpectedTest, Test: "TestOther"}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueUnexpectedTest),
+		},
+		{
+			name: "command failure",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusNotRun}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueCommandFailed, Detail: "exit status 2"}},
+			},
+			wantField: "invalid", wantDetail: string(gotestjson.IssueCommandFailed),
+		},
+		{
+			name: "test failure",
+			result: gotestjson.Result{
+				Tests:  []gotestjson.TestResult{{Name: name, Status: gotestjson.StatusFailed, Output: "assertion failed\n"}},
+				Issues: []gotestjson.Issue{{Code: gotestjson.IssueTestFailed, Test: name}},
+			},
+			wantField: "failure", wantDetail: "assertion failed",
+		},
 	}
-	if cases[1].Failure == "" || cases[1].SkipReason != "" {
-		t.Fatalf("absent selected test did not fail: %+v", cases[1])
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cases := goTestReportCases([]caseDef{matrixCase(name)}, tc.result)
+			if len(cases) != 1 {
+				t.Fatalf("len(cases)=%d, want 1", len(cases))
+			}
+			assertCaseField(t, cases[0], tc.wantField, tc.wantDetail)
+		})
 	}
 }
 
-func TestParseTestEventsFailsWithoutTerminalEvent(t *testing.T) {
-	selected := syntheticSpecs("TestInterrupted")
-	stream := eventStream(t,
-		event{Action: "run", Test: "TestInterrupted"},
-		event{Action: "output", Test: "TestInterrupted", Output: "partial output\n"},
-	)
-
-	cases, err := parseTestEvents(stream, selected)
-	if err != nil {
-		t.Fatal(err)
+func TestGoTestReportDiagnosticIsBounded(t *testing.T) {
+	const name = "TestExpected"
+	result := gotestjson.Result{
+		Tests: []gotestjson.TestResult{{
+			Name:   name,
+			Status: gotestjson.StatusIncomplete,
+			Output: strings.Repeat("x", 2*maxReportDiagnosticBytes),
+		}},
+		Issues: []gotestjson.Issue{{Code: gotestjson.IssueNoTerminal, Test: name}},
 	}
-	if cases[0].Failure == "" || !strings.Contains(cases[0].Failure, "no terminal") {
-		t.Fatalf("unterminated selected test did not fail: %+v", cases[0])
+	testCase := goTestReportCases([]caseDef{matrixCase(name)}, result)[0]
+	if len(testCase.InvalidReason) > maxReportDiagnosticBytes {
+		t.Fatalf("invalid diagnostic length=%d, max=%d", len(testCase.InvalidReason), maxReportDiagnosticBytes)
 	}
-	if cases[0].SkipReason != "" {
-		t.Fatalf("unterminated selected test was skipped: %+v", cases[0])
+	if !strings.Contains(testCase.InvalidReason, "diagnostic truncated") {
+		t.Fatalf("bounded diagnostic lacks truncation marker: %q", testCase.InvalidReason)
 	}
-}
-
-func TestParseTestEventsFailsZeroTests(t *testing.T) {
-	cases, err := parseTestEvents(strings.NewReader(""), syntheticSpecs("TestExpected"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cases) != 1 || cases[0].Failure == "" {
-		t.Fatalf("zero-test stream did not fail: %+v", cases)
-	}
-	if cases[0].SkipReason != "" {
-		t.Fatalf("zero-test stream was skipped: %+v", cases[0])
-	}
-}
-
-func syntheticSpecs(ids ...string) []manifest.Spec {
-	specs := make([]manifest.Spec, len(ids))
-	for i, id := range ids {
-		specs[i] = manifest.Required(id, "T3")
-	}
-	return specs
-}
-
-func eventStream(t *testing.T, events ...event) *bytes.Reader {
-	t.Helper()
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, ev := range events {
-		if err := enc.Encode(ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return bytes.NewReader(buf.Bytes())
 }
 
 func specIDs(specs []manifest.Spec) []string {
@@ -248,8 +268,36 @@ func specIDs(specs []manifest.Spec) []string {
 
 func caseNames(cases []report.Case) []string {
 	names := make([]string, len(cases))
-	for i, c := range cases {
-		names[i] = c.Name
+	for i, testCase := range cases {
+		names[i] = testCase.Name
 	}
 	return names
+}
+
+func assertCasePasses(t *testing.T, testCase report.Case) {
+	t.Helper()
+	if testCase.Failure != "" || testCase.InvalidReason != "" || testCase.SkipReason != "" {
+		t.Fatalf("case unexpectedly did not pass: %+v", testCase)
+	}
+}
+
+func assertCaseField(t *testing.T, testCase report.Case, field, detail string) {
+	t.Helper()
+	var got string
+	switch field {
+	case "failure":
+		got = testCase.Failure
+	case "invalid":
+		got = testCase.InvalidReason
+	case "skip":
+		got = testCase.SkipReason
+	default:
+		t.Fatalf("unknown case field %q", field)
+	}
+	if got == "" || !strings.Contains(got, detail) {
+		t.Fatalf("case field %s=%q, want detail %q; case=%+v", field, got, detail, testCase)
+	}
+	if testCase.Failure == "" && testCase.InvalidReason == "" && testCase.SkipReason == "" {
+		t.Fatalf("case unexpectedly passed: %+v", testCase)
+	}
 }

@@ -5,10 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
+	"path/filepath"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/gotestjson"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -20,21 +20,29 @@ type Options struct {
 }
 
 type caseDef struct {
-	spec    manifest.Spec
-	pattern string
+	spec     manifest.Spec
+	expected []string
 }
 
 var caseDefs = []caseDef{
-	{manifest.RequiredWithBudget("T6.graph.compat-mode", "T6", 2*time.Minute), "TestTargetConstructors|TestLegacy|TestDialerCompile|TestDialerRoot"},
-	{manifest.RequiredWithBudget("T6.peak.A-to-bulk-bond", "T6", 2*time.Minute), "^TestSelectorPeakTransferRuntimePromotesToBond$"},
-	{manifest.RequiredWithBudget("T6.peak.nested-normal-to-C", "T6", 2*time.Minute), "^TestSelectorPeakTransferNormalSelectorUsesQuality$"},
-	{manifest.RequiredWithBudget("T6.failover.hot-standby", "T6", 2*time.Minute), "^TestSelectorHotStandbyFailover$"},
-	{manifest.RequiredWithBudget("T6.peak.composite-normal", "T6", 2*time.Minute), "^TestSelectorPeakTransferCompositeNormalDeathStaysNormal$"},
-	{manifest.RequiredWithBudget("T6.peak.bad-speed", "T6", 2*time.Minute), "^TestSelectorPeakTransferBadSpeedQualityGate$"},
-	{manifest.RequiredWithBudget("T6.peak.stale-speed", "T6", 2*time.Minute), "^TestSelectorPeakTransferStaleSpeedEvidence$"},
-	{manifest.RequiredWithBudget("T6.peak.probe-budget", "T6", 2*time.Minute), "^TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate$"},
-	{manifest.RequiredWithBudget("T6.peak.slow-peak-revert", "T6", 2*time.Minute), "^TestSelectorPeakTransferSlowPeakRevertsAndSuppresses$"},
-	{manifest.RequiredWithBudget("T6.peak.rx-peer-policy", "T6", 2*time.Minute), "^TestSelectorPeakTransferRxPromotesPeerSenderOnly$"},
+	{
+		spec: manifest.RequiredWithBudget("T6.graph.compat-mode", "T6", 2*time.Minute),
+		expected: []string{
+			"TestLegacyRootTargetCompilesModes",
+			"TestTargetConstructorsExposeGroupKinds",
+			"TestDialerCompileDialPlanUsesRoot",
+			"TestDialerRootSelectorDialSmoke",
+		},
+	},
+	{manifest.RequiredWithBudget("T6.peak.A-to-bulk-bond", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferRuntimePromotesToBond"}},
+	{manifest.RequiredWithBudget("T6.peak.nested-normal-to-C", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferNormalSelectorUsesQuality"}},
+	{manifest.RequiredWithBudget("T6.failover.hot-standby", "T6", 2*time.Minute), []string{"TestSelectorHotStandbyFailover"}},
+	{manifest.RequiredWithBudget("T6.peak.composite-normal", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferCompositeNormalDeathStaysNormal"}},
+	{manifest.RequiredWithBudget("T6.peak.bad-speed", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferBadSpeedQualityGate"}},
+	{manifest.RequiredWithBudget("T6.peak.stale-speed", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferStaleSpeedEvidence"}},
+	{manifest.RequiredWithBudget("T6.peak.probe-budget", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate"}},
+	{manifest.RequiredWithBudget("T6.peak.slow-peak-revert", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferSlowPeakRevertsAndSuppresses"}},
+	{manifest.RequiredWithBudget("T6.peak.rx-peer-policy", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferRxPromotesPeerSenderOnly"}},
 }
 
 // Specs returns the ordered T6 case manifest.
@@ -75,7 +83,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	for _, def := range defs {
 		def := def
 		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
-			return runRootTargetGraphTests(c, rendrRoot, def.spec.ID, def.pattern)
+			return runRootTargetGraphTests(c, rendrRoot, def)
 		})
 	}
 }
@@ -101,7 +109,9 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 			Failure:  "case exceeded T6 budget: " + cctx.Err().Error(),
 		}
 	}
-	if rc.Failure != "" {
+	if rc.InvalidReason != "" {
+		fmt.Printf("  > T6/%s (took %s) - INVALID: %s\n", name, rc.Duration, rc.InvalidReason)
+	} else if rc.Failure != "" {
 		fmt.Printf("  > T6/%s (took %s) - FAIL: %s\n", name, rc.Duration, rc.Failure)
 	} else if rc.SkipReason != "" {
 		fmt.Printf("  > T6/%s - SKIP: %s\n", name, rc.SkipReason)
@@ -111,24 +121,19 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	suite.Add(rc)
 }
 
-func runRootTargetGraphTests(ctx context.Context, rendrRoot, name, pattern string) report.Case {
+func runRootTargetGraphTests(ctx context.Context, rendrRoot string, def caseDef) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
-		return report.Case{Name: name, Tier: "T6", Failure: "bad rendr root: " + err.Error()}
+		return report.Case{Name: def.spec.ID, Tier: "T6", InvalidReason: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.CommandContext(
-		ctx,
-		"/usr/local/go/bin/go",
-		"test",
-		".",
-		"-run",
-		pattern,
-		"-count=1",
-	)
-	cmd.Dir = rendrRoot
-	cmd.Env = append(os.Environ(), "GOCACHE=/tmp/go-build-rendr-t6")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return report.Case{Name: name, Tier: "T6", Failure: fmt.Sprintf("%v (%s)", err, strings.TrimSpace(string(out)))}
+	result, err := tier6GoTestExecutor.Run(ctx, gotestjson.Request{
+		Dir:      rendrRoot,
+		Package:  ".",
+		Pattern:  exactTestPattern(def.expected),
+		Expected: testExpectations(def.expected),
+		Env:      []string{"GOCACHE=" + filepath.Join(os.TempDir(), "go-build-rendr-t6")},
+	})
+	if err != nil && result.Passed() {
+		result.Issues = append(result.Issues, gotestjson.Issue{Code: gotestjson.IssueCommandFailed, Detail: err.Error()})
 	}
-	return report.Case{Name: name, Tier: "T6"}
+	return goTestReportCase(def.spec.ID, "T6", def.expected, result)
 }
