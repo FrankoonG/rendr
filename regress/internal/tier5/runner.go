@@ -51,7 +51,9 @@ var caseDefs = []caseDef{
 	},
 	{spec: manifest.RequiredWithBudget("T5.3-tcprepair-unprivileged", "T5", 2*time.Minute), run: probeUnprivileged},
 	{spec: manifest.RequiredWithBudget("T5.4-gvisor-unprivileged", "T5", 2*time.Minute), run: probeGVisorUnprivileged},
-	{spec: manifest.RequiredWithBudget("T5.5-tcprepair-gvisor-fallback-unprivileged", "T5", 2*time.Minute), run: probeTCPRepairGVisorFallbackUnprivileged},
+	// Keep the historical ID stable for --case/--from-case. The v1 oracle
+	// proves framed redial/attach and records that gVisor is not involved.
+	{spec: manifest.RequiredWithBudget("T5.5-tcprepair-gvisor-fallback-unprivileged", "T5", 2*time.Minute), run: probeTCPRepairFallbackUnprivileged},
 	{spec: manifest.RequiredWithBudget("T5.6-gvisor-packet-carrier-unprivileged", "T5", 2*time.Minute), run: probeGVisorPacketCarrierUnprivileged},
 }
 
