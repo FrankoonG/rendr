@@ -17,10 +17,11 @@ type engineBackedConn struct {
 	e    *engine.Engine
 	conn *engine.Conn
 
-	mode    atomic.Uint32 // Mode
-	closing atomic.Bool   // local-Close in flight; gates BYE send
-	peak    *peakTransferController
-	status  *pathStatusTracker
+	mode     atomic.Uint32 // Mode
+	closing  atomic.Bool   // local-Close in flight; gates BYE send
+	peak     *peakTransferController
+	status   *pathStatusTracker
+	resolver *pathFactoryResolver
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -186,13 +187,14 @@ func (c *engineBackedConn) MigratePathLocalAddr(id uint32, newLocal string) erro
 	return c.e.MigratePathLocalAddr(id, newLocal)
 }
 
-// AddPath dials a path matching spec and attaches it to this
-// engine via BRIDGE_TAG. The new path joins the existing flow on
-// the server side without breaking the application's Conn.
+// AddPath dials a path matching spec through the session-bound factory
+// resolver and attaches it to this engine via BRIDGE_TAG. The new path joins
+// the existing flow on the server side without breaking the application's
+// Conn.
 func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pc, err := dialPath(ctx, spec)
+	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
 	}

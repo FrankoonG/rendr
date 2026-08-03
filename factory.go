@@ -4,7 +4,57 @@ import (
 	"context"
 	"fmt"
 	"net"
+
+	"github.com/FrankoonG/rendr/transport"
+	"github.com/FrankoonG/rendr/transport/tcp"
+	"github.com/FrankoonG/rendr/transport/udpflow"
 )
+
+// pathFactoryResolver is the immutable, per-session snapshot of a Dialer's
+// custom factories. A session must keep using the factories that established
+// it even if the caller later reuses or mutates the original Dialer.
+type pathFactoryResolver struct {
+	stream map[string]StreamPathFactory
+	packet map[string]PacketPathFactory
+}
+
+func (d *Dialer) snapshotFactoryResolver() *pathFactoryResolver {
+	resolver := &pathFactoryResolver{
+		stream: make(map[string]StreamPathFactory, len(d.streamFactories)),
+		packet: make(map[string]PacketPathFactory, len(d.packetFactories)),
+	}
+	for name, factory := range d.streamFactories {
+		resolver.stream[name] = factory
+	}
+	for name, factory := range d.packetFactories {
+		resolver.packet[name] = factory
+	}
+	return resolver
+}
+
+// dialPath resolves a path against the session snapshot before consulting the
+// process-wide transport registry. The nil receiver is intentional: inbound
+// listener sessions have no caller-provided factories and retain the existing
+// registry-only AddPath behavior.
+func (r *pathFactoryResolver) dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
+	if r != nil {
+		if factory, ok := r.stream[spec.Transport]; ok {
+			conn, err := factory(ctx, spec.Address)
+			if err != nil {
+				return nil, err
+			}
+			return tcp.Wrap(conn), nil
+		}
+		if factory, ok := r.packet[spec.Transport]; ok {
+			conn, err := factory(ctx, spec.Address)
+			if err != nil {
+				return nil, err
+			}
+			return udpflow.WrapFromSpec(conn, spec)
+		}
+	}
+	return dialPath(ctx, spec)
+}
 
 // StreamPathFactory constructs the underlying byte-stream net.Conn for
 // one rendr stream-mode path. The factory's contract:
@@ -51,6 +101,10 @@ type PacketPathFactory func(ctx context.Context, addr string) (net.PacketConn, e
 // override a registered transport (e.g. a custom "tcp" implementation
 // for one Dialer only). To reach the global registry name, just leave
 // it unregistered on the Dialer.
+//
+// Dial and DialPacket snapshot the registered factories. Registrations or
+// other Dialer mutations after a connection is created do not affect that
+// connection's retries or dynamic AddPath calls.
 func (d *Dialer) AddStreamPathFactory(name string, f StreamPathFactory) error {
 	if name == "" {
 		return fmt.Errorf("rendr: empty StreamPathFactory name")
@@ -88,6 +142,8 @@ func (d *Dialer) AddStreamPathFactory(name string, f StreamPathFactory) error {
 //     the random flow_id; otherwise crypto/rand picks one.
 //
 // Names are unique per Dialer across both stream and packet maps.
+// Existing sessions retain the factory snapshot captured when they dialed;
+// registering another factory later affects only future sessions.
 func (d *Dialer) AddPacketPathFactory(name string, f PacketPathFactory) error {
 	if name == "" {
 		return fmt.Errorf("rendr: empty PacketPathFactory name")

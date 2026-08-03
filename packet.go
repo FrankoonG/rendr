@@ -22,10 +22,11 @@ import (
 // preservation to hold; this is negotiated in HELLO via
 // proto.CapsPacketMode.
 type enginePacketConn struct {
-	e      *engine.Engine
-	mode   atomic.Uint32
-	peak   *peakTransferController
-	status *pathStatusTracker
+	e        *engine.Engine
+	mode     atomic.Uint32
+	peak     *peakTransferController
+	status   *pathStatusTracker
+	resolver *pathFactoryResolver
 
 	lAddr   net.Addr
 	rAddr   net.Addr
@@ -142,12 +143,13 @@ func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
-// AddPath dials and attaches a fresh path matching spec. Same
-// semantics as AdminConn.AddPath on stream mode.
+// AddPath dials through the session-bound factory resolver and attaches a
+// fresh path matching spec. Same semantics as AdminConn.AddPath on stream
+// mode.
 func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pc, err := dialPath(ctx, spec)
+	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
 	}

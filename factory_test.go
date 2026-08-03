@@ -253,3 +253,328 @@ func TestM9X5AddPacketFactoryValidation(t *testing.T) {
 		t.Fatalf("expected stream-shadow-packet error, got %v", err)
 	}
 }
+
+func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := startFactoryStreamAccept(ln)
+
+	const transportName = "snapshot-stream"
+	var originalCalls, mutatedCalls, lateCalls atomic.Int32
+	original := func(ctx context.Context, addr string) (net.Conn, error) {
+		originalCalls.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	d := &Dialer{Paths: []PathSpec{{Transport: transportName, Address: ln.Addr().String()}}}
+	if err := d.AddStreamPathFactory(transportName, original); err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := awaitFactoryAccept(t, accepted)
+	defer server.Close()
+
+	// Replace the original Dialer's map after Dial. The live session must not
+	// share this map or consult it again.
+	d.streamFactories = map[string]StreamPathFactory{
+		transportName: func(context.Context, string) (net.Conn, error) {
+			mutatedCalls.Add(1)
+			return nil, errors.New("mutated stream factory must not run")
+		},
+	}
+	if err := d.AddStreamPathFactory("late-stream", func(context.Context, string) (net.Conn, error) {
+		lateCalls.Add(1)
+		return nil, errors.New("late stream factory must not run")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := client.(AdminConn)
+	if _, err := admin.AddPath(PathSpec{Transport: transportName, Address: ln.Addr().String()}); err != nil {
+		t.Fatalf("AddPath through captured stream factory: %v", err)
+	}
+	waitFactoryPathCount(t, client, server, 2)
+	if got := originalCalls.Load(); got != 2 {
+		t.Fatalf("original stream factory calls=%d, want 2", got)
+	}
+	if got := mutatedCalls.Load(); got != 0 {
+		t.Fatalf("mutated stream factory calls=%d, want 0", got)
+	}
+
+	_, err = admin.AddPath(PathSpec{Transport: "late-stream", Address: ln.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), `transport: "late-stream" not registered`) {
+		t.Fatalf("late stream factory error=%v, want current registry error", err)
+	}
+	if got := lateCalls.Load(); got != 0 {
+		t.Fatalf("late stream factory calls=%d, want 0", got)
+	}
+	assertFactoryStreamRoundTrip(t, client, server, "stream snapshot recovery")
+}
+
+func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := startFactoryPacketAccept(ln)
+
+	const transportName = "snapshot-packet"
+	var originalCalls, mutatedCalls, lateCalls atomic.Int32
+	original := func(context.Context, string) (net.PacketConn, error) {
+		originalCalls.Add(1)
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	d := &Dialer{Paths: []PathSpec{{Transport: transportName, Address: ln.Addr().String()}}}
+	if err := d.AddPacketPathFactory(transportName, original); err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := awaitFactoryAccept(t, accepted)
+	defer server.Close()
+
+	d.packetFactories = map[string]PacketPathFactory{
+		transportName: func(context.Context, string) (net.PacketConn, error) {
+			mutatedCalls.Add(1)
+			return nil, errors.New("mutated packet factory must not run")
+		},
+	}
+	if err := d.AddPacketPathFactory("late-packet", func(context.Context, string) (net.PacketConn, error) {
+		lateCalls.Add(1)
+		return nil, errors.New("late packet factory must not run")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := client.(AdminPacketConn)
+	if _, err := admin.AddPath(PathSpec{Transport: transportName, Address: ln.Addr().String()}); err != nil {
+		t.Fatalf("AddPath through captured packet factory: %v", err)
+	}
+	waitFactoryPathCount(t, client, server, 2)
+	if got := originalCalls.Load(); got != 2 {
+		t.Fatalf("original packet factory calls=%d, want 2", got)
+	}
+	if got := mutatedCalls.Load(); got != 0 {
+		t.Fatalf("mutated packet factory calls=%d, want 0", got)
+	}
+
+	_, err = admin.AddPath(PathSpec{Transport: "late-packet", Address: ln.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), `transport: "late-packet" not registered`) {
+		t.Fatalf("late packet factory error=%v, want current registry error", err)
+	}
+	if got := lateCalls.Load(); got != 0 {
+		t.Fatalf("late packet factory calls=%d, want 0", got)
+	}
+	assertFactoryPacketRoundTrip(t, client, server, "packet snapshot recovery")
+}
+
+func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
+	ln, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := startFactoryStreamAccept(ln)
+
+	const transportName = "retry-stream"
+	var originalCalls, mutatedCalls atomic.Int32
+	original := func(ctx context.Context, addr string) (net.Conn, error) {
+		call := originalCalls.Add(1)
+		if call == 2 {
+			return nil, errors.New("injected initial extra-path failure")
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	d := &Dialer{
+		Paths: []PathSpec{
+			{Transport: transportName, Address: ln.Addr().String()},
+			{Transport: transportName, Address: ln.Addr().String()},
+		},
+		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
+	}
+	if err := d.AddStreamPathFactory(transportName, original); err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := awaitFactoryAccept(t, accepted)
+	defer server.Close()
+
+	d.streamFactories = map[string]StreamPathFactory{
+		transportName: func(context.Context, string) (net.Conn, error) {
+			mutatedCalls.Add(1)
+			return nil, errors.New("mutated retry stream factory must not run")
+		},
+	}
+	waitFactoryPathCount(t, client, server, 2)
+	if got := originalCalls.Load(); got < 3 {
+		t.Fatalf("original retry stream factory calls=%d, want at least 3", got)
+	}
+	if got := mutatedCalls.Load(); got != 0 {
+		t.Fatalf("mutated retry stream factory calls=%d, want 0", got)
+	}
+	assertFactoryStreamRoundTrip(t, client, server, "stream snapshot retry")
+}
+
+func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
+	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := startFactoryPacketAccept(ln)
+
+	const transportName = "retry-packet"
+	var originalCalls, mutatedCalls atomic.Int32
+	original := func(context.Context, string) (net.PacketConn, error) {
+		call := originalCalls.Add(1)
+		if call == 2 {
+			return nil, errors.New("injected initial packet extra-path failure")
+		}
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	d := &Dialer{
+		Paths: []PathSpec{
+			{Transport: transportName, Address: ln.Addr().String()},
+			{Transport: transportName, Address: ln.Addr().String()},
+		},
+		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
+	}
+	if err := d.AddPacketPathFactory(transportName, original); err != nil {
+		t.Fatal(err)
+	}
+	client, err := d.DialPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := awaitFactoryAccept(t, accepted)
+	defer server.Close()
+
+	d.packetFactories = map[string]PacketPathFactory{
+		transportName: func(context.Context, string) (net.PacketConn, error) {
+			mutatedCalls.Add(1)
+			return nil, errors.New("mutated retry packet factory must not run")
+		},
+	}
+	waitFactoryPathCount(t, client, server, 2)
+	if got := originalCalls.Load(); got < 3 {
+		t.Fatalf("original retry packet factory calls=%d, want at least 3", got)
+	}
+	if got := mutatedCalls.Load(); got != 0 {
+		t.Fatalf("mutated retry packet factory calls=%d, want 0", got)
+	}
+	assertFactoryPacketRoundTrip(t, client, server, "packet snapshot retry")
+}
+
+type factoryAcceptResult[T any] struct {
+	conn T
+	err  error
+}
+
+func startFactoryStreamAccept(ln Listener) <-chan factoryAcceptResult[Conn] {
+	result := make(chan factoryAcceptResult[Conn], 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.Accept(ctx)
+		result <- factoryAcceptResult[Conn]{conn: conn, err: err}
+	}()
+	return result
+}
+
+func startFactoryPacketAccept(ln PacketListener) <-chan factoryAcceptResult[PacketConn] {
+	result := make(chan factoryAcceptResult[PacketConn], 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.AcceptPacket(ctx)
+		result <- factoryAcceptResult[PacketConn]{conn: conn, err: err}
+	}()
+	return result
+}
+
+func awaitFactoryAccept[T any](t *testing.T, result <-chan factoryAcceptResult[T]) T {
+	t.Helper()
+	select {
+	case accepted := <-result:
+		if accepted.err != nil {
+			t.Fatalf("accept: %v", accepted.err)
+		}
+		return accepted.conn
+	case <-time.After(6 * time.Second):
+		t.Fatal("accept timed out")
+		var zero T
+		return zero
+	}
+}
+
+type factoryPathSnapshot interface {
+	Paths() []PathInfo
+}
+
+func waitFactoryPathCount(t *testing.T, client, server factoryPathSnapshot, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) >= want && len(server.Paths()) >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("paths did not reach %d: client=%d server=%d", want, len(client.Paths()), len(server.Paths()))
+}
+
+func assertFactoryStreamRoundTrip(t *testing.T, client, server Conn, payload string) {
+	t.Helper()
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != payload {
+		t.Fatalf("stream payload=%q, want %q", got, payload)
+	}
+}
+
+func assertFactoryPacketRoundTrip(t *testing.T, client, server PacketConn, payload string) {
+	t.Helper()
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.WriteTo([]byte(payload), nil); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload)+32)
+	n, _, err := server.ReadFrom(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got[:n]) != payload {
+		t.Fatalf("packet payload=%q, want %q", got[:n], payload)
+	}
+}

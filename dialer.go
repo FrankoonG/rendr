@@ -10,8 +10,6 @@ import (
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
-	"github.com/FrankoonG/rendr/transport/tcp"
-	"github.com/FrankoonG/rendr/transport/udpflow"
 )
 
 // Dialer is the entry point for constructing a rendr Conn.
@@ -130,6 +128,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
+	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	flowID := engine.NewClientFlowID()
@@ -140,7 +139,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, false)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, resolver, false)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -163,9 +162,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		if i == firstIndex {
 			continue
 		}
-		id, err := d.attachExtraPath(ctx, e, ps, i, tracker)
+		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
 		if err != nil {
-			d.startRetry(e, ps, i, tracker)
+			d.startRetry(e, ps, i, tracker, resolver)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -178,6 +177,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	}
 	bc := newEngineBackedConn(e, c, mode)
 	bc.status = tracker
+	bc.resolver = resolver
 
 	// Arm the prime scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
@@ -209,6 +209,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	if len(paths) == 0 {
 		return nil, errNoPaths
 	}
+	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	flowID := engine.NewClientFlowID()
@@ -220,7 +221,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, true)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, resolver, true)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -241,9 +242,9 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		if i == firstIndex {
 			continue
 		}
-		id, err := d.attachExtraPath(ctx, e, ps, i, tracker)
+		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
 		if err != nil {
-			d.startRetry(e, ps, i, tracker)
+			d.startRetry(e, ps, i, tracker, resolver)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -253,6 +254,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	rAddr := addrFromString(first.Address)
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
 	bc.status = tracker
+	bc.resolver = resolver
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)
@@ -354,13 +356,14 @@ func (d *Dialer) dialInitialPath(
 	paths []PathSpec,
 	plan compiledTarget,
 	tracker *pathStatusTracker,
+	resolver *pathFactoryResolver,
 	packetMode bool,
 ) (PathSpec, int, transport.PathConn, proto.HelloAckPayload, error) {
 	var lastErr error
 	primaryPolicy := d.effectivePrimaryPolicy()
 	for i, ps := range paths {
 		tracker.set(i, PathDialing, nil)
-		pc, err := d.dialPathWithFactories(ctx, ps)
+		pc, err := resolver.dialPath(ctx, ps)
 		if err != nil {
 			tracker.set(i, PathUnavailable, err)
 			lastErr = err
@@ -389,9 +392,9 @@ func (d *Dialer) dialInitialPath(
 	return PathSpec{}, -1, nil, proto.HelloAckPayload{}, errNoPaths
 }
 
-func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker) (uint32, error) {
+func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
 	tracker.set(index, PathDialing, nil)
-	spc, err := d.dialPathWithFactories(ctx, ps)
+	spc, err := resolver.dialPath(ctx, ps)
 	if err != nil {
 		tracker.set(index, PathUnavailable, err)
 		return 0, err
@@ -419,7 +422,7 @@ func pathStateForHandshakeError(err error) PathState {
 	return PathNative
 }
 
-func (d *Dialer) startRetry(e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker) {
+func (d *Dialer) startRetry(e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) {
 	if tracker == nil {
 		return
 	}
@@ -445,7 +448,7 @@ func (d *Dialer) startRetry(e *engine.Engine, ps PathSpec, index int, tracker *p
 			case <-timer.C:
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, err := d.attachExtraPath(ctx, e, ps, index, tracker)
+			_, err := d.attachExtraPath(ctx, e, ps, index, tracker, resolver)
 			cancel()
 			if err == nil {
 				return
@@ -494,31 +497,6 @@ func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 		return nil, err
 	}
 	return tp.DialPath(ctx, spec)
-}
-
-// dialPathWithFactories is the Dialer-side variant. Consults the
-// Dialer's per-instance factory maps first, then falls back to
-// dialPath. Stream factories wrap the returned net.Conn via tcp.Wrap;
-// packet factories wrap the returned net.PacketConn via
-// udpflow.WrapFromSpec (which resolves peer addr + flow_id from
-// spec). Both wrappers reuse the same on-wire framing as the built-
-// in tcp / udpflow adapters.
-func (d *Dialer) dialPathWithFactories(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
-	if f, ok := d.streamFactories[spec.Transport]; ok {
-		conn, err := f(ctx, spec.Address)
-		if err != nil {
-			return nil, err
-		}
-		return tcp.Wrap(conn), nil
-	}
-	if f, ok := d.packetFactories[spec.Transport]; ok {
-		pc, err := f(ctx, spec.Address)
-		if err != nil {
-			return nil, err
-		}
-		return udpflow.WrapFromSpec(pc, spec)
-	}
-	return dialPath(ctx, spec)
 }
 
 var errNoPaths = errors.New("rendr: Dialer has no Paths")
