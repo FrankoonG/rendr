@@ -1,11 +1,4 @@
-// Package tier5 implements the TCP fallback / adapter verification
-// tier. The current matrix is:
-//   - T5.1 privileged tcprepair same-tuple rebuild G1 gate
-//   - T5.2 privileged gvisor netstack G1 gate
-//   - T5.3 unprivileged tcprepair capability probe must fail clearly
-//   - T5.4 unprivileged gvisor netstack G1 gate
-//   - T5.5 unprivileged tcprepair-unavailable then gvisor fallback G1 gate
-//   - T5.6 unprivileged gvisor packet-carrier G1 gate
+// Package tier5 implements the TCP fallback / adapter verification tier.
 package tier5
 
 import (
@@ -17,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
 	"github.com/FrankoonG/rendr/transport/gvisor"
@@ -25,87 +19,94 @@ import (
 
 // Options filters the tier5 adapter matrix.
 type Options struct {
-	Case string
+	Case     string
+	FromCase string
+}
+
+type caseDef struct {
+	spec manifest.Spec
+	run  func(context.Context, string) report.Case
+}
+
+var caseDefs = []caseDef{
+	{
+		spec: manifest.RequiredWithBudget("T5.1-tcprepair-privileged", "T5", 3*time.Minute),
+		run: func(ctx context.Context, _ string) report.Case {
+			const name = "T5.1-tcprepair-privileged"
+			if err := tcprepair.Available(); err != nil {
+				return report.Case{Name: name, Tier: "T5", Failure: err.Error()}
+			}
+			r := smoke.RunG1TCPRepairSameTuple(ctx, smoke.G1TCPRepairOpts{Size: 100 << 20, Migrations: 3})
+			return report.Case{Name: name, Tier: "T5", Duration: r.Duration, Failure: r.Failure}
+		},
+	},
+	{
+		spec: manifest.RequiredWithBudget("T5.2-gvisor-privileged", "T5", 2*time.Minute),
+		run: func(ctx context.Context, _ string) report.Case {
+			const name = "T5.2-gvisor-privileged"
+			if err := gvisor.Available(); err != nil {
+				return report.Case{Name: name, Tier: "T5", Failure: err.Error()}
+			}
+			r := smoke.RunG1(ctx, smoke.G1Opts{Size: 30 << 20, Migrations: 3, Paths: 2, Transport: "gvisor"})
+			return report.Case{Name: name, Tier: "T5", Duration: r.Duration, Failure: r.Failure}
+		},
+	},
+	{spec: manifest.RequiredWithBudget("T5.3-tcprepair-unprivileged", "T5", 2*time.Minute), run: probeUnprivileged},
+	{spec: manifest.RequiredWithBudget("T5.4-gvisor-unprivileged", "T5", 2*time.Minute), run: probeGVisorUnprivileged},
+	{spec: manifest.RequiredWithBudget("T5.5-tcprepair-gvisor-fallback-unprivileged", "T5", 2*time.Minute), run: probeTCPRepairGVisorFallbackUnprivileged},
+	{spec: manifest.RequiredWithBudget("T5.6-gvisor-packet-carrier-unprivileged", "T5", 2*time.Minute), run: probeGVisorPacketCarrierUnprivileged},
+}
+
+// Specs returns the ordered T5 case manifest.
+func Specs() []manifest.Spec {
+	specs := make([]manifest.Spec, len(caseDefs))
+	for i, def := range caseDefs {
+		specs[i] = def.spec
+	}
+	return specs
+}
+
+func selectCaseDefs(opts Options) ([]caseDef, error) {
+	selected, err := manifest.Select(Specs(), opts.Case, opts.FromCase)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]caseDef, len(caseDefs))
+	for _, def := range caseDefs {
+		byID[def.spec.ID] = def
+	}
+	defs := make([]caseDef, 0, len(selected))
+	for _, spec := range selected {
+		defs = append(defs, byID[spec.ID])
+	}
+	return defs, nil
 }
 
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
-	matched := false
-	add := func(c report.Case) {
-		if !caseMatches(opts.Case, c.Name) {
-			return
-		}
-		matched = true
-		suite.Add(c)
-	}
-	run := func(name string, budget time.Duration, fn func(context.Context) report.Case) {
-		if !caseMatches(opts.Case, name) {
-			return
-		}
-		matched = true
-		runCase(ctx, suite, name, budget, fn)
-	}
-	defer func() {
-		if opts.Case != "" && !matched {
-			suite.Add(report.Case{
-				Name:    "T5-case-filter",
-				Tier:    "T5",
-				Failure: fmt.Sprintf("no T5 case matched %q", opts.Case),
-			})
-		}
-	}()
-
-	if runtime.GOOS != "linux" {
-		add(report.Case{
-			Name:       "T5.1-tcprepair-privileged",
-			Tier:       "T5",
-			SkipReason: "Linux only",
+	defs, err := selectCaseDefs(opts)
+	if err != nil {
+		suite.Add(report.Case{
+			Name:    "T5-case-filter",
+			Tier:    "T5",
+			Failure: fmt.Sprintf("T5 case selection failed for case=%q from-case=%q: %v", opts.Case, opts.FromCase, err),
 		})
 		return
 	}
 
-	run("T5.1-tcprepair-privileged", 3*time.Minute, func(c context.Context) report.Case {
-		if err := tcprepair.Available(); err != nil {
-			return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Failure: err.Error()}
+	for _, def := range defs {
+		if runtime.GOOS != "linux" {
+			addLinuxOnlySkip(suite, def)
+			continue
 		}
-		r := smoke.RunG1TCPRepairSameTuple(c, smoke.G1TCPRepairOpts{
-			Size:       100 << 20,
-			Migrations: 3,
+		def := def
+		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+			return def.run(c, rendrRoot)
 		})
-		return report.Case{Name: "T5.1-tcprepair-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
-	})
-
-	run("T5.2-gvisor-privileged", 2*time.Minute, func(c context.Context) report.Case {
-		if err := gvisor.Available(); err != nil {
-			return report.Case{Name: "T5.2-gvisor-privileged", Tier: "T5", Failure: err.Error()}
-		}
-		r := smoke.RunG1(c, smoke.G1Opts{
-			Size:       30 << 20,
-			Migrations: 3,
-			Paths:      2,
-			Transport:  "gvisor",
-		})
-		return report.Case{Name: "T5.2-gvisor-privileged", Tier: "T5", Duration: r.Duration, Failure: r.Failure}
-	})
-
-	run("T5.3-tcprepair-unprivileged", 2*time.Minute, func(context.Context) report.Case {
-		return probeUnprivileged(rendrRoot)
-	})
-
-	run("T5.4-gvisor-unprivileged", 2*time.Minute, func(context.Context) report.Case {
-		return probeGVisorUnprivileged(rendrRoot)
-	})
-
-	run("T5.5-tcprepair-gvisor-fallback-unprivileged", 2*time.Minute, func(context.Context) report.Case {
-		return probeTCPRepairGVisorFallbackUnprivileged(rendrRoot)
-	})
-
-	run("T5.6-gvisor-packet-carrier-unprivileged", 2*time.Minute, func(context.Context) report.Case {
-		return probeGVisorPacketCarrierUnprivileged(rendrRoot)
-	})
+	}
 }
 
-func caseMatches(filter, name string) bool {
-	return filter == "" || filter == name
+func addLinuxOnlySkip(suite *report.Suite, def caseDef) {
+	suite.Add(report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: "Linux only"})
 }
 
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
@@ -139,7 +140,7 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	suite.Add(rc)
 }
 
-func probeUnprivileged(rendrRoot string) report.Case {
+func probeUnprivileged(ctx context.Context, rendrRoot string) report.Case {
 	const name = "T5.3-tcprepair-unprivileged"
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
@@ -147,7 +148,8 @@ func probeUnprivileged(rendrRoot string) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"setpriv",
 		"--bounding-set=-net_admin",
 		"--inh-caps=-net_admin",
@@ -167,7 +169,7 @@ func probeUnprivileged(rendrRoot string) report.Case {
 	return report.Case{Name: name, Tier: "T5"}
 }
 
-func probeGVisorUnprivileged(rendrRoot string) report.Case {
+func probeGVisorUnprivileged(ctx context.Context, rendrRoot string) report.Case {
 	const name = "T5.4-gvisor-unprivileged"
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
@@ -175,7 +177,8 @@ func probeGVisorUnprivileged(rendrRoot string) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"setpriv",
 		"--bounding-set=-net_admin",
 		"--inh-caps=-net_admin",
@@ -194,7 +197,7 @@ func probeGVisorUnprivileged(rendrRoot string) report.Case {
 	return report.Case{Name: name, Tier: "T5"}
 }
 
-func probeTCPRepairGVisorFallbackUnprivileged(rendrRoot string) report.Case {
+func probeTCPRepairGVisorFallbackUnprivileged(ctx context.Context, rendrRoot string) report.Case {
 	const name = "T5.5-tcprepair-gvisor-fallback-unprivileged"
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
@@ -202,7 +205,8 @@ func probeTCPRepairGVisorFallbackUnprivileged(rendrRoot string) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"setpriv",
 		"--bounding-set=-net_admin",
 		"--inh-caps=-net_admin",
@@ -221,7 +225,7 @@ func probeTCPRepairGVisorFallbackUnprivileged(rendrRoot string) report.Case {
 	return report.Case{Name: name, Tier: "T5"}
 }
 
-func probeGVisorPacketCarrierUnprivileged(rendrRoot string) report.Case {
+func probeGVisorPacketCarrierUnprivileged(ctx context.Context, rendrRoot string) report.Case {
 	const name = "T5.6-gvisor-packet-carrier-unprivileged"
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return report.Case{Name: name, Tier: "T5", SkipReason: "setpriv unavailable"}
@@ -229,7 +233,8 @@ func probeGVisorPacketCarrierUnprivileged(rendrRoot string) report.Case {
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T5", Failure: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"setpriv",
 		"--bounding-set=-net_admin",
 		"--inh-caps=-net_admin",

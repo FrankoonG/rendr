@@ -1,4 +1,4 @@
-package tier5
+package tier4
 
 import (
 	"context"
@@ -6,17 +6,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
 var orderedCaseIDs = []string{
-	"T5.1-tcprepair-privileged",
-	"T5.2-gvisor-privileged",
-	"T5.3-tcprepair-unprivileged",
-	"T5.4-gvisor-unprivileged",
-	"T5.5-tcprepair-gvisor-fallback-unprivileged",
-	"T5.6-gvisor-packet-carrier-unprivileged",
+	"G1-T4",
+	"G1-T4-quic",
+	"G2-T4",
+	"G2-T4-race-tcp",
+	"G2-T4-bond-tcp",
+	"M11-udp-relay-T4",
+	"M11-udp-relay-porthop-T4",
+	"M11-wireguard-relay-T4",
+	"M11-hysteria2-relay-T4",
+	"G3-T4",
 }
 
 func TestRunReportsSelectionFailures(t *testing.T) {
@@ -27,13 +32,13 @@ func TestRunReportsSelectionFailures(t *testing.T) {
 	}{
 		{
 			name: "missing",
-			opts: Options{Case: "T5.missing"},
-			want: `T5 case selection failed for case="T5.missing" from-case="": manifest: no case matched --case="T5.missing"`,
+			opts: Options{Case: "T4-missing"},
+			want: `T4 case selection failed for case="T4-missing" from-case="": manifest: no case matched --case="T4-missing"`,
 		},
 		{
 			name: "ambiguous",
 			opts: Options{Case: orderedCaseIDs[0], FromCase: orderedCaseIDs[1]},
-			want: `T5 case selection failed for case="T5.1-tcprepair-privileged" from-case="T5.2-gvisor-privileged": manifest: --case and --from-case are mutually exclusive`,
+			want: `T4 case selection failed for case="G1-T4" from-case="G1-T4-quic": manifest: --case and --from-case are mutually exclusive`,
 		},
 	}
 	for _, tt := range tests {
@@ -44,31 +49,10 @@ func TestRunReportsSelectionFailures(t *testing.T) {
 				t.Fatalf("reported cases = %v, want one selection failure", suite.Cases)
 			}
 			got := suite.Cases[0]
-			if got.Name != "T5-case-filter" || got.Tier != "T5" || got.Failure != tt.want {
-				t.Fatalf("selection failure = %+v, want T5-case-filter failure %q", got, tt.want)
+			if got.Name != "T4-case-filter" || got.Tier != "T4" || got.Failure != tt.want {
+				t.Fatalf("selection failure = %+v, want T4-case-filter failure %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestAddLinuxOnlySkipPreservesSelectedCases(t *testing.T) {
-	defs, err := selectCaseDefs(Options{FromCase: orderedCaseIDs[3]})
-	if err != nil {
-		t.Fatal(err)
-	}
-	suite := report.New()
-	for _, def := range defs {
-		addLinuxOnlySkip(suite, def)
-	}
-	got := make([]string, len(suite.Cases))
-	for i, rc := range suite.Cases {
-		got[i] = rc.Name
-		if rc.SkipReason != "Linux only" || rc.Failure != "" {
-			t.Fatalf("case %s = %+v, want Linux-only skip", rc.Name, rc)
-		}
-	}
-	if want := orderedCaseIDs[3:]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("reported IDs = %v, want %v", got, want)
 	}
 }
 
@@ -80,10 +64,24 @@ func TestSpecsOrdered(t *testing.T) {
 	if err := manifest.Validate(specs); err != nil {
 		t.Fatalf("Specs validation failed: %v", err)
 	}
-	wantBudgets := []time.Duration{3 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute}
+	wantBudgets := []time.Duration{
+		7 * time.Minute, 7 * time.Minute,
+		33 * time.Minute, 33 * time.Minute, 33 * time.Minute,
+		5 * time.Minute, 5 * time.Minute, 5 * time.Minute, 5 * time.Minute,
+		8 * time.Minute,
+	}
 	for i, spec := range specs {
 		if !spec.Mandatory || spec.Suite != manifest.SuiteNormal || spec.Budget != wantBudgets[i] {
 			t.Errorf("Specs()[%d] = %+v, want mandatory normal-suite budget %s", i, spec, wantBudgets[i])
+		}
+	}
+	wantProfiles := []chaos.Profile{
+		chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M,
+		{}, {}, {}, {}, {},
+	}
+	for i, def := range caseDefs {
+		if !reflect.DeepEqual(def.profile, wantProfiles[i]) {
+			t.Errorf("caseDefs[%d] profile = %+v, want %+v", i, def.profile, wantProfiles[i])
 		}
 	}
 }
@@ -95,10 +93,10 @@ func TestSelectCaseDefs(t *testing.T) {
 		want    []string
 		wantErr bool
 	}{
-		{name: "exact", opts: Options{Case: orderedCaseIDs[2]}, want: orderedCaseIDs[2:3]},
-		{name: "inclusive resume", opts: Options{FromCase: orderedCaseIDs[4]}, want: orderedCaseIDs[4:]},
-		{name: "missing exact", opts: Options{Case: "T5.missing"}, wantErr: true},
-		{name: "missing resume", opts: Options{FromCase: "T5.missing"}, wantErr: true},
+		{name: "exact", opts: Options{Case: orderedCaseIDs[3]}, want: orderedCaseIDs[3:4]},
+		{name: "inclusive resume", opts: Options{FromCase: orderedCaseIDs[7]}, want: orderedCaseIDs[7:]},
+		{name: "missing exact", opts: Options{Case: "T4-missing"}, wantErr: true},
+		{name: "missing resume", opts: Options{FromCase: "T4-missing"}, wantErr: true},
 		{name: "ambiguous", opts: Options{Case: orderedCaseIDs[0], FromCase: orderedCaseIDs[1]}, wantErr: true},
 	}
 	for _, tt := range tests {
