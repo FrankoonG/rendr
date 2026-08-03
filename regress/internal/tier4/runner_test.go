@@ -140,6 +140,17 @@ func TestApplyCleanupResultFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEvidenceFromDetailPreservesFacts(t *testing.T) {
+	got := evidenceFromDetail(map[string]any{"migrations": 3, "sha_match": true})
+	want := map[string]string{"migrations": "3", "sha_match": "true"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("evidence=%v want %v", got, want)
+	}
+	if evidenceFromDetail(nil) != nil {
+		t.Fatal("nil detail should remain nil evidence")
+	}
+}
+
 func specIDs(specs []manifest.Spec) []string {
 	ids := make([]string, len(specs))
 	for i, spec := range specs {

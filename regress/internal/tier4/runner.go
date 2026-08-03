@@ -221,6 +221,7 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	case r := <-done:
 		rc.Duration = r.Duration
 		rc.Failure = r.Failure
+		rc.Evidence = evidenceFromDetail(r.Detail)
 		if rc.Duration == 0 {
 			rc.Duration = time.Since(start)
 		}
@@ -237,6 +238,17 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 		fmt.Printf("  > T4/%s (took %s) — OK\n", name, rc.Duration)
 	}
 	suite.Add(rc)
+}
+
+func evidenceFromDetail(detail map[string]any) map[string]string {
+	if len(detail) == 0 {
+		return nil
+	}
+	evidence := make(map[string]string, len(detail))
+	for key, value := range detail {
+		evidence[key] = fmt.Sprint(value)
+	}
+	return evidence
 }
 
 func applyCleanupResult(rc *report.Case, cleanup func() error) {
