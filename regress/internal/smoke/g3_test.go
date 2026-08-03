@@ -107,3 +107,77 @@ func TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget(t *testing.T) {
 		t.Fatalf("explicit 0.5%% smoke budget rejected: invalid=%q failure=%q", invalid, failure)
 	}
 }
+
+func TestSummarizeG3MissingReportsRangesAndMigrationDistance(t *testing.T) {
+	bitmap := []uint8{1, 1, 0, 0, 1, 0, 1, 1, 0, 0}
+	got := summarizeG3Missing(bitmap, 12, []int64{4, 9}, 100)
+	if got.Count != 7 || got.RangeCount != 3 || got.RangeSample != "2-3,5,8-11" {
+		t.Fatalf("summary = %+v", got)
+	}
+	if got.SampleTruncated || got.NearestMigrationDistancePackets != 0 ||
+		got.NearMigrationPackets != 5 || got.NearMigrationWindowPackets != 1 {
+		t.Fatalf("migration correlation = %+v", got)
+	}
+}
+
+func TestSummarizeG3MissingBoundsRangeEvidence(t *testing.T) {
+	bitmap := make([]uint8, g3MissingRangeSampleLimit*2+1)
+	for i := 1; i < len(bitmap); i += 2 {
+		bitmap[i] = 1
+	}
+	got := summarizeG3Missing(bitmap, int64(len(bitmap)), nil, 100_000)
+	if !got.SampleTruncated || got.RangeCount <= g3MissingRangeSampleLimit {
+		t.Fatalf("summary = %+v", got)
+	}
+	if strings.Count(got.RangeSample, ",") != g3MissingRangeSampleLimit-1 {
+		t.Fatalf("range sample = %q", got.RangeSample)
+	}
+	if got.NearestMigrationDistancePackets != -1 || got.NearMigrationPackets != 0 {
+		t.Fatalf("unexpected migration evidence = %+v", got)
+	}
+}
+
+func TestParseAndDeltaG3HostUDPStats(t *testing.T) {
+	const fixture = `Ip: Forwarding DefaultTTL
+Ip: 1 64
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 100 2 7 110 5 1 0 3 2
+UdpLite: InDatagrams NoPorts
+UdpLite: 0 0
+`
+	before, err := parseG3HostUDPStats(strings.NewReader(fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := before
+	after.InDatagrams += 10
+	after.OutDatagrams += 12
+	after.InErrors += 3
+	after.RcvbufErrors += 2
+	after.SndbufErrors++
+	delta, err := deltaG3HostUDPStats(before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta.InDatagrams != 10 || delta.OutDatagrams != 12 || delta.InErrors != 3 ||
+		delta.RcvbufErrors != 2 || delta.SndbufErrors != 1 {
+		t.Fatalf("delta = %+v", delta)
+	}
+}
+
+func TestParseG3HostUDPStatsRejectsMalformedEvidence(t *testing.T) {
+	tests := []string{
+		"Tcp: A B\nTcp: 1 2\n",
+		"Udp: InDatagrams OutDatagrams\nUdp: 1\n",
+		"Udp: InDatagrams\nUdp: nope\n",
+	}
+	for _, fixture := range tests {
+		if _, err := parseG3HostUDPStats(strings.NewReader(fixture)); err == nil {
+			t.Fatalf("fixture %q unexpectedly parsed", fixture)
+		}
+	}
+	before := g3HostUDPStats{InDatagrams: 2}
+	if _, err := deltaG3HostUDPStats(before, g3HostUDPStats{InDatagrams: 1}); err == nil {
+		t.Fatal("decreasing counters unexpectedly accepted")
+	}
+}

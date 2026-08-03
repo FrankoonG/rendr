@@ -208,6 +208,7 @@ func isTimeoutError(err error) bool {
 func RunG3(ctx context.Context, opts G3Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
+	udpStatsBefore, udpStatsBeforeAvailable, udpStatsBeforeErr := readG3HostUDPStats()
 	name := fmt.Sprintf("G3-smoke (%d pps, %s, %d paths bond, %d migrations)",
 		opts.PPS, opts.Duration, opts.Paths, opts.Migrations)
 	targetPacketsFloat := float64(opts.PPS) * opts.Duration.Seconds()
@@ -367,6 +368,7 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 	startMig := admin.MigrationCount()
 	migrationAttempts := 0
 	migrationErrors := 0
+	migrationSequences := make([]int64, 0, opts.Migrations)
 	nextMigration := 1
 	targetPackets := int64(math.Ceil(targetPacketsFloat))
 	sendStarted := time.Now()
@@ -385,6 +387,7 @@ sendLoop:
 		}
 		for nextMigration <= opts.Migrations && sent >= targetPackets*int64(nextMigration)/int64(opts.Migrations+1) {
 			migrationAttempts++
+			migrationSequences = append(migrationSequences, sent)
 			cur := admin.ActivePath()
 			migrated := false
 			for _, path := range client.Paths() {
@@ -426,6 +429,7 @@ sendLoop:
 	close(sendDone)
 	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
 	receivedOutcome := <-recvOutcome
+	udpStatsAfter, udpStatsAfterAvailable, udpStatsAfterErr := readG3HostUDPStats()
 	gotLat := receivedOutcome.latencies
 
 	dur := time.Since(t0)
@@ -472,34 +476,46 @@ sendLoop:
 		ppsSent = float64(sent) / sendElapsed.Seconds()
 		ppsReceived = float64(received) / sendElapsed.Seconds()
 	}
+	missing := summarizeG3Missing(recvBmp, sent, migrationSequences, opts.PPS)
 
+	detail := map[string]any{
+		"target_pps":                     opts.PPS,
+		"pps_sent":                       ppsSent,
+		"pps_received":                   ppsReceived,
+		"send_elapsed_ms":                float64(sendElapsed) / float64(time.Millisecond),
+		"sent":                           sent,
+		"received":                       received,
+		"loss_pct":                       lossPct,
+		"loss_budget_pct":                opts.LossPct,
+		"migration_attempts":             migrationAttempts,
+		"migration_errors":               migrationErrors,
+		"migration_sequences":            formatG3Sequences(migrationSequences),
+		"migrations":                     migrations,
+		"latency_samples":                len(gotLat),
+		"p50_ms":                         float64(p50) / float64(time.Millisecond),
+		"p95_ms":                         float64(p95) / float64(time.Millisecond),
+		"p99_ms":                         float64(p99) / float64(time.Millisecond),
+		"max_ms":                         float64(maxN) / float64(time.Millisecond),
+		"malformed_packets":              receivedOutcome.malformedPackets,
+		"corrupt_packets":                receivedOutcome.corruptPackets,
+		"duplicate_packets":              receivedOutcome.duplicatePackets,
+		"out_of_range_packets":           receivedOutcome.outOfRangePackets,
+		"path_writers":                   pathWriters,
+		"wire_writes":                    wireWrites,
+		"missing_packets":                missing.Count,
+		"missing_range_count":            missing.RangeCount,
+		"missing_range_sample":           missing.RangeSample,
+		"missing_range_sample_truncated": missing.SampleTruncated,
+		"missing_nearest_migration_distance_packets": missing.NearestMigrationDistancePackets,
+		"missing_near_migration_packets":             missing.NearMigrationPackets,
+		"missing_near_migration_window_packets":      missing.NearMigrationWindowPackets,
+	}
+	addG3UDPStatsEvidence(detail, udpStatsBefore, udpStatsBeforeAvailable, udpStatsBeforeErr,
+		udpStatsAfter, udpStatsAfterAvailable, udpStatsAfterErr)
 	r := Result{
 		Name:     name,
 		Duration: dur,
-		Detail: map[string]any{
-			"target_pps":           opts.PPS,
-			"pps_sent":             ppsSent,
-			"pps_received":         ppsReceived,
-			"send_elapsed_ms":      float64(sendElapsed) / float64(time.Millisecond),
-			"sent":                 sent,
-			"received":             received,
-			"loss_pct":             lossPct,
-			"loss_budget_pct":      opts.LossPct,
-			"migration_attempts":   migrationAttempts,
-			"migration_errors":     migrationErrors,
-			"migrations":           migrations,
-			"latency_samples":      len(gotLat),
-			"p50_ms":               float64(p50) / float64(time.Millisecond),
-			"p95_ms":               float64(p95) / float64(time.Millisecond),
-			"p99_ms":               float64(p99) / float64(time.Millisecond),
-			"max_ms":               float64(maxN) / float64(time.Millisecond),
-			"malformed_packets":    receivedOutcome.malformedPackets,
-			"corrupt_packets":      receivedOutcome.corruptPackets,
-			"duplicate_packets":    receivedOutcome.duplicatePackets,
-			"out_of_range_packets": receivedOutcome.outOfRangePackets,
-			"path_writers":         pathWriters,
-			"wire_writes":          wireWrites,
-		},
+		Detail:   detail,
 	}
 	if writeFailure != "" {
 		r.Failure = writeFailure
