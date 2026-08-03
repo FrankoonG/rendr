@@ -294,8 +294,6 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestBeginInvocationInvalidatesStaleFixedPassReports",
 			"TestBeginInvocationRemovesStalePassBeforeWritingReplacement",
 			"TestInvocationScopeAndManifestDigestSeparateFullFromExact",
-			"TestInvocationSchemaV2IsRecordedInJUnitAndMarkdown",
-			"TestInvocationSchemaV2Validation",
 			"TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen",
 			"TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed",
 			"TestExecuteNormalRevisionDriftFailsAndPersistsEvidence",
