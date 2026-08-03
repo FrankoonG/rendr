@@ -50,11 +50,26 @@ var caseDefs = []caseDef{
 		spec:    manifest.RequiredWithBudget("G2-T4", "T4", 33*time.Minute),
 		profile: chaos.Realistic50M,
 		run: func(ctx context.Context) smoke.Result {
-			return smoke.RunG2(ctx, smoke.G2Opts{
+			return smoke.RunG2Paired(ctx, smoke.G2Opts{
 				Duration:     30 * time.Minute,
 				Migrations:   30,
 				Paths:        2,
 				Transport:    "tcp",
+				Mode:         rendr.ModePrime,
+				Interval:     100 * time.Millisecond,
+				P99CeilingMs: 200,
+			})
+		},
+	},
+	{
+		spec:    manifest.RequiredWithBudget("G2-T4-quic", "T4", 33*time.Minute),
+		profile: chaos.Realistic50M,
+		run: func(ctx context.Context) smoke.Result {
+			return smoke.RunG2Paired(ctx, smoke.G2Opts{
+				Duration:     30 * time.Minute,
+				Migrations:   30,
+				Paths:        2,
+				Transport:    "quic",
 				Mode:         rendr.ModePrime,
 				Interval:     100 * time.Millisecond,
 				P99CeilingMs: 200,
@@ -80,7 +95,7 @@ var caseDefs = []caseDef{
 		spec:    manifest.RequiredWithBudget("G2-T4-bond-tcp", "T4", 33*time.Minute),
 		profile: chaos.Realistic50M,
 		run: func(ctx context.Context) smoke.Result {
-			return smoke.RunG2(ctx, smoke.G2Opts{
+			return smoke.RunG2Paired(ctx, smoke.G2Opts{
 				Duration:     30 * time.Minute,
 				Migrations:   30,
 				Paths:        2,

@@ -21,6 +21,7 @@ var orderedCaseIDs = []string{
 	"G1-T4",
 	"G1-T4-quic",
 	"G2-T4",
+	"G2-T4-quic",
 	"G2-T4-race-tcp",
 	"G2-T4-bond-tcp",
 	"M11-udp-relay-T4",
@@ -72,7 +73,7 @@ func TestSpecsOrdered(t *testing.T) {
 	}
 	wantBudgets := []time.Duration{
 		7 * time.Minute, 7 * time.Minute,
-		33 * time.Minute, 33 * time.Minute, 33 * time.Minute,
+		33 * time.Minute, 33 * time.Minute, 33 * time.Minute, 33 * time.Minute,
 		5 * time.Minute, 5 * time.Minute, 5 * time.Minute, 5 * time.Minute,
 		8 * time.Minute,
 	}
@@ -82,7 +83,7 @@ func TestSpecsOrdered(t *testing.T) {
 		}
 	}
 	wantProfiles := []chaos.Profile{
-		chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M,
+		chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M,
 		{}, {}, {}, {}, {},
 	}
 	for i, def := range caseDefs {
