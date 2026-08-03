@@ -234,6 +234,22 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 		t.Fatal("burst read timed out; ingress lost or stranded a frame")
 	}
 
+	ownedPayload := []byte("owned-frame-reader")
+	if _, err := client.Write(ownedPayload); err != nil {
+		t.Fatal(err)
+	}
+	owned, ok := any(server).(transport.OwnedFrameReader)
+	if !ok {
+		t.Fatal("QUIC DATAGRAM path does not expose the owned-frame fast path")
+	}
+	ownedFrame, err := owned.ReadOwnedFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(ownedFrame, ownedPayload) {
+		t.Fatalf("owned frame mismatch: got %q want %q", ownedFrame, ownedPayload)
+	}
+
 	// Counter sanity.
 	if server.Reads() < 1 || client.Reads() < 1 {
 		t.Errorf("reads not counted: server=%d client=%d", server.Reads(), client.Reads())

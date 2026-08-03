@@ -82,22 +82,33 @@ func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
 // the datagram, the result is truncated (standard PacketConn-style
 // semantics) and io.ErrShortBuffer is returned.
 func (p *datagramPathConn) Read(buf []byte) (int, error) {
+	data, err := p.ReadOwnedFrame()
+	if err != nil {
+		return 0, err
+	}
+	if len(buf) < len(data) {
+		copy(buf, data)
+		return len(buf), io.ErrShortBuffer
+	}
+	return copy(buf, data), nil
+}
+
+// ReadOwnedFrame transfers the immutable allocation returned by quic-go to
+// the engine. This avoids copying every high-rate DATAGRAM through an
+// intermediate PathConn.Read buffer before it enters the reorder pipeline.
+func (p *datagramPathConn) ReadOwnedFrame() ([]byte, error) {
 	if p.dead.Load() {
-		return 0, net.ErrClosed
+		return nil, net.ErrClosed
 	}
 	data, ok := <-p.recvQ
 	if !ok {
 		p.deathMu.Lock()
 		err := p.deathErr
 		p.deathMu.Unlock()
-		return 0, p.swallow(err)
+		return nil, p.swallow(err)
 	}
 	p.reads.Add(1)
-	if len(buf) < len(data) {
-		copy(buf, data)
-		return len(buf), io.ErrShortBuffer
-	}
-	return copy(buf, data), nil
+	return data, nil
 }
 
 func (p *datagramPathConn) pumpDatagrams() {

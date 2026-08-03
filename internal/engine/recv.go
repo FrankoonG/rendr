@@ -195,7 +195,17 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		default:
 		}
 
-		n, err := slot.conn.Read(buf)
+		frame := buf[:0]
+		owned := false
+		var err error
+		if reader, ok := slot.conn.(transport.OwnedFrameReader); ok {
+			frame, err = reader.ReadOwnedFrame()
+			owned = true
+		} else {
+			var n int
+			n, err = slot.conn.Read(buf)
+			frame = buf[:n]
+		}
 		if err != nil {
 			return
 		}
@@ -203,10 +213,10 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		// version / framing rejection: from the path's perspective,
 		// "something arrived" is the signal monitoring cares about.
 		slot.lastRecvUnixNano.Store(nowFn().UnixNano())
-		if n < proto.HeaderSize {
+		if len(frame) < proto.HeaderSize {
 			return
 		}
-		hdr, err := proto.DecodeHeader(buf[:proto.HeaderSize])
+		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 		if err != nil {
 			return
 		}
@@ -215,7 +225,14 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 			_ = e.Close()
 			return
 		}
-		payload := append([]byte(nil), buf[proto.HeaderSize:n]...)
+		payload := frame[proto.HeaderSize:]
+		if owned {
+			// Prevent downstream append operations from overwriting bytes in
+			// the frame header that precedes this payload subslice.
+			payload = payload[:len(payload):len(payload)]
+		} else {
+			payload = append([]byte(nil), payload...)
+		}
 
 		// Per-path probes are handled before the SEQ-aware reorder
 		// path so they never stall the application stream. Probe

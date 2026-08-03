@@ -67,3 +67,15 @@ type PathConn interface {
 	LocalAddr() string
 	RemoteAddr() string
 }
+
+// OwnedFrameReader is an optional PathConn fast path for transports whose
+// receive API already returns a uniquely owned frame allocation. The returned
+// slice must remain immutable and valid after the next call; ownership passes
+// to the engine. Implementations must not recycle or reuse its backing array.
+//
+// PathConn.Read remains mandatory for callers that don't understand this
+// extension. The engine prefers ReadOwnedFrame when available to avoid an
+// otherwise redundant full-frame allocation and copy on high-rate paths.
+type OwnedFrameReader interface {
+	ReadOwnedFrame() ([]byte, error)
+}
