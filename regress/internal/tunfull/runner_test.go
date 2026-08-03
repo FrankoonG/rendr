@@ -10,25 +10,26 @@ import (
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/virtualif"
 )
 
 var orderedCaseIDs = []string{
+	caseKernelTUNPreflight,
 	caseG1Smoke,
 	caseG2Smoke,
 	caseG3Smoke,
 	caseG4PathDeath,
 	caseG5PathRecovery,
-	caseT3XrayStreamSmoke,
 	caseT3XrayMatrix,
-	caseT4LongRun,
 	caseT4G1,
 	caseT4G2,
 	caseT4G3,
-	caseT5Fallback,
+	caseT5AdapterMatrix,
 	caseT6Selector,
 }
 
 var defaultCaseIDs = []string{
+	caseKernelTUNPreflight,
 	caseG1Smoke,
 	caseG2Smoke,
 	caseG3Smoke,
@@ -38,7 +39,7 @@ var defaultCaseIDs = []string{
 	caseT4G1,
 	caseT4G2,
 	caseT4G3,
-	caseT5Fallback,
+	caseT5AdapterMatrix,
 	caseT6Selector,
 }
 
@@ -51,14 +52,13 @@ func TestSpecsOrderedAndBudgeted(t *testing.T) {
 		t.Fatalf("Specs validation failed: %v", err)
 	}
 	wantBudgets := []time.Duration{
+		30 * time.Second,
 		2 * time.Minute,
 		2 * time.Minute,
 		2 * time.Minute,
 		30 * time.Second,
 		time.Minute,
-		8 * time.Minute,
 		12 * time.Minute,
-		48 * time.Minute,
 		7 * time.Minute,
 		33 * time.Minute,
 		8 * time.Minute,
@@ -72,8 +72,32 @@ func TestSpecsOrderedAndBudgeted(t *testing.T) {
 	}
 
 	specs[0].ID = "mutated"
-	if got := Specs()[0].ID; got != caseG1Smoke {
+	if got := Specs()[0].ID; got != caseKernelTUNPreflight {
 		t.Fatalf("Specs returned shared storage: first ID = %q", got)
+	}
+}
+
+func testAliasesAreSeparateImmutableMetadata(t *testing.T) {
+	got := Aliases()
+	want := []Alias{
+		{ID: caseT3XrayStreamSmoke, Before: caseT3XrayMatrix, ExpandsTo: []string{caseT3XrayMatrix}},
+		{ID: caseT4LongRun, Before: caseT4G1, ExpandsTo: []string{caseT4G1, caseT4G2, caseT4G3}},
+		{ID: caseT4G2Prime, Before: caseT4G2, ExpandsTo: []string{caseT4G2}},
+		{ID: caseT5Fallback, Before: caseT5AdapterMatrix, ExpandsTo: []string{caseT5AdapterMatrix}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Aliases()=%+v want %+v", got, want)
+	}
+	got[0].ExpandsTo[0] = "mutated"
+	if Aliases()[0].ExpandsTo[0] != caseT3XrayMatrix {
+		t.Fatal("Aliases returned shared expansion storage")
+	}
+	for _, spec := range Specs() {
+		for _, alias := range got {
+			if spec.ID == alias.ID {
+				t.Fatalf("compatibility alias %q entered executable Specs", alias.ID)
+			}
+		}
 	}
 }
 
@@ -86,23 +110,12 @@ func TestSelectCaseDefs(t *testing.T) {
 	}{
 		{name: "default canonical order", want: defaultCaseIDs},
 		{name: "exact visible", opts: Options{Case: caseG3Smoke}, want: []string{caseG3Smoke}},
-		{name: "exact hidden xray smoke", opts: Options{Case: caseT3XrayStreamSmoke}, want: []string{caseT3XrayStreamSmoke}},
-		{name: "exact hidden long-run selector", opts: Options{Case: caseT4LongRun}, want: []string{caseT4G1, caseT4G2, caseT4G3}},
 		{
 			name: "inclusive resume",
 			opts: Options{FromCase: caseG5PathRecovery},
-			want: []string{caseG5PathRecovery, caseT3XrayMatrix, caseT4G1, caseT4G2, caseT4G3, caseT5Fallback, caseT6Selector},
+			want: []string{caseG5PathRecovery, caseT3XrayMatrix, caseT4G1, caseT4G2, caseT4G3, caseT5AdapterMatrix, caseT6Selector},
 		},
-		{
-			name: "resume from hidden xray smoke",
-			opts: Options{FromCase: caseT3XrayStreamSmoke},
-			want: []string{caseT3XrayStreamSmoke, caseT3XrayMatrix, caseT4G1, caseT4G2, caseT4G3, caseT5Fallback, caseT6Selector},
-		},
-		{
-			name: "resume from hidden long-run selector",
-			opts: Options{FromCase: caseT4LongRun},
-			want: []string{caseT4G1, caseT4G2, caseT4G3, caseT5Fallback, caseT6Selector},
-		},
+		{name: "alias is not executable", opts: Options{Case: caseT4LongRun}, wantErr: true},
 		{name: "missing exact", opts: Options{Case: "TUN-full.missing"}, wantErr: true},
 		{name: "missing resume", opts: Options{FromCase: "TUN-full.missing"}, wantErr: true},
 		{name: "ambiguous", opts: Options{Case: caseG1Smoke, FromCase: caseG2Smoke}, wantErr: true},
@@ -135,17 +148,17 @@ func TestRunReportsSelectionFailuresWithoutExecutingCases(t *testing.T) {
 		{
 			name: "unknown exact",
 			opts: Options{Case: "missing"},
-			want: `TUN full case selection failed for case="missing" from-case="": manifest: no case matched --case="missing"`,
+			want: `TUN synthetic L3/session case selection failed for case="missing" from-case="": manifest: no case matched --case="missing"`,
 		},
 		{
 			name: "unknown resume",
 			opts: Options{FromCase: "missing"},
-			want: `TUN full case selection failed for case="" from-case="missing": manifest: no case matched --from-case="missing"`,
+			want: `TUN synthetic L3/session case selection failed for case="" from-case="missing": manifest: no case matched --from-case="missing"`,
 		},
 		{
 			name: "ambiguous",
 			opts: Options{Case: caseG1Smoke, FromCase: caseG2Smoke},
-			want: `TUN full case selection failed for case="TUN-full.G1-smoke" from-case="TUN-full.G2-smoke": manifest: --case and --from-case are mutually exclusive`,
+			want: `TUN synthetic L3/session case selection failed for case="TUN-full.G1-smoke" from-case="TUN-full.G2-smoke": manifest: --case and --from-case are mutually exclusive`,
 		},
 	}
 	for _, tt := range tests {
@@ -238,40 +251,6 @@ func TestRunCaseDefsStopsAfterMandatoryOutcome(t *testing.T) {
 	}
 }
 
-func TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce(t *testing.T) {
-	defs, err := selectCaseDefs(Options{Case: caseT4LongRun})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantIDs := []string{caseT4G1, caseT4G2, caseT4G3}
-	if got := defIDs(defs); !reflect.DeepEqual(got, wantIDs) {
-		t.Fatalf("long-run executable members = %v, want %v", got, wantIDs)
-	}
-
-	var called []string
-	for i := range defs {
-		defs[i].run = func(_ context.Context, _ string, spec manifest.Spec) report.Case {
-			called = append(called, spec.ID)
-			if spec.ID == caseT4G2 {
-				return report.Case{Failure: "synthetic failure"}
-			}
-			return report.Case{}
-		}
-	}
-	suite := report.New()
-	runCaseDefs(context.Background(), suite, "", defs)
-
-	if want := []string{caseT4G1, caseT4G2}; !reflect.DeepEqual(called, want) {
-		t.Fatalf("executed members = %v, want %v", called, want)
-	}
-	if got := reportIDs(suite.Cases); !reflect.DeepEqual(got, wantIDs) {
-		t.Fatalf("member report IDs = %v, want %v", got, wantIDs)
-	}
-	if got := suite.Cases[2].InvalidReason; got != "not run after "+caseT4G2+" failed" {
-		t.Fatalf("trailing member invalid reason = %q", got)
-	}
-}
-
 func TestRunManifestCaseEnforcesBudget(t *testing.T) {
 	finished := make(chan struct{})
 	def := syntheticCase("synthetic.timeout", 10*time.Millisecond, func(ctx context.Context, _ string, _ manifest.Spec) report.Case {
@@ -280,7 +259,7 @@ func TestRunManifestCaseEnforcesBudget(t *testing.T) {
 		return report.Case{}
 	})
 	rc := runManifestCase(context.Background(), "", def)
-	if rc.Name != def.spec.ID || rc.Tier != def.spec.Tier || !strings.Contains(rc.Failure, "exceeded TUN full budget") {
+	if rc.Name != def.spec.ID || rc.Tier != def.spec.Tier || !strings.Contains(rc.Failure, "exceeded TUN synthetic-suite budget") {
 		t.Fatalf("timeout report = %+v", rc)
 	}
 	select {
@@ -311,13 +290,45 @@ func TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember(t *testing.T) {
 		t.Fatalf("missing budget err = %v", err)
 	}
 
-	selector := caseDef{
-		spec:    tunSpec("synthetic.selector", time.Second, false),
-		members: []string{"synthetic.missing"},
+	missingRunner := caseDef{spec: tunSpec("synthetic.missing-runner", time.Second, false)}
+	if err := validateCaseDefs([]caseDef{missingRunner}); err == nil || !strings.Contains(err.Error(), "no runner") {
+		t.Fatalf("missing runner err = %v", err)
 	}
-	if err := validateCaseDefs([]caseDef{selector}); err == nil || !strings.Contains(err.Error(), "unknown case") {
-		t.Fatalf("missing selector member err = %v", err)
+}
+
+func testKernelTUNPreflightFailsClosedAndRecordsSyntheticScope(t *testing.T) {
+	original := probeKernelTUN
+	t.Cleanup(func() { probeKernelTUN = original })
+
+	probeKernelTUN = func() virtualif.Capability {
+		return virtualif.Capability{Available: false, Reason: virtualif.ReasonTUNUnavailable, Err: errors.New("missing device")}
 	}
+	rc := runManifestCase(context.Background(), "", caseDefs[0])
+	if !strings.Contains(rc.InvalidReason, "cannot count as TUN release evidence") {
+		t.Fatalf("unavailable preflight=%+v", rc)
+	}
+	if rc.Evidence["kernel_tun_available"] != "false" || rc.Evidence["evidence_class"] != syntheticEvidenceClass || rc.Evidence["kernel_tun_gold"] != "false" {
+		t.Fatalf("unavailable evidence=%v", rc.Evidence)
+	}
+
+	probeKernelTUN = func() virtualif.Capability { return virtualif.Capability{Available: true} }
+	rc = runManifestCase(context.Background(), "", caseDefs[0])
+	if rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "" {
+		t.Fatalf("available preflight=%+v", rc)
+	}
+	if rc.Evidence["kernel_tun_available"] != "true" || rc.Evidence["required_gold_fixture"] != realTUNGoldFixture {
+		t.Fatalf("available evidence=%v", rc.Evidence)
+	}
+}
+
+func TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce(t *testing.T) {
+	t.Run("aliases are separate immutable metadata", testAliasesAreSeparateImmutableMetadata)
+	t.Run("kernel TUN preflight fails closed", testKernelTUNPreflightFailsClosedAndRecordsSyntheticScope)
+	t.Run("G3 measurements fail closed", testValidateTUNG3MeasurementsFailsClosed)
+	t.Run("G3 explicit loss budget", testValidateTUNG3MeasurementsHonorsOnlyExplicitLossBudget)
+	t.Run("G3 path evidence is deterministic", testFormatTUNG3PathWritesIsDeterministic)
+	t.Run("xray uses exact strict JSON contract", testRunT3XrayMatrixUsesExactStrictGoTestContract)
+	t.Run("xray rejects false-green streams", testTUNGoTestReportRejectsFalseGreenStreams)
 }
 
 func TestUnimplementedCaseFails(t *testing.T) {
@@ -336,13 +347,19 @@ func TestApplyT4CleanupResultFailsClosed(t *testing.T) {
 
 	rc = report.Case{Name: "case", Tier: "T7", Failure: "case boom"}
 	applyT4CleanupResult(&rc, func() error { return errors.New("cleanup boom") })
-	if rc.Failure != "case boom; chaos cleanup failed: cleanup boom" || rc.InvalidReason != "" {
+	if rc.Failure != "" || rc.InvalidReason != "chaos cleanup failed: cleanup boom" || rc.Evidence["untrusted_case_failure"] != "case boom" {
 		t.Fatalf("failed case=%+v", rc)
+	}
+
+	rc = report.Case{Name: "case", Tier: "T7", InvalidReason: "stimulus missing"}
+	applyT4CleanupResult(&rc, func() error { return errors.New("cleanup boom") })
+	if rc.Failure != "" || rc.InvalidReason != "stimulus missing; chaos cleanup failed: cleanup boom" {
+		t.Fatalf("invalid case=%+v", rc)
 	}
 }
 
 func syntheticCase(id string, budget time.Duration, run caseRun) caseDef {
-	return caseDef{spec: tunSpec(id, budget, false), defaultRun: true, run: run}
+	return caseDef{spec: tunSpec(id, budget, false), run: run}
 }
 
 func specIDs(specs []manifest.Spec) []string {

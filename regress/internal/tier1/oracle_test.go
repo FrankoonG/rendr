@@ -38,6 +38,18 @@ func TestContractsHaveDeterministicNonzeroCoverage(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("inventoried package cannot degrade to compile only", func(t *testing.T) {
+		err := validateContracts([]packageContract{{
+			ImportPath: "example/covered",
+			Argument:   "./covered",
+			Inventory:  []string{"TestRequired"},
+			RunTests:   []string{},
+		}})
+		if err == nil || !strings.Contains(err.Error(), "empty run set") {
+			t.Fatalf("error=%v, want empty-run-set rejection", err)
+		}
+	})
 }
 
 func TestRegressUnitRunsOnlyFastSmokeOracles(t *testing.T) {

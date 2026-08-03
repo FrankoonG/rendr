@@ -38,6 +38,88 @@ type g2Evidence struct {
 	recvDupsAfter         uint64
 }
 
+const g2MinimumCompletionPercent = 95
+
+type g2RunEvidence struct {
+	requestedDuration time.Duration
+	observedDuration  time.Duration
+	interval          time.Duration
+	sent              int
+	received          int
+	contextErr        error
+	operationErr      error
+	receiverErr       error
+	serverErr         error
+}
+
+func (e g2RunEvidence) expectedSamples() int {
+	if e.requestedDuration <= 0 || e.interval <= 0 {
+		return 0
+	}
+	return int(e.requestedDuration / e.interval)
+}
+
+func minimumG2Evidence(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	return (value*g2MinimumCompletionPercent + 99) / 100
+}
+
+// validateG2RunEvidence separates invalid stimulus from product failures.
+// Matching sender/receiver counts are insufficient: the run must also sustain
+// at least 95% of its requested duration and offered echo schedule.
+func validateG2RunEvidence(e g2RunEvidence) (invalidReason, failure string) {
+	if e.operationErr != nil {
+		return "", e.operationErr.Error()
+	}
+	if e.receiverErr != nil {
+		return "", fmt.Sprintf("receiver exited before clean teardown: %v", e.receiverErr)
+	}
+	if e.serverErr != nil {
+		return "", fmt.Sprintf("server echo exited before clean teardown: %v", e.serverErr)
+	}
+	if e.contextErr != nil {
+		return fmt.Sprintf("run context ended before completion: %v", e.contextErr), ""
+	}
+
+	minimumDuration := e.requestedDuration * g2MinimumCompletionPercent / 100
+	if e.observedDuration < minimumDuration {
+		return fmt.Sprintf(
+			"run duration %s below %d%% minimum %s (requested %s)",
+			e.observedDuration, g2MinimumCompletionPercent, minimumDuration, e.requestedDuration,
+		), ""
+	}
+
+	expectedSamples := e.expectedSamples()
+	minimumSamples := minimumG2Evidence(expectedSamples)
+	if e.sent < minimumSamples {
+		return fmt.Sprintf(
+			"offered echo samples=%d below %d%% minimum %d (expected %d for %s at %s cadence)",
+			e.sent, g2MinimumCompletionPercent, minimumSamples, expectedSamples,
+			e.requestedDuration, e.interval,
+		), ""
+	}
+	if e.received < minimumSamples {
+		return "", fmt.Sprintf(
+			"received echo samples=%d below %d%% minimum %d (expected %d)",
+			e.received, g2MinimumCompletionPercent, minimumSamples, expectedSamples,
+		)
+	}
+	return "", ""
+}
+
+func isG2IntentionalTeardownError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func validateG2Evidence(e g2Evidence) (uint64, uint64, error) {
 	migrations, err := validateRequestedMigrations(
 		e.migrationsRequested,
@@ -94,6 +176,11 @@ func (o *G2Opts) withDefaults() {
 // without exposing duplicate echoes to the application. Detail keys:
 //
 //	echoes                  int
+//	received_echoes         int
+//	expected_echoes         int
+//	minimum_echoes          int
+//	requested_duration_ms   int64
+//	observed_run_duration_ms int64
 //	lost                    int
 //	requested_migrations    int
 //	migration_calls_fired   int
@@ -149,32 +236,41 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	}
 	defer server.Close()
 
-	// Server echoes everything back; protocol is one 12-byte record
-	// per ping: 4B seq + 8B unix-nanos send-time. Server returns the
-	// same record verbatim.
-	echoErr := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 12)
-		for {
-			if _, err := io.ReadFull(server, buf); err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-					echoErr <- nil
-					return
-				}
-				echoErr <- err
-				return
-			}
-			if _, err := server.Write(buf); err != nil {
-				echoErr <- err
-				return
-			}
-		}
-	}()
-
 	admin, ok := client.(rendr.AdminConn)
 	if !ok {
 		return FromError(name, time.Since(t0), fmt.Errorf("client conn is not rendr.AdminConn"))
 	}
+
+	type goroutineResult struct {
+		err     error
+		endedAt time.Time
+	}
+
+	// Server echoes everything back; protocol is one 12-byte record
+	// per ping: 4B seq + 8B unix-nanos send-time. Server returns the
+	// same record verbatim. Every exit is reported and consumed below.
+	echoResultCh := make(chan goroutineResult, 1)
+	go func() {
+		buf := make([]byte, 12)
+		for {
+			if _, err := io.ReadFull(server, buf); err != nil {
+				echoResultCh <- goroutineResult{err: fmt.Errorf("read: %w", err), endedAt: time.Now()}
+				return
+			}
+			n, err := server.Write(buf)
+			if err != nil {
+				echoResultCh <- goroutineResult{err: fmt.Errorf("write: %w", err), endedAt: time.Now()}
+				return
+			}
+			if n != len(buf) {
+				echoResultCh <- goroutineResult{
+					err:     fmt.Errorf("write: %w (%d/%d bytes)", io.ErrShortWrite, n, len(buf)),
+					endedAt: time.Now(),
+				}
+				return
+			}
+		}
+	}()
 
 	// Migration ticker: spread `Migrations` migrations evenly across
 	// the run.
@@ -190,7 +286,10 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	startRecvDups := admin.RecvDups()
 	var migrationCallsFired int
 	rtts := make([]time.Duration, 0, int(opts.Duration/opts.Interval)+2)
-	deadline := time.Now().Add(opts.Duration)
+	runStarted := time.Now()
+	deadline := runStarted.Add(opts.Duration)
+	runTimer := time.NewTimer(opts.Duration)
+	defer runTimer.Stop()
 	tick := time.NewTicker(opts.Interval)
 	defer tick.Stop()
 
@@ -200,27 +299,39 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	// chan-send, main blocks on <-doneRecv, no one drains the chan.
 	// Smoke (300 echoes) stayed under the buffer; T4 (18000 echoes
 	// at 30min) hit it at echo 1024 and the run hung indefinitely.
-	// Single-writer slice + close(recvDone) is the happens-before fence.
+	// The single result-channel send is the ownership handoff and
+	// happens-before fence for the receiver-owned slice.
 	type echo struct {
 		seq int32
 		rtt time.Duration
 	}
-	echoBuf := make([]echo, 0, int(opts.Duration/opts.Interval)+128)
-	doneRecv := make(chan struct{})
+	type receiverResult struct {
+		goroutineResult
+		echoes []echo
+	}
+	receiverResultCh := make(chan receiverResult, 1)
 	go func() {
-		defer close(doneRecv)
+		echoes := make([]echo, 0, int(opts.Duration/opts.Interval)+128)
+		finish := func(err error) {
+			receiverResultCh <- receiverResult{
+				goroutineResult: goroutineResult{err: err, endedAt: time.Now()},
+				echoes:          echoes,
+			}
+		}
+		if err := client.SetReadDeadline(deadline.Add(5 * time.Second)); err != nil {
+			finish(fmt.Errorf("set read deadline: %w", err))
+			return
+		}
 		buf := make([]byte, 12)
 		for {
-			if err := client.SetReadDeadline(time.Now().Add(opts.Duration + 5*time.Second)); err != nil {
-				return
-			}
 			if _, err := io.ReadFull(client, buf); err != nil {
+				finish(fmt.Errorf("read: %w", err))
 				return
 			}
 			seq := int32(binary.BigEndian.Uint32(buf[:4]))
 			sentNs := int64(binary.BigEndian.Uint64(buf[4:]))
 			rtt := time.Duration(time.Now().UnixNano() - sentNs)
-			echoBuf = append(echoBuf, echo{seq: seq, rtt: rtt})
+			echoes = append(echoes, echo{seq: seq, rtt: rtt})
 		}
 	}()
 
@@ -232,19 +343,37 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	var seq int32
 	sent := map[int32]struct{}{}
 	lastProgress := time.Now()
+	var contextErr error
+	var operationErr error
+	var receiverResultValue receiverResult
+	var receiverDone bool
+	var echoResult goroutineResult
+	var echoDone bool
 runLoop:
-	for time.Now().Before(deadline) {
+	for {
 		select {
 		case <-tick.C:
 			seq++
 			buf := make([]byte, 12)
 			binary.BigEndian.PutUint32(buf[:4], uint32(seq))
 			binary.BigEndian.PutUint64(buf[4:], uint64(time.Now().UnixNano()))
-			_ = client.SetWriteDeadline(time.Now().Add(writeDeadline))
-			if _, err := client.Write(buf); err != nil {
-				return FromError(name, time.Since(t0), fmt.Errorf("write seq %d: %w", seq, err))
+			if err := client.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+				operationErr = fmt.Errorf("set write deadline for seq %d: %w", seq, err)
+				break runLoop
 			}
-			_ = client.SetWriteDeadline(time.Time{})
+			n, err := client.Write(buf)
+			if err != nil {
+				operationErr = fmt.Errorf("write seq %d: %w", seq, err)
+				break runLoop
+			}
+			if n != len(buf) {
+				operationErr = fmt.Errorf("write seq %d: %w (%d/%d bytes)", seq, io.ErrShortWrite, n, len(buf))
+				break runLoop
+			}
+			if err := client.SetWriteDeadline(time.Time{}); err != nil {
+				operationErr = fmt.Errorf("clear write deadline for seq %d: %w", seq, err)
+				break runLoop
+			}
 			sent[seq] = struct{}{}
 			// Coarse progress beacon for T4-scale long runs.
 			if opts.Duration > 60*time.Second && time.Since(lastProgress) >= 30*time.Second {
@@ -263,26 +392,96 @@ runLoop:
 				}
 			}
 			if target == 0 {
-				return FromError(name, time.Since(t0), fmt.Errorf("migration %d: no alternate path", migrationCallsFired+1))
+				operationErr = fmt.Errorf("migration %d: no alternate path", migrationCallsFired+1)
+				break runLoop
 			}
 			if err := admin.Migrate(target); err != nil {
-				return FromError(name, time.Since(t0), fmt.Errorf("migration %d: %w", migrationCallsFired+1, err))
+				operationErr = fmt.Errorf("migration %d: %w", migrationCallsFired+1, err)
+				break runLoop
 			}
 			migrationCallsFired++
 			if migrationCallsFired == opts.Migrations {
 				migTicker.Stop()
 				migTicker = nil
 			}
+		case receiverResultValue = <-receiverResultCh:
+			receiverDone = true
+			break runLoop
+		case echoResult = <-echoResultCh:
+			echoDone = true
+			break runLoop
 		case <-ctx.Done():
+			contextErr = ctx.Err()
+			break runLoop
+		case <-runTimer.C:
 			break runLoop
 		}
 	}
+	runElapsed := time.Since(runStarted)
 
 	// Give the receiver a moment to drain in-flight echoes, then
-	// force its ReadFull to return via the read deadline.
-	time.Sleep(500 * time.Millisecond)
-	_ = client.SetReadDeadline(time.Now())
-	<-doneRecv
+	// force its ReadFull to return via the read deadline. Any goroutine
+	// exit timestamped before teardown is evidence of an early failure.
+	if contextErr == nil && operationErr == nil && !receiverDone && !echoDone {
+		drainTimer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case receiverResultValue = <-receiverResultCh:
+			receiverDone = true
+		case echoResult = <-echoResultCh:
+			echoDone = true
+		case <-drainTimer.C:
+		}
+		if !drainTimer.Stop() {
+			select {
+			case <-drainTimer.C:
+			default:
+			}
+		}
+	}
+
+	teardownStarted := time.Now()
+	if !receiverDone {
+		if err := client.SetReadDeadline(teardownStarted); err != nil {
+			operationErr = errors.Join(operationErr, fmt.Errorf("set receiver teardown deadline: %w", err))
+		}
+		select {
+		case receiverResultValue = <-receiverResultCh:
+			receiverDone = true
+		case <-time.After(5 * time.Second):
+			operationErr = errors.Join(operationErr, fmt.Errorf("receiver did not stop within teardown timeout"))
+		}
+	}
+
+	endMigCount := admin.MigrationCount()
+	endRecvDups := admin.RecvDups()
+	_ = client.Close()
+	_ = server.Close()
+	if !echoDone {
+		select {
+		case echoResult = <-echoResultCh:
+			echoDone = true
+		case <-time.After(5 * time.Second):
+			operationErr = errors.Join(operationErr, fmt.Errorf("server echo goroutine did not stop within teardown timeout"))
+		}
+	}
+
+	var receiverErr error
+	echoBuf := receiverResultValue.echoes
+	if receiverDone {
+		if receiverResultValue.endedAt.Before(teardownStarted) {
+			receiverErr = receiverResultValue.err
+		} else if !isG2IntentionalTeardownError(receiverResultValue.err) {
+			receiverErr = receiverResultValue.err
+		}
+	}
+	var serverErr error
+	if echoDone {
+		if echoResult.endedAt.Before(teardownStarted) {
+			serverErr = echoResult.err
+		} else if !isG2IntentionalTeardownError(echoResult.err) {
+			serverErr = echoResult.err
+		}
+	}
 
 	received := map[int32]time.Duration{}
 	applicationDuplicates := 0
@@ -306,44 +505,74 @@ runLoop:
 		}
 	}
 
-	if len(rtts) == 0 {
-		return FromError(name, time.Since(t0), fmt.Errorf("no echoes received"))
+	var p50, p99, p999, maxRTT time.Duration
+	if len(rtts) > 0 {
+		sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+		p50 = rtts[len(rtts)*50/100]
+		p99 = rtts[len(rtts)*99/100]
+		p999 = rtts[len(rtts)*999/1000]
+		if p999 == 0 {
+			p999 = rtts[len(rtts)-1]
+		}
+		maxRTT = rtts[len(rtts)-1]
 	}
-	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
-	p50 := rtts[len(rtts)*50/100]
-	p99 := rtts[len(rtts)*99/100]
-	p999 := rtts[len(rtts)*999/1000]
-	if p999 == 0 && len(rtts) > 0 {
-		p999 = rtts[len(rtts)-1]
-	}
-	maxRTT := rtts[len(rtts)-1]
 
 	migrated, recvDups, evidenceErr := validateG2Evidence(g2Evidence{
 		mode:                  opts.Mode,
 		migrationsRequested:   opts.Migrations,
 		migrationCallsFired:   migrationCallsFired,
 		migrationCountBefore:  startMigCount,
-		migrationCountAfter:   admin.MigrationCount(),
+		migrationCountAfter:   endMigCount,
 		applicationDuplicates: applicationDuplicates,
 		recvDupsBefore:        startRecvDups,
-		recvDupsAfter:         admin.RecvDups(),
+		recvDupsAfter:         endRecvDups,
 	})
+	expectedEchoes := int(opts.Duration / opts.Interval)
+	minimumEchoes := minimumG2Evidence(expectedEchoes)
 	r := Result{
 		Name:     name,
 		Duration: time.Since(t0),
 		Detail: map[string]any{
-			"echoes":                 len(sent),
-			"lost":                   lost,
-			"requested_migrations":   opts.Migrations,
-			"migration_calls_fired":  migrationCallsFired,
-			"migrations":             migrated,
-			"application_duplicates": applicationDuplicates,
-			"recv_dups":              recvDups,
-			"p50_ms":                 float64(p50) / float64(time.Millisecond),
-			"p99_ms":                 float64(p99) / float64(time.Millisecond),
-			"p999_ms":                float64(p999) / float64(time.Millisecond),
-			"max_ms":                 float64(maxRTT) / float64(time.Millisecond),
+			"echoes":                   len(sent),
+			"received_echoes":          len(received),
+			"expected_echoes":          expectedEchoes,
+			"minimum_echoes":           minimumEchoes,
+			"requested_duration_ms":    opts.Duration.Milliseconds(),
+			"observed_run_duration_ms": runElapsed.Milliseconds(),
+			"lost":                     lost,
+			"requested_migrations":     opts.Migrations,
+			"migration_calls_fired":    migrationCallsFired,
+			"migrations":               migrated,
+			"application_duplicates":   applicationDuplicates,
+			"recv_dups":                recvDups,
+			"p50_ms":                   float64(p50) / float64(time.Millisecond),
+			"p99_ms":                   float64(p99) / float64(time.Millisecond),
+			"p999_ms":                  float64(p999) / float64(time.Millisecond),
+			"max_ms":                   float64(maxRTT) / float64(time.Millisecond),
 		},
+	}
+	invalidReason, runFailure := validateG2RunEvidence(g2RunEvidence{
+		requestedDuration: opts.Duration,
+		observedDuration:  runElapsed,
+		interval:          opts.Interval,
+		sent:              len(sent),
+		received:          len(received),
+		contextErr:        contextErr,
+		operationErr:      operationErr,
+		receiverErr:       receiverErr,
+		serverErr:         serverErr,
+	})
+	if invalidReason != "" {
+		r.InvalidReason = invalidReason
+		return r
+	}
+	if runFailure != "" {
+		r.Failure = runFailure
+		return r
+	}
+	if len(rtts) == 0 {
+		r.Failure = "no echoes received"
+		return r
 	}
 	if unexpected > 0 {
 		r.Failure = fmt.Sprintf("unexpected echo sequences: %d", unexpected)

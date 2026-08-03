@@ -76,7 +76,7 @@ func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
 	fs.StringVar(&cfg.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then T3)")
 	fs.StringVar(&cfg.tier, "tier", "", "specific phase-2 tier: 3 | 4 | 5 | 6 | 7 | 8")
 	fs.BoolVar(&cfg.full, "full", false, "run the normal T1-T8 full suite")
-	fs.BoolVar(&cfg.tunFull, "tun-full", false, "run the TUN full regression suite")
+	fs.BoolVar(&cfg.tunFull, "tun-full", false, "run the synthetic TUN/L3-session suite (not kernel-TUN Gold)")
 	fs.BoolVar(&cfg.list, "list", false, "write the selected case manifests as JSON and exit")
 	fs.BoolVar(&cfg.forcePhase2, "force-phase2", false, "skip the phase-1 gate (local debug only)")
 	fs.BoolVar(&cfg.allowNonLinux, "allow-non-linux", false, "bypass the Linux-only execution check")
@@ -194,6 +194,9 @@ func validateFlagCombinations(cfg runFlags) error {
 	if cfg.full && cfg.tunFull {
 		return errors.New("--full and --tun-full are mutually exclusive")
 	}
+	if cfg.full && (cfg.caseID != "" || cfg.fromCaseID != "") {
+		return errors.New("--full cannot be combined with --case or --from-case; use a standalone filter for resumable execution")
+	}
 	if cfg.tunFull && cfg.phase != "" {
 		return errors.New("--tun-full cannot be combined with --phase")
 	}
@@ -220,7 +223,7 @@ func loadCatalogs() ([]manifest.Spec, tunCatalog, error) {
 	if len(normalSpecs) == 0 {
 		return nil, tunCatalog{}, errors.New("normal catalog is empty")
 	}
-	tunCases, err := buildTUNCatalog(tunfull.Specs(), tunCaseRoles)
+	tunCases, err := buildTUNCatalog(tunfull.Specs(), tunfull.Aliases())
 	if err != nil {
 		return nil, tunCatalog{}, err
 	}
@@ -412,7 +415,7 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 	}
 	suite, revisionStart, err := beginInvocation(
 		cfg,
-		manifest.SuiteTUN,
+		tunInvocationSuite,
 		expected,
 		gate.CurrentRevision,
 		writeReports,
@@ -431,9 +434,9 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 	}
 
 	for i, spec := range expected {
-		fmt.Fprintf(stdout, "== phase 2 / TUN: %s ==\n", spec.ID)
+		fmt.Fprintf(stdout, "== phase 2 / TUN synthetic L3/session: %s ==\n", spec.ID)
 		before := len(suite.Cases)
-		tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: spec.ID})
+		runTUNCase(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: spec.ID})
 		reconcileErr := reconcileReportRows([]manifest.Spec{spec}, suite.Cases[before:])
 		if reconcileErr != nil {
 			suite.FailRun("TUN manifest reconciliation failed: " + reconcileErr.Error())
@@ -442,7 +445,20 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		if revisionErr != nil {
 			suite.FailRun(revisionErr.Error())
 		}
-		suite.Complete = i == len(expected)-1 && reconcileErr == nil && revisionErr == nil
+		caseFailed := reconcileErr != nil || suite.AnyFailedAt("T7")
+		if caseFailed {
+			for _, remaining := range expected[i+1:] {
+				suite.Add(tunfull.NotRunCase(remaining, spec.ID))
+			}
+			if finalErr := reconcileReportRows(expected, suite.Cases); finalErr != nil {
+				suite.FailRun("TUN final manifest reconciliation failed: " + finalErr.Error())
+				suite.Complete = false
+			} else {
+				suite.Complete = revisionErr == nil
+			}
+		} else {
+			suite.Complete = i == len(expected)-1 && revisionErr == nil
+		}
 		if err := writeReports(suite, cfg.reportDir); err != nil {
 			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", err)
 			return exitEnvError
@@ -451,12 +467,12 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 			fmt.Fprintln(stderr, "regress: TUN invocation revision changed:", revisionErr)
 			return exitPhase1Stale
 		}
-		if reconcileErr != nil || suite.AnyFailedAt("T7") {
-			fmt.Fprintln(stderr, "phase 2 / TUN full: FAILED")
+		if caseFailed {
+			fmt.Fprintln(stderr, "phase 2 / TUN synthetic L3/session: FAILED")
 			return exitT7Fail
 		}
 	}
-	fmt.Fprintln(stdout, "phase 2 / TUN full: GREEN")
+	fmt.Fprintln(stdout, "phase 2 / TUN synthetic L3/session: GREEN (kernel TUN Gold remains separate)")
 	return exitOK
 }
 
@@ -485,7 +501,7 @@ func containsSelectedPhase1(plan runplan.Plan) bool {
 }
 
 func requiresExistingPhase1Gate(plan runplan.Plan) bool {
-	return plan.HasPhase2() && !plan.CompletePhase1 && !containsSelectedPhase1(plan)
+	return plan.HasPhase2() && !plan.CompletePhase1
 }
 
 func writeRedPhase1Gate(cfg runFlags, stderr io.Writer) {
@@ -673,48 +689,15 @@ func buildPhase1State(
 
 const (
 	tunKindCase                  = "case"
-	tunKindCompatibilityCase     = "compatibility_case"
+	tunKindCompatibilityAlias    = "compatibility_alias"
 	tunKindCompatibilitySelector = "compatibility_selector"
+	tunSyntheticEvidenceClass    = "synthetic_l3_session_not_kernel_tun_gold"
+	tunInvocationSuite           = "tun-full/synthetic-l3-session"
 )
 
-type tunCaseRole struct {
-	ID         string
-	Kind       string
-	DefaultRun bool
-	ExpandsTo  []string
-}
-
-// tunCaseRoles is the public CLI contract for how tunfull.Specs maps onto an
-// unfiltered TUN full run. Keeping compatibility entries explicit makes any
-// registry/full drift a startup error instead of silently adding or omitting a
-// mandatory case from --list.
-var tunCaseRoles = []tunCaseRole{
-	{ID: "TUN-full.G1-smoke", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.G2-smoke", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.G3-smoke", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.G4-path-death", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.G5-path-recovery", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.T3-xray-stream-smoke", Kind: tunKindCompatibilityCase},
-	{ID: "TUN-full.T3-xray-matrix", Kind: tunKindCase, DefaultRun: true},
-	{
-		ID:   "TUN-full.T4-long-run",
-		Kind: tunKindCompatibilitySelector,
-		ExpandsTo: []string{
-			"TUN-full.T4-G1-1GiB-tcp",
-			"TUN-full.T4-G2-30m-prime",
-			"TUN-full.T4-G3-100k-pps",
-		},
-	},
-	{ID: "TUN-full.T4-G1-1GiB-tcp", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.T4-G2-30m-prime", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.T4-G3-100k-pps", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.T5-fallback", Kind: tunKindCase, DefaultRun: true},
-	{ID: "TUN-full.T6-selector", Kind: tunKindCase, DefaultRun: true},
-}
-
 type tunCatalog struct {
-	specs []manifest.Spec
-	roles []tunCaseRole
+	specs   []manifest.Spec
+	aliases []tunfull.Alias
 }
 
 type tunSelection struct {
@@ -722,100 +705,173 @@ type tunSelection struct {
 	runOrder []string
 }
 
-func buildTUNCatalog(specs []manifest.Spec, roles []tunCaseRole) (tunCatalog, error) {
+var runTUNCase = tunfull.Run
+
+type tunCatalogEntry struct {
+	listed listedCase
+	runIDs []string
+}
+
+func buildTUNCatalog(specs []manifest.Spec, aliases []tunfull.Alias) (tunCatalog, error) {
 	if err := manifest.Validate(specs); err != nil {
 		return tunCatalog{}, fmt.Errorf("TUN catalog validation failed: %w", err)
 	}
-	if len(specs) != len(roles) {
-		return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: registry has %d entries, role manifest has %d", len(specs), len(roles))
-	}
-
-	roleByID := make(map[string]tunCaseRole, len(roles))
+	byID := make(map[string]manifest.Spec, len(specs))
+	indexByID := make(map[string]int, len(specs))
 	for i, spec := range specs {
-		role := roles[i]
-		if role.ID != spec.ID {
-			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch at index %d: registry=%q role=%q", i, spec.ID, role.ID)
-		}
 		if spec.Suite != manifest.SuiteTUN || spec.Tier != "T7" || !spec.Mandatory || spec.Budget <= 0 {
-			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: invalid registered case %+v", spec)
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: invalid executable case %+v", spec)
 		}
-		switch role.Kind {
-		case tunKindCase:
-			if !role.DefaultRun || len(role.ExpandsTo) != 0 {
-				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: canonical case %q has invalid role", role.ID)
-			}
-		case tunKindCompatibilityCase:
-			if role.DefaultRun || len(role.ExpandsTo) != 0 {
-				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: compatibility case %q has invalid role", role.ID)
-			}
-		case tunKindCompatibilitySelector:
-			if role.DefaultRun || len(role.ExpandsTo) == 0 {
-				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: compatibility selector %q has invalid role", role.ID)
-			}
-		default:
-			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: case %q has unknown role %q", role.ID, role.Kind)
-		}
-		if _, duplicate := roleByID[role.ID]; duplicate {
-			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: duplicate role %q", role.ID)
-		}
-		roleByID[role.ID] = role
+		byID[spec.ID] = spec
+		indexByID[spec.ID] = i
 	}
-	for _, role := range roles {
-		for _, member := range role.ExpandsTo {
-			memberRole, ok := roleByID[member]
+	seenAliases := make(map[string]bool, len(aliases))
+	for _, alias := range aliases {
+		if alias.ID == "" || alias.Before == "" || len(alias.ExpandsTo) == 0 {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: incomplete alias %+v", alias)
+		}
+		if _, collision := byID[alias.ID]; collision {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q collides with executable case", alias.ID)
+		}
+		if seenAliases[alias.ID] {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: duplicate alias %q", alias.ID)
+		}
+		seenAliases[alias.ID] = true
+		if _, ok := byID[alias.Before]; !ok {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q has unknown continuation %q", alias.ID, alias.Before)
+		}
+		if alias.ExpandsTo[0] != alias.Before {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q first expansion %q must equal continuation %q", alias.ID, alias.ExpandsTo[0], alias.Before)
+		}
+		seenMembers := make(map[string]bool, len(alias.ExpandsTo))
+		continuationIndex := indexByID[alias.Before]
+		for i, member := range alias.ExpandsTo {
+			_, ok := byID[member]
 			if !ok {
-				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: selector %q references unknown case %q", role.ID, member)
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q references unknown case %q", alias.ID, member)
 			}
-			if !memberRole.DefaultRun || memberRole.Kind != tunKindCase {
-				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: selector %q member %q is not canonical", role.ID, member)
+			if seenMembers[member] {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q repeats case %q", alias.ID, member)
+			}
+			seenMembers[member] = true
+			if indexByID[member] != continuationIndex+i {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: alias %q expansion is not a contiguous canonical suffix", alias.ID)
 			}
 		}
 	}
 	return tunCatalog{
-		specs: append([]manifest.Spec(nil), specs...),
-		roles: cloneTUNRoles(roles),
+		specs:   append([]manifest.Spec(nil), specs...),
+		aliases: cloneTUNAliases(aliases),
 	}, nil
 }
 
-func cloneTUNRoles(roles []tunCaseRole) []tunCaseRole {
-	cloned := make([]tunCaseRole, len(roles))
-	for i, role := range roles {
-		cloned[i] = role
-		cloned[i].ExpandsTo = append([]string(nil), role.ExpandsTo...)
+func cloneTUNAliases(aliases []tunfull.Alias) []tunfull.Alias {
+	cloned := make([]tunfull.Alias, len(aliases))
+	for i, alias := range aliases {
+		cloned[i] = alias
+		cloned[i].ExpandsTo = append([]string(nil), alias.ExpandsTo...)
 	}
 	return cloned
 }
 
+func (catalog tunCatalog) entries() ([]tunCatalogEntry, error) {
+	aliasesBefore := make(map[string][]tunfull.Alias, len(catalog.aliases))
+	for _, alias := range catalog.aliases {
+		aliasesBefore[alias.Before] = append(aliasesBefore[alias.Before], alias)
+	}
+	byID := make(map[string]manifest.Spec, len(catalog.specs))
+	for _, spec := range catalog.specs {
+		byID[spec.ID] = spec
+	}
+	entries := make([]tunCatalogEntry, 0, len(catalog.specs)+len(catalog.aliases))
+	for _, spec := range catalog.specs {
+		for _, alias := range aliasesBefore[spec.ID] {
+			long := false
+			for _, member := range alias.ExpandsTo {
+				long = long || byID[member].Long
+			}
+			kind := tunKindCompatibilityAlias
+			if len(alias.ExpandsTo) > 1 {
+				kind = tunKindCompatibilitySelector
+			}
+			entries = append(entries, tunCatalogEntry{
+				listed: listedCase{
+					ID: alias.ID, Tier: "T7", Suite: manifest.SuiteTUN, Phase: 2,
+					Mandatory: false, Long: long, DefaultRun: false, Kind: kind,
+					ExpandsTo: append([]string(nil), alias.ExpandsTo...),
+				},
+				runIDs: append([]string(nil), alias.ExpandsTo...),
+			})
+		}
+		entries = append(entries, tunCatalogEntry{
+			listed: listedCaseFrom(spec, 2, true, tunKindCase, nil),
+			runIDs: []string{spec.ID},
+		})
+	}
+	return entries, nil
+}
+
 func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, error) {
-	selected, err := manifest.Select(catalog.specs, caseID, fromCaseID)
+	if caseID != "" && fromCaseID != "" {
+		return tunSelection{}, errors.New("manifest: --case and --from-case are mutually exclusive")
+	}
+	entries, err := catalog.entries()
 	if err != nil {
 		return tunSelection{}, err
 	}
-	roleByID := make(map[string]tunCaseRole, len(catalog.roles))
-	for _, role := range catalog.roles {
-		roleByID[role.ID] = role
+	if caseID == "" && fromCaseID == "" {
+		result := tunSelection{cases: make([]listedCase, len(entries)), runOrder: make([]string, len(catalog.specs))}
+		for i, entry := range entries {
+			result.cases[i] = entry.listed
+		}
+		for i, spec := range catalog.specs {
+			result.runOrder[i] = spec.ID
+		}
+		return result, nil
 	}
 
-	result := tunSelection{cases: make([]listedCase, 0, len(selected))}
-	emitted := make(map[string]bool, len(selected))
-	for _, spec := range selected {
-		role := roleByID[spec.ID]
-		result.cases = append(result.cases, listedCaseFrom(spec, 2, role.DefaultRun, role.Kind, role.ExpandsTo))
-		if !role.DefaultRun && caseID == "" && spec.ID != fromCaseID {
-			continue
+	want := caseID
+	if want == "" {
+		want = fromCaseID
+	}
+	start := -1
+	for i, entry := range entries {
+		if entry.listed.ID == want {
+			start = i
+			break
 		}
-		if len(role.ExpandsTo) == 0 {
-			if !emitted[role.ID] {
-				result.runOrder = append(result.runOrder, role.ID)
-				emitted[role.ID] = true
-			}
-			continue
+	}
+	if start < 0 {
+		if caseID != "" {
+			return tunSelection{}, fmt.Errorf("manifest: no case matched --case=%q", caseID)
 		}
-		for _, member := range role.ExpandsTo {
-			if !emitted[member] {
-				result.runOrder = append(result.runOrder, member)
-				emitted[member] = true
+		return tunSelection{}, fmt.Errorf("manifest: no case matched --from-case=%q", fromCaseID)
+	}
+	if caseID != "" {
+		entry := entries[start]
+		return tunSelection{cases: []listedCase{entry.listed}, runOrder: append([]string(nil), entry.runIDs...)}, nil
+	}
+
+	selectedEntries := entries[start:]
+	result := tunSelection{cases: make([]listedCase, len(selectedEntries))}
+	for i, entry := range selectedEntries {
+		result.cases[i] = entry.listed
+	}
+	emitted := make(map[string]bool)
+	add := func(ids ...string) {
+		for _, id := range ids {
+			if !emitted[id] {
+				result.runOrder = append(result.runOrder, id)
+				emitted[id] = true
 			}
+		}
+	}
+	if selectedEntries[0].listed.Kind != tunKindCase {
+		add(selectedEntries[0].runIDs...)
+	}
+	for _, entry := range selectedEntries {
+		if entry.listed.Kind == tunKindCase {
+			add(entry.runIDs...)
 		}
 	}
 	if len(result.runOrder) == 0 {
@@ -830,9 +886,10 @@ type listDocument struct {
 }
 
 type listCatalog struct {
-	Suite    string       `json:"suite"`
-	Cases    []listedCase `json:"cases"`
-	RunOrder []string     `json:"run_order"`
+	Suite         string       `json:"suite"`
+	EvidenceClass string       `json:"evidence_class,omitempty"`
+	Cases         []listedCase `json:"cases"`
+	RunOrder      []string     `json:"run_order"`
 }
 
 type listedCase struct {
@@ -856,7 +913,8 @@ func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tun
 			return listDocument{}, fmt.Errorf("TUN list selection: %w", err)
 		}
 		doc.Catalogs = append(doc.Catalogs, listCatalog{
-			Suite: manifest.SuiteTUN, Cases: selection.cases, RunOrder: selection.runOrder,
+			Suite: manifest.SuiteTUN, EvidenceClass: tunSyntheticEvidenceClass,
+			Cases: selection.cases, RunOrder: selection.runOrder,
 		})
 		return doc, nil
 	}
@@ -890,7 +948,8 @@ func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tun
 		return listDocument{}, err
 	}
 	doc.Catalogs = append(doc.Catalogs, normal, listCatalog{
-		Suite: manifest.SuiteTUN, Cases: tunSelection.cases, RunOrder: tunSelection.runOrder,
+		Suite: manifest.SuiteTUN, EvidenceClass: tunSyntheticEvidenceClass,
+		Cases: tunSelection.cases, RunOrder: tunSelection.runOrder,
 	})
 	return doc, nil
 }

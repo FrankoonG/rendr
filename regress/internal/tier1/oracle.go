@@ -123,6 +123,9 @@ func validateContracts(contracts []packageContract) error {
 		if contract.Excluded && (len(contract.Inventory) != 0 || len(contract.RunTests) != 0) {
 			return fmt.Errorf("excluded package %s must not declare tests", contract.ImportPath)
 		}
+		if !contract.Excluded && len(contract.Inventory) > 0 && contract.RunTests != nil && len(contract.RunTests) == 0 {
+			return fmt.Errorf("%s declares %d inventoried tests but an empty run set", contract.ImportPath, len(contract.Inventory))
+		}
 		if err := validateUniqueNames(contract.ImportPath+" inventory", contract.Inventory); err != nil {
 			return err
 		}

@@ -36,8 +36,8 @@ func TestPrepareCommandNormalScopes(t *testing.T) {
 			},
 		},
 		{
-			name: "full resume crosses tiers",
-			cfg:  runFlags{full: true, fromCaseID: "T5.4-gvisor-unprivileged"},
+			name: "standalone resume crosses tiers",
+			cfg:  runFlags{fromCaseID: "T5.4-gvisor-unprivileged"},
 			wantRuns: []runplan.TierRun{
 				{Tier: "T5", FromCase: "T5.4-gvisor-unprivileged"},
 				{Tier: "T6"},
@@ -95,6 +95,8 @@ func TestPrepareCommandRejectsConflictsAndOutOfScopeFilters(t *testing.T) {
 		{name: "list force", cfg: runFlags{list: true, forcePhase2: true}, want: "cannot be combined"},
 		{name: "legacy profile", cfg: runFlags{profile: "PYS-D-1"}, want: "not supported"},
 		{name: "full and tier", cfg: runFlags{full: true, tier: "4"}, want: "cannot be combined"},
+		{name: "full and exact case", cfg: runFlags{full: true, caseID: "go-test"}, want: "--full cannot be combined"},
+		{name: "full and resume", cfg: runFlags{full: true, fromCaseID: "go-test"}, want: "--full cannot be combined"},
 		{name: "invalid phase", cfg: runFlags{phase: "3"}, want: "invalid --phase"},
 		{name: "invalid tier", cfg: runFlags{tier: "9"}, want: "invalid --tier"},
 		{name: "case outside phase", cfg: runFlags{phase: "1", caseID: "T8.status.local-default"}, want: "no case matched"},
@@ -349,21 +351,21 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 }
 
 func TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen(t *testing.T) {
-	resumed, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-test"})
+	resumed, err := runplan.Build(runplan.Request{FromCase: "go-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resumed.HasPhase2() || !containsSelectedPhase1(resumed) {
 		t.Fatalf("resume plan does not bridge phase 1 to phase 2: %+v", resumed)
 	}
-	if requiresExistingPhase1Gate(resumed) {
-		t.Fatal("phase-1 resume incorrectly requires the pre-existing green gate")
+	if !requiresExistingPhase1Gate(resumed) {
+		t.Fatal("partial phase-1 resume bypasses the current green gate")
 	}
 	if shouldWriteGreenPhase1Gate(resumed) {
 		t.Fatal("partial phase-1 resume can mint a complete green gate")
 	}
 
-	phase2Only, err := runplan.Build(runplan.Request{Full: true, FromCase: "T5.4-gvisor-unprivileged"})
+	phase2Only, err := runplan.Build(runplan.Request{FromCase: "T5.4-gvisor-unprivileged"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +373,7 @@ func TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen(t *testing.T) {
 		t.Fatal("phase-2-only resume bypasses the phase-1 gate")
 	}
 
-	complete, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-vet"})
+	complete, err := runplan.Build(runplan.Request{FromCase: "go-vet"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,41 +385,58 @@ func TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen(t *testing.T) {
 func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) {
 	root := newMainTestRepo(t)
 	reportDir := t.TempDir()
-	red := gate.State{CommitSHA: "old", WorktreeSHA: "old", Status: "red", At: time.Unix(1, 0)}
-	if err := gate.Write(reportDir, red); err != nil {
-		t.Fatal(err)
-	}
 
 	restore := installSyntheticTierCommands(t)
 	defer restore()
-	plan, err := runplan.Build(runplan.Request{Full: true, FromCase: "go-test"})
+	plan, err := runplan.Build(runplan.Request{FromCase: "go-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := runFlags{full: true, fromCaseID: "go-test", reportDir: reportDir, rendrRoot: root}
+	cfg := runFlags{fromCaseID: "go-test", reportDir: reportDir, rendrRoot: root}
 	var stdout, stderr bytes.Buffer
-	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitOK {
-		t.Fatalf("code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitPhase1Stale {
+		t.Fatalf("code=%d want %d stderr=%s stdout=%s", code, exitPhase1Stale, stderr.String(), stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "phase 1: PARTIAL (green gate unchanged)") {
-		t.Fatalf("resume did not report partial phase 1:\n%s", stdout.String())
+	if stdout.Len() != 0 {
+		t.Fatalf("tiers ran before gate rejection:\n%s", stdout.String())
 	}
-	state, err := gate.Read(reportDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.CommitSHA != red.CommitSHA || state.WorktreeSHA != red.WorktreeSHA ||
-		state.Status != red.Status || !state.At.Equal(red.At) {
-		t.Fatalf("partial resume changed gate: got %+v want %+v", *state, red)
+	if !strings.Contains(stderr.String(), "phase 2 not allowed") {
+		t.Fatalf("missing gate diagnostic:\n%s", stderr.String())
 	}
 	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`state="pass"`, `complete="true"`, `invocation_scope="from-case"`, `invocation_from_case="go-test"`} {
+	for _, want := range []string{`state="fail"`, `complete="false"`, `invocation_scope="from-case"`, `invocation_from_case="go-test"`, "phase 2 gate rejected invocation"} {
 		if !strings.Contains(string(junit), want) {
 			t.Fatalf("resume JUnit missing %q:\n%s", want, junit)
 		}
+	}
+
+	greenDir := t.TempDir()
+	greenState, err := buildPhase1State(root, "green", time.Now(), gate.CurrentRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Write(greenDir, greenState); err != nil {
+		t.Fatal(err)
+	}
+	greenCfg := cfg
+	greenCfg.reportDir = greenDir
+	stdout.Reset()
+	stderr.Reset()
+	if code := executeNormal(context.Background(), greenCfg, plan, &stdout, &stderr); code != exitOK {
+		t.Fatalf("green-gated code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+
+	forcedDir := t.TempDir()
+	forcedCfg := cfg
+	forcedCfg.reportDir = forcedDir
+	forcedCfg.forcePhase2 = true
+	stdout.Reset()
+	stderr.Reset()
+	if code := executeNormal(context.Background(), forcedCfg, plan, &stdout, &stderr); code != exitOK {
+		t.Fatalf("forced code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
 	}
 }
 
@@ -468,7 +487,7 @@ func TestWriteKnownPhase1GateRejectsMissingIdentity(t *testing.T) {
 }
 
 func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
-	tunCatalog, err := buildTUNCatalog(tunfull.Specs(), tunCaseRoles)
+	tunCatalog, err := buildTUNCatalog(tunfull.Specs(), tunfull.Aliases())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,10 +495,11 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selection.cases) != len(tunfull.Specs()) {
-		t.Fatalf("listed cases=%d want registry count %d", len(selection.cases), len(tunfull.Specs()))
+	if len(selection.cases) != len(tunfull.Specs())+len(tunfull.Aliases()) {
+		t.Fatalf("listed cases=%d want executable+alias count %d", len(selection.cases), len(tunfull.Specs())+len(tunfull.Aliases()))
 	}
 	wantDefault := []string{
+		"TUN-full.preflight-kernel-tun",
 		"TUN-full.G1-smoke",
 		"TUN-full.G2-smoke",
 		"TUN-full.G3-smoke",
@@ -487,9 +507,9 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 		"TUN-full.G5-path-recovery",
 		"TUN-full.T3-xray-matrix",
 		"TUN-full.T4-G1-1GiB-tcp",
-		"TUN-full.T4-G2-30m-prime",
+		"TUN-full.T4-G2-30m-selector",
 		"TUN-full.T4-G3-100k-pps",
-		"TUN-full.T5-fallback",
+		"TUN-full.T5-adapter-matrix",
 		"TUN-full.T6-selector",
 	}
 	if !reflect.DeepEqual(selection.runOrder, wantDefault) {
@@ -497,7 +517,7 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	}
 
 	streamCompat := findListedCase(t, selection.cases, "TUN-full.T3-xray-stream-smoke")
-	if streamCompat.DefaultRun || streamCompat.Kind != tunKindCompatibilityCase {
+	if streamCompat.DefaultRun || streamCompat.Mandatory || streamCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(streamCompat.ExpandsTo, []string{"TUN-full.T3-xray-matrix"}) {
 		t.Fatalf("stream compatibility entry=%+v", streamCompat)
 	}
 	longCompat := findListedCase(t, selection.cases, "TUN-full.T4-long-run")
@@ -512,32 +532,106 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	if !reflect.DeepEqual(exact.runOrder, longCompat.ExpandsTo) {
 		t.Fatalf("selector run=%v want expansion %v", exact.runOrder, longCompat.ExpandsTo)
 	}
+	primeCompat := findListedCase(t, selection.cases, "TUN-full.T4-G2-30m-prime")
+	if primeCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(primeCompat.ExpandsTo, []string{"TUN-full.T4-G2-30m-selector"}) {
+		t.Fatalf("prime compatibility entry=%+v", primeCompat)
+	}
+	exact, err = tunCatalog.selectCases("TUN-full.T4-G2-30m-prime", "")
+	if err != nil || !reflect.DeepEqual(exact.runOrder, primeCompat.ExpandsTo) {
+		t.Fatalf("prime alias selection=%+v err=%v", exact, err)
+	}
+	fallbackCompat := findListedCase(t, selection.cases, "TUN-full.T5-fallback")
+	if fallbackCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(fallbackCompat.ExpandsTo, []string{"TUN-full.T5-adapter-matrix"}) {
+		t.Fatalf("fallback compatibility entry=%+v", fallbackCompat)
+	}
 	resumed, err := tunCatalog.selectCases("", "TUN-full.T3-xray-stream-smoke")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resumed.runOrder) == 0 || resumed.runOrder[0] != "TUN-full.T3-xray-stream-smoke" {
+	if len(resumed.runOrder) == 0 || resumed.runOrder[0] != "TUN-full.T3-xray-matrix" {
 		t.Fatalf("compatibility resume is not inclusive: %v", resumed.runOrder)
+	}
+	for _, spec := range tunfull.Specs() {
+		if !spec.Mandatory {
+			t.Fatalf("executable spec is not mandatory: %+v", spec)
+		}
 	}
 }
 
 func TestTUNCatalogMismatchFailsClosed(t *testing.T) {
 	specs := tunfull.Specs()
-	roles := cloneTUNRoles(tunCaseRoles)
-	roles[0].ID = "TUN-full.changed"
-	if _, err := buildTUNCatalog(specs, roles); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
-		t.Fatalf("identity mismatch err=%v", err)
-	}
-
-	roles = cloneTUNRoles(tunCaseRoles[:len(tunCaseRoles)-1])
-	if _, err := buildTUNCatalog(specs, roles); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
-		t.Fatalf("count mismatch err=%v", err)
-	}
-
 	badSpecs := append([]manifest.Spec(nil), specs...)
 	badSpecs[0].Mandatory = false
-	if _, err := buildTUNCatalog(badSpecs, tunCaseRoles); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
+	if _, err := buildTUNCatalog(badSpecs, tunfull.Aliases()); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
 		t.Fatalf("metadata mismatch err=%v", err)
+	}
+
+	aliases := cloneTUNAliases(tunfull.Aliases())
+	aliases[0].Before = "TUN-full.missing"
+	if _, err := buildTUNCatalog(specs, aliases); err == nil || !strings.Contains(err.Error(), "unknown continuation") {
+		t.Fatalf("continuation mismatch err=%v", err)
+	}
+	aliases = cloneTUNAliases(tunfull.Aliases())
+	aliases[0].ID = specs[0].ID
+	if _, err := buildTUNCatalog(specs, aliases); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("alias collision err=%v", err)
+	}
+	aliases = cloneTUNAliases(tunfull.Aliases())
+	aliases[0].ExpandsTo = []string{"TUN-full.missing"}
+	if _, err := buildTUNCatalog(specs, aliases); err == nil || !strings.Contains(err.Error(), "first expansion") {
+		t.Fatalf("alias expansion err=%v", err)
+	}
+	aliases = cloneTUNAliases(tunfull.Aliases())
+	aliases[1].ExpandsTo = []string{"TUN-full.T4-G1-1GiB-tcp", "TUN-full.T4-G3-100k-pps"}
+	if _, err := buildTUNCatalog(specs, aliases); err == nil || !strings.Contains(err.Error(), "contiguous canonical suffix") {
+		t.Fatalf("non-contiguous alias err=%v", err)
+	}
+	t.Run("expanded failure keeps canonical rows", testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase)
+}
+
+func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) {
+	catalog, err := buildTUNCatalog(tunfull.Specs(), tunfull.Aliases())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := catalog.selectCases("TUN-full.T4-long-run", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := runTUNCase
+	t.Cleanup(func() { runTUNCase = original })
+	var called []string
+	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, opts tunfull.Options) {
+		called = append(called, opts.Case)
+		suite.Add(report.Case{Name: opts.Case, Tier: "T7", Failure: "synthetic failure"})
+	}
+
+	root := newMainTestRepo(t)
+	reportDir := t.TempDir()
+	cfg := runFlags{
+		tunFull: true, caseID: "TUN-full.T4-long-run", forcePhase2: true,
+		rendrRoot: root, reportDir: reportDir,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeTUN(context.Background(), cfg, selection, &stdout, &stderr); code != exitT7Fail {
+		t.Fatalf("code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !reflect.DeepEqual(called, []string{"TUN-full.T4-G1-1GiB-tcp"}) {
+		t.Fatalf("executed=%v", called)
+	}
+	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`complete="true"`, `selected_cases="3"`, `invocation_suite="tun-full/synthetic-l3-session"`,
+		`name="TUN-full.T4-G1-1GiB-tcp"`, `name="TUN-full.T4-G2-30m-selector"`,
+		`name="TUN-full.T4-G3-100k-pps"`, "not run after TUN-full.T4-G1-1GiB-tcp failed",
+	} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, junit)
+		}
 	}
 }
 
@@ -556,7 +650,7 @@ func TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment(t *testing.T
 	if doc.Catalogs[0].Suite != manifest.SuiteNormal || len(doc.Catalogs[0].Cases) != len(catalog.NormalFull()) {
 		t.Fatalf("normal catalog summary=%+v", doc.Catalogs[0])
 	}
-	if doc.Catalogs[1].Suite != manifest.SuiteTUN || len(doc.Catalogs[1].Cases) != len(tunfull.Specs()) {
+	if doc.Catalogs[1].Suite != manifest.SuiteTUN || doc.Catalogs[1].EvidenceClass != tunSyntheticEvidenceClass || len(doc.Catalogs[1].Cases) != len(tunfull.Specs())+len(tunfull.Aliases()) {
 		t.Fatalf("TUN catalog summary=%+v", doc.Catalogs[1])
 	}
 	if !strings.Contains(stdout.String(), `"default_run": false`) {

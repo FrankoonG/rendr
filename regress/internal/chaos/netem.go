@@ -1,135 +1,215 @@
 //go:build linux
 
-// Package chaos applies Linux tc qdisc rules to the loopback interface
-// inside the regress container so tests can run against a realistic
-// network profile (bandwidth-limited, with optional loss / delay /
-// jitter) instead of the docker default "infinite bandwidth zero
-// latency" loopback that CLAUDE.md warns about:
-//
-//	"带宽限速是 resilience / recovery 类测试的必备前置——docker
-//	 默认网络太快，跑出来的数据没意义"
-//
-// Profile is the declarative shape (bandwidth bits/sec, loss percent,
-// delay base+jitter). Apply installs a tc tbf+netem qdisc stack on
-// `lo`; the returned cleanup MUST be deferred so a leaked qdisc
-// doesn't poison subsequent regress runs.
-//
-// Linux-only by build tag. Container needs CAP_NET_ADMIN
-// (scripts/regress.sh's --cap-add=NET_ADMIN provides it).
+// Package chaos owns Linux tc/netem fixtures used by the regression suite.
 package chaos
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
-	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// Profile is one chaos configuration. Zero-value = no qdisc applied
-// (the caller should skip the harness entirely in that case).
-type Profile struct {
-	// Bandwidth in bits per second (e.g. 50_000_000 = 50 Mbps).
-	// Zero leaves bandwidth uncapped.
-	Bandwidth int64
-	// LossPct is application-visible packet loss percentage, 0-100.
-	LossPct float64
-	// Delay is the base one-way delay added to every packet.
-	Delay time.Duration
-	// Jitter is the +/- random component layered on Delay.
-	Jitter time.Duration
+const loopbackLockPath = "/run/lock/rendr-regress-tc-lo.lock"
+
+// ApplyChecked installs a tc fixture that continuously exposes qdisc change
+// notifications and supports synchronous ownership verification.
+func ApplyChecked(p Profile) (Fixture, error) {
+	return applyWithDeps(p, fixtureDeps{
+		run:         runTCCommand,
+		acquireLock: acquireLoopbackLock,
+		handles:     randomHandles,
+		watch:       watchLoopbackQdisc,
+	})
 }
 
-// Realistic50M is the recommended default per project convention:
-// 50 Mbps bandwidth, no loss, no added delay. Models a typical
-// residential broadband link.
-var Realistic50M = Profile{Bandwidth: 50_000_000}
-
-// LossyWAN models a lossy intercontinental hop: 50 Mbps + 1% loss
-// + 80 ms base delay + 20 ms jitter. Used for resilience tests.
-var LossyWAN = Profile{
-	Bandwidth: 50_000_000,
-	LossPct:   1.0,
-	Delay:     80 * time.Millisecond,
-	Jitter:    20 * time.Millisecond,
+func runTCCommand(args ...string) ([]byte, error) {
+	return exec.Command("tc", args...).CombinedOutput()
 }
 
-// Apply installs the profile on `lo`. Returns a cleanup function
-// that removes the qdisc; caller MUST defer it.
-//
-// The qdisc stack is `tbf` (bandwidth shaper) at the root, with
-// `netem` (loss/delay/jitter) chained underneath via a child class.
-// This is the canonical ordering: shape first, then degrade — so
-// the bandwidth limit reflects the link cap and netem injects the
-// link's behavior.
-func Apply(p Profile) (cleanup func() error, err error) {
-	if p.Bandwidth <= 0 && p.LossPct <= 0 && p.Delay <= 0 {
-		// No-op profile; nothing to install.
-		return func() error { return nil }, nil
+type fileFixtureLock struct {
+	file *os.File
+	once sync.Once
+	err  error
+}
+
+func acquireLoopbackLock() (fixtureLock, error) {
+	file, err := os.OpenFile(loopbackLockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
 	}
-
-	// Clear any prior root qdisc first (idempotent setup).
-	_ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root").Run()
-
-	if p.Bandwidth > 0 {
-		// tbf params: rate, burst, latency. Latency=1s deliberately
-		// gives the tbf queue about rate*1s of headroom (6 MB at
-		// 50 Mbps). At the 50 Mbps regression baseline and above,
-		// burst must also be large enough for loopback/GSO-shaped TCP:
-		// the original rate/100 burst (62.5 KB at 50 Mbps) consistently
-		// manufactured TCP loss on lo and made G1-T4 abort at ~2m17s
-		// with ETIMEDOUT after only ~10 MiB written. A 4 MiB floor at
-		// 50 Mbps+ preserves the steady-state cap while avoiding
-		// qdisc-induced drops that do not model a clean broadband
-		// bottleneck. Lower-rate unit tests keep the small burst so
-		// short samples still observe shaping.
-		burst := p.Bandwidth / 800 // bytes ≈ rate-bits / 8 / 100
-		if p.Bandwidth >= 50_000_000 && burst < 4<<20 {
-			burst = 4 << 20
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		owner, _ := os.ReadFile(loopbackLockPath)
+		_ = file.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, fmt.Errorf("%w: another regress process owns loopback shaping (%s)", ErrStimulusInvalid, strings.TrimSpace(string(owner)))
 		}
-		if burst < 128<<10 {
-			burst = 128 << 10
-		}
-		args := []string{"qdisc", "add", "dev", "lo", "root", "handle", "1:",
-			"tbf",
-			"rate", fmt.Sprintf("%dbit", p.Bandwidth),
-			"burst", strconv.FormatInt(burst, 10),
-			"latency", "1s",
-		}
-		if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("tc tbf: %w (%s)", err, out)
-		}
+		return nil, err
 	}
-
-	if p.LossPct > 0 || p.Delay > 0 {
-		netemArgs := []string{"qdisc", "add", "dev", "lo"}
-		if p.Bandwidth > 0 {
-			netemArgs = append(netemArgs, "parent", "1:1", "handle", "10:")
-		} else {
-			netemArgs = append(netemArgs, "root", "handle", "10:")
-		}
-		netemArgs = append(netemArgs, "netem")
-		if p.Delay > 0 {
-			netemArgs = append(netemArgs, "delay", fmt.Sprintf("%dms", p.Delay.Milliseconds()))
-			if p.Jitter > 0 {
-				netemArgs = append(netemArgs, fmt.Sprintf("%dms", p.Jitter.Milliseconds()))
-			}
-		}
-		if p.LossPct > 0 {
-			netemArgs = append(netemArgs, "loss", fmt.Sprintf("%.2f%%", p.LossPct))
-		}
-		if out, err := exec.Command("tc", netemArgs...).CombinedOutput(); err != nil {
-			// Roll back tbf if it was installed.
-			_ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root").Run()
-			return nil, fmt.Errorf("tc netem: %w (%s)", err, out)
-		}
+	marker := fmt.Sprintf("pid=%d acquired=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+	if err := file.Truncate(0); err != nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		_ = file.Close()
+		return nil, err
 	}
+	if _, err := file.Seek(0, 0); err != nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	if _, err := file.WriteString(marker); err != nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	return &fileFixtureLock{file: file}, nil
+}
 
-	cleanup = func() error {
-		out, err := exec.Command("tc", "qdisc", "del", "dev", "lo", "root").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("tc qdisc del lo root: %w (%s)", err, out)
-		}
+func (l *fileFixtureLock) Release() error {
+	if l == nil {
 		return nil
 	}
-	return cleanup, nil
+	l.once.Do(func() {
+		if l.file == nil {
+			return
+		}
+		unlockErr := unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
+		closeErr := l.file.Close()
+		l.err = errors.Join(unlockErr, closeErr)
+	})
+	return l.err
+}
+
+func randomHandles() (string, string, error) {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", "", err
+	}
+	major := func(v uint16) uint16 { return 0x1000 + v%0xdfff }
+	root := major(binary.BigEndian.Uint16(raw[0:2]))
+	child := major(binary.BigEndian.Uint16(raw[2:4]))
+	if child == root {
+		child++
+		if child >= 0xefff {
+			child = 0x1000
+		}
+	}
+	return fmt.Sprintf("%x:", root), fmt.Sprintf("%x:", child), nil
+}
+
+type netlinkQdiscWatcher struct {
+	fd      int
+	ifindex int
+	changes chan error
+	done    chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func watchLoopbackQdisc() (qdiscWatcher, error) {
+	iface, err := net.InterfaceByName("lo")
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, unix.NETLINK_ROUTE)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: unix.RTMGRP_TC}); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+	w := &netlinkQdiscWatcher{
+		fd:      fd,
+		ifindex: iface.Index,
+		changes: make(chan error, 1),
+		done:    make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	go w.run()
+	return w, nil
+}
+
+func (w *netlinkQdiscWatcher) Changes() <-chan error { return w.changes }
+
+func (w *netlinkQdiscWatcher) Close() error {
+	if w == nil {
+		return nil
+	}
+	w.once.Do(func() { close(w.done) })
+	<-w.closed
+	return nil
+}
+
+func (w *netlinkQdiscWatcher) run() {
+	defer close(w.closed)
+	defer close(w.changes)
+	defer unix.Close(w.fd)
+	buffer := make([]byte, 64<<10)
+	for {
+		select {
+		case <-w.done:
+			return
+		default:
+		}
+		poll := []unix.PollFd{{Fd: int32(w.fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(poll, 250)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			w.report(fmt.Errorf("%w: qdisc event watcher poll failed: %v", ErrStimulusInvalid, err))
+			return
+		}
+		if n == 0 || poll[0].Revents&unix.POLLIN == 0 {
+			if poll[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+				w.report(fmt.Errorf("%w: qdisc event watcher poll revents=%#x", ErrStimulusInvalid, poll[0].Revents))
+				return
+			}
+			continue
+		}
+		n, _, err = unix.Recvfrom(w.fd, buffer, unix.MSG_DONTWAIT)
+		if err != nil {
+			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EINTR) {
+				continue
+			}
+			w.report(fmt.Errorf("%w: qdisc event watcher receive failed: %v", ErrStimulusInvalid, err))
+			return
+		}
+		messages, err := syscall.ParseNetlinkMessage(buffer[:n])
+		if err != nil {
+			w.report(fmt.Errorf("%w: parse qdisc event: %v", ErrStimulusInvalid, err))
+			return
+		}
+		for _, message := range messages {
+			if qdiscEventForInterface(message, w.ifindex) {
+				w.report(fmt.Errorf("%w: kernel reported a loopback qdisc replacement event", ErrStimulusInvalid))
+				return
+			}
+		}
+	}
+}
+
+func (w *netlinkQdiscWatcher) report(err error) {
+	select {
+	case w.changes <- err:
+	default:
+	}
+}
+
+func qdiscEventForInterface(message syscall.NetlinkMessage, ifindex int) bool {
+	if message.Header.Type != unix.RTM_NEWQDISC && message.Header.Type != unix.RTM_DELQDISC {
+		return false
+	}
+	// struct tcmsg stores tcm_ifindex at byte offset 4.
+	return len(message.Data) >= 8 && int(binary.NativeEndian.Uint32(message.Data[4:8])) == ifindex
 }

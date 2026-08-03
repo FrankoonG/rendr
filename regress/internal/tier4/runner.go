@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/FrankoonG/rendr"
@@ -218,21 +219,29 @@ func executeCase(ctx context.Context, def caseDef) report.Case {
 // after chaos cleanup so the selected-case loop can stop before launching any
 // later case, even when the smoke goroutine is still unwinding cancellation.
 func runCase(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) report.Case {
-	return runCaseWithChaos(ctx, name, budget, prof, fn, chaos.Apply)
+	return runCaseWithChaos(ctx, name, budget, prof, fn, chaos.ApplyChecked)
 }
 
-func runCaseWithChaos(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply func(chaos.Profile) (func() error, error)) report.Case {
+const chaosVerifyInterval = time.Second
+
+type chaosApplyFunc func(chaos.Profile) (chaos.Fixture, error)
+
+func runCaseWithChaos(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply chaosApplyFunc) report.Case {
+	return runCaseWithChaosInterval(ctx, name, budget, prof, fn, apply, chaosVerifyInterval)
+}
+
+func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply chaosApplyFunc, verifyInterval time.Duration) report.Case {
 	fmt.Printf("  > T4/%s (budget %s, chaos %s) — start\n", name, budget, profDesc(prof))
 	rc := report.Case{Name: name, Tier: "T4"}
-	cleanup, err := apply(prof)
+	fixture, err := apply(prof)
 	if err != nil {
-		rc.Failure = "chaos.Apply failed: " + err.Error()
-		fmt.Printf("  > T4/%s — FAIL: %s\n", name, rc.Failure)
+		rc.InvalidReason = "chaos fixture setup failed: " + err.Error()
+		fmt.Printf("  > T4/%s — INVALID: %s\n", name, rc.InvalidReason)
 		return rc
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
 	start := time.Now()
+	monitorFailures, monitorDone := monitorChaosFixture(cctx, fixture, verifyInterval)
 	done := make(chan smoke.Result, 1)
 	go func() {
 		done <- fn(cctx)
@@ -246,11 +255,24 @@ func runCaseWithChaos(ctx context.Context, name string, budget time.Duration, pr
 		if rc.Duration == 0 {
 			rc.Duration = time.Since(start)
 		}
+	case err := <-monitorFailures:
+		rc.Duration = time.Since(start)
+		markChaosInvalid(&rc, "chaos stimulus changed during case: "+err.Error())
 	case <-cctx.Done():
 		rc.Duration = time.Since(start)
 		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
 	}
-	applyCleanupResult(&rc, cleanup)
+	cancel()
+	<-monitorDone
+	select {
+	case err := <-monitorFailures:
+		markChaosInvalid(&rc, "chaos stimulus changed during case: "+err.Error())
+	default:
+	}
+	if err := fixture.Verify(); err != nil {
+		markChaosInvalid(&rc, "chaos final verification failed: "+err.Error())
+	}
+	applyCleanupResult(&rc, fixture.Cleanup)
 	if rc.Failure != "" {
 		fmt.Printf("  > T4/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
 	} else if rc.InvalidReason != "" {
@@ -289,13 +311,69 @@ func applyCleanupResult(rc *report.Case, cleanup func() error) {
 		return
 	}
 	if err := cleanup(); err != nil {
-		message := "chaos cleanup failed: " + err.Error()
-		if rc.Failure != "" {
-			rc.Failure += "; " + message
+		markChaosInvalid(rc, "chaos cleanup failed: "+err.Error())
+	}
+}
+
+func markChaosInvalid(rc *report.Case, reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	if rc.Failure != "" {
+		if rc.Evidence == nil {
+			rc.Evidence = make(map[string]string)
+		}
+		rc.Evidence["untrusted_case_failure"] = rc.Failure
+		rc.Failure = ""
+	}
+	for _, existing := range strings.Split(rc.InvalidReason, "; ") {
+		if existing == reason {
 			return
 		}
-		rc.InvalidReason = message
 	}
+	if rc.InvalidReason == "" {
+		rc.InvalidReason = reason
+	} else {
+		rc.InvalidReason += "; " + reason
+	}
+}
+
+func monitorChaosFixture(ctx context.Context, fixture chaos.Fixture, interval time.Duration) (<-chan error, <-chan struct{}) {
+	failures := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		changes := fixture.Changes()
+		var ticker *time.Ticker
+		var ticks <-chan time.Time
+		if interval > 0 {
+			ticker = time.NewTicker(interval)
+			ticks = ticker.C
+			defer ticker.Stop()
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err, ok := <-changes:
+				if !ok {
+					failures <- fmt.Errorf("qdisc event watcher stopped unexpectedly")
+					return
+				}
+				if err == nil {
+					err = fmt.Errorf("qdisc event watcher reported an unspecified change")
+				}
+				failures <- err
+				return
+			case <-ticks:
+				if err := fixture.Verify(); err != nil {
+					failures <- err
+					return
+				}
+			}
+		}
+	}()
+	return failures, done
 }
 
 func profDesc(p chaos.Profile) string {

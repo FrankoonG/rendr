@@ -1,5 +1,5 @@
-// Package tunfull defines the TUN translation of the existing full
-// regression surface.
+// Package tunfull defines synthetic L3/session translations of the existing
+// regression surface. It does not replace private real-kernel TUN Gold cases.
 package tunfull
 
 import (
@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -26,58 +24,72 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/transport/tcprepair"
+	"github.com/FrankoonG/rendr/tun"
 )
 
-// Options filters the TUN full baseline matrix.
+// Options filters the synthetic TUN/L3-session matrix.
 type Options struct {
 	Case     string
 	FromCase string
 }
 
 const (
-	caseG1Smoke           = "TUN-full.G1-smoke"
-	caseG2Smoke           = "TUN-full.G2-smoke"
-	caseG3Smoke           = "TUN-full.G3-smoke"
-	caseG4PathDeath       = "TUN-full.G4-path-death"
-	caseG5PathRecovery    = "TUN-full.G5-path-recovery"
-	caseT3XrayStreamSmoke = "TUN-full.T3-xray-stream-smoke"
-	caseT3XrayMatrix      = "TUN-full.T3-xray-matrix"
-	caseT4LongRun         = "TUN-full.T4-long-run"
-	caseT4G1              = "TUN-full.T4-G1-1GiB-tcp"
-	caseT4G2              = "TUN-full.T4-G2-30m-prime"
-	caseT4G3              = "TUN-full.T4-G3-100k-pps"
-	caseT5Fallback        = "TUN-full.T5-fallback"
-	caseT6Selector        = "TUN-full.T6-selector"
+	caseKernelTUNPreflight = "TUN-full.preflight-kernel-tun"
+	caseG1Smoke            = "TUN-full.G1-smoke"
+	caseG2Smoke            = "TUN-full.G2-smoke"
+	caseG3Smoke            = "TUN-full.G3-smoke"
+	caseG4PathDeath        = "TUN-full.G4-path-death"
+	caseG5PathRecovery     = "TUN-full.G5-path-recovery"
+	caseT3XrayStreamSmoke  = "TUN-full.T3-xray-stream-smoke"
+	caseT3XrayMatrix       = "TUN-full.T3-xray-matrix"
+	caseT4LongRun          = "TUN-full.T4-long-run"
+	caseT4G1               = "TUN-full.T4-G1-1GiB-tcp"
+	caseT4G2Prime          = "TUN-full.T4-G2-30m-prime"
+	caseT4G2               = "TUN-full.T4-G2-30m-selector"
+	caseT4G3               = "TUN-full.T4-G3-100k-pps"
+	caseT5Fallback         = "TUN-full.T5-fallback"
+	caseT5AdapterMatrix    = "TUN-full.T5-adapter-matrix"
+	caseT6Selector         = "TUN-full.T6-selector"
 )
 
 type caseRun func(context.Context, string, manifest.Spec) report.Case
 
 type caseDef struct {
-	spec       manifest.Spec
-	defaultRun bool
-	run        caseRun
-	members    []string
+	spec manifest.Spec
+	run  caseRun
 }
 
-// Compatibility selectors remain addressable, but are not repeated by the
-// unfiltered suite because their work is covered by the canonical cases.
+// Alias is non-executable catalog metadata retained for historical CLI IDs.
+// Before places the alias immediately before a canonical case in --list and
+// defines the inclusive --from-case continuation point.
+type Alias struct {
+	ID        string
+	Before    string
+	ExpandsTo []string
+}
+
+// caseDefs contains executable cases only. Every entry is mandatory, appears
+// once in Specs, executes once, and produces exactly one report row.
 var caseDefs = []caseDef{
-	{spec: tunSpec(caseG1Smoke, 2*time.Minute, false), defaultRun: true, run: runG1ManifestCase},
-	{spec: tunSpec(caseG2Smoke, 2*time.Minute, false), defaultRun: true, run: runG2ManifestCase},
-	{spec: tunSpec(caseG3Smoke, 2*time.Minute, false), defaultRun: true, run: runG3ManifestCase},
-	{spec: tunSpec(caseG4PathDeath, 30*time.Second, false), defaultRun: true, run: runG4ManifestCase},
-	{spec: tunSpec(caseG5PathRecovery, time.Minute, false), defaultRun: true, run: runG5ManifestCase},
-	{spec: tunSpec(caseT3XrayStreamSmoke, 8*time.Minute, true), run: runT3XrayStreamManifestCase},
-	{spec: tunSpec(caseT3XrayMatrix, 12*time.Minute, true), defaultRun: true, run: runT3XrayMatrixManifestCase},
-	{
-		spec:    tunSpec(caseT4LongRun, 48*time.Minute, true),
-		members: []string{caseT4G1, caseT4G2, caseT4G3},
-	},
-	{spec: tunSpec(caseT4G1, 7*time.Minute, true), defaultRun: true, run: runT4G1ManifestCase},
-	{spec: tunSpec(caseT4G2, 33*time.Minute, true), defaultRun: true, run: runT4G2ManifestCase},
-	{spec: tunSpec(caseT4G3, 8*time.Minute, true), defaultRun: true, run: runT4G3ManifestCase},
-	{spec: tunSpec(caseT5Fallback, 5*time.Minute, false), defaultRun: true, run: runT5ManifestCase},
-	{spec: tunSpec(caseT6Selector, 2*time.Minute, false), defaultRun: true, run: runT6ManifestCase},
+	{spec: tunSpec(caseKernelTUNPreflight, 30*time.Second, false), run: runKernelTUNPreflightManifestCase},
+	{spec: tunSpec(caseG1Smoke, 2*time.Minute, false), run: runG1ManifestCase},
+	{spec: tunSpec(caseG2Smoke, 2*time.Minute, false), run: runG2ManifestCase},
+	{spec: tunSpec(caseG3Smoke, 2*time.Minute, false), run: runG3ManifestCase},
+	{spec: tunSpec(caseG4PathDeath, 30*time.Second, false), run: runG4ManifestCase},
+	{spec: tunSpec(caseG5PathRecovery, time.Minute, false), run: runG5ManifestCase},
+	{spec: tunSpec(caseT3XrayMatrix, 12*time.Minute, true), run: runT3XrayMatrixManifestCase},
+	{spec: tunSpec(caseT4G1, 7*time.Minute, true), run: runT4G1ManifestCase},
+	{spec: tunSpec(caseT4G2, 33*time.Minute, true), run: runT4G2ManifestCase},
+	{spec: tunSpec(caseT4G3, 8*time.Minute, true), run: runT4G3ManifestCase},
+	{spec: tunSpec(caseT5AdapterMatrix, 5*time.Minute, false), run: runT5ManifestCase},
+	{spec: tunSpec(caseT6Selector, 2*time.Minute, false), run: runT6ManifestCase},
+}
+
+var aliases = []Alias{
+	{ID: caseT3XrayStreamSmoke, Before: caseT3XrayMatrix, ExpandsTo: []string{caseT3XrayMatrix}},
+	{ID: caseT4LongRun, Before: caseT4G1, ExpandsTo: []string{caseT4G1, caseT4G2, caseT4G3}},
+	{ID: caseT4G2Prime, Before: caseT4G2, ExpandsTo: []string{caseT4G2}},
+	{ID: caseT5Fallback, Before: caseT5AdapterMatrix, ExpandsTo: []string{caseT5AdapterMatrix}},
 }
 
 func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
@@ -91,10 +103,20 @@ func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
 	}
 }
 
-// Specs returns a copy of the ordered TUN full manifest, including the
-// compatibility selectors that older invocations could address directly.
+// Specs returns the canonical executable TUN synthetic-suite manifest.
 func Specs() []manifest.Spec {
 	return specsFrom(caseDefs)
+}
+
+// Aliases returns non-executable compatibility metadata. Aliases never enter
+// manifest validation, selected-case counts, or report rows.
+func Aliases() []Alias {
+	result := make([]Alias, len(aliases))
+	for i, alias := range aliases {
+		result[i] = alias
+		result[i].ExpandsTo = append([]string(nil), alias.ExpandsTo...)
+	}
+	return result
 }
 
 func specsFrom(defs []caseDef) []manifest.Spec {
@@ -122,22 +144,17 @@ func selectCaseDefsFrom(defs []caseDef, opts Options) ([]caseDef, error) {
 	for _, def := range defs {
 		byID[def.spec.ID] = def
 	}
-	raw := make([]caseDef, 0, len(selected))
+	result := make([]caseDef, 0, len(selected))
 	for _, spec := range selected {
-		def := byID[spec.ID]
-		if !def.defaultRun && opts.Case == "" && def.spec.ID != opts.FromCase {
-			continue
-		}
-		raw = append(raw, def)
+		result = append(result, byID[spec.ID])
 	}
-	return expandCaseDefs(raw, byID)
+	return result, nil
 }
 
 func validateCaseDefs(defs []caseDef) error {
 	if err := manifest.Validate(specsFrom(defs)); err != nil {
 		return err
 	}
-	byID := make(map[string]caseDef, len(defs))
 	for _, def := range defs {
 		spec := def.spec
 		if !spec.Mandatory {
@@ -149,62 +166,14 @@ func validateCaseDefs(defs []caseDef) error {
 		if spec.Budget <= 0 {
 			return fmt.Errorf("tunfull: case %q has no execution budget", spec.ID)
 		}
-		if (def.run == nil) == (len(def.members) == 0) {
-			return fmt.Errorf("tunfull: case %q must define exactly one runner or member list", spec.ID)
-		}
-		byID[spec.ID] = def
-	}
-	for _, def := range defs {
-		for _, member := range def.members {
-			if _, ok := byID[member]; !ok {
-				return fmt.Errorf("tunfull: selector %q references unknown case %q", def.spec.ID, member)
-			}
+		if def.run == nil {
+			return fmt.Errorf("tunfull: case %q has no runner", spec.ID)
 		}
 	}
-	_, err := expandCaseDefs(defs, byID)
-	return err
+	return nil
 }
 
-func expandCaseDefs(selected []caseDef, byID map[string]caseDef) ([]caseDef, error) {
-	emitted := make(map[string]bool, len(selected))
-	visiting := make(map[string]bool)
-	expanded := make([]caseDef, 0, len(selected))
-	var add func(caseDef) error
-	add = func(def caseDef) error {
-		if emitted[def.spec.ID] {
-			return nil
-		}
-		if visiting[def.spec.ID] {
-			return fmt.Errorf("tunfull: selector cycle at %q", def.spec.ID)
-		}
-		if len(def.members) == 0 {
-			emitted[def.spec.ID] = true
-			expanded = append(expanded, def)
-			return nil
-		}
-		visiting[def.spec.ID] = true
-		for _, id := range def.members {
-			member, ok := byID[id]
-			if !ok {
-				return fmt.Errorf("tunfull: selector %q references unknown case %q", def.spec.ID, id)
-			}
-			if err := add(member); err != nil {
-				return err
-			}
-		}
-		delete(visiting, def.spec.ID)
-		emitted[def.spec.ID] = true
-		return nil
-	}
-	for _, def := range selected {
-		if err := add(def); err != nil {
-			return nil, err
-		}
-	}
-	return expanded, nil
-}
-
-// Run executes the selected TUN full cases in manifest order.
+// Run executes selected synthetic TUN/L3-session cases in manifest order.
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
 	defs, err := selectCaseDefs(opts)
 	if err != nil {
@@ -212,7 +181,7 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 			Name: "TUN-full-case-filter",
 			Tier: "T7",
 			Failure: fmt.Sprintf(
-				"TUN full case selection failed for case=%q from-case=%q: %v",
+				"TUN synthetic L3/session case selection failed for case=%q from-case=%q: %v",
 				opts.Case,
 				opts.FromCase,
 				err,
@@ -243,11 +212,19 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 }
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
-	return report.Case{
+	rc := report.Case{
 		Name:          spec.ID,
 		Tier:          spec.Tier,
 		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
+	markSyntheticEvidence(&rc)
+	return rc
+}
+
+// NotRunCase creates the canonical synthetic-suite placeholder used when the
+// CLI stops after a mandatory failure. It preserves one row per selected spec.
+func NotRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return notRunCase(spec, failedCaseID)
 }
 
 func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.Case {
@@ -268,7 +245,7 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 	select {
 	case rc = <-done:
 		if err := cctx.Err(); err != nil {
-			budgetFailure := fmt.Sprintf("case exceeded TUN full budget %s: %v", def.spec.Budget, err)
+			budgetFailure := fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, err)
 			if rc.Failure == "" {
 				rc.Failure = budgetFailure
 			} else {
@@ -276,7 +253,7 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 			}
 		}
 	case <-cctx.Done():
-		rc.Failure = fmt.Sprintf("case exceeded TUN full budget %s: %v", def.spec.Budget, cctx.Err())
+		rc.Failure = fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, cctx.Err())
 	}
 	if rc.Duration == 0 {
 		rc.Duration = time.Since(start)
@@ -298,6 +275,55 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 	}
 	rc.Name = def.spec.ID
 	rc.Tier = def.spec.Tier
+	markSyntheticEvidence(&rc)
+	return rc
+}
+
+const (
+	syntheticEvidenceClass = "synthetic_l3_session_smoke"
+	realTUNGoldFixture     = "private_T7.kernel_fixture_required"
+)
+
+func markSyntheticEvidence(rc *report.Case) {
+	if rc == nil {
+		return
+	}
+	if rc.Evidence == nil {
+		rc.Evidence = make(map[string]string, 3)
+	}
+	if rc.Evidence["evidence_class"] == "" {
+		rc.Evidence["evidence_class"] = syntheticEvidenceClass
+	}
+	if rc.Evidence["kernel_tun_gold"] == "" {
+		rc.Evidence["kernel_tun_gold"] = "false"
+	}
+	if rc.Evidence["required_gold_fixture"] == "" {
+		rc.Evidence["required_gold_fixture"] = realTUNGoldFixture
+	}
+}
+
+var probeKernelTUN = tun.Probe
+
+func runKernelTUNPreflightManifestCase(_ context.Context, _ string, spec manifest.Spec) report.Case {
+	started := time.Now()
+	capability := probeKernelTUN()
+	rc := report.Case{
+		Name:     spec.ID,
+		Tier:     spec.Tier,
+		Duration: time.Since(started),
+		Evidence: map[string]string{
+			"kernel_tun_available": fmt.Sprintf("%t", capability.Available),
+			"kernel_tun_reason":    string(capability.Reason),
+		},
+	}
+	if !capability.Available {
+		detail := string(capability.Reason)
+		if capability.Err != nil {
+			detail = capability.Err.Error()
+		}
+		rc.InvalidReason = "kernel TUN preflight unavailable: " + detail +
+			"; this synthetic L3/session suite cannot count as TUN release evidence"
+	}
 	return rc
 }
 
@@ -314,7 +340,7 @@ func runG2ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report
 func runG3ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
 	return runG3Smoke(ctx, g3Options{
 		name: spec.ID, duration: 5 * time.Second, pps: 5000, payloadLen: 1024,
-		paths: 4, migrations: 3, lossPct: 0.5, p95Ceiling: 50 * time.Millisecond,
+		paths: 4, migrations: 3, lossPct: 0, p95Ceiling: 50 * time.Millisecond,
 	})
 }
 
@@ -327,10 +353,6 @@ func runG4ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report
 
 func runG5ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
 	return runG5PathRecovery(ctx, g5Options{name: spec.ID, paths: 2, postAddBytes: 256 << 10})
-}
-
-func runT3XrayStreamManifestCase(ctx context.Context, rendrRoot string, spec manifest.Spec) report.Case {
-	return runT3XrayStreamSmoke(ctx, rendrRoot, spec.ID)
 }
 
 func runT3XrayMatrixManifestCase(ctx context.Context, rendrRoot string, spec manifest.Spec) report.Case {
@@ -355,13 +377,18 @@ func runT4G3ManifestCase(ctx context.Context, _ string, spec manifest.Spec) repo
 	return runT4WithBudget(ctx, spec.ID, spec.Budget, chaos.Profile{}, func(c context.Context) report.Case {
 		return runG3Smoke(c, g3Options{
 			name: spec.ID, duration: 5 * time.Minute, pps: 100_000, payloadLen: 1024,
-			paths: 32, migrations: 10, lossPct: -1, p95Ceiling: 20 * time.Millisecond,
+			paths: 32, migrations: 10, lossPct: 0, p95Ceiling: 20 * time.Millisecond,
 		})
 	})
 }
 
 func runT5ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
-	return runT5Fallback(ctx, t5FallbackOptions{name: spec.ID})
+	rc := runT5AdapterMatrix(ctx, t5AdapterMatrixOptions{name: spec.ID})
+	if rc.Evidence == nil {
+		rc.Evidence = make(map[string]string)
+	}
+	rc.Evidence["t5_semantics"] = "independent_adapter_matrix_not_live_fallback"
+	return rc
 }
 
 func runT6ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
@@ -386,7 +413,12 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 	start := time.Now()
 	cleanup, err := chaos.Apply(prof)
 	if err != nil {
-		return failedCase(name, start, fmt.Errorf("chaos.Apply: %w", err))
+		return report.Case{
+			Name:          name,
+			Tier:          "T7",
+			Duration:      time.Since(start),
+			InvalidReason: "chaos fixture setup failed: " + err.Error(),
+		}
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -419,12 +451,30 @@ func applyT4CleanupResult(rc *report.Case, cleanup func() error) {
 		return
 	}
 	if err := cleanup(); err != nil {
-		message := "chaos cleanup failed: " + err.Error()
-		if rc.Failure != "" {
-			rc.Failure += "; " + message
+		markTUNChaosInvalid(rc, "chaos cleanup failed: "+err.Error())
+	}
+}
+
+func markTUNChaosInvalid(rc *report.Case, reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	if rc.Failure != "" {
+		if rc.Evidence == nil {
+			rc.Evidence = make(map[string]string)
+		}
+		rc.Evidence["untrusted_case_failure"] = rc.Failure
+		rc.Failure = ""
+	}
+	for _, existing := range strings.Split(rc.InvalidReason, "; ") {
+		if existing == reason {
 			return
 		}
-		rc.InvalidReason = message
+	}
+	if rc.InvalidReason == "" {
+		rc.InvalidReason = reason
+	} else {
+		rc.InvalidReason += "; " + reason
 	}
 }
 
@@ -475,54 +525,10 @@ type t6SelectorOptions struct {
 	bulkBondWrites int
 }
 
-type t5FallbackOptions struct {
+type t5AdapterMatrixOptions struct {
 	name       string
 	size       int64
 	migrations int
-}
-
-func runT3XrayStreamSmoke(ctx context.Context, rendrRoot, name string) report.Case {
-	return runT3XrayGoTest(ctx, rendrRoot, name, "^TestTUNT3(SS2022StreamOverTUN|VMessStreamOverTUN|VLESSVisionTLSStreamOverTUN|MixedSS2022VMessStreamOverTUN)$", 8*time.Minute, "6m")
-}
-
-func runT3XrayMatrix(ctx context.Context, rendrRoot, name string) report.Case {
-	return runT3XrayGoTest(ctx, rendrRoot, name, "^TestTUNT3", 12*time.Minute, "10m")
-}
-
-func runT3XrayGoTest(ctx context.Context, rendrRoot, name, pattern string, budget time.Duration, testTimeout string) report.Case {
-	start := time.Now()
-	if name == "" {
-		name = "TUN-full.T3-xray-go-test"
-	}
-	if _, err := os.Stat(rendrRoot); err != nil {
-		return failedCase(name, start, fmt.Errorf("bad rendr root: %w", err))
-	}
-	regressDir := filepath.Join(rendrRoot, "regress")
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	cmd := exec.CommandContext(
-		cctx,
-		"go",
-		"test",
-		"./internal/matrix",
-		"-run",
-		pattern,
-		"-count=1",
-		"-timeout",
-		testTimeout,
-	)
-	cmd.Dir = regressDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		} else {
-			msg = fmt.Sprintf("%v (%s)", err, msg)
-		}
-		return report.Case{Name: name, Tier: "T7", Duration: time.Since(start), Failure: msg}
-	}
-	return report.Case{Name: name, Tier: "T7", Duration: time.Since(start)}
 }
 
 func runG1Smoke(ctx context.Context, opts g1SmokeOptions) report.Case {
@@ -1152,10 +1158,10 @@ func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
 	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
 }
 
-func runT5Fallback(ctx context.Context, opts t5FallbackOptions) report.Case {
+func runT5AdapterMatrix(ctx context.Context, opts t5AdapterMatrixOptions) report.Case {
 	start := time.Now()
 	if opts.name == "" {
-		opts.name = "TUN-full.T5-fallback"
+		opts.name = caseT5AdapterMatrix
 	}
 	if opts.size <= 0 {
 		opts.size = 8 << 20
@@ -1763,7 +1769,7 @@ func waitRelayErr(ch <-chan error, timeout time.Duration) error {
 func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	start := time.Now()
 	if opts.name == "" {
-		opts.name = "TUN-full.G3-smoke"
+		opts.name = caseG3Smoke
 	}
 	if opts.duration <= 0 {
 		opts.duration = 5 * time.Second
@@ -1771,25 +1777,39 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if opts.pps <= 0 {
 		opts.pps = 5000
 	}
-	if opts.payloadLen <= 16 {
+	if opts.payloadLen == 0 {
 		opts.payloadLen = 1024
 	}
 	if opts.paths < 1 {
 		opts.paths = 4
 	}
-	if opts.migrations < 0 {
-		opts.migrations = 0
-	}
 	if opts.migrations == 0 {
 		opts.migrations = 3
 	}
 	if opts.lossPct < 0 {
-		opts.lossPct = 0
-	} else if opts.lossPct == 0 {
-		opts.lossPct = 0.5
+		return invalidTUNG3Case(opts.name, start, fmt.Sprintf("loss budget %.3f%% must be >=0", opts.lossPct), nil)
 	}
 	if opts.p95Ceiling <= 0 {
 		opts.p95Ceiling = 50 * time.Millisecond
+	}
+	if opts.migrations < 1 {
+		return invalidTUNG3Case(opts.name, start, "migration stimulus must request at least one transition", nil)
+	}
+	if opts.paths < 2 {
+		return invalidTUNG3Case(opts.name, start, fmt.Sprintf("paths=%d, want >=2 for migration evidence", opts.paths), nil)
+	}
+	if opts.payloadLen < 24 {
+		return invalidTUNG3Case(opts.name, start,
+			fmt.Sprintf("payload length=%d, want >=24 for sequence, timestamp, and integrity marker", opts.payloadLen), nil)
+	}
+	targetPacketsFloat := float64(opts.pps) * opts.duration.Seconds()
+	if targetPacketsFloat < 1 || targetPacketsFloat > tunG3MaximumPackets {
+		return invalidTUNG3Case(opts.name, start,
+			fmt.Sprintf("target packet count %.0f outside [1,%d]", targetPacketsFloat, tunG3MaximumPackets), nil)
+	}
+	packetInterval := time.Second / time.Duration(opts.pps)
+	if packetInterval <= 0 {
+		return invalidTUNG3Case(opts.name, start, fmt.Sprintf("target pps=%d produces a zero pacing interval", opts.pps), nil)
 	}
 
 	ln, err := rendr.ListenQUICDatagram("127.0.0.1:0", nil)
@@ -1833,7 +1853,7 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 
 	payload := make([]byte, opts.payloadLen)
 	binary.BigEndian.PutUint64(payload[:8], ^uint64(0))
-	binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(payload[len(payload)-8:], ^uint64(0)^tunG3PacketIntegrityMask)
 	packet, meta, err := udpPacketEventParts(id, payload)
 	if err != nil {
 		return failedCase(opts.name, start, err)
@@ -1885,119 +1905,232 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	if serverAdmin, ok := server.(rendr.AdminPacketConn); ok {
 		waitPacketPaths(ctx, serverAdmin, opts.paths)
 	}
-	time.Sleep(1 * time.Second)
 
-	expected := int(float64(opts.pps)*opts.duration.Seconds()) + opts.pps
-	recvBmp := make([]uint8, expected+opts.pps)
-	latencies := make([]time.Duration, 0, expected/100+1)
-	recvDone := make(chan struct{})
+	// The first packet creates the L3 session. Consume it before taking
+	// counters so bootstrap traffic cannot masquerade as measured load.
+	bootstrap := make([]byte, opts.payloadLen+64)
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := server.ReadFrom(bootstrap)
+	if err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("drain bootstrap packet: %w", err))
+	}
+	_ = server.SetReadDeadline(time.Time{})
+	if n != opts.payloadLen || binary.BigEndian.Uint64(bootstrap[:8]) != ^uint64(0) {
+		return invalidTUNG3Case(opts.name, start,
+			fmt.Sprintf("bootstrap packet mismatch: bytes=%d sequence=%d", n, binary.BigEndian.Uint64(bootstrap[:8])), nil)
+	}
+
+	pathsBefore := admin.Stats().Paths
+	if len(pathsBefore) != opts.paths {
+		return invalidTUNG3Case(opts.name, start,
+			fmt.Sprintf("path attach evidence=%d, want exactly %d", len(pathsBefore), opts.paths), nil)
+	}
+	pathWritesBefore := make(map[uint32]uint64, len(pathsBefore))
+	for _, path := range pathsBefore {
+		pathWritesBefore[path.ID] = path.Writes
+	}
+
+	expected := int(math.Ceil(targetPacketsFloat*1.25)) + 1
+	recvBmp := make([]uint8, expected)
+	sendEpoch := time.Now()
+	recvOutcome := make(chan tunG3ReceiveOutcome, 1)
 	sendDone := make(chan struct{})
-	payloadOffset := meta.PayloadOffset + 8
 	go func() {
-		defer close(recvDone)
+		outcome := tunG3ReceiveOutcome{latencies: make([]time.Duration, 0, expected/tunG3LatencySampleEvery+8)}
+		defer func() { recvOutcome <- outcome }()
 		buf := make([]byte, opts.payloadLen+64)
-		_ = server.SetReadDeadline(time.Now().Add(opts.duration + 2*time.Minute))
-		var rx int
-		sendDoneC := sendDone
+		_ = server.SetReadDeadline(time.Now().Add(opts.duration + 10*time.Second))
+		draining := false
 		for {
 			n, _, err := server.ReadFrom(buf)
 			if err != nil {
+				select {
+				case <-sendDone:
+					if !isNetTimeout(err) {
+						outcome.err = err
+					}
+				default:
+					outcome.err = err
+				}
 				return
 			}
-			select {
-			case <-sendDoneC:
-				sendDoneC = nil
-				_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-			default:
+			if !draining {
+				select {
+				case <-sendDone:
+					draining = true
+					_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+				default:
+				}
 			}
-			if n < 16 {
+			if n != opts.payloadLen {
+				outcome.malformedPackets++
 				continue
 			}
 			seq := binary.BigEndian.Uint64(buf[:8])
-			if seq < uint64(len(recvBmp)) {
-				recvBmp[seq] = 1
+			if seq >= uint64(len(recvBmp)) {
+				outcome.outOfRangePackets++
+				continue
 			}
-			if rx%100 == 0 {
-				sentNS := int64(binary.BigEndian.Uint64(buf[8:16]))
-				latencies = append(latencies, time.Since(time.Unix(0, sentNS)))
+			if marker := binary.BigEndian.Uint64(buf[n-8 : n]); marker != seq^tunG3PacketIntegrityMask {
+				outcome.corruptPackets++
+				continue
 			}
-			rx++
+			if recvBmp[seq] != 0 {
+				outcome.duplicatePackets++
+				continue
+			}
+			recvBmp[seq] = 1
+			if seq%tunG3LatencySampleEvery == 0 {
+				sentElapsed := time.Duration(binary.BigEndian.Uint64(buf[8:16]))
+				latency := time.Since(sendEpoch) - sentElapsed
+				if latency < 0 {
+					outcome.corruptPackets++
+				} else {
+					outcome.latencies = append(outcome.latencies, latency)
+				}
+			}
+			outcome.uniquePackets++
 		}
 	}()
 
 	startMig := admin.MigrationCount()
-	packetInterval := time.Second / time.Duration(opts.pps)
-	nextTick := time.Now()
-	endAt := time.Now().Add(opts.duration)
-	migInterval := opts.duration / time.Duration(opts.migrations+1)
-	migTicker := time.NewTicker(migInterval)
-	defer migTicker.Stop()
+	targetPackets := int64(math.Ceil(targetPacketsFloat))
+	migrationAttempts := 0
+	migrationErrors := 0
+	nextMigration := 1
+	sendStarted := time.Now()
+	nextTick := sendStarted
+	endAt := sendStarted.Add(opts.duration)
+	payloadOffset := meta.PayloadOffset + 8
 	var sent int64
+	writeFailure := ""
 	for time.Now().Before(endAt) {
-		select {
-		case <-ctx.Done():
-			return failedCase(opts.name, start, ctx.Err())
-		case <-migTicker.C:
+		if err := ctx.Err(); err != nil {
+			writeFailure = "sender context: " + err.Error()
+			break
+		}
+		for nextMigration <= opts.migrations && sent >= targetPackets*int64(nextMigration)/int64(opts.migrations+1) {
+			migrationAttempts++
 			next := nextPacketPath(admin)
-			if next != 0 {
-				_ = admin.Migrate(next)
+			if next == 0 {
+				migrationErrors++
+			} else if err := admin.Migrate(next); err != nil {
+				migrationErrors++
 			}
-		default:
+			nextMigration++
 		}
 		paceUntil(nextTick)
+		if !time.Now().Before(endAt) {
+			break
+		}
 		nextTick = nextTick.Add(packetInterval)
 		binary.BigEndian.PutUint64(payload[:8], uint64(sent))
-		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(payload[8:16], uint64(time.Since(sendEpoch)))
+		binary.BigEndian.PutUint64(payload[len(payload)-8:], uint64(sent)^tunG3PacketIntegrityMask)
 		copy(packet[payloadOffset:payloadOffset+len(payload)], payload)
 		if err := relay.HandlePacket(ctx, event); err != nil {
-			return failedCase(opts.name, start, fmt.Errorf("send seq %d: %w", sent, err))
+			writeFailure = fmt.Sprintf("send seq %d: %v", sent, err)
+			break
 		}
 		sent++
 	}
+	sendElapsed := time.Since(sendStarted)
 	close(sendDone)
 	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-	<-recvDone
+	receivedOutcome := <-recvOutcome
 	relay.CloseFlow(id)
 
-	lost := int64(0)
-	limit := sent
-	if limit > int64(len(recvBmp)) {
-		limit = int64(len(recvBmp))
+	sort.Slice(receivedOutcome.latencies, func(i, j int) bool {
+		return receivedOutcome.latencies[i] < receivedOutcome.latencies[j]
+	})
+	p95 := percentile(receivedOutcome.latencies, 0.95)
+	migrations := admin.MigrationCount() - startMig
+	perPathWrites := make(map[uint32]uint64, len(pathWritesBefore))
+	var wireWrites uint64
+	for _, path := range admin.Stats().Paths {
+		before, expectedPath := pathWritesBefore[path.ID]
+		if !expectedPath || path.Writes < before {
+			continue
+		}
+		delta := path.Writes - before
+		perPathWrites[path.ID] = delta
+		wireWrites += delta
 	}
-	missingBuckets := make([]int64, opts.migrations+1)
-	firstMissing := make([]int64, 0, 8)
-	for seq := int64(0); seq < limit; seq++ {
-		if recvBmp[seq] == 0 {
-			lost++
-			if len(firstMissing) < cap(firstMissing) {
-				firstMissing = append(firstMissing, seq)
-			}
-			if len(missingBuckets) > 0 && limit > 0 {
-				bucket := int(seq * int64(len(missingBuckets)) / limit)
-				if bucket >= len(missingBuckets) {
-					bucket = len(missingBuckets) - 1
-				}
-				missingBuckets[bucket]++
-			}
+	for pathID := range pathWritesBefore {
+		if _, ok := perPathWrites[pathID]; !ok {
+			perPathWrites[pathID] = 0
 		}
 	}
-	if sent > int64(len(recvBmp)) {
-		lost += sent - int64(len(recvBmp))
+	received := receivedOutcome.uniquePackets
+	lossPct := math.NaN()
+	if sent > 0 {
+		lossPct = float64(sent-received) / float64(sent) * 100
 	}
-	lossPct := float64(lost) / float64(sent) * 100
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	p95 := percentile(latencies, 0.95)
-	migrations := admin.MigrationCount() - startMig
-	if lossPct > opts.lossPct {
-		return failedCase(opts.name, start, fmt.Errorf("loss %.3f%% exceeds budget %.3f%% (sent=%d lost=%d migrations=%d bond_stuck_skips=%d p95=%s first_missing=%v missing_buckets=%v)", lossPct, opts.lossPct, sent, lost, migrations, admin.BondStuckSkips(), p95, firstMissing, missingBuckets))
+	offeredPPS := float64(0)
+	if sendElapsed > 0 {
+		offeredPPS = float64(sent) / sendElapsed.Seconds()
 	}
-	if p95 > opts.p95Ceiling {
-		return failedCase(opts.name, start, fmt.Errorf("P95 %s exceeds ceiling %s", p95, opts.p95Ceiling))
+	rc := report.Case{
+		Name:     opts.name,
+		Tier:     "T7",
+		Duration: time.Since(start),
+		Evidence: map[string]string{
+			"target_pps":           fmt.Sprintf("%d", opts.pps),
+			"offered_pps":          fmt.Sprintf("%.3f", offeredPPS),
+			"offered_ratio":        fmt.Sprintf("%.6f", offeredPPS/float64(opts.pps)),
+			"send_elapsed":         sendElapsed.String(),
+			"sent":                 fmt.Sprintf("%d", sent),
+			"received":             fmt.Sprintf("%d", received),
+			"loss_pct":             fmt.Sprintf("%.6f", lossPct),
+			"loss_budget_pct":      fmt.Sprintf("%.6f", opts.lossPct),
+			"latency_samples":      fmt.Sprintf("%d", len(receivedOutcome.latencies)),
+			"p95":                  p95.String(),
+			"migration_attempts":   fmt.Sprintf("%d", migrationAttempts),
+			"migration_errors":     fmt.Sprintf("%d", migrationErrors),
+			"migrations_observed":  fmt.Sprintf("%d", migrations),
+			"malformed_packets":    fmt.Sprintf("%d", receivedOutcome.malformedPackets),
+			"corrupt_packets":      fmt.Sprintf("%d", receivedOutcome.corruptPackets),
+			"duplicate_packets":    fmt.Sprintf("%d", receivedOutcome.duplicatePackets),
+			"out_of_range_packets": fmt.Sprintf("%d", receivedOutcome.outOfRangePackets),
+			"per_path_wire_writes": formatTUNG3PathWrites(perPathWrites),
+			"wire_writes":          fmt.Sprintf("%d", wireWrites),
+			"g3_semantics":         "synthetic_l3session_quic_datagram_not_rfc9000_cid_gold",
+		},
 	}
-	if migrations < uint64(opts.migrations) {
-		return failedCase(opts.name, start, fmt.Errorf("MigrationCount=%d, want >= %d", migrations, opts.migrations))
+	if writeFailure != "" {
+		rc.Failure = writeFailure
+		return rc
 	}
-	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+	if receivedOutcome.err != nil {
+		rc.Failure = "receiver: " + receivedOutcome.err.Error()
+		return rc
+	}
+	rc.InvalidReason, rc.Failure = validateTUNG3Measurements(opts, tunG3Measurements{
+		sent:               sent,
+		received:           received,
+		sendElapsed:        sendElapsed,
+		latencySamples:     len(receivedOutcome.latencies),
+		p95:                p95,
+		migrationAttempts:  migrationAttempts,
+		migrationErrors:    migrationErrors,
+		migrationsObserved: migrations,
+		malformedPackets:   receivedOutcome.malformedPackets,
+		corruptPackets:     receivedOutcome.corruptPackets,
+		duplicatePackets:   receivedOutcome.duplicatePackets,
+		outOfRangePackets:  receivedOutcome.outOfRangePackets,
+		perPathWrites:      perPathWrites,
+		wireWrites:         wireWrites,
+	})
+	return rc
+}
+
+func invalidTUNG3Case(name string, started time.Time, reason string, evidence map[string]string) report.Case {
+	return report.Case{Name: name, Tier: "T7", Duration: time.Since(started), InvalidReason: reason, Evidence: evidence}
+}
+
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func g3Root(addr string, paths int) rendr.Target {

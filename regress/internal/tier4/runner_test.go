@@ -3,7 +3,10 @@ package tier4
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,13 +125,15 @@ func TestSelectCaseDefs(t *testing.T) {
 
 func TestApplyCleanupResultFailsClosed(t *testing.T) {
 	tests := []struct {
-		name        string
-		initial     report.Case
-		wantFailure string
-		wantInvalid string
+		name         string
+		initial      report.Case
+		wantFailure  string
+		wantInvalid  string
+		wantEvidence string
 	}{
 		{name: "passing case becomes invalid", wantInvalid: "chaos cleanup failed: cleanup boom"},
-		{name: "failure retains both causes", initial: report.Case{Failure: "case boom"}, wantFailure: "case boom; chaos cleanup failed: cleanup boom"},
+		{name: "product failure becomes untrusted", initial: report.Case{Failure: "case boom"}, wantInvalid: "chaos cleanup failed: cleanup boom", wantEvidence: "case boom"},
+		{name: "existing invalidity is preserved", initial: report.Case{InvalidReason: "stimulus missing"}, wantInvalid: "stimulus missing; chaos cleanup failed: cleanup boom"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -137,8 +142,93 @@ func TestApplyCleanupResultFailsClosed(t *testing.T) {
 			if rc.Failure != tt.wantFailure || rc.InvalidReason != tt.wantInvalid {
 				t.Fatalf("case=%+v want failure=%q invalid=%q", rc, tt.wantFailure, tt.wantInvalid)
 			}
+			if got := rc.Evidence["untrusted_case_failure"]; got != tt.wantEvidence {
+				t.Fatalf("untrusted failure evidence=%q want %q", got, tt.wantEvidence)
+			}
 		})
 	}
+
+	t.Run("mid-run qdisc event invalidates a passing case", func(t *testing.T) {
+		changes := make(chan error, 1)
+		changes <- fmt.Errorf("%w: qdisc replaced", chaos.ErrStimulusInvalid)
+		cleanupCalled := false
+		fixture := &fakeChaosFixture{
+			changes: changes,
+			cleanup: func() error { cleanupCalled = true; return nil },
+		}
+		rc := runCaseWithChaosInterval(context.Background(), "event", time.Second, chaos.Realistic50M,
+			func(ctx context.Context) smoke.Result {
+				<-ctx.Done()
+				return smoke.Result{}
+			},
+			func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Hour)
+		if !cleanupCalled {
+			t.Fatal("cleanup was not called after monitor invalidity")
+		}
+		if rc.Failure != "" || !strings.Contains(rc.InvalidReason, "qdisc replaced") {
+			t.Fatalf("case=%+v, want qdisc event INVALID", rc)
+		}
+	})
+
+	t.Run("periodic verification catches persistent replacement", func(t *testing.T) {
+		var calls atomic.Int32
+		fixture := &fakeChaosFixture{verify: func() error {
+			if calls.Add(1) >= 1 {
+				return fmt.Errorf("%w: fingerprint changed", chaos.ErrStimulusInvalid)
+			}
+			return nil
+		}}
+		rc := runCaseWithChaosInterval(context.Background(), "poll", time.Second, chaos.Realistic50M,
+			func(ctx context.Context) smoke.Result {
+				<-ctx.Done()
+				return smoke.Result{}
+			},
+			func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Millisecond)
+		if rc.Failure != "" || !strings.Contains(rc.InvalidReason, "fingerprint changed") {
+			t.Fatalf("case=%+v, want periodic verification INVALID", rc)
+		}
+	})
+
+	t.Run("final verification catches a last-moment replacement", func(t *testing.T) {
+		fixture := &fakeChaosFixture{verify: func() error {
+			return fmt.Errorf("%w: owned root absent", chaos.ErrStimulusInvalid)
+		}}
+		rc := runCaseWithChaosInterval(context.Background(), "final", time.Second, chaos.Realistic50M,
+			func(context.Context) smoke.Result { return smoke.Result{Failure: "untrusted product failure"} },
+			func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Hour)
+		if rc.Failure != "" || !strings.Contains(rc.InvalidReason, "final verification failed") {
+			t.Fatalf("case=%+v, want final verification INVALID", rc)
+		}
+		if got := rc.Evidence["untrusted_case_failure"]; got != "untrusted product failure" {
+			t.Fatalf("untrusted failure evidence=%q", got)
+		}
+	})
+
+	t.Run("fixture setup failure is invalid not product failure", func(t *testing.T) {
+		rc := runCaseWithChaosInterval(context.Background(), "setup", time.Second, chaos.Realistic50M,
+			func(context.Context) smoke.Result {
+				t.Fatal("case ran after fixture setup failure")
+				return smoke.Result{}
+			},
+			func(chaos.Profile) (chaos.Fixture, error) { return nil, errors.New("lock busy") }, time.Hour)
+		if rc.Failure != "" || !strings.Contains(rc.InvalidReason, "lock busy") {
+			t.Fatalf("case=%+v, want setup INVALID", rc)
+		}
+	})
+
+	t.Run("budget expiry remains a case failure without monitor panic", func(t *testing.T) {
+		fixture := &fakeChaosFixture{}
+		rc := runCaseWithChaosInterval(context.Background(), "timeout", 2*time.Millisecond, chaos.Realistic50M,
+			func(ctx context.Context) smoke.Result {
+				<-ctx.Done()
+				time.Sleep(10 * time.Millisecond)
+				return smoke.Result{}
+			},
+			func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Hour)
+		if !strings.Contains(rc.Failure, "case exceeded T4 budget") || rc.InvalidReason != "" {
+			t.Fatalf("case=%+v, want timeout failure", rc)
+		}
+	})
 }
 
 func TestEvidenceFromDetailPreservesFacts(t *testing.T) {
@@ -194,11 +284,11 @@ func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
 		runCalls++
 		return runCaseWithChaos(ctx, def.spec.ID, def.spec.Budget, chaos.Profile{}, func(context.Context) smoke.Result {
 			return smoke.Result{}
-		}, func(chaos.Profile) (func() error, error) {
-			return func() error {
+		}, func(chaos.Profile) (chaos.Fixture, error) {
+			return &fakeChaosFixture{cleanup: func() error {
 				cleanupCalled = true
 				return errors.New("cleanup boom")
-			}, nil
+			}}, nil
 		})
 	})
 
@@ -214,6 +304,28 @@ func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
 	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
 		t.Fatalf("second row invalid reason = %q", got)
 	}
+}
+
+type fakeChaosFixture struct {
+	changes <-chan error
+	verify  func() error
+	cleanup func() error
+}
+
+func (f *fakeChaosFixture) Changes() <-chan error { return f.changes }
+
+func (f *fakeChaosFixture) Verify() error {
+	if f.verify == nil {
+		return nil
+	}
+	return f.verify()
+}
+
+func (f *fakeChaosFixture) Cleanup() error {
+	if f.cleanup == nil {
+		return nil
+	}
+	return f.cleanup()
 }
 
 func syntheticCaseDefs(tier string) []caseDef {
