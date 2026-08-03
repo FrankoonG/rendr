@@ -187,6 +187,7 @@ func (o *G2Opts) withDefaults() {
 //	migrations              uint64
 //	application_duplicates  int
 //	recv_dups               uint64
+//	recv_dups_observer      string
 //	p50_ms                  float64
 //	p99_ms                  float64
 //	p999_ms                 float64
@@ -240,6 +241,10 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	if !ok {
 		return FromError(name, time.Since(t0), fmt.Errorf("client conn is not rendr.AdminConn"))
 	}
+	serverAdmin, ok := server.(rendr.AdminConn)
+	if !ok {
+		return FromError(name, time.Since(t0), fmt.Errorf("server conn is not rendr.AdminConn"))
+	}
 
 	type goroutineResult struct {
 		err     error
@@ -283,7 +288,9 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	}
 
 	startMigCount := admin.MigrationCount()
-	startRecvDups := admin.RecvDups()
+	// Mode is sender-local. A client race duplicates client TX frames, so the
+	// independent proof lives on the peer/server RX engine, not client RX.
+	startRecvDups := serverAdmin.RecvDups()
 	var migrationCallsFired int
 	rtts := make([]time.Duration, 0, int(opts.Duration/opts.Interval)+2)
 	runStarted := time.Now()
@@ -453,7 +460,7 @@ runLoop:
 	}
 
 	endMigCount := admin.MigrationCount()
-	endRecvDups := admin.RecvDups()
+	endRecvDups := serverAdmin.RecvDups()
 	_ = client.Close()
 	_ = server.Close()
 	if !echoDone {
@@ -545,6 +552,7 @@ runLoop:
 			"migrations":               migrated,
 			"application_duplicates":   applicationDuplicates,
 			"recv_dups":                recvDups,
+			"recv_dups_observer":       "peer_server_rx",
 			"p50_ms":                   float64(p50) / float64(time.Millisecond),
 			"p99_ms":                   float64(p99) / float64(time.Millisecond),
 			"p999_ms":                  float64(p999) / float64(time.Millisecond),
