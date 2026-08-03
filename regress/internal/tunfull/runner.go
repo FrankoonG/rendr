@@ -23,161 +23,328 @@ import (
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/l3session"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/transport/tcprepair"
 )
 
 // Options filters the TUN full baseline matrix.
 type Options struct {
-	Case string
+	Case     string
+	FromCase string
 }
 
-// Planned cases mirror the non-TUN full surface that must eventually
-// run through TUN ingress. They intentionally fail until their real
-// TUN-backed implementations land; this preserves the hard guard that
-// --tun-full must not report a false green.
-var plannedCases = []string{
-	"TUN-full.G1-smoke",
-	"TUN-full.G2-smoke",
-	"TUN-full.G3-smoke",
-	"TUN-full.G4-path-death",
-	"TUN-full.G5-path-recovery",
-	"TUN-full.T3-xray-matrix",
-	"TUN-full.T4-G1-1GiB-tcp",
-	"TUN-full.T4-G2-30m-prime",
-	"TUN-full.T4-G3-100k-pps",
-	"TUN-full.T5-fallback",
-	"TUN-full.T6-selector",
+const (
+	caseG1Smoke           = "TUN-full.G1-smoke"
+	caseG2Smoke           = "TUN-full.G2-smoke"
+	caseG3Smoke           = "TUN-full.G3-smoke"
+	caseG4PathDeath       = "TUN-full.G4-path-death"
+	caseG5PathRecovery    = "TUN-full.G5-path-recovery"
+	caseT3XrayStreamSmoke = "TUN-full.T3-xray-stream-smoke"
+	caseT3XrayMatrix      = "TUN-full.T3-xray-matrix"
+	caseT4LongRun         = "TUN-full.T4-long-run"
+	caseT4G1              = "TUN-full.T4-G1-1GiB-tcp"
+	caseT4G2              = "TUN-full.T4-G2-30m-prime"
+	caseT4G3              = "TUN-full.T4-G3-100k-pps"
+	caseT5Fallback        = "TUN-full.T5-fallback"
+	caseT6Selector        = "TUN-full.T6-selector"
+)
+
+type caseRun func(context.Context, string, manifest.Spec) report.Case
+
+type caseDef struct {
+	spec       manifest.Spec
+	defaultRun bool
+	run        caseRun
+	members    []string
 }
 
-// Run records the TUN full baseline status. Implemented cases run as real
-// TUN/per-flow baselines; remaining planned cases stay as explicit guard
-// failures so --tun-full cannot report a false green.
-func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
-	if opts.Case == "TUN-full.T3-xray-stream-smoke" {
-		suite.Add(runT3XrayStreamSmoke(ctx, rendrRoot, opts.Case))
-		return
+// Compatibility selectors remain addressable, but are not repeated by the
+// unfiltered suite because their work is covered by the canonical cases.
+var caseDefs = []caseDef{
+	{spec: tunSpec(caseG1Smoke, 2*time.Minute, false), defaultRun: true, run: runG1ManifestCase},
+	{spec: tunSpec(caseG2Smoke, 2*time.Minute, false), defaultRun: true, run: runG2ManifestCase},
+	{spec: tunSpec(caseG3Smoke, 2*time.Minute, false), defaultRun: true, run: runG3ManifestCase},
+	{spec: tunSpec(caseG4PathDeath, 30*time.Second, false), defaultRun: true, run: runG4ManifestCase},
+	{spec: tunSpec(caseG5PathRecovery, time.Minute, false), defaultRun: true, run: runG5ManifestCase},
+	{spec: tunSpec(caseT3XrayStreamSmoke, 8*time.Minute, true), run: runT3XrayStreamManifestCase},
+	{spec: tunSpec(caseT3XrayMatrix, 12*time.Minute, true), defaultRun: true, run: runT3XrayMatrixManifestCase},
+	{
+		spec:    tunSpec(caseT4LongRun, 48*time.Minute, true),
+		members: []string{caseT4G1, caseT4G2, caseT4G3},
+	},
+	{spec: tunSpec(caseT4G1, 7*time.Minute, true), defaultRun: true, run: runT4G1ManifestCase},
+	{spec: tunSpec(caseT4G2, 33*time.Minute, true), defaultRun: true, run: runT4G2ManifestCase},
+	{spec: tunSpec(caseT4G3, 8*time.Minute, true), defaultRun: true, run: runT4G3ManifestCase},
+	{spec: tunSpec(caseT5Fallback, 5*time.Minute, false), defaultRun: true, run: runT5ManifestCase},
+	{spec: tunSpec(caseT6Selector, 2*time.Minute, false), defaultRun: true, run: runT6ManifestCase},
+}
+
+func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
+	return manifest.Spec{
+		ID:        id,
+		Tier:      "T7",
+		Suite:     manifest.SuiteTUN,
+		Mandatory: true,
+		Long:      long,
+		Budget:    budget,
 	}
-	if opts.Case == "TUN-full.T4-long-run" {
-		for _, name := range t4LongRunCases {
-			suite.Add(runPlannedCase(ctx, rendrRoot, name))
-		}
-		return
+}
+
+// Specs returns a copy of the ordered TUN full manifest, including the
+// compatibility selectors that older invocations could address directly.
+func Specs() []manifest.Spec {
+	return specsFrom(caseDefs)
+}
+
+func specsFrom(defs []caseDef) []manifest.Spec {
+	specs := make([]manifest.Spec, len(defs))
+	for i, def := range defs {
+		specs[i] = def.spec
 	}
-	matched := false
-	for _, name := range plannedCases {
-		if !caseMatches(opts.Case, name) {
+	return specs
+}
+
+func selectCaseDefs(opts Options) ([]caseDef, error) {
+	return selectCaseDefsFrom(caseDefs, opts)
+}
+
+func selectCaseDefsFrom(defs []caseDef, opts Options) ([]caseDef, error) {
+	if err := validateCaseDefs(defs); err != nil {
+		return nil, err
+	}
+	selected, err := manifest.Select(specsFrom(defs), opts.Case, opts.FromCase)
+	if err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]caseDef, len(defs))
+	for _, def := range defs {
+		byID[def.spec.ID] = def
+	}
+	raw := make([]caseDef, 0, len(selected))
+	for _, spec := range selected {
+		def := byID[spec.ID]
+		if !def.defaultRun && opts.Case == "" && def.spec.ID != opts.FromCase {
 			continue
 		}
-		matched = true
-		suite.Add(runPlannedCase(ctx, rendrRoot, name))
+		raw = append(raw, def)
 	}
-	if opts.Case != "" && !matched {
+	return expandCaseDefs(raw, byID)
+}
+
+func validateCaseDefs(defs []caseDef) error {
+	if err := manifest.Validate(specsFrom(defs)); err != nil {
+		return err
+	}
+	byID := make(map[string]caseDef, len(defs))
+	for _, def := range defs {
+		spec := def.spec
+		if !spec.Mandatory {
+			return fmt.Errorf("tunfull: case %q is not mandatory", spec.ID)
+		}
+		if spec.Suite != manifest.SuiteTUN {
+			return fmt.Errorf("tunfull: case %q has suite %q", spec.ID, spec.Suite)
+		}
+		if spec.Budget <= 0 {
+			return fmt.Errorf("tunfull: case %q has no execution budget", spec.ID)
+		}
+		if (def.run == nil) == (len(def.members) == 0) {
+			return fmt.Errorf("tunfull: case %q must define exactly one runner or member list", spec.ID)
+		}
+		byID[spec.ID] = def
+	}
+	for _, def := range defs {
+		for _, member := range def.members {
+			if _, ok := byID[member]; !ok {
+				return fmt.Errorf("tunfull: selector %q references unknown case %q", def.spec.ID, member)
+			}
+		}
+	}
+	_, err := expandCaseDefs(defs, byID)
+	return err
+}
+
+func expandCaseDefs(selected []caseDef, byID map[string]caseDef) ([]caseDef, error) {
+	emitted := make(map[string]bool, len(selected))
+	visiting := make(map[string]bool)
+	expanded := make([]caseDef, 0, len(selected))
+	var add func(caseDef) error
+	add = func(def caseDef) error {
+		if emitted[def.spec.ID] {
+			return nil
+		}
+		if visiting[def.spec.ID] {
+			return fmt.Errorf("tunfull: selector cycle at %q", def.spec.ID)
+		}
+		if len(def.members) == 0 {
+			emitted[def.spec.ID] = true
+			expanded = append(expanded, def)
+			return nil
+		}
+		visiting[def.spec.ID] = true
+		for _, id := range def.members {
+			member, ok := byID[id]
+			if !ok {
+				return fmt.Errorf("tunfull: selector %q references unknown case %q", def.spec.ID, id)
+			}
+			if err := add(member); err != nil {
+				return err
+			}
+		}
+		delete(visiting, def.spec.ID)
+		emitted[def.spec.ID] = true
+		return nil
+	}
+	for _, def := range selected {
+		if err := add(def); err != nil {
+			return nil, err
+		}
+	}
+	return expanded, nil
+}
+
+// Run executes the selected TUN full cases in manifest order.
+func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
+	defs, err := selectCaseDefs(opts)
+	if err != nil {
 		suite.Add(report.Case{
-			Name:    "TUN-full-case-filter",
-			Tier:    "T7",
-			Failure: fmt.Sprintf("no TUN full case matched %q", opts.Case),
+			Name: "TUN-full-case-filter",
+			Tier: "T7",
+			Failure: fmt.Sprintf(
+				"TUN full case selection failed for case=%q from-case=%q: %v",
+				opts.Case,
+				opts.FromCase,
+				err,
+			),
 		})
 		return
 	}
+	runCaseDefs(ctx, suite, rendrRoot, defs)
 }
 
-func runPlannedCase(ctx context.Context, rendrRoot, name string) report.Case {
-	switch name {
-	case "TUN-full.G1-smoke":
-		return runG1Smoke(ctx, g1SmokeOptions{
-			name:       name,
-			size:       30 << 20,
-			paths:      2,
-			migrations: 3,
-		})
-	case "TUN-full.G2-smoke":
-		return runG2Smoke(ctx, g2SmokeOptions{
-			name:       name,
-			duration:   30 * time.Second,
-			interval:   100 * time.Millisecond,
-			paths:      2,
-			migrations: 5,
-		})
-	case "TUN-full.G3-smoke":
-		return runG3Smoke(ctx, g3Options{
-			name:       name,
-			duration:   5 * time.Second,
-			pps:        5000,
-			payloadLen: 1024,
-			paths:      4,
-			migrations: 3,
-			lossPct:    0.5,
-			p95Ceiling: 50 * time.Millisecond,
-		})
-	case "TUN-full.G4-path-death":
-		return runG4PathDeath(ctx, g4Options{
-			name:     name,
-			duration: 6 * time.Second,
-			killAt:   2 * time.Second,
-			echoInt:  10 * time.Millisecond,
-			paths:    2,
-			budget:   5 * time.Second,
-		})
-	case "TUN-full.G5-path-recovery":
-		return runG5PathRecovery(ctx, g5Options{
-			name:         name,
-			paths:        2,
-			postAddBytes: 256 << 10,
-		})
-	case "TUN-full.T3-xray-stream-smoke":
-		return runT3XrayStreamSmoke(ctx, rendrRoot, name)
-	case "TUN-full.T3-xray-matrix":
-		return runT3XrayMatrix(ctx, rendrRoot, name)
-	case "TUN-full.T4-G1-1GiB-tcp":
-		return runT4WithBudget(ctx, name, 7*time.Minute, chaos.Realistic50M, func(c context.Context) report.Case {
-			return runG1Smoke(c, g1SmokeOptions{
-				name:       name,
-				size:       1 << 30,
-				paths:      2,
-				migrations: 10,
-			})
-		})
-	case "TUN-full.T4-G2-30m-prime":
-		return runT4WithBudget(ctx, name, 33*time.Minute, chaos.Realistic50M, func(c context.Context) report.Case {
-			return runG2Smoke(c, g2SmokeOptions{
-				name:       name,
-				duration:   30 * time.Minute,
-				interval:   100 * time.Millisecond,
-				paths:      2,
-				migrations: 30,
-			})
-		})
-	case "TUN-full.T4-G3-100k-pps":
-		return runT4WithBudget(ctx, name, 8*time.Minute, chaos.Profile{}, func(c context.Context) report.Case {
-			return runG3Smoke(c, g3Options{
-				name:       name,
-				duration:   5 * time.Minute,
-				pps:        100_000,
-				payloadLen: 1024,
-				paths:      32,
-				migrations: 10,
-				lossPct:    -1,
-				p95Ceiling: 20 * time.Millisecond,
-			})
-		})
-	case "TUN-full.T5-fallback":
-		return runT5Fallback(ctx, t5FallbackOptions{
-			name: name,
-		})
-	case "TUN-full.T6-selector":
-		return runT6Selector(ctx, t6SelectorOptions{
-			name: name,
-		})
-	default:
-		return UnimplementedCase(name)
+func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef) {
+	for _, def := range defs {
+		suite.Add(runManifestCase(ctx, rendrRoot, def))
 	}
 }
 
-var t4LongRunCases = []string{
-	"TUN-full.T4-G1-1GiB-tcp",
-	"TUN-full.T4-G2-30m-prime",
-	"TUN-full.T4-G3-100k-pps",
+func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.Case {
+	start := time.Now()
+	cctx, cancel := context.WithTimeout(ctx, def.spec.Budget)
+	defer cancel()
+	done := make(chan report.Case, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- report.Case{Failure: fmt.Sprintf("runner panic: %v", recovered)}
+			}
+		}()
+		done <- def.run(cctx, rendrRoot, def.spec)
+	}()
+
+	var rc report.Case
+	select {
+	case rc = <-done:
+		if err := cctx.Err(); err != nil {
+			budgetFailure := fmt.Sprintf("case exceeded TUN full budget %s: %v", def.spec.Budget, err)
+			if rc.Failure == "" {
+				rc.Failure = budgetFailure
+			} else {
+				rc.Failure = budgetFailure + ": " + rc.Failure
+			}
+		}
+	case <-cctx.Done():
+		rc.Failure = fmt.Sprintf("case exceeded TUN full budget %s: %v", def.spec.Budget, cctx.Err())
+	}
+	if rc.Duration == 0 {
+		rc.Duration = time.Since(start)
+	}
+	contractFailures := make([]string, 0, 2)
+	if rc.Name != "" && rc.Name != def.spec.ID {
+		contractFailures = append(contractFailures, fmt.Sprintf("runner reported case %q", rc.Name))
+	}
+	if rc.Tier != "" && rc.Tier != def.spec.Tier {
+		contractFailures = append(contractFailures, fmt.Sprintf("runner reported tier %q", rc.Tier))
+	}
+	if len(contractFailures) > 0 {
+		contractFailure := strings.Join(contractFailures, "; ")
+		if rc.Failure == "" {
+			rc.Failure = contractFailure
+		} else {
+			rc.Failure = contractFailure + ": " + rc.Failure
+		}
+	}
+	rc.Name = def.spec.ID
+	rc.Tier = def.spec.Tier
+	return rc
+}
+
+func runG1ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runG1Smoke(ctx, g1SmokeOptions{name: spec.ID, size: 30 << 20, paths: 2, migrations: 3})
+}
+
+func runG2ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runG2Smoke(ctx, g2SmokeOptions{
+		name: spec.ID, duration: 30 * time.Second, interval: 100 * time.Millisecond, paths: 2, migrations: 5,
+	})
+}
+
+func runG3ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runG3Smoke(ctx, g3Options{
+		name: spec.ID, duration: 5 * time.Second, pps: 5000, payloadLen: 1024,
+		paths: 4, migrations: 3, lossPct: 0.5, p95Ceiling: 50 * time.Millisecond,
+	})
+}
+
+func runG4ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runG4PathDeath(ctx, g4Options{
+		name: spec.ID, duration: 6 * time.Second, killAt: 2 * time.Second,
+		echoInt: 10 * time.Millisecond, paths: 2, budget: 5 * time.Second,
+	})
+}
+
+func runG5ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runG5PathRecovery(ctx, g5Options{name: spec.ID, paths: 2, postAddBytes: 256 << 10})
+}
+
+func runT3XrayStreamManifestCase(ctx context.Context, rendrRoot string, spec manifest.Spec) report.Case {
+	return runT3XrayStreamSmoke(ctx, rendrRoot, spec.ID)
+}
+
+func runT3XrayMatrixManifestCase(ctx context.Context, rendrRoot string, spec manifest.Spec) report.Case {
+	return runT3XrayMatrix(ctx, rendrRoot, spec.ID)
+}
+
+func runT4G1ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runT4WithBudget(ctx, spec.ID, spec.Budget, chaos.Realistic50M, func(c context.Context) report.Case {
+		return runG1Smoke(c, g1SmokeOptions{name: spec.ID, size: 1 << 30, paths: 2, migrations: 10})
+	})
+}
+
+func runT4G2ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runT4WithBudget(ctx, spec.ID, spec.Budget, chaos.Realistic50M, func(c context.Context) report.Case {
+		return runG2Smoke(c, g2SmokeOptions{
+			name: spec.ID, duration: 30 * time.Minute, interval: 100 * time.Millisecond, paths: 2, migrations: 30,
+		})
+	})
+}
+
+func runT4G3ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runT4WithBudget(ctx, spec.ID, spec.Budget, chaos.Profile{}, func(c context.Context) report.Case {
+		return runG3Smoke(c, g3Options{
+			name: spec.ID, duration: 5 * time.Minute, pps: 100_000, payloadLen: 1024,
+			paths: 32, migrations: 10, lossPct: -1, p95Ceiling: 20 * time.Millisecond,
+		})
+	})
+}
+
+func runT5ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runT5Fallback(ctx, t5FallbackOptions{name: spec.ID})
+}
+
+func runT6ManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
+	return runT6Selector(ctx, t6SelectorOptions{name: spec.ID})
 }
 
 // UnimplementedCase returns the explicit guard case used until real
@@ -192,10 +359,6 @@ func UnimplementedCase(name string) report.Case {
 		Duration: 0 * time.Second,
 		Failure:  "--tun-full baseline is not implemented yet; T7 feature tests are not a full TUN regression",
 	}
-}
-
-func caseMatches(filter, name string) bool {
-	return filter == "" || filter == name
 }
 
 func runT4WithBudget(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) report.Case) report.Case {
