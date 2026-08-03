@@ -28,7 +28,7 @@ const StateFileName = "last_phase1.json"
 type State struct {
 	CommitSHA   string    `json:"commit_sha"`
 	WorktreeSHA string    `json:"worktree_sha"`
-	Status      string    `json:"status"` // "green" | "red"
+	Status      string    `json:"status"` // "running" | "green" | "red"
 	At          time.Time `json:"at"`
 }
 
@@ -48,7 +48,33 @@ func Write(reportDir string, s State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(reportDir, StateFileName), b, 0o644)
+	b = append(b, '\n')
+	path := filepath.Join(reportDir, StateFileName)
+	tmp, err := os.CreateTemp(reportDir, "."+StateFileName+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(b); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err == nil {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // Read returns the persisted state. Returns os.ErrNotExist if no

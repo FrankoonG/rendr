@@ -64,6 +64,32 @@ func TestCurrentRevisionChangesWithTrackedContent(t *testing.T) {
 	}
 }
 
+func TestWriteAtomicallyReplacesState(t *testing.T) {
+	dir := t.TempDir()
+	first := State{CommitSHA: "one", WorktreeSHA: "tree-one", Status: "running", At: time.Unix(1, 0)}
+	second := State{CommitSHA: "two", WorktreeSHA: "tree-two", Status: "green", At: time.Unix(2, 0)}
+	if err := Write(dir, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(dir, second); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != second {
+		t.Fatalf("state=%+v want %+v", *got, second)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, "."+StateFileName+"-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temporary state files leaked: %v", temps)
+	}
+}
+
 func newTestRepo(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

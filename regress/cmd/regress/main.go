@@ -1,22 +1,25 @@
-// Command regress is the one-button rendr regression suite entry
-// point. It enforces the two-phase contract from
-// docs/regression-suite.md §4: phase 1 (T1+T2 rendr self-check)
-// must be green before phase 2 (T3+T4+T5 integration) is allowed
-// to run. Default invocation runs phase 1 then phase 2 T3; phase 1
-// failure exits without touching phase 2.
+// Command regress is the one-button rendr regression suite entry point.
+// It validates a registry-backed execution plan before starting any tier and
+// enforces the phase-1 gate before entering phase 2.
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/catalog"
 	"github.com/FrankoonG/rendr/regress/internal/gate"
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/regress/internal/runplan"
 	"github.com/FrankoonG/rendr/regress/internal/tier1"
 	"github.com/FrankoonG/rendr/regress/internal/tier2"
 	"github.com/FrankoonG/rendr/regress/internal/tier3"
@@ -28,7 +31,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tunfull"
 )
 
-// Exit codes match docs/regression-suite.md §10.
+// Exit codes match docs/regression-suite.md section 10.
 const (
 	exitOK          = 0
 	exitT1Fail      = 10
@@ -43,11 +46,14 @@ const (
 	exitPhase1Stale = 51
 )
 
+const listSchemaVersion = 1
+
 type runFlags struct {
 	phase         string
 	tier          string
 	full          bool
 	tunFull       bool
+	list          bool
 	forcePhase2   bool
 	allowNonLinux bool
 	profile       string
@@ -57,254 +63,788 @@ type runFlags struct {
 	rendrRoot     string
 }
 
-func parseFlags() runFlags {
-	var f runFlags
-	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
-	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5 | 6 | 7 | 8")
-	flag.BoolVar(&f.full, "full", false, "run phase 1 and all existing non-TUN phase-2 tiers (T3+T4+T5+T6+T7+T8)")
-	flag.BoolVar(&f.tunFull, "tun-full", false, "run TUN baseline/full regression subset")
-	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
-	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
-	flag.StringVar(&f.profile, "profile", "", "comma-separated path-profile filter (T3)")
-	flag.StringVar(&f.caseID, "case", "", "specific case id to run")
-	flag.StringVar(&f.fromCaseID, "from-case", "", "start at this case id and continue through later cases in the selected tier")
-	flag.StringVar(&f.reportDir, "report-dir", "reports", "directory to write JUnit + Markdown summary into")
-	flag.StringVar(&f.rendrRoot, "rendr-root", "..", "path to the rendr repo root (where the parent go.mod lives)")
-	flag.Parse()
-	return f
+func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
+	var cfg runFlags
+	fs := flag.NewFlagSet("regress", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&cfg.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then T3)")
+	fs.StringVar(&cfg.tier, "tier", "", "specific phase-2 tier: 3 | 4 | 5 | 6 | 7 | 8")
+	fs.BoolVar(&cfg.full, "full", false, "run the normal T1-T8 full suite")
+	fs.BoolVar(&cfg.tunFull, "tun-full", false, "run the TUN full regression suite")
+	fs.BoolVar(&cfg.list, "list", false, "write the selected case manifests as JSON and exit")
+	fs.BoolVar(&cfg.forcePhase2, "force-phase2", false, "skip the phase-1 gate (local debug only)")
+	fs.BoolVar(&cfg.allowNonLinux, "allow-non-linux", false, "bypass the Linux-only execution check")
+	fs.StringVar(&cfg.profile, "profile", "", "legacy T3 profile filter (unsupported; use --case)")
+	fs.StringVar(&cfg.caseID, "case", "", "run exactly one globally registered case")
+	fs.StringVar(&cfg.fromCaseID, "from-case", "", "resume inclusively from a registered case")
+	fs.StringVar(&cfg.reportDir, "report-dir", "reports", "directory for JUnit, summary, and gate state")
+	fs.StringVar(&cfg.rendrRoot, "rendr-root", "..", "path to the rendr repository root")
+	if err := fs.Parse(args); err != nil {
+		return runFlags{}, err
+	}
+	if fs.NArg() != 0 {
+		return runFlags{}, fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+	return cfg, nil
+}
+
+type preparedCommand struct {
+	normal *runplan.Plan
+	tun    *tunSelection
+	list   *listDocument
 }
 
 func main() {
-	cfg := parseFlags()
-	// Linux-only safety check. docs/regression-suite.md §3 specifies
-	// the suite runs in a Linux container (iptables / tc / netns /
-	// -race). Running on Windows / macOS hosts can mask real
-	// regressions that only surface under Linux scheduling.
-	if runtime.GOOS != "linux" && !cfg.allowNonLinux {
-		fmt.Fprintf(os.Stderr,
-			"regress: refusing to run on %s — the suite is designed for Linux.\n", runtime.GOOS)
-		fmt.Fprintln(os.Stderr, "  Use scripts/regress.sh to run inside the docker container.")
-		fmt.Fprintln(os.Stderr, "  For dev iteration only, pass --allow-non-linux to bypass.")
-		os.Exit(exitEnvError)
-	}
-	if err := tier1.VerifyRoot(cfg.rendrRoot); err != nil {
-		fmt.Fprintln(os.Stderr, "regress: rendr-root invalid:", err)
-		os.Exit(exitEnvError)
-	}
-	absRoot, err := filepath.Abs(cfg.rendrRoot)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "regress: cannot resolve rendr-root:", err)
-		os.Exit(exitEnvError)
-	}
-	cfg.rendrRoot = absRoot
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	suite := report.New()
+func runCLI(args []string, stdout, stderr io.Writer) int {
+	cfg, err := parseFlags(args, stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
+
+	prepared, err := prepareCommand(cfg)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
+	if prepared.list != nil {
+		if err := writeList(stdout, *prepared.list); err != nil {
+			fmt.Fprintln(stderr, "regress: cannot write case manifest:", err)
+			return exitEnvError
+		}
+		return exitOK
+	}
+
+	if runtime.GOOS != "linux" && !cfg.allowNonLinux {
+		fmt.Fprintf(stderr, "regress: refusing to run on %s; the suite is designed for Linux.\n", runtime.GOOS)
+		fmt.Fprintln(stderr, "  Use the Linux regression host, or pass --allow-non-linux for local iteration.")
+		return exitEnvError
+	}
+	root, err := resolveRendrRoot(cfg.rendrRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: rendr-root invalid:", err)
+		return exitEnvError
+	}
+	cfg.rendrRoot = root
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if prepared.tun != nil {
+		return executeTUN(ctx, cfg, *prepared.tun, stdout, stderr)
+	}
+	return executeNormal(ctx, cfg, *prepared.normal, stdout, stderr)
+}
 
-	runP1, runP2 := decidePhases(cfg)
+func prepareCommand(cfg runFlags) (preparedCommand, error) {
+	if err := validateFlagCombinations(cfg); err != nil {
+		return preparedCommand{}, err
+	}
+	normalSpecs, tunCatalog, err := loadCatalogs()
+	if err != nil {
+		return preparedCommand{}, err
+	}
 
-	if runP1 {
-		fmt.Println("== phase 1: rendr self-check (T1+T2) ==")
-		tier1.Run(ctx, suite, cfg.rendrRoot)
-		tier2.Run(ctx, suite, cfg.rendrRoot)
-		if err := writeReports(suite, cfg.reportDir); err != nil {
-			fmt.Fprintln(os.Stderr, "regress: cannot write phase 1 reports:", err)
-			os.Exit(exitEnvError)
+	if cfg.list {
+		doc, err := buildListDocument(cfg, normalSpecs, tunCatalog)
+		if err != nil {
+			return preparedCommand{}, err
 		}
+		return preparedCommand{list: &doc}, nil
+	}
+	if cfg.tunFull {
+		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID)
+		if err != nil {
+			return preparedCommand{}, fmt.Errorf("TUN run plan: %w", err)
+		}
+		return preparedCommand{tun: &selection}, nil
+	}
+
+	plan, err := runplan.Build(runplan.Request{
+		Phase:    cfg.phase,
+		Tier:     cfg.tier,
+		Full:     cfg.full,
+		Case:     cfg.caseID,
+		FromCase: cfg.fromCaseID,
+	})
+	if err != nil {
+		return preparedCommand{}, err
+	}
+	if cfg.forcePhase2 && !plan.HasPhase2() {
+		return preparedCommand{}, errors.New("--force-phase2 requires a plan that enters phase 2")
+	}
+	return preparedCommand{normal: &plan}, nil
+}
+
+func validateFlagCombinations(cfg runFlags) error {
+	if cfg.caseID != "" && cfg.fromCaseID != "" {
+		return errors.New("--case and --from-case are mutually exclusive")
+	}
+	if cfg.full && cfg.tunFull {
+		return errors.New("--full and --tun-full are mutually exclusive")
+	}
+	if cfg.tunFull && cfg.phase != "" {
+		return errors.New("--tun-full cannot be combined with --phase")
+	}
+	if cfg.tunFull && cfg.tier != "" {
+		return errors.New("--tun-full cannot be combined with --tier")
+	}
+	if cfg.phase == "1" && cfg.forcePhase2 {
+		return errors.New("--force-phase2 cannot be combined with --phase=1")
+	}
+	if cfg.list && cfg.forcePhase2 {
+		return errors.New("--force-phase2 cannot be combined with --list")
+	}
+	if cfg.profile != "" {
+		return errors.New("--profile is not supported by the registered case runners; use --case")
+	}
+	return nil
+}
+
+func loadCatalogs() ([]manifest.Spec, tunCatalog, error) {
+	if err := catalog.Validate(); err != nil {
+		return nil, tunCatalog{}, fmt.Errorf("normal catalog validation failed: %w", err)
+	}
+	normalSpecs := catalog.NormalFull()
+	if len(normalSpecs) == 0 {
+		return nil, tunCatalog{}, errors.New("normal catalog is empty")
+	}
+	tunCases, err := buildTUNCatalog(tunfull.Specs(), tunCaseRoles)
+	if err != nil {
+		return nil, tunCatalog{}, err
+	}
+	all := append(append([]manifest.Spec(nil), normalSpecs...), tunCases.specs...)
+	if err := manifest.Validate(all); err != nil {
+		return nil, tunCatalog{}, fmt.Errorf("global catalog validation failed: %w", err)
+	}
+	return normalSpecs, tunCases, nil
+}
+
+func resolveRendrRoot(root string) (string, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", root, err)
+	}
+	absRoot = filepath.Clean(absRoot)
+	if err := tier1.VerifyRoot(absRoot); err != nil {
+		return "", err
+	}
+	return absRoot, nil
+}
+
+type tierSelection struct {
+	Case     string
+	FromCase string
+}
+
+type tierCommand struct {
+	tier     string
+	title    string
+	exitCode int
+	run      func(context.Context, *report.Suite, string, tierSelection)
+}
+
+var tierCommands = map[string]tierCommand{
+	"T1": {
+		tier: "T1", title: "phase 1 / T1: contracts, unit, race, and static gates", exitCode: exitT1Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier1.RunWithOptions(ctx, suite, root, tier1.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T2": {
+		tier: "T2", title: "phase 1 / T2: rendr smoke contracts", exitCode: exitT2Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier2.RunWithOptions(ctx, suite, root, tier2.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T3": {
+		tier: "T3", title: "phase 2 / T3: PathFactory x xray outbound matrix", exitCode: exitT3Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier3.Run(ctx, suite, root, tier3.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T4": {
+		tier: "T4", title: "phase 2 / T4: long-run and release loads", exitCode: exitT4Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier4.Run(ctx, suite, root, tier4.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T5": {
+		tier: "T5", title: "phase 2 / T5: TCP fallback and adapters", exitCode: exitT5Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier5.Run(ctx, suite, root, tier5.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T6": {
+		tier: "T6", title: "phase 2 / T6: selector target graph", exitCode: exitT6Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier6.Run(ctx, suite, root, tier6.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T7": {
+		tier: "T7", title: "phase 2 / T7: TUN ingress and L3 identity", exitCode: exitT7Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier7.Run(ctx, suite, root, tier7.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+	"T8": {
+		tier: "T8", title: "phase 2 / T8: runtime status, identity, and recovery", exitCode: exitT8Fail,
+		run: func(ctx context.Context, suite *report.Suite, root string, selection tierSelection) {
+			tier8.Run(ctx, suite, root, tier8.Options{Case: selection.Case, FromCase: selection.FromCase})
+		},
+	},
+}
+
+func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout, stderr io.Writer) int {
+	if plan.HasPhase2() && !plan.CompletePhase1 && !cfg.forcePhase2 {
+		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
+			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
+			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
+			return exitPhase1Stale
+		}
+	}
+
+	var phase1Start *gate.Revision
+	if plan.CompletePhase1 {
 		revision, err := gate.CurrentRevision(cfg.rendrRoot)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "regress: cannot bind phase 1 revision:", err)
-			os.Exit(exitEnvError)
+			fmt.Fprintln(stderr, "regress: cannot fingerprint phase 1 start:", err)
+			return exitEnvError
 		}
-		state := gate.State{
-			CommitSHA:   revision.CommitSHA,
-			WorktreeSHA: revision.WorktreeSHA,
-			Status:      "green",
-			At:          time.Now(),
+		if err := writeKnownPhase1Gate(cfg.reportDir, revision, "running", time.Now()); err != nil {
+			fmt.Fprintln(stderr, "regress: cannot invalidate prior phase 1 gate:", err)
+			return exitEnvError
 		}
-		if suite.AnyFailedAt("T1") {
-			state.Status = "red"
-			_ = gate.Write(cfg.reportDir, state)
-			fmt.Fprintln(os.Stderr, "phase 1: T1 FAILED — phase 2 NOT entered")
-			os.Exit(exitT1Fail)
-		}
-		if suite.AnyFailedAt("T2") {
-			state.Status = "red"
-			_ = gate.Write(cfg.reportDir, state)
-			fmt.Fprintln(os.Stderr, "phase 1: T2 FAILED — phase 2 NOT entered")
-			os.Exit(exitT2Fail)
-		}
-		if err := gate.Write(cfg.reportDir, state); err != nil {
-			fmt.Fprintln(os.Stderr, "regress: cannot persist phase 1 state:", err)
-			os.Exit(exitEnvError)
-		}
-		fmt.Println("phase 1: GREEN")
+		phase1Start = &revision
 	}
 
-	if runP2 {
-		if !runP1 && !cfg.forcePhase2 {
-			if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: phase 2 not allowed:", err)
-				fmt.Fprintln(os.Stderr, "  → run `regress --phase=1` first, or pass --force-phase2 (local debug only)")
-				os.Exit(exitPhase1Stale)
+	suite := report.New()
+	for i, run := range plan.Runs {
+		command, ok := tierCommands[run.Tier]
+		if !ok {
+			fmt.Fprintf(stderr, "regress: execution plan contains unknown tier %q\n", run.Tier)
+			return exitEnvError
+		}
+		fmt.Fprintf(stdout, "== %s ==\n", command.title)
+		expected, err := specsForTierRun(run)
+		if err != nil {
+			fmt.Fprintln(stderr, "regress: cannot resolve planned cases:", err)
+			return exitEnvError
+		}
+		before := len(suite.Cases)
+		command.run(ctx, suite, cfg.rendrRoot, tierSelection{Case: run.Case, FromCase: run.FromCase})
+		if err := reconcileReportRows(expected, suite.Cases[before:]); err != nil {
+			suite.Add(report.Case{Name: run.Tier + "-manifest-reconcile", Tier: run.Tier, Failure: err.Error()})
+		}
+		if isLastPhase1Run(plan.Runs, i) && plan.CompletePhase1 {
+			if err := verifyPhase1Revision(cfg.rendrRoot, *phase1Start, gate.CurrentRevision); err != nil {
+				suite.Add(report.Case{Name: "phase1-revision-stable", Tier: run.Tier, Failure: err.Error()})
 			}
 		}
-		// Default phase-2 invocation runs T3 (path-factory matrix).
-		// T4 long-run, T5 fallback, and T6 selector graph are opt-in via --tier=4/5/6
-		// or included together via --full.
-		if cfg.tunFull {
-			fmt.Println("== phase 2 / TUN full baseline ==")
-			tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write TUN reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T7") {
-				fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
-				os.Exit(exitT7Fail)
-			}
-			fmt.Println("phase 2 / TUN full: GREEN")
-			os.Exit(exitOK)
+		suite.Complete = i == len(plan.Runs)-1
+		if err := writeReports(suite, cfg.reportDir); err != nil {
+			fmt.Fprintf(stderr, "regress: cannot write %s reports: %v\n", run.Tier, err)
+			return exitEnvError
 		}
-		runT3, runT4, runT5, runT6, runT7, runT8 := selectedTiers(cfg)
-		if !runT3 && !runT4 && !runT5 && !runT6 && !runT7 && !runT8 {
-			fmt.Fprintln(os.Stderr, "regress: invalid tier; use --tier=3, --tier=4, --tier=5, --tier=6, --tier=7, --tier=8, --tun-full, or --full")
-			os.Exit(exitEnvError)
+		if suite.AnyFailedAt(run.Tier) {
+			if isPhase1Tier(run.Tier) {
+				writeRedPhase1Gate(cfg, stderr)
+			}
+			fmt.Fprintf(stderr, "%s: FAILED\n", run.Tier)
+			return command.exitCode
 		}
-		if runT3 {
-			fmt.Println("== phase 2 / T3: PathFactory × xray outbound matrix ==")
-			tier3.Run(ctx, suite, cfg.rendrRoot, tier3.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T3 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T3") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T3: FAILED")
-				os.Exit(exitT3Fail)
-			}
-			fmt.Println("phase 2 / T3: GREEN")
-		}
-		if runT4 {
-			fmt.Println("== phase 2 / T4: long-run (1 GiB / 30 min / 100k pps) ==")
-			tier4.Run(ctx, suite, cfg.rendrRoot, tier4.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T4 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T4") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T4: FAILED")
-				os.Exit(exitT4Fail)
-			}
-			fmt.Println("phase 2 / T4: GREEN")
-		}
-		if runT5 {
-			fmt.Println("== phase 2 / T5: TCP fallback / adapter verification ==")
-			tier5.Run(ctx, suite, cfg.rendrRoot, tier5.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T5 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T5") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T5: FAILED")
-				os.Exit(exitT5Fail)
-			}
-			fmt.Println("phase 2 / T5: GREEN")
-		}
-		if runT6 {
-			fmt.Println("== phase 2 / T6: selector target graph / peak transfer ==")
-			tier6.Run(ctx, suite, cfg.rendrRoot, tier6.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T6 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T6") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T6: FAILED")
-				os.Exit(exitT6Fail)
-			}
-			fmt.Println("phase 2 / T6: GREEN")
-		}
-		if runT7 {
-			fmt.Println("== phase 2 / T7: TUN ingress / L3 identity ==")
-			tier7.Run(ctx, suite, cfg.rendrRoot, tier7.Options{Case: cfg.caseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T7 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T7") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T7: FAILED")
-				os.Exit(exitT7Fail)
-			}
-			fmt.Println("phase 2 / T7: GREEN")
-		}
-		if runT8 {
-			fmt.Println("== phase 2 / T8: runtime status / identity / recovery ==")
-			tier8.Run(ctx, suite, cfg.rendrRoot, tier8.Options{Case: cfg.caseID, FromCase: cfg.fromCaseID})
-			if err := writeReports(suite, cfg.reportDir); err != nil {
-				fmt.Fprintln(os.Stderr, "regress: cannot write T8 reports:", err)
-				os.Exit(exitEnvError)
-			}
-			if suite.AnyFailedAt("T8") {
-				fmt.Fprintln(os.Stderr, "phase 2 / T8: FAILED")
-				os.Exit(exitT8Fail)
-			}
-			fmt.Println("phase 2 / T8: GREEN")
-		}
-	}
+		fmt.Fprintf(stdout, "%s: GREEN\n", run.Tier)
 
-	if !runP1 && !runP2 {
-		fmt.Fprintln(os.Stderr, "regress: no phase selected; use --phase=1 or --phase=2")
-		os.Exit(exitEnvError)
+		if isLastPhase1Run(plan.Runs, i) {
+			if shouldWriteGreenPhase1Gate(plan) {
+				if err := writeKnownPhase1Gate(cfg.reportDir, *phase1Start, "green", time.Now()); err != nil {
+					fmt.Fprintln(stderr, "regress: cannot persist phase 1 state:", err)
+					return exitEnvError
+				}
+				fmt.Fprintln(stdout, "phase 1: GREEN")
+			} else {
+				fmt.Fprintln(stdout, "phase 1: PARTIAL (green gate unchanged)")
+			}
+		}
 	}
-
-	if suite.AnyFailed() {
-		os.Exit(exitT1Fail) // shouldn't reach here because P1 fails exit earlier; safeguard
-	}
-	os.Exit(exitOK)
+	return exitOK
 }
 
-// decidePhases interprets --phase / --tier / default to pick which
-// phases run. See docs/regression-suite.md §10.
-func decidePhases(cfg runFlags) (runP1, runP2 bool) {
-	switch {
-	case cfg.tunFull:
-		return false, true
-	case cfg.full:
-		return true, true
-	case cfg.phase == "1":
-		return true, false
-	case cfg.phase == "2":
-		return false, true
-	case cfg.tier != "":
-		return false, true
-	default:
-		return true, true
+func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdout, stderr io.Writer) int {
+	if !cfg.forcePhase2 {
+		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
+			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
+			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
+			return exitPhase1Stale
+		}
+	}
+
+	expected, err := tunSpecsForRunOrder(tunfull.Specs(), selection.runOrder)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: invalid prepared TUN plan:", err)
+		return exitEnvError
+	}
+	suite := report.New()
+	for i, spec := range expected {
+		fmt.Fprintf(stdout, "== phase 2 / TUN: %s ==\n", spec.ID)
+		before := len(suite.Cases)
+		tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: spec.ID})
+		if err := reconcileReportRows([]manifest.Spec{spec}, suite.Cases[before:]); err != nil {
+			suite.Add(report.Case{Name: "TUN-full-manifest-reconcile", Tier: "T7", Failure: err.Error()})
+		}
+		suite.Complete = i == len(expected)-1
+		if err := writeReports(suite, cfg.reportDir); err != nil {
+			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", err)
+			return exitEnvError
+		}
+		if suite.AnyFailedAt("T7") {
+			fmt.Fprintln(stderr, "phase 2 / TUN full: FAILED")
+			return exitT7Fail
+		}
+	}
+	fmt.Fprintln(stdout, "phase 2 / TUN full: GREEN")
+	return exitOK
+}
+
+func isPhase1Tier(tier string) bool {
+	return tier == "T1" || tier == "T2"
+}
+
+func isLastPhase1Run(runs []runplan.TierRun, index int) bool {
+	if index < 0 || index >= len(runs) || !isPhase1Tier(runs[index].Tier) {
+		return false
+	}
+	return index+1 == len(runs) || !isPhase1Tier(runs[index+1].Tier)
+}
+
+func shouldWriteGreenPhase1Gate(plan runplan.Plan) bool {
+	return plan.CompletePhase1
+}
+
+func writeRedPhase1Gate(cfg runFlags, stderr io.Writer) {
+	if err := writePhase1Gate(cfg.reportDir, cfg.rendrRoot, "red"); err != nil {
+		// Preserve the tier-specific failure code after the report was written.
+		fmt.Fprintln(stderr, "regress: warning: cannot persist red phase 1 state:", err)
 	}
 }
 
-func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7, runT8 bool) {
+func writePhase1Gate(reportDir, rendrRoot, status string) error {
+	state, err := buildPhase1State(rendrRoot, status, time.Now(), gate.CurrentRevision)
+	if err != nil {
+		return err
+	}
+	return gate.Write(reportDir, state)
+}
+
+func writeKnownPhase1Gate(reportDir string, revision gate.Revision, status string, at time.Time) error {
+	if revision.CommitSHA == "" || revision.WorktreeSHA == "" {
+		return errors.New("phase 1 revision identity is incomplete")
+	}
+	return gate.Write(reportDir, gate.State{
+		CommitSHA:   revision.CommitSHA,
+		WorktreeSHA: revision.WorktreeSHA,
+		Status:      status,
+		At:          at,
+	})
+}
+
+func verifyPhase1Revision(
+	rendrRoot string,
+	before gate.Revision,
+	currentRevision func(string) (gate.Revision, error),
+) error {
+	after, err := currentRevision(rendrRoot)
+	if err != nil {
+		return fmt.Errorf("fingerprint phase 1 completion: %w", err)
+	}
+	if before != after {
+		return fmt.Errorf(
+			"worktree changed during phase 1: before commit=%s worktree=%s, after commit=%s worktree=%s",
+			before.CommitSHA, before.WorktreeSHA, after.CommitSHA, after.WorktreeSHA,
+		)
+	}
+	return nil
+}
+
+func buildPhase1State(
+	rendrRoot string,
+	status string,
+	at time.Time,
+	currentRevision func(string) (gate.Revision, error),
+) (gate.State, error) {
+	revision, err := currentRevision(rendrRoot)
+	if err != nil {
+		return gate.State{}, fmt.Errorf("bind phase 1 revision: %w", err)
+	}
+	return gate.State{
+		CommitSHA:   revision.CommitSHA,
+		WorktreeSHA: revision.WorktreeSHA,
+		Status:      status,
+		At:          at,
+	}, nil
+}
+
+const (
+	tunKindCase                  = "case"
+	tunKindCompatibilityCase     = "compatibility_case"
+	tunKindCompatibilitySelector = "compatibility_selector"
+)
+
+type tunCaseRole struct {
+	ID         string
+	Kind       string
+	DefaultRun bool
+	ExpandsTo  []string
+}
+
+// tunCaseRoles is the public CLI contract for how tunfull.Specs maps onto an
+// unfiltered TUN full run. Keeping compatibility entries explicit makes any
+// registry/full drift a startup error instead of silently adding or omitting a
+// mandatory case from --list.
+var tunCaseRoles = []tunCaseRole{
+	{ID: "TUN-full.G1-smoke", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.G2-smoke", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.G3-smoke", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.G4-path-death", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.G5-path-recovery", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.T3-xray-stream-smoke", Kind: tunKindCompatibilityCase},
+	{ID: "TUN-full.T3-xray-matrix", Kind: tunKindCase, DefaultRun: true},
+	{
+		ID:   "TUN-full.T4-long-run",
+		Kind: tunKindCompatibilitySelector,
+		ExpandsTo: []string{
+			"TUN-full.T4-G1-1GiB-tcp",
+			"TUN-full.T4-G2-30m-prime",
+			"TUN-full.T4-G3-100k-pps",
+		},
+	},
+	{ID: "TUN-full.T4-G1-1GiB-tcp", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.T4-G2-30m-prime", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.T4-G3-100k-pps", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.T5-fallback", Kind: tunKindCase, DefaultRun: true},
+	{ID: "TUN-full.T6-selector", Kind: tunKindCase, DefaultRun: true},
+}
+
+type tunCatalog struct {
+	specs []manifest.Spec
+	roles []tunCaseRole
+}
+
+type tunSelection struct {
+	cases    []listedCase
+	runOrder []string
+}
+
+func buildTUNCatalog(specs []manifest.Spec, roles []tunCaseRole) (tunCatalog, error) {
+	if err := manifest.Validate(specs); err != nil {
+		return tunCatalog{}, fmt.Errorf("TUN catalog validation failed: %w", err)
+	}
+	if len(specs) != len(roles) {
+		return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: registry has %d entries, role manifest has %d", len(specs), len(roles))
+	}
+
+	roleByID := make(map[string]tunCaseRole, len(roles))
+	for i, spec := range specs {
+		role := roles[i]
+		if role.ID != spec.ID {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch at index %d: registry=%q role=%q", i, spec.ID, role.ID)
+		}
+		if spec.Suite != manifest.SuiteTUN || spec.Tier != "T7" || !spec.Mandatory || spec.Budget <= 0 {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: invalid registered case %+v", spec)
+		}
+		switch role.Kind {
+		case tunKindCase:
+			if !role.DefaultRun || len(role.ExpandsTo) != 0 {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: canonical case %q has invalid role", role.ID)
+			}
+		case tunKindCompatibilityCase:
+			if role.DefaultRun || len(role.ExpandsTo) != 0 {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: compatibility case %q has invalid role", role.ID)
+			}
+		case tunKindCompatibilitySelector:
+			if role.DefaultRun || len(role.ExpandsTo) == 0 {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: compatibility selector %q has invalid role", role.ID)
+			}
+		default:
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: case %q has unknown role %q", role.ID, role.Kind)
+		}
+		if _, duplicate := roleByID[role.ID]; duplicate {
+			return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: duplicate role %q", role.ID)
+		}
+		roleByID[role.ID] = role
+	}
+	for _, role := range roles {
+		for _, member := range role.ExpandsTo {
+			memberRole, ok := roleByID[member]
+			if !ok {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: selector %q references unknown case %q", role.ID, member)
+			}
+			if !memberRole.DefaultRun || memberRole.Kind != tunKindCase {
+				return tunCatalog{}, fmt.Errorf("TUN registry/full mismatch: selector %q member %q is not canonical", role.ID, member)
+			}
+		}
+	}
+	return tunCatalog{
+		specs: append([]manifest.Spec(nil), specs...),
+		roles: cloneTUNRoles(roles),
+	}, nil
+}
+
+func cloneTUNRoles(roles []tunCaseRole) []tunCaseRole {
+	cloned := make([]tunCaseRole, len(roles))
+	for i, role := range roles {
+		cloned[i] = role
+		cloned[i].ExpandsTo = append([]string(nil), role.ExpandsTo...)
+	}
+	return cloned
+}
+
+func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, error) {
+	selected, err := manifest.Select(catalog.specs, caseID, fromCaseID)
+	if err != nil {
+		return tunSelection{}, err
+	}
+	roleByID := make(map[string]tunCaseRole, len(catalog.roles))
+	for _, role := range catalog.roles {
+		roleByID[role.ID] = role
+	}
+
+	result := tunSelection{cases: make([]listedCase, 0, len(selected))}
+	emitted := make(map[string]bool, len(selected))
+	for _, spec := range selected {
+		role := roleByID[spec.ID]
+		result.cases = append(result.cases, listedCaseFrom(spec, 2, role.DefaultRun, role.Kind, role.ExpandsTo))
+		if !role.DefaultRun && caseID == "" && spec.ID != fromCaseID {
+			continue
+		}
+		if len(role.ExpandsTo) == 0 {
+			if !emitted[role.ID] {
+				result.runOrder = append(result.runOrder, role.ID)
+				emitted[role.ID] = true
+			}
+			continue
+		}
+		for _, member := range role.ExpandsTo {
+			if !emitted[member] {
+				result.runOrder = append(result.runOrder, member)
+				emitted[member] = true
+			}
+		}
+	}
+	if len(result.runOrder) == 0 {
+		return tunSelection{}, errors.New("selected TUN scope contains no executable cases")
+	}
+	return result, nil
+}
+
+type listDocument struct {
+	SchemaVersion int           `json:"schema_version"`
+	Catalogs      []listCatalog `json:"catalogs"`
+}
+
+type listCatalog struct {
+	Suite    string       `json:"suite"`
+	Cases    []listedCase `json:"cases"`
+	RunOrder []string     `json:"run_order"`
+}
+
+type listedCase struct {
+	ID         string        `json:"id"`
+	Tier       string        `json:"tier"`
+	Suite      string        `json:"suite"`
+	Phase      int           `json:"phase"`
+	Mandatory  bool          `json:"mandatory"`
+	Long       bool          `json:"long,omitempty"`
+	Budget     time.Duration `json:"budget_ns,omitempty"`
+	DefaultRun bool          `json:"default_run"`
+	Kind       string        `json:"kind"`
+	ExpandsTo  []string      `json:"expands_to,omitempty"`
+}
+
+func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tunCatalog) (listDocument, error) {
+	doc := listDocument{SchemaVersion: listSchemaVersion}
 	if cfg.tunFull {
-		return false, false, false, false, false, false
+		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID)
+		if err != nil {
+			return listDocument{}, fmt.Errorf("TUN list selection: %w", err)
+		}
+		doc.Catalogs = append(doc.Catalogs, listCatalog{
+			Suite: manifest.SuiteTUN, Cases: selection.cases, RunOrder: selection.runOrder,
+		})
+		return doc, nil
 	}
-	if cfg.full {
-		return true, true, true, true, true, true
+
+	if hasNormalListScope(cfg) {
+		plan, err := runplan.Build(runplan.Request{
+			Phase: cfg.phase, Tier: cfg.tier, Full: cfg.full,
+			Case: cfg.caseID, FromCase: cfg.fromCaseID,
+		})
+		if err != nil {
+			return listDocument{}, err
+		}
+		selected, err := specsForPlan(plan, catalog.ByTier)
+		if err != nil {
+			return listDocument{}, err
+		}
+		normal, err := normalListCatalog(selected)
+		if err != nil {
+			return listDocument{}, err
+		}
+		doc.Catalogs = append(doc.Catalogs, normal)
+		return doc, nil
 	}
-	switch cfg.tier {
-	case "", "3":
-		return true, false, false, false, false, false
-	case "4":
-		return false, true, false, false, false, false
-	case "5":
-		return false, false, true, false, false, false
-	case "6":
-		return false, false, false, true, false, false
-	case "7":
-		return false, false, false, false, true, false
-	case "8":
-		return false, false, false, false, false, true
+
+	normal, err := normalListCatalog(normalSpecs)
+	if err != nil {
+		return listDocument{}, err
+	}
+	tunSelection, err := tunCatalog.selectCases("", "")
+	if err != nil {
+		return listDocument{}, err
+	}
+	doc.Catalogs = append(doc.Catalogs, normal, listCatalog{
+		Suite: manifest.SuiteTUN, Cases: tunSelection.cases, RunOrder: tunSelection.runOrder,
+	})
+	return doc, nil
+}
+
+func hasNormalListScope(cfg runFlags) bool {
+	return cfg.phase != "" || cfg.tier != "" || cfg.full || cfg.caseID != "" || cfg.fromCaseID != ""
+}
+
+func specsForPlan(plan runplan.Plan, byTier func(string) []manifest.Spec) ([]manifest.Spec, error) {
+	var selected []manifest.Spec
+	for _, run := range plan.Runs {
+		tierSpecs := byTier(run.Tier)
+		if len(tierSpecs) == 0 {
+			return nil, fmt.Errorf("list plan references unknown or empty tier %q", run.Tier)
+		}
+		specs, err := manifest.Select(tierSpecs, run.Case, run.FromCase)
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", run.Tier, err)
+		}
+		selected = append(selected, specs...)
+	}
+	if err := manifest.Validate(selected); err != nil {
+		return nil, fmt.Errorf("selected list validation failed: %w", err)
+	}
+	return selected, nil
+}
+
+func specsForTierRun(run runplan.TierRun) ([]manifest.Spec, error) {
+	specs := catalog.ByTier(run.Tier)
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("unknown or empty tier %q", run.Tier)
+	}
+	selected, err := manifest.Select(specs, run.Case, run.FromCase)
+	if err != nil {
+		return nil, fmt.Errorf("select %s: %w", run.Tier, err)
+	}
+	return selected, nil
+}
+
+func tunSpecsForRunOrder(specs []manifest.Spec, ids []string) ([]manifest.Spec, error) {
+	byID := make(map[string]manifest.Spec, len(specs))
+	for _, spec := range specs {
+		byID[spec.ID] = spec
+	}
+	selected := make([]manifest.Spec, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			return nil, fmt.Errorf("duplicate TUN run ID %q", id)
+		}
+		spec, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("unknown TUN run ID %q", id)
+		}
+		seen[id] = true
+		selected = append(selected, spec)
+	}
+	if len(selected) == 0 {
+		return nil, errors.New("prepared TUN plan contains no executable cases")
+	}
+	return selected, nil
+}
+
+func reconcileReportRows(expected []manifest.Spec, actual []report.Case) error {
+	if len(actual) != len(expected) {
+		return fmt.Errorf("manifest/report row count mismatch: got %d, want %d", len(actual), len(expected))
+	}
+	seen := make(map[string]bool, len(actual))
+	for i, want := range expected {
+		got := actual[i]
+		if seen[got.Name] {
+			return fmt.Errorf("manifest/report duplicate case %q at row %d", got.Name, i)
+		}
+		seen[got.Name] = true
+		if got.Name != want.ID {
+			return fmt.Errorf("manifest/report ID mismatch at row %d: got %q, want %q", i, got.Name, want.ID)
+		}
+		if got.Tier != want.Tier {
+			return fmt.Errorf("manifest/report tier mismatch for %q: got %q, want %q", want.ID, got.Tier, want.Tier)
+		}
+	}
+	return nil
+}
+
+func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
+	if len(specs) == 0 {
+		return listCatalog{}, errors.New("normal list contains no cases")
+	}
+	if err := manifest.Validate(specs); err != nil {
+		return listCatalog{}, err
+	}
+	result := listCatalog{Suite: manifest.SuiteNormal, Cases: make([]listedCase, 0, len(specs)), RunOrder: make([]string, 0, len(specs))}
+	for _, spec := range specs {
+		if spec.Suite != manifest.SuiteNormal {
+			return listCatalog{}, fmt.Errorf("normal list case %q has suite %q", spec.ID, spec.Suite)
+		}
+		phase, err := phaseForTier(spec.Tier)
+		if err != nil {
+			return listCatalog{}, err
+		}
+		result.Cases = append(result.Cases, listedCaseFrom(spec, phase, true, tunKindCase, nil))
+		result.RunOrder = append(result.RunOrder, spec.ID)
+	}
+	return result, nil
+}
+
+func phaseForTier(tier string) (int, error) {
+	switch tier {
+	case "T1", "T2":
+		return 1, nil
+	case "T3", "T4", "T5", "T6", "T7", "T8":
+		return 2, nil
 	default:
-		return false, false, false, false, false, false
+		return 0, fmt.Errorf("case registry contains unknown tier %q", tier)
 	}
+}
+
+func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string, expandsTo []string) listedCase {
+	return listedCase{
+		ID:         spec.ID,
+		Tier:       spec.Tier,
+		Suite:      spec.Suite,
+		Phase:      phase,
+		Mandatory:  spec.Mandatory,
+		Long:       spec.Long,
+		Budget:     spec.Budget,
+		DefaultRun: defaultRun,
+		Kind:       kind,
+		ExpandsTo:  append([]string(nil), expandsTo...),
+	}
+}
+
+func writeList(w io.Writer, doc listDocument) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(doc)
 }
 
 func tunFullUnimplementedCase() report.Case {
