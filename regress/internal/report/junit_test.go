@@ -57,6 +57,7 @@ func TestMandatorySkipAndInvalidAreJUnitFailures(t *testing.T) {
 
 func TestEvidenceIsDeterministicInJUnitAndMarkdown(t *testing.T) {
 	s := New()
+	s.Complete = true
 	s.Add(Case{
 		Name: "evidence|case",
 		Tier: "T",
@@ -87,5 +88,53 @@ func TestEvidenceIsDeterministicInJUnitAndMarkdown(t *testing.T) {
 	}
 	if !strings.Contains(string(markdown), `evidence\|case`) || !strings.Contains(string(markdown), `alpha=first\|value; zeta=last`) {
 		t.Fatalf("Markdown evidence is absent, unordered, or unescaped:\n%s", markdown)
+	}
+}
+
+func TestIncompleteGreenReportIsPartial(t *testing.T) {
+	s := New()
+	s.Add(Case{Name: "green", Tier: "T"})
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, _ := os.ReadFile(junitPath)
+	markdown, _ := os.ReadFile(markdownPath)
+	if !strings.Contains(string(junit), `state="partial"`) {
+		t.Fatalf("JUnit missing partial state:\n%s", junit)
+	}
+	if !strings.Contains(string(markdown), "**OVERALL: PARTIAL**") || strings.Contains(string(markdown), "**OVERALL: PASS**") {
+		t.Fatalf("Markdown partial state is wrong:\n%s", markdown)
+	}
+
+	s.Complete = true
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	markdown, _ = os.ReadFile(markdownPath)
+	if !strings.Contains(string(markdown), "**OVERALL: PASS**") {
+		t.Fatalf("complete report did not pass:\n%s", markdown)
+	}
+}
+
+func TestAtomicWriteReplacesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.txt")
+	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("complete")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "complete" {
+		t.Fatalf("contents=%q want complete", got)
 	}
 }

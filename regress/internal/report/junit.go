@@ -5,6 +5,7 @@
 package report
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -38,6 +39,9 @@ type Case struct {
 type Suite struct {
 	Started time.Time
 	Cases   []Case
+	// Complete is set only after every case in the selected manifest has
+	// been reconciled. A green but incomplete report is PARTIAL, never PASS.
+	Complete bool
 }
 
 func New() *Suite { return &Suite{Started: time.Now()} }
@@ -72,6 +76,7 @@ func (s *Suite) AnyFailedAt(tierPrefix string) bool {
 
 type xmlSuites struct {
 	XMLName  xml.Name   `xml:"testsuites"`
+	State    string     `xml:"state,attr"`
 	Time     float64    `xml:"time,attr"`
 	Tests    int        `xml:"tests,attr"`
 	Failures int        `xml:"failures,attr"`
@@ -119,7 +124,7 @@ func (s *Suite) WriteJUnit(path string) error {
 		byTier[c.Tier] = append(byTier[c.Tier], c)
 	}
 
-	out := xmlSuites{Time: time.Since(s.Started).Seconds()}
+	out := xmlSuites{State: reportState(s), Time: time.Since(s.Started).Seconds()}
 	for _, tier := range tierOrder {
 		cs := byTier[tier]
 		xs := xmlSuite{Name: tier}
@@ -155,39 +160,28 @@ func (s *Suite) WriteJUnit(path string) error {
 		out.Suites = append(out.Suites, xs)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	var buf bytes.Buffer
+	if _, err := io.WriteString(&buf, xml.Header); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := io.WriteString(f, xml.Header); err != nil {
-		return err
-	}
-	enc := xml.NewEncoder(f)
+	enc := xml.NewEncoder(&buf)
 	enc.Indent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		return err
 	}
-	_, err = io.WriteString(f, "\n")
-	return err
+	if _, err := io.WriteString(&buf, "\n"); err != nil {
+		return err
+	}
+	return writeAtomic(path, buf.Bytes())
 }
 
 // WriteMarkdown emits a human-readable SUMMARY.md.
 func (s *Suite) WriteMarkdown(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	var buf bytes.Buffer
 
-	fmt.Fprintf(f, "# rendr regression — %s\n\n", s.Started.UTC().Format(time.RFC3339))
-	fmt.Fprintf(f, "Total elapsed: %s\n\n", time.Since(s.Started).Round(time.Millisecond))
+	fmt.Fprintf(&buf, "# rendr regression — %s\n\n", s.Started.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&buf, "State: %s\n\n", reportState(s))
+	fmt.Fprintf(&buf, "Total elapsed: %s\n\n", time.Since(s.Started).Round(time.Millisecond))
 
 	byTier := map[string][]Case{}
 	tierOrder := []string{}
@@ -199,9 +193,9 @@ func (s *Suite) WriteMarkdown(path string) error {
 	}
 
 	for _, tier := range tierOrder {
-		fmt.Fprintf(f, "## %s\n\n", tier)
-		fmt.Fprintln(f, "| Case | Time | Result | Evidence |")
-		fmt.Fprintln(f, "|------|------|--------|----------|")
+		fmt.Fprintf(&buf, "## %s\n\n", tier)
+		fmt.Fprintln(&buf, "| Case | Time | Result | Evidence |")
+		fmt.Fprintln(&buf, "|------|------|--------|----------|")
 		for _, c := range byTier[tier] {
 			result := "OK"
 			if c.InvalidReason != "" {
@@ -214,16 +208,61 @@ func (s *Suite) WriteMarkdown(path string) error {
 				result = "FAIL"
 			}
 			evidence := escapeMarkdown(formatEvidence(c.Evidence, "=", "; "))
-			fmt.Fprintf(f, "| %s | %s | %s | %s |\n", escapeMarkdown(c.Name), c.Duration.Round(time.Millisecond), escapeMarkdown(result), evidence)
+			fmt.Fprintf(&buf, "| %s | %s | %s | %s |\n", escapeMarkdown(c.Name), c.Duration.Round(time.Millisecond), escapeMarkdown(result), evidence)
 		}
-		fmt.Fprintln(f)
+		fmt.Fprintln(&buf)
 	}
 
-	overall := "PASS"
+	overall := strings.ToUpper(reportState(s))
+	fmt.Fprintf(&buf, "**OVERALL: %s**\n", overall)
+	return writeAtomic(path, buf.Bytes())
+}
+
+func reportState(s *Suite) string {
 	if s.AnyFailed() {
-		overall = "FAIL"
+		return "fail"
 	}
-	fmt.Fprintf(f, "**OVERALL: %s**\n", overall)
+	if !s.Complete {
+		return "partial"
+	}
+	return "pass"
+}
+
+func writeAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err == nil {
+		return nil
+	}
+	// Windows cannot replace an existing destination with Rename. Removing
+	// the old report first leaves either the new complete file or no file;
+	// it never leaves a truncated report that can masquerade as success.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
 	return nil
 }
 
