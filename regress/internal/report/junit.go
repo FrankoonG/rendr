@@ -20,8 +20,13 @@ type Case struct {
 	Duration time.Duration
 	// Empty Failure => pass.
 	Failure string
+	// InvalidReason means the harness could not prove that the stimulus,
+	// offered load, or oracle was valid. Invalid is always a failure.
+	InvalidReason string
 	// SkipReason set => the case was skipped (e.g. T5 adapter missing).
+	// Skips fail by default; Optional must be explicit for a non-blocking skip.
 	SkipReason string
+	Optional   bool
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -35,10 +40,15 @@ func New() *Suite { return &Suite{Started: time.Now()} }
 // Add records one case outcome.
 func (s *Suite) Add(c Case) { s.Cases = append(s.Cases, c) }
 
-// AnyFailed reports whether any non-skipped case failed.
+func (c Case) failed() bool {
+	return c.Failure != "" || c.InvalidReason != "" || (c.SkipReason != "" && !c.Optional)
+}
+
+// AnyFailed reports whether any case failed, was invalid, or was
+// mandatorily skipped.
 func (s *Suite) AnyFailed() bool {
 	for _, c := range s.Cases {
-		if c.Failure != "" {
+		if c.failed() {
 			return true
 		}
 	}
@@ -48,7 +58,7 @@ func (s *Suite) AnyFailed() bool {
 // AnyFailedAt returns true if any case in tierPrefix failed (e.g. "T1").
 func (s *Suite) AnyFailedAt(tierPrefix string) bool {
 	for _, c := range s.Cases {
-		if c.Tier == tierPrefix && c.Failure != "" {
+		if c.Tier == tierPrefix && c.failed() {
 			return true
 		}
 	}
@@ -56,12 +66,12 @@ func (s *Suite) AnyFailedAt(tierPrefix string) bool {
 }
 
 type xmlSuites struct {
-	XMLName    xml.Name   `xml:"testsuites"`
-	Time       float64    `xml:"time,attr"`
-	Tests      int        `xml:"tests,attr"`
-	Failures   int        `xml:"failures,attr"`
-	Skipped    int        `xml:"skipped,attr"`
-	Suites     []xmlSuite `xml:"testsuite"`
+	XMLName  xml.Name   `xml:"testsuites"`
+	Time     float64    `xml:"time,attr"`
+	Tests    int        `xml:"tests,attr"`
+	Failures int        `xml:"failures,attr"`
+	Skipped  int        `xml:"skipped,attr"`
+	Suites   []xmlSuite `xml:"testsuite"`
 }
 
 type xmlSuite struct {
@@ -115,10 +125,18 @@ func (s *Suite) WriteJUnit(path string) error {
 			}
 			xs.Tests++
 			out.Tests++
-			if c.SkipReason != "" {
+			if c.InvalidReason != "" {
+				xc.Failure = &xmlFailure{Message: "invalid", Body: c.InvalidReason}
+				xs.Failures++
+				out.Failures++
+			} else if c.SkipReason != "" && c.Optional {
 				xc.Skipped = &xmlSkipped{Message: c.SkipReason}
 				xs.Skipped++
 				out.Skipped++
+			} else if c.SkipReason != "" {
+				xc.Failure = &xmlFailure{Message: "mandatory case skipped", Body: c.SkipReason}
+				xs.Failures++
+				out.Failures++
 			} else if c.Failure != "" {
 				xc.Failure = &xmlFailure{Message: "failed", Body: c.Failure}
 				xs.Failures++
@@ -179,8 +197,12 @@ func (s *Suite) WriteMarkdown(path string) error {
 		fmt.Fprintln(f, "|------|------|--------|")
 		for _, c := range byTier[tier] {
 			result := "OK"
-			if c.SkipReason != "" {
-				result = "SKIP: " + c.SkipReason
+			if c.InvalidReason != "" {
+				result = "INVALID: " + c.InvalidReason
+			} else if c.SkipReason != "" && c.Optional {
+				result = "SKIP (optional): " + c.SkipReason
+			} else if c.SkipReason != "" {
+				result = "FAIL (mandatory skip): " + c.SkipReason
 			} else if c.Failure != "" {
 				result = "FAIL"
 			}
