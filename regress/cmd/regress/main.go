@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -62,7 +61,7 @@ func parseFlags() runFlags {
 	var f runFlags
 	flag.StringVar(&f.phase, "phase", "", "phase to run: 1 | 2 (default: 1 then 2-T3)")
 	flag.StringVar(&f.tier, "tier", "", "specific tier inside phase 2: 3 | 4 | 5 | 6 | 7 | 8")
-	flag.BoolVar(&f.full, "full", false, "run phase 1 and all existing non-TUN phase-2 tiers (T3+T4+T5+T6)")
+	flag.BoolVar(&f.full, "full", false, "run phase 1 and all existing non-TUN phase-2 tiers (T3+T4+T5+T6+T7+T8)")
 	flag.BoolVar(&f.tunFull, "tun-full", false, "run TUN baseline/full regression subset")
 	flag.BoolVar(&f.forcePhase2, "force-phase2", false, "skip phase-1 gate (local debug only; CI MUST NOT pass this)")
 	flag.BoolVar(&f.allowNonLinux, "allow-non-linux", false, "bypass the linux-only safety check (dev iteration only)")
@@ -109,11 +108,20 @@ func main() {
 		fmt.Println("== phase 1: rendr self-check (T1+T2) ==")
 		tier1.Run(ctx, suite, cfg.rendrRoot)
 		tier2.Run(ctx, suite, cfg.rendrRoot)
-		writeReports(suite, cfg.reportDir)
+		if err := writeReports(suite, cfg.reportDir); err != nil {
+			fmt.Fprintln(os.Stderr, "regress: cannot write phase 1 reports:", err)
+			os.Exit(exitEnvError)
+		}
+		revision, err := gate.CurrentRevision(cfg.rendrRoot)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "regress: cannot bind phase 1 revision:", err)
+			os.Exit(exitEnvError)
+		}
 		state := gate.State{
-			CommitSHA: gate.HeadCommit(),
-			Status:    "green",
-			At:        time.Now(),
+			CommitSHA:   revision.CommitSHA,
+			WorktreeSHA: revision.WorktreeSHA,
+			Status:      "green",
+			At:          time.Now(),
 		}
 		if suite.AnyFailedAt("T1") {
 			state.Status = "red"
@@ -136,7 +144,7 @@ func main() {
 
 	if runP2 {
 		if !runP1 && !cfg.forcePhase2 {
-			if err := gate.CheckPhase2Allowed(cfg.reportDir); err != nil {
+			if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
 				fmt.Fprintln(os.Stderr, "regress: phase 2 not allowed:", err)
 				fmt.Fprintln(os.Stderr, "  → run `regress --phase=1` first, or pass --force-phase2 (local debug only)")
 				os.Exit(exitPhase1Stale)
@@ -148,7 +156,10 @@ func main() {
 		if cfg.tunFull {
 			fmt.Println("== phase 2 / TUN full baseline ==")
 			tunfull.Run(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write TUN reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T7") {
 				fmt.Fprintln(os.Stderr, "phase 2 / TUN full: FAILED")
 				os.Exit(exitT7Fail)
@@ -164,7 +175,10 @@ func main() {
 		if runT3 {
 			fmt.Println("== phase 2 / T3: PathFactory × xray outbound matrix ==")
 			tier3.Run(ctx, suite, cfg.rendrRoot, tier3.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T3 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T3") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T3: FAILED")
 				os.Exit(exitT3Fail)
@@ -174,7 +188,10 @@ func main() {
 		if runT4 {
 			fmt.Println("== phase 2 / T4: long-run (1 GiB / 30 min / 100k pps) ==")
 			tier4.Run(ctx, suite, cfg.rendrRoot, tier4.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T4 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T4") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T4: FAILED")
 				os.Exit(exitT4Fail)
@@ -184,7 +201,10 @@ func main() {
 		if runT5 {
 			fmt.Println("== phase 2 / T5: TCP fallback / adapter verification ==")
 			tier5.Run(ctx, suite, cfg.rendrRoot, tier5.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T5 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T5") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T5: FAILED")
 				os.Exit(exitT5Fail)
@@ -194,7 +214,10 @@ func main() {
 		if runT6 {
 			fmt.Println("== phase 2 / T6: selector target graph / peak transfer ==")
 			tier6.Run(ctx, suite, cfg.rendrRoot, tier6.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T6 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T6") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T6: FAILED")
 				os.Exit(exitT6Fail)
@@ -204,7 +227,10 @@ func main() {
 		if runT7 {
 			fmt.Println("== phase 2 / T7: TUN ingress / L3 identity ==")
 			tier7.Run(ctx, suite, cfg.rendrRoot, tier7.Options{Case: cfg.caseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T7 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T7") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T7: FAILED")
 				os.Exit(exitT7Fail)
@@ -214,7 +240,10 @@ func main() {
 		if runT8 {
 			fmt.Println("== phase 2 / T8: runtime status / identity / recovery ==")
 			tier8.Run(ctx, suite, cfg.rendrRoot, tier8.Options{Case: cfg.caseID, FromCase: cfg.fromCaseID})
-			writeReports(suite, cfg.reportDir)
+			if err := writeReports(suite, cfg.reportDir); err != nil {
+				fmt.Fprintln(os.Stderr, "regress: cannot write T8 reports:", err)
+				os.Exit(exitEnvError)
+			}
 			if suite.AnyFailedAt("T8") {
 				fmt.Fprintln(os.Stderr, "phase 2 / T8: FAILED")
 				os.Exit(exitT8Fail)
@@ -258,7 +287,7 @@ func selectedTiers(cfg runFlags) (runT3, runT4, runT5, runT6, runT7, runT8 bool)
 		return false, false, false, false, false, false
 	}
 	if cfg.full {
-		return true, true, true, true, false, false
+		return true, true, true, true, true, true
 	}
 	switch cfg.tier {
 	case "", "3":
@@ -282,13 +311,14 @@ func tunFullUnimplementedCase() report.Case {
 	return tunfull.UnimplementedCase("")
 }
 
-func writeReports(suite *report.Suite, dir string) {
+func writeReports(suite *report.Suite, dir string) error {
 	junit := filepath.Join(dir, "junit.xml")
 	md := filepath.Join(dir, "SUMMARY.md")
-	if err := suite.WriteJUnit(junit); err != nil && !errors.Is(err, os.ErrPermission) {
-		fmt.Fprintln(os.Stderr, "regress: cannot write JUnit:", err)
+	if err := suite.WriteJUnit(junit); err != nil {
+		return fmt.Errorf("write JUnit: %w", err)
 	}
-	if err := suite.WriteMarkdown(md); err != nil && !errors.Is(err, os.ErrPermission) {
-		fmt.Fprintln(os.Stderr, "regress: cannot write SUMMARY.md:", err)
+	if err := suite.WriteMarkdown(md); err != nil {
+		return fmt.Errorf("write summary: %w", err)
 	}
+	return nil
 }

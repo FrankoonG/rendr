@@ -27,7 +27,7 @@ func TestSelectedTiers(t *testing.T) {
 		{name: "tier7", cfg: runFlags{tier: "7"}, wantT7: true},
 		{name: "tier8", cfg: runFlags{tier: "8"}, wantT8: true},
 		{name: "tun-full-handled-before-tier-selection", cfg: runFlags{tunFull: true}},
-		{name: "full", cfg: runFlags{full: true}, wantT3: true, wantT4: true, wantT5: true, wantT6: true},
+		{name: "full", cfg: runFlags{full: true}, wantT3: true, wantT4: true, wantT5: true, wantT6: true, wantT7: true, wantT8: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
