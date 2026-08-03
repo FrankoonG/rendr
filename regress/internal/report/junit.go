@@ -20,6 +20,8 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/environment"
 )
 
+const EvidenceClassV1ReleaseManifest = "v1_release_manifest"
+
 // Case is one regress case (e.g. T1.go-vet, T2.G1-smoke, T3.stream.D-1×D-2).
 type Case struct {
 	Name     string
@@ -48,9 +50,8 @@ type Revision struct {
 }
 
 // Invocation identifies the selected work represented by a report. Schema v3
-// adds start/end environment provenance to the v2 selection and revision
-// identity. Consumers must also check Complete before treating a green report
-// as evidence for a release gate.
+// added environment provenance; v4 separates a complete selected component
+// from a complete release manifest.
 type Invocation struct {
 	SchemaVersion    int
 	Suite            string
@@ -72,6 +73,8 @@ type Invocation struct {
 	RevisionEnd      Revision
 	EnvironmentStart environment.Snapshot
 	EnvironmentEnd   environment.Snapshot
+	EvidenceClass    string
+	ReleaseManifest  bool
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -162,6 +165,8 @@ type xmlSuites struct {
 	EnvironmentEndID    string         `xml:"environment_end_identity,attr,omitempty"`
 	QDiscStartDigest    string         `xml:"qdisc_start_digest,attr,omitempty"`
 	QDiscEndDigest      string         `xml:"qdisc_end_digest,attr,omitempty"`
+	EvidenceClass       string         `xml:"evidence_class,attr,omitempty"`
+	ReleaseManifest     bool           `xml:"release_manifest,attr"`
 	Time                float64        `xml:"time,attr"`
 	Tests               int            `xml:"tests,attr"`
 	Failures            int            `xml:"failures,attr"`
@@ -251,6 +256,8 @@ func (s *Suite) WriteJUnit(path string) error {
 		EnvironmentEndID:    s.Invocation.EnvironmentEnd.IdentityDigest,
 		QDiscStartDigest:    s.Invocation.EnvironmentStart.QDisc.Digest,
 		QDiscEndDigest:      s.Invocation.EnvironmentEnd.QDisc.Digest,
+		EvidenceClass:       s.Invocation.EvidenceClass,
+		ReleaseManifest:     s.Invocation.ReleaseManifest,
 		Time:                time.Since(s.Started).Seconds(),
 		Properties:          properties,
 	}
@@ -353,6 +360,8 @@ func (s *Suite) WriteMarkdown(path string) error {
 	fmt.Fprintf(&buf, "- Revision start: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionStart)))
 	fmt.Fprintf(&buf, "- Revision end: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionEnd)))
 	fmt.Fprintf(&buf, "- Complete: `%t`\n", s.Complete)
+	fmt.Fprintf(&buf, "- Evidence class: `%s`\n", escapeMarkdown(s.Invocation.EvidenceClass))
+	fmt.Fprintf(&buf, "- Release manifest: `%t`\n", s.Invocation.ReleaseManifest)
 	if s.RunFailure != "" {
 		fmt.Fprintf(&buf, "- Invocation failure: `%s`\n", escapeMarkdown(s.RunFailure))
 	}
@@ -513,6 +522,20 @@ func invocationIdentityFailure(s *Suite) string {
 			}
 		}
 	}
+	if inv.SchemaVersion >= 4 {
+		if strings.TrimSpace(inv.EvidenceClass) == "" {
+			reasons = append(reasons, "evidence class is missing")
+		}
+		if inv.ReleaseManifest && inv.Scope != "full" {
+			reasons = append(reasons, "release manifest must use full scope")
+		}
+		if inv.ReleaseManifest && inv.EvidenceClass != EvidenceClassV1ReleaseManifest {
+			reasons = append(reasons, "release manifest has a non-release evidence class")
+		}
+		if !inv.ReleaseManifest && inv.EvidenceClass == EvidenceClassV1ReleaseManifest {
+			reasons = append(reasons, "release evidence class is set without a release manifest")
+		}
+	}
 	if inv.SchemaVersion >= 3 {
 		if inv.EnvironmentStart.IsZero() {
 			reasons = append(reasons, "start environment snapshot is missing")
@@ -591,6 +614,7 @@ func formatInvocation(inv Invocation) string {
 	fields := map[string]string{
 		"allow_non_linux":         fmt.Sprintf("%t", inv.AllowNonLinux),
 		"catalog_digest":          inv.CatalogDigest,
+		"evidence_class":          inv.EvidenceClass,
 		"forced":                  fmt.Sprintf("%t", inv.Forced),
 		"full":                    fmt.Sprintf("%t", inv.Full),
 		"invocation_schema":       fmt.Sprintf("%d", inv.SchemaVersion),
@@ -600,6 +624,7 @@ func formatInvocation(inv Invocation) string {
 		"revision_end_worktree":   inv.RevisionEnd.WorktreeSHA,
 		"revision_start_commit":   inv.RevisionStart.CommitSHA,
 		"revision_start_worktree": inv.RevisionStart.WorktreeSHA,
+		"release_manifest":        fmt.Sprintf("%t", inv.ReleaseManifest),
 		"scope":                   inv.Scope,
 		"selected_case_ids":       formatCaseIDs(inv.SelectedCaseIDs),
 		"selected_cases":          fmt.Sprintf("%d", inv.SelectedCases),

@@ -50,7 +50,7 @@ const (
 
 const (
 	listSchemaVersion       = 2
-	invocationSchemaVersion = 3
+	invocationSchemaVersion = 4
 	junitReportFileName     = "junit.xml"
 	markdownReportFileName  = "SUMMARY.md"
 )
@@ -651,7 +651,16 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 		CatalogDigest:   catalogDigest,
 		SelectedCases:   len(selected),
 		SelectedCaseIDs: selectedIDs,
+		EvidenceClass:   invocationEvidenceClass(suiteName),
+		ReleaseManifest: false,
 	}, nil
+}
+
+func invocationEvidenceClass(suiteName string) string {
+	if suiteName == manifest.SuiteTUN {
+		return tunSyntheticEvidenceClass
+	}
+	return normalComponentEvidenceClass
 }
 
 func invocationScope(cfg runFlags, selected []manifest.Spec) string {
@@ -803,6 +812,7 @@ const (
 	tunKindCompatibilityAlias    = "compatibility_alias"
 	tunKindCompatibilitySelector = "compatibility_selector"
 	tunSyntheticEvidenceClass    = "synthetic_l3_session_not_kernel_tun_gold"
+	normalComponentEvidenceClass = "legacy_regression_component_not_v1_release_manifest"
 	tunInvocationSuite           = "tun-full/synthetic-l3-session"
 )
 

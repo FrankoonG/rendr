@@ -397,7 +397,8 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if full.Scope != "full" || full.Forced || full.SelectedCases != 2 || !full.Full || full.TUNFull {
+	if full.Scope != "full" || full.Forced || full.SelectedCases != 2 || !full.Full || full.TUNFull ||
+		full.SchemaVersion != invocationSchemaVersion || full.EvidenceClass != normalComponentEvidenceClass || full.ReleaseManifest {
 		t.Fatalf("full identity=%+v", full)
 	}
 	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 ||
@@ -438,7 +439,8 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tun.Suite != manifest.SuiteTUN || tun.Scope != "full" || !tun.Forced || !tun.TUNFull || tun.CatalogDigest == "" {
+	if tun.Suite != manifest.SuiteTUN || tun.Scope != "full" || !tun.Forced || !tun.TUNFull || tun.CatalogDigest == "" ||
+		tun.EvidenceClass != tunSyntheticEvidenceClass || tun.ReleaseManifest {
 		t.Fatalf("TUN/forced identity=%+v", tun)
 	}
 	selector, err := buildInvocationIdentity(runFlags{tunFull: true, caseID: "legacy-selector"}, manifest.SuiteTUN, all[:1])

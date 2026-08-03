@@ -568,6 +568,77 @@ func TestInvocationSchemaV3EnvironmentValidation(t *testing.T) {
 	}
 }
 
+func TestInvocationSchemaV4SeparatesComponentAndReleaseCompleteness(t *testing.T) {
+	valid := validV2TestInvocation("case.one")
+	valid.SchemaVersion = 4
+	valid.AllowNonLinux = true
+	valid.EnvironmentStart = validReportEnvironment(t, `[{"dev":"test0","kind":"fq_codel"}]`)
+	valid.EnvironmentEnd = valid.EnvironmentStart
+	valid.EvidenceClass = "legacy_regression_component_not_v1_release_manifest"
+	complete := func(inv Invocation) *Suite {
+		return &Suite{Invocation: inv, Complete: true, Cases: []Case{{Name: "case.one"}}}
+	}
+	if failure := invocationIdentityFailure(complete(valid)); failure != "" {
+		t.Fatalf("valid v4 component invocation failed: %s", failure)
+	}
+
+	missingClass := valid
+	missingClass.EvidenceClass = ""
+	if failure := invocationIdentityFailure(complete(missingClass)); !strings.Contains(failure, "evidence class is missing") {
+		t.Fatalf("missing-class failure = %q", failure)
+	}
+
+	nonFullRelease := valid
+	nonFullRelease.ReleaseManifest = true
+	nonFullRelease.EvidenceClass = EvidenceClassV1ReleaseManifest
+	nonFullRelease.Scope = "exact"
+	nonFullRelease.Case = "case.one"
+	if failure := invocationIdentityFailure(complete(nonFullRelease)); !strings.Contains(failure, "release manifest must use full scope") {
+		t.Fatalf("non-full release failure = %q", failure)
+	}
+
+	componentClaimingRelease := valid
+	componentClaimingRelease.ReleaseManifest = true
+	if failure := invocationIdentityFailure(complete(componentClaimingRelease)); !strings.Contains(failure, "release manifest has a non-release evidence class") {
+		t.Fatalf("component release failure = %q", failure)
+	}
+
+	releaseClassWithoutManifest := valid
+	releaseClassWithoutManifest.EvidenceClass = EvidenceClassV1ReleaseManifest
+	if failure := invocationIdentityFailure(complete(releaseClassWithoutManifest)); !strings.Contains(failure, "release evidence class is set without a release manifest") {
+		t.Fatalf("release-class-only failure = %q", failure)
+	}
+
+	s := complete(valid)
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`evidence_class="legacy_regression_component_not_v1_release_manifest"`, `release_manifest="false"`} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("JUnit missing %q:\n%s", want, junit)
+		}
+	}
+	for _, want := range []string{"- Evidence class: `legacy_regression_component_not_v1_release_manifest`", "- Release manifest: `false`"} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("Markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
 func TestRunFailureIsAStandardJUnitFailure(t *testing.T) {
 	s := New()
 	s.Complete = true
