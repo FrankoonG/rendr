@@ -400,7 +400,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestSpecsOrder", "TestSpecsHaveBoundedBudgets", "TestCriticalSmokeMigrationRequests",
 			"TestSelectCaseDefsExact", "TestSelectCaseDefsInclusiveResume", "TestRunWithOptionsMissingFilter",
 			"TestAddRunPreservesSmokeEvidence", "TestAddRunPreservesInvalidSmokeOutcome", "TestAddRunCancelsAndJoinsWorkloadBeforeReporting",
-			"TestRunSelectedCasesStopsAfterMandatoryOutcome",
+			"TestRunSelectedCasesStopsAfterMandatoryOutcome", "TestRunSelectedCasesBoundsUnjoinedWorkloadAndStopsTier",
 		),
 		testPackage(regressModule+"/internal/tier3", "./internal/tier3",
 			"TestSpecsFreezeCurrentMatrix", "TestSelectSpecs", "TestExactTestPatternIsAnchoredAndQuoted",
@@ -418,7 +418,12 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestRunSelectedCasesStopsAfterUnjoinedWorkload",
 		),
 		testPackage(regressModule+"/internal/tier5", "./internal/tier5",
-			"TestUnprivilegedProbeRequestsAreExactAndMandatory", "TestT5JSONContractRejectsZeroAndSkippedTests",
+			"TestUnprivilegedProbeRequestsAreExactAndMandatory", "TestUnprivilegedProbeContractsAreFactualAndTruthful",
+			"TestRunUnprivilegedGoTestMissingSetprivIsInvalid",
+			"TestApplyProbeEvidenceRequiresStructuredFacts", "TestApplyProbeEvidenceMergesValidatedFacts",
+			"TestProbeEvidenceRejectsInvalidCapabilityAndFallbackClaims", "TestProbeEvidenceAcceptsPreciseTypedFallbackFailure",
+			"TestManualRedialAttachEvidenceFailsProductContract", "TestMandatoryProbeSkipBecomesInvalid",
+			"TestT5JSONContractRejectsZeroAndSkippedTests",
 			"TestGoTestReportCaseFailsClosed", "TestGoTestReportCaseRecordsPassEvidence",
 			"TestGoTestReportDiagnosticIsBounded", "TestRunReportsSelectionFailures",
 			"TestAddLinuxOnlySkipPreservesSelectedCases", "TestSpecsOrdered", "TestSelectCaseDefs",
@@ -460,6 +465,19 @@ func regressUnitContracts(goos string) []packageContract {
 	if goos == "linux" {
 		chaos := contractByImportPath(contracts, regressModule+"/internal/chaos")
 		chaos.Inventory = []string{"TestApplyAndCleanup", "TestApplyShapesBandwidth"}
+		tier5 := contractByImportPath(contracts, regressModule+"/internal/tier5")
+		tier5.Inventory = append(tier5.Inventory,
+			"TestTier5TCPRepairUnprivilegedPreflight",
+			"TestTier5GVisorOwnedSessionUnprivileged",
+			"TestTier5TCPRepairFailureRequiresNegotiatedFallback",
+			"TestTier5GVisorPacketCarrierOwnedSessionUnprivileged",
+		)
+		tier5.RunTests = withoutTests(tier5.Inventory,
+			"TestTier5TCPRepairUnprivilegedPreflight",
+			"TestTier5GVisorOwnedSessionUnprivileged",
+			"TestTier5TCPRepairFailureRequiresNegotiatedFallback",
+			"TestTier5GVisorPacketCarrierOwnedSessionUnprivileged",
+		)
 	}
 	smoke := contractByImportPath(contracts, regressModule+"/internal/smoke")
 	smoke.RunTests = []string{

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
@@ -160,7 +161,7 @@ func TestAddRunCancelsAndJoinsWorkloadBeforeReporting(t *testing.T) {
 		wantFailure string
 	}{
 		{name: "deadline", budget: 5 * time.Millisecond, wantFailure: "exceeded T2 budget"},
-		{name: "parent cancel", budget: time.Second, withCancel: true, wantFailure: "case canceled: context canceled"},
+		{name: "parent cancel", budget: time.Second, withCancel: true, wantFailure: "case canceled during T2 execution: context canceled"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -244,7 +245,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 			defs := syntheticCaseDefs("T2")
 			var called []string
 			suite := report.New()
-			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) report.Case {
+			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) caseexec.Outcome {
 				called = append(called, def.spec.ID)
 				rc := report.Case{Name: def.spec.ID, Tier: def.spec.Tier}
 				if def.spec.ID == "synthetic.blocker" {
@@ -252,7 +253,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 					rc.InvalidReason = tt.outcome.InvalidReason
 					rc.SkipReason = tt.outcome.SkipReason
 				}
-				return rc
+				return caseexec.Outcome{Case: rc}
 			})
 
 			if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
@@ -261,6 +262,57 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 			assertFailFastRows(t, suite.Cases, "T2")
 		})
 	}
+}
+
+func TestRunSelectedCasesBoundsUnjoinedWorkloadAndStopsTier(t *testing.T) {
+	const (
+		budget      = 20 * time.Millisecond
+		joinTimeout = 30 * time.Millisecond
+	)
+
+	release := make(chan struct{})
+	workerDone := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseWorker)
+
+	defs := syntheticCaseDefs("T2")
+	defs[1].spec.Mandatory = false // MustStop, not mandatory failure, must halt the tier.
+	var called []string
+	suite := report.New()
+	start := time.Now()
+	runSelectedCases(context.Background(), suite, defs, func(ctx context.Context, def caseDef) caseexec.Outcome {
+		called = append(called, def.spec.ID)
+		if def.spec.ID != "synthetic.blocker" {
+			return caseexec.Outcome{Case: report.Case{Name: def.spec.ID, Tier: def.spec.Tier}}
+		}
+		return runSmokeCaseWithJoinTimeout(ctx, def.spec.ID, def.spec.Tier, budget, joinTimeout, func(context.Context) smoke.Result {
+			defer close(workerDone)
+			<-release
+			return smoke.Result{Detail: map[string]any{"late_success": true}}
+		})
+	})
+	elapsed := time.Since(start)
+
+	if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
+		t.Fatalf("executed cases = %v, want %v", called, want)
+	}
+	if elapsed > budget+joinTimeout+500*time.Millisecond {
+		t.Fatalf("unjoined workload returned after %s, want budget %s plus join limit %s", elapsed, budget, joinTimeout)
+	}
+	if got := suite.Cases[1]; got.Failure != "" || !strings.Contains(got.InvalidReason, "did not return within cleanup join limit") {
+		t.Fatalf("unjoined workload result = %+v, want INVALID-only outcome", got)
+	}
+	if got := suite.Cases[1].Evidence["timeout_cleanup"]; got != "unjoined" {
+		t.Fatalf("timeout cleanup evidence = %q, want unjoined", got)
+	}
+	if got := suite.Cases[1].Evidence["timeout_join_limit"]; got != joinTimeout.String() {
+		t.Fatalf("timeout join limit evidence = %q, want %q", got, joinTimeout)
+	}
+	assertFailFastRows(t, suite.Cases, "T2")
+
+	releaseWorker()
+	waitForSignal(t, workerDone, "released workload exit")
 }
 
 func syntheticCaseDefs(tier string) []caseDef {

@@ -15,10 +15,10 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/FrankoonG/rendr"
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
@@ -165,7 +165,7 @@ func RunWithOptions(ctx context.Context, suite *report.Suite, _ string, opts Opt
 	runSelectedCases(ctx, suite, defs, executeCase)
 }
 
-type caseExecutor func(context.Context, caseDef) report.Case
+type caseExecutor func(context.Context, caseDef) caseexec.Outcome
 
 func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
 	failedCaseID := ""
@@ -174,66 +174,53 @@ func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, 
 			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		rc := execute(ctx, def)
+		outcome := execute(ctx, def)
+		rc := outcome.Case
 		suite.Add(rc)
-		if mandatoryCaseFailed(def.spec, rc) {
+		if outcome.MustStop || mandatoryCaseFailed(def.spec, rc) {
 			failedCaseID = def.spec.ID
 		}
 	}
 }
 
-func executeCase(ctx context.Context, def caseDef) report.Case {
+func executeCase(ctx context.Context, def caseDef) caseexec.Outcome {
 	if def.onlyOn != "" && def.onlyOn != runtime.GOOS {
-		return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: def.skipReason}
+		return caseexec.Outcome{Case: report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: def.skipReason}}
 	}
 	return runSmokeCase(ctx, def.spec.ID, def.spec.Tier, def.spec.Budget, def.run)
 }
 
-func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) {
-	suite.Add(runSmokeCase(ctx, name, tier, budget, fn))
+func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) caseexec.Outcome {
+	outcome := runSmokeCase(ctx, name, tier, budget, fn)
+	suite.Add(outcome.Case)
+	return outcome
 }
 
-func runSmokeCase(ctx context.Context, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) report.Case {
-	if budget <= 0 {
-		return report.Case{Name: name, Tier: tier, Failure: "T2 case has no bounded execution budget"}
-	}
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	start := time.Now()
-	done := make(chan smoke.Result, 1)
-	var workload sync.WaitGroup
-	workload.Add(1)
-	go func() {
-		defer workload.Done()
-		done <- fn(cctx)
-	}()
+func runSmokeCase(ctx context.Context, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) caseexec.Outcome {
+	return runSmokeCaseWithJoinTimeout(ctx, name, tier, budget, caseexec.DefaultJoinTimeout, fn)
+}
 
-	var smokeResult smoke.Result
-	select {
-	case smokeResult = <-done:
-	case <-cctx.Done():
-	}
-	stopErr := cctx.Err()
-	cancel()
-	workload.Wait()
-
-	result := report.Case{Name: name, Tier: tier}
-	if stopErr != nil {
-		result.Duration = time.Since(start)
-		if stopErr == context.DeadlineExceeded {
-			result.Failure = fmt.Sprintf("case exceeded T2 budget %s: %v", budget, stopErr)
-		} else {
-			result.Failure = fmt.Sprintf("case canceled: %v", stopErr)
+func runSmokeCaseWithJoinTimeout(ctx context.Context, name, tier string, budget, joinTimeout time.Duration, fn func(context.Context) smoke.Result) caseexec.Outcome {
+	var workload func(context.Context) report.Case
+	if fn != nil {
+		workload = func(ctx context.Context) report.Case {
+			smokeResult := fn(ctx)
+			return report.Case{
+				Name:          name,
+				Tier:          tier,
+				Duration:      smokeResult.Duration,
+				Failure:       smokeResult.Failure,
+				InvalidReason: smokeResult.InvalidReason,
+				Evidence:      detailEvidence(smokeResult.Detail),
+			}
 		}
-		return result
 	}
-	result.Duration = smokeResult.Duration
-	if result.Duration == 0 {
-		result.Duration = time.Since(start)
-	}
-	result.Failure = smokeResult.Failure
-	result.InvalidReason = smokeResult.InvalidReason
-	result.Evidence = detailEvidence(smokeResult.Detail)
-	return result
+	return caseexec.Run(ctx, caseexec.Config{
+		Name:        name,
+		Tier:        tier,
+		Budget:      budget,
+		JoinTimeout: joinTimeout,
+	}, workload)
 }
 
 func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
