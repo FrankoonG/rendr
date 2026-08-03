@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/pem"
 	"testing"
 	"time"
@@ -194,6 +195,28 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], rep) {
 		t.Fatalf("reply mismatch: got %q want %q", buf[:n], rep)
+	}
+
+	// quic-go's internal DATAGRAM receive queue is intentionally only 128
+	// entries. Send a larger burst before reading from the adapter to prove
+	// the dedicated ingress pump drains that queue without silently losing
+	// frames while the engine-facing reader is briefly stalled.
+	const burstFrames = 512
+	burst := make([]byte, 64)
+	for seq := uint64(0); seq < burstFrames; seq++ {
+		binary.BigEndian.PutUint64(burst, seq)
+		if _, err := client.Write(burst); err != nil {
+			t.Fatalf("burst write %d: %v", seq, err)
+		}
+	}
+	for seq := uint64(0); seq < burstFrames; seq++ {
+		n, err := server.Read(buf)
+		if err != nil {
+			t.Fatalf("burst read %d: %v", seq, err)
+		}
+		if n != len(burst) || binary.BigEndian.Uint64(buf[:8]) != seq {
+			t.Fatalf("burst frame %d: n=%d seq=%d", seq, n, binary.BigEndian.Uint64(buf[:8]))
+		}
 	}
 
 	// Counter sanity.

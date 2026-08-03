@@ -20,6 +20,14 @@ import (
 // ceiling. Larger frames must use the stream-mode adapter.
 const MaxDatagramFrame = 1200
 
+// datagramIngressQueueLen decouples quic-go's small internal DATAGRAM
+// receive queue from engine framing and reorder work. quic-go intentionally
+// drops incoming DATAGRAMs when its 128-entry queue is full; a dedicated pump
+// keeps that queue draining while this bounded queue absorbs scheduler and GC
+// stalls. At MaxDatagramFrame, the retained payload bound is about 2.4 MiB per
+// path, plus slice overhead.
+const datagramIngressQueueLen = 2048
+
 // datagramPathConn is the DATAGRAM-mode QUIC PathConn. It transports
 // rendr frames over QUIC DATAGRAM frames (RFC 9221) instead of a
 // bidirectional stream. Use when the rendr engine is in packet mode
@@ -32,6 +40,7 @@ const MaxDatagramFrame = 1200
 type datagramPathConn struct {
 	conn   *qg.Conn
 	server bool
+	recvQ  chan []byte
 
 	writeMu sync.Mutex
 
@@ -54,7 +63,12 @@ type datagramPathConn struct {
 // connection. EnableDatagrams MUST have been true on both sides for
 // the wrapped conn's SendDatagram/ReceiveDatagram calls to work.
 func wrapDatagram(conn *qg.Conn, server bool) *datagramPathConn {
-	p := &datagramPathConn{conn: conn, server: server}
+	p := &datagramPathConn{
+		conn:   conn,
+		server: server,
+		recvQ:  make(chan []byte, datagramIngressQueueLen),
+	}
+	go p.pumpDatagrams()
 	go p.watchConn()
 	return p
 }
@@ -71,9 +85,11 @@ func (p *datagramPathConn) Read(buf []byte) (int, error) {
 	if p.dead.Load() {
 		return 0, net.ErrClosed
 	}
-	data, err := p.conn.ReceiveDatagram(context.Background())
-	if err != nil {
-		p.declareDeath(err)
+	data, ok := <-p.recvQ
+	if !ok {
+		p.deathMu.Lock()
+		err := p.deathErr
+		p.deathMu.Unlock()
 		return 0, p.swallow(err)
 	}
 	p.reads.Add(1)
@@ -82,6 +98,22 @@ func (p *datagramPathConn) Read(buf []byte) (int, error) {
 		return len(buf), io.ErrShortBuffer
 	}
 	return copy(buf, data), nil
+}
+
+func (p *datagramPathConn) pumpDatagrams() {
+	defer close(p.recvQ)
+	for {
+		data, err := p.conn.ReceiveDatagram(p.conn.Context())
+		if err != nil {
+			p.declareDeath(err)
+			return
+		}
+		select {
+		case p.recvQ <- data:
+		case <-p.conn.Context().Done():
+			return
+		}
+	}
 }
 
 // Write sends frame as one DATAGRAM. Rejects oversize frames - rendr
