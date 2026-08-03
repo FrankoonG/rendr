@@ -317,7 +317,7 @@ func (s *Suite) WriteMarkdown(path string) error {
 			} else if c.SkipReason != "" {
 				result = "FAIL (mandatory skip): " + c.SkipReason
 			} else if c.Failure != "" {
-				result = "FAIL"
+				result = "FAIL: " + compactDiagnostic(c.Failure, 512)
 			}
 			evidence := escapeMarkdown(formatEvidence(c.Evidence, "=", "; "))
 			fmt.Fprintf(&buf, "| %s | %s | %s | %s |\n", escapeMarkdown(c.Name), c.Duration.Round(time.Millisecond), escapeMarkdown(result), evidence)
@@ -328,6 +328,18 @@ func (s *Suite) WriteMarkdown(path string) error {
 	overall := strings.ToUpper(reportState(s))
 	fmt.Fprintf(&buf, "**OVERALL: %s**\n", overall)
 	return writeAtomic(path, buf.Bytes())
+}
+
+func compactDiagnostic(value string, limit int) string {
+	value = strings.Join(strings.Fields(strings.ToValidUTF8(value, "?")), " ")
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	const suffix = "..."
+	if limit <= len(suffix) {
+		return suffix[:limit]
+	}
+	return value[:limit-len(suffix)] + suffix
 }
 
 func reportState(s *Suite) string {

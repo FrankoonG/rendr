@@ -330,7 +330,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestEvidenceIsDeterministicInJUnitAndMarkdown", "TestIncompleteGreenReportIsPartial",
 			"TestInvocationIdentityIsRecordedInJUnitAndMarkdown", "TestRunFailureIsAStandardJUnitFailure",
 			"TestCompleteReportWithoutInvocationIdentityFailsClosed",
-			"TestAtomicWriteReplacesExistingFile",
+			"TestAtomicWriteReplacesExistingFile", "TestMarkdownIncludesBoundedSingleLineFailure",
 		),
 		testPackage(regressModule+"/internal/runplan", "./internal/runplan",
 			"TestBuildScopes", "TestBuildExactCaseFindsOwningTier", "TestBuildResumeCrossesTierBoundaries",

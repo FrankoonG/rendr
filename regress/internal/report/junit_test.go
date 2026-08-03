@@ -272,6 +272,26 @@ func TestAtomicWriteReplacesExistingFile(t *testing.T) {
 	}
 }
 
+func TestMarkdownIncludesBoundedSingleLineFailure(t *testing.T) {
+	s := New()
+	s.Complete = true
+	s.Invocation = validTestInvocation(1)
+	s.Cases = []Case{{Name: "broken", Tier: "T1", Failure: "first line\n" + strings.Repeat("x", 700)}}
+	s.Invocation.SelectedCases = 1
+	path := filepath.Join(t.TempDir(), "SUMMARY.md")
+	if err := s.WriteMarkdown(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	if !strings.Contains(text, "FAIL: first line ") || !strings.Contains(text, "...") {
+		t.Fatalf("failure summary missing or unbounded:\n%s", text)
+	}
+}
+
 func validTestInvocation(selected int) Invocation {
 	revision := Revision{CommitSHA: "commit", WorktreeSHA: "worktree"}
 	return Invocation{
