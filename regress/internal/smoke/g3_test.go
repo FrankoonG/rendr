@@ -61,7 +61,8 @@ func TestValidateG3MeasurementsRejectsFalseGreenEvidence(t *testing.T) {
 		{name: "migration not observed", mutate: func(m *g3Measurements) { m.migrationsObserved = 2 }, wantFailure: "MigrationCount=2"},
 		{name: "corrupt packet", mutate: func(m *g3Measurements) { m.corruptPackets = 1 }, wantFailure: "integrity failures"},
 		{name: "duplicate packet", mutate: func(m *g3Measurements) { m.duplicatePackets = 1 }, wantFailure: "duplicate application"},
-		{name: "strict packet loss", mutate: func(m *g3Measurements) { m.received = 999 }, wantFailure: "exceeds budget"},
+		{name: "bitmap counter mismatch", mutate: func(m *g3Measurements) { m.missingPackets = 1 }, wantInvalid: "missing bitmap count"},
+		{name: "strict packet loss", mutate: func(m *g3Measurements) { m.received = 999; m.missingPackets = 1 }, wantFailure: "exceeds budget"},
 		{name: "latency ceiling", mutate: func(m *g3Measurements) { m.p95 = 51 * time.Millisecond }, wantFailure: "exceeds ceiling"},
 	}
 
@@ -95,6 +96,7 @@ func TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget(t *testing.T) {
 	m := g3Measurements{
 		sent:               1000,
 		received:           999,
+		missingPackets:     1,
 		sendElapsed:        time.Second,
 		latencySamples:     20,
 		p95:                time.Millisecond,
@@ -110,29 +112,31 @@ func TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget(t *testing.T) {
 
 func TestSummarizeG3MissingReportsRangesAndMigrationDistance(t *testing.T) {
 	bitmap := []uint8{1, 1, 0, 0, 1, 0, 1, 1, 0, 0}
-	got := summarizeG3Missing(bitmap, 12, []int64{4, 9}, 100)
+	got := summarizeG3Missing(bitmap, 12, []int64{4, 9}, 5)
 	if got.Count != 7 || got.RangeCount != 3 || got.RangeSample != "2-3,5,8-11" {
 		t.Fatalf("summary = %+v", got)
 	}
-	if got.SampleTruncated || got.NearestMigrationDistancePackets != 0 ||
-		got.NearMigrationPackets != 5 || got.NearMigrationWindowPackets != 1 {
+	if got.OmittedRanges != 0 || got.NearestMigrationDistancePackets != 0 ||
+		got.NearestMigrationOffsetPackets != 0 || got.BeforeMigrationWindowPackets != 2 ||
+		got.AfterMigrationWindowPackets != 3 || got.MigrationNominalWindowPackets != 1 {
 		t.Fatalf("migration correlation = %+v", got)
 	}
 }
 
 func TestSummarizeG3MissingBoundsRangeEvidence(t *testing.T) {
-	bitmap := make([]uint8, g3MissingRangeSampleLimit*2+1)
+	bitmap := make([]uint8, g3MissingRangeEdgeLimit*4+1)
 	for i := 1; i < len(bitmap); i += 2 {
 		bitmap[i] = 1
 	}
 	got := summarizeG3Missing(bitmap, int64(len(bitmap)), nil, 100_000)
-	if !got.SampleTruncated || got.RangeCount <= g3MissingRangeSampleLimit {
+	if got.OmittedRanges != 1 || got.RangeCount != g3MissingRangeEdgeLimit*2+1 {
 		t.Fatalf("summary = %+v", got)
 	}
-	if strings.Count(got.RangeSample, ",") != g3MissingRangeSampleLimit-1 {
+	if strings.Count(got.RangeSample, ",") != g3MissingRangeEdgeLimit*2 {
 		t.Fatalf("range sample = %q", got.RangeSample)
 	}
-	if got.NearestMigrationDistancePackets != -1 || got.NearMigrationPackets != 0 {
+	if got.NearestMigrationDistancePackets != -1 || got.NearestMigrationOffsetPackets != -1 ||
+		got.BeforeMigrationWindowPackets != 0 || got.AfterMigrationWindowPackets != 0 {
 		t.Fatalf("unexpected migration evidence = %+v", got)
 	}
 }
@@ -160,8 +164,18 @@ UdpLite: 0 0
 		t.Fatal(err)
 	}
 	if delta.InDatagrams != 10 || delta.OutDatagrams != 12 || delta.InErrors != 3 ||
-		delta.RcvbufErrors != 2 || delta.SndbufErrors != 1 {
+		delta.RcvbufErrors != 2 || delta.SndbufErrors != 1 || !delta.MemErrorsPresent {
 		t.Fatalf("delta = %+v", delta)
+	}
+	const oldKernelFixture = `Udp: IgnoredMulti InCsumErrors SndbufErrors RcvbufErrors OutDatagrams InErrors NoPorts InDatagrams FutureColumn
+Udp: 3 0 1 5 110 7 2 100 999
+`
+	oldKernel, err := parseG3HostUDPStats(strings.NewReader(oldKernelFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldKernel.MemErrorsPresent || oldKernel.InDatagrams != 100 || oldKernel.IgnoredMulti != 3 {
+		t.Fatalf("old-kernel stats = %+v", oldKernel)
 	}
 }
 
@@ -170,6 +184,7 @@ func TestParseG3HostUDPStatsRejectsMalformedEvidence(t *testing.T) {
 		"Tcp: A B\nTcp: 1 2\n",
 		"Udp: InDatagrams OutDatagrams\nUdp: 1\n",
 		"Udp: InDatagrams\nUdp: nope\n",
+		"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors\nUdp: 1 2 3 4 5 6 7\n",
 	}
 	for _, fixture := range tests {
 		if _, err := parseG3HostUDPStats(strings.NewReader(fixture)); err == nil {
@@ -179,5 +194,22 @@ func TestParseG3HostUDPStatsRejectsMalformedEvidence(t *testing.T) {
 	before := g3HostUDPStats{InDatagrams: 2}
 	if _, err := deltaG3HostUDPStats(before, g3HostUDPStats{InDatagrams: 1}); err == nil {
 		t.Fatal("decreasing counters unexpectedly accepted")
+	}
+
+	detail := make(map[string]any)
+	addG3UDPStatsEvidence(detail,
+		g3HostUDPStats{}, g3UDPStatsUnsupported, nil,
+		g3HostUDPStats{}, g3UDPStatsUnsupported, nil,
+	)
+	if detail["udp_snmp_status"] != g3UDPStatsUnsupported || detail["udp_snmp_scope"] != "network_namespace" {
+		t.Fatalf("unsupported evidence = %+v", detail)
+	}
+	detail = make(map[string]any)
+	addG3UDPStatsEvidence(detail,
+		g3HostUDPStats{InDatagrams: 2}, g3UDPStatsOK, nil,
+		g3HostUDPStats{InDatagrams: 1}, g3UDPStatsOK, nil,
+	)
+	if detail["udp_snmp_status"] != g3UDPStatsCounterReset {
+		t.Fatalf("counter-reset evidence = %+v", detail)
 	}
 }

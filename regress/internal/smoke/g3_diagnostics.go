@@ -8,30 +8,45 @@ import (
 	"strings"
 )
 
-const g3MissingRangeSampleLimit = 32
+const (
+	g3MissingRangeEdgeLimit = 16
+	g3MigrationWindowMillis = 200
+
+	g3UDPStatsOK           = "ok"
+	g3UDPStatsUnsupported  = "unsupported"
+	g3UDPStatsReadError    = "read_error"
+	g3UDPStatsParseError   = "parse_error"
+	g3UDPStatsCounterReset = "counter_reset"
+)
 
 type g3MissingSummary struct {
 	Count                           int64
 	RangeCount                      int
 	RangeSample                     string
-	SampleTruncated                 bool
+	OmittedRanges                   int
 	NearestMigrationDistancePackets int64
-	NearMigrationPackets            int64
-	NearMigrationWindowPackets      int64
+	NearestMigrationOffsetPackets   int64
+	BeforeMigrationWindowPackets    int64
+	AfterMigrationWindowPackets     int64
+	MigrationNominalWindowPackets   int64
 }
 
 func summarizeG3Missing(bitmap []uint8, sent int64, migrationSequences []int64, pps int) g3MissingSummary {
-	summary := g3MissingSummary{NearestMigrationDistancePackets: -1}
+	summary := g3MissingSummary{
+		NearestMigrationDistancePackets: -1,
+		NearestMigrationOffsetPackets:   -1,
+	}
 	if sent <= 0 {
 		return summary
 	}
 	window := int64(1)
-	if pps > 100 {
-		window = int64(pps / 100) // 10 ms at the configured packet rate.
+	if pps >= 5 {
+		window = int64(pps) * g3MigrationWindowMillis / 1000
 	}
-	summary.NearMigrationWindowPackets = window
+	summary.MigrationNominalWindowPackets = window
 
-	ranges := make([]string, 0, g3MissingRangeSampleLimit)
+	firstRanges := make([]string, 0, g3MissingRangeEdgeLimit)
+	lastRanges := make([]string, 0, g3MissingRangeEdgeLimit)
 	for seq := int64(0); seq < sent; {
 		if seq < int64(len(bitmap)) && bitmap[seq] != 0 {
 			seq++
@@ -40,44 +55,70 @@ func summarizeG3Missing(bitmap []uint8, sent int64, migrationSequences []int64, 
 		start := seq
 		for seq < sent && (seq >= int64(len(bitmap)) || bitmap[seq] == 0) {
 			summary.Count++
-			if distance, ok := nearestG3MigrationDistance(seq, migrationSequences); ok {
+			if offset, ok := nearestG3MigrationOffset(seq, migrationSequences); ok {
+				distance := offset
+				if distance < 0 {
+					distance = -distance
+				}
 				if summary.NearestMigrationDistancePackets < 0 || distance < summary.NearestMigrationDistancePackets {
 					summary.NearestMigrationDistancePackets = distance
+					summary.NearestMigrationOffsetPackets = offset
 				}
 				if distance <= window {
-					summary.NearMigrationPackets++
+					if offset < 0 {
+						summary.BeforeMigrationWindowPackets++
+					} else {
+						summary.AfterMigrationWindowPackets++
+					}
 				}
 			}
 			seq++
 		}
 		end := seq - 1
+		rangeText := formatG3SequenceRange(start, end)
 		summary.RangeCount++
-		if len(ranges) < g3MissingRangeSampleLimit {
-			if start == end {
-				ranges = append(ranges, strconv.FormatInt(start, 10))
-			} else {
-				ranges = append(ranges, fmt.Sprintf("%d-%d", start, end))
-			}
+		if len(firstRanges) < g3MissingRangeEdgeLimit {
+			firstRanges = append(firstRanges, rangeText)
+		} else if len(lastRanges) < g3MissingRangeEdgeLimit {
+			lastRanges = append(lastRanges, rangeText)
 		} else {
-			summary.SampleTruncated = true
+			copy(lastRanges, lastRanges[1:])
+			lastRanges[len(lastRanges)-1] = rangeText
 		}
 	}
-	summary.RangeSample = strings.Join(ranges, ",")
+
+	parts := append([]string(nil), firstRanges...)
+	if summary.RangeCount > len(firstRanges)+len(lastRanges) {
+		summary.OmittedRanges = summary.RangeCount - len(firstRanges) - len(lastRanges)
+		parts = append(parts, fmt.Sprintf("...(%d omitted)...", summary.OmittedRanges))
+	}
+	parts = append(parts, lastRanges...)
+	summary.RangeSample = strings.Join(parts, ",")
 	return summary
 }
 
-func nearestG3MigrationDistance(seq int64, migrations []int64) (int64, bool) {
-	var nearest int64
+func formatG3SequenceRange(start, end int64) string {
+	if start == end {
+		return strconv.FormatInt(start, 10)
+	}
+	return fmt.Sprintf("%d-%d", start, end)
+}
+
+func nearestG3MigrationOffset(seq int64, migrations []int64) (int64, bool) {
+	var nearestOffset int64
+	var nearestDistance int64
 	for i, migration := range migrations {
-		distance := seq - migration
+		offset := seq - migration
+		distance := offset
 		if distance < 0 {
 			distance = -distance
 		}
-		if i == 0 || distance < nearest {
-			nearest = distance
+		if i == 0 || distance < nearestDistance {
+			nearestOffset = offset
+			nearestDistance = distance
 		}
 	}
-	return nearest, len(migrations) > 0
+	return nearestOffset, len(migrations) > 0
 }
 
 func formatG3Sequences(sequences []int64) string {
@@ -89,15 +130,16 @@ func formatG3Sequences(sequences []int64) string {
 }
 
 type g3HostUDPStats struct {
-	InDatagrams  uint64
-	NoPorts      uint64
-	InErrors     uint64
-	OutDatagrams uint64
-	RcvbufErrors uint64
-	SndbufErrors uint64
-	InCsumErrors uint64
-	IgnoredMulti uint64
-	MemErrors    uint64
+	InDatagrams      uint64
+	NoPorts          uint64
+	InErrors         uint64
+	OutDatagrams     uint64
+	RcvbufErrors     uint64
+	SndbufErrors     uint64
+	InCsumErrors     uint64
+	IgnoredMulti     uint64
+	MemErrors        uint64
+	MemErrorsPresent bool
 }
 
 func parseG3HostUDPStats(r io.Reader) (g3HostUDPStats, error) {
@@ -124,16 +166,27 @@ func parseG3HostUDPStats(r io.Reader) (g3HostUDPStats, error) {
 			}
 			parsed[name] = value
 		}
+		required := []string{
+			"InDatagrams", "NoPorts", "InErrors", "OutDatagrams",
+			"RcvbufErrors", "SndbufErrors", "InCsumErrors", "IgnoredMulti",
+		}
+		for _, name := range required {
+			if _, ok := parsed[name]; !ok {
+				return g3HostUDPStats{}, fmt.Errorf("/proc/net/snmp UDP missing required column %s", name)
+			}
+		}
+		memErrors, memErrorsPresent := parsed["MemErrors"]
 		return g3HostUDPStats{
-			InDatagrams:  parsed["InDatagrams"],
-			NoPorts:      parsed["NoPorts"],
-			InErrors:     parsed["InErrors"],
-			OutDatagrams: parsed["OutDatagrams"],
-			RcvbufErrors: parsed["RcvbufErrors"],
-			SndbufErrors: parsed["SndbufErrors"],
-			InCsumErrors: parsed["InCsumErrors"],
-			IgnoredMulti: parsed["IgnoredMulti"],
-			MemErrors:    parsed["MemErrors"],
+			InDatagrams:      parsed["InDatagrams"],
+			NoPorts:          parsed["NoPorts"],
+			InErrors:         parsed["InErrors"],
+			OutDatagrams:     parsed["OutDatagrams"],
+			RcvbufErrors:     parsed["RcvbufErrors"],
+			SndbufErrors:     parsed["SndbufErrors"],
+			InCsumErrors:     parsed["InCsumErrors"],
+			IgnoredMulti:     parsed["IgnoredMulti"],
+			MemErrors:        memErrors,
+			MemErrorsPresent: memErrorsPresent,
 		}, nil
 	}
 	if err := scanner.Err(); err != nil {
@@ -147,10 +200,10 @@ func deltaG3HostUDPStats(before, after g3HostUDPStats) (g3HostUDPStats, error) {
 		after.InErrors < before.InErrors || after.OutDatagrams < before.OutDatagrams ||
 		after.RcvbufErrors < before.RcvbufErrors || after.SndbufErrors < before.SndbufErrors ||
 		after.InCsumErrors < before.InCsumErrors || after.IgnoredMulti < before.IgnoredMulti ||
-		after.MemErrors < before.MemErrors {
-		return g3HostUDPStats{}, fmt.Errorf("host UDP counters decreased during case")
+		(before.MemErrorsPresent && after.MemErrorsPresent && after.MemErrors < before.MemErrors) {
+		return g3HostUDPStats{}, fmt.Errorf("network namespace UDP counters decreased during case")
 	}
-	return g3HostUDPStats{
+	delta := g3HostUDPStats{
 		InDatagrams:  after.InDatagrams - before.InDatagrams,
 		NoPorts:      after.NoPorts - before.NoPorts,
 		InErrors:     after.InErrors - before.InErrors,
@@ -159,37 +212,48 @@ func deltaG3HostUDPStats(before, after g3HostUDPStats) (g3HostUDPStats, error) {
 		SndbufErrors: after.SndbufErrors - before.SndbufErrors,
 		InCsumErrors: after.InCsumErrors - before.InCsumErrors,
 		IgnoredMulti: after.IgnoredMulti - before.IgnoredMulti,
-		MemErrors:    after.MemErrors - before.MemErrors,
-	}, nil
+	}
+	if before.MemErrorsPresent && after.MemErrorsPresent {
+		delta.MemErrors = after.MemErrors - before.MemErrors
+		delta.MemErrorsPresent = true
+	}
+	return delta, nil
 }
 
 func addG3UDPStatsEvidence(detail map[string]any,
-	before g3HostUDPStats, beforeAvailable bool, beforeErr error,
-	after g3HostUDPStats, afterAvailable bool, afterErr error,
+	before g3HostUDPStats, beforeStatus string, beforeErr error,
+	after g3HostUDPStats, afterStatus string, afterErr error,
 ) {
-	statsAvailable := beforeAvailable && afterAvailable && beforeErr == nil && afterErr == nil
-	detail["host_udp_stats_available"] = statsAvailable
-	detail["host_udp_stats_scope"] = "host_wide"
+	detail["udp_snmp_scope"] = "network_namespace"
+	status := beforeStatus
+	if status == g3UDPStatsOK {
+		status = afterStatus
+	}
 	if beforeErr != nil {
-		detail["host_udp_stats_before_error"] = beforeErr.Error()
+		detail["udp_snmp_before_error"] = beforeErr.Error()
 	}
 	if afterErr != nil {
-		detail["host_udp_stats_after_error"] = afterErr.Error()
+		detail["udp_snmp_after_error"] = afterErr.Error()
 	}
-	if !statsAvailable {
+	if status != g3UDPStatsOK {
+		detail["udp_snmp_status"] = status
 		return
 	}
 	delta, err := deltaG3HostUDPStats(before, after)
 	if err != nil {
-		detail["host_udp_stats_delta_error"] = err.Error()
+		detail["udp_snmp_status"] = g3UDPStatsCounterReset
+		detail["udp_snmp_delta_error"] = err.Error()
 		return
 	}
-	detail["host_udp_in_datagrams_delta"] = delta.InDatagrams
-	detail["host_udp_out_datagrams_delta"] = delta.OutDatagrams
-	detail["host_udp_in_errors_delta"] = delta.InErrors
-	detail["host_udp_rcvbuf_errors_delta"] = delta.RcvbufErrors
-	detail["host_udp_sndbuf_errors_delta"] = delta.SndbufErrors
-	detail["host_udp_no_ports_delta"] = delta.NoPorts
-	detail["host_udp_checksum_errors_delta"] = delta.InCsumErrors
-	detail["host_udp_memory_errors_delta"] = delta.MemErrors
+	detail["udp_snmp_status"] = g3UDPStatsOK
+	detail["udp_in_datagrams_delta"] = delta.InDatagrams
+	detail["udp_out_datagrams_delta"] = delta.OutDatagrams
+	detail["udp_in_errors_delta"] = delta.InErrors
+	detail["udp_rcvbuf_errors_delta"] = delta.RcvbufErrors
+	detail["udp_sndbuf_errors_delta"] = delta.SndbufErrors
+	detail["udp_no_ports_delta"] = delta.NoPorts
+	detail["udp_checksum_errors_delta"] = delta.InCsumErrors
+	if delta.MemErrorsPresent {
+		detail["udp_memory_errors_delta"] = delta.MemErrors
+	}
 }

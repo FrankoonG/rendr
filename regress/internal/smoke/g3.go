@@ -76,6 +76,7 @@ func (o *G3Opts) withDefaults() {
 type g3Measurements struct {
 	sent               int64
 	received           int64
+	missingPackets     int64
 	sendElapsed        time.Duration
 	latencySamples     int
 	p95                time.Duration
@@ -121,6 +122,9 @@ func validateG3Measurements(opts G3Opts, m g3Measurements) (invalidReason, failu
 	}
 	if m.received < 0 || m.received > m.sent {
 		return fmt.Sprintf("invalid delivery counters: sent=%d received=%d", m.sent, m.received), ""
+	}
+	if want := m.sent - m.received; m.missingPackets != want {
+		return fmt.Sprintf("missing bitmap count=%d, want sent-received=%d", m.missingPackets, want), ""
 	}
 	minimumSamples := g3MinimumSamples
 	if expected := int(m.received / g3LatencySampleEvery); expected > minimumSamples {
@@ -208,7 +212,6 @@ func isTimeoutError(err error) bool {
 func RunG3(ctx context.Context, opts G3Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
-	udpStatsBefore, udpStatsBeforeAvailable, udpStatsBeforeErr := readG3HostUDPStats()
 	name := fmt.Sprintf("G3-smoke (%d pps, %s, %d paths bond, %d migrations)",
 		opts.PPS, opts.Duration, opts.Paths, opts.Migrations)
 	targetPacketsFloat := float64(opts.PPS) * opts.Duration.Seconds()
@@ -295,6 +298,7 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		expected = 1000
 	}
 	recvBmp := make([]uint8, expected)
+	udpStatsBefore, udpStatsBeforeStatus, udpStatsBeforeErr := readG3HostUDPStats()
 	sendEpoch := time.Now()
 	recvOutcome := make(chan g3ReceiveOutcome, 1)
 	sendDone := make(chan struct{})
@@ -429,7 +433,7 @@ sendLoop:
 	close(sendDone)
 	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
 	receivedOutcome := <-recvOutcome
-	udpStatsAfter, udpStatsAfterAvailable, udpStatsAfterErr := readG3HostUDPStats()
+	udpStatsAfter, udpStatsAfterStatus, udpStatsAfterErr := readG3HostUDPStats()
 	gotLat := receivedOutcome.latencies
 
 	dur := time.Since(t0)
@@ -479,39 +483,42 @@ sendLoop:
 	missing := summarizeG3Missing(recvBmp, sent, migrationSequences, opts.PPS)
 
 	detail := map[string]any{
-		"target_pps":                     opts.PPS,
-		"pps_sent":                       ppsSent,
-		"pps_received":                   ppsReceived,
-		"send_elapsed_ms":                float64(sendElapsed) / float64(time.Millisecond),
-		"sent":                           sent,
-		"received":                       received,
-		"loss_pct":                       lossPct,
-		"loss_budget_pct":                opts.LossPct,
-		"migration_attempts":             migrationAttempts,
-		"migration_errors":               migrationErrors,
-		"migration_sequences":            formatG3Sequences(migrationSequences),
-		"migrations":                     migrations,
-		"latency_samples":                len(gotLat),
-		"p50_ms":                         float64(p50) / float64(time.Millisecond),
-		"p95_ms":                         float64(p95) / float64(time.Millisecond),
-		"p99_ms":                         float64(p99) / float64(time.Millisecond),
-		"max_ms":                         float64(maxN) / float64(time.Millisecond),
-		"malformed_packets":              receivedOutcome.malformedPackets,
-		"corrupt_packets":                receivedOutcome.corruptPackets,
-		"duplicate_packets":              receivedOutcome.duplicatePackets,
-		"out_of_range_packets":           receivedOutcome.outOfRangePackets,
-		"path_writers":                   pathWriters,
-		"wire_writes":                    wireWrites,
-		"missing_packets":                missing.Count,
-		"missing_range_count":            missing.RangeCount,
-		"missing_range_sample":           missing.RangeSample,
-		"missing_range_sample_truncated": missing.SampleTruncated,
+		"target_pps":            opts.PPS,
+		"pps_sent":              ppsSent,
+		"pps_received":          ppsReceived,
+		"send_elapsed_ms":       float64(sendElapsed) / float64(time.Millisecond),
+		"sent":                  sent,
+		"received":              received,
+		"loss_pct":              lossPct,
+		"loss_budget_pct":       opts.LossPct,
+		"migration_attempts":    migrationAttempts,
+		"migration_errors":      migrationErrors,
+		"migration_sequences":   formatG3Sequences(migrationSequences),
+		"migrations":            migrations,
+		"latency_samples":       len(gotLat),
+		"p50_ms":                float64(p50) / float64(time.Millisecond),
+		"p95_ms":                float64(p95) / float64(time.Millisecond),
+		"p99_ms":                float64(p99) / float64(time.Millisecond),
+		"max_ms":                float64(maxN) / float64(time.Millisecond),
+		"malformed_packets":     receivedOutcome.malformedPackets,
+		"corrupt_packets":       receivedOutcome.corruptPackets,
+		"duplicate_packets":     receivedOutcome.duplicatePackets,
+		"out_of_range_packets":  receivedOutcome.outOfRangePackets,
+		"path_writers":          pathWriters,
+		"wire_writes":           wireWrites,
+		"missing_packets":       missing.Count,
+		"missing_range_count":   missing.RangeCount,
+		"missing_range_sample":  missing.RangeSample,
+		"missing_range_omitted": missing.OmittedRanges,
 		"missing_nearest_migration_distance_packets": missing.NearestMigrationDistancePackets,
-		"missing_near_migration_packets":             missing.NearMigrationPackets,
-		"missing_near_migration_window_packets":      missing.NearMigrationWindowPackets,
+		"missing_nearest_migration_offset_packets":   missing.NearestMigrationOffsetPackets,
+		"missing_before_migration_window_packets":    missing.BeforeMigrationWindowPackets,
+		"missing_after_migration_window_packets":     missing.AfterMigrationWindowPackets,
+		"missing_migration_nominal_window_packets":   missing.MigrationNominalWindowPackets,
+		"missing_migration_nominal_window_ms":        200,
 	}
-	addG3UDPStatsEvidence(detail, udpStatsBefore, udpStatsBeforeAvailable, udpStatsBeforeErr,
-		udpStatsAfter, udpStatsAfterAvailable, udpStatsAfterErr)
+	addG3UDPStatsEvidence(detail, udpStatsBefore, udpStatsBeforeStatus, udpStatsBeforeErr,
+		udpStatsAfter, udpStatsAfterStatus, udpStatsAfterErr)
 	r := Result{
 		Name:     name,
 		Duration: dur,
@@ -528,6 +535,7 @@ sendLoop:
 	r.InvalidReason, r.Failure = validateG3Measurements(opts, g3Measurements{
 		sent:               sent,
 		received:           received,
+		missingPackets:     missing.Count,
 		sendElapsed:        sendElapsed,
 		latencySamples:     len(gotLat),
 		p95:                time.Duration(p95),

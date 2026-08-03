@@ -7,11 +7,14 @@ import (
 	"os"
 )
 
-func readG3HostUDPStats() (g3HostUDPStats, bool, error) {
+func readG3HostUDPStats() (g3HostUDPStats, string, error) {
 	data, err := os.ReadFile("/proc/net/snmp")
 	if err != nil {
-		return g3HostUDPStats{}, true, err
+		return g3HostUDPStats{}, g3UDPStatsReadError, err
 	}
 	stats, err := parseG3HostUDPStats(bytes.NewReader(data))
-	return stats, true, err
+	if err != nil {
+		return g3HostUDPStats{}, g3UDPStatsParseError, err
+	}
+	return stats, g3UDPStatsOK, nil
 }
