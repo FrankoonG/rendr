@@ -33,6 +33,7 @@ const (
 	g1SmokeMigrations     = 3
 	g2SmokeMigrations     = 5
 	g2RaceSmokeMigrations = -1
+	g3SmokeLossPct        = 0.5
 )
 
 // Options filters the tier2 smoke cases.
@@ -87,7 +88,9 @@ var caseDefs = []caseDef{
 		onlyOn:     "linux",
 		skipReason: "Linux only (sysctl net.core.rmem_max=8MiB for 30k pps QUIC DATAGRAM)",
 		run: func(ctx context.Context) smoke.Result {
-			return smoke.RunG3(ctx, smoke.G3Opts{})
+			// Phase 1 keeps its historical sub-1% smoke budget explicit.
+			// A zero value now means strict zero loss and is used by T4.
+			return smoke.RunG3(ctx, smoke.G3Opts{LossPct: g3SmokeLossPct})
 		},
 	},
 	{spec: manifest.RequiredWithBudget("G4", "T2", g4G5SmokeBudget), run: func(ctx context.Context) smoke.Result {
@@ -176,6 +179,7 @@ func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget 
 			result.Duration = time.Since(start)
 		}
 		result.Failure = r.Failure
+		result.InvalidReason = r.InvalidReason
 		result.Evidence = detailEvidence(r.Detail)
 	case <-cctx.Done():
 		result.Duration = time.Since(start)

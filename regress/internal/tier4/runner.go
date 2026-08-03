@@ -221,6 +221,7 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	case r := <-done:
 		rc.Duration = r.Duration
 		rc.Failure = r.Failure
+		rc.InvalidReason = r.InvalidReason
 		rc.Evidence = evidenceFromDetail(r.Detail)
 		if rc.Duration == 0 {
 			rc.Duration = time.Since(start)

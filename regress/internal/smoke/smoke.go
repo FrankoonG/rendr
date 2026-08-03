@@ -18,6 +18,10 @@ type Result struct {
 	Duration time.Duration
 	// Empty Failure means the run passed all internal asserts.
 	Failure string
+	// InvalidReason means the harness did not establish its stimulus,
+	// target load, or minimum evidence. Invalid is distinct from a
+	// product failure, but both must fail a mandatory release gate.
+	InvalidReason string
 	// Detail is free-form context for the report (throughput, RTT
 	// percentiles, migration count, etc.). Each Run* function
 	// documents its keys.

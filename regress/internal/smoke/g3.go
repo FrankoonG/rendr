@@ -3,17 +3,21 @@ package smoke
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math"
+	"net"
 	"runtime"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr"
 )
 
-// G3Opts configures one G3-smoke case (QUIC DATAGRAM at high pps +
-// ConnID migrations). Defaults match docs/regression-suite.md §6:
+// G3Opts configures one G3-smoke case (QUIC DATAGRAM at high pps plus
+// rendr packet-path transitions). This smoke does not prove RFC 9000
+// Connection ID or NAT rebinding; the release Gold case needs an external
+// packet-capture oracle for that. Defaults match docs/regression-suite.md §6:
 // 30k pps × ~6s with ≥3 migrations. Needs Linux + sysctl
 // net.core.rmem_max=8MiB; the tier2 dispatch already SKIPs on
 // non-Linux.
@@ -30,6 +34,14 @@ type G3Opts struct {
 	LossPct float64
 }
 
+const (
+	g3LatencySampleEvery  = 100
+	g3MinimumSamples      = 20
+	g3MinimumOfferedRatio = 0.95
+	g3PacketIntegrityMask = uint64(0xd6e8feb86659fd93)
+	g3MaximumPackets      = 100_000_000
+)
+
 func (o *G3Opts) withDefaults() {
 	if o.Duration <= 0 {
 		o.Duration = 5 * time.Second
@@ -45,11 +57,10 @@ func (o *G3Opts) withDefaults() {
 	if o.PayloadLen <= 0 {
 		o.PayloadLen = 1024
 	}
-	if o.Migrations < 0 {
-		o.Migrations = 0
-	}
 	if o.Migrations == 0 {
 		o.Migrations = 3
+	} else if o.Migrations < 0 {
+		o.Migrations = 0
 	}
 	if o.Paths < 1 {
 		o.Paths = 4
@@ -60,17 +71,123 @@ func (o *G3Opts) withDefaults() {
 	if o.LossPct < 0 {
 		o.LossPct = 0
 	}
-	if o.LossPct == 0 {
-		// Tolerate sub-1% loss from Go-runtime timer granularity
-		// (1ms tick at 5k pps = up to 5 packets per tick burst, the
-		// receiver-side drainer goroutine may miss some at migration
-		// boundaries). Smoke-level; T4 long-run tightens to 0%.
-		o.LossPct = 0.5
+}
+
+type g3Measurements struct {
+	sent               int64
+	received           int64
+	sendElapsed        time.Duration
+	latencySamples     int
+	p95                time.Duration
+	migrationAttempts  int
+	migrationErrors    int
+	migrationsObserved uint64
+	malformedPackets   int64
+	corruptPackets     int64
+	duplicatePackets   int64
+	outOfRangePackets  int64
+	pathWriters        int
+	wireWrites         uint64
+}
+
+type g3ReceiveOutcome struct {
+	latencies         []int64
+	uniquePackets     int64
+	malformedPackets  int64
+	corruptPackets    int64
+	duplicatePackets  int64
+	outOfRangePackets int64
+	err               error
+}
+
+// validateG3Measurements separates invalid harness evidence from observed
+// product failures. A mandatory case fails closed for either outcome, but the
+// distinction prevents an underpowered sender from being reported as a fast,
+// lossless transport.
+func validateG3Measurements(opts G3Opts, m g3Measurements) (invalidReason, failure string) {
+	if m.sent <= 0 {
+		return "sender produced no packets", ""
+	}
+	if m.sendElapsed <= 0 {
+		return fmt.Sprintf("sender elapsed=%s, want >0", m.sendElapsed), ""
+	}
+	offered := float64(m.sent) / m.sendElapsed.Seconds()
+	if math.IsNaN(offered) || math.IsInf(offered, 0) {
+		return fmt.Sprintf("offered pps is not finite: %v", offered), ""
+	}
+	if ratio := offered / float64(opts.PPS); ratio < g3MinimumOfferedRatio {
+		return fmt.Sprintf("offered load %.0fpps is %.1f%% of %dpps target; want >=%.0f%%",
+			offered, ratio*100, opts.PPS, g3MinimumOfferedRatio*100), ""
+	}
+	if m.received < 0 || m.received > m.sent {
+		return fmt.Sprintf("invalid delivery counters: sent=%d received=%d", m.sent, m.received), ""
+	}
+	minimumSamples := g3MinimumSamples
+	if expected := int(m.received / g3LatencySampleEvery); expected > minimumSamples {
+		minimumSamples = expected * 9 / 10
+	}
+	if m.latencySamples < minimumSamples {
+		return fmt.Sprintf("latency samples=%d, want >=%d", m.latencySamples, minimumSamples), ""
+	}
+	if m.migrationAttempts != opts.Migrations {
+		return fmt.Sprintf("migration stimulus attempts=%d, want exactly %d", m.migrationAttempts, opts.Migrations), ""
+	}
+	if opts.Paths > 1 && m.pathWriters < 2 {
+		return fmt.Sprintf("paths carrying frames=%d, want >=2", m.pathWriters), ""
+	}
+	if m.wireWrites < uint64(m.sent) {
+		return fmt.Sprintf("wire write delta=%d is below application packets=%d", m.wireWrites, m.sent), ""
+	}
+	if m.migrationErrors > 0 {
+		return "", fmt.Sprintf("migration requests rejected=%d", m.migrationErrors)
+	}
+	if opts.Migrations > 0 && m.migrationsObserved < uint64(opts.Migrations) {
+		return "", fmt.Sprintf("MigrationCount=%d, want >=%d", m.migrationsObserved, opts.Migrations)
+	}
+	if m.malformedPackets > 0 || m.corruptPackets > 0 || m.outOfRangePackets > 0 {
+		return "", fmt.Sprintf("packet integrity failures: malformed=%d corrupt=%d out_of_range=%d",
+			m.malformedPackets, m.corruptPackets, m.outOfRangePackets)
+	}
+	if m.duplicatePackets > 0 {
+		return "", fmt.Sprintf("duplicate application packets=%d", m.duplicatePackets)
+	}
+	lost := m.sent - m.received
+	lossPct := float64(lost) / float64(m.sent) * 100
+	if math.IsNaN(lossPct) || math.IsInf(lossPct, 0) {
+		return fmt.Sprintf("loss percentage is not finite: %v", lossPct), ""
+	}
+	if lossPct > opts.LossPct {
+		return "", fmt.Sprintf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.LossPct)
+	}
+	if m.p95 < 0 {
+		return fmt.Sprintf("P95 latency=%s, want >=0", m.p95), ""
+	}
+	if m.p95 > time.Duration(opts.P95CeilingMs)*time.Millisecond {
+		return "", fmt.Sprintf("P95 %.1fms exceeds ceiling %dms",
+			float64(m.p95)/float64(time.Millisecond), opts.P95CeilingMs)
+	}
+	return "", ""
+}
+
+func invalidG3Result(name string, started time.Time, reason string, detail map[string]any) Result {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	return Result{
+		Name:          name,
+		Duration:      time.Since(started),
+		InvalidReason: reason,
+		Detail:        detail,
 	}
 }
 
-// RunG3 drives one G3-smoke case end-to-end. The wire shape is
-// rendr packet-mode over QUIC DATAGRAM paths (multi-path bond),
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// RunG3 drives one packet-mode smoke case end-to-end. The wire shape is
+// rendr packet-mode over independent QUIC DATAGRAM paths (multi-path bond),
 // each application packet = 8B seq prefix + payload. Asserts:
 //   - application-visible loss ≤ LossPct (default 0)
 //   - P95 (recv-time - send-time) under ceiling (default 50ms)
@@ -93,6 +210,15 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 	t0 := time.Now()
 	name := fmt.Sprintf("G3-smoke (%d pps, %s, %d paths bond, %d migrations)",
 		opts.PPS, opts.Duration, opts.Paths, opts.Migrations)
+	targetPacketsFloat := float64(opts.PPS) * opts.Duration.Seconds()
+	if targetPacketsFloat < 1 || targetPacketsFloat > g3MaximumPackets {
+		return invalidG3Result(name, t0,
+			fmt.Sprintf("target packet count %.0f outside [1,%d]", targetPacketsFloat, g3MaximumPackets), nil)
+	}
+	if opts.PayloadLen+8 < 24 {
+		return invalidG3Result(name, t0,
+			fmt.Sprintf("wire packet length=%d, want >=24 for sequence, timestamp, and integrity marker", opts.PayloadLen+8), nil)
+	}
 
 	ln, err := rendr.ListenQUICDatagram("127.0.0.1:0", nil)
 	if err != nil {
@@ -145,132 +271,170 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	if gotClient, gotServer := len(client.Paths()), len(server.Paths()); gotClient < opts.Paths || gotServer < opts.Paths {
+		return invalidG3Result(name, t0,
+			fmt.Sprintf("path attach incomplete: client=%d server=%d want=%d", gotClient, gotServer, opts.Paths),
+			map[string]any{"client_paths": gotClient, "server_paths": gotServer})
+	}
 
 	admin, ok := client.(rendr.AdminPacketConn)
 	if !ok {
 		return FromError(name, time.Since(t0), fmt.Errorf("client is not rendr.AdminPacketConn"))
 	}
+	pathWritesBefore := make(map[uint32]uint64, opts.Paths)
+	for _, path := range admin.Stats().Paths {
+		pathWritesBefore[path.ID] = path.Writes
+	}
 
-	// Server receiver: single-writer, lock-free. The mutex+map
-	// approach used previously bottlenecked at ~5k pps recv (map
-	// hash + sync.Mutex Lock/Unlock cost ~5-10µs per packet),
-	// causing 96 % loss at 100k pps. For T4-scale we use a flat
-	// byte slice as a presence bitmap and sample latencies every N.
-	// The recv goroutine is the sole writer; main reads after
-	// close(recvDone) which provides the happens-before barrier.
-	expected := int(opts.PPS) * int(opts.Duration.Seconds()*2)
+	// The receiver is single-writer and uses a bounded presence bitmap.
+	// It sends one immutable outcome after the sender closes; the channel
+	// handoff is the happens-before barrier for bitmap and latency reads.
+	expected := int(math.Ceil(targetPacketsFloat*1.25)) + 1
 	if expected < 1000 {
 		expected = 1000
 	}
 	recvBmp := make([]uint8, expected)
-	const latSampleEvery = 100
-	latNs := make([]int64, 0, expected/latSampleEvery+8)
-	recvDone := make(chan struct{})
+	sendEpoch := time.Now()
+	recvOutcome := make(chan g3ReceiveOutcome, 1)
 	sendDone := make(chan struct{})
 	go func() {
-		defer close(recvDone)
+		outcome := g3ReceiveOutcome{
+			latencies: make([]int64, 0, expected/g3LatencySampleEvery+8),
+		}
+		defer func() { recvOutcome <- outcome }()
 		buf := make([]byte, opts.PayloadLen+8)
-		idleDeadline := time.Now().Add(opts.Duration + 5*time.Second)
-		_ = server.SetReadDeadline(idleDeadline)
-		var rxCount int64
+		_ = server.SetReadDeadline(time.Now().Add(opts.Duration + 10*time.Second))
+		draining := false
 		for {
 			n, _, err := server.ReadFrom(buf)
 			if err != nil {
+				select {
+				case <-sendDone:
+					if !isTimeoutError(err) {
+						outcome.err = err
+					}
+				default:
+					outcome.err = err
+				}
 				return
 			}
-			select {
-			case <-sendDone:
-				// After the sender stops, keep draining until we hit a
-				// short idle gap. Setting the deadline to "now" drops
-				// packets still queued in rendr/quic-go and overstates
-				// application loss at the tail.
-				idleDeadline = time.Now().Add(5 * time.Second)
-				_ = server.SetReadDeadline(idleDeadline)
-			default:
+			if !draining {
+				select {
+				case <-sendDone:
+					draining = true
+					// Keep one fixed tail window. Re-extending it on every
+					// packet could let stray traffic keep the case alive forever.
+					_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+				default:
+				}
 			}
-			if n < 16 {
+			if n != len(buf) {
+				outcome.malformedPackets++
 				continue
 			}
 			seq := binary.BigEndian.Uint64(buf[:8])
-			if seq < uint64(len(recvBmp)) {
-				recvBmp[seq] = 1
+			if seq >= uint64(len(recvBmp)) {
+				outcome.outOfRangePackets++
+				continue
 			}
-			if rxCount%latSampleEvery == 0 {
-				sentNs := int64(binary.BigEndian.Uint64(buf[8:16]))
-				latency := time.Now().UnixNano() - sentNs
-				latNs = append(latNs, latency)
+			if marker := binary.BigEndian.Uint64(buf[n-8:]); marker != seq^g3PacketIntegrityMask {
+				outcome.corruptPackets++
+				continue
 			}
-			rxCount++
+			if recvBmp[seq] != 0 {
+				outcome.duplicatePackets++
+				continue
+			}
+			recvBmp[seq] = 1
+			if outcome.uniquePackets%g3LatencySampleEvery == 0 {
+				sentElapsed := time.Duration(binary.BigEndian.Uint64(buf[8:16]))
+				latency := time.Since(sendEpoch) - sentElapsed
+				if latency < 0 {
+					outcome.corruptPackets++
+				} else {
+					outcome.latencies = append(outcome.latencies, int64(latency))
+				}
+			}
+			outcome.uniquePackets++
 		}
 	}()
 
-	// Migration scheduler: trigger Migrations spread evenly.
-	migInterval := opts.Duration / time.Duration(opts.Migrations+1)
-	migTicker := time.NewTicker(migInterval)
-	defer migTicker.Stop()
-
-	// Sender: paced loop.
+	// Sender: paced loop. Migration points are tied to produced packets,
+	// so an underpowered sender cannot claim it exercised every transition.
 	pktInterval := time.Second / time.Duration(opts.PPS)
-	payload := make([]byte, opts.PayloadLen)
 	pkt := make([]byte, opts.PayloadLen+8)
-	copy(pkt[16:], payload[8:]) // keep 16B header (seq + send_ns), rest payload
-
 	var sent int64
 	startMig := admin.MigrationCount()
-	endAt := time.Now().Add(opts.Duration)
-	nextTick := time.Now()
+	migrationAttempts := 0
+	migrationErrors := 0
+	nextMigration := 1
+	targetPackets := int64(math.Ceil(targetPacketsFloat))
+	sendStarted := time.Now()
+	endAt := sendStarted.Add(opts.Duration)
+	nextTick := sendStarted
+	writeFailure := ""
 
-	for time.Now().Before(endAt) {
-		select {
-		case <-migTicker.C:
+sendLoop:
+	for {
+		if err := ctx.Err(); err != nil {
+			writeFailure = "sender context: " + err.Error()
+			break
+		}
+		if !time.Now().Before(endAt) {
+			break
+		}
+		for nextMigration <= opts.Migrations && sent >= targetPackets*int64(nextMigration)/int64(opts.Migrations+1) {
+			migrationAttempts++
 			cur := admin.ActivePath()
-			for _, p := range client.Paths() {
-				if p.ID != cur {
-					_ = admin.Migrate(p.ID)
-					break
+			migrated := false
+			for _, path := range client.Paths() {
+				if path.ID == cur {
+					continue
 				}
+				if err := admin.Migrate(path.ID); err != nil {
+					migrationErrors++
+				}
+				migrated = true
+				break
 			}
-		default:
+			if !migrated {
+				migrationErrors++
+			}
+			nextMigration++
 		}
 		paceUntil(nextTick)
-		nextTick = nextTick.Add(pktInterval)
-		binary.BigEndian.PutUint64(pkt[:8], uint64(sent))
-		binary.BigEndian.PutUint64(pkt[8:16], uint64(time.Now().UnixNano()))
-		if _, err := client.WriteTo(pkt, nil); err != nil {
-			// Buffer exhausted on the sender side or socket gone.
-			// Treat as test failure since the contract says no
-			// application-visible error during migration.
-			return FromError(name, time.Since(t0), fmt.Errorf("WriteTo at seq %d: %w", sent, err))
+		if !time.Now().Before(endAt) {
+			break
 		}
-		atomic.AddInt64(&sent, 1)
+		nextTick = nextTick.Add(pktInterval)
+		seq := uint64(sent)
+		binary.BigEndian.PutUint64(pkt[:8], seq)
+		binary.BigEndian.PutUint64(pkt[8:16], uint64(time.Since(sendEpoch)))
+		binary.BigEndian.PutUint64(pkt[len(pkt)-8:], seq^g3PacketIntegrityMask)
+		n, err := client.WriteTo(pkt, nil)
+		if err != nil {
+			writeFailure = fmt.Sprintf("WriteTo at seq %d: %v", sent, err)
+			break sendLoop
+		}
+		if n != len(pkt) {
+			writeFailure = fmt.Sprintf("short WriteTo at seq %d: wrote %d of %d", sent, n, len(pkt))
+			break sendLoop
+		}
+		sent++
 	}
+	sendElapsed := time.Since(sendStarted)
 	close(sendDone)
 	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-	<-recvDone
-
-	// recvBmp / latNs were written exclusively by the recv goroutine;
-	// close(recvDone) is the happens-before fence that lets us read
-	// here without a lock.
-	gotLat := latNs
+	receivedOutcome := <-recvOutcome
+	gotLat := receivedOutcome.latencies
 
 	dur := time.Since(t0)
-	lost := int64(0)
-	cap := int64(len(recvBmp))
-	limit := sent
-	if limit > cap {
-		limit = cap
+	received := receivedOutcome.uniquePackets
+	lost := sent - received
+	lossPct := math.NaN()
+	if sent > 0 {
+		lossPct = float64(lost) / float64(sent) * 100
 	}
-	for s := int64(0); s < limit; s++ {
-		if recvBmp[s] == 0 {
-			lost++
-		}
-	}
-	// Any seqs beyond recvBmp's capacity are counted as lost (would
-	// indicate sender PPS exceeded the 2x preallocated headroom).
-	if sent > cap {
-		lost += sent - cap
-	}
-	lossPct := float64(lost) / float64(sent) * 100
 
 	sort.Slice(gotLat, func(i, j int) bool { return gotLat[i] < gotLat[j] })
 	idx := func(p int) int64 {
@@ -291,37 +455,76 @@ func RunG3(ctx context.Context, opts G3Opts) Result {
 		maxN = gotLat[len(gotLat)-1]
 	}
 	migrations := admin.MigrationCount() - startMig
-	received := sent - lost
+	pathWriters := 0
+	var wireWrites uint64
+	for _, path := range admin.Stats().Paths {
+		before := pathWritesBefore[path.ID]
+		if path.Writes <= before {
+			continue
+		}
+		delta := path.Writes - before
+		pathWriters++
+		wireWrites += delta
+	}
+	ppsSent := float64(0)
+	ppsReceived := float64(0)
+	if sendElapsed > 0 {
+		ppsSent = float64(sent) / sendElapsed.Seconds()
+		ppsReceived = float64(received) / sendElapsed.Seconds()
+	}
 
 	r := Result{
 		Name:     name,
 		Duration: dur,
 		Detail: map[string]any{
-			"pps_sent":     float64(sent) / dur.Seconds(),
-			"pps_received": float64(received) / dur.Seconds(),
-			"sent":         sent,
-			"received":     received,
-			"loss_pct":     lossPct,
-			"migrations":   migrations,
-			"p50_ms":       float64(p50) / float64(time.Millisecond),
-			"p95_ms":       float64(p95) / float64(time.Millisecond),
-			"p99_ms":       float64(p99) / float64(time.Millisecond),
-			"max_ms":       float64(maxN) / float64(time.Millisecond),
+			"target_pps":           opts.PPS,
+			"pps_sent":             ppsSent,
+			"pps_received":         ppsReceived,
+			"send_elapsed_ms":      float64(sendElapsed) / float64(time.Millisecond),
+			"sent":                 sent,
+			"received":             received,
+			"loss_pct":             lossPct,
+			"loss_budget_pct":      opts.LossPct,
+			"migration_attempts":   migrationAttempts,
+			"migration_errors":     migrationErrors,
+			"migrations":           migrations,
+			"latency_samples":      len(gotLat),
+			"p50_ms":               float64(p50) / float64(time.Millisecond),
+			"p95_ms":               float64(p95) / float64(time.Millisecond),
+			"p99_ms":               float64(p99) / float64(time.Millisecond),
+			"max_ms":               float64(maxN) / float64(time.Millisecond),
+			"malformed_packets":    receivedOutcome.malformedPackets,
+			"corrupt_packets":      receivedOutcome.corruptPackets,
+			"duplicate_packets":    receivedOutcome.duplicatePackets,
+			"out_of_range_packets": receivedOutcome.outOfRangePackets,
+			"path_writers":         pathWriters,
+			"wire_writes":          wireWrites,
 		},
 	}
-	if lossPct > opts.LossPct {
-		r.Failure = fmt.Sprintf("loss %.3f%% exceeds budget %.3f%%", lossPct, opts.LossPct)
+	if writeFailure != "" {
+		r.Failure = writeFailure
 		return r
 	}
-	if int(p95/int64(time.Millisecond)) > opts.P95CeilingMs {
-		r.Failure = fmt.Sprintf("P95 %.1fms exceeds ceiling %dms",
-			float64(p95)/float64(time.Millisecond), opts.P95CeilingMs)
+	if receivedOutcome.err != nil {
+		r.Failure = "receiver: " + receivedOutcome.err.Error()
 		return r
 	}
-	if opts.Migrations > 0 && migrations < uint64(opts.Migrations) {
-		r.Failure = fmt.Sprintf("MigrationCount=%d, want >= %d", migrations, opts.Migrations)
-		return r
-	}
+	r.InvalidReason, r.Failure = validateG3Measurements(opts, g3Measurements{
+		sent:               sent,
+		received:           received,
+		sendElapsed:        sendElapsed,
+		latencySamples:     len(gotLat),
+		p95:                time.Duration(p95),
+		migrationAttempts:  migrationAttempts,
+		migrationErrors:    migrationErrors,
+		migrationsObserved: migrations,
+		malformedPackets:   receivedOutcome.malformedPackets,
+		corruptPackets:     receivedOutcome.corruptPackets,
+		duplicatePackets:   receivedOutcome.duplicatePackets,
+		outOfRangePackets:  receivedOutcome.outOfRangePackets,
+		pathWriters:        pathWriters,
+		wireWrites:         wireWrites,
+	})
 	return r
 }
 

@@ -107,6 +107,16 @@ func TestAddRunPreservesSmokeEvidence(t *testing.T) {
 	}
 }
 
+func TestAddRunPreservesInvalidSmokeOutcome(t *testing.T) {
+	suite := report.New()
+	addRun(context.Background(), suite, "invalid", "T2", time.Second, func(context.Context) smoke.Result {
+		return smoke.Result{InvalidReason: "offered load below target"}
+	})
+	if got := suite.Cases[0]; got.InvalidReason != "offered load below target" || got.Failure != "" {
+		t.Fatalf("case=%+v want invalid-only outcome", got)
+	}
+}
+
 func TestAddRunEnforcesBudget(t *testing.T) {
 	suite := report.New()
 	release := make(chan struct{})
