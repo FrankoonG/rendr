@@ -367,17 +367,13 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 	if err != nil {
 		return failedCase(name, start, fmt.Errorf("chaos.Apply: %w", err))
 	}
-	defer func() {
-		if cleanup != nil {
-			_ = cleanup()
-		}
-	}()
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	done := make(chan report.Case, 1)
 	go func() {
 		done <- fn(cctx)
 	}()
+	var result report.Case
 	select {
 	case c := <-done:
 		if c.Name == "" {
@@ -389,9 +385,25 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 		if c.Duration == 0 {
 			c.Duration = time.Since(start)
 		}
-		return c
+		result = c
 	case <-cctx.Done():
-		return failedCase(name, start, fmt.Errorf("case exceeded T4 budget %s: %w", budget, cctx.Err()))
+		result = failedCase(name, start, fmt.Errorf("case exceeded T4 budget %s: %w", budget, cctx.Err()))
+	}
+	applyT4CleanupResult(&result, cleanup)
+	return result
+}
+
+func applyT4CleanupResult(rc *report.Case, cleanup func() error) {
+	if rc == nil || cleanup == nil {
+		return
+	}
+	if err := cleanup(); err != nil {
+		message := "chaos cleanup failed: " + err.Error()
+		if rc.Failure != "" {
+			rc.Failure += "; " + message
+			return
+		}
+		rc.InvalidReason = message
 	}
 }
 

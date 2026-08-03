@@ -210,14 +210,6 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 		suite.Add(rc)
 		return
 	}
-	defer func() {
-		if cleanup != nil {
-			if err := cleanup(); err != nil {
-				fmt.Printf("  > T4/%s — chaos cleanup failed: %v\n", name, err)
-			}
-		}
-	}()
-
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	start := time.Now()
@@ -236,12 +228,29 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 		rc.Duration = time.Since(start)
 		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
 	}
+	applyCleanupResult(&rc, cleanup)
 	if rc.Failure != "" {
 		fmt.Printf("  > T4/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
+	} else if rc.InvalidReason != "" {
+		fmt.Printf("  > T4/%s (took %s) — INVALID: %s\n", name, rc.Duration, rc.InvalidReason)
 	} else {
 		fmt.Printf("  > T4/%s (took %s) — OK\n", name, rc.Duration)
 	}
 	suite.Add(rc)
+}
+
+func applyCleanupResult(rc *report.Case, cleanup func() error) {
+	if rc == nil || cleanup == nil {
+		return
+	}
+	if err := cleanup(); err != nil {
+		message := "chaos cleanup failed: " + err.Error()
+		if rc.Failure != "" {
+			rc.Failure += "; " + message
+			return
+		}
+		rc.InvalidReason = message
+	}
 }
 
 func profDesc(p chaos.Profile) string {

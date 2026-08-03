@@ -2,6 +2,7 @@ package tier4
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -113,6 +114,27 @@ func TestSelectCaseDefs(t *testing.T) {
 			}
 			if got := defIDs(defs); !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("selected IDs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyCleanupResultFailsClosed(t *testing.T) {
+	tests := []struct {
+		name        string
+		initial     report.Case
+		wantFailure string
+		wantInvalid string
+	}{
+		{name: "passing case becomes invalid", wantInvalid: "chaos cleanup failed: cleanup boom"},
+		{name: "failure retains both causes", initial: report.Case{Failure: "case boom"}, wantFailure: "case boom; chaos cleanup failed: cleanup boom"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rc := tt.initial
+			applyCleanupResult(&rc, func() error { return errors.New("cleanup boom") })
+			if rc.Failure != tt.wantFailure || rc.InvalidReason != tt.wantInvalid {
+				t.Fatalf("case=%+v want failure=%q invalid=%q", rc, tt.wantFailure, tt.wantInvalid)
 			}
 		})
 	}

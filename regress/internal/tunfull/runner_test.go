@@ -2,6 +2,7 @@ package tunfull
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -246,6 +247,20 @@ func TestUnimplementedCaseFails(t *testing.T) {
 	c := UnimplementedCase("")
 	if c.Name != "TUN-full-not-implemented" || c.Tier != "T7" || c.Failure == "" {
 		t.Fatalf("bad unimplemented case: %+v", c)
+	}
+}
+
+func TestApplyT4CleanupResultFailsClosed(t *testing.T) {
+	rc := report.Case{Name: "case", Tier: "T7"}
+	applyT4CleanupResult(&rc, func() error { return errors.New("cleanup boom") })
+	if rc.Failure != "" || rc.InvalidReason != "chaos cleanup failed: cleanup boom" {
+		t.Fatalf("case=%+v", rc)
+	}
+
+	rc = report.Case{Name: "case", Tier: "T7", Failure: "case boom"}
+	applyT4CleanupResult(&rc, func() error { return errors.New("cleanup boom") })
+	if rc.Failure != "case boom; chaos cleanup failed: cleanup boom" || rc.InvalidReason != "" {
+		t.Fatalf("failed case=%+v", rc)
 	}
 }
 
