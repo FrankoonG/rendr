@@ -1906,18 +1906,48 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		waitPacketPaths(ctx, serverAdmin, opts.paths)
 	}
 
-	// The first packet creates the L3 session. Consume it before taking
-	// counters so bootstrap traffic cannot masquerade as measured load.
-	bootstrap := make([]byte, opts.payloadLen+64)
-	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, _, err := server.ReadFrom(bootstrap)
-	if err != nil {
-		return failedCase(opts.name, start, fmt.Errorf("drain bootstrap packet: %w", err))
+	peerPacketConn := newTunG3PeerPacketConn()
+	peerEgress := &tunG3PeerEgress{conn: peerPacketConn}
+	egresses := l3ingress.NewEgressRegistry()
+	if err := egresses.Register("direct", peerEgress); err != nil {
+		return failedCase(opts.name, start, fmt.Errorf("register peer egress: %w", err))
 	}
-	_ = server.SetReadDeadline(time.Time{})
-	if n != opts.payloadLen || binary.BigEndian.Uint64(bootstrap[:8]) != ^uint64(0) {
+	peerCtx, peerCancel := context.WithCancel(ctx)
+	defer peerCancel()
+	peerErr := make(chan error, 1)
+	go func() {
+		peerErr <- (&l3session.UDPPeerRelay{
+			PacketConn: server,
+			Egresses:   egresses,
+			BufferSize: opts.payloadLen + 128,
+		}).Run(peerCtx)
+	}()
+
+	// The first packet creates the L3 session. Consume it before taking
+	// counters so bootstrap traffic cannot masquerade as measured load. The
+	// packet must traverse the production peer envelope decoder and egress
+	// registry before it reaches this fixture-owned observer.
+	var bootstrap []byte
+	select {
+	case bootstrap = <-peerPacketConn.bootstrap:
+	case err := <-peerErr:
+		if err == nil {
+			err = errors.New("peer relay stopped before bootstrap")
+		}
+		return failedCase(opts.name, start, fmt.Errorf("peer relay before bootstrap: %w", err))
+	case <-time.After(5 * time.Second):
+		return failedCase(opts.name, start, fmt.Errorf("peer egress bootstrap timeout"))
+	}
+	if len(bootstrap) != opts.payloadLen || binary.BigEndian.Uint64(bootstrap[:8]) != ^uint64(0) ||
+		binary.BigEndian.Uint64(bootstrap[len(bootstrap)-8:]) != ^uint64(0)^tunG3PacketIntegrityMask {
 		return invalidTUNG3Case(opts.name, start,
-			fmt.Sprintf("bootstrap packet mismatch: bytes=%d sequence=%d", n, binary.BigEndian.Uint64(bootstrap[:8])), nil)
+			fmt.Sprintf("peer egress bootstrap mismatch: bytes=%d sequence=%d", len(bootstrap), binary.BigEndian.Uint64(bootstrap[:8])), nil)
+	}
+	peerDials, peerIdentity := peerEgress.snapshot()
+	if peerDials != 1 || peerIdentity != id || peerPacketConn.bootstrapCount.Load() != 1 {
+		return invalidTUNG3Case(opts.name, start,
+			fmt.Sprintf("peer egress dispatch evidence mismatch: dials=%d bootstrap=%d identity=%s want=%s",
+				peerDials, peerPacketConn.bootstrapCount.Load(), peerIdentity, id), nil)
 	}
 
 	pathsBefore := admin.Stats().Paths
@@ -1931,67 +1961,9 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	}
 
 	expected := int(math.Ceil(targetPacketsFloat*1.25)) + 1
-	recvBmp := make([]uint8, expected)
 	sendEpoch := time.Now()
-	recvOutcome := make(chan tunG3ReceiveOutcome, 1)
-	sendDone := make(chan struct{})
-	go func() {
-		outcome := tunG3ReceiveOutcome{latencies: make([]time.Duration, 0, expected/tunG3LatencySampleEvery+8)}
-		defer func() { recvOutcome <- outcome }()
-		buf := make([]byte, opts.payloadLen+64)
-		_ = server.SetReadDeadline(time.Now().Add(opts.duration + 10*time.Second))
-		draining := false
-		for {
-			n, _, err := server.ReadFrom(buf)
-			if err != nil {
-				select {
-				case <-sendDone:
-					if !isNetTimeout(err) {
-						outcome.err = err
-					}
-				default:
-					outcome.err = err
-				}
-				return
-			}
-			if !draining {
-				select {
-				case <-sendDone:
-					draining = true
-					_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-				default:
-				}
-			}
-			if n != opts.payloadLen {
-				outcome.malformedPackets++
-				continue
-			}
-			seq := binary.BigEndian.Uint64(buf[:8])
-			if seq >= uint64(len(recvBmp)) {
-				outcome.outOfRangePackets++
-				continue
-			}
-			if marker := binary.BigEndian.Uint64(buf[n-8 : n]); marker != seq^tunG3PacketIntegrityMask {
-				outcome.corruptPackets++
-				continue
-			}
-			if recvBmp[seq] != 0 {
-				outcome.duplicatePackets++
-				continue
-			}
-			recvBmp[seq] = 1
-			if seq%tunG3LatencySampleEvery == 0 {
-				sentElapsed := time.Duration(binary.BigEndian.Uint64(buf[8:16]))
-				latency := time.Since(sendEpoch) - sentElapsed
-				if latency < 0 {
-					outcome.corruptPackets++
-				} else {
-					outcome.latencies = append(outcome.latencies, latency)
-				}
-			}
-			outcome.uniquePackets++
-		}
-	}()
+	collector := newTunG3Collector(expected, opts.payloadLen, sendEpoch)
+	peerPacketConn.setObserver(collector.observe)
 
 	startMig := admin.MigrationCount()
 	targetPackets := int64(math.Ceil(targetPacketsFloat))
@@ -2035,10 +2007,14 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		sent++
 	}
 	sendElapsed := time.Since(sendStarted)
-	close(sendDone)
-	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-	receivedOutcome := <-recvOutcome
+	drainDeadline := time.Now().Add(5 * time.Second)
+	for collector.deliveredPackets() < sent && time.Now().Before(drainDeadline) {
+		time.Sleep(time.Millisecond)
+	}
 	relay.CloseFlow(id)
+	peerCancel()
+	peerRunErr := waitRelayErr(peerErr, 5*time.Second)
+	receivedOutcome := collector.snapshot()
 
 	sort.Slice(receivedOutcome.latencies, func(i, j int) bool {
 		return receivedOutcome.latencies[i] < receivedOutcome.latencies[j]
@@ -2094,6 +2070,10 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 			"out_of_range_packets": fmt.Sprintf("%d", receivedOutcome.outOfRangePackets),
 			"per_path_wire_writes": formatTUNG3PathWrites(perPathWrites),
 			"wire_writes":          fmt.Sprintf("%d", wireWrites),
+			"peer_egress":          "direct",
+			"peer_egress_dials":    fmt.Sprintf("%d", peerDials),
+			"peer_egress_packets":  fmt.Sprintf("%d", collector.processedPackets()),
+			"peer_identity_match":  fmt.Sprintf("%t", peerIdentity == id),
 			"g3_semantics":         "synthetic_l3session_quic_datagram_not_rfc9000_cid_gold",
 		},
 	}
@@ -2103,6 +2083,10 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	}
 	if receivedOutcome.err != nil {
 		rc.Failure = "receiver: " + receivedOutcome.err.Error()
+		return rc
+	}
+	if peerRunErr != nil {
+		rc.Failure = "peer relay: " + peerRunErr.Error()
 		return rc
 	}
 	rc.InvalidReason, rc.Failure = validateTUNG3Measurements(opts, tunG3Measurements{
