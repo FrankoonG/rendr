@@ -380,6 +380,7 @@ func regressUnitContracts(goos string) []packageContract {
 		),
 		testPackage(regressModule+"/internal/tier4", "./internal/tier4",
 			"TestRunReportsSelectionFailures", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestExecuteCasePreflightFailureIsInvalid",
 			"TestApplyCleanupResultFailsClosed", "TestEvidenceFromDetailPreservesFacts",
 			"TestRunSelectedCasesStopsAfterMandatoryOutcome", "TestCleanupCompletesBeforeFailFastDecision",
 		),
