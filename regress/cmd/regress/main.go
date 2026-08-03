@@ -750,7 +750,9 @@ type tunSelection struct {
 	runOrder []string
 }
 
-var runTUNCase = tunfull.Run
+var runTUNCase = func(ctx context.Context, suite *report.Suite, rendrRoot string, opts tunfull.Options) {
+	tunfull.RunCanonicalCase(ctx, suite, rendrRoot, opts.Case)
+}
 
 type tunCatalogEntry struct {
 	listed listedCase
@@ -1039,7 +1041,7 @@ func specsForPlan(plan runplan.Plan, byTier func(string) []manifest.Spec) ([]man
 		if len(tierSpecs) == 0 {
 			return nil, fmt.Errorf("list plan references unknown or empty tier %q", run.Tier)
 		}
-		specs, err := manifest.Select(tierSpecs, run.Case, run.FromCase)
+		specs, err := manifest.SelectWithPrerequisites(tierSpecs, run.Case, run.FromCase)
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %w", run.Tier, err)
 		}
@@ -1056,7 +1058,7 @@ func specsForTierRun(run runplan.TierRun) ([]manifest.Spec, error) {
 	if len(specs) == 0 {
 		return nil, fmt.Errorf("unknown or empty tier %q", run.Tier)
 	}
-	selected, err := manifest.Select(specs, run.Case, run.FromCase)
+	selected, err := manifest.SelectWithPrerequisites(specs, run.Case, run.FromCase)
 	if err != nil {
 		return nil, fmt.Errorf("select %s: %w", run.Tier, err)
 	}

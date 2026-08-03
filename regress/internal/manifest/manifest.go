@@ -79,6 +79,12 @@ func Validate(specs []Spec) error {
 					spec.ID, spec.Suite, required.ID, required.Suite,
 				)
 			}
+			if required.Tier != spec.Tier {
+				return fmt.Errorf(
+					"manifest: case %q in tier %q requires cross-tier prerequisite %q in tier %q",
+					spec.ID, spec.Tier, required.ID, required.Tier,
+				)
+			}
 		}
 	}
 
@@ -163,6 +169,16 @@ func Select(specs []Spec, caseID, fromCaseID string) ([]Spec, error) {
 	return nil, fmt.Errorf("manifest: no case matched --from-case=%q", fromCaseID)
 }
 
+// SelectWithPrerequisites applies an exact or inclusive-suffix selection and
+// expands the selected cases with every transitive prerequisite.
+func SelectWithPrerequisites(registry []Spec, caseID, fromCaseID string) ([]Spec, error) {
+	selected, err := Select(registry, caseID, fromCaseID)
+	if err != nil {
+		return nil, err
+	}
+	return WithPrerequisites(registry, selected)
+}
+
 // WithPrerequisites prepends the transitive prerequisites of selected cases.
 // The registry is authoritative: prerequisites follow its canonical order and
 // selected cases retain their first-occurrence order. The result contains each
@@ -193,36 +209,27 @@ func WithPrerequisites(registry, selected []Spec) ([]Spec, error) {
 		selectedIDs = append(selectedIDs, spec.ID)
 	}
 
-	required := make(map[string]struct{})
-	var collect func(string)
-	collect = func(id string) {
-		for _, requiredID := range byID[id].Requires {
-			if _, ok := required[requiredID]; ok {
-				continue
-			}
-			required[requiredID] = struct{}{}
-			collect(requiredID)
+	result := make([]Spec, 0, len(selectedIDs))
+	added := make(map[string]struct{}, len(registry))
+	var add func(string)
+	add = func(id string) {
+		if _, ok := added[id]; ok {
+			return
 		}
-	}
-	for _, id := range selectedIDs {
-		collect(id)
-	}
-
-	result := make([]Spec, 0, len(required)+len(selectedIDs))
-	added := make(map[string]struct{}, cap(result))
-	for _, spec := range registry {
-		if _, ok := required[spec.ID]; !ok {
-			continue
+		spec := byID[id]
+		for _, candidate := range registry {
+			for _, requiredID := range spec.Requires {
+				if candidate.ID == requiredID {
+					add(requiredID)
+					break
+				}
+			}
 		}
 		result = append(result, cloneSpec(spec))
-		added[spec.ID] = struct{}{}
+		added[id] = struct{}{}
 	}
 	for _, id := range selectedIDs {
-		if _, ok := added[id]; ok {
-			continue
-		}
-		result = append(result, cloneSpec(byID[id]))
-		added[id] = struct{}{}
+		add(id)
 	}
 	return result, nil
 }

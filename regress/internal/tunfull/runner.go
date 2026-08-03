@@ -140,7 +140,7 @@ func selectCaseDefsFrom(defs []caseDef, opts Options) ([]caseDef, error) {
 	if err := validateCaseDefs(defs); err != nil {
 		return nil, err
 	}
-	selected, err := manifest.Select(specsFrom(defs), opts.Case, opts.FromCase)
+	selected, err := manifest.SelectWithPrerequisites(specsFrom(defs), opts.Case, opts.FromCase)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +195,22 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		return
 	}
 	runCaseDefs(ctx, suite, rendrRoot, defs)
+}
+
+// RunCanonicalCase executes one canonical case without expanding dependencies.
+// The CLI uses it only after constructing and validating a closed run order.
+func RunCanonicalCase(ctx context.Context, suite *report.Suite, rendrRoot, caseID string) {
+	if err := validateCaseDefs(caseDefs); err != nil {
+		suite.Add(report.Case{Name: caseID, Tier: "T7", Failure: "invalid TUN canonical registry: " + err.Error()})
+		return
+	}
+	for _, def := range caseDefs {
+		if def.spec.ID == caseID {
+			runCaseDefs(ctx, suite, rendrRoot, []caseDef{def})
+			return
+		}
+	}
+	suite.Add(report.Case{Name: caseID, Tier: "T7", Failure: fmt.Sprintf("unknown canonical TUN case %q", caseID)})
 }
 
 func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef) {

@@ -11,14 +11,14 @@ func testSpecs() []Spec {
 	a := RequiredWithBudget("A", "T1", time.Second)
 	b := RequiredWithBudget("B", "T1", time.Second)
 	b.Requires = []string{"A"}
-	c := RequiredWithBudget("C", "T2", time.Second)
+	c := RequiredWithBudget("C", "T1", time.Second)
 	c.Requires = []string{"B"}
 	return []Spec{a, b, c}
 }
 
 func testRegistry() []Spec {
 	specs := testSpecs()
-	d := RequiredWithBudget("D", "T2", time.Second)
+	d := RequiredWithBudget("D", "T1", time.Second)
 	d.Requires = []string{"A"}
 	tun := Spec{
 		ID:        "TUN",
@@ -40,6 +40,21 @@ func TestSelectExactAndResume(t *testing.T) {
 		{name: "all", want: []string{"A", "B", "C"}},
 		{name: "exact remains exact", one: "C", want: []string{"C"}},
 		{name: "resume remains an inclusive suffix", from: "B", want: []string{"B", "C"}},
+	}
+
+	exact, err := SelectWithPrerequisites(testSpecs(), "C", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specIDs(exact); !reflect.DeepEqual(got, []string{"A", "B", "C"}) {
+		t.Fatalf("exact closure=%v", got)
+	}
+	resumed, err := SelectWithPrerequisites(testSpecs(), "", "C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specIDs(resumed); !reflect.DeepEqual(got, []string{"A", "B", "C"}) {
+		t.Fatalf("resume closure=%v", got)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,6 +199,14 @@ func TestValidateRejectsManifestMutations(t *testing.T) {
 			want: "cross-suite prerequisite",
 		},
 		{
+			name: "cross-tier prerequisite",
+			mutate: func(specs []Spec) []Spec {
+				specs[1].Tier = "T2"
+				return specs
+			},
+			want: "cross-tier prerequisite",
+		},
+		{
 			name: "self cycle",
 			mutate: func(specs []Spec) []Spec {
 				specs[0].Requires = []string{"A"}
@@ -227,7 +250,7 @@ func TestWithPrerequisitesPrependsTransitiveClosure(t *testing.T) {
 		{
 			name:     "canonical prerequisite and selected order",
 			selected: []Spec{registry[3], registry[2]},
-			want:     []string{"A", "B", "D", "C"},
+			want:     []string{"A", "D", "B", "C"},
 		},
 		{
 			name:     "selected prerequisite and repeated selections deduplicate",
@@ -249,6 +272,19 @@ func TestWithPrerequisitesPrependsTransitiveClosure(t *testing.T) {
 				t.Fatalf("ids=%v want %v", gotIDs, tt.want)
 			}
 		})
+	}
+
+	independent := RequiredWithBudget("independent", "T1", time.Second)
+	prerequisite := RequiredWithBudget("prerequisite", "T1", time.Second)
+	dependent := RequiredWithBudget("dependent", "T1", time.Second)
+	dependent.Requires = []string{prerequisite.ID}
+	full := []Spec{independent, prerequisite, dependent}
+	got, err := WithPrerequisites(full, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIDs := specIDs(got); !reflect.DeepEqual(gotIDs, []string{"independent", "prerequisite", "dependent"}) {
+		t.Fatalf("full closure reordered canonical selection: %v", gotIDs)
 	}
 }
 

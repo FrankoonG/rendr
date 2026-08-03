@@ -121,11 +121,11 @@ func TestSelectCaseDefs(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "default canonical order", want: defaultCaseIDs},
-		{name: "exact visible", opts: Options{Case: caseG3Smoke}, want: []string{caseG3Smoke}},
+		{name: "exact visible", opts: Options{Case: caseG3Smoke}, want: []string{caseKernelTUNPreflight, caseG3Smoke}},
 		{
 			name: "inclusive resume",
 			opts: Options{FromCase: caseG5PathRecovery},
-			want: []string{caseG5PathRecovery, caseT3XrayMatrix, caseT4G1, caseT4G2, caseT4G3, caseT5AdapterMatrix, caseT6Selector},
+			want: []string{caseKernelTUNPreflight, caseG5PathRecovery, caseT3XrayMatrix, caseT4G1, caseT4G2, caseT4G3, caseT5AdapterMatrix, caseT6Selector},
 		},
 		{name: "alias is not executable", opts: Options{Case: caseT4LongRun}, wantErr: true},
 		{name: "missing exact", opts: Options{Case: "TUN-full.missing"}, wantErr: true},

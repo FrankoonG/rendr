@@ -157,22 +157,34 @@ func Specs() []manifest.Spec {
 	specs := make([]manifest.Spec, len(caseDefs))
 	for i, def := range caseDefs {
 		specs[i] = def.spec
+		specs[i].Requires = append([]string(nil), def.spec.Requires...)
 	}
 	return specs
 }
 
 func selectCaseDefs(opts Options) ([]caseDef, error) {
-	selected, err := manifest.Select(Specs(), opts.Case, opts.FromCase)
+	return selectCaseDefsFrom(caseDefs, opts)
+}
+
+func selectCaseDefsFrom(registry []caseDef, opts Options) ([]caseDef, error) {
+	specs := make([]manifest.Spec, len(registry))
+	for i, def := range registry {
+		specs[i] = def.spec
+		specs[i].Requires = append([]string(nil), def.spec.Requires...)
+	}
+	selected, err := manifest.SelectWithPrerequisites(specs, opts.Case, opts.FromCase)
 	if err != nil {
 		return nil, err
 	}
-	byID := make(map[string]caseDef, len(caseDefs))
-	for _, def := range caseDefs {
+	byID := make(map[string]caseDef, len(registry))
+	for _, def := range registry {
 		byID[def.spec.ID] = def
 	}
 	defs := make([]caseDef, 0, len(selected))
 	for _, spec := range selected {
-		defs = append(defs, byID[spec.ID])
+		def := byID[spec.ID]
+		def.spec = spec
+		defs = append(defs, def)
 	}
 	return defs, nil
 }

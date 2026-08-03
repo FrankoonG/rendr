@@ -587,7 +587,9 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 func TestTUNCatalogMismatchFailsClosed(t *testing.T) {
 	specs := tunfull.Specs()
 	badSpecs := cloneManifestSpecs(specs)
-	badSpecs[0].Tier = "T6"
+	for i := range badSpecs {
+		badSpecs[i].Tier = "T6"
+	}
 	if _, err := buildTUNCatalog(badSpecs, tunfull.Aliases()); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
 		t.Fatalf("metadata mismatch err=%v", err)
 	}
@@ -721,10 +723,13 @@ func TestScopedListUsesExecutionPlan(t *testing.T) {
 }
 
 func TestSpecsForPlanSupportsSyntheticRegistries(t *testing.T) {
+	prerequisite := manifest.RequiredWithBudget("synthetic.one", "T1", time.Second)
+	dependent := manifest.RequiredWithBudget("synthetic.two", "T1", time.Second)
+	dependent.Requires = []string{prerequisite.ID}
 	registries := map[string][]manifest.Spec{
 		"T1": {
-			manifest.RequiredWithBudget("synthetic.one", "T1", time.Second),
-			manifest.RequiredWithBudget("synthetic.two", "T1", time.Second),
+			prerequisite,
+			dependent,
 		},
 		"T2": {
 			manifest.RequiredWithBudget("synthetic.three", "T2", time.Second),
@@ -740,7 +745,7 @@ func TestSpecsForPlanSupportsSyntheticRegistries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"synthetic.two", "synthetic.three"}
+	want := []string{"synthetic.one", "synthetic.two", "synthetic.three"}
 	if !reflect.DeepEqual(specIDs(got), want) {
 		t.Fatalf("selected IDs=%v want %v", specIDs(got), want)
 	}

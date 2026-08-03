@@ -28,6 +28,15 @@ func TestSpecsOrdered(t *testing.T) {
 	if got := specIDs(specs); !reflect.DeepEqual(got, orderedCaseIDs) {
 		t.Fatalf("Specs IDs = %v, want %v", got, orderedCaseIDs)
 	}
+
+	originalRequires := caseDefs[1].spec.Requires
+	caseDefs[1].spec.Requires = []string{caseDefs[0].spec.ID}
+	t.Cleanup(func() { caseDefs[1].spec.Requires = originalRequires })
+	copied := Specs()
+	copied[1].Requires[0] = "mutated"
+	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
+		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
+	}
 }
 
 func TestSelectCaseDefs(t *testing.T) {
@@ -57,6 +66,31 @@ func TestSelectCaseDefs(t *testing.T) {
 		}
 		if _, err := selectCaseDefs(Options{FromCase: "T8.missing"}); err == nil {
 			t.Fatal("missing resume filter succeeded")
+		}
+	})
+
+	t.Run("prerequisite expansion", func(t *testing.T) {
+		prerequisite := manifest.RequiredWithBudget("synthetic-prerequisite", "T8", time.Second)
+		resume := manifest.RequiredWithBudget("synthetic-resume", "T8", time.Second)
+		resume.Requires = []string{prerequisite.ID}
+		target := manifest.RequiredWithBudget("synthetic-target", "T8", time.Second)
+		target.Requires = []string{prerequisite.ID}
+		registry := []caseDef{{spec: prerequisite}, {spec: resume}, {spec: target}}
+
+		defs, err := selectCaseDefsFrom(registry, Options{Case: target.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := defIDs(defs), []string{prerequisite.ID, target.ID}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("exact IDs = %v, want %v", got, want)
+		}
+
+		defs, err = selectCaseDefsFrom(registry, Options{FromCase: resume.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := defIDs(defs), []string{prerequisite.ID, resume.ID, target.ID}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("resume IDs = %v, want %v", got, want)
 		}
 	})
 }
