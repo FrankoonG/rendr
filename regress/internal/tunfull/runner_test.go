@@ -2,6 +2,7 @@ package tunfull
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -121,7 +122,9 @@ func TestSelectCaseDefs(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "default canonical order", want: defaultCaseIDs},
+		{name: "exact preflight", opts: Options{Case: caseKernelTUNPreflight}, want: []string{caseKernelTUNPreflight}},
 		{name: "exact visible", opts: Options{Case: caseG3Smoke}, want: []string{caseKernelTUNPreflight, caseG3Smoke}},
+		{name: "resume from preflight", opts: Options{FromCase: caseKernelTUNPreflight}, want: defaultCaseIDs},
 		{
 			name: "inclusive resume",
 			opts: Options{FromCase: caseG5PathRecovery},
@@ -207,6 +210,7 @@ func TestRunReportsSelectionFailuresWithoutExecutingCases(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestRunCaseDefsUsesDeterministicManifestOrder(t *testing.T) {
@@ -282,6 +286,7 @@ func TestRunCaseDefsStopsAfterMandatoryOutcome(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestRunManifestCaseEnforcesBudget(t *testing.T) {
@@ -342,34 +347,244 @@ func TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember(t *testing.T) {
 	}
 }
 
-func testKernelTUNPreflightFailsClosedAndRecordsSyntheticScope(t *testing.T) {
+func testKernelTUNPreflightFailsClosedAndRecordsEvidenceScope(t *testing.T) {
 	original := probeKernelTUN
 	t.Cleanup(func() { probeKernelTUN = original })
 
-	probeKernelTUN = func() virtualif.Capability {
-		return virtualif.Capability{Available: false, Reason: virtualif.ReasonTUNUnavailable, Err: errors.New("missing device")}
+	probeKernelTUN = func(context.Context) kernelTUNGateResult {
+		result := passingKernelTUNGateResult()
+		result.Positive.Available = false
+		result.Positive.Reason = string(virtualif.ReasonTUNPermissionDenied)
+		result.Positive.Stage = "tun open"
+		result.Positive.Detail = "permission denied"
+		result.Positive.DeviceOpened = false
+		result.Positive.InterfaceCreated = false
+		result.Positive.KernelPacketRead = false
+		result.Positive.KernelPacketWrite = false
+		result.Positive.PacketIntegrity = false
+		result.Positive.ReadBytes = 0
+		result.Positive.WriteBytes = 0
+		return result
 	}
 	rc := runManifestCase(context.Background(), "", caseDefs[0])
 	if !strings.Contains(rc.InvalidReason, "cannot count as TUN release evidence") {
 		t.Fatalf("unavailable preflight=%+v", rc)
 	}
-	if rc.Evidence["kernel_tun_available"] != "false" || rc.Evidence["evidence_class"] != syntheticEvidenceClass || rc.Evidence["kernel_tun_gold"] != "false" {
+	if !strings.Contains(rc.InvalidReason, string(virtualif.ReasonTUNPermissionDenied)) {
+		t.Fatalf("permission denial was not preserved: %+v", rc)
+	}
+	if rc.Evidence["kernel_tun_available"] != "false" || rc.Evidence["evidence_class"] != realKernelTUNPreflightClass ||
+		rc.Evidence["kernel_tun_packet_io"] != "false" || rc.Evidence["kernel_tun_environment_gate_pass"] != "false" ||
+		rc.Evidence["kernel_tun_gold"] != "false" {
 		t.Fatalf("unavailable evidence=%v", rc.Evidence)
 	}
 
-	probeKernelTUN = func() virtualif.Capability { return virtualif.Capability{Available: true} }
+	probeKernelTUN = func(context.Context) kernelTUNGateResult { return passingKernelTUNGateResult() }
 	rc = runManifestCase(context.Background(), "", caseDefs[0])
 	if rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "" {
 		t.Fatalf("available preflight=%+v", rc)
 	}
-	if rc.Evidence["kernel_tun_available"] != "true" || rc.Evidence["required_gold_fixture"] != realTUNGoldFixture {
+	if rc.Evidence["kernel_tun_available"] != "true" || rc.Evidence["kernel_tun_packet_io"] != "true" ||
+		rc.Evidence["kernel_tun_environment_gate_pass"] != "true" || rc.Evidence["kernel_tun_negative_control_pass"] != "true" ||
+		rc.Evidence["kernel_tun_fd_read_from_kernel"] != "true" || rc.Evidence["kernel_tun_fd_write_to_kernel"] != "true" ||
+		rc.Evidence["kernel_tun_cleanup_verified"] != "true" ||
+		rc.Evidence["required_gold_fixture"] != realTUNGoldFixture ||
+		rc.Evidence["case_payload_via_kernel_tun"] != "false" || rc.Evidence["evidence_scope"] != "kernel_environment_only" {
 		t.Fatalf("available evidence=%v", rc.Evidence)
+	}
+}
+
+func TestKernelTUNGateRejectsMissingStimulusAndFalseGreenControls(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*kernelTUNGateResult)
+		contains string
+	}{
+		{
+			name: "missing kernel read",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Positive.KernelPacketRead = false
+			},
+			contains: "kernel-emitted packet",
+		},
+		{
+			name: "missing kernel write",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Positive.KernelPacketWrite = false
+			},
+			contains: "kernel UDP socket",
+		},
+		{
+			name: "cleanup not observed",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Positive.CleanupVerified = false
+			},
+			contains: "deterministic interface cleanup",
+		},
+		{
+			name: "negative control timed out",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Negative.TimedOut = true
+			},
+			contains: "negative kernel TUN capability control exceeded",
+		},
+		{
+			name: "capability drop not proved",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Negative.CapabilitiesDropped = false
+			},
+			contains: "CAP_NET_ADMIN was absent",
+		},
+		{
+			name: "negative control false green",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Negative.Available = true
+				result.Negative.Reason = ""
+			},
+			contains: "false-green",
+		},
+		{
+			name: "generic unavailability is not permission denial",
+			mutate: func(result *kernelTUNGateResult) {
+				result.Negative.Reason = string(virtualif.ReasonTUNUnavailable)
+			},
+			contains: "did not observe permission denial",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := passingKernelTUNGateResult()
+			tt.mutate(&result)
+			if got := validateKernelTUNGate(result); !strings.Contains(got, tt.contains) {
+				t.Fatalf("validateKernelTUNGate()=%q, want %q", got, tt.contains)
+			}
+		})
+	}
+
+	falseGreen := passingKernelTUNGateResult()
+	falseGreen.Negative.Available = true
+	falseGreen.Negative.Reason = ""
+	evidence := kernelTUNGateEvidence(falseGreen)
+	if evidence["kernel_tun_packet_io"] != "true" || evidence["kernel_tun_negative_control_pass"] != "false" ||
+		evidence["kernel_tun_environment_gate_pass"] != "false" {
+		t.Fatalf("false-green evidence=%v", evidence)
+	}
+}
+
+func TestRunKernelTUNGateBoundsPositiveAndNegativeHelpers(t *testing.T) {
+	original := executeKernelTUNProbe
+	t.Cleanup(func() { executeKernelTUNProbe = original })
+
+	var modes []string
+	executeKernelTUNProbe = func(ctx context.Context, mode string) kernelTUNProbeResult {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Errorf("mode %q had no deadline", mode)
+		}
+		remaining := time.Until(deadline)
+		limit := kernelTUNPositiveLimit
+		if mode == kernelTUNProbeNegative {
+			limit = kernelTUNNegativeLimit
+		}
+		if remaining <= 0 || remaining > limit {
+			t.Errorf("mode %q remaining bound=%s, want (0,%s]", mode, remaining, limit)
+		}
+		modes = append(modes, mode)
+		result := passingKernelTUNGateResult()
+		if mode == kernelTUNProbePositive {
+			return result.Positive
+		}
+		return result.Negative
+	}
+
+	result := runKernelTUNGate(context.Background())
+	if want := []string{kernelTUNProbePositive, kernelTUNProbeNegative}; !reflect.DeepEqual(modes, want) {
+		t.Fatalf("probe modes=%v, want %v", modes, want)
+	}
+	if invalid := validateKernelTUNGate(result); invalid != "" {
+		t.Fatalf("bounded gate rejected: %s", invalid)
+	}
+}
+
+func TestSyntheticRowsCannotClaimRealKernelTUNEvidence(t *testing.T) {
+	def := syntheticCase("synthetic.evidence", time.Second, func(context.Context, string, manifest.Spec) report.Case {
+		return report.Case{Evidence: map[string]string{
+			"evidence_class":                   realKernelTUNPreflightClass,
+			"kernel_tun_packet_io":             "true",
+			"kernel_tun_fd_read_from_kernel":   "true",
+			"kernel_tun_environment_gate_pass": "true",
+			"kernel_tun_gold":                  "true",
+			"case_payload_via_kernel_tun":      "true",
+		}}
+	})
+	rc := runManifestCase(context.Background(), "", def)
+	if rc.Evidence["evidence_class"] != syntheticEvidenceClass || rc.Evidence["kernel_tun_packet_io"] != "false" ||
+		rc.Evidence["kernel_tun_gold"] != "false" || rc.Evidence["case_payload_via_kernel_tun"] != "false" ||
+		rc.Evidence["evidence_scope"] != "synthetic_payload" {
+		t.Fatalf("synthetic evidence escaped normalization: %v", rc.Evidence)
+	}
+	if _, ok := rc.Evidence["kernel_tun_fd_read_from_kernel"]; ok {
+		t.Fatalf("synthetic evidence retained kernel packet claim: %v", rc.Evidence)
+	}
+	if _, ok := rc.Evidence["kernel_tun_environment_gate_pass"]; ok {
+		t.Fatalf("synthetic evidence retained environment gate claim: %v", rc.Evidence)
+	}
+}
+
+func TestKernelTUNHelperOutputRequiresMatchingStructuredIdentity(t *testing.T) {
+	result := passingKernelTUNGateResult().Positive
+	result.Schema = kernelTUNProbeSchema
+	result.Mode = kernelTUNProbePositive
+	result.Nonce = "expected"
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := []byte("unrelated output\n" + kernelTUNHelperLinePrefix + string(encoded) + "\n")
+	if _, err := parseKernelTUNHelperOutput(output, kernelTUNProbePositive, "expected"); err != nil {
+		t.Fatalf("valid structured output rejected: %v", err)
+	}
+	if _, err := parseKernelTUNHelperOutput(output, kernelTUNProbePositive, "wrong"); err == nil || !strings.Contains(err.Error(), "nonce mismatch") {
+		t.Fatalf("nonce mismatch err=%v", err)
+	}
+	if _, err := parseKernelTUNHelperOutput(append(output, output...), kernelTUNProbePositive, "expected"); err == nil ||
+		!strings.Contains(err.Error(), "multiple structured") {
+		t.Fatalf("duplicate result err=%v", err)
+	}
+}
+
+func TestKernelTUNHelperInvocationRequiresExactNonceAndMode(t *testing.T) {
+	environment := map[string]string{
+		kernelTUNHelperModeEnv:  kernelTUNProbeNegative,
+		kernelTUNHelperNonceEnv: "expected",
+	}
+	getenv := func(key string) string { return environment[key] }
+	mode, nonce, ok := kernelTUNHelperInvocation(
+		[]string{"regress", kernelTUNHelperArgPrefix + "expected"},
+		getenv,
+	)
+	if !ok || mode != kernelTUNProbeNegative || nonce != "expected" {
+		t.Fatalf("valid helper invocation=(%q,%q,%t)", mode, nonce, ok)
+	}
+	for _, args := range [][]string{
+		{"regress"},
+		{"regress", kernelTUNHelperArgPrefix + "wrong"},
+		{"regress", kernelTUNHelperArgPrefix + "expected", "extra"},
+	} {
+		if _, _, ok := kernelTUNHelperInvocation(args, getenv); ok {
+			t.Fatalf("helper invocation accepted args=%v", args)
+		}
+	}
+	environment[kernelTUNHelperModeEnv] = "unknown"
+	if _, _, ok := kernelTUNHelperInvocation([]string{"regress", kernelTUNHelperArgPrefix + "expected"}, getenv); ok {
+		t.Fatal("helper invocation accepted unknown mode")
 	}
 }
 
 func TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce(t *testing.T) {
 	t.Run("aliases are separate immutable metadata", testAliasesAreSeparateImmutableMetadata)
-	t.Run("kernel TUN preflight fails closed", testKernelTUNPreflightFailsClosedAndRecordsSyntheticScope)
+	t.Run("kernel TUN preflight fails closed", testKernelTUNPreflightFailsClosedAndRecordsEvidenceScope)
 	t.Run("G3 measurements fail closed", testValidateTUNG3MeasurementsFailsClosed)
 	t.Run("G3 explicit loss budget", testValidateTUNG3MeasurementsHonorsOnlyExplicitLossBudget)
 	t.Run("G3 path evidence is deterministic", testFormatTUNG3PathWritesIsDeterministic)
@@ -452,6 +667,37 @@ func TestApplyT4CleanupResultFailsClosed(t *testing.T) {
 
 func syntheticCase(id string, budget time.Duration, run caseRun) caseDef {
 	return caseDef{spec: tunSpec(id, budget, false), run: run}
+}
+
+func passingKernelTUNGateResult() kernelTUNGateResult {
+	return kernelTUNGateResult{
+		Positive: kernelTUNProbeResult{
+			Completed:         true,
+			Bounded:           true,
+			Available:         true,
+			Stage:             "complete",
+			DeviceOpened:      true,
+			InterfaceCreated:  true,
+			InterfaceName:     "rendrg0",
+			KernelPacketRead:  true,
+			KernelPacketWrite: true,
+			PacketIntegrity:   true,
+			ReadBytes:         64,
+			WriteBytes:        64,
+			CleanupAttempted:  true,
+			CleanupCloseOK:    true,
+			CleanupVerified:   true,
+		},
+		Negative: kernelTUNProbeResult{
+			Completed:           true,
+			Bounded:             true,
+			Available:           false,
+			Reason:              string(virtualif.ReasonTUNPermissionDenied),
+			Stage:               "probe-without-cap-net-admin",
+			CapabilitiesDropped: true,
+			CAPNetAdminPresent:  false,
+		},
+	}
 }
 
 func specIDs(specs []manifest.Spec) []string {

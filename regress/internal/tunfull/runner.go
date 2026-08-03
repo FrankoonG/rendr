@@ -24,7 +24,6 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/transport/tcprepair"
-	"github.com/FrankoonG/rendr/tun"
 )
 
 // Options filters the synthetic TUN/L3-session matrix.
@@ -302,7 +301,7 @@ func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 		Tier:          spec.Tier,
 		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
-	markSyntheticEvidence(&rc)
+	markTUNEvidence(&rc, spec.ID)
 	return rc
 }
 
@@ -375,53 +374,63 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 	}
 	rc.Name = def.spec.ID
 	rc.Tier = def.spec.Tier
-	markSyntheticEvidence(&rc)
+	markTUNEvidence(&rc, def.spec.ID)
 	return rc
 }
 
 const (
-	syntheticEvidenceClass = "synthetic_l3_session_smoke"
-	realTUNGoldFixture     = "private_T7.kernel_fixture_required"
+	syntheticEvidenceClass      = "synthetic_l3_session_smoke"
+	realKernelTUNPreflightClass = "real_kernel_tun_environment_preflight"
+	realTUNGoldFixture          = "private_T7.kernel_fixture_required"
 )
 
-func markSyntheticEvidence(rc *report.Case) {
+func markTUNEvidence(rc *report.Case, caseID string) {
 	if rc == nil {
 		return
 	}
 	if rc.Evidence == nil {
-		rc.Evidence = make(map[string]string, 3)
+		rc.Evidence = make(map[string]string, 6)
 	}
-	if rc.Evidence["evidence_class"] == "" {
-		rc.Evidence["evidence_class"] = syntheticEvidenceClass
-	}
-	if rc.Evidence["kernel_tun_gold"] == "" {
+	if caseID == caseKernelTUNPreflight {
 		rc.Evidence["kernel_tun_gold"] = "false"
-	}
-	if rc.Evidence["required_gold_fixture"] == "" {
 		rc.Evidence["required_gold_fixture"] = realTUNGoldFixture
+		rc.Evidence["case_payload_via_kernel_tun"] = "false"
+		rc.Evidence["evidence_class"] = realKernelTUNPreflightClass
+		rc.Evidence["evidence_scope"] = "kernel_environment_only"
+		if rc.Evidence["kernel_tun_packet_io"] == "" {
+			rc.Evidence["kernel_tun_packet_io"] = "false"
+		}
+		return
 	}
+
+	// These rows exercise production L3/session plumbing with synthetic packet
+	// sources. Never let runner-supplied evidence relabel them as kernel TUN.
+	for key := range rc.Evidence {
+		if strings.HasPrefix(key, "kernel_tun_") {
+			delete(rc.Evidence, key)
+		}
+	}
+	rc.Evidence["evidence_class"] = syntheticEvidenceClass
+	rc.Evidence["evidence_scope"] = "synthetic_payload"
+	rc.Evidence["kernel_tun_gold"] = "false"
+	rc.Evidence["kernel_tun_packet_io"] = "false"
+	rc.Evidence["required_gold_fixture"] = realTUNGoldFixture
+	rc.Evidence["case_payload_via_kernel_tun"] = "false"
 }
 
-var probeKernelTUN = tun.Probe
+var probeKernelTUN = runKernelTUNGate
 
-func runKernelTUNPreflightManifestCase(_ context.Context, _ string, spec manifest.Spec) report.Case {
+func runKernelTUNPreflightManifestCase(ctx context.Context, _ string, spec manifest.Spec) report.Case {
 	started := time.Now()
-	capability := probeKernelTUN()
+	gate := probeKernelTUN(ctx)
 	rc := report.Case{
 		Name:     spec.ID,
 		Tier:     spec.Tier,
 		Duration: time.Since(started),
-		Evidence: map[string]string{
-			"kernel_tun_available": fmt.Sprintf("%t", capability.Available),
-			"kernel_tun_reason":    string(capability.Reason),
-		},
+		Evidence: kernelTUNGateEvidence(gate),
 	}
-	if !capability.Available {
-		detail := string(capability.Reason)
-		if capability.Err != nil {
-			detail = capability.Err.Error()
-		}
-		rc.InvalidReason = "kernel TUN preflight unavailable: " + detail +
+	if invalidReason := validateKernelTUNGate(gate); invalidReason != "" {
+		rc.InvalidReason = "kernel TUN preflight unavailable: " + invalidReason +
 			"; this synthetic L3/session suite cannot count as TUN release evidence"
 	}
 	return rc
