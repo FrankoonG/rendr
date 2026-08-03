@@ -110,33 +110,44 @@ func RunWithOptions(ctx context.Context, suite *report.Suite, rendrRoot string, 
 			})
 			continue
 		}
-		start := time.Now()
-		var err error
-		var attempts int
-		for attempts = 0; attempts <= c.retries; attempts++ {
-			attemptCtx := ctx
-			var cancel context.CancelFunc
-			if c.spec.Budget > 0 {
-				attemptCtx, cancel = context.WithTimeout(ctx, c.spec.Budget)
-			}
-			err = c.fn(attemptCtx, rendrRoot)
-			if cancel != nil {
-				cancel()
-			}
-			if err == nil {
-				break
-			}
-		}
-		rc := report.Case{
-			Name:     c.spec.ID,
-			Tier:     "T1",
-			Duration: time.Since(start),
-		}
-		if err != nil {
-			rc.Failure = fmt.Sprintf("after %d attempt(s): %s", attempts, err.Error())
-		}
-		suite.Add(rc)
+		suite.Add(runCaseDef(ctx, rendrRoot, c))
 	}
+}
+
+func runCaseDef(ctx context.Context, rendrRoot string, c caseDef) report.Case {
+	start := time.Now()
+	caseCtx := ctx
+	var cancel context.CancelFunc
+	if c.spec.Budget > 0 {
+		caseCtx, cancel = context.WithTimeout(ctx, c.spec.Budget)
+		defer cancel()
+	}
+
+	var (
+		lastErr  error
+		failures []string
+		attempts int
+	)
+	for attempt := 1; attempt <= c.retries+1; attempt++ {
+		attempts = attempt
+		lastErr = c.fn(caseCtx, rendrRoot)
+		if lastErr == nil {
+			break
+		}
+		failures = append(failures, fmt.Sprintf("attempt %d: %v", attempt, lastErr))
+		if caseCtx.Err() != nil {
+			break
+		}
+	}
+
+	rc := report.Case{Name: c.spec.ID, Tier: c.spec.Tier, Duration: time.Since(start)}
+	switch {
+	case lastErr != nil:
+		rc.Failure = fmt.Sprintf("failed after %d attempt(s): %s", attempts, strings.Join(failures, "\n"))
+	case len(failures) > 0:
+		rc.InvalidReason = fmt.Sprintf("flaky result: passed on attempt %d after earlier failure(s): %s", attempts, strings.Join(failures, "\n"))
+	}
+	return rc
 }
 
 func runGo(ctx context.Context, rendrRoot string, args ...string) error {
