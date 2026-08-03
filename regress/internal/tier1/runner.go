@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -270,7 +271,6 @@ func grepFile(root, rel string, want *regexp.Regexp, label string) error {
 var (
 	rxProtoVersion        = regexp.MustCompile(`const\s+Version\s+uint8\s*=\s*2\b`)
 	rxUDPFlowVersion      = regexp.MustCompile(`const\s+UDPFlowVersion\s+uint8\s*=\s*0\b`)
-	rxMigrationBudget     = regexp.MustCompile(`MigrationBudget:\s*90\s*\*\s*time\.Second`)
 	rxModeValues          = regexp.MustCompile(`(?s)ModePrime\s+Mode\s*=\s*1.*?ModeBond\s+Mode\s*=\s*2.*?ModeRace\s+Mode\s*=\s*3`)
 	rxModeTransitionTable = regexp.MustCompile(`(?s)cur\s*==\s*ModeRace\s*&&\s*m\s*==\s*ModeBond.*?cur\s*==\s*ModeBond\s*&&\s*m\s*==\s*ModeRace`)
 )
@@ -283,9 +283,31 @@ func constUDPFlowVersion(_ context.Context, root string) error {
 	return grepFile(root, "proto/udpflow.go", rxUDPFlowVersion, "proto.UDPFlowVersion must be 0")
 }
 
-func constMigrationBudget(_ context.Context, root string) error {
-	return grepFile(root, "internal/engine/state.go", rxMigrationBudget,
-		"MigrationBudget default must be 90s (CLAUDE.md hard rule #4)")
+func constMigrationBudget(_ context.Context, _ string) error {
+	defaults := engine.DefaultLimits()
+	return validateMigrationBudgetContract(
+		defaults.MigrationBudget,
+		(engine.Limits{}).Clamp().MigrationBudget,
+		(engine.Limits{MigrationBudget: 5 * time.Minute}).Clamp().MigrationBudget,
+		(engine.Limits{MigrationBudget: 30 * time.Second}).Clamp().MigrationBudget,
+	)
+}
+
+func validateMigrationBudgetContract(defaultBudget, zeroBudget, upperBudget, lowerBudget time.Duration) error {
+	const wantDefault = 90 * time.Second
+	if defaultBudget != wantDefault {
+		return fmt.Errorf("default migration budget = %s, want %s", defaultBudget, wantDefault)
+	}
+	if zeroBudget != wantDefault {
+		return fmt.Errorf("zero migration budget clamps to %s, want %s", zeroBudget, wantDefault)
+	}
+	if upperBudget != wantDefault {
+		return fmt.Errorf("over-limit migration budget clamps to %s, want %s", upperBudget, wantDefault)
+	}
+	if lowerBudget != 30*time.Second {
+		return fmt.Errorf("short migration budget clamps to %s, want 30s", lowerBudget)
+	}
+	return nil
 }
 
 func constModeValues(_ context.Context, root string) error {

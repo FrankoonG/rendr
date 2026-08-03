@@ -47,6 +47,21 @@ func TestSpecsOrder(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+
+	t.Run("migration budget runtime contract", func(t *testing.T) {
+		if err := constMigrationBudget(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateMigrationBudgetContract(89*time.Second, 90*time.Second, 90*time.Second, 30*time.Second); err == nil {
+			t.Fatal("invalid default migration budget passed")
+		}
+		if err := validateMigrationBudgetContract(90*time.Second, 90*time.Second, 5*time.Minute, 30*time.Second); err == nil {
+			t.Fatal("unclamped upper migration budget passed")
+		}
+		if err := validateMigrationBudgetContract(90*time.Second, 90*time.Second, 90*time.Second, 90*time.Second); err == nil {
+			t.Fatal("short migration budget clamp regression passed")
+		}
+	})
 }
 
 func TestSelectCaseDefsExact(t *testing.T) {
