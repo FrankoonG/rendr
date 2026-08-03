@@ -351,6 +351,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestInvocationIdentityIsRecordedInJUnitAndMarkdown", "TestRunFailureIsAStandardJUnitFailure",
 			"TestInvocationSchemaV2IsRecordedInJUnitAndMarkdown", "TestInvocationSchemaV2Validation",
 			"TestInvocationSchemaV3EnvironmentIsRecordedInJUnitAndMarkdown", "TestInvocationSchemaV3EnvironmentValidation",
+			"TestInvocationSchemaV4SeparatesComponentAndReleaseCompleteness",
 			"TestCompleteReportWithoutInvocationIdentityFailsClosed",
 			"TestAtomicWriteReplacesExistingFile", "TestMarkdownIncludesBoundedSingleLineFailure",
 		),
