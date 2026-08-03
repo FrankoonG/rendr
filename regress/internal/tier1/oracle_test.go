@@ -63,6 +63,7 @@ func TestRegressUnitRunsOnlyFastSmokeOracles(t *testing.T) {
 		"TestValidateG2EvidenceRaceDuplicateSemantics",
 		"TestG2OptsMigrationDefaultAndDisable",
 		"TestG3OptsStrictLossAndMigrationDisable",
+		"TestValidateG3EffectiveUDPBuffers",
 		"TestValidateG3MeasurementsRejectsFalseGreenEvidence",
 		"TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget",
 		"TestValidateG4EvidenceNegativeControls",
