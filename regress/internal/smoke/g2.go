@@ -17,7 +17,7 @@ import (
 // 2 paths / tcp / prime / 100 ms cadence) match docs/regression-suite.md §6.
 type G2Opts struct {
 	Duration   time.Duration // default 30s
-	Migrations int           // approx migrations to trigger; default 5
+	Migrations int           // migrations; 0 defaults to 5, negative disables
 	Paths      int           // default 2
 	Transport  string        // default "tcp"
 	Mode       rendr.Mode    // default ModePrime; ModeRace / ModeBond for matrix coverage
@@ -27,11 +27,47 @@ type G2Opts struct {
 	P99CeilingMs int
 }
 
+type g2Evidence struct {
+	mode                  rendr.Mode
+	migrationsRequested   int
+	migrationCallsFired   int
+	migrationCountBefore  uint64
+	migrationCountAfter   uint64
+	applicationDuplicates int
+	recvDupsBefore        uint64
+	recvDupsAfter         uint64
+}
+
+func validateG2Evidence(e g2Evidence) (uint64, uint64, error) {
+	migrations, err := validateRequestedMigrations(
+		e.migrationsRequested,
+		e.migrationCallsFired,
+		e.migrationCountBefore,
+		e.migrationCountAfter,
+	)
+	if err != nil {
+		return migrations, 0, err
+	}
+	if e.applicationDuplicates != 0 {
+		return migrations, 0, fmt.Errorf("application-visible duplicate echoes=%d, want 0", e.applicationDuplicates)
+	}
+	if e.recvDupsAfter < e.recvDupsBefore {
+		return migrations, 0, fmt.Errorf("receive duplicate counter regressed from %d to %d", e.recvDupsBefore, e.recvDupsAfter)
+	}
+	recvDups := e.recvDupsAfter - e.recvDupsBefore
+	if e.mode == rendr.ModeRace && recvDups == 0 {
+		return migrations, recvDups, fmt.Errorf("race duplicate stimulus was not observed")
+	}
+	return migrations, recvDups, nil
+}
+
 func (o *G2Opts) withDefaults() {
 	if o.Duration <= 0 {
 		o.Duration = 30 * time.Second
 	}
-	if o.Migrations < 0 {
+	if o.Migrations == 0 {
+		o.Migrations = 5
+	} else if o.Migrations < 0 {
 		o.Migrations = 0
 	}
 	if o.Paths < 1 {
@@ -53,15 +89,21 @@ func (o *G2Opts) withDefaults() {
 
 // RunG2 drives a long-lived echo loop with periodic migrations,
 // asserts 0 loss and P99 RTT under the configured ceiling, and
-// proves MigrationCount() advances. Detail keys:
+// proves every requested migration fires. Race intentionally permits
+// zero migrations, but must observe engine-level duplicate suppression
+// without exposing duplicate echoes to the application. Detail keys:
 //
-//	echoes       int
-//	lost         int
-//	migrations   uint64
-//	p50_ms       float64
-//	p99_ms       float64
-//	p999_ms      float64
-//	max_ms       float64
+//	echoes                  int
+//	lost                    int
+//	requested_migrations    int
+//	migration_calls_fired   int
+//	migrations              uint64
+//	application_duplicates  int
+//	recv_dups               uint64
+//	p50_ms                  float64
+//	p99_ms                  float64
+//	p999_ms                 float64
+//	max_ms                  float64
 func RunG2(ctx context.Context, opts G2Opts) Result {
 	opts.withDefaults()
 	t0 := time.Now()
@@ -145,6 +187,8 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	}
 
 	startMigCount := admin.MigrationCount()
+	startRecvDups := admin.RecvDups()
+	var migrationCallsFired int
 	rtts := make([]time.Duration, 0, int(opts.Duration/opts.Interval)+2)
 	deadline := time.Now().Add(opts.Duration)
 	tick := time.NewTicker(opts.Interval)
@@ -188,6 +232,7 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	var seq int32
 	sent := map[int32]struct{}{}
 	lastProgress := time.Now()
+runLoop:
 	for time.Now().Before(deadline) {
 		select {
 		case <-tick.C:
@@ -210,14 +255,26 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 			}
 		case <-migTickerChan(migTicker):
 			cur := admin.ActivePath()
+			var target uint32
 			for _, p := range client.Paths() {
 				if p.ID != cur {
-					_ = admin.Migrate(p.ID)
+					target = p.ID
 					break
 				}
 			}
+			if target == 0 {
+				return FromError(name, time.Since(t0), fmt.Errorf("migration %d: no alternate path", migrationCallsFired+1))
+			}
+			if err := admin.Migrate(target); err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("migration %d: %w", migrationCallsFired+1, err))
+			}
+			migrationCallsFired++
+			if migrationCallsFired == opts.Migrations {
+				migTicker.Stop()
+				migTicker = nil
+			}
 		case <-ctx.Done():
-			break
+			break runLoop
 		}
 	}
 
@@ -228,8 +285,17 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	<-doneRecv
 
 	received := map[int32]time.Duration{}
+	applicationDuplicates := 0
+	unexpected := 0
 	for _, e := range echoBuf {
-		received[e.seq] = e.rtt
+		if _, ok := sent[e.seq]; !ok {
+			unexpected++
+		}
+		if _, ok := received[e.seq]; ok {
+			applicationDuplicates++
+		} else {
+			received[e.seq] = e.rtt
+		}
 		rtts = append(rtts, e.rtt)
 	}
 
@@ -252,19 +318,36 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 	}
 	maxRTT := rtts[len(rtts)-1]
 
-	migrated := admin.MigrationCount() - startMigCount
+	migrated, recvDups, evidenceErr := validateG2Evidence(g2Evidence{
+		mode:                  opts.Mode,
+		migrationsRequested:   opts.Migrations,
+		migrationCallsFired:   migrationCallsFired,
+		migrationCountBefore:  startMigCount,
+		migrationCountAfter:   admin.MigrationCount(),
+		applicationDuplicates: applicationDuplicates,
+		recvDupsBefore:        startRecvDups,
+		recvDupsAfter:         admin.RecvDups(),
+	})
 	r := Result{
 		Name:     name,
 		Duration: time.Since(t0),
 		Detail: map[string]any{
-			"echoes":     len(sent),
-			"lost":       lost,
-			"migrations": migrated,
-			"p50_ms":     float64(p50) / float64(time.Millisecond),
-			"p99_ms":     float64(p99) / float64(time.Millisecond),
-			"p999_ms":    float64(p999) / float64(time.Millisecond),
-			"max_ms":     float64(maxRTT) / float64(time.Millisecond),
+			"echoes":                 len(sent),
+			"lost":                   lost,
+			"requested_migrations":   opts.Migrations,
+			"migration_calls_fired":  migrationCallsFired,
+			"migrations":             migrated,
+			"application_duplicates": applicationDuplicates,
+			"recv_dups":              recvDups,
+			"p50_ms":                 float64(p50) / float64(time.Millisecond),
+			"p99_ms":                 float64(p99) / float64(time.Millisecond),
+			"p999_ms":                float64(p999) / float64(time.Millisecond),
+			"max_ms":                 float64(maxRTT) / float64(time.Millisecond),
 		},
+	}
+	if unexpected > 0 {
+		r.Failure = fmt.Sprintf("unexpected echo sequences: %d", unexpected)
+		return r
 	}
 	if lost > 0 {
 		r.Failure = fmt.Sprintf("echo loss: %d / %d", lost, len(sent))
@@ -274,8 +357,8 @@ func RunG2(ctx context.Context, opts G2Opts) Result {
 		r.Failure = fmt.Sprintf("P99 RTT %.1fms exceeds ceiling %dms", float64(p99)/float64(time.Millisecond), opts.P99CeilingMs)
 		return r
 	}
-	if opts.Migrations > 0 && migrated == 0 {
-		r.Failure = "no migrations actually fired"
+	if evidenceErr != nil {
+		r.Failure = evidenceErr.Error()
 		return r
 	}
 	return r

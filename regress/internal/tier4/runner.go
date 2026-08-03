@@ -64,7 +64,7 @@ var caseDefs = []caseDef{
 		run: func(ctx context.Context) smoke.Result {
 			return smoke.RunG2(ctx, smoke.G2Opts{
 				Duration:     30 * time.Minute,
-				Migrations:   0,
+				Migrations:   -1,
 				Paths:        2,
 				Transport:    "tcp",
 				Mode:         rendr.ModeRace,

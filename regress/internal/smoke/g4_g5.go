@@ -1,6 +1,7 @@
 package smoke
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -43,10 +44,40 @@ func (o *G4Opts) withDefaults() {
 	}
 }
 
+type g4KillOutcome struct {
+	at  time.Time
+	err error
+}
+
+func validateG4Evidence(killErr error, killAt, firstPostKill time.Time, postKillSamples int, budget time.Duration) (time.Duration, error) {
+	if killErr != nil {
+		return 0, fmt.Errorf("kill stimulus failed: %w", killErr)
+	}
+	if killAt.IsZero() {
+		return 0, fmt.Errorf("kill stimulus timestamp was not observed")
+	}
+	if firstPostKill.IsZero() {
+		return 0, fmt.Errorf("post-kill delivery timestamp was not observed")
+	}
+	if postKillSamples <= 0 {
+		return 0, fmt.Errorf("post-kill delivery samples=%d, want > 0", postKillSamples)
+	}
+	if firstPostKill.Before(killAt) {
+		return 0, fmt.Errorf("post-kill delivery timestamp precedes kill stimulus")
+	}
+	failover := firstPostKill.Sub(killAt)
+	if failover > budget {
+		return failover, fmt.Errorf("failover %dms exceeds %dms budget", failover.Milliseconds(), budget.Milliseconds())
+	}
+	return failover, nil
+}
+
 // RunG4 returns Result with Detail keys:
 //
 //	echoes              int
 //	application_lost    int
+//	kill_observed       bool
+//	post_kill_samples   int
 //	failover_ms         int64
 //	max_rtt_ms          float64
 func RunG4(ctx context.Context, opts G4Opts) Result {
@@ -128,7 +159,7 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		return FromError(name, time.Since(t0), fmt.Errorf("rendr.Conn lacks ForceKillPathForTest test hook"))
 	}
 
-	killDone := make(chan time.Time, 1)
+	killDone := make(chan g4KillOutcome, 1)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -136,21 +167,33 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		case <-time.After(opts.KillAt):
 		}
 		cur := admin.ActivePath()
-		if cur != 0 {
-			_ = killer.ForceKillPathForTest(cur)
+		if cur == 0 {
+			killDone <- g4KillOutcome{err: fmt.Errorf("no active path to kill")}
+			return
 		}
-		killDone <- time.Now()
+		if err := killer.ForceKillPathForTest(cur); err != nil {
+			killDone <- g4KillOutcome{err: err}
+			return
+		}
+		killDone <- g4KillOutcome{at: time.Now()}
 	}()
 
 	start := time.Now()
 	endAt := start.Add(opts.Duration)
 	var counter uint64
 	rxbuf := make([]byte, 8)
+	var killErr error
 	var killStamp time.Time
 	var firstPostKill time.Time
+	var postKillSamples int
 	var lost int
 	var maxRTT time.Duration
 	var cause string
+	recordKill := func(out g4KillOutcome) {
+		killStamp = out.at
+		killErr = out.err
+		killDone = nil
+	}
 	for time.Now().Before(endAt) {
 		var tx [8]byte
 		binary.BigEndian.PutUint64(tx[:], counter)
@@ -166,18 +209,21 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		if binary.BigEndian.Uint64(rxbuf) != counter {
 			lost++
 		}
-		rtt := time.Since(echoStart)
+		echoEnd := time.Now()
+		rtt := echoEnd.Sub(echoStart)
 		if rtt > maxRTT {
 			maxRTT = rtt
 		}
 		select {
-		case s := <-killDone:
-			killStamp = s
-			killDone = nil
+		case out := <-killDone:
+			recordKill(out)
 		default:
 		}
-		if !killStamp.IsZero() && firstPostKill.IsZero() && time.Now().After(killStamp) {
-			firstPostKill = time.Now()
+		if !killStamp.IsZero() && !echoEnd.Before(killStamp) {
+			postKillSamples++
+			if firstPostKill.IsZero() {
+				firstPostKill = echoEnd
+			}
 		}
 		counter++
 		if opts.EchoInt > 0 {
@@ -185,20 +231,37 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 		}
 	}
 
-	var failoverMs int64
-	if !killStamp.IsZero() && !firstPostKill.IsZero() {
-		failoverMs = firstPostKill.Sub(killStamp).Milliseconds()
+	if killDone != nil {
+		select {
+		case out := <-killDone:
+			recordKill(out)
+		default:
+		}
 	}
+	failover, evidenceErr := validateG4Evidence(
+		killErr,
+		killStamp,
+		firstPostKill,
+		postKillSamples,
+		time.Duration(opts.BudgetMs)*time.Millisecond,
+	)
+	failoverMs := failover.Milliseconds()
 
 	r := Result{
 		Name:     name,
 		Duration: time.Since(t0),
 		Detail: map[string]any{
-			"echoes":           int(counter),
-			"application_lost": lost,
-			"failover_ms":      failoverMs,
-			"max_rtt_ms":       float64(maxRTT) / float64(time.Millisecond),
+			"echoes":            int(counter),
+			"application_lost":  lost,
+			"kill_observed":     !killStamp.IsZero() && killErr == nil,
+			"post_kill_samples": postKillSamples,
+			"failover_ms":       failoverMs,
+			"max_rtt_ms":        float64(maxRTT) / float64(time.Millisecond),
 		},
+	}
+	if evidenceErr != nil {
+		r.Failure = evidenceErr.Error()
+		return r
 	}
 	if cause != "" {
 		r.Failure = cause
@@ -206,10 +269,6 @@ func RunG4(ctx context.Context, opts G4Opts) Result {
 	}
 	if lost > 0 {
 		r.Failure = fmt.Sprintf("application-visible echo loss: %d", lost)
-		return r
-	}
-	if failoverMs > int64(opts.BudgetMs) {
-		r.Failure = fmt.Sprintf("failover %dms exceeds %dms budget", failoverMs, opts.BudgetMs)
 		return r
 	}
 	return r
@@ -224,11 +283,55 @@ type G5Opts struct {
 	PostAddBytes int64 // default 256 KiB
 }
 
+func validateG5Payload(offset int64, sent, received []byte) error {
+	if len(sent) != len(received) {
+		return fmt.Errorf("post-recovery payload length at offset %d: sent=%d received=%d", offset, len(sent), len(received))
+	}
+	if bytes.Equal(sent, received) {
+		return nil
+	}
+	for i := range sent {
+		if sent[i] != received[i] {
+			return fmt.Errorf("post-recovery payload mismatch at offset %d: sent=%02x received=%02x", offset+int64(i), sent[i], received[i])
+		}
+	}
+	return fmt.Errorf("post-recovery payload mismatch at offset %d", offset)
+}
+
+func pathInfoByID(paths []rendr.PathInfo, id uint32) (rendr.PathInfo, bool) {
+	for _, path := range paths {
+		if path.ID == id {
+			return path, true
+		}
+	}
+	return rendr.PathInfo{}, false
+}
+
+func validateRecoveredPathProgress(newID, activeID uint32, before, after rendr.PathInfo) error {
+	if newID == 0 {
+		return fmt.Errorf("AddPath returned id=0")
+	}
+	if before.ID != newID || after.ID != newID {
+		return fmt.Errorf("recovered path %d was not present in both traffic snapshots", newID)
+	}
+	if activeID != newID {
+		return fmt.Errorf("active path after recovery traffic=%d, want recovered path %d", activeID, newID)
+	}
+	if after.Writes <= before.Writes {
+		return fmt.Errorf("recovered path %d writes did not advance: before=%d after=%d", newID, before.Writes, after.Writes)
+	}
+	if after.LastSendAt.IsZero() || !after.LastSendAt.After(before.LastSendAt) {
+		return fmt.Errorf("recovered path %d last-send timestamp did not advance", newID)
+	}
+	return nil
+}
+
 // RunG5 runs G4-style failover, then AddPath the killed transport
 // back and writes PostAddBytes more bytes. Asserts:
 //   - AddPath returns a fresh id
 //   - RecvDups stays 0 (no reorder artifacts)
-//   - bytes round-trip intact
+//   - bytes round-trip intact by direct comparison
+//   - the recovered path's write counter advances during the payload
 func RunG5(ctx context.Context, opts G5Opts) Result {
 	o := opts.G4
 	o.withDefaults()
@@ -295,9 +398,16 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 	if !ok {
 		return FromError(name, time.Since(t0), fmt.Errorf("rendr.Conn lacks ForceKillPathForTest test hook"))
 	}
+	originalPathIDs := make(map[uint32]struct{}, len(client.Paths()))
+	for _, path := range client.Paths() {
+		originalPathIDs[path.ID] = struct{}{}
+	}
 
 	// Kill the active path immediately.
 	cur := admin.ActivePath()
+	if cur == 0 {
+		return FromError(name, time.Since(t0), fmt.Errorf("no active path to kill"))
+	}
 	if err := killer.ForceKillPathForTest(cur); err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("kill active: %w", err))
 	}
@@ -327,12 +437,30 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 	if err != nil {
 		return FromError(name, time.Since(t0), fmt.Errorf("AddPath: %w", err))
 	}
+	if newID == 0 {
+		return FromError(name, time.Since(t0), fmt.Errorf("AddPath returned id=0"))
+	}
+	if _, existed := originalPathIDs[newID]; existed {
+		return FromError(name, time.Since(t0), fmt.Errorf("AddPath reused existing path id %d", newID))
+	}
+	if err := admin.Migrate(newID); err != nil {
+		return FromError(name, time.Since(t0), fmt.Errorf("migrate to recovered path %d: %w", newID, err))
+	}
+	if active := admin.ActivePath(); active != newID {
+		return FromError(name, time.Since(t0), fmt.Errorf("active path after recovered-path migration=%d, want %d", active, newID))
+	}
+
+	// Migrate emits its control frame asynchronously. Let that frame
+	// settle before taking the baseline so only the payload window is
+	// credited as recovered-path traffic.
+	time.Sleep(50 * time.Millisecond)
+	pathBefore, ok := pathInfoByID(client.Paths(), newID)
+	if !ok {
+		return FromError(name, time.Since(t0), fmt.Errorf("recovered path %d missing before payload", newID))
+	}
 
 	// Exchange PostAddBytes and verify no echo loss + no dups.
 	payload := make([]byte, 4096)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
 	var written int64
 	rx := make([]byte, 4096)
 	for written < opts.PostAddBytes {
@@ -340,8 +468,13 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 		if toWrite > int64(len(payload)) {
 			toWrite = int64(len(payload))
 		}
-		if _, err := client.Write(payload[:toWrite]); err != nil {
+		fillG1Pattern(payload[:toWrite], written)
+		n, err := client.Write(payload[:toWrite])
+		if err != nil {
 			return FromError(name, time.Since(t0), fmt.Errorf("post-add write: %w", err))
+		}
+		if int64(n) != toWrite {
+			return FromError(name, time.Since(t0), fmt.Errorf("post-add short write: got=%d want=%d", n, toWrite))
 		}
 		got := int64(0)
 		for got < toWrite {
@@ -351,26 +484,38 @@ func RunG5(ctx context.Context, opts G5Opts) Result {
 			}
 			got += int64(n)
 		}
+		if err := validateG5Payload(written, payload[:toWrite], rx[:toWrite]); err != nil {
+			return FromError(name, time.Since(t0), err)
+		}
 		written += toWrite
 	}
 
 	stats := admin.Stats()
+	pathAfter, ok := pathInfoByID(stats.Paths, newID)
+	if !ok {
+		return FromError(name, time.Since(t0), fmt.Errorf("recovered path %d missing after payload", newID))
+	}
+	progressErr := validateRecoveredPathProgress(newID, stats.ActivePath, pathBefore, pathAfter)
 	r := Result{
 		Name:     name,
 		Duration: time.Since(t0),
 		Detail: map[string]any{
-			"new_path_id":    newID,
-			"recv_dups":      stats.RecvDups,
-			"migration_count": stats.MigrationCount,
-			"post_add_bytes": written,
+			"new_path_id":            newID,
+			"new_path_writes_before": pathBefore.Writes,
+			"new_path_writes_after":  pathAfter.Writes,
+			"new_path_write_delta":   pathAfter.Writes - pathBefore.Writes,
+			"recv_dups":              stats.RecvDups,
+			"migration_count":        stats.MigrationCount,
+			"post_add_bytes":         written,
+			"payload_match":          true,
 		},
 	}
 	if stats.RecvDups > 0 {
 		r.Failure = fmt.Sprintf("RecvDups=%d after path re-add (expected 0)", stats.RecvDups)
 		return r
 	}
-	if newID == 0 {
-		r.Failure = "AddPath returned id=0"
+	if progressErr != nil {
+		r.Failure = progressErr.Error()
 		return r
 	}
 	return r

@@ -13,12 +13,26 @@ package tier2
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"time"
 
 	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
+)
+
+const (
+	streamSmokeBudget = time.Minute
+	g2SmokeBudget     = time.Minute
+	g3SmokeBudget     = time.Minute
+	g4G5SmokeBudget   = 30 * time.Second
+	relaySmokeBudget  = 30 * time.Second
+
+	g1SmokeMigrations     = 3
+	g2SmokeMigrations     = 5
+	g2RaceSmokeMigrations = -1
 )
 
 // Options filters the tier2 smoke cases.
@@ -35,10 +49,10 @@ type caseDef struct {
 }
 
 var caseDefs = []caseDef{
-	{spec: manifest.Required("G1-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
-		return smoke.RunG1(ctx, smoke.G1Opts{})
+	{spec: manifest.RequiredWithBudget("G1-smoke", "T2", streamSmokeBudget), run: func(ctx context.Context) smoke.Result {
+		return smoke.RunG1(ctx, smoke.G1Opts{Migrations: g1SmokeMigrations})
 	}},
-	{spec: manifest.Required("G1-mixed-tcp-quic-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("G1-mixed-tcp-quic-smoke", "T2", streamSmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG1(ctx, smoke.G1Opts{
 			Size:       8 << 20,
 			Migrations: 1,
@@ -48,41 +62,44 @@ var caseDefs = []caseDef{
 			},
 		})
 	}},
-	{spec: manifest.Required("G2-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
-		return smoke.RunG2(ctx, smoke.G2Opts{})
+	{spec: manifest.RequiredWithBudget("G2-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
+		return smoke.RunG2(ctx, smoke.G2Opts{Migrations: g2SmokeMigrations})
 	}},
 	// Matrix coverage at smoke scale: race + bond modes on TCP.
 	// Race mode dispatches each frame to every path, so migrations
-	// are semantically moot — set Migrations=0 to skip the
+	// are semantically moot — set Migrations=-1 to skip the
 	// "migrations actually fired" assertion. Bond keeps the
 	// default migration cadence to exercise active-path swap.
-	{spec: manifest.Required("G2-race-tcp-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("G2-race-tcp-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{
 			Mode:       rendr.ModeRace,
-			Migrations: 0,
+			Migrations: g2RaceSmokeMigrations,
 		})
 	}},
-	{spec: manifest.Required("G2-bond-tcp-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
-		return smoke.RunG2(ctx, smoke.G2Opts{Mode: rendr.ModeBond})
+	{spec: manifest.RequiredWithBudget("G2-bond-tcp-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
+		return smoke.RunG2(ctx, smoke.G2Opts{Mode: rendr.ModeBond, Migrations: g2SmokeMigrations})
 	}},
 	{
-		spec:       manifest.Required("G3-smoke", "T2"),
+		// This preserves the historical CaseID as a QUIC DATAGRAM smoke.
+		// It is not RFC 9000 CID/NAT-rebinding Gold evidence; V1-M1 still
+		// requires a replacement case with an external CID migration oracle.
+		spec:       manifest.RequiredWithBudget("G3-smoke", "T2", g3SmokeBudget),
 		onlyOn:     "linux",
 		skipReason: "Linux only (sysctl net.core.rmem_max=8MiB for 30k pps QUIC DATAGRAM)",
 		run: func(ctx context.Context) smoke.Result {
 			return smoke.RunG3(ctx, smoke.G3Opts{})
 		},
 	},
-	{spec: manifest.Required("G4", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("G4", "T2", g4G5SmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG4(ctx, smoke.G4Opts{})
 	}},
-	{spec: manifest.Required("G5", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("G5", "T2", g4G5SmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG5(ctx, smoke.G5Opts{})
 	}},
-	{spec: manifest.Required("M11-udp-relay-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("M11-udp-relay-smoke", "T2", relaySmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunUDPRelay(ctx, smoke.UDPRelayOpts{})
 	}},
-	{spec: manifest.Required("M11-udp-relay-porthop-smoke", "T2"), run: func(ctx context.Context) smoke.Result {
+	{spec: manifest.RequiredWithBudget("M11-udp-relay-porthop-smoke", "T2", relaySmokeBudget), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunUDPRelayPortHop(ctx, smoke.UDPRelayOpts{
 			Packets:    128,
 			Paths:      2,
@@ -134,16 +151,50 @@ func RunWithOptions(ctx context.Context, suite *report.Suite, _ string, opts Opt
 			suite.Add(report.Case{Name: def.spec.ID, Tier: "T2", SkipReason: def.skipReason})
 			continue
 		}
-		addRun(suite, def.spec.ID, "T2", func() smoke.Result { return def.run(ctx) })
+		addRun(ctx, suite, def.spec.ID, "T2", def.spec.Budget, def.run)
 	}
 }
 
-func addRun(suite *report.Suite, name, tier string, fn func() smoke.Result) {
-	r := fn()
-	suite.Add(report.Case{
-		Name:     name,
-		Tier:     tier,
-		Duration: r.Duration,
-		Failure:  r.Failure,
-	})
+func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) {
+	if budget <= 0 {
+		suite.Add(report.Case{Name: name, Tier: tier, Failure: "T2 case has no bounded execution budget"})
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	start := time.Now()
+	done := make(chan smoke.Result, 1)
+	go func() {
+		done <- fn(cctx)
+	}()
+
+	result := report.Case{Name: name, Tier: tier}
+	select {
+	case r := <-done:
+		result.Duration = r.Duration
+		if result.Duration == 0 {
+			result.Duration = time.Since(start)
+		}
+		result.Failure = r.Failure
+		result.Evidence = detailEvidence(r.Detail)
+	case <-cctx.Done():
+		result.Duration = time.Since(start)
+		if cctx.Err() == context.DeadlineExceeded {
+			result.Failure = fmt.Sprintf("case exceeded T2 budget %s: %v", budget, cctx.Err())
+		} else {
+			result.Failure = fmt.Sprintf("case canceled: %v", cctx.Err())
+		}
+	}
+	suite.Add(result)
+}
+
+func detailEvidence(detail map[string]any) map[string]string {
+	if len(detail) == 0 {
+		return nil
+	}
+	evidence := make(map[string]string, len(detail))
+	for key, value := range detail {
+		evidence[key] = fmt.Sprint(value)
+	}
+	return evidence
 }
