@@ -49,25 +49,28 @@ const (
 )
 
 const (
-	listSchemaVersion       = 2
-	invocationSchemaVersion = 4
+	listSchemaVersion       = 3
+	invocationSchemaVersion = 5
 	junitReportFileName     = "junit.xml"
 	markdownReportFileName  = "SUMMARY.md"
+	jsonReportFileName      = "report.json"
 )
 
 type runFlags struct {
-	phase         string
-	tier          string
-	full          bool
-	tunFull       bool
-	list          bool
-	forcePhase2   bool
-	allowNonLinux bool
-	profile       string
-	caseID        string
-	fromCaseID    string
-	reportDir     string
-	rendrRoot     string
+	phase            string
+	tier             string
+	full             bool
+	tunFull          bool
+	list             bool
+	forcePhase2      bool
+	allowNonLinux    bool
+	profile          string
+	caseID           string
+	fromCaseID       string
+	selectorID       string
+	requestedCaseIDs []string
+	reportDir        string
+	rendrRoot        string
 }
 
 func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
@@ -84,6 +87,7 @@ func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
 	fs.StringVar(&cfg.profile, "profile", "", "legacy T3 profile filter (unsupported; use --case)")
 	fs.StringVar(&cfg.caseID, "case", "", "run exactly one globally registered case")
 	fs.StringVar(&cfg.fromCaseID, "from-case", "", "resume inclusively from a registered case")
+	fs.StringVar(&cfg.selectorID, "selector", "", "expand one registered compatibility selector")
 	fs.StringVar(&cfg.reportDir, "report-dir", "reports", "directory for JUnit, summary, and gate state")
 	fs.StringVar(&cfg.rendrRoot, "rendr-root", "..", "path to the rendr repository root")
 	if err := fs.Parse(args); err != nil {
@@ -156,16 +160,20 @@ func prepareCommand(cfg runFlags) (preparedCommand, error) {
 	if err != nil {
 		return preparedCommand{}, err
 	}
+	suiteName, err := resolveCommandSuite(cfg, normalSpecs, tunCatalog)
+	if err != nil {
+		return preparedCommand{}, err
+	}
 
 	if cfg.list {
-		doc, err := buildListDocument(cfg, normalSpecs, tunCatalog)
+		doc, err := buildListDocument(cfg, suiteName, normalSpecs, tunCatalog)
 		if err != nil {
 			return preparedCommand{}, err
 		}
 		return preparedCommand{list: &doc}, nil
 	}
-	if cfg.tunFull {
-		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID)
+	if suiteName == manifest.SuiteTUN {
+		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID, cfg.selectorID)
 		if err != nil {
 			return preparedCommand{}, fmt.Errorf("TUN run plan: %w", err)
 		}
@@ -189,14 +197,20 @@ func prepareCommand(cfg runFlags) (preparedCommand, error) {
 }
 
 func validateFlagCombinations(cfg runFlags) error {
-	if cfg.caseID != "" && cfg.fromCaseID != "" {
-		return errors.New("--case and --from-case are mutually exclusive")
+	filters := 0
+	for _, value := range []string{cfg.caseID, cfg.fromCaseID, cfg.selectorID} {
+		if value != "" {
+			filters++
+		}
+	}
+	if filters > 1 {
+		return errors.New("--case, --from-case, and --selector are mutually exclusive")
 	}
 	if cfg.full && cfg.tunFull {
 		return errors.New("--full and --tun-full are mutually exclusive")
 	}
-	if cfg.full && (cfg.caseID != "" || cfg.fromCaseID != "") {
-		return errors.New("--full cannot be combined with --case or --from-case; use a standalone filter for resumable execution")
+	if cfg.full && filters != 0 {
+		return errors.New("--full cannot be combined with --case, --from-case, or --selector; use a standalone filter for targeted execution")
 	}
 	if cfg.tunFull && cfg.phase != "" {
 		return errors.New("--tun-full cannot be combined with --phase")
@@ -228,11 +242,85 @@ func loadCatalogs() ([]manifest.Spec, tunCatalog, error) {
 	if err != nil {
 		return nil, tunCatalog{}, err
 	}
-	all := append(append([]manifest.Spec(nil), normalSpecs...), tunCases.specs...)
-	if err := manifest.Validate(all); err != nil {
-		return nil, tunCatalog{}, fmt.Errorf("global catalog validation failed: %w", err)
+	if err := validateGlobalCatalogNames(normalSpecs, tunCases); err != nil {
+		return nil, tunCatalog{}, err
 	}
 	return normalSpecs, tunCases, nil
+}
+
+func validateGlobalCatalogNames(normalSpecs []manifest.Spec, tunCases tunCatalog) error {
+	all := append(append([]manifest.Spec(nil), normalSpecs...), tunCases.specs...)
+	if err := manifest.Validate(all); err != nil {
+		return fmt.Errorf("global catalog validation failed: %w", err)
+	}
+	normalIDs := make(map[string]bool, len(normalSpecs))
+	for _, spec := range normalSpecs {
+		normalIDs[spec.ID] = true
+	}
+	for _, alias := range tunCases.aliases {
+		if normalIDs[alias.ID] {
+			return fmt.Errorf("global catalog validation failed: TUN selector %q collides with a normal executable case", alias.ID)
+		}
+	}
+	return nil
+}
+
+func resolveCommandSuite(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tunCatalog) (string, error) {
+	if cfg.selectorID != "" {
+		if cfg.phase != "" || cfg.tier != "" {
+			return "", errors.New("--selector cannot be combined with --phase or --tier")
+		}
+		if !tunCatalog.hasSelector(cfg.selectorID) {
+			if _, ok := findManifestSpec(normalSpecs, cfg.selectorID); ok || tunCatalog.hasCase(cfg.selectorID) {
+				return "", fmt.Errorf("--selector=%q names an executable CaseID, not a compatibility selector; use --case", cfg.selectorID)
+			}
+			return "", fmt.Errorf("no compatibility selector matched --selector=%q", cfg.selectorID)
+		}
+		return manifest.SuiteTUN, nil
+	}
+
+	filterName, filterID := "", ""
+	if cfg.caseID != "" {
+		filterName, filterID = "--case", cfg.caseID
+	} else if cfg.fromCaseID != "" {
+		filterName, filterID = "--from-case", cfg.fromCaseID
+	}
+	if filterID == "" {
+		if cfg.tunFull {
+			return manifest.SuiteTUN, nil
+		}
+		return manifest.SuiteNormal, nil
+	}
+	if tunCatalog.hasSelector(filterID) {
+		return "", fmt.Errorf("%s=%q is a compatibility selector, not an executable CaseID; use --selector", filterName, filterID)
+	}
+	_, normal := findManifestSpec(normalSpecs, filterID)
+	tun := tunCatalog.hasCase(filterID)
+	if normal == tun {
+		if normal {
+			return "", fmt.Errorf("globally ambiguous executable CaseID %q", filterID)
+		}
+		return "", fmt.Errorf("manifest: no case matched %s=%q", filterName, filterID)
+	}
+	if normal {
+		if cfg.tunFull {
+			return "", fmt.Errorf("%s=%q belongs to the normal suite, not --tun-full", filterName, filterID)
+		}
+		return manifest.SuiteNormal, nil
+	}
+	if cfg.phase != "" || cfg.tier != "" {
+		return "", fmt.Errorf("%s=%q belongs to the TUN suite and cannot be combined with --phase or --tier", filterName, filterID)
+	}
+	return manifest.SuiteTUN, nil
+}
+
+func findManifestSpec(specs []manifest.Spec, id string) (manifest.Spec, bool) {
+	for _, spec := range specs {
+		if spec.ID == id {
+			return spec, true
+		}
+	}
+	return manifest.Spec{}, false
 }
 
 func resolveRendrRoot(root string) (string, error) {
@@ -420,6 +508,10 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 			}
 		}
 	}
+	if err := requirePassingFinalReport(cfg.reportDir, suite); err != nil {
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
 	return exitOK
 }
 
@@ -433,6 +525,7 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 	for i, plannedCase := range planned {
 		expected[i] = plannedCase.Spec()
 	}
+	cfg.requestedCaseIDs = append([]string(nil), selection.requestedOrder...)
 	suite, revisionStart, err := beginInvocation(
 		ctx,
 		cfg,
@@ -502,6 +595,10 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 			fmt.Fprintln(stderr, "phase 2 / TUN synthetic L3/session: FAILED")
 			return exitT7Fail
 		}
+	}
+	if err := requirePassingFinalReport(cfg.reportDir, suite); err != nil {
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
 	}
 	fmt.Fprintln(stdout, "phase 2 / TUN synthetic L3/session: GREEN (kernel TUN Gold remains separate)")
 	return exitOK
@@ -612,7 +709,7 @@ func beginInvocation(
 
 func invalidateFixedReports(dir string) error {
 	var removeErrors []error
-	for _, name := range []string{junitReportFileName, markdownReportFileName} {
+	for _, name := range []string{junitReportFileName, markdownReportFileName, jsonReportFileName} {
 		path := filepath.Join(dir, name)
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
@@ -634,44 +731,102 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 	for i, spec := range selected {
 		selectedIDs[i] = spec.ID
 	}
+	requestedIDs, requestAnchor, err := requestedInvocationIdentity(cfg, selectedIDs)
+	if err != nil {
+		return report.Invocation{}, err
+	}
 	return report.Invocation{
-		SchemaVersion:   invocationSchemaVersion,
-		Suite:           suiteName,
-		Scope:           invocationScope(cfg, selected),
-		Phase:           cfg.phase,
-		Tier:            cfg.tier,
-		Full:            cfg.full,
-		TUNFull:         cfg.tunFull,
-		Case:            cfg.caseID,
-		FromCase:        cfg.fromCaseID,
-		ResumeCaseID:    selectedIDs[0],
-		Forced:          cfg.forcePhase2,
-		AllowNonLinux:   cfg.allowNonLinux,
-		ManifestDigest:  digest,
-		CatalogDigest:   catalogDigest,
-		SelectedCases:   len(selected),
-		SelectedCaseIDs: selectedIDs,
-		EvidenceClass:   invocationEvidenceClass(suiteName),
-		ReleaseManifest: false,
+		SchemaVersion:    invocationSchemaVersion,
+		Suite:            suiteName,
+		Scope:            invocationScope(cfg),
+		Phase:            cfg.phase,
+		Tier:             cfg.tier,
+		Full:             cfg.full,
+		TUNFull:          cfg.tunFull,
+		Case:             cfg.caseID,
+		Selector:         cfg.selectorID,
+		FromCase:         cfg.fromCaseID,
+		ResumeCaseID:     selectedIDs[0],
+		Forced:           cfg.forcePhase2,
+		AllowNonLinux:    cfg.allowNonLinux,
+		ManifestDigest:   digest,
+		CatalogDigest:    catalogDigest,
+		SelectedCases:    len(selected),
+		SelectedCaseIDs:  selectedIDs,
+		RequestedCaseIDs: requestedIDs,
+		RequestAnchor:    requestAnchor,
+		EvidenceClass:    invocationEvidenceClass(suiteName),
+		ReleaseManifest:  false,
 	}, nil
 }
 
+func requestedInvocationIdentity(cfg runFlags, selectedIDs []string) ([]string, string, error) {
+	if len(selectedIDs) == 0 {
+		return nil, "", errors.New("selected manifest is empty")
+	}
+	indexByID := make(map[string]int, len(selectedIDs))
+	for i, id := range selectedIDs {
+		indexByID[id] = i
+	}
+	requested := append([]string(nil), cfg.requestedCaseIDs...)
+	anchor := ""
+	switch {
+	case cfg.selectorID != "":
+		anchor = cfg.selectorID
+		if len(requested) == 0 {
+			requested = append([]string(nil), selectedIDs...)
+		}
+	case cfg.caseID != "":
+		anchor = cfg.caseID
+		requested = []string{cfg.caseID}
+	case cfg.fromCaseID != "":
+		anchor = cfg.fromCaseID
+		start, ok := indexByID[cfg.fromCaseID]
+		if !ok {
+			return nil, "", fmt.Errorf("requested --from-case=%q is not in execution plan %v", cfg.fromCaseID, selectedIDs)
+		}
+		requested = append([]string(nil), selectedIDs[start:]...)
+	default:
+		requested = append([]string(nil), selectedIDs...)
+		anchor = requested[0]
+	}
+	seen := make(map[string]bool, len(requested))
+	lastIndex := -1
+	for _, id := range requested {
+		index, ok := indexByID[id]
+		if !ok {
+			return nil, "", fmt.Errorf("requested case %q is not in execution plan %v", id, selectedIDs)
+		}
+		if seen[id] || index <= lastIndex {
+			return nil, "", fmt.Errorf("requested cases are duplicate or out of execution order: %v", requested)
+		}
+		seen[id] = true
+		lastIndex = index
+	}
+	return requested, anchor, nil
+}
+
+func manifestIDs(specs []manifest.Spec) []string {
+	ids := make([]string, len(specs))
+	for i, spec := range specs {
+		ids[i] = spec.ID
+	}
+	return ids
+}
+
 func invocationEvidenceClass(suiteName string) string {
-	if suiteName == manifest.SuiteTUN {
+	if suiteName == manifest.SuiteTUN || suiteName == tunInvocationSuite {
 		return tunSyntheticEvidenceClass
 	}
 	return normalComponentEvidenceClass
 }
 
-func invocationScope(cfg runFlags, selected []manifest.Spec) string {
+func invocationScope(cfg runFlags) string {
 	switch {
-	case cfg.caseID != "":
-		for _, spec := range selected {
-			if spec.ID == cfg.caseID {
-				return "exact"
-			}
-		}
+	case cfg.selectorID != "":
 		return "selector"
+	case cfg.caseID != "":
+		return "exact"
 	case cfg.fromCaseID != "":
 		return "from-case"
 	case cfg.full || cfg.tunFull:
@@ -686,13 +841,58 @@ func invocationScope(cfg runFlags, selected []manifest.Spec) string {
 }
 
 func selectedManifestDigest(selected []manifest.Spec) (string, error) {
-	if len(selected) == 0 {
-		return "", errors.New("selected manifest is empty")
-	}
-	if err := manifest.Validate(selected); err != nil {
+	if err := validateSelectedManifest(selected); err != nil {
 		return "", fmt.Errorf("selected manifest is invalid: %w", err)
 	}
 	return digestJSON("selected manifest", selected)
+}
+
+// validateSelectedManifest validates reportable rows without requiring the
+// selected subset to contain prerequisite rows outside its requested scope.
+func validateSelectedManifest(selected []manifest.Spec) error {
+	if len(selected) == 0 {
+		return errors.New("selected manifest is empty")
+	}
+	wantSuite := selected[0].Suite
+	seen := make(map[string]bool, len(selected))
+	for i, spec := range selected {
+		if spec.ID == "" {
+			return fmt.Errorf("case %d has empty ID", i)
+		}
+		if seen[spec.ID] {
+			return fmt.Errorf("duplicate case ID %q", spec.ID)
+		}
+		seen[spec.ID] = true
+		if spec.Tier == "" {
+			return fmt.Errorf("case %q has empty tier", spec.ID)
+		}
+		if spec.Suite != manifest.SuiteNormal && spec.Suite != manifest.SuiteTUN {
+			return fmt.Errorf("case %q has unsupported suite %q", spec.ID, spec.Suite)
+		}
+		if spec.Suite != wantSuite {
+			return fmt.Errorf("case %q has suite %q, want %q", spec.ID, spec.Suite, wantSuite)
+		}
+		if !spec.Mandatory {
+			return fmt.Errorf("case %q is not mandatory", spec.ID)
+		}
+		if spec.Budget <= 0 {
+			return fmt.Errorf("case %q has non-positive budget %s", spec.ID, spec.Budget)
+		}
+		required := make(map[string]bool, len(spec.Requires))
+		for _, requiredID := range spec.Requires {
+			if requiredID == "" {
+				return fmt.Errorf("case %q has an empty prerequisite", spec.ID)
+			}
+			if required[requiredID] {
+				return fmt.Errorf("case %q has duplicate prerequisite %q", spec.ID, requiredID)
+			}
+			required[requiredID] = true
+		}
+		if _, err := spec.CanonicalDigest(); err != nil {
+			return fmt.Errorf("case %q is not canonically digestible: %w", spec.ID, err)
+		}
+	}
+	return nil
 }
 
 func suiteRegistryDigest(suiteName string) (string, error) {
@@ -704,7 +904,7 @@ func suiteRegistryDigest(suiteName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	doc, err := buildListDocument(runFlags{}, normalSpecs, tunCatalog)
+	doc, err := buildListDocument(runFlags{}, "", normalSpecs, tunCatalog)
 	if err != nil {
 		return "", fmt.Errorf("build full registry document: %w", err)
 	}
@@ -822,8 +1022,9 @@ type tunCatalog struct {
 }
 
 type tunSelection struct {
-	cases    []listedCase
-	runOrder []string
+	cases          []listedCase
+	runOrder       []string
+	requestedOrder []string
 }
 
 var runTUNCase = tunfull.RunPlannedCase
@@ -887,12 +1088,7 @@ func buildTUNCatalog(specs []manifest.Spec, aliases []tunfull.Alias) (tunCatalog
 }
 
 func cloneManifestSpecs(specs []manifest.Spec) []manifest.Spec {
-	cloned := make([]manifest.Spec, len(specs))
-	for i, spec := range specs {
-		cloned[i] = spec
-		cloned[i].Requires = append([]string(nil), spec.Requires...)
-	}
-	return cloned
+	return manifest.CloneSpecs(specs)
 }
 
 func cloneTUNAliases(aliases []tunfull.Alias) []tunfull.Alias {
@@ -902,6 +1098,20 @@ func cloneTUNAliases(aliases []tunfull.Alias) []tunfull.Alias {
 		cloned[i].ExpandsTo = append([]string(nil), alias.ExpandsTo...)
 	}
 	return cloned
+}
+
+func (catalog tunCatalog) hasCase(id string) bool {
+	_, ok := findManifestSpec(catalog.specs, id)
+	return ok
+}
+
+func (catalog tunCatalog) hasSelector(id string) bool {
+	for _, alias := range catalog.aliases {
+		if alias.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (catalog tunCatalog) entries() ([]tunCatalogEntry, error) {
@@ -933,31 +1143,59 @@ func (catalog tunCatalog) entries() ([]tunCatalogEntry, error) {
 				runIDs: append([]string(nil), alias.ExpandsTo...),
 			})
 		}
+		listed, err := listedCaseFrom(spec, 2, true, tunKindCase, nil)
+		if err != nil {
+			return nil, err
+		}
 		entries = append(entries, tunCatalogEntry{
-			listed: listedCaseFrom(spec, 2, true, tunKindCase, nil),
+			listed: listed,
 			runIDs: []string{spec.ID},
 		})
 	}
 	return entries, nil
 }
 
-func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, error) {
-	if caseID != "" && fromCaseID != "" {
-		return tunSelection{}, errors.New("manifest: --case and --from-case are mutually exclusive")
+func (catalog tunCatalog) selectCases(caseID, fromCaseID, selectorID string) (tunSelection, error) {
+	filters := 0
+	for _, value := range []string{caseID, fromCaseID, selectorID} {
+		if value != "" {
+			filters++
+		}
+	}
+	if filters > 1 {
+		return tunSelection{}, errors.New("manifest: --case, --from-case, and --selector are mutually exclusive")
 	}
 	entries, err := catalog.entries()
 	if err != nil {
 		return tunSelection{}, err
 	}
-	if caseID == "" && fromCaseID == "" {
-		result := tunSelection{cases: make([]listedCase, len(entries)), runOrder: make([]string, len(catalog.specs))}
+	if filters == 0 {
+		result := tunSelection{
+			cases: make([]listedCase, len(entries)), runOrder: make([]string, len(catalog.specs)),
+			requestedOrder: make([]string, len(catalog.specs)),
+		}
 		for i, entry := range entries {
 			result.cases[i] = entry.listed
 		}
 		for i, spec := range catalog.specs {
 			result.runOrder[i] = spec.ID
+			result.requestedOrder[i] = spec.ID
 		}
 		return catalog.withPrerequisites(result)
+	}
+
+	if selectorID != "" {
+		for _, entry := range entries {
+			if entry.listed.ID != selectorID || entry.listed.Kind == tunKindCase {
+				continue
+			}
+			return catalog.withPrerequisites(tunSelection{
+				cases:          []listedCase{entry.listed},
+				runOrder:       append([]string(nil), entry.runIDs...),
+				requestedOrder: append([]string(nil), entry.runIDs...),
+			})
+		}
+		return tunSelection{}, fmt.Errorf("manifest: no compatibility selector matched --selector=%q", selectorID)
 	}
 
 	want := caseID
@@ -965,50 +1203,39 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, 
 		want = fromCaseID
 	}
 	start := -1
-	for i, entry := range entries {
-		if entry.listed.ID == want {
+	for i, spec := range catalog.specs {
+		if spec.ID == want {
 			start = i
 			break
 		}
 	}
 	if start < 0 {
+		if catalog.hasSelector(want) {
+			return tunSelection{}, fmt.Errorf("manifest: %q is a compatibility selector; use --selector", want)
+		}
 		if caseID != "" {
 			return tunSelection{}, fmt.Errorf("manifest: no case matched --case=%q", caseID)
 		}
 		return tunSelection{}, fmt.Errorf("manifest: no case matched --from-case=%q", fromCaseID)
 	}
+	end := len(catalog.specs)
 	if caseID != "" {
-		entry := entries[start]
-		return catalog.withPrerequisites(tunSelection{
-			cases:    []listedCase{entry.listed},
-			runOrder: append([]string(nil), entry.runIDs...),
-		})
+		end = start + 1
 	}
-
-	selectedEntries := entries[start:]
-	result := tunSelection{cases: make([]listedCase, len(selectedEntries))}
-	for i, entry := range selectedEntries {
-		result.cases[i] = entry.listed
+	selectedSpecs := catalog.specs[start:end]
+	result := tunSelection{
+		cases:          make([]listedCase, len(selectedSpecs)),
+		runOrder:       make([]string, len(selectedSpecs)),
+		requestedOrder: make([]string, len(selectedSpecs)),
 	}
-	emitted := make(map[string]bool)
-	add := func(ids ...string) {
-		for _, id := range ids {
-			if !emitted[id] {
-				result.runOrder = append(result.runOrder, id)
-				emitted[id] = true
-			}
+	for i, spec := range selectedSpecs {
+		listed, err := listedCaseFrom(spec, 2, true, tunKindCase, nil)
+		if err != nil {
+			return tunSelection{}, err
 		}
-	}
-	if selectedEntries[0].listed.Kind != tunKindCase {
-		add(selectedEntries[0].runIDs...)
-	}
-	for _, entry := range selectedEntries {
-		if entry.listed.Kind == tunKindCase {
-			add(entry.runIDs...)
-		}
-	}
-	if len(result.runOrder) == 0 {
-		return tunSelection{}, errors.New("selected TUN scope contains no executable cases")
+		result.cases[i] = listed
+		result.runOrder[i] = spec.ID
+		result.requestedOrder[i] = spec.ID
 	}
 	return catalog.withPrerequisites(result)
 }
@@ -1035,41 +1262,57 @@ type listDocument struct {
 }
 
 type listCatalog struct {
-	Suite         string       `json:"suite"`
-	EvidenceClass string       `json:"evidence_class,omitempty"`
-	Cases         []listedCase `json:"cases"`
-	RunOrder      []string     `json:"run_order"`
+	Suite            string       `json:"suite"`
+	EvidenceClass    string       `json:"evidence_class,omitempty"`
+	Cases            []listedCase `json:"cases"`
+	RunOrder         []string     `json:"run_order"`
+	RequestedCaseIDs []string     `json:"requested_case_ids,omitempty"`
+	RequestAnchor    string       `json:"request_anchor,omitempty"`
 }
 
 type listedCase struct {
-	ID         string        `json:"id"`
-	Tier       string        `json:"tier"`
-	Suite      string        `json:"suite"`
-	Phase      int           `json:"phase"`
-	Mandatory  bool          `json:"mandatory"`
-	Requires   []string      `json:"requires,omitempty"`
-	Long       bool          `json:"long,omitempty"`
-	Budget     time.Duration `json:"budget_ns,omitempty"`
-	DefaultRun bool          `json:"default_run"`
-	Kind       string        `json:"kind"`
-	ExpandsTo  []string      `json:"expands_to,omitempty"`
+	ID         string             `json:"id"`
+	Tier       string             `json:"tier"`
+	Suite      string             `json:"suite"`
+	Phase      int                `json:"phase"`
+	Mandatory  bool               `json:"mandatory"`
+	Requires   []string           `json:"requires,omitempty"`
+	Long       bool               `json:"long,omitempty"`
+	Budget     time.Duration      `json:"budget_ns,omitempty"`
+	DefaultRun bool               `json:"default_run"`
+	Kind       string             `json:"kind"`
+	ExpandsTo  []string           `json:"expands_to,omitempty"`
+	CaseDigest string             `json:"case_digest,omitempty"`
+	Contract   *manifest.Contract `json:"contract,omitempty"`
 }
 
-func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tunCatalog) (listDocument, error) {
+func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Spec, tunCatalog tunCatalog) (listDocument, error) {
 	doc := listDocument{SchemaVersion: listSchemaVersion}
-	if cfg.tunFull {
-		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID)
+	if hasListScope(cfg) && suiteName == manifest.SuiteTUN {
+		selection, err := tunCatalog.selectCases(cfg.caseID, cfg.fromCaseID, cfg.selectorID)
 		if err != nil {
 			return listDocument{}, fmt.Errorf("TUN list selection: %w", err)
 		}
+		listed, err := tunCatalog.listSelection(selection)
+		if err != nil {
+			return listDocument{}, fmt.Errorf("TUN list projection: %w", err)
+		}
+		_, requestAnchor, err := requestedInvocationIdentity(runFlags{
+			caseID: cfg.caseID, fromCaseID: cfg.fromCaseID, selectorID: cfg.selectorID,
+			requestedCaseIDs: selection.requestedOrder,
+		}, selection.runOrder)
+		if err != nil {
+			return listDocument{}, fmt.Errorf("TUN list request identity: %w", err)
+		}
 		doc.Catalogs = append(doc.Catalogs, listCatalog{
 			Suite: manifest.SuiteTUN, EvidenceClass: tunSyntheticEvidenceClass,
-			Cases: selection.cases, RunOrder: selection.runOrder,
+			Cases: listed, RunOrder: selection.runOrder,
+			RequestedCaseIDs: append([]string(nil), selection.requestedOrder...), RequestAnchor: requestAnchor,
 		})
 		return doc, nil
 	}
 
-	if hasNormalListScope(cfg) {
+	if hasListScope(cfg) {
 		plan, err := runplan.Build(runplan.Request{
 			Phase: cfg.phase, Tier: cfg.tier, Full: cfg.full,
 			Case: cfg.caseID, FromCase: cfg.fromCaseID,
@@ -1085,6 +1328,12 @@ func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tun
 		if err != nil {
 			return listDocument{}, err
 		}
+		requestedIDs, requestAnchor, err := requestedInvocationIdentity(cfg, manifestIDs(selected))
+		if err != nil {
+			return listDocument{}, fmt.Errorf("normal list request identity: %w", err)
+		}
+		normal.RequestedCaseIDs = requestedIDs
+		normal.RequestAnchor = requestAnchor
 		doc.Catalogs = append(doc.Catalogs, normal)
 		return doc, nil
 	}
@@ -1093,7 +1342,7 @@ func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tun
 	if err != nil {
 		return listDocument{}, err
 	}
-	tunSelection, err := tunCatalog.selectCases("", "")
+	tunSelection, err := tunCatalog.selectCases("", "", "")
 	if err != nil {
 		return listDocument{}, err
 	}
@@ -1104,8 +1353,36 @@ func buildListDocument(cfg runFlags, normalSpecs []manifest.Spec, tunCatalog tun
 	return doc, nil
 }
 
-func hasNormalListScope(cfg runFlags) bool {
-	return cfg.phase != "" || cfg.tier != "" || cfg.full || cfg.caseID != "" || cfg.fromCaseID != ""
+func (catalog tunCatalog) listSelection(selection tunSelection) ([]listedCase, error) {
+	entries, err := catalog.entries()
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]listedCase, len(entries))
+	for _, entry := range entries {
+		byID[entry.listed.ID] = entry.listed
+	}
+	listed := make([]listedCase, 0, len(selection.runOrder)+len(selection.cases))
+	seen := make(map[string]bool, cap(listed))
+	for _, id := range selection.runOrder {
+		entry, ok := byID[id]
+		if !ok || entry.Kind != tunKindCase {
+			return nil, fmt.Errorf("execution CaseID %q has no executable catalog entry", id)
+		}
+		listed = append(listed, entry)
+		seen[id] = true
+	}
+	for _, requested := range selection.cases {
+		if !seen[requested.ID] {
+			listed = append(listed, requested)
+			seen[requested.ID] = true
+		}
+	}
+	return listed, nil
+}
+
+func hasListScope(cfg runFlags) bool {
+	return cfg.phase != "" || cfg.tier != "" || cfg.full || cfg.tunFull || cfg.caseID != "" || cfg.fromCaseID != "" || cfg.selectorID != ""
 }
 
 func specsForPlan(plan runplan.Plan, byTier func(string) []manifest.Spec) ([]manifest.Spec, error) {
@@ -1121,7 +1398,7 @@ func specsForPlan(plan runplan.Plan, byTier func(string) []manifest.Spec) ([]man
 		}
 		selected = append(selected, specs...)
 	}
-	if err := manifest.Validate(selected); err != nil {
+	if err := validateSelectedManifest(selected); err != nil {
 		return nil, fmt.Errorf("selected list validation failed: %w", err)
 	}
 	return selected, nil
@@ -1183,6 +1460,17 @@ func reconcileReportRows(expected []manifest.Spec, actual []report.Case) error {
 		if want.Mandatory && got.Optional {
 			return fmt.Errorf("manifest/report mandatory case %q was downgraded to optional", want.ID)
 		}
+		digest, err := want.CanonicalDigest()
+		if err != nil {
+			return fmt.Errorf("manifest/report cannot digest case %q: %w", want.ID, err)
+		}
+		if got.CaseDigest != "" && got.CaseDigest != digest {
+			return fmt.Errorf("manifest/report case %q digest mismatch: got %q, want %q", want.ID, got.CaseDigest, digest)
+		}
+		// This is the selected manifest identity, not proof that the runner
+		// exercised its declared stimulus. Contract evidence facts and their
+		// independent oracle remain responsible for execution truth.
+		actual[i].CaseDigest = digest
 	}
 	return nil
 }
@@ -1191,7 +1479,7 @@ func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
 	if len(specs) == 0 {
 		return listCatalog{}, errors.New("normal list contains no cases")
 	}
-	if err := manifest.Validate(specs); err != nil {
+	if err := validateSelectedManifest(specs); err != nil {
 		return listCatalog{}, err
 	}
 	result := listCatalog{Suite: manifest.SuiteNormal, Cases: make([]listedCase, 0, len(specs)), RunOrder: make([]string, 0, len(specs))}
@@ -1203,7 +1491,11 @@ func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
 		if err != nil {
 			return listCatalog{}, err
 		}
-		result.Cases = append(result.Cases, listedCaseFrom(spec, phase, true, tunKindCase, nil))
+		listed, err := listedCaseFrom(spec, phase, true, tunKindCase, nil)
+		if err != nil {
+			return listCatalog{}, err
+		}
+		result.Cases = append(result.Cases, listed)
 		result.RunOrder = append(result.RunOrder, spec.ID)
 	}
 	return result, nil
@@ -1220,7 +1512,19 @@ func phaseForTier(tier string) (int, error) {
 	}
 }
 
-func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string, expandsTo []string) listedCase {
+func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string, expandsTo []string) (listedCase, error) {
+	digest, err := spec.CanonicalDigest()
+	if err != nil {
+		return listedCase{}, fmt.Errorf("list case %q: %w", spec.ID, err)
+	}
+	var contract *manifest.Contract
+	if spec.Contract != nil {
+		normalized, err := spec.Contract.Normalize()
+		if err != nil {
+			return listedCase{}, fmt.Errorf("list case %q contract: %w", spec.ID, err)
+		}
+		contract = &normalized
+	}
 	return listedCase{
 		ID:         spec.ID,
 		Tier:       spec.Tier,
@@ -1233,7 +1537,9 @@ func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string,
 		DefaultRun: defaultRun,
 		Kind:       kind,
 		ExpandsTo:  append([]string(nil), expandsTo...),
-	}
+		CaseDigest: digest,
+		Contract:   contract,
+	}, nil
 }
 
 func writeList(w io.Writer, doc listDocument) error {
@@ -1249,11 +1555,50 @@ func tunFullUnimplementedCase() report.Case {
 func writeReports(suite *report.Suite, dir string) error {
 	junit := filepath.Join(dir, junitReportFileName)
 	md := filepath.Join(dir, markdownReportFileName)
+	jsonReport := filepath.Join(dir, jsonReportFileName)
 	if err := suite.WriteJUnit(junit); err != nil {
-		return fmt.Errorf("write JUnit: %w", err)
+		return failReportSet(dir, fmt.Errorf("write JUnit: %w", err))
 	}
 	if err := suite.WriteMarkdown(md); err != nil {
-		return fmt.Errorf("write summary: %w", err)
+		return failReportSet(dir, fmt.Errorf("write summary: %w", err))
+	}
+	// report.json is the machine gate and therefore the commit marker for the
+	// report set. Never leave a green canonical report when a companion report
+	// failed to persist.
+	if err := suite.WriteJSON(jsonReport); err != nil {
+		return failReportSet(dir, fmt.Errorf("write JSON report: %w", err))
+	}
+	return nil
+}
+
+func failReportSet(dir string, writeErr error) error {
+	if cleanupErr := invalidateFixedReports(dir); cleanupErr != nil {
+		return errors.Join(writeErr, fmt.Errorf("invalidate incomplete report set: %w", cleanupErr))
+	}
+	return writeErr
+}
+
+func requirePassingFinalReport(dir string, suite *report.Suite) error {
+	path := filepath.Join(dir, jsonReportFileName)
+	final, err := report.ReadJSON(path)
+	if err != nil {
+		return fmt.Errorf("cannot read finalized report: %w", err)
+	}
+	wantDigest, err := suite.ReportDigest()
+	if err != nil {
+		return fmt.Errorf("cannot seal in-memory final report: %w", err)
+	}
+	if final.ReportDigest != wantDigest {
+		return fmt.Errorf("finalized report digest %q does not match in-memory result %q", final.ReportDigest, wantDigest)
+	}
+	if !final.Complete {
+		return errors.New("finalized report is incomplete, refusing a zero exit")
+	}
+	if final.Invocation.SchemaVersion != invocationSchemaVersion {
+		return fmt.Errorf("finalized report invocation schema is %d, want %d", final.Invocation.SchemaVersion, invocationSchemaVersion)
+	}
+	if final.State != "pass" {
+		return fmt.Errorf("finalized report state is %q, refusing a zero exit", final.State)
 	}
 	return nil
 }

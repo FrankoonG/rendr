@@ -100,10 +100,7 @@ func clone(specs []manifest.Spec) []manifest.Spec {
 }
 
 func cloneSpec(spec manifest.Spec) manifest.Spec {
-	if spec.Requires != nil {
-		spec.Requires = append([]string(nil), spec.Requires...)
-	}
-	return spec
+	return manifest.CloneSpec(spec)
 }
 
 func validateSources(sources []tierSource) error {

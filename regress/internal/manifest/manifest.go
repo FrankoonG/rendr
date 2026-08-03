@@ -22,6 +22,7 @@ type Spec struct {
 	Requires  []string      `json:"requires,omitempty"`
 	Long      bool          `json:"long,omitempty"`
 	Budget    time.Duration `json:"budget_ns,omitempty"`
+	Contract  *Contract     `json:"contract,omitempty"`
 }
 
 // RequiredWithBudget constructs a mandatory normal-suite case with its
@@ -30,9 +31,34 @@ func RequiredWithBudget(id, tier string, budget time.Duration) Spec {
 	return Spec{ID: id, Tier: tier, Suite: SuiteNormal, Mandatory: true, Budget: budget}
 }
 
-// Validate rejects catalog states that could make listing and execution
-// disagree or make a resume point ambiguous.
+// Validate performs legacy/incremental validation. Specs with contracts must
+// have valid schema-v2 contracts, but uncontracted Specs remain accepted while
+// registries migrate.
 func Validate(specs []Spec) error {
+	return validateRegistry(specs, validationIncremental)
+}
+
+// ValidateCensus requires every Spec to have a valid contract. Truthful
+// blocked contracts are accepted so the census can represent legacy gaps.
+func ValidateCensus(specs []Spec) error {
+	return validateRegistry(specs, validationCensus)
+}
+
+// ValidateRelease requires a complete census containing only enforced
+// contracts. A blocked row is always a release failure.
+func ValidateRelease(specs []Spec) error {
+	return validateRegistry(specs, validationRelease)
+}
+
+type validationLevel uint8
+
+const (
+	validationIncremental validationLevel = iota
+	validationCensus
+	validationRelease
+)
+
+func validateRegistry(specs []Spec, level validationLevel) error {
 	seen := make(map[string]int, len(specs))
 	for i, spec := range specs {
 		if spec.ID == "" {
@@ -58,7 +84,25 @@ func Validate(specs []Spec) error {
 		if spec.Budget <= 0 {
 			return fmt.Errorf("manifest: case %q has non-positive budget %s", spec.ID, spec.Budget)
 		}
+		if err := validateStandaloneSpec(spec); err != nil {
+			return err
+		}
+		if spec.Contract == nil && level >= validationCensus {
+			return fmt.Errorf("manifest: case %q has no contract for census", spec.ID)
+		}
+		if spec.Contract != nil && spec.Contract.State == ContractStateBlocked && level == validationRelease {
+			return fmt.Errorf("manifest: case %q has a blocked contract and is not release-enforceable", spec.ID)
+		}
 		byID[spec.ID] = spec
+	}
+	for _, spec := range specs {
+		if spec.Contract == nil || spec.Contract.NegativeControl.Kind != NegativeControlCase {
+			continue
+		}
+		controlID := spec.Contract.NegativeControl.CaseID
+		if _, ok := byID[controlID]; !ok {
+			return fmt.Errorf("manifest: case %q negative control references unknown case %q", spec.ID, controlID)
+		}
 	}
 
 	for _, spec := range specs {
@@ -148,7 +192,7 @@ func Select(specs []Spec, caseID, fromCaseID string) ([]Spec, error) {
 		return nil, fmt.Errorf("manifest: --case and --from-case are mutually exclusive")
 	}
 	if caseID == "" && fromCaseID == "" {
-		return cloneSpecs(specs), nil
+		return CloneSpecs(specs), nil
 	}
 	want := caseID
 	if want == "" {
@@ -159,9 +203,9 @@ func Select(specs []Spec, caseID, fromCaseID string) ([]Spec, error) {
 			continue
 		}
 		if caseID != "" {
-			return cloneSpecs(specs[i : i+1]), nil
+			return CloneSpecs(specs[i : i+1]), nil
 		}
-		return cloneSpecs(specs[i:]), nil
+		return CloneSpecs(specs[i:]), nil
 	}
 	if caseID != "" {
 		return nil, fmt.Errorf("manifest: no case matched --case=%q", caseID)
@@ -240,35 +284,42 @@ func WithPrerequisites(registry, selected []Spec) ([]Spec, error) {
 		if _, selected := selectedSet[spec.ID]; selected {
 			continue
 		}
-		result = append(result, cloneSpec(spec))
+		result = append(result, CloneSpec(spec))
 	}
 	for _, id := range selectedIDs {
-		result = append(result, cloneSpec(byID[id]))
+		result = append(result, CloneSpec(byID[id]))
 	}
 	return result, nil
 }
 
-func cloneSpecs(specs []Spec) []Spec {
+// CloneSpecs returns a deep copy of Specs and every nested contract field.
+func CloneSpecs(specs []Spec) []Spec {
 	if specs == nil {
 		return nil
 	}
 	cloned := make([]Spec, len(specs))
 	for i, spec := range specs {
-		cloned[i] = cloneSpec(spec)
+		cloned[i] = CloneSpec(spec)
 	}
 	return cloned
 }
 
-func cloneSpec(spec Spec) Spec {
+// CloneSpec returns a deep copy of a Spec and every nested contract field.
+func CloneSpec(spec Spec) Spec {
 	if spec.Requires != nil {
 		spec.Requires = append([]string{}, spec.Requires...)
+	}
+	if spec.Contract != nil {
+		contract := cloneContract(*spec.Contract)
+		spec.Contract = &contract
 	}
 	return spec
 }
 
 func equalSpec(a, b Spec) bool {
 	if a.ID != b.ID || a.Tier != b.Tier || a.Suite != b.Suite || a.Mandatory != b.Mandatory ||
-		a.Long != b.Long || a.Budget != b.Budget || len(a.Requires) != len(b.Requires) {
+		a.Long != b.Long || a.Budget != b.Budget || len(a.Requires) != len(b.Requires) ||
+		!equalContracts(a.Contract, b.Contract) {
 		return false
 	}
 	for i := range a.Requires {

@@ -63,8 +63,7 @@ var caseDefs = []caseDef{
 func Specs() []manifest.Spec {
 	specs := make([]manifest.Spec, len(caseDefs))
 	for i, def := range caseDefs {
-		specs[i] = def.spec
-		specs[i].Requires = append([]string(nil), def.spec.Requires...)
+		specs[i] = manifest.CloneSpec(def.spec)
 	}
 	return specs
 }
@@ -76,8 +75,7 @@ func selectCaseDefs(opts Options) ([]caseDef, error) {
 func selectCaseDefsFrom(registry []caseDef, opts Options) ([]caseDef, error) {
 	specs := make([]manifest.Spec, len(registry))
 	for i, def := range registry {
-		specs[i] = def.spec
-		specs[i].Requires = append([]string(nil), def.spec.Requires...)
+		specs[i] = manifest.CloneSpec(def.spec)
 	}
 	selected, err := manifest.SelectWithPrerequisites(specs, opts.Case, opts.FromCase)
 	if err != nil {

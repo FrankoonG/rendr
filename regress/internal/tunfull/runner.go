@@ -72,9 +72,7 @@ type PlannedCase struct {
 
 // Spec returns a defensive copy of the planned case manifest.
 func (p PlannedCase) Spec() manifest.Spec {
-	spec := p.def.spec
-	spec.Requires = append([]string(nil), spec.Requires...)
-	return spec
+	return manifest.CloneSpec(p.def.spec)
 }
 
 // Alias is non-executable catalog metadata retained for historical CLI IDs.
@@ -144,8 +142,7 @@ func Aliases() []Alias {
 func specsFrom(defs []caseDef) []manifest.Spec {
 	specs := make([]manifest.Spec, len(defs))
 	for i, def := range defs {
-		specs[i] = def.spec
-		specs[i].Requires = append([]string(nil), def.spec.Requires...)
+		specs[i] = manifest.CloneSpec(def.spec)
 	}
 	return specs
 }

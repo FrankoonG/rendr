@@ -24,57 +24,62 @@ const EvidenceClassV1ReleaseManifest = "v1_release_manifest"
 
 // Case is one regress case (e.g. T1.go-vet, T2.G1-smoke, T3.stream.D-1×D-2).
 type Case struct {
-	Name     string
-	Tier     string
-	Duration time.Duration
+	Name       string        `json:"name"`
+	Tier       string        `json:"tier"`
+	CaseDigest string        `json:"case_digest,omitempty"`
+	Duration   time.Duration `json:"duration_ns"`
 	// Empty Failure => pass.
-	Failure string
+	Failure string `json:"failure,omitempty"`
 	// InvalidReason means the harness could not prove that the stimulus,
 	// offered load, or oracle was valid. Invalid is always a failure.
-	InvalidReason string
+	InvalidReason string `json:"invalid_reason,omitempty"`
 	// SkipReason set => the case was skipped (e.g. T5 adapter missing).
 	// Skips fail by default; Optional must be explicit for a non-blocking skip.
-	SkipReason string
-	Optional   bool
+	SkipReason string `json:"skip_reason,omitempty"`
+	Optional   bool   `json:"optional,omitempty"`
 	// Evidence records machine-produced stimulus, load, and oracle facts.
 	// Writers sort keys so reports are deterministic.
-	Evidence map[string]string
+	Evidence map[string]string `json:"evidence,omitempty"`
 }
 
 // Revision identifies one exact repository state. CommitSHA identifies HEAD;
 // WorktreeSHA additionally covers tracked edits and non-ignored untracked
 // files.
 type Revision struct {
-	CommitSHA   string
-	WorktreeSHA string
+	CommitSHA   string `json:"commit_sha"`
+	WorktreeSHA string `json:"worktree_sha"`
 }
 
 // Invocation identifies the selected work represented by a report. Schema v3
 // added environment provenance; v4 separates a complete selected component
-// from a complete release manifest.
+// from a complete release manifest; v5 separates requested cases from the
+// prerequisite-expanded execution set.
 type Invocation struct {
-	SchemaVersion    int
-	Suite            string
-	Scope            string
-	Phase            string
-	Tier             string
-	Full             bool
-	TUNFull          bool
-	Case             string
-	FromCase         string
-	ResumeCaseID     string
-	Forced           bool
-	AllowNonLinux    bool
-	ManifestDigest   string
-	CatalogDigest    string
-	SelectedCases    int
-	SelectedCaseIDs  []string
-	RevisionStart    Revision
-	RevisionEnd      Revision
-	EnvironmentStart environment.Snapshot
-	EnvironmentEnd   environment.Snapshot
-	EvidenceClass    string
-	ReleaseManifest  bool
+	SchemaVersion    int                  `json:"schema_version"`
+	Suite            string               `json:"suite"`
+	Scope            string               `json:"scope"`
+	Phase            string               `json:"phase,omitempty"`
+	Tier             string               `json:"tier,omitempty"`
+	Full             bool                 `json:"full"`
+	TUNFull          bool                 `json:"tun_full"`
+	Case             string               `json:"case,omitempty"`
+	Selector         string               `json:"selector,omitempty"`
+	FromCase         string               `json:"from_case,omitempty"`
+	ResumeCaseID     string               `json:"resume_case_id,omitempty"`
+	Forced           bool                 `json:"forced"`
+	AllowNonLinux    bool                 `json:"allow_non_linux"`
+	ManifestDigest   string               `json:"manifest_digest"`
+	CatalogDigest    string               `json:"catalog_digest"`
+	SelectedCases    int                  `json:"selected_cases"`
+	SelectedCaseIDs  []string             `json:"selected_case_ids"`
+	RequestedCaseIDs []string             `json:"requested_case_ids,omitempty"`
+	RequestAnchor    string               `json:"request_anchor,omitempty"`
+	RevisionStart    Revision             `json:"revision_start"`
+	RevisionEnd      Revision             `json:"revision_end"`
+	EnvironmentStart environment.Snapshot `json:"environment_start"`
+	EnvironmentEnd   environment.Snapshot `json:"environment_end"`
+	EvidenceClass    string               `json:"evidence_class"`
+	ReleaseManifest  bool                 `json:"release_manifest"`
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -149,14 +154,18 @@ type xmlSuites struct {
 	InvocationFull      bool           `xml:"invocation_full,attr"`
 	InvocationTUNFull   bool           `xml:"invocation_tun_full,attr"`
 	InvocationCase      string         `xml:"invocation_case,attr,omitempty"`
+	InvocationSelector  string         `xml:"invocation_selector,attr,omitempty"`
 	InvocationFromCase  string         `xml:"invocation_from_case,attr,omitempty"`
 	InvocationResumeID  string         `xml:"invocation_resume_case_id,attr,omitempty"`
 	InvocationForced    bool           `xml:"invocation_forced,attr"`
 	InvocationNonLinux  bool           `xml:"invocation_allow_non_linux,attr"`
 	ManifestDigest      string         `xml:"manifest_digest,attr"`
 	CatalogDigest       string         `xml:"catalog_digest,attr"`
+	ReportDigest        string         `xml:"report_digest,attr"`
 	SelectedCases       int            `xml:"selected_cases,attr"`
 	SelectedCaseIDs     string         `xml:"selected_case_ids,attr"`
+	RequestedCaseIDs    string         `xml:"requested_case_ids,attr,omitempty"`
+	RequestAnchor       string         `xml:"request_anchor,attr,omitempty"`
 	RevisionStartCommit string         `xml:"revision_start_commit,attr"`
 	RevisionStartTree   string         `xml:"revision_start_worktree,attr"`
 	RevisionEndCommit   string         `xml:"revision_end_commit,attr"`
@@ -195,13 +204,14 @@ type xmlSuite struct {
 }
 
 type xmlCase struct {
-	XMLName   xml.Name    `xml:"testcase"`
-	Name      string      `xml:"name,attr"`
-	Classname string      `xml:"classname,attr"`
-	Time      float64     `xml:"time,attr"`
-	Failure   *xmlFailure `xml:"failure,omitempty"`
-	Skipped   *xmlSkipped `xml:"skipped,omitempty"`
-	SystemOut string      `xml:"system-out,omitempty"`
+	XMLName    xml.Name    `xml:"testcase"`
+	Name       string      `xml:"name,attr"`
+	Classname  string      `xml:"classname,attr"`
+	CaseDigest string      `xml:"case_digest,attr,omitempty"`
+	Time       float64     `xml:"time,attr"`
+	Failure    *xmlFailure `xml:"failure,omitempty"`
+	Skipped    *xmlSkipped `xml:"skipped,omitempty"`
+	SystemOut  string      `xml:"system-out,omitempty"`
 }
 
 type xmlFailure struct {
@@ -215,6 +225,10 @@ type xmlSkipped struct {
 
 // WriteJUnit emits JUnit XML at path. Tier grouping = testsuite name.
 func (s *Suite) WriteJUnit(path string) error {
+	reportDigest, err := s.ReportDigest()
+	if err != nil {
+		return err
+	}
 	properties, err := environmentProperties(s.Invocation)
 	if err != nil {
 		return err
@@ -240,14 +254,18 @@ func (s *Suite) WriteJUnit(path string) error {
 		InvocationFull:      s.Invocation.Full,
 		InvocationTUNFull:   s.Invocation.TUNFull,
 		InvocationCase:      s.Invocation.Case,
+		InvocationSelector:  s.Invocation.Selector,
 		InvocationFromCase:  s.Invocation.FromCase,
 		InvocationResumeID:  s.Invocation.ResumeCaseID,
 		InvocationForced:    s.Invocation.Forced,
 		InvocationNonLinux:  s.Invocation.AllowNonLinux,
 		ManifestDigest:      s.Invocation.ManifestDigest,
 		CatalogDigest:       s.Invocation.CatalogDigest,
+		ReportDigest:        reportDigest,
 		SelectedCases:       s.Invocation.SelectedCases,
 		SelectedCaseIDs:     formatCaseIDs(s.Invocation.SelectedCaseIDs),
+		RequestedCaseIDs:    formatCaseIDs(s.Invocation.RequestedCaseIDs),
+		RequestAnchor:       s.Invocation.RequestAnchor,
 		RevisionStartCommit: s.Invocation.RevisionStart.CommitSHA,
 		RevisionStartTree:   s.Invocation.RevisionStart.WorktreeSHA,
 		RevisionEndCommit:   s.Invocation.RevisionEnd.CommitSHA,
@@ -266,9 +284,10 @@ func (s *Suite) WriteJUnit(path string) error {
 		xs := xmlSuite{Name: tier}
 		for _, c := range cs {
 			xc := xmlCase{
-				Name:      c.Name,
-				Classname: tier,
-				Time:      c.Duration.Seconds(),
+				Name:       c.Name,
+				Classname:  tier,
+				CaseDigest: c.CaseDigest,
+				Time:       c.Duration.Seconds(),
 			}
 			xs.Tests++
 			out.Tests++
@@ -329,6 +348,10 @@ func (s *Suite) WriteJUnit(path string) error {
 
 // WriteMarkdown emits a human-readable SUMMARY.md.
 func (s *Suite) WriteMarkdown(path string) error {
+	reportDigest, err := s.ReportDigest()
+	if err != nil {
+		return err
+	}
 	var buf bytes.Buffer
 
 	fmt.Fprintf(&buf, "# rendr regression — %s\n\n", s.Started.UTC().Format(time.RFC3339))
@@ -345,6 +368,9 @@ func (s *Suite) WriteMarkdown(path string) error {
 	if s.Invocation.Case != "" {
 		fmt.Fprintf(&buf, "- Case: `%s`\n", escapeMarkdown(s.Invocation.Case))
 	}
+	if s.Invocation.Selector != "" {
+		fmt.Fprintf(&buf, "- Selector: `%s`\n", escapeMarkdown(s.Invocation.Selector))
+	}
 	if s.Invocation.FromCase != "" {
 		fmt.Fprintf(&buf, "- From case: `%s`\n", escapeMarkdown(s.Invocation.FromCase))
 	}
@@ -355,8 +381,11 @@ func (s *Suite) WriteMarkdown(path string) error {
 	fmt.Fprintf(&buf, "- Allow non-Linux: `%t`\n", s.Invocation.AllowNonLinux)
 	fmt.Fprintf(&buf, "- Manifest digest: `%s`\n", escapeMarkdown(s.Invocation.ManifestDigest))
 	fmt.Fprintf(&buf, "- Catalog digest: `%s`\n", escapeMarkdown(s.Invocation.CatalogDigest))
+	fmt.Fprintf(&buf, "- Report digest: `%s`\n", escapeMarkdown(reportDigest))
 	fmt.Fprintf(&buf, "- Selected cases: `%d`\n", s.Invocation.SelectedCases)
 	fmt.Fprintf(&buf, "- Selected CaseIDs (ordered): `%s`\n", escapeMarkdown(formatCaseIDs(s.Invocation.SelectedCaseIDs)))
+	fmt.Fprintf(&buf, "- Requested CaseIDs (ordered): `%s`\n", escapeMarkdown(formatCaseIDs(s.Invocation.RequestedCaseIDs)))
+	fmt.Fprintf(&buf, "- Request anchor: `%s`\n", escapeMarkdown(s.Invocation.RequestAnchor))
 	fmt.Fprintf(&buf, "- Revision start: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionStart)))
 	fmt.Fprintf(&buf, "- Revision end: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionEnd)))
 	fmt.Fprintf(&buf, "- Complete: `%t`\n", s.Complete)
@@ -536,6 +565,71 @@ func invocationIdentityFailure(s *Suite) string {
 			reasons = append(reasons, "release evidence class is set without a release manifest")
 		}
 	}
+	if inv.SchemaVersion >= 5 {
+		if len(inv.RequestedCaseIDs) == 0 {
+			reasons = append(reasons, "requested case IDs are missing")
+		}
+		selectedIndex := make(map[string]int, len(inv.SelectedCaseIDs))
+		for i, id := range inv.SelectedCaseIDs {
+			selectedIndex[id] = i
+		}
+		seenRequested := make(map[string]bool, len(inv.RequestedCaseIDs))
+		lastSelectedIndex := -1
+		for i, id := range inv.RequestedCaseIDs {
+			if strings.TrimSpace(id) == "" {
+				reasons = append(reasons, fmt.Sprintf("requested case ID at index %d is empty", i))
+			}
+			if seenRequested[id] {
+				reasons = append(reasons, fmt.Sprintf("requested case ID %q is duplicated", id))
+			}
+			seenRequested[id] = true
+			selectedAt, ok := selectedIndex[id]
+			if !ok {
+				reasons = append(reasons, fmt.Sprintf("requested case ID %q is not in the execution case IDs", id))
+				continue
+			}
+			if selectedAt <= lastSelectedIndex {
+				reasons = append(reasons, "requested case IDs are not in execution order")
+			}
+			lastSelectedIndex = selectedAt
+		}
+		if strings.TrimSpace(inv.RequestAnchor) == "" {
+			reasons = append(reasons, "request anchor is missing")
+		}
+		switch inv.Scope {
+		case "exact":
+			if len(inv.RequestedCaseIDs) != 1 || len(inv.RequestedCaseIDs) == 1 && inv.RequestedCaseIDs[0] != inv.Case {
+				reasons = append(reasons, "exact scope must request only its case")
+			}
+			if inv.RequestAnchor != inv.Case {
+				reasons = append(reasons, "exact request anchor does not match its case")
+			}
+		case "from-case":
+			if len(inv.RequestedCaseIDs) != 0 && inv.RequestedCaseIDs[0] != inv.FromCase {
+				reasons = append(reasons, "from-case requested set does not begin at its anchor")
+			}
+			if inv.RequestAnchor != inv.FromCase {
+				reasons = append(reasons, "from-case request anchor does not match its filter")
+			}
+		case "selector":
+			if inv.Case != "" {
+				reasons = append(reasons, "selector scope unexpectedly has a case filter")
+			}
+			if inv.Selector == "" {
+				reasons = append(reasons, "selector scope is missing its selector")
+			}
+			if inv.RequestAnchor != inv.Selector {
+				reasons = append(reasons, "selector request anchor does not match its selector")
+			}
+		default:
+			if inv.Selector != "" {
+				reasons = append(reasons, fmt.Sprintf("scope %q unexpectedly has a selector filter", inv.Scope))
+			}
+			if len(inv.RequestedCaseIDs) != 0 && inv.RequestAnchor != inv.RequestedCaseIDs[0] {
+				reasons = append(reasons, "request anchor is not the first requested case ID")
+			}
+		}
+	}
 	if inv.SchemaVersion >= 3 {
 		if inv.EnvironmentStart.IsZero() {
 			reasons = append(reasons, "start environment snapshot is missing")
@@ -561,7 +655,7 @@ func invocationIdentityFailure(s *Suite) string {
 	if inv.Scope == "exact" && inv.Case == "" {
 		reasons = append(reasons, "exact scope is missing its case")
 	}
-	if inv.Scope == "selector" && inv.Case == "" {
+	if inv.Scope == "selector" && inv.SchemaVersion < 5 && inv.Case == "" {
 		reasons = append(reasons, "selector scope is missing its requested selector")
 	}
 	if inv.Scope == "from-case" && inv.FromCase == "" {
@@ -582,6 +676,9 @@ func invocationIdentityFailure(s *Suite) string {
 						"selected case ID %q does not match report row %d name %q",
 						inv.SelectedCaseIDs[i], i, row.Name,
 					))
+				}
+				if inv.SchemaVersion >= 5 && !validManifestDigest(row.CaseDigest) {
+					reasons = append(reasons, fmt.Sprintf("report row %d case digest is missing or malformed", i))
 				}
 			}
 		}
@@ -625,6 +722,8 @@ func formatInvocation(inv Invocation) string {
 		"revision_start_commit":   inv.RevisionStart.CommitSHA,
 		"revision_start_worktree": inv.RevisionStart.WorktreeSHA,
 		"release_manifest":        fmt.Sprintf("%t", inv.ReleaseManifest),
+		"request_anchor":          inv.RequestAnchor,
+		"requested_case_ids":      formatCaseIDs(inv.RequestedCaseIDs),
 		"scope":                   inv.Scope,
 		"selected_case_ids":       formatCaseIDs(inv.SelectedCaseIDs),
 		"selected_cases":          fmt.Sprintf("%d", inv.SelectedCases),
@@ -634,6 +733,9 @@ func formatInvocation(inv Invocation) string {
 	}
 	if inv.Case != "" {
 		fields["case"] = inv.Case
+	}
+	if inv.Selector != "" {
+		fields["selector"] = inv.Selector
 	}
 	if inv.FromCase != "" {
 		fields["from_case"] = inv.FromCase
