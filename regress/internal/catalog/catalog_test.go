@@ -19,8 +19,8 @@ import (
 
 const (
 	phase1Count     = 20
-	phase2Count     = 109
-	normalFullCount = 129
+	phase2Count     = 110
+	normalFullCount = 130
 )
 
 var expectedTiers = []struct {
@@ -31,7 +31,7 @@ var expectedTiers = []struct {
 	{tier: "T1", count: 10, specs: tier1.Specs},
 	{tier: "T2", count: 10, specs: tier2.Specs},
 	{tier: "T3", count: 44, specs: tier3.Specs},
-	{tier: "T4", count: 10, specs: tier4.Specs},
+	{tier: "T4", count: 11, specs: tier4.Specs},
 	{tier: "T5", count: 6, specs: tier5.Specs},
 	{tier: "T6", count: 10, specs: tier6.Specs},
 	{tier: "T7", count: 30, specs: tier7.Specs},
