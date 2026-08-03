@@ -49,7 +49,7 @@ const (
 
 const (
 	listSchemaVersion       = 1
-	invocationSchemaVersion = 1
+	invocationSchemaVersion = 2
 	junitReportFileName     = "junit.xml"
 	markdownReportFileName  = "SUMMARY.md"
 )
@@ -583,21 +583,39 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 	if err != nil {
 		return report.Invocation{}, err
 	}
+	catalogDigest, err := suiteRegistryDigest(suiteName)
+	if err != nil {
+		return report.Invocation{}, err
+	}
+	selectedIDs := make([]string, len(selected))
+	for i, spec := range selected {
+		selectedIDs[i] = spec.ID
+	}
 	return report.Invocation{
-		SchemaVersion:  invocationSchemaVersion,
-		Suite:          suiteName,
-		Scope:          invocationScope(cfg),
-		Case:           cfg.caseID,
-		FromCase:       cfg.fromCaseID,
-		Forced:         cfg.forcePhase2,
-		ManifestDigest: digest,
-		SelectedCases:  len(selected),
+		SchemaVersion:   invocationSchemaVersion,
+		Suite:           suiteName,
+		Scope:           invocationScope(cfg, selected),
+		Phase:           cfg.phase,
+		Tier:            cfg.tier,
+		Full:            cfg.full,
+		TUNFull:         cfg.tunFull,
+		Case:            cfg.caseID,
+		FromCase:        cfg.fromCaseID,
+		ResumeCaseID:    selectedIDs[0],
+		Forced:          cfg.forcePhase2,
+		ManifestDigest:  digest,
+		CatalogDigest:   catalogDigest,
+		SelectedCases:   len(selected),
+		SelectedCaseIDs: selectedIDs,
 	}, nil
 }
 
-func invocationScope(cfg runFlags) string {
+func invocationScope(cfg runFlags, selected []manifest.Spec) string {
 	switch {
 	case cfg.caseID != "":
+		if len(selected) != 1 || selected[0].ID != cfg.caseID {
+			return "selector"
+		}
 		return "exact"
 	case cfg.fromCaseID != "":
 		return "from-case"
@@ -619,9 +637,34 @@ func selectedManifestDigest(selected []manifest.Spec) (string, error) {
 	if err := manifest.Validate(selected); err != nil {
 		return "", fmt.Errorf("selected manifest is invalid: %w", err)
 	}
-	b, err := json.Marshal(selected)
+	return digestJSON("selected manifest", selected)
+}
+
+func suiteRegistryDigest(suiteName string) (string, error) {
+	registrySuite := suiteName
+	if suiteName == tunInvocationSuite {
+		registrySuite = manifest.SuiteTUN
+	}
+	normalSpecs, tunCatalog, err := loadCatalogs()
 	if err != nil {
-		return "", fmt.Errorf("encode selected manifest: %w", err)
+		return "", err
+	}
+	doc, err := buildListDocument(runFlags{}, normalSpecs, tunCatalog)
+	if err != nil {
+		return "", fmt.Errorf("build full registry document: %w", err)
+	}
+	for _, registry := range doc.Catalogs {
+		if registry.Suite == registrySuite {
+			return digestJSON(registrySuite+" registry", registry)
+		}
+	}
+	return "", fmt.Errorf("unknown invocation suite %q", suiteName)
+}
+
+func digestJSON(label string, value any) (string, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("encode %s: %w", label, err)
 	}
 	digest := sha256.Sum256(b)
 	return fmt.Sprintf("sha256:%x", digest[:]), nil

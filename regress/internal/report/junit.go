@@ -7,6 +7,7 @@ package report
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -44,20 +45,28 @@ type Revision struct {
 	WorktreeSHA string
 }
 
-// Invocation identifies the selected work represented by a report. Consumers
-// must check Suite, Scope, ManifestDigest, and Complete before treating a green
-// report as evidence for a release gate.
+// Invocation identifies the selected work represented by a report. Schema v2
+// binds the original selectors to the full catalog, ordered selected CaseIDs,
+// and their canonical resume point. Consumers must also check Complete before
+// treating a green report as evidence for a release gate.
 type Invocation struct {
-	SchemaVersion  int
-	Suite          string
-	Scope          string
-	Case           string
-	FromCase       string
-	Forced         bool
-	ManifestDigest string
-	SelectedCases  int
-	RevisionStart  Revision
-	RevisionEnd    Revision
+	SchemaVersion   int
+	Suite           string
+	Scope           string
+	Phase           string
+	Tier            string
+	Full            bool
+	TUNFull         bool
+	Case            string
+	FromCase        string
+	ResumeCaseID    string
+	Forced          bool
+	ManifestDigest  string
+	CatalogDigest   string
+	SelectedCases   int
+	SelectedCaseIDs []string
+	RevisionStart   Revision
+	RevisionEnd     Revision
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -127,11 +136,18 @@ type xmlSuites struct {
 	InvocationSchema    int        `xml:"invocation_schema,attr"`
 	InvocationSuite     string     `xml:"invocation_suite,attr"`
 	InvocationScope     string     `xml:"invocation_scope,attr"`
+	InvocationPhase     string     `xml:"invocation_phase,attr"`
+	InvocationTier      string     `xml:"invocation_tier,attr"`
+	InvocationFull      bool       `xml:"invocation_full,attr"`
+	InvocationTUNFull   bool       `xml:"invocation_tun_full,attr"`
 	InvocationCase      string     `xml:"invocation_case,attr,omitempty"`
 	InvocationFromCase  string     `xml:"invocation_from_case,attr,omitempty"`
+	InvocationResumeID  string     `xml:"invocation_resume_case_id,attr,omitempty"`
 	InvocationForced    bool       `xml:"invocation_forced,attr"`
 	ManifestDigest      string     `xml:"manifest_digest,attr"`
+	CatalogDigest       string     `xml:"catalog_digest,attr"`
 	SelectedCases       int        `xml:"selected_cases,attr"`
+	SelectedCaseIDs     string     `xml:"selected_case_ids,attr"`
 	RevisionStartCommit string     `xml:"revision_start_commit,attr"`
 	RevisionStartTree   string     `xml:"revision_start_worktree,attr"`
 	RevisionEndCommit   string     `xml:"revision_end_commit,attr"`
@@ -190,11 +206,18 @@ func (s *Suite) WriteJUnit(path string) error {
 		InvocationSchema:    s.Invocation.SchemaVersion,
 		InvocationSuite:     s.Invocation.Suite,
 		InvocationScope:     s.Invocation.Scope,
+		InvocationPhase:     s.Invocation.Phase,
+		InvocationTier:      s.Invocation.Tier,
+		InvocationFull:      s.Invocation.Full,
+		InvocationTUNFull:   s.Invocation.TUNFull,
 		InvocationCase:      s.Invocation.Case,
 		InvocationFromCase:  s.Invocation.FromCase,
+		InvocationResumeID:  s.Invocation.ResumeCaseID,
 		InvocationForced:    s.Invocation.Forced,
 		ManifestDigest:      s.Invocation.ManifestDigest,
+		CatalogDigest:       s.Invocation.CatalogDigest,
 		SelectedCases:       s.Invocation.SelectedCases,
+		SelectedCaseIDs:     formatCaseIDs(s.Invocation.SelectedCaseIDs),
 		RevisionStartCommit: s.Invocation.RevisionStart.CommitSHA,
 		RevisionStartTree:   s.Invocation.RevisionStart.WorktreeSHA,
 		RevisionEndCommit:   s.Invocation.RevisionEnd.CommitSHA,
@@ -275,17 +298,27 @@ func (s *Suite) WriteMarkdown(path string) error {
 	fmt.Fprintf(&buf, "State: %s\n\n", reportState(s))
 	fmt.Fprintln(&buf, "## Invocation")
 	fmt.Fprintln(&buf)
+	fmt.Fprintf(&buf, "- Schema version: `%d`\n", s.Invocation.SchemaVersion)
 	fmt.Fprintf(&buf, "- Suite: `%s`\n", escapeMarkdown(s.Invocation.Suite))
 	fmt.Fprintf(&buf, "- Scope: `%s`\n", escapeMarkdown(s.Invocation.Scope))
+	fmt.Fprintf(&buf, "- Phase: `%s`\n", escapeMarkdown(s.Invocation.Phase))
+	fmt.Fprintf(&buf, "- Tier: `%s`\n", escapeMarkdown(s.Invocation.Tier))
+	fmt.Fprintf(&buf, "- Full: `%t`\n", s.Invocation.Full)
+	fmt.Fprintf(&buf, "- TUN full: `%t`\n", s.Invocation.TUNFull)
 	if s.Invocation.Case != "" {
 		fmt.Fprintf(&buf, "- Case: `%s`\n", escapeMarkdown(s.Invocation.Case))
 	}
 	if s.Invocation.FromCase != "" {
 		fmt.Fprintf(&buf, "- From case: `%s`\n", escapeMarkdown(s.Invocation.FromCase))
 	}
+	if s.Invocation.ResumeCaseID != "" {
+		fmt.Fprintf(&buf, "- Resume CaseID: `%s`\n", escapeMarkdown(s.Invocation.ResumeCaseID))
+	}
 	fmt.Fprintf(&buf, "- Forced: `%t`\n", s.Invocation.Forced)
 	fmt.Fprintf(&buf, "- Manifest digest: `%s`\n", escapeMarkdown(s.Invocation.ManifestDigest))
+	fmt.Fprintf(&buf, "- Catalog digest: `%s`\n", escapeMarkdown(s.Invocation.CatalogDigest))
 	fmt.Fprintf(&buf, "- Selected cases: `%d`\n", s.Invocation.SelectedCases)
+	fmt.Fprintf(&buf, "- Selected CaseIDs (ordered): `%s`\n", escapeMarkdown(formatCaseIDs(s.Invocation.SelectedCaseIDs)))
 	fmt.Fprintf(&buf, "- Revision start: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionStart)))
 	fmt.Fprintf(&buf, "- Revision end: `%s`\n", escapeMarkdown(formatRevision(s.Invocation.RevisionEnd)))
 	fmt.Fprintf(&buf, "- Complete: `%t`\n", s.Complete)
@@ -387,11 +420,44 @@ func invocationIdentityFailure(s *Suite) string {
 	if inv.SelectedCases <= 0 {
 		reasons = append(reasons, "selected case count is missing")
 	}
+	if inv.SchemaVersion >= 2 {
+		if !validManifestDigest(inv.CatalogDigest) {
+			reasons = append(reasons, "catalog digest is missing or malformed")
+		}
+		if len(inv.SelectedCaseIDs) == 0 {
+			reasons = append(reasons, "selected case IDs are missing")
+		}
+		seenIDs := make(map[string]bool, len(inv.SelectedCaseIDs))
+		for i, id := range inv.SelectedCaseIDs {
+			if strings.TrimSpace(id) == "" {
+				reasons = append(reasons, fmt.Sprintf("selected case ID at index %d is empty", i))
+			}
+			if seenIDs[id] {
+				reasons = append(reasons, fmt.Sprintf("selected case ID %q is duplicated", id))
+			}
+			seenIDs[id] = true
+		}
+		if len(inv.SelectedCaseIDs) != inv.SelectedCases {
+			reasons = append(reasons, fmt.Sprintf(
+				"selected case ID count %d does not match selected case count %d",
+				len(inv.SelectedCaseIDs), inv.SelectedCases,
+			))
+		}
+		if inv.ResumeCaseID == "" {
+			reasons = append(reasons, "canonical resume case ID is missing")
+		}
+		if inv.ResumeCaseID != "" && (len(inv.SelectedCaseIDs) == 0 || inv.ResumeCaseID != inv.SelectedCaseIDs[0]) {
+			reasons = append(reasons, "canonical resume case ID is not the first selected case ID")
+		}
+	}
 	if inv.RevisionStart.CommitSHA == "" || inv.RevisionStart.WorktreeSHA == "" {
 		reasons = append(reasons, "start revision is incomplete")
 	}
 	if inv.Scope == "exact" && inv.Case == "" {
 		reasons = append(reasons, "exact scope is missing its case")
+	}
+	if inv.Scope == "selector" && inv.Case == "" {
+		reasons = append(reasons, "selector scope is missing its requested selector")
 	}
 	if inv.Scope == "from-case" && inv.FromCase == "" {
 		reasons = append(reasons, "from-case scope is missing its resume point")
@@ -404,6 +470,15 @@ func invocationIdentityFailure(s *Suite) string {
 		}
 		if inv.SelectedCases != len(s.Cases) {
 			reasons = append(reasons, fmt.Sprintf("selected case count %d does not match report rows %d", inv.SelectedCases, len(s.Cases)))
+		} else if inv.SchemaVersion >= 2 && len(inv.SelectedCaseIDs) == len(s.Cases) {
+			for i, row := range s.Cases {
+				if row.Name != inv.SelectedCaseIDs[i] {
+					reasons = append(reasons, fmt.Sprintf(
+						"selected case ID %q does not match report row %d name %q",
+						inv.SelectedCaseIDs[i], i, row.Name,
+					))
+				}
+			}
 		}
 	}
 	return strings.Join(reasons, "\n")
@@ -432,16 +507,22 @@ func invocationName(inv Invocation) string {
 
 func formatInvocation(inv Invocation) string {
 	fields := map[string]string{
+		"catalog_digest":          inv.CatalogDigest,
 		"forced":                  fmt.Sprintf("%t", inv.Forced),
+		"full":                    fmt.Sprintf("%t", inv.Full),
 		"invocation_schema":       fmt.Sprintf("%d", inv.SchemaVersion),
 		"manifest_digest":         inv.ManifestDigest,
+		"phase":                   inv.Phase,
 		"revision_end_commit":     inv.RevisionEnd.CommitSHA,
 		"revision_end_worktree":   inv.RevisionEnd.WorktreeSHA,
 		"revision_start_commit":   inv.RevisionStart.CommitSHA,
 		"revision_start_worktree": inv.RevisionStart.WorktreeSHA,
 		"scope":                   inv.Scope,
+		"selected_case_ids":       formatCaseIDs(inv.SelectedCaseIDs),
 		"selected_cases":          fmt.Sprintf("%d", inv.SelectedCases),
 		"suite":                   inv.Suite,
+		"tier":                    inv.Tier,
+		"tun_full":                fmt.Sprintf("%t", inv.TUNFull),
 	}
 	if inv.Case != "" {
 		fields["case"] = inv.Case
@@ -449,7 +530,21 @@ func formatInvocation(inv Invocation) string {
 	if inv.FromCase != "" {
 		fields["from_case"] = inv.FromCase
 	}
+	if inv.ResumeCaseID != "" {
+		fields["resume_case_id"] = inv.ResumeCaseID
+	}
 	return formatEvidence(fields, "=", "\n")
+}
+
+func formatCaseIDs(ids []string) string {
+	if ids == nil {
+		ids = []string{}
+	}
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		panic(fmt.Sprintf("report: encode selected case IDs: %v", err))
+	}
+	return string(encoded)
 }
 
 func formatRevision(revision Revision) string {

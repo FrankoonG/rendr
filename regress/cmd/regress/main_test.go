@@ -322,10 +322,11 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if full.Scope != "full" || full.Forced || full.SelectedCases != 2 {
+	if full.Scope != "full" || full.Forced || full.SelectedCases != 2 || !full.Full || full.TUNFull {
 		t.Fatalf("full identity=%+v", full)
 	}
-	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 {
+	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 ||
+		exact.ResumeCaseID != "two" || !reflect.DeepEqual(exact.SelectedCaseIDs, []string{"two"}) {
 		t.Fatalf("exact identity=%+v", exact)
 	}
 	if full.ManifestDigest == exact.ManifestDigest {
@@ -333,6 +334,12 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	}
 	if full.ManifestDigest == "" || !strings.HasPrefix(full.ManifestDigest, "sha256:") {
 		t.Fatalf("invalid full manifest digest %q", full.ManifestDigest)
+	}
+	if full.CatalogDigest == "" || full.CatalogDigest != exact.CatalogDigest {
+		t.Fatalf("normal catalog digests full=%q exact=%q", full.CatalogDigest, exact.CatalogDigest)
+	}
+	if !reflect.DeepEqual(full.SelectedCaseIDs, []string{"one", "two"}) || full.ResumeCaseID != "one" {
+		t.Fatalf("full selected identity=%+v", full)
 	}
 	reversed, err := selectedManifestDigest([]manifest.Spec{all[1], all[0]})
 	if err != nil {
@@ -345,8 +352,15 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tun.Suite != manifest.SuiteTUN || tun.Scope != "full" || !tun.Forced {
+	if tun.Suite != manifest.SuiteTUN || tun.Scope != "full" || !tun.Forced || !tun.TUNFull || tun.CatalogDigest == "" {
 		t.Fatalf("TUN/forced identity=%+v", tun)
+	}
+	selector, err := buildInvocationIdentity(runFlags{tunFull: true, caseID: "legacy-selector"}, manifest.SuiteTUN, all[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selector.Scope != "selector" || selector.Case != "legacy-selector" || selector.ResumeCaseID != "one" {
+		t.Fatalf("selector identity=%+v", selector)
 	}
 }
 

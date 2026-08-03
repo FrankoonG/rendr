@@ -1,6 +1,7 @@
 package report
 
 import (
+	"encoding/xml"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,6 +214,177 @@ func TestInvocationIdentityIsRecordedInJUnitAndMarkdown(t *testing.T) {
 	}
 }
 
+func TestInvocationSchemaV2IsRecordedInJUnitAndMarkdown(t *testing.T) {
+	s := New()
+	s.Complete = true
+	s.Invocation = validV2TestInvocation("T7.case.one", "T7.case.two")
+	s.Invocation.Scope = "from-case"
+	s.Invocation.Phase = "2"
+	s.Invocation.Tier = "7"
+	s.Invocation.Full = true
+	s.Invocation.TUNFull = true
+	s.Invocation.FromCase = "requested.resume.alias"
+	s.Invocation.ResumeCaseID = "T7.case.one"
+	s.Add(Case{Name: "T7.case.one", Tier: "T7"})
+	s.Add(Case{Name: "T7.case.two", Tier: "T7"})
+
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var root struct {
+		Schema          int    `xml:"invocation_schema,attr"`
+		Phase           string `xml:"invocation_phase,attr"`
+		Tier            string `xml:"invocation_tier,attr"`
+		Full            bool   `xml:"invocation_full,attr"`
+		TUNFull         bool   `xml:"invocation_tun_full,attr"`
+		FromCase        string `xml:"invocation_from_case,attr"`
+		ResumeCaseID    string `xml:"invocation_resume_case_id,attr"`
+		CatalogDigest   string `xml:"catalog_digest,attr"`
+		SelectedCaseIDs string `xml:"selected_case_ids,attr"`
+	}
+	if err := xml.Unmarshal(junit, &root); err != nil {
+		t.Fatal(err)
+	}
+	if root.Schema != 2 || root.Phase != "2" || root.Tier != "7" || !root.Full || !root.TUNFull {
+		t.Fatalf("JUnit selection dimensions = %+v", root)
+	}
+	if root.FromCase != "requested.resume.alias" || root.ResumeCaseID != "T7.case.one" {
+		t.Fatalf("JUnit resume identity = %+v", root)
+	}
+	if root.CatalogDigest != "sha256:"+strings.Repeat("c", 64) {
+		t.Fatalf("JUnit catalog digest = %q", root.CatalogDigest)
+	}
+	if root.SelectedCaseIDs != `["T7.case.one","T7.case.two"]` {
+		t.Fatalf("JUnit selected CaseIDs = %q", root.SelectedCaseIDs)
+	}
+
+	for _, want := range []string{
+		"- Schema version: `2`",
+		"- Phase: `2`",
+		"- Tier: `7`",
+		"- Full: `true`",
+		"- TUN full: `true`",
+		"- From case: `requested.resume.alias`",
+		"- Resume CaseID: `T7.case.one`",
+		"- Catalog digest: `sha256:" + strings.Repeat("c", 64) + "`",
+		"- Selected CaseIDs (ordered): `[\"T7.case.one\",\"T7.case.two\"]`",
+	} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("Markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestInvocationSchemaV2Validation(t *testing.T) {
+	valid := validV2TestInvocation("case.one", "case.two")
+	valid.Scope = "from-case"
+	valid.FromCase = "requested.resume.alias"
+	valid.ResumeCaseID = "case.one"
+
+	tests := []struct {
+		name   string
+		mutate func(*Invocation)
+		want   string
+	}{
+		{
+			name: "manifest digest is not sha256",
+			mutate: func(inv *Invocation) {
+				inv.ManifestDigest = "sha1:" + strings.Repeat("a", 40)
+			},
+			want: "selected manifest digest is missing or malformed",
+		},
+		{
+			name: "catalog digest is not sha256",
+			mutate: func(inv *Invocation) {
+				inv.CatalogDigest = "sha1:" + strings.Repeat("c", 40)
+			},
+			want: "catalog digest is missing or malformed",
+		},
+		{
+			name: "selected IDs are missing",
+			mutate: func(inv *Invocation) {
+				inv.SelectedCaseIDs = nil
+			},
+			want: "selected case IDs are missing",
+		},
+		{
+			name: "selected ID is empty",
+			mutate: func(inv *Invocation) {
+				inv.SelectedCaseIDs[1] = " "
+			},
+			want: "selected case ID at index 1 is empty",
+		},
+		{
+			name: "selected ID count differs",
+			mutate: func(inv *Invocation) {
+				inv.SelectedCases = 1
+			},
+			want: "selected case ID count 2 does not match selected case count 1",
+		},
+		{
+			name: "selected ID is duplicated",
+			mutate: func(inv *Invocation) {
+				inv.SelectedCaseIDs[1] = inv.SelectedCaseIDs[0]
+			},
+			want: `selected case ID "case.one" is duplicated`,
+		},
+		{
+			name: "canonical resume ID is missing",
+			mutate: func(inv *Invocation) {
+				inv.ResumeCaseID = ""
+			},
+			want: "canonical resume case ID is missing",
+		},
+		{
+			name: "canonical resume ID is not first",
+			mutate: func(inv *Invocation) {
+				inv.ResumeCaseID = "case.two"
+			},
+			want: "canonical resume case ID is not the first selected case ID",
+		},
+	}
+
+	if failure := invocationIdentityFailure(&Suite{Invocation: valid}); failure != "" {
+		t.Fatalf("valid v2 invocation failed validation: %s", failure)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inv := valid
+			inv.SelectedCaseIDs = append([]string(nil), valid.SelectedCaseIDs...)
+			tt.mutate(&inv)
+			failure := invocationIdentityFailure(&Suite{Invocation: inv})
+			if !strings.Contains(failure, tt.want) {
+				t.Fatalf("invocationIdentityFailure() = %q, want substring %q", failure, tt.want)
+			}
+		})
+	}
+
+	complete := Suite{
+		Invocation: valid,
+		Complete:   true,
+		Cases:      []Case{{Name: "case.one"}, {Name: "wrong.row"}},
+	}
+	complete.Invocation.RevisionEnd = complete.Invocation.RevisionStart
+	if failure := invocationIdentityFailure(&complete); !strings.Contains(failure, `selected case ID "case.two" does not match report row 1 name "wrong.row"`) {
+		t.Fatalf("complete row mismatch failure = %q", failure)
+	}
+}
+
 func TestRunFailureIsAStandardJUnitFailure(t *testing.T) {
 	s := New()
 	s.Complete = true
@@ -303,4 +475,23 @@ func validTestInvocation(selected int) Invocation {
 		RevisionStart:  revision,
 		RevisionEnd:    revision,
 	}
+}
+
+func validV2TestInvocation(selectedCaseIDs ...string) Invocation {
+	revision := Revision{CommitSHA: "commit", WorktreeSHA: "worktree"}
+	invocation := Invocation{
+		SchemaVersion:   2,
+		Suite:           "normal",
+		Scope:           "full",
+		ManifestDigest:  "sha256:" + strings.Repeat("a", 64),
+		CatalogDigest:   "sha256:" + strings.Repeat("c", 64),
+		SelectedCases:   len(selectedCaseIDs),
+		SelectedCaseIDs: append([]string(nil), selectedCaseIDs...),
+		RevisionStart:   revision,
+		RevisionEnd:     revision,
+	}
+	if len(selectedCaseIDs) != 0 {
+		invocation.ResumeCaseID = selectedCaseIDs[0]
+	}
+	return invocation
 }
