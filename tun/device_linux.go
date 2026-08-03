@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/FrankoonG/rendr/virtualif"
@@ -22,9 +24,11 @@ const (
 
 // Device is a Linux TUN file descriptor implementing virtualif.Device.
 type Device struct {
-	file *os.File
-	name string
-	mtu  int
+	file   *os.File
+	name   string
+	mtu    int
+	mu     sync.RWMutex
+	closed bool
 }
 
 // Open creates or attaches a Linux TUN device. It does not configure
@@ -57,11 +61,53 @@ func Open(cfg Config) (*Device, error) {
 	return &Device{file: f, name: ifReqName(req), mtu: cfg.MTU}, nil
 }
 
-func (d *Device) Read(p []byte) (int, error)  { return d.file.Read(p) }
-func (d *Device) Write(p []byte) (int, error) { return d.file.Write(p) }
-func (d *Device) Close() error                { return d.file.Close() }
-func (d *Device) Name() string                { return d.name }
-func (d *Device) MTU() int                    { return d.mtu }
+func (d *Device) Read(p []byte) (int, error) {
+	return d.retryIO(func(fd int) (int, error) { return unix.Read(fd, p) })
+}
+
+func (d *Device) Write(p []byte) (int, error) {
+	return d.retryIO(func(fd int) (int, error) { return unix.Write(fd, p) })
+}
+
+func (d *Device) retryIO(operation func(int) (int, error)) (int, error) {
+	for {
+		d.mu.RLock()
+		if d.closed {
+			d.mu.RUnlock()
+			return 0, os.ErrClosed
+		}
+		n, err := operation(int(d.file.Fd()))
+		d.mu.RUnlock()
+		if err == nil {
+			return n, nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			// Go's epoll integration can reject a TUN fd as "not pollable"
+			// on some kernels after the interface moves network namespaces.
+			// Keep the fd nonblocking so Close remains prompt, and retry with
+			// a bounded sleep instead of routing through os.File's poller.
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		return n, err
+	}
+}
+
+func (d *Device) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return os.ErrClosed
+	}
+	d.closed = true
+	return d.file.Close()
+}
+
+func (d *Device) Name() string { return d.name }
+func (d *Device) MTU() int     { return d.mtu }
 
 type ifReq struct {
 	Name  [unix.IFNAMSIZ]byte

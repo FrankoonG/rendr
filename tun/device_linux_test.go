@@ -3,11 +3,9 @@
 package tun
 
 import (
-	"errors"
 	"net/netip"
 	"os"
 	"os/exec"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -62,27 +60,35 @@ func TestDeviceReadsKernelRoutedIPv4Packet(t *testing.T) {
 
 	wantSrc := netip.MustParseAddr("10.250.0.1")
 	wantDst := netip.MustParseAddr("10.250.0.2")
-	buf := make([]byte, 1500)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		n, err := syscall.Read(int(dev.file.Fd()), buf)
-		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				time.Sleep(10 * time.Millisecond)
+	result := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, err := dev.Read(buf)
+			if err != nil {
+				result <- err
+				return
+			}
+			if n < 20 || buf[0]>>4 != 4 || buf[9] != 1 {
 				continue
 			}
-			t.Fatalf("read TUN packet: %v", err)
+			src := netip.AddrFrom4([4]byte{buf[12], buf[13], buf[14], buf[15]})
+			dst := netip.AddrFrom4([4]byte{buf[16], buf[17], buf[18], buf[19]})
+			if src == wantSrc && dst == wantDst {
+				result <- nil
+				return
+			}
 		}
-		if n < 20 || buf[0]>>4 != 4 || buf[9] != 1 {
-			continue
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Device.Read TUN packet: %v", err)
 		}
-		src := netip.AddrFrom4([4]byte{buf[12], buf[13], buf[14], buf[15]})
-		dst := netip.AddrFrom4([4]byte{buf[16], buf[17], buf[18], buf[19]})
-		if src == wantSrc && dst == wantDst {
-			return
-		}
+	case <-time.After(2 * time.Second):
+		_ = dev.Close()
+		t.Fatalf("timed out waiting for routed IPv4 packet on %s", dev.Name())
 	}
-	t.Fatalf("timed out waiting for routed IPv4 packet on %s", dev.Name())
 }
 
 func runIP(t *testing.T, args ...string) {

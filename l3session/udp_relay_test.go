@@ -66,13 +66,17 @@ func TestUDPRelayForwardsPayloadThroughRendrPacketSession(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	buf := make([]byte, 32)
+	buf := make([]byte, 256)
 	n, addr, err := server.ReadFrom(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(buf[:n]) != "query" {
-		t.Fatalf("server read %q want query", buf[:n])
+	envelope, err := decodeUDPEnvelope(buf[:n])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Identity != id || envelope.Egress != "direct" || string(envelope.Payload) != "query" {
+		t.Fatalf("server envelope=%+v want id=%s egress=direct payload=query", envelope, id)
 	}
 	if _, err := server.WriteTo([]byte("answer"), addr); err != nil {
 		t.Fatal(err)
@@ -193,7 +197,7 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 	send("one")
 	server := <-accepted
 	defer server.Close()
-	echoPacket(t, server, "one", "ack-one")
+	echoPacket(t, server, id, "one", "ack-one")
 	readReply("ack-one")
 
 	sess, ok := relay.manager().Session(id)
@@ -216,22 +220,26 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 	}
 
 	send("two")
-	echoPacket(t, server, "two", "ack-two")
+	echoPacket(t, server, id, "two", "ack-two")
 	readReply("ack-two")
 	if admin.FlowID() != server.FlowID() {
 		t.Fatalf("flow id changed across migration: client=%x server=%x", admin.FlowID(), server.FlowID())
 	}
 }
 
-func echoPacket(t *testing.T, pc rendr.PacketConn, want, reply string) {
+func echoPacket(t *testing.T, pc rendr.PacketConn, id l3ingress.L3Identity, want, reply string) {
 	t.Helper()
-	buf := make([]byte, 32)
+	buf := make([]byte, 256)
 	n, addr, err := pc.ReadFrom(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(buf[:n]) != want {
-		t.Fatalf("server read %q want %q", buf[:n], want)
+	envelope, err := decodeUDPEnvelope(buf[:n])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Identity != id || envelope.Egress != "direct" || string(envelope.Payload) != want {
+		t.Fatalf("server envelope=%+v want id=%s egress=direct payload=%q", envelope, id, want)
 	}
 	if _, err := pc.WriteTo([]byte(reply), addr); err != nil {
 		t.Fatal(err)

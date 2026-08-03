@@ -66,7 +66,14 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 		r.setPacketSession(id, sess)
 		r.startReplyLoop(ctx, id, sess)
 	}
-	_, err = sess.PacketConn.WriteTo(payload, rendrPeerAddr)
+	wirePacket, err := appendUDPEnvelope(nil, id, sess.Request.Egress, payload)
+	if err != nil {
+		return err
+	}
+	written, err := sess.PacketConn.WriteTo(wirePacket, rendrPeerAddr)
+	if err == nil && written != len(wirePacket) {
+		return fmt.Errorf("l3session: short rendr UDP request write: %d of %d", written, len(wirePacket))
+	}
 	return err
 }
 

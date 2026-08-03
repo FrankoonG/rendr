@@ -100,11 +100,33 @@ func (s Starter) Start(ctx context.Context, req l3ingress.SessionRequest) (*Sess
 		if err != nil {
 			return nil, err
 		}
+		if req.PreserveL3Identity {
+			admin, ok := c.(rendr.AdminConn)
+			if !ok {
+				_ = c.Close()
+				return nil, l3ingress.RequirePeerL3Identity(0)
+			}
+			if err := l3ingress.RequirePeerL3Identity(admin.Stats().PeerCaps); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+		}
 		return &Session{Request: req, Conn: c}, nil
 	case l3ingress.SessionKindPacket:
 		pc, err := d.DialPacket(ctx)
 		if err != nil {
 			return nil, err
+		}
+		if req.PreserveL3Identity {
+			admin, ok := pc.(rendr.AdminPacketConn)
+			if !ok {
+				_ = pc.Close()
+				return nil, l3ingress.RequirePeerL3Identity(0)
+			}
+			if err := l3ingress.RequirePeerL3Identity(admin.Stats().PeerCaps); err != nil {
+				_ = pc.Close()
+				return nil, err
+			}
 		}
 		return &Session{Request: req, PacketConn: pc}, nil
 	default:
