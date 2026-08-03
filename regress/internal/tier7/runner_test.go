@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -83,9 +84,9 @@ func TestSelectCaseDefs(t *testing.T) {
 
 func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 	defs := []caseDef{
-		{spec: manifest.Required("first", "T7")},
-		{spec: manifest.Required("second", "T7")},
-		{spec: manifest.Required("third", "T7")},
+		{spec: manifest.RequiredWithBudget("first", "T7", time.Second)},
+		{spec: manifest.RequiredWithBudget("second", "T7", time.Second)},
+		{spec: manifest.RequiredWithBudget("third", "T7", time.Second)},
 	}
 	tests := []struct {
 		name string

@@ -93,7 +93,7 @@ var aliases = []Alias{
 }
 
 func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
-	return manifest.Spec{
+	spec := manifest.Spec{
 		ID:        id,
 		Tier:      "T7",
 		Suite:     manifest.SuiteTUN,
@@ -101,6 +101,10 @@ func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
 		Long:      long,
 		Budget:    budget,
 	}
+	if strings.HasPrefix(id, "TUN-full.") && id != caseKernelTUNPreflight {
+		spec.Requires = []string{caseKernelTUNPreflight}
+	}
+	return spec
 }
 
 // Specs returns the canonical executable TUN synthetic-suite manifest.
@@ -123,6 +127,7 @@ func specsFrom(defs []caseDef) []manifest.Spec {
 	specs := make([]manifest.Spec, len(defs))
 	for i, def := range defs {
 		specs[i] = def.spec
+		specs[i].Requires = append([]string(nil), def.spec.Requires...)
 	}
 	return specs
 }

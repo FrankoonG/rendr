@@ -48,7 +48,7 @@ const (
 )
 
 const (
-	listSchemaVersion       = 1
+	listSchemaVersion       = 2
 	invocationSchemaVersion = 2
 	junitReportFileName     = "junit.xml"
 	markdownReportFileName  = "SUMMARY.md"
@@ -613,10 +613,12 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 func invocationScope(cfg runFlags, selected []manifest.Spec) string {
 	switch {
 	case cfg.caseID != "":
-		if len(selected) != 1 || selected[0].ID != cfg.caseID {
-			return "selector"
+		for _, spec := range selected {
+			if spec.ID == cfg.caseID {
+				return "exact"
+			}
 		}
-		return "exact"
+		return "selector"
 	case cfg.fromCaseID != "":
 		return "from-case"
 	case cfg.full || cfg.tunFull:
@@ -803,9 +805,18 @@ func buildTUNCatalog(specs []manifest.Spec, aliases []tunfull.Alias) (tunCatalog
 		}
 	}
 	return tunCatalog{
-		specs:   append([]manifest.Spec(nil), specs...),
+		specs:   cloneManifestSpecs(specs),
 		aliases: cloneTUNAliases(aliases),
 	}, nil
+}
+
+func cloneManifestSpecs(specs []manifest.Spec) []manifest.Spec {
+	cloned := make([]manifest.Spec, len(specs))
+	for i, spec := range specs {
+		cloned[i] = spec
+		cloned[i].Requires = append([]string(nil), spec.Requires...)
+	}
+	return cloned
 }
 
 func cloneTUNAliases(aliases []tunfull.Alias) []tunfull.Alias {
@@ -870,7 +881,7 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, 
 		for i, spec := range catalog.specs {
 			result.runOrder[i] = spec.ID
 		}
-		return result, nil
+		return catalog.withPrerequisites(result)
 	}
 
 	want := caseID
@@ -892,7 +903,10 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, 
 	}
 	if caseID != "" {
 		entry := entries[start]
-		return tunSelection{cases: []listedCase{entry.listed}, runOrder: append([]string(nil), entry.runIDs...)}, nil
+		return catalog.withPrerequisites(tunSelection{
+			cases:    []listedCase{entry.listed},
+			runOrder: append([]string(nil), entry.runIDs...),
+		})
 	}
 
 	selectedEntries := entries[start:]
@@ -920,7 +934,23 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID string) (tunSelection, 
 	if len(result.runOrder) == 0 {
 		return tunSelection{}, errors.New("selected TUN scope contains no executable cases")
 	}
-	return result, nil
+	return catalog.withPrerequisites(result)
+}
+
+func (catalog tunCatalog) withPrerequisites(selection tunSelection) (tunSelection, error) {
+	selected, err := tunSpecsForRunOrder(catalog.specs, selection.runOrder)
+	if err != nil {
+		return tunSelection{}, err
+	}
+	expanded, err := manifest.WithPrerequisites(catalog.specs, selected)
+	if err != nil {
+		return tunSelection{}, fmt.Errorf("expand TUN prerequisites: %w", err)
+	}
+	selection.runOrder = make([]string, len(expanded))
+	for i, spec := range expanded {
+		selection.runOrder[i] = spec.ID
+	}
+	return selection, nil
 }
 
 type listDocument struct {
@@ -941,6 +971,7 @@ type listedCase struct {
 	Suite      string        `json:"suite"`
 	Phase      int           `json:"phase"`
 	Mandatory  bool          `json:"mandatory"`
+	Requires   []string      `json:"requires,omitempty"`
 	Long       bool          `json:"long,omitempty"`
 	Budget     time.Duration `json:"budget_ns,omitempty"`
 	DefaultRun bool          `json:"default_run"`
@@ -1120,6 +1151,7 @@ func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string,
 		Suite:      spec.Suite,
 		Phase:      phase,
 		Mandatory:  spec.Mandatory,
+		Requires:   append([]string(nil), spec.Requires...),
 		Long:       spec.Long,
 		Budget:     spec.Budget,
 		DefaultRun: defaultRun,

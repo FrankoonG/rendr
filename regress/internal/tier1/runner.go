@@ -55,11 +55,11 @@ var caseDefs = []caseDef{
 	{manifest.RequiredWithBudget("regress-unit", "T1", 3*time.Minute), regressUnit, "", 0},
 	{manifest.RequiredWithBudget("go-test-race", "T1", 6*time.Minute), goTestRace, "linux", 4},
 	{manifest.RequiredWithBudget("go-bench-smoke", "T1", 90*time.Second), goBenchSmoke, "linux", 0},
-	{manifest.Required("const-proto-version", "T1"), constProtoVersion, "", 0},
-	{manifest.Required("const-udpflow-version", "T1"), constUDPFlowVersion, "", 0},
-	{manifest.Required("const-migration-budget-90s", "T1"), constMigrationBudget, "", 0},
-	{manifest.Required("const-mode-values", "T1"), constModeValues, "", 0},
-	{manifest.Required("const-mode-transition-table", "T1"), constModeTransitionTable, "", 0},
+	{manifest.RequiredWithBudget("const-proto-version", "T1", 5*time.Second), constProtoVersion, "", 0},
+	{manifest.RequiredWithBudget("const-udpflow-version", "T1", 5*time.Second), constUDPFlowVersion, "", 0},
+	{manifest.RequiredWithBudget("const-migration-budget-90s", "T1", 5*time.Second), constMigrationBudget, "", 0},
+	{manifest.RequiredWithBudget("const-mode-values", "T1", 5*time.Second), constModeValues, "", 0},
+	{manifest.RequiredWithBudget("const-mode-transition-table", "T1", 5*time.Second), constModeTransitionTable, "", 0},
 }
 
 // Specs returns the ordered T1 case manifest.

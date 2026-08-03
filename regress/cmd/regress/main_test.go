@@ -236,7 +236,7 @@ func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	spec := manifest.Required("synthetic.one", "T1")
+	spec := manifest.RequiredWithBudget("synthetic.one", "T1", time.Second)
 	cfg := runFlags{caseID: spec.ID, reportDir: dir, rendrRoot: "/exact/root"}
 	suite, revision, err := beginInvocation(
 		cfg,
@@ -290,7 +290,7 @@ func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
 	_, _, err := beginInvocation(
 		runFlags{reportDir: dir, rendrRoot: "/exact/root"},
 		manifest.SuiteNormal,
-		[]manifest.Spec{manifest.Required("one", "T1")},
+		[]manifest.Spec{manifest.RequiredWithBudget("one", "T1", time.Second)},
 		func(string) (gate.Revision, error) {
 			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
 		},
@@ -311,8 +311,8 @@ func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
 
 func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	all := []manifest.Spec{
-		manifest.Required("one", "T1"),
-		manifest.Required("two", "T1"),
+		manifest.RequiredWithBudget("one", "T1", time.Second),
+		manifest.RequiredWithBudget("two", "T1", time.Second),
 	}
 	full, err := buildInvocationIdentity(runFlags{full: true}, manifest.SuiteNormal, all)
 	if err != nil {
@@ -328,6 +328,17 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 ||
 		exact.ResumeCaseID != "two" || !reflect.DeepEqual(exact.SelectedCaseIDs, []string{"two"}) {
 		t.Fatalf("exact identity=%+v", exact)
+	}
+	exactWithPrerequisite, err := buildInvocationIdentity(
+		runFlags{caseID: "two"},
+		manifest.SuiteNormal,
+		all,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exactWithPrerequisite.Scope != "exact" || exactWithPrerequisite.ResumeCaseID != "one" {
+		t.Fatalf("exact identity with prerequisite=%+v", exactWithPrerequisite)
 	}
 	if full.ManifestDigest == exact.ManifestDigest {
 		t.Fatalf("full and exact manifests share digest %q", full.ManifestDigest)
@@ -543,15 +554,16 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(exact.runOrder, longCompat.ExpandsTo) {
-		t.Fatalf("selector run=%v want expansion %v", exact.runOrder, longCompat.ExpandsTo)
+	wantLongRun := append([]string{"TUN-full.preflight-kernel-tun"}, longCompat.ExpandsTo...)
+	if !reflect.DeepEqual(exact.runOrder, wantLongRun) {
+		t.Fatalf("selector run=%v want preflight+expansion %v", exact.runOrder, wantLongRun)
 	}
 	primeCompat := findListedCase(t, selection.cases, "TUN-full.T4-G2-30m-prime")
 	if primeCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(primeCompat.ExpandsTo, []string{"TUN-full.T4-G2-30m-selector"}) {
 		t.Fatalf("prime compatibility entry=%+v", primeCompat)
 	}
 	exact, err = tunCatalog.selectCases("TUN-full.T4-G2-30m-prime", "")
-	if err != nil || !reflect.DeepEqual(exact.runOrder, primeCompat.ExpandsTo) {
+	if err != nil || !reflect.DeepEqual(exact.runOrder, []string{"TUN-full.preflight-kernel-tun", "TUN-full.T4-G2-30m-selector"}) {
 		t.Fatalf("prime alias selection=%+v err=%v", exact, err)
 	}
 	fallbackCompat := findListedCase(t, selection.cases, "TUN-full.T5-fallback")
@@ -562,7 +574,7 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resumed.runOrder) == 0 || resumed.runOrder[0] != "TUN-full.T3-xray-matrix" {
+	if len(resumed.runOrder) < 2 || resumed.runOrder[0] != "TUN-full.preflight-kernel-tun" || resumed.runOrder[1] != "TUN-full.T3-xray-matrix" {
 		t.Fatalf("compatibility resume is not inclusive: %v", resumed.runOrder)
 	}
 	for _, spec := range tunfull.Specs() {
@@ -574,8 +586,8 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 
 func TestTUNCatalogMismatchFailsClosed(t *testing.T) {
 	specs := tunfull.Specs()
-	badSpecs := append([]manifest.Spec(nil), specs...)
-	badSpecs[0].Mandatory = false
+	badSpecs := cloneManifestSpecs(specs)
+	badSpecs[0].Tier = "T6"
 	if _, err := buildTUNCatalog(badSpecs, tunfull.Aliases()); err == nil || !strings.Contains(err.Error(), "registry/full mismatch") {
 		t.Fatalf("metadata mismatch err=%v", err)
 	}
@@ -618,7 +630,11 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 	var called []string
 	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, opts tunfull.Options) {
 		called = append(called, opts.Case)
-		suite.Add(report.Case{Name: opts.Case, Tier: "T7", Failure: "synthetic failure"})
+		rc := report.Case{Name: opts.Case, Tier: "T7"}
+		if opts.Case != "TUN-full.preflight-kernel-tun" {
+			rc.Failure = "synthetic failure"
+		}
+		suite.Add(rc)
 	}
 
 	root := newMainTestRepo(t)
@@ -631,7 +647,7 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 	if code := executeTUN(context.Background(), cfg, selection, &stdout, &stderr); code != exitT7Fail {
 		t.Fatalf("code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
 	}
-	if !reflect.DeepEqual(called, []string{"TUN-full.T4-G1-1GiB-tcp"}) {
+	if !reflect.DeepEqual(called, []string{"TUN-full.preflight-kernel-tun", "TUN-full.T4-G1-1GiB-tcp"}) {
 		t.Fatalf("executed=%v", called)
 	}
 	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
@@ -639,7 +655,8 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`complete="true"`, `selected_cases="3"`, `invocation_suite="tun-full/synthetic-l3-session"`,
+		`complete="true"`, `selected_cases="4"`, `invocation_suite="tun-full/synthetic-l3-session"`,
+		`name="TUN-full.preflight-kernel-tun"`,
 		`name="TUN-full.T4-G1-1GiB-tcp"`, `name="TUN-full.T4-G2-30m-selector"`,
 		`name="TUN-full.T4-G3-100k-pps"`, "not run after TUN-full.T4-G1-1GiB-tcp failed",
 	} {
@@ -670,6 +687,9 @@ func TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment(t *testing.T
 	if !strings.Contains(stdout.String(), `"default_run": false`) {
 		t.Fatal("JSON hides non-default compatibility entries")
 	}
+	if !strings.Contains(stdout.String(), `"requires":`) {
+		t.Fatal("JSON hides executable prerequisite metadata")
+	}
 }
 
 func TestScopedListUsesExecutionPlan(t *testing.T) {
@@ -690,7 +710,12 @@ func TestScopedListUsesExecutionPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = prepared.list.Catalogs[0]
-	if len(got.Cases) != 1 || got.Cases[0].Kind != tunKindCompatibilitySelector || len(got.RunOrder) != 3 {
+	if len(got.Cases) != 1 || got.Cases[0].Kind != tunKindCompatibilitySelector || !reflect.DeepEqual(got.RunOrder, []string{
+		"TUN-full.preflight-kernel-tun",
+		"TUN-full.T4-G1-1GiB-tcp",
+		"TUN-full.T4-G2-30m-selector",
+		"TUN-full.T4-G3-100k-pps",
+	}) {
 		t.Fatalf("scoped TUN list=%+v", got)
 	}
 }
@@ -698,11 +723,11 @@ func TestScopedListUsesExecutionPlan(t *testing.T) {
 func TestSpecsForPlanSupportsSyntheticRegistries(t *testing.T) {
 	registries := map[string][]manifest.Spec{
 		"T1": {
-			manifest.Required("synthetic.one", "T1"),
-			manifest.Required("synthetic.two", "T1"),
+			manifest.RequiredWithBudget("synthetic.one", "T1", time.Second),
+			manifest.RequiredWithBudget("synthetic.two", "T1", time.Second),
 		},
 		"T2": {
-			manifest.Required("synthetic.three", "T2"),
+			manifest.RequiredWithBudget("synthetic.three", "T2", time.Second),
 		},
 	}
 	plan := runplan.Plan{Runs: []runplan.TierRun{
@@ -723,8 +748,8 @@ func TestSpecsForPlanSupportsSyntheticRegistries(t *testing.T) {
 
 func TestReconcileReportRowsFailsClosed(t *testing.T) {
 	expected := []manifest.Spec{
-		manifest.Required("one", "T1"),
-		manifest.Required("two", "T1"),
+		manifest.RequiredWithBudget("one", "T1", time.Second),
+		manifest.RequiredWithBudget("two", "T1", time.Second),
 	}
 	tests := []struct {
 		name   string
@@ -770,6 +795,25 @@ func TestTUNRunOrderResolvesExactUniqueSpecs(t *testing.T) {
 	}
 	if _, err := tunSpecsForRunOrder(specs, []string{"TUN-full.G4-path-death", "TUN-full.G4-path-death"}); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate err=%v", err)
+	}
+
+	catalog, err := buildTUNCatalog(specs, tunfull.Aliases())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := catalog.selectCases("TUN-full.G4-path-death", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exact.runOrder; !reflect.DeepEqual(got, []string{"TUN-full.preflight-kernel-tun", "TUN-full.G4-path-death"}) {
+		t.Fatalf("exact run order=%v", got)
+	}
+	resumed, err := catalog.selectCases("", "TUN-full.G4-path-death")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resumed.runOrder; len(got) < 2 || got[0] != "TUN-full.preflight-kernel-tun" || got[1] != "TUN-full.G4-path-death" {
+		t.Fatalf("resume run order=%v", got)
 	}
 }
 

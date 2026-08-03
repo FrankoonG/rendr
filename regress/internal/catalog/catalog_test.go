@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/tier1"
@@ -94,12 +95,22 @@ func TestLookupAndByTierPreserveOwnership(t *testing.T) {
 	if got := ByTier("T9"); got != nil {
 		t.Errorf("ByTier(unknown) = %v, want nil", got)
 	}
-	if got, ok := Lookup("missing-case"); ok || got != (manifest.Spec{}) {
+	if got, ok := Lookup("missing-case"); ok || !reflect.DeepEqual(got, manifest.Spec{}) {
 		t.Errorf("Lookup(missing) = (%+v, %t), want zero, false", got, ok)
 	}
 }
 
 func TestCatalogAPIsDoNotExposeMutableAliases(t *testing.T) {
+	original := []manifest.Spec{{
+		ID: "dependent", Tier: "T1", Suite: manifest.SuiteNormal, Mandatory: true,
+		Budget: time.Second, Requires: []string{"preflight"},
+	}}
+	cloned := clone(original)
+	cloned[0].Requires[0] = "mutated"
+	if original[0].Requires[0] != "preflight" {
+		t.Fatalf("clone exposed prerequisite slice alias: %+v", original[0])
+	}
+
 	getters := []struct {
 		name string
 		get  func() []manifest.Spec
@@ -116,7 +127,7 @@ func TestCatalogAPIsDoNotExposeMutableAliases(t *testing.T) {
 			first[0] = manifest.Spec{ID: "mutated", Tier: "mutated", Suite: manifest.SuiteTUN}
 
 			second := getter.get()
-			if second[0] != want {
+			if !reflect.DeepEqual(second[0], want) {
 				t.Fatalf("second call starts with %+v after mutation, want %+v", second[0], want)
 			}
 		})
@@ -129,7 +140,7 @@ func TestCatalogAPIsDoNotExposeMutableAliases(t *testing.T) {
 	}
 	got.ID = "mutated"
 	again, ok := Lookup(want.ID)
-	if !ok || again != want {
+	if !ok || !reflect.DeepEqual(again, want) {
 		t.Fatalf("Lookup(%q) after result mutation = (%+v, %t), want (%+v, true)", want.ID, again, ok, want)
 	}
 }
@@ -143,15 +154,15 @@ func TestValidateSourcesRejectsInvalidCatalogs(t *testing.T) {
 		{
 			name: "duplicate ID across tiers",
 			sources: []tierSource{
-				testSource("T1", phaseOne, manifest.Required("same", "T1")),
-				testSource("T2", phaseOne, manifest.Required("same", "T2")),
+				testSource("T1", phaseOne, manifest.RequiredWithBudget("same", "T1", time.Second)),
+				testSource("T2", phaseOne, manifest.RequiredWithBudget("same", "T2", time.Second)),
 			},
 			want: "duplicate case ID",
 		},
 		{
 			name: "tier ownership mismatch",
 			sources: []tierSource{
-				testSource("T1", phaseOne, manifest.Required("wrong-owner", "T2")),
+				testSource("T1", phaseOne, manifest.RequiredWithBudget("wrong-owner", "T2", time.Second)),
 			},
 			want: "declares tier \"T2\"",
 		},
@@ -159,7 +170,7 @@ func TestValidateSourcesRejectsInvalidCatalogs(t *testing.T) {
 			name: "suite mismatch",
 			sources: []tierSource{
 				testSource("T1", phaseOne, manifest.Spec{
-					ID: "tun-case", Tier: "T1", Suite: manifest.SuiteTUN, Mandatory: true,
+					ID: "tun-case", Tier: "T1", Suite: manifest.SuiteTUN, Mandatory: true, Budget: time.Second,
 				}),
 			},
 			want: "declares suite \"tun-full\"",

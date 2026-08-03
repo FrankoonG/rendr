@@ -70,11 +70,22 @@ func TestSpecsOrderedAndBudgeted(t *testing.T) {
 		if !spec.Mandatory || spec.Suite != manifest.SuiteTUN || spec.Tier != "T7" || spec.Budget != wantBudgets[i] {
 			t.Errorf("Specs()[%d] = %+v, want mandatory TUN/T7 budget %s", i, spec, wantBudgets[i])
 		}
+		wantRequires := []string(nil)
+		if spec.ID != caseKernelTUNPreflight {
+			wantRequires = []string{caseKernelTUNPreflight}
+		}
+		if !reflect.DeepEqual(spec.Requires, wantRequires) {
+			t.Errorf("Specs()[%d].Requires = %v, want %v", i, spec.Requires, wantRequires)
+		}
 	}
 
 	specs[0].ID = "mutated"
+	specs[1].Requires[0] = "mutated"
 	if got := Specs()[0].ID; got != caseKernelTUNPreflight {
 		t.Fatalf("Specs returned shared storage: first ID = %q", got)
+	}
+	if got := Specs()[1].Requires[0]; got != caseKernelTUNPreflight {
+		t.Fatalf("Specs returned shared prerequisite storage: %q", got)
 	}
 }
 
@@ -300,7 +311,7 @@ func TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember(t *testing.T) {
 	noBudget := syntheticCase("synthetic.no-budget", 0, func(context.Context, string, manifest.Spec) report.Case {
 		return report.Case{}
 	})
-	if err := validateCaseDefs([]caseDef{noBudget}); err == nil || !strings.Contains(err.Error(), "no execution budget") {
+	if err := validateCaseDefs([]caseDef{noBudget}); err == nil || !strings.Contains(err.Error(), "non-positive budget") {
 		t.Fatalf("missing budget err = %v", err)
 	}
 

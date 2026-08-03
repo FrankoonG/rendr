@@ -59,7 +59,7 @@ func Lookup(id string) (manifest.Spec, bool) {
 	for _, source := range normalSources {
 		for _, spec := range source.specs() {
 			if spec.ID == id {
-				return spec, true
+				return cloneSpec(spec), true
 			}
 		}
 	}
@@ -85,14 +85,25 @@ func collect(include func(tierSource) bool) []manifest.Spec {
 	var specs []manifest.Spec
 	for _, source := range normalSources {
 		if include(source) {
-			specs = append(specs, source.specs()...)
+			specs = append(specs, clone(source.specs())...)
 		}
 	}
 	return specs
 }
 
 func clone(specs []manifest.Spec) []manifest.Spec {
-	return append([]manifest.Spec(nil), specs...)
+	result := make([]manifest.Spec, len(specs))
+	for i, spec := range specs {
+		result[i] = cloneSpec(spec)
+	}
+	return result
+}
+
+func cloneSpec(spec manifest.Spec) manifest.Spec {
+	if spec.Requires != nil {
+		spec.Requires = append([]string(nil), spec.Requires...)
+	}
+	return spec
 }
 
 func validateSources(sources []tierSource) error {

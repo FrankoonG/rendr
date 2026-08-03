@@ -27,9 +27,13 @@ var orderedCaseIDs = []string{
 }
 
 func TestSpecsOrder(t *testing.T) {
-	got := make([]string, len(Specs()))
-	for i, spec := range Specs() {
+	specs := Specs()
+	got := make([]string, len(specs))
+	for i, spec := range specs {
 		got[i] = spec.ID
+		if spec.Budget <= 0 {
+			t.Errorf("spec %q has unbounded budget %s", spec.ID, spec.Budget)
+		}
 	}
 	if !reflect.DeepEqual(got, orderedCaseIDs) {
 		t.Fatalf("Specs IDs = %v, want %v", got, orderedCaseIDs)
@@ -130,7 +134,7 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 		{
 			name: "failure",
 			first: caseDef{
-				spec: manifest.Required("first", "T1"),
+				spec: manifest.RequiredWithBudget("first", "T1", time.Second),
 				fn:   func(context.Context, string) error { return errors.New("boom") },
 			},
 			assertStop: func(t *testing.T, rc report.Case) {
@@ -144,7 +148,7 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 			first: func() caseDef {
 				attempt := 0
 				return caseDef{
-					spec:    manifest.Required("first", "T1"),
+					spec:    manifest.RequiredWithBudget("first", "T1", time.Second),
 					retries: 1,
 					fn: func(context.Context, string) error {
 						attempt++
@@ -164,7 +168,7 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 		{
 			name: "mandatory skip",
 			first: caseDef{
-				spec:   manifest.Required("first", "T1"),
+				spec:   manifest.RequiredWithBudget("first", "T1", time.Second),
 				onlyOn: "not-" + runtime.GOOS,
 				fn: func(context.Context, string) error {
 					t.Fatal("skipped case executor was invoked")
@@ -184,8 +188,8 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 			laterCalls := 0
 			defs := []caseDef{
 				tc.first,
-				{spec: manifest.Required("second", "T1"), fn: func(context.Context, string) error { laterCalls++; return nil }},
-				{spec: manifest.Required("third", "T1"), fn: func(context.Context, string) error { laterCalls++; return nil }},
+				{spec: manifest.RequiredWithBudget("second", "T1", time.Second), fn: func(context.Context, string) error { laterCalls++; return nil }},
+				{spec: manifest.RequiredWithBudget("third", "T1", time.Second), fn: func(context.Context, string) error { laterCalls++; return nil }},
 			}
 			suite := report.New()
 			runCaseDefs(context.Background(), suite, "", defs)
