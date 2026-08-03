@@ -78,7 +78,8 @@ func TestWriteAtomicallyReplacesState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *got != second {
+	if got.CommitSHA != second.CommitSHA || got.WorktreeSHA != second.WorktreeSHA ||
+		got.Status != second.Status || !got.At.Equal(second.At) {
 		t.Fatalf("state=%+v want %+v", *got, second)
 	}
 	temps, err := filepath.Glob(filepath.Join(dir, "."+StateFileName+"-*"))

@@ -406,7 +406,8 @@ func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *state != red {
+	if state.CommitSHA != red.CommitSHA || state.WorktreeSHA != red.WorktreeSHA ||
+		state.Status != red.Status || !state.At.Equal(red.At) {
 		t.Fatalf("partial resume changed gate: got %+v want %+v", *state, red)
 	}
 	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
