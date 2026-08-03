@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
@@ -184,7 +185,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 			defs := syntheticCaseDefs("T5")
 			var called []string
 			suite := report.New()
-			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) report.Case {
+			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) caseexec.Outcome {
 				called = append(called, def.spec.ID)
 				rc := report.Case{Name: def.spec.ID, Tier: def.spec.Tier}
 				if def.spec.ID == "synthetic.blocker" {
@@ -192,7 +193,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 					rc.InvalidReason = tt.outcome.InvalidReason
 					rc.SkipReason = tt.outcome.SkipReason
 				}
-				return rc
+				return caseexec.Outcome{Case: rc}
 			})
 
 			if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
@@ -200,6 +201,31 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 			}
 			assertFailFastRows(t, suite.Cases, "T5")
 		})
+	}
+}
+
+func TestRunSelectedCasesStopsAfterUnsafeOutcome(t *testing.T) {
+	defs := syntheticCaseDefs("T5")
+	defs[0].spec.Mandatory = false
+	calls := 0
+	suite := report.New()
+	runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) caseexec.Outcome {
+		calls++
+		return caseexec.Outcome{
+			Case: report.Case{
+				Name:          def.spec.ID,
+				Tier:          def.spec.Tier,
+				InvalidReason: "workload did not join; process exit required",
+			},
+			MustStop: true,
+		}
+	})
+
+	if calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", calls)
+	}
+	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
+		t.Fatalf("next case result = %q", got)
 	}
 }
 

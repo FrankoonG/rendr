@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/regress/internal/smoke"
@@ -101,12 +102,12 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		})
 		return
 	}
-	runSelectedCases(ctx, suite, defs, func(ctx context.Context, def caseDef) report.Case {
+	runSelectedCases(ctx, suite, defs, func(ctx context.Context, def caseDef) caseexec.Outcome {
 		return executeCase(ctx, def, rendrRoot)
 	})
 }
 
-type caseExecutor func(context.Context, caseDef) report.Case
+type caseExecutor func(context.Context, caseDef) caseexec.Outcome
 
 func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
 	failedCaseID := ""
@@ -115,17 +116,18 @@ func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, 
 			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		rc := execute(ctx, def)
+		outcome := execute(ctx, def)
+		rc := outcome.Case
 		suite.Add(rc)
-		if mandatoryCaseFailed(def.spec, rc) {
+		if outcome.MustStop || mandatoryCaseFailed(def.spec, rc) {
 			failedCaseID = def.spec.ID
 		}
 	}
 }
 
-func executeCase(ctx context.Context, def caseDef, rendrRoot string) report.Case {
+func executeCase(ctx context.Context, def caseDef, rendrRoot string) caseexec.Outcome {
 	if runtime.GOOS != "linux" {
-		return linuxOnlySkip(def)
+		return caseexec.Outcome{Case: linuxOnlySkip(def)}
 	}
 	return runCase(ctx, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
 		return def.run(c, rendrRoot)
@@ -158,27 +160,15 @@ func smokeReportCase(name string, result smoke.Result) report.Case {
 	}
 }
 
-func runCase(ctx context.Context, name string, budget time.Duration, fn func(context.Context) report.Case) report.Case {
+func runCase(ctx context.Context, name string, budget time.Duration, fn func(context.Context) report.Case) caseexec.Outcome {
 	fmt.Printf("  > T5/%s (budget %s) — start\n", name, budget)
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	start := time.Now()
-	done := make(chan report.Case, 1)
-	go func() { done <- fn(cctx) }()
-	var rc report.Case
-	select {
-	case rc = <-done:
-		if rc.Duration == 0 {
-			rc.Duration = time.Since(start)
-		}
-	case <-cctx.Done():
-		rc = report.Case{
-			Name:     name,
-			Tier:     "T5",
-			Duration: time.Since(start),
-			Failure:  "case exceeded T5 budget: " + cctx.Err().Error(),
-		}
-	}
+	outcome := caseexec.Run(ctx, caseexec.Config{
+		Name:        name,
+		Tier:        "T5",
+		Budget:      budget,
+		JoinTimeout: caseexec.DefaultJoinTimeout,
+	}, fn)
+	rc := outcome.Case
 	if rc.InvalidReason != "" {
 		fmt.Printf("  > T5/%s (took %s) — INVALID: %s\n", name, rc.Duration, rc.InvalidReason)
 	} else if rc.Failure != "" {
@@ -188,7 +178,7 @@ func runCase(ctx context.Context, name string, budget time.Duration, fn func(con
 	} else {
 		fmt.Printf("  > T5/%s (took %s) — OK\n", name, rc.Duration)
 	}
-	return rc
+	return outcome
 }
 
 func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {

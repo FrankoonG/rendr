@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
@@ -135,7 +136,7 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
 			suite := report.New()
-			runCaseDefs(context.Background(), suite, "", defs, func(_ context.Context, _ string, def caseDef) report.Case {
+			runCaseDefs(context.Background(), suite, "", defs, func(_ context.Context, _ string, def caseDef) caseexec.Outcome {
 				calls++
 				if calls > 1 {
 					t.Fatal("later executor was invoked")
@@ -144,7 +145,7 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 				rc.Name = def.spec.ID
 				rc.Tier = def.spec.Tier
 				rc.Evidence = map[string]string{"cleanup": "preserved"}
-				return rc
+				return caseexec.Outcome{Case: rc}
 			})
 
 			if calls != 1 {
@@ -162,6 +163,28 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunCaseDefsStopsAfterUnsafeOutcome(t *testing.T) {
+	defs := []caseDef{
+		{spec: manifest.Spec{ID: "first", Tier: "T7"}},
+		{spec: manifest.RequiredWithBudget("second", "T7", time.Second)},
+	}
+	calls := 0
+	suite := report.New()
+	runCaseDefs(context.Background(), suite, "", defs, func(_ context.Context, _ string, def caseDef) caseexec.Outcome {
+		calls++
+		return caseexec.Outcome{
+			Case:     report.Case{Name: def.spec.ID, Tier: def.spec.Tier, InvalidReason: "process exit required"},
+			MustStop: true,
+		}
+	})
+	if calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", calls)
+	}
+	if got := suite.Cases[1].InvalidReason; got != "not run after first failed" {
+		t.Fatalf("next case result = %q", got)
 	}
 }
 
