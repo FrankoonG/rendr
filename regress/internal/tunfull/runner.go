@@ -230,9 +230,10 @@ func NotRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.Case {
 	start := time.Now()
 	cctx, cancel := context.WithTimeout(ctx, def.spec.Budget)
-	defer cancel()
 	done := make(chan report.Case, 1)
+	workloadDone := make(chan struct{})
 	go func() {
+		defer close(workloadDone)
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				done <- report.Case{Failure: fmt.Sprintf("runner panic: %v", recovered)}
@@ -242,6 +243,8 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 	}()
 
 	var rc report.Case
+	timedOut := false
+	var timeoutErr error
 	select {
 	case rc = <-done:
 		if err := cctx.Err(); err != nil {
@@ -253,7 +256,19 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 			}
 		}
 	case <-cctx.Done():
-		rc.Failure = fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, cctx.Err())
+		timedOut = true
+		timeoutErr = cctx.Err()
+	}
+	cancel()
+	<-workloadDone
+	if timedOut {
+		rc = <-done
+		budgetFailure := fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, timeoutErr)
+		if rc.Failure == "" {
+			rc.Failure = budgetFailure
+		} else {
+			rc.Failure = budgetFailure + ": " + rc.Failure
+		}
 	}
 	if rc.Duration == 0 {
 		rc.Duration = time.Since(start)
@@ -409,9 +424,11 @@ func UnimplementedCase(name string) report.Case {
 	}
 }
 
+var tunChaosApply = chaos.Apply
+
 func runT4WithBudget(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) report.Case) report.Case {
 	start := time.Now()
-	cleanup, err := chaos.Apply(prof)
+	cleanup, err := tunChaosApply(prof)
 	if err != nil {
 		return report.Case{
 			Name:          name,
@@ -421,26 +438,33 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 		}
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	done := make(chan report.Case, 1)
-	go func() {
-		done <- fn(cctx)
-	}()
 	var result report.Case
-	select {
-	case c := <-done:
-		if c.Name == "" {
-			c.Name = name
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result = failedCase(name, start, fmt.Errorf("runner panic: %v", recovered))
+			}
+		}()
+		result = fn(cctx)
+	}()
+	budgetErr := cctx.Err()
+	cancel()
+	if budgetErr != nil {
+		budgetFailure := fmt.Sprintf("case exceeded T4 budget %s: %v", budget, budgetErr)
+		if result.Failure == "" {
+			result.Failure = budgetFailure
+		} else {
+			result.Failure = budgetFailure + ": " + result.Failure
 		}
-		if c.Tier == "" {
-			c.Tier = "T7"
-		}
-		if c.Duration == 0 {
-			c.Duration = time.Since(start)
-		}
-		result = c
-	case <-cctx.Done():
-		result = failedCase(name, start, fmt.Errorf("case exceeded T4 budget %s: %w", budget, cctx.Err()))
+	}
+	if result.Name == "" {
+		result.Name = name
+	}
+	if result.Tier == "" {
+		result.Tier = "T7"
+	}
+	if result.Duration == 0 {
+		result.Duration = time.Since(start)
 	}
 	applyT4CleanupResult(&result, cleanup)
 	return result

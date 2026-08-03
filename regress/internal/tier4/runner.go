@@ -227,8 +227,8 @@ func executeCase(ctx context.Context, def caseDef) report.Case {
 }
 
 // runCase enforces the per-case budget via select-on-Done. It returns only
-// after chaos cleanup so the selected-case loop can stop before launching any
-// later case, even when the smoke goroutine is still unwinding cancellation.
+// after the workload and chaos monitor stop and chaos cleanup completes, so the
+// selected-case loop cannot overlap one case's teardown with the next case.
 func runCase(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) report.Case {
 	return runCaseWithChaos(ctx, name, budget, prof, fn, chaos.ApplyChecked)
 }
@@ -253,12 +253,14 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	start := time.Now()
 	monitorFailures, monitorDone := monitorChaosFixture(cctx, fixture, verifyInterval)
-	done := make(chan smoke.Result, 1)
+	result := make(chan smoke.Result, 1)
+	workloadDone := make(chan struct{})
 	go func() {
-		done <- fn(cctx)
+		defer close(workloadDone)
+		result <- fn(cctx)
 	}()
 	select {
-	case r := <-done:
+	case r := <-result:
 		rc.Duration = r.Duration
 		rc.Failure = r.Failure
 		rc.InvalidReason = r.InvalidReason
@@ -273,7 +275,18 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 		rc.Duration = time.Since(start)
 		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
 	}
+	if stopErr := cctx.Err(); stopErr != nil {
+		rc = report.Case{
+			Name:     name,
+			Tier:     "T4",
+			Duration: time.Since(start),
+			Failure:  "case exceeded T4 budget (" + budget.String() + "): " + stopErr.Error(),
+		}
+	}
 	cancel()
+	// A late result must not replace the timeout or monitor outcome selected
+	// above, but the workload still owns resources until it has fully returned.
+	<-workloadDone
 	<-monitorDone
 	select {
 	case err := <-monitorFailures:
@@ -284,6 +297,7 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 		markChaosInvalid(&rc, "chaos final verification failed: "+err.Error())
 	}
 	applyCleanupResult(&rc, fixture.Cleanup)
+	rc.Duration = time.Since(start)
 	if rc.Failure != "" {
 		fmt.Printf("  > T4/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
 	} else if rc.InvalidReason != "" {

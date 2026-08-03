@@ -251,6 +251,166 @@ func TestApplyCleanupResultFailsClosed(t *testing.T) {
 	})
 }
 
+func TestRunCaseWithChaosJoinsDelayedWorkloadBeforeFixtureFinalization(t *testing.T) {
+	tests := []struct {
+		name        string
+		budget      time.Duration
+		changes     func() <-chan error
+		wantFailure string
+		wantInvalid string
+	}{
+		{
+			name:        "timeout remains authoritative",
+			budget:      5 * time.Millisecond,
+			wantFailure: "case exceeded T4 budget",
+		},
+		{
+			name:   "monitor invalidation",
+			budget: time.Second,
+			changes: func() <-chan error {
+				ch := make(chan error, 1)
+				ch <- fmt.Errorf("%w: qdisc replaced", chaos.ErrStimulusInvalid)
+				return ch
+			},
+			wantInvalid: "qdisc replaced",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var workloadFinished atomic.Bool
+			var verifyBeforeWorkload atomic.Bool
+			var cleanupBeforeWorkload atomic.Bool
+			var cleanupBeforeVerify atomic.Bool
+			var finalVerified atomic.Bool
+			unwindStarted := make(chan struct{})
+			releaseUnwind := make(chan struct{})
+			workloadDone := make(chan struct{})
+
+			go func() {
+				<-unwindStarted
+				time.Sleep(10 * time.Millisecond)
+				close(releaseUnwind)
+			}()
+
+			var changes <-chan error
+			if tt.changes != nil {
+				changes = tt.changes()
+			}
+			fixture := &fakeChaosFixture{
+				changes: changes,
+				verify: func() error {
+					if !workloadFinished.Load() {
+						verifyBeforeWorkload.Store(true)
+					}
+					finalVerified.Store(true)
+					return nil
+				},
+				cleanup: func() error {
+					if !workloadFinished.Load() {
+						cleanupBeforeWorkload.Store(true)
+					}
+					if !finalVerified.Load() {
+						cleanupBeforeVerify.Store(true)
+					}
+					return nil
+				},
+			}
+			rc := runCaseWithChaosInterval(context.Background(), tt.name, tt.budget, chaos.Realistic50M,
+				func(ctx context.Context) smoke.Result {
+					<-ctx.Done()
+					close(unwindStarted)
+					<-releaseUnwind
+					workloadFinished.Store(true)
+					close(workloadDone)
+					return smoke.Result{
+						Failure:       "late workload failure",
+						InvalidReason: "late workload invalidity",
+						Detail:        map[string]any{"late_result": true},
+					}
+				},
+				func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Hour)
+
+			select {
+			case <-workloadDone:
+			default:
+				t.Fatal("runCaseWithChaosInterval returned before the workload finished")
+			}
+			if verifyBeforeWorkload.Load() || cleanupBeforeWorkload.Load() {
+				t.Fatalf("fixture finalized before workload unwind: verify=%v cleanup=%v",
+					verifyBeforeWorkload.Load(), cleanupBeforeWorkload.Load())
+			}
+			if cleanupBeforeVerify.Load() {
+				t.Fatal("chaos cleanup ran before final verification")
+			}
+			if !strings.Contains(rc.Failure, tt.wantFailure) || !strings.Contains(rc.InvalidReason, tt.wantInvalid) {
+				t.Fatalf("case=%+v, want failure containing %q and invalidity containing %q", rc, tt.wantFailure, tt.wantInvalid)
+			}
+			if rc.Evidence["late_result"] != "" || strings.Contains(rc.Failure, "late workload") || strings.Contains(rc.InvalidReason, "late workload") {
+				t.Fatalf("late workload result replaced selected outcome: %+v", rc)
+			}
+		})
+	}
+}
+
+func TestRunCaseWithChaosResultCancelsAndJoinsMonitorBeforeFinalization(t *testing.T) {
+	ctxDone := make(chan (<-chan struct{}), 1)
+	monitorVerifyStarted := make(chan struct{})
+	monitorObservedCancel := make(chan struct{})
+	releaseMonitor := make(chan struct{})
+	var monitorVerifyReturned atomic.Bool
+	var finalVerifyBeforeMonitor atomic.Bool
+	var cleanupBeforeMonitor atomic.Bool
+	var verifyCalls atomic.Int32
+
+	go func() {
+		<-monitorObservedCancel
+		time.Sleep(10 * time.Millisecond)
+		close(releaseMonitor)
+	}()
+
+	fixture := &fakeChaosFixture{
+		verify: func() error {
+			if verifyCalls.Add(1) == 1 {
+				done := <-ctxDone
+				close(monitorVerifyStarted)
+				<-done
+				close(monitorObservedCancel)
+				<-releaseMonitor
+				monitorVerifyReturned.Store(true)
+				return nil
+			}
+			if !monitorVerifyReturned.Load() {
+				finalVerifyBeforeMonitor.Store(true)
+			}
+			return nil
+		},
+		cleanup: func() error {
+			if !monitorVerifyReturned.Load() {
+				cleanupBeforeMonitor.Store(true)
+			}
+			return nil
+		},
+	}
+	rc := runCaseWithChaosInterval(context.Background(), "result", time.Second, chaos.Realistic50M,
+		func(ctx context.Context) smoke.Result {
+			ctxDone <- ctx.Done()
+			<-monitorVerifyStarted
+			return smoke.Result{}
+		},
+		func(chaos.Profile) (chaos.Fixture, error) { return fixture, nil }, time.Millisecond)
+
+	if rc.Failure != "" || rc.InvalidReason != "" {
+		t.Fatalf("case=%+v, want successful result", rc)
+	}
+	if verifyCalls.Load() < 2 {
+		t.Fatalf("fixture verification calls = %d, want at least monitor plus final verification", verifyCalls.Load())
+	}
+	if finalVerifyBeforeMonitor.Load() || cleanupBeforeMonitor.Load() {
+		t.Fatalf("fixture finalized before monitor exit: verify=%v cleanup=%v",
+			finalVerifyBeforeMonitor.Load(), cleanupBeforeMonitor.Load())
+	}
+}
+
 func TestEvidenceFromDetailPreservesFacts(t *testing.T) {
 	got := evidenceFromDetail(map[string]any{"migrations": 3, "sha_match": true})
 	want := map[string]string{"migrations": "3", "sha_match": "true"}

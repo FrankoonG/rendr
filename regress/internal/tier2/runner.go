@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/FrankoonG/rendr"
@@ -185,31 +186,41 @@ func runSmokeCase(ctx context.Context, name, tier string, budget time.Duration, 
 		return report.Case{Name: name, Tier: tier, Failure: "T2 case has no bounded execution budget"}
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
 	start := time.Now()
 	done := make(chan smoke.Result, 1)
+	var workload sync.WaitGroup
+	workload.Add(1)
 	go func() {
+		defer workload.Done()
 		done <- fn(cctx)
 	}()
 
-	result := report.Case{Name: name, Tier: tier}
+	var smokeResult smoke.Result
 	select {
-	case r := <-done:
-		result.Duration = r.Duration
-		if result.Duration == 0 {
-			result.Duration = time.Since(start)
-		}
-		result.Failure = r.Failure
-		result.InvalidReason = r.InvalidReason
-		result.Evidence = detailEvidence(r.Detail)
+	case smokeResult = <-done:
 	case <-cctx.Done():
-		result.Duration = time.Since(start)
-		if cctx.Err() == context.DeadlineExceeded {
-			result.Failure = fmt.Sprintf("case exceeded T2 budget %s: %v", budget, cctx.Err())
-		} else {
-			result.Failure = fmt.Sprintf("case canceled: %v", cctx.Err())
-		}
 	}
+	stopErr := cctx.Err()
+	cancel()
+	workload.Wait()
+
+	result := report.Case{Name: name, Tier: tier}
+	if stopErr != nil {
+		result.Duration = time.Since(start)
+		if stopErr == context.DeadlineExceeded {
+			result.Failure = fmt.Sprintf("case exceeded T2 budget %s: %v", budget, stopErr)
+		} else {
+			result.Failure = fmt.Sprintf("case canceled: %v", stopErr)
+		}
+		return result
+	}
+	result.Duration = smokeResult.Duration
+	if result.Duration == 0 {
+		result.Duration = time.Since(start)
+	}
+	result.Failure = smokeResult.Failure
+	result.InvalidReason = smokeResult.InvalidReason
+	result.Evidence = detailEvidence(smokeResult.Detail)
 	return result
 }
 

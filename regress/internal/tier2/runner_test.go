@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -118,16 +119,81 @@ func TestAddRunPreservesInvalidSmokeOutcome(t *testing.T) {
 	}
 }
 
-func TestAddRunEnforcesBudget(t *testing.T) {
-	suite := report.New()
-	release := make(chan struct{})
-	defer close(release)
-	addRun(context.Background(), suite, "timeout", "T2", time.Millisecond, func(context.Context) smoke.Result {
-		<-release
-		return smoke.Result{}
-	})
-	if got := suite.Cases[0].Failure; !strings.Contains(got, "exceeded T2 budget") {
-		t.Fatalf("failure = %q, want budget failure", got)
+func TestAddRunCancelsAndJoinsWorkloadBeforeReporting(t *testing.T) {
+	tests := []struct {
+		name        string
+		budget      time.Duration
+		withCancel  bool
+		wantFailure string
+	}{
+		{name: "deadline", budget: 5 * time.Millisecond, wantFailure: "exceeded T2 budget"},
+		{name: "parent cancel", budget: time.Second, withCancel: true, wantFailure: "case canceled: context canceled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			trigger := func() {}
+			if tt.withCancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				trigger = cancel
+				defer cancel()
+			}
+
+			suite := report.New()
+			started := make(chan struct{})
+			unwindStarted := make(chan struct{})
+			allowUnwind := make(chan struct{})
+			unwound := make(chan struct{})
+			returned := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(allowUnwind) }) }
+			defer release()
+
+			go func() {
+				addRun(ctx, suite, "quiescence", "T2", tt.budget, func(ctx context.Context) smoke.Result {
+					close(started)
+					<-ctx.Done()
+					close(unwindStarted)
+					<-allowUnwind
+					close(unwound)
+					return smoke.Result{Detail: map[string]any{"late_success": true}}
+				})
+				close(returned)
+			}()
+
+			waitForSignal(t, started, "workload start")
+			trigger()
+			waitForSignal(t, unwindStarted, "cancellation")
+			select {
+			case <-returned:
+				t.Fatal("addRun returned before the canceled workload unwound")
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			release()
+			waitForSignal(t, returned, "addRun return after workload unwind")
+			select {
+			case <-unwound:
+			default:
+				t.Fatal("addRun returned without joining the workload")
+			}
+			if len(suite.Cases) != 1 {
+				t.Fatalf("cases = %d, want 1", len(suite.Cases))
+			}
+			if got := suite.Cases[0].Failure; !strings.Contains(got, tt.wantFailure) {
+				t.Fatalf("failure = %q, want %q despite late success", got, tt.wantFailure)
+			}
+		})
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
 	}
 }
 

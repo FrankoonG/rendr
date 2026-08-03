@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 	"github.com/FrankoonG/rendr/virtualif"
@@ -252,13 +253,26 @@ func TestRunCaseDefsStopsAfterMandatoryOutcome(t *testing.T) {
 }
 
 func TestRunManifestCaseEnforcesBudget(t *testing.T) {
+	cancelSeen := make(chan struct{})
+	release := make(chan struct{})
 	finished := make(chan struct{})
 	def := syntheticCase("synthetic.timeout", 10*time.Millisecond, func(ctx context.Context, _ string, _ manifest.Spec) report.Case {
 		<-ctx.Done()
+		close(cancelSeen)
+		<-release
 		close(finished)
 		return report.Case{}
 	})
-	rc := runManifestCase(context.Background(), "", def)
+	returned := make(chan report.Case, 1)
+	go func() { returned <- runManifestCase(context.Background(), "", def) }()
+	<-cancelSeen
+	select {
+	case rc := <-returned:
+		t.Fatalf("runManifestCase returned before workload quiesced: %+v", rc)
+	default:
+	}
+	close(release)
+	rc := <-returned
 	if rc.Name != def.spec.ID || rc.Tier != def.spec.Tier || !strings.Contains(rc.Failure, "exceeded TUN synthetic-suite budget") {
 		t.Fatalf("timeout report = %+v", rc)
 	}
@@ -356,6 +370,52 @@ func TestApplyT4CleanupResultFailsClosed(t *testing.T) {
 	if rc.Failure != "" || rc.InvalidReason != "stimulus missing; chaos cleanup failed: cleanup boom" {
 		t.Fatalf("invalid case=%+v", rc)
 	}
+
+	t.Run("budget joins workload before cleanup", func(t *testing.T) {
+		original := tunChaosApply
+		t.Cleanup(func() { tunChaosApply = original })
+		cancelSeen := make(chan struct{})
+		release := make(chan struct{})
+		finished := make(chan struct{})
+		cleanupCalled := make(chan struct{})
+		tunChaosApply = func(chaos.Profile) (func() error, error) {
+			return func() error {
+				select {
+				case <-finished:
+				default:
+					t.Error("cleanup ran before workload quiesced")
+				}
+				close(cleanupCalled)
+				return nil
+			}, nil
+		}
+		returned := make(chan report.Case, 1)
+		go func() {
+			returned <- runT4WithBudget(context.Background(), "synthetic.t4", 10*time.Millisecond, chaos.Profile{}, func(ctx context.Context) report.Case {
+				<-ctx.Done()
+				close(cancelSeen)
+				<-release
+				close(finished)
+				return report.Case{Name: "synthetic.t4", Tier: "T7"}
+			})
+		}()
+		<-cancelSeen
+		select {
+		case got := <-returned:
+			t.Fatalf("runT4WithBudget returned before workload quiesced: %+v", got)
+		default:
+		}
+		close(release)
+		got := <-returned
+		if !strings.Contains(got.Failure, "exceeded T4 budget") {
+			t.Fatalf("timeout report = %+v", got)
+		}
+		select {
+		case <-cleanupCalled:
+		default:
+			t.Fatal("cleanup was not called before return")
+		}
+	})
 }
 
 func syntheticCase(id string, budget time.Duration, run caseRun) caseDef {
