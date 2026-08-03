@@ -54,3 +54,38 @@ func TestMandatorySkipAndInvalidAreJUnitFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestEvidenceIsDeterministicInJUnitAndMarkdown(t *testing.T) {
+	s := New()
+	s.Add(Case{
+		Name: "evidence|case",
+		Tier: "T",
+		Evidence: map[string]string{
+			"zeta":  "last",
+			"alpha": "first|value",
+		},
+	})
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(junit), "<system-out>alpha=first|value&#xA;zeta=last</system-out>") {
+		t.Fatalf("JUnit evidence is absent or unordered:\n%s", junit)
+	}
+	if !strings.Contains(string(markdown), `evidence\|case`) || !strings.Contains(string(markdown), `alpha=first\|value; zeta=last`) {
+		t.Fatalf("Markdown evidence is absent, unordered, or unescaped:\n%s", markdown)
+	}
+}

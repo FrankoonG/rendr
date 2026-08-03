@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,9 @@ type Case struct {
 	// Skips fail by default; Optional must be explicit for a non-blocking skip.
 	SkipReason string
 	Optional   bool
+	// Evidence records machine-produced stimulus, load, and oracle facts.
+	// Writers sort keys so reports are deterministic.
+	Evidence map[string]string
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -91,6 +96,7 @@ type xmlCase struct {
 	Time      float64     `xml:"time,attr"`
 	Failure   *xmlFailure `xml:"failure,omitempty"`
 	Skipped   *xmlSkipped `xml:"skipped,omitempty"`
+	SystemOut string      `xml:"system-out,omitempty"`
 }
 
 type xmlFailure struct {
@@ -142,6 +148,7 @@ func (s *Suite) WriteJUnit(path string) error {
 				xs.Failures++
 				out.Failures++
 			}
+			xc.SystemOut = formatEvidence(c.Evidence, "=", "\n")
 			xs.Time += c.Duration.Seconds()
 			xs.Cases = append(xs.Cases, xc)
 		}
@@ -193,8 +200,8 @@ func (s *Suite) WriteMarkdown(path string) error {
 
 	for _, tier := range tierOrder {
 		fmt.Fprintf(f, "## %s\n\n", tier)
-		fmt.Fprintln(f, "| Case | Time | Result |")
-		fmt.Fprintln(f, "|------|------|--------|")
+		fmt.Fprintln(f, "| Case | Time | Result | Evidence |")
+		fmt.Fprintln(f, "|------|------|--------|----------|")
 		for _, c := range byTier[tier] {
 			result := "OK"
 			if c.InvalidReason != "" {
@@ -206,7 +213,8 @@ func (s *Suite) WriteMarkdown(path string) error {
 			} else if c.Failure != "" {
 				result = "FAIL"
 			}
-			fmt.Fprintf(f, "| %s | %s | %s |\n", c.Name, c.Duration.Round(time.Millisecond), result)
+			evidence := escapeMarkdown(formatEvidence(c.Evidence, "=", "; "))
+			fmt.Fprintf(f, "| %s | %s | %s | %s |\n", escapeMarkdown(c.Name), c.Duration.Round(time.Millisecond), escapeMarkdown(result), evidence)
 		}
 		fmt.Fprintln(f)
 	}
@@ -217,4 +225,27 @@ func (s *Suite) WriteMarkdown(path string) error {
 	}
 	fmt.Fprintf(f, "**OVERALL: %s**\n", overall)
 	return nil
+}
+
+func formatEvidence(evidence map[string]string, assignment, separator string) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(evidence))
+	for key := range evidence {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+assignment+evidence[key])
+	}
+	return strings.Join(parts, separator)
+}
+
+func escapeMarkdown(value string) string {
+	value = strings.ReplaceAll(value, "\\", "\\\\")
+	value = strings.ReplaceAll(value, "|", "\\|")
+	value = strings.ReplaceAll(value, "\r", " ")
+	return strings.ReplaceAll(value, "\n", " ")
 }
