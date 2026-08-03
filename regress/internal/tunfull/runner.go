@@ -59,6 +59,24 @@ type caseDef struct {
 	run  caseRun
 }
 
+type plannedCaseToken struct{ valid bool }
+
+var plannedCaseSeal = &plannedCaseToken{valid: true}
+
+// PlannedCase is a canonical executable case from a prerequisite-closed plan.
+// Values can only be created by PlanCases; its fields are intentionally sealed.
+type PlannedCase struct {
+	seal *plannedCaseToken
+	def  caseDef
+}
+
+// Spec returns a defensive copy of the planned case manifest.
+func (p PlannedCase) Spec() manifest.Spec {
+	spec := p.def.spec
+	spec.Requires = append([]string(nil), spec.Requires...)
+	return spec
+}
+
 // Alias is non-executable catalog metadata retained for historical CLI IDs.
 // Before places the alias immediately before a canonical case in --list and
 // defines the inclusive --from-case continuation point.
@@ -197,20 +215,66 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	runCaseDefs(ctx, suite, rendrRoot, defs)
 }
 
-// RunCanonicalCase executes one canonical case without expanding dependencies.
-// The CLI uses it only after constructing and validating a closed run order.
-func RunCanonicalCase(ctx context.Context, suite *report.Suite, rendrRoot, caseID string) {
+// PlanCases validates an explicit canonical run order and rejects plans that
+// omit, reorder, or duplicate prerequisites.
+func PlanCases(ids []string) ([]PlannedCase, error) {
 	if err := validateCaseDefs(caseDefs); err != nil {
-		suite.Add(report.Case{Name: caseID, Tier: "T7", Failure: "invalid TUN canonical registry: " + err.Error()})
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, errors.New("tunfull: planned case list is empty")
+	}
+	byID := make(map[string]caseDef, len(caseDefs))
+	for _, def := range caseDefs {
+		byID[def.spec.ID] = def
+	}
+	selected := make([]manifest.Spec, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			return nil, fmt.Errorf("tunfull: duplicate planned case %q", id)
+		}
+		def, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("tunfull: unknown planned case %q", id)
+		}
+		seen[id] = true
+		selected = append(selected, def.spec)
+	}
+	expanded, err := manifest.WithPrerequisites(Specs(), selected)
+	if err != nil {
+		return nil, err
+	}
+	if len(expanded) != len(ids) {
+		return nil, fmt.Errorf("tunfull: planned cases are not prerequisite-closed: got %v, want %v", ids, plannedSpecIDs(expanded))
+	}
+	planned := make([]PlannedCase, len(ids))
+	for i, spec := range expanded {
+		if spec.ID != ids[i] {
+			return nil, fmt.Errorf("tunfull: planned cases are not in canonical closed order: got %v, want %v", ids, plannedSpecIDs(expanded))
+		}
+		def := byID[spec.ID]
+		def.spec = spec
+		planned[i] = PlannedCase{seal: plannedCaseSeal, def: def}
+	}
+	return planned, nil
+}
+
+// RunPlannedCase executes one case from a sealed prerequisite-closed plan.
+func RunPlannedCase(ctx context.Context, suite *report.Suite, rendrRoot string, planned PlannedCase) {
+	if planned.seal != plannedCaseSeal || planned.def.run == nil {
+		suite.Add(report.Case{Name: "TUN-full-invalid-plan", Tier: "T7", Failure: "invalid or unsealed TUN planned case"})
 		return
 	}
-	for _, def := range caseDefs {
-		if def.spec.ID == caseID {
-			runCaseDefs(ctx, suite, rendrRoot, []caseDef{def})
-			return
-		}
+	runCaseDefs(ctx, suite, rendrRoot, []caseDef{planned.def})
+}
+
+func plannedSpecIDs(specs []manifest.Spec) []string {
+	ids := make([]string, len(specs))
+	for i, spec := range specs {
+		ids[i] = spec.ID
 	}
-	suite.Add(report.Case{Name: caseID, Tier: "T7", Failure: fmt.Sprintf("unknown canonical TUN case %q", caseID)})
+	return ids
 }
 
 func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef) {

@@ -189,11 +189,14 @@ func WithPrerequisites(registry, selected []Spec) ([]Spec, error) {
 	}
 
 	byID := make(map[string]Spec, len(registry))
-	for _, spec := range registry {
+	indexByID := make(map[string]int, len(registry))
+	for i, spec := range registry {
 		byID[spec.ID] = spec
+		indexByID[spec.ID] = i
 	}
 	selectedIDs := make([]string, 0, len(selected))
 	selectedSet := make(map[string]struct{}, len(selected))
+	lastIndex := -1
 	for i, spec := range selected {
 		canonical, ok := byID[spec.ID]
 		if !ok {
@@ -205,31 +208,42 @@ func WithPrerequisites(registry, selected []Spec) ([]Spec, error) {
 		if _, ok := selectedSet[spec.ID]; ok {
 			continue
 		}
+		index := indexByID[spec.ID]
+		if index < lastIndex {
+			return nil, fmt.Errorf("manifest: selected case %q at index %d is out of canonical order", spec.ID, i)
+		}
+		lastIndex = index
 		selectedSet[spec.ID] = struct{}{}
 		selectedIDs = append(selectedIDs, spec.ID)
 	}
 
-	result := make([]Spec, 0, len(selectedIDs))
-	added := make(map[string]struct{}, len(registry))
-	var add func(string)
-	add = func(id string) {
-		if _, ok := added[id]; ok {
-			return
-		}
-		spec := byID[id]
-		for _, candidate := range registry {
-			for _, requiredID := range spec.Requires {
-				if candidate.ID == requiredID {
-					add(requiredID)
-					break
-				}
+	required := make(map[string]struct{}, len(registry))
+	var collect func(string)
+	collect = func(id string) {
+		for _, requiredID := range byID[id].Requires {
+			if _, ok := required[requiredID]; ok {
+				continue
 			}
+			required[requiredID] = struct{}{}
+			collect(requiredID)
 		}
-		result = append(result, cloneSpec(spec))
-		added[id] = struct{}{}
 	}
 	for _, id := range selectedIDs {
-		add(id)
+		collect(id)
+	}
+
+	result := make([]Spec, 0, len(required)+len(selectedIDs))
+	for _, spec := range registry {
+		if _, needed := required[spec.ID]; !needed {
+			continue
+		}
+		if _, selected := selectedSet[spec.ID]; selected {
+			continue
+		}
+		result = append(result, cloneSpec(spec))
+	}
+	for _, id := range selectedIDs {
+		result = append(result, cloneSpec(byID[id]))
 	}
 	return result, nil
 }

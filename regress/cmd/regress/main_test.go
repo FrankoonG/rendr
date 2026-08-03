@@ -630,10 +630,11 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 	original := runTUNCase
 	t.Cleanup(func() { runTUNCase = original })
 	var called []string
-	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, opts tunfull.Options) {
-		called = append(called, opts.Case)
-		rc := report.Case{Name: opts.Case, Tier: "T7"}
-		if opts.Case != "TUN-full.preflight-kernel-tun" {
+	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, planned tunfull.PlannedCase) {
+		caseID := planned.Spec().ID
+		called = append(called, caseID)
+		rc := report.Case{Name: caseID, Tier: "T7"}
+		if caseID != "TUN-full.preflight-kernel-tun" {
 			rc.Failure = "synthetic failure"
 		}
 		suite.Add(rc)

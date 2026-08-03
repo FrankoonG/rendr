@@ -293,7 +293,7 @@ func TestInvocationSchemaV2IsRecordedInJUnitAndMarkdown(t *testing.T) {
 func TestInvocationSchemaV2Validation(t *testing.T) {
 	valid := validV2TestInvocation("case.one", "case.two")
 	valid.Scope = "from-case"
-	valid.FromCase = "requested.resume.alias"
+	valid.FromCase = "case.two"
 	valid.ResumeCaseID = "case.one"
 
 	tests := []struct {
@@ -357,10 +357,56 @@ func TestInvocationSchemaV2Validation(t *testing.T) {
 			},
 			want: "canonical resume case ID is not the first selected case ID",
 		},
+		{
+			name: "exact case is not selected",
+			mutate: func(inv *Invocation) {
+				inv.Scope = "exact"
+				inv.Case = "case.missing"
+				inv.FromCase = ""
+			},
+			want: `exact case "case.missing" is not in the selected case IDs`,
+		},
+		{
+			name: "from-case is not selected",
+			mutate: func(inv *Invocation) {
+				inv.FromCase = "case.missing"
+			},
+			want: `from-case "case.missing" is not in the selected case IDs`,
+		},
+		{
+			name: "exact scope has from-case filter",
+			mutate: func(inv *Invocation) {
+				inv.Scope = "exact"
+				inv.Case = "case.two"
+			},
+			want: "exact scope unexpectedly has a from-case filter",
+		},
+		{
+			name: "unfiltered scope has case filter",
+			mutate: func(inv *Invocation) {
+				inv.Scope = "full"
+				inv.Case = "case.two"
+				inv.FromCase = ""
+			},
+			want: `scope "full" unexpectedly has a case filter`,
+		},
 	}
 
 	if failure := invocationIdentityFailure(&Suite{Invocation: valid}); failure != "" {
 		t.Fatalf("valid v2 invocation failed validation: %s", failure)
+	}
+	exactWithPrerequisite := valid
+	exactWithPrerequisite.Scope = "exact"
+	exactWithPrerequisite.Case = "case.two"
+	exactWithPrerequisite.FromCase = ""
+	if failure := invocationIdentityFailure(&Suite{Invocation: exactWithPrerequisite}); failure != "" {
+		t.Fatalf("valid exact invocation with prerequisite failed validation: %s", failure)
+	}
+	selectorWithPrerequisite := exactWithPrerequisite
+	selectorWithPrerequisite.Scope = "selector"
+	selectorWithPrerequisite.Case = "requested.selector.alias"
+	if failure := invocationIdentityFailure(&Suite{Invocation: selectorWithPrerequisite}); failure != "" {
+		t.Fatalf("valid selector invocation with prerequisite failed validation: %s", failure)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

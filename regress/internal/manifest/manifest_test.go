@@ -249,12 +249,12 @@ func TestWithPrerequisitesPrependsTransitiveClosure(t *testing.T) {
 		},
 		{
 			name:     "canonical prerequisite and selected order",
-			selected: []Spec{registry[3], registry[2]},
-			want:     []string{"A", "D", "B", "C"},
+			selected: []Spec{registry[2], registry[3]},
+			want:     []string{"A", "B", "C", "D"},
 		},
 		{
 			name:     "selected prerequisite and repeated selections deduplicate",
-			selected: []Spec{registry[2], registry[1], registry[2]},
+			selected: []Spec{registry[1], registry[2], registry[2]},
 			want:     []string{"A", "B", "C"},
 		},
 		{
@@ -274,17 +274,24 @@ func TestWithPrerequisitesPrependsTransitiveClosure(t *testing.T) {
 		})
 	}
 
-	independent := RequiredWithBudget("independent", "T1", time.Second)
 	prerequisite := RequiredWithBudget("prerequisite", "T1", time.Second)
+	independent := RequiredWithBudget("independent", "T1", time.Second)
 	dependent := RequiredWithBudget("dependent", "T1", time.Second)
 	dependent.Requires = []string{prerequisite.ID}
-	full := []Spec{independent, prerequisite, dependent}
+	full := []Spec{prerequisite, independent, dependent}
 	got, err := WithPrerequisites(full, full)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotIDs := specIDs(got); !reflect.DeepEqual(gotIDs, []string{"independent", "prerequisite", "dependent"}) {
+	if gotIDs := specIDs(got); !reflect.DeepEqual(gotIDs, []string{"prerequisite", "independent", "dependent"}) {
 		t.Fatalf("full closure reordered canonical selection: %v", gotIDs)
+	}
+	got, err = WithPrerequisites(full, full[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIDs := specIDs(got); !reflect.DeepEqual(gotIDs, []string{"prerequisite", "independent", "dependent"}) {
+		t.Fatalf("suffix closure did not prepend missing prerequisite: %v", gotIDs)
 	}
 }
 
@@ -299,6 +306,12 @@ func TestWithPrerequisitesRejectsUnknownSelection(t *testing.T) {
 	_, err = WithPrerequisites(testRegistry(), []Spec{changed})
 	if err == nil || !strings.Contains(err.Error(), "does not match canonical metadata") {
 		t.Fatalf("metadata mismatch err=%v", err)
+	}
+
+	registry := testRegistry()
+	_, err = WithPrerequisites(registry, []Spec{registry[2], registry[1]})
+	if err == nil || !strings.Contains(err.Error(), "out of canonical order") {
+		t.Fatalf("noncanonical selection err=%v", err)
 	}
 }
 

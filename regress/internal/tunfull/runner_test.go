@@ -149,6 +149,27 @@ func TestSelectCaseDefs(t *testing.T) {
 			}
 		})
 	}
+
+	if _, err := PlanCases([]string{caseG3Smoke}); err == nil || !strings.Contains(err.Error(), "not prerequisite-closed") {
+		t.Fatalf("unclosed plan err=%v", err)
+	}
+	planned, err := PlanCases([]string{caseKernelTUNPreflight, caseG3Smoke})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{planned[0].Spec().ID, planned[1].Spec().ID}; !reflect.DeepEqual(got, []string{caseKernelTUNPreflight, caseG3Smoke}) {
+		t.Fatalf("planned IDs=%v", got)
+	}
+	spec := planned[1].Spec()
+	spec.Requires[0] = "mutated"
+	if got := planned[1].Spec().Requires[0]; got != caseKernelTUNPreflight {
+		t.Fatalf("planned Spec exposed prerequisite alias: %q", got)
+	}
+	invalidSuite := report.New()
+	RunPlannedCase(context.Background(), invalidSuite, "unused", PlannedCase{})
+	if len(invalidSuite.Cases) != 1 || invalidSuite.Cases[0].Failure == "" {
+		t.Fatalf("unsealed plan report=%+v", invalidSuite.Cases)
+	}
 }
 
 func TestRunReportsSelectionFailuresWithoutExecutingCases(t *testing.T) {

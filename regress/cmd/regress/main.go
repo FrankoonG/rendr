@@ -408,10 +408,14 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 }
 
 func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdout, stderr io.Writer) int {
-	expected, err := tunSpecsForRunOrder(tunfull.Specs(), selection.runOrder)
+	planned, err := tunfull.PlanCases(selection.runOrder)
 	if err != nil {
 		fmt.Fprintln(stderr, "regress: invalid prepared TUN plan:", err)
 		return exitEnvError
+	}
+	expected := make([]manifest.Spec, len(planned))
+	for i, plannedCase := range planned {
+		expected[i] = plannedCase.Spec()
 	}
 	suite, revisionStart, err := beginInvocation(
 		cfg,
@@ -433,10 +437,11 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		}
 	}
 
-	for i, spec := range expected {
+	for i, plannedCase := range planned {
+		spec := plannedCase.Spec()
 		fmt.Fprintf(stdout, "== phase 2 / TUN synthetic L3/session: %s ==\n", spec.ID)
 		before := len(suite.Cases)
-		runTUNCase(ctx, suite, cfg.rendrRoot, tunfull.Options{Case: spec.ID})
+		runTUNCase(ctx, suite, cfg.rendrRoot, plannedCase)
 		reconcileErr := reconcileReportRows([]manifest.Spec{spec}, suite.Cases[before:])
 		if reconcileErr != nil {
 			suite.FailRun("TUN manifest reconciliation failed: " + reconcileErr.Error())
@@ -750,9 +755,7 @@ type tunSelection struct {
 	runOrder []string
 }
 
-var runTUNCase = func(ctx context.Context, suite *report.Suite, rendrRoot string, opts tunfull.Options) {
-	tunfull.RunCanonicalCase(ctx, suite, rendrRoot, opts.Case)
-}
+var runTUNCase = tunfull.RunPlannedCase
 
 type tunCatalogEntry struct {
 	listed listedCase

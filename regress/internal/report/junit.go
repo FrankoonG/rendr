@@ -421,6 +421,8 @@ func invocationIdentityFailure(s *Suite) string {
 		reasons = append(reasons, "selected case count is missing")
 	}
 	if inv.SchemaVersion >= 2 {
+		// This package does not own the case registry, so it can validate digest
+		// shape but cannot independently recompute the catalog digest.
 		if !validManifestDigest(inv.CatalogDigest) {
 			reasons = append(reasons, "catalog digest is missing or malformed")
 		}
@@ -448,6 +450,33 @@ func invocationIdentityFailure(s *Suite) string {
 		}
 		if inv.ResumeCaseID != "" && (len(inv.SelectedCaseIDs) == 0 || inv.ResumeCaseID != inv.SelectedCaseIDs[0]) {
 			reasons = append(reasons, "canonical resume case ID is not the first selected case ID")
+		}
+		switch inv.Scope {
+		case "exact":
+			if inv.Case != "" && !seenIDs[inv.Case] {
+				reasons = append(reasons, fmt.Sprintf("exact case %q is not in the selected case IDs", inv.Case))
+			}
+			if inv.FromCase != "" {
+				reasons = append(reasons, "exact scope unexpectedly has a from-case filter")
+			}
+		case "selector":
+			if inv.FromCase != "" {
+				reasons = append(reasons, "selector scope unexpectedly has a from-case filter")
+			}
+		case "from-case":
+			if inv.FromCase != "" && !seenIDs[inv.FromCase] {
+				reasons = append(reasons, fmt.Sprintf("from-case %q is not in the selected case IDs", inv.FromCase))
+			}
+			if inv.Case != "" {
+				reasons = append(reasons, "from-case scope unexpectedly has a case filter")
+			}
+		default:
+			if inv.Case != "" {
+				reasons = append(reasons, fmt.Sprintf("scope %q unexpectedly has a case filter", inv.Scope))
+			}
+			if inv.FromCase != "" {
+				reasons = append(reasons, fmt.Sprintf("scope %q unexpectedly has a from-case filter", inv.Scope))
+			}
 		}
 	}
 	if inv.RevisionStart.CommitSHA == "" || inv.RevisionStart.WorktreeSHA == "" {
