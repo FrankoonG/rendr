@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"testing"
 	"time"
 
@@ -209,14 +210,28 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 			t.Fatalf("burst write %d: %v", seq, err)
 		}
 	}
-	for seq := uint64(0); seq < burstFrames; seq++ {
-		n, err := server.Read(buf)
+	burstRead := make(chan error, 1)
+	go func() {
+		for seq := uint64(0); seq < burstFrames; seq++ {
+			n, err := server.Read(buf)
+			if err != nil {
+				burstRead <- fmt.Errorf("burst read %d: %w", seq, err)
+				return
+			}
+			if n != len(burst) || binary.BigEndian.Uint64(buf[:8]) != seq {
+				burstRead <- fmt.Errorf("burst frame %d: n=%d seq=%d", seq, n, binary.BigEndian.Uint64(buf[:8]))
+				return
+			}
+		}
+		burstRead <- nil
+	}()
+	select {
+	case err := <-burstRead:
 		if err != nil {
-			t.Fatalf("burst read %d: %v", seq, err)
+			t.Fatal(err)
 		}
-		if n != len(burst) || binary.BigEndian.Uint64(buf[:8]) != seq {
-			t.Fatalf("burst frame %d: n=%d seq=%d", seq, n, binary.BigEndian.Uint64(buf[:8]))
-		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("burst read timed out; ingress lost or stranded a frame")
 	}
 
 	// Counter sanity.
