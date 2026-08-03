@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/FrankoonG/rendr/regress/internal/environment"
 )
 
 // Case is one regress case (e.g. T1.go-vet, T2.G1-smoke, T3.stream.D-1×D-2).
@@ -45,28 +47,31 @@ type Revision struct {
 	WorktreeSHA string
 }
 
-// Invocation identifies the selected work represented by a report. Schema v2
-// binds the original selectors to the full catalog, ordered selected CaseIDs,
-// and their canonical resume point. Consumers must also check Complete before
-// treating a green report as evidence for a release gate.
+// Invocation identifies the selected work represented by a report. Schema v3
+// adds start/end environment provenance to the v2 selection and revision
+// identity. Consumers must also check Complete before treating a green report
+// as evidence for a release gate.
 type Invocation struct {
-	SchemaVersion   int
-	Suite           string
-	Scope           string
-	Phase           string
-	Tier            string
-	Full            bool
-	TUNFull         bool
-	Case            string
-	FromCase        string
-	ResumeCaseID    string
-	Forced          bool
-	ManifestDigest  string
-	CatalogDigest   string
-	SelectedCases   int
-	SelectedCaseIDs []string
-	RevisionStart   Revision
-	RevisionEnd     Revision
+	SchemaVersion    int
+	Suite            string
+	Scope            string
+	Phase            string
+	Tier             string
+	Full             bool
+	TUNFull          bool
+	Case             string
+	FromCase         string
+	ResumeCaseID     string
+	Forced           bool
+	AllowNonLinux    bool
+	ManifestDigest   string
+	CatalogDigest    string
+	SelectedCases    int
+	SelectedCaseIDs  []string
+	RevisionStart    Revision
+	RevisionEnd      Revision
+	EnvironmentStart environment.Snapshot
+	EnvironmentEnd   environment.Snapshot
 }
 
 // Suite collects cases across tiers and writes the final report.
@@ -129,34 +134,49 @@ func (s *Suite) AnyFailedAt(tierPrefix string) bool {
 }
 
 type xmlSuites struct {
-	XMLName             xml.Name   `xml:"testsuites"`
-	Name                string     `xml:"name,attr"`
-	State               string     `xml:"state,attr"`
-	Complete            bool       `xml:"complete,attr"`
-	InvocationSchema    int        `xml:"invocation_schema,attr"`
-	InvocationSuite     string     `xml:"invocation_suite,attr"`
-	InvocationScope     string     `xml:"invocation_scope,attr"`
-	InvocationPhase     string     `xml:"invocation_phase,attr"`
-	InvocationTier      string     `xml:"invocation_tier,attr"`
-	InvocationFull      bool       `xml:"invocation_full,attr"`
-	InvocationTUNFull   bool       `xml:"invocation_tun_full,attr"`
-	InvocationCase      string     `xml:"invocation_case,attr,omitempty"`
-	InvocationFromCase  string     `xml:"invocation_from_case,attr,omitempty"`
-	InvocationResumeID  string     `xml:"invocation_resume_case_id,attr,omitempty"`
-	InvocationForced    bool       `xml:"invocation_forced,attr"`
-	ManifestDigest      string     `xml:"manifest_digest,attr"`
-	CatalogDigest       string     `xml:"catalog_digest,attr"`
-	SelectedCases       int        `xml:"selected_cases,attr"`
-	SelectedCaseIDs     string     `xml:"selected_case_ids,attr"`
-	RevisionStartCommit string     `xml:"revision_start_commit,attr"`
-	RevisionStartTree   string     `xml:"revision_start_worktree,attr"`
-	RevisionEndCommit   string     `xml:"revision_end_commit,attr"`
-	RevisionEndTree     string     `xml:"revision_end_worktree,attr"`
-	Time                float64    `xml:"time,attr"`
-	Tests               int        `xml:"tests,attr"`
-	Failures            int        `xml:"failures,attr"`
-	Skipped             int        `xml:"skipped,attr"`
-	Suites              []xmlSuite `xml:"testsuite"`
+	XMLName             xml.Name       `xml:"testsuites"`
+	Name                string         `xml:"name,attr"`
+	State               string         `xml:"state,attr"`
+	Complete            bool           `xml:"complete,attr"`
+	InvocationSchema    int            `xml:"invocation_schema,attr"`
+	InvocationSuite     string         `xml:"invocation_suite,attr"`
+	InvocationScope     string         `xml:"invocation_scope,attr"`
+	InvocationPhase     string         `xml:"invocation_phase,attr"`
+	InvocationTier      string         `xml:"invocation_tier,attr"`
+	InvocationFull      bool           `xml:"invocation_full,attr"`
+	InvocationTUNFull   bool           `xml:"invocation_tun_full,attr"`
+	InvocationCase      string         `xml:"invocation_case,attr,omitempty"`
+	InvocationFromCase  string         `xml:"invocation_from_case,attr,omitempty"`
+	InvocationResumeID  string         `xml:"invocation_resume_case_id,attr,omitempty"`
+	InvocationForced    bool           `xml:"invocation_forced,attr"`
+	InvocationNonLinux  bool           `xml:"invocation_allow_non_linux,attr"`
+	ManifestDigest      string         `xml:"manifest_digest,attr"`
+	CatalogDigest       string         `xml:"catalog_digest,attr"`
+	SelectedCases       int            `xml:"selected_cases,attr"`
+	SelectedCaseIDs     string         `xml:"selected_case_ids,attr"`
+	RevisionStartCommit string         `xml:"revision_start_commit,attr"`
+	RevisionStartTree   string         `xml:"revision_start_worktree,attr"`
+	RevisionEndCommit   string         `xml:"revision_end_commit,attr"`
+	RevisionEndTree     string         `xml:"revision_end_worktree,attr"`
+	EnvironmentStartID  string         `xml:"environment_start_identity,attr,omitempty"`
+	EnvironmentEndID    string         `xml:"environment_end_identity,attr,omitempty"`
+	QDiscStartDigest    string         `xml:"qdisc_start_digest,attr,omitempty"`
+	QDiscEndDigest      string         `xml:"qdisc_end_digest,attr,omitempty"`
+	Time                float64        `xml:"time,attr"`
+	Tests               int            `xml:"tests,attr"`
+	Failures            int            `xml:"failures,attr"`
+	Skipped             int            `xml:"skipped,attr"`
+	Properties          *xmlProperties `xml:"properties,omitempty"`
+	Suites              []xmlSuite     `xml:"testsuite"`
+}
+
+type xmlProperties struct {
+	Properties []xmlProperty `xml:"property"`
+}
+
+type xmlProperty struct {
+	Name  string `xml:"name,attr"`
+	Value string `xml:"value,attr"`
 }
 
 type xmlSuite struct {
@@ -190,6 +210,10 @@ type xmlSkipped struct {
 
 // WriteJUnit emits JUnit XML at path. Tier grouping = testsuite name.
 func (s *Suite) WriteJUnit(path string) error {
+	properties, err := environmentProperties(s.Invocation)
+	if err != nil {
+		return err
+	}
 	byTier := map[string][]Case{}
 	tierOrder := []string{}
 	for _, c := range s.Cases {
@@ -214,6 +238,7 @@ func (s *Suite) WriteJUnit(path string) error {
 		InvocationFromCase:  s.Invocation.FromCase,
 		InvocationResumeID:  s.Invocation.ResumeCaseID,
 		InvocationForced:    s.Invocation.Forced,
+		InvocationNonLinux:  s.Invocation.AllowNonLinux,
 		ManifestDigest:      s.Invocation.ManifestDigest,
 		CatalogDigest:       s.Invocation.CatalogDigest,
 		SelectedCases:       s.Invocation.SelectedCases,
@@ -222,7 +247,12 @@ func (s *Suite) WriteJUnit(path string) error {
 		RevisionStartTree:   s.Invocation.RevisionStart.WorktreeSHA,
 		RevisionEndCommit:   s.Invocation.RevisionEnd.CommitSHA,
 		RevisionEndTree:     s.Invocation.RevisionEnd.WorktreeSHA,
+		EnvironmentStartID:  s.Invocation.EnvironmentStart.IdentityDigest,
+		EnvironmentEndID:    s.Invocation.EnvironmentEnd.IdentityDigest,
+		QDiscStartDigest:    s.Invocation.EnvironmentStart.QDisc.Digest,
+		QDiscEndDigest:      s.Invocation.EnvironmentEnd.QDisc.Digest,
 		Time:                time.Since(s.Started).Seconds(),
+		Properties:          properties,
 	}
 	for _, tier := range tierOrder {
 		cs := byTier[tier]
@@ -315,6 +345,7 @@ func (s *Suite) WriteMarkdown(path string) error {
 		fmt.Fprintf(&buf, "- Resume CaseID: `%s`\n", escapeMarkdown(s.Invocation.ResumeCaseID))
 	}
 	fmt.Fprintf(&buf, "- Forced: `%t`\n", s.Invocation.Forced)
+	fmt.Fprintf(&buf, "- Allow non-Linux: `%t`\n", s.Invocation.AllowNonLinux)
 	fmt.Fprintf(&buf, "- Manifest digest: `%s`\n", escapeMarkdown(s.Invocation.ManifestDigest))
 	fmt.Fprintf(&buf, "- Catalog digest: `%s`\n", escapeMarkdown(s.Invocation.CatalogDigest))
 	fmt.Fprintf(&buf, "- Selected cases: `%d`\n", s.Invocation.SelectedCases)
@@ -326,6 +357,9 @@ func (s *Suite) WriteMarkdown(path string) error {
 		fmt.Fprintf(&buf, "- Invocation failure: `%s`\n", escapeMarkdown(s.RunFailure))
 	}
 	fmt.Fprintln(&buf)
+	if err := writeEnvironmentMarkdown(&buf, s.Invocation); err != nil {
+		return err
+	}
 	fmt.Fprintf(&buf, "Total elapsed: %s\n\n", time.Since(s.Started).Round(time.Millisecond))
 
 	byTier := map[string][]Case{}
@@ -479,6 +513,25 @@ func invocationIdentityFailure(s *Suite) string {
 			}
 		}
 	}
+	if inv.SchemaVersion >= 3 {
+		if inv.EnvironmentStart.IsZero() {
+			reasons = append(reasons, "start environment snapshot is missing")
+		} else if err := environment.Validate(inv.EnvironmentStart); err != nil {
+			reasons = append(reasons, "start environment snapshot is incomplete: "+err.Error())
+		} else if inv.EnvironmentStart.Runtime.GOOS != "linux" && !inv.AllowNonLinux {
+			reasons = append(reasons, "non-Linux environment is missing the allow-non-linux bypass")
+		}
+		endRequired := s.Complete || len(s.Cases) != 0 || s.RunFailure != ""
+		if inv.EnvironmentEnd.IsZero() {
+			if endRequired {
+				reasons = append(reasons, "end environment snapshot is missing")
+			}
+		} else if inv.EnvironmentStart.IsZero() {
+			reasons = append(reasons, "end environment snapshot exists without a start snapshot")
+		} else if err := environment.ValidatePair(inv.EnvironmentStart, inv.EnvironmentEnd); err != nil {
+			reasons = append(reasons, "environment provenance mismatch: "+err.Error())
+		}
+	}
 	if inv.RevisionStart.CommitSHA == "" || inv.RevisionStart.WorktreeSHA == "" {
 		reasons = append(reasons, "start revision is incomplete")
 	}
@@ -536,6 +589,7 @@ func invocationName(inv Invocation) string {
 
 func formatInvocation(inv Invocation) string {
 	fields := map[string]string{
+		"allow_non_linux":         fmt.Sprintf("%t", inv.AllowNonLinux),
 		"catalog_digest":          inv.CatalogDigest,
 		"forced":                  fmt.Sprintf("%t", inv.Forced),
 		"full":                    fmt.Sprintf("%t", inv.Full),
@@ -562,7 +616,72 @@ func formatInvocation(inv Invocation) string {
 	if inv.ResumeCaseID != "" {
 		fields["resume_case_id"] = inv.ResumeCaseID
 	}
+	if !inv.EnvironmentStart.IsZero() {
+		if encoded, err := environment.Marshal(inv.EnvironmentStart); err == nil {
+			fields["environment_start"] = encoded
+		}
+	}
+	if !inv.EnvironmentEnd.IsZero() {
+		if encoded, err := environment.Marshal(inv.EnvironmentEnd); err == nil {
+			fields["environment_end"] = encoded
+		}
+	}
 	return formatEvidence(fields, "=", "\n")
+}
+
+func environmentProperties(inv Invocation) (*xmlProperties, error) {
+	var properties []xmlProperty
+	for _, snapshot := range []struct {
+		name  string
+		value environment.Snapshot
+	}{
+		{name: "rendr.environment.start", value: inv.EnvironmentStart},
+		{name: "rendr.environment.end", value: inv.EnvironmentEnd},
+	} {
+		if snapshot.value.IsZero() {
+			continue
+		}
+		encoded, err := environment.Marshal(snapshot.value)
+		if err != nil {
+			return nil, err
+		}
+		properties = append(properties, xmlProperty{Name: snapshot.name, Value: encoded})
+	}
+	if len(properties) == 0 {
+		return nil, nil
+	}
+	return &xmlProperties{Properties: properties}, nil
+}
+
+func writeEnvironmentMarkdown(buf *bytes.Buffer, inv Invocation) error {
+	if inv.EnvironmentStart.IsZero() && inv.EnvironmentEnd.IsZero() {
+		return nil
+	}
+	fmt.Fprintln(buf, "## Environment")
+	fmt.Fprintln(buf)
+	for _, snapshot := range []struct {
+		label string
+		value environment.Snapshot
+	}{
+		{label: "Start", value: inv.EnvironmentStart},
+		{label: "End", value: inv.EnvironmentEnd},
+	} {
+		fmt.Fprintf(buf, "### %s\n\n", snapshot.label)
+		if snapshot.value.IsZero() {
+			fmt.Fprintln(buf, "`pending`")
+			fmt.Fprintln(buf)
+			continue
+		}
+		encoded, err := environment.Marshal(snapshot.value)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(buf, "```json")
+		fmt.Fprintln(buf, encoded)
+		fmt.Fprintln(buf, "```")
+		fmt.Fprintln(buf)
+	}
+	return nil
 }
 
 func formatCaseIDs(ids []string) string {

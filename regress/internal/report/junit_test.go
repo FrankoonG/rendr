@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/FrankoonG/rendr/regress/internal/environment"
 )
 
 func TestSuiteFailureSemantics(t *testing.T) {
@@ -431,6 +433,141 @@ func TestInvocationSchemaV2Validation(t *testing.T) {
 	}
 }
 
+func TestInvocationSchemaV3EnvironmentIsRecordedInJUnitAndMarkdown(t *testing.T) {
+	snapshot := validReportEnvironment(t, `[{"dev":"test0","kind":"fq_codel"}]`)
+	s := New()
+	s.Complete = true
+	s.Invocation = validV2TestInvocation("case.one")
+	s.Invocation.SchemaVersion = 3
+	s.Invocation.AllowNonLinux = true
+	s.Invocation.EnvironmentStart = snapshot
+	s.Invocation.EnvironmentEnd = snapshot
+	s.Add(Case{Name: "case.one", Tier: "T1"})
+
+	dir := t.TempDir()
+	junitPath := filepath.Join(dir, "junit.xml")
+	markdownPath := filepath.Join(dir, "SUMMARY.md")
+	if err := s.WriteJUnit(junitPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteMarkdown(markdownPath); err != nil {
+		t.Fatal(err)
+	}
+	junit, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := os.ReadFile(markdownPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var root struct {
+		Schema        int    `xml:"invocation_schema,attr"`
+		AllowNonLinux bool   `xml:"invocation_allow_non_linux,attr"`
+		StartID       string `xml:"environment_start_identity,attr"`
+		EndID         string `xml:"environment_end_identity,attr"`
+		QDiscStart    string `xml:"qdisc_start_digest,attr"`
+		QDiscEnd      string `xml:"qdisc_end_digest,attr"`
+		Properties    struct {
+			Items []struct {
+				Name  string `xml:"name,attr"`
+				Value string `xml:"value,attr"`
+			} `xml:"property"`
+		} `xml:"properties"`
+	}
+	if err := xml.Unmarshal(junit, &root); err != nil {
+		t.Fatal(err)
+	}
+	if root.Schema != 3 || !root.AllowNonLinux || root.StartID != snapshot.IdentityDigest || root.EndID != snapshot.IdentityDigest {
+		t.Fatalf("JUnit environment identity = %+v", root)
+	}
+	if root.QDiscStart != snapshot.QDisc.Digest || root.QDiscEnd != snapshot.QDisc.Digest {
+		t.Fatalf("JUnit qdisc digests = start %q end %q", root.QDiscStart, root.QDiscEnd)
+	}
+	if len(root.Properties.Items) != 2 || root.Properties.Items[0].Name != "rendr.environment.start" || root.Properties.Items[1].Name != "rendr.environment.end" {
+		t.Fatalf("JUnit environment properties = %+v", root.Properties.Items)
+	}
+	for _, property := range root.Properties.Items {
+		if !strings.Contains(property.Value, `"hostname":"synthetic-host"`) || !strings.Contains(property.Value, `"vm_role":"client"`) {
+			t.Fatalf("JUnit property %q lacks structured provenance: %s", property.Name, property.Value)
+		}
+	}
+	for _, want := range []string{"- Allow non-Linux: `true`", "## Environment", "### Start", "### End", `"qdisc"`, `"vm_role":"client"`} {
+		if !strings.Contains(string(markdown), want) {
+			t.Fatalf("Markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestInvocationSchemaV3EnvironmentValidation(t *testing.T) {
+	start := validReportEnvironment(t, `[{"dev":"test0","kind":"fq_codel"}]`)
+	valid := validV2TestInvocation("case.one")
+	valid.SchemaVersion = 3
+	valid.AllowNonLinux = true
+	valid.EnvironmentStart = start
+	valid.EnvironmentEnd = start
+	complete := func(inv Invocation) *Suite {
+		return &Suite{Invocation: inv, Complete: true, Cases: []Case{{Name: "case.one"}}}
+	}
+	if failure := invocationIdentityFailure(complete(valid)); failure != "" {
+		t.Fatalf("valid v3 invocation failed: %s", failure)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Invocation)
+		want   string
+	}{
+		{
+			name: "non-Linux bypass missing",
+			mutate: func(inv *Invocation) {
+				inv.AllowNonLinux = false
+			},
+			want: "non-Linux environment is missing the allow-non-linux bypass",
+		},
+		{
+			name: "missing start",
+			mutate: func(inv *Invocation) {
+				inv.EnvironmentStart = environment.Snapshot{}
+			},
+			want: "start environment snapshot is missing",
+		},
+		{
+			name: "missing end",
+			mutate: func(inv *Invocation) {
+				inv.EnvironmentEnd = environment.Snapshot{}
+			},
+			want: "end environment snapshot is missing",
+		},
+		{
+			name: "stable identity drift",
+			mutate: func(inv *Invocation) {
+				drifted := inv.EnvironmentEnd
+				drifted.Hostname = "other-host"
+				inv.EnvironmentEnd = sealReportEnvironment(t, drifted)
+			},
+			want: "stable environment identity changed",
+		},
+		{
+			name: "qdisc not restored",
+			mutate: func(inv *Invocation) {
+				inv.EnvironmentEnd = validReportEnvironment(t, `[{"dev":"test0","kind":"netem"}]`)
+			},
+			want: "qdisc state was not restored",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inv := valid
+			tt.mutate(&inv)
+			if failure := invocationIdentityFailure(complete(inv)); !strings.Contains(failure, tt.want) {
+				t.Fatalf("validation failure = %q want substring %q", failure, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunFailureIsAStandardJUnitFailure(t *testing.T) {
 	s := New()
 	s.Complete = true
@@ -540,4 +677,30 @@ func validV2TestInvocation(selectedCaseIDs ...string) Invocation {
 		invocation.ResumeCaseID = selectedCaseIDs[0]
 	}
 	return invocation
+}
+
+func validReportEnvironment(t *testing.T, qdisc string) environment.Snapshot {
+	t.Helper()
+	return sealReportEnvironment(t, environment.Snapshot{
+		SchemaVersion: environment.SnapshotSchemaVersion,
+		Runtime: environment.Runtime{
+			GoVersion: "go1.26.3",
+			GOOS:      "windows",
+			GOARCH:    "amd64",
+		},
+		Hostname:   "synthetic-host",
+		NumCPU:     4,
+		Interfaces: []environment.Interface{{Name: "test0", MTU: 1500}},
+		QDisc:      environment.QDisc{Supported: true, State: []byte(qdisc)},
+		Metadata:   environment.Metadata{VMRole: "client", CPUGroup: "CPU1/128-255"},
+	})
+}
+
+func sealReportEnvironment(t *testing.T, snapshot environment.Snapshot) environment.Snapshot {
+	t.Helper()
+	sealed, err := environment.Seal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sealed
 }

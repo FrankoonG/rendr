@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/catalog"
+	"github.com/FrankoonG/rendr/regress/internal/environment"
 	"github.com/FrankoonG/rendr/regress/internal/gate"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -49,7 +50,7 @@ const (
 
 const (
 	listSchemaVersion       = 2
-	invocationSchemaVersion = 2
+	invocationSchemaVersion = 3
 	junitReportFileName     = "junit.xml"
 	markdownReportFileName  = "SUMMARY.md"
 )
@@ -316,10 +317,12 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 		return exitEnvError
 	}
 	suite, revisionStart, err := beginInvocation(
+		ctx,
 		cfg,
 		manifest.SuiteNormal,
 		selected,
 		gate.CurrentRevision,
+		environment.Capture,
 		writeReports,
 	)
 	if err != nil {
@@ -329,7 +332,7 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 
 	if requiresExistingPhase1Gate(plan) && !cfg.forcePhase2 {
 		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
-			persistInvocationFailure(suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
 			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
 			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
 			return exitPhase1Stale
@@ -338,7 +341,7 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 
 	if plan.CompletePhase1 {
 		if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "running", time.Now()); err != nil {
-			persistInvocationFailure(suite, cfg, revisionStart, "cannot invalidate prior phase 1 gate: "+err.Error(), gate.CurrentRevision, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, "cannot invalidate prior phase 1 gate: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
 			fmt.Fprintln(stderr, "regress: cannot invalidate prior phase 1 gate:", err)
 			return exitEnvError
 		}
@@ -347,12 +350,14 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 	for i, run := range plan.Runs {
 		command, ok := tierCommands[run.Tier]
 		if !ok {
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, "execution plan contains unknown tier "+run.Tier, gate.CurrentRevision, environment.Capture, stderr)
 			fmt.Fprintf(stderr, "regress: execution plan contains unknown tier %q\n", run.Tier)
 			return exitEnvError
 		}
 		fmt.Fprintf(stdout, "== %s ==\n", command.title)
 		expected, err := specsForTierRun(run)
 		if err != nil {
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, "cannot resolve planned cases: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
 			fmt.Fprintln(stderr, "regress: cannot resolve planned cases:", err)
 			return exitEnvError
 		}
@@ -362,11 +367,15 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 		if reconcileErr != nil {
 			suite.FailRun(run.Tier + " manifest reconciliation failed: " + reconcileErr.Error())
 		}
+		environmentErr := updateInvocationEnvironment(ctx, suite, environment.Capture)
+		if environmentErr != nil {
+			suite.FailRun(environmentErr.Error())
+		}
 		revisionErr := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, gate.CurrentRevision)
 		if revisionErr != nil {
 			suite.FailRun(revisionErr.Error())
 		}
-		suite.Complete = i == len(plan.Runs)-1 && reconcileErr == nil && revisionErr == nil
+		suite.Complete = i == len(plan.Runs)-1 && reconcileErr == nil && environmentErr == nil && revisionErr == nil
 		if err := writeReports(suite, cfg.reportDir); err != nil {
 			fmt.Fprintf(stderr, "regress: cannot write %s reports: %v\n", run.Tier, err)
 			return exitEnvError
@@ -377,6 +386,13 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 			}
 			fmt.Fprintln(stderr, "regress: invocation revision changed:", revisionErr)
 			return exitPhase1Stale
+		}
+		if environmentErr != nil {
+			if isPhase1Tier(run.Tier) {
+				writeRedPhase1Gate(cfg, stderr)
+			}
+			fmt.Fprintln(stderr, "regress: invocation environment invalid:", environmentErr)
+			return exitEnvError
 		}
 		if reconcileErr != nil || suite.AnyFailedAt(run.Tier) {
 			if isPhase1Tier(run.Tier) {
@@ -418,10 +434,12 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		expected[i] = plannedCase.Spec()
 	}
 	suite, revisionStart, err := beginInvocation(
+		ctx,
 		cfg,
 		tunInvocationSuite,
 		expected,
 		gate.CurrentRevision,
+		environment.Capture,
 		writeReports,
 	)
 	if err != nil {
@@ -430,7 +448,7 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 	}
 	if !cfg.forcePhase2 {
 		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
-			persistInvocationFailure(suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
 			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
 			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
 			return exitPhase1Stale
@@ -446,6 +464,10 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		if reconcileErr != nil {
 			suite.FailRun("TUN manifest reconciliation failed: " + reconcileErr.Error())
 		}
+		environmentErr := updateInvocationEnvironment(ctx, suite, environment.Capture)
+		if environmentErr != nil {
+			suite.FailRun(environmentErr.Error())
+		}
 		revisionErr := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, gate.CurrentRevision)
 		if revisionErr != nil {
 			suite.FailRun(revisionErr.Error())
@@ -459,10 +481,10 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 				suite.FailRun("TUN final manifest reconciliation failed: " + finalErr.Error())
 				suite.Complete = false
 			} else {
-				suite.Complete = revisionErr == nil
+				suite.Complete = environmentErr == nil && revisionErr == nil
 			}
 		} else {
-			suite.Complete = i == len(expected)-1 && revisionErr == nil
+			suite.Complete = i == len(expected)-1 && environmentErr == nil && revisionErr == nil
 		}
 		if err := writeReports(suite, cfg.reportDir); err != nil {
 			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", err)
@@ -471,6 +493,10 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		if revisionErr != nil {
 			fmt.Fprintln(stderr, "regress: TUN invocation revision changed:", revisionErr)
 			return exitPhase1Stale
+		}
+		if environmentErr != nil {
+			fmt.Fprintln(stderr, "regress: TUN invocation environment invalid:", environmentErr)
+			return exitEnvError
 		}
 		if caseFailed {
 			fmt.Fprintln(stderr, "phase 2 / TUN synthetic L3/session: FAILED")
@@ -537,10 +563,12 @@ func writeKnownPhase1Gate(reportDir string, revision gate.Revision, status strin
 }
 
 func beginInvocation(
+	ctx context.Context,
 	cfg runFlags,
 	suiteName string,
 	selected []manifest.Spec,
 	currentRevision func(string) (gate.Revision, error),
+	captureEnvironment func(context.Context) (environment.Snapshot, error),
 	writer func(*report.Suite, string) error,
 ) (*report.Suite, gate.Revision, error) {
 	identity, err := buildInvocationIdentity(cfg, suiteName, selected)
@@ -556,6 +584,16 @@ func beginInvocation(
 		}
 		return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %w", err)
 	}
+
+	snapshot, captureErr := captureEnvironment(ctx)
+	if captureErr != nil {
+		suite.FailRun("cannot capture invocation start environment: " + captureErr.Error())
+		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+			return suite, gate.Revision{}, fmt.Errorf("capture invocation start environment: %v; write failure report: %w", captureErr, writeErr)
+		}
+		return suite, gate.Revision{}, fmt.Errorf("capture invocation start environment: %w", captureErr)
+	}
+	suite.Invocation.EnvironmentStart = snapshot
 
 	revision, revisionErr := currentRevision(cfg.rendrRoot)
 	if revisionErr != nil {
@@ -608,6 +646,7 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 		FromCase:        cfg.fromCaseID,
 		ResumeCaseID:    selectedIDs[0],
 		Forced:          cfg.forcePhase2,
+		AllowNonLinux:   cfg.allowNonLinux,
 		ManifestDigest:  digest,
 		CatalogDigest:   catalogDigest,
 		SelectedCases:   len(selected),
@@ -681,6 +720,23 @@ func reportRevision(revision gate.Revision) report.Revision {
 	return report.Revision{CommitSHA: revision.CommitSHA, WorktreeSHA: revision.WorktreeSHA}
 }
 
+func updateInvocationEnvironment(
+	ctx context.Context,
+	suite *report.Suite,
+	captureEnvironment func(context.Context) (environment.Snapshot, error),
+) error {
+	suite.Invocation.EnvironmentEnd = environment.Snapshot{}
+	snapshot, err := captureEnvironment(ctx)
+	if err != nil {
+		return fmt.Errorf("capture invocation end environment: %w", err)
+	}
+	suite.Invocation.EnvironmentEnd = snapshot
+	if err := environment.ValidatePair(suite.Invocation.EnvironmentStart, snapshot); err != nil {
+		return fmt.Errorf("validate invocation environment: %w", err)
+	}
+	return nil
+}
+
 func updateInvocationRevision(
 	suite *report.Suite,
 	rendrRoot string,
@@ -702,15 +758,20 @@ func updateInvocationRevision(
 }
 
 func persistInvocationFailure(
+	ctx context.Context,
 	suite *report.Suite,
 	cfg runFlags,
 	revisionStart gate.Revision,
 	reason string,
 	currentRevision func(string) (gate.Revision, error),
+	captureEnvironment func(context.Context) (environment.Snapshot, error),
 	stderr io.Writer,
 ) {
 	suite.Complete = false
 	suite.FailRun(reason)
+	if err := updateInvocationEnvironment(ctx, suite, captureEnvironment); err != nil {
+		suite.FailRun(err.Error())
+	}
 	if err := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, currentRevision); err != nil {
 		suite.FailRun(err.Error())
 	}

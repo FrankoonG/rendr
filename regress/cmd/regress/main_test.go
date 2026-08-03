@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/catalog"
+	"github.com/FrankoonG/rendr/regress/internal/environment"
 	"github.com/FrankoonG/rendr/regress/internal/gate"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -225,6 +226,76 @@ func TestUpdateInvocationRevisionRejectsConcurrentChanges(t *testing.T) {
 	}
 }
 
+func TestUpdateInvocationEnvironmentRequiresStableIdentityAndRestoredQDisc(t *testing.T) {
+	start := testEnvironmentWithQDisc(t, `[{"dev":"test0","kind":"fq_codel"}]`)
+	suite := report.New()
+	suite.Invocation.EnvironmentStart = start
+	if err := updateInvocationEnvironment(context.Background(), suite, func(context.Context) (environment.Snapshot, error) {
+		return start, nil
+	}); err != nil {
+		t.Fatalf("stable environment: %v", err)
+	}
+
+	leaked := testEnvironmentWithQDisc(t, `[{"dev":"test0","kind":"netem"}]`)
+	err := updateInvocationEnvironment(context.Background(), suite, func(context.Context) (environment.Snapshot, error) {
+		return leaked, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "qdisc state was not restored") {
+		t.Fatalf("qdisc leak error = %v", err)
+	}
+	if suite.Invocation.EnvironmentEnd.QDisc.Digest != leaked.QDisc.Digest {
+		t.Fatalf("leaked end snapshot was not retained: %+v", suite.Invocation.EnvironmentEnd.QDisc)
+	}
+
+	drifted := start
+	drifted.Hostname = "other-host"
+	drifted, sealErr := environment.Seal(drifted)
+	if sealErr != nil {
+		t.Fatal(sealErr)
+	}
+	err = updateInvocationEnvironment(context.Background(), suite, func(context.Context) (environment.Snapshot, error) {
+		return drifted, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "stable environment identity changed") {
+		t.Fatalf("identity drift error = %v", err)
+	}
+}
+
+func TestBeginInvocationFailsClosedWhenEnvironmentCaptureFails(t *testing.T) {
+	dir := t.TempDir()
+	spec := manifest.RequiredWithBudget("synthetic.one", "T1", time.Second)
+	revisionCalled := false
+	_, _, err := beginInvocation(
+		context.Background(),
+		runFlags{caseID: spec.ID, reportDir: dir, rendrRoot: "/exact/root"},
+		manifest.SuiteNormal,
+		[]manifest.Spec{spec},
+		func(string) (gate.Revision, error) {
+			revisionCalled = true
+			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
+		},
+		func(context.Context) (environment.Snapshot, error) {
+			return environment.Snapshot{}, errors.New("mandatory source unavailable")
+		},
+		writeReports,
+	)
+	if err == nil || !strings.Contains(err.Error(), "mandatory source unavailable") {
+		t.Fatalf("begin invocation error = %v", err)
+	}
+	if revisionCalled {
+		t.Fatal("revision fingerprint ran after mandatory environment capture failed")
+	}
+	junit, readErr := os.ReadFile(filepath.Join(dir, junitReportFileName))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, want := range []string{`state="fail"`, "cannot capture invocation start environment", "start environment snapshot is missing"} {
+		if !strings.Contains(string(junit), want) {
+			t.Fatalf("failure JUnit missing %q:\n%s", want, junit)
+		}
+	}
+}
+
 func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
 	dir := t.TempDir()
 	junitPath := filepath.Join(dir, "junit.xml")
@@ -237,8 +308,9 @@ func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
 	}
 
 	spec := manifest.RequiredWithBudget("synthetic.one", "T1", time.Second)
-	cfg := runFlags{caseID: spec.ID, reportDir: dir, rendrRoot: "/exact/root"}
+	cfg := runFlags{caseID: spec.ID, reportDir: dir, rendrRoot: "/exact/root", allowNonLinux: true}
 	suite, revision, err := beginInvocation(
+		context.Background(),
 		cfg,
 		manifest.SuiteNormal,
 		[]manifest.Spec{spec},
@@ -248,6 +320,7 @@ func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
 			}
 			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
 		},
+		captureTestEnvironment,
 		writeReports,
 	)
 	if err != nil {
@@ -288,12 +361,14 @@ func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
 	}
 	writerCalled := false
 	_, _, err := beginInvocation(
-		runFlags{reportDir: dir, rendrRoot: "/exact/root"},
+		context.Background(),
+		runFlags{reportDir: dir, rendrRoot: "/exact/root", allowNonLinux: true},
 		manifest.SuiteNormal,
 		[]manifest.Spec{manifest.RequiredWithBudget("one", "T1", time.Second)},
 		func(string) (gate.Revision, error) {
 			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
 		},
+		captureTestEnvironment,
 		func(*report.Suite, string) error {
 			writerCalled = true
 			for _, name := range []string{junitReportFileName, markdownReportFileName} {
@@ -318,7 +393,7 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exact, err := buildInvocationIdentity(runFlags{caseID: "two", forcePhase2: true}, manifest.SuiteNormal, all[1:])
+	exact, err := buildInvocationIdentity(runFlags{caseID: "two", forcePhase2: true, allowNonLinux: true}, manifest.SuiteNormal, all[1:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +401,7 @@ func TestInvocationScopeAndManifestDigestSeparateFullFromExact(t *testing.T) {
 		t.Fatalf("full identity=%+v", full)
 	}
 	if exact.Scope != "exact" || exact.Case != "two" || !exact.Forced || exact.SelectedCases != 1 ||
-		exact.ResumeCaseID != "two" || !reflect.DeepEqual(exact.SelectedCaseIDs, []string{"two"}) {
+		!exact.AllowNonLinux || exact.ResumeCaseID != "two" || !reflect.DeepEqual(exact.SelectedCaseIDs, []string{"two"}) {
 		t.Fatalf("exact identity=%+v", exact)
 	}
 	exactWithPrerequisite, err := buildInvocationIdentity(
@@ -872,6 +947,34 @@ func installSyntheticTierCommands(t *testing.T) func() {
 			tierCommands[tier] = original
 		}
 	}
+}
+
+func captureTestEnvironment(context.Context) (environment.Snapshot, error) {
+	return environment.Seal(environment.Snapshot{
+		SchemaVersion: environment.SnapshotSchemaVersion,
+		Runtime: environment.Runtime{
+			GoVersion: "go-test",
+			GOOS:      "windows",
+			GOARCH:    "amd64",
+		},
+		Hostname:   "synthetic-host",
+		NumCPU:     4,
+		Interfaces: []environment.Interface{{Name: "test0", MTU: 1500}},
+	})
+}
+
+func testEnvironmentWithQDisc(t *testing.T, qdisc string) environment.Snapshot {
+	t.Helper()
+	snapshot, err := captureTestEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.QDisc = environment.QDisc{Supported: true, State: []byte(qdisc)}
+	sealed, err := environment.Seal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sealed
 }
 
 func newMainTestRepo(t *testing.T) string {
