@@ -80,15 +80,31 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		suite.Add(report.Case{Name: "T6-case-filter", Tier: "T6", Failure: failure})
 		return
 	}
-	for _, def := range defs {
-		def := def
-		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+	runCaseDefs(ctx, suite, rendrRoot, defs, func(ctx context.Context, rendrRoot string, def caseDef) report.Case {
+		return runCase(ctx, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
 			return runRootTargetGraphTests(c, rendrRoot, def)
 		})
+	})
+}
+
+type caseExecutor func(context.Context, string, caseDef) report.Case
+
+func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef, execute caseExecutor) {
+	failedCaseID := ""
+	for _, def := range defs {
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
+			continue
+		}
+		rc := execute(ctx, rendrRoot, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
 	}
 }
 
-func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
+func runCase(ctx context.Context, name string, budget time.Duration, fn func(context.Context) report.Case) report.Case {
 	fmt.Printf("  > T6/%s (budget %s) - start\n", name, budget)
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -118,7 +134,19 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	} else {
 		fmt.Printf("  > T6/%s (took %s) - OK\n", name, rc.Duration)
 	}
-	suite.Add(rc)
+	return rc
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+	}
 }
 
 func runRootTargetGraphTests(ctx context.Context, rendrRoot string, def caseDef) report.Case {

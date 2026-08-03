@@ -10,6 +10,7 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
+	"github.com/FrankoonG/rendr/regress/internal/smoke"
 )
 
 var orderedCaseIDs = []string{
@@ -148,6 +149,97 @@ func TestEvidenceFromDetailPreservesFacts(t *testing.T) {
 	}
 	if evidenceFromDetail(nil) != nil {
 		t.Fatal("nil detail should remain nil evidence")
+	}
+}
+
+func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome report.Case
+	}{
+		{name: "failure", outcome: report.Case{Failure: "boom"}},
+		{name: "invalid", outcome: report.Case{InvalidReason: "stimulus missing"}},
+		{name: "mandatory skip", outcome: report.Case{SkipReason: "dependency unavailable"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defs := syntheticCaseDefs("T4")
+			var called []string
+			suite := report.New()
+			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) report.Case {
+				called = append(called, def.spec.ID)
+				rc := report.Case{Name: def.spec.ID, Tier: def.spec.Tier}
+				if def.spec.ID == "synthetic.blocker" {
+					rc.Failure = tt.outcome.Failure
+					rc.InvalidReason = tt.outcome.InvalidReason
+					rc.SkipReason = tt.outcome.SkipReason
+				}
+				return rc
+			})
+
+			if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
+				t.Fatalf("executed cases = %v, want %v", called, want)
+			}
+			assertFailFastRows(t, suite.Cases, "T4")
+		})
+	}
+}
+
+func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
+	defs := syntheticCaseDefs("T4")[:2]
+	cleanupCalled := false
+	runCalls := 0
+	suite := report.New()
+	runSelectedCases(context.Background(), suite, defs, func(ctx context.Context, def caseDef) report.Case {
+		runCalls++
+		return runCaseWithChaos(ctx, def.spec.ID, def.spec.Budget, chaos.Profile{}, func(context.Context) smoke.Result {
+			return smoke.Result{}
+		}, func(chaos.Profile) (func() error, error) {
+			return func() error {
+				cleanupCalled = true
+				return errors.New("cleanup boom")
+			}, nil
+		})
+	})
+
+	if !cleanupCalled {
+		t.Fatal("chaos cleanup was not called")
+	}
+	if runCalls != 1 {
+		t.Fatalf("case runner calls = %d, want 1", runCalls)
+	}
+	if got := suite.Cases[0].InvalidReason; got != "chaos cleanup failed: cleanup boom" {
+		t.Fatalf("first row invalid reason = %q", got)
+	}
+	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
+		t.Fatalf("second row invalid reason = %q", got)
+	}
+}
+
+func syntheticCaseDefs(tier string) []caseDef {
+	ids := []string{"synthetic.first", "synthetic.blocker", "synthetic.after"}
+	defs := make([]caseDef, len(ids))
+	for i, id := range ids {
+		defs[i].spec = manifest.RequiredWithBudget(id, tier, time.Second)
+	}
+	return defs
+}
+
+func assertFailFastRows(t *testing.T, cases []report.Case, tier string) {
+	t.Helper()
+	wantIDs := []string{"synthetic.first", "synthetic.blocker", "synthetic.after"}
+	gotIDs := make([]string, len(cases))
+	for i, rc := range cases {
+		gotIDs[i] = rc.Name
+		if rc.Tier != tier {
+			t.Fatalf("row %d tier = %q, want %q", i, rc.Tier, tier)
+		}
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("report IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	if got := cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
+		t.Fatalf("trailing row invalid reason = %q", got)
 	}
 }
 

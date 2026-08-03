@@ -138,10 +138,30 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		suite.Add(report.Case{Name: "T3-matrix", Tier: "T3", InvalidReason: "no matrix tests selected"})
 		return
 	}
+	runCaseDefs(ctx, suite, rendrRoot, selected, runMatrixCase)
+}
 
-	expected := expectedTestNames(selected)
-	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+type caseExecutor func(context.Context, string, caseDef) report.Case
+
+func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef, execute caseExecutor) {
+	failedCaseID := ""
+	for _, def := range defs {
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
+			continue
+		}
+		rc := execute(ctx, rendrRoot, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
+	}
+}
+
+func runMatrixCase(ctx context.Context, rendrRoot string, def caseDef) report.Case {
+	cctx, cancel := context.WithTimeout(ctx, def.spec.Budget)
 	defer cancel()
+	expected := def.expected
 	result, runErr := tier3GoTestExecutor.Run(cctx, gotestjson.Request{
 		Dir:         filepath.Join(rendrRoot, "regress"),
 		Package:     "./internal/matrix/...",
@@ -152,8 +172,18 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 	if runErr != nil && result.Passed() {
 		result.Issues = append(result.Issues, gotestjson.Issue{Code: gotestjson.IssueCommandFailed, Detail: runErr.Error()})
 	}
-	for _, testCase := range goTestReportCases(selected, result) {
-		suite.Add(testCase)
+	return goTestReportCases([]caseDef{def}, result)[0]
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

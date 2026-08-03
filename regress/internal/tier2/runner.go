@@ -149,19 +149,40 @@ func RunWithOptions(ctx context.Context, suite *report.Suite, _ string, opts Opt
 		suite.Add(report.Case{Name: "T2-case-filter", Tier: "T2", Failure: err.Error()})
 		return
 	}
+	runSelectedCases(ctx, suite, defs, executeCase)
+}
+
+type caseExecutor func(context.Context, caseDef) report.Case
+
+func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
+	failedCaseID := ""
 	for _, def := range defs {
-		if def.onlyOn != "" && def.onlyOn != runtime.GOOS {
-			suite.Add(report.Case{Name: def.spec.ID, Tier: "T2", SkipReason: def.skipReason})
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		addRun(ctx, suite, def.spec.ID, "T2", def.spec.Budget, def.run)
+		rc := execute(ctx, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
 	}
 }
 
+func executeCase(ctx context.Context, def caseDef) report.Case {
+	if def.onlyOn != "" && def.onlyOn != runtime.GOOS {
+		return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: def.skipReason}
+	}
+	return runSmokeCase(ctx, def.spec.ID, def.spec.Tier, def.spec.Budget, def.run)
+}
+
 func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) {
+	suite.Add(runSmokeCase(ctx, name, tier, budget, fn))
+}
+
+func runSmokeCase(ctx context.Context, name, tier string, budget time.Duration, fn func(context.Context) smoke.Result) report.Case {
 	if budget <= 0 {
-		suite.Add(report.Case{Name: name, Tier: tier, Failure: "T2 case has no bounded execution budget"})
-		return
+		return report.Case{Name: name, Tier: tier, Failure: "T2 case has no bounded execution budget"}
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -189,7 +210,19 @@ func addRun(ctx context.Context, suite *report.Suite, name, tier string, budget 
 			result.Failure = fmt.Sprintf("case canceled: %v", cctx.Err())
 		}
 	}
-	suite.Add(result)
+	return result
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+	}
 }
 
 func detailEvidence(detail map[string]any) map[string]string {

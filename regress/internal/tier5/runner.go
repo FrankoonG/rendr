@@ -89,21 +89,43 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 		})
 		return
 	}
+	runSelectedCases(ctx, suite, defs, func(ctx context.Context, def caseDef) report.Case {
+		return executeCase(ctx, def, rendrRoot)
+	})
+}
 
+type caseExecutor func(context.Context, caseDef) report.Case
+
+func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
+	failedCaseID := ""
 	for _, def := range defs {
-		if runtime.GOOS != "linux" {
-			addLinuxOnlySkip(suite, def)
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		def := def
-		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
-			return def.run(c, rendrRoot)
-		})
+		rc := execute(ctx, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
 	}
 }
 
+func executeCase(ctx context.Context, def caseDef, rendrRoot string) report.Case {
+	if runtime.GOOS != "linux" {
+		return linuxOnlySkip(def)
+	}
+	return runCase(ctx, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+		return def.run(c, rendrRoot)
+	})
+}
+
 func addLinuxOnlySkip(suite *report.Suite, def caseDef) {
-	suite.Add(report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: "Linux only"})
+	suite.Add(linuxOnlySkip(def))
+}
+
+func linuxOnlySkip(def caseDef) report.Case {
+	return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: "Linux only"}
 }
 
 func smokeReportCase(name string, result smoke.Result) report.Case {
@@ -124,7 +146,7 @@ func smokeReportCase(name string, result smoke.Result) report.Case {
 	}
 }
 
-func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
+func runCase(ctx context.Context, name string, budget time.Duration, fn func(context.Context) report.Case) report.Case {
 	fmt.Printf("  > T5/%s (budget %s) — start\n", name, budget)
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -154,5 +176,17 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	} else {
 		fmt.Printf("  > T5/%s (took %s) — OK\n", name, rc.Duration)
 	}
-	suite.Add(rc)
+	return rc
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+	}
 }

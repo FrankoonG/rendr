@@ -185,30 +185,50 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 		})
 		return
 	}
+	runSelectedCases(ctx, suite, defs, executeCase)
+}
 
+type caseExecutor func(context.Context, caseDef) report.Case
+
+func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
+	failedCaseID := ""
 	for _, def := range defs {
-		if def.skipReason != nil {
-			if reason := def.skipReason(); reason != "" {
-				suite.Add(report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: reason})
-				continue
-			}
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
+			continue
 		}
-		runCase(ctx, suite, def.spec.ID, def.spec.Budget, def.profile, def.run)
+		rc := execute(ctx, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
 	}
 }
 
-// runCase enforces the per-case budget via select-on-Done. Smoke cases only
-// honor ctx at some blocking points, so the outer select guarantees that the
-// tier continues and container teardown bounds any blocked smoke goroutine.
-func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) {
+func executeCase(ctx context.Context, def caseDef) report.Case {
+	if def.skipReason != nil {
+		if reason := def.skipReason(); reason != "" {
+			return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: reason}
+		}
+	}
+	return runCase(ctx, def.spec.ID, def.spec.Budget, def.profile, def.run)
+}
+
+// runCase enforces the per-case budget via select-on-Done. It returns only
+// after chaos cleanup so the selected-case loop can stop before launching any
+// later case, even when the smoke goroutine is still unwinding cancellation.
+func runCase(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) report.Case {
+	return runCaseWithChaos(ctx, name, budget, prof, fn, chaos.Apply)
+}
+
+func runCaseWithChaos(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply func(chaos.Profile) (func() error, error)) report.Case {
 	fmt.Printf("  > T4/%s (budget %s, chaos %s) — start\n", name, budget, profDesc(prof))
 	rc := report.Case{Name: name, Tier: "T4"}
-	cleanup, err := chaos.Apply(prof)
+	cleanup, err := apply(prof)
 	if err != nil {
 		rc.Failure = "chaos.Apply failed: " + err.Error()
 		fmt.Printf("  > T4/%s — FAIL: %s\n", name, rc.Failure)
-		suite.Add(rc)
-		return
+		return rc
 	}
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -238,7 +258,19 @@ func runCase(ctx context.Context, suite *report.Suite, name string, budget time.
 	} else {
 		fmt.Printf("  > T4/%s (took %s) — OK\n", name, rc.Duration)
 	}
-	suite.Add(rc)
+	return rc
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+	}
 }
 
 func evidenceFromDetail(detail map[string]any) map[string]string {

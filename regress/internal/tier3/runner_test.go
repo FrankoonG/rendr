@@ -1,6 +1,7 @@
 package tier3
 
 import (
+	"context"
 	"reflect"
 	"regexp"
 	"strings"
@@ -132,6 +133,53 @@ func TestFilteredRunPatternMatchesOnlySelection(t *testing.T) {
 				if got, want := pattern.MatchString(spec.ID), selectedIDs[spec.ID]; got != want {
 					t.Errorf("pattern selection for %q=%v, want %v", spec.ID, got, want)
 				}
+			}
+		})
+	}
+}
+
+func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
+	defs := []caseDef{matrixCase("TestFirst"), matrixCase("TestSecond"), matrixCase("TestThird")}
+	tests := []struct {
+		name string
+		row  report.Case
+	}{
+		{name: "failure", row: report.Case{Failure: "assertion failed"}},
+		{name: "invalid", row: report.Case{InvalidReason: "malformed stream"}},
+		{name: "mandatory skip", row: report.Case{SkipReason: "dependency unavailable"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			suite := report.New()
+			runCaseDefs(context.Background(), suite, "", defs, func(_ context.Context, _ string, def caseDef) report.Case {
+				calls++
+				if calls > 2 {
+					t.Fatal("later executor was invoked")
+				}
+				if calls == 1 {
+					return report.Case{Name: def.spec.ID, Tier: def.spec.Tier}
+				}
+				rc := tc.row
+				rc.Name = def.spec.ID
+				rc.Tier = def.spec.Tier
+				rc.Evidence = map[string]string{"attempt": "preserved"}
+				return rc
+			})
+
+			if calls != 2 {
+				t.Fatalf("executor calls = %d, want 2", calls)
+			}
+			if got := caseNames(suite.Cases); !reflect.DeepEqual(got, []string{"TestFirst", "TestSecond", "TestThird"}) {
+				t.Fatalf("report rows = %v", got)
+			}
+			if got := suite.Cases[1].Evidence["attempt"]; got != "preserved" {
+				t.Fatalf("failing evidence = %q", got)
+			}
+			last := suite.Cases[2]
+			if last.Tier != "T3" || last.InvalidReason != "not run after TestSecond failed" || last.Failure != "" || last.SkipReason != "" {
+				t.Fatalf("not-run row = %+v", last)
 			}
 		})
 	}

@@ -224,8 +224,29 @@ func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Option
 }
 
 func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef) {
+	failedCaseID := ""
 	for _, def := range defs {
-		suite.Add(runManifestCase(ctx, rendrRoot, def))
+		if failedCaseID != "" {
+			suite.Add(notRunCase(def.spec, failedCaseID))
+			continue
+		}
+		rc := runManifestCase(ctx, rendrRoot, def)
+		suite.Add(rc)
+		if mandatoryCaseFailed(def.spec, rc) {
+			failedCaseID = def.spec.ID
+		}
+	}
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

@@ -195,6 +195,83 @@ func TestRunCaseDefsUsesDeterministicManifestOrder(t *testing.T) {
 	}
 }
 
+func TestRunCaseDefsStopsAfterMandatoryOutcome(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome report.Case
+	}{
+		{name: "failure", outcome: report.Case{Failure: "boom"}},
+		{name: "invalid", outcome: report.Case{InvalidReason: "stimulus missing"}},
+		{name: "mandatory skip", outcome: report.Case{SkipReason: "dependency unavailable"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var called []string
+			defs := []caseDef{
+				syntheticCase("synthetic.first", time.Second, func(_ context.Context, _ string, spec manifest.Spec) report.Case {
+					called = append(called, spec.ID)
+					return report.Case{}
+				}),
+				syntheticCase("synthetic.blocker", time.Second, func(_ context.Context, _ string, spec manifest.Spec) report.Case {
+					called = append(called, spec.ID)
+					return tt.outcome
+				}),
+				syntheticCase("synthetic.after", time.Second, func(_ context.Context, _ string, spec manifest.Spec) report.Case {
+					called = append(called, spec.ID)
+					return report.Case{}
+				}),
+			}
+			suite := report.New()
+			runCaseDefs(context.Background(), suite, "", defs)
+
+			if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
+				t.Fatalf("executed cases = %v, want %v", called, want)
+			}
+			wantIDs := []string{"synthetic.first", "synthetic.blocker", "synthetic.after"}
+			if got := reportIDs(suite.Cases); !reflect.DeepEqual(got, wantIDs) {
+				t.Fatalf("report IDs = %v, want %v", got, wantIDs)
+			}
+			if got := suite.Cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
+				t.Fatalf("trailing row invalid reason = %q", got)
+			}
+		})
+	}
+}
+
+func TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce(t *testing.T) {
+	defs, err := selectCaseDefs(Options{Case: caseT4LongRun})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{caseT4G1, caseT4G2, caseT4G3}
+	if got := defIDs(defs); !reflect.DeepEqual(got, wantIDs) {
+		t.Fatalf("long-run executable members = %v, want %v", got, wantIDs)
+	}
+
+	var called []string
+	for i := range defs {
+		defs[i].run = func(_ context.Context, _ string, spec manifest.Spec) report.Case {
+			called = append(called, spec.ID)
+			if spec.ID == caseT4G2 {
+				return report.Case{Failure: "synthetic failure"}
+			}
+			return report.Case{}
+		}
+	}
+	suite := report.New()
+	runCaseDefs(context.Background(), suite, "", defs)
+
+	if want := []string{caseT4G1, caseT4G2}; !reflect.DeepEqual(called, want) {
+		t.Fatalf("executed members = %v, want %v", called, want)
+	}
+	if got := reportIDs(suite.Cases); !reflect.DeepEqual(got, wantIDs) {
+		t.Fatalf("member report IDs = %v, want %v", got, wantIDs)
+	}
+	if got := suite.Cases[2].InvalidReason; got != "not run after "+caseT4G2+" failed" {
+		t.Fatalf("trailing member invalid reason = %q", got)
+	}
+}
+
 func TestRunManifestCaseEnforcesBudget(t *testing.T) {
 	finished := make(chan struct{})
 	def := syntheticCase("synthetic.timeout", 10*time.Millisecond, func(ctx context.Context, _ string, _ manifest.Spec) report.Case {

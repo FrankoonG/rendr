@@ -1,10 +1,12 @@
 package tier8
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
+	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
 var orderedCaseIDs = []string{
@@ -58,6 +60,55 @@ func TestSelectCaseDefs(t *testing.T) {
 	})
 }
 
+func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
+	defs := []caseDef{
+		{spec: manifest.Required("first", "T8")},
+		{spec: manifest.Required("second", "T8")},
+		{spec: manifest.Required("third", "T8")},
+	}
+	tests := []struct {
+		name string
+		row  report.Case
+	}{
+		{name: "failure", row: report.Case{Failure: "boom"}},
+		{name: "invalid", row: report.Case{InvalidReason: "bad evidence"}},
+		{name: "mandatory skip", row: report.Case{SkipReason: "missing capability"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			suite := report.New()
+			runCaseDefs(context.Background(), suite, "", defs, func(_ context.Context, _ string, def caseDef) report.Case {
+				calls++
+				if calls > 1 {
+					t.Fatal("later executor was invoked")
+				}
+				rc := tc.row
+				rc.Name = def.spec.ID
+				rc.Tier = def.spec.Tier
+				rc.Evidence = map[string]string{"cleanup": "preserved"}
+				return rc
+			})
+
+			if calls != 1 {
+				t.Fatalf("executor calls = %d, want 1", calls)
+			}
+			if got := reportCaseNames(suite.Cases); !reflect.DeepEqual(got, []string{"first", "second", "third"}) {
+				t.Fatalf("report rows = %v", got)
+			}
+			if suite.Cases[0].Evidence["cleanup"] != "preserved" {
+				t.Fatalf("failing row lost evidence: %+v", suite.Cases[0])
+			}
+			for _, rc := range suite.Cases[1:] {
+				if rc.Tier != "T8" || rc.InvalidReason != "not run after first failed" || rc.Failure != "" || rc.SkipReason != "" {
+					t.Fatalf("not-run row = %+v", rc)
+				}
+			}
+		})
+	}
+}
+
 func specIDs(specs []manifest.Spec) []string {
 	ids := make([]string, len(specs))
 	for i, spec := range specs {
@@ -84,4 +135,12 @@ func defIDs(defs []caseDef) []string {
 		ids[i] = def.spec.ID
 	}
 	return ids
+}
+
+func reportCaseNames(cases []report.Case) []string {
+	names := make([]string, len(cases))
+	for i, rc := range cases {
+		names[i] = rc.Name
+	}
+	return names
 }
