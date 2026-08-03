@@ -415,6 +415,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestRunCaseWithChaosJoinsDelayedWorkloadBeforeFixtureFinalization",
 			"TestRunCaseWithChaosResultCancelsAndJoinsMonitorBeforeFinalization",
 			"TestRunSelectedCasesStopsAfterMandatoryOutcome", "TestCleanupCompletesBeforeFailFastDecision",
+			"TestRunSelectedCasesStopsAfterUnjoinedWorkload",
 		),
 		testPackage(regressModule+"/internal/tier5", "./internal/tier5",
 			"TestUnprivilegedProbeRequestsAreExactAndMandatory", "TestT5JSONContractRejectsZeroAndSkippedTests",

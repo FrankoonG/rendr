@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -470,7 +471,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 			defs := syntheticCaseDefs("T4")
 			var called []string
 			suite := report.New()
-			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) report.Case {
+			runSelectedCases(context.Background(), suite, defs, func(_ context.Context, def caseDef) caseexec.Outcome {
 				called = append(called, def.spec.ID)
 				rc := report.Case{Name: def.spec.ID, Tier: def.spec.Tier}
 				if def.spec.ID == "synthetic.blocker" {
@@ -478,7 +479,7 @@ func TestRunSelectedCasesStopsAfterMandatoryOutcome(t *testing.T) {
 					rc.InvalidReason = tt.outcome.InvalidReason
 					rc.SkipReason = tt.outcome.SkipReason
 				}
-				return rc
+				return caseexec.Outcome{Case: rc}
 			})
 
 			if want := []string{"synthetic.first", "synthetic.blocker"}; !reflect.DeepEqual(called, want) {
@@ -494,16 +495,16 @@ func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
 	cleanupCalled := false
 	runCalls := 0
 	suite := report.New()
-	runSelectedCases(context.Background(), suite, defs, func(ctx context.Context, def caseDef) report.Case {
+	runSelectedCases(context.Background(), suite, defs, func(ctx context.Context, def caseDef) caseexec.Outcome {
 		runCalls++
-		return runCaseWithChaos(ctx, def.spec.ID, def.spec.Budget, chaos.Profile{}, func(context.Context) smoke.Result {
+		return runCaseWithChaosOutcomeInterval(ctx, def.spec.ID, def.spec.Budget, chaos.Profile{}, func(context.Context) smoke.Result {
 			return smoke.Result{}
 		}, func(chaos.Profile) (chaos.Fixture, error) {
 			return &fakeChaosFixture{cleanup: func() error {
 				cleanupCalled = true
 				return errors.New("cleanup boom")
 			}}, nil
-		})
+		}, chaosVerifyInterval)
 	})
 
 	if !cleanupCalled {
@@ -518,6 +519,60 @@ func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
 	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
 		t.Fatalf("second row invalid reason = %q", got)
 	}
+}
+
+func TestRunSelectedCasesStopsAfterUnjoinedWorkload(t *testing.T) {
+	originalJoinTimeout := tier4CaseJoinTimeout
+	tier4CaseJoinTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { tier4CaseJoinTimeout = originalJoinTimeout })
+
+	release := make(chan struct{})
+	workerDone := make(chan struct{})
+	var released atomic.Bool
+	releaseWorker := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	t.Cleanup(func() {
+		releaseWorker()
+		select {
+		case <-workerDone:
+		case <-time.After(time.Second):
+			t.Error("noncooperative T4 workload did not exit after release")
+		}
+	})
+
+	defs := syntheticCaseDefs("T4")[:2]
+	defs[0].spec.Budget = 20 * time.Millisecond
+	secondCalled := false
+	suite := report.New()
+	started := time.Now()
+	runSelectedCases(context.Background(), suite, defs, func(ctx context.Context, def caseDef) caseexec.Outcome {
+		if def.spec.ID != defs[0].spec.ID {
+			secondCalled = true
+			return caseexec.Outcome{Case: report.Case{Name: def.spec.ID, Tier: def.spec.Tier}}
+		}
+		return runCaseWithChaosOutcomeInterval(ctx, def.spec.ID, def.spec.Budget, chaos.Profile{}, func(context.Context) smoke.Result {
+			defer close(workerDone)
+			<-release
+			return smoke.Result{}
+		}, func(chaos.Profile) (chaos.Fixture, error) {
+			return &fakeChaosFixture{}, nil
+		}, time.Hour)
+	})
+
+	if secondCalled {
+		t.Fatal("runner started a later case after an unjoined timeout")
+	}
+	if elapsed := time.Since(started); elapsed < 35*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("bounded T4 timeout elapsed=%s", elapsed)
+	}
+	if len(suite.Cases) != 2 || !strings.Contains(suite.Cases[0].InvalidReason, "Go cannot terminate") ||
+		!strings.Contains(suite.Cases[1].InvalidReason, "not run after synthetic.first failed") {
+		t.Fatalf("unjoined T4 rows=%+v", suite.Cases)
+	}
+	releaseWorker()
 }
 
 type fakeChaosFixture struct {

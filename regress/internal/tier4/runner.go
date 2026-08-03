@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr"
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -200,10 +201,10 @@ func Run(ctx context.Context, suite *report.Suite, _ string, opts Options) {
 		})
 		return
 	}
-	runSelectedCases(ctx, suite, defs, executeCase)
+	runSelectedCases(ctx, suite, defs, executeCaseOutcome)
 }
 
-type caseExecutor func(context.Context, caseDef) report.Case
+type caseExecutor func(context.Context, caseDef) caseexec.Outcome
 
 func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, execute caseExecutor) {
 	failedCaseID := ""
@@ -212,35 +213,54 @@ func runSelectedCases(ctx context.Context, suite *report.Suite, defs []caseDef, 
 			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		rc := execute(ctx, def)
+		outcome := execute(ctx, def)
+		rc := outcome.Case
 		suite.Add(rc)
-		if mandatoryCaseFailed(def.spec, rc) {
+		if outcome.MustStop || mandatoryCaseFailed(def.spec, rc) {
 			failedCaseID = def.spec.ID
 		}
 	}
 }
 
 func executeCase(ctx context.Context, def caseDef) report.Case {
-	if def.skipReason != nil {
-		if reason := def.skipReason(); reason != "" {
-			return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: reason}
-		}
-	}
-	if def.preflight != nil {
-		if err := def.preflight(); err != nil {
-			return report.Case{
-				Name:          def.spec.ID,
-				Tier:          def.spec.Tier,
-				InvalidReason: "case preflight failed: " + err.Error(),
-			}
-		}
-	}
-	return runCase(ctx, def.spec.ID, def.spec.Budget, def.profile, def.run)
+	return executeCaseOutcome(ctx, def).Case
 }
 
-// runCase enforces the per-case budget via select-on-Done. It returns only
-// after the workload and chaos monitor stop and chaos cleanup completes, so the
-// selected-case loop cannot overlap one case's teardown with the next case.
+var tier4CaseJoinTimeout = caseexec.DefaultJoinTimeout
+
+func executeCaseOutcome(ctx context.Context, def caseDef) caseexec.Outcome {
+	return caseexec.Run(ctx, caseexec.Config{
+		Name:        def.spec.ID,
+		Tier:        def.spec.Tier,
+		Budget:      def.spec.Budget,
+		JoinTimeout: tier4CaseJoinTimeout,
+	}, func(cctx context.Context) (rc report.Case) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				rc = report.Case{Name: def.spec.ID, Tier: def.spec.Tier, Failure: fmt.Sprintf("runner panic: %v", recovered)}
+			}
+		}()
+		if def.skipReason != nil {
+			if reason := def.skipReason(); reason != "" {
+				return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: reason}
+			}
+		}
+		if def.preflight != nil {
+			if err := def.preflight(); err != nil {
+				return report.Case{
+					Name:          def.spec.ID,
+					Tier:          def.spec.Tier,
+					InvalidReason: "case preflight failed: " + err.Error(),
+				}
+			}
+		}
+		return runCaseWithChaosBody(cctx, def.spec.ID, def.spec.Budget, def.profile, def.run, chaos.ApplyChecked, chaosVerifyInterval)
+	})
+}
+
+// runCase returns only after the workload and chaos monitor stop and chaos
+// cleanup completes. A non-cooperative teardown is bounded by caseexec and
+// makes the tier unsafe to continue.
 func runCase(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result) report.Case {
 	return runCaseWithChaos(ctx, name, budget, prof, fn, chaos.ApplyChecked)
 }
@@ -254,6 +274,22 @@ func runCaseWithChaos(ctx context.Context, name string, budget time.Duration, pr
 }
 
 func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply chaosApplyFunc, verifyInterval time.Duration) report.Case {
+	return runCaseWithChaosOutcomeInterval(ctx, name, budget, prof, fn, apply, verifyInterval).Case
+}
+
+func runCaseWithChaosOutcomeInterval(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply chaosApplyFunc, verifyInterval time.Duration) caseexec.Outcome {
+	return caseexec.Run(ctx, caseexec.Config{
+		Name:        name,
+		Tier:        "T4",
+		Budget:      budget,
+		JoinTimeout: tier4CaseJoinTimeout,
+	}, func(cctx context.Context) report.Case {
+		return runCaseWithChaosBody(cctx, name, budget, prof, fn, apply, verifyInterval)
+	})
+}
+
+func runCaseWithChaosBody(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) smoke.Result, apply chaosApplyFunc, verifyInterval time.Duration) report.Case {
+	started := time.Now()
 	fmt.Printf("  > T4/%s (budget %s, chaos %s) — start\n", name, budget, profDesc(prof))
 	rc := report.Case{Name: name, Tier: "T4"}
 	fixture, err := apply(prof)
@@ -262,8 +298,7 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 		fmt.Printf("  > T4/%s — INVALID: %s\n", name, rc.InvalidReason)
 		return rc
 	}
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	start := time.Now()
+	cctx, cancel := context.WithCancel(ctx)
 	monitorFailures, monitorDone := monitorChaosFixture(cctx, fixture, verifyInterval)
 	result := make(chan smoke.Result, 1)
 	workloadDone := make(chan struct{})
@@ -278,22 +313,14 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 		rc.InvalidReason = r.InvalidReason
 		rc.Evidence = evidenceFromDetail(r.Detail)
 		if rc.Duration == 0 {
-			rc.Duration = time.Since(start)
+			rc.Duration = time.Since(started)
 		}
 	case err := <-monitorFailures:
-		rc.Duration = time.Since(start)
+		rc.Duration = time.Since(started)
 		markChaosInvalid(&rc, "chaos stimulus changed during case: "+err.Error())
 	case <-cctx.Done():
-		rc.Duration = time.Since(start)
-		rc.Failure = "case exceeded T4 budget (" + budget.String() + "): " + cctx.Err().Error()
-	}
-	if stopErr := cctx.Err(); stopErr != nil {
-		rc = report.Case{
-			Name:     name,
-			Tier:     "T4",
-			Duration: time.Since(start),
-			Failure:  "case exceeded T4 budget (" + budget.String() + "): " + stopErr.Error(),
-		}
+		rc.Duration = time.Since(started)
+		rc.Failure = "case stopped during T4 execution: " + cctx.Err().Error()
 	}
 	cancel()
 	// A late result must not replace the timeout or monitor outcome selected
@@ -309,7 +336,7 @@ func runCaseWithChaosInterval(ctx context.Context, name string, budget time.Dura
 		markChaosInvalid(&rc, "chaos final verification failed: "+err.Error())
 	}
 	applyCleanupResult(&rc, fixture.Cleanup)
-	rc.Duration = time.Since(start)
+	rc.Duration = time.Since(started)
 	if rc.Failure != "" {
 		fmt.Printf("  > T4/%s (took %s) — FAIL: %s\n", name, rc.Duration, rc.Failure)
 	} else if rc.InvalidReason != "" {
