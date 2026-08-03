@@ -9,67 +9,75 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
 // Options filters the tier6 selector graph matrix.
 type Options struct {
-	Case string
+	Case     string
+	FromCase string
+}
+
+type caseDef struct {
+	spec    manifest.Spec
+	pattern string
+}
+
+var caseDefs = []caseDef{
+	{manifest.RequiredWithBudget("T6.graph.compat-mode", "T6", 2*time.Minute), "TestTargetConstructors|TestLegacy|TestDialerCompile|TestDialerRoot"},
+	{manifest.RequiredWithBudget("T6.peak.A-to-bulk-bond", "T6", 2*time.Minute), "^TestSelectorPeakTransferRuntimePromotesToBond$"},
+	{manifest.RequiredWithBudget("T6.peak.nested-normal-to-C", "T6", 2*time.Minute), "^TestSelectorPeakTransferNormalSelectorUsesQuality$"},
+	{manifest.RequiredWithBudget("T6.failover.hot-standby", "T6", 2*time.Minute), "^TestSelectorHotStandbyFailover$"},
+	{manifest.RequiredWithBudget("T6.peak.composite-normal", "T6", 2*time.Minute), "^TestSelectorPeakTransferCompositeNormalDeathStaysNormal$"},
+	{manifest.RequiredWithBudget("T6.peak.bad-speed", "T6", 2*time.Minute), "^TestSelectorPeakTransferBadSpeedQualityGate$"},
+	{manifest.RequiredWithBudget("T6.peak.stale-speed", "T6", 2*time.Minute), "^TestSelectorPeakTransferStaleSpeedEvidence$"},
+	{manifest.RequiredWithBudget("T6.peak.probe-budget", "T6", 2*time.Minute), "^TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate$"},
+	{manifest.RequiredWithBudget("T6.peak.slow-peak-revert", "T6", 2*time.Minute), "^TestSelectorPeakTransferSlowPeakRevertsAndSuppresses$"},
+	{manifest.RequiredWithBudget("T6.peak.rx-peer-policy", "T6", 2*time.Minute), "^TestSelectorPeakTransferRxPromotesPeerSenderOnly$"},
+}
+
+// Specs returns the ordered T6 case manifest.
+func Specs() []manifest.Spec {
+	specs := make([]manifest.Spec, len(caseDefs))
+	for i, def := range caseDefs {
+		specs[i] = def.spec
+	}
+	return specs
+}
+
+func selectCaseDefs(opts Options) ([]caseDef, error) {
+	selected, err := manifest.Select(Specs(), opts.Case, opts.FromCase)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]caseDef, len(caseDefs))
+	for _, def := range caseDefs {
+		byID[def.spec.ID] = def
+	}
+	defs := make([]caseDef, 0, len(selected))
+	for _, spec := range selected {
+		defs = append(defs, byID[spec.ID])
+	}
+	return defs, nil
 }
 
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
-	matched := false
-	run := func(name string, budget time.Duration, fn func(context.Context) report.Case) {
-		if !caseMatches(opts.Case, name) {
-			return
+	defs, err := selectCaseDefs(opts)
+	if err != nil {
+		failure := fmt.Sprintf("no T6 case matched case=%q from-case=%q", opts.Case, opts.FromCase)
+		if opts.FromCase == "" {
+			failure = fmt.Sprintf("no T6 case matched %q", opts.Case)
 		}
-		matched = true
-		runCase(ctx, suite, name, budget, fn)
+		suite.Add(report.Case{Name: "T6-case-filter", Tier: "T6", Failure: failure})
+		return
 	}
-	defer func() {
-		if opts.Case != "" && !matched {
-			suite.Add(report.Case{
-				Name:    "T6-case-filter",
-				Tier:    "T6",
-				Failure: fmt.Sprintf("no T6 case matched %q", opts.Case),
-			})
-		}
-	}()
-
-	run("T6.graph.compat-mode", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.graph.compat-mode", "TestTargetConstructors|TestLegacy|TestDialerCompile|TestDialerRoot")
-	})
-	run("T6.peak.A-to-bulk-bond", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.A-to-bulk-bond", "^TestSelectorPeakTransferRuntimePromotesToBond$")
-	})
-	run("T6.peak.nested-normal-to-C", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.nested-normal-to-C", "^TestSelectorPeakTransferNormalSelectorUsesQuality$")
-	})
-	run("T6.failover.hot-standby", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.failover.hot-standby", "^TestSelectorHotStandbyFailover$")
-	})
-	run("T6.peak.composite-normal", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.composite-normal", "^TestSelectorPeakTransferCompositeNormalDeathStaysNormal$")
-	})
-	run("T6.peak.bad-speed", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.bad-speed", "^TestSelectorPeakTransferBadSpeedQualityGate$")
-	})
-	run("T6.peak.stale-speed", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.stale-speed", "^TestSelectorPeakTransferStaleSpeedEvidence$")
-	})
-	run("T6.peak.probe-budget", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.probe-budget", "^TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate$")
-	})
-	run("T6.peak.slow-peak-revert", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.slow-peak-revert", "^TestSelectorPeakTransferSlowPeakRevertsAndSuppresses$")
-	})
-	run("T6.peak.rx-peer-policy", 2*time.Minute, func(c context.Context) report.Case {
-		return runRootTargetGraphTests(c, rendrRoot, "T6.peak.rx-peer-policy", "^TestSelectorPeakTransferRxPromotesPeerSenderOnly$")
-	})
-}
-
-func caseMatches(filter, name string) bool {
-	return filter == "" || filter == name
+	for _, def := range defs {
+		def := def
+		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+			return runRootTargetGraphTests(c, rendrRoot, def.spec.ID, def.pattern)
+		})
+	}
 }
 
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {

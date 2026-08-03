@@ -10,127 +10,96 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
 // Options filters the tier7 TUN/l3ingress matrix.
 type Options struct {
-	Case string
+	Case     string
+	FromCase string
+}
+
+type caseDef struct {
+	spec    manifest.Spec
+	pkg     string
+	pattern string
+}
+
+var caseDefs = []caseDef{
+	{manifest.RequiredWithBudget("T7.capability.local-probe", "T7", 30*time.Second), "./tun", "^TestProbeReturnsMachineReadableCapability$"},
+	{manifest.RequiredWithBudget("T7.tun.open-smoke", "T7", 30*time.Second), "./tun", "^TestOpenCreatesEphemeralDeviceWhenAvailable$"},
+	{manifest.RequiredWithBudget("T7.tun.packet-io", "T7", 30*time.Second), "./tun", "^TestDeviceReadsKernelRoutedIPv4Packet$"},
+	{manifest.RequiredWithBudget("T7.config.invalid-mtu", "T7", 30*time.Second), "./tun", "^TestConfigValidateRejectsSmallMTU$"},
+	{manifest.RequiredWithBudget("T7.l3.identity-smoke", "T7", 30*time.Second), "./l3ingress", "^TestParseIPv4TCPIdentity|TestParseIPv6UDPIdentity$"},
+	{manifest.RequiredWithBudget("T7.l3.identity-wire", "T7", 30*time.Second), "./l3ingress", "^TestIdentityWireRoundTripIPv4|TestIdentityWireRoundTripIPv6|TestIdentityWireRejectsMixedFamilies$"},
+	{manifest.RequiredWithBudget("T7.capability.peer-denied", "T7", 30*time.Second), "./l3ingress", "^TestRequirePeerL3Identity|TestRequirePeerEgress$"},
+	{manifest.RequiredWithBudget("T7.capability.peer-advertise", "T7", 30*time.Second), ".", "^TestDialerAdvertisesL3IdentityCapability|TestDialPacketAdvertisesL3IdentityAndPacketMode$"},
+	{manifest.RequiredWithBudget("T7.router.per-flow-hook", "T7", 30*time.Second), "./l3ingress", "^TestPumpRoutesParsedPackets$"},
+	{manifest.RequiredWithBudget("T7.router.per-flow-cache", "T7", 30*time.Second), "./l3ingress", "^TestPumpCachesRouterDecisionPerFlow$"},
+	{manifest.RequiredWithBudget("T7.session.request", "T7", 30*time.Second), "./l3ingress", "^TestBuildSessionRequestMapsTCPAndUDP|TestBuildSessionRequestRejectsInvalidDecisions|TestBuildSessionRequestRejectsIdentityMismatch$"},
+	{manifest.RequiredWithBudget("T7.session.start", "T7", 30*time.Second), "./l3session", "^TestStarterStreamSessionPreservesL3Capability|TestStarterPacketSessionPreservesL3Capability|TestStarterRejectsUnsupportedRequest$"},
+	{manifest.RequiredWithBudget("T7.session.manager", "T7", 30*time.Second), "./l3session", "^TestManagerStartsOneSessionPerFlow|TestManagerPropagatesPlanningErrors$"},
+	{manifest.RequiredWithBudget("T7.session.lifecycle", "T7", 30*time.Second), "./l3session", "^TestManagerClosesSessionOnFlowClose$"},
+	{manifest.RequiredWithBudget("T7.session.path-observe", "T7", 30*time.Second), "./l3session", "^TestManagerRecordsSessionPathSelectionAndMigrations$"},
+	{manifest.RequiredWithBudget("T7.router.flow-deny", "T7", 30*time.Second), "./l3ingress", "^TestFlowTableCachesDeniedDecision|TestPumpSkipsDeniedFlow$"},
+	{manifest.RequiredWithBudget("T7.flow.lifecycle-stats", "T7", 30*time.Second), "./l3ingress", "^TestFlowTableCachesDecisionAndStats|TestFlowTableCloseSnapshot|TestPumpUsesProvidedFlowTable$"},
+	{manifest.RequiredWithBudget("T7.flow.observe", "T7", 30*time.Second), "./l3ingress", "^TestFlowTableObserverReceivesLifecycleSnapshots|TestFlowTableRecordsPathSelectionAndMigrations$"},
+	{manifest.RequiredWithBudget("T7.selector.per-flow", "T7", 30*time.Second), "./l3ingress", "^TestFlowTableTracksIndependentSelectorFlows$"},
+	{manifest.RequiredWithBudget("T7.peer-egress-hook", "T7", 30*time.Second), "./l3ingress", "^TestEgressRegistryDispatchesIdentity|TestEgressRegistryMachineReadableErrors$"},
+	{manifest.RequiredWithBudget("T7.tcp.peer-egress", "T7", 30*time.Second), "./l3ingress", "^TestTCPFlowRelayDispatchesIdentityAndBridgesStream|TestTCPFlowRelayCloseFlowAllowsReopen$"},
+	{manifest.RequiredWithBudget("T7.udp.identity-smoke", "T7", 30*time.Second), "./l3ingress", "^TestUDPPayloadExtractsData|TestBuildUDPPacketRoundTripIPv4|TestBuildUDPPacketRoundTripIPv6|TestUDPFlowRelayDispatchesPayloadAndWritesReply|TestUDPFlowRelayCloseFlowAllowsReopen$"},
+	{manifest.RequiredWithBudget("T7.udp.rendr-relay", "T7", 30*time.Second), "./l3session", "^TestUDPRelayForwardsPayloadThroughRendrPacketSession$"},
+	{manifest.RequiredWithBudget("T7.udp.migration", "T7", 30*time.Second), "./l3session", "^TestUDPRelayPreservesFlowAcrossPacketMigration$"},
+	{manifest.RequiredWithBudget("T7.tcp.rendr-relay", "T7", 30*time.Second), "./l3session", "^TestTCPRelayBridgesEndpointThroughRendrStreamSession$"},
+	{manifest.RequiredWithBudget("T7.tcp.migration", "T7", 30*time.Second), "./l3session", "^TestTCPRelayPreservesFlowAcrossStreamMigration$"},
+	{manifest.RequiredWithBudget("T7.tcp.lifecycle-flags", "T7", 30*time.Second), "./l3ingress", "^TestParseTCPCloseFlags|TestPumpClosesFlowTableOnTCPReset$"},
+	{manifest.RequiredWithBudget("T7.l3.parse-error-skip", "T7", 30*time.Second), "./l3ingress", "^TestPumpSkipsParseErrors$"},
+	{manifest.RequiredWithBudget("T7.l3.fragment-boundary", "T7", 30*time.Second), "./l3ingress", "^TestParseIPv4UDPMoreFragmentFirstFragment|TestParseRejectsIPv4NonInitialFragment$"},
+	{manifest.RequiredWithBudget("T7.l3.unsupported-protocol", "T7", 30*time.Second), "./l3ingress", "^TestParseRejectsUnsupportedProtocol|TestParseRejectsShortPacket$"},
+}
+
+// Specs returns the ordered T7 case manifest.
+func Specs() []manifest.Spec {
+	specs := make([]manifest.Spec, len(caseDefs))
+	for i, def := range caseDefs {
+		specs[i] = def.spec
+	}
+	return specs
+}
+
+func selectCaseDefs(opts Options) ([]caseDef, error) {
+	selected, err := manifest.Select(Specs(), opts.Case, opts.FromCase)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]caseDef, len(caseDefs))
+	for _, def := range caseDefs {
+		byID[def.spec.ID] = def
+	}
+	defs := make([]caseDef, 0, len(selected))
+	for _, spec := range selected {
+		defs = append(defs, byID[spec.ID])
+	}
+	return defs, nil
 }
 
 func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
-	matched := false
-	run := func(name string, budget time.Duration, fn func(context.Context) report.Case) {
-		if !caseMatches(opts.Case, name) {
-			return
+	defs, err := selectCaseDefs(opts)
+	if err != nil {
+		failure := fmt.Sprintf("no T7 case matched case=%q from-case=%q", opts.Case, opts.FromCase)
+		if opts.FromCase == "" {
+			failure = fmt.Sprintf("no T7 case matched %q", opts.Case)
 		}
-		matched = true
-		runCase(ctx, suite, name, budget, fn)
+		suite.Add(report.Case{Name: "T7-case-filter", Tier: "T7", Failure: failure})
+		return
 	}
-	defer func() {
-		if opts.Case != "" && !matched {
-			suite.Add(report.Case{
-				Name:    "T7-case-filter",
-				Tier:    "T7",
-				Failure: fmt.Sprintf("no T7 case matched %q", opts.Case),
-			})
-		}
-	}()
-
-	run("T7.capability.local-probe", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.capability.local-probe", "./tun", "^TestProbeReturnsMachineReadableCapability$")
-	})
-	run("T7.tun.open-smoke", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tun.open-smoke", "./tun", "^TestOpenCreatesEphemeralDeviceWhenAvailable$")
-	})
-	run("T7.tun.packet-io", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tun.packet-io", "./tun", "^TestDeviceReadsKernelRoutedIPv4Packet$")
-	})
-	run("T7.config.invalid-mtu", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.config.invalid-mtu", "./tun", "^TestConfigValidateRejectsSmallMTU$")
-	})
-	run("T7.l3.identity-smoke", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.l3.identity-smoke", "./l3ingress", "^TestParseIPv4TCPIdentity|TestParseIPv6UDPIdentity$")
-	})
-	run("T7.l3.identity-wire", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.l3.identity-wire", "./l3ingress", "^TestIdentityWireRoundTripIPv4|TestIdentityWireRoundTripIPv6|TestIdentityWireRejectsMixedFamilies$")
-	})
-	run("T7.capability.peer-denied", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.capability.peer-denied", "./l3ingress", "^TestRequirePeerL3Identity|TestRequirePeerEgress$")
-	})
-	run("T7.capability.peer-advertise", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.capability.peer-advertise", ".", "^TestDialerAdvertisesL3IdentityCapability|TestDialPacketAdvertisesL3IdentityAndPacketMode$")
-	})
-	run("T7.router.per-flow-hook", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.router.per-flow-hook", "./l3ingress", "^TestPumpRoutesParsedPackets$")
-	})
-	run("T7.router.per-flow-cache", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.router.per-flow-cache", "./l3ingress", "^TestPumpCachesRouterDecisionPerFlow$")
-	})
-	run("T7.session.request", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.session.request", "./l3ingress", "^TestBuildSessionRequestMapsTCPAndUDP|TestBuildSessionRequestRejectsInvalidDecisions|TestBuildSessionRequestRejectsIdentityMismatch$")
-	})
-	run("T7.session.start", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.session.start", "./l3session", "^TestStarterStreamSessionPreservesL3Capability|TestStarterPacketSessionPreservesL3Capability|TestStarterRejectsUnsupportedRequest$")
-	})
-	run("T7.session.manager", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.session.manager", "./l3session", "^TestManagerStartsOneSessionPerFlow|TestManagerPropagatesPlanningErrors$")
-	})
-	run("T7.session.lifecycle", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.session.lifecycle", "./l3session", "^TestManagerClosesSessionOnFlowClose$")
-	})
-	run("T7.session.path-observe", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.session.path-observe", "./l3session", "^TestManagerRecordsSessionPathSelectionAndMigrations$")
-	})
-	run("T7.router.flow-deny", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.router.flow-deny", "./l3ingress", "^TestFlowTableCachesDeniedDecision|TestPumpSkipsDeniedFlow$")
-	})
-	run("T7.flow.lifecycle-stats", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.flow.lifecycle-stats", "./l3ingress", "^TestFlowTableCachesDecisionAndStats|TestFlowTableCloseSnapshot|TestPumpUsesProvidedFlowTable$")
-	})
-	run("T7.flow.observe", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.flow.observe", "./l3ingress", "^TestFlowTableObserverReceivesLifecycleSnapshots|TestFlowTableRecordsPathSelectionAndMigrations$")
-	})
-	run("T7.selector.per-flow", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.selector.per-flow", "./l3ingress", "^TestFlowTableTracksIndependentSelectorFlows$")
-	})
-	run("T7.peer-egress-hook", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.peer-egress-hook", "./l3ingress", "^TestEgressRegistryDispatchesIdentity|TestEgressRegistryMachineReadableErrors$")
-	})
-	run("T7.tcp.peer-egress", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tcp.peer-egress", "./l3ingress", "^TestTCPFlowRelayDispatchesIdentityAndBridgesStream|TestTCPFlowRelayCloseFlowAllowsReopen$")
-	})
-	run("T7.udp.identity-smoke", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.udp.identity-smoke", "./l3ingress", "^TestUDPPayloadExtractsData|TestBuildUDPPacketRoundTripIPv4|TestBuildUDPPacketRoundTripIPv6|TestUDPFlowRelayDispatchesPayloadAndWritesReply|TestUDPFlowRelayCloseFlowAllowsReopen$")
-	})
-	run("T7.udp.rendr-relay", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.udp.rendr-relay", "./l3session", "^TestUDPRelayForwardsPayloadThroughRendrPacketSession$")
-	})
-	run("T7.udp.migration", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.udp.migration", "./l3session", "^TestUDPRelayPreservesFlowAcrossPacketMigration$")
-	})
-	run("T7.tcp.rendr-relay", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tcp.rendr-relay", "./l3session", "^TestTCPRelayBridgesEndpointThroughRendrStreamSession$")
-	})
-	run("T7.tcp.migration", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tcp.migration", "./l3session", "^TestTCPRelayPreservesFlowAcrossStreamMigration$")
-	})
-	run("T7.tcp.lifecycle-flags", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.tcp.lifecycle-flags", "./l3ingress", "^TestParseTCPCloseFlags|TestPumpClosesFlowTableOnTCPReset$")
-	})
-	run("T7.l3.parse-error-skip", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.l3.parse-error-skip", "./l3ingress", "^TestPumpSkipsParseErrors$")
-	})
-	run("T7.l3.fragment-boundary", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.l3.fragment-boundary", "./l3ingress", "^TestParseIPv4UDPMoreFragmentFirstFragment|TestParseRejectsIPv4NonInitialFragment$")
-	})
-	run("T7.l3.unsupported-protocol", 30*time.Second, func(c context.Context) report.Case {
-		return runGoTests(c, rendrRoot, "T7.l3.unsupported-protocol", "./l3ingress", "^TestParseRejectsUnsupportedProtocol|TestParseRejectsShortPacket$")
-	})
-}
-
-func caseMatches(filter, name string) bool {
-	return filter == "" || filter == name
+	for _, def := range defs {
+		def := def
+		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+			return runGoTests(c, rendrRoot, def.spec.ID, def.pkg, def.pattern)
+		})
+	}
 }
 
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {

@@ -1,4 +1,4 @@
-package tier6
+package tier8
 
 import (
 	"reflect"
@@ -8,16 +8,15 @@ import (
 )
 
 var orderedCaseIDs = []string{
-	"T6.graph.compat-mode",
-	"T6.peak.A-to-bulk-bond",
-	"T6.peak.nested-normal-to-C",
-	"T6.failover.hot-standby",
-	"T6.peak.composite-normal",
-	"T6.peak.bad-speed",
-	"T6.peak.stale-speed",
-	"T6.peak.probe-budget",
-	"T6.peak.slow-peak-revert",
-	"T6.peak.rx-peer-policy",
+	"T8.status.local-default",
+	"T8.status.peer-rendr",
+	"T8.primary.default-first-leaf",
+	"T8.primary.explicit-path",
+	"T8.primary.explicit-group-resolve",
+	"T8.primary.prefer-fallback",
+	"T8.primary.require-fails",
+	"T8.retry.forwarding-fixed",
+	"T8.retry.no-app-error",
 }
 
 func TestSpecsOrdered(t *testing.T) {
@@ -30,30 +29,30 @@ func TestSpecsOrdered(t *testing.T) {
 
 func TestSelectCaseDefs(t *testing.T) {
 	t.Run("exact", func(t *testing.T) {
-		defs, err := selectCaseDefs(Options{Case: orderedCaseIDs[3]})
+		defs, err := selectCaseDefs(Options{Case: orderedCaseIDs[2]})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := defIDs(defs); !reflect.DeepEqual(got, orderedCaseIDs[3:4]) {
-			t.Fatalf("selected IDs = %v, want %v", got, orderedCaseIDs[3:4])
+		if got := defIDs(defs); !reflect.DeepEqual(got, orderedCaseIDs[2:3]) {
+			t.Fatalf("selected IDs = %v, want %v", got, orderedCaseIDs[2:3])
 		}
 	})
 
 	t.Run("inclusive resume", func(t *testing.T) {
-		defs, err := selectCaseDefs(Options{FromCase: orderedCaseIDs[7]})
+		defs, err := selectCaseDefs(Options{FromCase: orderedCaseIDs[6]})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := defIDs(defs); !reflect.DeepEqual(got, orderedCaseIDs[7:]) {
-			t.Fatalf("selected IDs = %v, want %v", got, orderedCaseIDs[7:])
+		if got := defIDs(defs); !reflect.DeepEqual(got, orderedCaseIDs[6:]) {
+			t.Fatalf("selected IDs = %v, want %v", got, orderedCaseIDs[6:])
 		}
 	})
 
 	t.Run("missing", func(t *testing.T) {
-		if _, err := selectCaseDefs(Options{Case: "T6.missing"}); err == nil {
+		if _, err := selectCaseDefs(Options{Case: "T8.missing"}); err == nil {
 			t.Fatal("missing exact filter succeeded")
 		}
-		if _, err := selectCaseDefs(Options{FromCase: "T6.missing"}); err == nil {
+		if _, err := selectCaseDefs(Options{FromCase: "T8.missing"}); err == nil {
 			t.Fatal("missing resume filter succeeded")
 		}
 	})

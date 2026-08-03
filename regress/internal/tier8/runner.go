@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
 )
 
@@ -18,46 +19,64 @@ type Options struct {
 	FromCase string
 }
 
-func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
-	matched := false
-	run := func(name string, budget time.Duration, pattern string) {
-		if !caseMatches(opts.Case, opts.FromCase, name, matched) {
-			return
-		}
-		matched = true
-		runCase(ctx, suite, name, budget, func(c context.Context) report.Case {
-			return runGoTest(c, rendrRoot, name, pattern)
-		})
-	}
-	defer func() {
-		if (opts.Case != "" || opts.FromCase != "") && !matched {
-			suite.Add(report.Case{
-				Name:    "T8-case-filter",
-				Tier:    "T8",
-				Failure: fmt.Sprintf("no T8 case matched case=%q from-case=%q", opts.Case, opts.FromCase),
-			})
-		}
-	}()
-
-	run("T8.status.local-default", time.Minute, "^TestProbeLocalDefault$")
-	run("T8.status.peer-rendr", 2*time.Minute, "^TestDialerStatusPeerRendr$")
-	run("T8.primary.default-first-leaf", 2*time.Minute, "^TestDialerRootSelectorDialSmoke$")
-	run("T8.primary.explicit-path", time.Minute, "^TestDialerPrimaryExplicitPathReordersPlan$")
-	run("T8.primary.explicit-group-resolve", time.Minute, "^TestDialerPrimaryExplicitGroupResolvesLeaf$")
-	run("T8.primary.prefer-fallback", 2*time.Minute, "^TestDialerPrimaryPreferFallbackStatus$")
-	run("T8.primary.require-fails", 2*time.Minute, "^TestDialerPrimaryRequireFails$")
-	run("T8.retry.forwarding-fixed", 2*time.Minute, "^TestDialerOptionalPathRetryAttachesAfterForwardingFix$")
-	run("T8.retry.no-app-error", 2*time.Minute, "^TestDialerOptionalPathFailureDoesNotSurfaceToApp$")
+type caseDef struct {
+	spec    manifest.Spec
+	pattern string
 }
 
-func caseMatches(filter, fromCase, name string, alreadyStarted bool) bool {
-	if filter != "" {
-		return filter == name
+var caseDefs = []caseDef{
+	{manifest.RequiredWithBudget("T8.status.local-default", "T8", time.Minute), "^TestProbeLocalDefault$"},
+	{manifest.RequiredWithBudget("T8.status.peer-rendr", "T8", 2*time.Minute), "^TestDialerStatusPeerRendr$"},
+	{manifest.RequiredWithBudget("T8.primary.default-first-leaf", "T8", 2*time.Minute), "^TestDialerRootSelectorDialSmoke$"},
+	{manifest.RequiredWithBudget("T8.primary.explicit-path", "T8", time.Minute), "^TestDialerPrimaryExplicitPathReordersPlan$"},
+	{manifest.RequiredWithBudget("T8.primary.explicit-group-resolve", "T8", time.Minute), "^TestDialerPrimaryExplicitGroupResolvesLeaf$"},
+	{manifest.RequiredWithBudget("T8.primary.prefer-fallback", "T8", 2*time.Minute), "^TestDialerPrimaryPreferFallbackStatus$"},
+	{manifest.RequiredWithBudget("T8.primary.require-fails", "T8", 2*time.Minute), "^TestDialerPrimaryRequireFails$"},
+	{manifest.RequiredWithBudget("T8.retry.forwarding-fixed", "T8", 2*time.Minute), "^TestDialerOptionalPathRetryAttachesAfterForwardingFix$"},
+	{manifest.RequiredWithBudget("T8.retry.no-app-error", "T8", 2*time.Minute), "^TestDialerOptionalPathFailureDoesNotSurfaceToApp$"},
+}
+
+// Specs returns the ordered T8 case manifest.
+func Specs() []manifest.Spec {
+	specs := make([]manifest.Spec, len(caseDefs))
+	for i, def := range caseDefs {
+		specs[i] = def.spec
 	}
-	if fromCase == "" {
-		return true
+	return specs
+}
+
+func selectCaseDefs(opts Options) ([]caseDef, error) {
+	selected, err := manifest.Select(Specs(), opts.Case, opts.FromCase)
+	if err != nil {
+		return nil, err
 	}
-	return alreadyStarted || fromCase == name
+	byID := make(map[string]caseDef, len(caseDefs))
+	for _, def := range caseDefs {
+		byID[def.spec.ID] = def
+	}
+	defs := make([]caseDef, 0, len(selected))
+	for _, spec := range selected {
+		defs = append(defs, byID[spec.ID])
+	}
+	return defs, nil
+}
+
+func Run(ctx context.Context, suite *report.Suite, rendrRoot string, opts Options) {
+	defs, err := selectCaseDefs(opts)
+	if err != nil {
+		suite.Add(report.Case{
+			Name:    "T8-case-filter",
+			Tier:    "T8",
+			Failure: fmt.Sprintf("no T8 case matched case=%q from-case=%q", opts.Case, opts.FromCase),
+		})
+		return
+	}
+	for _, def := range defs {
+		def := def
+		runCase(ctx, suite, def.spec.ID, def.spec.Budget, func(c context.Context) report.Case {
+			return runGoTest(c, rendrRoot, def.spec.ID, def.pattern)
+		})
+	}
 }
 
 func runCase(ctx context.Context, suite *report.Suite, name string, budget time.Duration, fn func(context.Context) report.Case) {
@@ -95,7 +114,7 @@ func runGoTest(ctx context.Context, rendrRoot, name, pattern string) report.Case
 	if _, err := os.Stat(rendrRoot); err != nil {
 		return report.Case{Name: name, Tier: "T8", Failure: "bad rendr root: " + err.Error()}
 	}
-	cmd := exec.CommandContext(ctx, "/usr/local/go/bin/go", "test", ".", "-run", pattern, "-count=1")
+	cmd := exec.CommandContext(ctx, "go", "test", ".", "-run", pattern, "-count=1")
 	cmd.Dir = rendrRoot
 	cmd.Env = append(os.Environ(), "GOCACHE=/tmp/go-build-rendr-t8")
 	out, err := cmd.CombinedOutput()
