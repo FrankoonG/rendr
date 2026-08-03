@@ -27,6 +27,7 @@ type caseDef struct {
 	profile    chaos.Profile
 	run        func(context.Context) smoke.Result
 	skipReason func() string
+	preflight  func() error
 }
 
 var caseDefs = []caseDef{
@@ -129,7 +130,8 @@ var caseDefs = []caseDef{
 		},
 	},
 	{
-		spec: manifest.RequiredWithBudget("G3-T4", "T4", 8*time.Minute),
+		spec:      manifest.RequiredWithBudget("G3-T4", "T4", 8*time.Minute),
+		preflight: smoke.G3UDPBufferPreflight,
 		run: func(ctx context.Context) smoke.Result {
 			return smoke.RunG3(ctx, smoke.G3Opts{
 				Duration:     5 * time.Minute,
@@ -143,7 +145,7 @@ var caseDefs = []caseDef{
 		},
 		skipReason: func() string {
 			if runtime.GOOS != "linux" {
-				return "Linux only (100k pps QUIC DATAGRAM needs net.core.rmem_max=8MiB)"
+				return "Linux only (100k pps QUIC DATAGRAM needs effective 8MiB UDP socket buffers)"
 			}
 			return ""
 		},
@@ -210,6 +212,15 @@ func executeCase(ctx context.Context, def caseDef) report.Case {
 	if def.skipReason != nil {
 		if reason := def.skipReason(); reason != "" {
 			return report.Case{Name: def.spec.ID, Tier: def.spec.Tier, SkipReason: reason}
+		}
+	}
+	if def.preflight != nil {
+		if err := def.preflight(); err != nil {
+			return report.Case{
+				Name:          def.spec.ID,
+				Tier:          def.spec.Tier,
+				InvalidReason: "case preflight failed: " + err.Error(),
+			}
 		}
 	}
 	return runCase(ctx, def.spec.ID, def.spec.Budget, def.profile, def.run)

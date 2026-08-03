@@ -123,6 +123,26 @@ func TestSelectCaseDefs(t *testing.T) {
 	}
 }
 
+func TestExecuteCasePreflightFailureIsInvalid(t *testing.T) {
+	runCalled := false
+	def := caseDef{
+		spec:      manifest.RequiredWithBudget("preflight", "T4", time.Second),
+		preflight: func() error { return errors.New("effective socket buffer clamped") },
+		run: func(context.Context) smoke.Result {
+			runCalled = true
+			return smoke.Result{}
+		},
+	}
+	rc := executeCase(context.Background(), def)
+	if runCalled {
+		t.Fatal("case body ran after preflight failure")
+	}
+	if rc.Failure != "" || rc.SkipReason != "" ||
+		rc.InvalidReason != "case preflight failed: effective socket buffer clamped" {
+		t.Fatalf("case=%+v, want explicit preflight INVALID", rc)
+	}
+}
+
 func TestApplyCleanupResultFailsClosed(t *testing.T) {
 	tests := []struct {
 		name         string
