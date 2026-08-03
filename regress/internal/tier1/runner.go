@@ -52,6 +52,7 @@ var caseDefs = []caseDef{
 	// attempts. 4 retries (5 attempts total) brings the compound
 	// fail rate below ~1%.
 	{manifest.RequiredWithBudget("go-test", "T1", 5*time.Minute), goTest, "", 4},
+	{manifest.RequiredWithBudget("regress-unit", "T1", 3*time.Minute), regressUnit, "", 0},
 	{manifest.RequiredWithBudget("go-test-race", "T1", 6*time.Minute), goTestRace, "linux", 4},
 	{manifest.RequiredWithBudget("go-bench-smoke", "T1", 90*time.Second), goBenchSmoke, "linux", 0},
 	{manifest.Required("const-proto-version", "T1"), constProtoVersion, "", 0},
@@ -181,6 +182,40 @@ func goVet(ctx context.Context, root string) error {
 
 func goTest(ctx context.Context, root string) error {
 	return runGo(ctx, root, "test", "./...", "-count=1", "-timeout", "240s")
+}
+
+func regressUnit(ctx context.Context, root string) error {
+	regressRoot := filepath.Join(root, "regress")
+	cmd := exec.CommandContext(ctx, "go", "list", "./...")
+	cmd.Dir = regressRoot
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("go list regress packages: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	packages := filterRegressUnitPackages(strings.Fields(string(out)))
+	if len(packages) == 0 {
+		return errors.New("go list returned no regress unit packages")
+	}
+	args := []string{"test", "-count=1", "-timeout", "150s"}
+	args = append(args, packages...)
+	return runGo(ctx, regressRoot, args...)
+}
+
+func filterRegressUnitPackages(packages []string) []string {
+	out := make([]string, 0, len(packages))
+	for _, pkg := range packages {
+		switch {
+		case strings.Contains(pkg, "/internal/matrix"):
+			continue
+		case strings.HasSuffix(pkg, "/internal/smoke"):
+			continue
+		case strings.HasSuffix(pkg, "/internal/xrayglue"):
+			continue
+		default:
+			out = append(out, pkg)
+		}
+	}
+	return out
 }
 
 func goTestRace(ctx context.Context, root string) error {

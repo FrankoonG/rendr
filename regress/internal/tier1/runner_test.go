@@ -15,6 +15,7 @@ import (
 var orderedCaseIDs = []string{
 	"go-vet",
 	"go-test",
+	"regress-unit",
 	"go-test-race",
 	"go-bench-smoke",
 	"const-proto-version",
@@ -116,6 +117,21 @@ func TestRunCaseDefCleanFirstPass(t *testing.T) {
 	rc := runCaseDef(context.Background(), "", def)
 	if rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "" {
 		t.Fatalf("clean first pass = %+v", rc)
+	}
+}
+
+func TestFilterRegressUnitPackages(t *testing.T) {
+	input := []string{
+		"example/regress/cmd/regress",
+		"example/regress/internal/matrix",
+		"example/regress/internal/matrix/driver",
+		"example/regress/internal/smoke",
+		"example/regress/internal/xrayglue",
+		"example/regress/internal/report",
+	}
+	want := []string{"example/regress/cmd/regress", "example/regress/internal/report"}
+	if got := filterRegressUnitPackages(input); !reflect.DeepEqual(got, want) {
+		t.Fatalf("packages=%v want %v", got, want)
 	}
 }
 
