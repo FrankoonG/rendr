@@ -102,16 +102,43 @@ func RunWithOptions(ctx context.Context, suite *report.Suite, rendrRoot string, 
 		suite.Add(report.Case{Name: "T1-case-filter", Tier: "T1", Failure: err.Error()})
 		return
 	}
+	runCaseDefs(ctx, suite, rendrRoot, defs)
+}
+
+func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, defs []caseDef) {
+	failedCaseID := ""
 	for _, c := range defs {
-		if c.onlyOn != "" && c.onlyOn != runtime.GOOS {
-			suite.Add(report.Case{
-				Name:       c.spec.ID,
-				Tier:       "T1",
-				SkipReason: fmt.Sprintf("only runs on %s", c.onlyOn),
-			})
+		if failedCaseID != "" {
+			suite.Add(notRunCase(c.spec, failedCaseID))
 			continue
 		}
-		suite.Add(runCaseDef(ctx, rendrRoot, c))
+
+		var rc report.Case
+		if c.onlyOn != "" && c.onlyOn != runtime.GOOS {
+			rc = report.Case{
+				Name:       c.spec.ID,
+				Tier:       c.spec.Tier,
+				SkipReason: fmt.Sprintf("only runs on %s", c.onlyOn),
+			}
+		} else {
+			rc = runCaseDef(ctx, rendrRoot, c)
+		}
+		suite.Add(rc)
+		if mandatoryCaseFailed(c.spec, rc) {
+			failedCaseID = c.spec.ID
+		}
+	}
+}
+
+func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
+	return spec.Mandatory && (rc.Failure != "" || rc.InvalidReason != "" || rc.SkipReason != "")
+}
+
+func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
+	return report.Case{
+		Name:          spec.ID,
+		Tier:          spec.Tier,
+		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 
@@ -181,24 +208,12 @@ func goVet(ctx context.Context, root string) error {
 }
 
 func goTest(ctx context.Context, root string) error {
-	return runGo(ctx, root, "test", "./...", "-count=1", "-timeout", "240s")
+	return runTestContractSuite(ctx, root, rootTestContracts(runtime.GOOS, false), false, 240*time.Second)
 }
 
 func regressUnit(ctx context.Context, root string) error {
 	regressRoot := filepath.Join(root, "regress")
-	cmd := exec.CommandContext(ctx, "go", "list", "./...")
-	cmd.Dir = regressRoot
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("go list regress packages: %v\n%s", err, strings.TrimSpace(string(out)))
-	}
-	packages := filterRegressUnitPackages(strings.Fields(string(out)))
-	if len(packages) == 0 {
-		return errors.New("go list returned no regress unit packages")
-	}
-	args := []string{"test", "-count=1", "-timeout", "150s"}
-	args = append(args, packages...)
-	return runGo(ctx, regressRoot, args...)
+	return runTestContractSuite(ctx, regressRoot, regressUnitContracts(runtime.GOOS), false, 150*time.Second)
 }
 
 func filterRegressUnitPackages(packages []string) []string {
@@ -206,8 +221,6 @@ func filterRegressUnitPackages(packages []string) []string {
 	for _, pkg := range packages {
 		switch {
 		case strings.Contains(pkg, "/internal/matrix"):
-			continue
-		case strings.HasSuffix(pkg, "/internal/smoke"):
 			continue
 		case strings.HasSuffix(pkg, "/internal/xrayglue"):
 			continue
@@ -219,11 +232,11 @@ func filterRegressUnitPackages(packages []string) []string {
 }
 
 func goTestRace(ctx context.Context, root string) error {
-	return runGo(ctx, root, "test", "./...", "-count=1", "-race", "-timeout", "360s")
+	return runTestContractSuite(ctx, root, rootTestContracts(runtime.GOOS, true), true, 360*time.Second)
 }
 
 func goBenchSmoke(ctx context.Context, root string) error {
-	return runGo(ctx, root, "test", "-run=^$", "-bench=.", "-benchtime=1x", "-timeout", "60s", "./...")
+	return runBenchmarkContract(ctx, root)
 }
 
 // Const grep cases — each reads one file and asserts an exact regex

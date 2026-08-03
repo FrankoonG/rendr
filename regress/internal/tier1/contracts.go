@@ -1,0 +1,475 @@
+package tier1
+
+import "fmt"
+
+const (
+	rendrModule   = "github.com/FrankoonG/rendr"
+	regressModule = rendrModule + "/regress"
+)
+
+type packageContract struct {
+	ImportPath string
+	Argument   string
+	Inventory  []string
+	RunTests   []string
+	Excluded   bool
+}
+
+func testPackage(importPath, argument string, tests ...string) packageContract {
+	return packageContract{ImportPath: importPath, Argument: argument, Inventory: tests}
+}
+
+func excludedPackage(importPath, argument string) packageContract {
+	return packageContract{ImportPath: importPath, Argument: argument, Excluded: true}
+}
+
+func rootTestContracts(goos string, race bool) []packageContract {
+	contracts := []packageContract{
+		testPackage(rendrModule, ".",
+			"TestDialerAdvertisesL3IdentityCapability",
+			"TestDialPacketAdvertisesL3IdentityAndPacketMode",
+			"TestM9X5StreamPathFactoryRoundTrip",
+			"TestM9X5StreamFactoryFallback",
+			"TestM9X5AddStreamFactoryValidation",
+			"TestM9X5PacketPathFactoryRoundTrip",
+			"TestM9X5AddPacketFactoryValidation",
+			"TestTCPListenerFailKeepsAcceptChannelOpen",
+			"TestUDPFlowListenerFailKeepsPacketAcceptChannelOpen",
+			"TestSetReadDeadlineTimesOut",
+			"TestPathInfoLastRecvAt",
+			"TestDialerCustomLimitsApplied",
+			"TestM2QUICDatagramPacketRoundTrip",
+			"TestSentinelErrorsAreMatchable",
+			"TestSetReadDeadlinePacketMode",
+			"TestSetReadDeadlinePacketModeUpdatesBlockedRead",
+			"TestModeConstants",
+			"TestM1DialAcceptRoundTrip",
+			"TestGVisorPacketCarrierDialAcceptRoundTrip",
+			"TestM1LargePayload",
+			"TestM1FlowIDsAreUnique",
+			"TestErrorReExports",
+			"TestM1PlannedMigration",
+			"TestM1MigrationBudgetExpires",
+			"TestM1FailoverToSurvivingPath",
+			"TestM1CleanCloseEOF",
+			"TestM1G1Sketch",
+			"TestM1G2Sketch",
+			"TestM7RaceWritesAllPaths",
+			"TestM8BondPathDeathContinuesOnSurvivor",
+			"TestAdminConnStatsSnapshot",
+			"TestAdminConnStateAndHWM",
+			"TestPathInfoCountersExposed",
+			"TestG5PathRecoveryViaAddPath",
+			"TestAdminConnRemovePath",
+			"TestAdminConnRemoveActivePathFailovers",
+			"TestAdminConnOnMigrate",
+			"TestAdminConnMigrationCount",
+			"TestM7DedupWindowBoundedOnLoopback",
+			"TestM8BondPathPinning",
+			"TestM8BondRoundRobinAcrossPaths",
+			"TestM8BondHonorsPathWeights",
+			"TestM8BondSkipsStuckPath",
+			"TestM5UDPFlowPlannedMigration",
+			"TestM5UDPFlowFailoverToSurvivingPath",
+			"TestM5UDPFlowDialAcceptRoundTrip",
+			"TestM5PacketBoundariesPreserved",
+			"TestM5PacketRejectOversize",
+			"TestM5PacketSurvivesPlannedMigration",
+			"TestM5PacketStreamUnderMigration",
+			"TestM5PacketRaceModeDuplicates",
+			"TestM6PathRTTProbeRecords",
+			"TestM6PrimeAutoMigrateOnQualityChange",
+			"TestM2G1SketchQUIC",
+			"TestM2QUICRoundTrip",
+			"TestM2MixedTCPQUICMigration",
+			"TestM2TCPPathDeathFailsOverToUDPBackedStream",
+			"TestListenMultiValidation",
+			"TestM2QUICDeathTriggersMigration",
+			"TestM1ZombieAfterTwoNoPayloadMigrations",
+			"TestProbeLocalDefault",
+			"TestDialerOptionalPathRetryAttachesAfterForwardingFix",
+			"TestDialerOptionalPathFailureDoesNotSurfaceToApp",
+			"TestLegacyRootTargetCompilesModes",
+			"TestSelectorPeakTransferOrdersPeakTargetsLast",
+			"TestTargetConstructorsExposeGroupKinds",
+			"TestDialerCompileDialPlanUsesRoot",
+			"TestDialerPrimaryExplicitPathReordersPlan",
+			"TestDialerPrimaryExplicitGroupResolvesLeaf",
+			"TestDialerStatusPeerRendr",
+			"TestDialerPrimaryPreferFallbackStatus",
+			"TestDialerPrimaryRequireFails",
+			"TestDialerRootSelectorDialSmoke",
+			"TestSelectorPeakTransferRuntimePromotesToBond",
+			"TestSelectorPeakTransferNormalSelectorUsesQuality",
+			"TestSelectorHotStandbyFailover",
+			"TestSelectorPeakTransferCompositeNormalDeathStaysNormal",
+			"TestSelectorPeakTransferBadSpeedQualityGate",
+			"TestSelectorPeakTransferStaleSpeedEvidence",
+			"TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate",
+			"TestSelectorPeakTransferSlowPeakRevertsAndSuppresses",
+			"TestSelectorPeakTransferRxPromotesPeerSenderOnly",
+			"ExampleDialer_Dial",
+			"ExampleAdminConn",
+			"ExampleDialer_DialPacket",
+		),
+		testPackage(rendrModule+"/examples/socks5", "./examples/socks5", "TestSOCKS5OverRendr"),
+		testPackage(rendrModule+"/internal/engine", "./internal/engine",
+			"TestSendByeDoesNotBlockBehindSendMu",
+			"TestPeerAckClampedToSentSeq",
+			"TestPeerAckRefreshesZombieCounter",
+			"TestBondRedistributesDeadPathHistory",
+			"TestBondRedistributionSkipsAckedHistory",
+			"TestPrimeRedistributesUnackedFrameOnPathDeath",
+			"TestExplicitMigrateReplaysUnackedFrames",
+			"TestPacketRecvWindowCoversG3T4Duration",
+			"TestPacketMarksDoNotTripRecvQueueOverflow",
+			"TestRecvQueueOverflowClosesConnection",
+			"TestDefaultLimits",
+			"TestLimitsClampUpper",
+			"TestLimitsClampLowerAllowed",
+			"TestLimitsClampZeroFillsDefaults",
+		),
+		testPackage(rendrModule+"/l3ingress", "./l3ingress",
+			"TestEgressRegistryDispatchesIdentity",
+			"TestEgressRegistryMachineReadableErrors",
+			"TestFlowTableCachesDecisionAndStats",
+			"TestFlowTableCloseSnapshot",
+			"TestFlowTableCachesDeniedDecision",
+			"TestFlowTableObserverReceivesLifecycleSnapshots",
+			"TestFlowTableRecordsPathSelectionAndMigrations",
+			"TestFlowTableTracksIndependentSelectorFlows",
+			"TestParseIPv4TCPIdentity",
+			"TestParseTCPCloseFlags",
+			"TestParseIPv4UDPMoreFragmentFirstFragment",
+			"TestParseRejectsIPv4NonInitialFragment",
+			"TestParseIPv6UDPIdentity",
+			"TestParseRejectsUnsupportedProtocol",
+			"TestParseRejectsShortPacket",
+			"TestPumpRoutesParsedPackets",
+			"TestPumpSkipsParseErrors",
+			"TestPumpCachesRouterDecisionPerFlow",
+			"TestPumpUsesProvidedFlowTable",
+			"TestPumpClosesFlowTableOnTCPReset",
+			"TestPumpSkipsDeniedFlow",
+			"TestPumpRequiresDeviceAndHandler",
+			"TestBuildSessionRequestMapsTCPAndUDP",
+			"TestBuildSessionRequestRejectsInvalidDecisions",
+			"TestBuildSessionRequestRejectsIdentityMismatch",
+			"TestTCPFlowRelayDispatchesIdentityAndBridgesStream",
+			"TestTCPFlowRelayCloseFlowAllowsReopen",
+			"TestUDPPayloadExtractsData",
+			"TestBuildUDPPacketRoundTripIPv4",
+			"TestAppendUDPPacketReusesBuffer",
+			"TestBuildUDPPacketRoundTripIPv6",
+			"TestUDPFlowRelayDispatchesPayloadAndWritesReply",
+			"TestUDPFlowRelayRequiresDecision",
+			"TestUDPFlowRelayCloseFlowAllowsReopen",
+			"TestIdentityWireRoundTripIPv4",
+			"TestIdentityWireRoundTripIPv6",
+			"TestIdentityWireRejectsMixedFamilies",
+			"TestRequirePeerL3Identity",
+			"TestRequirePeerEgress",
+		),
+		testPackage(rendrModule+"/l3session", "./l3session",
+			"TestManagerStartsOneSessionPerFlow",
+			"TestManagerPropagatesPlanningErrors",
+			"TestManagerClosesSessionOnFlowClose",
+			"TestManagerRecordsSessionPathSelectionAndMigrations",
+			"TestStarterStreamSessionPreservesL3Capability",
+			"TestStarterPacketSessionPreservesL3Capability",
+			"TestStarterRejectsUnsupportedRequest",
+			"TestTCPRelayBridgesEndpointThroughRendrStreamSession",
+			"TestTCPRelayPreservesFlowAcrossStreamMigration",
+			"TestUDPRelayForwardsPayloadThroughRendrPacketSession",
+			"TestUDPRelayPreservesFlowAcrossPacketMigration",
+			"TestUDPPeerRelayDispatchesIdentityAndBridgesReplies",
+			"TestUDPPeerRelayRejectsMetadataChange",
+			"TestUDPEnvelopeRoundTrip",
+			"TestUDPEnvelopeRejectsMalformedAndChangingMetadata",
+		),
+		testPackage(rendrModule+"/mode", "./mode"),
+		testPackage(rendrModule+"/proto", "./proto",
+			"TestCtrlCodeFromFlags", "TestHelloRoundTrip", "TestMigrateNotifyRoundTrip",
+			"TestPathQualityRoundTrip", "TestHeartbeatRoundTrip", "TestByeRoundTrip",
+			"TestBridgeTagRoundTrip", "TestHelloAckRoundTrip", "TestBridgeAckRoundTrip",
+			"TestHelloPathNameRoundTrip", "TestBridgeTagPathNameRoundTrip", "TestPolicyRequestRoundTrip",
+			"TestRejectShortPayloads", "TestCtrlCodeStability", "TestCapsBitStability",
+			"TestProbeWireStability", "TestAckPayloadRoundTrip", "TestAckPayloadWireStability",
+			"TestBridgeTagWireStability", "TestMigrateNotifyWireStability", "TestPathQualityWireStability",
+			"TestHeartbeatWireStability", "TestByeWireStability", "TestHelloWireStability",
+			"TestHeaderRoundTrip", "TestHeaderRejectsBadVersion", "TestHeaderRejectsBadFlags",
+			"TestHeaderRejectsOversizedSeq", "TestHeaderRejectsShortBuf", "TestVersionConstants",
+			"TestHeaderWireStability", "TestUDPFlowHeaderRoundTrip", "TestUDPFlowHeaderRejectsShort",
+			"TestUDPFlowFrameRoundTrip", "TestUDPFlowWireStability",
+		),
+		testPackage(rendrModule+"/transport", "./transport",
+			"TestClassifyEOFQuiesced", "TestClassifyEOFMidStream", "TestClassifyUnexpectedEOF",
+			"TestClassifyByeOverridesError", "TestClassifyNetTimeout", "TestClassifyECONNRESET",
+			"TestClassifyNilWithBye", "TestClassifyNilWithoutBye", "TestClassifyIdleTimeoutString",
+			"TestClassifyHandshakeError", "TestClassifyNetErrNonTimeout", "TestClassifyTimeoutBoundary",
+		),
+		testPackage(rendrModule+"/transport/gvisor", "./transport/gvisor",
+			"TestGVisorTransportRoundTrip", "TestGVisorPacketCarrierRoundTrip", "TestGVisorAcceptTimeoutDoesNotPoisonListener",
+		),
+		testPackage(rendrModule+"/transport/quic", "./transport/quic",
+			"TestStreamSwallowTransportDeathAsNetErrClosed", "TestStreamSwallowByeEOF",
+			"TestStreamDeadWritePrecheckReturnsNetErrClosed", "TestDatagramDeadPrechecksReturnNetErrClosed",
+			"TestQUICRoundTrip", "TestQUICDatagramRoundTrip", "TestQUICDatagramOversizeRejected",
+			"TestQUICOversizeRejected", "TestQUICOptsApplied",
+		),
+		testPackage(rendrModule+"/transport/tcp", "./transport/tcp",
+			"TestTCPRoundTrip", "TestTCPRejectsOversize", "TestTCPRejectsEmpty",
+			"TestTCPOnDeathOnRemoteClose", "TestTCPOnDeathAfterBye", "TestTCPReadReturnsErrClosedNotRaw",
+			"TestTCPLengthPrefixWireStability",
+		),
+		testPackage(rendrModule+"/transport/tcprepair", "./transport/tcprepair", "TestParseLinuxKernelRelease"),
+		testPackage(rendrModule+"/transport/udpflow", "./transport/udpflow",
+			"TestUDPFlowDialAndWrite", "TestUDPFlowDialReadRoundTrip", "TestUDPFlowOversizeRejected",
+			"TestUDPFlowListenerRoundTrip", "TestUDPFlowMigrationSameFlowFromNewTuple", "TestUDPFlowRandomFlowID",
+		),
+		testPackage(rendrModule+"/tun", "./tun",
+			"TestConfigNormalizeAndValidate", "TestConfigValidateRejectsSmallMTU", "TestProbeReturnsMachineReadableCapability",
+		),
+		testPackage(rendrModule+"/udprelay", "./udprelay",
+			"TestRelayRoundTripOverMigratedPacketConn", "TestDialAndServeRoundTrip", "TestServerAcceptsMultipleClients",
+		),
+		testPackage(rendrModule+"/virtualif", "./virtualif", "TestErrorReasonIsInspectable"),
+		testPackage(rendrModule+"/xray", "./xray",
+			"TestXrayInstanceAsStreamFactoryFreedomOutbound", "TestParseTCPDestination",
+			"TestXrayBalancerAsStreamFactories", "TestRegisterRendrTransportDialerWithXrayInternetDial",
+			"TestRegisterRendrTransportListenerWithXrayInternetListen", "TestJoinXrayHostPortIPv6",
+			"TestM9ConfigValidate", "TestM9DialerRoundTrip", "TestM9DialerPacketRoundTrip",
+			"TestM9XrayQUICDatagramRoundTrip", "TestM9XrayListenerFlowIDs", "TestM9XrayMixedTCPQUICListener",
+			"TestM9MigrationUnderLoadThroughXrayWrap", "TestM9AdminSurfaceThroughXrayWrap",
+			"ExampleDialer", "ExampleDialer_admin", "ExampleListener_FlowIDs",
+		),
+	}
+
+	root := &contracts[0]
+	if goos == "linux" {
+		root.Inventory = append(root.Inventory, "TestTCPRepairAdminPathRebuildSameTuple")
+		tcpRepair := contractByImportPath(contracts, rendrModule+"/transport/tcprepair")
+		tcpRepair.Inventory = append(tcpRepair.Inventory,
+			"TestInstallTCPDropBuildsSymmetricRules",
+			"TestInstallTCPDropRollsBackOnFailure",
+			"TestInstallTCPDropRejectsNilAddr",
+			"TestSnapshotRestoreServerSide",
+			"TestTransportRoundTrip",
+			"TestTransportExposesTCPConn",
+			"TestAvailableExpectation",
+		)
+		tunContract := contractByImportPath(contracts, rendrModule+"/tun")
+		tunContract.Inventory = append(tunContract.Inventory,
+			"TestOpenCreatesEphemeralDeviceWhenAvailable",
+			"TestDeviceReadsKernelRoutedIPv4Packet",
+		)
+	}
+
+	if goos == "windows" {
+		root.RunTests = withoutTests(root.Inventory, "TestM1CleanCloseEOF")
+	}
+	if goos == "linux" {
+		root.RunTests = withoutTests(root.Inventory, "TestTCPRepairAdminPathRebuildSameTuple")
+		tcpRepair := contractByImportPath(contracts, rendrModule+"/transport/tcprepair")
+		tcpRepair.RunTests = withoutTests(tcpRepair.Inventory, "TestAvailableExpectation")
+		if race {
+			root.RunTests = withoutTests(root.RunTests, "TestTCPRepairAdminPathRebuildSameTuple")
+		}
+	}
+	return contracts
+}
+
+func regressUnitContracts(goos string) []packageContract {
+	contracts := []packageContract{
+		testPackage(regressModule+"/cmd/capprobe", "./cmd/capprobe"),
+		testPackage(regressModule+"/cmd/pathbench", "./cmd/pathbench"),
+		testPackage(regressModule+"/cmd/regress", "./cmd/regress",
+			"TestPrepareCommandNormalScopes", "TestPrepareCommandRejectsConflictsAndOutOfScopeFilters",
+			"TestEveryTierAdapterForwardsBothFilters", "TestPartialPhaseOneCannotMintGreenGate",
+			"TestBuildPhase1StateUsesExactRendrRoot", "TestUpdateInvocationRevisionRejectsConcurrentChanges",
+			"TestBeginInvocationInvalidatesStaleFixedPassReports",
+			"TestBeginInvocationRemovesStalePassBeforeWritingReplacement",
+			"TestInvocationScopeAndManifestDigestSeparateFullFromExact",
+			"TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen",
+			"TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed",
+			"TestExecuteNormalRevisionDriftFailsAndPersistsEvidence",
+			"TestWriteKnownPhase1GateRejectsMissingIdentity", "TestTUNCatalogMakesCompatibilitySelectorsExplicit",
+			"TestTUNCatalogMismatchFailsClosed", "TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment",
+			"TestScopedListUsesExecutionPlan", "TestSpecsForPlanSupportsSyntheticRegistries",
+			"TestReconcileReportRowsFailsClosed", "TestTUNRunOrderResolvesExactUniqueSpecs",
+			"TestTunFullUnimplementedCaseFails",
+		),
+		testPackage(regressModule+"/internal/catalog", "./internal/catalog",
+			"TestCatalogExactOrderAndCount", "TestCatalogIDsAreGloballyUnique", "TestLookupAndByTierPreserveOwnership",
+			"TestCatalogAPIsDoNotExposeMutableAliases", "TestValidateSourcesRejectsInvalidCatalogs",
+		),
+		testPackage(regressModule+"/internal/chaos", "./internal/chaos"),
+		testPackage(regressModule+"/internal/gate", "./internal/gate",
+			"TestCheckPhase2RejectsMissingRevisionIdentity", "TestCurrentRevisionChangesWithUntrackedContent",
+			"TestCurrentRevisionChangesWithTrackedContent", "TestWriteAtomicallyReplacesState",
+		),
+		testPackage(regressModule+"/internal/gotestjson", "./internal/gotestjson",
+			"TestBuildArgs", "TestExecutorReturnsOrderedSyntheticResults",
+			"TestExecutorClassifiesNonzeroExitByRepresentedFailure", "TestExecutorRejectsMalformedAndTruncatedCapture",
+			"TestExecutorCancellationIsBounded", "TestExecutorRejectsInvalidRequestWithoutStarting",
+			"TestExecutorHelperProcess", "TestParseReturnsExpectationOrderAndDeterministicDetails",
+			"TestParseFailClosedConditions", "TestParseAllowsExplicitlyOptionalSkip",
+			"TestParseAcceptsCompleteFinalObjectWithoutNewline", "TestParseRejectsDuplicateAndCrossPackageSequences",
+			"TestParseBoundsRetainedOutputWithoutChangingOutcome", "TestParseBoundsEncodedEventSize",
+			"TestParsePropagatesReaderFailure", "TestParseRejectsInvalidConfiguration",
+			"TestValidationErrorCopiesIssues", "TestExecutorRunsGoThroughCommandPrefix",
+			"TestExecutorRejectsEmptyCommandPrefixEntry",
+		),
+		testPackage(regressModule+"/internal/manifest", "./internal/manifest",
+			"TestSelectExactAndResume", "TestSelectRejectsAmbiguousOrMissingFilters", "TestValidateRejectsDuplicateIDs",
+		),
+		excludedPackage(regressModule+"/internal/matrix", "./internal/matrix"),
+		excludedPackage(regressModule+"/internal/matrix/driver", "./internal/matrix/driver"),
+		testPackage(regressModule+"/internal/report", "./internal/report",
+			"TestSuiteFailureSemantics", "TestMandatorySkipAndInvalidAreJUnitFailures",
+			"TestEvidenceIsDeterministicInJUnitAndMarkdown", "TestIncompleteGreenReportIsPartial",
+			"TestInvocationIdentityIsRecordedInJUnitAndMarkdown", "TestRunFailureIsAStandardJUnitFailure",
+			"TestCompleteReportWithoutInvocationIdentityFailsClosed",
+			"TestAtomicWriteReplacesExistingFile",
+		),
+		testPackage(regressModule+"/internal/runplan", "./internal/runplan",
+			"TestBuildScopes", "TestBuildExactCaseFindsOwningTier", "TestBuildResumeCrossesTierBoundaries",
+			"TestBuildResumeWithinTier", "TestBuildPhaseOnePartialDoesNotMintGate",
+			"TestBuildFromFirstCaseKeepsCompletePhaseOne", "TestBuildRejectsInvalidOrOutOfScopeRequests",
+		),
+		testPackage(regressModule+"/internal/smoke", "./internal/smoke",
+			"TestRunG1GVisor", "TestRunG1GVisorPacketCarrier",
+			"TestValidateRequestedMigrations", "TestG1OptsMigrationDefaultAndDisable",
+			"TestFillG1PatternIsPositionStableAndNotChunkPeriodic", "TestVerifyNoTrailingPayload",
+			"TestValidateG2EvidenceRejectsPartialMigrationStimulus", "TestValidateG2EvidenceRaceDuplicateSemantics",
+			"TestG2OptsMigrationDefaultAndDisable", "TestG3OptsStrictLossAndMigrationDisable",
+			"TestValidateG3MeasurementsRejectsFalseGreenEvidence",
+			"TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget",
+			"TestValidateG4EvidenceNegativeControls", "TestValidateG4EvidenceAllowsMeasuredSubMillisecondFailover",
+			"TestValidateG5PayloadRejectsMismatch", "TestValidateRecoveredPathProgressNegativeControl",
+			"TestRunHysteriaRelay", "TestTCPRepairUnavailableFallsBackToGVisor",
+			"TestRunUDPRelayServerMode", "TestRunUDPRelayPortHop", "TestMigrationPoints", "TestRunWireGuardRelay",
+		),
+		testPackage(regressModule+"/internal/tier1", "./internal/tier1",
+			"TestSpecsOrder", "TestSelectCaseDefsExact", "TestSelectCaseDefsInclusiveResume",
+			"TestRunWithOptionsMissingFilter", "TestRunCaseDefPreservesRecoveredFailure",
+			"TestRunCaseDefUsesOneBudgetAcrossRetries", "TestRunCaseDefCleanFirstPass",
+			"TestRunCaseDefsFailFastKeepsManifestRows", "TestFilterRegressUnitPackages",
+			"TestContractsHaveDeterministicNonzeroCoverage", "TestRegressUnitRunsOnlyFastSmokeOracles",
+			"TestValidateTestInventoryRejectsNonexistentAndRenamedTests",
+			"TestExpectedTestSkipIsNotPass",
+			"TestValidateBenchmarkJSONAcceptsExpectedResults",
+			"TestValidateBenchmarkJSONRejectsMissingAndZeroResults",
+		),
+		testPackage(regressModule+"/internal/tier2", "./internal/tier2",
+			"TestSpecsOrder", "TestSpecsHaveBoundedBudgets", "TestCriticalSmokeMigrationRequests",
+			"TestSelectCaseDefsExact", "TestSelectCaseDefsInclusiveResume", "TestRunWithOptionsMissingFilter",
+			"TestAddRunPreservesSmokeEvidence", "TestAddRunPreservesInvalidSmokeOutcome", "TestAddRunEnforcesBudget",
+			"TestRunSelectedCasesStopsAfterMandatoryOutcome",
+		),
+		testPackage(regressModule+"/internal/tier3", "./internal/tier3",
+			"TestSpecsFreezeCurrentMatrix", "TestSelectSpecs", "TestExactTestPatternIsAnchoredAndQuoted",
+			"TestFilteredRunPatternMatchesOnlySelection", "TestRunCaseDefsFailFastKeepsManifestRows",
+			"TestGoTestReportCasesUseDefinitionOrder", "TestGoTestReportCasesFailClosed",
+			"TestGoTestReportDiagnosticIsBounded",
+		),
+		testPackage(regressModule+"/internal/tier4", "./internal/tier4",
+			"TestRunReportsSelectionFailures", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestApplyCleanupResultFailsClosed", "TestEvidenceFromDetailPreservesFacts",
+			"TestRunSelectedCasesStopsAfterMandatoryOutcome", "TestCleanupCompletesBeforeFailFastDecision",
+		),
+		testPackage(regressModule+"/internal/tier5", "./internal/tier5",
+			"TestUnprivilegedProbeRequestsAreExactAndMandatory", "TestT5JSONContractRejectsZeroAndSkippedTests",
+			"TestGoTestReportCaseFailsClosed", "TestGoTestReportCaseRecordsPassEvidence",
+			"TestGoTestReportDiagnosticIsBounded", "TestRunReportsSelectionFailures",
+			"TestAddLinuxOnlySkipPreservesSelectedCases", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestSmokeReportCasePreservesInvalidAndEvidence", "TestRunSelectedCasesStopsAfterMandatoryOutcome",
+		),
+		testPackage(regressModule+"/internal/tier6", "./internal/tier6",
+			"TestCaseDefinitionsUseExactExpectedTests", "TestGoTestReportCaseFailsClosed",
+			"TestGoTestReportDiagnosticIsBounded", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestRunCaseDefsFailFastKeepsManifestRows",
+		),
+		testPackage(regressModule+"/internal/tier7", "./internal/tier7",
+			"TestCaseDefinitionsUseExactExpectedTests", "TestGoTestReportCaseFailsClosed",
+			"TestGoTestReportDiagnosticIsBounded", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestRunCaseDefsFailFastKeepsManifestRows",
+		),
+		testPackage(regressModule+"/internal/tier8", "./internal/tier8",
+			"TestCaseDefinitionsUseExactExpectedTests", "TestGoTestReportCaseFailsClosed",
+			"TestSpecsOrdered", "TestSelectCaseDefs", "TestRunCaseDefsFailFastKeepsManifestRows",
+		),
+		testPackage(regressModule+"/internal/tunfull", "./internal/tunfull",
+			"TestSpecsOrderedAndBudgeted", "TestSelectCaseDefs", "TestRunReportsSelectionFailuresWithoutExecutingCases",
+			"TestRunCaseDefsUsesDeterministicManifestOrder", "TestRunCaseDefsStopsAfterMandatoryOutcome",
+			"TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce", "TestRunManifestCaseEnforcesBudget",
+			"TestRunManifestCaseFailsClosedOnWrongIdentity", "TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember",
+			"TestUnimplementedCaseFails", "TestApplyT4CleanupResultFailsClosed",
+		),
+		excludedPackage(regressModule+"/internal/xrayglue", "./internal/xrayglue"),
+	}
+
+	if goos == "linux" {
+		chaos := contractByImportPath(contracts, regressModule+"/internal/chaos")
+		chaos.Inventory = []string{"TestApplyAndCleanup", "TestApplyShapesBandwidth"}
+	}
+	smoke := contractByImportPath(contracts, regressModule+"/internal/smoke")
+	smoke.RunTests = []string{
+		"TestValidateRequestedMigrations",
+		"TestG1OptsMigrationDefaultAndDisable",
+		"TestFillG1PatternIsPositionStableAndNotChunkPeriodic",
+		"TestVerifyNoTrailingPayload",
+		"TestValidateG2EvidenceRejectsPartialMigrationStimulus",
+		"TestValidateG2EvidenceRaceDuplicateSemantics",
+		"TestG2OptsMigrationDefaultAndDisable",
+		"TestG3OptsStrictLossAndMigrationDisable",
+		"TestValidateG3MeasurementsRejectsFalseGreenEvidence",
+		"TestValidateG3MeasurementsHonorsExplicitSmokeLossBudget",
+		"TestValidateG4EvidenceNegativeControls",
+		"TestValidateG4EvidenceAllowsMeasuredSubMillisecondFailover",
+		"TestValidateG5PayloadRejectsMismatch",
+		"TestValidateRecoveredPathProgressNegativeControl",
+	}
+	return contracts
+}
+
+func contractByImportPath(contracts []packageContract, importPath string) *packageContract {
+	for i := range contracts {
+		if contracts[i].ImportPath == importPath {
+			return &contracts[i]
+		}
+	}
+	panic(fmt.Sprintf("tier1 contract %q not found", importPath))
+}
+
+func withoutTests(tests []string, omitted ...string) []string {
+	remove := make(map[string]bool, len(omitted))
+	for _, name := range omitted {
+		remove[name] = true
+	}
+	out := make([]string, 0, len(tests))
+	for _, name := range tests {
+		if !remove[name] {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func testsToRun(contract packageContract) []string {
+	if contract.RunTests != nil {
+		return contract.RunTests
+	}
+	return contract.Inventory
+}
+
+type benchmarkExpectation struct {
+	Name       string
+	Iterations int64
+	Metrics    []string
+}
+
+var benchmarkContract = []benchmarkExpectation{
+	{Name: "BenchmarkStreamThroughputTCP", Iterations: 1, Metrics: []string{"ns/op", "MB/s"}},
+	{Name: "BenchmarkStreamThroughputTCPWithMigration", Iterations: 1, Metrics: []string{"ns/op", "MB/s"}},
+}

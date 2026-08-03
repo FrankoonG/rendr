@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,91 @@ func TestRunCaseDefCleanFirstPass(t *testing.T) {
 	}
 }
 
+func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
+	tests := []struct {
+		name       string
+		first      caseDef
+		assertStop func(*testing.T, report.Case)
+	}{
+		{
+			name: "failure",
+			first: caseDef{
+				spec: manifest.Required("first", "T1"),
+				fn:   func(context.Context, string) error { return errors.New("boom") },
+			},
+			assertStop: func(t *testing.T, rc report.Case) {
+				if !strings.Contains(rc.Failure, "boom") {
+					t.Fatalf("failure row = %+v", rc)
+				}
+			},
+		},
+		{
+			name: "invalid retry recovery",
+			first: func() caseDef {
+				attempt := 0
+				return caseDef{
+					spec:    manifest.Required("first", "T1"),
+					retries: 1,
+					fn: func(context.Context, string) error {
+						attempt++
+						if attempt == 1 {
+							return errors.New("flaky")
+						}
+						return nil
+					},
+				}
+			}(),
+			assertStop: func(t *testing.T, rc report.Case) {
+				if !strings.Contains(rc.InvalidReason, "flaky") {
+					t.Fatalf("invalid row = %+v", rc)
+				}
+			},
+		},
+		{
+			name: "mandatory skip",
+			first: caseDef{
+				spec:   manifest.Required("first", "T1"),
+				onlyOn: "not-" + runtime.GOOS,
+				fn: func(context.Context, string) error {
+					t.Fatal("skipped case executor was invoked")
+					return nil
+				},
+			},
+			assertStop: func(t *testing.T, rc report.Case) {
+				if rc.SkipReason == "" {
+					t.Fatalf("skip row = %+v", rc)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			laterCalls := 0
+			defs := []caseDef{
+				tc.first,
+				{spec: manifest.Required("second", "T1"), fn: func(context.Context, string) error { laterCalls++; return nil }},
+				{spec: manifest.Required("third", "T1"), fn: func(context.Context, string) error { laterCalls++; return nil }},
+			}
+			suite := report.New()
+			runCaseDefs(context.Background(), suite, "", defs)
+
+			if laterCalls != 0 {
+				t.Fatalf("later executor calls = %d, want 0", laterCalls)
+			}
+			if got := reportCaseNames(suite.Cases); !reflect.DeepEqual(got, []string{"first", "second", "third"}) {
+				t.Fatalf("report rows = %v", got)
+			}
+			tc.assertStop(t, suite.Cases[0])
+			for _, rc := range suite.Cases[1:] {
+				if rc.Tier != "T1" || rc.InvalidReason != "not run after first failed" || rc.Failure != "" || rc.SkipReason != "" {
+					t.Fatalf("not-run row = %+v", rc)
+				}
+			}
+		})
+	}
+}
+
 func TestFilterRegressUnitPackages(t *testing.T) {
 	input := []string{
 		"example/regress/cmd/regress",
@@ -129,7 +215,11 @@ func TestFilterRegressUnitPackages(t *testing.T) {
 		"example/regress/internal/xrayglue",
 		"example/regress/internal/report",
 	}
-	want := []string{"example/regress/cmd/regress", "example/regress/internal/report"}
+	want := []string{
+		"example/regress/cmd/regress",
+		"example/regress/internal/smoke",
+		"example/regress/internal/report",
+	}
 	if got := filterRegressUnitPackages(input); !reflect.DeepEqual(got, want) {
 		t.Fatalf("packages=%v want %v", got, want)
 	}
@@ -141,4 +231,12 @@ func caseDefIDs(defs []caseDef) []string {
 		ids[i] = def.spec.ID
 	}
 	return ids
+}
+
+func reportCaseNames(cases []report.Case) []string {
+	names := make([]string, len(cases))
+	for i, rc := range cases {
+		names[i] = rc.Name
+	}
+	return names
 }

@@ -18,10 +18,11 @@ func TestBuildArgs(t *testing.T) {
 		Package:     "./internal/matrix/...",
 		Pattern:     "^(?:TestOne|TestTwo)$",
 		TestTimeout: 6 * time.Minute,
+		Race:        true,
 	}
 	want := []string{
 		"test", "-json", "-count=1", "-run", "^(?:TestOne|TestTwo)$",
-		"-timeout", "6m0s", "./internal/matrix/...",
+		"-race", "-timeout", "6m0s", "./internal/matrix/...",
 	}
 	if got := buildArgs(request); !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildArgs()=%#v, want %#v", got, want)

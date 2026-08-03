@@ -27,6 +27,8 @@ type Request struct {
 	Expected    []Expectation
 	TestTimeout time.Duration
 	Env         []string
+	// Race enables the Go race detector for this exact test invocation.
+	Race bool
 	// CommandPrefix wraps the go invocation without a shell. For example,
 	// []string{"setpriv", "--bounding-set=-net_admin"} executes
 	// "setpriv ... go test -json ..." while preserving JSON validation and
@@ -155,6 +157,9 @@ func validateRequest(ctx context.Context, request Request, executor Executor) []
 
 func buildArgs(request Request) []string {
 	args := []string{"test", "-json", "-count=1", "-run", request.Pattern}
+	if request.Race {
+		args = append(args, "-race")
+	}
 	if request.TestTimeout > 0 {
 		args = append(args, "-timeout", request.TestTimeout.String())
 	}
