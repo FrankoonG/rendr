@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
@@ -167,6 +168,53 @@ func TestApplyAndCleanup(t *testing.T) {
 			t.Fatalf("Cleanup: %v", err)
 		}
 	})
+
+	t.Run("real external replacement is observable and preserved", func(t *testing.T) {
+		if testing.Short() || !testCanManageTC() {
+			t.Skip("requires Linux root with tc")
+		}
+		fixture, err := ApplyChecked(Realistic50M)
+		if err != nil {
+			t.Fatalf("ApplyChecked(Realistic50M): %v", err)
+		}
+
+		const externalHandle = "9999:"
+		deleteExternal := func() {
+			_, _ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "handle", externalHandle).CombinedOutput()
+		}
+		defer deleteExternal()
+		out, err := exec.Command(
+			"tc", "qdisc", "replace", "dev", "lo", "root", "handle", externalHandle,
+			"netem", "delay", "1ms",
+		).CombinedOutput()
+		if err != nil {
+			_ = fixture.Cleanup()
+			t.Fatalf("replace fixture qdisc: %v (%s)", err, out)
+		}
+
+		select {
+		case err := <-fixture.Changes():
+			if !errors.Is(err, ErrStimulusInvalid) {
+				t.Fatalf("change error=%v, want ErrStimulusInvalid", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("qdisc replacement produced no netlink invalidation")
+		}
+		if err := fixture.Verify(); !errors.Is(err, ErrStimulusInvalid) {
+			t.Fatalf("Verify error=%v, want ErrStimulusInvalid", err)
+		}
+		if err := fixture.Cleanup(); !errors.Is(err, ErrStimulusInvalid) {
+			t.Fatalf("Cleanup error=%v, want ErrStimulusInvalid", err)
+		}
+
+		state, err := exec.Command("tc", "-j", "qdisc", "show", "dev", "lo").CombinedOutput()
+		if err != nil {
+			t.Fatalf("inspect external qdisc: %v (%s)", err, state)
+		}
+		if !strings.Contains(string(state), `"handle":"`+externalHandle+`"`) {
+			t.Fatalf("fixture cleanup removed external qdisc: %s", state)
+		}
+	})
 }
 
 // TestApplyShapesBandwidth proves the real shaper limits loopback throughput.
@@ -186,7 +234,7 @@ func TestApplyShapesBandwidth(t *testing.T) {
 
 	const payloadMB = 4
 	got := measureTCPThroughput(t, payloadMB)
-	t.Logf("measured throughput at 10 Mbps shaper: %.2f Mbps", got)
+	t.Logf("measured throughput at 10 Mbps shaper: %.2f Mbps", got/1_000_000)
 	if got > 15_000_000 {
 		t.Fatalf("measured %.0f bps > 15 Mbps; tbf shaper not engaging", got)
 	}
