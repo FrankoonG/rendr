@@ -77,6 +77,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		cmd.Env = append(os.Environ(), request.Env...)
 	}
 	cmd.WaitDelay = waitDelay
+	configureProcessGroup(cmd)
 
 	capture := &boundedBuffer{limit: maxJSONBytes}
 	cmd.Stdout = capture
