@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -310,13 +311,111 @@ func TestRunManifestCaseEnforcesBudget(t *testing.T) {
 	}
 	close(release)
 	rc := <-returned
-	if rc.Name != def.spec.ID || rc.Tier != def.spec.Tier || !strings.Contains(rc.Failure, "exceeded TUN synthetic-suite budget") {
+	if rc.Name != def.spec.ID || rc.Tier != def.spec.Tier || !strings.Contains(rc.Failure, "case exceeded T7 budget") ||
+		rc.Evidence["timeout_cleanup"] != "joined" || rc.Evidence["timeout_budget"] != def.spec.Budget.String() {
 		t.Fatalf("timeout report = %+v", rc)
 	}
 	select {
 	case <-finished:
 	case <-time.After(time.Second):
 		t.Fatal("synthetic timeout runner did not exit after cancellation")
+	}
+}
+
+func TestRunCaseDefsStopsAfterUnjoinedTimeout(t *testing.T) {
+	originalJoinTimeout := tunCaseJoinTimeout
+	tunCaseJoinTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { tunCaseJoinTimeout = originalJoinTimeout })
+
+	release := make(chan struct{})
+	workerDone := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		select {
+		case <-workerDone:
+		case <-time.After(time.Second):
+			t.Error("noncooperative test worker did not exit after release")
+		}
+	})
+	secondCalled := false
+	defs := []caseDef{
+		syntheticCase("synthetic.unjoined", 20*time.Millisecond, func(context.Context, string, manifest.Spec) report.Case {
+			defer close(workerDone)
+			<-release
+			return report.Case{}
+		}),
+		syntheticCase("synthetic.after-unjoined", time.Second, func(context.Context, string, manifest.Spec) report.Case {
+			secondCalled = true
+			return report.Case{}
+		}),
+	}
+	suite := report.New()
+	runCaseDefs(context.Background(), suite, "", defs)
+	if secondCalled {
+		t.Fatal("runner started a later case after an unjoined timeout")
+	}
+	if len(suite.Cases) != 2 || !strings.Contains(suite.Cases[0].InvalidReason, "Go cannot terminate") ||
+		!strings.Contains(suite.Cases[1].InvalidReason, "not run after synthetic.unjoined failed") {
+		t.Fatalf("unjoined timeout rows = %+v", suite.Cases)
+	}
+}
+
+func TestExecuteG4PathKillFailsClosedWithoutStimulus(t *testing.T) {
+	tests := []struct {
+		name       string
+		activePath uint32
+		kill       func(uint32) error
+		paths      func() []rendr.PathInfo
+		wantError  string
+	}{
+		{name: "no active path", wantError: "no active path"},
+		{
+			name: "kill error", activePath: 7,
+			kill:      func(uint32) error { return errors.New("synthetic kill rejected") },
+			paths:     func() []rendr.PathInfo { return []rendr.PathInfo{{ID: 7}, {ID: 8}} },
+			wantError: "synthetic kill rejected",
+		},
+		{
+			name: "path remains", activePath: 7,
+			kill:      func(uint32) error { return nil },
+			paths:     func() []rendr.PathInfo { return []rendr.PathInfo{{ID: 7}, {ID: 8}} },
+			wantError: "remains attached",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outcome := executeG4PathKill(tt.activePath, tt.kill, tt.paths)
+			if outcome.Err == nil || !strings.Contains(outcome.Err.Error(), tt.wantError) || outcome.PathRemoved {
+				t.Fatalf("kill outcome = %+v, want error containing %q", outcome, tt.wantError)
+			}
+		})
+	}
+
+	outcome := executeG4PathKill(7, func(uint32) error { return nil }, func() []rendr.PathInfo {
+		return []rendr.PathInfo{{ID: 8}}
+	})
+	if outcome.Err != nil || !outcome.Attempted || !outcome.PathRemoved || outcome.PathID != 7 || outcome.At.IsZero() {
+		t.Fatalf("successful kill outcome = %+v", outcome)
+	}
+}
+
+func TestT5AdapterMatrixRejectsPartialCoverage(t *testing.T) {
+	original := tunTCPRepairAvailable
+	tunTCPRepairAvailable = func() error { return errors.New("TCP_REPAIR unavailable") }
+	t.Cleanup(func() { tunTCPRepairAvailable = original })
+
+	rc := runT5AdapterMatrix(context.Background(), t5AdapterMatrixOptions{name: caseT5AdapterMatrix})
+	if !strings.Contains(rc.InvalidReason, "mandatory tcprepair adapter unavailable") || rc.Failure != "" {
+		t.Fatalf("partial adapter matrix = %+v", rc)
+	}
+	for _, key := range []string{"tcprepair_exercised", "gvisor_exercised", "gvisor_packet_exercised"} {
+		if rc.Evidence[key] != "false" {
+			t.Fatalf("partial adapter evidence %s=%q", key, rc.Evidence[key])
+		}
 	}
 }
 

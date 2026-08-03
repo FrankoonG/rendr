@@ -20,6 +20,7 @@ import (
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/l3session"
+	"github.com/FrankoonG/rendr/regress/internal/caseexec"
 	"github.com/FrankoonG/rendr/regress/internal/chaos"
 	"github.com/FrankoonG/rendr/regress/internal/manifest"
 	"github.com/FrankoonG/rendr/regress/internal/report"
@@ -283,9 +284,10 @@ func runCaseDefs(ctx context.Context, suite *report.Suite, rendrRoot string, def
 			suite.Add(notRunCase(def.spec, failedCaseID))
 			continue
 		}
-		rc := runManifestCase(ctx, rendrRoot, def)
+		outcome := runManifestCaseOutcome(ctx, rendrRoot, def)
+		rc := outcome.Case
 		suite.Add(rc)
-		if mandatoryCaseFailed(def.spec, rc) {
+		if outcome.MustStop || mandatoryCaseFailed(def.spec, rc) {
 			failedCaseID = def.spec.ID
 		}
 	}
@@ -311,52 +313,27 @@ func NotRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return notRunCase(spec, failedCaseID)
 }
 
+var tunCaseJoinTimeout = caseexec.DefaultJoinTimeout
+
 func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.Case {
-	start := time.Now()
-	cctx, cancel := context.WithTimeout(ctx, def.spec.Budget)
-	done := make(chan report.Case, 1)
-	workloadDone := make(chan struct{})
-	go func() {
-		defer close(workloadDone)
+	return runManifestCaseOutcome(ctx, rendrRoot, def).Case
+}
+
+func runManifestCaseOutcome(ctx context.Context, rendrRoot string, def caseDef) caseexec.Outcome {
+	outcome := caseexec.Run(ctx, caseexec.Config{
+		Name:        def.spec.ID,
+		Tier:        def.spec.Tier,
+		Budget:      def.spec.Budget,
+		JoinTimeout: tunCaseJoinTimeout,
+	}, func(cctx context.Context) (rc report.Case) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				done <- report.Case{Failure: fmt.Sprintf("runner panic: %v", recovered)}
+				rc = report.Case{Failure: fmt.Sprintf("runner panic: %v", recovered)}
 			}
 		}()
-		done <- def.run(cctx, rendrRoot, def.spec)
-	}()
-
-	var rc report.Case
-	timedOut := false
-	var timeoutErr error
-	select {
-	case rc = <-done:
-		if err := cctx.Err(); err != nil {
-			budgetFailure := fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, err)
-			if rc.Failure == "" {
-				rc.Failure = budgetFailure
-			} else {
-				rc.Failure = budgetFailure + ": " + rc.Failure
-			}
-		}
-	case <-cctx.Done():
-		timedOut = true
-		timeoutErr = cctx.Err()
-	}
-	cancel()
-	<-workloadDone
-	if timedOut {
-		rc = <-done
-		budgetFailure := fmt.Sprintf("case exceeded TUN synthetic-suite budget %s: %v", def.spec.Budget, timeoutErr)
-		if rc.Failure == "" {
-			rc.Failure = budgetFailure
-		} else {
-			rc.Failure = budgetFailure + ": " + rc.Failure
-		}
-	}
-	if rc.Duration == 0 {
-		rc.Duration = time.Since(start)
-	}
+		return def.run(cctx, rendrRoot, def.spec)
+	})
+	rc := outcome.Case
 	contractFailures := make([]string, 0, 2)
 	if rc.Name != "" && rc.Name != def.spec.ID {
 		contractFailures = append(contractFailures, fmt.Sprintf("runner reported case %q", rc.Name))
@@ -375,7 +352,8 @@ func runManifestCase(ctx context.Context, rendrRoot string, def caseDef) report.
 	rc.Name = def.spec.ID
 	rc.Tier = def.spec.Tier
 	markTUNEvidence(&rc, def.spec.ID)
-	return rc
+	outcome.Case = rc
+	return outcome
 }
 
 const (
@@ -618,6 +596,41 @@ type g4Options struct {
 	echoInt  time.Duration
 	paths    int
 	budget   time.Duration
+}
+
+type g4KillOutcome struct {
+	PathID      uint32
+	At          time.Time
+	Attempted   bool
+	PathRemoved bool
+	Err         error
+}
+
+func executeG4PathKill(activePath uint32, kill func(uint32) error, pathsAfter func() []rendr.PathInfo) g4KillOutcome {
+	outcome := g4KillOutcome{PathID: activePath}
+	if activePath == 0 {
+		outcome.Err = errors.New("no active path to kill")
+		return outcome
+	}
+	if kill == nil || pathsAfter == nil {
+		outcome.Err = errors.New("path-kill stimulus is incomplete")
+		return outcome
+	}
+	outcome.Attempted = true
+	if err := kill(activePath); err != nil {
+		outcome.Err = fmt.Errorf("kill active path %d: %w", activePath, err)
+		return outcome
+	}
+	outcome.At = time.Now()
+	outcome.PathRemoved = true
+	for _, path := range pathsAfter() {
+		if path.ID == activePath {
+			outcome.PathRemoved = false
+			outcome.Err = fmt.Errorf("killed path %d remains attached", activePath)
+			break
+		}
+	}
+	return outcome
 }
 
 type g5Options struct {
@@ -1098,6 +1111,10 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 		return failedCase(opts.name, start, err)
 	}
 	defer env.close()
+	if attached := len(env.admin.Paths()); attached != opts.paths {
+		return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start),
+			InvalidReason: fmt.Sprintf("path-death stimulus topology has %d attached paths, want %d", attached, opts.paths)}
+	}
 
 	killer, ok := env.admin.(interface {
 		ForceKillPathForTest(id uint32) error
@@ -1107,7 +1124,7 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 	}
 	echoErr := startStreamEcho(env.server, 8)
 
-	killDone := make(chan time.Time, 1)
+	killDone := make(chan g4KillOutcome, 1)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -1115,10 +1132,7 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 		case <-time.After(opts.killAt):
 		}
 		cur := env.admin.ActivePath()
-		if cur != 0 {
-			_ = killer.ForceKillPathForTest(cur)
-		}
-		killDone <- time.Now()
+		killDone <- executeG4PathKill(cur, killer.ForceKillPathForTest, env.admin.Paths)
 	}()
 
 	endAt := time.Now().Add(opts.duration)
@@ -1126,7 +1140,9 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 	var lost int
 	var maxRTT time.Duration
 	var killStamp time.Time
+	var killOutcome g4KillOutcome
 	var firstPostKill time.Time
+	var postKillSamples int
 	for time.Now().Before(endAt) {
 		var tx [8]byte
 		binary.BigEndian.PutUint64(tx[:], seq)
@@ -1145,13 +1161,20 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 			maxRTT = rtt
 		}
 		select {
-		case s := <-killDone:
-			killStamp = s
+		case outcome := <-killDone:
+			killOutcome = outcome
+			if outcome.Err != nil {
+				return failedCase(opts.name, start, outcome.Err)
+			}
+			killStamp = outcome.At
 			killDone = nil
 		default:
 		}
 		if !killStamp.IsZero() && firstPostKill.IsZero() && time.Now().After(killStamp) {
 			firstPostKill = time.Now()
+		}
+		if !killStamp.IsZero() && time.Now().After(killStamp) {
+			postKillSamples++
 		}
 		seq++
 		select {
@@ -1167,11 +1190,18 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 	if killStamp.IsZero() {
 		return failedCase(opts.name, start, fmt.Errorf("path kill did not run"))
 	}
+	if !killOutcome.Attempted || !killOutcome.PathRemoved || killOutcome.PathID == 0 {
+		return failedCase(opts.name, start, fmt.Errorf("path kill stimulus was not proved: attempted=%t removed=%t path=%d",
+			killOutcome.Attempted, killOutcome.PathRemoved, killOutcome.PathID))
+	}
 	if firstPostKill.IsZero() {
 		return failedCase(opts.name, start, fmt.Errorf("no echo completed after path kill"))
 	}
 	if failover := firstPostKill.Sub(killStamp); failover > opts.budget {
 		return failedCase(opts.name, start, fmt.Errorf("failover %s exceeds %s budget", failover, opts.budget))
+	}
+	if postKillSamples == 0 {
+		return failedCase(opts.name, start, errors.New("no application samples completed after path kill"))
 	}
 	_ = env.app.Close()
 	if err := env.waitRelay(5 * time.Second); err != nil {
@@ -1184,8 +1214,16 @@ func runG4PathDeath(ctx context.Context, opts g4Options) report.Case {
 		}
 	default:
 	}
-	_ = maxRTT
-	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+	failover := firstPostKill.Sub(killStamp)
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start), Evidence: map[string]string{
+		"kill_attempted":     "true",
+		"kill_path_id":       fmt.Sprint(killOutcome.PathID),
+		"kill_path_removed":  "true",
+		"post_kill_samples":  fmt.Sprint(postKillSamples),
+		"failover_ms":        fmt.Sprint(failover.Milliseconds()),
+		"max_echo_rtt_ms":    fmt.Sprint(maxRTT.Milliseconds()),
+		"application_losses": fmt.Sprint(lost),
+	}}
 }
 
 func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
@@ -1276,6 +1314,8 @@ func runG5PathRecovery(ctx context.Context, opts g5Options) report.Case {
 	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
 }
 
+var tunTCPRepairAvailable = tcprepair.Available
+
 func runT5AdapterMatrix(ctx context.Context, opts t5AdapterMatrixOptions) report.Case {
 	start := time.Now()
 	if opts.name == "" {
@@ -1288,7 +1328,7 @@ func runT5AdapterMatrix(ctx context.Context, opts t5AdapterMatrixOptions) report
 		opts.migrations = 2
 	}
 
-	if err := tcprepair.Available(); err == nil {
+	if err := tunTCPRepairAvailable(); err == nil {
 		ln, err := rendr.ListenTCP("127.0.0.1:0")
 		if err != nil {
 			return failedCase(opts.name, start, fmt.Errorf("tcprepair listen: %w", err))
@@ -1298,8 +1338,13 @@ func runT5AdapterMatrix(ctx context.Context, opts t5AdapterMatrixOptions) report
 			return failedCase(opts.name, start, fmt.Errorf("tcprepair path: %w", err))
 		}
 		_ = ln.Close()
-	} else if !strings.Contains(err.Error(), "gvisor fallback") {
-		return failedCase(opts.name, start, fmt.Errorf("tcprepair unavailable error does not name gvisor fallback: %w", err))
+	} else {
+		return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start),
+			InvalidReason: "mandatory tcprepair adapter unavailable: " + err.Error(), Evidence: map[string]string{
+				"tcprepair_exercised":     "false",
+				"gvisor_exercised":        "false",
+				"gvisor_packet_exercised": "false",
+			}}
 	}
 
 	ln, err := rendr.ListenGVisor("")
@@ -1322,7 +1367,11 @@ func runT5AdapterMatrix(ctx context.Context, opts t5AdapterMatrixOptions) report
 	}
 	_ = packetLn.Close()
 
-	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start)}
+	return report.Case{Name: opts.name, Tier: "T7", Duration: time.Since(start), Evidence: map[string]string{
+		"tcprepair_exercised":     "true",
+		"gvisor_exercised":        "true",
+		"gvisor_packet_exercised": "true",
+	}}
 }
 
 func runT6Selector(ctx context.Context, opts t6SelectorOptions) report.Case {

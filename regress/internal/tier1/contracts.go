@@ -442,6 +442,8 @@ func regressUnitContracts(goos string) []packageContract {
 		testPackage(regressModule+"/internal/tunfull", "./internal/tunfull",
 			"TestSpecsOrderedAndBudgeted", "TestSelectCaseDefs", "TestRunReportsSelectionFailuresWithoutExecutingCases",
 			"TestRunCaseDefsUsesDeterministicManifestOrder", "TestRunCaseDefsStopsAfterMandatoryOutcome",
+			"TestRunCaseDefsStopsAfterUnjoinedTimeout", "TestExecuteG4PathKillFailsClosedWithoutStimulus",
+			"TestT5AdapterMatrixRejectsPartialCoverage",
 			"TestLongRunAliasReportsEachSelectedExecutableMemberExactlyOnce", "TestRunManifestCaseEnforcesBudget",
 			"TestRunManifestCaseFailsClosedOnWrongIdentity", "TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember",
 			"TestKernelTUNGateRejectsMissingStimulusAndFalseGreenControls",
