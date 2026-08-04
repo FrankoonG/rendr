@@ -22,6 +22,7 @@ type engineBackedConn struct {
 	peak     *peakTransferController
 	status   *pathStatusTracker
 	resolver *pathFactoryResolver
+	graph    compiledTargetGraph
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -170,6 +171,11 @@ func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	defer cancel()
 	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
+		return 0, err
+	}
+	spec, err = c.graph.resolvePathSpec(spec, c.e.Paths())
+	if err != nil {
+		_ = pc.Close()
 		return 0, err
 	}
 	if _, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec)); err != nil {

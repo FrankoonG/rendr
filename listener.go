@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -153,7 +154,7 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
-	if err := e.AcceptPeerNegotiation(p.Negotiation); err != nil {
+	if err := e.AcceptPeerNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return
@@ -175,14 +176,14 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 		return
 	}
 
-	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
+	spec := specFromAddrName(pc.RemoteAddr(), helloPathName(p))
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e)); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -234,11 +235,11 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		return
 	}
 	if err := e.ValidateBridgeBinding(p); err != nil {
-		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectProtoState, err.Error())
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, bridgeValidationAckCode(err), err.Error())
 		_ = pc.Close()
 		return
 	}
-	spec := specFromAddrName(pc.RemoteAddr(), p.PathName)
+	spec := specFromAddrName(pc.RemoteAddr(), bridgePathName(e, p))
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
@@ -282,4 +283,21 @@ func eLocalCaps(e *engine.Engine) uint32 {
 		caps |= proto.CapsL3Identity
 	}
 	return caps
+}
+
+func helloPathName(p proto.HelloPayload) string {
+	node, _ := p.LocalTXManifest.Node(p.InitialTargetID)
+	return node.Name
+}
+
+func bridgePathName(e *engine.Engine, p proto.BridgeTagPayload) string {
+	name, _ := e.PeerPathName(p.TargetID)
+	return name
+}
+
+func bridgeValidationAckCode(err error) proto.AckCode {
+	if errors.Is(err, engine.ErrDuplicateAttach) {
+		return proto.AckRejectDuplicate
+	}
+	return proto.AckRejectProtoState
 }

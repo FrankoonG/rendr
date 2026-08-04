@@ -2,20 +2,51 @@ package proto
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 )
 
 func testNegotiation(flow [16]byte) Negotiation {
-	return NewNegotiation(SessionEpoch(flow))
+	return testNegotiationFor(flow, testGraphManifest("path"))
+}
+
+func testNegotiationFor(flow [16]byte, manifest GraphManifest) Negotiation {
+	n := NewNegotiation(SessionEpoch(flow))
+	n.GraphDigest, _ = manifest.Digest()
+	return n
+}
+
+func testGraphManifest(name string) GraphManifest {
+	id := DeriveTargetID(GraphNodeKindPath, name)
+	return GraphManifest{RootID: id, Nodes: []GraphNode{{ID: id, Kind: GraphNodeKindPath, Name: name}}}
+}
+
+func mustHelloWire(t *testing.T, payload HelloPayload) []byte {
+	t.Helper()
+	wire, err := payload.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+func mustHelloAckWire(t *testing.T, payload HelloAckPayload) []byte {
+	t.Helper()
+	wire, err := payload.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
 }
 
 func testBridgeTag(bridgeID [16]byte, name string) BridgeTagPayload {
 	return BridgeTagPayload{
 		BridgeID:      bridgeID,
+		AttachID:      [16]byte{1},
 		SessionEpoch:  SessionEpoch(bridgeID),
+		Direction:     SenderDirectionClientToServer,
 		GraphRevision: 1,
-		TargetID:      StableTargetID(name),
-		PathName:      name,
+		TargetID:      DeriveTargetID(GraphNodeKindPath, name),
 	}
 }
 
@@ -33,12 +64,14 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 
 func TestHelloRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	want := HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow, Caps: 0xAABB_CCDD}
-	got, err := DecodeHello(want.Encode())
+	manifest := testGraphManifest("path")
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, Caps: 0xAABB_CCDD, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	wire := mustHelloWire(t, want)
+	got, err := DecodeHello(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
+	if !bytes.Equal(mustHelloWire(t, got), wire) {
 		t.Fatalf("hello: got %+v want %+v", got, want)
 	}
 }
@@ -101,16 +134,20 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 func TestHelloAckRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	want := HelloAckPayload{
-		Negotiation: testNegotiation(flow),
-		FlowID:      flow,
-		InstanceID:  InstanceID{5, 6, 7, 8},
-		Caps:        0xAABB_CCDD,
+		Negotiation:         testNegotiation(flow),
+		FlowID:              flow,
+		InstanceID:          InstanceID{5, 6, 7, 8},
+		Caps:                0xAABB_CCDD,
+		InitialTargetID:     testGraphManifest("path").RootID,
+		AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiation(flow).GraphDigest},
+		LocalTXManifest:     testGraphManifest("path"),
 	}
-	got, err := DecodeHelloAck(want.Encode())
+	wire := mustHelloAckWire(t, want)
+	got, err := DecodeHelloAck(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
+	if !bytes.Equal(mustHelloAckWire(t, got), wire) {
 		t.Fatalf("hello_ack: got %+v want %+v", got, want)
 	}
 }
@@ -118,13 +155,16 @@ func TestHelloAckRoundTrip(t *testing.T) {
 func TestBridgeAckRoundTrip(t *testing.T) {
 	bridgeID := [16]byte{0xFE, 0xED}
 	want := BridgeAckPayload{
-		BridgeID:      bridgeID,
-		InstanceID:    InstanceID{1, 2, 3, 4},
-		SessionEpoch:  SessionEpoch(bridgeID),
-		GraphRevision: 1,
-		TargetID:      StableTargetID("B"),
-		Code:          AckRejectInstance,
-		Reason:        "instance mismatch",
+		BridgeID:          bridgeID,
+		AttachID:          [16]byte{9},
+		InstanceID:        InstanceID{1, 2, 3, 4},
+		SessionEpoch:      SessionEpoch(bridgeID),
+		Direction:         SenderDirectionClientToServer,
+		GraphRevision:     1,
+		TargetID:          DeriveTargetID(GraphNodeKindPath, "B"),
+		ResponderTargetID: DeriveTargetID(GraphNodeKindPath, "B"),
+		Code:              AckRejectInstance,
+		Reason:            "instance mismatch",
 	}
 	got, err := DecodeBridgeAck(want.Encode())
 	if err != nil {
@@ -137,12 +177,14 @@ func TestBridgeAckRoundTrip(t *testing.T) {
 
 func TestHelloPathNameRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
-	want := HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow, Caps: CapsPacketMode, PathName: "A"}
-	got, err := DecodeHello(want.Encode())
+	manifest := testGraphManifest("A")
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, Caps: CapsPacketMode, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	wire := mustHelloWire(t, want)
+	got, err := DecodeHello(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
+	if !bytes.Equal(mustHelloWire(t, got), wire) {
 		t.Fatalf("hello path name: got %+v want %+v", got, want)
 	}
 }
@@ -283,7 +325,8 @@ func TestRejectLegacyHandshakePayloads(t *testing.T) {
 
 func TestHelloRejectsInvalidNegotiationBeforeUse(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
-	base := (HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+	manifest := testGraphManifest("path")
+	base := mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
 	mutations := map[string]func([]byte){
 		"protocol major":   func(b []byte) { b[1] = 2 },
 		"reserved":         func(b []byte) { b[7] = 1 },
@@ -312,7 +355,8 @@ func TestHandshakePayloadsRejectMalformedExtensions(t *testing.T) {
 			name: "hello",
 			base: func() []byte {
 				flow := [16]byte{1}
-				return (HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+				manifest := testGraphManifest("path")
+				return mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
 			}(),
 			decode: func(b []byte) error {
 				_, err := DecodeHello(b)
@@ -321,7 +365,7 @@ func TestHandshakePayloadsRejectMalformedExtensions(t *testing.T) {
 		},
 		{
 			name: "bridge_tag",
-			base: testBridgeTag([16]byte{1}, "").Encode(),
+			base: testBridgeTag([16]byte{1}, "path").Encode(),
 			decode: func(b []byte) error {
 				_, err := DecodeBridgeTag(b)
 				return err
@@ -329,7 +373,7 @@ func TestHandshakePayloadsRejectMalformedExtensions(t *testing.T) {
 		},
 		{
 			name: "bridge_ack",
-			base: BridgeAckPayload{BridgeID: [16]byte{1}, SessionEpoch: SessionEpoch{1}, GraphRevision: 1, TargetID: StableTargetID("")}.Encode(),
+			base: BridgeAckPayload{BridgeID: [16]byte{1}, AttachID: [16]byte{1}, SessionEpoch: SessionEpoch{1}, Direction: SenderDirectionClientToServer, GraphRevision: 1, TargetID: DeriveTargetID(GraphNodeKindPath, "path"), ResponderTargetID: DeriveTargetID(GraphNodeKindPath, "path")}.Encode(),
 			decode: func(b []byte) error {
 				_, err := DecodeBridgeAck(b)
 				return err
@@ -368,7 +412,8 @@ func TestFixedPayloadsRejectTrailingBytes(t *testing.T) {
 		{"ack", AckPayload{Direction: SenderDirectionClientToServer}.Encode(), func(b []byte) bool { _, ok := DecodeAck(b); return ok }},
 		{"hello_ack", func() []byte {
 			flow := [16]byte{1}
-			return (HelloAckPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+			manifest := testGraphManifest("path")
+			return mustHelloAckWire(t, HelloAckPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiationFor(flow, manifest).GraphDigest}, LocalTXManifest: manifest})
 		}(), func(b []byte) bool { _, err := DecodeHelloAck(b); return err == nil }},
 		{"migrate_notify", MigrateNotifyPayload{}.Encode(), func(b []byte) bool { _, err := DecodeMigrateNotify(b); return err == nil }},
 		{"path_quality", PathQualityPayload{}.Encode(), func(b []byte) bool { _, err := DecodePathQuality(b); return err == nil }},
@@ -542,9 +587,11 @@ func TestBridgeTagWireStability(t *testing.T) {
 	}
 	p := BridgeTagPayload{
 		BridgeID:               bridgeID,
+		AttachID:               [16]byte{0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF},
 		InstanceID:             InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
 		ExpectedPeerInstanceID: InstanceID{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F},
 		SessionEpoch:           SessionEpoch(bridgeID),
+		Direction:              SenderDirectionClientToServer,
 		GraphRevision:          0x0102030405060708,
 		GraphDigest:            GraphDigest{0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F},
 		TargetID:               TargetID{0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F},
@@ -552,12 +599,15 @@ func TestBridgeTagWireStability(t *testing.T) {
 	want := []byte{
 		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+		0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
 		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
 		0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
 		0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
 		0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
 		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 		0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
 		0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
@@ -620,11 +670,13 @@ func TestByeWireStability(t *testing.T) {
 func TestHelloWireStability(t *testing.T) {
 	flow := [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
 	p := HelloPayload{
-		Negotiation: testNegotiation(flow),
-		FlowID:      flow,
-		InstanceID:  InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
-		Caps:        0x01020304,
+		FlowID:     flow,
+		InstanceID: InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
+		Caps:       0x01020304,
 	}
+	p.LocalTXManifest = testGraphManifest("path")
+	p.InitialTargetID = p.LocalTXManifest.RootID
+	p.Negotiation = testNegotiationFor(flow, p.LocalTXManifest)
 	want := []byte{
 		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
@@ -642,7 +694,13 @@ func TestHelloWireStability(t *testing.T) {
 		0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
 		0x01, 0x02, 0x03, 0x04,
 	}
-	if !bytes.Equal(p.Encode(), want) {
-		t.Fatalf("hello wire drift:\n got=%x\nwant=%x", p.Encode(), want)
+	var err error
+	want, err = hex.DecodeString("00010000000000000000000000000007000000000000000700112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mustHelloWire(t, p)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("hello wire drift:\n got=%x\nwant=%x", got, want)
 	}
 }

@@ -121,7 +121,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
-	if err := e.ConfigureLocalGraph(plan.graphRevision, proto.GraphDigest(plan.graph.digest)); err != nil {
+	if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
 		_ = e.Close()
 		return nil, err
 	}
@@ -169,6 +169,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	bc := newEngineBackedConn(e, c, mode)
 	bc.status = tracker
 	bc.resolver = resolver
+	bc.graph = plan.graph
 
 	// Arm the selector scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
@@ -206,7 +207,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
-	if err := e.ConfigureLocalGraph(plan.graphRevision, proto.GraphDigest(plan.graph.digest)); err != nil {
+	if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
 		_ = e.Close()
 		return nil, err
 	}
@@ -250,6 +251,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
 	bc.status = tracker
 	bc.resolver = resolver
+	bc.graph = plan.graph
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)

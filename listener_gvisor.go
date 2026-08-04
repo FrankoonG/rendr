@@ -149,7 +149,7 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
-	if err := e.AcceptPeerNegotiation(p.Negotiation); err != nil {
+	if err := e.AcceptPeerNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return
@@ -170,14 +170,14 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 		return
 	}
 
-	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, p.PathName)
+	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, helloPathName(p))
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e)); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -224,11 +224,11 @@ func (l *gvisorListener) handleBridgeTag(pc transport.PathConn, payload []byte) 
 		return
 	}
 	if err := e.ValidateBridgeBinding(p); err != nil {
-		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectProtoState, err.Error())
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, bridgeValidationAckCode(err), err.Error())
 		_ = pc.Close()
 		return
 	}
-	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, p.PathName)
+	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, bridgePathName(e, p))
 	if _, err := e.AttachPath(pc, spec); err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()

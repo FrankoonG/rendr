@@ -52,6 +52,8 @@ type Engine struct {
 	graphMu       sync.RWMutex
 	localGraph    graphBinding
 	peerGraph     graphBinding
+	attachMu      sync.Mutex
+	seenAttach    map[[16]byte]struct{}
 	created       time.Time
 
 	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
@@ -290,6 +292,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		limits:           limits.Clamp(),
 		created:          time.Now(),
 		paths:            make(map[uint32]*pathSlot),
+		seenAttach:       make(map[[16]byte]struct{}),
 		recvPacketCh:     make(chan []byte, 16384),
 		recvPacketWake:   make(chan struct{}, 1),
 		recvWake:         make(chan struct{}, 1),

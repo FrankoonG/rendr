@@ -45,11 +45,9 @@ const (
 type GraphDigest [32]byte
 type TargetID [16]byte
 
-func StableTargetID(name string) TargetID {
-	sum := sha256.Sum256([]byte("rendr-target-v1\x00" + name))
-	var id TargetID
-	copy(id[:], sum[:len(id)])
-	return id
+type GraphBinding struct {
+	Revision uint64
+	Digest   GraphDigest
 }
 
 // Negotiation is carried by both HELLO and HELLO_ACK before any bridge state
@@ -75,6 +73,10 @@ func NewNegotiation(epoch SessionEpoch) Negotiation {
 		SessionEpoch:  epoch,
 		GraphRevision: 1,
 	}
+}
+
+func (n Negotiation) GraphBinding() GraphBinding {
+	return GraphBinding{Revision: n.GraphRevision, Digest: n.GraphDigest}
 }
 
 func (n Negotiation) encodeTo(b []byte) {
@@ -304,28 +306,41 @@ const (
 	CapsL3Identity uint32 = 1 << 1
 )
 
-// HelloPayload: flow_id (16B) + instance_id (16B) + caps (4B), followed
-// optionally by one length-prefixed path name.
+// HelloPayload declares the initiator's TX graph and the path leaf carrying
+// this initial handshake. Dial-specific addresses and options never enter the
+// manifest.
 type HelloPayload struct {
 	Negotiation
-	FlowID     [16]byte
-	InstanceID InstanceID
-	Caps       uint32
-	PathName   string
+	FlowID          [16]byte
+	InstanceID      InstanceID
+	Caps            uint32
+	InitialTargetID TargetID
+	LocalTXManifest GraphManifest
 }
 
-const HelloPayloadSize = NegotiationSize + 36
+const HelloPayloadSize = NegotiationSize + 56
 
-func (p HelloPayload) Encode() []byte {
+func (p HelloPayload) Encode() ([]byte, error) {
+	manifest, err := p.LocalTXManifest.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("proto: encode hello graph: %w", err)
+	}
+	if err := validateGraphNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
+		return nil, err
+	}
+	node, ok := p.LocalTXManifest.Node(p.InitialTargetID)
+	if !ok || node.Kind != GraphNodeKindPath {
+		return nil, fmt.Errorf("proto: hello initial target is not a path in the graph")
+	}
 	b := make([]byte, HelloPayloadSize)
 	p.Negotiation.encodeTo(b[:NegotiationSize])
 	copy(b[80:96], p.FlowID[:])
 	copy(b[96:112], p.InstanceID[:])
 	binary.BigEndian.PutUint32(b[112:116], p.Caps)
-	if p.PathName != "" {
-		b = appendPathName(b, p.PathName)
-	}
-	return b
+	copy(b[116:132], p.InitialTargetID[:])
+	binary.BigEndian.PutUint32(b[132:136], uint32(len(manifest)))
+	b = append(b, manifest...)
+	return b, nil
 }
 
 func DecodeHello(b []byte) (HelloPayload, error) {
@@ -341,43 +356,72 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 	copy(p.FlowID[:], b[80:96])
 	copy(p.InstanceID[:], b[96:112])
 	p.Caps = binary.BigEndian.Uint32(b[112:116])
+	copy(p.InitialTargetID[:], b[116:132])
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
 		return HelloPayload{}, fmt.Errorf("proto: hello session epoch does not match flow id")
 	}
-	p.PathName, err = decodeOptionalString8("hello path name", b[HelloPayloadSize:])
+	manifestLen := int(binary.BigEndian.Uint32(b[132:136]))
+	if manifestLen != len(b)-HelloPayloadSize || manifestLen > GraphManifestMaxWireBytes {
+		return HelloPayload{}, fmt.Errorf("proto: hello graph length %d does not match remaining payload %d", manifestLen, len(b)-HelloPayloadSize)
+	}
+	p.LocalTXManifest, err = DecodeGraphManifest(b[HelloPayloadSize:])
 	if err != nil {
+		return HelloPayload{}, fmt.Errorf("proto: decode hello graph: %w", err)
+	}
+	if err := validateGraphNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
 		return HelloPayload{}, err
+	}
+	node, ok := p.LocalTXManifest.Node(p.InitialTargetID)
+	if !ok || node.Kind != GraphNodeKindPath {
+		return HelloPayload{}, fmt.Errorf("proto: hello initial target is not a path in the graph")
 	}
 	return p, nil
 }
 
-func (p HelloPayload) EncodeWithPathName(name string) []byte {
-	p.PathName = name
-	return p.Encode()
-}
-
 type HelloAckPayload struct {
 	Negotiation
-	FlowID     [16]byte
-	InstanceID InstanceID
-	Caps       uint32
+	FlowID              [16]byte
+	InstanceID          InstanceID
+	Caps                uint32
+	InitialTargetID     TargetID
+	AcceptedPeerBinding GraphBinding
+	LocalTXManifest     GraphManifest
 }
 
-const HelloAckPayloadSize = NegotiationSize + 36
+const HelloAckPayloadSize = NegotiationSize + 96
 
-func (p HelloAckPayload) Encode() []byte {
+func (p HelloAckPayload) Encode() ([]byte, error) {
+	manifest, err := p.LocalTXManifest.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("proto: encode hello_ack graph: %w", err)
+	}
+	if err := validateGraphNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
+		return nil, err
+	}
+	if p.AcceptedPeerBinding.Revision == 0 {
+		return nil, fmt.Errorf("proto: hello_ack has zero accepted peer graph revision")
+	}
+	node, ok := p.LocalTXManifest.Node(p.InitialTargetID)
+	if !ok || node.Kind != GraphNodeKindPath {
+		return nil, fmt.Errorf("proto: hello_ack initial target is not a path in the graph")
+	}
 	b := make([]byte, HelloAckPayloadSize)
 	p.Negotiation.encodeTo(b[:NegotiationSize])
 	copy(b[80:96], p.FlowID[:])
 	copy(b[96:112], p.InstanceID[:])
 	binary.BigEndian.PutUint32(b[112:116], p.Caps)
-	return b
+	copy(b[116:132], p.InitialTargetID[:])
+	binary.BigEndian.PutUint64(b[132:140], p.AcceptedPeerBinding.Revision)
+	copy(b[140:172], p.AcceptedPeerBinding.Digest[:])
+	binary.BigEndian.PutUint32(b[172:176], uint32(len(manifest)))
+	b = append(b, manifest...)
+	return b, nil
 }
 
 func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	var p HelloAckPayload
-	if err := requireExactPayloadSize("hello_ack", len(b), HelloAckPayloadSize); err != nil {
-		return p, err
+	if len(b) < HelloAckPayloadSize {
+		return p, fmt.Errorf("proto: hello_ack payload too short: %d < %d", len(b), HelloAckPayloadSize)
 	}
 	var err error
 	p.Negotiation, err = decodeNegotiation(b[:NegotiationSize])
@@ -387,10 +431,42 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	copy(p.FlowID[:], b[80:96])
 	copy(p.InstanceID[:], b[96:112])
 	p.Caps = binary.BigEndian.Uint32(b[112:116])
+	copy(p.InitialTargetID[:], b[116:132])
+	p.AcceptedPeerBinding.Revision = binary.BigEndian.Uint64(b[132:140])
+	copy(p.AcceptedPeerBinding.Digest[:], b[140:172])
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack session epoch does not match flow id")
 	}
+	if p.AcceptedPeerBinding.Revision == 0 {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack has zero accepted peer graph revision")
+	}
+	manifestLen := int(binary.BigEndian.Uint32(b[172:176]))
+	if manifestLen != len(b)-HelloAckPayloadSize || manifestLen > GraphManifestMaxWireBytes {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack graph length %d does not match remaining payload %d", manifestLen, len(b)-HelloAckPayloadSize)
+	}
+	p.LocalTXManifest, err = DecodeGraphManifest(b[HelloAckPayloadSize:])
+	if err != nil {
+		return HelloAckPayload{}, fmt.Errorf("proto: decode hello_ack graph: %w", err)
+	}
+	if err := validateGraphNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
+		return HelloAckPayload{}, err
+	}
+	node, ok := p.LocalTXManifest.Node(p.InitialTargetID)
+	if !ok || node.Kind != GraphNodeKindPath {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack initial target is not a path in the graph")
+	}
 	return p, nil
+}
+
+func validateGraphNegotiation(negotiation Negotiation, manifest GraphManifest) error {
+	digest, err := manifest.Digest()
+	if err != nil {
+		return fmt.Errorf("proto: invalid negotiated graph: %w", err)
+	}
+	if digest != negotiation.GraphDigest {
+		return fmt.Errorf("proto: negotiated graph digest mismatch")
+	}
+	return nil
 }
 
 // MigrateNotifyPayload: new_path_id (4B).
@@ -499,64 +575,59 @@ func DecodeBye(b []byte) (ByePayload, error) {
 // bridge table can attach the new PathConn to the correct Conn.
 type BridgeTagPayload struct {
 	BridgeID               [16]byte
+	AttachID               [16]byte
 	InstanceID             InstanceID
 	ExpectedPeerInstanceID InstanceID
 	SessionEpoch           SessionEpoch
+	Direction              SenderDirection
 	GraphRevision          uint64
 	GraphDigest            GraphDigest
 	TargetID               TargetID
-	PathName               string
 }
 
-const BridgeTagPayloadSize = 120
+const BridgeTagPayloadSize = 144
 
 func (p BridgeTagPayload) Encode() []byte {
 	b := make([]byte, BridgeTagPayloadSize)
 	copy(b[0:16], p.BridgeID[:])
-	copy(b[16:32], p.InstanceID[:])
-	copy(b[32:48], p.ExpectedPeerInstanceID[:])
-	copy(b[48:64], p.SessionEpoch[:])
-	binary.BigEndian.PutUint64(b[64:72], p.GraphRevision)
-	copy(b[72:104], p.GraphDigest[:])
-	copy(b[104:120], p.TargetID[:])
-	if p.PathName != "" {
-		b = appendPathName(b, p.PathName)
-	}
+	copy(b[16:32], p.AttachID[:])
+	copy(b[32:48], p.InstanceID[:])
+	copy(b[48:64], p.ExpectedPeerInstanceID[:])
+	copy(b[64:80], p.SessionEpoch[:])
+	b[80] = byte(p.Direction)
+	binary.BigEndian.PutUint64(b[88:96], p.GraphRevision)
+	copy(b[96:128], p.GraphDigest[:])
+	copy(b[128:144], p.TargetID[:])
 	return b
 }
 
 func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
-	if len(b) < BridgeTagPayloadSize {
-		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag payload too short: %d < %d", len(b), BridgeTagPayloadSize)
+	if err := requireExactPayloadSize("bridge_tag", len(b), BridgeTagPayloadSize); err != nil {
+		return BridgeTagPayload{}, err
 	}
 	var p BridgeTagPayload
 	copy(p.BridgeID[:], b[0:16])
-	copy(p.InstanceID[:], b[16:32])
-	copy(p.ExpectedPeerInstanceID[:], b[32:48])
-	copy(p.SessionEpoch[:], b[48:64])
-	p.GraphRevision = binary.BigEndian.Uint64(b[64:72])
-	copy(p.GraphDigest[:], b[72:104])
-	copy(p.TargetID[:], b[104:120])
+	copy(p.AttachID[:], b[16:32])
+	copy(p.InstanceID[:], b[32:48])
+	copy(p.ExpectedPeerInstanceID[:], b[48:64])
+	copy(p.SessionEpoch[:], b[64:80])
+	p.Direction = SenderDirection(b[80])
+	if !p.Direction.Valid() || binary.BigEndian.Uint64(b[80:88])&0x00ffffffffffffff != 0 {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag invalid direction or reserved bytes")
+	}
+	p.GraphRevision = binary.BigEndian.Uint64(b[88:96])
+	copy(p.GraphDigest[:], b[96:128])
+	copy(p.TargetID[:], b[128:144])
 	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
 		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag session epoch does not match bridge id")
 	}
 	if p.GraphRevision == 0 {
 		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag zero graph revision")
 	}
-	var err error
-	p.PathName, err = decodeOptionalString8("bridge_tag path name", b[BridgeTagPayloadSize:])
-	if err != nil {
-		return BridgeTagPayload{}, err
-	}
-	if p.TargetID != StableTargetID(p.PathName) {
-		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag target id does not match path name")
+	if p.AttachID == ([16]byte{}) {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag zero attach id")
 	}
 	return p, nil
-}
-
-func (p BridgeTagPayload) EncodeWithPathName(name string) []byte {
-	p.PathName = name
-	return p.Encode()
 }
 
 type AckCode uint8
@@ -595,27 +666,33 @@ func (c AckCode) String() string {
 }
 
 type BridgeAckPayload struct {
-	BridgeID      [16]byte
-	InstanceID    InstanceID
-	SessionEpoch  SessionEpoch
-	GraphRevision uint64
-	GraphDigest   GraphDigest
-	TargetID      TargetID
-	Code          AckCode
-	Reason        string
+	BridgeID          [16]byte
+	AttachID          [16]byte
+	InstanceID        InstanceID
+	SessionEpoch      SessionEpoch
+	Direction         SenderDirection
+	GraphRevision     uint64
+	GraphDigest       GraphDigest
+	TargetID          TargetID
+	ResponderTargetID TargetID
+	Code              AckCode
+	Reason            string
 }
 
-const BridgeAckPayloadSize = 105
+const BridgeAckPayloadSize = 145
 
 func (p BridgeAckPayload) Encode() []byte {
 	b := make([]byte, BridgeAckPayloadSize)
 	copy(b[0:16], p.BridgeID[:])
-	copy(b[16:32], p.InstanceID[:])
-	copy(b[32:48], p.SessionEpoch[:])
-	binary.BigEndian.PutUint64(b[48:56], p.GraphRevision)
-	copy(b[56:88], p.GraphDigest[:])
-	copy(b[88:104], p.TargetID[:])
-	b[104] = byte(p.Code)
+	copy(b[16:32], p.AttachID[:])
+	copy(b[32:48], p.InstanceID[:])
+	copy(b[48:64], p.SessionEpoch[:])
+	b[64] = byte(p.Direction)
+	binary.BigEndian.PutUint64(b[72:80], p.GraphRevision)
+	copy(b[80:112], p.GraphDigest[:])
+	copy(b[112:128], p.TargetID[:])
+	copy(b[128:144], p.ResponderTargetID[:])
+	b[144] = byte(p.Code)
 	if p.Reason != "" {
 		b = appendString8(b, p.Reason)
 	}
@@ -628,17 +705,29 @@ func DecodeBridgeAck(b []byte) (BridgeAckPayload, error) {
 		return p, fmt.Errorf("proto: bridge_ack payload too short: %d < %d", len(b), BridgeAckPayloadSize)
 	}
 	copy(p.BridgeID[:], b[0:16])
-	copy(p.InstanceID[:], b[16:32])
-	copy(p.SessionEpoch[:], b[32:48])
-	p.GraphRevision = binary.BigEndian.Uint64(b[48:56])
-	copy(p.GraphDigest[:], b[56:88])
-	copy(p.TargetID[:], b[88:104])
-	p.Code = AckCode(b[104])
+	copy(p.AttachID[:], b[16:32])
+	copy(p.InstanceID[:], b[32:48])
+	copy(p.SessionEpoch[:], b[48:64])
+	p.Direction = SenderDirection(b[64])
+	if !p.Direction.Valid() || binary.BigEndian.Uint64(b[64:72])&0x00ffffffffffffff != 0 {
+		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack invalid direction or reserved bytes")
+	}
+	p.GraphRevision = binary.BigEndian.Uint64(b[72:80])
+	copy(p.GraphDigest[:], b[80:112])
+	copy(p.TargetID[:], b[112:128])
+	copy(p.ResponderTargetID[:], b[128:144])
+	p.Code = AckCode(b[144])
 	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
 		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack session epoch does not match bridge id")
 	}
 	if p.GraphRevision == 0 {
 		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack zero graph revision")
+	}
+	if p.AttachID == ([16]byte{}) {
+		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack zero attach id")
+	}
+	if p.ResponderTargetID == (TargetID{}) {
+		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack zero responder target id")
 	}
 	var err error
 	p.Reason, err = decodeOptionalString8("bridge_ack reason", b[BridgeAckPayloadSize:])

@@ -1,11 +1,16 @@
 package rendr
 
 import (
+	"bytes"
 	"encoding/hex"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/proto"
 )
 
 func TestCompileTargetGraphCanonicalGolden(t *testing.T) {
@@ -47,9 +52,13 @@ func TestCompileTargetGraphCanonicalGolden(t *testing.T) {
 	if got := string(graph.canonical); got != wantCanonical {
 		t.Fatalf("canonical graph mismatch\n got: %s\nwant: %s", got, wantCanonical)
 	}
-	const wantDigest = "e86418596b40e1305a05e3379b3ca001c7946fd450f0af313903242fb0ba180a"
-	if got := hex.EncodeToString(graph.digest[:]); got != wantDigest {
-		t.Fatalf("digest=%s want %s", got, wantDigest)
+	const wantLocalDigest = "e86418596b40e1305a05e3379b3ca001c7946fd450f0af313903242fb0ba180a"
+	if got := hex.EncodeToString(graph.localDigest[:]); got != wantLocalDigest {
+		t.Fatalf("local digest=%s want %s", got, wantLocalDigest)
+	}
+	const wantManifestDigest = "b584dfdcdd53fc875adee3ad9ecd95ffb0406de7872f16a12e129a07444088dd"
+	if got := hex.EncodeToString(graph.digest[:]); got != wantManifestDigest {
+		t.Fatalf("manifest digest=%s want %s", got, wantManifestDigest)
 	}
 	if graph.nodeCount != 11 || graph.maxDepth != 4 {
 		t.Fatalf("bounds metadata=(nodes=%d depth=%d) want (11,4)", graph.nodeCount, graph.maxDepth)
@@ -62,6 +71,62 @@ func TestCompileTargetGraphCanonicalGolden(t *testing.T) {
 	}
 	if got := targetGraphChildNames(graph.nodesByName["fast"]); strings.Join(got, ",") != "fast-a,fast-b" {
 		t.Fatalf("flattened race children=%v", got)
+	}
+
+	if err := graph.manifest.Validate(); err != nil {
+		t.Fatalf("manifest validation: %v", err)
+	}
+	calculatedDigest, err := graph.manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.digest != calculatedDigest {
+		t.Fatalf("session digest=%x manifest digest=%x", graph.digest, calculatedDigest)
+	}
+	if graph.manifest.RootID != proto.DeriveTargetID(proto.GraphNodeKindSelector, "root") {
+		t.Fatalf("root id=%x", graph.manifest.RootID)
+	}
+	if len(graph.manifest.Nodes) != 9 || len(graph.nodesByID) != 9 || len(graph.leafIDs) != 6 {
+		t.Fatalf("wire metadata=(nodes=%d indexed=%d leaves=%d) want (9,9,6)", len(graph.manifest.Nodes), len(graph.nodesByID), len(graph.leafIDs))
+	}
+	for _, flattened := range []struct {
+		kind proto.GraphNodeKind
+		name string
+	}{
+		{kind: proto.GraphNodeKindBond, name: "bulk-inner"},
+		{kind: proto.GraphNodeKindRace, name: "fast-inner"},
+	} {
+		if _, exists := graph.nodesByID[proto.DeriveTargetID(flattened.kind, flattened.name)]; exists {
+			t.Fatalf("flattened target %q entered wire manifest", flattened.name)
+		}
+	}
+	for name, weight := range map[string]uint16{"primary": 7, "bulk-b": 2, "bulk-c": 3} {
+		node := manifestNodeByName(t, graph.manifest, name)
+		if node.Weight != weight {
+			t.Fatalf("manifest path %q weight=%d want %d", name, node.Weight, weight)
+		}
+		if indexed := graph.nodesByID[node.ID]; indexed == nil || indexed.name != name {
+			t.Fatalf("manifest path %q is not indexed by id", name)
+		}
+		if _, leaf := graph.leafIDs[node.ID]; !leaf {
+			t.Fatalf("manifest path %q is not in leaf membership", name)
+		}
+	}
+	rootNode := manifestNodeByName(t, graph.manifest, "root")
+	if got := manifestTargetNames(graph, rootNode.Children); strings.Join(got, ",") != "primary,bulk,fast" {
+		t.Fatalf("manifest root children=%v", got)
+	}
+	if got := manifestTargetNames(graph, rootNode.PeakCandidates); !sameStrings(got, []string{"bulk", "fast"}) {
+		t.Fatalf("manifest root peak candidates=%v", got)
+	}
+	wire, err := graph.manifest.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, localOnly := range []string{"edge.example:443", "source-a", "rendr", "zeta"} {
+		if bytes.Contains(wire, []byte(localOnly)) {
+			t.Fatalf("local-only value %q entered wire manifest", localOnly)
+		}
 	}
 }
 
@@ -86,7 +151,7 @@ func TestCompileTargetGraphCanonicalDeterminism(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(first.canonical) != string(second.canonical) || first.digest != second.digest {
+	if string(first.canonical) != string(second.canonical) || first.localDigest != second.localDigest || first.digest != second.digest {
 		t.Fatalf("equivalent graphs differ\nfirst:  %s\nsecond: %s", first.canonical, second.canonical)
 	}
 
@@ -99,6 +164,119 @@ func TestCompileTargetGraphCanonicalDeterminism(t *testing.T) {
 	}
 	if first.digest == reordered.digest {
 		t.Fatal("child order did not affect graph digest")
+	}
+}
+
+func TestCompileTargetGraphWireManifestExcludesLocalConfiguration(t *testing.T) {
+	first, err := compileTargetGraph(Selector("root", []Target{
+		Path("a", PathSpec{
+			Transport: "tcp",
+			Address:   "first.example:443",
+			Local:     "source-a",
+			Weight:    3,
+			Opts:      map[string]string{"credential": "first", "alpn": "one"},
+		}),
+	}, PeakTransfer{Targets: []string{"a"}, SaturationRatio: 0.8, SaturationFor: time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := compileTargetGraph(Selector("root", []Target{
+		Path("a", PathSpec{
+			Transport: "quic",
+			Address:   "second.example:8443",
+			Local:     "source-b",
+			Weight:    3,
+			Opts:      map[string]string{"credential": "second", "alpn": "two"},
+		}),
+	}, PeakTransfer{Targets: []string{"a"}, SaturationRatio: 0.95, SaturationFor: 20 * time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.digest != second.digest {
+		t.Fatalf("local configuration changed session graph digest: %x != %x", first.digest, second.digest)
+	}
+	if first.localDigest == second.localDigest || bytes.Equal(first.canonical, second.canonical) {
+		t.Fatal("distinct local configuration did not change local snapshot")
+	}
+
+	changedWeight, err := compileTargetGraph(Selector("root", []Target{
+		Path("a", PathSpec{Transport: "tcp", Weight: 4}),
+	}, PeakTransfer{Targets: []string{"a"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.digest == changedWeight.digest {
+		t.Fatal("path weight did not change session graph digest")
+	}
+}
+
+func TestCompileTargetGraphSameModeNormalizationHasStableManifest(t *testing.T) {
+	tests := []struct {
+		name   string
+		nested Target
+		flat   Target
+	}{
+		{
+			name: "bond",
+			nested: Bond("root", []Target{
+				Path("a", PathSpec{Weight: 1}),
+				Bond("absorbed", []Target{Path("b", PathSpec{Weight: 2}), Path("c", PathSpec{Weight: 3})}),
+			}),
+			flat: Bond("root", []Target{
+				Path("a", PathSpec{Weight: 1}),
+				Path("b", PathSpec{Weight: 2}),
+				Path("c", PathSpec{Weight: 3}),
+			}),
+		},
+		{
+			name: "race",
+			nested: Race("root", []Target{
+				Race("absorbed", []Target{Path("a", PathSpec{}), Path("b", PathSpec{})}),
+				Path("c", PathSpec{}),
+			}),
+			flat: Race("root", []Target{
+				Path("a", PathSpec{}),
+				Path("b", PathSpec{}),
+				Path("c", PathSpec{}),
+			}),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nested, err := compileTargetGraph(test.nested)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flat, err := compileTargetGraph(test.flat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nested.digest != flat.digest {
+				t.Fatalf("equivalent normalized manifests differ: %x != %x", nested.digest, flat.digest)
+			}
+			nestedWire, err := nested.manifest.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			flatWire, err := flat.manifest.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(nestedWire, flatWire) {
+				t.Fatalf("equivalent normalized manifest bytes differ\nnested: %x\nflat:   %x", nestedWire, flatWire)
+			}
+			if bytes.Equal(nested.canonical, flat.canonical) || nested.localDigest == flat.localDigest {
+				t.Fatal("local snapshot lost absorbed group identity")
+			}
+			absorbedKind, err := graphNodeKind(nested.nodesByName["absorbed"].kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := nested.nodesByID[proto.DeriveTargetID(absorbedKind, "absorbed")]; exists {
+				t.Fatal("absorbed group identity entered manifest index")
+			}
+		})
 	}
 }
 
@@ -148,7 +326,10 @@ func TestCompileTargetGraphRejectsInvalidGraphs(t *testing.T) {
 		{name: "unknown peak", root: Selector("root", []Target{Path("a", PathSpec{})}, PeakTransfer{Targets: []string{"missing"}}), want: "unknown PeakTransfer reference"},
 		{name: "non-immediate peak", root: Selector("root", []Target{Bond("bulk", []Target{Path("a", PathSpec{})})}, PeakTransfer{Targets: []string{"a"}}), want: "unknown PeakTransfer reference"},
 		{name: "conflicting path name", root: Path("a", PathSpec{Opts: map[string]string{"name": "b"}}), want: "conflicts with PathSpec option name"},
+		{name: "invalid utf8 name", root: Path(string([]byte{0xff}), PathSpec{}), want: "valid UTF-8"},
+		{name: "overlong name", root: Path(strings.Repeat("n", proto.GraphManifestMaxNameBytes+1), PathSpec{}), want: "maximum"},
 		{name: "too deep", root: targetGraphAtDepth(targetGraphMaxDepth + 1), want: "depth exceeds"},
+		{name: "manifest too large", root: targetGraphWithNodes(800), want: "wire size exceeds"},
 		{name: "too many nodes", root: targetGraphWithNodes(targetGraphMaxNodes + 1), want: "node count exceeds"},
 	}
 
@@ -171,12 +352,13 @@ func TestCompileTargetGraphAcceptsBounds(t *testing.T) {
 		t.Fatalf("maxDepth=%d want %d", depthGraph.maxDepth, targetGraphMaxDepth)
 	}
 
-	nodeGraph, err := compileTargetGraph(targetGraphWithNodes(targetGraphMaxNodes))
+	const acceptedNodes = 512
+	nodeGraph, err := compileTargetGraph(targetGraphWithNodes(acceptedNodes))
 	if err != nil {
 		t.Fatalf("node boundary rejected: %v", err)
 	}
-	if nodeGraph.nodeCount != targetGraphMaxNodes {
-		t.Fatalf("nodeCount=%d want %d", nodeGraph.nodeCount, targetGraphMaxNodes)
+	if nodeGraph.nodeCount != acceptedNodes || len(nodeGraph.manifest.Nodes) != acceptedNodes {
+		t.Fatalf("nodeCount=(local=%d manifest=%d) want %d", nodeGraph.nodeCount, len(nodeGraph.manifest.Nodes), acceptedNodes)
 	}
 }
 
@@ -190,11 +372,20 @@ func TestCompileTargetGraphOwnsSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCanonical := string(graph.canonical)
+	wantManifest, err := graph.manifest.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLocalDigest := graph.localDigest
 	wantDigest := graph.digest
 
 	opts["alpn"] = "changed"
 	peakTargets[0] = "changed"
-	if string(graph.canonical) != wantCanonical || graph.digest != wantDigest {
+	gotManifest, err := graph.manifest.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(graph.canonical) != wantCanonical || graph.localDigest != wantLocalDigest || graph.digest != wantDigest || !bytes.Equal(gotManifest, wantManifest) {
 		t.Fatal("compiled graph changed after caller mutation")
 	}
 	if got := graph.nodesByName["a"].path.Opts["alpn"]; got != "rendr" {
@@ -203,6 +394,38 @@ func TestCompileTargetGraphOwnsSnapshot(t *testing.T) {
 	if got := graph.root.peak.Targets[0]; got != "a" {
 		t.Fatalf("compiled peak target=%q want a", got)
 	}
+}
+
+func manifestNodeByName(t *testing.T, manifest proto.GraphManifest, name string) proto.GraphNode {
+	t.Helper()
+	for _, node := range manifest.Nodes {
+		if node.Name == name {
+			return node
+		}
+	}
+	t.Fatalf("manifest node %q not found", name)
+	return proto.GraphNode{}
+}
+
+func manifestTargetNames(graph compiledTargetGraph, ids []proto.TargetID) []string {
+	names := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if node := graph.nodesByID[id]; node != nil {
+			names = append(names, node.name)
+		}
+	}
+	return names
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	got = append([]string(nil), got...)
+	want = append([]string(nil), want...)
+	sort.Strings(got)
+	sort.Strings(want)
+	return slices.Equal(got, want)
 }
 
 func targetGraphChildNames(node *targetGraphNode) []string {

@@ -191,12 +191,18 @@ func TestDialPacketRejectsHelloAckWithoutPacketCapability(t *testing.T) {
 			return nil, fmt.Errorf("DialPacket HELLO omitted packet-mode capability")
 		}
 
-		ackPayload := proto.HelloAckPayload{
-			Negotiation: hello.Negotiation,
-			FlowID:      hello.FlowID,
-			InstanceID:  proto.InstanceID{1},
-			Caps:        0,
-		}.Encode()
+		ackPayload, err := (proto.HelloAckPayload{
+			Negotiation:         hello.Negotiation,
+			FlowID:              hello.FlowID,
+			InstanceID:          proto.InstanceID{1},
+			Caps:                0,
+			InitialTargetID:     hello.InitialTargetID,
+			AcceptedPeerBinding: proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
+			LocalTXManifest:     hello.LocalTXManifest,
+		}).Encode()
+		if err != nil {
+			return nil, err
+		}
 		ackHeader := proto.Header{
 			Version: proto.Version,
 			Type:    proto.FrameCtrl,

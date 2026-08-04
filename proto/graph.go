@@ -16,7 +16,9 @@ const (
 	GraphManifestMaxNodes     = 1024
 	GraphManifestMaxDepth     = 32
 	GraphManifestMaxNameBytes = 255
-	GraphManifestMaxWireBytes = 1 << 20
+	// A manifest is embedded in one HELLO control frame. Leave room for the
+	// fixed handshake envelope inside the engine's 32 KiB payload ceiling.
+	GraphManifestMaxWireBytes = 30 << 10
 )
 
 const (
@@ -77,6 +79,26 @@ type GraphNode struct {
 type GraphManifest struct {
 	RootID TargetID
 	Nodes  []GraphNode
+}
+
+// Node returns a copy of the node identified by id.
+func (m GraphManifest) Node(id TargetID) (GraphNode, bool) {
+	for _, node := range m.Nodes {
+		if node.ID == id {
+			return node, true
+		}
+	}
+	return GraphNode{}, false
+}
+
+// NodeByName returns a copy of the uniquely named node.
+func (m GraphManifest) NodeByName(name string) (GraphNode, bool) {
+	for _, node := range m.Nodes {
+		if node.Name == name {
+			return node, true
+		}
+	}
+	return GraphNode{}, false
 }
 
 // DeriveTargetID returns the stable v1 identity for a node kind and name.

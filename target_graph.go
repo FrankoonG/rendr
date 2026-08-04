@@ -7,6 +7,8 @@ import (
 	"math"
 	"reflect"
 	"sort"
+
+	"github.com/FrankoonG/rendr/proto"
 )
 
 const (
@@ -20,9 +22,13 @@ const (
 // same-kind groups absorbed into bond and race scheduling domains.
 type compiledTargetGraph struct {
 	root        *targetGraphNode
+	manifest    proto.GraphManifest
 	canonical   []byte
-	digest      [sha256.Size]byte
+	localDigest [sha256.Size]byte
+	digest      proto.GraphDigest
 	nodesByName map[string]*targetGraphNode
+	nodesByID   map[proto.TargetID]*targetGraphNode
+	leafIDs     map[proto.TargetID]struct{}
 	nodeCount   int
 	maxDepth    int
 }
@@ -34,6 +40,7 @@ type targetGraphNode struct {
 	peak      *PeakTransfer
 	children  []*targetGraphNode
 	flattened bool
+	id        proto.TargetID
 }
 
 type targetGraphCompiler struct {
@@ -59,14 +66,118 @@ func compileTargetGraph(root Target) (compiledTargetGraph, error) {
 	if err != nil {
 		return compiledTargetGraph{}, fmt.Errorf("rendr: serialize target graph: %w", err)
 	}
+	manifest, digest, nodesByID, leafIDs, err := buildTargetGraphManifest(node)
+	if err != nil {
+		return compiledTargetGraph{}, err
+	}
 	return compiledTargetGraph{
 		root:        node,
+		manifest:    manifest,
 		canonical:   canonical,
-		digest:      sha256.Sum256(canonical),
+		localDigest: sha256.Sum256(canonical),
+		digest:      digest,
 		nodesByName: c.nodesByName,
+		nodesByID:   nodesByID,
+		leafIDs:     leafIDs,
 		nodeCount:   c.nodeCount,
 		maxDepth:    c.maxDepth,
 	}, nil
+}
+
+type targetGraphManifestBuilder struct {
+	nodes     []proto.GraphNode
+	nodesByID map[proto.TargetID]*targetGraphNode
+	leafIDs   map[proto.TargetID]struct{}
+}
+
+// buildTargetGraphManifest projects only remotely meaningful scheduling
+// semantics. Dial addresses, local bindings, opaque options, policy tuning,
+// and identities of same-mode groups absorbed during normalization remain in
+// the local snapshot and never enter the session graph digest.
+func buildTargetGraphManifest(root *targetGraphNode) (
+	proto.GraphManifest,
+	proto.GraphDigest,
+	map[proto.TargetID]*targetGraphNode,
+	map[proto.TargetID]struct{},
+	error,
+) {
+	b := targetGraphManifestBuilder{
+		nodesByID: make(map[proto.TargetID]*targetGraphNode),
+		leafIDs:   make(map[proto.TargetID]struct{}),
+	}
+	rootID, err := b.add(root)
+	if err != nil {
+		return proto.GraphManifest{}, proto.GraphDigest{}, nil, nil, err
+	}
+	manifest := proto.GraphManifest{RootID: rootID, Nodes: b.nodes}
+	digest, err := manifest.Digest()
+	if err != nil {
+		return proto.GraphManifest{}, proto.GraphDigest{}, nil, nil, fmt.Errorf("rendr: invalid target graph manifest: %w", err)
+	}
+	return manifest, digest, b.nodesByID, b.leafIDs, nil
+}
+
+func (b *targetGraphManifestBuilder) add(node *targetGraphNode) (proto.TargetID, error) {
+	if node == nil {
+		return proto.TargetID{}, fmt.Errorf("rendr: target graph manifest contains a nil node")
+	}
+	kind, err := graphNodeKind(node.kind)
+	if err != nil {
+		return proto.TargetID{}, err
+	}
+	id := proto.DeriveTargetID(kind, node.name)
+	if previous, exists := b.nodesByID[id]; exists {
+		return proto.TargetID{}, fmt.Errorf("rendr: target id collision between %q and %q", previous.name, node.name)
+	}
+	node.id = id
+	b.nodesByID[id] = node
+
+	wireNode := proto.GraphNode{ID: id, Kind: kind, Name: node.name}
+	if node.kind == TargetKindPath {
+		if node.path == nil {
+			return proto.TargetID{}, fmt.Errorf("rendr: path target %q has no path spec", node.name)
+		}
+		wireNode.Weight = node.path.Weight
+		b.leafIDs[id] = struct{}{}
+		b.nodes = append(b.nodes, wireNode)
+		return id, nil
+	}
+
+	childIDs := make(map[string]proto.TargetID, len(node.children))
+	for _, child := range node.children {
+		childID, err := b.add(child)
+		if err != nil {
+			return proto.TargetID{}, err
+		}
+		wireNode.Children = append(wireNode.Children, childID)
+		childIDs[child.name] = childID
+	}
+	if node.peak != nil {
+		for _, name := range node.peak.Targets {
+			peakID, exists := childIDs[name]
+			if !exists {
+				return proto.TargetID{}, fmt.Errorf("rendr: selector target %q has unknown manifest PeakTransfer reference %q", node.name, name)
+			}
+			wireNode.PeakCandidates = append(wireNode.PeakCandidates, peakID)
+		}
+	}
+	b.nodes = append(b.nodes, wireNode)
+	return id, nil
+}
+
+func graphNodeKind(kind TargetKind) (proto.GraphNodeKind, error) {
+	switch kind {
+	case TargetKindPath:
+		return proto.GraphNodeKindPath, nil
+	case TargetKindSelector:
+		return proto.GraphNodeKindSelector, nil
+	case TargetKindBond:
+		return proto.GraphNodeKindBond, nil
+	case TargetKindRace:
+		return proto.GraphNodeKindRace, nil
+	default:
+		return proto.GraphNodeKindInvalid, fmt.Errorf("rendr: unknown target kind %q", kind)
+	}
 }
 
 // compileDialPlan derives the temporary flat dispatcher input from the same
@@ -154,6 +265,64 @@ func modeForTargetKind(kind TargetKind) (Mode, error) {
 	default:
 		return 0, fmt.Errorf("rendr: unknown target kind %q", kind)
 	}
+}
+
+func (g compiledTargetGraph) resolvePathSpec(spec PathSpec, attached []PathInfo) (PathSpec, error) {
+	if name := pathSpecName(spec); name != "" {
+		node, ok := g.nodesByName[name]
+		if !ok || node.path == nil {
+			return PathSpec{}, fmt.Errorf("rendr: %q is not a path in the session graph", name)
+		}
+		if !samePathConfig(*node.path, spec) {
+			return PathSpec{}, fmt.Errorf("rendr: path %q does not match the frozen session graph", name)
+		}
+		return clonePathSpec(*node.path), nil
+	}
+
+	candidates := make([]*targetGraphNode, 0, 2)
+	for _, node := range g.nodesByName {
+		if node.path != nil && samePathConfig(*node.path, spec) {
+			candidates = append(candidates, node)
+		}
+	}
+	if len(candidates) == 0 {
+		return PathSpec{}, fmt.Errorf("rendr: path is not present in the frozen session graph")
+	}
+	attachedNames := make(map[string]bool, len(attached))
+	for _, path := range attached {
+		attachedNames[pathSpecName(path.Spec)] = true
+	}
+	missing := make([]*targetGraphNode, 0, len(candidates))
+	for _, candidate := range candidates {
+		if !attachedNames[candidate.name] {
+			missing = append(missing, candidate)
+		}
+	}
+	if len(missing) == 1 {
+		return clonePathSpec(*missing[0].path), nil
+	}
+	if len(candidates) == 1 {
+		return clonePathSpec(*candidates[0].path), nil
+	}
+	return PathSpec{}, fmt.Errorf("rendr: path matches multiple graph leaves; specify a target name")
+}
+
+func samePathConfig(frozen, candidate PathSpec) bool {
+	if frozen.Transport != candidate.Transport || frozen.Address != candidate.Address ||
+		frozen.Local != candidate.Local || frozen.Weight != candidate.Weight {
+		return false
+	}
+	for key, value := range frozen.Opts {
+		if key != "name" && candidate.Opts[key] != value {
+			return false
+		}
+	}
+	for key, value := range candidate.Opts {
+		if key != "name" && frozen.Opts[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *targetGraphCompiler) compile(target Target, depth int) (*targetGraphNode, error) {
