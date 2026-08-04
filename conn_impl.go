@@ -114,9 +114,9 @@ func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint
 // listener-side path attach logic. Not part of the public API.
 func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
 
-// ForceKillPathForTest is a method-set backdoor that lets external
-// test harnesses (regress/internal/smoke, chaos/cmd/g4) simulate a
-// sudden death on path id by duck-typed interface assertion:
+// ForceKillPathForTest is a method-set backdoor that lets private
+// integration harnesses simulate sudden path death by duck-typed
+// interface assertion:
 //
 //	if k, ok := c.(interface{ ForceKillPathForTest(uint32) error }); ok { ... }
 //

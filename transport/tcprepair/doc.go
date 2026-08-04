@@ -1,4 +1,4 @@
-// Package tcprepair productizes the M3 spike: server-side TCP socket
+// Package tcprepair provides experimental server-side TCP socket
 // migration via Linux TCP_REPAIR. The package is Linux-only by build
 // tag; non-Linux GOOS gets a stub that errors on any call.
 //
@@ -15,26 +15,24 @@
 //
 // # What is NOT yet provided
 //
-// Production integration with rendr's path migration machinery is
-// the follow-up M3-prod-stage-2 work — see docs/tcp-migration.md.
-// Specifically:
+// Production integration with rendr's path migration machinery is not
+// yet provided. Specifically:
 //
 //   - Only an iptables-backed migration window is provided today.
 //     PathConn.MigratePathLocalAddr installs temporary DROP rules
 //     around the snapshot/restore window; nftables/conntrack policy
 //     backends are follow-up work.
 //   - Server-side only. The client socket is untouched. Symmetric
-//     client-side TCP_REPAIR (for true two-end migration) is a
-//     larger design; see docs/tcp-migration.md "对称迁移".
+//     client-side TCP_REPAIR is required for true two-end migration.
 //   - Same 5-tuple. Restoring to a DIFFERENT local addr is what
-//     enables real network migration (wifi→cellular); not in
-//     v0.1.0 scope.
+//     enables real network migration (wifi→cellular); it is not
+//     currently supported.
 //   - Single process. The snapshot lives in-memory; surviving a
 //     server-process crash needs persistence to disk + a recovery
 //     handshake. Out of scope.
 //
 // Requires Linux >= 4.5 for full TCP_REPAIR_WINDOW support (base
 // TCP_REPAIR was added in kernel 3.5). Caller must hold
-// CAP_NET_ADMIN (scripts/regress.sh's docker --cap-add=NET_ADMIN
-// provides it).
+// CAP_NET_ADMIN; the private Linux regression environment verifies
+// both privileged and permission-denied behavior.
 package tcprepair

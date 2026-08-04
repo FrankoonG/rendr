@@ -64,13 +64,13 @@ func (r *pathFactoryResolver) dialPath(ctx context.Context, spec PathSpec) (tran
 //     framing on top; a torn or reordered byte stream will fail HELLO
 //     and the path is rejected.
 //   - The returned connection MUST terminate at the same rendr peer as
-//     every other path in the Dialer (docs/plan.md §"项目定位" C1).
-//     rendr verifies this in HELLO via the shared flow_id; a mismatch
-//     causes the path to be dropped at handshake.
+//     every other path in the Dialer. rendr verifies this in HELLO via
+//     the shared flow_id; a mismatch causes the path to be dropped at
+//     handshake.
 //
 // Typical uses:
-//   - Wrap an xray-core outbound chain (vless / trojan / ss / nested /
-//     reverse) so rendr migrates across xray-protected paths.
+//   - Wrap an embedder-owned proxy or tunnel connection so rendr can
+//     migrate across paths without knowing the outer protocol.
 //   - Plug in a custom transport (e.g. a private overlay socket) that
 //     isn't worth a full transport.Transport adapter.
 //

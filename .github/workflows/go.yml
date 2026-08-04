@@ -2,7 +2,7 @@ name: go
 
 on:
   push:
-    branches: [main, "v0.1.*"]
+    branches: [main, "v1.*"]
   pull_request:
     branches: [main]
 
@@ -24,6 +24,36 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: public module boundary
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(git ls-files '*go.mod' | wc -l)" -ne 1 ]; then
+            echo 'the public tree must contain exactly one tracked Go module' >&2
+            exit 1
+          fi
+          if go list -m -f '{{.Path}}' all | grep -Fxq 'github.com/xtls/xray-core'; then
+            echo 'xray-core remains in the public module list' >&2
+            exit 1
+          fi
+          if go mod graph | grep -Fq 'github.com/xtls/xray-core@'; then
+            echo 'xray-core remains in the public module graph' >&2
+            exit 1
+          fi
+          if go list -deps -test ./... | grep -Fq 'github.com/xtls/xray-core'; then
+            echo 'xray-core remains in the public package closure' >&2
+            exit 1
+          fi
+          if git grep -n -E 'github.com/xtls/xray-core|github.com/FrankoonG/rendr/xray' -- '*.go' go.mod go.sum; then
+            echo 'xray-specific imports remain in public Go/module files' >&2
+            exit 1
+          fi
+          if git ls-files | grep -Eq '^(xray/|regress/|scripts/regress\.sh$|\.github/workflows/regress\.yml$|docker/regress\.Dockerfile$)'; then
+            echo 'private integration or heavy regression assets remain tracked' >&2
+            exit 1
+          fi
 
       - name: go vet
         run: go vet ./...

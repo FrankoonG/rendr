@@ -11,7 +11,7 @@ import (
 // BenchmarkStreamThroughputTCP measures sustained bytes/sec on a
 // single-path TCP loopback connection with no migration. It is the
 // baseline against which "with-migration" overhead is compared
-// (CLAUDE.md hard target G1: <10% regression with migrations).
+// (release target: less than 10% regression with migrations).
 //
 //	go test -bench=BenchmarkStreamThroughputTCP -benchtime=2s
 func BenchmarkStreamThroughputTCP(b *testing.B) {

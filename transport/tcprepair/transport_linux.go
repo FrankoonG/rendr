@@ -120,10 +120,9 @@ func (p *PathConn) TCPConn() *net.TCPConn { return p.tcp }
 func (p *PathConn) Snapshot() (*State, error) { return Snapshot(p.tcp) }
 
 // MigratePathLocalAddr rebuilds the underlying TCP socket via
-// TCP_REPAIR and returns a fresh PathConn. v0.1.0 supports only the
-// same local 4-tuple rebuild shape validated by the stage-1 POC; a
-// different local address still needs the broader coordination
-// protocol described in docs/handoff-2026-05-20.md.
+// TCP_REPAIR and returns a fresh PathConn. The current implementation
+// supports only the same local 4-tuple rebuild shape; a different local
+// address needs broader peer-side migration coordination.
 func (p *PathConn) MigratePathLocalAddr(newLocal string) (transport.PathConn, error) {
 	curLocal := p.tcp.LocalAddr().String()
 	if newLocal != "" && newLocal != curLocal {

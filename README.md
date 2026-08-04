@@ -43,7 +43,7 @@ the embedder's application protocol.
 | `flow_id` | The stable per-flow identifier used by rendr peers to attach new paths to the same logical flow. |
 | Path | One concrete underlying route between two rendr peers, such as a TCP connection, QUIC connection, UDP flow, gVisor carrier, or embedder-provided tunnel. |
 | Transport | The adapter that creates a path from a `PathSpec`. Built-in examples include `tcp`, `quic`, `udpflow`, and `gvisor`. |
-| Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, xray-backed, or custom. |
+| Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, tunneled, or custom. |
 | Target | A node in the policy graph. A target can be a leaf `Path`, a `Selector`, a `Race`, or a `Bond`. |
 | Root target | The policy graph entry point supplied to a `Dialer`. It replaces the older flat `Mode + Paths` shape for new integrations. |
 | Selector / prime | The single-target quality policy. It chooses one child target at a time, favoring latency, jitter, loss, and stability. |
@@ -59,7 +59,6 @@ the embedder's application protocol.
 | TUN ingress | An L3 ingress layer that captures OS IP packets and turns flows into rendr sessions. It is not itself a path policy. |
 | L3 identity | The original logical source/destination IP and port tuple carried with a flow for peer-side egress decisions. |
 | Egress hook | Embedder-owned code that decides how peer-side traffic lands after rendr has migrated the flow. |
-| xray glue | Integration code that lets rendr either appear as an xray transport or consume xray outbound chains as rendr paths. |
 | TCP_REPAIR | A Linux kernel mechanism explored for native TCP state migration. |
 | gVisor fallback | A user-space TCP path used when kernel TCP migration support is unavailable or not permitted. |
 
@@ -71,7 +70,7 @@ rendr provides:
 - Path attach, path death classification, failover, recovery, and
   migration control.
 - TCP, QUIC, opaque-UDP, and gVisor-backed carrier building blocks.
-- Integration surfaces for custom transports and xray-based embedders.
+- Standard Go integration surfaces for custom transports and embedders.
 - TUN/L3 identity building blocks for programs that need per-flow
   migration below an OS network stack.
 
@@ -85,11 +84,16 @@ rendr does not provide:
 - A default guarantee that the final destination server sees the
   original source IP.
 
+xray-core is exercised as an external Go embedder in the compatibility
+regression matrix; it is not a rendr dependency or public adapter package.
+Code that previously imported `github.com/FrankoonG/rendr/xray` must own
+that integration glue and supply standard stream or packet factories.
+
 ## Status
 
 rendr is in active pre-`v1.0` development. The API is usable for
-experimentation and internal integration, but policy graph, TUN, and
-xray glue surfaces may still evolve as the migration model is hardened.
+experimentation and internal integration, but policy graph and TUN
+surfaces may still evolve as the migration model is hardened.
 
 ## License
 
