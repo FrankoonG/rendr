@@ -62,7 +62,7 @@ func (s *Session) Close() error {
 }
 
 // DialerOption lets embedders inject per-session Dialer knobs such as
-// factories, prime timing, or migration budget without making l3ingress
+// factories, selector timing, or migration budget without making l3ingress
 // depend on top-level rendr types.
 type DialerOption func(req l3ingress.SessionRequest, d *rendr.Dialer) error
 

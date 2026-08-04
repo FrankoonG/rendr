@@ -13,7 +13,7 @@ import (
 // enginePacketConn is the concrete rendr.PacketConn returned by
 // Dialer.DialPacket and PacketListener.AcceptPacket. It wraps an
 // engine in packet-boundary mode and exposes net.PacketConn plus the
-// rendr-specific Paths/SetMode/FlowID methods.
+// rendr-specific Paths/FlowID/Status methods.
 //
 // The wire format is identical to stream-mode rendr; the only
 // difference is that SendPacket emits one DATA frame per call (no
@@ -36,7 +36,9 @@ type enginePacketConn struct {
 func newEnginePacketConn(e *engine.Engine, mode Mode, lAddr, rAddr net.Addr) *enginePacketConn {
 	pc := &enginePacketConn{e: e, lAddr: lAddr, rAddr: rAddr}
 	pc.mode.Store(uint32(mode))
-	e.SetMode(uint32(mode))
+	if kind, ok := mode.executionKind(); ok {
+		_ = e.ConfigureExecution(kind)
+	}
 	return pc
 }
 
@@ -68,10 +70,8 @@ func (c *enginePacketConn) Close() error {
 	if c.peak != nil {
 		c.peak.stopLoop()
 	}
-	if !c.closing.Swap(true) && !c.e.IsClosed() {
-		_ = c.e.SendBye(proto.ByeNormal)
-	}
-	return c.e.Close()
+	c.closing.Store(true)
+	return c.e.GracefulClose(proto.ByeNormal)
 }
 
 func (c *enginePacketConn) LocalAddr() net.Addr { return c.lAddr }
@@ -89,25 +89,6 @@ func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }
 func (c *enginePacketConn) FlowID() [16]byte  { return c.e.FlowID() }
 func (c *enginePacketConn) Status() Status {
 	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
-}
-
-func (c *enginePacketConn) SetMode(m Mode) error {
-	if !m.Valid() {
-		return ErrModeSwitchIllegal
-	}
-	cur := Mode(c.mode.Load())
-	if cur == m {
-		return nil
-	}
-	if cur == ModeRace && m == ModeBond {
-		return ErrModeSwitchIllegal
-	}
-	if cur == ModeBond && m == ModeRace {
-		return ErrModeSwitchIllegal
-	}
-	c.mode.Store(uint32(m))
-	c.e.SetMode(uint32(m))
-	return nil
 }
 
 func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
@@ -153,7 +134,7 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := engine.PerformClientBridgeTagAck(pc, c.e.FlowID(), c.e.LocalInstanceID(), c.e.PeerInstanceID(), pathSpecName(spec)); err != nil {
+	if _, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}

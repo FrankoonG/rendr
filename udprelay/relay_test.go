@@ -35,11 +35,7 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 	}()
 
 	client, err := (&rendr.Dialer{
-		Mode: rendr.ModePrime,
-		Paths: []rendr.PathSpec{
-			{Transport: "udpflow", Address: ln.Addr().String()},
-			{Transport: "udpflow", Address: ln.Addr().String()},
-		},
+		Root: packetSelector(ln.Addr().String()),
 	}).DialPacket(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -132,11 +128,7 @@ func TestDialAndServeRoundTrip(t *testing.T) {
 
 	clientRelay, err := Dial(ctx, DialConfig{
 		Dialer: &rendr.Dialer{
-			Mode: rendr.ModePrime,
-			Paths: []rendr.PathSpec{
-				{Transport: "udpflow", Address: ln.Addr().String()},
-				{Transport: "udpflow", Address: ln.Addr().String()},
-			},
+			Root: packetSelector(ln.Addr().String()),
 		},
 		LocalAddr: "127.0.0.1:0",
 	})
@@ -192,11 +184,7 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		clientRelay, err := Dial(ctx, DialConfig{
 			Dialer: &rendr.Dialer{
-				Mode: rendr.ModePrime,
-				Paths: []rendr.PathSpec{
-					{Transport: "udpflow", Address: ln.Addr().String()},
-					{Transport: "udpflow", Address: ln.Addr().String()},
-				},
+				Root: packetSelector(ln.Addr().String()),
 			},
 			LocalAddr: "127.0.0.1:0",
 		})
@@ -216,6 +204,13 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 		sendAndExpect(t, app, clientRelay.LocalAddr(), []byte(fmt.Sprintf("server-client-%d-after", i)))
 		_ = app.Close()
 	}
+}
+
+func packetSelector(addr string) rendr.Target {
+	return rendr.Selector("root", []rendr.Target{
+		rendr.Path("udp-a", rendr.PathSpec{Transport: "udpflow", Address: addr}),
+		rendr.Path("udp-b", rendr.PathSpec{Transport: "udpflow", Address: addr}),
+	})
 }
 
 func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {

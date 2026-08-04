@@ -54,18 +54,18 @@ type Limits struct {
 	// migration once zombie protection trips. Hard rule #5: 30s.
 	ZombieCooldown time.Duration
 
-	// PrimeHysteresis: prime mode requires score(primary) >
+	// SelectorHysteresis: selector mode requires score(primary) >
 	// score(other) * (1 + Hysteresis) for the dwell window before
 	// switching. Default 0.25.
-	PrimeHysteresis float64
+	SelectorHysteresis float64
 
-	// PrimeDwell: minimum duration a candidate must remain the
+	// SelectorDwell: minimum duration a candidate must remain the
 	// best-scoring path before the engine migrates to it. Default 5s.
-	PrimeDwell time.Duration
+	SelectorDwell time.Duration
 
-	// PrimeCooldown: minimum gap between two successive prime-mode
+	// SelectorCooldown: minimum gap between two successive selector-mode
 	// migrations regardless of score. Default 30s.
-	PrimeCooldown time.Duration
+	SelectorCooldown time.Duration
 
 	// BondStuckRTTMultiplier: in bond mode, a path whose latest
 	// probe-measured RTT exceeds best_path_rtt * Multiplier is
@@ -79,20 +79,20 @@ type Limits struct {
 // Changing these requires updating CLAUDE.md.
 func DefaultLimits() Limits {
 	return Limits{
-		MigrationBudget:     90 * time.Second,
-		ZombieMaxMigrations: 2,
-		ZombieCooldown:      30 * time.Second,
-		PrimeHysteresis:        0.25,
-		PrimeDwell:             5 * time.Second,
-		PrimeCooldown:          30 * time.Second,
+		MigrationBudget:        90 * time.Second,
+		ZombieMaxMigrations:    2,
+		ZombieCooldown:         30 * time.Second,
+		SelectorHysteresis:     0.25,
+		SelectorDwell:          5 * time.Second,
+		SelectorCooldown:       30 * time.Second,
 		BondStuckRTTMultiplier: 3.0,
 	}
 }
 
 // Clamp tightens user-supplied limits to the project caps.
-// MigrationBudget can be lower than 90s but not higher. The prime
+// MigrationBudget can be lower than 90s but not higher. The selector
 // knobs (hysteresis, dwell, cooldown) accept caller-supplied values
-// down to short values so tests can drive prime in seconds rather
+// down to short values so tests can drive selector in seconds rather
 // than dozens of seconds; only zero / negative get the default.
 func (l Limits) Clamp() Limits {
 	def := DefaultLimits()
@@ -105,14 +105,14 @@ func (l Limits) Clamp() Limits {
 	if l.ZombieCooldown <= 0 {
 		l.ZombieCooldown = def.ZombieCooldown
 	}
-	if l.PrimeHysteresis <= 0 {
-		l.PrimeHysteresis = def.PrimeHysteresis
+	if l.SelectorHysteresis <= 0 {
+		l.SelectorHysteresis = def.SelectorHysteresis
 	}
-	if l.PrimeDwell <= 0 {
-		l.PrimeDwell = def.PrimeDwell
+	if l.SelectorDwell <= 0 {
+		l.SelectorDwell = def.SelectorDwell
 	}
-	if l.PrimeCooldown <= 0 {
-		l.PrimeCooldown = def.PrimeCooldown
+	if l.SelectorCooldown <= 0 {
+		l.SelectorCooldown = def.SelectorCooldown
 	}
 	if l.BondStuckRTTMultiplier <= 1.0 {
 		l.BondStuckRTTMultiplier = def.BondStuckRTTMultiplier

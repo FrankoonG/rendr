@@ -8,10 +8,13 @@ import (
 	"github.com/FrankoonG/rendr/proto"
 )
 
-func TestPacketRecvWindowCoversG3T4Duration(t *testing.T) {
-	const g3T4Packets = 100_000 * 5 * 60
-	if packetRecvWindowBits <= g3T4Packets {
-		t.Fatalf("packetRecvWindowBits=%d, want > %d", packetRecvWindowBits, g3T4Packets)
+func TestPacketRecvWindowCoversReplayCreditWithoutAllocationAmplification(t *testing.T) {
+	const maximumPublishedWithoutAck = sendHistoryWindow + sendControlReserve + 1
+	if packetRecvWindowBits < maximumPublishedWithoutAck {
+		t.Fatalf("packetRecvWindowBits=%d, want >= replay credit %d", packetRecvWindowBits, maximumPublishedWithoutAck)
+	}
+	if packetRecvWindowBits > 2*maximumPublishedWithoutAck {
+		t.Fatalf("packetRecvWindowBits=%d permits allocation amplification beyond replay credit %d", packetRecvWindowBits, maximumPublishedWithoutAck)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/proto"
 )
 
 const (
@@ -61,7 +62,7 @@ func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compil
 		stop:     make(chan struct{}),
 	}
 	if !c.peakMode.Valid() {
-		c.peakMode = ModePrime
+		c.peakMode = ModeSelector
 	}
 	for i, id := range pathIDs {
 		name := ""
@@ -95,9 +96,9 @@ func (c *peakTransferController) start() {
 	if c == nil || len(c.normalIDs) == 0 || len(c.peakIDs) == 0 {
 		return
 	}
-	_ = c.e.SetDispatchPolicy(uint32(ModePrime), c.normalIDs[0], c.normalIDs, "selector")
-	_ = c.e.SendPolicyRequest(uint32(ModePrime), firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "selector-rx")
-	c.e.StartPrime(nil, 0)
+	_ = c.e.SetDispatchPolicy(proto.ExecutionKindSelector, c.normalIDs[0], c.normalIDs, "selector")
+	_ = c.e.SendPolicyRequest(proto.ExecutionKindSelector, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "selector-rx")
+	c.e.StartSelector(nil, 0)
 	go c.loop()
 }
 
@@ -202,7 +203,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		st.saturatedSince = time.Time{}
 		st.returnSince = time.Time{}
 		c.mu.Unlock()
-		c.applyPolicy(rx, uint32(c.peakMode), c.peakIDs[0], c.peakIDs, firstNonEmpty(c.peakNames), nonEmptyNames(c.peakNames), "peak-transfer")
+		c.applyPolicy(rx, c.peakMode, c.peakIDs[0], c.peakIDs, firstNonEmpty(c.peakNames), nonEmptyNames(c.peakNames), "peak-transfer")
 		c.mu.Lock()
 		return
 	}
@@ -221,7 +222,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 			st.returnSince = time.Time{}
 			st.suppressUntil = now.Add(defaultPeakSuppressFor)
 			c.mu.Unlock()
-			c.applyPolicy(rx, uint32(ModePrime), c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-verify-failed")
+			c.applyPolicy(rx, ModeSelector, c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-verify-failed")
 			c.mu.Lock()
 			return
 		}
@@ -254,20 +255,24 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	st.peakBytes = 0
 	st.returnSince = time.Time{}
 	c.mu.Unlock()
-	c.applyPolicy(rx, uint32(ModePrime), c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-return")
+	c.applyPolicy(rx, ModeSelector, c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-return")
 	c.mu.Lock()
 }
 
-func (c *peakTransferController) applyPolicy(rx bool, mode uint32, activeID uint32, scopeIDs []uint32, activeName string, scopeNames []string, cause string) {
+func (c *peakTransferController) applyPolicy(rx bool, mode Mode, activeID uint32, scopeIDs []uint32, activeName string, scopeNames []string, cause string) {
+	kind, ok := mode.executionKind()
+	if !ok {
+		return
+	}
 	if rx {
 		if activeName == "" || len(scopeNames) == 0 {
 			return
 		}
-		_ = c.e.SendPolicyRequest(mode, activeName, scopeNames, cause+"-rx")
+		_ = c.e.SendPolicyRequest(kind, activeName, scopeNames, cause+"-rx")
 		return
 	}
-	_ = c.e.SetDispatchPolicy(mode, activeID, scopeIDs, cause)
-	c.setMode(Mode(mode))
+	_ = c.e.SetDispatchPolicy(kind, activeID, scopeIDs, cause)
+	c.setMode(mode)
 }
 
 func (c *peakTransferController) peakHealthy() bool {

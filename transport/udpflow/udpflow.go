@@ -133,6 +133,9 @@ func (p *PathConn) Read(buf []byte) (int, error) {
 		if err != nil {
 			continue
 		}
+		if h.Version != proto.UDPFlowVersion {
+			continue
+		}
 		if h.FlowID != p.flowID {
 			// Wrong flow on a shared socket - shouldn't happen on a
 			// connected UDP socket but stay safe.

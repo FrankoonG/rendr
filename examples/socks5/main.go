@@ -171,20 +171,19 @@ func dialRendr(ctx context.Context, serverAddr, pathList string) (rendr.Conn, er
 		pathList = serverAddr
 	}
 	addrs := strings.Split(pathList, ",")
-	paths := make([]rendr.PathSpec, 0, len(addrs))
+	targets := make([]rendr.Target, 0, len(addrs))
 	for _, addr := range addrs {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			continue
 		}
-		paths = append(paths, rendr.PathSpec{Transport: "tcp", Address: addr})
+		targets = append(targets, rendr.Path(fmt.Sprintf("path-%d", len(targets)+1), rendr.PathSpec{Transport: "tcp", Address: addr}))
 	}
-	if len(paths) == 0 {
+	if len(targets) == 0 {
 		return nil, errors.New("no rendr paths configured")
 	}
 	d := &rendr.Dialer{
-		Mode:  rendr.ModePrime,
-		Paths: paths,
+		Root: rendr.Selector("root", targets),
 	}
 	return d.Dial(ctx)
 }

@@ -39,7 +39,7 @@ func TestUDPFlowHeaderRejectsShort(t *testing.T) {
 // end-to-end including the payload slice contract.
 func TestUDPFlowFrameRoundTrip(t *testing.T) {
 	want := UDPFlowFrame{
-		Header:  UDPFlowHeader{Version: 0, FlowID: [UDPFlowIDSize]byte{9, 8, 7, 6, 5, 4, 3}},
+		Header:  UDPFlowHeader{Version: UDPFlowVersion, FlowID: [UDPFlowIDSize]byte{9, 8, 7, 6, 5, 4, 3}},
 		Payload: []byte("opaque udp body"),
 	}
 	wire, err := want.Encode()
@@ -62,14 +62,14 @@ func TestUDPFlowFrameRoundTrip(t *testing.T) {
 // without bumping UDPFlowVersion violates CLAUDE.md hard rule #7.
 func TestUDPFlowWireStability(t *testing.T) {
 	h := UDPFlowHeader{
-		Version: 0,
+		Version: UDPFlowVersion,
 		FlowID:  [UDPFlowIDSize]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77},
 	}
 	var buf [UDPFlowHeaderSize]byte
 	if err := h.Encode(buf[:]); err != nil {
 		t.Fatal(err)
 	}
-	want := []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
+	want := []byte{0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
 	if !bytes.Equal(buf[:], want) {
 		t.Fatalf("wire drift:\n got=%x\nwant=%x\n(bumping UDPFlowVersion is required if intentional)", buf, want)
 	}

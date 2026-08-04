@@ -16,28 +16,19 @@ import (
 )
 
 // applyOptsToTLS clones base and applies any path-spec overrides
-// (server_name, alpn, insecure, ca_pem). Returning a fresh clone
+// (server_name, insecure, ca_pem). Returning a fresh clone
 // every call keeps concurrent DialPath calls from racing on the
 // shared base.
 func applyOptsToTLS(base *tls.Config, opts map[string]string) (*tls.Config, error) {
 	out := base.Clone()
+	out.NextProtos = []string{ALPN}
 	if v, ok := opts["server_name"]; ok && v != "" {
 		out.ServerName = v
 	}
 	if v, ok := opts["alpn"]; ok && v != "" {
 		parts := strings.Split(v, ",")
-		out.NextProtos = parts
-		// Force the rendr ALPN to appear in the list - even if the
-		// embedder forgot it - because the server side advertises it.
-		hasRendr := false
-		for _, p := range parts {
-			if strings.TrimSpace(p) == ALPN {
-				hasRendr = true
-				break
-			}
-		}
-		if !hasRendr {
-			out.NextProtos = append(out.NextProtos, ALPN)
+		if len(parts) != 1 || strings.TrimSpace(parts[0]) != ALPN {
+			return nil, fmt.Errorf("quic: alpn must be exactly %q", ALPN)
 		}
 	}
 	if v, ok := opts["insecure"]; ok && v == "true" {
@@ -56,11 +47,10 @@ func applyOptsToTLS(base *tls.Config, opts map[string]string) (*tls.Config, erro
 	return out, nil
 }
 
-// ALPN is the protocol identifier rendr advertises in QUIC TLS.
-// Embedders that want a custom ALPN must override via the Transport
-// constructor; the value is wire-stable so any change requires
-// bumping proto.Version per CLAUDE.md hard rule #7.
-const ALPN = "rendr/0"
+// ALPN is the only protocol identifier rendr advertises in QUIC TLS.
+// It names the v1 protocol family; compact-frame compatibility is
+// validated by the mandatory inner handshake before session allocation.
+const ALPN = "rendr/1"
 
 // devTLSConfig builds an insecure self-signed TLS config suitable for
 // dev / test loopback. Production embedders must supply their own

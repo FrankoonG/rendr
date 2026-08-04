@@ -63,11 +63,11 @@ func TestHeaderRejectsShortBuf(t *testing.T) {
 // format). Either bump these intentionally (and update the byte
 // tests in lockstep) or do not change them.
 func TestVersionConstants(t *testing.T) {
-	if Version != 2 {
-		t.Errorf("proto.Version drifted: got %d want 2", Version)
+	if Version != 3 {
+		t.Errorf("proto.Version drifted: got %d want 3", Version)
 	}
-	if UDPFlowVersion != 0 {
-		t.Errorf("proto.UDPFlowVersion drifted: got %d want 0", UDPFlowVersion)
+	if UDPFlowVersion != 1 {
+		t.Errorf("proto.UDPFlowVersion drifted: got %d want 1", UDPFlowVersion)
 	}
 }
 

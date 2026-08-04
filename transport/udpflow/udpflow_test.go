@@ -51,7 +51,7 @@ func TestUDPFlowDialAndWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := append([]byte{
-		0x00,                                     // VER
+		proto.UDPFlowVersion,                     // VER
 		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // FLOW_ID
 	}, frame...) //nolint:gocritic // intentional concat
 	if !bytes.Equal(buf[:got], want) {
@@ -89,13 +89,19 @@ func TestUDPFlowDialReadRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Peer reads the datagram and echoes it back verbatim.
+	// Peer reads the datagram. An old-epoch copy must be ignored before the
+	// valid echo is accepted on the same flow id.
 	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 2048)
 	n, src, err := peer.ReadFromUDP(buf)
 	if err != nil {
+		t.Fatal(err)
+	}
+	oldEpoch := append([]byte(nil), buf[:n]...)
+	oldEpoch[0] = 0
+	if _, err := peer.WriteToUDP(oldEpoch, src); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := peer.WriteToUDP(buf[:n], src); err != nil {

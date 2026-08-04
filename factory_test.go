@@ -45,10 +45,10 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 		return net.Dial("tcp", addr)
 	}
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "factory-tcp", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "factory-tcp", Address: ln.Addr().String()}})}
+
 	if err := d.AddStreamPathFactory("factory-tcp", factory); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 	}
 	probeAddr := probe.Addr().String()
 	probe.Close()
-	d := &Dialer{Paths: []PathSpec{{Transport: "no-such-transport", Address: probeAddr}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "no-such-transport", Address: probeAddr}})}
 	if _, err := d.Dial(context.Background()); err == nil {
 		t.Fatal("expected dial error for unknown transport")
 	}
@@ -125,7 +125,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 		accepted <- c
 	}()
 
-	d2 := &Dialer{Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	d2 := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	c, err := d2.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial via global tcp: %v", err)
@@ -190,10 +190,10 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "factory-udp", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "factory-udp", Address: ln.Addr().String()}})}
+
 	if err := d.AddPacketPathFactory("factory-udp", factory); err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
-	d := &Dialer{Paths: []PathSpec{{Transport: transportName, Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: transportName, Address: ln.Addr().String()}})}
 	if err := d.AddStreamPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
-	d := &Dialer{Paths: []PathSpec{{Transport: transportName, Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: transportName, Address: ln.Addr().String()}})}
 	if err := d.AddPacketPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
 	}
@@ -396,10 +396,10 @@ func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
 	d := &Dialer{
-		Paths: []PathSpec{
+		Root: selectorRoot([]PathSpec{
 			{Transport: transportName, Address: ln.Addr().String()},
 			{Transport: transportName, Address: ln.Addr().String()},
-		},
+		}),
 		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
 	}
 	if err := d.AddStreamPathFactory(transportName, original); err != nil {
@@ -447,10 +447,10 @@ func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
 	d := &Dialer{
-		Paths: []PathSpec{
+		Root: selectorRoot([]PathSpec{
 			{Transport: transportName, Address: ln.Addr().String()},
 			{Transport: transportName, Address: ln.Addr().String()},
-		},
+		}),
 		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
 	}
 	if err := d.AddPacketPathFactory(transportName, original); err != nil {

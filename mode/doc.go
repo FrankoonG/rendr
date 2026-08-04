@@ -1,5 +1,5 @@
 // Package mode defines the Scheduler contract between the rendr
-// engine and a mode strategy (prime / bond / race).
+// engine and a mode strategy (selector / bond / race).
 //
 // The engine owns the frame stream and the path set; the Scheduler
 // is a pure function from (frame, available paths) → (paths to send

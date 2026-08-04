@@ -1,4 +1,4 @@
-// Package proto defines the rendr control-plane wire format v1.
+// Package proto defines the rendr control-plane wire format.
 //
 // Every rendr frame on the wire carries an 8-byte header:
 //
@@ -10,7 +10,7 @@
 //		|                     SEQ (high 32 bits)                         |
 //		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //
-//	  VER 2 bits, current value 1
+//	  VER 2 bits, current value 3
 //	  T   1 bit, 0=DATA 1=CTRL
 //	  F   1 bit, last-frame-of-message (reliable streams only)
 //	  FLAGS 12 bits, mode-dependent; for CTRL frames the low 8 bits are

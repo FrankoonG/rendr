@@ -3,7 +3,6 @@ package engine
 import (
 	"io"
 	"net"
-	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -13,21 +12,22 @@ import (
 const recvBatchSize = 64
 
 const recvReorderWindowLimit = 16 * 1024
+const streamRecvWindowFrames = sendHistoryWindow
 
-// packetRecvWindowBits bounds the amount of out-of-order packet-mode
-// state we keep as a bitmap instead of one map entry per SEQ. 32 Mi
-// bits = 4 MiB and covers ~335 s at 100k pps, enough for the 5 min
-// G3-T4 gate plus tail drain without falling back to recvQueue map
-// growth when one packet gap pins expectedRecvSeq.
-const packetRecvWindowBits = 32 << 20
+// packetRecvWindowBits only needs to cover the sender's bounded unacknowledged
+// ledger. A larger window lets a malicious peer pin the receive floor while
+// forcing one frame-digest allocation per distant packet.
+const packetRecvWindowBits = 512
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
 // hold the payload bytes; ctrl frames hold the flags so the in-order
 // drainer can dispatch them after the SEQ space catches up.
 type recvItem struct {
+	slot    *pathSlot
 	isCtrl  bool
 	flags   uint16
 	payload []byte
+	digest  proto.FrameDigest
 	// packet-mode data may be delivered as soon as the first copy
 	// arrives; delivered tracks that early handoff so later SEQ-floor
 	// advancement can retire the slot without delivering twice.
@@ -96,6 +96,10 @@ func (e *Engine) packetConsumeHeadLocked() {
 	word := idx / 64
 	bit := idx % 64
 	e.recvSeenBits[word] &^= uint64(1) << bit
+	if digest, ok := e.recvFrameProofs[e.expectedRecvSeq]; ok {
+		e.recvProof = proto.AdvanceAckProof(e.recvProof, digest)
+		delete(e.recvFrameProofs, e.expectedRecvSeq)
+	}
 	if e.recvPacketMarks > 0 {
 		e.recvPacketMarks--
 	}
@@ -113,23 +117,46 @@ func (e *Engine) packetConsumeHeadLocked() {
 //   - net.ErrClosed if the engine itself was Close()d locally
 func (e *Engine) Recv(buf []byte) (int, error) {
 	e.recvMu.Lock()
-	defer e.recvMu.Unlock()
 	for {
 		if len(e.recvDeliver) > 0 {
 			n := copy(buf, e.recvDeliver)
 			e.recvDeliver = e.recvDeliver[n:]
+			e.consumeStreamDeliveryLocked(n)
+			wokeReader := e.drainContiguousLocked(nil)
+			ackNext, ackGap, ackProof := e.receiveAckStateLocked()
+			finalErr := e.takeRecvFinalLocked()
+			if wokeReader {
+				e.recvCond.Broadcast()
+			}
+			e.recvMu.Unlock()
+			e.finishReceiveProgress(ackNext, ackGap, ackProof, finalErr)
 			return n, nil
 		}
 		if e.isClosed() {
 			if err := e.CloseErr(); err != nil {
+				e.recvMu.Unlock()
 				return 0, err
 			}
+			e.recvMu.Unlock()
 			return 0, net.ErrClosed
 		}
 		if e.recvDeadlineExceededLocked() {
+			e.recvMu.Unlock()
 			return 0, ErrReadDeadlineExceeded
 		}
 		e.recvCond.Wait()
+	}
+}
+
+func (e *Engine) consumeStreamDeliveryLocked(n int) {
+	for n > 0 && len(e.recvDeliverFrames) > 0 {
+		if n < e.recvDeliverFrames[0] {
+			e.recvDeliverFrames[0] -= n
+			return
+		}
+		n -= e.recvDeliverFrames[0]
+		copy(e.recvDeliverFrames, e.recvDeliverFrames[1:])
+		e.recvDeliverFrames = e.recvDeliverFrames[:len(e.recvDeliverFrames)-1]
 	}
 }
 
@@ -144,6 +171,11 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 // for a budget exhaustion - same shape as Recv.
 func (e *Engine) RecvPacket() ([]byte, error) {
 	for {
+		select {
+		case p := <-e.recvPacketCh:
+			return p, nil
+		default:
+		}
 		e.recvMu.Lock()
 		deadline := e.recvDeadline
 		e.recvMu.Unlock()
@@ -172,6 +204,11 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 		case <-e.closed:
 			if timer != nil {
 				timer.Stop()
+			}
+			select {
+			case p := <-e.recvPacketCh:
+				return p, nil
+			default:
 			}
 			if err := e.CloseErr(); err != nil {
 				return nil, err
@@ -248,16 +285,6 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 				e.handlePathProbeReply(slot, payload)
 				continue
 			}
-			if code == proto.CtrlBye {
-				// BYE is still delivered through the SEQ-aware reorder
-				// path below, but mark the transport immediately. A peer
-				// can close its TCP write side right after sending BYE; if
-				// the resulting EOF wins the race against recvLoop draining
-				// slot.recvQ, OnDeath must still classify it as clean.
-				if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
-					pc.MarkByeSeen()
-				}
-			}
 		}
 
 		if !e.enqueueRecvFrame(slot, hdr, payload) {
@@ -281,7 +308,7 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 		return
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	_, _ = slot.conn.Write(frame)
+	_, _ = slot.writeFrame(frame)
 }
 
 // handlePathProbeReply matches the reply against an outstanding
@@ -289,7 +316,9 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 // RTT.
 func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 	if ack, ok := proto.DecodeAck(payload); ok {
-		e.notePeerAck(ack.NextSeq)
+		if e.notePeerAck(ack) && ack.Gap {
+			e.requestReplay(ack.NextSeq)
+		}
 		return
 	}
 	p, err := proto.DecodeProbe(payload)
@@ -329,27 +358,116 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 	}
 }
 
-func (e *Engine) notePeerAck(nextSeq uint64) {
-	if nextSeq > atomic.LoadUint64(&e.sendSeq) {
+func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
+	binding := e.localGraphBinding()
+	if ack.SessionEpoch != proto.SessionEpoch(e.flowID) ||
+		ack.Direction != senderDirection(e.side) ||
+		ack.GraphRevision != binding.revision ||
+		ack.GraphDigest != binding.digest ||
+		ack.NextSeq > e.sendPublishedNext.Load() {
+		return false
+	}
+	valid, application := e.acknowledgeSendFrames(ack.NextSeq, ack.Proof)
+	if valid && application {
+		e.markPayload()
+	}
+	return valid
+}
+
+type ackRequest struct {
+	nextSeq uint64
+	gap     bool
+	proof   proto.AckProof
+	waiters []chan struct{}
+}
+
+func (e *Engine) sendAck(nextSeq uint64, gap bool, proof proto.AckProof) {
+	if (nextSeq == 0 && !gap) || e.isClosed() {
 		return
 	}
-	for {
-		cur := e.sendAckNext.Load()
-		if nextSeq <= cur {
-			return
+	e.enqueueAck(ackRequest{nextSeq: nextSeq, gap: gap, proof: proof})
+}
+
+func (e *Engine) sendTerminalAck(nextSeq uint64, gap bool, proof proto.AckProof) {
+	done := make(chan struct{})
+	if !e.enqueueAck(ackRequest{nextSeq: nextSeq, gap: gap, proof: proof, waiters: []chan struct{}{done}}) {
+		return
+	}
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	case <-e.closed:
+	}
+}
+
+func (e *Engine) enqueueAck(request ackRequest) bool {
+	if e.isClosed() {
+		return false
+	}
+	e.ackMu.Lock()
+	if pending := e.ackPending; pending != nil {
+		switch {
+		case request.nextSeq < pending.nextSeq:
+			for _, waiter := range request.waiters {
+				close(waiter)
+			}
+			e.ackMu.Unlock()
+			return true
+		case request.nextSeq == pending.nextSeq:
+			pending.gap = pending.gap || request.gap
+			pending.waiters = append(pending.waiters, request.waiters...)
+			e.ackMu.Unlock()
+			return true
+		default:
+			request.waiters = append(request.waiters, pending.waiters...)
 		}
-		if e.sendAckNext.CompareAndSwap(cur, nextSeq) {
-			e.markPayload()
+	}
+	e.ackPending = &request
+	e.ackMu.Unlock()
+	select {
+	case e.ackWake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (e *Engine) ackWriterLoop() {
+	for {
+		select {
+		case <-e.closed:
 			return
+		case <-e.ackWake:
+		}
+		for {
+			e.ackMu.Lock()
+			request := e.ackPending
+			e.ackPending = nil
+			e.ackMu.Unlock()
+			if request == nil {
+				break
+			}
+			e.writeAck(*request)
+			for _, waiter := range request.waiters {
+				close(waiter)
+			}
 		}
 	}
 }
 
-func (e *Engine) sendAck(nextSeq uint64) {
-	if nextSeq == 0 || e.isClosed() {
-		return
-	}
-	payload := proto.AckPayload{NextSeq: nextSeq}.Encode()
+func (e *Engine) writeAck(request ackRequest) {
+	nextSeq, gap := request.nextSeq, request.gap
+	binding := e.peerGraphBinding()
+	payload := proto.AckPayload{
+		SessionEpoch:  proto.SessionEpoch(e.flowID),
+		Direction:     peerSenderDirection(e.side),
+		GraphRevision: binding.revision,
+		GraphDigest:   binding.digest,
+		NextSeq:       nextSeq,
+		Gap:           gap,
+		Proof:         request.proof,
+	}.Encode()
 	hdr := proto.Header{
 		Version: proto.Version,
 		Type:    proto.FrameCtrl,
@@ -363,12 +481,95 @@ func (e *Engine) sendAck(nextSeq uint64) {
 	copy(frame[proto.HeaderSize:], payload)
 
 	e.pathsMu.RLock()
-	slot := e.paths[e.activeID]
+	slots := make([]*pathSlot, 0, len(e.paths))
+	for _, slot := range e.paths {
+		slots = append(slots, slot)
+	}
 	e.pathsMu.RUnlock()
+	terminal := len(request.waiters) != 0
+	var results chan bool
+	if terminal {
+		results = make(chan bool, len(slots))
+	}
+	for _, slot := range slots {
+		e.enqueuePathAck(slot, pathAckWrite{frame: frame, terminal: terminal, result: results})
+	}
+	if !terminal || len(slots) == 0 {
+		return
+	}
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	for range slots {
+		select {
+		case ok := <-results:
+			if ok {
+				return
+			}
+		case <-timer.C:
+			return
+		case <-e.closed:
+			return
+		}
+	}
+}
+
+func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 	if slot == nil {
 		return
 	}
-	_, _ = slot.conn.Write(frame)
+	slot.ackMu.Lock()
+	if pending := slot.ackPending; pending != nil {
+		if pending.terminal && !request.terminal {
+			slot.ackMu.Unlock()
+			return
+		}
+		if pending.result != nil {
+			select {
+			case pending.result <- false:
+			default:
+			}
+		}
+	}
+	slot.ackPending = &request
+	if slot.ackRunning {
+		slot.ackMu.Unlock()
+		return
+	}
+	slot.ackRunning = true
+	slot.ackMu.Unlock()
+	go e.pathAckWriter(slot)
+}
+
+func (e *Engine) pathAckWriter(slot *pathSlot) {
+	for {
+		slot.ackMu.Lock()
+		request := slot.ackPending
+		slot.ackPending = nil
+		if request == nil {
+			slot.ackRunning = false
+			slot.ackMu.Unlock()
+			return
+		}
+		slot.ackMu.Unlock()
+
+		n, err := slot.writeFrame(request.frame)
+		ok := err == nil && n == len(request.frame)
+		if request.result != nil {
+			select {
+			case request.result <- ok:
+			default:
+			}
+		}
+		if !ok {
+			select {
+			case <-slot.quit:
+				return
+			case <-e.closed:
+				return
+			default:
+			}
+		}
+	}
 }
 
 // enqueueRecvFrame hands one fully-decoded frame to the per-path recv
@@ -407,6 +608,28 @@ func (e *Engine) recvLoop() {
 		case <-e.closed:
 			return
 		case <-e.recvWake:
+		}
+	}
+}
+
+func (e *Engine) ackLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	ticks := 0
+	for {
+		select {
+		case <-e.closed:
+			return
+		case <-ticker.C:
+			ticks++
+			e.recvMu.Lock()
+			nextSeq := e.expectedRecvSeq
+			gap := e.recvHasGapLocked()
+			proof := e.recvProof
+			e.recvMu.Unlock()
+			if gap || (nextSeq > 0 && ticks%10 == 0) {
+				e.sendAck(nextSeq, gap, proof)
+			}
 		}
 	}
 }
@@ -479,25 +702,69 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 			wokeReader = true
 		}
 	}
-	ackNext := uint64(0)
-	if e.expectedRecvSeq > e.recvAckSent {
-		e.recvAckSent = e.expectedRecvSeq
-		ackNext = e.expectedRecvSeq
-	}
-	if wokeReader || e.isClosed() {
-		e.recvCond.Broadcast()
-	}
-	e.recvMu.Unlock()
-	if ackNext != 0 {
-		e.sendAck(ackNext)
-	}
 	for _, pkt := range deliverPackets {
 		select {
 		case e.recvPacketCh <- pkt:
 		case <-e.closed:
+			e.recvMu.Unlock()
 			return
 		}
 	}
+	ackNext, ackGap, ackProof := e.receiveAckStateLocked()
+	if wokeReader || e.isClosed() {
+		e.recvCond.Broadcast()
+	}
+	finalErr := e.takeRecvFinalLocked()
+	e.recvMu.Unlock()
+	e.finishReceiveProgress(ackNext, ackGap, ackProof, finalErr)
+}
+
+func (e *Engine) receiveAckStateLocked() (uint64, bool, proto.AckProof) {
+	ackNext := uint64(0)
+	ackGap := false
+	if e.expectedRecvSeq > e.recvAckSent {
+		e.recvAckSent = e.expectedRecvSeq
+		ackNext = e.expectedRecvSeq
+	}
+	if e.recvHasGapLocked() {
+		ackNext = e.expectedRecvSeq
+		ackGap = true
+	}
+	return ackNext, ackGap, e.recvProof
+}
+
+func (e *Engine) takeRecvFinalLocked() error {
+	if e.recvFinalErr == nil || e.recvFinalHandled {
+		return nil
+	}
+	e.recvFinalHandled = true
+	return e.recvFinalErr
+}
+
+func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.AckProof, finalErr error) {
+	if finalErr != nil {
+		if nextSeq != 0 || gap {
+			e.sendTerminalAck(nextSeq, gap, proof)
+		}
+		e.setCloseErr(finalErr)
+		_ = e.Close()
+		return
+	}
+	if nextSeq != 0 || gap {
+		e.sendAck(nextSeq, gap, proof)
+	}
+}
+
+func (e *Engine) recvHasGapLocked() bool {
+	if e.recvDroppedThrough != 0 && e.expectedRecvSeq <= e.recvDroppedThrough {
+		return true
+	}
+	if len(e.recvQueue) > 0 {
+		if _, ok := e.recvQueue[e.expectedRecvSeq]; !ok {
+			return true
+		}
+	}
+	return e.packetized && e.recvPacketMarks > 0 && !e.packetHeadSeenLocked()
 }
 
 // onFrameRecvLocked inserts a frame into the reorder buffer and drains
@@ -517,11 +784,18 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		}
 		return false
 	}
+	digest := recvFrameDigest(hdr, payload)
 
 	if e.packetized && hdr.Type != proto.FrameCtrl {
 		cap := e.packetSeenCapLocked()
 		if cap > 0 {
 			delta := hdr.Seq - e.expectedRecvSeq
+			if delta >= cap || e.recvPacketMarks >= sendHistoryWindow {
+				if hdr.Seq > e.recvDroppedThrough {
+					e.recvDroppedThrough = hdr.Seq
+				}
+				return false
+			}
 			if delta < cap {
 				if e.packetSeenLocked(hdr.Seq) {
 					e.recvDups++
@@ -538,6 +812,7 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 					return false
 				}
 				e.packetMarkSeenLocked(hdr.Seq)
+				e.recvFrameProofs[hdr.Seq] = digest
 				e.recvPacketMarks++
 				*deliverPackets = append(*deliverPackets, payload)
 				e.markPayloadLocked()
@@ -545,25 +820,7 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 					e.recvQueueHWM = n
 				}
 
-				for {
-					if item, ok := e.recvQueue[e.expectedRecvSeq]; ok {
-						delete(e.recvQueue, e.expectedRecvSeq)
-						e.expectedRecvSeq++
-						e.packetAdvanceHeadLocked()
-						if item.isCtrl {
-							e.applyCtrlLocked(slot, item.flags, item.payload)
-						} else if !item.delivered {
-							*deliverPackets = append(*deliverPackets, item.payload)
-							e.markPayloadLocked()
-						}
-						continue
-					}
-					if !e.packetHeadSeenLocked() {
-						break
-					}
-					e.packetConsumeHeadLocked()
-					e.expectedRecvSeq++
-				}
+				e.drainContiguousLocked(deliverPackets)
 				return true
 			}
 		}
@@ -588,9 +845,11 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 	}
 
 	e.recvQueue[hdr.Seq] = recvItem{
+		slot:    slot,
 		isCtrl:  hdr.Type == proto.FrameCtrl,
 		flags:   hdr.Flags,
 		payload: payload,
+		digest:  digest,
 	}
 	if e.packetized && hdr.Type != proto.FrameCtrl {
 		// Packet mode follows datagram semantics: preserve packet
@@ -609,6 +868,10 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		e.recvQueueHWM = n
 	}
 
+	return e.drainContiguousLocked(deliverPackets)
+}
+
+func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 	wokeReader := false
 	for {
 		item, ok := e.recvQueue[e.expectedRecvSeq]
@@ -620,13 +883,20 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 			}
 			break
 		}
+		if !e.packetized && !item.isCtrl && len(e.recvDeliverFrames) >= streamRecvWindowFrames {
+			break
+		}
 		delete(e.recvQueue, e.expectedRecvSeq)
+		e.recvProof = proto.AdvanceAckProof(e.recvProof, item.digest)
 		e.expectedRecvSeq++
 		if e.packetized {
 			e.packetAdvanceHeadLocked()
 		}
 		if item.isCtrl {
-			e.applyCtrlLocked(slot, item.flags, item.payload)
+			e.applyCtrlLocked(item.slot, item.flags, item.payload)
+			if e.recvTerminal {
+				break
+			}
 		} else {
 			if e.packetized {
 				if !item.delivered {
@@ -637,12 +907,22 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 				}
 			} else {
 				e.recvDeliver = append(e.recvDeliver, item.payload...)
+				e.recvDeliverFrames = append(e.recvDeliverFrames, len(item.payload))
 				e.markPayloadLocked()
 			}
 			wokeReader = true
 		}
 	}
 	return wokeReader
+}
+
+func recvFrameDigest(hdr proto.Header, payload []byte) proto.FrameDigest {
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		return proto.FrameDigest{}
+	}
+	copy(frame[proto.HeaderSize:], payload)
+	return proto.DigestFrame(frame)
 }
 
 // applyCtrlLocked dispatches a control frame whose SEQ has reached
@@ -654,21 +934,35 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 	code := proto.CtrlCodeFromFlags(flags)
 	switch code {
 	case proto.CtrlBye:
-		// Peer-initiated teardown -> clean close. Record io.EOF as the
-		// close cause so the local application's Read picks up EOF.
-		if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
-			pc.MarkByeSeen()
+		if e.recvTerminal {
+			return
 		}
-		// Schedule Close in a goroutine so we do not re-enter recvMu.
-		go func() {
-			e.setCloseErr(io.EOF)
-			_ = e.Close()
-		}()
+		bye, err := proto.DecodeBye(payload)
+		closeErr := error(ErrPeerProtocol)
+		if err == nil {
+			switch bye.Reason {
+			case proto.ByeNormal:
+				closeErr = io.EOF
+				if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
+					pc.MarkByeSeen()
+				}
+			case proto.ByeMigBudget:
+				closeErr = ErrMigrationBudgetExceeded
+			case proto.ByeZombie:
+				closeErr = ErrZombie
+			case proto.ByeProtoVer:
+				closeErr = ErrPeerProtoVersion
+			case proto.ByeAppRequest:
+				closeErr = ErrPeerClosed
+			}
+		}
+		e.recvFinalErr = closeErr
+		e.recvTerminal = true
 
 	case proto.CtrlPolicyRequest:
 		if p, err := proto.DecodePolicyRequest(payload); err == nil {
 			go func() {
-				_ = e.SetDispatchPolicyByName(uint32(p.Mode), p.ActiveName, p.ScopeNames, p.Cause)
+				_ = e.SetDispatchPolicyByName(p.Kind, p.ActiveName, p.ScopeNames, p.Cause)
 			}()
 		}
 

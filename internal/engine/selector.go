@@ -14,7 +14,7 @@ import (
 // Default coefficients: rtt + jitter + 10ms per loss percent.
 type ScoreFn func(transport.PathQuality) float64
 
-// DefaultScoreFn implements the prime scoring with α=1.0 and
+// DefaultScoreFn implements the selector scoring with α=1.0 and
 // β=10ms per percent loss. β was picked so 5% loss adds 50 ms of
 // "effective RTT" - i.e. a 5% loss path is treated about as bad as
 // 50 ms of extra latency. Embedders that want a different curve can
@@ -26,10 +26,10 @@ func DefaultScoreFn(q transport.PathQuality) float64 {
 	return rtt + jit + 10.0*loss
 }
 
-// prime is the per-Engine prime-mode scheduler state. It is created
-// only when StartPrime is called; otherwise nil (and the engine
+// selector is the per-Engine selector-mode scheduler state. It is created
+// only when StartSelector is called; otherwise nil (and the engine
 // behaves like fixed-path: only death-driven migration fires).
-type prime struct {
+type selector struct {
 	mu sync.Mutex
 
 	score      ScoreFn
@@ -48,40 +48,40 @@ type prime struct {
 	done chan struct{}
 }
 
-// StartPrime arms the prime-mode quality scheduler. tickEvery sets
+// StartSelector arms the selector-mode quality scheduler. tickEvery sets
 // the cadence at which the engine re-scores paths; pass 0 for a
 // 200ms default. The scheduler runs until Engine.Close.
 //
-// Per CLAUDE.md hard rule #3 ("默认不安装主动迁移触发器"), prime
+// Per CLAUDE.md hard rule #3 ("默认不安装主动迁移触发器"), selector
 // scoring is OFF until this method is called. The Dialer wires it
-// up when Mode == ModePrime.
-func (e *Engine) StartPrime(score ScoreFn, tickEvery time.Duration) {
+// up when Mode == ModeSelector.
+func (e *Engine) StartSelector(score ScoreFn, tickEvery time.Duration) {
 	if score == nil {
 		score = DefaultScoreFn
 	}
 	if tickEvery <= 0 {
 		tickEvery = 200 * time.Millisecond
 	}
-	p := &prime{
+	p := &selector{
 		score:      score,
-		hysteresis: e.limits.PrimeHysteresis,
-		dwell:      e.limits.PrimeDwell,
-		cooldown:   e.limits.PrimeCooldown,
+		hysteresis: e.limits.SelectorHysteresis,
+		dwell:      e.limits.SelectorDwell,
+		cooldown:   e.limits.SelectorCooldown,
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
-	e.primeMu.Lock()
-	if e.prime != nil {
-		e.primeMu.Unlock()
+	e.selectorMu.Lock()
+	if e.selector != nil {
+		e.selectorMu.Unlock()
 		return
 	}
-	e.prime = p
-	e.primeMu.Unlock()
+	e.selector = p
+	e.selectorMu.Unlock()
 
 	go p.loop(e, tickEvery)
 }
 
-func (p *prime) loop(e *Engine, tick time.Duration) {
+func (p *selector) loop(e *Engine, tick time.Duration) {
 	defer close(p.done)
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -98,8 +98,8 @@ func (p *prime) loop(e *Engine, tick time.Duration) {
 }
 
 // evaluate runs one tick of the scheduler.
-func (p *prime) evaluate(e *Engine) {
-	if e.mode.Load() != dispatchPrime {
+func (p *selector) evaluate(e *Engine) {
+	if e.mode.Load() != dispatchSelector {
 		return
 	}
 	now := nowFn()
@@ -180,7 +180,7 @@ func (p *prime) evaluate(e *Engine) {
 }
 
 // SetPathQualityForTest pokes a quality reading into a specific
-// path. Used by unit tests to drive prime-mode scoring without
+// path. Used by unit tests to drive selector-mode scoring without
 // having to wait for real RTT measurements (M6(2/n) wires up the
 // HEARTBEAT-based probe; until then the engine reads only what
 // tests / external callers inject).

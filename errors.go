@@ -1,7 +1,6 @@
 package rendr
 
 import (
-	"errors"
 	"net"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -20,6 +19,9 @@ var (
 	ErrMigrationBudgetExceeded = engine.ErrMigrationBudgetExceeded
 	ErrZombie                  = engine.ErrZombie
 	ErrPeerProtoVersion        = engine.ErrPeerProtoVersion
+	ErrPeerProtocol            = engine.ErrPeerProtocol
+	ErrPeerClosed              = engine.ErrPeerClosed
+	ErrGracefulCloseTimeout    = engine.ErrGracefulCloseTimeout
 	ErrLastPath                = engine.ErrLastPath
 	ErrPacketTooLarge          = engine.ErrPacketTooLarge
 	ErrRecvWindowExceeded      = engine.ErrRecvWindowExceeded
@@ -29,12 +31,4 @@ var (
 	// payload is ready. Implements net.Error with Timeout()==true so
 	// idiomatic timeout checks via errors.As work transparently.
 	ErrReadDeadlineExceeded net.Error = engine.ErrReadDeadlineExceeded
-
-	// ErrModeSwitchIllegal is returned by Conn.SetMode for transitions
-	// that the engine refuses (e.g. race -> bond).
-	ErrModeSwitchIllegal = errors.New("rendr: illegal mode transition")
-
-	// ErrNotImplemented is a build-stage placeholder used by API
-	// surfaces whose implementations land in later milestones.
-	ErrNotImplemented = errors.New("rendr: not implemented in this milestone")
 )

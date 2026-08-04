@@ -8,7 +8,7 @@ import (
 // incoming frames into a single ordered stream.
 type Scheduler interface {
 	// Submit accepts a frame from the engine and returns the subset
-	// of paths that should carry it on this send. prime returns
+	// of paths that should carry it on this send. selector returns
 	// exactly one path; race returns all paths; bond returns one
 	// chosen per-path-weighted scheduling decision.
 	//

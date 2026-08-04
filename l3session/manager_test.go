@@ -225,7 +225,6 @@ func (f *fakeConn) SetDeadline(time.Time) error      { return nil }
 func (f *fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 func (f *fakeConn) Paths() []rendr.PathInfo          { return nil }
-func (f *fakeConn) SetMode(rendr.Mode) error         { return nil }
 func (f *fakeConn) FlowID() [16]byte                 { return [16]byte{} }
 func (f *fakeConn) Status() rendr.Status             { return rendr.Status{} }
 

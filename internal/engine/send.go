@@ -2,12 +2,13 @@ package engine
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
-	"github.com/FrankoonG/rendr/transport"
 )
 
 // SendData splits buf into ≤MaxPayload frames, assigns SEQ, encodes
@@ -46,81 +47,54 @@ func (e *Engine) SendPacket(buf []byte) error {
 	if len(buf) > MaxPayload {
 		return ErrPacketTooLarge
 	}
-	return e.sendFrameWithHistory(proto.FrameData, 0, buf, false)
+	return e.sendFrame(proto.FrameData, 0, buf)
 }
 
 // SendPolicyRequest asks the peer to update its sender policy for this flow.
 // It is intentionally just another sequenced control frame: the peer applies
 // it after earlier DATA/CTRL frames reach the reorder head.
-func (e *Engine) SendPolicyRequest(mode uint32, activeName string, scopeNames []string, cause string) error {
+func (e *Engine) SendPolicyRequest(kind proto.ExecutionKind, activeName string, scopeNames []string, cause string) error {
+	if !kind.Valid() {
+		return fmt.Errorf("engine: invalid execution kind %d", kind)
+	}
 	names := append([]string(nil), scopeNames...)
 	return e.sendFrame(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyRequest), proto.PolicyRequestPayload{
-		Mode:       uint8(mode),
+		Kind:       kind,
 		ActiveName: activeName,
 		ScopeNames: names,
 		Cause:      cause,
 	}.Encode())
 }
 
-// SendBye emits a CTRL_BYE frame on the active path. Best-effort
-// and explicitly non-retrying: if the active path is dead or
-// missing, the call returns immediately with net.ErrClosed instead
-// of engaging the migration budget. That's intentional - BYE is the
-// local-Close convention, and Close should not block 90 s on a
-// failing peer.
+// SendBye emits the final sequenced frame. It shares the same sequencer as
+// DATA so a concurrent successful Write is always ordered before the final
+// sequence number and the receiver cannot observe an early clean EOF.
 func (e *Engine) SendBye(reason proto.ByeReason) error {
-	payload := proto.ByePayload{Reason: reason}.Encode()
-
-	if !e.sendMu.TryLock() {
-		return net.ErrClosed
-	}
-	defer e.sendMu.Unlock()
-
-	if e.isClosed() {
-		return net.ErrClosed
-	}
-
-	e.pathsMu.RLock()
-	id := e.activeID
-	var pc transport.PathConn
-	if id != 0 {
-		if s, ok := e.paths[id]; ok {
-			pc = s.conn
-		}
-	}
-	e.pathsMu.RUnlock()
-	if pc == nil {
-		return net.ErrClosed
-	}
-
-	seq := atomic.AddUint64(&e.sendSeq, 1) - 1
-	hdr := proto.Header{
-		Version: proto.Version,
-		Type:    proto.FrameCtrl,
-		Flags:   proto.FlagsForCtrl(proto.CtrlBye),
-		Seq:     seq,
-	}
-	frame := make([]byte, proto.HeaderSize+len(payload))
-	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
-		return err
-	}
-	copy(frame[proto.HeaderSize:], payload)
-	_, err := pc.Write(frame)
-	return err
+	e.sendClosing.Store(true)
+	e.terminalOnce.Do(func() {
+		e.terminalErr = e.sendTerminalFrame(reason)
+		close(e.terminalDone)
+	})
+	<-e.terminalDone
+	return e.terminalErr
 }
 
 // sendFrame builds a single rendr frame and pushes it on the active
 // path. Frame type may be Data or Ctrl; for Ctrl, flags encodes the
 // CtrlCode in its low 8 bits.
 func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) error {
-	return e.sendFrameWithHistory(t, flags, payload, true)
-}
-
-func (e *Engine) sendFrameWithHistory(t proto.FrameType, flags uint16, payload []byte, remember bool) error {
+	if e.sendClosing.Load() {
+		return net.ErrClosed
+	}
+	control := t == proto.FrameCtrl
+	if err := e.acquireSendSlot(control); err != nil {
+		return err
+	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
-	if e.isClosed() {
+	if e.isClosed() || e.sendClosing.Load() {
+		e.releaseSendSlot(control)
 		return net.ErrClosed
 	}
 
@@ -133,23 +107,64 @@ func (e *Engine) sendFrameWithHistory(t proto.FrameType, flags uint16, payload [
 	}
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		e.releaseSendSlot(control)
 		return err
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
+	if err := e.reserveSendFrame(frame); err != nil {
+		e.releaseSendSlot(control)
+		return err
+	}
+	// Publication means the SEQ has a replay owner and may now be observed by
+	// any path. Advancing before dispatch lets a fast race child ACK while a
+	// slower sibling is still inside Write without having that ACK rejected.
+	e.publishSendSeq(seq + 1)
 	if err := e.dispatch(frame); err != nil {
 		return err
 	}
-	if remember {
-		e.rememberSendFrame(frame)
-	}
 	return nil
+}
+
+func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+	if e.isClosed() {
+		return net.ErrClosed
+	}
+	seq := atomic.AddUint64(&e.sendSeq, 1) - 1
+	payload := proto.ByePayload{Reason: reason}.Encode()
+	hdr := proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlBye),
+		Seq:     seq,
+	}
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		return err
+	}
+	copy(frame[proto.HeaderSize:], payload)
+	if err := e.reserveTerminalFrame(frame); err != nil {
+		return err
+	}
+	e.publishSendSeq(seq + 1)
+	return e.dispatch(frame)
+}
+
+func (e *Engine) publishSendSeq(next uint64) {
+	for {
+		cur := e.sendPublishedNext.Load()
+		if next <= cur || e.sendPublishedNext.CompareAndSwap(cur, next) {
+			return
+		}
+	}
 }
 
 // dispatch writes a fully-built frame on the path(s) appropriate to
 // the current Mode:
 //
-//	prime / 0 (default) - write on the single active path
+//	selector / 0 (default) - write on the single active path
 //	race                - write on every attached path
 //	bond                - round-robin frame-level across all paths
 //
@@ -175,31 +190,34 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 		}
 		e.pathsMu.RLock()
 		id := e.activeID
-		var pc transport.PathConn
 		var slot *pathSlot
 		if id != 0 {
 			if s, ok := e.paths[id]; ok {
-				pc = s.conn
 				slot = s
 			}
 		}
 		e.pathsMu.RUnlock()
 
-		if pc == nil {
+		if slot == nil {
 			if err := e.waitForPath(); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if _, err := pc.Write(frame); err != nil {
+		n, err := slot.writeFrame(frame)
+		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				continue
 			}
 			return err
 		}
+		if n != len(frame) {
+			return io.ErrShortWrite
+		}
 		if slot != nil {
 			slot.lastSendUnixNano.Store(nowFn().UnixNano())
+			slot.recordDispatch(frame)
 		}
 		return nil
 	}
@@ -306,39 +324,96 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		}
 		e.bondPinLeft--
 		slot := e.paths[ids[idx]]
-		pc := slot.conn
 		e.pathsMu.Unlock()
 
-		if _, err := pc.Write(frame); err != nil {
+		n, err := slot.writeFrame(frame)
+		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				// Path died mid-write; pick again.
 				continue
 			}
 			return err
 		}
+		if n != len(frame) {
+			return io.ErrShortWrite
+		}
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
+		slot.recordDispatch(frame)
 		slot.rememberBondFrame(frame)
 		return nil
 	}
 }
 
-func (e *Engine) redistributeFrames(frames [][]byte) {
+func (e *Engine) redistributeFrames(frames [][]byte) error {
 	if len(frames) == 0 || e.isClosed() {
-		return
+		return nil
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
+	return e.redistributeFramesLocked(frames)
+}
 
+func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 	for _, frame := range frames {
 		if e.isClosed() {
-			return
+			return net.ErrClosed
 		}
-		_ = e.dispatchRedistributedBondFrame(frame)
+		if err := e.dispatchRedistributedBondFrame(frame); err != nil {
+			return err
+		}
+		if len(frame) >= proto.HeaderSize {
+			if hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil {
+				e.publishSendSeq(hdr.Seq + 1)
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Engine) requestReplay(nextSeq uint64) {
+	select {
+	case e.replayRequests <- nextSeq:
+	default:
 	}
 }
 
-func (e *Engine) redistributeBondFrames(frames [][]byte) {
-	e.redistributeFrames(frames)
+func (e *Engine) replayLoop() {
+	for {
+		select {
+		case <-e.closed:
+			return
+		case nextSeq := <-e.replayRequests:
+			e.replayUntilSent(nextSeq)
+		}
+	}
+}
+
+func (e *Engine) replayUntilSent(nextSeq uint64) {
+	backoff := 10 * time.Millisecond
+	for {
+		if acked := e.sendAckNext.Load(); nextSeq < acked {
+			nextSeq = acked
+		}
+		frames := e.sendHistorySnapshot(nextSeq)
+		if len(frames) == 0 {
+			return
+		}
+		if err := e.redistributeFrames(frames); err == nil {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-e.closed:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		if backoff < 200*time.Millisecond {
+			backoff *= 2
+		}
+	}
 }
 
 func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
@@ -382,7 +457,7 @@ func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
 
 		now := nowFn().UnixNano()
 		for _, slot := range slots {
-			if _, err := slot.conn.Write(frame); err == nil {
+			if n, err := slot.writeFrame(frame); err == nil && n == len(frame) {
 				slot.lastSendUnixNano.Store(now)
 				return nil
 			}
@@ -491,9 +566,10 @@ func (e *Engine) dispatchRace(frame []byte) error {
 		anyOk := false
 		now := nowFn().UnixNano()
 		for _, s := range slots {
-			if _, err := s.conn.Write(frame); err == nil {
+			if n, err := s.writeFrame(frame); err == nil && n == len(frame) {
 				anyOk = true
 				s.lastSendUnixNano.Store(now)
+				s.recordDispatch(frame)
 			}
 		}
 		if anyOk {

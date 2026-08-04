@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func testNegotiation(flow [16]byte) Negotiation {
+	return NewNegotiation(SessionEpoch(flow))
+}
+
+func testBridgeTag(bridgeID [16]byte, name string) BridgeTagPayload {
+	return BridgeTagPayload{
+		BridgeID:      bridgeID,
+		SessionEpoch:  SessionEpoch(bridgeID),
+		GraphRevision: 1,
+		TargetID:      StableTargetID(name),
+		PathName:      name,
+	}
+}
+
 func TestCtrlCodeFromFlags(t *testing.T) {
 	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlHello)); got != CtrlHello {
 		t.Fatalf("hello round-trip: got %v want %v", got, CtrlHello)
@@ -18,7 +32,8 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 }
 
 func TestHelloRoundTrip(t *testing.T) {
-	want := HelloPayload{FlowID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, Caps: 0xAABB_CCDD}
+	flow := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	want := HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow, Caps: 0xAABB_CCDD}
 	got, err := DecodeHello(want.Encode())
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +88,7 @@ func TestByeRoundTrip(t *testing.T) {
 }
 
 func TestBridgeTagRoundTrip(t *testing.T) {
-	want := BridgeTagPayload{BridgeID: [16]byte{0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6, 7, 8}}
+	want := testBridgeTag([16]byte{0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6, 7, 8}, "")
 	got, err := DecodeBridgeTag(want.Encode())
 	if err != nil {
 		t.Fatal(err)
@@ -84,10 +99,12 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 }
 
 func TestHelloAckRoundTrip(t *testing.T) {
+	flow := [16]byte{1, 2, 3, 4}
 	want := HelloAckPayload{
-		FlowID:     [16]byte{1, 2, 3, 4},
-		InstanceID: InstanceID{5, 6, 7, 8},
-		Caps:       0xAABB_CCDD,
+		Negotiation: testNegotiation(flow),
+		FlowID:      flow,
+		InstanceID:  InstanceID{5, 6, 7, 8},
+		Caps:        0xAABB_CCDD,
 	}
 	got, err := DecodeHelloAck(want.Encode())
 	if err != nil {
@@ -99,11 +116,15 @@ func TestHelloAckRoundTrip(t *testing.T) {
 }
 
 func TestBridgeAckRoundTrip(t *testing.T) {
+	bridgeID := [16]byte{0xFE, 0xED}
 	want := BridgeAckPayload{
-		BridgeID:   [16]byte{0xFE, 0xED},
-		InstanceID: InstanceID{1, 2, 3, 4},
-		Code:       AckRejectInstance,
-		Reason:     "instance mismatch",
+		BridgeID:      bridgeID,
+		InstanceID:    InstanceID{1, 2, 3, 4},
+		SessionEpoch:  SessionEpoch(bridgeID),
+		GraphRevision: 1,
+		TargetID:      StableTargetID("B"),
+		Code:          AckRejectInstance,
+		Reason:        "instance mismatch",
 	}
 	got, err := DecodeBridgeAck(want.Encode())
 	if err != nil {
@@ -115,7 +136,8 @@ func TestBridgeAckRoundTrip(t *testing.T) {
 }
 
 func TestHelloPathNameRoundTrip(t *testing.T) {
-	want := HelloPayload{FlowID: [16]byte{1, 2, 3, 4}, Caps: CapsPacketMode, PathName: "A"}
+	flow := [16]byte{1, 2, 3, 4}
+	want := HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow, Caps: CapsPacketMode, PathName: "A"}
 	got, err := DecodeHello(want.Encode())
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +148,7 @@ func TestHelloPathNameRoundTrip(t *testing.T) {
 }
 
 func TestBridgeTagPathNameRoundTrip(t *testing.T) {
-	want := BridgeTagPayload{BridgeID: [16]byte{0xFE, 0xED}, PathName: "B"}
+	want := testBridgeTag([16]byte{0xFE, 0xED}, "B")
 	got, err := DecodeBridgeTag(want.Encode())
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +160,7 @@ func TestBridgeTagPathNameRoundTrip(t *testing.T) {
 
 func TestPolicyRequestRoundTrip(t *testing.T) {
 	want := PolicyRequestPayload{
-		Mode:       2,
+		Kind:       ExecutionKindBond,
 		ActiveName: "B",
 		ScopeNames: []string{"B", "C"},
 		Cause:      "peak-transfer-rx",
@@ -147,11 +169,219 @@ func TestPolicyRequestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != want.Mode || got.ActiveName != want.ActiveName || got.Cause != want.Cause {
+	if got.Kind != want.Kind || got.ActiveName != want.ActiveName || got.Cause != want.Cause {
 		t.Fatalf("policy request: got %+v want %+v", got, want)
 	}
 	if len(got.ScopeNames) != 2 || got.ScopeNames[0] != "B" || got.ScopeNames[1] != "C" {
 		t.Fatalf("policy request scope names=%v", got.ScopeNames)
+	}
+}
+
+func TestPolicyRequestWireStability(t *testing.T) {
+	p := PolicyRequestPayload{
+		Kind:       ExecutionKindSelector,
+		ActiveName: "A",
+		ScopeNames: []string{"B", "C"},
+		Cause:      "rx",
+	}
+	want := []byte{
+		0x01, 0x02, 0x00, 0x00,
+		0x01, 'A',
+		0x01, 'B',
+		0x01, 'C',
+		0x02, 'r', 'x',
+	}
+	if got := p.Encode(); !bytes.Equal(got, want) {
+		t.Fatalf("policy_request wire drift:\n got=%x\nwant=%x", got, want)
+	}
+}
+
+func TestExecutionKindStability(t *testing.T) {
+	cases := []struct {
+		kind ExecutionKind
+		want byte
+	}{
+		{ExecutionKindInvalid, 0},
+		{ExecutionKindSelector, 1},
+		{ExecutionKindBond, 2},
+		{ExecutionKindRace, 3},
+	}
+	for _, tc := range cases {
+		if byte(tc.kind) != tc.want {
+			t.Errorf("execution kind drifted: got %d want %d", tc.kind, tc.want)
+		}
+	}
+}
+
+func TestExecutionKindValid(t *testing.T) {
+	for _, kind := range []ExecutionKind{ExecutionKindSelector, ExecutionKindBond, ExecutionKindRace} {
+		if !kind.Valid() {
+			t.Errorf("kind %d is not valid", kind)
+		}
+	}
+	for _, kind := range []ExecutionKind{ExecutionKindInvalid, 4, 255} {
+		if kind.Valid() {
+			t.Errorf("kind %d is unexpectedly valid", kind)
+		}
+	}
+}
+
+func TestPolicyRequestRejectsInvalidKind(t *testing.T) {
+	for _, kind := range []ExecutionKind{ExecutionKindInvalid, 4, 255} {
+		wire := PolicyRequestPayload{Kind: kind}.Encode()
+		if _, err := DecodePolicyRequest(wire); err == nil {
+			t.Errorf("accepted invalid execution kind %d", kind)
+		}
+	}
+}
+
+func TestPolicyRequestRejectsMalformedFields(t *testing.T) {
+	valid := PolicyRequestPayload{
+		Kind:       ExecutionKindSelector,
+		ActiveName: "active",
+		ScopeNames: []string{"scope"},
+		Cause:      "cause",
+	}.Encode()
+
+	tests := []struct {
+		name string
+		wire []byte
+	}{
+		{
+			name: "nonzero reserved",
+			wire: func() []byte {
+				b := append([]byte(nil), valid...)
+				b[2] = 1
+				return b
+			}(),
+		},
+		{name: "truncated active name", wire: []byte{byte(ExecutionKindSelector), 0, 0, 0, 2, 'x'}},
+		{name: "truncated scope name", wire: []byte{byte(ExecutionKindSelector), 1, 0, 0, 0, 2, 'x'}},
+		{name: "missing cause", wire: []byte{byte(ExecutionKindSelector), 0, 0, 0, 0}},
+		{name: "trailing field", wire: append(append([]byte(nil), valid...), 0)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodePolicyRequest(tc.wire); err == nil {
+				t.Fatal("accepted malformed policy request")
+			}
+		})
+	}
+}
+
+func TestRejectLegacyHandshakePayloads(t *testing.T) {
+	legacyHello := make([]byte, 20)
+	if _, err := DecodeHello(legacyHello); err == nil {
+		t.Fatal("accepted legacy 20-byte HELLO")
+	}
+
+	legacyBridgeTag := make([]byte, 16)
+	if _, err := DecodeBridgeTag(legacyBridgeTag); err == nil {
+		t.Fatal("accepted legacy 16-byte BRIDGE_TAG")
+	}
+}
+
+func TestHelloRejectsInvalidNegotiationBeforeUse(t *testing.T) {
+	flow := [16]byte{1, 2, 3, 4}
+	base := (HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+	mutations := map[string]func([]byte){
+		"protocol major":   func(b []byte) { b[1] = 2 },
+		"reserved":         func(b []byte) { b[7] = 1 },
+		"unknown required": func(b []byte) { b[16] = 0x80 },
+		"zero revision":    func(b []byte) { clear(b[40:48]) },
+		"epoch mismatch":   func(b []byte) { b[24]++ },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			wire := append([]byte(nil), base...)
+			mutate(wire)
+			if _, err := DecodeHello(wire); err == nil {
+				t.Fatal("accepted invalid negotiation")
+			}
+		})
+	}
+}
+
+func TestHandshakePayloadsRejectMalformedExtensions(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   []byte
+		decode func([]byte) error
+	}{
+		{
+			name: "hello",
+			base: func() []byte {
+				flow := [16]byte{1}
+				return (HelloPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+			}(),
+			decode: func(b []byte) error {
+				_, err := DecodeHello(b)
+				return err
+			},
+		},
+		{
+			name: "bridge_tag",
+			base: testBridgeTag([16]byte{1}, "").Encode(),
+			decode: func(b []byte) error {
+				_, err := DecodeBridgeTag(b)
+				return err
+			},
+		},
+		{
+			name: "bridge_ack",
+			base: BridgeAckPayload{BridgeID: [16]byte{1}, SessionEpoch: SessionEpoch{1}, GraphRevision: 1, TargetID: StableTargetID("")}.Encode(),
+			decode: func(b []byte) error {
+				_, err := DecodeBridgeAck(b)
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name+"/empty", func(t *testing.T) {
+			wire := append(append([]byte(nil), tc.base...), 0)
+			if err := tc.decode(wire); err == nil {
+				t.Fatal("accepted empty extension")
+			}
+		})
+		t.Run(tc.name+"/truncated", func(t *testing.T) {
+			wire := append(append([]byte(nil), tc.base...), 2, 'x')
+			if err := tc.decode(wire); err == nil {
+				t.Fatal("accepted truncated extension")
+			}
+		})
+		t.Run(tc.name+"/trailing", func(t *testing.T) {
+			wire := append(append([]byte(nil), tc.base...), 1, 'x', 0)
+			if err := tc.decode(wire); err == nil {
+				t.Fatal("accepted trailing extension")
+			}
+		})
+	}
+}
+
+func TestFixedPayloadsRejectTrailingBytes(t *testing.T) {
+	tests := []struct {
+		name   string
+		wire   []byte
+		decode func([]byte) bool
+	}{
+		{"probe", ProbePayload{}.Encode(), func(b []byte) bool { _, err := DecodeProbe(b); return err == nil }},
+		{"ack", AckPayload{Direction: SenderDirectionClientToServer}.Encode(), func(b []byte) bool { _, ok := DecodeAck(b); return ok }},
+		{"hello_ack", func() []byte {
+			flow := [16]byte{1}
+			return (HelloAckPayload{Negotiation: testNegotiation(flow), FlowID: flow}).Encode()
+		}(), func(b []byte) bool { _, err := DecodeHelloAck(b); return err == nil }},
+		{"migrate_notify", MigrateNotifyPayload{}.Encode(), func(b []byte) bool { _, err := DecodeMigrateNotify(b); return err == nil }},
+		{"path_quality", PathQualityPayload{}.Encode(), func(b []byte) bool { _, err := DecodePathQuality(b); return err == nil }},
+		{"heartbeat", HeartbeatPayload{}.Encode(), func(b []byte) bool { _, err := DecodeHeartbeat(b); return err == nil }},
+		{"bye", ByePayload{}.Encode(), func(b []byte) bool { _, err := DecodeBye(b); return err == nil }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := append(append([]byte(nil), tc.wire...), 0)
+			if tc.decode(wire) {
+				t.Fatal("accepted trailing byte")
+			}
+		})
 	}
 }
 
@@ -233,7 +463,13 @@ func TestProbeWireStability(t *testing.T) {
 }
 
 func TestAckPayloadRoundTrip(t *testing.T) {
-	want := AckPayload{NextSeq: 0x0102030405060708}
+	want := AckPayload{
+		SessionEpoch:  SessionEpoch{1, 2, 3, 4},
+		Direction:     SenderDirectionClientToServer,
+		GraphRevision: 0x1112131415161718,
+		NextSeq:       0x0102030405060708,
+		Gap:           true,
+	}
 	got, ok := DecodeAck(want.Encode())
 	if !ok {
 		t.Fatal("DecodeAck rejected encoded ack")
@@ -247,25 +483,71 @@ func TestAckPayloadRoundTrip(t *testing.T) {
 }
 
 func TestAckPayloadWireStability(t *testing.T) {
-	p := AckPayload{NextSeq: 0x0102030405060708}
+	p := AckPayload{
+		SessionEpoch:  SessionEpoch{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		Direction:     SenderDirectionServerToClient,
+		GraphRevision: 0x1112131415161718,
+		GraphDigest: GraphDigest{
+			0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+			0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40,
+			0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+			0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50,
+		},
+		NextSeq: 0x0102030405060708,
+		Gap:     true,
+		Proof:   AckProof{0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30},
+	}
 	want := []byte{
 		0x52, 0x45, 0x4e, 0x44, 0x52, 0x5f, 0x41, 0x43,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+		0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40,
+		0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+		0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+		0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
 	}
 	if !bytes.Equal(p.Encode(), want) {
 		t.Fatalf("ack wire drift:\n got=%x\nwant=%x", p.Encode(), want)
 	}
 }
 
+func TestAckPayloadRejectsInvalidBindingFields(t *testing.T) {
+	base := AckPayload{Direction: SenderDirectionClientToServer}.Encode()
+	mutations := map[string]func([]byte){
+		"version":   func(b []byte) { b[8]++ },
+		"direction": func(b []byte) { b[9] = 0 },
+		"flags":     func(b []byte) { b[10] = 0x80 },
+		"reserved":  func(b []byte) { b[15] = 1 },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			wire := append([]byte(nil), base...)
+			mutate(wire)
+			if _, ok := DecodeAck(wire); ok {
+				t.Fatal("accepted invalid ACK binding")
+			}
+		})
+	}
+}
+
 func TestBridgeTagWireStability(t *testing.T) {
+	bridgeID := [16]byte{
+		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	}
 	p := BridgeTagPayload{
-		BridgeID: [16]byte{
-			0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
-			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-		},
+		BridgeID:               bridgeID,
 		InstanceID:             InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
 		ExpectedPeerInstanceID: InstanceID{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F},
+		SessionEpoch:           SessionEpoch(bridgeID),
+		GraphRevision:          0x0102030405060708,
+		GraphDigest:            GraphDigest{0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F},
+		TargetID:               TargetID{0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F},
 	}
 	want := []byte{
 		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
@@ -274,6 +556,15 @@ func TestBridgeTagWireStability(t *testing.T) {
 		0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
 		0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
 		0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
+		0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+		0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+		0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+		0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+		0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+		0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
 	}
 	if !bytes.Equal(p.Encode(), want) {
 		t.Fatalf("bridge_tag wire drift:\n got=%x\nwant=%x", p.Encode(), want)
@@ -327,12 +618,24 @@ func TestByeWireStability(t *testing.T) {
 }
 
 func TestHelloWireStability(t *testing.T) {
+	flow := [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
 	p := HelloPayload{
-		FlowID:     [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
-		InstanceID: InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
-		Caps:       0x01020304,
+		Negotiation: testNegotiation(flow),
+		FlowID:      flow,
+		InstanceID:  InstanceID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F},
+		Caps:        0x01020304,
 	}
 	want := []byte{
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
 		0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
 		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,

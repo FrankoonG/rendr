@@ -16,7 +16,7 @@ type PathSpec struct {
 	// The engine treats it as opaque.
 	Opts map[string]string
 	// Weight is an advisory hint to the mode layer (bond/race) about
-	// share of frames. prime ignores Weight.
+	// share of frames. Selector ignores Weight.
 	Weight uint16
 }
 
@@ -24,7 +24,7 @@ type PathSpec struct {
 //
 // Reads / Writes are cumulative frame counters; transports that
 // don't instrument framing leave them at 0. Active is true iff this
-// path is the current send target under prime mode (always one
+// path is the current send target under selector mode (always one
 // active path); under race/bond, Active flags the first path
 // returned by dispatch's iteration order and should not be used
 // for routing decisions.
@@ -35,7 +35,12 @@ type PathInfo struct {
 	Since   time.Time
 	Reads   uint64
 	Writes  uint64
-	Active  bool
+	// DataWrites and ControlWrites split engine-framed egress so probes and
+	// cumulative ACKs cannot masquerade as application throughput.
+	DataWrites     uint64
+	ControlWrites  uint64
+	DataDispatches uint64
+	Active         bool
 	// RecvDups: inbound frames on this path whose SEQ was already
 	// delivered or buffered (race-mode duplicates, accidental
 	// retransmits). Sum across all paths equals ConnStats.RecvDups.

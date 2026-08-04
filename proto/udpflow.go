@@ -9,7 +9,7 @@ import (
 // UDPFlowVersion is the current wire-protocol version for the
 // opaque-UDP flow header. CLAUDE.md hard rule #7: any wire change
 // MUST bump this.
-const UDPFlowVersion uint8 = 0
+const UDPFlowVersion uint8 = 1
 
 // UDPFlowHeaderSize is the fixed 8-byte preamble prepended to every
 // payload datagram that rendr carries over opaque UDP.

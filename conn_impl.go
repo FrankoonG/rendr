@@ -12,7 +12,7 @@ import (
 
 // engineBackedConn is the concrete rendr.Conn returned by Dial and
 // Accept. It embeds the net.Conn surface provided by the engine and
-// exposes the rendr-specific Paths/SetMode/FlowID methods.
+// exposes the rendr-specific Paths/FlowID/Status methods.
 type engineBackedConn struct {
 	e    *engine.Engine
 	conn *engine.Conn
@@ -27,7 +27,9 @@ type engineBackedConn struct {
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
 	bc := &engineBackedConn{e: e, conn: c}
 	bc.mode.Store(uint32(mode))
-	e.SetMode(uint32(mode))
+	if kind, ok := mode.executionKind(); ok {
+		_ = e.ConfigureExecution(kind)
+	}
 	return bc
 }
 
@@ -55,12 +57,8 @@ func (c *engineBackedConn) Close() error {
 	if c.peak != nil {
 		c.peak.stopLoop()
 	}
-	if !c.closing.Swap(true) && !c.e.IsClosed() {
-		_ = c.e.SendBye(proto.ByeNormal)
-		c.e.QuiesceActivePath()
-		time.Sleep(10 * time.Millisecond)
-	}
-	return c.conn.Close()
+	c.closing.Store(true)
+	return c.e.GracefulClose(proto.ByeNormal)
 }
 func (c *engineBackedConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *engineBackedConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
@@ -77,30 +75,6 @@ func (c *engineBackedConn) FlowID() [16]byte { return c.e.FlowID() }
 
 func (c *engineBackedConn) Status() Status {
 	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
-}
-
-// SetMode enforces the legal mode transitions:
-//   - prime <-> race: allowed
-//   - prime <-> bond: allowed
-//   - race <-> bond: forbidden (race has no per-path order; bond
-//     requires it for reorder window bounding)
-func (c *engineBackedConn) SetMode(m Mode) error {
-	if !m.Valid() {
-		return ErrModeSwitchIllegal
-	}
-	cur := Mode(c.mode.Load())
-	if cur == m {
-		return nil
-	}
-	if cur == ModeRace && m == ModeBond {
-		return ErrModeSwitchIllegal
-	}
-	if cur == ModeBond && m == ModeRace {
-		return ErrModeSwitchIllegal
-	}
-	c.mode.Store(uint32(m))
-	c.e.SetMode(uint32(m))
-	return nil
 }
 
 func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
@@ -198,7 +172,7 @@ func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := engine.PerformClientBridgeTagAck(pc, c.e.FlowID(), c.e.LocalInstanceID(), c.e.PeerInstanceID(), pathSpecName(spec)); err != nil {
+	if _, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec)); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}

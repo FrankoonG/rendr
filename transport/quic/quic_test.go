@@ -494,6 +494,32 @@ func TestQUICOptsApplied(t *testing.T) {
 	}
 }
 
+func TestQUICALPNIsV1Only(t *testing.T) {
+	_, base, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, value := range []string{"legacy", "legacy," + ALPN, ALPN + ",other"} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := applyOptsToTLS(base, map[string]string{"alpn": value}); err == nil {
+				t.Fatalf("applyOptsToTLS accepted non-v1-only ALPN %q", value)
+			}
+		})
+	}
+
+	cfg, err := applyOptsToTLS(base, map[string]string{"alpn": "  " + ALPN + "  "})
+	if err != nil {
+		t.Fatalf("applyOptsToTLS rejected %q: %v", ALPN, err)
+	}
+	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != ALPN {
+		t.Fatalf("NextProtos = %v, want [%q]", cfg.NextProtos, ALPN)
+	}
+	if ALPN != "rendr/1" {
+		t.Fatalf("ALPN = %q, want rendr/1", ALPN)
+	}
+}
+
 // serverCertPEMFor extracts the leaf certificate from a server TLS
 // config and returns it as a PEM-encoded string suitable for
 // ca_pem.

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -97,7 +98,9 @@ func TestBondRedistributesDeadPathHistory(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	client.SetMode(dispatchBond)
+	if err := client.ConfigureExecution(proto.ExecutionKindBond); err != nil {
+		t.Fatal(err)
+	}
 	client.SetBondPinSizeForTest(1)
 
 	c1, s1 := newMemoryPathPair()
@@ -154,7 +157,9 @@ func TestBondRedistributionSkipsAckedHistory(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	client.SetMode(dispatchBond)
+	if err := client.ConfigureExecution(proto.ExecutionKindBond); err != nil {
+		t.Fatal(err)
+	}
 	client.SetBondPinSizeForTest(1)
 
 	c1, s1 := newMemoryPathPair()
@@ -215,7 +220,7 @@ func TestBondRedistributionSkipsAckedHistory(t *testing.T) {
 	}
 }
 
-func TestPrimeRedistributesUnackedFrameOnPathDeath(t *testing.T) {
+func TestSelectorRedistributesUnackedFrameOnPathDeath(t *testing.T) {
 	flow := NewClientFlowID()
 	client := New(SideClient, flow, Limits{}.Clamp())
 	server := New(SideServer, flow, Limits{}.Clamp())
@@ -240,7 +245,7 @@ func TestPrimeRedistributesUnackedFrameOnPathDeath(t *testing.T) {
 		t.Fatalf("attach server path 2: %v", err)
 	}
 
-	payload := []byte("lost-on-dead-prime-path")
+	payload := []byte("lost-on-dead-selector-path")
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
@@ -257,7 +262,7 @@ func TestPrimeRedistributesUnackedFrameOnPathDeath(t *testing.T) {
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(&Conn{E: server}, got); err != nil {
-		t.Fatalf("server did not receive redistributed prime frame: %v", err)
+		t.Fatalf("server did not receive redistributed selector frame: %v", err)
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("redistributed payload = %q, want %q", got, payload)

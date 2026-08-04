@@ -14,37 +14,25 @@ import (
 
 // Dialer is the entry point for constructing a rendr Conn.
 //
-// Dialer is intentionally minimal: the path set is fixed at dial
-// time. The engine will not discover paths on its own; the embedder
-// feeds candidate PathSpecs. Use AddPath / RemovePath on the
-// returned AdminConn to mutate the path set after dial.
+// Root is the single configuration entry point for the initial target graph.
+// Use AddPath / RemovePath on the returned AdminConn to mutate the path set
+// after dial.
 type Dialer struct {
-	// Root is the v0.4 policy graph entry point. When set, it replaces
-	// Mode+Paths for the initial dial. Selector/Race/Bond all compile
-	// down to the current engine mode layer until the full nested runtime
-	// policy executor lands.
+	// Root is the target graph entry point. Selector/Race/Bond currently
+	// compile down to the flattened engine mode layer until the recursive
+	// runtime policy executor lands.
 	Root Target
 
-	// RootConfig is the structured v0.4+ root entry point. When set,
-	// it overrides Root, Primary, and PrimaryPolicy.
-	RootConfig *RootConfig
-
-	// Mode is the initial operational mode.
-	Mode Mode
-
-	// Paths are the candidate paths for this connection.
-	Paths []PathSpec
-
-	// Hysteresis (prime only): the new path must beat the current by
+	// Hysteresis (selector only): the new path must beat the current by
 	// this fraction of the current score before a switch is allowed.
 	// Default 0.25.
 	Hysteresis float64
 
-	// Dwell (prime only): minimum time the engine must stay on a path
+	// Dwell (selector only): minimum time the engine must stay on a path
 	// after attaching to it. Default 5s.
 	Dwell time.Duration
 
-	// Cooldown (prime only): minimum gap between two successive
+	// Cooldown (selector only): minimum gap between two successive
 	// migrations regardless of quality. Default 30s.
 	Cooldown time.Duration
 
@@ -116,9 +104,8 @@ type Dialer struct {
 // (attached during the same Dial call or later via the migration
 // API) send BRIDGE_TAG carrying the same flow_id.
 //
-// M1 limits: prime mode only; the first path in d.Paths becomes the
-// active path, the remainder are attached but kept idle until a
-// migration trigger fires.
+// The first compiled path becomes active; the remainder are attached and
+// dispatched according to the root target's flattened mode.
 func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	plan, err := d.compileDialPlan()
 	if err != nil {
@@ -126,7 +113,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	}
 	mode, paths := plan.mode, plan.paths
 	if len(paths) == 0 {
-		return nil, errNoPaths
+		return nil, errNoCompiledPath
 	}
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
@@ -134,12 +121,16 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
+	if err := e.ConfigureLocalGraph(plan.graphRevision, proto.GraphDigest(plan.graph.digest)); err != nil {
+		_ = e.Close()
+		return nil, err
+	}
 	e.SetLocalInstanceID(instanceID)
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, resolver, false)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, false)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -179,14 +170,14 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	bc.status = tracker
 	bc.resolver = resolver
 
-	// Arm the prime scheduler now that all initial paths are
+	// Arm the selector scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
 	// triggers opt-in; here it is opt-in because the embedder
-	// explicitly chose Mode == ModePrime.
+	// explicitly chose a Selector root.
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)
-	} else if mode == ModePrime {
-		e.StartPrime(nil, 0)
+	} else if mode == ModeSelector {
+		e.StartSelector(nil, 0)
 	}
 	return bc, nil
 }
@@ -197,9 +188,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 // notified via proto.CapsPacketMode in the HELLO so its engine also
 // runs the packet-boundary drainer.
 //
-// All Dialer fields (Mode, Paths, prime knobs, MigrationBudget) apply
-// identically to packet-mode connections; the underlying engine and
-// path machinery are the same.
+// The Root graph, selector knobs, and MigrationBudget apply identically to
+// packet-mode connections; the underlying engine and path machinery are the
+// same.
 func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	plan, err := d.compileDialPlan()
 	if err != nil {
@@ -207,7 +198,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 	mode, paths := plan.mode, plan.paths
 	if len(paths) == 0 {
-		return nil, errNoPaths
+		return nil, errNoCompiledPath
 	}
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
@@ -215,13 +206,17 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
 	e := engine.New(engine.SideClient, flowID, d.engineLimits())
+	if err := e.ConfigureLocalGraph(plan.graphRevision, proto.GraphDigest(plan.graph.digest)); err != nil {
+		_ = e.Close()
+		return nil, err
+	}
 	e.SetLocalInstanceID(instanceID)
 	e.SetPacketMode()
 	if d.ProbeInterval > 0 {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, flowID, instanceID, paths, plan, tracker, resolver, true)
+	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, true)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -258,8 +253,8 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)
-	} else if mode == ModePrime {
-		e.StartPrime(nil, 0)
+	} else if mode == ModeSelector {
+		e.StartSelector(nil, 0)
 	}
 	return bc, nil
 }
@@ -272,33 +267,22 @@ func (d *Dialer) instanceID() InstanceID {
 }
 
 func (d *Dialer) compileDialPlan() (compiledTarget, error) {
-	root := d.Root
-	primary := d.Primary
-	if d.RootConfig != nil {
-		root = d.RootConfig.Target
-		if d.RootConfig.Primary != "" {
-			primary = d.RootConfig.Primary
-		}
+	if d.Root == nil {
+		return compiledTarget{}, errRootRequired
 	}
-	if root != nil {
-		ct, err := compileTargetForDial(root)
-		if err != nil {
-			return compiledTarget{}, err
-		}
-		return d.applyPrimary(ct, root, primary)
-	}
-	if len(d.Paths) == 0 {
-		return compiledTarget{}, errNoPaths
-	}
-	mode := d.Mode
-	if !mode.Valid() {
-		mode = ModePrime
-	}
-	ct, err := compileTargetForDial(legacyRootTarget(mode, d.Paths))
+	graph, err := compileTargetGraph(d.Root)
 	if err != nil {
-		return compiledTarget{}, err
+		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
 	}
-	return d.applyPrimary(ct, legacyRootTarget(mode, d.Paths), primary)
+	ct, err := graph.compileDialPlan()
+	if err != nil {
+		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
+	}
+	ct, err = d.applyPrimary(ct, d.Root, d.Primary)
+	if err != nil {
+		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
+	}
+	return ct, nil
 }
 
 func (d *Dialer) applyPrimary(ct compiledTarget, root Target, primary string) (compiledTarget, error) {
@@ -339,9 +323,6 @@ func (d *Dialer) applyPrimary(ct compiledTarget, root Target, primary string) (c
 }
 
 func (d *Dialer) effectivePrimaryPolicy() PrimaryPolicy {
-	if d.RootConfig != nil && d.RootConfig.PrimaryPolicy != "" {
-		return d.RootConfig.PrimaryPolicy
-	}
 	if d.PrimaryPolicy == PrimaryRequire {
 		return PrimaryRequire
 	}
@@ -351,7 +332,6 @@ func (d *Dialer) effectivePrimaryPolicy() PrimaryPolicy {
 func (d *Dialer) dialInitialPath(
 	ctx context.Context,
 	e *engine.Engine,
-	flowID [16]byte,
 	instanceID InstanceID,
 	paths []PathSpec,
 	plan compiledTarget,
@@ -373,7 +353,7 @@ func (d *Dialer) dialInitialPath(
 			continue
 		}
 		tracker.set(i, PathHandshaking, nil)
-		ack, err := engine.PerformClientHelloAck(pc, flowID, instanceID, d.helloCaps(packetMode), pathSpecName(ps))
+		ack, err := performClientHelloAckContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps))
 		if err != nil {
 			_ = pc.Close()
 			state := pathStateForHandshakeError(err)
@@ -384,12 +364,49 @@ func (d *Dialer) dialInitialPath(
 			}
 			continue
 		}
+		if peerPacketMode := ack.Caps&proto.CapsPacketMode != 0; peerPacketMode != packetMode {
+			err = fmt.Errorf("rendr: peer session kind mismatch: packet=%t", peerPacketMode)
+			_ = pc.Close()
+			tracker.set(i, PathNative, err)
+			lastErr = err
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, err
+			}
+			continue
+		}
 		return ps, i, pc, ack, nil
 	}
 	if lastErr != nil {
 		return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: no usable path: %w", lastErr)
 	}
-	return PathSpec{}, -1, nil, proto.HelloAckPayload{}, errNoPaths
+	return PathSpec{}, -1, nil, proto.HelloAckPayload{}, errNoCompiledPath
+}
+
+type clientHelloResult struct {
+	ack proto.HelloAckPayload
+	err error
+}
+
+func performClientHelloAckContext(
+	ctx context.Context,
+	pc transport.PathConn,
+	e *engine.Engine,
+	instanceID InstanceID,
+	caps uint32,
+	name string,
+) (proto.HelloAckPayload, error) {
+	result := make(chan clientHelloResult, 1)
+	go func() {
+		ack, err := engine.PerformClientHelloAck(pc, e, instanceID, caps, name)
+		result <- clientHelloResult{ack: ack, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		_ = pc.Close()
+		return proto.HelloAckPayload{}, ctx.Err()
+	case value := <-result:
+		return value.ack, value.err
+	}
 }
 
 func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
@@ -400,7 +417,7 @@ func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathS
 		return 0, err
 	}
 	tracker.set(index, PathHandshaking, nil)
-	if _, err := engine.PerformClientBridgeTagAck(spc, e.FlowID(), e.LocalInstanceID(), e.PeerInstanceID(), pathSpecName(ps)); err != nil {
+	if _, err := engine.PerformClientBridgeTagAck(spc, e, pathSpecName(ps)); err != nil {
 		_ = spc.Close()
 		tracker.set(index, pathStateForHandshakeError(err), err)
 		return 0, err
@@ -479,9 +496,9 @@ func (d *Dialer) helloCaps(packetMode bool) uint32 {
 func (d *Dialer) engineLimits() engine.Limits {
 	return engine.Limits{
 		MigrationBudget:        d.MigrationBudget,
-		PrimeHysteresis:        d.Hysteresis,
-		PrimeDwell:             d.Dwell,
-		PrimeCooldown:          d.Cooldown,
+		SelectorHysteresis:     d.Hysteresis,
+		SelectorDwell:          d.Dwell,
+		SelectorCooldown:       d.Cooldown,
 		ZombieMaxMigrations:    d.ZombieMaxMigrations,
 		ZombieCooldown:         d.ZombieCooldown,
 		BondStuckRTTMultiplier: d.BondStuckRTTMultiplier,
@@ -499,7 +516,10 @@ func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 	return tp.DialPath(ctx, spec)
 }
 
-var errNoPaths = errors.New("rendr: Dialer has no Paths")
+var (
+	errRootRequired   = errors.New("rendr: invalid Dialer config: Root target is required")
+	errNoCompiledPath = errors.New("rendr: invalid Dialer config: Root target contains no path leaves")
+)
 
 // stringAddr is a trivial net.Addr for the application-facing
 // LocalAddr/RemoteAddr; M1 does not synthesise OS sockets so the

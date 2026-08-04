@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestLegacyRootTargetCompilesModes(t *testing.T) {
+func TestRootTargetConstructorsCompileModes(t *testing.T) {
 	paths := []PathSpec{
 		{Transport: "tcp", Address: "a"},
 		{Transport: "tcp", Address: "b"},
@@ -18,13 +18,13 @@ func TestLegacyRootTargetCompilesModes(t *testing.T) {
 		mode Mode
 		want Mode
 	}{
-		{name: "default", mode: 0, want: ModePrime},
-		{name: "prime", mode: ModePrime, want: ModePrime},
+		{name: "selector", mode: ModeSelector, want: ModeSelector},
 		{name: "race", mode: ModeRace, want: ModeRace},
 		{name: "bond", mode: ModeBond, want: ModeBond},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			ct, err := compileTargetForDial(legacyRootTarget(tt.mode, paths))
+			root := testRoot(map[Mode]TargetKind{ModeSelector: TargetKindSelector, ModeRace: TargetKindRace, ModeBond: TargetKindBond}[tt.mode], paths)
+			ct, err := compileTargetForDial(root)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -54,8 +54,8 @@ func TestSelectorPeakTransferOrdersPeakTargetsLast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ct.mode != ModePrime {
-		t.Fatalf("mode=%v want %v", ct.mode, ModePrime)
+	if ct.mode != ModeSelector {
+		t.Fatalf("mode=%v want %v", ct.mode, ModeSelector)
 	}
 	if !ct.peakTransfer {
 		t.Fatal("peakTransfer=false")
@@ -104,10 +104,8 @@ func TestTargetConstructorsExposeGroupKinds(t *testing.T) {
 	}
 }
 
-func TestDialerCompileDialPlanUsesRoot(t *testing.T) {
+func TestDialerCompileDialPlanUsesSingleRoot(t *testing.T) {
 	d := &Dialer{
-		Mode:  ModeBond,
-		Paths: []PathSpec{{Transport: "tcp", Address: "legacy"}},
 		Root: Selector("root", []Target{
 			Path("root-path", PathSpec{Transport: "tcp", Address: "root"}),
 		}),
@@ -116,14 +114,14 @@ func TestDialerCompileDialPlanUsesRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.mode != ModePrime {
-		t.Fatalf("mode=%v want %v", plan.mode, ModePrime)
+	if plan.mode != ModeSelector {
+		t.Fatalf("mode=%v want %v", plan.mode, ModeSelector)
 	}
 	if plan.peakTransfer {
 		t.Fatal("peak=true")
 	}
 	if len(plan.paths) != 1 || plan.paths[0].Address != "root" {
-		t.Fatalf("paths=%+v; root should take precedence over legacy Paths", plan.paths)
+		t.Fatalf("paths=%+v; root should compile its only leaf", plan.paths)
 	}
 }
 
@@ -431,7 +429,7 @@ func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
 		t.Fatalf("peak bond did not dispatch on both peak paths: before=%v after=%v", before, after)
 	}
 
-	waitForMode(t, client, ModePrime, 3*time.Second)
+	waitForMode(t, client, ModeSelector, 3*time.Second)
 	_ = client.Close()
 	select {
 	case <-drainDone:
@@ -760,8 +758,8 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	time.Sleep(500 * time.Millisecond)
-	if got := client.(interface{ Mode() Mode }).Mode(); got != ModePrime {
-		t.Fatalf("mode=%v want prime; bad peak quality should block promotion", got)
+	if got := client.(interface{ Mode() Mode }).Mode(); got != ModeSelector {
+		t.Fatalf("mode=%v want selector; bad peak quality should block promotion", got)
 	}
 	if got := client.(AdminConn).ActivePath(); got == ids["C"] {
 		t.Fatalf("active path promoted to bad peak C=%d", ids["C"])
@@ -833,8 +831,8 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	time.Sleep(500 * time.Millisecond)
-	if got := client.(interface{ Mode() Mode }).Mode(); got != ModePrime {
-		t.Fatalf("mode=%v want prime; stale peak evidence should block promotion", got)
+	if got := client.(interface{ Mode() Mode }).Mode(); got != ModeSelector {
+		t.Fatalf("mode=%v want selector; stale peak evidence should block promotion", got)
 	}
 	if got := client.(AdminConn).ActivePath(); got == ids["C"] {
 		t.Fatalf("active path promoted using stale peak evidence C=%d", ids["C"])

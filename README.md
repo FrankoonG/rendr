@@ -21,7 +21,7 @@ carry frames at a given moment.
 
 The core policy shapes are:
 
-- `prime` / selector: use the best single path and migrate when
+- `selector`: use the best single path and migrate when
   quality justifies it.
 - `race`: duplicate frames across paths and keep the first valid
   arrival.
@@ -46,7 +46,7 @@ the embedder's application protocol.
 | Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, tunneled, or custom. |
 | Target | A node in the policy graph. A target can be a leaf `Path`, a `Selector`, a `Race`, or a `Bond`. |
 | Root target | The policy graph entry point supplied to a `Dialer`. It replaces the older flat `Mode + Paths` shape for new integrations. |
-| Selector / prime | The single-target quality policy. It chooses one child target at a time, favoring latency, jitter, loss, and stability. |
+| Selector | The single-target quality policy. It chooses one child target at a time, favoring latency, jitter, loss, and stability. |
 | Race | A redundancy policy that sends frames on multiple paths and accepts the first valid arrival. |
 | Bond | An aggregation policy that distributes frames across paths to combine throughput. |
 | Mixed carrier graph | A flow whose available paths may use different carrier families, for example TCP and UDP-backed paths. |

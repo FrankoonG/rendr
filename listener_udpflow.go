@@ -21,7 +21,7 @@ import (
 // datagram arriving from a fresh 4-tuple but carrying a known
 // flow_id updates the corresponding ServerPathConn's RemoteAddr
 // without firing any engine-level migration. Engine-driven
-// migration (Engine.Migrate / prime / race) layers on top of that
+// migration (Engine.Migrate / selector / race) layers on top of that
 // and remains transport-agnostic.
 func ListenUDPFlow(addr string) (Listener, error) {
 	ln, err := uflow.Listen(addr)
@@ -179,6 +179,16 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	if err := e.AcceptPeerNegotiation(p.Negotiation); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := e.MirrorPeerGraphForLocal(); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
 	e.SetLocalInstanceID(l.instanceID)
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerInstanceID(p.InstanceID)
@@ -201,7 +211,7 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -212,7 +222,7 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 	rAddr := addrFromString(pc.RemoteAddr())
 
 	if packetMode {
-		bp := newEnginePacketConn(e, ModePrime, lAddr, rAddr)
+		bp := newEnginePacketConn(e, ModeSelector, lAddr, rAddr)
 		go func(flowID [16]byte) {
 			<-bp.e.Closed()
 			l.bridges.Remove(flowID)
@@ -230,7 +240,7 @@ func (l *udpFlowListener) handleHello(pc *uflow.ServerPathConn, payload []byte) 
 		LAddr: lAddr,
 		RAddr: rAddr,
 	}
-	bc := newEngineBackedConn(e, c, ModePrime)
+	bc := newEngineBackedConn(e, c, ModeSelector)
 
 	go func(flowID [16]byte) {
 		<-bc.e.Closed()
@@ -255,20 +265,25 @@ func (l *udpFlowListener) handleBridgeTag(pc *uflow.ServerPathConn, payload []by
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectUnknown, "unknown flow")
 		_ = pc.Close()
 		return
 	}
 	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "peer instance mismatch")
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectInstance, "peer instance mismatch")
+		_ = pc.Close()
+		return
+	}
+	if err := e.ValidateBridgeBinding(p); err != nil {
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectProtoState, err.Error())
 		_ = pc.Close()
 		return
 	}
 	spec := specWithTargetName(PathSpec{Transport: "udpflow", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
+	_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckOK, "")
 }

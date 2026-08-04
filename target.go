@@ -2,11 +2,10 @@ package rendr
 
 import (
 	"errors"
-	"fmt"
 	"time"
 )
 
-// Target is one node in the v0.4 policy graph.
+// Target is one node in a rendr policy graph.
 //
 // A Path, Selector, Race, or Bond is a Target. Parent groups always see a child
 // group as one logical target; group internals are execution details.
@@ -121,6 +120,9 @@ func (p PeakTransfer) applySelector(g *GroupTarget) {
 	g.Peak = &cp
 }
 
+// compiledTarget is the temporary M3 bridge to the flat engine. It preserves
+// enough graph metadata for current selection behavior, but it is not the M4
+// recursive group executor.
 type compiledTarget struct {
 	mode          Mode
 	paths         []PathSpec
@@ -130,6 +132,8 @@ type compiledTarget struct {
 	peakMode      Mode
 	peakOptions   PeakTransfer
 	runtimeNested bool
+	graph         compiledTargetGraph
+	graphRevision uint64
 }
 
 var (
@@ -137,137 +141,12 @@ var (
 	errEmptyGroupTarget = errors.New("rendr: group target has no children")
 )
 
-func legacyRootTarget(mode Mode, paths []PathSpec) Target {
-	children := make([]Target, 0, len(paths))
-	for i, ps := range paths {
-		children = append(children, Path(fmt.Sprintf("path-%d", i+1), ps))
-	}
-	if !mode.Valid() {
-		mode = ModePrime
-	}
-	switch mode {
-	case ModeRace:
-		return Race("root", children)
-	case ModeBond:
-		return Bond("root", children)
-	default:
-		return Selector("root", children)
-	}
-}
-
 func compileTargetForDial(root Target) (compiledTarget, error) {
-	if root == nil {
-		return compiledTarget{}, errNilTarget
+	graph, err := compileTargetGraph(root)
+	if err != nil {
+		return compiledTarget{}, err
 	}
-	return compileTargetNode(root, true)
-}
-
-func compileTargetNode(t Target, root bool) (compiledTarget, error) {
-	switch v := t.(type) {
-	case PathTarget:
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{specWithTargetName(v.Spec, v.TargetName)}, pathPeak: []bool{false}}, nil
-	case *PathTarget:
-		if v == nil {
-			return compiledTarget{}, errNilTarget
-		}
-		return compiledTarget{mode: ModePrime, paths: []PathSpec{specWithTargetName(v.Spec, v.TargetName)}, pathPeak: []bool{false}}, nil
-	case GroupTarget:
-		return compileGroupTarget(v, root)
-	case *GroupTarget:
-		if v == nil {
-			return compiledTarget{}, errNilTarget
-		}
-		return compileGroupTarget(*v, root)
-	default:
-		return compiledTarget{}, fmt.Errorf("rendr: unsupported target type %T", t)
-	}
-}
-
-func compileGroupTarget(g GroupTarget, root bool) (compiledTarget, error) {
-	if len(g.Children) == 0 {
-		return compiledTarget{}, errEmptyGroupTarget
-	}
-	var out compiledTarget
-	switch g.Kind {
-	case TargetKindRace:
-		out.mode = ModeRace
-	case TargetKindBond:
-		out.mode = ModeBond
-	case TargetKindSelector:
-		out.mode = ModePrime
-	default:
-		return compiledTarget{}, fmt.Errorf("rendr: unknown target kind %q", g.Kind)
-	}
-	out.peakTransfer = g.Peak != nil
-	if g.Peak != nil {
-		out.peakOptions = *g.Peak
-		out.peakOptions.Targets = append([]string(nil), g.Peak.Targets...)
-	}
-	peakSet := map[string]bool{}
-	if g.Peak != nil {
-		for _, name := range g.Peak.Targets {
-			peakSet[name] = true
-		}
-	}
-	for _, child := range orderedChildren(g.Children, peakSet) {
-		childPeak := child != nil && peakSet[child.Name()]
-		ct, err := compileTargetNode(child, false)
-		if err != nil {
-			return compiledTarget{}, err
-		}
-		if !isPathOnly(child) {
-			out.runtimeNested = true
-		}
-		out.paths = append(out.paths, ct.paths...)
-		for _, peak := range ct.pathPeak {
-			out.pathPeak = append(out.pathPeak, peak || childPeak)
-		}
-		out.peakTransfer = out.peakTransfer || ct.peakTransfer
-		if childPeak && out.peakMode == 0 {
-			out.peakMode = ct.mode
-		}
-		if out.peakMode == 0 && ct.peakMode != 0 {
-			out.peakMode = ct.peakMode
-		}
-		out.runtimeNested = out.runtimeNested || ct.runtimeNested
-	}
-	if len(out.paths) == 0 {
-		return compiledTarget{}, errEmptyGroupTarget
-	}
-	if len(out.pathPeak) != len(out.paths) {
-		out.pathPeak = make([]bool, len(out.paths))
-	}
-	if out.peakTransfer && out.peakMode == 0 {
-		out.peakMode = ModePrime
-	}
-	return out, nil
-}
-
-func orderedChildren(children []Target, peakSet map[string]bool) []Target {
-	if len(peakSet) == 0 {
-		return append([]Target(nil), children...)
-	}
-	out := make([]Target, 0, len(children))
-	for _, c := range children {
-		if c != nil && !peakSet[c.Name()] {
-			out = append(out, c)
-		}
-	}
-	for _, c := range children {
-		if c != nil && peakSet[c.Name()] {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-func isPathOnly(t Target) bool {
-	switch t.(type) {
-	case PathTarget, *PathTarget:
-		return true
-	default:
-		return false
-	}
+	return graph.compileDialPlan()
 }
 
 func specWithTargetName(spec PathSpec, name string) PathSpec {

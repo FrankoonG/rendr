@@ -234,7 +234,6 @@ func (c *scriptedRendrPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return 0, nil, io.EOF
 	}
 }
-func (c *scriptedRendrPacketConn) Paths() []rendr.PathInfo  { return nil }
-func (c *scriptedRendrPacketConn) SetMode(rendr.Mode) error { return nil }
-func (c *scriptedRendrPacketConn) FlowID() [16]byte         { return [16]byte{1} }
-func (c *scriptedRendrPacketConn) Status() rendr.Status     { return rendr.Status{} }
+func (c *scriptedRendrPacketConn) Paths() []rendr.PathInfo { return nil }
+func (c *scriptedRendrPacketConn) FlowID() [16]byte        { return [16]byte{1} }
+func (c *scriptedRendrPacketConn) Status() rendr.Status    { return rendr.Status{} }

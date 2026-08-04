@@ -70,7 +70,7 @@ func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
 	for i := range paths {
 		paths[i] = PathSpec{Transport: "tcp", Address: ln.Addr().String()}
 	}
-	client, err := (&Dialer{Mode: ModePrime, Paths: paths}).Dial(context.Background())
+	client, err := (&Dialer{Root: selectorRoot(paths)}).Dial(context.Background())
 	if err != nil {
 		b.Fatal(err)
 	}

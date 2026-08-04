@@ -149,6 +149,16 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 	}
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
+	if err := e.AcceptPeerNegotiation(p.Negotiation); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
+	if err := e.MirrorPeerGraphForLocal(); err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return
+	}
 	e.SetLocalInstanceID(l.instanceID)
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerInstanceID(p.InstanceID)
@@ -167,7 +177,7 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, p.FlowID, l.instanceID, eLocalCaps(e)); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e)); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -179,7 +189,7 @@ func (l *gvisorListener) handleHello(pc transport.PathConn, payload []byte) {
 		LAddr: addrFromString(pc.LocalAddr()),
 		RAddr: addrFromString(pc.RemoteAddr()),
 	}
-	bc := newEngineBackedConn(e, c, ModePrime)
+	bc := newEngineBackedConn(e, c, ModeSelector)
 
 	go func(flowID [16]byte) {
 		<-bc.e.Closed()
@@ -204,20 +214,25 @@ func (l *gvisorListener) handleBridgeTag(pc transport.PathConn, payload []byte) 
 		e, ok = waitBridgeArrival(l.bridges, p.BridgeID, 500*time.Millisecond)
 	}
 	if !ok {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectUnknown, "unknown flow")
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectUnknown, "unknown flow")
 		_ = pc.Close()
 		return
 	}
 	if p.ExpectedPeerInstanceID != (proto.InstanceID{}) && p.ExpectedPeerInstanceID != l.instanceID {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectInstance, "instance mismatch")
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectInstance, "instance mismatch")
+		_ = pc.Close()
+		return
+	}
+	if err := e.ValidateBridgeBinding(p); err != nil {
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectProtoState, err.Error())
 		_ = pc.Close()
 		return
 	}
 	spec := specWithTargetName(PathSpec{Transport: "gvisor", Address: pc.RemoteAddr()}, p.PathName)
 	if _, err := e.AttachPath(pc, spec); err != nil {
-		_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckRejectAttach, err.Error())
+		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAck(pc, p.BridgeID, l.instanceID, proto.AckOK, "")
+	_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckOK, "")
 }

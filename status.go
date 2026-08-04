@@ -154,12 +154,6 @@ const (
 	PrimaryRequire PrimaryPolicy = "require"
 )
 
-type RootConfig struct {
-	Target        Target
-	Primary       string
-	PrimaryPolicy PrimaryPolicy
-}
-
 type RetryPolicy struct {
 	Enabled    bool
 	MinBackoff time.Duration

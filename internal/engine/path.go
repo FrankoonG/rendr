@@ -36,10 +36,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 		e.pathsMu.Unlock()
 		return
 	}
-	var redistribute [][]byte
-	if cause != transport.CauseCleanClose && !e.Packetized() {
-		redistribute = e.sendHistorySnapshot(e.sendAckNext.Load())
-	}
+	shouldReplay := cause != transport.CauseCleanClose
 	slot.closeQuit()
 	delete(e.paths, id)
 	wasActive := e.activeID == id
@@ -75,8 +72,8 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 			_ = e.Close()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		if hasPaths && len(redistribute) > 0 {
-			go e.redistributeBondFrames(redistribute)
+		if hasPaths && shouldReplay {
+			e.requestReplay(e.sendAckNext.Load())
 		}
 		// Successful death-driven migration counts for zombie
 		// accounting. Without a fresh path, fall through to budget.

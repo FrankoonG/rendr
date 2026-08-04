@@ -8,20 +8,9 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
-// PerformClientHello sends HELLO on pc as the first frame and returns
-// without waiting for a response. flowID is the engine's flow id.
-func PerformClientHello(pc transport.PathConn, flowID [16]byte, caps uint32) error {
-	payload := proto.HelloPayload{FlowID: flowID, Caps: caps}.Encode()
-	return writeCtrl(pc, proto.CtrlHello, 0, payload, 0)
-}
-
-func PerformClientHelloWithPathName(pc transport.PathConn, flowID [16]byte, caps uint32, name string) error {
-	payload := proto.HelloPayload{FlowID: flowID, Caps: caps}.EncodeWithPathName(name)
-	return writeCtrl(pc, proto.CtrlHello, 0, payload, 0)
-}
-
-func PerformClientHelloAck(pc transport.PathConn, flowID [16]byte, instanceID proto.InstanceID, caps uint32, name string) (proto.HelloAckPayload, error) {
-	payload := proto.HelloPayload{FlowID: flowID, InstanceID: instanceID, Caps: caps}.EncodeWithPathName(name)
+func PerformClientHelloAck(pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32, name string) (proto.HelloAckPayload, error) {
+	flowID := e.FlowID()
+	payload := proto.HelloPayload{Negotiation: e.LocalNegotiation(), FlowID: flowID, InstanceID: instanceID, Caps: caps}.EncodeWithPathName(name)
 	if err := writeCtrl(pc, proto.CtrlHello, 0, payload, 0); err != nil {
 		return proto.HelloAckPayload{}, err
 	}
@@ -39,27 +28,15 @@ func PerformClientHelloAck(pc transport.PathConn, flowID [16]byte, instanceID pr
 	if ack.FlowID != flowID {
 		return proto.HelloAckPayload{}, fmt.Errorf("engine: HELLO_ACK flow mismatch")
 	}
+	if err := e.AcceptPeerNegotiation(ack.Negotiation); err != nil {
+		return proto.HelloAckPayload{}, err
+	}
 	return ack, nil
 }
 
-// PerformClientBridgeTag sends BRIDGE_TAG so the server attaches
-// this new path to an existing bridge identified by bridgeID.
-func PerformClientBridgeTag(pc transport.PathConn, bridgeID [16]byte) error {
-	payload := proto.BridgeTagPayload{BridgeID: bridgeID}.Encode()
-	return writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0)
-}
-
-func PerformClientBridgeTagWithPathName(pc transport.PathConn, bridgeID [16]byte, name string) error {
-	payload := proto.BridgeTagPayload{BridgeID: bridgeID}.EncodeWithPathName(name)
-	return writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0)
-}
-
-func PerformClientBridgeTagAck(pc transport.PathConn, bridgeID [16]byte, instanceID, expectedPeer proto.InstanceID, name string) (proto.BridgeAckPayload, error) {
-	payload := proto.BridgeTagPayload{
-		BridgeID:               bridgeID,
-		InstanceID:             instanceID,
-		ExpectedPeerInstanceID: expectedPeer,
-	}.EncodeWithPathName(name)
+func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (proto.BridgeAckPayload, error) {
+	tag := newBridgeTagPayload(e.FlowID(), e.LocalInstanceID(), e.PeerInstanceID(), e.LocalNegotiation(), name)
+	payload := tag.Encode()
 	if err := writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0); err != nil {
 		return proto.BridgeAckPayload{}, err
 	}
@@ -74,8 +51,15 @@ func PerformClientBridgeTagAck(pc transport.PathConn, bridgeID [16]byte, instanc
 	if err != nil {
 		return proto.BridgeAckPayload{}, err
 	}
-	if ack.BridgeID != bridgeID {
+	if ack.BridgeID != e.FlowID() {
 		return proto.BridgeAckPayload{}, fmt.Errorf("engine: BRIDGE_ACK flow mismatch")
+	}
+	if ack.InstanceID != e.PeerInstanceID() {
+		return proto.BridgeAckPayload{}, fmt.Errorf("engine: BRIDGE_ACK instance mismatch")
+	}
+	if ack.SessionEpoch != tag.SessionEpoch || ack.GraphRevision != tag.GraphRevision ||
+		ack.GraphDigest != tag.GraphDigest || ack.TargetID != tag.TargetID {
+		return proto.BridgeAckPayload{}, fmt.Errorf("engine: BRIDGE_ACK binding mismatch")
 	}
 	if !ack.Code.OK() {
 		if ack.Reason != "" {
@@ -86,14 +70,55 @@ func PerformClientBridgeTagAck(pc transport.PathConn, bridgeID [16]byte, instanc
 	return ack, nil
 }
 
-func PerformHelloAck(pc transport.PathConn, flowID [16]byte, instanceID proto.InstanceID, caps uint32) error {
-	payload := proto.HelloAckPayload{FlowID: flowID, InstanceID: instanceID, Caps: caps}.Encode()
+func PerformHelloAck(pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32) error {
+	payload := proto.HelloAckPayload{Negotiation: e.LocalNegotiation(), FlowID: e.FlowID(), InstanceID: instanceID, Caps: caps}.Encode()
 	return writeCtrl(pc, proto.CtrlHelloAck, 0, payload, 0)
 }
 
-func PerformBridgeAck(pc transport.PathConn, bridgeID [16]byte, instanceID proto.InstanceID, code proto.AckCode, reason string) error {
-	payload := proto.BridgeAckPayload{BridgeID: bridgeID, InstanceID: instanceID, Code: code, Reason: reason}.Encode()
+func PerformBridgeAck(pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, code proto.AckCode, reason string) error {
+	payload := proto.BridgeAckPayload{
+		BridgeID:      tag.BridgeID,
+		InstanceID:    instanceID,
+		SessionEpoch:  tag.SessionEpoch,
+		GraphRevision: tag.GraphRevision,
+		GraphDigest:   tag.GraphDigest,
+		TargetID:      tag.TargetID,
+		Code:          code,
+		Reason:        reason,
+	}.Encode()
 	return writeCtrl(pc, proto.CtrlBridgeAck, 0, payload, 0)
+}
+
+func newBridgeTagPayload(bridgeID [16]byte, instanceID, expectedPeer proto.InstanceID, negotiation proto.Negotiation, name string) proto.BridgeTagPayload {
+	return proto.BridgeTagPayload{
+		BridgeID:               bridgeID,
+		InstanceID:             instanceID,
+		ExpectedPeerInstanceID: expectedPeer,
+		SessionEpoch:           negotiation.SessionEpoch,
+		GraphRevision:          negotiation.GraphRevision,
+		GraphDigest:            negotiation.GraphDigest,
+		TargetID:               proto.StableTargetID(name),
+		PathName:               name,
+	}
+}
+
+// ValidateBridgeBinding verifies an attach request against immutable session
+// identity before the caller allocates a path id or starts reader goroutines.
+func (e *Engine) ValidateBridgeBinding(tag proto.BridgeTagPayload) error {
+	if tag.BridgeID != e.flowID || tag.SessionEpoch != proto.SessionEpoch(e.flowID) {
+		return fmt.Errorf("engine: bridge session epoch mismatch")
+	}
+	binding := e.peerGraphBinding()
+	if tag.GraphRevision != binding.revision || tag.GraphDigest != binding.digest {
+		return fmt.Errorf("engine: bridge graph binding mismatch")
+	}
+	if tag.InstanceID == (proto.InstanceID{}) || tag.InstanceID != e.PeerInstanceID() {
+		return fmt.Errorf("engine: bridge sender instance mismatch")
+	}
+	if tag.ExpectedPeerInstanceID == (proto.InstanceID{}) || tag.ExpectedPeerInstanceID != e.LocalInstanceID() {
+		return fmt.Errorf("engine: bridge receiver instance mismatch")
+	}
+	return nil
 }
 
 // PerformBye sends BYE on the active path. Best-effort: failures are

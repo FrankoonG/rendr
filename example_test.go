@@ -33,8 +33,7 @@ func ExampleDialer_Dial() {
 	}()
 
 	d := &rendr.Dialer{
-		Mode:  rendr.ModePrime,
-		Paths: []rendr.PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 	}
 	c, err := d.Dial(context.Background())
 	if err != nil {
@@ -69,8 +68,7 @@ func ExampleAdminConn() {
 	}()
 
 	d := &rendr.Dialer{
-		Mode:  rendr.ModePrime,
-		Paths: []rendr.PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
+		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 	}
 	c, err := d.Dial(context.Background())
 	if err != nil {
@@ -88,7 +86,7 @@ func ExampleAdminConn() {
 	<-srvDone
 	// Output:
 	// state: active
-	// mode: prime
+	// mode: selector
 	// paths: 1
 }
 
@@ -117,8 +115,7 @@ func ExampleDialer_DialPacket() {
 	}()
 
 	d := &rendr.Dialer{
-		Mode:  rendr.ModePrime,
-		Paths: []rendr.PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
+		Root: rendr.Path("udp", rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
 	}
 	c, err := d.DialPacket(context.Background())
 	if err != nil {

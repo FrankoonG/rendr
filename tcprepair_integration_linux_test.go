@@ -45,12 +45,12 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcprepair", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)

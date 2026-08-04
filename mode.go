@@ -1,15 +1,19 @@
 package rendr
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/FrankoonG/rendr/proto"
+)
 
 // Mode selects how the engine uses the set of available paths.
 type Mode uint8
 
 const (
-	// ModePrime picks the single best-scoring path and migrates only
+	// ModeSelector picks the single best-scoring path and migrates only
 	// when another path beats the current one by the hysteresis margin
 	// for at least dwell, with cooldown between switches.
-	ModePrime Mode = 1
+	ModeSelector Mode = 1
 	// ModeBond splits frames across paths to aggregate throughput.
 	ModeBond Mode = 2
 	// ModeRace duplicates every frame across all paths and dedupes on
@@ -20,8 +24,8 @@ const (
 
 func (m Mode) String() string {
 	switch m {
-	case ModePrime:
-		return "prime"
+	case ModeSelector:
+		return "selector"
 	case ModeBond:
 		return "bond"
 	case ModeRace:
@@ -33,5 +37,18 @@ func (m Mode) String() string {
 
 // Valid reports whether m is one of the defined modes.
 func (m Mode) Valid() bool {
-	return m == ModePrime || m == ModeBond || m == ModeRace
+	return m == ModeSelector || m == ModeBond || m == ModeRace
+}
+
+func (m Mode) executionKind() (proto.ExecutionKind, bool) {
+	switch m {
+	case ModeSelector:
+		return proto.ExecutionKindSelector, true
+	case ModeBond:
+		return proto.ExecutionKindBond, true
+	case ModeRace:
+		return proto.ExecutionKindRace, true
+	default:
+		return proto.ExecutionKindInvalid, false
+	}
 }

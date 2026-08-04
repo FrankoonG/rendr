@@ -18,6 +18,25 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
+func testRoot(kind TargetKind, specs []PathSpec) Target {
+	children := make([]Target, 0, len(specs))
+	for i, spec := range specs {
+		children = append(children, Path(fmt.Sprintf("path-%d", i+1), spec))
+	}
+	switch kind {
+	case TargetKindRace:
+		return Race("root", children)
+	case TargetKindBond:
+		return Bond("root", children)
+	default:
+		return Selector("root", children)
+	}
+}
+
+func selectorRoot(specs []PathSpec) Target { return testRoot(TargetKindSelector, specs) }
+func raceRoot(specs []PathSpec) Target     { return testRoot(TargetKindRace, specs) }
+func bondRoot(specs []PathSpec) Target     { return testRoot(TargetKindBond, specs) }
+
 // waitForNPaths polls until both client and server see at least n
 // attached paths, retrying via AdminConn.AddPath against the named
 // transport+address if the client falls short. The Dialer is
@@ -68,10 +87,10 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -141,10 +160,10 @@ func TestPathInfoLastRecvAt(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -214,11 +233,10 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 	}()
 
 	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+		Root: selectorRoot([]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
+		}),
 		ZombieMaxMigrations: 1,
 		ZombieCooldown:      30 * time.Second,
 	}
@@ -280,14 +298,14 @@ func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{
 			Transport: "quic",
 			Address:   ln.Addr().String(),
 			Opts:      map[string]string{"mode": "datagram"},
-		}},
-	}
+		}})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -380,10 +398,10 @@ func TestSetReadDeadlinePacketMode(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -451,10 +469,10 @@ func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -497,28 +515,6 @@ func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
 	}
 }
 
-// TestModeConstants pins the integer values of the public Mode enum.
-// The values must match internal/engine.dispatchPrime/Bond/Race
-// because (*engineBackedConn).SetMode passes uint32(rendr.Mode) to
-// engine.SetMode without remapping. A drift here silently desyncs
-// the dispatcher selection from the public API.
-func TestModeConstants(t *testing.T) {
-	cases := []struct {
-		mode Mode
-		want uint8
-	}{
-		{ModePrime, 1},
-		{ModeBond, 2},
-		{ModeRace, 3},
-	}
-	for _, c := range cases {
-		if uint8(c.mode) != c.want {
-			t.Errorf("%s drifted: got %d want %d (engine.dispatch* must match)",
-				c.mode, uint8(c.mode), c.want)
-		}
-	}
-}
-
 // TestM1DialAcceptRoundTrip is the minimal end-to-end demo for M1:
 // ListenTCP + Dialer.Dial + Read/Write a payload over the rendr Conn.
 // Both ends live in the same process; the wire path is a real TCP
@@ -547,12 +543,12 @@ func TestM1DialAcceptRoundTrip(t *testing.T) {
 	}()
 
 	// Dial side.
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	clientConn, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -625,10 +621,9 @@ func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}},
-	}).Dial(context.Background())
+	client, err := (&Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}})}).Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,7 +674,7 @@ func TestM1LargePayload(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -766,7 +761,7 @@ func TestM1FlowIDsAreUnique(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+			d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 			c, err := d.Dial(context.Background())
 			if err != nil {
 				clientErrs[i] = err
@@ -848,13 +843,13 @@ func TestM1PlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -963,11 +958,10 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:            ModePrime,
-		Paths:           []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
-		MigrationBudget: 200 * time.Millisecond,
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}), MigrationBudget: 200 * time.Millisecond}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1034,14 +1028,13 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-		MigrationBudget: 3 * time.Second,
-	}
+		}), MigrationBudget: 3 * time.Second}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1134,7 +1127,7 @@ func TestM1CleanCloseEOF(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1199,13 +1192,13 @@ func TestM1G1Sketch(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1337,15 +1330,15 @@ func TestM1G2Sketch(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1474,13 +1467,13 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime, // start prime then flip; SetMode flow lives here.
-		Paths: []PathSpec{
+	d := &Dialer{Root: raceRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1515,10 +1508,6 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	})
 	if len(probes) != 2 {
 		t.Fatalf("expected 2 probes, got %d", len(probes))
-	}
-
-	if err := client.SetMode(ModeRace); err != nil {
-		t.Fatal(err)
 	}
 
 	const N = 8
@@ -1574,13 +1563,13 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: bondRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1611,9 +1600,6 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	}
 
 	bc.Engine().SetBondPinSizeForTest(1)
-	if err := client.SetMode(ModeBond); err != nil {
-		t.Fatalf("SetMode(bond): %v", err)
-	}
 	for i := range probes {
 		probes[i].base = probes[i].writer.Writes()
 	}
@@ -1695,7 +1681,7 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 // flow id, mode, state, active path, the path list, and recv-queue
 // HWM in one call. Fields must be internally consistent (same
 // flow id everywhere, ActivePath in Paths if non-zero, Mode
-// reflecting the most recent SetMode).
+// reflecting the executor selected by the root target).
 func TestAdminConnStatsSnapshot(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
@@ -1715,13 +1701,13 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1744,8 +1730,8 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 	if s.State != "active" {
 		t.Errorf("Stats.State: got %q want %q", s.State, "active")
 	}
-	if s.Mode != ModePrime {
-		t.Errorf("Stats.Mode: got %v want %v", s.Mode, ModePrime)
+	if s.Mode != ModeSelector {
+		t.Errorf("Stats.Mode: got %v want %v", s.Mode, ModeSelector)
 	}
 	if s.ActivePath == 0 {
 		t.Error("Stats.ActivePath should be non-zero after dial")
@@ -1779,16 +1765,6 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 		t.Errorf("Stats.CreatedAt unreasonable: age=%s", age)
 	}
 
-	// Mode read should track SetMode write.
-	if err := client.SetMode(ModeRace); err != nil {
-		t.Fatal(err)
-	}
-	if got := adm.Mode(); got != ModeRace {
-		t.Errorf("Mode() after SetMode(Race): got %v want %v", got, ModeRace)
-	}
-	if got := adm.Stats().Mode; got != ModeRace {
-		t.Errorf("Stats.Mode after SetMode(Race): got %v want %v", got, ModeRace)
-	}
 }
 
 // TestAdminConnStateAndHWM: State() reports the bridge lifecycle
@@ -1813,7 +1789,7 @@ func TestAdminConnStateAndHWM(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1885,7 +1861,7 @@ func TestPathInfoCountersExposed(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Mode: ModePrime, Paths: []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}}
+	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1943,13 +1919,13 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2051,13 +2027,13 @@ func TestAdminConnRemovePath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2146,13 +2122,13 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2213,14 +2189,14 @@ func TestAdminConnOnMigrate(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2330,14 +2306,14 @@ func TestAdminConnMigrationCount(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2460,13 +2436,13 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: raceRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2475,9 +2451,9 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Wait for BOTH sides to see 2 attached paths before SetMode.
+	// Wait for both sides to see two attached paths before sending.
 	// Previous version only checked server.Paths() >= 2; if the
-	// client side was still finishing path-2 attach when SetMode
+	// client side was still finishing path-2 attach when traffic
 	// fired, race-mode dispatch would target only the single
 	// already-attached path and emit no duplicates. Result:
 	// RecvDups=0 (test fails) and HWM=1 (no concurrent arrivals).
@@ -2491,10 +2467,6 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	}
 	if len(client.Paths()) < 2 {
 		t.Fatalf("M7 setup: client only sees %d paths after 5s; race-mode dispatch needs ≥2", len(client.Paths()))
-	}
-
-	if err := client.SetMode(ModeRace); err != nil {
-		t.Fatal(err)
 	}
 
 	// Stream 64 frames in race mode. Receiver should drain each
@@ -2571,13 +2543,13 @@ func TestM8BondPathPinning(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: bondRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2612,9 +2584,6 @@ func TestM8BondPathPinning(t *testing.T) {
 
 	// Pin size 4 so 16 frames -> 4 runs of 4.
 	bc.Engine().SetBondPinSizeForTest(4)
-	if err := client.SetMode(ModeBond); err != nil {
-		t.Fatalf("SetMode bond: %v", err)
-	}
 
 	const N = 16
 	payload := []byte("pinframe")
@@ -2701,13 +2670,13 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: bondRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2741,10 +2710,6 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 		}
 	})
 
-	if err := client.SetMode(ModeBond); err != nil {
-		t.Fatalf("SetMode(bond): %v", err)
-	}
-
 	// Send N small frames; each engine.SendData call produces one
 	// data frame (the payload is < MaxPayload).
 	const N = 16
@@ -2766,7 +2731,7 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 
 	// Bond should distribute roughly evenly. Each path should see
 	// >= 1 data write (we allow asymmetry for ctrl frames that
-	// went on whichever path was active before SetMode).
+	// went on whichever path was initially active).
 	var totals []uint64
 	for _, p := range probes {
 		got := p.writer.Writes() - p.base
@@ -2801,14 +2766,13 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:          ModePrime,
-		ProbeInterval: time.Hour,
-		Paths: []PathSpec{
+	d := &Dialer{Root: bondRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String(), Weight: 3},
 			{Transport: "tcp", Address: ln.Addr().String(), Weight: 1},
-		},
-	}
+		}), ProbeInterval: time.Hour}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2826,33 +2790,17 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 	type pp struct {
 		id     uint32
 		weight uint16
-		writer interface{ Writes() uint64 }
 		base   uint64
 	}
 	var probes []pp
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pp{id: id, writer: w})
-		}
-	})
+	for _, path := range client.Paths() {
+		probes = append(probes, pp{id: path.ID, weight: path.Spec.Weight, base: path.DataDispatches})
+	}
 	if len(probes) != 2 {
 		t.Fatalf("expected 2 probes, got %d", len(probes))
 	}
-	for _, path := range client.Paths() {
-		for i := range probes {
-			if probes[i].id == path.ID {
-				probes[i].weight = path.Spec.Weight
-			}
-		}
-	}
 
 	bc.Engine().SetBondPinSizeForTest(1)
-	if err := client.SetMode(ModeBond); err != nil {
-		t.Fatalf("SetMode(bond): %v", err)
-	}
-	for i := range probes {
-		probes[i].base = probes[i].writer.Writes()
-	}
 
 	const N = 16
 	payload := []byte("weighted")
@@ -2868,8 +2816,12 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 	}
 
 	counts := map[uint16]uint64{}
-	for _, p := range probes {
-		counts[p.weight] += p.writer.Writes() - p.base
+	for _, path := range client.Paths() {
+		for _, p := range probes {
+			if p.id == path.ID {
+				counts[p.weight] += path.DataDispatches - p.base
+			}
+		}
 	}
 	if counts[3] != 12 || counts[1] != 4 {
 		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, want 12/4", counts[3], counts[1])
@@ -2904,13 +2856,13 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: bondRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -2952,10 +2904,6 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 	// here: stuck-skip should bypass the slow path regardless.
 	for i := range probes {
 		probes[i].base = probes[i].writer.Writes()
-	}
-
-	if err := client.SetMode(ModeBond); err != nil {
-		t.Fatalf("SetMode(bond): %v", err)
 	}
 
 	const N = 20
@@ -3025,13 +2973,13 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
 			{Transport: "udpflow", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3128,14 +3076,13 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
 			{Transport: "udpflow", Address: ln.Addr().String()},
-		},
-		MigrationBudget: 3 * time.Second,
-	}
+		}), MigrationBudget: 3 * time.Second}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3205,10 +3152,10 @@ func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3270,10 +3217,10 @@ func TestM5PacketBoundariesPreserved(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3357,10 +3304,10 @@ func TestM5PacketRejectOversize(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3414,13 +3361,13 @@ func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
 			{Transport: "udpflow", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3528,14 +3475,14 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 				accepted <- c
 			}()
 
-			d := &Dialer{
-				Mode: ModePrime,
-				Paths: []PathSpec{
+			d := &Dialer{Root: selectorRoot(
+
+				[]PathSpec{
 					{Transport: "udpflow", Address: ln.Addr().String()},
 					{Transport: "udpflow", Address: ln.Addr().String()},
 					{Transport: "udpflow", Address: ln.Addr().String()},
-				},
-			}
+				})}
+
 			client, err := d.DialPacket(context.Background())
 			if err != nil {
 				return err
@@ -3655,13 +3602,13 @@ func TestM5PacketRaceModeDuplicates(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: raceRoot(
+
+		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
 			{Transport: "udpflow", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3678,17 +3625,13 @@ func TestM5PacketRaceModeDuplicates(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if err := client.SetMode(ModeRace); err != nil {
-		t.Fatalf("SetMode race: %v", err)
-	}
-
-	// Settle: the SetMode flip on the client doesn't synchronously
+	// Settle: attachment on the client doesn't synchronously
 	// guarantee server-side reader goroutines for both paths are
 	// drained-ready. Give the scheduler a beat so race fanout lands
 	// on two prepared paths.
 	time.Sleep(50 * time.Millisecond)
 
-	// Warmup: drain a couple of packets in prime-style (only one
+	// Warmup: drain a couple of packets before the
 	// path absorbs each, the other ignores) before switching to the
 	// count window. udpflow's per-path UDP socket can occasionally
 	// be momentarily flaky on Windows loopback under parallel test
@@ -3786,11 +3729,10 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:          ModePrime,
-		Paths:         []PathSpec{{Transport: "tcp", Address: ln.Addr().String()}},
-		ProbeInterval: 100 * time.Millisecond,
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}), ProbeInterval: 100 * time.Millisecond}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3824,14 +3766,14 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 	t.Logf("loopback RTT measured = %s", rtt)
 }
 
-// TestM6PrimeAutoMigrateOnQualityChange: with prime-mode quality
+// TestM6SelectorAutoMigrateOnQualityChange: with selector quality
 // scheduler armed, when path 2 becomes substantially better than
 // the current path 1 (10x lower RTT), the engine must migrate to
 // it after dwell + cooldown without the test calling Migrate.
 //
 // Uses SetPathQualityForTest to inject scores; the production
 // RTT/jitter/loss probe lands in M6(2/n).
-func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
+func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -3851,11 +3793,10 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 	}()
 
 	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+		Root: selectorRoot([]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
+		}),
 		Hysteresis: 0.1,
 		Dwell:      50 * time.Millisecond,
 		Cooldown:   100 * time.Millisecond,
@@ -3896,7 +3837,7 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		RTT: 10 * time.Millisecond,
 	})
 
-	// Wait at most dwell + cooldown + tick slack for the prime
+	// Wait at most dwell + cooldown + tick slack for the selector
 	// scheduler to fire. 10 s tolerance covers parallel-package
 	// contention that pushes scheduler ticks past the nominal
 	// dwell+cooldown when ~10 packages worth of sockets/goroutines
@@ -3911,7 +3852,7 @@ func TestM6PrimeAutoMigrateOnQualityChange(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !migrated {
-		t.Fatalf("prime scheduler did not migrate to better path within 10s (active still %d, wanted %d)",
+		t.Fatalf("selector did not migrate to better path within 10s (active still %d, wanted %d)",
 			bc.Engine().ActivePath(), otherID)
 	}
 }
@@ -3940,13 +3881,13 @@ func TestM2G1SketchQUIC(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "quic", Address: ln.Addr().String()},
 			{Transport: "quic", Address: ln.Addr().String()},
-		},
-	}
+		})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4064,10 +4005,10 @@ func TestM2QUICRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode:  ModePrime,
-		Paths: []PathSpec{{Transport: "quic", Address: ln.Addr().String()}},
-	}
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{{Transport: "quic", Address: ln.Addr().String()}})}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4125,14 +4066,13 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: addrs[0].String()},
 			{Transport: "quic", Address: addrs[1].String()},
-		},
-		MigrationBudget: 3 * time.Second,
-	}
+		}), MigrationBudget: 3 * time.Second}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4230,14 +4170,12 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	client, err := (&Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: addrs[0].String()},
 			{Transport: "quic", Address: addrs[1].String()},
-		},
-		MigrationBudget: 5 * time.Second,
-	}).Dial(context.Background())
+		}), MigrationBudget: 5 * time.Second}).Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4265,7 +4203,7 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 	}
 	if admin.ActivePath() != tcpPath {
 		if err := admin.Migrate(tcpPath); err != nil {
-			t.Fatalf("prime tcp path: %v", err)
+			t.Fatalf("selector tcp path: %v", err)
 		}
 	}
 
@@ -4376,14 +4314,13 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "quic", Address: ln.Addr().String()},
 			{Transport: "quic", Address: ln.Addr().String()},
-		},
-		MigrationBudget: 3 * time.Second,
-	}
+		}), MigrationBudget: 3 * time.Second}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4434,7 +4371,7 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 
 // TestM1ZombieAfterTwoNoPayloadMigrations enforces CLAUDE.md hard
 // rule #5: two consecutive completed migrations with zero payload
-// arriving in between must trip ErrZombie. The harness primes the
+// arriving in between must trip ErrZombie. The harness initializes the
 // engine with one echo so zombieLeft is full, then kills the active
 // path twice with no traffic between the kills.
 func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
@@ -4456,15 +4393,14 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
-		Mode: ModePrime,
-		Paths: []PathSpec{
+	d := &Dialer{Root: selectorRoot(
+
+		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
-		},
-		MigrationBudget: 1 * time.Second,
-	}
+		}), MigrationBudget: 1 * time.Second}
+
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4500,6 +4436,9 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 	}
 
 	bc := client.(*engineBackedConn)
+	if !bc.Engine().WaitForSendDrain() {
+		t.Fatal("liveness payload was not acknowledged before zombie scenario")
+	}
 
 	// First kill: client.activeID dies, engine migrates to a survivor.
 	// zombieLeft: 2 -> 1 (no payload yet between this and a hypothetical next).

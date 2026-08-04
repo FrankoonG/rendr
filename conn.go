@@ -20,13 +20,6 @@ type Conn interface {
 	// Paths returns a snapshot of the currently-attached path set.
 	Paths() []PathInfo
 
-	// SetMode atomically switches the operational mode.
-	// Some transitions are illegal at runtime: race → bond is rejected
-	// (race has no per-path sequencing; bond requires it). bond → prime
-	// and prime ↔ race are allowed. SetMode returns nil on success or
-	// an error describing the rejection cause.
-	SetMode(Mode) error
-
 	// FlowID returns the 16-byte flow identifier assigned at
 	// handshake. It is invariant for the Conn's lifetime and serves
 	// as the demux key on the server side across path migration.
@@ -42,7 +35,6 @@ type PacketConn interface {
 	net.PacketConn
 
 	Paths() []PathInfo
-	SetMode(Mode) error
 	FlowID() [16]byte
 	Status() Status
 }
@@ -124,9 +116,8 @@ type AdminConn interface {
 	// (e.g. metrics, structured logs).
 	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
 
-	// Mode returns the current operational mode (prime/race/bond).
-	// Symmetric counterpart to SetMode; lets callers verify a
-	// mode transition succeeded.
+	// Mode returns the current operational mode
+	// (selector/race/bond).
 	Mode() Mode
 
 	// Stats returns a coherent one-call snapshot of everything a

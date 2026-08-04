@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 )
@@ -25,6 +26,98 @@ const (
 
 type InstanceID [16]byte
 
+const (
+	ProtocolMajor uint16 = 1
+	ProtocolMinor uint16 = 0
+)
+
+type FeatureSet uint64
+
+const (
+	FeatureReplayLedger   FeatureSet = 1 << 0
+	FeatureDirectionalACK FeatureSet = 1 << 1
+	FeatureStrictDecode   FeatureSet = 1 << 2
+
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode
+	RequiredFeatures  FeatureSet = SupportedFeatures
+)
+
+type GraphDigest [32]byte
+type TargetID [16]byte
+
+func StableTargetID(name string) TargetID {
+	sum := sha256.Sum256([]byte("rendr-target-v1\x00" + name))
+	var id TargetID
+	copy(id[:], sum[:len(id)])
+	return id
+}
+
+// Negotiation is carried by both HELLO and HELLO_ACK before any bridge state
+// is allocated. Minor versions remain feature-negotiated within protocol 1.
+type Negotiation struct {
+	ProtocolMajor uint16
+	ProtocolMinor uint16
+	Supported     FeatureSet
+	Required      FeatureSet
+	SessionEpoch  SessionEpoch
+	GraphRevision uint64
+	GraphDigest   GraphDigest
+}
+
+const NegotiationSize = 80
+
+func NewNegotiation(epoch SessionEpoch) Negotiation {
+	return Negotiation{
+		ProtocolMajor: ProtocolMajor,
+		ProtocolMinor: ProtocolMinor,
+		Supported:     SupportedFeatures,
+		Required:      RequiredFeatures,
+		SessionEpoch:  epoch,
+		GraphRevision: 1,
+	}
+}
+
+func (n Negotiation) encodeTo(b []byte) {
+	binary.BigEndian.PutUint16(b[0:2], n.ProtocolMajor)
+	binary.BigEndian.PutUint16(b[2:4], n.ProtocolMinor)
+	binary.BigEndian.PutUint64(b[8:16], uint64(n.Supported))
+	binary.BigEndian.PutUint64(b[16:24], uint64(n.Required))
+	copy(b[24:40], n.SessionEpoch[:])
+	binary.BigEndian.PutUint64(b[40:48], n.GraphRevision)
+	copy(b[48:80], n.GraphDigest[:])
+}
+
+func decodeNegotiation(b []byte) (Negotiation, error) {
+	if len(b) < NegotiationSize {
+		return Negotiation{}, fmt.Errorf("proto: negotiation too short: %d < %d", len(b), NegotiationSize)
+	}
+	if binary.BigEndian.Uint32(b[4:8]) != 0 {
+		return Negotiation{}, fmt.Errorf("proto: negotiation reserved bytes must be zero")
+	}
+	n := Negotiation{
+		ProtocolMajor: binary.BigEndian.Uint16(b[0:2]),
+		ProtocolMinor: binary.BigEndian.Uint16(b[2:4]),
+		Supported:     FeatureSet(binary.BigEndian.Uint64(b[8:16])),
+		Required:      FeatureSet(binary.BigEndian.Uint64(b[16:24])),
+		GraphRevision: binary.BigEndian.Uint64(b[40:48]),
+	}
+	copy(n.SessionEpoch[:], b[24:40])
+	copy(n.GraphDigest[:], b[48:80])
+	if n.ProtocolMajor != ProtocolMajor {
+		return Negotiation{}, fmt.Errorf("proto: unsupported protocol major %d", n.ProtocolMajor)
+	}
+	if n.Required&^SupportedFeatures != 0 {
+		return Negotiation{}, fmt.Errorf("proto: unknown required features 0x%x", uint64(n.Required&^SupportedFeatures))
+	}
+	if n.Required&^n.Supported != 0 {
+		return Negotiation{}, fmt.Errorf("proto: required features not advertised as supported")
+	}
+	if n.GraphRevision == 0 {
+		return Negotiation{}, fmt.Errorf("proto: zero graph revision")
+	}
+	return n, nil
+}
+
 // ProbePayload carries timestamps for per-path RTT measurement.
 // Probe frames are intentionally out-of-band of the SEQ reorder
 // buffer: the engine handles them directly in the per-path reader
@@ -36,6 +129,7 @@ type ProbePayload struct {
 
 const ProbePayloadSize = 16
 const ackProbeReplyMagic uint64 = 0x52454e44525f4143 // "RENDR_AC" prefix
+const ackPayloadVersion uint8 = 1
 
 func (p ProbePayload) Encode() []byte {
 	b := make([]byte, ProbePayloadSize)
@@ -46,47 +140,113 @@ func (p ProbePayload) Encode() []byte {
 
 func DecodeProbe(b []byte) (ProbePayload, error) {
 	var p ProbePayload
-	if len(b) < ProbePayloadSize {
-		return p, fmt.Errorf("proto: probe payload too short: %d < %d", len(b), ProbePayloadSize)
+	if err := requireExactPayloadSize("probe", len(b), ProbePayloadSize); err != nil {
+		return p, err
 	}
 	p.TS = binary.BigEndian.Uint64(b[0:8])
 	p.ID = binary.BigEndian.Uint64(b[8:16])
 	return p, nil
 }
 
-// AckPayload carries the receiver's cumulative SEQ floor. NextSeq is
-// the first frame SEQ not yet contiguously received, so all frames
-// with SEQ < NextSeq are safe to trim from resend windows.
-//
-// ACKs are encoded as a PATH_PROBE_REPLY extension rather than as a
-// new control code. Older peers decode the first 16 bytes as an
-// unmatched probe reply with ID=0 and ignore it; newer peers recognize
-// the magic and consume it out of band.
-type AckPayload struct {
-	NextSeq uint64
+// SenderDirection identifies the sequenced sender an ACK applies to.
+type SenderDirection uint8
+
+const (
+	SenderDirectionInvalid        SenderDirection = 0
+	SenderDirectionClientToServer SenderDirection = 1
+	SenderDirectionServerToClient SenderDirection = 2
+)
+
+func (d SenderDirection) Valid() bool {
+	return d == SenderDirectionClientToServer || d == SenderDirectionServerToClient
 }
 
-const AckPayloadSize = ProbePayloadSize + 8
+// SessionEpoch binds control-plane evidence to one logical connection.
+type SessionEpoch [16]byte
+type FrameDigest [32]byte
+type AckProof [16]byte
+
+func DigestFrame(frame []byte) FrameDigest {
+	return sha256.Sum256(frame)
+}
+
+func InitialAckProof(epoch SessionEpoch, direction SenderDirection, graphRevision uint64, graphDigest GraphDigest) AckProof {
+	h := sha256.New()
+	h.Write([]byte("rendr-ack-proof-v1\x00"))
+	h.Write(epoch[:])
+	h.Write([]byte{byte(direction)})
+	var revision [8]byte
+	binary.BigEndian.PutUint64(revision[:], graphRevision)
+	h.Write(revision[:])
+	h.Write(graphDigest[:])
+	var proof AckProof
+	copy(proof[:], h.Sum(nil))
+	return proof
+}
+
+func AdvanceAckProof(previous AckProof, frame FrameDigest) AckProof {
+	h := sha256.New()
+	h.Write([]byte("rendr-ack-chain-v1\x00"))
+	h.Write(previous[:])
+	h.Write(frame[:])
+	var proof AckProof
+	copy(proof[:], h.Sum(nil))
+	return proof
+}
+
+// AckPayload carries the receiver's cumulative SEQ floor. NextSeq is the
+// first frame not yet contiguously received. Gap asks the sender to replay
+// from NextSeq; repeated gap ACKs make a lost first request recoverable.
+type AckPayload struct {
+	SessionEpoch  SessionEpoch
+	Direction     SenderDirection
+	GraphRevision uint64
+	GraphDigest   GraphDigest
+	NextSeq       uint64
+	Gap           bool
+	Proof         AckProof
+}
+
+const AckPayloadSize = 96
 
 func (p AckPayload) Encode() []byte {
 	b := make([]byte, AckPayloadSize)
 	binary.BigEndian.PutUint64(b[0:8], ackProbeReplyMagic)
-	binary.BigEndian.PutUint64(b[8:16], 0)
-	binary.BigEndian.PutUint64(b[16:24], p.NextSeq)
+	b[8] = ackPayloadVersion
+	b[9] = byte(p.Direction)
+	if p.Gap {
+		b[10] = 1
+	}
+	copy(b[16:32], p.SessionEpoch[:])
+	binary.BigEndian.PutUint64(b[32:40], p.GraphRevision)
+	copy(b[40:72], p.GraphDigest[:])
+	binary.BigEndian.PutUint64(b[72:80], p.NextSeq)
+	copy(b[80:96], p.Proof[:])
 	return b
 }
 
 func DecodeAck(b []byte) (AckPayload, bool) {
-	if len(b) < AckPayloadSize {
+	if len(b) != AckPayloadSize {
 		return AckPayload{}, false
 	}
 	if binary.BigEndian.Uint64(b[0:8]) != ackProbeReplyMagic {
 		return AckPayload{}, false
 	}
-	if binary.BigEndian.Uint64(b[8:16]) != 0 {
+	if b[8] != ackPayloadVersion || !SenderDirection(b[9]).Valid() {
 		return AckPayload{}, false
 	}
-	return AckPayload{NextSeq: binary.BigEndian.Uint64(b[16:24])}, true
+	if b[10]&^byte(1) != 0 || b[11] != 0 || binary.BigEndian.Uint32(b[12:16]) != 0 {
+		return AckPayload{}, false
+	}
+	var p AckPayload
+	p.Direction = SenderDirection(b[9])
+	p.Gap = b[10]&1 != 0
+	copy(p.SessionEpoch[:], b[16:32])
+	p.GraphRevision = binary.BigEndian.Uint64(b[32:40])
+	copy(p.GraphDigest[:], b[40:72])
+	p.NextSeq = binary.BigEndian.Uint64(b[72:80])
+	copy(p.Proof[:], b[80:96])
+	return p, true
 }
 
 func (c CtrlCode) String() string {
@@ -144,24 +304,24 @@ const (
 	CapsL3Identity uint32 = 1 << 1
 )
 
-// HelloPayload: flow_id (16B) + instance_id (16B) + caps (4B).
+// HelloPayload: flow_id (16B) + instance_id (16B) + caps (4B), followed
+// optionally by one length-prefixed path name.
 type HelloPayload struct {
+	Negotiation
 	FlowID     [16]byte
 	InstanceID InstanceID
 	Caps       uint32
 	PathName   string
 }
 
-const (
-	HelloPayloadLegacySize = 20
-	HelloPayloadSize       = 36
-)
+const HelloPayloadSize = NegotiationSize + 36
 
 func (p HelloPayload) Encode() []byte {
 	b := make([]byte, HelloPayloadSize)
-	copy(b[0:16], p.FlowID[:])
-	copy(b[16:32], p.InstanceID[:])
-	binary.BigEndian.PutUint32(b[32:36], p.Caps)
+	p.Negotiation.encodeTo(b[:NegotiationSize])
+	copy(b[80:96], p.FlowID[:])
+	copy(b[96:112], p.InstanceID[:])
+	binary.BigEndian.PutUint32(b[112:116], p.Caps)
 	if p.PathName != "" {
 		b = appendPathName(b, p.PathName)
 	}
@@ -170,18 +330,24 @@ func (p HelloPayload) Encode() []byte {
 
 func DecodeHello(b []byte) (HelloPayload, error) {
 	var p HelloPayload
-	if len(b) < HelloPayloadLegacySize {
-		return p, fmt.Errorf("proto: hello payload too short: %d < %d", len(b), HelloPayloadLegacySize)
+	if len(b) < HelloPayloadSize {
+		return p, fmt.Errorf("proto: hello payload too short: %d < %d", len(b), HelloPayloadSize)
 	}
-	copy(p.FlowID[:], b[0:16])
-	if len(b) >= HelloPayloadSize {
-		copy(p.InstanceID[:], b[16:32])
-		p.Caps = binary.BigEndian.Uint32(b[32:36])
-		p.PathName, _ = decodePathName(b[HelloPayloadSize:])
-		return p, nil
+	var err error
+	p.Negotiation, err = decodeNegotiation(b[:NegotiationSize])
+	if err != nil {
+		return HelloPayload{}, err
 	}
-	p.Caps = binary.BigEndian.Uint32(b[16:20])
-	p.PathName, _ = decodePathName(b[HelloPayloadLegacySize:])
+	copy(p.FlowID[:], b[80:96])
+	copy(p.InstanceID[:], b[96:112])
+	p.Caps = binary.BigEndian.Uint32(b[112:116])
+	if p.SessionEpoch != SessionEpoch(p.FlowID) {
+		return HelloPayload{}, fmt.Errorf("proto: hello session epoch does not match flow id")
+	}
+	p.PathName, err = decodeOptionalString8("hello path name", b[HelloPayloadSize:])
+	if err != nil {
+		return HelloPayload{}, err
+	}
 	return p, nil
 }
 
@@ -191,29 +357,39 @@ func (p HelloPayload) EncodeWithPathName(name string) []byte {
 }
 
 type HelloAckPayload struct {
+	Negotiation
 	FlowID     [16]byte
 	InstanceID InstanceID
 	Caps       uint32
 }
 
-const HelloAckPayloadSize = 36
+const HelloAckPayloadSize = NegotiationSize + 36
 
 func (p HelloAckPayload) Encode() []byte {
 	b := make([]byte, HelloAckPayloadSize)
-	copy(b[0:16], p.FlowID[:])
-	copy(b[16:32], p.InstanceID[:])
-	binary.BigEndian.PutUint32(b[32:36], p.Caps)
+	p.Negotiation.encodeTo(b[:NegotiationSize])
+	copy(b[80:96], p.FlowID[:])
+	copy(b[96:112], p.InstanceID[:])
+	binary.BigEndian.PutUint32(b[112:116], p.Caps)
 	return b
 }
 
 func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	var p HelloAckPayload
-	if len(b) < HelloAckPayloadSize {
-		return p, fmt.Errorf("proto: hello_ack payload too short: %d < %d", len(b), HelloAckPayloadSize)
+	if err := requireExactPayloadSize("hello_ack", len(b), HelloAckPayloadSize); err != nil {
+		return p, err
 	}
-	copy(p.FlowID[:], b[0:16])
-	copy(p.InstanceID[:], b[16:32])
-	p.Caps = binary.BigEndian.Uint32(b[32:36])
+	var err error
+	p.Negotiation, err = decodeNegotiation(b[:NegotiationSize])
+	if err != nil {
+		return HelloAckPayload{}, err
+	}
+	copy(p.FlowID[:], b[80:96])
+	copy(p.InstanceID[:], b[96:112])
+	p.Caps = binary.BigEndian.Uint32(b[112:116])
+	if p.SessionEpoch != SessionEpoch(p.FlowID) {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack session epoch does not match flow id")
+	}
 	return p, nil
 }
 
@@ -231,8 +407,8 @@ func (p MigrateNotifyPayload) Encode() []byte {
 }
 
 func DecodeMigrateNotify(b []byte) (MigrateNotifyPayload, error) {
-	if len(b) < MigrateNotifyPayloadSize {
-		return MigrateNotifyPayload{}, fmt.Errorf("proto: migrate_notify payload too short: %d < %d", len(b), MigrateNotifyPayloadSize)
+	if err := requireExactPayloadSize("migrate_notify", len(b), MigrateNotifyPayloadSize); err != nil {
+		return MigrateNotifyPayload{}, err
 	}
 	return MigrateNotifyPayload{NewPathID: binary.BigEndian.Uint32(b[0:4])}, nil
 }
@@ -260,8 +436,8 @@ func (p PathQualityPayload) Encode() []byte {
 }
 
 func DecodePathQuality(b []byte) (PathQualityPayload, error) {
-	if len(b) < PathQualityPayloadSize {
-		return PathQualityPayload{}, fmt.Errorf("proto: path_quality payload too short: %d < %d", len(b), PathQualityPayloadSize)
+	if err := requireExactPayloadSize("path_quality", len(b), PathQualityPayloadSize); err != nil {
+		return PathQualityPayload{}, err
 	}
 	return PathQualityPayload{
 		RTTus:    binary.BigEndian.Uint32(b[0:4]),
@@ -284,8 +460,8 @@ func (p HeartbeatPayload) Encode() []byte {
 }
 
 func DecodeHeartbeat(b []byte) (HeartbeatPayload, error) {
-	if len(b) < HeartbeatPayloadSize {
-		return HeartbeatPayload{}, fmt.Errorf("proto: heartbeat payload too short: %d < %d", len(b), HeartbeatPayloadSize)
+	if err := requireExactPayloadSize("heartbeat", len(b), HeartbeatPayloadSize); err != nil {
+		return HeartbeatPayload{}, err
 	}
 	return HeartbeatPayload{Timestamp: binary.BigEndian.Uint64(b[0:8])}, nil
 }
@@ -313,8 +489,8 @@ func (p ByePayload) Encode() []byte {
 }
 
 func DecodeBye(b []byte) (ByePayload, error) {
-	if len(b) < ByePayloadSize {
-		return ByePayload{}, fmt.Errorf("proto: bye payload too short: %d < %d", len(b), ByePayloadSize)
+	if err := requireExactPayloadSize("bye", len(b), ByePayloadSize); err != nil {
+		return ByePayload{}, err
 	}
 	return ByePayload{Reason: ByeReason(b[0])}, nil
 }
@@ -325,19 +501,24 @@ type BridgeTagPayload struct {
 	BridgeID               [16]byte
 	InstanceID             InstanceID
 	ExpectedPeerInstanceID InstanceID
+	SessionEpoch           SessionEpoch
+	GraphRevision          uint64
+	GraphDigest            GraphDigest
+	TargetID               TargetID
 	PathName               string
 }
 
-const (
-	BridgeTagPayloadLegacySize = 16
-	BridgeTagPayloadSize       = 48
-)
+const BridgeTagPayloadSize = 120
 
 func (p BridgeTagPayload) Encode() []byte {
 	b := make([]byte, BridgeTagPayloadSize)
 	copy(b[0:16], p.BridgeID[:])
 	copy(b[16:32], p.InstanceID[:])
 	copy(b[32:48], p.ExpectedPeerInstanceID[:])
+	copy(b[48:64], p.SessionEpoch[:])
+	binary.BigEndian.PutUint64(b[64:72], p.GraphRevision)
+	copy(b[72:104], p.GraphDigest[:])
+	copy(b[104:120], p.TargetID[:])
 	if p.PathName != "" {
 		b = appendPathName(b, p.PathName)
 	}
@@ -345,18 +526,31 @@ func (p BridgeTagPayload) Encode() []byte {
 }
 
 func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
-	if len(b) < BridgeTagPayloadLegacySize {
-		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag payload too short: %d < %d", len(b), BridgeTagPayloadLegacySize)
+	if len(b) < BridgeTagPayloadSize {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag payload too short: %d < %d", len(b), BridgeTagPayloadSize)
 	}
 	var p BridgeTagPayload
 	copy(p.BridgeID[:], b[0:16])
-	if len(b) >= BridgeTagPayloadSize {
-		copy(p.InstanceID[:], b[16:32])
-		copy(p.ExpectedPeerInstanceID[:], b[32:48])
-		p.PathName, _ = decodePathName(b[BridgeTagPayloadSize:])
-		return p, nil
+	copy(p.InstanceID[:], b[16:32])
+	copy(p.ExpectedPeerInstanceID[:], b[32:48])
+	copy(p.SessionEpoch[:], b[48:64])
+	p.GraphRevision = binary.BigEndian.Uint64(b[64:72])
+	copy(p.GraphDigest[:], b[72:104])
+	copy(p.TargetID[:], b[104:120])
+	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag session epoch does not match bridge id")
 	}
-	p.PathName, _ = decodePathName(b[BridgeTagPayloadLegacySize:])
+	if p.GraphRevision == 0 {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag zero graph revision")
+	}
+	var err error
+	p.PathName, err = decodeOptionalString8("bridge_tag path name", b[BridgeTagPayloadSize:])
+	if err != nil {
+		return BridgeTagPayload{}, err
+	}
+	if p.TargetID != StableTargetID(p.PathName) {
+		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag target id does not match path name")
+	}
 	return p, nil
 }
 
@@ -401,19 +595,27 @@ func (c AckCode) String() string {
 }
 
 type BridgeAckPayload struct {
-	BridgeID   [16]byte
-	InstanceID InstanceID
-	Code       AckCode
-	Reason     string
+	BridgeID      [16]byte
+	InstanceID    InstanceID
+	SessionEpoch  SessionEpoch
+	GraphRevision uint64
+	GraphDigest   GraphDigest
+	TargetID      TargetID
+	Code          AckCode
+	Reason        string
 }
 
-const BridgeAckPayloadSize = 33
+const BridgeAckPayloadSize = 105
 
 func (p BridgeAckPayload) Encode() []byte {
 	b := make([]byte, BridgeAckPayloadSize)
 	copy(b[0:16], p.BridgeID[:])
 	copy(b[16:32], p.InstanceID[:])
-	b[32] = byte(p.Code)
+	copy(b[32:48], p.SessionEpoch[:])
+	binary.BigEndian.PutUint64(b[48:56], p.GraphRevision)
+	copy(b[56:88], p.GraphDigest[:])
+	copy(b[88:104], p.TargetID[:])
+	b[104] = byte(p.Code)
 	if p.Reason != "" {
 		b = appendString8(b, p.Reason)
 	}
@@ -427,23 +629,53 @@ func DecodeBridgeAck(b []byte) (BridgeAckPayload, error) {
 	}
 	copy(p.BridgeID[:], b[0:16])
 	copy(p.InstanceID[:], b[16:32])
-	p.Code = AckCode(b[32])
-	p.Reason, _ = decodePathName(b[BridgeAckPayloadSize:])
+	copy(p.SessionEpoch[:], b[32:48])
+	p.GraphRevision = binary.BigEndian.Uint64(b[48:56])
+	copy(p.GraphDigest[:], b[56:88])
+	copy(p.TargetID[:], b[88:104])
+	p.Code = AckCode(b[104])
+	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
+		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack session epoch does not match bridge id")
+	}
+	if p.GraphRevision == 0 {
+		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack zero graph revision")
+	}
+	var err error
+	p.Reason, err = decodeOptionalString8("bridge_ack reason", b[BridgeAckPayloadSize:])
+	if err != nil {
+		return BridgeAckPayload{}, err
+	}
 	return p, nil
+}
+
+// ExecutionKind is the wire-level group executor selected by a policy
+// request. It is intentionally independent from any public or engine enum.
+type ExecutionKind uint8
+
+const (
+	ExecutionKindInvalid  ExecutionKind = 0
+	ExecutionKindSelector ExecutionKind = 1
+	ExecutionKindBond     ExecutionKind = 2
+	ExecutionKindRace     ExecutionKind = 3
+)
+
+// Valid reports whether k identifies a wire executor.
+func (k ExecutionKind) Valid() bool {
+	return k == ExecutionKindSelector || k == ExecutionKindBond || k == ExecutionKindRace
 }
 
 // PolicyRequestPayload asks the peer to update its local sender policy for
 // this flow. It is used by receive-side selector decisions: the receiver can
 // observe RX saturation, but the peer owns the corresponding TX dispatch.
 type PolicyRequestPayload struct {
-	Mode       uint8
+	Kind       ExecutionKind
 	ActiveName string
 	ScopeNames []string
 	Cause      string
 }
 
 func (p PolicyRequestPayload) Encode() []byte {
-	b := []byte{p.Mode, 0, 0, 0}
+	b := []byte{byte(p.Kind), 0, 0, 0}
 	b[1] = byte(len(p.ScopeNames))
 	b = appendString8(b, p.ActiveName)
 	for _, name := range p.ScopeNames {
@@ -457,7 +689,13 @@ func DecodePolicyRequest(b []byte) (PolicyRequestPayload, error) {
 	if len(b) < 4 {
 		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request payload too short: %d < 4", len(b))
 	}
-	p := PolicyRequestPayload{Mode: b[0]}
+	p := PolicyRequestPayload{Kind: ExecutionKind(b[0])}
+	if !p.Kind.Valid() {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request invalid execution kind: %d", b[0])
+	}
+	if b[2] != 0 || b[3] != 0 {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request reserved bytes must be zero")
+	}
 	count := int(b[1])
 	rest := b[4:]
 	var ok bool
@@ -474,9 +712,12 @@ func DecodePolicyRequest(b []byte) (PolicyRequestPayload, error) {
 		}
 		p.ScopeNames = append(p.ScopeNames, name)
 	}
-	p.Cause, _, ok = readString8(rest)
+	p.Cause, rest, ok = readString8(rest)
 	if !ok {
 		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing cause")
+	}
+	if len(rest) != 0 {
+		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request trailing bytes: %d", len(rest))
 	}
 	return p, nil
 }
@@ -485,9 +726,21 @@ func appendPathName(b []byte, name string) []byte {
 	return appendString8(b, name)
 }
 
-func decodePathName(b []byte) (string, bool) {
-	name, _, ok := readString8(b)
-	return name, ok
+func decodeOptionalString8(field string, b []byte) (string, error) {
+	if len(b) == 0 {
+		return "", nil
+	}
+	value, rest, ok := readString8(b)
+	if !ok {
+		return "", fmt.Errorf("proto: malformed %s", field)
+	}
+	if value == "" {
+		return "", fmt.Errorf("proto: empty %s", field)
+	}
+	if len(rest) != 0 {
+		return "", fmt.Errorf("proto: %s trailing bytes: %d", field, len(rest))
+	}
+	return value, nil
 }
 
 func appendString8(b []byte, s string) []byte {
@@ -507,4 +760,11 @@ func readString8(b []byte) (string, []byte, bool) {
 		return "", b, false
 	}
 	return string(b[1 : 1+n]), b[1+n:], true
+}
+
+func requireExactPayloadSize(name string, got, want int) error {
+	if got != want {
+		return fmt.Errorf("proto: %s payload size: %d != %d", name, got, want)
+	}
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -48,9 +49,12 @@ type Engine struct {
 	peerInstance  proto.InstanceID
 	peerKind      atomic.Uint32
 	state         atomic.Uint32 // BridgeState
+	graphMu       sync.RWMutex
+	localGraph    graphBinding
+	peerGraph     graphBinding
 	created       time.Time
 
-	// Mode is the dispatcher selector: 1=prime, 2=bond, 3=race.
+	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
 	mode atomic.Uint32
 
@@ -92,28 +96,48 @@ type Engine struct {
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
 	// active at the time.
-	sendMu      sync.Mutex
-	sendSeq     uint64
-	sendAckNext atomic.Uint64
-	sendHistMu  sync.Mutex
-	sendHist    sendHistory
+	sendMu            sync.Mutex
+	sendSeq           uint64
+	sendAckNext       atomic.Uint64
+	sendPublishedNext atomic.Uint64
+	sendProof         proto.AckProof
+	sendAckProof      proto.AckProof
+	sendHistMu        sync.Mutex
+	sendHist          sendHistory
+	sendSlots         chan struct{}
+	sendControlSlots  chan struct{}
+	sendClosing       atomic.Bool
+	terminalOnce      sync.Once
+	terminalDone      chan struct{}
+	terminalErr       error
+	replayRequests    chan uint64
+	ackMu             sync.Mutex
+	ackPending        *ackRequest
+	ackWake           chan struct{}
 
 	// Recv state: reorder buffer keyed by SEQ. expectedRecvSeq is the
 	// next SEQ the application should observe.
-	recvMu          sync.Mutex
-	recvCond        *sync.Cond
-	recvPacketCh    chan []byte
-	recvPacketWake  chan struct{}
-	recvWake        chan struct{}
-	recvQueue       map[uint64]recvItem
-	expectedRecvSeq uint64
-	recvAckSent     uint64
-	recvDeliver     []byte // pending bytes for the next Read (stream)
-	packetized      bool   // when true, drainer routes payload to recvPacketCh
-	recvPathCursor  uint64
-	recvSeenBits    []uint64
-	recvSeenHead    uint64
-	recvPacketMarks int
+	recvMu             sync.Mutex
+	recvCond           *sync.Cond
+	recvPacketCh       chan []byte
+	recvPacketWake     chan struct{}
+	recvWake           chan struct{}
+	recvQueue          map[uint64]recvItem
+	expectedRecvSeq    uint64
+	recvAckSent        uint64
+	recvDeliver        []byte // pending bytes for the next Read (stream)
+	recvDeliverFrames  []int  // remaining bytes per admitted stream DATA frame
+	packetized         bool   // when true, drainer routes payload to recvPacketCh
+	recvPathCursor     uint64
+	recvSeenBits       []uint64
+	recvSeenHead       uint64
+	recvPacketMarks    int
+	recvFinalErr       error
+	recvTerminal       bool
+	recvFinalHandled   bool
+	recvProof          proto.AckProof
+	recvFrameProofs    map[uint64]proto.FrameDigest
+	recvDroppedThrough uint64
 
 	// recvDeadline is the application-set read deadline (zero = none).
 	// When non-zero, Recv / RecvPacket return a timeout error if no
@@ -143,9 +167,9 @@ type Engine struct {
 	zombieLeft    int
 	zombieLastMig time.Time
 
-	// Prime-mode scheduler. nil until StartPrime is called.
-	primeMu sync.Mutex
-	prime   *prime
+	// Selector-mode scheduler. nil until StartSelector is called.
+	selectorMu sync.Mutex
+	selector   *selector
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -155,10 +179,13 @@ type Engine struct {
 	probeIntervalOverride time.Duration // 0 = default 1s; tests can shorten
 
 	// Lifecycle.
-	closeOnce sync.Once
-	closed    chan struct{}
-	closeErr  error
-	closeMu   sync.Mutex
+	closeOnce    sync.Once
+	closed       chan struct{}
+	closeErr     error
+	closeMu      sync.Mutex
+	gracefulOnce sync.Once
+	gracefulDone chan struct{}
+	gracefulErr  error
 }
 
 // pathSlot tracks one attached path and its reader goroutine.
@@ -172,6 +199,10 @@ type pathSlot struct {
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
 	maintenance atomic.Bool
+	writeMu     sync.Mutex
+	ackMu       sync.Mutex
+	ackPending  *pathAckWrite
+	ackRunning  bool
 
 	// recvDups counts inbound frames on THIS path whose SEQ had
 	// already been delivered or buffered. Used per-path so monitoring
@@ -191,6 +222,9 @@ type pathSlot struct {
 	// socket. Engine-level (not probe-level): both data and ctrl
 	// writes bump it.
 	lastSendUnixNano atomic.Int64
+	dataWrites       atomic.Uint64
+	controlWrites    atomic.Uint64
+	dataDispatches   atomic.Uint64
 
 	// bondSendHistory keeps a bounded ring of fully encoded frames
 	// successfully written through this path in bond mode. If the
@@ -205,6 +239,38 @@ type pathSlot struct {
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits
+}
+
+type pathAckWrite struct {
+	frame    []byte
+	terminal bool
+	result   chan<- bool
+}
+
+func (s *pathSlot) writeFrame(frame []byte) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.conn.Write(frame)
+	if err == nil && n == len(frame) && len(frame) >= proto.HeaderSize {
+		if header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize]); decodeErr == nil {
+			if header.Type == proto.FrameData {
+				s.dataWrites.Add(1)
+			} else {
+				s.controlWrites.Add(1)
+			}
+		}
+	}
+	return n, err
+}
+
+func (s *pathSlot) recordDispatch(frame []byte) {
+	if len(frame) < proto.HeaderSize {
+		return
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err == nil && header.Type == proto.FrameData {
+		s.dataDispatches.Add(1)
+	}
 }
 
 // closeQuit is idempotent: multiple paths into the engine
@@ -228,13 +294,28 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		recvPacketWake:   make(chan struct{}, 1),
 		recvWake:         make(chan struct{}, 1),
 		recvQueue:        make(map[uint64]recvItem),
+		recvFrameProofs:  make(map[uint64]proto.FrameDigest),
+		sendSlots:        make(chan struct{}, sendHistoryWindow),
+		sendControlSlots: make(chan struct{}, sendControlReserve),
+		replayRequests:   make(chan uint64, 1),
+		ackWake:          make(chan struct{}, 1),
 		zombieLeft:       limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding: make(map[uint64]time.Time),
 		closed:           make(chan struct{}),
+		gracefulDone:     make(chan struct{}),
+		terminalDone:     make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))
+	e.localGraph = graphBinding{revision: 1}
+	e.peerGraph = graphBinding{revision: 1}
+	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(flowID), senderDirection(side), 1, proto.GraphDigest{})
+	e.sendAckProof = e.sendProof
+	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(flowID), peerSenderDirection(side), 1, proto.GraphDigest{})
 	go e.recvLoop()
+	go e.replayLoop()
+	go e.ackLoop()
+	go e.ackWriterLoop()
 	return e
 }
 
@@ -361,8 +442,8 @@ func (e *Engine) nextPathGenerationLocked() uint64 {
 //
 // Per CLAUDE.md hard rule #3 ("默认不安装主动迁移触发器"), the
 // prober only OBSERVES quality - it does not itself trigger
-// migration. Prime-mode scoring decides migration via the
-// independent scheduler in prime.go.
+// migration. Selector-mode scoring decides migration via the
+// independent scheduler in selector.go.
 func (e *Engine) proberLoop(slot *pathSlot) {
 	t := time.NewTicker(e.probeInterval())
 	defer t.Stop()
@@ -394,7 +475,7 @@ func (e *Engine) proberLoop(slot *pathSlot) {
 			copy(frame[proto.HeaderSize:], payload)
 			// Best-effort write; failure means the path is dying and
 			// OnDeath will fire from the read side soon enough.
-			_, _ = slot.conn.Write(frame)
+			_, _ = slot.writeFrame(frame)
 
 			// GC stale probes older than 30 s so the map cannot grow.
 			e.probeMu.Lock()
@@ -443,6 +524,9 @@ func (e *Engine) Paths() []transport.PathInfo {
 			pi.IngressQueue = observer.IngressQueueStats()
 		}
 		pi.RecvDups = s.recvDups.Load()
+		pi.DataWrites = s.dataWrites.Load()
+		pi.ControlWrites = s.controlWrites.Load()
+		pi.DataDispatches = s.dataDispatches.Load()
 		if ns := s.lastRecvUnixNano.Load(); ns > 0 {
 			pi.LastRecvAt = time.Unix(0, ns)
 		}
@@ -464,15 +548,43 @@ func (e *Engine) Migrate(id uint32) error {
 }
 
 func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
-	e.pathsMu.Lock()
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+
+	if e.isClosed() {
+		return net.ErrClosed
+	}
+
+	e.pathsMu.RLock()
 	slot, ok := e.paths[id]
 	if !ok {
-		e.pathsMu.Unlock()
+		e.pathsMu.RUnlock()
 		return fmt.Errorf("engine: migrate to unknown path %d", id)
 	}
 	if e.activeID == id {
-		e.pathsMu.Unlock()
+		e.pathsMu.RUnlock()
 		return nil
+	}
+	gen := slot.gen
+	e.pathsMu.RUnlock()
+
+	replay := e.sendHistorySnapshot(e.sendAckNext.Load())
+	for _, frame := range replay {
+		n, err := slot.writeFrame(frame)
+		if err != nil {
+			return err
+		}
+		if n != len(frame) {
+			return io.ErrShortWrite
+		}
+		slot.lastSendUnixNano.Store(nowFn().UnixNano())
+	}
+
+	e.pathsMu.Lock()
+	current, ok := e.paths[id]
+	if !ok || current != slot || current.gen != gen {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: migration target %d changed during replay", id)
 	}
 	oldID := e.activeID
 	e.activeID = id
@@ -481,43 +593,12 @@ func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 	}
 	e.migrationCount++
 	e.setState(BridgeActive)
-
-	// Build the MIGRATE_NOTIFY frame while still under the lock so
-	// sendSeq is serialised consistently with other ctrl emissions.
-	hdr := proto.Header{
-		Version: proto.Version,
-		Type:    proto.FrameCtrl,
-		Flags:   proto.FlagsForCtrl(proto.CtrlMigrateNotify),
-		Seq:     atomic.AddUint64(&e.sendSeq, 1) - 1,
-	}
-	payload := proto.MigrateNotifyPayload{NewPathID: id}.Encode()
-	frame := make([]byte, proto.HeaderSize+len(payload))
-	_ = hdr.Encode(frame[:proto.HeaderSize])
-	copy(frame[proto.HeaderSize:], payload)
-	pc := slot.conn
-	var replay [][]byte
-	if !e.Packetized() {
-		replay = e.sendHistorySnapshot(e.sendAckNext.Load())
-	}
 	e.pathsMu.Unlock()
 
-	// Hook fan-out and the MIGRATE_NOTIFY send happen AFTER unlock so
-	// fireMigrateHooks can safely RLock pathsMu and hook callbacks
-	// can call back into AdminConn methods without deadlocking. If
-	// the captured pc has closed concurrently, the Write fails and
-	// onPathDeath will pick up the slack.
 	if cause == "" {
 		cause = "explicit"
 	}
 	e.fireMigrateHooks(oldID, id, cause)
-	go func() {
-		if _, err := pc.Write(frame); err == nil && !e.Packetized() {
-			e.rememberSendFrame(frame)
-		}
-		if len(replay) > 0 {
-			e.redistributeFrames(replay)
-		}
-	}()
 	return nil
 }
 
@@ -535,23 +616,115 @@ func (e *Engine) isClosed() bool {
 // wrapper, which uses it to gate the BYE on local Close.
 func (e *Engine) IsClosed() bool { return e.isClosed() }
 
-// ModeRace / ModeBond / ModePrime values used by SetMode. These
-// mirror the public rendr.Mode values; the engine duplicates them
-// to avoid an import cycle.
+// WaitForSendDrain waits for the peer's cumulative ACK to cover every frame
+// published before the call. It is used only during explicit local close.
+func (e *Engine) WaitForSendDrain() bool {
+	target := e.sendPublishedNext.Load()
+	if e.sendAckNext.Load() >= target {
+		return true
+	}
+	wait := e.limits.MigrationBudget
+	if wait > 2*time.Second {
+		wait = 2 * time.Second
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if e.sendAckNext.Load() >= target {
+			return true
+		}
+		select {
+		case <-e.closed:
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// GracefulClose linearizes the local send side, emits exactly one final BYE,
+// waits briefly for cumulative acknowledgement, and then tears down paths.
+// Concurrent callers observe the same result. A broken PathConn cannot hold
+// the public Close call forever; timeout returns ErrGracefulCloseTimeout.
+func (e *Engine) GracefulClose(reason proto.ByeReason) error {
+	e.gracefulOnce.Do(func() {
+		e.gracefulErr = e.runGracefulClose(reason)
+		close(e.gracefulDone)
+	})
+	<-e.gracefulDone
+	return e.gracefulErr
+}
+
+func (e *Engine) runGracefulClose(reason proto.ByeReason) error {
+	if e.isClosed() {
+		return nil
+	}
+	e.sendClosing.Store(true)
+	timeout := e.limits.MigrationBudget
+	if timeout > 2*time.Second {
+		timeout = 2 * time.Second
+	}
+	sent := make(chan error, 1)
+	go func() { sent <- e.SendBye(reason) }()
+	timer := time.NewTimer(timeout)
+	var closeErr error
+	select {
+	case err := <-sent:
+		if err != nil {
+			closeErr = err
+		} else if !e.WaitForSendDrain() {
+			closeErr = ErrGracefulCloseTimeout
+		}
+	case <-timer.C:
+		closeErr = ErrGracefulCloseTimeout
+	case <-e.closed:
+		return nil
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	e.QuiesceActivePath()
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	select {
+	case err := <-closed:
+		if closeErr == nil {
+			closeErr = err
+		}
+	case <-time.After(250 * time.Millisecond):
+		if closeErr == nil {
+			closeErr = ErrGracefulCloseTimeout
+		}
+	}
+	return closeErr
+}
+
+// Internal dispatch identifiers are deliberately separate from both the
+// public API mode and the wire-level proto.ExecutionKind.
 const (
-	dispatchPrime uint32 = 1
-	dispatchBond  uint32 = 2
-	dispatchRace  uint32 = 3
+	dispatchSelector uint32 = 1
+	dispatchBond     uint32 = 2
+	dispatchRace     uint32 = 3
 )
 
-// SetMode updates the dispatcher mode. Called by the public
-// engineBackedConn wrapper after the application-level SetMode
-// validates the transition.
-func (e *Engine) SetMode(mode uint32) {
+// ConfigureExecution sets the initial sender executor using an explicit wire
+// mapping. Runtime policy transitions use SetDispatchPolicy.
+func (e *Engine) ConfigureExecution(kind proto.ExecutionKind) error {
+	mode, ok := dispatchForExecutionKind(kind)
+	if !ok {
+		return fmt.Errorf("engine: invalid execution kind %d", kind)
+	}
 	e.pathsMu.Lock()
 	e.dispatchScope = nil
 	e.pathsMu.Unlock()
 	e.mode.Store(mode)
+	return nil
 }
 
 // Mode returns the current dispatcher mode.
@@ -560,9 +733,10 @@ func (e *Engine) Mode() uint32 { return e.mode.Load() }
 // SetDispatchPolicy updates the sender's mode and optionally limits
 // dispatch to a policy-selected path group. It is used by the policy
 // graph layer for selector -> bond/race target changes.
-func (e *Engine) SetDispatchPolicy(mode uint32, active uint32, scope []uint32, cause string) error {
-	if mode != dispatchPrime && mode != dispatchBond && mode != dispatchRace {
-		mode = dispatchPrime
+func (e *Engine) SetDispatchPolicy(kind proto.ExecutionKind, active uint32, scope []uint32, cause string) error {
+	mode, ok := dispatchForExecutionKind(kind)
+	if !ok {
+		return fmt.Errorf("engine: invalid execution kind %d", kind)
 	}
 	e.pathsMu.Lock()
 	if len(scope) > 0 {
@@ -616,7 +790,7 @@ func (e *Engine) SetDispatchPolicy(mode uint32, active uint32, scope []uint32, c
 // SetDispatchPolicy. Receive-side selectors send target/path names because path
 // ids are local to each peer; this method resolves those names against the
 // local path slots and then applies the ordinary sender policy.
-func (e *Engine) SetDispatchPolicyByName(mode uint32, activeName string, scopeNames []string, cause string) error {
+func (e *Engine) SetDispatchPolicyByName(kind proto.ExecutionKind, activeName string, scopeNames []string, cause string) error {
 	e.pathsMu.RLock()
 	byName := make(map[string]uint32, len(e.paths))
 	for id, slot := range e.paths {
@@ -642,7 +816,7 @@ func (e *Engine) SetDispatchPolicyByName(mode uint32, activeName string, scopeNa
 		}
 		active = id
 	}
-	return e.SetDispatchPolicy(mode, active, scope, cause)
+	return e.SetDispatchPolicy(kind, active, scope, cause)
 }
 
 func pathSlotName(slot *pathSlot) string {
