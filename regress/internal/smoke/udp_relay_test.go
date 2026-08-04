@@ -19,6 +19,10 @@ func TestRunUDPRelayServerMode(t *testing.T) {
 	if r.Failure != "" {
 		t.Fatalf("RunUDPRelay failed: %s", r.Failure)
 	}
+	if r.InvalidReason != "" {
+		t.Fatalf("RunUDPRelay invalid: %s", r.InvalidReason)
+	}
+	assertInflightMigrationDetail(t, r, 2)
 }
 
 func TestRunUDPRelayPortHop(t *testing.T) {
@@ -34,8 +38,22 @@ func TestRunUDPRelayPortHop(t *testing.T) {
 	if r.Failure != "" {
 		t.Fatalf("RunUDPRelayPortHop failed: %s", r.Failure)
 	}
+	if r.InvalidReason != "" {
+		t.Fatalf("RunUDPRelayPortHop invalid: %s", r.InvalidReason)
+	}
+	assertInflightMigrationDetail(t, r, 2)
 	if got := r.Detail["port_hops"]; got != 3 {
 		t.Fatalf("port_hops detail=%v want 3", got)
+	}
+}
+
+func assertInflightMigrationDetail(t *testing.T, result Result, expected int) {
+	t.Helper()
+	if got := result.Detail["expected_inflight_migrations"]; got != expected {
+		t.Fatalf("expected_inflight_migrations detail=%v want %d", got, expected)
+	}
+	if got := result.Detail["inflight_migrations"]; got != expected {
+		t.Fatalf("inflight_migrations detail=%v want %d", got, expected)
 	}
 }
 

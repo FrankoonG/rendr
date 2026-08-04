@@ -1,18 +1,21 @@
 // Package gate enforces the two-phase contract from
 // docs/regression-suite.md §4: phase 1 (rendr self-check, T1+T2) must
-// be validated green for the current commit before phase 2 (T3-T5)
-// is allowed to run.
+// be validated green for the current commit before phase 2 (T3-T8 and the
+// TUN suite) is allowed to run.
 //
 // State is persisted in <report-dir>/last_phase1.json. --force-phase2
 // bypasses the check (local debug only; CI must not pass it).
 package gate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,15 +24,23 @@ import (
 	"time"
 )
 
-const StateFileName = "last_phase1.json"
+const (
+	StateFileName      = "last_phase1.json"
+	StateSchemaVersion = 2
+)
 
 // State recorded after each phase-1 run. Phase-2 entry verifies the
-// current git HEAD matches CommitSHA and Status == "green".
+// current git HEAD matches CommitSHA and Status == "green". A green state
+// also identifies the exact finalized report-set generation and its canonical
+// report digest.
 type State struct {
-	CommitSHA   string    `json:"commit_sha"`
-	WorktreeSHA string    `json:"worktree_sha"`
-	Status      string    `json:"status"` // "running" | "green" | "red"
-	At          time.Time `json:"at"`
+	SchemaVersion         int       `json:"schema_version"`
+	CommitSHA             string    `json:"commit_sha"`
+	WorktreeSHA           string    `json:"worktree_sha"`
+	ReportSetGeneration   string    `json:"report_set_generation,omitempty"`
+	CanonicalReportDigest string    `json:"canonical_report_digest,omitempty"`
+	Status                string    `json:"status"` // "running" | "green" | "red"
+	At                    time.Time `json:"at"`
 }
 
 // Revision binds a phase result to both HEAD and all non-ignored source
@@ -41,6 +52,9 @@ type Revision struct {
 
 // Write records the phase-1 outcome.
 func Write(reportDir string, s State) error {
+	if err := s.validate(); err != nil {
+		return fmt.Errorf("validate phase 1 state: %w", err)
+	}
 	if err := os.MkdirAll(reportDir, 0o755); err != nil {
 		return err
 	}
@@ -84,11 +98,79 @@ func Read(reportDir string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
 	var s State
-	if err := json.Unmarshal(b, &s); err != nil {
-		return nil, err
+	if err := decoder.Decode(&s); err != nil {
+		return nil, fmt.Errorf("decode phase 1 state: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return nil, fmt.Errorf("decode phase 1 state: %w", err)
+	}
+	if err := s.validate(); err != nil {
+		return nil, fmt.Errorf("validate phase 1 state: %w", err)
 	}
 	return &s, nil
+}
+
+func (s State) validate() error {
+	if s.SchemaVersion != StateSchemaVersion {
+		return fmt.Errorf("schema version is %d, want %d", s.SchemaVersion, StateSchemaVersion)
+	}
+	if strings.TrimSpace(s.CommitSHA) == "" || strings.TrimSpace(s.WorktreeSHA) == "" {
+		return errors.New("revision identity is incomplete")
+	}
+	switch s.Status {
+	case "running", "green", "red":
+	default:
+		return fmt.Errorf("status %q is invalid", s.Status)
+	}
+	if s.At.IsZero() {
+		return errors.New("timestamp is missing")
+	}
+
+	if s.Status == "green" {
+		if s.ReportSetGeneration == "" {
+			return errors.New("green state is missing report-set generation")
+		}
+		if s.CanonicalReportDigest == "" {
+			return errors.New("green state is missing canonical report digest")
+		}
+	}
+	if s.ReportSetGeneration == "" && s.CanonicalReportDigest != "" {
+		return errors.New("canonical report digest requires report-set generation")
+	}
+	if s.ReportSetGeneration != "" && s.CanonicalReportDigest == "" {
+		return errors.New("report-set generation requires canonical report digest")
+	}
+	if s.ReportSetGeneration != "" && !validReportSetGeneration(s.ReportSetGeneration) {
+		return fmt.Errorf("report-set generation %q is malformed", s.ReportSetGeneration)
+	}
+	if s.CanonicalReportDigest != "" && !validCanonicalReportDigest(s.CanonicalReportDigest) {
+		return fmt.Errorf("canonical report digest %q is malformed", s.CanonicalReportDigest)
+	}
+	return nil
+}
+
+func validReportSetGeneration(generation string) bool {
+	if len(generation) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(generation)
+	return err == nil
+}
+
+func validCanonicalReportDigest(digest string) bool {
+	const prefix = "sha256:"
+	if len(digest) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(digest, prefix) {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(digest, prefix))
+	return err == nil
 }
 
 // CurrentRevision returns the full commit and a content hash for tracked

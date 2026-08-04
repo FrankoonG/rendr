@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -15,10 +16,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/udprelay"
+)
+
+const (
+	hysteriaProcessJoinTimeout = 3 * time.Second
+	hysteriaProcessWaitDelay   = time.Second
+	hysteriaMustStopEvidence   = "chaos_teardown_unsafe"
 )
 
 // HysteriaRelayOpts configures the M11 real Hysteria 2-over-udprelay smoke.
@@ -49,7 +57,7 @@ func HysteriaAvailable() bool {
 // RunHysteriaRelay runs a real Hysteria 2 client/server pair over rendr's UDP
 // relay endpoint, then migrates the rendr packet carrier underneath a built-in
 // Hysteria speedtest transfer.
-func RunHysteriaRelay(ctx context.Context, opts HysteriaRelayOpts) Result {
+func RunHysteriaRelay(ctx context.Context, opts HysteriaRelayOpts) (result Result) {
 	opts.withDefaults()
 	t0 := time.Now()
 	name := fmt.Sprintf("Hysteria2-over-UDP-relay (%d bytes, %d paths, %d migrations)", opts.DataSize, opts.Paths, opts.Migrations)
@@ -82,7 +90,14 @@ func RunHysteriaRelay(ctx context.Context, opts HysteriaRelayOpts) Result {
 	if err != nil {
 		return FromError(name, time.Since(t0), err)
 	}
-	defer serverProc.stop()
+	defer func() {
+		applyHysteriaProcessError(&result, name, t0, serverProc.stop(hysteriaProcessJoinTimeout))
+		if result.Failure != "" {
+			if serverLog := serverProc.logTail(); serverLog != "" {
+				result.Failure += "; server log: " + serverLog
+			}
+		}
+	}()
 	if err := serverProc.waitHealthy(500 * time.Millisecond); err != nil {
 		return FromError(name, time.Since(t0), err)
 	}
@@ -143,7 +158,9 @@ func RunHysteriaRelay(ctx context.Context, opts HysteriaRelayOpts) Result {
 	admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
 	speedLog, err := runHysteriaSpeedtest(ctx, clientCfg, opts.DataSize, opts.Migrations, admin)
 	if err != nil {
-		return FromError(name, time.Since(t0), fmt.Errorf("%w; speedtest log: %s; server log: %s", err, speedLog, serverProc.logTail()))
+		result = FromError(name, time.Since(t0), fmt.Errorf("%w; speedtest log: %s", err, speedLog))
+		applyHysteriaMustStop(&result, err)
+		return result
 	}
 	if got := admin.MigrationCount(); got < uint64(opts.Migrations) {
 		return FromError(name, time.Since(t0), fmt.Errorf("migration count=%d want >=%d", got, opts.Migrations))
@@ -195,55 +212,212 @@ quic:
 }
 
 type hysteriaProcess struct {
-	cmd  *exec.Cmd
-	log  bytes.Buffer
-	done chan error
+	role        string
+	cmd         *exec.Cmd
+	log         bytes.Buffer
+	done        chan struct{}
+	waitErr     error
+	containment *hysteriaProcessContainment
 }
+
+type hysteriaProcessContainment struct {
+	kill    func() error
+	confirm func(time.Duration) error
+}
+
+// hysteriaProcessJoinError means a killed child could not be reaped within
+// the teardown bound. Continuing the tier in this process is unsafe.
+type hysteriaProcessJoinError struct {
+	Role    string
+	Timeout time.Duration
+}
+
+func (e *hysteriaProcessJoinError) Error() string {
+	return fmt.Sprintf("%s process did not join within %s after kill", e.Role, e.Timeout)
+}
+
+func (e *hysteriaProcessJoinError) MustStop() bool { return true }
+
+// hysteriaProcessTeardownError means Wait returned but the platform could not
+// prove that the contained process tree was gone.
+type hysteriaProcessTeardownError struct {
+	Role    string
+	Timeout time.Duration
+	Cause   error
+}
+
+func (e *hysteriaProcessTeardownError) Error() string {
+	return fmt.Sprintf("%s process teardown was not confirmed within %s: %v", e.Role, e.Timeout, e.Cause)
+}
+
+func (e *hysteriaProcessTeardownError) Unwrap() error { return e.Cause }
+
+func (e *hysteriaProcessTeardownError) MustStop() bool { return true }
 
 func startHysteriaProcess(ctx context.Context, mode, config string) (*hysteriaProcess, error) {
 	bin, err := exec.LookPath("hysteria")
 	if err != nil {
 		return nil, err
 	}
-	p := &hysteriaProcess{done: make(chan error, 1)}
 	cmd := exec.CommandContext(ctx, bin, "--disable-update-check", "--log-level", "info", mode, "-c", config)
+	return startHysteriaCommand(cmd, "hysteria "+mode)
+}
+
+func startHysteriaCommand(cmd *exec.Cmd, role string) (*hysteriaProcess, error) {
+	if cmd == nil {
+		return nil, fmt.Errorf("start %s: command is nil", role)
+	}
+	containment, err := configureHysteriaProcessContainment(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("contain %s: %w", role, err)
+	}
+	p := &hysteriaProcess{
+		role:        role,
+		cmd:         cmd,
+		done:        make(chan struct{}),
+		containment: containment,
+	}
+	cmd.WaitDelay = hysteriaProcessWaitDelay
 	cmd.Stdout = &p.log
 	cmd.Stderr = &p.log
-	p.cmd = cmd
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start hysteria %s: %w", mode, err)
+		return nil, fmt.Errorf("start %s: %w", role, err)
 	}
-	go func() { p.done <- cmd.Wait() }()
+	go func() {
+		p.waitErr = cmd.Wait()
+		close(p.done)
+	}()
 	return p, nil
 }
 
 func (p *hysteriaProcess) waitHealthy(d time.Duration) error {
 	select {
-	case err := <-p.done:
-		return fmt.Errorf("hysteria exited early: %w; log: %s", err, p.logTail())
+	case <-p.done:
+		if p.waitErr == nil {
+			return fmt.Errorf("hysteria exited early; log: %s", p.logTail())
+		}
+		return fmt.Errorf("hysteria exited early: %w; log: %s", p.waitErr, p.logTail())
 	case <-time.After(d):
 		return nil
 	}
 }
 
-func (p *hysteriaProcess) stop() {
-	if p == nil || p.cmd == nil || p.cmd.Process == nil {
-		return
+func (p *hysteriaProcess) stop(joinTimeout time.Duration) error {
+	if p == nil {
+		return nil
 	}
-	_ = p.cmd.Process.Kill()
+	if joinTimeout <= 0 {
+		joinTimeout = hysteriaProcessJoinTimeout
+	}
+	deadline := time.Now().Add(joinTimeout)
+	var killErr error
+	if p.containment == nil || p.containment.kill == nil {
+		killErr = fmt.Errorf("%s process has no containment kill function", p.role)
+	} else if err := p.containment.kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		killErr = fmt.Errorf("kill %s process: %w", p.role, err)
+	}
+	if !p.joined() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || !waitHysteriaProcess(p.done, remaining) {
+			return errors.Join(killErr, &hysteriaProcessJoinError{Role: p.role, Timeout: joinTimeout})
+		}
+	}
+
+	remaining := time.Until(deadline)
+	if p.containment == nil || p.containment.confirm == nil {
+		cause := fmt.Errorf("%s process has no containment verification function", p.role)
+		return errors.Join(killErr, &hysteriaProcessTeardownError{Role: p.role, Timeout: joinTimeout, Cause: cause})
+	}
+	if err := p.containment.confirm(remaining); err != nil {
+		return errors.Join(killErr, &hysteriaProcessTeardownError{Role: p.role, Timeout: joinTimeout, Cause: err})
+	}
+	return killErr
+}
+
+func waitHysteriaProcess(done <-chan struct{}, limit time.Duration) bool {
+	if limit <= 0 {
+		return false
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (p *hysteriaProcess) joined() bool {
+	if p == nil || p.done == nil {
+		return true
+	}
 	select {
 	case <-p.done:
-	case <-time.After(time.Second):
+		return true
+	default:
+		return false
 	}
 }
 
 func (p *hysteriaProcess) logTail() string {
+	if p == nil || !p.joined() {
+		return ""
+	}
 	const max = 1024
 	s := p.log.String()
 	if len(s) > max {
 		return s[len(s)-max:]
 	}
 	return s
+}
+
+func applyHysteriaProcessError(result *Result, name string, started time.Time, err error) {
+	if result == nil || err == nil {
+		return
+	}
+	result.Name = name
+	result.Duration = time.Since(started)
+	if result.Detail == nil {
+		result.Detail = make(map[string]any)
+	}
+	if applyHysteriaMustStop(result, err) {
+		return
+	}
+	if result.Failure == "" {
+		result.Failure = err.Error()
+	} else {
+		result.Failure += "; " + err.Error()
+	}
+}
+
+func applyHysteriaMustStop(result *Result, err error) bool {
+	if result == nil || err == nil {
+		return false
+	}
+	var mustStop interface {
+		error
+		MustStop() bool
+	}
+	if errors.As(err, &mustStop) && mustStop.MustStop() {
+		reason := result.Failure
+		if reason == "" {
+			reason = err.Error()
+		} else if !strings.Contains(reason, err.Error()) {
+			reason += "; " + err.Error()
+		}
+		if result.InvalidReason != "" {
+			reason = result.InvalidReason + "; " + reason
+		}
+		result.Failure = ""
+		result.InvalidReason = reason
+		if result.Detail == nil {
+			result.Detail = make(map[string]any)
+		}
+		result.Detail[hysteriaMustStopEvidence] = err.Error()
+		return true
+	}
+	return false
 }
 
 func writeSelfSignedCert(certFile, keyFile string) error {
@@ -285,37 +459,70 @@ func runHysteriaSpeedtest(ctx context.Context, config string, dataSize, migratio
 	cctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, bin, "--disable-update-check", "--log-level", "info", "speedtest", "-c", config, "--data-size", strconv.Itoa(dataSize), "--use-bytes")
-	var log bytes.Buffer
-	cmd.Stdout = &log
-	cmd.Stderr = &log
-	if err := cmd.Start(); err != nil {
-		return logTail(log.String()), fmt.Errorf("start hysteria speedtest: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	for i := 0; i < migrations; i++ {
-		select {
-		case err := <-done:
-			return logTail(log.String()), fmt.Errorf("hysteria speedtest exited before migration %d/%d: %w", i+1, migrations, err)
-		case <-time.After(250 * time.Millisecond):
-		}
-		if err := migrateRelay(admin); err != nil {
-			_ = cmd.Process.Kill()
-			return logTail(log.String()), fmt.Errorf("migrate: %w", err)
-		}
-	}
-	err = <-done
+	p, err := startHysteriaCommand(cmd, "hysteria speedtest")
 	if err != nil {
-		return logTail(log.String()), fmt.Errorf("hysteria speedtest: %w", err)
+		return "", err
 	}
-	return logTail(log.String()), nil
+	return runHysteriaSpeedtestProcess(cctx, p, migrations, func() error {
+		return migrateRelay(admin)
+	}, 250*time.Millisecond, hysteriaProcessJoinTimeout)
 }
 
-func logTail(s string) string {
-	const max = 1024
-	if len(s) > max {
-		return s[len(s)-max:]
+func runHysteriaSpeedtestProcess(
+	ctx context.Context,
+	p *hysteriaProcess,
+	migrations int,
+	migrate func() error,
+	migrationInterval time.Duration,
+	joinTimeout time.Duration,
+) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("hysteria speedtest process is nil")
 	}
-	return s
+	if migrate == nil && migrations > 0 {
+		stopErr := p.stop(joinTimeout)
+		return p.logTail(), errors.Join(fmt.Errorf("hysteria speedtest migrate function is nil"), stopErr)
+	}
+	if migrationInterval <= 0 {
+		migrationInterval = 250 * time.Millisecond
+	}
+	for i := 0; i < migrations; i++ {
+		timer := time.NewTimer(migrationInterval)
+		select {
+		case <-p.done:
+			timer.Stop()
+			waitErr := p.waitErr
+			stopErr := p.stop(joinTimeout)
+			return p.logTail(), errors.Join(earlyHysteriaExitError(waitErr, i+1, migrations), stopErr)
+		case <-ctx.Done():
+			timer.Stop()
+			stopErr := p.stop(joinTimeout)
+			return p.logTail(), errors.Join(fmt.Errorf("hysteria speedtest canceled: %w", ctx.Err()), stopErr)
+		case <-timer.C:
+		}
+		if err := migrate(); err != nil {
+			stopErr := p.stop(joinTimeout)
+			return p.logTail(), errors.Join(fmt.Errorf("migrate: %w", err), stopErr)
+		}
+	}
+
+	select {
+	case <-p.done:
+		waitErr := p.waitErr
+		stopErr := p.stop(joinTimeout)
+		if waitErr != nil {
+			return p.logTail(), errors.Join(fmt.Errorf("hysteria speedtest: %w", waitErr), stopErr)
+		}
+		return p.logTail(), stopErr
+	case <-ctx.Done():
+		stopErr := p.stop(joinTimeout)
+		return p.logTail(), errors.Join(fmt.Errorf("hysteria speedtest canceled: %w", ctx.Err()), stopErr)
+	}
+}
+
+func earlyHysteriaExitError(waitErr error, migration, migrations int) error {
+	if waitErr == nil {
+		return fmt.Errorf("hysteria speedtest exited before migration %d/%d", migration, migrations)
+	}
+	return fmt.Errorf("hysteria speedtest exited before migration %d/%d: %w", migration, migrations, waitErr)
 }

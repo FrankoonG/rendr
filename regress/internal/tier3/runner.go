@@ -35,10 +35,17 @@ func matrixCase(testName string) caseDef {
 	}
 }
 
+func freezeMatrixCases(defs []caseDef) []caseDef {
+	for i := range defs {
+		defs[i].spec = mustMatrixSpec(defs[i].spec.ID)
+	}
+	return defs
+}
+
 // caseDefs freezes the top-level matrix tests and their execution/report
 // order. TestTUNT3 remains part of the baseline until suite membership is
 // redesigned in a later milestone.
-var caseDefs = []caseDef{
+var caseDefs = freezeMatrixCases([]caseDef{
 	matrixCase("TestT3GlueAVMessOverRendrTransport"),
 	matrixCase("TestT3GlueAVMessOverRendrTransportMigrates"),
 	matrixCase("TestT3GlueAVLESSTLSOverRendrTransportMigrates"),
@@ -83,7 +90,7 @@ var caseDefs = []caseDef{
 	matrixCase("TestT3VlessVisionTLSxItself"),
 	matrixCase("TestT3VMessxVMess"),
 	matrixCase("TestT3SS2022xVMess"),
-}
+})
 
 // Specs returns a copy of the ordered T3 case manifest.
 func Specs() []manifest.Spec {
@@ -191,9 +198,12 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +18,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const loopbackLockPath = "/run/lock/rendr-regress-tc-lo.lock"
+const (
+	loopbackLockPath       = "/run/lock/rendr-regress-tc-lo.lock"
+	qdiscWatcherPollMillis = 250
+	qdiscWatcherCloseLimit = time.Second
+)
 
 // ApplyChecked installs a tc fixture that continuously exposes qdisc change
 // notifications and supports synchronous ownership verification.
@@ -33,7 +36,7 @@ func ApplyChecked(p Profile) (Fixture, error) {
 }
 
 func runTCCommand(args ...string) ([]byte, error) {
-	return exec.Command("tc", args...).CombinedOutput()
+	return runExternalCommand(tcCommandTimeout, "tc", args...)
 }
 
 type fileFixtureLock struct {
@@ -106,16 +109,38 @@ func randomHandles() (string, string, error) {
 	return fmt.Sprintf("%x:", root), fmt.Sprintf("%x:", child), nil
 }
 
+func randomBarrierSequence() (uint32, error) {
+	var raw [4]byte
+	for {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return 0, err
+		}
+		if sequence := binary.BigEndian.Uint32(raw[:]); sequence != 0 {
+			return sequence, nil
+		}
+	}
+}
+
 type netlinkQdiscWatcher struct {
-	fd      int
-	ifindex int
-	changes chan error
-	done    chan struct{}
-	closed  chan struct{}
-	once    sync.Once
+	fd            int
+	ifindex       int
+	changes       chan error
+	done          chan struct{}
+	closed        chan struct{}
+	barrier       func(uint32) error
+	barrierSeq    uint32
+	barrierPortID uint32
+	kernelUnicast func(unix.Sockaddr) bool
+	closeLimit    time.Duration
+	closeErr      error
+	once          sync.Once
 }
 
 func watchLoopbackQdisc() (qdiscWatcher, error) {
+	barrierSeq, err := randomBarrierSequence()
+	if err != nil {
+		return nil, fmt.Errorf("allocate qdisc watcher barrier sequence: %w", err)
+	}
 	iface, err := net.InterfaceByName("lo")
 	if err != nil {
 		return nil, err
@@ -128,13 +153,28 @@ func watchLoopbackQdisc() (qdiscWatcher, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
-	w := &netlinkQdiscWatcher{
-		fd:      fd,
-		ifindex: iface.Index,
-		changes: make(chan error, 1),
-		done:    make(chan struct{}),
-		closed:  make(chan struct{}),
+	bound, err := unix.Getsockname(fd)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("inspect qdisc watcher netlink port: %w", err)
 	}
+	netlink, ok := bound.(*unix.SockaddrNetlink)
+	if !ok || netlink.Pid == 0 {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("inspect qdisc watcher netlink port: unexpected address %T", bound)
+	}
+	w := &netlinkQdiscWatcher{
+		fd:            fd,
+		ifindex:       iface.Index,
+		changes:       make(chan error, 1),
+		done:          make(chan struct{}),
+		closed:        make(chan struct{}),
+		barrierSeq:    barrierSeq,
+		barrierPortID: netlink.Pid,
+		kernelUnicast: kernelUnicastNetlinkSender,
+		closeLimit:    qdiscWatcherCloseLimit,
+	}
+	w.barrier = func(sequence uint32) error { return sendQdiscDrainBarrier(fd, sequence) }
 	go w.run()
 	return w, nil
 }
@@ -145,9 +185,46 @@ func (w *netlinkQdiscWatcher) Close() error {
 	if w == nil {
 		return nil
 	}
-	w.once.Do(func() { close(w.done) })
+	w.once.Do(func() {
+		select {
+		case <-w.closed:
+			close(w.done)
+			return
+		default:
+		}
+
+		barrierResult := make(chan error, 1)
+		if w.barrier == nil {
+			barrierResult <- errors.New("qdisc watcher has no shutdown barrier")
+		} else {
+			go func() { barrierResult <- w.barrier(w.barrierSeq) }()
+		}
+		timer := time.NewTimer(w.shutdownLimit())
+		select {
+		case err := <-barrierResult:
+			if err != nil {
+				w.closeErr = fmt.Errorf("%w: qdisc watcher shutdown barrier send failed: %v", ErrStimulusInvalid, err)
+			}
+		case <-timer.C:
+			w.closeErr = fmt.Errorf("%w: qdisc watcher shutdown barrier send exceeded %s", ErrStimulusInvalid, w.shutdownLimit())
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		close(w.done)
+	})
 	<-w.closed
-	return nil
+	return w.closeErr
+}
+
+func (w *netlinkQdiscWatcher) shutdownLimit() time.Duration {
+	if w.closeLimit > 0 {
+		return w.closeLimit
+	}
+	return qdiscWatcherCloseLimit
 }
 
 func (w *netlinkQdiscWatcher) run() {
@@ -155,14 +232,45 @@ func (w *netlinkQdiscWatcher) run() {
 	defer close(w.changes)
 	defer unix.Close(w.fd)
 	buffer := make([]byte, 64<<10)
+	shuttingDown := false
+	var shutdownDeadline time.Time
+	beginShutdown := func() {
+		if !shuttingDown {
+			shuttingDown = true
+			shutdownDeadline = time.Now().Add(w.shutdownLimit())
+		}
+	}
 	for {
-		select {
-		case <-w.done:
+		if !shuttingDown {
+			select {
+			case <-w.done:
+				beginShutdown()
+			default:
+			}
+		}
+		if shuttingDown && w.closeErr != nil {
+			w.report(w.closeErr)
 			return
-		default:
+		}
+		if shuttingDown && !time.Now().Before(shutdownDeadline) {
+			err := fmt.Errorf("%w: qdisc watcher shutdown barrier response exceeded %s", ErrStimulusInvalid, w.shutdownLimit())
+			w.closeErr = errors.Join(w.closeErr, err)
+			w.report(err)
+			return
 		}
 		poll := []unix.PollFd{{Fd: int32(w.fd), Events: unix.POLLIN}}
-		n, err := unix.Poll(poll, 250)
+		pollMillis := qdiscWatcherPollMillis
+		if shuttingDown {
+			remaining := time.Until(shutdownDeadline)
+			remainingMillis := int((remaining + time.Millisecond - 1) / time.Millisecond)
+			if remainingMillis < 1 {
+				remainingMillis = 1
+			}
+			if remainingMillis < pollMillis {
+				pollMillis = remainingMillis
+			}
+		}
+		n, err := unix.Poll(poll, pollMillis)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue
@@ -177,7 +285,7 @@ func (w *netlinkQdiscWatcher) run() {
 			}
 			continue
 		}
-		n, _, err = unix.Recvfrom(w.fd, buffer, unix.MSG_DONTWAIT)
+		n, sender, err := unix.Recvfrom(w.fd, buffer, unix.MSG_DONTWAIT)
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EINTR) {
 				continue
@@ -191,12 +299,90 @@ func (w *netlinkQdiscWatcher) run() {
 			return
 		}
 		for _, message := range messages {
+			kernelUnicast := w.kernelUnicast != nil && w.kernelUnicast(sender)
+			barrierKind, barrierErr := classifyQdiscBarrierMessage(message, w.barrierSeq, w.barrierPortID, kernelUnicast)
+			if barrierKind != qdiscBarrierNone {
+				if !shuttingDown {
+					<-w.done
+					beginShutdown()
+					if w.closeErr != nil {
+						w.report(w.closeErr)
+						return
+					}
+				}
+				if barrierErr != nil {
+					err := fmt.Errorf("%w: qdisc watcher shutdown barrier response: %v", ErrStimulusInvalid, barrierErr)
+					w.closeErr = errors.Join(w.closeErr, err)
+					w.report(err)
+					return
+				}
+				if barrierKind == qdiscBarrierTerminal {
+					return
+				}
+				continue
+			}
 			if qdiscEventForInterface(message, w.ifindex) {
-				w.report(fmt.Errorf("%w: kernel reported a loopback qdisc replacement event", ErrStimulusInvalid))
+				w.report(fmt.Errorf("%w: kernel reported a loopback qdisc replacement event (seq=%d pid=%d flags=%#x kernel_unicast=%t barrier_seq=%d)",
+					ErrStimulusInvalid, message.Header.Seq, message.Header.Pid, message.Header.Flags, kernelUnicast, w.barrierSeq))
 				return
 			}
 		}
 	}
+}
+
+type qdiscBarrierMessageKind uint8
+
+const (
+	qdiscBarrierNone qdiscBarrierMessageKind = iota
+	qdiscBarrierData
+	qdiscBarrierTerminal
+)
+
+func classifyQdiscBarrierMessage(message syscall.NetlinkMessage, sequence, portID uint32, kernelUnicast bool) (qdiscBarrierMessageKind, error) {
+	if sequence == 0 || portID == 0 || message.Header.Seq != sequence || message.Header.Pid != portID || !kernelUnicast {
+		return qdiscBarrierNone, nil
+	}
+	switch message.Header.Type {
+	case unix.NLMSG_DONE:
+		return qdiscBarrierTerminal, nil
+	case unix.NLMSG_ERROR:
+		return qdiscBarrierTerminal, netlinkMessageError(message)
+	case unix.RTM_NEWQDISC:
+		if message.Header.Flags&unix.NLM_F_MULTI != 0 {
+			return qdiscBarrierData, nil
+		}
+	}
+	return qdiscBarrierNone, nil
+}
+
+func kernelUnicastNetlinkSender(sender unix.Sockaddr) bool {
+	netlink, ok := sender.(*unix.SockaddrNetlink)
+	return ok && netlink.Pid == 0 && netlink.Groups == 0
+}
+
+func sendQdiscDrainBarrier(fd int, sequence uint32) error {
+	const tcmsgSize = 20
+	request := make([]byte, unix.NLMSG_HDRLEN+tcmsgSize)
+	binary.NativeEndian.PutUint32(request[0:4], uint32(len(request)))
+	binary.NativeEndian.PutUint16(request[4:6], unix.RTM_GETQDISC)
+	binary.NativeEndian.PutUint16(request[6:8], unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
+	binary.NativeEndian.PutUint32(request[8:12], sequence)
+	request[unix.NLMSG_HDRLEN] = unix.AF_UNSPEC
+	return unix.Sendto(fd, request, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK})
+}
+
+func netlinkMessageError(message syscall.NetlinkMessage) error {
+	if len(message.Data) < 4 {
+		return errors.New("short NLMSG_ERROR payload")
+	}
+	errno := int32(binary.NativeEndian.Uint32(message.Data[:4]))
+	if errno == 0 {
+		return nil
+	}
+	if errno > 0 {
+		errno = -errno
+	}
+	return syscall.Errno(-errno)
 }
 
 func (w *netlinkQdiscWatcher) report(err error) {

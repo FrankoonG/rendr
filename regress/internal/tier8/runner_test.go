@@ -3,6 +3,7 @@ package tier8
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +27,33 @@ var orderedCaseIDs = []string{
 func TestSpecsOrdered(t *testing.T) {
 	specs := Specs()
 	assertRequiredSpecs(t, specs)
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatal(err)
+	}
 	if got := specIDs(specs); !reflect.DeepEqual(got, orderedCaseIDs) {
 		t.Fatalf("Specs IDs = %v, want %v", got, orderedCaseIDs)
+	}
+	for i, spec := range specs {
+		if spec.Contract == nil {
+			t.Fatalf("spec %q has nil contract", spec.ID)
+		}
+		if got, want := expectedTestCount(*spec.Contract), uint64(len(caseDefs[i].expected)); got != want {
+			t.Fatalf("spec %q expected test count = %d, want %d", spec.ID, got, want)
+		}
+	}
+	weak := specs[2].Contract
+	if !strings.Contains(weak.Purpose, "does not assert which leaf") {
+		t.Fatalf("default-first-leaf purpose overclaims current test: %q", weak.Purpose)
+	}
+	for _, dimension := range []manifest.ContractDimension{
+		manifest.ContractDimensionStimulus,
+		manifest.ContractDimensionOracle,
+		manifest.ContractDimensionNegativeControl,
+		manifest.ContractDimensionResources,
+	} {
+		if !hasMissingDimension(*weak, dimension) {
+			t.Fatalf("default-first-leaf contract is not blocked on %q", dimension)
+		}
 	}
 
 	originalRequires := caseDefs[1].spec.Requires
@@ -37,6 +63,15 @@ func TestSpecsOrdered(t *testing.T) {
 	copied[1].Requires[0] = "mutated"
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
+	}
+	copied[1].Contract.MissingDimensions[0].Reason = "mutated"
+	copied[1].Contract.Topology.Roles[0] = "mutated"
+	copied[1].Contract.RoleCapabilities["client"] = []string{"mutated"}
+	copied[1].Contract.Load.Params[0].Value++
+	fresh := Specs()[1].Contract
+	if fresh.MissingDimensions[0].Reason == "mutated" || fresh.Topology.Roles[0] == "mutated" ||
+		len(fresh.RoleCapabilities["client"]) != 0 || fresh.Load.Params[0].Value != 1 {
+		t.Fatalf("Specs result aliases nested contract state: %+v", fresh)
 	}
 }
 
@@ -136,8 +171,12 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 			if suite.Cases[0].Evidence["cleanup"] != "preserved" {
 				t.Fatalf("failing row lost evidence: %+v", suite.Cases[0])
 			}
+			if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+				t.Fatalf("executed failing row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+			}
 			for _, rc := range suite.Cases[1:] {
-				if rc.Tier != "T8" || rc.InvalidReason != "not run after first failed" || rc.Failure != "" || rc.SkipReason != "" {
+				if rc.Tier != "T8" || rc.ExecutionState != report.ExecutionStateNotRun || rc.BlockedByCaseID != "first" ||
+					rc.InvalidReason != "not run after first failed" || rc.Failure != "" || rc.SkipReason != "" {
 					t.Fatalf("not-run row = %+v", rc)
 				}
 			}
@@ -162,8 +201,12 @@ func TestRunCaseDefsStopsAfterUnsafeOutcome(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("executor calls = %d, want 1", calls)
 	}
-	if got := suite.Cases[1].InvalidReason; got != "not run after first failed" {
-		t.Fatalf("next case result = %q", got)
+	if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+		t.Fatalf("executed stopping row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
+	if got := suite.Cases[1]; got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "first" ||
+		got.InvalidReason != "not run after first failed" {
+		t.Fatalf("next case result = %+v", got)
 	}
 }
 
@@ -201,4 +244,22 @@ func reportCaseNames(cases []report.Case) []string {
 		names[i] = rc.Name
 	}
 	return names
+}
+
+func expectedTestCount(contract manifest.Contract) uint64 {
+	for _, param := range contract.Load.Params {
+		if param.Name == "expected_top_level_tests" {
+			return param.Value
+		}
+	}
+	return 0
+}
+
+func hasMissingDimension(contract manifest.Contract, dimension manifest.ContractDimension) bool {
+	for _, missing := range contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return true
+		}
+	}
+	return false
 }

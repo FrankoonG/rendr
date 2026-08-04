@@ -35,9 +35,19 @@ func TestSpecsOrder(t *testing.T) {
 		if spec.Budget <= 0 {
 			t.Errorf("spec %q has unbounded budget %s", spec.ID, spec.Budget)
 		}
+		if spec.Contract == nil {
+			t.Errorf("spec %q has no schema-v3 contract", spec.ID)
+			continue
+		}
+		if err := spec.Contract.Validate(); err != nil {
+			t.Errorf("spec %q contract: %v", spec.ID, err)
+		}
 	}
 	if !reflect.DeepEqual(got, orderedCaseIDs) {
 		t.Fatalf("Specs IDs = %v, want %v", got, orderedCaseIDs)
+	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("ValidateCensus(Specs()) = %v", err)
 	}
 
 	originalRequires := caseDefs[1].spec.Requires
@@ -48,6 +58,41 @@ func TestSpecsOrder(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+
+	contractCopy := Specs()
+	contractCopy[0].Contract.Purpose = "mutated"
+	contractCopy[0].Contract.MissingDimensions[0].Reason = "mutated"
+	contractCopy[0].Contract.Topology.Roles[0] = "mutated"
+	contractCopy[0].Contract.RoleCapabilities["runner"] = append(contractCopy[0].Contract.RoleCapabilities["runner"], "mutated")
+	fresh := Specs()[0].Contract
+	if fresh.Purpose == "mutated" || fresh.MissingDimensions[0].Reason == "mutated" || fresh.Topology.Roles[0] == "mutated" || len(fresh.RoleCapabilities["runner"]) != 0 {
+		t.Fatalf("Specs returned aliased T1 contract: %+v", fresh)
+	}
+
+	t.Run("blocked dimensions remain factual", func(t *testing.T) {
+		byID := specsByID(specs)
+		goTestSpec := byID["go-test"]
+		for _, dimension := range []manifest.ContractDimension{
+			manifest.ContractDimensionTopology,
+			manifest.ContractDimensionRoleCapabilities,
+			manifest.ContractDimensionPayload,
+			manifest.ContractDimensionLoad,
+			manifest.ContractDimensionSeed,
+			manifest.ContractDimensionStimulus,
+			manifest.ContractDimensionOracle,
+			manifest.ContractDimensionNegativeControl,
+			manifest.ContractDimensionResources,
+		} {
+			if !contractMissing(goTestSpec, dimension) {
+				t.Errorf("go-test missing dimensions omit %q", dimension)
+			}
+		}
+		for _, spec := range specs {
+			if !contractMissing(spec, manifest.ContractDimensionStimulus) || !contractMissing(spec, manifest.ContractDimensionOracle) {
+				t.Errorf("spec %q asserts evidence despite T1 emitting no Case.Evidence", spec.ID)
+			}
+		}
+	})
 
 	t.Run("migration budget runtime contract", func(t *testing.T) {
 		if err := constMigrationBudget(context.Background(), ""); err != nil {
@@ -63,6 +108,26 @@ func TestSpecsOrder(t *testing.T) {
 			t.Fatal("short migration budget clamp regression passed")
 		}
 	})
+}
+
+func specsByID(specs []manifest.Spec) map[string]manifest.Spec {
+	byID := make(map[string]manifest.Spec, len(specs))
+	for _, spec := range specs {
+		byID[spec.ID] = spec
+	}
+	return byID
+}
+
+func contractMissing(spec manifest.Spec, dimension manifest.ContractDimension) bool {
+	if spec.Contract == nil {
+		return false
+	}
+	for _, missing := range spec.Contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSelectCaseDefsExact(t *testing.T) {

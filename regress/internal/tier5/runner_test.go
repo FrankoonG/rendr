@@ -3,6 +3,7 @@ package tier5
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,11 +83,86 @@ func TestSpecsOrdered(t *testing.T) {
 	if err := manifest.Validate(specs); err != nil {
 		t.Fatalf("Specs validation failed: %v", err)
 	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("closed T5 census validation failed: %v", err)
+	}
 	wantBudgets := []time.Duration{3 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute, 2 * time.Minute}
 	for i, spec := range specs {
 		if !spec.Mandatory || spec.Suite != manifest.SuiteNormal || spec.Budget != wantBudgets[i] {
 			t.Errorf("Specs()[%d] = %+v, want mandatory normal-suite budget %s", i, spec, wantBudgets[i])
 		}
+		if spec.Contract == nil {
+			t.Fatalf("case %q has no schema-v3 contract", spec.ID)
+		}
+		if err := spec.Contract.Validate(); err != nil {
+			t.Fatalf("case %q contract validation failed: %v", spec.ID, err)
+		}
+		if spec.Contract.State != manifest.ContractStateBlocked {
+			t.Errorf("case %q contract state=%q, want blocked while resource minima and negative controls are unfrozen", spec.ID, spec.Contract.State)
+		}
+		if tier5MissingReason(spec.Contract, manifest.ContractDimensionResources) == "" {
+			t.Errorf("case %q does not mark per-role resources unfrozen", spec.ID)
+		}
+		for _, item := range []struct {
+			dimension manifest.ContractDimension
+			profile   manifest.EvidenceProfile
+		}{
+			{manifest.ContractDimensionStimulus, spec.Contract.Stimulus},
+			{manifest.ContractDimensionOracle, spec.Contract.Oracle},
+		} {
+			if tier5MissingReason(spec.Contract, item.dimension) == "" && len(item.profile.Assertions) == 0 {
+				t.Errorf("case %q %s profile has no typed assertion", spec.ID, item.dimension)
+			}
+		}
+	}
+
+	fallback := specs[4].Contract
+	if reason := tier5MissingReason(fallback, manifest.ContractDimensionOracle); !strings.Contains(reason, "AdminConn.AddPath") {
+		t.Fatalf("T5.5 oracle block reason=%q, want explicit regression-orchestrated redial/attach limitation", reason)
+	}
+	if fallback.Oracle.Name != "" || len(fallback.Oracle.RequiredFacts) != 0 || len(fallback.Oracle.Assertions) != 0 {
+		t.Fatalf("T5.5 claims a completed fallback oracle: %+v", fallback.Oracle)
+	}
+	if !strings.Contains(fallback.Purpose, "regression-orchestrated same-session redial/attach") {
+		t.Fatalf("T5.5 purpose=%q, want current explicit redial/attach behavior", fallback.Purpose)
+	}
+	if reason := tier5MissingReason(fallback, manifest.ContractDimensionPayload); !strings.Contains(reason, "different byte lengths") ||
+		fallback.Payload.Applicability != manifest.ApplicabilityUnfrozen {
+		t.Fatalf("T5.5 payload dimension does not record its variable round-trip strings: payload=%+v reason=%q", fallback.Payload, reason)
+	}
+	if got, ok := tier5ProfileParam(fallback.Load, "bidirectional_round_trips"); !ok || got != 4 {
+		t.Fatalf("T5.5 load bidirectional_round_trips = %d, present=%t, want 4", got, ok)
+	}
+
+	for _, index := range []int{3, 5} {
+		contract := specs[index].Contract
+		if containsTier5String(contract.Oracle.RequiredFacts, "gvisor_packet_link_rebind_observed") ||
+			!containsTier5String(contract.Stimulus.RequiredFacts, "gvisor_packet_link_rebind_observed") ||
+			!tier5HasAssertion(contract.Stimulus, "gvisor_packet_link_rebind_observed", manifest.EvidenceEquals, "false") {
+			t.Errorf("case %q treats absent packet-link rebind observation as a successful oracle: stimulus=%+v oracle=%+v", specs[index].ID, contract.Stimulus, contract.Oracle)
+		}
+		if !tier5HasAssertion(contract.Oracle, "sha256_match", manifest.EvidenceEquals, "true") ||
+			!tier5HasAssertion(contract.Oracle, "workload_result", manifest.EvidenceEquals, "pass") {
+			t.Errorf("case %q lacks typed workload pass predicates: %+v", specs[index].ID, contract.Oracle)
+		}
+	}
+
+	contractCopy := Specs()
+	contractCopy[0].Contract.Purpose = "mutated"
+	contractCopy[0].Contract.MissingDimensions[0].Reason = "mutated"
+	contractCopy[0].Contract.RoleCapabilities["test-process"][0] = "mutated"
+	contractCopy[0].Contract.Oracle.Assertions[0].Expected = "mutated"
+	if got := caseDefs[0].spec.Contract.Purpose; got == "mutated" {
+		t.Fatal("Specs exposed mutable contract text")
+	}
+	if got := caseDefs[0].spec.Contract.MissingDimensions[0].Reason; got == "mutated" {
+		t.Fatal("Specs exposed mutable nested contract metadata")
+	}
+	if got := caseDefs[0].spec.Contract.RoleCapabilities["test-process"][0]; got == "mutated" {
+		t.Fatal("Specs exposed mutable role capabilities")
+	}
+	if got := caseDefs[0].spec.Contract.Oracle.Assertions[0].Expected; got == "mutated" {
+		t.Fatal("Specs exposed mutable evidence assertions")
 	}
 
 	originalRequires := caseDefs[1].spec.Requires
@@ -97,6 +173,45 @@ func TestSpecsOrdered(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+}
+
+func tier5MissingReason(contract *manifest.Contract, dimension manifest.ContractDimension) string {
+	if contract == nil {
+		return ""
+	}
+	for _, missing := range contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return missing.Reason
+		}
+	}
+	return ""
+}
+
+func tier5ProfileParam(profile manifest.Profile, name string) (uint64, bool) {
+	for _, parameter := range profile.Params {
+		if parameter.Name == name {
+			return parameter.Value, true
+		}
+	}
+	return 0, false
+}
+
+func tier5HasAssertion(profile manifest.EvidenceProfile, fact string, predicate manifest.EvidencePredicate, expected string) bool {
+	for _, assertion := range profile.Assertions {
+		if assertion.Fact == fact && assertion.Predicate == predicate && assertion.Expected == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTier5String(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSelectCaseDefs(t *testing.T) {
@@ -224,8 +339,17 @@ func TestRunSelectedCasesStopsAfterUnsafeOutcome(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("executor calls = %d, want 1", calls)
 	}
-	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
-		t.Fatalf("next case result = %q", got)
+	if got := len(suite.Cases); got != len(defs) {
+		t.Fatalf("report rows = %d, want %d", got, len(defs))
+	}
+	if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+		t.Fatalf("executed stopping row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
+	for _, got := range suite.Cases[1:] {
+		if got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "synthetic.first" ||
+			got.InvalidReason != "not run after synthetic.first failed" {
+			t.Fatalf("downstream not-run row = %+v", got)
+		}
 	}
 }
 
@@ -251,7 +375,16 @@ func assertFailFastRows(t *testing.T, cases []report.Case, tier string) {
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("report IDs = %v, want %v", gotIDs, wantIDs)
 	}
-	if got := cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
+	for i, rc := range cases[:2] {
+		if rc.ExecutionState != report.ExecutionStateExecuted || rc.BlockedByCaseID != "" {
+			t.Fatalf("executed row %d state = %q blocked by %q", i, rc.ExecutionState, rc.BlockedByCaseID)
+		}
+	}
+	trailing := cases[2]
+	if trailing.ExecutionState != report.ExecutionStateNotRun || trailing.BlockedByCaseID != "synthetic.blocker" {
+		t.Fatalf("trailing row state = %q blocked by %q", trailing.ExecutionState, trailing.BlockedByCaseID)
+	}
+	if got := trailing.InvalidReason; got != "not run after synthetic.blocker failed" {
 		t.Fatalf("trailing row invalid reason = %q", got)
 	}
 }

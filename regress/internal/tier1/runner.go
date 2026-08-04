@@ -44,7 +44,7 @@ type caseDef struct {
 }
 
 var caseDefs = []caseDef{
-	{manifest.RequiredWithBudget("go-vet", "T1", 60*time.Second), goVet, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("go-vet", "T1", 60*time.Second), tier1ManifestContract("go-vet")), goVet, "", 0},
 	// go-test / go-test-race: TestM5PacketStreamUnderMigration
 	// (15s receiver deadline) and TestM7DedupWindowBoundedOnLoopback
 	// (75% race-mode dedup threshold) flake on contended loopback
@@ -53,15 +53,15 @@ var caseDefs = []caseDef{
 	// at low single-digit % per attempt compounds to ~10% across 3
 	// attempts. 4 retries (5 attempts total) brings the compound
 	// fail rate below ~1%.
-	{manifest.RequiredWithBudget("go-test", "T1", 5*time.Minute), goTest, "", 4},
-	{manifest.RequiredWithBudget("regress-unit", "T1", 3*time.Minute), regressUnit, "", 0},
-	{manifest.RequiredWithBudget("go-test-race", "T1", 6*time.Minute), goTestRace, "linux", 4},
-	{manifest.RequiredWithBudget("go-bench-smoke", "T1", 90*time.Second), goBenchSmoke, "linux", 0},
-	{manifest.RequiredWithBudget("const-proto-version", "T1", 5*time.Second), constProtoVersion, "", 0},
-	{manifest.RequiredWithBudget("const-udpflow-version", "T1", 5*time.Second), constUDPFlowVersion, "", 0},
-	{manifest.RequiredWithBudget("const-migration-budget-90s", "T1", 5*time.Second), constMigrationBudget, "", 0},
-	{manifest.RequiredWithBudget("const-mode-values", "T1", 5*time.Second), constModeValues, "", 0},
-	{manifest.RequiredWithBudget("const-mode-transition-table", "T1", 5*time.Second), constModeTransitionTable, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("go-test", "T1", 5*time.Minute), tier1ManifestContract("go-test")), goTest, "", 4},
+	{mustManifestSpec(manifest.RequiredWithBudget("regress-unit", "T1", 3*time.Minute), tier1ManifestContract("regress-unit")), regressUnit, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("go-test-race", "T1", 6*time.Minute), tier1ManifestContract("go-test-race")), goTestRace, "linux", 4},
+	{mustManifestSpec(manifest.RequiredWithBudget("go-bench-smoke", "T1", 90*time.Second), tier1ManifestContract("go-bench-smoke")), goBenchSmoke, "linux", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("const-proto-version", "T1", 5*time.Second), tier1ManifestContract("const-proto-version")), constProtoVersion, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("const-udpflow-version", "T1", 5*time.Second), tier1ManifestContract("const-udpflow-version")), constUDPFlowVersion, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("const-migration-budget-90s", "T1", 5*time.Second), tier1ManifestContract("const-migration-budget-90s")), constMigrationBudget, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("const-mode-values", "T1", 5*time.Second), tier1ManifestContract("const-mode-values")), constModeValues, "", 0},
+	{mustManifestSpec(manifest.RequiredWithBudget("const-mode-transition-table", "T1", 5*time.Second), tier1ManifestContract("const-mode-transition-table")), constModeTransitionTable, "", 0},
 }
 
 // Specs returns the ordered T1 case manifest.
@@ -149,9 +149,12 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

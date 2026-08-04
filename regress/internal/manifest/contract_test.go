@@ -73,8 +73,14 @@ func TestNormalizeRejectsDuplicateSetClaims(t *testing.T) {
 			c.Payload.Params = append(c.Payload.Params, ProfileParam{Name: "payload_bytes", Value: 2, Unit: UnitBytes})
 		}, want: "payload profile param \"payload_bytes\" is duplicated"},
 		{name: "evidence fact", mutate: func(c *Contract) {
-			c.Stimulus.RequiredFacts = append(c.Stimulus.RequiredFacts, "path_changed")
-		}, want: "stimulus required facts entry \"path_changed\" is duplicated"},
+			c.Stimulus.RequiredFacts = append(c.Stimulus.RequiredFacts, "stimulus_timestamp_ns")
+		}, want: "stimulus required facts entry \"stimulus_timestamp_ns\" is duplicated"},
+		{name: "evidence assertion", mutate: func(c *Contract) {
+			c.Oracle.Assertions = append(c.Oracle.Assertions, c.Oracle.Assertions[0])
+		}, want: "oracle assertion for fact"},
+		{name: "claim binding", mutate: func(c *Contract) {
+			c.ClaimBindings = append(c.ClaimBindings, c.ClaimBindings[0])
+		}, want: "claim binding"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,7 +112,16 @@ func TestContractValidateRejectsIncompleteOrNonCanonicalClaims(t *testing.T) {
 		{name: "payload applicability", mutate: func(c *Contract) { c.Payload.Applicability = "" }, want: "unsupported payload applicability"},
 		{name: "payload params", mutate: func(c *Contract) { c.Payload.Params = nil }, want: "payload profile params are missing"},
 		{name: "seed mode", mutate: func(c *Contract) { c.Seed.Mode = "" }, want: "unsupported seed policy"},
-		{name: "stimulus facts", mutate: func(c *Contract) { c.Stimulus.RequiredFacts = nil }, want: "stimulus required facts are missing"},
+		{name: "stimulus evidence", mutate: func(c *Contract) {
+			c.Stimulus.RequiredFacts = nil
+			c.Stimulus.Assertions = nil
+		}, want: "stimulus evidence requirements are missing"},
+		{name: "stimulus assertions", mutate: func(c *Contract) { c.Stimulus.Assertions = nil }, want: "declared stimulus evidence requires at least one typed assertion"},
+		{name: "oracle assertions", mutate: func(c *Contract) { c.Oracle.Assertions = nil }, want: "declared oracle evidence requires at least one typed assertion"},
+		{name: "assertion predicate", mutate: func(c *Contract) { c.Oracle.Assertions[0].Predicate = "unknown" }, want: "unsupported predicate"},
+		{name: "assertion uint", mutate: func(c *Contract) {
+			c.Oracle.Assertions[0] = EvidenceAssertion{Fact: "delivered_bytes", Predicate: EvidenceUintAtLeast, Expected: "not-a-number"}
+		}, want: "is not uint64"},
 		{name: "control kind", mutate: func(c *Contract) { c.NegativeControl.Kind = "" }, want: "unsupported negative control"},
 		{name: "resource state", mutate: func(c *Contract) { c.Resources.State = "" }, want: "unsupported resource state"},
 		{name: "resource role", mutate: func(c *Contract) { delete(c.Resources.Roles, "server") }, want: "server\" has no resource budget"},
@@ -127,6 +142,37 @@ func TestContractValidateRejectsIncompleteOrNonCanonicalClaims(t *testing.T) {
 	t.Run("applicability and seed modes", testProfileApplicabilityAndSeedModes)
 	t.Run("negative controls", testNegativeControlKindsAndRegistryReferences)
 	t.Run("zero path topology", testZeroPathTopologyIsFactual)
+	t.Run("evidence assertions", testEvidenceAssertions)
+}
+
+func testEvidenceAssertions(t *testing.T) {
+	tests := []struct {
+		name      string
+		assertion EvidenceAssertion
+		actual    string
+		wantError bool
+	}{
+		{name: "equals", assertion: EvidenceAssertion{Fact: "ok", Predicate: EvidenceEquals, Expected: "true"}, actual: "true"},
+		{name: "equals rejects false", assertion: EvidenceAssertion{Fact: "ok", Predicate: EvidenceEquals, Expected: "true"}, actual: "false", wantError: true},
+		{name: "uint minimum", assertion: EvidenceAssertion{Fact: "pps", Predicate: EvidenceUintAtLeast, Expected: "100000"}, actual: "100000"},
+		{name: "uint minimum rejects", assertion: EvidenceAssertion{Fact: "pps", Predicate: EvidenceUintAtLeast, Expected: "100000"}, actual: "99999", wantError: true},
+		{name: "uint equals", assertion: EvidenceAssertion{Fact: "paths", Predicate: EvidenceUintEquals, Expected: "2"}, actual: "2"},
+		{name: "uint equals rejects", assertion: EvidenceAssertion{Fact: "paths", Predicate: EvidenceUintEquals, Expected: "2"}, actual: "3", wantError: true},
+		{name: "int equals", assertion: EvidenceAssertion{Fact: "seed", Predicate: EvidenceIntEquals, Expected: "-42"}, actual: "-42"},
+		{name: "int typed", assertion: EvidenceAssertion{Fact: "seed", Predicate: EvidenceInt}, actual: "-42"},
+		{name: "int typed rejects text", assertion: EvidenceAssertion{Fact: "seed", Predicate: EvidenceInt}, actual: "random", wantError: true},
+		{name: "float maximum", assertion: EvidenceAssertion{Fact: "loss", Predicate: EvidenceFloatAtMost, Expected: "0.1"}, actual: "0.01"},
+		{name: "float maximum rejects", assertion: EvidenceAssertion{Fact: "loss", Predicate: EvidenceFloatAtMost, Expected: "0.1"}, actual: "0.2", wantError: true},
+		{name: "missing", assertion: EvidenceAssertion{Fact: "ok", Predicate: EvidenceEquals, Expected: "true"}, wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := EvaluateEvidenceAssertion(tt.assertion, tt.actual)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("EvaluateEvidenceAssertion() err=%v wantError=%v", err, tt.wantError)
+			}
+		})
+	}
 }
 
 func testEnforcedContractRequiresEveryDimension(t *testing.T) {
@@ -265,6 +311,9 @@ func testProfileApplicabilityAndSeedModes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			contract := completeContractInput(time.Second)
 			tt.mutate(&contract)
+			if tt.valid {
+				bindAllClaimEvidence(&contract)
+			}
 			_, err := Normalize(contract)
 			if tt.valid && err != nil {
 				t.Fatal(err)
@@ -296,6 +345,9 @@ func testNegativeControlKindsAndRegistryReferences(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			contract := completeContractInput(time.Second)
 			contract.NegativeControl = tt.control
+			if tt.valid {
+				bindAllClaimEvidence(&contract)
+			}
 			_, err := Normalize(contract)
 			if tt.valid && err != nil {
 				t.Fatal(err)
@@ -309,12 +361,61 @@ func testNegativeControlKindsAndRegistryReferences(t *testing.T) {
 	control := mustCompleteSpec(t, "control", time.Second)
 	treatment := mustCompleteSpec(t, "treatment", time.Second)
 	treatment.Contract.NegativeControl = NegativeControl{Kind: NegativeControlCase, CaseID: control.ID}
+	bindAllClaimEvidence(treatment.Contract)
 	if err := ValidateCensus([]Spec{control, treatment}); err != nil {
 		t.Fatal(err)
 	}
 	treatment.Contract.NegativeControl.CaseID = "invented"
+	bindAllClaimEvidence(treatment.Contract)
 	if err := ValidateCensus([]Spec{control, treatment}); err == nil || !strings.Contains(err.Error(), "unknown case") {
 		t.Fatalf("unknown control err=%v", err)
+	}
+}
+
+func TestReleaseNegativeControlCaseRequiresExecutionDependency(t *testing.T) {
+	control := mustCompleteSpec(t, "control", time.Second)
+	treatment := mustCompleteSpec(t, "treatment", time.Second)
+	treatment.Contract.NegativeControl = NegativeControl{Kind: NegativeControlCase, CaseID: control.ID}
+	bindAllClaimEvidence(treatment.Contract)
+	registry := []Spec{control, treatment}
+
+	if err := ValidateCensus(registry); err != nil {
+		t.Fatalf("census rejected known control without release wiring: %v", err)
+	}
+	if err := ValidateRelease(registry); err == nil || !strings.Contains(err.Error(), "must directly require negative control") {
+		t.Fatalf("release validation err=%v", err)
+	}
+
+	treatment.Requires = []string{control.ID}
+	registry = []Spec{control, treatment}
+	if err := ValidateRelease(registry); err != nil {
+		t.Fatalf("release rejected ordered control dependency: %v", err)
+	}
+	selected, err := SelectWithPrerequisites(registry, treatment.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specIDs(selected); !reflect.DeepEqual(got, []string{control.ID, treatment.ID}) {
+		t.Fatalf("release treatment selection omitted control execution: %v", got)
+	}
+
+	self := CloneSpec(treatment)
+	self.Requires = nil
+	self.Contract.NegativeControl.CaseID = self.ID
+	bindAllClaimEvidence(self.Contract)
+	if err := ValidateCensus([]Spec{self}); err == nil || !strings.Contains(err.Error(), "cannot name itself") {
+		t.Fatalf("self-referencing negative control err=%v", err)
+	}
+
+	blockedContract := completeContractInput(time.Second)
+	blockedContract.NegativeControl = NegativeControl{Kind: NegativeControlCase, CaseID: control.ID}
+	makeBlocked(&blockedContract, ContractDimensionEntrypoint)
+	blocked, err := NewCompleteSpec(RequiredWithBudget("blocked-treatment", "T2", time.Second), blockedContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCensus([]Spec{control, blocked}); err != nil {
+		t.Fatalf("truthful blocked census rejected missing release dependency: %v", err)
 	}
 }
 
@@ -327,6 +428,7 @@ func testZeroPathTopologyIsFactual(t *testing.T) {
 	contract.Load = Profile{Applicability: ApplicabilityNotApplicable}
 	contract.Seed = SeedPolicy{Mode: SeedModeNone}
 	contract.NegativeControl = NegativeControl{Kind: NegativeControlNotApplicable, Reason: "static validation has no treatment"}
+	bindAllClaimEvidence(&contract)
 	if _, err := Normalize(contract); err != nil {
 		t.Fatalf("factual no-network contract rejected: %v", err)
 	}
@@ -353,12 +455,14 @@ func TestNewCompleteSpecRejectsCrossFieldIncompleteness(t *testing.T) {
 	base := RequiredWithBudget("case.complete", "T2", 30*time.Second)
 	contract := normalizedContract(t, base.Budget)
 	contract.Resources.Timeout++
+	bindAllClaimEvidence(&contract)
 	if _, err := NewCompleteSpec(base, contract); err == nil || !strings.Contains(err.Error(), "does not match legacy budget") {
 		t.Fatalf("budget mismatch err=%v", err)
 	}
 
 	contract = normalizedContract(t, base.Budget)
 	contract.NegativeControl = NegativeControl{Kind: NegativeControlCase, CaseID: base.ID}
+	bindAllClaimEvidence(&contract)
 	if _, err := NewCompleteSpec(base, contract); err == nil || !strings.Contains(err.Error(), "cannot name itself") {
 		t.Fatalf("self negative-control err=%v", err)
 	}
@@ -389,7 +493,10 @@ func testCloneSpecAndCloneSpecsAreDeep(t *testing.T) {
 		clone.Contract.Load.Params[0].Name = "changed"
 		*clone.Contract.Seed.FixedSeed = 99
 		clone.Contract.Stimulus.RequiredFacts[0] = "changed"
+		clone.Contract.Stimulus.Assertions[0].Expected = "changed"
 		clone.Contract.Oracle.RequiredFacts[0] = "changed"
+		clone.Contract.Oracle.Assertions[0].Expected = "changed"
+		clone.Contract.ClaimBindings[0].Assertion.Fact = "changed"
 		allocation := clone.Contract.Resources.Roles["client"]
 		allocation.VCPUs = 99
 		clone.Contract.Resources.Roles["client"] = allocation
@@ -398,7 +505,9 @@ func testCloneSpecAndCloneSpecsAreDeep(t *testing.T) {
 		original.Contract.Topology.Roles[0] != "client" || original.Contract.RoleCapabilities["client"][0] != "net-admin" ||
 		original.Contract.RoleCapabilities["new"] != nil || original.Contract.Payload.Params[0].Name != "chunk_bytes" ||
 		original.Contract.Load.Params[0].Name != "duration_ns" || *original.Contract.Seed.FixedSeed != 42 ||
-		original.Contract.Stimulus.RequiredFacts[0] != "path_changed" || original.Contract.Oracle.RequiredFacts[0] != "application_errors_zero" ||
+		original.Contract.Stimulus.RequiredFacts[0] != "stimulus_timestamp_ns" || original.Contract.Stimulus.Assertions[0].Expected != "true" ||
+		original.Contract.Oracle.RequiredFacts[0] != "delivered_bytes" || original.Contract.Oracle.Assertions[0].Expected != "0" ||
+		original.Contract.ClaimBindings[0].Assertion.Fact == "changed" ||
 		original.Contract.Resources.Roles["client"].VCPUs != 2 {
 		t.Fatal("deep clone mutation reached original spec")
 	}
@@ -419,6 +528,9 @@ func TestSpecCanonicalDigestStableAcrossSetAndMapOrder(t *testing.T) {
 	reverseParams(reordered.Contract.Load.Params)
 	reverseStrings(reordered.Contract.Stimulus.RequiredFacts)
 	reverseStrings(reordered.Contract.Oracle.RequiredFacts)
+	reverseAssertions(reordered.Contract.Stimulus.Assertions)
+	reverseAssertions(reordered.Contract.Oracle.Assertions)
+	reverseClaimBindings(reordered.Contract.ClaimBindings)
 	reordered.Contract.RoleCapabilities = map[string][]string{
 		"server": reordered.Contract.RoleCapabilities["server"],
 		"client": reordered.Contract.RoleCapabilities["client"],
@@ -478,7 +590,9 @@ func TestSpecCanonicalDigestBindsEverySemanticDimension(t *testing.T) {
 		{name: "load", mutate: func(s *Spec) { s.Contract.Load.Params[0].Value++ }},
 		{name: "seed", mutate: func(s *Spec) { *s.Contract.Seed.FixedSeed++ }},
 		{name: "stimulus", mutate: func(s *Spec) { s.Contract.Stimulus.RequiredFacts[0] += "_v2" }},
+		{name: "stimulus assertion", mutate: func(s *Spec) { s.Contract.Stimulus.Assertions[0].Expected = "false" }},
 		{name: "oracle", mutate: func(s *Spec) { s.Contract.Oracle.RequiredFacts[0] += "_v2" }},
+		{name: "oracle assertion", mutate: func(s *Spec) { s.Contract.Oracle.Assertions[0].Expected = "false" }},
 		{name: "control", mutate: func(s *Spec) { s.Contract.NegativeControl.EmbeddedID += "-v2" }},
 		{name: "resource timeout", mutate: func(s *Spec) { s.Budget++; s.Contract.Resources.Timeout++ }},
 		{name: "resource role", mutate: func(s *Spec) {
@@ -492,6 +606,7 @@ func TestSpecCanonicalDigestBindsEverySemanticDimension(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			changed := CloneSpec(base)
 			tt.mutate(&changed)
+			bindAllClaimEvidence(changed.Contract)
 			if got := mustDigest(t, changed); got == want {
 				t.Fatalf("semantic mutation did not change digest %q", got)
 			}
@@ -582,7 +697,7 @@ func TestMixedLegacyAndCompleteRegistrySupportsIncrementalMigration(t *testing.T
 
 func completeContractInput(timeout time.Duration) Contract {
 	seed := int64(42)
-	return Contract{
+	contract := Contract{
 		SchemaVersion: ContractSchemaVersion,
 		State:         ContractStateEnforced,
 		Purpose:       "  prove lossless migration  ",
@@ -619,12 +734,19 @@ func completeContractInput(timeout time.Duration) Contract {
 		Stimulus: EvidenceProfile{
 			Name:          " path-migration ",
 			Version:       1,
-			RequiredFacts: []string{" stimulus_timestamp_ns ", " path_changed "},
+			RequiredFacts: []string{" stimulus_timestamp_ns "},
+			Assertions: []EvidenceAssertion{
+				{Fact: " path_changed ", Predicate: EvidenceEquals, Expected: " true "},
+			},
 		},
 		Oracle: EvidenceProfile{
 			Name:          " lossless-stream ",
 			Version:       1,
-			RequiredFacts: []string{" sha256_match ", " application_errors_zero ", " delivered_bytes "},
+			RequiredFacts: []string{" delivered_bytes "},
+			Assertions: []EvidenceAssertion{
+				{Fact: " sha256_match ", Predicate: EvidenceEquals, Expected: " true "},
+				{Fact: " application_errors_zero ", Predicate: EvidenceEquals, Expected: " 0 "},
+			},
 		},
 		NegativeControl: NegativeControl{Kind: NegativeControlEmbedded, EmbeddedID: " no-path-change "},
 		Resources: ResourceBudget{
@@ -637,6 +759,8 @@ func completeContractInput(timeout time.Duration) Contract {
 			Exclusivity: ExclusivityShared,
 		},
 	}
+	bindAllClaimEvidence(&contract)
+	return contract
 }
 
 func blockedContractInput() Contract {
@@ -648,6 +772,7 @@ func blockedContractInput() Contract {
 func makeBlocked(contract *Contract, dimensions ...ContractDimension) {
 	contract.State = ContractStateBlocked
 	contract.MissingDimensions = nil
+	contract.ClaimBindings = nil
 	for _, dimension := range dimensions {
 		contract.MissingDimensions = append(contract.MissingDimensions, MissingDimension{
 			Dimension: dimension,
@@ -687,6 +812,18 @@ func makeBlocked(contract *Contract, dimensions ...ContractDimension) {
 			contract.MissingDimensions = append(contract.MissingDimensions, MissingDimension{Dimension: ContractDimensionResources, Reason: "topology roles are unfrozen"})
 			contract.Resources = ResourceBudget{State: ResourceStateUnfrozen}
 		}
+	}
+}
+
+func bindAllClaimEvidence(contract *Contract) {
+	contract.ClaimBindings = nil
+	requirements, err := contract.ClaimEvidenceRequirements()
+	if err != nil {
+		panic(err)
+	}
+	contract.ClaimBindings = make([]ClaimEvidenceBinding, len(requirements))
+	for i, requirement := range requirements {
+		contract.ClaimBindings[i] = requirement.Bind("claim" + strings.ReplaceAll(string(requirement.ClaimKey), "/", "_"))
 	}
 }
 
@@ -768,6 +905,18 @@ func reverseStrings(values []string) {
 }
 
 func reverseParams(values []ProfileParam) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
+
+func reverseAssertions(values []EvidenceAssertion) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
+
+func reverseClaimBindings(values []ClaimEvidenceBinding) {
 	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
 		values[left], values[right] = values[right], values[left]
 	}

@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr"
@@ -79,33 +80,39 @@ func (p PlannedCase) Spec() manifest.Spec {
 // Before places the alias immediately before a canonical case in --list and
 // defines the inclusive --from-case continuation point.
 type Alias struct {
-	ID        string
-	Before    string
-	ExpandsTo []string
+	ID            string
+	Before        string
+	ExpandsTo     []string
+	RetiredReason string
 }
 
 // caseDefs contains executable cases only. Every entry is mandatory, appears
 // once in Specs, executes once, and produces exactly one report row.
 var caseDefs = []caseDef{
-	{spec: tunSpec(caseKernelTUNPreflight, 30*time.Second, false), run: runKernelTUNPreflightManifestCase},
-	{spec: tunSpec(caseG1Smoke, 2*time.Minute, false), run: runG1ManifestCase},
-	{spec: tunSpec(caseG2Smoke, 2*time.Minute, false), run: runG2ManifestCase},
-	{spec: tunSpec(caseG3Smoke, 2*time.Minute, false), run: runG3ManifestCase},
-	{spec: tunSpec(caseG4PathDeath, 30*time.Second, false), run: runG4ManifestCase},
-	{spec: tunSpec(caseG5PathRecovery, time.Minute, false), run: runG5ManifestCase},
-	{spec: tunSpec(caseT3XrayMatrix, 12*time.Minute, true), run: runT3XrayMatrixManifestCase},
-	{spec: tunSpec(caseT4G1, 7*time.Minute, true), run: runT4G1ManifestCase},
-	{spec: tunSpec(caseT4G2, 33*time.Minute, true), run: runT4G2ManifestCase},
-	{spec: tunSpec(caseT4G3, 8*time.Minute, true), run: runT4G3ManifestCase},
-	{spec: tunSpec(caseT5AdapterMatrix, 5*time.Minute, false), run: runT5ManifestCase},
-	{spec: tunSpec(caseT6Selector, 2*time.Minute, false), run: runT6ManifestCase},
+	{spec: completeTUNSpec(caseKernelTUNPreflight, 30*time.Second, false), run: runKernelTUNPreflightManifestCase},
+	{spec: completeTUNSpec(caseG1Smoke, 2*time.Minute, false), run: runG1ManifestCase},
+	{spec: completeTUNSpec(caseG2Smoke, 2*time.Minute, false), run: runG2ManifestCase},
+	{spec: completeTUNSpec(caseG3Smoke, 2*time.Minute, false), run: runG3ManifestCase},
+	{spec: completeTUNSpec(caseG4PathDeath, 30*time.Second, false), run: runG4ManifestCase},
+	{spec: completeTUNSpec(caseG5PathRecovery, time.Minute, false), run: runG5ManifestCase},
+	{spec: completeTUNSpec(caseT3XrayMatrix, 12*time.Minute, true), run: runT3XrayMatrixManifestCase},
+	{spec: completeTUNSpec(caseT4G1, 7*time.Minute, true), run: runT4G1ManifestCase},
+	{spec: completeTUNSpec(caseT4G2, 33*time.Minute, true), run: runT4G2ManifestCase},
+	{spec: completeTUNSpec(caseT4G3, 8*time.Minute, true), run: runT4G3ManifestCase},
+	{spec: completeTUNSpec(caseT5AdapterMatrix, 5*time.Minute, false), run: runT5ManifestCase},
+	{spec: completeTUNSpec(caseT6Selector, 2*time.Minute, false), run: runT6ManifestCase},
 }
 
 var aliases = []Alias{
 	{ID: caseT3XrayStreamSmoke, Before: caseT3XrayMatrix, ExpandsTo: []string{caseT3XrayMatrix}},
 	{ID: caseT4LongRun, Before: caseT4G1, ExpandsTo: []string{caseT4G1, caseT4G2, caseT4G3}},
 	{ID: caseT4G2Prime, Before: caseT4G2, ExpandsTo: []string{caseT4G2}},
-	{ID: caseT5Fallback, Before: caseT5AdapterMatrix, ExpandsTo: []string{caseT5AdapterMatrix}},
+	{
+		ID:            caseT5Fallback,
+		Before:        caseT5AdapterMatrix,
+		ExpandsTo:     []string{caseT5AdapterMatrix},
+		RetiredReason: "historical name claimed fallback coverage, but the replacement adapter matrix does not exercise fallback",
+	},
 }
 
 func tunSpec(id string, budget time.Duration, long bool) manifest.Spec {
@@ -172,7 +179,7 @@ func selectCaseDefsFrom(defs []caseDef, opts Options) ([]caseDef, error) {
 }
 
 func validateCaseDefs(defs []caseDef) error {
-	if err := manifest.Validate(specsFrom(defs)); err != nil {
+	if err := manifest.ValidateCensus(specsFrom(defs)); err != nil {
 		return err
 	}
 	for _, def := range defs {
@@ -295,13 +302,14 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 }
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
-	rc := report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+	return report.Case{
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
-	markTUNEvidence(&rc, spec.ID)
-	return rc
 }
 
 // NotRunCase creates the canonical synthetic-suite placeholder used when the
@@ -330,6 +338,7 @@ func runManifestCaseOutcome(ctx context.Context, rendrRoot string, def caseDef) 
 		}()
 		return def.run(cctx, rendrRoot, def.spec)
 	})
+	enforceTUNCleanupOutcome(&outcome)
 	rc := outcome.Case
 	contractFailures := make([]string, 0, 2)
 	if rc.Name != "" && rc.Name != def.spec.ID {
@@ -495,9 +504,21 @@ func UnimplementedCase(name string) report.Case {
 
 var tunChaosApply = chaos.Apply
 
+const (
+	maxTUNCleanupStartDelay   = 250 * time.Millisecond
+	maxTUNTeardownQuiesce     = 500 * time.Millisecond
+	maxTUNCleanupWait         = 5 * time.Second
+	tunCleanupStateEvidence   = "chaos_cleanup_state"
+	tunCleanupLimitEvidence   = "chaos_cleanup_limit"
+	tunTeardownUnsafeEvidence = "chaos_teardown_unsafe"
+	tunCleanupStateComplete   = "complete"
+	tunCleanupStateFailed     = "failed"
+	tunCleanupStateUnjoined   = "unjoined"
+)
+
 func runT4WithBudget(ctx context.Context, name string, budget time.Duration, prof chaos.Profile, fn func(context.Context) report.Case) report.Case {
 	start := time.Now()
-	cleanup, err := tunChaosApply(prof)
+	cleanupFunc, err := applyTUNChaos(prof)
 	if err != nil {
 		return report.Case{
 			Name:          name,
@@ -506,26 +527,38 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 			InvalidReason: "chaos fixture setup failed: " + err.Error(),
 		}
 	}
-	cctx, cancel := context.WithTimeout(ctx, budget)
-	var result report.Case
-	func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				result = failedCase(name, start, fmt.Errorf("runner panic: %v", recovered))
-			}
-		}()
-		result = fn(cctx)
-	}()
-	budgetErr := cctx.Err()
-	cancel()
-	if budgetErr != nil {
-		budgetFailure := fmt.Sprintf("case exceeded T4 budget %s: %v", budget, budgetErr)
-		if result.Failure == "" {
-			result.Failure = budgetFailure
-		} else {
-			result.Failure = budgetFailure + ": " + result.Failure
+	if cleanupFunc == nil {
+		return report.Case{
+			Name:          name,
+			Tier:          "T7",
+			Duration:      time.Since(start),
+			InvalidReason: "chaos fixture setup failed: apply returned a nil cleanup",
 		}
 	}
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	timing := tunTeardownTimingFor(tunCaseJoinTimeout)
+	cleanup := newTUNCleanup(cleanupFunc)
+	startTUNCleanupOnCancel(cctx, cleanup, timing.cleanupStartDelay)
+	completed, workloadDone := startTUNWorkload(cctx, fn)
+
+	var result report.Case
+	var stopErr error
+	select {
+	case completion := <-completed:
+		result = completion.result
+		if deadline, ok := cctx.Deadline(); ok && completion.finishedAt.After(deadline) {
+			stopErr = context.DeadlineExceeded
+		}
+	case <-cctx.Done():
+		stopErr = cctx.Err()
+	}
+	canceledAt := time.Now()
+	cancel()
+	if stopErr != nil {
+		appendT4StopFailure(&result, budget, stopErr)
+	}
+	finalizeTUNCleanup(&result, cleanup, workloadDone, canceledAt, timing)
+	enforceTUNCleanupCase(&result)
 	if result.Name == "" {
 		result.Name = name
 	}
@@ -535,15 +568,279 @@ func runT4WithBudget(ctx context.Context, name string, budget time.Duration, pro
 	if result.Duration == 0 {
 		result.Duration = time.Since(start)
 	}
-	applyT4CleanupResult(&result, cleanup)
 	return result
+}
+
+type tunTeardownTiming struct {
+	cleanupStartDelay time.Duration
+	cleanupWait       time.Duration
+	quiesceWait       time.Duration
+}
+
+func tunTeardownTimingFor(joinTimeout time.Duration) tunTeardownTiming {
+	if joinTimeout <= 0 {
+		joinTimeout = caseexec.DefaultJoinTimeout
+	}
+	startDelay := minTUNDuration(joinTimeout/4, maxTUNCleanupStartDelay)
+	cleanupWait := minTUNDuration(joinTimeout/2, maxTUNCleanupWait)
+	quiesceWait := minTUNDuration(joinTimeout*3/4, maxTUNTeardownQuiesce)
+	if startDelay <= 0 {
+		startDelay = time.Nanosecond
+	}
+	if cleanupWait <= 0 {
+		cleanupWait = time.Nanosecond
+	}
+	if quiesceWait < startDelay {
+		quiesceWait = startDelay
+	}
+	return tunTeardownTiming{
+		cleanupStartDelay: startDelay,
+		cleanupWait:       cleanupWait,
+		quiesceWait:       quiesceWait,
+	}
+}
+
+func minTUNDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+type tunCleanup struct {
+	cleanup func() error
+	once    sync.Once
+	started chan struct{}
+	done    chan struct{}
+	mu      sync.Mutex
+	err     error
+}
+
+func newTUNCleanup(cleanup func() error) *tunCleanup {
+	return &tunCleanup{
+		cleanup: cleanup,
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+}
+
+func (c *tunCleanup) Start() {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		close(c.started)
+		go func() {
+			err := invokeTUNCleanup(c.cleanup)
+			c.mu.Lock()
+			c.err = err
+			c.mu.Unlock()
+			close(c.done)
+		}()
+	})
+}
+
+func (c *tunCleanup) Wait(limit time.Duration) (error, bool) {
+	if c == nil {
+		return nil, true
+	}
+	c.Start()
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-c.done:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.err, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+func invokeTUNCleanup(cleanup func() error) (err error) {
+	if cleanup == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("cleanup panicked: %v", recovered)
+		}
+	}()
+	return cleanup()
+}
+
+func startTUNCleanupOnCancel(ctx context.Context, cleanup *tunCleanup, delay time.Duration) {
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-cleanup.started:
+			return
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cleanup.Start()
+		case <-cleanup.started:
+		}
+	}()
+}
+
+func applyTUNChaos(profile chaos.Profile) (cleanup func() error, err error) {
+	if tunChaosApply == nil {
+		return nil, fmt.Errorf("apply function is nil")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cleanup = nil
+			err = fmt.Errorf("apply panicked: %v", recovered)
+		}
+	}()
+	return tunChaosApply(profile)
+}
+
+type tunWorkloadCompletion struct {
+	result     report.Case
+	finishedAt time.Time
+}
+
+func startTUNWorkload(ctx context.Context, fn func(context.Context) report.Case) (<-chan tunWorkloadCompletion, <-chan struct{}) {
+	completed := make(chan tunWorkloadCompletion, 1)
+	done := make(chan struct{})
+	go func() {
+		result := invokeTUNWorkload(ctx, fn)
+		finishedAt := time.Now()
+		close(done)
+		completed <- tunWorkloadCompletion{result: result, finishedAt: finishedAt}
+	}()
+	return completed, done
+}
+
+func invokeTUNWorkload(ctx context.Context, fn func(context.Context) report.Case) (result report.Case) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = report.Case{Failure: fmt.Sprintf("runner panic: %v", recovered)}
+		}
+	}()
+	if fn == nil {
+		return report.Case{Failure: "runner panic: nil workload"}
+	}
+	return fn(ctx)
+}
+
+func appendT4StopFailure(rc *report.Case, budget time.Duration, stopErr error) {
+	if rc == nil || stopErr == nil {
+		return
+	}
+	stopFailure := fmt.Sprintf("case canceled during T4 execution: %v", stopErr)
+	if errors.Is(stopErr, context.DeadlineExceeded) {
+		stopFailure = fmt.Sprintf("case exceeded T4 budget %s: %v", budget, stopErr)
+	}
+	if rc.Failure == "" {
+		rc.Failure = stopFailure
+	} else {
+		rc.Failure = stopFailure + ": " + rc.Failure
+	}
+}
+
+func finalizeTUNCleanup(rc *report.Case, cleanup *tunCleanup, workloadDone <-chan struct{}, canceledAt time.Time, timing tunTeardownTiming) {
+	workloadJoined := waitForTUNWorkload(workloadDone, canceledAt.Add(timing.cleanupStartDelay))
+	cleanup.Start()
+	cleanupErr, cleanupJoined := cleanup.Wait(timing.cleanupWait)
+	ensureTUNEvidence(rc)[tunCleanupLimitEvidence] = timing.cleanupWait.String()
+	switch {
+	case !cleanupJoined:
+		ensureTUNEvidence(rc)[tunCleanupStateEvidence] = tunCleanupStateUnjoined
+		appendTUNUnsafe(rc, fmt.Sprintf("chaos cleanup did not return within %s", timing.cleanupWait))
+	case cleanupErr != nil:
+		ensureTUNEvidence(rc)[tunCleanupStateEvidence] = tunCleanupStateFailed
+		appendTUNUnsafe(rc, "chaos cleanup failed: "+cleanupErr.Error())
+	default:
+		ensureTUNEvidence(rc)[tunCleanupStateEvidence] = tunCleanupStateComplete
+	}
+
+	if !workloadJoined {
+		workloadJoined = waitForTUNWorkload(workloadDone, canceledAt.Add(timing.quiesceWait))
+	}
+	if !workloadJoined {
+		appendTUNUnsafe(rc, fmt.Sprintf("canceled workload did not return within bounded teardown grace %s; Go cannot terminate it, so the regress process must exit before any later case runs", timing.quiesceWait))
+	}
+}
+
+func waitForTUNWorkload(done <-chan struct{}, deadline time.Time) bool {
+	if tunChannelClosed(done) {
+		return true
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return tunChannelClosed(done)
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return tunChannelClosed(done)
+	}
+}
+
+func tunChannelClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureTUNEvidence(rc *report.Case) map[string]string {
+	if rc.Evidence == nil {
+		rc.Evidence = make(map[string]string)
+	}
+	return rc.Evidence
+}
+
+func appendTUNUnsafe(rc *report.Case, reason string) {
+	if rc == nil || reason == "" {
+		return
+	}
+	evidence := ensureTUNEvidence(rc)
+	for _, existing := range strings.Split(evidence[tunTeardownUnsafeEvidence], "; ") {
+		if existing == reason {
+			return
+		}
+	}
+	if evidence[tunTeardownUnsafeEvidence] == "" {
+		evidence[tunTeardownUnsafeEvidence] = reason
+	} else {
+		evidence[tunTeardownUnsafeEvidence] += "; " + reason
+	}
+}
+
+func enforceTUNCleanupCase(rc *report.Case) bool {
+	if rc == nil || rc.Evidence == nil {
+		return false
+	}
+	reason := rc.Evidence[tunTeardownUnsafeEvidence]
+	if reason == "" {
+		return false
+	}
+	markTUNChaosInvalid(rc, reason)
+	return true
+}
+
+func enforceTUNCleanupOutcome(outcome *caseexec.Outcome) {
+	if outcome != nil && enforceTUNCleanupCase(&outcome.Case) {
+		outcome.MustStop = true
+	}
 }
 
 func applyT4CleanupResult(rc *report.Case, cleanup func() error) {
 	if rc == nil || cleanup == nil {
 		return
 	}
-	if err := cleanup(); err != nil {
+	if err := invokeTUNCleanup(cleanup); err != nil {
 		markTUNChaosInvalid(rc, "chaos cleanup failed: "+err.Error())
 	}
 }
@@ -556,8 +853,15 @@ func markTUNChaosInvalid(rc *report.Case, reason string) {
 		if rc.Evidence == nil {
 			rc.Evidence = make(map[string]string)
 		}
-		rc.Evidence["untrusted_case_failure"] = rc.Failure
+		if existing := rc.Evidence["untrusted_case_failure"]; existing == "" {
+			rc.Evidence["untrusted_case_failure"] = rc.Failure
+		} else if existing != rc.Failure {
+			rc.Evidence["untrusted_teardown_failure"] = rc.Failure
+		}
 		rc.Failure = ""
+	}
+	if rc.InvalidReason == reason || strings.HasSuffix(rc.InvalidReason, "; "+reason) {
+		return
 	}
 	for _, existing := range strings.Split(rc.InvalidReason, "; ") {
 		if existing == reason {

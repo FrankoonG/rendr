@@ -139,19 +139,28 @@ func RunUDPRelay(ctx context.Context, opts UDPRelayOpts) Result {
 
 	admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
 	migrateAt := migrationPoints(opts.Packets, opts.Migrations)
+	inflightMigrations := 0
 	for i := 0; i < opts.Packets; i++ {
 		payload := []byte(fmt.Sprintf("udp-relay-packet-%04d", i))
-		if err := relayRoundTrip(app, clientRelay.LocalAddr(), payload); err != nil {
-			return FromError(name, time.Since(t0), fmt.Errorf("packet %d: %w", i, err))
-		}
+		var beforeReceive func() error
 		if _, ok := migrateAt[i]; ok {
-			if err := migrateRelay(admin); err != nil {
-				return FromError(name, time.Since(t0), fmt.Errorf("migrate: %w", err))
+			beforeReceive = func() error {
+				if err := migrateRelay(admin); err != nil {
+					return fmt.Errorf("migrate: %w", err)
+				}
+				inflightMigrations++
+				return nil
 			}
+		}
+		if err := relayRoundTrip(app, clientRelay.LocalAddr(), payload, beforeReceive); err != nil {
+			return FromError(name, time.Since(t0), fmt.Errorf("packet %d: %w", i, err))
 		}
 	}
 	if got := admin.MigrationCount(); got < uint64(opts.Migrations) {
 		return FromError(name, time.Since(t0), fmt.Errorf("migration count=%d want >=%d", got, opts.Migrations))
+	}
+	if inflightMigrations != opts.Migrations {
+		return FromError(name, time.Since(t0), fmt.Errorf("inflight migrations=%d want exactly %d", inflightMigrations, opts.Migrations))
 	}
 
 	elapsed := time.Since(t0)
@@ -159,13 +168,15 @@ func RunUDPRelay(ctx context.Context, opts UDPRelayOpts) Result {
 		Name:     name,
 		Duration: elapsed,
 		Detail: map[string]any{
-			"packets":         opts.Packets,
-			"paths":           opts.Paths,
-			"requested_migs":  opts.Migrations,
-			"server":          opts.Server,
-			"migration_count": admin.MigrationCount(),
-			"elapsed_seconds": elapsed.Seconds(),
-			"packets_per_sec": float64(opts.Packets) / elapsed.Seconds(),
+			"packets":                      opts.Packets,
+			"paths":                        opts.Paths,
+			"requested_migs":               opts.Migrations,
+			"expected_inflight_migrations": opts.Migrations,
+			"inflight_migrations":          inflightMigrations,
+			"server":                       opts.Server,
+			"migration_count":              admin.MigrationCount(),
+			"elapsed_seconds":              elapsed.Seconds(),
+			"packets_per_sec":              float64(opts.Packets) / elapsed.Seconds(),
 		},
 	}
 }
@@ -244,6 +255,7 @@ func RunUDPRelayPortHop(ctx context.Context, opts UDPRelayOpts) Result {
 	migrateAt := migrationPoints(opts.Packets, opts.Migrations)
 	hopAt := migrationPoints(opts.Packets, opts.PortHops)
 	hopsDone := 0
+	inflightMigrations := 0
 	for i := 0; i < opts.Packets; i++ {
 		if _, ok := hopAt[i]; ok && i > 0 {
 			_ = app.Close()
@@ -256,17 +268,25 @@ func RunUDPRelayPortHop(ctx context.Context, opts UDPRelayOpts) Result {
 			hopsDone++
 		}
 		payload := []byte(fmt.Sprintf("udp-relay-porthop-%04d-from-%s", i, app.LocalAddr()))
-		if err := relayRoundTrip(app, clientRelay.LocalAddr(), payload); err != nil {
-			return FromError(name, time.Since(t0), fmt.Errorf("packet %d: %w", i, err))
-		}
+		var beforeReceive func() error
 		if _, ok := migrateAt[i]; ok {
-			if err := migrateRelay(admin); err != nil {
-				return FromError(name, time.Since(t0), fmt.Errorf("migrate: %w", err))
+			beforeReceive = func() error {
+				if err := migrateRelay(admin); err != nil {
+					return fmt.Errorf("migrate: %w", err)
+				}
+				inflightMigrations++
+				return nil
 			}
+		}
+		if err := relayRoundTrip(app, clientRelay.LocalAddr(), payload, beforeReceive); err != nil {
+			return FromError(name, time.Since(t0), fmt.Errorf("packet %d: %w", i, err))
 		}
 	}
 	if got := admin.MigrationCount(); got < uint64(opts.Migrations) {
 		return FromError(name, time.Since(t0), fmt.Errorf("migration count=%d want >=%d", got, opts.Migrations))
+	}
+	if inflightMigrations != opts.Migrations {
+		return FromError(name, time.Since(t0), fmt.Errorf("inflight migrations=%d want exactly %d", inflightMigrations, opts.Migrations))
 	}
 	if hopsDone < opts.PortHops {
 		return FromError(name, time.Since(t0), fmt.Errorf("port hops=%d want >=%d", hopsDone, opts.PortHops))
@@ -280,14 +300,16 @@ func RunUDPRelayPortHop(ctx context.Context, opts UDPRelayOpts) Result {
 		Name:     name,
 		Duration: elapsed,
 		Detail: map[string]any{
-			"packets":         opts.Packets,
-			"paths":           opts.Paths,
-			"requested_migs":  opts.Migrations,
-			"migration_count": admin.MigrationCount(),
-			"port_hops":       hopsDone,
-			"unique_ports":    len(seenPorts),
-			"elapsed_seconds": elapsed.Seconds(),
-			"packets_per_sec": float64(opts.Packets) / elapsed.Seconds(),
+			"packets":                      opts.Packets,
+			"paths":                        opts.Paths,
+			"requested_migs":               opts.Migrations,
+			"expected_inflight_migrations": opts.Migrations,
+			"inflight_migrations":          inflightMigrations,
+			"migration_count":              admin.MigrationCount(),
+			"port_hops":                    hopsDone,
+			"unique_ports":                 len(seenPorts),
+			"elapsed_seconds":              elapsed.Seconds(),
+			"packets_per_sec":              float64(opts.Packets) / elapsed.Seconds(),
 		},
 	}
 }
@@ -350,9 +372,14 @@ func waitServerRelay(client rendr.PacketConn, server *udprelay.Server, wantPaths
 	return fmt.Errorf("server relays=%d client paths=%d want relays>=1 paths>=%d", server.Relays(), len(ca.Paths()), wantPaths)
 }
 
-func relayRoundTrip(app net.PacketConn, relayAddr net.Addr, payload []byte) error {
+func relayRoundTrip(app net.PacketConn, relayAddr net.Addr, payload []byte, beforeReceive func() error) error {
 	if _, err := app.WriteTo(payload, relayAddr); err != nil {
 		return err
+	}
+	if beforeReceive != nil {
+		if err := beforeReceive(); err != nil {
+			return err
+		}
 	}
 	if err := app.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return err

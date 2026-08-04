@@ -27,7 +27,7 @@ type caseDef struct {
 
 var caseDefs = []caseDef{
 	{
-		spec: manifest.RequiredWithBudget("T6.graph.compat-mode", "T6", 2*time.Minute),
+		spec: mustCaseSpec("T6.graph.compat-mode", 2*time.Minute),
 		expected: []string{
 			"TestLegacyRootTargetCompilesModes",
 			"TestTargetConstructorsExposeGroupKinds",
@@ -35,15 +35,15 @@ var caseDefs = []caseDef{
 			"TestDialerRootSelectorDialSmoke",
 		},
 	},
-	{manifest.RequiredWithBudget("T6.peak.A-to-bulk-bond", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferRuntimePromotesToBond"}},
-	{manifest.RequiredWithBudget("T6.peak.nested-normal-to-C", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferNormalSelectorUsesQuality"}},
-	{manifest.RequiredWithBudget("T6.failover.hot-standby", "T6", 2*time.Minute), []string{"TestSelectorHotStandbyFailover"}},
-	{manifest.RequiredWithBudget("T6.peak.composite-normal", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferCompositeNormalDeathStaysNormal"}},
-	{manifest.RequiredWithBudget("T6.peak.bad-speed", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferBadSpeedQualityGate"}},
-	{manifest.RequiredWithBudget("T6.peak.stale-speed", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferStaleSpeedEvidence"}},
-	{manifest.RequiredWithBudget("T6.peak.probe-budget", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate"}},
-	{manifest.RequiredWithBudget("T6.peak.slow-peak-revert", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferSlowPeakRevertsAndSuppresses"}},
-	{manifest.RequiredWithBudget("T6.peak.rx-peer-policy", "T6", 2*time.Minute), []string{"TestSelectorPeakTransferRxPromotesPeerSenderOnly"}},
+	{mustCaseSpec("T6.peak.A-to-bulk-bond", 2*time.Minute), []string{"TestSelectorPeakTransferRuntimePromotesToBond"}},
+	{mustCaseSpec("T6.peak.nested-normal-to-C", 2*time.Minute), []string{"TestSelectorPeakTransferNormalSelectorUsesQuality"}},
+	{mustCaseSpec("T6.failover.hot-standby", 2*time.Minute), []string{"TestSelectorHotStandbyFailover"}},
+	{mustCaseSpec("T6.peak.composite-normal", 2*time.Minute), []string{"TestSelectorPeakTransferCompositeNormalDeathStaysNormal"}},
+	{mustCaseSpec("T6.peak.bad-speed", 2*time.Minute), []string{"TestSelectorPeakTransferBadSpeedQualityGate"}},
+	{mustCaseSpec("T6.peak.stale-speed", 2*time.Minute), []string{"TestSelectorPeakTransferStaleSpeedEvidence"}},
+	{mustCaseSpec("T6.peak.probe-budget", 2*time.Minute), []string{"TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate"}},
+	{mustCaseSpec("T6.peak.slow-peak-revert", 2*time.Minute), []string{"TestSelectorPeakTransferSlowPeakRevertsAndSuppresses"}},
+	{mustCaseSpec("T6.peak.rx-peer-policy", 2*time.Minute), []string{"TestSelectorPeakTransferRxPromotesPeerSenderOnly"}},
 }
 
 // Specs returns the ordered T6 case manifest.
@@ -143,9 +143,12 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

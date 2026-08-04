@@ -51,10 +51,10 @@ type caseDef struct {
 }
 
 var caseDefs = []caseDef{
-	{spec: manifest.RequiredWithBudget("G1-smoke", "T2", streamSmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G1-smoke", "T2", streamSmokeBudget), tier2ManifestContract("G1-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG1(ctx, smoke.G1Opts{Migrations: g1SmokeMigrations})
 	}},
-	{spec: manifest.RequiredWithBudget("G1-mixed-tcp-quic-smoke", "T2", streamSmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G1-mixed-tcp-quic-smoke", "T2", streamSmokeBudget), tier2ManifestContract("G1-mixed-tcp-quic-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG1(ctx, smoke.G1Opts{
 			Size:       8 << 20,
 			Migrations: 1,
@@ -64,7 +64,7 @@ var caseDefs = []caseDef{
 			},
 		})
 	}},
-	{spec: manifest.RequiredWithBudget("G2-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G2-smoke", "T2", g2SmokeBudget), tier2ManifestContract("G2-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{Migrations: g2SmokeMigrations})
 	}},
 	// Matrix coverage at smoke scale: race + bond modes on TCP.
@@ -72,20 +72,20 @@ var caseDefs = []caseDef{
 	// are semantically moot — set Migrations=-1 to skip the
 	// "migrations actually fired" assertion. Bond keeps the
 	// default migration cadence to exercise active-path swap.
-	{spec: manifest.RequiredWithBudget("G2-race-tcp-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G2-race-tcp-smoke", "T2", g2SmokeBudget), tier2ManifestContract("G2-race-tcp-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{
 			Mode:       rendr.ModeRace,
 			Migrations: g2RaceSmokeMigrations,
 		})
 	}},
-	{spec: manifest.RequiredWithBudget("G2-bond-tcp-smoke", "T2", g2SmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G2-bond-tcp-smoke", "T2", g2SmokeBudget), tier2ManifestContract("G2-bond-tcp-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG2(ctx, smoke.G2Opts{Mode: rendr.ModeBond, Migrations: g2SmokeMigrations})
 	}},
 	{
 		// This preserves the historical CaseID as a QUIC DATAGRAM smoke.
 		// It is not RFC 9000 CID/NAT-rebinding Gold evidence; V1-M1 still
 		// requires a replacement case with an external CID migration oracle.
-		spec:       manifest.RequiredWithBudget("G3-smoke", "T2", g3SmokeBudget),
+		spec:       mustManifestSpec(manifest.RequiredWithBudget("G3-smoke", "T2", g3SmokeBudget), tier2ManifestContract("G3-smoke")),
 		onlyOn:     "linux",
 		skipReason: "Linux only (sysctl net.core.rmem_max=8MiB for 30k pps QUIC DATAGRAM)",
 		run: func(ctx context.Context) smoke.Result {
@@ -94,16 +94,16 @@ var caseDefs = []caseDef{
 			return smoke.RunG3(ctx, smoke.G3Opts{LossPct: g3SmokeLossPct})
 		},
 	},
-	{spec: manifest.RequiredWithBudget("G4", "T2", g4G5SmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G4", "T2", g4G5SmokeBudget), tier2ManifestContract("G4")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG4(ctx, smoke.G4Opts{})
 	}},
-	{spec: manifest.RequiredWithBudget("G5", "T2", g4G5SmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("G5", "T2", g4G5SmokeBudget), tier2ManifestContract("G5")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunG5(ctx, smoke.G5Opts{})
 	}},
-	{spec: manifest.RequiredWithBudget("M11-udp-relay-smoke", "T2", relaySmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("M11-udp-relay-smoke", "T2", relaySmokeBudget), tier2ManifestContract("M11-udp-relay-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunUDPRelay(ctx, smoke.UDPRelayOpts{})
 	}},
-	{spec: manifest.RequiredWithBudget("M11-udp-relay-porthop-smoke", "T2", relaySmokeBudget), run: func(ctx context.Context) smoke.Result {
+	{spec: mustManifestSpec(manifest.RequiredWithBudget("M11-udp-relay-porthop-smoke", "T2", relaySmokeBudget), tier2ManifestContract("M11-udp-relay-porthop-smoke")), run: func(ctx context.Context) smoke.Result {
 		return smoke.RunUDPRelayPortHop(ctx, smoke.UDPRelayOpts{
 			Packets:    128,
 			Paths:      2,
@@ -227,9 +227,12 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

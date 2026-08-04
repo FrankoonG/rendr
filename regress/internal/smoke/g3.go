@@ -566,7 +566,20 @@ sendLoop:
 		pathWriters:        pathWriters,
 		wireWrites:         wireWrites,
 	})
+	r.InvalidReason = requireG3UDPStatsEvidence(r.InvalidReason, detail["udp_snmp_status"])
 	return r
+}
+
+func requireG3UDPStatsEvidence(existing string, statusValue any) string {
+	status := fmt.Sprint(statusValue)
+	if status == g3UDPStatsOK {
+		return existing
+	}
+	reason := "UDP SNMP evidence is not usable: status=" + status
+	if existing == "" {
+		return reason
+	}
+	return existing + "; " + reason
 }
 
 // paceUntil smooths the sender cadence for sub-millisecond packet

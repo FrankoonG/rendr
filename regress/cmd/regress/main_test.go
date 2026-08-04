@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,7 +125,8 @@ func TestPrepareCommandResolvesCanonicalCaseSuite(t *testing.T) {
 	if _, err := resolveCommandSuite(runFlags{caseID: exactID}, ambiguous, tunCases); err == nil || !strings.Contains(err.Error(), "globally ambiguous") {
 		t.Fatalf("ambiguous executable CaseID err=%v", err)
 	}
-	selectorCollision := []manifest.Spec{manifest.RequiredWithBudget("TUN-full.T4-long-run", "T1", time.Second)}
+	selectorCollision := catalog.NormalFull()[:1]
+	selectorCollision[0].ID = "TUN-full.T4-long-run"
 	if err := validateGlobalCatalogNames(selectorCollision, tunCases); err == nil || !strings.Contains(err.Error(), "TUN selector") {
 		t.Fatalf("selector/executable collision err=%v", err)
 	}
@@ -143,6 +145,7 @@ func TestPrepareCommandRejectsConflictsAndOutOfScopeFilters(t *testing.T) {
 		{name: "tun and tier", cfg: runFlags{tunFull: true, tier: "7"}, want: "cannot be combined"},
 		{name: "phase one force", cfg: runFlags{phase: "1", forcePhase2: true}, want: "cannot be combined"},
 		{name: "list force", cfg: runFlags{list: true, forcePhase2: true}, want: "cannot be combined"},
+		{name: "list unproven", cfg: runFlags{list: true, allowUnprovenContracts: true}, want: "cannot be combined"},
 		{name: "legacy profile", cfg: runFlags{profile: "PYS-D-1"}, want: "not supported"},
 		{name: "full and tier", cfg: runFlags{full: true, tier: "4"}, want: "cannot be combined"},
 		{name: "full and exact case", cfg: runFlags{full: true, caseID: "go-test"}, want: "--full cannot be combined"},
@@ -223,7 +226,7 @@ func TestPartialPhaseOneCannotMintGreenGate(t *testing.T) {
 func TestBuildPhase1StateUsesExactRendrRoot(t *testing.T) {
 	wantRoot := `E:\exact\rendr-root`
 	wantTime := time.Unix(123, 456)
-	state, err := buildPhase1State(wantRoot, "green", wantTime, func(gotRoot string) (gate.Revision, error) {
+	state, err := buildPhase1State(wantRoot, "red", wantTime, func(gotRoot string) (gate.Revision, error) {
 		if gotRoot != wantRoot {
 			t.Fatalf("CurrentRevision root=%q want %q", gotRoot, wantRoot)
 		}
@@ -232,12 +235,12 @@ func TestBuildPhase1StateUsesExactRendrRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := gate.State{CommitSHA: "commit", WorktreeSHA: "worktree", Status: "green", At: wantTime}
+	want := gate.State{SchemaVersion: gate.StateSchemaVersion, CommitSHA: "commit", WorktreeSHA: "worktree", Status: "red", At: wantTime}
 	if !reflect.DeepEqual(state, want) {
 		t.Fatalf("state=%+v want %+v", state, want)
 	}
 
-	_, err = buildPhase1State(wantRoot, "green", wantTime, func(string) (gate.Revision, error) {
+	_, err = buildPhase1State(wantRoot, "red", wantTime, func(string) (gate.Revision, error) {
 		return gate.Revision{}, errors.New("revision failed")
 	})
 	if err == nil || !strings.Contains(err.Error(), "revision failed") {
@@ -330,7 +333,7 @@ func TestBeginInvocationFailsClosedWhenEnvironmentCaptureFails(t *testing.T) {
 		func(context.Context) (environment.Snapshot, error) {
 			return environment.Snapshot{}, errors.New("mandatory source unavailable")
 		},
-		writeReports,
+		newTestReportStore(t, dir),
 	)
 	if err == nil || !strings.Contains(err.Error(), "mandatory source unavailable") {
 		t.Fatalf("begin invocation error = %v", err)
@@ -374,7 +377,7 @@ func TestBeginInvocationInvalidatesStaleFixedPassReports(t *testing.T) {
 			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
 		},
 		captureTestEnvironment,
-		writeReports,
+		newTestReportStore(t, dir),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -422,14 +425,17 @@ func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
 			return gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, nil
 		},
 		captureTestEnvironment,
-		func(*report.Suite, string) error {
-			writerCalled = true
-			for _, name := range []string{junitReportFileName, markdownReportFileName, jsonReportFileName} {
-				if _, statErr := os.Stat(filepath.Join(dir, name)); !errors.Is(statErr, os.ErrNotExist) {
-					t.Fatalf("stale %s still exists before replacement write: %v", name, statErr)
+		invocationReportStore{
+			invalidate: newTestReportStore(t, dir).invalidate,
+			publish: func(context.Context, *report.Suite) error {
+				writerCalled = true
+				for _, name := range []string{junitReportFileName, markdownReportFileName, jsonReportFileName} {
+					if _, statErr := os.Stat(filepath.Join(dir, name)); !errors.Is(statErr, os.ErrNotExist) {
+						t.Fatalf("stale %s still exists before replacement write: %v", name, statErr)
+					}
 				}
-			}
-			return errors.New("synthetic writer failure")
+				return errors.New("synthetic writer failure")
+			},
 		},
 	)
 	if !writerCalled || err == nil || !strings.Contains(err.Error(), "synthetic writer failure") {
@@ -444,7 +450,7 @@ func TestBeginInvocationRemovesStalePassBeforeWritingReplacement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blockedSummary, "keep"), []byte("block replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeReports(report.New(), blockedDir); err == nil || !strings.Contains(err.Error(), "write summary") {
+	if err := writeReports(report.New(), blockedDir); err == nil {
 		t.Fatalf("companion report failure=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(blockedDir, jsonReportFileName)); !errors.Is(err, os.ErrNotExist) {
@@ -568,7 +574,7 @@ func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := runFlags{fromCaseID: "go-test", allowNonLinux: true, reportDir: reportDir, rendrRoot: root}
+	cfg := runFlags{fromCaseID: "go-test", allowNonLinux: true, allowUnprovenContracts: true, reportDir: reportDir, rendrRoot: root}
 	var stdout, stderr bytes.Buffer
 	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitPhase1Stale {
 		t.Fatalf("code=%d want %d stderr=%s stdout=%s", code, exitPhase1Stale, stderr.String(), stdout.String())
@@ -579,30 +585,36 @@ func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) 
 	if !strings.Contains(stderr.String(), "phase 2 not allowed") {
 		t.Fatalf("missing gate diagnostic:\n%s", stderr.String())
 	}
-	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{`state="fail"`, `complete="false"`, `invocation_scope="from-case"`, `invocation_from_case="go-test"`, "phase 2 gate rejected invocation"} {
-		if !strings.Contains(string(junit), want) {
-			t.Fatalf("resume JUnit missing %q:\n%s", want, junit)
-		}
+	if _, err := os.Stat(filepath.Join(reportDir, junitReportFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("gate rejection overwrote phase-1 evidence: %v", err)
 	}
 
 	greenDir := t.TempDir()
-	greenState, err := buildPhase1State(root, "green", time.Now(), gate.CurrentRevision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := gate.Write(greenDir, greenState); err != nil {
-		t.Fatal(err)
-	}
+	writeSyntheticGreenPhase1Gate(t, greenDir, root)
 	greenCfg := cfg
 	greenCfg.reportDir = greenDir
 	stdout.Reset()
 	stderr.Reset()
 	if code := executeNormal(context.Background(), greenCfg, plan, &stdout, &stderr); code != exitOK {
 		t.Fatalf("green-gated code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := executeNormal(context.Background(), greenCfg, plan, &stdout, &stderr); code != exitOK {
+		t.Fatalf("second green-gated resume code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	verifiedResume, err := report.Verify(context.Background(), greenDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateState, err := gate.Read(greenDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := verifiedResume.Report.Invocation.Phase1Authorization
+	if authorization == nil || authorization.ReportSetGeneration != gateState.ReportSetGeneration ||
+		authorization.CanonicalReportDigest != gateState.CanonicalReportDigest {
+		t.Fatalf("phase-2 report authorization=%+v gate=%+v", authorization, gateState)
 	}
 
 	forcedDir := t.TempDir()
@@ -613,6 +625,195 @@ func TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed(t *testing.T) 
 	stderr.Reset()
 	if code := executeNormal(context.Background(), forcedCfg, plan, &stdout, &stderr); code != exitOK {
 		t.Fatalf("forced code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+}
+
+func TestBuildPhase1ProofSuiteProjectsCombinedInvocation(t *testing.T) {
+	first, firstEvidence := syntheticEnforcedSpec(t, "phase1.one", "T1")
+	second, secondEvidence := syntheticEnforcedSpec(t, "phase1.two", "T2")
+	phase2, _ := syntheticEnforcedSpec(t, "phase2.one", "T3")
+	phase1Specs := []manifest.Spec{first, second}
+	combinedSpecs := append(manifest.CloneSpecs(phase1Specs), phase2)
+	identity, err := buildInvocationIdentity(runFlags{full: true}, manifest.SuiteNormal, combinedSpecs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := captureTestLinuxEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := gate.Revision{CommitSHA: "phase1-commit", WorktreeSHA: strings.Repeat("a", 64)}
+	identity.EnvironmentStart = snapshot
+	identity.EnvironmentEnd = snapshot
+	identity.RevisionStart = reportRevision(revision)
+	identity.RevisionEnd = reportRevision(revision)
+	source := report.New()
+	source.Invocation = identity
+	source.Add(report.Case{Name: first.ID, Tier: first.Tier, Evidence: firstEvidence})
+	source.Add(report.Case{Name: second.ID, Tier: second.Tier, Evidence: secondEvidence})
+
+	proof, err := buildPhase1ProofSuite(source, phase1Specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Complete || proof == source || !proof.Complete || proof.Invocation.Scope != "phase-1" || proof.Invocation.Full || len(proof.Cases) != 2 {
+		t.Fatalf("source/proof projection source_complete=%t proof=%+v", source.Complete, proof.Invocation)
+	}
+	document, err := proof.Document()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.State != "pass" {
+		t.Fatalf("phase 1 proof state=%q", document.State)
+	}
+
+	dir := t.TempDir()
+	firstGeneration, err := publishPhase1Proof(context.Background(), dir, proof, phase1Specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGeneration, err := publishPhase1Proof(context.Background(), dir, proof, phase1Specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstGeneration.Manifest.Generation == secondGeneration.Manifest.Generation {
+		t.Fatal("phase 1 proof generations collided")
+	}
+	for _, generation := range []string{firstGeneration.Manifest.Generation, secondGeneration.Manifest.Generation} {
+		if _, err := report.Verify(context.Background(), phase1ProofDir(dir, generation)); err != nil {
+			t.Fatalf("immutable phase 1 generation %s: %v", generation, err)
+		}
+	}
+	state := gate.State{
+		SchemaVersion: gate.StateSchemaVersion, CommitSHA: revision.CommitSHA, WorktreeSHA: revision.WorktreeSHA,
+		ReportSetGeneration: secondGeneration.Manifest.Generation, CanonicalReportDigest: secondGeneration.Manifest.CanonicalReportDigest,
+		Status: "green", At: time.Now(),
+	}
+	if err := validatePhase1Proof(state, secondGeneration, phase1Specs); err != nil {
+		t.Fatalf("canonical phase 1 proof rejected: %v", err)
+	}
+}
+
+func TestValidatePhase1ProofRejectsWrongIdentity(t *testing.T) {
+	dir := t.TempDir()
+	root := newMainTestRepo(t)
+	writeSyntheticGreenPhase1Gate(t, dir, root)
+	state, err := gate.Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := phase1SpecsProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readProof := func(t *testing.T) report.VerifiedSet {
+		t.Helper()
+		verified, err := report.Verify(context.Background(), phase1ProofDir(dir, state.ReportSetGeneration))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verified.Report.Cases = cloneReportCases(verified.Report.Cases)
+		verified.Report.Invocation.SelectedCaseIDs = append([]string(nil), verified.Report.Invocation.SelectedCaseIDs...)
+		verified.Report.Invocation.RequestedCaseIDs = append([]string(nil), verified.Report.Invocation.RequestedCaseIDs...)
+		return verified
+	}
+	if err := validatePhase1Proof(*state, readProof(t), expected); err != nil {
+		t.Fatalf("valid proof rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*report.VerifiedSet)
+	}{
+		{name: "schema downgrade", mutate: func(v *report.VerifiedSet) { v.Report.Invocation.SchemaVersion-- }},
+		{name: "wrong scope", mutate: func(v *report.VerifiedSet) { v.Report.Invocation.Scope = "exact" }},
+		{name: "forced", mutate: func(v *report.VerifiedSet) { v.Report.Invocation.Forced = true }},
+		{name: "wrong catalog", mutate: func(v *report.VerifiedSet) { v.Report.Invocation.CatalogDigest = "sha256:" + strings.Repeat("f", 64) }},
+		{name: "wrong revision", mutate: func(v *report.VerifiedSet) { v.Report.Invocation.RevisionEnd.CommitSHA = "other" }},
+		{name: "partial selected IDs", mutate: func(v *report.VerifiedSet) {
+			v.Report.Invocation.SelectedCaseIDs = v.Report.Invocation.SelectedCaseIDs[:1]
+		}},
+		{name: "wrong case digest", mutate: func(v *report.VerifiedSet) { v.Report.Cases[0].CaseDigest = "sha256:" + strings.Repeat("e", 64) }},
+		{name: "self-attested blocked contract", mutate: func(v *report.VerifiedSet) {
+			v.Report.Cases[0].Evidence[report.EvidenceContractStateKey] = string(manifest.ContractStateBlocked)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verified := readProof(t)
+			tt.mutate(&verified)
+			if err := validatePhase1Proof(*state, verified, expected); err == nil {
+				t.Fatal("malformed phase 1 proof was accepted")
+			}
+		})
+	}
+}
+
+func TestVerifyFinalPhase1AuthorizationRejectsMissingOrWrongLineage(t *testing.T) {
+	dir := t.TempDir()
+	root := newMainTestRepo(t)
+	writeSyntheticGreenPhase1Gate(t, dir, root)
+	authorization, err := verifyPhase1Gate(context.Background(), dir, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := runFlags{reportDir: dir, rendrRoot: root}
+	suite := report.New()
+	suite.Invocation.Phase1Authorization = &authorization
+	if err := verifyFinalPhase1Authorization(context.Background(), cfg, suite); err != nil {
+		t.Fatalf("valid lineage rejected: %v", err)
+	}
+	suite.Invocation.Phase1Authorization = nil
+	if err := verifyFinalPhase1Authorization(context.Background(), cfg, suite); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing lineage error=%v", err)
+	}
+	wrong := authorization
+	wrong.ReportSetGeneration = strings.Repeat("f", 32)
+	suite.Invocation.Phase1Authorization = &wrong
+	if err := verifyFinalPhase1Authorization(context.Background(), cfg, suite); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("wrong lineage error=%v", err)
+	}
+}
+
+func TestExecuteNormalFinalAuthorizationFailureReplacesPassingReport(t *testing.T) {
+	dir := t.TempDir()
+	root := newMainTestRepo(t)
+	writeSyntheticGreenPhase1Gate(t, dir, root)
+	plan, err := runplan.Build(runplan.Request{Case: "T5.4-gvisor-unprivileged"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := tierCommands["T5"]
+	command := original
+	command.run = func(_ context.Context, suite *report.Suite, _ string, _ tierSelection) {
+		spec, ok := findManifestSpec(catalog.ByTier("T5"), "T5.4-gvisor-unprivileged")
+		if !ok {
+			t.Fatal("T5.4 spec is missing")
+		}
+		suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier, Evidence: syntheticContractEvidence(spec)})
+		state, err := gate.Read(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(phase1ProofDir(dir, state.ReportSetGeneration)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tierCommands["T5"] = command
+	t.Cleanup(func() { tierCommands["T5"] = original })
+	cfg := runFlags{
+		caseID: "T5.4-gvisor-unprivileged", allowNonLinux: true, allowUnprovenContracts: true,
+		rendrRoot: root, reportDir: dir,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitPhase1Stale {
+		t.Fatalf("code=%d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	verified, err := report.Verify(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Report.State != "fail" || verified.Report.Complete || !strings.Contains(verified.Report.RunFailure, "final phase 1 authorization") {
+		t.Fatalf("persisted final authorization failure=%+v", verified.Report)
 	}
 }
 
@@ -634,7 +835,7 @@ func TestExecuteNormalRevisionDriftFailsAndPersistsEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := runFlags{caseID: "go-vet", reportDir: reportDir, rendrRoot: root}
+	cfg := runFlags{caseID: "go-vet", allowUnprovenContracts: true, reportDir: reportDir, rendrRoot: root}
 	var stdout, stderr bytes.Buffer
 	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitPhase1Stale {
 		t.Fatalf("code=%d want %d stderr=%s", code, exitPhase1Stale, stderr.String())
@@ -671,16 +872,23 @@ func TestExecuteNormalExitFollowsFinalizedReportValidity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := runFlags{
+	var preflightOut, preflightErr bytes.Buffer
+	if code := executeNormal(context.Background(), runFlags{
 		caseID: "go-vet", allowNonLinux: true,
+		reportDir: t.TempDir(), rendrRoot: root,
+	}, plan, &preflightOut, &preflightErr); code != exitEnvError || !strings.Contains(preflightErr.String(), "--allow-unproven-contracts") {
+		t.Fatalf("unproven preflight code=%d stderr=%s stdout=%s", code, preflightErr.String(), preflightOut.String())
+	}
+	cfg := runFlags{
+		caseID: "go-vet", allowNonLinux: true, allowUnprovenContracts: true,
 		reportDir: reportDir, rendrRoot: root,
 	}
 	var stdout, stderr bytes.Buffer
-	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitEnvError {
-		t.Fatalf("code=%d want %d stderr=%s stdout=%s", code, exitEnvError, stderr.String(), stdout.String())
+	if code := executeNormal(context.Background(), cfg, plan, &stdout, &stderr); code != exitT1Fail {
+		t.Fatalf("code=%d want %d stderr=%s stdout=%s", code, exitT1Fail, stderr.String(), stdout.String())
 	}
-	if !strings.Contains(stderr.String(), `finalized report state is "fail"`) {
-		t.Fatalf("missing finalized-report diagnostic: %s", stderr.String())
+	if !strings.Contains(stderr.String(), `T1: FAILED`) {
+		t.Fatalf("missing harness-failure diagnostic: %s", stderr.String())
 	}
 	junit, err := os.ReadFile(filepath.Join(reportDir, junitReportFileName))
 	if err != nil {
@@ -690,12 +898,23 @@ func TestExecuteNormalExitFollowsFinalizedReportValidity(t *testing.T) {
 		t.Fatalf("unexpected finalized report:\n%s", junit)
 	}
 
+	partialSpec := catalog.NormalFull()[0]
+	partialIdentity, err := buildInvocationIdentity(runFlags{caseID: partialSpec.ID, allowNonLinux: true}, manifest.SuiteNormal, []manifest.Spec{partialSpec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialIdentity.EnvironmentStart, err = captureTestEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialIdentity.RevisionStart = report.Revision{CommitSHA: "partial-commit", WorktreeSHA: "partial-tree"}
 	partial := report.New()
+	partial.Invocation = partialIdentity
 	partialDir := t.TempDir()
 	if err := writeReports(partial, partialDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := requirePassingFinalReport(partialDir, partial); err == nil || !strings.Contains(err.Error(), "incomplete") {
+	if err := requirePassingFinalReport(partialDir, partial, []manifest.Spec{partialSpec}); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("partial final report err=%v", err)
 	}
 }
@@ -704,6 +923,10 @@ func TestWriteKnownPhase1GateRejectsMissingIdentity(t *testing.T) {
 	err := writeKnownPhase1Gate(t.TempDir(), gate.Revision{}, "running", time.Now())
 	if err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("err=%v", err)
+	}
+	err = writeKnownPhase1Gate(t.TempDir(), gate.Revision{CommitSHA: "commit", WorktreeSHA: "tree"}, "green", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "report-set generation") {
+		t.Fatalf("green gate without report binding err=%v", err)
 	}
 }
 
@@ -738,11 +961,11 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 	}
 
 	streamCompat := findListedCase(t, selection.cases, "TUN-full.T3-xray-stream-smoke")
-	if streamCompat.DefaultRun || streamCompat.Mandatory || streamCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(streamCompat.ExpandsTo, []string{"TUN-full.T3-xray-matrix"}) {
+	if streamCompat.InDefaultCommand || streamCompat.InSuiteFull || streamCompat.Mandatory || streamCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(streamCompat.ExpandsTo, []string{"TUN-full.T3-xray-matrix"}) {
 		t.Fatalf("stream compatibility entry=%+v", streamCompat)
 	}
 	longCompat := findListedCase(t, selection.cases, "TUN-full.T4-long-run")
-	if longCompat.DefaultRun || longCompat.Kind != tunKindCompatibilitySelector || len(longCompat.ExpandsTo) != 3 {
+	if longCompat.InDefaultCommand || longCompat.InSuiteFull || longCompat.Kind != tunKindCompatibilitySelector || len(longCompat.ExpandsTo) != 3 {
 		t.Fatalf("long-run compatibility entry=%+v", longCompat)
 	}
 
@@ -766,8 +989,11 @@ func TestTUNCatalogMakesCompatibilitySelectorsExplicit(t *testing.T) {
 		t.Fatalf("prime alias selection=%+v err=%v", exact, err)
 	}
 	fallbackCompat := findListedCase(t, selection.cases, "TUN-full.T5-fallback")
-	if fallbackCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(fallbackCompat.ExpandsTo, []string{"TUN-full.T5-adapter-matrix"}) {
+	if fallbackCompat.Kind != tunKindCompatibilityAlias || !reflect.DeepEqual(fallbackCompat.ExpandsTo, []string{"TUN-full.T5-adapter-matrix"}) || fallbackCompat.RetiredReason == "" {
 		t.Fatalf("fallback compatibility entry=%+v", fallbackCompat)
+	}
+	if _, err := tunCatalog.selectCases("", "", "TUN-full.T5-fallback"); err == nil || !strings.Contains(err.Error(), "is retired") {
+		t.Fatalf("retired fallback alias was executable: %v", err)
 	}
 	if _, err := tunCatalog.selectCases("", "TUN-full.T3-xray-stream-smoke", ""); err == nil || !strings.Contains(err.Error(), "use --selector") {
 		t.Fatalf("compatibility selector was accepted as --from-case: %v", err)
@@ -833,9 +1059,10 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 	t.Cleanup(func() { runTUNCase = original })
 	var called []string
 	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, planned tunfull.PlannedCase) {
-		caseID := planned.Spec().ID
+		spec := planned.Spec()
+		caseID := spec.ID
 		called = append(called, caseID)
-		rc := report.Case{Name: caseID, Tier: "T7"}
+		rc := report.Case{Name: caseID, Tier: "T7", Evidence: syntheticContractEvidence(spec)}
 		if caseID != "TUN-full.preflight-kernel-tun" {
 			rc.Failure = "synthetic failure"
 		}
@@ -846,7 +1073,7 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 	reportDir := t.TempDir()
 	cfg := runFlags{
 		tunFull: true, selectorID: "TUN-full.T4-long-run", forcePhase2: true,
-		rendrRoot: root, reportDir: reportDir,
+		allowNonLinux: true, allowUnprovenContracts: true, rendrRoot: root, reportDir: reportDir,
 	}
 	var stdout, stderr bytes.Buffer
 	if code := executeTUN(context.Background(), cfg, selection, &stdout, &stderr); code != exitT7Fail {
@@ -860,10 +1087,11 @@ func testExecuteTUNFailurePreservesOneRowPerExpandedCanonicalCase(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`complete="true"`, `selected_cases="4"`, `invocation_suite="tun-full/synthetic-l3-session"`,
+		`complete="false"`, `selected_cases="4"`, `invocation_suite="tun-full"`,
 		`name="TUN-full.preflight-kernel-tun"`,
 		`name="TUN-full.T4-G1-1GiB-tcp"`, `name="TUN-full.T4-G2-30m-selector"`,
-		`name="TUN-full.T4-G3-100k-pps"`, "not run after TUN-full.T4-G1-1GiB-tcp failed",
+		`name="TUN-full.T4-G3-100k-pps"`, `execution_state="not_run"`,
+		`blocked_by_case_id="TUN-full.T4-G1-1GiB-tcp"`, "blocked by case TUN-full.T4-G1-1GiB-tcp",
 	} {
 		if !strings.Contains(string(junit), want) {
 			t.Fatalf("JUnit missing %q:\n%s", want, junit)
@@ -886,12 +1114,12 @@ func TestExecuteTUNCanonicalResumeProducesMatchingPassingReport(t *testing.T) {
 	t.Cleanup(func() { runTUNCase = original })
 	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, planned tunfull.PlannedCase) {
 		spec := planned.Spec()
-		suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier})
+		suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier, Evidence: syntheticContractEvidence(spec)})
 	}
 
 	reportDir := t.TempDir()
 	cfg := runFlags{
-		fromCaseID: resumeID, forcePhase2: true, allowNonLinux: true,
+		fromCaseID: resumeID, forcePhase2: true, allowNonLinux: true, allowUnprovenContracts: true,
 		rendrRoot: newMainTestRepo(t), reportDir: reportDir,
 	}
 	var stdout, stderr bytes.Buffer
@@ -903,7 +1131,7 @@ func TestExecuteTUNCanonicalResumeProducesMatchingPassingReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`state="pass"`, `invocation_scope="from-case"`,
+		`state="unproven"`, `invocation_scope="from-case"`,
 		`invocation_from_case="` + resumeID + `"`,
 		`invocation_resume_case_id="TUN-full.preflight-kernel-tun"`,
 		`request_anchor="` + resumeID + `"`,
@@ -934,12 +1162,12 @@ func TestExecuteTUNCompatibilitySelectorProducesCanonicalPassingRows(t *testing.
 	t.Cleanup(func() { runTUNCase = original })
 	runTUNCase = func(_ context.Context, suite *report.Suite, _ string, planned tunfull.PlannedCase) {
 		spec := planned.Spec()
-		suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier})
+		suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier, Evidence: syntheticContractEvidence(spec)})
 	}
 
 	reportDir := t.TempDir()
 	cfg := runFlags{
-		selectorID: selectorID, forcePhase2: true, allowNonLinux: true,
+		selectorID: selectorID, forcePhase2: true, allowNonLinux: true, allowUnprovenContracts: true,
 		rendrRoot: newMainTestRepo(t), reportDir: reportDir,
 	}
 	var stdout, stderr bytes.Buffer
@@ -951,7 +1179,7 @@ func TestExecuteTUNCompatibilitySelectorProducesCanonicalPassingRows(t *testing.
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`state="pass"`, `invocation_scope="selector"`,
+		`state="unproven"`, `invocation_scope="selector"`,
 		`invocation_selector="` + selectorID + `"`,
 		`request_anchor="` + selectorID + `"`,
 		`selected_case_ids="[&#34;` + wantRows[0] + `&#34;,&#34;` + wantRows[1] + `&#34;]"`,
@@ -980,11 +1208,27 @@ func TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment(t *testing.T
 	if doc.Catalogs[0].Suite != manifest.SuiteNormal || len(doc.Catalogs[0].Cases) != len(catalog.NormalFull()) {
 		t.Fatalf("normal catalog summary=%+v", doc.Catalogs[0])
 	}
-	if doc.Catalogs[1].Suite != manifest.SuiteTUN || doc.Catalogs[1].EvidenceClass != tunSyntheticEvidenceClass || len(doc.Catalogs[1].Cases) != len(tunfull.Specs())+len(tunfull.Aliases()) {
+	if doc.Catalogs[1].Suite != manifest.SuiteTUN || doc.Catalogs[1].EvidenceClass != tunSyntheticEvidenceClass ||
+		len(doc.Catalogs[1].Cases) != len(tunfull.Specs()) || len(doc.Catalogs[1].Selectors) != len(tunfull.Aliases()) {
 		t.Fatalf("TUN catalog summary=%+v", doc.Catalogs[1])
 	}
-	if !strings.Contains(stdout.String(), `"default_run": false`) {
-		t.Fatal("JSON hides non-default compatibility entries")
+	wantDefault, err := normalDefaultCommandRunOrder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(doc.Catalogs[0].CatalogOrder, manifestIDs(catalog.NormalFull())) ||
+		!reflect.DeepEqual(doc.Catalogs[0].DefaultCommandRunOrder, wantDefault) ||
+		!reflect.DeepEqual(doc.Catalogs[0].SuiteFullRunOrder, manifestIDs(catalog.NormalFull())) ||
+		len(doc.Catalogs[0].SelectedRunOrder) != 0 {
+		t.Fatalf("normal projections=%+v", doc.Catalogs[0])
+	}
+	if len(doc.Catalogs[1].DefaultCommandRunOrder) != 0 ||
+		!reflect.DeepEqual(doc.Catalogs[1].SuiteFullRunOrder, manifestIDs(tunfull.Specs())) ||
+		len(doc.Catalogs[1].SelectedRunOrder) != 0 {
+		t.Fatalf("TUN projections=%+v", doc.Catalogs[1])
+	}
+	if strings.Contains(stdout.String(), `"default_run"`) || !strings.Contains(stdout.String(), `"in_default_command": false`) {
+		t.Fatal("JSON did not replace ambiguous default_run semantics")
 	}
 	if !strings.Contains(stdout.String(), `"requires":`) {
 		t.Fatal("JSON hides executable prerequisite metadata")
@@ -994,12 +1238,13 @@ func TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment(t *testing.T
 		specByID[spec.ID] = spec
 	}
 	for _, listedCatalog := range doc.Catalogs {
+		defaultIDs := make(map[string]bool, len(listedCatalog.DefaultCommandRunOrder))
+		for _, id := range listedCatalog.DefaultCommandRunOrder {
+			defaultIDs[id] = true
+		}
 		for _, listed := range listedCatalog.Cases {
 			if listed.Kind != tunKindCase {
-				if listed.CaseDigest != "" || listed.Contract != nil {
-					t.Fatalf("non-executable selector %q exposes an executable contract: %+v", listed.ID, listed)
-				}
-				continue
+				t.Fatalf("catalog cases contains non-executable entry: %+v", listed)
 			}
 			spec, ok := specByID[listed.ID]
 			if !ok {
@@ -1012,7 +1257,21 @@ func TestListIsMachineReadableAndDoesNotRequireExecutionEnvironment(t *testing.T
 			if listed.CaseDigest != wantDigest {
 				t.Fatalf("listed case %q digest=%q want %q", listed.ID, listed.CaseDigest, wantDigest)
 			}
+			if !listed.InSuiteFull || listed.InDefaultCommand != defaultIDs[listed.ID] {
+				t.Fatalf("listed case %q projection flags=%+v default IDs=%v", listed.ID, listed, listedCatalog.DefaultCommandRunOrder)
+			}
 		}
+		for _, selector := range listedCatalog.Selectors {
+			if selector.Kind != tunKindCompatibilityAlias && selector.Kind != tunKindCompatibilitySelector {
+				t.Fatalf("catalog selectors contains executable entry: %+v", selector)
+			}
+			if selector.CaseDigest != "" || selector.Contract != nil {
+				t.Fatalf("non-executable selector %q exposes an executable contract: %+v", selector.ID, selector)
+			}
+		}
+	}
+	if _, _, err := splitListedCases([]listedCase{{ID: "invalid", Kind: "unknown"}}); err == nil || !strings.Contains(err.Error(), "unsupported kind") {
+		t.Fatalf("unknown listed kind err=%v", err)
 	}
 }
 
@@ -1025,8 +1284,9 @@ func TestScopedListUsesExecutionPlan(t *testing.T) {
 		t.Fatalf("prepared=%+v", prepared)
 	}
 	got := prepared.list.Catalogs[0]
-	if len(got.Cases) != 1 || got.Cases[0].Tier != "T5" || !reflect.DeepEqual(got.RunOrder, []string{"T5.4-gvisor-unprivileged"}) ||
-		!reflect.DeepEqual(got.RequestedCaseIDs, []string{"T5.4-gvisor-unprivileged"}) || got.RequestAnchor != "T5.4-gvisor-unprivileged" {
+	if len(got.Cases) != 1 || got.Cases[0].Tier != "T5" || !reflect.DeepEqual(got.SelectedRunOrder, []string{"T5.4-gvisor-unprivileged"}) ||
+		!reflect.DeepEqual(got.RequestedCaseIDs, []string{"T5.4-gvisor-unprivileged"}) || got.RequestAnchor != "T5.4-gvisor-unprivileged" ||
+		!reflect.DeepEqual(got.CatalogOrder, manifestIDs(catalog.NormalFull())) {
 		t.Fatalf("scoped normal list=%+v", got)
 	}
 
@@ -1035,7 +1295,7 @@ func TestScopedListUsesExecutionPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = prepared.list.Catalogs[0]
-	if len(got.Cases) != 5 || findListedCase(t, got.Cases, "TUN-full.T4-long-run").Kind != tunKindCompatibilitySelector || !reflect.DeepEqual(got.RunOrder, []string{
+	if len(got.Cases) != 4 || len(got.Selectors) != 1 || findListedCase(t, got.Selectors, "TUN-full.T4-long-run").Kind != tunKindCompatibilitySelector || !reflect.DeepEqual(got.SelectedRunOrder, []string{
 		"TUN-full.preflight-kernel-tun",
 		"TUN-full.T4-G1-1GiB-tcp",
 		"TUN-full.T4-G2-30m-selector",
@@ -1131,6 +1391,186 @@ func TestReconcileReportRowsFailsClosed(t *testing.T) {
 	if err := reconcileReportRows(expected, validRows); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("pre-filled wrong case digest err=%v", err)
 	}
+
+	contractedBase := manifest.RequiredWithBudget("contracted", "T1", time.Second)
+	contracted, err := manifest.NewCompleteSpec(contractedBase, manifest.Contract{
+		SchemaVersion: manifest.ContractSchemaVersion,
+		State:         manifest.ContractStateBlocked,
+		MissingDimensions: []manifest.MissingDimension{{
+			Dimension: manifest.ContractDimensionResources,
+			Reason:    "minimum isolated allocation is not calibrated",
+		}},
+		Purpose:          "exercise contract evidence reconciliation",
+		Entrypoint:       "cmd/regress.TestReconcileReportRowsFailsClosed",
+		Topology:         manifest.Topology{Profile: "in-process", Roles: []string{"runner"}, Isolation: "process", PathCount: 0},
+		RoleCapabilities: map[string][]string{"runner": {}},
+		Payload:          manifest.Profile{Applicability: manifest.ApplicabilityNotApplicable},
+		Load:             manifest.Profile{Applicability: manifest.ApplicabilityNotApplicable},
+		Seed:             manifest.SeedPolicy{Mode: manifest.SeedModeNone},
+		Stimulus: manifest.EvidenceProfile{Name: "synthetic-stimulus", Version: 1, Assertions: []manifest.EvidenceAssertion{{
+			Fact: "stimulus_seen", Predicate: manifest.EvidenceEquals, Expected: "true",
+		}}},
+		Oracle: manifest.EvidenceProfile{Name: "synthetic-oracle", Version: 1, Assertions: []manifest.EvidenceAssertion{{
+			Fact: "oracle_passed", Predicate: manifest.EvidenceEquals, Expected: "true",
+		}}},
+		NegativeControl: manifest.NegativeControl{Kind: manifest.NegativeControlEmbedded, EmbeddedID: "missing-evidence"},
+		Resources:       manifest.ResourceBudget{State: manifest.ResourceStateUnfrozen},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundContract := *contracted.Contract
+	requirements, err := boundContract.ClaimEvidenceRequirements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requirement := range requirements {
+		if requirement.ClaimKey == "/topology/path_count" {
+			boundContract.ClaimBindings = []manifest.ClaimEvidenceBinding{requirement.Bind("observed_path_count")}
+			break
+		}
+	}
+	if len(boundContract.ClaimBindings) != 1 {
+		t.Fatal("topology path-count claim requirement was not found")
+	}
+	contracted, err = manifest.NewCompleteSpec(contractedBase, boundContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractRows := []report.Case{{
+		Name: contracted.ID, Tier: contracted.Tier,
+		Evidence: map[string]string{"stimulus_seen": "true", "oracle_passed": "true", "observed_path_count": "0"},
+	}}
+	if err := reconcileReportRows([]manifest.Spec{contracted}, contractRows); err != nil {
+		t.Fatal(err)
+	}
+	if contractRows[0].Evidence["manifest_contract_state"] != string(manifest.ContractStateBlocked) ||
+		!strings.Contains(contractRows[0].Evidence["manifest_contract_missing"], string(manifest.ContractDimensionResources)) {
+		t.Fatalf("contract annotations=%v", contractRows[0].Evidence)
+	}
+	delete(contractRows[0].Evidence, "oracle_passed")
+	if err := reconcileReportRows([]manifest.Spec{contracted}, contractRows); err == nil || !strings.Contains(err.Error(), "oracle_passed") {
+		t.Fatalf("missing required oracle fact err=%v", err)
+	}
+	contractRows[0].Evidence["oracle_passed"] = "false"
+	if err := reconcileReportRows([]manifest.Spec{contracted}, contractRows); err == nil || !strings.Contains(err.Error(), `want "true"`) {
+		t.Fatalf("false oracle fact err=%v", err)
+	}
+	contractRows[0].Evidence["oracle_passed"] = "true"
+	delete(contractRows[0].Evidence, "observed_path_count")
+	if err := reconcileReportRows([]manifest.Spec{contracted}, contractRows); err == nil || !strings.Contains(err.Error(), "/topology/path_count") {
+		t.Fatalf("missing structured claim evidence err=%v", err)
+	}
+
+	trustedFailure := []report.Case{{
+		Name: contracted.ID, Tier: contracted.Tier, Failure: "product failed",
+		Evidence: map[string]string{"stimulus_seen": "true", "observed_path_count": "0"},
+	}}
+	if err := reconcileReportRows([]manifest.Spec{contracted}, trustedFailure); err != nil || trustedFailure[0].Failure == "" || trustedFailure[0].InvalidReason != "" {
+		t.Fatalf("trusted product failure row=%+v err=%v", trustedFailure[0], err)
+	}
+	untrustedFailure := []report.Case{{
+		Name: contracted.ID, Tier: contracted.Tier, Failure: "product failed",
+		Evidence: map[string]string{"stimulus_seen": "false", "observed_path_count": "0"},
+	}}
+	if err := reconcileReportRows([]manifest.Spec{contracted}, untrustedFailure); err != nil || untrustedFailure[0].Failure != "" ||
+		!strings.Contains(untrustedFailure[0].InvalidReason, "lacks valid stimulus evidence") || untrustedFailure[0].Evidence["manifest_reported_failure"] != "product failed" {
+		t.Fatalf("untrusted product failure row=%+v err=%v", untrustedFailure[0], err)
+	}
+	notRun := []report.Case{{
+		Name: contracted.ID, Tier: contracted.Tier, ExecutionState: report.ExecutionStateNotRun,
+		BlockerKind: report.BlockerKindCase, BlockedByCaseID: "previous", InvalidReason: "not run after previous failed",
+	}}
+	if err := reconcileReportRows([]manifest.Spec{contracted}, notRun); err != nil {
+		t.Fatalf("not-run row reconciliation: %v", err)
+	}
+
+	abortSpecs := []manifest.Spec{
+		manifest.RequiredWithBudget("abort.one", "T1", time.Second),
+		manifest.RequiredWithBudget("abort.two", "T1", time.Second),
+		manifest.RequiredWithBudget("abort.three", "T2", time.Second),
+	}
+	aborted := report.New()
+	aborted.Add(report.Case{Name: "abort.one", Tier: "T1", Failure: "synthetic failure"})
+	if err := finalizeAbortedInvocation(abortSpecs, aborted, caseInvocationBlocker("abort.one")); err != nil {
+		t.Fatal(err)
+	}
+	if aborted.Complete || len(aborted.Cases) != len(abortSpecs) {
+		t.Fatalf("aborted projection=%+v", aborted)
+	}
+	for _, row := range aborted.Cases[1:] {
+		if row.ExecutionState != report.ExecutionStateNotRun || row.BlockerKind != report.BlockerKindCase || row.BlockedByCaseID != "abort.one" || row.CaseDigest == "" {
+			t.Fatalf("case-blocked projection row=%+v", row)
+		}
+	}
+
+	signaled := report.New()
+	signaled.Add(report.Case{Name: "abort.one", Tier: "T1", Failure: "interrupted"})
+	signaled.Add(report.Case{
+		Name: "abort.two", Tier: "T1", ExecutionState: report.ExecutionStateNotRun,
+		BlockerKind: report.BlockerKindCase, BlockedByCaseID: "abort.one", InvalidReason: "not run after abort.one failed",
+	})
+	if err := finalizeAbortedInvocation(abortSpecs, signaled, reasonInvocationBlocker(report.BlockerKindSignal, "interrupt")); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range signaled.Cases[1:] {
+		if row.ExecutionState != report.ExecutionStateNotRun || row.BlockerKind != report.BlockerKindSignal || row.BlockerReason != "interrupt" || row.BlockedByCaseID != "" {
+			t.Fatalf("signal-blocked projection row=%+v", row)
+		}
+	}
+}
+
+func TestFirstFailedExecutedCaseIDIgnoresOptionalSkip(t *testing.T) {
+	cases := []report.Case{
+		{Name: "optional", SkipReason: "not selected", Optional: true},
+		{Name: "passing"},
+		{Name: "mandatory", SkipReason: "dependency unavailable"},
+	}
+	if got := firstFailedExecutedCaseID(cases); got != "mandatory" {
+		t.Fatalf("first failed case=%q want mandatory", got)
+	}
+	cases[2].Optional = true
+	if got := firstFailedExecutedCaseID(cases); got != "" {
+		t.Fatalf("all-optional skips produced blocker %q", got)
+	}
+}
+
+func TestReconcileContractEvidenceRequiresCollectorIdentity(t *testing.T) {
+	spec, evidence := syntheticEnforcedSpec(t, "collector.identity", "T1")
+	valid := []report.Case{{Name: spec.ID, Tier: spec.Tier, Evidence: evidence}}
+	if err := reconcileReportRows([]manifest.Spec{spec}, valid); err != nil {
+		t.Fatalf("valid collector identity: %v", err)
+	}
+
+	missingVersion := []report.Case{{Name: spec.ID, Tier: spec.Tier, Evidence: cloneReportCases(valid)[0].Evidence}}
+	delete(missingVersion[0].Evidence, "manifest_stimulus_profile_version")
+	if err := reconcileReportRows([]manifest.Spec{spec}, missingVersion); err == nil || !strings.Contains(err.Error(), "profile version") {
+		t.Fatalf("missing collector version error=%v", err)
+	}
+
+	staleName := []report.Case{{Name: spec.ID, Tier: spec.Tier, Evidence: cloneReportCases(valid)[0].Evidence}}
+	staleName[0].Evidence["manifest_oracle_profile_name"] = "stale-oracle"
+	if err := reconcileReportRows([]manifest.Spec{spec}, staleName); err == nil || !strings.Contains(err.Error(), "profile identity") {
+		t.Fatalf("stale collector name error=%v", err)
+	}
+}
+
+func TestReportPublicationContextSurvivesInvocationCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	publication, cancelPublication := reportPublicationContext(parent)
+	defer cancelPublication()
+	cancelParent()
+	if err := publication.Err(); err != nil {
+		t.Fatalf("publication inherited invocation cancellation: %v", err)
+	}
+	deadline, ok := publication.Deadline()
+	if !ok {
+		t.Fatal("publication context has no bounded deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > 10*time.Second {
+		t.Fatalf("publication deadline remaining=%s", remaining)
+	}
 }
 
 func TestTUNRunOrderResolvesExactUniqueSpecs(t *testing.T) {
@@ -1208,7 +1648,7 @@ func installSyntheticTierCommands(t *testing.T) func() {
 				t.Fatal(err)
 			}
 			for _, spec := range selected {
-				suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier})
+				suite.Add(report.Case{Name: spec.ID, Tier: spec.Tier, Evidence: syntheticContractEvidence(spec)})
 			}
 		}
 		tierCommands[tier] = command
@@ -1218,6 +1658,193 @@ func installSyntheticTierCommands(t *testing.T) func() {
 			tierCommands[tier] = original
 		}
 	}
+}
+
+func syntheticContractEvidence(spec manifest.Spec) map[string]string {
+	if spec.Contract == nil {
+		return nil
+	}
+	evidence := make(map[string]string)
+	for _, fact := range spec.Contract.Stimulus.RequiredFacts {
+		evidence[fact] = "synthetic-test-fixture"
+	}
+	for _, fact := range spec.Contract.Oracle.RequiredFacts {
+		evidence[fact] = "synthetic-test-fixture"
+	}
+	for _, assertion := range spec.Contract.Stimulus.Assertions {
+		evidence[assertion.Fact] = assertion.Expected
+	}
+	for _, assertion := range spec.Contract.Oracle.Assertions {
+		evidence[assertion.Fact] = assertion.Expected
+	}
+	if len(evidence) == 0 {
+		return nil
+	}
+	return evidence
+}
+
+func newTestReportStore(t *testing.T, dir string) invocationReportStore {
+	t.Helper()
+	lease, err := report.AcquireReportSetLease(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := lease.Close(); err != nil {
+			t.Errorf("close report lease: %v", err)
+		}
+	})
+	return reportStoreForLease(lease)
+}
+
+func writeSyntheticGreenPhase1Gate(t *testing.T, dir, root string) {
+	t.Helper()
+	canonical, err := loadCanonicalPhase1Specs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs := make([]manifest.Spec, len(canonical))
+	evidence := make(map[string]map[string]string, len(canonical))
+	for i, original := range canonical {
+		specs[i], evidence[original.ID] = syntheticEnforcedSpec(t, original.ID, original.Tier)
+	}
+	previousProvider := phase1SpecsProvider
+	phase1SpecsProvider = func() ([]manifest.Spec, error) {
+		return manifest.CloneSpecs(specs), nil
+	}
+	t.Cleanup(func() { phase1SpecsProvider = previousProvider })
+
+	identity, err := buildInvocationIdentity(runFlags{phase: "1"}, manifest.SuiteNormal, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := captureTestLinuxEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := gate.CurrentRevision(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.EnvironmentStart = snapshot
+	identity.EnvironmentEnd = snapshot
+	identity.RevisionStart = reportRevision(revision)
+	identity.RevisionEnd = reportRevision(revision)
+	suite := report.New()
+	suite.Invocation = identity
+	suite.Complete = true
+	for _, spec := range specs {
+		digest, err := spec.CanonicalDigest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		suite.Add(report.Case{
+			Name: spec.ID, Tier: spec.Tier, CaseDigest: digest,
+			Evidence: evidence[spec.ID],
+		})
+	}
+	verified, err := publishPhase1Proof(context.Background(), dir, suite, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeKnownPhase1Gate(dir, revision, "green", time.Now(), verified.Manifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func syntheticEnforcedSpec(t *testing.T, id, tier string) (manifest.Spec, map[string]string) {
+	t.Helper()
+	base := manifest.RequiredWithBudget(id, tier, time.Second)
+	contract := manifest.Contract{
+		SchemaVersion:    manifest.ContractSchemaVersion,
+		State:            manifest.ContractStateEnforced,
+		Purpose:          "exercise canonical phase 1 proof validation",
+		Entrypoint:       "cmd/regress synthetic phase 1 fixture",
+		Topology:         manifest.Topology{Profile: "in-process", Roles: []string{"runner"}, Isolation: "process", PathCount: 0},
+		RoleCapabilities: map[string][]string{"runner": {}},
+		Payload:          manifest.Profile{Applicability: manifest.ApplicabilityNotApplicable},
+		Load:             manifest.Profile{Applicability: manifest.ApplicabilityNotApplicable},
+		Seed:             manifest.SeedPolicy{Mode: manifest.SeedModeNone},
+		Stimulus: manifest.EvidenceProfile{Name: "synthetic-stimulus", Version: 1, Assertions: []manifest.EvidenceAssertion{{
+			Fact: "stimulus_seen", Predicate: manifest.EvidenceEquals, Expected: "true",
+		}}},
+		Oracle: manifest.EvidenceProfile{Name: "synthetic-oracle", Version: 1, Assertions: []manifest.EvidenceAssertion{{
+			Fact: "oracle_passed", Predicate: manifest.EvidenceEquals, Expected: "true",
+		}}},
+		NegativeControl: manifest.NegativeControl{Kind: manifest.NegativeControlNotApplicable, Reason: "synthetic validator fixture"},
+		Resources: manifest.ResourceBudget{
+			State: manifest.ResourceStateDefined, Timeout: time.Second, Exclusivity: manifest.ExclusivityShared,
+			Roles: map[string]manifest.RoleResourceBudget{"runner": {VCPUs: 1, RAMBytes: 1, DiskBytes: 1}},
+		},
+	}
+	requirements, err := contract.ClaimEvidenceRequirements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := map[string]string{
+		"stimulus_seen":                     "true",
+		"oracle_passed":                     "true",
+		"manifest_stimulus_profile_name":    "synthetic-stimulus",
+		"manifest_stimulus_profile_version": "1",
+		"manifest_oracle_profile_name":      "synthetic-oracle",
+		"manifest_oracle_profile_version":   "1",
+	}
+	for i, requirement := range requirements {
+		fact := fmt.Sprintf("claim_%03d", i)
+		contract.ClaimBindings = append(contract.ClaimBindings, requirement.Bind(fact))
+		value := requirement.Expected
+		if requirement.Predicate == manifest.EvidenceInt {
+			value = "1"
+		}
+		evidence[fact] = value
+	}
+	spec, err := manifest.NewCompleteSpec(base, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence[report.EvidenceContractStateKey] = string(manifest.ContractStateEnforced)
+	return spec, evidence
+}
+
+func captureTestLinuxEnvironment(context.Context) (environment.Snapshot, error) {
+	sysctlNames := []string{
+		"net.core.rmem_default",
+		"net.core.rmem_max",
+		"net.core.wmem_default",
+		"net.core.wmem_max",
+		"net.ipv4.tcp_congestion_control",
+		"net.ipv4.tcp_mtu_probing",
+		"net.ipv4.tcp_rmem",
+		"net.ipv4.tcp_wmem",
+		"net.ipv4.udp_rmem_min",
+		"net.ipv4.udp_wmem_min",
+	}
+	sysctls := make([]environment.Sysctl, len(sysctlNames))
+	for i, name := range sysctlNames {
+		sysctls[i] = environment.Sysctl{Name: name, Value: "synthetic"}
+	}
+	return environment.Seal(environment.Snapshot{
+		SchemaVersion: environment.SnapshotSchemaVersion,
+		Runtime: environment.Runtime{
+			GoVersion: "go-test",
+			GOOS:      "linux",
+			GOARCH:    "amd64",
+		},
+		Hostname:      "synthetic-host",
+		KernelRelease: "6.8.0-test",
+		BootID:        "00000000-0000-4000-8000-000000000001",
+		NumCPU:        4,
+		CPU: environment.CPU{
+			Models:         []string{"Synthetic CPU"},
+			OnlineSet:      "0-3",
+			ProcessAllowed: "0-3",
+		},
+		TotalMemoryBytes: 4 << 30,
+		Clocksource:      "tsc",
+		Interfaces:       []environment.Interface{{Name: "test0", MTU: 1500}},
+		SocketSysctls:    sysctls,
+		QDisc:            environment.QDisc{Supported: true, State: []byte("[]")},
+	})
 }
 
 func captureTestEnvironment(context.Context) (environment.Snapshot, error) {

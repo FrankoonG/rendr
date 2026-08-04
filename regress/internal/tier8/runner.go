@@ -26,15 +26,15 @@ type caseDef struct {
 }
 
 var caseDefs = []caseDef{
-	{manifest.RequiredWithBudget("T8.status.local-default", "T8", time.Minute), []string{"TestProbeLocalDefault"}},
-	{manifest.RequiredWithBudget("T8.status.peer-rendr", "T8", 2*time.Minute), []string{"TestDialerStatusPeerRendr"}},
-	{manifest.RequiredWithBudget("T8.primary.default-first-leaf", "T8", 2*time.Minute), []string{"TestDialerRootSelectorDialSmoke"}},
-	{manifest.RequiredWithBudget("T8.primary.explicit-path", "T8", time.Minute), []string{"TestDialerPrimaryExplicitPathReordersPlan"}},
-	{manifest.RequiredWithBudget("T8.primary.explicit-group-resolve", "T8", time.Minute), []string{"TestDialerPrimaryExplicitGroupResolvesLeaf"}},
-	{manifest.RequiredWithBudget("T8.primary.prefer-fallback", "T8", 2*time.Minute), []string{"TestDialerPrimaryPreferFallbackStatus"}},
-	{manifest.RequiredWithBudget("T8.primary.require-fails", "T8", 2*time.Minute), []string{"TestDialerPrimaryRequireFails"}},
-	{manifest.RequiredWithBudget("T8.retry.forwarding-fixed", "T8", 2*time.Minute), []string{"TestDialerOptionalPathRetryAttachesAfterForwardingFix"}},
-	{manifest.RequiredWithBudget("T8.retry.no-app-error", "T8", 2*time.Minute), []string{"TestDialerOptionalPathFailureDoesNotSurfaceToApp"}},
+	{mustCaseSpec("T8.status.local-default", time.Minute), []string{"TestProbeLocalDefault"}},
+	{mustCaseSpec("T8.status.peer-rendr", 2*time.Minute), []string{"TestDialerStatusPeerRendr"}},
+	{mustCaseSpec("T8.primary.default-first-leaf", 2*time.Minute), []string{"TestDialerRootSelectorDialSmoke"}},
+	{mustCaseSpec("T8.primary.explicit-path", time.Minute), []string{"TestDialerPrimaryExplicitPathReordersPlan"}},
+	{mustCaseSpec("T8.primary.explicit-group-resolve", time.Minute), []string{"TestDialerPrimaryExplicitGroupResolvesLeaf"}},
+	{mustCaseSpec("T8.primary.prefer-fallback", 2*time.Minute), []string{"TestDialerPrimaryPreferFallbackStatus"}},
+	{mustCaseSpec("T8.primary.require-fails", 2*time.Minute), []string{"TestDialerPrimaryRequireFails"}},
+	{mustCaseSpec("T8.retry.forwarding-fixed", 2*time.Minute), []string{"TestDialerOptionalPathRetryAttachesAfterForwardingFix"}},
+	{mustCaseSpec("T8.retry.no-app-error", 2*time.Minute), []string{"TestDialerOptionalPathFailureDoesNotSurfaceToApp"}},
 }
 
 // Specs returns the ordered T8 case manifest.
@@ -134,9 +134,12 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }
 

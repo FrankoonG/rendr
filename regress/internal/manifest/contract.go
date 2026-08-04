@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const ContractSchemaVersion = 2
+const ContractSchemaVersion = 4
 
 // ContractState distinguishes facts enforced by a runnable case from census
 // rows that truthfully record why the legacy case cannot yet be enforced.
@@ -111,20 +113,21 @@ const (
 // Enforced contracts contain every applicable fact. Blocked contracts retain
 // known facts and explicitly enumerate every dimension that remains unfrozen.
 type Contract struct {
-	SchemaVersion     int                 `json:"schema_version"`
-	State             ContractState       `json:"state"`
-	MissingDimensions []MissingDimension  `json:"missing_dimensions,omitempty"`
-	Purpose           string              `json:"purpose"`
-	Entrypoint        string              `json:"entrypoint"`
-	Topology          Topology            `json:"topology"`
-	RoleCapabilities  map[string][]string `json:"role_capabilities"`
-	Payload           Profile             `json:"payload"`
-	Load              Profile             `json:"load"`
-	Seed              SeedPolicy          `json:"seed"`
-	Stimulus          EvidenceProfile     `json:"stimulus"`
-	Oracle            EvidenceProfile     `json:"oracle"`
-	NegativeControl   NegativeControl     `json:"negative_control"`
-	Resources         ResourceBudget      `json:"resources"`
+	SchemaVersion     int                    `json:"schema_version"`
+	State             ContractState          `json:"state"`
+	MissingDimensions []MissingDimension     `json:"missing_dimensions,omitempty"`
+	Purpose           string                 `json:"purpose"`
+	Entrypoint        string                 `json:"entrypoint"`
+	Topology          Topology               `json:"topology"`
+	RoleCapabilities  map[string][]string    `json:"role_capabilities"`
+	Payload           Profile                `json:"payload"`
+	Load              Profile                `json:"load"`
+	Seed              SeedPolicy             `json:"seed"`
+	Stimulus          EvidenceProfile        `json:"stimulus"`
+	Oracle            EvidenceProfile        `json:"oracle"`
+	NegativeControl   NegativeControl        `json:"negative_control"`
+	Resources         ResourceBudget         `json:"resources"`
+	ClaimBindings     []ClaimEvidenceBinding `json:"claim_bindings,omitempty"`
 }
 
 // Topology identifies the topology recipe and the roles it must isolate.
@@ -154,19 +157,47 @@ type ProfileParam struct {
 	Unit  BaseUnit `json:"unit"`
 }
 
-// SeedPolicy makes deterministic, recorded-random, and factual seedless cases
-// distinguishable. FixedSeed is present only for SeedModeFixed.
+// SeedPolicy covers randomness that can change workload, topology, stimulus,
+// or oracle outcomes. Protocol identity and cryptographic nonce generation are
+// provenance, not scenario seeds, unless a case asserts behavior from them.
+// FixedSeed is present only for SeedModeFixed.
 type SeedPolicy struct {
 	Mode      SeedMode `json:"mode"`
 	FixedSeed *int64   `json:"fixed_seed,omitempty"`
 }
 
-// EvidenceProfile names a versioned evidence collector and the facts that
-// must be present before its stimulus or oracle can be considered valid.
+// EvidencePredicate gives a machine-checkable meaning to an evidence value.
+// RequiredFacts below are observational presence requirements and are never
+// sufficient by themselves for an enforced oracle.
+type EvidencePredicate string
+
+const (
+	EvidenceEquals       EvidencePredicate = "equals"
+	EvidenceUintEquals   EvidencePredicate = "uint-equals"
+	EvidenceUintAtLeast  EvidencePredicate = "uint-at-least"
+	EvidenceUintAtMost   EvidencePredicate = "uint-at-most"
+	EvidenceIntEquals    EvidencePredicate = "int-equals"
+	EvidenceInt          EvidencePredicate = "int"
+	EvidenceFloatAtLeast EvidencePredicate = "float-at-least"
+	EvidenceFloatAtMost  EvidencePredicate = "float-at-most"
+)
+
+// EvidenceAssertion is one typed predicate over a report.Case evidence fact.
+// Expected is textual because report evidence is textual; numeric predicates
+// parse both sides before comparison.
+type EvidenceAssertion struct {
+	Fact      string            `json:"fact"`
+	Predicate EvidencePredicate `json:"predicate"`
+	Expected  string            `json:"expected"`
+}
+
+// EvidenceProfile names a versioned evidence collector. RequiredFacts only
+// require non-empty observations. Assertions prove semantic values.
 type EvidenceProfile struct {
-	Name          string   `json:"name"`
-	Version       int      `json:"version"`
-	RequiredFacts []string `json:"required_facts"`
+	Name          string              `json:"name"`
+	Version       int                 `json:"version"`
+	RequiredFacts []string            `json:"required_facts"`
+	Assertions    []EvidenceAssertion `json:"assertions,omitempty"`
 }
 
 // NegativeControl identifies a separate manifest case, an embedded control,
@@ -195,7 +226,7 @@ type RoleResourceBudget struct {
 	DiskBytes uint64 `json:"disk_bytes"`
 }
 
-// NewCompleteSpec attaches a valid schema-v2 contract to existing Spec
+// NewCompleteSpec attaches a valid schema-v4 contract to existing Spec
 // metadata. The compatibility name is retained while registries migrate; both
 // enforced and truthful blocked contracts are accepted.
 func NewCompleteSpec(base Spec, contract Contract) (Spec, error) {
@@ -216,6 +247,10 @@ func NewCompleteSpec(base Spec, contract Contract) (Spec, error) {
 // Normalize returns a deep canonical copy. It sorts set-like fields and never
 // fills a missing claim or converts placeholder text into an enforced fact.
 func Normalize(contract Contract) (Contract, error) {
+	return normalizeContract(contract, true)
+}
+
+func normalizeContract(contract Contract, validateBindings bool) (Contract, error) {
 	normalized := cloneContract(contract)
 	normalized.State = ContractState(strings.TrimSpace(string(normalized.State)))
 	normalized.Purpose = strings.TrimSpace(normalized.Purpose)
@@ -257,8 +292,9 @@ func Normalize(contract Contract) (Contract, error) {
 	normalized.NegativeControl.CaseID = strings.TrimSpace(normalized.NegativeControl.CaseID)
 	normalized.NegativeControl.EmbeddedID = strings.TrimSpace(normalized.NegativeControl.EmbeddedID)
 	normalized.NegativeControl.Reason = strings.TrimSpace(normalized.NegativeControl.Reason)
+	normalizeClaimEvidenceBindings(normalized.ClaimBindings)
 
-	if err := normalized.Validate(); err != nil {
+	if err := normalized.validate(validateBindings); err != nil {
 		return Contract{}, err
 	}
 	return normalized, nil
@@ -272,6 +308,10 @@ func (c Contract) Normalize() (Contract, error) {
 // Validate checks schema compatibility, canonical form, completeness, and the
 // truthfulness rules for enforced and blocked contracts.
 func (c Contract) Validate() error {
+	return c.validate(true)
+}
+
+func (c Contract) validate(validateBindings bool) error {
 	var reasons []string
 	if c.SchemaVersion != ContractSchemaVersion {
 		reasons = append(reasons, fmt.Sprintf("schema_version=%d, want %d", c.SchemaVersion, ContractSchemaVersion))
@@ -311,6 +351,9 @@ func (c Contract) Validate() error {
 		if !dimensionMissing(missing, ContractDimensionResources) {
 			reasons = append(reasons, "resources must also be missing when topology is missing")
 		}
+	}
+	if validateBindings {
+		validateClaimEvidenceBindings(&reasons, c, missing)
 	}
 	return errors.Join(stringErrors(reasons)...)
 }
@@ -399,7 +442,10 @@ func cloneContract(c Contract) Contract {
 		clone.Seed.FixedSeed = &seed
 	}
 	clone.Stimulus.RequiredFacts = cloneStrings(c.Stimulus.RequiredFacts)
+	clone.Stimulus.Assertions = cloneEvidenceAssertions(c.Stimulus.Assertions)
 	clone.Oracle.RequiredFacts = cloneStrings(c.Oracle.RequiredFacts)
+	clone.Oracle.Assertions = cloneEvidenceAssertions(c.Oracle.Assertions)
+	clone.ClaimBindings = cloneClaimEvidenceBindings(c.ClaimBindings)
 	if c.Resources.Roles != nil {
 		clone.Resources.Roles = make(map[string]RoleResourceBudget, len(c.Resources.Roles))
 		for role, budget := range c.Resources.Roles {
@@ -492,6 +538,31 @@ func normalizeProfile(profile *Profile) {
 func normalizeEvidenceProfile(profile *EvidenceProfile) {
 	profile.Name = strings.TrimSpace(profile.Name)
 	normalizeStrings(profile.RequiredFacts)
+	for i := range profile.Assertions {
+		normalizeEvidenceAssertion(&profile.Assertions[i])
+	}
+	sort.Slice(profile.Assertions, func(i, j int) bool {
+		if profile.Assertions[i].Fact != profile.Assertions[j].Fact {
+			return profile.Assertions[i].Fact < profile.Assertions[j].Fact
+		}
+		if profile.Assertions[i].Predicate != profile.Assertions[j].Predicate {
+			return profile.Assertions[i].Predicate < profile.Assertions[j].Predicate
+		}
+		return profile.Assertions[i].Expected < profile.Assertions[j].Expected
+	})
+}
+
+func normalizeEvidenceAssertion(assertion *EvidenceAssertion) {
+	assertion.Fact = strings.TrimSpace(assertion.Fact)
+	assertion.Predicate = EvidencePredicate(strings.TrimSpace(string(assertion.Predicate)))
+	assertion.Expected = strings.TrimSpace(assertion.Expected)
+}
+
+func cloneEvidenceAssertions(assertions []EvidenceAssertion) []EvidenceAssertion {
+	if assertions == nil {
+		return nil
+	}
+	return append([]EvidenceAssertion(nil), assertions...)
 }
 
 func normalizeStrings(values []string) {
@@ -675,7 +746,7 @@ func validateSeedDimension(reasons *[]string, policy SeedPolicy, missing map[Con
 
 func validateEvidenceDimension(reasons *[]string, dimension ContractDimension, label string, profile EvidenceProfile, missing map[ContractDimension]struct{}) {
 	if dimensionMissing(missing, dimension) {
-		if profile.Name != "" || profile.Version != 0 || len(profile.RequiredFacts) != 0 {
+		if profile.Name != "" || profile.Version != 0 || len(profile.RequiredFacts) != 0 || len(profile.Assertions) != 0 {
 			*reasons = append(*reasons, fmt.Sprintf("missing dimension %q must not contain evidence facts", dimension))
 		}
 		return
@@ -684,7 +755,127 @@ func validateEvidenceDimension(reasons *[]string, dimension ContractDimension, l
 	if profile.Version <= 0 {
 		*reasons = append(*reasons, label+" evidence profile version must be positive")
 	}
-	validateStringSet(reasons, label+" required facts", profile.RequiredFacts, true)
+	if len(profile.RequiredFacts) == 0 && len(profile.Assertions) == 0 {
+		*reasons = append(*reasons, label+" evidence requirements are missing")
+	}
+	validateStringSet(reasons, label+" required facts", profile.RequiredFacts, false)
+	validateEvidenceAssertions(reasons, label, profile.Assertions)
+	if len(profile.Assertions) == 0 {
+		*reasons = append(*reasons, fmt.Sprintf("declared %s evidence requires at least one typed assertion", label))
+	}
+}
+
+func validateEvidenceAssertions(reasons *[]string, label string, assertions []EvidenceAssertion) {
+	seen := make(map[string]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		validateCanonicalText(reasons, label+" assertion fact", assertion.Fact)
+		key := assertion.Fact + "\x00" + string(assertion.Predicate)
+		if _, ok := seen[key]; ok {
+			*reasons = append(*reasons, fmt.Sprintf("%s assertion for fact %q and predicate %q is duplicated", label, assertion.Fact, assertion.Predicate))
+		}
+		seen[key] = struct{}{}
+		switch assertion.Predicate {
+		case EvidenceEquals:
+			validateCanonicalText(reasons, label+" assertion expected value", assertion.Expected)
+		case EvidenceUintEquals, EvidenceUintAtLeast, EvidenceUintAtMost:
+			validateCanonicalText(reasons, label+" assertion expected value", assertion.Expected)
+			if _, err := strconv.ParseUint(assertion.Expected, 10, 64); err != nil {
+				*reasons = append(*reasons, fmt.Sprintf("%s assertion %q expected value %q is not uint64", label, assertion.Fact, assertion.Expected))
+			}
+		case EvidenceIntEquals:
+			validateCanonicalText(reasons, label+" assertion expected value", assertion.Expected)
+			if _, err := strconv.ParseInt(assertion.Expected, 10, 64); err != nil {
+				*reasons = append(*reasons, fmt.Sprintf("%s assertion %q expected value %q is not int64", label, assertion.Fact, assertion.Expected))
+			}
+		case EvidenceInt:
+			if assertion.Expected != "" {
+				*reasons = append(*reasons, fmt.Sprintf("%s assertion %q predicate %q must not contain an expected value", label, assertion.Fact, assertion.Predicate))
+			}
+		case EvidenceFloatAtLeast, EvidenceFloatAtMost:
+			validateCanonicalText(reasons, label+" assertion expected value", assertion.Expected)
+			value, err := strconv.ParseFloat(assertion.Expected, 64)
+			if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+				*reasons = append(*reasons, fmt.Sprintf("%s assertion %q expected value %q is not finite float64", label, assertion.Fact, assertion.Expected))
+			}
+		default:
+			*reasons = append(*reasons, fmt.Sprintf("%s assertion %q has unsupported predicate %q", label, assertion.Fact, assertion.Predicate))
+		}
+	}
+}
+
+// EvaluateEvidenceAssertion checks one normalized assertion against a textual
+// report value. Validation should run before execution; this function still
+// fails closed on malformed expected values.
+func EvaluateEvidenceAssertion(assertion EvidenceAssertion, actual string) error {
+	if strings.TrimSpace(actual) == "" {
+		return fmt.Errorf("fact %q is missing", assertion.Fact)
+	}
+	switch assertion.Predicate {
+	case EvidenceEquals:
+		if actual != assertion.Expected {
+			return fmt.Errorf("fact %q = %q, want %q", assertion.Fact, actual, assertion.Expected)
+		}
+	case EvidenceUintEquals, EvidenceUintAtLeast, EvidenceUintAtMost:
+		got, err := strconv.ParseUint(actual, 10, 64)
+		if err != nil {
+			return fmt.Errorf("fact %q value %q is not uint64", assertion.Fact, actual)
+		}
+		want, err := strconv.ParseUint(assertion.Expected, 10, 64)
+		if err != nil {
+			return fmt.Errorf("fact %q expected value %q is not uint64", assertion.Fact, assertion.Expected)
+		}
+		if assertion.Predicate == EvidenceUintEquals && got != want {
+			return fmt.Errorf("fact %q = %d, want %d", assertion.Fact, got, want)
+		}
+		if assertion.Predicate == EvidenceUintAtLeast && got < want {
+			return fmt.Errorf("fact %q = %d, want at least %d", assertion.Fact, got, want)
+		}
+		if assertion.Predicate == EvidenceUintAtMost && got > want {
+			return fmt.Errorf("fact %q = %d, want at most %d", assertion.Fact, got, want)
+		}
+	case EvidenceIntEquals, EvidenceInt:
+		got, err := strconv.ParseInt(actual, 10, 64)
+		if err != nil {
+			return fmt.Errorf("fact %q value %q is not int64", assertion.Fact, actual)
+		}
+		if assertion.Predicate == EvidenceIntEquals {
+			want, err := strconv.ParseInt(assertion.Expected, 10, 64)
+			if err != nil {
+				return fmt.Errorf("fact %q expected value %q is not int64", assertion.Fact, assertion.Expected)
+			}
+			if got != want {
+				return fmt.Errorf("fact %q = %d, want %d", assertion.Fact, got, want)
+			}
+		} else if assertion.Expected != "" {
+			return fmt.Errorf("fact %q predicate %q must not contain an expected value", assertion.Fact, assertion.Predicate)
+		}
+	case EvidenceFloatAtLeast, EvidenceFloatAtMost:
+		got, err := parseFiniteFloat(actual)
+		if err != nil {
+			return fmt.Errorf("fact %q value %q is not finite float64", assertion.Fact, actual)
+		}
+		want, err := parseFiniteFloat(assertion.Expected)
+		if err != nil {
+			return fmt.Errorf("fact %q expected value %q is not finite float64", assertion.Fact, assertion.Expected)
+		}
+		if assertion.Predicate == EvidenceFloatAtLeast && got < want {
+			return fmt.Errorf("fact %q = %g, want at least %g", assertion.Fact, got, want)
+		}
+		if assertion.Predicate == EvidenceFloatAtMost && got > want {
+			return fmt.Errorf("fact %q = %g, want at most %g", assertion.Fact, got, want)
+		}
+	default:
+		return fmt.Errorf("fact %q has unsupported predicate %q", assertion.Fact, assertion.Predicate)
+	}
+	return nil
+}
+
+func parseFiniteFloat(value string) (float64, error) {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, errors.New("not a finite float64")
+	}
+	return parsed, nil
 }
 
 func validateNegativeControlDimension(reasons *[]string, control NegativeControl, state ContractState, missing map[ContractDimension]struct{}) {

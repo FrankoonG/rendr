@@ -3,15 +3,22 @@ package gotestjson
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-const helperScenarioEnv = "GOTESTJSON_HELPER_SCENARIO"
+const (
+	helperScenarioEnv          = "GOTESTJSON_HELPER_SCENARIO"
+	helperDescendantEnv        = "GOTESTJSON_HELPER_DESCENDANT"
+	helperDescendantPIDFileEnv = "GOTESTJSON_HELPER_DESCENDANT_PID_FILE"
+	helperDescendantEscapeEnv  = "GOTESTJSON_HELPER_DESCENDANT_ESCAPE"
+)
 
 func TestBuildArgs(t *testing.T) {
 	request := Request{
@@ -125,9 +132,44 @@ func TestExecutorCancellationIsBounded(t *testing.T) {
 	if !result.HasIssue(IssueCommandCanceled) {
 		t.Fatalf("issues=%+v, want command canceled", result.Issues)
 	}
+	if result.HasIssue(IssueProcessLeak) || result.HasIssue(IssueProcessCleanup) {
+		t.Fatalf("cancellation left process cleanup issues: %+v", result.Issues)
+	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("canceled executor returned after %s, want <=3s", elapsed)
 	}
+
+	t.Run("cleanup failure invalidates a passing command", func(t *testing.T) {
+		executor := syntheticExecutor()
+		executor.containProcess = func(*exec.Cmd) (processContainment, error) {
+			return staticProcessContainment{result: processCleanupResult{
+				evidence: ProcessCleanupEvidence{
+					Method:          ProcessContainmentSubreaper,
+					LeakDetected:    true,
+					DescendantCount: 1,
+				},
+				err: errors.New("synthetic reap failure"),
+			}}, nil
+		}
+		result, err := executor.Run(
+			context.Background(),
+			syntheticRequest(t, "pass", required("TestFirst", "TestSecond")),
+		)
+		assertValidationError(t, err)
+		if !result.HasIssue(IssueProcessLeak) || !result.HasIssue(IssueProcessCleanup) {
+			t.Fatalf("issues=%+v, want process leak and cleanup failure", result.Issues)
+		}
+	})
+
+	testLinuxProcessGroupCleanup(t)
+}
+
+type staticProcessContainment struct {
+	result processCleanupResult
+}
+
+func (s staticProcessContainment) cleanup(time.Duration, bool) processCleanupResult {
+	return s.result
 }
 
 func TestExecutorRejectsInvalidRequestWithoutStarting(t *testing.T) {
@@ -150,7 +192,26 @@ func TestExecutorRejectsInvalidRequestWithoutStarting(t *testing.T) {
 	}
 }
 
+func TestExecutorFailsClosedWhenContainmentCannotBeConfigured(t *testing.T) {
+	executor := syntheticExecutor()
+	executor.containProcess = func(*exec.Cmd) (processContainment, error) {
+		return nil, errors.New("synthetic containment failure")
+	}
+	result, err := executor.Run(
+		context.Background(),
+		syntheticRequest(t, "pass", required("TestFirst", "TestSecond")),
+	)
+	assertValidationError(t, err)
+	if !result.HasIssue(IssueProcessContainment) || result.HasIssue(IssueZeroTests) {
+		t.Fatalf("issues=%+v, want only typed containment failure", result.Issues)
+	}
+}
+
 func TestExecutorHelperProcess(t *testing.T) {
+	if os.Getenv(helperDescendantEnv) != "" {
+		time.Sleep(10 * time.Minute)
+		os.Exit(96)
+	}
 	scenario := os.Getenv(helperScenarioEnv)
 	if scenario == "" {
 		return
@@ -201,8 +262,39 @@ func TestExecutorHelperProcess(t *testing.T) {
 		emit(testEvent{Action: "run", Test: "TestOne"})
 		time.Sleep(10 * time.Minute)
 		os.Exit(98)
+	case "hang-descendant", "leak-descendant":
+		pidFile := os.Getenv(helperDescendantPIDFileEnv)
+		if pidFile == "" {
+			os.Exit(95)
+		}
+		startEscapingDescendant(pidFile)
+		emit(testEvent{Action: "run", Test: "TestOne"})
+		if scenario == "hang-descendant" {
+			time.Sleep(10 * time.Minute)
+			os.Exit(91)
+		}
+		emit(testEvent{Action: "pass", Test: "TestOne", Elapsed: 0.01})
+		os.Exit(0)
 	default:
 		os.Exit(99)
+	}
+}
+
+func startEscapingDescendant(pidFile string) {
+	child := exec.Command(os.Args[0], "-test.run=^TestExecutorHelperProcess$")
+	child.Env = append(os.Environ(), helperDescendantEnv+"=1")
+	configureEscapingDescendant(child, os.Getenv(helperDescendantEscapeEnv))
+	if err := child.Start(); err != nil {
+		os.Exit(94)
+	}
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		_ = child.Process.Kill()
+		_, _ = child.Process.Wait()
+		os.Exit(93)
+	}
+	if err := child.Process.Release(); err != nil {
+		_ = child.Process.Kill()
+		os.Exit(92)
 	}
 }
 

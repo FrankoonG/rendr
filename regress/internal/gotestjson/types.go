@@ -39,22 +39,44 @@ type TestResult struct {
 type IssueCode string
 
 const (
-	IssueInvalidConfig   IssueCode = "invalid_config"
-	IssueMalformedJSON   IssueCode = "malformed_json"
-	IssueReadFailure     IssueCode = "read_failure"
-	IssueEventTooLarge   IssueCode = "event_too_large"
-	IssueCaptureLimit    IssueCode = "capture_limit"
-	IssueZeroTests       IssueCode = "zero_tests"
-	IssueTestNotRun      IssueCode = "test_not_run"
-	IssueNoTerminal      IssueCode = "no_terminal_event"
-	IssueMandatorySkip   IssueCode = "mandatory_skip"
-	IssueTestFailed      IssueCode = "test_failed"
-	IssueUnexpectedTest  IssueCode = "unexpected_test"
-	IssueInvalidEvent    IssueCode = "invalid_event"
-	IssueInvalidSequence IssueCode = "invalid_event_sequence"
-	IssueCommandCanceled IssueCode = "command_canceled"
-	IssueCommandFailed   IssueCode = "command_failed"
+	IssueInvalidConfig      IssueCode = "invalid_config"
+	IssueMalformedJSON      IssueCode = "malformed_json"
+	IssueReadFailure        IssueCode = "read_failure"
+	IssueEventTooLarge      IssueCode = "event_too_large"
+	IssueCaptureLimit       IssueCode = "capture_limit"
+	IssueZeroTests          IssueCode = "zero_tests"
+	IssueTestNotRun         IssueCode = "test_not_run"
+	IssueNoTerminal         IssueCode = "no_terminal_event"
+	IssueMandatorySkip      IssueCode = "mandatory_skip"
+	IssueTestFailed         IssueCode = "test_failed"
+	IssueUnexpectedTest     IssueCode = "unexpected_test"
+	IssueInvalidEvent       IssueCode = "invalid_event"
+	IssueInvalidSequence    IssueCode = "invalid_event_sequence"
+	IssueCommandCanceled    IssueCode = "command_canceled"
+	IssueCommandFailed      IssueCode = "command_failed"
+	IssueProcessContainment IssueCode = "process_containment_failed"
+	IssueProcessLeak        IssueCode = "process_leak"
+	IssueProcessCleanup     IssueCode = "process_cleanup_failed"
 )
+
+// ProcessContainmentMethod identifies the Linux command boundary used for an
+// invocation. Other platforms report ProcessContainmentNone.
+type ProcessContainmentMethod string
+
+const (
+	ProcessContainmentNone      ProcessContainmentMethod = "none"
+	ProcessContainmentCgroupV2  ProcessContainmentMethod = "cgroup_v2"
+	ProcessContainmentSubreaper ProcessContainmentMethod = "subreaper_proc"
+)
+
+// ProcessCleanupEvidence records the independently observable outcome of
+// post-command descendant detection and teardown.
+type ProcessCleanupEvidence struct {
+	Method               ProcessContainmentMethod
+	LeakDetected         bool
+	DescendantCount      int
+	TerminationConfirmed bool
+}
 
 // Issue describes one fail-closed validation finding.
 type Issue struct {
@@ -82,6 +104,7 @@ type Result struct {
 	CommandOutput          string
 	CommandOutputTruncated bool
 	CaptureTruncated       bool
+	ProcessCleanup         ProcessCleanupEvidence
 	Issues                 []Issue
 }
 

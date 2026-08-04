@@ -299,8 +299,19 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestInvocationScopeAndManifestDigestSeparateFullFromExact",
 			"TestPhaseOneResumeCanRepairRedGateWithoutMintingGreen",
 			"TestExecuteNormalPhaseOneResumeBypassesRedGateButLeavesItRed",
+			"TestExecuteNormalFinalAuthorizationFailureReplacesPassingReport",
+			"TestBuildPhase1ProofSuiteProjectsCombinedInvocation",
+			"TestValidatePhase1ProofRejectsWrongIdentity",
+			"TestVerifyFinalPhase1AuthorizationRejectsMissingOrWrongLineage",
 			"TestExecuteNormalRevisionDriftFailsAndPersistsEvidence",
 			"TestExecuteNormalExitFollowsFinalizedReportValidity",
+			"TestFirstFailedExecutedCaseIDIgnoresOptionalSkip",
+			"TestReconcileContractEvidenceRequiresCollectorIdentity",
+			"TestReportPublicationContextSurvivesInvocationCancellation",
+			"TestRequirePassingVerifiedSetRejectsAuthorityBypasses",
+			"TestRequirePassingVerifiedSetPinsFrozenUnprovenCatalog",
+			"TestPersistedPhase2EvidenceRequiresAuthorizationLineage",
+			"TestValidateTrustedReleaseManifestRejectsPartialCatalog",
 			"TestWriteKnownPhase1GateRejectsMissingIdentity", "TestTUNCatalogMakesCompatibilitySelectorsExplicit",
 			"TestExecuteTUNCanonicalResumeProducesMatchingPassingReport",
 			"TestExecuteTUNCompatibilitySelectorProducesCanonicalPassingRows",
@@ -326,13 +337,16 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestMetadataUsesExplicitEnvironmentVariables",
 		),
 		testPackage(regressModule+"/internal/gate", "./internal/gate",
-			"TestCheckPhase2RejectsMissingRevisionIdentity", "TestCurrentRevisionChangesWithUntrackedContent",
-			"TestCurrentRevisionChangesWithTrackedContent", "TestWriteAtomicallyReplacesState",
+			"TestWriteRejectsMissingRevisionIdentity", "TestCheckPhase2AllowsBoundGreenState",
+			"TestCurrentRevisionChangesWithUntrackedContent", "TestCurrentRevisionChangesWithTrackedContent",
+			"TestWriteAtomicallyReplacesState", "TestRunningAndRedMayOmitReportIdentity",
+			"TestWriteValidationFailsClosed", "TestReadValidationFailsClosed",
 		),
 		testPackage(regressModule+"/internal/gotestjson", "./internal/gotestjson",
 			"TestBuildArgs", "TestExecutorReturnsOrderedSyntheticResults",
 			"TestExecutorClassifiesNonzeroExitByRepresentedFailure", "TestExecutorRejectsMalformedAndTruncatedCapture",
 			"TestExecutorCancellationIsBounded", "TestExecutorRejectsInvalidRequestWithoutStarting",
+			"TestExecutorFailsClosedWhenContainmentCannotBeConfigured",
 			"TestExecutorHelperProcess", "TestParseReturnsExpectationOrderAndDeterministicDetails",
 			"TestParseFailClosedConditions", "TestParseAllowsExplicitlyOptionalSkip",
 			"TestParseAcceptsCompleteFinalObjectWithoutNewline", "TestParseRejectsDuplicateAndCrossPackageSequences",
@@ -342,12 +356,18 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestExecutorRejectsEmptyCommandPrefixEntry",
 		),
 		testPackage(regressModule+"/internal/manifest", "./internal/manifest",
+			"TestClaimEvidenceRequirementsCoverEveryStructuredClaim",
+			"TestEnforcedContractRejectsIncompleteOrMismatchedClaimBindings",
+			"TestClaimBindingsRejectEvidenceFactReuseAcrossDistinctClaims",
+			"TestBlockedCensusPreservesUnprovenContractsWithoutClaimBindings",
+			"TestRuntimeClaimAssertionsExposeTypedRunnerData", "TestCanonicalDigestBindsClaimEvidenceMapping",
 			"TestSelectExactAndResume", "TestSelectRejectsAmbiguousOrMissingFilters",
 			"TestValidateAcceptsClosedAcyclicRegistry", "TestValidateRejectsManifestMutations",
 			"TestWithPrerequisitesPrependsTransitiveClosure", "TestWithPrerequisitesRejectsUnknownSelection",
 			"TestSelectionsDoNotAliasRequires",
 			"TestNewCompleteSpecNormalizesWithoutInventingClaims", "TestNormalizeRejectsDuplicateSetClaims",
 			"TestContractValidateRejectsIncompleteOrNonCanonicalClaims",
+			"TestReleaseNegativeControlCaseRequiresExecutionDependency",
 			"TestLegacySpecRemainsValidAndDigestibleWithoutContract",
 			"TestNewCompleteSpecRejectsCrossFieldIncompleteness",
 			"TestSpecCanonicalDigestStableAcrossSetAndMapOrder",
@@ -364,6 +384,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestInvocationSchemaV2IsRecordedInJUnitAndMarkdown", "TestInvocationSchemaV2Validation",
 			"TestInvocationSchemaV3EnvironmentIsRecordedInJUnitAndMarkdown", "TestInvocationSchemaV3EnvironmentValidation",
 			"TestInvocationSchemaV4SeparatesComponentAndReleaseCompleteness",
+			"TestReleaseManifestRequiresCurrentUnbypassedFullIdentity",
 			"TestCompleteReportWithoutInvocationIdentityFailsClosed",
 			"TestDocumentDigestIsStableAndCoversReportClaims",
 			"TestWriteJSONAndHumanReportsShareVerifiedDigest",
@@ -397,7 +418,12 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestParseG3HostUDPStatsRejectsMalformedEvidence",
 			"TestValidateG4EvidenceNegativeControls", "TestValidateG4EvidenceAllowsMeasuredSubMillisecondFailover",
 			"TestValidateG5PayloadRejectsMismatch", "TestValidateRecoveredPathProgressNegativeControl",
-			"TestRunHysteriaRelay", "TestTCPRepairUnavailableFallsBackToGVisor",
+			"TestRunHysteriaRelay", "TestHysteriaSpeedtestCancellationJoinsProcess",
+			"TestHysteriaSpeedtestMigrationFailureKillsAndJoinsProcess",
+			"TestHysteriaProcessUnjoinedIsTypedMustStopFailure",
+			"TestHysteriaProcessUnconfirmedTeardownIsTypedMustStopFailure", "TestHysteriaRelayHelperProcess",
+			"TestHysteriaRelayDescendantProcess",
+			"TestTCPRepairUnavailableFallsBackToGVisor",
 			"TestRunUDPRelayServerMode", "TestRunUDPRelayPortHop", "TestMigrationPoints", "TestRunWireGuardRelay",
 		),
 		testPackage(regressModule+"/internal/tier1", "./internal/tier1",
@@ -426,12 +452,14 @@ func regressUnitContracts(goos string) []packageContract {
 		),
 		testPackage(regressModule+"/internal/tier4", "./internal/tier4",
 			"TestRunReportsSelectionFailures", "TestSpecsOrdered", "TestSelectCaseDefs",
+			"TestInFlightMigrationOracleRejectsOldFalseGreenEvidence",
+			"TestInFlightMigrationOracleAcceptsExactBoundedEvidence",
 			"TestExecuteCasePreflightFailureIsInvalid",
 			"TestApplyCleanupResultFailsClosed", "TestEvidenceFromDetailPreservesFacts",
 			"TestRunCaseWithChaosJoinsDelayedWorkloadBeforeFixtureFinalization",
 			"TestRunCaseWithChaosResultCancelsAndJoinsMonitorBeforeFinalization",
 			"TestRunSelectedCasesStopsAfterMandatoryOutcome", "TestCleanupCompletesBeforeFailFastDecision",
-			"TestRunSelectedCasesStopsAfterUnjoinedWorkload",
+			"TestRunSelectedCasesStopsAfterUnjoinedWorkload", "TestTier4CleanupCancellationSafety",
 		),
 		testPackage(regressModule+"/internal/tier5", "./internal/tier5",
 			"TestUnprivilegedProbeRequestsAreExactAndMandatory", "TestUnprivilegedProbeContractsAreFactualAndTruthful",
@@ -473,7 +501,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestSyntheticRowsCannotClaimRealKernelTUNEvidence",
 			"TestKernelTUNHelperOutputRequiresMatchingStructuredIdentity",
 			"TestKernelTUNHelperInvocationRequiresExactNonceAndMode",
-			"TestUnimplementedCaseFails", "TestApplyT4CleanupResultFailsClosed",
+			"TestUnimplementedCaseFails", "TestApplyT4CleanupResultFailsClosed", "TestTUNFullCleanupCancellationSafety",
 		),
 		excludedPackage(regressModule+"/internal/xrayglue", "./internal/xrayglue"),
 	}
@@ -481,6 +509,7 @@ func regressUnitContracts(goos string) []packageContract {
 	if goos == "linux" {
 		chaos := contractByImportPath(contracts, regressModule+"/internal/chaos")
 		chaos.Inventory = []string{"TestApplyAndCleanup", "TestApplyShapesBandwidth"}
+		chaos.RunTests = []string{"TestApplyAndCleanup"}
 		tier1 := contractByImportPath(contracts, regressModule+"/internal/tier1")
 		tier1.Inventory = append(tier1.Inventory,
 			"TestRunGoCancellationKillsCompiledTestProcessTree",
@@ -499,6 +528,8 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestTier5TCPRepairFailureRequiresNegotiatedFallback",
 			"TestTier5GVisorPacketCarrierOwnedSessionUnprivileged",
 		)
+		smoke := contractByImportPath(contracts, regressModule+"/internal/smoke")
+		smoke.Inventory = append(smoke.Inventory, "TestHysteriaCancellationKillsPipeHoldingDescendantGroup")
 	}
 	smoke := contractByImportPath(contracts, regressModule+"/internal/smoke")
 	smoke.RunTests = []string{
@@ -527,6 +558,15 @@ func regressUnitContracts(goos string) []packageContract {
 		"TestValidateG4EvidenceAllowsMeasuredSubMillisecondFailover",
 		"TestValidateG5PayloadRejectsMismatch",
 		"TestValidateRecoveredPathProgressNegativeControl",
+		"TestHysteriaSpeedtestCancellationJoinsProcess",
+		"TestHysteriaSpeedtestMigrationFailureKillsAndJoinsProcess",
+		"TestHysteriaProcessUnjoinedIsTypedMustStopFailure",
+		"TestHysteriaProcessUnconfirmedTeardownIsTypedMustStopFailure",
+		"TestHysteriaRelayHelperProcess",
+		"TestHysteriaRelayDescendantProcess",
+	}
+	if goos == "linux" {
+		smoke.RunTests = append(smoke.RunTests, "TestHysteriaCancellationKillsPipeHoldingDescendantGroup")
 	}
 	return contracts
 }

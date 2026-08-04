@@ -28,12 +28,34 @@ var orderedCaseIDs = []string{
 }
 
 func TestSpecsOrder(t *testing.T) {
-	got := make([]string, len(Specs()))
-	for i, spec := range Specs() {
+	specs := Specs()
+	got := make([]string, len(specs))
+	for i, spec := range specs {
 		got[i] = spec.ID
+		if spec.Contract == nil {
+			t.Errorf("spec %q has no schema-v3 contract", spec.ID)
+			continue
+		}
+		if err := spec.Contract.Validate(); err != nil {
+			t.Errorf("spec %q contract: %v", spec.ID, err)
+		}
+		for _, item := range []struct {
+			dimension manifest.ContractDimension
+			profile   manifest.EvidenceProfile
+		}{
+			{manifest.ContractDimensionStimulus, spec.Contract.Stimulus},
+			{manifest.ContractDimensionOracle, spec.Contract.Oracle},
+		} {
+			if !contractMissing(spec, item.dimension) && len(item.profile.Assertions) == 0 {
+				t.Errorf("spec %q %s profile has no typed assertion", spec.ID, item.dimension)
+			}
+		}
 	}
 	if !reflect.DeepEqual(got, orderedCaseIDs) {
 		t.Fatalf("Specs IDs = %v, want %v", got, orderedCaseIDs)
+	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("ValidateCensus(Specs()) = %v", err)
 	}
 
 	originalRequires := caseDefs[1].spec.Requires
@@ -44,6 +66,126 @@ func TestSpecsOrder(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+
+	contractCopy := Specs()
+	contractCopy[0].Contract.Purpose = "mutated"
+	contractCopy[0].Contract.MissingDimensions[0].Reason = "mutated"
+	contractCopy[0].Contract.Topology.Roles[0] = "mutated"
+	contractCopy[0].Contract.RoleCapabilities["client"] = append(contractCopy[0].Contract.RoleCapabilities["client"], "mutated")
+	contractCopy[0].Contract.Payload.Params[0].Value++
+	contractCopy[0].Contract.Stimulus.RequiredFacts[0] = "mutated"
+	contractCopy[0].Contract.Oracle.Assertions[0].Expected = "mutated"
+	fresh := Specs()[0].Contract
+	if fresh.Purpose == "mutated" || fresh.MissingDimensions[0].Reason == "mutated" || fresh.Topology.Roles[0] == "mutated" || len(fresh.RoleCapabilities["client"]) != 0 || fresh.Payload.Params[0].Value != 30<<20 || fresh.Stimulus.RequiredFacts[0] == "mutated" || fresh.Oracle.Assertions[0].Expected == "mutated" {
+		t.Fatalf("Specs returned aliased T2 contract: %+v", fresh)
+	}
+
+	t.Run("weak cases remain truthfully blocked", func(t *testing.T) {
+		byID := specsByID(specs)
+		for _, id := range orderedCaseIDs {
+			spec := byID[id]
+			if spec.Contract.State != manifest.ContractStateBlocked {
+				t.Errorf("spec %q state = %q, want blocked", id, spec.Contract.State)
+			}
+			if !contractMissing(spec, manifest.ContractDimensionNegativeControl) || !contractMissing(spec, manifest.ContractDimensionResources) {
+				t.Errorf("spec %q must remain blocked on negative control and resources", id)
+			}
+		}
+		g3 := byID["G3-smoke"]
+		if !strings.Contains(g3.Contract.Purpose, "does not prove RFC 9000 CID or NAT rebinding") {
+			t.Errorf("G3 purpose overclaims CID semantics: %q", g3.Contract.Purpose)
+		}
+		if got, ok := contractParam(g3.Contract.Payload, "body_bytes"); !ok || got != 1024 {
+			t.Errorf("G3 body_bytes = %d, present=%t, want 1024", got, ok)
+		}
+		if got, ok := contractParam(g3.Contract.Payload, "application_record_bytes"); !ok || got != 1032 {
+			t.Errorf("G3 application_record_bytes = %d, present=%t, want 1032", got, ok)
+		}
+		if _, ok := contractParam(g3.Contract.Load, "offered_pps"); ok {
+			t.Errorf("G3 load still labels its configured target as offered_pps: %+v", g3.Contract.Load)
+		}
+		if got, ok := contractParam(g3.Contract.Load, "target_pps"); !ok || got != 5000 {
+			t.Errorf("G3 target_pps = %d, present=%t, want 5000", got, ok)
+		}
+		wantG3Capabilities := []string{"Linux", "net.core.rmem_max >= 8388608 bytes"}
+		for _, role := range []string{"client", "server"} {
+			if got := g3.Contract.RoleCapabilities[role]; !reflect.DeepEqual(got, wantG3Capabilities) {
+				t.Errorf("G3 %s capabilities = %v, want %v", role, got, wantG3Capabilities)
+			}
+		}
+		if !hasContractAssertion(g3.Contract.Stimulus, "pps_sent", manifest.EvidenceFloatAtLeast, "4750") ||
+			!hasContractAssertion(g3.Contract.Oracle, "loss_pct", manifest.EvidenceFloatAtMost, "0.5") ||
+			!hasContractAssertion(g3.Contract.Oracle, "udp_snmp_status", manifest.EvidenceEquals, "ok") {
+			t.Errorf("G3 typed load/oracle assertions are incomplete: stimulus=%+v oracle=%+v", g3.Contract.Stimulus, g3.Contract.Oracle)
+		}
+		for _, id := range []string{"G2-smoke", "G2-race-tcp-smoke", "G2-bond-tcp-smoke"} {
+			g2 := byID[id]
+			if _, ok := contractParam(g2.Contract.Load, "p99_ceiling_ns"); ok {
+				t.Errorf("%s freezes a P99 ceiling despite an under-qualified sample population", id)
+			}
+			if !strings.Contains(g2.Contract.Purpose, "1,000-sample P99 qualification minimum") ||
+				!hasContractAssertion(g2.Contract.Stimulus, "p99_qualified", manifest.EvidenceEquals, "false") ||
+				containsContractString(g2.Contract.Oracle.RequiredFacts, "p99_qualified") ||
+				!hasContractAssertion(g2.Contract.Oracle, "transport_lost_echoes", manifest.EvidenceEquals, "0") {
+				t.Errorf("%s does not separate diagnostic P99 evidence from continuity predicates: %+v", id, g2.Contract)
+			}
+		}
+		g4 := byID["G4"]
+		if !strings.Contains(g4.Contract.Purpose, "ForceKillPathForTest") {
+			t.Errorf("G4 purpose hides synthetic kill hook: %q", g4.Contract.Purpose)
+		}
+		porthop := byID["M11-udp-relay-porthop-smoke"]
+		if !contractMissing(porthop, manifest.ContractDimensionPayload) || !contractMissing(porthop, manifest.ContractDimensionSeed) {
+			t.Errorf("port-hop contract froze OS-assigned address payload or seed")
+		}
+	})
+}
+
+func specsByID(specs []manifest.Spec) map[string]manifest.Spec {
+	byID := make(map[string]manifest.Spec, len(specs))
+	for _, spec := range specs {
+		byID[spec.ID] = spec
+	}
+	return byID
+}
+
+func contractMissing(spec manifest.Spec, dimension manifest.ContractDimension) bool {
+	if spec.Contract == nil {
+		return false
+	}
+	for _, missing := range spec.Contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return true
+		}
+	}
+	return false
+}
+
+func contractParam(profile manifest.Profile, name string) (uint64, bool) {
+	for _, parameter := range profile.Params {
+		if parameter.Name == name {
+			return parameter.Value, true
+		}
+	}
+	return 0, false
+}
+
+func hasContractAssertion(profile manifest.EvidenceProfile, fact string, predicate manifest.EvidencePredicate, expected string) bool {
+	for _, assertion := range profile.Assertions {
+		if assertion.Fact == fact && assertion.Predicate == predicate && assertion.Expected == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsContractString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSpecsHaveBoundedBudgets(t *testing.T) {
@@ -337,7 +479,16 @@ func assertFailFastRows(t *testing.T, cases []report.Case, tier string) {
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("report IDs = %v, want %v", gotIDs, wantIDs)
 	}
-	if got := cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
+	for i, rc := range cases[:2] {
+		if rc.ExecutionState != report.ExecutionStateExecuted || rc.BlockedByCaseID != "" {
+			t.Fatalf("executed row %d state = %q blocked by %q", i, rc.ExecutionState, rc.BlockedByCaseID)
+		}
+	}
+	trailing := cases[2]
+	if trailing.ExecutionState != report.ExecutionStateNotRun || trailing.BlockedByCaseID != "synthetic.blocker" {
+		t.Fatalf("trailing row state = %q blocked by %q", trailing.ExecutionState, trailing.BlockedByCaseID)
+	}
+	if got := trailing.InvalidReason; got != "not run after synthetic.blocker failed" {
 		t.Fatalf("trailing row invalid reason = %q", got)
 	}
 }

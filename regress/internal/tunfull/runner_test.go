@@ -79,6 +79,24 @@ func TestSpecsOrderedAndBudgeted(t *testing.T) {
 		if !reflect.DeepEqual(spec.Requires, wantRequires) {
 			t.Errorf("Specs()[%d].Requires = %v, want %v", i, spec.Requires, wantRequires)
 		}
+		if spec.Contract == nil {
+			t.Errorf("Specs()[%d] has no schema-v3 contract", i)
+			continue
+		}
+		for _, item := range []struct {
+			dimension manifest.ContractDimension
+			profile   manifest.EvidenceProfile
+		}{
+			{manifest.ContractDimensionStimulus, spec.Contract.Stimulus},
+			{manifest.ContractDimensionOracle, spec.Contract.Oracle},
+		} {
+			if !hasTUNMissing(spec.Contract, item.dimension) && len(item.profile.Assertions) == 0 {
+				t.Errorf("Specs()[%d] %s profile has no typed assertion", i, item.dimension)
+			}
+		}
+	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("TUN census validation failed: %v", err)
 	}
 
 	specs[0].ID = "mutated"
@@ -89,6 +107,124 @@ func TestSpecsOrderedAndBudgeted(t *testing.T) {
 	if got := Specs()[1].Requires[0]; got != caseKernelTUNPreflight {
 		t.Fatalf("Specs returned shared prerequisite storage: %q", got)
 	}
+
+	t.Run("contracts are defensive copies", func(t *testing.T) {
+		first := Specs()
+		first[0].Contract.MissingDimensions[0].Reason = "mutated"
+		first[0].Contract.Topology.Roles[0] = "mutated"
+		first[0].Contract.Payload.Params[0].Name = "mutated"
+		first[0].Contract.Stimulus.RequiredFacts[0] = "mutated"
+		first[0].Contract.Oracle.Assertions[0].Expected = "mutated"
+		fresh := Specs()[0].Contract
+		if fresh.MissingDimensions[0].Reason == "mutated" || fresh.Topology.Roles[0] == "mutated" ||
+			fresh.Payload.Params[0].Name == "mutated" || fresh.Stimulus.RequiredFacts[0] == "mutated" ||
+			fresh.Oracle.Assertions[0].Expected == "mutated" {
+			t.Fatal("mutating a returned contract changed the closed TUN registry")
+		}
+	})
+
+	t.Run("kernel and synthetic claims stay distinct", func(t *testing.T) {
+		registrySpecs := Specs()
+		byID := make(map[string]manifest.Spec, len(registrySpecs))
+		for _, spec := range registrySpecs {
+			byID[spec.ID] = spec
+		}
+		preflight := byID[caseKernelTUNPreflight].Contract
+		if preflight.NegativeControl.Kind != manifest.NegativeControlEmbedded ||
+			preflight.NegativeControl.EmbeddedID != "CAP_NET_ADMIN-denied kernel TUN helper probe" ||
+			!containsTUNString(preflight.Stimulus.RequiredFacts, "kernel_tun_fd_read_from_kernel") ||
+			!containsTUNString(preflight.Oracle.RequiredFacts, "kernel_tun_negative_control_pass") ||
+			containsTUNString(preflight.Oracle.RequiredFacts, "kernel_tun_gold") ||
+			!hasTUNAssertion(preflight.Stimulus, "kernel_tun_gold", manifest.EvidenceEquals, "false") ||
+			!hasTUNAssertion(preflight.Oracle, "kernel_tun_environment_gate_pass", manifest.EvidenceEquals, "true") {
+			t.Fatalf("kernel preflight contract does not match emitted positive/negative evidence: %+v", preflight)
+		}
+		for _, id := range []string{caseG1Smoke, caseG2Smoke, caseG5PathRecovery, caseT4G1, caseT4G2, caseT6Selector} {
+			contract := byID[id].Contract
+			if contract.State != manifest.ContractStateBlocked || !hasTUNMissing(contract, manifest.ContractDimensionStimulus) ||
+				!hasTUNMissing(contract, manifest.ContractDimensionOracle) || contract.Stimulus.Name != "" || contract.Oracle.Name != "" {
+				t.Errorf("synthetic case %s does not remain blocked on absent emitted evidence: %+v", id, contract)
+			}
+		}
+		adapter := byID[caseT5AdapterMatrix].Contract
+		if hasTUNMissing(adapter, manifest.ContractDimensionStimulus) || !hasTUNMissing(adapter, manifest.ContractDimensionOracle) ||
+			adapter.Oracle.Name != "" || !hasTUNAssertion(adapter.Stimulus, "gvisor_exercised", manifest.EvidenceEquals, "true") {
+			t.Errorf("synthetic adapter matrix does not separate observations from its missing oracle: %+v", adapter)
+		}
+		for _, id := range []string{caseG3Smoke, caseT4G3} {
+			contract := byID[id].Contract
+			if !strings.Contains(contract.Purpose, "does not prove RFC 9000 CID rebinding") ||
+				containsTUNString(contract.Oracle.RequiredFacts, "g3_semantics") ||
+				!containsTUNString(contract.Stimulus.RequiredFacts, "g3_semantics") ||
+				!hasTUNAssertion(contract.Stimulus, "g3_semantics", manifest.EvidenceEquals, "synthetic_l3session_quic_datagram_not_rfc9000_cid_gold") {
+				t.Errorf("synthetic G3 contract %s overstates kernel TUN or CID semantics: %+v", id, contract)
+			}
+			if got, ok := tunProfileParam(contract.Payload, "application_record_bytes"); !ok || got != 1024 {
+				t.Errorf("synthetic G3 %s application_record_bytes = %d, present=%t, want 1024", id, got, ok)
+			}
+			if got, ok := tunProfileParam(contract.Payload, "body_bytes"); !ok || got != 1016 {
+				t.Errorf("synthetic G3 %s body_bytes = %d, present=%t, want 1016", id, got, ok)
+			}
+			if got, ok := tunProfileParam(contract.Payload, "sequence_prefix_bytes"); !ok || got != 8 {
+				t.Errorf("synthetic G3 %s sequence_prefix_bytes = %d, present=%t, want 8", id, got, ok)
+			}
+		}
+		g3Smoke := byID[caseG3Smoke].Contract
+		if _, ok := tunProfileParam(g3Smoke.Load, "offered_pps"); ok {
+			t.Errorf("synthetic G3 smoke labels its configured target as offered_pps: %+v", g3Smoke.Load)
+		}
+		if got, ok := tunProfileParam(g3Smoke.Load, "target_pps"); !ok || got != 5000 {
+			t.Errorf("synthetic G3 smoke target_pps = %d, present=%t, want 5000", got, ok)
+		}
+		g3Long := byID[caseT4G3].Contract
+		if !hasTUNMissing(g3Long, manifest.ContractDimensionLoad) || g3Long.Load.Applicability != manifest.ApplicabilityUnfrozen ||
+			!strings.Contains(g3Long.Purpose, "at or above 95,000 pps") ||
+			!hasTUNAssertion(g3Long.Stimulus, "offered_pps", manifest.EvidenceFloatAtLeast, "95000") {
+			t.Errorf("synthetic 100k G3 does not record its factual 95%% load floor: %+v", g3Long)
+		}
+		if got := len(Aliases()); got != 4 {
+			t.Fatalf("Aliases count = %d, want 4 non-executable aliases", got)
+		}
+	})
+}
+
+func hasTUNMissing(contract *manifest.Contract, dimension manifest.ContractDimension) bool {
+	if contract == nil {
+		return false
+	}
+	for _, missing := range contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTUNString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func tunProfileParam(profile manifest.Profile, name string) (uint64, bool) {
+	for _, parameter := range profile.Params {
+		if parameter.Name == name {
+			return parameter.Value, true
+		}
+	}
+	return 0, false
+}
+
+func hasTUNAssertion(profile manifest.EvidenceProfile, fact string, predicate manifest.EvidencePredicate, expected string) bool {
+	for _, assertion := range profile.Assertions {
+		if assertion.Fact == fact && assertion.Predicate == predicate && assertion.Expected == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func testAliasesAreSeparateImmutableMetadata(t *testing.T) {
@@ -97,7 +233,12 @@ func testAliasesAreSeparateImmutableMetadata(t *testing.T) {
 		{ID: caseT3XrayStreamSmoke, Before: caseT3XrayMatrix, ExpandsTo: []string{caseT3XrayMatrix}},
 		{ID: caseT4LongRun, Before: caseT4G1, ExpandsTo: []string{caseT4G1, caseT4G2, caseT4G3}},
 		{ID: caseT4G2Prime, Before: caseT4G2, ExpandsTo: []string{caseT4G2}},
-		{ID: caseT5Fallback, Before: caseT5AdapterMatrix, ExpandsTo: []string{caseT5AdapterMatrix}},
+		{
+			ID:            caseT5Fallback,
+			Before:        caseT5AdapterMatrix,
+			ExpandsTo:     []string{caseT5AdapterMatrix},
+			RetiredReason: "historical name claimed fallback coverage, but the replacement adapter matrix does not exercise fallback",
+		},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Aliases()=%+v want %+v", got, want)
@@ -282,6 +423,14 @@ func TestRunCaseDefsStopsAfterMandatoryOutcome(t *testing.T) {
 			if got := reportIDs(suite.Cases); !reflect.DeepEqual(got, wantIDs) {
 				t.Fatalf("report IDs = %v, want %v", got, wantIDs)
 			}
+			for i, rc := range suite.Cases[:2] {
+				if rc.ExecutionState != report.ExecutionStateExecuted || rc.BlockedByCaseID != "" {
+					t.Fatalf("executed row %d state = %q blocked by %q", i, rc.ExecutionState, rc.BlockedByCaseID)
+				}
+			}
+			if got := suite.Cases[2]; got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "synthetic.blocker" {
+				t.Fatalf("trailing row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+			}
 			if got := suite.Cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
 				t.Fatalf("trailing row invalid reason = %q", got)
 			}
@@ -362,6 +511,12 @@ func TestRunCaseDefsStopsAfterUnjoinedTimeout(t *testing.T) {
 		!strings.Contains(suite.Cases[1].InvalidReason, "not run after synthetic.unjoined failed") {
 		t.Fatalf("unjoined timeout rows = %+v", suite.Cases)
 	}
+	if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+		t.Fatalf("unjoined executed row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
+	if got := suite.Cases[1]; got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "synthetic.unjoined" {
+		t.Fatalf("unjoined downstream row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
 }
 
 func TestExecuteG4PathKillFailsClosedWithoutStimulus(t *testing.T) {
@@ -440,7 +595,8 @@ func TestValidateCaseDefsRejectsMissingBudgetAndSelectorMember(t *testing.T) {
 		t.Fatalf("missing budget err = %v", err)
 	}
 
-	missingRunner := caseDef{spec: tunSpec("synthetic.missing-runner", time.Second, false)}
+	missingRunner := caseDef{spec: Specs()[0]}
+	missingRunner.spec.ID = "synthetic.missing-runner"
 	if err := validateCaseDefs([]caseDef{missingRunner}); err == nil || !strings.Contains(err.Error(), "no runner") {
 		t.Fatalf("missing runner err = %v", err)
 	}

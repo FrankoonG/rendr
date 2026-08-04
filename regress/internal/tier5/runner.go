@@ -28,7 +28,7 @@ type caseDef struct {
 
 var caseDefs = []caseDef{
 	{
-		spec: manifest.RequiredWithBudget("T5.1-tcprepair-privileged", "T5", 3*time.Minute),
+		spec: mustTier5Spec("T5.1-tcprepair-privileged", 3*time.Minute),
 		run: func(ctx context.Context, _ string) report.Case {
 			const name = "T5.1-tcprepair-privileged"
 			if err := tcprepair.Available(); err != nil {
@@ -39,7 +39,7 @@ var caseDefs = []caseDef{
 		},
 	},
 	{
-		spec: manifest.RequiredWithBudget("T5.2-gvisor-privileged", "T5", 2*time.Minute),
+		spec: mustTier5Spec("T5.2-gvisor-privileged", 2*time.Minute),
 		run: func(ctx context.Context, _ string) report.Case {
 			const name = "T5.2-gvisor-privileged"
 			if err := gvisor.Available(); err != nil {
@@ -49,12 +49,12 @@ var caseDefs = []caseDef{
 			return smokeReportCase(name, r)
 		},
 	},
-	{spec: manifest.RequiredWithBudget("T5.3-tcprepair-unprivileged", "T5", 2*time.Minute), run: probeUnprivileged},
-	{spec: manifest.RequiredWithBudget("T5.4-gvisor-unprivileged", "T5", 2*time.Minute), run: probeGVisorUnprivileged},
+	{spec: mustTier5Spec("T5.3-tcprepair-unprivileged", 2*time.Minute), run: probeUnprivileged},
+	{spec: mustTier5Spec("T5.4-gvisor-unprivileged", 2*time.Minute), run: probeGVisorUnprivileged},
 	// Keep the historical ID stable for --case/--from-case. The v1 oracle
 	// proves framed redial/attach and records that gVisor is not involved.
-	{spec: manifest.RequiredWithBudget("T5.5-tcprepair-gvisor-fallback-unprivileged", "T5", 2*time.Minute), run: probeTCPRepairFallbackUnprivileged},
-	{spec: manifest.RequiredWithBudget("T5.6-gvisor-packet-carrier-unprivileged", "T5", 2*time.Minute), run: probeGVisorPacketCarrierUnprivileged},
+	{spec: mustTier5Spec("T5.5-tcprepair-gvisor-fallback-unprivileged", 2*time.Minute), run: probeTCPRepairFallbackUnprivileged},
+	{spec: mustTier5Spec("T5.6-gvisor-packet-carrier-unprivileged", 2*time.Minute), run: probeGVisorPacketCarrierUnprivileged},
 }
 
 // Specs returns the ordered T5 case manifest.
@@ -187,8 +187,11 @@ func mandatoryCaseFailed(spec manifest.Spec, rc report.Case) bool {
 
 func notRunCase(spec manifest.Spec, failedCaseID string) report.Case {
 	return report.Case{
-		Name:          spec.ID,
-		Tier:          spec.Tier,
-		InvalidReason: fmt.Sprintf("not run after %s failed", failedCaseID),
+		Name:            spec.ID,
+		Tier:            spec.Tier,
+		ExecutionState:  report.ExecutionStateNotRun,
+		BlockerKind:     report.BlockerKindCase,
+		BlockedByCaseID: failedCaseID,
+		InvalidReason:   fmt.Sprintf("not run after %s failed", failedCaseID),
 	}
 }

@@ -14,7 +14,7 @@ import (
 
 // JSONReportSchemaVersion identifies the canonical machine-readable report
 // envelope. It is independent from Invocation.SchemaVersion.
-const JSONReportSchemaVersion = 1
+const JSONReportSchemaVersion = 2
 
 // Document is the content-addressed machine-readable form of one regression
 // component. ReportDigest covers every field except ReportDigest itself.
@@ -35,6 +35,10 @@ func (s *Suite) Document() (Document, error) {
 		return Document{}, fmt.Errorf("report: nil suite")
 	}
 	invocation := s.Invocation
+	if invocation.Phase1Authorization != nil {
+		authorization := *invocation.Phase1Authorization
+		invocation.Phase1Authorization = &authorization
+	}
 	if invocation.SelectedCaseIDs == nil {
 		invocation.SelectedCaseIDs = []string{}
 	} else {
@@ -49,7 +53,10 @@ func (s *Suite) Document() (Document, error) {
 	invocation.EnvironmentEnd = cloneEnvironmentSnapshot(invocation.EnvironmentEnd)
 	cases := make([]Case, len(s.Cases))
 	for i, source := range s.Cases {
-		cases[i] = source
+		if err := source.validateExecutionState(); err != nil {
+			return Document{}, fmt.Errorf("report: case %d execution state: %w", i, err)
+		}
+		cases[i] = normalizeCaseExecution(source)
 		if source.Evidence != nil {
 			cases[i].Evidence = make(map[string]string, len(source.Evidence))
 			for key, value := range source.Evidence {
@@ -61,7 +68,7 @@ func (s *Suite) Document() (Document, error) {
 		SchemaVersion: JSONReportSchemaVersion,
 		State:         reportState(s),
 		StartedAt:     s.Started.UTC().Format(time.RFC3339Nano),
-		Complete:      s.Complete,
+		Complete:      reportComplete(s),
 		RunFailure:    s.RunFailure,
 		Invocation:    invocation,
 		Cases:         cases,
@@ -98,15 +105,22 @@ func (s *Suite) WriteJSON(path string) error {
 	if err != nil {
 		return err
 	}
+	encoded, err := encodeJSONDocument(document)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(path, encoded)
+}
+
+func encodeJSONDocument(document Document) ([]byte, error) {
 	// Emit the same compact canonical representation used by the digest. In
 	// particular, indenting json.RawMessage environment fields would alter
 	// their byte-level canonical form after a read-back.
 	encoded, err := json.Marshal(document)
 	if err != nil {
-		return fmt.Errorf("report: encode JSON document: %w", err)
+		return nil, fmt.Errorf("report: encode JSON document: %w", err)
 	}
-	encoded = append(encoded, '\n')
-	return writeAtomic(path, encoded)
+	return append(encoded, '\n'), nil
 }
 
 // ReadJSON reads one report and verifies its schema and content digest.
@@ -115,6 +129,10 @@ func ReadJSON(path string) (Document, error) {
 	if err != nil {
 		return Document{}, err
 	}
+	return decodeJSONDocument(encoded)
+}
+
+func decodeJSONDocument(encoded []byte) (Document, error) {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	var document Document
@@ -138,6 +156,11 @@ func (d Document) VerifyDigest() error {
 	if !validManifestDigest(d.ReportDigest) {
 		return fmt.Errorf("report: malformed report digest %q", d.ReportDigest)
 	}
+	for i, c := range d.Cases {
+		if err := c.validateExecutionState(); err != nil {
+			return fmt.Errorf("report: case %d execution state: %w", i, err)
+		}
+	}
 	want, err := d.computeDigest()
 	if err != nil {
 		return err
@@ -152,13 +175,7 @@ func (d Document) VerifyDigest() error {
 	if canonical := started.UTC().Format(time.RFC3339Nano); d.StartedAt != canonical {
 		return fmt.Errorf("report: non-canonical started_at %q, want %q", d.StartedAt, canonical)
 	}
-	suite := &Suite{
-		Started:    started,
-		Invocation: d.Invocation,
-		Cases:      d.Cases,
-		Complete:   d.Complete,
-		RunFailure: d.RunFailure,
-	}
+	suite := d.suite(started)
 	if wantState := reportState(suite); d.State != wantState {
 		reason := invocationFailure(suite)
 		if reason == "" && suite.AnyFailed() {
@@ -167,6 +184,27 @@ func (d Document) VerifyDigest() error {
 		return fmt.Errorf("report: state %q is inconsistent with contents; want %q (%s)", d.State, wantState, reason)
 	}
 	return nil
+}
+
+func (d Document) suite(started time.Time) *Suite {
+	return &Suite{
+		Started:    started,
+		Invocation: d.Invocation,
+		Cases:      d.Cases,
+		Complete:   d.Complete,
+		RunFailure: d.RunFailure,
+	}
+}
+
+func suiteFromDocument(document Document) (*Suite, error) {
+	if err := document.VerifyDigest(); err != nil {
+		return nil, err
+	}
+	started, err := time.Parse(time.RFC3339Nano, document.StartedAt)
+	if err != nil {
+		return nil, fmt.Errorf("report: invalid started_at %q: %w", document.StartedAt, err)
+	}
+	return document.suite(started), nil
 }
 
 func (d Document) computeDigest() (string, error) {

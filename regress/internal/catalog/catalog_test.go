@@ -15,12 +15,15 @@ import (
 	"github.com/FrankoonG/rendr/regress/internal/tier6"
 	"github.com/FrankoonG/rendr/regress/internal/tier7"
 	"github.com/FrankoonG/rendr/regress/internal/tier8"
+	"github.com/FrankoonG/rendr/regress/internal/tunfull"
 )
 
 const (
 	phase1Count     = 20
 	phase2Count     = 110
 	normalFullCount = 130
+	tunFullCount    = 12
+	globalCaseCount = 142
 )
 
 var expectedTiers = []struct {
@@ -51,6 +54,17 @@ func TestCatalogExactOrderAndCount(t *testing.T) {
 		if got := len(expected.specs()); got != expected.count {
 			t.Errorf("%s Specs count = %d, want %d", expected.tier, got, expected.count)
 		}
+	}
+
+	all := append(NormalFull(), tunfull.Specs()...)
+	if got := len(tunfull.Specs()); got != tunFullCount {
+		t.Errorf("TUN executable count = %d, want %d", got, tunFullCount)
+	}
+	if got := len(all); got != globalCaseCount {
+		t.Fatalf("global executable count = %d, want %d", got, globalCaseCount)
+	}
+	if err := manifest.ValidateCensus(all); err != nil {
+		t.Fatalf("global contract census: %v", err)
 	}
 }
 

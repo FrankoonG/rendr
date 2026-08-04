@@ -37,6 +37,32 @@ func TestSpecsFreezeCurrentMatrix(t *testing.T) {
 		if got := caseDefs[i].expected; !reflect.DeepEqual(got, []string{spec.ID}) {
 			t.Fatalf("case %q expected tests=%v, want [%s]", spec.ID, got, spec.ID)
 		}
+		if spec.Contract == nil {
+			t.Fatalf("case %q has no schema-v3 contract", spec.ID)
+		}
+		if err := spec.Contract.Validate(); err != nil {
+			t.Fatalf("case %q contract validation failed: %v", spec.ID, err)
+		}
+		if spec.Contract.State != manifest.ContractStateBlocked {
+			t.Fatalf("case %q contract state=%q, want blocked for unfrozen public xray fixture", spec.ID, spec.Contract.State)
+		}
+		for _, dimension := range []manifest.ContractDimension{
+			manifest.ContractDimensionTopology,
+			manifest.ContractDimensionPayload,
+			manifest.ContractDimensionLoad,
+			manifest.ContractDimensionSeed,
+			manifest.ContractDimensionStimulus,
+			manifest.ContractDimensionOracle,
+			manifest.ContractDimensionNegativeControl,
+			manifest.ContractDimensionResources,
+		} {
+			if matrixMissingReason(spec.Contract, dimension) == "" {
+				t.Errorf("case %q does not block unfrozen dimension %q", spec.ID, dimension)
+			}
+		}
+	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("closed T3 census validation failed: %v", err)
 	}
 	if t3 != 30 || tunT3 != 14 {
 		t.Fatalf("case families: TestT3=%d TestTUNT3=%d, want 30 and 14", t3, tunT3)
@@ -59,6 +85,23 @@ func TestSpecsFreezeCurrentMatrix(t *testing.T) {
 	if got := Specs()[0].ID; got == "mutated" {
 		t.Fatal("Specs exposed mutable package definitions")
 	}
+	contractCopy := Specs()
+	contractCopy[0].Contract.Purpose = "mutated"
+	contractCopy[0].Contract.MissingDimensions[0].Reason = "mutated"
+	if got := caseDefs[0].spec.Contract.Purpose; got == "mutated" {
+		t.Fatal("Specs exposed mutable contract text")
+	}
+	if got := caseDefs[0].spec.Contract.MissingDimensions[0].Reason; got == "mutated" {
+		t.Fatal("Specs exposed mutable nested contract metadata")
+	}
+
+	tunContract := specs[27].Contract
+	if reason := matrixMissingReason(tunContract, manifest.ContractDimensionTopology); !strings.Contains(reason, "does not open /dev/net/tun") {
+		t.Fatalf("synthetic TUN topology reason=%q, want explicit absence of /dev/net/tun", reason)
+	}
+	if len(tunContract.Stimulus.RequiredFacts) != 0 || len(tunContract.Oracle.RequiredFacts) != 0 {
+		t.Fatalf("synthetic TUN contract claims report evidence: stimulus=%v oracle=%v", tunContract.Stimulus.RequiredFacts, tunContract.Oracle.RequiredFacts)
+	}
 
 	originalRequires := caseDefs[1].spec.Requires
 	caseDefs[1].spec.Requires = []string{caseDefs[0].spec.ID}
@@ -68,6 +111,18 @@ func TestSpecsFreezeCurrentMatrix(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+}
+
+func matrixMissingReason(contract *manifest.Contract, dimension manifest.ContractDimension) string {
+	if contract == nil {
+		return ""
+	}
+	for _, missing := range contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return missing.Reason
+		}
+	}
+	return ""
 }
 
 func TestSelectSpecs(t *testing.T) {
@@ -221,7 +276,15 @@ func TestRunCaseDefsFailFastKeepsManifestRows(t *testing.T) {
 			if got := suite.Cases[1].Evidence["attempt"]; got != "preserved" {
 				t.Fatalf("failing evidence = %q", got)
 			}
+			for i, rc := range suite.Cases[:2] {
+				if rc.ExecutionState != report.ExecutionStateExecuted || rc.BlockedByCaseID != "" {
+					t.Fatalf("executed row %d state = %q blocked by %q", i, rc.ExecutionState, rc.BlockedByCaseID)
+				}
+			}
 			last := suite.Cases[2]
+			if last.ExecutionState != report.ExecutionStateNotRun || last.BlockedByCaseID != "TestSecond" {
+				t.Fatalf("not-run row state = %q blocked by %q", last.ExecutionState, last.BlockedByCaseID)
+			}
 			if last.Tier != "T3" || last.InvalidReason != "not run after TestSecond failed" || last.Failure != "" || last.SkipReason != "" {
 				t.Fatalf("not-run row = %+v", last)
 			}

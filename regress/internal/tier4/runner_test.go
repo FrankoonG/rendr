@@ -81,10 +81,29 @@ func TestSpecsOrdered(t *testing.T) {
 		if !spec.Mandatory || spec.Suite != manifest.SuiteNormal || spec.Budget != wantBudgets[i] {
 			t.Errorf("Specs()[%d] = %+v, want mandatory normal-suite budget %s", i, spec, wantBudgets[i])
 		}
+		if spec.Contract == nil {
+			t.Errorf("Specs()[%d] has no schema-v3 contract", i)
+			continue
+		}
+		for _, item := range []struct {
+			dimension manifest.ContractDimension
+			profile   manifest.EvidenceProfile
+		}{
+			{manifest.ContractDimensionStimulus, spec.Contract.Stimulus},
+			{manifest.ContractDimensionOracle, spec.Contract.Oracle},
+		} {
+			if !hasTier4Missing(spec.Contract, item.dimension) && len(item.profile.Assertions) == 0 {
+				t.Errorf("Specs()[%d] %s profile has no typed assertion", i, item.dimension)
+			}
+		}
+	}
+	if err := manifest.ValidateCensus(specs); err != nil {
+		t.Fatalf("T4 census validation failed: %v", err)
 	}
 	wantProfiles := []chaos.Profile{
 		chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M,
-		{}, {}, {}, {}, {},
+		chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M, chaos.Realistic50M,
+		{},
 	}
 	for i, def := range caseDefs {
 		if !reflect.DeepEqual(def.profile, wantProfiles[i]) {
@@ -100,6 +119,150 @@ func TestSpecsOrdered(t *testing.T) {
 	if got, want := caseDefs[1].spec.Requires[0], caseDefs[0].spec.ID; got != want {
 		t.Fatalf("Specs result mutated caseDefs prerequisite to %q, want %q", got, want)
 	}
+
+	t.Run("contracts are defensive copies", func(t *testing.T) {
+		first := Specs()
+		first[0].Contract.MissingDimensions[0].Reason = "mutated"
+		first[0].Contract.Topology.Roles[0] = "mutated"
+		first[0].Contract.Payload.Params[0].Name = "mutated"
+		first[0].Contract.Stimulus.RequiredFacts[0] = "mutated"
+		first[0].Contract.Oracle.Assertions[0].Expected = "mutated"
+		fresh := Specs()[0].Contract
+		if fresh.MissingDimensions[0].Reason == "mutated" || fresh.Topology.Roles[0] == "mutated" ||
+			fresh.Payload.Params[0].Name == "mutated" || fresh.Stimulus.RequiredFacts[0] == "mutated" ||
+			fresh.Oracle.Assertions[0].Expected == "mutated" {
+			t.Fatal("mutating a returned contract changed the closed T4 registry")
+		}
+	})
+
+	t.Run("weak cases remain factually blocked", func(t *testing.T) {
+		byID := make(map[string]manifest.Spec, len(specs))
+		for _, spec := range specs {
+			byID[spec.ID] = spec
+		}
+		for _, id := range []string{"G1-T4", "G3-T4", "M11-udp-relay-T4"} {
+			contract := byID[id].Contract
+			if contract.State != manifest.ContractStateBlocked || !hasTier4Missing(contract, manifest.ContractDimensionNegativeControl) ||
+				!hasTier4Missing(contract, manifest.ContractDimensionResources) {
+				t.Errorf("%s contract does not preserve absent-control/resource blockers: %+v", id, contract)
+			}
+		}
+		g3 := byID["G3-T4"].Contract
+		if g3.Topology.PathCount != 8 || !strings.Contains(g3.Purpose, "multi-connection QUIC DATAGRAM") ||
+			!strings.Contains(g3.Purpose, "at least 95,000 measured offered pps") {
+			t.Fatalf("G3-T4 contract overstates CID semantics or path shape: %+v", g3)
+		}
+		if !hasTier4Missing(g3, manifest.ContractDimensionLoad) || g3.Load.Applicability != manifest.ApplicabilityUnfrozen {
+			t.Errorf("G3-T4 exact offered load is not marked unfrozen: %+v", g3)
+		}
+		if got, ok := tier4Param(g3.Payload, "body_bytes"); !ok || got != 1024 {
+			t.Errorf("G3-T4 body_bytes = %d, present=%t, want 1024", got, ok)
+		}
+		if got, ok := tier4Param(g3.Payload, "application_record_bytes"); !ok || got != 1032 {
+			t.Errorf("G3-T4 application_record_bytes = %d, present=%t, want 1032", got, ok)
+		}
+		if !hasTier4Assertion(g3.Stimulus, "pps_sent", manifest.EvidenceFloatAtLeast, "95000") ||
+			!hasTier4Assertion(g3.Oracle, "loss_pct", manifest.EvidenceFloatAtMost, "0") ||
+			!hasTier4Assertion(g3.Oracle, "udp_snmp_status", manifest.EvidenceEquals, "ok") {
+			t.Errorf("G3-T4 typed load/oracle predicates are incomplete: stimulus=%+v oracle=%+v", g3.Stimulus, g3.Oracle)
+		}
+		g2 := byID["G2-T4"].Contract
+		for _, fact := range []string{"fd_identity_observed", "independent_path_observer"} {
+			if containsTier4String(g2.Oracle.RequiredFacts, fact) || !containsTier4String(g2.Stimulus.RequiredFacts, fact) ||
+				!hasTier4Assertion(g2.Stimulus, fact, manifest.EvidenceEquals, "false") {
+				t.Errorf("G2-T4 fact %q is not isolated as false observational context: stimulus=%+v oracle=%+v", fact, g2.Stimulus, g2.Oracle)
+			}
+		}
+		for _, assertion := range []struct {
+			fact      string
+			predicate manifest.EvidencePredicate
+			expected  string
+		}{
+			{"baseline_received_echoes", manifest.EvidenceUintAtLeast, "1000"},
+			{"baseline_transport_lost_echoes", manifest.EvidenceEquals, "0"},
+			{"paired_p99_qualified", manifest.EvidenceEquals, "true"},
+			{"treatment_received_echoes", manifest.EvidenceUintAtLeast, "1000"},
+			{"treatment_transport_lost_echoes", manifest.EvidenceEquals, "0"},
+		} {
+			if !hasTier4Assertion(g2.Oracle, assertion.fact, assertion.predicate, assertion.expected) {
+				t.Errorf("G2-T4 oracle lacks factual assertion %+v: %+v", assertion, g2.Oracle)
+			}
+		}
+	})
+}
+
+func TestInFlightMigrationOracleRejectsOldFalseGreenEvidence(t *testing.T) {
+	oldFalseGreen := smoke.Result{Detail: map[string]any{
+		"requested_migs":               3,
+		"expected_inflight_migrations": 3,
+		"inflight_migrations":          0,
+		"migration_count":              uint64(3),
+	}}
+	validated := withCaseOracle(func(context.Context) smoke.Result { return oldFalseGreen }, validateInFlightMigrationEvidence)(context.Background())
+	if !strings.Contains(validated.InvalidReason, "inflight_migrations=0 want exactly expected_inflight_migrations=3") {
+		t.Fatalf("old completed-roundtrip schedule was not rejected: %+v", validated)
+	}
+
+	missingBoundaryEvidence := smoke.Result{Detail: map[string]any{
+		"requested_migs":  3,
+		"migration_count": uint64(3),
+	}}
+	validated = withCaseOracle(func(context.Context) smoke.Result { return missingBoundaryEvidence }, validateInFlightMigrationEvidence)(context.Background())
+	if !strings.Contains(validated.InvalidReason, "missing expected_inflight_migrations") {
+		t.Fatalf("missing boundary evidence was not rejected: %+v", validated)
+	}
+}
+
+func TestInFlightMigrationOracleAcceptsExactBoundedEvidence(t *testing.T) {
+	result := smoke.Result{Detail: map[string]any{
+		"requested_migs":               3,
+		"expected_inflight_migrations": 3,
+		"inflight_migrations":          3,
+		"migration_count":              uint64(3),
+	}}
+	validated := withCaseOracle(func(context.Context) smoke.Result { return result }, validateInFlightMigrationEvidence)(context.Background())
+	if validated.Failure != "" || validated.InvalidReason != "" {
+		t.Fatalf("exact bounded evidence was rejected: %+v", validated)
+	}
+}
+
+func hasTier4Missing(contract *manifest.Contract, dimension manifest.ContractDimension) bool {
+	if contract == nil {
+		return false
+	}
+	for _, missing := range contract.MissingDimensions {
+		if missing.Dimension == dimension {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTier4String(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func tier4Param(profile manifest.Profile, name string) (uint64, bool) {
+	for _, parameter := range profile.Params {
+		if parameter.Name == name {
+			return parameter.Value, true
+		}
+	}
+	return 0, false
+}
+
+func hasTier4Assertion(profile manifest.EvidenceProfile, fact string, predicate manifest.EvidencePredicate, expected string) bool {
+	for _, assertion := range profile.Assertions {
+		if assertion.Fact == fact && assertion.Predicate == predicate && assertion.Expected == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSelectCaseDefs(t *testing.T) {
@@ -517,8 +680,14 @@ func TestCleanupCompletesBeforeFailFastDecision(t *testing.T) {
 	if got := suite.Cases[0].InvalidReason; got != "chaos cleanup failed: cleanup boom" {
 		t.Fatalf("first row invalid reason = %q", got)
 	}
+	if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+		t.Fatalf("first row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
 	if got := suite.Cases[1].InvalidReason; got != "not run after synthetic.first failed" {
 		t.Fatalf("second row invalid reason = %q", got)
+	}
+	if got := suite.Cases[1]; got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "synthetic.first" {
+		t.Fatalf("second row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
 	}
 }
 
@@ -573,6 +742,12 @@ func TestRunSelectedCasesStopsAfterUnjoinedWorkload(t *testing.T) {
 		!strings.Contains(suite.Cases[1].InvalidReason, "not run after synthetic.first failed") {
 		t.Fatalf("unjoined T4 rows=%+v", suite.Cases)
 	}
+	if got := suite.Cases[0]; got.ExecutionState != report.ExecutionStateExecuted || got.BlockedByCaseID != "" {
+		t.Fatalf("unjoined executed row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
+	if got := suite.Cases[1]; got.ExecutionState != report.ExecutionStateNotRun || got.BlockedByCaseID != "synthetic.first" {
+		t.Fatalf("unjoined downstream row state = %q blocked by %q", got.ExecutionState, got.BlockedByCaseID)
+	}
 	releaseWorker()
 }
 
@@ -620,7 +795,16 @@ func assertFailFastRows(t *testing.T, cases []report.Case, tier string) {
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("report IDs = %v, want %v", gotIDs, wantIDs)
 	}
-	if got := cases[2].InvalidReason; got != "not run after synthetic.blocker failed" {
+	for i, rc := range cases[:2] {
+		if rc.ExecutionState != report.ExecutionStateExecuted || rc.BlockedByCaseID != "" {
+			t.Fatalf("executed row %d state = %q blocked by %q", i, rc.ExecutionState, rc.BlockedByCaseID)
+		}
+	}
+	trailing := cases[2]
+	if trailing.ExecutionState != report.ExecutionStateNotRun || trailing.BlockedByCaseID != "synthetic.blocker" {
+		t.Fatalf("trailing row state = %q blocked by %q", trailing.ExecutionState, trailing.BlockedByCaseID)
+	}
+	if got := trailing.InvalidReason; got != "not run after synthetic.blocker failed" {
 		t.Fatalf("trailing row invalid reason = %q", got)
 	}
 }

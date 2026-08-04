@@ -22,4 +22,8 @@ func TestRunWireGuardRelay(t *testing.T) {
 	if r.Failure != "" {
 		t.Fatalf("RunWireGuardRelay failed: %s", r.Failure)
 	}
+	if r.InvalidReason != "" {
+		t.Fatalf("RunWireGuardRelay invalid: %s", r.InvalidReason)
+	}
+	assertInflightMigrationDetail(t, r, 2)
 }

@@ -3,12 +3,16 @@
 package chaos
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +23,108 @@ import (
 // lifecycle tests. Keeping one top-level name preserves the strict T1 test
 // inventory while exercising each interference state as a subtest.
 func TestApplyAndCleanup(t *testing.T) {
+	t.Run("blocked command is terminated at its deadline", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("requires a POSIX shell")
+		}
+		started := time.Now()
+		out, err := runExternalCommand(50*time.Millisecond, "sh", "-c", "sleep 10 & child=$!; echo $child; wait")
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("runExternalCommand error=%v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("blocked command took %s to terminate", elapsed)
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) == 0 {
+			t.Fatalf("child PID missing from command output %q", out)
+		}
+		childPID, parseErr := strconv.Atoi(fields[0])
+		if parseErr != nil {
+			t.Fatalf("parse child PID from %q: %v", out, parseErr)
+		}
+		deadline := time.Now().Add(time.Second)
+		for !testProcessGone(childPID) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !testProcessGone(childPID) {
+			t.Fatalf("descendant pid %d survived command timeout", childPID)
+		}
+	})
+
+	t.Run("watcher shutdown drains queued notification", testWatcherShutdownBarrier)
+
+	t.Run("cleanup is not mutex-blocked by an in-flight verification", func(t *testing.T) {
+		installedJSON := []byte(`[{"handle":"1000:","kind":"tbf","parent":"","root":true}]`)
+		var canonicalValue any
+		if err := json.Unmarshal(installedJSON, &canonicalValue); err != nil {
+			t.Fatal(err)
+		}
+		fingerprint, err := json.Marshal(canonicalValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstProbeStarted := make(chan struct{})
+		releaseFirstProbe := make(chan struct{})
+		cleanupProbeStarted := make(chan struct{})
+		var runMu sync.Mutex
+		showCalls := 0
+		installed := true
+		run := func(args ...string) ([]byte, error) {
+			runMu.Lock()
+			if containsArg(args, "show") {
+				showCalls++
+				call := showCalls
+				currentInstalled := installed
+				runMu.Unlock()
+				switch call {
+				case 1:
+					close(firstProbeStarted)
+					<-releaseFirstProbe
+				case 2:
+					close(cleanupProbeStarted)
+				}
+				if currentInstalled {
+					return installedJSON, nil
+				}
+				return []byte(`[]`), nil
+			}
+			if containsArg(args, "del") {
+				installed = false
+				runMu.Unlock()
+				return nil, nil
+			}
+			runMu.Unlock()
+			return nil, fmt.Errorf("unexpected tc args %v", args)
+		}
+		lock := &fakeFixtureLock{}
+		fixture := &managedFixture{
+			profile: Realistic50M, run: run, lock: lock, watcher: newFakeQdiscWatcher(),
+			rootHandle: "1000:", childHandle: "2000:", fingerprint: fingerprint, cleanupDone: make(chan struct{}),
+		}
+		verifyDone := make(chan error, 1)
+		go func() { verifyDone <- fixture.Verify() }()
+		<-firstProbeStarted
+		cleanupDone := make(chan error, 1)
+		go func() { cleanupDone <- fixture.Cleanup() }()
+		select {
+		case <-cleanupProbeStarted:
+		case <-time.After(time.Second):
+			close(releaseFirstProbe)
+			t.Fatal("cleanup waited on the in-flight Verify mutex")
+		}
+		close(releaseFirstProbe)
+		if err := <-verifyDone; err != nil {
+			t.Fatalf("in-flight Verify: %v", err)
+		}
+		if err := <-cleanupDone; err != nil {
+			t.Fatalf("concurrent Cleanup: %v", err)
+		}
+		if !lock.released {
+			t.Fatal("cleanup did not release fixture ownership")
+		}
+	})
+
 	t.Run("injectable apply verify and exact cleanup", func(t *testing.T) {
 		tc := newFakeTC()
 		lock := &fakeFixtureLock{}
@@ -45,6 +151,20 @@ func TestApplyAndCleanup(t *testing.T) {
 		}
 	})
 
+	t.Run("injectable bandwidth profile lifecycle", func(t *testing.T) {
+		tc := newFakeTC()
+		fixture, err := applyWithDeps(Profile{Bandwidth: 10_000_000}, fakeFixtureDeps(tc, &fakeFixtureLock{}, newFakeQdiscWatcher()))
+		if err != nil {
+			t.Fatalf("applyWithDeps: %v", err)
+		}
+		if err := fixture.Verify(); err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if err := fixture.Cleanup(); err != nil {
+			t.Fatalf("Cleanup: %v", err)
+		}
+	})
+
 	t.Run("preexisting root is rejected without deletion", func(t *testing.T) {
 		tc := newFakeTC()
 		tc.setState(qdiscJSON(qdiscFixture{Kind: "fq_codel", Handle: "8001:", Root: true, Options: map[string]any{"limit": 10240}}))
@@ -62,11 +182,12 @@ func TestApplyAndCleanup(t *testing.T) {
 	})
 
 	for _, scenario := range []struct {
-		name  string
-		state []byte
+		name        string
+		state       []byte
+		wantRelease bool
 	}{
-		{name: "external deletion", state: defaultQdiscJSON()},
-		{name: "external replacement", state: qdiscJSON(qdiscFixture{Kind: "fq_codel", Handle: "9001:", Root: true})},
+		{name: "external deletion", state: defaultQdiscJSON(), wantRelease: true},
+		{name: "external replacement", state: qdiscJSON(qdiscFixture{Kind: "fq_codel", Handle: "9001:", Root: true}), wantRelease: true},
 		{name: "same handle changed options", state: qdiscJSON(qdiscFixture{Kind: "tbf", Handle: "1234:", Root: true, Options: map[string]any{"rate": 1}})},
 	} {
 		t.Run(scenario.name+" is invalid and never broadly deleted", func(t *testing.T) {
@@ -88,8 +209,8 @@ func TestApplyAndCleanup(t *testing.T) {
 			if got := tc.commandPrefixCount("qdisc", "del"); got != beforeDeleteCount {
 				t.Fatalf("cleanup deleted unowned qdisc; commands=%v", tc.commandsSnapshot())
 			}
-			if !lock.released {
-				t.Fatal("ownership lock not released after interference")
+			if lock.released != scenario.wantRelease {
+				t.Fatalf("ownership lock release=%v, want %v", lock.released, scenario.wantRelease)
 			}
 		})
 	}
@@ -126,14 +247,114 @@ func TestApplyAndCleanup(t *testing.T) {
 
 	t.Run("delete race is classified as stimulus invalidity", func(t *testing.T) {
 		tc := newFakeTC()
-		fixture, err := applyWithDeps(Realistic50M, fakeFixtureDeps(tc, &fakeFixtureLock{}, newFakeQdiscWatcher()))
+		lock := &fakeFixtureLock{}
+		fixture, err := applyWithDeps(Realistic50M, fakeFixtureDeps(tc, lock, newFakeQdiscWatcher()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		tc.failDeleteWithState = defaultQdiscJSON()
+		tc.failDeleteWithState = qdiscJSON(qdiscFixture{Kind: "fq_codel", Handle: "9001:", Root: true})
 		err = fixture.Cleanup()
-		if !errors.Is(err, ErrStimulusInvalid) || !strings.Contains(err.Error(), "changed while cleanup") {
+		if !errors.Is(err, ErrStimulusInvalid) || !strings.Contains(err.Error(), "external root is present") {
 			t.Fatalf("Cleanup error=%v, want delete-race invalidity", err)
+		}
+		if !lock.released {
+			t.Fatal("ownership lock retained after exact probe proved generated handles absent")
+		}
+	})
+
+	for _, scenario := range []struct {
+		name    string
+		profile Profile
+		failAdd int
+	}{
+		{name: "root add", profile: Realistic50M, failAdd: 1},
+		{name: "child add", profile: LossyWAN, failAdd: 2},
+	} {
+		t.Run(scenario.name+" side effect then timeout is rolled back", func(t *testing.T) {
+			tc := newFakeTC()
+			tc.failAddAfterMutationAt = scenario.failAdd
+			lock := &fakeFixtureLock{}
+			_, err := applyWithDeps(scenario.profile, fakeFixtureDeps(tc, lock, newFakeQdiscWatcher()))
+			if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("apply error=%v, want deadline", err)
+			}
+			if !lock.released {
+				t.Fatal("ownership lock was not released after rollback proved absence")
+			}
+			state, probeErr := probeQdiscs(tc.run)
+			if probeErr != nil {
+				t.Fatal(probeErr)
+			}
+			if activeRoot(state.records) != nil || !handlesAbsent(state.records, "1234:", "5678:") {
+				t.Fatalf("timed-out add contaminated qdisc state: %s", state.canonical)
+			}
+		})
+	}
+
+	t.Run("delete side effect then timeout proves absence before release", func(t *testing.T) {
+		tc := newFakeTC()
+		lock := &fakeFixtureLock{}
+		fixture, err := applyWithDeps(Realistic50M, fakeFixtureDeps(tc, lock, newFakeQdiscWatcher()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.failDeleteAfterMutation = true
+		err = fixture.Cleanup()
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Cleanup error=%v, want delete deadline", err)
+		}
+		if !lock.released {
+			t.Fatal("ownership lock was not released after delete absence proof")
+		}
+		state, probeErr := probeQdiscs(tc.run)
+		if probeErr != nil {
+			t.Fatal(probeErr)
+		}
+		if activeRoot(state.records) != nil || !handlesAbsent(state.records, "1234:", "5678:") {
+			t.Fatalf("timed-out delete left qdisc state: %s", state.canonical)
+		}
+	})
+
+	t.Run("delete timeout without side effect retains ownership lock", func(t *testing.T) {
+		tc := newFakeTC()
+		lock := &fakeFixtureLock{}
+		fixture, err := applyWithDeps(Realistic50M, fakeFixtureDeps(tc, lock, newFakeQdiscWatcher()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc.failDeleteWithoutMutation = true
+		err = fixture.Cleanup()
+		if !errors.Is(err, ErrStimulusInvalid) || !strings.Contains(err.Error(), "rollback did not prove absence") {
+			t.Fatalf("Cleanup error=%v, want unresolved delete invalidity", err)
+		}
+		if lock.released {
+			t.Fatal("ownership lock released while the generated qdisc remained installed")
+		}
+	})
+
+	t.Run("unresolved add outcome retains ownership lock", func(t *testing.T) {
+		tc := newFakeTC()
+		lock := &fakeFixtureLock{}
+		mutationStarted := false
+		run := func(args ...string) ([]byte, error) {
+			if mutationStarted && containsArg(args, "show") {
+				return nil, context.DeadlineExceeded
+			}
+			out, err := tc.run(args...)
+			if len(args) >= 2 && args[0] == "qdisc" && args[1] == "add" {
+				mutationStarted = true
+				return out, context.DeadlineExceeded
+			}
+			return out, err
+		}
+		deps := fakeFixtureDeps(tc, lock, newFakeQdiscWatcher())
+		deps.run = run
+		_, err := applyWithDeps(Realistic50M, deps)
+		if !errors.Is(err, ErrStimulusInvalid) || !strings.Contains(err.Error(), "cannot probe qdisc ownership") {
+			t.Fatalf("apply error=%v, want unresolved contamination", err)
+		}
+		if lock.released {
+			t.Fatal("ownership lock released despite unresolved qdisc outcome")
 		}
 	})
 
@@ -152,76 +373,91 @@ func TestApplyAndCleanup(t *testing.T) {
 		}
 	})
 
-	t.Run("real tc integration", func(t *testing.T) {
-		if testing.Short() || !testCanManageTC() {
-			t.Skip("requires Linux root with tc")
-		}
-		fixture, err := ApplyChecked(Realistic50M)
-		if err != nil {
-			t.Fatalf("ApplyChecked(Realistic50M): %v", err)
-		}
-		if err := fixture.Verify(); err != nil {
-			_ = fixture.Cleanup()
-			t.Fatalf("Verify: %v", err)
-		}
-		if err := fixture.Cleanup(); err != nil {
-			t.Fatalf("Cleanup: %v", err)
-		}
-	})
-
-	t.Run("real external replacement is observable and preserved", func(t *testing.T) {
-		if testing.Short() || !testCanManageTC() {
-			t.Skip("requires Linux root with tc")
-		}
-		fixture, err := ApplyChecked(Realistic50M)
-		if err != nil {
-			t.Fatalf("ApplyChecked(Realistic50M): %v", err)
-		}
-
-		const externalHandle = "9999:"
-		deleteExternal := func() {
-			_, _ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "handle", externalHandle).CombinedOutput()
-		}
-		defer deleteExternal()
-		out, err := exec.Command(
-			"tc", "qdisc", "replace", "dev", "lo", "root", "handle", externalHandle,
-			"netem", "delay", "1ms",
-		).CombinedOutput()
-		if err != nil {
-			_ = fixture.Cleanup()
-			t.Fatalf("replace fixture qdisc: %v (%s)", err, out)
-		}
-
-		select {
-		case err := <-fixture.Changes():
-			if !errors.Is(err, ErrStimulusInvalid) {
-				t.Fatalf("change error=%v, want ErrStimulusInvalid", err)
+	if tcIntegrationRequested() {
+		t.Run("real tc integration", func(t *testing.T) {
+			requireTCIntegration(t)
+			fixture, err := ApplyChecked(Realistic50M)
+			if err != nil {
+				t.Fatalf("ApplyChecked(Realistic50M): %v", err)
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("qdisc replacement produced no netlink invalidation")
-		}
-		if err := fixture.Verify(); !errors.Is(err, ErrStimulusInvalid) {
-			t.Fatalf("Verify error=%v, want ErrStimulusInvalid", err)
-		}
-		if err := fixture.Cleanup(); !errors.Is(err, ErrStimulusInvalid) {
-			t.Fatalf("Cleanup error=%v, want ErrStimulusInvalid", err)
-		}
+			if err := fixture.Verify(); err != nil {
+				_ = fixture.Cleanup()
+				t.Fatalf("Verify: %v", err)
+			}
+			if err := fixture.Cleanup(); err != nil {
+				t.Fatalf("Cleanup: %v", err)
+			}
+		})
 
-		state, err := exec.Command("tc", "-j", "qdisc", "show", "dev", "lo").CombinedOutput()
-		if err != nil {
-			t.Fatalf("inspect external qdisc: %v (%s)", err, state)
-		}
-		if !strings.Contains(string(state), `"handle":"`+externalHandle+`"`) {
-			t.Fatalf("fixture cleanup removed external qdisc: %s", state)
-		}
-	})
+		t.Run("real external replacement is observable and preserved", func(t *testing.T) {
+			requireTCIntegration(t)
+			fixture, err := ApplyChecked(Realistic50M)
+			if err != nil {
+				t.Fatalf("ApplyChecked(Realistic50M): %v", err)
+			}
+
+			const externalHandle = "9999:"
+			deleteExternal := func() {
+				_, _ = exec.Command("tc", "qdisc", "del", "dev", "lo", "root", "handle", externalHandle).CombinedOutput()
+			}
+			defer deleteExternal()
+			out, err := exec.Command(
+				"tc", "qdisc", "replace", "dev", "lo", "root", "handle", externalHandle,
+				"netem", "delay", "1ms",
+			).CombinedOutput()
+			if err != nil {
+				_ = fixture.Cleanup()
+				t.Fatalf("replace fixture qdisc: %v (%s)", err, out)
+			}
+
+			select {
+			case err := <-fixture.Changes():
+				if !errors.Is(err, ErrStimulusInvalid) {
+					t.Fatalf("change error=%v, want ErrStimulusInvalid", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("qdisc replacement produced no netlink invalidation")
+			}
+			if err := fixture.Verify(); !errors.Is(err, ErrStimulusInvalid) {
+				t.Fatalf("Verify error=%v, want ErrStimulusInvalid", err)
+			}
+			if err := fixture.Cleanup(); !errors.Is(err, ErrStimulusInvalid) {
+				t.Fatalf("Cleanup error=%v, want ErrStimulusInvalid", err)
+			}
+
+			state, err := exec.Command("tc", "-j", "qdisc", "show", "dev", "lo").CombinedOutput()
+			if err != nil {
+				t.Fatalf("inspect external qdisc: %v (%s)", err, state)
+			}
+			if !strings.Contains(string(state), `"handle":"`+externalHandle+`"`) {
+				t.Fatalf("fixture cleanup removed external qdisc: %s", state)
+			}
+
+			deleteExternal()
+			managed, ok := fixture.(*managedFixture)
+			if !ok {
+				t.Fatalf("fixture type %T does not expose retained integration lock", fixture)
+			}
+			clean, err := probeQdiscs(managed.run)
+			if err != nil {
+				t.Fatalf("prove external qdisc cleanup: %v", err)
+			}
+			if active := activeRoot(clean.records); active != nil {
+				t.Fatalf("external qdisc cleanup left kind=%s handle=%s", active.Kind, active.Handle)
+			}
+			if err := managed.lock.Release(); err != nil {
+				t.Fatalf("release retained integration lock after absence proof: %v", err)
+			}
+		})
+	}
 }
 
 // TestApplyShapesBandwidth proves the real shaper limits loopback throughput.
 func TestApplyShapesBandwidth(t *testing.T) {
-	if testing.Short() || !testCanManageTC() {
-		t.Skip("requires Linux root with tc")
+	if !tcIntegrationRequested() {
+		t.Skip("set RENDR_CHAOS_INTEGRATION=1 and run this package deliberately with go test -p=1")
 	}
+	requireTCIntegration(t)
 	fixture, err := ApplyChecked(Profile{Bandwidth: 10_000_000})
 	if err != nil {
 		t.Fatalf("ApplyChecked: %v", err)
@@ -244,6 +480,23 @@ func TestApplyShapesBandwidth(t *testing.T) {
 	if err := fixture.Verify(); err != nil {
 		t.Fatalf("shaping changed during throughput test: %v", err)
 	}
+}
+
+func requireTCIntegration(t *testing.T) {
+	t.Helper()
+	if !tcIntegrationRequested() {
+		t.Fatal("tc integration requires RENDR_CHAOS_INTEGRATION=1")
+	}
+	if testing.Short() {
+		t.Fatal("RENDR_CHAOS_INTEGRATION=1 is incompatible with -short")
+	}
+	if !testCanManageTC() {
+		t.Fatal("RENDR_CHAOS_INTEGRATION=1 requires Linux root with tc in PATH")
+	}
+}
+
+func tcIntegrationRequested() bool {
+	return os.Getenv("RENDR_CHAOS_INTEGRATION") == "1"
 }
 
 func measureTCPThroughput(t *testing.T, mb int) float64 {
@@ -341,10 +594,14 @@ func defaultQdiscJSON() []byte {
 }
 
 type fakeTC struct {
-	mu                  sync.Mutex
-	state               []byte
-	commands            [][]string
-	failDeleteWithState []byte
+	mu                        sync.Mutex
+	state                     []byte
+	commands                  [][]string
+	failDeleteWithState       []byte
+	failAddAfterMutationAt    int
+	failDeleteAfterMutation   bool
+	failDeleteWithoutMutation bool
+	addCalls                  int
 }
 
 func newFakeTC() *fakeTC { return &fakeTC{state: defaultQdiscJSON()} }
@@ -357,6 +614,7 @@ func (f *fakeTC) run(args ...string) ([]byte, error) {
 		return append([]byte(nil), f.state...), nil
 	}
 	if len(args) >= 2 && args[0] == "qdisc" && args[1] == "add" {
+		f.addCalls++
 		handle := argAfter(args, "handle")
 		parent := argAfter(args, "parent")
 		root := containsArg(args, "root")
@@ -377,9 +635,15 @@ func (f *fakeTC) run(args ...string) ([]byte, error) {
 			existing = append(existing, added[0])
 			f.state, _ = json.Marshal(existing)
 		}
+		if f.failAddAfterMutationAt == f.addCalls {
+			return []byte("timed out after add side effect"), context.DeadlineExceeded
+		}
 		return nil, nil
 	}
 	if len(args) >= 2 && args[0] == "qdisc" && args[1] == "del" {
+		if f.failDeleteWithoutMutation {
+			return []byte("timed out before delete side effect"), context.DeadlineExceeded
+		}
 		if f.failDeleteWithState != nil {
 			f.state = append([]byte(nil), f.failDeleteWithState...)
 			return []byte("qdisc changed concurrently"), errors.New("exit status 2")
@@ -390,6 +654,9 @@ func (f *fakeTC) run(args ...string) ([]byte, error) {
 		for _, record := range records {
 			if record.Root && record.Handle == handle {
 				f.state = defaultQdiscJSON()
+				if f.failDeleteAfterMutation {
+					return []byte("timed out after delete side effect"), context.DeadlineExceeded
+				}
 				return nil, nil
 			}
 		}

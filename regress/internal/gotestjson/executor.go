@@ -32,7 +32,7 @@ type Request struct {
 	// CommandPrefix wraps the go invocation without a shell. For example,
 	// []string{"setpriv", "--bounding-set=-net_admin"} executes
 	// "setpriv ... go test -json ..." while preserving JSON validation and
-	// process-group cancellation.
+	// process containment, cancellation, and cleanup.
 	CommandPrefix []string
 }
 
@@ -45,6 +45,16 @@ type Executor struct {
 	Parser       Parser
 
 	commandContext func(context.Context, string, ...string) *exec.Cmd
+	containProcess func(*exec.Cmd) (processContainment, error)
+}
+
+type processContainment interface {
+	cleanup(time.Duration, bool) processCleanupResult
+}
+
+type processCleanupResult struct {
+	evidence ProcessCleanupEvidence
+	err      error
 }
 
 // Run executes a request with the default Executor.
@@ -54,7 +64,8 @@ func Run(ctx context.Context, request Request) (Result, error) {
 
 // Run executes go test -json and validates the result. A represented test
 // failure is reported as IssueTestFailed; a non-zero command without such a
-// failure additionally reports IssueCommandFailed.
+// failure additionally reports IssueCommandFailed. On Linux, surviving
+// descendants invalidate the result even when the command exits successfully.
 func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 	if issues := validateRequest(ctx, request, e); len(issues) != 0 {
 		result, _ := initialResult(request.Expected)
@@ -87,7 +98,17 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		cmd.Env = append(os.Environ(), request.Env...)
 	}
 	cmd.WaitDelay = waitDelay
-	configureProcessGroup(cmd)
+	containProcess := e.containProcess
+	if containProcess == nil {
+		containProcess = configureProcessContainment
+	}
+	containment, containmentErr := containProcess(cmd)
+	if containmentErr != nil {
+		result, _ := initialResult(request.Expected)
+		result.Command = command
+		result.Issues = []Issue{{Code: IssueProcessContainment, Detail: containmentErr.Error()}}
+		return result, resultError(result.Issues)
+	}
 
 	jsonCapture := &boundedBuffer{limit: maxJSONBytes}
 	stderrCapture := &boundedBuffer{limit: maxJSONBytes}
@@ -95,6 +116,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 	cmd.Stderr = stderrCapture
 	started := time.Now()
 	runErr := cmd.Run()
+	processCleanup := containment.cleanup(waitDelay, ctx.Err() == nil)
 	duration := time.Since(started)
 
 	result, _ := e.Parser.Parse(bytes.NewReader(jsonCapture.Bytes()), request.Expected)
@@ -102,6 +124,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 	result.Duration = duration
 	result.CommandOutput = joinCommandDiagnostics(result.CommandOutput, stderrCapture.Bytes())
 	result.CommandOutputTruncated = result.CommandOutputTruncated || stderrCapture.Truncated()
+	result.ProcessCleanup = processCleanup.evidence
 	issues := append([]Issue(nil), result.Issues...)
 
 	if jsonCapture.Truncated() || stderrCapture.Truncated() {
@@ -122,6 +145,18 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 			}
 			issues = append(issues, Issue{Code: IssueCommandFailed, Detail: detail})
 		}
+	}
+	if processCleanup.evidence.LeakDetected {
+		detail := fmt.Sprintf(
+			"containment=%s detected %d surviving descendants; termination_confirmed=%t",
+			processCleanup.evidence.Method,
+			processCleanup.evidence.DescendantCount,
+			processCleanup.evidence.TerminationConfirmed,
+		)
+		issues = append(issues, Issue{Code: IssueProcessLeak, Detail: detail})
+	}
+	if processCleanup.err != nil {
+		issues = append(issues, Issue{Code: IssueProcessCleanup, Detail: processCleanup.err.Error()})
 	}
 
 	result.Issues = issues

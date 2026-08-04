@@ -2,6 +2,19 @@
 
 package gotestjson
 
-import "os/exec"
+import (
+	"os/exec"
+	"time"
+)
 
-func configureProcessGroup(_ *exec.Cmd) {}
+type unsupportedProcessContainment struct{}
+
+func configureProcessContainment(_ *exec.Cmd) (processContainment, error) {
+	return unsupportedProcessContainment{}, nil
+}
+
+func (unsupportedProcessContainment) cleanup(_ time.Duration, _ bool) processCleanupResult {
+	return processCleanupResult{evidence: ProcessCleanupEvidence{
+		Method: ProcessContainmentNone,
+	}}
+}

@@ -131,7 +131,7 @@ func validateSources(sources []tierSource) error {
 			specs = append(specs, spec)
 		}
 	}
-	if err := manifest.Validate(specs); err != nil {
+	if err := manifest.ValidateCensus(specs); err != nil {
 		return fmt.Errorf("catalog: %w", err)
 	}
 	return nil

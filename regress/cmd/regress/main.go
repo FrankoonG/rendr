@@ -12,8 +12,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/FrankoonG/rendr/regress/internal/catalog"
@@ -49,28 +52,30 @@ const (
 )
 
 const (
-	listSchemaVersion       = 3
-	invocationSchemaVersion = 5
-	junitReportFileName     = "junit.xml"
-	markdownReportFileName  = "SUMMARY.md"
-	jsonReportFileName      = "report.json"
+	listSchemaVersion       = 6
+	invocationSchemaVersion = report.InvocationSchemaVersion
+	junitReportFileName     = report.JUnitReportFileName
+	markdownReportFileName  = report.MarkdownReportFileName
+	jsonReportFileName      = report.JSONReportFileName
 )
 
 type runFlags struct {
-	phase            string
-	tier             string
-	full             bool
-	tunFull          bool
-	list             bool
-	forcePhase2      bool
-	allowNonLinux    bool
-	profile          string
-	caseID           string
-	fromCaseID       string
-	selectorID       string
-	requestedCaseIDs []string
-	reportDir        string
-	rendrRoot        string
+	phase                  string
+	tier                   string
+	full                   bool
+	tunFull                bool
+	list                   bool
+	forcePhase2            bool
+	allowNonLinux          bool
+	allowUnprovenContracts bool
+	profile                string
+	caseID                 string
+	fromCaseID             string
+	selectorID             string
+	requestedCaseIDs       []string
+	phase1Authorization    *report.Phase1Authorization
+	reportDir              string
+	rendrRoot              string
 }
 
 func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
@@ -84,6 +89,7 @@ func parseFlags(args []string, stderr io.Writer) (runFlags, error) {
 	fs.BoolVar(&cfg.list, "list", false, "write the selected case manifests as JSON and exit")
 	fs.BoolVar(&cfg.forcePhase2, "force-phase2", false, "skip the phase-1 gate (local debug only)")
 	fs.BoolVar(&cfg.allowNonLinux, "allow-non-linux", false, "bypass the Linux-only execution check")
+	fs.BoolVar(&cfg.allowUnprovenContracts, "allow-unproven-contracts", false, "allow audited legacy cases with blocked manifest contracts (baseline only)")
 	fs.StringVar(&cfg.profile, "profile", "", "legacy T3 profile filter (unsupported; use --case)")
 	fs.StringVar(&cfg.caseID, "case", "", "run exactly one globally registered case")
 	fs.StringVar(&cfg.fromCaseID, "from-case", "", "resume inclusively from a registered case")
@@ -103,6 +109,20 @@ type preparedCommand struct {
 	normal *runplan.Plan
 	tun    *tunSelection
 	list   *listDocument
+}
+
+type invocationReportStore struct {
+	invalidate func(context.Context) error
+	publish    func(context.Context, *report.Suite) error
+	verify     func(context.Context) (report.VerifiedSet, error)
+}
+
+func reportStoreForLease(lease *report.ReportSetLease) invocationReportStore {
+	return invocationReportStore{
+		invalidate: lease.Invalidate,
+		publish:    lease.Publish,
+		verify:     lease.Verify,
+	}
 }
 
 func main() {
@@ -144,8 +164,14 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 	}
 	cfg.rendrRoot = root
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// Restore default signal handling after the first signal so a second
+		// signal can force termination even if cleanup is blocked.
+		stop()
+	}()
 	if prepared.tun != nil {
 		return executeTUN(ctx, cfg, *prepared.tun, stdout, stderr)
 	}
@@ -224,6 +250,9 @@ func validateFlagCombinations(cfg runFlags) error {
 	if cfg.list && cfg.forcePhase2 {
 		return errors.New("--force-phase2 cannot be combined with --list")
 	}
+	if cfg.list && cfg.allowUnprovenContracts {
+		return errors.New("--allow-unproven-contracts cannot be combined with --list")
+	}
 	if cfg.profile != "" {
 		return errors.New("--profile is not supported by the registered case runners; use --case")
 	}
@@ -250,7 +279,7 @@ func loadCatalogs() ([]manifest.Spec, tunCatalog, error) {
 
 func validateGlobalCatalogNames(normalSpecs []manifest.Spec, tunCases tunCatalog) error {
 	all := append(append([]manifest.Spec(nil), normalSpecs...), tunCases.specs...)
-	if err := manifest.Validate(all); err != nil {
+	if err := manifest.ValidateCensus(all); err != nil {
 		return fmt.Errorf("global catalog validation failed: %w", err)
 	}
 	normalIDs := make(map[string]bool, len(normalSpecs))
@@ -398,11 +427,42 @@ var tierCommands = map[string]tierCommand{
 	},
 }
 
-func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout, stderr io.Writer) int {
+var phase1SpecsProvider = loadCanonicalPhase1Specs
+
+func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout, stderr io.Writer) (exitCode int) {
+	if plan.CompletePhase1 && plan.HasPhase2() && cfg.allowUnprovenContracts && !cfg.forcePhase2 {
+		fmt.Fprintln(stderr, "regress: a combined unproven baseline cannot authorize its own phase 2; rerun with --force-phase2 for audited baseline collection")
+		return exitPhase1Stale
+	}
 	selected, err := specsForPlan(plan, catalog.ByTier)
 	if err != nil {
 		fmt.Fprintln(stderr, "regress: cannot resolve selected manifest:", err)
 		return exitEnvError
+	}
+	if err := requireContractProofOptIn(selected, cfg.allowUnprovenContracts); err != nil {
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
+	lease, err := report.AcquireReportSetLease(ctx, cfg.reportDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: cannot acquire report invocation lease:", err)
+		return exitEnvError
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			fmt.Fprintln(stderr, "regress: cannot release report invocation lease:", err)
+			exitCode = exitEnvError
+		}
+	}()
+	reportStore := reportStoreForLease(lease)
+	if requiresExistingPhase1Gate(plan) && !cfg.forcePhase2 {
+		authorization, err := verifyPhase1Gate(ctx, cfg.reportDir, cfg.rendrRoot)
+		if err != nil {
+			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
+			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
+			return exitPhase1Stale
+		}
+		cfg.phase1Authorization = &authorization
 	}
 	suite, revisionStart, err := beginInvocation(
 		ctx,
@@ -411,25 +471,16 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 		selected,
 		gate.CurrentRevision,
 		environment.Capture,
-		writeReports,
+		reportStore,
 	)
 	if err != nil {
 		fmt.Fprintln(stderr, "regress: cannot initialize invocation report:", err)
 		return exitEnvError
 	}
 
-	if requiresExistingPhase1Gate(plan) && !cfg.forcePhase2 {
-		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
-			persistInvocationFailure(ctx, suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
-			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
-			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
-			return exitPhase1Stale
-		}
-	}
-
 	if plan.CompletePhase1 {
 		if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "running", time.Now()); err != nil {
-			persistInvocationFailure(ctx, suite, cfg, revisionStart, "cannot invalidate prior phase 1 gate: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "cannot invalidate prior phase 1 gate: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
 			fmt.Fprintln(stderr, "regress: cannot invalidate prior phase 1 gate:", err)
 			return exitEnvError
 		}
@@ -438,14 +489,14 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 	for i, run := range plan.Runs {
 		command, ok := tierCommands[run.Tier]
 		if !ok {
-			persistInvocationFailure(ctx, suite, cfg, revisionStart, "execution plan contains unknown tier "+run.Tier, gate.CurrentRevision, environment.Capture, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "execution plan contains unknown tier "+run.Tier, gate.CurrentRevision, environment.Capture, reportStore, stderr)
 			fmt.Fprintf(stderr, "regress: execution plan contains unknown tier %q\n", run.Tier)
 			return exitEnvError
 		}
 		fmt.Fprintf(stdout, "== %s ==\n", command.title)
 		expected, err := specsForTierRun(run)
 		if err != nil {
-			persistInvocationFailure(ctx, suite, cfg, revisionStart, "cannot resolve planned cases: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "cannot resolve planned cases: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
 			fmt.Fprintln(stderr, "regress: cannot resolve planned cases:", err)
 			return exitEnvError
 		}
@@ -463,9 +514,26 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 		if revisionErr != nil {
 			suite.FailRun(revisionErr.Error())
 		}
-		suite.Complete = i == len(plan.Runs)-1 && reconcileErr == nil && environmentErr == nil && revisionErr == nil
-		if err := writeReports(suite, cfg.reportDir); err != nil {
-			fmt.Fprintf(stderr, "regress: cannot write %s reports: %v\n", run.Tier, err)
+		blocker, aborted := invocationAbortBlocker(ctx, suite, reconcileErr, environmentErr, revisionErr)
+		if aborted {
+			if finalErr := finalizeAbortedInvocation(selected, suite, blocker); finalErr != nil {
+				suite.FailRun("cannot project aborted invocation: " + finalErr.Error())
+			}
+		} else {
+			suite.Complete = i == len(plan.Runs)-1
+		}
+		publishCtx, cancelPublish := reportPublicationContext(ctx)
+		publishErr := reportStore.publish(publishCtx, suite)
+		cancelPublish()
+		if publishErr != nil {
+			fmt.Fprintf(stderr, "regress: cannot write %s reports: %v\n", run.Tier, publishErr)
+			return exitEnvError
+		}
+		if ctx.Err() != nil {
+			if isPhase1Tier(run.Tier) {
+				writeRedPhase1Gate(cfg, stderr)
+			}
+			fmt.Fprintln(stderr, "regress: invocation canceled:", ctx.Err())
 			return exitEnvError
 		}
 		if revisionErr != nil {
@@ -482,40 +550,78 @@ func executeNormal(ctx context.Context, cfg runFlags, plan runplan.Plan, stdout,
 			fmt.Fprintln(stderr, "regress: invocation environment invalid:", environmentErr)
 			return exitEnvError
 		}
-		if reconcileErr != nil || suite.AnyFailedAt(run.Tier) {
+		if reconcileErr != nil || suite.AnyFailed() {
 			if isPhase1Tier(run.Tier) {
 				writeRedPhase1Gate(cfg, stderr)
 			}
 			fmt.Fprintf(stderr, "%s: FAILED\n", run.Tier)
 			return command.exitCode
 		}
-		fmt.Fprintf(stdout, "%s: GREEN\n", run.Tier)
+		fmt.Fprintf(stdout, "%s: %s\n", run.Tier, contractResultLabel(suite))
 
 		if isLastPhase1Run(plan.Runs, i) {
-			if shouldWriteGreenPhase1Gate(plan) {
-				if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "green", time.Now()); err != nil {
+			if shouldWriteGreenPhase1Gate(plan) && !cfg.allowUnprovenContracts && !cfg.allowNonLinux {
+				phase1Specs, err := phase1SpecsProvider()
+				if err != nil {
+					writeRedPhase1Gate(cfg, stderr)
+					fmt.Fprintln(stderr, "regress: phase 1 manifest resolution failed:", err)
+					return exitEnvError
+				}
+				proofSuite, err := buildPhase1ProofSuite(suite, phase1Specs)
+				if err != nil {
+					writeRedPhase1Gate(cfg, stderr)
+					fmt.Fprintln(stderr, "regress: phase 1 proof projection failed:", err)
+					return exitEnvError
+				}
+				verified, err := publishPhase1Proof(ctx, cfg.reportDir, proofSuite, phase1Specs)
+				if err != nil {
+					writeRedPhase1Gate(cfg, stderr)
+					fmt.Fprintln(stderr, "regress: phase 1 proof publication failed:", err)
+					return exitEnvError
+				}
+				if err := writeKnownPhase1Gate(cfg.reportDir, revisionStart, "green", time.Now(), verified.Manifest); err != nil {
 					suite.Complete = false
 					suite.FailRun("cannot persist phase 1 state: " + err.Error())
-					if reportErr := writeReports(suite, cfg.reportDir); reportErr != nil {
+					if reportErr := reportStore.publish(ctx, suite); reportErr != nil {
 						fmt.Fprintln(stderr, "regress: cannot persist invocation failure report:", reportErr)
 					}
 					fmt.Fprintln(stderr, "regress: cannot persist phase 1 state:", err)
 					return exitEnvError
 				}
+				if plan.HasPhase2() {
+					authorization := phase1Authorization(revisionStart, verified.Manifest)
+					suite.Invocation.Phase1Authorization = &authorization
+				}
 				fmt.Fprintln(stdout, "phase 1: GREEN")
+			} else if shouldWriteGreenPhase1Gate(plan) {
+				writeRedPhase1Gate(cfg, stderr)
+				fmt.Fprintln(stdout, "phase 1: UNPROVEN (green gate not written)")
 			} else {
 				fmt.Fprintln(stdout, "phase 1: PARTIAL (green gate unchanged)")
 			}
 		}
 	}
-	if err := requirePassingFinalReport(cfg.reportDir, suite); err != nil {
+	if requiresPhase1Authorization(selected) && !cfg.forcePhase2 {
+		if err := verifyFinalPhase1Authorization(ctx, cfg, suite); err != nil {
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "final phase 1 authorization verification failed: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
+			fmt.Fprintln(stderr, "regress: final phase 1 authorization verification failed:", err)
+			return exitPhase1Stale
+		}
+	}
+	if err := requirePassingFinalReportStore(ctx, reportStore, suite, selected); err != nil {
+		persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "final report verification failed: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
 		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
+	if err := ctx.Err(); err != nil {
+		persistInvocationFailure(ctx, suite, cfg, revisionStart, selected, "invocation canceled before successful return: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
+		fmt.Fprintln(stderr, "regress: invocation canceled before successful return:", err)
 		return exitEnvError
 	}
 	return exitOK
 }
 
-func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdout, stderr io.Writer) int {
+func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdout, stderr io.Writer) (exitCode int) {
 	planned, err := tunfull.PlanCases(selection.runOrder)
 	if err != nil {
 		fmt.Fprintln(stderr, "regress: invalid prepared TUN plan:", err)
@@ -525,6 +631,31 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 	for i, plannedCase := range planned {
 		expected[i] = plannedCase.Spec()
 	}
+	if err := requireContractProofOptIn(expected, cfg.allowUnprovenContracts); err != nil {
+		fmt.Fprintln(stderr, "regress:", err)
+		return exitEnvError
+	}
+	lease, err := report.AcquireReportSetLease(ctx, cfg.reportDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "regress: cannot acquire report invocation lease:", err)
+		return exitEnvError
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			fmt.Fprintln(stderr, "regress: cannot release report invocation lease:", err)
+			exitCode = exitEnvError
+		}
+	}()
+	reportStore := reportStoreForLease(lease)
+	if !cfg.forcePhase2 {
+		authorization, err := verifyPhase1Gate(ctx, cfg.reportDir, cfg.rendrRoot)
+		if err != nil {
+			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
+			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
+			return exitPhase1Stale
+		}
+		cfg.phase1Authorization = &authorization
+	}
 	cfg.requestedCaseIDs = append([]string(nil), selection.requestedOrder...)
 	suite, revisionStart, err := beginInvocation(
 		ctx,
@@ -533,21 +664,12 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		expected,
 		gate.CurrentRevision,
 		environment.Capture,
-		writeReports,
+		reportStore,
 	)
 	if err != nil {
 		fmt.Fprintln(stderr, "regress: cannot initialize TUN invocation report:", err)
 		return exitEnvError
 	}
-	if !cfg.forcePhase2 {
-		if err := gate.CheckPhase2Allowed(cfg.reportDir, cfg.rendrRoot); err != nil {
-			persistInvocationFailure(ctx, suite, cfg, revisionStart, "phase 2 gate rejected invocation: "+err.Error(), gate.CurrentRevision, environment.Capture, stderr)
-			fmt.Fprintln(stderr, "regress: phase 2 not allowed:", err)
-			fmt.Fprintln(stderr, "  Run a complete phase 1 first, or pass --force-phase2 for local debugging.")
-			return exitPhase1Stale
-		}
-	}
-
 	for i, plannedCase := range planned {
 		spec := plannedCase.Spec()
 		fmt.Fprintf(stdout, "== phase 2 / TUN synthetic L3/session: %s ==\n", spec.ID)
@@ -565,22 +687,23 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 		if revisionErr != nil {
 			suite.FailRun(revisionErr.Error())
 		}
-		caseFailed := reconcileErr != nil || suite.AnyFailedAt("T7")
-		if caseFailed {
-			for _, remaining := range expected[i+1:] {
-				suite.Add(tunfull.NotRunCase(remaining, spec.ID))
-			}
-			if finalErr := reconcileReportRows(expected, suite.Cases); finalErr != nil {
+		blocker, aborted := invocationAbortBlocker(ctx, suite, reconcileErr, environmentErr, revisionErr)
+		if aborted {
+			if finalErr := finalizeAbortedInvocation(expected, suite, blocker); finalErr != nil {
 				suite.FailRun("TUN final manifest reconciliation failed: " + finalErr.Error())
-				suite.Complete = false
-			} else {
-				suite.Complete = environmentErr == nil && revisionErr == nil
 			}
 		} else {
-			suite.Complete = i == len(expected)-1 && environmentErr == nil && revisionErr == nil
+			suite.Complete = i == len(expected)-1
 		}
-		if err := writeReports(suite, cfg.reportDir); err != nil {
-			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", err)
+		publishCtx, cancelPublish := reportPublicationContext(ctx)
+		publishErr := reportStore.publish(publishCtx, suite)
+		cancelPublish()
+		if publishErr != nil {
+			fmt.Fprintln(stderr, "regress: cannot write TUN reports:", publishErr)
+			return exitEnvError
+		}
+		if ctx.Err() != nil {
+			fmt.Fprintln(stderr, "regress: TUN invocation canceled:", ctx.Err())
 			return exitEnvError
 		}
 		if revisionErr != nil {
@@ -591,16 +714,29 @@ func executeTUN(ctx context.Context, cfg runFlags, selection tunSelection, stdou
 			fmt.Fprintln(stderr, "regress: TUN invocation environment invalid:", environmentErr)
 			return exitEnvError
 		}
-		if caseFailed {
+		if aborted {
 			fmt.Fprintln(stderr, "phase 2 / TUN synthetic L3/session: FAILED")
 			return exitT7Fail
 		}
 	}
-	if err := requirePassingFinalReport(cfg.reportDir, suite); err != nil {
+	if !cfg.forcePhase2 {
+		if err := verifyFinalPhase1Authorization(ctx, cfg, suite); err != nil {
+			persistInvocationFailure(ctx, suite, cfg, revisionStart, expected, "final phase 1 authorization verification failed: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
+			fmt.Fprintln(stderr, "regress: final phase 1 authorization verification failed:", err)
+			return exitPhase1Stale
+		}
+	}
+	if err := requirePassingFinalReportStore(ctx, reportStore, suite, expected); err != nil {
+		persistInvocationFailure(ctx, suite, cfg, revisionStart, expected, "final report verification failed: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
 		fmt.Fprintln(stderr, "regress:", err)
 		return exitEnvError
 	}
-	fmt.Fprintln(stdout, "phase 2 / TUN synthetic L3/session: GREEN (kernel TUN Gold remains separate)")
+	if err := ctx.Err(); err != nil {
+		persistInvocationFailure(ctx, suite, cfg, revisionStart, expected, "TUN invocation canceled before successful return: "+err.Error(), gate.CurrentRevision, environment.Capture, reportStore, stderr)
+		fmt.Fprintln(stderr, "regress: TUN invocation canceled before successful return:", err)
+		return exitEnvError
+	}
+	fmt.Fprintf(stdout, "phase 2 / TUN synthetic L3/session: %s (kernel TUN Gold remains separate)\n", contractResultLabel(suite))
 	return exitOK
 }
 
@@ -647,16 +783,211 @@ func writePhase1Gate(reportDir, rendrRoot, status string) error {
 	return gate.Write(reportDir, state)
 }
 
-func writeKnownPhase1Gate(reportDir string, revision gate.Revision, status string, at time.Time) error {
+func verifyPhase1Gate(ctx context.Context, reportDir, rendrRoot string) (report.Phase1Authorization, error) {
+	if err := gate.CheckPhase2Allowed(reportDir, rendrRoot); err != nil {
+		return report.Phase1Authorization{}, err
+	}
+	state, err := gate.Read(reportDir)
+	if err != nil {
+		return report.Phase1Authorization{}, fmt.Errorf("read phase 1 state: %w", err)
+	}
+	verified, err := report.Verify(ctx, phase1ProofDir(reportDir, state.ReportSetGeneration))
+	if err != nil {
+		return report.Phase1Authorization{}, fmt.Errorf("verify phase 1 report set: %w", err)
+	}
+	phase1Specs, err := phase1SpecsProvider()
+	if err != nil {
+		return report.Phase1Authorization{}, fmt.Errorf("resolve canonical phase 1 manifest: %w", err)
+	}
+	if err := validatePhase1Proof(*state, verified, phase1Specs); err != nil {
+		return report.Phase1Authorization{}, err
+	}
+	return phase1Authorization(gate.Revision{CommitSHA: state.CommitSHA, WorktreeSHA: state.WorktreeSHA}, verified.Manifest), nil
+}
+
+func phase1Authorization(revision gate.Revision, proof report.SetManifest) report.Phase1Authorization {
+	return report.Phase1Authorization{
+		CommitSHA: revision.CommitSHA, WorktreeSHA: revision.WorktreeSHA,
+		ReportSetGeneration: proof.Generation, CanonicalReportDigest: proof.CanonicalReportDigest,
+	}
+}
+
+func verifyFinalPhase1Authorization(ctx context.Context, cfg runFlags, suite *report.Suite) error {
+	authorization, err := verifyPhase1Gate(ctx, cfg.reportDir, cfg.rendrRoot)
+	if err != nil {
+		return err
+	}
+	if suite == nil || suite.Invocation.Phase1Authorization == nil {
+		return errors.New("final report is missing phase-1 authorization")
+	}
+	if *suite.Invocation.Phase1Authorization != authorization {
+		return errors.New("final report phase-1 authorization does not match the current gate proof")
+	}
+	return nil
+}
+
+func loadCanonicalPhase1Specs() ([]manifest.Spec, error) {
+	plan, err := runplan.Build(runplan.Request{Phase: "1"})
+	if err != nil {
+		return nil, err
+	}
+	return specsForPlan(plan, catalog.ByTier)
+}
+
+func buildPhase1ProofSuite(source *report.Suite, expected []manifest.Spec) (*report.Suite, error) {
+	if source == nil {
+		return nil, errors.New("cannot project phase 1 proof from a nil suite")
+	}
+	if source.RunFailure != "" {
+		return nil, errors.New("cannot project phase 1 proof from a failed invocation")
+	}
+	if len(source.Cases) != len(expected) {
+		return nil, fmt.Errorf("phase 1 proof row count is %d, want %d", len(source.Cases), len(expected))
+	}
+	identity, err := buildInvocationIdentity(runFlags{phase: "1"}, manifest.SuiteNormal, expected)
+	if err != nil {
+		return nil, fmt.Errorf("build canonical phase 1 identity: %w", err)
+	}
+	identity.EnvironmentStart = source.Invocation.EnvironmentStart
+	identity.EnvironmentEnd = source.Invocation.EnvironmentEnd
+	identity.RevisionStart = source.Invocation.RevisionStart
+	identity.RevisionEnd = source.Invocation.RevisionEnd
+	proof := &report.Suite{
+		Started:    source.Started,
+		Invocation: identity,
+		Cases:      cloneReportCases(source.Cases),
+		Complete:   true,
+	}
+	if err := reconcileReportRows(expected, proof.Cases); err != nil {
+		return nil, fmt.Errorf("reconcile canonical phase 1 rows: %w", err)
+	}
+	if proof.AnyFailed() {
+		return nil, errors.New("canonical phase 1 projection contains a failing row")
+	}
+	if _, err := proof.ReportDigest(); err != nil {
+		return nil, fmt.Errorf("seal canonical phase 1 proof: %w", err)
+	}
+	return proof, nil
+}
+
+func validatePhase1Proof(state gate.State, verified report.VerifiedSet, expected []manifest.Spec) error {
+	if state.ReportSetGeneration != verified.Manifest.Generation {
+		return fmt.Errorf("phase 1 report generation mismatch: gate=%s report=%s", state.ReportSetGeneration, verified.Manifest.Generation)
+	}
+	if state.CanonicalReportDigest != verified.Manifest.CanonicalReportDigest {
+		return fmt.Errorf("phase 1 report digest mismatch: gate=%s report=%s", state.CanonicalReportDigest, verified.Manifest.CanonicalReportDigest)
+	}
+	if !verified.Report.Complete || verified.Report.State != "pass" {
+		return fmt.Errorf("phase 1 report is not proven passing evidence: state=%s complete=%t", verified.Report.State, verified.Report.Complete)
+	}
+	invocation := verified.Report.Invocation
+	if invocation.SchemaVersion != invocationSchemaVersion {
+		return fmt.Errorf("phase 1 invocation schema is %d, want %d", invocation.SchemaVersion, invocationSchemaVersion)
+	}
+	if invocation.Suite != manifest.SuiteNormal || invocation.Scope != "phase-1" || invocation.Phase != "1" {
+		return fmt.Errorf("phase 1 proof has wrong identity: suite=%q scope=%q phase=%q", invocation.Suite, invocation.Scope, invocation.Phase)
+	}
+	if invocation.Full || invocation.TUNFull || invocation.Forced || invocation.AllowNonLinux || invocation.AllowUnprovenContracts || invocation.ReleaseManifest {
+		return fmt.Errorf("phase 1 proof contains forbidden bypass flags: full=%t tun_full=%t forced=%t non_linux=%t unproven=%t release=%t",
+			invocation.Full, invocation.TUNFull, invocation.Forced, invocation.AllowNonLinux, invocation.AllowUnprovenContracts, invocation.ReleaseManifest)
+	}
+	if !invocation.ContractProofRequired {
+		return errors.New("phase 1 proof does not require contract evidence")
+	}
+	if invocation.Case != "" || invocation.Selector != "" || invocation.FromCase != "" || invocation.Tier != "" {
+		return errors.New("phase 1 proof contains a scoped or filtered request identity")
+	}
+	if invocation.RevisionStart.CommitSHA != state.CommitSHA || invocation.RevisionStart.WorktreeSHA != state.WorktreeSHA ||
+		invocation.RevisionEnd != invocation.RevisionStart {
+		return errors.New("phase 1 proof revision does not match the gate revision")
+	}
+	if invocation.EnvironmentStart.Runtime.GOOS != "linux" || invocation.EnvironmentEnd.Runtime.GOOS != "linux" {
+		return errors.New("phase 1 proof was not captured on Linux")
+	}
+	wantManifestDigest, err := selectedManifestDigest(expected)
+	if err != nil {
+		return fmt.Errorf("digest canonical phase 1 manifest: %w", err)
+	}
+	wantCatalogDigest, err := suiteRegistryDigest(manifest.SuiteNormal)
+	if err != nil {
+		return fmt.Errorf("digest canonical normal catalog: %w", err)
+	}
+	wantIDs := manifestIDs(expected)
+	if invocation.ManifestDigest != wantManifestDigest || invocation.CatalogDigest != wantCatalogDigest ||
+		invocation.SelectedCases != len(wantIDs) || !equalStrings(invocation.SelectedCaseIDs, wantIDs) {
+		return errors.New("phase 1 proof does not match the canonical T1+T2 manifest")
+	}
+	if len(wantIDs) == 0 || invocation.ResumeCaseID != wantIDs[0] || invocation.RequestAnchor != wantIDs[0] ||
+		!equalStrings(invocation.RequestedCaseIDs, wantIDs) {
+		return errors.New("phase 1 proof has an invalid resume identity")
+	}
+	rows := cloneReportCases(verified.Report.Cases)
+	for i, spec := range expected {
+		if spec.Contract == nil || spec.Contract.State != manifest.ContractStateEnforced {
+			return fmt.Errorf("canonical phase 1 contract %q is not enforced", spec.ID)
+		}
+		digest, err := spec.CanonicalDigest()
+		if err != nil {
+			return fmt.Errorf("digest canonical phase 1 case %q: %w", spec.ID, err)
+		}
+		if rows[i].CaseDigest != digest {
+			return fmt.Errorf("phase 1 case %q digest mismatch", spec.ID)
+		}
+		if rows[i].Evidence[report.EvidenceContractStateKey] != string(manifest.ContractStateEnforced) {
+			return fmt.Errorf("phase 1 case %q lacks enforced contract evidence", spec.ID)
+		}
+	}
+	if err := reconcileReportRows(expected, rows); err != nil {
+		return fmt.Errorf("revalidate persisted phase 1 contract evidence: %w", err)
+	}
+	return nil
+}
+
+func cloneReportCases(source []report.Case) []report.Case {
+	cloned := make([]report.Case, len(source))
+	for i, row := range source {
+		cloned[i] = row
+		if row.Evidence != nil {
+			cloned[i].Evidence = make(map[string]string, len(row.Evidence))
+			for key, value := range row.Evidence {
+				cloned[i].Evidence[key] = value
+			}
+		}
+	}
+	return cloned
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func writeKnownPhase1Gate(reportDir string, revision gate.Revision, status string, at time.Time, manifest ...report.SetManifest) error {
 	if revision.CommitSHA == "" || revision.WorktreeSHA == "" {
 		return errors.New("phase 1 revision identity is incomplete")
 	}
-	return gate.Write(reportDir, gate.State{
-		CommitSHA:   revision.CommitSHA,
-		WorktreeSHA: revision.WorktreeSHA,
-		Status:      status,
-		At:          at,
-	})
+	state := gate.State{
+		SchemaVersion: gate.StateSchemaVersion,
+		CommitSHA:     revision.CommitSHA,
+		WorktreeSHA:   revision.WorktreeSHA,
+		Status:        status,
+		At:            at,
+	}
+	if len(manifest) > 1 {
+		return errors.New("phase 1 state received multiple report-set manifests")
+	}
+	if len(manifest) == 1 {
+		state.ReportSetGeneration = manifest[0].Generation
+		state.CanonicalReportDigest = manifest[0].CanonicalReportDigest
+	}
+	return gate.Write(reportDir, state)
 }
 
 func beginInvocation(
@@ -666,7 +997,7 @@ func beginInvocation(
 	selected []manifest.Spec,
 	currentRevision func(string) (gate.Revision, error),
 	captureEnvironment func(context.Context) (environment.Snapshot, error),
-	writer func(*report.Suite, string) error,
+	reports invocationReportStore,
 ) (*report.Suite, gate.Revision, error) {
 	identity, err := buildInvocationIdentity(cfg, suiteName, selected)
 	if err != nil {
@@ -674,9 +1005,12 @@ func beginInvocation(
 	}
 	suite := report.New()
 	suite.Invocation = identity
-	if err := invalidateFixedReports(cfg.reportDir); err != nil {
+	if err := reports.invalidate(ctx); err != nil {
 		suite.FailRun("cannot invalidate stale reports: " + err.Error())
-		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+		if finalErr := finalizeAbortedInvocation(selected, suite, reasonInvocationBlocker(report.BlockerKindHarness, "report-set invalidation failed")); finalErr != nil {
+			suite.FailRun("cannot project aborted invocation: " + finalErr.Error())
+		}
+		if writeErr := reports.publish(ctx, suite); writeErr != nil {
 			return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %v; write failure report: %w", err, writeErr)
 		}
 		return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %w", err)
@@ -685,7 +1019,10 @@ func beginInvocation(
 	snapshot, captureErr := captureEnvironment(ctx)
 	if captureErr != nil {
 		suite.FailRun("cannot capture invocation start environment: " + captureErr.Error())
-		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+		if finalErr := finalizeAbortedInvocation(selected, suite, reasonInvocationBlocker(report.BlockerKindEnvironment, "start environment capture failed")); finalErr != nil {
+			suite.FailRun("cannot project aborted invocation: " + finalErr.Error())
+		}
+		if writeErr := reports.publish(ctx, suite); writeErr != nil {
 			return suite, gate.Revision{}, fmt.Errorf("capture invocation start environment: %v; write failure report: %w", captureErr, writeErr)
 		}
 		return suite, gate.Revision{}, fmt.Errorf("capture invocation start environment: %w", captureErr)
@@ -695,27 +1032,25 @@ func beginInvocation(
 	revision, revisionErr := currentRevision(cfg.rendrRoot)
 	if revisionErr != nil {
 		suite.FailRun("cannot fingerprint invocation start: " + revisionErr.Error())
-		if writeErr := writer(suite, cfg.reportDir); writeErr != nil {
+		if finalErr := finalizeAbortedInvocation(selected, suite, reasonInvocationBlocker(report.BlockerKindRevision, "start revision fingerprint failed")); finalErr != nil {
+			suite.FailRun("cannot project aborted invocation: " + finalErr.Error())
+		}
+		if writeErr := reports.publish(ctx, suite); writeErr != nil {
 			return suite, gate.Revision{}, fmt.Errorf("fingerprint invocation start: %v; invalidate stale reports: %w", revisionErr, writeErr)
 		}
 		return suite, gate.Revision{}, fmt.Errorf("fingerprint invocation start: %w", revisionErr)
 	}
 	suite.Invocation.RevisionStart = reportRevision(revision)
-	if err := writer(suite, cfg.reportDir); err != nil {
+	publishCtx, cancelPublish := reportPublicationContext(ctx)
+	defer cancelPublish()
+	if err := reports.publish(publishCtx, suite); err != nil {
 		return suite, gate.Revision{}, fmt.Errorf("invalidate stale reports: %w", err)
 	}
 	return suite, revision, nil
 }
 
 func invalidateFixedReports(dir string) error {
-	var removeErrors []error
-	for _, name := range []string{junitReportFileName, markdownReportFileName, jsonReportFileName} {
-		path := filepath.Join(dir, name)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
-		}
-	}
-	return errors.Join(removeErrors...)
+	return report.InvalidateSet(dir)
 }
 
 func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest.Spec) (report.Invocation, error) {
@@ -735,29 +1070,36 @@ func buildInvocationIdentity(cfg runFlags, suiteName string, selected []manifest
 	if err != nil {
 		return report.Invocation{}, err
 	}
-	return report.Invocation{
-		SchemaVersion:    invocationSchemaVersion,
-		Suite:            suiteName,
-		Scope:            invocationScope(cfg),
-		Phase:            cfg.phase,
-		Tier:             cfg.tier,
-		Full:             cfg.full,
-		TUNFull:          cfg.tunFull,
-		Case:             cfg.caseID,
-		Selector:         cfg.selectorID,
-		FromCase:         cfg.fromCaseID,
-		ResumeCaseID:     selectedIDs[0],
-		Forced:           cfg.forcePhase2,
-		AllowNonLinux:    cfg.allowNonLinux,
-		ManifestDigest:   digest,
-		CatalogDigest:    catalogDigest,
-		SelectedCases:    len(selected),
-		SelectedCaseIDs:  selectedIDs,
-		RequestedCaseIDs: requestedIDs,
-		RequestAnchor:    requestAnchor,
-		EvidenceClass:    invocationEvidenceClass(suiteName),
-		ReleaseManifest:  false,
-	}, nil
+	invocation := report.Invocation{
+		SchemaVersion:          invocationSchemaVersion,
+		Suite:                  suiteName,
+		Scope:                  invocationScope(cfg),
+		Phase:                  cfg.phase,
+		Tier:                   cfg.tier,
+		Full:                   cfg.full,
+		TUNFull:                cfg.tunFull,
+		Case:                   cfg.caseID,
+		Selector:               cfg.selectorID,
+		FromCase:               cfg.fromCaseID,
+		ResumeCaseID:           selectedIDs[0],
+		Forced:                 cfg.forcePhase2,
+		AllowNonLinux:          cfg.allowNonLinux,
+		AllowUnprovenContracts: cfg.allowUnprovenContracts,
+		ManifestDigest:         digest,
+		CatalogDigest:          catalogDigest,
+		SelectedCases:          len(selected),
+		SelectedCaseIDs:        selectedIDs,
+		RequestedCaseIDs:       requestedIDs,
+		RequestAnchor:          requestAnchor,
+		EvidenceClass:          invocationEvidenceClass(suiteName),
+		ReleaseManifest:        false,
+		ContractProofRequired:  true,
+	}
+	if cfg.phase1Authorization != nil {
+		authorization := *cfg.phase1Authorization
+		invocation.Phase1Authorization = &authorization
+	}
+	return invocation, nil
 }
 
 func requestedInvocationIdentity(cfg runFlags, selectedIDs []string) ([]string, string, error) {
@@ -819,6 +1161,60 @@ func invocationEvidenceClass(suiteName string) string {
 		return tunSyntheticEvidenceClass
 	}
 	return normalComponentEvidenceClass
+}
+
+func requireContractProofOptIn(specs []manifest.Spec, allowUnproven bool) error {
+	if len(specs) == 0 {
+		return errors.New("cannot evaluate contract proof policy for an empty manifest")
+	}
+	var blocked []string
+	for _, spec := range specs {
+		if spec.Contract == nil || spec.Contract.State != manifest.ContractStateEnforced {
+			blocked = append(blocked, spec.ID)
+		}
+	}
+	if len(blocked) == 0 {
+		if allowUnproven {
+			return errors.New("--allow-unproven-contracts is unnecessary because every selected contract is enforced")
+		}
+		return nil
+	}
+	if allowUnproven {
+		suiteName := specs[0].Suite
+		digest, err := suiteRegistryDigest(suiteName)
+		if err != nil {
+			return fmt.Errorf("verify frozen V1-M1 catalog: %w", err)
+		}
+		want := v1M1UnprovenCatalogDigests[suiteName]
+		if want == "" || digest != want {
+			return fmt.Errorf("--allow-unproven-contracts is restricted to the frozen V1-M1 catalog: suite=%s digest=%s want=%s", suiteName, digest, want)
+		}
+		return nil
+	}
+	const previewLimit = 5
+	preview := blocked
+	if len(preview) > previewLimit {
+		preview = preview[:previewLimit]
+	}
+	detail := strings.Join(preview, ", ")
+	if len(blocked) > len(preview) {
+		detail += fmt.Sprintf(" (+%d more)", len(blocked)-len(preview))
+	}
+	return fmt.Errorf(
+		"selected manifest contains %d unproven contract(s): %s; use --allow-unproven-contracts only for the audited V1-M1 legacy baseline",
+		len(blocked), detail,
+	)
+}
+
+func contractResultLabel(suite *report.Suite) string {
+	proof, err := report.ContractProofState(suite)
+	if err != nil {
+		return "INVALID CONTRACT PROOF"
+	}
+	if proof == report.ContractProofUnproven {
+		return "PASS (UNPROVEN CONTRACTS)"
+	}
+	return "GREEN"
 }
 
 func invocationScope(cfg runFlags) string {
@@ -896,24 +1292,26 @@ func validateSelectedManifest(selected []manifest.Spec) error {
 }
 
 func suiteRegistryDigest(suiteName string) (string, error) {
-	registrySuite := suiteName
-	if suiteName == tunInvocationSuite {
-		registrySuite = manifest.SuiteTUN
-	}
 	normalSpecs, tunCatalog, err := loadCatalogs()
 	if err != nil {
 		return "", err
 	}
-	doc, err := buildListDocument(runFlags{}, "", normalSpecs, tunCatalog)
-	if err != nil {
-		return "", fmt.Errorf("build full registry document: %w", err)
+	payload := struct {
+		Suite                 string          `json:"suite"`
+		ContractSchemaVersion int             `json:"contract_schema_version"`
+		Specs                 []manifest.Spec `json:"specs"`
+		Aliases               []tunfull.Alias `json:"aliases,omitempty"`
+	}{Suite: suiteName, ContractSchemaVersion: manifest.ContractSchemaVersion}
+	switch suiteName {
+	case manifest.SuiteNormal:
+		payload.Specs = normalSpecs
+	case manifest.SuiteTUN:
+		payload.Specs = tunCatalog.specs
+		payload.Aliases = tunCatalog.aliases
+	default:
+		return "", fmt.Errorf("unknown invocation suite %q", suiteName)
 	}
-	for _, registry := range doc.Catalogs {
-		if registry.Suite == registrySuite {
-			return digestJSON(registrySuite+" registry", registry)
-		}
-	}
-	return "", fmt.Errorf("unknown invocation suite %q", suiteName)
+	return digestJSON(suiteName+" registry", payload)
 }
 
 func digestJSON(label string, value any) (string, error) {
@@ -971,20 +1369,27 @@ func persistInvocationFailure(
 	suite *report.Suite,
 	cfg runFlags,
 	revisionStart gate.Revision,
+	expected []manifest.Spec,
 	reason string,
 	currentRevision func(string) (gate.Revision, error),
 	captureEnvironment func(context.Context) (environment.Snapshot, error),
+	reports invocationReportStore,
 	stderr io.Writer,
 ) {
 	suite.Complete = false
 	suite.FailRun(reason)
+	if err := finalizeAbortedInvocation(expected, suite, reasonInvocationBlocker(report.BlockerKindHarness, reason)); err != nil {
+		suite.FailRun("cannot project aborted invocation: " + err.Error())
+	}
 	if err := updateInvocationEnvironment(ctx, suite, captureEnvironment); err != nil {
 		suite.FailRun(err.Error())
 	}
 	if err := updateInvocationRevision(suite, cfg.rendrRoot, revisionStart, currentRevision); err != nil {
 		suite.FailRun(err.Error())
 	}
-	if err := writeReports(suite, cfg.reportDir); err != nil {
+	publishCtx, cancelPublish := reportPublicationContext(ctx)
+	defer cancelPublish()
+	if err := reports.publish(publishCtx, suite); err != nil {
 		fmt.Fprintln(stderr, "regress: warning: cannot persist invocation failure report:", err)
 	}
 }
@@ -1000,10 +1405,11 @@ func buildPhase1State(
 		return gate.State{}, fmt.Errorf("bind phase 1 revision: %w", err)
 	}
 	return gate.State{
-		CommitSHA:   revision.CommitSHA,
-		WorktreeSHA: revision.WorktreeSHA,
-		Status:      status,
-		At:          at,
+		SchemaVersion: gate.StateSchemaVersion,
+		CommitSHA:     revision.CommitSHA,
+		WorktreeSHA:   revision.WorktreeSHA,
+		Status:        status,
+		At:            at,
 	}, nil
 }
 
@@ -1013,8 +1419,13 @@ const (
 	tunKindCompatibilitySelector = "compatibility_selector"
 	tunSyntheticEvidenceClass    = "synthetic_l3_session_not_kernel_tun_gold"
 	normalComponentEvidenceClass = "legacy_regression_component_not_v1_release_manifest"
-	tunInvocationSuite           = "tun-full/synthetic-l3-session"
+	tunInvocationSuite           = manifest.SuiteTUN
 )
+
+var v1M1UnprovenCatalogDigests = map[string]string{
+	manifest.SuiteNormal: "sha256:134f7d28c282ab8a08f7eeaf17863cdea086b797c6e3adca4a265f748c4d9111",
+	manifest.SuiteTUN:    "sha256:2c1bb1a20b0d4260e6f1e6984fdb20f453d2ddb92fc97f2ef75a66dbb92485f0",
+}
 
 type tunCatalog struct {
 	specs   []manifest.Spec
@@ -1030,12 +1441,13 @@ type tunSelection struct {
 var runTUNCase = tunfull.RunPlannedCase
 
 type tunCatalogEntry struct {
-	listed listedCase
-	runIDs []string
+	listed        listedCase
+	runIDs        []string
+	retiredReason string
 }
 
 func buildTUNCatalog(specs []manifest.Spec, aliases []tunfull.Alias) (tunCatalog, error) {
-	if err := manifest.Validate(specs); err != nil {
+	if err := manifest.ValidateCensus(specs); err != nil {
 		return tunCatalog{}, fmt.Errorf("TUN catalog validation failed: %w", err)
 	}
 	byID := make(map[string]manifest.Spec, len(specs))
@@ -1137,13 +1549,15 @@ func (catalog tunCatalog) entries() ([]tunCatalogEntry, error) {
 			entries = append(entries, tunCatalogEntry{
 				listed: listedCase{
 					ID: alias.ID, Tier: "T7", Suite: manifest.SuiteTUN, Phase: 2,
-					Mandatory: false, Long: long, DefaultRun: false, Kind: kind,
-					ExpandsTo: append([]string(nil), alias.ExpandsTo...),
+					Mandatory: false, Long: long, InDefaultCommand: false, InSuiteFull: false, Kind: kind,
+					ExpandsTo:     append([]string(nil), alias.ExpandsTo...),
+					RetiredReason: alias.RetiredReason,
 				},
-				runIDs: append([]string(nil), alias.ExpandsTo...),
+				runIDs:        append([]string(nil), alias.ExpandsTo...),
+				retiredReason: alias.RetiredReason,
 			})
 		}
-		listed, err := listedCaseFrom(spec, 2, true, tunKindCase, nil)
+		listed, err := listedCaseFrom(spec, 2, false, true, tunKindCase, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1189,6 +1603,9 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID, selectorID string) (tu
 			if entry.listed.ID != selectorID || entry.listed.Kind == tunKindCase {
 				continue
 			}
+			if entry.retiredReason != "" {
+				return tunSelection{}, fmt.Errorf("manifest: compatibility selector %q is retired: %s", selectorID, entry.retiredReason)
+			}
 			return catalog.withPrerequisites(tunSelection{
 				cases:          []listedCase{entry.listed},
 				runOrder:       append([]string(nil), entry.runIDs...),
@@ -1229,7 +1646,7 @@ func (catalog tunCatalog) selectCases(caseID, fromCaseID, selectorID string) (tu
 		requestedOrder: make([]string, len(selectedSpecs)),
 	}
 	for i, spec := range selectedSpecs {
-		listed, err := listedCaseFrom(spec, 2, true, tunKindCase, nil)
+		listed, err := listedCaseFrom(spec, 2, false, true, tunKindCase, nil)
 		if err != nil {
 			return tunSelection{}, err
 		}
@@ -1262,28 +1679,35 @@ type listDocument struct {
 }
 
 type listCatalog struct {
-	Suite            string       `json:"suite"`
-	EvidenceClass    string       `json:"evidence_class,omitempty"`
-	Cases            []listedCase `json:"cases"`
-	RunOrder         []string     `json:"run_order"`
-	RequestedCaseIDs []string     `json:"requested_case_ids,omitempty"`
-	RequestAnchor    string       `json:"request_anchor,omitempty"`
+	Suite                  string       `json:"suite"`
+	EvidenceClass          string       `json:"evidence_class,omitempty"`
+	CatalogDigest          string       `json:"catalog_digest"`
+	Cases                  []listedCase `json:"cases"`
+	Selectors              []listedCase `json:"selectors,omitempty"`
+	CatalogOrder           []string     `json:"catalog_order"`
+	DefaultCommandRunOrder []string     `json:"default_command_run_order"`
+	SuiteFullRunOrder      []string     `json:"suite_full_run_order"`
+	SelectedRunOrder       []string     `json:"selected_run_order,omitempty"`
+	RequestedCaseIDs       []string     `json:"requested_case_ids,omitempty"`
+	RequestAnchor          string       `json:"request_anchor,omitempty"`
 }
 
 type listedCase struct {
-	ID         string             `json:"id"`
-	Tier       string             `json:"tier"`
-	Suite      string             `json:"suite"`
-	Phase      int                `json:"phase"`
-	Mandatory  bool               `json:"mandatory"`
-	Requires   []string           `json:"requires,omitempty"`
-	Long       bool               `json:"long,omitempty"`
-	Budget     time.Duration      `json:"budget_ns,omitempty"`
-	DefaultRun bool               `json:"default_run"`
-	Kind       string             `json:"kind"`
-	ExpandsTo  []string           `json:"expands_to,omitempty"`
-	CaseDigest string             `json:"case_digest,omitempty"`
-	Contract   *manifest.Contract `json:"contract,omitempty"`
+	ID               string             `json:"id"`
+	Tier             string             `json:"tier"`
+	Suite            string             `json:"suite"`
+	Phase            int                `json:"phase"`
+	Mandatory        bool               `json:"mandatory"`
+	Requires         []string           `json:"requires,omitempty"`
+	Long             bool               `json:"long,omitempty"`
+	Budget           time.Duration      `json:"budget_ns,omitempty"`
+	InDefaultCommand bool               `json:"in_default_command"`
+	InSuiteFull      bool               `json:"in_suite_full"`
+	Kind             string             `json:"kind"`
+	ExpandsTo        []string           `json:"expands_to,omitempty"`
+	RetiredReason    string             `json:"retired_reason,omitempty"`
+	CaseDigest       string             `json:"case_digest,omitempty"`
+	Contract         *manifest.Contract `json:"contract,omitempty"`
 }
 
 func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Spec, tunCatalog tunCatalog) (listDocument, error) {
@@ -1297,6 +1721,10 @@ func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Sp
 		if err != nil {
 			return listDocument{}, fmt.Errorf("TUN list projection: %w", err)
 		}
+		cases, selectors, err := splitListedCases(listed)
+		if err != nil {
+			return listDocument{}, fmt.Errorf("TUN list projection: %w", err)
+		}
 		_, requestAnchor, err := requestedInvocationIdentity(runFlags{
 			caseID: cfg.caseID, fromCaseID: cfg.fromCaseID, selectorID: cfg.selectorID,
 			requestedCaseIDs: selection.requestedOrder,
@@ -1304,9 +1732,15 @@ func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Sp
 		if err != nil {
 			return listDocument{}, fmt.Errorf("TUN list request identity: %w", err)
 		}
+		catalogDigest, err := suiteRegistryDigest(manifest.SuiteTUN)
+		if err != nil {
+			return listDocument{}, err
+		}
 		doc.Catalogs = append(doc.Catalogs, listCatalog{
 			Suite: manifest.SuiteTUN, EvidenceClass: tunSyntheticEvidenceClass,
-			Cases: listed, RunOrder: selection.runOrder,
+			CatalogDigest: catalogDigest,
+			Cases:         cases, Selectors: selectors, CatalogOrder: manifestIDs(tunCatalog.specs),
+			DefaultCommandRunOrder: []string{}, SuiteFullRunOrder: manifestIDs(tunCatalog.specs), SelectedRunOrder: selection.runOrder,
 			RequestedCaseIDs: append([]string(nil), selection.requestedOrder...), RequestAnchor: requestAnchor,
 		})
 		return doc, nil
@@ -1334,6 +1768,7 @@ func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Sp
 		}
 		normal.RequestedCaseIDs = requestedIDs
 		normal.RequestAnchor = requestAnchor
+		normal.SelectedRunOrder = manifestIDs(selected)
 		doc.Catalogs = append(doc.Catalogs, normal)
 		return doc, nil
 	}
@@ -1346,11 +1781,37 @@ func buildListDocument(cfg runFlags, suiteName string, normalSpecs []manifest.Sp
 	if err != nil {
 		return listDocument{}, err
 	}
+	tunCases, tunSelectors, err := splitListedCases(tunSelection.cases)
+	if err != nil {
+		return listDocument{}, fmt.Errorf("TUN list projection: %w", err)
+	}
+	tunCatalogDigest, err := suiteRegistryDigest(manifest.SuiteTUN)
+	if err != nil {
+		return listDocument{}, err
+	}
 	doc.Catalogs = append(doc.Catalogs, normal, listCatalog{
 		Suite: manifest.SuiteTUN, EvidenceClass: tunSyntheticEvidenceClass,
-		Cases: tunSelection.cases, RunOrder: tunSelection.runOrder,
+		CatalogDigest: tunCatalogDigest,
+		Cases:         tunCases, Selectors: tunSelectors, CatalogOrder: manifestIDs(tunCatalog.specs),
+		DefaultCommandRunOrder: []string{}, SuiteFullRunOrder: tunSelection.runOrder,
 	})
 	return doc, nil
+}
+
+func splitListedCases(entries []listedCase) ([]listedCase, []listedCase, error) {
+	cases := make([]listedCase, 0, len(entries))
+	selectors := make([]listedCase, 0)
+	for _, entry := range entries {
+		switch entry.Kind {
+		case tunKindCase:
+			cases = append(cases, entry)
+		case tunKindCompatibilityAlias, tunKindCompatibilitySelector:
+			selectors = append(selectors, entry)
+		default:
+			return nil, nil, fmt.Errorf("listed entry %q has unsupported kind %q", entry.ID, entry.Kind)
+		}
+	}
+	return cases, selectors, nil
 }
 
 func (catalog tunCatalog) listSelection(selection tunSelection) ([]listedCase, error) {
@@ -1471,8 +1932,184 @@ func reconcileReportRows(expected []manifest.Spec, actual []report.Case) error {
 		// exercised its declared stimulus. Contract evidence facts and their
 		// independent oracle remain responsible for execution truth.
 		actual[i].CaseDigest = digest
+		if err := reconcileContractEvidence(want, &actual[i]); err != nil {
+			return fmt.Errorf("manifest/report case %q contract evidence: %w", want.ID, err)
+		}
 	}
 	return nil
+}
+
+func reconcileContractEvidence(spec manifest.Spec, row *report.Case) error {
+	if spec.Contract == nil {
+		return nil
+	}
+	if row.Evidence == nil {
+		row.Evidence = make(map[string]string)
+	}
+	missing, err := json.Marshal(spec.Contract.MissingDimensions)
+	if err != nil {
+		return fmt.Errorf("encode missing dimensions: %w", err)
+	}
+	row.Evidence[report.EvidenceContractStateKey] = string(spec.Contract.State)
+	row.Evidence["manifest_contract_missing"] = string(missing)
+	if row.ExecutionState == report.ExecutionStateNotRun || row.InvalidReason != "" || row.SkipReason != "" {
+		return nil
+	}
+	claimAssertions, err := spec.Contract.RuntimeClaimAssertions()
+	if err != nil {
+		return fmt.Errorf("load structured claim bindings: %w", err)
+	}
+	for _, claim := range claimAssertions {
+		if err := manifest.EvaluateEvidenceAssertion(claim.Assertion, row.Evidence[claim.Assertion.Fact]); err != nil {
+			return fmt.Errorf("%s claim %q: %w", claim.Dimension, claim.ClaimKey, err)
+		}
+	}
+	if row.Failure != "" {
+		if err := validateEvidenceProfile("stimulus", spec.Contract.Stimulus, row.Evidence, spec.Contract.State == manifest.ContractStateEnforced); err != nil {
+			row.Evidence["manifest_reported_failure"] = row.Failure
+			row.Failure = ""
+			row.InvalidReason = "product failure lacks valid stimulus evidence: " + err.Error()
+		}
+		return nil
+	}
+	for _, item := range []struct {
+		label   string
+		profile manifest.EvidenceProfile
+	}{
+		{label: "stimulus", profile: spec.Contract.Stimulus},
+		{label: "oracle", profile: spec.Contract.Oracle},
+	} {
+		if item.profile.Name == "" {
+			continue
+		}
+		if err := validateEvidenceProfile(item.label, item.profile, row.Evidence, spec.Contract.State == manifest.ContractStateEnforced); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvidenceProfile(label string, profile manifest.EvidenceProfile, evidence map[string]string, requireIdentity bool) error {
+	if profile.Name == "" {
+		return fmt.Errorf("%s evidence is not declared by this blocked contract", label)
+	}
+	if requireIdentity {
+		nameFact := "manifest_" + label + "_profile_name"
+		versionFact := "manifest_" + label + "_profile_version"
+		if evidence[nameFact] != profile.Name {
+			return fmt.Errorf("%s profile identity is %q, want %q", label, evidence[nameFact], profile.Name)
+		}
+		if evidence[versionFact] != fmt.Sprintf("%d", profile.Version) {
+			return fmt.Errorf("%s profile version is %q, want %d", label, evidence[versionFact], profile.Version)
+		}
+	}
+	for _, fact := range profile.RequiredFacts {
+		if strings.TrimSpace(evidence[fact]) == "" {
+			return fmt.Errorf("%s profile %q is missing required fact %q", label, profile.Name, fact)
+		}
+	}
+	for _, assertion := range profile.Assertions {
+		if err := manifest.EvaluateEvidenceAssertion(assertion, evidence[assertion.Fact]); err != nil {
+			return fmt.Errorf("%s profile %q assertion: %w", label, profile.Name, err)
+		}
+	}
+	return nil
+}
+
+type invocationBlocker struct {
+	kind   report.BlockerKind
+	caseID string
+	reason string
+}
+
+func caseInvocationBlocker(caseID string) invocationBlocker {
+	return invocationBlocker{kind: report.BlockerKindCase, caseID: caseID}
+}
+
+func reasonInvocationBlocker(kind report.BlockerKind, reason string) invocationBlocker {
+	return invocationBlocker{kind: kind, reason: strings.TrimSpace(reason)}
+}
+
+func finalizeAbortedInvocation(expected []manifest.Spec, suite *report.Suite, blocker invocationBlocker) error {
+	if suite == nil {
+		return errors.New("cannot finalize a nil invocation")
+	}
+	if blocker.kind == "" {
+		return errors.New("cannot finalize invocation without blocker kind")
+	}
+	if len(suite.Cases) > len(expected) {
+		return fmt.Errorf("report has %d rows for %d selected cases", len(suite.Cases), len(expected))
+	}
+	for i, row := range suite.Cases {
+		if row.Name != expected[i].ID {
+			return fmt.Errorf("existing report row %d is %q, want %q", i, row.Name, expected[i].ID)
+		}
+		if row.ExecutionState == report.ExecutionStateNotRun {
+			applyInvocationBlocker(&suite.Cases[i], blocker)
+		}
+	}
+	for _, spec := range expected[len(suite.Cases):] {
+		row := report.Case{
+			Name:           spec.ID,
+			Tier:           spec.Tier,
+			ExecutionState: report.ExecutionStateNotRun,
+		}
+		applyInvocationBlocker(&row, blocker)
+		suite.Add(row)
+	}
+	suite.Complete = false
+	return reconcileReportRows(expected, suite.Cases)
+}
+
+func applyInvocationBlocker(row *report.Case, blocker invocationBlocker) {
+	row.BlockerKind = blocker.kind
+	row.BlockedByCaseID = ""
+	row.BlockerReason = ""
+	if blocker.kind == report.BlockerKindCase {
+		row.BlockedByCaseID = blocker.caseID
+		row.InvalidReason = fmt.Sprintf("not run after %s failed", blocker.caseID)
+		return
+	}
+	row.BlockerReason = blocker.reason
+	row.InvalidReason = fmt.Sprintf("not run: %s blocker: %s", blocker.kind, blocker.reason)
+}
+
+func firstFailedExecutedCaseID(cases []report.Case) string {
+	for _, row := range cases {
+		if row.ExecutionState == report.ExecutionStateNotRun {
+			continue
+		}
+		if row.Failure != "" || row.InvalidReason != "" || (row.SkipReason != "" && !row.Optional) {
+			return row.Name
+		}
+	}
+	return ""
+}
+
+func invocationAbortBlocker(ctx context.Context, suite *report.Suite, reconcileErr, environmentErr, revisionErr error) (invocationBlocker, bool) {
+	if err := ctx.Err(); err != nil {
+		return reasonInvocationBlocker(report.BlockerKindSignal, err.Error()), true
+	}
+	if revisionErr != nil {
+		return reasonInvocationBlocker(report.BlockerKindRevision, revisionErr.Error()), true
+	}
+	if environmentErr != nil {
+		return reasonInvocationBlocker(report.BlockerKindEnvironment, environmentErr.Error()), true
+	}
+	if reconcileErr != nil {
+		return reasonInvocationBlocker(report.BlockerKindHarness, reconcileErr.Error()), true
+	}
+	if caseID := firstFailedExecutedCaseID(suite.Cases); caseID != "" {
+		return caseInvocationBlocker(caseID), true
+	}
+	if suite.RunFailure != "" {
+		return reasonInvocationBlocker(report.BlockerKindHarness, suite.RunFailure), true
+	}
+	return invocationBlocker{}, false
+}
+
+func reportPublicationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 
 func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
@@ -1482,7 +2119,22 @@ func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
 	if err := validateSelectedManifest(specs); err != nil {
 		return listCatalog{}, err
 	}
-	result := listCatalog{Suite: manifest.SuiteNormal, Cases: make([]listedCase, 0, len(specs)), RunOrder: make([]string, 0, len(specs))}
+	defaultOrder, err := normalDefaultCommandRunOrder()
+	if err != nil {
+		return listCatalog{}, err
+	}
+	defaultIDs := make(map[string]bool, len(defaultOrder))
+	for _, id := range defaultOrder {
+		defaultIDs[id] = true
+	}
+	catalogDigest, err := suiteRegistryDigest(manifest.SuiteNormal)
+	if err != nil {
+		return listCatalog{}, err
+	}
+	result := listCatalog{
+		Suite: manifest.SuiteNormal, Cases: make([]listedCase, 0, len(specs)), CatalogOrder: manifestIDs(catalog.NormalFull()),
+		CatalogDigest: catalogDigest, DefaultCommandRunOrder: defaultOrder, SuiteFullRunOrder: manifestIDs(catalog.NormalFull()),
+	}
 	for _, spec := range specs {
 		if spec.Suite != manifest.SuiteNormal {
 			return listCatalog{}, fmt.Errorf("normal list case %q has suite %q", spec.ID, spec.Suite)
@@ -1491,14 +2143,25 @@ func normalListCatalog(specs []manifest.Spec) (listCatalog, error) {
 		if err != nil {
 			return listCatalog{}, err
 		}
-		listed, err := listedCaseFrom(spec, phase, true, tunKindCase, nil)
+		listed, err := listedCaseFrom(spec, phase, defaultIDs[spec.ID], true, tunKindCase, nil)
 		if err != nil {
 			return listCatalog{}, err
 		}
 		result.Cases = append(result.Cases, listed)
-		result.RunOrder = append(result.RunOrder, spec.ID)
 	}
 	return result, nil
+}
+
+func normalDefaultCommandRunOrder() ([]string, error) {
+	plan, err := runplan.Build(runplan.Request{})
+	if err != nil {
+		return nil, fmt.Errorf("build default command projection: %w", err)
+	}
+	specs, err := specsForPlan(plan, catalog.ByTier)
+	if err != nil {
+		return nil, fmt.Errorf("resolve default command projection: %w", err)
+	}
+	return manifestIDs(specs), nil
 }
 
 func phaseForTier(tier string) (int, error) {
@@ -1512,7 +2175,17 @@ func phaseForTier(tier string) (int, error) {
 	}
 }
 
-func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string, expandsTo []string) (listedCase, error) {
+func requiresPhase1Authorization(specs []manifest.Spec) bool {
+	for _, spec := range specs {
+		phase, err := phaseForTier(spec.Tier)
+		if err == nil && phase == 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func listedCaseFrom(spec manifest.Spec, phase int, inDefaultCommand, inSuiteFull bool, kind string, expandsTo []string) (listedCase, error) {
 	digest, err := spec.CanonicalDigest()
 	if err != nil {
 		return listedCase{}, fmt.Errorf("list case %q: %w", spec.ID, err)
@@ -1526,19 +2199,20 @@ func listedCaseFrom(spec manifest.Spec, phase int, defaultRun bool, kind string,
 		contract = &normalized
 	}
 	return listedCase{
-		ID:         spec.ID,
-		Tier:       spec.Tier,
-		Suite:      spec.Suite,
-		Phase:      phase,
-		Mandatory:  spec.Mandatory,
-		Requires:   append([]string(nil), spec.Requires...),
-		Long:       spec.Long,
-		Budget:     spec.Budget,
-		DefaultRun: defaultRun,
-		Kind:       kind,
-		ExpandsTo:  append([]string(nil), expandsTo...),
-		CaseDigest: digest,
-		Contract:   contract,
+		ID:               spec.ID,
+		Tier:             spec.Tier,
+		Suite:            spec.Suite,
+		Phase:            phase,
+		Mandatory:        spec.Mandatory,
+		Requires:         append([]string(nil), spec.Requires...),
+		Long:             spec.Long,
+		Budget:           spec.Budget,
+		InDefaultCommand: inDefaultCommand,
+		InSuiteFull:      inSuiteFull,
+		Kind:             kind,
+		ExpandsTo:        append([]string(nil), expandsTo...),
+		CaseDigest:       digest,
+		Contract:         contract,
 	}, nil
 }
 
@@ -1550,55 +2224,4 @@ func writeList(w io.Writer, doc listDocument) error {
 
 func tunFullUnimplementedCase() report.Case {
 	return tunfull.UnimplementedCase("")
-}
-
-func writeReports(suite *report.Suite, dir string) error {
-	junit := filepath.Join(dir, junitReportFileName)
-	md := filepath.Join(dir, markdownReportFileName)
-	jsonReport := filepath.Join(dir, jsonReportFileName)
-	if err := suite.WriteJUnit(junit); err != nil {
-		return failReportSet(dir, fmt.Errorf("write JUnit: %w", err))
-	}
-	if err := suite.WriteMarkdown(md); err != nil {
-		return failReportSet(dir, fmt.Errorf("write summary: %w", err))
-	}
-	// report.json is the machine gate and therefore the commit marker for the
-	// report set. Never leave a green canonical report when a companion report
-	// failed to persist.
-	if err := suite.WriteJSON(jsonReport); err != nil {
-		return failReportSet(dir, fmt.Errorf("write JSON report: %w", err))
-	}
-	return nil
-}
-
-func failReportSet(dir string, writeErr error) error {
-	if cleanupErr := invalidateFixedReports(dir); cleanupErr != nil {
-		return errors.Join(writeErr, fmt.Errorf("invalidate incomplete report set: %w", cleanupErr))
-	}
-	return writeErr
-}
-
-func requirePassingFinalReport(dir string, suite *report.Suite) error {
-	path := filepath.Join(dir, jsonReportFileName)
-	final, err := report.ReadJSON(path)
-	if err != nil {
-		return fmt.Errorf("cannot read finalized report: %w", err)
-	}
-	wantDigest, err := suite.ReportDigest()
-	if err != nil {
-		return fmt.Errorf("cannot seal in-memory final report: %w", err)
-	}
-	if final.ReportDigest != wantDigest {
-		return fmt.Errorf("finalized report digest %q does not match in-memory result %q", final.ReportDigest, wantDigest)
-	}
-	if !final.Complete {
-		return errors.New("finalized report is incomplete, refusing a zero exit")
-	}
-	if final.Invocation.SchemaVersion != invocationSchemaVersion {
-		return fmt.Errorf("finalized report invocation schema is %d, want %d", final.Invocation.SchemaVersion, invocationSchemaVersion)
-	}
-	if final.State != "pass" {
-		return fmt.Errorf("finalized report state is %q, refusing a zero exit", final.State)
-	}
-	return nil
 }

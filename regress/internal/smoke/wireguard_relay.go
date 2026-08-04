@@ -153,6 +153,7 @@ func RunWireGuardRelay(ctx context.Context, opts WireGuardRelayOpts) Result {
 	migrateAt := migrationPoints(opts.Messages, opts.Migrations)
 	payload := make([]byte, opts.MessageSize)
 	reply := make([]byte, opts.MessageSize)
+	inflightMigrations := 0
 	for i := 0; i < opts.Messages; i++ {
 		fillWireGuardPayload(payload, i)
 		if err := tcpConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -161,20 +162,24 @@ func RunWireGuardRelay(ctx context.Context, opts WireGuardRelayOpts) Result {
 		if err := writeFull(tcpConn, payload); err != nil {
 			return FromError(name, time.Since(t0), fmt.Errorf("message %d write: %w", i, err))
 		}
+		if _, ok := migrateAt[i]; ok {
+			if err := migrateRelay(admin); err != nil {
+				return FromError(name, time.Since(t0), fmt.Errorf("message %d migrate while response outstanding: %w", i, err))
+			}
+			inflightMigrations++
+		}
 		if _, err := io.ReadFull(tcpConn, reply); err != nil {
 			return FromError(name, time.Since(t0), fmt.Errorf("message %d read: %w", i, err))
 		}
 		if !bytes.Equal(reply, payload) {
 			return FromError(name, time.Since(t0), fmt.Errorf("message %d echo mismatch", i))
 		}
-		if _, ok := migrateAt[i]; ok {
-			if err := migrateRelay(admin); err != nil {
-				return FromError(name, time.Since(t0), fmt.Errorf("migrate: %w", err))
-			}
-		}
 	}
 	if got := admin.MigrationCount(); got < uint64(opts.Migrations) {
 		return FromError(name, time.Since(t0), fmt.Errorf("migration count=%d want >=%d", got, opts.Migrations))
+	}
+	if inflightMigrations != opts.Migrations {
+		return FromError(name, time.Since(t0), fmt.Errorf("inflight migrations=%d want exactly %d", inflightMigrations, opts.Migrations))
 	}
 
 	elapsed := time.Since(t0)
@@ -182,12 +187,14 @@ func RunWireGuardRelay(ctx context.Context, opts WireGuardRelayOpts) Result {
 		Name:     name,
 		Duration: elapsed,
 		Detail: map[string]any{
-			"messages":        opts.Messages,
-			"bytes":           opts.Messages * opts.MessageSize,
-			"paths":           opts.Paths,
-			"requested_migs":  opts.Migrations,
-			"migration_count": admin.MigrationCount(),
-			"elapsed_seconds": elapsed.Seconds(),
+			"messages":                     opts.Messages,
+			"bytes":                        opts.Messages * opts.MessageSize,
+			"paths":                        opts.Paths,
+			"requested_migs":               opts.Migrations,
+			"expected_inflight_migrations": opts.Migrations,
+			"inflight_migrations":          inflightMigrations,
+			"migration_count":              admin.MigrationCount(),
+			"elapsed_seconds":              elapsed.Seconds(),
 		},
 	}
 }

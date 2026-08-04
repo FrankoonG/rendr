@@ -19,7 +19,7 @@ type Spec struct {
 	Tier      string        `json:"tier"`
 	Suite     string        `json:"suite"`
 	Mandatory bool          `json:"mandatory"`
-	Requires  []string      `json:"requires,omitempty"`
+	Requires  []string      `json:"requires,omitempty"` // Canonical execution dependencies, including separate release controls.
 	Long      bool          `json:"long,omitempty"`
 	Budget    time.Duration `json:"budget_ns,omitempty"`
 	Contract  *Contract     `json:"contract,omitempty"`
@@ -32,7 +32,7 @@ func RequiredWithBudget(id, tier string, budget time.Duration) Spec {
 }
 
 // Validate performs legacy/incremental validation. Specs with contracts must
-// have valid schema-v2 contracts, but uncontracted Specs remain accepted while
+// have valid schema-v4 contracts, but uncontracted Specs remain accepted while
 // registries migrate.
 func Validate(specs []Spec) error {
 	return validateRegistry(specs, validationIncremental)
@@ -45,7 +45,8 @@ func ValidateCensus(specs []Spec) error {
 }
 
 // ValidateRelease requires a complete census containing only enforced
-// contracts. A blocked row is always a release failure.
+// contracts. A blocked row is always a release failure. Separate negative
+// controls must be direct prerequisites so selection executes them first.
 func ValidateRelease(specs []Spec) error {
 	return validateRegistry(specs, validationRelease)
 }
@@ -127,6 +128,15 @@ func validateRegistry(specs []Spec, level validationLevel) error {
 				return fmt.Errorf(
 					"manifest: case %q in tier %q requires cross-tier prerequisite %q in tier %q",
 					spec.ID, spec.Tier, required.ID, required.Tier,
+				)
+			}
+		}
+		if level == validationRelease && spec.Contract != nil && spec.Contract.NegativeControl.Kind == NegativeControlCase {
+			controlID := spec.Contract.NegativeControl.CaseID
+			if _, ok := requireIndexes[controlID]; !ok {
+				return fmt.Errorf(
+					"manifest: release case %q must directly require negative control case %q",
+					spec.ID, controlID,
 				)
 			}
 		}

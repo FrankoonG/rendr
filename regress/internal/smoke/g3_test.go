@@ -204,6 +204,9 @@ func TestParseG3HostUDPStatsRejectsMalformedEvidence(t *testing.T) {
 	if detail["udp_snmp_status"] != g3UDPStatsUnsupported || detail["udp_snmp_scope"] != "network_namespace" {
 		t.Fatalf("unsupported evidence = %+v", detail)
 	}
+	if invalid := requireG3UDPStatsEvidence("", detail["udp_snmp_status"]); !strings.Contains(invalid, g3UDPStatsUnsupported) {
+		t.Fatalf("unsupported status did not invalidate the run: %q", invalid)
+	}
 	detail = make(map[string]any)
 	addG3UDPStatsEvidence(detail,
 		g3HostUDPStats{InDatagrams: 2}, g3UDPStatsOK, nil,
@@ -211,5 +214,11 @@ func TestParseG3HostUDPStatsRejectsMalformedEvidence(t *testing.T) {
 	)
 	if detail["udp_snmp_status"] != g3UDPStatsCounterReset {
 		t.Fatalf("counter-reset evidence = %+v", detail)
+	}
+	if invalid := requireG3UDPStatsEvidence("prior", detail["udp_snmp_status"]); !strings.Contains(invalid, "prior; ") || !strings.Contains(invalid, g3UDPStatsCounterReset) {
+		t.Fatalf("counter-reset status did not preserve prior invalidity: %q", invalid)
+	}
+	if invalid := requireG3UDPStatsEvidence("", g3UDPStatsOK); invalid != "" {
+		t.Fatalf("healthy UDP SNMP evidence was rejected: %q", invalid)
 	}
 }

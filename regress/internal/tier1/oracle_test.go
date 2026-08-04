@@ -55,7 +55,12 @@ func TestContractsHaveDeterministicNonzeroCoverage(t *testing.T) {
 }
 
 func TestRegressUnitRunsOnlyFastSmokeOracles(t *testing.T) {
-	contract := contractByImportPath(regressUnitContracts("linux"), regressModule+"/internal/smoke")
+	contracts := regressUnitContracts("linux")
+	chaosContract := contractByImportPath(contracts, regressModule+"/internal/chaos")
+	if want := []string{"TestApplyAndCleanup"}; !reflect.DeepEqual(chaosContract.RunTests, want) {
+		t.Fatalf("chaos run set=%v want=%v", chaosContract.RunTests, want)
+	}
+	contract := contractByImportPath(contracts, regressModule+"/internal/smoke")
 	want := []string{
 		"TestValidateRequestedMigrations",
 		"TestG1OptsMigrationDefaultAndDisable",
@@ -82,6 +87,13 @@ func TestRegressUnitRunsOnlyFastSmokeOracles(t *testing.T) {
 		"TestValidateG4EvidenceAllowsMeasuredSubMillisecondFailover",
 		"TestValidateG5PayloadRejectsMismatch",
 		"TestValidateRecoveredPathProgressNegativeControl",
+		"TestHysteriaSpeedtestCancellationJoinsProcess",
+		"TestHysteriaSpeedtestMigrationFailureKillsAndJoinsProcess",
+		"TestHysteriaProcessUnjoinedIsTypedMustStopFailure",
+		"TestHysteriaProcessUnconfirmedTeardownIsTypedMustStopFailure",
+		"TestHysteriaRelayHelperProcess",
+		"TestHysteriaRelayDescendantProcess",
+		"TestHysteriaCancellationKillsPipeHoldingDescendantGroup",
 	}
 	if !reflect.DeepEqual(contract.RunTests, want) {
 		t.Fatalf("smoke run set=%v want=%v", contract.RunTests, want)

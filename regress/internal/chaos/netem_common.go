@@ -2,14 +2,21 @@ package chaos
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	tcCommandTimeout = time.Second
+	tcCommandWait    = 250 * time.Millisecond
 )
 
 // Profile is one chaos configuration. Zero-value means no qdisc is applied.
@@ -38,6 +45,11 @@ var LossyWAN = Profile{
 // ErrStimulusInvalid marks fixture interference or lost ownership. A result
 // produced after this error is not evidence about rendr and must be INVALID.
 var ErrStimulusInvalid = errors.New("chaos stimulus invalid")
+
+var contaminatedFixtureLocks struct {
+	sync.Mutex
+	locks []fixtureLock
+}
 
 // Fixture owns one applied qdisc stimulus. Changes reports asynchronous
 // kernel notifications for qdisc changes on the shaped interface. Verify is a
@@ -89,6 +101,8 @@ type managedFixture struct {
 	childHandle string
 	fingerprint []byte
 	cleaned     bool
+	cleanupDone chan struct{}
+	cleanupErr  error
 }
 
 type noOpFixture struct{}
@@ -113,9 +127,12 @@ func applyWithDeps(p Profile, deps fixtureDeps) (Fixture, error) {
 		return nil, fmt.Errorf("acquire loopback qdisc ownership: %w", err)
 	}
 	releaseOnError := true
+	retainOnError := false
 	defer func() {
 		if releaseOnError {
 			_ = lock.Release()
+		} else if retainOnError {
+			retainContaminatedLock(lock)
 		}
 	}()
 
@@ -138,42 +155,47 @@ func applyWithDeps(p Profile, deps fixtureDeps) (Fixture, error) {
 	rootKind := "netem"
 	if p.Bandwidth > 0 {
 		rootKind = "tbf"
-		if err := runTC(deps.run, tbfArgs(p, rootHandle)); err != nil {
-			return nil, fmt.Errorf("install tbf root: %w", err)
+	}
+	ownership := qdiscOwnership{
+		rootKind:    rootKind,
+		rootHandle:  rootHandle,
+		childHandle: childHandle,
+	}
+	failAfterMutation := func(cause error) (Fixture, error) {
+		absenceProved, rollbackErr := removeOwnedRootAndProveAbsence(deps.run, ownership)
+		if !absenceProved {
+			releaseOnError = false
+			retainOnError = true
 		}
-	} else if err := runTC(deps.run, netemArgs(p, rootHandle, "")); err != nil {
-		return nil, fmt.Errorf("install netem root: %w", err)
+		return nil, errors.Join(cause, rollbackErr)
 	}
 
-	installedRoot := true
-	rollback := func() {
-		if installedRoot {
-			_ = deleteOwnedRoot(deps.run, rootHandle)
-		}
+	rootArgs := netemArgs(p, rootHandle, "")
+	if p.Bandwidth > 0 {
+		rootArgs = tbfArgs(p, rootHandle)
+	}
+	if err := runTC(deps.run, rootArgs); err != nil {
+		return failAfterMutation(fmt.Errorf("install %s root: %w", rootKind, err))
 	}
 
 	if p.Bandwidth > 0 && hasNetem(p) {
 		parent := strings.TrimSuffix(rootHandle, ":") + ":1"
 		if err := runTC(deps.run, netemArgs(p, childHandle, parent)); err != nil {
-			rollback()
-			return nil, fmt.Errorf("install netem child: %w", err)
+			return failAfterMutation(fmt.Errorf("install netem child: %w", err))
 		}
 	}
 
 	after, err := probeQdiscs(deps.run)
 	if err != nil {
-		rollback()
-		return nil, fmt.Errorf("probe loopback qdisc after apply: %w", err)
+		return failAfterMutation(fmt.Errorf("probe loopback qdisc after apply: %w", err))
 	}
 	if err := validateOwnedState(after, p, rootKind, rootHandle, childHandle); err != nil {
-		rollback()
-		return nil, err
+		return failAfterMutation(err)
 	}
 
 	watcher, err := deps.watch()
 	if err != nil {
-		rollback()
-		return nil, fmt.Errorf("watch loopback qdisc: %w", err)
+		return failAfterMutation(fmt.Errorf("watch loopback qdisc: %w", err))
 	}
 
 	fixture := &managedFixture{
@@ -184,15 +206,14 @@ func applyWithDeps(p Profile, deps fixtureDeps) (Fixture, error) {
 		rootHandle:  rootHandle,
 		childHandle: childHandle,
 		fingerprint: after.canonical,
+		cleanupDone: make(chan struct{}),
 	}
 	// Close the bind-to-watch race with one synchronous state check.
 	if err := fixture.Verify(); err != nil {
 		_ = watcher.Close()
-		rollback()
-		return nil, err
+		return failAfterMutation(err)
 	}
 
-	installedRoot = false
 	releaseOnError = false
 	return fixture, nil
 }
@@ -209,14 +230,15 @@ func (f *managedFixture) Verify() error {
 		return fmt.Errorf("%w: nil fixture", ErrStimulusInvalid)
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.verifyLocked()
-}
-
-func (f *managedFixture) verifyLocked() error {
 	if f.cleaned {
+		f.mu.Unlock()
 		return fmt.Errorf("%w: fixture was already cleaned", ErrStimulusInvalid)
 	}
+	f.mu.Unlock()
+	return f.verifyCurrent()
+}
+
+func (f *managedFixture) verifyCurrent() error {
 	current, err := probeQdiscs(f.run)
 	if err != nil {
 		return fmt.Errorf("%w: probe loopback qdisc: %v", ErrStimulusInvalid, err)
@@ -235,16 +257,39 @@ func (f *managedFixture) verifyLocked() error {
 	return nil
 }
 
-func (f *managedFixture) Cleanup() error {
+func (f *managedFixture) Cleanup() (result error) {
 	if f == nil {
 		return nil
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	if f.cleanupDone == nil {
+		f.cleanupDone = make(chan struct{})
+	}
 	if f.cleaned {
-		return nil
+		done := f.cleanupDone
+		f.mu.Unlock()
+		<-done
+		f.mu.Lock()
+		err := f.cleanupErr
+		f.mu.Unlock()
+		return err
 	}
 	f.cleaned = true
+	done := f.cleanupDone
+	f.mu.Unlock()
+	defer func() {
+		recovered := recover()
+		if recovered != nil {
+			result = fmt.Errorf("cleanup panic: %v", recovered)
+		}
+		f.mu.Lock()
+		f.cleanupErr = result
+		close(done)
+		f.mu.Unlock()
+		if recovered != nil {
+			panic(recovered)
+		}
+	}()
 
 	var errs []error
 	if f.watcher != nil {
@@ -258,32 +303,37 @@ func (f *managedFixture) Cleanup() error {
 			}
 		}
 	}
-	// Never issue a broad root delete after ownership has been lost. This is
-	// the key guard against deleting a qdisc installed by another process.
-	if err := f.verifyForCleanupLocked(); err != nil {
-		errs = append(errs, err)
-	} else if err := deleteOwnedRoot(f.run, f.rootHandle); err != nil {
-		current, probeErr := probeQdiscs(f.run)
-		if probeErr == nil && !bytes.Equal(current.canonical, f.fingerprint) {
-			errs = append(errs, fmt.Errorf("%w: owned qdisc changed while cleanup deleted it: %v", ErrStimulusInvalid, err))
-		} else {
-			errs = append(errs, err)
-			if probeErr != nil {
-				errs = append(errs, fmt.Errorf("probe after qdisc delete failure: %w", probeErr))
-			}
-		}
-	} else if err := verifyOwnedHandlesAbsent(f.run, f.rootHandle, f.childHandle); err != nil {
+	absenceProved := false
+	// Never issue a broad root delete after ownership has been lost. Exact
+	// fingerprint verification guards against deleting another owner's qdisc.
+	if err := f.verifyForCleanup(); err != nil {
 		errs = append(errs, err)
 	}
-	if f.lock != nil {
+	rootKind := "netem"
+	if f.profile.Bandwidth > 0 {
+		rootKind = "tbf"
+	}
+	var removeErr error
+	absenceProved, removeErr = removeOwnedRootAndProveAbsence(f.run, qdiscOwnership{
+		rootKind:    rootKind,
+		rootHandle:  f.rootHandle,
+		childHandle: f.childHandle,
+		fingerprint: f.fingerprint,
+	})
+	if removeErr != nil {
+		errs = append(errs, removeErr)
+	}
+	if absenceProved && f.lock != nil {
 		if err := f.lock.Release(); err != nil {
 			errs = append(errs, fmt.Errorf("release qdisc ownership lock: %w", err))
 		}
+	} else if f.lock != nil {
+		retainContaminatedLock(f.lock)
 	}
 	return errors.Join(errs...)
 }
 
-func (f *managedFixture) verifyForCleanupLocked() error {
+func (f *managedFixture) verifyForCleanup() error {
 	// Cleanup sets cleaned first to make repeated calls idempotent, so use the
 	// same checks without the lifecycle guard.
 	current, err := probeQdiscs(f.run)
@@ -302,6 +352,113 @@ func (f *managedFixture) verifyForCleanupLocked() error {
 			ErrStimulusInvalid, shortFingerprint(f.fingerprint), shortFingerprint(current.canonical))
 	}
 	return nil
+}
+
+func runExternalCommand(limit time.Duration, binary string, args ...string) ([]byte, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("invalid command timeout %s", limit)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, args...)
+	configureExternalCommand(cmd)
+	cmd.WaitDelay = tcCommandWait
+	output, err := cmd.CombinedOutput()
+	cleanupErr := cleanupExternalCommand(cmd, tcCommandWait)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return output, errors.Join(
+			fmt.Errorf("%s command exceeded %s: %w", binary, limit, ctxErr),
+			cleanupErr,
+		)
+	}
+	return output, errors.Join(err, cleanupErr)
+}
+
+type qdiscOwnership struct {
+	rootKind    string
+	rootHandle  string
+	childHandle string
+	fingerprint []byte
+}
+
+type qdiscOwnershipState uint8
+
+const (
+	qdiscContaminated qdiscOwnershipState = iota
+	qdiscAbsent
+	qdiscOwned
+)
+
+func (o qdiscOwnership) classify(snapshot qdiscSnapshot) qdiscOwnershipState {
+	if handlesAbsent(snapshot.records, o.rootHandle, o.childHandle) {
+		return qdiscAbsent
+	}
+	active := activeRoot(snapshot.records)
+	if o.fingerprint != nil {
+		if bytes.Equal(snapshot.canonical, o.fingerprint) {
+			return qdiscOwned
+		}
+		return qdiscContaminated
+	}
+	if active != nil && active.Root && active.Kind == o.rootKind && active.Handle == o.rootHandle {
+		return qdiscOwned
+	}
+	return qdiscContaminated
+}
+
+func removeOwnedRootAndProveAbsence(run tcRunFunc, ownership qdiscOwnership) (bool, error) {
+	var mutationErrs []error
+	for attempts := 0; attempts < 2; attempts++ {
+		current, err := probeQdiscs(run)
+		if err != nil {
+			return false, errors.Join(errors.Join(mutationErrs...),
+				fmt.Errorf("%w: cannot probe qdisc ownership during rollback: %v", ErrStimulusInvalid, err))
+		}
+		switch ownership.classify(current) {
+		case qdiscAbsent:
+			if active := activeRoot(current.records); active != nil {
+				return true, errors.Join(errors.Join(mutationErrs...),
+					fmt.Errorf("%w: generated qdisc is absent but an external root is present (kind=%s handle=%s)",
+						ErrStimulusInvalid, active.Kind, active.Handle))
+			}
+			return true, errors.Join(mutationErrs...)
+		case qdiscContaminated:
+			return false, errors.Join(errors.Join(mutationErrs...),
+				fmt.Errorf("%w: qdisc ownership is contaminated during rollback; external root is present or owned fingerprint changed (root=%s fingerprint=%s)",
+					ErrStimulusInvalid, ownership.rootHandle, shortFingerprint(current.canonical)))
+		}
+
+		if err := deleteOwnedRoot(run, ownership.rootHandle); err != nil {
+			mutationErrs = append(mutationErrs, err)
+		}
+	}
+
+	current, err := probeQdiscs(run)
+	if err != nil {
+		return false, errors.Join(errors.Join(mutationErrs...),
+			fmt.Errorf("%w: cannot prove qdisc absence after rollback: %v", ErrStimulusInvalid, err))
+	}
+	if ownership.classify(current) == qdiscAbsent {
+		return true, errors.Join(mutationErrs...)
+	}
+	return false, errors.Join(errors.Join(mutationErrs...),
+		fmt.Errorf("%w: qdisc rollback did not prove absence (root=%s fingerprint=%s)",
+			ErrStimulusInvalid, ownership.rootHandle, shortFingerprint(current.canonical)))
+}
+
+func handlesAbsent(records []qdiscRecord, rootHandle, childHandle string) bool {
+	for _, record := range records {
+		if record.Handle == rootHandle || (childHandle != "" && record.Handle == childHandle) {
+			return false
+		}
+	}
+	return true
+}
+
+func retainContaminatedLock(lock fixtureLock) {
+	contaminatedFixtureLocks.Lock()
+	contaminatedFixtureLocks.locks = append(contaminatedFixtureLocks.locks, lock)
+	contaminatedFixtureLocks.Unlock()
 }
 
 type qdiscRecord struct {
@@ -365,19 +522,6 @@ func validateOwnedState(s qdiscSnapshot, p Profile, rootKind, rootHandle, childH
 	}
 	if !childFound {
 		return fmt.Errorf("%w: owned netem child handle=%s parent=%s is absent or replaced", ErrStimulusInvalid, childHandle, parent)
-	}
-	return nil
-}
-
-func verifyOwnedHandlesAbsent(run tcRunFunc, rootHandle, childHandle string) error {
-	current, err := probeQdiscs(run)
-	if err != nil {
-		return fmt.Errorf("verify qdisc cleanup: %w", err)
-	}
-	for _, r := range current.records {
-		if r.Handle == rootHandle || (childHandle != "" && r.Handle == childHandle) {
-			return fmt.Errorf("qdisc cleanup left owned handle %s installed", r.Handle)
-		}
 	}
 	return nil
 }
