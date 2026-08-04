@@ -797,9 +797,10 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	}
 	engine.pathsMu.RLock()
 	scopeLen := len(engine.dispatchScope)
+	scopeHasFallback := engine.dispatchScope[paths[pathA.Name]]
 	engine.pathsMu.RUnlock()
-	if scopeLen != 0 {
-		t.Fatalf("dead selected scope remained effective: len=%d", scopeLen)
+	if scopeLen != 1 || !scopeHasFallback {
+		t.Fatalf("recursive death fallback scope len=%d has-A=%v", scopeLen, scopeHasFallback)
 	}
 	done := make(chan error, 1)
 	go func() {

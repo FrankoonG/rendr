@@ -234,6 +234,18 @@ func (p *executionPlan) root() (executionPlanNode, bool) {
 	return p.node(p.rootID)
 }
 
+func (p *executionPlan) hasKind(kind proto.GraphNodeKind) bool {
+	if p == nil {
+		return false
+	}
+	for _, entry := range p.nodes {
+		if entry.node.kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // node returns an owned view of id. Mutating its slices cannot change p.
 func (p *executionPlan) node(id proto.TargetID) (executionPlanNode, bool) {
 	if p == nil {

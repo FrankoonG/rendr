@@ -2831,16 +2831,10 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 	}
 }
 
-// TestM8BondSkipsStuckPath: bond mode must not round-robin frames
-// onto a path whose latest probe RTT is >= BondStuckRTTMultiplier x
-// the best path's RTT. Without this, a single slow path balloons
-// the receiver's reorder window and tanks effective bond bandwidth.
-//
-// We synthesise the RTT skew by injecting fake quality readings
-// via Engine.SetPathQualityForTest (real probes won't have measured
-// loopback paths as 100ms apart). The test then writes N data
-// frames and checks that the stuck path absorbed zero of them.
-func TestM8BondSkipsStuckPath(t *testing.T) {
+// TestM8BondHighRTTAloneDoesNotSkipPath verifies the v1 bond priority:
+// speed and stability precede latency. A healthy high-RTT path remains part
+// of aggregation; only observed writer/delivery stalls may quarantine it.
+func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -2894,7 +2888,8 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 	if len(probes) != 2 {
 		t.Fatalf("expected 2 probes, got %d", len(probes))
 	}
-	// Inject quality: probes[0]=1ms (fast), probes[1]=100ms (stuck @ 100x).
+	// Inject quality: probes[0]=1ms and probes[1]=100ms. Both writers remain
+	// healthy, so latency alone must not remove either bond member.
 	bc.Engine().SetPathQualityForTest(probes[0].id, transport.PathQuality{
 		RTT: 1 * time.Millisecond,
 	})
@@ -2902,9 +2897,11 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 		RTT: 100 * time.Millisecond,
 	})
 
-	// Capture baseline Writes() AFTER injection so any prior probe /
-	// ctrl traffic does not count against us. Pin size doesn't matter
-	// here: stuck-skip should bypass the slow path regardless.
+	bc.Engine().SetBondPinSizeForTest(1)
+	baseline := make(map[uint32]uint64, len(probes))
+	for _, path := range client.Paths() {
+		baseline[path.ID] = path.DataDispatches
+	}
 	for i := range probes {
 		probes[i].base = probes[i].writer.Writes()
 	}
@@ -2925,29 +2922,24 @@ func TestM8BondSkipsStuckPath(t *testing.T) {
 		t.Fatalf("byte-stream mismatch under bond+stuck-skip")
 	}
 
-	fastDelta := probes[0].writer.Writes() - probes[0].base
-	stuckDelta := probes[1].writer.Writes() - probes[1].base
-	t.Logf("fast path %d writes; stuck path %d writes", fastDelta, stuckDelta)
-
-	if fastDelta < N {
-		t.Fatalf("fast path absorbed %d writes; expected >= %d (all data + ctrl)",
-			fastDelta, N)
+	dispatches := make(map[uint32]uint64, len(probes))
+	var total uint64
+	for _, path := range client.Paths() {
+		delta := path.DataDispatches - baseline[path.ID]
+		dispatches[path.ID] = delta
+		total += delta
 	}
-	// Stuck path must absorb zero DATA frames. We allow up to 2 ctrl
-	// frames as noise (one MIGRATE_NOTIFY from a hypothetical prior
-	// migration; nothing else is expected to slip through).
-	if stuckDelta > 2 {
-		t.Fatalf("stuck path absorbed %d writes; expected <= 2", stuckDelta)
+	if total != N {
+		t.Fatalf("bond DATA dispatch total=%d want %d; per-path=%v", total, N, dispatches)
 	}
-
-	// The BondStuckSkips counter must have advanced at least once
-	// per skipped round-robin slot. With pin defaultBondPinSize=8
-	// and 2 paths, every other pin-window candidate is the stuck
-	// path, so 20 frames produce >= 1 skip during cursor rotation.
+	for _, probe := range probes {
+		if dispatches[probe.id] == 0 {
+			t.Fatalf("healthy high-RTT bond member was excluded: %v", dispatches)
+		}
+	}
 	skips := bc.BondStuckSkips()
-	t.Logf("bond stuck-skips counter: %d", skips)
-	if skips == 0 {
-		t.Fatal("BondStuckSkips==0; counter not wired up or never triggered")
+	if skips != 0 {
+		t.Fatalf("RTT-only input produced %d writer-stall quarantines", skips)
 	}
 	if got := bc.Stats().BondStuckSkips; got != skips {
 		t.Fatalf("Stats().BondStuckSkips=%d disagrees with BondStuckSkips()=%d", got, skips)

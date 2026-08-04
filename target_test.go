@@ -204,8 +204,8 @@ func TestDialerStatusPeerRendr(t *testing.T) {
 	if st.Peer.InstanceID == (InstanceID{}) {
 		t.Fatal("peer instance id is zero")
 	}
-	if len(st.Paths) != 1 || st.Paths[0].State != PathAttached || !st.Paths[0].Primary {
-		t.Fatalf("paths=%+v want one attached primary path", st.Paths)
+	if len(st.Paths) != 1 || st.Paths[0].Name != "A" || st.Paths[0].State != PathAttached {
+		t.Fatalf("paths=%+v want path A attached", st.Paths)
 	}
 }
 
@@ -257,8 +257,8 @@ func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
 	if len(st.Paths) != 2 {
 		t.Fatalf("paths=%d want 2: %+v", len(st.Paths), st.Paths)
 	}
-	if !st.Paths[0].Primary || st.Paths[0].State != PathPending && st.Paths[0].State != PathUnavailable {
-		t.Fatalf("primary status=%+v want pending/unavailable", st.Paths[0])
+	if st.Paths[0].Name != "A" || st.Paths[0].State != PathPending && st.Paths[0].State != PathUnavailable {
+		t.Fatalf("path A status=%+v want pending/unavailable", st.Paths[0])
 	}
 	if st.Paths[1].Name != "B" || st.Paths[1].State != PathAttached || !st.Paths[1].Active {
 		t.Fatalf("fallback status=%+v want active attached B", st.Paths[1])

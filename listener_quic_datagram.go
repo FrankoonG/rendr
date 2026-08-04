@@ -175,14 +175,14 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 		Opts:      map[string]string{"mode": "datagram"},
 	}
 	spec = specWithTargetName(spec, helloPathName(p))
-	_, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
+	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
 	if err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
+	if err := acknowledgeInitialServerPath(e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()

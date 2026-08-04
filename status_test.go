@@ -4,21 +4,90 @@ import (
 	"context"
 	"io"
 	"net"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/proto"
 )
 
-func TestProbeLocalDefault(t *testing.T) {
+func TestProbeLocalReportsOnlyCoreCapabilities(t *testing.T) {
 	st, err := ProbeLocal(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.Caps.Has(CapRendr) {
-		t.Fatalf("caps=%v missing %q", st.Caps, CapRendr)
+	want := CapabilitySet{CapRendr, CapL7, CapPacketMode}
+	if !reflect.DeepEqual(st.Caps, want) {
+		t.Fatalf("caps=%v want exact core set %v", st.Caps, want)
 	}
-	if !st.Caps.Has(CapL7) {
-		t.Fatalf("caps=%v missing %q", st.Caps, CapL7)
+
+	for _, adapterCapability := range []CapabilityID{
+		"tcp_repair",
+		"gvisor",
+		"tun",
+		"mixed",
+		"quic_datagram",
+	} {
+		filtered, err := ProbeLocal(context.Background(), adapterCapability)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(filtered.Caps) != 0 {
+			t.Fatalf("adapter capability %q leaked from root probe: %v", adapterCapability, filtered.Caps)
+		}
+	}
+}
+
+func TestProbeLocalHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ProbeLocal(ctx)
+	if err != context.Canceled {
+		t.Fatalf("error=%v want context.Canceled", err)
+	}
+}
+
+func TestPeerCapabilitiesRequireExplicitRendrPeer(t *testing.T) {
+	bits := uint32(proto.CapsPacketMode | proto.CapsL3Identity)
+	var instanceID InstanceID
+	instanceID[0] = 1
+	for _, kind := range []PeerKind{PeerUnknown, PeerNative} {
+		got := peerStatus(kind, instanceID, bits)
+		if got.InstanceID != (InstanceID{}) || len(got.Caps) != 0 {
+			t.Fatalf("kind=%q status=%+v want no inferred rendr evidence", kind, got)
+		}
+	}
+
+	want := CapabilitySet{CapRendr, CapL7, CapPacketMode, CapL3Identity}
+	got := peerStatus(PeerRendr, instanceID, bits)
+	if got.InstanceID != instanceID || !reflect.DeepEqual(got.Caps, want) {
+		t.Fatalf("rendr peer status=%+v want instance=%v caps=%v", got, instanceID, want)
+	}
+}
+
+func TestPathStatusDoesNotDependOnTransportName(t *testing.T) {
+	statusFor := func(transportName string) []PathStatus {
+		spec := specWithTargetName(PathSpec{
+			Transport: transportName,
+			Address:   "example.invalid:443",
+		}, "leaf")
+		return newPathStatusTracker([]PathSpec{spec}, "leaf").snapshot(nil)
+	}
+
+	baseline := statusFor("custom")
+	for _, adapterName := range []string{"tcprepair", "gvisor", "tun", "quic", "udpflow"} {
+		if got := statusFor(adapterName); !reflect.DeepEqual(got, baseline) {
+			t.Fatalf("transport %q changed generic path evidence: got=%+v want=%+v", adapterName, got, baseline)
+		}
+	}
+
+	typ := reflect.TypeOf(PathStatus{})
+	for _, removed := range []string{"Transport", "Primary", "Caps"} {
+		if _, ok := typ.FieldByName(removed); ok {
+			t.Fatalf("PathStatus still exposes adapter/config field %q", removed)
+		}
 	}
 }
 

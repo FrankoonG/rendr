@@ -8,9 +8,6 @@ import (
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
-	"github.com/FrankoonG/rendr/transport/gvisor"
-	"github.com/FrankoonG/rendr/transport/tcprepair"
-	"github.com/FrankoonG/rendr/tun"
 )
 
 // InstanceID identifies one running rendr runtime. It is generated at
@@ -24,15 +21,16 @@ type InstanceID = proto.InstanceID
 type CapabilityID string
 
 const (
-	CapRendr        CapabilityID = "rendr"
-	CapL7           CapabilityID = "l7"
-	CapTUN          CapabilityID = "tun"
-	CapL3Identity   CapabilityID = "l3_identity"
-	CapTCPRepair    CapabilityID = "tcp_repair"
-	CapGVisor       CapabilityID = "gvisor"
-	CapMixed        CapabilityID = "mixed"
-	CapPacketMode   CapabilityID = "packet_mode"
-	CapQUICDatagram CapabilityID = "quic_datagram"
+	// CapRendr confirms the local runtime or peer speaks the rendr session
+	// protocol. It does not imply any optional leaf implementation.
+	CapRendr CapabilityID = "rendr"
+	// CapL7 confirms support for the generic framed stream contract.
+	CapL7 CapabilityID = "l7"
+	// CapL3Identity confirms that L3 identity metadata was negotiated for a
+	// session. It does not claim that a TUN device is available.
+	CapL3Identity CapabilityID = "l3_identity"
+	// CapPacketMode confirms support for the generic framed packet contract.
+	CapPacketMode CapabilityID = "packet_mode"
 )
 
 type CapabilitySet []CapabilityID
@@ -50,9 +48,19 @@ type LocalStatus struct {
 	Caps CapabilitySet
 }
 
-// ProbeLocal reports locally available rendr capabilities. The ids
-// argument is an optional filter; when empty it probes the default core set.
-func ProbeLocal(_ context.Context, ids ...CapabilityID) (LocalStatus, error) {
+// ProbeLocal reports process-intrinsic core capabilities. Optional adapters
+// own their probes and status; the root package neither imports nor guesses
+// them from factory or transport names. The ids argument is an optional
+// filter over this core set.
+func ProbeLocal(ctx context.Context, ids ...CapabilityID) (LocalStatus, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return LocalStatus{}, ctx.Err()
+		default:
+		}
+	}
+
 	want := make(map[CapabilityID]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
@@ -67,18 +75,7 @@ func ProbeLocal(_ context.Context, ids ...CapabilityID) (LocalStatus, error) {
 
 	add(CapRendr)
 	add(CapL7)
-	add(CapMixed)
 	add(CapPacketMode)
-	add(CapQUICDatagram)
-	if include(CapGVisor) && gvisor.Available() == nil {
-		add(CapGVisor)
-	}
-	if include(CapTCPRepair) && tcprepair.Available() == nil {
-		add(CapTCPRepair)
-	}
-	if include(CapTUN) && tun.Probe().Available {
-		add(CapTUN)
-	}
 	return LocalStatus{Caps: caps}, nil
 }
 
@@ -116,11 +113,8 @@ const (
 
 type PathStatus struct {
 	Name      string
-	Transport string
 	State     PathState
 	Active    bool
-	Primary   bool
-	Caps      CapabilitySet
 	LastError string
 }
 
@@ -142,7 +136,9 @@ const (
 	FallbackDeny  FallbackPolicy = "deny"
 )
 
-type RuntimeConfig struct {
+// IngressRuntimeConfig describes ingress capability preferences and fallback
+// behavior.
+type IngressRuntimeConfig struct {
 	IngressMode IngressMode
 	Fallback    FallbackPolicy
 }
@@ -161,7 +157,10 @@ type RetryPolicy struct {
 	Jitter     float64
 }
 
-func capsFromProto(bits uint32) CapabilitySet {
+func capsFromProto(kind PeerKind, bits uint32) CapabilitySet {
+	if kind != PeerRendr {
+		return nil
+	}
 	caps := CapabilitySet{CapRendr, CapL7}
 	if bits&proto.CapsPacketMode != 0 {
 		caps = append(caps, CapPacketMode)
@@ -172,21 +171,14 @@ func capsFromProto(bits uint32) CapabilitySet {
 	return caps
 }
 
-func pathCaps(spec PathSpec) CapabilitySet {
-	caps := CapabilitySet{CapL7}
-	switch spec.Transport {
-	case "tcprepair":
-		caps = append(caps, CapTCPRepair)
-	case "gvisor":
-		caps = append(caps, CapGVisor)
-	case "quic":
-		if spec.Opts != nil && spec.Opts["mode"] == "datagram" {
-			caps = append(caps, CapQUICDatagram, CapPacketMode)
-		}
-	case "udpflow":
-		caps = append(caps, CapPacketMode)
+func peerStatus(kind PeerKind, instanceID InstanceID, bits uint32) PeerStatus {
+	status := PeerStatus{Kind: kind}
+	if kind != PeerRendr {
+		return status
 	}
-	return caps
+	status.InstanceID = instanceID
+	status.Caps = capsFromProto(kind, bits)
+	return status
 }
 
 type pathStatusTracker struct {
@@ -197,11 +189,10 @@ type pathStatusTracker struct {
 type trackedPathStatus struct {
 	spec      PathSpec
 	state     PathState
-	primary   bool
 	lastError string
 }
 
-func newPathStatusTracker(paths []PathSpec, primaryName string) *pathStatusTracker {
+func newPathStatusTracker(paths []PathSpec, _ string) *pathStatusTracker {
 	t := &pathStatusTracker{paths: make([]trackedPathStatus, len(paths))}
 	for i, ps := range paths {
 		name := pathSpecName(ps)
@@ -209,16 +200,9 @@ func newPathStatusTracker(paths []PathSpec, primaryName string) *pathStatusTrack
 			name = "path-" + strconv.Itoa(i+1)
 			ps = specWithTargetName(ps, name)
 		}
-		primary := false
-		if primaryName != "" {
-			primary = name == primaryName
-		} else {
-			primary = i == 0
-		}
 		t.paths[i] = trackedPathStatus{
-			spec:    ps,
-			state:   PathPending,
-			primary: primary,
+			spec:  ps,
+			state: PathPending,
 		}
 	}
 	return t
@@ -250,21 +234,18 @@ func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
 	for _, tracked := range t.paths {
 		if idx := matchAttachedPath(tracked.spec, attached, used); idx >= 0 {
 			used[idx] = true
-			out = append(out, pathStatusFromInfo(attached[idx], tracked.primary))
+			out = append(out, pathStatusFromInfo(attached[idx]))
 			continue
 		}
 		out = append(out, PathStatus{
 			Name:      pathSpecName(tracked.spec),
-			Transport: tracked.spec.Transport,
 			State:     tracked.state,
-			Primary:   tracked.primary,
-			Caps:      pathCaps(tracked.spec),
 			LastError: tracked.lastError,
 		})
 	}
 	for i, p := range attached {
 		if !used[i] {
-			out = append(out, pathStatusFromInfo(p, false))
+			out = append(out, pathStatusFromInfo(p))
 		}
 	}
 	return out
@@ -282,14 +263,11 @@ func matchAttachedPath(spec PathSpec, attached []PathInfo, used []bool) int {
 	return -1
 }
 
-func pathStatusFromInfo(p PathInfo, primary bool) PathStatus {
+func pathStatusFromInfo(p PathInfo) PathStatus {
 	return PathStatus{
-		Name:      pathSpecName(p.Spec),
-		Transport: p.Spec.Transport,
-		State:     PathAttached,
-		Active:    p.Active,
-		Primary:   primary,
-		Caps:      pathCaps(p.Spec),
+		Name:   pathSpecName(p.Spec),
+		State:  PathAttached,
+		Active: p.Active,
 	}
 }
 
@@ -302,25 +280,18 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker) Stat
 	case engine.PeerNative:
 		peerKind = PeerNative
 	default:
-		if e.PeerCaps() != 0 || e.PeerInstanceID() != (InstanceID{}) {
-			peerKind = PeerRendr
-		}
 	}
 	paths := e.Paths()
 	out := tracker.snapshot(paths)
 	if out == nil {
 		out = make([]PathStatus, 0, len(paths))
 		for _, p := range paths {
-			out = append(out, pathStatusFromInfo(p, p.ID == 1))
+			out = append(out, pathStatusFromInfo(p))
 		}
 	}
 	return Status{
 		Local: local.Caps,
-		Peer: PeerStatus{
-			Kind:       peerKind,
-			InstanceID: e.PeerInstanceID(),
-			Caps:       capsFromProto(e.PeerCaps()),
-		},
+		Peer:  peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
 		Paths: out,
 	}
 }

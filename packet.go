@@ -40,6 +40,7 @@ func newEnginePacketConn(e *engine.Engine, mode Mode, lAddr, rAddr net.Addr) *en
 	if kind, ok := mode.executionKind(); ok {
 		_ = e.ConfigureExecution(kind)
 	}
+	e.StartSelector(nil, 0)
 	return pc
 }
 

@@ -15,8 +15,51 @@ func TestRecursiveDispatchCrossModeTrafficIsNotFlattened(t *testing.T) {
 	tests := []struct {
 		name     string
 		manifest func(*testing.T) (proto.GraphManifest, map[string]proto.TargetID)
+		paths    []string
 		want     map[string]uint64
 	}{
+		{
+			name: "selector invokes bond child",
+			manifest: func(t *testing.T) (proto.GraphManifest, map[string]proto.TargetID) {
+				return runtimeGraph(t,
+					runtimeNode(proto.GraphNodeKindSelector, "root", "aggregate", "c"),
+					runtimeNode(proto.GraphNodeKindBond, "aggregate", "a", "b"),
+					runtimeNode(proto.GraphNodeKindPath, "a"),
+					runtimeNode(proto.GraphNodeKindPath, "b"),
+					runtimeNode(proto.GraphNodeKindPath, "c"),
+				)
+			},
+			paths: []string{"a", "b", "c"},
+			want:  map[string]uint64{"a": 2, "b": 2, "c": 0},
+		},
+		{
+			name: "selector invokes race child",
+			manifest: func(t *testing.T) (proto.GraphManifest, map[string]proto.TargetID) {
+				return runtimeGraph(t,
+					runtimeNode(proto.GraphNodeKindSelector, "root", "redundant", "c"),
+					runtimeNode(proto.GraphNodeKindRace, "redundant", "a", "b"),
+					runtimeNode(proto.GraphNodeKindPath, "a"),
+					runtimeNode(proto.GraphNodeKindPath, "b"),
+					runtimeNode(proto.GraphNodeKindPath, "c"),
+				)
+			},
+			paths: []string{"a", "b", "c"},
+			want:  map[string]uint64{"a": 4, "b": 4, "c": 0},
+		},
+		{
+			name: "bond invokes selector child",
+			manifest: func(t *testing.T) (proto.GraphManifest, map[string]proto.TargetID) {
+				return runtimeGraph(t,
+					runtimeNode(proto.GraphNodeKindBond, "root", "choice", "c"),
+					runtimeNode(proto.GraphNodeKindSelector, "choice", "a", "b"),
+					runtimeNode(proto.GraphNodeKindPath, "a"),
+					runtimeNode(proto.GraphNodeKindPath, "b"),
+					runtimeNode(proto.GraphNodeKindPath, "c"),
+				)
+			},
+			paths: []string{"a", "b", "c"},
+			want:  map[string]uint64{"a": 2, "b": 0, "c": 2},
+		},
 		{
 			name: "race invokes one bond child per frame",
 			manifest: func(t *testing.T) (proto.GraphManifest, map[string]proto.TargetID) {
@@ -28,7 +71,8 @@ func TestRecursiveDispatchCrossModeTrafficIsNotFlattened(t *testing.T) {
 					runtimeNode(proto.GraphNodeKindPath, "c"),
 				)
 			},
-			want: map[string]uint64{"direct": 4, "b": 2, "c": 2},
+			paths: []string{"direct", "b", "c"},
+			want:  map[string]uint64{"direct": 4, "b": 2, "c": 2},
 		},
 		{
 			name: "bond invokes whole race child",
@@ -41,14 +85,29 @@ func TestRecursiveDispatchCrossModeTrafficIsNotFlattened(t *testing.T) {
 					runtimeNode(proto.GraphNodeKindPath, "c"),
 				)
 			},
-			want: map[string]uint64{"direct": 2, "b": 2, "c": 2},
+			paths: []string{"direct", "b", "c"},
+			want:  map[string]uint64{"direct": 2, "b": 2, "c": 2},
+		},
+		{
+			name: "race invokes selector child",
+			manifest: func(t *testing.T) (proto.GraphManifest, map[string]proto.TargetID) {
+				return runtimeGraph(t,
+					runtimeNode(proto.GraphNodeKindRace, "root", "choice", "c"),
+					runtimeNode(proto.GraphNodeKindSelector, "choice", "a", "b"),
+					runtimeNode(proto.GraphNodeKindPath, "a"),
+					runtimeNode(proto.GraphNodeKindPath, "b"),
+					runtimeNode(proto.GraphNodeKindPath, "c"),
+				)
+			},
+			paths: []string{"a", "b", "c"},
+			want:  map[string]uint64{"a": 4, "b": 0, "c": 4},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			manifest, _ := test.manifest(t)
-			client, server, captures := newRecursiveEnginePair(t, manifest, "direct", "b", "c")
+			client, server, captures := newRecursiveEnginePair(t, manifest, test.paths...)
 			client.SetPacketMode()
 			server.SetPacketMode()
 			for i := 0; i < 4; i++ {
@@ -163,6 +222,90 @@ func TestRaceBlockedAndFailedChildrenRespectMigrationBudget(t *testing.T) {
 	}
 }
 
+func TestBondBlockedChildDoesNotHeadOfLineBlockHealthySibling(t *testing.T) {
+	manifest, _ := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindBond, "root", "blocked", "healthy"),
+		runtimeNode(proto.GraphNodeKindPath, "blocked"),
+		runtimeNode(proto.GraphNodeKindPath, "healthy"),
+	)
+	flow := NewClientFlowID()
+	limits := Limits{MigrationBudget: time.Second}.Clamp()
+	client := New(SideClient, flow, limits)
+	server := New(SideServer, flow, limits)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	configureRecursivePair(t, client, server, manifest)
+
+	blockedClient, blockedServer := newMemoryPathPair()
+	block := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(block) }) }
+	t.Cleanup(release)
+	attachRecursivePath(t, client, server, "blocked", &blockedDispatchPath{PathConn: blockedClient, block: block}, blockedServer)
+	healthyClient, healthyServer := newMemoryPathPair()
+	attachRecursivePath(t, client, server, "healthy", healthyClient, healthyServer)
+
+	start := time.Now()
+	if _, err := client.SendData([]byte("bond-fallback")); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < minimumDispatchStallWindow || elapsed > 600*time.Millisecond {
+		t.Fatalf("bond fallback elapsed=%v, want [%v,600ms]", elapsed, minimumDispatchStallWindow)
+	}
+	buf := make([]byte, len("bond-fallback"))
+	if n, err := server.Recv(buf); err != nil || string(buf[:n]) != "bond-fallback" {
+		t.Fatalf("server Recv=(%q,%v)", buf[:n], err)
+	}
+	if got := client.BondStuckSkips(); got != 1 {
+		t.Fatalf("writer-stall quarantine count=%d, want 1", got)
+	}
+	release()
+}
+
+func TestBondAllBlockedChildrenHonorMigrationBudget(t *testing.T) {
+	manifest, _ := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindBond, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	limits := Limits{MigrationBudget: 275 * time.Millisecond}.Clamp()
+	e := New(SideClient, NewClientFlowID(), limits)
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	blocks := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releases [2]sync.Once
+	for i, name := range []string{"a", "b"} {
+		path, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		t.Cleanup(func() { releases[i].Do(func() { close(blocks[i]) }) })
+		spec := transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": name}}
+		if _, err := e.AttachPath(&blockedDispatchPath{PathConn: path, block: blocks[i]}, spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	_, err := e.SendData([]byte("all-blocked"))
+	elapsed := time.Since(start)
+	for i := range blocks {
+		releases[i].Do(func() { close(blocks[i]) })
+	}
+	if err != ErrMigrationBudgetExceeded {
+		t.Fatalf("SendData error=%v, want %v", err, ErrMigrationBudgetExceeded)
+	}
+	if elapsed < limits.MigrationBudget || elapsed > limits.MigrationBudget+300*time.Millisecond {
+		t.Fatalf("all-blocked elapsed=%v, want [%v,%v]", elapsed, limits.MigrationBudget, limits.MigrationBudget+300*time.Millisecond)
+	}
+}
+
 func TestRecursivePolicySelectionIsOneSequencedBoundary(t *testing.T) {
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
@@ -222,6 +365,52 @@ func TestRecursivePolicySelectionIsOneSequencedBoundary(t *testing.T) {
 	if aSeqs[len(aSeqs)-1] >= bSeqs[0] {
 		t.Fatalf("policy boundary interleaved old and new routes: a=%v b=%v", aSeqs, bSeqs)
 	}
+}
+
+func TestRecursiveDispatchDeepGraphPreservesEveryBoundary(t *testing.T) {
+	a := runtimeNode(proto.GraphNodeKindPath, "a")
+	b := runtimeNode(proto.GraphNodeKindPath, "b")
+	c := runtimeNode(proto.GraphNodeKindPath, "c")
+	d := runtimeNode(proto.GraphNodeKindPath, "d")
+	e := runtimeNode(proto.GraphNodeKindPath, "e")
+	inner := proto.GraphNode{
+		ID: proto.DeriveTargetID(proto.GraphNodeKindSelector, "inner"), Kind: proto.GraphNodeKindSelector, Name: "inner",
+		Children: []proto.TargetID{a.ID, b.ID},
+	}
+	aggregate := proto.GraphNode{
+		ID: proto.DeriveTargetID(proto.GraphNodeKindBond, "aggregate"), Kind: proto.GraphNodeKindBond, Name: "aggregate",
+		Children: []proto.TargetID{inner.ID, c.ID},
+	}
+	redundant := proto.GraphNode{
+		ID: proto.DeriveTargetID(proto.GraphNodeKindRace, "redundant"), Kind: proto.GraphNodeKindRace, Name: "redundant",
+		Children: []proto.TargetID{aggregate.ID, d.ID},
+	}
+	root := proto.GraphNode{
+		ID: proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"), Kind: proto.GraphNodeKindSelector, Name: "root",
+		Children: []proto.TargetID{redundant.ID, e.ID},
+	}
+	manifest := proto.GraphManifest{RootID: root.ID, Nodes: []proto.GraphNode{root, redundant, aggregate, inner, a, b, c, d, e}}
+	if err := manifest.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	client, server, captures := newRecursiveEnginePair(t, manifest, "a", "b", "c", "d", "e")
+	client.SetPacketMode()
+	server.SetPacketMode()
+	if err := client.SelectLocalTarget(inner.ID, b.ID, "deep-test"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		payload := []byte{byte(i)}
+		if err := client.SendPacket(payload); err != nil {
+			t.Fatal(err)
+		}
+		got, err := server.RecvPacket()
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("RecvPacket=(%x,%v), want %x", got, err, payload)
+		}
+	}
+	want := map[string]uint64{"a": 0, "b": 2, "c": 2, "d": 4, "e": 0}
+	waitForCapturedFrames(t, captures, want)
 }
 
 type blockedDispatchPath struct {

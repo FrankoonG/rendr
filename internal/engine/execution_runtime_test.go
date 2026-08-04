@@ -3,8 +3,10 @@ package engine
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 )
 
 func TestExecutionRuntimePreservesCrossModeBoundaries(t *testing.T) {
@@ -92,12 +94,53 @@ func TestExecutionRuntimeSelectorDeathBypassesPolicyAndRecoversDesired(t *testin
 	}
 }
 
+func TestExecutionRuntimeSelectorAggregateRTTUsesEffectiveChild(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindBond, "root", "choice", "direct"),
+		runtimeNode(proto.GraphNodeKindSelector, "choice", "fast", "slow"),
+		runtimeNode(proto.GraphNodeKindPath, "fast"),
+		runtimeNode(proto.GraphNodeKindPath, "slow"),
+		runtimeNode(proto.GraphNodeKindPath, "direct"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["choice"], ids["slow"]); err != nil {
+		t.Fatal(err)
+	}
+	attached := runtimeAttached(ids, "fast", "slow", "direct")
+	var available func(proto.TargetID) bool
+	available = func(id proto.TargetID) bool {
+		node, ok := runtime.plan.node(id)
+		if !ok {
+			return false
+		}
+		if node.kind == proto.GraphNodeKindPath {
+			return attached[id]
+		}
+		for _, child := range node.children {
+			if available(child) {
+				return true
+			}
+		}
+		return false
+	}
+	qualities := map[proto.TargetID]transport.PathQuality{
+		ids["fast"]:   {RTT: time.Millisecond},
+		ids["slow"]:   {RTT: time.Second},
+		ids["direct"]: {RTT: 100 * time.Millisecond},
+	}
+	if got := runtime.aggregateRTT(ids["choice"], available, qualities); got != time.Second {
+		t.Fatalf("selector aggregate RTT=%v, want effective slow child RTT=1s", got)
+	}
+}
+
 func runtimeNode(kind proto.GraphNodeKind, name string, children ...string) proto.GraphNode {
 	node := proto.GraphNode{ID: proto.DeriveTargetID(kind, name), Kind: kind, Name: name}
 	for _, child := range children {
 		var childKind proto.GraphNodeKind
 		switch child {
 		case "inner":
+			childKind = proto.GraphNodeKindSelector
+		case "choice":
 			childKind = proto.GraphNodeKindSelector
 		case "aggregate":
 			childKind = proto.GraphNodeKindBond

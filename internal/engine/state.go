@@ -59,6 +59,10 @@ type Limits struct {
 	// switching. Default 0.25.
 	SelectorHysteresis float64
 
+	// SelectorLatencyFloor prevents a sub-millisecond best RTT from making
+	// the relative feasible band collapse to scheduling noise. Default 1ms.
+	SelectorLatencyFloor time.Duration
+
 	// SelectorDwell: minimum duration a candidate must remain the
 	// best-scoring path before the engine migrates to it. Default 5s.
 	SelectorDwell time.Duration
@@ -83,6 +87,7 @@ func DefaultLimits() Limits {
 		ZombieMaxMigrations:    2,
 		ZombieCooldown:         30 * time.Second,
 		SelectorHysteresis:     0.25,
+		SelectorLatencyFloor:   time.Millisecond,
 		SelectorDwell:          5 * time.Second,
 		SelectorCooldown:       30 * time.Second,
 		BondStuckRTTMultiplier: 3.0,
@@ -107,6 +112,9 @@ func (l Limits) Clamp() Limits {
 	}
 	if l.SelectorHysteresis <= 0 {
 		l.SelectorHysteresis = def.SelectorHysteresis
+	}
+	if l.SelectorLatencyFloor <= 0 {
+		l.SelectorLatencyFloor = def.SelectorLatencyFloor
 	}
 	if l.SelectorDwell <= 0 {
 		l.SelectorDwell = def.SelectorDwell

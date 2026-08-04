@@ -413,6 +413,12 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		e.policyStateMu.Unlock()
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
+	if err := e.admitPeerPolicy(prepare.SelectorID, prepare.TargetID, prepare.Cause); err != nil {
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, err.Error())
+		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
+		e.policyStateMu.Unlock()
+		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
+	}
 	if prepare.BaseGeneration != e.policyGeneration {
 		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, prepare.SelectorID, "base generation is stale")
 		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
@@ -552,7 +558,10 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 	e.policyStateMu.Unlock()
 
-	applyErr := e.applyPolicySelectionFromGraph(pending.graph, prepare.SelectorID, prepare.TargetID, prepare.Cause)
+	applyErr := e.admitPeerPolicy(prepare.SelectorID, prepare.TargetID, prepare.Cause)
+	if applyErr == nil {
+		applyErr = e.applyPolicySelectionFromGraph(pending.graph, prepare.SelectorID, prepare.TargetID, prepare.Cause)
+	}
 
 	e.policyStateMu.Lock()
 	if e.policyIncoming != pending || e.policyGeneration != prepare.BaseGeneration {

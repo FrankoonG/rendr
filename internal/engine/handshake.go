@@ -185,6 +185,13 @@ func (e *Engine) ValidateBridgeBinding(tag proto.BridgeTagPayload) error {
 		return ErrDuplicateAttach
 	}
 	e.seenAttach[tag.AttachID] = struct{}{}
+	e.seenAttachFIFO = append(e.seenAttachFIFO, tag.AttachID)
+	if len(e.seenAttachFIFO) > maxSeenAttachIDs {
+		oldest := e.seenAttachFIFO[0]
+		copy(e.seenAttachFIFO, e.seenAttachFIFO[1:])
+		e.seenAttachFIFO = e.seenAttachFIFO[:len(e.seenAttachFIFO)-1]
+		delete(e.seenAttach, oldest)
+	}
 	e.attachMu.Unlock()
 	return nil
 }

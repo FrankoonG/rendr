@@ -343,7 +343,6 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		}
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		slot.recordDispatch(frame)
-		slot.rememberBondFrame(frame)
 		return nil
 	}
 }
@@ -362,7 +361,7 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 		if e.isClosed() {
 			return net.ErrClosed
 		}
-		if err := e.dispatchRedistributedBondFrame(frame); err != nil {
+		if err := e.dispatch(frame); err != nil {
 			return err
 		}
 		if len(frame) >= proto.HeaderSize {
@@ -420,56 +419,6 @@ func (e *Engine) replayUntilSent(nextSeq uint64) {
 	}
 }
 
-func (e *Engine) dispatchRedistributedBondFrame(frame []byte) error {
-	for {
-		e.pathsMu.Lock()
-		if len(e.paths) == 0 {
-			e.pathsMu.Unlock()
-			return net.ErrClosed
-		}
-		activeID := e.activeID
-		ids := make([]uint32, 0, len(e.paths))
-		for id := range e.paths {
-			if !e.dispatchScopeAllowsLocked(id) {
-				continue
-			}
-			ids = append(ids, id)
-		}
-		if len(ids) == 0 {
-			e.pathsMu.Unlock()
-			return net.ErrClosed
-		}
-		for i := 1; i < len(ids); i++ {
-			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
-				ids[j-1], ids[j] = ids[j], ids[j-1]
-			}
-		}
-		if activeID != 0 {
-			for i, id := range ids {
-				if id == activeID {
-					copy(ids[1:i+1], ids[:i])
-					ids[0] = id
-					break
-				}
-			}
-		}
-		slots := make([]*pathSlot, 0, len(ids))
-		for _, id := range ids {
-			slots = append(slots, e.paths[id])
-		}
-		e.pathsMu.Unlock()
-
-		now := nowFn().UnixNano()
-		for _, slot := range slots {
-			if n, err := slot.writeFrame(frame); err == nil && n == len(frame) {
-				slot.lastSendUnixNano.Store(now)
-				return nil
-			}
-		}
-		return net.ErrClosed
-	}
-}
-
 func (e *Engine) bondWeightsLocked(ids []uint32) ([]uint16, uint64) {
 	weights := make([]uint16, len(ids))
 	var total uint64
@@ -505,41 +454,11 @@ func bondWeightedIndex(weights []uint16, total uint64, cursor uint64) int {
 	return len(weights) - 1
 }
 
-// computeBondStuckMask returns, for each id in ids (in order), true
-// if that path's latest probe RTT exceeds best_rtt * multiplier.
-// Caller must hold e.pathsMu in read or write mode.
-//
-// Paths with zero RTT (no probe reply yet) are never stuck; if no
-// path has any positive RTT reading the mask is all-false.
+// computeBondStuckMask is retained for the transitional flat dispatcher.
+// Latency alone cannot exclude a bond member; recursive dispatch performs
+// evidence-based writer-stall quarantine instead.
 func (e *Engine) computeBondStuckMask(ids []uint32) []bool {
-	mask := make([]bool, len(ids))
-	var best time.Duration
-	rtts := make([]time.Duration, len(ids))
-	for i, id := range ids {
-		if s, ok := e.paths[id]; ok {
-			rtts[i] = s.conn.Quality().RTT
-			if rtts[i] > 0 && (best == 0 || rtts[i] < best) {
-				best = rtts[i]
-			}
-		}
-	}
-	if best == 0 {
-		return mask
-	}
-	mult := e.limits.BondStuckRTTMultiplier
-	if mult >= 1_000_000 {
-		return mask
-	}
-	if mult <= 1.0 {
-		mult = 3.0
-	}
-	threshold := time.Duration(float64(best) * mult)
-	for i, r := range rtts {
-		if r > 0 && r > threshold {
-			mask[i] = true
-		}
-	}
-	return mask
+	return make([]bool, len(ids))
 }
 
 // dispatchRace writes the same frame on every attached path.

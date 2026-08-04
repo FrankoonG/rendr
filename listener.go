@@ -178,14 +178,14 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	}
 
 	spec := specFromAddrName(pc.RemoteAddr(), helloPathName(p))
-	_, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
+	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
 	if err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
+	if err := acknowledgeInitialServerPath(e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -260,7 +260,7 @@ func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, pe
 	if err != nil {
 		return 0, proto.TargetID{}, err
 	}
-	id, err := e.AttachPathBound(pc, spec, engine.PathBinding{
+	id, err := e.PreparePathBound(pc, spec, engine.PathBinding{
 		LocalTXTargetID: localTargetID,
 		PeerTXTargetID:  peerTargetID,
 	})
@@ -269,6 +269,22 @@ func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, pe
 
 func acknowledgeServerPath(e *engine.Engine, pathID uint32, pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, localTargetID proto.TargetID) error {
 	if err := engine.PerformBridgeAckForTarget(pc, tag, instanceID, localTargetID, proto.AckOK, ""); err != nil {
+		e.AbortPathAttach(pathID, err)
+		return err
+	}
+	if err := e.CommitPathAttach(pathID); err != nil {
+		e.AbortPathAttach(pathID, err)
+		return err
+	}
+	return nil
+}
+
+func acknowledgeInitialServerPath(e *engine.Engine, pathID uint32, pc transport.PathConn, instanceID proto.InstanceID, caps uint32, localTargetID, peerTargetID proto.TargetID) error {
+	if err := engine.PerformHelloAck(pc, e, instanceID, caps, localTargetID, peerTargetID); err != nil {
+		e.AbortPathAttach(pathID, err)
+		return err
+	}
+	if err := e.CommitPathAttach(pathID); err != nil {
 		e.AbortPathAttach(pathID, err)
 		return err
 	}

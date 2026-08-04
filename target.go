@@ -134,6 +134,7 @@ type compiledTarget struct {
 	runtimeNested bool
 	graph         compiledTargetGraph
 	graphRevision uint64
+	runtimeConfig RuntimeConfig
 }
 
 var (

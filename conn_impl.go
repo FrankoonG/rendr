@@ -31,6 +31,7 @@ func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBac
 	if kind, ok := mode.executionKind(); ok {
 		_ = e.ConfigureExecution(kind)
 	}
+	e.StartSelector(nil, 0)
 	return bc
 }
 

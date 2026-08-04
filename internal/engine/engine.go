@@ -20,6 +20,10 @@ import (
 // a larger one would not fit in 16-bit length-prefix.
 const MaxPayload = 32 * 1024
 
+const maxSessionPaths = 64
+const maxSeenAttachIDs = 1024
+const pathCloseTimeout = 250 * time.Millisecond
+
 // Side indicates whether this engine is the dialing (client) side or
 // the listening (server) side. The only behavioural difference in M1
 // is who issues HELLO first.
@@ -41,21 +45,22 @@ const (
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side          Side
-	flowID        [16]byte
-	limits        Limits
-	peerCaps      atomic.Uint32
-	localInstance proto.InstanceID
-	peerInstance  proto.InstanceID
-	peerKind      atomic.Uint32
-	state         atomic.Uint32 // BridgeState
-	graphMu       sync.RWMutex
-	localGraph    graphBinding
-	peerGraph     graphBinding
-	localExec     *executionRuntime
-	attachMu      sync.Mutex
-	seenAttach    map[[16]byte]struct{}
-	created       time.Time
+	side           Side
+	flowID         [16]byte
+	limits         Limits
+	peerCaps       atomic.Uint32
+	localInstance  proto.InstanceID
+	peerInstance   proto.InstanceID
+	peerKind       atomic.Uint32
+	state          atomic.Uint32 // BridgeState
+	graphMu        sync.RWMutex
+	localGraph     graphBinding
+	peerGraph      graphBinding
+	localExec      *executionRuntime
+	attachMu       sync.Mutex
+	seenAttach     map[[16]byte]struct{}
+	seenAttachFIFO [][16]byte
+	created        time.Time
 
 	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
@@ -87,11 +92,12 @@ type Engine struct {
 	migrateHookID uint64
 
 	// Path management. activeID == 0 means "no active path".
-	pathsMu     sync.RWMutex
-	paths       map[uint32]*pathSlot
-	nextPathID  uint32
-	nextPathGen uint64
-	activeID    uint32
+	pathsMu      sync.RWMutex
+	paths        map[uint32]*pathSlot
+	pendingPaths map[uint32]*pathSlot
+	nextPathID   uint32
+	nextPathGen  uint64
+	activeID     uint32
 	// dispatchScope optionally limits race/bond dispatch and death
 	// failover to a policy-selected target group. nil means all paths.
 	dispatchScope map[uint32]bool
@@ -192,6 +198,8 @@ type Engine struct {
 	policyInbox          chan policyMessage
 	policyQueueMu        sync.Mutex
 	policyQueued         map[policyMessageKey]struct{}
+	policyAdmissionMu    sync.RWMutex
+	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -251,18 +259,10 @@ type pathSlot struct {
 	controlWrites    atomic.Uint64
 	dataDispatches   atomic.Uint64
 
-	// bondSendHistory keeps a bounded ring of fully encoded frames
-	// successfully written through this path in bond mode. If the
-	// path dies asynchronously, the engine can replay these exact
-	// SEQs on surviving paths; recv-side dedup makes already-arrived
-	// frames harmless while filling gaps left on the dead path.
-	bondSendMu   sync.Mutex
-	bondSendRing [][]byte
-	bondSendNext int
-	bondSendFull bool
-	dispatchMu   sync.Mutex
-	dispatchQ    chan pathDispatchJob
-	dispatchDead bool
+	dispatchMu      sync.Mutex
+	dispatchQ       chan pathDispatchJob
+	dispatchDead    bool
+	dispatchStalled atomic.Bool
 
 	quit     chan struct{}
 	quitOnce sync.Once
@@ -324,6 +324,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		limits:              limits.Clamp(),
 		created:             time.Now(),
 		paths:               make(map[uint32]*pathSlot),
+		pendingPaths:        make(map[uint32]*pathSlot),
 		seenAttach:          make(map[[16]byte]struct{}),
 		recvPacketCh:        make(chan []byte, 16384),
 		recvPacketWake:      make(chan struct{}, 1),
@@ -437,6 +438,21 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 // graph leaves. Binding validation happens before any path ID, callback, or
 // goroutine is allocated.
 func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
+	id, err := e.PreparePathBound(pc, spec, binding)
+	if err != nil {
+		return 0, err
+	}
+	if err := e.CommitPathAttach(id); err != nil {
+		e.AbortPathAttach(id, err)
+		return 0, err
+	}
+	return id, nil
+}
+
+// PreparePathBound validates and reserves a path without making it visible to
+// DATA dispatch. The server uses this phase while BRIDGE_ACK still owns the
+// carrier exclusively.
+func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
 	if pc == nil {
 		return 0, errors.New("engine: nil PathConn")
 	}
@@ -451,7 +467,18 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 		_ = pc.Close()
 		return 0, net.ErrClosed
 	}
+	if len(e.paths)+len(e.pendingPaths) >= maxSessionPaths {
+		_ = pc.Close()
+		return 0, fmt.Errorf("engine: session path limit %d reached", maxSessionPaths)
+	}
+	all := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths))
 	for _, existing := range e.paths {
+		all = append(all, existing)
+	}
+	for _, existing := range e.pendingPaths {
+		all = append(all, existing)
+	}
+	for _, existing := range all {
 		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
 		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
 		if sameLocal && samePeer {
@@ -494,24 +521,42 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 		doneR:           make(chan struct{}),
 		doneW:           make(chan struct{}),
 	}
+	e.pendingPaths[id] = slot
+	return id, nil
+}
+
+// CommitPathAttach publishes a prepared path and starts its data-plane loops.
+func (e *Engine) CommitPathAttach(id uint32) error {
+	e.pathsMu.Lock()
+	slot := e.pendingPaths[id]
+	if slot == nil {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: commit unknown pending path %d", id)
+	}
+	if e.isClosed() {
+		delete(e.pendingPaths, id)
+		e.pathsMu.Unlock()
+		_ = slot.conn.Close()
+		return net.ErrClosed
+	}
+	delete(e.pendingPaths, id)
 	e.paths[id] = slot
-
-	gen := slot.gen
-	pc.OnDeath(func(cause transport.DeathCause, err error) {
-		e.onPathDeath(id, gen, cause, err)
-	})
-
 	if e.activeID == 0 {
 		e.activeID = id
 		if e.State() == BridgeInit || e.State() == BridgeMigrating {
 			e.setState(BridgeActive)
 		}
 	}
+	e.pathsMu.Unlock()
 
+	gen := slot.gen
+	slot.conn.OnDeath(func(cause transport.DeathCause, err error) {
+		e.onPathDeath(id, gen, cause, err)
+	})
 	go e.readerLoop(slot)
 	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
-	return id, nil
+	return nil
 }
 
 func (e *Engine) nextPathGenerationLocked() uint64 {
@@ -626,7 +671,34 @@ func (e *Engine) Paths() []transport.PathInfo {
 // are replayed on the new active path; recv-side dedup makes already
 // delivered frames harmless while filling gaps left on the old path.
 func (e *Engine) Migrate(id uint32) error {
+	if runtime := e.localExecutionRuntime(); runtime != nil {
+		return e.migrateRecursiveSelectorPath(id, runtime)
+	}
 	return e.migrateOwnerDecision(id, true, "explicit")
+}
+
+func (e *Engine) migrateRecursiveSelectorPath(id uint32, runtime *executionRuntime) error {
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	targetID := proto.TargetID{}
+	if slot != nil {
+		targetID = slot.localTXTargetID
+	}
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		return fmt.Errorf("engine: migrate to unknown path %d", id)
+	}
+	root, ok := runtime.plan.root()
+	if !ok || root.kind != proto.GraphNodeKindSelector {
+		return fmt.Errorf("engine: path migration requires a selector root")
+	}
+	if err := runtime.plan.validateImmediateChild(root.targetID, targetID); err != nil {
+		return fmt.Errorf("engine: path %d is not a directly selectable root target: %w", id, err)
+	}
+	if err := e.SelectLocalTarget(root.targetID, targetID, "explicit"); err != nil {
+		return err
+	}
+	return e.redistributeFrames(e.sendHistorySnapshot(e.sendAckNext.Load()))
 }
 
 func (e *Engine) migrateOwnerDecision(id uint32, clearScope bool, cause string) error {
@@ -911,6 +983,18 @@ func (e *Engine) setDispatchPolicyAndSelection(
 			e.pathsMu.Unlock()
 			return err
 		}
+		effectiveKind, projectedActive, projectedScope, err := e.projectRecursiveDispatchLocked(runtime)
+		if err != nil {
+			e.pathsMu.Unlock()
+			return err
+		}
+		mode, ok = dispatchForExecutionKind(effectiveKind)
+		if !ok {
+			e.pathsMu.Unlock()
+			return fmt.Errorf("engine: invalid effective execution kind %d", effectiveKind)
+		}
+		active = projectedActive
+		scope = projectedScope
 	}
 	oldID := e.activeID
 	if active == 0 {
@@ -943,6 +1027,63 @@ func (e *Engine) setDispatchPolicyAndSelection(
 		e.fireMigrateHooks(oldID, newID, cause)
 	}
 	return nil
+}
+
+// projectRecursiveDispatchLocked maps the root's effective target subtree to
+// the transitional flat observability fields. Caller must hold pathsMu.
+func (e *Engine) projectRecursiveDispatchLocked(runtime *executionRuntime) (proto.ExecutionKind, uint32, []uint32, error) {
+	attached := make(map[proto.TargetID]bool, len(e.paths))
+	for _, slot := range e.paths {
+		attached[slot.localTXTargetID] = true
+	}
+	leafTargets, kind, err := runtime.activeLeafTargets(attached)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	leafSet := make(map[proto.TargetID]bool, len(leafTargets))
+	for _, leafID := range leafTargets {
+		leafSet[leafID] = true
+	}
+	scope := make([]uint32, 0, len(leafTargets))
+	for pathID, slot := range e.paths {
+		if leafSet[slot.localTXTargetID] {
+			scope = append(scope, pathID)
+		}
+	}
+	for i := 1; i < len(scope); i++ {
+		for j := i; j > 0 && scope[j] < scope[j-1]; j-- {
+			scope[j], scope[j-1] = scope[j-1], scope[j]
+		}
+	}
+	active := uint32(0)
+	for _, pathID := range scope {
+		if pathID == e.activeID {
+			active = pathID
+			break
+		}
+	}
+	if active == 0 && len(scope) > 0 {
+		active = scope[0]
+	}
+	return kind, active, scope, nil
+}
+
+// SetPeerPolicyAdmission installs a bounded, local sender-side admission
+// check for advisory peer selection requests. A nil function clears it.
+func (e *Engine) SetPeerPolicyAdmission(fn func(selectorID, targetID proto.TargetID, cause string) error) {
+	e.policyAdmissionMu.Lock()
+	e.policyAdmission = fn
+	e.policyAdmissionMu.Unlock()
+}
+
+func (e *Engine) admitPeerPolicy(selectorID, targetID proto.TargetID, cause string) error {
+	e.policyAdmissionMu.RLock()
+	fn := e.policyAdmission
+	e.policyAdmissionMu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(selectorID, targetID, cause)
 }
 
 // SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
@@ -1042,11 +1183,9 @@ func (e *Engine) Packetized() bool {
 // from RTT skew between paths".
 const defaultBondPinSize = 8
 
-// BondStuckSkips returns the cumulative number of times bond
-// dispatch bypassed a path because its probe-measured RTT exceeded
-// best_path_rtt * BondStuckRTTMultiplier. Pure observability counter;
-// useful for verifying that the stuck-skip protection is actually
-// firing in production.
+// BondStuckSkips returns the cumulative number of path writer stalls that
+// caused recursive dispatch to retry the immutable frame on another route.
+// RTT by itself never increments this counter or excludes a bond child.
 func (e *Engine) BondStuckSkips() uint64 {
 	e.pathsMu.RLock()
 	legacy := e.bondStuckSkips
@@ -1147,26 +1286,45 @@ func (e *Engine) Close() error {
 		e.closing.Store(true)
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
-		slots := make([]*pathSlot, 0, len(e.paths))
+		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths))
 		for _, s := range e.paths {
 			s.closeQuit()
 			slots = append(slots, s)
 		}
+		for _, s := range e.pendingPaths {
+			slots = append(slots, s)
+		}
 		e.paths = make(map[uint32]*pathSlot)
+		e.pendingPaths = make(map[uint32]*pathSlot)
 		e.activeID = 0
 		e.dispatchScope = nil
 		e.pathsMu.Unlock()
-		for _, s := range slots {
-			if err := s.conn.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
 		close(e.closed)
 		// Wake any Read goroutine waiting on data.
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()
 		e.recvMu.Unlock()
 		e.setState(BridgeDead)
+
+		results := make(chan error, len(slots))
+		for _, s := range slots {
+			go func(slot *pathSlot) { results <- slot.conn.Close() }(s)
+		}
+		timer := time.NewTimer(pathCloseTimeout)
+		defer timer.Stop()
+		for range slots {
+			select {
+			case err := <-results:
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+			case <-timer.C:
+				if firstErr == nil {
+					firstErr = fmt.Errorf("engine: path close timed out after %s", pathCloseTimeout)
+				}
+				return
+			}
+		}
 	})
 	return firstErr
 }
@@ -1297,9 +1455,17 @@ func (e *Engine) ForceKillPathForTest(id uint32) error {
 // handshake acknowledgement could not be delivered. The generation check in
 // onPathDeath makes this safe against a concurrent transport callback.
 func (e *Engine) AbortPathAttach(id uint32, cause error) {
-	e.pathsMu.RLock()
+	e.pathsMu.Lock()
+	pending := e.pendingPaths[id]
+	if pending != nil {
+		delete(e.pendingPaths, id)
+	}
 	slot := e.paths[id]
-	e.pathsMu.RUnlock()
+	e.pathsMu.Unlock()
+	if pending != nil {
+		_ = pending.conn.Close()
+		return
+	}
 	if slot != nil {
 		e.onPathDeath(id, slot.gen, transport.CauseTransportError, cause)
 	}

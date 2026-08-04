@@ -11,6 +11,9 @@ import (
 
 const pathDispatchQueueSize = 64
 
+const minimumDispatchStallWindow = 100 * time.Millisecond
+const maximumDispatchStallWindow = 2 * time.Second
+
 type pathDispatchJob struct {
 	frame  []byte
 	bonded bool
@@ -60,9 +63,6 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	if err == nil {
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		slot.recordDispatch(job.frame)
-		if job.bonded {
-			slot.rememberBondFrame(job.frame)
-		}
 	} else {
 		// Some third-party PathConn implementations cannot reliably invoke
 		// OnDeath after a failed Write. The generation check makes this
@@ -70,6 +70,9 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 		e.onPathDeath(slot.id, slot.gen, transport.CauseTransportError, err)
 	}
 	job.result <- pathDispatchResult{slot: slot, err: err}
+	// A timed-out caller may already be retrying this immutable frame on a
+	// sibling. Completion re-admits the path for a later frame.
+	slot.dispatchStalled.Store(false)
 }
 
 func (e *Engine) rejectQueuedDispatches(slot *pathSlot) {
@@ -93,19 +96,24 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 		attached := make(map[proto.TargetID]bool, len(e.paths))
 		latest := make(map[proto.TargetID]*pathSlot, len(e.paths))
 		qualities := make(map[proto.TargetID]transport.PathQuality, len(e.paths))
+		capacities := make(map[proto.TargetID]uint64, len(e.paths))
 		for _, slot := range e.paths {
 			if slot.localTXTargetID == (proto.TargetID{}) {
+				continue
+			}
+			if slot.dispatchStalled.Load() {
 				continue
 			}
 			attached[slot.localTXTargetID] = true
 			if previous := latest[slot.localTXTargetID]; previous == nil || slot.gen > previous.gen {
 				latest[slot.localTXTargetID] = slot
 				qualities[slot.localTXTargetID] = slot.conn.Quality()
+				capacities[slot.localTXTargetID] = uint64(slot.spec.Weight)
 			}
 		}
 		e.pathsMu.RUnlock()
 
-		ticket, err := runtime.buildTicketObserved(attached, qualities, e.Packetized(), e.bondPinSize, e.limits.BondStuckRTTMultiplier)
+		ticket, err := runtime.buildTicketObserved(attached, qualities, capacities, e.Packetized(), e.bondPinSize, e.limits.BondStuckRTTMultiplier)
 		if err != nil {
 			if err != errNoExecutionRoute {
 				return err
@@ -118,6 +126,7 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 
 		results := make(chan pathDispatchResult, len(ticket.routes))
 		submitted := 0
+		submittedSlots := make(map[*pathSlot]struct{}, len(ticket.routes))
 		for _, route := range ticket.routes {
 			slot := latest[route.targetID]
 			if slot == nil {
@@ -125,6 +134,7 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 			}
 			if slot.submitDispatch(pathDispatchJob{frame: frame, bonded: route.bonded, result: results}) {
 				submitted++
+				submittedSlots[slot] = struct{}{}
 			}
 		}
 		if submitted == 0 {
@@ -139,9 +149,16 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 			return e.executionBudgetExceeded()
 		}
 		budgetTimer := time.NewTimer(remainingBudget)
+		stallTimer := time.NewTimer(e.executionStallWindow(submittedSlots))
+		pending := make(map[*pathSlot]struct{}, submitted)
+		for slot := range submittedSlots {
+			pending[slot] = struct{}{}
+		}
+		stalled := false
 		for remaining := submitted; remaining > 0; remaining-- {
 			select {
 			case result := <-results:
+				delete(pending, result.slot)
 				if result.err == nil {
 					if !budgetTimer.Stop() {
 						select {
@@ -149,20 +166,69 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 						default:
 						}
 					}
+					if !stallTimer.Stop() {
+						select {
+						case <-stallTimer.C:
+						default:
+						}
+					}
 					return nil
 				}
+			case <-stallTimer.C:
+				for slot := range pending {
+					if slot.dispatchStalled.CompareAndSwap(false, true) {
+						runtime.stuckSkips.Add(1)
+					}
+				}
+				stalled = true
+				remaining = 1
 			case <-e.closed:
 				budgetTimer.Stop()
+				stallTimer.Stop()
 				return net.ErrClosed
 			case <-budgetTimer.C:
+				stallTimer.Stop()
 				return e.executionBudgetExceeded()
 			}
 		}
-		budgetTimer.Stop()
+		if !budgetTimer.Stop() && !stalled {
+			select {
+			case <-budgetTimer.C:
+			default:
+			}
+		}
+		if !stallTimer.Stop() && !stalled {
+			select {
+			case <-stallTimer.C:
+			default:
+			}
+		}
+		if stalled {
+			continue
+		}
 		if err := e.waitForExecutionProgress(deadline); err != nil {
 			return err
 		}
 	}
+}
+
+func (e *Engine) executionStallWindow(slots map[*pathSlot]struct{}) time.Duration {
+	window := minimumDispatchStallWindow
+	now := nowFn()
+	for slot := range slots {
+		quality := slot.conn.Quality()
+		if quality.At.IsZero() || now.Sub(quality.At) > selectorEvidenceFreshFor {
+			continue
+		}
+		candidate := 4*quality.RTT + 2*quality.Jitter
+		if candidate > window {
+			window = candidate
+		}
+	}
+	if window > maximumDispatchStallWindow {
+		return maximumDispatchStallWindow
+	}
+	return window
 }
 
 func (e *Engine) waitForExecutionProgress(deadline time.Time) error {

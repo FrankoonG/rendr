@@ -137,6 +137,18 @@ func (e *Engine) LocalGraphManifest() proto.GraphManifest {
 	return manifest
 }
 
+// PeerGraphManifest returns an owned snapshot of the graph used by the peer's
+// sender. Callers use it for direction-specific policy decisions; mutating the
+// returned manifest cannot alter the engine's negotiated graph binding.
+func (e *Engine) PeerGraphManifest() proto.GraphManifest {
+	binding := e.peerGraphBinding()
+	manifest, _, err := ownGraphManifest(binding.manifest)
+	if err != nil {
+		return proto.GraphManifest{}
+	}
+	return manifest
+}
+
 func (e *Engine) LocalPathTargetID(name string) (proto.TargetID, error) {
 	binding := e.localGraphBinding()
 	if !binding.configured {

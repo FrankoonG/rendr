@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,13 +27,13 @@ type peakTransferController struct {
 	e       *engine.Engine
 	setMode func(Mode)
 
-	normalIDs      []uint32
-	peakIDs        []uint32
-	peakMode       Mode
-	opts           PeakTransfer
-	selectorID     proto.TargetID
-	normalTargetID proto.TargetID
-	peakTargetID   proto.TargetID
+	normalIDs    []uint32
+	peakIDs      []uint32
+	peakMode     Mode
+	opts         PeakTransfer
+	tuning       SelectorTuning
+	localTargets peakTransferTargets
+	peerTargets  peakTransferTargets
 
 	writeBytes atomic.Uint64
 	readBytes  atomic.Uint64
@@ -42,6 +43,57 @@ type peakTransferController struct {
 	rx peakTransferDirection
 
 	stop chan struct{}
+}
+
+type peakTransferChoice uint8
+
+const (
+	peakTransferNormal peakTransferChoice = iota + 1
+	peakTransferPeak
+)
+
+type peakTransferTargets struct {
+	selectorID     proto.TargetID
+	normalTargetID proto.TargetID
+	peakTargetID   proto.TargetID
+}
+
+func peakTargetsFromManifest(manifest proto.GraphManifest) peakTransferTargets {
+	root, ok := manifest.Node(manifest.RootID)
+	if !ok || root.Kind != proto.GraphNodeKindSelector {
+		return peakTransferTargets{}
+	}
+	peaks := make(map[proto.TargetID]struct{}, len(root.PeakCandidates))
+	for _, id := range root.PeakCandidates {
+		peaks[id] = struct{}{}
+	}
+	targets := peakTransferTargets{selectorID: root.ID}
+	for _, id := range root.Children {
+		if _, peak := peaks[id]; peak {
+			if targets.peakTargetID == (proto.TargetID{}) {
+				targets.peakTargetID = id
+			}
+			continue
+		}
+		if targets.normalTargetID == (proto.TargetID{}) {
+			targets.normalTargetID = id
+		}
+	}
+	return targets
+}
+
+func (t peakTransferTargets) selection(choice peakTransferChoice) (proto.TargetID, proto.TargetID, bool) {
+	if t.selectorID == (proto.TargetID{}) {
+		return proto.TargetID{}, proto.TargetID{}, false
+	}
+	switch choice {
+	case peakTransferNormal:
+		return t.selectorID, t.normalTargetID, t.normalTargetID != (proto.TargetID{})
+	case peakTransferPeak:
+		return t.selectorID, t.peakTargetID, t.peakTargetID != (proto.TargetID{})
+	default:
+		return proto.TargetID{}, proto.TargetID{}, false
+	}
 }
 
 type peakTransferDirection struct {
@@ -61,6 +113,7 @@ func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compil
 		setMode:  setMode,
 		peakMode: plan.peakMode,
 		opts:     plan.peakOptions,
+		tuning:   plan.runtimeConfig.Selector,
 		stop:     make(chan struct{}),
 	}
 	if !c.peakMode.Valid() {
@@ -79,24 +132,8 @@ func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compil
 	if len(c.peakIDs) == 0 && len(pathIDs) > 1 {
 		c.peakIDs = append(c.peakIDs, pathIDs[1:]...)
 	}
-	if root, ok := plan.graph.manifest.Node(plan.graph.manifest.RootID); ok && root.Kind == proto.GraphNodeKindSelector {
-		c.selectorID = root.ID
-		peaks := make(map[proto.TargetID]struct{}, len(root.PeakCandidates))
-		for _, id := range root.PeakCandidates {
-			peaks[id] = struct{}{}
-		}
-		for _, id := range root.Children {
-			if _, peak := peaks[id]; peak {
-				if c.peakTargetID == (proto.TargetID{}) {
-					c.peakTargetID = id
-				}
-				continue
-			}
-			if c.normalTargetID == (proto.TargetID{}) {
-				c.normalTargetID = id
-			}
-		}
-	}
+	c.localTargets = peakTargetsFromManifest(plan.graph.manifest)
+	c.peerTargets = peakTargetsFromManifest(e.PeerGraphManifest())
 	return c
 }
 
@@ -104,12 +141,29 @@ func (c *peakTransferController) start() {
 	if c == nil || len(c.normalIDs) == 0 || len(c.peakIDs) == 0 {
 		return
 	}
-	if c.selectorID != (proto.TargetID{}) && c.normalTargetID != (proto.TargetID{}) {
-		_ = c.e.InitializePolicySelection(c.selectorID, c.normalTargetID, "selector")
-		_ = c.e.RequestPeerSelection(context.Background(), c.selectorID, c.normalTargetID, "selector-rx")
+	if selectorID, targetID, ok := c.localTargets.selection(peakTransferNormal); ok {
+		_ = c.e.InitializePolicySelection(selectorID, targetID, "selector")
 	}
+	if selectorID, targetID, ok := c.peerTargets.selection(peakTransferNormal); ok {
+		_ = c.requestPeerSelection(context.Background(), peakTransferNormal, selectorID, targetID, "selector-rx")
+	}
+	c.e.SetPeerPolicyAdmission(c.admitPeerSelection)
 	c.e.StartSelector(nil, 0)
 	go c.loop()
+}
+
+func (c *peakTransferController) admitPeerSelection(selectorID, targetID proto.TargetID, _ string) error {
+	wantSelector, peakTarget, ok := c.localTargets.selection(peakTransferPeak)
+	if !ok || selectorID != wantSelector || targetID != peakTarget {
+		return nil
+	}
+	c.mu.Lock()
+	suppressed := time.Now().Before(c.tx.suppressUntil)
+	c.mu.Unlock()
+	if suppressed {
+		return fmt.Errorf("rendr: local peak target is temporarily suppressed")
+	}
+	return nil
 }
 
 func (c *peakTransferController) stopLoop() {
@@ -185,7 +239,10 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		}
 		needFor := c.opts.SaturationFor
 		if needFor <= 0 {
-			needFor = defaultPeakSaturationFor
+			needFor = c.tuning.PeakPromoteAfter
+			if needFor <= 0 {
+				needFor = defaultPeakSaturationFor
+			}
 		}
 		saturated := bps > 0 && bps >= st.normalPeakBps*ratio
 		if !saturated {
@@ -213,7 +270,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		st.saturatedSince = time.Time{}
 		st.returnSince = time.Time{}
 		c.mu.Unlock()
-		c.applyPolicy(rx, c.peakMode, c.peakTargetID, "peak-transfer")
+		_ = c.applyPolicy(rx, c.peakMode, peakTransferPeak, "peak-transfer")
 		c.mu.Lock()
 		return
 	}
@@ -232,7 +289,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 			st.returnSince = time.Time{}
 			st.suppressUntil = now.Add(defaultPeakSuppressFor)
 			c.mu.Unlock()
-			c.applyPolicy(rx, ModeSelector, c.normalTargetID, "peak-verify-failed")
+			_ = c.applyPolicy(rx, ModeSelector, peakTransferNormal, "peak-verify-failed")
 			c.mu.Lock()
 			return
 		}
@@ -246,7 +303,10 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	}
 	needFor := c.opts.ReturnFor
 	if needFor <= 0 {
-		needFor = defaultPeakReturnFor
+		needFor = c.tuning.PeakReturnAfter
+		if needFor <= 0 {
+			needFor = defaultPeakReturnFor
+		}
 	}
 	low := st.normalPeakBps > 0 && bps < st.normalPeakBps*ratio
 	if !low {
@@ -264,22 +324,43 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	st.peakStarted = time.Time{}
 	st.peakBytes = 0
 	st.returnSince = time.Time{}
+	// Returning without a suppression window immediately re-satisfies the
+	// normal-path saturation predicate and oscillates back to the same peak
+	// target. Treat the observed low peak rate as bounded negative evidence.
+	st.suppressUntil = now.Add(defaultPeakSuppressFor)
 	c.mu.Unlock()
-	c.applyPolicy(rx, ModeSelector, c.normalTargetID, "peak-return")
+	_ = c.applyPolicy(rx, ModeSelector, peakTransferNormal, "peak-return")
 	c.mu.Lock()
 }
 
-func (c *peakTransferController) applyPolicy(rx bool, mode Mode, peerTargetID proto.TargetID, cause string) {
+func (c *peakTransferController) applyPolicy(rx bool, mode Mode, choice peakTransferChoice, cause string) error {
 	if rx {
-		if c.selectorID == (proto.TargetID{}) || peerTargetID == (proto.TargetID{}) {
-			return
+		selectorID, targetID, ok := c.peerTargets.selection(choice)
+		if !ok {
+			return fmt.Errorf("rendr: peer peak-transfer target is unavailable")
 		}
-		_ = c.e.RequestPeerSelection(context.Background(), c.selectorID, peerTargetID, cause+"-rx")
-		return
+		return c.requestPeerSelection(context.Background(), choice, selectorID, targetID, cause+"-rx")
 	}
-	if err := c.e.SelectLocalTarget(c.selectorID, peerTargetID, cause); err == nil {
-		c.setMode(mode)
+	selectorID, targetID, ok := c.localTargets.selection(choice)
+	if !ok {
+		return fmt.Errorf("rendr: local peak-transfer target is unavailable")
 	}
+	if err := c.e.SelectLocalTarget(selectorID, targetID, cause); err != nil {
+		return err
+	}
+	c.setMode(mode)
+	return nil
+}
+
+func (c *peakTransferController) requestPeerSelection(ctx context.Context, choice peakTransferChoice, selectorID, targetID proto.TargetID, cause string) error {
+	wantSelector, wantTarget, ok := c.peerTargets.selection(choice)
+	if !ok {
+		return fmt.Errorf("rendr: peer peak-transfer target is unavailable")
+	}
+	if selectorID != wantSelector || targetID != wantTarget {
+		return fmt.Errorf("rendr: peer peak-transfer target does not match the negotiated peer graph")
+	}
+	return c.e.RequestPeerSelection(ctx, selectorID, targetID, cause)
 }
 
 func (c *peakTransferController) peakHealthy() bool {

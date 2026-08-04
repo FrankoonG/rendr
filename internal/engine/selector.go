@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -56,6 +57,9 @@ type selector struct {
 // scoring is OFF until this method is called. The Dialer wires it
 // up when Mode == ModeSelector.
 func (e *Engine) StartSelector(score ScoreFn, tickEvery time.Duration) {
+	if runtime := e.localExecutionRuntime(); runtime != nil && !runtime.plan.hasKind(proto.GraphNodeKindSelector) {
+		return
+	}
 	if score == nil {
 		score = DefaultScoreFn
 	}
@@ -99,6 +103,10 @@ func (p *selector) loop(e *Engine, tick time.Duration) {
 
 // evaluate runs one tick of the scheduler.
 func (p *selector) evaluate(e *Engine) {
+	if runtime := e.localExecutionRuntime(); runtime != nil {
+		p.evaluateRecursive(e, runtime)
+		return
+	}
 	if e.mode.Load() != dispatchSelector {
 		return
 	}
@@ -179,6 +187,28 @@ func (p *selector) evaluate(e *Engine) {
 	p.bestSince = time.Time{}
 }
 
+func (p *selector) evaluateRecursive(e *Engine, runtime *executionRuntime) {
+	now := nowFn()
+	policy := selectorEvidencePolicy{
+		latencyBandRatio:  e.limits.SelectorHysteresis,
+		latencyBandFloor:  e.limits.SelectorLatencyFloor,
+		minimumConfidence: 1,
+	}
+	decisions := runtime.selectorDecisions(
+		senderDirection(e.side),
+		e.selectorEvidenceObservations(),
+		now,
+		policy,
+		e.limits.SelectorDwell,
+		e.limits.SelectorCooldown,
+	)
+	for _, decision := range decisions {
+		if err := e.SelectLocalTarget(decision.selectorID, decision.targetID, decision.cause); err == nil {
+			runtime.noteSelectorDecision(decision, now)
+		}
+	}
+}
+
 // SetPathQualityForTest pokes a quality reading into a specific
 // path. Used by unit tests to drive selector-mode scoring without
 // having to wait for real RTT measurements (M6(2/n) wires up the
@@ -190,6 +220,9 @@ func (e *Engine) SetPathQualityForTest(id uint32, q transport.PathQuality) {
 	e.pathsMu.RUnlock()
 	if !ok {
 		return
+	}
+	if q.At.IsZero() && q.RTT > 0 {
+		q.At = nowFn()
 	}
 	if setter, ok := slot.conn.(interface {
 		SetQuality(transport.PathQuality)

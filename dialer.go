@@ -74,9 +74,8 @@ type Dialer struct {
 	// Zero means generate a fresh ephemeral runtime id for this Dialer.
 	InstanceID InstanceID
 
-	// Runtime controls ingress capability preferences. Zero value is
-	// interpreted as IngressTUN with fallback allowed; current L7
-	// Dial/DialPacket paths use it only for status/API compatibility.
+	// Runtime is the immutable v1 policy configuration inherited from a
+	// Runtime. Direct Dialer use accepts the zero value as defaults.
 	Runtime RuntimeConfig
 
 	// Primary names the path or group that should be used for the
@@ -284,6 +283,10 @@ func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 	if d.Root == nil {
 		return compiledTarget{}, errRootRequired
 	}
+	runtimeConfig, err := normalizeRuntimeConfig(d.Runtime)
+	if err != nil {
+		return compiledTarget{}, err
+	}
 	graph, err := compileTargetGraph(d.Root)
 	if err != nil {
 		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
@@ -292,6 +295,7 @@ func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 	if err != nil {
 		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
 	}
+	ct.runtimeConfig = runtimeConfig
 	ct, err = d.applyPrimary(ct, d.Root, d.Primary)
 	if err != nil {
 		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
@@ -526,15 +530,35 @@ func (d *Dialer) helloCaps(packetMode bool) uint32 {
 // engine clamps unset / out-of-range values back to project defaults
 // (90 s migration budget, 2 zombie migrations, 30 s cooldown, etc.).
 func (d *Dialer) engineLimits() engine.Limits {
-	return engine.Limits{
-		MigrationBudget:        d.MigrationBudget,
-		SelectorHysteresis:     d.Hysteresis,
-		SelectorDwell:          d.Dwell,
-		SelectorCooldown:       d.Cooldown,
+	runtimeConfig, err := normalizeRuntimeConfig(d.Runtime)
+	if err != nil {
+		runtimeConfig = DefaultRuntimeConfig()
+	}
+	limits := engine.Limits{
+		MigrationBudget:        runtimeConfig.Recovery.MigrationBudget,
+		SelectorHysteresis:     runtimeConfig.Selector.LatencyBandRatio,
+		SelectorLatencyFloor:   runtimeConfig.Selector.LatencyBandFloor,
+		SelectorDwell:          runtimeConfig.Selector.QualityDwell,
+		SelectorCooldown:       runtimeConfig.Selector.QualityCooldown,
 		ZombieMaxMigrations:    d.ZombieMaxMigrations,
 		ZombieCooldown:         d.ZombieCooldown,
 		BondStuckRTTMultiplier: d.BondStuckRTTMultiplier,
 	}
+	// Transitional direct-Dialer fields remain effective until the D11 API
+	// deletion commit updates the legacy package tests.
+	if d.MigrationBudget != 0 {
+		limits.MigrationBudget = d.MigrationBudget
+	}
+	if d.Hysteresis != 0 {
+		limits.SelectorHysteresis = d.Hysteresis
+	}
+	if d.Dwell != 0 {
+		limits.SelectorDwell = d.Dwell
+	}
+	if d.Cooldown != 0 {
+		limits.SelectorCooldown = d.Cooldown
+	}
+	return limits
 }
 
 // dialPath resolves spec to a transport.PathConn via the global

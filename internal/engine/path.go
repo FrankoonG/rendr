@@ -26,6 +26,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	if debugPathDeath {
 		fmt.Fprintf(os.Stderr, "[rendr-engine] path %d died: cause=%v err=%v\n", id, cause, err)
 	}
+	runtime := e.localExecutionRuntime()
 	e.pathsMu.Lock()
 	slot, ok := e.paths[id]
 	if !ok {
@@ -43,7 +44,24 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	migratedOk := false
 	var newActive uint32
 	if wasActive {
-		e.activeID = e.pickAnyActive()
+		if runtime != nil {
+			kind, active, scope, projectErr := e.projectRecursiveDispatchLocked(runtime)
+			if projectErr == nil {
+				e.activeID = active
+				e.dispatchScope = make(map[uint32]bool, len(scope))
+				for _, pathID := range scope {
+					e.dispatchScope[pathID] = true
+				}
+				if mode, valid := dispatchForExecutionKind(kind); valid {
+					e.mode.Store(mode)
+				}
+			} else {
+				e.activeID = 0
+				e.dispatchScope = nil
+			}
+		} else {
+			e.activeID = e.pickAnyActive()
+		}
 		newActive = e.activeID
 		if e.activeID == 0 {
 			e.setState(BridgeMigrating)
