@@ -951,6 +951,25 @@ type g3Options struct {
 	p95Ceiling time.Duration
 }
 
+type tunG3StatsSnapshotter interface {
+	Stats() rendr.ConnStats
+}
+
+type tunG3FinalEvidence struct {
+	initialPathCount   int
+	finalPathCount     int
+	migrationsObserved uint64
+	perPathWrites      map[uint32]uint64
+	wireWrites         uint64
+}
+
+func (e tunG3FinalEvidence) invalidReason() string {
+	if e.finalPathCount != e.initialPathCount {
+		return fmt.Sprintf("final pre-teardown path count=%d differs from initial=%d", e.finalPathCount, e.initialPathCount)
+	}
+	return ""
+}
+
 type t6SelectorOptions struct {
 	name           string
 	bulkWarmWrites int
@@ -2479,32 +2498,17 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 	for collector.deliveredPackets() < sent && time.Now().Before(drainDeadline) {
 		time.Sleep(time.Millisecond)
 	}
-	relay.CloseFlow(id)
-	peerCancel()
-	peerRunErr := waitRelayErr(peerErr, 5*time.Second)
+	finalEvidence, peerRunErr := finalizeTUNG3Evidence(admin, pathWritesBefore, startMig, func() error {
+		relay.CloseFlow(id)
+		peerCancel()
+		return waitRelayErr(peerErr, 5*time.Second)
+	})
 	receivedOutcome := collector.snapshot()
 
 	sort.Slice(receivedOutcome.latencies, func(i, j int) bool {
 		return receivedOutcome.latencies[i] < receivedOutcome.latencies[j]
 	})
 	p95 := percentile(receivedOutcome.latencies, 0.95)
-	migrations := admin.MigrationCount() - startMig
-	perPathWrites := make(map[uint32]uint64, len(pathWritesBefore))
-	var wireWrites uint64
-	for _, path := range admin.Stats().Paths {
-		before, expectedPath := pathWritesBefore[path.ID]
-		if !expectedPath || path.Writes < before {
-			continue
-		}
-		delta := path.Writes - before
-		perPathWrites[path.ID] = delta
-		wireWrites += delta
-	}
-	for pathID := range pathWritesBefore {
-		if _, ok := perPathWrites[pathID]; !ok {
-			perPathWrites[pathID] = 0
-		}
-	}
 	received := receivedOutcome.uniquePackets
 	lossPct := math.NaN()
 	if sent > 0 {
@@ -2519,30 +2523,32 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		Tier:     "T7",
 		Duration: time.Since(start),
 		Evidence: map[string]string{
-			"target_pps":           fmt.Sprintf("%d", opts.pps),
-			"offered_pps":          fmt.Sprintf("%.3f", offeredPPS),
-			"offered_ratio":        fmt.Sprintf("%.6f", offeredPPS/float64(opts.pps)),
-			"send_elapsed":         sendElapsed.String(),
-			"sent":                 fmt.Sprintf("%d", sent),
-			"received":             fmt.Sprintf("%d", received),
-			"loss_pct":             fmt.Sprintf("%.6f", lossPct),
-			"loss_budget_pct":      fmt.Sprintf("%.6f", opts.lossPct),
-			"latency_samples":      fmt.Sprintf("%d", len(receivedOutcome.latencies)),
-			"p95":                  p95.String(),
-			"migration_attempts":   fmt.Sprintf("%d", migrationAttempts),
-			"migration_errors":     fmt.Sprintf("%d", migrationErrors),
-			"migrations_observed":  fmt.Sprintf("%d", migrations),
-			"malformed_packets":    fmt.Sprintf("%d", receivedOutcome.malformedPackets),
-			"corrupt_packets":      fmt.Sprintf("%d", receivedOutcome.corruptPackets),
-			"duplicate_packets":    fmt.Sprintf("%d", receivedOutcome.duplicatePackets),
-			"out_of_range_packets": fmt.Sprintf("%d", receivedOutcome.outOfRangePackets),
-			"per_path_wire_writes": formatTUNG3PathWrites(perPathWrites),
-			"wire_writes":          fmt.Sprintf("%d", wireWrites),
-			"peer_egress":          "direct",
-			"peer_egress_dials":    fmt.Sprintf("%d", peerDials),
-			"peer_egress_packets":  fmt.Sprintf("%d", collector.processedPackets()),
-			"peer_identity_match":  fmt.Sprintf("%t", peerIdentity == id),
-			"g3_semantics":         "synthetic_l3session_quic_datagram_not_rfc9000_cid_gold",
+			"target_pps":                    fmt.Sprintf("%d", opts.pps),
+			"offered_pps":                   fmt.Sprintf("%.3f", offeredPPS),
+			"offered_ratio":                 fmt.Sprintf("%.6f", offeredPPS/float64(opts.pps)),
+			"send_elapsed":                  sendElapsed.String(),
+			"sent":                          fmt.Sprintf("%d", sent),
+			"received":                      fmt.Sprintf("%d", received),
+			"loss_pct":                      fmt.Sprintf("%.6f", lossPct),
+			"loss_budget_pct":               fmt.Sprintf("%.6f", opts.lossPct),
+			"latency_samples":               fmt.Sprintf("%d", len(receivedOutcome.latencies)),
+			"p95":                           p95.String(),
+			"migration_attempts":            fmt.Sprintf("%d", migrationAttempts),
+			"migration_errors":              fmt.Sprintf("%d", migrationErrors),
+			"migrations_observed":           fmt.Sprintf("%d", finalEvidence.migrationsObserved),
+			"malformed_packets":             fmt.Sprintf("%d", receivedOutcome.malformedPackets),
+			"corrupt_packets":               fmt.Sprintf("%d", receivedOutcome.corruptPackets),
+			"duplicate_packets":             fmt.Sprintf("%d", receivedOutcome.duplicatePackets),
+			"out_of_range_packets":          fmt.Sprintf("%d", receivedOutcome.outOfRangePackets),
+			"initial_path_count":            fmt.Sprintf("%d", finalEvidence.initialPathCount),
+			"final_pre_teardown_path_count": fmt.Sprintf("%d", finalEvidence.finalPathCount),
+			"per_path_wire_writes":          formatTUNG3PathWrites(finalEvidence.perPathWrites),
+			"wire_writes":                   fmt.Sprintf("%d", finalEvidence.wireWrites),
+			"peer_egress":                   "direct",
+			"peer_egress_dials":             fmt.Sprintf("%d", peerDials),
+			"peer_egress_packets":           fmt.Sprintf("%d", collector.processedPackets()),
+			"peer_identity_match":           fmt.Sprintf("%t", peerIdentity == id),
+			"g3_semantics":                  "synthetic_l3session_quic_datagram_not_rfc9000_cid_gold",
 		},
 	}
 	if writeFailure != "" {
@@ -2557,6 +2563,10 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		rc.Failure = "peer relay: " + peerRunErr.Error()
 		return rc
 	}
+	if reason := finalEvidence.invalidReason(); reason != "" {
+		rc.InvalidReason = reason
+		return rc
+	}
 	rc.InvalidReason, rc.Failure = validateTUNG3Measurements(opts, tunG3Measurements{
 		sent:               sent,
 		received:           received,
@@ -2565,15 +2575,37 @@ func runG3Smoke(ctx context.Context, opts g3Options) report.Case {
 		p95:                p95,
 		migrationAttempts:  migrationAttempts,
 		migrationErrors:    migrationErrors,
-		migrationsObserved: migrations,
+		migrationsObserved: finalEvidence.migrationsObserved,
 		malformedPackets:   receivedOutcome.malformedPackets,
 		corruptPackets:     receivedOutcome.corruptPackets,
 		duplicatePackets:   receivedOutcome.duplicatePackets,
 		outOfRangePackets:  receivedOutcome.outOfRangePackets,
-		perPathWrites:      perPathWrites,
-		wireWrites:         wireWrites,
+		perPathWrites:      finalEvidence.perPathWrites,
+		wireWrites:         finalEvidence.wireWrites,
 	})
 	return rc
+}
+
+func finalizeTUNG3Evidence(admin tunG3StatsSnapshotter, pathWritesBefore map[uint32]uint64, startMig uint64, teardown func() error) (tunG3FinalEvidence, error) {
+	finalStats := admin.Stats()
+	evidence := tunG3FinalEvidence{
+		initialPathCount: len(pathWritesBefore),
+		finalPathCount:   len(finalStats.Paths),
+		perPathWrites:    make(map[uint32]uint64, len(finalStats.Paths)),
+	}
+	if finalStats.MigrationCount >= startMig {
+		evidence.migrationsObserved = finalStats.MigrationCount - startMig
+	}
+	for _, path := range finalStats.Paths {
+		before, expectedPath := pathWritesBefore[path.ID]
+		if !expectedPath || path.Writes < before {
+			continue
+		}
+		delta := path.Writes - before
+		evidence.perPathWrites[path.ID] = delta
+		evidence.wireWrites += delta
+	}
+	return evidence, teardown()
 }
 
 func invalidTUNG3Case(name string, started time.Time, reason string, evidence map[string]string) report.Case {

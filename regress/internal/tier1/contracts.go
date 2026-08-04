@@ -490,6 +490,7 @@ func regressUnitContracts(goos string) []packageContract {
 			"TestRunCaseDefsStopsAfterUnsafeOutcome",
 		),
 		testPackage(regressModule+"/internal/tunfull", "./internal/tunfull",
+			"TestTUNG3CapturesPathEvidenceBeforeTeardown", "TestTUNG3FinalEvidenceRejectsPathCountChange",
 			"TestSpecsOrderedAndBudgeted", "TestSelectCaseDefs", "TestRunReportsSelectionFailuresWithoutExecutingCases",
 			"TestRunCaseDefsUsesDeterministicManifestOrder", "TestRunCaseDefsStopsAfterMandatoryOutcome",
 			"TestRunCaseDefsStopsAfterUnjoinedTimeout", "TestExecuteG4PathKillFailsClosedWithoutStimulus",

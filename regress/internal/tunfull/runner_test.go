@@ -31,6 +31,60 @@ var orderedCaseIDs = []string{
 	caseT6Selector,
 }
 
+type teardownSensitiveTUNG3Stats struct {
+	closed             bool
+	statsCalls         int
+	observedAfterClose bool
+}
+
+func (a *teardownSensitiveTUNG3Stats) Stats() rendr.ConnStats {
+	a.statsCalls++
+	if a.closed {
+		a.observedAfterClose = true
+		return rendr.ConnStats{}
+	}
+	return rendr.ConnStats{
+		MigrationCount: 7,
+		Paths: []rendr.PathInfo{
+			{ID: 1, Writes: 110},
+			{ID: 2, Writes: 220},
+		},
+	}
+}
+
+func TestTUNG3CapturesPathEvidenceBeforeTeardown(t *testing.T) {
+	admin := &teardownSensitiveTUNG3Stats{}
+	evidence, err := finalizeTUNG3Evidence(admin, map[uint32]uint64{1: 10, 2: 20}, 4, func() error {
+		if admin.statsCalls != 1 {
+			t.Fatalf("Stats calls before teardown=%d, want exactly 1", admin.statsCalls)
+		}
+		admin.closed = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("finalize evidence: %v", err)
+	}
+	if !admin.closed || admin.observedAfterClose {
+		t.Fatalf("teardown ordering: closed=%t observed_after_close=%t", admin.closed, admin.observedAfterClose)
+	}
+	if evidence.initialPathCount != 2 || evidence.finalPathCount != 2 {
+		t.Fatalf("path counts=(%d,%d), want (2,2)", evidence.initialPathCount, evidence.finalPathCount)
+	}
+	if evidence.migrationsObserved != 3 {
+		t.Fatalf("migrations=%d, want 3", evidence.migrationsObserved)
+	}
+	if !reflect.DeepEqual(evidence.perPathWrites, map[uint32]uint64{1: 100, 2: 200}) || evidence.wireWrites != 300 {
+		t.Fatalf("path evidence=%v total=%d", evidence.perPathWrites, evidence.wireWrites)
+	}
+}
+
+func TestTUNG3FinalEvidenceRejectsPathCountChange(t *testing.T) {
+	evidence := tunG3FinalEvidence{initialPathCount: 2, finalPathCount: 1}
+	if got := evidence.invalidReason(); !strings.Contains(got, "final pre-teardown path count=1 differs from initial=2") {
+		t.Fatalf("invalid reason=%q", got)
+	}
+}
+
 var defaultCaseIDs = []string{
 	caseKernelTUNPreflight,
 	caseG1Smoke,
