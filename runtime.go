@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -16,8 +17,8 @@ type Runtime struct {
 	instanceID InstanceID
 
 	mu              sync.RWMutex
-	streamFactories map[string]StreamPathFactory
-	packetFactories map[string]PacketPathFactory
+	streamFactories map[string]StreamFactory
+	packetFactories map[string]PacketFactory
 }
 
 // SessionConfig describes one stream or packet session. Root is mandatory.
@@ -26,10 +27,29 @@ type Runtime struct {
 type SessionConfig struct {
 	Root Target
 
-	Primary       string
-	PrimaryPolicy PrimaryPolicy
-
 	PreserveL3Identity bool
+}
+
+// CarrierFamily states the factual network family beneath a generic factory.
+// It neither selects nor grants a mobility implementation.
+type CarrierFamily uint8
+
+const (
+	CarrierUnknown CarrierFamily = iota
+	CarrierTCP
+	CarrierUDP
+)
+
+func (f CarrierFamily) valid() bool { return f <= CarrierUDP }
+
+type StreamFactory struct {
+	Carrier CarrierFamily
+	Dial    func(context.Context, string) (net.Conn, error)
+}
+
+type PacketFactory struct {
+	Carrier CarrierFamily
+	Dial    func(context.Context, string) (net.PacketConn, error)
 }
 
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
@@ -40,8 +60,8 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 	return &Runtime{
 		config:          normalized,
 		instanceID:      engine.NewInstanceID(),
-		streamFactories: make(map[string]StreamPathFactory),
-		packetFactories: make(map[string]PacketPathFactory),
+		streamFactories: make(map[string]StreamFactory),
+		packetFactories: make(map[string]PacketFactory),
 	}, nil
 }
 
@@ -69,18 +89,21 @@ func (r *Runtime) DialPacket(ctx context.Context, config SessionConfig) (PacketC
 	return dialer.DialPacket(ctx)
 }
 
-// AddStreamPathFactory registers a process-local generic stream carrier.
+// RegisterStreamFactory registers a process-local generic stream carrier.
 // Sessions snapshot the registry at dial time, so later registrations cannot
 // change recovery behavior of an existing connection.
-func (r *Runtime) AddStreamPathFactory(name string, factory StreamPathFactory) error {
+func (r *Runtime) RegisterStreamFactory(name string, factory StreamFactory) error {
 	if r == nil {
 		return fmt.Errorf("rendr: nil Runtime")
 	}
 	if name == "" {
-		return fmt.Errorf("rendr: empty StreamPathFactory name")
+		return fmt.Errorf("rendr: empty StreamFactory name")
 	}
-	if factory == nil {
-		return fmt.Errorf("rendr: nil StreamPathFactory %q", name)
+	if factory.Dial == nil {
+		return fmt.Errorf("rendr: nil StreamFactory.Dial %q", name)
+	}
+	if !factory.Carrier.valid() {
+		return fmt.Errorf("rendr: invalid StreamFactory carrier %d", factory.Carrier)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -88,21 +111,24 @@ func (r *Runtime) AddStreamPathFactory(name string, factory StreamPathFactory) e
 		return fmt.Errorf("rendr: stream factory %q already registered", name)
 	}
 	if _, exists := r.packetFactories[name]; exists {
-		return fmt.Errorf("rendr: %q already registered as PacketPathFactory", name)
+		return fmt.Errorf("rendr: %q already registered as PacketFactory", name)
 	}
 	r.streamFactories[name] = factory
 	return nil
 }
 
-func (r *Runtime) AddPacketPathFactory(name string, factory PacketPathFactory) error {
+func (r *Runtime) RegisterPacketFactory(name string, factory PacketFactory) error {
 	if r == nil {
 		return fmt.Errorf("rendr: nil Runtime")
 	}
 	if name == "" {
-		return fmt.Errorf("rendr: empty PacketPathFactory name")
+		return fmt.Errorf("rendr: empty PacketFactory name")
 	}
-	if factory == nil {
-		return fmt.Errorf("rendr: nil PacketPathFactory %q", name)
+	if factory.Dial == nil {
+		return fmt.Errorf("rendr: nil PacketFactory.Dial %q", name)
+	}
+	if !factory.Carrier.valid() {
+		return fmt.Errorf("rendr: invalid PacketFactory carrier %d", factory.Carrier)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -110,7 +136,7 @@ func (r *Runtime) AddPacketPathFactory(name string, factory PacketPathFactory) e
 		return fmt.Errorf("rendr: packet factory %q already registered", name)
 	}
 	if _, exists := r.streamFactories[name]; exists {
-		return fmt.Errorf("rendr: %q already registered as StreamPathFactory", name)
+		return fmt.Errorf("rendr: %q already registered as StreamFactory", name)
 	}
 	r.packetFactories[name] = factory
 	return nil
@@ -125,12 +151,15 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*Dialer, error) {
 	}
 	r.mu.RLock()
 	streams := make(map[string]StreamPathFactory, len(r.streamFactories))
+	carriers := make(map[string]CarrierFamily, len(r.streamFactories)+len(r.packetFactories))
 	for name, factory := range r.streamFactories {
-		streams[name] = factory
+		streams[name] = factory.Dial
+		carriers[name] = factory.Carrier
 	}
 	packets := make(map[string]PacketPathFactory, len(r.packetFactories))
 	for name, factory := range r.packetFactories {
-		packets[name] = factory
+		packets[name] = factory.Dial
+		carriers[name] = factory.Carrier
 	}
 	r.mu.RUnlock()
 	return &Dialer{
@@ -138,9 +167,8 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*Dialer, error) {
 		Runtime:            r.config,
 		PreserveL3Identity: config.PreserveL3Identity,
 		InstanceID:         r.instanceID,
-		Primary:            config.Primary,
-		PrimaryPolicy:      config.PrimaryPolicy,
 		streamFactories:    streams,
 		packetFactories:    packets,
+		factoryCarriers:    carriers,
 	}, nil
 }

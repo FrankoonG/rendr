@@ -14,14 +14,16 @@ import (
 // custom factories. A session must keep using the factories that established
 // it even if the caller later reuses or mutates the original Dialer.
 type pathFactoryResolver struct {
-	stream map[string]StreamPathFactory
-	packet map[string]PacketPathFactory
+	stream  map[string]StreamPathFactory
+	packet  map[string]PacketPathFactory
+	carrier map[string]CarrierFamily
 }
 
 func (d *Dialer) snapshotFactoryResolver() *pathFactoryResolver {
 	resolver := &pathFactoryResolver{
-		stream: make(map[string]StreamPathFactory, len(d.streamFactories)),
-		packet: make(map[string]PacketPathFactory, len(d.packetFactories)),
+		stream:  make(map[string]StreamPathFactory, len(d.streamFactories)),
+		packet:  make(map[string]PacketPathFactory, len(d.packetFactories)),
+		carrier: make(map[string]CarrierFamily, len(d.factoryCarriers)),
 	}
 	for name, factory := range d.streamFactories {
 		resolver.stream[name] = factory
@@ -29,7 +31,17 @@ func (d *Dialer) snapshotFactoryResolver() *pathFactoryResolver {
 	for name, factory := range d.packetFactories {
 		resolver.packet[name] = factory
 	}
+	for name, carrier := range d.factoryCarriers {
+		resolver.carrier[name] = carrier
+	}
 	return resolver
+}
+
+func (r *pathFactoryResolver) carrierFamily(name string) CarrierFamily {
+	if r == nil {
+		return CarrierUnknown
+	}
+	return r.carrier[name]
 }
 
 // dialPath resolves a path against the session snapshot before consulting the
@@ -122,6 +134,10 @@ func (d *Dialer) AddStreamPathFactory(name string, f StreamPathFactory) error {
 		return fmt.Errorf("rendr: %q already registered as PacketPathFactory on this Dialer", name)
 	}
 	d.streamFactories[name] = f
+	if d.factoryCarriers == nil {
+		d.factoryCarriers = map[string]CarrierFamily{}
+	}
+	d.factoryCarriers[name] = CarrierUnknown
 	return nil
 }
 
@@ -161,5 +177,9 @@ func (d *Dialer) AddPacketPathFactory(name string, f PacketPathFactory) error {
 		return fmt.Errorf("rendr: %q already registered as StreamPathFactory on this Dialer", name)
 	}
 	d.packetFactories[name] = f
+	if d.factoryCarriers == nil {
+		d.factoryCarriers = map[string]CarrierFamily{}
+	}
+	d.factoryCarriers[name] = CarrierUnknown
 	return nil
 }

@@ -31,8 +31,11 @@ func TestRuntimeSessionDialerSnapshotsFactoriesAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	factory := func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed }
-	if err := runtime.AddStreamPathFactory("custom", factory); err != nil {
+	factory := StreamFactory{
+		Carrier: CarrierTCP,
+		Dial:    func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
+	}
+	if err := runtime.RegisterStreamFactory("custom", factory); err != nil {
 		t.Fatal(err)
 	}
 	root := Path("p", PathSpec{Transport: "custom", Address: "peer"})
@@ -50,6 +53,36 @@ func TestRuntimeSessionDialerSnapshotsFactoriesAndIdentity(t *testing.T) {
 	}
 	if second.streamFactories["custom"] == nil {
 		t.Fatal("one session mutated the runtime factory registry")
+	}
+	if second.factoryCarriers["custom"] != CarrierTCP {
+		t.Fatalf("carrier=%d want TCP", second.factoryCarriers["custom"])
+	}
+}
+
+func TestRuntimeFactoryDescriptorsValidateFacts(t *testing.T) {
+	runtime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamDial := func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed }
+	packetDial := func(context.Context, string) (net.PacketConn, error) { return nil, net.ErrClosed }
+	if err := runtime.RegisterStreamFactory("", StreamFactory{Dial: streamDial}); err == nil {
+		t.Fatal("empty stream factory name accepted")
+	}
+	if err := runtime.RegisterStreamFactory("stream", StreamFactory{}); err == nil {
+		t.Fatal("nil stream dial accepted")
+	}
+	if err := runtime.RegisterStreamFactory("stream", StreamFactory{Carrier: CarrierFamily(255), Dial: streamDial}); err == nil {
+		t.Fatal("invalid stream carrier accepted")
+	}
+	if err := runtime.RegisterStreamFactory("shared", StreamFactory{Carrier: CarrierUDP, Dial: streamDial}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RegisterPacketFactory("shared", PacketFactory{Carrier: CarrierUDP, Dial: packetDial}); err == nil {
+		t.Fatal("cross-kind duplicate factory accepted")
+	}
+	if err := runtime.RegisterPacketFactory("packet", PacketFactory{Carrier: CarrierUDP, Dial: packetDial}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -118,5 +151,68 @@ func TestRuntimeDialsStandardNetConnSession(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("payload=%q want=%q", got, payload)
+	}
+}
+
+func TestRuntimeDialsRegisteredStreamFactoryDescriptor(t *testing.T) {
+	listener, err := ListenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	runtime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RegisterStreamFactory("custom-stream", StreamFactory{
+		Carrier: CarrierTCP,
+		Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", address)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := runtime.Dial(context.Background(), SessionConfig{Root: Path("custom", PathSpec{
+		Transport: "custom-stream",
+		Address:   listener.Addr().String(),
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var server Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("accept timed out")
+	}
+	defer server.Close()
+
+	payload := []byte("runtime-descriptor")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload=%q want %q", got, payload)
 	}
 }

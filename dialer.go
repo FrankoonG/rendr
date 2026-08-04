@@ -96,6 +96,7 @@ type Dialer struct {
 	// match a registered factory. See factory.go for the API.
 	streamFactories map[string]StreamPathFactory
 	packetFactories map[string]PacketPathFactory
+	factoryCarriers map[string]CarrierFamily
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
