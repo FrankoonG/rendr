@@ -173,6 +173,21 @@ type Engine struct {
 	selectorMu sync.Mutex
 	selector   *selector
 
+	// Directional policy transactions are serialized independently from the
+	// data sequencer. The inbox preserves receive order while network writes
+	// and path-death failover remain outside policyStateMu.
+	policySendGate       chan struct{}
+	policyOwnerMu        sync.Mutex
+	policyStateMu        sync.Mutex
+	policyGeneration     uint64
+	policyPeerGeneration uint64
+	policyOutgoing       *outgoingPolicyTransaction
+	policyIncoming       *incomingPolicyTransaction
+	policySelections     map[proto.TargetID]proto.TargetID
+	policyCompleted      map[[16]byte]completedPolicyTransaction
+	policyCompletedOrder [][16]byte
+	policyInbox          chan policyMessage
+
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
 	probeMu               sync.Mutex
@@ -302,6 +317,10 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		sendControlSlots: make(chan struct{}, sendControlReserve),
 		replayRequests:   make(chan uint64, 1),
 		ackWake:          make(chan struct{}, 1),
+		policyInbox:      make(chan policyMessage, 64),
+		policySendGate:   make(chan struct{}, 1),
+		policySelections: make(map[proto.TargetID]proto.TargetID),
+		policyCompleted:  make(map[[16]byte]completedPolicyTransaction),
 		zombieLeft:       limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding: make(map[uint64]time.Time),
 		closed:           make(chan struct{}),
@@ -319,6 +338,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	go e.replayLoop()
 	go e.ackLoop()
 	go e.ackWriterLoop()
+	go e.policyLoop()
 	return e
 }
 
@@ -547,7 +567,52 @@ func (e *Engine) Paths() []transport.PathInfo {
 // are replayed on the new active path; recv-side dedup makes already
 // delivered frames harmless while filling gaps left on the old path.
 func (e *Engine) Migrate(id uint32) error {
-	return e.migrate(id, true, "explicit")
+	return e.migrateOwnerDecision(id, true, "explicit")
+}
+
+func (e *Engine) migrateOwnerDecision(id uint32, clearScope bool, cause string) error {
+	e.policyOwnerMu.Lock()
+	defer e.policyOwnerMu.Unlock()
+	if err := e.migrate(id, clearScope, cause); err != nil {
+		return err
+	}
+	e.recordPathPolicyDecision(id)
+	return nil
+}
+
+func (e *Engine) recordPathPolicyDecision(id uint32) {
+	binding := e.localGraphBinding()
+	root, ok := binding.manifest.Node(binding.manifest.RootID)
+	if !ok || root.Kind != proto.GraphNodeKindSelector {
+		return
+	}
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	name := pathSlotName(slot)
+	e.pathsMu.RUnlock()
+	node, ok := binding.manifest.NodeByName(name)
+	if !ok || node.Kind != proto.GraphNodeKindPath {
+		return
+	}
+	immediate := false
+	for _, childID := range root.Children {
+		if childID == node.ID {
+			immediate = true
+			break
+		}
+	}
+	if !immediate {
+		return
+	}
+	e.policyStateMu.Lock()
+	defer e.policyStateMu.Unlock()
+	if e.policySelections[root.ID] == node.ID {
+		return
+	}
+	if e.policyGeneration != ^uint64(0) {
+		e.policyGeneration++
+	}
+	e.policySelections[root.ID] = node.ID
 }
 
 func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
@@ -733,14 +798,19 @@ func (e *Engine) ConfigureExecution(kind proto.ExecutionKind) error {
 // Mode returns the current dispatcher mode.
 func (e *Engine) Mode() uint32 { return e.mode.Load() }
 
-// SetDispatchPolicy updates the sender's mode and optionally limits
-// dispatch to a policy-selected path group. It is used by the policy
-// graph layer for selector -> bond/race target changes.
-func (e *Engine) SetDispatchPolicy(kind proto.ExecutionKind, active uint32, scope []uint32, cause string) error {
+// setDispatchPolicy updates the temporary flat dispatcher at one sender
+// boundary. Callers must own policyOwnerMu when this is a runtime decision;
+// initialization runs before the engine is exposed to the application.
+func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scope []uint32, cause string) error {
 	mode, ok := dispatchForExecutionKind(kind)
 	if !ok {
 		return fmt.Errorf("engine: invalid execution kind %d", kind)
 	}
+	// Serialize the policy boundary with sequenced DATA/CTRL publication. Once
+	// this returns, every later frame observes the new mode, scope, and active
+	// path as one state transition.
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
 	e.pathsMu.Lock()
 	if len(scope) > 0 {
 		for _, id := range scope {
@@ -787,39 +857,6 @@ func (e *Engine) SetDispatchPolicy(kind proto.ExecutionKind, active uint32, scop
 		e.fireMigrateHooks(oldID, newID, cause)
 	}
 	return nil
-}
-
-// SetDispatchPolicyByName is the peer-control counterpart to
-// SetDispatchPolicy. Receive-side selectors send target/path names because path
-// ids are local to each peer; this method resolves those names against the
-// local path slots and then applies the ordinary sender policy.
-func (e *Engine) SetDispatchPolicyByName(kind proto.ExecutionKind, activeName string, scopeNames []string, cause string) error {
-	e.pathsMu.RLock()
-	byName := make(map[string]uint32, len(e.paths))
-	for id, slot := range e.paths {
-		if name := pathSlotName(slot); name != "" {
-			byName[name] = id
-		}
-	}
-	e.pathsMu.RUnlock()
-
-	scope := make([]uint32, 0, len(scopeNames))
-	for _, name := range scopeNames {
-		id, ok := byName[name]
-		if !ok {
-			return fmt.Errorf("engine: policy references unknown path name %q", name)
-		}
-		scope = append(scope, id)
-	}
-	var active uint32
-	if activeName != "" {
-		id, ok := byName[activeName]
-		if !ok {
-			return fmt.Errorf("engine: policy activates unknown path name %q", activeName)
-		}
-		active = id
-	}
-	return e.SetDispatchPolicy(kind, active, scope, cause)
 }
 
 func pathSlotName(slot *pathSlot) string {

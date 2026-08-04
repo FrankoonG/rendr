@@ -2,7 +2,6 @@ package engine
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -50,22 +49,6 @@ func (e *Engine) SendPacket(buf []byte) error {
 	return e.sendFrame(proto.FrameData, 0, buf)
 }
 
-// SendPolicyRequest asks the peer to update its sender policy for this flow.
-// It is intentionally just another sequenced control frame: the peer applies
-// it after earlier DATA/CTRL frames reach the reorder head.
-func (e *Engine) SendPolicyRequest(kind proto.ExecutionKind, activeName string, scopeNames []string, cause string) error {
-	if !kind.Valid() {
-		return fmt.Errorf("engine: invalid execution kind %d", kind)
-	}
-	names := append([]string(nil), scopeNames...)
-	return e.sendFrame(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyRequest), proto.PolicyRequestPayload{
-		Kind:       kind,
-		ActiveName: activeName,
-		ScopeNames: names,
-		Cause:      cause,
-	}.Encode())
-}
-
 // SendBye emits the final sequenced frame. It shares the same sequencer as
 // DATA so a concurrent successful Write is always ordered before the final
 // sequence number and the receiver cannot observe an early clean EOF.
@@ -83,19 +66,27 @@ func (e *Engine) SendBye(reason proto.ByeReason) error {
 // path. Frame type may be Data or Ctrl; for Ctrl, flags encodes the
 // CtrlCode in its low 8 bits.
 func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) error {
+	_, err := e.sendFrameTracked(t, flags, payload)
+	return err
+}
+
+// sendFrameTracked publishes one new sequenced frame and returns the exact
+// immutable bytes owned by the replay ledger. Transaction retries can
+// redispatch these bytes without allocating another SEQ or control slot.
+func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byte) ([]byte, error) {
 	if e.sendClosing.Load() {
-		return net.ErrClosed
+		return nil, net.ErrClosed
 	}
 	control := t == proto.FrameCtrl
 	if err := e.acquireSendSlot(control); err != nil {
-		return err
+		return nil, err
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
 	if e.isClosed() || e.sendClosing.Load() {
 		e.releaseSendSlot(control)
-		return net.ErrClosed
+		return nil, net.ErrClosed
 	}
 
 	seq := atomic.AddUint64(&e.sendSeq, 1) - 1
@@ -108,22 +99,32 @@ func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) erro
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
 		e.releaseSendSlot(control)
-		return err
+		return nil, err
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
 	if err := e.reserveSendFrame(frame); err != nil {
 		e.releaseSendSlot(control)
-		return err
+		return nil, err
 	}
 	// Publication means the SEQ has a replay owner and may now be observed by
 	// any path. Advancing before dispatch lets a fast race child ACK while a
 	// slower sibling is still inside Write without having that ACK rejected.
 	e.publishSendSeq(seq + 1)
-	if err := e.dispatch(frame); err != nil {
-		return err
+	err := e.dispatch(frame)
+	return frame, err
+}
+
+func (e *Engine) replaySequencedFrame(frame []byte) error {
+	if len(frame) < proto.HeaderSize {
+		return proto.ErrBadHeader
 	}
-	return nil
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+	if e.isClosed() || e.sendClosing.Load() {
+		return net.ErrClosed
+	}
+	return e.dispatch(frame)
 }
 
 func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {

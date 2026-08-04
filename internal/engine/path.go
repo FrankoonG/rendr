@@ -142,8 +142,12 @@ func (e *Engine) pickAnyActive() uint32 {
 		return id
 	}
 	// If the selected policy group is exhausted but other paths remain,
-	// fall back immediately. Death failover must never wait for dwell or
-	// policy cooldown.
+	// clear only the effective flat scope and fall back immediately. The
+	// graph-level desired selection remains in policySelections for recovery;
+	// death failover must never spin behind dwell or policy cooldown.
+	if len(e.dispatchScope) != 0 {
+		e.dispatchScope = nil
+	}
 	for id := range e.paths {
 		return id
 	}

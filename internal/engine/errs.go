@@ -13,6 +13,8 @@ var (
 	ErrPeerProtocol            = errors.New("rendr: peer protocol violation")
 	ErrPeerClosed              = errors.New("rendr: peer requested close")
 	ErrGracefulCloseTimeout    = errors.New("rendr: graceful close was not acknowledged")
+	ErrPolicyRejected          = errors.New("rendr: peer rejected policy transaction")
+	ErrPolicyOutcomeUnknown    = errors.New("rendr: policy transaction outcome is unknown")
 
 	// ErrLastPath is returned by RemovePath when the named path is
 	// the only attached path. Callers who want to fully tear down

@@ -18,8 +18,10 @@ const (
 	CtrlBye            CtrlCode = 0x05
 	CtrlPathProbe      CtrlCode = 0x06
 	CtrlPathProbeReply CtrlCode = 0x07
-	CtrlPolicyRequest  CtrlCode = 0x08
+	CtrlPolicyPrepare  CtrlCode = 0x08
 	CtrlHelloAck       CtrlCode = 0x09
+	CtrlPolicyAck      CtrlCode = 0x0A
+	CtrlPolicyCommit   CtrlCode = 0x0B
 	CtrlBridgeTag      CtrlCode = 0x10
 	CtrlBridgeAck      CtrlCode = 0x11
 )
@@ -28,17 +30,18 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 0
+	ProtocolMinor uint16 = 1
 )
 
 type FeatureSet uint64
 
 const (
-	FeatureReplayLedger   FeatureSet = 1 << 0
-	FeatureDirectionalACK FeatureSet = 1 << 1
-	FeatureStrictDecode   FeatureSet = 1 << 2
+	FeatureReplayLedger      FeatureSet = 1 << 0
+	FeatureDirectionalACK    FeatureSet = 1 << 1
+	FeatureStrictDecode      FeatureSet = 1 << 2
+	FeaturePolicyTransaction FeatureSet = 1 << 3
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -267,8 +270,12 @@ func (c CtrlCode) String() string {
 		return "PATH_PROBE"
 	case CtrlPathProbeReply:
 		return "PATH_PROBE_REPLY"
-	case CtrlPolicyRequest:
-		return "POLICY_REQUEST"
+	case CtrlPolicyPrepare:
+		return "POLICY_PREPARE"
+	case CtrlPolicyAck:
+		return "POLICY_ACK"
+	case CtrlPolicyCommit:
+		return "POLICY_COMMIT"
 	case CtrlHelloAck:
 		return "HELLO_ACK"
 	case CtrlBridgeTag:
@@ -751,68 +758,6 @@ const (
 // Valid reports whether k identifies a wire executor.
 func (k ExecutionKind) Valid() bool {
 	return k == ExecutionKindSelector || k == ExecutionKindBond || k == ExecutionKindRace
-}
-
-// PolicyRequestPayload asks the peer to update its local sender policy for
-// this flow. It is used by receive-side selector decisions: the receiver can
-// observe RX saturation, but the peer owns the corresponding TX dispatch.
-type PolicyRequestPayload struct {
-	Kind       ExecutionKind
-	ActiveName string
-	ScopeNames []string
-	Cause      string
-}
-
-func (p PolicyRequestPayload) Encode() []byte {
-	b := []byte{byte(p.Kind), 0, 0, 0}
-	b[1] = byte(len(p.ScopeNames))
-	b = appendString8(b, p.ActiveName)
-	for _, name := range p.ScopeNames {
-		b = appendString8(b, name)
-	}
-	b = appendString8(b, p.Cause)
-	return b
-}
-
-func DecodePolicyRequest(b []byte) (PolicyRequestPayload, error) {
-	if len(b) < 4 {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request payload too short: %d < 4", len(b))
-	}
-	p := PolicyRequestPayload{Kind: ExecutionKind(b[0])}
-	if !p.Kind.Valid() {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request invalid execution kind: %d", b[0])
-	}
-	if b[2] != 0 || b[3] != 0 {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request reserved bytes must be zero")
-	}
-	count := int(b[1])
-	rest := b[4:]
-	var ok bool
-	p.ActiveName, rest, ok = readString8(rest)
-	if !ok {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing active name")
-	}
-	p.ScopeNames = make([]string, 0, count)
-	for i := 0; i < count; i++ {
-		var name string
-		name, rest, ok = readString8(rest)
-		if !ok {
-			return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing scope name %d", i)
-		}
-		p.ScopeNames = append(p.ScopeNames, name)
-	}
-	p.Cause, rest, ok = readString8(rest)
-	if !ok {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request missing cause")
-	}
-	if len(rest) != 0 {
-		return PolicyRequestPayload{}, fmt.Errorf("proto: policy_request trailing bytes: %d", len(rest))
-	}
-	return p, nil
-}
-
-func appendPathName(b []byte, name string) []byte {
-	return appendString8(b, name)
 }
 
 func decodeOptionalString8(field string, b []byte) (string, error) {

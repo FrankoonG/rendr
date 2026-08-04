@@ -171,7 +171,7 @@ func (p *selector) evaluate(e *Engine) {
 		return
 	}
 	// Fire migration.
-	if err := e.migrate(bestID, false, "quality"); err == nil {
+	if err := e.migrateOwnerDecision(bestID, false, "quality"); err == nil {
 		p.lastMig = now
 	}
 	// Reset candidate tracking after a migration.

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -782,6 +783,14 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		if slot != nil {
 			slot.recvDups.Add(1)
 		}
+		// Policy phases are transaction-idempotent and cache their exact
+		// responses. Re-deliver an already-sequenced phase to the policy
+		// inbox so replaying the same outer SEQ can recover a lost response
+		// without consuming another control slot. It does not advance the
+		// receive proof or application sequence a second time.
+		if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
+			e.applyCtrlLocked(slot, hdr.Flags, payload)
+		}
 		return false
 	}
 	digest := recvFrameDigest(hdr, payload)
@@ -869,6 +878,10 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 	}
 
 	return e.drainContiguousLocked(deliverPackets)
+}
+
+func isPolicyCtrl(code proto.CtrlCode) bool {
+	return code == proto.CtrlPolicyPrepare || code == proto.CtrlPolicyAck || code == proto.CtrlPolicyCommit
 }
 
 func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
@@ -959,11 +972,34 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 		e.recvFinalErr = closeErr
 		e.recvTerminal = true
 
-	case proto.CtrlPolicyRequest:
-		if p, err := proto.DecodePolicyRequest(payload); err == nil {
-			go func() {
-				_ = e.SetDispatchPolicyByName(p.Kind, p.ActiveName, p.ScopeNames, p.Cause)
-			}()
+	case proto.CtrlPolicyPrepare:
+		prepare, err := proto.DecodePolicyPrepare(payload)
+		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessagePrepare, prepare: prepare}) {
+			if err != nil {
+				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_PREPARE: %v", ErrPeerProtocol, err)
+				e.recvTerminal = true
+			}
+			return
+		}
+
+	case proto.CtrlPolicyAck:
+		ack, err := proto.DecodePolicyAck(payload)
+		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessageAck, ack: ack}) {
+			if err != nil {
+				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_ACK: %v", ErrPeerProtocol, err)
+				e.recvTerminal = true
+			}
+			return
+		}
+
+	case proto.CtrlPolicyCommit:
+		commit, err := proto.DecodePolicyCommit(payload)
+		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessageCommit, commit: commit}) {
+			if err != nil {
+				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_COMMIT: %v", ErrPeerProtocol, err)
+				e.recvTerminal = true
+			}
+			return
 		}
 
 	case proto.CtrlMigrateNotify,

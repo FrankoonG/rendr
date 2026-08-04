@@ -1,6 +1,7 @@
 package rendr
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,12 +26,13 @@ type peakTransferController struct {
 	e       *engine.Engine
 	setMode func(Mode)
 
-	normalIDs   []uint32
-	peakIDs     []uint32
-	normalNames []string
-	peakNames   []string
-	peakMode    Mode
-	opts        PeakTransfer
+	normalIDs      []uint32
+	peakIDs        []uint32
+	peakMode       Mode
+	opts           PeakTransfer
+	selectorID     proto.TargetID
+	normalTargetID proto.TargetID
+	peakTargetID   proto.TargetID
 
 	writeBytes atomic.Uint64
 	readBytes  atomic.Uint64
@@ -65,28 +67,34 @@ func newPeakTransferController(e *engine.Engine, setMode func(Mode), plan compil
 		c.peakMode = ModeSelector
 	}
 	for i, id := range pathIDs {
-		name := ""
-		if i < len(plan.paths) {
-			name = pathSpecName(plan.paths[i])
-		}
 		if i < len(plan.pathPeak) && plan.pathPeak[i] {
 			c.peakIDs = append(c.peakIDs, id)
-			c.peakNames = append(c.peakNames, name)
 		} else {
 			c.normalIDs = append(c.normalIDs, id)
-			c.normalNames = append(c.normalNames, name)
 		}
 	}
 	if len(c.normalIDs) == 0 && len(pathIDs) > 0 {
 		c.normalIDs = append(c.normalIDs, pathIDs[0])
-		if len(plan.paths) > 0 {
-			c.normalNames = append(c.normalNames, pathSpecName(plan.paths[0]))
-		}
 	}
 	if len(c.peakIDs) == 0 && len(pathIDs) > 1 {
 		c.peakIDs = append(c.peakIDs, pathIDs[1:]...)
-		for _, ps := range plan.paths[1:] {
-			c.peakNames = append(c.peakNames, pathSpecName(ps))
+	}
+	if root, ok := plan.graph.manifest.Node(plan.graph.manifest.RootID); ok && root.Kind == proto.GraphNodeKindSelector {
+		c.selectorID = root.ID
+		peaks := make(map[proto.TargetID]struct{}, len(root.PeakCandidates))
+		for _, id := range root.PeakCandidates {
+			peaks[id] = struct{}{}
+		}
+		for _, id := range root.Children {
+			if _, peak := peaks[id]; peak {
+				if c.peakTargetID == (proto.TargetID{}) {
+					c.peakTargetID = id
+				}
+				continue
+			}
+			if c.normalTargetID == (proto.TargetID{}) {
+				c.normalTargetID = id
+			}
 		}
 	}
 	return c
@@ -96,8 +104,10 @@ func (c *peakTransferController) start() {
 	if c == nil || len(c.normalIDs) == 0 || len(c.peakIDs) == 0 {
 		return
 	}
-	_ = c.e.SetDispatchPolicy(proto.ExecutionKindSelector, c.normalIDs[0], c.normalIDs, "selector")
-	_ = c.e.SendPolicyRequest(proto.ExecutionKindSelector, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "selector-rx")
+	if c.selectorID != (proto.TargetID{}) && c.normalTargetID != (proto.TargetID{}) {
+		_ = c.e.InitializePolicySelection(c.selectorID, c.normalTargetID, "selector")
+		_ = c.e.RequestPeerSelection(context.Background(), c.selectorID, c.normalTargetID, "selector-rx")
+	}
 	c.e.StartSelector(nil, 0)
 	go c.loop()
 }
@@ -203,7 +213,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 		st.saturatedSince = time.Time{}
 		st.returnSince = time.Time{}
 		c.mu.Unlock()
-		c.applyPolicy(rx, c.peakMode, c.peakIDs[0], c.peakIDs, firstNonEmpty(c.peakNames), nonEmptyNames(c.peakNames), "peak-transfer")
+		c.applyPolicy(rx, c.peakMode, c.peakTargetID, "peak-transfer")
 		c.mu.Lock()
 		return
 	}
@@ -222,7 +232,7 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 			st.returnSince = time.Time{}
 			st.suppressUntil = now.Add(defaultPeakSuppressFor)
 			c.mu.Unlock()
-			c.applyPolicy(rx, ModeSelector, c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-verify-failed")
+			c.applyPolicy(rx, ModeSelector, c.normalTargetID, "peak-verify-failed")
 			c.mu.Lock()
 			return
 		}
@@ -255,24 +265,21 @@ func (c *peakTransferController) evaluate(now time.Time, bytes uint64, bps float
 	st.peakBytes = 0
 	st.returnSince = time.Time{}
 	c.mu.Unlock()
-	c.applyPolicy(rx, ModeSelector, c.normalIDs[0], c.normalIDs, firstNonEmpty(c.normalNames), nonEmptyNames(c.normalNames), "peak-return")
+	c.applyPolicy(rx, ModeSelector, c.normalTargetID, "peak-return")
 	c.mu.Lock()
 }
 
-func (c *peakTransferController) applyPolicy(rx bool, mode Mode, activeID uint32, scopeIDs []uint32, activeName string, scopeNames []string, cause string) {
-	kind, ok := mode.executionKind()
-	if !ok {
-		return
-	}
+func (c *peakTransferController) applyPolicy(rx bool, mode Mode, peerTargetID proto.TargetID, cause string) {
 	if rx {
-		if activeName == "" || len(scopeNames) == 0 {
+		if c.selectorID == (proto.TargetID{}) || peerTargetID == (proto.TargetID{}) {
 			return
 		}
-		_ = c.e.SendPolicyRequest(kind, activeName, scopeNames, cause+"-rx")
+		_ = c.e.RequestPeerSelection(context.Background(), c.selectorID, peerTargetID, cause+"-rx")
 		return
 	}
-	_ = c.e.SetDispatchPolicy(kind, activeID, scopeIDs, cause)
-	c.setMode(mode)
+	if err := c.e.SelectLocalTarget(c.selectorID, peerTargetID, cause); err == nil {
+		c.setMode(mode)
+	}
 }
 
 func (c *peakTransferController) peakHealthy() bool {
@@ -305,23 +312,4 @@ func (c *peakTransferController) peakHealthy() bool {
 		}
 	}
 	return !seenMeasured
-}
-
-func nonEmptyNames(names []string) []string {
-	out := make([]string, 0, len(names))
-	for _, name := range names {
-		if name != "" {
-			out = append(out, name)
-		}
-	}
-	return out
-}
-
-func firstNonEmpty(names []string) string {
-	for _, name := range names {
-		if name != "" {
-			return name
-		}
-	}
-	return ""
 }

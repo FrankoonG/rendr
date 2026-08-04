@@ -200,44 +200,6 @@ func TestBridgeTagPathNameRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPolicyRequestRoundTrip(t *testing.T) {
-	want := PolicyRequestPayload{
-		Kind:       ExecutionKindBond,
-		ActiveName: "B",
-		ScopeNames: []string{"B", "C"},
-		Cause:      "peak-transfer-rx",
-	}
-	got, err := DecodePolicyRequest(want.Encode())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Kind != want.Kind || got.ActiveName != want.ActiveName || got.Cause != want.Cause {
-		t.Fatalf("policy request: got %+v want %+v", got, want)
-	}
-	if len(got.ScopeNames) != 2 || got.ScopeNames[0] != "B" || got.ScopeNames[1] != "C" {
-		t.Fatalf("policy request scope names=%v", got.ScopeNames)
-	}
-}
-
-func TestPolicyRequestWireStability(t *testing.T) {
-	p := PolicyRequestPayload{
-		Kind:       ExecutionKindSelector,
-		ActiveName: "A",
-		ScopeNames: []string{"B", "C"},
-		Cause:      "rx",
-	}
-	want := []byte{
-		0x01, 0x02, 0x00, 0x00,
-		0x01, 'A',
-		0x01, 'B',
-		0x01, 'C',
-		0x02, 'r', 'x',
-	}
-	if got := p.Encode(); !bytes.Equal(got, want) {
-		t.Fatalf("policy_request wire drift:\n got=%x\nwant=%x", got, want)
-	}
-}
-
 func TestExecutionKindStability(t *testing.T) {
 	cases := []struct {
 		kind ExecutionKind
@@ -265,49 +227,6 @@ func TestExecutionKindValid(t *testing.T) {
 		if kind.Valid() {
 			t.Errorf("kind %d is unexpectedly valid", kind)
 		}
-	}
-}
-
-func TestPolicyRequestRejectsInvalidKind(t *testing.T) {
-	for _, kind := range []ExecutionKind{ExecutionKindInvalid, 4, 255} {
-		wire := PolicyRequestPayload{Kind: kind}.Encode()
-		if _, err := DecodePolicyRequest(wire); err == nil {
-			t.Errorf("accepted invalid execution kind %d", kind)
-		}
-	}
-}
-
-func TestPolicyRequestRejectsMalformedFields(t *testing.T) {
-	valid := PolicyRequestPayload{
-		Kind:       ExecutionKindSelector,
-		ActiveName: "active",
-		ScopeNames: []string{"scope"},
-		Cause:      "cause",
-	}.Encode()
-
-	tests := []struct {
-		name string
-		wire []byte
-	}{
-		{
-			name: "nonzero reserved",
-			wire: func() []byte {
-				b := append([]byte(nil), valid...)
-				b[2] = 1
-				return b
-			}(),
-		},
-		{name: "truncated active name", wire: []byte{byte(ExecutionKindSelector), 0, 0, 0, 2, 'x'}},
-		{name: "truncated scope name", wire: []byte{byte(ExecutionKindSelector), 1, 0, 0, 0, 2, 'x'}},
-		{name: "missing cause", wire: []byte{byte(ExecutionKindSelector), 0, 0, 0, 0}},
-		{name: "trailing field", wire: append(append([]byte(nil), valid...), 0)},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := DecodePolicyRequest(tc.wire); err == nil {
-				t.Fatal("accepted malformed policy request")
-			}
-		})
 	}
 }
 
@@ -453,9 +372,6 @@ func TestRejectShortPayloads(t *testing.T) {
 	if _, err := DecodeBridgeAck(short); err == nil {
 		t.Error("bridge_ack accepted short input")
 	}
-	if _, err := DecodePolicyRequest(short); err == nil {
-		t.Error("policy_request accepted short input")
-	}
 	if _, err := DecodeBye(nil); err == nil {
 		t.Error("bye accepted nil input")
 	}
@@ -473,8 +389,10 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlBye, 0x05},
 		{CtrlPathProbe, 0x06},
 		{CtrlPathProbeReply, 0x07},
-		{CtrlPolicyRequest, 0x08},
+		{CtrlPolicyPrepare, 0x08},
 		{CtrlHelloAck, 0x09},
+		{CtrlPolicyAck, 0x0A},
+		{CtrlPolicyCommit, 0x0B},
 		{CtrlBridgeTag, 0x10},
 		{CtrlBridgeAck, 0x11},
 	}
@@ -695,7 +613,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("00010000000000000000000000000007000000000000000700112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("0001000100000000000000000000000f000000000000000f00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}
