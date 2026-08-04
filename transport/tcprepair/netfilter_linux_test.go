@@ -40,13 +40,15 @@ func TestInstallTCPDropBuildsSymmetricRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleanup()
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
 
 	want := []netfilterCall{
-		{name: "iptables", args: []string{"-I", "INPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-I", "OUTPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-D", "OUTPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-D", "INPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-I", "INPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-I", "OUTPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-D", "OUTPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-D", "INPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
 	}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("iptables calls mismatch:\ngot  %#v\nwant %#v", runner.calls, want)
@@ -65,13 +67,32 @@ func TestInstallTCPDropRollsBackOnFailure(t *testing.T) {
 		t.Fatalf("error did not include command output: %v", err)
 	}
 	want := []netfilterCall{
-		{name: "iptables", args: []string{"-I", "INPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-I", "OUTPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-D", "OUTPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
-		{name: "iptables", args: []string{"-D", "INPUT", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-I", "INPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-I", "OUTPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "1000", "-d", "127.0.0.1", "--dport", "2000", "-j", "DROP"}},
+		{name: "iptables", args: []string{"-D", "INPUT", "-w", "5", "-p", "tcp", "-s", "127.0.0.1", "--sport", "2000", "-d", "127.0.0.1", "--dport", "1000", "-j", "DROP"}},
 	}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("iptables rollback calls mismatch:\ngot  %#v\nwant %#v", runner.calls, want)
+	}
+}
+
+func TestTCPDropCleanupReportsFailureAndCanRetry(t *testing.T) {
+	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1000}
+	remote := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2000}
+	runner := &fakeNetfilterRunner{failOnCall: 3, failMessage: "delete failed"}
+	cleanup, err := (iptablesRuleManager{runner: runner}).InstallTCPDrop(local, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanup(); err == nil || !strings.Contains(err.Error(), "delete failed") {
+		t.Fatalf("cleanup error=%v, want delete failure", err)
+	}
+	runner.failOnCall = 0
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup retry: %v", err)
+	}
+	if got := len(runner.calls); got != 5 {
+		t.Fatalf("iptables calls=%d, want 5 (two insert, two first cleanup, one retry)", got)
 	}
 }
 

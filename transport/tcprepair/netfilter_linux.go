@@ -8,7 +8,10 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
+	"sync"
 )
+
+const xtablesLockWaitSeconds = "5"
 
 type netfilterRunner interface {
 	Run(name string, args ...string) ([]byte, error)
@@ -21,7 +24,7 @@ func (execNetfilterRunner) Run(name string, args ...string) ([]byte, error) {
 }
 
 type tcpDropRuleManager interface {
-	InstallTCPDrop(local, remote *net.TCPAddr) (func(), error)
+	InstallTCPDrop(local, remote *net.TCPAddr) (func() error, error)
 }
 
 type iptablesRuleManager struct {
@@ -30,11 +33,11 @@ type iptablesRuleManager struct {
 
 var tcpDropRules tcpDropRuleManager = iptablesRuleManager{runner: execNetfilterRunner{}}
 
-func installDropRules(local, remote *net.TCPAddr) (func(), error) {
+func installDropRules(local, remote *net.TCPAddr) (func() error, error) {
 	return tcpDropRules.InstallTCPDrop(local, remote)
 }
 
-func (m iptablesRuleManager) InstallTCPDrop(local, remote *net.TCPAddr) (func(), error) {
+func (m iptablesRuleManager) InstallTCPDrop(local, remote *net.TCPAddr) (func() error, error) {
 	if local == nil || remote == nil {
 		return nil, errors.New("tcprepair: nil local/remote addr")
 	}
@@ -43,17 +46,32 @@ func (m iptablesRuleManager) InstallTCPDrop(local, remote *net.TCPAddr) (func(),
 		runner = execNetfilterRunner{}
 	}
 	rules := iptablesTCPDropRules(local, remote)
-	cleanup := func() {
+	active := make([]bool, len(rules))
+	var cleanupMu sync.Mutex
+	cleanup := func() error {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		var cleanupErr error
 		for i := len(rules) - 1; i >= 0; i-- {
+			if !active[i] {
+				continue
+			}
 			deleteRule := rules[i].deleteArgs()
-			_, _ = runner.Run("iptables", deleteRule...)
+			out, err := runner.Run("iptables", deleteRule...)
+			if err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("tcprepair: remove iptables rule %d failed: %v (%s)", i, err, out))
+				continue
+			}
+			active[i] = false
 		}
+		return cleanupErr
 	}
 	for i, rule := range rules {
 		if out, err := runner.Run("iptables", rule.insertArgs...); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("tcprepair: iptables rule %d failed: %v (%s)", i, err, out)
+			installErr := fmt.Errorf("tcprepair: iptables rule %d failed: %v (%s)", i, err, out)
+			return nil, errors.Join(installErr, cleanup())
 		}
+		active[i] = true
 	}
 	return cleanup, nil
 }
@@ -74,7 +92,7 @@ func iptablesTCPDropRules(local, remote *net.TCPAddr) []iptablesRule {
 	localPort := strconv.Itoa(local.Port)
 	remotePort := strconv.Itoa(remote.Port)
 	return []iptablesRule{
-		{insertArgs: []string{"-I", "INPUT", "-p", "tcp", "-s", remoteIP, "--sport", remotePort, "-d", localIP, "--dport", localPort, "-j", "DROP"}},
-		{insertArgs: []string{"-I", "OUTPUT", "-p", "tcp", "-s", localIP, "--sport", localPort, "-d", remoteIP, "--dport", remotePort, "-j", "DROP"}},
+		{insertArgs: []string{"-I", "INPUT", "-w", xtablesLockWaitSeconds, "-p", "tcp", "-s", remoteIP, "--sport", remotePort, "-d", localIP, "--dport", localPort, "-j", "DROP"}},
+		{insertArgs: []string{"-I", "OUTPUT", "-w", xtablesLockWaitSeconds, "-p", "tcp", "-s", localIP, "--sport", localPort, "-d", remoteIP, "--dport", remotePort, "-j", "DROP"}},
 	}
 }

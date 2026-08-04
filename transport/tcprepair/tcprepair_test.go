@@ -86,7 +86,7 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 	dropInstalled := true
 	defer func() {
 		if dropInstalled {
-			cleanupDrop()
+			_ = cleanupDrop()
 		}
 	}()
 
@@ -108,7 +108,9 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 	defer newSrv.Close()
 	newSrvTCP := newSrv.(*net.TCPConn)
 
-	cleanupDrop()
+	if err := cleanupDrop(); err != nil {
+		t.Fatalf("iptables cleanup: %v", err)
+	}
 	dropInstalled = false
 
 	// Replay: the unread bytes should be drainable from the new fd.

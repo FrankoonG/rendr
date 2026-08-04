@@ -803,7 +803,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&Dialer{Root: root}).Dial(ctx)
+	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

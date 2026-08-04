@@ -137,7 +137,12 @@ func (p *PathConn) MigratePathLocalAddr(newLocal string) (transport.PathConn, er
 	if err != nil {
 		return nil, err
 	}
-	defer cleanup()
+	cleanupDone := false
+	defer func() {
+		if !cleanupDone {
+			_ = cleanup()
+		}
+	}()
 
 	_ = p.base.Close()
 	fd, err := Restore(snap)
@@ -156,6 +161,11 @@ func (p *PathConn) MigratePathLocalAddr(newLocal string) (transport.PathConn, er
 		return nil, errors.New("tcprepair: restored socket is not *net.TCPConn")
 	}
 	_ = tc.SetKeepAlive(false)
+	if err := cleanup(); err != nil {
+		_ = tc.Close()
+		return nil, err
+	}
+	cleanupDone = true
 	return Wrap(tc), nil
 }
 
