@@ -263,6 +263,116 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 	}
 }
 
+func TestQUICDatagramOwnedFrameRemainsImmutable(t *testing.T) {
+	srvTLS, cliTLS, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := Listen("127.0.0.1:0", srvTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvCh := make(chan *datagramPathConn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pc, err := ln.AcceptDatagram(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		srvCh <- pc
+	}()
+
+	tp := &Transport{ClientTLS: cliTLS}
+	cliPath, err := tp.DialPath(context.Background(), transport.PathSpec{
+		Address: ln.Addr().String(),
+		Opts:    map[string]string{"mode": "datagram"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := cliPath.(*datagramPathConn)
+	defer client.Close()
+
+	wantRetained := make([]byte, 256)
+	for i := range wantRetained {
+		wantRetained[i] = byte(i ^ 0xa5)
+	}
+	if _, err := client.Write(wantRetained); err != nil {
+		t.Fatal(err)
+	}
+
+	var server *datagramPathConn
+	select {
+	case server = <-srvCh:
+	case err := <-errCh:
+		t.Fatalf("accept: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server accept timed out")
+	}
+	defer server.Close()
+
+	owned, ok := any(server).(transport.OwnedFrameReader)
+	if !ok {
+		t.Fatal("QUIC DATAGRAM path does not expose the owned-frame fast path")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		retained, err := owned.ReadOwnedFrame()
+		if err != nil {
+			done <- fmt.Errorf("read retained frame: %w", err)
+			return
+		}
+		if !bytes.Equal(retained, wantRetained) {
+			done <- fmt.Errorf("retained frame mismatch before pressure")
+			return
+		}
+
+		const reusePressureFrames = 512
+		pressure := make([]byte, len(wantRetained))
+		for seq := uint64(1); seq <= reusePressureFrames; seq++ {
+			for i := range pressure {
+				pressure[i] = byte(seq)
+			}
+			binary.BigEndian.PutUint64(pressure, seq)
+			if _, err := client.Write(pressure); err != nil {
+				done <- fmt.Errorf("pressure write %d: %w", seq, err)
+				return
+			}
+			frame, err := owned.ReadOwnedFrame()
+			if err != nil {
+				done <- fmt.Errorf("pressure read %d: %w", seq, err)
+				return
+			}
+			if !bytes.Equal(frame, pressure) {
+				done <- fmt.Errorf("pressure frame %d mismatch", seq)
+				return
+			}
+		}
+		if !bytes.Equal(retained, wantRetained) {
+			done <- fmt.Errorf("retained frame changed after %d subsequent reads", reusePressureFrames)
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = client.Close()
+		_ = server.Close()
+		t.Fatal("owned-frame reuse pressure timed out")
+	}
+}
+
 // TestQUICDatagramOversizeRejected: SendDatagram with a frame larger
 // than MaxDatagramFrame must return an error without crashing.
 func TestQUICDatagramOversizeRejected(t *testing.T) {
