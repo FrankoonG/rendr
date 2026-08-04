@@ -980,6 +980,13 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 		t.Fatalf("initial read: %v", err)
 	}
 
+	// Make recovery genuinely impossible before killing the live path. A
+	// still-listening endpoint is expected to be redialed automatically by the
+	// v1 runtime and therefore must not be used to prove budget expiry.
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	// Now violently break the server's only path: ForceKill so the
 	// engine sees a TransportError (NOT a BYE - we are simulating
 	// G4 "pathçœŸæ­»äº¡", not a clean teardown).
@@ -1898,7 +1905,7 @@ func TestPathInfoCountersExposed(t *testing.T) {
 	}
 }
 
-// TestG5PathRecoveryViaAddPath: 2 paths, kill one, AddPath a
+// TestG5PathRecoveryViaAddPath: 2 paths, detach one, AddPath a
 // replacement (same spec); verify the new path attaches to the
 // existing engine via BRIDGE_TAG and the stream continues without
 // any application-visible error. This is the G5 acceptance
@@ -1958,15 +1965,26 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Kill one client path.
+	// Explicitly detach the inactive client path. A transport-error death is
+	// automatically redialed in v1 and would make this manual AddPath contract
+	// race the recovery supervisor instead of testing BRIDGE attachment.
 	bc := client.(*engineBackedConn)
 	preKill := len(bc.Paths())
-	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
+	var detachedID uint32
+	for _, path := range bc.Paths() {
+		if !path.Active {
+			detachedID = path.ID
+			break
+		}
+	}
+	if detachedID == 0 {
+		t.Fatal("no inactive path available for detach")
+	}
+	if err := bc.RemovePath(detachedID); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
 	if len(bc.Paths()) != preKill-1 {
-		t.Fatalf("after kill: paths=%d want %d", len(bc.Paths()), preKill-1)
+		t.Fatalf("after detach: paths=%d want %d", len(bc.Paths()), preKill-1)
 	}
 
 	// Recover: AddPath a fresh socket to the same listener.

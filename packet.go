@@ -28,6 +28,7 @@ type enginePacketConn struct {
 	status   *pathStatusTracker
 	resolver *pathFactoryResolver
 	graph    compiledTargetGraph
+	recovery *pathRecoverySupervisor
 
 	lAddr   net.Addr
 	rAddr   net.Addr
@@ -132,6 +133,10 @@ func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(i
 func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	return c.addPath(ctx, spec)
+}
+
+func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, error) {
 	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
@@ -157,6 +162,10 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 		return 0, err
 	}
 	return id, nil
+}
+
+func (c *enginePacketConn) startPathRecovery() {
+	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath)
 }
 
 // Stats returns the same coherent snapshot as AdminConn.Stats does

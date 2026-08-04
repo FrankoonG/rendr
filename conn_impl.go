@@ -23,6 +23,7 @@ type engineBackedConn struct {
 	status   *pathStatusTracker
 	resolver *pathFactoryResolver
 	graph    compiledTargetGraph
+	recovery *pathRecoverySupervisor
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -170,6 +171,10 @@ func (c *engineBackedConn) MigratePathLocalAddr(id uint32, newLocal string) erro
 func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	return c.addPath(ctx, spec)
+}
+
+func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, error) {
 	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
@@ -195,4 +200,8 @@ func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 		return 0, err
 	}
 	return id, nil
+}
+
+func (c *engineBackedConn) startPathRecovery() {
+	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath)
 }

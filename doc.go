@@ -1,16 +1,29 @@
 // Package rendr provides connection-preserving migration for Go streams and
 // packet connections.
 //
-// A Dialer accepts one root Target graph. Path constructs leaves, while
+// A Runtime accepts one root Target graph per SessionConfig. Path constructs leaves, while
 // Selector, Race, and Bond compose leaves or other groups. Selector keeps one
 // immediate child active, Race sends through every eligible child, and Bond
 // aggregates frames across its children.
 //
-//	root := rendr.Selector("root", []rendr.Target{
-//		rendr.Path("primary", rendr.PathSpec{Transport: "tcp", Address: "host-a:443"}),
-//		rendr.Path("backup", rendr.PathSpec{Transport: "tcp", Address: "host-b:443"}),
+//	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+//	if err != nil {
+//		return err
+//	}
+//	err = runtime.RegisterStreamFactory("edge-tcp", rendr.StreamFactory{
+//		Carrier: rendr.CarrierTCP,
+//		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+//			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+//		},
 //	})
-//	c, err := (&rendr.Dialer{Root: root}).Dial(ctx)
+//	if err != nil {
+//		return err
+//	}
+//	root := rendr.Selector("root", []rendr.Target{
+//		rendr.Path("primary", rendr.PathSpec{Transport: "edge-tcp", Address: "host-a:443"}),
+//		rendr.Path("backup", rendr.PathSpec{Transport: "edge-tcp", Address: "host-b:443"}),
+//	})
+//	c, err := runtime.Dial(ctx, rendr.SessionConfig{Root: root})
 //
 // Dial and DialPacket return net.Conn and net.PacketConn compatible values.
 // Transport failure is handled below those interfaces: migration does not

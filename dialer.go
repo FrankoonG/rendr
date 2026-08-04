@@ -117,6 +117,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	}
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
+	for index, spec := range paths {
+		tracker.setMobility(index, planLeafMobility(spec, resolver))
+	}
 
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
@@ -176,6 +179,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.graph = plan.graph
+	bc.startPathRecovery()
 
 	// Arm the selector scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
@@ -209,6 +213,9 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
+	for index, spec := range paths {
+		tracker.setMobility(index, planLeafMobility(spec, resolver))
+	}
 
 	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
@@ -264,6 +271,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.graph = plan.graph
+	bc.startPathRecovery()
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)

@@ -88,9 +88,12 @@ const (
 )
 
 type Status struct {
-	Local CapabilitySet
-	Peer  PeerStatus
-	Paths []PathStatus
+	FlowID   [16]byte
+	State    string
+	Protocol SessionProtocol
+	Local    CapabilitySet
+	Peer     PeerStatus
+	Paths    []PathStatus
 }
 
 type PeerStatus struct {
@@ -112,9 +115,11 @@ const (
 )
 
 type PathStatus struct {
+	ID        uint32
 	Name      string
 	State     PathState
 	Active    bool
+	Mobility  MobilityStatus
 	LastError string
 }
 
@@ -189,6 +194,7 @@ type pathStatusTracker struct {
 type trackedPathStatus struct {
 	spec      PathSpec
 	state     PathState
+	mobility  MobilityStatus
 	lastError string
 }
 
@@ -222,6 +228,15 @@ func (t *pathStatusTracker) set(index int, state PathState, err error) {
 	}
 }
 
+func (t *pathStatusTracker) setMobility(index int, mobility MobilityStatus) {
+	if t == nil || index < 0 || index >= len(t.paths) {
+		return
+	}
+	t.mu.Lock()
+	t.paths[index].mobility = mobility
+	t.mu.Unlock()
+}
+
 func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
 	if t == nil {
 		return nil
@@ -234,18 +249,19 @@ func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
 	for _, tracked := range t.paths {
 		if idx := matchAttachedPath(tracked.spec, attached, used); idx >= 0 {
 			used[idx] = true
-			out = append(out, pathStatusFromInfo(attached[idx]))
+			out = append(out, pathStatusFromInfo(attached[idx], tracked.mobility))
 			continue
 		}
 		out = append(out, PathStatus{
 			Name:      pathSpecName(tracked.spec),
 			State:     tracked.state,
+			Mobility:  tracked.mobility,
 			LastError: tracked.lastError,
 		})
 	}
 	for i, p := range attached {
 		if !used[i] {
-			out = append(out, pathStatusFromInfo(p))
+			out = append(out, pathStatusFromInfo(p, MobilityStatus{}))
 		}
 	}
 	return out
@@ -263,11 +279,13 @@ func matchAttachedPath(spec PathSpec, attached []PathInfo, used []bool) int {
 	return -1
 }
 
-func pathStatusFromInfo(p PathInfo) PathStatus {
+func pathStatusFromInfo(p PathInfo, mobility MobilityStatus) PathStatus {
 	return PathStatus{
-		Name:   pathSpecName(p.Spec),
-		State:  PathAttached,
-		Active: p.Active,
+		ID:       p.ID,
+		Name:     pathSpecName(p.Spec),
+		State:    PathAttached,
+		Active:   p.Active,
+		Mobility: mobility,
 	}
 }
 
@@ -286,12 +304,22 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker) Stat
 	if out == nil {
 		out = make([]PathStatus, 0, len(paths))
 		for _, p := range paths {
-			out = append(out, pathStatusFromInfo(p))
+			out = append(out, pathStatusFromInfo(p, MobilityStatus{}))
 		}
 	}
 	return Status{
-		Local: local.Caps,
-		Peer:  peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
-		Paths: out,
+		FlowID:   e.FlowID(),
+		State:    e.State().String(),
+		Protocol: sessionProtocolForEngine(e),
+		Local:    local.Caps,
+		Peer:     peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
+		Paths:    out,
 	}
+}
+
+func sessionProtocolForEngine(e *engine.Engine) SessionProtocol {
+	if e != nil && e.Packetized() {
+		return SessionProtocolFramedPacketV3
+	}
+	return SessionProtocolFramedStreamV3
 }

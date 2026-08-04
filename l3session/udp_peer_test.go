@@ -35,10 +35,14 @@ func TestUDPPeerRelayDispatchesIdentityAndBridgesReplies(t *testing.T) {
 		}
 		accepted <- pc
 	}()
-	client, err := (&rendr.Dialer{
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := runtime.DialPacket(ctx, rendr.SessionConfig{
 		Root:               rendr.Path("udp", rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
 		PreserveL3Identity: true,
-	}).DialPacket(ctx)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

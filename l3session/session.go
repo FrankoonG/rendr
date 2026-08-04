@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
@@ -61,20 +62,29 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// DialerOption lets embedders inject per-session Dialer knobs such as
-// factories, selector timing, or migration budget without making l3ingress
-// depend on top-level rendr types.
-type DialerOption func(req l3ingress.SessionRequest, d *rendr.Dialer) error
-
 // Starter starts rendr sessions for l3ingress SessionRequests.
 type Starter struct {
-	Options []DialerOption
+	// Runtime owns factories, tuning, capabilities, and the rendr instance
+	// identity shared by sessions. When nil, Starter creates one default
+	// Runtime on first use and reuses it for its lifetime.
+	Runtime *rendr.Runtime
+
+	// ConfigureSession is the narrow per-session customization point. The L3
+	// identity requirement is copied from the request after this hook returns,
+	// so a hook cannot accidentally weaken fail-closed identity preservation.
+	ConfigureSession func(l3ingress.SessionRequest, *rendr.SessionConfig) error
+
+	runtimeMu       sync.Mutex
+	resolvedRuntime *rendr.Runtime
 }
 
 // Start creates either a rendr Conn or PacketConn for req. req.Root must be a
 // rendr.Target; lower l3ingress packages keep it opaque to avoid an import
 // cycle.
-func (s Starter) Start(ctx context.Context, req l3ingress.SessionRequest) (*Session, error) {
+func (s *Starter) Start(ctx context.Context, req l3ingress.SessionRequest) (*Session, error) {
+	if s == nil {
+		return nil, errors.New("l3session: nil Starter")
+	}
 	root, ok := req.Root.(rendr.Target)
 	if !ok || root == nil {
 		return nil, &Error{
@@ -82,48 +92,40 @@ func (s Starter) Start(ctx context.Context, req l3ingress.SessionRequest) (*Sess
 			Detail: fmt.Sprintf("%T", req.Root),
 		}
 	}
-	d := &rendr.Dialer{
+	config := rendr.SessionConfig{
 		Root:               root,
 		PreserveL3Identity: req.PreserveL3Identity,
 	}
-	for _, opt := range s.Options {
-		if opt == nil {
-			continue
-		}
-		if err := opt(req, d); err != nil {
+	if s.ConfigureSession != nil {
+		if err := s.ConfigureSession(req, &config); err != nil {
 			return nil, err
 		}
 	}
+	config.PreserveL3Identity = req.PreserveL3Identity
+	runtime, err := s.sessionRuntime()
+	if err != nil {
+		return nil, err
+	}
 	switch req.Kind {
 	case l3ingress.SessionKindStream:
-		c, err := d.Dial(ctx)
+		c, err := runtime.Dial(ctx, config)
 		if err != nil {
 			return nil, err
 		}
 		if req.PreserveL3Identity {
-			admin, ok := c.(rendr.AdminConn)
-			if !ok {
-				_ = c.Close()
-				return nil, l3ingress.RequirePeerL3Identity(0)
-			}
-			if err := l3ingress.RequirePeerL3Identity(admin.Stats().PeerCaps); err != nil {
+			if err := requirePeerL3Identity(c); err != nil {
 				_ = c.Close()
 				return nil, err
 			}
 		}
 		return &Session{Request: req, Conn: c}, nil
 	case l3ingress.SessionKindPacket:
-		pc, err := d.DialPacket(ctx)
+		pc, err := runtime.DialPacket(ctx, config)
 		if err != nil {
 			return nil, err
 		}
 		if req.PreserveL3Identity {
-			admin, ok := pc.(rendr.AdminPacketConn)
-			if !ok {
-				_ = pc.Close()
-				return nil, l3ingress.RequirePeerL3Identity(0)
-			}
-			if err := l3ingress.RequirePeerL3Identity(admin.Stats().PeerCaps); err != nil {
+			if err := requirePeerL3Identity(pc); err != nil {
 				_ = pc.Close()
 				return nil, err
 			}
@@ -135,6 +137,36 @@ func (s Starter) Start(ctx context.Context, req l3ingress.SessionRequest) (*Sess
 			Detail: string(req.Kind),
 		}
 	}
+}
+
+func (s *Starter) sessionRuntime() (*rendr.Runtime, error) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	if s.resolvedRuntime != nil {
+		return s.resolvedRuntime, nil
+	}
+	if s.Runtime != nil {
+		s.resolvedRuntime = s.Runtime
+		return s.resolvedRuntime, nil
+	}
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		return nil, err
+	}
+	s.resolvedRuntime = runtime
+	return runtime, nil
+}
+
+type statusCloser interface {
+	Status() rendr.Status
+	Close() error
+}
+
+func requirePeerL3Identity(conn statusCloser) error {
+	if conn != nil && conn.Status().Peer.Caps.Has(rendr.CapL3Identity) {
+		return nil
+	}
+	return l3ingress.RequirePeerL3Identity(0)
 }
 
 // AsError returns the typed l3session error when err contains one.

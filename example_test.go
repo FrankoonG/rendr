@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 
 	"github.com/FrankoonG/rendr"
 )
 
-// ExampleDialer_Dial demonstrates the smallest useful rendr setup:
+// ExampleRuntime_Dial demonstrates the smallest useful rendr setup:
 // one TCP path between two in-process endpoints. Real deployments
 // supply two or more paths so migration has somewhere to go.
-func ExampleDialer_Dial() {
+func ExampleRuntime_Dial() {
 	ln, err := rendr.ListenTCP("127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
@@ -32,10 +33,13 @@ func ExampleDialer_Dial() {
 		fmt.Println("server got:", string(buf[:n]))
 	}()
 
-	d := &rendr.Dialer{
-		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+	runtime, err := newStreamRuntime()
+	if err != nil {
+		log.Fatal(err)
 	}
-	c, err := d.Dial(context.Background())
+	c, err := runtime.Dial(context.Background(), rendr.SessionConfig{
+		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "stream", Address: ln.Addr().String()}),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,10 +71,13 @@ func ExampleAdminConn() {
 		_, _ = io.ReadFull(c, buf)
 	}()
 
-	d := &rendr.Dialer{
-		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+	runtime, err := newStreamRuntime()
+	if err != nil {
+		log.Fatal(err)
 	}
-	c, err := d.Dial(context.Background())
+	c, err := runtime.Dial(context.Background(), rendr.SessionConfig{
+		Root: rendr.Path("tcp", rendr.PathSpec{Transport: "stream", Address: ln.Addr().String()}),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -90,11 +97,11 @@ func ExampleAdminConn() {
 	// paths: 1
 }
 
-// ExampleDialer_DialPacket demonstrates packet-boundary mode over
+// ExampleRuntime_DialPacket demonstrates packet-boundary mode over
 // opaque UDP. Each WriteTo becomes one frame; each ReadFrom returns
 // one frame's payload. Use this for datagram-oriented protocols
 // (WireGuard, custom UDP echo) where boundaries must be preserved.
-func ExampleDialer_DialPacket() {
+func ExampleRuntime_DialPacket() {
 	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
@@ -114,10 +121,13 @@ func ExampleDialer_DialPacket() {
 		fmt.Println("server got:", string(buf[:n]))
 	}()
 
-	d := &rendr.Dialer{
-		Root: rendr.Path("udp", rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
+	runtime, err := newPacketRuntime()
+	if err != nil {
+		log.Fatal(err)
 	}
-	c, err := d.DialPacket(context.Background())
+	c, err := runtime.DialPacket(context.Background(), rendr.SessionConfig{
+		Root: rendr.Path("udp", rendr.PathSpec{Transport: "packet", Address: ln.Addr().String()}),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -125,4 +135,38 @@ func ExampleDialer_DialPacket() {
 	_, _ = c.WriteTo([]byte("hello packets"), nil)
 	<-srvDone
 	// Output: server got: hello packets
+}
+
+func newStreamRuntime() (*rendr.Runtime, error) {
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{}
+	if err := runtime.RegisterStreamFactory("stream", rendr.StreamFactory{
+		Carrier: rendr.CarrierTCP,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", addr)
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return runtime, nil
+}
+
+func newPacketRuntime() (*rendr.Runtime, error) {
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		return nil, err
+	}
+	listenConfig := &net.ListenConfig{}
+	if err := runtime.RegisterPacketFactory("packet", rendr.PacketFactory{
+		Carrier: rendr.CarrierUDP,
+		Dial: func(ctx context.Context, _ string) (net.PacketConn, error) {
+			return listenConfig.ListenPacket(ctx, "udp", "127.0.0.1:0")
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return runtime, nil
 }

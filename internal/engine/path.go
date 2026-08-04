@@ -72,6 +72,16 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	}
 	hasPaths := len(e.paths) > 0
 	e.pathsMu.Unlock()
+	e.firePathDeathHooks(PathDeathEvent{
+		ID:   id,
+		Spec: slot.spec,
+		Binding: PathBinding{
+			LocalTXTargetID: slot.localTXTargetID,
+			PeerTXTargetID:  slot.peerTXTargetID,
+		},
+		Cause: cause,
+		Err:   err,
+	})
 
 	// A transport may report death while a concurrent Write is blocked and
 	// only unblock that Write when Close is called. Close asynchronously: an

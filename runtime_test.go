@@ -215,4 +215,11 @@ func TestRuntimeDialsRegisteredStreamFactoryDescriptor(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("payload=%q want %q", got, payload)
 	}
+	status := client.Status()
+	if status.Protocol != SessionProtocolFramedStreamV3 || status.FlowID != client.FlowID() {
+		t.Fatalf("session status protocol/flow=%q/%x", status.Protocol, status.FlowID)
+	}
+	if len(status.Paths) != 1 || status.Paths[0].Mobility.ID != MobilityRedialAttach || status.Paths[0].Mobility.Reason == "" {
+		t.Fatalf("path mobility status=%+v", status.Paths)
+	}
 }

@@ -103,6 +103,10 @@ func serveRendrConn(ctx context.Context, c rendr.Conn) error {
 }
 
 func runClient(ctx context.Context, cfg config) error {
+	runtime, err := newRendrRuntime()
+	if err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", cfg.listenAddr)
 	if err != nil {
 		return err
@@ -115,10 +119,27 @@ func runClient(ctx context.Context, cfg config) error {
 		}
 		go func() {
 			_ = serveSOCKSConn(ctx, raw, func(ctx context.Context) (rendr.Conn, error) {
-				return dialRendr(ctx, cfg.serverAddr, cfg.paths)
+				return dialRendr(ctx, runtime, cfg.serverAddr, cfg.paths)
 			})
 		}()
 	}
+}
+
+func newRendrRuntime() (*rendr.Runtime, error) {
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		return nil, err
+	}
+	tcpDialer := &net.Dialer{}
+	if err := runtime.RegisterStreamFactory("tcp", rendr.StreamFactory{
+		Carrier: rendr.CarrierTCP,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return tcpDialer.DialContext(ctx, "tcp", addr)
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return runtime, nil
 }
 
 func serveSOCKSConn(ctx context.Context, raw net.Conn, dial func(context.Context) (rendr.Conn, error)) error {
@@ -166,7 +187,7 @@ func copyBuffered(dst io.Writer, br *bufio.Reader) error {
 	return nil
 }
 
-func dialRendr(ctx context.Context, serverAddr, pathList string) (rendr.Conn, error) {
+func dialRendr(ctx context.Context, runtime *rendr.Runtime, serverAddr, pathList string) (rendr.Conn, error) {
 	if pathList == "" {
 		pathList = serverAddr
 	}
@@ -182,10 +203,9 @@ func dialRendr(ctx context.Context, serverAddr, pathList string) (rendr.Conn, er
 	if len(targets) == 0 {
 		return nil, errors.New("no rendr paths configured")
 	}
-	d := &rendr.Dialer{
+	return runtime.Dial(ctx, rendr.SessionConfig{
 		Root: rendr.Selector("root", targets),
-	}
-	return d.Dial(ctx)
+	})
 }
 
 func readSOCKSConnect(c net.Conn) (string, error) {

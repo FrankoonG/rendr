@@ -12,6 +12,8 @@ import (
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport/tcp"
+	"github.com/FrankoonG/rendr/virtualif"
 )
 
 func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
@@ -33,15 +35,35 @@ func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
 		accepted <- c
 	}()
 
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RegisterStreamFactory("test-stream", rendr.StreamFactory{
+		Carrier: rendr.CarrierTCP,
+		Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	req := l3ingress.SessionRequest{
 		Kind:               l3ingress.SessionKindStream,
 		Identity:           testIdentity(l3ingress.ProtocolTCP),
 		Peer:               "peer-a",
-		Root:               rendr.Path("tcp-a", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+		Root:               rendr.Path("tcp-a", rendr.PathSpec{Transport: "test-stream", Address: ln.Addr().String()}),
 		Egress:             "direct",
 		PreserveL3Identity: true,
 	}
-	sess, err := Starter{}.Start(context.Background(), req)
+	starter := &Starter{
+		Runtime: runtime,
+		ConfigureSession: func(_ l3ingress.SessionRequest, config *rendr.SessionConfig) error {
+			config.PreserveL3Identity = false
+			return nil
+		},
+	}
+	sess, err := starter.Start(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +129,8 @@ func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
 		Egress:             "direct",
 		PreserveL3Identity: true,
 	}
-	sess, err := Starter{}.Start(context.Background(), req)
+	starter := &Starter{}
+	sess, err := starter.Start(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +172,8 @@ func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
 }
 
 func TestStarterRejectsUnsupportedRequest(t *testing.T) {
-	_, err := Starter{}.Start(context.Background(), l3ingress.SessionRequest{
+	starter := &Starter{}
+	_, err := starter.Start(context.Background(), l3ingress.SessionRequest{
 		Kind:               l3ingress.SessionKindStream,
 		Identity:           testIdentity(l3ingress.ProtocolTCP),
 		Peer:               "peer-a",
@@ -159,7 +183,7 @@ func TestStarterRejectsUnsupportedRequest(t *testing.T) {
 	})
 	assertReason(t, err, ReasonUnsupportedRoot)
 
-	_, err = Starter{}.Start(context.Background(), l3ingress.SessionRequest{
+	_, err = starter.Start(context.Background(), l3ingress.SessionRequest{
 		Kind:               l3ingress.SessionKind("raw"),
 		Identity:           testIdentity(l3ingress.ProtocolTCP),
 		Peer:               "peer-a",
@@ -168,6 +192,110 @@ func TestStarterRejectsUnsupportedRequest(t *testing.T) {
 		PreserveL3Identity: true,
 	})
 	assertReason(t, err, ReasonUnsupportedKind)
+}
+
+func TestStarterCreatesAndReusesDefaultRuntime(t *testing.T) {
+	starter := &Starter{}
+	first, err := starter.sessionRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := starter.sessionRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || first != second {
+		t.Fatalf("default Runtime was not reused: first=%p second=%p", first, second)
+	}
+}
+
+func TestStarterFailsClosedWhenPeerLacksL3Identity(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	stop := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- servePeerWithoutL3Identity(ln, stop)
+	}()
+
+	starter := &Starter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, startErr := starter.Start(ctx, l3ingress.SessionRequest{
+		Kind:               l3ingress.SessionKindStream,
+		Identity:           testIdentity(l3ingress.ProtocolTCP),
+		Peer:               "peer-a",
+		Root:               rendr.Path("tcp-a", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+		Egress:             "direct",
+		PreserveL3Identity: true,
+	})
+	close(stop)
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	var identityErr *virtualif.Error
+	if !errors.As(startErr, &identityErr) {
+		t.Fatalf("err=%v, want *virtualif.Error", startErr)
+	}
+	if identityErr.Reason != virtualif.ReasonPeerL3IdentityUnsupported {
+		t.Fatalf("reason=%q want %q", identityErr.Reason, virtualif.ReasonPeerL3IdentityUnsupported)
+	}
+}
+
+func servePeerWithoutL3Identity(ln net.Listener, stop <-chan struct{}) error {
+	raw, err := ln.Accept()
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	path := tcp.Wrap(raw)
+	buf := make([]byte, tcp.MaxFrameSize)
+	n, err := path.Read(buf)
+	if err != nil {
+		return err
+	}
+	header, err := proto.DecodeHeader(buf[:proto.HeaderSize])
+	if err != nil {
+		return err
+	}
+	if header.Type != proto.FrameCtrl || proto.CtrlCodeFromFlags(header.Flags) != proto.CtrlHello {
+		return errors.New("test peer: expected HELLO")
+	}
+	hello, err := proto.DecodeHello(buf[proto.HeaderSize:n])
+	if err != nil {
+		return err
+	}
+	ackPayload, err := (proto.HelloAckPayload{
+		Negotiation:          hello.Negotiation,
+		FlowID:               hello.FlowID,
+		InstanceID:           proto.InstanceID{1},
+		Caps:                 0,
+		InitialTargetID:      hello.InitialTargetID,
+		AcceptedPeerBinding:  proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
+		AcceptedPeerTargetID: hello.InitialTargetID,
+		LocalTXManifest:      hello.LocalTXManifest,
+	}).Encode()
+	if err != nil {
+		return err
+	}
+	frame := make([]byte, proto.HeaderSize+len(ackPayload))
+	if err := (proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlHelloAck),
+	}).Encode(frame[:proto.HeaderSize]); err != nil {
+		return err
+	}
+	copy(frame[proto.HeaderSize:], ackPayload)
+	if _, err := path.Write(frame); err != nil {
+		return err
+	}
+	<-stop
+	return nil
 }
 
 func testIdentity(protoNum l3ingress.Protocol) l3ingress.L3Identity {

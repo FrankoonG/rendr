@@ -44,6 +44,15 @@ func (r *pathFactoryResolver) carrierFamily(name string) CarrierFamily {
 	return r.carrier[name]
 }
 
+func (r *pathFactoryResolver) hasFactory(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, stream := r.stream[name]
+	_, packet := r.packet[name]
+	return stream || packet
+}
+
 // dialPath resolves a path against the session snapshot before consulting the
 // process-wide transport registry. The nil receiver is intentional: inbound
 // listener sessions have no caller-provided factories and retain the existing

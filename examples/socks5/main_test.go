@@ -40,6 +40,10 @@ func TestSOCKS5OverRendr(t *testing.T) {
 	}
 	defer socksLn.Close()
 	socksDone := make(chan error, 1)
+	runtime, err := newRendrRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		raw, err := socksLn.Accept()
 		if err != nil {
@@ -47,7 +51,7 @@ func TestSOCKS5OverRendr(t *testing.T) {
 			return
 		}
 		socksDone <- serveSOCKSConn(ctx, raw, func(ctx context.Context) (rendr.Conn, error) {
-			return dialRendr(ctx, rendrLn.Addr().String(), rendrLn.Addr().String())
+			return dialRendr(ctx, runtime, rendrLn.Addr().String(), rendrLn.Addr().String())
 		})
 	}()
 

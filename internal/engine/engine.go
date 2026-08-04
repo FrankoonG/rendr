@@ -88,8 +88,10 @@ type Engine struct {
 	// (each in its own goroutine) when activeID changes. Registered
 	// via OnMigrate; cancelled via the returned cancel function.
 	// Held under pathsMu - same as migrationCount.
-	migrateHooks  map[uint64]func(oldID, newID uint32, cause string)
-	migrateHookID uint64
+	migrateHooks    map[uint64]func(oldID, newID uint32, cause string)
+	migrateHookID   uint64
+	pathDeathHooks  map[uint64]func(PathDeathEvent)
+	pathDeathHookID uint64
 
 	// Path management. activeID == 0 means "no active path".
 	pathsMu      sync.RWMutex
@@ -217,6 +219,16 @@ type Engine struct {
 	gracefulOnce sync.Once
 	gracefulDone chan struct{}
 	gracefulErr  error
+}
+
+// PathDeathEvent is an internal immutable snapshot emitted after one path is
+// removed from the engine. Root wrappers use it to redial the same frozen leaf.
+type PathDeathEvent struct {
+	ID      uint32
+	Spec    transport.PathSpec
+	Binding PathBinding
+	Cause   transport.DeathCause
+	Err     error
 }
 
 // pathSlot tracks one attached path and its reader goroutine.
@@ -1230,6 +1242,39 @@ func (e *Engine) OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel f
 		e.pathsMu.Lock()
 		delete(e.migrateHooks, id)
 		e.pathsMu.Unlock()
+	}
+}
+
+// OnPathDeath registers an internal lifecycle subscriber. Callbacks run in
+// fresh goroutines after pathsMu is released.
+func (e *Engine) OnPathDeath(fn func(PathDeathEvent)) (cancel func()) {
+	if fn == nil {
+		return func() {}
+	}
+	e.pathsMu.Lock()
+	e.pathDeathHookID++
+	id := e.pathDeathHookID
+	if e.pathDeathHooks == nil {
+		e.pathDeathHooks = make(map[uint64]func(PathDeathEvent))
+	}
+	e.pathDeathHooks[id] = fn
+	e.pathsMu.Unlock()
+	return func() {
+		e.pathsMu.Lock()
+		delete(e.pathDeathHooks, id)
+		e.pathsMu.Unlock()
+	}
+}
+
+func (e *Engine) firePathDeathHooks(event PathDeathEvent) {
+	e.pathsMu.RLock()
+	hooks := make([]func(PathDeathEvent), 0, len(e.pathDeathHooks))
+	for _, hook := range e.pathDeathHooks {
+		hooks = append(hooks, hook)
+	}
+	e.pathsMu.RUnlock()
+	for _, hook := range hooks {
+		go hook(event)
 	}
 }
 
