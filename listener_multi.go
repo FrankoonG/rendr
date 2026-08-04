@@ -240,13 +240,14 @@ func (l *MultiListener) handleHello(pc transport.PathConn, transportName string,
 	}
 
 	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, helloPathName(p))
-	if _, err := e.AttachPath(pc, spec); err != nil {
+	_, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
+	if err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), p.InitialTargetID); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -298,10 +299,11 @@ func (l *MultiListener) handleBridgeTag(pc transport.PathConn, transportName str
 		return
 	}
 	spec := specWithTargetName(PathSpec{Transport: transportName, Address: pc.RemoteAddr()}, bridgePathName(e, p))
-	if _, err := e.AttachPath(pc, spec); err != nil {
+	_, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
+	if err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckOK, "")
+	_ = engine.PerformBridgeAckForTarget(pc, p, l.instanceID, localTargetID, proto.AckOK, "")
 }

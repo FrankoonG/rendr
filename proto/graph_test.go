@@ -181,6 +181,15 @@ func TestGraphManifestValidateRejectsInvalidGraphs(t *testing.T) {
 	valid := graphTestManifest()
 	path := graphTestNode(GraphNodeKindPath, "path")
 	group := graphTestNode(GraphNodeKindSelector, "group", path.ID)
+	bondParent := graphTestNode(GraphNodeKindBond, "bond-parent")
+	bondChild := graphTestNode(GraphNodeKindBond, "bond-child", path.ID)
+	bondParent.Children = []TargetID{bondChild.ID}
+	raceParent := graphTestNode(GraphNodeKindRace, "race-parent")
+	raceChild := graphTestNode(GraphNodeKindRace, "race-child", path.ID)
+	raceParent.Children = []TargetID{raceChild.ID}
+	left := graphTestNode(GraphNodeKindSelector, "left", path.ID)
+	right := graphTestNode(GraphNodeKindSelector, "right", path.ID)
+	dagRoot := graphTestNode(GraphNodeKindSelector, "dag-root", left.ID, right.ID)
 
 	deep := makeDepthManifest(GraphManifestMaxDepth + 1)
 	tooMany := make([]GraphNode, GraphManifestMaxNodes+1)
@@ -211,6 +220,9 @@ func TestGraphManifestValidateRejectsInvalidGraphs(t *testing.T) {
 		{name: "path peaks", manifest: GraphManifest{RootID: path.ID, Nodes: []GraphNode{{ID: path.ID, Kind: path.Kind, Name: path.Name, PeakCandidates: []TargetID{path.ID}}}}},
 		{name: "empty group", manifest: GraphManifest{RootID: DeriveTargetID(GraphNodeKindBond, "empty"), Nodes: []GraphNode{graphTestNode(GraphNodeKindBond, "empty")}}},
 		{name: "group weight", manifest: GraphManifest{RootID: group.ID, Nodes: []GraphNode{{ID: group.ID, Kind: group.Kind, Name: group.Name, Weight: 1, Children: group.Children}, path}}},
+		{name: "unnormalized bond", manifest: GraphManifest{RootID: bondParent.ID, Nodes: []GraphNode{bondParent, bondChild, path}}},
+		{name: "unnormalized race", manifest: GraphManifest{RootID: raceParent.ID, Nodes: []GraphNode{raceParent, raceChild, path}}},
+		{name: "multiple parents", manifest: GraphManifest{RootID: dagRoot.ID, Nodes: []GraphNode{dagRoot, left, right, path}}},
 		{name: "peak on race", manifest: nonSelectorPeakManifest()},
 		{name: "duplicate peak", manifest: duplicatePeakManifest()},
 		{name: "peak not child", manifest: nonChildPeakManifest()},

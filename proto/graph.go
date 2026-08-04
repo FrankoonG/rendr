@@ -194,17 +194,26 @@ func (m GraphManifest) Validate() error {
 		return fmt.Errorf("proto: graph root %x does not identify a node", m.RootID)
 	}
 
+	parents := make(map[TargetID]TargetID, len(m.Nodes)-1)
 	for i := range m.Nodes {
 		node := &m.Nodes[i]
 		children := make(map[TargetID]struct{}, len(node.Children))
 		for _, childID := range node.Children {
-			if _, exists := byID[childID]; !exists {
+			child, exists := byID[childID]
+			if !exists {
 				return fmt.Errorf("proto: graph node %q references missing child %x", node.Name, childID)
 			}
 			if _, duplicate := children[childID]; duplicate {
 				return fmt.Errorf("proto: graph node %q repeats child %x", node.Name, childID)
 			}
 			children[childID] = struct{}{}
+			if previous, duplicate := parents[childID]; duplicate {
+				return fmt.Errorf("proto: graph target %q has multiple parents %q and %q", child.Name, byID[previous].Name, node.Name)
+			}
+			parents[childID] = node.ID
+			if (node.Kind == GraphNodeKindBond || node.Kind == GraphNodeKindRace) && child.Kind == node.Kind {
+				return fmt.Errorf("proto: %s node %q contains unnormalized %s child %q", node.Kind, node.Name, child.Kind, child.Name)
+			}
 		}
 		peaks := make(map[TargetID]struct{}, len(node.PeakCandidates))
 		for _, peakID := range node.PeakCandidates {
@@ -216,6 +225,9 @@ func (m GraphManifest) Validate() error {
 				return fmt.Errorf("proto: selector node %q peak candidate %x is not an immediate child", node.Name, peakID)
 			}
 		}
+	}
+	if _, hasParent := parents[m.RootID]; hasParent {
+		return fmt.Errorf("proto: graph root %q must not have a parent", byID[m.RootID].Name)
 	}
 
 	const (

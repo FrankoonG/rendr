@@ -9,6 +9,7 @@ import (
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 	"github.com/FrankoonG/rendr/transport/tcp"
 )
 
@@ -177,13 +178,14 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	}
 
 	spec := specFromAddrName(pc.RemoteAddr(), helloPathName(p))
-	if _, err := e.AttachPath(pc, spec); err != nil {
+	_, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
+	if err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), p.InitialTargetID); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -240,12 +242,29 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		return
 	}
 	spec := specFromAddrName(pc.RemoteAddr(), bridgePathName(e, p))
-	if _, err := e.AttachPath(pc, spec); err != nil {
+	_, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
+	if err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckOK, "")
+	_ = engine.PerformBridgeAckForTarget(pc, p, l.instanceID, localTargetID, proto.AckOK, "")
+}
+
+func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID) (uint32, proto.TargetID, error) {
+	peerName, err := e.PeerPathName(peerTargetID)
+	if err != nil {
+		return 0, proto.TargetID{}, err
+	}
+	localTargetID, err := e.LocalPathTargetID(peerName)
+	if err != nil {
+		return 0, proto.TargetID{}, err
+	}
+	id, err := e.AttachPathBound(pc, spec, engine.PathBinding{
+		LocalTXTargetID: localTargetID,
+		PeerTXTargetID:  peerTargetID,
+	})
+	return id, localTargetID, err
 }
 
 // waitBridgeArrival polls the bridge table for flow_id up to total,

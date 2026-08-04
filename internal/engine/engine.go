@@ -212,11 +212,13 @@ type Engine struct {
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
-	id       uint32
-	gen      uint64
-	conn     transport.PathConn
-	spec     transport.PathSpec
-	attached time.Time
+	id              uint32
+	gen             uint64
+	conn            transport.PathConn
+	spec            transport.PathSpec
+	localTXTargetID proto.TargetID
+	peerTXTargetID  proto.TargetID
+	attached        time.Time
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
@@ -411,8 +413,26 @@ func (e *Engine) setState(s BridgeState) { e.state.Store(uint32(s)) }
 // If no path was previously active, the new path becomes active.
 // AttachPath spawns the per-path reader goroutine.
 func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uint32, error) {
+	binding, err := e.InferPathBinding(spec)
+	if err != nil {
+		if pc != nil {
+			_ = pc.Close()
+		}
+		return 0, err
+	}
+	return e.AttachPathBound(pc, spec, binding)
+}
+
+// AttachPathBound registers a path with its independently negotiated sender
+// graph leaves. Binding validation happens before any path ID, callback, or
+// goroutine is allocated.
+func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
 	if pc == nil {
 		return 0, errors.New("engine: nil PathConn")
+	}
+	if err := e.validatePathBinding(binding); err != nil {
+		_ = pc.Close()
+		return 0, err
 	}
 	e.pathsMu.Lock()
 	defer e.pathsMu.Unlock()
@@ -434,14 +454,16 @@ func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uin
 		recvQSize = 1024
 	}
 	slot := &pathSlot{
-		id:       id,
-		gen:      e.nextPathGenerationLocked(),
-		conn:     pc,
-		spec:     spec,
-		attached: time.Now(),
-		recvQ:    make(chan recvFrame, recvQSize),
-		quit:     make(chan struct{}),
-		doneR:    make(chan struct{}),
+		id:              id,
+		gen:             e.nextPathGenerationLocked(),
+		conn:            pc,
+		spec:            spec,
+		localTXTargetID: binding.LocalTXTargetID,
+		peerTXTargetID:  binding.PeerTXTargetID,
+		attached:        time.Now(),
+		recvQ:           make(chan recvFrame, recvQSize),
+		quit:            make(chan struct{}),
+		doneR:           make(chan struct{}),
 	}
 	e.paths[id] = slot
 

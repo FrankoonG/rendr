@@ -5,7 +5,17 @@ import (
 	"sync/atomic"
 
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 )
+
+// PathBinding records which leaf a physical path represents in each sender's
+// immutable graph. The two identities are intentionally independent: a
+// full-duplex carrier can have different names and graph positions in each
+// direction.
+type PathBinding struct {
+	LocalTXTargetID proto.TargetID
+	PeerTXTargetID  proto.TargetID
+}
 
 // graphBinding identifies one direction's immutable sender graph. A session
 // has two bindings because each peer owns its own transmit policy graph.
@@ -137,6 +147,72 @@ func (e *Engine) PeerPathName(id proto.TargetID) (string, error) {
 		return "", fmt.Errorf("engine: target is not a path in the peer graph")
 	}
 	return node.Name, nil
+}
+
+func (e *Engine) PeerPathTargetID(name string) (proto.TargetID, error) {
+	binding := e.peerGraphBinding()
+	if !binding.configured {
+		return proto.TargetID{}, fmt.Errorf("engine: peer graph is not configured")
+	}
+	node, ok := binding.manifest.NodeByName(name)
+	if !ok || node.Kind != proto.GraphNodeKindPath {
+		return proto.TargetID{}, fmt.Errorf("engine: %q is not a path in the peer graph", name)
+	}
+	return node.ID, nil
+}
+
+// InferPathBinding is retained for engine-level tests and symmetric graph
+// callers. Handshake code should pass the two negotiated IDs explicitly.
+func (e *Engine) InferPathBinding(spec transport.PathSpec) (PathBinding, error) {
+	name := ""
+	if spec.Opts != nil {
+		name = spec.Opts["name"]
+	}
+	local := e.localGraphBinding()
+	peer := e.peerGraphBinding()
+	if !local.configured && !peer.configured {
+		return PathBinding{}, nil
+	}
+	if name == "" {
+		return PathBinding{}, fmt.Errorf("engine: configured graph path has no target name")
+	}
+	var out PathBinding
+	var err error
+	if local.configured {
+		out.LocalTXTargetID, err = e.LocalPathTargetID(name)
+		if err != nil {
+			return PathBinding{}, err
+		}
+	}
+	if peer.configured {
+		out.PeerTXTargetID, err = e.PeerPathTargetID(name)
+		if err != nil {
+			return PathBinding{}, err
+		}
+	}
+	return out, nil
+}
+
+func (e *Engine) validatePathBinding(binding PathBinding) error {
+	local := e.localGraphBinding()
+	if local.configured {
+		node, ok := local.manifest.Node(binding.LocalTXTargetID)
+		if !ok || node.Kind != proto.GraphNodeKindPath {
+			return fmt.Errorf("engine: local TX target is not a path in the bound graph")
+		}
+	} else if binding.LocalTXTargetID != (proto.TargetID{}) {
+		return fmt.Errorf("engine: local TX target supplied without a local graph")
+	}
+	peer := e.peerGraphBinding()
+	if peer.configured {
+		node, ok := peer.manifest.Node(binding.PeerTXTargetID)
+		if !ok || node.Kind != proto.GraphNodeKindPath {
+			return fmt.Errorf("engine: peer TX target is not a path in the bound graph")
+		}
+	} else if binding.PeerTXTargetID != (proto.TargetID{}) {
+		return fmt.Errorf("engine: peer TX target supplied without a peer graph")
+	}
+	return nil
 }
 
 // AcceptPeerNegotiation validates the peer's directional declaration and

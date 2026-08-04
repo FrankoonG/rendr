@@ -138,7 +138,13 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	e.SetPeerInstanceID(ack.InstanceID)
-	firstID, err := e.AttachPath(pc, first)
+	firstBinding, err := negotiatedPathBinding(e, pathSpecName(first), ack.InitialTargetID)
+	if err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return nil, err
+	}
+	firstID, err := e.AttachPathBound(pc, first, firstBinding)
 	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
@@ -225,7 +231,13 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	e.SetPeerInstanceID(ack.InstanceID)
-	firstID, err := e.AttachPath(pc, first)
+	firstBinding, err := negotiatedPathBinding(e, pathSpecName(first), ack.InitialTargetID)
+	if err != nil {
+		_ = pc.Close()
+		_ = e.Close()
+		return nil, err
+	}
+	firstID, err := e.AttachPathBound(pc, first, firstBinding)
 	if err != nil {
 		_ = pc.Close()
 		_ = e.Close()
@@ -419,12 +431,19 @@ func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathS
 		return 0, err
 	}
 	tracker.set(index, PathHandshaking, nil)
-	if _, err := engine.PerformClientBridgeTagAck(spc, e, pathSpecName(ps)); err != nil {
+	ack, err := engine.PerformClientBridgeTagAck(spc, e, pathSpecName(ps))
+	if err != nil {
 		_ = spc.Close()
 		tracker.set(index, pathStateForHandshakeError(err), err)
 		return 0, err
 	}
-	id, err := e.AttachPath(spc, ps)
+	binding, err := negotiatedPathBinding(e, pathSpecName(ps), ack.ResponderTargetID)
+	if err != nil {
+		_ = spc.Close()
+		tracker.set(index, PathUnavailable, err)
+		return 0, err
+	}
+	id, err := e.AttachPathBound(spc, ps, binding)
 	if err != nil {
 		_ = spc.Close()
 		tracker.set(index, PathUnavailable, err)
@@ -432,6 +451,17 @@ func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathS
 	}
 	tracker.set(index, PathAttached, nil)
 	return id, nil
+}
+
+func negotiatedPathBinding(e *engine.Engine, localName string, peerTargetID proto.TargetID) (engine.PathBinding, error) {
+	localTargetID, err := e.LocalPathTargetID(localName)
+	if err != nil {
+		return engine.PathBinding{}, err
+	}
+	if _, err := e.PeerPathName(peerTargetID); err != nil {
+		return engine.PathBinding{}, err
+	}
+	return engine.PathBinding{LocalTXTargetID: localTargetID, PeerTXTargetID: peerTargetID}, nil
 }
 
 func pathStateForHandshakeError(err error) PathState {

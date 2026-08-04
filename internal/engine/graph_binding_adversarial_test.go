@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 )
 
 func adversarialGraphManifest(rootName string, rootKind proto.GraphNodeKind, leafNames ...string) (proto.GraphManifest, []proto.TargetID) {
@@ -96,6 +97,60 @@ func TestDirectionalGraphBindingsRemainAsymmetric(t *testing.T) {
 	}
 	if localNegotiation.GraphDigest == peerBinding.digest {
 		t.Fatal("engine mirrored one direction's graph into the other")
+	}
+}
+
+func TestAttachPathBoundPreservesDirectionalLeafIdentity(t *testing.T) {
+	flow := [16]byte{0x32}
+	e := New(SideClient, flow, Limits{}.Clamp())
+	defer e.Close()
+	local, localLeaves := adversarialGraphManifest("client-selector", proto.GraphNodeKindSelector, "client-a")
+	peer, peerLeaves := adversarialGraphManifest("server-race", proto.GraphNodeKindRace, "server-z")
+	if err := e.ConfigureLocalGraph(7, local); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(13, peer); err != nil {
+		t.Fatal(err)
+	}
+
+	clientPath, serverPath := newMemoryPathPair()
+	defer serverPath.Close()
+	id, err := e.AttachPathBound(clientPath, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: localLeaves[0],
+		PeerTXTargetID:  peerLeaves[0],
+	})
+	if err != nil {
+		t.Fatalf("AttachPathBound: %v", err)
+	}
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	e.pathsMu.RUnlock()
+	if slot == nil || slot.localTXTargetID != localLeaves[0] || slot.peerTXTargetID != peerLeaves[0] {
+		t.Fatalf("directional binding = %+v, want local=%x peer=%x", slot, localLeaves[0], peerLeaves[0])
+	}
+}
+
+func TestAttachPathBoundRejectsForeignLeafBeforeAllocation(t *testing.T) {
+	manifest, leaves := adversarialGraphManifest("root", proto.GraphNodeKindSelector, "a")
+	e := New(SideClient, [16]byte{0x33}, Limits{}.Clamp())
+	defer e.Close()
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	clientPath, serverPath := newMemoryPathPair()
+	defer serverPath.Close()
+	_, err := e.AttachPathBound(clientPath, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: proto.DeriveTargetID(proto.GraphNodeKindPath, "foreign"),
+		PeerTXTargetID:  leaves[0],
+	})
+	if err == nil {
+		t.Fatal("accepted a local leaf outside the immutable graph")
+	}
+	if got := len(e.Paths()); got != 0 {
+		t.Fatalf("invalid binding allocated %d path(s)", got)
 	}
 }
 

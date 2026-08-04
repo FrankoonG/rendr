@@ -140,11 +140,17 @@ func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 		_ = pc.Close()
 		return 0, err
 	}
-	if _, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec)); err != nil {
+	ack, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec))
+	if err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
-	id, err := c.e.AttachPath(pc, spec)
+	binding, err := negotiatedPathBinding(c.e, pathSpecName(spec), ack.ResponderTargetID)
+	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	id, err := c.e.AttachPathBound(pc, spec, binding)
 	if err != nil {
 		_ = pc.Close()
 		return 0, err

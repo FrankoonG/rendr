@@ -114,6 +114,13 @@ func PerformHelloAck(pc transport.PathConn, e *Engine, instanceID proto.Instance
 }
 
 func PerformBridgeAck(pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, code proto.AckCode, reason string) error {
+	return PerformBridgeAckForTarget(pc, tag, instanceID, tag.TargetID, code, reason)
+}
+
+// PerformBridgeAckForTarget acknowledges an attached full-duplex carrier and
+// declares the independently selected responder-TX leaf. Rejection paths may
+// use PerformBridgeAck because the responder identity is ignored unless OK.
+func PerformBridgeAckForTarget(pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, responderTargetID proto.TargetID, code proto.AckCode, reason string) error {
 	payload := proto.BridgeAckPayload{
 		BridgeID:          tag.BridgeID,
 		AttachID:          tag.AttachID,
@@ -123,7 +130,7 @@ func PerformBridgeAck(pc transport.PathConn, tag proto.BridgeTagPayload, instanc
 		GraphRevision:     tag.GraphRevision,
 		GraphDigest:       tag.GraphDigest,
 		TargetID:          tag.TargetID,
-		ResponderTargetID: tag.TargetID,
+		ResponderTargetID: responderTargetID,
 		Code:              code,
 		Reason:            reason,
 	}.Encode()
