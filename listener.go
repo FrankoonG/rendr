@@ -185,7 +185,7 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -242,13 +242,13 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		return
 	}
 	spec := specFromAddrName(pc.RemoteAddr(), bridgePathName(e, p))
-	_, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
+	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
 	if err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAckForTarget(pc, p, l.instanceID, localTargetID, proto.AckOK, "")
+	_ = acknowledgeServerPath(e, pathID, pc, p, l.instanceID, localTargetID)
 }
 
 func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID) (uint32, proto.TargetID, error) {
@@ -265,6 +265,14 @@ func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, pe
 		PeerTXTargetID:  peerTargetID,
 	})
 	return id, localTargetID, err
+}
+
+func acknowledgeServerPath(e *engine.Engine, pathID uint32, pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, localTargetID proto.TargetID) error {
+	if err := engine.PerformBridgeAckForTarget(pc, tag, instanceID, localTargetID, proto.AckOK, ""); err != nil {
+		e.AbortPathAttach(pathID, err)
+		return err
+	}
+	return nil
 }
 
 // waitBridgeArrival polls the bridge table for flow_id up to total,

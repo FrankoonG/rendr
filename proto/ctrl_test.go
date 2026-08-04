@@ -134,13 +134,14 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 func TestHelloAckRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	want := HelloAckPayload{
-		Negotiation:         testNegotiation(flow),
-		FlowID:              flow,
-		InstanceID:          InstanceID{5, 6, 7, 8},
-		Caps:                0xAABB_CCDD,
-		InitialTargetID:     testGraphManifest("path").RootID,
-		AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiation(flow).GraphDigest},
-		LocalTXManifest:     testGraphManifest("path"),
+		Negotiation:          testNegotiation(flow),
+		FlowID:               flow,
+		InstanceID:           InstanceID{5, 6, 7, 8},
+		Caps:                 0xAABB_CCDD,
+		InitialTargetID:      testGraphManifest("path").RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: 1, Digest: testNegotiation(flow).GraphDigest},
+		AcceptedPeerTargetID: testGraphManifest("path").RootID,
+		LocalTXManifest:      testGraphManifest("path"),
 	}
 	wire := mustHelloAckWire(t, want)
 	got, err := DecodeHelloAck(wire)
@@ -332,7 +333,7 @@ func TestFixedPayloadsRejectTrailingBytes(t *testing.T) {
 		{"hello_ack", func() []byte {
 			flow := [16]byte{1}
 			manifest := testGraphManifest("path")
-			return mustHelloAckWire(t, HelloAckPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiationFor(flow, manifest).GraphDigest}, LocalTXManifest: manifest})
+			return mustHelloAckWire(t, HelloAckPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiationFor(flow, manifest).GraphDigest}, AcceptedPeerTargetID: manifest.RootID, LocalTXManifest: manifest})
 		}(), func(b []byte) bool { _, err := DecodeHelloAck(b); return err == nil }},
 		{"migrate_notify", MigrateNotifyPayload{}.Encode(), func(b []byte) bool { _, err := DecodeMigrateNotify(b); return err == nil }},
 		{"path_quality", PathQualityPayload{}.Encode(), func(b []byte) bool { _, err := DecodePathQuality(b); return err == nil }},
@@ -613,7 +614,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("0001000200000000000000000000001f000000000000001f00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("0001000300000000000000000000007f000000000000007f00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

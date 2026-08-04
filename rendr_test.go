@@ -1525,10 +1525,13 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 	}
 
 	for _, p := range probes {
+		deadline := time.Now().Add(time.Second)
+		for p.writer.Writes()-p.base < uint64(N) && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
 		got := p.writer.Writes() - p.base
-		// Race must put at least N frames on each path; >= because
-		// the engine may also have sent ctrl frames (probe etc) that
-		// flow on a single path.
+		// Race returns after the first successful child, but every admitted
+		// replica must still complete asynchronously on a healthy path.
 		if got < uint64(N) {
 			t.Errorf("path %d saw %d writes, want >= %d", p.id, got, N)
 		}

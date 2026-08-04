@@ -27,14 +27,20 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 2 {
-		t.Fatalf("protocol minor=%d want=2", ProtocolMinor)
+	if ProtocolMinor != 3 {
+		t.Fatalf("protocol minor=%d want=3", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
 	}
 	if SupportedFeatures&FeaturePolicyReservation == 0 || RequiredFeatures&FeaturePolicyReservation == 0 {
 		t.Fatal("policy reservation feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeatureDirectionalPathBinding == 0 || RequiredFeatures&FeatureDirectionalPathBinding == 0 {
+		t.Fatal("directional path binding feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeatureRecursiveExecutor == 0 || RequiredFeatures&FeatureRecursiveExecutor == 0 {
+		t.Fatal("recursive executor feature is not required by negotiation")
 	}
 }
 

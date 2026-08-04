@@ -46,6 +46,9 @@ func PerformClientHelloAck(pc transport.PathConn, e *Engine, instanceID proto.In
 	if ack.AcceptedPeerBinding.Revision != local.revision || ack.AcceptedPeerBinding.Digest != local.digest {
 		return proto.HelloAckPayload{}, fmt.Errorf("engine: HELLO_ACK did not accept local graph binding")
 	}
+	if ack.AcceptedPeerTargetID != targetID {
+		return proto.HelloAckPayload{}, fmt.Errorf("engine: HELLO_ACK accepted a different local target")
+	}
 	if err := e.AcceptPeerNegotiation(ack.Negotiation, ack.LocalTXManifest); err != nil {
 		return proto.HelloAckPayload{}, err
 	}
@@ -96,16 +99,17 @@ func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (p
 	return ack, nil
 }
 
-func PerformHelloAck(pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32, localTargetID proto.TargetID) error {
+func PerformHelloAck(pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32, localTargetID, acceptedPeerTargetID proto.TargetID) error {
 	peer := e.peerGraphBinding()
 	payload, err := (proto.HelloAckPayload{
-		Negotiation:         e.LocalNegotiation(),
-		FlowID:              e.FlowID(),
-		InstanceID:          instanceID,
-		Caps:                caps,
-		InitialTargetID:     localTargetID,
-		AcceptedPeerBinding: proto.GraphBinding{Revision: peer.revision, Digest: peer.digest},
-		LocalTXManifest:     e.LocalGraphManifest(),
+		Negotiation:          e.LocalNegotiation(),
+		FlowID:               e.FlowID(),
+		InstanceID:           instanceID,
+		Caps:                 caps,
+		InitialTargetID:      localTargetID,
+		AcceptedPeerBinding:  proto.GraphBinding{Revision: peer.revision, Digest: peer.digest},
+		AcceptedPeerTargetID: acceptedPeerTargetID,
+		LocalTXManifest:      e.LocalGraphManifest(),
 	}).Encode()
 	if err != nil {
 		return err

@@ -192,13 +192,14 @@ func TestDialPacketRejectsHelloAckWithoutPacketCapability(t *testing.T) {
 		}
 
 		ackPayload, err := (proto.HelloAckPayload{
-			Negotiation:         hello.Negotiation,
-			FlowID:              hello.FlowID,
-			InstanceID:          proto.InstanceID{1},
-			Caps:                0,
-			InitialTargetID:     hello.InitialTargetID,
-			AcceptedPeerBinding: proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
-			LocalTXManifest:     hello.LocalTXManifest,
+			Negotiation:          hello.Negotiation,
+			FlowID:               hello.FlowID,
+			InstanceID:           proto.InstanceID{1},
+			Caps:                 0,
+			InitialTargetID:      hello.InitialTargetID,
+			AcceptedPeerBinding:  proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
+			AcceptedPeerTargetID: hello.InitialTargetID,
+			LocalTXManifest:      hello.LocalTXManifest,
 		}).Encode()
 		if err != nil {
 			return nil, err

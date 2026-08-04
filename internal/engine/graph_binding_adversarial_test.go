@@ -154,6 +154,40 @@ func TestAttachPathBoundRejectsForeignLeafBeforeAllocation(t *testing.T) {
 	}
 }
 
+func TestAttachPathBoundRejectsDuplicateDirectionalLeaf(t *testing.T) {
+	manifest, leaves := adversarialGraphManifest("root", proto.GraphNodeKindSelector, "a", "b")
+	e := New(SideClient, [16]byte{0x34}, Limits{}.Clamp())
+	defer e.Close()
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	first, firstPeer := newMemoryPathPair()
+	defer firstPeer.Close()
+	if _, err := e.AttachPathBound(first, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: leaves[0], PeerTXTargetID: leaves[0],
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []PathBinding{
+		{LocalTXTargetID: leaves[0], PeerTXTargetID: leaves[1]},
+		{LocalTXTargetID: leaves[1], PeerTXTargetID: leaves[0]},
+	}
+	for _, binding := range tests {
+		candidate, peer := newMemoryPathPair()
+		if _, err := e.AttachPathBound(candidate, transport.PathSpec{Transport: "memory"}, binding); err == nil {
+			t.Fatal("accepted duplicate live directional leaf binding")
+		}
+		_ = peer.Close()
+	}
+	if got := len(e.Paths()); got != 1 {
+		t.Fatalf("duplicate binding allocated paths: %d", got)
+	}
+}
+
 func TestConfigureLocalAndPeerGraphsAreImmutable(t *testing.T) {
 	base, _ := adversarialGraphManifest("base-root", proto.GraphNodeKindSelector, "base-a", "base-b")
 	different, _ := adversarialGraphManifest("different-root", proto.GraphNodeKindBond, "different-a", "different-b")
@@ -196,13 +230,15 @@ func TestPerformClientHelloAckRequiresAcceptedPeerBindingEcho(t *testing.T) {
 	serverDigest := adversarialGraphDigest(t, serverManifest)
 
 	tests := []struct {
-		name       string
-		mutateEcho func(*proto.GraphBinding)
-		wantErr    bool
+		name                 string
+		mutateEcho           func(*proto.GraphBinding)
+		acceptedPeerTargetID proto.TargetID
+		wantErr              bool
 	}{
 		{name: "exact echo"},
 		{name: "wrong revision", wantErr: true, mutateEcho: func(binding *proto.GraphBinding) { binding.Revision++ }},
 		{name: "wrong digest", wantErr: true, mutateEcho: func(binding *proto.GraphBinding) { binding.Digest[0] ^= 0xff }},
+		{name: "wrong accepted target", acceptedPeerTargetID: clientLeaves[1], wantErr: true},
 	}
 
 	for _, tc := range tests {
@@ -243,13 +279,18 @@ func TestPerformClientHelloAckRequiresAcceptedPeerBindingEcho(t *testing.T) {
 				serverNegotiation := proto.NewNegotiation(proto.SessionEpoch(flow))
 				serverNegotiation.GraphRevision = 23
 				serverNegotiation.GraphDigest = serverDigest
+				acceptedTargetID := tc.acceptedPeerTargetID
+				if acceptedTargetID == (proto.TargetID{}) {
+					acceptedTargetID = clientLeaves[0]
+				}
 				ack := proto.HelloAckPayload{
-					Negotiation:         serverNegotiation,
-					FlowID:              flow,
-					InstanceID:          serverInstance,
-					LocalTXManifest:     serverManifest,
-					InitialTargetID:     serverLeaves[0],
-					AcceptedPeerBinding: echo,
+					Negotiation:          serverNegotiation,
+					FlowID:               flow,
+					InstanceID:           serverInstance,
+					LocalTXManifest:      serverManifest,
+					InitialTargetID:      serverLeaves[0],
+					AcceptedPeerBinding:  echo,
+					AcceptedPeerTargetID: acceptedTargetID,
 				}
 				ackWire, err := ack.Encode()
 				if err != nil {

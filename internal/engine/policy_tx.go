@@ -792,6 +792,13 @@ func (e *Engine) applyPolicySelectionFromGraph(binding graphBinding, selectorID,
 	if err := validatePolicySelection(binding.manifest, selectorID, targetID); err != nil {
 		return err
 	}
+	runtime := e.localExecutionRuntime()
+	if runtime == nil || runtime.plan == nil {
+		return fmt.Errorf("engine: local execution runtime is not configured")
+	}
+	if err := runtime.plan.validateImmediateChild(selectorID, targetID); err != nil {
+		return err
+	}
 	target, _ := binding.manifest.Node(targetID)
 	kind := proto.ExecutionKindSelector
 	switch target.Kind {
@@ -805,29 +812,28 @@ func (e *Engine) applyPolicySelectionFromGraph(binding graphBinding, selectorID,
 		return fmt.Errorf("engine: unsupported policy target kind %s", target.Kind)
 	}
 
-	leafNames := make([]string, 0)
-	if err := collectGraphLeafNames(binding.manifest, targetID, &leafNames); err != nil {
-		return err
+	leaves, ok := runtime.plan.leafDescendants(targetID)
+	if !ok {
+		return fmt.Errorf("engine: selected target has no path descendants")
 	}
 	e.pathsMu.RLock()
-	byName := make(map[string]uint32, len(e.paths))
+	attached := make(map[proto.TargetID]uint32, len(e.paths))
 	for id, slot := range e.paths {
-		name := pathSlotName(slot)
-		if name != "" {
-			byName[name] = id
+		if previous := attached[slot.localTXTargetID]; previous == 0 || id > previous {
+			attached[slot.localTXTargetID] = id
 		}
 	}
-	e.pathsMu.RUnlock()
-	scope := make([]uint32, 0, len(leafNames))
-	for _, name := range leafNames {
-		if id := byName[name]; id != 0 {
+	scope := make([]uint32, 0, len(leaves))
+	for _, leaf := range leaves {
+		if id := attached[leaf.targetID]; id != 0 {
 			scope = append(scope, id)
 		}
 	}
+	e.pathsMu.RUnlock()
 	if len(scope) == 0 {
 		return fmt.Errorf("engine: selected target has no attached path")
 	}
-	return e.setDispatchPolicy(kind, scope[0], scope, cause)
+	return e.setDispatchPolicyAndSelection(kind, scope[0], scope, cause, runtime, selectorID, targetID)
 }
 
 func collectGraphLeafNames(manifest proto.GraphManifest, id proto.TargetID, names *[]string) error {

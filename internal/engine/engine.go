@@ -52,6 +52,7 @@ type Engine struct {
 	graphMu       sync.RWMutex
 	localGraph    graphBinding
 	peerGraph     graphBinding
+	localExec     *executionRuntime
 	attachMu      sync.Mutex
 	seenAttach    map[[16]byte]struct{}
 	created       time.Time
@@ -259,10 +260,14 @@ type pathSlot struct {
 	bondSendRing [][]byte
 	bondSendNext int
 	bondSendFull bool
+	dispatchMu   sync.Mutex
+	dispatchQ    chan pathDispatchJob
+	dispatchDead bool
 
 	quit     chan struct{}
 	quitOnce sync.Once
 	doneR    chan struct{} // closed when reader goroutine exits
+	doneW    chan struct{} // closed when data writer goroutine exits
 }
 
 type pathAckWrite struct {
@@ -301,7 +306,12 @@ func (s *pathSlot) recordDispatch(frame []byte) {
 // (Engine.Close, onPathDeath, an explicit migration tear-down) can
 // all signal a slot to exit without panicking on a double close.
 func (s *pathSlot) closeQuit() {
-	s.quitOnce.Do(func() { close(s.quit) })
+	s.quitOnce.Do(func() {
+		s.dispatchMu.Lock()
+		s.dispatchDead = true
+		s.dispatchMu.Unlock()
+		close(s.quit)
+	})
 }
 
 // New constructs an engine. flowID is the connection identifier; on
@@ -441,6 +451,23 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 		_ = pc.Close()
 		return 0, net.ErrClosed
 	}
+	for _, existing := range e.paths {
+		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
+		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
+		if sameLocal && samePeer {
+			// Make-before-break recovery may briefly attach two physical
+			// carriers for the same logical directional leaf pair.
+			continue
+		}
+		if sameLocal {
+			_ = pc.Close()
+			return 0, fmt.Errorf("engine: local TX target is already paired with another peer target")
+		}
+		if samePeer {
+			_ = pc.Close()
+			return 0, fmt.Errorf("engine: peer TX target is already paired with another local target")
+		}
+	}
 
 	e.nextPathID++
 	id := e.nextPathID
@@ -462,8 +489,10 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 		peerTXTargetID:  binding.PeerTXTargetID,
 		attached:        time.Now(),
 		recvQ:           make(chan recvFrame, recvQSize),
+		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
 		quit:            make(chan struct{}),
 		doneR:           make(chan struct{}),
+		doneW:           make(chan struct{}),
 	}
 	e.paths[id] = slot
 
@@ -480,6 +509,7 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 	}
 
 	go e.readerLoop(slot)
+	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
 	return id, nil
 }
@@ -617,9 +647,12 @@ func (e *Engine) recordPathPolicyDecision(id uint32) {
 	}
 	e.pathsMu.RLock()
 	slot := e.paths[id]
-	name := pathSlotName(slot)
+	targetID := proto.TargetID{}
+	if slot != nil {
+		targetID = slot.localTXTargetID
+	}
 	e.pathsMu.RUnlock()
-	node, ok := binding.manifest.NodeByName(name)
+	node, ok := binding.manifest.Node(targetID)
 	if !ok || node.Kind != proto.GraphNodeKindPath {
 		return
 	}
@@ -834,6 +867,18 @@ func (e *Engine) Mode() uint32 { return e.mode.Load() }
 // boundary. Callers must own policyOwnerMu when this is a runtime decision;
 // initialization runs before the engine is exposed to the application.
 func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scope []uint32, cause string) error {
+	return e.setDispatchPolicyAndSelection(kind, active, scope, cause, nil, proto.TargetID{}, proto.TargetID{})
+}
+
+func (e *Engine) setDispatchPolicyAndSelection(
+	kind proto.ExecutionKind,
+	active uint32,
+	scope []uint32,
+	cause string,
+	runtime *executionRuntime,
+	selectorID proto.TargetID,
+	targetID proto.TargetID,
+) error {
 	mode, ok := dispatchForExecutionKind(kind)
 	if !ok {
 		return fmt.Errorf("engine: invalid execution kind %d", kind)
@@ -859,6 +904,12 @@ func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scop
 		if _, ok := e.paths[active]; !ok {
 			e.pathsMu.Unlock()
 			return fmt.Errorf("engine: policy activates unknown path %d", active)
+		}
+	}
+	if runtime != nil {
+		if err := runtime.selectChild(selectorID, targetID); err != nil {
+			e.pathsMu.Unlock()
+			return err
 		}
 	}
 	oldID := e.activeID
@@ -892,13 +943,6 @@ func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scop
 		e.fireMigrateHooks(oldID, newID, cause)
 	}
 	return nil
-}
-
-func pathSlotName(slot *pathSlot) string {
-	if slot == nil || slot.spec.Opts == nil {
-		return ""
-	}
-	return slot.spec.Opts["name"]
 }
 
 // SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
@@ -1005,8 +1049,12 @@ const defaultBondPinSize = 8
 // firing in production.
 func (e *Engine) BondStuckSkips() uint64 {
 	e.pathsMu.RLock()
-	defer e.pathsMu.RUnlock()
-	return e.bondStuckSkips
+	legacy := e.bondStuckSkips
+	e.pathsMu.RUnlock()
+	if runtime := e.localExecutionRuntime(); runtime != nil {
+		return legacy + runtime.stuckSkips.Load()
+	}
+	return legacy
 }
 
 // MigrationCount returns the cumulative number of active-path
@@ -1243,6 +1291,18 @@ func (e *Engine) ForceKillPathForTest(id uint32) error {
 	err := slot.conn.Close()
 	e.onPathDeath(id, slot.gen, transport.CauseTransportError, err)
 	return err
+}
+
+// AbortPathAttach rolls back a path that was locally attached but whose
+// handshake acknowledgement could not be delivered. The generation check in
+// onPathDeath makes this safe against a concurrent transport callback.
+func (e *Engine) AbortPathAttach(id uint32, cause error) {
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	e.pathsMu.RUnlock()
+	if slot != nil {
+		e.onPathDeath(id, slot.gen, transport.CauseTransportError, cause)
+	}
 }
 
 func (e *Engine) setCloseErr(err error) {

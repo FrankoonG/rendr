@@ -30,19 +30,21 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 2
+	ProtocolMinor uint16 = 3
 )
 
 type FeatureSet uint64
 
 const (
-	FeatureReplayLedger      FeatureSet = 1 << 0
-	FeatureDirectionalACK    FeatureSet = 1 << 1
-	FeatureStrictDecode      FeatureSet = 1 << 2
-	FeaturePolicyTransaction FeatureSet = 1 << 3
-	FeaturePolicyReservation FeatureSet = 1 << 4
+	FeatureReplayLedger           FeatureSet = 1 << 0
+	FeatureDirectionalACK         FeatureSet = 1 << 1
+	FeatureStrictDecode           FeatureSet = 1 << 2
+	FeaturePolicyTransaction      FeatureSet = 1 << 3
+	FeaturePolicyReservation      FeatureSet = 1 << 4
+	FeatureDirectionalPathBinding FeatureSet = 1 << 5
+	FeatureRecursiveExecutor      FeatureSet = 1 << 6
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -394,15 +396,16 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 
 type HelloAckPayload struct {
 	Negotiation
-	FlowID              [16]byte
-	InstanceID          InstanceID
-	Caps                uint32
-	InitialTargetID     TargetID
-	AcceptedPeerBinding GraphBinding
-	LocalTXManifest     GraphManifest
+	FlowID               [16]byte
+	InstanceID           InstanceID
+	Caps                 uint32
+	InitialTargetID      TargetID
+	AcceptedPeerBinding  GraphBinding
+	AcceptedPeerTargetID TargetID
+	LocalTXManifest      GraphManifest
 }
 
-const HelloAckPayloadSize = NegotiationSize + 96
+const HelloAckPayloadSize = NegotiationSize + 112
 
 func (p HelloAckPayload) Encode() ([]byte, error) {
 	manifest, err := p.LocalTXManifest.Encode()
@@ -414,6 +417,9 @@ func (p HelloAckPayload) Encode() ([]byte, error) {
 	}
 	if p.AcceptedPeerBinding.Revision == 0 {
 		return nil, fmt.Errorf("proto: hello_ack has zero accepted peer graph revision")
+	}
+	if p.AcceptedPeerTargetID == (TargetID{}) {
+		return nil, fmt.Errorf("proto: hello_ack has zero accepted peer target")
 	}
 	node, ok := p.LocalTXManifest.Node(p.InitialTargetID)
 	if !ok || node.Kind != GraphNodeKindPath {
@@ -427,7 +433,8 @@ func (p HelloAckPayload) Encode() ([]byte, error) {
 	copy(b[116:132], p.InitialTargetID[:])
 	binary.BigEndian.PutUint64(b[132:140], p.AcceptedPeerBinding.Revision)
 	copy(b[140:172], p.AcceptedPeerBinding.Digest[:])
-	binary.BigEndian.PutUint32(b[172:176], uint32(len(manifest)))
+	copy(b[172:188], p.AcceptedPeerTargetID[:])
+	binary.BigEndian.PutUint32(b[188:192], uint32(len(manifest)))
 	b = append(b, manifest...)
 	return b, nil
 }
@@ -448,13 +455,17 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	copy(p.InitialTargetID[:], b[116:132])
 	p.AcceptedPeerBinding.Revision = binary.BigEndian.Uint64(b[132:140])
 	copy(p.AcceptedPeerBinding.Digest[:], b[140:172])
+	copy(p.AcceptedPeerTargetID[:], b[172:188])
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack session epoch does not match flow id")
 	}
 	if p.AcceptedPeerBinding.Revision == 0 {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack has zero accepted peer graph revision")
 	}
-	manifestLen := int(binary.BigEndian.Uint32(b[172:176]))
+	if p.AcceptedPeerTargetID == (TargetID{}) {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack has zero accepted peer target")
+	}
+	manifestLen := int(binary.BigEndian.Uint32(b[188:192]))
 	if manifestLen != len(b)-HelloAckPayloadSize || manifestLen > GraphManifestMaxWireBytes {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack graph length %d does not match remaining payload %d", manifestLen, len(b)-HelloAckPayloadSize)
 	}

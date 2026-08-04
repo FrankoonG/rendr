@@ -174,6 +174,9 @@ func (e *Engine) publishSendSeq(next uint64) {
 // ErrMigrationBudgetExceeded only when there are no usable paths
 // after the budget.
 func (e *Engine) dispatch(frame []byte) error {
+	if runtime := e.localExecutionRuntime(); runtime != nil {
+		return e.dispatchRecursive(frame, runtime)
+	}
 	switch e.mode.Load() {
 	case dispatchRace:
 		return e.dispatchRace(frame)

@@ -33,6 +33,13 @@ func (e *Engine) localGraphBinding() graphBinding {
 	return binding
 }
 
+func (e *Engine) localExecutionRuntime() *executionRuntime {
+	e.graphMu.RLock()
+	runtime := e.localExec
+	e.graphMu.RUnlock()
+	return runtime
+}
+
 func (e *Engine) peerGraphBinding() graphBinding {
 	e.graphMu.RLock()
 	binding := e.peerGraph
@@ -49,6 +56,10 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 	owned, digest, err := ownGraphManifest(manifest)
 	if err != nil {
 		return fmt.Errorf("engine: invalid local graph: %w", err)
+	}
+	plan, err := compileExecutionPlan(owned)
+	if err != nil {
+		return err
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
@@ -71,6 +82,7 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 	}
 	binding := graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
 	e.localGraph = binding
+	e.localExec = newExecutionRuntime(plan)
 	e.graphMu.Unlock()
 	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(e.flowID), senderDirection(e.side), revision, digest)
 	e.sendAckProof = e.sendProof

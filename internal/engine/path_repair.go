@@ -47,15 +47,23 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		return err
 	}
 
+	recvQSize := 64
+	if e.Packetized() {
+		recvQSize = 1024
+	}
 	newSlot := &pathSlot{
-		id:       slot.id,
-		gen:      0,
-		conn:     newConn,
-		spec:     slot.spec,
-		attached: slot.attached,
-		recvQ:    make(chan recvFrame, 64),
-		quit:     make(chan struct{}),
-		doneR:    make(chan struct{}),
+		id:              slot.id,
+		gen:             0,
+		conn:            newConn,
+		spec:            slot.spec,
+		localTXTargetID: slot.localTXTargetID,
+		peerTXTargetID:  slot.peerTXTargetID,
+		attached:        slot.attached,
+		recvQ:           make(chan recvFrame, recvQSize),
+		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
+		quit:            make(chan struct{}),
+		doneR:           make(chan struct{}),
+		doneW:           make(chan struct{}),
 	}
 
 	e.pathsMu.Lock()
@@ -74,6 +82,7 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		e.onPathDeath(id, gen, cause, err)
 	})
 	go e.readerLoop(newSlot)
+	go e.pathWriterLoop(newSlot)
 	go e.proberLoop(newSlot)
 	return nil
 }

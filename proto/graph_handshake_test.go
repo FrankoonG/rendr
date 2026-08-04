@@ -139,12 +139,13 @@ func TestHelloAckSeparatesAsymmetricLocalTXFromAcceptedPeerBinding(t *testing.T)
 	}
 
 	wantAck := HelloAckPayload{
-		Negotiation:         serverNegotiation,
-		FlowID:              flow,
-		InstanceID:          InstanceID{0x31},
-		LocalTXManifest:     serverManifest,
-		InitialTargetID:     serverLeaves[1],
-		AcceptedPeerBinding: graphHandshakeBinding(clientNegotiation),
+		Negotiation:          serverNegotiation,
+		FlowID:               flow,
+		InstanceID:           InstanceID{0x31},
+		LocalTXManifest:      serverManifest,
+		InitialTargetID:      serverLeaves[1],
+		AcceptedPeerBinding:  graphHandshakeBinding(clientNegotiation),
+		AcceptedPeerTargetID: clientLeaves[0],
 	}
 	ack, err := DecodeHelloAck(mustEncodeGraphHandshakeHelloAck(t, wantAck))
 	if err != nil {
@@ -177,12 +178,13 @@ func TestHandshakeRejectsInitialTargetOutsideLocalTXPathSet(t *testing.T) {
 		InitialTargetID: leaves[0],
 	})
 	validAck := mustEncodeGraphHandshakeHelloAck(t, HelloAckPayload{
-		Negotiation:         negotiation,
-		FlowID:              flow,
-		InstanceID:          InstanceID{2},
-		LocalTXManifest:     manifest,
-		InitialTargetID:     leaves[0],
-		AcceptedPeerBinding: graphHandshakeBinding(negotiation),
+		Negotiation:          negotiation,
+		FlowID:               flow,
+		InstanceID:           InstanceID{2},
+		LocalTXManifest:      manifest,
+		InitialTargetID:      leaves[0],
+		AcceptedPeerBinding:  graphHandshakeBinding(negotiation),
+		AcceptedPeerTargetID: leaves[0],
 	})
 	manifestWire, err := manifest.Encode()
 	if err != nil {
@@ -242,12 +244,13 @@ func TestHandshakeRejectsNonCanonicalLocalTXManifest(t *testing.T) {
 		{
 			name: "hello_ack",
 			wire: mustEncodeGraphHandshakeHelloAck(t, HelloAckPayload{
-				Negotiation:         negotiation,
-				FlowID:              flow,
-				InstanceID:          InstanceID{2},
-				LocalTXManifest:     manifest,
-				InitialTargetID:     leaves[1],
-				AcceptedPeerBinding: graphHandshakeBinding(negotiation),
+				Negotiation:          negotiation,
+				FlowID:               flow,
+				InstanceID:           InstanceID{2},
+				LocalTXManifest:      manifest,
+				InitialTargetID:      leaves[1],
+				AcceptedPeerBinding:  graphHandshakeBinding(negotiation),
+				AcceptedPeerTargetID: leaves[0],
 			}),
 			decode: func(wire []byte) error { _, err := DecodeHelloAck(wire); return err },
 		},

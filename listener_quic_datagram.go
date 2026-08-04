@@ -182,7 +182,7 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 		_ = e.Close()
 		return
 	}
-	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID); err != nil {
+	if err := engine.PerformHelloAck(pc, e, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
 		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
@@ -236,11 +236,11 @@ func (l *quicDatagramListener) handleBridgeTag(pc transport.PathConn, payload []
 		Opts:      map[string]string{"mode": "datagram"},
 	}
 	spec = specWithTargetName(spec, bridgePathName(e, p))
-	_, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
+	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.TargetID)
 	if err != nil {
 		_ = engine.PerformBridgeAck(pc, p, l.instanceID, proto.AckRejectAttach, err.Error())
 		_ = pc.Close()
 		return
 	}
-	_ = engine.PerformBridgeAckForTarget(pc, p, l.instanceID, localTargetID, proto.AckOK, "")
+	_ = acknowledgeServerPath(e, pathID, pc, p, l.instanceID, localTargetID)
 }
