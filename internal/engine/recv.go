@@ -19,6 +19,7 @@ const streamRecvWindowFrames = sendHistoryWindow
 // ledger. A larger window lets a malicious peer pin the receive floor while
 // forcing one frame-digest allocation per distant packet.
 const packetRecvWindowBits = 512
+const policyReplayDigestLimit = 64
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
 // hold the payload bytes; ctrl frames hold the flags so the in-order
@@ -777,6 +778,7 @@ func (e *Engine) recvHasGapLocked() bool {
 // drainer dispatches each in turn so the application stream remains
 // contiguous regardless of how ctrl frames are interleaved.
 func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []byte, deliverPackets *[][]byte) bool {
+	digest := recvFrameDigest(hdr, payload)
 	if hdr.Seq < e.expectedRecvSeq {
 		// Duplicate (race / redistribute) or out-of-window.
 		e.recvDups++
@@ -789,11 +791,17 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		// without consuming another control slot. It does not advance the
 		// receive proof or application sequence a second time.
 		if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
-			e.applyCtrlLocked(slot, hdr.Flags, payload)
+			if accepted, ok := e.policyReplayDigests[hdr.Seq]; ok {
+				if accepted != digest {
+					e.recvFinalErr = fmt.Errorf("%w: altered policy frame reused sequence %d", ErrPeerProtocol, hdr.Seq)
+					e.recvTerminal = true
+					return false
+				}
+				e.applyCtrlLocked(slot, hdr.Flags, payload)
+			}
 		}
 		return false
 	}
-	digest := recvFrameDigest(hdr, payload)
 
 	if e.packetized && hdr.Type != proto.FrameCtrl {
 		cap := e.packetSeenCapLocked()
@@ -899,13 +907,17 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 		if !e.packetized && !item.isCtrl && len(e.recvDeliverFrames) >= streamRecvWindowFrames {
 			break
 		}
-		delete(e.recvQueue, e.expectedRecvSeq)
+		seq := e.expectedRecvSeq
+		delete(e.recvQueue, seq)
 		e.recvProof = proto.AdvanceAckProof(e.recvProof, item.digest)
 		e.expectedRecvSeq++
 		if e.packetized {
 			e.packetAdvanceHeadLocked()
 		}
 		if item.isCtrl {
+			if isPolicyCtrl(proto.CtrlCodeFromFlags(item.flags)) {
+				e.rememberPolicyReplayDigestLocked(seq, item.digest)
+			}
 			e.applyCtrlLocked(item.slot, item.flags, item.payload)
 			if e.recvTerminal {
 				break
@@ -927,6 +939,19 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 		}
 	}
 	return wokeReader
+}
+
+func (e *Engine) rememberPolicyReplayDigestLocked(seq uint64, digest proto.FrameDigest) {
+	if _, exists := e.policyReplayDigests[seq]; exists {
+		return
+	}
+	e.policyReplayDigests[seq] = digest
+	e.policyReplayOrder = append(e.policyReplayOrder, seq)
+	for len(e.policyReplayOrder) > policyReplayDigestLimit {
+		oldest := e.policyReplayOrder[0]
+		e.policyReplayOrder = e.policyReplayOrder[1:]
+		delete(e.policyReplayDigests, oldest)
+	}
 }
 
 func recvFrameDigest(hdr proto.Header, payload []byte) proto.FrameDigest {
@@ -974,7 +999,16 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 
 	case proto.CtrlPolicyPrepare:
 		prepare, err := proto.DecodePolicyPrepare(payload)
-		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessagePrepare, prepare: prepare}) {
+		var digest proto.PolicyProposalDigest
+		if err == nil {
+			digest, err = prepare.ProposalDigest()
+		}
+		message := policyMessage{
+			kind:    policyMessagePrepare,
+			key:     policyMessageKey{kind: policyMessagePrepare, transactionID: prepare.TransactionID, digest: digest},
+			prepare: prepare,
+		}
+		if err != nil || !e.enqueuePolicyMessageLocked(message) {
 			if err != nil {
 				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_PREPARE: %v", ErrPeerProtocol, err)
 				e.recvTerminal = true
@@ -984,7 +1018,12 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 
 	case proto.CtrlPolicyAck:
 		ack, err := proto.DecodePolicyAck(payload)
-		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessageAck, ack: ack}) {
+		message := policyMessage{
+			kind: policyMessageAck,
+			key:  policyMessageKey{kind: policyMessageAck, phase: ack.Phase, transactionID: ack.TransactionID, digest: ack.ProposalDigest},
+			ack:  ack,
+		}
+		if err != nil || !e.enqueuePolicyMessageLocked(message) {
 			if err != nil {
 				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_ACK: %v", ErrPeerProtocol, err)
 				e.recvTerminal = true
@@ -994,7 +1033,12 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 
 	case proto.CtrlPolicyCommit:
 		commit, err := proto.DecodePolicyCommit(payload)
-		if err != nil || !e.enqueuePolicyMessageLocked(policyMessage{kind: policyMessageCommit, commit: commit}) {
+		message := policyMessage{
+			kind:   policyMessageCommit,
+			key:    policyMessageKey{kind: policyMessageCommit, transactionID: commit.TransactionID, digest: commit.ProposalDigest},
+			commit: commit,
+		}
+		if err != nil || !e.enqueuePolicyMessageLocked(message) {
 			if err != nil {
 				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_COMMIT: %v", ErrPeerProtocol, err)
 				e.recvTerminal = true

@@ -146,6 +146,9 @@ func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.Gr
 	if peer.ProtocolMajor != local.ProtocolMajor {
 		return fmt.Errorf("engine: protocol major mismatch: local=%d peer=%d", local.ProtocolMajor, peer.ProtocolMajor)
 	}
+	if peer.ProtocolMinor < local.ProtocolMinor {
+		return fmt.Errorf("engine: protocol minor mismatch: local=%d peer=%d", local.ProtocolMinor, peer.ProtocolMinor)
+	}
 	if peer.SessionEpoch != proto.SessionEpoch(e.flowID) {
 		return fmt.Errorf("engine: negotiation session epoch mismatch")
 	}

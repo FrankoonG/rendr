@@ -22,12 +22,49 @@ func testPolicyProposalDigest() PolicyProposalDigest {
 	return PolicyProposalDigest{9}
 }
 
+func testPolicyReservationID() PolicyReservationID {
+	return PolicyReservationID{8}
+}
+
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 1 {
-		t.Fatalf("protocol minor=%d want=1", ProtocolMinor)
+	if ProtocolMinor != 2 {
+		t.Fatalf("protocol minor=%d want=2", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeaturePolicyReservation == 0 || RequiredFeatures&FeaturePolicyReservation == 0 {
+		t.Fatal("policy reservation feature is not required by negotiation")
+	}
+}
+
+func TestHelloRejectsLegacyPolicyPeerDuringDecode(t *testing.T) {
+	flow := [16]byte{0x44}
+	manifest := testGraphManifest("legacy-policy-peer")
+	tests := []struct {
+		name    string
+		minor   uint16
+		feature FeatureSet
+	}{
+		{name: "one phase request", minor: 0, feature: FeaturePolicyTransaction},
+		{name: "transaction without owner reservation", minor: 1, feature: FeaturePolicyReservation},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			negotiation := testNegotiationFor(flow, manifest)
+			negotiation.ProtocolMinor = test.minor
+			negotiation.Supported &^= test.feature
+			negotiation.Required &^= test.feature
+			wire := mustHelloWire(t, HelloPayload{
+				Negotiation:     negotiation,
+				FlowID:          flow,
+				InitialTargetID: manifest.RootID,
+				LocalTXManifest: manifest,
+			})
+			if _, err := DecodeHello(wire); err == nil {
+				t.Fatal("legacy peer reached post-decode engine allocation")
+			}
+		})
 	}
 }
 
@@ -104,6 +141,7 @@ func TestPolicyAckRoundTrip(t *testing.T) {
 		CurrentGeneration:        11,
 		CurrentTargetID:          TargetID{6},
 		ProposalDigest:           testPolicyProposalDigest(),
+		ReservationID:            testPolicyReservationID(),
 	}
 	wire, err := accepted.Encode()
 	if err != nil {
@@ -129,7 +167,7 @@ func TestPolicyAckRoundTrip(t *testing.T) {
 }
 
 func TestPolicyCommitRoundTrip(t *testing.T) {
-	want := PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 12, ProposalDigest: testPolicyProposalDigest()}
+	want := PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 12, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}
 	wire, err := want.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -165,11 +203,13 @@ func TestPolicyTransactionWireStability(t *testing.T) {
 		CurrentGeneration:        12,
 		CurrentTargetID:          prepare.TargetID,
 		ProposalDigest:           digest,
+		ReservationID:            testPolicyReservationID(),
 	}).Encode()
 	commitWire, _ := (PolicyCommit{
 		PolicyTransactionBinding: prepare.PolicyTransactionBinding,
 		Generation:               12,
 		ProposalDigest:           digest,
+		ReservationID:            testPolicyReservationID(),
 	}).Encode()
 	tests := []struct {
 		name string
@@ -177,8 +217,8 @@ func TestPolicyTransactionWireStability(t *testing.T) {
 		want string
 	}{
 		{name: "prepare", wire: prepareWire, want: "849f9beae745ef6e4e3de5defd3c1b3c4152347d2fd51e52f6b712e3d6cc8e1d"},
-		{name: "ack", wire: ackWire, want: "9952ad7d76174f0a3837be1539da0c03d97045af9a2f1b6d0ea9a0da8c4c55ed"},
-		{name: "commit", wire: commitWire, want: "7cfeca1f4f026cc589072f87f278f7f91394f9e1543c0f606dde82b3c03a11fb"},
+		{name: "ack", wire: ackWire, want: "d27a416d49100e6bc3ad607bc276c8ed67116747341912c408ad1df4f87ca906"},
+		{name: "commit", wire: commitWire, want: "e9e244b76f6e41808264e9ca76472871cb466002141e8a6a7f41045c7a37d327"},
 	}
 	for _, test := range tests {
 		if got := sha256.Sum256(test.wire); test.want != fmt.Sprintf("%x", got) {
@@ -201,8 +241,9 @@ func TestPolicyPayloadsRejectMalformedAndTrailing(t *testing.T) {
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
 		ProposalDigest:           testPolicyProposalDigest(),
+		ReservationID:            testPolicyReservationID(),
 	}).Encode()
-	commit, _ := (PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 1, ProposalDigest: testPolicyProposalDigest()}).Encode()
+	commit, _ := (PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}).Encode()
 
 	tests := []struct {
 		name   string
@@ -273,7 +314,7 @@ func TestPolicyPayloadBoundsAndSemanticValidation(t *testing.T) {
 		}
 	}
 
-	acceptedWithReason := PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ProposalDigest: testPolicyProposalDigest(), Reason: "no"}
+	acceptedWithReason := PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID(), Reason: "no"}
 	if _, err := acceptedWithReason.Encode(); err == nil {
 		t.Fatal("accepted success ACK with reason")
 	}
@@ -288,8 +329,8 @@ func TestPolicyPayloadBoundsAndSemanticValidation(t *testing.T) {
 
 func FuzzDecodePolicyTransactions(f *testing.F) {
 	prepare, _ := (PolicyPrepare{PolicyTransactionBinding: testPolicyBinding(), Action: PolicyActionSelectChild, SelectorID: TargetID{1}, TargetID: TargetID{2}}).Encode()
-	ack, _ := (PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ProposalDigest: testPolicyProposalDigest()}).Encode()
-	commit, _ := (PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 1, ProposalDigest: testPolicyProposalDigest()}).Encode()
+	ack, _ := (PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}).Encode()
+	commit, _ := (PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}).Encode()
 	f.Add(prepare)
 	f.Add(ack)
 	f.Add(commit)

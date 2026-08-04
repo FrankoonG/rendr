@@ -215,7 +215,7 @@ func policyTxUnitPrepare(engine *Engine, txByte byte, base uint64, selectorID, t
 	}
 }
 
-func policyTxUnitCommit(t *testing.T, prepare proto.PolicyPrepare, generation uint64) proto.PolicyCommit {
+func policyTxUnitCommit(t *testing.T, prepare proto.PolicyPrepare, generation uint64, reservation proto.PolicyReservationID) proto.PolicyCommit {
 	t.Helper()
 	digest, err := prepare.ProposalDigest()
 	if err != nil {
@@ -225,6 +225,7 @@ func policyTxUnitCommit(t *testing.T, prepare proto.PolicyPrepare, generation ui
 		PolicyTransactionBinding: prepare.PolicyTransactionBinding,
 		Generation:               generation,
 		ProposalDigest:           digest,
+		ReservationID:            reservation,
 	}
 }
 
@@ -277,7 +278,7 @@ func TestPolicyTransactionCommitAppliesStateBeforeFinalAck(t *testing.T) {
 		t.Fatalf("PREPARE changed owner state: %+v", prepareAck)
 	}
 
-	commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation)
+	commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID)
 	finalAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyCommit(commit)
 	})
@@ -308,7 +309,7 @@ func TestPolicyTransactionDuplicatePrepareAndCommitAreIdempotent(t *testing.T) {
 		t.Fatalf("duplicate PREPARE ACK=%+v want %+v", duplicatePrepare.ack, firstPrepare.ack)
 	}
 
-	commit := policyTxUnitCommit(t, prepare, firstPrepare.ack.Generation)
+	commit := policyTxUnitCommit(t, prepare, firstPrepare.ack.Generation, firstPrepare.ack.ReservationID)
 	firstFinal := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyCommit(commit)
 	})
@@ -356,7 +357,7 @@ func TestPolicyTransactionRejectsTxIDReuseWithDifferentContent(t *testing.T) {
 		prepareAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 			return fixture.engine.handlePolicyPrepare(prepare)
 		})
-		commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation)
+		commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID)
 		policyTxUnitRequireAck(t, fixture.recorder, func() error {
 			return fixture.engine.handlePolicyCommit(commit)
 		})
@@ -413,13 +414,13 @@ func TestPolicyTransactionCrossedTransactionsAreBusy(t *testing.T) {
 			t.Fatalf("crossed PREPARE ACK=%+v", busyPrepare.ack)
 		}
 		busyCommit := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, crossed, firstAck.ack.Generation))
+			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, crossed, firstAck.ack.Generation, firstAck.ack.ReservationID))
 		})
 		if busyCommit.ack.Phase != proto.PolicyAckPhaseFinal || busyCommit.ack.Code != proto.PolicyAckCodeBusy {
 			t.Fatalf("crossed COMMIT ACK=%+v", busyCommit.ack)
 		}
 		final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, first, firstAck.ack.Generation))
+			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, first, firstAck.ack.Generation, firstAck.ack.ReservationID))
 		})
 		if final.ack.Code != proto.PolicyAckCodeAccept || final.ack.CurrentTargetID != fixture.targetB {
 			t.Fatalf("original transaction did not retain ownership: %+v", final.ack)
@@ -454,7 +455,7 @@ func TestPolicyTransactionExpiryAndSupersededCommit(t *testing.T) {
 		fixture.engine.policyIncoming.expires = time.Unix(0, 0)
 		fixture.engine.policyStateMu.Unlock()
 
-		commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation)
+		commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID)
 		expired := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 			return fixture.engine.handlePolicyCommit(commit)
 		})
@@ -471,7 +472,7 @@ func TestPolicyTransactionExpiryAndSupersededCommit(t *testing.T) {
 		fixture := newPolicyTxUnitFixture(t)
 		prepare := policyTxUnitPrepare(fixture.engine, 11, 0, fixture.selectorID, fixture.targetB)
 		observation := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, 1))
+			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, 1, proto.PolicyReservationID{1}))
 		})
 		if observation.ack.Phase != proto.PolicyAckPhaseFinal || observation.ack.Code != proto.PolicyAckCodeSuperseded {
 			t.Fatalf("unprepared COMMIT ACK=%+v", observation.ack)
@@ -536,7 +537,7 @@ func TestPolicyTransactionRejectsForeignGraphBinding(t *testing.T) {
 			test.mutate(&prepare.PolicyTransactionBinding)
 			var err error
 			if test.commit {
-				err = fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, 1))
+				err = fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, 1, proto.PolicyReservationID{1}))
 			} else {
 				err = fixture.engine.handlePolicyPrepare(prepare)
 			}
@@ -588,7 +589,7 @@ func TestPolicyTransactionRejectsNonImmediateSelectorChild(t *testing.T) {
 		return engine.handlePolicyPrepare(immediate)
 	})
 	finalAck := policyTxUnitRequireAck(t, recorder, func() error {
-		return engine.handlePolicyCommit(policyTxUnitCommit(t, immediate, prepareAck.ack.Generation))
+		return engine.handlePolicyCommit(policyTxUnitCommit(t, immediate, prepareAck.ack.Generation, prepareAck.ack.ReservationID))
 	})
 	if finalAck.ack.Code != proto.PolicyAckCodeAccept || finalAck.ack.CurrentTargetID != bond.ID {
 		t.Fatalf("immediate group target was not committed: %+v", finalAck.ack)
@@ -608,7 +609,7 @@ func TestPolicyTransactionLocalDecisionSupersedesPreparedCommit(t *testing.T) {
 		t.Fatalf("SelectLocalTarget: %v", err)
 	}
 	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-		return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, prepareAck.ack.Generation))
+		return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID))
 	})
 	if final.ack.Code != proto.PolicyAckCodeStale {
 		t.Fatalf("stale remote COMMIT ACK=%+v", final.ack)
@@ -634,7 +635,7 @@ func TestPolicyTransactionProposalDigestPreventsExpiryABA(t *testing.T) {
 	changed.TargetID = fixture.targetA
 	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyPrepare(changed))
 
-	oldCommit := policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation)
+	oldCommit := policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation, oldAck.ack.ReservationID)
 	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyCommit(oldCommit)
 	})
@@ -646,7 +647,7 @@ func TestPolicyTransactionProposalDigestPreventsExpiryABA(t *testing.T) {
 	}
 }
 
-func TestPolicyTransactionProposalDigestSurvivesCacheEvictionABA(t *testing.T) {
+func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
 	fixture := newPolicyTxUnitFixture(t)
 	oldPrepare := policyTxUnitPrepare(fixture.engine, 42, 0, fixture.selectorID, fixture.targetB)
 	oldAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
@@ -663,24 +664,26 @@ func TestPolicyTransactionProposalDigestSurvivesCacheEvictionABA(t *testing.T) {
 			t.Fatal(err)
 		}
 		fixture.engine.policyStateMu.Lock()
-		ack := fixture.engine.policyRejectLocked(stale.PolicyTransactionBinding, digest, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, fixture.selectorID, "base generation is stale")
+		ack := fixture.engine.policyRejectLocked(stale.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, fixture.selectorID, "base generation is stale")
 		fixture.engine.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: stale, digest: digest, prepareAck: ack})
 		fixture.engine.policyStateMu.Unlock()
 	}
 
 	newPrepare := oldPrepare
-	newPrepare.TargetID = fixture.targetA
 	newAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyPrepare(newPrepare)
 	})
-	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation)))
+	if newAck.ack.ReservationID == oldAck.ack.ReservationID {
+		t.Fatal("reaccepted proposal reused the expired owner reservation")
+	}
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation, oldAck.ack.ReservationID)))
 	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != (proto.TargetID{}) || !pending {
 		t.Fatalf("delayed old COMMIT changed new pending state: generation=%d selection=%x pending=%v", generation, selection, pending)
 	}
 	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-		return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, newPrepare, newAck.ack.Generation))
+		return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, newPrepare, newAck.ack.Generation, newAck.ack.ReservationID))
 	})
-	if final.ack.Code != proto.PolicyAckCodeAccept || final.ack.CurrentTargetID != fixture.targetA {
+	if final.ack.Code != proto.PolicyAckCodeAccept || final.ack.CurrentTargetID != fixture.targetB {
 		t.Fatalf("new proposal failed after ABA rejection: %+v", final.ack)
 	}
 }
@@ -717,6 +720,7 @@ func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               1,
 		ProposalDigest:           digest,
+		ReservationID:            proto.PolicyReservationID{1},
 	}
 	prepareAck := base
 	prepareAck.Phase = proto.PolicyAckPhasePrepare
@@ -734,6 +738,33 @@ func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
 	}
 	if len(tx.prepareAcks) != 1 || len(tx.finalAcks) != 1 {
 		t.Fatalf("phase mailbox depths=%d/%d want=1/1", len(tx.prepareAcks), len(tx.finalAcks))
+	}
+}
+
+func TestPolicyInboxCoalescesExactDuplicatePhase(t *testing.T) {
+	e := &Engine{
+		policyInbox:  make(chan policyMessage, 64),
+		policyQueued: make(map[policyMessageKey]struct{}),
+	}
+	key := policyMessageKey{
+		kind:          policyMessagePrepare,
+		transactionID: [16]byte{91},
+		digest:        proto.PolicyProposalDigest{1},
+	}
+	message := policyMessage{kind: policyMessagePrepare, key: key}
+	for i := 0; i < 1024; i++ {
+		if !e.enqueuePolicyMessageLocked(message) {
+			t.Fatalf("duplicate %d was treated as inbox overflow", i)
+		}
+	}
+	if got := len(e.policyInbox); got != 1 {
+		t.Fatalf("coalesced inbox depth=%d want=1", got)
+	}
+	e.policyQueueMu.Lock()
+	queued := len(e.policyQueued)
+	e.policyQueueMu.Unlock()
+	if queued != 1 || e.recvTerminal {
+		t.Fatalf("coalesced state queued=%d terminal=%v", queued, e.recvTerminal)
 	}
 }
 

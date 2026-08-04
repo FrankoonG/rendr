@@ -14,8 +14,8 @@ const (
 
 	PolicyTransactionBindingSize = 80
 	PolicyPrepareHeaderSize      = 136
-	PolicyAckHeaderSize          = 160
-	PolicyCommitSize             = 120
+	PolicyAckHeaderSize          = 176
+	PolicyCommitSize             = 136
 )
 
 var policyTransactionMagic = [4]byte{'R', 'P', 'T', 'X'}
@@ -65,6 +65,7 @@ const (
 )
 
 type PolicyProposalDigest [32]byte
+type PolicyReservationID [16]byte
 
 // PolicyPrepare asks the sender owner to reserve generation base+1 for one
 // selector immediate-child change. It does not alter dispatch by itself.
@@ -183,6 +184,7 @@ type PolicyAck struct {
 	CurrentGeneration uint64
 	CurrentTargetID   TargetID
 	ProposalDigest    PolicyProposalDigest
+	ReservationID     PolicyReservationID
 	Reason            string
 }
 
@@ -200,7 +202,8 @@ func (p PolicyAck) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint64(b[96:104], p.CurrentGeneration)
 	copy(b[104:120], p.CurrentTargetID[:])
 	copy(b[120:152], p.ProposalDigest[:])
-	binary.BigEndian.PutUint16(b[152:154], uint16(len(p.Reason)))
+	copy(b[152:168], p.ReservationID[:])
+	binary.BigEndian.PutUint16(b[168:170], uint16(len(p.Reason)))
 	copy(b[PolicyAckHeaderSize:], p.Reason)
 	return b, nil
 }
@@ -213,10 +216,10 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 	if err != nil {
 		return PolicyAck{}, err
 	}
-	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[154:156]) != 0 || binary.BigEndian.Uint32(wire[156:160]) != 0 {
+	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[170:172]) != 0 || binary.BigEndian.Uint32(wire[172:176]) != 0 {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reserved bytes must be zero")
 	}
-	reasonLen := int(binary.BigEndian.Uint16(wire[152:154]))
+	reasonLen := int(binary.BigEndian.Uint16(wire[168:170]))
 	if reasonLen > PolicyMaxReasonBytes || len(wire)-PolicyAckHeaderSize != reasonLen {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reason length %d does not match payload", reasonLen)
 	}
@@ -230,6 +233,7 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 	}
 	copy(p.CurrentTargetID[:], wire[104:120])
 	copy(p.ProposalDigest[:], wire[120:152])
+	copy(p.ReservationID[:], wire[152:168])
 	if err := p.validate(); err != nil {
 		return PolicyAck{}, err
 	}
@@ -252,6 +256,9 @@ func (p PolicyAck) validate() error {
 	if p.ProposalDigest == (PolicyProposalDigest{}) {
 		return fmt.Errorf("proto: policy ack has zero proposal digest")
 	}
+	if p.Code == PolicyAckCodeAccept && p.ReservationID == (PolicyReservationID{}) {
+		return fmt.Errorf("proto: accepted policy ack has zero reservation id")
+	}
 	if len(p.Reason) > PolicyMaxReasonBytes || !utf8.ValidString(p.Reason) {
 		return fmt.Errorf("proto: policy ack reason is invalid or exceeds %d bytes", PolicyMaxReasonBytes)
 	}
@@ -268,6 +275,7 @@ type PolicyCommit struct {
 	PolicyTransactionBinding
 	Generation     uint64
 	ProposalDigest PolicyProposalDigest
+	ReservationID  PolicyReservationID
 }
 
 func (p PolicyCommit) Encode() ([]byte, error) {
@@ -277,14 +285,19 @@ func (p PolicyCommit) Encode() ([]byte, error) {
 	if p.ProposalDigest == (PolicyProposalDigest{}) {
 		return nil, fmt.Errorf("proto: policy commit has zero proposal digest")
 	}
+	if p.ReservationID == (PolicyReservationID{}) {
+		return nil, fmt.Errorf("proto: policy commit has zero reservation id")
+	}
 	b, err := encodePolicyTransactionBinding(p.PolicyTransactionBinding, policyTransactionCommit)
 	if err != nil {
 		return nil, err
 	}
 	b = append(b, make([]byte, 8)...)
 	b = append(b, make([]byte, 32)...)
+	b = append(b, make([]byte, 16)...)
 	binary.BigEndian.PutUint64(b[80:88], p.Generation)
 	copy(b[88:120], p.ProposalDigest[:])
+	copy(b[120:136], p.ReservationID[:])
 	return b, nil
 }
 
@@ -298,11 +311,15 @@ func DecodePolicyCommit(wire []byte) (PolicyCommit, error) {
 	}
 	p := PolicyCommit{PolicyTransactionBinding: binding, Generation: binary.BigEndian.Uint64(wire[80:88])}
 	copy(p.ProposalDigest[:], wire[88:120])
+	copy(p.ReservationID[:], wire[120:136])
 	if p.Generation == 0 {
 		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero generation")
 	}
 	if p.ProposalDigest == (PolicyProposalDigest{}) {
 		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero proposal digest")
+	}
+	if p.ReservationID == (PolicyReservationID{}) {
+		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero reservation id")
 	}
 	return p, nil
 }

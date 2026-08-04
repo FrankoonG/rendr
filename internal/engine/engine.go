@@ -119,27 +119,29 @@ type Engine struct {
 
 	// Recv state: reorder buffer keyed by SEQ. expectedRecvSeq is the
 	// next SEQ the application should observe.
-	recvMu             sync.Mutex
-	recvCond           *sync.Cond
-	recvPacketCh       chan []byte
-	recvPacketWake     chan struct{}
-	recvWake           chan struct{}
-	recvQueue          map[uint64]recvItem
-	expectedRecvSeq    uint64
-	recvAckSent        uint64
-	recvDeliver        []byte // pending bytes for the next Read (stream)
-	recvDeliverFrames  []int  // remaining bytes per admitted stream DATA frame
-	packetized         bool   // when true, drainer routes payload to recvPacketCh
-	recvPathCursor     uint64
-	recvSeenBits       []uint64
-	recvSeenHead       uint64
-	recvPacketMarks    int
-	recvFinalErr       error
-	recvTerminal       bool
-	recvFinalHandled   bool
-	recvProof          proto.AckProof
-	recvFrameProofs    map[uint64]proto.FrameDigest
-	recvDroppedThrough uint64
+	recvMu              sync.Mutex
+	recvCond            *sync.Cond
+	recvPacketCh        chan []byte
+	recvPacketWake      chan struct{}
+	recvWake            chan struct{}
+	recvQueue           map[uint64]recvItem
+	expectedRecvSeq     uint64
+	recvAckSent         uint64
+	recvDeliver         []byte // pending bytes for the next Read (stream)
+	recvDeliverFrames   []int  // remaining bytes per admitted stream DATA frame
+	packetized          bool   // when true, drainer routes payload to recvPacketCh
+	recvPathCursor      uint64
+	recvSeenBits        []uint64
+	recvSeenHead        uint64
+	recvPacketMarks     int
+	recvFinalErr        error
+	recvTerminal        bool
+	recvFinalHandled    bool
+	recvProof           proto.AckProof
+	recvFrameProofs     map[uint64]proto.FrameDigest
+	policyReplayDigests map[uint64]proto.FrameDigest
+	policyReplayOrder   []uint64
+	recvDroppedThrough  uint64
 
 	// recvDeadline is the application-set read deadline (zero = none).
 	// When non-zero, Recv / RecvPacket return a timeout error if no
@@ -187,6 +189,8 @@ type Engine struct {
 	policyCompleted      map[[16]byte]completedPolicyTransaction
 	policyCompletedOrder [][16]byte
 	policyInbox          chan policyMessage
+	policyQueueMu        sync.Mutex
+	policyQueued         map[policyMessageKey]struct{}
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -196,6 +200,7 @@ type Engine struct {
 	probeIntervalOverride time.Duration // 0 = default 1s; tests can shorten
 
 	// Lifecycle.
+	closing      atomic.Bool
 	closeOnce    sync.Once
 	closed       chan struct{}
 	closeErr     error
@@ -302,30 +307,32 @@ func (s *pathSlot) closeQuit() {
 // server side it should be copied from the inbound HELLO.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
-		side:             side,
-		flowID:           flowID,
-		limits:           limits.Clamp(),
-		created:          time.Now(),
-		paths:            make(map[uint32]*pathSlot),
-		seenAttach:       make(map[[16]byte]struct{}),
-		recvPacketCh:     make(chan []byte, 16384),
-		recvPacketWake:   make(chan struct{}, 1),
-		recvWake:         make(chan struct{}, 1),
-		recvQueue:        make(map[uint64]recvItem),
-		recvFrameProofs:  make(map[uint64]proto.FrameDigest),
-		sendSlots:        make(chan struct{}, sendHistoryWindow),
-		sendControlSlots: make(chan struct{}, sendControlReserve),
-		replayRequests:   make(chan uint64, 1),
-		ackWake:          make(chan struct{}, 1),
-		policyInbox:      make(chan policyMessage, 64),
-		policySendGate:   make(chan struct{}, 1),
-		policySelections: make(map[proto.TargetID]proto.TargetID),
-		policyCompleted:  make(map[[16]byte]completedPolicyTransaction),
-		zombieLeft:       limits.Clamp().ZombieMaxMigrations,
-		probeOutstanding: make(map[uint64]time.Time),
-		closed:           make(chan struct{}),
-		gracefulDone:     make(chan struct{}),
-		terminalDone:     make(chan struct{}),
+		side:                side,
+		flowID:              flowID,
+		limits:              limits.Clamp(),
+		created:             time.Now(),
+		paths:               make(map[uint32]*pathSlot),
+		seenAttach:          make(map[[16]byte]struct{}),
+		recvPacketCh:        make(chan []byte, 16384),
+		recvPacketWake:      make(chan struct{}, 1),
+		recvWake:            make(chan struct{}, 1),
+		recvQueue:           make(map[uint64]recvItem),
+		recvFrameProofs:     make(map[uint64]proto.FrameDigest),
+		policyReplayDigests: make(map[uint64]proto.FrameDigest),
+		sendSlots:           make(chan struct{}, sendHistoryWindow),
+		sendControlSlots:    make(chan struct{}, sendControlReserve),
+		replayRequests:      make(chan uint64, 1),
+		ackWake:             make(chan struct{}, 1),
+		policyInbox:         make(chan policyMessage, 64),
+		policySendGate:      make(chan struct{}, 1),
+		policySelections:    make(map[proto.TargetID]proto.TargetID),
+		policyCompleted:     make(map[[16]byte]completedPolicyTransaction),
+		policyQueued:        make(map[policyMessageKey]struct{}),
+		zombieLeft:          limits.Clamp().ZombieMaxMigrations,
+		probeOutstanding:    make(map[uint64]time.Time),
+		closed:              make(chan struct{}),
+		gracefulDone:        make(chan struct{}),
+		terminalDone:        make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))
@@ -672,6 +679,9 @@ func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 
 // isClosed checks the lifecycle.
 func (e *Engine) isClosed() bool {
+	if e.closing.Load() {
+		return true
+	}
 	select {
 	case <-e.closed:
 		return true
@@ -811,6 +821,9 @@ func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scop
 	// path as one state transition.
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
+	if e.isClosed() || e.sendClosing.Load() {
+		return net.ErrClosed
+	}
 	e.pathsMu.Lock()
 	if len(scope) > 0 {
 		for _, id := range scope {
@@ -1061,15 +1074,23 @@ func (e *Engine) SetProbeIntervalForTest(d time.Duration) {
 func (e *Engine) Close() error {
 	var firstErr error
 	e.closeOnce.Do(func() {
+		e.closing.Store(true)
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
+		slots := make([]*pathSlot, 0, len(e.paths))
 		for _, s := range e.paths {
 			s.closeQuit()
+			slots = append(slots, s)
+		}
+		e.paths = make(map[uint32]*pathSlot)
+		e.activeID = 0
+		e.dispatchScope = nil
+		e.pathsMu.Unlock()
+		for _, s := range slots {
 			if err := s.conn.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
-		e.pathsMu.Unlock()
 		close(e.closed)
 		// Wake any Read goroutine waiting on data.
 		e.recvMu.Lock()

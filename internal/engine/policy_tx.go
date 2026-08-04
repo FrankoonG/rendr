@@ -28,6 +28,7 @@ type outgoingPolicyTransaction struct {
 type incomingPolicyTransaction struct {
 	prepare      proto.PolicyPrepare
 	digest       proto.PolicyProposalDigest
+	reservation  proto.PolicyReservationID
 	graph        graphBinding
 	generation   uint64
 	expires      time.Time
@@ -54,9 +55,17 @@ const (
 
 type policyMessage struct {
 	kind    policyMessageKind
+	key     policyMessageKey
 	prepare proto.PolicyPrepare
 	ack     proto.PolicyAck
 	commit  proto.PolicyCommit
+}
+
+type policyMessageKey struct {
+	kind          policyMessageKind
+	phase         proto.PolicyAckPhase
+	transactionID [16]byte
+	digest        proto.PolicyProposalDigest
 }
 
 type policyProtocolViolation struct{ err error }
@@ -159,6 +168,7 @@ func (e *Engine) RequestPeerSelection(ctx context.Context, selectorID, targetID 
 	defer retry.Stop()
 	commitSent := false
 	var generation uint64
+	var reservation proto.PolicyReservationID
 	var commitFrame []byte
 	ackChannel := (<-chan proto.PolicyAck)(tx.prepareAcks)
 	for {
@@ -211,10 +221,12 @@ func (e *Engine) RequestPeerSelection(ctx context.Context, selectorID, targetID 
 					return e.policyProtocolError(fmt.Errorf("owner assigned invalid generation %d from base %d", ack.Generation, base))
 				}
 				generation = ack.Generation
+				reservation = ack.ReservationID
 				commit := proto.PolicyCommit{
 					PolicyTransactionBinding: tx.prepare.PolicyTransactionBinding,
 					Generation:               generation,
 					ProposalDigest:           digest,
+					ReservationID:            reservation,
 				}
 				commitFrame, err, pending = e.sendPolicyFrameWithContext(txCtx, func() ([]byte, error) {
 					return e.sendPolicyCommit(commit)
@@ -238,7 +250,7 @@ func (e *Engine) RequestPeerSelection(ctx context.Context, selectorID, targetID 
 				e.recordPeerPolicyGeneration(ack.CurrentGeneration)
 				return fmt.Errorf("%w: %s", ErrPolicyRejected, ack.Reason)
 			}
-			if ack.Generation != generation || ack.CurrentGeneration != generation || ack.CurrentTargetID != targetID {
+			if ack.Generation != generation || ack.CurrentGeneration != generation || ack.CurrentTargetID != targetID || ack.ReservationID != reservation {
 				return e.policyProtocolError(fmt.Errorf("COMMIT_ACK does not prove requested policy state"))
 			}
 			e.recordPeerPolicyGeneration(generation)
@@ -301,14 +313,28 @@ func (e *Engine) sendPolicyCommit(p proto.PolicyCommit) ([]byte, error) {
 }
 
 func (e *Engine) enqueuePolicyMessageLocked(message policyMessage) bool {
+	e.policyQueueMu.Lock()
+	if _, exists := e.policyQueued[message.key]; exists {
+		e.policyQueueMu.Unlock()
+		return true
+	}
+	e.policyQueued[message.key] = struct{}{}
+	e.policyQueueMu.Unlock()
 	select {
 	case e.policyInbox <- message:
 		return true
 	default:
+		e.releasePolicyMessageKey(message.key)
 		e.recvFinalErr = fmt.Errorf("%w: policy inbox capacity exceeded", ErrPeerProtocol)
 		e.recvTerminal = true
 		return false
 	}
+}
+
+func (e *Engine) releasePolicyMessageKey(key policyMessageKey) {
+	e.policyQueueMu.Lock()
+	delete(e.policyQueued, key)
+	e.policyQueueMu.Unlock()
 }
 
 func (e *Engine) policyLoop() {
@@ -325,6 +351,7 @@ func (e *Engine) policyLoop() {
 			}
 			e.policyStateMu.Unlock()
 		case message := <-e.policyInbox:
+			e.releasePolicyMessageKey(message.key)
 			var err error
 			switch message.kind {
 			case policyMessagePrepare:
@@ -375,28 +402,33 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 			e.policyStateMu.Unlock()
 			return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, frame)
 		}
-		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeBusy, 0, prepare.SelectorID, "another policy transaction is pending")
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeBusy, 0, prepare.SelectorID, "another policy transaction is pending")
 		e.policyStateMu.Unlock()
 		_, err := e.sendPolicyAck(ack)
 		return err
 	}
 	if err := validatePolicySelection(graph.manifest, prepare.SelectorID, prepare.TargetID); err != nil {
-		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, err.Error())
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, err.Error())
 		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
 		e.policyStateMu.Unlock()
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
 	if prepare.BaseGeneration != e.policyGeneration {
-		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, prepare.SelectorID, "base generation is stale")
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, prepare.SelectorID, "base generation is stale")
 		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
 		e.policyStateMu.Unlock()
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
 	if e.policyGeneration == ^uint64(0) {
-		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, "generation space exhausted")
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, "generation space exhausted")
 		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
 		e.policyStateMu.Unlock()
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
+	}
+	reservation, err := newPolicyReservationID()
+	if err != nil {
+		e.policyStateMu.Unlock()
+		return err
 	}
 	generation := e.policyGeneration + 1
 	ack := proto.PolicyAck{
@@ -407,14 +439,16 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		CurrentGeneration:        e.policyGeneration,
 		CurrentTargetID:          e.policySelections[prepare.SelectorID],
 		ProposalDigest:           digest,
+		ReservationID:            reservation,
 	}
 	e.policyIncoming = &incomingPolicyTransaction{
-		prepare:    prepare,
-		digest:     digest,
-		graph:      graph,
-		generation: generation,
-		expires:    time.Now().Add(policyTransactionTTL),
-		prepareAck: ack,
+		prepare:     prepare,
+		digest:      digest,
+		reservation: reservation,
+		graph:       graph,
+		generation:  generation,
+		expires:     time.Now().Add(policyTransactionTTL),
+		prepareAck:  ack,
 	}
 	e.policyStateMu.Unlock()
 	return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
@@ -479,18 +513,18 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 	pending := e.policyIncoming
 	if pending == nil {
-		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeSuperseded, commit.Generation, proto.TargetID{}, "prepared transaction is no longer pending")
+		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, commit.ReservationID, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeSuperseded, commit.Generation, proto.TargetID{}, "prepared transaction is no longer pending")
 		e.policyStateMu.Unlock()
 		_, err := e.sendPolicyAck(ack)
 		return err
 	}
 	if pending.prepare.TransactionID != commit.TransactionID {
-		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeBusy, commit.Generation, proto.TargetID{}, "another policy transaction is pending")
+		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, commit.ReservationID, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeBusy, commit.Generation, proto.TargetID{}, "another policy transaction is pending")
 		e.policyStateMu.Unlock()
 		_, err := e.sendPolicyAck(ack)
 		return err
 	}
-	if pending.generation != commit.Generation || pending.digest != commit.ProposalDigest {
+	if pending.generation != commit.Generation || pending.digest != commit.ProposalDigest || pending.reservation != commit.ReservationID {
 		e.policyStateMu.Unlock()
 		return policyViolation(fmt.Errorf("policy transaction id reused with different COMMIT proposal"))
 	}
@@ -510,7 +544,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		if e.policyIncoming == pending {
 			e.policyIncoming = nil
 		}
-		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeStale, commit.Generation, prepare.SelectorID, "owner state changed after PREPARE")
+		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, pending.reservation, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeStale, commit.Generation, prepare.SelectorID, "owner state changed after PREPARE")
 		completed := completedPolicyTransaction{prepare: prepare, digest: pending.digest, prepareAck: pending.prepareAck, prepareFrame: pending.prepareFrame, finalAck: ack}
 		e.rememberPolicyCompletedLocked(completed)
 		e.policyStateMu.Unlock()
@@ -527,7 +561,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 	var ack proto.PolicyAck
 	if applyErr != nil {
-		ack = e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeReject, commit.Generation, prepare.SelectorID, applyErr.Error())
+		ack = e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, pending.reservation, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeReject, commit.Generation, prepare.SelectorID, applyErr.Error())
 	} else {
 		e.policyGeneration = commit.Generation
 		e.policySelections[prepare.SelectorID] = prepare.TargetID
@@ -539,6 +573,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			CurrentGeneration:        commit.Generation,
 			CurrentTargetID:          prepare.TargetID,
 			ProposalDigest:           pending.digest,
+			ReservationID:            pending.reservation,
 		}
 	}
 	e.policyIncoming = nil
@@ -553,14 +588,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
 }
 
-func (e *Engine) policyReject(binding proto.PolicyTransactionBinding, digest proto.PolicyProposalDigest, phase proto.PolicyAckPhase, code proto.PolicyAckCode, generation uint64, selectorID proto.TargetID, reason string) proto.PolicyAck {
-	e.policyStateMu.Lock()
-	ack := e.policyRejectLocked(binding, digest, phase, code, generation, selectorID, reason)
-	e.policyStateMu.Unlock()
-	return ack
-}
-
-func (e *Engine) policyRejectLocked(binding proto.PolicyTransactionBinding, digest proto.PolicyProposalDigest, phase proto.PolicyAckPhase, code proto.PolicyAckCode, generation uint64, selectorID proto.TargetID, reason string) proto.PolicyAck {
+func (e *Engine) policyRejectLocked(binding proto.PolicyTransactionBinding, digest proto.PolicyProposalDigest, reservation proto.PolicyReservationID, phase proto.PolicyAckPhase, code proto.PolicyAckCode, generation uint64, selectorID proto.TargetID, reason string) proto.PolicyAck {
 	if len(reason) > proto.PolicyMaxReasonBytes {
 		reason = reason[:proto.PolicyMaxReasonBytes]
 		for !utf8.ValidString(reason) {
@@ -575,6 +603,7 @@ func (e *Engine) policyRejectLocked(binding proto.PolicyTransactionBinding, dige
 		CurrentGeneration:        e.policyGeneration,
 		CurrentTargetID:          e.policySelections[selectorID],
 		ProposalDigest:           digest,
+		ReservationID:            reservation,
 		Reason:                   reason,
 	}
 }
@@ -607,6 +636,7 @@ func (e *Engine) expirePolicyIncomingLocked(pending *incomingPolicyTransaction) 
 	ack := e.policyRejectLocked(
 		pending.prepare.PolicyTransactionBinding,
 		pending.digest,
+		pending.reservation,
 		proto.PolicyAckPhaseFinal,
 		proto.PolicyAckCodeSuperseded,
 		pending.generation,
@@ -823,6 +853,17 @@ func newPolicyTransactionID() ([16]byte, error) {
 		return id, fmt.Errorf("engine: generate policy transaction id: %w", err)
 	}
 	if id == ([16]byte{}) {
+		id[0] = 1
+	}
+	return id, nil
+}
+
+func newPolicyReservationID() (proto.PolicyReservationID, error) {
+	var id proto.PolicyReservationID
+	if _, err := rand.Read(id[:]); err != nil {
+		return id, fmt.Errorf("engine: generate policy reservation id: %w", err)
+	}
+	if id == (proto.PolicyReservationID{}) {
 		id[0] = 1
 	}
 	return id, nil

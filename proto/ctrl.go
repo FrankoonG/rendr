@@ -30,7 +30,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 1
+	ProtocolMinor uint16 = 2
 )
 
 type FeatureSet uint64
@@ -40,8 +40,9 @@ const (
 	FeatureDirectionalACK    FeatureSet = 1 << 1
 	FeatureStrictDecode      FeatureSet = 1 << 2
 	FeaturePolicyTransaction FeatureSet = 1 << 3
+	FeaturePolicyReservation FeatureSet = 1 << 4
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -111,11 +112,17 @@ func decodeNegotiation(b []byte) (Negotiation, error) {
 	if n.ProtocolMajor != ProtocolMajor {
 		return Negotiation{}, fmt.Errorf("proto: unsupported protocol major %d", n.ProtocolMajor)
 	}
+	if n.ProtocolMinor < ProtocolMinor {
+		return Negotiation{}, fmt.Errorf("proto: protocol minor %d lacks required v1 features", n.ProtocolMinor)
+	}
 	if n.Required&^SupportedFeatures != 0 {
 		return Negotiation{}, fmt.Errorf("proto: unknown required features 0x%x", uint64(n.Required&^SupportedFeatures))
 	}
 	if n.Required&^n.Supported != 0 {
 		return Negotiation{}, fmt.Errorf("proto: required features not advertised as supported")
+	}
+	if RequiredFeatures&^n.Supported != 0 {
+		return Negotiation{}, fmt.Errorf("proto: peer lacks mandatory features 0x%x", uint64(RequiredFeatures&^n.Supported))
 	}
 	if n.GraphRevision == 0 {
 		return Negotiation{}, fmt.Errorf("proto: zero graph revision")

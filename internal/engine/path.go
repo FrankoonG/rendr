@@ -55,6 +55,11 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	hasPaths := len(e.paths) > 0
 	e.pathsMu.Unlock()
 
+	// A transport may report death while a concurrent Write is blocked and
+	// only unblock that Write when Close is called. Close asynchronously: an
+	// adapter is allowed to invoke OnDeath from inside its own Close method,
+	// and recursively entering a sync.Once-backed Close would deadlock.
+	go func() { _ = slot.conn.Close() }()
 	e.drainDeadSlot(slot)
 
 	if migratedOk {
