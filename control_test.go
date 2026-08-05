@@ -8,7 +8,6 @@ type testConnectionControl interface {
 	MigrationController
 	PathController
 	ConnectionObserver
-	MigratePathLocalAddr(pathID uint32, newLocal string) error
 }
 
 type testPacketConnectionControl interface {

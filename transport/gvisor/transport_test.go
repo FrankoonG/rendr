@@ -18,7 +18,7 @@ import (
 const testTimeout = 5 * time.Second
 
 func TestGVisorTransportRoundTrip(t *testing.T) {
-	ln, err := Listen("")
+	ln, err := NewDomain().Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestGVisorTransportRoundTrip(t *testing.T) {
 		accepted <- pc
 	}()
 
-	client, err := New().DialPath(context.Background(), transport.PathSpec{
+	client, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	})
@@ -64,9 +64,78 @@ func TestGVisorTransportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGVisorDomainsIsolateSameAddress(t *testing.T) {
+	firstDomain := NewDomain()
+	secondDomain := NewDomain()
+	first, err := firstDomain.Listen("shared-name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := secondDomain.Listen("shared-name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	firstClient, firstServer := dialAndAccept(t, first)
+	defer firstClient.Close()
+	defer firstServer.Close()
+	secondClient, secondServer := dialAndAccept(t, second)
+	defer secondClient.Close()
+	defer secondServer.Close()
+
+	assertRoundTrip(t, firstClient, firstServer, []byte("first domain"))
+	assertRoundTrip(t, secondClient, secondServer, []byte("second domain"))
+}
+
+func TestGVisorDomainConcurrentDuplicateListen(t *testing.T) {
+	domain := NewDomain()
+	start := make(chan struct{})
+	type result struct {
+		listener *Listener
+		err      error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			listener, err := domain.Listen("duplicate")
+			results <- result{listener: listener, err: err}
+		}()
+	}
+	close(start)
+
+	var successes, failures int
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			failures++
+			continue
+		}
+		successes++
+		defer result.listener.Close()
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("concurrent duplicate Listen successes=%d failures=%d, want 1/1", successes, failures)
+	}
+}
+
+func TestGVisorNilDomainFactoryFailsClosed(t *testing.T) {
+	var domain *Domain
+	_, err := domain.Factory().DialPath(context.Background(), transport.PathSpec{Address: "127.0.0.1:1"})
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("nil Domain")) {
+		t.Fatalf("nil Domain DialPath error=%v, want explicit nil Domain failure", err)
+	}
+	var factory *Transport
+	if _, err := factory.DialPath(context.Background(), transport.PathSpec{Address: "127.0.0.1:1"}); err == nil || !bytes.Contains([]byte(err.Error()), []byte("nil Transport")) {
+		t.Fatalf("nil Transport DialPath error=%v, want explicit nil Transport failure", err)
+	}
+}
+
 func TestGVisorListenerCloseUnblocksAcceptPath(t *testing.T) {
 	tests := map[string]func() (*Listener, error){
-		"process-local":  func() (*Listener, error) { return Listen("") },
+		"process-local":  func() (*Listener, error) { return NewDomain().Listen("") },
 		"packet-carried": func() (*Listener, error) { return ListenPacket("127.0.0.1:0") },
 	}
 	for name, listen := range tests {
@@ -102,7 +171,8 @@ func TestGVisorListenerCloseUnblocksAcceptPath(t *testing.T) {
 }
 
 func TestGVisorProcessLocalAcceptedPathsSurviveListenerClose(t *testing.T) {
-	ln, err := Listen("")
+	domain := NewDomain()
+	ln, err := domain.Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,12 +186,16 @@ func TestGVisorProcessLocalAcceptedPathsSurviveListenerClose(t *testing.T) {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if path, err := New().DialPath(context.Background(), transport.PathSpec{
+	if path, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	}); err == nil {
 		_ = path.Close()
-		t.Fatal("DialPath succeeded through a closed process-local registry entry")
+		t.Fatal("DialPath succeeded through a closed process-local Domain entry")
+	}
+	if replacement, err := domain.Listen(ln.Addr().String()); err == nil {
+		_ = replacement.Close()
+		t.Fatal("Domain key was reused while accepted paths still retained the old listener")
 	}
 	assertNotCleaned(t, ln)
 	assertRoundTrip(t, client1, server1, []byte("first path after listener close"))
@@ -137,10 +211,15 @@ func TestGVisorProcessLocalAcceptedPathsSurviveListenerClose(t *testing.T) {
 		t.Fatalf("close last accepted path: %v", err)
 	}
 	waitForCleanup(t, ln)
+	replacement, err := domain.Listen(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Domain key was not released after final cleanup: %v", err)
+	}
+	_ = replacement.Close()
 }
 
 func TestGVisorAcceptCloseRaceCleansUp(t *testing.T) {
-	ln, err := Listen("")
+	ln, err := NewDomain().Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +239,7 @@ func TestGVisorAcceptCloseRaceCleansUp(t *testing.T) {
 		<-start
 		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 		defer cancel()
-		path, err := New().DialPath(ctx, transport.PathSpec{
+		path, err := ln.Factory().DialPath(ctx, transport.PathSpec{
 			Transport: "gvisor",
 			Address:   ln.Addr().String(),
 		})
@@ -221,7 +300,7 @@ func TestGVisorPacketAcceptedPathSurvivesListenerClose(t *testing.T) {
 }
 
 func TestGVisorAcceptedPathDeathReleasesListener(t *testing.T) {
-	ln, err := Listen("")
+	ln, err := NewDomain().Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +386,7 @@ func TestRetainedPathConnReleasesOnceAndPreservesOptionalMethods(t *testing.T) {
 }
 
 func TestGVisorListenerSessionKind(t *testing.T) {
-	ln, err := Listen("")
+	ln, err := NewDomain().Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +407,7 @@ func dialAndAccept(t *testing.T, ln *Listener) (transport.PathConn, transport.Pa
 		path, err := ln.AcceptPath(context.Background())
 		accepted <- result{path: path, err: err}
 	}()
-	client, err := New().DialPath(context.Background(), transport.PathSpec{
+	client, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	})
@@ -404,7 +483,7 @@ func TestGVisorPacketCarrierRoundTrip(t *testing.T) {
 		accepted <- pc
 	}()
 
-	client, err := New().DialPath(context.Background(), transport.PathSpec{
+	client, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	})
@@ -429,7 +508,7 @@ func TestGVisorPacketCarrierRoundTrip(t *testing.T) {
 }
 
 func TestGVisorAcceptTimeoutDoesNotPoisonListener(t *testing.T) {
-	ln, err := Listen("")
+	ln, err := NewDomain().Listen("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +520,7 @@ func TestGVisorAcceptTimeoutDoesNotPoisonListener(t *testing.T) {
 		t.Fatal("Accept unexpectedly succeeded without a dial")
 	}
 
-	client, err := New().DialPath(context.Background(), transport.PathSpec{
+	client, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	})

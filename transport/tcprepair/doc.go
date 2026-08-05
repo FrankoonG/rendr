@@ -1,27 +1,19 @@
-// Package tcprepair provides experimental server-side TCP socket
-// migration via Linux TCP_REPAIR. The package is Linux-only by build
-// tag; non-Linux GOOS gets a stub that errors on any call.
+// Package tcprepair provides a factual Linux TCP_REPAIR capability probe.
+// Snapshot/restore primitives remain internal until rendr can wrap them in an
+// owned, peer-negotiated, rollback-safe transaction.
 //
-// What the package provides
+// # Ownership and planning boundary
 //
-//   - Snapshot(*net.TCPConn) (*State, error): capture all TCP state
-//     (snd_nxt, rcv_nxt, send/recv queue contents, TCP_INFO,
-//     TCP_TIMESTAMP, TCP_REPAIR_WINDOW) without disturbing the
-//     ongoing connection. Toggles TCP_REPAIR on/off internally.
-//   - Restore(*State) (int, error): build a new socket on the same
-//     5-tuple, restore SEQ/ACK + queues + window, exit TCP_REPAIR.
-//     Returns the file descriptor; caller wraps via os.NewFile +
-//     net.FileConn.
+// This package deliberately does not register a transport and cannot be named
+// by PathSpec. Calling Available does not select a rendr mobility
+// implementation. Internal snapshot/restore may be used only for a raw TCP
+// endpoint that rendr owned from session establishment and only after local
+// eligibility and peer agreement have both succeeded.
 //
-// # What is NOT yet provided
+// What is not yet provided:
 //
-// Production integration with rendr's path migration machinery is not
-// yet provided. Specifically:
-//
-//   - Only an iptables-backed migration window is provided today.
-//     PathConn.MigratePathLocalAddr installs temporary DROP rules
-//     around the snapshot/restore window; nftables/conntrack policy
-//     backends are follow-up work.
+//   - A planner-owned prepare/commit/rollback transaction around the
+//     snapshot/restore window.
 //   - Server-side only. The client socket is untouched. Symmetric
 //     client-side TCP_REPAIR is required for true two-end migration.
 //   - Same 5-tuple. Restoring to a DIFFERENT local addr is what
@@ -34,5 +26,6 @@
 // Requires Linux >= 4.5 for full TCP_REPAIR_WINDOW support (base
 // TCP_REPAIR was added in kernel 3.5). Caller must hold
 // CAP_NET_ADMIN; the private Linux regression environment verifies
-// both privileged and permission-denied behavior.
+// both privileged and permission-denied behavior. TCP_REPAIR failure does not
+// imply that an existing kernel socket can be converted into a gVisor endpoint.
 package tcprepair

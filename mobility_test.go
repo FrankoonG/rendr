@@ -11,14 +11,18 @@ func TestGenericCarrierFactsNeverGrantOwnedMobility(t *testing.T) {
 		stream: map[string]streamPathFactory{
 			"tcp-family": func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
 			"udp-family": func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
+			"tcprepair":  func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
+			"gvisor":     func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
 		},
 		carrier: map[string]CarrierFamily{
 			"tcp-family": CarrierTCP,
 			"udp-family": CarrierUDP,
+			"tcprepair":  CarrierTCP,
+			"gvisor":     CarrierUnknown,
 		},
 	}
-	for _, factory := range []string{"tcp-family", "udp-family"} {
-		status := planLeafMobility(PathSpec{Transport: factory}, resolver)
+	for _, factory := range []string{"tcp-family", "udp-family", "tcprepair", "gvisor"} {
+		status := planLeafMobility(resolver.carrierFamily(factory))
 		if status.ID != MobilityRedialAttach {
 			t.Fatalf("factory=%s mobility=%q, want %q", factory, status.ID, MobilityRedialAttach)
 		}
@@ -29,8 +33,10 @@ func TestGenericCarrierFactsNeverGrantOwnedMobility(t *testing.T) {
 }
 
 func TestUnknownBuiltInPathFailsConservativelyToRedialAttach(t *testing.T) {
-	status := planLeafMobility(PathSpec{Transport: "implementation-name-must-not-matter"}, nil)
-	if status.ID != MobilityRedialAttach || status.Reason == "" {
-		t.Fatalf("status=%+v", status)
+	for _, name := range []string{"implementation-name-must-not-matter", "tcprepair", "gvisor"} {
+		status := planLeafMobility(CarrierUnknown)
+		if status.ID != MobilityRedialAttach || status.Reason == "" {
+			t.Fatalf("transport=%q status=%+v", name, status)
+		}
 	}
 }

@@ -69,7 +69,7 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	snap, err := Snapshot(srv)
+	snap, err := snapshot(srv)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 	}
 
 	// Suppress RSTs during the migration window using the same
-	// netfilter abstraction as PathConn.MigratePathLocalAddr.
+	// netfilter abstraction used by a future planner-owned transaction.
 	cleanupDrop, err := installDropRules(srvAddr, cliAddr)
 	if err != nil {
 		t.Fatalf("iptables drop: %v", err)
@@ -94,7 +94,7 @@ func TestSnapshotRestoreServerSide(t *testing.T) {
 		t.Fatalf("server close: %v", err)
 	}
 
-	newFd, err := Restore(snap)
+	newFd, err := restore(snap)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

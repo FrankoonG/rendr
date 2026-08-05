@@ -249,6 +249,7 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 		ZombieCooldown:      30 * time.Second,
 		Retry:               retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
+	controlled.Bind(t, d)
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +319,7 @@ func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
 			Address:   ln.Addr().String(),
 			Opts:      map[string]string{"mode": "datagram"},
 		}})}
+	bindOptionalFramedFactory(t, d, "quic")
 
 	client, err := d.DialPacket(context.Background())
 	if err != nil {
@@ -634,9 +636,11 @@ func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&sessionDialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
-		[]PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}})}).Dial(context.Background())
+		[]PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}})}
+	bindOptionalFramedFactory(t, d, "gvisor")
+	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1048,6 +1052,7 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		Path("A", controlled.Spec(ln.Addr().String(), "A")),
 		Path("B", controlled.Spec(ln.Addr().String(), "B")),
 	}), MigrationBudget: 3 * time.Second, ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -1627,6 +1632,7 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 		}),
 		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2256,6 +2262,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 		}),
 		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2378,6 +2385,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 		}),
 		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2616,6 +2624,7 @@ func TestM8BondPathPinning(t *testing.T) {
 		Path("A", controlled.Spec(ln.Addr().String(), "A")),
 		Path("B", controlled.Spec(ln.Addr().String(), "B")),
 	}), ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2887,6 +2896,7 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 		Path("low", controlled.Spec(ln.Addr().String(), "low")),
 		Path("high", controlled.Spec(ln.Addr().String(), "high")),
 	}), ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -3828,6 +3838,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 		// while the production selector evaluates it.
 		ProbeInterval: 30 * time.Second,
 	}
+	controlled.Bind(t, d)
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -3912,6 +3923,7 @@ func TestM2G1SketchQUIC(t *testing.T) {
 			{Transport: "quic", Address: ln.Addr().String()},
 			{Transport: "quic", Address: ln.Addr().String()},
 		})}
+	bindOptionalFramedFactory(t, d, "quic")
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4034,6 +4046,7 @@ func TestM2QUICRoundTrip(t *testing.T) {
 	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "quic", Address: ln.Addr().String()}})}
+	bindOptionalFramedFactory(t, d, "quic")
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4102,6 +4115,7 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 			{Transport: "tcp", Address: tcpAddr.String()},
 			{Transport: "quic", Address: quicAddr.String()},
 		}), MigrationBudget: 3 * time.Second}
+	bindOptionalFramedFactory(t, d, "quic")
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4204,12 +4218,14 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&sessionDialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: tcpAddr.String()},
 			{Transport: "quic", Address: quicAddr.String()},
-		}), MigrationBudget: 5 * time.Second}).Dial(context.Background())
+		}), MigrationBudget: 5 * time.Second}
+	bindOptionalFramedFactory(t, d, "quic")
+	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4364,6 +4380,7 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		Path("A", controlled.Spec(ln.Addr().String(), "A")),
 		Path("B", controlled.Spec(ln.Addr().String(), "B")),
 	}), MigrationBudget: 3 * time.Second, ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4490,6 +4507,7 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 		ProbeInterval:   30 * time.Second,
 		Retry:           retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
+	controlled.Bind(t, d)
 
 	client, err := d.Dial(context.Background())
 	if err != nil {

@@ -478,14 +478,16 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 			SaturationRatio: 0.99,
 		},
 	)
-	client, err := (&sessionDialer{
+	dialer := &sessionDialer{
 		Root:          root,
 		Hysteresis:    0.05,
 		Dwell:         100 * time.Millisecond,
 		Cooldown:      100 * time.Millisecond,
 		ProbeInterval: 30 * time.Second,
 		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
-	}).Dial(ctx)
+	}
+	controlled.Bind(t, dialer)
+	client, err := dialer.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,14 +555,16 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 		Path("A", spec("A")),
 		Path("B", spec("B")),
 	})
-	client, err := (&sessionDialer{
+	dialer := &sessionDialer{
 		Root:          root,
 		Hysteresis:    0.05,
 		Dwell:         100 * time.Millisecond,
 		Cooldown:      100 * time.Millisecond,
 		ProbeInterval: 30 * time.Second,
 		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
-	}).Dial(ctx)
+	}
+	controlled.Bind(t, dialer)
+	client, err := dialer.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,14 +654,16 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		},
 		PeakTransfer{Targets: []string{"D"}, SaturationFor: 10 * time.Second},
 	)
-	client, err := (&sessionDialer{
+	dialer := &sessionDialer{
 		Root:          root,
 		Hysteresis:    0.05,
 		Dwell:         100 * time.Millisecond,
 		Cooldown:      100 * time.Millisecond,
 		ProbeInterval: 30 * time.Second,
 		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
-	}).Dial(ctx)
+	}
+	controlled.Bind(t, dialer)
+	client, err := dialer.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,7 +750,9 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
+	dialer := &sessionDialer{Root: root, ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, dialer)
+	client, err := dialer.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +828,9 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
+	dialer := &sessionDialer{Root: root, ProbeInterval: 30 * time.Second}
+	controlled.Bind(t, dialer)
+	client, err := dialer.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

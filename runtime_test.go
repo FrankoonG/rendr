@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/transport/tcp"
 )
 
 func TestNewRuntimeFreezesNormalizedConfig(t *testing.T) {
@@ -83,6 +85,68 @@ func TestRuntimeFactoryDescriptorsValidateFacts(t *testing.T) {
 	}
 	if err := runtime.RegisterPacketFactory("packet", PacketFactory{Carrier: CarrierUDP, Dial: packetDial}); err != nil {
 		t.Fatal(err)
+	}
+	if err := runtime.RegisterFramedFactory("", FramedFactory{Factory: tcp.New()}); err == nil {
+		t.Fatal("empty framed factory name accepted")
+	}
+	if err := runtime.RegisterFramedFactory("framed", FramedFactory{}); err == nil {
+		t.Fatal("nil framed factory accepted")
+	}
+	var typedNil *tcp.Transport
+	if err := runtime.RegisterFramedFactory("typed-nil", FramedFactory{Factory: typedNil}); err == nil {
+		t.Fatal("typed-nil framed factory accepted")
+	}
+	if err := runtime.RegisterFramedFactory("framed", FramedFactory{Carrier: CarrierFamily(255), Factory: tcp.New()}); err == nil {
+		t.Fatal("invalid framed carrier accepted")
+	}
+	if err := runtime.RegisterFramedFactory("framed", FramedFactory{Carrier: CarrierTCP, Factory: tcp.New()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RegisterStreamFactory("framed", StreamFactory{Carrier: CarrierTCP, Dial: streamDial}); err == nil {
+		t.Fatal("framed/stream cross-kind duplicate accepted")
+	}
+	for _, reserved := range []string{"tcp", "udpflow"} {
+		if err := runtime.RegisterFramedFactory(reserved, FramedFactory{Carrier: CarrierTCP, Factory: tcp.New()}); err == nil {
+			t.Fatalf("built-in factory %q was shadowed", reserved)
+		}
+	}
+}
+
+func TestRuntimeFramedFactoryIDsCannotSelectMobility(t *testing.T) {
+	for _, name := range []string{"tcprepair", "gvisor", "arbitrary"} {
+		t.Run(name, func(t *testing.T) {
+			runtime, err := NewRuntime(RuntimeConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.RegisterFramedFactory(name, FramedFactory{Carrier: CarrierTCP, Factory: tcp.New()}); err != nil {
+				t.Fatal(err)
+			}
+			dialer, err := runtime.sessionDialer(SessionConfig{Root: Path("leaf", PathSpec{Transport: name, Address: "peer"})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := dialer.snapshotFactoryResolver()
+			if !resolver.hasFactory(name) {
+				t.Fatalf("factory %q missing from Runtime snapshot", name)
+			}
+			status := planLeafMobility(resolver.carrierFamily(name))
+			if status.ID != MobilityRedialAttach {
+				t.Fatalf("factory ID %q selected mobility %q", name, status.ID)
+			}
+
+			other, err := NewRuntime(RuntimeConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherDialer, err := other.sessionDialer(SessionConfig{Root: Path("leaf", PathSpec{Transport: name, Address: "peer"})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if otherDialer.snapshotFactoryResolver().hasFactory(name) {
+				t.Fatalf("factory %q leaked across Runtime instances", name)
+			}
+		})
 	}
 }
 

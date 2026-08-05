@@ -1,8 +1,8 @@
-// Package gvisor provides a user-space TCP transport backed by gVisor
-// netstack. It is the M4 no-CAP_NET_ADMIN companion to tcprepair:
-// no kernel TCP_REPAIR sockopts are needed. It supports both an
-// in-process virtual link for cheap tests and an outer UDP
-// packet-carrier link for real process/host boundaries.
+// Package gvisor provides a user-space TCP carrier backed by gVisor netstack.
+// It supports both an in-process virtual link for cheap tests and an outer UDP
+// packet-carrier link for real process/host boundaries. Selecting this carrier
+// does not select gvisor_packet_link_rebind mobility; that requires a
+// planner-owned endpoint handle and peer agreement.
 package gvisor
 
 import (
@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/transport"
@@ -38,42 +37,59 @@ const (
 var (
 	clientIP = tcpip.AddrFrom4([4]byte{10, 0, 0, 1})
 	serverIP = tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
-
-	regMu    sync.RWMutex
-	registry = map[string]*Listener{}
-	nextID   atomic.Uint64
 )
 
-// Transport is the gVisor netstack-backed TCP adapter.
-type Transport struct{}
-
-// New returns a gVisor transport.
-func New() *Transport { return &Transport{} }
-
-func init() {
-	if err := transport.Default.Register(New()); err != nil {
-		panic(err)
-	}
+// Domain owns process-local gVisor listener resolution. A Domain is explicit
+// so independent rendr Runtime instances never share hidden endpoint state.
+type Domain struct {
+	mu        sync.RWMutex
+	listeners map[string]*Listener
+	nextID    uint64
 }
 
-// Name implements transport.Transport.
-func (*Transport) Name() string { return "gvisor" }
+// NewDomain returns an isolated process-local gVisor endpoint domain.
+func NewDomain() *Domain {
+	return &Domain{listeners: make(map[string]*Listener)}
+}
 
-// Available reports whether the adapter is compiled in. Unlike
-// tcprepair, gVisor netstack needs no kernel capability probe.
+// Transport is the gVisor netstack-backed TCP adapter. A transport returned
+// by New dials real outer UDP packet carriers. Domain.Factory returns a
+// transport bound to one explicit process-local Domain.
+type Transport struct {
+	domain       *Domain
+	processLocal bool
+}
+
+// New returns a gVisor transport for real outer UDP packet carriers.
+func New() *Transport { return &Transport{} }
+
+// Factory returns a path factory scoped to d's process-local listeners.
+func (d *Domain) Factory() *Transport { return &Transport{domain: d, processLocal: true} }
+
+// Available reports whether the carrier is compiled in. It says nothing about
+// whether a particular session is eligible for packet-link rebinding.
 func Available() error { return nil }
 
-// DialPath connects to a process-local gVisor listener created by
-// Listen. The listener owns the virtual link and server stack; each
-// dial creates a fresh gVisor TCP connection over the client stack.
-func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
-	regMu.RLock()
-	l := registry[spec.Address]
-	regMu.RUnlock()
-	if l == nil {
-		return dialPacketCarrier(ctx, spec.Address)
+// DialPath uses the explicit Domain when this Transport came from
+// Domain.Factory; otherwise it connects through a real outer UDP packet
+// carrier. Each dial creates a fresh gVisor TCP connection.
+func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+	if t == nil {
+		return nil, errors.New("gvisor: nil Transport")
 	}
-	return l.dial(ctx)
+	if t.processLocal {
+		if t.domain == nil {
+			return nil, errors.New("gvisor: process-local factory has nil Domain")
+		}
+		t.domain.mu.RLock()
+		l, exists := t.domain.listeners[spec.Address]
+		t.domain.mu.RUnlock()
+		if !exists || l == nil {
+			return nil, fmt.Errorf("gvisor: process-local listener %q is unavailable", spec.Address)
+		}
+		return l.dial(ctx)
+	}
+	return dialPacketCarrier(ctx, spec.Address)
 }
 
 // Probe dials, captures handshake RTT, and closes.
@@ -92,6 +108,7 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 type Listener struct {
 	addr    string
 	netAddr net.Addr
+	domain  *Domain
 
 	client *stack.Stack
 	server *stack.Stack
@@ -125,20 +142,45 @@ type acceptResult struct {
 	err error
 }
 
-// Listen creates a process-local gVisor TCP listener. If addr is
-// empty, a unique address is allocated. The returned address is a
-// registry key, not an OS socket address.
-func Listen(addr string) (*Listener, error) {
-	if addr == "" {
-		addr = fmt.Sprintf("gvisor-%d", nextID.Add(1))
+// Listen creates a process-local gVisor TCP listener in d. If addr is empty, a
+// unique address is allocated within the Domain. The returned address is a
+// Domain-local key, not an OS socket address.
+func (d *Domain) Listen(addr string) (*Listener, error) {
+	if d == nil {
+		return nil, errors.New("gvisor: nil Domain")
 	}
-
-	regMu.Lock()
-	if _, exists := registry[addr]; exists {
-		regMu.Unlock()
+	d.mu.Lock()
+	if d.listeners == nil {
+		d.listeners = make(map[string]*Listener)
+	}
+	if addr == "" {
+		for {
+			d.nextID++
+			addr = fmt.Sprintf("gvisor-%d", d.nextID)
+			if _, exists := d.listeners[addr]; !exists {
+				break
+			}
+		}
+	}
+	if _, exists := d.listeners[addr]; exists {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("gvisor: listener %q already exists", addr)
 	}
-	regMu.Unlock()
+	// Reserve the key while stacks are constructed so concurrent duplicate
+	// Listen calls cannot both succeed.
+	d.listeners[addr] = nil
+	d.mu.Unlock()
+	reserved := true
+	defer func() {
+		if !reserved {
+			return
+		}
+		d.mu.Lock()
+		if listener, exists := d.listeners[addr]; exists && listener == nil {
+			delete(d.listeners, addr)
+		}
+		d.mu.Unlock()
+	}()
 
 	clientEP, serverEP := veth.NewPair(mtu, veth.DefaultBacklogSize)
 	clientStack, err := newStack(clientIP, clientEP)
@@ -163,6 +205,7 @@ func Listen(addr string) (*Listener, error) {
 
 	l := &Listener{
 		addr:        addr,
+		domain:      d,
 		client:      clientStack,
 		server:      serverStack,
 		ln:          ln,
@@ -171,15 +214,16 @@ func Listen(addr string) (*Listener, error) {
 		acceptDone:  make(chan struct{}),
 		cleanupDone: make(chan struct{}),
 	}
-	regMu.Lock()
-	registry[addr] = l
-	regMu.Unlock()
+	d.mu.Lock()
+	d.listeners[addr] = l
+	d.mu.Unlock()
+	reserved = false
 	go l.acceptLoop()
 	return l, nil
 }
 
 // ListenPacket creates a gVisor TCP listener whose virtual link is
-// carried by outer UDP datagrams. Unlike Listen, addr is a real OS UDP
+// carried by outer UDP datagrams. Unlike Domain.Listen, addr is a real OS UDP
 // listen address, so the transport can span processes or hosts while
 // remaining unprivileged.
 func ListenPacket(addr string) (*Listener, error) {
@@ -322,12 +366,6 @@ func (l *Listener) Close() error {
 		close(l.closed)
 		l.lifecycleMu.Unlock()
 
-		regMu.Lock()
-		if registry[l.addr] == l {
-			delete(registry, l.addr)
-		}
-		regMu.Unlock()
-
 		l.ln.Shutdown()
 		l.closeErr = l.ln.Close()
 		<-l.acceptDone
@@ -337,12 +375,22 @@ func (l *Listener) Close() error {
 	return l.closeErr
 }
 
-// Addr returns the process-local registry address.
+// Addr returns the Domain-local key or outer packet-carrier address.
 func (l *Listener) Addr() net.Addr {
 	if l.netAddr != nil {
 		return l.netAddr
 	}
 	return addr(l.addr)
+}
+
+// Factory returns the client path factory paired with this listener. For a
+// process-local listener it retains the explicit Domain; for a packet-carrier
+// listener it dials the listener's real UDP address.
+func (l *Listener) Factory() *Transport {
+	if l == nil {
+		return &Transport{processLocal: true}
+	}
+	return &Transport{domain: l.domain, processLocal: l.domain != nil}
 }
 
 func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
@@ -554,6 +602,13 @@ func (l *Listener) cleanupReadyLocked() bool {
 
 func (l *Listener) cleanupShared() {
 	l.cleanupOnce.Do(func() {
+		if l.domain != nil {
+			l.domain.mu.Lock()
+			if l.domain.listeners[l.addr] == l {
+				delete(l.domain.listeners, l.addr)
+			}
+			l.domain.mu.Unlock()
+		}
 		if l.wire != nil {
 			_ = l.wire.Close()
 		}

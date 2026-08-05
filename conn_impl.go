@@ -147,11 +147,6 @@ func (c *engineBackedConn) RemovePath(id uint32) error {
 	return c.e.RemovePath(id)
 }
 
-// MigratePathLocalAddr asks path id to rebuild itself at newLocal.
-func (c *engineBackedConn) MigratePathLocalAddr(id uint32, newLocal string) error {
-	return c.e.MigratePathLocalAddr(id, newLocal)
-}
-
 // AddPath dials a path matching spec through the session-bound factory
 // resolver and attaches it to this engine via BRIDGE_TAG. The new path joins
 // the existing flow on the server side without breaking the application's

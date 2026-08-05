@@ -63,6 +63,25 @@ func runtimeGVisorPacketSource(name, address string) runtimeFixtureSource {
 	return runtimeFixtureSource{name: name, kind: runtimeFixtureGVisorPacket, address: address}
 }
 
+func bindOptionalFramedFactory(tb testing.TB, dialer *sessionDialer, name string) {
+	tb.Helper()
+	var (
+		carrier CarrierFamily
+		factory transport.PathFactory
+	)
+	switch name {
+	case "quic":
+		carrier, factory = CarrierUDP, qadapter.New()
+	case "gvisor":
+		carrier, factory = CarrierUnknown, gadapter.New()
+	default:
+		tb.Fatalf("unknown optional framed factory %q", name)
+	}
+	if err := dialer.AddFramedPathFactory(name, carrier, factory); err != nil {
+		tb.Fatalf("bind optional framed factory %q: %v", name, err)
+	}
+}
+
 type runtimeListenerFixture struct {
 	listener    *SessionListener
 	sourceAddrs map[string]net.Addr
@@ -165,7 +184,7 @@ func listenRuntimeSources(sources ...runtimeFixtureSource) (*runtimeListenerFixt
 			framedPaths[source.name] = tracked
 			closers = append(closers, framed.Close)
 		case runtimeFixtureGVisor:
-			framed, listenErr := gadapter.Listen(source.address)
+			framed, listenErr := gadapter.NewDomain().Listen(source.address)
 			if listenErr != nil {
 				closeSources()
 				return nil, fmt.Errorf("test runtime source %q: %w", source.name, listenErr)
@@ -377,7 +396,6 @@ const runtimeControlledTCPTransportName = "rendr-test-controlled-tcp"
 
 var (
 	runtimeControlledTCPSequence atomic.Uint64
-	runtimeControlledTCPOnce     sync.Once
 	runtimeControlledTCPMux      = &runtimeControlledTCPMuxTransport{controllers: make(map[string]*runtimeControlledTCPTransport)}
 )
 
@@ -442,11 +460,6 @@ func newRuntimeControlledQUICTransport(t testing.TB) *runtimeControlledTCPTransp
 
 func newRuntimeControlledPathTransport(t testing.TB, baseTransport string) *runtimeControlledTCPTransport {
 	t.Helper()
-	runtimeControlledTCPOnce.Do(func() {
-		if err := transport.Default.Register(runtimeControlledTCPMux); err != nil {
-			panic(fmt.Sprintf("register controlled TCP test transport: %v", err))
-		}
-	})
 	tr := &runtimeControlledTCPTransport{
 		id:            fmt.Sprintf("control-%d", runtimeControlledTCPSequence.Add(1)),
 		baseTransport: baseTransport,
@@ -461,6 +474,17 @@ func newRuntimeControlledPathTransport(t testing.TB, baseTransport string) *runt
 }
 
 func (*runtimeControlledTCPTransport) Name() string { return runtimeControlledTCPTransportName }
+
+func (t *runtimeControlledTCPTransport) Bind(tb testing.TB, dialer *sessionDialer) {
+	tb.Helper()
+	carrier := CarrierTCP
+	if t.baseTransport == "quic" {
+		carrier = CarrierUDP
+	}
+	if err := dialer.AddFramedPathFactory(runtimeControlledTCPTransportName, carrier, runtimeControlledTCPMux); err != nil {
+		tb.Fatalf("bind controlled path factory: %v", err)
+	}
+}
 
 func (t *runtimeControlledTCPTransport) Spec(address, pathName string) PathSpec {
 	return PathSpec{
@@ -500,14 +524,9 @@ func (t *runtimeControlledTCPTransport) dialPath(ctx context.Context, spec trans
 			base = tadapter.Wrap(raw)
 		}
 	} else {
-		backend, lookupErr := transport.Default.Lookup(t.baseTransport)
-		if lookupErr != nil {
-			err = lookupErr
-		} else {
-			baseSpec := spec.Clone()
-			baseSpec.Transport = t.baseTransport
-			base, err = backend.DialPath(ctx, baseSpec)
-		}
+		baseSpec := spec.Clone()
+		baseSpec.Transport = t.baseTransport
+		base, err = qadapter.New().DialPath(ctx, baseSpec)
 	}
 
 	t.mu.Lock()
@@ -546,13 +565,15 @@ func (t *runtimeControlledTCPTransport) probe(ctx context.Context, spec transpor
 	t.dialing++
 	t.mu.Unlock()
 
-	backend, err := transport.Default.Lookup(t.baseTransport)
-	var quality transport.PathQuality
-	if err == nil {
-		baseSpec := spec.Clone()
-		baseSpec.Transport = t.baseTransport
-		quality, err = backend.Probe(ctx, baseSpec)
+	var backend transport.PathFactory = tadapter.New()
+	if t.baseTransport == "quic" {
+		backend = qadapter.New()
 	}
+	var err error
+	var quality transport.PathQuality
+	baseSpec := spec.Clone()
+	baseSpec.Transport = t.baseTransport
+	quality, err = backend.Probe(ctx, baseSpec)
 
 	t.mu.Lock()
 	t.dialing--
@@ -834,9 +855,8 @@ func TestRuntimeSessionListenerStandardHTTPServer(t *testing.T) {
 }
 
 func TestRuntimeConnectionsExcludeTestBackdoors(t *testing.T) {
-	// This contract covers the removed Engine/ForceKill test-only surfaces.
-	// Manual mobility administration is a separate D11 slice and is not
-	// presented here as a test backdoor.
+	// This contract covers removed engine, fault-injection, and manual mobility
+	// surfaces. Mobility planning is internal and read-only through Status.
 	t.Run("stream", func(t *testing.T) {
 		fixture, err := listenRuntimeTCP("127.0.0.1:0")
 		if err != nil {
@@ -985,7 +1005,7 @@ func assertNoRuntimeTestBackdoors(t *testing.T, label string, value any) {
 		t.Fatalf("%s exposes ForceKillPathForTest through interface assertion", label)
 	}
 	valueType := reflect.TypeOf(value)
-	for _, method := range []string{"Engine", "ForceKillPathForTest"} {
+	for _, method := range []string{"Engine", "ForceKillPathForTest", "MigratePathLocalAddr"} {
 		if _, exposed := valueType.MethodByName(method); exposed {
 			t.Fatalf("%s exposes production method %s", label, method)
 		}

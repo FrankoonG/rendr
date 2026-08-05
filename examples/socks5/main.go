@@ -139,20 +139,7 @@ func runClient(ctx context.Context, cfg config) error {
 }
 
 func newRendrRuntime() (*rendr.Runtime, error) {
-	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
-	if err != nil {
-		return nil, err
-	}
-	tcpDialer := &net.Dialer{}
-	if err := runtime.RegisterStreamFactory("tcp", rendr.StreamFactory{
-		Carrier: rendr.CarrierTCP,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
-			return tcpDialer.DialContext(ctx, "tcp", addr)
-		},
-	}); err != nil {
-		return nil, err
-	}
-	return runtime, nil
+	return rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 }
 
 func serveSOCKSConn(ctx context.Context, raw net.Conn, dial func(context.Context) (rendr.Conn, error)) error {

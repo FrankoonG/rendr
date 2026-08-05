@@ -17,7 +17,7 @@ func requireTCPRepairWindowKernel() error {
 		return nil
 	}
 	if version.lessThan(4, 5) {
-		return fmt.Errorf("tcprepair: TCP_REPAIR_WINDOW requires Linux >= 4.5 (kernel %s), use gvisor fallback", release)
+		return fmt.Errorf("tcprepair: TCP_REPAIR_WINDOW requires Linux >= 4.5 (kernel %s)", release)
 	}
 	return nil
 }

@@ -146,7 +146,7 @@ func (s *pathRecoverySupervisor) loop(cancel func(), desired []PathSpec, ready c
 	closing := false
 
 	for index, spec := range desired {
-		if planLeafMobility(spec, s.resolver).ID != MobilityRedialAttach {
+		if planLeafMobility(s.resolver.carrierFamily(spec.Transport)).ID != MobilityRedialAttach {
 			continue
 		}
 		key := recoveryLeafKey(spec)
@@ -365,7 +365,7 @@ func (s *pathRecoverySupervisor) loop(cancel func(), desired []PathSpec, ready c
 				}
 				continue
 			}
-			if planLeafMobility(event.Spec, s.resolver).ID != MobilityRedialAttach {
+			if planLeafMobility(s.resolver.carrierFamily(event.Spec.Transport)).ID != MobilityRedialAttach {
 				if update.reply != nil {
 					update.reply <- activeWorkers
 				}

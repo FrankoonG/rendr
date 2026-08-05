@@ -108,29 +108,27 @@ func (p *handshakeAdversarialPath) OnDeath(fn func(transport.DeathCause, error))
 func (*handshakeAdversarialPath) LocalAddr() string  { return "handshake-adversarial-local" }
 func (*handshakeAdversarialPath) RemoteAddr() string { return "handshake-adversarial-remote" }
 
-func registerHandshakeAdversarialTransport(t *testing.T, name string, path transport.PathConn) {
+func handshakeAdversarialSessionDialer(t *testing.T, transportName string, path transport.PathConn) *sessionDialer {
 	t.Helper()
-	if err := transport.Default.Register(&handshakeAdversarialTransport{name: name, path: path}); err != nil {
-		t.Fatalf("register test transport %q: %v", name, err)
-	}
-}
-
-func handshakeAdversarialSessionDialer(transportName string) *sessionDialer {
-	return &sessionDialer{Root: Path("handshake-path", PathSpec{
+	dialer := &sessionDialer{Root: Path("handshake-path", PathSpec{
 		Transport: transportName,
 		Address:   "handshake-peer",
 	})}
+	if err := dialer.AddFramedPathFactory(transportName, CarrierUnknown, &handshakeAdversarialTransport{name: transportName, path: path}); err != nil {
+		t.Fatalf("register test transport %q: %v", transportName, err)
+	}
+	return dialer
 }
 
 func TestDialContextCancellationBoundsHelloAckWait(t *testing.T) {
 	transportName := nextHandshakeAdversarialTransportName("context-cancel")
 	path := newHandshakeAdversarialPath(nil)
-	registerHandshakeAdversarialTransport(t, transportName, path)
+	dialer := handshakeAdversarialSessionDialer(t, transportName, path)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		conn, err := handshakeAdversarialSessionDialer(transportName).Dial(ctx)
+		conn, err := dialer.Dial(ctx)
 		if conn != nil {
 			_ = conn.Close()
 		}
@@ -217,9 +215,9 @@ func TestDialPacketRejectsHelloAckWithoutPacketCapability(t *testing.T) {
 		copy(response[proto.HeaderSize:], ackPayload)
 		return response, nil
 	})
-	registerHandshakeAdversarialTransport(t, transportName, path)
+	dialer := handshakeAdversarialSessionDialer(t, transportName, path)
 
-	packetConn, err := handshakeAdversarialSessionDialer(transportName).DialPacket(context.Background())
+	packetConn, err := dialer.DialPacket(context.Background())
 	if packetConn != nil {
 		_ = packetConn.Close()
 	}
@@ -252,9 +250,9 @@ func TestDialReportsTypedProtocolNegotiationRejection(t *testing.T) {
 		response[proto.HeaderSize] = byte(proto.ByeProtoVer)
 		return response, nil
 	})
-	registerHandshakeAdversarialTransport(t, transportName, path)
+	dialer := handshakeAdversarialSessionDialer(t, transportName, path)
 
-	conn, err := handshakeAdversarialSessionDialer(transportName).Dial(context.Background())
+	conn, err := dialer.Dial(context.Background())
 	if conn != nil {
 		_ = conn.Close()
 	}

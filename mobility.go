@@ -22,13 +22,9 @@ type MobilityStatus struct {
 	PlannedAt time.Time
 }
 
-func planLeafMobility(spec PathSpec, resolver *pathFactoryResolver) MobilityStatus {
+func planLeafMobility(carrier CarrierFamily) MobilityStatus {
 	planned := MobilityStatus{ID: MobilityRedialAttach, PlannedAt: time.Now()}
-	if resolver == nil || !resolver.hasFactory(spec.Transport) {
-		planned.Reason = "no owned mobility endpoint; use framed redial/attach"
-		return planned
-	}
-	switch resolver.carrierFamily(spec.Transport) {
+	switch carrier {
 	case CarrierTCP:
 		planned.Reason = "generic TCP-family factory does not grant TCB ownership"
 	case CarrierUDP:

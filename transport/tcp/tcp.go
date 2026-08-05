@@ -29,16 +29,6 @@ type Transport struct{}
 // New returns a Transport ready for use.
 func New() *Transport { return &Transport{} }
 
-func init() {
-	if err := transport.Default.Register(New()); err != nil {
-		// Duplicate registration is a programming error in init() chains.
-		panic(err)
-	}
-}
-
-// Name implements transport.Transport.
-func (*Transport) Name() string { return "tcp" }
-
 // DialPath dials a TCP socket and wraps it in a PathConn.
 //
 // Disables Go's default 15-second TCP keepalive (Dialer.KeepAlive < 0).

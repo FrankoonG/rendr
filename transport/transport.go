@@ -5,13 +5,10 @@ import (
 	"io"
 )
 
-// Transport is the factory for one kind of underlying network
-// path. Implementations are registered globally (or attached to a
-// Runtime/session listener) and looked up by Name().
-type Transport interface {
-	// Name is the identifier the embedder uses in PathSpec.Transport.
-	Name() string
-
+// PathFactory opens one kind of already-framed network path. A factory is
+// registered explicitly on a rendr Runtime under an opaque caller-chosen ID;
+// the ID is not part of this interface and cannot select leaf mobility.
+type PathFactory interface {
 	// DialPath establishes a single PathConn for spec. The returned
 	// PathConn is already past any TLS/handshake stage; if the
 	// handshake itself fails, DialPath returns the error and no

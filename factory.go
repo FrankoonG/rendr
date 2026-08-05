@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"fmt"
 	"net"
 
 	"github.com/FrankoonG/rendr/transport"
@@ -18,20 +19,41 @@ type packetPathFactory func(context.Context, string) (net.PacketConn, error)
 type pathFactoryResolver struct {
 	stream  map[string]streamPathFactory
 	packet  map[string]packetPathFactory
+	framed  map[string]transport.PathFactory
 	carrier map[string]CarrierFamily
+}
+
+func builtinPathFactories() map[string]transport.PathFactory {
+	return map[string]transport.PathFactory{
+		"tcp":     tcp.New(),
+		"udpflow": udpflow.New(),
+	}
+}
+
+func isBuiltinPathFactory(name string) bool {
+	switch name {
+	case "tcp", "udpflow":
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *sessionDialer) snapshotFactoryResolver() *pathFactoryResolver {
 	resolver := &pathFactoryResolver{
 		stream:  make(map[string]streamPathFactory, len(d.streamFactories)),
 		packet:  make(map[string]packetPathFactory, len(d.packetFactories)),
-		carrier: make(map[string]CarrierFamily, len(d.factoryCarriers)),
+		framed:  builtinPathFactories(),
+		carrier: map[string]CarrierFamily{"tcp": CarrierTCP, "udpflow": CarrierUDP},
 	}
 	for name, factory := range d.streamFactories {
 		resolver.stream[name] = factory
 	}
 	for name, factory := range d.packetFactories {
 		resolver.packet[name] = factory
+	}
+	for name, factory := range d.framedFactories {
+		resolver.framed[name] = factory
 	}
 	for name, carrier := range d.factoryCarriers {
 		resolver.carrier[name] = carrier
@@ -52,13 +74,13 @@ func (r *pathFactoryResolver) hasFactory(name string) bool {
 	}
 	_, stream := r.stream[name]
 	_, packet := r.packet[name]
-	return stream || packet
+	_, framed := r.framed[name]
+	return stream || packet || framed
 }
 
-// dialPath resolves a path against the session snapshot before consulting the
-// process-wide transport registry. The nil receiver is intentional: inbound
-// listener sessions have no caller-provided factories and retain the existing
-// registry-only AddPath behavior.
+// dialPath resolves a path only against the immutable session snapshot. This
+// preserves the same Runtime-local factory for initial dial, explicit AddPath,
+// and recovery retries; unknown IDs fail closed.
 func (r *pathFactoryResolver) dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 	if r != nil {
 		if factory, ok := r.stream[spec.Transport]; ok {
@@ -75,6 +97,9 @@ func (r *pathFactoryResolver) dialPath(ctx context.Context, spec PathSpec) (tran
 			}
 			return udpflow.WrapFromSpec(conn, spec)
 		}
+		if factory, ok := r.framed[spec.Transport]; ok {
+			return factory.DialPath(ctx, spec)
+		}
 	}
-	return dialPath(ctx, spec)
+	return nil, fmt.Errorf("rendr: path factory %q is not registered on this Runtime", spec.Transport)
 }

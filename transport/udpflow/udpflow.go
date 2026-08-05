@@ -22,7 +22,7 @@ import (
 // adapter discards oversize writes.
 const MaxDatagram = 1400
 
-// Transport implements transport.Transport over opaque UDP. spec.Opts
+// Transport opens framed paths over opaque UDP. spec.Opts
 // recognised keys:
 //
 //	flow_id_hex   14-char hex; overrides the random flow id.
@@ -31,9 +31,6 @@ type Transport struct{}
 
 // New returns a Transport ready for client-side use.
 func New() *Transport { return &Transport{} }
-
-// Name implements transport.Transport.
-func (*Transport) Name() string { return "udpflow" }
 
 // DialPath dials a UDP socket toward spec.Address, generates a
 // random flow_id (or accepts one from spec.Opts), and returns a
@@ -311,12 +308,6 @@ func hexNibble(c byte) (byte, error) {
 		return c - 'A' + 10, nil
 	}
 	return 0, fmt.Errorf("udpflow: bad hex char %q", c)
-}
-
-func init() {
-	if err := transport.Default.Register(New()); err != nil {
-		panic(err)
-	}
 }
 
 // Wrap promotes an external net.PacketConn into an udpflow PathConn.

@@ -85,10 +85,9 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 	}
 }
 
-// TestM9X5StreamFactoryFallback: when a PathSpec.Transport matches a
-// global registry transport AND a factory of the same name exists on
-// the session dialer, the factory wins. Conversely, an unregistered factory
-// name falls through to the global registry without error.
+// TestM9X5StreamFactoryFallback keeps its historical test ID while verifying
+// the v1 Runtime boundary: unknown IDs fail closed and immutable built-ins are
+// available without a process-global registry.
 func TestM9X5StreamFactoryFallback(t *testing.T) {
 	// Part 1: unknown transport name returns an error and does NOT
 	// touch any listener. Use a closed listener to source an address
@@ -104,8 +103,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 		t.Fatal("expected dial error for unknown transport")
 	}
 
-	// Part 2: "tcp" used without a factory -> falls back to the
-	// global transport.Default registry. Wait for the accept-side
+	// Part 2: "tcp" is an immutable built-in framed factory. Wait for the accept-side
 	// HELLO to fully complete before closing the listener to avoid
 	// racing with listener.handleHello on teardown.
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
@@ -128,7 +126,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 	d2 := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	c, err := d2.Dial(context.Background())
 	if err != nil {
-		t.Fatalf("Dial via global tcp: %v", err)
+		t.Fatalf("Dial via built-in tcp: %v", err)
 	}
 	srv := <-accepted
 	c.Close()

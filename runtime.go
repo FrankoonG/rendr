@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/transport"
 )
 
-// Runtime owns process-wide rendr policy defaults, factory registrations,
+// Runtime owns one isolated set of rendr policy defaults, factory registrations,
 // capability state, and runtime identity. Configuration is copied and frozen
 // by NewRuntime; individual sessions supply only SessionConfig.
 type Runtime struct {
@@ -20,6 +22,7 @@ type Runtime struct {
 	mu              sync.RWMutex
 	streamFactories map[string]StreamFactory
 	packetFactories map[string]PacketFactory
+	framedFactories map[string]FramedFactory
 
 	listenMu sync.Mutex
 	listener *SessionListener
@@ -84,6 +87,15 @@ type PacketFactory struct {
 	Dial func(context.Context, string) (net.PacketConn, error)
 }
 
+// FramedFactory registers an advanced carrier whose Factory already
+// returns a transport.PathConn with rendr frame boundaries. It is intended for
+// optional adapters such as QUIC and gVisor. Like the generic factories, it
+// states only carrier facts and never grants owned mobility.
+type FramedFactory struct {
+	Carrier CarrierFamily
+	Factory transport.PathFactory
+}
+
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 	normalized, err := normalizeRuntimeConfig(config)
 	if err != nil {
@@ -95,6 +107,7 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 		bridges:         engine.NewBridgeTable(),
 		streamFactories: make(map[string]StreamFactory),
 		packetFactories: make(map[string]PacketFactory),
+		framedFactories: make(map[string]FramedFactory),
 	}, nil
 }
 
@@ -140,11 +153,17 @@ func (r *Runtime) RegisterStreamFactory(name string, factory StreamFactory) erro
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if isBuiltinPathFactory(name) {
+		return fmt.Errorf("rendr: stream factory %q conflicts with a built-in carrier", name)
+	}
 	if _, exists := r.streamFactories[name]; exists {
 		return fmt.Errorf("rendr: stream factory %q already registered", name)
 	}
 	if _, exists := r.packetFactories[name]; exists {
 		return fmt.Errorf("rendr: %q already registered as PacketFactory", name)
+	}
+	if _, exists := r.framedFactories[name]; exists {
+		return fmt.Errorf("rendr: %q already registered as FramedFactory", name)
 	}
 	r.streamFactories[name] = factory
 	return nil
@@ -165,13 +184,53 @@ func (r *Runtime) RegisterPacketFactory(name string, factory PacketFactory) erro
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if isBuiltinPathFactory(name) {
+		return fmt.Errorf("rendr: packet factory %q conflicts with a built-in carrier", name)
+	}
 	if _, exists := r.packetFactories[name]; exists {
 		return fmt.Errorf("rendr: packet factory %q already registered", name)
 	}
 	if _, exists := r.streamFactories[name]; exists {
 		return fmt.Errorf("rendr: %q already registered as StreamFactory", name)
 	}
+	if _, exists := r.framedFactories[name]; exists {
+		return fmt.Errorf("rendr: %q already registered as FramedFactory", name)
+	}
 	r.packetFactories[name] = factory
+	return nil
+}
+
+// RegisterFramedFactory registers an optional already-framed carrier. Sessions
+// snapshot the descriptor at dial time. The registration ID is an opaque
+// lookup key and is never passed to the mobility planner.
+func (r *Runtime) RegisterFramedFactory(name string, factory FramedFactory) error {
+	if r == nil {
+		return fmt.Errorf("rendr: nil Runtime")
+	}
+	if name == "" {
+		return fmt.Errorf("rendr: empty FramedFactory name")
+	}
+	if nilPathFactory(factory.Factory) {
+		return fmt.Errorf("rendr: nil FramedFactory.Factory %q", name)
+	}
+	if !factory.Carrier.valid() {
+		return fmt.Errorf("rendr: invalid FramedFactory carrier %d", factory.Carrier)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if isBuiltinPathFactory(name) {
+		return fmt.Errorf("rendr: framed factory %q conflicts with a built-in carrier", name)
+	}
+	if _, exists := r.streamFactories[name]; exists {
+		return fmt.Errorf("rendr: %q already registered as StreamFactory", name)
+	}
+	if _, exists := r.packetFactories[name]; exists {
+		return fmt.Errorf("rendr: %q already registered as PacketFactory", name)
+	}
+	if _, exists := r.framedFactories[name]; exists {
+		return fmt.Errorf("rendr: framed factory %q already registered", name)
+	}
+	r.framedFactories[name] = factory
 	return nil
 }
 
@@ -184,7 +243,7 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 	}
 	r.mu.RLock()
 	streams := make(map[string]streamPathFactory, len(r.streamFactories))
-	carriers := make(map[string]CarrierFamily, len(r.streamFactories)+len(r.packetFactories))
+	carriers := make(map[string]CarrierFamily, len(r.streamFactories)+len(r.packetFactories)+len(r.framedFactories))
 	for name, factory := range r.streamFactories {
 		streams[name] = factory.Dial
 		carriers[name] = factory.Carrier
@@ -192,6 +251,11 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 	packets := make(map[string]packetPathFactory, len(r.packetFactories))
 	for name, factory := range r.packetFactories {
 		packets[name] = factory.Dial
+		carriers[name] = factory.Carrier
+	}
+	framed := make(map[string]transport.PathFactory, len(r.framedFactories))
+	for name, factory := range r.framedFactories {
+		framed[name] = factory.Factory
 		carriers[name] = factory.Carrier
 	}
 	r.mu.RUnlock()
@@ -202,8 +266,22 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 		InstanceID:         r.instanceID,
 		streamFactories:    streams,
 		packetFactories:    packets,
+		framedFactories:    framed,
 		factoryCarriers:    carriers,
 	}, nil
+}
+
+func nilPathFactory(factory transport.PathFactory) bool {
+	if factory == nil {
+		return true
+	}
+	value := reflect.ValueOf(factory)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (r *Runtime) engineLimits() engine.Limits {

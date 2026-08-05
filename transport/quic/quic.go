@@ -38,15 +38,6 @@ func New() *Transport {
 	return &Transport{ClientTLS: ct}
 }
 
-func init() {
-	if err := transport.Default.Register(New()); err != nil {
-		panic(err)
-	}
-}
-
-// Name implements transport.Transport.
-func (*Transport) Name() string { return "quic" }
-
 // DefaultUDPBufferBytes is the SO_RCVBUF / SO_SNDBUF target the QUIC
 // adapter applies to every UDP socket it opens. 8 MiB is what
 // G3 100k-pps DATAGRAM validation needed on Linux; smaller defaults

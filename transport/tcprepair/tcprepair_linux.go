@@ -28,9 +28,9 @@ const (
 	tcpDumpQueueMax = 64 << 20
 )
 
-// State is the immutable snapshot of one server-side TCP connection's
-// kernel state. Produced by Snapshot, consumed by Restore.
-type State struct {
+// state is the internal snapshot of one server-side TCP connection's kernel
+// state. It never crosses the planner-owned transaction boundary.
+type state struct {
 	LocalAddr  *net.TCPAddr
 	RemoteAddr *net.TCPAddr
 	SendSeq    uint32
@@ -63,16 +63,35 @@ type tcpRepairWindowVal struct {
 	RcvWup uint32
 }
 
-// Snapshot captures all state needed to rebuild a TCP socket
+type snapshotOps interface {
+	setInt(fd, opt, value int) error
+	getInt(fd, opt int) (int, error)
+	dumpQueue(fd int) ([]byte, error)
+	getRaw(fd, opt int, buf []byte) (int, error)
+}
+
+type syscallSnapshotOps struct{}
+
+func (syscallSnapshotOps) setInt(fd, opt, value int) error  { return setInt(fd, opt, value) }
+func (syscallSnapshotOps) getInt(fd, opt int) (int, error)  { return getInt(fd, opt) }
+func (syscallSnapshotOps) dumpQueue(fd int) ([]byte, error) { return dumpQueue(fd) }
+func (syscallSnapshotOps) getRaw(fd, opt int, buf []byte) (int, error) {
+	return getRaw(fd, opt, buf)
+}
+
+// snapshot captures all state needed to rebuild a TCP socket
 // equivalent to c. Caller MUST keep c alive (and unread/unwritten)
-// during this call — Snapshot toggles TCP_REPAIR mode on the live
-// fd, peeks at the kernel queues, and resets TCP_REPAIR before
-// returning.
+// during this call. Snapshot leaves the socket in TCP_REPAIR mode on success
+// so a transaction can close it without emitting FIN/RST. If any capture step
+// fails, Snapshot restores the live socket to normal mode before returning.
 //
 // Snapshot does NOT close c. The canonical migration sequence
 // installs an iptables DROP on the 5-tuple, calls Snapshot, then
 // closes c, then Restore on a new fd, then removes the iptables rule.
-func Snapshot(c *net.TCPConn) (*State, error) {
+func snapshot(c *net.TCPConn) (*state, error) {
+	if c == nil {
+		return nil, errors.New("tcprepair: nil TCPConn")
+	}
 	la, ok := c.LocalAddr().(*net.TCPAddr)
 	if !ok {
 		return nil, fmt.Errorf("tcprepair: LocalAddr is not *net.TCPAddr")
@@ -81,57 +100,10 @@ func Snapshot(c *net.TCPConn) (*State, error) {
 	if !ok {
 		return nil, fmt.Errorf("tcprepair: RemoteAddr is not *net.TCPAddr")
 	}
-	s := &State{LocalAddr: la, RemoteAddr: ra}
+	s := &state{LocalAddr: la, RemoteAddr: ra}
 
 	err := control(c, func(fd int) error {
-		if err := setInt(fd, tcpRepair, 1); err != nil {
-			return fmt.Errorf("enter repair: %w", err)
-		}
-
-		if err := setInt(fd, tcpRepairQueue, tcpSendQueue); err != nil {
-			return fmt.Errorf("queue=send: %w", err)
-		}
-		ss, err := getInt(fd, tcpQueueSeq)
-		if err != nil {
-			return fmt.Errorf("get send_seq: %w", err)
-		}
-		s.SendSeq = uint32(ss)
-		s.SendQueue, err = dumpQueue(fd)
-		if err != nil {
-			return fmt.Errorf("dump send queue: %w", err)
-		}
-
-		if err := setInt(fd, tcpRepairQueue, tcpRecvQueue); err != nil {
-			return fmt.Errorf("queue=recv: %w", err)
-		}
-		rs, err := getInt(fd, tcpQueueSeq)
-		if err != nil {
-			return fmt.Errorf("get recv_seq: %w", err)
-		}
-		s.RecvSeq = uint32(rs)
-		s.RecvQueue, err = dumpQueue(fd)
-		if err != nil {
-			return fmt.Errorf("dump recv queue: %w", err)
-		}
-
-		if err := setInt(fd, tcpRepairQueue, tcpNoQueue); err != nil {
-			return fmt.Errorf("queue=none: %w", err)
-		}
-
-		ibuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Info)), int(unsafe.Sizeof(s.Info)))
-		if _, err := getRaw(fd, tcpInfoOpt, ibuf); err != nil {
-			return fmt.Errorf("get tcp_info: %w", err)
-		}
-		ts, err := getInt(fd, tcpTimestamp)
-		if err != nil {
-			return fmt.Errorf("get ts: %w", err)
-		}
-		s.Timestamp = uint32(ts)
-		wbuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Window)), int(unsafe.Sizeof(s.Window)))
-		if _, err := getRaw(fd, tcpRepairWindow, wbuf); err != nil {
-			return repairWindowError("get repair_window", err)
-		}
-		return nil
+		return captureState(fd, s, syscallSnapshotOps{})
 	})
 	if err != nil {
 		return nil, err
@@ -139,18 +111,85 @@ func Snapshot(c *net.TCPConn) (*State, error) {
 	return s, nil
 }
 
-// Restore builds a new TCP socket equivalent to the connection that
+func captureState(fd int, s *state, ops snapshotOps) (retErr error) {
+	if err := ops.setInt(fd, tcpRepair, 1); err != nil {
+		return fmt.Errorf("enter repair: %w", err)
+	}
+	keepRepair := false
+	defer func() {
+		if keepRepair {
+			return
+		}
+		_ = ops.setInt(fd, tcpRepairQueue, tcpNoQueue)
+		if err := ops.setInt(fd, tcpRepair, 0); err != nil {
+			exitErr := fmt.Errorf("exit repair after snapshot failure: %w", err)
+			if retErr == nil {
+				retErr = exitErr
+			} else {
+				retErr = errors.Join(retErr, exitErr)
+			}
+		}
+	}()
+
+	if err := ops.setInt(fd, tcpRepairQueue, tcpSendQueue); err != nil {
+		return fmt.Errorf("queue=send: %w", err)
+	}
+	ss, err := ops.getInt(fd, tcpQueueSeq)
+	if err != nil {
+		return fmt.Errorf("get send_seq: %w", err)
+	}
+	s.SendSeq = uint32(ss)
+	s.SendQueue, err = ops.dumpQueue(fd)
+	if err != nil {
+		return fmt.Errorf("dump send queue: %w", err)
+	}
+
+	if err := ops.setInt(fd, tcpRepairQueue, tcpRecvQueue); err != nil {
+		return fmt.Errorf("queue=recv: %w", err)
+	}
+	rs, err := ops.getInt(fd, tcpQueueSeq)
+	if err != nil {
+		return fmt.Errorf("get recv_seq: %w", err)
+	}
+	s.RecvSeq = uint32(rs)
+	s.RecvQueue, err = ops.dumpQueue(fd)
+	if err != nil {
+		return fmt.Errorf("dump recv queue: %w", err)
+	}
+
+	if err := ops.setInt(fd, tcpRepairQueue, tcpNoQueue); err != nil {
+		return fmt.Errorf("queue=none: %w", err)
+	}
+
+	ibuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Info)), int(unsafe.Sizeof(s.Info)))
+	if _, err := ops.getRaw(fd, tcpInfoOpt, ibuf); err != nil {
+		return fmt.Errorf("get tcp_info: %w", err)
+	}
+	ts, err := ops.getInt(fd, tcpTimestamp)
+	if err != nil {
+		return fmt.Errorf("get ts: %w", err)
+	}
+	s.Timestamp = uint32(ts)
+	wbuf := unsafe.Slice((*byte)(unsafe.Pointer(&s.Window)), int(unsafe.Sizeof(s.Window)))
+	if _, err := ops.getRaw(fd, tcpRepairWindow, wbuf); err != nil {
+		return repairWindowError("get repair_window", err)
+	}
+	keepRepair = true
+	return nil
+}
+
+// restore builds a new TCP socket equivalent to the connection that
 // produced s. Returns the new fd (already out of REPAIR mode);
 // caller wraps via os.NewFile + net.FileConn. Caller is responsible
 // for installing/removing an iptables DROP on s.LocalAddr+s.RemoteAddr
 // to suppress the brief RST window between original close and new
 // socket exit-of-REPAIR.
-func Restore(s *State) (int, error) {
+func restore(s *state) (int, error) {
 	if s == nil {
-		return -1, errors.New("tcprepair: nil State")
+		return -1, errors.New("tcprepair: nil state")
 	}
 	if s.LocalAddr == nil || s.RemoteAddr == nil {
-		return -1, errors.New("tcprepair: State has nil addresses")
+		return -1, errors.New("tcprepair: state has nil addresses")
 	}
 	if s.LocalAddr.IP.To4() == nil || s.RemoteAddr.IP.To4() == nil {
 		return -1, errors.New("tcprepair: IPv6 not yet supported")
@@ -253,7 +292,7 @@ func Restore(s *State) (int, error) {
 
 func repairWindowError(op string, err error) error {
 	if errors.Is(err, syscall.ENOPROTOOPT) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) {
-		return fmt.Errorf("%s: %w (TCP_REPAIR_WINDOW requires Linux >= 4.5; use gvisor fallback)", op, err)
+		return fmt.Errorf("%s: %w (TCP_REPAIR_WINDOW requires Linux >= 4.5)", op, err)
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }

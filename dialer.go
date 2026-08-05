@@ -88,6 +88,7 @@ type sessionDialer struct {
 	// Factory maps are immutable snapshots of the owning Runtime registry.
 	streamFactories map[string]streamPathFactory
 	packetFactories map[string]packetPathFactory
+	framedFactories map[string]transport.PathFactory
 	factoryCarriers map[string]CarrierFamily
 }
 
@@ -110,7 +111,7 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 	for index, spec := range paths {
-		tracker.setMobility(index, planLeafMobility(spec, resolver))
+		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
 	flowID := engine.NewClientFlowID()
@@ -191,7 +192,7 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	resolver := d.snapshotFactoryResolver()
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 	for index, spec := range paths {
-		tracker.setMobility(index, planLeafMobility(spec, resolver))
+		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
 	flowID := engine.NewClientFlowID()
@@ -442,17 +443,6 @@ func (d *sessionDialer) engineLimits() engine.Limits {
 		limits.SelectorCooldown = d.Cooldown
 	}
 	return limits
-}
-
-// dialPath resolves spec to a transport.PathConn via the global
-// transport.Default registry. Used by post-dial paths (AddPath) that
-// don't have access to the originating Runtime's factory snapshot.
-func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
-	tp, err := transport.Default.Lookup(spec.Transport)
-	if err != nil {
-		return nil, err
-	}
-	return tp.DialPath(ctx, spec)
 }
 
 var (
