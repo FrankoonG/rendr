@@ -127,27 +127,6 @@ type StatusReporter interface {
 	Status() Status
 }
 
-type IngressMode string
-
-const (
-	IngressTUN IngressMode = "tun"
-	IngressL7  IngressMode = "l7"
-)
-
-type FallbackPolicy string
-
-const (
-	FallbackAllow FallbackPolicy = "allow"
-	FallbackDeny  FallbackPolicy = "deny"
-)
-
-// IngressRuntimeConfig describes ingress capability preferences and fallback
-// behavior.
-type IngressRuntimeConfig struct {
-	IngressMode IngressMode
-	Fallback    FallbackPolicy
-}
-
 type PrimaryPolicy string
 
 const (

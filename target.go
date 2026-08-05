@@ -63,40 +63,18 @@ func Selector(name string, children []Target, opts ...SelectorOption) Target {
 }
 
 // Race constructs a race target.
-func Race(name string, children []Target, opts ...RaceOption) Target {
-	g := GroupTarget{TargetName: name, Kind: TargetKindRace, Children: append([]Target(nil), children...)}
-	for _, opt := range opts {
-		if opt != nil {
-			opt.applyRace(&g)
-		}
-	}
-	return g
+func Race(name string, children []Target) Target {
+	return GroupTarget{TargetName: name, Kind: TargetKindRace, Children: append([]Target(nil), children...)}
 }
 
 // Bond constructs a bond target.
-func Bond(name string, children []Target, opts ...BondOption) Target {
-	g := GroupTarget{TargetName: name, Kind: TargetKindBond, Children: append([]Target(nil), children...)}
-	for _, opt := range opts {
-		if opt != nil {
-			opt.applyBond(&g)
-		}
-	}
-	return g
+func Bond(name string, children []Target) Target {
+	return GroupTarget{TargetName: name, Kind: TargetKindBond, Children: append([]Target(nil), children...)}
 }
 
 // SelectorOption configures a Selector target.
 type SelectorOption interface {
 	applySelector(*GroupTarget)
-}
-
-// RaceOption is reserved for future race target knobs.
-type RaceOption interface {
-	applyRace(*GroupTarget)
-}
-
-// BondOption is reserved for future bond target knobs.
-type BondOption interface {
-	applyBond(*GroupTarget)
 }
 
 // PeakTransfer marks selector children that should only be used as
