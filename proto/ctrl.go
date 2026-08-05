@@ -39,7 +39,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 6
+	ProtocolMinor uint16 = 7
 )
 
 type FeatureSet uint64
@@ -62,10 +62,31 @@ const (
 	// predecessor until one fixed deadline. This is additive to terminal commit;
 	// it does not add an ACK-of-ACTIVATED message.
 	FeaturePathAdmissionCrossRouteTerminal FeatureSet = 1 << 9
+	// FeatureLeafMobilityEnvelope assigns the former negotiation reserved bytes
+	// to the supported and required specialized leaf-mobility sets.
+	FeatureLeafMobilityEnvelope FeatureSet = 1 << 10
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
+
+// LeafMobilitySet advertises specialized operations. Redial/attach is the
+// implicit zero baseline and therefore does not consume a bit.
+type LeafMobilitySet uint16
+
+const (
+	LeafMobilityTCPRepair        LeafMobilitySet = 1 << 0
+	LeafMobilityQUICCIDRebind    LeafMobilitySet = 1 << 1
+	LeafMobilityUDPFlowRebind    LeafMobilitySet = 1 << 2
+	LeafMobilityGVisorLinkRebind LeafMobilitySet = 1 << 3
+
+	LeafMobilityKnownMask LeafMobilitySet = LeafMobilityTCPRepair | LeafMobilityQUICCIDRebind | LeafMobilityUDPFlowRebind | LeafMobilityGVisorLinkRebind
+)
+
+// Has reports whether all requested non-zero operations are present.
+func (s LeafMobilitySet) Has(requested LeafMobilitySet) bool {
+	return requested != 0 && s&requested == requested
+}
 
 type GraphDigest [32]byte
 type TargetID [16]byte
@@ -78,13 +99,15 @@ type GraphBinding struct {
 // Negotiation is carried by both HELLO and HELLO_ACK before any bridge state
 // is allocated. Minor versions remain feature-negotiated within protocol 1.
 type Negotiation struct {
-	ProtocolMajor uint16
-	ProtocolMinor uint16
-	Supported     FeatureSet
-	Required      FeatureSet
-	SessionEpoch  SessionEpoch
-	GraphRevision uint64
-	GraphDigest   GraphDigest
+	ProtocolMajor     uint16
+	ProtocolMinor     uint16
+	MobilitySupported LeafMobilitySet
+	MobilityRequired  LeafMobilitySet
+	Supported         FeatureSet
+	Required          FeatureSet
+	SessionEpoch      SessionEpoch
+	GraphRevision     uint64
+	GraphDigest       GraphDigest
 }
 
 const NegotiationSize = 80
@@ -107,6 +130,8 @@ func (n Negotiation) GraphBinding() GraphBinding {
 func (n Negotiation) encodeTo(b []byte) {
 	binary.BigEndian.PutUint16(b[0:2], n.ProtocolMajor)
 	binary.BigEndian.PutUint16(b[2:4], n.ProtocolMinor)
+	binary.BigEndian.PutUint16(b[4:6], uint16(n.MobilitySupported))
+	binary.BigEndian.PutUint16(b[6:8], uint16(n.MobilityRequired))
 	binary.BigEndian.PutUint64(b[8:16], uint64(n.Supported))
 	binary.BigEndian.PutUint64(b[16:24], uint64(n.Required))
 	copy(b[24:40], n.SessionEpoch[:])
@@ -118,37 +143,49 @@ func decodeNegotiation(b []byte) (Negotiation, error) {
 	if len(b) < NegotiationSize {
 		return Negotiation{}, fmt.Errorf("proto: negotiation too short: %d < %d", len(b), NegotiationSize)
 	}
-	if binary.BigEndian.Uint32(b[4:8]) != 0 {
-		return Negotiation{}, fmt.Errorf("proto: negotiation reserved bytes must be zero")
-	}
 	n := Negotiation{
-		ProtocolMajor: binary.BigEndian.Uint16(b[0:2]),
-		ProtocolMinor: binary.BigEndian.Uint16(b[2:4]),
-		Supported:     FeatureSet(binary.BigEndian.Uint64(b[8:16])),
-		Required:      FeatureSet(binary.BigEndian.Uint64(b[16:24])),
-		GraphRevision: binary.BigEndian.Uint64(b[40:48]),
+		ProtocolMajor:     binary.BigEndian.Uint16(b[0:2]),
+		ProtocolMinor:     binary.BigEndian.Uint16(b[2:4]),
+		MobilitySupported: LeafMobilitySet(binary.BigEndian.Uint16(b[4:6])),
+		MobilityRequired:  LeafMobilitySet(binary.BigEndian.Uint16(b[6:8])),
+		Supported:         FeatureSet(binary.BigEndian.Uint64(b[8:16])),
+		Required:          FeatureSet(binary.BigEndian.Uint64(b[16:24])),
+		GraphRevision:     binary.BigEndian.Uint64(b[40:48]),
 	}
 	copy(n.SessionEpoch[:], b[24:40])
 	copy(n.GraphDigest[:], b[48:80])
-	if n.ProtocolMajor != ProtocolMajor {
-		return Negotiation{}, fmt.Errorf("%w: unsupported protocol major %d", ErrNegotiationIncompatible, n.ProtocolMajor)
-	}
-	if n.ProtocolMinor < ProtocolMinor {
-		return Negotiation{}, fmt.Errorf("%w: protocol minor %d lacks required v1 features", ErrNegotiationIncompatible, n.ProtocolMinor)
-	}
-	if n.Required&^SupportedFeatures != 0 {
-		return Negotiation{}, fmt.Errorf("%w: unknown required features 0x%x", ErrNegotiationIncompatible, uint64(n.Required&^SupportedFeatures))
-	}
-	if n.Required&^n.Supported != 0 {
-		return Negotiation{}, fmt.Errorf("%w: required features not advertised as supported", ErrNegotiationIncompatible)
-	}
-	if RequiredFeatures&^n.Supported != 0 {
-		return Negotiation{}, fmt.Errorf("%w: peer lacks mandatory features 0x%x", ErrNegotiationIncompatible, uint64(RequiredFeatures&^n.Supported))
-	}
-	if n.GraphRevision == 0 {
-		return Negotiation{}, fmt.Errorf("proto: zero graph revision")
+	if err := validateNegotiation(n); err != nil {
+		return Negotiation{}, err
 	}
 	return n, nil
+}
+
+func validateNegotiation(n Negotiation) error {
+	if n.ProtocolMajor != ProtocolMajor {
+		return fmt.Errorf("%w: unsupported protocol major %d", ErrNegotiationIncompatible, n.ProtocolMajor)
+	}
+	if n.ProtocolMinor < ProtocolMinor {
+		return fmt.Errorf("%w: protocol minor %d lacks required v1 features", ErrNegotiationIncompatible, n.ProtocolMinor)
+	}
+	if n.Required&^SupportedFeatures != 0 {
+		return fmt.Errorf("%w: unknown required features 0x%x", ErrNegotiationIncompatible, uint64(n.Required&^SupportedFeatures))
+	}
+	if n.Required&^n.Supported != 0 {
+		return fmt.Errorf("%w: required features not advertised as supported", ErrNegotiationIncompatible)
+	}
+	if RequiredFeatures&^n.Supported != 0 {
+		return fmt.Errorf("%w: peer lacks mandatory features 0x%x", ErrNegotiationIncompatible, uint64(RequiredFeatures&^n.Supported))
+	}
+	if unknown := n.MobilityRequired &^ LeafMobilityKnownMask; unknown != 0 {
+		return fmt.Errorf("%w: unknown required leaf mobility 0x%x", ErrNegotiationIncompatible, uint16(unknown))
+	}
+	if n.MobilityRequired&^n.MobilitySupported != 0 {
+		return fmt.Errorf("%w: required leaf mobility not advertised as supported", ErrNegotiationIncompatible)
+	}
+	if n.GraphRevision == 0 {
+		return fmt.Errorf("proto: zero graph revision")
+	}
+	return nil
 }
 
 // ProbePayload carries timestamps for per-path RTT measurement.
@@ -362,6 +399,9 @@ type HelloPayload struct {
 const HelloPayloadSize = NegotiationSize + 56
 
 func (p HelloPayload) Encode() ([]byte, error) {
+	if err := validateNegotiation(p.Negotiation); err != nil {
+		return nil, err
+	}
 	if p.InstanceID == (InstanceID{}) {
 		return nil, fmt.Errorf("proto: hello has zero instance id")
 	}
@@ -439,6 +479,9 @@ type HelloAckPayload struct {
 const HelloAckPayloadSize = NegotiationSize + 112
 
 func (p HelloAckPayload) Encode() ([]byte, error) {
+	if err := validateNegotiation(p.Negotiation); err != nil {
+		return nil, err
+	}
 	if p.InstanceID == (InstanceID{}) {
 		return nil, fmt.Errorf("proto: hello_ack has zero instance id")
 	}

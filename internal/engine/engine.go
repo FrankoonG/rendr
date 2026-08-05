@@ -47,24 +47,26 @@ const (
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side               Side
-	flowID             [16]byte
-	limits             Limits
-	peerCaps           atomic.Uint32
-	localInstance      proto.InstanceID
-	peerInstance       proto.InstanceID
-	peerKind           atomic.Uint32
-	state              atomic.Uint32 // BridgeState
-	graphMu            sync.RWMutex
-	localGraph         graphBinding
-	peerGraph          graphBinding
-	localExec          *executionRuntime
-	peerNegotiation    proto.Negotiation
-	peerNegotiationSet bool
-	attachMu           sync.Mutex
-	seenAttach         map[[16]byte]struct{}
-	seenAttachFIFO     [][16]byte
-	created            time.Time
+	side                Side
+	flowID              [16]byte
+	limits              Limits
+	peerCaps            atomic.Uint32
+	localInstance       proto.InstanceID
+	peerInstance        proto.InstanceID
+	peerKind            atomic.Uint32
+	state               atomic.Uint32 // BridgeState
+	graphMu             sync.RWMutex
+	localGraph          graphBinding
+	peerGraph           graphBinding
+	localExec           *executionRuntime
+	localNegotiation    proto.Negotiation
+	localNegotiationSet bool
+	peerNegotiation     proto.Negotiation
+	peerNegotiationSet  bool
+	attachMu            sync.Mutex
+	seenAttach          map[[16]byte]struct{}
+	seenAttachFIFO      [][16]byte
+	created             time.Time
 
 	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.

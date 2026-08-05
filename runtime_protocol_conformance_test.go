@@ -35,6 +35,13 @@ func TestRuntimeListenerNegotiationRejectionConformance(t *testing.T) {
 			},
 		},
 		{
+			name: "unsupported required mobility",
+			mutate: func(frame []byte) {
+				binary.BigEndian.PutUint16(frame[proto.HeaderSize+4:proto.HeaderSize+6], uint16(proto.LeafMobilityTCPRepair))
+				binary.BigEndian.PutUint16(frame[proto.HeaderSize+6:proto.HeaderSize+8], uint16(proto.LeafMobilityTCPRepair))
+			},
+		},
+		{
 			name: "missing terminal-commit feature",
 			mutate: func(frame []byte) {
 				feature := uint64(proto.FeaturePathAdmissionTerminalCommit)
@@ -180,6 +187,14 @@ func TestRuntimeDialMalformedHelloAckIsTypedProtocolFailure(t *testing.T) {
 			name: "incompatible negotiation",
 			mutate: func(frame []byte) {
 				binary.BigEndian.PutUint16(frame[proto.HeaderSize+2:proto.HeaderSize+4], proto.ProtocolMinor-1)
+			},
+			want: ErrPeerProtoVersion,
+		},
+		{
+			name: "unsupported required mobility",
+			mutate: func(frame []byte) {
+				binary.BigEndian.PutUint16(frame[proto.HeaderSize+4:proto.HeaderSize+6], uint16(proto.LeafMobilityTCPRepair))
+				binary.BigEndian.PutUint16(frame[proto.HeaderSize+6:proto.HeaderSize+8], uint16(proto.LeafMobilityTCPRepair))
 			},
 			want: ErrPeerProtoVersion,
 		},

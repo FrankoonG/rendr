@@ -286,14 +286,17 @@ func TestTxAdversarialNonNormalOrMalformedByeIsNotClean(t *testing.T) {
 			e := New(SideServer, [16]byte{0xa4, byte(i)}, Limits{})
 			defer e.Close()
 			path := newTxAdversarialPath()
+			readGate := make(chan struct{})
 			path.reads <- txAdversarialReadStep{
 				frame: txAdversarialFrame(t, proto.FrameCtrl, proto.CtrlBye, 0, test.payload),
 			}
-			if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: test.name}); err != nil {
+			_, err := e.AttachPath(&txAdversarialGatedReadPath{PathConn: path, gate: readGate}, transport.PathSpec{Transport: "adversarial", Address: test.name})
+			close(readGate)
+			if err != nil {
 				t.Fatalf("attach path: %v", err)
 			}
 
-			err := txAdversarialRecvError(t, e, time.Second)
+			err = txAdversarialRecvError(t, e, time.Second)
 			if errors.Is(err, io.EOF) {
 				t.Fatalf("BYE payload %x became clean EOF", test.payload)
 			}

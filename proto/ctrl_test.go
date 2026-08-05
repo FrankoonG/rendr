@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"testing"
 )
 
@@ -39,6 +40,21 @@ func mustHelloAckWire(t *testing.T, payload HelloAckPayload) []byte {
 	return wire
 }
 
+func mutateNegotiationWireForDecodeTest(t *testing.T, wire []byte, mutate func(*Negotiation)) []byte {
+	t.Helper()
+	if len(wire) < NegotiationSize {
+		t.Fatalf("wire length=%d want at least %d", len(wire), NegotiationSize)
+	}
+	negotiation, err := decodeNegotiation(wire[:NegotiationSize])
+	if err != nil {
+		t.Fatalf("decode valid negotiation fixture: %v", err)
+	}
+	mutate(&negotiation)
+	out := append([]byte(nil), wire...)
+	negotiation.encodeTo(out[:NegotiationSize])
+	return out
+}
+
 func testBridgeTag(bridgeID [16]byte, name string) BridgeTagPayload {
 	return BridgeTagPayload{
 		BridgeID:      bridgeID,
@@ -73,6 +89,203 @@ func TestHelloRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(mustHelloWire(t, got), wire) {
 		t.Fatalf("hello: got %+v want %+v", got, want)
+	}
+}
+
+func TestLeafMobilityEnvelope(t *testing.T) {
+	if ProtocolMinor != 7 {
+		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
+	}
+	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
+		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
+	}
+	if LeafMobilityTCPRepair != 1<<0 || LeafMobilityQUICCIDRebind != 1<<1 || LeafMobilityUDPFlowRebind != 1<<2 || LeafMobilityGVisorLinkRebind != 1<<3 {
+		t.Fatal("leaf mobility bit assignment drifted")
+	}
+	if LeafMobilityKnownMask != 0x0f {
+		t.Fatalf("known leaf mobility mask=0x%x want=0x0f", LeafMobilityKnownMask)
+	}
+	if LeafMobilityKnownMask.Has(0) {
+		t.Fatal("Has accepted a zero request")
+	}
+	if !LeafMobilityKnownMask.Has(LeafMobilityTCPRepair | LeafMobilityUDPFlowRebind) {
+		t.Fatal("Has rejected present operations")
+	}
+
+	flow := [16]byte{0x71}
+	manifest := testGraphManifest("mobility-envelope")
+	payload := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	wire := mustHelloWire(t, payload)
+	if !bytes.Equal(wire[4:8], []byte{0, 0, 0, 0}) {
+		t.Fatalf("default mobility bytes=%x want=00000000", wire[4:8])
+	}
+	got, err := DecodeHello(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MobilitySupported != 0 || got.MobilityRequired != 0 {
+		t.Fatalf("default mobility round-trip=(0x%x,0x%x) want=(0,0)", got.MobilitySupported, got.MobilityRequired)
+	}
+}
+
+func TestLeafMobilityEnvelopeValidation(t *testing.T) {
+	flow := [16]byte{0x72}
+	manifest := testGraphManifest("mobility-validation")
+	base := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+
+	t.Run("unknown supported is preserved", func(t *testing.T) {
+		wire := mustHelloWire(t, base)
+		wire[4] = 0x80
+		got, err := DecodeHello(wire)
+		if err != nil {
+			t.Fatalf("unknown supported mobility rejected: %v", err)
+		}
+		if got.MobilitySupported != 1<<15 {
+			t.Fatalf("supported mobility=0x%x want=0x8000", got.MobilitySupported)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{name: "unknown required", mutate: func(b []byte) { b[6] = 0x80; b[4] = 0x80 }},
+		{name: "required not supported", mutate: func(b []byte) { b[7] = byte(LeafMobilityTCPRepair) }},
+		{name: "old minor", mutate: func(b []byte) { b[3] = byte(ProtocolMinor - 1) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := mustHelloWire(t, base)
+			test.mutate(wire)
+			if _, err := DecodeHello(wire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("error=%v want %v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+}
+
+func TestLeafMobilityEnvelopeHelloAckDecodeValidation(t *testing.T) {
+	flow := [16]byte{0x74}
+	manifest := testGraphManifest("mobility-ack-validation")
+	negotiation := testNegotiationFor(flow, manifest)
+	base := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+
+	t.Run("unknown supported is preserved", func(t *testing.T) {
+		wire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, base), func(n *Negotiation) {
+			n.MobilitySupported = 1 << 15
+		})
+		got, err := DecodeHelloAck(wire)
+		if err != nil {
+			t.Fatalf("unknown supported mobility rejected: %v", err)
+		}
+		if got.MobilitySupported != 1<<15 {
+			t.Fatalf("supported mobility=0x%x want=0x8000", got.MobilitySupported)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "unknown required", mutate: func(n *Negotiation) {
+			n.MobilitySupported = 1 << 15
+			n.MobilityRequired = 1 << 15
+		}},
+		{name: "required not supported", mutate: func(n *Negotiation) {
+			n.MobilityRequired = LeafMobilityTCPRepair
+		}},
+		{name: "old minor", mutate: func(n *Negotiation) {
+			n.ProtocolMinor--
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, base), test.mutate)
+			if _, err := DecodeHelloAck(wire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+}
+
+func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
+	flow := [16]byte{0x73}
+	manifest := testGraphManifest("mobility-round-trip")
+	negotiation := testNegotiationFor(flow, manifest)
+	negotiation.MobilitySupported = LeafMobilityTCPRepair | LeafMobilityUDPFlowRebind
+	negotiation.MobilityRequired = LeafMobilityUDPFlowRebind
+
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	helloWire := mustHelloWire(t, hello)
+	wantPrefix, err := hex.DecodeString("000100070005000400000000000007ff00000000000007ff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(helloWire[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("HELLO negotiation prefix=%x want=%x", helloWire[:len(wantPrefix)], wantPrefix)
+	}
+	gotHello, err := DecodeHello(helloWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHello.Negotiation != negotiation {
+		t.Fatalf("HELLO negotiation=%+v want=%+v", gotHello.Negotiation, negotiation)
+	}
+
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	ackWire := mustHelloAckWire(t, ack)
+	if !bytes.Equal(ackWire[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("HELLO_ACK negotiation prefix=%x want=%x", ackWire[:len(wantPrefix)], wantPrefix)
+	}
+	gotAck, err := DecodeHelloAck(ackWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAck.Negotiation != negotiation {
+		t.Fatalf("HELLO_ACK negotiation=%+v want=%+v", gotAck.Negotiation, negotiation)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "unknown required", mutate: func(n *Negotiation) {
+			n.MobilitySupported = 1 << 15
+			n.MobilityRequired = 1 << 15
+		}},
+		{name: "required not supported", mutate: func(n *Negotiation) {
+			n.MobilitySupported = 0
+			n.MobilityRequired = LeafMobilityTCPRepair
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			badHello := hello
+			test.mutate(&badHello.Negotiation)
+			if _, err := badHello.Encode(); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO encode error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			badAck := ack
+			test.mutate(&badAck.Negotiation)
+			if _, err := badAck.Encode(); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK encode error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
 	}
 }
 
@@ -248,11 +461,11 @@ func TestHelloRejectsInvalidNegotiationBeforeUse(t *testing.T) {
 	manifest := testGraphManifest("path")
 	base := mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
 	mutations := map[string]func([]byte){
-		"protocol major":   func(b []byte) { b[1] = 2 },
-		"reserved":         func(b []byte) { b[7] = 1 },
-		"unknown required": func(b []byte) { b[16] = 0x80 },
-		"zero revision":    func(b []byte) { clear(b[40:48]) },
-		"epoch mismatch":   func(b []byte) { b[24]++ },
+		"protocol major":                  func(b []byte) { b[1] = 2 },
+		"mobility required not supported": func(b []byte) { b[7] = 1 },
+		"unknown required":                func(b []byte) { b[16] = 0x80 },
+		"zero revision":                   func(b []byte) { clear(b[40:48]) },
+		"epoch mismatch":                  func(b []byte) { b[24]++ },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -617,7 +830,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("000100060000000000000000000003ff00000000000003ff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("000100070000000000000000000007ff00000000000007ff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

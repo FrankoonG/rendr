@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -91,12 +92,97 @@ func TestDirectionalGraphBindingsRemainAsymmetric(t *testing.T) {
 	if localNegotiation.GraphRevision != 7 || localNegotiation.GraphDigest != localDigest {
 		t.Fatalf("local binding = (%d,%x), want (7,%x)", localNegotiation.GraphRevision, localNegotiation.GraphDigest, localDigest)
 	}
+	if localNegotiation.MobilitySupported != 0 || localNegotiation.MobilityRequired != 0 {
+		t.Fatalf("unimplemented specialized mobility advertised as supported=0x%x required=0x%x", localNegotiation.MobilitySupported, localNegotiation.MobilityRequired)
+	}
+	mutated := localNegotiation
+	mutated.MobilitySupported = proto.LeafMobilityTCPRepair
+	if again := e.LocalNegotiation(); again != localNegotiation {
+		t.Fatalf("local negotiation changed through returned value: got=%+v want=%+v", again, localNegotiation)
+	}
 	peerBinding := e.peerGraphBinding()
 	if peerBinding.revision != 13 || peerBinding.digest != peerDigest {
 		t.Fatalf("peer binding = (%d,%x), want (13,%x)", peerBinding.revision, peerBinding.digest, peerDigest)
 	}
 	if localNegotiation.GraphDigest == peerBinding.digest {
 		t.Fatal("engine mirrored one direction's graph into the other")
+	}
+}
+
+func TestLeafMobilityNegotiationCompatibility(t *testing.T) {
+	epoch := proto.SessionEpoch{0x35}
+	baseLocal := proto.NewNegotiation(epoch)
+	basePeer := proto.NewNegotiation(epoch)
+
+	tests := []struct {
+		name    string
+		local   proto.Negotiation
+		peer    proto.Negotiation
+		wantErr bool
+	}{
+		{name: "implicit redial baseline", local: baseLocal, peer: basePeer},
+		{name: "optional peer operation", local: baseLocal, peer: func() proto.Negotiation {
+			n := basePeer
+			n.MobilitySupported = proto.LeafMobilityTCPRepair
+			return n
+		}()},
+		{name: "mutually supported required operation", local: func() proto.Negotiation {
+			n := baseLocal
+			n.MobilitySupported = proto.LeafMobilityUDPFlowRebind
+			n.MobilityRequired = proto.LeafMobilityUDPFlowRebind
+			return n
+		}(), peer: func() proto.Negotiation {
+			n := basePeer
+			n.MobilitySupported = proto.LeafMobilityUDPFlowRebind
+			n.MobilityRequired = proto.LeafMobilityUDPFlowRebind
+			return n
+		}()},
+		{name: "peer lacks local requirement", local: func() proto.Negotiation {
+			n := baseLocal
+			n.MobilitySupported = proto.LeafMobilityUDPFlowRebind
+			n.MobilityRequired = proto.LeafMobilityUDPFlowRebind
+			return n
+		}(), peer: basePeer, wantErr: true},
+		{name: "local lacks peer requirement", local: baseLocal, peer: func() proto.Negotiation {
+			n := basePeer
+			n.MobilitySupported = proto.LeafMobilityTCPRepair
+			n.MobilityRequired = proto.LeafMobilityTCPRepair
+			return n
+		}(), wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateNegotiationCompatibility(test.local, test.peer)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("compatibility error=%v wantErr=%v", err, test.wantErr)
+			}
+			if test.wantErr && !errors.Is(err, proto.ErrNegotiationIncompatible) {
+				t.Fatalf("compatibility error=%v want=%v", err, proto.ErrNegotiationIncompatible)
+			}
+		})
+	}
+}
+
+func TestPeerMobilityEnvelopeIsFrozenAtAdmission(t *testing.T) {
+	flow := [16]byte{0x36}
+	manifest, _ := adversarialGraphManifest("mobility-freeze", proto.GraphNodeKindSelector, "path-a")
+	e := New(SideClient, flow, Limits{}.Clamp())
+	defer e.Close()
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	digest := adversarialGraphDigest(t, manifest)
+	peer := proto.NewNegotiation(proto.SessionEpoch(flow))
+	peer.GraphDigest = digest
+	if err := e.AcceptPeerNegotiation(peer, manifest); err != nil {
+		t.Fatalf("accept baseline peer: %v", err)
+	}
+
+	changed := peer
+	changed.MobilitySupported = proto.LeafMobilityTCPRepair
+	if err := e.ValidatePeerNegotiation(changed, manifest); !errors.Is(err, proto.ErrNegotiationIncompatible) {
+		t.Fatalf("changed mobility envelope error=%v want=%v", err, proto.ErrNegotiationIncompatible)
 	}
 }
 

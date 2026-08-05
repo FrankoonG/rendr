@@ -575,6 +575,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		}
 	}()
 	if err := e.AcceptPeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err != nil {
+		rejectIncompatibleNegotiation(pc, err)
 		return false
 	}
 	if err := e.MirrorPeerGraphForLocal(); err != nil {
@@ -654,6 +655,7 @@ func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc tran
 		return false
 	}
 	if err := e.ValidatePeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err != nil {
+		rejectIncompatibleNegotiation(pc, err)
 		return false
 	}
 	name, err := e.PeerPathName(hello.InitialTargetID)

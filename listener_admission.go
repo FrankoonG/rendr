@@ -22,10 +22,14 @@ func canonicalFirstControlCode(hdr proto.Header) (proto.CtrlCode, bool) {
 
 func decodeHelloForAdmission(pc transport.PathConn, payload []byte) (proto.HelloPayload, error) {
 	hello, err := proto.DecodeHello(payload)
+	rejectIncompatibleNegotiation(pc, err)
+	return hello, err
+}
+
+func rejectIncompatibleNegotiation(pc transport.PathConn, err error) {
 	if err != nil && errors.Is(err, proto.ErrNegotiationIncompatible) {
 		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
 	}
-	return hello, err
 }
 
 func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID) (uint32, proto.TargetID, error) {

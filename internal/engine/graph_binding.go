@@ -81,8 +81,13 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 		return fmt.Errorf("engine: local graph is already configured")
 	}
 	binding := graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
+	negotiation := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
+	negotiation.GraphRevision = revision
+	negotiation.GraphDigest = digest
 	e.localGraph = binding
 	e.localExec = newExecutionRuntime(plan)
+	e.localNegotiation = negotiation
+	e.localNegotiationSet = true
 	e.graphMu.Unlock()
 	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(e.flowID), senderDirection(e.side), revision, digest)
 	e.sendAckProof = e.sendProof
@@ -121,7 +126,14 @@ func (e *Engine) ConfigurePeerGraph(revision uint64, manifest proto.GraphManifes
 
 // LocalNegotiation builds the HELLO/HELLO_ACK declaration for this sender.
 func (e *Engine) LocalNegotiation() proto.Negotiation {
-	binding := e.localGraphBinding()
+	e.graphMu.RLock()
+	if e.localNegotiationSet {
+		negotiation := e.localNegotiation
+		e.graphMu.RUnlock()
+		return negotiation
+	}
+	binding := e.localGraph
+	e.graphMu.RUnlock()
 	n := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
 	n.GraphRevision = binding.revision
 	n.GraphDigest = binding.digest
@@ -251,7 +263,7 @@ func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.Gr
 	e.graphMu.Lock()
 	if e.peerNegotiationSet && e.peerNegotiation != peer {
 		e.graphMu.Unlock()
-		return fmt.Errorf("engine: peer negotiation changed")
+		return fmt.Errorf("%w: engine: peer negotiation changed", proto.ErrNegotiationIncompatible)
 	}
 	e.peerNegotiation = peer
 	e.peerNegotiationSet = true
@@ -264,20 +276,11 @@ func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.Gr
 // identical even after DATA has started flowing.
 func (e *Engine) ValidatePeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
 	local := e.LocalNegotiation()
-	if peer.ProtocolMajor != local.ProtocolMajor {
-		return fmt.Errorf("engine: protocol major mismatch: local=%d peer=%d", local.ProtocolMajor, peer.ProtocolMajor)
-	}
-	if peer.ProtocolMinor < local.ProtocolMinor {
-		return fmt.Errorf("engine: protocol minor mismatch: local=%d peer=%d", local.ProtocolMinor, peer.ProtocolMinor)
+	if err := validateNegotiationCompatibility(local, peer); err != nil {
+		return err
 	}
 	if peer.SessionEpoch != proto.SessionEpoch(e.flowID) {
 		return fmt.Errorf("engine: negotiation session epoch mismatch")
-	}
-	if local.Required&^peer.Supported != 0 {
-		return fmt.Errorf("engine: peer lacks required features 0x%x", uint64(local.Required&^peer.Supported))
-	}
-	if peer.Required&^local.Supported != 0 {
-		return fmt.Errorf("engine: local side lacks peer-required features 0x%x", uint64(peer.Required&^local.Supported))
 	}
 	digest, err := manifest.Digest()
 	if err != nil {
@@ -296,7 +299,29 @@ func (e *Engine) ValidatePeerNegotiation(peer proto.Negotiation, manifest proto.
 		return fmt.Errorf("engine: peer graph binding changed")
 	}
 	if frozenSet && frozen != peer {
-		return fmt.Errorf("engine: peer negotiation changed")
+		return fmt.Errorf("%w: engine: peer negotiation changed", proto.ErrNegotiationIncompatible)
+	}
+	return nil
+}
+
+func validateNegotiationCompatibility(local, peer proto.Negotiation) error {
+	if peer.ProtocolMajor != local.ProtocolMajor {
+		return fmt.Errorf("%w: engine: protocol major mismatch: local=%d peer=%d", proto.ErrNegotiationIncompatible, local.ProtocolMajor, peer.ProtocolMajor)
+	}
+	if peer.ProtocolMinor < local.ProtocolMinor {
+		return fmt.Errorf("%w: engine: protocol minor mismatch: local=%d peer=%d", proto.ErrNegotiationIncompatible, local.ProtocolMinor, peer.ProtocolMinor)
+	}
+	if missing := local.Required &^ peer.Supported; missing != 0 {
+		return fmt.Errorf("%w: engine: peer lacks required features 0x%x", proto.ErrNegotiationIncompatible, uint64(missing))
+	}
+	if missing := peer.Required &^ local.Supported; missing != 0 {
+		return fmt.Errorf("%w: engine: local side lacks peer-required features 0x%x", proto.ErrNegotiationIncompatible, uint64(missing))
+	}
+	if missing := local.MobilityRequired &^ peer.MobilitySupported; missing != 0 {
+		return fmt.Errorf("%w: engine: peer lacks required leaf mobility 0x%x", proto.ErrNegotiationIncompatible, uint16(missing))
+	}
+	if missing := peer.MobilityRequired &^ local.MobilitySupported; missing != 0 {
+		return fmt.Errorf("%w: engine: local side lacks peer-required leaf mobility 0x%x", proto.ErrNegotiationIncompatible, uint16(missing))
 	}
 	return nil
 }

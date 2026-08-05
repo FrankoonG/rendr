@@ -28,8 +28,8 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 6 {
-		t.Fatalf("protocol minor=%d want=6", ProtocolMinor)
+	if ProtocolMinor != 7 {
+		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
@@ -42,6 +42,9 @@ func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
 	}
 	if SupportedFeatures&FeatureRecursiveExecutor == 0 || RequiredFeatures&FeatureRecursiveExecutor == 0 {
 		t.Fatal("recursive executor feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
+		t.Fatal("leaf mobility envelope feature is not required by negotiation")
 	}
 }
 
@@ -59,15 +62,17 @@ func TestHelloRejectsLegacyPolicyPeerDuringDecode(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			negotiation := testNegotiationFor(flow, manifest)
-			negotiation.ProtocolMinor = test.minor
-			negotiation.Supported &^= test.feature
-			negotiation.Required &^= test.feature
 			wire := mustHelloWire(t, HelloPayload{
 				Negotiation:     negotiation,
 				FlowID:          flow,
 				InstanceID:      InstanceID{1},
 				InitialTargetID: manifest.RootID,
 				LocalTXManifest: manifest,
+			})
+			wire = mutateNegotiationWireForDecodeTest(t, wire, func(n *Negotiation) {
+				n.ProtocolMinor = test.minor
+				n.Supported &^= test.feature
+				n.Required &^= test.feature
 			})
 			if _, err := DecodeHello(wire); !errors.Is(err, ErrNegotiationIncompatible) {
 				t.Fatalf("legacy peer error=%v, want incompatible negotiation", err)

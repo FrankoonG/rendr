@@ -14,12 +14,14 @@ func TestPathAdmissionTerminalFeatureIsNegotiatedOnCurrentMinor(t *testing.T) {
 			flow := [16]byte{0x46}
 			manifest := testGraphManifest("terminal-feature-peer")
 			negotiation := testNegotiationFor(flow, manifest)
-			negotiation.Supported &^= feature
-			negotiation.Required &^= feature
 
 			helloWire := mustHelloWire(t, HelloPayload{
 				Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
 				InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+			})
+			helloWire = mutateNegotiationWireForDecodeTest(t, helloWire, func(n *Negotiation) {
+				n.Supported &^= feature
+				n.Required &^= feature
 			})
 			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
 				t.Fatalf("HELLO without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
@@ -31,6 +33,10 @@ func TestPathAdmissionTerminalFeatureIsNegotiatedOnCurrentMinor(t *testing.T) {
 				AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
 				AcceptedPeerTargetID: manifest.RootID,
 				LocalTXManifest:      manifest,
+			})
+			ackWire = mutateNegotiationWireForDecodeTest(t, ackWire, func(n *Negotiation) {
+				n.Supported &^= feature
+				n.Required &^= feature
 			})
 			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
 				t.Fatalf("HELLO_ACK without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
@@ -59,8 +65,8 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	if Version != 3 {
 		t.Fatalf("frame envelope version=%d want=3", Version)
 	}
-	if ProtocolMinor != 6 {
-		t.Fatalf("protocol minor=%d want=6", ProtocolMinor)
+	if ProtocolMinor != 7 {
+		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePathAdmissionTransaction == 0 || RequiredFeatures&FeaturePathAdmissionTransaction == 0 {
 		t.Fatal("path admission transaction feature is not mandatory")
@@ -70,6 +76,9 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	}
 	if SupportedFeatures&FeaturePathAdmissionCrossRouteTerminal == 0 || RequiredFeatures&FeaturePathAdmissionCrossRouteTerminal == 0 {
 		t.Fatal("path admission cross-route terminal feature is not mandatory")
+	}
+	if SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
+		t.Fatal("leaf mobility envelope feature is not mandatory")
 	}
 	if PathAdmissionWireVersion != 1 {
 		t.Fatalf("path admission wire version=%d want=1", PathAdmissionWireVersion)
