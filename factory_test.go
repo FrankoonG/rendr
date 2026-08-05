@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// TestM9X5StreamPathFactoryRoundTrip drives a Dialer entirely through
+// TestM9X5StreamPathFactoryRoundTrip drives an internal session dialer through
 // an AddStreamPathFactory-registered transport: no global registry
 // involvement, no tcp/udpflow code path. The factory hands rendr a
 // net.Conn produced by net.Pipe()-style plumbing into a real rendr
@@ -45,7 +45,7 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 		return net.Dial("tcp", addr)
 	}
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "factory-tcp", Address: ln.Addr().String()}})}
 
@@ -87,7 +87,7 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 
 // TestM9X5StreamFactoryFallback: when a PathSpec.Transport matches a
 // global registry transport AND a factory of the same name exists on
-// the Dialer, the factory wins. Conversely, an unregistered factory
+// the session dialer, the factory wins. Conversely, an unregistered factory
 // name falls through to the global registry without error.
 func TestM9X5StreamFactoryFallback(t *testing.T) {
 	// Part 1: unknown transport name returns an error and does NOT
@@ -99,7 +99,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 	}
 	probeAddr := probe.Addr().String()
 	probe.Close()
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "no-such-transport", Address: probeAddr}})}
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "no-such-transport", Address: probeAddr}})}
 	if _, err := d.Dial(context.Background()); err == nil {
 		t.Fatal("expected dial error for unknown transport")
 	}
@@ -125,7 +125,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 		accepted <- c
 	}()
 
-	d2 := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+	d2 := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	c, err := d2.Dial(context.Background())
 	if err != nil {
 		t.Fatalf("Dial via global tcp: %v", err)
@@ -139,7 +139,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 // empty name, nil factory, duplicate registration, name conflict
 // across stream/packet maps.
 func TestM9X5AddStreamFactoryValidation(t *testing.T) {
-	d := &Dialer{}
+	d := &sessionDialer{}
 	if err := d.AddStreamPathFactory("", func(context.Context, string) (net.Conn, error) { return nil, nil }); err == nil {
 		t.Fatal("empty name should error")
 	}
@@ -156,7 +156,7 @@ func TestM9X5AddStreamFactoryValidation(t *testing.T) {
 	}
 }
 
-// TestM9X5PacketPathFactoryRoundTrip drives a packet-mode Dialer
+// TestM9X5PacketPathFactoryRoundTrip drives a packet-mode session dialer
 // entirely through an AddPacketPathFactory-registered source. The
 // factory returns a *net.UDPConn produced by net.ListenUDP (which
 // satisfies net.PacketConn). rendr's udpflow.WrapFromSpec then
@@ -190,7 +190,7 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "factory-udp", Address: ln.Addr().String()}})}
 
@@ -233,7 +233,7 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 // factories — empty name, nil factory, duplicate registration,
 // shadow conflict with stream factory of the same name.
 func TestM9X5AddPacketFactoryValidation(t *testing.T) {
-	d := &Dialer{}
+	d := &sessionDialer{}
 	dummy := func(context.Context, string) (net.PacketConn, error) { return nil, nil }
 	if err := d.AddPacketPathFactory("", dummy); err == nil {
 		t.Fatal("empty name should error")
@@ -249,7 +249,7 @@ func TestM9X5AddPacketFactoryValidation(t *testing.T) {
 	}
 	// Cross-map shadow conflict: registering stream factory with same name.
 	streamFn := func(context.Context, string) (net.Conn, error) { return nil, nil }
-	if err := d.AddStreamPathFactory("p", streamFn); err == nil || !strings.Contains(err.Error(), "PacketPathFactory") {
+	if err := d.AddStreamPathFactory("p", streamFn); err == nil || !strings.Contains(err.Error(), "packet factory") {
 		t.Fatalf("expected stream-shadow-packet error, got %v", err)
 	}
 }
@@ -268,7 +268,7 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
-	d := &Dialer{Root: selectorRoot([]PathSpec{
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{
 		{Transport: transportName, Address: ln.Addr().String()},
 		{Transport: transportName, Address: ln.Addr().String()},
 	})}
@@ -290,9 +290,9 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	}
 	waitFactoryClientPathCount(t, client, 1)
 
-	// Replace the original Dialer's map after Dial. The live session must not
+	// Replace the original session dialer's map after Dial. The live session must not
 	// share this map or consult it again.
-	d.streamFactories = map[string]StreamPathFactory{
+	d.streamFactories = map[string]streamPathFactory{
 		transportName: func(context.Context, string) (net.Conn, error) {
 			mutatedCalls.Add(1)
 			return nil, errors.New("mutated stream factory must not run")
@@ -340,7 +340,7 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
-	d := &Dialer{Root: selectorRoot([]PathSpec{
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{
 		{Transport: transportName, Address: ln.Addr().String()},
 		{Transport: transportName, Address: ln.Addr().String()},
 	})}
@@ -362,7 +362,7 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	}
 	waitFactoryClientPathCount(t, client, 1)
 
-	d.packetFactories = map[string]PacketPathFactory{
+	d.packetFactories = map[string]packetPathFactory{
 		transportName: func(context.Context, string) (net.PacketConn, error) {
 			mutatedCalls.Add(1)
 			return nil, errors.New("mutated packet factory must not run")
@@ -413,12 +413,12 @@ func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 		}
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: selectorRoot([]PathSpec{
 			{Transport: transportName, Address: ln.Addr().String()},
 			{Transport: transportName, Address: ln.Addr().String()},
 		}),
-		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
+		Retry: retryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
 	}
 	if err := d.AddStreamPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
@@ -431,7 +431,7 @@ func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
 
-	d.streamFactories = map[string]StreamPathFactory{
+	d.streamFactories = map[string]streamPathFactory{
 		transportName: func(context.Context, string) (net.Conn, error) {
 			mutatedCalls.Add(1)
 			return nil, errors.New("mutated retry stream factory must not run")
@@ -464,12 +464,12 @@ func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 		}
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: selectorRoot([]PathSpec{
 			{Transport: transportName, Address: ln.Addr().String()},
 			{Transport: transportName, Address: ln.Addr().String()},
 		}),
-		Retry: RetryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
+		Retry: retryPolicy{MinBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond},
 	}
 	if err := d.AddPacketPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
@@ -482,7 +482,7 @@ func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
 
-	d.packetFactories = map[string]PacketPathFactory{
+	d.packetFactories = map[string]packetPathFactory{
 		transportName: func(context.Context, string) (net.PacketConn, error) {
 			mutatedCalls.Add(1)
 			return nil, errors.New("mutated retry packet factory must not run")

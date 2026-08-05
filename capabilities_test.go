@@ -27,7 +27,7 @@ func TestDialerAdvertisesL3IdentityCapability(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root:               Path("tcp", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 		PreserveL3Identity: true,
 	}).Dial(context.Background())
@@ -66,7 +66,7 @@ func TestDialPacketAdvertisesL3IdentityAndPacketMode(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root:               Path("udp", PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
 		PreserveL3Identity: true,
 	}).DialPacket(context.Background())

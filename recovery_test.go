@@ -128,7 +128,7 @@ func TestRecoveryGenerationReconcilesStartupAndInFlightDeath(t *testing.T) {
 		}
 		return id, nil
 	}
-	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{spec}, nil, RetryPolicy{})
+	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{spec}, nil, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -175,7 +175,7 @@ func TestCleanRemovalCancelsInFlightRecoveryWithoutResurrection(t *testing.T) {
 		canceledOnce.Do(func() { close(canceled) })
 		return 0, ctx.Err()
 	}
-	if supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, nil, RetryPolicy{}); supervisor == nil {
+	if supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, nil, retryPolicy{}); supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
 	if err := e.ForceKillPathForTest(leafID); err != nil {
@@ -232,7 +232,7 @@ func TestCleanRemovalTombstoneIgnoresDelayedTransportDeath(t *testing.T) {
 	supervisor := newPathRecoverySupervisor(e, nil, func(context.Context, PathSpec) (uint32, error) {
 		attempts.Add(1)
 		return 0, errors.New("unexpected redial")
-	}, []PathSpec{leaf}, nil, RetryPolicy{})
+	}, []PathSpec{leaf}, nil, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -310,7 +310,7 @@ func TestRecoveryRemoveThenAddSameLeafIgnoresOldGenerationDeath(t *testing.T) {
 			recovered <- id
 		}
 		return id, err
-	}, []PathSpec{leaf}, nil, RetryPolicy{})
+	}, []PathSpec{leaf}, nil, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -384,7 +384,7 @@ func TestCanceledRecoveryDoesNotClaimConcurrentManualPath(t *testing.T) {
 		return 0, ctx.Err()
 	}
 	tracker := newPathStatusTracker([]PathSpec{leaf}, "")
-	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, tracker, RetryPolicy{})
+	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, tracker, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -454,7 +454,7 @@ func TestDelayedAddNotificationCannotUndoCleanRemoval(t *testing.T) {
 	supervisor := newPathRecoverySupervisor(e, nil, func(context.Context, PathSpec) (uint32, error) {
 		attempts.Add(1)
 		return 0, errors.New("unexpected recovery")
-	}, []PathSpec{leaf}, nil, RetryPolicy{})
+	}, []PathSpec{leaf}, nil, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -485,7 +485,7 @@ func TestRecoveryStopCancelsWorkerWithoutRestart(t *testing.T) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
 		return 0, ctx.Err()
-	}, []PathSpec{spec}, nil, RetryPolicy{})
+	}, []PathSpec{spec}, nil, retryPolicy{})
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -509,7 +509,7 @@ func TestRecoveryStatusUpdatesAreActorValidated(t *testing.T) {
 	tracker := newPathStatusTracker([]PathSpec{spec}, "")
 	supervisor := newPathRecoverySupervisor(e, nil, func(context.Context, PathSpec) (uint32, error) {
 		return 0, errors.New("injected dial failure")
-	}, []PathSpec{spec}, tracker, RetryPolicy{MinBackoff: time.Second, MaxBackoff: time.Second})
+	}, []PathSpec{spec}, tracker, retryPolicy{MinBackoff: time.Second, MaxBackoff: time.Second})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		status := tracker.snapshot(nil)
@@ -584,7 +584,7 @@ func TestCleanRemovalRetiresLateSuccessfulRecoveryAttach(t *testing.T) {
 		return id, err
 	}
 	tracker := newPathStatusTracker([]PathSpec{leaf}, "")
-	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, tracker, RetryPolicy{})
+	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, tracker, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
@@ -692,7 +692,7 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 		<-allowReturn
 		return id, nil
 	}
-	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, nil, RetryPolicy{})
+	supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, nil, retryPolicy{})
 	if supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}

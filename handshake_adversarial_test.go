@@ -115,8 +115,8 @@ func registerHandshakeAdversarialTransport(t *testing.T, name string, path trans
 	}
 }
 
-func handshakeAdversarialDialer(transportName string) *Dialer {
-	return &Dialer{Root: Path("handshake-path", PathSpec{
+func handshakeAdversarialSessionDialer(transportName string) *sessionDialer {
+	return &sessionDialer{Root: Path("handshake-path", PathSpec{
 		Transport: transportName,
 		Address:   "handshake-peer",
 	})}
@@ -130,7 +130,7 @@ func TestDialContextCancellationBoundsHelloAckWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		conn, err := handshakeAdversarialDialer(transportName).Dial(ctx)
+		conn, err := handshakeAdversarialSessionDialer(transportName).Dial(ctx)
 		if conn != nil {
 			_ = conn.Close()
 		}
@@ -219,7 +219,7 @@ func TestDialPacketRejectsHelloAckWithoutPacketCapability(t *testing.T) {
 	})
 	registerHandshakeAdversarialTransport(t, transportName, path)
 
-	packetConn, err := handshakeAdversarialDialer(transportName).DialPacket(context.Background())
+	packetConn, err := handshakeAdversarialSessionDialer(transportName).DialPacket(context.Background())
 	if packetConn != nil {
 		_ = packetConn.Close()
 	}
@@ -254,7 +254,7 @@ func TestDialReportsTypedProtocolNegotiationRejection(t *testing.T) {
 	})
 	registerHandshakeAdversarialTransport(t, transportName, path)
 
-	conn, err := handshakeAdversarialDialer(transportName).Dial(context.Background())
+	conn, err := handshakeAdversarialSessionDialer(transportName).Dial(context.Background())
 	if conn != nil {
 		_ = conn.Close()
 	}

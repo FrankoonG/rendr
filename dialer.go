@@ -79,7 +79,7 @@ type sessionDialer struct {
 	Primary string
 
 	// PrimaryPolicy controls whether primary failure can fall back to
-	// another path. Zero value is PrimaryPrefer.
+	// another path. Zero value prefers primary and permits fallback.
 	PrimaryPolicy primaryPolicy
 
 	// Retry controls background retry of optional failed paths. Zero

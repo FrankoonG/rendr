@@ -99,14 +99,26 @@ type Listener struct {
 	ep     *channel.Endpoint
 	wire   net.PacketConn
 
-	closeOnce sync.Once
-	closed    chan struct{}
-	acceptCh  chan acceptResult
+	closeOnce   sync.Once
+	closeErr    error
+	closed      chan struct{}
+	acceptCh    chan acceptResult
+	acceptDone  chan struct{}
+	cleanupOnce sync.Once
+	cleanupDone chan struct{}
+
+	lifecycleMu   sync.Mutex
+	closing       bool
+	admissionDone bool
+	active        int
+	dialing       int
 
 	remoteMu sync.RWMutex
 	remote   net.Addr
 	remotes  map[uint16]net.Addr
 }
+
+var _ transport.PathListener = (*Listener)(nil)
 
 type acceptResult struct {
 	pc  transport.PathConn
@@ -150,12 +162,14 @@ func Listen(addr string) (*Listener, error) {
 	}
 
 	l := &Listener{
-		addr:     addr,
-		client:   clientStack,
-		server:   serverStack,
-		ln:       ln,
-		closed:   make(chan struct{}),
-		acceptCh: make(chan acceptResult, 1),
+		addr:        addr,
+		client:      clientStack,
+		server:      serverStack,
+		ln:          ln,
+		closed:      make(chan struct{}),
+		acceptCh:    make(chan acceptResult, 1),
+		acceptDone:  make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
 	regMu.Lock()
 	registry[addr] = l
@@ -196,15 +210,17 @@ func ListenPacket(addr string) (*Listener, error) {
 		return nil, fmt.Errorf("gvisor: listen tcp: %w", err)
 	}
 	l := &Listener{
-		addr:     pc.LocalAddr().String(),
-		netAddr:  pc.LocalAddr(),
-		server:   serverStack,
-		ln:       ln,
-		ep:       ep,
-		wire:     pc,
-		closed:   make(chan struct{}),
-		acceptCh: make(chan acceptResult, 1),
-		remotes:  make(map[uint16]net.Addr),
+		addr:        pc.LocalAddr().String(),
+		netAddr:     pc.LocalAddr(),
+		server:      serverStack,
+		ln:          ln,
+		ep:          ep,
+		wire:        pc,
+		closed:      make(chan struct{}),
+		acceptCh:    make(chan acceptResult, 1),
+		acceptDone:  make(chan struct{}),
+		cleanupDone: make(chan struct{}),
+		remotes:     make(map[uint16]net.Addr),
 	}
 	go l.pumpInbound()
 	go l.pumpOutbound()
@@ -241,6 +257,15 @@ func newStack(addr tcpip.Address, ep stack.LinkEndpoint) (*stack.Stack, error) {
 func (l *Listener) Accept(ctx context.Context) (transport.PathConn, error) {
 	select {
 	case r := <-l.acceptCh:
+		l.lifecycleMu.Lock()
+		closing := l.closing
+		l.lifecycleMu.Unlock()
+		if closing {
+			if r.pc != nil {
+				_ = r.pc.Close()
+			}
+			return nil, net.ErrClosed
+		}
 		return r.pc, r.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -249,14 +274,30 @@ func (l *Listener) Accept(ctx context.Context) (transport.PathConn, error) {
 	}
 }
 
+// AcceptPath delegates to Accept.
+func (l *Listener) AcceptPath(ctx context.Context) (transport.PathConn, error) {
+	return l.Accept(ctx)
+}
+
+// SessionKind reports that gVisor's framed TCP path can carry either rendr
+// session contract.
+func (*Listener) SessionKind() transport.PathSessionKind {
+	return transport.PathSessionAny
+}
+
 func (l *Listener) acceptLoop() {
+	defer l.finishAdmission()
 	for {
 		c, err := l.ln.Accept()
 		var r acceptResult
 		if err != nil {
 			r.err = err
 		} else {
-			r.pc = basetcp.Wrap(c)
+			var retained bool
+			r.pc, retained = l.retainAccepted(c)
+			if !retained {
+				return
+			}
 		}
 		select {
 		case l.acceptCh <- r:
@@ -272,32 +313,28 @@ func (l *Listener) acceptLoop() {
 	}
 }
 
-// Close tears down the listener and its virtual network.
+// Close stops admission immediately. The virtual network remains alive until
+// every accepted path has closed or terminally died.
 func (l *Listener) Close() error {
-	var err error
 	l.closeOnce.Do(func() {
+		l.lifecycleMu.Lock()
+		l.closing = true
+		close(l.closed)
+		l.lifecycleMu.Unlock()
+
 		regMu.Lock()
 		if registry[l.addr] == l {
 			delete(registry, l.addr)
 		}
 		regMu.Unlock()
-		close(l.closed)
-		if l.wire != nil {
-			_ = l.wire.Close()
-		}
-		if l.ep != nil {
-			l.ep.Close()
-		}
+
 		l.ln.Shutdown()
-		err = l.ln.Close()
-		if l.client != nil {
-			l.client.Close()
-		}
-		if l.server != nil {
-			l.server.Close()
-		}
+		l.closeErr = l.ln.Close()
+		<-l.acceptDone
+		l.discardPendingAccepts()
+		l.cleanupIfIdle()
 	})
-	return err
+	return l.closeErr
 }
 
 // Addr returns the process-local registry address.
@@ -309,10 +346,8 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
-	select {
-	case <-l.closed:
+	if !l.beginDial() {
 		return nil, net.ErrClosed
-	default:
 	}
 	c, err := gonet.DialContextTCP(ctx, l.client, tcpip.FullAddress{
 		NIC:  nicID,
@@ -320,10 +355,17 @@ func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
 		Port: listenPort,
 	}, header.IPv4ProtocolNumber)
 	if err != nil {
+		closing := l.endDial()
+		if closing {
+			return nil, net.ErrClosed
+		}
 		if errors.Is(err, net.ErrClosed) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("gvisor: dial tcp: %w", err)
+	}
+	if l.finishDial(c) {
+		return nil, net.ErrClosed
 	}
 	return basetcp.Wrap(c), nil
 }
@@ -357,25 +399,175 @@ func dialPacketCarrier(ctx context.Context, remote string) (transport.PathConn, 
 		clientStack.Close()
 		return nil, fmt.Errorf("gvisor: dial packet-carrier tcp: %w", err)
 	}
-	return &managedPathConn{
-		PathConn: basetcp.Wrap(c),
-		cleanup: func() {
-			link.close()
-			clientStack.Close()
-		},
-	}, nil
+	return newRetainedPathConn(basetcp.Wrap(c), func() {
+		link.close()
+		clientStack.Close()
+	}), nil
 }
 
-type managedPathConn struct {
-	transport.PathConn
-	once    sync.Once
-	cleanup func()
+// retainedPathConn keeps its owner's resources alive while the concrete TCP
+// path is usable. Embedding the concrete basetcp type preserves its optional
+// engine-facing methods in this wrapper's method set.
+type retainedPathConn struct {
+	*basetcp.PathConn
+
+	releaseOnce sync.Once
+	release     func()
+
+	deathMu    sync.Mutex
+	dead       bool
+	deathCause transport.DeathCause
+	deathErr   error
+	deathFn    func(transport.DeathCause, error)
 }
 
-func (p *managedPathConn) Close() error {
+func newRetainedPathConn(path *basetcp.PathConn, release func()) *retainedPathConn {
+	p := &retainedPathConn{PathConn: path, release: release}
+	path.OnDeath(p.onDeath)
+	return p
+}
+
+func (p *retainedPathConn) Close() error {
 	err := p.PathConn.Close()
-	p.once.Do(p.cleanup)
+	p.releaseOnce.Do(p.release)
 	return err
+}
+
+func (p *retainedPathConn) OnDeath(fn func(transport.DeathCause, error)) {
+	p.deathMu.Lock()
+	if !p.dead {
+		p.deathFn = fn
+		p.deathMu.Unlock()
+		return
+	}
+	cause, err := p.deathCause, p.deathErr
+	p.deathMu.Unlock()
+	if fn != nil {
+		go fn(cause, err)
+	}
+}
+
+func (p *retainedPathConn) onDeath(cause transport.DeathCause, err error) {
+	p.releaseOnce.Do(p.release)
+	p.deathMu.Lock()
+	p.dead = true
+	p.deathCause = cause
+	p.deathErr = err
+	fn := p.deathFn
+	p.deathFn = nil
+	p.deathMu.Unlock()
+	if fn != nil {
+		fn(cause, err)
+	}
+}
+
+func (l *Listener) retainAccepted(c net.Conn) (transport.PathConn, bool) {
+	l.lifecycleMu.Lock()
+	if l.closing {
+		l.lifecycleMu.Unlock()
+		_ = c.Close()
+		return nil, false
+	}
+	l.active++
+	l.lifecycleMu.Unlock()
+	return newRetainedPathConn(basetcp.Wrap(c), l.releaseAccepted), true
+}
+
+func (l *Listener) releaseAccepted() {
+	l.lifecycleMu.Lock()
+	if l.active > 0 {
+		l.active--
+	}
+	cleanup := l.cleanupReadyLocked()
+	l.lifecycleMu.Unlock()
+	if cleanup {
+		l.cleanupShared()
+	}
+}
+
+func (l *Listener) beginDial() bool {
+	l.lifecycleMu.Lock()
+	defer l.lifecycleMu.Unlock()
+	if l.closing {
+		return false
+	}
+	l.dialing++
+	return true
+}
+
+func (l *Listener) endDial() bool {
+	l.lifecycleMu.Lock()
+	l.dialing--
+	closing := l.closing
+	cleanup := l.cleanupReadyLocked()
+	l.lifecycleMu.Unlock()
+	if cleanup {
+		l.cleanupShared()
+	}
+	return closing
+}
+
+func (l *Listener) finishDial(c net.Conn) bool {
+	closing := l.endDial()
+	if closing {
+		_ = c.Close()
+	}
+	return closing
+}
+
+func (l *Listener) finishAdmission() {
+	l.lifecycleMu.Lock()
+	l.admissionDone = true
+	cleanup := l.cleanupReadyLocked()
+	l.lifecycleMu.Unlock()
+	close(l.acceptDone)
+	if cleanup {
+		l.cleanupShared()
+	}
+}
+
+func (l *Listener) discardPendingAccepts() {
+	for {
+		select {
+		case r := <-l.acceptCh:
+			if r.pc != nil {
+				_ = r.pc.Close()
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (l *Listener) cleanupIfIdle() {
+	l.lifecycleMu.Lock()
+	cleanup := l.cleanupReadyLocked()
+	l.lifecycleMu.Unlock()
+	if cleanup {
+		l.cleanupShared()
+	}
+}
+
+func (l *Listener) cleanupReadyLocked() bool {
+	return l.closing && l.admissionDone && l.active == 0 && l.dialing == 0
+}
+
+func (l *Listener) cleanupShared() {
+	l.cleanupOnce.Do(func() {
+		if l.wire != nil {
+			_ = l.wire.Close()
+		}
+		if l.ep != nil {
+			l.ep.Close()
+		}
+		if l.client != nil {
+			l.client.Close()
+		}
+		if l.server != nil {
+			l.server.Close()
+		}
+		close(l.cleanupDone)
+	})
 }
 
 func (l *Listener) pumpInbound() {

@@ -43,11 +43,24 @@ type PacketSource struct {
 	Conn    net.PacketConn
 }
 
+// FramedSource contributes an optional transport listener that already
+// produces rendr PathConn framing and lifecycle signals. It is the ingress
+// boundary for transports such as QUIC and gVisor; Runtime owns admission,
+// bridge identity, limits, and accepted-session publication after AcceptPath.
+// SessionListener.Close closes Listener; accepted paths are independently
+// owned by their sessions.
+type FramedSource struct {
+	Name     string
+	Carrier  CarrierFamily
+	Listener transport.PathListener
+}
+
 // ListenConfig describes the inbound carrier sources that share one Runtime
 // identity and bridge namespace.
 type ListenConfig struct {
 	Streams []StreamSource
 	Packets []PacketSource
+	Framed  []FramedSource
 }
 
 // acceptedStreamConn restricts the dynamic method set to capabilities an
@@ -82,6 +95,7 @@ type SessionListener struct {
 	addrs    []net.Addr
 	closers  []func() error
 	carriers map[string]CarrierFamily
+	kinds    map[string]transport.PathSessionKind
 
 	sourceMu     sync.Mutex
 	activeSource int
@@ -106,11 +120,12 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 	if r == nil {
 		return nil, fmt.Errorf("rendr: nil Runtime")
 	}
-	if len(config.Streams)+len(config.Packets) == 0 {
+	if len(config.Streams)+len(config.Packets)+len(config.Framed) == 0 {
 		return nil, fmt.Errorf("rendr: ListenConfig requires at least one source")
 	}
-	seen := make(map[string]struct{}, len(config.Streams)+len(config.Packets))
-	seenObjects := make(map[uintptr]string, len(config.Streams)+len(config.Packets))
+	seen := make(map[string]struct{}, len(config.Streams)+len(config.Packets)+len(config.Framed))
+	seenObjects := make(map[uintptr]string, len(config.Streams)+len(config.Packets)+len(config.Framed))
+	framedKinds := make(map[string]transport.PathSessionKind, len(config.Framed))
 	for index, source := range config.Streams {
 		if source.Name == "" {
 			return nil, fmt.Errorf("rendr: StreamSource[%d] has an empty name", index)
@@ -153,6 +168,32 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 			seenObjects[pointer] = source.Name
 		}
 	}
+	for index, source := range config.Framed {
+		if source.Name == "" {
+			return nil, fmt.Errorf("rendr: FramedSource[%d] has an empty name", index)
+		}
+		if _, duplicate := seen[source.Name]; duplicate {
+			return nil, fmt.Errorf("rendr: duplicate inbound source %q", source.Name)
+		}
+		seen[source.Name] = struct{}{}
+		if !source.Carrier.valid() {
+			return nil, fmt.Errorf("rendr: FramedSource %q has invalid carrier %d", source.Name, source.Carrier)
+		}
+		if isNilNetworkSource(source.Listener) {
+			return nil, fmt.Errorf("rendr: FramedSource %q has a nil Listener", source.Name)
+		}
+		kind := source.Listener.SessionKind()
+		if kind > transport.PathSessionPacket {
+			return nil, fmt.Errorf("rendr: FramedSource %q has invalid session kind %d", source.Name, kind)
+		}
+		framedKinds[source.Name] = kind
+		if pointer := networkSourcePointer(source.Listener); pointer != 0 {
+			if previous := seenObjects[pointer]; previous != "" {
+				return nil, fmt.Errorf("rendr: inbound sources %q and %q share one network object", previous, source.Name)
+			}
+			seenObjects[pointer] = source.Name
+		}
+	}
 
 	l := &SessionListener{
 		runtime:      r,
@@ -161,16 +202,18 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 		streamSlots:  make(chan struct{}, runtimeAcceptQueueSize),
 		packetSlots:  make(chan struct{}, runtimeAcceptQueueSize),
 		handshakes:   make(chan struct{}, runtimeHandshakeLimit),
-		activeSource: len(config.Streams) + len(config.Packets),
+		activeSource: len(config.Streams) + len(config.Packets) + len(config.Framed),
 		inflight:     make(map[uint64]transport.PathConn),
 		closed:       make(chan struct{}),
-		carriers:     make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)),
+		carriers:     make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		kinds:        make(map[string]transport.PathSessionKind, len(config.Streams)+len(config.Packets)+len(config.Framed)),
 	}
 	if err := r.claimListener(l); err != nil {
 		return nil, err
 	}
 	for _, source := range config.Streams {
 		l.carriers[source.Name] = source.Carrier
+		l.kinds[source.Name] = transport.PathSessionAny
 		l.addrs = append(l.addrs, source.Listener.Addr())
 		l.closers = append(l.closers, source.Listener.Close)
 		l.workers.Add(1)
@@ -181,6 +224,7 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 	}
 	for _, source := range config.Packets {
 		l.carriers[source.Name] = source.Carrier
+		l.kinds[source.Name] = transport.PathSessionAny
 		packetListener, err := uflow.NewListenerFromPacketConn(source.Conn)
 		if err != nil {
 			l.shutdown(err)
@@ -193,6 +237,17 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 			defer l.workers.Done()
 			l.acceptPacketSource(source, packetListener)
 		}(source, packetListener)
+	}
+	for _, source := range config.Framed {
+		l.carriers[source.Name] = source.Carrier
+		l.kinds[source.Name] = framedKinds[source.Name]
+		l.addrs = append(l.addrs, source.Listener.Addr())
+		l.closers = append(l.closers, source.Listener.Close)
+		l.workers.Add(1)
+		go func(source FramedSource) {
+			defer l.workers.Done()
+			l.acceptFramedSource(source)
+		}(source)
 	}
 	return l, nil
 }
@@ -355,6 +410,70 @@ func (l *SessionListener) acceptPacketSource(source PacketSource, listener *uflo
 	}
 }
 
+func (l *SessionListener) acceptFramedSource(source FramedSource) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-l.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	for {
+		acceptCtx, acceptCancel := context.WithTimeout(ctx, runtimeHandshakeTimeout)
+		pc, err := source.Listener.AcceptPath(acceptCtx)
+		acceptTimedOut := errors.Is(acceptCtx.Err(), context.DeadlineExceeded)
+		acceptCancel()
+		if err != nil {
+			if acceptTimedOut && ctx.Err() == nil {
+				continue
+			}
+			l.sourceEnded(err)
+			return
+		}
+		if isNilNetworkSource(pc) {
+			l.sourceEnded(fmt.Errorf("rendr: FramedSource %q returned a nil PathConn", source.Name))
+			return
+		}
+		if !l.acquireHandshake() {
+			_ = pc.Close()
+			return
+		}
+		inflightID, ok := l.trackInflight(pc)
+		if !ok {
+			<-l.handshakes
+			_ = pc.Close()
+			return
+		}
+		clearDeadline := armPathHandshakeDeadline(pc)
+		l.workers.Add(1)
+		go func() {
+			defer l.workers.Done()
+			l.serveIncoming(inflightID, source.Name, source.Carrier, pc, clearDeadline)
+		}()
+	}
+}
+
+func armPathHandshakeDeadline(pc transport.PathConn) func() {
+	return armPathHandshakeDeadlineAfter(pc, runtimeHandshakeTimeout)
+}
+
+func armPathHandshakeDeadlineAfter(pc transport.PathConn, timeout time.Duration) func() {
+	var active atomic.Bool
+	active.Store(true)
+	timer := time.AfterFunc(timeout, func() {
+		if active.CompareAndSwap(true, false) {
+			_ = pc.Close()
+		}
+	})
+	return func() {
+		if active.CompareAndSwap(true, false) {
+			timer.Stop()
+		}
+	}
+}
+
 func (l *SessionListener) acquireHandshake() bool {
 	select {
 	case <-l.closed:
@@ -406,6 +525,9 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		return false
 	}
 	packetMode := hello.Caps&proto.CapsPacketMode != 0
+	if !l.sourceAllowsSession(sourceName, packetMode) {
+		return false
+	}
 	var reservation engine.BridgeReservation
 	for {
 		reservation, err = l.runtime.bridges.Reserve(hello.FlowID)
@@ -563,6 +685,10 @@ func (l *SessionListener) handleRuntimeBridge(sourceName string, pc transport.Pa
 		_ = engine.PerformBridgeAck(pc, tag, l.runtime.instanceID, proto.AckRejectUnknown, "unknown flow")
 		return false
 	}
+	if !l.sourceAllowsSession(sourceName, e.Packetized()) {
+		_ = engine.PerformBridgeAck(pc, tag, l.runtime.instanceID, proto.AckRejectAttach, "source session kind mismatch")
+		return false
+	}
 	select {
 	case <-l.closed:
 		return false
@@ -598,6 +724,23 @@ func (l *SessionListener) awaitRuntimeEngine(flowID [16]byte) (*engine.Engine, e
 	defer close(stopCloseWatch)
 	defer cancel()
 	return l.runtime.bridges.WaitActive(ctx, flowID)
+}
+
+func (l *SessionListener) sourceAllowsSession(sourceName string, packetMode bool) bool {
+	kind, known := l.kinds[sourceName]
+	if !known {
+		return false
+	}
+	switch kind {
+	case transport.PathSessionAny:
+		return true
+	case transport.PathSessionStream:
+		return !packetMode
+	case transport.PathSessionPacket:
+		return packetMode
+	default:
+		return false
+	}
 }
 
 func modeFromManifest(manifest proto.GraphManifest) Mode {

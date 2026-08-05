@@ -45,7 +45,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcprepair", Address: ln.Addr().String()},

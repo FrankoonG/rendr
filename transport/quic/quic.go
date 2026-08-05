@@ -127,14 +127,14 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
 	}
 	if useDatagram {
-		return wrapDatagram(conn, false), nil
+		return wrapDatagram(conn, false, nil), nil
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		_ = conn.CloseWithError(0, "open stream failed")
 		return nil, fmt.Errorf("quic: open stream: %w", err)
 	}
-	return wrap(conn, stream, false), nil
+	return wrap(conn, stream, false, nil), nil
 }
 
 // Probe times the handshake + first-stream open as a coarse RTT
@@ -153,14 +153,15 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 // Accept wraps a server-accepted (connection, stream) pair. Used by
 // the listener-side dispatcher (see rendr.ListenQUIC).
 func Accept(conn *qg.Conn, stream *qg.Stream) *PathConn {
-	return wrap(conn, stream, true)
+	return wrap(conn, stream, true, nil)
 }
 
-func wrap(conn *qg.Conn, stream *qg.Stream, server bool) *PathConn {
+func wrap(conn *qg.Conn, stream *qg.Stream, server bool, release func()) *PathConn {
 	pc := &PathConn{
-		conn:   conn,
-		stream: stream,
-		server: server,
+		conn:    conn,
+		stream:  stream,
+		server:  server,
+		release: release,
 	}
 	go pc.watchConn()
 	return pc
@@ -168,9 +169,10 @@ func wrap(conn *qg.Conn, stream *qg.Stream, server bool) *PathConn {
 
 // PathConn implements transport.PathConn over a single QUIC stream.
 type PathConn struct {
-	conn   *qg.Conn
-	stream *qg.Stream
-	server bool
+	conn    *qg.Conn
+	stream  *qg.Stream
+	server  bool
+	release func()
 
 	writeMu sync.Mutex
 	readBuf [LengthPrefixSize]byte
@@ -250,6 +252,7 @@ func (p *PathConn) Close() error {
 	p.deathErr = err
 	p.deathFn = nil
 	p.deathMu.Unlock()
+	p.releaseRetention()
 	return err
 }
 
@@ -319,8 +322,15 @@ func (p *PathConn) declareDeath(err error) {
 	fn := p.deathFn
 	p.deathFn = nil
 	p.deathMu.Unlock()
+	p.releaseRetention()
 	if fn != nil {
 		fn(p.classify(err), err)
+	}
+}
+
+func (p *PathConn) releaseRetention() {
+	if p.release != nil {
+		p.release()
 	}
 }
 

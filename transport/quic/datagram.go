@@ -38,9 +38,10 @@ const datagramIngressQueueLen = 2048
 // Wire shape: one DATAGRAM frame == one rendr frame. No length
 // prefix - the DATAGRAM boundary IS the frame boundary.
 type datagramPathConn struct {
-	conn   *qg.Conn
-	server bool
-	recvQ  chan []byte
+	conn    *qg.Conn
+	server  bool
+	recvQ   chan []byte
+	release func()
 
 	writeMu sync.Mutex
 
@@ -63,11 +64,12 @@ type datagramPathConn struct {
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
 // the wrapped conn's SendDatagram/ReceiveDatagram calls to work.
-func wrapDatagram(conn *qg.Conn, server bool) *datagramPathConn {
+func wrapDatagram(conn *qg.Conn, server bool, release func()) *datagramPathConn {
 	p := &datagramPathConn{
-		conn:   conn,
-		server: server,
-		recvQ:  make(chan []byte, datagramIngressQueueLen),
+		conn:    conn,
+		server:  server,
+		recvQ:   make(chan []byte, datagramIngressQueueLen),
+		release: release,
 	}
 	go p.pumpDatagrams()
 	go p.watchConn()
@@ -76,7 +78,7 @@ func wrapDatagram(conn *qg.Conn, server bool) *datagramPathConn {
 
 // AcceptDatagram wraps a server-accepted DATAGRAM-capable connection.
 func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
-	return wrapDatagram(conn, true)
+	return wrapDatagram(conn, true, nil)
 }
 
 // Read pops one DATAGRAM and copies into buf. If buf is smaller than
@@ -174,6 +176,7 @@ func (p *datagramPathConn) Close() error {
 	p.deathErr = err
 	p.deathFn = nil
 	p.deathMu.Unlock()
+	p.releaseRetention()
 	return err
 }
 
@@ -242,8 +245,15 @@ func (p *datagramPathConn) declareDeath(err error) {
 	fn := p.deathFn
 	p.deathFn = nil
 	p.deathMu.Unlock()
+	p.releaseRetention()
 	if fn != nil {
 		fn(p.classify(err), err)
+	}
+}
+
+func (p *datagramPathConn) releaseRetention() {
+	if p.release != nil {
+		p.release()
 	}
 }
 

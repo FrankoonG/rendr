@@ -39,7 +39,7 @@ func bondRoot(specs []PathSpec) Target     { return testRoot(TargetKindBond, spe
 
 // waitForNPaths polls until both client and server see at least n
 // attached paths, retrying via testConnectionControl.AddPath against the named
-// transport+address if the client falls short. The Dialer is
+// transport+address if the client falls short. The session dialer is
 // best-effort about extra paths (silent-skip on dial failure);
 // under heavy parallel test load that drops paths often enough to
 // be a per-test pollution source. Centralising the retry here
@@ -87,7 +87,7 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 
@@ -160,7 +160,7 @@ func TestPathInfoLastRecvAt(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 
@@ -208,12 +208,12 @@ func TestPathInfoLastRecvAt(t *testing.T) {
 	}
 }
 
-// TestDialerCustomLimitsApplied: setting ZombieMaxMigrations on the
-// Dialer must reach the engine. We construct a Dialer with the
+// TestDialerCustomLimitsApplied verifies that a session-level
+// ZombieMaxMigrations setting reaches the engine. We construct a session dialer with the
 // minimum-zombie value (1) and run a single death-driven failover;
 // the engine should trip zombie protection after that one event
 // (which would not trigger under the default 2). This validates that
-// the Dialer→engine.Limits plumbing actually carries the field.
+// the sessionDialer-to-engine Limits plumbing actually carries the field.
 func TestDialerCustomLimitsApplied(t *testing.T) {
 	ln, err := ListenTCP("127.0.0.1:0")
 	if err != nil {
@@ -232,7 +232,7 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: selectorRoot([]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -274,8 +274,8 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 }
 
 // TestM2QUICDatagramPacketRoundTrip exercises the full DATAGRAM
-// stack through the rendr public surface: rendr.ListenQUICDatagram
-// on the server + Dialer.DialPacket with PathSpec.Opts["mode"]=
+// stack through the package-local session path: rendr.ListenQUICDatagram
+// on the server + sessionDialer.DialPacket with PathSpec.Opts["mode"]=
 // "datagram" on the client. Confirms the wire-level QUIC DATAGRAM
 // support (commit 690fa60) integrates correctly through engine
 // packet mode.
@@ -298,7 +298,7 @@ func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{
 			Transport: "quic",
@@ -398,7 +398,7 @@ func TestSetReadDeadlinePacketMode(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
 
@@ -469,7 +469,7 @@ func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
 
@@ -516,7 +516,7 @@ func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
 }
 
 // TestM1DialAcceptRoundTrip is the minimal end-to-end demo for M1:
-// ListenTCP + Dialer.Dial + Read/Write a payload over the rendr Conn.
+// ListenTCP + sessionDialer.Dial + Read/Write a payload over the rendr Conn.
 // Both ends live in the same process; the wire path is a real TCP
 // socket on the loopback.
 func TestM1DialAcceptRoundTrip(t *testing.T) {
@@ -543,7 +543,7 @@ func TestM1DialAcceptRoundTrip(t *testing.T) {
 	}()
 
 	// Dial side.
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -621,7 +621,7 @@ func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{Root: selectorRoot(
+	client, err := (&sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "gvisor", Address: ln.Addr().String()}})}).Dial(context.Background())
 	if err != nil {
@@ -674,7 +674,7 @@ func TestM1LargePayload(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -761,7 +761,7 @@ func TestM1FlowIDsAreUnique(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+			d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 			c, err := d.Dial(context.Background())
 			if err != nil {
 				clientErrs[i] = err
@@ -843,7 +843,7 @@ func TestM1PlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -958,7 +958,7 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}), MigrationBudget: 200 * time.Millisecond}
 
@@ -1035,7 +1035,7 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1134,7 +1134,7 @@ func TestM1CleanCloseEOF(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1199,7 +1199,7 @@ func TestM1G1Sketch(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1337,7 +1337,7 @@ func TestM1G2Sketch(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1474,7 +1474,7 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: raceRoot(
+	d := &sessionDialer{Root: raceRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1573,7 +1573,7 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: bondRoot(
+	d := &sessionDialer{Root: bondRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1711,7 +1711,7 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -1799,7 +1799,7 @@ func TestAdminConnStateAndHWM(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1871,7 +1871,7 @@ func TestPathInfoCountersExposed(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
+	d := &sessionDialer{Root: selectorRoot([]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}})}
 	client, err := d.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1929,7 +1929,7 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2048,7 +2048,7 @@ func TestAdminConnRemovePath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2143,7 +2143,7 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2210,7 +2210,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2327,7 +2327,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2457,7 +2457,7 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: raceRoot(
+	d := &sessionDialer{Root: raceRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2564,7 +2564,7 @@ func TestM8BondPathPinning(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: bondRoot(
+	d := &sessionDialer{Root: bondRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2655,7 +2655,7 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: bondRoot(
+	d := &sessionDialer{Root: bondRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2751,7 +2751,7 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: bondRoot(
+	d := &sessionDialer{Root: bondRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String(), Weight: 3},
@@ -2850,7 +2850,7 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: bondRoot(
+	d := &sessionDialer{Root: bondRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -2969,7 +2969,7 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
@@ -3072,7 +3072,7 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
@@ -3125,7 +3125,7 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 	}
 }
 
-// TestM5UDPFlowDialAcceptRoundTrip: Dialer over udpflow path +
+// TestM5UDPFlowDialAcceptRoundTrip: session dialer over udpflow path +
 // ListenUDPFlow accept; data flows in both directions over an
 // opaque UDP datagram pair. Migration test (path swap on the same
 // flow_id) belongs to a chaos run; this just proves wire+API.
@@ -3148,7 +3148,7 @@ func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
 
@@ -3213,7 +3213,7 @@ func TestM5PacketBoundariesPreserved(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
 
@@ -3300,7 +3300,7 @@ func TestM5PacketRejectOversize(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "udpflow", Address: ln.Addr().String()}})}
 
@@ -3357,7 +3357,7 @@ func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
@@ -3471,7 +3471,7 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 				accepted <- c
 			}()
 
-			d := &Dialer{Root: selectorRoot(
+			d := &sessionDialer{Root: selectorRoot(
 
 				[]PathSpec{
 					{Transport: "udpflow", Address: ln.Addr().String()},
@@ -3598,7 +3598,7 @@ func TestM5PacketRaceModeDuplicates(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: raceRoot(
+	d := &sessionDialer{Root: raceRoot(
 
 		[]PathSpec{
 			{Transport: "udpflow", Address: ln.Addr().String()},
@@ -3725,7 +3725,7 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "tcp", Address: ln.Addr().String()}}), ProbeInterval: 100 * time.Millisecond}
 
@@ -3788,7 +3788,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: selectorRoot([]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -3877,7 +3877,7 @@ func TestM2G1SketchQUIC(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "quic", Address: ln.Addr().String()},
@@ -3979,7 +3979,7 @@ func TestM2G1SketchQUIC(t *testing.T) {
 	t.Logf("16 MiB over QUIC + 3 migrations in %s, sha256 verified", time.Since(t0))
 }
 
-// TestM2QUICRoundTrip: Dialer over QUIC path + ListenQUIC accept;
+// TestM2QUICRoundTrip: session dialer over QUIC path + ListenQUIC accept;
 // public rendr.Conn round-trips bytes through one QUIC connection
 // per path. Matches the M1 TCP smoke test but over the QUIC adapter.
 func TestM2QUICRoundTrip(t *testing.T) {
@@ -4001,7 +4001,7 @@ func TestM2QUICRoundTrip(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{{Transport: "quic", Address: ln.Addr().String()}})}
 
@@ -4029,7 +4029,7 @@ func TestM2QUICRoundTrip(t *testing.T) {
 	}
 }
 
-// TestM2MixedTCPQUICMigration: two paths on the same Dialer, one
+// TestM2MixedTCPQUICMigration: two paths on the same session dialer, one
 // TCP and one QUIC, both attached to the same engine. Send the
 // first half on TCP, migrate to QUIC, send the rest. Hash must match.
 //
@@ -4062,7 +4062,7 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: addrs[0].String()},
@@ -4166,7 +4166,7 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		accepted <- c
 	}()
 
-	client, err := (&Dialer{Root: selectorRoot(
+	client, err := (&sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: addrs[0].String()},
@@ -4310,7 +4310,7 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "quic", Address: ln.Addr().String()},
@@ -4389,7 +4389,7 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &Dialer{Root: selectorRoot(
+	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String()},
@@ -4406,7 +4406,7 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 	defer server.Close()
 
 	// Wait for all 3 paths on both ends; retry via AddPath under
-	// load if Dialer's silent-skip dropped one of the extras.
+	// load if the session dialer's silent-skip dropped one of the extras.
 	bcAdm := client.(testConnectionControl)
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {

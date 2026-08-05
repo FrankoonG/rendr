@@ -126,12 +126,12 @@ func TestDialerOptionalPathRetryAttachesAfterForwardingFix(t *testing.T) {
 
 	var useNative atomic.Bool
 	useNative.Store(true)
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: Selector("root", []Target{
 			Path("A", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 			Path("B", PathSpec{Transport: "switch", Address: "B"}),
 		}),
-		Retry: RetryPolicy{MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond},
+		Retry: retryPolicy{MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond},
 	}
 	if err := d.AddStreamPathFactory("switch", func(ctx context.Context, _ string) (net.Conn, error) {
 		addr := ln.Addr().String()
@@ -198,12 +198,12 @@ func TestDialerOptionalPathFailureDoesNotSurfaceToApp(t *testing.T) {
 		}
 	}()
 
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root: Selector("root", []Target{
 			Path("A", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 			Path("B", PathSpec{Transport: "tcp", Address: badAddr}),
 		}),
-		Retry: RetryPolicy{MinBackoff: 20 * time.Millisecond, MaxBackoff: 20 * time.Millisecond},
+		Retry: retryPolicy{MinBackoff: 20 * time.Millisecond, MaxBackoff: 20 * time.Millisecond},
 	}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)

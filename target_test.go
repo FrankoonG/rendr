@@ -105,7 +105,7 @@ func TestTargetConstructorsExposeGroupKinds(t *testing.T) {
 }
 
 func TestDialerCompileDialPlanUsesSingleRoot(t *testing.T) {
-	d := &Dialer{
+	d := &sessionDialer{
 		Root: Selector("root", []Target{
 			Path("root-path", PathSpec{Transport: "tcp", Address: "root"}),
 		}),
@@ -130,7 +130,7 @@ func TestDialerPrimaryExplicitPathReordersPlan(t *testing.T) {
 		Path("A", PathSpec{Transport: "tcp", Address: "a"}),
 		Path("B", PathSpec{Transport: "tcp", Address: "b"}),
 	})
-	plan, err := (&Dialer{Root: root, Primary: "B"}).compileDialPlan()
+	plan, err := (&sessionDialer{Root: root, Primary: "B"}).compileDialPlan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDialerPrimaryExplicitGroupResolvesLeaf(t *testing.T) {
 		Path("A", PathSpec{Transport: "tcp", Address: "a"}),
 		bulk,
 	})
-	plan, err := (&Dialer{Root: root, Primary: "bulk"}).compileDialPlan()
+	plan, err := (&sessionDialer{Root: root, Primary: "bulk"}).compileDialPlan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestDialerStatusPeerRendr(t *testing.T) {
 		}
 	}()
 
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root: Selector("root", []Target{
 			Path("A", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 		}),
@@ -237,7 +237,7 @@ func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
 		Path("A", PathSpec{Transport: "tcp", Address: badAddr}),
 		Path("B", PathSpec{Transport: "tcp", Address: good.Addr().String()}),
 	})
-	client, err := (&Dialer{Root: root, Primary: "A"}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, Primary: "A"}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestDialerPrimaryRequireFails(t *testing.T) {
 		Path("A", PathSpec{Transport: "tcp", Address: badAddr}),
 		Path("B", PathSpec{Transport: "tcp", Address: good.Addr().String()}),
 	})
-	client, err := (&Dialer{Root: root, Primary: "A", PrimaryPolicy: PrimaryRequire}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, Primary: "A", PrimaryPolicy: primaryRequire}).Dial(ctx)
 	if err == nil {
 		client.Close()
 		t.Fatal("Dial succeeded with unavailable required primary")
@@ -320,7 +320,7 @@ func TestDialerRootSelectorDialSmoke(t *testing.T) {
 		Path("A", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 		Path("B", PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
 	})
-	client, err := (&Dialer{Root: root}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	client, err := (&Dialer{Root: root}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 			SaturationRatio: 0.99,
 		},
 	)
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root:       root,
 		Hysteresis: 0.05,
 		Dwell:      100 * time.Millisecond,
@@ -548,7 +548,7 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 		Path("A", spec("A")),
 		Path("B", spec("B")),
 	})
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root:       root,
 		Hysteresis: 0.05,
 		Dwell:      100 * time.Millisecond,
@@ -641,7 +641,7 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		},
 		PeakTransfer{Targets: []string{"D"}, SaturationFor: 10 * time.Second},
 	)
-	client, err := (&Dialer{
+	client, err := (&sessionDialer{
 		Root:       root,
 		Hysteresis: 0.05,
 		Dwell:      100 * time.Millisecond,
@@ -729,7 +729,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&Dialer{Root: root}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,7 +804,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +880,7 @@ func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
 			ProbeBudget:     64 << 10,
 		},
 	)
-	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +968,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	d := &Dialer{Root: root, ProbeInterval: time.Hour}
+	d := &sessionDialer{Root: root, ProbeInterval: time.Hour}
 	if err := d.AddStreamPathFactory("slow-tcp", func(ctx context.Context, addr string) (net.Conn, error) {
 		var nd net.Dialer
 		c, err := nd.DialContext(ctx, "tcp", addr)
@@ -1069,7 +1069,7 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	client, err := (&Dialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,7 +8,7 @@ import (
 
 func TestGenericCarrierFactsNeverGrantOwnedMobility(t *testing.T) {
 	resolver := &pathFactoryResolver{
-		stream: map[string]StreamPathFactory{
+		stream: map[string]streamPathFactory{
 			"tcp-family": func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
 			"udp-family": func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed },
 		},
