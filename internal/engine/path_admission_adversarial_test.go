@@ -105,6 +105,7 @@ type admissionSetSizes struct {
 	predecessors int
 	byLeaf       int
 	byPath       int
+	completed    int
 	generations  []uint64
 	inboxLens    []int
 }
@@ -370,7 +371,7 @@ func TestPathAdmissionCloseQuiescesEveryLifecycleSet(t *testing.T) {
 			}
 			state := snapshotAdmissionSets(e)
 			if state.active != 0 || state.pending != 0 || state.staged != 0 || state.retained != 0 ||
-				state.predecessors != 0 || state.byLeaf != 0 || state.byPath != 0 || len(state.generations) != 0 {
+				state.predecessors != 0 || state.byLeaf != 0 || state.byPath != 0 || state.completed != 0 || len(state.generations) != 0 {
 				t.Fatalf("Close left admission state: %+v", state)
 			}
 			for _, slot := range slots {
@@ -648,7 +649,9 @@ func TestGracefulCloseClosesAdmissionGateBeforeByeCompletes(t *testing.T) {
 }
 
 func TestCompletedAdmissionReplayKeepsOriginalDeadline(t *testing.T) {
-	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	e, binding := newAdmissionAdversarialEngineWithLimits(t, SideClient, Limits{
+		MigrationBudget: 30 * time.Millisecond,
+	})
 	base, peer := newMemoryPathPair()
 	t.Cleanup(func() { _ = peer.Close() })
 	path := &admissionBlockingWritePath{
@@ -686,11 +689,15 @@ func TestCompletedAdmissionReplayKeepsOriginalDeadline(t *testing.T) {
 	if err := e.rememberCompletedPathAdmission(id, commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
 		t.Fatal(err)
 	}
-	e.pathsMu.Lock()
+	e.pathsMu.RLock()
 	slot := e.paths[id]
-	slot.completedAdmission.expires = time.Now().Add(30 * time.Millisecond)
-	expires := slot.completedAdmission.expires
-	e.pathsMu.Unlock()
+	completed := e.completedPathAdmissions[commit.PathAdmissionBinding]
+	if completed == nil {
+		e.pathsMu.RUnlock()
+		t.Fatal("completed admission replay was not registered at engine scope")
+	}
+	expires := completed.expires
+	e.pathsMu.RUnlock()
 	receipt := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
 		Phase:                proto.PathAdmissionPhaseFinal,
@@ -708,8 +715,134 @@ func TestCompletedAdmissionReplayKeepsOriginalDeadline(t *testing.T) {
 		_, ok := e.PathRef(id)
 		return !ok
 	})
+	if err := e.CloseErr(); errors.Is(err, ErrPathAdmissionOutcomeUnknown) {
+		t.Fatalf("completed replay expiry closed session as outcome unknown: %v", err)
+	}
 	if time.Now().After(expires.Add(300 * time.Millisecond)) {
 		t.Fatalf("terminal replay outlived original deadline %v", expires)
+	}
+}
+
+func TestCompletedAdmissionReplayReplacementIsBenign(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	base, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	path := &admissionBlockingWritePath{
+		PathConn: base,
+		entered:  make(chan struct{}),
+		unblock:  make(chan struct{}),
+	}
+	id, err := e.AttachPathBound(path, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := e.localGraphBinding()
+	makeCommit := func(token byte, base uint64) proto.PathAdmissionCommit {
+		return admissionCommit(
+			proto.PathAdmissionKindBridge, proto.SessionEpoch(e.FlowID()), proto.PathAdmissionID{token},
+			senderDirection(SideClient), local.revision, local.digest,
+			binding.LocalTXTargetID, binding.PeerTXTargetID, base,
+			[]byte{token, 1}, []byte{token, 2},
+		)
+	}
+	oldCommit := makeCommit(0x72, 0)
+	oldActivated := proto.PathAdmissionAck{
+		PathAdmissionBinding: oldCommit.PathAdmissionBinding,
+		Phase:                proto.PathAdmissionPhaseActivated,
+		Code:                 proto.AckOK,
+	}
+	oldActivatedWire, err := oldActivated.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rememberCompletedPathAdmission(id, oldCommit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, oldActivatedWire); err != nil {
+		t.Fatal(err)
+	}
+	receipt := proto.PathAdmissionAck{
+		PathAdmissionBinding: oldCommit.PathAdmissionBinding,
+		Phase:                proto.PathAdmissionPhaseFinal,
+		Code:                 proto.AckOK,
+	}
+	receiptWire, err := receipt.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	e.pathsMu.RUnlock()
+	if !e.routePathAdmissionControl(slot, proto.CtrlPathAdmissionAck, receiptWire) {
+		t.Fatal("old completed receipt was not consumed")
+	}
+	waitAdmissionChannel(t, path.entered, "old completed replay write")
+
+	newCommit := makeCommit(0x73, 1)
+	newActivated := proto.PathAdmissionAck{
+		PathAdmissionBinding: newCommit.PathAdmissionBinding,
+		Phase:                proto.PathAdmissionPhaseActivated,
+		Code:                 proto.AckOK,
+	}
+	newActivatedWire, err := newActivated.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rememberCompletedPathAdmission(id, newCommit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, newActivatedWire); err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.RLock()
+	_, oldPresent := e.completedPathAdmissions[oldCommit.PathAdmissionBinding]
+	_, newPresent := e.completedPathAdmissions[newCommit.PathAdmissionBinding]
+	e.pathsMu.RUnlock()
+	if oldPresent || !newPresent {
+		t.Fatalf("completed replacement state old=%t new=%t", oldPresent, newPresent)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CloseErr(); errors.Is(err, ErrPathAdmissionOutcomeUnknown) {
+		t.Fatalf("stale completed replay closed session as outcome unknown: %v", err)
+	}
+}
+
+func TestPathAdmissionStaleTerminalSourceRequiresCurrentRouteRetry(t *testing.T) {
+	e, pathBinding := newAdmissionAdversarialEngine(t, SideClient)
+	old, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory"}, pathBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, binding := prepareBoundAdmission(t, e, replacement, pathBinding, 0x74)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ActivateStagedPath(replacementID, true); err != nil {
+		t.Fatal(err)
+	}
+	staleSource, ok := e.PathRef(replacementID)
+	if !ok {
+		t.Fatal("replacement route is not active")
+	}
+	e.onPathDeath(replacementID, staleSource.Owner, transport.CauseTransportError, errors.New("death after terminal proof dequeue"))
+	if active := e.ActivePath(); active != oldID {
+		t.Fatalf("active path after successor death=%d, want predecessor=%d", active, oldID)
+	}
+	if err := e.promotePathAdmissionRoute(binding, staleSource); !errors.Is(err, errPathAdmissionRouteChanged) {
+		t.Fatalf("stale terminal source error=%v, want %v", err, errPathAdmissionRouteChanged)
+	}
+	currentSource, ok := e.PathRef(oldID)
+	if !ok {
+		t.Fatal("current predecessor route is unavailable")
+	}
+	if err := e.promotePathAdmissionRoute(binding, currentSource); err != nil {
+		t.Fatalf("current terminal source retry: %v", err)
+	}
+	if err := e.completePathAdmissionBindingRoute(binding, false); err != nil {
+		t.Fatal(err)
+	}
+	if e.CloseErr() != nil {
+		t.Fatalf("stale source retry closed session: %v", e.CloseErr())
 	}
 }
 
@@ -772,12 +905,19 @@ func TestMalformedAdmissionControlClosesAsPeerProtocol(t *testing.T) {
 }
 
 func newAdmissionAdversarialEngine(t *testing.T, side Side) (*Engine, PathBinding) {
+	return newAdmissionAdversarialEngineWithLimits(t, side, Limits{
+		MigrationBudget:     time.Second,
+		ZombieMaxMigrations: 10,
+	})
+}
+
+func newAdmissionAdversarialEngineWithLimits(t *testing.T, side Side, limits Limits) (*Engine, PathBinding) {
 	t.Helper()
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
 	)
-	e := New(side, NewClientFlowID(), Limits{MigrationBudget: time.Second, ZombieMaxMigrations: 10}.Clamp())
+	e := New(side, NewClientFlowID(), limits.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
 	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
 		t.Fatal(err)
@@ -860,6 +1000,7 @@ func snapshotAdmissionSets(e *Engine) admissionSetSizes {
 		predecessors: len(e.pathPredecessors),
 		byLeaf:       len(e.pathAdmissionByLeaf),
 		byPath:       len(e.pathAdmissionByPath),
+		completed:    len(e.completedPathAdmissions),
 		generations:  make([]uint64, 0, len(e.pathLeafGeneration)),
 	}
 	for _, generation := range e.pathLeafGeneration {

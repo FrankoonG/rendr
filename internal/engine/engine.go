@@ -105,14 +105,15 @@ type Engine struct {
 	// retainedPaths remain receive-capable while a staged admission is
 	// finalized. They are excluded from every TX dispatcher and provide a
 	// bounded rollback target if the successor dies before confirmation.
-	retainedPaths       map[uint32]*pathSlot
-	pathPredecessors    map[uint32][]uint32
-	pathAdmissionByLeaf map[pathAdmissionLeafKey]pathAdmissionReservation
-	pathAdmissionByPath map[uint32]pathAdmissionLeafKey
-	pathLeafGeneration  map[pathAdmissionLeafKey]uint64
-	nextPathID          uint32
-	nextPathGen         uint64
-	activeID            uint32
+	retainedPaths           map[uint32]*pathSlot
+	pathPredecessors        map[uint32][]uint32
+	pathAdmissionByLeaf     map[pathAdmissionLeafKey]pathAdmissionReservation
+	pathAdmissionByPath     map[uint32]pathAdmissionLeafKey
+	completedPathAdmissions map[proto.PathAdmissionBinding]*completedPathAdmission
+	pathLeafGeneration      map[pathAdmissionLeafKey]uint64
+	nextPathID              uint32
+	nextPathGen             uint64
+	activeID                uint32
 	// dispatchScope optionally limits race/bond dispatch and death
 	// failover to a policy-selected target group. nil means all paths.
 	dispatchScope map[uint32]bool
@@ -323,20 +324,18 @@ type pathSlot struct {
 	dispatchFenced  bool
 	dispatchStalled atomic.Bool
 
-	quit                   chan struct{}
-	quitOnce               sync.Once
-	doneR                  chan struct{} // closed when reader goroutine exits
-	doneW                  chan struct{} // closed when data writer goroutine exits
-	admissionInbox         chan pathAdmissionMessage
-	admissionDone          chan struct{}
-	admissionOnce          sync.Once
-	admissionReplayPending atomic.Bool
-	admissionRollback      atomic.Bool
-	readerStarted          atomic.Bool
-	writerStarted          atomic.Bool
-	proberStarted          atomic.Bool
-	doneP                  chan struct{}
-	completedAdmission     *completedPathAdmission // guarded by Engine.pathsMu
+	quit              chan struct{}
+	quitOnce          sync.Once
+	doneR             chan struct{} // closed when reader goroutine exits
+	doneW             chan struct{} // closed when data writer goroutine exits
+	admissionInbox    chan pathAdmissionMessage
+	admissionDone     chan struct{}
+	admissionOnce     sync.Once
+	admissionRollback atomic.Bool
+	readerStarted     atomic.Bool
+	writerStarted     atomic.Bool
+	proberStarted     atomic.Bool
+	doneP             chan struct{}
 }
 
 type pathAckWrite struct {
@@ -502,40 +501,41 @@ func (s *pathSlot) completeAdmission() {
 // server side it should be copied from the inbound HELLO.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
-		side:                side,
-		flowID:              flowID,
-		limits:              limits.Clamp(),
-		created:             time.Now(),
-		paths:               make(map[uint32]*pathSlot),
-		pendingPaths:        make(map[uint32]*pathSlot),
-		stagedPaths:         make(map[uint32]*pathSlot),
-		retainedPaths:       make(map[uint32]*pathSlot),
-		pathPredecessors:    make(map[uint32][]uint32),
-		pathAdmissionByLeaf: make(map[pathAdmissionLeafKey]pathAdmissionReservation),
-		pathAdmissionByPath: make(map[uint32]pathAdmissionLeafKey),
-		pathLeafGeneration:  make(map[pathAdmissionLeafKey]uint64),
-		seenAttach:          make(map[[16]byte]struct{}),
-		recvPacketCh:        make(chan []byte, 16384),
-		recvPacketWake:      make(chan struct{}, 1),
-		recvWake:            make(chan struct{}, 1),
-		recvQueue:           make(map[uint64]recvItem),
-		recvFrameProofs:     make(map[uint64]proto.FrameDigest),
-		policyReplayDigests: make(map[uint64]proto.FrameDigest),
-		sendSlots:           make(chan struct{}, sendHistoryWindow),
-		sendControlSlots:    make(chan struct{}, sendControlReserve),
-		replayRequests:      make(chan uint64, 1),
-		ackWake:             make(chan struct{}, 1),
-		policyInbox:         make(chan policyMessage, 64),
-		policySendGate:      make(chan struct{}, 1),
-		policySelections:    make(map[proto.TargetID]proto.TargetID),
-		policyCompleted:     make(map[[16]byte]completedPolicyTransaction),
-		policyQueued:        make(map[policyMessageKey]struct{}),
-		zombieLeft:          limits.Clamp().ZombieMaxMigrations,
-		probeOutstanding:    make(map[uint64]time.Time),
-		closed:              make(chan struct{}),
-		quiesced:            make(chan struct{}),
-		gracefulDone:        make(chan struct{}),
-		terminalDone:        make(chan struct{}),
+		side:                    side,
+		flowID:                  flowID,
+		limits:                  limits.Clamp(),
+		created:                 time.Now(),
+		paths:                   make(map[uint32]*pathSlot),
+		pendingPaths:            make(map[uint32]*pathSlot),
+		stagedPaths:             make(map[uint32]*pathSlot),
+		retainedPaths:           make(map[uint32]*pathSlot),
+		pathPredecessors:        make(map[uint32][]uint32),
+		pathAdmissionByLeaf:     make(map[pathAdmissionLeafKey]pathAdmissionReservation),
+		pathAdmissionByPath:     make(map[uint32]pathAdmissionLeafKey),
+		completedPathAdmissions: make(map[proto.PathAdmissionBinding]*completedPathAdmission),
+		pathLeafGeneration:      make(map[pathAdmissionLeafKey]uint64),
+		seenAttach:              make(map[[16]byte]struct{}),
+		recvPacketCh:            make(chan []byte, 16384),
+		recvPacketWake:          make(chan struct{}, 1),
+		recvWake:                make(chan struct{}, 1),
+		recvQueue:               make(map[uint64]recvItem),
+		recvFrameProofs:         make(map[uint64]proto.FrameDigest),
+		policyReplayDigests:     make(map[uint64]proto.FrameDigest),
+		sendSlots:               make(chan struct{}, sendHistoryWindow),
+		sendControlSlots:        make(chan struct{}, sendControlReserve),
+		replayRequests:          make(chan uint64, 1),
+		ackWake:                 make(chan struct{}, 1),
+		policyInbox:             make(chan policyMessage, 64),
+		policySendGate:          make(chan struct{}, 1),
+		policySelections:        make(map[proto.TargetID]proto.TargetID),
+		policyCompleted:         make(map[[16]byte]completedPolicyTransaction),
+		policyQueued:            make(map[policyMessageKey]struct{}),
+		zombieLeft:              limits.Clamp().ZombieMaxMigrations,
+		probeOutstanding:        make(map[uint64]time.Time),
+		closed:                  make(chan struct{}),
+		quiesced:                make(chan struct{}),
+		gracefulDone:            make(chan struct{}),
+		terminalDone:            make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
 	e.state.Store(uint32(BridgeInit))
@@ -659,8 +659,15 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		return 0, err
 	}
 	e.pathsMu.Lock()
+	var (
+		completedKey     pathAdmissionLeafKey
+		completedKeyOK   bool
+		completedOverlap []*pathSlot
+		superseded       map[uint32]struct{}
+	)
 	rejectLocked := func(err error) (uint32, error) {
 		e.pathsMu.Unlock()
+		e.retirePathSet(completedOverlap)
 		_ = pc.Close()
 		return 0, err
 	}
@@ -668,7 +675,11 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	if e.isClosed() || e.sendClosing.Load() {
 		return rejectLocked(net.ErrClosed)
 	}
-	if len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths) >= maxSessionPaths {
+	if completedKey, completedKeyOK = pathAdmissionKey(e.side, binding); completedKeyOK {
+		superseded = e.completedAdmissionPredecessorsLocked(completedKey)
+	}
+	pathCount := len(e.paths) + len(e.pendingPaths) + len(e.stagedPaths) + len(e.retainedPaths) - len(superseded)
+	if pathCount >= maxSessionPaths {
 		return rejectLocked(fmt.Errorf("engine: session path limit %d reached", maxSessionPaths))
 	}
 	for _, inFlight := range []map[uint32]*pathSlot{e.pendingPaths, e.stagedPaths} {
@@ -695,6 +706,9 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		all = append(all, existing)
 	}
 	for _, existing := range all {
+		if _, replaceable := superseded[existing.id]; replaceable {
+			continue
+		}
 		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
 		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
 		if sameLocal && samePeer {
@@ -747,8 +761,12 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		admissionInbox:  make(chan pathAdmissionMessage, pathAdmissionInboxSize),
 		admissionDone:   make(chan struct{}),
 	}
+	if completedKeyOK {
+		completedOverlap = e.retireCompletedAdmissionPredecessorsLocked(completedKey)
+	}
 	e.pendingPaths[id] = slot
 	e.pathsMu.Unlock()
+	e.retirePathSet(completedOverlap)
 	return id, nil
 }
 
@@ -816,11 +834,12 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		ctx = context.Background()
 	}
 	var (
-		retired       []*pathSlot
-		fenced        []*pathSlot
-		oldActive     uint32
-		recoveryEvent bool
-		superseded    bool
+		retired           []*pathSlot
+		fenced            []*pathSlot
+		oldActive         uint32
+		recoveryEvent     bool
+		superseded        bool
+		admissionDeadline time.Time
 	)
 	e.pathsMu.Lock()
 	slot := e.stagedPaths[id]
@@ -940,6 +959,8 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
 		slot.completeAdmission()
+	} else {
+		admissionDeadline = e.ensurePathAdmissionDeadlineLocked(id)
 	}
 	e.pathsMu.Unlock()
 
@@ -957,9 +978,12 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	if retainPredecessor {
 		gen := slot.gen
-		retention := e.limits.MigrationBudget
 		go func() {
-			timer := time.NewTimer(retention)
+			delay := time.Until(admissionDeadline)
+			if delay < 0 {
+				delay = 0
+			}
+			timer := time.NewTimer(delay)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
@@ -1922,6 +1946,7 @@ func (e *Engine) Close() error {
 		e.pathPredecessors = make(map[uint32][]uint32)
 		e.pathAdmissionByLeaf = make(map[pathAdmissionLeafKey]pathAdmissionReservation)
 		e.pathAdmissionByPath = make(map[uint32]pathAdmissionLeafKey)
+		e.completedPathAdmissions = make(map[proto.PathAdmissionBinding]*completedPathAdmission)
 		e.pathLeafGeneration = make(map[pathAdmissionLeafKey]uint64)
 		e.activeID = 0
 		e.dispatchScope = nil

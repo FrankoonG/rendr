@@ -104,11 +104,12 @@ func PerformClientHelloAdmissionContext(
 		return ClientHelloAdmission{}, err
 	}
 	commitSent = true
-	if err := performClientAdmission(e, pathID, commit); err != nil {
+	admittedPathID, err := performClientAdmission(e, pathID, commit)
+	if err != nil {
 		return ClientHelloAdmission{}, pathAdmissionOutcomeUnknown(err)
 	}
 	success = true
-	return ClientHelloAdmission{Ack: ack, PathID: pathID}, nil
+	return ClientHelloAdmission{Ack: ack, PathID: admittedPathID}, nil
 }
 
 func PerformClientBridgeAdmissionContext(
@@ -174,11 +175,12 @@ func PerformClientBridgeAdmissionContext(
 		return ClientBridgeAdmission{}, err
 	}
 	commitSent = true
-	if err := performClientAdmission(e, pathID, commit); err != nil {
+	admittedPathID, err := performClientAdmission(e, pathID, commit)
+	if err != nil {
 		return ClientBridgeAdmission{}, pathAdmissionOutcomeUnknown(err)
 	}
 	success = true
-	return ClientBridgeAdmission{Ack: ack, PathID: pathID}, nil
+	return ClientBridgeAdmission{Ack: ack, PathID: admittedPathID}, nil
 }
 
 func PerformServerHelloAdmission(
@@ -241,20 +243,24 @@ func PerformServerBridgeAdmission(
 		proto.CtrlBridgeTag, proposalWire, proto.CtrlBridgeAck, responseWire)
 }
 
-func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmissionCommit) error {
-	ctx, cancel := context.WithTimeout(context.Background(), e.limits.MigrationBudget)
+func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmissionCommit) (uint32, error) {
+	deadline, err := e.beginPathAdmissionCommit(pathID, commit.PathAdmissionBinding)
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	commitWire, err := commit.Encode()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionCommit, commitWire); err != nil {
-		return err
+	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionCommit, commitWire); err != nil {
+		return 0, err
 	}
-	if err := waitForAdmissionAck(ctx, e, pathID, commit, proto.PathAdmissionPhaseCommitted, func() error {
-		return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionCommit, commitWire)
+	if _, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseCommitted, func() error {
+		return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionCommit, commitWire)
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	confirm := proto.PathAdmissionConfirm{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -262,23 +268,18 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	}
 	confirmWire, err := confirm.Encode()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionConfirm, confirmWire); err != nil {
-		return err
+	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionConfirm, confirmWire); err != nil {
+		return 0, err
 	}
-	if err := waitForAdmissionAck(ctx, e, pathID, commit, proto.PathAdmissionPhaseFinal, func() error {
-		return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionConfirm, confirmWire)
+	if _, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseFinal, func() error {
+		return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionConfirm, confirmWire)
 	}); err != nil {
-		return err
+		return 0, err
 	}
-	if err := e.activateStagedPathContext(ctx, pathID, true, true); err != nil {
-		return err
-	}
-	// Sending FINAL receipt can make the responder activate. From this point
-	// the predecessor is not a safe unilateral rollback target.
-	if err := e.DisablePathAdmissionRollback(pathID); err != nil {
-		return err
+	if err := e.activatePathAdmissionRouteContext(ctx, commit.PathAdmissionBinding, true, true); err != nil {
+		return 0, err
 	}
 	receipt := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -287,20 +288,37 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	}
 	receiptWire, err := receipt.Encode()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, receiptWire); err != nil {
-		return err
+	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, receiptWire); err != nil {
+		return 0, err
 	}
-	if err := waitForAdmissionAck(ctx, e, pathID, commit, proto.PathAdmissionPhaseActivated, func() error {
-		return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, receiptWire)
-	}); err != nil {
-		return err
+	for {
+		activatedRoute, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseActivated, func() error {
+			return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, receiptWire)
+		})
+		if err != nil {
+			return 0, err
+		}
+		if err := e.promotePathAdmissionRoute(commit.PathAdmissionBinding, activatedRoute); err != nil {
+			if errors.Is(err, errPathAdmissionRouteChanged) {
+				continue
+			}
+			return 0, err
+		}
+		break
+	}
+	admittedPathID, ok := e.admittedPathForBinding(commit.PathAdmissionBinding)
+	if !ok {
+		return 0, fmt.Errorf("engine: admitted leaf has no live route")
 	}
 	// ACTIVATED is the responder's terminal commit proof. The responder
 	// already learned that this side activated when it received FINAL, so an
 	// ACK-of-ACTIVATED would add only an unsatisfiable last-message ambiguity.
-	return e.CompletePathAdmissionBinding(pathID, commit.PathAdmissionBinding)
+	if err := e.completePathAdmissionBindingRoute(commit.PathAdmissionBinding, false); err != nil {
+		return 0, err
+	}
+	return admittedPathID, nil
 }
 
 func performServerAdmission(
@@ -364,10 +382,14 @@ func performServerAdmission(
 		return err
 	}
 	postCommit = true
+	deadline, err := e.beginPathAdmissionCommit(pathID, commit.PathAdmissionBinding)
+	if err != nil {
+		return err
+	}
 	if err := e.StagePathAttach(pathID); err != nil {
 		return err
 	}
-	postCommitCtx, postCommitCancel := context.WithTimeout(context.Background(), e.limits.MigrationBudget)
+	postCommitCtx, postCommitCancel := context.WithDeadline(context.Background(), deadline)
 	defer postCommitCancel()
 	committed := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -378,10 +400,10 @@ func performServerAdmission(
 	if err != nil {
 		return err
 	}
-	if err := e.WritePathAdmissionControlContext(postCommitCtx, pathID, proto.CtrlPathAdmissionAck, committedWire); err != nil {
+	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, committedWire); err != nil {
 		return err
 	}
-	confirm, confirmWire, err := waitForAdmissionConfirm(postCommitCtx, e, pathID, commit, commitWire, committedWire)
+	confirm, confirmWire, err := waitForAdmissionConfirm(postCommitCtx, e, commit, commitWire, committedWire)
 	if err != nil {
 		e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
 		_ = e.Close()
@@ -396,16 +418,30 @@ func performServerAdmission(
 	if err != nil {
 		return err
 	}
-	if err := e.WritePathAdmissionControlContext(postCommitCtx, pathID, proto.CtrlPathAdmissionAck, finalWire); err != nil {
+	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, finalWire); err != nil {
 		return err
 	}
-	if err := waitForFinalReceipt(postCommitCtx, e, pathID, commit, confirm, confirmWire, finalWire); err != nil {
-		e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-		_ = e.Close()
-		return err
-	}
-	if err := e.activateStagedPathContext(postCommitCtx, pathID, true, false); err != nil {
-		return err
+	activatedRoute := false
+	for {
+		receiptRoute, err := waitForFinalReceipt(postCommitCtx, e, commit, confirm, confirmWire, finalWire)
+		if err != nil {
+			e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
+			_ = e.Close()
+			return err
+		}
+		if !activatedRoute {
+			if err := e.activatePathAdmissionRouteContext(postCommitCtx, commit.PathAdmissionBinding, true, true); err != nil {
+				return err
+			}
+			activatedRoute = true
+		}
+		if err := e.promotePathAdmissionRoute(commit.PathAdmissionBinding, receiptRoute); err != nil {
+			if errors.Is(err, errPathAdmissionRouteChanged) {
+				continue
+			}
+			return err
+		}
+		break
 	}
 	activated := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -420,13 +456,13 @@ func performServerAdmission(
 	// ACTIVATED is lost after a successful local write, the initiator retries
 	// its byte-identical FINAL receipt and the completed path replays the same
 	// terminal proof.
-	if err := e.rememberCompletedPathAdmission(pathID, commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
+	if err := e.rememberCompletedPathAdmissionRoute(commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
 		return err
 	}
-	if err := e.WritePathAdmissionControlContext(postCommitCtx, pathID, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
+	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
 		return err
 	}
-	if err := e.CompletePathAdmissionBinding(pathID, commit.PathAdmissionBinding); err != nil {
+	if err := e.completePathAdmissionBindingRoute(commit.PathAdmissionBinding, true); err != nil {
 		return err
 	}
 	completed = true
@@ -559,46 +595,44 @@ func waitRawCommit(
 func waitForAdmissionAck(
 	ctx context.Context,
 	e *Engine,
-	pathID uint32,
 	commit proto.PathAdmissionCommit,
 	phase proto.PathAdmissionPhase,
 	resend func() error,
-) error {
+) (PathRef, error) {
 	for {
-		code, payload, err := waitStagedAdmission(ctx, e, pathID, resend)
+		code, payload, source, err := waitStagedAdmission(ctx, e, commit.PathAdmissionBinding, resend)
 		if err != nil {
-			return err
+			return PathRef{}, err
 		}
 		if code != proto.CtrlPathAdmissionAck {
 			continue
 		}
 		ack, err := proto.DecodePathAdmissionAck(payload)
 		if err != nil {
-			return err
+			return PathRef{}, err
 		}
 		if ack.Phase != phase {
 			continue
 		}
 		if err := ack.ValidateForCommit(commit); err != nil {
-			return err
+			return PathRef{}, err
 		}
 		if !ack.Code.OK() {
-			return fmt.Errorf("engine: path admission rejected: %s: %s", ack.Code, ack.Reason)
+			return PathRef{}, fmt.Errorf("engine: path admission rejected: %s: %s", ack.Code, ack.Reason)
 		}
-		return nil
+		return source, nil
 	}
 }
 
 func waitForAdmissionConfirm(
 	ctx context.Context,
 	e *Engine,
-	pathID uint32,
 	commit proto.PathAdmissionCommit,
 	commitWire, committedWire []byte,
 ) (proto.PathAdmissionConfirm, []byte, error) {
 	for {
-		code, payload, err := waitStagedAdmission(ctx, e, pathID, func() error {
-			return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, committedWire)
+		code, payload, _, err := waitStagedAdmission(ctx, e, commit.PathAdmissionBinding, func() error {
+			return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, committedWire)
 		})
 		if err != nil {
 			return proto.PathAdmissionConfirm{}, nil, err
@@ -608,7 +642,7 @@ func waitForAdmissionConfirm(
 			if !equalBytes(payload, commitWire) {
 				return proto.PathAdmissionConfirm{}, nil, fmt.Errorf("engine: mutated duplicate path admission COMMIT")
 			}
-			if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, committedWire); err != nil {
+			if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, committedWire); err != nil {
 				return proto.PathAdmissionConfirm{}, nil, err
 			}
 		case proto.CtrlPathAdmissionConfirm:
@@ -627,17 +661,16 @@ func waitForAdmissionConfirm(
 func waitForFinalReceipt(
 	ctx context.Context,
 	e *Engine,
-	pathID uint32,
 	commit proto.PathAdmissionCommit,
 	confirm proto.PathAdmissionConfirm,
 	confirmWire, finalWire []byte,
-) error {
+) (PathRef, error) {
 	for {
-		code, payload, err := waitStagedAdmission(ctx, e, pathID, func() error {
-			return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, finalWire)
+		code, payload, source, err := waitStagedAdmission(ctx, e, commit.PathAdmissionBinding, func() error {
+			return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, finalWire)
 		})
 		if err != nil {
-			return err
+			return PathRef{}, err
 		}
 		switch code {
 		case proto.CtrlPathAdmissionConfirm:
@@ -645,24 +678,24 @@ func waitForFinalReceipt(
 			if err != nil || got != confirm || !equalBytes(payload, confirmWire) {
 				continue
 			}
-			if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, finalWire); err != nil {
-				return err
+			if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, finalWire); err != nil {
+				return PathRef{}, err
 			}
 		case proto.CtrlPathAdmissionAck:
 			receipt, err := proto.DecodePathAdmissionAck(payload)
 			if err != nil {
-				return err
+				return PathRef{}, err
 			}
 			if receipt.Phase != proto.PathAdmissionPhaseFinal {
 				continue
 			}
 			if err := receipt.ValidateForCommit(commit); err != nil || !receipt.Code.OK() {
 				if err != nil {
-					return err
+					return PathRef{}, err
 				}
-				return fmt.Errorf("engine: path admission receipt rejected")
+				return PathRef{}, fmt.Errorf("engine: path admission receipt rejected")
 			}
-			return nil
+			return source, nil
 		}
 	}
 }
@@ -781,23 +814,23 @@ func readRawAdmission(ctx context.Context, pc transport.PathConn, resend func() 
 	}
 }
 
-func waitStagedAdmission(ctx context.Context, e *Engine, pathID uint32, resend func() error) (proto.CtrlCode, []byte, error) {
+func waitStagedAdmission(ctx context.Context, e *Engine, binding proto.PathAdmissionBinding, resend func() error) (proto.CtrlCode, []byte, PathRef, error) {
 	for {
 		attempt, cancel := context.WithTimeout(ctx, pathAdmissionRetryInterval)
-		code, payload, err := e.WaitPathAdmissionControl(attempt, pathID)
+		code, payload, source, err := e.WaitPathAdmissionControlBinding(attempt, binding)
 		cancel()
 		if err == nil {
-			return code, payload, nil
+			return code, payload, source, nil
 		}
 		if ctx.Err() != nil {
-			return 0, nil, ctx.Err()
+			return 0, nil, PathRef{}, ctx.Err()
 		}
 		if !errors.Is(err, context.DeadlineExceeded) {
-			return 0, nil, err
+			return 0, nil, PathRef{}, err
 		}
 		if resend != nil {
 			if err := resend(); err != nil {
-				return 0, nil, err
+				return 0, nil, PathRef{}, err
 			}
 		}
 	}

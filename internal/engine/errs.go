@@ -17,6 +17,7 @@ var (
 	ErrPolicyOutcomeUnknown        = errors.New("rendr: policy transaction outcome is unknown")
 	ErrPathAdmissionOutcomeUnknown = errors.New("rendr: path admission outcome is unknown")
 	ErrPathAdmissionRejected       = errors.New("rendr: path admission rejected")
+	errPathAdmissionRouteChanged   = errors.New("engine: path admission route changed")
 
 	// ErrLastPath is returned by RemovePath when the named path is
 	// the only attached path. Callers who want to fully tear down

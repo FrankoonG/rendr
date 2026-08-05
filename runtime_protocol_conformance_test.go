@@ -35,9 +35,19 @@ func TestRuntimeListenerNegotiationRejectionConformance(t *testing.T) {
 			},
 		},
 		{
-			name: "missing mandatory feature",
+			name: "missing terminal-commit feature",
 			mutate: func(frame []byte) {
 				feature := uint64(proto.FeaturePathAdmissionTerminalCommit)
+				supported := binary.BigEndian.Uint64(frame[proto.HeaderSize+8 : proto.HeaderSize+16])
+				required := binary.BigEndian.Uint64(frame[proto.HeaderSize+16 : proto.HeaderSize+24])
+				binary.BigEndian.PutUint64(frame[proto.HeaderSize+8:proto.HeaderSize+16], supported&^feature)
+				binary.BigEndian.PutUint64(frame[proto.HeaderSize+16:proto.HeaderSize+24], required&^feature)
+			},
+		},
+		{
+			name: "missing cross-route terminal feature",
+			mutate: func(frame []byte) {
+				feature := uint64(proto.FeaturePathAdmissionCrossRouteTerminal)
 				supported := binary.BigEndian.Uint64(frame[proto.HeaderSize+8 : proto.HeaderSize+16])
 				required := binary.BigEndian.Uint64(frame[proto.HeaderSize+16 : proto.HeaderSize+24])
 				binary.BigEndian.PutUint64(frame[proto.HeaderSize+8:proto.HeaderSize+16], supported&^feature)

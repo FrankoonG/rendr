@@ -39,7 +39,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 5
+	ProtocolMinor uint16 = 6
 )
 
 type FeatureSet uint64
@@ -57,8 +57,13 @@ const (
 	// admission proof. Peers without it wait for an ambiguous terminal receipt
 	// and are not wire-state compatible with protocol minor 5.
 	FeaturePathAdmissionTerminalCommit FeatureSet = 1 << 8
+	// FeaturePathAdmissionCrossRouteTerminal keeps a post-COMMIT admission
+	// transaction addressable through either its successor or retained
+	// predecessor until one fixed deadline. This is additive to terminal commit;
+	// it does not add an ACK-of-ACTIVATED message.
+	FeaturePathAdmissionCrossRouteTerminal FeatureSet = 1 << 9
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 

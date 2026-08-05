@@ -77,7 +77,15 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 			return
 		}
 		delete(e.stagedPaths, id)
-		e.releasePathAdmissionLocked(id)
+		var fallback *pathSlot
+		for _, candidate := range e.paths {
+			if sameBoundLeaf(staged, candidate) && (fallback == nil || candidate.gen > fallback.gen) {
+				fallback = candidate
+			}
+		}
+		if fallback == nil || !e.transferPathAdmissionLocked(id, fallback.id) {
+			e.releasePathAdmissionLocked(id)
+		}
 		staged.closeQuit()
 		e.pathsMu.Unlock()
 		go e.retireSupersededPath(staged)
@@ -156,7 +164,6 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 	}
 	slot.closeQuit()
 	delete(e.paths, slot.id)
-	e.releasePathAdmissionLocked(slot.id)
 	predecessorIDs := e.pathPredecessors[slot.id]
 	delete(e.pathPredecessors, slot.id)
 	var restored *pathSlot
@@ -191,6 +198,9 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 			delete(e.dispatchScope, slot.id)
 			e.dispatchScope[restored.id] = true
 		}
+	}
+	if restored == nil || !e.transferPathAdmissionLocked(slot.id, restored.id) {
+		e.releasePathAdmissionLocked(slot.id)
 	}
 	wasActive := e.activeID == slot.id
 	migratedOk := false

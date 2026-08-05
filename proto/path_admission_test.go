@@ -9,29 +9,33 @@ import (
 )
 
 func TestPathAdmissionTerminalFeatureIsNegotiatedOnCurrentMinor(t *testing.T) {
-	flow := [16]byte{0x46}
-	manifest := testGraphManifest("terminal-feature-peer")
-	negotiation := testNegotiationFor(flow, manifest)
-	negotiation.Supported &^= FeaturePathAdmissionTerminalCommit
-	negotiation.Required &^= FeaturePathAdmissionTerminalCommit
+	for _, feature := range []FeatureSet{FeaturePathAdmissionTerminalCommit, FeaturePathAdmissionCrossRouteTerminal} {
+		t.Run(fmt.Sprintf("feature-0x%x", feature), func(t *testing.T) {
+			flow := [16]byte{0x46}
+			manifest := testGraphManifest("terminal-feature-peer")
+			negotiation := testNegotiationFor(flow, manifest)
+			negotiation.Supported &^= feature
+			negotiation.Required &^= feature
 
-	helloWire := mustHelloWire(t, HelloPayload{
-		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
-		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
-	})
-	if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
-		t.Fatalf("HELLO without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
-	}
+			helloWire := mustHelloWire(t, HelloPayload{
+				Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+				InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+			})
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
+			}
 
-	ackWire := mustHelloAckWire(t, HelloAckPayload{
-		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
-		InitialTargetID:      manifest.RootID,
-		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
-		AcceptedPeerTargetID: manifest.RootID,
-		LocalTXManifest:      manifest,
-	})
-	if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
-		t.Fatalf("HELLO_ACK without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
+			ackWire := mustHelloAckWire(t, HelloAckPayload{
+				Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+				InitialTargetID:      manifest.RootID,
+				AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+				AcceptedPeerTargetID: manifest.RootID,
+				LocalTXManifest:      manifest,
+			})
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK without terminal feature error=%v, want %v", err, ErrNegotiationIncompatible)
+			}
+		})
 	}
 }
 
@@ -55,14 +59,17 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	if Version != 3 {
 		t.Fatalf("frame envelope version=%d want=3", Version)
 	}
-	if ProtocolMinor != 5 {
-		t.Fatalf("protocol minor=%d want=5", ProtocolMinor)
+	if ProtocolMinor != 6 {
+		t.Fatalf("protocol minor=%d want=6", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePathAdmissionTransaction == 0 || RequiredFeatures&FeaturePathAdmissionTransaction == 0 {
 		t.Fatal("path admission transaction feature is not mandatory")
 	}
 	if SupportedFeatures&FeaturePathAdmissionTerminalCommit == 0 || RequiredFeatures&FeaturePathAdmissionTerminalCommit == 0 {
 		t.Fatal("path admission terminal-commit feature is not mandatory")
+	}
+	if SupportedFeatures&FeaturePathAdmissionCrossRouteTerminal == 0 || RequiredFeatures&FeaturePathAdmissionCrossRouteTerminal == 0 {
+		t.Fatal("path admission cross-route terminal feature is not mandatory")
 	}
 	if PathAdmissionWireVersion != 1 {
 		t.Fatalf("path admission wire version=%d want=1", PathAdmissionWireVersion)

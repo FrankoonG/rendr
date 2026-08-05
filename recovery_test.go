@@ -909,6 +909,7 @@ func waitForStreamReplacement(t *testing.T, client, server *engineBackedConn, ol
 func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	observedErrors := make(map[string]struct{})
 	for time.Now().Before(deadline) {
 		clientPaths := client.Paths()
 		serverPaths := server.Paths()
@@ -916,9 +917,16 @@ func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, ol
 			len(serverPaths) == 1 && serverPaths[0].ID != oldServerID {
 			return clientPaths[0].ID, serverPaths[0].ID
 		}
+		for _, path := range client.status.snapshot(clientPaths, client.carriers) {
+			if path.LastError != "" {
+				observedErrors[path.LastError] = struct{}{}
+			}
+		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("packet replacement did not commit: old client/server=%d/%d client=%v server=%v", oldClientID, oldServerID, client.Paths(), server.Paths())
+	t.Fatalf("packet replacement did not commit: old client/server=%d/%d client=%v server=%v client_status=%+v server_status=%+v client_close=%v server_close=%v observed_errors=%v",
+		oldClientID, oldServerID, client.Paths(), server.Paths(), client.Status(), server.Status(),
+		client.e.CloseErr(), server.e.CloseErr(), observedErrors)
 	return 0, 0
 }
 

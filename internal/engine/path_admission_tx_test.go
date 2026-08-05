@@ -393,6 +393,63 @@ func TestBridgeAdmissionSupersedesSameLeafWithoutDataLoss(t *testing.T) {
 	}
 }
 
+func TestConsecutiveBridgeAdmissionsSupersedeCompletedOverlap(t *testing.T) {
+	initialClient, initialServer := newMemoryPathPair()
+	client, server := establishHelloAdmissionPair(t, initialClient, initialServer)
+
+	firstClient, firstServer := newMemoryPathPair()
+	first := performBridgeAdmissionPair(t, client, server, firstClient, firstServer)
+	waitAdmissionCondition(t, time.Second, "first responder overlap", func() bool {
+		state := snapshotAdmissionSets(server)
+		return state.byPath == 0 && state.byLeaf == 0 && state.retained == 1 && state.predecessors == 1 && state.completed == 1
+	})
+
+	secondClient, secondServer := newMemoryPathPair()
+	second := performBridgeAdmissionPair(t, client, server, secondClient, secondServer)
+	if second.PathID == first.PathID || client.ActivePath() != second.PathID {
+		t.Fatalf("consecutive admission did not publish a new client generation: first=%d second=%d active=%d", first.PathID, second.PathID, client.ActivePath())
+	}
+	waitAdmissionCondition(t, time.Second, "second responder overlap", func() bool {
+		state := snapshotAdmissionSets(server)
+		return state.byPath == 0 && state.byLeaf == 0 && state.retained == 1 && state.predecessors == 1 && state.completed == 1
+	})
+	assertAdmissionPayload(t, client, server, []byte("consecutive-bridge-up"))
+	assertAdmissionPayload(t, server, client, []byte("consecutive-bridge-down"))
+}
+
+func TestRejectedPreparePreservesCompletedAdmissionOverlap(t *testing.T) {
+	initialClient, initialServer := newMemoryPathPair()
+	client, server := establishHelloAdmissionPair(t, initialClient, initialServer)
+	firstClient, firstServer := newMemoryPathPair()
+	performBridgeAdmissionPair(t, client, server, firstClient, firstServer)
+	waitAdmissionCondition(t, time.Second, "responder completed overlap", func() bool {
+		state := snapshotAdmissionSets(server)
+		return state.retained == 1 && state.predecessors == 1 && state.completed == 1
+	})
+
+	server.pathsMu.RLock()
+	active := server.paths[server.activeID]
+	if active == nil {
+		server.pathsMu.RUnlock()
+		t.Fatal("server has no active successor")
+	}
+	binding := PathBinding{LocalTXTargetID: active.localTXTargetID, PeerTXTargetID: active.peerTXTargetID}
+	server.pathsMu.RUnlock()
+	active.maintenance.Store(true)
+	defer active.maintenance.Store(false)
+	candidate, candidatePeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = candidatePeer.Close() })
+	if _, err := server.PreparePathBound(candidate, transport.PathSpec{Transport: "memory"}, binding); !errors.Is(err, ErrPathAttachInProgress) {
+		t.Fatalf("prepare during successor maintenance error=%v, want %v", err, ErrPathAttachInProgress)
+	}
+	active.maintenance.Store(false)
+	state := snapshotAdmissionSets(server)
+	if state.retained != 1 || state.predecessors != 1 || state.completed != 1 {
+		t.Fatalf("rejected prepare destroyed completed overlap: %+v", state)
+	}
+	assertAdmissionPayload(t, client, server, []byte("rejected-prepare-preserved-overlap"))
+}
+
 func TestBridgeAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -431,11 +488,12 @@ func TestBridgeAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 			if admission.PathID == oldClient || client.ActivePath() != admission.PathID || server.ActivePath() == oldServer {
 				t.Fatalf("replacement client=%d/%d server=%d/%d", oldClient, client.ActivePath(), oldServer, server.ActivePath())
 			}
-			waitAdmissionCondition(t, time.Second, "bridge admission cleanup", func() bool {
+			waitAdmissionCondition(t, time.Second, "bridge admission terminal retention", func() bool {
 				clientState, serverState := snapshotAdmissionSets(client), snapshotAdmissionSets(server)
 				return clientState.byPath == 0 && clientState.retained == 0 && clientState.predecessors == 0 &&
-					serverState.byPath == 0 && serverState.retained == 0 && serverState.predecessors == 0
+					serverState.byPath == 0 && serverState.byLeaf == 0 && serverState.retained == 1 && serverState.predecessors == 1
 			})
+			assertAdmissionOverlap(t, server, server.ActivePath(), oldServer)
 			assertAdmissionPayload(t, client, server, []byte("bridge-phase-up-"+test.name))
 			assertAdmissionPayload(t, server, client, []byte("bridge-phase-down-"+test.name))
 		})
