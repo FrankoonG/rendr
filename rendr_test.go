@@ -14,8 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/FrankoonG/rendr/transport"
 )
 
 func testRoot(kind TargetKind, specs []PathSpec) Target {
@@ -36,6 +34,15 @@ func testRoot(kind TargetKind, specs []PathSpec) Target {
 func selectorRoot(specs []PathSpec) Target { return testRoot(TargetKindSelector, specs) }
 func raceRoot(specs []PathSpec) Target     { return testRoot(TargetKindRace, specs) }
 func bondRoot(specs []PathSpec) Target     { return testRoot(TargetKindBond, specs) }
+
+func pathNameByID(paths []PathInfo, id uint32) string {
+	for _, path := range paths {
+		if path.ID == id {
+			return path.Spec.Opts["name"]
+		}
+	}
+	return ""
+}
 
 // waitForNPaths polls until both client and server see at least n
 // attached paths, retrying via testConnectionControl.AddPath against the named
@@ -232,13 +239,15 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 		accepted <- c
 	}()
 
+	controlled := newRuntimeControlledTCPTransport(t)
 	d := &sessionDialer{
-		Root: selectorRoot([]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
 		}),
 		ZombieMaxMigrations: 1,
 		ZombieCooldown:      30 * time.Second,
+		Retry:               retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -248,15 +257,19 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 2, 8*time.Second) {
 		t.Skipf("could not stabilize 2 paths each; environment too noisy")
 	}
 
 	// Kill the active path. With ZombieMax=1 the engine trips on this
 	// single death-driven failover (no payload between migrations).
-	bc := client.(*engineBackedConn)
-	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
-		t.Fatalf("ForceKillPathForTest: %v", err)
+	observer := client.(ConnectionObserver)
+	activeName := pathNameByID(client.Paths(), observer.ActivePath())
+	if activeName == "" {
+		t.Fatalf("active path %d has no fixture name", observer.ActivePath())
+	}
+	if err := controlled.Fail(activeName); err != nil {
+		t.Fatalf("fail active path: %v", err)
 	}
 
 	// Subsequent Read should surface ErrZombie within the budget.
@@ -864,15 +877,13 @@ func TestM1PlannedMigration(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc, ok := client.(*engineBackedConn)
-	if !ok {
-		t.Fatalf("client type %T not engineBackedConn", client)
-	}
+	observer := client.(ConnectionObserver)
+	migrator := client.(MigrationController)
 
 	// Identify a non-active path to migrate to.
-	currentID := bc.Engine().ActivePath()
+	currentID := observer.ActivePath()
 	var otherID uint32
-	for _, p := range bc.Paths() {
+	for _, p := range client.Paths() {
 		if p.ID != currentID {
 			otherID = p.ID
 			break
@@ -906,7 +917,7 @@ func TestM1PlannedMigration(t *testing.T) {
 	if _, err := client.Write(want[:half]); err != nil {
 		t.Fatalf("write first half: %v", err)
 	}
-	if err := bc.Engine().Migrate(otherID); err != nil {
+	if err := migrator.Migrate(otherID); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := client.Write(want[half:]); err != nil {
@@ -932,8 +943,8 @@ func TestM1PlannedMigration(t *testing.T) {
 	}
 
 	// Active path on the client should now be otherID.
-	if bc.Engine().ActivePath() != otherID {
-		t.Errorf("active path after migrate: got %d want %d", bc.Engine().ActivePath(), otherID)
+	if observer.ActivePath() != otherID {
+		t.Errorf("active path after migrate: got %d want %d", observer.ActivePath(), otherID)
 	}
 }
 
@@ -1009,11 +1020,10 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 	}
 }
 
-// TestM1FailoverToSurvivingPath: two paths configured; kill the
-// active one; engine must transparently fall back to the survivor
-// and continue streaming, no error surfaced to the application.
-//
-// This is the simplest G4 (pathçœŸæ­»äº¡) regression test.
+// TestM1FailoverToSurvivingPath is a fast carrier-close smoke: with two
+// attached paths, close the active server carrier and require transparent
+// failover to the pre-existing survivor. Release-grade G4 uses an
+// unannounced network blackhole on the Linux test VM.
 func TestM1FailoverToSurvivingPath(t *testing.T) {
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
@@ -1033,12 +1043,11 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		}), MigrationBudget: 3 * time.Second}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{Root: Selector("root", []Target{
+		Path("A", controlled.Spec(ln.Addr().String(), "A")),
+		Path("B", controlled.Spec(ln.Addr().String(), "B")),
+	}), MigrationBudget: 3 * time.Second, ProbeInterval: 30 * time.Second}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -1058,8 +1067,8 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(server.Paths()) < 2 {
-		t.Fatalf("server only has %d paths after 5s", len(server.Paths()))
+	if len(client.Paths()) < 2 || len(server.Paths()) < 2 {
+		t.Fatalf("two-path carrier-close topology incomplete: client=%d server=%d", len(client.Paths()), len(server.Paths()))
 	}
 
 	// Prove liveness through current active path.
@@ -1072,14 +1081,56 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Kill the actual server-side carrier so the client observes a remote
-	// transport failure rather than a synthesized local death callback.
-	if err := ln.CloseAcceptedPath("tcp", 0); err != nil {
+	observer := client.(ConnectionObserver)
+	killedID := observer.ActivePath()
+	killedName := pathNameByID(client.Paths(), killedID)
+	if killedName == "" {
+		t.Fatalf("active path %d has no controlled leaf name", killedID)
+	}
+	initial := make(map[uint32]string, len(client.Paths()))
+	for _, path := range client.Paths() {
+		initial[path.ID] = path.Spec.Opts["name"]
+	}
+	peerLocal, err := controlled.LocalAddr(killedName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled.Block(killedName)
+	migrationsBefore := observer.MigrationCount()
+	// Close the exact server-side carrier paired with the active client path.
+	// The blocked leaf cannot redial and masquerade as survivor failover.
+	if _, err := ln.CloseAcceptedPeerPath("tcp", peerLocal); err != nil {
 		t.Fatal(err)
 	}
 
-	// Give the engine a moment to fail over.
-	time.Sleep(150 * time.Millisecond)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		killedAttached := false
+		for _, path := range client.Paths() {
+			if path.ID == killedID {
+				killedAttached = true
+				break
+			}
+		}
+		if !killedAttached && observer.ActivePath() != killedID && observer.MigrationCount() > migrationsBefore {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	newActive := observer.ActivePath()
+	newName, preexisting := initial[newActive]
+	if newActive == 0 || newActive == killedID || !preexisting || newName == killedName {
+		t.Fatalf("carrier-close survivor is not a different pre-existing path: killed=%d/%q active=%d/%q initial=%v",
+			killedID, killedName, newActive, newName, initial)
+	}
+	for _, path := range client.Paths() {
+		if path.ID == killedID {
+			t.Fatalf("closed carrier path %d remains attached: %+v", killedID, client.Paths())
+		}
+	}
+	if observer.MigrationCount() <= migrationsBefore {
+		t.Fatalf("carrier close did not increment MigrationCount: before=%d after=%d", migrationsBefore, observer.MigrationCount())
+	}
 
 	// Stream more data; client should reach server via path 2.
 	const reply = "second-channel-payload"
@@ -1244,7 +1295,8 @@ func TestM1G1Sketch(t *testing.T) {
 		done <- nil
 	}()
 
-	bc := client.(*engineBackedConn)
+	observer := client.(ConnectionObserver)
+	migrator := client.(MigrationController)
 
 	// 3 migrations at ~30%, ~50%, ~70%.
 	migrateAt := []int{total * 3 / 10, total * 5 / 10, total * 7 / 10}
@@ -1264,16 +1316,16 @@ func TestM1G1Sketch(t *testing.T) {
 		written += n
 		// Time-bounded migration trigger.
 		for mi < len(migrateAt) && written >= migrateAt[mi] {
-			cur := bc.Engine().ActivePath()
+			cur := observer.ActivePath()
 			var other uint32
-			for _, p := range bc.Paths() {
+			for _, p := range client.Paths() {
 				if p.ID != cur {
 					other = p.ID
 					break
 				}
 			}
 			if other != 0 {
-				if err := bc.Engine().Migrate(other); err != nil {
+				if err := migrator.Migrate(other); err != nil {
 					t.Fatalf("migrate %d: %v", mi, err)
 				}
 				t.Logf("migrate %d at %d bytes -> path %d", mi, written, other)
@@ -1368,7 +1420,8 @@ func TestM1G2Sketch(t *testing.T) {
 		}
 	}()
 
-	bc := client.(*engineBackedConn)
+	observer := client.(ConnectionObserver)
+	migrator := client.(MigrationController)
 
 	// Migration trigger every ~200 ms. migCount is accessed from two
 	// goroutines so we use atomic.Int64; close(stopMig) only signals
@@ -1385,16 +1438,16 @@ func TestM1G2Sketch(t *testing.T) {
 			case <-stopMig:
 				return
 			case <-ticker.C:
-				cur := bc.Engine().ActivePath()
+				cur := observer.ActivePath()
 				var other uint32
-				for _, p := range bc.Paths() {
+				for _, p := range client.Paths() {
 					if p.ID != cur {
 						other = p.ID
 						break
 					}
 				}
 				if other != 0 {
-					if err := bc.Engine().Migrate(other); err == nil {
+					if err := migrator.Migrate(other); err == nil {
 						migCount.Add(1)
 					}
 				}
@@ -1493,21 +1546,12 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 		t.Fatalf("expected 2 client paths, got %d", len(client.Paths()))
 	}
 
-	// Capture per-path Writes() baseline.
-	bc := client.(*engineBackedConn)
-	type pathProbe struct {
-		id     uint32
-		writer interface{ Writes() uint64 }
-		base   uint64
+	baseline := make(map[uint32]uint64, 2)
+	for _, path := range client.Paths() {
+		baseline[path.ID] = path.FirstDataDispatches
 	}
-	var probes []pathProbe
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pathProbe{id: id, writer: w, base: w.Writes()})
-		}
-	})
-	if len(probes) != 2 {
-		t.Fatalf("expected 2 probes, got %d", len(probes))
+	if len(baseline) != 2 {
+		t.Fatalf("expected 2 path snapshots, got %d", len(baseline))
 	}
 
 	const N = 8
@@ -1524,16 +1568,25 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 		t.Fatalf("server drain: %v", err)
 	}
 
-	for _, p := range probes {
+	for id, base := range baseline {
 		deadline := time.Now().Add(time.Second)
-		for p.writer.Writes()-p.base < uint64(N) && time.Now().Before(deadline) {
+		var got uint64
+		for time.Now().Before(deadline) {
+			for _, path := range client.Paths() {
+				if path.ID == id {
+					got = path.FirstDataDispatches - base
+					break
+				}
+			}
+			if got >= uint64(N) {
+				break
+			}
 			time.Sleep(time.Millisecond)
 		}
-		got := p.writer.Writes() - p.base
 		// Race returns after the first successful child, but every admitted
 		// replica must still complete asynchronously on a healthy path.
 		if got < uint64(N) {
-			t.Errorf("path %d saw %d writes, want >= %d", p.id, got, N)
+			t.Errorf("path %d saw %d first DATA dispatches, want >= %d", id, got, N)
 		}
 	}
 }
@@ -1566,12 +1619,14 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: bondRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		})}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{
+		Root: Bond("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
+		}),
+		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -1581,30 +1636,14 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 2, 8*time.Second) {
 		t.Fatalf("expected 2 paths each, got client=%d server=%d",
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
-	type pp struct {
-		id     uint32
-		writer interface{ Writes() uint64 }
-		base   uint64
-	}
-	var probes []pp
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pp{id: id, writer: w})
-		}
-	})
-	if len(probes) != 2 {
-		t.Fatalf("expected 2 probes, got %d", len(probes))
-	}
-
-	bc.Engine().SetBondPinSizeForTest(1)
-	for i := range probes {
-		probes[i].base = probes[i].writer.Writes()
+	baseline := make(map[uint32]uint64, 2)
+	for _, path := range client.Paths() {
+		baseline[path.ID] = path.FirstDataDispatches
 	}
 
 	const preN = 16
@@ -1617,24 +1656,29 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 
 	killID := uint32(0)
 	var survivorBase uint64
-	for _, p := range probes {
-		if p.writer.Writes() > p.base {
-			killID = p.id
+	var survivorID uint32
+	for _, path := range client.Paths() {
+		if path.FirstDataDispatches > baseline[path.ID] {
+			killID = path.ID
 			break
 		}
 	}
 	if killID == 0 {
 		t.Fatal("bond did not write on either probed path")
 	}
-	for _, p := range probes {
-		if p.id != killID {
-			survivorBase = p.writer.Writes()
+	for _, path := range client.Paths() {
+		if path.ID != killID {
+			survivorID = path.ID
+			survivorBase = path.FirstDataDispatches
 			break
 		}
 	}
-
-	if err := bc.Engine().ForceKillPathForTest(killID); err != nil {
-		t.Fatalf("ForceKillPathForTest(%d): %v", killID, err)
+	killName := pathNameByID(client.Paths(), killID)
+	if killName == "" {
+		t.Fatalf("kill path %d has no fixture name", killID)
+	}
+	if err := controlled.Fail(killName); err != nil {
+		t.Fatalf("fail path %d: %v", killID, err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1668,9 +1712,9 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 	}
 
 	var survivorWrites uint64
-	for _, p := range probes {
-		if p.id != killID {
-			survivorWrites = p.writer.Writes()
+	for _, path := range client.Paths() {
+		if path.ID == survivorID {
+			survivorWrites = path.FirstDataDispatches
 			break
 		}
 	}
@@ -1961,10 +2005,10 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 	// Explicitly detach the inactive client path. A transport-error death is
 	// automatically redialed in v1 and would make this manual AddPath contract
 	// race the recovery supervisor instead of testing BRIDGE attachment.
-	bc := client.(*engineBackedConn)
-	preKill := len(bc.Paths())
+	admin := client.(testConnectionControl)
+	preKill := len(admin.Paths())
 	var detachedID uint32
-	for _, path := range bc.Paths() {
+	for _, path := range admin.Paths() {
 		if !path.Active {
 			detachedID = path.ID
 			break
@@ -1973,23 +2017,23 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 	if detachedID == 0 {
 		t.Fatal("no inactive path available for detach")
 	}
-	if err := bc.RemovePath(detachedID); err != nil {
+	if err := admin.RemovePath(detachedID); err != nil {
 		t.Fatal(err)
 	}
-	if len(bc.Paths()) != preKill-1 {
-		t.Fatalf("after detach: paths=%d want %d", len(bc.Paths()), preKill-1)
+	if len(admin.Paths()) != preKill-1 {
+		t.Fatalf("after detach: paths=%d want %d", len(admin.Paths()), preKill-1)
 	}
 
 	// Recover: AddPath a fresh socket to the same listener.
-	newID, err := bc.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()})
+	newID, err := admin.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()})
 	if err != nil {
 		t.Fatalf("AddPath: %v", err)
 	}
 	if newID == 0 {
 		t.Fatal("AddPath returned 0 id")
 	}
-	if len(bc.Paths()) != preKill {
-		t.Fatalf("after AddPath: paths=%d want %d", len(bc.Paths()), preKill)
+	if len(admin.Paths()) != preKill {
+		t.Fatalf("after AddPath: paths=%d want %d", len(admin.Paths()), preKill)
 	}
 
 	// Drive traffic on the recovered conn.
@@ -2203,13 +2247,15 @@ func TestAdminConnOnMigrate(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		})}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
+			Path("C", controlled.Spec(ln.Addr().String(), "C")),
+		}),
+		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2219,7 +2265,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 3, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 3, 8*time.Second) {
 		t.Fatalf("expected 3 paths each, got client=%d server=%d",
 			len(client.Paths()), len(server.Paths()))
 	}
@@ -2258,9 +2304,12 @@ func TestAdminConnOnMigrate(t *testing.T) {
 	}
 
 	// 2. Death-driven failover fires with cause="death".
-	bc := client.(*engineBackedConn)
-	if err := bc.Engine().ForceKillPathForTest(adm.ActivePath()); err != nil {
-		t.Fatalf("ForceKillPathForTest: %v", err)
+	activeName := pathNameByID(client.Paths(), adm.ActivePath())
+	if activeName == "" {
+		t.Fatalf("active path %d has no fixture name", adm.ActivePath())
+	}
+	if err := controlled.Fail(activeName); err != nil {
+		t.Fatalf("fail active path: %v", err)
 	}
 	select {
 	case e := <-events:
@@ -2320,13 +2369,15 @@ func TestAdminConnMigrationCount(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		})}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
+			Path("C", controlled.Spec(ln.Addr().String(), "C")),
+		}),
+		Retry: retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2336,7 +2387,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 3, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 3, 8*time.Second) {
 		t.Fatalf("expected 3 paths each, got client=%d server=%d",
 			len(client.Paths()), len(server.Paths()))
 	}
@@ -2376,9 +2427,12 @@ func TestAdminConnMigrationCount(t *testing.T) {
 
 	// Death-driven failover: kill the active path; engine moves to
 	// one of the remaining two. MigrationCount should now be 2.
-	bc := client.(*engineBackedConn)
-	if err := bc.Engine().ForceKillPathForTest(adm.ActivePath()); err != nil {
-		t.Fatalf("ForceKillPathForTest: %v", err)
+	activeName := pathNameByID(client.Paths(), adm.ActivePath())
+	if activeName == "" {
+		t.Fatalf("active path %d has no fixture name", adm.ActivePath())
+	}
+	if err := controlled.Fail(activeName); err != nil {
+		t.Fatalf("fail active path: %v", err)
 	}
 	// Give onPathDeath a tick.
 	time.Sleep(50 * time.Millisecond)
@@ -2535,10 +2589,9 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	}
 }
 
-// TestM8BondPathPinning: with pin size = 4 and 2 paths, sending 16
-// frames must produce 4-frame runs that stay on one path before
-// the next run jumps to the other. Path pinning is the M8 mechanism
-// to bound reorder-window growth under RTT skew between paths.
+// TestM8BondPathPinning exercises the production pin size over real carriers.
+// Exact run boundaries are an executor contract and are tested without the
+// asynchronous replay path in internal/engine.
 func TestM8BondPathPinning(t *testing.T) {
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
@@ -2558,12 +2611,11 @@ func TestM8BondPathPinning(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: bondRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		})}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{Root: Bond("root", []Target{
+		Path("A", controlled.Spec(ln.Addr().String(), "A")),
+		Path("B", controlled.Spec(ln.Addr().String(), "B")),
+	}), ProbeInterval: 30 * time.Second}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2581,13 +2633,10 @@ func TestM8BondPathPinning(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	bc := client.(*engineBackedConn)
-
-	// Pin size 4 so 64 frames form 16 alternating runs of 4.
-	const pinSize = 4
-	bc.Engine().SetBondPinSizeForTest(pinSize)
-
-	const N = 64
+	const (
+		productionPinSize = 8
+		N                 = 4 * productionPinSize
+	)
 	payload := []byte("pinframe")
 	for i := 0; i < N; i++ {
 		if _, err := client.Write(payload); err != nil {
@@ -2610,8 +2659,13 @@ func TestM8BondPathPinning(t *testing.T) {
 	}
 	var first, physical uint64
 	for _, path := range paths {
-		if path.FirstDataDispatches == 0 {
-			t.Fatalf("path %d carried no first-publication DATA: %+v", path.ID, paths)
+		if path.FirstDataDispatches < productionPinSize {
+			t.Fatalf("path %d carried only %d first-publication DATA, want at least one full pin: %+v",
+				path.ID, path.FirstDataDispatches, paths)
+		}
+		if path.FirstDataDispatches > N-productionPinSize {
+			t.Fatalf("path %d monopolized %d first-publication DATA: %+v",
+				path.ID, path.FirstDataDispatches, paths)
 		}
 		first += path.FirstDataDispatches
 		physical += path.DataDispatches
@@ -2675,23 +2729,14 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
-	// Capture per-path Writes() before flipping mode.
-	type pp struct {
-		id     uint32
-		writer interface{ Writes() uint64 }
-		base   uint64
+	baseline := make(map[uint32]uint64, 2)
+	for _, path := range client.Paths() {
+		baseline[path.ID] = path.FirstDataDispatches
 	}
-	var probes []pp
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pp{id: id, writer: w, base: w.Writes()})
-		}
-	})
 
 	// Send N small frames; each engine.SendData call produces one
 	// data frame (the payload is < MaxPayload).
-	const N = 16
+	const N = 32
 	payload := []byte("bond-frame")
 	for i := 0; i < N; i++ {
 		if _, err := client.Write(payload); err != nil {
@@ -2712,10 +2757,13 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 	// >= 1 data write (we allow asymmetry for ctrl frames that
 	// went on whichever path was initially active).
 	var totals []uint64
-	for _, p := range probes {
-		got := p.writer.Writes() - p.base
+	for _, path := range client.Paths() {
+		got := path.FirstDataDispatches - baseline[path.ID]
 		totals = append(totals, got)
-		t.Logf("path %d saw %d wire writes after bond switch", p.id, got)
+		t.Logf("path %d saw %d first DATA dispatches", path.ID, got)
+	}
+	if len(totals) != 2 {
+		t.Fatalf("bond path snapshots=%d want 2", len(totals))
 	}
 	if totals[0] == 0 || totals[1] == 0 {
 		t.Fatalf("bond did not exercise both paths: %v", totals)
@@ -2723,9 +2771,9 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 }
 
 // TestM8BondHonorsPathWeights verifies PathSpec.Weight controls the
-// relative share of bond pin windows. With pin=1 and weights 3:1,
-// 16 single-frame writes should route 12 frames to the heavier path
-// and 4 to the lighter path.
+// relative share of bond pin windows. With the production pin size and
+// weights 3:1, 64 writes span two complete weighted cycles and route 48
+// first-publication frames to the heavier path and 16 to the lighter path.
 func TestM8BondHonorsPathWeights(t *testing.T) {
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
@@ -2750,7 +2798,7 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 		[]PathSpec{
 			{Transport: "tcp", Address: ln.Addr().String(), Weight: 3},
 			{Transport: "tcp", Address: ln.Addr().String(), Weight: 1},
-		}), ProbeInterval: time.Hour}
+		}), ProbeInterval: 30 * time.Second}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2765,7 +2813,6 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
 	type pp struct {
 		id     uint32
 		weight uint16
@@ -2773,15 +2820,13 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 	}
 	var probes []pp
 	for _, path := range client.Paths() {
-		probes = append(probes, pp{id: path.ID, weight: path.Spec.Weight, base: path.DataDispatches})
+		probes = append(probes, pp{id: path.ID, weight: path.Spec.Weight, base: path.FirstDataDispatches})
 	}
 	if len(probes) != 2 {
 		t.Fatalf("expected 2 probes, got %d", len(probes))
 	}
 
-	bc.Engine().SetBondPinSizeForTest(1)
-
-	const N = 16
+	const N = 64
 	payload := []byte("weighted")
 	for i := 0; i < N; i++ {
 		if _, err := client.Write(payload); err != nil {
@@ -2798,27 +2843,20 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 	for _, path := range client.Paths() {
 		for _, p := range probes {
 			if p.id == path.ID {
-				counts[p.weight] += path.DataDispatches - p.base
+				counts[p.weight] += path.FirstDataDispatches - p.base
 			}
 		}
 	}
 	totalDispatches := counts[3] + counts[1]
-	if totalDispatches < N {
-		t.Fatalf("weighted bond dispatches=%d want at least %d application frames", totalDispatches, N)
+	if totalDispatches != N {
+		t.Fatalf("weighted first DATA dispatches=%d want %d", totalDispatches, N)
 	}
-	if totalDispatches > N+N/2 {
-		t.Fatalf("weighted bond dispatches=%d exceed replay bound %d", totalDispatches, N+N/2)
-	}
-	// DataDispatches counts physical replay as well as first publication. Every
-	// weighted scheduling cycle must still contain three weight-3 dispatches
-	// for one weight-1 dispatch; an incomplete final cycle can differ by at
-	// most three.
-	delta := int64(counts[3]) - 3*int64(counts[1])
-	if delta < 0 {
-		delta = -delta
-	}
-	if counts[1] == 0 || delta > 3 {
-		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, ratio delta=%d want <=3", counts[3], counts[1], delta)
+	// Control frames can consume a live pin between DATA publications, so the
+	// exact 48:16 scheduler contract is proved in internal/engine. This
+	// end-to-end oracle still rejects a broken 1:1 scheduler and requires the
+	// lighter path to receive at least one complete production pin.
+	if counts[3] < 48 || counts[1] < 8 || counts[3] < 2*counts[1] {
+		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, want heavy>=48 light>=8 and heavy>=2*light", counts[3], counts[1])
 	}
 }
 
@@ -2844,12 +2882,11 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: bondRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		})}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{Root: Bond("root", []Target{
+		Path("low", controlled.Spec(ln.Addr().String(), "low")),
+		Path("high", controlled.Spec(ln.Addr().String(), "high")),
+	}), ProbeInterval: 30 * time.Second}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -2859,45 +2896,25 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 2, 8*time.Second) {
 		t.Fatalf("expected 2 paths each, got client=%d server=%d",
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
-	type pp struct {
-		id     uint32
-		writer interface{ Writes() uint64 }
-		base   uint64
+	if err := controlled.SetQuality("low", PathQuality{RTT: time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
 	}
-	var probes []pp
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pp{id: id, writer: w})
-		}
-	})
-	if len(probes) != 2 {
-		t.Fatalf("expected 2 probes, got %d", len(probes))
+	if err := controlled.SetQuality("high", PathQuality{RTT: 100 * time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
 	}
-	// Inject quality: probes[0]=1ms and probes[1]=100ms. Both writers remain
+	// Both paths remain healthy even though one reports 100x the RTT, so
 	// healthy, so latency alone must not remove either bond member.
-	bc.Engine().SetPathQualityForTest(probes[0].id, transport.PathQuality{
-		RTT: 1 * time.Millisecond,
-	})
-	bc.Engine().SetPathQualityForTest(probes[1].id, transport.PathQuality{
-		RTT: 100 * time.Millisecond,
-	})
-
-	bc.Engine().SetBondPinSizeForTest(1)
-	baseline := make(map[uint32]uint64, len(probes))
+	baseline := make(map[uint32]uint64, 2)
 	for _, path := range client.Paths() {
-		baseline[path.ID] = path.DataDispatches
-	}
-	for i := range probes {
-		probes[i].base = probes[i].writer.Writes()
+		baseline[path.ID] = path.FirstDataDispatches
 	}
 
-	const N = 20
+	const N = 32
 	payload := []byte("stuckpath")
 	for i := 0; i < N; i++ {
 		if _, err := client.Write(payload); err != nil {
@@ -2913,30 +2930,27 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 		t.Fatalf("byte-stream mismatch under bond+stuck-skip")
 	}
 
-	dispatches := make(map[uint32]uint64, len(probes))
+	dispatches := make(map[uint32]uint64, 2)
 	var total uint64
 	for _, path := range client.Paths() {
-		delta := path.DataDispatches - baseline[path.ID]
+		delta := path.FirstDataDispatches - baseline[path.ID]
 		dispatches[path.ID] = delta
 		total += delta
 	}
-	// DATA may be replayed after a legitimate bond reordering gap. The
-	// application-level byte comparison above proves unique delivery; here we
-	// bound replay amplification instead of pretending one application write
-	// must always equal one physical dispatch.
-	if total < N || total > 2*N {
-		t.Fatalf("bond DATA dispatch total=%d outside [%d,%d]; per-path=%v", total, N, 2*N, dispatches)
+	if total != N {
+		t.Fatalf("bond first DATA dispatch total=%d want %d; per-path=%v", total, N, dispatches)
 	}
-	for _, probe := range probes {
-		if dispatches[probe.id] == 0 {
+	for id := range baseline {
+		if dispatches[id] == 0 {
 			t.Fatalf("healthy high-RTT bond member was excluded: %v", dispatches)
 		}
 	}
-	skips := bc.BondStuckSkips()
+	observer := client.(ConnectionObserver)
+	skips := observer.BondStuckSkips()
 	if skips != 0 {
 		t.Fatalf("RTT-only input produced %d writer-stall quarantines", skips)
 	}
-	if got := bc.Stats().BondStuckSkips; got != skips {
+	if got := observer.Stats().BondStuckSkips; got != skips {
 		t.Fatalf("Stats().BondStuckSkips=%d disagrees with BondStuckSkips()=%d", got, skips)
 	}
 }
@@ -2983,10 +2997,11 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
-	cur := bc.Engine().ActivePath()
+	observer := client.(ConnectionObserver)
+	migrator := client.(MigrationController)
+	cur := observer.ActivePath()
 	var other uint32
-	for _, p := range bc.Paths() {
+	for _, p := range client.Paths() {
 		if p.ID != cur {
 			other = p.ID
 			break
@@ -3019,7 +3034,7 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 	if _, err := client.Write(want[:half]); err != nil {
 		t.Fatalf("write first half: %v", err)
 	}
-	if err := bc.Engine().Migrate(other); err != nil {
+	if err := migrator.Migrate(other); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := client.Write(want[half:]); err != nil {
@@ -3038,8 +3053,8 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("payload mismatch")
 	}
-	if bc.Engine().ActivePath() != other {
-		t.Errorf("active path after migrate: got %d want %d", bc.Engine().ActivePath(), other)
+	if observer.ActivePath() != other {
+		t.Errorf("active path after migrate: got %d want %d", observer.ActivePath(), other)
 	}
 }
 
@@ -3066,12 +3081,20 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "udpflow", Address: ln.Addr().String()},
-			{Transport: "udpflow", Address: ln.Addr().String()},
-		}), MigrationBudget: 3 * time.Second}
+	const factoryName = "faultable-udpflow"
+	tracked := &runtimeTrackedPacketFactory{}
+	d := &sessionDialer{
+		Root: Selector("root", []Target{
+			Path("A", PathSpec{Transport: factoryName, Address: ln.Addr().String(), Opts: map[string]string{"name": "A"}}),
+			Path("B", PathSpec{Transport: factoryName, Address: ln.Addr().String(), Opts: map[string]string{"name": "B"}}),
+		}),
+		MigrationBudget: 3 * time.Second,
+		ProbeInterval:   30 * time.Second,
+		Retry:           retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
+	if err := d.AddPacketPathFactory(factoryName, tracked.Dial); err != nil {
+		t.Fatal(err)
+	}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -3081,7 +3104,7 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "udpflow", ln.Addr().String(), 2, 8*time.Second) {
+	if !waitForNPaths(t, client, server, factoryName, ln.Addr().String(), 2, 8*time.Second) {
 		t.Fatalf("expected 2 paths each, got client=%d server=%d",
 			len(client.Paths()), len(server.Paths()))
 	}
@@ -3100,11 +3123,21 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 	// failure signal is on the client side - the OS UDP socket
 	// closes, the engine's readerLoop on that path observes
 	// transport error, onPathDeath fires, and the engine fails over.
-	bc := client.(*engineBackedConn)
-	if err := bc.Engine().ForceKillPathForTest(bc.Engine().ActivePath()); err != nil {
+	observer := client.(ConnectionObserver)
+	oldActive := observer.ActivePath()
+	if got := pathNameByID(client.Paths(), oldActive); got != "A" {
+		t.Fatalf("initial UDP active path name=%q want A", got)
+	}
+	if err := tracked.Fail(0); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && observer.ActivePath() == oldActive {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := observer.ActivePath(); got == 0 || got == oldActive {
+		t.Fatalf("UDP path did not fail over: old=%d active=%d", oldActive, got)
+	}
 
 	const tail = "post-udp-failover"
 	if _, err := client.Write([]byte(tail)); err != nil {
@@ -3761,8 +3794,8 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 // the current path 1 (10x lower RTT), the engine must migrate to
 // it after dwell + cooldown without the test calling Migrate.
 //
-// Uses SetPathQualityForTest to inject scores; the production
-// RTT/jitter/loss probe lands in M6(2/n).
+// A test-owned TCP path adapter publishes controlled quality readings while
+// the production selector consumes them through PathConn.Quality.
 func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
@@ -3782,18 +3815,18 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 		accepted <- c
 	}()
 
+	controlled := newRuntimeControlledTCPTransport(t)
 	d := &sessionDialer{
-		Root: selectorRoot([]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
 		}),
 		Hysteresis: 0.1,
 		Dwell:      50 * time.Millisecond,
 		Cooldown:   100 * time.Millisecond,
-		// Long probe interval so the real RTT probe does not
-		// overwrite SetPathQualityForTest before the scheduler
-		// has a chance to act on the injected qualities.
-		ProbeInterval: time.Hour,
+		// Long probe interval keeps this test's controlled path evidence stable
+		// while the production selector evaluates it.
+		ProbeInterval: 30 * time.Second,
 	}
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -3803,29 +3836,31 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 8*time.Second) {
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 2, 8*time.Second) {
 		t.Fatalf("only client=%d server=%d paths after 8s",
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	bc := client.(*engineBackedConn)
-	pathsInfo := bc.Paths()
+	observer := client.(ConnectionObserver)
+	pathsInfo := client.Paths()
 	p1ID, p2ID := pathsInfo[0].ID, pathsInfo[1].ID
 
-	startActive := bc.Engine().ActivePath()
+	startActive := observer.ActivePath()
 	// Inject qualities: current is mediocre, the other is much better.
-	bc.Engine().SetPathQualityForTest(startActive, transport.PathQuality{
-		RTT: 100 * time.Millisecond,
-	})
+	startName := pathNameByID(pathsInfo, startActive)
 	var otherID uint32
 	if startActive == p1ID {
 		otherID = p2ID
 	} else {
 		otherID = p1ID
 	}
-	bc.Engine().SetPathQualityForTest(otherID, transport.PathQuality{
-		RTT: 10 * time.Millisecond,
-	})
+	otherName := pathNameByID(pathsInfo, otherID)
+	if err := controlled.SetQuality(startName, PathQuality{RTT: 100 * time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlled.SetQuality(otherName, PathQuality{RTT: 10 * time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Wait at most dwell + cooldown + tick slack for the selector
 	// scheduler to fire. 10 s tolerance covers parallel-package
@@ -3835,7 +3870,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	migrated := false
 	waitUntil := time.Now().Add(10 * time.Second)
 	for time.Now().Before(waitUntil) {
-		if bc.Engine().ActivePath() == otherID {
+		if observer.ActivePath() == otherID {
 			migrated = true
 			break
 		}
@@ -3843,7 +3878,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	}
 	if !migrated {
 		t.Fatalf("selector did not migrate to better path within 10s (active still %d, wanted %d)",
-			bc.Engine().ActivePath(), otherID)
+			observer.ActivePath(), otherID)
 	}
 }
 
@@ -3923,7 +3958,8 @@ func TestM2G1SketchQUIC(t *testing.T) {
 		done <- nil
 	}()
 
-	bc := client.(*engineBackedConn)
+	observer := client.(ConnectionObserver)
+	migrator := client.(MigrationController)
 	migrateAt := []int{total * 3 / 10, total * 5 / 10, total * 7 / 10}
 	t0 := time.Now()
 	written := 0
@@ -3940,16 +3976,16 @@ func TestM2G1SketchQUIC(t *testing.T) {
 		}
 		written += n
 		for mi < len(migrateAt) && written >= migrateAt[mi] {
-			cur := bc.Engine().ActivePath()
+			cur := observer.ActivePath()
 			var other uint32
-			for _, p := range bc.Paths() {
+			for _, p := range client.Paths() {
 				if p.ID != cur {
 					other = p.ID
 					break
 				}
 			}
 			if other != 0 {
-				if err := bc.Engine().Migrate(other); err != nil {
+				if err := migrator.Migrate(other); err != nil {
 					t.Fatalf("migrate %d: %v", mi, err)
 				}
 				t.Logf("quic-migrate %d at %d bytes -> path %d", mi, written, other)
@@ -4186,7 +4222,6 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 	}
 
 	admin := client.(testConnectionControl)
-	clientEngine := client.(*engineBackedConn)
 	var tcpPath, quicPath uint32
 	for _, p := range client.Paths() {
 		switch p.Spec.Transport {
@@ -4242,8 +4277,8 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		sendHash.Write(buf[:n])
 		sent += n
 		if !killed && sent >= killAt {
-			if err := clientEngine.ForceKillPathForTest(tcpPath); err != nil {
-				t.Fatalf("force-kill tcp path: %v", err)
+			if err := ln.CloseAcceptedPath("tcp", 0); err != nil {
+				t.Fatalf("close accepted TCP path: %v", err)
 			}
 			killed = true
 			deadline := time.Now().Add(2 * time.Second)
@@ -4324,12 +4359,11 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "quic", Address: ln.Addr().String()},
-			{Transport: "quic", Address: ln.Addr().String()},
-		}), MigrationBudget: 3 * time.Second}
+	controlled := newRuntimeControlledQUICTransport(t)
+	d := &sessionDialer{Root: Selector("root", []Target{
+		Path("A", controlled.Spec(ln.Addr().String(), "A")),
+		Path("B", controlled.Spec(ln.Addr().String(), "B")),
+	}), MigrationBudget: 3 * time.Second, ProbeInterval: 30 * time.Second}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4347,8 +4381,8 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(server.Paths()) < 2 {
-		t.Fatalf("server only has %d paths", len(server.Paths()))
+	if len(client.Paths()) < 2 || len(server.Paths()) < 2 {
+		t.Fatalf("two-path QUIC carrier-close topology incomplete: client=%d server=%d", len(client.Paths()), len(server.Paths()))
 	}
 
 	if _, err := client.Write([]byte("hello")); err != nil {
@@ -4359,10 +4393,53 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ln.CloseAcceptedPath("quic", 0); err != nil {
+	observer := client.(ConnectionObserver)
+	killedID := observer.ActivePath()
+	killedName := pathNameByID(client.Paths(), killedID)
+	if killedName == "" {
+		t.Fatalf("active QUIC path %d has no controlled leaf name", killedID)
+	}
+	initial := make(map[uint32]string, len(client.Paths()))
+	for _, path := range client.Paths() {
+		initial[path.ID] = path.Spec.Opts["name"]
+	}
+	peerLocal, err := controlled.LocalAddr(killedName)
+	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	controlled.Block(killedName)
+	migrationsBefore := observer.MigrationCount()
+	if _, err := ln.CloseAcceptedPeerPath("quic", peerLocal); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		killedAttached := false
+		for _, path := range client.Paths() {
+			if path.ID == killedID {
+				killedAttached = true
+				break
+			}
+		}
+		if !killedAttached && observer.ActivePath() != killedID && observer.MigrationCount() > migrationsBefore {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	newActive := observer.ActivePath()
+	newName, preexisting := initial[newActive]
+	if newActive == 0 || newActive == killedID || !preexisting || newName == killedName {
+		t.Fatalf("QUIC survivor is not a different pre-existing path: killed=%d/%q active=%d/%q initial=%v",
+			killedID, killedName, newActive, newName, initial)
+	}
+	for _, path := range client.Paths() {
+		if path.ID == killedID {
+			t.Fatalf("closed QUIC path %d remains attached: %+v", killedID, client.Paths())
+		}
+	}
+	if observer.MigrationCount() <= migrationsBefore {
+		t.Fatalf("QUIC carrier close did not increment MigrationCount: before=%d after=%d", migrationsBefore, observer.MigrationCount())
+	}
 
 	// Continue streaming.
 	const tail = "post-quic-failover"
@@ -4402,13 +4479,17 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 		accepted <- c
 	}()
 
-	d := &sessionDialer{Root: selectorRoot(
-
-		[]PathSpec{
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-			{Transport: "tcp", Address: ln.Addr().String()},
-		}), MigrationBudget: 1 * time.Second}
+	controlled := newRuntimeControlledTCPTransport(t)
+	d := &sessionDialer{
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
+			Path("C", controlled.Spec(ln.Addr().String(), "C")),
+		}),
+		MigrationBudget: 1 * time.Second,
+		ProbeInterval:   30 * time.Second,
+		Retry:           retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
 
 	client, err := d.Dial(context.Background())
 	if err != nil {
@@ -4427,7 +4508,13 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 			break
 		}
 		if len(client.Paths()) < 3 {
-			_, _ = bcAdm.AddPath(PathSpec{Transport: "tcp", Address: ln.Addr().String()})
+			present := idsByName(client.Paths())
+			for _, name := range []string{"A", "B", "C"} {
+				if present[name] == 0 {
+					_, _ = bcAdm.AddPath(controlled.Spec(ln.Addr().String(), name))
+					break
+				}
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -4443,30 +4530,44 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 	if _, err := io.ReadFull(server, hi); err != nil {
 		t.Fatal(err)
 	}
-
-	bc := client.(*engineBackedConn)
-	if !bc.Engine().WaitForSendDrain() {
-		t.Fatal("liveness payload was not acknowledged before zombie scenario")
+	if _, err := server.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	ack := make([]byte, 2)
+	if _, err := io.ReadFull(client, ack); err != nil {
+		t.Fatal(err)
+	}
+	if string(ack) != "ok" {
+		t.Fatalf("liveness reply=%q want ok", ack)
 	}
 
 	// First kill: client.activeID dies, engine migrates to a survivor.
 	// zombieLeft: 2 -> 1 (no payload yet between this and a hypothetical next).
-	kill1 := bc.Engine().ActivePath()
-	if err := bc.Engine().ForceKillPathForTest(kill1); err != nil {
+	kill1 := bcAdm.ActivePath()
+	kill1Name := pathNameByID(client.Paths(), kill1)
+	if kill1Name == "" {
+		t.Fatalf("first active path %d has no fixture name", kill1)
+	}
+	if err := controlled.Fail(kill1Name); err != nil {
 		t.Fatalf("kill1: %v", err)
 	}
 
-	// Brief settle so the migration callback finishes; no data is
-	// pushed in either direction.
-	time.Sleep(20 * time.Millisecond)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && bcAdm.ActivePath() == kill1 {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Second kill: again the active dies, engine migrates again.
 	// zombieLeft: 1 -> 0 -> ErrZombie close fires.
-	kill2 := bc.Engine().ActivePath()
+	kill2 := bcAdm.ActivePath()
 	if kill2 == 0 || kill2 == kill1 {
 		t.Fatalf("expected fresh active after migration; got %d (was %d)", kill2, kill1)
 	}
-	if err := bc.Engine().ForceKillPathForTest(kill2); err != nil {
+	kill2Name := pathNameByID(client.Paths(), kill2)
+	if kill2Name == "" {
+		t.Fatalf("second active path %d has no fixture name", kill2)
+	}
+	if err := controlled.Fail(kill2Name); err != nil {
 		t.Fatalf("kill2: %v", err)
 	}
 

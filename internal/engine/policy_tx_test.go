@@ -89,19 +89,36 @@ type policyTxUnitPath struct {
 	recorder  *policyTxUnitAckRecorder
 	closed    chan struct{}
 	closeOnce sync.Once
+	failed    chan struct{}
+	failOnce  sync.Once
+	failMu    sync.Mutex
+	failErr   error
+	deathMu   sync.Mutex
+	deathFn   func(transport.DeathCause, error)
+	deathOnce sync.Once
 }
 
 func newPolicyTxUnitPath(name string, recorder *policyTxUnitAckRecorder) *policyTxUnitPath {
-	return &policyTxUnitPath{name: name, recorder: recorder, closed: make(chan struct{})}
+	return &policyTxUnitPath{name: name, recorder: recorder, closed: make(chan struct{}), failed: make(chan struct{})}
 }
 
 func (p *policyTxUnitPath) Read([]byte) (int, error) {
-	<-p.closed
-	return 0, net.ErrClosed
+	select {
+	case <-p.failed:
+		err := p.failure()
+		p.notifyFailure(err)
+		return 0, err
+	case <-p.closed:
+		return 0, net.ErrClosed
+	}
 }
 
 func (p *policyTxUnitPath) Write(frame []byte) (int, error) {
 	select {
+	case <-p.failed:
+		err := p.failure()
+		p.notifyFailure(err)
+		return 0, err
 	case <-p.closed:
 		return 0, net.ErrClosed
 	default:
@@ -115,10 +132,44 @@ func (p *policyTxUnitPath) Close() error {
 	return nil
 }
 
-func (p *policyTxUnitPath) Quality() transport.PathQuality            { return transport.PathQuality{} }
-func (p *policyTxUnitPath) OnDeath(func(transport.DeathCause, error)) {}
-func (p *policyTxUnitPath) LocalAddr() string                         { return "policy-tx-local" }
-func (p *policyTxUnitPath) RemoteAddr() string                        { return "policy-tx-remote" }
+func (p *policyTxUnitPath) Quality() transport.PathQuality { return transport.PathQuality{} }
+func (p *policyTxUnitPath) OnDeath(fn func(transport.DeathCause, error)) {
+	p.deathMu.Lock()
+	p.deathFn = fn
+	p.deathMu.Unlock()
+}
+func (p *policyTxUnitPath) LocalAddr() string  { return "policy-tx-local" }
+func (p *policyTxUnitPath) RemoteAddr() string { return "policy-tx-remote" }
+
+func (p *policyTxUnitPath) Fail(err error) {
+	if err == nil {
+		err = errors.New("injected policy path failure")
+	}
+	p.failOnce.Do(func() {
+		p.failMu.Lock()
+		p.failErr = err
+		p.failMu.Unlock()
+		close(p.failed)
+	})
+}
+
+func (p *policyTxUnitPath) failure() error {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	if p.failErr == nil {
+		return errors.New("policy path failed")
+	}
+	return p.failErr
+}
+
+func (p *policyTxUnitPath) notifyFailure(err error) {
+	p.deathMu.Lock()
+	fn := p.deathFn
+	p.deathMu.Unlock()
+	if fn != nil {
+		p.deathOnce.Do(func() { fn(transport.CauseTransportError, err) })
+	}
+}
 
 type policyTxUnitFixture struct {
 	engine     *Engine
@@ -146,7 +197,7 @@ func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
 		RootID: selector.ID,
 		Nodes:  []proto.GraphNode{selector, pathA, pathB},
 	}
-	engine, recorder, paths := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
+	engine, recorder, paths, _ := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
 	return &policyTxUnitFixture{
 		engine:     engine,
 		recorder:   recorder,
@@ -160,7 +211,7 @@ func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
 	}
 }
 
-func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorID proto.TargetID, leafNames ...string) (*Engine, *policyTxUnitAckRecorder, map[string]uint32) {
+func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorID proto.TargetID, leafNames ...string) (*Engine, *policyTxUnitAckRecorder, map[string]uint32, map[string]*policyTxUnitPath) {
 	t.Helper()
 	engine := New(SideServer, [16]byte{0xa7, 0x31}, Limits{}.Clamp())
 	t.Cleanup(func() { _ = engine.Close() })
@@ -175,8 +226,10 @@ func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorI
 	}
 	recorder := &policyTxUnitAckRecorder{engine: engine, selectorID: selectorID}
 	paths := make(map[string]uint32, len(leafNames))
+	pathHandles := make(map[string]*policyTxUnitPath, len(leafNames))
 	for _, name := range leafNames {
-		id, err := engine.AttachPath(newPolicyTxUnitPath(name, recorder), transport.PathSpec{
+		path := newPolicyTxUnitPath(name, recorder)
+		id, err := engine.AttachPath(path, transport.PathSpec{
 			Transport: "policy-tx-unit",
 			Address:   name,
 			Opts:      map[string]string{"name": name},
@@ -185,8 +238,9 @@ func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorI
 			t.Fatalf("AttachPath(%q): %v", name, err)
 		}
 		paths[name] = id
+		pathHandles[name] = path
 	}
-	return engine, recorder, paths
+	return engine, recorder, paths, pathHandles
 }
 
 func policyTxUnitNode(kind proto.GraphNodeKind, name string, children ...proto.TargetID) proto.GraphNode {
@@ -571,7 +625,7 @@ func TestPolicyTransactionRejectsNonImmediateSelectorChild(t *testing.T) {
 		RootID: selector.ID,
 		Nodes:  []proto.GraphNode{selector, bond, pathA, pathB},
 	}
-	engine, recorder, paths := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
+	engine, recorder, paths, _ := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
 
 	descendant := policyTxUnitPrepare(engine, 30, 0, selector.ID, pathB.ID)
 	rejected := policyTxUnitRequireAck(t, recorder, func() error {
@@ -775,7 +829,7 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	bond := policyTxUnitNode(proto.GraphNodeKindBond, "scope-selected-bond", pathB.ID, pathC.ID)
 	root := policyTxUnitNode(proto.GraphNodeKindSelector, "scope-root", pathA.ID, bond.ID)
 	manifest := proto.GraphManifest{RootID: root.ID, Nodes: []proto.GraphNode{root, bond, pathA, pathB, pathC}}
-	engine, _, paths := newPolicyTxUnitEngine(t, manifest, root.ID, pathA.Name, pathB.Name, pathC.Name)
+	engine, _, paths, pathHandles := newPolicyTxUnitEngine(t, manifest, root.ID, pathA.Name, pathB.Name, pathC.Name)
 	if err := engine.InitializePolicySelection(root.ID, pathA.ID, "initial"); err != nil {
 		t.Fatal(err)
 	}
@@ -785,13 +839,11 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	if engine.Mode() != dispatchBond || engine.ActivePath() != paths[pathB.Name] {
 		t.Fatalf("bond selection mode/active=%d/%d", engine.Mode(), engine.ActivePath())
 	}
-	if err := engine.ForceKillPathForTest(paths[pathB.Name]); err != nil {
-		t.Fatal(err)
-	}
+	pathHandles[pathB.Name].Fail(errors.New("selected bond path B failed"))
+	waitPathDetached(t, engine, paths[pathB.Name])
 	engine.markPayload()
-	if err := engine.ForceKillPathForTest(paths[pathC.Name]); err != nil {
-		t.Fatal(err)
-	}
+	pathHandles[pathC.Name].Fail(errors.New("selected bond path C failed"))
+	waitPathDetached(t, engine, paths[pathC.Name])
 	if engine.ActivePath() != paths[pathA.Name] {
 		t.Fatalf("fallback active=%d want=%d", engine.ActivePath(), paths[pathA.Name])
 	}

@@ -295,10 +295,7 @@ func (e *Engine) dispatchBond(frame []byte, firstPublication bool) error {
 			// Pin expired OR current went stuck. Advance until we
 			// land on a non-stuck path, or give up after one full
 			// rotation (all paths stuck).
-			pin := e.bondPinSize
-			if pin <= 0 {
-				pin = defaultBondPinSize
-			}
+			pin := e.limits.BondPinSize
 			if e.Packetized() {
 				// Packet-mode bond on QUIC DATAGRAM is the G3 hot
 				// path: per-path 8-frame pinning creates avoidable

@@ -77,6 +77,15 @@ type Limits struct {
 	// the receiver's reorder window. Default 3.0. A path with zero
 	// RTT reading (unmeasured) is never considered stuck.
 	BondStuckRTTMultiplier float64
+
+	// ProbeInterval controls the fixed cadence of per-path RTT probes.
+	// It is immutable after Engine construction. Default 1s.
+	ProbeInterval time.Duration
+
+	// BondPinSize is the number of consecutive frames kept on one bond
+	// child before advancing. It is capped by the replay window so one
+	// pin cannot monopolize more frames than the engine can retain.
+	BondPinSize int
 }
 
 // DefaultLimits returns the project-mandated default limits.
@@ -91,6 +100,8 @@ func DefaultLimits() Limits {
 		SelectorDwell:          5 * time.Second,
 		SelectorCooldown:       30 * time.Second,
 		BondStuckRTTMultiplier: 3.0,
+		ProbeInterval:          time.Second,
+		BondPinSize:            defaultBondPinSize,
 	}
 }
 
@@ -124,6 +135,14 @@ func (l Limits) Clamp() Limits {
 	}
 	if l.BondStuckRTTMultiplier <= 1.0 {
 		l.BondStuckRTTMultiplier = def.BondStuckRTTMultiplier
+	}
+	if l.ProbeInterval < 10*time.Millisecond || l.ProbeInterval > 30*time.Second {
+		l.ProbeInterval = def.ProbeInterval
+	}
+	if l.BondPinSize <= 0 {
+		l.BondPinSize = def.BondPinSize
+	} else if l.BondPinSize > sendHistoryWindow {
+		l.BondPinSize = sendHistoryWindow
 	}
 	return l
 }

@@ -19,6 +19,10 @@ type sequencerTestPath struct {
 
 	closed    chan struct{}
 	closeOnce sync.Once
+	failed    chan struct{}
+	failOnce  sync.Once
+	failMu    sync.Mutex
+	failErr   error
 
 	deathMu sync.Mutex
 	deathFn func(transport.DeathCause, error)
@@ -33,23 +37,35 @@ type sequencerTestPath struct {
 }
 
 func newSequencerTestPathPair() (*sequencerTestPath, *sequencerTestPath) {
-	a := &sequencerTestPath{in: make(chan []byte, 1024), closed: make(chan struct{})}
-	b := &sequencerTestPath{in: make(chan []byte, 1024), closed: make(chan struct{})}
+	a := &sequencerTestPath{in: make(chan []byte, 1024), closed: make(chan struct{}), failed: make(chan struct{})}
+	b := &sequencerTestPath{in: make(chan []byte, 1024), closed: make(chan struct{}), failed: make(chan struct{})}
 	a.peer = b
 	b.peer = a
 	return a, b
 }
 
 func (p *sequencerTestPath) Read(buf []byte) (int, error) {
+	if err := p.failure(); err != nil {
+		p.notifyFailure(err)
+		return 0, err
+	}
 	select {
 	case frame := <-p.in:
 		return copy(buf, frame), nil
+	case <-p.failed:
+		err := p.failure()
+		p.notifyFailure(err)
+		return 0, err
 	case <-p.closed:
 		return 0, net.ErrClosed
 	}
 }
 
 func (p *sequencerTestPath) Write(frame []byte) (int, error) {
+	if err := p.failure(); err != nil {
+		p.notifyFailure(err)
+		return 0, err
+	}
 	select {
 	case <-p.closed:
 		return 0, net.ErrClosed
@@ -66,13 +82,7 @@ func (p *sequencerTestPath) Write(frame []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 	}
-	if p.dieFirstWrite.Load() && p.died.CompareAndSwap(false, true) {
-		p.deathMu.Lock()
-		fn := p.deathFn
-		p.deathMu.Unlock()
-		if fn != nil {
-			fn(transport.CauseTransportError, errors.New("injected path death during write"))
-		}
+	if p.dieFirstWrite.Load() && p.notifyFailure(errors.New("injected path death during write")) {
 		return len(frame), nil
 	}
 	if p.dropWrites.Load() {
@@ -84,6 +94,10 @@ func (p *sequencerTestPath) Write(frame []byte) (int, error) {
 		return len(frame), nil
 	case <-p.peer.closed:
 		return 0, net.ErrClosed
+	case <-p.failed:
+		err := p.failure()
+		p.notifyFailure(err)
+		return 0, err
 	case <-p.closed:
 		return 0, net.ErrClosed
 	}
@@ -100,6 +114,44 @@ func (p *sequencerTestPath) OnDeath(fn func(transport.DeathCause, error)) {
 	p.deathMu.Lock()
 	p.deathFn = fn
 	p.deathMu.Unlock()
+}
+
+func (p *sequencerTestPath) Fail(err error) {
+	if err == nil {
+		err = errors.New("injected sequencer path failure")
+	}
+	p.failOnce.Do(func() {
+		p.failMu.Lock()
+		p.failErr = err
+		p.failMu.Unlock()
+		close(p.failed)
+	})
+}
+
+func (p *sequencerTestPath) failure() error {
+	select {
+	case <-p.failed:
+		p.failMu.Lock()
+		err := p.failErr
+		p.failMu.Unlock()
+		if err == nil {
+			return errors.New("sequencer path failed")
+		}
+		return err
+	default:
+		return nil
+	}
+}
+
+func (p *sequencerTestPath) notifyFailure(err error) bool {
+	p.deathMu.Lock()
+	fn := p.deathFn
+	p.deathMu.Unlock()
+	if fn != nil && p.died.CompareAndSwap(false, true) {
+		fn(transport.CauseTransportError, err)
+		return true
+	}
+	return false
 }
 
 func (*sequencerTestPath) LocalAddr() string  { return "sequencer-local" }
@@ -119,6 +171,9 @@ func attachSequencerPair(t *testing.T, client, server *Engine, c, s *sequencerTe
 }
 
 func TestTXSequenceOwnedBeforePathWrite(t *testing.T) {
+	// The callback-inside-successful-Write edge is deliberately synthetic: it
+	// proves TX journal linearization only. Real carrier failure detection and
+	// error classification are covered by transport-facing tests.
 	flow := NewClientFlowID()
 	client := New(SideClient, flow, Limits{}.Clamp())
 	server := New(SideServer, flow, Limits{}.Clamp())
@@ -240,12 +295,10 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 	if c1.writes.Load() < sendHistoryWindow {
 		t.Fatalf("blackhole writes = %d, want at least %d", c1.writes.Load(), sendHistoryWindow)
 	}
-	if err := client.ForceKillPathForTest(deadID); err != nil {
-		t.Fatalf("kill blackhole: %v", err)
-	}
-	if err := server.ForceKillPathForTest(serverDeadID); err != nil {
-		t.Fatalf("kill peer blackhole: %v", err)
-	}
+	c1.Fail(errors.New("client blackhole failed"))
+	waitPathDetached(t, client, deadID)
+	s1.Fail(errors.New("server blackhole failed"))
+	waitPathDetached(t, server, serverDeadID)
 	deadline = time.Now().Add(2 * time.Second)
 	for {
 		server.recvMu.Lock()
@@ -311,12 +364,10 @@ func TestPacketGapCannotStrandFinalControlFrame(t *testing.T) {
 	if err := client.SendPacket(want); err != nil {
 		t.Fatalf("SendPacket: %v", err)
 	}
-	if err := client.ForceKillPathForTest(deadID); err != nil {
-		t.Fatalf("kill packet blackhole: %v", err)
-	}
-	if err := server.ForceKillPathForTest(serverDeadID); err != nil {
-		t.Fatalf("kill peer packet blackhole: %v", err)
-	}
+	c1.Fail(errors.New("client packet blackhole failed"))
+	waitPathDetached(t, client, deadID)
+	s1.Fail(errors.New("server packet blackhole failed"))
+	waitPathDetached(t, server, serverDeadID)
 	if err := client.SendBye(0); err != nil {
 		t.Fatalf("SendBye: %v", err)
 	}

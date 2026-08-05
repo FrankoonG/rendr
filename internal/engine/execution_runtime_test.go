@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -73,43 +74,69 @@ func TestExecutionRuntimeNestedSelectorsKeepIndependentState(t *testing.T) {
 }
 
 func TestExecutionRuntimeBondPinsFourFramesPerChild(t *testing.T) {
-	manifest, ids := runtimeGraph(t,
-		runtimeNode(proto.GraphNodeKindBond, "root", "a", "b"),
-		runtimeNode(proto.GraphNodeKindPath, "a"),
-		runtimeNode(proto.GraphNodeKindPath, "b"),
-	)
-	runtime := mustExecutionRuntime(t, manifest)
-	attached := runtimeAttached(ids, "a", "b")
-
-	const (
-		frameCount = 64
-		pinSize    = 4
-	)
-	routes := make([]proto.TargetID, 0, frameCount)
-	for frame := 0; frame < frameCount; frame++ {
-		ticket, err := runtime.buildTicket(attached, false, pinSize)
-		if err != nil {
-			t.Fatalf("ticket %d: %v", frame, err)
-		}
-		if len(ticket.routes) != 1 {
-			t.Fatalf("ticket %d routes=%v, want one bond route", frame, ticket.routes)
-		}
-		routes = append(routes, ticket.routes[0].targetID)
-	}
-
-	var previousRun proto.TargetID
-	for start := 0; start < frameCount; start += pinSize {
-		run := routes[start]
-		for offset := 1; offset < pinSize; offset++ {
-			if routes[start+offset] != run {
-				t.Fatalf("run %d split at offset %d: routes=%x", start/pinSize, offset, routes)
+	for _, pinSize := range []int{4, DefaultLimits().BondPinSize} {
+		t.Run(fmt.Sprintf("pin-%d", pinSize), func(t *testing.T) {
+			manifest, ids := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindBond, "root", "a", "b"),
+				runtimeNode(proto.GraphNodeKindPath, "a"),
+				runtimeNode(proto.GraphNodeKindPath, "b"),
+			)
+			runtime := mustExecutionRuntime(t, manifest)
+			attached := runtimeAttached(ids, "a", "b")
+			frameCount := pinSize * 8
+			routes := make([]proto.TargetID, 0, frameCount)
+			for frame := 0; frame < frameCount; frame++ {
+				ticket, err := runtime.buildTicket(attached, false, pinSize)
+				if err != nil {
+					t.Fatalf("ticket %d: %v", frame, err)
+				}
+				if len(ticket.routes) != 1 {
+					t.Fatalf("ticket %d routes=%v, want one bond route", frame, ticket.routes)
+				}
+				routes = append(routes, ticket.routes[0].targetID)
 			}
-		}
-		if start != 0 && run == previousRun {
-			t.Fatalf("runs %d and %d reused child %x: routes=%x", start/pinSize-1, start/pinSize, run, routes)
-		}
-		previousRun = run
+
+			var previousRun proto.TargetID
+			for start := 0; start < frameCount; start += pinSize {
+				run := routes[start]
+				for offset := 1; offset < pinSize; offset++ {
+					if routes[start+offset] != run {
+						t.Fatalf("run %d split at offset %d: routes=%x", start/pinSize, offset, routes)
+					}
+				}
+				if start != 0 && run == previousRun {
+					t.Fatalf("runs %d and %d reused child %x: routes=%x", start/pinSize-1, start/pinSize, run, routes)
+				}
+				previousRun = run
+			}
+		})
 	}
+
+	t.Run("weighted-3-to-1", func(t *testing.T) {
+		a := runtimeNode(proto.GraphNodeKindPath, "a")
+		a.Weight = 3
+		b := runtimeNode(proto.GraphNodeKindPath, "b")
+		b.Weight = 1
+		root := runtimeNode(proto.GraphNodeKindBond, "root", "a", "b")
+		manifest, ids := runtimeGraph(t, root, a, b)
+		runtime := mustExecutionRuntime(t, manifest)
+		attached := runtimeAttached(ids, "a", "b")
+		capacities := map[proto.TargetID]uint64{ids["a"]: 3, ids["b"]: 1}
+		counts := map[proto.TargetID]int{}
+		for frame := 0; frame < 64; frame++ {
+			ticket, err := runtime.buildTicketObserved(attached, nil, capacities, false, DefaultLimits().BondPinSize, 0)
+			if err != nil {
+				t.Fatalf("ticket %d: %v", frame, err)
+			}
+			if len(ticket.routes) != 1 {
+				t.Fatalf("ticket %d routes=%v, want one bond route", frame, ticket.routes)
+			}
+			counts[ticket.routes[0].targetID]++
+		}
+		if counts[ids["a"]] != 48 || counts[ids["b"]] != 16 {
+			t.Fatalf("weighted routes a=%d b=%d, want 48:16", counts[ids["a"]], counts[ids["b"]])
+		}
+	})
 }
 
 func TestExecutionRuntimeSelectorDeathBypassesPolicyAndRecoversDesired(t *testing.T) {

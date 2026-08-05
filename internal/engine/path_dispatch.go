@@ -115,7 +115,7 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime, firs
 		}
 		e.pathsMu.RUnlock()
 
-		ticket, err := runtime.buildTicketObserved(attached, qualities, capacities, e.Packetized(), e.bondPinSize, e.limits.BondStuckRTTMultiplier)
+		ticket, err := runtime.buildTicketObserved(attached, qualities, capacities, e.Packetized(), e.limits.BondPinSize, e.limits.BondStuckRTTMultiplier)
 		if err != nil {
 			if err != errNoExecutionRoute {
 				return err

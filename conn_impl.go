@@ -91,22 +91,6 @@ func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint
 	c.peak.start()
 }
 
-// Engine returns the underlying engine for in-package tests and the
-// listener-side path attach logic. Not part of the public API.
-func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
-
-// ForceKillPathForTest is a method-set backdoor that lets private
-// integration harnesses simulate sudden path death by duck-typed
-// interface assertion:
-//
-//	if k, ok := c.(interface{ ForceKillPathForTest(uint32) error }); ok { ... }
-//
-// Not part of the public API. Production code that wants to drop a
-// path cleanly should use PathController.RemovePath instead.
-func (c *engineBackedConn) ForceKillPathForTest(id uint32) error {
-	return c.e.ForceKillPathForTest(id)
-}
-
 // Migrate switches the active path to id. Embedders request it through the
 // narrow MigrationController interface.
 func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }

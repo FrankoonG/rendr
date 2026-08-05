@@ -121,9 +121,6 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		return nil, err
 	}
 	e.SetLocalInstanceID(instanceID)
-	if d.ProbeInterval > 0 {
-		e.SetProbeIntervalForTest(d.ProbeInterval)
-	}
 
 	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, false)
 	if err != nil {
@@ -206,9 +203,6 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	}
 	e.SetLocalInstanceID(instanceID)
 	e.SetPacketMode()
-	if d.ProbeInterval > 0 {
-		e.SetProbeIntervalForTest(d.ProbeInterval)
-	}
 
 	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, true)
 	if err != nil {
@@ -424,6 +418,7 @@ func (d *sessionDialer) engineLimits() engine.Limits {
 	}
 	limits := engine.Limits{
 		MigrationBudget:        runtimeConfig.Recovery.MigrationBudget,
+		ProbeInterval:          d.ProbeInterval,
 		SelectorHysteresis:     runtimeConfig.Selector.LatencyBandRatio,
 		SelectorLatencyFloor:   runtimeConfig.Selector.LatencyBandFloor,
 		SelectorDwell:          runtimeConfig.Selector.QualityDwell,

@@ -462,9 +462,8 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 		accepted <- c
 	}()
 
-	spec := func(name string) PathSpec {
-		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
-	}
+	controlled := newRuntimeControlledTCPTransport(t)
+	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root",
 		[]Target{
 			Selector("normal", []Target{
@@ -480,10 +479,12 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 		},
 	)
 	client, err := (&sessionDialer{
-		Root:       root,
-		Hysteresis: 0.05,
-		Dwell:      100 * time.Millisecond,
-		Cooldown:   100 * time.Millisecond,
+		Root:          root,
+		Hysteresis:    0.05,
+		Dwell:         100 * time.Millisecond,
+		Cooldown:      100 * time.Millisecond,
+		ProbeInterval: 30 * time.Second,
+		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -504,10 +505,15 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 	if ids["A"] == 0 || ids["B"] == 0 || ids["C"] == 0 {
 		t.Fatalf("idsByName=%v", ids)
 	}
-	ebc := client.(*engineBackedConn)
-	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 250 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 50 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["C"], PathQuality{RTT: 1 * time.Millisecond, At: time.Now()})
+	for name, quality := range map[string]PathQuality{
+		"A": {RTT: 250 * time.Millisecond, At: time.Now()},
+		"B": {RTT: 50 * time.Millisecond, At: time.Now()},
+		"C": {RTT: 1 * time.Millisecond, At: time.Now()},
+	} {
+		if err := controlled.SetQuality(name, quality); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -541,18 +547,19 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 		accepted <- c
 	}()
 
-	spec := func(name string) PathSpec {
-		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
-	}
+	controlled := newRuntimeControlledTCPTransport(t)
+	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root", []Target{
 		Path("A", spec("A")),
 		Path("B", spec("B")),
 	})
 	client, err := (&sessionDialer{
-		Root:       root,
-		Hysteresis: 0.05,
-		Dwell:      100 * time.Millisecond,
-		Cooldown:   100 * time.Millisecond,
+		Root:          root,
+		Hysteresis:    0.05,
+		Dwell:         100 * time.Millisecond,
+		Cooldown:      100 * time.Millisecond,
+		ProbeInterval: 30 * time.Second,
+		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -573,13 +580,16 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 	if ids["A"] == 0 || ids["B"] == 0 {
 		t.Fatalf("idsByName=%v", ids)
 	}
-	ebc := client.(*engineBackedConn)
-	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 30 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 50 * time.Millisecond, At: time.Now()})
+	if err := controlled.SetQuality("A", PathQuality{RTT: 30 * time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlled.SetQuality("B", PathQuality{RTT: 50 * time.Millisecond, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 	if got := client.(testConnectionControl).ActivePath(); got != ids["A"] {
 		t.Fatalf("initial active=%d want A=%d", got, ids["A"])
 	}
-	if err := ebc.ForceKillPathForTest(ids["A"]); err != nil {
+	if err := controlled.Fail("A"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(1 * time.Second)
@@ -625,9 +635,8 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		accepted <- c
 	}()
 
-	spec := func(name string) PathSpec {
-		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
-	}
+	controlled := newRuntimeControlledTCPTransport(t)
+	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root",
 		[]Target{
 			Selector("normal", []Target{
@@ -642,10 +651,12 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		PeakTransfer{Targets: []string{"D"}, SaturationFor: 10 * time.Second},
 	)
 	client, err := (&sessionDialer{
-		Root:       root,
-		Hysteresis: 0.05,
-		Dwell:      100 * time.Millisecond,
-		Cooldown:   100 * time.Millisecond,
+		Root:          root,
+		Hysteresis:    0.05,
+		Dwell:         100 * time.Millisecond,
+		Cooldown:      100 * time.Millisecond,
+		ProbeInterval: 30 * time.Second,
+		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
 	}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -663,11 +674,16 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 	defer server.Close()
 
 	ids := idsByName(client.Paths())
-	ebc := client.(*engineBackedConn)
-	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 150 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 140 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["C"], PathQuality{RTT: 80 * time.Millisecond, At: time.Now()})
-	ebc.Engine().SetPathQualityForTest(ids["D"], PathQuality{RTT: 1 * time.Millisecond, At: time.Now()})
+	for name, quality := range map[string]PathQuality{
+		"A": {RTT: 150 * time.Millisecond, At: time.Now()},
+		"B": {RTT: 140 * time.Millisecond, At: time.Now()},
+		"C": {RTT: 80 * time.Millisecond, At: time.Now()},
+		"D": {RTT: 1 * time.Millisecond, At: time.Now()},
+	} {
+		if err := controlled.SetQuality(name, quality); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -679,7 +695,7 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 	if got := client.(testConnectionControl).ActivePath(); got != ids["C"] {
 		t.Fatalf("active=%d want C=%d before death", got, ids["C"])
 	}
-	if err := ebc.ForceKillPathForTest(ids["C"]); err != nil {
+	if err := controlled.Fail("C"); err != nil {
 		t.Fatal(err)
 	}
 	deadline = time.Now().Add(1 * time.Second)
@@ -715,9 +731,8 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 		accepted <- c
 	}()
 
-	spec := func(name string) PathSpec {
-		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
-	}
+	controlled := newRuntimeControlledTCPTransport(t)
+	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root",
 		[]Target{
 			Path("A", spec("A")),
@@ -729,7 +744,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&sessionDialer{Root: root}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -747,12 +762,14 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 	go io.Copy(io.Discard, server)
 
 	ids := idsByName(client.Paths())
-	client.(*engineBackedConn).Engine().SetPathQualityForTest(ids["C"], PathQuality{
+	if err := controlled.SetQuality("C", PathQuality{
 		RTT:    100 * time.Millisecond,
 		Jitter: 250 * time.Millisecond,
 		LossPP: 500,
 		At:     time.Now(),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	chunk := make([]byte, 32<<10)
 	for i := 0; i < 48; i++ {
 		if _, err := client.Write(chunk); err != nil {
@@ -790,9 +807,8 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 		accepted <- c
 	}()
 
-	spec := func(name string) PathSpec {
-		return PathSpec{Transport: "tcp", Address: ln.Addr().String(), Opts: map[string]string{"name": name}}
-	}
+	controlled := newRuntimeControlledTCPTransport(t)
+	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root",
 		[]Target{
 			Path("A", spec("A")),
@@ -804,7 +820,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 			SaturationRatio: 0.8,
 		},
 	)
-	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,10 +838,12 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	go io.Copy(io.Discard, server)
 
 	ids := idsByName(client.Paths())
-	client.(*engineBackedConn).Engine().SetPathQualityForTest(ids["C"], PathQuality{
+	if err := controlled.SetQuality("C", PathQuality{
 		RTT: 10 * time.Millisecond,
 		At:  time.Now().Add(-10 * time.Second),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	chunk := make([]byte, 32<<10)
 	for i := 0; i < 48; i++ {
 		if _, err := client.Write(chunk); err != nil {
@@ -880,7 +898,7 @@ func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
 			ProbeBudget:     64 << 10,
 		},
 	)
-	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +986,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	d := &sessionDialer{Root: root, ProbeInterval: time.Hour}
+	d := &sessionDialer{Root: root, ProbeInterval: 30 * time.Second}
 	if err := d.AddStreamPathFactory("slow-tcp", func(ctx context.Context, addr string) (net.Conn, error) {
 		var nd net.Dialer
 		c, err := nd.DialContext(ctx, "tcp", addr)
@@ -1069,7 +1087,7 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	client, err := (&sessionDialer{Root: root, ProbeInterval: time.Hour}).Dial(ctx)
+	client, err := (&sessionDialer{Root: root, ProbeInterval: 30 * time.Second}).Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

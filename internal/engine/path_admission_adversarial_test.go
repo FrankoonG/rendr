@@ -523,10 +523,7 @@ func TestPathAdmissionCommittedSuccessorDeathDoesNotRestorePredecessor(t *testin
 	if err := e.activateStagedPathContext(context.Background(), replacementID, true, false); err != nil {
 		t.Fatal(err)
 	}
-	e.pathsMu.RLock()
-	replacementOwner := e.paths[replacementID].owner
-	e.pathsMu.RUnlock()
-	e.onPathDeath(replacementID, replacementOwner, transport.CauseTransportError, errors.New("successor failed after peer activation"))
+	failMemoryPath(t, e, replacementID, replacement, errors.New("successor failed after peer activation"))
 
 	waitAdmissionCondition(t, time.Second, "unsafe predecessor retirement", old.closed.Load)
 	if active := e.ActivePath(); active == oldID {
@@ -824,7 +821,7 @@ func TestPathAdmissionStaleTerminalSourceRequiresCurrentRouteRetry(t *testing.T)
 	if !ok {
 		t.Fatal("replacement route is not active")
 	}
-	e.onPathDeath(replacementID, staleSource.Owner, transport.CauseTransportError, errors.New("death after terminal proof dequeue"))
+	failMemoryPath(t, e, replacementID, replacement, errors.New("death after terminal proof dequeue"))
 	if active := e.ActivePath(); active != oldID {
 		t.Fatalf("active path after successor death=%d, want predecessor=%d", active, oldID)
 	}

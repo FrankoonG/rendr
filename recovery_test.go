@@ -40,6 +40,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attempts atomic.Int32
+	var carriers recoveryCarrierTracker
 	if err := runtime.RegisterStreamFactory("recover-stream", StreamFactory{
 		Carrier: CarrierTCP,
 		Dial: func(ctx context.Context, address string) (net.Conn, error) {
@@ -48,7 +49,11 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 				return nil, &net.DNSError{Err: "injected recovery dial failure", IsTemporary: true}
 			}
 			var dialer net.Dialer
-			return dialer.DialContext(ctx, "tcp", address)
+			conn, err := dialer.DialContext(ctx, "tcp", address)
+			if err == nil {
+				carriers.track(conn)
+			}
+			return conn, err
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -74,9 +79,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	serverObserver := server.(ConnectionObserver)
 	deadID := client.Paths()[0].ID
 	deadServerID := server.Paths()[0].ID
-	if err := client.e.ForceKillPathForTest(deadID); err != nil {
-		t.Fatal(err)
-	}
+	carriers.fail(t, 0)
 	replacement, serverReplacement := waitForStreamReplacement(t, client, server, deadID, deadServerID, 5*time.Second)
 	if attempts.Load() < 4 {
 		t.Fatalf("recovery did not retry injected dial failures: attempts=%d", attempts.Load())
@@ -84,9 +87,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	assertBidirectionalStreamPayload(t, client, server, "first-replacement")
 	assertPathCarriedData(t, client.Paths(), replacement)
 	assertPathCarriedData(t, server.Paths(), serverReplacement)
-	if err := client.e.ForceKillPathForTest(replacement); err != nil {
-		t.Fatal(err)
-	}
+	carriers.fail(t, 1)
 	second, secondServer := waitForStreamReplacement(t, client, server, replacement, serverReplacement, 5*time.Second)
 	if attempts.Load() < 5 {
 		t.Fatalf("immediate second death did not redial again: attempts=%d", attempts.Load())
@@ -123,9 +124,7 @@ func TestRecoveryGenerationReconcilesStartupAndInFlightDeath(t *testing.T) {
 			return 0, err
 		}
 		if attempt == 1 {
-			if err := e.ForceKillPathForTest(id); err != nil {
-				return 0, err
-			}
+			_ = peer.Close()
 		}
 		return id, nil
 	}
@@ -159,7 +158,7 @@ func TestCleanRemovalCancelsInFlightRecoveryWithoutResurrection(t *testing.T) {
 	}
 	leaf := PathSpec{Transport: "cancel-test", Address: "peer", Opts: map[string]string{"name": "leaf"}}
 	guard := PathSpec{Transport: "cancel-test", Address: "guard", Opts: map[string]string{"name": "guard"}}
-	leafID, leafPeer := attachPipe(leaf)
+	_, leafPeer := attachPipe(leaf)
 	defer leafPeer.Close()
 	_, guardPeer := attachPipe(guard)
 	defer guardPeer.Close()
@@ -179,9 +178,7 @@ func TestCleanRemovalCancelsInFlightRecoveryWithoutResurrection(t *testing.T) {
 	if supervisor := newPathRecoverySupervisor(e, nil, add, []PathSpec{leaf}, nil, retryPolicy{}); supervisor == nil {
 		t.Fatal("recovery supervisor was not created")
 	}
-	if err := e.ForceKillPathForTest(leafID); err != nil {
-		t.Fatal(err)
-	}
+	_ = leafPeer.Close()
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -251,8 +248,8 @@ func TestCleanRemovalTombstoneIgnoresDelayedTransportDeath(t *testing.T) {
 		}
 	}
 	waitAbsent(leaf, "leaf")
-	supervisor.publishDeathForTest(engine.PathDeathEvent{ID: leafID, Spec: leaf.Clone(), Cause: transport.CauseTransportError, Err: errors.New("delayed old generation")})
-	if active := supervisor.activeWorkersForTest(); active != 0 {
+	publishRecoveryDeath(t, supervisor, engine.PathDeathEvent{ID: leafID, Spec: leaf.Clone(), Cause: transport.CauseTransportError, Err: errors.New("delayed old generation")})
+	if active := recoveryActiveWorkers(t, supervisor); active != 0 {
 		t.Fatalf("delayed transport death started %d recovery worker(s)", active)
 	}
 	if got := attempts.Load(); got != 0 {
@@ -265,6 +262,7 @@ func TestRecoveryRemoveThenAddSameLeafIgnoresOldGenerationDeath(t *testing.T) {
 	t.Cleanup(func() { _ = e.Close() })
 	var peersMu sync.Mutex
 	var peers []net.Conn
+	peersByID := make(map[uint32]net.Conn)
 	attachPath := func(spec PathSpec) (uint32, error) {
 		local, peer := net.Pipe()
 		id, err := e.AttachPath(tcp.Wrap(local), spec)
@@ -275,6 +273,7 @@ func TestRecoveryRemoveThenAddSameLeafIgnoresOldGenerationDeath(t *testing.T) {
 		}
 		peersMu.Lock()
 		peers = append(peers, peer)
+		peersByID[id] = peer
 		peersMu.Unlock()
 		return id, nil
 	}
@@ -320,24 +319,28 @@ func TestRecoveryRemoveThenAddSameLeafIgnoresOldGenerationDeath(t *testing.T) {
 	}
 	newID := attach(leaf)
 	supervisor.pathAdded(leaf, newID)
-	supervisor.publishDeathForTest(engine.PathDeathEvent{
+	publishRecoveryDeath(t, supervisor, engine.PathDeathEvent{
 		ID: oldRef.ID, Owner: oldRef.Owner, Spec: leaf.Clone(),
 		Cause: transport.CauseTransportError, Err: errors.New("delayed old generation death"),
 	})
-	supervisor.publishDeathForTest(engine.PathDeathEvent{
+	publishRecoveryDeath(t, supervisor, engine.PathDeathEvent{
 		ID: oldRef.ID, Owner: oldRef.Owner, Spec: leaf.Clone(),
 		Cause: transport.CauseCleanClose, Administrative: true,
 	})
-	if active := supervisor.activeWorkersForTest(); active != 0 || attempts.Load() != 0 {
+	if active := recoveryActiveWorkers(t, supervisor); active != 0 || attempts.Load() != 0 {
 		t.Fatalf("old generation death started recovery: active=%d attempts=%d", active, attempts.Load())
 	}
 	if ref, ok := e.PathRef(newID); !ok || ref.ID != newID {
 		t.Fatalf("old generation death removed manual replacement %d: paths=%v", newID, e.Paths())
 	}
 
-	if err := e.ForceKillPathForTest(newID); err != nil {
-		t.Fatal(err)
+	peersMu.Lock()
+	newPeer := peersByID[newID]
+	peersMu.Unlock()
+	if newPeer == nil {
+		t.Fatalf("new path %d has no test-owned peer", newID)
 	}
+	_ = newPeer.Close()
 	select {
 	case replacementID := <-recovered:
 		if replacementID == newID {
@@ -407,7 +410,7 @@ func TestCanceledRecoveryDoesNotClaimConcurrentManualPath(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		active := supervisor.activeWorkersForTest()
+		active := recoveryActiveWorkers(t, supervisor)
 		_, attached := e.PathRef(manualID)
 		if active == 0 || !attached {
 			break
@@ -417,7 +420,7 @@ func TestCanceledRecoveryDoesNotClaimConcurrentManualPath(t *testing.T) {
 	if ref, ok := e.PathRef(manualID); !ok || ref.ID != manualID {
 		t.Fatalf("stale recovery completion retired concurrent manual path %d: paths=%v", manualID, e.Paths())
 	}
-	if active := supervisor.activeWorkersForTest(); active != 0 {
+	if active := recoveryActiveWorkers(t, supervisor); active != 0 {
 		t.Fatalf("canceled recovery completion did not drain: active=%d", active)
 	}
 	if err := e.Close(); err != nil {
@@ -469,7 +472,7 @@ func TestDelayedAddNotificationCannotUndoCleanRemoval(t *testing.T) {
 	// Model AddPath's notification being delayed until after the exact
 	// generation was administratively removed.
 	supervisor.pathAddedRef(leaf, leafID, ref)
-	if active := supervisor.activeWorkersForTest(); active != 0 || attempts.Load() != 0 {
+	if active := recoveryActiveWorkers(t, supervisor); active != 0 || attempts.Load() != 0 {
 		t.Fatalf("delayed add notification resurrected clean leaf: active=%d attempts=%d", active, attempts.Load())
 	}
 }
@@ -612,12 +615,12 @@ func TestCleanRemovalRetiresLateSuccessfulRecoveryAttach(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if !recoveryLeafAttached(e.Paths(), leaf) && supervisor.activeWorkersForTest() == 0 {
+		if !recoveryLeafAttached(e.Paths(), leaf) && recoveryActiveWorkers(t, supervisor) == 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if recoveryLeafAttached(e.Paths(), leaf) || supervisor.activeWorkersForTest() != 0 {
+	if recoveryLeafAttached(e.Paths(), leaf) || recoveryActiveWorkers(t, supervisor) != 0 {
 		t.Fatalf("late successful recovery attach %d survived clean tombstone: %v", lateID, e.Paths())
 	}
 	if !recoveryLeafAttached(e.Paths(), guard) || e.IsClosed() {
@@ -723,13 +726,13 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 	}
 	returnOnce.Do(func() { close(allowReturn) })
 	deadline := time.Now().Add(2 * time.Second)
-	for (len(e.Paths()) != 0 || supervisor.activeWorkersForTest() != 0) && time.Now().Before(deadline) {
+	for (len(e.Paths()) != 0 || recoveryActiveWorkers(t, supervisor) != 0) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if paths := e.Paths(); len(paths) != 0 {
 		t.Fatalf("paths after tombstoned sole replacement cleanup=%v", paths)
 	}
-	if active := supervisor.activeWorkersForTest(); active != 0 {
+	if active := recoveryActiveWorkers(t, supervisor); active != 0 {
 		t.Fatalf("recovery workers after stale last-path retirement=%d", active)
 	}
 	if state := e.State(); state != engine.BridgeMigrating {
@@ -833,6 +836,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attempts atomic.Int32
+	var carriers recoveryCarrierTracker
 	if err := runtime.RegisterPacketFactory("recover-packet", PacketFactory{
 		Carrier: CarrierUDP,
 		Dial: func(context.Context, string) (net.PacketConn, error) {
@@ -840,7 +844,11 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 			if attempt == 2 || attempt == 3 {
 				return nil, &net.DNSError{Err: "injected packet recovery dial failure", IsTemporary: true}
 			}
-			return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			if err == nil {
+				carriers.track(conn)
+			}
+			return conn, err
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -866,9 +874,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	serverObserver := server.(ConnectionObserver)
 	deadID := client.Paths()[0].ID
 	deadServerID := server.Paths()[0].ID
-	if err := client.e.ForceKillPathForTest(deadID); err != nil {
-		t.Fatal(err)
-	}
+	carriers.fail(t, 0)
 	replacement, serverReplacement := waitForPacketReplacement(t, client, server, deadID, deadServerID, 5*time.Second)
 	if attempts.Load() < 4 {
 		t.Fatalf("packet recovery did not retry dial failures: attempts=%d", attempts.Load())
@@ -876,9 +882,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	assertBidirectionalPacketPayload(t, client, server, "first-packet-replacement")
 	assertPathCarriedData(t, client.Paths(), replacement)
 	assertPathCarriedData(t, server.Paths(), serverReplacement)
-	if err := client.e.ForceKillPathForTest(replacement); err != nil {
-		t.Fatal(err)
-	}
+	carriers.fail(t, 1)
 	second, secondServer := waitForPacketReplacement(t, client, server, replacement, serverReplacement, 5*time.Second)
 	if attempts.Load() < 5 {
 		t.Fatalf("packet immediate second death did not redial: attempts=%d", attempts.Load())
@@ -1007,6 +1011,64 @@ func assertPathCarriedData(t *testing.T, paths []PathInfo, id uint32) {
 		}
 	}
 	t.Fatalf("replacement path %d disappeared: %v", id, paths)
+}
+
+type recoveryCarrierTracker struct {
+	mu       sync.Mutex
+	carriers []io.Closer
+}
+
+func (c *recoveryCarrierTracker) track(carrier io.Closer) {
+	c.mu.Lock()
+	c.carriers = append(c.carriers, carrier)
+	c.mu.Unlock()
+}
+
+func (c *recoveryCarrierTracker) fail(t *testing.T, ordinal int) {
+	t.Helper()
+	c.mu.Lock()
+	if ordinal < 0 || ordinal >= len(c.carriers) {
+		available := len(c.carriers)
+		c.mu.Unlock()
+		t.Fatalf("recovery carrier %d unavailable; tracked=%d", ordinal, available)
+	}
+	carrier := c.carriers[ordinal]
+	c.mu.Unlock()
+	if err := carrier.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("fail recovery carrier %d: %v", ordinal, err)
+	}
+}
+
+func publishRecoveryDeath(t *testing.T, supervisor *pathRecoverySupervisor, event engine.PathDeathEvent) {
+	t.Helper()
+	reply := make(chan int, 1)
+	if !supervisor.enqueue(recoveryUpdate{kind: recoveryUpdateDeath, death: event, reply: reply}) {
+		t.Fatal("recovery supervisor stopped before death stimulus")
+	}
+	select {
+	case <-reply:
+	case <-supervisor.done:
+		t.Fatal("recovery supervisor stopped before death stimulus completed")
+	case <-time.After(time.Second):
+		t.Fatal("recovery supervisor did not consume death stimulus")
+	}
+}
+
+func recoveryActiveWorkers(t *testing.T, supervisor *pathRecoverySupervisor) int {
+	t.Helper()
+	reply := make(chan int, 1)
+	if !supervisor.enqueue(recoveryUpdate{kind: recoveryUpdateBarrier, reply: reply}) {
+		return 0
+	}
+	select {
+	case active := <-reply:
+		return active
+	case <-supervisor.done:
+		return 0
+	case <-time.After(time.Second):
+		t.Fatal("recovery supervisor did not reach barrier")
+		return 0
+	}
 }
 
 func waitForMigrationCounts(t *testing.T, client, server func() uint64, want uint64) {

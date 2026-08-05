@@ -208,25 +208,3 @@ func (p *selector) evaluateRecursive(e *Engine, runtime *executionRuntime) {
 		}
 	}
 }
-
-// SetPathQualityForTest pokes a quality reading into a specific
-// path. Used by unit tests to drive selector-mode scoring without
-// having to wait for real RTT measurements (M6(2/n) wires up the
-// HEARTBEAT-based probe; until then the engine reads only what
-// tests / external callers inject).
-func (e *Engine) SetPathQualityForTest(id uint32, q transport.PathQuality) {
-	e.pathsMu.RLock()
-	slot, ok := e.paths[id]
-	e.pathsMu.RUnlock()
-	if !ok {
-		return
-	}
-	if q.At.IsZero() && q.RTT > 0 {
-		q.At = nowFn()
-	}
-	if setter, ok := slot.conn.(interface {
-		SetQuality(transport.PathQuality)
-	}); ok {
-		setter.SetQuality(q)
-	}
-}

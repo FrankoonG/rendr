@@ -371,12 +371,8 @@ func TestTxAdversarialSolePathRecoveryDeliversLastUnackedTail(t *testing.T) {
 	if _, err := client.SendData(tail); err != nil {
 		t.Fatalf("publish tail: %v", err)
 	}
-	if err := client.ForceKillPathForTest(oldClientID); err != nil {
-		t.Fatalf("kill client path: %v", err)
-	}
-	if err := server.ForceKillPathForTest(oldServerID); err != nil {
-		t.Fatalf("kill server path: %v", err)
-	}
+	failMemoryPath(t, client, oldClientID, oldClient, errors.New("old client carrier failed"))
+	failMemoryPath(t, server, oldServerID, oldServer, errors.New("old server carrier failed"))
 
 	newClient, newServer := newMemoryPathPair()
 	readGate := make(chan struct{})

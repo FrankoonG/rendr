@@ -133,9 +133,7 @@ func TestSameLeafAdmissionIsSerializedAndRollsBackToPredecessor(t *testing.T) {
 	if !concurrent.closed.Load() || !stagedConcurrent.closed.Load() {
 		t.Fatalf("rejected candidates closed = %t/%t, want true/true", concurrent.closed.Load(), stagedConcurrent.closed.Load())
 	}
-	if err := e.ForceKillPathForTest(winnerID); err != nil {
-		t.Fatal(err)
-	}
+	failMemoryPath(t, e, winnerID, winnerBase, errors.New("successor transport failed"))
 	deadline := time.Now().Add(time.Second)
 	for e.ActivePath() != oldID && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -181,9 +179,7 @@ func TestPathSpecOptsAreOwnedAcrossEngineBoundaries(t *testing.T) {
 		<-mutated
 		observed <- event.Spec.Opts["token"]
 	})
-	if err := e.ForceKillPathForTest(id); err != nil {
-		t.Fatal(err)
-	}
+	failMemoryPath(t, e, id, path, errors.New("path transport failed"))
 	select {
 	case got := <-observed:
 		if got != "frozen" {

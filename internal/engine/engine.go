@@ -74,10 +74,9 @@ type Engine struct {
 	// the current path before bondCursor advances. Path pinning is
 	// the M8 mitigation for reorder-window blow-up under RTT skew
 	// (path pinning, see dispatchBond). When bondPinLeft hits 0 we
-	// bump bondCursor and refill bondPinLeft from bondPinSize.
+	// bump bondCursor and refill bondPinLeft from limits.BondPinSize.
 	bondCursor     uint64
 	bondPinLeft    int
-	bondPinSize    int    // 0 = use defaultBondPinSize
 	bondStuckSkips uint64 // count of round-robin slots bypassed for RTT
 
 	// migrationCount tracks the number of active-path changes that
@@ -219,10 +218,9 @@ type Engine struct {
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
-	probeMu               sync.Mutex
-	probeOutstanding      map[uint64]time.Time
-	probeNextID           uint64
-	probeIntervalOverride time.Duration // 0 = default 1s; tests can shorten
+	probeMu          sync.Mutex
+	probeOutstanding map[uint64]time.Time
+	probeNextID      uint64
 
 	// Lifecycle.
 	closing      atomic.Bool
@@ -1111,7 +1109,7 @@ func (e *Engine) nextPathGenerationLocked() uint64 {
 // independent scheduler in selector.go.
 func (e *Engine) proberLoop(slot *pathSlot) {
 	defer close(slot.doneP)
-	t := time.NewTicker(e.probeInterval())
+	t := time.NewTicker(e.limits.ProbeInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -1887,34 +1885,6 @@ func (e *Engine) fireMigrateHooks(oldID, newID uint32, cause string) {
 	}
 }
 
-// SetBondPinSizeForTest is a backdoor for tests that want to
-// observe pinning without sending 64+ frames. Not part of the API.
-func (e *Engine) SetBondPinSizeForTest(n int) {
-	if n <= 0 {
-		return
-	}
-	e.pathsMu.Lock()
-	e.bondPinSize = n
-	// Reset the current pin so the change takes effect on the next
-	// frame rather than waiting out the residual count.
-	e.bondPinLeft = 0
-	e.pathsMu.Unlock()
-}
-
-// probeInterval lets tests override the prober cadence. Default 1s.
-func (e *Engine) probeInterval() time.Duration {
-	if e.probeIntervalOverride > 0 {
-		return e.probeIntervalOverride
-	}
-	return 1 * time.Second
-}
-
-// SetProbeIntervalForTest is a backdoor for tests that want a
-// shorter prober cadence; not part of the API.
-func (e *Engine) SetProbeIntervalForTest(d time.Duration) {
-	e.probeIntervalOverride = d
-}
-
 // Close tears down the engine, closing all attached paths.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
@@ -2072,18 +2042,6 @@ func (e *Engine) RecvDups() uint64 {
 	return e.recvDups
 }
 
-// WalkPathsForTest invokes fn for every attached path. fn receives
-// the path id and the underlying PathConn as a bare any so tests can
-// type-assert to transport-specific diagnostic interfaces (e.g.
-// tcp.PathConn.Writes()).
-func (e *Engine) WalkPathsForTest(fn func(id uint32, pc interface{})) {
-	e.pathsMu.RLock()
-	defer e.pathsMu.RUnlock()
-	for id, s := range e.paths {
-		fn(id, s.conn)
-	}
-}
-
 // RemovePath gracefully detaches path id from the engine. The
 // underlying socket is closed and a clean-close OnDeath fires, which
 // (since CauseCleanClose on a non-last path is a no-op) just drops
@@ -2187,26 +2145,6 @@ func (e *Engine) RetirePath(ref PathRef, reason error) error {
 	e.sendMu.Unlock()
 	e.finishPathDeparture(departure)
 	return nil
-}
-
-// ForceKillPathForTest is a backdoor for tests that need to simulate
-// a sudden network death on a specific attached path. It closes the
-// socket AND synthesises an onPathDeath(TransportError) so the
-// engine's normal migration / budget machinery fires; without the
-// second step, local PathConn.Close would silently leave the engine
-// thinking the path is still attached.
-//
-// Not part of the API; gated by an obvious name to discourage misuse.
-func (e *Engine) ForceKillPathForTest(id uint32) error {
-	e.pathsMu.RLock()
-	slot, ok := e.paths[id]
-	e.pathsMu.RUnlock()
-	if !ok {
-		return fmt.Errorf("engine: kill unknown path %d", id)
-	}
-	err := slot.conn.Close()
-	e.onPathDeath(id, slot.owner, transport.CauseTransportError, err)
-	return err
 }
 
 // AbortPathAttach rolls back a path that was locally attached but whose

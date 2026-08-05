@@ -496,30 +496,6 @@ func (s *pathRecoverySupervisor) stop() {
 	}
 }
 
-func (s *pathRecoverySupervisor) publishDeathForTest(event engine.PathDeathEvent) {
-	reply := make(chan int, 1)
-	if !s.enqueue(recoveryUpdate{kind: recoveryUpdateDeath, death: event, reply: reply}) {
-		return
-	}
-	select {
-	case <-reply:
-	case <-s.done:
-	}
-}
-
-func (s *pathRecoverySupervisor) activeWorkersForTest() int {
-	reply := make(chan int, 1)
-	if !s.enqueue(recoveryUpdate{kind: recoveryUpdateBarrier, reply: reply}) {
-		return 0
-	}
-	select {
-	case active := <-reply:
-		return active
-	case <-s.done:
-		return 0
-	}
-}
-
 func recoveryLeafKey(spec PathSpec) string {
 	if name := pathSpecName(spec); name != "" {
 		return name

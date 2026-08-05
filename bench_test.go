@@ -41,7 +41,7 @@ func BenchmarkStreamThroughputTCPWithMigration(b *testing.B) {
 // benchStream drives b.N write/read pairs of `chunk` bytes between
 // loopback rendr Conns. nPaths sets how many TCP paths the client
 // attaches; migrateEvery==0 disables explicit migration, otherwise
-// the client calls Engine.Migrate after every `migrateEvery`
+// the client calls MigrationController.Migrate after every `migrateEvery`
 // transferred bytes. b.SetBytes is set to chunk so go test reports
 // MB/s; b.ResetTimer skips setup cost from the measurement.
 func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
@@ -96,7 +96,8 @@ func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
 		drainErr <- nil
 	}()
 
-	bc, _ := client.(*engineBackedConn)
+	migrator, canMigrate := client.(MigrationController)
+	observer, canObserve := client.(ConnectionObserver)
 	payload := make([]byte, chunk)
 	for i := range payload {
 		payload[i] = byte(i & 0xFF)
@@ -110,14 +111,14 @@ func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
 		if _, err := client.Write(payload); err != nil {
 			b.Fatal(err)
 		}
-		if migrateEvery > 0 && bc != nil {
+		if migrateEvery > 0 && canMigrate && canObserve {
 			sentSinceMigrate += chunk
 			if sentSinceMigrate >= migrateEvery {
 				sentSinceMigrate = 0
-				cur := bc.Engine().ActivePath()
-				for _, p := range bc.Paths() {
+				cur := observer.ActivePath()
+				for _, p := range client.Paths() {
 					if p.ID != cur {
-						_ = bc.Engine().Migrate(p.ID)
+						_ = migrator.Migrate(p.ID)
 						break
 					}
 				}
