@@ -11,6 +11,13 @@ import (
 	"github.com/FrankoonG/rendr"
 )
 
+func TestDialRequiresRuntime(t *testing.T) {
+	_, err := Dial(context.Background(), DialConfig{})
+	if err == nil || err.Error() != "udprelay: Runtime is required" {
+		t.Fatalf("Dial error = %v, want Runtime is required", err)
+	}
+}
+
 func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -34,9 +41,10 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 		accepted <- pc
 	}()
 
-	client, err := (&rendr.Dialer{
+	runtime := newRuntime(t)
+	client, err := runtime.DialPacket(ctx, rendr.SessionConfig{
 		Root: packetSelector(ln.Addr().String()),
-	}).DialPacket(ctx)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +135,8 @@ func TestDialAndServeRoundTrip(t *testing.T) {
 	}()
 
 	clientRelay, err := Dial(ctx, DialConfig{
-		Dialer: &rendr.Dialer{
+		Runtime: newRuntime(t),
+		Session: rendr.SessionConfig{
 			Root: packetSelector(ln.Addr().String()),
 		},
 		LocalAddr: "127.0.0.1:0",
@@ -183,7 +192,8 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		clientRelay, err := Dial(ctx, DialConfig{
-			Dialer: &rendr.Dialer{
+			Runtime: newRuntime(t),
+			Session: rendr.SessionConfig{
 				Root: packetSelector(ln.Addr().String()),
 			},
 			LocalAddr: "127.0.0.1:0",
@@ -211,6 +221,15 @@ func packetSelector(addr string) rendr.Target {
 		rendr.Path("udp-a", rendr.PathSpec{Transport: "udpflow", Address: addr}),
 		rendr.Path("udp-b", rendr.PathSpec{Transport: "udpflow", Address: addr}),
 	})
+}
+
+func newRuntime(t *testing.T) *rendr.Runtime {
+	t.Helper()
+	runtime, err := rendr.NewRuntime(rendr.RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }
 
 func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {

@@ -54,7 +54,7 @@ type selector struct {
 // 200ms default. The scheduler runs until Engine.Close.
 //
 // Per CLAUDE.md hard rule #3 ("默认不安装主动迁移触发器"), selector
-// scoring is OFF until this method is called. The Dialer wires it
+// scoring is OFF until this method is called. The session constructor wires it
 // up when Mode == ModeSelector.
 func (e *Engine) StartSelector(score ScoreFn, tickEvery time.Duration) {
 	if runtime := e.localExecutionRuntime(); runtime != nil && !runtime.plan.hasKind(proto.GraphNodeKindSelector) {

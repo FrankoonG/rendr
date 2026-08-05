@@ -2,7 +2,7 @@
 // per-Conn state machine, cleanClose discrimination, zombie protection.
 //
 // This package is internal. The only public surface is the top-level
-// rendr.Conn / rendr.PacketConn / rendr.Dialer / rendr.Listener,
+// rendr.Conn / rendr.PacketConn / rendr.Runtime / rendr.SessionListener,
 // which wrap the engine.
 //
 // M0 publishes only the state-machine enums and the bridge-table

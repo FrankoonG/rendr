@@ -16,7 +16,7 @@ const defaultBufferSize = 64 << 10
 //
 // PacketConn is the rendr packet-mode connection used as the migrated
 // carrier. It is required for now; callers can create one with
-// Dialer.DialPacket or PacketListener.AcceptPacket.
+// Runtime.DialPacket or SessionListener.AcceptPacket.
 //
 // LocalAddr is the UDP address exposed to the application or used as
 // the source socket for target traffic. Empty means "127.0.0.1:0".
@@ -35,15 +35,23 @@ type Config struct {
 // DialConfig creates a client-side relay and dials the rendr
 // packet-mode carrier for it.
 type DialConfig struct {
-	Dialer     *rendr.Dialer
+	Runtime    *rendr.Runtime
+	Session    rendr.SessionConfig
 	LocalAddr  string
 	BufferSize int
+}
+
+// PacketAcceptor is the inbound packet-session capability used by the relay.
+// A rendr SessionListener satisfies it without exposing listener internals.
+type PacketAcceptor interface {
+	AcceptPacket(context.Context) (rendr.PacketConn, error)
+	Close() error
 }
 
 // ServeConfig creates a server-side relay from an accepted rendr
 // packet-mode carrier.
 type ServeConfig struct {
-	Listener   rendr.PacketListener
+	Listener   PacketAcceptor
 	LocalAddr  string
 	TargetAddr string
 	BufferSize int
@@ -52,7 +60,7 @@ type ServeConfig struct {
 // Server accepts rendr packet-mode connections and starts one
 // server-side Relay for each accepted client.
 type Server struct {
-	listener   rendr.PacketListener
+	listener   PacketAcceptor
 	localAddr  string
 	targetAddr string
 	bufferSize int
@@ -80,10 +88,10 @@ type Relay struct {
 // Dial dials a rendr PacketConn and starts a client-side local UDP
 // relay for a self-managed UDP application.
 func Dial(ctx context.Context, cfg DialConfig) (*Relay, error) {
-	if cfg.Dialer == nil {
-		return nil, errors.New("udprelay: Dialer is required")
+	if cfg.Runtime == nil {
+		return nil, errors.New("udprelay: Runtime is required")
 	}
-	pc, err := cfg.Dialer.DialPacket(ctx)
+	pc, err := cfg.Runtime.DialPacket(ctx, cfg.Session)
 	if err != nil {
 		return nil, fmt.Errorf("udprelay: dial packet carrier: %w", err)
 	}

@@ -45,7 +45,7 @@ the embedder's application protocol.
 | Transport | The adapter that creates a path from a `PathSpec`. Built-in examples include `tcp`, `quic`, `udpflow`, and `gvisor`. |
 | Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, tunneled, or custom. |
 | Target | A node in the policy graph. A target can be a leaf `Path`, a `Selector`, a `Race`, or a `Bond`. |
-| Root target | The policy graph entry point supplied to a `Dialer`. It replaces the older flat `Mode + Paths` shape for new integrations. |
+| Root target | The policy graph entry point supplied in `SessionConfig` to a `Runtime`. |
 | Selector | The single-target quality policy. It chooses one child target at a time, favoring latency, jitter, loss, and stability. |
 | Race | A redundancy policy that sends frames on multiple paths and accepts the first valid arrival. |
 | Bond | An aggregation policy that distributes frames across paths to combine throughput. |

@@ -12,15 +12,12 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
-// Dialer is the entry point for constructing a rendr Conn.
-//
-// Root is the single configuration entry point for the initial target graph.
-// Runtime uses this implementation internally. Returned sessions expose
-// optional path mutation through PathController.
-type Dialer struct {
-	// Root is the target graph entry point. Selector/Race/Bond currently
-	// compile down to the flattened engine mode layer until the recursive
-	// runtime policy executor lands.
+// sessionDialer freezes one Runtime and SessionConfig into the internal
+// construction state for a single session. Callers enter through Runtime;
+// this type deliberately is not part of the public API.
+type sessionDialer struct {
+	// Root is the target graph entry point compiled into the recursive
+	// selector/race/bond execution manifest.
 	Root Target
 
 	// Hysteresis (selector only): the new path must beat the current by
@@ -71,11 +68,10 @@ type Dialer struct {
 	PreserveL3Identity bool
 
 	// InstanceID identifies this runtime during HELLO/BRIDGE attach.
-	// Zero means generate a fresh ephemeral runtime id for this Dialer.
+	// Zero means generate a fresh ephemeral runtime id.
 	InstanceID InstanceID
 
-	// Runtime is the immutable v1 policy configuration inherited from a
-	// Runtime. Direct Dialer use accepts the zero value as defaults.
+	// Runtime is the immutable v1 policy configuration inherited from Runtime.
 	Runtime RuntimeConfig
 
 	// Primary names the path or group that should be used for the
@@ -84,18 +80,15 @@ type Dialer struct {
 
 	// PrimaryPolicy controls whether primary failure can fall back to
 	// another path. Zero value is PrimaryPrefer.
-	PrimaryPolicy PrimaryPolicy
+	PrimaryPolicy primaryPolicy
 
 	// Retry controls background retry of optional failed paths. Zero
 	// value enables bounded retry with conservative defaults.
-	Retry RetryPolicy
+	Retry retryPolicy
 
-	// streamFactories / packetFactories are populated via
-	// AddStreamPathFactory / AddPacketPathFactory. They override
-	// transport.Default lookup for PathSpec.Transport names that
-	// match a registered factory. See factory.go for the API.
-	streamFactories map[string]StreamPathFactory
-	packetFactories map[string]PacketPathFactory
+	// Factory maps are immutable snapshots of the owning Runtime registry.
+	streamFactories map[string]streamPathFactory
+	packetFactories map[string]packetPathFactory
 	factoryCarriers map[string]CarrierFamily
 }
 
@@ -104,9 +97,9 @@ type Dialer struct {
 // (attached during the same Dial call or later via the migration
 // API) send BRIDGE_TAG carrying the same flow_id.
 //
-// The first compiled path becomes active; the remainder are attached and
-// dispatched according to the root target's flattened mode.
-func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
+// The first usable compiled path establishes the session; the remainder are
+// attached and dispatched by the recursive target executor.
+func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	plan, err := d.compileDialPlan()
 	if err != nil {
 		return nil, err
@@ -190,7 +183,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 // The Root graph, selector knobs, and MigrationBudget apply identically to
 // packet-mode connections; the underlying engine and path machinery are the
 // same.
-func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
+func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	plan, err := d.compileDialPlan()
 	if err != nil {
 		return nil, err
@@ -257,14 +250,14 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	return bc, nil
 }
 
-func (d *Dialer) instanceID() InstanceID {
+func (d *sessionDialer) instanceID() InstanceID {
 	if d.InstanceID != (InstanceID{}) {
 		return d.InstanceID
 	}
 	return engine.NewInstanceID()
 }
 
-func (d *Dialer) compileDialPlan() (compiledTarget, error) {
+func (d *sessionDialer) compileDialPlan() (compiledTarget, error) {
 	if d.Root == nil {
 		return compiledTarget{}, errRootRequired
 	}
@@ -274,21 +267,21 @@ func (d *Dialer) compileDialPlan() (compiledTarget, error) {
 	}
 	graph, err := compileTargetGraph(d.Root)
 	if err != nil {
-		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
+		return compiledTarget{}, fmt.Errorf("rendr: invalid SessionConfig: %w", err)
 	}
 	ct, err := graph.compileDialPlan()
 	if err != nil {
-		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
+		return compiledTarget{}, fmt.Errorf("rendr: invalid SessionConfig: %w", err)
 	}
 	ct.runtimeConfig = runtimeConfig
 	ct, err = d.applyPrimary(ct, d.Root, d.Primary)
 	if err != nil {
-		return compiledTarget{}, fmt.Errorf("rendr: invalid Dialer config: %w", err)
+		return compiledTarget{}, fmt.Errorf("rendr: invalid SessionConfig: %w", err)
 	}
 	return ct, nil
 }
 
-func (d *Dialer) applyPrimary(ct compiledTarget, root Target, primary string) (compiledTarget, error) {
+func (d *sessionDialer) applyPrimary(ct compiledTarget, root Target, primary string) (compiledTarget, error) {
 	if len(ct.paths) == 0 {
 		return ct, nil
 	}
@@ -325,14 +318,14 @@ func (d *Dialer) applyPrimary(ct compiledTarget, root Target, primary string) (c
 	return ct, nil
 }
 
-func (d *Dialer) effectivePrimaryPolicy() PrimaryPolicy {
-	if d.PrimaryPolicy == PrimaryRequire {
-		return PrimaryRequire
+func (d *sessionDialer) effectivePrimaryPolicy() primaryPolicy {
+	if d.PrimaryPolicy == primaryRequire {
+		return primaryRequire
 	}
-	return PrimaryPrefer
+	return primaryPrefer
 }
 
-func (d *Dialer) dialInitialPath(
+func (d *sessionDialer) dialInitialPath(
 	ctx context.Context,
 	e *engine.Engine,
 	instanceID InstanceID,
@@ -350,7 +343,7 @@ func (d *Dialer) dialInitialPath(
 		if err != nil {
 			tracker.set(i, PathUnavailable, err)
 			lastErr = err
-			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
 				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
 			}
 			continue
@@ -362,7 +355,7 @@ func (d *Dialer) dialInitialPath(
 			state := pathStateForHandshakeError(err)
 			tracker.set(i, state, err)
 			lastErr = err
-			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
 				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
 			}
 			continue
@@ -373,7 +366,7 @@ func (d *Dialer) dialInitialPath(
 			_ = e.Close()
 			tracker.set(i, PathNative, err)
 			lastErr = err
-			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
+			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
 				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
 			}
 			continue
@@ -386,7 +379,7 @@ func (d *Dialer) dialInitialPath(
 	return PathSpec{}, -1, proto.HelloAckPayload{}, 0, errNoCompiledPath
 }
 
-func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
+func (d *sessionDialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
 	tracker.set(index, PathDialing, nil)
 	spc, err := resolver.dialPath(ctx, ps)
 	if err != nil {
@@ -411,7 +404,7 @@ func pathStateForHandshakeError(err error) PathState {
 	return PathNative
 }
 
-func (d *Dialer) helloCaps(packetMode bool) uint32 {
+func (d *sessionDialer) helloCaps(packetMode bool) uint32 {
 	var caps uint32
 	if packetMode {
 		caps |= proto.CapsPacketMode
@@ -422,10 +415,10 @@ func (d *Dialer) helloCaps(packetMode bool) uint32 {
 	return caps
 }
 
-// engineLimits packs the Dialer-side knobs into engine.Limits. The
+// engineLimits packs the session knobs into engine.Limits. The
 // engine clamps unset / out-of-range values back to project defaults
 // (90 s migration budget, 2 zombie migrations, 30 s cooldown, etc.).
-func (d *Dialer) engineLimits() engine.Limits {
+func (d *sessionDialer) engineLimits() engine.Limits {
 	runtimeConfig, err := normalizeRuntimeConfig(d.Runtime)
 	if err != nil {
 		runtimeConfig = DefaultRuntimeConfig()
@@ -440,8 +433,8 @@ func (d *Dialer) engineLimits() engine.Limits {
 		ZombieCooldown:         d.ZombieCooldown,
 		BondStuckRTTMultiplier: d.BondStuckRTTMultiplier,
 	}
-	// Transitional direct-Dialer fields remain effective until the D11 API
-	// deletion commit updates the legacy package tests.
+	// Transitional package-test knobs remain effective while the old direct
+	// constructor coverage is migrated to Runtime fixtures.
 	if d.MigrationBudget != 0 {
 		limits.MigrationBudget = d.MigrationBudget
 	}
@@ -459,7 +452,7 @@ func (d *Dialer) engineLimits() engine.Limits {
 
 // dialPath resolves spec to a transport.PathConn via the global
 // transport.Default registry. Used by post-dial paths (AddPath) that
-// don't have access to the originating Dialer's factory maps.
+// don't have access to the originating Runtime's factory snapshot.
 func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 	tp, err := transport.Default.Lookup(spec.Transport)
 	if err != nil {
@@ -469,8 +462,8 @@ func dialPath(ctx context.Context, spec PathSpec) (transport.PathConn, error) {
 }
 
 var (
-	errRootRequired   = errors.New("rendr: invalid Dialer config: Root target is required")
-	errNoCompiledPath = errors.New("rendr: invalid Dialer config: Root target contains no path leaves")
+	errRootRequired   = errors.New("rendr: invalid SessionConfig: Root target is required")
+	errNoCompiledPath = errors.New("rendr: invalid SessionConfig: Root target contains no path leaves")
 )
 
 // stringAddr is a trivial net.Addr for the application-facing

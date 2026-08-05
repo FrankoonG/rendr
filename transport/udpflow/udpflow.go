@@ -80,7 +80,7 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 // PathConn implements transport.PathConn over a connected datagram
 // socket. The conn field is typed net.Conn (not *net.UDPConn) so the
 // same struct can carry datagrams sourced from a vanilla UDP dial AND
-// from a user-supplied PacketPathFactory (which provides a
+// from a user-supplied Runtime PacketFactory (which provides a
 // net.PacketConn; we wrap it with packetAsConn into net.Conn shape).
 type PathConn struct {
 	conn   net.Conn
@@ -327,11 +327,11 @@ func init() {
 //
 // flowID is the 7-byte rendr UDP flow identifier embedded in every
 // outgoing datagram and validated on every inbound. The caller is
-// responsible for negotiating it out-of-band; the Dialer-side
-// PacketPathFactory codepath generates a random flow_id at session
+// responsible for negotiating it out-of-band; the Runtime PacketFactory
+// codepath generates a random flow_id at session
 // start and passes it through here.
 //
-// Used by rendr.Dialer to back PacketPathFactory paths. Production
+// Used by rendr.Runtime to back PacketFactory paths. Production
 // embedders MUST guarantee the returned net.PacketConn preserves
 // datagram boundaries and has an MTU sufficient for the rendr 8B
 // flow-id header plus expected payload (C2 packet-mode contract).
@@ -342,7 +342,7 @@ func Wrap(pc net.PacketConn, peer net.Addr, flowID [proto.UDPFlowIDSize]byte) *P
 	}
 }
 
-// WrapFromSpec is the common Dialer call site: resolve the peer addr
+// WrapFromSpec is the common Runtime session call site: resolve the peer addr
 // from spec.Address (must be host:port for UDP), pick or generate the
 // flow_id according to spec.Opts (same semantics as DialPath), and
 // hand back a ready-to-attach PathConn. The supplied net.PacketConn

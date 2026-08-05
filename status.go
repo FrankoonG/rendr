@@ -128,14 +128,14 @@ type StatusReporter interface {
 	Status() Status
 }
 
-type PrimaryPolicy string
+type primaryPolicy string
 
 const (
-	PrimaryPrefer  PrimaryPolicy = "prefer"
-	PrimaryRequire PrimaryPolicy = "require"
+	primaryPrefer  primaryPolicy = "prefer"
+	primaryRequire primaryPolicy = "require"
 )
 
-type RetryPolicy struct {
+type retryPolicy struct {
 	Enabled    bool
 	MinBackoff time.Duration
 	MaxBackoff time.Duration

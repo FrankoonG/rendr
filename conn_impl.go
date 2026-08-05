@@ -216,6 +216,6 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	return admission.PathID, nil
 }
 
-func (c *engineBackedConn) startPathRecovery(desired []PathSpec, retry RetryPolicy) {
+func (c *engineBackedConn) startPathRecovery(desired []PathSpec, retry retryPolicy) {
 	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }

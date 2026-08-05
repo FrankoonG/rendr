@@ -65,13 +65,23 @@ const (
 func (f CarrierFamily) valid() bool { return f <= CarrierUDP }
 
 type StreamFactory struct {
+	// Carrier reports the factual network family beneath Dial. It does not
+	// request a mobility backend or assert ownership of the returned socket.
 	Carrier CarrierFamily
-	Dial    func(context.Context, string) (net.Conn, error)
+	// Dial receives PathSpec.Address and must honor context cancellation. The
+	// returned connection must be an ordered byte stream terminating at the
+	// same rendr peer as every other leaf in the session.
+	Dial func(context.Context, string) (net.Conn, error)
 }
 
 type PacketFactory struct {
+	// Carrier reports the factual network family beneath Dial. It does not
+	// request a mobility backend or assert ownership of the returned socket.
 	Carrier CarrierFamily
-	Dial    func(context.Context, string) (net.PacketConn, error)
+	// Dial receives PathSpec.Address and must honor context cancellation. The
+	// returned connection must preserve datagram boundaries and provide an MTU
+	// sufficient for rendr flow framing plus the application's payload.
+	Dial func(context.Context, string) (net.PacketConn, error)
 }
 
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
@@ -165,7 +175,7 @@ func (r *Runtime) RegisterPacketFactory(name string, factory PacketFactory) erro
 	return nil
 }
 
-func (r *Runtime) sessionDialer(config SessionConfig) (*Dialer, error) {
+func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 	if r == nil {
 		return nil, fmt.Errorf("rendr: nil Runtime")
 	}
@@ -173,19 +183,19 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*Dialer, error) {
 		return nil, errRootRequired
 	}
 	r.mu.RLock()
-	streams := make(map[string]StreamPathFactory, len(r.streamFactories))
+	streams := make(map[string]streamPathFactory, len(r.streamFactories))
 	carriers := make(map[string]CarrierFamily, len(r.streamFactories)+len(r.packetFactories))
 	for name, factory := range r.streamFactories {
 		streams[name] = factory.Dial
 		carriers[name] = factory.Carrier
 	}
-	packets := make(map[string]PacketPathFactory, len(r.packetFactories))
+	packets := make(map[string]packetPathFactory, len(r.packetFactories))
 	for name, factory := range r.packetFactories {
 		packets[name] = factory.Dial
 		carriers[name] = factory.Carrier
 	}
 	r.mu.RUnlock()
-	return &Dialer{
+	return &sessionDialer{
 		Root:               config.Root,
 		Runtime:            r.config,
 		PreserveL3Identity: config.PreserveL3Identity,

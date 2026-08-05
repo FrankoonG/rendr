@@ -11,7 +11,7 @@ import (
 )
 
 // enginePacketConn is the concrete rendr.PacketConn returned by
-// Dialer.DialPacket and PacketListener.AcceptPacket. It wraps an
+// Runtime.DialPacket and SessionListener.AcceptPacket. It wraps an
 // engine in packet-boundary mode and exposes net.PacketConn plus the
 // rendr-specific Paths/FlowID/Status methods.
 //
@@ -174,7 +174,7 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	return admission.PathID, nil
 }
 
-func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry RetryPolicy) {
+func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry retryPolicy) {
 	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }
 

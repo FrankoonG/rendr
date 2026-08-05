@@ -7,7 +7,7 @@ import (
 
 // Transport is the factory for one kind of underlying network
 // path. Implementations are registered globally (or attached to a
-// Dialer/Listener) and looked up by Name().
+// Runtime/session listener) and looked up by Name().
 type Transport interface {
 	// Name is the identifier the embedder uses in PathSpec.Transport.
 	Name() string

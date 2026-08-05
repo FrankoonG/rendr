@@ -15,7 +15,7 @@ import (
 
 // ListenQUICDatagram starts a QUIC listener that accepts incoming
 // connections in DATAGRAM mode (RFC 9221). One DATAGRAM == one rendr
-// frame; no bidi stream is opened. Pair with Dialer.DialPacket and
+// frame; no bidi stream is opened. Pair with Runtime.DialPacket and
 // PathSpec.Opts["mode"]="datagram" on the client side.
 //
 // The server's engine is forced into packet mode regardless of the

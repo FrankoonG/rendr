@@ -33,7 +33,7 @@ func ListenGVisor(addr string) (Listener, error) {
 // ListenGVisorPacket starts a gVisor-netstack rendr listener whose
 // virtual link is carried over outer UDP datagrams. The returned
 // address is a real OS UDP address and can be used by a remote
-// Dialer path with Transport "gvisor".
+// Runtime session path with Transport "gvisor".
 func ListenGVisorPacket(addr string) (Listener, error) {
 	ln, err := gadapter.ListenPacket(addr)
 	if err != nil {

@@ -74,7 +74,7 @@ func newPathRecoverySupervisor(
 	addPath func(context.Context, PathSpec) (uint32, error),
 	desired []PathSpec,
 	tracker *pathStatusTracker,
-	retry RetryPolicy,
+	retry retryPolicy,
 ) *pathRecoverySupervisor {
 	if e == nil || addPath == nil {
 		return nil
