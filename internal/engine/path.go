@@ -74,7 +74,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	e.pathsMu.Unlock()
 	e.firePathDeathHooks(PathDeathEvent{
 		ID:   id,
-		Spec: slot.spec,
+		Spec: slot.spec.Clone(),
 		Binding: PathBinding{
 			LocalTXTargetID: slot.localTXTargetID,
 			PeerTXTargetID:  slot.peerTXTargetID,
@@ -105,7 +105,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 			_ = e.Close()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		if hasPaths && shouldReplay {
+		if shouldReplay {
 			e.requestReplay(e.sendAckNext.Load())
 		}
 		// Successful death-driven migration counts for zombie

@@ -27,6 +27,7 @@ type enginePacketConn struct {
 	peak     *peakTransferController
 	status   *pathStatusTracker
 	resolver *pathFactoryResolver
+	carriers map[string]CarrierFamily
 	graph    compiledTargetGraph
 	recovery *pathRecoverySupervisor
 
@@ -91,7 +92,7 @@ func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }
 func (c *enginePacketConn) FlowID() [16]byte  { return c.e.FlowID() }
 func (c *enginePacketConn) Status() Status {
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers)
 }
 
 func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
@@ -141,13 +142,21 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
 	spec, err = c.graph.resolvePathSpec(spec, c.e.Paths())
 	if err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
-	ack, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec))
+	ack, err := engine.PerformClientBridgeTagAckContext(ctx, pc, c.e, pathSpecName(spec))
 	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
@@ -164,8 +173,8 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	return id, nil
 }
 
-func (c *enginePacketConn) startPathRecovery() {
-	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath)
+func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry RetryPolicy) {
+	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }
 
 // Stats returns the same coherent snapshot as AdminConn.Stats does

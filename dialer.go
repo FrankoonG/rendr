@@ -164,7 +164,6 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		}
 		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
 		if err != nil {
-			d.startRetry(e, ps, i, tracker, resolver)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -178,8 +177,9 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	bc := newEngineBackedConn(e, c, mode)
 	bc.status = tracker
 	bc.resolver = resolver
+	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
-	bc.startPathRecovery()
+	bc.startPathRecovery(paths, d.Retry)
 
 	// Arm the selector scheduler now that all initial paths are
 	// attached. CLAUDE.md hard rule #3 keeps active migration
@@ -259,7 +259,6 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		}
 		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
 		if err != nil {
-			d.startRetry(e, ps, i, tracker, resolver)
 			continue
 		}
 		pathIDs = append(pathIDs, id)
@@ -270,8 +269,9 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
 	bc.status = tracker
 	bc.resolver = resolver
+	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
-	bc.startPathRecovery()
+	bc.startPathRecovery(paths, d.Retry)
 
 	if plan.peakTransfer {
 		bc.startPeakTransfer(plan, pathIDs)
@@ -424,7 +424,7 @@ func performClientHelloAckContext(
 ) (proto.HelloAckPayload, error) {
 	result := make(chan clientHelloResult, 1)
 	go func() {
-		ack, err := engine.PerformClientHelloAck(pc, e, instanceID, caps, name)
+		ack, err := engine.PerformClientHelloAckContext(ctx, pc, e, instanceID, caps, name)
 		result <- clientHelloResult{ack: ack, err: err}
 	}()
 	select {
@@ -444,7 +444,7 @@ func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathS
 		return 0, err
 	}
 	tracker.set(index, PathHandshaking, nil)
-	ack, err := engine.PerformClientBridgeTagAck(spc, e, pathSpecName(ps))
+	ack, err := engine.PerformClientBridgeTagAckContext(ctx, spc, e, pathSpecName(ps))
 	if err != nil {
 		_ = spc.Close()
 		tracker.set(index, pathStateForHandshakeError(err), err)
@@ -482,46 +482,6 @@ func pathStateForHandshakeError(err error) PathState {
 		return PathAttached
 	}
 	return PathNative
-}
-
-func (d *Dialer) startRetry(e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) {
-	if tracker == nil {
-		return
-	}
-	minBackoff := d.Retry.MinBackoff
-	if minBackoff <= 0 {
-		minBackoff = 500 * time.Millisecond
-	}
-	maxBackoff := d.Retry.MaxBackoff
-	if maxBackoff <= 0 {
-		maxBackoff = 5 * time.Second
-	}
-	if maxBackoff < minBackoff {
-		maxBackoff = minBackoff
-	}
-	go func() {
-		backoff := minBackoff
-		for {
-			timer := time.NewTimer(backoff)
-			select {
-			case <-e.Closed():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, err := d.attachExtraPath(ctx, e, ps, index, tracker, resolver)
-			cancel()
-			if err == nil {
-				return
-			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			tracker.set(index, PathPending, err)
-		}
-	}()
 }
 
 func (d *Dialer) helloCaps(packetMode bool) uint32 {

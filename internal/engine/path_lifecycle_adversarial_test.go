@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,6 +63,117 @@ func TestPreparedPathIsInvisibleUntilBridgeAckCommit(t *testing.T) {
 	}
 	if got := bCapture.dataSequences(); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("committed path DATA=%v, want [1]", got)
+	}
+}
+
+func TestSameLeafCommitSupersedesOnlyOlderGeneration(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+	)
+	e := New(SideServer, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	binding := PathBinding{LocalTXTargetID: ids["a"], PeerTXTargetID: ids["a"]}
+
+	oldBase, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	old := &observedClosePath{PathConn: oldBase}
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	staleBase, stalePeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = stalePeer.Close() })
+	stale := &observedClosePath{PathConn: staleBase}
+	staleID, err := e.PreparePathBound(stale, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerBase, winnerPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = winnerPeer.Close() })
+	winner := &observedClosePath{PathConn: winnerBase}
+	winnerID, err := e.PreparePathBound(winner, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if paths := e.Paths(); len(paths) != 1 || paths[0].ID != oldID {
+		t.Fatalf("pending replacements displaced old path before commit: %v", paths)
+	}
+	if err := e.CommitPathAttach(winnerID); err != nil {
+		t.Fatalf("commit winner: %v", err)
+	}
+	if err := e.CommitPathAttach(staleID); !errors.Is(err, ErrStalePathAttach) {
+		t.Fatalf("stale commit error = %v, want %v", err, ErrStalePathAttach)
+	}
+	if paths := e.Paths(); len(paths) != 1 || paths[0].ID != winnerID {
+		t.Fatalf("stale commit deleted winner: %v", paths)
+	}
+	if got := e.ActivePath(); got != winnerID {
+		t.Fatalf("active path = %d, want winner %d", got, winnerID)
+	}
+	deadline := time.Now().Add(time.Second)
+	for (!old.closed.Load() || !stale.closed.Load()) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !old.closed.Load() || !stale.closed.Load() {
+		t.Fatalf("superseded candidates closed old/stale = %t/%t, want true/true", old.closed.Load(), stale.closed.Load())
+	}
+	if winner.closed.Load() {
+		t.Fatal("stale commit closed the winning path")
+	}
+	if got := e.MigrationCount(); got != 1 {
+		t.Fatalf("same-leaf supersession migrations = %d, want 1", got)
+	}
+}
+
+func TestPathSpecOptsAreOwnedAcrossEngineBoundaries(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	path, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	spec := transport.PathSpec{Transport: "memory", Address: "snapshot", Opts: map[string]string{"token": "frozen"}}
+	id, err := e.AttachPath(path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.Opts["token"] = "caller-mutated"
+	first := e.Paths()
+	if got := first[0].Spec.Opts["token"]; got != "frozen" {
+		t.Fatalf("stored PathSpec option = %q, want frozen", got)
+	}
+	first[0].Spec.Opts["token"] = "snapshot-mutated"
+	if got := e.Paths()[0].Spec.Opts["token"]; got != "frozen" {
+		t.Fatalf("second PathSpec snapshot option = %q, want frozen", got)
+	}
+
+	mutated := make(chan struct{})
+	observed := make(chan string, 1)
+	e.OnPathDeath(func(event PathDeathEvent) {
+		event.Spec.Opts["token"] = "hook-mutated"
+		close(mutated)
+	})
+	e.OnPathDeath(func(event PathDeathEvent) {
+		<-mutated
+		observed <- event.Spec.Opts["token"]
+	})
+	if err := e.ForceKillPathForTest(id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-observed:
+		if got != "frozen" {
+			t.Fatalf("death hook PathSpec option = %q, want frozen", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("death hook snapshots were not delivered")
 	}
 }
 

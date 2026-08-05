@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -31,6 +32,16 @@ type txAdversarialPath struct {
 	writeMu sync.Mutex
 	writes  [][]byte
 	writeFn func([]byte) (int, error)
+}
+
+type txAdversarialGatedReadPath struct {
+	transport.PathConn
+	gate <-chan struct{}
+}
+
+func (p *txAdversarialGatedReadPath) Read(buf []byte) (int, error) {
+	<-p.gate
+	return p.PathConn.Read(buf)
 }
 
 func newTxAdversarialPath() *txAdversarialPath {
@@ -333,5 +344,84 @@ func TestTxAdversarialOneShotReplayWriteFailureRetriesWithoutTraffic(t *testing.
 	case <-replaySucceeded:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("one-shot replay failure was not retried; DATA attempts = %d", dataAttempts.Load())
+	}
+}
+
+func TestTxAdversarialSolePathRecoveryDeliversLastUnackedTail(t *testing.T) {
+	flow := NewClientFlowID()
+	client := New(SideClient, flow, Limits{}.Clamp())
+	server := New(SideServer, flow, Limits{}.Clamp())
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	oldClient, oldServer := newMemoryPathPair()
+	oldClient.dropWrites.Store(true)
+	oldClientID, err := client.AttachPath(oldClient, transport.PathSpec{Transport: "memory", Address: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldServerID, err := server.AttachPath(oldServer, transport.PathSpec{Transport: "memory", Address: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tail := []byte("last-unacknowledged-tail")
+	if _, err := client.SendData(tail); err != nil {
+		t.Fatalf("publish tail: %v", err)
+	}
+	if err := client.ForceKillPathForTest(oldClientID); err != nil {
+		t.Fatalf("kill client path: %v", err)
+	}
+	if err := server.ForceKillPathForTest(oldServerID); err != nil {
+		t.Fatalf("kill server path: %v", err)
+	}
+
+	newClient, newServer := newMemoryPathPair()
+	readGate := make(chan struct{})
+	var releaseGate sync.Once
+	releaseRead := func() { releaseGate.Do(func() { close(readGate) }) }
+	defer releaseRead()
+	if _, err := server.AttachPath(&txAdversarialGatedReadPath{PathConn: newServer, gate: readGate}, transport.PathSpec{Transport: "memory", Address: "replacement"}); err != nil {
+		t.Fatalf("attach server replacement: %v", err)
+	}
+	if _, err := client.AttachPath(newClient, transport.PathSpec{Transport: "memory", Address: "replacement"}); err != nil {
+		t.Fatalf("attach client replacement: %v", err)
+	}
+	if got := client.MigrationCount(); got != 1 {
+		t.Fatalf("client recovery migrations = %d, want 1", got)
+	}
+	if got := server.MigrationCount(); got != 1 {
+		t.Fatalf("server recovery migrations = %d, want 1", got)
+	}
+	client.zombieMu.Lock()
+	clientZombieLeft := client.zombieLeft
+	client.zombieMu.Unlock()
+	server.zombieMu.Lock()
+	serverZombieLeft := server.zombieLeft
+	server.zombieMu.Unlock()
+	wantZombieLeft := client.limits.ZombieMaxMigrations - 1
+	if clientZombieLeft != wantZombieLeft || serverZombieLeft != wantZombieLeft {
+		t.Fatalf("zombie accounting client/server = %d/%d, want %d/%d", clientZombieLeft, serverZombieLeft, wantZombieLeft, wantZombieLeft)
+	}
+	releaseRead()
+
+	got := make([]byte, len(tail))
+	recvDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(&Conn{E: server}, got)
+		recvDone <- err
+	}()
+	select {
+	case err := <-recvDone:
+		if err != nil {
+			t.Fatalf("receive replayed tail: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("last unacknowledged tail was not replayed after sole-path recovery")
+	}
+	if !bytes.Equal(got, tail) {
+		t.Fatalf("replayed tail = %q, want %q", got, tail)
 	}
 }

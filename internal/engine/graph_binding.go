@@ -242,6 +242,27 @@ func (e *Engine) validatePathBinding(binding PathBinding) error {
 // AcceptPeerNegotiation validates the peer's directional declaration and
 // freezes it before any path reader can publish sequenced frames.
 func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
+	if err := e.ValidatePeerNegotiation(peer, manifest); err != nil {
+		return err
+	}
+	if err := e.ConfigurePeerGraph(peer.GraphRevision, manifest); err != nil {
+		return err
+	}
+	e.graphMu.Lock()
+	if e.peerNegotiationSet && e.peerNegotiation != peer {
+		e.graphMu.Unlock()
+		return fmt.Errorf("engine: peer negotiation changed")
+	}
+	e.peerNegotiation = peer
+	e.peerNegotiationSet = true
+	e.graphMu.Unlock()
+	return nil
+}
+
+// ValidatePeerNegotiation checks an admission retry without mutating receive
+// state. Once HELLO has frozen a peer, retries must be byte-semantically
+// identical even after DATA has started flowing.
+func (e *Engine) ValidatePeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
 	local := e.LocalNegotiation()
 	if peer.ProtocolMajor != local.ProtocolMajor {
 		return fmt.Errorf("engine: protocol major mismatch: local=%d peer=%d", local.ProtocolMajor, peer.ProtocolMajor)
@@ -265,7 +286,19 @@ func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.Gr
 	if digest != peer.GraphDigest {
 		return fmt.Errorf("engine: peer graph digest mismatch")
 	}
-	return e.ConfigurePeerGraph(peer.GraphRevision, manifest)
+	e.graphMu.RLock()
+	configured := e.peerGraph.configured
+	current := e.peerGraph
+	frozen := e.peerNegotiation
+	frozenSet := e.peerNegotiationSet
+	e.graphMu.RUnlock()
+	if configured && (current.revision != peer.GraphRevision || current.digest != digest) {
+		return fmt.Errorf("engine: peer graph binding changed")
+	}
+	if frozenSet && frozen != peer {
+		return fmt.Errorf("engine: peer negotiation changed")
+	}
+	return nil
 }
 
 // MirrorPeerGraphForLocal is the listener default until an embedder supplies

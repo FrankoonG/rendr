@@ -20,6 +20,20 @@ type PathSpec struct {
 	Weight uint16
 }
 
+// Clone returns an owned snapshot of the path specification. Opts is opaque to
+// the engine, but it is still mutable caller-owned state and must not cross an
+// asynchronous engine boundary by reference.
+func (s PathSpec) Clone() PathSpec {
+	clone := s
+	if s.Opts != nil {
+		clone.Opts = make(map[string]string, len(s.Opts))
+		for key, value := range s.Opts {
+			clone.Opts[key] = value
+		}
+	}
+	return clone
+}
+
 // PathInfo is the engine's read-only snapshot of one attached path.
 //
 // Reads / Writes are cumulative frame counters; transports that

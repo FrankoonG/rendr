@@ -15,10 +15,32 @@ import (
 type Runtime struct {
 	config     RuntimeConfig
 	instanceID InstanceID
+	bridges    *engine.BridgeTable
 
 	mu              sync.RWMutex
 	streamFactories map[string]StreamFactory
 	packetFactories map[string]PacketFactory
+
+	listenMu sync.Mutex
+	listener *SessionListener
+}
+
+func (r *Runtime) claimListener(listener *SessionListener) error {
+	r.listenMu.Lock()
+	defer r.listenMu.Unlock()
+	if r.listener != nil {
+		return fmt.Errorf("rendr: Runtime already has an active SessionListener")
+	}
+	r.listener = listener
+	return nil
+}
+
+func (r *Runtime) releaseListener(listener *SessionListener) {
+	r.listenMu.Lock()
+	if r.listener == listener {
+		r.listener = nil
+	}
+	r.listenMu.Unlock()
 }
 
 // SessionConfig describes one stream or packet session. Root is mandatory.
@@ -60,6 +82,7 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 	return &Runtime{
 		config:          normalized,
 		instanceID:      engine.NewInstanceID(),
+		bridges:         engine.NewBridgeTable(),
 		streamFactories: make(map[string]StreamFactory),
 		packetFactories: make(map[string]PacketFactory),
 	}, nil
@@ -171,4 +194,17 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*Dialer, error) {
 		packetFactories:    packets,
 		factoryCarriers:    carriers,
 	}, nil
+}
+
+func (r *Runtime) engineLimits() engine.Limits {
+	if r == nil {
+		return engine.Limits{}
+	}
+	return engine.Limits{
+		MigrationBudget:      r.config.Recovery.MigrationBudget,
+		SelectorHysteresis:   r.config.Selector.LatencyBandRatio,
+		SelectorLatencyFloor: r.config.Selector.LatencyBandFloor,
+		SelectorDwell:        r.config.Selector.QualityDwell,
+		SelectorCooldown:     r.config.Selector.QualityCooldown,
+	}
 }

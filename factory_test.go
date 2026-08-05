@@ -268,7 +268,10 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: transportName, Address: ln.Addr().String()}})}
+	d := &Dialer{Root: selectorRoot([]PathSpec{
+		{Transport: transportName, Address: ln.Addr().String()},
+		{Transport: transportName, Address: ln.Addr().String()},
+	})}
 	if err := d.AddStreamPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
 	}
@@ -279,6 +282,13 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	defer client.Close()
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
+	waitFactoryPathCount(t, client, server, 2)
+	admin := client.(AdminConn)
+	removeID := inactiveFactoryPathID(t, client.Paths())
+	if err := admin.RemovePath(removeID); err != nil {
+		t.Fatalf("RemovePath before snapshot AddPath: %v", err)
+	}
+	waitFactoryClientPathCount(t, client, 1)
 
 	// Replace the original Dialer's map after Dial. The live session must not
 	// share this map or consult it again.
@@ -295,13 +305,12 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	admin := client.(AdminConn)
 	if _, err := admin.AddPath(PathSpec{Transport: transportName, Address: ln.Addr().String()}); err != nil {
 		t.Fatalf("AddPath through captured stream factory: %v", err)
 	}
 	waitFactoryPathCount(t, client, server, 2)
-	if got := originalCalls.Load(); got != 2 {
-		t.Fatalf("original stream factory calls=%d, want 2", got)
+	if got := originalCalls.Load(); got != 3 {
+		t.Fatalf("original stream factory calls=%d, want 3", got)
 	}
 	if got := mutatedCalls.Load(); got != 0 {
 		t.Fatalf("mutated stream factory calls=%d, want 0", got)
@@ -331,7 +340,10 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		originalCalls.Add(1)
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
-	d := &Dialer{Root: selectorRoot([]PathSpec{{Transport: transportName, Address: ln.Addr().String()}})}
+	d := &Dialer{Root: selectorRoot([]PathSpec{
+		{Transport: transportName, Address: ln.Addr().String()},
+		{Transport: transportName, Address: ln.Addr().String()},
+	})}
 	if err := d.AddPacketPathFactory(transportName, original); err != nil {
 		t.Fatal(err)
 	}
@@ -342,6 +354,13 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	defer client.Close()
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
+	waitFactoryPathCount(t, client, server, 2)
+	admin := client.(AdminPacketConn)
+	removeID := inactiveFactoryPathID(t, client.Paths())
+	if err := admin.RemovePath(removeID); err != nil {
+		t.Fatalf("RemovePath before snapshot AddPath: %v", err)
+	}
+	waitFactoryClientPathCount(t, client, 1)
 
 	d.packetFactories = map[string]PacketPathFactory{
 		transportName: func(context.Context, string) (net.PacketConn, error) {
@@ -356,13 +375,12 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	admin := client.(AdminPacketConn)
 	if _, err := admin.AddPath(PathSpec{Transport: transportName, Address: ln.Addr().String()}); err != nil {
 		t.Fatalf("AddPath through captured packet factory: %v", err)
 	}
 	waitFactoryPathCount(t, client, server, 2)
-	if got := originalCalls.Load(); got != 2 {
-		t.Fatalf("original packet factory calls=%d, want 2", got)
+	if got := originalCalls.Load(); got != 3 {
+		t.Fatalf("original packet factory calls=%d, want 3", got)
 	}
 	if got := mutatedCalls.Load(); got != 0 {
 		t.Fatalf("mutated packet factory calls=%d, want 0", got)
@@ -536,6 +554,29 @@ func waitFactoryPathCount(t *testing.T, client, server factoryPathSnapshot, want
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("paths did not reach %d: client=%d server=%d", want, len(client.Paths()), len(server.Paths()))
+}
+
+func waitFactoryClientPathCount(t *testing.T, client factoryPathSnapshot, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.Paths()) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("client paths did not reach %d: got %d", want, len(client.Paths()))
+}
+
+func inactiveFactoryPathID(t *testing.T, paths []PathInfo) uint32 {
+	t.Helper()
+	for _, path := range paths {
+		if !path.Active {
+			return path.ID
+		}
+	}
+	t.Fatal("factory snapshot test has no inactive path")
+	return 0
 }
 
 func assertFactoryStreamRoundTrip(t *testing.T, client, server Conn, payload string) {

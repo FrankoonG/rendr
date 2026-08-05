@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
@@ -55,6 +57,38 @@ func PerformClientHelloAck(pc transport.PathConn, e *Engine, instanceID proto.In
 	return ack, nil
 }
 
+type helloAckResult struct {
+	ack proto.HelloAckPayload
+	err error
+}
+
+// PerformClientHelloAckContext gives initial admission the same cancellation
+// contract as replacement attachment. Closing the candidate unblocks the
+// framed read when the caller or session terminates.
+func PerformClientHelloAckContext(ctx context.Context, pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32, name string) (proto.HelloAckPayload, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pc == nil || e == nil {
+		return proto.HelloAckPayload{}, errors.New("engine: nil hello handshake participant")
+	}
+	result := make(chan helloAckResult, 1)
+	go func() {
+		ack, err := PerformClientHelloAck(pc, e, instanceID, caps, name)
+		result <- helloAckResult{ack: ack, err: err}
+	}()
+	select {
+	case value := <-result:
+		return value.ack, value.err
+	case <-ctx.Done():
+		_ = pc.Close()
+		return proto.HelloAckPayload{}, ctx.Err()
+	case <-e.Closed():
+		_ = pc.Close()
+		return proto.HelloAckPayload{}, net.ErrClosed
+	}
+}
+
 func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (proto.BridgeAckPayload, error) {
 	targetID, err := e.LocalPathTargetID(name)
 	if err != nil {
@@ -97,6 +131,39 @@ func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (p
 		return ack, fmt.Errorf("engine: BRIDGE_ACK responder target: %w", err)
 	}
 	return ack, nil
+}
+
+type bridgeAckResult struct {
+	ack proto.BridgeAckPayload
+	err error
+}
+
+// PerformClientBridgeTagAckContext bounds a replacement handshake by both the
+// caller's attempt context and the session lifecycle. Closing the candidate is
+// what unblocks arbitrary PathConn implementations whose Read has no context
+// surface; recovery can then retry with a fresh carrier.
+func PerformClientBridgeTagAckContext(ctx context.Context, pc transport.PathConn, e *Engine, name string) (proto.BridgeAckPayload, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pc == nil || e == nil {
+		return proto.BridgeAckPayload{}, errors.New("engine: nil bridge handshake participant")
+	}
+	result := make(chan bridgeAckResult, 1)
+	go func() {
+		ack, err := PerformClientBridgeTagAck(pc, e, name)
+		result <- bridgeAckResult{ack: ack, err: err}
+	}()
+	select {
+	case value := <-result:
+		return value.ack, value.err
+	case <-ctx.Done():
+		_ = pc.Close()
+		return proto.BridgeAckPayload{}, ctx.Err()
+	case <-e.Closed():
+		_ = pc.Close()
+		return proto.BridgeAckPayload{}, net.ErrClosed
+	}
 }
 
 func PerformHelloAck(pc transport.PathConn, e *Engine, instanceID proto.InstanceID, caps uint32, localTargetID, acceptedPeerTargetID proto.TargetID) error {

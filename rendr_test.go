@@ -2947,8 +2947,12 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 		dispatches[path.ID] = delta
 		total += delta
 	}
-	if total != N {
-		t.Fatalf("bond DATA dispatch total=%d want %d; per-path=%v", total, N, dispatches)
+	// DATA may be replayed after a legitimate bond reordering gap. The
+	// application-level byte comparison above proves unique delivery; here we
+	// bound replay amplification instead of pretending one application write
+	// must always equal one physical dispatch.
+	if total < N || total > 2*N {
+		t.Fatalf("bond DATA dispatch total=%d outside [%d,%d]; per-path=%v", total, N, 2*N, dispatches)
 	}
 	for _, probe := range probes {
 		if dispatches[probe.id] == 0 {

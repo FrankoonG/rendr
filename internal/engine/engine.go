@@ -45,22 +45,24 @@ const (
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side           Side
-	flowID         [16]byte
-	limits         Limits
-	peerCaps       atomic.Uint32
-	localInstance  proto.InstanceID
-	peerInstance   proto.InstanceID
-	peerKind       atomic.Uint32
-	state          atomic.Uint32 // BridgeState
-	graphMu        sync.RWMutex
-	localGraph     graphBinding
-	peerGraph      graphBinding
-	localExec      *executionRuntime
-	attachMu       sync.Mutex
-	seenAttach     map[[16]byte]struct{}
-	seenAttachFIFO [][16]byte
-	created        time.Time
+	side               Side
+	flowID             [16]byte
+	limits             Limits
+	peerCaps           atomic.Uint32
+	localInstance      proto.InstanceID
+	peerInstance       proto.InstanceID
+	peerKind           atomic.Uint32
+	state              atomic.Uint32 // BridgeState
+	graphMu            sync.RWMutex
+	localGraph         graphBinding
+	peerGraph          graphBinding
+	localExec          *executionRuntime
+	peerNegotiation    proto.Negotiation
+	peerNegotiationSet bool
+	attachMu           sync.Mutex
+	seenAttach         map[[16]byte]struct{}
+	seenAttachFIFO     [][16]byte
+	created            time.Time
 
 	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
@@ -230,6 +232,8 @@ type PathDeathEvent struct {
 	Cause   transport.DeathCause
 	Err     error
 }
+
+var ErrStalePathAttach = errors.New("engine: stale path attach generation")
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
@@ -523,7 +527,7 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		id:              id,
 		gen:             e.nextPathGenerationLocked(),
 		conn:            pc,
-		spec:            spec,
+		spec:            spec.Clone(),
 		localTXTargetID: binding.LocalTXTargetID,
 		peerTXTargetID:  binding.PeerTXTargetID,
 		attached:        time.Now(),
@@ -539,6 +543,11 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 
 // CommitPathAttach publishes a prepared path and starts its data-plane loops.
 func (e *Engine) CommitPathAttach(id uint32) error {
+	var (
+		retired       []*pathSlot
+		oldActive     uint32
+		recoveryEvent bool
+	)
 	e.pathsMu.Lock()
 	slot := e.pendingPaths[id]
 	if slot == nil {
@@ -551,13 +560,45 @@ func (e *Engine) CommitPathAttach(id uint32) error {
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
+	for existingID, existing := range e.paths {
+		if !sameBoundLeaf(slot, existing) {
+			continue
+		}
+		if existing.gen >= slot.gen {
+			delete(e.pendingPaths, id)
+			e.pathsMu.Unlock()
+			_ = slot.conn.Close()
+			return fmt.Errorf("%w: pending=%d winner=%d", ErrStalePathAttach, slot.gen, existing.gen)
+		}
+		existing.maintenance.Store(true)
+		existing.closeQuit()
+		delete(e.paths, existingID)
+		if e.dispatchScope[existingID] {
+			delete(e.dispatchScope, existingID)
+			e.dispatchScope[id] = true
+		}
+		retired = append(retired, existing)
+	}
 	delete(e.pendingPaths, id)
+	oldActive = e.activeID
 	e.paths[id] = slot
 	if e.activeID == 0 {
 		e.activeID = id
+		recoveryEvent = e.State() == BridgeMigrating
 		if e.State() == BridgeInit || e.State() == BridgeMigrating {
 			e.setState(BridgeActive)
 		}
+	} else {
+		for _, existing := range retired {
+			if existing.id == e.activeID {
+				e.activeID = id
+				recoveryEvent = true
+				break
+			}
+		}
+	}
+	if recoveryEvent {
+		e.migrationCount++
 	}
 	e.pathsMu.Unlock()
 
@@ -568,7 +609,33 @@ func (e *Engine) CommitPathAttach(id uint32) error {
 	go e.readerLoop(slot)
 	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
+	for _, existing := range retired {
+		go e.retireSupersededPath(existing)
+	}
+	if recoveryEvent {
+		e.fireMigrateHooks(oldActive, id, "recovery")
+		e.recordMigration()
+	}
+	if len(retired) != 0 {
+		e.requestReplay(e.sendAckNext.Load())
+	}
 	return nil
+}
+
+func sameBoundLeaf(a, b *pathSlot) bool {
+	if a == nil || b == nil || a.localTXTargetID == (proto.TargetID{}) || a.peerTXTargetID == (proto.TargetID{}) {
+		return false
+	}
+	return a.localTXTargetID == b.localTXTargetID && a.peerTXTargetID == b.peerTXTargetID
+}
+
+func (e *Engine) retireSupersededPath(slot *pathSlot) {
+	_ = slot.conn.Close()
+	select {
+	case <-slot.doneR:
+	case <-time.After(pathCloseTimeout):
+	}
+	e.drainDeadSlot(slot)
 }
 
 func (e *Engine) nextPathGenerationLocked() uint64 {
@@ -647,7 +714,7 @@ func (e *Engine) Paths() []transport.PathInfo {
 	for _, s := range e.paths {
 		pi := transport.PathInfo{
 			ID:      s.id,
-			Spec:    s.spec,
+			Spec:    s.spec.Clone(),
 			Quality: s.conn.Quality(),
 			Since:   s.attached,
 			Active:  s.id == e.activeID,
@@ -1274,7 +1341,9 @@ func (e *Engine) firePathDeathHooks(event PathDeathEvent) {
 	}
 	e.pathsMu.RUnlock()
 	for _, hook := range hooks {
-		go hook(event)
+		snapshot := event
+		snapshot.Spec = event.Spec.Clone()
+		go hook(snapshot)
 	}
 }
 

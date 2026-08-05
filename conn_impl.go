@@ -22,6 +22,7 @@ type engineBackedConn struct {
 	peak     *peakTransferController
 	status   *pathStatusTracker
 	resolver *pathFactoryResolver
+	carriers map[string]CarrierFamily
 	graph    compiledTargetGraph
 	recovery *pathRecoverySupervisor
 }
@@ -77,7 +78,7 @@ func (c *engineBackedConn) Paths() []PathInfo {
 func (c *engineBackedConn) FlowID() [16]byte { return c.e.FlowID() }
 
 func (c *engineBackedConn) Status() Status {
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status)
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers)
 }
 
 func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
@@ -179,13 +180,21 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
 	spec, err = c.graph.resolvePathSpec(spec, c.e.Paths())
 	if err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
-	ack, err := engine.PerformClientBridgeTagAck(pc, c.e, pathSpecName(spec))
+	ack, err := engine.PerformClientBridgeTagAckContext(ctx, pc, c.e, pathSpecName(spec))
 	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
@@ -202,6 +211,6 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	return id, nil
 }
 
-func (c *engineBackedConn) startPathRecovery() {
-	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath)
+func (c *engineBackedConn) startPathRecovery(desired []PathSpec, retry RetryPolicy) {
+	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }

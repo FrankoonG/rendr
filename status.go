@@ -117,6 +117,7 @@ const (
 type PathStatus struct {
 	ID        uint32
 	Name      string
+	Carrier   CarrierFamily
 	State     PathState
 	Active    bool
 	Mobility  MobilityStatus
@@ -216,9 +217,13 @@ func (t *pathStatusTracker) setMobility(index int, mobility MobilityStatus) {
 	t.mu.Unlock()
 }
 
-func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
+func (t *pathStatusTracker) snapshot(attached []PathInfo, carrierMaps ...map[string]CarrierFamily) []PathStatus {
 	if t == nil {
 		return nil
+	}
+	var carriers map[string]CarrierFamily
+	if len(carrierMaps) != 0 {
+		carriers = carrierMaps[0]
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -228,11 +233,12 @@ func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
 	for _, tracked := range t.paths {
 		if idx := matchAttachedPath(tracked.spec, attached, used); idx >= 0 {
 			used[idx] = true
-			out = append(out, pathStatusFromInfo(attached[idx], tracked.mobility))
+			out = append(out, pathStatusFromInfo(attached[idx], tracked.mobility, carriers))
 			continue
 		}
 		out = append(out, PathStatus{
 			Name:      pathSpecName(tracked.spec),
+			Carrier:   carrierForPathSpec(tracked.spec, carriers),
 			State:     tracked.state,
 			Mobility:  tracked.mobility,
 			LastError: tracked.lastError,
@@ -240,7 +246,7 @@ func (t *pathStatusTracker) snapshot(attached []PathInfo) []PathStatus {
 	}
 	for i, p := range attached {
 		if !used[i] {
-			out = append(out, pathStatusFromInfo(p, MobilityStatus{}))
+			out = append(out, pathStatusFromInfo(p, MobilityStatus{}, carriers))
 		}
 	}
 	return out
@@ -258,17 +264,18 @@ func matchAttachedPath(spec PathSpec, attached []PathInfo, used []bool) int {
 	return -1
 }
 
-func pathStatusFromInfo(p PathInfo, mobility MobilityStatus) PathStatus {
+func pathStatusFromInfo(p PathInfo, mobility MobilityStatus, carriers map[string]CarrierFamily) PathStatus {
 	return PathStatus{
 		ID:       p.ID,
 		Name:     pathSpecName(p.Spec),
+		Carrier:  carrierForPathSpec(p.Spec, carriers),
 		State:    PathAttached,
 		Active:   p.Active,
 		Mobility: mobility,
 	}
 }
 
-func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker) Status {
+func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carriers map[string]CarrierFamily) Status {
 	local, _ := ProbeLocal(context.Background())
 	peerKind := PeerUnknown
 	switch e.PeerKind() {
@@ -279,11 +286,11 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker) Stat
 	default:
 	}
 	paths := e.Paths()
-	out := tracker.snapshot(paths)
+	out := tracker.snapshot(paths, carriers)
 	if out == nil {
 		out = make([]PathStatus, 0, len(paths))
 		for _, p := range paths {
-			out = append(out, pathStatusFromInfo(p, MobilityStatus{}))
+			out = append(out, pathStatusFromInfo(p, MobilityStatus{}, carriers))
 		}
 	}
 	return Status{
@@ -294,6 +301,13 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker) Stat
 		Peer:     peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
 		Paths:    out,
 	}
+}
+
+func carrierForPathSpec(spec PathSpec, carriers map[string]CarrierFamily) CarrierFamily {
+	if carriers == nil {
+		return CarrierUnknown
+	}
+	return carriers[spec.Transport]
 }
 
 func sessionProtocolForEngine(e *engine.Engine) SessionProtocol {
