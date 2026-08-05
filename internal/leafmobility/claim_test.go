@@ -28,8 +28,8 @@ func TestEnumValuesStable(t *testing.T) {
 		{"SessionStream", uint64(SessionStream), 1},
 		{"SessionPacket", uint64(SessionPacket), 2},
 		{"OperationTCPRepair", uint64(OperationTCPRepair), 1},
-		{"OperationUDPFlowRebind", uint64(OperationUDPFlowRebind), 2},
-		{"OperationQUICCIDRebind", uint64(OperationQUICCIDRebind), 4},
+		{"OperationQUICCIDRebind", uint64(OperationQUICCIDRebind), 2},
+		{"OperationUDPFlowRebind", uint64(OperationUDPFlowRebind), 4},
 		{"OperationGVisorLinkRebind", uint64(OperationGVisorLinkRebind), 8},
 	}
 	for _, test := range tests {
@@ -93,6 +93,18 @@ func TestNewClaimAcceptsAnySessionAndNoOperations(t *testing.T) {
 	facts.Operations = 0
 	if _, err := NewClaim(facts); err != nil {
 		t.Fatalf("NewClaim() error = %v", err)
+	}
+}
+
+func TestNewClaimRejectsOperationWithoutDriver(t *testing.T) {
+	facts := testFacts()
+	facts.Operations = OperationTCPRepair
+	claim, err := NewClaim(facts)
+	if !errors.Is(err, ErrDriverRequired) {
+		t.Fatalf("NewClaim error=%v want=%v", err, ErrDriverRequired)
+	}
+	if claim != nil {
+		t.Fatal("unbacked operation returned a claim")
 	}
 }
 
@@ -308,7 +320,6 @@ func testFacts() Facts {
 		Role:       RoleDialer,
 		Scope:      ScopeEndpoint,
 		Session:    SessionStream,
-		Operations: OperationTCPRepair,
 		Generation: 7,
 	}
 }

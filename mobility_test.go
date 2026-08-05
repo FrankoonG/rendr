@@ -107,7 +107,6 @@ func TestRetiredEndpointCannotContributeOwnershipEvidence(t *testing.T) {
 		Role:       leafmobility.RoleDialer,
 		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionStream,
-		Operations: leafmobility.OperationTCPRepair,
 		Generation: leafmobility.NextGeneration(),
 	})
 	claim.RetireUnbound()

@@ -328,7 +328,7 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 		return fmt.Errorf("engine: terminal admission transaction did not follow predecessor")
 	}
 	e.pathsMu.Unlock()
-	go e.retireSupersededPath(current)
+	e.retirePathAsync(current)
 	e.requestReplay(e.sendAckNext.Load())
 	if wasActive {
 		e.fireMigrateHooks(current.id, predecessor.id, "admission-terminal-route")
@@ -634,7 +634,7 @@ func (e *Engine) finishCompletedPathAdmissionPromotion(promotion completedPathAd
 	if promotion.retired == nil {
 		return
 	}
-	go e.retireSupersededPath(promotion.retired)
+	e.retirePathAsync(promotion.retired)
 	e.requestReplay(e.sendAckNext.Load())
 	if promotion.migrated {
 		e.fireMigrateHooks(promotion.oldPathID, promotion.newPathID, "admission-terminal-replay-route")

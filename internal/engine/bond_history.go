@@ -102,6 +102,20 @@ func (e *Engine) sendHistorySnapshot(ackNext uint64) [][]byte {
 	return out
 }
 
+func (e *Engine) sendHistoryFrame(seq uint64) []byte {
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	for _, entry := range e.sendHist.entries {
+		if entry.seq == seq {
+			return append([]byte(nil), entry.frame...)
+		}
+		if entry.seq > seq {
+			break
+		}
+	}
+	return nil
+}
+
 // acknowledgeSendFrames releases every contiguous replay entry below nextSeq.
 // It reports whether the ACK proves delivery of application payload; control
 // progress alone must not refresh zombie protection.

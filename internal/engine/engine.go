@@ -47,26 +47,28 @@ const (
 // Engine is the per-Conn migration engine. One Engine backs one
 // application-visible rendr.Conn.
 type Engine struct {
-	side                Side
-	flowID              [16]byte
-	limits              Limits
-	peerCaps            atomic.Uint32
-	localInstance       proto.InstanceID
-	peerInstance        proto.InstanceID
-	peerKind            atomic.Uint32
-	state               atomic.Uint32 // BridgeState
-	graphMu             sync.RWMutex
-	localGraph          graphBinding
-	peerGraph           graphBinding
-	localExec           *executionRuntime
-	localNegotiation    proto.Negotiation
-	localNegotiationSet bool
-	peerNegotiation     proto.Negotiation
-	peerNegotiationSet  bool
-	attachMu            sync.Mutex
-	seenAttach          map[[16]byte]struct{}
-	seenAttachFIFO      [][16]byte
-	created             time.Time
+	side                    Side
+	flowID                  [16]byte
+	limits                  Limits
+	peerCaps                atomic.Uint32
+	localInstance           proto.InstanceID
+	peerInstance            proto.InstanceID
+	peerKind                atomic.Uint32
+	state                   atomic.Uint32 // BridgeState
+	graphMu                 sync.RWMutex
+	localGraph              graphBinding
+	peerGraph               graphBinding
+	localExec               *executionRuntime
+	localMobilitySupport    proto.LeafMobilitySet
+	localMobilitySupportSet bool
+	localNegotiation        proto.Negotiation
+	localNegotiationSet     bool
+	peerNegotiation         proto.Negotiation
+	peerNegotiationSet      bool
+	attachMu                sync.Mutex
+	seenAttach              map[[16]byte]struct{}
+	seenAttachFIFO          [][16]byte
+	created                 time.Time
 
 	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
 	// Loaded by dispatch() to decide single-path vs all-paths send.
@@ -137,7 +139,16 @@ type Engine struct {
 	terminalOnce      sync.Once
 	terminalDone      chan struct{}
 	terminalErr       error
-	replayRequests    chan uint64
+	replayMu          sync.Mutex
+	replayPending     replayRequest
+	replayPendingSet  bool
+	replayAckNext     uint64
+	replayAckGap      bool
+	replayAckSeen     bool
+	replayAckVersion  uint64
+	replayWake        chan struct{}
+	replayAckWake     chan struct{}
+	gapReplayBackoff  time.Duration
 	ackMu             sync.Mutex
 	ackPending        *ackRequest
 	ackWake           chan struct{}
@@ -541,7 +552,9 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		policyReplayDigests:     make(map[uint64]proto.FrameDigest),
 		sendSlots:               make(chan struct{}, sendHistoryWindow),
 		sendControlSlots:        make(chan struct{}, sendControlReserve),
-		replayRequests:          make(chan uint64, 1),
+		replayWake:              make(chan struct{}, 1),
+		replayAckWake:           make(chan struct{}, 1),
+		gapReplayBackoff:        10 * time.Millisecond,
 		ackWake:                 make(chan struct{}, 1),
 		policyInbox:             make(chan policyMessage, 64),
 		policySendGate:          make(chan struct{}, 1),
@@ -1011,7 +1024,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
 	for _, existing := range retired {
-		go e.retireSupersededPath(existing)
+		e.retirePathAsync(existing)
 	}
 	if recoveryEvent {
 		e.fireMigrateHooks(oldActive, id, "recovery")
@@ -1095,7 +1108,7 @@ func (e *Engine) releasePathPredecessorsLocked(successorID uint32, successorGen 
 
 func (e *Engine) retirePathSet(retired []*pathSlot) {
 	for _, predecessor := range retired {
-		go e.retireSupersededPath(predecessor)
+		e.retirePathAsync(predecessor)
 	}
 }
 
@@ -1146,6 +1159,17 @@ func (e *Engine) retireSupersededPath(slot *pathSlot) {
 		}
 	}
 	e.drainDeadSlot(slot)
+}
+
+// retirePathAsync ends endpoint ownership synchronously, then detaches carrier
+// cleanup. Callers may return as soon as this function does without leaving a
+// published mobility candidate valid for a logically departed path.
+func (e *Engine) retirePathAsync(slot *pathSlot) {
+	if slot == nil {
+		return
+	}
+	slot.retireMobilityClaim()
+	go e.retireSupersededPath(slot)
 }
 
 func (e *Engine) nextPathGenerationLocked() uint64 {

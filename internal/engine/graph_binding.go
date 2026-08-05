@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -47,6 +48,36 @@ func (e *Engine) peerGraphBinding() graphBinding {
 	return binding
 }
 
+// ConfigureLocalMobilityCapabilities freezes driver-backed session families
+// before the local graph and HELLO declaration are built. A sealed capability
+// proves implementation presence only; every migration still needs a fresh
+// factual candidate and peer-plan agreement for the exact owned claim.
+func (e *Engine) ConfigureLocalMobilityCapabilities(capabilities ...leafmobility.Capability) error {
+	var supported proto.LeafMobilitySet
+	for _, capability := range capabilities {
+		operation := capability.Operation()
+		if operation == 0 {
+			return fmt.Errorf("engine: invalid zero leaf mobility capability")
+		}
+		wire, err := operation.ProtocolSet()
+		if err != nil {
+			return err
+		}
+		supported |= wire
+	}
+	e.graphMu.Lock()
+	defer e.graphMu.Unlock()
+	if e.localGraph.configured || e.localNegotiationSet {
+		return fmt.Errorf("engine: local mobility support is already frozen")
+	}
+	if e.localMobilitySupportSet && e.localMobilitySupport != supported {
+		return fmt.Errorf("engine: local mobility support is already configured")
+	}
+	e.localMobilitySupport = supported
+	e.localMobilitySupportSet = true
+	return nil
+}
+
 // ConfigureLocalGraph freezes the graph used by this engine's sender. It must
 // run before a sequenced frame is allocated.
 func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManifest) error {
@@ -84,6 +115,7 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 	negotiation := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
 	negotiation.GraphRevision = revision
 	negotiation.GraphDigest = digest
+	negotiation.MobilitySupported = e.localMobilitySupport
 	e.localGraph = binding
 	e.localExec = newExecutionRuntime(plan)
 	e.localNegotiation = negotiation
@@ -133,10 +165,12 @@ func (e *Engine) LocalNegotiation() proto.Negotiation {
 		return negotiation
 	}
 	binding := e.localGraph
+	supported := e.localMobilitySupport
 	e.graphMu.RUnlock()
 	n := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
 	n.GraphRevision = binding.revision
 	n.GraphDigest = binding.digest
+	n.MobilitySupported = supported
 	return n
 }
 

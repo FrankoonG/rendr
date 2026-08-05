@@ -350,6 +350,258 @@ func TestTxAdversarialOneShotReplayWriteFailureRetriesWithoutTraffic(t *testing.
 	}
 }
 
+func TestGapReplayFollowsCurrentCumulativeGapState(t *testing.T) {
+	e := New(SideClient, [16]byte{0xa6}, Limits{})
+	defer e.Close()
+	e.gapReplayBackoff = time.Second
+	path := newTxAdversarialPath()
+
+	var mu sync.Mutex
+	attempts := make(map[uint64]int)
+	changed := make(chan struct{}, 32)
+	thirdSeq0 := make(chan struct{}, 1)
+	path.writeFn = func(frame []byte) (int, error) {
+		if len(frame) >= proto.HeaderSize {
+			hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+			if err == nil && hdr.Type == proto.FrameData {
+				mu.Lock()
+				attempts[hdr.Seq]++
+				attempt := attempts[hdr.Seq]
+				mu.Unlock()
+				if hdr.Seq == 0 && attempt == 3 {
+					select {
+					case thirdSeq0 <- struct{}{}:
+					default:
+					}
+				}
+				select {
+				case changed <- struct{}{}:
+				default:
+				}
+			}
+		}
+		return len(frame), nil
+	}
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "gap-frontier"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := e.SendData([]byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	initialGap := currentAck(e, 0)
+	initialGap.Gap = true
+	if !e.notePeerAck(initialGap) {
+		t.Fatal("failed to install initial cumulative gap")
+	}
+	e.requestGapReplay(initialGap.NextSeq)
+	waitAttempts := func(seq uint64, want int) {
+		t.Helper()
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		for {
+			mu.Lock()
+			got := attempts[seq]
+			mu.Unlock()
+			if got >= want {
+				return
+			}
+			select {
+			case <-changed:
+			case <-deadline.C:
+				t.Fatalf("SEQ %d attempts=%d want>=%d", seq, got, want)
+			}
+		}
+	}
+	waitAttempts(0, 2)
+	select {
+	case <-thirdSeq0:
+		t.Fatal("stale ACK wake bypassed configured replay backoff")
+	case <-time.After(20 * time.Millisecond):
+	}
+	mu.Lock()
+	seq1BeforeACK := attempts[1]
+	mu.Unlock()
+	if seq1BeforeACK != 1 {
+		t.Fatalf("replayed suffix before ACK frontier advanced: SEQ 1 attempts=%d", seq1BeforeACK)
+	}
+	cleared := currentAck(e, 1)
+	if !e.notePeerAck(cleared) {
+		t.Fatal("failed to install cumulative ACK for SEQ 0")
+	}
+	time.Sleep(25 * time.Millisecond)
+	mu.Lock()
+	seq1AfterClear := attempts[1]
+	mu.Unlock()
+	if seq1AfterClear != 1 {
+		t.Fatalf("continued gap replay after Gap=false: SEQ 1 attempts=%d", seq1AfterClear)
+	}
+
+	continued := currentAck(e, 1)
+	continued.Gap = true
+	if !e.notePeerAck(continued) {
+		t.Fatal("failed to install continuing cumulative gap")
+	}
+	e.requestGapReplay(1)
+	waitAttempts(1, 2)
+	if !e.notePeerAck(currentAck(e, 4)) {
+		t.Fatal("failed to advance cumulative ACK to target")
+	}
+	time.Sleep(25 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts[2] != 1 || attempts[3] != 1 {
+		t.Fatalf("replayed acknowledged suffix: attempts=%v", attempts)
+	}
+}
+
+func TestReplayACKStateIsMonotonicAcrossPathReaders(t *testing.T) {
+	e := &Engine{}
+	if !e.publishReplayAck(5, false) {
+		t.Fatal("initial ACK state was not published")
+	}
+	if !e.publishReplayAck(5, true) {
+		t.Fatal("same-frontier gap did not supersede no-gap state")
+	}
+	if e.publishReplayAck(5, false) {
+		t.Fatal("stale same-frontier no-gap ACK cleared an observed gap")
+	}
+	if e.publishReplayAck(4, true) {
+		t.Fatal("lower cumulative ACK frontier overwrote newer state")
+	}
+	next, gap, seen, version := e.replayAckState()
+	if !seen || next != 5 || !gap || version != 2 {
+		t.Fatalf("ACK state=(next=%d gap=%t seen=%t version=%d), want (5,true,true,2)", next, gap, seen, version)
+	}
+	if !e.publishReplayAck(6, false) {
+		t.Fatal("advanced cumulative frontier did not clear gap state")
+	}
+	next, gap, seen, version = e.replayAckState()
+	if !seen || next != 6 || gap || version != 3 {
+		t.Fatalf("advanced ACK state=(next=%d gap=%t seen=%t version=%d), want (6,false,true,3)", next, gap, seen, version)
+	}
+}
+
+func TestReplayACKStateConcurrentPathReaders(t *testing.T) {
+	const (
+		rounds  = 100
+		workers = 64
+		maxSeq  = uint64(31)
+	)
+	for round := 0; round < rounds; round++ {
+		e := &Engine{}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for worker := 0; worker < workers; worker++ {
+			worker := worker
+			go func() {
+				defer wg.Done()
+				<-start
+				nextSeq := uint64(worker % int(maxSeq+1))
+				gap := worker == workers-1 || worker%3 == 0
+				e.publishReplayAck(nextSeq, gap)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		next, gap, seen, _ := e.replayAckState()
+		if !seen || next != maxSeq || !gap {
+			t.Fatalf("round %d concurrent ACK state=(next=%d gap=%t seen=%t), want (%d,true,true)", round, next, gap, seen, maxSeq)
+		}
+	}
+}
+
+func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
+	e := New(SideClient, [16]byte{0xa7}, Limits{})
+	defer e.Close()
+	path := newTxAdversarialPath()
+
+	var mu sync.Mutex
+	attempts := make(map[uint64]int)
+	changed := make(chan struct{}, 64)
+	path.writeFn = func(frame []byte) (int, error) {
+		if len(frame) >= proto.HeaderSize {
+			hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+			if err == nil && hdr.Type == proto.FrameData {
+				mu.Lock()
+				attempts[hdr.Seq]++
+				mu.Unlock()
+				select {
+				case changed <- struct{}{}:
+				default:
+				}
+			}
+		}
+		return len(frame), nil
+	}
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "full-preempts-gap"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := e.SendData([]byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.requestGapReplay(0)
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		mu.Lock()
+		gapActive := attempts[0] >= 2
+		mu.Unlock()
+		if gapActive {
+			break
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			t.Fatal("gap replay did not become active")
+		}
+	}
+
+	e.requestReplay(0)
+	for {
+		mu.Lock()
+		fullFinished := attempts[1] >= 2 && attempts[2] >= 2 && attempts[3] >= 2
+		mu.Unlock()
+		if fullFinished {
+			break
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("full replay starved behind active gap repair: attempts=%v", attempts)
+		}
+	}
+}
+
+func TestReplayRequestsCoalesceWithoutDroppingLatestTarget(t *testing.T) {
+	e := &Engine{replayWake: make(chan struct{}, 1)}
+	e.queueReplay(replayRequest{nextSeq: 7, target: 10, gap: true})
+	e.queueReplay(replayRequest{nextSeq: 5, target: 20, gap: true})
+	request, ok := e.takeReplayRequest()
+	if !ok || !request.gap || request.nextSeq != 5 || request.target != 20 {
+		t.Fatalf("merged gap request=%+v ok=%t", request, ok)
+	}
+
+	e.queueReplay(replayRequest{nextSeq: 9, target: 30, gap: true})
+	e.queueReplay(replayRequest{nextSeq: 4})
+	e.queueReplay(replayRequest{nextSeq: 2, target: 40, gap: true})
+	e.queueReplay(replayRequest{nextSeq: 3})
+	request, ok = e.takeReplayRequest()
+	if !ok || request.gap || request.nextSeq != 2 {
+		t.Fatalf("full replay did not dominate gaps: request=%+v ok=%t", request, ok)
+	}
+	if _, ok := e.takeReplayRequest(); ok {
+		t.Fatal("coalesced queue retained a duplicate request")
+	}
+}
+
 func TestTxAdversarialSolePathRecoveryDeliversLastUnackedTail(t *testing.T) {
 	flow := NewClientFlowID()
 	client := New(SideClient, flow, Limits{}.Clamp())

@@ -370,11 +370,109 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 	return nil
 }
 
+type replayRequest struct {
+	nextSeq uint64
+	target  uint64
+	gap     bool
+}
+
 func (e *Engine) requestReplay(nextSeq uint64) {
+	e.queueReplay(replayRequest{nextSeq: nextSeq})
+}
+
+func (e *Engine) requestGapReplay(nextSeq uint64) {
+	request := replayRequest{
+		nextSeq: nextSeq,
+		target:  e.sendPublishedNext.Load(),
+		gap:     true,
+	}
+	if request.target <= request.nextSeq {
+		return
+	}
+	e.queueReplay(request)
+}
+
+func (e *Engine) queueReplay(request replayRequest) {
+	e.replayMu.Lock()
+	if !e.replayPendingSet {
+		e.replayPending = request
+		e.replayPendingSet = true
+	} else {
+		pending := e.replayPending
+		switch {
+		case !pending.gap:
+			if request.nextSeq < pending.nextSeq {
+				pending.nextSeq = request.nextSeq
+			}
+		case !request.gap:
+			if pending.nextSeq < request.nextSeq {
+				request.nextSeq = pending.nextSeq
+			}
+			pending = request
+		default:
+			if request.nextSeq < pending.nextSeq {
+				pending.nextSeq = request.nextSeq
+			}
+			if request.target > pending.target {
+				pending.target = request.target
+			}
+		}
+		e.replayPending = pending
+	}
+	e.replayMu.Unlock()
 	select {
-	case e.replayRequests <- nextSeq:
+	case e.replayWake <- struct{}{}:
 	default:
 	}
+}
+
+func (e *Engine) takeReplayRequest() (replayRequest, bool) {
+	e.replayMu.Lock()
+	defer e.replayMu.Unlock()
+	if !e.replayPendingSet {
+		return replayRequest{}, false
+	}
+	request := e.replayPending
+	e.replayPending = replayRequest{}
+	e.replayPendingSet = false
+	return request, true
+}
+
+func (e *Engine) replayAckState() (nextSeq uint64, gap bool, seen bool, version uint64) {
+	e.replayMu.Lock()
+	defer e.replayMu.Unlock()
+	return e.replayAckNext, e.replayAckGap, e.replayAckSeen, e.replayAckVersion
+}
+
+// publishReplayAck serializes ACK observations from independent path readers.
+// NextSeq never regresses. At the same frontier, Gap=true dominates because a
+// delayed no-gap ACK may predate the out-of-order frame that revealed the gap;
+// without a wire ACK generation, clearing it would be unsafe. Advancing the
+// cumulative frontier starts a new gap state.
+func (e *Engine) publishReplayAck(nextSeq uint64, gap bool) bool {
+	e.replayMu.Lock()
+	defer e.replayMu.Unlock()
+	if e.replayAckSeen {
+		switch {
+		case nextSeq < e.replayAckNext:
+			return false
+		case nextSeq == e.replayAckNext:
+			if e.replayAckGap || !gap {
+				return false
+			}
+		}
+	}
+	e.replayAckNext = nextSeq
+	e.replayAckGap = gap
+	e.replayAckSeen = true
+	e.replayAckVersion++
+	return true
+}
+
+func (e *Engine) fullReplayPending() bool {
+	e.replayMu.Lock()
+	defer e.replayMu.Unlock()
+	return e.replayPendingSet && !e.replayPending.gap
 }
 
 func (e *Engine) replayLoop() {
@@ -382,8 +480,101 @@ func (e *Engine) replayLoop() {
 		select {
 		case <-e.closed:
 			return
-		case nextSeq := <-e.replayRequests:
-			e.replayUntilSent(nextSeq)
+		case <-e.replayWake:
+		}
+		for {
+			request, ok := e.takeReplayRequest()
+			if !ok {
+				break
+			}
+			if request.gap {
+				e.replayGapUntilAcknowledged(request.nextSeq, request.target)
+			} else {
+				e.replayUntilSent(request.nextSeq)
+			}
+		}
+	}
+}
+
+// replayGapUntilAcknowledged repairs one cumulative gap at a time. Replaying
+// the entire suffix on every transient cross-path reorder creates a replay
+// storm; pacing at the ACK frontier lets already-buffered frames collapse the
+// gap in one step while still walking every genuinely lost frame forward.
+func (e *Engine) replayGapUntilAcknowledged(nextSeq, target uint64) {
+	backoff := e.gapReplayBackoff
+	if backoff <= 0 {
+		backoff = 10 * time.Millisecond
+	}
+	frontier := nextSeq
+	for frontier < target {
+		if e.fullReplayPending() {
+			return
+		}
+		acked, gap, seen, ackVersion := e.replayAckState()
+		if seen && acked >= frontier && !gap {
+			return
+		}
+		if acked > frontier {
+			frontier = acked
+			backoff = e.gapReplayBackoff
+			if backoff <= 0 {
+				backoff = 10 * time.Millisecond
+			}
+			if frontier >= target {
+				return
+			}
+		}
+		frame := e.sendHistoryFrame(frontier)
+		if len(frame) == 0 {
+			return
+		}
+		_ = e.replaySequencedFrame(frame)
+
+		timer := time.NewTimer(backoff)
+	waitForProgress:
+		for {
+			select {
+			case <-e.closed:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-e.replayAckWake:
+				_, _, _, currentVersion := e.replayAckState()
+				if currentVersion <= ackVersion {
+					// The wake may predate this replay attempt. It carries no
+					// post-send progress and must not bypass backoff.
+					continue
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				break waitForProgress
+			case <-e.replayWake:
+				if e.fullReplayPending() {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
+				// A coalesced gap-only request does not prove progress. Keep
+				// the existing timer so repeated gap ACKs cannot collapse the
+				// exponential pacing into a replay storm.
+			case <-timer.C:
+				if backoff < 200*time.Millisecond {
+					backoff *= 2
+					if backoff > 200*time.Millisecond {
+						backoff = 200 * time.Millisecond
+					}
+				}
+				break waitForProgress
+			}
 		}
 	}
 }

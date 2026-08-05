@@ -88,7 +88,7 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 		}
 		staged.closeQuit()
 		e.pathsMu.Unlock()
-		go e.retireSupersededPath(staged)
+		e.retirePathAsync(staged)
 		e.firePathDeathHooks(PathDeathEvent{
 			ID: id, Owner: staged.owner, Spec: staged.spec.Clone(),
 			Binding: PathBinding{LocalTXTargetID: staged.localTXTargetID, PeerTXTargetID: staged.peerTXTargetID},
@@ -117,7 +117,7 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 		}
 		retained.closeQuit()
 		e.pathsMu.Unlock()
-		go e.retireSupersededPath(retained)
+		e.retirePathAsync(retained)
 		return
 	}
 	slot, ok := e.paths[id]
@@ -164,6 +164,10 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 	}
 	slot.closeQuit()
 	delete(e.paths, slot.id)
+	// Ownership ends at the topology commit, not when asynchronous carrier
+	// cleanup eventually runs. Published candidates must become stale before
+	// RemovePath or a death callback can return.
+	slot.retireMobilityClaim()
 	predecessorIDs := e.pathPredecessors[slot.id]
 	delete(e.pathPredecessors, slot.id)
 	var restored *pathSlot
@@ -176,18 +180,18 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 		delete(e.retainedPaths, predecessorID)
 		if !rollbackAllowed {
 			candidate.closeQuit()
-			go e.retireSupersededPath(candidate)
+			e.retirePathAsync(candidate)
 			continue
 		}
 		if restored == nil || candidate.gen > restored.gen {
 			if restored != nil {
 				restored.closeQuit()
-				go e.retireSupersededPath(restored)
+				e.retirePathAsync(restored)
 			}
 			restored = candidate
 		} else {
 			candidate.closeQuit()
-			go e.retireSupersededPath(candidate)
+			e.retirePathAsync(candidate)
 		}
 	}
 	if restored != nil {
@@ -251,7 +255,7 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 	// only unblock that Write when Close is called. Close asynchronously: an
 	// adapter is allowed to invoke OnDeath from inside its own Close method,
 	// and recursively entering a sync.Once-backed Close would deadlock.
-	go e.retireSupersededPath(departure.slot)
+	e.retirePathAsync(departure.slot)
 	if departure.explicitRemoval {
 		// A local administrative removal is clean for lifecycle policy, but it
 		// is not proof that every frame accepted by this carrier was ACKed.

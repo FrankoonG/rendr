@@ -3,6 +3,7 @@ package leafmobility
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 )
@@ -51,8 +52,8 @@ type Operation uint8
 
 const (
 	OperationTCPRepair        Operation = 1 << 0
-	OperationUDPFlowRebind    Operation = 1 << 1
-	OperationQUICCIDRebind    Operation = 1 << 2
+	OperationQUICCIDRebind    Operation = 1 << 1
+	OperationUDPFlowRebind    Operation = 1 << 2
 	OperationGVisorLinkRebind Operation = 1 << 3
 	knownOperations                     = OperationTCPRepair | OperationUDPFlowRebind | OperationQUICCIDRebind | OperationGVisorLinkRebind
 )
@@ -88,6 +89,8 @@ var (
 	ErrNotBound        = errors.New("leafmobility: claim is not bound")
 	ErrBindingMismatch = errors.New("leafmobility: binding mismatch")
 	ErrRetired         = errors.New("leafmobility: claim is retired")
+	ErrDriverRequired  = errors.New("leafmobility: specialized operation requires a driver")
+	ErrInvalidDriver   = errors.New("leafmobility: invalid driver")
 )
 
 var generationCounter atomic.Uint64
@@ -112,6 +115,7 @@ type Provider interface {
 type Claim struct {
 	noCopy noCopy
 	facts  Facts
+	driver Driver
 
 	mu      sync.RWMutex
 	binding Binding
@@ -124,7 +128,34 @@ func NewClaim(facts Facts) (*Claim, error) {
 	if err := validateFacts(facts); err != nil {
 		return nil, err
 	}
+	if facts.Operations != 0 {
+		return nil, fmt.Errorf("%w: operations %#x", ErrDriverRequired, facts.Operations)
+	}
 	return &Claim{facts: facts}, nil
+}
+
+// NewDrivenClaim creates a claim whose specialized operation is backed by a
+// concrete in-module driver. The operation comes from the driver rather than
+// caller-supplied facts, so a descriptor cannot manufacture capability.
+func NewDrivenClaim(facts Facts, driver Driver) (*Claim, error) {
+	if facts.Operations != 0 {
+		return nil, fmt.Errorf("%w: facts must not predeclare operations %#x", ErrInvalidDriver, facts.Operations)
+	}
+	if err := validateFacts(facts); err != nil {
+		return nil, err
+	}
+	if interfaceIsNil(driver) {
+		return nil, fmt.Errorf("%w: nil driver", ErrInvalidDriver)
+	}
+	operation := driver.Operation()
+	if !operation.single() {
+		return nil, fmt.Errorf("%w: operation %#x is not one known operation", ErrInvalidDriver, operation)
+	}
+	if want := operationForKind(facts.Kind); operation != want {
+		return nil, fmt.Errorf("%w: kind %d requires operation %#x, got %#x", ErrInvalidDriver, facts.Kind, want, operation)
+	}
+	facts.Operations = operation
+	return &Claim{facts: facts, driver: driver}, nil
 }
 
 // MustNewClaim is NewClaim for adapter facts that cannot be invalid at runtime.
@@ -136,9 +167,38 @@ func MustNewClaim(facts Facts) *Claim {
 	return claim
 }
 
+// MustNewDrivenClaim is NewDrivenClaim for adapter wiring that is fixed at
+// construction time.
+func MustNewDrivenClaim(facts Facts, driver Driver) *Claim {
+	claim, err := NewDrivenClaim(facts, driver)
+	if err != nil {
+		panic(err)
+	}
+	return claim
+}
+
 // Snapshot returns a value copy of the claimed facts.
 func (c *Claim) Snapshot() Facts {
 	return c.facts
+}
+
+// State returns one coherent ownership snapshot. Driver identity is exposed
+// only as a boolean; this checkpoint exposes local candidate planning but no
+// executable driver operation.
+func (c *Claim) State() ClaimState {
+	if c == nil {
+		return ClaimState{Retired: true}
+	}
+	c.mu.RLock()
+	state := ClaimState{
+		Facts:     c.facts,
+		Binding:   c.binding,
+		Bound:     c.bound,
+		Retired:   c.retired,
+		HasDriver: c.driver != nil,
+	}
+	c.mu.RUnlock()
+	return state
 }
 
 // Bind binds the claim exactly once.
@@ -241,6 +301,38 @@ func validateFacts(facts Facts) error {
 		return fmt.Errorf("%w: generation is zero", ErrInvalidFacts)
 	}
 	return nil
+}
+
+func (o Operation) single() bool {
+	return o != 0 && o&^knownOperations == 0 && o&(o-1) == 0
+}
+
+func operationForKind(kind Kind) Operation {
+	switch kind {
+	case KindRawTCP:
+		return OperationTCPRepair
+	case KindUDPFlow:
+		return OperationUDPFlowRebind
+	case KindQUIC:
+		return OperationQUICCIDRebind
+	case KindGVisor:
+		return OperationGVisorLinkRebind
+	default:
+		return 0
+	}
+}
+
+func interfaceIsNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func validateBinding(binding Binding) error {

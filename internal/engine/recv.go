@@ -329,7 +329,7 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 	if ack, ok := proto.DecodeAck(payload); ok {
 		if e.notePeerAck(ack) && ack.Gap {
-			e.requestReplay(ack.NextSeq)
+			e.requestGapReplay(ack.NextSeq)
 		}
 		return
 	}
@@ -380,6 +380,12 @@ func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
 		return false
 	}
 	valid, application := e.acknowledgeSendFrames(ack.NextSeq, ack.Proof)
+	if valid && e.publishReplayAck(ack.NextSeq, ack.Gap) {
+		select {
+		case e.replayAckWake <- struct{}{}:
+		default:
+		}
+	}
 	if valid && application {
 		e.markPayload()
 	}

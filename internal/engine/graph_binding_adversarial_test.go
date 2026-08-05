@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -106,6 +107,40 @@ func TestDirectionalGraphBindingsRemainAsymmetric(t *testing.T) {
 	}
 	if localNegotiation.GraphDigest == peerBinding.digest {
 		t.Fatal("engine mirrored one direction's graph into the other")
+	}
+}
+
+func TestLocalMobilitySupportFreezesWithNegotiation(t *testing.T) {
+	flow := [16]byte{0x37}
+	manifest, _ := adversarialGraphManifest("mobility-support", proto.GraphNodeKindSelector, "path-a")
+	e := New(SideClient, flow, Limits{}.Clamp())
+	defer e.Close()
+	tcpDriver := &enginePlanDriver{operation: leafmobility.OperationTCPRepair}
+	quicDriver := &enginePlanDriver{operation: leafmobility.OperationQUICCIDRebind}
+	tcpCapability := mustEngineCapability(t, tcpDriver)
+	quicCapability := mustEngineCapability(t, quicDriver)
+	supported := proto.LeafMobilityTCPRepair | proto.LeafMobilityQUICCIDRebind
+	if err := e.ConfigureLocalMobilityCapabilities(tcpCapability, quicCapability); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigureLocalMobilityCapabilities(tcpCapability, quicCapability); err != nil {
+		t.Fatalf("idempotent support configuration: %v", err)
+	}
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	negotiation := e.LocalNegotiation()
+	if negotiation.MobilitySupported != supported || negotiation.MobilityRequired != 0 {
+		t.Fatalf("mobility envelope=(0x%x,0x%x) want=(0x%x,0)", negotiation.MobilitySupported, negotiation.MobilityRequired, supported)
+	}
+	if err := e.ConfigureLocalMobilityCapabilities(tcpCapability, quicCapability); err == nil {
+		t.Fatal("changed local mobility support after graph freeze")
+	}
+
+	invalid := New(SideClient, [16]byte{0x38}, Limits{}.Clamp())
+	defer invalid.Close()
+	if err := invalid.ConfigureLocalMobilityCapabilities(leafmobility.Capability{}); err == nil {
+		t.Fatal("accepted an unbacked local mobility capability")
 	}
 }
 
