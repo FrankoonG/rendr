@@ -251,7 +251,7 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		// Stamp last-recv after a successful read but before any
 		// version / framing rejection: from the path's perspective,
 		// "something arrived" is the signal monitoring cares about.
-		slot.lastRecvUnixNano.Store(nowFn().UnixNano())
+		slot.noteRecv(nowFn())
 		if len(frame) < proto.HeaderSize {
 			return
 		}
@@ -261,7 +261,7 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		}
 		if hdr.Version != proto.Version {
 			e.setCloseErr(ErrPeerProtoVersion)
-			_ = e.Close()
+			go e.Close()
 			return
 		}
 		payload := frame[proto.HeaderSize:]
@@ -279,6 +279,16 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		// can pick any value (we use 0) and we filter on type+code.
 		if hdr.Type == proto.FrameCtrl {
 			code := proto.CtrlCodeFromFlags(hdr.Flags)
+			if isPathAdmissionCtrl(code) || isPathAdmissionHandshakeCtrl(code) {
+				if hdr.Flags != proto.FlagsForCtrl(code) || hdr.Seq != 0 || hdr.Last {
+					e.setCloseErr(ErrPeerProtocol)
+					go e.Close()
+					return
+				}
+				if e.routePathAdmissionControl(slot, code, payload) {
+					continue
+				}
+			}
 			if code == proto.CtrlPathProbe {
 				e.handlePathProbeRequest(slot, payload)
 				continue
@@ -483,10 +493,7 @@ func (e *Engine) writeAck(request ackRequest) {
 	copy(frame[proto.HeaderSize:], payload)
 
 	e.pathsMu.RLock()
-	slots := make([]*pathSlot, 0, len(e.paths))
-	for _, slot := range e.paths {
-		slots = append(slots, slot)
-	}
+	slots := e.receiveSlotsLocked()
 	e.pathsMu.RUnlock()
 	terminal := len(request.waiters) != 0
 	var results chan bool
@@ -520,6 +527,16 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 		return
 	}
 	slot.ackMu.Lock()
+	if slot.ackClosed {
+		if request.result != nil {
+			select {
+			case request.result <- false:
+			default:
+			}
+		}
+		slot.ackMu.Unlock()
+		return
+	}
 	if pending := slot.ackPending; pending != nil {
 		if pending.terminal && !request.terminal {
 			slot.ackMu.Unlock()
@@ -538,8 +555,12 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 		return
 	}
 	slot.ackRunning = true
+	slot.ackWG.Add(1)
 	slot.ackMu.Unlock()
-	go e.pathAckWriter(slot)
+	go func() {
+		defer slot.ackWG.Done()
+		e.pathAckWriter(slot)
+	}()
 }
 
 func (e *Engine) pathAckWriter(slot *pathSlot) {
@@ -669,12 +690,23 @@ func (e *Engine) fillRecvBatch(batch *[]recvFrame) bool {
 func (e *Engine) recvSlotsSnapshot() []*pathSlot {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
-	if len(e.paths) == 0 {
-		return nil
+	return e.receiveSlotsLocked()
+}
+
+// receiveSlotsLocked includes staged and retained paths: both are deliberately
+// TX-invisible but must keep accepting sequenced DATA and activation controls
+// throughout the overlap window. Caller holds pathsMu for reading or writing.
+func (e *Engine) receiveSlotsLocked() []*pathSlot {
+	ids := make([]uint32, 0, len(e.paths)+len(e.stagedPaths)+len(e.retainedPaths))
+	slotsByID := make(map[uint32]*pathSlot, cap(ids))
+	for _, set := range []map[uint32]*pathSlot{e.paths, e.stagedPaths, e.retainedPaths} {
+		for id, slot := range set {
+			ids = append(ids, id)
+			slotsByID[id] = slot
+		}
 	}
-	ids := make([]uint32, 0, len(e.paths))
-	for id := range e.paths {
-		ids = append(ids, id)
+	if len(ids) == 0 {
+		return nil
 	}
 	for i := 1; i < len(ids); i++ {
 		for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
@@ -683,7 +715,7 @@ func (e *Engine) recvSlotsSnapshot() []*pathSlot {
 	}
 	slots := make([]*pathSlot, 0, len(ids))
 	for _, id := range ids {
-		slots = append(slots, e.paths[id])
+		slots = append(slots, slotsByID[id])
 	}
 	return slots
 }
@@ -749,7 +781,7 @@ func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.Ack
 			e.sendTerminalAck(nextSeq, gap, proof)
 		}
 		e.setCloseErr(finalErr)
-		_ = e.Close()
+		e.requestClose()
 		return
 	}
 	if nextSeq != 0 || gap {

@@ -19,32 +19,148 @@ var nowFn = time.Now
 // migration budget exhausts).
 var debugPathDeath = os.Getenv("RENDR_DEBUG_PATH_DEATH") != ""
 
+type deferredPathDeath struct {
+	slot  *pathSlot
+	cause transport.DeathCause
+	err   error
+}
+
+// unwindFencedPathsLocked either makes a still-live predecessor dispatchable
+// again or consumes the death callback that arrived while maintenance held it.
+// Caller holds pathsMu and invokes processDeferredPathDeaths after unlocking.
+func (e *Engine) unwindFencedPathsLocked(slots []*pathSlot) []deferredPathDeath {
+	deaths := make([]deferredPathDeath, 0, len(slots))
+	for _, slot := range slots {
+		if current := e.paths[slot.id]; current != slot {
+			continue
+		}
+		slot.maintenance.Store(false)
+		if cause, err, ok := slot.takePendingDeath(); ok {
+			deaths = append(deaths, deferredPathDeath{slot: slot, cause: cause, err: err})
+			continue
+		}
+		slot.unfenceDispatch()
+	}
+	return deaths
+}
+
+func (e *Engine) processDeferredPathDeaths(deaths []deferredPathDeath) {
+	for _, death := range deaths {
+		e.onPathDeath(death.slot.id, death.slot.owner, death.cause, death.err)
+	}
+}
+
 // onPathDeath is the OnDeath callback installed on every attached
 // PathConn. It runs on the transport adapter's goroutine, so it
 // keeps work brief and never blocks on locks held by the send path.
-func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, err error) {
+func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause, err error) {
 	if debugPathDeath {
 		fmt.Fprintf(os.Stderr, "[rendr-engine] path %d died: cause=%v err=%v\n", id, cause, err)
 	}
 	runtime := e.localExecutionRuntime()
 	e.pathsMu.Lock()
+	if staged, ok := e.stagedPaths[id]; ok {
+		if staged.owner != owner {
+			e.pathsMu.Unlock()
+			return
+		}
+		delete(e.stagedPaths, id)
+		e.releasePathAdmissionLocked(id)
+		staged.closeQuit()
+		e.pathsMu.Unlock()
+		go e.retireSupersededPath(staged)
+		e.firePathDeathHooks(PathDeathEvent{
+			ID: id, Spec: staged.spec.Clone(),
+			Binding: PathBinding{LocalTXTargetID: staged.localTXTargetID, PeerTXTargetID: staged.peerTXTargetID},
+			Cause:   cause, Err: err,
+		})
+		return
+	}
+	if retained, ok := e.retainedPaths[id]; ok {
+		if retained.owner != owner {
+			e.pathsMu.Unlock()
+			return
+		}
+		delete(e.retainedPaths, id)
+		for successorID, predecessorIDs := range e.pathPredecessors {
+			filtered := predecessorIDs[:0]
+			for _, predecessorID := range predecessorIDs {
+				if predecessorID != id {
+					filtered = append(filtered, predecessorID)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(e.pathPredecessors, successorID)
+			} else {
+				e.pathPredecessors[successorID] = filtered
+			}
+		}
+		retained.closeQuit()
+		e.pathsMu.Unlock()
+		go e.retireSupersededPath(retained)
+		return
+	}
 	slot, ok := e.paths[id]
 	if !ok {
 		e.pathsMu.Unlock()
 		return
 	}
-	if slot.gen != gen || slot.maintenance.Load() {
+	if slot.owner != owner {
+		e.pathsMu.Unlock()
+		return
+	}
+	if slot.maintenance.Load() {
+		slot.recordPendingDeath(cause, err)
 		e.pathsMu.Unlock()
 		return
 	}
 	shouldReplay := cause != transport.CauseCleanClose
 	slot.closeQuit()
 	delete(e.paths, id)
+	e.releasePathAdmissionLocked(id)
+	predecessorIDs := e.pathPredecessors[id]
+	delete(e.pathPredecessors, id)
+	var restored *pathSlot
+	rollbackAllowed := slot.admissionRollback.Load()
+	for _, predecessorID := range predecessorIDs {
+		candidate := e.retainedPaths[predecessorID]
+		if candidate == nil {
+			continue
+		}
+		delete(e.retainedPaths, predecessorID)
+		if !rollbackAllowed {
+			candidate.closeQuit()
+			go e.retireSupersededPath(candidate)
+			continue
+		}
+		if restored == nil || candidate.gen > restored.gen {
+			if restored != nil {
+				restored.closeQuit()
+				go e.retireSupersededPath(restored)
+			}
+			restored = candidate
+		} else {
+			candidate.closeQuit()
+			go e.retireSupersededPath(candidate)
+		}
+	}
+	if restored != nil {
+		restored.maintenance.Store(false)
+		restored.unfenceDispatch()
+		e.paths[restored.id] = restored
+		if e.dispatchScope[id] {
+			delete(e.dispatchScope, id)
+			e.dispatchScope[restored.id] = true
+		}
+	}
 	wasActive := e.activeID == id
 	migratedOk := false
 	var newActive uint32
 	if wasActive {
-		if runtime != nil {
+		if restored != nil {
+			e.activeID = restored.id
+			migratedOk = true
+		} else if runtime != nil {
 			kind, active, scope, projectErr := e.projectRecursiveDispatchLocked(runtime)
 			if projectErr == nil {
 				e.activeID = active
@@ -87,8 +203,7 @@ func (e *Engine) onPathDeath(id uint32, gen uint64, cause transport.DeathCause, 
 	// only unblock that Write when Close is called. Close asynchronously: an
 	// adapter is allowed to invoke OnDeath from inside its own Close method,
 	// and recursively entering a sync.Once-backed Close would deadlock.
-	go func() { _ = slot.conn.Close() }()
-	e.drainDeadSlot(slot)
+	go e.retireSupersededPath(slot)
 
 	if migratedOk {
 		e.fireMigrateHooks(id, newActive, "death")

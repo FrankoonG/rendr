@@ -133,7 +133,7 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, false)
+	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, false)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -141,18 +141,6 @@ func (d *Dialer) Dial(ctx context.Context) (Conn, error) {
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	e.SetPeerInstanceID(ack.InstanceID)
-	firstBinding, err := negotiatedPathBinding(e, pathSpecName(first), ack.InitialTargetID)
-	if err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
-	firstID, err := e.AttachPathBound(pc, first, firstBinding)
-	if err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
 	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
@@ -230,7 +218,7 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		e.SetProbeIntervalForTest(d.ProbeInterval)
 	}
 
-	first, firstIndex, pc, ack, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, true)
+	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, true)
 	if err != nil {
 		_ = e.Close()
 		return nil, err
@@ -238,18 +226,6 @@ func (d *Dialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	e.SetPeerInstanceID(ack.InstanceID)
-	firstBinding, err := negotiatedPathBinding(e, pathSpecName(first), ack.InitialTargetID)
-	if err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
-	firstID, err := e.AttachPathBound(pc, first, firstBinding)
-	if err != nil {
-		_ = pc.Close()
-		_ = e.Close()
-		return nil, err
-	}
 	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
@@ -365,7 +341,7 @@ func (d *Dialer) dialInitialPath(
 	tracker *pathStatusTracker,
 	resolver *pathFactoryResolver,
 	packetMode bool,
-) (PathSpec, int, transport.PathConn, proto.HelloAckPayload, error) {
+) (PathSpec, int, proto.HelloAckPayload, uint32, error) {
 	var lastErr error
 	primaryPolicy := d.effectivePrimaryPolicy()
 	for i, ps := range paths {
@@ -375,65 +351,39 @@ func (d *Dialer) dialInitialPath(
 			tracker.set(i, PathUnavailable, err)
 			lastErr = err
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
-				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
+				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
 			}
 			continue
 		}
 		tracker.set(i, PathHandshaking, nil)
-		ack, err := performClientHelloAckContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps))
+		admission, err := engine.PerformClientHelloAdmissionContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps)
 		if err != nil {
 			_ = pc.Close()
 			state := pathStateForHandshakeError(err)
 			tracker.set(i, state, err)
 			lastErr = err
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
-				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
+				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
 			}
 			continue
 		}
+		ack := admission.Ack
 		if peerPacketMode := ack.Caps&proto.CapsPacketMode != 0; peerPacketMode != packetMode {
 			err = fmt.Errorf("rendr: peer session kind mismatch: packet=%t", peerPacketMode)
-			_ = pc.Close()
+			_ = e.Close()
 			tracker.set(i, PathNative, err)
 			lastErr = err
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == PrimaryRequire {
-				return PathSpec{}, -1, nil, proto.HelloAckPayload{}, err
+				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
 			}
 			continue
 		}
-		return ps, i, pc, ack, nil
+		return ps, i, ack, admission.PathID, nil
 	}
 	if lastErr != nil {
-		return PathSpec{}, -1, nil, proto.HelloAckPayload{}, fmt.Errorf("rendr: no usable path: %w", lastErr)
+		return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: no usable path: %w", lastErr)
 	}
-	return PathSpec{}, -1, nil, proto.HelloAckPayload{}, errNoCompiledPath
-}
-
-type clientHelloResult struct {
-	ack proto.HelloAckPayload
-	err error
-}
-
-func performClientHelloAckContext(
-	ctx context.Context,
-	pc transport.PathConn,
-	e *engine.Engine,
-	instanceID InstanceID,
-	caps uint32,
-	name string,
-) (proto.HelloAckPayload, error) {
-	result := make(chan clientHelloResult, 1)
-	go func() {
-		ack, err := engine.PerformClientHelloAckContext(ctx, pc, e, instanceID, caps, name)
-		result <- clientHelloResult{ack: ack, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		_ = pc.Close()
-		return proto.HelloAckPayload{}, ctx.Err()
-	case value := <-result:
-		return value.ack, value.err
-	}
+	return PathSpec{}, -1, proto.HelloAckPayload{}, 0, errNoCompiledPath
 }
 
 func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
@@ -444,37 +394,14 @@ func (d *Dialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathS
 		return 0, err
 	}
 	tracker.set(index, PathHandshaking, nil)
-	ack, err := engine.PerformClientBridgeTagAckContext(ctx, spc, e, pathSpecName(ps))
+	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, spc, e, pathSpecName(ps), ps)
 	if err != nil {
 		_ = spc.Close()
 		tracker.set(index, pathStateForHandshakeError(err), err)
 		return 0, err
 	}
-	binding, err := negotiatedPathBinding(e, pathSpecName(ps), ack.ResponderTargetID)
-	if err != nil {
-		_ = spc.Close()
-		tracker.set(index, PathUnavailable, err)
-		return 0, err
-	}
-	id, err := e.AttachPathBound(spc, ps, binding)
-	if err != nil {
-		_ = spc.Close()
-		tracker.set(index, PathUnavailable, err)
-		return 0, err
-	}
 	tracker.set(index, PathAttached, nil)
-	return id, nil
-}
-
-func negotiatedPathBinding(e *engine.Engine, localName string, peerTargetID proto.TargetID) (engine.PathBinding, error) {
-	localTargetID, err := e.LocalPathTargetID(localName)
-	if err != nil {
-		return engine.PathBinding{}, err
-	}
-	if _, err := e.PeerPathName(peerTargetID); err != nil {
-		return engine.PathBinding{}, err
-	}
-	return engine.PathBinding{LocalTXTargetID: localTargetID, PeerTXTargetID: peerTargetID}, nil
+	return admission.PathID, nil
 }
 
 func pathStateForHandshakeError(err error) PathState {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -312,6 +313,9 @@ func writeCtrl(pc transport.PathConn, code proto.CtrlCode, flagsExtra uint16, pa
 		return err
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	_, err := pc.Write(frame)
+	n, err := pc.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
 	return err
 }

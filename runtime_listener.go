@@ -332,8 +332,10 @@ func (l *SessionListener) acquireHandshake() bool {
 
 func (l *SessionListener) serveIncoming(inflightID uint64, sourceName string, _ CarrierFamily, pc transport.PathConn, clearDeadline func()) {
 	owned := false
+	var clearDeadlineOnce sync.Once
+	clearHandshakeDeadline := func() { clearDeadlineOnce.Do(clearDeadline) }
 	defer func() {
-		clearDeadline()
+		clearHandshakeDeadline()
 		l.untrackInflight(inflightID)
 		<-l.handshakes
 		if !owned {
@@ -342,13 +344,17 @@ func (l *SessionListener) serveIncoming(inflightID uint64, sourceName string, _ 
 	}()
 
 	hdr, payload, err := engine.ReadFirstFrame(pc)
-	if err != nil || hdr.Type != proto.FrameCtrl || hdr.Last || hdr.Seq != 0 {
+	if err != nil {
 		return
 	}
-	code := proto.CtrlCodeFromFlags(hdr.Flags)
-	if hdr.Flags != proto.FlagsForCtrl(code) {
+	code, ok := canonicalFirstControlCode(hdr)
+	if !ok {
 		return
 	}
+	// The first-frame deadline has done its job. Admission owns separate 10s
+	// pre-COMMIT and migration-budget post-COMMIT contexts; retaining the
+	// socket deadline would truncate reconciliation.
+	clearHandshakeDeadline()
 	switch code {
 	case proto.CtrlHello:
 		owned = l.handleRuntimeHello(inflightID, sourceName, pc, payload)
@@ -358,7 +364,7 @@ func (l *SessionListener) serveIncoming(inflightID uint64, sourceName string, _ 
 }
 
 func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName string, pc transport.PathConn, payload []byte) bool {
-	hello, err := proto.DecodeHello(payload)
+	hello, err := decodeHelloForAdmission(pc, payload)
 	if err != nil {
 		return false
 	}
@@ -385,7 +391,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		if state != engine.BridgeEntryActive || e == nil {
 			return false
 		}
-		return l.handleDuplicateRuntimeHello(sourceName, pc, hello, e)
+		return l.handleDuplicateRuntimeHello(sourceName, pc, hello, payload, e)
 	}
 	if !l.acquireAcceptSlot(packetMode) {
 		l.runtime.bridges.Abort(reservation)
@@ -431,7 +437,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	if err != nil {
 		return false
 	}
-	if err := acknowledgeInitialServerPath(e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello.InitialTargetID); err != nil {
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello, payload); err != nil {
 		return false
 	}
 	engineOwnsPath = true
@@ -468,7 +474,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	return true
 }
 
-func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc transport.PathConn, hello proto.HelloPayload, e *engine.Engine) bool {
+func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc transport.PathConn, hello proto.HelloPayload, proposalWire []byte, e *engine.Engine) bool {
 	if e.PeerKind() != engine.PeerRendr || e.PeerInstanceID() != hello.InstanceID || e.PeerCaps() != hello.Caps {
 		return false
 	}
@@ -487,7 +493,7 @@ func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc tran
 	if err != nil {
 		return false
 	}
-	if err := acknowledgeInitialServerPath(e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello.InitialTargetID); err != nil {
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello, proposalWire); err != nil {
 		return false
 	}
 	return true
@@ -522,7 +528,7 @@ func (l *SessionListener) handleRuntimeBridge(sourceName string, pc transport.Pa
 		_ = engine.PerformBridgeAck(pc, tag, l.runtime.instanceID, proto.AckRejectAttach, err.Error())
 		return false
 	}
-	if err := acknowledgeServerPath(e, pathID, pc, tag, l.runtime.instanceID, localTargetID); err != nil {
+	if err := acknowledgeServerPath(context.Background(), e, pathID, pc, tag, payload, l.runtime.instanceID, localTargetID); err != nil {
 		return false
 	}
 	return true

@@ -7,14 +7,15 @@ import "errors"
 // so callers can errors.Is against the rendr.* symbol without
 // reaching into internal/engine.
 var (
-	ErrMigrationBudgetExceeded = errors.New("rendr: migration budget exceeded")
-	ErrZombie                  = errors.New("rendr: zombie connection detected")
-	ErrPeerProtoVersion        = errors.New("rendr: incompatible protocol version")
-	ErrPeerProtocol            = errors.New("rendr: peer protocol violation")
-	ErrPeerClosed              = errors.New("rendr: peer requested close")
-	ErrGracefulCloseTimeout    = errors.New("rendr: graceful close was not acknowledged")
-	ErrPolicyRejected          = errors.New("rendr: peer rejected policy transaction")
-	ErrPolicyOutcomeUnknown    = errors.New("rendr: policy transaction outcome is unknown")
+	ErrMigrationBudgetExceeded     = errors.New("rendr: migration budget exceeded")
+	ErrZombie                      = errors.New("rendr: zombie connection detected")
+	ErrPeerProtoVersion            = errors.New("rendr: incompatible protocol version")
+	ErrPeerProtocol                = errors.New("rendr: peer protocol violation")
+	ErrPeerClosed                  = errors.New("rendr: peer requested close")
+	ErrGracefulCloseTimeout        = errors.New("rendr: graceful close was not acknowledged")
+	ErrPolicyRejected              = errors.New("rendr: peer rejected policy transaction")
+	ErrPolicyOutcomeUnknown        = errors.New("rendr: policy transaction outcome is unknown")
+	ErrPathAdmissionOutcomeUnknown = errors.New("rendr: path admission outcome is unknown")
 
 	// ErrLastPath is returned by RemovePath when the named path is
 	// the only attached path. Callers who want to fully tear down

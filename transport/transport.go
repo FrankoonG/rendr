@@ -47,7 +47,9 @@ const (
 )
 
 // PathConn is one live path. It MUST NOT surface migration-class
-// errors via Read/Write; use OnDeath instead.
+// errors via Read/Write; use OnDeath instead. Close MUST promptly unblock every
+// concurrent Read and Write. Engine admission deadlines and bounded shutdown
+// rely on this contract; adapters that cannot provide it are not conforming.
 type PathConn interface {
 	io.ReadWriteCloser
 

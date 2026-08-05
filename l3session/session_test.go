@@ -2,6 +2,7 @@ package l3session
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -294,8 +295,101 @@ func servePeerWithoutL3Identity(ln net.Listener, stop <-chan struct{}) error {
 	if _, err := path.Write(frame); err != nil {
 		return err
 	}
+	proposalHash := sha256.Sum256(buf[proto.HeaderSize:n])
+	responseHash := sha256.Sum256(ackPayload)
+	binding := proto.PathAdmissionBinding{
+		Kind:                   proto.PathAdmissionKindHello,
+		Direction:              proto.SenderDirectionClientToServer,
+		SessionEpoch:           hello.SessionEpoch,
+		AdmissionID:            proto.PathAdmissionID(hello.FlowID),
+		InitiatorGraphRevision: hello.GraphRevision,
+		InitiatorGraphDigest:   hello.GraphDigest,
+		InitiatorTargetID:      hello.InitialTargetID,
+		ResponderTargetID:      hello.InitialTargetID,
+		BaseLeafGeneration:     0,
+		ProposalDigest:         proto.PathAdmissionProposalDigest(proposalHash),
+		ResponderPlanDigest:    proto.PathAdmissionPlanDigest(responseHash),
+	}
+	prepared, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhasePrepared, Code: proto.AckOK}).Encode()
+	if err != nil {
+		return err
+	}
+	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, prepared); err != nil {
+		return err
+	}
+	commitWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionCommit)
+	if err != nil {
+		return err
+	}
+	commit, err := proto.DecodePathAdmissionCommit(commitWire)
+	if err != nil || commit.PathAdmissionBinding != binding {
+		return errors.New("test peer: invalid path admission COMMIT")
+	}
+	committed, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseCommitted, Code: proto.AckOK}).Encode()
+	if err != nil {
+		return err
+	}
+	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, committed); err != nil {
+		return err
+	}
+	confirmWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionConfirm)
+	if err != nil {
+		return err
+	}
+	confirm, err := proto.DecodePathAdmissionConfirm(confirmWire)
+	if err != nil || confirm.PathAdmissionBinding != binding {
+		return errors.New("test peer: invalid path admission CONFIRM")
+	}
+	finalAck, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseFinal, Code: proto.AckOK}).Encode()
+	if err != nil {
+		return err
+	}
+	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, finalAck); err != nil {
+		return err
+	}
+	receiptWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionAck)
+	if err != nil {
+		return err
+	}
+	receipt, err := proto.DecodePathAdmissionAck(receiptWire)
+	if err != nil || receipt.Phase != proto.PathAdmissionPhaseFinal || receipt.PathAdmissionBinding != binding {
+		return errors.New("test peer: invalid path admission FINAL receipt")
+	}
+	activated, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseActivated, Code: proto.AckOK}).Encode()
+	if err != nil {
+		return err
+	}
+	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, activated); err != nil {
+		return err
+	}
 	<-stop
 	return nil
+}
+
+func writeTestAdmissionControl(path *tcp.PathConn, code proto.CtrlCode, payload []byte) error {
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameCtrl, Flags: proto.FlagsForCtrl(code)}).Encode(frame[:proto.HeaderSize]); err != nil {
+		return err
+	}
+	copy(frame[proto.HeaderSize:], payload)
+	_, err := path.Write(frame)
+	return err
+}
+
+func readTestAdmissionControl(path *tcp.PathConn, want proto.CtrlCode) ([]byte, error) {
+	buf := make([]byte, tcp.MaxFrameSize)
+	n, err := path.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	hdr, err := proto.DecodeHeader(buf[:proto.HeaderSize])
+	if err != nil {
+		return nil, err
+	}
+	if hdr.Type != proto.FrameCtrl || proto.CtrlCodeFromFlags(hdr.Flags) != want || hdr.Seq != 0 {
+		return nil, errors.New("test peer: unexpected admission control")
+	}
+	return append([]byte(nil), buf[proto.HeaderSize:n]...), nil
 }
 
 func testIdentity(protoNum l3ingress.Protocol) l3ingress.L3Identity {

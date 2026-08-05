@@ -16,15 +16,16 @@ import (
 // callers can errors.Is against rendr.ErrFoo and have it match what
 // the engine returned.
 var (
-	ErrMigrationBudgetExceeded = engine.ErrMigrationBudgetExceeded
-	ErrZombie                  = engine.ErrZombie
-	ErrPeerProtoVersion        = engine.ErrPeerProtoVersion
-	ErrPeerProtocol            = engine.ErrPeerProtocol
-	ErrPeerClosed              = engine.ErrPeerClosed
-	ErrGracefulCloseTimeout    = engine.ErrGracefulCloseTimeout
-	ErrLastPath                = engine.ErrLastPath
-	ErrPacketTooLarge          = engine.ErrPacketTooLarge
-	ErrRecvWindowExceeded      = engine.ErrRecvWindowExceeded
+	ErrMigrationBudgetExceeded     = engine.ErrMigrationBudgetExceeded
+	ErrZombie                      = engine.ErrZombie
+	ErrPeerProtoVersion            = engine.ErrPeerProtoVersion
+	ErrPeerProtocol                = engine.ErrPeerProtocol
+	ErrPeerClosed                  = engine.ErrPeerClosed
+	ErrGracefulCloseTimeout        = engine.ErrGracefulCloseTimeout
+	ErrLastPath                    = engine.ErrLastPath
+	ErrPacketTooLarge              = engine.ErrPacketTooLarge
+	ErrRecvWindowExceeded          = engine.ErrRecvWindowExceeded
+	ErrPathAdmissionOutcomeUnknown = engine.ErrPathAdmissionOutcomeUnknown
 
 	// ErrReadDeadlineExceeded is the sentinel returned by Read /
 	// ReadFrom when a SetReadDeadline-set deadline elapses before

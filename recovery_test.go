@@ -69,10 +69,11 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	client := clientConn.(*engineBackedConn)
 	server := serverConn.(*engineBackedConn)
 	deadID := client.Paths()[0].ID
+	deadServerID := server.Paths()[0].ID
 	if err := client.e.ForceKillPathForTest(deadID); err != nil {
 		t.Fatal(err)
 	}
-	replacement, serverReplacement := waitForStreamReplacement(t, client, server, deadID, 5*time.Second)
+	replacement, serverReplacement := waitForStreamReplacement(t, client, server, deadID, deadServerID, 5*time.Second)
 	if attempts.Load() < 4 {
 		t.Fatalf("recovery did not retry injected dial failures: attempts=%d", attempts.Load())
 	}
@@ -82,7 +83,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	if err := client.e.ForceKillPathForTest(replacement); err != nil {
 		t.Fatal(err)
 	}
-	second, secondServer := waitForStreamReplacement(t, client, server, replacement, 5*time.Second)
+	second, secondServer := waitForStreamReplacement(t, client, server, replacement, serverReplacement, 5*time.Second)
 	if attempts.Load() < 5 {
 		t.Fatalf("immediate second death did not redial again: attempts=%d", attempts.Load())
 	}
@@ -327,10 +328,11 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	client := clientConn.(*enginePacketConn)
 	server := serverConn.(*enginePacketConn)
 	deadID := client.Paths()[0].ID
+	deadServerID := server.Paths()[0].ID
 	if err := client.e.ForceKillPathForTest(deadID); err != nil {
 		t.Fatal(err)
 	}
-	replacement, serverReplacement := waitForPacketReplacement(t, client, server, deadID, 5*time.Second)
+	replacement, serverReplacement := waitForPacketReplacement(t, client, server, deadID, deadServerID, 5*time.Second)
 	if attempts.Load() < 4 {
 		t.Fatalf("packet recovery did not retry dial failures: attempts=%d", attempts.Load())
 	}
@@ -340,7 +342,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	if err := client.e.ForceKillPathForTest(replacement); err != nil {
 		t.Fatal(err)
 	}
-	second, secondServer := waitForPacketReplacement(t, client, server, replacement, 5*time.Second)
+	second, secondServer := waitForPacketReplacement(t, client, server, replacement, serverReplacement, 5*time.Second)
 	if attempts.Load() < 5 {
 		t.Fatalf("packet immediate second death did not redial: attempts=%d", attempts.Load())
 	}
@@ -353,33 +355,35 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	}
 }
 
-func waitForStreamReplacement(t *testing.T, client, server *engineBackedConn, oldID uint32, timeout time.Duration) (uint32, uint32) {
+func waitForStreamReplacement(t *testing.T, client, server *engineBackedConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		clientPaths := client.Paths()
 		serverPaths := server.Paths()
-		if len(clientPaths) == 1 && clientPaths[0].ID != oldID && len(serverPaths) == 1 {
+		if len(clientPaths) == 1 && clientPaths[0].ID != oldClientID &&
+			len(serverPaths) == 1 && serverPaths[0].ID != oldServerID {
 			return clientPaths[0].ID, serverPaths[0].ID
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("stream replacement did not commit: old=%d client=%v server=%v", oldID, client.Paths(), server.Paths())
+	t.Fatalf("stream replacement did not commit: old client/server=%d/%d client=%v server=%v", oldClientID, oldServerID, client.Paths(), server.Paths())
 	return 0, 0
 }
 
-func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, oldID uint32, timeout time.Duration) (uint32, uint32) {
+func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		clientPaths := client.Paths()
 		serverPaths := server.Paths()
-		if len(clientPaths) == 1 && clientPaths[0].ID != oldID && len(serverPaths) == 1 {
+		if len(clientPaths) == 1 && clientPaths[0].ID != oldClientID &&
+			len(serverPaths) == 1 && serverPaths[0].ID != oldServerID {
 			return clientPaths[0].ID, serverPaths[0].ID
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("packet replacement did not commit: old=%d client=%v server=%v", oldID, client.Paths(), server.Paths())
+	t.Fatalf("packet replacement did not commit: old client/server=%d/%d client=%v server=%v", oldClientID, oldServerID, client.Paths(), server.Paths())
 	return 0, 0
 }
 

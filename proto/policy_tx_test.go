@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -27,8 +28,8 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 3 {
-		t.Fatalf("protocol minor=%d want=3", ProtocolMinor)
+	if ProtocolMinor != 4 {
+		t.Fatalf("protocol minor=%d want=4", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
@@ -64,13 +65,31 @@ func TestHelloRejectsLegacyPolicyPeerDuringDecode(t *testing.T) {
 			wire := mustHelloWire(t, HelloPayload{
 				Negotiation:     negotiation,
 				FlowID:          flow,
+				InstanceID:      InstanceID{1},
 				InitialTargetID: manifest.RootID,
 				LocalTXManifest: manifest,
 			})
-			if _, err := DecodeHello(wire); err == nil {
-				t.Fatal("legacy peer reached post-decode engine allocation")
+			if _, err := DecodeHello(wire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("legacy peer error=%v, want incompatible negotiation", err)
 			}
 		})
+	}
+}
+
+func TestHelloAcceptsCompatibleHigherMinor(t *testing.T) {
+	flow := [16]byte{0x45}
+	manifest := testGraphManifest("higher-minor-peer")
+	negotiation := testNegotiationFor(flow, manifest)
+	negotiation.ProtocolMinor++
+	wire := mustHelloWire(t, HelloPayload{
+		Negotiation:     negotiation,
+		FlowID:          flow,
+		InstanceID:      InstanceID{1},
+		InitialTargetID: manifest.RootID,
+		LocalTXManifest: manifest,
+	})
+	if _, err := DecodeHello(wire); err != nil {
+		t.Fatalf("compatible higher minor rejected: %v", err)
 	}
 }
 

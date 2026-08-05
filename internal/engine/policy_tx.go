@@ -890,6 +890,6 @@ func (e *Engine) policyProtocolError(err error) error {
 	}
 	wrapped := fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	e.setCloseErr(wrapped)
-	_ = e.Close()
+	go e.Close()
 	return wrapped
 }

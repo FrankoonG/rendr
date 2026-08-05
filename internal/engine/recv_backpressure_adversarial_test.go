@@ -350,6 +350,11 @@ func TestRecvTerminalAckCompletesBeforeTransportClose(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("terminal receive did not finish after releasing ACK and close")
 	}
+	select {
+	case <-path.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("terminal ACK completion did not trigger transport close")
+	}
 
 	terminalOrder := path.terminalOrd.Load()
 	closeOrder := path.closeOrd.Load()

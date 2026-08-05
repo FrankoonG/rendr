@@ -209,7 +209,7 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 			continue
 		}
 
-		n, err := slot.writeFrame(frame)
+		n, err := slot.writeDispatchedFrame(frame)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				continue
@@ -330,7 +330,7 @@ func (e *Engine) dispatchBond(frame []byte) error {
 		slot := e.paths[ids[idx]]
 		e.pathsMu.Unlock()
 
-		n, err := slot.writeFrame(frame)
+		n, err := slot.writeDispatchedFrame(frame)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				// Path died mid-write; pick again.
@@ -489,7 +489,7 @@ func (e *Engine) dispatchRace(frame []byte) error {
 		anyOk := false
 		now := nowFn().UnixNano()
 		for _, s := range slots {
-			if n, err := s.writeFrame(frame); err == nil && n == len(frame) {
+			if n, err := s.writeDispatchedFrame(frame); err == nil && n == len(frame) {
 				anyOk = true
 				s.lastSendUnixNano.Store(now)
 				s.recordDispatch(frame)

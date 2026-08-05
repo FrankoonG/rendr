@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -99,9 +100,18 @@ type Engine struct {
 	pathsMu      sync.RWMutex
 	paths        map[uint32]*pathSlot
 	pendingPaths map[uint32]*pathSlot
-	nextPathID   uint32
-	nextPathGen  uint64
-	activeID     uint32
+	stagedPaths  map[uint32]*pathSlot
+	// retainedPaths remain receive-capable while a staged admission is
+	// finalized. They are excluded from every TX dispatcher and provide a
+	// bounded rollback target if the successor dies before confirmation.
+	retainedPaths       map[uint32]*pathSlot
+	pathPredecessors    map[uint32][]uint32
+	pathAdmissionByLeaf map[pathAdmissionLeafKey]pathAdmissionReservation
+	pathAdmissionByPath map[uint32]pathAdmissionLeafKey
+	pathLeafGeneration  map[pathAdmissionLeafKey]uint64
+	nextPathID          uint32
+	nextPathGen         uint64
+	activeID            uint32
 	// dispatchScope optionally limits race/bond dispatch and death
 	// failover to a policy-selected target group. nil means all paths.
 	dispatchScope map[uint32]bool
@@ -215,7 +225,10 @@ type Engine struct {
 	// Lifecycle.
 	closing      atomic.Bool
 	closeOnce    sync.Once
-	closed       chan struct{}
+	closed       chan struct{} // internal cancellation
+	quiesced     chan struct{} // public completion after owned loops stop
+	coreWG       sync.WaitGroup
+	closeResult  error
 	closeErr     error
 	closeMu      sync.Mutex
 	gracefulOnce sync.Once
@@ -233,12 +246,14 @@ type PathDeathEvent struct {
 	Err     error
 }
 
-var ErrStalePathAttach = errors.New("engine: stale path attach generation")
+var ErrPathAttachInProgress = errors.New("engine: path attach already in progress for leaf")
+var ErrPathTXFenced = fmt.Errorf("%w: engine path is TX-fenced", net.ErrClosed)
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
 	id              uint32
 	gen             uint64
+	owner           uint64
 	conn            transport.PathConn
 	spec            transport.PathSpec
 	localTXTargetID proto.TargetID
@@ -247,11 +262,18 @@ type pathSlot struct {
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
-	maintenance atomic.Bool
-	writeMu     sync.Mutex
-	ackMu       sync.Mutex
-	ackPending  *pathAckWrite
-	ackRunning  bool
+	maintenance  atomic.Bool
+	deathPending atomic.Bool
+	deathMu      sync.Mutex
+	deathCause   transport.DeathCause
+	deathErr     error
+	txEnabled    atomic.Bool
+	writePermit  chan struct{}
+	ackMu        sync.Mutex
+	ackPending   *pathAckWrite
+	ackRunning   bool
+	ackClosed    bool
+	ackWG        sync.WaitGroup
 
 	// recvDups counts inbound frames on THIS path whose SEQ had
 	// already been delivered or buffered. Used per-path so monitoring
@@ -278,12 +300,23 @@ type pathSlot struct {
 	dispatchMu      sync.Mutex
 	dispatchQ       chan pathDispatchJob
 	dispatchDead    bool
+	dispatchFenced  bool
 	dispatchStalled atomic.Bool
 
-	quit     chan struct{}
-	quitOnce sync.Once
-	doneR    chan struct{} // closed when reader goroutine exits
-	doneW    chan struct{} // closed when data writer goroutine exits
+	quit                   chan struct{}
+	quitOnce               sync.Once
+	doneR                  chan struct{} // closed when reader goroutine exits
+	doneW                  chan struct{} // closed when data writer goroutine exits
+	admissionInbox         chan pathAdmissionMessage
+	admissionDone          chan struct{}
+	admissionOnce          sync.Once
+	admissionReplayPending atomic.Bool
+	admissionRollback      atomic.Bool
+	readerStarted          atomic.Bool
+	writerStarted          atomic.Bool
+	proberStarted          atomic.Bool
+	doneP                  chan struct{}
+	completedAdmission     *completedPathAdmission // guarded by Engine.pathsMu
 }
 
 type pathAckWrite struct {
@@ -293,8 +326,14 @@ type pathAckWrite struct {
 }
 
 func (s *pathSlot) writeFrame(frame []byte) (int, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	if err := s.acquireWrite(context.Background()); err != nil {
+		return 0, err
+	}
+	defer s.releaseWrite()
+	return s.writeFrameOwned(frame)
+}
+
+func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
 	n, err := s.conn.Write(frame)
 	if err == nil && n == len(frame) && len(frame) >= proto.HeaderSize {
 		if header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize]); decodeErr == nil {
@@ -308,6 +347,82 @@ func (s *pathSlot) writeFrame(frame []byte) (int, error) {
 	return n, err
 }
 
+func (s *pathSlot) writeDispatchedFrame(frame []byte) (int, error) {
+	if err := s.acquireWrite(context.Background()); err != nil {
+		return 0, err
+	}
+	defer s.releaseWrite()
+	if !s.txEnabled.Load() {
+		return 0, ErrPathTXFenced
+	}
+	return s.writeFrameOwned(frame)
+}
+
+func (s *pathSlot) acquireWrite(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-s.writePermit:
+		return nil
+	case <-s.quit:
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *pathSlot) releaseWrite() {
+	s.writePermit <- struct{}{}
+}
+
+func (s *pathSlot) waitWriteIdle(ctx context.Context) error {
+	if err := s.acquireWrite(ctx); err != nil {
+		return err
+	}
+	s.releaseWrite()
+	return nil
+
+}
+
+func (s *pathSlot) recordPendingDeath(cause transport.DeathCause, err error) {
+	s.deathMu.Lock()
+	s.deathCause = cause
+	s.deathErr = err
+	s.deathMu.Unlock()
+	s.deathPending.Store(true)
+}
+
+func (s *pathSlot) takePendingDeath() (transport.DeathCause, error, bool) {
+	if !s.deathPending.CompareAndSwap(true, false) {
+		return transport.CauseUnknown, nil, false
+	}
+	s.deathMu.Lock()
+	cause, err := s.deathCause, s.deathErr
+	s.deathCause, s.deathErr = transport.CauseUnknown, nil
+	s.deathMu.Unlock()
+	if cause == transport.CauseUnknown {
+		cause = transport.CauseTransportError
+	}
+	return cause, err, true
+}
+
+func (s *pathSlot) fenceDispatch() {
+	s.dispatchMu.Lock()
+	s.dispatchFenced = true
+	s.txEnabled.Store(false)
+	s.dispatchMu.Unlock()
+}
+
+func (s *pathSlot) unfenceDispatch() {
+	s.dispatchMu.Lock()
+	if !s.dispatchDead {
+		s.txEnabled.Store(true)
+		s.dispatchFenced = false
+	}
+	s.dispatchMu.Unlock()
+}
+
 func (s *pathSlot) recordDispatch(frame []byte) {
 	if len(frame) < proto.HeaderSize {
 		return
@@ -318,16 +433,48 @@ func (s *pathSlot) recordDispatch(frame []byte) {
 	}
 }
 
+func (s *pathSlot) noteRecv(at time.Time) {
+	next := at.UnixNano()
+	for {
+		previous := s.lastRecvUnixNano.Load()
+		if next <= previous {
+			next = previous + 1
+		}
+		if s.lastRecvUnixNano.CompareAndSwap(previous, next) {
+			return
+		}
+	}
+}
+
 // closeQuit is idempotent: multiple paths into the engine
 // (Engine.Close, onPathDeath, an explicit migration tear-down) can
 // all signal a slot to exit without panicking on a double close.
 func (s *pathSlot) closeQuit() {
 	s.quitOnce.Do(func() {
+		s.completeAdmission()
+		s.ackMu.Lock()
+		s.ackClosed = true
+		if s.ackPending != nil && s.ackPending.result != nil {
+			select {
+			case s.ackPending.result <- false:
+			default:
+			}
+		}
+		s.ackPending = nil
+		s.ackMu.Unlock()
 		s.dispatchMu.Lock()
 		s.dispatchDead = true
+		s.dispatchFenced = true
+		s.txEnabled.Store(false)
 		s.dispatchMu.Unlock()
 		close(s.quit)
 	})
+}
+
+func (s *pathSlot) completeAdmission() {
+	if s != nil {
+		s.admissionOnce.Do(func() { close(s.admissionDone) })
+	}
 }
 
 // New constructs an engine. flowID is the connection identifier; on
@@ -341,6 +488,12 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		created:             time.Now(),
 		paths:               make(map[uint32]*pathSlot),
 		pendingPaths:        make(map[uint32]*pathSlot),
+		stagedPaths:         make(map[uint32]*pathSlot),
+		retainedPaths:       make(map[uint32]*pathSlot),
+		pathPredecessors:    make(map[uint32][]uint32),
+		pathAdmissionByLeaf: make(map[pathAdmissionLeafKey]pathAdmissionReservation),
+		pathAdmissionByPath: make(map[uint32]pathAdmissionLeafKey),
+		pathLeafGeneration:  make(map[pathAdmissionLeafKey]uint64),
 		seenAttach:          make(map[[16]byte]struct{}),
 		recvPacketCh:        make(chan []byte, 16384),
 		recvPacketWake:      make(chan struct{}, 1),
@@ -360,6 +513,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		zombieLeft:          limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding:    make(map[uint64]time.Time),
 		closed:              make(chan struct{}),
+		quiesced:            make(chan struct{}),
 		gracefulDone:        make(chan struct{}),
 		terminalDone:        make(chan struct{}),
 	}
@@ -370,12 +524,20 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(flowID), senderDirection(side), 1, proto.GraphDigest{})
 	e.sendAckProof = e.sendProof
 	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(flowID), peerSenderDirection(side), 1, proto.GraphDigest{})
-	go e.recvLoop()
-	go e.replayLoop()
-	go e.ackLoop()
-	go e.ackWriterLoop()
-	go e.policyLoop()
+	e.startCoreLoop(e.recvLoop)
+	e.startCoreLoop(e.replayLoop)
+	e.startCoreLoop(e.ackLoop)
+	e.startCoreLoop(e.ackWriterLoop)
+	e.startCoreLoop(e.policyLoop)
 	return e
+}
+
+func (e *Engine) startCoreLoop(loop func()) {
+	e.coreWG.Add(1)
+	go func() {
+		defer e.coreWG.Done()
+		loop()
+	}()
 }
 
 // NewClientFlowID returns a fresh random flow_id for use by the
@@ -477,21 +639,39 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		return 0, err
 	}
 	e.pathsMu.Lock()
-	defer e.pathsMu.Unlock()
+	rejectLocked := func(err error) (uint32, error) {
+		e.pathsMu.Unlock()
+		_ = pc.Close()
+		return 0, err
+	}
 
 	if e.isClosed() {
-		_ = pc.Close()
-		return 0, net.ErrClosed
+		return rejectLocked(net.ErrClosed)
 	}
-	if len(e.paths)+len(e.pendingPaths) >= maxSessionPaths {
-		_ = pc.Close()
-		return 0, fmt.Errorf("engine: session path limit %d reached", maxSessionPaths)
+	if len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths) >= maxSessionPaths {
+		return rejectLocked(fmt.Errorf("engine: session path limit %d reached", maxSessionPaths))
 	}
-	all := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths))
+	for _, inFlight := range []map[uint32]*pathSlot{e.pendingPaths, e.stagedPaths} {
+		for _, existing := range inFlight {
+			if binding.LocalTXTargetID != (proto.TargetID{}) &&
+				binding.PeerTXTargetID != (proto.TargetID{}) &&
+				existing.localTXTargetID == binding.LocalTXTargetID &&
+				existing.peerTXTargetID == binding.PeerTXTargetID {
+				return rejectLocked(ErrPathAttachInProgress)
+			}
+		}
+	}
+	all := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths))
 	for _, existing := range e.paths {
 		all = append(all, existing)
 	}
 	for _, existing := range e.pendingPaths {
+		all = append(all, existing)
+	}
+	for _, existing := range e.stagedPaths {
+		all = append(all, existing)
+	}
+	for _, existing := range e.retainedPaths {
 		all = append(all, existing)
 	}
 	for _, existing := range all {
@@ -503,12 +683,10 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			continue
 		}
 		if sameLocal {
-			_ = pc.Close()
-			return 0, fmt.Errorf("engine: local TX target is already paired with another peer target")
+			return rejectLocked(fmt.Errorf("engine: local TX target is already paired with another peer target"))
 		}
 		if samePeer {
-			_ = pc.Close()
-			return 0, fmt.Errorf("engine: peer TX target is already paired with another local target")
+			return rejectLocked(fmt.Errorf("engine: peer TX target is already paired with another local target"))
 		}
 	}
 
@@ -519,13 +697,18 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		e.nextPathID++
 		id = e.nextPathID
 	}
+	if err := e.reservePathAdmissionLocked(id, binding); err != nil {
+		return rejectLocked(err)
+	}
 	recvQSize := 64
 	if e.Packetized() {
 		recvQSize = 1024
 	}
+	generation := e.nextPathGenerationLocked()
 	slot := &pathSlot{
 		id:              id,
-		gen:             e.nextPathGenerationLocked(),
+		gen:             generation,
+		owner:           generation,
 		conn:            pc,
 		spec:            spec.Clone(),
 		localTXTargetID: binding.LocalTXTargetID,
@@ -533,26 +716,43 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		attached:        time.Now(),
 		recvQ:           make(chan recvFrame, recvQSize),
 		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
+		writePermit:     newPathWritePermit(),
 		quit:            make(chan struct{}),
 		doneR:           make(chan struct{}),
 		doneW:           make(chan struct{}),
+		doneP:           make(chan struct{}),
+		admissionInbox:  make(chan pathAdmissionMessage, pathAdmissionInboxSize),
+		admissionDone:   make(chan struct{}),
 	}
 	e.pendingPaths[id] = slot
+	e.pathsMu.Unlock()
 	return id, nil
 }
 
-// CommitPathAttach publishes a prepared path and starts its data-plane loops.
+func newPathWritePermit() chan struct{} {
+	permit := make(chan struct{}, 1)
+	permit <- struct{}{}
+	return permit
+}
+
+// CommitPathAttach preserves the original one-call attach contract. Admission
+// handshakes use StagePathAttach and ActivateStagedPath separately so the new
+// carrier can receive confirmation without becoming a TX route prematurely.
 func (e *Engine) CommitPathAttach(id uint32) error {
-	var (
-		retired       []*pathSlot
-		oldActive     uint32
-		recoveryEvent bool
-	)
+	if err := e.StagePathAttach(id); err != nil {
+		return err
+	}
+	return e.ActivateStagedPath(id, false)
+}
+
+// StagePathAttach starts only the receive side of a prepared carrier. The
+// path is deliberately absent from Paths, activeID, and every TX dispatcher.
+func (e *Engine) StagePathAttach(id uint32) error {
 	e.pathsMu.Lock()
 	slot := e.pendingPaths[id]
 	if slot == nil {
 		e.pathsMu.Unlock()
-		return fmt.Errorf("engine: commit unknown pending path %d", id)
+		return fmt.Errorf("engine: stage unknown pending path %d", id)
 	}
 	if e.isClosed() {
 		delete(e.pendingPaths, id)
@@ -560,27 +760,146 @@ func (e *Engine) CommitPathAttach(id uint32) error {
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
-	for existingID, existing := range e.paths {
+	delete(e.pendingPaths, id)
+	slot.readerStarted.Store(true)
+	e.stagedPaths[id] = slot
+	e.pathsMu.Unlock()
+
+	owner := slot.owner
+	slot.conn.OnDeath(func(cause transport.DeathCause, err error) {
+		e.onPathDeath(id, owner, cause, err)
+	})
+	go e.readerLoop(slot)
+	return nil
+}
+
+// ActivateStagedPath publishes an RX-ready staged path as the TX successor.
+// When retainPredecessor is true, one previous generation remains RX-capable
+// for at most the migration budget so a lost final admission message cannot
+// strand the two peers on disjoint generations.
+func (e *Engine) ActivateStagedPath(id uint32, retainPredecessor bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), e.limits.MigrationBudget)
+	defer cancel()
+	return e.activateStagedPathContext(ctx, id, retainPredecessor, retainPredecessor)
+}
+
+// activateStagedPath publishes a staged path after draining any application
+// write already in progress on its predecessor. rollbackAllowed is false once
+// the peer has proved it already activated this generation: from that point a
+// successor failure is an uncertain distributed outcome and must not revive a
+// predecessor the peer may have retired.
+func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retainPredecessor, rollbackAllowed bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var (
+		retired       []*pathSlot
+		fenced        []*pathSlot
+		oldActive     uint32
+		recoveryEvent bool
+		superseded    bool
+	)
+	e.pathsMu.Lock()
+	slot := e.stagedPaths[id]
+	if slot == nil {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: activate unknown staged path %d", id)
+	}
+	if e.isClosed() {
+		delete(e.stagedPaths, id)
+		e.pathsMu.Unlock()
+		slot.closeQuit()
+		_ = slot.conn.Close()
+		return net.ErrClosed
+	}
+	// Fence new application dispatches while pathsMu still protects the active
+	// set. Drain writes outside pathsMu: transports may synchronously report
+	// OnDeath from Write, and that callback also needs pathsMu.
+	for _, existing := range e.paths {
 		if !sameBoundLeaf(slot, existing) {
 			continue
 		}
-		if existing.gen >= slot.gen {
-			delete(e.pendingPaths, id)
-			e.pathsMu.Unlock()
-			_ = slot.conn.Close()
-			return fmt.Errorf("%w: pending=%d winner=%d", ErrStalePathAttach, slot.gen, existing.gen)
-		}
 		existing.maintenance.Store(true)
+		existing.fenceDispatch()
+		fenced = append(fenced, existing)
+	}
+	e.pathsMu.Unlock()
+
+	for _, existing := range fenced {
+		if err := existing.waitWriteIdle(ctx); err != nil {
+			e.pathsMu.Lock()
+			deaths := e.unwindFencedPathsLocked(fenced)
+			e.pathsMu.Unlock()
+			e.processDeferredPathDeaths(deaths)
+			return fmt.Errorf("engine: predecessor write fence: %w", err)
+		}
+	}
+
+	e.pathsMu.Lock()
+	slot = e.stagedPaths[id]
+	if slot == nil || e.isClosed() {
+		deaths := e.unwindFencedPathsLocked(fenced)
+		e.pathsMu.Unlock()
+		e.processDeferredPathDeaths(deaths)
+		if slot == nil {
+			return fmt.Errorf("engine: staged path %d changed during activation", id)
+		}
+		return net.ErrClosed
+	}
+	for _, existing := range fenced {
+		if current := e.paths[existing.id]; current != existing || !sameBoundLeaf(slot, existing) {
+			deaths := e.unwindFencedPathsLocked(fenced)
+			e.pathsMu.Unlock()
+			e.processDeferredPathDeaths(deaths)
+			return fmt.Errorf("engine: predecessor changed during path activation")
+		}
+	}
+	// A native in-place repair may have advanced the generation while this
+	// admission waited for its peer. Rebase under the same lock that publishes
+	// the successor; no competing staged attach for this leaf is permitted.
+	for _, existing := range e.paths {
+		if sameBoundLeaf(slot, existing) && existing.gen >= slot.gen {
+			slot.gen = e.nextPathGenerationLocked()
+			break
+		}
+	}
+	if _, err := e.advancePathAdmissionLocked(id); err != nil {
+		deaths := e.unwindFencedPathsLocked(fenced)
+		e.pathsMu.Unlock()
+		e.processDeferredPathDeaths(deaths)
+		return err
+	}
+	// Keep at most one older receive generation per logical leaf.
+	for retainedID, existing := range e.retainedPaths {
+		if !sameBoundLeaf(slot, existing) {
+			continue
+		}
+		delete(e.retainedPaths, retainedID)
 		existing.closeQuit()
+		retired = append(retired, existing)
+	}
+	for _, existing := range fenced {
+		existingID := existing.id
+		superseded = true
 		delete(e.paths, existingID)
 		if e.dispatchScope[existingID] {
 			delete(e.dispatchScope, existingID)
 			e.dispatchScope[id] = true
 		}
-		retired = append(retired, existing)
+		if retainPredecessor && !existing.deathPending.Load() {
+			e.retainedPaths[existingID] = existing
+			e.pathPredecessors[id] = append(e.pathPredecessors[id], existingID)
+		} else {
+			existing.closeQuit()
+			retired = append(retired, existing)
+		}
 	}
-	delete(e.pendingPaths, id)
+	delete(e.stagedPaths, id)
 	oldActive = e.activeID
+	slot.unfenceDispatch()
+	slot.admissionRollback.Store(rollbackAllowed)
+	slot.writerStarted.Store(true)
+	slot.proberStarted.Store(true)
 	e.paths[id] = slot
 	if e.activeID == 0 {
 		e.activeID = id
@@ -588,25 +907,18 @@ func (e *Engine) CommitPathAttach(id uint32) error {
 		if e.State() == BridgeInit || e.State() == BridgeMigrating {
 			e.setState(BridgeActive)
 		}
-	} else {
-		for _, existing := range retired {
-			if existing.id == e.activeID {
-				e.activeID = id
-				recoveryEvent = true
-				break
-			}
-		}
+	} else if _, activeStillPresent := e.paths[e.activeID]; !activeStillPresent {
+		e.activeID = id
+		recoveryEvent = true
 	}
 	if recoveryEvent {
 		e.migrationCount++
 	}
+	if !retainPredecessor {
+		e.releasePathAdmissionLocked(id)
+	}
 	e.pathsMu.Unlock()
 
-	gen := slot.gen
-	slot.conn.OnDeath(func(cause transport.DeathCause, err error) {
-		e.onPathDeath(id, gen, cause, err)
-	})
-	go e.readerLoop(slot)
 	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
 	for _, existing := range retired {
@@ -616,10 +928,73 @@ func (e *Engine) CommitPathAttach(id uint32) error {
 		e.fireMigrateHooks(oldActive, id, "recovery")
 		e.recordMigration()
 	}
-	if len(retired) != 0 {
+	if superseded {
 		e.requestReplay(e.sendAckNext.Load())
 	}
+	if retainPredecessor {
+		gen := slot.gen
+		retention := e.limits.MigrationBudget
+		go func() {
+			timer := time.NewTimer(retention)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				e.completePathAdmissionGeneration(id, gen)
+			case <-slot.admissionDone:
+			case <-e.closed:
+			}
+		}()
+	}
 	return nil
+}
+
+// ReleasePathPredecessors ends the overlap window after peer confirmation.
+func (e *Engine) ReleasePathPredecessors(successorID uint32) {
+	e.pathsMu.RLock()
+	successor := e.paths[successorID]
+	e.pathsMu.RUnlock()
+	if successor == nil {
+		return
+	}
+	successor.completeAdmission()
+	e.releasePathPredecessors(successorID, successor.gen)
+}
+
+// DisablePathAdmissionRollback records that the peer may already have made
+// the successor generation durable. A later successor failure must use normal
+// recovery or fail closed; reviving the predecessor could split the peers.
+func (e *Engine) DisablePathAdmissionRollback(pathID uint32) error {
+	e.pathsMu.RLock()
+	slot := e.pathSlotForAdmissionLocked(pathID)
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		return fmt.Errorf("engine: admission path %d is unavailable", pathID)
+	}
+	slot.admissionRollback.Store(false)
+	return nil
+}
+
+func (e *Engine) releasePathPredecessors(successorID uint32, successorGen uint64) {
+	e.pathsMu.Lock()
+	successor := e.paths[successorID]
+	if successor == nil || successor.gen != successorGen {
+		e.pathsMu.Unlock()
+		return
+	}
+	ids := e.pathPredecessors[successorID]
+	delete(e.pathPredecessors, successorID)
+	retired := make([]*pathSlot, 0, len(ids))
+	for _, predecessorID := range ids {
+		if predecessor := e.retainedPaths[predecessorID]; predecessor != nil {
+			delete(e.retainedPaths, predecessorID)
+			predecessor.closeQuit()
+			retired = append(retired, predecessor)
+		}
+	}
+	e.pathsMu.Unlock()
+	for _, predecessor := range retired {
+		go e.retireSupersededPath(predecessor)
+	}
 }
 
 func sameBoundLeaf(a, b *pathSlot) bool {
@@ -631,9 +1006,31 @@ func sameBoundLeaf(a, b *pathSlot) bool {
 
 func (e *Engine) retireSupersededPath(slot *pathSlot) {
 	_ = slot.conn.Close()
+	timer := time.NewTimer(pathCloseTimeout)
+	defer timer.Stop()
 	select {
 	case <-slot.doneR:
-	case <-time.After(pathCloseTimeout):
+	case <-timer.C:
+		// Never race a final reader enqueue. A conforming PathConn.Close
+		// unblocks Read promptly; if it does not, keep cleanup detached until
+		// the reader eventually exits instead of stranding a late frame.
+		go func() {
+			<-slot.doneR
+			e.drainDeadSlot(slot)
+		}()
+		return
+	}
+	if slot.writerStarted.Load() {
+		select {
+		case <-slot.doneW:
+		case <-timer.C:
+		}
+	}
+	if slot.proberStarted.Load() {
+		select {
+		case <-slot.doneP:
+		case <-timer.C:
+		}
 	}
 	e.drainDeadSlot(slot)
 }
@@ -651,6 +1048,7 @@ func (e *Engine) nextPathGenerationLocked() uint64 {
 // migration. Selector-mode scoring decides migration via the
 // independent scheduler in selector.go.
 func (e *Engine) proberLoop(slot *pathSlot) {
+	defer close(slot.doneP)
 	t := time.NewTicker(e.probeInterval())
 	defer t.Stop()
 	for {
@@ -851,7 +1249,7 @@ func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
 
 	replay := e.sendHistorySnapshot(e.sendAckNext.Load())
 	for _, frame := range replay {
-		n, err := slot.writeFrame(frame)
+		n, err := slot.writeDispatchedFrame(frame)
 		if err != nil {
 			return err
 		}
@@ -1395,21 +1793,41 @@ func (e *Engine) SetProbeIntervalForTest(d time.Duration) {
 
 // Close tears down the engine, closing all attached paths.
 func (e *Engine) Close() error {
-	var firstErr error
 	e.closeOnce.Do(func() {
+		var firstErr error
+		recordErr := func(err error) {
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 		e.closing.Store(true)
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
-		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths))
+		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths))
 		for _, s := range e.paths {
 			s.closeQuit()
 			slots = append(slots, s)
 		}
 		for _, s := range e.pendingPaths {
+			s.closeQuit()
+			slots = append(slots, s)
+		}
+		for _, s := range e.stagedPaths {
+			s.closeQuit()
+			slots = append(slots, s)
+		}
+		for _, s := range e.retainedPaths {
+			s.closeQuit()
 			slots = append(slots, s)
 		}
 		e.paths = make(map[uint32]*pathSlot)
 		e.pendingPaths = make(map[uint32]*pathSlot)
+		e.stagedPaths = make(map[uint32]*pathSlot)
+		e.retainedPaths = make(map[uint32]*pathSlot)
+		e.pathPredecessors = make(map[uint32][]uint32)
+		e.pathAdmissionByLeaf = make(map[pathAdmissionLeafKey]pathAdmissionReservation)
+		e.pathAdmissionByPath = make(map[uint32]pathAdmissionLeafKey)
+		e.pathLeafGeneration = make(map[pathAdmissionLeafKey]uint64)
 		e.activeID = 0
 		e.dispatchScope = nil
 		e.pathsMu.Unlock()
@@ -1418,29 +1836,56 @@ func (e *Engine) Close() error {
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()
 		e.recvMu.Unlock()
-		e.setState(BridgeDead)
-
 		results := make(chan error, len(slots))
 		for _, s := range slots {
 			go func(slot *pathSlot) { results <- slot.conn.Close() }(s)
 		}
+		reaped := make(chan error, 1)
+		go func() {
+			var reapErr error
+			for range slots {
+				if err := <-results; err != nil && reapErr == nil {
+					reapErr = err
+				}
+			}
+			for _, slot := range slots {
+				if slot.readerStarted.Load() {
+					<-slot.doneR
+				}
+				if slot.writerStarted.Load() {
+					<-slot.doneW
+				}
+				if slot.proberStarted.Load() {
+					<-slot.doneP
+				}
+				slot.ackWG.Wait()
+			}
+			e.coreWG.Wait()
+			e.selectorMu.Lock()
+			selector := e.selector
+			e.selectorMu.Unlock()
+			if selector != nil {
+				<-selector.done
+			}
+			e.setState(BridgeDead)
+			close(e.quiesced)
+			reaped <- reapErr
+		}()
 		timer := time.NewTimer(pathCloseTimeout)
 		defer timer.Stop()
-		for range slots {
-			select {
-			case err := <-results:
-				if err != nil && firstErr == nil {
-					firstErr = err
-				}
-			case <-timer.C:
-				if firstErr == nil {
-					firstErr = fmt.Errorf("engine: path close timed out after %s", pathCloseTimeout)
-				}
-				return
-			}
+		select {
+		case err := <-reaped:
+			recordErr(err)
+		case <-timer.C:
+			recordErr(fmt.Errorf("engine: shutdown did not quiesce after %s", pathCloseTimeout))
 		}
+		e.closeResult = firstErr
 	})
-	return firstErr
+	return e.closeResult
+}
+
+func (e *Engine) requestClose() {
+	go e.Close()
 }
 
 // CloseErr returns the recorded close cause once the engine is dead;
@@ -1451,9 +1896,10 @@ func (e *Engine) CloseErr() error {
 	return e.closeErr
 }
 
-// Closed returns a channel that is closed when the engine has fully
-// shut down. Useful for downstream cleanup goroutines.
-func (e *Engine) Closed() <-chan struct{} { return e.closed }
+// Closed returns a channel that is closed only after engine-owned path and
+// core loops have actually quiesced. Close itself may return a timeout first;
+// the asynchronous reaper keeps ownership until this channel closes.
+func (e *Engine) Closed() <-chan struct{} { return e.quiesced }
 
 // QuiesceActivePath half-closes the active transport, when supported,
 // after the local side has sent BYE. This gives TCP peers a chance to
@@ -1541,7 +1987,7 @@ func (e *Engine) RemovePath(id uint32) error {
 	// route death through the listener fanout and only emit it on
 	// hard transport errors, not on local close.
 	_ = slot.conn.Close()
-	e.onPathDeath(id, slot.gen, transport.CauseCleanClose, nil)
+	e.onPathDeath(id, slot.owner, transport.CauseCleanClose, nil)
 	return nil
 }
 
@@ -1561,7 +2007,7 @@ func (e *Engine) ForceKillPathForTest(id uint32) error {
 		return fmt.Errorf("engine: kill unknown path %d", id)
 	}
 	err := slot.conn.Close()
-	e.onPathDeath(id, slot.gen, transport.CauseTransportError, err)
+	e.onPathDeath(id, slot.owner, transport.CauseTransportError, err)
 	return err
 }
 
@@ -1574,14 +2020,27 @@ func (e *Engine) AbortPathAttach(id uint32, cause error) {
 	if pending != nil {
 		delete(e.pendingPaths, id)
 	}
+	staged := e.stagedPaths[id]
+	if staged != nil {
+		delete(e.stagedPaths, id)
+		staged.closeQuit()
+	}
+	if pending != nil || staged != nil {
+		e.releasePathAdmissionLocked(id)
+	}
 	slot := e.paths[id]
 	e.pathsMu.Unlock()
 	if pending != nil {
 		_ = pending.conn.Close()
 		return
 	}
+	if staged != nil {
+		_ = staged.conn.Close()
+		e.drainDeadSlot(staged)
+		return
+	}
 	if slot != nil {
-		e.onPathDeath(id, slot.gen, transport.CauseTransportError, cause)
+		e.onPathDeath(id, slot.owner, transport.CauseTransportError, cause)
 	}
 }
 

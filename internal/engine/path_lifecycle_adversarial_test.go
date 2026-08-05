@@ -66,12 +66,12 @@ func TestPreparedPathIsInvisibleUntilBridgeAckCommit(t *testing.T) {
 	}
 }
 
-func TestSameLeafCommitSupersedesOnlyOlderGeneration(t *testing.T) {
+func TestSameLeafAdmissionIsSerializedAndRollsBackToPredecessor(t *testing.T) {
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
 	)
-	e := New(SideServer, NewClientFlowID(), Limits{}.Clamp())
+	e := New(SideServer, NewClientFlowID(), Limits{ZombieMaxMigrations: 10}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
 	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
 		t.Fatal(err)
@@ -89,13 +89,6 @@ func TestSameLeafCommitSupersedesOnlyOlderGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	staleBase, stalePeer := newMemoryPathPair()
-	t.Cleanup(func() { _ = stalePeer.Close() })
-	stale := &observedClosePath{PathConn: staleBase}
-	staleID, err := e.PreparePathBound(stale, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding)
-	if err != nil {
-		t.Fatal(err)
-	}
 	winnerBase, winnerPeer := newMemoryPathPair()
 	t.Cleanup(func() { _ = winnerPeer.Close() })
 	winner := &observedClosePath{PathConn: winnerBase}
@@ -103,34 +96,58 @@ func TestSameLeafCommitSupersedesOnlyOlderGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	concurrentBase, concurrentPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = concurrentPeer.Close() })
+	concurrent := &observedClosePath{PathConn: concurrentBase}
+	if _, err := e.PreparePathBound(concurrent, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding); !errors.Is(err, ErrPathAttachInProgress) {
+		t.Fatalf("concurrent prepare error = %v, want %v", err, ErrPathAttachInProgress)
+	}
 
 	if paths := e.Paths(); len(paths) != 1 || paths[0].ID != oldID {
-		t.Fatalf("pending replacements displaced old path before commit: %v", paths)
+		t.Fatalf("pending replacement displaced old path before stage: %v", paths)
 	}
-	if err := e.CommitPathAttach(winnerID); err != nil {
-		t.Fatalf("commit winner: %v", err)
+	if err := e.StagePathAttach(winnerID); err != nil {
+		t.Fatalf("stage winner: %v", err)
 	}
-	if err := e.CommitPathAttach(staleID); !errors.Is(err, ErrStalePathAttach) {
-		t.Fatalf("stale commit error = %v, want %v", err, ErrStalePathAttach)
+	stagedBase, stagedPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = stagedPeer.Close() })
+	stagedConcurrent := &observedClosePath{PathConn: stagedBase}
+	if _, err := e.PreparePathBound(stagedConcurrent, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "a"}}, binding); !errors.Is(err, ErrPathAttachInProgress) {
+		t.Fatalf("prepare while staged error = %v, want %v", err, ErrPathAttachInProgress)
+	}
+	if paths := e.Paths(); len(paths) != 1 || paths[0].ID != oldID {
+		t.Fatalf("staged path became TX-visible: %v", paths)
+	}
+	if err := e.ActivateStagedPath(winnerID, true); err != nil {
+		t.Fatalf("activate winner: %v", err)
 	}
 	if paths := e.Paths(); len(paths) != 1 || paths[0].ID != winnerID {
-		t.Fatalf("stale commit deleted winner: %v", paths)
+		t.Fatalf("activated path set = %v, want winner only", paths)
 	}
 	if got := e.ActivePath(); got != winnerID {
 		t.Fatalf("active path = %d, want winner %d", got, winnerID)
 	}
+	if old.closed.Load() {
+		t.Fatal("predecessor closed before admission confirmation")
+	}
+	if !concurrent.closed.Load() || !stagedConcurrent.closed.Load() {
+		t.Fatalf("rejected candidates closed = %t/%t, want true/true", concurrent.closed.Load(), stagedConcurrent.closed.Load())
+	}
+	if err := e.ForceKillPathForTest(winnerID); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(time.Second)
-	for (!old.closed.Load() || !stale.closed.Load()) && time.Now().Before(deadline) {
+	for e.ActivePath() != oldID && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if !old.closed.Load() || !stale.closed.Load() {
-		t.Fatalf("superseded candidates closed old/stale = %t/%t, want true/true", old.closed.Load(), stale.closed.Load())
+	if got := e.ActivePath(); got != oldID {
+		t.Fatalf("active path after successor death = %d, want predecessor %d", got, oldID)
 	}
-	if winner.closed.Load() {
-		t.Fatal("stale commit closed the winning path")
+	if old.closed.Load() {
+		t.Fatal("rollback predecessor was closed")
 	}
-	if got := e.MigrationCount(); got != 1 {
-		t.Fatalf("same-leaf supersession migrations = %d, want 1", got)
+	if got := e.MigrationCount(); got != 2 {
+		t.Fatalf("activate plus rollback migrations = %d, want 2", got)
 	}
 }
 
@@ -294,8 +311,8 @@ func TestEngineCloseCannotBePinnedByOnePathAdapter(t *testing.T) {
 	go func() { done <- e.Close() }()
 	select {
 	case <-e.Closed():
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("engine lifecycle remained open behind blocked adapter Close")
+		t.Fatal("engine reported quiescence while an owned adapter Close was still blocked")
+	case <-time.After(20 * time.Millisecond):
 	}
 	select {
 	case <-blocked.started:
@@ -309,13 +326,27 @@ func TestEngineCloseCannotBePinnedByOnePathAdapter(t *testing.T) {
 	if !healthy.closed.Load() {
 		t.Fatal("blocked adapter prevented healthy path Close")
 	}
+	var firstCloseErr error
 	select {
-	case err := <-done:
-		if err == nil {
+	case firstCloseErr = <-done:
+		if firstCloseErr == nil {
 			t.Fatal("bounded Close did not report adapter timeout")
 		}
 	case <-time.After(pathCloseTimeout + 100*time.Millisecond):
 		t.Fatal("Engine.Close exceeded path adapter timeout")
 	}
+	select {
+	case <-e.Closed():
+		t.Fatal("timed-out Close reported quiescence before blocked adapter exited")
+	default:
+	}
+	if secondCloseErr := e.Close(); secondCloseErr != firstCloseErr {
+		t.Fatalf("repeated Close error=%v, want persisted %v", secondCloseErr, firstCloseErr)
+	}
 	close(blocked.release)
+	select {
+	case <-e.Closed():
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous reaper did not publish quiescence after adapter exit")
+	}
 }

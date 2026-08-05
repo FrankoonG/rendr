@@ -151,26 +151,12 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 		_ = pc.Close()
 		return 0, err
 	}
-	ack, err := engine.PerformClientBridgeTagAckContext(ctx, pc, c.e, pathSpecName(spec))
+	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, pc, c.e, pathSpecName(spec), spec)
 	if err != nil {
 		_ = pc.Close()
 		return 0, err
 	}
-	if err := ctx.Err(); err != nil {
-		_ = pc.Close()
-		return 0, err
-	}
-	binding, err := negotiatedPathBinding(c.e, pathSpecName(spec), ack.ResponderTargetID)
-	if err != nil {
-		_ = pc.Close()
-		return 0, err
-	}
-	id, err := c.e.AttachPathBound(pc, spec, binding)
-	if err != nil {
-		_ = pc.Close()
-		return 0, err
-	}
-	return id, nil
+	return admission.PathID, nil
 }
 
 func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry RetryPolicy) {

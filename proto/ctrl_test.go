@@ -65,7 +65,7 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 func TestHelloRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	manifest := testGraphManifest("path")
-	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, Caps: 0xAABB_CCDD, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: 0xAABB_CCDD, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
 	wire := mustHelloWire(t, want)
 	got, err := DecodeHello(wire)
 	if err != nil {
@@ -179,7 +179,7 @@ func TestBridgeAckRoundTrip(t *testing.T) {
 func TestHelloPathNameRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	manifest := testGraphManifest("A")
-	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, Caps: CapsPacketMode, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: CapsPacketMode, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
 	wire := mustHelloWire(t, want)
 	got, err := DecodeHello(wire)
 	if err != nil {
@@ -246,7 +246,7 @@ func TestRejectLegacyHandshakePayloads(t *testing.T) {
 func TestHelloRejectsInvalidNegotiationBeforeUse(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	manifest := testGraphManifest("path")
-	base := mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
+	base := mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
 	mutations := map[string]func([]byte){
 		"protocol major":   func(b []byte) { b[1] = 2 },
 		"reserved":         func(b []byte) { b[7] = 1 },
@@ -276,7 +276,7 @@ func TestHandshakePayloadsRejectMalformedExtensions(t *testing.T) {
 			base: func() []byte {
 				flow := [16]byte{1}
 				manifest := testGraphManifest("path")
-				return mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
+				return mustHelloWire(t, HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, LocalTXManifest: manifest})
 			}(),
 			decode: func(b []byte) error {
 				_, err := DecodeHello(b)
@@ -333,7 +333,7 @@ func TestFixedPayloadsRejectTrailingBytes(t *testing.T) {
 		{"hello_ack", func() []byte {
 			flow := [16]byte{1}
 			manifest := testGraphManifest("path")
-			return mustHelloAckWire(t, HelloAckPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InitialTargetID: manifest.RootID, AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiationFor(flow, manifest).GraphDigest}, AcceptedPeerTargetID: manifest.RootID, LocalTXManifest: manifest})
+			return mustHelloAckWire(t, HelloAckPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, InitialTargetID: manifest.RootID, AcceptedPeerBinding: GraphBinding{Revision: 1, Digest: testNegotiationFor(flow, manifest).GraphDigest}, AcceptedPeerTargetID: manifest.RootID, LocalTXManifest: manifest})
 		}(), func(b []byte) bool { _, err := DecodeHelloAck(b); return err == nil }},
 		{"migrate_notify", MigrateNotifyPayload{}.Encode(), func(b []byte) bool { _, err := DecodeMigrateNotify(b); return err == nil }},
 		{"path_quality", PathQualityPayload{}.Encode(), func(b []byte) bool { _, err := DecodePathQuality(b); return err == nil }},
@@ -394,6 +394,9 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlHelloAck, 0x09},
 		{CtrlPolicyAck, 0x0A},
 		{CtrlPolicyCommit, 0x0B},
+		{CtrlPathAdmissionCommit, 0x0C},
+		{CtrlPathAdmissionAck, 0x0D},
+		{CtrlPathAdmissionConfirm, 0x0E},
 		{CtrlBridgeTag, 0x10},
 		{CtrlBridgeAck, 0x11},
 	}
@@ -614,7 +617,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("0001000300000000000000000000007f000000000000007f00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("000100040000000000000000000000ff00000000000000ff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

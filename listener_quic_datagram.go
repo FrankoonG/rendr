@@ -123,11 +123,12 @@ func (l *quicDatagramListener) serveIncoming(pc transport.PathConn) {
 		_ = pc.Close()
 		return
 	}
-	if hdr.Type != proto.FrameCtrl {
+	code, ok := canonicalFirstControlCode(hdr)
+	if !ok {
 		_ = pc.Close()
 		return
 	}
-	switch proto.CtrlCodeFromFlags(hdr.Flags) {
+	switch code {
 	case proto.CtrlHello:
 		l.handleHello(pc, payload)
 	case proto.CtrlBridgeTag:
@@ -138,11 +139,21 @@ func (l *quicDatagramListener) serveIncoming(pc transport.PathConn) {
 }
 
 func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte) {
-	p, err := proto.DecodeHello(payload)
+	p, err := decodeHelloForAdmission(pc, payload)
 	if err != nil {
 		_ = pc.Close()
 		return
 	}
+	reservation, ok := reserveInitialBridge(l.bridges, p.FlowID, pc)
+	if !ok {
+		return
+	}
+	activated := false
+	defer func() {
+		if !activated {
+			l.bridges.Abort(reservation)
+		}
+	}()
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
 	if err := e.AcceptPeerNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
@@ -162,13 +173,6 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 	// DATAGRAM-mode peer implies packet boundaries regardless of
 	// whether CapsPacketMode was set; force it.
 	e.SetPacketMode()
-	if !l.bridges.Put(p.FlowID, e) {
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
-		_ = pc.Close()
-		_ = e.Close()
-		return
-	}
-
 	spec := PathSpec{
 		Transport: "quic",
 		Address:   pc.RemoteAddr(),
@@ -177,26 +181,29 @@ func (l *quicDatagramListener) handleHello(pc transport.PathConn, payload []byte
 	spec = specWithTargetName(spec, helloPathName(p))
 	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
 	if err != nil {
-		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := acknowledgeInitialServerPath(e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
-		l.bridges.Remove(p.FlowID)
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p, payload); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
+	if err := l.bridges.Activate(reservation, e); err != nil {
+		_ = e.Close()
+		return
+	}
+	activated = true
 
 	lAddr := addrFromString(pc.LocalAddr())
 	rAddr := addrFromString(pc.RemoteAddr())
 	bp := newEnginePacketConn(e, ModeSelector, lAddr, rAddr)
 
-	go func(flowID [16]byte) {
+	go func() {
 		<-bp.e.Closed()
-		l.bridges.Remove(flowID)
-	}(p.FlowID)
+		l.bridges.RemoveActive(reservation, e)
+	}()
 
 	select {
 	case l.acceptPacket <- bp:
@@ -242,5 +249,5 @@ func (l *quicDatagramListener) handleBridgeTag(pc transport.PathConn, payload []
 		_ = pc.Close()
 		return
 	}
-	_ = acknowledgeServerPath(e, pathID, pc, p, l.instanceID, localTargetID)
+	_ = acknowledgeServerPath(context.Background(), e, pathID, pc, p, payload, l.instanceID, localTargetID)
 }

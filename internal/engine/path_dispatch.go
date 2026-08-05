@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -28,7 +29,7 @@ type pathDispatchResult struct {
 func (s *pathSlot) submitDispatch(job pathDispatchJob) bool {
 	s.dispatchMu.Lock()
 	defer s.dispatchMu.Unlock()
-	if s.dispatchDead {
+	if s.dispatchDead || s.dispatchFenced {
 		return false
 	}
 	select {
@@ -56,18 +57,18 @@ func (e *Engine) pathWriterLoop(slot *pathSlot) {
 }
 
 func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
-	n, err := slot.writeFrame(job.frame)
+	n, err := slot.writeDispatchedFrame(job.frame)
 	if err == nil && n != len(job.frame) {
 		err = io.ErrShortWrite
 	}
 	if err == nil {
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		slot.recordDispatch(job.frame)
-	} else {
+	} else if !errors.Is(err, ErrPathTXFenced) {
 		// Some third-party PathConn implementations cannot reliably invoke
 		// OnDeath after a failed Write. The generation check makes this
 		// synthetic report idempotent with a concurrent transport callback.
-		e.onPathDeath(slot.id, slot.gen, transport.CauseTransportError, err)
+		e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
 	}
 	job.result <- pathDispatchResult{slot: slot, err: err}
 	// A timed-out caller may already be retrying this immutable frame on a
@@ -191,13 +192,13 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 				return e.executionBudgetExceeded()
 			}
 		}
-		if !budgetTimer.Stop() && !stalled {
+		if !budgetTimer.Stop() {
 			select {
 			case <-budgetTimer.C:
 			default:
 			}
 		}
-		if !stallTimer.Stop() && !stalled {
+		if !stallTimer.Stop() {
 			select {
 			case <-stallTimer.C:
 			default:

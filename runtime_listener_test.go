@@ -666,9 +666,6 @@ func TestRuntimeListenerRejectsNoncanonicalHelloBeforeReservation(t *testing.T) 
 				t.Fatal(err)
 			}
 			instanceID := engine.NewInstanceID()
-			if testCase.zeroInstance {
-				instanceID = proto.InstanceID{}
-			}
 			targetID, err := clientEngine.LocalPathTargetID("path")
 			if err != nil {
 				t.Fatal(err)
@@ -682,6 +679,9 @@ func TestRuntimeListenerRejectsNoncanonicalHelloBeforeReservation(t *testing.T) 
 			}).Encode()
 			if err != nil {
 				t.Fatal(err)
+			}
+			if testCase.zeroInstance {
+				clear(payload[96:112])
 			}
 			clientRaw, serverRaw := net.Pipe()
 			defer clientRaw.Close()

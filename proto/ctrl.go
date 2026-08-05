@@ -3,48 +3,58 @@ package proto
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
+
+// ErrNegotiationIncompatible marks a syntactically readable negotiation that
+// cannot establish the mandatory wire contract. Listeners may safely answer
+// it with BYE(protocol-version) instead of collapsing the dial into EOF.
+var ErrNegotiationIncompatible = errors.New("proto: incompatible negotiation")
 
 // CtrlCode identifies a control-frame subtype. It occupies the low 8
 // bits of the FLAGS field when Header.Type == FrameCtrl.
 type CtrlCode uint8
 
 const (
-	CtrlHello          CtrlCode = 0x01
-	CtrlMigrateNotify  CtrlCode = 0x02
-	CtrlPathQuality    CtrlCode = 0x03
-	CtrlHeartbeat      CtrlCode = 0x04
-	CtrlBye            CtrlCode = 0x05
-	CtrlPathProbe      CtrlCode = 0x06
-	CtrlPathProbeReply CtrlCode = 0x07
-	CtrlPolicyPrepare  CtrlCode = 0x08
-	CtrlHelloAck       CtrlCode = 0x09
-	CtrlPolicyAck      CtrlCode = 0x0A
-	CtrlPolicyCommit   CtrlCode = 0x0B
-	CtrlBridgeTag      CtrlCode = 0x10
-	CtrlBridgeAck      CtrlCode = 0x11
+	CtrlHello                CtrlCode = 0x01
+	CtrlMigrateNotify        CtrlCode = 0x02
+	CtrlPathQuality          CtrlCode = 0x03
+	CtrlHeartbeat            CtrlCode = 0x04
+	CtrlBye                  CtrlCode = 0x05
+	CtrlPathProbe            CtrlCode = 0x06
+	CtrlPathProbeReply       CtrlCode = 0x07
+	CtrlPolicyPrepare        CtrlCode = 0x08
+	CtrlHelloAck             CtrlCode = 0x09
+	CtrlPolicyAck            CtrlCode = 0x0A
+	CtrlPolicyCommit         CtrlCode = 0x0B
+	CtrlPathAdmissionCommit  CtrlCode = 0x0C
+	CtrlPathAdmissionAck     CtrlCode = 0x0D
+	CtrlPathAdmissionConfirm CtrlCode = 0x0E
+	CtrlBridgeTag            CtrlCode = 0x10
+	CtrlBridgeAck            CtrlCode = 0x11
 )
 
 type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 3
+	ProtocolMinor uint16 = 4
 )
 
 type FeatureSet uint64
 
 const (
-	FeatureReplayLedger           FeatureSet = 1 << 0
-	FeatureDirectionalACK         FeatureSet = 1 << 1
-	FeatureStrictDecode           FeatureSet = 1 << 2
-	FeaturePolicyTransaction      FeatureSet = 1 << 3
-	FeaturePolicyReservation      FeatureSet = 1 << 4
-	FeatureDirectionalPathBinding FeatureSet = 1 << 5
-	FeatureRecursiveExecutor      FeatureSet = 1 << 6
+	FeatureReplayLedger             FeatureSet = 1 << 0
+	FeatureDirectionalACK           FeatureSet = 1 << 1
+	FeatureStrictDecode             FeatureSet = 1 << 2
+	FeaturePolicyTransaction        FeatureSet = 1 << 3
+	FeaturePolicyReservation        FeatureSet = 1 << 4
+	FeatureDirectionalPathBinding   FeatureSet = 1 << 5
+	FeatureRecursiveExecutor        FeatureSet = 1 << 6
+	FeaturePathAdmissionTransaction FeatureSet = 1 << 7
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -112,19 +122,19 @@ func decodeNegotiation(b []byte) (Negotiation, error) {
 	copy(n.SessionEpoch[:], b[24:40])
 	copy(n.GraphDigest[:], b[48:80])
 	if n.ProtocolMajor != ProtocolMajor {
-		return Negotiation{}, fmt.Errorf("proto: unsupported protocol major %d", n.ProtocolMajor)
+		return Negotiation{}, fmt.Errorf("%w: unsupported protocol major %d", ErrNegotiationIncompatible, n.ProtocolMajor)
 	}
 	if n.ProtocolMinor < ProtocolMinor {
-		return Negotiation{}, fmt.Errorf("proto: protocol minor %d lacks required v1 features", n.ProtocolMinor)
+		return Negotiation{}, fmt.Errorf("%w: protocol minor %d lacks required v1 features", ErrNegotiationIncompatible, n.ProtocolMinor)
 	}
 	if n.Required&^SupportedFeatures != 0 {
-		return Negotiation{}, fmt.Errorf("proto: unknown required features 0x%x", uint64(n.Required&^SupportedFeatures))
+		return Negotiation{}, fmt.Errorf("%w: unknown required features 0x%x", ErrNegotiationIncompatible, uint64(n.Required&^SupportedFeatures))
 	}
 	if n.Required&^n.Supported != 0 {
-		return Negotiation{}, fmt.Errorf("proto: required features not advertised as supported")
+		return Negotiation{}, fmt.Errorf("%w: required features not advertised as supported", ErrNegotiationIncompatible)
 	}
 	if RequiredFeatures&^n.Supported != 0 {
-		return Negotiation{}, fmt.Errorf("proto: peer lacks mandatory features 0x%x", uint64(RequiredFeatures&^n.Supported))
+		return Negotiation{}, fmt.Errorf("%w: peer lacks mandatory features 0x%x", ErrNegotiationIncompatible, uint64(RequiredFeatures&^n.Supported))
 	}
 	if n.GraphRevision == 0 {
 		return Negotiation{}, fmt.Errorf("proto: zero graph revision")
@@ -285,6 +295,12 @@ func (c CtrlCode) String() string {
 		return "POLICY_ACK"
 	case CtrlPolicyCommit:
 		return "POLICY_COMMIT"
+	case CtrlPathAdmissionCommit:
+		return "PATH_ADMISSION_COMMIT"
+	case CtrlPathAdmissionAck:
+		return "PATH_ADMISSION_ACK"
+	case CtrlPathAdmissionConfirm:
+		return "PATH_ADMISSION_CONFIRM"
 	case CtrlHelloAck:
 		return "HELLO_ACK"
 	case CtrlBridgeTag:
@@ -337,6 +353,9 @@ type HelloPayload struct {
 const HelloPayloadSize = NegotiationSize + 56
 
 func (p HelloPayload) Encode() ([]byte, error) {
+	if p.InstanceID == (InstanceID{}) {
+		return nil, fmt.Errorf("proto: hello has zero instance id")
+	}
 	manifest, err := p.LocalTXManifest.Encode()
 	if err != nil {
 		return nil, fmt.Errorf("proto: encode hello graph: %w", err)
@@ -371,6 +390,9 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 	}
 	copy(p.FlowID[:], b[80:96])
 	copy(p.InstanceID[:], b[96:112])
+	if p.InstanceID == (InstanceID{}) {
+		return HelloPayload{}, fmt.Errorf("proto: hello has zero instance id")
+	}
 	p.Caps = binary.BigEndian.Uint32(b[112:116])
 	copy(p.InitialTargetID[:], b[116:132])
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
@@ -408,6 +430,9 @@ type HelloAckPayload struct {
 const HelloAckPayloadSize = NegotiationSize + 112
 
 func (p HelloAckPayload) Encode() ([]byte, error) {
+	if p.InstanceID == (InstanceID{}) {
+		return nil, fmt.Errorf("proto: hello_ack has zero instance id")
+	}
 	manifest, err := p.LocalTXManifest.Encode()
 	if err != nil {
 		return nil, fmt.Errorf("proto: encode hello_ack graph: %w", err)
@@ -451,6 +476,9 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	}
 	copy(p.FlowID[:], b[80:96])
 	copy(p.InstanceID[:], b[96:112])
+	if p.InstanceID == (InstanceID{}) {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack has zero instance id")
+	}
 	p.Caps = binary.BigEndian.Uint32(b[112:116])
 	copy(p.InitialTargetID[:], b[116:132])
 	p.AcceptedPeerBinding.Revision = binary.BigEndian.Uint64(b[132:140])

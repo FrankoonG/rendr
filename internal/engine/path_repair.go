@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/FrankoonG/rendr/transport"
@@ -33,8 +34,46 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: path %d transport does not support local-addr migration", id)
 	}
+	if len(e.pathPredecessors[id]) != 0 {
+		e.pathsMu.Unlock()
+		return ErrPathAttachInProgress
+	}
+	for _, inFlight := range []map[uint32]*pathSlot{e.pendingPaths, e.stagedPaths} {
+		for _, candidate := range inFlight {
+			if sameBoundLeaf(slot, candidate) {
+				e.pathsMu.Unlock()
+				return ErrPathAttachInProgress
+			}
+		}
+	}
 	slot.maintenance.Store(true)
+	slot.fenceDispatch()
 	e.pathsMu.Unlock()
+
+	// Do not wait for a transport write while holding pathsMu. A PathConn may
+	// synchronously invoke OnDeath from Write, and that callback needs pathsMu.
+	fenceCtx, cancelFence := context.WithTimeout(context.Background(), e.limits.MigrationBudget)
+	err := slot.waitWriteIdle(fenceCtx)
+	cancelFence()
+	if err != nil {
+		e.pathsMu.Lock()
+		deaths := e.unwindFencedPathsLocked([]*pathSlot{slot})
+		e.pathsMu.Unlock()
+		e.processDeferredPathDeaths(deaths)
+		return fmt.Errorf("engine: local-addr migration write fence: %w", err)
+	}
+	e.pathsMu.Lock()
+	current := e.paths[id]
+	closed := e.isClosed()
+	var deaths []deferredPathDeath
+	if current != slot || closed || slot.deathPending.Load() {
+		deaths = e.unwindFencedPathsLocked([]*pathSlot{slot})
+	}
+	e.pathsMu.Unlock()
+	e.processDeferredPathDeaths(deaths)
+	if current != slot || closed || len(deaths) != 0 {
+		return fmt.Errorf("engine: path %d changed during local-addr migration fence", id)
+	}
 
 	newConn, err := migrator.MigratePathLocalAddr(newLocal)
 	if err != nil {
@@ -43,7 +82,7 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 			slot.maintenance.Store(false)
 		}
 		e.pathsMu.Unlock()
-		e.onPathDeath(id, slot.gen, transport.CauseTransportError, err)
+		e.onPathDeath(id, slot.owner, transport.CauseTransportError, err)
 		return err
 	}
 
@@ -61,9 +100,13 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		attached:        slot.attached,
 		recvQ:           make(chan recvFrame, recvQSize),
 		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
+		writePermit:     newPathWritePermit(),
 		quit:            make(chan struct{}),
 		doneR:           make(chan struct{}),
 		doneW:           make(chan struct{}),
+		doneP:           make(chan struct{}),
+		admissionInbox:  make(chan pathAdmissionMessage, pathAdmissionInboxSize),
+		admissionDone:   make(chan struct{}),
 	}
 
 	e.pathsMu.Lock()
@@ -73,13 +116,18 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		return fmt.Errorf("engine: path %d changed during local-addr migration", id)
 	}
 	newSlot.gen = e.nextPathGenerationLocked()
+	newSlot.owner = newSlot.gen
+	newSlot.unfenceDispatch()
+	newSlot.readerStarted.Store(true)
+	newSlot.writerStarted.Store(true)
+	newSlot.proberStarted.Store(true)
 	e.paths[id] = newSlot
 	slot.closeQuit()
 	e.pathsMu.Unlock()
 
-	gen := newSlot.gen
+	owner := newSlot.owner
 	newConn.OnDeath(func(cause transport.DeathCause, err error) {
-		e.onPathDeath(id, gen, cause, err)
+		e.onPathDeath(id, owner, cause, err)
 	})
 	go e.readerLoop(newSlot)
 	go e.pathWriterLoop(newSlot)

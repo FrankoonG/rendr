@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -224,5 +225,88 @@ func TestDialPacketRejectsHelloAckWithoutPacketCapability(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("DialPacket accepted HELLO_ACK without CapsPacketMode")
+	}
+}
+
+func TestDialReportsTypedProtocolNegotiationRejection(t *testing.T) {
+	transportName := nextHandshakeAdversarialTransportName("typed-negotiation-reject")
+	path := newHandshakeAdversarialPath(func(frame []byte) ([]byte, error) {
+		if len(frame) < proto.HeaderSize {
+			return nil, fmt.Errorf("short HELLO frame: %d bytes", len(frame))
+		}
+		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Type != proto.FrameCtrl || proto.CtrlCodeFromFlags(hdr.Flags) != proto.CtrlHello {
+			return nil, fmt.Errorf("got %s, want HELLO", proto.CtrlCodeFromFlags(hdr.Flags))
+		}
+		response := make([]byte, proto.HeaderSize+1)
+		if err := (proto.Header{
+			Version: proto.Version,
+			Type:    proto.FrameCtrl,
+			Flags:   proto.FlagsForCtrl(proto.CtrlBye),
+		}).Encode(response[:proto.HeaderSize]); err != nil {
+			return nil, err
+		}
+		response[proto.HeaderSize] = byte(proto.ByeProtoVer)
+		return response, nil
+	})
+	registerHandshakeAdversarialTransport(t, transportName, path)
+
+	conn, err := handshakeAdversarialDialer(transportName).Dial(context.Background())
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(err, ErrPeerProtoVersion) {
+		t.Fatalf("Dial error=%v, want ErrPeerProtoVersion", err)
+	}
+}
+
+func TestListenerNegotiationRejectEmitsProtocolBye(t *testing.T) {
+	graph, err := compileTargetGraph(Path("path", PathSpec{Transport: "test", Address: "peer"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowID := [16]byte{1}
+	negotiation := proto.NewNegotiation(proto.SessionEpoch(flowID))
+	digest, err := graph.manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	negotiation.GraphDigest = digest
+	payload, err := (proto.HelloPayload{
+		Negotiation:     negotiation,
+		FlowID:          flowID,
+		InstanceID:      proto.InstanceID{1},
+		InitialTargetID: graph.manifest.RootID,
+		LocalTXManifest: graph.manifest,
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint16(payload[2:4], proto.ProtocolMinor-1)
+
+	byeObserved := false
+	path := newHandshakeAdversarialPath(func(frame []byte) ([]byte, error) {
+		if len(frame) != proto.HeaderSize+1 {
+			return nil, fmt.Errorf("BYE frame size=%d", len(frame))
+		}
+		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Type != proto.FrameCtrl || proto.CtrlCodeFromFlags(hdr.Flags) != proto.CtrlBye ||
+			proto.ByeReason(frame[proto.HeaderSize]) != proto.ByeProtoVer {
+			return nil, fmt.Errorf("unexpected negotiation rejection frame")
+		}
+		byeObserved = true
+		return nil, nil
+	})
+	if _, err := decodeHelloForAdmission(path, payload); !errors.Is(err, proto.ErrNegotiationIncompatible) {
+		t.Fatalf("decode error=%v, want incompatible negotiation", err)
+	}
+	if !byeObserved {
+		t.Fatal("listener did not emit protocol BYE")
 	}
 }

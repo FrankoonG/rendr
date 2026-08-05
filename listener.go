@@ -131,11 +131,11 @@ func (l *tcpListener) serveIncoming(rawC net.Conn) {
 		_ = pc.Close()
 		return
 	}
-	if hdr.Type != proto.FrameCtrl {
+	code, ok := canonicalFirstControlCode(hdr)
+	if !ok {
 		_ = pc.Close()
 		return
 	}
-	code := proto.CtrlCodeFromFlags(hdr.Flags)
 	switch code {
 	case proto.CtrlHello:
 		l.handleHello(pc, payload)
@@ -147,12 +147,51 @@ func (l *tcpListener) serveIncoming(rawC net.Conn) {
 	}
 }
 
+func canonicalFirstControlCode(hdr proto.Header) (proto.CtrlCode, bool) {
+	if hdr.Version != proto.Version || hdr.Type != proto.FrameCtrl || hdr.Last || hdr.Seq != 0 {
+		return 0, false
+	}
+	code := proto.CtrlCodeFromFlags(hdr.Flags)
+	if hdr.Flags != proto.FlagsForCtrl(code) || (code != proto.CtrlHello && code != proto.CtrlBridgeTag) {
+		return 0, false
+	}
+	return code, true
+}
+
+func decodeHelloForAdmission(pc transport.PathConn, payload []byte) (proto.HelloPayload, error) {
+	hello, err := proto.DecodeHello(payload)
+	if err != nil && errors.Is(err, proto.ErrNegotiationIncompatible) {
+		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+	}
+	return hello, err
+}
+
+func reserveInitialBridge(table *engine.BridgeTable, flowID [16]byte, pc transport.PathConn) (engine.BridgeReservation, bool) {
+	reservation, err := table.Reserve(flowID)
+	if err != nil {
+		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
+		_ = pc.Close()
+		return engine.BridgeReservation{}, false
+	}
+	return reservation, true
+}
+
 func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
-	p, err := proto.DecodeHello(payload)
+	p, err := decodeHelloForAdmission(pc, payload)
 	if err != nil {
 		_ = pc.Close()
 		return
 	}
+	reservation, ok := reserveInitialBridge(l.bridges, p.FlowID, pc)
+	if !ok {
+		return
+	}
+	activated := false
+	defer func() {
+		if !activated {
+			l.bridges.Abort(reservation)
+		}
+	}()
 
 	e := engine.New(engine.SideServer, p.FlowID, engine.Limits{})
 	if err := e.AcceptPeerNegotiation(p.Negotiation, p.LocalTXManifest); err != nil {
@@ -169,28 +208,23 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerInstanceID(p.InstanceID)
 	e.SetPeerCaps(p.Caps)
-	if !l.bridges.Put(p.FlowID, e) {
-		// Collision: BYE and drop.
-		_ = engine.PerformBye(pc, proto.ByeProtoVer, 0)
-		_ = pc.Close()
-		_ = e.Close()
-		return
-	}
-
 	spec := specFromAddrName(pc.RemoteAddr(), helloPathName(p))
 	pathID, localTargetID, err := attachServerPath(e, pc, spec, p.InitialTargetID)
 	if err != nil {
-		l.bridges.Remove(p.FlowID)
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
-	if err := acknowledgeInitialServerPath(e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p.InitialTargetID); err != nil {
-		l.bridges.Remove(p.FlowID)
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.instanceID, eLocalCaps(e), localTargetID, p, payload); err != nil {
 		_ = pc.Close()
 		_ = e.Close()
 		return
 	}
+	if err := l.bridges.Activate(reservation, e); err != nil {
+		_ = e.Close()
+		return
+	}
+	activated = true
 
 	c := &engine.Conn{
 		E:     e,
@@ -200,10 +234,10 @@ func (l *tcpListener) handleHello(pc *tcp.PathConn, payload []byte) {
 	bc := newEngineBackedConn(e, c, ModeSelector)
 
 	// GC bridge entry when the engine dies.
-	go func(flowID [16]byte) {
+	go func() {
 		<-bc.e.Closed()
-		l.bridges.Remove(flowID)
-	}(p.FlowID)
+		l.bridges.RemoveActive(reservation, e)
+	}()
 
 	select {
 	case l.accept <- bc:
@@ -248,7 +282,7 @@ func (l *tcpListener) handleBridgeTag(pc *tcp.PathConn, payload []byte) {
 		_ = pc.Close()
 		return
 	}
-	_ = acknowledgeServerPath(e, pathID, pc, p, l.instanceID, localTargetID)
+	_ = acknowledgeServerPath(context.Background(), e, pathID, pc, p, payload, l.instanceID, localTargetID)
 }
 
 func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID) (uint32, proto.TargetID, error) {
@@ -267,24 +301,16 @@ func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, pe
 	return id, localTargetID, err
 }
 
-func acknowledgeServerPath(e *engine.Engine, pathID uint32, pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, localTargetID proto.TargetID) error {
-	if err := engine.PerformBridgeAckForTarget(pc, tag, instanceID, localTargetID, proto.AckOK, ""); err != nil {
-		e.AbortPathAttach(pathID, err)
-		return err
-	}
-	if err := e.CommitPathAttach(pathID); err != nil {
+func acknowledgeServerPath(ctx context.Context, e *engine.Engine, pathID uint32, pc transport.PathConn, tag proto.BridgeTagPayload, proposalWire []byte, instanceID proto.InstanceID, localTargetID proto.TargetID) error {
+	if err := engine.PerformServerBridgeAdmission(ctx, pc, e, pathID, instanceID, localTargetID, tag, proposalWire); err != nil {
 		e.AbortPathAttach(pathID, err)
 		return err
 	}
 	return nil
 }
 
-func acknowledgeInitialServerPath(e *engine.Engine, pathID uint32, pc transport.PathConn, instanceID proto.InstanceID, caps uint32, localTargetID, peerTargetID proto.TargetID) error {
-	if err := engine.PerformHelloAck(pc, e, instanceID, caps, localTargetID, peerTargetID); err != nil {
-		e.AbortPathAttach(pathID, err)
-		return err
-	}
-	if err := e.CommitPathAttach(pathID); err != nil {
+func acknowledgeInitialServerPath(ctx context.Context, e *engine.Engine, pathID uint32, pc transport.PathConn, instanceID proto.InstanceID, caps uint32, localTargetID proto.TargetID, hello proto.HelloPayload, proposalWire []byte) error {
+	if err := engine.PerformServerHelloAdmission(ctx, pc, e, pathID, instanceID, caps, localTargetID, hello.InitialTargetID, hello, proposalWire); err != nil {
 		e.AbortPathAttach(pathID, err)
 		return err
 	}
