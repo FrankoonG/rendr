@@ -75,6 +75,7 @@ type SessionListener struct {
 	inflight     map[uint64]transport.PathConn
 	nextInflight atomic.Uint64
 	closing      bool
+	workers      sync.WaitGroup
 
 	closeOnce sync.Once
 	closeErr  error
@@ -155,7 +156,11 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 		l.carriers[source.Name] = source.Carrier
 		l.addrs = append(l.addrs, source.Listener.Addr())
 		l.closers = append(l.closers, source.Listener.Close)
-		go l.acceptStreamSource(source)
+		l.workers.Add(1)
+		go func(source StreamSource) {
+			defer l.workers.Done()
+			l.acceptStreamSource(source)
+		}(source)
 	}
 	for _, source := range config.Packets {
 		l.carriers[source.Name] = source.Carrier
@@ -166,7 +171,11 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 		}
 		l.addrs = append(l.addrs, packetListener.Addr())
 		l.closers = append(l.closers, packetListener.Close)
-		go l.acceptPacketSource(source, packetListener)
+		l.workers.Add(1)
+		go func(source PacketSource, packetListener *uflow.Listener) {
+			defer l.workers.Done()
+			l.acceptPacketSource(source, packetListener)
+		}(source, packetListener)
 	}
 	return l, nil
 }
@@ -285,9 +294,13 @@ func (l *SessionListener) acceptStreamSource(source StreamSource) {
 			_ = pc.Close()
 			return
 		}
-		go l.serveIncoming(inflightID, source.Name, source.Carrier, pc, func() {
-			_ = raw.SetDeadline(time.Time{})
-		})
+		l.workers.Add(1)
+		go func() {
+			defer l.workers.Done()
+			l.serveIncoming(inflightID, source.Name, source.Carrier, pc, func() {
+				_ = raw.SetDeadline(time.Time{})
+			})
+		}()
 	}
 }
 
@@ -317,7 +330,11 @@ func (l *SessionListener) acceptPacketSource(source PacketSource, listener *uflo
 			_ = pc.Close()
 			return
 		}
-		go l.serveIncoming(inflightID, source.Name, source.Carrier, pc, func() {})
+		l.workers.Add(1)
+		go func() {
+			defer l.workers.Done()
+			l.serveIncoming(inflightID, source.Name, source.Carrier, pc, func() {})
+		}()
 	}
 }
 
@@ -460,7 +477,11 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		if l.publishPacket(inflightID, conn) {
 			slotHeld = false
 		} else {
-			_ = conn.Close()
+			// The application never acquired this session, so there is no
+			// graceful-close obligation. A graceful BYE can wait the full
+			// migration budget after listener shutdown has already removed every
+			// route, pinning the worker that shutdown is joining.
+			_ = e.Close()
 		}
 		return true
 	}
@@ -469,7 +490,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	if l.publishStream(inflightID, conn) {
 		slotHeld = false
 	} else {
-		_ = conn.Close()
+		_ = e.Close()
 	}
 	return true
 }
@@ -608,7 +629,9 @@ func (l *SessionListener) sourceEnded(err error) {
 	cause := l.sourceErr
 	l.sourceMu.Unlock()
 	if last {
-		l.shutdown(cause)
+		// sourceEnded runs inside a counted source worker. Shutdown joins all
+		// workers, so transfer ownership to another goroutine before returning.
+		go l.shutdown(cause)
 	}
 }
 
@@ -626,6 +649,7 @@ func (l *SessionListener) shutdown(cause error) {
 			}
 		}
 		l.closeInflight()
+		l.workers.Wait()
 		l.drainQueuedSessions()
 		l.runtime.releaseListener(l)
 	})
@@ -731,7 +755,7 @@ func (l *SessionListener) drainQueuedSessions() {
 		select {
 		case conn := <-l.streamAccept:
 			l.releaseAcceptSlot(false)
-			_ = conn.Close()
+			_ = conn.e.Close()
 		default:
 			goto packets
 		}
@@ -742,7 +766,7 @@ packets:
 		select {
 		case conn := <-l.packetAccept:
 			l.releaseAcceptSlot(true)
-			_ = conn.Close()
+			_ = conn.e.Close()
 		default:
 			return
 		}

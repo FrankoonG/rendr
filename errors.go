@@ -26,6 +26,7 @@ var (
 	ErrPacketTooLarge              = engine.ErrPacketTooLarge
 	ErrRecvWindowExceeded          = engine.ErrRecvWindowExceeded
 	ErrPathAdmissionOutcomeUnknown = engine.ErrPathAdmissionOutcomeUnknown
+	ErrPathAdmissionRejected       = engine.ErrPathAdmissionRejected
 
 	// ErrReadDeadlineExceeded is the sentinel returned by Read /
 	// ReadFrom when a SetReadDeadline-set deadline elapses before

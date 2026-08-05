@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +10,118 @@ import (
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
+
+func TestBridgeAdmissionRejectionIsNotProtocolViolation(t *testing.T) {
+	initialClient, initialServer := newMemoryPathPair()
+	client, server := establishHelloAdmissionPair(t, initialClient, initialServer)
+	clientPath, serverPath := newMemoryPathPair()
+	serverDone := make(chan error, 1)
+	go func() {
+		hdr, proposal, err := ReadFirstFrame(serverPath)
+		if err == nil {
+			err = validateAdmissionHeader(hdr, proto.CtrlBridgeTag)
+		}
+		var tag proto.BridgeTagPayload
+		if err == nil {
+			tag, err = proto.DecodeBridgeTag(proposal)
+		}
+		if err == nil {
+			err = PerformBridgeAck(serverPath, tag, server.LocalInstanceID(), proto.AckRejectAttach, "injected rejection")
+		}
+		serverDone <- err
+	}()
+	_, err := PerformClientBridgeAdmissionContext(context.Background(), clientPath, client, "a", transport.PathSpec{Transport: "memory"})
+	if err == nil {
+		t.Fatal("bridge rejection was accepted")
+	}
+	if !errors.Is(err, ErrPathAdmissionRejected) {
+		t.Fatalf("bridge rejection error=%v, want %v", err, ErrPathAdmissionRejected)
+	}
+	if errors.Is(err, ErrPeerProtocol) {
+		t.Fatalf("valid bridge rejection was misclassified as peer protocol failure: %v", err)
+	}
+	if serverErr := <-serverDone; serverErr != nil {
+		t.Fatal(serverErr)
+	}
+	if got := len(client.Paths()); got != 1 {
+		t.Fatalf("rejected bridge published client path: %v", client.Paths())
+	}
+	if got := len(server.Paths()); got != 1 {
+		t.Fatalf("rejected bridge published server path: %v", server.Paths())
+	}
+}
+
+func TestBridgeAdmissionMalformedAndMismatchedAckAreProtocolFailures(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload func(proto.BridgeTagPayload, *Engine) []byte
+	}{
+		{
+			name: "malformed",
+			payload: func(proto.BridgeTagPayload, *Engine) []byte {
+				return []byte{1, 2, 3}
+			},
+		},
+		{
+			name: "binding mismatch",
+			payload: func(tag proto.BridgeTagPayload, server *Engine) []byte {
+				responderTargetID, err := server.LocalPathTargetID("a")
+				if err != nil {
+					panic(err)
+				}
+				ack := proto.BridgeAckPayload{
+					BridgeID:          tag.BridgeID,
+					AttachID:          tag.AttachID,
+					InstanceID:        server.LocalInstanceID(),
+					SessionEpoch:      tag.SessionEpoch,
+					Direction:         tag.Direction,
+					GraphRevision:     tag.GraphRevision,
+					GraphDigest:       tag.GraphDigest,
+					TargetID:          tag.TargetID,
+					ResponderTargetID: responderTargetID,
+					Code:              proto.AckOK,
+				}
+				ack.AttachID[0] ^= 0xff
+				return ack.Encode()
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			initialClient, initialServer := newMemoryPathPair()
+			client, server := establishHelloAdmissionPair(t, initialClient, initialServer)
+			clientPath, serverPath := newMemoryPathPair()
+			serverDone := make(chan error, 1)
+			go func() {
+				hdr, proposal, err := ReadFirstFrame(serverPath)
+				if err == nil {
+					err = validateAdmissionHeader(hdr, proto.CtrlBridgeTag)
+				}
+				var tag proto.BridgeTagPayload
+				if err == nil {
+					tag, err = proto.DecodeBridgeTag(proposal)
+				}
+				if err == nil {
+					err = writeAdmissionCtrlContext(context.Background(), serverPath, proto.CtrlBridgeAck, test.payload(tag, server))
+				}
+				serverDone <- err
+			}()
+			_, err := PerformClientBridgeAdmissionContext(context.Background(), clientPath, client, "a", transport.PathSpec{Transport: "memory"})
+			if !errors.Is(err, ErrPeerProtocol) {
+				t.Fatalf("bridge admission error=%v, want %v", err, ErrPeerProtocol)
+			}
+			if errors.Is(err, ErrPathAdmissionRejected) {
+				t.Fatalf("malformed peer response was classified as valid rejection: %v", err)
+			}
+			if serverErr := <-serverDone; serverErr != nil {
+				t.Fatal(serverErr)
+			}
+			if got := len(client.Paths()); got != 1 {
+				t.Fatalf("malformed bridge response published client path: %v", client.Paths())
+			}
+		})
+	}
+}
 
 type helloAdmissionServerResult struct {
 	engine *Engine
@@ -19,6 +132,36 @@ type admissionDropPath struct {
 	transport.PathConn
 	mu    sync.Mutex
 	drops map[string]int
+}
+
+type blockingAdmissionPath struct {
+	transport.PathConn
+	key         string
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingAdmissionPath(pc transport.PathConn, key string) *blockingAdmissionPath {
+	return &blockingAdmissionPath{
+		PathConn: pc,
+		key:      key,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+}
+
+func (p *blockingAdmissionPath) Write(frame []byte) (int, error) {
+	if admissionFrameKey(frame) == p.key {
+		p.enteredOnce.Do(func() { close(p.entered) })
+		<-p.release
+	}
+	return p.PathConn.Write(frame)
+}
+
+func (p *blockingAdmissionPath) unblock() {
+	p.releaseOnce.Do(func() { close(p.release) })
 }
 
 func (p *admissionDropPath) remaining(key string) int {
@@ -181,7 +324,6 @@ func TestHelloAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 		{name: "confirm", clientDrop: "confirm"},
 		{name: "final", serverDrop: "final"},
 		{name: "activated", serverDrop: "activated"},
-		{name: "activated-receipt", clientDrop: "activated"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -217,9 +359,11 @@ func TestHelloAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 func TestBridgeAdmissionSupersedesSameLeafWithoutDataLoss(t *testing.T) {
 	initialClientPath, initialServerPath := newMemoryPathPair()
 	client, server := establishHelloAdmissionPair(t, initialClientPath, initialServerPath)
-	// The client emits the terminal receipt before returning; allow the server
-	// reader to release the initial transaction reservation.
-	time.Sleep(20 * time.Millisecond)
+	waitAdmissionCondition(t, time.Second, "initial admission cleanup", func() bool {
+		clientState, serverState := snapshotAdmissionSets(client), snapshotAdmissionSets(server)
+		return clientState.byPath == 0 && clientState.retained == 0 && clientState.predecessors == 0 &&
+			serverState.byPath == 0 && serverState.retained == 0 && serverState.predecessors == 0
+	})
 	oldClient, oldServer := client.ActivePath(), server.ActivePath()
 
 	clientPath, serverPath := newMemoryPathPair()
@@ -261,7 +405,6 @@ func TestBridgeAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 		{name: "confirm", clientDrop: "confirm"},
 		{name: "final", serverDrop: "final"},
 		{name: "activated", serverDrop: "activated"},
-		{name: "activated-receipt", clientDrop: "activated"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -299,8 +442,118 @@ func TestBridgeAdmissionRecoversEveryDroppedPhase(t *testing.T) {
 	}
 }
 
+func TestBridgeAdmissionRemovalWaitsForResponderActivation(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	initialClient, initialServer := newMemoryPathPair()
+	client, server := establishHelloAdmissionPairWithGraph(t, initialClient, initialServer, manifest, "a")
+
+	clientPath, serverBase := newMemoryPathPair()
+	serverPath := newBlockingAdmissionPath(serverBase, "activated")
+	t.Cleanup(serverPath.unblock)
+	serverDone := startServerBridgeAdmission(server, serverPath)
+	type clientResult struct {
+		admission ClientBridgeAdmission
+		err       error
+	}
+	clientDone := make(chan clientResult, 1)
+	go func() {
+		admission, err := PerformClientBridgeAdmissionContext(context.Background(), clientPath, client, "b",
+			transport.PathSpec{Transport: "memory"})
+		clientDone <- clientResult{admission: admission, err: err}
+	}()
+
+	select {
+	case <-serverPath.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("responder did not reach terminal ACTIVATED write")
+	}
+
+	var pathID uint32
+	var slot *pathSlot
+	waitAdmissionCondition(t, time.Second, "admitted b path publication", func() bool {
+		client.pathsMu.RLock()
+		defer client.pathsMu.RUnlock()
+		for id, candidate := range client.paths {
+			if candidate.localTXTargetID == ids["b"] {
+				pathID, slot = id, candidate
+				return true
+			}
+		}
+		return false
+	})
+
+	removed := make(chan error, 1)
+	go func() { removed <- client.RemovePath(pathID) }()
+	waitAdmissionCondition(t, time.Second, "removal admission wait", func() bool {
+		return slot.removeWaiters.Load() > 0
+	})
+	select {
+	case <-slot.admissionDone:
+		t.Fatal("admission barrier closed before responder ACTIVATED was received")
+	default:
+	}
+	select {
+	case err := <-removed:
+		t.Fatalf("RemovePath crossed unreceived responder activation: %v", err)
+	default:
+	}
+
+	serverPath.unblock()
+	select {
+	case result := <-clientDone:
+		if result.err != nil {
+			t.Fatalf("client bridge admission: %v", result.err)
+		}
+		if result.admission.PathID != pathID {
+			t.Fatalf("client admitted path=%d, want %d", result.admission.PathID, pathID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client admission did not finish after responder activation release")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server bridge admission: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server admission did not finish after responder activation release")
+	}
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatalf("remove admitted path: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RemovePath did not resume after responder activation")
+	}
+	if got := client.Paths(); len(got) != 1 || got[0].ID == pathID {
+		t.Fatalf("remaining client paths=%v after removing admitted path %d", got, pathID)
+	}
+}
+
 func performBridgeAdmissionPair(t *testing.T, client, server *Engine, clientPath, serverPath transport.PathConn) ClientBridgeAdmission {
+	return performBridgeAdmissionPairTarget(t, client, server, clientPath, serverPath, "a")
+}
+
+func performBridgeAdmissionPairTarget(t *testing.T, client, server *Engine, clientPath, serverPath transport.PathConn, targetName string) ClientBridgeAdmission {
 	t.Helper()
+	serverDone := startServerBridgeAdmission(server, serverPath)
+	admission, err := PerformClientBridgeAdmissionContext(context.Background(), clientPath, client, targetName,
+		transport.PathSpec{Transport: "memory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	return admission
+}
+
+func startServerBridgeAdmission(server *Engine, serverPath transport.PathConn) <-chan error {
 	serverDone := make(chan error, 1)
 	go func() {
 		hdr, proposalWire, err := ReadFirstFrame(serverPath)
@@ -336,15 +589,7 @@ func performBridgeAdmissionPair(t *testing.T, client, server *Engine, clientPath
 		}
 		serverDone <- err
 	}()
-	admission, err := PerformClientBridgeAdmissionContext(context.Background(), clientPath, client, "a",
-		transport.PathSpec{Transport: "memory"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := <-serverDone; err != nil {
-		t.Fatal(err)
-	}
-	return admission
+	return serverDone
 }
 
 func assertAdmissionPayload(t *testing.T, sender, receiver *Engine, payload []byte) {
@@ -365,6 +610,11 @@ func establishHelloAdmissionPair(t *testing.T, clientPath, serverPath transport.
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
 	)
+	return establishHelloAdmissionPairWithGraph(t, clientPath, serverPath, manifest, "a")
+}
+
+func establishHelloAdmissionPairWithGraph(t *testing.T, clientPath, serverPath transport.PathConn, manifest proto.GraphManifest, initialName string) (*Engine, *Engine) {
+	t.Helper()
 	client := New(SideClient, NewClientFlowID(), Limits{ZombieMaxMigrations: 10}.Clamp())
 	if err := client.ConfigureLocalGraph(1, manifest); err != nil {
 		t.Fatal(err)
@@ -397,7 +647,7 @@ func establishHelloAdmissionPair(t *testing.T, clientPath, serverPath transport.
 		}
 		var localTargetID proto.TargetID
 		if err == nil {
-			localTargetID, err = server.LocalPathTargetID("a")
+			localTargetID, err = server.LocalPathTargetID(initialName)
 		}
 		var pathID uint32
 		if err == nil {
@@ -412,7 +662,7 @@ func establishHelloAdmissionPair(t *testing.T, clientPath, serverPath transport.
 		serverDone <- helloAdmissionServerResult{engine: server, err: err}
 	}()
 	admission, err := PerformClientHelloAdmissionContext(context.Background(), clientPath, client,
-		clientInstance, 0, "a", transport.PathSpec{Transport: "memory"})
+		clientInstance, 0, initialName, transport.PathSpec{Transport: "memory"})
 	if err != nil {
 		_ = client.Close()
 		t.Fatal(err)

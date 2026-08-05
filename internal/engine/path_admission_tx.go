@@ -62,16 +62,16 @@ func PerformClientHelloAdmissionContext(
 	}
 	ack, err := proto.DecodeHelloAck(responseWire)
 	if err != nil {
-		return ClientHelloAdmission{}, err
+		return ClientHelloAdmission{}, classifyPeerHandshakeError("malformed HELLO_ACK", err)
 	}
 	if err := validateClientHelloAck(e, hello, ack); err != nil {
-		return ClientHelloAdmission{}, err
+		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
 	if peerPacket := ack.Caps&proto.CapsPacketMode != 0; peerPacket != (caps&proto.CapsPacketMode != 0) {
-		return ClientHelloAdmission{}, fmt.Errorf("engine: peer session kind mismatch: packet=%t", peerPacket)
+		return ClientHelloAdmission{}, fmt.Errorf("%w: peer session kind mismatch: packet=%t", ErrPeerProtocol, peerPacket)
 	}
 	if err := e.AcceptPeerNegotiation(ack.Negotiation, ack.LocalTXManifest); err != nil {
-		return ClientHelloAdmission{}, err
+		return ClientHelloAdmission{}, classifyPeerHandshakeError("HELLO_ACK negotiation", err)
 	}
 	pathID, err := e.PreparePathBound(pc, spec, PathBinding{
 		LocalTXTargetID: localTargetID,
@@ -135,10 +135,13 @@ func PerformClientBridgeAdmissionContext(
 	}
 	ack, err := proto.DecodeBridgeAck(responseWire)
 	if err != nil {
-		return ClientBridgeAdmission{}, err
+		return ClientBridgeAdmission{}, fmt.Errorf("%w: malformed BRIDGE_ACK: %v", ErrPeerProtocol, err)
+	}
+	if !ack.Code.OK() {
+		return ClientBridgeAdmission{}, fmt.Errorf("%w: %s: %s", ErrPathAdmissionRejected, ack.Code, ack.Reason)
 	}
 	if err := validateClientBridgeAck(e, tag, ack); err != nil {
-		return ClientBridgeAdmission{}, err
+		return ClientBridgeAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
 	pathID, err := e.PreparePathBound(pc, spec, PathBinding{
 		LocalTXTargetID: localTargetID,
@@ -294,25 +297,10 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	}); err != nil {
 		return err
 	}
-	activatedReceipt := proto.PathAdmissionAck{
-		PathAdmissionBinding: commit.PathAdmissionBinding,
-		Phase:                proto.PathAdmissionPhaseActivated,
-		Code:                 proto.AckOK,
-	}
-	activatedReceiptWire, err := activatedReceipt.Encode()
-	if err != nil {
-		return err
-	}
-	// Install replay state before releasing the live reservation. If the first
-	// terminal receipt is lost, duplicate ACTIVATED messages are answered by
-	// the bounded completed-admission path.
-	if err := e.rememberCompletedPathAdmission(pathID, commit.PathAdmissionBinding, proto.PathAdmissionPhaseActivated, activatedReceiptWire); err != nil {
-		return err
-	}
-	if err := e.CompletePathAdmissionBinding(pathID, commit.PathAdmissionBinding); err != nil {
-		return err
-	}
-	return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, activatedReceiptWire)
+	// ACTIVATED is the responder's terminal commit proof. The responder
+	// already learned that this side activated when it received FINAL, so an
+	// ACK-of-ACTIVATED would add only an unsatisfiable last-message ambiguity.
+	return e.CompletePathAdmissionBinding(pathID, commit.PathAdmissionBinding)
 }
 
 func performServerAdmission(
@@ -428,10 +416,14 @@ func performServerAdmission(
 	if err != nil {
 		return err
 	}
-	if err := e.WritePathAdmissionControlContext(postCommitCtx, pathID, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
+	// Install the replay response before releasing the live reservation. If
+	// ACTIVATED is lost after a successful local write, the initiator retries
+	// its byte-identical FINAL receipt and the completed path replays the same
+	// terminal proof.
+	if err := e.rememberCompletedPathAdmission(pathID, commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
 		return err
 	}
-	if err := waitForActivatedReceipt(postCommitCtx, e, pathID, commit, finalWire, activatedWire); err != nil {
+	if err := e.WritePathAdmissionControlContext(postCommitCtx, pathID, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
 		return err
 	}
 	if err := e.CompletePathAdmissionBinding(pathID, commit.PathAdmissionBinding); err != nil {
@@ -511,7 +503,7 @@ func sendProposalReadResponse(ctx context.Context, pc transport.PathConn, propos
 			return nil, err
 		}
 		if err := validateAdmissionHeader(hdr, proto.CtrlCodeFromFlags(hdr.Flags)); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 		}
 		code := proto.CtrlCodeFromFlags(hdr.Flags)
 		if code == proto.CtrlBye {
@@ -520,6 +512,7 @@ func sendProposalReadResponse(ctx context.Context, pc transport.PathConn, propos
 		if code == responseCode {
 			return payload, nil
 		}
+		return nil, fmt.Errorf("%w: expected %s, got %s", ErrPeerProtocol, responseCode, code)
 	}
 }
 
@@ -674,49 +667,6 @@ func waitForFinalReceipt(
 	}
 }
 
-func waitForActivatedReceipt(
-	ctx context.Context,
-	e *Engine,
-	pathID uint32,
-	commit proto.PathAdmissionCommit,
-	finalReceiptWire, activatedWire []byte,
-) error {
-	for {
-		code, payload, err := waitStagedAdmission(ctx, e, pathID, func() error {
-			return e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, activatedWire)
-		})
-		if err != nil {
-			return err
-		}
-		if code != proto.CtrlPathAdmissionAck {
-			continue
-		}
-		receipt, err := proto.DecodePathAdmissionAck(payload)
-		if err != nil {
-			return err
-		}
-		if receipt.Phase == proto.PathAdmissionPhaseFinal {
-			if !equalBytes(payload, finalReceiptWire) || receipt.ValidateForCommit(commit) != nil || !receipt.Code.OK() {
-				return fmt.Errorf("engine: invalid duplicate FINAL receipt")
-			}
-			if err := e.WritePathAdmissionControlContext(ctx, pathID, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
-				return err
-			}
-			continue
-		}
-		if receipt.Phase != proto.PathAdmissionPhaseActivated {
-			continue
-		}
-		if err := receipt.ValidateForCommit(commit); err != nil {
-			return err
-		}
-		if !receipt.Code.OK() {
-			return fmt.Errorf("engine: path admission ACTIVATED receipt rejected")
-		}
-		return nil
-	}
-}
-
 func admissionCommit(
 	kind proto.PathAdmissionKind,
 	epoch proto.SessionEpoch,
@@ -770,9 +720,6 @@ func validateClientBridgeAck(e *Engine, tag proto.BridgeTagPayload, ack proto.Br
 		ack.GraphDigest != tag.GraphDigest || ack.TargetID != tag.TargetID ||
 		ack.AttachID != tag.AttachID || ack.Direction != tag.Direction {
 		return fmt.Errorf("engine: BRIDGE_ACK binding mismatch")
-	}
-	if !ack.Code.OK() {
-		return fmt.Errorf("engine: bridge rejected: %s: %s", ack.Code, ack.Reason)
 	}
 	if _, err := e.PeerPathName(ack.ResponderTargetID); err != nil {
 		return fmt.Errorf("engine: BRIDGE_ACK responder target: %w", err)
@@ -904,4 +851,11 @@ func admissionByeError(payload []byte) error {
 		return ErrPeerProtoVersion
 	}
 	return fmt.Errorf("%w: %d", ErrPeerClosed, bye.Reason)
+}
+
+func classifyPeerHandshakeError(stage string, err error) error {
+	if errors.Is(err, proto.ErrNegotiationIncompatible) || errors.Is(err, ErrPeerProtoVersion) {
+		return fmt.Errorf("%w: %s: %v", ErrPeerProtoVersion, stage, err)
+	}
+	return fmt.Errorf("%w: %s: %v", ErrPeerProtocol, stage, err)
 }

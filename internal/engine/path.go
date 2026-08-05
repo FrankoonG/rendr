@@ -25,6 +25,18 @@ type deferredPathDeath struct {
 	err   error
 }
 
+type pathDeparture struct {
+	slot            *pathSlot
+	event           PathDeathEvent
+	cause           transport.DeathCause
+	err             error
+	explicitRemoval bool
+	shouldReplay    bool
+	migrated        bool
+	newActive       uint32
+	hasPaths        bool
+}
+
 // unwindFencedPathsLocked either makes a still-live predecessor dispatchable
 // again or consumes the death callback that arrived while maintenance held it.
 // Caller holds pathsMu and invokes processDeferredPathDeaths after unlocking.
@@ -70,7 +82,7 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 		e.pathsMu.Unlock()
 		go e.retireSupersededPath(staged)
 		e.firePathDeathHooks(PathDeathEvent{
-			ID: id, Spec: staged.spec.Clone(),
+			ID: id, Owner: staged.owner, Spec: staged.spec.Clone(),
 			Binding: PathBinding{LocalTXTargetID: staged.localTXTargetID, PeerTXTargetID: staged.peerTXTargetID},
 			Cause:   cause, Err: err,
 		})
@@ -114,12 +126,39 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 		e.pathsMu.Unlock()
 		return
 	}
-	shouldReplay := cause != transport.CauseCleanClose
+	departure := e.detachPathLocked(slot, runtime, cause, err, false)
+	e.pathsMu.Unlock()
+	e.finishPathDeparture(departure)
+}
+
+// detachPathLocked is the sole logical-departure transition for an active
+// path generation. The caller holds pathsMu. Carrier shutdown, callbacks, and
+// replay happen later in finishPathDeparture, after the topology commit.
+func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cause transport.DeathCause, err error, explicitRemoval bool) pathDeparture {
+	departure := pathDeparture{
+		slot:            slot,
+		cause:           cause,
+		err:             err,
+		explicitRemoval: explicitRemoval,
+		shouldReplay:    explicitRemoval || cause != transport.CauseCleanClose,
+		event: PathDeathEvent{
+			ID:    slot.id,
+			Owner: slot.owner,
+			Spec:  slot.spec.Clone(),
+			Binding: PathBinding{
+				LocalTXTargetID: slot.localTXTargetID,
+				PeerTXTargetID:  slot.peerTXTargetID,
+			},
+			Cause:          cause,
+			Err:            err,
+			Administrative: explicitRemoval,
+		},
+	}
 	slot.closeQuit()
-	delete(e.paths, id)
-	e.releasePathAdmissionLocked(id)
-	predecessorIDs := e.pathPredecessors[id]
-	delete(e.pathPredecessors, id)
+	delete(e.paths, slot.id)
+	e.releasePathAdmissionLocked(slot.id)
+	predecessorIDs := e.pathPredecessors[slot.id]
+	delete(e.pathPredecessors, slot.id)
 	var restored *pathSlot
 	rollbackAllowed := slot.admissionRollback.Load()
 	for _, predecessorID := range predecessorIDs {
@@ -148,12 +187,12 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 		restored.maintenance.Store(false)
 		restored.unfenceDispatch()
 		e.paths[restored.id] = restored
-		if e.dispatchScope[id] {
-			delete(e.dispatchScope, id)
+		if e.dispatchScope[slot.id] {
+			delete(e.dispatchScope, slot.id)
 			e.dispatchScope[restored.id] = true
 		}
 	}
-	wasActive := e.activeID == id
+	wasActive := e.activeID == slot.id
 	migratedOk := false
 	var newActive uint32
 	if wasActive {
@@ -186,50 +225,65 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 			e.migrationCount++
 		}
 	}
-	hasPaths := len(e.paths) > 0
-	e.pathsMu.Unlock()
-	e.firePathDeathHooks(PathDeathEvent{
-		ID:   id,
-		Spec: slot.spec.Clone(),
-		Binding: PathBinding{
-			LocalTXTargetID: slot.localTXTargetID,
-			PeerTXTargetID:  slot.peerTXTargetID,
-		},
-		Cause: cause,
-		Err:   err,
-	})
+	departure.migrated = migratedOk
+	departure.newActive = newActive
+	departure.hasPaths = len(e.paths) > 0
+	return departure
+}
+
+func (e *Engine) finishPathDeparture(departure pathDeparture) {
+	if departure.slot == nil {
+		return
+	}
+	e.firePathDeathHooks(departure.event)
 
 	// A transport may report death while a concurrent Write is blocked and
 	// only unblock that Write when Close is called. Close asynchronously: an
 	// adapter is allowed to invoke OnDeath from inside its own Close method,
 	// and recursively entering a sync.Once-backed Close would deadlock.
-	go e.retireSupersededPath(slot)
-
-	if migratedOk {
-		e.fireMigrateHooks(id, newActive, "death")
+	go e.retireSupersededPath(departure.slot)
+	if departure.explicitRemoval {
+		// A local administrative removal is clean for lifecycle policy, but it
+		// is not proof that every frame accepted by this carrier was ACKed.
+		// Replay from the cumulative ACK head on the surviving route.
+		e.requestReplay(e.sendAckNext.Load())
 	}
 
-	switch cause {
+	if departure.migrated {
+		e.fireMigrateHooks(departure.slot.id, departure.newActive, "death")
+	}
+
+	if departure.explicitRemoval {
+		// RemovePath commits only with a real survivor. If a concurrent fault
+		// consumes that survivor immediately afterward, preserve transport-loss
+		// semantics; an administrative action must never manufacture clean EOF.
+		if !departure.hasPaths {
+			go e.startMigrationBudget(departure.err)
+		}
+		return
+	}
+
+	switch departure.cause {
 	case transport.CauseCleanClose:
 		// Hard rule #2: only a clean close ends the engine. And only
 		// if this was the last path; partial cleanCloses on a
 		// non-final path are a no-op (the engine continues on
 		// remaining paths).
-		if !hasPaths {
+		if !departure.hasPaths {
 			e.setCloseErr(io.EOF)
 			_ = e.Close()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		if shouldReplay {
+		if departure.shouldReplay {
 			e.requestReplay(e.sendAckNext.Load())
 		}
 		// Successful death-driven migration counts for zombie
 		// accounting. Without a fresh path, fall through to budget.
-		if migratedOk {
+		if departure.migrated {
 			e.recordMigration()
 		}
-		if !hasPaths {
-			go e.startMigrationBudget(err)
+		if !departure.hasPaths {
+			go e.startMigrationBudget(departure.err)
 		}
 	}
 }

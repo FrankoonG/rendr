@@ -34,6 +34,10 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: path %d transport does not support local-addr migration", id)
 	}
+	if _, admissionLive := e.pathAdmissionByPath[id]; admissionLive {
+		e.pathsMu.Unlock()
+		return ErrPathAttachInProgress
+	}
 	if len(e.pathPredecessors[id]) != 0 {
 		e.pathsMu.Unlock()
 		return ErrPathAttachInProgress
@@ -121,6 +125,9 @@ func (e *Engine) MigratePathLocalAddr(id uint32, newLocal string) error {
 	newSlot.readerStarted.Store(true)
 	newSlot.writerStarted.Store(true)
 	newSlot.proberStarted.Store(true)
+	// Native repair replaces an already-admitted physical generation; it does
+	// not start a new path-admission transaction.
+	newSlot.completeAdmission()
 	e.paths[id] = newSlot
 	slot.closeQuit()
 	e.pathsMu.Unlock()

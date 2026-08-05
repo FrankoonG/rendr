@@ -39,7 +39,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 4
+	ProtocolMinor uint16 = 5
 )
 
 type FeatureSet uint64
@@ -53,8 +53,12 @@ const (
 	FeatureDirectionalPathBinding   FeatureSet = 1 << 5
 	FeatureRecursiveExecutor        FeatureSet = 1 << 6
 	FeaturePathAdmissionTransaction FeatureSet = 1 << 7
+	// FeaturePathAdmissionTerminalCommit makes responder ACTIVATED the final
+	// admission proof. Peers without it wait for an ambiguous terminal receipt
+	// and are not wire-state compatible with protocol minor 5.
+	FeaturePathAdmissionTerminalCommit FeatureSet = 1 << 8
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 

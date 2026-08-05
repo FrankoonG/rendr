@@ -269,6 +269,88 @@ func TestSelectorRedistributesUnackedFrameOnPathDeath(t *testing.T) {
 	}
 }
 
+func TestRemovePathReplaysUnackedFrame(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind proto.ExecutionKind
+	}{
+		{name: "selector", kind: proto.ExecutionKindSelector},
+		{name: "bond", kind: proto.ExecutionKindBond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kind := test.kind
+			flow := NewClientFlowID()
+			client := New(SideClient, flow, Limits{}.Clamp())
+			server := New(SideServer, flow, Limits{}.Clamp())
+			defer client.Close()
+			defer server.Close()
+			if err := client.ConfigureExecution(kind); err != nil {
+				t.Fatal(err)
+			}
+			if kind == proto.ExecutionKindBond {
+				client.SetBondPinSizeForTest(1)
+			}
+
+			c1, s1 := newMemoryPathPair()
+			c2, s2 := newMemoryPathPair()
+			c1.dropWrites.Store(true)
+			removedID, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
+				t.Fatal(err)
+			}
+			if kind == proto.ExecutionKindBond {
+				client.pathsMu.Lock()
+				client.bondCursor = ^uint64(0)
+				client.bondPinLeft = 0
+				client.pathsMu.Unlock()
+			}
+
+			payload := []byte("unacked-before-clean-remove")
+			if _, err := client.SendData(payload); err != nil {
+				t.Fatal(err)
+			}
+			if c1.Writes() != 1 || c2.Writes() != 0 {
+				t.Fatalf("initial route writes: removed=%d survivor=%d", c1.Writes(), c2.Writes())
+			}
+			if err := client.RemovePath(removedID); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(payload))
+			if _, err := io.ReadFull(&Conn{E: server}, got); err != nil {
+				t.Fatalf("replayed read: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("replayed payload=%q want=%q", got, payload)
+			}
+			deadline := time.Now().Add(time.Second)
+			for client.sendAckNext.Load() < 1 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if got := client.sendAckNext.Load(); got < 1 {
+				t.Fatalf("replayed frame was not acknowledged: sendAckNext=%d", got)
+			}
+			if got := c2.Writes(); got != 1 {
+				t.Fatalf("surviving path writes=%d, want one replay", got)
+			}
+			if got := server.RecvDups(); got != 0 {
+				t.Fatalf("server duplicate frames=%d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestExplicitMigrateReplaysUnackedFrames(t *testing.T) {
 	flow := NewClientFlowID()
 	client := New(SideClient, flow, Limits{}.Clamp())

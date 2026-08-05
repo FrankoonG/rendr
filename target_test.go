@@ -257,8 +257,11 @@ func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
 	if len(st.Paths) != 2 {
 		t.Fatalf("paths=%d want 2: %+v", len(st.Paths), st.Paths)
 	}
-	if st.Paths[0].Name != "A" || st.Paths[0].State != PathPending && st.Paths[0].State != PathUnavailable {
-		t.Fatalf("path A status=%+v want pending/unavailable", st.Paths[0])
+	pathARecovering := st.Paths[0].State == PathPending ||
+		st.Paths[0].State == PathDialing ||
+		st.Paths[0].State == PathUnavailable
+	if st.Paths[0].Name != "A" || !pathARecovering || st.Paths[0].Active {
+		t.Fatalf("path A status=%+v want inactive pending/dialing/unavailable", st.Paths[0])
 	}
 	if st.Paths[1].Name != "B" || st.Paths[1].State != PathAttached || !st.Paths[1].Active {
 		t.Fatalf("fallback status=%+v want active attached B", st.Paths[1])

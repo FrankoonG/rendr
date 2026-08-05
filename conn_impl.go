@@ -62,6 +62,9 @@ func (c *engineBackedConn) Close() error {
 		c.peak.stopLoop()
 	}
 	c.closing.Store(true)
+	if c.recovery != nil {
+		c.recovery.stop()
+	}
 	return c.e.GracefulClose(proto.ByeNormal)
 }
 func (c *engineBackedConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
@@ -139,16 +142,17 @@ func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
 // Paths is filled from engine.Paths() which is taken under a read
 // lock, so the snapshot is consistent across the path set.
 func (c *engineBackedConn) Stats() ConnStats {
+	topology := c.e.TopologySnapshot()
 	return ConnStats{
 		FlowID:         c.e.FlowID(),
-		State:          c.e.State().String(),
+		State:          topology.State.String(),
 		Mode:           Mode(c.mode.Load()),
-		ActivePath:     c.e.ActivePath(),
-		Paths:          c.e.Paths(),
+		ActivePath:     topology.ActivePath,
+		Paths:          topology.Paths,
 		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
 		RecvDups:       c.e.RecvDups(),
 		BondStuckSkips: c.e.BondStuckSkips(),
-		MigrationCount: c.e.MigrationCount(),
+		MigrationCount: topology.MigrationCount,
 		CreatedAt:      c.e.CreatedAt(),
 		PeerCaps:       c.e.PeerCaps(),
 		PeerInstanceID: c.e.PeerInstanceID(),
@@ -172,10 +176,27 @@ func (c *engineBackedConn) MigratePathLocalAddr(id uint32, newLocal string) erro
 func (c *engineBackedConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return c.addPath(ctx, spec)
+	resolved, err := c.graph.resolvePathSpec(spec, c.e.Paths())
+	if err != nil {
+		return 0, err
+	}
+	id, err := c.addPath(ctx, resolved)
+	if err == nil && c.recovery != nil {
+		// Re-enable the logical leaf even if the newly admitted physical path
+		// dies before AddPath returns and is already absent from Engine.Paths.
+		c.recovery.pathAdded(resolved, id)
+	}
+	return id, err
 }
 
 func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, error) {
+	if c.closing.Load() {
+		return 0, net.ErrClosed
+	}
+	spec, err := c.graph.resolvePathSpec(spec, c.e.Paths())
+	if err != nil {
+		return 0, err
+	}
 	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
@@ -184,10 +205,9 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 		_ = pc.Close()
 		return 0, err
 	}
-	spec, err = c.graph.resolvePathSpec(spec, c.e.Paths())
-	if err != nil {
+	if c.closing.Load() {
 		_ = pc.Close()
-		return 0, err
+		return 0, net.ErrClosed
 	}
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, pc, c.e, pathSpecName(spec), spec)
 	if err != nil {

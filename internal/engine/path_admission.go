@@ -173,9 +173,15 @@ func (e *Engine) releasePathAdmissionLocked(pathID uint32) {
 // and closes any retained predecessor after peer activation is proven.
 func (e *Engine) CompletePathAdmission(pathID uint32) {
 	e.pathsMu.Lock()
+	successor := e.paths[pathID]
+	if successor == nil {
+		e.pathsMu.Unlock()
+		return
+	}
+	retired := e.releasePathPredecessorsLocked(pathID, successor.gen)
 	e.releasePathAdmissionLocked(pathID)
 	e.pathsMu.Unlock()
-	e.ReleasePathPredecessors(pathID)
+	e.retirePathSet(retired)
 }
 
 // CompletePathAdmissionBinding makes delayed completion messages token-safe.
@@ -191,9 +197,15 @@ func (e *Engine) CompletePathAdmissionBinding(pathID uint32, binding proto.PathA
 		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: path %d admission completion token mismatch", pathID)
 	}
+	successor := e.paths[pathID]
+	if successor == nil {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: path %d admission successor is unavailable", pathID)
+	}
+	retired := e.releasePathPredecessorsLocked(pathID, successor.gen)
 	e.releasePathAdmissionLocked(pathID)
 	e.pathsMu.Unlock()
-	e.ReleasePathPredecessors(pathID)
+	e.retirePathSet(retired)
 	return nil
 }
 
@@ -204,9 +216,10 @@ func (e *Engine) completePathAdmissionGeneration(pathID uint32, generation uint6
 		e.pathsMu.Unlock()
 		return
 	}
+	retired := e.releasePathPredecessorsLocked(pathID, generation)
 	e.releasePathAdmissionLocked(pathID)
 	e.pathsMu.Unlock()
-	e.releasePathPredecessors(pathID, generation)
+	e.retirePathSet(retired)
 }
 
 func (e *Engine) rememberCompletedPathAdmission(pathID uint32, binding proto.PathAdmissionBinding, requestPhase proto.PathAdmissionPhase, response []byte) error {
@@ -235,7 +248,7 @@ func (e *Engine) completedPathAdmission(pathID uint32) (completedPathAdmission, 
 		return completedPathAdmission{}, false
 	}
 	entry := *slot.completedAdmission
-	if nowFn().After(entry.expires) {
+	if !nowFn().Before(entry.expires) {
 		if slot.completedAdmission != nil && slot.completedAdmission.binding == entry.binding {
 			slot.completedAdmission = nil
 		}

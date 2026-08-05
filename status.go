@@ -285,7 +285,8 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 		peerKind = PeerNative
 	default:
 	}
-	paths := e.Paths()
+	topology := e.TopologySnapshot()
+	paths := topology.Paths
 	out := tracker.snapshot(paths, carriers)
 	if out == nil {
 		out = make([]PathStatus, 0, len(paths))
@@ -295,7 +296,7 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 	}
 	return Status{
 		FlowID:   e.FlowID(),
-		State:    e.State().String(),
+		State:    topology.State.String(),
 		Protocol: sessionProtocolForEngine(e),
 		Local:    local.Caps,
 		Peer:     peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),

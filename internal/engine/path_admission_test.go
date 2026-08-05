@@ -2,12 +2,42 @@ package engine
 
 import (
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
+
+func TestPathAdmissionCannotPublishAfterGracefulCloseStarts(t *testing.T) {
+	t.Run("prepare", func(t *testing.T) {
+		e, binding := admissionTestEngine(t)
+		e.sendClosing.Store(true)
+		candidate, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		if _, err := e.PreparePathBound(candidate, transport.PathSpec{Transport: "memory"}, binding); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("prepare after close gate error=%v, want %v", err, net.ErrClosed)
+		}
+	})
+
+	t.Run("activate", func(t *testing.T) {
+		e, binding := admissionTestEngine(t)
+		candidate, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		id, err := e.PreparePathBound(candidate, transport.PathSpec{Transport: "memory"}, binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.StagePathAttach(id); err != nil {
+			t.Fatal(err)
+		}
+		e.sendClosing.Store(true)
+		if err := e.ActivateStagedPath(id, false); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("activate after close gate error=%v, want %v", err, net.ErrClosed)
+		}
+	})
+}
 
 func admissionTestEngine(t *testing.T) (*Engine, PathBinding) {
 	t.Helper()
@@ -64,6 +94,22 @@ func TestPathAdmissionLogicalGenerationAndCompletion(t *testing.T) {
 		t.Fatalf("prepare before completion error=%v, want %v", err, ErrPathAttachInProgress)
 	}
 	e.CompletePathAdmission(id)
+	e.pathsMu.RLock()
+	successor := e.paths[id]
+	predecessors := append([]uint32(nil), e.pathPredecessors[id]...)
+	retained := len(e.retainedPaths)
+	e.pathsMu.RUnlock()
+	if successor == nil {
+		t.Fatal("completed admission lost successor")
+	}
+	select {
+	case <-successor.admissionDone:
+	default:
+		t.Fatal("completed admission returned before closing removal barrier")
+	}
+	if len(predecessors) != 0 || retained != 0 {
+		t.Fatalf("completed admission returned with predecessor ownership: predecessors=%v retained=%d", predecessors, retained)
+	}
 	deadline := time.Now().Add(time.Second)
 	for !old.closed.Load() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -82,6 +128,114 @@ func TestPathAdmissionLogicalGenerationAndCompletion(t *testing.T) {
 		t.Fatalf("next base=%d err=%v, want 2", base, err)
 	}
 	e.AbortPathAttach(nextID, nil)
+}
+
+func TestRemovePathWaitsForAdmissionCompletion(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	a, aPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = aPeer.Close() })
+	if _, err := e.AttachPathBound(a, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: ids["a"], PeerTXTargetID: ids["a"],
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, bPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = bPeer.Close() })
+	bID, err := e.PreparePathBound(b, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.StagePathAttach(bID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ActivateStagedPath(bID, true); err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.RLock()
+	bSlot := e.paths[bID]
+	e.pathsMu.RUnlock()
+
+	removed := make(chan error, 1)
+	go func() { removed <- e.RemovePath(bID) }()
+	deadline := time.Now().Add(time.Second)
+	for bSlot.removeWaiters.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if bSlot.removeWaiters.Load() == 0 {
+		t.Fatal("RemovePath did not enter admission wait")
+	}
+	select {
+	case err := <-removed:
+		t.Fatalf("RemovePath crossed unfinished admission barrier: %v", err)
+	default:
+	}
+	e.CompletePathAdmission(bID)
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RemovePath did not resume after admission completion")
+	}
+}
+
+func TestAdmissionRetentionTimeoutCompletesRemovalBarrier(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{MigrationBudget: 20 * time.Millisecond}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	a, aPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = aPeer.Close() })
+	if _, err := e.AttachPathBound(a, transport.PathSpec{Transport: "memory"}, PathBinding{LocalTXTargetID: ids["a"], PeerTXTargetID: ids["a"]}); err != nil {
+		t.Fatal(err)
+	}
+	b, bPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = bPeer.Close() })
+	bID, err := e.PreparePathBound(b, transport.PathSpec{Transport: "memory"}, PathBinding{LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.StagePathAttach(bID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ActivateStagedPath(bID, true); err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.RLock()
+	done := e.paths[bID].admissionDone
+	e.pathsMu.RUnlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retention timeout did not complete admission barrier")
+	}
+	if err := e.RemovePath(bID); err != nil {
+		t.Fatalf("remove after retention timeout: %v", err)
+	}
 }
 
 func TestStagedPathIsReceiveReadyAndTXInvisible(t *testing.T) {

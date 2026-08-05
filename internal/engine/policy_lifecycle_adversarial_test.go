@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,18 @@ type lifecycleHealthyPath struct {
 	death     func(transport.DeathCause, error)
 }
 
+type qualityDeathPath struct {
+	*lifecycleHealthyPath
+	once sync.Once
+}
+
+func (p *qualityDeathPath) Quality() transport.PathQuality {
+	p.once.Do(func() {
+		p.die(transport.CauseTransportError, errors.New("quality observer detected death"))
+	})
+	return transport.PathQuality{}
+}
+
 func newLifecycleHealthyPath() *lifecycleHealthyPath {
 	return &lifecycleHealthyPath{closed: make(chan struct{})}
 }
@@ -129,6 +142,14 @@ func (p *lifecycleHealthyPath) OnDeath(fn func(transport.DeathCause, error)) {
 }
 func (p *lifecycleHealthyPath) LocalAddr() string  { return "healthy-local" }
 func (p *lifecycleHealthyPath) RemoteAddr() string { return "healthy-remote" }
+func (p *lifecycleHealthyPath) die(cause transport.DeathCause, err error) {
+	p.deathMu.Lock()
+	death := p.death
+	p.deathMu.Unlock()
+	if death != nil {
+		death(cause, err)
+	}
+}
 
 func TestEngineCloseDoesNotHoldPathsLockAcrossSynchronousDeath(t *testing.T) {
 	e := New(SideClient, [16]byte{0xb1}, Limits{}.Clamp())
@@ -145,6 +166,235 @@ func TestEngineCloseDoesNotHoldPathsLockAcrossSynchronousDeath(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Engine.Close deadlocked in synchronous OnDeath callback")
+	}
+}
+
+func TestRemovePathLinearizesSynchronousCloseDeathAsClean(t *testing.T) {
+	e := New(SideClient, [16]byte{0xb2}, Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	healthy := newLifecycleHealthyPath()
+	if _, err := e.AttachPath(healthy, transport.PathSpec{Transport: "test", Address: "healthy"}); err != nil {
+		t.Fatal(err)
+	}
+	removed := newSynchronousDeathClosePath()
+	removedID, err := e.AttachPath(removed, transport.PathSpec{Transport: "test", Address: "remove"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	death := make(chan PathDeathEvent, 1)
+	cancel := e.OnPathDeath(func(event PathDeathEvent) {
+		if event.ID == removedID {
+			death <- event
+		}
+	})
+	defer cancel()
+
+	if err := e.RemovePath(removedID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-death:
+		if event.Cause != transport.CauseCleanClose || event.Err != nil {
+			t.Fatalf("removal death=(cause=%v err=%v), want clean close", event.Cause, event.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("clean removal did not publish a path-death event")
+	}
+	if paths := e.Paths(); len(paths) != 1 || paths[0].ID == removedID {
+		t.Fatalf("paths after clean removal=%v", paths)
+	}
+}
+
+func TestConcurrentRemovePathPreservesOneSurvivor(t *testing.T) {
+	e := New(SideClient, [16]byte{0xb3}, Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	first := newLifecycleHealthyPath()
+	firstID, err := e.AttachPath(first, transport.PathSpec{Transport: "test", Address: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := newLifecycleHealthyPath()
+	secondID, err := e.AttachPath(second, transport.PathSpec{Transport: "test", Address: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.RLock()
+	firstSlot := e.paths[firstID]
+	secondSlot := e.paths[secondID]
+	e.pathsMu.RUnlock()
+
+	e.sendMu.Lock()
+	firstResult := make(chan error, 1)
+	secondResult := make(chan error, 1)
+	go func() { firstResult <- e.RemovePath(firstID) }()
+	go func() { secondResult <- e.RemovePath(secondID) }()
+	deadline := time.Now().Add(time.Second)
+	for (firstSlot.removeWaiters.Load() == 0 || secondSlot.removeWaiters.Load() == 0) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if firstSlot.removeWaiters.Load() == 0 || secondSlot.removeWaiters.Load() == 0 {
+		e.sendMu.Unlock()
+		t.Fatal("concurrent removals did not both reach the serialization gate")
+	}
+	e.sendMu.Unlock()
+	var firstErr, secondErr error
+	select {
+	case firstErr = <-firstResult:
+	case <-time.After(time.Second):
+		t.Fatal("first concurrent removal did not finish")
+	}
+	select {
+	case secondErr = <-secondResult:
+	case <-time.After(time.Second):
+		t.Fatal("second concurrent removal did not finish")
+	}
+	if (firstErr == nil) == (secondErr == nil) {
+		t.Fatalf("concurrent removals errors=(%v, %v), want one success", firstErr, secondErr)
+	}
+	if firstErr != nil && !errors.Is(firstErr, ErrLastPath) {
+		t.Fatalf("first removal error=%v, want %v", firstErr, ErrLastPath)
+	}
+	if secondErr != nil && !errors.Is(secondErr, ErrLastPath) {
+		t.Fatalf("second removal error=%v, want %v", secondErr, ErrLastPath)
+	}
+	paths := e.Paths()
+	wantID := firstID
+	if firstErr == nil {
+		wantID = secondID
+	}
+	if len(paths) != 1 || paths[0].ID != wantID {
+		t.Fatalf("paths after concurrent removals=%v, want only %d", paths, wantID)
+	}
+}
+
+func TestRemovePathAfterSurvivorFaultReturnsLastPathWithoutEOF(t *testing.T) {
+	e := New(SideClient, [16]byte{0xb4}, Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	kept := newLifecycleHealthyPath()
+	keptID, err := e.AttachPath(kept, transport.PathSpec{Transport: "test", Address: "kept"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := newLifecycleHealthyPath()
+	if _, err := e.AttachPath(failed, transport.PathSpec{Transport: "test", Address: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	failed.die(transport.CauseTransportError, errors.New("injected survivor fault"))
+	if err := e.RemovePath(keptID); !errors.Is(err, ErrLastPath) {
+		t.Fatalf("remove after survivor fault error=%v, want %v", err, ErrLastPath)
+	}
+	if e.IsClosed() || errors.Is(e.CloseErr(), io.EOF) {
+		t.Fatalf("survivor fault plus rejected remove became clean EOF: closed=%t err=%v", e.IsClosed(), e.CloseErr())
+	}
+}
+
+func TestSurvivorFaultAfterRemovePathStartsMigrationNotEOF(t *testing.T) {
+	e := New(SideClient, [16]byte{0xb5}, Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	removed := newLifecycleHealthyPath()
+	removedID, err := e.AttachPath(removed, transport.PathSpec{Transport: "test", Address: "removed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	survivor := newLifecycleHealthyPath()
+	if _, err := e.AttachPath(survivor, transport.PathSpec{Transport: "test", Address: "survivor"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RemovePath(removedID); err != nil {
+		t.Fatal(err)
+	}
+	survivor.die(transport.CauseTransportError, errors.New("injected final carrier fault"))
+	if state := e.State(); state != BridgeMigrating {
+		t.Fatalf("state after final carrier fault=%s, want %s", state, BridgeMigrating)
+	}
+	if e.IsClosed() || errors.Is(e.CloseErr(), io.EOF) {
+		t.Fatalf("administrative removal plus transport outage became clean EOF: closed=%t err=%v", e.IsClosed(), e.CloseErr())
+	}
+}
+
+func TestTopologySnapshotRemainsCoherentDuringMigration(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	aID, err := e.AttachPath(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID, err := e.AttachPath(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	stop := make(chan struct{})
+	migrateErr := make(chan error, 1)
+	go func() {
+		close(started)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				migrateErr <- nil
+				return
+			default:
+			}
+			id := aID
+			if i%2 == 0 {
+				id = bID
+			}
+			if err := e.Migrate(id); err != nil {
+				migrateErr <- err
+				return
+			}
+		}
+	}()
+	<-started
+
+	for i := 0; i < 2000; i++ {
+		snapshot := e.TopologySnapshot()
+		activeFlags := 0
+		activeFound := false
+		for _, path := range snapshot.Paths {
+			if path.Active {
+				activeFlags++
+			}
+			if path.ID == snapshot.ActivePath {
+				activeFound = path.Active
+			}
+		}
+		if snapshot.ActivePath == 0 {
+			if activeFlags != 0 {
+				t.Fatalf("zero active ID with %d active path flags: %+v", activeFlags, snapshot)
+			}
+		} else if !activeFound || activeFlags != 1 {
+			t.Fatalf("torn topology snapshot: %+v", snapshot)
+		}
+	}
+	close(stop)
+	if err := <-migrateErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTopologySnapshotDoesNotHoldPathLockAcrossTransportObserver(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if _, err := e.AttachPath(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "guard"}); err != nil {
+		t.Fatal(err)
+	}
+	path := &qualityDeathPath{lifecycleHealthyPath: newLifecycleHealthyPath()}
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "snapshot", Address: "observer"}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan TopologySnapshot, 1)
+	go func() { done <- e.TopologySnapshot() }()
+	select {
+	case snapshot := <-done:
+		if len(snapshot.Paths) != 2 {
+			t.Fatalf("frozen snapshot paths=%d, want 2", len(snapshot.Paths))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TopologySnapshot deadlocked in synchronous transport observer")
 	}
 }
 

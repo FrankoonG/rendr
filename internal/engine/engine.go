@@ -91,10 +91,11 @@ type Engine struct {
 	// (each in its own goroutine) when activeID changes. Registered
 	// via OnMigrate; cancelled via the returned cancel function.
 	// Held under pathsMu - same as migrationCount.
-	migrateHooks    map[uint64]func(oldID, newID uint32, cause string)
-	migrateHookID   uint64
-	pathDeathHooks  map[uint64]func(PathDeathEvent)
-	pathDeathHookID uint64
+	migrateHooks         map[uint64]func(oldID, newID uint32, cause string)
+	migrateHookID        uint64
+	pathDeathHooks       map[uint64]func(PathDeathEvent)
+	pathDeathSerialHooks map[uint64]func(PathDeathEvent)
+	pathDeathHookID      uint64
 
 	// Path management. activeID == 0 means "no active path".
 	pathsMu      sync.RWMutex
@@ -239,11 +240,29 @@ type Engine struct {
 // PathDeathEvent is an internal immutable snapshot emitted after one path is
 // removed from the engine. Root wrappers use it to redial the same frozen leaf.
 type PathDeathEvent struct {
-	ID      uint32
-	Spec    transport.PathSpec
-	Binding PathBinding
-	Cause   transport.DeathCause
-	Err     error
+	ID             uint32
+	Owner          uint64
+	Spec           transport.PathSpec
+	Binding        PathBinding
+	Cause          transport.DeathCause
+	Err            error
+	Administrative bool
+}
+
+// PathRef names one physical generation of a logical path ID.
+type PathRef struct {
+	ID    uint32
+	Owner uint64
+}
+
+// TopologySnapshot captures fields that must agree on one path-set epoch.
+// Per-path counters remain atomic observations, but membership, active path,
+// lifecycle state, and migration count are read under one pathsMu hold.
+type TopologySnapshot struct {
+	State          BridgeState
+	ActivePath     uint32
+	Paths          []transport.PathInfo
+	MigrationCount uint64
 }
 
 var ErrPathAttachInProgress = errors.New("engine: path attach already in progress for leaf")
@@ -262,18 +281,19 @@ type pathSlot struct {
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
-	maintenance  atomic.Bool
-	deathPending atomic.Bool
-	deathMu      sync.Mutex
-	deathCause   transport.DeathCause
-	deathErr     error
-	txEnabled    atomic.Bool
-	writePermit  chan struct{}
-	ackMu        sync.Mutex
-	ackPending   *pathAckWrite
-	ackRunning   bool
-	ackClosed    bool
-	ackWG        sync.WaitGroup
+	maintenance   atomic.Bool
+	deathPending  atomic.Bool
+	deathMu       sync.Mutex
+	deathCause    transport.DeathCause
+	deathErr      error
+	removeWaiters atomic.Int32
+	txEnabled     atomic.Bool
+	writePermit   chan struct{}
+	ackMu         sync.Mutex
+	ackPending    *pathAckWrite
+	ackRunning    bool
+	ackClosed     bool
+	ackWG         sync.WaitGroup
 
 	// recvDups counts inbound frames on THIS path whose SEQ had
 	// already been delivered or buffered. Used per-path so monitoring
@@ -645,7 +665,7 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		return 0, err
 	}
 
-	if e.isClosed() {
+	if e.isClosed() || e.sendClosing.Load() {
 		return rejectLocked(net.ErrClosed)
 	}
 	if len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths) >= maxSessionPaths {
@@ -678,6 +698,9 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
 		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
 		if sameLocal && samePeer {
+			if existing.maintenance.Load() {
+				return rejectLocked(ErrPathAttachInProgress)
+			}
 			// Make-before-break recovery may briefly attach two physical
 			// carriers for the same logical directional leaf pair.
 			continue
@@ -754,7 +777,7 @@ func (e *Engine) StagePathAttach(id uint32) error {
 		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: stage unknown pending path %d", id)
 	}
-	if e.isClosed() {
+	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.pendingPaths, id)
 		e.pathsMu.Unlock()
 		_ = slot.conn.Close()
@@ -805,7 +828,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		e.pathsMu.Unlock()
 		return fmt.Errorf("engine: activate unknown staged path %d", id)
 	}
-	if e.isClosed() {
+	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.stagedPaths, id)
 		e.pathsMu.Unlock()
 		slot.closeQuit()
@@ -837,7 +860,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 
 	e.pathsMu.Lock()
 	slot = e.stagedPaths[id]
-	if slot == nil || e.isClosed() {
+	if slot == nil || e.isClosed() || e.sendClosing.Load() {
 		deaths := e.unwindFencedPathsLocked(fenced)
 		e.pathsMu.Unlock()
 		e.processDeferredPathDeaths(deaths)
@@ -916,6 +939,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
+		slot.completeAdmission()
 	}
 	e.pathsMu.Unlock()
 
@@ -950,14 +974,15 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 
 // ReleasePathPredecessors ends the overlap window after peer confirmation.
 func (e *Engine) ReleasePathPredecessors(successorID uint32) {
-	e.pathsMu.RLock()
+	e.pathsMu.Lock()
 	successor := e.paths[successorID]
-	e.pathsMu.RUnlock()
 	if successor == nil {
+		e.pathsMu.Unlock()
 		return
 	}
-	successor.completeAdmission()
-	e.releasePathPredecessors(successorID, successor.gen)
+	retired := e.releasePathPredecessorsLocked(successorID, successor.gen)
+	e.pathsMu.Unlock()
+	e.retirePathSet(retired)
 }
 
 // DisablePathAdmissionRollback records that the peer may already have made
@@ -976,11 +1001,17 @@ func (e *Engine) DisablePathAdmissionRollback(pathID uint32) error {
 
 func (e *Engine) releasePathPredecessors(successorID uint32, successorGen uint64) {
 	e.pathsMu.Lock()
+	retired := e.releasePathPredecessorsLocked(successorID, successorGen)
+	e.pathsMu.Unlock()
+	e.retirePathSet(retired)
+}
+
+func (e *Engine) releasePathPredecessorsLocked(successorID uint32, successorGen uint64) []*pathSlot {
 	successor := e.paths[successorID]
 	if successor == nil || successor.gen != successorGen {
-		e.pathsMu.Unlock()
-		return
+		return nil
 	}
+	successor.completeAdmission()
 	ids := e.pathPredecessors[successorID]
 	delete(e.pathPredecessors, successorID)
 	retired := make([]*pathSlot, 0, len(ids))
@@ -991,7 +1022,10 @@ func (e *Engine) releasePathPredecessors(successorID uint32, successorGen uint64
 			retired = append(retired, predecessor)
 		}
 	}
-	e.pathsMu.Unlock()
+	return retired
+}
+
+func (e *Engine) retirePathSet(retired []*pathSlot) {
 	for _, predecessor := range retired {
 		go e.retireSupersededPath(predecessor)
 	}
@@ -1107,15 +1141,44 @@ func (e *Engine) ActivePath() uint32 {
 // (all in-tree adapters do).
 func (e *Engine) Paths() []transport.PathInfo {
 	e.pathsMu.RLock()
-	defer e.pathsMu.RUnlock()
-	out := make([]transport.PathInfo, 0, len(e.paths))
+	activeID := e.activeID
+	slots := e.pathSlotsLocked()
+	e.pathsMu.RUnlock()
+	return pathInfos(slots, activeID)
+}
+
+// TopologySnapshot returns one coherent public-observation epoch.
+func (e *Engine) TopologySnapshot() TopologySnapshot {
+	e.pathsMu.RLock()
+	activeID := e.activeID
+	slots := e.pathSlotsLocked()
+	snapshot := TopologySnapshot{
+		State:          BridgeState(e.state.Load()),
+		ActivePath:     activeID,
+		MigrationCount: e.migrationCount,
+	}
+	e.pathsMu.RUnlock()
+	snapshot.Paths = pathInfos(slots, activeID)
+	return snapshot
+}
+
+func (e *Engine) pathSlotsLocked() []*pathSlot {
+	slots := make([]*pathSlot, 0, len(e.paths))
 	for _, s := range e.paths {
+		slots = append(slots, s)
+	}
+	return slots
+}
+
+func pathInfos(slots []*pathSlot, activeID uint32) []transport.PathInfo {
+	out := make([]transport.PathInfo, 0, len(slots))
+	for _, s := range slots {
 		pi := transport.PathInfo{
 			ID:      s.id,
 			Spec:    s.spec.Clone(),
 			Quality: s.conn.Quality(),
 			Since:   s.attached,
-			Active:  s.id == e.activeID,
+			Active:  s.id == activeID,
 		}
 		if rw, ok := s.conn.(interface {
 			Reads() uint64
@@ -1731,13 +1794,45 @@ func (e *Engine) OnPathDeath(fn func(PathDeathEvent)) (cancel func()) {
 	}
 }
 
+// OnPathDeathSerial registers an internal, nonblocking lifecycle subscriber
+// that is invoked in topology-commit order before the departure operation
+// returns. It is reserved for state-machine queues such as recovery; callbacks
+// must only enqueue bounded immutable work.
+func (e *Engine) OnPathDeathSerial(fn func(PathDeathEvent)) (cancel func()) {
+	if fn == nil {
+		return func() {}
+	}
+	e.pathsMu.Lock()
+	e.pathDeathHookID++
+	id := e.pathDeathHookID
+	if e.pathDeathSerialHooks == nil {
+		e.pathDeathSerialHooks = make(map[uint64]func(PathDeathEvent))
+	}
+	e.pathDeathSerialHooks[id] = fn
+	e.pathsMu.Unlock()
+	return func() {
+		e.pathsMu.Lock()
+		delete(e.pathDeathSerialHooks, id)
+		e.pathsMu.Unlock()
+	}
+}
+
 func (e *Engine) firePathDeathHooks(event PathDeathEvent) {
 	e.pathsMu.RLock()
 	hooks := make([]func(PathDeathEvent), 0, len(e.pathDeathHooks))
 	for _, hook := range e.pathDeathHooks {
 		hooks = append(hooks, hook)
 	}
+	serialHooks := make([]func(PathDeathEvent), 0, len(e.pathDeathSerialHooks))
+	for _, hook := range e.pathDeathSerialHooks {
+		serialHooks = append(serialHooks, hook)
+	}
 	e.pathsMu.RUnlock()
+	for _, hook := range serialHooks {
+		snapshot := event
+		snapshot.Spec = event.Spec.Clone()
+		hook(snapshot)
+	}
 	for _, hook := range hooks {
 		snapshot := event
 		snapshot.Spec = event.Spec.Clone()
@@ -1970,24 +2065,97 @@ func (e *Engine) WalkPathsForTest(fn func(id uint32, pc interface{})) {
 // instead. Returns a generic "unknown path" error if id is not in
 // the engine's path set.
 func (e *Engine) RemovePath(id uint32) error {
+	timer := time.NewTimer(e.limits.MigrationBudget)
+	defer timer.Stop()
+
+	for {
+		e.pathsMu.RLock()
+		slot := e.paths[id]
+		if slot == nil {
+			e.pathsMu.RUnlock()
+			return fmt.Errorf("engine: remove unknown path %d", id)
+		}
+		owner := slot.owner
+		admissionDone := slot.admissionDone
+		e.pathsMu.RUnlock()
+
+		slot.removeWaiters.Add(1)
+		select {
+		case <-admissionDone:
+		case <-e.closed:
+			slot.removeWaiters.Add(-1)
+			if err := e.CloseErr(); err != nil {
+				return err
+			}
+			return net.ErrClosed
+		case <-timer.C:
+			slot.removeWaiters.Add(-1)
+			return fmt.Errorf("engine: path %d admission did not complete within migration budget", id)
+		}
+
+		// Native repair uses the same outer lock order. Whichever operation
+		// acquires sendMu first commits; the loser revalidates the physical owner
+		// and can never resurrect or remove a stale generation.
+		e.sendMu.Lock()
+		slot.removeWaiters.Add(-1)
+		runtime := e.localExecutionRuntime()
+		e.pathsMu.Lock()
+		current := e.paths[id]
+		if current != slot || current.owner != owner {
+			e.pathsMu.Unlock()
+			e.sendMu.Unlock()
+			continue
+		}
+		if current.maintenance.Load() {
+			e.pathsMu.Unlock()
+			e.sendMu.Unlock()
+			return ErrPathAttachInProgress
+		}
+		if len(e.paths) <= 1 {
+			e.pathsMu.Unlock()
+			e.sendMu.Unlock()
+			return ErrLastPath
+		}
+		departure := e.detachPathLocked(current, runtime, transport.CauseCleanClose, nil, true)
+		e.pathsMu.Unlock()
+		e.sendMu.Unlock()
+		e.finishPathDeparture(departure)
+		return nil
+	}
+}
+
+// PathRef returns the current physical generation for id.
+func (e *Engine) PathRef(id uint32) (PathRef, bool) {
+	e.pathsMu.RLock()
+	slot := e.paths[id]
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		return PathRef{}, false
+	}
+	return PathRef{ID: id, Owner: slot.owner}, true
+}
+
+// RetirePath removes one exact stale physical generation as an administrative
+// cleanup. Unlike RemovePath it may retire the last path; the engine then
+// enters its migration budget instead of manufacturing EOF. Lifecycle
+// subscribers see a clean administrative departure and must not redial it.
+func (e *Engine) RetirePath(ref PathRef, reason error) error {
+	if ref.ID == 0 || ref.Owner == 0 {
+		return fmt.Errorf("engine: invalid stale path reference")
+	}
+	e.sendMu.Lock()
+	runtime := e.localExecutionRuntime()
 	e.pathsMu.Lock()
-	slot, ok := e.paths[id]
-	if !ok {
+	slot := e.paths[ref.ID]
+	if slot == nil || slot.owner != ref.Owner {
 		e.pathsMu.Unlock()
-		return fmt.Errorf("engine: remove unknown path %d", id)
+		e.sendMu.Unlock()
+		return fmt.Errorf("engine: stale path generation is unavailable")
 	}
-	if len(e.paths) <= 1 {
-		e.pathsMu.Unlock()
-		return ErrLastPath
-	}
+	departure := e.detachPathLocked(slot, runtime, transport.CauseCleanClose, reason, true)
 	e.pathsMu.Unlock()
-	// Close the socket so the per-path reader exits, then synthesise
-	// a clean-close OnDeath. We avoid relying on the transport's own
-	// OnDeath firing because some adapters (e.g. udpflow ServerPathConn)
-	// route death through the listener fanout and only emit it on
-	// hard transport errors, not on local close.
-	_ = slot.conn.Close()
-	e.onPathDeath(id, slot.owner, transport.CauseCleanClose, nil)
+	e.sendMu.Unlock()
+	e.finishPathDeparture(departure)
 	return nil
 }
 

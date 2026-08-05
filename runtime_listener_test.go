@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -326,6 +327,175 @@ func TestRuntimeListenerCloseUnblocksSlowFirstFrame(t *testing.T) {
 	}
 }
 
+func TestRuntimeListenerCloseJoinsHandshakeWorker(t *testing.T) {
+	source := newRuntimePipeListener()
+	runtime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := runtime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name: "gated", Carrier: CarrierUnknown, Listener: source,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newGatedFirstFrameConn()
+	if err := source.inject(conn); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handshake worker did not enter first-frame read")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- listener.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("listener Close returned before handshake worker exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	conn.releaseRead()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener Close did not join released handshake worker")
+	}
+	if got := runtimeListenerInflight(listener); got != 0 {
+		t.Fatalf("in-flight paths after joined close=%d", got)
+	}
+}
+
+func TestRuntimeListenerLastSourceFailureCompletesSelfShutdown(t *testing.T) {
+	runtime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceErr := errors.New("terminal source failure")
+	listener, err := runtime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name: "terminal", Carrier: CarrierUnknown, Listener: &terminalErrorListener{err: sourceErr},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-listener.closed:
+	case <-time.After(time.Second):
+		t.Fatal("last-source failure did not start listener shutdown")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		runtime.listenMu.Lock()
+		released := runtime.listener == nil
+		runtime.listenMu.Unlock()
+		if released {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	runtime.listenMu.Lock()
+	released := runtime.listener == nil
+	runtime.listenMu.Unlock()
+	if !released {
+		t.Fatal("last-source worker waited on itself during shutdown")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := listener.AcceptStream(ctx); !errors.Is(err, sourceErr) {
+		t.Fatalf("accept error=%v, want terminal source error", err)
+	}
+	replacementSource := newRuntimePipeListener()
+	replacement, err := runtime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name: "replacement", Carrier: CarrierUnknown, Listener: replacementSource,
+	}}})
+	if err != nil {
+		t.Fatalf("runtime did not accept replacement listener after self-shutdown: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeListenerCloseForceClosesUnacceptedSession(t *testing.T) {
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverRuntime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := serverRuntime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name:     "stream",
+		Carrier:  CarrierTCP,
+		Listener: rawListener,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRuntime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientRuntime.RegisterStreamFactory("stream", StreamFactory{
+		Carrier: CarrierTCP,
+		Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := clientRuntime.Dial(context.Background(), SessionConfig{Root: Path("stream", PathSpec{
+		Transport: "stream",
+		Address:   rawListener.Addr().String(),
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.(*engineBackedConn).e.Close() })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(listener.streamAccept) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(listener.streamAccept) != 1 {
+		t.Fatal("completed session was not queued before listener close")
+	}
+	serverEngine, ok := serverRuntime.bridges.Lookup(client.FlowID())
+	if !ok || serverEngine == nil {
+		t.Fatal("queued session engine was not active before listener close")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- listener.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener close waited on graceful teardown of an unaccepted session")
+	}
+	if got := len(listener.streamAccept); got != 0 {
+		t.Fatalf("queued sessions after close=%d", got)
+	}
+	deadline = time.Now().Add(time.Second)
+	for serverRuntime.bridges.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := serverRuntime.bridges.Len(); got != 0 {
+		t.Fatalf("bridge entries after force-closing unaccepted session=%d", got)
+	}
+	select {
+	case <-serverEngine.Closed():
+	case <-time.After(time.Second):
+		t.Fatal("unaccepted server engine did not quiesce after listener close")
+	}
+}
+
 func TestRuntimeListenerBridgeCannotObserveFailedHelloReservation(t *testing.T) {
 	source := newRuntimePipeListener()
 	serverRuntime, err := NewRuntime(RuntimeConfig{})
@@ -513,7 +683,10 @@ func TestRuntimeListenerAcceptCloseOwnershipLinearization(t *testing.T) {
 		} else if result.conn != nil {
 			t.Fatalf("iteration %d returned conn with error %v", iteration, result.err)
 		}
-		_ = client.Close()
+		// This test owns the unpublished side directly. A listener-close win
+		// intentionally leaves no peer route, so graceful Close would spend its
+		// full bounded timeout on every iteration and obscure the ownership race.
+		_ = client.(*engineBackedConn).e.Close()
 		deadline := time.Now().Add(time.Second)
 		for serverRuntime.bridges.Len() != 0 && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
@@ -841,6 +1014,56 @@ type runtimePipeListener struct {
 	closed chan struct{}
 	once   sync.Once
 }
+
+type gatedFirstFrameConn struct {
+	readStarted chan struct{}
+	release     chan struct{}
+	closed      chan struct{}
+	readOnce    sync.Once
+	releaseOnce sync.Once
+	closeOnce   sync.Once
+}
+
+type terminalErrorListener struct{ err error }
+
+func (l *terminalErrorListener) Accept() (net.Conn, error) { return nil, l.err }
+func (l *terminalErrorListener) Close() error              { return nil }
+func (l *terminalErrorListener) Addr() net.Addr            { return stringAddr("terminal-error") }
+
+func newGatedFirstFrameConn() *gatedFirstFrameConn {
+	return &gatedFirstFrameConn{
+		readStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (c *gatedFirstFrameConn) Read([]byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readStarted) })
+	<-c.release
+	return 0, net.ErrClosed
+}
+
+func (c *gatedFirstFrameConn) Write(payload []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(payload), nil
+	}
+}
+
+func (c *gatedFirstFrameConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *gatedFirstFrameConn) LocalAddr() net.Addr              { return stringAddr("gated-local") }
+func (c *gatedFirstFrameConn) RemoteAddr() net.Addr             { return stringAddr("gated-remote") }
+func (c *gatedFirstFrameConn) SetDeadline(time.Time) error      { return nil }
+func (c *gatedFirstFrameConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *gatedFirstFrameConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *gatedFirstFrameConn) releaseRead()                     { c.releaseOnce.Do(func() { close(c.release) }) }
 
 func newRuntimePipeListener() *runtimePipeListener {
 	return &runtimePipeListener{

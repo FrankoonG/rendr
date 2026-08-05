@@ -75,6 +75,9 @@ func (c *enginePacketConn) Close() error {
 		c.peak.stopLoop()
 	}
 	c.closing.Store(true)
+	if c.recovery != nil {
+		c.recovery.stop()
+	}
 	return c.e.GracefulClose(proto.ByeNormal)
 }
 
@@ -134,10 +137,25 @@ func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(i
 func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return c.addPath(ctx, spec)
+	resolved, err := c.graph.resolvePathSpec(spec, c.e.Paths())
+	if err != nil {
+		return 0, err
+	}
+	id, err := c.addPath(ctx, resolved)
+	if err == nil && c.recovery != nil {
+		c.recovery.pathAdded(resolved, id)
+	}
+	return id, err
 }
 
 func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, error) {
+	if c.closing.Load() {
+		return 0, net.ErrClosed
+	}
+	spec, err := c.graph.resolvePathSpec(spec, c.e.Paths())
+	if err != nil {
+		return 0, err
+	}
 	pc, err := c.resolver.dialPath(ctx, spec)
 	if err != nil {
 		return 0, err
@@ -146,10 +164,9 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 		_ = pc.Close()
 		return 0, err
 	}
-	spec, err = c.graph.resolvePathSpec(spec, c.e.Paths())
-	if err != nil {
+	if c.closing.Load() {
 		_ = pc.Close()
-		return 0, err
+		return 0, net.ErrClosed
 	}
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, pc, c.e, pathSpecName(spec), spec)
 	if err != nil {
@@ -166,16 +183,17 @@ func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry RetryPoli
 // Stats returns the same coherent snapshot as AdminConn.Stats does
 // for stream-mode Conn.
 func (c *enginePacketConn) Stats() ConnStats {
+	topology := c.e.TopologySnapshot()
 	return ConnStats{
 		FlowID:         c.e.FlowID(),
-		State:          c.e.State().String(),
+		State:          topology.State.String(),
 		Mode:           Mode(c.mode.Load()),
-		ActivePath:     c.e.ActivePath(),
-		Paths:          c.e.Paths(),
+		ActivePath:     topology.ActivePath,
+		Paths:          topology.Paths,
 		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
 		RecvDups:       c.e.RecvDups(),
 		BondStuckSkips: c.e.BondStuckSkips(),
-		MigrationCount: c.e.MigrationCount(),
+		MigrationCount: topology.MigrationCount,
 		CreatedAt:      c.e.CreatedAt(),
 		PeerCaps:       c.e.PeerCaps(),
 		PeerInstanceID: c.e.PeerInstanceID(),

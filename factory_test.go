@@ -317,8 +317,8 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	}
 
 	_, err = admin.AddPath(PathSpec{Transport: "late-stream", Address: ln.Addr().String()})
-	if err == nil || !strings.Contains(err.Error(), `transport: "late-stream" not registered`) {
-		t.Fatalf("late stream factory error=%v, want current registry error", err)
+	if err == nil || !strings.Contains(err.Error(), "path is not present in the frozen session graph") {
+		t.Fatalf("late stream factory error=%v, want frozen graph rejection", err)
 	}
 	if got := lateCalls.Load(); got != 0 {
 		t.Fatalf("late stream factory calls=%d, want 0", got)
@@ -387,8 +387,8 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	}
 
 	_, err = admin.AddPath(PathSpec{Transport: "late-packet", Address: ln.Addr().String()})
-	if err == nil || !strings.Contains(err.Error(), `transport: "late-packet" not registered`) {
-		t.Fatalf("late packet factory error=%v, want current registry error", err)
+	if err == nil || !strings.Contains(err.Error(), "path is not present in the frozen session graph") {
+		t.Fatalf("late packet factory error=%v, want frozen graph rejection", err)
 	}
 	if got := lateCalls.Load(); got != 0 {
 		t.Fatalf("late packet factory calls=%d, want 0", got)

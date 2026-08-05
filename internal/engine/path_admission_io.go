@@ -52,7 +52,7 @@ func (e *Engine) routePathAdmissionControl(slot *pathSlot, code proto.CtrlCode, 
 			receipt.PathAdmissionBinding == completed.binding && slot.admissionReplayPending.CompareAndSwap(false, true) {
 			go func() {
 				defer slot.admissionReplayPending.Store(false)
-				ctx, cancel := context.WithTimeout(context.Background(), e.limits.MigrationBudget)
+				ctx, cancel := context.WithDeadline(context.Background(), completed.expires)
 				defer cancel()
 				_ = e.WritePathAdmissionControlContext(ctx, slot.id, proto.CtrlPathAdmissionAck, completed.response)
 			}()

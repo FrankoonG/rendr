@@ -617,6 +617,102 @@ func TestPathAdmissionControlWriteHonorsContextBudget(t *testing.T) {
 	})
 }
 
+func TestGracefulCloseClosesAdmissionGateBeforeByeCompletes(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	base, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	path := &admissionBlockingWritePath{
+		PathConn: base,
+		entered:  make(chan struct{}),
+		unblock:  make(chan struct{}),
+	}
+	if _, err := e.AttachPathBound(path, transport.PathSpec{Transport: "memory"}, binding); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- e.GracefulClose(proto.ByeNormal) }()
+	waitAdmissionChannel(t, path.entered, "blocked graceful BYE")
+
+	candidate, candidatePeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = candidatePeer.Close() })
+	if _, err := e.PreparePathBound(candidate, transport.PathSpec{Transport: "memory"}, binding); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("prepare during graceful close error=%v, want %v", err, net.ErrClosed)
+	}
+	_ = path.Close()
+	_ = e.Close()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("graceful close did not finish after releasing BYE write")
+	}
+}
+
+func TestCompletedAdmissionReplayKeepsOriginalDeadline(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	base, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	path := &admissionBlockingWritePath{
+		PathConn: base,
+		entered:  make(chan struct{}),
+		unblock:  make(chan struct{}),
+	}
+	id, err := e.AttachPathBound(path, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := e.localGraphBinding()
+	commit := admissionCommit(
+		proto.PathAdmissionKindBridge,
+		proto.SessionEpoch(e.FlowID()),
+		proto.PathAdmissionID{0x71},
+		senderDirection(SideClient),
+		local.revision,
+		local.digest,
+		binding.LocalTXTargetID,
+		binding.PeerTXTargetID,
+		0,
+		[]byte("proposal"),
+		[]byte("response"),
+	)
+	activated := proto.PathAdmissionAck{
+		PathAdmissionBinding: commit.PathAdmissionBinding,
+		Phase:                proto.PathAdmissionPhaseActivated,
+		Code:                 proto.AckOK,
+	}
+	activatedWire, err := activated.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rememberCompletedPathAdmission(id, commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
+		t.Fatal(err)
+	}
+	e.pathsMu.Lock()
+	slot := e.paths[id]
+	slot.completedAdmission.expires = time.Now().Add(30 * time.Millisecond)
+	expires := slot.completedAdmission.expires
+	e.pathsMu.Unlock()
+	receipt := proto.PathAdmissionAck{
+		PathAdmissionBinding: commit.PathAdmissionBinding,
+		Phase:                proto.PathAdmissionPhaseFinal,
+		Code:                 proto.AckOK,
+	}
+	receiptWire, err := receipt.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.routePathAdmissionControl(slot, proto.CtrlPathAdmissionAck, receiptWire) {
+		t.Fatal("completed admission receipt was not consumed")
+	}
+	waitAdmissionChannel(t, path.entered, "completed admission replay write")
+	waitAdmissionCondition(t, 500*time.Millisecond, "fixed-deadline replay retirement", func() bool {
+		_, ok := e.PathRef(id)
+		return !ok
+	})
+	if time.Now().After(expires.Add(300 * time.Millisecond)) {
+		t.Fatalf("terminal replay outlived original deadline %v", expires)
+	}
+}
+
 func TestPathAdmissionFencedDispatchCannotKillRetainedPredecessor(t *testing.T) {
 	e, binding := newAdmissionAdversarialEngine(t, SideClient)
 	old, oldPeer := newMemoryPathPair()
