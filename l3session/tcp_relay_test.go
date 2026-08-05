@@ -14,10 +14,7 @@ import (
 )
 
 func TestTCPRelayBridgesEndpointThroughRendrStreamSession(t *testing.T) {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestStreamSessionListener(t, "tcp")
 	defer ln.Close()
 
 	accepted := acceptStream(t, ln)
@@ -69,10 +66,7 @@ func TestTCPRelayBridgesEndpointThroughRendrStreamSession(t *testing.T) {
 }
 
 func TestTCPRelayPreservesFlowAcrossStreamMigration(t *testing.T) {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestStreamSessionListener(t, "tcp")
 	defer ln.Close()
 
 	accepted := acceptStream(t, ln)
@@ -130,13 +124,13 @@ func TestTCPRelayPreservesFlowAcrossStreamMigration(t *testing.T) {
 	}
 }
 
-func acceptStream(t *testing.T, ln rendr.Listener) <-chan rendr.Conn {
+func acceptStream(t *testing.T, ln *rendr.SessionListener) <-chan rendr.Conn {
 	t.Helper()
 	accepted := make(chan rendr.Conn, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		c, err := ln.Accept(ctx)
+		c, err := ln.AcceptStream(ctx)
 		if err != nil {
 			t.Errorf("accept stream: %v", err)
 			return

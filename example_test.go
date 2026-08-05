@@ -14,8 +14,21 @@ import (
 // one TCP path between two in-process endpoints. Real deployments
 // supply two or more paths so migration has somewhere to go.
 func ExampleRuntime_Dial() {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	serverRuntime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
+		log.Fatal(err)
+	}
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln, err := serverRuntime.Listen(rendr.ListenConfig{Streams: []rendr.StreamSource{{
+		Name:     "stream",
+		Carrier:  rendr.CarrierTCP,
+		Listener: rawListener,
+	}}})
+	if err != nil {
+		_ = rawListener.Close()
 		log.Fatal(err)
 	}
 	defer ln.Close()
@@ -23,7 +36,7 @@ func ExampleRuntime_Dial() {
 	srvDone := make(chan struct{})
 	go func() {
 		defer close(srvDone)
-		c, err := ln.Accept(context.Background())
+		c, err := ln.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
@@ -51,8 +64,21 @@ func ExampleRuntime_Dial() {
 
 // ExampleConnectionObserver shows the optional observation surface.
 func ExampleConnectionObserver() {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
+	serverRuntime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
+		log.Fatal(err)
+	}
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln, err := serverRuntime.Listen(rendr.ListenConfig{Streams: []rendr.StreamSource{{
+		Name:     "stream",
+		Carrier:  rendr.CarrierTCP,
+		Listener: rawListener,
+	}}})
+	if err != nil {
+		_ = rawListener.Close()
 		log.Fatal(err)
 	}
 	defer ln.Close()
@@ -60,7 +86,7 @@ func ExampleConnectionObserver() {
 	srvDone := make(chan struct{})
 	go func() {
 		defer close(srvDone)
-		c, err := ln.Accept(context.Background())
+		c, err := ln.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
@@ -100,8 +126,21 @@ func ExampleConnectionObserver() {
 // one frame's payload. Use this for datagram-oriented protocols
 // (WireGuard, custom UDP echo) where boundaries must be preserved.
 func ExampleRuntime_DialPacket() {
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
+	serverRuntime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
+		log.Fatal(err)
+	}
+	rawPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln, err := serverRuntime.Listen(rendr.ListenConfig{Packets: []rendr.PacketSource{{
+		Name:    "packet",
+		Carrier: rendr.CarrierUDP,
+		Conn:    rawPacketConn,
+	}}})
+	if err != nil {
+		_ = rawPacketConn.Close()
 		log.Fatal(err)
 	}
 	defer ln.Close()

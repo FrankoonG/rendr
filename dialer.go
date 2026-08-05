@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -475,16 +474,3 @@ func (s stringAddr) Network() string { return "rendr" }
 func (s stringAddr) String() string  { return string(s) }
 
 func addrFromString(s string) stringAddr { return stringAddr(s) }
-
-// Listener accepts inbound rendr Conns. The set of acceptable
-// transports is determined by registering transport adapters on the
-// Listener (see transport.Registry).
-type Listener interface {
-	Accept(ctx context.Context) (Conn, error)
-	Close() error
-	// Addr returns the listener's local network address, useful for
-	// tests that bind ":0" and need to discover the chosen port.
-	Addr() net.Addr
-	// FlowIDs returns the live flow_id set for diagnostics.
-	FlowIDs() [][16]byte
-}

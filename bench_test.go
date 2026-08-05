@@ -45,7 +45,7 @@ func BenchmarkStreamThroughputTCPWithMigration(b *testing.B) {
 // transferred bytes. b.SetBytes is set to chunk so go test reports
 // MB/s; b.ResetTimer skips setup cost from the measurement.
 func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		b.Fatal(err)
 	}

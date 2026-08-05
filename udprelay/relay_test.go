@@ -25,10 +25,7 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 	echo, echoAddr := startUDPEcho(t)
 	defer echo.Close()
 
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newPacketSessionListener(t, "udpflow")
 	defer ln.Close()
 
 	accepted := make(chan rendr.PacketConn, 1)
@@ -114,10 +111,7 @@ func TestDialAndServeRoundTrip(t *testing.T) {
 	echo, echoAddr := startUDPEcho(t)
 	defer echo.Close()
 
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newPacketSessionListener(t, "udpflow")
 	defer ln.Close()
 
 	serverReady := make(chan *Relay, 1)
@@ -175,10 +169,7 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 	echo, echoAddr := startUDPEcho(t)
 	defer echo.Close()
 
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newPacketSessionListener(t, "udpflow")
 
 	server, err := Listen(ctx, ServeConfig{
 		Listener:   ln,
@@ -232,6 +223,25 @@ func newRuntime(t *testing.T) *rendr.Runtime {
 	return runtime
 }
 
+func newPacketSessionListener(t *testing.T, sourceName string) *rendr.SessionListener {
+	t.Helper()
+	runtime := newRuntime(t)
+	rawPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := runtime.Listen(rendr.ListenConfig{Packets: []rendr.PacketSource{{
+		Name:    sourceName,
+		Carrier: rendr.CarrierUDP,
+		Conn:    rawPacketConn,
+	}}})
+	if err != nil {
+		_ = rawPacketConn.Close()
+		t.Fatal(err)
+	}
+	return listener
+}
+
 func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -253,16 +263,21 @@ func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {
 
 func waitPacketPaths(t *testing.T, client, server rendr.PacketConn, want int) {
 	t.Helper()
-	ca := client.(packetControl)
-	sa := server.(packetControl)
+	serverObserver, ok := server.(rendr.ConnectionObserver)
+	if !ok {
+		t.Fatal("accepted packet session does not expose ConnectionObserver")
+	}
+	if _, ok := server.(rendr.PathController); ok {
+		t.Fatal("accepted packet session unexpectedly exposes PathController")
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(ca.Paths()) >= want && len(sa.Paths()) >= want {
+		if len(client.Paths()) >= want && len(serverObserver.Stats().Paths) >= want {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("paths did not attach: client=%d server=%d want=%d", len(ca.Paths()), len(sa.Paths()), want)
+	t.Fatalf("paths did not attach: client=%d server=%d want=%d", len(client.Paths()), len(serverObserver.Stats().Paths), want)
 }
 
 func waitServerRelays(t *testing.T, server *Server, want int) {

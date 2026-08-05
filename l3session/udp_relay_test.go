@@ -12,10 +12,7 @@ import (
 )
 
 func TestUDPRelayForwardsPayloadThroughRendrPacketSession(t *testing.T) {
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestPacketSessionListener(t, "udpflow")
 	defer ln.Close()
 
 	accepted := make(chan rendr.PacketConn, 1)
@@ -114,10 +111,7 @@ func TestUDPRelayForwardsPayloadThroughRendrPacketSession(t *testing.T) {
 }
 
 func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestPacketSessionListener(t, "udpflow")
 	defer ln.Close()
 
 	accepted := make(chan rendr.PacketConn, 1)

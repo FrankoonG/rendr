@@ -18,17 +18,14 @@ import (
 )
 
 func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
-	ln, err := rendr.ListenTCP("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestStreamSessionListener(t, "test-stream")
 	defer ln.Close()
 
 	accepted := make(chan rendr.Conn, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		c, err := ln.Accept(ctx)
+		c, err := ln.AcceptStream(ctx)
 		if err != nil {
 			t.Errorf("accept stream: %v", err)
 			return
@@ -104,10 +101,7 @@ func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
 }
 
 func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
-	ln, err := rendr.ListenUDPFlowPacket("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := newTestPacketSessionListener(t, "udpflow")
 	defer ln.Close()
 
 	accepted := make(chan rendr.PacketConn, 1)

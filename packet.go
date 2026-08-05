@@ -196,15 +196,3 @@ func (c *enginePacketConn) Stats() ConnStats {
 		PeerInstanceID: c.e.PeerInstanceID(),
 	}
 }
-
-// PacketListener accepts inbound rendr PacketConns. The udpflow
-// listener implements both Listener and PacketListener: HELLO with
-// CapsPacketMode routes to AcceptPacket, otherwise to Accept. A
-// listener can therefore serve mixed packet- and stream-mode peers
-// simultaneously without separate ports.
-type PacketListener interface {
-	AcceptPacket(ctx context.Context) (PacketConn, error)
-	Close() error
-	Addr() net.Addr
-	FlowIDs() [][16]byte
-}

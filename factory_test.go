@@ -20,9 +20,9 @@ import (
 //   - subsequent Write/Read round-trips through rendr framing
 //   - the factory was invoked exactly once (single path)
 //   - flow_id symmetry (C1) still holds because the underlying
-//     listener is a real rendr.Listener
+//     listener is a real Runtime-owned session listener
 func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 	// Part 1: unknown transport name returns an error and does NOT
 	// touch any listener. Use a closed listener to source an address
 	// for shape; never dial against it.
-	probe, err := ListenTCP("127.0.0.1:0")
+	probe, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestM9X5StreamFactoryFallback(t *testing.T) {
 	// global transport.Default registry. Wait for the accept-side
 	// HELLO to fully complete before closing the listener to avoid
 	// racing with listener.handleHello on teardown.
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestM9X5AddStreamFactoryValidation(t *testing.T) {
 //   - factory is invoked exactly once (single path)
 //   - flow_id symmetry between client and server
 func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestM9X5AddPacketFactoryValidation(t *testing.T) {
 }
 
 func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 }
 
 func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 }
 
 func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestStreamFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 }
 
 func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ type factoryAcceptResult[T any] struct {
 	err  error
 }
 
-func startFactoryStreamAccept(ln Listener) <-chan factoryAcceptResult[Conn] {
+func startFactoryStreamAccept(ln *runtimeListenerFixture) <-chan factoryAcceptResult[Conn] {
 	result := make(chan factoryAcceptResult[Conn], 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -514,7 +514,7 @@ func startFactoryStreamAccept(ln Listener) <-chan factoryAcceptResult[Conn] {
 	return result
 }
 
-func startFactoryPacketAccept(ln PacketListener) <-chan factoryAcceptResult[PacketConn] {
+func startFactoryPacketAccept(ln *runtimeListenerFixture) <-chan factoryAcceptResult[PacketConn] {
 	result := make(chan factoryAcceptResult[PacketConn], 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

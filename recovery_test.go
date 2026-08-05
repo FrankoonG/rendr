@@ -17,7 +17,7 @@ import (
 )
 
 func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
-	listener, err := ListenTCP("127.0.0.1:0")
+	listener, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,8 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	defer serverConn.Close()
 
 	client := clientConn.(*engineBackedConn)
-	server := serverConn.(*engineBackedConn)
+	server := serverConn
+	serverObserver := server.(ConnectionObserver)
 	deadID := client.Paths()[0].ID
 	deadServerID := server.Paths()[0].ID
 	if err := client.e.ForceKillPathForTest(deadID); err != nil {
@@ -93,7 +94,7 @@ func TestRuntimeAutomaticallyRedialsDeadGenericLeaf(t *testing.T) {
 	assertBidirectionalStreamPayload(t, client, server, "second-replacement")
 	assertPathCarriedData(t, client.Paths(), second)
 	assertPathCarriedData(t, server.Paths(), secondServer)
-	waitForMigrationCounts(t, client.MigrationCount, server.MigrationCount, 2)
+	waitForMigrationCounts(t, client.MigrationCount, serverObserver.MigrationCount, 2)
 }
 
 func TestRecoveryGenerationReconcilesStartupAndInFlightDeath(t *testing.T) {
@@ -740,7 +741,7 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 }
 
 func TestCleanPathRemovalDoesNotTriggerAutomaticRedial(t *testing.T) {
-	listener, err := ListenTCP("127.0.0.1:0")
+	listener, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -809,7 +810,7 @@ func TestCleanPathRemovalDoesNotTriggerAutomaticRedial(t *testing.T) {
 }
 
 func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
-	listener, err := ListenUDPFlowPacket("127.0.0.1:0")
+	listener, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -861,7 +862,8 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	defer serverConn.Close()
 
 	client := clientConn.(*enginePacketConn)
-	server := serverConn.(*enginePacketConn)
+	server := serverConn
+	serverObserver := server.(ConnectionObserver)
 	deadID := client.Paths()[0].ID
 	deadServerID := server.Paths()[0].ID
 	if err := client.e.ForceKillPathForTest(deadID); err != nil {
@@ -884,13 +886,13 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	assertBidirectionalPacketPayload(t, client, server, "second-packet-replacement")
 	assertPathCarriedData(t, client.Paths(), second)
 	assertPathCarriedData(t, server.Paths(), secondServer)
-	waitForMigrationCounts(t, client.MigrationCount, server.MigrationCount, 2)
+	waitForMigrationCounts(t, client.MigrationCount, serverObserver.MigrationCount, 2)
 	if status := client.Status(); status.Protocol != SessionProtocolFramedPacketV3 {
 		t.Fatalf("packet protocol=%q", status.Protocol)
 	}
 }
 
-func waitForStreamReplacement(t *testing.T, client, server *engineBackedConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
+func waitForStreamReplacement(t *testing.T, client *engineBackedConn, server Conn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -906,7 +908,7 @@ func waitForStreamReplacement(t *testing.T, client, server *engineBackedConn, ol
 	return 0, 0
 }
 
-func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
+func waitForPacketReplacement(t *testing.T, client *enginePacketConn, server PacketConn, oldClientID, oldServerID uint32, timeout time.Duration) (uint32, uint32) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	observedErrors := make(map[string]struct{})
@@ -924,9 +926,9 @@ func waitForPacketReplacement(t *testing.T, client, server *enginePacketConn, ol
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("packet replacement did not commit: old client/server=%d/%d client=%v server=%v client_status=%+v server_status=%+v client_close=%v server_close=%v observed_errors=%v",
+	t.Fatalf("packet replacement did not commit: old client/server=%d/%d client=%v server=%v client_status=%+v server_status=%+v client_close=%v observed_errors=%v",
 		oldClientID, oldServerID, client.Paths(), server.Paths(), client.Status(), server.Status(),
-		client.e.CloseErr(), server.e.CloseErr(), observedErrors)
+		client.e.CloseErr(), observedErrors)
 	return 0, 0
 }
 

@@ -69,7 +69,7 @@ func waitForNPaths(t *testing.T, client Conn, server Conn, transport, addr strin
 // blocking behaviour. Validates that idle reads can be cancelled
 // without resorting to Close.
 func TestSetReadDeadlineTimesOut(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestSetReadDeadlineTimesOut(t *testing.T) {
 // is wired up so monitoring can distinguish probe-fresh paths from
 // genuinely-idle paths under NAT-keepalive scenarios.
 func TestPathInfoLastRecvAt(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestPathInfoLastRecvAt(t *testing.T) {
 // (which would not trigger under the default 2). This validates that
 // the sessionDialer-to-engine Limits plumbing actually carries the field.
 func TestDialerCustomLimitsApplied(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,13 +274,13 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 }
 
 // TestM2QUICDatagramPacketRoundTrip exercises the full DATAGRAM
-// stack through the package-local session path: rendr.ListenQUICDatagram
+// stack through a Runtime FramedSource backed by QUIC DATAGRAM
 // on the server + sessionDialer.DialPacket with PathSpec.Opts["mode"]=
 // "datagram" on the client. Confirms the wire-level QUIC DATAGRAM
 // support (commit 690fa60) integrates correctly through engine
 // packet mode.
 func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
-	ln, err := ListenQUICDatagram("127.0.0.1:0", nil)
+	ln, err := listenRuntimeQUICDatagram("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestSentinelErrorsAreMatchable(t *testing.T) {
 // goes through enginePacketConn.SetReadDeadline → engine.SetReadDeadline,
 // and Engine.RecvPacket honors the deadline the same way Recv does.
 func TestSetReadDeadlinePacketMode(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +451,7 @@ func TestSetReadDeadlinePacketMode(t *testing.T) {
 // waiting on the timer captured at call entry and ignores the new
 // deadline until the old one expires.
 func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,11 +516,11 @@ func TestSetReadDeadlinePacketModeUpdatesBlockedRead(t *testing.T) {
 }
 
 // TestM1DialAcceptRoundTrip is the minimal end-to-end demo for M1:
-// ListenTCP + sessionDialer.Dial + Read/Write a payload over the rendr Conn.
+// Runtime raw-TCP ingress + sessionDialer.Dial + Read/Write over rendr Conn.
 // Both ends live in the same process; the wire path is a real TCP
 // socket on the loopback.
 func TestM1DialAcceptRoundTrip(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +602,7 @@ func TestM1DialAcceptRoundTrip(t *testing.T) {
 }
 
 func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
-	ln, err := ListenGVisorPacket("127.0.0.1:0")
+	ln, err := listenRuntimeGVisorPacket("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +656,7 @@ func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
 // exceeds MaxPayload, so multiple frames flow per logical write.
 // This is the smallest building block for G1.
 func TestM1LargePayload(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +730,7 @@ func TestM1LargePayload(t *testing.T) {
 // server side ends up with N distinct flow_ids.
 func TestM1FlowIDsAreUnique(t *testing.T) {
 	const N = 8
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +825,7 @@ func TestErrorReExports(t *testing.T) {
 // hot-switches active path mid-transfer. The peer must see the
 // entire byte stream contiguously, with no error and no gap.
 func TestM1PlannedMigration(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -940,7 +940,7 @@ func TestM1PlannedMigration(t *testing.T) {
 // TestM1MigrationBudgetExpires kills the only path and verifies that
 // after MigrationBudget elapses, Read returns ErrMigrationBudgetExceeded.
 func TestM1MigrationBudgetExpires(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -987,12 +987,10 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Now violently break the server's only path: ForceKill so the
-	// engine sees a TransportError (NOT a BYE - we are simulating
-	// G4 "pathçœŸæ­»äº¡", not a clean teardown).
-	sc := server.(*engineBackedConn)
-	for _, p := range sc.Paths() {
-		_ = sc.Engine().ForceKillPathForTest(p.ID)
+	// Close the actual server-side carrier without a rendr BYE. The client must
+	// classify the resulting remote socket failure through its reader loop.
+	if err := ln.CloseAcceptedPath("tcp", 0); err != nil {
+		t.Fatal(err)
 	}
 
 	readErr := make(chan error, 1)
@@ -1017,7 +1015,7 @@ func TestM1MigrationBudgetExpires(t *testing.T) {
 //
 // This is the simplest G4 (pathçœŸæ­»äº¡) regression test.
 func TestM1FailoverToSurvivingPath(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1074,16 +1072,11 @@ func TestM1FailoverToSurvivingPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reach in and kill the currently-active server-side path. This
-	// is the "G4-light" surrogate: G4 proper kills the network out
-	// from under the path; in-process the equivalent is to slam its
-	// PathConn closed.
-	sc := server.(*engineBackedConn)
-	sActive := sc.Engine().ActivePath()
-	// Close the server-side active PathConn directly. This forces
-	// the OTHER endpoint (client) to observe a TransportError, which
-	// must trigger a migration to the surviving path.
-	killServerPath(t, sc, sActive)
+	// Kill the actual server-side carrier so the client observes a remote
+	// transport failure rather than a synthesized local death callback.
+	if err := ln.CloseAcceptedPath("tcp", 0); err != nil {
+		t.Fatal(err)
+	}
 
 	// Give the engine a moment to fail over.
 	time.Sleep(150 * time.Millisecond)
@@ -1116,7 +1109,7 @@ func TestM1CleanCloseEOF(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows TCP loopback may reorder BYE vs FIN; see godoc")
 	}
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1181,7 +1174,7 @@ func TestM1CleanCloseEOF(t *testing.T) {
 //   - byte stream is contiguous and order-preserving
 //   - hash matches end-to-end
 func TestM1G1Sketch(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1319,7 +1312,7 @@ func TestM1G2Sketch(t *testing.T) {
 		t.Skip("skipping G2 sketch in -short")
 	}
 
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1456,7 +1449,7 @@ func TestM1G2Sketch(t *testing.T) {
 // must produce a wire frame on EVERY attached path. Verifies via
 // tcp.PathConn.Writes() per-path counters.
 func TestM7RaceWritesAllPaths(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1555,7 +1548,7 @@ func TestM7RaceWritesAllPaths(t *testing.T) {
 //   - the application-visible byte stream before and after the kill
 //     is delivered in order.
 func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1693,7 +1686,7 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 // flow id everywhere, ActivePath in Paths if non-zero, Mode
 // reflecting the executor selected by the root target).
 func TestAdminConnStatsSnapshot(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1781,7 +1774,7 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 // transitions and RecvQueueHWM exposes the dedup-buffer high-water
 // mark used to detect race-mode reorder window overflow.
 func TestAdminConnStateAndHWM(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1853,7 +1846,7 @@ func TestAdminConnStateAndHWM(t *testing.T) {
 // can spot a saturated or idle path without poking into transport-
 // private types.
 func TestPathInfoCountersExposed(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1911,7 +1904,7 @@ func TestPathInfoCountersExposed(t *testing.T) {
 // any application-visible error. This is the G5 acceptance
 // minimum: "path A recovers and re-joins the available set."
 func TestG5PathRecoveryViaAddPath(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2030,7 +2023,7 @@ func TestG5PathRecoveryViaAddPath(t *testing.T) {
 // path (ErrLastPath), and rejects unknown ids. If RemovePath drops
 // the active path it must failover before returning.
 func TestAdminConnRemovePath(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2125,7 +2118,7 @@ func TestAdminConnRemovePath(t *testing.T) {
 // path triggers automatic failover to a surviving path before
 // returning; the application Write/Read after the call must succeed.
 func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2192,7 +2185,7 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 // explicit Migrate and death-driven failover. The cause field
 // distinguishes the two paths. Cancel must stop further events.
 func TestAdminConnOnMigrate(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2309,7 +2302,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 // explicit Migrate calls and death-driven failover, but not count
 // the initial active-path assignment at Dial time.
 func TestAdminConnMigrationCount(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2439,7 +2432,7 @@ func waitRecvDupsStable(t *testing.T, adm recvDupSnapshotter) (uint64, []PathInf
 // window overflow' - a hard race-mode bug when path RTT skew is
 // large enough to outrun the receiver's reorder window.
 func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2505,7 +2498,8 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hwm := server.(*engineBackedConn).Engine().RecvQueueHighWaterMark()
+	serverObserver := server.(ConnectionObserver)
+	hwm := serverObserver.RecvQueueHWM()
 	t.Logf("race-mode recv-queue HWM = %d (over %d frames on 2 paths)", hwm, N)
 	if hwm > 64 {
 		t.Errorf("recv-queue HWM unexpectedly high (%d) - dedup window may be growing without bound", hwm)
@@ -2520,13 +2514,13 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	// land on a path that isn't yet attached engine-side - allow up
 	// to ~25% missing without failing. The strict-zero-loss check is
 	// on the data stream above (rxbuf bytes match).
-	srvAdm := server.(testConnectionControl)
+	srvAdm := server.(recvDupSnapshotter)
 	dups, paths := waitRecvDupsStable(t, srvAdm)
 	t.Logf("race-mode RecvDups = %d (over %d frames on 2 paths)", dups, N)
 	if dups < uint64(N*3/4) {
 		t.Errorf("RecvDups=%d < 75%% of N=%d: race-mode dedup not counted", dups, N)
 	}
-	if got := srvAdm.Stats().RecvDups; got != dups {
+	if got := serverObserver.Stats().RecvDups; got != dups {
 		t.Errorf("Stats().RecvDups=%d disagrees with RecvDups()=%d", got, dups)
 	}
 
@@ -2546,7 +2540,7 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 // the next run jumps to the other. Path pinning is the M8 mechanism
 // to bound reorder-window growth under RTT skew between paths.
 func TestM8BondPathPinning(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2637,7 +2631,7 @@ func TestM8BondPathPinning(t *testing.T) {
 // not duplication", so unlike race each path sees a strict subset.
 // Receiver-side reorder reassembles into the original byte stream.
 func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2733,7 +2727,7 @@ func TestM8BondRoundRobinAcrossPaths(t *testing.T) {
 // 16 single-frame writes should route 12 frames to the heavier path
 // and 4 to the lighter path.
 func TestM8BondHonorsPathWeights(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2832,7 +2826,7 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 // speed and stability precede latency. A healthy high-RTT path remains part
 // of aggregation; only observed writer/delivery stalls may quarantine it.
 func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2951,7 +2945,7 @@ func TestM8BondHighRTTAloneDoesNotSkipPath(t *testing.T) {
 // path via engine.Migrate mid-stream. Confirms M5 paths plug into
 // the same engine migration primitive that TCP / QUIC use.
 func TestM5UDPFlowPlannedMigration(t *testing.T) {
-	ln, err := ListenUDPFlow("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3054,7 +3048,7 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 // TransportError; engine fails over to the survivor without
 // surfacing an app-level error.
 func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
-	ln, err := ListenUDPFlow("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3126,11 +3120,11 @@ func TestM5UDPFlowFailoverToSurvivingPath(t *testing.T) {
 }
 
 // TestM5UDPFlowDialAcceptRoundTrip: session dialer over udpflow path +
-// ListenUDPFlow accept; data flows in both directions over an
+// Runtime raw-UDP accept; data flows in both directions over an
 // opaque UDP datagram pair. Migration test (path swap on the same
 // flow_id) belongs to a chaos run; this just proves wire+API.
 func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
-	ln, err := ListenUDPFlow("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3195,7 +3189,7 @@ func TestM5UDPFlowDialAcceptRoundTrip(t *testing.T) {
 // payload. Concatenated stream-mode behaviour is the failure case
 // this test guards against.
 func TestM5PacketBoundariesPreserved(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3283,7 +3277,7 @@ func TestM5PacketBoundariesPreserved(t *testing.T) {
 // larger than engine.MaxPayload returns ErrPacketTooLarge and the
 // connection stays healthy for subsequent legal writes.
 func TestM5PacketRejectOversize(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3339,7 +3333,7 @@ func TestM5PacketRejectOversize(t *testing.T) {
 // required to deliver in strict send order; the contract here is
 // that every application packet arrives exactly once.
 func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3453,7 +3447,7 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		err := func() error {
-			ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+			ln, err := listenRuntimeUDP("127.0.0.1:0")
 			if err != nil {
 				return err
 			}
@@ -3580,7 +3574,7 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 // RecvDups. Validates the dispatcher's mode-agnostic behaviour
 // against the packet-boundary drainer.
 func TestM5PacketRaceModeDuplicates(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3707,7 +3701,7 @@ func TestM5PacketRaceModeDuplicates(t *testing.T) {
 // back; the engine writes the measured RTT into PathConn.Quality().
 // On loopback the RTT is single-digit microseconds.
 func TestM6PathRTTProbeRecords(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3770,7 +3764,7 @@ func TestM6PathRTTProbeRecords(t *testing.T) {
 // Uses SetPathQualityForTest to inject scores; the production
 // RTT/jitter/loss probe lands in M6(2/n).
 func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3859,7 +3853,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 // testing is "byte-stream over migration", not raw throughput) + 3
 // forced migrations between two QUIC paths + SHA-256 verified.
 func TestM2G1SketchQUIC(t *testing.T) {
-	ln, err := ListenQUIC("127.0.0.1:0", nil)
+	ln, err := listenRuntimeQUIC("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3979,11 +3973,11 @@ func TestM2G1SketchQUIC(t *testing.T) {
 	t.Logf("16 MiB over QUIC + 3 migrations in %s, sha256 verified", time.Since(t0))
 }
 
-// TestM2QUICRoundTrip: session dialer over QUIC path + ListenQUIC accept;
+// TestM2QUICRoundTrip: session dialer over QUIC + Runtime framed accept;
 // public rendr.Conn round-trips bytes through one QUIC connection
 // per path. Matches the M1 TCP smoke test but over the QUIC adapter.
 func TestM2QUICRoundTrip(t *testing.T) {
-	ln, err := ListenQUIC("127.0.0.1:0", nil)
+	ln, err := listenRuntimeQUIC("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4037,9 +4031,9 @@ func TestM2QUICRoundTrip(t *testing.T) {
 // symmetrically (same proto.Frame envelope, same DeathCause
 // taxonomy, same migration semantics).
 func TestM2MixedTCPQUICMigration(t *testing.T) {
-	ln, err := Listen(
-		ListenSpec{Transport: "tcp", Address: "127.0.0.1:0"},
-		ListenSpec{Transport: "quic", Address: "127.0.0.1:0"},
+	ln, err := listenRuntimeSources(
+		runtimeTCPSource("tcp", "127.0.0.1:0"),
+		runtimeQUICSource("quic", "127.0.0.1:0", nil),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -4048,6 +4042,10 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 	addrs := ln.Addrs()
 	if len(addrs) != 2 {
 		t.Fatalf("Addrs len=%d want 2", len(addrs))
+	}
+	tcpAddr, quicAddr := ln.SourceAddr("tcp"), ln.SourceAddr("quic")
+	if tcpAddr == nil || quicAddr == nil {
+		t.Fatalf("source address map: tcp=%v quic=%v", tcpAddr, quicAddr)
 	}
 
 	accepted := make(chan Conn, 1)
@@ -4065,8 +4063,8 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 	d := &sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
-			{Transport: "tcp", Address: addrs[0].String()},
-			{Transport: "quic", Address: addrs[1].String()},
+			{Transport: "tcp", Address: tcpAddr.String()},
+			{Transport: "quic", Address: quicAddr.String()},
 		}), MigrationBudget: 3 * time.Second}
 
 	client, err := d.Dial(context.Background())
@@ -4141,9 +4139,9 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 // the same rendr Conn must continue losslessly over a QUIC stream path
 // (UDP-backed, but still reliable and ordered).
 func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
-	ln, err := Listen(
-		ListenSpec{Transport: "tcp", Address: "127.0.0.1:0"},
-		ListenSpec{Transport: "quic", Address: "127.0.0.1:0"},
+	ln, err := listenRuntimeSources(
+		runtimeTCPSource("tcp", "127.0.0.1:0"),
+		runtimeQUICSource("quic", "127.0.0.1:0", nil),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -4152,6 +4150,10 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 	addrs := ln.Addrs()
 	if len(addrs) != 2 {
 		t.Fatalf("Addrs len=%d want 2", len(addrs))
+	}
+	tcpAddr, quicAddr := ln.SourceAddr("tcp"), ln.SourceAddr("quic")
+	if tcpAddr == nil || quicAddr == nil {
+		t.Fatalf("source address map: tcp=%v quic=%v", tcpAddr, quicAddr)
 	}
 
 	accepted := make(chan Conn, 1)
@@ -4169,8 +4171,8 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 	client, err := (&sessionDialer{Root: selectorRoot(
 
 		[]PathSpec{
-			{Transport: "tcp", Address: addrs[0].String()},
-			{Transport: "quic", Address: addrs[1].String()},
+			{Transport: "tcp", Address: tcpAddr.String()},
+			{Transport: "quic", Address: quicAddr.String()},
 		}), MigrationBudget: 5 * time.Second}).Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -4179,7 +4181,7 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	if !waitForNPaths(t, client, server, "quic", addrs[1].String(), 2, 5*time.Second) {
+	if !waitForNPaths(t, client, server, "quic", quicAddr.String(), 2, 5*time.Second) {
 		t.Fatalf("paths did not attach: client=%d server=%d", len(client.Paths()), len(server.Paths()))
 	}
 
@@ -4280,11 +4282,23 @@ func fillDeterministic(buf []byte, offset int64) {
 }
 
 func TestListenMultiValidation(t *testing.T) {
-	if _, err := Listen(); err == nil {
-		t.Fatal("Listen with no specs unexpectedly succeeded")
+	serverRuntime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := Listen(ListenSpec{Transport: "udpflow", Address: "127.0.0.1:0"}); err == nil {
-		t.Fatal("Listen with unsupported stream transport unexpectedly succeeded")
+	if _, err := serverRuntime.Listen(ListenConfig{}); err == nil {
+		t.Fatal("Runtime.Listen with no sources unexpectedly succeeded")
+	}
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := serverRuntime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name: "invalid-carrier", Carrier: CarrierFamily(255), Listener: raw,
+	}}}); err == nil {
+		t.Fatal("Runtime.Listen with an invalid source carrier unexpectedly succeeded")
 	}
 }
 
@@ -4292,7 +4306,7 @@ func TestListenMultiValidation(t *testing.T) {
 // kill the active one and verify the engine fails over to the
 // surviving QUIC path without surfacing an error to the application.
 func TestM2QUICDeathTriggersMigration(t *testing.T) {
-	ln, err := ListenQUIC("127.0.0.1:0", nil)
+	ln, err := listenRuntimeQUIC("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4345,8 +4359,7 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sc := server.(*engineBackedConn)
-	if err := sc.Engine().ForceKillPathForTest(sc.Engine().ActivePath()); err != nil {
+	if err := ln.CloseAcceptedPath("quic", 0); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -4371,7 +4384,7 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 // engine with one echo so zombieLeft is full, then kills the active
 // path twice with no traffic between the kills.
 func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4470,22 +4483,5 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Read did not surface ErrZombie within 3s")
-	}
-}
-
-// killServerPath reaches into the engine and slams a path closed,
-// simulating a sudden network death. Exposed only for in-package
-// tests.
-func killServerPath(t *testing.T, bc *engineBackedConn, id uint32) {
-	t.Helper()
-	for _, info := range bc.Paths() {
-		if info.ID == id {
-			break
-		}
-	}
-	// The engine's path table is internal; use the engine-level
-	// helper Tests need a back-door for forced-death simulation.
-	if err := bc.Engine().ForceKillPathForTest(id); err != nil {
-		t.Fatalf("kill path %d: %v", id, err)
 	}
 }

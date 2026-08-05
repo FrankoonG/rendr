@@ -27,7 +27,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 		t.Skipf("tcprepair unavailable: %v", err)
 	}
 
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -101,7 +101,7 @@ func TestRuntimeRejectsNilAndMissingRoot(t *testing.T) {
 }
 
 func TestRuntimeDialsStandardNetConnSession(t *testing.T) {
-	listener, err := ListenTCP("127.0.0.1:0")
+	listener, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestRuntimeDialsStandardNetConnSession(t *testing.T) {
 }
 
 func TestRuntimeDialsRegisteredStreamFactoryDescriptor(t *testing.T) {
-	listener, err := ListenTCP("127.0.0.1:0")
+	listener, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

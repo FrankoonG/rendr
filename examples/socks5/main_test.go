@@ -19,14 +19,27 @@ func TestSOCKS5OverRendr(t *testing.T) {
 	echoAddr, stopEcho := startTCPEcho(t)
 	defer stopEcho()
 
-	rendrLn, err := rendr.ListenTCP("127.0.0.1:0")
+	serverRuntime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
+		t.Fatal(err)
+	}
+	rawRendrLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendrLn, err := serverRuntime.Listen(rendr.ListenConfig{Streams: []rendr.StreamSource{{
+		Name:     "tcp",
+		Carrier:  rendr.CarrierTCP,
+		Listener: rawRendrLn,
+	}}})
+	if err != nil {
+		_ = rawRendrLn.Close()
 		t.Fatal(err)
 	}
 	defer rendrLn.Close()
 	rendrDone := make(chan error, 1)
 	go func() {
-		c, err := rendrLn.Accept(ctx)
+		c, err := rendrLn.AcceptStream(ctx)
 		if err != nil {
 			rendrDone <- err
 			return

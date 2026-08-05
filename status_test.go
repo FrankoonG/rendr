@@ -92,7 +92,7 @@ func TestPathStatusDoesNotDependOnTransportName(t *testing.T) {
 }
 
 func TestDialerOptionalPathRetryAttachesAfterForwardingFix(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestDialerOptionalPathRetryAttachesAfterForwardingFix(t *testing.T) {
 }
 
 func TestDialerOptionalPathFailureDoesNotSurfaceToApp(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

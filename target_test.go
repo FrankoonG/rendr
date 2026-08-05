@@ -164,7 +164,7 @@ func TestDialerPrimaryExplicitGroupResolvesLeaf(t *testing.T) {
 }
 
 func TestDialerStatusPeerRendr(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestDialerStatusPeerRendr(t *testing.T) {
 }
 
 func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
-	good, err := ListenTCP("127.0.0.1:0")
+	good, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestDialerPrimaryPreferFallbackStatus(t *testing.T) {
 }
 
 func TestDialerPrimaryRequireFails(t *testing.T) {
-	good, err := ListenTCP("127.0.0.1:0")
+	good, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestDialerPrimaryRequireFails(t *testing.T) {
 }
 
 func TestDialerRootSelectorDialSmoke(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestDialerRootSelectorDialSmoke(t *testing.T) {
 }
 
 func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
 }
 
 func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 }
 
 func TestSelectorHotStandbyFailover(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 }
 
 func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 }
 
 func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +770,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 }
 
 func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +843,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 }
 
 func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,7 +932,7 @@ func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
 }
 
 func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1033,7 +1033,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 }
 
 func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1098,13 +1098,14 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 
 	chunk := make([]byte, 32<<10)
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && server.(testConnectionControl).ActivePath() != serverIDs["B"] {
+	serverObserver := server.(ConnectionObserver)
+	for time.Now().Before(deadline) && serverObserver.ActivePath() != serverIDs["B"] {
 		if _, err := server.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := server.(testConnectionControl).ActivePath(); got != serverIDs["B"] {
+	if got := serverObserver.ActivePath(); got != serverIDs["B"] {
 		t.Fatalf("server tx active path=%d want B=%d", got, serverIDs["B"])
 	}
 	if got := client.(testConnectionControl).ActivePath(); got != clientIDs["A"] {

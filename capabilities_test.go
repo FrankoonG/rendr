@@ -9,7 +9,7 @@ import (
 )
 
 func TestDialerAdvertisesL3IdentityCapability(t *testing.T) {
-	ln, err := ListenTCP("127.0.0.1:0")
+	ln, err := listenRuntimeTCP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestDialerAdvertisesL3IdentityCapability(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	stats := server.(testConnectionControl).Stats()
+	stats := server.(ConnectionObserver).Stats()
 	if stats.PeerCaps&proto.CapsL3Identity == 0 {
 		t.Fatalf("server PeerCaps=0x%08x missing CapsL3Identity", stats.PeerCaps)
 	}
@@ -48,7 +48,7 @@ func TestDialerAdvertisesL3IdentityCapability(t *testing.T) {
 }
 
 func TestDialPacketAdvertisesL3IdentityAndPacketMode(t *testing.T) {
-	ln, err := ListenUDPFlowPacket("127.0.0.1:0")
+	ln, err := listenRuntimeUDP("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestDialPacketAdvertisesL3IdentityAndPacketMode(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	stats := server.(testPacketConnectionControl).Stats()
+	stats := server.(ConnectionObserver).Stats()
 	if stats.PeerCaps&proto.CapsL3Identity == 0 {
 		t.Fatalf("packet PeerCaps=0x%08x missing CapsL3Identity", stats.PeerCaps)
 	}

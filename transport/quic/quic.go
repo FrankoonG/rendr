@@ -151,7 +151,7 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 }
 
 // Accept wraps a server-accepted (connection, stream) pair. Used by
-// the listener-side dispatcher (see rendr.ListenQUIC).
+// Listener before the path enters a rendr FramedSource.
 func Accept(conn *qg.Conn, stream *qg.Stream) *PathConn {
 	return wrap(conn, stream, true, nil)
 }

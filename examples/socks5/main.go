@@ -58,13 +58,26 @@ func main() {
 }
 
 func runServer(ctx context.Context, addr string) error {
-	ln, err := rendr.ListenTCP(addr)
+	runtime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
+		return err
+	}
+	rawListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	ln, err := runtime.Listen(rendr.ListenConfig{Streams: []rendr.StreamSource{{
+		Name:     "tcp",
+		Carrier:  rendr.CarrierTCP,
+		Listener: rawListener,
+	}}})
+	if err != nil {
+		_ = rawListener.Close()
 		return err
 	}
 	defer ln.Close()
 	for {
-		c, err := ln.Accept(ctx)
+		c, err := ln.AcceptStream(ctx)
 		if err != nil {
 			return err
 		}

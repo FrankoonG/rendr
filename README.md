@@ -42,7 +42,7 @@ the embedder's application protocol.
 | Application flow | One logical application conversation carried by rendr. In stream mode this maps to one stable `net.Conn`; in packet mode it maps to one stable `net.PacketConn`. |
 | `flow_id` | The stable per-flow identifier used by rendr peers to attach new paths to the same logical flow. |
 | Path | One concrete underlying route between two rendr peers, such as a TCP connection, QUIC connection, UDP flow, gVisor carrier, or embedder-provided tunnel. |
-| Transport | The adapter that creates a path from a `PathSpec`. Built-in examples include `tcp`, `quic`, `udpflow`, and `gvisor`. |
+| Transport | The adapter that creates a path from a `PathSpec`. The core registers TCP and opaque UDP; optional packages such as QUIC and gVisor register their own adapters when imported. |
 | Carrier | The byte-stream or datagram substrate used by a path. A carrier can be direct, proxied, tunneled, or custom. |
 | Target | A node in the policy graph. A target can be a leaf `Path`, a `Selector`, a `Race`, or a `Bond`. |
 | Root target | The policy graph entry point supplied in `SessionConfig` to a `Runtime`. |
@@ -53,14 +53,14 @@ the embedder's application protocol.
 | Stream mode | rendr presents a `net.Conn`; byte order is preserved. |
 | Packet mode | rendr presents a `net.PacketConn`; each write maps to one packet-shaped frame. |
 | `InstanceID` | An ephemeral identifier for one running rendr runtime. It lets a client verify that additional paths attach to the same peer instance. |
-| Capability | A string identifier exposed through status APIs, such as `rendr`, `l7`, `tun`, `l3_identity`, `tcp_repair`, `gvisor`, `mixed`, `packet_mode`, or `quic_datagram`. |
+| Capability | A stable string identifier exposed through status APIs. The core currently reports `rendr`, `l7`, `l3_identity`, and `packet_mode`; optional adapters expose their own factual status separately. |
 | Status | A runtime snapshot of local capabilities, peer kind, peer capabilities, and leaf path states. |
 | Primary path / target | The preferred initial path or target used to establish the first handshake. Later traffic can still migrate according to policy. |
 | TUN ingress | An L3 ingress layer that captures OS IP packets and turns flows into rendr sessions. It is not itself a path policy. |
 | L3 identity | The original logical source/destination IP and port tuple carried with a flow for peer-side egress decisions. |
 | Egress hook | Embedder-owned code that decides how peer-side traffic lands after rendr has migrated the flow. |
 | TCP_REPAIR | A Linux kernel mechanism explored for native TCP state migration. |
-| gVisor fallback | A user-space TCP path used when kernel TCP migration support is unavailable or not permitted. |
+| gVisor-owned leaf | A user-space TCP endpoint held by gVisor from session creation. Its packet link can be rebound, but it cannot adopt an arbitrary live kernel TCP socket. |
 
 ## Scope
 
