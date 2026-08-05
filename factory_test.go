@@ -283,7 +283,7 @@ func TestStreamFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
 	waitFactoryPathCount(t, client, server, 2)
-	admin := client.(AdminConn)
+	admin := client.(testConnectionControl)
 	removeID := inactiveFactoryPathID(t, client.Paths())
 	if err := admin.RemovePath(removeID); err != nil {
 		t.Fatalf("RemovePath before snapshot AddPath: %v", err)
@@ -355,7 +355,7 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	server := awaitFactoryAccept(t, accepted)
 	defer server.Close()
 	waitFactoryPathCount(t, client, server, 2)
-	admin := client.(AdminPacketConn)
+	admin := client.(testPacketConnectionControl)
 	removeID := inactiveFactoryPathID(t, client.Paths())
 	if err := admin.RemovePath(removeID); err != nil {
 		t.Fatalf("RemovePath before snapshot AddPath: %v", err)

@@ -105,9 +105,8 @@ func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint
 	c.peak.start()
 }
 
-// Admin-style methods on enginePacketConn mirror the AdminConn
-// surface on stream-mode connections. Applications that need them
-// type-assert to AdminPacketConn (or its individual interfaces).
+// Optional control and observation methods mirror stream-mode connections.
+// Applications assert only the narrow interface they need.
 func (c *enginePacketConn) Migrate(id uint32) error { return c.e.Migrate(id) }
 func (c *enginePacketConn) ActivePath() uint32      { return c.e.ActivePath() }
 func (c *enginePacketConn) State() string           { return c.e.State().String() }
@@ -132,8 +131,7 @@ func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
 // AddPath dials through the session-bound factory resolver and attaches a
-// fresh path matching spec. Same semantics as AdminConn.AddPath on stream
-// mode.
+// fresh path matching spec.
 func (c *enginePacketConn) AddPath(spec PathSpec) (uint32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -180,8 +178,7 @@ func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry RetryPoli
 	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }
 
-// Stats returns the same coherent snapshot as AdminConn.Stats does
-// for stream-mode Conn.
+// Stats returns the same coherent snapshot as stream-mode Conn.
 func (c *enginePacketConn) Stats() ConnStats {
 	topology := c.e.TopologySnapshot()
 	return ConnStats{
@@ -198,25 +195,6 @@ func (c *enginePacketConn) Stats() ConnStats {
 		PeerCaps:       c.e.PeerCaps(),
 		PeerInstanceID: c.e.PeerInstanceID(),
 	}
-}
-
-// AdminPacketConn is the AdminConn analogue for packet-mode. It
-// extends PacketConn with the same migration/observability surface
-// stream-mode AdminConn exposes.
-type AdminPacketConn interface {
-	PacketConn
-	Migrate(pathID uint32) error
-	ActivePath() uint32
-	AddPath(spec PathSpec) (uint32, error)
-	RemovePath(pathID uint32) error
-	State() string
-	RecvQueueHWM() int
-	RecvDups() uint64
-	BondStuckSkips() uint64
-	MigrationCount() uint64
-	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
-	Mode() Mode
-	Stats() ConnStats
 }
 
 // PacketListener accepts inbound rendr PacketConns. The udpflow

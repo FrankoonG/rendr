@@ -49,10 +49,8 @@ func ExampleRuntime_Dial() {
 	// Output: server got: hello rendr
 }
 
-// ExampleAdminConn shows the monitoring / control face. After
-// Dial, the application can assert to rendr.AdminConn to inspect
-// path state, drive migration, or attach a fresh path post-death.
-func ExampleAdminConn() {
+// ExampleConnectionObserver shows the optional observation surface.
+func ExampleConnectionObserver() {
 	ln, err := rendr.ListenTCP("127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
@@ -84,7 +82,7 @@ func ExampleAdminConn() {
 	defer c.Close()
 	_, _ = c.Write(make([]byte, 8))
 
-	if adm, ok := c.(rendr.AdminConn); ok {
+	if adm, ok := c.(rendr.ConnectionObserver); ok {
 		s := adm.Stats()
 		fmt.Println("state:", s.State)
 		fmt.Println("mode:", s.Mode)

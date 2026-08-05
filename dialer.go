@@ -15,8 +15,8 @@ import (
 // Dialer is the entry point for constructing a rendr Conn.
 //
 // Root is the single configuration entry point for the initial target graph.
-// Use AddPath / RemovePath on the returned AdminConn to mutate the path set
-// after dial.
+// Runtime uses this implementation internally. Returned sessions expose
+// optional path mutation through PathController.
 type Dialer struct {
 	// Root is the target graph entry point. Selector/Race/Bond currently
 	// compile down to the flattened engine mode layer until the recursive

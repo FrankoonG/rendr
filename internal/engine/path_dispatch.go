@@ -16,9 +16,10 @@ const minimumDispatchStallWindow = 100 * time.Millisecond
 const maximumDispatchStallWindow = 2 * time.Second
 
 type pathDispatchJob struct {
-	frame  []byte
-	bonded bool
-	result chan<- pathDispatchResult
+	frame            []byte
+	bonded           bool
+	firstPublication bool
+	result           chan<- pathDispatchResult
 }
 
 type pathDispatchResult struct {
@@ -63,7 +64,7 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	}
 	if err == nil {
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
-		slot.recordDispatch(job.frame)
+		slot.recordDispatch(job.frame, job.firstPublication)
 	} else if !errors.Is(err, ErrPathTXFenced) {
 		// Some third-party PathConn implementations cannot reliably invoke
 		// OnDeath after a failed Write. The generation check makes this
@@ -87,7 +88,7 @@ func (e *Engine) rejectQueuedDispatches(slot *pathSlot) {
 	}
 }
 
-func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) error {
+func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime, firstPublication bool) error {
 	deadline := nowFn().Add(e.limits.MigrationBudget)
 	for {
 		if e.isClosed() {
@@ -133,7 +134,12 @@ func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime) erro
 			if slot == nil {
 				continue
 			}
-			if slot.submitDispatch(pathDispatchJob{frame: frame, bonded: route.bonded, result: results}) {
+			if slot.submitDispatch(pathDispatchJob{
+				frame:            frame,
+				bonded:           route.bonded,
+				firstPublication: firstPublication,
+				result:           results,
+			}) {
 				submitted++
 				submittedSlots[slot] = struct{}{}
 			}

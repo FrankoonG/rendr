@@ -50,14 +50,31 @@ type ListenConfig struct {
 	Packets []PacketSource
 }
 
+// acceptedStreamConn restricts the dynamic method set to capabilities an
+// inbound session can actually honor. The peer owns the frozen graph and
+// factory resolver, so an accepted session cannot initiate AddPath.
+type acceptedStreamConn struct {
+	Conn
+	MigrationController
+	ConnectionObserver
+	engine *engine.Engine
+}
+
+type acceptedPacketConn struct {
+	PacketConn
+	MigrationController
+	ConnectionObserver
+	engine *engine.Engine
+}
+
 // SessionListener accepts application sessions assembled from all sources in
 // one ListenConfig. It implements net.Listener for stream sessions and also
 // provides a context-aware, strongly typed AcceptStream method.
 type SessionListener struct {
 	runtime *Runtime
 
-	streamAccept chan *engineBackedConn
-	packetAccept chan *enginePacketConn
+	streamAccept chan *acceptedStreamConn
+	packetAccept chan *acceptedPacketConn
 	streamSlots  chan struct{}
 	packetSlots  chan struct{}
 	handshakes   chan struct{}
@@ -139,8 +156,8 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 
 	l := &SessionListener{
 		runtime:      r,
-		streamAccept: make(chan *engineBackedConn, runtimeAcceptQueueSize),
-		packetAccept: make(chan *enginePacketConn, runtimeAcceptQueueSize),
+		streamAccept: make(chan *acceptedStreamConn, runtimeAcceptQueueSize),
+		packetAccept: make(chan *acceptedPacketConn, runtimeAcceptQueueSize),
 		streamSlots:  make(chan struct{}, runtimeAcceptQueueSize),
 		packetSlots:  make(chan struct{}, runtimeAcceptQueueSize),
 		handshakes:   make(chan struct{}, runtimeHandshakeLimit),
@@ -472,8 +489,14 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	laddr := addrFromString(pc.LocalAddr())
 	raddr := addrFromString(pc.RemoteAddr())
 	if packetMode {
-		conn := newEnginePacketConn(e, mode, laddr, raddr)
-		conn.carriers = l.carriers
+		base := newEnginePacketConn(e, mode, laddr, raddr)
+		base.carriers = l.carriers
+		conn := &acceptedPacketConn{
+			PacketConn:          base,
+			MigrationController: base,
+			ConnectionObserver:  base,
+			engine:              e,
+		}
 		if l.publishPacket(inflightID, conn) {
 			slotHeld = false
 		} else {
@@ -485,8 +508,14 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		}
 		return true
 	}
-	conn := newEngineBackedConn(e, &engine.Conn{E: e, LAddr: laddr, RAddr: raddr}, mode)
-	conn.carriers = l.carriers
+	base := newEngineBackedConn(e, &engine.Conn{E: e, LAddr: laddr, RAddr: raddr}, mode)
+	base.carriers = l.carriers
+	conn := &acceptedStreamConn{
+		Conn:                base,
+		MigrationController: base,
+		ConnectionObserver:  base,
+		engine:              e,
+	}
 	if l.publishStream(inflightID, conn) {
 		slotHeld = false
 	} else {
@@ -694,7 +723,7 @@ func (l *SessionListener) closeInflight() {
 	}
 }
 
-func (l *SessionListener) publishStream(inflightID uint64, conn *engineBackedConn) bool {
+func (l *SessionListener) publishStream(inflightID uint64, conn *acceptedStreamConn) bool {
 	l.inflightMu.Lock()
 	defer l.inflightMu.Unlock()
 	if l.closing {
@@ -709,7 +738,7 @@ func (l *SessionListener) publishStream(inflightID uint64, conn *engineBackedCon
 	}
 }
 
-func (l *SessionListener) publishPacket(inflightID uint64, conn *enginePacketConn) bool {
+func (l *SessionListener) publishPacket(inflightID uint64, conn *acceptedPacketConn) bool {
 	l.inflightMu.Lock()
 	defer l.inflightMu.Unlock()
 	if l.closing {
@@ -755,7 +784,7 @@ func (l *SessionListener) drainQueuedSessions() {
 		select {
 		case conn := <-l.streamAccept:
 			l.releaseAcceptSlot(false)
-			_ = conn.e.Close()
+			_ = conn.engine.Close()
 		default:
 			goto packets
 		}
@@ -766,7 +795,7 @@ packets:
 		select {
 		case conn := <-l.packetAccept:
 			l.releaseAcceptSlot(true)
-			_ = conn.e.Close()
+			_ = conn.engine.Close()
 		default:
 			return
 		}

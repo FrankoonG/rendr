@@ -32,7 +32,8 @@
 // from transport death.
 //
 // The normal connection interfaces expose path and status snapshots. Optional
-// narrow administrative interfaces provide explicit migration and path-set
-// management for embedders and tests. Runtime mobility is planned from factual
-// carrier capabilities; callers select targets, not socket migration backends.
+// narrow MigrationController, PathController, and ConnectionObserver
+// interfaces expose only the control or telemetry capability an embedder
+// requests. Runtime mobility is planned from factual carrier capabilities;
+// callers select targets, not socket migration backends.
 package rendr

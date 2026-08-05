@@ -39,20 +39,17 @@ type PacketConn interface {
 	Status() Status
 }
 
-// AdminConn extends Conn with operations that are not part of the
-// normal application surface: explicit path migration, active-path
-// introspection, and dynamic path attach. Tools that drive
-// migration externally (runtime balancers, monitoring panels,
-// integration tests) assert to this interface.
-//
-// Application code should NOT depend on AdminConn; the engine
-// reserves the right to migrate on its own and an external migrate
-// can race with internal scheduling.
-type AdminConn interface {
-	Conn
+// MigrationController is the optional explicit migration surface shared by
+// stream and packet sessions. Normal applications do not need this interface;
+// rendr's scheduler and recovery planner migrate automatically.
+type MigrationController interface {
 	Migrate(pathID uint32) error
-	ActivePath() uint32
+}
 
+// PathController is the optional dynamic path-set surface shared by stream
+// and packet sessions. AddPath can only restore a leaf that belongs to the
+// session's frozen target graph.
+type PathController interface {
 	// AddPath dials a new path matching spec and joins it to the
 	// existing engine via BRIDGE_TAG. Returns the new path id on
 	// success. This is the G5 "path recovery" primitive: after a
@@ -67,13 +64,14 @@ type AdminConn interface {
 	// AddPath/RemovePath are the symmetric primitives for runtime
 	// path-set management; the engine itself never calls RemovePath.
 	RemovePath(pathID uint32) error
+}
 
-	// MigratePathLocalAddr asks the named path transport to rebuild its
-	// underlying socket while preserving the logical path id. This is
-	// currently used by TCP_REPAIR-style transports; unsupported
-	// transports return an error.
-	MigratePathLocalAddr(pathID uint32, newLocal string) error
-
+// ConnectionObserver exposes coherent migration and scheduling telemetry
+// without granting mutation. It is implemented by both Conn and PacketConn
+// concrete values and is intentionally separate from the application data
+// interfaces.
+type ConnectionObserver interface {
+	ActivePath() uint32
 	// State returns the bridge lifecycle stage as a short string:
 	// "init", "handshaking", "active", "migrating", "closing",
 	// "dead". Production monitoring uses this for a liveness
@@ -129,7 +127,7 @@ type AdminConn interface {
 	Stats() ConnStats
 }
 
-// ConnStats is the one-call snapshot returned by AdminConn.Stats.
+// ConnStats is the one-call snapshot returned by ConnectionObserver.Stats.
 // Layout is stable; fields are added to the end for forward
 // compatibility.
 type ConnStats struct {

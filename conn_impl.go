@@ -102,14 +102,13 @@ func (c *engineBackedConn) Engine() *engine.Engine { return c.e }
 //	if k, ok := c.(interface{ ForceKillPathForTest(uint32) error }); ok { ... }
 //
 // Not part of the public API. Production code that wants to drop a
-// path cleanly should use AdminConn.RemovePath instead.
+// path cleanly should use PathController.RemovePath instead.
 func (c *engineBackedConn) ForceKillPathForTest(id uint32) error {
 	return c.e.ForceKillPathForTest(id)
 }
 
-// Migrate switches the active path to id. Exposed to external admin
-// surfaces (runtime balancers, monitoring panels) via the AdminConn
-// interface assertion.
+// Migrate switches the active path to id. Embedders request it through the
+// narrow MigrationController interface.
 func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
 
 // ActivePath returns the currently-active path id.

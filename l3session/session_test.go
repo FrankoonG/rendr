@@ -75,7 +75,7 @@ func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	assertPeerL3Cap(t, server.(rendr.AdminConn).Stats().PeerCaps, false)
+	assertPeerL3Cap(t, server.(rendr.ConnectionObserver).Stats().PeerCaps, false)
 
 	go func() {
 		buf := make([]byte, 5)
@@ -142,7 +142,7 @@ func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	assertPeerL3Cap(t, server.(rendr.AdminPacketConn).Stats().PeerCaps, true)
+	assertPeerL3Cap(t, server.(rendr.ConnectionObserver).Stats().PeerCaps, true)
 
 	go func() {
 		buf := make([]byte, 32)

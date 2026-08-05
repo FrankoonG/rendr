@@ -185,7 +185,7 @@ func TestManagerRecordsSessionPathSelectionAndMigrations(t *testing.T) {
 	if !ok {
 		t.Fatal("missing session")
 	}
-	admin := sess.Conn.(rendr.AdminConn)
+	admin := sess.Conn.(streamControl)
 	var pathB uint32
 	for _, p := range admin.Paths() {
 		if p.Spec.Opts["name"] == "tcp-b" {

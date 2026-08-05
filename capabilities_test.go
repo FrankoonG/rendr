@@ -38,7 +38,7 @@ func TestDialerAdvertisesL3IdentityCapability(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	stats := server.(AdminConn).Stats()
+	stats := server.(testConnectionControl).Stats()
 	if stats.PeerCaps&proto.CapsL3Identity == 0 {
 		t.Fatalf("server PeerCaps=0x%08x missing CapsL3Identity", stats.PeerCaps)
 	}
@@ -77,7 +77,7 @@ func TestDialPacketAdvertisesL3IdentityAndPacketMode(t *testing.T) {
 
 	server := <-accepted
 	defer server.Close()
-	stats := server.(AdminPacketConn).Stats()
+	stats := server.(testPacketConnectionControl).Stats()
 	if stats.PeerCaps&proto.CapsL3Identity == 0 {
 		t.Fatalf("packet PeerCaps=0x%08x missing CapsL3Identity", stats.PeerCaps)
 	}

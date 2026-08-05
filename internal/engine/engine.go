@@ -313,10 +313,11 @@ type pathSlot struct {
 	// stamped after a successful dispatch write to this slot's
 	// socket. Engine-level (not probe-level): both data and ctrl
 	// writes bump it.
-	lastSendUnixNano atomic.Int64
-	dataWrites       atomic.Uint64
-	controlWrites    atomic.Uint64
-	dataDispatches   atomic.Uint64
+	lastSendUnixNano    atomic.Int64
+	dataWrites          atomic.Uint64
+	controlWrites       atomic.Uint64
+	dataDispatches      atomic.Uint64
+	firstDataDispatches atomic.Uint64
 
 	dispatchMu      sync.Mutex
 	dispatchQ       chan pathDispatchJob
@@ -442,13 +443,16 @@ func (s *pathSlot) unfenceDispatch() {
 	s.dispatchMu.Unlock()
 }
 
-func (s *pathSlot) recordDispatch(frame []byte) {
+func (s *pathSlot) recordDispatch(frame []byte, firstPublication bool) {
 	if len(frame) < proto.HeaderSize {
 		return
 	}
 	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 	if err == nil && header.Type == proto.FrameData {
 		s.dataDispatches.Add(1)
+		if firstPublication {
+			s.firstDataDispatches.Add(1)
+		}
 	}
 }
 
@@ -1218,6 +1222,7 @@ func pathInfos(slots []*pathSlot, activeID uint32) []transport.PathInfo {
 		pi.DataWrites = s.dataWrites.Load()
 		pi.ControlWrites = s.controlWrites.Load()
 		pi.DataDispatches = s.dataDispatches.Load()
+		pi.FirstDataDispatches = s.firstDataDispatches.Load()
 		if ns := s.lastRecvUnixNano.Load(); ns > 0 {
 			pi.LastRecvAt = time.Unix(0, ns)
 		}
@@ -1777,7 +1782,7 @@ func (e *Engine) MigrationCount() uint64 {
 // path). The returned function cancels the subscription.
 //
 // Hooks run after pathsMu has been released, so fn may safely call
-// back into AdminConn methods.
+// back into the root package's narrow control interfaces.
 func (e *Engine) OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func()) {
 	if fn == nil {
 		return func() {}

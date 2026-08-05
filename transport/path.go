@@ -54,7 +54,12 @@ type PathInfo struct {
 	DataWrites     uint64
 	ControlWrites  uint64
 	DataDispatches uint64
-	Active         bool
+	// FirstDataDispatches counts successful DATA writes issued by the
+	// frame's initial publication. DataDispatches also includes recovery
+	// replay, so comparing the two exposes retransmission overhead without
+	// letting replay masquerade as a scheduler route decision.
+	FirstDataDispatches uint64
+	Active              bool
 	// RecvDups: inbound frames on this path whose SEQ was already
 	// delivered or buffered (race-mode duplicates, accidental
 	// retransmits). Sum across all paths equals ConnStats.RecvDups.

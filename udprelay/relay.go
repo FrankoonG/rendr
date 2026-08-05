@@ -272,8 +272,7 @@ func Start(ctx context.Context, cfg Config) (*Relay, error) {
 func (r *Relay) LocalAddr() net.Addr { return r.udp.LocalAddr() }
 
 // PacketConn returns the underlying rendr carrier. Callers may
-// type-assert it to rendr.AdminPacketConn to add paths or trigger
-// explicit migrations.
+// type-assert it to rendr.PathController or rendr.MigrationController.
 func (r *Relay) PacketConn() rendr.PacketConn { return r.pc }
 
 // Done is closed when the relay is stopped.

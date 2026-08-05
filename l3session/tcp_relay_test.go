@@ -98,7 +98,7 @@ func TestTCPRelayPreservesFlowAcrossStreamMigration(t *testing.T) {
 	if !ok || sess.Conn == nil {
 		t.Fatalf("missing stream session: ok=%v sess=%+v", ok, sess)
 	}
-	admin := sess.Conn.(rendr.AdminConn)
+	admin := sess.Conn.(streamControl)
 	var pathB uint32
 	for _, p := range admin.Paths() {
 		if p.Spec.Opts["name"] == "tcp-b" {

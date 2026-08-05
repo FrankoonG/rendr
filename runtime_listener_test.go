@@ -73,6 +73,7 @@ func TestRuntimeListenerCrossSourceBridgeAndCloseIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	assertAcceptedControlSurface(t, server)
 
 	if !waitForRuntimePathCount(client, server, 2, 5*time.Second) {
 		t.Fatalf("cross-source bridge did not attach: client=%v server=%v", client.Paths(), server.Paths())
@@ -193,6 +194,7 @@ func TestRuntimeListenerPacketSessionSurvivesListenerClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
+	assertAcceptedControlSurface(t, server)
 	assertPacketRoundTrip(t, client, server, []byte("packet-before-close"))
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
@@ -277,7 +279,7 @@ func TestRuntimeListenerCrossStreamPacketSourceBridge(t *testing.T) {
 	}
 
 	serverPacketID := runtimeListenerPathID(t, server.Paths(), "packet")
-	if err := server.(*engineBackedConn).Migrate(serverPacketID); err != nil {
+	if err := server.(MigrationController).Migrate(serverPacketID); err != nil {
 		t.Fatal(err)
 	}
 	assertStreamRoundTrip(t, server, client, []byte("reverse-over-packet-leaf"))
@@ -960,6 +962,19 @@ func runtimeListenerPathInfo(t *testing.T, paths []PathInfo, id uint32) PathInfo
 	}
 	t.Fatalf("path id %d not found in %v", id, paths)
 	return PathInfo{}
+}
+
+func assertAcceptedControlSurface(t *testing.T, session any) {
+	t.Helper()
+	if _, ok := session.(MigrationController); !ok {
+		t.Fatalf("accepted session %T lacks MigrationController", session)
+	}
+	if _, ok := session.(ConnectionObserver); !ok {
+		t.Fatalf("accepted session %T lacks ConnectionObserver", session)
+	}
+	if _, ok := session.(PathController); ok {
+		t.Fatalf("accepted session %T exposes unsupported PathController", session)
+	}
 }
 
 func assertStatusCarrier(t *testing.T, status Status, name string, want CarrierFamily) {

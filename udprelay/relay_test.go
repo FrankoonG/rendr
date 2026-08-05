@@ -77,7 +77,7 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 
 	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("before-migration"))
 
-	admin := client.(rendr.AdminPacketConn)
+	admin := client.(packetControl)
 	cur := admin.ActivePath()
 	var next uint32
 	for _, p := range admin.Paths() {
@@ -154,7 +154,7 @@ func TestDialAndServeRoundTrip(t *testing.T) {
 	defer app.Close()
 
 	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("dial-serve-before"))
-	admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
+	admin := clientRelay.PacketConn().(packetControl)
 	migrateToAlternate(t, admin)
 	sendAndExpect(t, app, clientRelay.LocalAddr(), []byte("dial-serve-after"))
 }
@@ -199,7 +199,7 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 			t.Fatal(err)
 		}
 		sendAndExpect(t, app, clientRelay.LocalAddr(), []byte(fmt.Sprintf("server-client-%d-before", i)))
-		admin := clientRelay.PacketConn().(rendr.AdminPacketConn)
+		admin := clientRelay.PacketConn().(packetControl)
 		migrateToAlternate(t, admin)
 		sendAndExpect(t, app, clientRelay.LocalAddr(), []byte(fmt.Sprintf("server-client-%d-after", i)))
 		_ = app.Close()
@@ -234,8 +234,8 @@ func startUDPEcho(t *testing.T) (net.PacketConn, net.Addr) {
 
 func waitPacketPaths(t *testing.T, client, server rendr.PacketConn, want int) {
 	t.Helper()
-	ca := client.(rendr.AdminPacketConn)
-	sa := server.(rendr.AdminPacketConn)
+	ca := client.(packetControl)
+	sa := server.(packetControl)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(ca.Paths()) >= want && len(sa.Paths()) >= want {
@@ -258,7 +258,7 @@ func waitServerRelays(t *testing.T, server *Server, want int) {
 	t.Fatalf("server relays=%d want >=%d", server.Relays(), want)
 }
 
-func migrateToAlternate(t *testing.T, admin rendr.AdminPacketConn) {
+func migrateToAlternate(t *testing.T, admin packetControl) {
 	t.Helper()
 	cur := admin.ActivePath()
 	var next uint32

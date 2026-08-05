@@ -511,13 +511,13 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if client.(AdminConn).ActivePath() == ids["B"] {
+		if client.(testConnectionControl).ActivePath() == ids["B"] {
 			return
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("active path=%d want B=%d; peak C=%d must stay out of normal quality selector",
-		client.(AdminConn).ActivePath(), ids["B"], ids["C"])
+		client.(testConnectionControl).ActivePath(), ids["B"], ids["C"])
 }
 
 func TestSelectorHotStandbyFailover(t *testing.T) {
@@ -576,7 +576,7 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 	ebc := client.(*engineBackedConn)
 	ebc.Engine().SetPathQualityForTest(ids["A"], PathQuality{RTT: 30 * time.Millisecond, At: time.Now()})
 	ebc.Engine().SetPathQualityForTest(ids["B"], PathQuality{RTT: 50 * time.Millisecond, At: time.Now()})
-	if got := client.(AdminConn).ActivePath(); got != ids["A"] {
+	if got := client.(testConnectionControl).ActivePath(); got != ids["A"] {
 		t.Fatalf("initial active=%d want A=%d", got, ids["A"])
 	}
 	if err := ebc.ForceKillPathForTest(ids["A"]); err != nil {
@@ -584,12 +584,12 @@ func TestSelectorHotStandbyFailover(t *testing.T) {
 	}
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
-		if client.(AdminConn).ActivePath() == ids["B"] {
+		if client.(testConnectionControl).ActivePath() == ids["B"] {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := client.(AdminConn).ActivePath(); got != ids["B"] {
+	if got := client.(testConnectionControl).ActivePath(); got != ids["B"] {
 		t.Fatalf("active after A death=%d want B=%d", got, ids["B"])
 	}
 	if _, err := client.Write([]byte("ok")); err != nil {
@@ -671,12 +671,12 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if client.(AdminConn).ActivePath() == ids["C"] {
+		if client.(testConnectionControl).ActivePath() == ids["C"] {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if got := client.(AdminConn).ActivePath(); got != ids["C"] {
+	if got := client.(testConnectionControl).ActivePath(); got != ids["C"] {
 		t.Fatalf("active=%d want C=%d before death", got, ids["C"])
 	}
 	if err := ebc.ForceKillPathForTest(ids["C"]); err != nil {
@@ -684,14 +684,14 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 	}
 	deadline = time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
-		got := client.(AdminConn).ActivePath()
+		got := client.(testConnectionControl).ActivePath()
 		if got == ids["A"] || got == ids["B"] {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("active after C death=%d; wanted A or B, not peak D=%d",
-		client.(AdminConn).ActivePath(), ids["D"])
+		client.(testConnectionControl).ActivePath(), ids["D"])
 }
 
 func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
@@ -764,7 +764,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 	if got := client.(interface{ Mode() Mode }).Mode(); got != ModeSelector {
 		t.Fatalf("mode=%v want selector; bad peak quality should block promotion", got)
 	}
-	if got := client.(AdminConn).ActivePath(); got == ids["C"] {
+	if got := client.(testConnectionControl).ActivePath(); got == ids["C"] {
 		t.Fatalf("active path promoted to bad peak C=%d", ids["C"])
 	}
 }
@@ -837,7 +837,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	if got := client.(interface{ Mode() Mode }).Mode(); got != ModeSelector {
 		t.Fatalf("mode=%v want selector; stale peak evidence should block promotion", got)
 	}
-	if got := client.(AdminConn).ActivePath(); got == ids["C"] {
+	if got := client.(testConnectionControl).ActivePath(); got == ids["C"] {
 		t.Fatalf("active path promoted using stale peak evidence C=%d", ids["C"])
 	}
 }
@@ -907,12 +907,12 @@ func TestSelectorPeakTransferProbeBudgetUsesSinglePeakCandidate(t *testing.T) {
 	ids := idsByName(client.Paths())
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if client.(AdminConn).ActivePath() == ids["P1"] {
+		if client.(testConnectionControl).ActivePath() == ids["P1"] {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if got := client.(AdminConn).ActivePath(); got != ids["P1"] {
+	if got := client.(testConnectionControl).ActivePath(); got != ids["P1"] {
 		t.Fatalf("active after peak promotion=%d want P1", got)
 	}
 
@@ -1003,13 +1003,13 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 
 	chunk := make([]byte, 32<<10)
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && client.(AdminConn).ActivePath() != ids["B"] {
+	for time.Now().Before(deadline) && client.(testConnectionControl).ActivePath() != ids["B"] {
 		if _, err := client.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := client.(AdminConn).ActivePath(); got != ids["B"] {
+	if got := client.(testConnectionControl).ActivePath(); got != ids["B"] {
 		t.Fatalf("active path=%d want B=%d", got, ids["B"])
 	}
 
@@ -1026,7 +1026,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
-		if got := client.(AdminConn).ActivePath(); got != ids["A"] {
+		if got := client.(testConnectionControl).ActivePath(); got != ids["A"] {
 			t.Fatalf("active path=%d want A=%d while slow peak is suppressed", got, ids["A"])
 		}
 	}
@@ -1098,16 +1098,16 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 
 	chunk := make([]byte, 32<<10)
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && server.(AdminConn).ActivePath() != serverIDs["B"] {
+	for time.Now().Before(deadline) && server.(testConnectionControl).ActivePath() != serverIDs["B"] {
 		if _, err := server.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := server.(AdminConn).ActivePath(); got != serverIDs["B"] {
+	if got := server.(testConnectionControl).ActivePath(); got != serverIDs["B"] {
 		t.Fatalf("server tx active path=%d want B=%d", got, serverIDs["B"])
 	}
-	if got := client.(AdminConn).ActivePath(); got != clientIDs["A"] {
+	if got := client.(testConnectionControl).ActivePath(); got != clientIDs["A"] {
 		t.Fatalf("client tx active path=%d want A=%d; rx policy must not move local tx", got, clientIDs["A"])
 	}
 	for i := 0; i < 32; i++ {
@@ -1134,9 +1134,9 @@ func waitForMode(t *testing.T, c Conn, want Mode, within time.Duration) {
 
 func waitForActivePath(t *testing.T, c Conn, want uint32, within time.Duration) {
 	t.Helper()
-	admin, ok := c.(AdminConn)
+	admin, ok := c.(testConnectionControl)
 	if !ok {
-		t.Fatalf("connection does not expose AdminConn; want active path %d", want)
+		t.Fatalf("connection does not expose testConnectionControl; want active path %d", want)
 	}
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {

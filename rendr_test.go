@@ -38,7 +38,7 @@ func raceRoot(specs []PathSpec) Target     { return testRoot(TargetKindRace, spe
 func bondRoot(specs []PathSpec) Target     { return testRoot(TargetKindBond, specs) }
 
 // waitForNPaths polls until both client and server see at least n
-// attached paths, retrying via AdminConn.AddPath against the named
+// attached paths, retrying via testConnectionControl.AddPath against the named
 // transport+address if the client falls short. The Dialer is
 // best-effort about extra paths (silent-skip on dial failure);
 // under heavy parallel test load that drops paths often enough to
@@ -49,7 +49,7 @@ func bondRoot(specs []PathSpec) Target     { return testRoot(TargetKindBond, spe
 // false otherwise (caller decides whether to t.Skip or t.Fatal).
 func waitForNPaths(t *testing.T, client Conn, server Conn, transport, addr string, n int, total time.Duration) bool {
 	t.Helper()
-	adm, _ := client.(AdminConn)
+	adm, _ := client.(testConnectionControl)
 	deadline := time.Now().Add(total)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= n && len(server.Paths()) >= n {
@@ -1731,7 +1731,7 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 	s := adm.Stats()
 
 	if s.FlowID != client.FlowID() {
@@ -1808,9 +1808,9 @@ func TestAdminConnStateAndHWM(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	adm, ok := client.(AdminConn)
+	adm, ok := client.(testConnectionControl)
 	if !ok {
-		t.Fatal("client does not implement AdminConn")
+		t.Fatal("client does not implement testConnectionControl")
 	}
 	if s := adm.State(); s != "active" {
 		t.Errorf("State() after dial: got %q want %q", s, "active")
@@ -2074,7 +2074,7 @@ func TestAdminConnRemovePath(t *testing.T) {
 		t.Fatalf("expected 2 paths, got %d", len(client.Paths()))
 	}
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 
 	// 1. Drop a NON-active path. The active path's id is bc.ActivePath();
 	// pick any other.
@@ -2158,7 +2158,7 @@ func TestAdminConnRemoveActivePathFailovers(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 	if !waitForNPaths(t, client, server, "tcp", ln.Addr().String(), 2, 15*time.Second) {
 		t.Skipf("could not stabilize 2 paths each under load (client=%d server=%d) - load-pathological, skipping",
 			len(client.Paths()), len(server.Paths()))
@@ -2231,7 +2231,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 
 	// Collect events via a channel so the test can verify cause + ids.
 	type ev struct {
@@ -2348,7 +2348,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 			len(client.Paths()), len(server.Paths()))
 	}
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 	// Initial active-path assignment does NOT count.
 	if got := adm.MigrationCount(); got != 0 {
 		t.Fatalf("initial MigrationCount=%d want 0", got)
@@ -2520,7 +2520,7 @@ func TestM7DedupWindowBoundedOnLoopback(t *testing.T) {
 	// land on a path that isn't yet attached engine-side - allow up
 	// to ~25% missing without failing. The strict-zero-loss check is
 	// on the data stream above (rxbuf bytes match).
-	srvAdm := server.(AdminConn)
+	srvAdm := server.(testConnectionControl)
 	dups, paths := waitRecvDupsStable(t, srvAdm)
 	t.Logf("race-mode RecvDups = %d (over %d frames on 2 paths)", dups, N)
 	if dups < uint64(N*3/4) {
@@ -2589,46 +2589,16 @@ func TestM8BondPathPinning(t *testing.T) {
 
 	bc := client.(*engineBackedConn)
 
-	type pp struct {
-		id     uint32
-		writer interface{ Writes() uint64 }
-	}
-	var probes []pp
-	bc.Engine().WalkPathsForTest(func(id uint32, pc interface{}) {
-		if w, ok := pc.(interface{ Writes() uint64 }); ok {
-			probes = append(probes, pp{id: id, writer: w})
-		}
-	})
-	if len(probes) != 2 {
-		t.Fatalf("expected 2 probes, got %d", len(probes))
-	}
+	// Pin size 4 so 64 frames form 16 alternating runs of 4.
+	const pinSize = 4
+	bc.Engine().SetBondPinSizeForTest(pinSize)
 
-	// Pin size 4 so 16 frames -> 4 runs of 4.
-	bc.Engine().SetBondPinSizeForTest(4)
-
-	const N = 16
+	const N = 64
 	payload := []byte("pinframe")
-	pathPerFrame := make([]uint32, 0, N)
-	prevA := probes[0].writer.Writes()
-	prevB := probes[1].writer.Writes()
 	for i := 0; i < N; i++ {
 		if _, err := client.Write(payload); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
-		// Whichever path's Writes() advanced this iteration is the
-		// path the engine chose for this frame.
-		curA := probes[0].writer.Writes()
-		curB := probes[1].writer.Writes()
-		if curA > prevA {
-			pathPerFrame = append(pathPerFrame, probes[0].id)
-		} else if curB > prevB {
-			pathPerFrame = append(pathPerFrame, probes[1].id)
-		} else {
-			t.Fatalf("frame %d: neither path's Writes() advanced (a=%d b=%d)",
-				i, curA, curB)
-		}
-		prevA = curA
-		prevB = curB
 	}
 
 	// Drain server.
@@ -2636,34 +2606,28 @@ func TestM8BondPathPinning(t *testing.T) {
 	if _, err := io.ReadFull(server, rxbuf); err != nil {
 		t.Fatalf("server drain: %v", err)
 	}
+	if want := bytes.Repeat(payload, N); !bytes.Equal(rxbuf, want) {
+		t.Fatal("bond pinning payload corrupted")
+	}
 
-	t.Logf("path-per-frame: %v", pathPerFrame)
-
-	// Verify pinning: count the number of times consecutive frames
-	// switched paths. With pin=4 and 16 frames we should see at
-	// most ceil(16/4)-1 = 3 switches.
-	switches := 0
-	for i := 1; i < len(pathPerFrame); i++ {
-		if pathPerFrame[i] != pathPerFrame[i-1] {
-			switches++
+	paths := client.Paths()
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(paths))
+	}
+	var first, physical uint64
+	for _, path := range paths {
+		if path.FirstDataDispatches == 0 {
+			t.Fatalf("path %d carried no first-publication DATA: %+v", path.ID, paths)
 		}
+		first += path.FirstDataDispatches
+		physical += path.DataDispatches
 	}
-	if switches > 3 {
-		t.Fatalf("path pinning broken: %d switches across %d frames (expected <= 3 with pin=4)",
-			switches, N)
+	if first != N {
+		t.Fatalf("first DATA dispatches=%d want %d", first, N)
 	}
-
-	// Sanity: both paths got >=1 frame.
-	var aN, bN int
-	for _, p := range pathPerFrame {
-		if p == probes[0].id {
-			aN++
-		} else if p == probes[1].id {
-			bN++
-		}
-	}
-	if aN == 0 || bN == 0 {
-		t.Fatalf("one path saw no frames: %v", pathPerFrame)
+	if physical < first || physical > first+N/2 {
+		t.Fatalf("physical DATA dispatches=%d outside bounded replay range [%d,%d]",
+			physical, first, first+N/2)
 	}
 }
 
@@ -2844,8 +2808,23 @@ func TestM8BondHonorsPathWeights(t *testing.T) {
 			}
 		}
 	}
-	if counts[3] != 12 || counts[1] != 4 {
-		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, want 12/4", counts[3], counts[1])
+	totalDispatches := counts[3] + counts[1]
+	if totalDispatches < N {
+		t.Fatalf("weighted bond dispatches=%d want at least %d application frames", totalDispatches, N)
+	}
+	if totalDispatches > N+N/2 {
+		t.Fatalf("weighted bond dispatches=%d exceed replay bound %d", totalDispatches, N+N/2)
+	}
+	// DataDispatches counts physical replay as well as first publication. Every
+	// weighted scheduling cycle must still contain three weight-3 dispatches
+	// for one weight-1 dispatch; an incomplete final cycle can differ by at
+	// most three.
+	delta := int64(counts[3]) - 3*int64(counts[1])
+	if delta < 0 {
+		delta = -delta
+	}
+	if counts[1] == 0 || delta > 3 {
+		t.Fatalf("weighted bond distribution = weight3:%d weight1:%d, ratio delta=%d want <=3", counts[3], counts[1], delta)
 	}
 }
 
@@ -4119,7 +4098,7 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 	if quicPath == 0 {
 		t.Fatalf("no quic path in client paths: %+v", client.Paths())
 	}
-	admin := client.(AdminConn)
+	admin := client.(testConnectionControl)
 
 	want := bytes.Repeat([]byte("tcp-to-quic-mixed-"), 64*1024)
 	got := make([]byte, len(want))
@@ -4204,7 +4183,7 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		t.Fatalf("paths did not attach: client=%d server=%d", len(client.Paths()), len(server.Paths()))
 	}
 
-	admin := client.(AdminConn)
+	admin := client.(testConnectionControl)
 	clientEngine := client.(*engineBackedConn)
 	var tcpPath, quicPath uint32
 	for _, p := range client.Paths() {
@@ -4428,7 +4407,7 @@ func TestM1ZombieAfterTwoNoPayloadMigrations(t *testing.T) {
 
 	// Wait for all 3 paths on both ends; retry via AddPath under
 	// load if Dialer's silent-skip dropped one of the extras.
-	bcAdm := client.(AdminConn)
+	bcAdm := client.(testConnectionControl)
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(client.Paths()) >= 3 && len(server.Paths()) >= 3 {

@@ -154,13 +154,13 @@ func sessionPathNames(sess *Session) []string {
 		return nil
 	}
 	if sess.Conn != nil {
-		if c, ok := sess.Conn.(rendr.AdminConn); ok {
+		if c, ok := sess.Conn.(rendr.ConnectionObserver); ok {
 			return selectedPathNames(c.Stats())
 		}
 		return pathNames(sess.Conn.Paths())
 	}
 	if sess.PacketConn != nil {
-		if c, ok := sess.PacketConn.(rendr.AdminPacketConn); ok {
+		if c, ok := sess.PacketConn.(rendr.ConnectionObserver); ok {
 			return selectedPathNames(c.Stats())
 		}
 		return pathNames(sess.PacketConn.Paths())

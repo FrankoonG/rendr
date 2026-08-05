@@ -59,7 +59,7 @@ func TestTCPRepairAdminPathRebuildSameTuple(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	adm := client.(AdminConn)
+	adm := client.(testConnectionControl)
 	pathID := adm.ActivePath()
 	if pathID == 0 {
 		t.Fatal("no active path")

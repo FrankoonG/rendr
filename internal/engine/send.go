@@ -111,7 +111,7 @@ func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byt
 	// any path. Advancing before dispatch lets a fast race child ACK while a
 	// slower sibling is still inside Write without having that ACK rejected.
 	e.publishSendSeq(seq + 1)
-	err := e.dispatch(frame)
+	err := e.dispatch(frame, true)
 	return frame, err
 }
 
@@ -124,7 +124,7 @@ func (e *Engine) replaySequencedFrame(frame []byte) error {
 	if e.isClosed() || e.sendClosing.Load() {
 		return net.ErrClosed
 	}
-	return e.dispatch(frame)
+	return e.dispatch(frame, false)
 }
 
 func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
@@ -150,7 +150,7 @@ func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
 		return err
 	}
 	e.publishSendSeq(seq + 1)
-	return e.dispatch(frame)
+	return e.dispatch(frame, true)
 }
 
 func (e *Engine) publishSendSeq(next uint64) {
@@ -173,21 +173,21 @@ func (e *Engine) publishSendSeq(next uint64) {
 // (receiver dedup handles duplicates). It returns
 // ErrMigrationBudgetExceeded only when there are no usable paths
 // after the budget.
-func (e *Engine) dispatch(frame []byte) error {
+func (e *Engine) dispatch(frame []byte, firstPublication bool) error {
 	if runtime := e.localExecutionRuntime(); runtime != nil {
-		return e.dispatchRecursive(frame, runtime)
+		return e.dispatchRecursive(frame, runtime, firstPublication)
 	}
 	switch e.mode.Load() {
 	case dispatchRace:
-		return e.dispatchRace(frame)
+		return e.dispatchRace(frame, firstPublication)
 	case dispatchBond:
-		return e.dispatchBond(frame)
+		return e.dispatchBond(frame, firstPublication)
 	default:
-		return e.dispatchSingle(frame)
+		return e.dispatchSingle(frame, firstPublication)
 	}
 }
 
-func (e *Engine) dispatchSingle(frame []byte) error {
+func (e *Engine) dispatchSingle(frame []byte, firstPublication bool) error {
 	for {
 		if e.isClosed() {
 			return net.ErrClosed
@@ -221,7 +221,7 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 		}
 		if slot != nil {
 			slot.lastSendUnixNano.Store(nowFn().UnixNano())
-			slot.recordDispatch(frame)
+			slot.recordDispatch(frame, firstPublication)
 		}
 		return nil
 	}
@@ -243,7 +243,7 @@ func (e *Engine) dispatchSingle(frame []byte) error {
 // weight means 1. Redistribute-on-death replays only frames newer
 // than the peer's latest cumulative ACK, with the bounded recent
 // window as the conservative fallback when no ACK has arrived yet.
-func (e *Engine) dispatchBond(frame []byte) error {
+func (e *Engine) dispatchBond(frame []byte, firstPublication bool) error {
 	for {
 		if e.isClosed() {
 			return net.ErrClosed
@@ -342,7 +342,7 @@ func (e *Engine) dispatchBond(frame []byte) error {
 			return io.ErrShortWrite
 		}
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
-		slot.recordDispatch(frame)
+		slot.recordDispatch(frame, firstPublication)
 		return nil
 	}
 }
@@ -361,7 +361,7 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 		if e.isClosed() {
 			return net.ErrClosed
 		}
-		if err := e.dispatch(frame); err != nil {
+		if err := e.dispatch(frame, false); err != nil {
 			return err
 		}
 		if len(frame) >= proto.HeaderSize {
@@ -464,7 +464,7 @@ func (e *Engine) computeBondStuckMask(ids []uint32) []bool {
 // dispatchRace writes the same frame on every attached path.
 // At least one success is required; if every path errors, the
 // engine waits inside the migration budget for a fresh path.
-func (e *Engine) dispatchRace(frame []byte) error {
+func (e *Engine) dispatchRace(frame []byte, firstPublication bool) error {
 	for {
 		if e.isClosed() {
 			return net.ErrClosed
@@ -492,7 +492,7 @@ func (e *Engine) dispatchRace(frame []byte) error {
 			if n, err := s.writeDispatchedFrame(frame); err == nil && n == len(frame) {
 				anyOk = true
 				s.lastSendUnixNano.Store(now)
-				s.recordDispatch(frame)
+				s.recordDispatch(frame, firstPublication)
 			}
 		}
 		if anyOk {

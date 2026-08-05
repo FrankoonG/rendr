@@ -204,7 +204,7 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 	if !ok || sess.PacketConn == nil {
 		t.Fatalf("missing packet session: ok=%v sess=%+v", ok, sess)
 	}
-	admin := sess.PacketConn.(rendr.AdminPacketConn)
+	admin := sess.PacketConn.(packetControl)
 	var pathB uint32
 	for _, p := range admin.Paths() {
 		if p.Spec.Opts["name"] == "udp-b" {

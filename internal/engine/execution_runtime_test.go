@@ -72,6 +72,46 @@ func TestExecutionRuntimeNestedSelectorsKeepIndependentState(t *testing.T) {
 	}
 }
 
+func TestExecutionRuntimeBondPinsFourFramesPerChild(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindBond, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	attached := runtimeAttached(ids, "a", "b")
+
+	const (
+		frameCount = 64
+		pinSize    = 4
+	)
+	routes := make([]proto.TargetID, 0, frameCount)
+	for frame := 0; frame < frameCount; frame++ {
+		ticket, err := runtime.buildTicket(attached, false, pinSize)
+		if err != nil {
+			t.Fatalf("ticket %d: %v", frame, err)
+		}
+		if len(ticket.routes) != 1 {
+			t.Fatalf("ticket %d routes=%v, want one bond route", frame, ticket.routes)
+		}
+		routes = append(routes, ticket.routes[0].targetID)
+	}
+
+	var previousRun proto.TargetID
+	for start := 0; start < frameCount; start += pinSize {
+		run := routes[start]
+		for offset := 1; offset < pinSize; offset++ {
+			if routes[start+offset] != run {
+				t.Fatalf("run %d split at offset %d: routes=%x", start/pinSize, offset, routes)
+			}
+		}
+		if start != 0 && run == previousRun {
+			t.Fatalf("runs %d and %d reused child %x: routes=%x", start/pinSize-1, start/pinSize, run, routes)
+		}
+		previousRun = run
+	}
+}
+
 func TestExecutionRuntimeSelectorDeathBypassesPolicyAndRecoversDesired(t *testing.T) {
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
