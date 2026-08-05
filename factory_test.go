@@ -75,6 +75,10 @@ func TestM9X5StreamPathFactoryRoundTrip(t *testing.T) {
 	if dials.Load() != 1 {
 		t.Fatalf("factory invoked %d times, want 1", dials.Load())
 	}
+	streamMobility := client.Status().Paths[0].Mobility
+	if streamMobility.ID != MobilityRedialAttach || streamMobility.Reason != MobilityReasonEndpointNotOwned || streamMobility.EndpointGeneration != 0 {
+		t.Fatalf("generic StreamFactory mobility=%+v", streamMobility)
+	}
 
 	if cli, ok := client.(Conn); ok {
 		if srv, ok := server.(Conn); ok {
@@ -224,6 +228,10 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 	}
 	if client.(PacketConn).FlowID() != server.(PacketConn).FlowID() {
 		t.Fatalf("flow_id mismatch through packet factory wrap")
+	}
+	packetMobility := client.Status().Paths[0].Mobility
+	if packetMobility.ID != MobilityRedialAttach || packetMobility.Reason != MobilityReasonEndpointNotOwned || packetMobility.EndpointGeneration != 0 {
+		t.Fatalf("generic PacketFactory mobility=%+v", packetMobility)
 	}
 }
 

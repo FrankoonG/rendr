@@ -9,6 +9,7 @@ import (
 
 	qg "github.com/quic-go/quic-go"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -192,7 +193,7 @@ func (l *Listener) Accept(ctx context.Context) (*PathConn, error) {
 		release()
 		return nil, err
 	}
-	return wrap(conn, stream, true, release), nil
+	return wrap(conn, stream, true, release, leafmobility.RoleAcceptor), nil
 }
 
 // AcceptPath delegates to Accept.
@@ -219,7 +220,7 @@ func (l *Listener) AcceptDatagram(ctx context.Context) (*datagramPathConn, error
 		release()
 		return nil, err
 	}
-	return wrapDatagram(conn, true, release), nil
+	return wrapDatagram(conn, true, release, leafmobility.RoleAcceptor), nil
 }
 
 // AcceptPath delegates to the wrapped listener's DATAGRAM acceptor.

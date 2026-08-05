@@ -217,6 +217,21 @@ func (t *pathStatusTracker) setMobility(index int, mobility MobilityStatus) {
 	t.mu.Unlock()
 }
 
+func (t *pathStatusTracker) setMobilityForSpec(spec PathSpec, mobility MobilityStatus) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for index := range t.paths {
+		tracked := t.paths[index].spec
+		if pathSpecName(tracked) == pathSpecName(spec) && tracked.Transport == spec.Transport && tracked.Address == spec.Address {
+			t.paths[index].mobility = mobility
+			return
+		}
+	}
+}
+
 func (t *pathStatusTracker) snapshot(attached []PathInfo, carrierMaps ...map[string]CarrierFamily) []PathStatus {
 	if t == nil {
 		return nil
@@ -292,6 +307,21 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 		out = make([]PathStatus, 0, len(paths))
 		for _, p := range paths {
 			out = append(out, pathStatusFromInfo(p, MobilityStatus{}, carriers))
+		}
+	}
+	mobilityByPath := make(map[uint32]MobilityStatus, len(paths))
+	for _, path := range paths {
+		mobilityByPath[path.ID] = planLeafMobilityAt(path.Since)
+	}
+	for _, owned := range topology.LeafMobility {
+		mobilityByPath[owned.Ref.ID] = planLeafMobilityAt(
+			owned.PlannedAt,
+			owned.Facts,
+		)
+	}
+	for index := range out {
+		if mobility, ok := mobilityByPath[out[index].ID]; ok {
+			out[index].Mobility = mobility
 		}
 	}
 	return Status{

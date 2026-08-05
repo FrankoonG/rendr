@@ -10,6 +10,7 @@ import (
 
 	qg "github.com/quic-go/quic-go"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -60,6 +61,7 @@ func TestListenerAcceptPathDelegatesToStreamAccept(t *testing.T) {
 	}
 	result := awaitPathAccept(t, accepted)
 	t.Cleanup(func() { _ = result.path.Close() })
+	assertQUICListenerClaim(t, result.path, leafmobility.SessionAny)
 
 	got := make([]byte, len(want))
 	n, err := result.path.Read(got)
@@ -105,6 +107,7 @@ func TestDatagramListenerAcceptPathDelegatesToDatagramAccept(t *testing.T) {
 	}
 	result := awaitPathAccept(t, accepted)
 	t.Cleanup(func() { _ = result.path.Close() })
+	assertQUICListenerClaim(t, result.path, leafmobility.SessionPacket)
 
 	got := make([]byte, len(want))
 	n, err := result.path.Read(got)
@@ -116,6 +119,20 @@ func TestDatagramListenerAcceptPathDelegatesToDatagramAccept(t *testing.T) {
 	}
 	if _, ok := result.path.(transport.OwnedFrameReader); !ok {
 		t.Fatal("DATAGRAM AcceptPath returned a stream path")
+	}
+}
+
+func assertQUICListenerClaim(t *testing.T, path transport.PathConn, session leafmobility.Session) {
+	t.Helper()
+	provider, ok := path.(leafmobility.Provider)
+	if !ok || provider.LeafMobilityClaim() == nil {
+		t.Fatal("adapter listener path has no sealed ownership claim")
+	}
+	facts := provider.LeafMobilityClaim().Snapshot()
+	if facts.Kind != leafmobility.KindQUIC || facts.Role != leafmobility.RoleAcceptor ||
+		facts.Scope != leafmobility.ScopeEndpoint || facts.Session != session ||
+		facts.Operations != 0 || facts.Generation == 0 {
+		t.Fatalf("adapter listener QUIC facts=%+v", facts)
 	}
 }
 

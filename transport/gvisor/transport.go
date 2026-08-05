@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -415,7 +416,9 @@ func (l *Listener) dial(ctx context.Context) (transport.PathConn, error) {
 	if l.finishDial(c) {
 		return nil, net.ErrClosed
 	}
-	return basetcp.Wrap(c), nil
+	return newRetainedOwnedPathConn(
+		basetcp.Wrap(c), nil, leafmobility.RoleDialer, leafmobility.ScopeProcessLocal,
+	), nil
 }
 
 func dialPacketCarrier(ctx context.Context, remote string) (transport.PathConn, error) {
@@ -447,10 +450,10 @@ func dialPacketCarrier(ctx context.Context, remote string) (transport.PathConn, 
 		clientStack.Close()
 		return nil, fmt.Errorf("gvisor: dial packet-carrier tcp: %w", err)
 	}
-	return newRetainedPathConn(basetcp.Wrap(c), func() {
+	return newRetainedOwnedPathConn(basetcp.Wrap(c), func() {
 		link.close()
 		clientStack.Close()
-	}), nil
+	}, leafmobility.RoleDialer, leafmobility.ScopeEndpoint), nil
 }
 
 // retainedPathConn keeps its owner's resources alive while the concrete TCP
@@ -458,6 +461,7 @@ func dialPacketCarrier(ctx context.Context, remote string) (transport.PathConn, 
 // engine-facing methods in this wrapper's method set.
 type retainedPathConn struct {
 	*basetcp.PathConn
+	claim *leafmobility.Claim
 
 	releaseOnce sync.Once
 	release     func()
@@ -470,12 +474,35 @@ type retainedPathConn struct {
 }
 
 func newRetainedPathConn(path *basetcp.PathConn, release func()) *retainedPathConn {
+	if release == nil {
+		release = func() {}
+	}
 	p := &retainedPathConn{PathConn: path, release: release}
 	path.OnDeath(p.onDeath)
 	return p
 }
 
+func newRetainedOwnedPathConn(path *basetcp.PathConn, release func(), role leafmobility.Role, scope leafmobility.Scope) *retainedPathConn {
+	p := newRetainedPathConn(path, release)
+	p.claim = leafmobility.MustNewClaim(leafmobility.Facts{
+		Kind:       leafmobility.KindGVisor,
+		Role:       role,
+		Scope:      scope,
+		Session:    leafmobility.SessionAny,
+		Generation: leafmobility.NextGeneration(),
+	})
+	return p
+}
+
+func (p *retainedPathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
+}
+
 func (p *retainedPathConn) Close() error {
+	p.claim.RetireUnbound()
 	err := p.PathConn.Close()
 	p.releaseOnce.Do(p.release)
 	return err
@@ -496,6 +523,7 @@ func (p *retainedPathConn) OnDeath(fn func(transport.DeathCause, error)) {
 }
 
 func (p *retainedPathConn) onDeath(cause transport.DeathCause, err error) {
+	p.claim.RetireUnbound()
 	p.releaseOnce.Do(p.release)
 	p.deathMu.Lock()
 	p.dead = true
@@ -518,7 +546,11 @@ func (l *Listener) retainAccepted(c net.Conn) (transport.PathConn, bool) {
 	}
 	l.active++
 	l.lifecycleMu.Unlock()
-	return newRetainedPathConn(basetcp.Wrap(c), l.releaseAccepted), true
+	scope := leafmobility.ScopeSharedLink
+	if l.domain != nil {
+		scope = leafmobility.ScopeProcessLocal
+	}
+	return newRetainedOwnedPathConn(basetcp.Wrap(c), l.releaseAccepted, leafmobility.RoleAcceptor, scope), true
 }
 
 func (l *Listener) releaseAccepted() {

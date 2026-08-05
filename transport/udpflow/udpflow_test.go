@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -32,6 +33,15 @@ func TestUDPFlowDialAndWrite(t *testing.T) {
 	}
 	pc := pcRaw.(*PathConn)
 	defer pc.Close()
+	claim := pc.LeafMobilityClaim()
+	if claim == nil {
+		t.Fatal("adapter-dialed UDP flow has no sealed ownership claim")
+	}
+	facts := claim.Snapshot()
+	if facts.Kind != leafmobility.KindUDPFlow || facts.Role != leafmobility.RoleDialer ||
+		facts.Scope != leafmobility.ScopeEndpoint || facts.Generation == 0 {
+		t.Fatalf("adapter-dialed UDP flow facts=%+v", facts)
+	}
 
 	frame := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02}
 	n, err := pc.Write(frame)
@@ -60,6 +70,12 @@ func TestUDPFlowDialAndWrite(t *testing.T) {
 
 	if got, want := pc.Writes(), uint64(1); got != want {
 		t.Errorf("Writes() = %d, want %d", got, want)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !claim.Retired() {
+		t.Fatal("direct close did not retire unbound UDP-flow claim")
 	}
 }
 

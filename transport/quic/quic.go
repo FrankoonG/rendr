@@ -14,6 +14,7 @@ import (
 
 	qg "github.com/quic-go/quic-go"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -118,14 +119,14 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
 	}
 	if useDatagram {
-		return wrapDatagram(conn, false, nil), nil
+		return wrapDatagram(conn, false, nil, leafmobility.RoleDialer), nil
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		_ = conn.CloseWithError(0, "open stream failed")
 		return nil, fmt.Errorf("quic: open stream: %w", err)
 	}
-	return wrap(conn, stream, false, nil), nil
+	return wrap(conn, stream, false, nil, leafmobility.RoleDialer), nil
 }
 
 // Probe times the handshake + first-stream open as a coarse RTT
@@ -141,18 +142,27 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 	return transport.PathQuality{RTT: rtt, At: time.Now()}, nil
 }
 
-// Accept wraps a server-accepted (connection, stream) pair. Used by
-// Listener before the path enters a rendr FramedSource.
+// Accept wraps an externally accepted (connection, stream) pair. It does not
+// grant adapter ownership; Listener uses the private owned wrapper instead.
 func Accept(conn *qg.Conn, stream *qg.Stream) *PathConn {
-	return wrap(conn, stream, true, nil)
+	return wrap(conn, stream, true, nil, leafmobility.RoleUnknown)
 }
 
-func wrap(conn *qg.Conn, stream *qg.Stream, server bool, release func()) *PathConn {
+func wrap(conn *qg.Conn, stream *qg.Stream, server bool, release func(), role leafmobility.Role) *PathConn {
 	pc := &PathConn{
 		conn:    conn,
 		stream:  stream,
 		server:  server,
 		release: release,
+	}
+	if role != leafmobility.RoleUnknown {
+		pc.claim = leafmobility.MustNewClaim(leafmobility.Facts{
+			Kind:       leafmobility.KindQUIC,
+			Role:       role,
+			Scope:      leafmobility.ScopeEndpoint,
+			Session:    leafmobility.SessionAny,
+			Generation: leafmobility.NextGeneration(),
+		})
 	}
 	go pc.watchConn()
 	return pc
@@ -164,6 +174,7 @@ type PathConn struct {
 	stream  *qg.Stream
 	server  bool
 	release func()
+	claim   *leafmobility.Claim
 
 	writeMu sync.Mutex
 	readBuf [LengthPrefixSize]byte
@@ -178,6 +189,13 @@ type PathConn struct {
 	deathMu  sync.Mutex
 	deathFn  func(cause transport.DeathCause, err error)
 	deathErr error
+}
+
+func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
 }
 
 // Read returns one framed payload+header concatenated.
@@ -234,6 +252,7 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 
 // Close closes the stream then the underlying QUIC connection.
 func (p *PathConn) Close() error {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -303,6 +322,7 @@ func (p *PathConn) classify(err error) transport.DeathCause {
 }
 
 func (p *PathConn) declareDeath(err error) {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 )
@@ -87,6 +88,66 @@ func TestGVisorDomainsIsolateSameAddress(t *testing.T) {
 
 	assertRoundTrip(t, firstClient, firstServer, []byte("first domain"))
 	assertRoundTrip(t, secondClient, secondServer, []byte("second domain"))
+}
+
+func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
+	tests := []struct {
+		name        string
+		listen      func() (*Listener, error)
+		clientScope leafmobility.Scope
+		serverScope leafmobility.Scope
+	}{
+		{
+			name:        "process-local",
+			listen:      func() (*Listener, error) { return NewDomain().Listen("") },
+			clientScope: leafmobility.ScopeProcessLocal,
+			serverScope: leafmobility.ScopeProcessLocal,
+		},
+		{
+			name:        "packet-carried",
+			listen:      func() (*Listener, error) { return ListenPacket("127.0.0.1:0") },
+			clientScope: leafmobility.ScopeEndpoint,
+			serverScope: leafmobility.ScopeSharedLink,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := test.listen()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			client, server := dialAndAccept(t, listener)
+			defer client.Close()
+			defer server.Close()
+			assertGVisorClaim(t, client, leafmobility.RoleDialer, test.clientScope)
+			assertGVisorClaim(t, server, leafmobility.RoleAcceptor, test.serverScope)
+			clientClaim := client.(leafmobility.Provider).LeafMobilityClaim()
+			serverClaim := server.(leafmobility.Provider).LeafMobilityClaim()
+			if err := client.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !clientClaim.Retired() || !serverClaim.Retired() {
+				t.Fatalf("direct close retirement client/server=%t/%t", clientClaim.Retired(), serverClaim.Retired())
+			}
+		})
+	}
+}
+
+func assertGVisorClaim(t *testing.T, path transport.PathConn, role leafmobility.Role, scope leafmobility.Scope) {
+	t.Helper()
+	provider, ok := path.(leafmobility.Provider)
+	if !ok || provider.LeafMobilityClaim() == nil {
+		t.Fatal("gVisor adapter path has no sealed ownership claim")
+	}
+	facts := provider.LeafMobilityClaim().Snapshot()
+	if facts.Kind != leafmobility.KindGVisor || facts.Role != role || facts.Scope != scope ||
+		facts.Session != leafmobility.SessionAny || facts.Operations != 0 || facts.Generation == 0 {
+		t.Fatalf("gVisor ownership facts=%+v", facts)
+	}
 }
 
 func TestGVisorDomainConcurrentDuplicateListen(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -64,6 +65,28 @@ func TestTCPRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], frame) {
 		t.Fatalf("frame round-trip mismatch: got %x want %x", buf[:n], frame)
+	}
+}
+
+func TestTCPAdapterOwnershipDoesNotUpgradeWrap(t *testing.T) {
+	client, server := newPair(t)
+	clientClaim := client.LeafMobilityClaim()
+	if clientClaim == nil {
+		t.Fatal("adapter-dialed TCP path has no sealed ownership claim")
+	}
+	facts := clientClaim.Snapshot()
+	if facts.Kind != leafmobility.KindRawTCP || facts.Role != leafmobility.RoleDialer ||
+		facts.Scope != leafmobility.ScopeEndpoint || facts.Generation == 0 {
+		t.Fatalf("adapter-dialed TCP facts=%+v", facts)
+	}
+	if claim := server.LeafMobilityClaim(); claim != nil {
+		t.Fatalf("tcp.Wrap upgraded embedder-owned connection: %+v", claim.Snapshot())
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !clientClaim.Retired() {
+		t.Fatal("direct close did not retire unbound TCP claim")
 	}
 }
 

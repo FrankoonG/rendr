@@ -179,6 +179,7 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
+	c.status.setMobilityForSpec(spec, planPathConnMobility(c.resolver.carrierFamily(spec.Transport), pc))
 	if err := ctx.Err(); err != nil {
 		_ = pc.Close()
 		return 0, err

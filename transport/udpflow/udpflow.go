@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -57,7 +58,17 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 		_ = c.Close()
 		return nil, err
 	}
-	pc := &PathConn{conn: c, flowID: flowID}
+	pc := &PathConn{
+		conn:   c,
+		flowID: flowID,
+		claim: leafmobility.MustNewClaim(leafmobility.Facts{
+			Kind:       leafmobility.KindUDPFlow,
+			Role:       leafmobility.RoleDialer,
+			Scope:      leafmobility.ScopeEndpoint,
+			Session:    leafmobility.SessionAny,
+			Generation: leafmobility.NextGeneration(),
+		}),
+	}
 	return pc, nil
 }
 
@@ -82,6 +93,7 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 type PathConn struct {
 	conn   net.Conn
 	flowID [proto.UDPFlowIDSize]byte
+	claim  *leafmobility.Claim
 
 	writeMu sync.Mutex
 
@@ -98,6 +110,13 @@ type PathConn struct {
 
 	writes atomic.Uint64
 	reads  atomic.Uint64
+}
+
+func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
 }
 
 // FlowID returns the 7-byte flow identifier used on the wire.
@@ -182,6 +201,7 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 
 // Close shuts the UDP socket.
 func (p *PathConn) Close() error {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -241,6 +261,7 @@ func (p *PathConn) classify(err error) transport.DeathCause {
 }
 
 func (p *PathConn) declareDeath(err error) {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}

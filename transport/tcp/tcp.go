@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -61,10 +62,13 @@ func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transp
 	// Belt-and-suspenders: hard-disable keepalive on the dialed socket.
 	// Dialer.KeepAlive=-1 SHOULD suppress it but Go version behavior
 	// has surprised us before.
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(false)
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		_ = c.Close()
+		return nil, fmt.Errorf("tcp: dial returned %T, want *net.TCPConn", c)
 	}
-	return Wrap(c), nil
+	_ = tc.SetKeepAlive(false)
+	return wrapOwned(tc), nil
 }
 
 // Probe dials, captures handshake RTT, and closes. M1 placeholder;
@@ -88,9 +92,29 @@ func Wrap(c net.Conn) *PathConn {
 	}
 }
 
+func wrapOwned(c *net.TCPConn) *PathConn {
+	path := Wrap(c)
+	path.claim = leafmobility.MustNewClaim(leafmobility.Facts{
+		Kind:       leafmobility.KindRawTCP,
+		Role:       leafmobility.RoleDialer,
+		Scope:      leafmobility.ScopeEndpoint,
+		Session:    leafmobility.SessionAny,
+		Generation: leafmobility.NextGeneration(),
+	})
+	return path
+}
+
+func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
+}
+
 // PathConn carries length-prefixed rendr frames over a single TCP socket.
 type PathConn struct {
-	c net.Conn
+	c     net.Conn
+	claim *leafmobility.Claim
 
 	writeMu sync.Mutex // serialises framed Writes
 	readBuf [LengthPrefixSize]byte
@@ -194,6 +218,7 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 // Close shuts the socket. After Close, Read and Write return
 // net.ErrClosed. Close idempotency: extra calls are no-ops.
 func (p *PathConn) Close() error {
+	p.claim.RetireUnbound()
 	if p.dead.CompareAndSwap(false, true) {
 		err := p.c.Close()
 		p.deathMu.Lock()
@@ -260,6 +285,7 @@ func (p *PathConn) classify(err error) transport.DeathCause {
 }
 
 func (p *PathConn) declareDeath(err error) {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}

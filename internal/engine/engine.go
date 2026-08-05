@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -261,7 +262,18 @@ type TopologySnapshot struct {
 	State          BridgeState
 	ActivePath     uint32
 	Paths          []transport.PathInfo
+	LeafMobility   []LeafMobilitySnapshot
 	MigrationCount uint64
+}
+
+// LeafMobilitySnapshot is engine-internal ownership evidence bound to one
+// physical path generation. Root status code may inspect it, but public path
+// APIs never expose the sealed claim itself.
+type LeafMobilitySnapshot struct {
+	Ref       PathRef
+	Binding   PathBinding
+	Facts     leafmobility.Facts
+	PlannedAt time.Time
 }
 
 var ErrPathAttachInProgress = errors.New("engine: path attach already in progress for leaf")
@@ -276,6 +288,8 @@ type pathSlot struct {
 	spec            transport.PathSpec
 	localTXTargetID proto.TargetID
 	peerTXTargetID  proto.TargetID
+	mobilityClaim   *leafmobility.Claim
+	mobilityFacts   leafmobility.Facts
 	attached        time.Time
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
@@ -660,6 +674,16 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		_ = pc.Close()
 		return 0, err
 	}
+	var (
+		mobilityClaim *leafmobility.Claim
+		mobilityFacts leafmobility.Facts
+	)
+	if provider, ok := pc.(leafmobility.Provider); ok {
+		mobilityClaim = provider.LeafMobilityClaim()
+		if mobilityClaim != nil {
+			mobilityFacts = mobilityClaim.Snapshot()
+		}
+	}
 	e.pathsMu.Lock()
 	var (
 		completedKey     pathAdmissionLeafKey
@@ -744,6 +768,18 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		recvQSize = 1024
 	}
 	generation := e.nextPathGenerationLocked()
+	if mobilityClaim != nil {
+		if err := mobilityClaim.Bind(leafmobility.Binding{
+			FlowID:        e.flowID,
+			LocalTargetID: [16]byte(binding.LocalTXTargetID),
+			PeerTargetID:  [16]byte(binding.PeerTXTargetID),
+			PathID:        id,
+			Owner:         generation,
+		}); err != nil {
+			e.releasePathAdmissionLocked(id)
+			return rejectLocked(fmt.Errorf("engine: bind owned leaf: %w", err))
+		}
+	}
 	slot := &pathSlot{
 		id:              id,
 		gen:             generation,
@@ -752,6 +788,8 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		spec:            spec.Clone(),
 		localTXTargetID: binding.LocalTXTargetID,
 		peerTXTargetID:  binding.PeerTXTargetID,
+		mobilityClaim:   mobilityClaim,
+		mobilityFacts:   mobilityFacts,
 		attached:        time.Now(),
 		recvQ:           make(chan recvFrame, recvQSize),
 		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
@@ -800,6 +838,7 @@ func (e *Engine) StagePathAttach(id uint32) error {
 	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.pendingPaths, id)
 		e.pathsMu.Unlock()
+		slot.retireMobilityClaim()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -853,6 +892,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		delete(e.stagedPaths, id)
 		e.pathsMu.Unlock()
 		slot.closeQuit()
+		slot.retireMobilityClaim()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -1064,7 +1104,18 @@ func sameBoundLeaf(a, b *pathSlot) bool {
 	return a.localTXTargetID == b.localTXTargetID && a.peerTXTargetID == b.peerTXTargetID
 }
 
+func (s *pathSlot) retireMobilityClaim() {
+	if s == nil || s.mobilityClaim == nil {
+		return
+	}
+	binding, ok := s.mobilityClaim.Binding()
+	if ok {
+		_ = s.mobilityClaim.Retire(binding)
+	}
+}
+
 func (e *Engine) retireSupersededPath(slot *pathSlot) {
+	slot.retireMobilityClaim()
 	_ = slot.conn.Close()
 	timer := time.NewTimer(pathCloseTimeout)
 	defer timer.Stop()
@@ -1182,6 +1233,17 @@ func (e *Engine) TopologySnapshot() TopologySnapshot {
 		State:          BridgeState(e.state.Load()),
 		ActivePath:     activeID,
 		MigrationCount: e.migrationCount,
+	}
+	for _, slot := range slots {
+		if slot.mobilityClaim == nil {
+			continue
+		}
+		snapshot.LeafMobility = append(snapshot.LeafMobility, LeafMobilitySnapshot{
+			Ref:       PathRef{ID: slot.id, Owner: slot.owner},
+			Binding:   PathBinding{LocalTXTargetID: slot.localTXTargetID, PeerTXTargetID: slot.peerTXTargetID},
+			Facts:     slot.mobilityFacts,
+			PlannedAt: slot.attached,
+		})
 	}
 	e.pathsMu.RUnlock()
 	snapshot.Paths = pathInfos(slots, activeID)
@@ -1933,6 +1995,7 @@ func (e *Engine) Close() error {
 		e.recvMu.Unlock()
 		results := make(chan error, len(slots))
 		for _, s := range slots {
+			s.retireMobilityClaim()
 			go func(slot *pathSlot) { results <- slot.conn.Close() }(s)
 		}
 		reaped := make(chan error, 1)
@@ -2167,10 +2230,12 @@ func (e *Engine) AbortPathAttach(id uint32, cause error) {
 	slot := e.paths[id]
 	e.pathsMu.Unlock()
 	if pending != nil {
+		pending.retireMobilityClaim()
 		_ = pending.conn.Close()
 		return
 	}
 	if staged != nil {
+		staged.retireMobilityClaim()
 		_ = staged.conn.Close()
 		e.drainDeadSlot(staged)
 		return

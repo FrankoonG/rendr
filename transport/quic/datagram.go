@@ -11,6 +11,7 @@ import (
 
 	qg "github.com/quic-go/quic-go"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -42,6 +43,7 @@ type datagramPathConn struct {
 	server  bool
 	recvQ   chan []byte
 	release func()
+	claim   *leafmobility.Claim
 
 	writeMu sync.Mutex
 
@@ -64,21 +66,38 @@ type datagramPathConn struct {
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
 // the wrapped conn's SendDatagram/ReceiveDatagram calls to work.
-func wrapDatagram(conn *qg.Conn, server bool, release func()) *datagramPathConn {
+func wrapDatagram(conn *qg.Conn, server bool, release func(), role leafmobility.Role) *datagramPathConn {
 	p := &datagramPathConn{
 		conn:    conn,
 		server:  server,
 		recvQ:   make(chan []byte, datagramIngressQueueLen),
 		release: release,
 	}
+	if role != leafmobility.RoleUnknown {
+		p.claim = leafmobility.MustNewClaim(leafmobility.Facts{
+			Kind:       leafmobility.KindQUIC,
+			Role:       role,
+			Scope:      leafmobility.ScopeEndpoint,
+			Session:    leafmobility.SessionPacket,
+			Generation: leafmobility.NextGeneration(),
+		})
+	}
 	go p.pumpDatagrams()
 	go p.watchConn()
 	return p
 }
 
-// AcceptDatagram wraps a server-accepted DATAGRAM-capable connection.
+// AcceptDatagram wraps an externally accepted DATAGRAM-capable connection and
+// does not grant adapter ownership.
 func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
-	return wrapDatagram(conn, true, nil)
+	return wrapDatagram(conn, true, nil, leafmobility.RoleUnknown)
+}
+
+func (p *datagramPathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
 }
 
 // Read pops one DATAGRAM and copies into buf. If buf is smaller than
@@ -168,6 +187,7 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 }
 
 func (p *datagramPathConn) Close() error {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -236,6 +256,7 @@ func (p *datagramPathConn) classify(err error) transport.DeathCause {
 }
 
 func (p *datagramPathConn) declareDeath(err error) {
+	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}

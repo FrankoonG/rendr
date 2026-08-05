@@ -342,6 +342,7 @@ func (d *sessionDialer) dialInitialPath(
 			}
 			continue
 		}
+		tracker.setMobility(i, planPathConnMobility(resolver.carrierFamily(ps.Transport), pc))
 		tracker.set(i, PathHandshaking, nil)
 		admission, err := engine.PerformClientHelloAdmissionContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps)
 		if err != nil {
@@ -380,6 +381,7 @@ func (d *sessionDialer) attachExtraPath(ctx context.Context, e *engine.Engine, p
 		tracker.set(index, PathUnavailable, err)
 		return 0, err
 	}
+	tracker.setMobility(index, planPathConnMobility(resolver.carrierFamily(ps.Transport), spc))
 	tracker.set(index, PathHandshaking, nil)
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, spc, e, pathSpecName(ps), ps)
 	if err != nil {

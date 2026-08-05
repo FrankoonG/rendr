@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -302,6 +303,7 @@ type ServerPathConn struct {
 	listener *Listener
 	conn     net.PacketConn
 	flowID   [proto.UDPFlowIDSize]byte
+	claim    *leafmobility.Claim
 
 	// accepted is protected by listener.mu.
 	accepted bool
@@ -334,9 +336,23 @@ func newServerPathConn(l *Listener, flowID [proto.UDPFlowIDSize]byte, src net.Ad
 		listener: l,
 		conn:     l.conn,
 		flowID:   flowID,
-		remote:   src,
-		inbox:    make(chan []byte, inboxSize),
+		claim: leafmobility.MustNewClaim(leafmobility.Facts{
+			Kind:       leafmobility.KindUDPFlow,
+			Role:       leafmobility.RoleAcceptor,
+			Scope:      leafmobility.ScopeSharedLink,
+			Session:    leafmobility.SessionAny,
+			Generation: leafmobility.NextGeneration(),
+		}),
+		remote: src,
+		inbox:  make(chan []byte, inboxSize),
 	}
+}
+
+func (p *ServerPathConn) LeafMobilityClaim() *leafmobility.Claim {
+	if p == nil {
+		return nil
+	}
+	return p.claim
 }
 
 func (p *ServerPathConn) FlowID() [proto.UDPFlowIDSize]byte { return p.flowID }
@@ -466,6 +482,7 @@ func (p *ServerPathConn) declareDeath(err error) {
 }
 
 func (p *ServerPathConn) finish(err error, notify bool) {
+	p.claim.RetireUnbound()
 	var fn func(cause transport.DeathCause, err error)
 
 	p.deathMu.Lock()

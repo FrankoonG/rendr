@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
+	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 )
 
 func TestProbeLocalReportsOnlyCoreCapabilities(t *testing.T) {
@@ -88,6 +91,29 @@ func TestPathStatusDoesNotDependOnTransportName(t *testing.T) {
 		if _, ok := typ.FieldByName(removed); ok {
 			t.Fatalf("PathStatus still exposes adapter/config field %q", removed)
 		}
+	}
+}
+
+func TestAttachedGenericPathHasStableRedialMobilityStatus(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	e := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{})
+	defer e.Close()
+	if _, err := e.AttachPath(basetcp.Wrap(left), transport.PathSpec{Transport: "generic"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := statusFromEngine(e, ModeSelector, nil, nil)
+	second := statusFromEngine(e, ModeSelector, nil, nil)
+	if len(first.Paths) != 1 || len(second.Paths) != 1 {
+		t.Fatalf("path snapshots=%d/%d want=1/1", len(first.Paths), len(second.Paths))
+	}
+	got := first.Paths[0].Mobility
+	if got.ID != MobilityRedialAttach || got.Reason != MobilityReasonEndpointNotOwned || got.PlannedAt.IsZero() {
+		t.Fatalf("generic mobility=%+v", got)
+	}
+	if second.Paths[0].Mobility.PlannedAt != got.PlannedAt {
+		t.Fatalf("planned timestamp changed across observations: %v -> %v", got.PlannedAt, second.Paths[0].Mobility.PlannedAt)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	qg "github.com/quic-go/quic-go"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -119,6 +120,32 @@ func TestQUICRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got[:rn], reply) {
 		t.Fatalf("reply mismatch: got %x want %x", got[:rn], reply)
+	}
+}
+
+func TestQUICAdapterOwnershipDoesNotUpgradeExternalAccept(t *testing.T) {
+	p := newPair(t)
+	claim := p.client.LeafMobilityClaim()
+	if claim == nil {
+		t.Fatal("adapter-dialed QUIC path has no sealed claim")
+	}
+	facts := claim.Snapshot()
+	if facts.Kind != leafmobility.KindQUIC || facts.Role != leafmobility.RoleDialer ||
+		facts.Scope != leafmobility.ScopeEndpoint || facts.Operations != 0 || facts.Generation == 0 {
+		t.Fatalf("adapter-dialed QUIC facts=%+v", facts)
+	}
+	if _, err := p.client.Write([]byte("ownership")); err != nil {
+		t.Fatal(err)
+	}
+	server := p.awaitServer(t)
+	if claim := server.LeafMobilityClaim(); claim != nil {
+		t.Fatalf("public Accept upgraded external QUIC connection: %+v", claim.Snapshot())
+	}
+	if err := p.client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !claim.Retired() {
+		t.Fatal("direct close did not retire unbound QUIC claim")
 	}
 }
 
