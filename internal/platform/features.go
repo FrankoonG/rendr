@@ -11,7 +11,7 @@ import (
 )
 
 // ProbeRevision invalidates cached evidence when probe semantics change.
-const ProbeRevision uint32 = 1
+const ProbeRevision uint32 = 2
 
 // FeatureID is a stable internal identity for one independently probed
 // platform primitive.

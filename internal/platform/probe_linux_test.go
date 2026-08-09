@@ -136,6 +136,100 @@ func TestSystemDetectorTUNExpectation(t *testing.T) {
 	}
 }
 
+func TestSystemDetectorTCPRepairExpectation(t *testing.T) {
+	expectation := os.Getenv("RENDR_EXPECT_TCPREPAIR")
+	if expectation == "" {
+		t.Skip("RENDR_EXPECT_TCPREPAIR is unset")
+	}
+	detector, err := newSystemDetector()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := detector.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	permission := requireFeature(t, snapshot, FeatureTCPRepairPermission)
+	base := requireFeature(t, snapshot, FeatureTCPRepairBase)
+	queue := requireFeature(t, snapshot, FeatureTCPRepairQueueSeq)
+	window := requireFeature(t, snapshot, FeatureTCPRepairWindow)
+	options := requireFeature(t, snapshot, FeatureTCPRepairOptions)
+	switch expectation {
+	case "available":
+		for _, evidence := range []FeatureEvidence{permission, base, queue, window, options} {
+			if evidence.State != FeatureAvailable {
+				t.Fatalf("%s=%s/%s, want available", evidence.ID, evidence.State, evidence.Reason)
+			}
+		}
+	case "permission_denied":
+		for _, evidence := range []FeatureEvidence{permission, base} {
+			if evidence.State != FeaturePermissionDenied {
+				t.Fatalf("%s=%s/%s, want permission_denied", evidence.ID, evidence.State, evidence.Reason)
+			}
+		}
+		for _, evidence := range []FeatureEvidence{queue, window, options} {
+			if evidence.State != FeatureUnprobed {
+				t.Fatalf("dependent %s=%s/%s, want unprobed", evidence.ID, evidence.State, evidence.Reason)
+			}
+		}
+	default:
+		t.Fatalf("unknown RENDR_EXPECT_TCPREPAIR value %q", expectation)
+	}
+}
+
+func TestSystemDetectorTransparentBindExpectation(t *testing.T) {
+	expectation := os.Getenv("RENDR_EXPECT_TRANSPARENT_BIND")
+	if expectation == "" {
+		t.Skip("RENDR_EXPECT_TRANSPARENT_BIND is unset")
+	}
+	detector, err := newSystemDetector()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := detector.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4 := requireFeature(t, snapshot, FeatureTransparentBindV4)
+	v6 := requireFeature(t, snapshot, FeatureTransparentBindV6)
+	switch expectation {
+	case "available":
+		for _, evidence := range []FeatureEvidence{v4, v6} {
+			if evidence.State != FeatureAvailable {
+				t.Fatalf("%s=%s/%s, want available", evidence.ID, evidence.State, evidence.Reason)
+			}
+		}
+	case "permission_denied":
+		for _, evidence := range []FeatureEvidence{v4, v6} {
+			if evidence.State != FeaturePermissionDenied {
+				t.Fatalf("%s=%s/%s, want permission_denied", evidence.ID, evidence.State, evidence.Reason)
+			}
+		}
+	default:
+		t.Fatalf("unknown RENDR_EXPECT_TRANSPARENT_BIND value %q", expectation)
+	}
+}
+
+func TestSystemDetectorUDPOffloadExpectation(t *testing.T) {
+	if os.Getenv("RENDR_EXPECT_UDP_OFFLOAD") != "available" {
+		t.Skip("UDP offload expectation is unset")
+	}
+	detector, err := newSystemDetector()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := detector.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []FeatureID{FeatureUDPGSO, FeatureUDPGRO} {
+		evidence := requireFeature(t, snapshot, id)
+		if evidence.State != FeatureAvailable || evidence.Source != SourceRuntimeRoundTrip {
+			t.Fatalf("%s=%s/%s source=%s, want active available", id, evidence.State, evidence.Reason, evidence.Source)
+		}
+	}
+}
+
 func TestAcquireExecutionContextIncludesSecurityBoundary(t *testing.T) {
 	unlock := lockExecutionThread()
 	defer unlock()

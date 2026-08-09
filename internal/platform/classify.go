@@ -22,7 +22,8 @@ func classifyProbeError(id FeatureID, at time.Time, source EvidenceSource, err e
 		case syscall.EPERM, syscall.EACCES:
 			state = FeaturePermissionDenied
 			reason = ReasonPermissionDenied
-		case syscall.ENOPROTOOPT, syscall.EOPNOTSUPP, syscall.ENOSYS, syscall.ENOTTY:
+		case syscall.ENOPROTOOPT, syscall.EOPNOTSUPP, syscall.ENOSYS, syscall.ENOTTY,
+			syscall.EAFNOSUPPORT, syscall.EPFNOSUPPORT, syscall.EPROTONOSUPPORT, syscall.ESOCKTNOSUPPORT:
 			state = FeatureUnsupported
 			reason = ReasonPrimitiveUnsupported
 		case syscall.ENOENT, syscall.ENODEV:

@@ -22,7 +22,25 @@ func (systemProber) Probe(ctx context.Context, identity ExecutionContext, at tim
 	if major < 5 {
 		return uniformLinuxEvidence(FeatureUnsupported, ReasonKernelBelowMinimum, SourcePlatformBoundary, syscall.ENOSYS, false, at)
 	}
-	return probeTUN(ctx, at, defaultTUNProbeOps())
+	tcpRepair, err := probeTCPRepair(ctx, at, defaultTCPRepairProbeOps())
+	if err != nil {
+		return nil, err
+	}
+	transparentBind, err := probeTransparentBind(ctx, at, defaultTransparentBindProbeOps())
+	if err != nil {
+		return nil, err
+	}
+	tun, err := probeTUN(ctx, at, defaultTUNProbeOps())
+	if err != nil {
+		return nil, err
+	}
+	udp, err := probeUDP(ctx, at, defaultUDPProbeOps())
+	if err != nil {
+		return nil, err
+	}
+	observations := append(tcpRepair, transparentBind...)
+	observations = append(observations, tun...)
+	return append(observations, udp...), nil
 }
 
 func uniformLinuxEvidence(state FeatureState, reason FeatureReason, source EvidenceSource, errno syscall.Errno, retryable bool, at time.Time) ([]FeatureEvidence, error) {
