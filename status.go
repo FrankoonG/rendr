@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/internal/platform"
 	"github.com/FrankoonG/rendr/proto"
 )
 
@@ -45,13 +46,14 @@ func (s CapabilitySet) Has(id CapabilityID) bool {
 }
 
 type LocalStatus struct {
-	Caps CapabilitySet
+	Caps   CapabilitySet
+	Kernel KernelFeatures
 }
 
-// ProbeLocal reports process-intrinsic core capabilities. Optional adapters
-// own their probes and status; the root package neither imports nor guesses
-// them from factory or transport names. The ids argument is an optional
-// filter over this core set.
+// ProbeLocal reports process-intrinsic core capabilities together with a
+// process-shared active kernel-feature snapshot. The root package does not
+// import optional adapters and never guesses from factory or transport names.
+// The ids argument is an optional filter over the core capability set.
 func ProbeLocal(ctx context.Context, ids ...CapabilityID) (LocalStatus, error) {
 	if ctx != nil {
 		select {
@@ -76,7 +78,21 @@ func ProbeLocal(ctx context.Context, ids ...CapabilityID) (LocalStatus, error) {
 	add(CapRendr)
 	add(CapL7)
 	add(CapPacketMode)
-	return LocalStatus{Caps: caps}, nil
+	kernel, err := platform.Detect(ctx)
+	if err != nil {
+		return LocalStatus{Caps: caps}, err
+	}
+	return LocalStatus{Caps: caps, Kernel: kernelFeaturesFromPlatform(kernel)}, nil
+}
+
+func coreLocalStatus() LocalStatus {
+	return LocalStatus{Caps: CapabilitySet{CapRendr, CapL7, CapPacketMode}}
+}
+
+func (status LocalStatus) snapshot(now time.Time) LocalStatus {
+	status.Caps = append(CapabilitySet(nil), status.Caps...)
+	status.Kernel = status.Kernel.snapshot(now)
+	return status
 }
 
 type PeerKind string
@@ -92,6 +108,7 @@ type Status struct {
 	State    string
 	Protocol SessionProtocol
 	Local    CapabilitySet
+	Kernel   KernelFeatures
 	Peer     PeerStatus
 	Paths    []PathStatus
 }
@@ -290,8 +307,11 @@ func pathStatusFromInfo(p PathInfo, mobility MobilityStatus, carriers map[string
 	}
 }
 
-func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carriers map[string]CarrierFamily) Status {
-	local, _ := ProbeLocal(context.Background())
+func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carriers map[string]CarrierFamily, localStatuses ...LocalStatus) Status {
+	local := coreLocalStatus()
+	if len(localStatuses) != 0 {
+		local = localStatuses[0].snapshot(time.Now())
+	}
 	peerKind := PeerUnknown
 	switch e.PeerKind() {
 	case engine.PeerRendr:
@@ -329,6 +349,7 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 		State:    topology.State.String(),
 		Protocol: sessionProtocolForEngine(e),
 		Local:    local.Caps,
+		Kernel:   local.Kernel,
 		Peer:     peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
 		Paths:    out,
 	}

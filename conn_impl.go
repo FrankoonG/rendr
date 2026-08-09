@@ -17,14 +17,15 @@ type engineBackedConn struct {
 	e    *engine.Engine
 	conn *engine.Conn
 
-	mode     atomic.Uint32 // Mode
-	closing  atomic.Bool   // local-Close in flight; gates BYE send
-	peak     *peakTransferController
-	status   *pathStatusTracker
-	resolver *pathFactoryResolver
-	carriers map[string]CarrierFamily
-	graph    compiledTargetGraph
-	recovery *pathRecoverySupervisor
+	mode        atomic.Uint32 // Mode
+	closing     atomic.Bool   // local-Close in flight; gates BYE send
+	peak        *peakTransferController
+	status      *pathStatusTracker
+	resolver    *pathFactoryResolver
+	carriers    map[string]CarrierFamily
+	graph       compiledTargetGraph
+	recovery    *pathRecoverySupervisor
+	localStatus func() LocalStatus
 }
 
 func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
@@ -81,7 +82,11 @@ func (c *engineBackedConn) Paths() []PathInfo {
 func (c *engineBackedConn) FlowID() [16]byte { return c.e.FlowID() }
 
 func (c *engineBackedConn) Status() Status {
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers)
+	local := coreLocalStatus()
+	if c.localStatus != nil {
+		local = c.localStatus()
+	}
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers, local)
 }
 
 func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {

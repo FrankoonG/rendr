@@ -2,13 +2,21 @@ package rendr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/internal/platform"
 	"github.com/FrankoonG/rendr/transport"
+)
+
+var (
+	ErrRuntimeContextChanged = errors.New("rendr: Runtime execution context changed")
+	ErrStaleKernelFeatures   = errors.New("rendr: stale kernel feature snapshot")
 )
 
 // Runtime owns one isolated set of rendr policy defaults, factory registrations,
@@ -19,6 +27,9 @@ type Runtime struct {
 	instanceID     InstanceID
 	bridges        *engine.BridgeTable
 	mobilityLedger *engine.LeafMobilityPeerLedger
+	localStatus    LocalStatus
+	contextDigest  [32]byte
+	statusMu       sync.RWMutex
 
 	mu              sync.RWMutex
 	streamFactories map[string]StreamFactory
@@ -98,19 +109,116 @@ type FramedFactory struct {
 }
 
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
+	return NewRuntimeContext(context.Background(), config)
+}
+
+// NewRuntimeContext creates a Runtime after obtaining one complete factual
+// platform snapshot. Optional unavailable features remain typed status and do
+// not prevent generic framed operation.
+func NewRuntimeContext(ctx context.Context, config RuntimeConfig) (*Runtime, error) {
+	return newRuntimeContextWithProbe(ctx, config, ProbeLocal)
+}
+
+func newRuntimeContextWithProbe(ctx context.Context, config RuntimeConfig, probe func(context.Context, ...CapabilityID) (LocalStatus, error)) (*Runtime, error) {
 	normalized, err := normalizeRuntimeConfig(config)
 	if err != nil {
 		return nil, err
+	}
+	localStatus, err := probe(ctx)
+	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		localStatus = coreLocalStatus()
+		localStatus.Kernel = failedKernelFeatures(time.Now())
 	}
 	return &Runtime{
 		config:          normalized,
 		instanceID:      engine.NewInstanceID(),
 		bridges:         engine.NewBridgeTable(),
 		mobilityLedger:  engine.NewLeafMobilityPeerLedger(),
+		localStatus:     localStatus.snapshot(time.Now()),
+		contextDigest:   localStatus.Kernel.contextDigest,
 		streamFactories: make(map[string]StreamFactory),
 		packetFactories: make(map[string]PacketFactory),
 		framedFactories: make(map[string]FramedFactory),
 	}, nil
+}
+
+// LocalStatus returns a defensive, syscall-free view of the Runtime's last
+// complete platform snapshot. Expired evidence is atomically unprobed.
+func (r *Runtime) LocalStatus() LocalStatus {
+	if r == nil {
+		return LocalStatus{}
+	}
+	r.statusMu.RLock()
+	status := r.localStatus.snapshot(time.Now())
+	boundContext := r.contextDigest
+	r.statusMu.RUnlock()
+	if status.Kernel.contextDigest != ([32]byte{}) && platform.InvalidationGeneration() > status.Kernel.invalidationGeneration {
+		status.Kernel = status.Kernel.unprobed(KernelFeatureReasonInvalidated, KernelEvidenceRuntimeInvalidation)
+		return status
+	}
+	if boundContext == ([32]byte{}) {
+		return status
+	}
+	currentContext, err := platform.CurrentRuntimeContextDigest()
+	if err != nil {
+		status.Kernel = status.Kernel.unprobed(KernelFeatureReasonContextProbeFailed, KernelEvidenceContextCheck)
+		return status
+	}
+	if currentContext != boundContext {
+		status.Kernel = status.Kernel.unprobed(KernelFeatureReasonContextChanged, KernelEvidenceContextCheck)
+		return status
+	}
+	if status.Kernel.threadScoped {
+		status.Kernel = status.Kernel.unprobed(KernelFeatureReasonThreadScoped, KernelEvidenceContextCheck)
+	}
+	return status
+}
+
+// RefreshLocalStatus performs an explicit active refresh. Status methods never
+// invoke it implicitly; mobility preflight may call it before relying on a
+// platform primitive.
+func (r *Runtime) RefreshLocalStatus(ctx context.Context) (LocalStatus, error) {
+	if r == nil {
+		return LocalStatus{}, fmt.Errorf("rendr: nil Runtime")
+	}
+	status, err := ProbeLocal(ctx)
+	if err != nil {
+		return LocalStatus{}, err
+	}
+	status = status.snapshot(time.Now())
+	r.statusMu.Lock()
+	if r.contextDigest != ([32]byte{}) && status.Kernel.contextDigest != r.contextDigest {
+		r.statusMu.Unlock()
+		return LocalStatus{}, ErrRuntimeContextChanged
+	}
+	if status.Kernel.Generation < r.localStatus.Kernel.Generation {
+		r.statusMu.Unlock()
+		return LocalStatus{}, ErrStaleKernelFeatures
+	}
+	if r.contextDigest == ([32]byte{}) {
+		r.contextDigest = status.Kernel.contextDigest
+	}
+	r.localStatus = status
+	r.statusMu.Unlock()
+	return r.LocalStatus(), nil
+}
+
+func (r *Runtime) invalidateKernelFeature(id KernelFeatureID) error {
+	if r == nil {
+		return fmt.Errorf("rendr: nil Runtime")
+	}
+	if err := platform.Invalidate(platform.FeatureID(id)); err != nil {
+		return err
+	}
+	r.statusMu.Lock()
+	r.localStatus.Kernel = r.localStatus.Kernel.unprobed(KernelFeatureReasonInvalidated, KernelEvidenceRuntimeInvalidation)
+	r.localStatus.Kernel.invalidationGeneration = platform.InvalidationGeneration()
+	r.localStatus.Kernel.threadScoped = false
+	r.statusMu.Unlock()
+	return nil
 }
 
 // Config returns the immutable normalized runtime configuration by value.
@@ -271,6 +379,7 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 		framedFactories:    framed,
 		factoryCarriers:    carriers,
 		mobilityLedger:     r.mobilityLedger,
+		localStatus:        r.LocalStatus,
 	}, nil
 }
 

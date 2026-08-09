@@ -22,14 +22,15 @@ import (
 // preservation to hold; this is negotiated in HELLO via
 // proto.CapsPacketMode.
 type enginePacketConn struct {
-	e        *engine.Engine
-	mode     atomic.Uint32
-	peak     *peakTransferController
-	status   *pathStatusTracker
-	resolver *pathFactoryResolver
-	carriers map[string]CarrierFamily
-	graph    compiledTargetGraph
-	recovery *pathRecoverySupervisor
+	e           *engine.Engine
+	mode        atomic.Uint32
+	peak        *peakTransferController
+	status      *pathStatusTracker
+	resolver    *pathFactoryResolver
+	carriers    map[string]CarrierFamily
+	graph       compiledTargetGraph
+	recovery    *pathRecoverySupervisor
+	localStatus func() LocalStatus
 
 	lAddr   net.Addr
 	rAddr   net.Addr
@@ -95,7 +96,11 @@ func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }
 func (c *enginePacketConn) FlowID() [16]byte  { return c.e.FlowID() }
 func (c *enginePacketConn) Status() Status {
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers)
+	local := coreLocalStatus()
+	if c.localStatus != nil {
+		local = c.localStatus()
+	}
+	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers, local)
 }
 
 func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {

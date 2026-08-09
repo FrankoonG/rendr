@@ -633,6 +633,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	raddr := addrFromString(pc.RemoteAddr())
 	if packetMode {
 		base := newEnginePacketConn(e, mode, laddr, raddr)
+		base.localStatus = l.runtime.LocalStatus
 		base.carriers = l.carriers
 		conn := &acceptedPacketConn{
 			PacketConn:          base,
@@ -652,6 +653,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		return true
 	}
 	base := newEngineBackedConn(e, &engine.Conn{E: e, LAddr: laddr, RAddr: raddr}, mode)
+	base.localStatus = l.runtime.LocalStatus
 	base.carriers = l.carriers
 	conn := &acceptedStreamConn{
 		Conn:                base,

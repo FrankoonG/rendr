@@ -91,6 +91,7 @@ type sessionDialer struct {
 	framedFactories map[string]transport.PathFactory
 	factoryCarriers map[string]CarrierFamily
 	mobilityLedger  *engine.LeafMobilityPeerLedger
+	localStatus     func() LocalStatus
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -148,6 +149,7 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		RAddr: addrFromString(first.Address),
 	}
 	bc := newEngineBackedConn(e, c, mode)
+	bc.localStatus = d.localStatus
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
@@ -218,6 +220,7 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	lAddr := addrFromString("rendr-client")
 	rAddr := addrFromString(first.Address)
 	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
+	bc.localStatus = d.localStatus
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
