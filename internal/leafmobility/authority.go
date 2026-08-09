@@ -62,6 +62,7 @@ type resourceTransactionToken struct {
 	unknownFrom       ResourceTransactionState
 	state             ResourceTransactionState
 	proposalPublished bool
+	executionIssued   bool
 	expiry            *time.Timer
 }
 
@@ -315,10 +316,10 @@ func (t *ResourceTransaction) ReconcileFinalRejected() error {
 	return nil
 }
 
-// Consume records that the engine crossed its own driver-execution boundary.
-// It deliberately returns no token: ResourceTransaction is resource state, not
-// a capability, and specialized drivers must require an engine-owned permit.
-func (t *ResourceTransaction) Consume() error {
+// consumeWithoutExecution exists only for package-local resource-state tests.
+// Production crosses this boundary through AuthorityIssuer.ConsumeExecution,
+// which additionally binds exact peer and driver evidence.
+func (t *ResourceTransaction) consumeWithoutExecution() error {
 	if t == nil || t.token == nil {
 		return ErrAuthorityStale
 	}
@@ -327,21 +328,25 @@ func (t *ResourceTransaction) Consume() error {
 	defer token.claim.mu.Unlock()
 	token.resource.mu.Lock()
 	defer token.resource.mu.Unlock()
-	switch token.state {
+	return token.consumeLocked()
+}
+
+func (t *resourceTransactionToken) consumeLocked() error {
+	switch t.state {
 	case ResourceTransactionConsumed:
 		return ErrAuthorityConsumed
 	case ResourceTransactionOutcomeUnknown:
 		return ErrTransactionOutcomeUnknown
 	case ResourceTransactionFinalAccepted:
-		if !token.activeLocked() || !token.claim.currentForPlanLocked(token.plan) {
-			_ = token.markOutcomeUnknownLocked()
+		if !t.activeLocked() || !t.claim.currentForPlanLocked(t.plan) {
+			_ = t.markOutcomeUnknownLocked()
 			return ErrAuthorityStale
 		}
-		if !token.deadline.After(time.Now()) {
-			_ = token.markOutcomeUnknownLocked()
+		if !t.deadline.After(time.Now()) {
+			_ = t.markOutcomeUnknownLocked()
 			return ErrAuthorityExpired
 		}
-		token.state = ResourceTransactionConsumed
+		t.state = ResourceTransactionConsumed
 		return nil
 	default:
 		return ErrAuthorityStale

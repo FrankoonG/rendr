@@ -162,12 +162,14 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 			Administrative: explicitRemoval,
 		},
 	}
-	slot.closeQuit()
+	slot.fenceDispatchForRetirement()
 	delete(e.paths, slot.id)
 	// Ownership ends at the topology commit, not when asynchronous carrier
 	// cleanup eventually runs. Published candidates must become stale before
 	// RemovePath or a death callback can return.
-	slot.retireMobilityClaim()
+	if !slot.requestMobilityClaimRetirement() {
+		slot.closeQuit()
+	}
 	predecessorIDs := e.pathPredecessors[slot.id]
 	delete(e.pathPredecessors, slot.id)
 	var restored *pathSlot

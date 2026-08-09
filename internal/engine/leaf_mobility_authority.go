@@ -14,17 +14,19 @@ import (
 )
 
 const (
-	leafMobilityRetryInterval  = 200 * time.Millisecond
-	leafMobilityRecordLimit    = sendHistoryWindow + sendControlReserve
-	leafMobilityOOBRecordLimit = leafMobilityRecordLimit * 6
+	leafMobilityRetryInterval             = 200 * time.Millisecond
+	leafMobilityExecutionWatchdogInterval = 10 * time.Millisecond
+	leafMobilityRecordLimit               = sendHistoryWindow + sendControlReserve
+	leafMobilityOOBRecordLimit            = leafMobilityRecordLimit * 6
 )
 
 var (
-	ErrLeafMobilityAuthorityBusy       = errors.New("engine: leaf mobility authority is busy")
-	ErrLeafMobilityAdmissionBusy       = errors.New("engine: leaf admission overlaps mobility authority")
-	ErrLeafMobilityRejected            = errors.New("engine: peer rejected leaf mobility transaction")
-	ErrLeafMobilityOutcomeUnknown      = errors.New("engine: leaf mobility transaction outcome is unknown")
-	errLeafMobilityResponseUnavailable = errors.New("engine: leaf mobility response route is unavailable")
+	ErrLeafMobilityAuthorityBusy         = errors.New("engine: leaf mobility authority is busy")
+	ErrLeafMobilityAdmissionBusy         = errors.New("engine: leaf admission overlaps mobility authority")
+	ErrLeafMobilityRejected              = errors.New("engine: peer rejected leaf mobility transaction")
+	ErrLeafMobilityOutcomeUnknown        = errors.New("engine: leaf mobility transaction outcome is unknown")
+	errLeafMobilityResponseUnavailable   = errors.New("engine: leaf mobility response route is unavailable")
+	errLeafMobilityResolutionUnpublished = errors.New("engine: leaf mobility resolution was not published")
 )
 
 type leafMobilityMessageKind uint8
@@ -73,6 +75,7 @@ type leafMobilityAckEvent struct {
 
 type outgoingLeafMobilityTransaction struct {
 	source          PathRef
+	sourceSlot      *pathSlot
 	prepare         proto.LeafMobilityPeerPlanPrepare
 	digest          proto.LeafMobilityProposalDigest
 	resourceTx      *leafmobility.ResourceTransaction
@@ -243,12 +246,15 @@ type leafMobilityAuthorityToken struct {
 	expiryGeneration uint64
 	expiryMu         sync.Mutex
 	resolveMu        sync.Mutex
+	consumed         bool
+	execution        *leafmobility.Execution
 	done             chan struct{}
 	once             sync.Once
 }
 
 type LeafMobilityPermit struct {
-	token *leafMobilityAuthorityToken
+	token     *leafMobilityAuthorityToken
+	execution *leafmobility.Execution
 }
 
 func (a *LeafMobilityAuthority) State() leafmobility.ResourceTransactionState {
@@ -263,23 +269,149 @@ func (a *LeafMobilityAuthority) Consume() (*LeafMobilityPermit, error) {
 		return nil, leafmobility.ErrAuthorityStale
 	}
 	token := a.token
+	token.resolveMu.Lock()
+	select {
+	case <-token.done:
+		token.resolveMu.Unlock()
+		return nil, leafmobility.ErrAuthorityStale
+	default:
+	}
+	if token.consumed {
+		token.resolveMu.Unlock()
+		return nil, leafmobility.ErrAuthorityConsumed
+	}
 	token.engine.pathsMu.RLock()
 	if token.engine.isClosed() || token.engine.sendClosing.Load() {
 		token.engine.pathsMu.RUnlock()
-		token.outcomeUnknownSerialized(fmt.Errorf("engine is closing"))
+		token.outcomeUnknown(fmt.Errorf("engine is closing"))
+		token.resolveMu.Unlock()
 		return nil, net.ErrClosed
 	}
 	if err := token.engine.validateLeafMobilityAuthoritySourceLocked(token.outgoing); err != nil {
 		token.engine.pathsMu.RUnlock()
-		token.outcomeUnknownSerialized(err)
+		token.outcomeUnknown(err)
+		token.resolveMu.Unlock()
 		return nil, err
 	}
-	err := token.outgoing.resourceTx.Consume()
+	plan := token.outgoing.resourceTx.Snapshot().Plan
+	agreement := leafmobility.PeerAgreement{
+		Binding:                 token.outgoing.prepare.LeafMobilityPeerPlanBinding,
+		Generation:              token.outgoing.commit.Generation,
+		ActorEndpointGeneration: token.outgoing.commit.ActorEndpointGeneration,
+		PeerEndpointGeneration:  token.outgoing.commit.PeerEndpointGeneration,
+		ActorPlanDigest:         token.outgoing.prepare.ActorPlanDigest,
+		ProposalDigest:          token.outgoing.commit.ProposalDigest,
+		PeerPlanDigest:          token.outgoing.commit.PeerPlanDigest,
+		AgreementDigest:         token.outgoing.commit.AgreementDigest,
+		ReservationID:           token.outgoing.commit.ReservationID,
+	}
+	execution, err := token.engine.leafIssuer.ConsumeExecution(
+		token.outgoing.claim, token.outgoing.resourceTx, plan, agreement,
+	)
 	token.engine.pathsMu.RUnlock()
 	if err != nil {
+		token.resolveMu.Unlock()
 		return nil, err
 	}
-	return &LeafMobilityPermit{token: token}, nil
+	token.consumed = true
+	token.execution = execution
+	token.resolveMu.Unlock()
+	permit := &LeafMobilityPermit{token: token, execution: execution}
+	permit.armExecutionWatchdog()
+	return permit, nil
+}
+
+func (p *LeafMobilityPermit) armExecutionWatchdog() {
+	if p == nil || p.token == nil || p.token.engine == nil || p.execution == nil {
+		return
+	}
+	watch := func() { p.watchExecutionTerminal() }
+	if !p.token.engine.startLeafMobilityAsync(watch) {
+		go watch()
+	}
+}
+
+func (p *LeafMobilityPermit) watchExecutionTerminal() {
+	forwardDeadline := p.execution.ForwardDeadline()
+	if forwardDeadline.IsZero() {
+		return
+	}
+	timer := time.NewTimer(max(time.Until(forwardDeadline), 0))
+	defer timer.Stop()
+	select {
+	case <-p.token.done:
+		p.forceLocalExecutionClosed()
+		return
+	case <-p.token.engine.closed:
+		p.forceLocalExecutionClosed()
+		return
+	case <-timer.C:
+	}
+
+	cleanupCtx, cancel := context.WithDeadline(context.Background(), p.token.outgoing.deadline)
+	defer cancel()
+	ticker := time.NewTicker(leafMobilityExecutionWatchdogInterval)
+	defer ticker.Stop()
+	for {
+		var err error
+		switch p.execution.State() {
+		case leafmobility.ExecutionCommitted:
+			err = p.Complete(cleanupCtx)
+		case leafmobility.ExecutionAuthorized, leafmobility.ExecutionPrepared,
+			leafmobility.ExecutionCutover, leafmobility.ExecutionRollbackRequired,
+			leafmobility.ExecutionRolledBack:
+			err = p.RolledBack(cleanupCtx)
+		case leafmobility.ExecutionFailedClosed, leafmobility.ExecutionInvalid:
+			p.token.outcomeUnknownSerialized(leafmobility.ErrExecutionState)
+			return
+		}
+		if err == nil {
+			return
+		}
+		if errors.Is(err, ErrLeafMobilityOutcomeUnknown) || errors.Is(err, leafmobility.ErrAuthorityStale) {
+			return
+		}
+		select {
+		case <-p.token.done:
+			p.forceLocalExecutionClosed()
+			return
+		case <-p.token.engine.closed:
+			p.forceLocalExecutionClosed()
+			return
+		case <-cleanupCtx.Done():
+			p.forceLocalExecutionClosed()
+			p.token.outcomeUnknownSerialized(cleanupCtx.Err())
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *LeafMobilityPermit) forceLocalExecutionClosed() {
+	if p == nil || p.execution == nil {
+		return
+	}
+	p.execution.CancelForward()
+	for {
+		switch p.execution.State() {
+		case leafmobility.ExecutionCommitted:
+			_ = p.execution.FinalizeCommitted()
+			return
+		case leafmobility.ExecutionRolledBack:
+			_ = p.execution.FinalizeRolledBack()
+			return
+		case leafmobility.ExecutionFailedClosed, leafmobility.ExecutionInvalid:
+			return
+		}
+		if err := p.execution.Rollback(context.Background()); err == nil {
+			_ = p.execution.FinalizeRolledBack()
+			return
+		} else if !errors.Is(err, leafmobility.ErrExecutionBusy) {
+			_ = p.execution.FailClosed()
+			return
+		}
+		time.Sleep(leafMobilityExecutionWatchdogInterval)
+	}
 }
 
 // Rollback resolves an authority that was never consumed by a destructive
@@ -289,7 +421,7 @@ func (a *LeafMobilityAuthority) Rollback(ctx context.Context) error {
 	if a == nil || a.token == nil || a.token.outgoing == nil || a.token.outgoing.resourceTx == nil {
 		return leafmobility.ErrAuthorityStale
 	}
-	return a.token.resolve(ctx, leafmobility.ResolutionRolledBack)
+	return a.token.resolve(ctx, leafmobility.ResolutionRolledBack, false)
 }
 
 func (p *LeafMobilityPermit) State() leafmobility.ResourceTransactionState {
@@ -299,23 +431,119 @@ func (p *LeafMobilityPermit) State() leafmobility.ResourceTransactionState {
 	return p.token.outgoing.resourceTx.State()
 }
 
-func (p *LeafMobilityPermit) Complete(ctx context.Context) error {
-	if p == nil || p.token == nil || p.token.outgoing == nil || p.token.outgoing.resourceTx == nil {
+func (p *LeafMobilityPermit) ExecutionState() leafmobility.ExecutionState {
+	if p == nil || p.execution == nil {
+		return leafmobility.ExecutionInvalid
+	}
+	return p.execution.State()
+}
+
+func (p *LeafMobilityPermit) Prepare(ctx context.Context) error {
+	if p == nil || p.execution == nil {
 		return leafmobility.ErrAuthorityStale
 	}
-	return p.token.resolve(ctx, leafmobility.ResolutionComplete)
+	if err := p.validateExecutionSource(); err != nil {
+		return err
+	}
+	if err := p.execution.Prepare(ctx); err != nil {
+		return err
+	}
+	return p.validateExecutionSource()
+}
+
+func (p *LeafMobilityPermit) Cutover(ctx context.Context) error {
+	if p == nil || p.execution == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	if err := p.validateExecutionSource(); err != nil {
+		return err
+	}
+	if err := p.execution.Cutover(ctx); err != nil {
+		return err
+	}
+	return p.validateExecutionSource()
+}
+
+func (p *LeafMobilityPermit) CommitDriver(ctx context.Context) error {
+	if p == nil || p.execution == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	if err := p.validateExecutionSource(); err != nil {
+		return err
+	}
+	if err := p.execution.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *LeafMobilityPermit) validateExecutionSource() error {
+	if p == nil || p.token == nil || p.token.engine == nil || p.token.outgoing == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	p.token.engine.pathsMu.RLock()
+	err := p.token.engine.validateLeafMobilityAuthoritySourceLocked(p.token.outgoing)
+	p.token.engine.pathsMu.RUnlock()
+	return err
+}
+
+func (p *LeafMobilityPermit) Complete(ctx context.Context) error {
+	if p == nil || p.token == nil || p.token.outgoing == nil || p.token.outgoing.resourceTx == nil || p.execution == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	if p.execution.State() != leafmobility.ExecutionCommitted {
+		return leafmobility.ErrExecutionState
+	}
+	return p.token.resolveCommitted(ctx)
 }
 
 func (p *LeafMobilityPermit) RolledBack(ctx context.Context) error {
-	if p == nil || p.token == nil || p.token.outgoing == nil || p.token.outgoing.resourceTx == nil {
+	if p == nil || p.token == nil || p.token.outgoing == nil || p.token.outgoing.resourceTx == nil || p.execution == nil {
 		return leafmobility.ErrAuthorityStale
 	}
-	return p.token.resolve(ctx, leafmobility.ResolutionRolledBack)
+	if err := p.execution.Rollback(ctx); err != nil {
+		return err
+	}
+	return p.token.resolve(ctx, leafmobility.ResolutionRolledBack, true)
+}
+
+// Execute runs the complete local driver transaction, then publishes the
+// matching peer resolution. A local failure is never reported as ROLLED_BACK
+// until the driver has actually restored its endpoint ownership.
+func (p *LeafMobilityPermit) Execute(ctx context.Context) error {
+	if p == nil || p.execution == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	if err := p.Prepare(ctx); err != nil {
+		return p.rollbackAfterFailure(ctx, err)
+	}
+	if err := p.Cutover(ctx); err != nil {
+		return p.rollbackAfterFailure(ctx, err)
+	}
+	if err := p.CommitDriver(ctx); err != nil {
+		return p.rollbackAfterFailure(ctx, err)
+	}
+	return p.Complete(ctx)
+}
+
+func (p *LeafMobilityPermit) rollbackAfterFailure(ctx context.Context, cause error) error {
+	cleanupParent := context.Background()
+	if ctx != nil {
+		cleanupParent = context.WithoutCancel(ctx)
+	}
+	deadline := time.Now()
+	if p != nil && p.token != nil && p.token.outgoing != nil {
+		deadline = p.token.outgoing.deadline
+	}
+	cleanupCtx, cancel := context.WithDeadline(cleanupParent, deadline)
+	defer cancel()
+	return errors.Join(cause, p.RolledBack(cleanupCtx))
 }
 
 // NegotiateLeafMobilityAuthority runs PREPARE/PREPARED/COMMIT/FINAL over the
 // exact path. The returned authority still owns the session transaction; the
-// caller must Consume+Complete/RolledBack or Rollback before its deadline.
+// caller must Rollback it unconsumed, or Consume and then Execute (or complete
+// the equivalent phased driver sequence) before its deadline.
 func (e *Engine) NegotiateLeafMobilityAuthority(
 	ctx context.Context,
 	ref PathRef,
@@ -330,7 +558,7 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 	if plan.Operation == 0 {
 		return nil, leafmobility.ErrBaselinePlan
 	}
-	claim, err := e.validateLeafMobilitySource(ref, plan)
+	claim, sourceSlot, err := e.validateLeafMobilitySource(ref, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +594,7 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 		return nil, err
 	}
 	outgoing := &outgoingLeafMobilityTransaction{
-		source: ref, prepare: prepare, digest: digest, deadline: plan.Deadline,
+		source: ref, sourceSlot: sourceSlot, prepare: prepare, digest: digest, deadline: plan.Deadline,
 		prepared: make(chan leafMobilityAckEvent, 1), final: make(chan leafMobilityAckEvent, 1),
 		released: make(chan leafMobilityAckEvent, 1), preempt: make(chan error, 1),
 	}
@@ -566,6 +794,7 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 func (t *leafMobilityAuthorityToken) resolve(
 	ctx context.Context,
 	resolution leafmobility.Resolution,
+	permitOwned bool,
 ) error {
 	if t == nil || t.engine == nil || t.outgoing == nil || t.outgoing.resourceTx == nil {
 		return leafmobility.ErrAuthorityStale
@@ -587,6 +816,12 @@ func (t *leafMobilityAuthorityToken) resolve(
 		return leafmobility.ErrAuthorityStale
 	default:
 	}
+	if t.consumed != permitOwned {
+		if t.consumed {
+			return leafmobility.ErrAuthorityConsumed
+		}
+		return leafmobility.ErrAuthorityStale
+	}
 	if t.outgoing.recoveryOwned.Load() || t.outgoing.abandoned.Load() {
 		rearmExpiry = false
 		return ErrLeafMobilityOutcomeUnknown
@@ -601,7 +836,7 @@ func (t *leafMobilityAuthorityToken) resolve(
 	txCtx, cancel := context.WithDeadline(ctx, t.outgoing.deadline)
 	defer cancel()
 	frame, err, pending := t.engine.sendLeafMobilityFrameWithContext(txCtx, func() ([]byte, error) {
-		return t.engine.sendLeafMobilityCommitAt(t.outgoing.source, message, func(frame []byte) error {
+		return t.engine.sendLeafMobilityCommitForOutgoing(t.outgoing, message, func(frame []byte) error {
 			t.engine.leafTx.mu.Lock()
 			defer t.engine.leafTx.mu.Unlock()
 			if t.engine.leafTx.outgoing != t.outgoing {
@@ -618,7 +853,7 @@ func (t *leafMobilityAuthorityToken) resolve(
 	if pending != nil {
 		rearmExpiry = false
 		t.outgoing.abandoned.Store(true)
-		t.engine.abortLeafMobilityPathWrite(t.outgoing.source)
+		t.engine.abortOutgoingLeafMobilityPathWrite(t.outgoing)
 		finish := func() {
 			t.engine.finishAbandonedLeafMobilityResolutionWrite(t.outgoing, pending)
 		}
@@ -629,7 +864,7 @@ func (t *leafMobilityAuthorityToken) resolve(
 	}
 	if err != nil {
 		if len(frame) == 0 {
-			return err
+			return fmt.Errorf("%w: %w", errLeafMobilityResolutionUnpublished, err)
 		}
 		rearmExpiry = false
 		_ = t.outgoing.resourceTx.MarkOutcomeUnknown()
@@ -655,11 +890,11 @@ func (t *leafMobilityAuthorityToken) resolve(
 			return fmt.Errorf("%w: %v", ErrLeafMobilityOutcomeUnknown, txCtx.Err())
 		case <-retry.C:
 			_, retryErr, retryPending := t.engine.sendLeafMobilityFrameWithContext(txCtx, func() ([]byte, error) {
-				return frame, t.engine.replayLeafMobilityFrame(t.outgoing.source, frame)
+				return frame, t.engine.replayLeafMobilityFrameForOutgoing(t.outgoing, frame)
 			})
 			if retryPending != nil {
 				t.outgoing.abandoned.Store(true)
-				t.engine.abortLeafMobilityPathWrite(t.outgoing.source)
+				t.engine.abortOutgoingLeafMobilityPathWrite(t.outgoing)
 				finish := func() {
 					t.engine.finishAbandonedLeafMobilityResolutionWrite(t.outgoing, retryPending)
 				}
@@ -698,12 +933,61 @@ func (t *leafMobilityAuthorityToken) resolve(
 	}
 }
 
+// resolveCommitted owns terminal publication after the driver has committed.
+// Caller cancellation cannot strand a locally committed endpoint. A failure
+// known to have published zero bytes is retried until the immutable plan
+// deadline; uncertain publication is handed to the existing recovery path.
+func (t *leafMobilityAuthorityToken) resolveCommitted(ctx context.Context) error {
+	if t == nil || t.outgoing == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	parent := context.Background()
+	if ctx != nil {
+		parent = context.WithoutCancel(ctx)
+	}
+	terminalCtx, cancel := context.WithDeadline(parent, t.outgoing.deadline)
+	defer cancel()
+
+	for {
+		if err := terminalCtx.Err(); err != nil {
+			t.outcomeUnknownSerialized(err)
+			return fmt.Errorf("%w: committed resolution deadline: %w", ErrLeafMobilityOutcomeUnknown, err)
+		}
+		err := t.resolve(terminalCtx, leafmobility.ResolutionComplete, true)
+		if !errors.Is(err, errLeafMobilityResolutionUnpublished) {
+			return err
+		}
+		timer := time.NewTimer(leafMobilityRetryInterval)
+		select {
+		case <-timer.C:
+		case <-terminalCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			t.outcomeUnknownSerialized(terminalCtx.Err())
+			return fmt.Errorf("%w: committed resolution deadline: %w", ErrLeafMobilityOutcomeUnknown, terminalCtx.Err())
+		case <-t.done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ErrLeafMobilityOutcomeUnknown
+		}
+	}
+}
+
 func (t *leafMobilityAuthorityToken) finish() {
 	if t == nil {
 		return
 	}
 	t.once.Do(func() {
 		t.stopExpiry()
+		t.releaseTerminalExecution()
 		close(t.done)
 		t.engine.finishOutgoingLeafMobility(t.outgoing)
 	})
@@ -716,9 +1000,22 @@ func (t *leafMobilityAuthorityToken) outcomeUnknown(cause error) {
 	t.once.Do(func() {
 		t.stopExpiry()
 		_ = t.outgoing.resourceTx.MarkOutcomeUnknown()
+		t.releaseTerminalExecution()
 		close(t.done)
 		t.engine.finishOutgoingLeafMobility(t.outgoing)
 	})
+}
+
+func (t *leafMobilityAuthorityToken) releaseTerminalExecution() {
+	if t == nil || t.execution == nil {
+		return
+	}
+	switch t.execution.State() {
+	case leafmobility.ExecutionCommitted:
+		_ = t.execution.FinalizeCommitted()
+	case leafmobility.ExecutionRolledBack:
+		_ = t.execution.FinalizeRolledBack()
+	}
 }
 
 func (t *leafMobilityAuthorityToken) finishSerialized() {
@@ -1109,7 +1406,7 @@ func (e *Engine) publishRecoveredLeafMobilityRollback(
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	_, err, pending := e.sendLeafMobilityFrameWithContext(ctx, func() ([]byte, error) {
-		return e.sendLeafMobilityCommitAt(outgoing.source, message, func(frame []byte) error {
+		return e.sendLeafMobilityCommitForOutgoing(outgoing, message, func(frame []byte) error {
 			e.leafTx.mu.Lock()
 			defer e.leafTx.mu.Unlock()
 			if e.leafTx.outgoing != outgoing {
@@ -1124,7 +1421,7 @@ func (e *Engine) publishRecoveredLeafMobilityRollback(
 		})
 	})
 	if pending != nil {
-		e.abortLeafMobilityPathWrite(outgoing.source)
+		e.abortOutgoingLeafMobilityPathWrite(outgoing)
 		e.setOutgoingLeafMobilityRecoveryWrite(outgoing, pending)
 		return err
 	}
@@ -1153,10 +1450,10 @@ func (e *Engine) replayOutgoingLeafMobilityRecovery(
 	ctx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
 	defer cancel()
 	_, _, pending := e.sendLeafMobilityFrameWithContext(ctx, func() ([]byte, error) {
-		return frame, e.replayLeafMobilityFrame(outgoing.source, frame)
+		return frame, e.replayLeafMobilityFrameForOutgoing(outgoing, frame)
 	})
 	if pending != nil {
-		e.abortLeafMobilityPathWrite(outgoing.source)
+		e.abortOutgoingLeafMobilityPathWrite(outgoing)
 		e.setOutgoingLeafMobilityRecoveryWrite(outgoing, pending)
 	}
 }

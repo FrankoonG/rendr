@@ -91,16 +91,16 @@ func (e *Engine) routeLeafMobilityOOB(slot *pathSlot, header proto.Header, paylo
 	return nil
 }
 
-func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan) (*leafmobility.Claim, error) {
+func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan) (*leafmobility.Claim, *pathSlot, error) {
 	if e == nil || ref.ID == 0 || ref.Owner == 0 || e.isClosed() || e.sendClosing.Load() {
-		return nil, net.ErrClosed
+		return nil, nil, net.ErrClosed
 	}
 	e.pathsMu.RLock()
 	slot := e.paths[ref.ID]
 	if slot == nil || slot.owner != ref.Owner || slot.mobilityClaim == nil || slot.maintenance.Load() ||
 		slot.routeGeneration.Load() == 0 || plan.Binding.PathID != ref.ID || plan.Binding.Owner != ref.Owner {
 		e.pathsMu.RUnlock()
-		return nil, ErrStalePathRef
+		return nil, nil, ErrStalePathRef
 	}
 	key, valid := pathAdmissionKey(e.side, PathBinding{
 		LocalTXTargetID: slot.localTXTargetID, PeerTXTargetID: slot.peerTXTargetID,
@@ -110,12 +110,12 @@ func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan)
 	claim := slot.mobilityClaim
 	e.pathsMu.RUnlock()
 	if !valid || admission || predecessors != 0 {
-		return nil, ErrLeafMobilityAdmissionBusy
+		return nil, nil, ErrLeafMobilityAdmissionBusy
 	}
 	if err := claim.ValidatePlanCurrent(plan); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return claim, nil
+	return claim, slot, nil
 }
 
 func (e *Engine) leafClaimForRef(ref PathRef) (*leafmobility.Claim, bool) {
@@ -157,7 +157,8 @@ func (e *Engine) validateLeafMobilityAuthoritySourceLocked(outgoing *outgoingLea
 		return net.ErrClosed
 	}
 	slot := e.paths[outgoing.source.ID]
-	if slot == nil || slot.owner != outgoing.source.Owner || slot.mobilityClaim != outgoing.claim || slot.maintenance.Load() {
+	if slot == nil || slot.owner != outgoing.source.Owner || slot.mobilityClaim != outgoing.claim || slot.maintenance.Load() ||
+		slot.routeGeneration.Load() == 0 || slot.routeGeneration.Load() != outgoing.prepare.RouteGeneration {
 		return ErrStalePathRef
 	}
 	plan := outgoing.resourceTx.Snapshot().Plan
@@ -355,6 +356,23 @@ func (e *Engine) sendLeafMobilityCommitAt(
 	return e.sendLeafMobilityFrameAt(ref, proto.CtrlLeafMobilityCommit, payload, onPublish)
 }
 
+func (e *Engine) sendLeafMobilityCommitForOutgoing(
+	outgoing *outgoingLeafMobilityTransaction,
+	commit proto.LeafMobilityPeerPlanCommit,
+	onPublish func([]byte) error,
+) ([]byte, error) {
+	if outgoing == nil {
+		return nil, ErrStalePathRef
+	}
+	payload, err := commit.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return e.sendLeafMobilityFrameOnSlot(
+		outgoing.source, outgoing.sourceSlot, proto.CtrlLeafMobilityCommit, payload, onPublish,
+	)
+}
+
 func (e *Engine) sendLeafMobilityAckBounded(
 	ref PathRef,
 	ack proto.LeafMobilityPeerPlanAck,
@@ -458,6 +476,16 @@ func (e *Engine) sendLeafMobilityFrameAt(
 	payload []byte,
 	onPublish func([]byte) error,
 ) ([]byte, error) {
+	return e.sendLeafMobilityFrameOnSlot(ref, nil, code, payload, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityFrameOnSlot(
+	ref PathRef,
+	sourceSlot *pathSlot,
+	code proto.CtrlCode,
+	payload []byte,
+	onPublish func([]byte) error,
+) ([]byte, error) {
 	if e.isClosed() || e.sendClosing.Load() {
 		return nil, net.ErrClosed
 	}
@@ -476,10 +504,31 @@ func (e *Engine) sendLeafMobilityFrameAt(
 			return nil, err
 		}
 	}
-	if err := e.writeLeafMobilityFrame(ref, frame); err != nil {
-		return frame, err
+	var writeErr error
+	if sourceSlot == nil {
+		writeErr = e.writeLeafMobilityFrame(ref, frame)
+	} else {
+		writeErr = writeLeafMobilityFrameToSlot(ref, sourceSlot, frame)
+	}
+	if writeErr != nil {
+		return frame, writeErr
 	}
 	return frame, nil
+}
+
+func (e *Engine) replayLeafMobilityFrameForOutgoing(outgoing *outgoingLeafMobilityTransaction, frame []byte) error {
+	if outgoing == nil || len(frame) < proto.HeaderSize {
+		return proto.ErrBadHeader
+	}
+	if e.isClosed() || e.sendClosing.Load() {
+		return net.ErrClosed
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil || header.Type != proto.FrameCtrl || !isLeafMobilityCtrl(proto.CtrlCodeFromFlags(header.Flags)) ||
+		header.Seq == 0 || header.Last {
+		return proto.ErrBadHeader
+	}
+	return writeLeafMobilityFrameToSlot(outgoing.source, outgoing.sourceSlot, frame)
 }
 
 func (e *Engine) replayLeafMobilityFrame(ref PathRef, frame []byte) error {
@@ -513,6 +562,13 @@ func (e *Engine) writeLeafMobilityFrame(ref PathRef, frame []byte) error {
 		return ErrStalePathRef
 	}
 	e.pathsMu.RUnlock()
+	return writeLeafMobilityFrameToSlot(ref, slot, frame)
+}
+
+func writeLeafMobilityFrameToSlot(ref PathRef, slot *pathSlot, frame []byte) error {
+	if slot == nil || slot.id != ref.ID || slot.owner != ref.Owner {
+		return ErrStalePathRef
+	}
 	n, err := slot.writeFrame(frame)
 	if err != nil {
 		return err
@@ -522,6 +578,16 @@ func (e *Engine) writeLeafMobilityFrame(ref PathRef, frame []byte) error {
 	}
 	slot.lastSendUnixNano.Store(nowFn().UnixNano())
 	return nil
+}
+
+func (e *Engine) abortOutgoingLeafMobilityPathWrite(outgoing *outgoingLeafMobilityTransaction) {
+	if outgoing == nil || outgoing.sourceSlot == nil {
+		return
+	}
+	conn := outgoing.sourceSlot.conn
+	if !e.startLeafMobilityAsync(func() { _ = conn.Close() }) {
+		_ = conn.Close()
+	}
 }
 
 func (e *Engine) abortLeafMobilityPathWrite(ref PathRef) {

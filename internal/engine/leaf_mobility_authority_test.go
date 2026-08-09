@@ -375,7 +375,7 @@ func TestEngineLeafMobilityAuthorityRequiresRealPeerTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := permit.Complete(context.Background()); err != nil {
+	if err := permit.Execute(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fixture.client.SendData([]byte("after-authority")); err != nil {
@@ -385,6 +385,25 @@ func TestEngineLeafMobilityAuthorityRequiresRealPeerTransaction(t *testing.T) {
 	n, err := fixture.server.Recv(buf)
 	if err != nil || string(buf[:n]) != "after-authority" {
 		t.Fatalf("post-transaction data=%q err=%v", buf[:n], err)
+	}
+}
+
+func TestEngineLeafMobilityConsumeRejectsChangedRouteGeneration(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xa2)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.pathsMu.Lock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	slot.routeGeneration.Store(slot.routeGeneration.Load() + 1)
+	fixture.client.pathsMu.Unlock()
+	if _, err := authority.Consume(); !errors.Is(err, ErrStalePathRef) {
+		t.Fatalf("Consume after route generation change=%v want=%v", err, ErrStalePathRef)
+	}
+	if authority.State() != leafmobility.ResourceTransactionOutcomeUnknown {
+		t.Fatalf("authority state=%d want outcome-unknown", authority.State())
 	}
 }
 
@@ -1332,6 +1351,15 @@ func TestEngineLeafMobilityCopiedPermitHasOneResolutionPublisher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.CommitDriver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	copyOfPermit := *permit
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -1355,6 +1383,374 @@ func TestEngineLeafMobilityCopiedPermitHasOneResolutionPublisher(t *testing.T) {
 	}
 	if authority.State() != leafmobility.ResourceTransactionCompleted {
 		t.Fatalf("authority state=%d want released", authority.State())
+	}
+}
+
+func TestEngineLeafMobilityConsumedAuthorityCannotPublishRollback(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc5)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyOfAuthority := *authority
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRejected := func(stage string) {
+		t.Helper()
+		sequence := fixture.client.leafTx.messageSeq.Load()
+		for _, candidate := range []*LeafMobilityAuthority{authority, &copyOfAuthority} {
+			if err := candidate.Rollback(context.Background()); !errors.Is(err, leafmobility.ErrAuthorityConsumed) {
+				t.Fatalf("%s stale authority rollback=%v", stage, err)
+			}
+		}
+		if got := fixture.client.leafTx.messageSeq.Load(); got != sequence {
+			t.Fatalf("%s stale authority published sequence %d after %d", stage, got, sequence)
+		}
+	}
+	assertRejected("consumed")
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("prepared")
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("cutover")
+	if err := permit.CommitDriver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("committed")
+	if err := permit.Complete(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEngineLeafMobilityOutcomeUnknownStillCleansLocalExecution(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc6)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	permit.token.outcomeUnknownSerialized(errors.New("forced outcome unknown"))
+	eventuallyEngine(t, time.Second, func() bool {
+		state := permit.ExecutionState()
+		return state == leafmobility.ExecutionRolledBack || state == leafmobility.ExecutionFailedClosed
+	})
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.client.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("outcome-unknown execution retained its claim lease")
+	}
+}
+
+func TestEngineCloseIsBoundedWhileDriverRollbackIsBlocked(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientDriver.rollbackEntered = make(chan struct{})
+	fixture.clientDriver.rollbackRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(fixture.clientDriver.rollbackRelease) }) }
+	t.Cleanup(release)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc7)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.client.Close() }()
+	select {
+	case <-fixture.clientDriver.rollbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("close did not request local rollback")
+	}
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("Close unexpectedly reported full quiescence while rollback was blocked")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close exceeded its bounded shutdown wait")
+	}
+	release()
+	select {
+	case <-fixture.client.Closed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("background shutdown did not finish after rollback release")
+	}
+}
+
+func TestEngineLeafMobilityCommittedResolutionIgnoresCallerCancellationAndRetriesZeroFrame(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc1)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.CommitDriver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	sequence := fixture.client.leafTx.messageSeq.Load()
+	fixture.client.leafTx.messageSeq.Store(proto.MaxSeq)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := make(chan error, 1)
+	go func() { result <- permit.Complete(canceled) }()
+	select {
+	case err := <-result:
+		t.Fatalf("committed completion returned before retry: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	fixture.client.leafTx.messageSeq.Store(sequence)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine-owned committed completion did not retry")
+	}
+	if permit.State() != leafmobility.ResourceTransactionCompleted || fixture.clientResource.Snapshot().Poisoned {
+		t.Fatalf("permit=%d resource=%+v", permit.State(), fixture.clientResource.Snapshot())
+	}
+}
+
+func TestEngineLeafMobilityCommittedResolutionSurvivesAdministrativePathRetirement(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc9)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.CommitDriver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.client.RetirePath(fixture.clientRef, errors.New("administrative retirement after commit")); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Complete(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if permit.State() != leafmobility.ResourceTransactionCompleted || permit.ExecutionState() != leafmobility.ExecutionCommitted {
+		t.Fatalf("permit state=(%d,%d)", permit.State(), permit.ExecutionState())
+	}
+}
+
+func TestEngineLeafMobilityRecoveryRetainsCommittedCarrierLease(t *testing.T) {
+	dropper := &dropLeafAckPath{phase: proto.LeafMobilityPeerPlanAckPhaseReleased}
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, func(path *memoryPathConn) transport.PathConn {
+		dropper.PathConn = path
+		return dropper
+	})
+	fixture.client.limits.MigrationBudget = 150 * time.Millisecond
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xcb)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.CommitDriver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Complete(context.Background()); !errors.Is(err, ErrLeafMobilityOutcomeUnknown) {
+		t.Fatalf("completion error=%v want outcome unknown", err)
+	}
+	retired := make(chan error, 1)
+	go func() { retired <- fixture.clientClaim.Retire(plan.Binding) }()
+	select {
+	case err := <-retired:
+		t.Fatalf("recovery released committed carrier early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case err := <-retired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery did not release committed carrier at terminal budget")
+	}
+}
+
+func TestEngineLeafMobilityRollbackSurvivesAdministrativePathRetirement(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xca)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.client.RetirePath(fixture.clientRef, errors.New("administrative retirement before cutover")); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err == nil {
+		t.Fatal("cutover crossed logical path retirement")
+	}
+	if err := permit.RolledBack(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if permit.State() != leafmobility.ResourceTransactionRolledBack || permit.ExecutionState() != leafmobility.ExecutionRolledBack {
+		t.Fatalf("permit state=(%d,%d)", permit.State(), permit.ExecutionState())
+	}
+}
+
+func TestEngineLeafMobilityPermitWatchdogOwnsAbandonedTerminalWork(t *testing.T) {
+	t.Run("prepared rolls back", func(t *testing.T) {
+		fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+		fixture.client.limits.MigrationBudget = 400 * time.Millisecond
+		plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc2)
+		authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		permit, err := authority.Consume()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		eventuallyEngine(t, 2*time.Second, func() bool {
+			return permit.State() == leafmobility.ResourceTransactionRolledBack &&
+				permit.ExecutionState() == leafmobility.ExecutionRolledBack
+		})
+		if fixture.clientResource.Snapshot().Poisoned || fixture.serverResource.Snapshot().Poisoned {
+			t.Fatal("watchdog rollback poisoned a resolved resource")
+		}
+	})
+
+	t.Run("committed completes", func(t *testing.T) {
+		fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+		fixture.client.limits.MigrationBudget = 400 * time.Millisecond
+		plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc3)
+		authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		permit, err := authority.Consume()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Cutover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.CommitDriver(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		eventuallyEngine(t, 2*time.Second, func() bool {
+			return permit.State() == leafmobility.ResourceTransactionCompleted
+		})
+		if fixture.clientResource.Snapshot().Poisoned || fixture.serverResource.Snapshot().Poisoned {
+			t.Fatal("watchdog completion poisoned a resolved resource")
+		}
+	})
+}
+
+func TestEngineCloseCancelsPreparedDriverLease(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc4)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.client.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Close remained blocked on an abandoned driver lease")
+	}
+	if state := permit.ExecutionState(); state != leafmobility.ExecutionRolledBack && state != leafmobility.ExecutionFailedClosed {
+		t.Fatalf("execution state after close=%d", state)
+	}
+}
+
+func TestEngineCloseInvalidatesClaimAcrossValidationToDriverGap(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc8)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.validateExecutionSource(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.client.Close(); err != nil {
+		t.Fatalf("close before driver: %v", err)
+	}
+	if err := permit.execution.Prepare(context.Background()); err == nil {
+		t.Fatal("driver execution crossed engine close")
+	}
+	if calls := fixture.clientDriver.prepareCalls.Load(); calls != 0 {
+		t.Fatalf("driver Prepare calls after close=%d", calls)
 	}
 }
 

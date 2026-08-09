@@ -13,16 +13,22 @@ import (
 )
 
 type enginePlanDriver struct {
-	operation leafmobility.Operation
-	calls     atomic.Int32
-	evidence  leafmobility.EvidenceDigest
-	entered   chan struct{}
-	release   chan struct{}
+	operation       leafmobility.Operation
+	calls           atomic.Int32
+	evidence        leafmobility.EvidenceDigest
+	entered         chan struct{}
+	release         chan struct{}
+	rollbackEntered chan struct{}
+	rollbackRelease chan struct{}
+	prepareCalls    atomic.Int32
+	cutoverCalls    atomic.Int32
+	commitCalls     atomic.Int32
+	rollbackCalls   atomic.Int32
 }
 
 func (d *enginePlanDriver) Operation() leafmobility.Operation { return d.operation }
 
-func (d *enginePlanDriver) Preflight(_ context.Context, _ leafmobility.PreflightRequest) (leafmobility.PreflightResult, error) {
+func (d *enginePlanDriver) Preflight(_ context.Context, request leafmobility.PreflightRequest) (leafmobility.DriverAttempt, leafmobility.PreflightResult, error) {
 	d.calls.Add(1)
 	if d.entered != nil {
 		close(d.entered)
@@ -30,7 +36,76 @@ func (d *enginePlanDriver) Preflight(_ context.Context, _ leafmobility.Preflight
 	if d.release != nil {
 		<-d.release
 	}
-	return leafmobility.PreflightResult{Eligible: true, EvidenceDigest: d.evidence}, nil
+	now := time.Now()
+	observed, expires := now.Add(-time.Second).UnixNano(), now.Add(20*time.Second).UnixNano()
+	contextDigest := request.ContextDigest
+	endpointGeneration := request.Facts.Generation
+	references, err := leafmobility.NewProbeReferences(
+		request.PlatformProbe,
+		leafmobility.ProbeReference{
+			ID: leafmobility.ProbeEndpointState, Revision: 1, Generation: 2, EndpointGeneration: endpointGeneration,
+			ObservedNano: observed, ExpiresNano: expires, ContextDigest: contextDigest, Digest: leafmobility.EvidenceDigest{2},
+		},
+		leafmobility.ProbeReference{
+			ID: leafmobility.ProbeTuple, Revision: 1, Generation: 3, EndpointGeneration: endpointGeneration,
+			ObservedNano: observed, ExpiresNano: expires, ContextDigest: contextDigest, Digest: leafmobility.EvidenceDigest{3},
+		},
+		leafmobility.ProbeReference{
+			ID: leafmobility.ProbeQuarantineSchema, Revision: 1, Generation: 4, EndpointGeneration: endpointGeneration,
+			ObservedNano: observed, ExpiresNano: expires, ContextDigest: contextDigest, Digest: leafmobility.EvidenceDigest{4},
+		},
+		leafmobility.ProbeReference{
+			ID: leafmobility.ProbeRollbackReadiness, Revision: 1, Generation: 5, EndpointGeneration: endpointGeneration,
+			ObservedNano: observed, ExpiresNano: expires, ContextDigest: contextDigest, Digest: leafmobility.EvidenceDigest{5},
+		},
+	)
+	if err != nil {
+		return nil, leafmobility.PreflightResult{}, err
+	}
+	result := leafmobility.PreflightResult{
+		Eligible: true, Stage: leafmobility.StagePreflightComplete, EvidenceDigest: d.evidence, ProbeReferences: references,
+	}
+	return &enginePlanDriverTransaction{driver: d, evidence: leafmobility.AttemptEvidence{
+		Digest: result.EvidenceDigest, ProbeReferences: result.ProbeReferences,
+	}}, result, nil
+}
+
+type enginePlanDriverTransaction struct {
+	driver   *enginePlanDriver
+	evidence leafmobility.AttemptEvidence
+}
+
+func (t *enginePlanDriverTransaction) Evidence() leafmobility.AttemptEvidence { return t.evidence }
+
+func (t *enginePlanDriverTransaction) Prepare(context.Context, leafmobility.ExecutionRequest) error {
+	t.driver.prepareCalls.Add(1)
+	return nil
+}
+func (t *enginePlanDriverTransaction) Cutover(context.Context, leafmobility.ExecutionRequest) error {
+	t.driver.cutoverCalls.Add(1)
+	return nil
+}
+func (t *enginePlanDriverTransaction) Commit(context.Context, leafmobility.ExecutionRequest) error {
+	t.driver.commitCalls.Add(1)
+	return nil
+}
+func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobility.ExecutionRequest) error {
+	t.driver.rollbackCalls.Add(1)
+	if t.driver.rollbackEntered != nil {
+		select {
+		case <-t.driver.rollbackEntered:
+		default:
+			close(t.driver.rollbackEntered)
+		}
+	}
+	if t.driver.rollbackRelease != nil {
+		select {
+		case <-t.driver.rollbackRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func TestEnginePlansSpecializedMobilityFromExactFrozenEvidence(t *testing.T) {

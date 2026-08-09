@@ -120,6 +120,12 @@ type Claim struct {
 	facts    Facts
 	driver   Driver
 	resource *resourceState
+	issuer   *authorityIssuerToken
+
+	executionMu       sync.Mutex
+	executionActive   bool
+	executionRetiring bool
+	executionDone     chan struct{}
 
 	mu                sync.RWMutex
 	binding           Binding
@@ -159,6 +165,9 @@ func NewDrivenClaim(facts Facts, driver Driver, resource Resource) (*Claim, erro
 	}
 	if interfaceIsNil(driver) {
 		return nil, fmt.Errorf("%w: nil driver", ErrInvalidDriver)
+	}
+	if _, ok := interfaceIdentity(driver); !ok {
+		return nil, fmt.Errorf("%w: driver must have stable pointer identity", ErrInvalidDriver)
 	}
 	operation := driver.Operation()
 	if !operation.single() {
@@ -219,8 +228,18 @@ func (c *Claim) State() ClaimState {
 
 // Bind binds the claim exactly once.
 func (c *Claim) Bind(binding Binding) error {
+	if c != nil && c.driver != nil {
+		return ErrAuthorityIssuerRequired
+	}
+	return c.bind(binding, nil)
+}
+
+func (c *Claim) bind(binding Binding, issuer *authorityIssuerToken) error {
 	if err := validateBinding(binding); err != nil {
 		return err
+	}
+	if c == nil {
+		return ErrInvalidBinding
 	}
 
 	c.mu.Lock()
@@ -233,6 +252,7 @@ func (c *Claim) Bind(binding Binding) error {
 	}
 	c.binding = binding
 	c.bound = true
+	c.issuer = issuer
 	return nil
 }
 
@@ -240,22 +260,47 @@ func (c *Claim) Bind(binding Binding) error {
 // same retirement is idempotent; a stale or copied binding cannot retire a
 // newer owner.
 func (c *Claim) Retire(binding Binding) error {
-	if err := validateBinding(binding); err != nil {
+	if err := c.RequestRetire(binding); err != nil {
 		return err
 	}
+	c.waitExecutionQuiesced()
+	return nil
+}
+
+// RequestRetire commits logical retirement without waiting for an in-flight
+// driver attempt. It is safe under an engine topology lock: new executions
+// are rejected immediately, while physical carrier cleanup must call Retire
+// outside that lock to wait for rollback or commit.
+func (c *Claim) RequestRetire(binding Binding) error {
+	_, err := c.RequestRetireState(binding)
+	return err
+}
+
+// RequestRetireState additionally reports whether carrier cleanup must wait
+// for an active execution to publish or abandon its terminal outcome.
+func (c *Claim) RequestRetireState(binding Binding) (bool, error) {
+	if err := validateBinding(binding); err != nil {
+		return false, err
+	}
+	if c == nil {
+		return false, ErrInvalidBinding
+	}
+	c.executionMu.Lock()
+	defer c.executionMu.Unlock()
 	c.mu.Lock()
 	if !c.bound {
 		c.mu.Unlock()
-		return ErrNotBound
+		return false, ErrNotBound
 	}
 	if c.binding != binding {
 		c.mu.Unlock()
-		return ErrBindingMismatch
+		return false, ErrBindingMismatch
 	}
+	c.executionRetiring = true
 	c.retired = true
 	c.revokeResourceTransactionLocked()
 	c.mu.Unlock()
-	return nil
+	return c.executionActive, nil
 }
 
 // RetireUnbound invalidates a path that never entered engine ownership. It
@@ -265,15 +310,62 @@ func (c *Claim) RetireUnbound() bool {
 	if c == nil {
 		return false
 	}
+	c.executionMu.Lock()
 	c.mu.Lock()
 	if c.bound {
 		c.mu.Unlock()
+		c.executionMu.Unlock()
 		return false
 	}
+	c.executionRetiring = true
 	c.retired = true
 	c.revokeResourceTransactionLocked()
 	c.mu.Unlock()
+	done := c.executionDone
+	c.executionMu.Unlock()
+	if done != nil {
+		<-done
+	}
 	return true
+}
+
+func (c *Claim) acquireExecutionLease() bool {
+	if c == nil {
+		return false
+	}
+	c.executionMu.Lock()
+	defer c.executionMu.Unlock()
+	if c.executionRetiring || c.executionActive {
+		return false
+	}
+	c.executionActive = true
+	c.executionDone = make(chan struct{})
+	return true
+}
+
+func (c *Claim) releaseExecutionLease() {
+	if c == nil {
+		return
+	}
+	c.executionMu.Lock()
+	if c.executionActive {
+		c.executionActive = false
+		close(c.executionDone)
+		c.executionDone = nil
+	}
+	c.executionMu.Unlock()
+}
+
+func (c *Claim) waitExecutionQuiesced() {
+	if c == nil {
+		return
+	}
+	c.executionMu.Lock()
+	done := c.executionDone
+	c.executionMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // Retired reports whether the bound endpoint has left engine ownership.
@@ -366,6 +458,23 @@ func interfaceIsNil(value any) bool {
 	default:
 		return false
 	}
+}
+
+func interfaceIdentity(value any) (uintptr, bool) {
+	if value == nil {
+		return 0, false
+	}
+	reflected := reflect.ValueOf(value)
+	if reflected.Kind() != reflect.Pointer || reflected.IsNil() {
+		return 0, false
+	}
+	return reflected.Pointer(), true
+}
+
+func sameInterfaceIdentity(left, right any) bool {
+	leftID, leftOK := interfaceIdentity(left)
+	rightID, rightOK := interfaceIdentity(right)
+	return leftOK && rightOK && leftID == rightID && reflect.TypeOf(left) == reflect.TypeOf(right)
 }
 
 func validateBinding(binding Binding) error {

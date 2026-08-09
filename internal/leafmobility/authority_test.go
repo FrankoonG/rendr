@@ -34,10 +34,10 @@ func TestResourceTransactionTracksExecutionWithoutIssuingCapability(t *testing.T
 	}
 
 	copyOfTransaction := *tx
-	if err := copyOfTransaction.Consume(); err != nil {
+	if err := copyOfTransaction.consumeWithoutExecution(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Consume(); !errors.Is(err, ErrAuthorityConsumed) {
+	if err := tx.consumeWithoutExecution(); !errors.Is(err, ErrAuthorityConsumed) {
 		t.Fatalf("second consume=%v want=%v", err, ErrAuthorityConsumed)
 	}
 	if err := tx.BeginResolution(ResolutionComplete); err != nil {
@@ -173,7 +173,7 @@ func TestResourceTransactionLateFinalAcceptedRequiresNoExecutionRollback(t *test
 	if err := tx.ReconcileFinalAccepted(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Consume(); !errors.Is(err, ErrAuthorityExpired) {
+	if err := tx.consumeWithoutExecution(); !errors.Is(err, ErrAuthorityExpired) {
 		t.Fatalf("consume after immutable deadline=%v want=%v", err, ErrAuthorityExpired)
 	}
 	snapshot := tx.Snapshot()
@@ -204,7 +204,7 @@ func TestResourceTransactionLateReleasedFinishesUncertainResolution(t *testing.T
 		func() error { return tx.MarkPrepared(1, plan.Deadline) },
 		tx.MarkCommitPublished,
 		tx.MarkFinalAccepted,
-		tx.Consume,
+		tx.consumeWithoutExecution,
 		func() error { return tx.BeginResolution(ResolutionComplete) },
 		tx.MarkOutcomeUnknown,
 	} {
@@ -334,7 +334,7 @@ func TestResourceTransactionCopiesConsumeExactlyOnce(t *testing.T) {
 		go func(transaction ResourceTransaction) {
 			defer wg.Done()
 			<-start
-			switch err := transaction.Consume(); {
+			switch err := transaction.consumeWithoutExecution(); {
 			case err == nil:
 				wins.Add(1)
 			case errors.Is(err, ErrAuthorityConsumed):
@@ -385,7 +385,7 @@ func TestResourceTransactionStateAndSnapshotAreRaceSafe(t *testing.T) {
 		func() error { return tx.MarkPrepared(1, plan.Deadline.Add(-time.Millisecond)) },
 		tx.MarkCommitPublished,
 		tx.MarkFinalAccepted,
-		tx.Consume,
+		tx.consumeWithoutExecution,
 		func() error { return tx.BeginResolution(ResolutionComplete) },
 		func() error { return tx.FinishResolution(ResolutionComplete) },
 	} {
@@ -589,14 +589,15 @@ func resourceTransactionFixture(t testing.TB, lease time.Duration) (*Claim, Plan
 
 func newTestDrivenClaim(t testing.TB, resource Resource, operation Operation, kind Kind, binding Binding) *Claim {
 	t.Helper()
-	driver := &fakeDriver{operation: operation, result: PreflightResult{Eligible: true, EvidenceDigest: EvidenceDigest{0xa1}}}
 	facts := testDrivenFacts()
 	facts.Kind = kind
 	facts.Generation = NextGeneration()
+	driver := &fakeDriver{operation: operation, result: PreflightResult{
+		Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0xa1},
+		ProbeReferences: testProbeReferencesFor(0xa1, facts.Generation),
+	}}
 	claim := MustNewDrivenClaim(facts, driver, resource)
-	if err := claim.Bind(binding); err != nil {
-		t.Fatal(err)
-	}
+	bindDrivenClaim(t, claim, binding)
 	t.Cleanup(func() { _ = claim.Retire(binding) })
 	return claim
 }

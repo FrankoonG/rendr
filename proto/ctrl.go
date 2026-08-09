@@ -42,7 +42,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 10
+	ProtocolMinor uint16 = 11
 )
 
 type FeatureSet uint64
@@ -78,8 +78,13 @@ const (
 	// FeatureServerAssignedSessionEpoch separates the replayable client HELLO
 	// proposal from the final session identity selected by the listener.
 	FeatureServerAssignedSessionEpoch FeatureSet = 1 << 13
+	// FeatureLeafMobilityTypedExecution requires canonical eligibility stages,
+	// probe references, exact preflight-attempt binding, and an engine-issued
+	// execution domain. Minor-10 peers cannot safely interpret these plan
+	// digests and must reject before allocating session state.
+	FeatureLeafMobilityTypedExecution FeatureSet = 1 << 14
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -188,6 +193,9 @@ func validateNegotiation(n Negotiation) error {
 	}
 	if RequiredFeatures&^n.Supported != 0 {
 		return fmt.Errorf("%w: peer lacks mandatory features 0x%x", ErrNegotiationIncompatible, uint64(RequiredFeatures&^n.Supported))
+	}
+	if RequiredFeatures&^n.Required != 0 {
+		return fmt.Errorf("%w: peer does not require mandatory features 0x%x", ErrNegotiationIncompatible, uint64(RequiredFeatures&^n.Required))
 	}
 	if unknown := n.MobilityRequired &^ LeafMobilityKnownMask; unknown != 0 {
 		return fmt.Errorf("%w: unknown required leaf mobility 0x%x", ErrNegotiationIncompatible, uint16(unknown))

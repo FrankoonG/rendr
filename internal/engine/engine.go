@@ -234,6 +234,7 @@ type Engine struct {
 	policyAdmissionMu    sync.RWMutex
 	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
 	leafTx               *leafMobilityRuntime
+	leafIssuer           *leafmobility.AuthorityIssuer
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -516,13 +517,20 @@ func (s *pathSlot) closeQuit() {
 		}
 		s.ackPending = nil
 		s.ackMu.Unlock()
-		s.dispatchMu.Lock()
-		s.dispatchDead = true
-		s.dispatchFenced = true
-		s.txEnabled.Store(false)
-		s.dispatchMu.Unlock()
+		s.fenceDispatchForRetirement()
 		close(s.quit)
 	})
+}
+
+func (s *pathSlot) fenceDispatchForRetirement() {
+	if s == nil {
+		return
+	}
+	s.dispatchMu.Lock()
+	s.dispatchDead = true
+	s.dispatchFenced = true
+	s.txEnabled.Store(false)
+	s.dispatchMu.Unlock()
 }
 
 func (s *pathSlot) completeAdmission() {
@@ -568,6 +576,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		policyCompleted:         make(map[[16]byte]completedPolicyTransaction),
 		policyQueued:            make(map[policyMessageKey]struct{}),
 		leafTx:                  newLeafMobilityRuntime(),
+		leafIssuer:              leafmobility.NewAuthorityIssuer(),
 		zombieLeft:              limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding:        make(map[uint64]time.Time),
 		closed:                  make(chan struct{}),
@@ -870,7 +879,7 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	}
 	generation := e.nextPathGenerationLocked()
 	if mobilityClaim != nil {
-		if err := mobilityClaim.Bind(leafmobility.Binding{
+		if err := e.leafIssuer.BindClaim(mobilityClaim, leafmobility.Binding{
 			FlowID:        e.FlowID(),
 			LocalTargetID: [16]byte(binding.LocalTXTargetID),
 			PeerTargetID:  [16]byte(binding.PeerTXTargetID),
@@ -938,9 +947,9 @@ func (e *Engine) StagePathAttach(id uint32) error {
 	}
 	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.pendingPaths, id)
-		slot.retireMobilityClaim()
 		e.releasePathAdmissionLocked(id)
 		e.pathsMu.Unlock()
+		slot.retireMobilityClaim()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -993,9 +1002,9 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.stagedPaths, id)
 		slot.closeQuit()
-		slot.retireMobilityClaim()
 		e.releasePathAdmissionLocked(id)
 		e.pathsMu.Unlock()
+		slot.retireMobilityClaim()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -1026,13 +1035,16 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	slot = e.stagedPaths[id]
 	if slot == nil || e.isClosed() || e.sendClosing.Load() {
 		deaths := e.unwindFencedPathsLocked(fenced)
+		retireSlot := slot
 		if slot != nil {
 			delete(e.stagedPaths, id)
 			slot.closeQuit()
-			slot.retireMobilityClaim()
 			e.releasePathAdmissionLocked(id)
 		}
 		e.pathsMu.Unlock()
+		if retireSlot != nil {
+			retireSlot.retireMobilityClaim()
+		}
 		e.processDeferredPathDeaths(deaths)
 		if slot == nil {
 			return fmt.Errorf("engine: staged path %d changed during activation", id)
@@ -1229,8 +1241,21 @@ func (s *pathSlot) retireMobilityClaim() {
 	}
 }
 
+func (s *pathSlot) requestMobilityClaimRetirement() bool {
+	if s == nil || s.mobilityClaim == nil {
+		return false
+	}
+	binding, ok := s.mobilityClaim.Binding()
+	if ok {
+		active, _ := s.mobilityClaim.RequestRetireState(binding)
+		return active
+	}
+	return false
+}
+
 func (e *Engine) retireSupersededPath(slot *pathSlot) {
 	slot.retireMobilityClaim()
+	slot.closeQuit()
 	_ = slot.conn.Close()
 	timer := time.NewTimer(pathCloseTimeout)
 	defer timer.Stop()
@@ -1268,7 +1293,7 @@ func (e *Engine) retirePathAsync(slot *pathSlot) {
 	if slot == nil {
 		return
 	}
-	slot.retireMobilityClaim()
+	slot.requestMobilityClaimRetirement()
 	go e.retireSupersededPath(slot)
 }
 
@@ -2093,22 +2118,22 @@ func (e *Engine) Close() error {
 		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths))
 		for _, s := range e.paths {
 			s.closeQuit()
-			s.retireMobilityClaim()
+			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.pendingPaths {
 			s.closeQuit()
-			s.retireMobilityClaim()
+			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.stagedPaths {
 			s.closeQuit()
-			s.retireMobilityClaim()
+			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.retainedPaths {
 			s.closeQuit()
-			s.retireMobilityClaim()
+			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, reservation := range e.pathAdmissionByLeaf {
@@ -2133,8 +2158,10 @@ func (e *Engine) Close() error {
 		e.recvMu.Unlock()
 		results := make(chan error, len(slots))
 		for _, s := range slots {
-			s.retireMobilityClaim()
-			go func(slot *pathSlot) { results <- slot.conn.Close() }(s)
+			go func(slot *pathSlot) {
+				slot.retireMobilityClaim()
+				results <- slot.conn.Close()
+			}(s)
 		}
 		reaped := make(chan error, 1)
 		go func() {
