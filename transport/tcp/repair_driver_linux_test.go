@@ -849,34 +849,37 @@ func TestTCPRepairAttemptRestoreFailureRollsBackFromSnapshot(t *testing.T) {
 	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 }
 
-func TestTCPRepairAttemptUnknownRestoreCleanupNeverRetriesTupleOrReleasesQuarantine(t *testing.T) {
-	restoreFailure := errors.New("restore failed with an unowned descriptor")
+func TestTCPRepairAttemptRestoreCloseDiagnosticStillRollsBackAndReleasesQuarantine(t *testing.T) {
+	restoreFailure := errors.New("restore failed")
+	closeDiagnostic := errors.New("raw descriptor close diagnostic")
 	fixture := newRepairDriverFixture(t)
+	replacement, replacementPeer := newRepairDriverTCPPair(t)
 	restoreCalls := 0
 	fixture.kernel.restoreFn = func(context.Context, *tcprepair.Snapshot) (*net.TCPConn, error) {
 		restoreCalls++
-		return nil, errors.Join(restoreFailure, tcprepair.ErrRestoreCleanupUnknown)
+		if restoreCalls == 1 {
+			return nil, errors.Join(restoreFailure, closeDiagnostic)
+		}
+		return replacement, nil
 	}
 	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, restoreFailure) || !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
-		t.Fatalf("Stage = %v, want restore cleanup unknown", err)
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, restoreFailure) || !errors.Is(err, closeDiagnostic) {
+		t.Fatalf("Stage = %v, want restore and close diagnostics", err)
 	}
-	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
-		t.Fatalf("Rollback = %v, want cleanup unknown", err)
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Rollback = %v", err)
 	}
-	if restoreCalls != 1 || fixture.lease.releaseCalls() != 0 {
-		t.Fatalf("restore/release calls=%d/%d want 1/0", restoreCalls, fixture.lease.releaseCalls())
+	if restoreCalls != 2 || fixture.lease.releaseCalls() != 1 {
+		t.Fatalf("restore/release calls=%d/%d want 2/1", restoreCalls, fixture.lease.releaseCalls())
 	}
-	if err := fixture.attempt.FailClosed(context.Background(), fixture.request); !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
-		t.Fatalf("FailClosed = %v, want cleanup unknown", err)
+	if fixture.attempt.quarantine != nil || fixture.attempt.executor != nil || !fixture.attempt.EndpointGenerationChanged() {
+		t.Fatalf("rollback did not close ownership: %+v", fixture.attempt)
 	}
-	if !fixture.attempt.endpointTerminated || fixture.attempt.quarantine == nil || fixture.attempt.executor == nil {
-		t.Fatalf("unknown cleanup lost fail-closed ownership: %+v", fixture.attempt)
-	}
-	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore")
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "restore", "release")
+	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 }
 
 func TestTCPRepairAttemptActivateFailureIsRetryableAndRejectsRollback(t *testing.T) {

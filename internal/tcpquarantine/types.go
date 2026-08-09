@@ -33,6 +33,9 @@ var (
 	ErrLeaseConflict            = errors.New("tcpquarantine: transaction is active for a different tuple or execution scope")
 	ErrStaleLease               = errors.New("tcpquarantine: lease incarnation is no longer active")
 	ErrLeaseGenerationExhausted = errors.New("tcpquarantine: lease generation exhausted")
+	ErrReconcileIncomplete      = errors.New("tcpquarantine: stale quarantine reconciliation is incomplete")
+	ErrManagedTableMalformed    = errors.New("tcpquarantine: managed nft table metadata is malformed")
+	ErrProcessStateUnknown      = errors.New("tcpquarantine: quarantine owner process state is unknown")
 )
 
 // TransactionID is a binary transaction identity. Names sent to nft are
@@ -126,11 +129,18 @@ func New(config Config) (*Manager, error) {
 	if owner.isZero() {
 		return nil, errors.New("tcpquarantine: random source returned an all-zero owner token")
 	}
+	process, err := currentProcessIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("tcpquarantine: identify owner process: %w", err)
+	}
 	return &Manager{
 		runner:           runner,
 		owner:            owner,
+		process:          process,
+		processState:     observeProcessIdentity,
 		reconcileTimeout: timeout,
 		activeLeases:     make(map[leaseKey]*leaseState),
+		reconciledScopes: make(map[namespaceScope]struct{}),
 	}, nil
 }
 

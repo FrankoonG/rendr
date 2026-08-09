@@ -3,16 +3,128 @@
 package tcpquarantine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
+
+const restartHelperEnvironment = "RENDR_TCP_QUARANTINE_RESTART_HELPER"
+
+func TestPrivilegedProcessRestartReconcilesStaleQuarantine(t *testing.T) {
+	if os.Getenv(restartHelperEnvironment) == "1" {
+		runRestartQuarantineHelper()
+	}
+	if os.Getenv("RENDR_TCP_QUARANTINE_TEST") != "1" {
+		t.Skip("set RENDR_TCP_QUARANTINE_TEST=1 to exercise real nft quarantine")
+	}
+	if os.Getenv("RENDR_TCP_QUARANTINE_NETNS") != "1" {
+		t.Fatal("privileged test must run in a dedicated network namespace")
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=^TestPrivilegedProcessRestartReconcilesStaleQuarantine$")
+	command.Env = append(os.Environ(), restartHelperEnvironment+"=1")
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatalf("helper stdin: %v", err)
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatalf("helper stdout: %v", err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	waited := false
+	defer func() {
+		_ = stdin.Close()
+		if !waited {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() {
+		_ = stdin.Close()
+		waitErr := command.Wait()
+		waited = true
+		t.Fatalf("helper did not publish table: scan=%v wait=%v stderr=%s", scanner.Err(), waitErr, stderr.String())
+	}
+	table := strings.TrimPrefix(scanner.Text(), "TABLE=")
+	identity, managed, err := parseManagedTableName(table)
+	if err != nil || !managed {
+		t.Fatalf("helper table %q is not managed: %v", table, err)
+	}
+	spec := identity.spec()
+
+	manager, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New parent manager: %v", err)
+	}
+	report, err := manager.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile live helper: %v", err)
+	}
+	if report.Live != 1 || report.Removed != 0 || report.Unknown != 0 {
+		t.Fatalf("live helper report = %+v", report)
+	}
+	scope, err := currentNamespaceScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed := manager.observeBounded(context.Background(), scope, spec); observed.state != stateExact {
+		t.Fatalf("live helper table observation = %+v", observed)
+	}
+
+	if err := stdin.Close(); err != nil {
+		t.Fatalf("release helper: %v", err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("helper exit: %v stderr=%s", err, stderr.String())
+	}
+	waited = true
+
+	report, err = manager.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile exited helper: %v", err)
+	}
+	if report.Removed != 1 || report.Live != 0 || report.Unknown != 0 {
+		t.Fatalf("exited helper report = %+v", report)
+	}
+	if observed := manager.observeBounded(context.Background(), scope, spec); observed.state != stateAbsent {
+		t.Fatalf("stale helper table observation = %+v", observed)
+	}
+}
+
+func runRestartQuarantineHelper() {
+	manager, err := New(Config{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "new manager: %v\n", err)
+		os.Exit(2)
+	}
+	lease, err := manager.Install(context.Background(), testTransactionID(), testTuple())
+	if err != nil || lease == nil {
+		fmt.Fprintf(os.Stderr, "install quarantine: lease=%v err=%v\n", lease, err)
+		os.Exit(2)
+	}
+	fmt.Printf("TABLE=%s\n", lease.state.spec.table)
+	_ = os.Stdout.Sync()
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	// Deliberately bypass Release to model abrupt process ownership loss.
+	os.Exit(0)
+}
 
 func TestPrivilegedPreflightInstallAndReleaseDataPlane(t *testing.T) {
 	if os.Getenv("RENDR_TCP_QUARANTINE_TEST") != "1" {

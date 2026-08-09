@@ -563,7 +563,7 @@ func TestRestoreFDFailureRefreezesAndCloses(t *testing.T) {
 	}
 }
 
-func TestRestoreFDCloseFailureMarksCleanupUnknown(t *testing.T) {
+func TestRestoreFDCloseFailureIsDiagnosticAfterOwnershipRelease(t *testing.T) {
 	closeFailure := errors.New("raw replacement close failed")
 	snapshot := testLinuxSnapshot(t)
 	ops := newFakeLinuxSocketOps()
@@ -571,12 +571,11 @@ func TestRestoreFDCloseFailureMarksCleanupUnknown(t *testing.T) {
 	ops.closeErr = closeFailure
 
 	fd, err := restoreFD(context.Background(), snapshot, ops)
-	if fd != -1 || !errors.Is(err, errFakeSocketCall) || !errors.Is(err, closeFailure) ||
-		!errors.Is(err, ErrRestoreCleanupUnknown) {
-		t.Fatalf("restoreFD() = (%d, %v), want primary + close + cleanup-unknown", fd, err)
+	if fd != -1 || !errors.Is(err, errFakeSocketCall) || !errors.Is(err, closeFailure) {
+		t.Fatalf("restoreFD() = (%d, %v), want primary + diagnostic close error", fd, err)
 	}
-	if ops.closed {
-		t.Fatal("fake close failure was reported as proven closed")
+	if !ops.closed {
+		t.Fatal("Linux close error did not release descriptor ownership")
 	}
 }
 
@@ -1068,14 +1067,9 @@ func (ops *fakeLinuxSocketOps) poll(fds []unix.PollFd, timeout int) (int, error)
 }
 
 func (ops *fakeLinuxSocketOps) close(fd int) error {
-	if err := ops.record(fakeSocketCall{op: "close", fd: fd}); err != nil {
-		return err
-	}
-	if ops.closeErr != nil {
-		return ops.closeErr
-	}
+	recordErr := ops.record(fakeSocketCall{op: "close", fd: fd})
 	ops.closed = true
-	return nil
+	return errors.Join(recordErr, ops.closeErr)
 }
 
 func (ops *fakeLinuxSocketOps) trace() string {

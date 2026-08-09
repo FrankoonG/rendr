@@ -20,15 +20,14 @@ const (
 )
 
 var (
-	ErrUnsupported           = errors.New("tcprepair: platform is unsupported")
-	ErrIneligibleState       = errors.New("tcprepair: endpoint state is ineligible")
-	ErrUnsupportedOption     = errors.New("tcprepair: endpoint uses an unsupported TCP option")
-	ErrQueueBudget           = errors.New("tcprepair: queue exceeds snapshot budget")
-	ErrSnapshotInvalid       = errors.New("tcprepair: snapshot is invalid")
-	ErrSourceStateUnknown    = errors.New("tcprepair: source state is unknown")
-	ErrSourceClosed          = errors.New("tcprepair: source is closed")
-	ErrSourceReleased        = errors.New("tcprepair: source ownership was released")
-	ErrRestoreCleanupUnknown = errors.New("tcprepair: restore cleanup is unproven")
+	ErrUnsupported        = errors.New("tcprepair: platform is unsupported")
+	ErrIneligibleState    = errors.New("tcprepair: endpoint state is ineligible")
+	ErrUnsupportedOption  = errors.New("tcprepair: endpoint uses an unsupported TCP option")
+	ErrQueueBudget        = errors.New("tcprepair: queue exceeds snapshot budget")
+	ErrSnapshotInvalid    = errors.New("tcprepair: snapshot is invalid")
+	ErrSourceStateUnknown = errors.New("tcprepair: source state is unknown")
+	ErrSourceClosed       = errors.New("tcprepair: source is closed")
+	ErrSourceReleased     = errors.New("tcprepair: source ownership was released")
 )
 
 // SourceState reports the only socket ownership facts Capture can prove. An

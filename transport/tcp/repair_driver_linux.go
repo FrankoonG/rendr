@@ -190,6 +190,8 @@ func (driver *tcpRepairDriver) Preflight(
 			errors.Is(err, tcpquarantine.ErrNFTExecutableUnavailable) {
 			reason = leafmobility.ReasonQuarantineUnavailable
 			retryable = false
+		} else if errors.Is(err, tcpquarantine.ErrReconcileIncomplete) {
+			retryable = true
 		}
 		return driver.ineligible(request, leafmobility.StageQuarantine, reason, retryable,
 			endpointProbe, tupleProbe,
@@ -427,7 +429,6 @@ type tcpRepairAttempt struct {
 	replacementPublished  bool
 	replacementDiscarding bool
 	quarantineUnverified  bool
-	restoreCleanupUnknown bool
 	endpointChanged       bool
 	executor              repairAttemptExecutor
 	endpointTerminated    bool
@@ -542,7 +543,6 @@ func (attempt *tcpRepairAttempt) Stage(
 		}
 		replacement, restoreErr := attempt.driver.kernel.Restore(operationCtx, attempt.snapshot)
 		if restoreErr != nil {
-			attempt.restoreCleanupUnknown = errors.Is(restoreErr, tcprepair.ErrRestoreCleanupUnknown)
 			return restoreErr
 		}
 		attempt.replacement = replacement
@@ -656,9 +656,6 @@ func (attempt *tcpRepairAttempt) Rollback(ctx context.Context, request leafmobil
 				attempt.replacementPublished = true
 				attempt.endpointChanged = true
 			} else if attempt.sourceLease != nil && attempt.sourceLease.State() == tcprepair.SourceStateClosed {
-				if attempt.restoreCleanupUnknown {
-					return tcprepair.ErrRestoreCleanupUnknown
-				}
 				if attempt.snapshot == nil {
 					return errors.New("tcp: closed repair source has no rollback snapshot")
 				}
@@ -781,9 +778,6 @@ func (attempt *tcpRepairAttempt) FailClosed(ctx context.Context, request leafmob
 	}
 
 	if attempt.quarantine != nil {
-		if attempt.restoreCleanupUnknown {
-			return tcprepair.ErrRestoreCleanupUnknown
-		}
 		if attempt.executor == nil {
 			return errors.New("tcp: fail-closed lost quarantine namespace ownership")
 		}

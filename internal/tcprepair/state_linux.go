@@ -313,25 +313,16 @@ func Restore(ctx context.Context, snapshot *Snapshot) (*net.TCPConn, error) {
 	conn, fileErr := net.FileConn(file)
 	closeErr := file.Close()
 	if fileErr != nil {
-		if closeErr != nil {
-			closeErr = errors.Join(ErrRestoreCleanupUnknown, closeErr)
-		}
 		return nil, errors.Join(fmt.Errorf("tcprepair: wrap restored socket: %w", fileErr), closeErr)
 	}
 	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
 		discardErr := conn.Close()
-		if discardErr != nil {
-			discardErr = errors.Join(ErrRestoreCleanupUnknown, discardErr)
-		}
 		return nil, errors.Join(fmt.Errorf("%w: restored socket became %T", ErrUnsupported, conn), discardErr)
 	}
 	if closeErr != nil {
 		discardErr := tcpConn.Close()
-		cleanupErr := errors.Join(ErrRestoreCleanupUnknown, closeErr)
-		if discardErr != nil && !errors.Is(discardErr, net.ErrClosed) {
-			cleanupErr = errors.Join(cleanupErr, discardErr)
-		}
+		cleanupErr := errors.Join(closeErr, discardErr)
 		return nil, fmt.Errorf("tcprepair: release restored file: %w", cleanupErr)
 	}
 	return tcpConn, nil
@@ -1004,10 +995,10 @@ func discardFD(fd int, ops linuxSocketOps) error {
 }
 
 func closeReplacementFD(fd int, ops linuxSocketOps) error {
-	if err := ops.close(fd); err != nil {
-		return errors.Join(ErrRestoreCleanupUnknown, err)
-	}
-	return nil
+	// Linux releases the descriptor before any later close error is reported.
+	// Retrying this numeric fd could close an unrelated descriptor that another
+	// goroutine has already allocated, so the error is diagnostic only.
+	return ops.close(fd)
 }
 
 func queueLength(fd int, request uint, label string, ops linuxSocketOps) (uint32, error) {

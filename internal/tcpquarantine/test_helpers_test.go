@@ -101,6 +101,13 @@ func mustManager(t *testing.T, runner Runner) *Manager {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	scope, err := currentNamespaceScope()
+	if err != nil {
+		t.Fatalf("currentNamespaceScope() error = %v", err)
+	}
+	// Most lease tests isolate mutation semantics. Reconciliation has its own
+	// scripted tests and production calls cannot set this package-private map.
+	manager.reconciledScopes[scope] = struct{}{}
 	return manager
 }
 
@@ -207,12 +214,23 @@ func matchJSON(protocol, field string, value any) map[string]any {
 }
 
 func emptyTablesResult(t *testing.T) RunResult {
+	return tableListResult(t)
+}
+
+func tableListResult(t *testing.T, names ...string) RunResult {
 	t.Helper()
+	objects := []any{
+		map[string]any{"metainfo": map[string]any{"json_schema_version": 1}},
+		map[string]any{"future_metadata": map[string]any{"ignored": true}},
+	}
+	for _, name := range names {
+		objects = append(objects, map[string]any{"table": map[string]any{
+			"family": nftFamily,
+			"name":   name,
+		}})
+	}
 	payload, err := json.Marshal(map[string]any{
-		"nftables": []any{
-			map[string]any{"metainfo": map[string]any{"json_schema_version": 1}},
-			map[string]any{"future_metadata": map[string]any{"ignored": true}},
-		},
+		"nftables": objects,
 	})
 	if err != nil {
 		t.Fatalf("marshal empty nft table list: %v", err)

@@ -2,7 +2,6 @@ package tcpquarantine
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"net/netip"
 	"regexp"
@@ -58,7 +57,7 @@ func TestReleaseRefusesToObserveOrDeleteOutsideInstalledNamespace(t *testing.T) 
 		t.Fatal(err)
 	}
 	scope.inode++
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	state, err := manager.reserveLease(testTransactionID(), spec, scope)
 	if err != nil {
 		t.Fatalf("reserveLease() error = %v", err)
@@ -73,7 +72,7 @@ func TestReleaseRefusesToObserveOrDeleteOutsideInstalledNamespace(t *testing.T) 
 func TestPreflightUsesCheckBatchAndProvesAbsence(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(runnerStep{
 		wantArgs:  []string{"-c", "-f", "-"},
 		wantStdin: spec.installBatch(),
@@ -89,7 +88,7 @@ func TestPreflightUsesCheckBatchAndProvesAbsence(t *testing.T) {
 func TestPreflightNeverDeletesUnexpectedTable(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
 		runnerStep{wantArgs: []string{"-c", "-f", "-"}, wantStdin: spec.installBatch(), err: errFakeCommand},
 		runnerStep{wantArgs: spec.listTableArgs(), result: exactTableResult(t, spec, nil)},
@@ -105,7 +104,7 @@ func TestPreflightNeverDeletesUnexpectedTable(t *testing.T) {
 func TestInstallErrorAbsent(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(runnerStep{
 		wantArgs:  []string{"-f", "-"},
 		wantStdin: spec.installBatch(),
@@ -126,7 +125,7 @@ func TestInstallErrorAbsent(t *testing.T) {
 func TestInstallErrorAbsentCanRetryWithNewIncarnation(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(runnerStep{
 		wantArgs:  []string{"-f", "-"},
 		wantStdin: spec.installBatch(),
@@ -162,7 +161,7 @@ func TestInstallErrorAbsentCanRetryWithNewIncarnation(t *testing.T) {
 func TestInstallErrorPresentIsReconciledAsSuccess(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
 		runnerStep{wantArgs: []string{"-f", "-"}, wantStdin: spec.installBatch(), err: errFakeCommand},
 		runnerStep{wantArgs: spec.listTableArgs(), result: exactTableResult(t, spec, nil)},
@@ -184,7 +183,7 @@ func TestInstallErrorPresentIsReconciledAsSuccess(t *testing.T) {
 func TestInstallErrorMalformedCleansUp(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
 		runnerStep{wantArgs: []string{"-f", "-"}, wantStdin: spec.installBatch(), err: errFakeCommand},
 		runnerStep{wantArgs: spec.listTableArgs(), result: RunResult{Stdout: []byte(`{"nftables":[`)}},
@@ -209,7 +208,7 @@ func TestInstallErrorMalformedCleansUp(t *testing.T) {
 func TestInstallVerifyFailureCleansUpMutatedRule(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	mutated := exactTableResult(t, spec, func(objects []any) {
 		mutateRule(objects, outputChain, func(rule map[string]any) {
 			expressions := rule["expr"].([]any)
@@ -233,7 +232,7 @@ func TestInstallVerifyFailureCleansUpMutatedRule(t *testing.T) {
 func TestInstallUnknownCleanupReturnsRetryableLease(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
 		runnerStep{wantArgs: []string{"-f", "-"}, wantStdin: spec.installBatch()},
 		runnerStep{wantArgs: spec.listTableArgs(), err: errFakeCommand},
@@ -382,7 +381,7 @@ func TestDuplicateSequentialInstallReturnsBusyWithoutNFTMutation(t *testing.T) {
 func TestDuplicateConcurrentInstallHasOneOwnershipToken(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	started := make(chan struct{})
 	allow := make(chan struct{})
 	runner.append(
@@ -510,7 +509,7 @@ func TestFailedReleaseRetryAndReinstallRejectStaleLeaseABA(t *testing.T) {
 func TestCanceledInstallUsesDetachedBoundedCleanup(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	started := make(chan struct{})
 	runner.append(runnerStep{
 		wantArgs:  []string{"-f", "-"},
@@ -552,25 +551,29 @@ func TestCanceledInstallUsesDetachedBoundedCleanup(t *testing.T) {
 	runner.assertDone()
 }
 
-func TestBatchNamesUseOnlyOwnerAndTransactionHex(t *testing.T) {
+func TestBatchNamesBindProcessOwnerTransactionAndTuple(t *testing.T) {
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
-	expected := "rendr_q_" + hex.EncodeToString(manager.owner[:]) + "_" + strings.Repeat("22", tokenSize)
-	if spec.table != expected || spec.comment != expected {
-		t.Fatalf("derived names = (%q, %q), want %q", spec.table, spec.comment, expected)
+	spec := manager.newSpec(testTransactionID(), testTuple())
+	if spec.comment != managedTableComment(spec.table) || len(spec.comment) > 128 {
+		t.Fatalf("derived comment = %q for table %q", spec.comment, spec.table)
 	}
-	if !regexp.MustCompile(`^rendr_q_[0-9a-f]{32}_[0-9a-f]{32}$`).MatchString(spec.table) {
-		t.Fatalf("table name %q is not token/transaction hex", spec.table)
+	if !regexp.MustCompile(`^rendr_q2_(?:[0-9a-f]{16}_){4}[0-9a-f]{32}_[0-9a-f]{32}_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{8}_[0-9a-f]{4}$`).MatchString(spec.table) {
+		t.Fatalf("table name %q does not use the fixed managed schema", spec.table)
+	}
+	identity, managed, err := parseManagedTableName(spec.table)
+	if err != nil || !managed || identity.process != manager.process || identity.owner != manager.owner ||
+		identity.transactionID != testTransactionID() || identity.tuple != testTuple() {
+		t.Fatalf("parseManagedTableName() = (%+v, %t, %v)", identity, managed, err)
 	}
 	batch := string(spec.installBatch())
 	if strings.Count(batch, "add table ") != 1 || strings.Count(batch, "add chain ") != 2 || strings.Count(batch, "add rule ") != 2 {
 		t.Fatalf("install batch does not contain one table, two chains, and two rules:\n%s", batch)
 	}
-	if strings.Count(batch, `comment "`+expected+`"`) != 2 {
+	if strings.Count(batch, `comment "`+spec.comment+`"`) != 2 {
 		t.Fatalf("rule comments are not the derived comment:\n%s", batch)
 	}
-	if got := string(spec.deleteBatch()); got != "delete table inet "+expected+"\n" {
+	if got := string(spec.deleteBatch()); got != "delete table inet "+spec.table+"\n" {
 		t.Fatalf("delete batch = %q", got)
 	}
 }
@@ -609,7 +612,7 @@ func installVerifiedLease(t *testing.T) (*Lease, *scriptedRunner, nftSpec) {
 	t.Helper()
 	runner := newScriptedRunner(t)
 	manager := mustManager(t, runner)
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
 		runnerStep{wantArgs: []string{"-f", "-"}, wantStdin: spec.installBatch()},
 		runnerStep{wantArgs: spec.listTableArgs(), result: exactTableResult(t, spec, nil)},

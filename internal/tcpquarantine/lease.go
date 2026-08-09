@@ -12,11 +12,16 @@ import (
 type Manager struct {
 	runner           Runner
 	owner            ownerToken
+	process          processIdentity
+	processState     func(processIdentity) (processState, error)
 	reconcileTimeout time.Duration
 
 	mu                  sync.Mutex
 	activeLeases        map[leaseKey]*leaseState
 	nextLeaseGeneration uint64
+
+	reconcileMu      sync.Mutex
+	reconciledScopes map[namespaceScope]struct{}
 }
 
 // Lease retains cleanup ownership until absence has been independently proven.
@@ -29,7 +34,6 @@ type Lease struct {
 
 type leaseKey struct {
 	transactionID TransactionID
-	table         string
 }
 
 type leaseState struct {
@@ -55,11 +59,14 @@ func (manager *Manager) Preflight(ctx context.Context, transactionID Transaction
 	if err := validateRequest(ctx, transactionID, tuple); err != nil {
 		return err
 	}
-	spec := newNFTSpec(manager.owner, transactionID, tuple)
 	scope, err := currentNamespaceScope()
 	if err != nil {
 		return errors.Join(ErrExecutionScopeChanged, err)
 	}
+	if err := manager.ensureReconciled(ctx, scope); err != nil {
+		return err
+	}
+	spec := manager.newSpec(transactionID, tuple)
 	result, runErr := manager.runScoped(ctx, scope, []string{"-c", "-f", "-"}, spec.installBatch())
 	runErr = normalizeRunError("preflight", result, runErr)
 	observation := manager.observeBounded(ctx, scope, spec)
@@ -85,11 +92,14 @@ func (manager *Manager) Install(ctx context.Context, transactionID TransactionID
 	if err := validateRequest(ctx, transactionID, tuple); err != nil {
 		return nil, err
 	}
-	spec := newNFTSpec(manager.owner, transactionID, tuple)
 	scope, err := currentNamespaceScope()
 	if err != nil {
 		return nil, errors.Join(ErrExecutionScopeChanged, err)
 	}
+	if err := manager.ensureReconciled(ctx, scope); err != nil {
+		return nil, err
+	}
+	spec := manager.newSpec(transactionID, tuple)
 	state, err := manager.reserveLease(transactionID, spec, scope)
 	if err != nil {
 		return nil, err
@@ -123,12 +133,16 @@ func (manager *Manager) Install(ctx context.Context, transactionID TransactionID
 	return lease, errors.Join(primaryErr, fmt.Errorf("%w: %w", ErrCleanupIncomplete, cleanup.err))
 }
 
+func (manager *Manager) newSpec(transactionID TransactionID, tuple Tuple) nftSpec {
+	return newNFTSpec(manager.process, manager.owner, transactionID, tuple)
+}
+
 func (manager *Manager) reserveLease(
 	transactionID TransactionID,
 	spec nftSpec,
 	scope namespaceScope,
 ) (*leaseState, error) {
-	key := leaseKey{transactionID: transactionID, table: spec.table}
+	key := leaseKey{transactionID: transactionID}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if current := manager.activeLeases[key]; current != nil {

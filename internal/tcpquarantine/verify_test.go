@@ -4,7 +4,7 @@ import "testing"
 
 func TestVerifyTableJSONAllowsMetadataButRejectsMutatedExpressions(t *testing.T) {
 	manager := mustManager(t, newScriptedRunner(t))
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	tests := []struct {
 		name    string
 		mutate  func([]any)
@@ -99,7 +99,7 @@ func TestVerifyTableJSONAllowsMetadataButRejectsMutatedExpressions(t *testing.T)
 
 func TestTablePresentInListRejectsMalformedTableObject(t *testing.T) {
 	manager := mustManager(t, newScriptedRunner(t))
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	_, err := tablePresentInList([]byte(`{"nftables":[{"table":{"family":"inet"}}]}`), spec)
 	if err == nil {
 		t.Fatalf("tablePresentInList() error = %v, want malformed enumeration error", err)
@@ -108,7 +108,7 @@ func TestTablePresentInListRejectsMalformedTableObject(t *testing.T) {
 
 func TestTablePresentInListRejectsAmbiguousObjects(t *testing.T) {
 	manager := mustManager(t, newScriptedRunner(t))
-	spec := newNFTSpec(manager.owner, testTransactionID(), testTuple())
+	spec := manager.newSpec(testTransactionID(), testTuple())
 	payload := `{"nftables":[{"table":{"family":"inet","name":"elsewhere"},"chain":{}}]}`
 	if _, err := tablePresentInList([]byte(payload), spec); err == nil {
 		t.Fatalf("tablePresentInList(%s) unexpectedly succeeded", payload)
