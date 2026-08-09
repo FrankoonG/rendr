@@ -68,7 +68,7 @@ func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transp
 		return nil, fmt.Errorf("tcp: dial returned %T, want *net.TCPConn", c)
 	}
 	_ = tc.SetKeepAlive(false)
-	return wrapOwned(tc), nil
+	return wrapOwned(tc, leafmobility.RoleDialer), nil
 }
 
 // Probe dials, captures handshake RTT, and closes. M1 placeholder;
@@ -88,15 +88,15 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 // to a PathConn. Used by the Listener side.
 func Wrap(c net.Conn) *PathConn {
 	return &PathConn{
-		c: c,
+		endpoint: newEndpointOwner(c),
 	}
 }
 
-func wrapOwned(c *net.TCPConn) *PathConn {
+func wrapOwned(c *net.TCPConn, role leafmobility.Role) *PathConn {
 	path := Wrap(c)
 	path.claim = leafmobility.MustNewClaim(leafmobility.Facts{
 		Kind:       leafmobility.KindRawTCP,
-		Role:       leafmobility.RoleDialer,
+		Role:       role,
 		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionAny,
 		Generation: leafmobility.NextGeneration(),
@@ -113,11 +113,11 @@ func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 
 // PathConn carries length-prefixed rendr frames over a single TCP socket.
 type PathConn struct {
-	c     net.Conn
-	claim *leafmobility.Claim
+	endpoint *endpointOwner
+	claim    *leafmobility.Claim
 
+	readMu  sync.Mutex // preserves partial frame state across endpoint maintenance
 	writeMu sync.Mutex // serialises framed Writes
-	readBuf [LengthPrefixSize]byte
 
 	// quality is set by the engine via SetQuality; M1 keeps it static.
 	qualityMu sync.RWMutex
@@ -132,9 +132,13 @@ type PathConn struct {
 	// sending; used by Classify on the read side.
 	quiesced atomic.Bool
 
-	deathMu  sync.Mutex
-	deathFn  func(cause transport.DeathCause, err error)
-	deathErr error
+	deathMu        sync.Mutex
+	deathFn        func(cause transport.DeathCause, err error)
+	deathErr       error
+	deathCause     transport.DeathCause
+	deathReady     bool
+	deathLocal     bool
+	deathDelivered bool
 
 	// Frame counters for diagnostics / race-mode tests.
 	writes atomic.Uint64
@@ -157,11 +161,15 @@ func (p *PathConn) Reads() uint64 { return p.reads.Load() }
 // Returning the raw socket error would leak transport state into the
 // application.
 func (p *PathConn) Read(buf []byte) (int, error) {
-	if _, err := io.ReadFull(p.c, p.readBuf[:]); err != nil {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+
+	var prefix [LengthPrefixSize]byte
+	if err := p.readFull(prefix[:]); err != nil {
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
-	n := int(binary.BigEndian.Uint16(p.readBuf[:]))
+	n := int(binary.BigEndian.Uint16(prefix[:]))
 	if n == 0 {
 		// Zero-length framed unit is a protocol error; declare death.
 		err := errors.New("tcp: zero-length frame")
@@ -178,7 +186,7 @@ func (p *PathConn) Read(buf []byte) (int, error) {
 		p.declareDeath(err)
 		return 0, net.ErrClosed
 	}
-	if _, err := io.ReadFull(p.c, buf[:n]); err != nil {
+	if err := p.readFull(buf[:n]); err != nil {
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
@@ -199,20 +207,18 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 	if p.dead.Load() {
 		return 0, net.ErrClosed
 	}
-
 	var lp [LengthPrefixSize]byte
 	binary.BigEndian.PutUint16(lp[:], uint16(len(frame)))
-	if _, err := p.c.Write(lp[:]); err != nil {
+	if err := p.writeFull(lp[:]); err != nil {
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
-	n, err := p.c.Write(frame)
-	if err != nil {
+	if err := p.writeFull(frame); err != nil {
 		p.declareDeath(err)
-		return n, p.swallow(err)
+		return 0, p.swallow(err)
 	}
 	p.writes.Add(1)
-	return n, nil
+	return len(frame), nil
 }
 
 // Close shuts the socket. After Close, Read and Write return
@@ -220,16 +226,8 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 func (p *PathConn) Close() error {
 	p.claim.RetireUnbound()
 	if p.dead.CompareAndSwap(false, true) {
-		err := p.c.Close()
-		p.deathMu.Lock()
-		p.deathErr = err
-		fn := p.deathFn
-		// Only fire callback for non-locally-initiated deaths. Local
-		// Close intentionally does not deliver OnDeath - the engine
-		// already knows it triggered the teardown.
-		p.deathFn = nil
-		p.deathMu.Unlock()
-		_ = fn
+		err := p.endpoint.close()
+		p.publishTerminal(true, err)
 		return err
 	}
 	return nil
@@ -239,10 +237,17 @@ func (p *PathConn) Close() error {
 // It intentionally does not mark the path dead: the read side may still
 // need to consume peer control frames during graceful rendr shutdown.
 func (p *PathConn) CloseWrite() error {
-	if cw, ok := p.c.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	write, err := p.endpoint.acquireWrite()
+	if err != nil {
+		return net.ErrClosed
 	}
-	return nil
+	if cw, ok := write.conn.(interface{ CloseWrite() error }); ok {
+		err = cw.CloseWrite()
+	}
+	_ = write.finish(err, err == nil)
+	return err
 }
 
 // Quality returns the most recent measurement.
@@ -262,14 +267,23 @@ func (p *PathConn) SetQuality(q transport.PathQuality) {
 
 // OnDeath registers a callback. The callback fires at most once.
 func (p *PathConn) OnDeath(fn func(cause transport.DeathCause, err error)) {
-	p.deathMu.Lock()
-	defer p.deathMu.Unlock()
-	if p.dead.Load() {
-		// Already dead; fire immediately so the engine still gets notified.
-		go fn(p.classify(p.deathErr), p.deathErr)
+	if fn == nil {
 		return
 	}
-	p.deathFn = fn
+	p.deathMu.Lock()
+	if !p.deathReady {
+		p.deathFn = fn
+		p.deathMu.Unlock()
+		return
+	}
+	if p.deathLocal || p.deathDelivered {
+		p.deathMu.Unlock()
+		return
+	}
+	p.deathDelivered = true
+	cause, err := p.deathCause, p.deathErr
+	p.deathMu.Unlock()
+	go fn(cause, err)
 }
 
 // MarkByeSeen records that an inbound BYE control frame was observed,
@@ -289,15 +303,36 @@ func (p *PathConn) declareDeath(err error) {
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}
-	_ = p.c.Close()
+	_ = p.endpoint.close()
+	p.publishTerminal(false, err)
+}
+
+func (p *PathConn) publishTerminal(local bool, err error) {
+	if !local && err == nil {
+		err = net.ErrClosed
+	}
+	cause := transport.CauseUnknown
+	if !local {
+		cause = p.classify(err)
+	}
 	p.deathMu.Lock()
+	if p.deathReady {
+		p.deathMu.Unlock()
+		return
+	}
 	p.deathErr = err
+	p.deathCause = cause
+	p.deathReady = true
+	p.deathLocal = local
 	fn := p.deathFn
 	p.deathFn = nil
-	p.deathMu.Unlock()
-	if fn != nil {
-		fn(p.classify(err), err)
+	if local || fn == nil {
+		p.deathMu.Unlock()
+		return
 	}
+	p.deathDelivered = true
+	p.deathMu.Unlock()
+	fn(cause, err)
 }
 
 // swallow converts a raw socket error into the muted Read/Write
@@ -312,16 +347,77 @@ func (p *PathConn) swallow(err error) error {
 
 // LocalAddr returns the local end of the wrapped socket.
 func (p *PathConn) LocalAddr() string {
-	if a := p.c.LocalAddr(); a != nil {
-		return a.String()
+	local, _ := p.endpoint.addresses()
+	if local != nil {
+		return local.String()
 	}
 	return ""
 }
 
 // RemoteAddr returns the remote end of the wrapped socket.
 func (p *PathConn) RemoteAddr() string {
-	if a := p.c.RemoteAddr(); a != nil {
-		return a.String()
+	_, remote := p.endpoint.addresses()
+	if remote != nil {
+		return remote.String()
 	}
 	return ""
+}
+
+func (p *PathConn) readFull(buf []byte) error {
+	for offset := 0; offset < len(buf); {
+		read, err := p.endpoint.acquireRead()
+		if err != nil {
+			return err
+		}
+		n, readErr := read.conn.Read(buf[offset:])
+		complete := n > 0 && offset+n >= len(buf)
+		interrupted := read.finish(readErr, complete)
+		if n > 0 {
+			offset += n
+		}
+		if offset == len(buf) {
+			return nil
+		}
+		if readErr != nil {
+			if interrupted {
+				continue
+			}
+			if !p.endpoint.markFailure(read.generation) {
+				continue
+			}
+			return readErr
+		}
+		if n == 0 {
+			return errors.New("tcp: endpoint read made no progress")
+		}
+	}
+	return nil
+}
+
+func (p *PathConn) writeFull(buf []byte) error {
+	for len(buf) > 0 {
+		write, err := p.endpoint.acquireWrite()
+		if err != nil {
+			return err
+		}
+		n, writeErr := write.conn.Write(buf)
+		complete := n > 0 && n >= len(buf)
+		interrupted := write.finish(writeErr, complete)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if writeErr != nil {
+			if interrupted {
+				continue
+			}
+			if !p.endpoint.markFailure(write.generation) {
+				continue
+			}
+			return writeErr
+		}
+		if n == 0 {
+			return errors.New("tcp: endpoint write made no progress")
+		}
+	}
+	return nil
 }
