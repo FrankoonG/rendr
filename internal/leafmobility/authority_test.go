@@ -26,19 +26,23 @@ func TestResourceTransactionTracksExecutionWithoutIssuingCapability(t *testing.T
 	if err := tx.MarkPrepared(plan.BaseGeneration+1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
+	copyOfTransaction := *tx
+	if err := copyOfTransaction.stageWithoutExecution(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.stageWithoutExecution(); !errors.Is(err, ErrAuthorityConsumed) {
+		t.Fatalf("second stage=%v want=%v", err, ErrAuthorityConsumed)
+	}
+	markResourceExecutionIssued(t, tx)
 	if err := tx.MarkCommitPublished(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.MarkFinalAccepted(); err != nil {
+	if err := tx.markFinalAcceptedWithoutExecution(); err != nil {
 		t.Fatal(err)
 	}
 
-	copyOfTransaction := *tx
-	if err := copyOfTransaction.consumeWithoutExecution(); err != nil {
+	if err := tx.token.markPublished(); err != nil {
 		t.Fatal(err)
-	}
-	if err := tx.consumeWithoutExecution(); !errors.Is(err, ErrAuthorityConsumed) {
-		t.Fatalf("second consume=%v want=%v", err, ErrAuthorityConsumed)
 	}
 	if err := tx.BeginResolution(ResolutionComplete); err != nil {
 		t.Fatal(err)
@@ -68,6 +72,10 @@ func TestResourceTransactionFinalRejectConsumesGenerationAndReleases(t *testing.
 	if err := tx.MarkPrepared(plan.BaseGeneration+1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
+	if err := tx.stageWithoutExecution(); err != nil {
+		t.Fatal(err)
+	}
+	markResourceExecutionIssued(t, tx)
 	if err := tx.MarkCommitPublished(); err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +136,10 @@ func TestResourceTransactionLateFinalRejectedReconcilesUnknownOutcome(t *testing
 	if err := tx.MarkPrepared(1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
+	if err := tx.stageWithoutExecution(); err != nil {
+		t.Fatal(err)
+	}
+	markResourceExecutionIssued(t, tx)
 	if err := tx.MarkCommitPublished(); err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +169,8 @@ func TestResourceTransactionLateFinalRejectedReconcilesUnknownOutcome(t *testing
 	}
 }
 
-func TestResourceTransactionLateFinalAcceptedRequiresNoExecutionRollback(t *testing.T) {
-	claim, plan := resourceTransactionFixture(t, 25*time.Millisecond)
+func TestResourceTransactionLateFinalAcceptedNeverCreatesPublishRight(t *testing.T) {
+	claim, plan := resourceTransactionFixture(t, time.Second)
 	tx, err := claim.ReserveResourceTransaction(plan)
 	if err != nil {
 		t.Fatal(err)
@@ -166,19 +178,22 @@ func TestResourceTransactionLateFinalAcceptedRequiresNoExecutionRollback(t *test
 	if err := tx.MarkPrepared(1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
+	if err := tx.stageWithoutExecution(); err != nil {
+		t.Fatal(err)
+	}
+	markResourceExecutionIssued(t, tx)
 	if err := tx.MarkCommitPublished(); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, time.Second, func() bool { return tx.State() == ResourceTransactionOutcomeUnknown })
-	if err := tx.ReconcileFinalAccepted(); err != nil {
+	if err := tx.MarkOutcomeUnknown(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.consumeWithoutExecution(); !errors.Is(err, ErrAuthorityExpired) {
-		t.Fatalf("consume after immutable deadline=%v want=%v", err, ErrAuthorityExpired)
+	if err := tx.reconcileFinalAcceptedWithoutExecution(); err != nil {
+		t.Fatal(err)
 	}
 	snapshot := tx.Snapshot()
-	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionFinalAccepted {
-		t.Fatalf("snapshot after denied consume=%+v", snapshot)
+	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionPublishAuthorized {
+		t.Fatalf("snapshot after late FINAL=%+v", snapshot)
 	}
 	if err := tx.BeginResolution(ResolutionComplete); !errors.Is(err, ErrTransactionOutcomeUnknown) {
 		t.Fatalf("no-execution complete=%v want=%v", err, ErrTransactionOutcomeUnknown)
@@ -202,9 +217,11 @@ func TestResourceTransactionLateReleasedFinishesUncertainResolution(t *testing.T
 	}
 	for _, transition := range []func() error{
 		func() error { return tx.MarkPrepared(1, plan.Deadline) },
+		tx.stageWithoutExecution,
+		func() error { markResourceExecutionIssued(t, tx); return nil },
 		tx.MarkCommitPublished,
-		tx.MarkFinalAccepted,
-		tx.consumeWithoutExecution,
+		tx.markFinalAcceptedWithoutExecution,
+		tx.token.markPublished,
 		func() error { return tx.BeginResolution(ResolutionComplete) },
 		tx.MarkOutcomeUnknown,
 	} {
@@ -233,8 +250,10 @@ func TestResourceTransactionRecoveryRejectsContradictoryEvidence(t *testing.T) {
 	}
 	for _, transition := range []func() error{
 		func() error { return tx.MarkPrepared(1, plan.Deadline) },
+		tx.stageWithoutExecution,
+		func() error { markResourceExecutionIssued(t, tx); return nil },
 		tx.MarkCommitPublished,
-		tx.MarkFinalAccepted,
+		tx.markFinalAcceptedWithoutExecution,
 		tx.MarkOutcomeUnknown,
 	} {
 		if err := transition(); err != nil {
@@ -244,11 +263,11 @@ func TestResourceTransactionRecoveryRejectsContradictoryEvidence(t *testing.T) {
 	if err := tx.ReconcileFinalRejected(); !errors.Is(err, ErrResourceTransactionState) {
 		t.Fatalf("contradictory late rejection=%v want=%v", err, ErrResourceTransactionState)
 	}
-	if err := tx.ReconcileFinalAccepted(); !errors.Is(err, ErrResourceTransactionState) {
+	if err := tx.reconcileFinalAcceptedWithoutExecution(); !errors.Is(err, ErrResourceTransactionState) {
 		t.Fatalf("duplicate recovery acceptance=%v want=%v", err, ErrResourceTransactionState)
 	}
 	snapshot := tx.Snapshot()
-	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionFinalAccepted ||
+	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionPublishAuthorized ||
 		!claimResource(claim).Snapshot().Poisoned {
 		t.Fatalf("contradictory evidence changed fail-closed state: transaction=%+v resource=%+v", snapshot, claimResource(claim).Snapshot())
 	}
@@ -287,6 +306,10 @@ func TestResourceTransactionExpiryIsFailClosedAfterCommit(t *testing.T) {
 		if err := tx.MarkPrepared(plan.BaseGeneration+1, plan.Deadline); err != nil {
 			t.Fatal(err)
 		}
+		if err := tx.stageWithoutExecution(); err != nil {
+			t.Fatal(err)
+		}
+		markResourceExecutionIssued(t, tx)
 		if err := tx.MarkCommitPublished(); err != nil {
 			t.Fatal(err)
 		}
@@ -306,19 +329,13 @@ func TestResourceTransactionExpiryIsFailClosedAfterCommit(t *testing.T) {
 	})
 }
 
-func TestResourceTransactionCopiesConsumeExactlyOnce(t *testing.T) {
+func TestResourceTransactionCopiesStageExactlyOnce(t *testing.T) {
 	claim, plan := resourceTransactionFixture(t, time.Second)
 	tx, err := claim.ReserveResourceTransaction(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.MarkPrepared(1, plan.Deadline); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.MarkCommitPublished(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.MarkFinalAccepted(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -334,7 +351,7 @@ func TestResourceTransactionCopiesConsumeExactlyOnce(t *testing.T) {
 		go func(transaction ResourceTransaction) {
 			defer wg.Done()
 			<-start
-			switch err := transaction.consumeWithoutExecution(); {
+			switch err := transaction.stageWithoutExecution(); {
 			case err == nil:
 				wins.Add(1)
 			case errors.Is(err, ErrAuthorityConsumed):
@@ -383,9 +400,11 @@ func TestResourceTransactionStateAndSnapshotAreRaceSafe(t *testing.T) {
 	}
 	for _, transition := range []func() error{
 		func() error { return tx.MarkPrepared(1, plan.Deadline.Add(-time.Millisecond)) },
+		tx.stageWithoutExecution,
+		func() error { markResourceExecutionIssued(t, tx); return nil },
 		tx.MarkCommitPublished,
-		tx.MarkFinalAccepted,
-		tx.consumeWithoutExecution,
+		tx.markFinalAcceptedWithoutExecution,
+		tx.token.markPublished,
 		func() error { return tx.BeginResolution(ResolutionComplete) },
 		func() error { return tx.FinishResolution(ResolutionComplete) },
 	} {
@@ -471,8 +490,10 @@ func TestResourceHandlePreservesGenerationAcrossClaimReplacement(t *testing.T) {
 	}
 	for _, transition := range []func() error{
 		func() error { return tx.MarkPrepared(1, firstPlan.Deadline) },
+		tx.stageWithoutExecution,
+		func() error { markResourceExecutionIssued(t, tx); return nil },
 		tx.MarkCommitPublished,
-		tx.MarkFinalAccepted,
+		tx.markFinalAcceptedWithoutExecution,
 		func() error { return tx.BeginResolution(ResolutionRolledBack) },
 		func() error { return tx.FinishResolution(ResolutionRolledBack) },
 	} {
@@ -528,17 +549,21 @@ func TestResourceTransactionRetirementIsFailClosedAfterFinalAcceptance(t *testin
 	if err := tx.MarkPrepared(1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
+	if err := tx.stageWithoutExecution(); err != nil {
+		t.Fatal(err)
+	}
+	markResourceExecutionIssued(t, tx)
 	if err := tx.MarkCommitPublished(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.MarkFinalAccepted(); err != nil {
+	if err := tx.markFinalAcceptedWithoutExecution(); err != nil {
 		t.Fatal(err)
 	}
 	if err := claim.Retire(plan.Binding); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := tx.Snapshot()
-	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionFinalAccepted {
+	if snapshot.State != ResourceTransactionOutcomeUnknown || snapshot.UnknownFrom != ResourceTransactionPublishAuthorized {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 	if err := tx.BeginResolution(ResolutionRolledBack); err != nil {
@@ -585,6 +610,24 @@ func resourceTransactionFixture(t testing.TB, lease time.Duration) (*Claim, Plan
 	claim := newTestDrivenClaim(t, resource, OperationTCPRepair, KindRawTCP, binding)
 	plan := authorityPlan(t, claim, binding, TransactionID{0xb1, 0xb2}, time.Now().Add(lease))
 	return claim, plan
+}
+
+func markResourceExecutionIssued(t testing.TB, transaction *ResourceTransaction) {
+	t.Helper()
+	if transaction == nil || transaction.token == nil {
+		t.Fatal("nil resource transaction")
+	}
+	token := transaction.token
+	token.claim.mu.Lock()
+	token.resource.mu.Lock()
+	if token.state != ResourceTransactionExecutionStaged || token.executionIssued {
+		token.resource.mu.Unlock()
+		token.claim.mu.Unlock()
+		t.Fatalf("cannot issue test execution from state=%d issued=%t", token.state, token.executionIssued)
+	}
+	token.executionIssued = true
+	token.resource.mu.Unlock()
+	token.claim.mu.Unlock()
 }
 
 func newTestDrivenClaim(t testing.TB, resource Resource, operation Operation, kind Kind, binding Binding) *Claim {

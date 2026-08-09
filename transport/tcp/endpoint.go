@@ -342,14 +342,26 @@ func (m *endpointMaintenance) Conn() net.Conn {
 // Replace atomically publishes a replacement while readers remain paused.
 // Closing the predecessor is deliberately left to the destructive driver.
 func (m *endpointMaintenance) Replace(replacement net.Conn) error {
+	return m.ReplaceContext(context.Background(), replacement)
+}
+
+// ReplaceContext checks cancellation while holding the endpoint owner lock,
+// immediately before the owner-swap linearization point.
+func (m *endpointMaintenance) ReplaceContext(ctx context.Context, replacement net.Conn) error {
 	if m == nil || m.owner == nil || replacement == nil || m.done {
 		return errEndpointStaleLease
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	o := m.owner
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed || o.failed || !o.maintenance || o.conn != m.conn || o.generation != m.generation || o.readActive || o.writeActive {
 		return errEndpointStaleLease
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	o.conn = replacement
 	o.generation++

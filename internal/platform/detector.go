@@ -62,6 +62,23 @@ func newDetector(prober prober) (*detector, error) {
 // Current returns a defensive immutable snapshot. On Linux, key acquisition,
 // probing, cleanup, and identity verification run on one locked OS thread.
 func (d *detector) Current(ctx context.Context) (KernelFeatures, error) {
+	return d.current(ctx, 0)
+}
+
+// CurrentFresh bypasses a still-valid cached snapshot when it cannot cover
+// minimumRemaining. Destructive planners use this to avoid starting a
+// transaction on evidence that will expire before one bounded recovery turn.
+func (d *detector) CurrentFresh(ctx context.Context, minimumRemaining time.Duration) (KernelFeatures, error) {
+	if minimumRemaining < 0 {
+		return KernelFeatures{}, fmt.Errorf("platform: negative minimum snapshot validity")
+	}
+	if d != nil && minimumRemaining > d.ttl {
+		minimumRemaining = d.ttl
+	}
+	return d.current(ctx, minimumRemaining)
+}
+
+func (d *detector) current(ctx context.Context, minimumRemaining time.Duration) (KernelFeatures, error) {
 	if d == nil {
 		return KernelFeatures{}, fmt.Errorf("platform: nil detector")
 	}
@@ -78,7 +95,7 @@ func (d *detector) Current(ctx context.Context) (KernelFeatures, error) {
 	unlock := lockExecutionThread()
 	defer unlock()
 	for attempt := 0; attempt < maxContextRetries; attempt++ {
-		snapshot, retry, err := d.currentOnce(ctx)
+		snapshot, retry, err := d.currentOnce(ctx, minimumRemaining)
 		if !retry {
 			return snapshot, err
 		}
@@ -86,7 +103,7 @@ func (d *detector) Current(ctx context.Context) (KernelFeatures, error) {
 	return KernelFeatures{}, ErrExecutionContextChanged
 }
 
-func (d *detector) currentOnce(ctx context.Context) (KernelFeatures, bool, error) {
+func (d *detector) currentOnce(ctx context.Context, minimumRemaining time.Duration) (KernelFeatures, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return KernelFeatures{}, false, err
 	}
@@ -104,7 +121,9 @@ func (d *detector) currentOnce(ctx context.Context) (KernelFeatures, bool, error
 	cached, ok := d.cached[identity]
 	cacheGeneration := d.generation
 	d.mu.RUnlock()
-	if ok && !now.Before(cached.probedClock) && now.Before(cached.expiresClock) {
+	minimumExpiry := now.Add(minimumRemaining)
+	if ok && !now.Before(cached.probedClock) && now.Before(cached.expiresClock) &&
+		!cached.expiresClock.Before(minimumExpiry) {
 		if err := lease.Close(); err != nil {
 			return KernelFeatures{}, false, fmt.Errorf("platform: close execution context: %w", err)
 		}

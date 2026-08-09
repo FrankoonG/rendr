@@ -214,7 +214,11 @@ func platformReferenceMatchesCurrent(ctx context.Context, reference ProbeReferen
 }
 
 func currentPlatformReference(ctx context.Context) (ProbeReference, error) {
-	snapshot, err := platform.Detect(ctx)
+	return currentPlatformReferenceFresh(ctx, 0)
+}
+
+func currentPlatformReferenceFresh(ctx context.Context, minimumRemaining time.Duration) (ProbeReference, error) {
+	snapshot, err := platform.DetectFresh(ctx, minimumRemaining)
 	if err != nil {
 		return ProbeReference{}, err
 	}
@@ -826,7 +830,14 @@ func invokeDriverPreflight(
 		return PreflightRequest{}, nil, PreflightResult{}, fmt.Errorf("%w: execution context unavailable: %v", ErrInvalidDriver, err)
 	}
 	preflight = PreflightRequest{PlanRequest: request, Facts: facts, ContextDigest: contextDigest}
-	platformProbe, platformErr := currentPlatformReference(ctx)
+	minimumPlatformValidity := request.Deadline.Sub(time.Now())
+	if minimumPlatformValidity > time.Second {
+		minimumPlatformValidity = time.Second
+	}
+	if minimumPlatformValidity < 0 {
+		minimumPlatformValidity = 0
+	}
+	platformProbe, platformErr := currentPlatformReferenceFresh(ctx, minimumPlatformValidity)
 	if platformErr != nil || platformProbe.ContextDigest != contextDigest {
 		return PreflightRequest{}, nil, PreflightResult{}, fmt.Errorf("%w: platform evidence unavailable: %v", ErrInvalidDriver, platformErr)
 	}
@@ -1109,8 +1120,8 @@ const planCanonicalSize = 696
 
 func digestPlan(plan Plan) LocalPlanDigest {
 	wire := make([]byte, planCanonicalSize)
-	copy(wire[0:4], "RLM2")
-	wire[4] = 2
+	copy(wire[0:4], "RLM3")
+	wire[4] = 3
 	wire[5] = byte(plan.Direction)
 	wire[6] = byte(plan.Session)
 	wire[7] = byte(plan.Operation)

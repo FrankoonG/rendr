@@ -61,12 +61,17 @@ type fakeDriverTransaction struct {
 
 func (t *fakeDriverTransaction) Evidence() AttemptEvidence { return t.evidence }
 
-func (*fakeDriverTransaction) Prepare(context.Context, ExecutionRequest) error    { return nil }
-func (*fakeDriverTransaction) Cutover(context.Context, ExecutionRequest) error    { return nil }
-func (*fakeDriverTransaction) Commit(context.Context, ExecutionRequest) error     { return nil }
-func (*fakeDriverTransaction) Rollback(context.Context, ExecutionRequest) error   { return nil }
-func (*fakeDriverTransaction) FailClosed(context.Context, ExecutionRequest) error { return nil }
-func (*fakeDriverTransaction) EndpointGenerationChanged() bool                    { return false }
+func (*fakeDriverTransaction) Prepare(context.Context, ExecutionRequest) error { return nil }
+func (*fakeDriverTransaction) Stage(context.Context, ExecutionRequest) (PublicationEvidence, error) {
+	return PublicationEvidence{Digest: EvidenceDigest{0x51}}, nil
+}
+func (*fakeDriverTransaction) Publish(context.Context, ExecutionRequest) error  { return nil }
+func (*fakeDriverTransaction) Activate(context.Context, ExecutionRequest) error { return nil }
+func (*fakeDriverTransaction) Rollback(context.Context, ExecutionRequest) error { return nil }
+func (*fakeDriverTransaction) FailClosed(context.Context, ExecutionRequest) error {
+	return nil
+}
+func (*fakeDriverTransaction) EndpointGenerationChanged() bool { return false }
 
 func TestNewDrivenClaimDerivesOperationFromDriver(t *testing.T) {
 	tests := []struct {
@@ -525,7 +530,7 @@ func TestPlanDigestCanonicalGolden(t *testing.T) {
 		),
 	}
 	plan.LocalDigest = digestPlan(plan)
-	const want = "7d757e7922fd41a359064983164037476593170a94a6c0b4f8357e8732f605c7"
+	const want = "de97881035019034826f77bbce98e69d29bfc0692ba55dc20e3d7ab1bd00282e"
 	if got := hex.EncodeToString(plan.LocalDigest[:]); got != want {
 		t.Fatalf("plan digest=%s want=%s", got, want)
 	}

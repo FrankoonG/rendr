@@ -28,8 +28,8 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 11 {
-		t.Fatalf("protocol minor=%d want=11", ProtocolMinor)
+	if ProtocolMinor != 12 {
+		t.Fatalf("protocol minor=%d want=12", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")

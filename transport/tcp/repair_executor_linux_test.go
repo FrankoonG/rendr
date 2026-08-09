@@ -230,6 +230,9 @@ func TestRepairNamespaceExecutorRestoreFailureTerminatesClosed(t *testing.T) {
 	if err := executor.Close(context.Background()); !errors.Is(err, restoreFailure) {
 		t.Fatalf("Close = %v, want restore failure", err)
 	}
+	if !executor.Closed() {
+		t.Fatal("executor did not prove worker termination after restore failure")
+	}
 	if err := executor.Do(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errRepairExecutorClosed) {
 		t.Fatalf("Do after failed restore = %v, want closed", err)
 	}

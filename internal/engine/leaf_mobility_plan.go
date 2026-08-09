@@ -80,5 +80,10 @@ func (e *Engine) PlanLeafMobilityCandidate(
 	if !currentOK {
 		return leafmobility.Plan{}, fmt.Errorf("%w: path changed during planning", ErrStalePathRef)
 	}
+	if plan.Operation != 0 {
+		if _, err := e.leafMobilityControlRoutes(ref); err != nil {
+			return leafmobility.Plan{}, err
+		}
+	}
 	return plan, nil
 }

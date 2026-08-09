@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"testing"
@@ -9,23 +10,23 @@ import (
 
 func testLeafMobilityPeerPlanBinding() LeafMobilityPeerPlanBinding {
 	return LeafMobilityPeerPlanBinding{
-		CoordinatorSide: LeafMobilityActorClient,
-		ActorSide:       LeafMobilityActorClient,
-		Direction:       SenderDirectionClientToServer,
-		SessionKind:     LeafMobilitySessionStream,
-		Operation:       LeafMobilityOperationTCPRepair,
-		Fallback:        LeafMobilityFallbackRedialAttach,
-		LeaseMillis:     LeafMobilityPeerPlanMaxLeaseMillis,
-		SessionEpoch:    SessionEpoch{0x11, 0x12},
-		TransactionID:   [16]byte{0x21, 0x22},
-		ClientGraph:     GraphBinding{Revision: 3, Digest: GraphDigest{0x31, 0x32}},
-		ServerGraph:     GraphBinding{Revision: 4, Digest: GraphDigest{0x41, 0x42}},
-		ClientTargetID:  TargetID{0x51, 0x52},
-		ServerTargetID:  TargetID{0x61, 0x62},
-		BaseGeneration:  7,
-		ResourceScope:   LeafMobilityResourceEndpoint,
-		ResourceID:      LeafMobilityResourceID{0x63, 0x64},
-		RouteGeneration: 9,
+		CoordinatorSide:        LeafMobilityActorClient,
+		ActorSide:              LeafMobilityActorClient,
+		Direction:              SenderDirectionClientToServer,
+		SessionKind:            LeafMobilitySessionStream,
+		Operation:              LeafMobilityOperationTCPRepair,
+		Fallback:               LeafMobilityFallbackRedialAttach,
+		LeaseMillis:            LeafMobilityPeerPlanMaxLeaseMillis,
+		SessionEpoch:           SessionEpoch{0x11, 0x12},
+		TransactionID:          [16]byte{0x21, 0x22},
+		ClientGraph:            GraphBinding{Revision: 3, Digest: GraphDigest{0x31, 0x32}},
+		ServerGraph:            GraphBinding{Revision: 4, Digest: GraphDigest{0x41, 0x42}},
+		SubjectClientTargetID:  TargetID{0x51, 0x52},
+		SubjectServerTargetID:  TargetID{0x61, 0x62},
+		BaseGeneration:         7,
+		ResourceScope:          LeafMobilityResourceEndpoint,
+		ResourceID:             LeafMobilityResourceID{0x63, 0x64},
+		SubjectRouteGeneration: 9,
 	}
 }
 
@@ -94,6 +95,7 @@ func testLeafMobilityPeerPlanCommitForAck(ack LeafMobilityPeerPlanAck) LeafMobil
 		PeerPlanDigest:              ack.PeerPlanDigest,
 		AgreementDigest:             ack.AgreementDigest,
 		ReservationID:               ack.ReservationID,
+		PublicationDigest:           LeafMobilityPublicationDigest{0xa1, 0xa2},
 	}
 }
 
@@ -141,6 +143,7 @@ func TestLeafMobilityPeerPlanRoundTripAndAgreement(t *testing.T) {
 	final.Phase = LeafMobilityPeerPlanAckPhaseFinal
 	final.Stage = LeafMobilityPeerPlanCommitStageCommit
 	final.CurrentGeneration = final.Generation
+	final.PublicationDigest = commit.PublicationDigest
 	finalWire, err := final.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +165,7 @@ func TestLeafMobilityExecutionResolutionRoundTrip(t *testing.T) {
 	final.Phase = LeafMobilityPeerPlanAckPhaseFinal
 	final.Stage = LeafMobilityPeerPlanCommitStageCommit
 	final.CurrentGeneration = final.Generation
+	final.PublicationDigest = commit.PublicationDigest
 	if err := final.ValidateForCommit(commit); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +178,9 @@ func TestLeafMobilityExecutionResolutionRoundTrip(t *testing.T) {
 		t.Run(fmt.Sprintf("stage-%d", stage), func(t *testing.T) {
 			resolution := commit
 			resolution.Stage = stage
+			if stage == LeafMobilityPeerPlanCommitStageAbort {
+				resolution.PublicationDigest = LeafMobilityPublicationDigest{}
+			}
 			wire, err := resolution.Encode()
 			if err != nil {
 				t.Fatal(err)
@@ -185,11 +192,17 @@ func TestLeafMobilityExecutionResolutionRoundTrip(t *testing.T) {
 			if err := decoded.ValidateForPrepared(prepare, prepared); err != nil {
 				t.Fatal(err)
 			}
+			if stage != LeafMobilityPeerPlanCommitStageAbort {
+				if err := decoded.ValidateForCommit(commit); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			released := prepared
 			released.Phase = LeafMobilityPeerPlanAckPhaseReleased
 			released.Stage = stage
 			released.CurrentGeneration = released.Generation
+			released.PublicationDigest = resolution.PublicationDigest
 			ackWire, err := released.Encode()
 			if err != nil {
 				t.Fatal(err)
@@ -204,11 +217,71 @@ func TestLeafMobilityExecutionResolutionRoundTrip(t *testing.T) {
 		})
 	}
 
+	preCommitRollback := commit
+	preCommitRollback.Stage = LeafMobilityPeerPlanCommitStageRolledBack
+	preCommitRollback.PublicationDigest = LeafMobilityPublicationDigest{}
+	if _, err := preCommitRollback.Encode(); err != nil {
+		t.Fatalf("pre-COMMIT rollback with zero publication digest: %v", err)
+	}
+
 	wrong := final
 	wrong.Phase = LeafMobilityPeerPlanAckPhaseReleased
 	wrong.Stage = LeafMobilityPeerPlanCommitStageComplete
 	if err := wrong.ValidateForCommit(commit); err == nil {
 		t.Fatal("RELEASED receipt authorized the COMMIT stage")
+	}
+}
+
+func TestLeafMobilityPublicationDigestStageRules(t *testing.T) {
+	prepared := testLeafMobilityPeerPlanPreparedAck(t)
+	prepared.PublicationDigest = LeafMobilityPublicationDigest{1}
+	if _, err := prepared.Encode(); err == nil {
+		t.Fatal("PREPARED encoded a publication digest")
+	}
+
+	commit := testLeafMobilityPeerPlanCommit(t)
+	for _, stage := range []LeafMobilityPeerPlanCommitStage{
+		LeafMobilityPeerPlanCommitStageCommit,
+		LeafMobilityPeerPlanCommitStageComplete,
+	} {
+		withoutDigest := commit
+		withoutDigest.Stage = stage
+		withoutDigest.PublicationDigest = LeafMobilityPublicationDigest{}
+		if _, err := withoutDigest.Encode(); err == nil {
+			t.Fatalf("stage %d encoded a zero publication digest", stage)
+		}
+	}
+
+	abort := commit
+	abort.Stage = LeafMobilityPeerPlanCommitStageAbort
+	if _, err := abort.Encode(); err == nil {
+		t.Fatal("ABORT encoded a publication digest")
+	}
+	abort.PublicationDigest = LeafMobilityPublicationDigest{}
+	if _, err := abort.Encode(); err != nil {
+		t.Fatalf("ABORT rejected a zero publication digest: %v", err)
+	}
+
+	for name, digest := range map[string]LeafMobilityPublicationDigest{
+		"pre-commit":  {},
+		"post-commit": commit.PublicationDigest,
+	} {
+		t.Run("rollback-"+name, func(t *testing.T) {
+			rollback := commit
+			rollback.Stage = LeafMobilityPeerPlanCommitStageRolledBack
+			rollback.PublicationDigest = digest
+			if _, err := rollback.Encode(); err != nil {
+				t.Fatalf("ROLLED_BACK rejected valid publication digest: %v", err)
+			}
+		})
+	}
+
+	final := testLeafMobilityPeerPlanPreparedAck(t)
+	final.Phase = LeafMobilityPeerPlanAckPhaseFinal
+	final.Stage = LeafMobilityPeerPlanCommitStageCommit
+	final.CurrentGeneration = final.Generation
+	if _, err := final.Encode(); err == nil {
+		t.Fatal("FINAL encoded a zero publication digest")
 	}
 }
 
@@ -268,8 +341,9 @@ func TestLeafMobilityProposalDigestBindsEverySemanticField(t *testing.T) {
 		{name: "client graph", right: func(p *LeafMobilityPeerPlanPrepare) { p.ClientGraph.Digest[2] ^= 0xff }},
 		{name: "server revision", right: func(p *LeafMobilityPeerPlanPrepare) { p.ServerGraph.Revision++ }},
 		{name: "server graph", right: func(p *LeafMobilityPeerPlanPrepare) { p.ServerGraph.Digest[2] ^= 0xff }},
-		{name: "client target", right: func(p *LeafMobilityPeerPlanPrepare) { p.ClientTargetID[2] ^= 0xff }},
-		{name: "server target", right: func(p *LeafMobilityPeerPlanPrepare) { p.ServerTargetID[2] ^= 0xff }},
+		{name: "subject client target", right: func(p *LeafMobilityPeerPlanPrepare) { p.SubjectClientTargetID[2] ^= 0xff }},
+		{name: "subject server target", right: func(p *LeafMobilityPeerPlanPrepare) { p.SubjectServerTargetID[2] ^= 0xff }},
+		{name: "subject route generation", right: func(p *LeafMobilityPeerPlanPrepare) { p.SubjectRouteGeneration++ }},
 		{name: "base generation", right: func(p *LeafMobilityPeerPlanPrepare) { p.BaseGeneration++ }},
 		{name: "resource scope", right: func(p *LeafMobilityPeerPlanPrepare) { p.ResourceScope = LeafMobilityResourceSharedLink }},
 		{name: "resource id", right: func(p *LeafMobilityPeerPlanPrepare) { p.ResourceID[2] ^= 0xff }},
@@ -466,29 +540,29 @@ func TestLeafMobilityPeerPlanRejectsUnsupportedV1Semantics(t *testing.T) {
 func TestLeafMobilityPeerPlanCanonicalizesClientAndServerViews(t *testing.T) {
 	want := testLeafMobilityPeerPlanBinding()
 	clientView := LeafMobilityPeerPlanView{
-		LocalSide:       LeafMobilityActorClient,
-		CoordinatorSide: want.CoordinatorSide,
-		ActorSide:       want.ActorSide,
-		Direction:       want.Direction,
-		SessionKind:     want.SessionKind,
-		Operation:       want.Operation,
-		Fallback:        want.Fallback,
-		LeaseMillis:     want.LeaseMillis,
-		SessionEpoch:    want.SessionEpoch,
-		TransactionID:   want.TransactionID,
-		LocalGraph:      want.ClientGraph,
-		PeerGraph:       want.ServerGraph,
-		LocalTargetID:   want.ClientTargetID,
-		PeerTargetID:    want.ServerTargetID,
-		BaseGeneration:  want.BaseGeneration,
-		ResourceScope:   want.ResourceScope,
-		ResourceID:      want.ResourceID,
-		RouteGeneration: want.RouteGeneration,
+		LocalSide:              LeafMobilityActorClient,
+		CoordinatorSide:        want.CoordinatorSide,
+		ActorSide:              want.ActorSide,
+		Direction:              want.Direction,
+		SessionKind:            want.SessionKind,
+		Operation:              want.Operation,
+		Fallback:               want.Fallback,
+		LeaseMillis:            want.LeaseMillis,
+		SessionEpoch:           want.SessionEpoch,
+		TransactionID:          want.TransactionID,
+		LocalGraph:             want.ClientGraph,
+		PeerGraph:              want.ServerGraph,
+		LocalTargetID:          want.SubjectClientTargetID,
+		PeerTargetID:           want.SubjectServerTargetID,
+		BaseGeneration:         want.BaseGeneration,
+		ResourceScope:          want.ResourceScope,
+		ResourceID:             want.ResourceID,
+		SubjectRouteGeneration: want.SubjectRouteGeneration,
 	}
 	serverView := clientView
 	serverView.LocalSide = LeafMobilityActorServer
 	serverView.LocalGraph, serverView.PeerGraph = want.ServerGraph, want.ClientGraph
-	serverView.LocalTargetID, serverView.PeerTargetID = want.ServerTargetID, want.ClientTargetID
+	serverView.LocalTargetID, serverView.PeerTargetID = want.SubjectServerTargetID, want.SubjectClientTargetID
 	clientBinding, err := clientView.CanonicalBinding()
 	if err != nil {
 		t.Fatal(err)
@@ -507,6 +581,22 @@ func TestLeafMobilityPeerPlanCanonicalizesClientAndServerViews(t *testing.T) {
 	}
 	if clientBinding.LeaseKey() != serverBinding.LeaseKey() {
 		t.Fatal("client/server lease keys differ")
+	}
+}
+
+func TestLeafMobilitySubjectBindingOffsetsStayStable(t *testing.T) {
+	binding := testLeafMobilityPeerPlanBinding()
+	wire, err := encodeLeafMobilityPeerPlanBinding(binding, leafMobilityPeerPlanMessagePrepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != 200 {
+		t.Fatalf("binding size=%d want=200", len(wire))
+	}
+	if !bytes.Equal(wire[128:144], binding.SubjectClientTargetID[:]) ||
+		!bytes.Equal(wire[144:160], binding.SubjectServerTargetID[:]) ||
+		binary.BigEndian.Uint64(wire[192:200]) != binding.SubjectRouteGeneration {
+		t.Fatal("subject binding offsets drifted")
 	}
 }
 
@@ -615,9 +705,11 @@ func TestLeafMobilityPeerPlanStrictDecode(t *testing.T) {
 		{"ACK short", ack[:LeafMobilityPeerPlanAckHeaderSize-1], func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanAck(b); return err }},
 		{"ACK trailing", append(append([]byte(nil), ack...), 0), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanAck(b); return err }},
 		{"ACK phase reserved", mutateLeafMobilityWire(ack, LeafMobilityPeerPlanBindingSize+2), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanAck(b); return err }},
+		{"ACK reserved byte", mutateLeafMobilityWire(ack, LeafMobilityPeerPlanBindingSize+3), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanAck(b); return err }},
 		{"ACK tail reserved", mutateLeafMobilityWire(ack, LeafMobilityPeerPlanBindingSize+154), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanAck(b); return err }},
 		{"commit short", commit[:len(commit)-1], func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanCommit(b); return err }},
 		{"commit trailing", append(append([]byte(nil), commit...), 0), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanCommit(b); return err }},
+		{"commit reserved byte", mutateLeafMobilityWire(commit, LeafMobilityPeerPlanBindingSize+137), func(b []byte) error { _, err := DecodeLeafMobilityPeerPlanCommit(b); return err }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -648,6 +740,7 @@ func TestLeafMobilityPeerPlanCrossPhaseMutationRejected(t *testing.T) {
 	final.Phase = LeafMobilityPeerPlanAckPhaseFinal
 	final.Stage = LeafMobilityPeerPlanCommitStageCommit
 	final.CurrentGeneration = final.Generation
+	final.PublicationDigest = commit.PublicationDigest
 
 	changedAck := prepared
 	changedAck.ActorEndpointGeneration++
@@ -668,6 +761,20 @@ func TestLeafMobilityPeerPlanCrossPhaseMutationRejected(t *testing.T) {
 	changedFinal.PeerEndpointGeneration++
 	if err := changedFinal.ValidateForCommit(commit); err == nil {
 		t.Fatal("mutated final ACK matched commit")
+	}
+	changedPublication := final
+	changedPublication.PublicationDigest[0] ^= 0xff
+	if err := changedPublication.ValidateForCommit(commit); err == nil {
+		t.Fatal("cross-phase publication digest mismatch matched commit")
+	}
+	complete := commit
+	complete.Stage = LeafMobilityPeerPlanCommitStageComplete
+	if err := complete.ValidateForCommit(commit); err != nil {
+		t.Fatalf("matching COMPLETE did not correlate with COMMIT: %v", err)
+	}
+	complete.PublicationDigest[0] ^= 0xff
+	if err := complete.ValidateForCommit(commit); err == nil {
+		t.Fatal("COMPLETE publication digest mismatch matched COMMIT")
 	}
 	if err := final.ValidateForPrepare(prepare); err == nil {
 		t.Fatal("final ACK was accepted as prepared ACK")
@@ -782,6 +889,7 @@ func TestLeafMobilityFinalRejectedAckGenerationAndCorrelation(t *testing.T) {
 	finalReject.Stage = LeafMobilityPeerPlanCommitStageCommit
 	finalReject.Code = LeafMobilityPeerPlanAckCodeSuperseded
 	finalReject.CurrentGeneration = finalReject.Generation
+	finalReject.PublicationDigest = commit.PublicationDigest
 	finalReject.Reason = "actor path retired before authority publication"
 
 	wire, err := finalReject.Encode()
@@ -829,8 +937,8 @@ func TestLeafMobilityPeerPlanWireStability(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepared := testLeafMobilityPeerPlanPreparedAck(t)
-	const wantProposal = "878123722a1f117d180e801dc60c60110f0416693852dbb31a929d7ade9bd1f7"
-	const wantAgreement = "feb0c529b9c4aa9e78355253e392e9eb0c23db0e08e67795b92ac930b3cd2789"
+	const wantProposal = "a57eb7a88b2f87fef425f815b60446bd7d84f14ad4480ff40b8b53c27ac80392"
+	const wantAgreement = "791b1ffd685bb3105625a9278cb194ffa5fe03f3373f671ae9dd29a1c62f857e"
 	if got := hex.EncodeToString(proposal[:]); got != wantProposal {
 		t.Fatalf("proposal digest=%s want=%s", got, wantProposal)
 	}
@@ -838,7 +946,7 @@ func TestLeafMobilityPeerPlanWireStability(t *testing.T) {
 		t.Fatalf("agreement digest=%s want=%s", got, wantAgreement)
 	}
 	if LeafMobilityPeerPlanBindingSize != 200 || LeafMobilityPeerPlanPrepareSize != 240 ||
-		LeafMobilityPeerPlanAckHeaderSize != 360 || LeafMobilityPeerPlanCommitSize != 344 {
+		LeafMobilityPeerPlanAckHeaderSize != 392 || LeafMobilityPeerPlanCommitSize != 376 {
 		t.Fatal("leaf mobility peer-plan wire sizes drifted")
 	}
 }

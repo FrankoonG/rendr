@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,7 +26,12 @@ type enginePlanDriver struct {
 	prepareCalls    atomic.Int32
 	cutoverCalls    atomic.Int32
 	commitCalls     atomic.Int32
+	activateCalls   atomic.Int32
+	activateErr     error
 	rollbackCalls   atomic.Int32
+	evidenceEntered chan struct{}
+	evidenceRelease chan struct{}
+	evidenceOnce    sync.Once
 }
 
 func (d *enginePlanDriver) Operation() leafmobility.Operation { return d.operation }
@@ -77,17 +83,25 @@ type enginePlanDriverTransaction struct {
 	evidence leafmobility.AttemptEvidence
 }
 
-func (t *enginePlanDriverTransaction) Evidence() leafmobility.AttemptEvidence { return t.evidence }
+func (t *enginePlanDriverTransaction) Evidence() leafmobility.AttemptEvidence {
+	if t.driver.evidenceEntered != nil {
+		t.driver.evidenceOnce.Do(func() { close(t.driver.evidenceEntered) })
+	}
+	if t.driver.evidenceRelease != nil {
+		<-t.driver.evidenceRelease
+	}
+	return t.evidence
+}
 
 func (t *enginePlanDriverTransaction) Prepare(context.Context, leafmobility.ExecutionRequest) error {
 	t.driver.prepareCalls.Add(1)
 	return nil
 }
-func (t *enginePlanDriverTransaction) Cutover(context.Context, leafmobility.ExecutionRequest) error {
+func (t *enginePlanDriverTransaction) Stage(context.Context, leafmobility.ExecutionRequest) (leafmobility.PublicationEvidence, error) {
 	t.driver.cutoverCalls.Add(1)
-	return nil
+	return leafmobility.PublicationEvidence{Digest: leafmobility.EvidenceDigest{0x71}}, nil
 }
-func (t *enginePlanDriverTransaction) Commit(ctx context.Context, _ leafmobility.ExecutionRequest) error {
+func (t *enginePlanDriverTransaction) Publish(ctx context.Context, _ leafmobility.ExecutionRequest) error {
 	t.driver.commitCalls.Add(1)
 	if t.driver.commitEntered != nil {
 		select {
@@ -104,6 +118,10 @@ func (t *enginePlanDriverTransaction) Commit(ctx context.Context, _ leafmobility
 		}
 	}
 	return nil
+}
+func (t *enginePlanDriverTransaction) Activate(context.Context, leafmobility.ExecutionRequest) error {
+	t.driver.activateCalls.Add(1)
+	return t.driver.activateErr
 }
 func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobility.ExecutionRequest) error {
 	t.driver.rollbackCalls.Add(1)
@@ -274,8 +292,9 @@ func TestLogicalPathDepartureInvalidatesPublishedCandidateBeforeCleanup(t *testi
 func engineWithPlannableLeaf(t *testing.T, claim *leafmobility.Claim, local leafmobility.Capability, peer proto.LeafMobilitySet) (*Engine, PathRef) {
 	t.Helper()
 	manifest, ids := runtimeGraph(t,
-		runtimeNode(proto.GraphNodeKindSelector, "root", "a"),
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "control"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "control"),
 	)
 	flow := NewClientFlowID()
 	e := New(SideClient, flow, Limits{}.Clamp())
@@ -303,6 +322,13 @@ func engineWithPlannableLeaf(t *testing.T, claim *leafmobility.Claim, local leaf
 	ref, ok := e.PathRef(id)
 	if !ok {
 		t.Fatal("missing path ref")
+	}
+	control, controlRemote := newMemoryPathPair()
+	t.Cleanup(func() { _ = controlRemote.Close() })
+	if _, err := e.AttachPathBound(control, transport.PathSpec{Transport: "memory"}, PathBinding{
+		LocalTXTargetID: ids["control"], PeerTXTargetID: ids["control"],
+	}); err != nil {
+		t.Fatal(err)
 	}
 	return e, ref
 }

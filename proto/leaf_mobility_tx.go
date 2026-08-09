@@ -8,15 +8,15 @@ import (
 )
 
 const (
-	LeafMobilityPeerPlanWireVersion    uint8 = 2
+	LeafMobilityPeerPlanWireVersion    uint8 = 3
 	LeafMobilityPeerPlanMaxReasonBytes       = 512
 	LeafMobilityPeerPlanMaxLeaseMillis       = 90_000
 
 	LeafMobilityPeerPlanBindingSize   = 200
 	LeafMobilityPeerPlanPrepareSize   = 240
-	LeafMobilityPeerPlanAckHeaderSize = 360
+	LeafMobilityPeerPlanAckHeaderSize = 392
 	LeafMobilityPeerPlanAckMaxSize    = LeafMobilityPeerPlanAckHeaderSize + LeafMobilityPeerPlanMaxReasonBytes
-	LeafMobilityPeerPlanCommitSize    = 344
+	LeafMobilityPeerPlanCommitSize    = 376
 )
 
 var leafMobilityPeerPlanMagic = [4]byte{'R', 'L', 'T', 'X'}
@@ -112,6 +112,7 @@ type LeafMobilityPlanDigest [32]byte
 type LeafMobilityProposalDigest [32]byte
 type LeafMobilityPeerDigest [32]byte
 type LeafMobilityAgreementDigest [32]byte
+type LeafMobilityPublicationDigest [32]byte
 type LeafMobilityReservationID [16]byte
 
 // LeafMobilityPeerPlanBinding is canonical from the client/server viewpoint.
@@ -129,12 +130,14 @@ type LeafMobilityPeerPlanBinding struct {
 	TransactionID   [16]byte
 	ClientGraph     GraphBinding
 	ServerGraph     GraphBinding
-	ClientTargetID  TargetID
-	ServerTargetID  TargetID
-	BaseGeneration  uint64
-	ResourceScope   LeafMobilityResourceScope
-	ResourceID      LeafMobilityResourceID
-	RouteGeneration uint64
+	// Subject fields identify the leaf being migrated. They never describe the
+	// OOB control route, which may replay this transaction on any session path.
+	SubjectClientTargetID  TargetID
+	SubjectServerTargetID  TargetID
+	BaseGeneration         uint64
+	ResourceScope          LeafMobilityResourceScope
+	ResourceID             LeafMobilityResourceID
+	SubjectRouteGeneration uint64
 }
 
 func (b LeafMobilityPeerPlanBinding) Validate() error {
@@ -185,8 +188,8 @@ func (b LeafMobilityPeerPlanBinding) Validate() error {
 			return fmt.Errorf("proto: leaf mobility peer plan has invalid %s graph binding", name)
 		}
 	}
-	if b.ClientTargetID == (TargetID{}) || b.ServerTargetID == (TargetID{}) {
-		return fmt.Errorf("proto: leaf mobility peer plan has zero client or server target id")
+	if b.SubjectClientTargetID == (TargetID{}) || b.SubjectServerTargetID == (TargetID{}) {
+		return fmt.Errorf("proto: leaf mobility peer plan has zero subject client or server target id")
 	}
 	if b.BaseGeneration == ^uint64(0) {
 		return fmt.Errorf("proto: leaf mobility peer plan generation cannot advance")
@@ -194,8 +197,8 @@ func (b LeafMobilityPeerPlanBinding) Validate() error {
 	if !b.ResourceScope.Valid() || b.ResourceID == (LeafMobilityResourceID{}) {
 		return fmt.Errorf("proto: leaf mobility peer plan has invalid resource identity")
 	}
-	if b.RouteGeneration == 0 {
-		return fmt.Errorf("proto: leaf mobility peer plan has zero route generation")
+	if b.SubjectRouteGeneration == 0 {
+		return fmt.Errorf("proto: leaf mobility peer plan has zero subject route generation")
 	}
 	return nil
 }
@@ -204,49 +207,49 @@ func (b LeafMobilityPeerPlanBinding) Validate() error {
 // client/server canonical wire order. LeaseMillis creates a local deadline
 // only on the first observation of LeaseKey; replay must never refresh it.
 type LeafMobilityPeerPlanView struct {
-	LocalSide       LeafMobilityActorSide
-	CoordinatorSide LeafMobilityActorSide
-	ActorSide       LeafMobilityActorSide
-	Direction       SenderDirection
-	SessionKind     LeafMobilitySessionKind
-	Operation       LeafMobilityOperation
-	Fallback        LeafMobilityFallback
-	LeaseMillis     uint32
-	SessionEpoch    SessionEpoch
-	TransactionID   [16]byte
-	LocalGraph      GraphBinding
-	PeerGraph       GraphBinding
-	LocalTargetID   TargetID
-	PeerTargetID    TargetID
-	BaseGeneration  uint64
-	ResourceScope   LeafMobilityResourceScope
-	ResourceID      LeafMobilityResourceID
-	RouteGeneration uint64
+	LocalSide              LeafMobilityActorSide
+	CoordinatorSide        LeafMobilityActorSide
+	ActorSide              LeafMobilityActorSide
+	Direction              SenderDirection
+	SessionKind            LeafMobilitySessionKind
+	Operation              LeafMobilityOperation
+	Fallback               LeafMobilityFallback
+	LeaseMillis            uint32
+	SessionEpoch           SessionEpoch
+	TransactionID          [16]byte
+	LocalGraph             GraphBinding
+	PeerGraph              GraphBinding
+	LocalTargetID          TargetID
+	PeerTargetID           TargetID
+	BaseGeneration         uint64
+	ResourceScope          LeafMobilityResourceScope
+	ResourceID             LeafMobilityResourceID
+	SubjectRouteGeneration uint64
 }
 
 func (v LeafMobilityPeerPlanView) CanonicalBinding() (LeafMobilityPeerPlanBinding, error) {
 	binding := LeafMobilityPeerPlanBinding{
-		CoordinatorSide: v.CoordinatorSide,
-		ActorSide:       v.ActorSide,
-		Direction:       v.Direction,
-		SessionKind:     v.SessionKind,
-		Operation:       v.Operation,
-		Fallback:        v.Fallback,
-		LeaseMillis:     v.LeaseMillis,
-		SessionEpoch:    v.SessionEpoch,
-		TransactionID:   v.TransactionID,
-		BaseGeneration:  v.BaseGeneration,
-		ResourceScope:   v.ResourceScope,
-		ResourceID:      v.ResourceID,
-		RouteGeneration: v.RouteGeneration,
+		CoordinatorSide:        v.CoordinatorSide,
+		ActorSide:              v.ActorSide,
+		Direction:              v.Direction,
+		SessionKind:            v.SessionKind,
+		Operation:              v.Operation,
+		Fallback:               v.Fallback,
+		LeaseMillis:            v.LeaseMillis,
+		SessionEpoch:           v.SessionEpoch,
+		TransactionID:          v.TransactionID,
+		BaseGeneration:         v.BaseGeneration,
+		ResourceScope:          v.ResourceScope,
+		ResourceID:             v.ResourceID,
+		SubjectRouteGeneration: v.SubjectRouteGeneration,
 	}
 	switch v.LocalSide {
 	case LeafMobilityActorClient:
 		binding.ClientGraph, binding.ServerGraph = v.LocalGraph, v.PeerGraph
-		binding.ClientTargetID, binding.ServerTargetID = v.LocalTargetID, v.PeerTargetID
+		binding.SubjectClientTargetID, binding.SubjectServerTargetID = v.LocalTargetID, v.PeerTargetID
 	case LeafMobilityActorServer:
 		binding.ClientGraph, binding.ServerGraph = v.PeerGraph, v.LocalGraph
-		binding.ClientTargetID, binding.ServerTargetID = v.PeerTargetID, v.LocalTargetID
+		binding.SubjectClientTargetID, binding.SubjectServerTargetID = v.PeerTargetID, v.LocalTargetID
 	default:
 		return LeafMobilityPeerPlanBinding{}, fmt.Errorf("proto: leaf mobility peer-plan view has invalid local side %d", v.LocalSide)
 	}
@@ -333,7 +336,7 @@ func (p LeafMobilityPeerPlanPrepare) ProposalDigest() (LeafMobilityProposalDiges
 		return LeafMobilityProposalDigest{}, err
 	}
 	h := sha256.New()
-	h.Write([]byte("rendr-leaf-mobility-proposal-v2\x00"))
+	h.Write([]byte("rendr-leaf-mobility-proposal-v3\x00"))
 	h.Write(wire)
 	var digest LeafMobilityProposalDigest
 	copy(digest[:], h.Sum(nil))
@@ -399,6 +402,7 @@ type LeafMobilityPeerPlanAck struct {
 	PeerPlanDigest          LeafMobilityPeerDigest
 	AgreementDigest         LeafMobilityAgreementDigest
 	ReservationID           LeafMobilityReservationID
+	PublicationDigest       LeafMobilityPublicationDigest
 	Reason                  string
 }
 
@@ -422,6 +426,7 @@ func (p LeafMobilityPeerPlanAck) Encode() ([]byte, error) {
 	copy(wire[offset+104:offset+136], p.AgreementDigest[:])
 	copy(wire[offset+136:offset+152], p.ReservationID[:])
 	binary.BigEndian.PutUint16(wire[offset+152:offset+154], uint16(len(p.Reason)))
+	copy(wire[offset+160:offset+192], p.PublicationDigest[:])
 	copy(wire[LeafMobilityPeerPlanAckHeaderSize:], p.Reason)
 	return wire, nil
 }
@@ -458,6 +463,7 @@ func DecodeLeafMobilityPeerPlanAck(wire []byte) (LeafMobilityPeerPlanAck, error)
 	copy(p.PeerPlanDigest[:], wire[offset+72:offset+104])
 	copy(p.AgreementDigest[:], wire[offset+104:offset+136])
 	copy(p.ReservationID[:], wire[offset+136:offset+152])
+	copy(p.PublicationDigest[:], wire[offset+160:offset+192])
 	if err := p.validate(); err != nil {
 		return LeafMobilityPeerPlanAck{}, err
 	}
@@ -477,15 +483,24 @@ func (p LeafMobilityPeerPlanAck) validate() error {
 		if p.Stage != LeafMobilityPeerPlanCommitStageInvalid {
 			return fmt.Errorf("proto: prepared leaf mobility ACK cannot name a commit stage")
 		}
+		if p.PublicationDigest != (LeafMobilityPublicationDigest{}) {
+			return fmt.Errorf("proto: prepared leaf mobility ACK has a publication digest")
+		}
 	case LeafMobilityPeerPlanAckPhaseFinal:
 		if p.Stage != LeafMobilityPeerPlanCommitStageCommit {
 			return fmt.Errorf("proto: final leaf mobility ACK must acknowledge COMMIT")
+		}
+		if p.PublicationDigest == (LeafMobilityPublicationDigest{}) {
+			return fmt.Errorf("proto: final leaf mobility ACK has zero publication digest")
 		}
 	case LeafMobilityPeerPlanAckPhaseReleased:
 		if p.Stage != LeafMobilityPeerPlanCommitStageComplete &&
 			p.Stage != LeafMobilityPeerPlanCommitStageRolledBack &&
 			p.Stage != LeafMobilityPeerPlanCommitStageAbort {
 			return fmt.Errorf("proto: released leaf mobility ACK has invalid resolution stage %d", p.Stage)
+		}
+		if err := validateLeafMobilityPublicationDigest(p.Stage, p.PublicationDigest); err != nil {
+			return fmt.Errorf("proto: released leaf mobility ACK: %w", err)
 		}
 	}
 	if p.Code < LeafMobilityPeerPlanAckCodeAccept || p.Code > LeafMobilityPeerPlanAckCodeSuperseded {
@@ -570,6 +585,7 @@ type LeafMobilityPeerPlanCommit struct {
 	PeerPlanDigest          LeafMobilityPeerDigest
 	AgreementDigest         LeafMobilityAgreementDigest
 	ReservationID           LeafMobilityReservationID
+	PublicationDigest       LeafMobilityPublicationDigest
 }
 
 func (p LeafMobilityPeerPlanCommit) Encode() ([]byte, error) {
@@ -590,6 +606,7 @@ func (p LeafMobilityPeerPlanCommit) Encode() ([]byte, error) {
 	copy(wire[offset+88:offset+120], p.AgreementDigest[:])
 	copy(wire[offset+120:offset+136], p.ReservationID[:])
 	wire[offset+136] = byte(p.Stage)
+	copy(wire[offset+144:offset+176], p.PublicationDigest[:])
 	return wire, nil
 }
 
@@ -613,6 +630,7 @@ func DecodeLeafMobilityPeerPlanCommit(wire []byte) (LeafMobilityPeerPlanCommit, 
 	copy(p.PeerPlanDigest[:], wire[offset+56:offset+88])
 	copy(p.AgreementDigest[:], wire[offset+88:offset+120])
 	copy(p.ReservationID[:], wire[offset+120:offset+136])
+	copy(p.PublicationDigest[:], wire[offset+144:offset+176])
 	if binary.BigEndian.Uint32(wire[offset+137:offset+141]) != 0 ||
 		wire[offset+141] != 0 || binary.BigEndian.Uint16(wire[offset+142:offset+144]) != 0 {
 		return LeafMobilityPeerPlanCommit{}, fmt.Errorf("proto: leaf mobility commit reserved bytes must be zero")
@@ -629,6 +647,9 @@ func (p LeafMobilityPeerPlanCommit) validate() error {
 	}
 	if !p.Stage.valid() {
 		return fmt.Errorf("proto: leaf mobility commit has invalid stage %d", p.Stage)
+	}
+	if err := validateLeafMobilityPublicationDigest(p.Stage, p.PublicationDigest); err != nil {
+		return err
 	}
 	wantGeneration, err := p.ReservedGeneration()
 	if err != nil {
@@ -669,6 +690,30 @@ func (p LeafMobilityPeerPlanCommit) ValidateForPrepared(prepare LeafMobilityPeer
 	return nil
 }
 
+// ValidateForCommit correlates a post-COMMIT terminal resolution with the
+// exact staged publication. Pre-COMMIT ROLLED_BACK and ABORT instead correlate
+// through ValidateForPrepared and carry a zero publication digest.
+func (p LeafMobilityPeerPlanCommit) ValidateForCommit(commit LeafMobilityPeerPlanCommit) error {
+	if err := commit.validate(); err != nil {
+		return err
+	}
+	if commit.Stage != LeafMobilityPeerPlanCommitStageCommit {
+		return fmt.Errorf("proto: leaf mobility terminal resolution requires COMMIT")
+	}
+	if err := p.validate(); err != nil {
+		return err
+	}
+	if p.Stage != LeafMobilityPeerPlanCommitStageComplete && p.Stage != LeafMobilityPeerPlanCommitStageRolledBack {
+		return fmt.Errorf("proto: leaf mobility COMMIT has invalid terminal resolution stage %d", p.Stage)
+	}
+	correlated := p
+	correlated.Stage = LeafMobilityPeerPlanCommitStageCommit
+	if correlated != commit {
+		return fmt.Errorf("proto: leaf mobility terminal resolution does not match COMMIT")
+	}
+	return nil
+}
+
 func (p LeafMobilityPeerPlanAck) ValidateForCommit(commit LeafMobilityPeerPlanCommit) error {
 	if err := commit.validate(); err != nil {
 		return err
@@ -687,8 +732,25 @@ func (p LeafMobilityPeerPlanAck) ValidateForCommit(commit LeafMobilityPeerPlanCo
 		p.Generation != commit.Generation || p.ActorEndpointGeneration != commit.ActorEndpointGeneration ||
 		p.PeerEndpointGeneration != commit.PeerEndpointGeneration || p.ProposalDigest != commit.ProposalDigest ||
 		p.PeerPlanDigest != commit.PeerPlanDigest || p.AgreementDigest != commit.AgreementDigest ||
-		p.ReservationID != commit.ReservationID {
+		p.ReservationID != commit.ReservationID || p.PublicationDigest != commit.PublicationDigest {
 		return fmt.Errorf("proto: leaf mobility final ACK does not match commit")
+	}
+	return nil
+}
+
+func validateLeafMobilityPublicationDigest(stage LeafMobilityPeerPlanCommitStage, digest LeafMobilityPublicationDigest) error {
+	switch stage {
+	case LeafMobilityPeerPlanCommitStageCommit, LeafMobilityPeerPlanCommitStageComplete:
+		if digest == (LeafMobilityPublicationDigest{}) {
+			return fmt.Errorf("proto: leaf mobility stage %d has zero publication digest", stage)
+		}
+	case LeafMobilityPeerPlanCommitStageAbort:
+		if digest != (LeafMobilityPublicationDigest{}) {
+			return fmt.Errorf("proto: leaf mobility ABORT has a publication digest")
+		}
+	case LeafMobilityPeerPlanCommitStageRolledBack:
+		// A rollback before COMMIT has no publication digest. After COMMIT it
+		// echoes the already-bound digest; correlation validates exact equality.
 	}
 	return nil
 }
@@ -720,7 +782,7 @@ func ComputeLeafMobilityAgreementDigest(
 	}
 	canonical[5] = 0
 	h := sha256.New()
-	h.Write([]byte("rendr-leaf-mobility-agreement-v2\x00"))
+	h.Write([]byte("rendr-leaf-mobility-agreement-v3\x00"))
 	h.Write(canonical)
 	var scalar [24]byte
 	binary.BigEndian.PutUint64(scalar[0:8], generation)
@@ -752,12 +814,12 @@ func encodeLeafMobilityPeerPlanBinding(binding LeafMobilityPeerPlanBinding, mess
 	copy(wire[56:88], binding.ClientGraph.Digest[:])
 	binary.BigEndian.PutUint64(wire[88:96], binding.ServerGraph.Revision)
 	copy(wire[96:128], binding.ServerGraph.Digest[:])
-	copy(wire[128:144], binding.ClientTargetID[:])
-	copy(wire[144:160], binding.ServerTargetID[:])
+	copy(wire[128:144], binding.SubjectClientTargetID[:])
+	copy(wire[144:160], binding.SubjectServerTargetID[:])
 	binary.BigEndian.PutUint64(wire[160:168], binding.BaseGeneration)
 	wire[168] = byte(binding.ResourceScope)
 	copy(wire[176:192], binding.ResourceID[:])
-	binary.BigEndian.PutUint64(wire[192:200], binding.RouteGeneration)
+	binary.BigEndian.PutUint64(wire[192:200], binding.SubjectRouteGeneration)
 	return wire, nil
 }
 
@@ -772,25 +834,25 @@ func decodeLeafMobilityPeerPlanBinding(wire []byte, want leafMobilityPeerPlanMes
 		return LeafMobilityPeerPlanBinding{}, fmt.Errorf("proto: leaf mobility peer plan reserved bytes must be zero")
 	}
 	binding := LeafMobilityPeerPlanBinding{
-		CoordinatorSide: LeafMobilityActorSide(wire[6]),
-		ActorSide:       LeafMobilityActorSide(wire[7]),
-		Direction:       SenderDirection(wire[8]),
-		SessionKind:     LeafMobilitySessionKind(wire[9]),
-		Operation:       LeafMobilityOperation(wire[10]),
-		Fallback:        LeafMobilityFallback(wire[11]),
-		LeaseMillis:     binary.BigEndian.Uint32(wire[12:16]),
-		ClientGraph:     GraphBinding{Revision: binary.BigEndian.Uint64(wire[48:56])},
-		ServerGraph:     GraphBinding{Revision: binary.BigEndian.Uint64(wire[88:96])},
-		BaseGeneration:  binary.BigEndian.Uint64(wire[160:168]),
-		ResourceScope:   LeafMobilityResourceScope(wire[168]),
-		RouteGeneration: binary.BigEndian.Uint64(wire[192:200]),
+		CoordinatorSide:        LeafMobilityActorSide(wire[6]),
+		ActorSide:              LeafMobilityActorSide(wire[7]),
+		Direction:              SenderDirection(wire[8]),
+		SessionKind:            LeafMobilitySessionKind(wire[9]),
+		Operation:              LeafMobilityOperation(wire[10]),
+		Fallback:               LeafMobilityFallback(wire[11]),
+		LeaseMillis:            binary.BigEndian.Uint32(wire[12:16]),
+		ClientGraph:            GraphBinding{Revision: binary.BigEndian.Uint64(wire[48:56])},
+		ServerGraph:            GraphBinding{Revision: binary.BigEndian.Uint64(wire[88:96])},
+		BaseGeneration:         binary.BigEndian.Uint64(wire[160:168]),
+		ResourceScope:          LeafMobilityResourceScope(wire[168]),
+		SubjectRouteGeneration: binary.BigEndian.Uint64(wire[192:200]),
 	}
 	copy(binding.SessionEpoch[:], wire[16:32])
 	copy(binding.TransactionID[:], wire[32:48])
 	copy(binding.ClientGraph.Digest[:], wire[56:88])
 	copy(binding.ServerGraph.Digest[:], wire[96:128])
-	copy(binding.ClientTargetID[:], wire[128:144])
-	copy(binding.ServerTargetID[:], wire[144:160])
+	copy(binding.SubjectClientTargetID[:], wire[128:144])
+	copy(binding.SubjectServerTargetID[:], wire[144:160])
 	copy(binding.ResourceID[:], wire[176:192])
 	if err := binding.Validate(); err != nil {
 		return LeafMobilityPeerPlanBinding{}, err

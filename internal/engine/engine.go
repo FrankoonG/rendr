@@ -253,6 +253,7 @@ type Engine struct {
 	closed       chan struct{} // internal cancellation
 	quiesced     chan struct{} // public completion after owned loops stop
 	coreWG       sync.WaitGroup
+	retireWG     sync.WaitGroup
 	closeResult  error
 	closeErr     error
 	closeMu      sync.Mutex
@@ -377,6 +378,8 @@ type pathSlot struct {
 	writerStarted     atomic.Bool
 	proberStarted     atomic.Bool
 	doneP             chan struct{}
+	retireTracked     atomic.Bool
+	retireStarted     atomic.Bool
 }
 
 type pathAckWrite struct {
@@ -1131,6 +1134,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 			continue
 		}
 		delete(e.retainedPaths, retainedID)
+		e.trackPathRetirementLocked(existing)
 		existing.closeQuit()
 		retired = append(retired, existing)
 	}
@@ -1146,6 +1150,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 			e.retainedPaths[existingID] = existing
 			e.pathPredecessors[id] = append(e.pathPredecessors[id], existingID)
 		} else {
+			e.trackPathRetirementLocked(existing)
 			existing.closeQuit()
 			retired = append(retired, existing)
 		}
@@ -1241,6 +1246,7 @@ func (e *Engine) releasePathPredecessorsLocked(successorID uint32, successorGen 
 	for _, predecessorID := range ids {
 		if predecessor := e.retainedPaths[predecessorID]; predecessor != nil {
 			delete(e.retainedPaths, predecessorID)
+			e.trackPathRetirementLocked(predecessor)
 			predecessor.closeQuit()
 			retired = append(retired, predecessor)
 		}
@@ -1287,44 +1293,49 @@ func (e *Engine) retireSupersededPath(slot *pathSlot) {
 	slot.retireMobilityClaim()
 	slot.closeQuit()
 	_ = slot.conn.Close()
-	timer := time.NewTimer(pathCloseTimeout)
-	defer timer.Stop()
-	select {
-	case <-slot.doneR:
-	case <-timer.C:
-		// Never race a final reader enqueue. A conforming PathConn.Close
-		// unblocks Read promptly; if it does not, keep cleanup detached until
-		// the reader eventually exits instead of stranding a late frame.
-		go func() {
-			<-slot.doneR
-			e.drainDeadSlot(slot)
-		}()
-		return
+	if slot.readerStarted.Load() {
+		<-slot.doneR
 	}
 	if slot.writerStarted.Load() {
-		select {
-		case <-slot.doneW:
-		case <-timer.C:
-		}
+		<-slot.doneW
 	}
 	if slot.proberStarted.Load() {
-		select {
-		case <-slot.doneP:
-		case <-timer.C:
-		}
+		<-slot.doneP
 	}
+	slot.ackWG.Wait()
 	e.drainDeadSlot(slot)
 }
 
-// retirePathAsync ends endpoint ownership synchronously, then detaches carrier
-// cleanup. Callers may return as soon as this function does without leaving a
-// published mobility candidate valid for a logically departed path.
+// trackPathRetirementLocked transfers a slot from topology ownership to the
+// reaper set before pathsMu is released. Close cannot begin waiting until it
+// has crossed the same lock, so every detached reaper ticket precedes Wait.
+func (e *Engine) trackPathRetirementLocked(slot *pathSlot) {
+	if slot != nil && slot.retireTracked.CompareAndSwap(false, true) {
+		e.retireWG.Add(1)
+	}
+}
+
+// retirePathAsync ends endpoint ownership and physical carrier cleanup under
+// the ticket installed at logical departure. Closed remains open until the
+// exact reaper returns.
 func (e *Engine) retirePathAsync(slot *pathSlot) {
 	if slot == nil {
 		return
 	}
+	if !slot.retireTracked.Load() {
+		// Defensive fallback for a caller that does not own pathsMu. Keeping the
+		// cleanup synchronous is safer than creating work Close cannot observe.
+		e.retireSupersededPath(slot)
+		return
+	}
+	if !slot.retireStarted.CompareAndSwap(false, true) {
+		return
+	}
 	slot.requestMobilityClaimRetirement()
-	go e.retireSupersededPath(slot)
+	go func() {
+		defer e.retireWG.Done()
+		e.retireSupersededPath(slot)
+	}()
 }
 
 func (e *Engine) nextPathGenerationLocked() uint64 {
@@ -2216,6 +2227,7 @@ func (e *Engine) Close() error {
 			e.coreWG.Wait()
 			e.leafTx.writerWG.Wait()
 			e.leafTx.asyncWG.Wait()
+			e.retireWG.Wait()
 			e.releaseLeafMobilityPeerLedgerSession()
 			e.selectorMu.Lock()
 			selector := e.selector

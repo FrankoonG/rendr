@@ -66,8 +66,8 @@ func TestPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T
 	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 		t.Fatalf("Prepare in namespace A: %v", err)
 	}
-	if err := fixture.attempt.Cutover(context.Background(), fixture.request); err != nil {
-		t.Fatalf("Cutover in namespace A: %v", err)
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Stage in namespace A: %v", err)
 	}
 
 	rolledBack := make(chan error, 1)
@@ -92,7 +92,7 @@ func TestPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T
 	assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
 }
 
-func TestPrivilegedTCPRepairDriverMigratesItsActiveControlCarrier(t *testing.T) {
+func TestPrivilegedTCPRepairDriverMigratesActiveDataWithIndependentControlRoute(t *testing.T) {
 	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_TEST") != "1" {
 		t.Skip("set RENDR_TCP_REPAIR_DRIVER_TEST=1 to exercise the real driver")
 	}
@@ -114,10 +114,9 @@ func TestPrivilegedTCPRepairDriverMigratesItsActiveControlCarrier(t *testing.T) 
 	serverEngine := engine.New(engine.SideServer, flowID, limits)
 	defer clientEngine.Close()
 	defer serverEngine.Close()
-	configureRepairEnginePair(t, clientEngine, serverEngine, clientDriver, serverDriver)
+	rawTargetID, controlTargetID := configureRepairEnginePair(t, clientEngine, serverEngine, clientDriver, serverDriver)
 
-	targetID := proto.DeriveTargetID(proto.GraphNodeKindPath, "raw")
-	binding := engine.PathBinding{LocalTXTargetID: targetID, PeerTXTargetID: targetID}
+	binding := engine.PathBinding{LocalTXTargetID: rawTargetID, PeerTXTargetID: rawTargetID}
 	spec := transport.PathSpec{Transport: "tcp", Opts: map[string]string{"name": "raw"}}
 	clientPathID, err := clientEngine.AttachPathBound(clientPath, spec, binding)
 	if err != nil {
@@ -125,6 +124,16 @@ func TestPrivilegedTCPRepairDriverMigratesItsActiveControlCarrier(t *testing.T) 
 	}
 	if _, err := serverEngine.AttachPathBound(serverPath, spec, binding); err != nil {
 		t.Fatalf("attach server path: %v", err)
+	}
+	clientControlConn, serverControlConn := net.Pipe()
+	controlBinding := engine.PathBinding{LocalTXTargetID: controlTargetID, PeerTXTargetID: controlTargetID}
+	clientControl := Wrap(clientControlConn)
+	serverControl := Wrap(serverControlConn)
+	if _, err := clientEngine.AttachPathBound(clientControl, transport.PathSpec{Transport: "memory"}, controlBinding); err != nil {
+		t.Fatalf("attach client control path: %v", err)
+	}
+	if _, err := serverEngine.AttachPathBound(serverControl, transport.PathSpec{Transport: "memory"}, controlBinding); err != nil {
+		t.Fatalf("attach server control path: %v", err)
 	}
 	clientRef, ok := clientEngine.PathRef(clientPathID)
 	if !ok {
@@ -173,6 +182,11 @@ func TestPrivilegedTCPRepairDriverMigratesItsActiveControlCarrier(t *testing.T) 
 
 	if err := permit.Execute(ctx); err != nil {
 		t.Fatalf("Execute TCP_REPAIR mobility: %v", err)
+	}
+	if clientControl.Writes() == 0 || clientControl.Reads() == 0 ||
+		serverControl.Writes() == 0 || serverControl.Reads() == 0 {
+		t.Fatalf("independent control path was not used: client=(writes=%d reads=%d) server=(writes=%d reads=%d)",
+			clientControl.Writes(), clientControl.Reads(), serverControl.Writes(), serverControl.Reads())
 	}
 	if err := <-sendResult; err != nil {
 		t.Fatalf("SendData across migration: %v", err)
@@ -258,7 +272,7 @@ func configureRepairEnginePair(
 	t *testing.T,
 	client, server *engine.Engine,
 	clientDriver, serverDriver *tcpRepairDriver,
-) {
+) (proto.TargetID, proto.TargetID) {
 	t.Helper()
 	clientCapability, err := leafmobility.CapabilityForDriver(clientDriver)
 	if err != nil {
@@ -274,10 +288,16 @@ func configureRepairEnginePair(
 	if err := server.ConfigureLocalMobilityCapabilities(serverCapability); err != nil {
 		t.Fatalf("server mobility capabilities: %v", err)
 	}
-	targetID := proto.DeriveTargetID(proto.GraphNodeKindPath, "raw")
+	rawTargetID := proto.DeriveTargetID(proto.GraphNodeKindPath, "raw")
+	controlTargetID := proto.DeriveTargetID(proto.GraphNodeKindPath, "control")
+	rootTargetID := proto.DeriveTargetID(proto.GraphNodeKindSelector, "root")
 	manifest := proto.GraphManifest{
-		RootID: targetID,
-		Nodes:  []proto.GraphNode{{ID: targetID, Kind: proto.GraphNodeKindPath, Name: "raw"}},
+		RootID: rootTargetID,
+		Nodes: []proto.GraphNode{
+			{ID: rootTargetID, Kind: proto.GraphNodeKindSelector, Name: "root", Children: []proto.TargetID{rawTargetID, controlTargetID}},
+			{ID: rawTargetID, Kind: proto.GraphNodeKindPath, Name: "raw"},
+			{ID: controlTargetID, Kind: proto.GraphNodeKindPath, Name: "control"},
+		},
 	}
 	if err := client.ConfigureLocalGraph(1, manifest); err != nil {
 		t.Fatalf("client graph: %v", err)
@@ -300,6 +320,7 @@ func configureRepairEnginePair(
 	if err := server.SetPeerInstanceID(clientID); err != nil {
 		t.Fatalf("server peer instance: %v", err)
 	}
+	return rawTargetID, controlTargetID
 }
 
 func driverTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {

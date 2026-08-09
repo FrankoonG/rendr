@@ -32,23 +32,28 @@ func (d *transactionalTestDriver) Preflight(_ context.Context, request Preflight
 }
 
 type transactionalTestAttempt struct {
-	prepareErr    error
-	cutoverErr    error
-	commitErr     error
-	rollbackErr   error
-	failClosedErr error
+	prepareErr      error
+	stageErr        error
+	publishErr      error
+	activateErr     error
+	rollbackErr     error
+	failClosedErr   error
+	publication     PublicationEvidence
+	zeroPublication bool
 
 	prepareCalls    atomic.Int32
-	cutoverCalls    atomic.Int32
-	commitCalls     atomic.Int32
+	stageCalls      atomic.Int32
+	publishCalls    atomic.Int32
+	activateCalls   atomic.Int32
 	rollbackCalls   atomic.Int32
 	failClosedCalls atomic.Int32
 	prepareEnter    chan struct{}
 	prepareExit     chan struct{}
-	commitEnter     chan struct{}
-	commitExit      chan struct{}
+	publishEnter    chan struct{}
+	publishExit     chan struct{}
 	panicPrepare    bool
-	commitHook      func()
+	publishHook     func()
+	activateHook    func()
 	rollbackHook    func()
 	mu              sync.Mutex
 	request         ExecutionRequest
@@ -84,23 +89,35 @@ func (a *transactionalTestAttempt) Prepare(ctx context.Context, request Executio
 	return a.prepareErr
 }
 
-func (a *transactionalTestAttempt) Cutover(context.Context, ExecutionRequest) error {
-	a.cutoverCalls.Add(1)
-	return a.cutoverErr
+func (a *transactionalTestAttempt) Stage(context.Context, ExecutionRequest) (PublicationEvidence, error) {
+	a.stageCalls.Add(1)
+	publication := a.publication
+	if publication.Digest == (EvidenceDigest{}) && a.stageErr == nil && !a.zeroPublication {
+		publication.Digest = EvidenceDigest{0x51}
+	}
+	return publication, a.stageErr
 }
 
-func (a *transactionalTestAttempt) Commit(context.Context, ExecutionRequest) error {
-	a.commitCalls.Add(1)
-	if a.commitEnter != nil {
-		close(a.commitEnter)
+func (a *transactionalTestAttempt) Publish(context.Context, ExecutionRequest) error {
+	a.publishCalls.Add(1)
+	if a.publishEnter != nil {
+		close(a.publishEnter)
 	}
-	if a.commitExit != nil {
-		<-a.commitExit
+	if a.publishExit != nil {
+		<-a.publishExit
 	}
-	if a.commitHook != nil {
-		a.commitHook()
+	if a.publishHook != nil {
+		a.publishHook()
 	}
-	return a.commitErr
+	return a.publishErr
+}
+
+func (a *transactionalTestAttempt) Activate(context.Context, ExecutionRequest) error {
+	a.activateCalls.Add(1)
+	if a.activateHook != nil {
+		a.activateHook()
+	}
+	return a.activateErr
 }
 
 func (a *transactionalTestAttempt) Rollback(ctx context.Context, _ ExecutionRequest) error {
@@ -114,7 +131,10 @@ func (a *transactionalTestAttempt) Rollback(ctx context.Context, _ ExecutionRequ
 	return a.rollbackErr
 }
 
-type testIncarnationReporter struct{ value atomic.Uint64 }
+type testIncarnationReporter struct {
+	value     atomic.Uint64
+	panicRead atomic.Bool
+}
 
 func newTestIncarnationReporter() *testIncarnationReporter {
 	reporter := &testIncarnationReporter{}
@@ -123,6 +143,9 @@ func newTestIncarnationReporter() *testIncarnationReporter {
 }
 
 func (reporter *testIncarnationReporter) LeafMobilityIncarnation() uint64 {
+	if reporter.panicRead.Load() {
+		panic("forced incarnation reporter failure")
+	}
 	return reporter.value.Load()
 }
 
@@ -160,12 +183,12 @@ func TestClaimConsumeExecutionBindsExactPlanAndDriver(t *testing.T) {
 	if _, err := issuer.ConsumeExecution(claim, tx, forged, testPeerAgreement(forged)); !errors.Is(err, ErrAuthorityStale) {
 		t.Fatalf("forged plan consume=%v want=%v", err, ErrAuthorityStale)
 	}
-	if tx.State() != ResourceTransactionFinalAccepted {
+	if tx.State() != ResourceTransactionPrepared {
 		t.Fatalf("forged plan changed transaction state=%d", tx.State())
 	}
 
 	mutations := []func(*PeerAgreement){
-		func(a *PeerAgreement) { a.Binding.RouteGeneration++ },
+		func(a *PeerAgreement) { a.Binding.SubjectRouteGeneration++ },
 		func(a *PeerAgreement) { a.Generation++ },
 		func(a *PeerAgreement) { a.ActorEndpointGeneration++ },
 		func(a *PeerAgreement) { a.PeerEndpointGeneration++ },
@@ -181,7 +204,7 @@ func TestClaimConsumeExecutionBindsExactPlanAndDriver(t *testing.T) {
 		if _, err := issuer.ConsumeExecution(claim, tx, plan, agreement); !errors.Is(err, ErrInvalidPeerAgreement) {
 			t.Fatalf("mutated agreement %d consume=%v want=%v", index, err, ErrInvalidPeerAgreement)
 		}
-		if tx.State() != ResourceTransactionFinalAccepted {
+		if tx.State() != ResourceTransactionPrepared {
 			t.Fatalf("mutated agreement %d changed transaction state=%d", index, tx.State())
 		}
 	}
@@ -192,7 +215,7 @@ func TestClaimConsumeExecutionBindsExactPlanAndDriver(t *testing.T) {
 	if _, err := issuer.ConsumeExecution(claim, tx, plan, testPeerAgreement(plan)); !errors.Is(err, ErrAuthorityStale) {
 		t.Fatalf("mutated attempt evidence consume=%v want=%v", err, ErrAuthorityStale)
 	}
-	if attempt.prepareCalls.Load() != 0 || tx.State() != ResourceTransactionFinalAccepted {
+	if attempt.prepareCalls.Load() != 0 || tx.State() != ResourceTransactionPrepared {
 		t.Fatalf("mutated attempt invoked driver or changed transaction: calls=%d state=%d", attempt.prepareCalls.Load(), tx.State())
 	}
 	attempt.mu.Lock()
@@ -207,7 +230,7 @@ func TestClaimConsumeExecutionBindsExactPlanAndDriver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if execution.State() != ExecutionAuthorized || tx.State() != ResourceTransactionConsumed {
+	if execution.State() != ExecutionAuthorized || tx.State() != ResourceTransactionExecutionStaged {
 		t.Fatalf("execution=%d transaction=%d", execution.State(), tx.State())
 	}
 	if _, err := issuer.ConsumeExecution(claim, tx, plan, testPeerAgreement(plan)); !errors.Is(err, ErrAuthorityConsumed) {
@@ -233,7 +256,7 @@ func TestClaimConsumeExecutionBindsExactPlanAndDriver(t *testing.T) {
 
 func TestExecutionEnforcesOrderAndTerminalState(t *testing.T) {
 	reporter := newTestIncarnationReporter()
-	attempt := &transactionalTestAttempt{commitHook: func() { reporter.value.Add(1) }}
+	attempt := &transactionalTestAttempt{publishHook: func() { reporter.value.Add(1) }}
 	driver := &transactionalTestDriver{
 		operation: OperationTCPRepair,
 		result: PreflightResult{
@@ -246,8 +269,8 @@ func TestExecutionEnforcesOrderAndTerminalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Cutover(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("cutover before prepare=%v", err)
+	if err := execution.Stage(context.Background()); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("stage before prepare=%v", err)
 	}
 	if err := execution.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
@@ -255,30 +278,342 @@ func TestExecutionEnforcesOrderAndTerminalState(t *testing.T) {
 	if err := execution.Prepare(context.Background()); !errors.Is(err, ErrExecutionState) {
 		t.Fatalf("second prepare=%v", err)
 	}
-	if err := execution.Cutover(context.Background()); err != nil {
+	if err := execution.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Commit(context.Background()); err != nil {
+	if got := reporter.value.Load(); got != 1 {
+		t.Fatalf("private Stage changed endpoint incarnation to %d", got)
+	}
+	if digest, err := execution.PublicationDigest(); err != nil || digest == (proto.LeafMobilityPublicationDigest{}) {
+		t.Fatalf("publication digest=(%x, %v)", digest, err)
+	}
+	if err := execution.Publish(context.Background()); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("publish before FINAL=%v", err)
+	}
+	if calls := attempt.publishCalls.Load(); calls != 0 {
+		t.Fatalf("publish before FINAL invoked driver %d time(s)", calls)
+	}
+	authorizeExecutionPublish(t, execution, tx)
+	if err := execution.Publish(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if execution.State() != ExecutionCommitted {
-		t.Fatalf("state=%d want committed", execution.State())
+	if execution.State() != ExecutionPublished {
+		t.Fatalf("state=%d want published", execution.State())
 	}
 	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("rollback after commit=%v", err)
+		t.Fatalf("rollback after publish=%v", err)
 	}
-	if err := execution.FinalizeCommitted(); err != nil {
+	if err := execution.Activate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if attempt.prepareCalls.Load() != 1 || attempt.cutoverCalls.Load() != 1 || attempt.commitCalls.Load() != 1 || attempt.rollbackCalls.Load() != 0 {
-		t.Fatalf("calls prepare=%d cutover=%d commit=%d rollback=%d",
-			attempt.prepareCalls.Load(), attempt.cutoverCalls.Load(), attempt.commitCalls.Load(), attempt.rollbackCalls.Load())
+	if err := execution.FinalizePublished(); err != nil {
+		t.Fatal(err)
+	}
+	if attempt.prepareCalls.Load() != 1 || attempt.stageCalls.Load() != 1 || attempt.publishCalls.Load() != 1 ||
+		attempt.activateCalls.Load() != 1 || attempt.rollbackCalls.Load() != 0 {
+		t.Fatalf("calls prepare=%d stage=%d publish=%d activate=%d rollback=%d",
+			attempt.prepareCalls.Load(), attempt.stageCalls.Load(), attempt.publishCalls.Load(),
+			attempt.activateCalls.Load(), attempt.rollbackCalls.Load())
 	}
 }
 
-func TestExecutionCommitAdvancesOnlyFutureEndpointGeneration(t *testing.T) {
+func TestExecutionFinalAcceptanceLinearizesResourceAndDriverState(t *testing.T) {
+	newStaged := func(t *testing.T, deadline time.Time) (*Execution, *ResourceTransaction, *transactionalTestAttempt) {
+		t.Helper()
+		attempt := &transactionalTestAttempt{}
+		driver := &transactionalTestDriver{
+			operation: OperationTCPRepair,
+			result: PreflightResult{
+				Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x6a}, ProbeReferences: testProbeReferences(0x6a),
+			},
+			attempt: attempt,
+		}
+		issuer, claim, plan, transaction := executableClaimFixtureWithDeadline(t, driver, deadline)
+		execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Stage(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.MarkCommitPublished(); err != nil {
+			t.Fatal(err)
+		}
+		return execution, transaction, attempt
+	}
+
+	t.Run("final wins", func(t *testing.T) {
+		execution, transaction, _ := newStaged(t, canonicalTime(time.Now().Add(time.Second)))
+		disposition, err := execution.ResolveFinalAcceptance(true)
+		if err != nil || disposition != FinalAcceptancePublishAllowed {
+			t.Fatalf("disposition/error=%d/%v", disposition, err)
+		}
+		if execution.State() != ExecutionPublishAuthorized || transaction.State() != ResourceTransactionPublishAuthorized {
+			t.Fatalf("states=(%d,%d)", execution.State(), transaction.State())
+		}
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.BeginResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.FinishResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+	})
+
+	t.Run("recovery forbids publish", func(t *testing.T) {
+		execution, transaction, attempt := newStaged(t, canonicalTime(time.Now().Add(time.Second)))
+		disposition, err := execution.ResolveFinalAcceptance(false)
+		if err != nil || disposition != FinalAcceptanceRollbackOnly {
+			t.Fatalf("disposition/error=%d/%v", disposition, err)
+		}
+		snapshot := transaction.Snapshot()
+		if execution.State() != ExecutionRollbackRequired || snapshot.State != ResourceTransactionOutcomeUnknown ||
+			snapshot.UnknownFrom != ResourceTransactionPublishAuthorized {
+			t.Fatalf("execution/transaction=%d/%+v", execution.State(), snapshot)
+		}
+		if err := execution.Publish(context.Background()); !errors.Is(err, ErrExecutionState) {
+			t.Fatalf("recovery Publish=%v want state error", err)
+		}
+		if calls := attempt.publishCalls.Load(); calls != 0 {
+			t.Fatalf("recovery invoked Publish %d time(s)", calls)
+		}
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.BeginResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.FinishResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+	})
+
+	t.Run("commit uncertainty forbids publish", func(t *testing.T) {
+		execution, transaction, _ := newStaged(t, canonicalTime(time.Now().Add(time.Second)))
+		if err := transaction.MarkOutcomeUnknown(); err != nil {
+			t.Fatal(err)
+		}
+		disposition, err := execution.ResolveFinalAcceptance(true)
+		if err != nil || disposition != FinalAcceptanceRollbackOnly {
+			t.Fatalf("disposition/error=%d/%v", disposition, err)
+		}
+		snapshot := transaction.Snapshot()
+		if execution.State() != ExecutionRollbackRequired || snapshot.State != ResourceTransactionOutcomeUnknown ||
+			snapshot.UnknownFrom != ResourceTransactionPublishAuthorized {
+			t.Fatalf("execution/transaction=%d/%+v", execution.State(), snapshot)
+		}
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.BeginResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.FinishResolution(ResolutionRolledBack); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+	})
+
+	t.Run("deadline wins", func(t *testing.T) {
+		deadline := canonicalTime(time.Now().Add(150 * time.Millisecond))
+		execution, transaction, attempt := newStaged(t, deadline)
+		time.Sleep(max(time.Until(deadline), 0) + 5*time.Millisecond)
+		disposition, err := execution.ResolveFinalAcceptance(true)
+		if err != nil || disposition != FinalAcceptanceRollbackOnly {
+			t.Fatalf("disposition/error=%d/%v", disposition, err)
+		}
+		snapshot := transaction.Snapshot()
+		if execution.State() != ExecutionRollbackRequired || snapshot.State != ResourceTransactionOutcomeUnknown ||
+			snapshot.UnknownFrom != ResourceTransactionPublishAuthorized {
+			t.Fatalf("execution/transaction=%d/%+v", execution.State(), snapshot)
+		}
+		if calls := attempt.publishCalls.Load(); calls != 0 {
+			t.Fatalf("deadline invoked Publish %d time(s)", calls)
+		}
+		if err := execution.FailClosed(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestExecutionStageRequiresPublicationEvidence(t *testing.T) {
+	attempt := &transactionalTestAttempt{zeroPublication: true}
+	driver := &transactionalTestDriver{
+		operation: OperationTCPRepair,
+		result: PreflightResult{
+			Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x52}, ProbeReferences: testProbeReferences(0x52),
+		},
+		attempt: attempt,
+	}
+	execution := consumeExecutableClaim(t, driver)
+	if err := execution.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Stage(context.Background()); !errors.Is(err, ErrExecutionDriver) {
+		t.Fatalf("Stage with zero publication evidence=%v want=%v", err, ErrExecutionDriver)
+	}
+	if execution.State() != ExecutionRollbackRequired {
+		t.Fatalf("state=%d want rollback-required", execution.State())
+	}
+	if _, err := execution.PublicationDigest(); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("PublicationDigest after rejected Stage=%v want=%v", err, ErrExecutionState)
+	}
+	if err := execution.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	finalizeRolledBackExecution(t, execution)
+}
+
+func TestExecutionPublishErrorWithoutIncarnationChangeCanRollback(t *testing.T) {
+	publishFailure := errors.New("publish failed before owner swap")
 	reporter := newTestIncarnationReporter()
-	attempt := &transactionalTestAttempt{commitHook: func() { reporter.value.Add(1) }}
+	attempt := &transactionalTestAttempt{publishErr: publishFailure}
+	driver := &transactionalTestDriver{
+		operation: OperationTCPRepair,
+		result: PreflightResult{
+			Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x53}, ProbeReferences: testProbeReferences(0x53),
+		},
+		attempt: attempt,
+	}
+	issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, driver, reporter)
+	execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Stage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	authorizeExecutionPublish(t, execution, transaction)
+	if err := execution.Publish(context.Background()); !errors.Is(err, publishFailure) {
+		t.Fatalf("Publish=%v want=%v", err, publishFailure)
+	}
+	if execution.State() != ExecutionRollbackRequired {
+		t.Fatalf("state=%d want rollback-required", execution.State())
+	}
+	if err := execution.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	finalizeRolledBackExecution(t, execution)
+	if attempt.rollbackCalls.Load() != 1 || reporter.value.Load() != 1 {
+		t.Fatalf("rollback calls/incarnation=%d/%d want=1/1", attempt.rollbackCalls.Load(), reporter.value.Load())
+	}
+}
+
+func TestExecutionPublishErrorWithUnprovenIncarnationRequiresFailClosed(t *testing.T) {
+	publishFailure := errors.New("publish failed after an unknown owner boundary")
+	reporter := newTestIncarnationReporter()
+	attempt := &transactionalTestAttempt{
+		publishErr: publishFailure,
+		publishHook: func() {
+			reporter.panicRead.Store(true)
+		},
+	}
+	driver := &transactionalTestDriver{
+		operation: OperationTCPRepair,
+		result: PreflightResult{
+			Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x55}, ProbeReferences: testProbeReferences(0x55),
+		},
+		attempt: attempt,
+	}
+	issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, driver, reporter)
+	execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Stage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	authorizeExecutionPublish(t, execution, transaction)
+	if err := execution.Publish(context.Background()); !errors.Is(err, publishFailure) {
+		t.Fatalf("Publish=%v want=%v", err, publishFailure)
+	}
+	if execution.State() != ExecutionFailClosedRequired {
+		t.Fatalf("state=%d want fail-closed-required", execution.State())
+	}
+	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("Rollback after unproven Publish=%v want state rejection", err)
+	}
+	if attempt.rollbackCalls.Load() != 0 {
+		t.Fatalf("unproven Publish invoked Rollback %d time(s)", attempt.rollbackCalls.Load())
+	}
+	reporter.panicRead.Store(false)
+	if err := execution.FailClosed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if execution.State() != ExecutionFailedClosed || attempt.failClosedCalls.Load() != 1 {
+		t.Fatalf("state/fail-closed calls=%d/%d", execution.State(), attempt.failClosedCalls.Load())
+	}
+}
+
+func TestExecutionActivateFailureCanOnlyRetryActivate(t *testing.T) {
+	activateFailure := errors.New("activation still pending")
+	reporter := newTestIncarnationReporter()
+	attempt := &transactionalTestAttempt{
+		publishHook: func() { reporter.value.Add(1) },
+		activateErr: activateFailure,
+	}
+	driver := &transactionalTestDriver{
+		operation: OperationTCPRepair,
+		result: PreflightResult{
+			Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x54}, ProbeReferences: testProbeReferences(0x54),
+		},
+		attempt: attempt,
+	}
+	issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, driver, reporter)
+	execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Stage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	authorizeExecutionPublish(t, execution, transaction)
+	if err := execution.Publish(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Activate(context.Background()); !errors.Is(err, activateFailure) {
+		t.Fatalf("Activate=%v want=%v", err, activateFailure)
+	}
+	if execution.State() != ExecutionActivationRequired {
+		t.Fatalf("state=%d want activation-required", execution.State())
+	}
+	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("Rollback after Publish=%v want=%v", err, ErrExecutionState)
+	}
+	if attempt.rollbackCalls.Load() != 0 {
+		t.Fatalf("post-Publish rollback calls=%d", attempt.rollbackCalls.Load())
+	}
+	attempt.activateErr = nil
+	if err := execution.Activate(context.Background()); err != nil {
+		t.Fatalf("Activate retry: %v", err)
+	}
+	if err := execution.FinalizePublished(); err != nil {
+		t.Fatal(err)
+	}
+	if attempt.activateCalls.Load() != 2 {
+		t.Fatalf("activate calls=%d want=2", attempt.activateCalls.Load())
+	}
+}
+
+func TestExecutionPublishAdvancesOnlyFutureEndpointGeneration(t *testing.T) {
+	reporter := newTestIncarnationReporter()
+	attempt := &transactionalTestAttempt{publishHook: func() { reporter.value.Add(1) }}
 	driver := &transactionalTestDriver{
 		operation: OperationTCPRepair,
 		result: PreflightResult{
@@ -294,33 +629,37 @@ func TestExecutionCommitAdvancesOnlyFutureEndpointGeneration(t *testing.T) {
 	if err := execution.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Cutover(context.Background()); err != nil {
+	if err := execution.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Commit(context.Background()); err != nil {
+	authorizeExecutionPublish(t, execution, transaction)
+	if err := execution.Publish(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	current := claim.Snapshot().Generation
 	if current == 0 || current == plan.EndpointGeneration {
-		t.Fatalf("committed endpoint generation=%d, old=%d", current, plan.EndpointGeneration)
+		t.Fatalf("published endpoint generation=%d, old=%d", current, plan.EndpointGeneration)
 	}
 	if execution.token.request.Plan.EndpointGeneration != plan.EndpointGeneration ||
 		execution.token.request.Agreement.ActorEndpointGeneration != plan.EndpointGeneration {
-		t.Fatal("commit rewrote immutable transaction evidence")
+		t.Fatal("publish rewrote immutable transaction evidence")
 	}
 	if err := claim.ValidatePlanCurrent(plan); !errors.Is(err, ErrStalePlan) {
-		t.Fatalf("old plan after commit=%v want=%v", err, ErrStalePlan)
+		t.Fatalf("old plan after publish=%v want=%v", err, ErrStalePlan)
 	}
-	if err := execution.FinalizeCommitted(); err != nil {
+	if err := execution.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.FinalizePublished(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestExecutionSuccessfulCommitIsIrreversibleAfterConcurrentCancellation(t *testing.T) {
+func TestExecutionSuccessfulPublishIsIrreversibleAfterConcurrentCancellation(t *testing.T) {
 	reporter := newTestIncarnationReporter()
 	attempt := &transactionalTestAttempt{
-		commitEnter: make(chan struct{}), commitExit: make(chan struct{}),
-		commitHook: func() { reporter.value.Add(1) },
+		publishEnter: make(chan struct{}), publishExit: make(chan struct{}),
+		publishHook: func() { reporter.value.Add(1) },
 	}
 	driver := &transactionalTestDriver{
 		operation: OperationTCPRepair,
@@ -337,29 +676,33 @@ func TestExecutionSuccessfulCommitIsIrreversibleAfterConcurrentCancellation(t *t
 	if err := execution.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Cutover(context.Background()); err != nil {
+	if err := execution.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	authorizeExecutionPublish(t, execution, tx)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
-	go func() { result <- execution.Commit(ctx) }()
+	go func() { result <- execution.Publish(ctx) }()
 	select {
-	case <-attempt.commitEnter:
+	case <-attempt.publishEnter:
 	case <-time.After(time.Second):
-		t.Fatal("Commit did not enter driver")
+		t.Fatal("Publish did not enter driver")
 	}
 	cancel()
-	close(attempt.commitExit)
+	close(attempt.publishExit)
 	if err := <-result; err != nil {
-		t.Fatalf("successful driver commit was downgraded: %v", err)
+		t.Fatalf("successful driver publish was downgraded: %v", err)
 	}
-	if execution.State() != ExecutionCommitted {
-		t.Fatalf("state=%d want committed", execution.State())
+	if execution.State() != ExecutionPublished {
+		t.Fatalf("state=%d want published", execution.State())
 	}
 	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("rollback after committed driver=%v", err)
+		t.Fatalf("rollback after published driver=%v", err)
 	}
-	if err := execution.FinalizeCommitted(); err != nil {
+	if err := execution.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.FinalizePublished(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -419,8 +762,14 @@ func TestExecutionFailClosedCleanupFailureRetainsRetryableOwnership(t *testing.T
 	if err := execution.FailClosed(context.Background()); !errors.Is(err, cleanupFailure) {
 		t.Fatalf("first FailClosed = %v, want cleanup failure", err)
 	}
-	if execution.State() != ExecutionRollbackRequired {
+	if execution.State() != ExecutionFailClosedRequired {
 		t.Fatalf("state=%d want cleanup ownership retained", execution.State())
+	}
+	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
+		t.Fatalf("Rollback after failed FailClosed=%v want state rejection", err)
+	}
+	if attempt.rollbackCalls.Load() != 0 {
+		t.Fatalf("failed FailClosed reopened Rollback %d time(s)", attempt.rollbackCalls.Load())
 	}
 	retired := make(chan error, 1)
 	go func() { retired <- claim.Retire(plan.Binding) }()
@@ -446,7 +795,7 @@ func TestExecutionFailClosedCleanupFailureRetainsRetryableOwnership(t *testing.T
 	}
 }
 
-func TestExecutionCommitRequiresPhysicalIncarnationChange(t *testing.T) {
+func TestExecutionNilPublishWithoutIncarnationChangeRequiresFailClosed(t *testing.T) {
 	cleanupFailure := errors.New("cleanup proof pending")
 	reporter := newTestIncarnationReporter()
 	attempt := &transactionalTestAttempt{failClosedErr: cleanupFailure}
@@ -465,27 +814,28 @@ func TestExecutionCommitRequiresPhysicalIncarnationChange(t *testing.T) {
 	if err := execution.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Cutover(context.Background()); err != nil {
+	if err := execution.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	authorizeExecutionPublish(t, execution, tx)
 	before := claim.Snapshot().Generation
-	if err := execution.Commit(context.Background()); !errors.Is(err, ErrIncarnationUnproven) {
-		t.Fatalf("Commit = %v, want incarnation proof failure", err)
+	if err := execution.Publish(context.Background()); !errors.Is(err, ErrIncarnationUnproven) {
+		t.Fatalf("Publish = %v, want incarnation proof failure", err)
 	}
 	if execution.State() != ExecutionFailClosedRequired || claim.Snapshot().Generation != before {
 		t.Fatalf("state/generation=%d/%d want fail-closed-required/%d", execution.State(), claim.Snapshot().Generation, before)
 	}
 	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("Rollback after unproven commit = %v, want state rejection", err)
+		t.Fatalf("Rollback after unproven publish = %v, want state rejection", err)
 	}
 	if calls := attempt.rollbackCalls.Load(); calls != 0 {
-		t.Fatalf("unproven commit invoked Rollback %d time(s)", calls)
+		t.Fatalf("unproven publish invoked Rollback %d time(s)", calls)
 	}
 	retired := make(chan error, 1)
 	go func() { retired <- claim.Retire(plan.Binding) }()
 	select {
 	case err := <-retired:
-		t.Fatalf("unproven commit released execution lease: %v", err)
+		t.Fatalf("unproven publish released execution lease: %v", err)
 	case <-time.After(25 * time.Millisecond):
 	}
 	if err := execution.FailClosed(context.Background()); !errors.Is(err, cleanupFailure) {
@@ -513,7 +863,7 @@ func TestExecutionCommitRequiresPhysicalIncarnationChange(t *testing.T) {
 	}
 }
 
-func TestExecutionCommitWithoutIncarnationReporterIsUnproven(t *testing.T) {
+func TestExecutionPublishWithoutIncarnationReporterIsUnproven(t *testing.T) {
 	attempt := &transactionalTestAttempt{}
 	driver := &transactionalTestDriver{
 		operation: OperationTCPRepair,
@@ -530,17 +880,18 @@ func TestExecutionCommitWithoutIncarnationReporterIsUnproven(t *testing.T) {
 	if err := execution.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Cutover(context.Background()); err != nil {
+	if err := execution.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.Commit(context.Background()); !errors.Is(err, ErrIncarnationUnproven) {
-		t.Fatalf("Commit = %v, want incarnation proof failure", err)
+	authorizeExecutionPublish(t, execution, tx)
+	if err := execution.Publish(context.Background()); !errors.Is(err, ErrIncarnationUnproven) {
+		t.Fatalf("Publish = %v, want incarnation proof failure", err)
 	}
 	if execution.State() != ExecutionFailClosedRequired {
 		t.Fatalf("state=%d want fail-closed-required", execution.State())
 	}
 	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("Rollback after unproven commit = %v, want state rejection", err)
+		t.Fatalf("Rollback after unproven publish = %v, want state rejection", err)
 	}
 	if attempt.rollbackCalls.Load() != 0 {
 		t.Fatal("missing incarnation reporter invoked Rollback")
@@ -550,10 +901,10 @@ func TestExecutionCommitWithoutIncarnationReporterIsUnproven(t *testing.T) {
 	}
 }
 
-func TestExecutionUsesClaimIncarnationReporterForCommitAndRollback(t *testing.T) {
-	t.Run("commit", func(t *testing.T) {
+func TestExecutionUsesClaimIncarnationReporterForPublishAndRollback(t *testing.T) {
+	t.Run("publish", func(t *testing.T) {
 		reporter := newTestIncarnationReporter()
-		attempt := &transactionalTestAttempt{commitHook: func() { reporter.value.Add(1) }}
+		attempt := &transactionalTestAttempt{publishHook: func() { reporter.value.Add(1) }}
 		driver := &transactionalTestDriver{
 			operation: OperationTCPRepair,
 			result: PreflightResult{
@@ -570,26 +921,30 @@ func TestExecutionUsesClaimIncarnationReporterForCommitAndRollback(t *testing.T)
 		if err := execution.Prepare(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if err := execution.Cutover(context.Background()); err != nil {
+		if err := execution.Stage(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if err := execution.Commit(context.Background()); err != nil {
+		authorizeExecutionPublish(t, execution, tx)
+		if err := execution.Publish(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer execution.FinalizeCommitted()
+		defer execution.FinalizePublished()
 		if claim.Snapshot().Generation == before {
-			t.Fatal("commit reporter change did not advance claim generation")
+			t.Fatal("publish reporter change did not advance claim generation")
 		}
-		if err := execution.FinalizeCommitted(); err != nil {
+		if err := execution.Activate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.FinalizePublished(); err != nil {
 			t.Fatal(err)
 		}
 	})
 
 	t.Run("rollback", func(t *testing.T) {
 		reporter := newTestIncarnationReporter()
-		cutoverFailure := errors.New("cutover failed after reconstruction")
+		stageFailure := errors.New("stage failed after reconstruction")
 		attempt := &transactionalTestAttempt{
-			cutoverErr:   cutoverFailure,
+			stageErr:     stageFailure,
 			rollbackHook: func() { reporter.value.Add(1) },
 		}
 		driver := &transactionalTestDriver{
@@ -608,8 +963,8 @@ func TestExecutionUsesClaimIncarnationReporterForCommitAndRollback(t *testing.T)
 		if err := execution.Prepare(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if err := execution.Cutover(context.Background()); !errors.Is(err, cutoverFailure) {
-			t.Fatalf("Cutover = %v", err)
+		if err := execution.Stage(context.Background()); !errors.Is(err, stageFailure) {
+			t.Fatalf("Stage = %v", err)
 		}
 		if err := execution.Rollback(context.Background()); err != nil {
 			t.Fatal(err)
@@ -625,7 +980,7 @@ func TestExecutionUsesClaimIncarnationReporterForCommitAndRollback(t *testing.T)
 func TestExecutionRollbackAdvancesGenerationOnlyAfterReconstruction(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("changed_%t", changed), func(t *testing.T) {
-			attempt := &transactionalTestAttempt{cutoverErr: errors.New("forced cutover failure"), endpointChanged: changed}
+			attempt := &transactionalTestAttempt{stageErr: errors.New("forced stage failure"), endpointChanged: changed}
 			driver := &transactionalTestDriver{
 				operation: OperationTCPRepair,
 				result: PreflightResult{
@@ -641,8 +996,8 @@ func TestExecutionRollbackAdvancesGenerationOnlyAfterReconstruction(t *testing.T
 			if err := execution.Prepare(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if err := execution.Cutover(context.Background()); err == nil {
-				t.Fatal("Cutover unexpectedly succeeded")
+			if err := execution.Stage(context.Background()); err == nil {
+				t.Fatal("Stage unexpectedly succeeded")
 			}
 			if err := execution.Rollback(context.Background()); err != nil {
 				t.Fatal(err)
@@ -745,8 +1100,8 @@ func TestExecutionSerializesDriverSteps(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Prepare did not enter driver")
 	}
-	if err := execution.Cutover(context.Background()); !errors.Is(err, ErrExecutionBusy) {
-		t.Fatalf("concurrent cutover=%v want=%v", err, ErrExecutionBusy)
+	if err := execution.Stage(context.Background()); !errors.Is(err, ErrExecutionBusy) {
+		t.Fatalf("concurrent stage=%v want=%v", err, ErrExecutionBusy)
 	}
 	close(attempt.prepareExit)
 	if err := <-prepared; err != nil {
@@ -971,13 +1326,23 @@ func executableClaimFixtureWithReporter(
 	driver Driver,
 	reporter IncarnationReporter,
 ) (*AuthorityIssuer, *Claim, Plan, *ResourceTransaction) {
+	return executableClaimFixtureWithDeadlineAndReporter(
+		t, driver, canonicalTime(time.Now().Add(time.Minute)), reporter,
+	)
+}
+
+func executableClaimFixtureWithDeadlineAndReporter(
+	t testing.TB,
+	driver Driver,
+	deadline time.Time,
+	reporter IncarnationReporter,
+) (*AuthorityIssuer, *Claim, Plan, *ResourceTransaction) {
 	t.Helper()
 	resource := MustNewResource(ScopeEndpoint)
 	binding := testBinding(31)
 	claim := MustNewDrivenClaimWithIncarnation(testDrivenFacts(), driver, resource, reporter)
 	issuer := bindDrivenClaim(t, claim, binding)
 	t.Cleanup(func() { _ = claim.Retire(binding) })
-	deadline := canonicalTime(time.Now().Add(time.Minute))
 	plan, err := PlanCandidate(context.Background(), claim, PlanRequest{
 		TransactionID: TransactionID{0xe1, 0xe2}, Binding: binding,
 		Direction: protoDirectionForExecutionTest(), Session: SessionStream,
@@ -991,12 +1356,6 @@ func executableClaimFixtureWithReporter(
 		t.Fatal(err)
 	}
 	if err := tx.MarkPrepared(plan.BaseGeneration+1, plan.Deadline); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.MarkCommitPublished(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.MarkFinalAccepted(); err != nil {
 		t.Fatal(err)
 	}
 	return issuer, claim, plan, tx
@@ -1035,13 +1394,37 @@ func executableClaimFixtureWithDeadline(
 	if err := tx.MarkPrepared(plan.BaseGeneration+1, plan.Deadline); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.MarkCommitPublished(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.MarkFinalAccepted(); err != nil {
-		t.Fatal(err)
-	}
 	return issuer, claim, plan, tx
+}
+
+func authorizeExecutionPublish(t testing.TB, execution *Execution, transaction *ResourceTransaction) {
+	t.Helper()
+	digest, err := execution.PublicationDigest()
+	if err != nil {
+		t.Fatalf("PublicationDigest: %v", err)
+	}
+	if digest == (proto.LeafMobilityPublicationDigest{}) {
+		t.Fatal("PublicationDigest returned zero digest")
+	}
+	if err := transaction.MarkCommitPublished(); err != nil {
+		t.Fatalf("MarkCommitPublished: %v", err)
+	}
+	if state := transaction.State(); state != ResourceTransactionCommitPublished {
+		t.Fatalf("transaction state=%d want commit-published", state)
+	}
+	disposition, err := execution.ResolveFinalAcceptance(true)
+	if err != nil {
+		t.Fatalf("ResolveFinalAcceptance: %v", err)
+	}
+	if disposition != FinalAcceptancePublishAllowed {
+		t.Fatalf("FINAL disposition=%d want publish-allowed", disposition)
+	}
+	if state := transaction.State(); state != ResourceTransactionPublishAuthorized {
+		t.Fatalf("transaction state=%d want publish-authorized", state)
+	}
+	if state := execution.State(); state != ExecutionPublishAuthorized {
+		t.Fatalf("execution state=%d want publish-authorized", state)
+	}
 }
 
 func consumeExecutableClaim(t testing.TB, driver Driver) *Execution {
@@ -1056,23 +1439,23 @@ func consumeExecutableClaim(t testing.TB, driver Driver) *Execution {
 
 func testPeerAgreement(plan Plan) PeerAgreement {
 	binding := proto.LeafMobilityPeerPlanBinding{
-		CoordinatorSide: proto.LeafMobilityActorClient,
-		ActorSide:       proto.LeafMobilityActorClient,
-		Direction:       plan.Direction,
-		SessionKind:     protocolSession(plan.Session),
-		Operation:       protocolOperation(plan.Operation),
-		Fallback:        proto.LeafMobilityFallbackRedialAttach,
-		LeaseMillis:     1_000,
-		SessionEpoch:    proto.SessionEpoch(plan.Binding.FlowID),
-		TransactionID:   [16]byte(plan.TransactionID),
-		ClientGraph:     proto.GraphBinding{Revision: 1, Digest: proto.GraphDigest{1}},
-		ServerGraph:     proto.GraphBinding{Revision: 1, Digest: proto.GraphDigest{2}},
-		ClientTargetID:  proto.TargetID(plan.Binding.LocalTargetID),
-		ServerTargetID:  proto.TargetID(plan.Binding.PeerTargetID),
-		BaseGeneration:  plan.BaseGeneration,
-		ResourceScope:   protocolScope(plan.Scope),
-		ResourceID:      proto.LeafMobilityResourceID(plan.ResourceID),
-		RouteGeneration: 9,
+		CoordinatorSide:        proto.LeafMobilityActorClient,
+		ActorSide:              proto.LeafMobilityActorClient,
+		Direction:              plan.Direction,
+		SessionKind:            protocolSession(plan.Session),
+		Operation:              protocolOperation(plan.Operation),
+		Fallback:               proto.LeafMobilityFallbackRedialAttach,
+		LeaseMillis:            1_000,
+		SessionEpoch:           proto.SessionEpoch(plan.Binding.FlowID),
+		TransactionID:          [16]byte(plan.TransactionID),
+		ClientGraph:            proto.GraphBinding{Revision: 1, Digest: proto.GraphDigest{1}},
+		ServerGraph:            proto.GraphBinding{Revision: 1, Digest: proto.GraphDigest{2}},
+		SubjectClientTargetID:  proto.TargetID(plan.Binding.LocalTargetID),
+		SubjectServerTargetID:  proto.TargetID(plan.Binding.PeerTargetID),
+		BaseGeneration:         plan.BaseGeneration,
+		ResourceScope:          protocolScope(plan.Scope),
+		ResourceID:             proto.LeafMobilityResourceID(plan.ResourceID),
+		SubjectRouteGeneration: 9,
 	}
 	actorPlan := proto.LeafMobilityPlanDigest(plan.LocalDigest)
 	prepare := proto.LeafMobilityPeerPlanPrepare{

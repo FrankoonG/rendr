@@ -42,7 +42,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 11
+	ProtocolMinor uint16 = 12
 )
 
 type FeatureSet uint64
@@ -83,8 +83,12 @@ const (
 	// execution domain. Minor-10 peers cannot safely interpret these plan
 	// digests and must reject before allocating session state.
 	FeatureLeafMobilityTypedExecution FeatureSet = 1 << 14
+	// FeatureLeafMobilityStagedPublication requires the actor to stage and bind
+	// a private successor before COMMIT, then publish it only after a correlated
+	// FINAL. The publication digest is echoed through terminal resolution.
+	FeatureLeafMobilityStagedPublication FeatureSet = 1 << 15
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 

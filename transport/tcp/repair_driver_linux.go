@@ -67,6 +67,10 @@ type repairAttemptExecutor interface {
 	Close(context.Context) error
 }
 
+type repairAttemptExecutorState interface {
+	Closed() bool
+}
+
 type repairExecutorFactory func(
 	context.Context,
 	*net.TCPConn,
@@ -397,8 +401,9 @@ type repairAttemptStage uint8
 const (
 	repairAttemptPreflight repairAttemptStage = iota + 1
 	repairAttemptPrepared
-	repairAttemptCutover
-	repairAttemptCommitted
+	repairAttemptStaged
+	repairAttemptPublished
+	repairAttemptActivated
 	repairAttemptRolledBack
 	repairAttemptFailedClosed
 )
@@ -419,7 +424,9 @@ type tcpRepairAttempt struct {
 	snapshot              *tcprepair.Snapshot
 	sourceLease           repairSource
 	replacement           *net.TCPConn
-	replacementReady      bool
+	replacementPublished  bool
+	replacementDiscarding bool
+	quarantineUnverified  bool
 	restoreCleanupUnknown bool
 	endpointChanged       bool
 	executor              repairAttemptExecutor
@@ -486,6 +493,7 @@ func (attempt *tcpRepairAttempt) Prepare(ctx context.Context, request leafmobili
 	})
 	if lease != nil {
 		attempt.quarantine = lease
+		attempt.quarantineUnverified = err != nil
 	}
 	if err != nil {
 		return err
@@ -494,14 +502,17 @@ func (attempt *tcpRepairAttempt) Prepare(ctx context.Context, request leafmobili
 	return nil
 }
 
-func (attempt *tcpRepairAttempt) Cutover(ctx context.Context, request leafmobility.ExecutionRequest) error {
+func (attempt *tcpRepairAttempt) Stage(
+	ctx context.Context,
+	request leafmobility.ExecutionRequest,
+) (leafmobility.PublicationEvidence, error) {
 	if attempt == nil || attempt.driver == nil {
-		return errors.New("tcp: nil repair attempt")
+		return leafmobility.PublicationEvidence{}, errors.New("tcp: nil repair attempt")
 	}
 	attempt.mu.Lock()
 	defer attempt.mu.Unlock()
 	if attempt.stage != repairAttemptPrepared || !attempt.matches(request) || attempt.source == nil || attempt.quarantine == nil {
-		return errors.New("tcp: repair Cutover is not prepared")
+		return leafmobility.PublicationEvidence{}, errors.New("tcp: repair Stage is not prepared")
 	}
 	var sourceLease repairSource
 	err := attempt.executor.Do(ctx, func(context.Context) error {
@@ -514,33 +525,15 @@ func (attempt *tcpRepairAttempt) Cutover(ctx context.Context, request leafmobili
 		attempt.snapshot = sourceLease.Snapshot()
 	}
 	if err != nil {
-		return err
+		return leafmobility.PublicationEvidence{}, err
 	}
 	if attempt.sourceLease == nil || attempt.sourceLease.State() != tcprepair.SourceStateRepair || attempt.snapshot == nil {
-		return errors.New("tcp: repair capture returned contradictory source state")
+		return leafmobility.PublicationEvidence{}, errors.New("tcp: repair capture returned contradictory source state")
 	}
 	if attempt.snapshot.Tuple() != attempt.inspection.Tuple {
-		return errors.New("tcp: repair snapshot tuple changed")
+		return leafmobility.PublicationEvidence{}, errors.New("tcp: repair snapshot tuple changed")
 	}
-	attempt.stage = repairAttemptCutover
-	return nil
-}
-
-func (attempt *tcpRepairAttempt) Commit(ctx context.Context, request leafmobility.ExecutionRequest) error {
-	if attempt == nil || attempt.driver == nil {
-		return errors.New("tcp: nil repair attempt")
-	}
-	attempt.mu.Lock()
-	defer attempt.mu.Unlock()
-	if attempt.stage != repairAttemptCutover || !attempt.matches(request) || attempt.snapshot == nil ||
-		attempt.maintenance == nil || attempt.source == nil || attempt.sourceLease == nil ||
-		attempt.sourceLease.State() != tcprepair.SourceStateRepair {
-		return errors.New("tcp: repair Commit is not cut over")
-	}
-	if attempt.executor == nil {
-		return errors.New("tcp: repair Commit lost its namespace executor")
-	}
-	err := attempt.executor.Do(ctx, func(operationCtx context.Context) error {
+	err = attempt.executor.Do(ctx, func(operationCtx context.Context) error {
 		if closeErr := attempt.sourceLease.Close(); closeErr != nil {
 			return fmt.Errorf("tcp: close captured source: %w", closeErr)
 		}
@@ -553,23 +546,61 @@ func (attempt *tcpRepairAttempt) Commit(ctx context.Context, request leafmobilit
 			return restoreErr
 		}
 		attempt.replacement = replacement
-		if replaceErr := attempt.maintenance.Replace(replacement); replaceErr != nil {
-			return errors.Join(replaceErr, attempt.discardReplacement())
-		}
-		attempt.replacementReady = true
-		attempt.endpointChanged = true
-		return attempt.releaseQuarantine(operationCtx)
+		return nil
 	})
 	if err != nil {
+		return leafmobility.PublicationEvidence{}, err
+	}
+	attempt.stage = repairAttemptStaged
+	return leafmobility.PublicationEvidence{Digest: leafmobility.EvidenceDigest(attempt.snapshot.Digest())}, nil
+}
+
+func (attempt *tcpRepairAttempt) Publish(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	if attempt == nil || attempt.driver == nil {
+		return errors.New("tcp: nil repair attempt")
+	}
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.stage != repairAttemptStaged || !attempt.matches(request) || attempt.maintenance == nil ||
+		attempt.replacement == nil || attempt.replacementPublished {
+		return errors.New("tcp: repair Publish is not staged")
+	}
+	if err := attempt.maintenance.ReplaceContext(ctx, attempt.replacement); err != nil {
 		return err
 	}
-	if err := attempt.closeExecutor(ctx); err != nil {
-		return err
+	attempt.replacementPublished = true
+	attempt.endpointChanged = true
+	attempt.stage = repairAttemptPublished
+	return nil
+}
+
+func (attempt *tcpRepairAttempt) Activate(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	if attempt == nil || attempt.driver == nil {
+		return errors.New("tcp: nil repair attempt")
+	}
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.stage == repairAttemptActivated {
+		return nil
+	}
+	if attempt.stage != repairAttemptPublished || !attempt.matches(request) || !attempt.replacementPublished {
+		return errors.New("tcp: repair Activate is not published")
 	}
 	if err := attempt.resumeEndpoint(); err != nil {
 		return err
 	}
-	attempt.stage = repairAttemptCommitted
+	if attempt.quarantine != nil {
+		if attempt.executor == nil {
+			return errors.New("tcp: repair Activate lost quarantine namespace ownership")
+		}
+		if err := attempt.executor.Do(ctx, attempt.releaseQuarantine); err != nil {
+			return err
+		}
+	}
+	if err := attempt.closeExecutor(ctx); err != nil {
+		return err
+	}
+	attempt.stage = repairAttemptActivated
 	return nil
 }
 
@@ -579,11 +610,14 @@ func (attempt *tcpRepairAttempt) Rollback(ctx context.Context, request leafmobil
 	}
 	attempt.mu.Lock()
 	defer attempt.mu.Unlock()
-	if !attempt.matches(request) || attempt.stage == repairAttemptCommitted {
+	if !attempt.matches(request) || attempt.stage == repairAttemptPublished || attempt.stage == repairAttemptActivated {
 		return errors.New("tcp: repair Rollback request does not match active attempt")
 	}
 	if attempt.stage == repairAttemptRolledBack {
 		return nil
+	}
+	if attempt.endpointTerminated {
+		return errors.New("tcp: repair Rollback cannot restore a fail-closed endpoint")
 	}
 	if attempt.maintenance == nil {
 		if attempt.quarantine != nil {
@@ -600,21 +634,27 @@ func (attempt *tcpRepairAttempt) Rollback(ctx context.Context, request leafmobil
 		attempt.stage = repairAttemptRolledBack
 		return nil
 	}
-	needsNamespace := attempt.replacement != nil || attempt.replacementReady || attempt.sourceLease != nil || attempt.quarantine != nil
+	needsNamespace := attempt.replacement != nil || attempt.replacementPublished || attempt.sourceLease != nil || attempt.quarantine != nil
 	if needsNamespace {
 		if attempt.executor == nil {
 			return errors.New("tcp: repair Rollback lost its namespace executor")
 		}
 		if err := attempt.executor.Do(ctx, func(operationCtx context.Context) error {
-			if attempt.replacement != nil && !attempt.replacementReady {
-				if err := attempt.discardReplacement(); err != nil {
-					return err
-				}
+			if attempt.replacementPublished {
+				return nil
 			}
-			if attempt.replacementReady {
-				// A failed Commit may already have published a valid replacement.
-				// Keep it; rollback refers to the bilateral decision, not to reviving a
-				// kernel fd that no longer exists.
+			if attempt.replacementDiscarding {
+				if discardErr := attempt.discardReplacement(); discardErr != nil {
+					return discardErr
+				}
+				attempt.replacementDiscarding = false
+			}
+			if attempt.replacement != nil {
+				if replaceErr := attempt.maintenance.Replace(attempt.replacement); replaceErr != nil {
+					return replaceErr
+				}
+				attempt.replacementPublished = true
+				attempt.endpointChanged = true
 			} else if attempt.sourceLease != nil && attempt.sourceLease.State() == tcprepair.SourceStateClosed {
 				if attempt.restoreCleanupUnknown {
 					return tcprepair.ErrRestoreCleanupUnknown
@@ -628,24 +668,34 @@ func (attempt *tcpRepairAttempt) Rollback(ctx context.Context, request leafmobil
 				}
 				attempt.replacement = replacement
 				if replaceErr := attempt.maintenance.Replace(replacement); replaceErr != nil {
-					return errors.Join(replaceErr, attempt.discardReplacement())
+					discardErr := attempt.discardReplacement()
+					attempt.replacementDiscarding = discardErr != nil && attempt.replacement != nil
+					return errors.Join(replaceErr, discardErr)
 				}
-				attempt.replacementReady = true
+				attempt.replacementPublished = true
 				attempt.endpointChanged = true
 			} else if attempt.sourceLease != nil {
 				if resumeErr := attempt.sourceLease.Resume(); resumeErr != nil {
 					return resumeErr
 				}
 			}
-			return attempt.releaseQuarantine(operationCtx)
+			return nil
 		}); err != nil {
 			return err
 		}
 	}
-	if err := attempt.closeExecutor(ctx); err != nil {
+	if err := attempt.resumeEndpoint(); err != nil {
 		return err
 	}
-	if err := attempt.resumeEndpoint(); err != nil {
+	if attempt.quarantine != nil {
+		if attempt.executor == nil {
+			return errors.New("tcp: repair Rollback lost quarantine namespace ownership")
+		}
+		if err := attempt.executor.Do(ctx, attempt.releaseQuarantine); err != nil {
+			return err
+		}
+	}
+	if err := attempt.closeExecutor(ctx); err != nil {
 		return err
 	}
 	attempt.stage = repairAttemptRolledBack
@@ -667,7 +717,7 @@ func (attempt *tcpRepairAttempt) FailClosed(ctx context.Context, request leafmob
 	if attempt.stage == repairAttemptFailedClosed {
 		return nil
 	}
-	if attempt.stage == repairAttemptCommitted && attempt.maintenance == nil {
+	if attempt.maintenance == nil && !attempt.endpointTerminated {
 		maintenance, err := attempt.driver.endpoint.beginMaintenance(ctx)
 		if err != nil {
 			return err
@@ -676,6 +726,9 @@ func (attempt *tcpRepairAttempt) FailClosed(ctx context.Context, request leafmob
 	}
 
 	if !attempt.endpointTerminated {
+		if err := attempt.ensureFailClosedQuarantine(ctx); err != nil {
+			return err
+		}
 		terminate := func(context.Context) error {
 			var closeErr error
 			var terminalConn net.Conn
@@ -683,7 +736,7 @@ func (attempt *tcpRepairAttempt) FailClosed(ctx context.Context, request leafmob
 				// Enter is best effort: the still-active quarantine is the RST
 				// containment boundary. Close is the resource-ownership proof.
 				_ = attempt.driver.kernel.Enter(attempt.replacement)
-				if attempt.replacementReady {
+				if attempt.replacementPublished {
 					terminalConn = attempt.replacement
 				}
 				closeErr = attempt.closeReplacementHandle()
@@ -691,13 +744,13 @@ func (attempt *tcpRepairAttempt) FailClosed(ctx context.Context, request leafmob
 					return fmt.Errorf("tcp: fail-closed replacement close: %w", closeErr)
 				}
 			}
-			if !attempt.replacementReady && attempt.sourceLease != nil {
+			if !attempt.replacementPublished && attempt.sourceLease != nil {
 				terminalConn = attempt.source
 				closeErr = attempt.sourceLease.Close()
 				if closeErr != nil && attempt.sourceLease.State() == tcprepair.SourceStateClosed {
 					closeErr = nil
 				}
-			} else if !attempt.replacementReady && attempt.source != nil {
+			} else if !attempt.replacementPublished && attempt.source != nil {
 				terminalConn = attempt.source
 				_ = attempt.driver.kernel.Enter(attempt.source)
 				closeErr = attempt.source.Close()
@@ -776,7 +829,58 @@ func (attempt *tcpRepairAttempt) releaseQuarantine(ctx context.Context) error {
 		return err
 	}
 	attempt.quarantine = nil
+	attempt.quarantineUnverified = false
 	return nil
+}
+
+func (attempt *tcpRepairAttempt) ensureFailClosedQuarantine(ctx context.Context) error {
+	if attempt.quarantine != nil && !attempt.quarantineUnverified {
+		return nil
+	}
+	if attempt.quarantine != nil {
+		if attempt.executor == nil {
+			return errors.New("tcp: fail-closed lost unverified quarantine namespace ownership")
+		}
+		if err := attempt.executor.Do(ctx, attempt.releaseQuarantine); err != nil {
+			return err
+		}
+	}
+	if attempt.maintenance == nil || attempt.driver.quarantine == nil || attempt.driver.newExecutor == nil {
+		return errors.New("tcp: fail-closed cannot establish RST quarantine")
+	}
+	conn, ok := attempt.maintenance.Conn().(*net.TCPConn)
+	if !ok || conn == nil {
+		return errors.New("tcp: fail-closed endpoint is not raw TCP")
+	}
+	if attempt.executor == nil {
+		executor, err := attempt.driver.newExecutor(ctx, conn, attempt.preflight.ContextDigest)
+		if err != nil {
+			return err
+		}
+		attempt.executor = executor
+	}
+	return attempt.executor.Do(ctx, func(operationCtx context.Context) error {
+		lease, installErr := attempt.driver.quarantine.Install(
+			operationCtx,
+			tcpquarantine.TransactionID(attempt.preflight.TransactionID),
+			quarantineTuple(attempt.inspection.Tuple),
+		)
+		if lease != nil {
+			attempt.quarantine = lease
+			attempt.quarantineUnverified = installErr != nil
+		}
+		if installErr == nil {
+			if lease == nil {
+				return errors.New("tcp: fail-closed quarantine install returned no lease")
+			}
+			return nil
+		}
+		if lease == nil {
+			return installErr
+		}
+		cleanupErr := attempt.releaseQuarantine(operationCtx)
+		return errors.Join(installErr, cleanupErr)
+	})
 }
 
 func (attempt *tcpRepairAttempt) resumeEndpoint() error {
@@ -820,7 +924,8 @@ func (attempt *tcpRepairAttempt) closeExecutor(ctx context.Context) error {
 		return nil
 	}
 	err := attempt.executor.Close(ctx)
-	if err == nil || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+	state, stateKnown := attempt.executor.(repairAttemptExecutorState)
+	if err == nil || (stateKnown && state.Closed()) {
 		attempt.executor = nil
 	}
 	return err

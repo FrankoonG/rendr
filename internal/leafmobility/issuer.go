@@ -49,9 +49,10 @@ func (i *AuthorityIssuer) BindClaim(claim *Claim, binding Binding) error {
 	return claim.bind(binding, i.token)
 }
 
-// ConsumeExecution atomically binds a correlated FINAL agreement to the exact
-// claim, resource transaction, plan, issuer domain, driver and preflight
-// attempt. Driver code is invoked only after all locks are released.
+// ConsumeExecution atomically binds a correlated PREPARED reservation to the
+// exact claim, resource transaction, plan, issuer domain, driver and preflight
+// attempt. It authorizes private staging only. Execution.Publish remains
+// impossible until the engine later records correlated FINAL authorization.
 func (i *AuthorityIssuer) ConsumeExecution(
 	claim *Claim,
 	transaction *ResourceTransaction,
@@ -118,7 +119,7 @@ func (i *AuthorityIssuer) ConsumeExecution(
 		claim.mu.Unlock()
 		return nil, ErrAuthorityStale
 	}
-	if err := token.consumeLocked(); err != nil {
+	if err := token.stageExecutionLocked(); err != nil {
 		resource.mu.Unlock()
 		claim.mu.Unlock()
 		return nil, err
@@ -155,7 +156,7 @@ func validatePeerAgreement(plan Plan, agreement PeerAgreement) error {
 	if binding.ActorSide == proto.LeafMobilityActorServer {
 		clientTarget, serverTarget = serverTarget, clientTarget
 	}
-	if binding.ClientTargetID != clientTarget || binding.ServerTargetID != serverTarget {
+	if binding.SubjectClientTargetID != clientTarget || binding.SubjectServerTargetID != serverTarget {
 		return ErrInvalidPeerAgreement
 	}
 	prepare := proto.LeafMobilityPeerPlanPrepare{

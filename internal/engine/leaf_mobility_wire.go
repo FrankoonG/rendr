@@ -7,19 +7,32 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 )
 
+// ErrLeafMobilityControlRouteUnavailable means no path is independent from
+// the mobility subject and currently eligible to carry its OOB control frame.
+var ErrLeafMobilityControlRouteUnavailable = errors.New("engine: leaf mobility control route unavailable")
+
+const leafMobilityControlRouteAttemptLimit = time.Second
+
+type leafMobilityControlCandidate struct {
+	ref                  PathRef
+	slot                 *pathSlot
+	subject              *pathSlot
+	allowDetachedSubject bool
+}
+
 func (e *Engine) routeLeafMobilityOOB(slot *pathSlot, header proto.Header, payload []byte) error {
-	source := pathRefForSlot(slot)
-	routeGeneration := slot.routeGeneration.Load()
-	if source.ID == 0 || routeGeneration == 0 {
+	control := pathRefForSlot(slot)
+	if control.ID == 0 {
 		return nil
 	}
-	message := leafMobilityMessage{source: source, seq: header.Seq}
+	message := leafMobilityMessage{seq: header.Seq}
 	var binding proto.LeafMobilityPeerPlanBinding
 	switch code := proto.CtrlCodeFromFlags(header.Flags); code {
 	case proto.CtrlLeafMobilityPrepare:
@@ -46,18 +59,25 @@ func (e *Engine) routeLeafMobilityOOB(slot *pathSlot, header proto.Header, paylo
 	default:
 		return fmt.Errorf("unknown leaf mobility control %s", code)
 	}
-	clientTarget, serverTarget := slot.localTXTargetID, slot.peerTXTargetID
-	if e.side == SideServer {
-		clientTarget, serverTarget = slot.peerTXTargetID, slot.localTXTargetID
+	if err := binding.Validate(); err != nil {
+		return err
 	}
-	if binding.SessionEpoch != proto.SessionEpoch(e.FlowID()) ||
-		binding.ClientTargetID != clientTarget || binding.ServerTargetID != serverTarget ||
-		binding.RouteGeneration != routeGeneration {
-		// A byte-exact old-route frame may surface on a replacement carrier.
-		// It cannot authorize that carrier and is benign stale replay.
+	if binding.SessionEpoch != proto.SessionEpoch(e.FlowID()) {
 		return nil
 	}
-	key := leafMobilityOOBKey{source: source, seq: header.Seq}
+	subject, ok := e.resolveLeafMobilitySubject(binding)
+	if !ok {
+		return nil
+	}
+	if control == subject || e.leafMobilityControlConflictsWithBinding(slot, binding) ||
+		e.leafMobilityControlConflictsWithSubject(slot, subject) {
+		// A stale exact frame can legitimately arrive after its former path was
+		// replaced. It is not an independent control route, so drop it without
+		// authorizing state or turning a harmless replay into a session close.
+		return nil
+	}
+	message.source = subject
+	key := leafMobilityOOBKey{source: subject, seq: header.Seq}
 	digest := recvFrameDigest(header, payload)
 	now := time.Now()
 	e.leafTx.oobMu.Lock()
@@ -91,6 +111,96 @@ func (e *Engine) routeLeafMobilityOOB(slot *pathSlot, header proto.Header, paylo
 	return nil
 }
 
+func (e *Engine) leafMobilityControlConflictsWithSubject(control *pathSlot, subject PathRef) bool {
+	e.pathsMu.RLock()
+	subjectSlot := e.leafMobilitySubjectSlotLocked(subject)
+	conflicts := subjectSlot != nil && subjectSlot.owner == subject.Owner && control != nil &&
+		(control.localTXTargetID == subjectSlot.localTXTargetID && control.peerTXTargetID == subjectSlot.peerTXTargetID)
+	if !conflicts && subjectSlot != nil && subjectSlot.owner == subject.Owner && control != nil &&
+		subjectSlot.mobilityClaim != nil && control.mobilityClaim != nil {
+		subjectResource := subjectSlot.mobilityClaim.Snapshot().ResourceID
+		conflicts = subjectResource != (leafmobility.ResourceID{}) && subjectResource == control.mobilityClaim.Snapshot().ResourceID
+	}
+	e.pathsMu.RUnlock()
+	return conflicts
+}
+
+func (e *Engine) leafMobilityControlConflictsWithBinding(
+	control *pathSlot,
+	binding proto.LeafMobilityPeerPlanBinding,
+) bool {
+	if control == nil {
+		return false
+	}
+	localTarget, peerTarget := binding.SubjectClientTargetID, binding.SubjectServerTargetID
+	if e.side == SideServer {
+		localTarget, peerTarget = peerTarget, localTarget
+	}
+	if control.localTXTargetID == localTarget && control.peerTXTargetID == peerTarget {
+		return true
+	}
+	if control.mobilityClaim == nil || binding.ResourceID == (proto.LeafMobilityResourceID{}) {
+		return false
+	}
+	resourceID := control.mobilityClaim.Snapshot().ResourceID
+	return resourceID != (leafmobility.ResourceID{}) &&
+		proto.LeafMobilityResourceID(resourceID) == binding.ResourceID
+}
+
+func (e *Engine) resolveLeafMobilitySubject(binding proto.LeafMobilityPeerPlanBinding) (PathRef, bool) {
+	localTarget, peerTarget := binding.SubjectClientTargetID, binding.SubjectServerTargetID
+	if e.side == SideServer {
+		localTarget, peerTarget = peerTarget, localTarget
+	}
+	e.pathsMu.RLock()
+	var subject PathRef
+	for _, slots := range []map[uint32]*pathSlot{e.paths, e.retainedPaths, e.stagedPaths} {
+		for _, candidate := range slots {
+			if candidate.localTXTargetID != localTarget || candidate.peerTXTargetID != peerTarget ||
+				candidate.routeGeneration.Load() != binding.SubjectRouteGeneration {
+				continue
+			}
+			if subject.ID != 0 && subject != pathRefForSlot(candidate) {
+				e.pathsMu.RUnlock()
+				return PathRef{}, false
+			}
+			subject = pathRefForSlot(candidate)
+		}
+	}
+	e.pathsMu.RUnlock()
+	if subject.ID != 0 {
+		return subject, true
+	}
+
+	// A transaction keeps its exact subject owner after administrative
+	// topology retirement so FINAL/RELEASED can still arrive over a sibling
+	// control route. This is lookup evidence only; it never reactivates the
+	// retired subject for DATA.
+	e.leafTx.mu.Lock()
+	defer e.leafTx.mu.Unlock()
+	if outgoing := e.leafTx.outgoing; outgoing != nil &&
+		outgoing.prepare.LeafMobilityPeerPlanBinding == binding {
+		return outgoing.source, true
+	}
+	if incoming := e.leafTx.incoming[binding.TransactionID]; incoming != nil &&
+		incoming.prepare.LeafMobilityPeerPlanBinding == binding {
+		return incoming.source, true
+	}
+	if completed, ok := e.leafTx.completed[binding.TransactionID]; ok &&
+		completed.prepare.LeafMobilityPeerPlanBinding == binding {
+		return completed.source, true
+	}
+	if rejected, ok := e.leafTx.rejected[binding.TransactionID]; ok &&
+		rejected.prepare.LeafMobilityPeerPlanBinding == binding {
+		return rejected.source, true
+	}
+	if terminal, ok := e.leafTx.actorTerminal[binding.TransactionID]; ok &&
+		terminal.prepare.LeafMobilityPeerPlanBinding == binding {
+		return terminal.source, true
+	}
+	return PathRef{}, false
+}
+
 func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan) (*leafmobility.Claim, *pathSlot, error) {
 	if e == nil || ref.ID == 0 || ref.Owner == 0 || e.isClosed() || e.sendClosing.Load() {
 		return nil, nil, net.ErrClosed
@@ -118,16 +228,16 @@ func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan)
 	return claim, slot, nil
 }
 
-func (e *Engine) leafClaimForRef(ref PathRef) (*leafmobility.Claim, bool) {
+func (e *Engine) leafClaimForRef(ref PathRef) (*leafmobility.Claim, *pathSlot, bool) {
 	e.pathsMu.RLock()
 	slot := e.paths[ref.ID]
 	if slot == nil || slot.owner != ref.Owner || slot.mobilityClaim == nil || slot.maintenance.Load() {
 		e.pathsMu.RUnlock()
-		return nil, false
+		return nil, nil, false
 	}
 	claim := slot.mobilityClaim
 	e.pathsMu.RUnlock()
-	return claim, true
+	return claim, slot, true
 }
 
 func (e *Engine) leafSourceCurrent(ref PathRef, claim *leafmobility.Claim) bool {
@@ -158,7 +268,7 @@ func (e *Engine) validateLeafMobilityAuthoritySourceLocked(outgoing *outgoingLea
 	}
 	slot := e.paths[outgoing.source.ID]
 	if slot == nil || slot.owner != outgoing.source.Owner || slot.mobilityClaim != outgoing.claim || slot.maintenance.Load() ||
-		slot.routeGeneration.Load() == 0 || slot.routeGeneration.Load() != outgoing.prepare.RouteGeneration {
+		slot.routeGeneration.Load() == 0 || slot.routeGeneration.Load() != outgoing.prepare.SubjectRouteGeneration {
 		return ErrStalePathRef
 	}
 	plan := outgoing.resourceTx.Snapshot().Plan
@@ -197,7 +307,7 @@ func (e *Engine) validateIncomingLeafMobilityBinding(ref PathRef, binding proto.
 	e.pathsMu.RLock()
 	slot := e.paths[ref.ID]
 	if slot == nil || slot.owner != ref.Owner || slot.routeGeneration.Load() == 0 ||
-		binding.RouteGeneration != slot.routeGeneration.Load() {
+		binding.SubjectRouteGeneration != slot.routeGeneration.Load() {
 		e.pathsMu.RUnlock()
 		return ErrStalePathRef
 	}
@@ -211,7 +321,7 @@ func (e *Engine) validateIncomingLeafMobilityBinding(ref PathRef, binding proto.
 		clientTarget, serverTarget = peerTarget, localTarget
 	}
 	if binding.ClientGraph != clientGraph || binding.ServerGraph != serverGraph ||
-		binding.ClientTargetID != clientTarget || binding.ServerTargetID != serverTarget {
+		binding.SubjectClientTargetID != clientTarget || binding.SubjectServerTargetID != serverTarget {
 		return fmt.Errorf("leaf mobility graph or target binding mismatch")
 	}
 	return nil
@@ -229,30 +339,30 @@ func (e *Engine) canonicalLeafMobilityBinding(plan leafmobility.Plan, leaseMilli
 	}
 	e.pathsMu.RUnlock()
 	binding := proto.LeafMobilityPeerPlanBinding{
-		CoordinatorSide: proto.LeafMobilityActorClient,
-		ActorSide:       protocolActorSide(e.side),
-		Direction:       plan.Direction,
-		SessionKind:     protocolLeafSession(plan.Session),
-		Operation:       protocolLeafOperation(plan.Operation),
-		Fallback:        proto.LeafMobilityFallbackRedialAttach,
-		LeaseMillis:     leaseMillis,
-		SessionEpoch:    proto.SessionEpoch(plan.Binding.FlowID),
-		TransactionID:   [16]byte(plan.TransactionID),
-		BaseGeneration:  plan.BaseGeneration,
-		ResourceScope:   protocolLeafScope(plan.Scope),
-		ResourceID:      proto.LeafMobilityResourceID(plan.ResourceID),
-		RouteGeneration: routeGeneration,
+		CoordinatorSide:        proto.LeafMobilityActorClient,
+		ActorSide:              protocolActorSide(e.side),
+		Direction:              plan.Direction,
+		SessionKind:            protocolLeafSession(plan.Session),
+		Operation:              protocolLeafOperation(plan.Operation),
+		Fallback:               proto.LeafMobilityFallbackRedialAttach,
+		LeaseMillis:            leaseMillis,
+		SessionEpoch:           proto.SessionEpoch(plan.Binding.FlowID),
+		TransactionID:          [16]byte(plan.TransactionID),
+		BaseGeneration:         plan.BaseGeneration,
+		ResourceScope:          protocolLeafScope(plan.Scope),
+		ResourceID:             proto.LeafMobilityResourceID(plan.ResourceID),
+		SubjectRouteGeneration: routeGeneration,
 	}
 	if e.side == SideClient {
 		binding.ClientGraph = proto.GraphBinding{Revision: localGraph.revision, Digest: localGraph.digest}
 		binding.ServerGraph = proto.GraphBinding{Revision: peerGraph.revision, Digest: peerGraph.digest}
-		binding.ClientTargetID = proto.TargetID(plan.Binding.LocalTargetID)
-		binding.ServerTargetID = proto.TargetID(plan.Binding.PeerTargetID)
+		binding.SubjectClientTargetID = proto.TargetID(plan.Binding.LocalTargetID)
+		binding.SubjectServerTargetID = proto.TargetID(plan.Binding.PeerTargetID)
 	} else {
 		binding.ClientGraph = proto.GraphBinding{Revision: peerGraph.revision, Digest: peerGraph.digest}
 		binding.ServerGraph = proto.GraphBinding{Revision: localGraph.revision, Digest: localGraph.digest}
-		binding.ClientTargetID = proto.TargetID(plan.Binding.PeerTargetID)
-		binding.ServerTargetID = proto.TargetID(plan.Binding.LocalTargetID)
+		binding.SubjectClientTargetID = proto.TargetID(plan.Binding.PeerTargetID)
+		binding.SubjectServerTargetID = proto.TargetID(plan.Binding.LocalTargetID)
 	}
 	return binding
 }
@@ -336,15 +446,35 @@ func newLeafMobilityReservationID() (proto.LeafMobilityReservationID, error) {
 	return id, nil
 }
 
-func (e *Engine) sendLeafMobilityPrepare(ref PathRef, prepare proto.LeafMobilityPeerPlanPrepare) ([]byte, error) {
+func (e *Engine) sendLeafMobilityPrepare(
+	ref PathRef,
+	prepare proto.LeafMobilityPeerPlanPrepare,
+) ([]byte, error) {
+	return e.sendLeafMobilityPrepareContext(context.Background(), ref, prepare)
+}
+
+func (e *Engine) sendLeafMobilityPrepareContext(
+	ctx context.Context,
+	ref PathRef,
+	prepare proto.LeafMobilityPeerPlanPrepare,
+) ([]byte, error) {
 	payload, err := prepare.Encode()
 	if err != nil {
 		return nil, err
 	}
-	return e.sendLeafMobilityFrameAt(ref, proto.CtrlLeafMobilityPrepare, payload, nil)
+	return e.sendLeafMobilityFrameAtContext(ctx, ref, proto.CtrlLeafMobilityPrepare, payload, nil)
 }
 
 func (e *Engine) sendLeafMobilityCommitAt(
+	ref PathRef,
+	commit proto.LeafMobilityPeerPlanCommit,
+	onPublish func([]byte) error,
+) ([]byte, error) {
+	return e.sendLeafMobilityCommitAtContext(context.Background(), ref, commit, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityCommitAtContext(
+	ctx context.Context,
 	ref PathRef,
 	commit proto.LeafMobilityPeerPlanCommit,
 	onPublish func([]byte) error,
@@ -353,10 +483,19 @@ func (e *Engine) sendLeafMobilityCommitAt(
 	if err != nil {
 		return nil, err
 	}
-	return e.sendLeafMobilityFrameAt(ref, proto.CtrlLeafMobilityCommit, payload, onPublish)
+	return e.sendLeafMobilityFrameAtContext(ctx, ref, proto.CtrlLeafMobilityCommit, payload, onPublish)
 }
 
 func (e *Engine) sendLeafMobilityCommitForOutgoing(
+	outgoing *outgoingLeafMobilityTransaction,
+	commit proto.LeafMobilityPeerPlanCommit,
+	onPublish func([]byte) error,
+) ([]byte, error) {
+	return e.sendLeafMobilityCommitForOutgoingContext(context.Background(), outgoing, commit, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityCommitForOutgoingContext(
+	ctx context.Context,
 	outgoing *outgoingLeafMobilityTransaction,
 	commit proto.LeafMobilityPeerPlanCommit,
 	onPublish func([]byte) error,
@@ -368,13 +507,24 @@ func (e *Engine) sendLeafMobilityCommitForOutgoing(
 	if err != nil {
 		return nil, err
 	}
-	return e.sendLeafMobilityFrameOnSlot(
+	return e.sendLeafMobilityFrameOnSlotContext(
+		ctx,
 		outgoing.source, outgoing.sourceSlot, proto.CtrlLeafMobilityCommit, payload, onPublish,
 	)
 }
 
 func (e *Engine) sendLeafMobilityAckBounded(
 	ref PathRef,
+	ack proto.LeafMobilityPeerPlanAck,
+	deadline time.Time,
+	onPublish func([]byte),
+) ([]byte, error) {
+	return e.sendLeafMobilityAckBoundedOnSlot(ref, nil, ack, deadline, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityAckBoundedOnSlot(
+	ref PathRef,
+	sourceSlot *pathSlot,
 	ack proto.LeafMobilityPeerPlanAck,
 	deadline time.Time,
 	onPublish func([]byte),
@@ -392,8 +542,8 @@ func (e *Engine) sendLeafMobilityAckBounded(
 	case <-e.closed:
 		return nil, net.ErrClosed
 	}
-	frame, sendErr, pending := e.sendLeafMobilityFrameWithContext(ctx, func() ([]byte, error) {
-		return e.sendLeafMobilityFrameAt(ref, proto.CtrlLeafMobilityAck, payload, func(frame []byte) error {
+	frame, sendErr, pending := e.sendLeafMobilityFrameWithContext(ctx, func(writeCtx context.Context) ([]byte, error) {
+		return e.sendLeafMobilityFrameOnSlotContext(writeCtx, ref, sourceSlot, proto.CtrlLeafMobilityAck, payload, func(frame []byte) error {
 			if onPublish != nil {
 				onPublish(frame)
 			}
@@ -404,7 +554,6 @@ func (e *Engine) sendLeafMobilityAckBounded(
 		<-e.leafTx.responseGate
 		return frame, leafMobilityResponseWriteError(sendErr)
 	}
-	e.abortLeafMobilityPathWrite(ref)
 	select {
 	case outcome := <-pending:
 		<-e.leafTx.responseGate
@@ -422,8 +571,12 @@ func (e *Engine) sendLeafMobilityAckBounded(
 }
 
 func (e *Engine) replayLeafMobilityResponse(ref PathRef, frame []byte, deadline time.Time) error {
+	return e.replayLeafMobilityResponseOnSlot(ref, nil, frame, deadline)
+}
+
+func (e *Engine) replayLeafMobilityResponseOnSlot(ref PathRef, sourceSlot *pathSlot, frame []byte, deadline time.Time) error {
 	if len(frame) == 0 {
-		return nil
+		return fmt.Errorf("%w: empty cached response frame", errLeafMobilityResponseUnavailable)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
@@ -434,14 +587,28 @@ func (e *Engine) replayLeafMobilityResponse(ref PathRef, frame []byte, deadline 
 	case <-e.closed:
 		return net.ErrClosed
 	}
-	_, err, pending := e.sendLeafMobilityFrameWithContext(ctx, func() ([]byte, error) {
-		return frame, e.replayLeafMobilityFrame(ref, frame)
+	_, err, pending := e.sendLeafMobilityFrameWithContext(ctx, func(writeCtx context.Context) ([]byte, error) {
+		if sourceSlot == nil {
+			return frame, e.replayLeafMobilityFrameContext(writeCtx, ref, frame)
+		}
+		if len(frame) < proto.HeaderSize {
+			return frame, proto.ErrBadHeader
+		}
+		header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if decodeErr != nil || header.Type != proto.FrameCtrl || !isLeafMobilityCtrl(proto.CtrlCodeFromFlags(header.Flags)) ||
+			header.Seq == 0 || header.Last {
+			return frame, proto.ErrBadHeader
+		}
+		controlRoutes, routeErr := e.leafMobilityControlRoutesWithSubject(ref, sourceSlot)
+		if routeErr != nil {
+			return frame, routeErr
+		}
+		return frame, e.writeLeafMobilityFrameOnControlRoutes(writeCtx, ref, controlRoutes, frame)
 	})
 	if pending == nil {
 		<-e.leafTx.responseGate
 		return leafMobilityResponseWriteError(err)
 	}
-	e.abortLeafMobilityPathWrite(ref)
 	cleanup := func() {
 		<-pending
 		<-e.leafTx.responseGate
@@ -476,7 +643,17 @@ func (e *Engine) sendLeafMobilityFrameAt(
 	payload []byte,
 	onPublish func([]byte) error,
 ) ([]byte, error) {
-	return e.sendLeafMobilityFrameOnSlot(ref, nil, code, payload, onPublish)
+	return e.sendLeafMobilityFrameAtContext(context.Background(), ref, code, payload, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityFrameAtContext(
+	ctx context.Context,
+	ref PathRef,
+	code proto.CtrlCode,
+	payload []byte,
+	onPublish func([]byte) error,
+) ([]byte, error) {
+	return e.sendLeafMobilityFrameOnSlotContext(ctx, ref, nil, code, payload, onPublish)
 }
 
 func (e *Engine) sendLeafMobilityFrameOnSlot(
@@ -486,8 +663,29 @@ func (e *Engine) sendLeafMobilityFrameOnSlot(
 	payload []byte,
 	onPublish func([]byte) error,
 ) ([]byte, error) {
+	return e.sendLeafMobilityFrameOnSlotContext(context.Background(), ref, sourceSlot, code, payload, onPublish)
+}
+
+func (e *Engine) sendLeafMobilityFrameOnSlotContext(
+	ctx context.Context,
+	ref PathRef,
+	sourceSlot *pathSlot,
+	code proto.CtrlCode,
+	payload []byte,
+	onPublish func([]byte) error,
+) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if e.isClosed() || e.sendClosing.Load() {
 		return nil, net.ErrClosed
+	}
+	controlRoutes, err := e.leafMobilityControlRoutesWithSubject(ref, sourceSlot)
+	if err != nil {
+		return nil, err
 	}
 	seq := e.leafTx.messageSeq.Add(1)
 	if seq == 0 || seq > proto.MaxSeq {
@@ -499,17 +697,15 @@ func (e *Engine) sendLeafMobilityFrameOnSlot(
 		return nil, err
 	}
 	copy(frame[proto.HeaderSize:], payload)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if onPublish != nil {
 		if err := onPublish(frame); err != nil {
 			return nil, err
 		}
 	}
-	var writeErr error
-	if sourceSlot == nil {
-		writeErr = e.writeLeafMobilityFrame(ref, frame)
-	} else {
-		writeErr = writeLeafMobilityFrameToSlot(ref, sourceSlot, frame)
-	}
+	writeErr := e.writeLeafMobilityFrameOnControlRoutes(ctx, ref, controlRoutes, frame)
 	if writeErr != nil {
 		return frame, writeErr
 	}
@@ -517,6 +713,14 @@ func (e *Engine) sendLeafMobilityFrameOnSlot(
 }
 
 func (e *Engine) replayLeafMobilityFrameForOutgoing(outgoing *outgoingLeafMobilityTransaction, frame []byte) error {
+	return e.replayLeafMobilityFrameForOutgoingContext(context.Background(), outgoing, frame)
+}
+
+func (e *Engine) replayLeafMobilityFrameForOutgoingContext(
+	ctx context.Context,
+	outgoing *outgoingLeafMobilityTransaction,
+	frame []byte,
+) error {
 	if outgoing == nil || len(frame) < proto.HeaderSize {
 		return proto.ErrBadHeader
 	}
@@ -528,10 +732,18 @@ func (e *Engine) replayLeafMobilityFrameForOutgoing(outgoing *outgoingLeafMobili
 		header.Seq == 0 || header.Last {
 		return proto.ErrBadHeader
 	}
-	return writeLeafMobilityFrameToSlot(outgoing.source, outgoing.sourceSlot, frame)
+	controlRoutes, err := e.leafMobilityControlRoutesWithSubject(outgoing.source, outgoing.sourceSlot)
+	if err != nil {
+		return err
+	}
+	return e.writeLeafMobilityFrameOnControlRoutes(ctx, outgoing.source, controlRoutes, frame)
 }
 
 func (e *Engine) replayLeafMobilityFrame(ref PathRef, frame []byte) error {
+	return e.replayLeafMobilityFrameContext(context.Background(), ref, frame)
+}
+
+func (e *Engine) replayLeafMobilityFrameContext(ctx context.Context, ref PathRef, frame []byte) error {
 	if len(frame) < proto.HeaderSize {
 		return proto.ErrBadHeader
 	}
@@ -543,26 +755,249 @@ func (e *Engine) replayLeafMobilityFrame(ref PathRef, frame []byte) error {
 		header.Seq == 0 || header.Last {
 		return proto.ErrBadHeader
 	}
-	// Transaction state owns the exact frame. It stays pinned to the original
-	// route and never enters the application DATA replay/ACK domain.
-	return e.writeLeafMobilityFrame(ref, frame)
+	// Transaction state owns the exact frame, but not its control route. The
+	// replay stays outside the application DATA replay/ACK domain.
+	return e.writeLeafMobilityFrame(ctx, ref, frame)
 }
 
-func (e *Engine) writeLeafMobilityFrame(ref PathRef, frame []byte) error {
+func (e *Engine) writeLeafMobilityFrame(ctx context.Context, ref PathRef, frame []byte) error {
+	controlRoutes, err := e.leafMobilityControlRoutes(ref)
+	if err != nil {
+		return err
+	}
+	return e.writeLeafMobilityFrameOnControlRoutes(ctx, ref, controlRoutes, frame)
+}
+
+func (e *Engine) leafMobilityControlRoutes(subject PathRef) ([]leafMobilityControlCandidate, error) {
+	return e.leafMobilityControlRoutesWithSubject(subject, nil)
+}
+
+func (e *Engine) leafMobilityControlRoutesWithSubject(
+	subject PathRef,
+	subjectHint *pathSlot,
+) ([]leafMobilityControlCandidate, error) {
 	e.pathsMu.RLock()
-	slot := e.paths[ref.ID]
-	if slot == nil {
-		slot = e.retainedPaths[ref.ID]
+	subjectSlot := e.leafMobilitySubjectSlotLocked(subject)
+	allowDetachedSubject := false
+	if subjectSlot == nil && subjectHint != nil && subjectHint.id == subject.ID && subjectHint.owner == subject.Owner {
+		subjectSlot = subjectHint
+		allowDetachedSubject = true
 	}
-	if slot == nil {
-		slot = e.stagedPaths[ref.ID]
-	}
-	if slot == nil || slot.owner != ref.Owner {
+	if subjectSlot == nil {
 		e.pathsMu.RUnlock()
-		return ErrStalePathRef
+		return nil, ErrStalePathRef
+	}
+	candidateCapacity := len(e.paths)
+	if candidateCapacity > 0 {
+		candidateCapacity--
+	}
+	candidates := make([]leafMobilityControlCandidate, 0, candidateCapacity)
+	for _, slot := range e.paths {
+		if !e.leafMobilityControlSlotEligibleLocked(subjectSlot, slot) {
+			continue
+		}
+		candidates = append(candidates, leafMobilityControlCandidate{
+			ref: pathRefForSlot(slot), slot: slot, subject: subjectSlot,
+			allowDetachedSubject: allowDetachedSubject,
+		})
 	}
 	e.pathsMu.RUnlock()
-	return writeLeafMobilityFrameToSlot(ref, slot, frame)
+	if len(candidates) == 0 {
+		return nil, ErrLeafMobilityControlRouteUnavailable
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ref.ID < candidates[j].ref.ID })
+	return candidates, nil
+}
+
+func (e *Engine) leafMobilitySubjectSlotLocked(subject PathRef) *pathSlot {
+	for _, slots := range []map[uint32]*pathSlot{e.paths, e.retainedPaths, e.stagedPaths} {
+		if slot := slots[subject.ID]; slot != nil && slot.owner == subject.Owner {
+			return slot
+		}
+	}
+	return nil
+}
+
+func (e *Engine) leafMobilityControlSlotEligibleLocked(subject, control *pathSlot) bool {
+	if subject == nil || control == nil || control == subject || e.paths[control.id] != control ||
+		control.maintenance.Load() || control.routeGeneration.Load() == 0 ||
+		(control.localTXTargetID == subject.localTXTargetID && control.peerTXTargetID == subject.peerTXTargetID) {
+		return false
+	}
+	if subject.mobilityClaim != nil && control.mobilityClaim != nil {
+		subjectResource := subject.mobilityClaim.Snapshot().ResourceID
+		if subjectResource != (leafmobility.ResourceID{}) && subjectResource == control.mobilityClaim.Snapshot().ResourceID {
+			return false
+		}
+	}
+	control.dispatchMu.Lock()
+	eligible := !control.dispatchDead && !control.dispatchFenced && !control.dispatchStalled.Load() && control.txEnabled.Load()
+	control.dispatchMu.Unlock()
+	return eligible
+}
+
+func (e *Engine) writeLeafMobilityFrameOnControlRoutes(
+	ctx context.Context,
+	subject PathRef,
+	candidates []leafMobilityControlCandidate,
+	frame []byte,
+) error {
+	var lastErr error
+	for index, candidate := range candidates {
+		attemptCtx, cancel := leafMobilityControlRouteAttemptContext(ctx, len(candidates)-index)
+		err := e.writeLeafMobilityFrameToControlSlot(
+			attemptCtx, subject, candidate, frame, index+1 < len(candidates),
+		)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	if lastErr == nil || errors.Is(lastErr, ErrLeafMobilityControlRouteUnavailable) || errors.Is(lastErr, ErrStalePathRef) {
+		return ErrLeafMobilityControlRouteUnavailable
+	}
+	return errors.Join(ErrLeafMobilityControlRouteUnavailable, lastErr)
+}
+
+func leafMobilityControlRouteAttemptContext(parent context.Context, remainingCandidates int) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if remainingCandidates <= 1 {
+		return context.WithCancel(parent)
+	}
+	budget := leafMobilityControlRouteAttemptLimit
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remainingCandidates > 0 {
+			remaining /= time.Duration(remainingCandidates)
+		}
+		if remaining < budget {
+			budget = remaining
+		}
+	}
+	if budget <= 0 {
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx, func() {}
+	}
+	return context.WithTimeout(parent, budget)
+}
+
+type leafMobilityControlWriteResult struct {
+	n   int
+	err error
+}
+
+func (e *Engine) writeLeafMobilityFrameToControlSlot(
+	ctx context.Context,
+	subject PathRef,
+	candidate leafMobilityControlCandidate,
+	frame []byte,
+	hasFallback bool,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.registerLeafMobilityControlWrite(subject, candidate.slot)
+	defer e.unregisterLeafMobilityControlWrite(subject, candidate.slot)
+	if err := candidate.slot.acquireWrite(ctx); err != nil {
+		return err
+	}
+	defer candidate.slot.releaseWrite()
+
+	e.pathsMu.RLock()
+	currentSubject := e.leafMobilitySubjectSlotLocked(subject)
+	subjectCurrent := currentSubject == candidate.subject ||
+		(candidate.allowDetachedSubject && currentSubject == nil && candidate.subject != nil &&
+			candidate.subject.id == subject.ID && candidate.subject.owner == subject.Owner)
+	current := subjectCurrent && e.leafMobilityControlSlotEligibleLocked(candidate.subject, candidate.slot)
+	e.pathsMu.RUnlock()
+	if !current {
+		return ErrLeafMobilityControlRouteUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !hasFallback {
+		n, err := candidate.slot.writeFrameOwned(frame)
+		if err != nil {
+			return err
+		}
+		if n != len(frame) {
+			return io.ErrShortWrite
+		}
+		candidate.slot.lastSendUnixNano.Store(nowFn().UnixNano())
+		return nil
+	}
+
+	result := make(chan leafMobilityControlWriteResult, 1)
+	go func() {
+		n, err := candidate.slot.writeFrameOwned(frame)
+		result <- leafMobilityControlWriteResult{n: n, err: err}
+	}()
+	var outcome leafMobilityControlWriteResult
+	select {
+	case outcome = <-result:
+	case <-ctx.Done():
+		select {
+		case outcome = <-result:
+			// Prefer an already observable write completion at the deadline.
+		default:
+			_ = candidate.slot.conn.Close()
+			outcome = <-result
+			return ctx.Err()
+		}
+	}
+	if outcome.err != nil {
+		return outcome.err
+	}
+	if outcome.n != len(frame) {
+		return io.ErrShortWrite
+	}
+	candidate.slot.lastSendUnixNano.Store(nowFn().UnixNano())
+	return nil
+}
+
+func (e *Engine) registerLeafMobilityControlWrite(subject PathRef, slot *pathSlot) {
+	e.leafTx.controlWriteMu.Lock()
+	slots := e.leafTx.controlWrites[subject]
+	if slots == nil {
+		slots = make(map[*pathSlot]uint32)
+		e.leafTx.controlWrites[subject] = slots
+	}
+	slots[slot]++
+	e.leafTx.controlWriteMu.Unlock()
+}
+
+func (e *Engine) unregisterLeafMobilityControlWrite(subject PathRef, slot *pathSlot) {
+	e.leafTx.controlWriteMu.Lock()
+	if slots := e.leafTx.controlWrites[subject]; slots != nil {
+		if slots[slot] <= 1 {
+			delete(slots, slot)
+		} else {
+			slots[slot]--
+		}
+		if len(slots) == 0 {
+			delete(e.leafTx.controlWrites, subject)
+		}
+	}
+	e.leafTx.controlWriteMu.Unlock()
+}
+
+func (e *Engine) activeLeafMobilityControlWrites(subject PathRef) []*pathSlot {
+	e.leafTx.controlWriteMu.Lock()
+	slots := make([]*pathSlot, 0, len(e.leafTx.controlWrites[subject]))
+	for slot := range e.leafTx.controlWrites[subject] {
+		slots = append(slots, slot)
+	}
+	e.leafTx.controlWriteMu.Unlock()
+	sort.Slice(slots, func(i, j int) bool { return slots[i].id < slots[j].id })
+	return slots
 }
 
 func writeLeafMobilityFrameToSlot(ref PathRef, slot *pathSlot, frame []byte) error {
@@ -578,34 +1013,4 @@ func writeLeafMobilityFrameToSlot(ref PathRef, slot *pathSlot, frame []byte) err
 	}
 	slot.lastSendUnixNano.Store(nowFn().UnixNano())
 	return nil
-}
-
-func (e *Engine) abortOutgoingLeafMobilityPathWrite(outgoing *outgoingLeafMobilityTransaction) {
-	if outgoing == nil || outgoing.sourceSlot == nil {
-		return
-	}
-	conn := outgoing.sourceSlot.conn
-	if !e.startLeafMobilityAsync(func() { _ = conn.Close() }) {
-		_ = conn.Close()
-	}
-}
-
-func (e *Engine) abortLeafMobilityPathWrite(ref PathRef) {
-	e.pathsMu.RLock()
-	slot := e.paths[ref.ID]
-	if slot == nil {
-		slot = e.retainedPaths[ref.ID]
-	}
-	if slot == nil {
-		slot = e.stagedPaths[ref.ID]
-	}
-	if slot == nil || slot.owner != ref.Owner {
-		e.pathsMu.RUnlock()
-		return
-	}
-	conn := slot.conn
-	e.pathsMu.RUnlock()
-	if !e.startLeafMobilityAsync(func() { _ = conn.Close() }) {
-		_ = conn.Close()
-	}
 }

@@ -337,6 +337,7 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 		return fmt.Errorf("%w: terminal source %d is outside the current transaction route", errPathAdmissionRouteChanged, source.ID)
 	}
 
+	e.trackPathRetirementLocked(current)
 	delete(e.paths, current.id)
 	delete(e.retainedPaths, predecessor.id)
 	delete(e.pathPredecessors, current.id)
@@ -675,6 +676,7 @@ func (e *Engine) promoteCompletedPathAdmissionRouteLocked(entry *completedPathAd
 	if !allowed {
 		return completedPathAdmissionPromotion{}, false
 	}
+	e.trackPathRetirementLocked(current)
 	delete(e.paths, current.id)
 	delete(e.retainedPaths, predecessor.id)
 	delete(e.pathPredecessors, current.id)

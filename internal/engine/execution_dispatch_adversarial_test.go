@@ -64,11 +64,12 @@ func TestLeafMobilityOutcomeUnknownRetainsFenceForAdmittedData(t *testing.T) {
 	if err := permit.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := permit.Cutover(context.Background()); err != nil {
+	if err := permit.Stage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := permit.CommitDriver(context.Background()); !errors.Is(err, leafmobility.ErrIncarnationUnproven) {
-		t.Fatalf("CommitDriver = %v, want unproven incarnation", err)
+	authorizeLeafMobilityPublish(t, permit)
+	if err := permit.PublishDriver(context.Background()); !errors.Is(err, leafmobility.ErrIncarnationUnproven) {
+		t.Fatalf("PublishDriver = %v, want unproven incarnation", err)
 	}
 	permit.token.outcomeUnknownSerialized(leafmobility.ErrIncarnationUnproven)
 	select {

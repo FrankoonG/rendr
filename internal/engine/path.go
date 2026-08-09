@@ -82,6 +82,7 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 			e.pathsMu.Unlock()
 			return
 		}
+		e.trackPathRetirementLocked(staged)
 		delete(e.stagedPaths, id)
 		var fallback *pathSlot
 		for _, candidate := range e.paths {
@@ -107,6 +108,7 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 			e.pathsMu.Unlock()
 			return
 		}
+		e.trackPathRetirementLocked(retained)
 		delete(e.retainedPaths, id)
 		for successorID, predecessorIDs := range e.pathPredecessors {
 			filtered := predecessorIDs[:0]
@@ -169,6 +171,7 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 		},
 	}
 	slot.fenceDispatchForRetirement()
+	e.trackPathRetirementLocked(slot)
 	delete(e.paths, slot.id)
 	// Ownership ends at the topology commit, not when asynchronous carrier
 	// cleanup eventually runs. Published candidates must become stale before
@@ -187,17 +190,20 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 		}
 		delete(e.retainedPaths, predecessorID)
 		if !rollbackAllowed {
+			e.trackPathRetirementLocked(candidate)
 			candidate.closeQuit()
 			e.retirePathAsync(candidate)
 			continue
 		}
 		if restored == nil || candidate.gen > restored.gen {
 			if restored != nil {
+				e.trackPathRetirementLocked(restored)
 				restored.closeQuit()
 				e.retirePathAsync(restored)
 			}
 			restored = candidate
 		} else {
+			e.trackPathRetirementLocked(candidate)
 			candidate.closeQuit()
 			e.retirePathAsync(candidate)
 		}

@@ -2,6 +2,7 @@ package leafmobility
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	goruntime "runtime"
@@ -19,16 +20,29 @@ const (
 	ExecutionInvalid ExecutionState = iota
 	ExecutionAuthorized
 	ExecutionPrepared
-	ExecutionCutover
-	ExecutionCommitted
+	ExecutionStaged
+	ExecutionPublishAuthorized
+	ExecutionPublished
+	ExecutionActivationRequired
+	ExecutionActivated
 	ExecutionRollbackRequired
-	// ExecutionFailClosedRequired means Commit returned nil, but the Claim's
-	// physical endpoint reporter did not prove a new incarnation. Commit may
-	// already be irreversible, so rollback is forbidden and only destructive
-	// fail-closed cleanup can release the execution lease.
+	// ExecutionFailClosedRequired means Publish may have crossed its owner-swap
+	// boundary without a complete, trustworthy outcome. Rollback is forbidden;
+	// only destructive fail-closed cleanup can release the execution lease.
 	ExecutionFailClosedRequired
 	ExecutionRolledBack
 	ExecutionFailedClosed
+)
+
+// FinalAcceptanceDisposition is the only result of atomically consuming a
+// correlated FINAL acceptance. RollbackOnly records the peer decision and
+// consumes its generation, but never grants the driver a Publish right.
+type FinalAcceptanceDisposition uint8
+
+const (
+	FinalAcceptanceInvalid FinalAcceptanceDisposition = iota
+	FinalAcceptancePublishAllowed
+	FinalAcceptanceRollbackOnly
 )
 
 var (
@@ -65,14 +79,27 @@ type AttemptEvidence struct {
 	ProbeReferences ProbeReferences
 }
 
+// PublicationEvidence is sealed driver evidence for the private successor
+// built by Stage. It is opaque on the wire; the engine hashes it with the
+// bilateral agreement so COMMIT_INTENT cannot be minted before staging.
+type PublicationEvidence struct {
+	Digest EvidenceDigest
+}
+
 // DriverAttempt is created by one non-destructive Preflight call. It is kept
 // private inside Plan and invoked only by an engine-bound Execution. Every
 // failing forward stage must preserve enough state for Rollback.
 type DriverAttempt interface {
 	Evidence() AttemptEvidence
 	Prepare(context.Context, ExecutionRequest) error
-	Cutover(context.Context, ExecutionRequest) error
-	Commit(context.Context, ExecutionRequest) error
+	// Stage creates and validates a private successor. It must not change the
+	// endpoint owner's visible incarnation or release packet quarantine.
+	Stage(context.Context, ExecutionRequest) (PublicationEvidence, error)
+	// Publish performs only the endpoint-owner swap. Activate owns every
+	// post-publication step that may need retrying. Implementations must check
+	// the context while holding the owner lock immediately before swapping.
+	Publish(context.Context, ExecutionRequest) error
+	Activate(context.Context, ExecutionRequest) error
 	Rollback(context.Context, ExecutionRequest) error
 	// FailClosed terminates every driver-owned endpoint and removes every
 	// destructive side effect. It is idempotent and retryable beyond the
@@ -119,6 +146,7 @@ type executionToken struct {
 	leaseHeld          bool
 	incarnationBefore  uint64
 	incarnationTracked bool
+	publication        PublicationEvidence
 	stageCancel        context.CancelFunc
 }
 
@@ -201,16 +229,193 @@ func (e *Execution) Prepare(ctx context.Context) error {
 	})
 }
 
-func (e *Execution) Cutover(ctx context.Context) error {
-	return e.runForwardStep(ctx, ExecutionPrepared, ExecutionCutover, "cutover", func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) error {
-		return attempt.Cutover(ctx, request)
+func (e *Execution) Stage(ctx context.Context) error {
+	var publication PublicationEvidence
+	err := e.runForwardStep(ctx, ExecutionPrepared, ExecutionStaged, "stage", func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) error {
+		var stageErr error
+		publication, stageErr = attempt.Stage(ctx, request)
+		if stageErr == nil && publication.Digest == (EvidenceDigest{}) {
+			return fmt.Errorf("%w: stage returned zero publication evidence", ErrExecutionDriver)
+		}
+		if stageErr == nil {
+			e.token.mu.Lock()
+			e.token.publication = publication
+			e.token.mu.Unlock()
+		}
+		return stageErr
 	})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func (e *Execution) Commit(ctx context.Context) error {
-	return e.runForwardStep(ctx, ExecutionCutover, ExecutionCommitted, "commit", func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) error {
-		return attempt.Commit(ctx, request)
-	})
+// PublicationDigest binds the private successor evidence to the exact peer
+// agreement. Peers echo this opaque value through FINAL and terminal receipts.
+func (e *Execution) PublicationDigest() (proto.LeafMobilityPublicationDigest, error) {
+	if e == nil || e.token == nil {
+		return proto.LeafMobilityPublicationDigest{}, ErrExecutionState
+	}
+	e.token.mu.Lock()
+	state := e.token.state
+	publication := e.token.publication
+	agreement := e.token.request.Agreement.AgreementDigest
+	e.token.mu.Unlock()
+	if state != ExecutionStaged && state != ExecutionPublishAuthorized && state != ExecutionPublished &&
+		state != ExecutionActivationRequired && state != ExecutionActivated {
+		return proto.LeafMobilityPublicationDigest{}, ErrExecutionState
+	}
+	if publication.Digest == (EvidenceDigest{}) || agreement == (proto.LeafMobilityAgreementDigest{}) {
+		return proto.LeafMobilityPublicationDigest{}, ErrExecutionState
+	}
+	h := sha256.New()
+	h.Write([]byte("rendr-leaf-mobility-publication-v1\x00"))
+	h.Write(agreement[:])
+	h.Write(publication.Digest[:])
+	var digest proto.LeafMobilityPublicationDigest
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+// ResolveFinalAcceptance atomically consumes the correlated FINAL state and
+// advances both the resource transaction and this exact Execution. Recovery
+// passes allowPublish=false because an abandoned COMMIT can only converge by
+// rolling back its private successor. No driver method is invoked here.
+func (e *Execution) ResolveFinalAcceptance(allowPublish bool) (FinalAcceptanceDisposition, error) {
+	if e == nil || e.token == nil {
+		return FinalAcceptanceInvalid, ErrExecutionState
+	}
+	token := e.token
+	token.mu.Lock()
+	if token.busy {
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrExecutionBusy
+	}
+	stateBefore := token.state
+	if stateBefore != ExecutionStaged && stateBefore != ExecutionRollbackRequired && stateBefore != ExecutionRolledBack {
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrExecutionState
+	}
+	if (stateBefore != ExecutionRolledBack && !token.leaseHeld) || token.claim == nil || token.transaction == nil {
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrExecutionState
+	}
+	if stateBefore != ExecutionStaged {
+		allowPublish = false
+	}
+	token.busy = true
+	request := token.request
+	token.mu.Unlock()
+
+	factualCurrent := request.Plan.attempt != nil && request.Plan.attempt.evidenceCurrent() &&
+		request.Plan.ProbeReferences.matchesCurrentExecutionContext() &&
+		request.Plan.ProbeReferences.matchesCurrentPlatform(context.Background())
+	now := time.Now()
+	factualCurrent = factualCurrent && request.Plan.ProbeReferences.validFor(
+		request.Plan.Operation, request.Plan.EndpointGeneration,
+		now.UnixNano(), request.Plan.Deadline.UnixNano(), true,
+	)
+
+	token.mu.Lock()
+	if token.state != stateBefore || !token.busy {
+		token.busy = false
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrExecutionState
+	}
+	claim := token.claim
+	claim.mu.Lock()
+	resource := claim.resource
+	if resource == nil {
+		claim.mu.Unlock()
+		token.busy = false
+		if stateBefore != ExecutionRolledBack {
+			token.state = ExecutionRollbackRequired
+		}
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrAuthorityStale
+	}
+	resource.mu.Lock()
+	transaction := token.transaction
+	linearizedAt := time.Now()
+	factualCurrent = factualCurrent && request.Plan.ProbeReferences.validFor(
+		request.Plan.Operation, request.Plan.EndpointGeneration,
+		linearizedAt.UnixNano(), request.Plan.Deadline.UnixNano(), true,
+	)
+	identityCurrent := claim.issuer == token.issuer && claim.activeTransaction == transaction &&
+		transaction.claim == claim && transaction.resource == resource && transaction.activeLocked() &&
+		transaction.executionIssued && transaction.plan == request.Plan
+	if !identityCurrent {
+		resource.mu.Unlock()
+		claim.mu.Unlock()
+		token.busy = false
+		if stateBefore != ExecutionRolledBack {
+			token.state = ExecutionRollbackRequired
+		}
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrAuthorityStale
+	}
+
+	late := false
+	switch transaction.state {
+	case ResourceTransactionCommitPublished:
+		late = !transaction.deadline.After(linearizedAt)
+	case ResourceTransactionOutcomeUnknown:
+		if transaction.unknownFrom != ResourceTransactionCommitPublished {
+			resource.mu.Unlock()
+			claim.mu.Unlock()
+			token.busy = false
+			if stateBefore != ExecutionRolledBack {
+				token.state = ExecutionRollbackRequired
+			}
+			token.mu.Unlock()
+			return FinalAcceptanceInvalid, ErrTransactionOutcomeUnknown
+		}
+		late = true
+	default:
+		resource.mu.Unlock()
+		claim.mu.Unlock()
+		token.busy = false
+		if stateBefore != ExecutionRolledBack {
+			token.state = ExecutionRollbackRequired
+		}
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, ErrResourceTransactionState
+	}
+	if err := transaction.consumeGenerationLocked(); err != nil {
+		resource.mu.Unlock()
+		claim.mu.Unlock()
+		token.busy = false
+		if stateBefore != ExecutionRolledBack {
+			token.state = ExecutionRollbackRequired
+		}
+		token.mu.Unlock()
+		return FinalAcceptanceInvalid, err
+	}
+	if transaction.expiry != nil {
+		transaction.expiry.Stop()
+		transaction.expiry = nil
+	}
+	publishAllowed := allowPublish && !late && factualCurrent && token.forwardDeadline.After(linearizedAt) &&
+		claim.currentForPlanLocked(request.Plan)
+	if publishAllowed {
+		transaction.unknownFrom = ResourceTransactionInvalid
+		transaction.state = ResourceTransactionPublishAuthorized
+		token.state = ExecutionPublishAuthorized
+	} else {
+		transaction.unknownFrom = ResourceTransactionPublishAuthorized
+		transaction.state = ResourceTransactionOutcomeUnknown
+		if stateBefore != ExecutionRolledBack {
+			token.state = ExecutionRollbackRequired
+		}
+	}
+	resource.mu.Unlock()
+	claim.mu.Unlock()
+	token.busy = false
+	token.mu.Unlock()
+	if publishAllowed {
+		return FinalAcceptancePublishAllowed, nil
+	}
+	return FinalAcceptanceRollbackOnly, nil
 }
 
 func (e *Execution) runForwardStep(
@@ -263,7 +468,7 @@ func (e *Execution) runForwardStep(
 		}
 	}
 
-	if err := e.validateAuthorityCurrent(); err != nil {
+	if err := e.validateAuthorityCurrent(ResourceTransactionExecutionStaged); err != nil {
 		token.mu.Lock()
 		token.busy = false
 		if want == ExecutionAuthorized {
@@ -312,7 +517,7 @@ func (e *Execution) runForwardStep(
 	token.mu.Unlock()
 	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
 	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
-	err := invokeDriverStep(name, expectedContext, expectedPlatform, true, next != ExecutionCommitted, func() error {
+	err := invokeDriverStep(name, expectedContext, expectedPlatform, true, true, func() error {
 		return step(attempt, stageCtx, request)
 	})
 	stageContextErr := stageCtx.Err()
@@ -320,30 +525,11 @@ func (e *Execution) runForwardStep(
 	token.stageCancel = nil
 	token.mu.Unlock()
 	cancel()
-	// A nil Commit return is the irreversible local linearization point.
-	// Cancellation or topology changes observed afterward cannot make a
-	// committed endpoint rollback-capable again.
-	if err == nil && next == ExecutionCommitted {
-		after, proven := token.claim.endpointIncarnation()
-		if !token.incarnationTracked || !proven || after == token.incarnationBefore {
-			token.mu.Lock()
-			token.busy = false
-			token.state = ExecutionFailClosedRequired
-			token.mu.Unlock()
-			return fmt.Errorf("%w: commit: %w", ErrExecutionDriver, ErrIncarnationUnproven)
-		}
-		token.claim.advanceEndpointGeneration()
-		token.mu.Lock()
-		token.busy = false
-		token.state = ExecutionCommitted
-		token.mu.Unlock()
-		return nil
-	}
 	if err == nil && stageContextErr != nil {
 		err = fmt.Errorf("%w: %s deadline: %w", ErrExecutionDriver, name, stageContextErr)
 	}
 	if err == nil {
-		err = e.validateAuthorityCurrent()
+		err = e.validateAuthorityCurrent(ResourceTransactionExecutionStaged)
 	}
 	token.mu.Lock()
 	token.busy = false
@@ -356,14 +542,142 @@ func (e *Execution) runForwardStep(
 	return err
 }
 
-// FinalizeCommitted releases carrier ownership only after the engine has
-// resolved, or definitively failed to resolve, the peer terminal outcome.
-func (e *Execution) FinalizeCommitted() error {
+// Publish crosses the only local owner-swap boundary. A driver error with an
+// unchanged sealed incarnation is rollback-capable; every changed or
+// contradictory outcome requires fail-closed cleanup.
+func (e *Execution) Publish(ctx context.Context) error {
+	if e == nil || e.token == nil {
+		return ErrExecutionState
+	}
+	token := e.token
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	token.mu.Lock()
+	if token.busy || token.state != ExecutionPublishAuthorized || interfaceIsNil(token.attempt) || !token.leaseHeld {
+		token.mu.Unlock()
+		return ErrExecutionState
+	}
+	token.busy = true
+	attempt, request := token.attempt, token.request
+	token.mu.Unlock()
+	if err := e.validateAuthorityCurrent(ResourceTransactionPublishAuthorized); err != nil {
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionRollbackRequired
+		token.mu.Unlock()
+		return err
+	}
+	if !token.forwardDeadline.After(time.Now()) {
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionRollbackRequired
+		token.mu.Unlock()
+		return ErrPlanExpired
+	}
+	stageCtx, cancel := context.WithDeadline(ctx, token.forwardDeadline)
+	token.mu.Lock()
+	token.stageCancel = cancel
+	token.mu.Unlock()
+	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
+	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
+	err := invokeDriverStep("publish", expectedContext, expectedPlatform, true, false, func() error {
+		return attempt.Publish(stageCtx, request)
+	})
+	token.mu.Lock()
+	token.stageCancel = nil
+	token.mu.Unlock()
+	cancel()
+	after, proven := token.claim.endpointIncarnation()
+	unchanged := token.incarnationTracked && proven && after == token.incarnationBefore
+	changed := token.incarnationTracked && proven && after != token.incarnationBefore
+	if changed {
+		token.claim.advanceEndpointGeneration()
+	}
+	if err != nil {
+		token.mu.Lock()
+		token.busy = false
+		if unchanged {
+			token.state = ExecutionRollbackRequired
+		} else {
+			token.state = ExecutionFailClosedRequired
+		}
+		token.mu.Unlock()
+		return err
+	}
+	if !changed {
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionFailClosedRequired
+		token.mu.Unlock()
+		return fmt.Errorf("%w: publish: %w", ErrExecutionDriver, ErrIncarnationUnproven)
+	}
+	if err := token.transaction.markPublished(); err != nil {
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionFailClosedRequired
+		token.mu.Unlock()
+		return fmt.Errorf("%w: publish transaction: %w", ErrExecutionDriver, err)
+	}
+	token.mu.Lock()
+	token.busy = false
+	token.state = ExecutionPublished
+	token.mu.Unlock()
+	return nil
+}
+
+// Activate retries post-publication work without reopening rollback. It may
+// resume the endpoint, release quarantine, and close namespace executors.
+func (e *Execution) Activate(ctx context.Context) error {
+	if e == nil || e.token == nil {
+		return ErrExecutionState
+	}
+	token := e.token
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	token.mu.Lock()
+	if token.busy || (token.state != ExecutionPublished && token.state != ExecutionActivationRequired) ||
+		interfaceIsNil(token.attempt) || !token.leaseHeld {
+		token.mu.Unlock()
+		return ErrExecutionState
+	}
+	token.busy = true
+	attempt, request := token.attempt, token.request
+	token.mu.Unlock()
+	if err := e.validatePublishedCurrent(); err != nil {
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionFailClosedRequired
+		token.mu.Unlock()
+		return err
+	}
+	stageCtx, cancel := context.WithDeadline(ctx, token.deadline)
+	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
+	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
+	err := invokeDriverStep("activate", expectedContext, expectedPlatform, true, true, func() error {
+		return attempt.Activate(stageCtx, request)
+	})
+	cancel()
+	token.mu.Lock()
+	token.busy = false
+	if err == nil {
+		token.state = ExecutionActivated
+	} else {
+		token.state = ExecutionActivationRequired
+	}
+	token.mu.Unlock()
+	return err
+}
+
+// FinalizePublished releases carrier ownership only after activation and peer
+// terminal resolution have both completed.
+func (e *Execution) FinalizePublished() error {
 	if e == nil || e.token == nil {
 		return ErrExecutionState
 	}
 	e.token.mu.Lock()
-	if e.token.state != ExecutionCommitted || e.token.busy {
+	if e.token.state != ExecutionActivated || e.token.busy {
 		e.token.mu.Unlock()
 		return ErrExecutionState
 	}
@@ -402,7 +716,7 @@ func (e *Execution) releaseLease() {
 	claim.releaseExecutionLease()
 }
 
-func (e *Execution) validateAuthorityCurrent() error {
+func (e *Execution) validateAuthorityCurrent(want ResourceTransactionState) error {
 	if e == nil || e.token == nil {
 		return ErrAuthorityStale
 	}
@@ -434,9 +748,33 @@ func (e *Execution) validateAuthorityCurrent() error {
 	transaction := execution.transaction
 	current := claim.issuer == execution.issuer && claim.activeTransaction == transaction &&
 		transaction.claim == claim && transaction.resource == resource && transaction.activeLocked() &&
-		transaction.state == ResourceTransactionConsumed && transaction.executionIssued &&
+		transaction.state == want && transaction.executionIssued &&
 		transaction.plan == execution.request.Plan && transaction.deadline.After(time.Now()) &&
 		claim.currentForPlanLocked(execution.request.Plan)
+	resource.mu.Unlock()
+	claim.mu.Unlock()
+	if !current {
+		return ErrAuthorityStale
+	}
+	return nil
+}
+
+func (e *Execution) validatePublishedCurrent() error {
+	if e == nil || e.token == nil || e.token.claim == nil || e.token.transaction == nil {
+		return ErrAuthorityStale
+	}
+	token := e.token
+	claim := token.claim
+	claim.mu.Lock()
+	resource := claim.resource
+	if resource == nil {
+		claim.mu.Unlock()
+		return ErrAuthorityStale
+	}
+	resource.mu.Lock()
+	current := token.transaction.claim == claim && token.transaction.resource == resource &&
+		token.transaction.activeLocked() && token.transaction.state == ResourceTransactionPublished &&
+		token.transaction.executionIssued
 	resource.mu.Unlock()
 	claim.mu.Unlock()
 	if !current {
@@ -467,12 +805,13 @@ func (e *Execution) Rollback(ctx context.Context) error {
 	case ExecutionRolledBack:
 		token.mu.Unlock()
 		return nil
-	case ExecutionPrepared, ExecutionCutover, ExecutionRollbackRequired:
+	case ExecutionPrepared, ExecutionStaged, ExecutionPublishAuthorized, ExecutionRollbackRequired:
 		if interfaceIsNil(token.attempt) {
 			token.mu.Unlock()
 			return ErrExecutionState
 		}
-	case ExecutionCommitted, ExecutionFailClosedRequired, ExecutionFailedClosed, ExecutionInvalid:
+	case ExecutionPublished, ExecutionActivationRequired, ExecutionActivated,
+		ExecutionFailClosedRequired, ExecutionFailedClosed, ExecutionInvalid:
 		token.mu.Unlock()
 		return ErrExecutionState
 	default:
@@ -560,13 +899,16 @@ func (e *Execution) FailClosed(ctx context.Context) error {
 		token.mu.Unlock()
 		return ErrExecutionBusy
 	}
-	switch token.state {
+	stateBefore := token.state
+	switch stateBefore {
 	case ExecutionAuthorized:
 		token.state = ExecutionFailedClosed
 		token.mu.Unlock()
 		e.releaseLease()
 		return nil
-	case ExecutionPrepared, ExecutionCutover, ExecutionRollbackRequired, ExecutionFailClosedRequired:
+	case ExecutionPrepared, ExecutionStaged, ExecutionPublishAuthorized,
+		ExecutionPublished, ExecutionActivationRequired, ExecutionRollbackRequired,
+		ExecutionFailClosedRequired:
 		if interfaceIsNil(token.attempt) {
 			token.mu.Unlock()
 			return ErrExecutionState
@@ -590,12 +932,11 @@ func (e *Execution) FailClosed(ctx context.Context) error {
 	token.busy = false
 	if err == nil {
 		token.state = ExecutionFailedClosed
-	} else if token.state == ExecutionFailClosedRequired {
-		// An unproven nil Commit remains beyond the rollback boundary even when
-		// cleanup needs another attempt.
-		token.state = ExecutionFailClosedRequired
 	} else {
-		token.state = ExecutionRollbackRequired
+		// Once the driver has entered FailClosed, cleanup may already have
+		// terminated the physical endpoint. Failure can only be retried through
+		// FailClosed; Rollback must never be reopened.
+		token.state = ExecutionFailClosedRequired
 	}
 	token.mu.Unlock()
 	if err != nil {

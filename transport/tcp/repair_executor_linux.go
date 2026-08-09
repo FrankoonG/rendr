@@ -248,6 +248,16 @@ func (executor *repairNamespaceExecutor) Close(ctx context.Context) error {
 	return executor.closeErr
 }
 
+func (executor *repairNamespaceExecutor) Closed() bool {
+	if executor == nil {
+		return true
+	}
+	executor.callMu.Lock()
+	closed := executor.closed
+	executor.callMu.Unlock()
+	return closed
+}
+
 func (executor *repairNamespaceExecutor) loop(
 	targetFD int,
 	expected leafmobility.ContextDigest,

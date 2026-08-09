@@ -41,6 +41,38 @@ func TestDetectorCachesOnlyExactExecutionContext(t *testing.T) {
 	}
 }
 
+func TestDetectorRefreshesCacheThatCannotCoverRequestedValidity(t *testing.T) {
+	var calls atomic.Int32
+	identity := testExecutionContext("caps-a")
+	now := time.Unix(100, 0).UTC()
+	detector := testDetector(t, &identity, probeFunc(func(_ context.Context, _ ExecutionContext, _ time.Time) ([]FeatureEvidence, error) {
+		calls.Add(1)
+		return nil, nil
+	}))
+	detector.ttl = 10 * time.Second
+	detector.now = func() time.Time { return now }
+
+	first, err := detector.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(9500 * time.Millisecond)
+	if cached, err := detector.Current(context.Background()); err != nil || cached.Generation != first.Generation {
+		t.Fatalf("ordinary lookup snapshot/error=%d/%v want cached generation %d", cached.Generation, err, first.Generation)
+	}
+	refreshed, err := detector.CurrentFresh(context.Background(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || refreshed.Generation == first.Generation || refreshed.ExpiresAt.Sub(now) != detector.ttl {
+		t.Fatalf("fresh lookup calls=%d generations=%d/%d remaining=%s",
+			calls.Load(), first.Generation, refreshed.Generation, refreshed.ExpiresAt.Sub(now))
+	}
+	if _, err := detector.CurrentFresh(context.Background(), -time.Nanosecond); err == nil {
+		t.Fatal("negative minimum validity was accepted")
+	}
+}
+
 func TestDetectorSerializesConcurrentSameContextProbe(t *testing.T) {
 	identity := testExecutionContext("caps-a")
 	started := make(chan struct{})

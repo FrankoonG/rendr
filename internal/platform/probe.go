@@ -1,6 +1,9 @@
 package platform
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 var systemDetector = func() *detector {
 	detector, err := newSystemDetector()
@@ -19,6 +22,12 @@ func newSystemDetector() (*detector, error) {
 // Detect returns the process-shared, execution-context-keyed active snapshot.
 func Detect(ctx context.Context) (KernelFeatures, error) {
 	return systemDetector.Current(ctx)
+}
+
+// DetectFresh returns an active snapshot with at least minimumRemaining cache
+// validity when the platform can provide it.
+func DetectFresh(ctx context.Context, minimumRemaining time.Duration) (KernelFeatures, error) {
+	return systemDetector.CurrentFresh(ctx, minimumRemaining)
 }
 
 // Invalidate discards cached evidence after a contradictory real syscall.

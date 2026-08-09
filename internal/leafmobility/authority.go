@@ -9,20 +9,21 @@ import (
 type ResourceTransactionState uint8
 
 const (
-	ResourceTransactionInvalid         ResourceTransactionState = 0
-	ResourceTransactionProposed        ResourceTransactionState = 1
-	ResourceTransactionPrepared        ResourceTransactionState = 2
-	ResourceTransactionCommitPublished ResourceTransactionState = 3
-	ResourceTransactionFinalAccepted   ResourceTransactionState = 4
-	ResourceTransactionFinalRejected   ResourceTransactionState = 5
-	ResourceTransactionConsumed        ResourceTransactionState = 6
-	ResourceTransactionResolving       ResourceTransactionState = 7
-	ResourceTransactionCompleted       ResourceTransactionState = 8
-	ResourceTransactionRolledBack      ResourceTransactionState = 9
-	ResourceTransactionAborted         ResourceTransactionState = 10
-	ResourceTransactionExpired         ResourceTransactionState = 11
-	ResourceTransactionOutcomeUnknown  ResourceTransactionState = 12
-	ResourceTransactionRevoked         ResourceTransactionState = 13
+	ResourceTransactionInvalid           ResourceTransactionState = 0
+	ResourceTransactionProposed          ResourceTransactionState = 1
+	ResourceTransactionPrepared          ResourceTransactionState = 2
+	ResourceTransactionExecutionStaged   ResourceTransactionState = 3
+	ResourceTransactionCommitPublished   ResourceTransactionState = 4
+	ResourceTransactionPublishAuthorized ResourceTransactionState = 5
+	ResourceTransactionFinalRejected     ResourceTransactionState = 6
+	ResourceTransactionPublished         ResourceTransactionState = 7
+	ResourceTransactionResolving         ResourceTransactionState = 8
+	ResourceTransactionCompleted         ResourceTransactionState = 9
+	ResourceTransactionRolledBack        ResourceTransactionState = 10
+	ResourceTransactionAborted           ResourceTransactionState = 11
+	ResourceTransactionExpired           ResourceTransactionState = 12
+	ResourceTransactionOutcomeUnknown    ResourceTransactionState = 13
+	ResourceTransactionRevoked           ResourceTransactionState = 14
 )
 
 type Resolution uint8
@@ -31,6 +32,7 @@ const (
 	ResolutionInvalid    Resolution = 0
 	ResolutionComplete   Resolution = 1
 	ResolutionRolledBack Resolution = 2
+	ResolutionAbort      Resolution = 3
 )
 
 var (
@@ -205,8 +207,9 @@ func (t *ResourceTransaction) MarkPrepared(generation uint64, deadline time.Time
 	return nil
 }
 
-// MarkCommitPublished records the replay-ledger publication linearization
-// point. It does not establish peer agreement or authorize driver execution.
+// MarkCommitPublished records publication of COMMIT_INTENT after the local
+// driver has staged a private replacement. It does not authorize publishing
+// that replacement to the endpoint owner.
 func (t *ResourceTransaction) MarkCommitPublished() error {
 	if t == nil || t.token == nil {
 		return ErrResourceTransactionState
@@ -220,16 +223,17 @@ func (t *ResourceTransaction) MarkCommitPublished() error {
 		token.expireLocked()
 		return ErrPlanExpired
 	}
-	if token.state != ResourceTransactionPrepared || !token.activeLocked() {
+	if token.state != ResourceTransactionExecutionStaged || !token.activeLocked() || !token.executionIssued {
 		return ErrResourceTransactionState
 	}
 	token.state = ResourceTransactionCommitPublished
 	return nil
 }
 
-// MarkFinalAccepted records a correlated FINAL acceptance. This advances the
-// resource generation but intentionally returns no execution capability.
-func (t *ResourceTransaction) MarkFinalAccepted() error {
+// markFinalAcceptedWithoutExecution exists only for package-local resource
+// state tests. Production must consume FINAL through the exact Execution so
+// resource and driver authorization linearize together.
+func (t *ResourceTransaction) markFinalAcceptedWithoutExecution() error {
 	if t == nil || t.token == nil {
 		return ErrResourceTransactionState
 	}
@@ -241,10 +245,14 @@ func (t *ResourceTransaction) MarkFinalAccepted() error {
 	if token.state != ResourceTransactionCommitPublished || !token.activeLocked() {
 		return ErrResourceTransactionState
 	}
+	if !token.deadline.After(time.Now()) {
+		_ = token.markOutcomeUnknownLocked()
+		return ErrAuthorityExpired
+	}
 	if err := token.consumeGenerationLocked(); err != nil {
 		return err
 	}
-	token.state = ResourceTransactionFinalAccepted
+	token.state = ResourceTransactionPublishAuthorized
 	return nil
 }
 
@@ -269,11 +277,9 @@ func (t *ResourceTransaction) MarkFinalRejected() error {
 	return nil
 }
 
-// ReconcileFinalAccepted records a late, correlated FINAL acceptance after the
-// COMMIT outcome became unknown. The transaction stays held and cannot be
-// consumed after its immutable deadline; the engine must resolve it without
-// execution.
-func (t *ResourceTransaction) ReconcileFinalAccepted() error {
+// reconcileFinalAcceptedWithoutExecution exists only for package-local state
+// tests. Production recovery consumes late FINAL through the exact Execution.
+func (t *ResourceTransaction) reconcileFinalAcceptedWithoutExecution() error {
 	if t == nil || t.token == nil {
 		return ErrResourceTransactionState
 	}
@@ -283,14 +289,18 @@ func (t *ResourceTransaction) ReconcileFinalAccepted() error {
 	token.resource.mu.Lock()
 	defer token.resource.mu.Unlock()
 	if token.state != ResourceTransactionOutcomeUnknown ||
-		token.unknownFrom != ResourceTransactionCommitPublished || !token.activeLocked() {
+		token.unknownFrom != ResourceTransactionCommitPublished || !token.activeLocked() || !token.executionIssued {
 		return ErrResourceTransactionState
 	}
 	if err := token.consumeGenerationLocked(); err != nil {
 		return err
 	}
-	token.unknownFrom = ResourceTransactionInvalid
-	token.state = ResourceTransactionFinalAccepted
+	if token.expiry != nil {
+		token.expiry.Stop()
+		token.expiry = nil
+	}
+	token.unknownFrom = ResourceTransactionPublishAuthorized
+	token.state = ResourceTransactionOutcomeUnknown
 	return nil
 }
 
@@ -316,10 +326,10 @@ func (t *ResourceTransaction) ReconcileFinalRejected() error {
 	return nil
 }
 
-// consumeWithoutExecution exists only for package-local resource-state tests.
+// stageWithoutExecution exists only for package-local resource-state tests.
 // Production crosses this boundary through AuthorityIssuer.ConsumeExecution,
 // which additionally binds exact peer and driver evidence.
-func (t *ResourceTransaction) consumeWithoutExecution() error {
+func (t *ResourceTransaction) stageWithoutExecution() error {
 	if t == nil || t.token == nil {
 		return ErrAuthorityStale
 	}
@@ -328,16 +338,16 @@ func (t *ResourceTransaction) consumeWithoutExecution() error {
 	defer token.claim.mu.Unlock()
 	token.resource.mu.Lock()
 	defer token.resource.mu.Unlock()
-	return token.consumeLocked()
+	return token.stageExecutionLocked()
 }
 
-func (t *resourceTransactionToken) consumeLocked() error {
+func (t *resourceTransactionToken) stageExecutionLocked() error {
 	switch t.state {
-	case ResourceTransactionConsumed:
+	case ResourceTransactionExecutionStaged:
 		return ErrAuthorityConsumed
 	case ResourceTransactionOutcomeUnknown:
 		return ErrTransactionOutcomeUnknown
-	case ResourceTransactionFinalAccepted:
+	case ResourceTransactionPrepared:
 		if !t.activeLocked() || !t.claim.currentForPlanLocked(t.plan) {
 			_ = t.markOutcomeUnknownLocked()
 			return ErrAuthorityStale
@@ -346,22 +356,41 @@ func (t *resourceTransactionToken) consumeLocked() error {
 			_ = t.markOutcomeUnknownLocked()
 			return ErrAuthorityExpired
 		}
-		t.state = ResourceTransactionConsumed
+		t.state = ResourceTransactionExecutionStaged
 		return nil
 	default:
 		return ErrAuthorityStale
 	}
 }
 
+// markPublished records the local owner-swap linearization point. It is
+// called only after the sealed incarnation reporter proves that Publish
+// changed the physical endpoint. Activation and peer terminal resolution may
+// still be pending.
+func (t *resourceTransactionToken) markPublished() error {
+	if t == nil || t.claim == nil || t.resource == nil {
+		return ErrResourceTransactionState
+	}
+	t.claim.mu.Lock()
+	defer t.claim.mu.Unlock()
+	t.resource.mu.Lock()
+	defer t.resource.mu.Unlock()
+	if t.state != ResourceTransactionPublishAuthorized || !t.activeLocked() || !t.executionIssued {
+		return ErrResourceTransactionState
+	}
+	t.state = ResourceTransactionPublished
+	return nil
+}
+
 // BeginResolution records the engine's selected terminal driver outcome.
-// FinalAccepted may only enter a no-execution rollback. A consumed transaction
-// may complete or roll back. Deterministic cleanup may also resume from the
-// corresponding fail-closed state after the immutable deadline.
+// COMPLETE requires a published endpoint, ROLLED_BACK is only valid after
+// FINAL authorization but before Publish, and ABORT terminates a pre-COMMIT
+// staged execution or an unconsumed PREPARED reservation.
 func (t *ResourceTransaction) BeginResolution(resolution Resolution) error {
 	if t == nil || t.token == nil {
 		return ErrResourceTransactionState
 	}
-	if resolution != ResolutionComplete && resolution != ResolutionRolledBack {
+	if resolution != ResolutionComplete && resolution != ResolutionRolledBack && resolution != ResolutionAbort {
 		return ErrResourceTransactionState
 	}
 	token := t.token
@@ -373,18 +402,45 @@ func (t *ResourceTransaction) BeginResolution(resolution Resolution) error {
 		return ErrResourceTransactionState
 	}
 	switch token.state {
-	case ResourceTransactionFinalAccepted:
+	case ResourceTransactionPublished:
+		if resolution != ResolutionComplete {
+			return ErrResourceTransactionState
+		}
+	case ResourceTransactionPublishAuthorized:
 		if resolution != ResolutionRolledBack {
 			return ErrResourceTransactionState
 		}
-	case ResourceTransactionConsumed:
+	case ResourceTransactionPrepared:
+		if resolution != ResolutionAbort {
+			return ErrResourceTransactionState
+		}
+		if err := token.consumeGenerationLocked(); err != nil {
+			return err
+		}
+	case ResourceTransactionExecutionStaged:
+		if resolution != ResolutionRolledBack {
+			return ErrResourceTransactionState
+		}
+		if err := token.consumeGenerationLocked(); err != nil {
+			return err
+		}
 	case ResourceTransactionOutcomeUnknown:
 		switch token.unknownFrom {
-		case ResourceTransactionFinalAccepted:
+		case ResourceTransactionPublishAuthorized:
 			if resolution != ResolutionRolledBack {
 				return ErrTransactionOutcomeUnknown
 			}
-		case ResourceTransactionConsumed:
+		case ResourceTransactionPublished:
+			if resolution != ResolutionComplete {
+				return ErrTransactionOutcomeUnknown
+			}
+		case ResourceTransactionExecutionStaged:
+			if resolution != ResolutionRolledBack {
+				return ErrTransactionOutcomeUnknown
+			}
+			if err := token.consumeGenerationLocked(); err != nil {
+				return err
+			}
 		case ResourceTransactionResolving:
 			if token.resolution == resolution {
 				return nil
@@ -408,7 +464,7 @@ func (t *ResourceTransaction) FinishResolution(resolution Resolution) error {
 	if t == nil || t.token == nil {
 		return ErrResourceTransactionState
 	}
-	if resolution != ResolutionComplete && resolution != ResolutionRolledBack {
+	if resolution != ResolutionComplete && resolution != ResolutionRolledBack && resolution != ResolutionAbort {
 		return ErrResourceTransactionState
 	}
 	token := t.token
@@ -426,6 +482,8 @@ func (t *ResourceTransaction) FinishResolution(resolution Resolution) error {
 	state := ResourceTransactionCompleted
 	if resolution == ResolutionRolledBack {
 		state = ResourceTransactionRolledBack
+	} else if resolution == ResolutionAbort {
+		state = ResourceTransactionAborted
 	}
 	token.clearLocked(state)
 	return nil
@@ -453,8 +511,9 @@ func (t *ResourceTransaction) Abort() error {
 		}
 		token.clearLocked(ResourceTransactionAborted)
 		return nil
-	case ResourceTransactionCommitPublished, ResourceTransactionFinalAccepted,
-		ResourceTransactionConsumed, ResourceTransactionResolving, ResourceTransactionOutcomeUnknown:
+	case ResourceTransactionExecutionStaged, ResourceTransactionCommitPublished,
+		ResourceTransactionPublishAuthorized, ResourceTransactionPublished,
+		ResourceTransactionResolving, ResourceTransactionOutcomeUnknown:
 		return ErrTransactionOutcomeUnknown
 	default:
 		return ErrResourceTransactionState
@@ -477,8 +536,9 @@ func (t *resourceTransactionToken) markOutcomeUnknownLocked() error {
 	switch t.state {
 	case ResourceTransactionOutcomeUnknown:
 		return nil
-	case ResourceTransactionCommitPublished, ResourceTransactionFinalAccepted,
-		ResourceTransactionConsumed, ResourceTransactionResolving:
+	case ResourceTransactionExecutionStaged, ResourceTransactionCommitPublished,
+		ResourceTransactionPublishAuthorized, ResourceTransactionPublished,
+		ResourceTransactionResolving:
 		if err := t.consumeGenerationLocked(); err != nil {
 			return err
 		}
@@ -516,8 +576,9 @@ func (t *resourceTransactionToken) expireLocked() {
 			}
 		}
 		t.clearLocked(ResourceTransactionExpired)
-	case ResourceTransactionCommitPublished, ResourceTransactionFinalAccepted,
-		ResourceTransactionConsumed, ResourceTransactionResolving:
+	case ResourceTransactionExecutionStaged, ResourceTransactionCommitPublished,
+		ResourceTransactionPublishAuthorized, ResourceTransactionPublished,
+		ResourceTransactionResolving:
 		_ = t.markOutcomeUnknownLocked()
 	}
 }
@@ -577,8 +638,9 @@ func (c *Claim) revokeResourceTransactionLocked() {
 			}
 		}
 		transaction.clearLocked(ResourceTransactionRevoked)
-	case ResourceTransactionCommitPublished, ResourceTransactionFinalAccepted,
-		ResourceTransactionConsumed, ResourceTransactionResolving:
+	case ResourceTransactionExecutionStaged, ResourceTransactionCommitPublished,
+		ResourceTransactionPublishAuthorized, ResourceTransactionPublished,
+		ResourceTransactionResolving:
 		_ = transaction.markOutcomeUnknownLocked()
 	}
 	c.resource.mu.Unlock()

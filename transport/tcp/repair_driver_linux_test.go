@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -108,6 +109,27 @@ func newInlineRepairExecutor(
 	leafmobility.ContextDigest,
 ) (repairAttemptExecutor, error) {
 	return inlineRepairExecutor{}, nil
+}
+
+type retryCloseRepairExecutor struct {
+	trace      *repairDriverTrace
+	closeCalls int
+	closeFn    func(int) error
+}
+
+func (executor *retryCloseRepairExecutor) Do(ctx context.Context, run func(context.Context) error) error {
+	return run(ctx)
+}
+
+func (executor *retryCloseRepairExecutor) Close(context.Context) error {
+	executor.closeCalls++
+	if executor.trace != nil {
+		executor.trace.add("executor-close")
+	}
+	if executor.closeFn != nil {
+		return executor.closeFn(executor.closeCalls)
+	}
+	return nil
 }
 
 func (kernel *fakeRepairKernel) Inspect(conn *net.TCPConn) (tcprepair.Inspection, error) {
@@ -339,14 +361,25 @@ func newRepairDriverTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return client, result.conn
 }
 
-func prepareAndCutoverRepairAttempt(t *testing.T, fixture *repairDriverFixture) {
+func configurePrivateRepairReplacement(t *testing.T, fixture *repairDriverFixture) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	replacement, peer := newRepairDriverTCPPair(t)
+	fixture.kernel.restoreFn = func(context.Context, *tcprepair.Snapshot) (*net.TCPConn, error) {
+		return replacement, nil
+	}
+	return replacement, peer
+}
+
+func prepareAndStageRepairAttempt(t *testing.T, fixture *repairDriverFixture) leafmobility.PublicationEvidence {
 	t.Helper()
 	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if err := fixture.attempt.Cutover(context.Background(), fixture.request); err != nil {
-		t.Fatalf("Cutover: %v", err)
+	evidence, err := fixture.attempt.Stage(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
 	}
+	return evidence
 }
 
 func assertRepairDriverEvents(t *testing.T, trace *repairDriverTrace, want ...string) {
@@ -568,31 +601,44 @@ func TestTCPRepairAttemptPrepareFailuresRollbackMaintenance(t *testing.T) {
 	})
 }
 
-func TestTCPRepairAttemptCutoverCapturesAndRollsBackOriginalEndpoint(t *testing.T) {
+func TestTCPRepairAttemptStageKeepsReplacementPrivateAndRollbackPublishesIt(t *testing.T) {
 	fixture := newRepairDriverFixture(t)
+	replacement, replacementPeer := configurePrivateRepairReplacement(t, fixture)
 	originalGeneration := fixture.attempt.ownerGeneration
-	prepareAndCutoverRepairAttempt(t, fixture)
-	if fixture.attempt.stage != repairAttemptCutover || fixture.attempt.snapshot != fixture.kernel.snapshot ||
-		fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateRepair {
-		t.Fatalf("cutover attempt = %+v", fixture.attempt)
+	evidence := prepareAndStageRepairAttempt(t, fixture)
+	if fixture.attempt.stage != repairAttemptStaged || fixture.attempt.snapshot != fixture.kernel.snapshot ||
+		fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateClosed ||
+		fixture.attempt.replacement != replacement || fixture.attempt.replacementPublished {
+		t.Fatalf("staged attempt = %+v", fixture.attempt)
 	}
-	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture")
-
-	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
-		t.Fatalf("Rollback cutover: %v", err)
+	if want := leafmobility.EvidenceDigest(fixture.kernel.snapshot.Digest()); evidence.Digest != want {
+		t.Fatalf("Stage evidence = %x, want %x", evidence.Digest, want)
 	}
 	conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
-	if conn != fixture.source || generation != originalGeneration || maintenance || terminal {
-		t.Fatalf("rolled-back endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	if conn != fixture.source || generation != originalGeneration || !maintenance || terminal || fixture.attempt.quarantine == nil {
+		t.Fatalf("endpoint after Stage = (%T,%d,maintenance=%t,terminal=%t), quarantine=%T",
+			conn, generation, maintenance, terminal, fixture.attempt.quarantine)
 	}
 	if fixture.attempt.EndpointGenerationChanged() {
-		t.Fatal("ordinary cutover rollback changed endpoint generation")
+		t.Fatal("Stage changed the endpoint owner incarnation")
 	}
-	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "resume", "release")
-	assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore")
+
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Rollback staged attempt: %v", err)
+	}
+	conn, generation, maintenance, terminal = repairEndpointState(fixture.path.endpoint)
+	if conn != replacement || generation == originalGeneration || maintenance || terminal {
+		t.Fatalf("rolled-back endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
+	if !fixture.attempt.EndpointGenerationChanged() || fixture.attempt.quarantine != nil {
+		t.Fatalf("staged rollback changed=%t quarantine=%T", fixture.attempt.EndpointGenerationChanged(), fixture.attempt.quarantine)
+	}
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "release")
+	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 }
 
-func TestTCPRepairAttemptCutoverFailureReleasesMaintenance(t *testing.T) {
+func TestTCPRepairAttemptStageFailureReleasesMaintenanceOnRollback(t *testing.T) {
 	t.Run("capture error", func(t *testing.T) {
 		captureFailure := errors.New("capture failed")
 		fixture := newRepairDriverFixture(t)
@@ -602,15 +648,15 @@ func TestTCPRepairAttemptCutoverFailureReleasesMaintenance(t *testing.T) {
 		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := fixture.attempt.Cutover(context.Background(), fixture.request); !errors.Is(err, captureFailure) {
-			t.Fatalf("Cutover = %v, want capture failure", err)
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, captureFailure) {
+			t.Fatalf("Stage = %v, want capture failure", err)
 		}
 		if fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateNormal ||
 			fixture.attempt.snapshot != nil {
 			t.Fatalf("failed capture retained repair state: %+v", fixture.attempt)
 		}
 		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
-			t.Fatalf("Rollback failed Cutover: %v", err)
+			t.Fatalf("Rollback failed Stage: %v", err)
 		}
 		assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "release")
 		assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
@@ -625,8 +671,8 @@ func TestTCPRepairAttemptCutoverFailureReleasesMaintenance(t *testing.T) {
 		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := fixture.attempt.Cutover(context.Background(), fixture.request); !errors.Is(err, captureFailure) {
-			t.Fatalf("Cutover = %v, want capture failure", err)
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, captureFailure) {
+			t.Fatalf("Stage = %v, want capture failure", err)
 		}
 		if fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateUnknown ||
 			fixture.attempt.snapshot != nil {
@@ -649,8 +695,8 @@ func TestTCPRepairAttemptCutoverFailureReleasesMaintenance(t *testing.T) {
 		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := fixture.attempt.Cutover(context.Background(), fixture.request); err == nil {
-			t.Fatal("Cutover accepted a snapshot with a changed tuple")
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err == nil {
+			t.Fatal("Stage accepted a snapshot with a changed tuple")
 		}
 		if fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateRepair ||
 			fixture.attempt.snapshot == nil {
@@ -664,7 +710,7 @@ func TestTCPRepairAttemptCutoverFailureReleasesMaintenance(t *testing.T) {
 	})
 }
 
-func TestTCPRepairAttemptCommitOrdersCloseRestoreReplaceReleaseResume(t *testing.T) {
+func TestTCPRepairAttemptPublishOnlySwapsOwnerAndActivateReleasesMaintenance(t *testing.T) {
 	fixture := newRepairDriverFixture(t)
 	replacement, replacementPeer := newRepairDriverTCPPair(t)
 	originalGeneration := fixture.attempt.ownerGeneration
@@ -679,27 +725,84 @@ func TestTCPRepairAttemptCommitOrdersCloseRestoreReplaceReleaseResume(t *testing
 	}
 	fixture.lease.releaseFn = func(context.Context, int) error {
 		conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
-		if conn != replacement || generation == originalGeneration || !maintenance || terminal {
+		if conn != replacement || generation == originalGeneration || maintenance || terminal {
 			return fmt.Errorf(
-				"release before replacement publication: conn=%T generation=%d maintenance=%t terminal=%t",
+				"release before endpoint resume: conn=%T generation=%d maintenance=%t terminal=%t",
 				conn, generation, maintenance, terminal,
 			)
 		}
 		return nil
 	}
-	prepareAndCutoverRepairAttempt(t, fixture)
+	prepareAndStageRepairAttempt(t, fixture)
 
-	if err := fixture.attempt.Commit(context.Background(), fixture.request); err != nil {
-		t.Fatalf("Commit: %v", err)
+	if err := fixture.attempt.Publish(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Publish: %v", err)
 	}
 	conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
-	if conn != replacement || generation == originalGeneration || maintenance || terminal {
-		t.Fatalf("committed endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	if conn != replacement || generation == originalGeneration || !maintenance || terminal {
+		t.Fatalf("published endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
 	}
-	if fixture.attempt.stage != repairAttemptCommitted || !fixture.attempt.EndpointGenerationChanged() {
-		t.Fatalf("committed attempt stage=%d changed=%t", fixture.attempt.stage, fixture.attempt.EndpointGenerationChanged())
+	if fixture.attempt.stage != repairAttemptPublished || !fixture.attempt.EndpointGenerationChanged() ||
+		fixture.attempt.quarantine == nil || fixture.attempt.executor == nil {
+		t.Fatalf("published attempt stage=%d changed=%t quarantine=%T executor=%T",
+			fixture.attempt.stage, fixture.attempt.EndpointGenerationChanged(), fixture.attempt.quarantine, fixture.attempt.executor)
+	}
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore")
+
+	if err := fixture.attempt.Activate(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	conn, generation, maintenance, terminal = repairEndpointState(fixture.path.endpoint)
+	if conn != replacement || generation == originalGeneration || maintenance || terminal {
+		t.Fatalf("activated endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
+	if fixture.attempt.stage != repairAttemptActivated || fixture.attempt.quarantine != nil || fixture.attempt.executor != nil {
+		t.Fatalf("activated attempt = %+v", fixture.attempt)
 	}
 	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "release")
+	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
+}
+
+func TestTCPRepairAttemptPublishRechecksContextUnderOwnerLock(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	replacement, replacementPeer := configurePrivateRepairReplacement(t, fixture)
+	originalGeneration := fixture.attempt.ownerGeneration
+	prepareAndStageRepairAttempt(t, fixture)
+
+	fixture.path.endpoint.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- fixture.attempt.Publish(ctx, fixture.request) }()
+	lockDeadline := time.Now().Add(time.Second)
+	for fixture.attempt.mu.TryLock() {
+		fixture.attempt.mu.Unlock()
+		if !time.Now().Before(lockDeadline) {
+			fixture.path.endpoint.mu.Unlock()
+			t.Fatal("Publish did not reach the endpoint owner lock")
+		}
+		runtime.Gosched()
+	}
+	<-ctx.Done()
+	fixture.path.endpoint.mu.Unlock()
+	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Publish after owner-lock deadline=%v want deadline exceeded", err)
+	}
+	conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+	if conn != fixture.source || generation != originalGeneration || !maintenance || terminal {
+		t.Fatalf("deadline-crossing Publish changed owner=(%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
+	if fixture.attempt.stage != repairAttemptStaged || fixture.attempt.replacementPublished ||
+		fixture.attempt.EndpointGenerationChanged() {
+		t.Fatalf("deadline-crossing Publish mutated attempt: %+v", fixture.attempt)
+	}
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Rollback after rejected Publish: %v", err)
+	}
+	conn, generation, maintenance, terminal = repairEndpointState(fixture.path.endpoint)
+	if conn != replacement || generation == originalGeneration || maintenance || terminal {
+		t.Fatalf("rolled-back endpoint=(%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
 	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 }
 
@@ -722,10 +825,12 @@ func TestTCPRepairAttemptRestoreFailureRollsBackFromSnapshot(t *testing.T) {
 		}
 		return replacement, nil
 	}
-	prepareAndCutoverRepairAttempt(t, fixture)
+	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 
-	if err := fixture.attempt.Commit(context.Background(), fixture.request); !errors.Is(err, restoreFailure) {
-		t.Fatalf("Commit = %v, want restore failure", err)
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, restoreFailure) {
+		t.Fatalf("Stage = %v, want restore failure", err)
 	}
 	if _, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint); generation != originalGeneration || !maintenance || terminal {
 		t.Fatalf("endpoint after failed restore = generation %d maintenance=%t terminal=%t", generation, maintenance, terminal)
@@ -752,10 +857,12 @@ func TestTCPRepairAttemptUnknownRestoreCleanupNeverRetriesTupleOrReleasesQuarant
 		restoreCalls++
 		return nil, errors.Join(restoreFailure, tcprepair.ErrRestoreCleanupUnknown)
 	}
-	prepareAndCutoverRepairAttempt(t, fixture)
+	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 
-	if err := fixture.attempt.Commit(context.Background(), fixture.request); !errors.Is(err, restoreFailure) || !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
-		t.Fatalf("Commit = %v, want restore cleanup unknown", err)
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, restoreFailure) || !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
+		t.Fatalf("Stage = %v, want restore cleanup unknown", err)
 	}
 	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, tcprepair.ErrRestoreCleanupUnknown) {
 		t.Fatalf("Rollback = %v, want cleanup unknown", err)
@@ -772,7 +879,7 @@ func TestTCPRepairAttemptUnknownRestoreCleanupNeverRetriesTupleOrReleasesQuarant
 	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore")
 }
 
-func TestTCPRepairAttemptReleaseFailureRollsBackPublishedReplacement(t *testing.T) {
+func TestTCPRepairAttemptActivateFailureIsRetryableAndRejectsRollback(t *testing.T) {
 	releaseFailure := errors.New("release failed after replace")
 	fixture := newRepairDriverFixture(t)
 	replacement, replacementPeer := newRepairDriverTCPPair(t)
@@ -788,17 +895,26 @@ func TestTCPRepairAttemptReleaseFailureRollsBackPublishedReplacement(t *testing.
 		}
 		return nil
 	}
-	prepareAndCutoverRepairAttempt(t, fixture)
+	prepareAndStageRepairAttempt(t, fixture)
+	if err := fixture.attempt.Publish(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
 
-	if err := fixture.attempt.Commit(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
-		t.Fatalf("Commit = %v, want release failure", err)
+	if err := fixture.attempt.Activate(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
+		t.Fatalf("Activate = %v, want release failure", err)
 	}
 	conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
-	if conn != replacement || generation == originalGeneration || !maintenance || terminal {
-		t.Fatalf("endpoint after failed release = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	if conn != replacement || generation == originalGeneration || maintenance || terminal {
+		t.Fatalf("endpoint after failed Activate = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
 	}
-	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
-		t.Fatalf("Rollback published replacement: %v", err)
+	if fixture.attempt.stage != repairAttemptPublished || fixture.attempt.quarantine == nil || fixture.attempt.executor == nil {
+		t.Fatalf("failed Activate lost retry state: %+v", fixture.attempt)
+	}
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err == nil {
+		t.Fatal("Rollback accepted an already published replacement")
+	}
+	if err := fixture.attempt.Activate(context.Background(), fixture.request); err != nil {
+		t.Fatalf("retry Activate: %v", err)
 	}
 	if restoreCalls != 1 || fixture.lease.releaseCalls() != 2 || !fixture.attempt.EndpointGenerationChanged() {
 		t.Fatalf(
@@ -807,6 +923,44 @@ func TestTCPRepairAttemptReleaseFailureRollsBackPublishedReplacement(t *testing.
 		)
 	}
 	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "release", "release")
+	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
+}
+
+func TestTCPRepairAttemptPublishFailureWithoutIncarnationChangeCanRollback(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	replacement, replacementPeer := configurePrivateRepairReplacement(t, fixture)
+	originalGeneration := fixture.attempt.ownerGeneration
+	prepareAndStageRepairAttempt(t, fixture)
+
+	fixture.path.endpoint.mu.Lock()
+	fixture.path.endpoint.readActive = true
+	fixture.path.endpoint.mu.Unlock()
+	publishErr := fixture.attempt.Publish(context.Background(), fixture.request)
+	fixture.path.endpoint.mu.Lock()
+	fixture.path.endpoint.readActive = false
+	fixture.path.endpoint.mu.Unlock()
+	if !errors.Is(publishErr, errEndpointStaleLease) {
+		t.Fatalf("Publish = %v, want stale maintenance lease", publishErr)
+	}
+	conn, generation, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+	if conn != fixture.source || generation != originalGeneration || !maintenance || terminal {
+		t.Fatalf("endpoint after failed Publish = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
+	if fixture.attempt.stage != repairAttemptStaged || fixture.attempt.EndpointGenerationChanged() || fixture.attempt.quarantine == nil {
+		t.Fatalf("failed Publish mutated boundary state: %+v", fixture.attempt)
+	}
+
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Rollback after failed Publish: %v", err)
+	}
+	conn, generation, maintenance, terminal = repairEndpointState(fixture.path.endpoint)
+	if conn != replacement || generation == originalGeneration || maintenance || terminal {
+		t.Fatalf("rolled-back endpoint = (%T,%d,maintenance=%t,terminal=%t)", conn, generation, maintenance, terminal)
+	}
+	if !fixture.attempt.EndpointGenerationChanged() || fixture.attempt.quarantine != nil {
+		t.Fatalf("rollback changed=%t quarantine=%T", fixture.attempt.EndpointGenerationChanged(), fixture.attempt.quarantine)
+	}
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "release")
 	assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 }
 
@@ -825,7 +979,17 @@ func TestTCPRepairAttemptRollbackFailuresAreRetryable(t *testing.T) {
 			}
 			return nil
 		}
-		prepareAndCutoverRepairAttempt(t, fixture)
+		fixture.kernel.inspection.Tuple = tcprepair.Tuple{
+			Local:  netip.MustParseAddrPort("127.0.0.1:12001"),
+			Remote: netip.MustParseAddrPort("127.0.0.1:12002"),
+		}
+		fixture.attempt.inspection = fixture.kernel.inspection
+		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err == nil {
+			t.Fatal("Stage accepted snapshot tuple drift")
+		}
 
 		if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, resumeFailure) {
 			t.Fatalf("first Rollback = %v, want Resume failure", err)
@@ -849,19 +1013,24 @@ func TestTCPRepairAttemptRollbackFailuresAreRetryable(t *testing.T) {
 	t.Run("quarantine Release", func(t *testing.T) {
 		releaseFailure := errors.New("release retry required")
 		fixture := newRepairDriverFixture(t)
+		replacement, replacementPeer := configurePrivateRepairReplacement(t, fixture)
 		fixture.lease.releaseFn = func(_ context.Context, call int) error {
+			conn, _, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+			if conn != replacement || maintenance || terminal {
+				return fmt.Errorf("release observed owner=%T maintenance=%t terminal=%t", conn, maintenance, terminal)
+			}
 			if call == 1 {
 				return releaseFailure
 			}
 			return nil
 		}
-		prepareAndCutoverRepairAttempt(t, fixture)
+		prepareAndStageRepairAttempt(t, fixture)
 
 		if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
 			t.Fatalf("first Rollback = %v, want Release failure", err)
 		}
-		if _, _, available := fixture.path.endpoint.current(); available {
-			t.Fatal("failed Release exposed endpoint before retry")
+		if conn, _, available := fixture.path.endpoint.current(); !available || conn != replacement {
+			t.Fatalf("failed Release lost restored endpoint: conn=%T available=%t", conn, available)
 		}
 		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
 			t.Fatalf("retry Rollback: %v", err)
@@ -869,14 +1038,287 @@ func TestTCPRepairAttemptRollbackFailuresAreRetryable(t *testing.T) {
 		if fixture.lease.releaseCalls() != 2 {
 			t.Fatalf("release calls = %d, want 2", fixture.lease.releaseCalls())
 		}
-		assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "resume", "release", "release")
-		assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+		if !fixture.attempt.EndpointGenerationChanged() {
+			t.Fatal("staged rollback did not publish its private replacement")
+		}
+		assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "release", "release")
+		assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
 	})
+
+	t.Run("executor Close", func(t *testing.T) {
+		closeFailure := errors.New("executor close retry required")
+		fixture := newRepairDriverFixture(t)
+		_, replacementPeer := configurePrivateRepairReplacement(t, fixture)
+		executor := &retryCloseRepairExecutor{
+			trace: fixture.trace,
+			closeFn: func(call int) error {
+				if call == 1 {
+					return closeFailure
+				}
+				return nil
+			},
+		}
+		fixture.attempt.driver.newExecutor = func(
+			context.Context, *net.TCPConn, leafmobility.ContextDigest,
+		) (repairAttemptExecutor, error) {
+			return executor, nil
+		}
+		prepareAndStageRepairAttempt(t, fixture)
+
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, closeFailure) {
+			t.Fatalf("first Rollback = %v, want Close failure", err)
+		}
+		if fixture.attempt.executor != executor || fixture.attempt.quarantine != nil ||
+			fixture.attempt.maintenance != nil || fixture.attempt.stage != repairAttemptStaged {
+			t.Fatalf("failed Close lost retry state: %+v", fixture.attempt)
+		}
+		assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+			t.Fatalf("retry Rollback: %v", err)
+		}
+		if executor.closeCalls != 2 || fixture.attempt.stage != repairAttemptRolledBack {
+			t.Fatalf("close calls/stage=%d/%d want 2/rolled-back", executor.closeCalls, fixture.attempt.stage)
+		}
+		assertRepairDriverEvents(t, fixture.trace,
+			"inspect", "install", "capture", "restore", "release", "executor-close", "executor-close")
+	})
+
+	t.Run("closed namespace executor", func(t *testing.T) {
+		restoreFailure := errors.New("restore original namespace failed")
+		fixture := newRepairDriverFixture(t)
+		_, replacementPeer := configurePrivateRepairReplacement(t, fixture)
+		ops := newFakeRepairNamespaceOps()
+		expected := ops.digests[ops.targetFD]
+		fixture.attempt.preflight.ContextDigest = expected
+		ops.setErrors[ops.originalFD] = restoreFailure
+		fixture.attempt.driver.newExecutor = func(
+			ctx context.Context, conn *net.TCPConn, _ leafmobility.ContextDigest,
+		) (repairAttemptExecutor, error) {
+			return newRepairNamespaceExecutorWithOps(ctx, conn, expected, ops)
+		}
+		prepareAndStageRepairAttempt(t, fixture)
+
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, restoreFailure) {
+			t.Fatalf("first Rollback = %v, want namespace restore failure", err)
+		}
+		if fixture.attempt.executor != nil || fixture.attempt.quarantine != nil || fixture.attempt.maintenance != nil {
+			t.Fatalf("terminated executor retained cleanup state: %+v", fixture.attempt)
+		}
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+			t.Fatalf("retry Rollback after terminated executor: %v", err)
+		}
+		if fixture.attempt.stage != repairAttemptRolledBack {
+			t.Fatalf("stage=%d want rolled-back", fixture.attempt.stage)
+		}
+		assertRepairPathRoundTrip(t, fixture.path, replacementPeer)
+	})
+}
+
+func TestTCPRepairAttemptFailClosedAfterPartialRollbackReacquiresMaintenance(t *testing.T) {
+	releaseFailure := errors.New("rollback release failed")
+	fixture := newRepairDriverFixture(t)
+	configurePrivateRepairReplacement(t, fixture)
+	fixture.lease.releaseFn = func(_ context.Context, call int) error {
+		if call == 1 {
+			return releaseFailure
+		}
+		_, _, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+		if !terminal || maintenance {
+			return fmt.Errorf("fail-closed release observed terminal=%t maintenance=%t", terminal, maintenance)
+		}
+		return nil
+	}
+	prepareAndStageRepairAttempt(t, fixture)
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
+		t.Fatalf("Rollback = %v, want release failure", err)
+	}
+	if fixture.attempt.maintenance != nil || !fixture.attempt.replacementPublished || fixture.attempt.quarantine == nil {
+		t.Fatalf("partial rollback state=%+v", fixture.attempt)
+	}
+	if err := fixture.attempt.FailClosed(context.Background(), fixture.request); err != nil {
+		t.Fatalf("FailClosed after partial rollback: %v", err)
+	}
+	if !fixture.attempt.endpointTerminated || fixture.attempt.stage != repairAttemptFailedClosed ||
+		fixture.attempt.quarantine != nil || fixture.attempt.executor != nil {
+		t.Fatalf("fail-closed state=%+v", fixture.attempt)
+	}
+}
+
+func TestTCPRepairAttemptFailClosedReinstallsQuarantineAfterRollbackCleanupFailure(t *testing.T) {
+	closeFailure := errors.New("executor close failed before stop")
+	fixture := newRepairDriverFixture(t)
+	configurePrivateRepairReplacement(t, fixture)
+	executor := &retryCloseRepairExecutor{
+		trace: fixture.trace,
+		closeFn: func(call int) error {
+			if call == 1 {
+				return closeFailure
+			}
+			return nil
+		},
+	}
+	fixture.attempt.driver.newExecutor = func(
+		context.Context, *net.TCPConn, leafmobility.ContextDigest,
+	) (repairAttemptExecutor, error) {
+		return executor, nil
+	}
+	fixture.lease.releaseFn = func(_ context.Context, call int) error {
+		if call == 2 {
+			_, _, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+			if !terminal || maintenance {
+				return fmt.Errorf("reinstalled quarantine released before terminal owner proof")
+			}
+		}
+		return nil
+	}
+	prepareAndStageRepairAttempt(t, fixture)
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, closeFailure) {
+		t.Fatalf("Rollback = %v, want executor close failure", err)
+	}
+	if fixture.attempt.maintenance != nil || fixture.attempt.quarantine != nil || fixture.attempt.executor != executor {
+		t.Fatalf("partial cleanup state=%+v", fixture.attempt)
+	}
+	if err := fixture.attempt.FailClosed(context.Background(), fixture.request); err != nil {
+		t.Fatalf("FailClosed with quarantine reinstall: %v", err)
+	}
+	installCalls := 0
+	for _, event := range fixture.trace.snapshot() {
+		if event == "install" {
+			installCalls++
+		}
+	}
+	if installCalls != 2 || fixture.lease.releaseCalls() != 2 {
+		t.Fatalf("events=%v releases=%d, want quarantine reinstall/release", fixture.trace.snapshot(), fixture.lease.releaseCalls())
+	}
+}
+
+func TestTCPRepairAttemptFailClosedReisolatesOriginalSourceAfterRollbackCleanupFailure(t *testing.T) {
+	captureFailure := errors.New("capture failed before replacement")
+	closeFailure := errors.New("executor close failed before stop")
+	fixture := newRepairDriverFixture(t)
+	executor := &retryCloseRepairExecutor{
+		trace: fixture.trace,
+		closeFn: func(call int) error {
+			if call == 1 {
+				return closeFailure
+			}
+			return nil
+		},
+	}
+	fixture.attempt.driver.newExecutor = func(
+		context.Context, *net.TCPConn, leafmobility.ContextDigest,
+	) (repairAttemptExecutor, error) {
+		return executor, nil
+	}
+	fixture.kernel.captureFn = func(conn *net.TCPConn) (repairSource, error) {
+		return &fakeRepairSource{
+			trace: fixture.trace, conn: conn, snapshot: fixture.kernel.snapshot, state: tcprepair.SourceStateNormal,
+		}, captureFailure
+	}
+	fixture.lease.releaseFn = func(_ context.Context, call int) error {
+		if call == 2 {
+			_, _, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
+			if !terminal || maintenance {
+				return fmt.Errorf("source quarantine released before terminal owner proof")
+			}
+		}
+		return nil
+	}
+	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, captureFailure) {
+		t.Fatalf("Stage=%v want capture failure", err)
+	}
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, closeFailure) {
+		t.Fatalf("Rollback=%v want executor close failure", err)
+	}
+	if fixture.attempt.maintenance != nil || fixture.attempt.quarantine != nil ||
+		fixture.attempt.replacementPublished || fixture.attempt.executor != executor {
+		t.Fatalf("partial source rollback state=%+v", fixture.attempt)
+	}
+	if err := fixture.attempt.FailClosed(context.Background(), fixture.request); err != nil {
+		t.Fatalf("FailClosed original source: %v", err)
+	}
+	if !fixture.attempt.endpointTerminated || fixture.attempt.stage != repairAttemptFailedClosed ||
+		fixture.attempt.quarantine != nil || fixture.attempt.executor != nil {
+		t.Fatalf("source fail-closed state=%+v", fixture.attempt)
+	}
+	installCalls := 0
+	for _, event := range fixture.trace.snapshot() {
+		if event == "install" {
+			installCalls++
+		}
+	}
+	if installCalls != 2 || fixture.lease.releaseCalls() != 2 {
+		t.Fatalf("events=%v releases=%d, want source quarantine reinstall", fixture.trace.snapshot(), fixture.lease.releaseCalls())
+	}
+}
+
+func TestTCPRepairAttemptRollbackDiscardsUnprovenReplacementBeforeRestore(t *testing.T) {
+	stageRestoreFailure := errors.New("stage restore failed")
+	discardFailure := errors.New("discard close state unknown")
+	fixture := newRepairDriverFixture(t)
+	replacementA, _ := newRepairDriverTCPPair(t)
+	replacementB, replacementBPeer := newRepairDriverTCPPair(t)
+	restoreCalls := 0
+	fixture.kernel.restoreFn = func(context.Context, *tcprepair.Snapshot) (*net.TCPConn, error) {
+		restoreCalls++
+		switch restoreCalls {
+		case 1:
+			return nil, stageRestoreFailure
+		case 2:
+			return replacementA, nil
+		default:
+			return replacementB, nil
+		}
+	}
+	closeCalls := 0
+	fixture.attempt.closeReplacement = func(conn *net.TCPConn) error {
+		if conn != replacementA {
+			return conn.Close()
+		}
+		closeCalls++
+		if closeCalls == 1 {
+			return discardFailure
+		}
+		return conn.Close()
+	}
+	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); !errors.Is(err, stageRestoreFailure) {
+		t.Fatalf("Stage=%v want restore failure", err)
+	}
+	fixture.path.endpoint.mu.Lock()
+	fixture.path.endpoint.readActive = true
+	fixture.path.endpoint.mu.Unlock()
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); !errors.Is(err, discardFailure) {
+		t.Fatalf("first Rollback=%v want discard uncertainty", err)
+	}
+	fixture.path.endpoint.mu.Lock()
+	fixture.path.endpoint.readActive = false
+	fixture.path.endpoint.mu.Unlock()
+	if !fixture.attempt.replacementDiscarding || fixture.attempt.replacement != replacementA {
+		t.Fatalf("unproven replacement state=%+v", fixture.attempt)
+	}
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+		t.Fatalf("retry Rollback: %v", err)
+	}
+	conn, _, available := fixture.path.endpoint.current()
+	if !available || conn != replacementB || restoreCalls != 3 || closeCalls != 2 {
+		t.Fatalf("owner=%T available=%t restores=%d closes=%d", conn, available, restoreCalls, closeCalls)
+	}
+	if _, err := replacementA.Write([]byte("must-be-closed")); err == nil {
+		t.Fatal("discarded replacement remained connected")
+	}
+	assertRepairPathRoundTrip(t, fixture.path, replacementBPeer)
 }
 
 func TestTCPRepairAttemptFailClosedTerminatesEndpointBeforeQuarantineRelease(t *testing.T) {
 	fixture := newRepairDriverFixture(t)
-	prepareAndCutoverRepairAttempt(t, fixture)
+	configurePrivateRepairReplacement(t, fixture)
+	prepareAndStageRepairAttempt(t, fixture)
 	fixture.lease.releaseFn = func(context.Context, int) error {
 		_, _, maintenance, terminal := repairEndpointState(fixture.path.endpoint)
 		if !terminal || maintenance {
@@ -896,13 +1338,14 @@ func TestTCPRepairAttemptFailClosedTerminatesEndpointBeforeQuarantineRelease(t *
 	if !terminal || maintenance {
 		t.Fatalf("endpoint terminal=%t maintenance=%t", terminal, maintenance)
 	}
-	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "release")
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "enter", "release")
 }
 
 func TestTCPRepairAttemptFailClosedReleaseFailureIsRetryable(t *testing.T) {
 	releaseFailure := errors.New("fail-closed release failed")
 	fixture := newRepairDriverFixture(t)
-	prepareAndCutoverRepairAttempt(t, fixture)
+	configurePrivateRepairReplacement(t, fixture)
+	prepareAndStageRepairAttempt(t, fixture)
 	fixture.lease.releaseFn = func(_ context.Context, call int) error {
 		if call == 1 {
 			return releaseFailure
@@ -916,13 +1359,16 @@ func TestTCPRepairAttemptFailClosedReleaseFailureIsRetryable(t *testing.T) {
 	if !fixture.attempt.endpointTerminated || fixture.attempt.quarantine == nil || fixture.attempt.executor == nil {
 		t.Fatalf("failed cleanup lost ownership: %+v", fixture.attempt)
 	}
+	if err := fixture.attempt.Rollback(context.Background(), fixture.request); err == nil {
+		t.Fatal("Rollback accepted an endpoint already terminated by FailClosed")
+	}
 	if err := fixture.attempt.FailClosed(context.Background(), fixture.request); err != nil {
 		t.Fatalf("retry FailClosed: %v", err)
 	}
 	if fixture.lease.releaseCalls() != 2 || fixture.attempt.stage != repairAttemptFailedClosed {
 		t.Fatalf("release/stage=%d/%d want 2/failed-closed", fixture.lease.releaseCalls(), fixture.attempt.stage)
 	}
-	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "release", "release")
+	assertRepairDriverEvents(t, fixture.trace, "inspect", "install", "capture", "restore", "enter", "release", "release")
 }
 
 func TestTCPRepairAttemptFailClosedRetainsReplacementUntilCloseIsProven(t *testing.T) {
@@ -939,9 +1385,12 @@ func TestTCPRepairAttemptFailClosedRetainsReplacementUntilCloseIsProven(t *testi
 		}
 		return nil
 	}
-	prepareAndCutoverRepairAttempt(t, fixture)
-	if err := fixture.attempt.Commit(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
-		t.Fatalf("Commit = %v, want release failure", err)
+	prepareAndStageRepairAttempt(t, fixture)
+	if err := fixture.attempt.Publish(context.Background(), fixture.request); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := fixture.attempt.Activate(context.Background(), fixture.request); !errors.Is(err, releaseFailure) {
+		t.Fatalf("Activate = %v, want release failure", err)
 	}
 
 	closeCalls := 0
@@ -1048,23 +1497,44 @@ func TestTCPRepairAttemptRequestMismatchDoesNotMutate(t *testing.T) {
 				call:  (*tcpRepairAttempt).Prepare, wantStage: repairAttemptPreflight,
 			},
 			{
-				name: "Cutover",
+				name: "Stage",
 				setup: func(t *testing.T, fixture *repairDriverFixture) {
 					if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 						t.Fatalf("Prepare: %v", err)
 					}
 				},
-				call: (*tcpRepairAttempt).Cutover, wantStage: repairAttemptPrepared,
+				call: func(attempt *tcpRepairAttempt, ctx context.Context, request leafmobility.ExecutionRequest) error {
+					_, err := attempt.Stage(ctx, request)
+					return err
+				},
+				wantStage: repairAttemptPrepared,
 			},
 			{
-				name:  "Commit",
-				setup: prepareAndCutoverRepairAttempt,
-				call:  (*tcpRepairAttempt).Commit, wantStage: repairAttemptCutover,
+				name: "Publish",
+				setup: func(t *testing.T, fixture *repairDriverFixture) {
+					_, fixture.peer = configurePrivateRepairReplacement(t, fixture)
+					prepareAndStageRepairAttempt(t, fixture)
+				},
+				call: (*tcpRepairAttempt).Publish, wantStage: repairAttemptStaged,
 			},
 			{
-				name:  "Rollback",
-				setup: prepareAndCutoverRepairAttempt,
-				call:  (*tcpRepairAttempt).Rollback, wantStage: repairAttemptCutover,
+				name: "Activate",
+				setup: func(t *testing.T, fixture *repairDriverFixture) {
+					_, fixture.peer = configurePrivateRepairReplacement(t, fixture)
+					prepareAndStageRepairAttempt(t, fixture)
+					if err := fixture.attempt.Publish(context.Background(), fixture.request); err != nil {
+						t.Fatalf("Publish: %v", err)
+					}
+				},
+				call: (*tcpRepairAttempt).Activate, wantStage: repairAttemptPublished,
+			},
+			{
+				name: "Rollback",
+				setup: func(t *testing.T, fixture *repairDriverFixture) {
+					_, fixture.peer = configurePrivateRepairReplacement(t, fixture)
+					prepareAndStageRepairAttempt(t, fixture)
+				},
+				call: (*tcpRepairAttempt).Rollback, wantStage: repairAttemptStaged,
 			},
 		}
 		for _, test := range tests {
@@ -1083,7 +1553,11 @@ func TestTCPRepairAttemptRequestMismatchDoesNotMutate(t *testing.T) {
 				if got := fixture.trace.snapshot(); fmt.Sprint(got) != fmt.Sprint(before) {
 					t.Fatalf("mismatched %s calls = %v, want unchanged %v", test.name, got, before)
 				}
-				if fixture.attempt.maintenance != nil {
+				if fixture.attempt.stage == repairAttemptPublished {
+					if err := fixture.attempt.Activate(context.Background(), fixture.request); err != nil {
+						t.Fatalf("cleanup Activate: %v", err)
+					}
+				} else if fixture.attempt.maintenance != nil {
 					if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
 						t.Fatalf("cleanup Rollback: %v", err)
 					}
