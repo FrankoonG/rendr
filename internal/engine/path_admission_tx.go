@@ -70,8 +70,16 @@ func PerformClientHelloAdmissionContext(
 	if peerPacket := ack.Caps&proto.CapsPacketMode != 0; peerPacket != (caps&proto.CapsPacketMode != 0) {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: peer session kind mismatch: packet=%t", ErrPeerProtocol, peerPacket)
 	}
+	if err := e.AdoptSessionEpoch(ack.FlowID); err != nil {
+		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
+	}
 	if err := e.AcceptPeerNegotiation(ack.Negotiation, ack.LocalTXManifest); err != nil {
 		return ClientHelloAdmission{}, classifyPeerHandshakeError("HELLO_ACK negotiation", err)
+	}
+	// StagePathAttach starts the reader, so identity must be visible before a
+	// peer can send leaf-mobility OOB on the activated route.
+	if err := e.installPeerInstanceID(ack.InstanceID); err != nil {
+		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
 	pathID, err := e.PreparePathBound(pc, spec, PathBinding{
 		LocalTXTargetID: localTargetID,
@@ -94,7 +102,7 @@ func PerformClientHelloAdmissionContext(
 		e.AbortPathAttach(pathID, nil)
 	}()
 	commit, err := readAndBindPrepared(ctx, pc, e, pathID, proto.PathAdmissionKindHello,
-		hello.SessionEpoch, proto.PathAdmissionID(hello.FlowID), senderDirection(SideClient),
+		proto.SessionEpoch(e.FlowID()), proto.PathAdmissionID(hello.FlowID), senderDirection(SideClient),
 		hello.GraphRevision, hello.GraphDigest, hello.InitialTargetID, ack.InitialTargetID,
 		proposalWire, responseWire, proto.CtrlHello, proto.CtrlHelloAck)
 	if err != nil {
@@ -209,7 +217,7 @@ func PerformServerHelloAdmission(
 		return err
 	}
 	return performServerAdmission(ctx, pc, e, pathID, proto.PathAdmissionKindHello,
-		hello.SessionEpoch, proto.PathAdmissionID(hello.FlowID), senderDirection(SideClient),
+		proto.SessionEpoch(e.FlowID()), proto.PathAdmissionID(hello.FlowID), senderDirection(SideClient),
 		hello.GraphRevision, hello.GraphDigest, hello.InitialTargetID, localTargetID,
 		proto.CtrlHello, proposalWire, proto.CtrlHelloAck, responseWire)
 }
@@ -732,8 +740,11 @@ func admissionCommit(
 }
 
 func validateClientHelloAck(e *Engine, hello proto.HelloPayload, ack proto.HelloAckPayload) error {
-	if ack.FlowID != hello.FlowID {
-		return fmt.Errorf("engine: HELLO_ACK flow mismatch")
+	if ack.FlowID == ([16]byte{}) {
+		return fmt.Errorf("engine: HELLO_ACK has zero final session epoch")
+	}
+	if ack.FlowID == hello.FlowID {
+		return fmt.Errorf("engine: HELLO_ACK did not assign a final session epoch")
 	}
 	local := e.localGraphBinding()
 	if ack.AcceptedPeerBinding.Revision != local.revision || ack.AcceptedPeerBinding.Digest != local.digest {

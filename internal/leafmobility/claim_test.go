@@ -1,8 +1,10 @@
 package leafmobility
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 )
 
@@ -315,14 +317,26 @@ func TestRetireUnboundCannotRevokeBoundOwner(t *testing.T) {
 }
 
 func testFacts() Facts {
+	resourceID := ResourceID{0x31, 0x32}
+	binary.BigEndian.PutUint64(resourceID[8:], testResourceCounter.Add(1))
 	return Facts{
 		Kind:       KindRawTCP,
 		Role:       RoleDialer,
 		Scope:      ScopeEndpoint,
 		Session:    SessionStream,
 		Generation: 7,
+		ResourceID: resourceID,
 	}
 }
+
+func testDrivenFacts() Facts {
+	facts := testFacts()
+	facts.Scope = ScopeUnknown
+	facts.ResourceID = ResourceID{}
+	return facts
+}
+
+var testResourceCounter atomic.Uint64
 
 func testBinding(id byte) Binding {
 	return Binding{

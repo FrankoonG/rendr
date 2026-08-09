@@ -38,10 +38,9 @@ func TestEnginePlansSpecializedMobilityFromExactFrozenEvidence(t *testing.T) {
 	claim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
 		Kind:       leafmobility.KindRawTCP,
 		Role:       leafmobility.RoleDialer,
-		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionStream,
 		Generation: leafmobility.NextGeneration(),
-	}, driver)
+	}, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint))
 	capability := mustEngineCapability(t, driver)
 	e, ref := engineWithPlannableLeaf(t, claim, capability, proto.LeafMobilityTCPRepair)
 	started := time.Now()
@@ -66,10 +65,9 @@ func TestEnginePlannerCannotPromoteOwnershipWithoutPeerSupport(t *testing.T) {
 	claim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
 		Kind:       leafmobility.KindRawTCP,
 		Role:       leafmobility.RoleDialer,
-		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionStream,
 		Generation: leafmobility.NextGeneration(),
-	}, driver)
+	}, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint))
 	e, ref := engineWithPlannableLeaf(t, claim, mustEngineCapability(t, driver), 0)
 	plan, err := e.PlanLeafMobilityCandidate(context.Background(), ref, leafmobility.TransactionID{2}, proto.SenderDirectionServerToClient)
 	if err != nil {
@@ -123,10 +121,9 @@ func TestEnginePlannerCannotPublishAfterConcurrentPathRetirement(t *testing.T) {
 	claim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
 		Kind:       leafmobility.KindRawTCP,
 		Role:       leafmobility.RoleDialer,
-		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionStream,
 		Generation: leafmobility.NextGeneration(),
-	}, driver)
+	}, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint))
 	e, ref := engineWithPlannableLeaf(t, claim, mustEngineCapability(t, driver), proto.LeafMobilityTCPRepair)
 	result := make(chan error, 1)
 	go func() {
@@ -157,10 +154,9 @@ func TestLogicalPathDepartureInvalidatesPublishedCandidateBeforeCleanup(t *testi
 	claim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
 		Kind:       leafmobility.KindRawTCP,
 		Role:       leafmobility.RoleDialer,
-		Scope:      leafmobility.ScopeEndpoint,
 		Session:    leafmobility.SessionStream,
 		Generation: leafmobility.NextGeneration(),
-	}, driver)
+	}, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint))
 	e, ref := engineWithPlannableLeaf(t, claim, mustEngineCapability(t, driver), proto.LeafMobilityTCPRepair)
 	plan, err := e.PlanLeafMobilityCandidate(context.Background(), ref, leafmobility.TransactionID{6}, proto.SenderDirectionClientToServer)
 	if err != nil {

@@ -246,12 +246,18 @@ func TestHelloAdmissionPublishesBothSidesAndCarriesData(t *testing.T) {
 			serverDone <- helloAdmissionServerResult{err: err}
 			return
 		}
-		server := New(SideServer, hello.FlowID, Limits{}.Clamp())
+		serverEpoch := NewClientFlowID()
+		for serverEpoch == hello.FlowID || serverEpoch == ([16]byte{}) {
+			serverEpoch = NewClientFlowID()
+		}
+		server := New(SideServer, serverEpoch, Limits{}.Clamp())
 		server.SetLocalInstanceID(serverInstance)
 		server.SetPeerInstanceID(hello.InstanceID)
 		server.SetPeerKind(PeerRendr)
 		server.SetPeerCaps(hello.Caps)
-		if err := server.AcceptPeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err != nil {
+		peerNegotiation := hello.Negotiation
+		peerNegotiation.SessionEpoch = proto.SessionEpoch(serverEpoch)
+		if err := server.AcceptPeerNegotiation(peerNegotiation, hello.LocalTXManifest); err != nil {
 			serverDone <- helloAdmissionServerResult{engine: server, err: err}
 			return
 		}
@@ -279,6 +285,9 @@ func TestHelloAdmissionPublishesBothSidesAndCarriesData(t *testing.T) {
 		clientInstance, 0, "a", transport.PathSpec{Transport: "memory"})
 	if err != nil {
 		t.Fatalf("client admission: %v", err)
+	}
+	if client.PeerInstanceID() != admission.Ack.InstanceID {
+		t.Fatal("client admission returned before publishing peer identity")
 	}
 	client.SetPeerKind(PeerRendr)
 	client.SetPeerInstanceID(admission.Ack.InstanceID)
@@ -695,12 +704,18 @@ func establishHelloAdmissionPairWithGraph(t *testing.T, clientPath, serverPath t
 			serverDone <- helloAdmissionServerResult{err: err}
 			return
 		}
-		server := New(SideServer, hello.FlowID, Limits{ZombieMaxMigrations: 10}.Clamp())
+		serverEpoch := NewClientFlowID()
+		for serverEpoch == hello.FlowID || serverEpoch == ([16]byte{}) {
+			serverEpoch = NewClientFlowID()
+		}
+		server := New(SideServer, serverEpoch, Limits{ZombieMaxMigrations: 10}.Clamp())
 		server.SetLocalInstanceID(serverInstance)
 		server.SetPeerInstanceID(hello.InstanceID)
 		server.SetPeerKind(PeerRendr)
 		server.SetPeerCaps(hello.Caps)
-		if err := server.AcceptPeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err == nil {
+		peerNegotiation := hello.Negotiation
+		peerNegotiation.SessionEpoch = proto.SessionEpoch(serverEpoch)
+		if err := server.AcceptPeerNegotiation(peerNegotiation, hello.LocalTXManifest); err == nil {
 			err = server.MirrorPeerGraphForLocal()
 		}
 		var localTargetID proto.TargetID
@@ -724,6 +739,10 @@ func establishHelloAdmissionPairWithGraph(t *testing.T, clientPath, serverPath t
 	if err != nil {
 		_ = client.Close()
 		t.Fatal(err)
+	}
+	if client.PeerInstanceID() != admission.Ack.InstanceID {
+		_ = client.Close()
+		t.Fatal("client admission returned before publishing peer identity")
 	}
 	client.SetPeerKind(PeerRendr)
 	client.SetPeerInstanceID(admission.Ack.InstanceID)

@@ -15,9 +15,10 @@ import (
 // capability state, and runtime identity. Configuration is copied and frozen
 // by NewRuntime; individual sessions supply only SessionConfig.
 type Runtime struct {
-	config     RuntimeConfig
-	instanceID InstanceID
-	bridges    *engine.BridgeTable
+	config         RuntimeConfig
+	instanceID     InstanceID
+	bridges        *engine.BridgeTable
+	mobilityLedger *engine.LeafMobilityPeerLedger
 
 	mu              sync.RWMutex
 	streamFactories map[string]StreamFactory
@@ -105,6 +106,7 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 		config:          normalized,
 		instanceID:      engine.NewInstanceID(),
 		bridges:         engine.NewBridgeTable(),
+		mobilityLedger:  engine.NewLeafMobilityPeerLedger(),
 		streamFactories: make(map[string]StreamFactory),
 		packetFactories: make(map[string]PacketFactory),
 		framedFactories: make(map[string]FramedFactory),
@@ -268,6 +270,7 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 		packetFactories:    packets,
 		framedFactories:    framed,
 		factoryCarriers:    carriers,
+		mobilityLedger:     r.mobilityLedger,
 	}, nil
 }
 

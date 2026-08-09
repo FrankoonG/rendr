@@ -246,13 +246,15 @@ func TestTxAdversarialByeAboveGapThenPathEOFCannotBeClean(t *testing.T) {
 	e := New(SideServer, [16]byte{0xa3}, Limits{MigrationBudget: 25 * time.Millisecond})
 	defer e.Close()
 	path := newTxAdversarialPath()
+	readGate := make(chan struct{})
 	path.reads <- txAdversarialReadStep{
 		frame: txAdversarialFrame(t, proto.FrameCtrl, proto.CtrlBye, 1, proto.ByePayload{Reason: proto.ByeNormal}.Encode()),
 	}
 	path.reads <- txAdversarialReadStep{err: io.EOF, signalDeath: true}
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "bye-gap"}); err != nil {
+	if _, err := e.AttachPath(&txAdversarialGatedReadPath{PathConn: path, gate: readGate}, transport.PathSpec{Transport: "adversarial", Address: "bye-gap"}); err != nil {
 		t.Fatalf("attach path: %v", err)
 	}
+	close(readGate)
 
 	err := txAdversarialRecvError(t, e, time.Second)
 	if errors.Is(err, io.EOF) {

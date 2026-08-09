@@ -20,6 +20,7 @@ type sendHistoryEntry struct {
 	application bool
 	control     bool
 	terminal    bool
+	priorProof  proto.AckProof
 	proof       proto.AckProof
 }
 
@@ -48,6 +49,7 @@ func (e *Engine) reserveSendFrameClass(frame []byte, terminal bool) error {
 		application: hdr.Type == proto.FrameData && len(frame) > proto.HeaderSize,
 		control:     hdr.Type == proto.FrameCtrl,
 		terminal:    terminal,
+		priorProof:  e.sendProof,
 	}
 	entry.proof = proto.AdvanceAckProof(e.sendProof, proto.DigestFrame(frame))
 
@@ -63,6 +65,25 @@ func (e *Engine) reserveSendFrameClass(frame []byte, terminal bool) error {
 	e.sendHist.entries = append(e.sendHist.entries, entry)
 	e.sendProof = entry.proof
 	return nil
+}
+
+// rollbackReservedSendFrame removes the unpublished tail entry. It is valid
+// only while sendMu is held and before publishSendSeq makes the SEQ observable.
+func (e *Engine) rollbackReservedSendFrame(seq uint64) bool {
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	if len(e.sendHist.entries) == 0 {
+		return false
+	}
+	last := len(e.sendHist.entries) - 1
+	entry := e.sendHist.entries[last]
+	if entry.seq != seq || e.sendPublishedNext.Load() > seq {
+		return false
+	}
+	e.sendProof = entry.priorProof
+	e.sendHist.entries[last] = sendHistoryEntry{}
+	e.sendHist.entries = e.sendHist.entries[:last]
+	return true
 }
 
 func (e *Engine) acquireSendSlot(control bool) error {

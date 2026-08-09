@@ -264,9 +264,16 @@ func servePeerWithoutL3Identity(ln net.Listener, stop <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
+	finalEpoch := hello.FlowID
+	finalEpoch[0] ^= 0x80
+	if finalEpoch == ([16]byte{}) {
+		finalEpoch[1] = 1
+	}
+	ackNegotiation := hello.Negotiation
+	ackNegotiation.SessionEpoch = proto.SessionEpoch(finalEpoch)
 	ackPayload, err := (proto.HelloAckPayload{
-		Negotiation:          hello.Negotiation,
-		FlowID:               hello.FlowID,
+		Negotiation:          ackNegotiation,
+		FlowID:               finalEpoch,
 		InstanceID:           proto.InstanceID{1},
 		Caps:                 0,
 		InitialTargetID:      hello.InitialTargetID,
@@ -294,7 +301,7 @@ func servePeerWithoutL3Identity(ln net.Listener, stop <-chan struct{}) error {
 	binding := proto.PathAdmissionBinding{
 		Kind:                   proto.PathAdmissionKindHello,
 		Direction:              proto.SenderDirectionClientToServer,
-		SessionEpoch:           hello.SessionEpoch,
+		SessionEpoch:           proto.SessionEpoch(finalEpoch),
 		AdmissionID:            proto.PathAdmissionID(hello.FlowID),
 		InitiatorGraphRevision: hello.GraphRevision,
 		InitiatorGraphDigest:   hello.GraphDigest,

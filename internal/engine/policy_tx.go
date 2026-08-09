@@ -114,7 +114,7 @@ func (e *Engine) RequestPeerSelection(ctx context.Context, selectorID, targetID 
 	base := e.policyPeerGeneration
 	prepare := proto.PolicyPrepare{
 		PolicyTransactionBinding: proto.PolicyTransactionBinding{
-			SessionEpoch:  proto.SessionEpoch(e.flowID),
+			SessionEpoch:  proto.SessionEpoch(e.FlowID()),
 			Direction:     peerSenderDirection(e.side),
 			GraphBinding:  proto.GraphBinding{Revision: peer.revision, Digest: peer.digest},
 			TransactionID: txID,
@@ -691,7 +691,7 @@ func (e *Engine) validateIncomingPolicyBinding(binding proto.PolicyTransactionBi
 		return fmt.Errorf("local policy graph is not configured")
 	}
 	want := proto.PolicyTransactionBinding{
-		SessionEpoch: proto.SessionEpoch(e.flowID),
+		SessionEpoch: proto.SessionEpoch(e.FlowID()),
 		Direction:    senderDirection(e.side),
 		GraphBinding: proto.GraphBinding{Revision: local.revision, Digest: local.digest},
 	}
@@ -706,7 +706,7 @@ func (e *Engine) validateOutgoingPolicyBinding(binding proto.PolicyTransactionBi
 	if !peer.configured {
 		return fmt.Errorf("peer policy graph is not configured")
 	}
-	if binding.SessionEpoch != proto.SessionEpoch(e.flowID) || binding.Direction != peerSenderDirection(e.side) ||
+	if binding.SessionEpoch != proto.SessionEpoch(e.FlowID()) || binding.Direction != peerSenderDirection(e.side) ||
 		binding.GraphBinding != (proto.GraphBinding{Revision: peer.revision, Digest: peer.digest}) {
 		return fmt.Errorf("policy ACK binding does not match peer sender graph")
 	}

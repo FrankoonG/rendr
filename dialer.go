@@ -90,6 +90,7 @@ type sessionDialer struct {
 	packetFactories map[string]packetPathFactory
 	framedFactories map[string]transport.PathFactory
 	factoryCarriers map[string]CarrierFamily
+	mobilityLedger  *engine.LeafMobilityPeerLedger
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -114,23 +115,17 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
-	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
-	e := engine.New(engine.SideClient, flowID, d.engineLimits())
-	if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
-		_ = e.Close()
-		return nil, err
-	}
-	e.SetLocalInstanceID(instanceID)
-
-	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, false)
+	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, false)
 	if err != nil {
-		_ = e.Close()
 		return nil, err
 	}
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
-	e.SetPeerInstanceID(ack.InstanceID)
+	if err := e.SetPeerInstanceID(ack.InstanceID); err != nil {
+		_ = e.Close()
+		return nil, err
+	}
 	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
@@ -195,24 +190,17 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
-	flowID := engine.NewClientFlowID()
 	instanceID := d.instanceID()
-	e := engine.New(engine.SideClient, flowID, d.engineLimits())
-	if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
-		_ = e.Close()
-		return nil, err
-	}
-	e.SetLocalInstanceID(instanceID)
-	e.SetPacketMode()
-
-	first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, e, instanceID, paths, plan, tracker, resolver, true)
+	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, true)
 	if err != nil {
-		_ = e.Close()
 		return nil, err
 	}
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
-	e.SetPeerInstanceID(ack.InstanceID)
+	if err := e.SetPeerInstanceID(ack.InstanceID); err != nil {
+		_ = e.Close()
+		return nil, err
+	}
 	tracker.set(firstIndex, PathAttached, nil)
 	pathIDs := []uint32{firstID}
 
@@ -321,14 +309,13 @@ func (d *sessionDialer) effectivePrimaryPolicy() primaryPolicy {
 
 func (d *sessionDialer) dialInitialPath(
 	ctx context.Context,
-	e *engine.Engine,
 	instanceID InstanceID,
 	paths []PathSpec,
 	plan compiledTarget,
 	tracker *pathStatusTracker,
 	resolver *pathFactoryResolver,
 	packetMode bool,
-) (PathSpec, int, proto.HelloAckPayload, uint32, error) {
+) (*engine.Engine, PathSpec, int, proto.HelloAckPayload, uint32, error) {
 	var lastErr error
 	primaryPolicy := d.effectivePrimaryPolicy()
 	for i, ps := range paths {
@@ -338,20 +325,41 @@ func (d *sessionDialer) dialInitialPath(
 			tracker.set(i, PathUnavailable, err)
 			lastErr = err
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
-				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
+				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q unavailable: %w", plan.primaryName, err)
 			}
 			continue
+		}
+		e := engine.New(engine.SideClient, engine.NewClientFlowID(), d.engineLimits())
+		e.SetLeafMobilityPeerLedger(d.mobilityLedger)
+		if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
+			_ = pc.Close()
+			_ = e.Close()
+			return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
+		}
+		e.SetLocalInstanceID(instanceID)
+		if packetMode {
+			e.SetPacketMode()
 		}
 		tracker.setMobility(i, planPathConnMobility(resolver.carrierFamily(ps.Transport), pc))
 		tracker.set(i, PathHandshaking, nil)
 		admission, err := engine.PerformClientHelloAdmissionContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps)
 		if err != nil {
 			_ = pc.Close()
+			_ = e.Close()
 			state := pathStateForHandshakeError(err)
 			tracker.set(i, state, err)
 			lastErr = err
+			// COMMIT crossed the wire, so the listener may already have
+			// published this session even though its terminal ACTIVATED proof
+			// was lost. Starting a new proposal on another path would turn one
+			// Dial into two server application sessions. The caller must observe
+			// the typed uncertain outcome instead of an unsafe fallback.
+			if errors.Is(err, engine.ErrPathAdmissionOutcomeUnknown) {
+				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
+					fmt.Errorf("rendr: initial path %q admission outcome is unknown: %w", pathSpecName(ps), err)
+			}
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
-				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
+				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
 			}
 			continue
 		}
@@ -362,16 +370,16 @@ func (d *sessionDialer) dialInitialPath(
 			tracker.set(i, PathNative, err)
 			lastErr = err
 			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
-				return PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
+				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
 			}
 			continue
 		}
-		return ps, i, ack, admission.PathID, nil
+		return e, ps, i, ack, admission.PathID, nil
 	}
 	if lastErr != nil {
-		return PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: no usable path: %w", lastErr)
+		return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: no usable path: %w", lastErr)
 	}
-	return PathSpec{}, -1, proto.HelloAckPayload{}, 0, errNoCompiledPath
+	return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, errNoCompiledPath
 }
 
 func (d *sessionDialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {

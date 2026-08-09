@@ -63,6 +63,8 @@ func (o Operation) Has(requested Operation) bool {
 	return requested != 0 && o&requested == requested
 }
 
+type ResourceID [16]byte
+
 // Facts is an immutable-by-convention ownership snapshot.
 type Facts struct {
 	Kind       Kind
@@ -71,6 +73,7 @@ type Facts struct {
 	Session    Session
 	Operations Operation
 	Generation uint64
+	ResourceID ResourceID
 }
 
 // Binding ties a claim to one physical path generation.
@@ -113,14 +116,16 @@ type Provider interface {
 
 // Claim is a pointer-owned, single-bind ownership claim.
 type Claim struct {
-	noCopy noCopy
-	facts  Facts
-	driver Driver
+	noCopy   noCopy
+	facts    Facts
+	driver   Driver
+	resource *resourceState
 
-	mu      sync.RWMutex
-	binding Binding
-	bound   bool
-	retired bool
+	mu                sync.RWMutex
+	binding           Binding
+	bound             bool
+	retired           bool
+	activeTransaction *resourceTransactionToken
 }
 
 // NewClaim validates facts and returns a new unbound claim.
@@ -137,10 +142,18 @@ func NewClaim(facts Facts) (*Claim, error) {
 // NewDrivenClaim creates a claim whose specialized operation is backed by a
 // concrete in-module driver. The operation comes from the driver rather than
 // caller-supplied facts, so a descriptor cannot manufacture capability.
-func NewDrivenClaim(facts Facts, driver Driver) (*Claim, error) {
+func NewDrivenClaim(facts Facts, driver Driver, resource Resource) (*Claim, error) {
 	if facts.Operations != 0 {
 		return nil, fmt.Errorf("%w: facts must not predeclare operations %#x", ErrInvalidDriver, facts.Operations)
 	}
+	if facts.Scope != ScopeUnknown || facts.ResourceID != (ResourceID{}) {
+		return nil, fmt.Errorf("%w: driven claim must derive resource facts from its owner", ErrInvalidDriver)
+	}
+	if resource.state == nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidDriver, ErrInvalidResource)
+	}
+	facts.Scope = resource.state.scope
+	facts.ResourceID = resource.state.id
 	if err := validateFacts(facts); err != nil {
 		return nil, err
 	}
@@ -155,7 +168,7 @@ func NewDrivenClaim(facts Facts, driver Driver) (*Claim, error) {
 		return nil, fmt.Errorf("%w: kind %d requires operation %#x, got %#x", ErrInvalidDriver, facts.Kind, want, operation)
 	}
 	facts.Operations = operation
-	return &Claim{facts: facts, driver: driver}, nil
+	return &Claim{facts: facts, driver: driver, resource: resource.state}, nil
 }
 
 // MustNewClaim is NewClaim for adapter facts that cannot be invalid at runtime.
@@ -169,8 +182,8 @@ func MustNewClaim(facts Facts) *Claim {
 
 // MustNewDrivenClaim is NewDrivenClaim for adapter wiring that is fixed at
 // construction time.
-func MustNewDrivenClaim(facts Facts, driver Driver) *Claim {
-	claim, err := NewDrivenClaim(facts, driver)
+func MustNewDrivenClaim(facts Facts, driver Driver, resource Resource) *Claim {
+	claim, err := NewDrivenClaim(facts, driver, resource)
 	if err != nil {
 		panic(err)
 	}
@@ -196,6 +209,9 @@ func (c *Claim) State() ClaimState {
 		Bound:     c.bound,
 		Retired:   c.retired,
 		HasDriver: c.driver != nil,
+	}
+	if c.resource != nil {
+		state.BaseGeneration = c.resource.currentGeneration()
 	}
 	c.mu.RUnlock()
 	return state
@@ -228,14 +244,17 @@ func (c *Claim) Retire(binding Binding) error {
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.bound {
+		c.mu.Unlock()
 		return ErrNotBound
 	}
 	if c.binding != binding {
+		c.mu.Unlock()
 		return ErrBindingMismatch
 	}
 	c.retired = true
+	c.revokeResourceTransactionLocked()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -247,11 +266,13 @@ func (c *Claim) RetireUnbound() bool {
 		return false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.bound {
+		c.mu.Unlock()
 		return false
 	}
 	c.retired = true
+	c.revokeResourceTransactionLocked()
+	c.mu.Unlock()
 	return true
 }
 
@@ -271,6 +292,18 @@ func (c *Claim) Binding() (Binding, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.binding, c.bound
+}
+
+// ExecutionGeneration is the last terminal peer-agreement generation of the
+// claimed resource. Claims that share a link observe one generation.
+func (c *Claim) ExecutionGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	resource := c.resource
+	c.mu.RUnlock()
+	return resource.currentGeneration()
 }
 
 func validateFacts(facts Facts) error {

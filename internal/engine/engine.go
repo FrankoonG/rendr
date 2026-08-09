@@ -49,8 +49,12 @@ const (
 type Engine struct {
 	side                    Side
 	flowID                  [16]byte
+	flowIDValue             atomic.Pointer[[16]byte]
+	sessionEpochMu          sync.Mutex
+	sessionEpochAdopted     bool
 	limits                  Limits
 	peerCaps                atomic.Uint32
+	identityMu              sync.RWMutex
 	localInstance           proto.InstanceID
 	peerInstance            proto.InstanceID
 	peerKind                atomic.Uint32
@@ -229,6 +233,7 @@ type Engine struct {
 	policyQueued         map[policyMessageKey]struct{}
 	policyAdmissionMu    sync.RWMutex
 	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
+	leafTx               *leafMobilityRuntime
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -301,6 +306,7 @@ type pathSlot struct {
 	spec            transport.PathSpec
 	localTXTargetID proto.TargetID
 	peerTXTargetID  proto.TargetID
+	routeGeneration atomic.Uint64
 	mobilityClaim   *leafmobility.Claim
 	mobilityFacts   leafmobility.Facts
 	attached        time.Time
@@ -525,9 +531,9 @@ func (s *pathSlot) completeAdmission() {
 	}
 }
 
-// New constructs an engine. flowID is the connection identifier; on
-// the client side it should be a fresh 16 random bytes, on the
-// server side it should be copied from the inbound HELLO.
+// New constructs an engine. A client starts with a fresh HELLO proposal ID and
+// adopts the server-assigned final session epoch before attaching its first
+// path. A server is constructed directly with that final epoch.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
 		side:                    side,
@@ -561,6 +567,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		policySelections:        make(map[proto.TargetID]proto.TargetID),
 		policyCompleted:         make(map[[16]byte]completedPolicyTransaction),
 		policyQueued:            make(map[policyMessageKey]struct{}),
+		leafTx:                  newLeafMobilityRuntime(),
 		zombieLeft:              limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding:        make(map[uint64]time.Time),
 		closed:                  make(chan struct{}),
@@ -569,6 +576,8 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		terminalDone:            make(chan struct{}),
 	}
 	e.recvCond = sync.NewCond(&e.recvMu)
+	flowSnapshot := flowID
+	e.flowIDValue.Store(&flowSnapshot)
 	e.state.Store(uint32(BridgeInit))
 	e.localGraph = graphBinding{revision: 1}
 	e.peerGraph = graphBinding{revision: 1}
@@ -580,6 +589,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e.startCoreLoop(e.ackLoop)
 	e.startCoreLoop(e.ackWriterLoop)
 	e.startCoreLoop(e.policyLoop)
+	e.startCoreLoop(e.leafMobilityLoop)
 	return e
 }
 
@@ -618,16 +628,76 @@ func NewInstanceID() proto.InstanceID {
 	return id
 }
 
-// FlowID returns the engine's flow identifier.
-func (e *Engine) FlowID() [16]byte { return e.flowID }
+// FlowID returns the engine's current session identifier. Client engines expose
+// their provisional proposal only before HELLO_ACK; they are not returned to an
+// embedder until the final server-assigned value has been installed.
+func (e *Engine) FlowID() [16]byte {
+	if e == nil {
+		return [16]byte{}
+	}
+	if snapshot := e.flowIDValue.Load(); snapshot != nil {
+		return *snapshot
+	}
+	return e.flowID
+}
 
-func (e *Engine) SetLocalInstanceID(id proto.InstanceID) { e.localInstance = id }
+func (e *Engine) SetLocalInstanceID(id proto.InstanceID) {
+	e.identityMu.Lock()
+	if e.localInstance == (proto.InstanceID{}) || e.localInstance == id {
+		e.localInstance = id
+	}
+	e.identityMu.Unlock()
+}
 
-func (e *Engine) LocalInstanceID() proto.InstanceID { return e.localInstance }
+func (e *Engine) LocalInstanceID() proto.InstanceID {
+	e.identityMu.RLock()
+	id := e.localInstance
+	e.identityMu.RUnlock()
+	return id
+}
 
-func (e *Engine) SetPeerInstanceID(id proto.InstanceID) { e.peerInstance = id }
+func (e *Engine) SetPeerInstanceID(id proto.InstanceID) error {
+	return e.installPeerInstanceID(id)
+}
 
-func (e *Engine) PeerInstanceID() proto.InstanceID { return e.peerInstance }
+func (e *Engine) installPeerInstanceID(id proto.InstanceID) error {
+	if e == nil {
+		return net.ErrClosed
+	}
+	if id == (proto.InstanceID{}) {
+		return fmt.Errorf("engine: zero peer instance id")
+	}
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
+	e.leafTx.mu.Lock()
+	defer e.leafTx.mu.Unlock()
+	if e.closing.Load() {
+		return net.ErrClosed
+	}
+	e.identityMu.Lock()
+	if e.peerInstance != (proto.InstanceID{}) && e.peerInstance != id {
+		e.identityMu.Unlock()
+		return fmt.Errorf("engine: peer instance id changed")
+	}
+	e.peerInstance = id
+	e.identityMu.Unlock()
+	if e.leafTx.sessionLedger == nil {
+		ledger := e.leafTx.peerLedger
+		epoch := proto.SessionEpoch(e.FlowID())
+		ledger.retainSession(id, epoch)
+		e.leafTx.sessionLedger = ledger
+		e.leafTx.sessionPeer = id
+		e.leafTx.sessionEpoch = epoch
+	}
+	return nil
+}
+
+func (e *Engine) PeerInstanceID() proto.InstanceID {
+	e.identityMu.RLock()
+	id := e.peerInstance
+	e.identityMu.RUnlock()
+	return id
+}
 
 func (e *Engine) SetPeerKind(kind PeerKind) { e.peerKind.Store(uint32(kind)) }
 
@@ -682,6 +752,8 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 // DATA dispatch. The server uses this phase while BRIDGE_ACK still owns the
 // carrier exclusively.
 func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
 	if pc == nil {
 		return 0, errors.New("engine: nil PathConn")
 	}
@@ -746,12 +818,16 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	for _, existing := range e.retainedPaths {
 		all = append(all, existing)
 	}
+	admissionClaims := []*leafmobility.Claim{mobilityClaim}
 	for _, existing := range all {
+		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
+		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
+		if sameLocal && samePeer && existing.mobilityClaim != nil {
+			admissionClaims = append(admissionClaims, existing.mobilityClaim)
+		}
 		if _, replaceable := superseded[existing.id]; replaceable {
 			continue
 		}
-		sameLocal := binding.LocalTXTargetID != (proto.TargetID{}) && existing.localTXTargetID == binding.LocalTXTargetID
-		samePeer := binding.PeerTXTargetID != (proto.TargetID{}) && existing.peerTXTargetID == binding.PeerTXTargetID
 		if sameLocal && samePeer {
 			if existing.maintenance.Load() {
 				return rejectLocked(ErrPathAttachInProgress)
@@ -767,6 +843,16 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			return rejectLocked(fmt.Errorf("engine: peer TX target is already paired with another local target"))
 		}
 	}
+	resourceAdmission, err := leafmobility.ReserveAdmissions(admissionClaims...)
+	if err != nil {
+		if errors.Is(err, leafmobility.ErrAuthorityActive) {
+			return rejectLocked(ErrLeafMobilityAuthorityBusy)
+		}
+		if errors.Is(err, leafmobility.ErrResourceAdmissionActive) {
+			return rejectLocked(ErrPathAttachInProgress)
+		}
+		return rejectLocked(fmt.Errorf("engine: reserve admission resources: %w", err))
+	}
 
 	e.nextPathID++
 	id := e.nextPathID
@@ -775,7 +861,7 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		e.nextPathID++
 		id = e.nextPathID
 	}
-	if err := e.reservePathAdmissionLocked(id, binding); err != nil {
+	if err := e.reservePathAdmissionLocked(id, binding, resourceAdmission); err != nil {
 		return rejectLocked(err)
 	}
 	recvQSize := 64
@@ -785,7 +871,7 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	generation := e.nextPathGenerationLocked()
 	if mobilityClaim != nil {
 		if err := mobilityClaim.Bind(leafmobility.Binding{
-			FlowID:        e.flowID,
+			FlowID:        e.FlowID(),
 			LocalTargetID: [16]byte(binding.LocalTXTargetID),
 			PeerTargetID:  [16]byte(binding.PeerTXTargetID),
 			PathID:        id,
@@ -852,8 +938,9 @@ func (e *Engine) StagePathAttach(id uint32) error {
 	}
 	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.pendingPaths, id)
-		e.pathsMu.Unlock()
 		slot.retireMobilityClaim()
+		e.releasePathAdmissionLocked(id)
+		e.pathsMu.Unlock()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -890,12 +977,12 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		ctx = context.Background()
 	}
 	var (
-		retired           []*pathSlot
-		fenced            []*pathSlot
-		oldActive         uint32
-		recoveryEvent     bool
-		superseded        bool
-		admissionDeadline time.Time
+		retired         []*pathSlot
+		fenced          []*pathSlot
+		oldActive       uint32
+		recoveryEvent   bool
+		superseded      bool
+		admissionExpiry pathAdmissionExpiry
 	)
 	e.pathsMu.Lock()
 	slot := e.stagedPaths[id]
@@ -905,9 +992,10 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	if e.isClosed() || e.sendClosing.Load() {
 		delete(e.stagedPaths, id)
-		e.pathsMu.Unlock()
 		slot.closeQuit()
 		slot.retireMobilityClaim()
+		e.releasePathAdmissionLocked(id)
+		e.pathsMu.Unlock()
 		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
@@ -938,11 +1026,18 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	slot = e.stagedPaths[id]
 	if slot == nil || e.isClosed() || e.sendClosing.Load() {
 		deaths := e.unwindFencedPathsLocked(fenced)
+		if slot != nil {
+			delete(e.stagedPaths, id)
+			slot.closeQuit()
+			slot.retireMobilityClaim()
+			e.releasePathAdmissionLocked(id)
+		}
 		e.pathsMu.Unlock()
 		e.processDeferredPathDeaths(deaths)
 		if slot == nil {
 			return fmt.Errorf("engine: staged path %d changed during activation", id)
 		}
+		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
 	for _, existing := range fenced {
@@ -962,11 +1057,32 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 			break
 		}
 	}
-	if _, err := e.advancePathAdmissionLocked(id); err != nil {
+	routeGeneration, err := e.advancePathAdmissionLocked(id)
+	if err != nil {
 		deaths := e.unwindFencedPathsLocked(fenced)
 		e.pathsMu.Unlock()
 		e.processDeferredPathDeaths(deaths)
 		return err
+	}
+	currentRouteGeneration := slot.routeGeneration.Load()
+	if routeGeneration != 0 && currentRouteGeneration != 0 && currentRouteGeneration != routeGeneration {
+		deaths := e.unwindFencedPathsLocked(fenced)
+		e.pathsMu.Unlock()
+		e.processDeferredPathDeaths(deaths)
+		return fmt.Errorf("engine: path %d route generation is unavailable", id)
+	}
+	if routeGeneration != 0 {
+		slot.routeGeneration.Store(routeGeneration)
+	}
+	if retainPredecessor {
+		var ok bool
+		admissionExpiry, ok = e.pathAdmissionExpiryLocked(id)
+		if !ok {
+			deaths := e.unwindFencedPathsLocked(fenced)
+			e.pathsMu.Unlock()
+			e.processDeferredPathDeaths(deaths)
+			return fmt.Errorf("engine: path %d admission reservation changed during activation", id)
+		}
 	}
 	// Keep at most one older receive generation per logical leaf.
 	for retainedID, existing := range e.retainedPaths {
@@ -1016,8 +1132,6 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
 		slot.completeAdmission()
-	} else {
-		admissionDeadline = e.ensurePathAdmissionDeadlineLocked(id)
 	}
 	e.pathsMu.Unlock()
 
@@ -1034,21 +1148,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		e.requestReplay(e.sendAckNext.Load())
 	}
 	if retainPredecessor {
-		gen := slot.gen
-		go func() {
-			delay := time.Until(admissionDeadline)
-			if delay < 0 {
-				delay = 0
-			}
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				e.completePathAdmissionGeneration(id, gen)
-			case <-slot.admissionDone:
-			case <-e.closed:
-			}
-		}()
+		go e.expirePathAdmission(admissionExpiry)
 	}
 	return nil
 }
@@ -1982,25 +2082,37 @@ func (e *Engine) Close() error {
 				firstErr = err
 			}
 		}
+		e.sessionEpochMu.Lock()
 		e.closing.Store(true)
+		e.sessionEpochMu.Unlock()
+		e.leafTx.writerMu.Lock()
+		e.leafTx.writerClosing = true
+		e.leafTx.writerMu.Unlock()
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
 		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths))
 		for _, s := range e.paths {
 			s.closeQuit()
+			s.retireMobilityClaim()
 			slots = append(slots, s)
 		}
 		for _, s := range e.pendingPaths {
 			s.closeQuit()
+			s.retireMobilityClaim()
 			slots = append(slots, s)
 		}
 		for _, s := range e.stagedPaths {
 			s.closeQuit()
+			s.retireMobilityClaim()
 			slots = append(slots, s)
 		}
 		for _, s := range e.retainedPaths {
 			s.closeQuit()
+			s.retireMobilityClaim()
 			slots = append(slots, s)
+		}
+		for _, reservation := range e.pathAdmissionByLeaf {
+			reservation.release()
 		}
 		e.paths = make(map[uint32]*pathSlot)
 		e.pendingPaths = make(map[uint32]*pathSlot)
@@ -2045,6 +2157,9 @@ func (e *Engine) Close() error {
 				slot.ackWG.Wait()
 			}
 			e.coreWG.Wait()
+			e.leafTx.writerWG.Wait()
+			e.leafTx.asyncWG.Wait()
+			e.releaseLeafMobilityPeerLedgerSession()
 			e.selectorMu.Lock()
 			selector := e.selector
 			e.selectorMu.Unlock()
@@ -2276,7 +2391,7 @@ func (e *Engine) setCloseErr(err error) {
 	if e.closeErr == nil {
 		e.closeErr = err
 		if debugPathDeath {
-			fmt.Printf("[rendr-engine] closeErr side=%v flow=%x err=%v\n", e.side, e.flowID, err)
+			fmt.Printf("[rendr-engine] closeErr side=%v flow=%x err=%v\n", e.side, e.FlowID(), err)
 		}
 	}
 	e.closeMu.Unlock()

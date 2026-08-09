@@ -102,15 +102,17 @@ func TestBridgeTableReservationPublicationAndCapacityCleanup(t *testing.T) {
 
 func TestBridgeTableStaleOperationsCannotCrossGeneration(t *testing.T) {
 	table := NewBridgeTableWithCapacity(1)
-	id := [16]byte{0x31}
-	stale, err := table.Reserve(id)
+	proposal := [16]byte{0x31}
+	firstSession := [16]byte{0x32}
+	secondSession := [16]byte{0x33}
+	stale, err := table.Reserve(proposal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !table.Abort(stale) {
 		t.Fatal("initial abort failed")
 	}
-	current, err := table.Reserve(id)
+	current, err := table.Reserve(proposal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +124,7 @@ func TestBridgeTableStaleOperationsCannotCrossGeneration(t *testing.T) {
 	if table.Abort(stale) {
 		t.Fatal("stale Abort removed current reservation")
 	}
-	if err := table.Activate(current, currentEngine); err != nil {
+	if err := table.ActivateSession(current, firstSession, currentEngine); err != nil {
 		t.Fatal(err)
 	}
 	if table.RemoveActive(current, staleEngine) {
@@ -131,26 +133,134 @@ func TestBridgeTableStaleOperationsCannotCrossGeneration(t *testing.T) {
 	if table.RemoveActive(stale, staleEngine) {
 		t.Fatal("stale-generation removal succeeded")
 	}
-	if got, ok := table.Lookup(id); !ok || got != currentEngine {
+	if got, ok := table.Lookup(proposal); !ok || got != currentEngine {
 		t.Fatalf("current engine was disturbed: (%p, %v)", got, ok)
+	}
+	if got, ok := table.Lookup(firstSession); !ok || got != currentEngine {
+		t.Fatalf("final session lookup = (%p, %v), want (%p, true)", got, ok, currentEngine)
 	}
 	if !table.RemoveActive(current, currentEngine) {
 		t.Fatal("current generation removal failed")
 	}
+	if _, ok := table.Lookup(firstSession); ok {
+		t.Fatal("removed final session remains published")
+	}
+	next, err := table.Reserve(proposal)
+	if err != nil {
+		t.Fatalf("proposal reuse: %v", err)
+	}
+	nextEngine := new(Engine)
+	if err := table.ActivateSession(next, secondSession, nextEngine); err != nil {
+		t.Fatalf("activate replacement session: %v", err)
+	}
+	if table.RemoveActive(current, currentEngine) {
+		t.Fatal("repeated old cleanup removed replacement session")
+	}
+	if got, ok := table.Lookup(secondSession); !ok || got != nextEngine {
+		t.Fatalf("replacement final lookup = (%p, %v), want (%p, true)", got, ok, nextEngine)
+	}
+}
 
-	next, err := table.Reserve(id)
+func TestBridgeTableServerAssignedSessionEpochPreventsResurrection(t *testing.T) {
+	table := NewBridgeTableWithCapacity(1)
+	proposal := [16]byte{0x41}
+	firstSession := [16]byte{0x42}
+	secondSession := [16]byte{0x43}
+	first, err := table.Reserve(proposal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextEngine := new(Engine)
-	if err := table.Activate(next, nextEngine); err != nil {
+	firstEngine := new(Engine)
+	if err := table.ActivateSession(first, firstSession, firstEngine); err != nil {
 		t.Fatal(err)
 	}
-	if table.RemoveActive(current, currentEngine) {
-		t.Fatal("old cleanup removed an ABA replacement")
+	for _, id := range [][16]byte{proposal, firstSession} {
+		if got, ok := table.Lookup(id); !ok || got != firstEngine {
+			t.Fatalf("first lookup %x = (%p, %v), want (%p, true)", id, got, ok, firstEngine)
+		}
 	}
-	if got, ok := table.Lookup(id); !ok || got != nextEngine {
-		t.Fatalf("ABA replacement was disturbed: (%p, %v)", got, ok)
+	if !table.RemoveActive(first, firstEngine) {
+		t.Fatal("first removal failed")
+	}
+	second, err := table.Reserve(proposal)
+	if err != nil {
+		t.Fatalf("proposal reuse: %v", err)
+	}
+	secondEngine := new(Engine)
+	if err := table.ActivateSession(second, secondSession, secondEngine); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := table.Lookup(firstSession); ok {
+		t.Fatal("old final epoch resolved after proposal reuse")
+	}
+	if got, ok := table.Lookup(secondSession); !ok || got != secondEngine {
+		t.Fatalf("second final lookup = (%p, %v), want (%p, true)", got, ok, secondEngine)
+	}
+	if table.RemoveActive(first, firstEngine) {
+		t.Fatal("stale reservation removed replacement session")
+	}
+}
+
+func TestBridgeTableAssignSessionReservesFinalEpochBeforeActivation(t *testing.T) {
+	table := NewBridgeTableWithCapacity(2)
+	first, err := table.Reserve([16]byte{0x51})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := table.Reserve([16]byte{0x52})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := [16]byte{0x53}
+	if err := table.AssignSession(first, final); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.AssignSession(first, final); err != nil {
+		t.Fatalf("idempotent assignment: %v", err)
+	}
+	if err := table.AssignSession(second, final); !errors.Is(err, ErrBridgeSessionConflict) {
+		t.Fatalf("colliding assignment error=%v want=%v", err, ErrBridgeSessionConflict)
+	}
+	if !table.Abort(first) {
+		t.Fatal("abort assigned reservation failed")
+	}
+	if err := table.AssignSession(second, final); err != nil {
+		t.Fatalf("released final epoch remained reserved: %v", err)
+	}
+}
+
+func TestBridgeTableWaitActiveFollowsReservedFinalEpoch(t *testing.T) {
+	table := NewBridgeTableWithCapacity(1)
+	proposal := [16]byte{0x61}
+	final := [16]byte{0x62}
+	reservation, err := table.Reserve(proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.AssignSession(reservation, final); err != nil {
+		t.Fatal(err)
+	}
+	type waitResult struct {
+		engine *Engine
+		state  BridgeEntryState
+		err    error
+	}
+	result := make(chan waitResult, 1)
+	baseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ctx := &observedDoneContext{Context: baseCtx, observed: make(chan struct{})}
+	go func() {
+		engine, state, err := table.WaitActive(ctx, final)
+		result <- waitResult{engine: engine, state: state, err: err}
+	}()
+	<-ctx.observed
+	active := new(Engine)
+	if err := table.ActivateSession(reservation, final, active); err != nil {
+		t.Fatal(err)
+	}
+	got := <-result
+	if got.err != nil || got.state != BridgeEntryActive || got.engine != active {
+		t.Fatalf("final wait=(%p,%v,%v), want (%p,%v,nil)", got.engine, got.state, got.err, active, BridgeEntryActive)
 	}
 }
 
@@ -289,6 +399,9 @@ func TestBridgeTableTransitionalWrappersCannotRemoveTransaction(t *testing.T) {
 	table.Remove(legacyID)
 	if e, ok := table.Get(legacyID); ok || e != nil {
 		t.Fatalf("legacy Remove left entry: (%p, %v)", e, ok)
+	}
+	if !table.Put(legacyID, legacyEngine) {
+		t.Fatal("legacy wrapper could not reuse an inactive ID")
 	}
 }
 

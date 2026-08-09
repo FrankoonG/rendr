@@ -76,6 +76,9 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlBridgeAck)); got != CtrlBridgeAck {
 		t.Fatalf("bridge_ack round-trip: got %v want %v", got, CtrlBridgeAck)
 	}
+	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlLeafMobilityCommit)); got != CtrlLeafMobilityCommit {
+		t.Fatalf("leaf_mobility_commit round-trip: got %v want %v", got, CtrlLeafMobilityCommit)
+	}
 }
 
 func TestHelloRoundTrip(t *testing.T) {
@@ -93,11 +96,23 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestLeafMobilityEnvelope(t *testing.T) {
-	if ProtocolMinor != 7 {
-		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
+	if ProtocolMinor != 10 {
+		t.Fatalf("protocol minor=%d want=10", ProtocolMinor)
 	}
 	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
+	}
+	if FeatureLeafMobilityTransaction != 1<<11 || SupportedFeatures&FeatureLeafMobilityTransaction == 0 || RequiredFeatures&FeatureLeafMobilityTransaction == 0 {
+		t.Fatal("leaf mobility transaction feature is not stable and mandatory")
+	}
+	if FeatureLeafMobilityOOBTransaction != 1<<12 || SupportedFeatures&FeatureLeafMobilityOOBTransaction == 0 || RequiredFeatures&FeatureLeafMobilityOOBTransaction == 0 {
+		t.Fatal("leaf mobility OOB transaction feature is not stable and mandatory")
+	}
+	if FeatureServerAssignedSessionEpoch != 1<<13 || SupportedFeatures&FeatureServerAssignedSessionEpoch == 0 || RequiredFeatures&FeatureServerAssignedSessionEpoch == 0 {
+		t.Fatal("server-assigned session epoch feature is not stable and mandatory")
+	}
+	if NegotiationSize != 80 {
+		t.Fatalf("negotiation size=%d want=80", NegotiationSize)
 	}
 	if LeafMobilityTCPRepair != 1<<0 || LeafMobilityQUICCIDRebind != 1<<1 || LeafMobilityUDPFlowRebind != 1<<2 || LeafMobilityGVisorLinkRebind != 1<<3 {
 		t.Fatal("leaf mobility bit assignment drifted")
@@ -128,6 +143,67 @@ func TestLeafMobilityEnvelope(t *testing.T) {
 	}
 }
 
+func TestLeafMobilityTransactionIsMandatoryOnCurrentMinor(t *testing.T) {
+	flow := [16]byte{0x75}
+	manifest := testGraphManifest("mobility-transaction-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	withoutTransaction := func(n *Negotiation) {
+		n.Supported &^= FeatureLeafMobilityTransaction
+		n.Required &^= FeatureLeafMobilityTransaction
+	}
+
+	helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}), withoutTransaction)
+	if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("HELLO without leaf mobility transaction error=%v, want %v", err, ErrNegotiationIncompatible)
+	}
+
+	ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}), withoutTransaction)
+	if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("HELLO_ACK without leaf mobility transaction error=%v, want %v", err, ErrNegotiationIncompatible)
+	}
+}
+
+func TestServerAssignedSessionEpochIsMandatoryOnCurrentMinor(t *testing.T) {
+	flow := [16]byte{0x76}
+	manifest := testGraphManifest("server-session-epoch-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	base := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "feature missing", mutate: func(n *Negotiation) {
+			n.Supported &^= FeatureServerAssignedSessionEpoch
+			n.Required &^= FeatureServerAssignedSessionEpoch
+		}},
+		{name: "minor nine", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 9
+			n.Supported &^= FeatureServerAssignedSessionEpoch
+			n.Required &^= FeatureServerAssignedSessionEpoch
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), test.mutate)
+			if _, err := DecodeHello(wire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+}
+
 func TestLeafMobilityEnvelopeValidation(t *testing.T) {
 	flow := [16]byte{0x72}
 	manifest := testGraphManifest("mobility-validation")
@@ -151,7 +227,11 @@ func TestLeafMobilityEnvelopeValidation(t *testing.T) {
 	}{
 		{name: "unknown required", mutate: func(b []byte) { b[6] = 0x80; b[4] = 0x80 }},
 		{name: "required not supported", mutate: func(b []byte) { b[7] = byte(LeafMobilityTCPRepair) }},
-		{name: "old minor", mutate: func(b []byte) { b[3] = byte(ProtocolMinor - 1) }},
+		{name: "minor 7 without transaction", mutate: func(b []byte) {
+			b[3] = 7
+			b[14] &^= byte(FeatureLeafMobilityTransaction >> 8)
+			b[22] &^= byte(FeatureLeafMobilityTransaction >> 8)
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -200,8 +280,10 @@ func TestLeafMobilityEnvelopeHelloAckDecodeValidation(t *testing.T) {
 		{name: "required not supported", mutate: func(n *Negotiation) {
 			n.MobilityRequired = LeafMobilityTCPRepair
 		}},
-		{name: "old minor", mutate: func(n *Negotiation) {
-			n.ProtocolMinor--
+		{name: "minor 7 without transaction", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 7
+			n.Supported &^= FeatureLeafMobilityTransaction
+			n.Required &^= FeatureLeafMobilityTransaction
 		}},
 	}
 	for _, test := range tests {
@@ -226,7 +308,7 @@ func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
 		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
 	}
 	helloWire := mustHelloWire(t, hello)
-	wantPrefix, err := hex.DecodeString("000100070005000400000000000007ff00000000000007ff")
+	wantPrefix, err := hex.DecodeString("0001000a000500040000000000003fff0000000000003fff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,6 +694,9 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlPathAdmissionConfirm, 0x0E},
 		{CtrlBridgeTag, 0x10},
 		{CtrlBridgeAck, 0x11},
+		{CtrlLeafMobilityPrepare, 0x12},
+		{CtrlLeafMobilityAck, 0x13},
+		{CtrlLeafMobilityCommit, 0x14},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -830,7 +915,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("000100070000000000000000000007ff00000000000007ff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("0001000a000000000000000000003fff0000000000003fff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

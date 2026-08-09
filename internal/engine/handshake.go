@@ -227,7 +227,8 @@ func newBridgeTagPayload(e *Engine, targetID proto.TargetID) proto.BridgeTagPayl
 // ValidateBridgeBinding verifies an attach request against immutable session
 // identity before the caller allocates a path id or starts reader goroutines.
 func (e *Engine) ValidateBridgeBinding(tag proto.BridgeTagPayload) error {
-	if tag.BridgeID != e.flowID || tag.SessionEpoch != proto.SessionEpoch(e.flowID) {
+	flowID := e.FlowID()
+	if tag.BridgeID != flowID || tag.SessionEpoch != proto.SessionEpoch(flowID) {
 		return fmt.Errorf("engine: bridge session epoch mismatch")
 	}
 	binding := e.peerGraphBinding()

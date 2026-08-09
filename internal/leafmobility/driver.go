@@ -13,11 +13,12 @@ import (
 
 // ClaimState is a coherent ownership observation used by the planner.
 type ClaimState struct {
-	Facts     Facts
-	Binding   Binding
-	Bound     bool
-	Retired   bool
-	HasDriver bool
+	Facts          Facts
+	Binding        Binding
+	BaseGeneration uint64
+	Bound          bool
+	Retired        bool
+	HasDriver      bool
 }
 
 type TransactionID [16]byte
@@ -49,6 +50,7 @@ const (
 	ReasonDeadlineExpired
 	ReasonPreflightRejected
 	ReasonPreflightFailed
+	ReasonStaleGeneration
 )
 
 func (r Reason) String() string {
@@ -77,6 +79,8 @@ func (r Reason) String() string {
 		return "preflight_rejected"
 	case ReasonPreflightFailed:
 		return "preflight_failed"
+	case ReasonStaleGeneration:
+		return "stale_generation"
 	default:
 		return fmt.Sprintf("reason_%d", r)
 	}
@@ -180,6 +184,7 @@ type Plan struct {
 	TransactionID      TransactionID
 	Binding            Binding
 	EndpointGeneration uint64
+	BaseGeneration     uint64
 	Direction          proto.SenderDirection
 	Session            Session
 	Operation          Operation
@@ -192,6 +197,7 @@ type Plan struct {
 	Kind               Kind
 	Role               Role
 	Scope              Scope
+	ResourceID         ResourceID
 	EvidenceDigest     EvidenceDigest
 	LocalDigest        LocalPlanDigest
 }
@@ -236,9 +242,11 @@ func PlanCandidate(ctx context.Context, claim *Claim, request PlanRequest) (Plan
 	}
 	state, driver := claim.stateWithDriver()
 	base.EndpointGeneration = state.Facts.Generation
+	base.BaseGeneration = state.BaseGeneration
 	base.Kind = state.Facts.Kind
 	base.Role = state.Facts.Role
 	base.Scope = state.Facts.Scope
+	base.ResourceID = state.Facts.ResourceID
 	if state.Retired {
 		return finalizePlan(base, ReasonEndpointRetired, false), nil
 	}
@@ -287,6 +295,9 @@ func PlanCandidate(ctx context.Context, claim *Claim, request PlanRequest) (Plan
 	if !current.Bound || current.Binding != state.Binding || current.Facts != state.Facts {
 		return finalizePlan(base, ReasonBindingMismatch, false), nil
 	}
+	if current.BaseGeneration != state.BaseGeneration {
+		return finalizePlan(base, ReasonStaleGeneration, false), nil
+	}
 	if !result.Eligible {
 		return finalizePlan(base, result.Reason, result.Retryable), nil
 	}
@@ -311,8 +322,8 @@ func (c *Claim) ValidatePlanCurrent(plan Plan) error {
 	state, driver := c.stateWithDriver()
 	if state.Retired || !state.Bound || state.Binding != plan.Binding ||
 		state.Facts.Generation != plan.EndpointGeneration || state.Facts.Kind != plan.Kind ||
-		state.Facts.Role != plan.Role || state.Facts.Scope != plan.Scope || driver == nil ||
-		!state.Facts.Operations.Has(plan.Operation) {
+		state.Facts.Role != plan.Role || state.Facts.Scope != plan.Scope || state.Facts.ResourceID != plan.ResourceID || driver == nil ||
+		state.BaseGeneration != plan.BaseGeneration || !state.Facts.Operations.Has(plan.Operation) {
 		return ErrStalePlan
 	}
 	return nil
@@ -341,6 +352,7 @@ func (p Plan) Validate() error {
 	} else {
 		if !p.Operation.single() || p.Reason != ReasonNone || p.EndpointGeneration == 0 ||
 			operationForKind(p.Kind) != p.Operation || p.Role == RoleUnknown || p.Scope == ScopeUnknown ||
+			p.ResourceID == (ResourceID{}) ||
 			!p.LocalSupport.Has(p.Operation) || !p.PeerSupport.Has(p.Operation) ||
 			p.EvidenceDigest == (EvidenceDigest{}) {
 			return fmt.Errorf("%w: invalid specialized decision", ErrInvalidPlan)
@@ -403,7 +415,7 @@ func finalizePlan(plan Plan, reason Reason, retryable bool) Plan {
 	return plan
 }
 
-const planCanonicalSize = 144
+const planCanonicalSize = 168
 
 func digestPlan(plan Plan) LocalPlanDigest {
 	wire := make([]byte, planCanonicalSize)
@@ -429,8 +441,10 @@ func digestPlan(plan Plan) LocalPlanDigest {
 	binary.BigEndian.PutUint32(wire[84:88], plan.Binding.PathID)
 	binary.BigEndian.PutUint64(wire[88:96], plan.Binding.Owner)
 	binary.BigEndian.PutUint64(wire[96:104], plan.EndpointGeneration)
-	binary.BigEndian.PutUint64(wire[104:112], uint64(plan.Deadline.UnixNano()))
-	copy(wire[112:144], plan.EvidenceDigest[:])
+	binary.BigEndian.PutUint64(wire[104:112], plan.BaseGeneration)
+	binary.BigEndian.PutUint64(wire[112:120], uint64(plan.Deadline.UnixNano()))
+	copy(wire[120:136], plan.ResourceID[:])
+	copy(wire[136:168], plan.EvidenceDigest[:])
 	return sha256.Sum256(wire)
 }
 
@@ -447,6 +461,9 @@ func (c *Claim) stateWithDriver() (ClaimState, Driver) {
 		HasDriver: c.driver != nil,
 	}
 	driver := c.driver
+	if c.resource != nil {
+		state.BaseGeneration = c.resource.currentGeneration()
+	}
 	c.mu.RUnlock()
 	return state, driver
 }

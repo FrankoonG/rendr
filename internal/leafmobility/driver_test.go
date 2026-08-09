@@ -43,10 +43,10 @@ func TestNewDrivenClaimDerivesOperationFromDriver(t *testing.T) {
 		{KindGVisor, OperationGVisorLinkRebind},
 	}
 	for _, test := range tests {
-		facts := testFacts()
+		facts := testDrivenFacts()
 		facts.Kind = test.kind
 		driver := &fakeDriver{operation: test.operation}
-		claim, err := NewDrivenClaim(facts, driver)
+		claim, err := NewDrivenClaim(facts, driver, MustNewResource(ScopeEndpoint))
 		if err != nil {
 			t.Fatalf("kind=%d operation=%#x: %v", test.kind, test.operation, err)
 		}
@@ -97,27 +97,35 @@ func TestCapabilityRequiresConcreteDriver(t *testing.T) {
 }
 
 func TestNewDrivenClaimRejectsForgedOrMismatchedDriver(t *testing.T) {
-	facts := testFacts()
+	facts := testDrivenFacts()
+	resource := MustNewResource(ScopeEndpoint)
 	var typedNil *fakeDriver
 	tests := []struct {
-		name   string
-		facts  Facts
-		driver Driver
+		name     string
+		facts    Facts
+		driver   Driver
+		resource Resource
 	}{
-		{name: "nil", facts: facts},
-		{name: "typed nil", facts: facts, driver: typedNil},
-		{name: "zero operation", facts: facts, driver: &fakeDriver{}},
-		{name: "multiple operations", facts: facts, driver: &fakeDriver{operation: OperationTCPRepair | OperationQUICCIDRebind}},
-		{name: "wrong kind", facts: facts, driver: &fakeDriver{operation: OperationQUICCIDRebind}},
+		{name: "nil", facts: facts, resource: resource},
+		{name: "typed nil", facts: facts, driver: typedNil, resource: resource},
+		{name: "zero operation", facts: facts, driver: &fakeDriver{}, resource: resource},
+		{name: "multiple operations", facts: facts, driver: &fakeDriver{operation: OperationTCPRepair | OperationQUICCIDRebind}, resource: resource},
+		{name: "wrong kind", facts: facts, driver: &fakeDriver{operation: OperationQUICCIDRebind}, resource: resource},
 		{name: "predeclared facts", facts: func() Facts {
 			f := facts
 			f.Operations = OperationTCPRepair
 			return f
-		}(), driver: &fakeDriver{operation: OperationTCPRepair}},
+		}(), driver: &fakeDriver{operation: OperationTCPRepair}, resource: resource},
+		{name: "predeclared resource", facts: func() Facts {
+			f := facts
+			f.Scope = ScopeEndpoint
+			return f
+		}(), driver: &fakeDriver{operation: OperationTCPRepair}, resource: resource},
+		{name: "zero resource", facts: facts, driver: &fakeDriver{operation: OperationTCPRepair}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			claim, err := NewDrivenClaim(test.facts, test.driver)
+			claim, err := NewDrivenClaim(test.facts, test.driver, test.resource)
 			if !errors.Is(err, ErrInvalidDriver) {
 				t.Fatalf("error=%v want=%v", err, ErrInvalidDriver)
 			}
@@ -134,7 +142,8 @@ func TestPlanCandidateRequiresExactSessionAndEndpointEvidence(t *testing.T) {
 		operation: OperationTCPRepair,
 		result:    PreflightResult{Eligible: true, EvidenceDigest: evidence},
 	}
-	claim := MustNewDrivenClaim(testFacts(), driver)
+	facts := testDrivenFacts()
+	claim := MustNewDrivenClaim(facts, driver, MustNewResource(ScopeEndpoint))
 	binding := testBinding(7)
 	if err := claim.Bind(binding); err != nil {
 		t.Fatal(err)
@@ -145,8 +154,9 @@ func TestPlanCandidateRequiresExactSessionAndEndpointEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if plan.Operation != OperationTCPRepair || plan.Fallback != FallbackRedialAttach ||
-		plan.Reason != ReasonNone || plan.EndpointGeneration != testFacts().Generation ||
+		plan.Reason != ReasonNone || plan.EndpointGeneration != facts.Generation ||
 		plan.Kind != KindRawTCP || plan.Role != RoleDialer || plan.Scope != ScopeEndpoint ||
+		plan.ResourceID == (ResourceID{}) ||
 		plan.EvidenceDigest != evidence || plan.LocalDigest == (LocalPlanDigest{}) {
 		t.Fatalf("specialized plan=%+v", plan)
 	}
@@ -212,7 +222,7 @@ func TestPlanCandidateFallbacksDoNotCallDriverPrematurely(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			driver := &fakeDriver{operation: OperationTCPRepair, result: test.result, preErr: test.preErr}
-			claim := MustNewDrivenClaim(testFacts(), driver)
+			claim := MustNewDrivenClaim(testDrivenFacts(), driver, MustNewResource(ScopeEndpoint))
 			if err := claim.Bind(binding); err != nil {
 				t.Fatal(err)
 			}
@@ -248,7 +258,7 @@ func TestPlanCandidateBoundsAndRechecksDeadline(t *testing.T) {
 		result:         PreflightResult{Eligible: true, EvidenceDigest: EvidenceDigest{1}},
 		waitForContext: true,
 	}
-	claim := MustNewDrivenClaim(testFacts(), driver)
+	claim := MustNewDrivenClaim(testDrivenFacts(), driver, MustNewResource(ScopeEndpoint))
 	if err := claim.Bind(binding); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +274,7 @@ func TestPlanCandidateHonorsParentCancellation(t *testing.T) {
 		operation: OperationTCPRepair,
 		result:    PreflightResult{Eligible: true, EvidenceDigest: EvidenceDigest{1}},
 	}
-	claim := MustNewDrivenClaim(testFacts(), driver)
+	claim := MustNewDrivenClaim(testDrivenFacts(), driver, MustNewResource(ScopeEndpoint))
 	if err := claim.Bind(binding); err != nil {
 		t.Fatal(err)
 	}
@@ -315,12 +325,18 @@ func TestPlanDigestCanonicalGolden(t *testing.T) {
 		Kind:               KindRawTCP,
 		Role:               RoleDialer,
 		Scope:              ScopeEndpoint,
+		ResourceID:         ResourceID{0x31, 0x32},
 		EvidenceDigest:     EvidenceDigest{0xde, 0xad, 0xbe, 0xef},
 	}
 	plan.LocalDigest = digestPlan(plan)
-	const want = "ae14d243c6ae414a420b8b85b178f6ed11e647bbb19b46e15edd2ccc5adc86f2"
+	const want = "c88c384811a5af0eb71fef7c62d87bdb0f703d38be1dd67b8cf3d2ef4e496207"
 	if got := hex.EncodeToString(plan.LocalDigest[:]); got != want {
 		t.Fatalf("plan digest=%s want=%s", got, want)
+	}
+	nextGeneration := plan
+	nextGeneration.BaseGeneration++
+	if digestPlan(nextGeneration) == plan.LocalDigest {
+		t.Fatal("resource base generation did not enter plan digest")
 	}
 }
 
@@ -337,7 +353,7 @@ func TestInvalidPreflightEvidenceFailsClosed(t *testing.T) {
 	}
 	for i, result := range tests {
 		driver := &fakeDriver{operation: OperationTCPRepair, result: result}
-		claim := MustNewDrivenClaim(testFacts(), driver)
+		claim := MustNewDrivenClaim(testDrivenFacts(), driver, MustNewResource(ScopeEndpoint))
 		if err := claim.Bind(binding); err != nil {
 			t.Fatal(err)
 		}

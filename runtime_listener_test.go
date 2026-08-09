@@ -807,6 +807,87 @@ func TestRuntimeListenerHelloRetryAfterLostAckIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRuntimeListenerReusedHelloProposalGetsFreshFinalEpoch(t *testing.T) {
+	source := newRuntimePipeListener()
+	serverRuntime, err := NewRuntime(RuntimeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := serverRuntime.Listen(ListenConfig{Streams: []StreamSource{{
+		Name: "pipe", Carrier: CarrierTCP, Listener: source,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	graph, err := compileTargetGraph(Path("path", PathSpec{Transport: "pipe", Address: "peer"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal := [16]byte{0x71, 0x72}
+	clientInstance := engine.NewInstanceID()
+	var finals [2][16]byte
+	for attempt := range finals {
+		clientEngine := engine.New(engine.SideClient, proposal, engine.Limits{}.Clamp())
+		if err := clientEngine.ConfigureLocalGraph(1, graph.manifest); err != nil {
+			_ = clientEngine.Close()
+			t.Fatal(err)
+		}
+		clientEngine.SetLocalInstanceID(clientInstance)
+		clientRaw, serverRaw := net.Pipe()
+		if err := source.inject(serverRaw); err != nil {
+			_ = clientEngine.Close()
+			_ = clientRaw.Close()
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		admission, err := engine.PerformClientHelloAdmissionContext(ctx, tcp.Wrap(clientRaw), clientEngine,
+			clientInstance, 0, "path", PathSpec{Transport: "pipe"})
+		if err != nil {
+			cancel()
+			_ = clientEngine.Close()
+			t.Fatalf("attempt %d client admission: %v", attempt, err)
+		}
+		clientEngine.SetPeerKind(engine.PeerRendr)
+		clientEngine.SetPeerCaps(admission.Ack.Caps)
+		if err := clientEngine.SetPeerInstanceID(admission.Ack.InstanceID); err != nil {
+			cancel()
+			_ = clientEngine.Close()
+			t.Fatal(err)
+		}
+		server, err := listener.AcceptStream(ctx)
+		cancel()
+		if err != nil {
+			_ = clientEngine.Close()
+			t.Fatalf("attempt %d accept: %v", attempt, err)
+		}
+		serverEngine := server.(*acceptedStreamConn).engine
+		finals[attempt] = clientEngine.FlowID()
+		if finals[attempt] == proposal || finals[attempt] == ([16]byte{}) {
+			t.Fatalf("attempt %d final epoch=%x proposal=%x", attempt, finals[attempt], proposal)
+		}
+		if serverEngine.FlowID() != finals[attempt] || admission.Ack.FlowID != finals[attempt] {
+			t.Fatalf("attempt %d epoch mismatch client=%x server=%x ack=%x", attempt, finals[attempt], serverEngine.FlowID(), admission.Ack.FlowID)
+		}
+		_ = clientEngine.Close()
+		_ = serverEngine.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for serverRuntime.bridges.Len() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := serverRuntime.bridges.Len(); got != 0 {
+			t.Fatalf("attempt %d bridge entries after close=%d", attempt, got)
+		}
+		if _, ok := serverRuntime.bridges.Lookup(finals[attempt]); ok {
+			t.Fatalf("attempt %d retired final epoch remains addressable", attempt)
+		}
+	}
+	if finals[0] == finals[1] {
+		t.Fatalf("proposal reuse resurrected final epoch %x", finals[0])
+	}
+}
+
 func TestRuntimeListenerRejectsNoncanonicalHelloBeforeReservation(t *testing.T) {
 	source := newRuntimePipeListener()
 	runtime, err := NewRuntime(RuntimeConfig{})

@@ -124,6 +124,10 @@ func (e *Engine) replaySequencedFrame(frame []byte) error {
 	if e.isClosed() || e.sendClosing.Load() {
 		return net.ErrClosed
 	}
+	return e.dispatchReplayFrameLocked(frame)
+}
+
+func (e *Engine) dispatchReplayFrameLocked(frame []byte) error {
 	return e.dispatch(frame, false)
 }
 
@@ -358,7 +362,7 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 		if e.isClosed() {
 			return net.ErrClosed
 		}
-		if err := e.dispatch(frame, false); err != nil {
+		if err := e.dispatchReplayFrameLocked(frame); err != nil {
 			return err
 		}
 		if len(frame) >= proto.HeaderSize {

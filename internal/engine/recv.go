@@ -19,7 +19,11 @@ const streamRecvWindowFrames = sendHistoryWindow
 // ledger. A larger window lets a malicious peer pin the receive floor while
 // forcing one frame-digest allocation per distant packet.
 const packetRecvWindowBits = 512
-const policyReplayDigestLimit = 64
+
+// Keep transaction digests for the sender's entire bounded replay domain so an
+// exact old phase can recover a lost receipt without being reclassified as an
+// unsolicited new transaction.
+const policyReplayDigestLimit = sendHistoryWindow + sendControlReserve
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
 // hold the payload bytes; ctrl frames hold the flags so the in-order
@@ -273,12 +277,24 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 			payload = append([]byte(nil), payload...)
 		}
 
-		// Per-path probes are handled before the SEQ-aware reorder
-		// path so they never stall the application stream. Probe
-		// frames intentionally do not consume a SEQ slot - the peer
-		// can pick any value (we use 0) and we filter on type+code.
+		// Leaf mobility, path admission, and probes use their own OOB
+		// sequencing rules and are handled before the application DATA
+		// reorder path. Leaf mobility requires a nonzero transaction-local
+		// message sequence; admission and probes use sequence zero.
 		if hdr.Type == proto.FrameCtrl {
 			code := proto.CtrlCodeFromFlags(hdr.Flags)
+			if isLeafMobilityCtrl(code) {
+				if err := proto.ValidateLeafMobilityCtrlFlags(hdr.Flags); err != nil || hdr.Seq == 0 || hdr.Last {
+					e.setCloseErr(fmt.Errorf("%w: malformed leaf mobility OOB header", ErrPeerProtocol))
+					go e.Close()
+					return
+				}
+				if err := e.routeLeafMobilityOOB(slot, hdr, payload); err != nil {
+					_ = e.leafMobilityProtocolError(err)
+					return
+				}
+				continue
+			}
 			if isPathAdmissionCtrl(code) || isPathAdmissionHandshakeCtrl(code) {
 				if hdr.Flags != proto.FlagsForCtrl(code) || hdr.Seq != 0 || hdr.Last {
 					e.setCloseErr(ErrPeerProtocol)
@@ -372,7 +388,7 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 
 func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
 	binding := e.localGraphBinding()
-	if ack.SessionEpoch != proto.SessionEpoch(e.flowID) ||
+	if ack.SessionEpoch != proto.SessionEpoch(e.FlowID()) ||
 		ack.Direction != senderDirection(e.side) ||
 		ack.GraphRevision != binding.revision ||
 		ack.GraphDigest != binding.digest ||
@@ -478,7 +494,7 @@ func (e *Engine) writeAck(request ackRequest) {
 	nextSeq, gap := request.nextSeq, request.gap
 	binding := e.peerGraphBinding()
 	payload := proto.AckPayload{
-		SessionEpoch:  proto.SessionEpoch(e.flowID),
+		SessionEpoch:  proto.SessionEpoch(e.FlowID()),
 		Direction:     peerSenderDirection(e.side),
 		GraphRevision: binding.revision,
 		GraphDigest:   binding.digest,
@@ -828,14 +844,14 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		// inbox so replaying the same outer SEQ can recover a lost response
 		// without consuming another control slot. It does not advance the
 		// receive proof or application sequence a second time.
-		if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
+		if hdr.Type == proto.FrameCtrl && isReplayableTransactionCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
 			if accepted, ok := e.policyReplayDigests[hdr.Seq]; ok {
 				if accepted != digest {
 					e.recvFinalErr = fmt.Errorf("%w: altered policy frame reused sequence %d", ErrPeerProtocol, hdr.Seq)
 					e.recvTerminal = true
 					return false
 				}
-				e.applyCtrlLocked(slot, hdr.Flags, payload)
+				e.applyCtrlLocked(slot, hdr.Flags, payload, true)
 			}
 		}
 		return false
@@ -930,6 +946,14 @@ func isPolicyCtrl(code proto.CtrlCode) bool {
 	return code == proto.CtrlPolicyPrepare || code == proto.CtrlPolicyAck || code == proto.CtrlPolicyCommit
 }
 
+func isLeafMobilityCtrl(code proto.CtrlCode) bool {
+	return code == proto.CtrlLeafMobilityPrepare || code == proto.CtrlLeafMobilityAck || code == proto.CtrlLeafMobilityCommit
+}
+
+func isReplayableTransactionCtrl(code proto.CtrlCode) bool {
+	return isPolicyCtrl(code)
+}
+
 func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 	wokeReader := false
 	for {
@@ -953,10 +977,10 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 			e.packetAdvanceHeadLocked()
 		}
 		if item.isCtrl {
-			if isPolicyCtrl(proto.CtrlCodeFromFlags(item.flags)) {
+			if isReplayableTransactionCtrl(proto.CtrlCodeFromFlags(item.flags)) {
 				e.rememberPolicyReplayDigestLocked(seq, item.digest)
 			}
-			e.applyCtrlLocked(item.slot, item.flags, item.payload)
+			e.applyCtrlLocked(item.slot, item.flags, item.payload, false)
 			if e.recvTerminal {
 				break
 			}
@@ -1006,7 +1030,7 @@ func recvFrameDigest(hdr proto.Header, payload []byte) proto.FrameDigest {
 //
 // To avoid deadlocks against Close (which itself broadcasts the recv
 // cond), heavyweight teardown work fires in a goroutine.
-func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
+func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte, replayed bool) {
 	code := proto.CtrlCodeFromFlags(flags)
 	switch code {
 	case proto.CtrlBye:
@@ -1093,6 +1117,13 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte) {
 		// purely to keep the reorder window contiguous.
 		_ = payload
 	}
+}
+
+func pathRefForSlot(slot *pathSlot) PathRef {
+	if slot == nil {
+		return PathRef{}
+	}
+	return PathRef{ID: slot.id, Owner: slot.owner}
 }
 
 func (e *Engine) markPayload() {

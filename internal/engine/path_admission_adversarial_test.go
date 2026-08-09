@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -65,6 +66,19 @@ type admissionBlockingWritePath struct {
 	unblock   chan struct{}
 	writeOnce sync.Once
 	closeOnce sync.Once
+}
+
+type admissionBlockingSuccessfulWritePath struct {
+	transport.PathConn
+	entered   chan struct{}
+	release   chan struct{}
+	writeOnce sync.Once
+}
+
+func (p *admissionBlockingSuccessfulWritePath) Write(frame []byte) (int, error) {
+	p.writeOnce.Do(func() { close(p.entered) })
+	<-p.release
+	return len(frame), nil
 }
 
 func (p *admissionBlockingWritePath) Write(_ []byte) (int, error) {
@@ -502,6 +516,136 @@ func TestPathAdmissionActivationDoesNotDeadlockSynchronousDeathCallback(t *testi
 	if state.retained != 0 || state.predecessors != 0 {
 		t.Fatalf("dead predecessor survived activation fence: %+v", state)
 	}
+}
+
+func TestPathAdmissionGracefulCloseDuringFenceReleasesStagedReservation(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	oldBase, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	old := &admissionBlockingSuccessfulWritePath{
+		PathConn: oldBase,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSlot := admissionPathSlot(t, e, oldID)
+
+	sendDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("write-held-until-graceful-close"))
+		sendDone <- err
+	}()
+	waitAdmissionChannel(t, old.entered, "predecessor write")
+
+	replacement, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, _ := prepareBoundAdmission(t, e, replacement, binding, 0x75)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+	activated := make(chan error, 1)
+	go func() {
+		activated <- e.activateStagedPathContext(context.Background(), replacementID, true, true)
+	}()
+	waitAdmissionCondition(t, time.Second, "predecessor TX fence", func() bool {
+		return oldSlot.maintenance.Load() && !oldSlot.txEnabled.Load()
+	})
+	e.sendClosing.Store(true)
+	close(old.release)
+
+	if err := <-activated; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("activation after graceful-close gate error=%v, want %v", err, net.ErrClosed)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("predecessor send after fence release: %v", err)
+	}
+	assertPathAdmissionReleased(t, e, replacementID)
+}
+
+func TestPathAdmissionTransferredReservationExpiresOnOriginalToken(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngineWithLimits(t, SideClient, Limits{
+		MigrationBudget:     100 * time.Millisecond,
+		ZombieMaxMigrations: 10,
+	})
+	resource := leafmobility.MustNewResource(leafmobility.ScopeEndpoint)
+	newClaim := func() *leafmobility.Claim {
+		driver := &enginePlanDriver{
+			operation: leafmobility.OperationTCPRepair,
+			evidence:  leafmobility.EvidenceDigest{0x76},
+		}
+		return leafmobility.MustNewDrivenClaim(leafmobility.Facts{
+			Kind:       leafmobility.KindRawTCP,
+			Role:       leafmobility.RoleDialer,
+			Session:    leafmobility.SessionStream,
+			Generation: leafmobility.NextGeneration(),
+		}, driver, resource)
+	}
+
+	oldBase, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	oldID, err := e.AttachPathBound(&claimedMemoryPath{PathConn: oldBase, claim: newClaim()}, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacementBase, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, _ := prepareBoundAdmission(t, e,
+		&claimedMemoryPath{PathConn: replacementBase, claim: newClaim()}, binding, 0x76)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ActivateStagedPath(replacementID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	e.pathsMu.RLock()
+	key := e.pathAdmissionByPath[replacementID]
+	token := e.pathAdmissionByLeaf[key].token
+	e.pathsMu.RUnlock()
+	if token == nil {
+		t.Fatal("activated admission has no immutable token")
+	}
+
+	failMemoryPath(t, e, replacementID, replacementBase, errors.New("successor failed before admission deadline"))
+	if active := e.ActivePath(); active != oldID {
+		t.Fatalf("active path after successor death=%d, want predecessor=%d", active, oldID)
+	}
+	e.pathsMu.RLock()
+	transferredKey, transferred := e.pathAdmissionByPath[oldID]
+	transferredReservation := e.pathAdmissionByLeaf[key]
+	e.pathsMu.RUnlock()
+	if !transferred || transferredKey != key || transferredReservation.pathID != oldID || transferredReservation.token != token {
+		t.Fatalf("reservation did not transfer with immutable token: transferred=%t key=%+v reservation=%+v", transferred, transferredKey, transferredReservation)
+	}
+
+	probeClaim := newClaim()
+	if reservation, err := leafmobility.ReserveAdmissions(probeClaim); !errors.Is(err, leafmobility.ErrResourceAdmissionActive) {
+		reservation.Release()
+		t.Fatalf("shared resource before timeout error=%v, want %v", err, leafmobility.ErrResourceAdmissionActive)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	var probeReservation *leafmobility.AdmissionReservation
+	for probeReservation == nil && time.Now().Before(deadline) {
+		reservation, err := leafmobility.ReserveAdmissions(probeClaim)
+		if err == nil {
+			probeReservation = reservation
+			break
+		}
+		if !errors.Is(err, leafmobility.ErrResourceAdmissionActive) {
+			t.Fatalf("shared resource after transfer returned unexpected error: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if probeReservation == nil {
+		t.Fatal("transferred admission did not release shared resource at its original deadline")
+	}
+	probeReservation.Release()
+	assertPathAdmissionReleased(t, e, oldID)
 }
 
 func TestPathAdmissionCommittedSuccessorDeathDoesNotRestorePredecessor(t *testing.T) {

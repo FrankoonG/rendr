@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
@@ -342,6 +343,84 @@ func TestConfigureLocalAndPeerGraphsAreImmutable(t *testing.T) {
 				t.Fatal("accepted a different graph manifest after configuration was frozen")
 			}
 		})
+	}
+}
+
+func TestPathCannotPublishBeforeBothDirectionalGraphsFreeze(t *testing.T) {
+	manifest, _ := adversarialGraphManifest("freeze-root", proto.GraphNodeKindSelector, "path")
+	proposal := [16]byte{0x81}
+	final := [16]byte{0x82}
+	e := New(SideClient, proposal, Limits{}.Clamp())
+	defer e.Close()
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AdoptSessionEpoch(final); err != nil {
+		t.Fatal(err)
+	}
+	path, peer := newMemoryPathPair()
+	defer peer.Close()
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "path"}}); err == nil {
+		t.Fatal("path published before peer graph was frozen")
+	}
+	if got := len(e.Paths()); got != 0 {
+		t.Fatalf("paths after rejected pre-negotiation attach=%d want=0", got)
+	}
+}
+
+func TestPathAttachLinearizesWithPeerNegotiation(t *testing.T) {
+	manifest, _ := adversarialGraphManifest("linear-root", proto.GraphNodeKindSelector, "path")
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for iteration := 0; iteration < 256; iteration++ {
+		proposal := [16]byte{0x91, byte(iteration), byte(iteration >> 8)}
+		final := [16]byte{0x92, byte(iteration), byte(iteration >> 8)}
+		e := New(SideClient, proposal, Limits{}.Clamp())
+		if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.AdoptSessionEpoch(final); err != nil {
+			t.Fatal(err)
+		}
+		peerNegotiation := proto.NewNegotiation(proto.SessionEpoch(final))
+		peerNegotiation.GraphRevision = 1
+		peerNegotiation.GraphDigest = digest
+		path, peer := newMemoryPathPair()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var attachErr, negotiationErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			_, attachErr = e.AttachPath(path, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "path"}})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			negotiationErr = e.AcceptPeerNegotiation(peerNegotiation, manifest)
+		}()
+		close(start)
+		wg.Wait()
+		if negotiationErr != nil {
+			t.Fatalf("iteration %d negotiation error: %v", iteration, negotiationErr)
+		}
+		if attachErr == nil {
+			e.pathsMu.RLock()
+			for _, slot := range e.paths {
+				if slot.peerTXTargetID == (proto.TargetID{}) {
+					e.pathsMu.RUnlock()
+					t.Fatalf("iteration %d published zero peer target", iteration)
+				}
+			}
+			e.pathsMu.RUnlock()
+		} else if got := len(e.Paths()); got != 0 {
+			t.Fatalf("iteration %d rejected attach left %d paths", iteration, got)
+		}
+		_ = e.Close()
+		_ = peer.Close()
 	}
 }
 

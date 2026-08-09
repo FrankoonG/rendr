@@ -33,13 +33,16 @@ const (
 	CtrlPathAdmissionConfirm CtrlCode = 0x0E
 	CtrlBridgeTag            CtrlCode = 0x10
 	CtrlBridgeAck            CtrlCode = 0x11
+	CtrlLeafMobilityPrepare  CtrlCode = 0x12
+	CtrlLeafMobilityAck      CtrlCode = 0x13
+	CtrlLeafMobilityCommit   CtrlCode = 0x14
 )
 
 type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 7
+	ProtocolMinor uint16 = 10
 )
 
 type FeatureSet uint64
@@ -65,8 +68,18 @@ const (
 	// FeatureLeafMobilityEnvelope assigns the former negotiation reserved bytes
 	// to the supported and required specialized leaf-mobility sets.
 	FeatureLeafMobilityEnvelope FeatureSet = 1 << 10
+	// FeatureLeafMobilityTransaction requires bilateral prepare/ack/commit and
+	// execution-resolution agreement before resource guards can be released.
+	FeatureLeafMobilityTransaction FeatureSet = 1 << 11
+	// FeatureLeafMobilityOOBTransaction moves route-bound mobility phases out
+	// of the application DATA sequence domain. Exact transaction receipts, not
+	// cumulative DATA ACKs, provide their retry/duplicate contract.
+	FeatureLeafMobilityOOBTransaction FeatureSet = 1 << 12
+	// FeatureServerAssignedSessionEpoch separates the replayable client HELLO
+	// proposal from the final session identity selected by the listener.
+	FeatureServerAssignedSessionEpoch FeatureSet = 1 << 13
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -353,6 +366,12 @@ func (c CtrlCode) String() string {
 		return "BRIDGE_TAG"
 	case CtrlBridgeAck:
 		return "BRIDGE_ACK"
+	case CtrlLeafMobilityPrepare:
+		return "LEAF_MOBILITY_PREPARE"
+	case CtrlLeafMobilityAck:
+		return "LEAF_MOBILITY_ACK"
+	case CtrlLeafMobilityCommit:
+		return "LEAF_MOBILITY_COMMIT"
 	default:
 		return fmt.Sprintf("ctrl(0x%02x)", uint8(c))
 	}

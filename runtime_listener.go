@@ -567,14 +567,32 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		}
 	}()
 
-	e := engine.New(engine.SideServer, hello.FlowID, l.runtime.engineLimits())
+	var sessionID [16]byte
+	for {
+		sessionID = engine.NewClientFlowID()
+		if sessionID == ([16]byte{}) || sessionID == hello.FlowID {
+			continue
+		}
+		err = l.runtime.bridges.AssignSession(reservation, sessionID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, engine.ErrBridgeSessionConflict) {
+			return false
+		}
+	}
+
+	e := engine.New(engine.SideServer, sessionID, l.runtime.engineLimits())
+	e.SetLeafMobilityPeerLedger(l.runtime.mobilityLedger)
 	engineOwnsPath := false
 	defer func() {
 		if !activated {
 			_ = e.Close()
 		}
 	}()
-	if err := e.AcceptPeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err != nil {
+	peerNegotiation := hello.Negotiation
+	peerNegotiation.SessionEpoch = proto.SessionEpoch(sessionID)
+	if err := e.AcceptPeerNegotiation(peerNegotiation, hello.LocalTXManifest); err != nil {
 		rejectIncompatibleNegotiation(pc, err)
 		return false
 	}
@@ -583,7 +601,9 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	}
 	e.SetLocalInstanceID(l.runtime.instanceID)
 	e.SetPeerKind(engine.PeerRendr)
-	e.SetPeerInstanceID(hello.InstanceID)
+	if err := e.SetPeerInstanceID(hello.InstanceID); err != nil {
+		return false
+	}
 	e.SetPeerCaps(hello.Caps)
 	if packetMode {
 		e.SetPacketMode()
@@ -598,7 +618,7 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 		return false
 	}
 	engineOwnsPath = true
-	if err := l.runtime.bridges.Activate(reservation, e); err != nil {
+	if err := l.runtime.bridges.ActivateSession(reservation, sessionID, e); err != nil {
 		_ = e.Close()
 		return engineOwnsPath
 	}
@@ -654,7 +674,9 @@ func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc tran
 	if e.Packetized() != (hello.Caps&proto.CapsPacketMode != 0) {
 		return false
 	}
-	if err := e.ValidatePeerNegotiation(hello.Negotiation, hello.LocalTXManifest); err != nil {
+	peerNegotiation := hello.Negotiation
+	peerNegotiation.SessionEpoch = proto.SessionEpoch(e.FlowID())
+	if err := e.ValidatePeerNegotiation(peerNegotiation, hello.LocalTXManifest); err != nil {
 		rejectIncompatibleNegotiation(pc, err)
 		return false
 	}

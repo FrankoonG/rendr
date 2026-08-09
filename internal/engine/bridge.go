@@ -10,6 +10,7 @@ const DefaultBridgeTableCapacity = 4096
 
 var (
 	ErrBridgeDuplicate           = errors.New("engine: bridge flow is already reserved or active")
+	ErrBridgeSessionConflict     = errors.New("engine: bridge session epoch is already active")
 	ErrBridgeTableFull           = errors.New("engine: bridge table is full")
 	ErrBridgeInvalidEngine       = errors.New("engine: bridge engine is nil")
 	ErrBridgeStaleReservation    = errors.New("engine: bridge reservation is stale or invalid")
@@ -37,17 +38,20 @@ type BridgeReservation struct {
 
 type bridgeTableEntry struct {
 	generation uint64
+	sessionID  [16]byte
 	state      BridgeEntryState
 	engine     *Engine
 	changed    chan struct{}
 	legacy     bool
 }
 
-// BridgeTable owns the bounded server-side flow publication lifecycle:
-// absent -> reserved -> active -> absent.
+// BridgeTable owns the bounded server-side flow publication lifecycle. entries
+// is keyed by the client HELLO proposal ID; sessions is keyed by the
+// server-assigned final session epoch after activation.
 type BridgeTable struct {
 	mu             sync.Mutex
 	entries        map[[16]byte]*bridgeTableEntry
+	sessions       map[[16]byte]*bridgeTableEntry
 	capacity       int
 	nextGeneration uint64
 }
@@ -65,6 +69,7 @@ func NewBridgeTableWithCapacity(capacity int) *BridgeTable {
 	}
 	return &BridgeTable{
 		entries:  make(map[[16]byte]*bridgeTableEntry),
+		sessions: make(map[[16]byte]*bridgeTableEntry),
 		capacity: capacity,
 	}
 }
@@ -78,6 +83,9 @@ func (b *BridgeTable) Reserve(id [16]byte) (BridgeReservation, error) {
 
 	if _, exists := b.entries[id]; exists {
 		return BridgeReservation{}, ErrBridgeDuplicate
+	}
+	if _, exists := b.sessions[id]; exists {
+		return BridgeReservation{}, ErrBridgeSessionConflict
 	}
 	if len(b.entries) >= b.capacity {
 		return BridgeReservation{}, ErrBridgeTableFull
@@ -101,6 +109,25 @@ func (b *BridgeTable) Reserve(id [16]byte) (BridgeReservation, error) {
 
 // Activate publishes e only when reservation still owns the reserved entry.
 func (b *BridgeTable) Activate(reservation BridgeReservation, e *Engine) error {
+	return b.ActivateSession(reservation, reservation.flowID, e)
+}
+
+// AssignSession reserves a final session epoch before it is published in
+// HELLO_ACK. This prevents a random epoch collision from being discovered only
+// after the peer has committed path admission.
+func (b *BridgeTable) AssignSession(reservation BridgeReservation, sessionID [16]byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	entry, ok := b.matchLocked(reservation)
+	if !ok || entry.state != BridgeEntryReserved || entry.legacy {
+		return ErrBridgeStaleReservation
+	}
+	return b.assignSessionLocked(entry, sessionID)
+}
+
+// ActivateSession publishes e under a server-assigned final session epoch
+// while retaining the HELLO proposal ID as an active duplicate-handshake alias.
+func (b *BridgeTable) ActivateSession(reservation BridgeReservation, sessionID [16]byte, e *Engine) error {
 	if e == nil {
 		return ErrBridgeInvalidEngine
 	}
@@ -111,9 +138,33 @@ func (b *BridgeTable) Activate(reservation BridgeReservation, e *Engine) error {
 	if !ok || entry.state != BridgeEntryReserved || entry.legacy {
 		return ErrBridgeStaleReservation
 	}
+	if err := b.assignSessionLocked(entry, sessionID); err != nil {
+		return err
+	}
 	entry.engine = e
 	entry.state = BridgeEntryActive
 	close(entry.changed)
+	return nil
+}
+
+func (b *BridgeTable) assignSessionLocked(entry *bridgeTableEntry, sessionID [16]byte) error {
+	if sessionID == ([16]byte{}) {
+		return ErrBridgeSessionConflict
+	}
+	if entry.sessionID != ([16]byte{}) {
+		if entry.sessionID == sessionID {
+			return nil
+		}
+		return ErrBridgeSessionConflict
+	}
+	if other, exists := b.sessions[sessionID]; exists && other != entry {
+		return ErrBridgeSessionConflict
+	}
+	if other, exists := b.entries[sessionID]; exists && other != entry {
+		return ErrBridgeSessionConflict
+	}
+	entry.sessionID = sessionID
+	b.sessions[sessionID] = entry
 	return nil
 }
 
@@ -121,7 +172,10 @@ func (b *BridgeTable) Activate(reservation BridgeReservation, e *Engine) error {
 func (b *BridgeTable) Lookup(id [16]byte) (*Engine, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	entry, ok := b.entries[id]
+	entry, ok := b.sessions[id]
+	if !ok {
+		entry, ok = b.entries[id]
+	}
 	if !ok || entry.state != BridgeEntryActive {
 		return nil, false
 	}
@@ -135,7 +189,10 @@ func (b *BridgeTable) Lookup(id [16]byte) (*Engine, bool) {
 // generation, which would attach a path to the wrong session after an ABA.
 func (b *BridgeTable) WaitActive(ctx context.Context, id [16]byte) (*Engine, BridgeEntryState, error) {
 	b.mu.Lock()
-	entry, ok := b.entries[id]
+	entry, ok := b.sessions[id]
+	if !ok {
+		entry, ok = b.entries[id]
+	}
 	if !ok {
 		b.mu.Unlock()
 		if err := ctx.Err(); err != nil {
@@ -168,7 +225,10 @@ func (b *BridgeTable) WaitActive(ctx context.Context, id [16]byte) (*Engine, Bri
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	entry, ok = b.entries[id]
+	entry, ok = b.sessions[id]
+	if !ok {
+		entry, ok = b.entries[id]
+	}
 	if !ok {
 		return nil, BridgeEntryAbsent, nil
 	}
@@ -191,6 +251,7 @@ func (b *BridgeTable) Abort(reservation BridgeReservation) bool {
 		return false
 	}
 	delete(b.entries, reservation.flowID)
+	delete(b.sessions, entry.sessionID)
 	close(entry.changed)
 	return true
 }
@@ -209,6 +270,7 @@ func (b *BridgeTable) RemoveActive(reservation BridgeReservation, e *Engine) boo
 		return false
 	}
 	delete(b.entries, reservation.flowID)
+	delete(b.sessions, entry.sessionID)
 	return true
 }
 
@@ -235,19 +297,25 @@ func (b *BridgeTable) Put(id [16]byte, e *Engine) bool {
 	if _, exists := b.entries[id]; exists || len(b.entries) >= b.capacity {
 		return false
 	}
+	if _, exists := b.sessions[id]; exists {
+		return false
+	}
 	if b.nextGeneration == ^uint64(0) {
 		return false
 	}
 	b.nextGeneration++
 	changed := make(chan struct{})
 	close(changed)
-	b.entries[id] = &bridgeTableEntry{
+	entry := &bridgeTableEntry{
 		generation: b.nextGeneration,
+		sessionID:  id,
 		state:      BridgeEntryActive,
 		engine:     e,
 		changed:    changed,
 		legacy:     true,
 	}
+	b.entries[id] = entry
+	b.sessions[id] = entry
 	return true
 }
 
@@ -263,6 +331,7 @@ func (b *BridgeTable) Remove(id [16]byte) {
 	entry, ok := b.entries[id]
 	if ok && entry.legacy {
 		delete(b.entries, id)
+		delete(b.sessions, entry.sessionID)
 	}
 	b.mu.Unlock()
 }
@@ -279,9 +348,9 @@ func (b *BridgeTable) Snapshot() [][16]byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([][16]byte, 0, len(b.entries))
-	for id, entry := range b.entries {
+	for _, entry := range b.entries {
 		if entry.state == BridgeEntryActive {
-			out = append(out, id)
+			out = append(out, entry.sessionID)
 		}
 	}
 	return out

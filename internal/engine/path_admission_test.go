@@ -21,6 +21,21 @@ func TestPathAdmissionCannotPublishAfterGracefulCloseStarts(t *testing.T) {
 		}
 	})
 
+	t.Run("stage", func(t *testing.T) {
+		e, binding := admissionTestEngine(t)
+		candidate, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		id, err := e.PreparePathBound(candidate, transport.PathSpec{Transport: "memory"}, binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.sendClosing.Store(true)
+		if err := e.StagePathAttach(id); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("stage after close gate error=%v, want %v", err, net.ErrClosed)
+		}
+		assertPathAdmissionReleased(t, e, id)
+	})
+
 	t.Run("activate", func(t *testing.T) {
 		e, binding := admissionTestEngine(t)
 		candidate, peer := newMemoryPathPair()
@@ -36,7 +51,26 @@ func TestPathAdmissionCannotPublishAfterGracefulCloseStarts(t *testing.T) {
 		if err := e.ActivateStagedPath(id, false); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("activate after close gate error=%v, want %v", err, net.ErrClosed)
 		}
+		assertPathAdmissionReleased(t, e, id)
 	})
+}
+
+func assertPathAdmissionReleased(t *testing.T, e *Engine, pathID uint32) {
+	t.Helper()
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	if _, pending := e.pendingPaths[pathID]; pending {
+		t.Fatalf("path %d remained pending after admission release", pathID)
+	}
+	if _, staged := e.stagedPaths[pathID]; staged {
+		t.Fatalf("path %d remained staged after admission release", pathID)
+	}
+	if _, reserved := e.pathAdmissionByPath[pathID]; reserved {
+		t.Fatalf("path %d retained admission path index", pathID)
+	}
+	if len(e.pathAdmissionByLeaf) != 0 {
+		t.Fatalf("path %d retained %d admission leaf reservations", pathID, len(e.pathAdmissionByLeaf))
+	}
 }
 
 func admissionTestEngine(t *testing.T) (*Engine, PathBinding) {

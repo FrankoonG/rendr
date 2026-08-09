@@ -47,7 +47,7 @@ func (e *Engine) PlanLeafMobilityCandidate(
 	}
 	claim := slot.mobilityClaim
 	binding := leafmobility.Binding{
-		FlowID:        e.flowID,
+		FlowID:        e.FlowID(),
 		LocalTargetID: [16]byte(slot.localTXTargetID),
 		PeerTargetID:  [16]byte(slot.peerTXTargetID),
 		PathID:        slot.id,

@@ -4,11 +4,112 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
 )
+
+func TestEnginePeerInstanceIdentityIsImmutableAndConcurrentSafe(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{})
+	t.Cleanup(func() { _ = e.Close() })
+	peer := proto.InstanceID{1}
+	if err := e.installPeerInstanceID(peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installPeerInstanceID(proto.InstanceID{2}); err == nil {
+		t.Fatal("peer identity changed after initial publication")
+	}
+	var wg sync.WaitGroup
+	for index := 0; index < 16; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				e.SetPeerInstanceID(peer)
+				if got := e.PeerInstanceID(); got != peer {
+					t.Errorf("peer identity=%x want=%x", got, peer)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestEngineCloseCannotResurrectPeerLedgerSession(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		e := New(SideClient, NewClientFlowID(), Limits{})
+		ledger := NewLeafMobilityPeerLedger()
+		e.SetLeafMobilityPeerLedger(ledger)
+		peer := proto.InstanceID{byte(iteration + 1), 1}
+		start := make(chan struct{})
+		installed := make(chan error, 1)
+		closed := make(chan error, 1)
+		go func() {
+			<-start
+			installed <- e.installPeerInstanceID(peer)
+		}()
+		go func() {
+			<-start
+			closed <- e.Close()
+		}()
+		close(start)
+		<-installed
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+		<-e.Closed()
+		ledger.mu.Lock()
+		refs := len(ledger.sessions)
+		ledger.mu.Unlock()
+		if refs != 0 {
+			t.Fatalf("iteration %d retained %d sessions after close", iteration, refs)
+		}
+		if err := e.installPeerInstanceID(peer); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("iteration %d late identity error=%v want closed", iteration, err)
+		}
+	}
+}
+
+func TestEngineCloseSerializesPeerLedgerReplacement(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		e := New(SideClient, NewClientFlowID(), Limits{})
+		first := NewLeafMobilityPeerLedger()
+		second := NewLeafMobilityPeerLedger()
+		e.SetLeafMobilityPeerLedger(first)
+		if err := e.installPeerInstanceID(proto.InstanceID{byte(iteration + 1), 2}); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		closed := make(chan error, 1)
+		replaced := make(chan struct{})
+		go func() {
+			<-start
+			e.SetLeafMobilityPeerLedger(second)
+			close(replaced)
+		}()
+		go func() {
+			<-start
+			closed <- e.Close()
+		}()
+		close(start)
+		<-replaced
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+		<-e.Closed()
+		for name, ledger := range map[string]*LeafMobilityPeerLedger{"first": first, "second": second} {
+			ledger.mu.Lock()
+			refs := len(ledger.sessions)
+			ledger.mu.Unlock()
+			if refs != 0 {
+				t.Fatalf("iteration %d %s ledger retained %d sessions", iteration, name, refs)
+			}
+		}
+	}
+}
 
 func bridgeHandshakeEngine(t *testing.T) *Engine {
 	t.Helper()

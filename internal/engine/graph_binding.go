@@ -81,6 +81,8 @@ func (e *Engine) ConfigureLocalMobilityCapabilities(capabilities ...leafmobility
 // ConfigureLocalGraph freezes the graph used by this engine's sender. It must
 // run before a sequenced frame is allocated.
 func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManifest) error {
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
 	if revision == 0 {
 		return fmt.Errorf("engine: zero local graph revision")
 	}
@@ -91,6 +93,18 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 	plan, err := compileExecutionPlan(owned)
 	if err != nil {
 		return err
+	}
+	e.graphMu.RLock()
+	current := e.localGraph
+	e.graphMu.RUnlock()
+	if current.configured {
+		if current.revision == revision && current.digest == digest {
+			return nil
+		}
+		return fmt.Errorf("engine: local graph is already configured")
+	}
+	if e.hasPathPublication() {
+		return fmt.Errorf("engine: cannot configure local graph after path publication")
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
@@ -112,7 +126,7 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 		return fmt.Errorf("engine: local graph is already configured")
 	}
 	binding := graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
-	negotiation := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
+	negotiation := proto.NewNegotiation(proto.SessionEpoch(e.FlowID()))
 	negotiation.GraphRevision = revision
 	negotiation.GraphDigest = digest
 	negotiation.MobilitySupported = e.localMobilitySupport
@@ -121,20 +135,137 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 	e.localNegotiation = negotiation
 	e.localNegotiationSet = true
 	e.graphMu.Unlock()
-	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(e.flowID), senderDirection(e.side), revision, digest)
+	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(e.FlowID()), senderDirection(e.side), revision, digest)
 	e.sendAckProof = e.sendProof
+	return nil
+}
+
+// AdoptSessionEpoch replaces a client's provisional HELLO identity with the
+// final epoch selected by the server. It is deliberately a one-time pre-path
+// operation: changing identity after any peer, transport, replay, or payload
+// evidence exists would splice two logical sessions together.
+func (e *Engine) AdoptSessionEpoch(epoch [16]byte) error {
+	if e == nil {
+		return fmt.Errorf("engine: nil engine")
+	}
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
+	if e.side != SideClient {
+		return fmt.Errorf("engine: only a client may adopt a server session epoch")
+	}
+	if epoch == ([16]byte{}) {
+		return fmt.Errorf("engine: zero server session epoch")
+	}
+	if e.sessionEpochAdopted {
+		if e.flowID == epoch {
+			return nil
+		}
+		return fmt.Errorf("engine: server session epoch is already adopted")
+	}
+	if epoch == e.flowID {
+		return fmt.Errorf("engine: server session epoch was not reassigned")
+	}
+	if e.closing.Load() {
+		return fmt.Errorf("engine: cannot adopt session epoch after close")
+	}
+
+	e.pathsMu.RLock()
+	pathsPristine := len(e.paths) == 0 && len(e.pendingPaths) == 0 && len(e.stagedPaths) == 0 &&
+		len(e.retainedPaths) == 0 && e.nextPathID == 0 && e.nextPathGen == 0
+	e.pathsMu.RUnlock()
+	if !pathsPristine {
+		return fmt.Errorf("engine: cannot adopt session epoch after path publication")
+	}
+	e.attachMu.Lock()
+	attachPristine := len(e.seenAttach) == 0 && len(e.seenAttachFIFO) == 0
+	e.attachMu.Unlock()
+	if !attachPristine {
+		return fmt.Errorf("engine: cannot adopt session epoch after attach evidence")
+	}
+	e.identityMu.RLock()
+	peerIdentitySet := e.peerInstance != (proto.InstanceID{})
+	e.identityMu.RUnlock()
+	if peerIdentitySet {
+		return fmt.Errorf("engine: cannot adopt session epoch after peer identity")
+	}
+
+	e.leafTx.oobMu.Lock()
+	e.leafTx.mu.Lock()
+	leafPristine := e.leafTx.sessionLedger == nil && e.leafTx.outgoing == nil &&
+		len(e.leafTx.incoming) == 0 && len(e.leafTx.completed) == 0 &&
+		len(e.leafTx.rejected) == 0 && len(e.leafTx.actorTerminal) == 0 &&
+		len(e.leafTx.oobSeen) == 0 && e.leafTx.messageSeq.Load() == 0
+	e.leafTx.mu.Unlock()
+	e.leafTx.oobMu.Unlock()
+	if !leafPristine {
+		return fmt.Errorf("engine: cannot adopt session epoch after mobility evidence")
+	}
+
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	e.graphMu.Lock()
+	defer e.graphMu.Unlock()
+	if e.closing.Load() {
+		return fmt.Errorf("engine: cannot adopt session epoch after close")
+	}
+	if atomic.LoadUint64(&e.sendSeq) != 0 || e.sendPublishedNext.Load() != 0 ||
+		e.sendAckNext.Load() != 0 || len(e.sendHist.entries) != 0 {
+		return fmt.Errorf("engine: cannot adopt session epoch after send evidence")
+	}
+	if e.expectedRecvSeq != 0 || e.recvAckSent != 0 || len(e.recvQueue) != 0 ||
+		len(e.recvDeliver) != 0 || len(e.recvDeliverFrames) != 0 || e.recvPacketMarks != 0 ||
+		len(e.recvFrameProofs) != 0 || e.recvDroppedThrough != 0 || e.recvTerminal {
+		return fmt.Errorf("engine: cannot adopt session epoch after receive evidence")
+	}
+	if !e.localGraph.configured || !e.localNegotiationSet {
+		return fmt.Errorf("engine: local graph must be frozen before session epoch adoption")
+	}
+	if e.peerGraph.configured || e.peerNegotiationSet {
+		return fmt.Errorf("engine: cannot adopt session epoch after peer negotiation")
+	}
+
+	e.flowID = epoch
+	e.localNegotiation.SessionEpoch = proto.SessionEpoch(epoch)
+	e.sendProof = proto.InitialAckProof(proto.SessionEpoch(epoch), senderDirection(e.side), e.localGraph.revision, e.localGraph.digest)
+	e.sendAckProof = e.sendProof
+	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(epoch), peerSenderDirection(e.side), e.peerGraph.revision, e.peerGraph.digest)
+	flowSnapshot := epoch
+	e.flowIDValue.Store(&flowSnapshot)
+	e.sessionEpochAdopted = true
 	return nil
 }
 
 // ConfigurePeerGraph freezes the graph used by the peer's sender. It must run
 // before this engine accepts a sequenced frame.
 func (e *Engine) ConfigurePeerGraph(revision uint64, manifest proto.GraphManifest) error {
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
+	return e.configurePeerGraph(revision, manifest)
+}
+
+func (e *Engine) configurePeerGraph(revision uint64, manifest proto.GraphManifest) error {
 	if revision == 0 {
 		return fmt.Errorf("engine: zero peer graph revision")
 	}
 	owned, digest, err := ownGraphManifest(manifest)
 	if err != nil {
 		return fmt.Errorf("engine: invalid peer graph: %w", err)
+	}
+	e.graphMu.RLock()
+	current := e.peerGraph
+	e.graphMu.RUnlock()
+	if current.configured {
+		if current.revision == revision && current.digest == digest {
+			return nil
+		}
+		return fmt.Errorf("engine: peer graph is already configured")
+	}
+	if e.hasPathPublication() {
+		return fmt.Errorf("engine: cannot configure peer graph after path publication")
 	}
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
@@ -152,7 +283,7 @@ func (e *Engine) ConfigurePeerGraph(revision uint64, manifest proto.GraphManifes
 	}
 	e.peerGraph = graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
 	e.graphMu.Unlock()
-	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(e.flowID), peerSenderDirection(e.side), revision, digest)
+	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(e.FlowID()), peerSenderDirection(e.side), revision, digest)
 	return nil
 }
 
@@ -167,7 +298,7 @@ func (e *Engine) LocalNegotiation() proto.Negotiation {
 	binding := e.localGraph
 	supported := e.localMobilitySupport
 	e.graphMu.RUnlock()
-	n := proto.NewNegotiation(proto.SessionEpoch(e.flowID))
+	n := proto.NewNegotiation(proto.SessionEpoch(e.FlowID()))
 	n.GraphRevision = binding.revision
 	n.GraphDigest = binding.digest
 	n.MobilitySupported = supported
@@ -240,6 +371,9 @@ func (e *Engine) InferPathBinding(spec transport.PathSpec) (PathBinding, error) 
 	}
 	local := e.localGraphBinding()
 	peer := e.peerGraphBinding()
+	if local.configured != peer.configured {
+		return PathBinding{}, fmt.Errorf("engine: both directional graphs must be frozen before path publication")
+	}
 	if !local.configured && !peer.configured {
 		return PathBinding{}, nil
 	}
@@ -265,6 +399,10 @@ func (e *Engine) InferPathBinding(spec transport.PathSpec) (PathBinding, error) 
 
 func (e *Engine) validatePathBinding(binding PathBinding) error {
 	local := e.localGraphBinding()
+	peer := e.peerGraphBinding()
+	if local.configured != peer.configured {
+		return fmt.Errorf("engine: both directional graphs must be frozen before path publication")
+	}
 	if local.configured {
 		node, ok := local.manifest.Node(binding.LocalTXTargetID)
 		if !ok || node.Kind != proto.GraphNodeKindPath {
@@ -273,7 +411,6 @@ func (e *Engine) validatePathBinding(binding PathBinding) error {
 	} else if binding.LocalTXTargetID != (proto.TargetID{}) {
 		return fmt.Errorf("engine: local TX target supplied without a local graph")
 	}
-	peer := e.peerGraphBinding()
 	if peer.configured {
 		node, ok := peer.manifest.Node(binding.PeerTXTargetID)
 		if !ok || node.Kind != proto.GraphNodeKindPath {
@@ -285,13 +422,23 @@ func (e *Engine) validatePathBinding(binding PathBinding) error {
 	return nil
 }
 
+func (e *Engine) hasPathPublication() bool {
+	e.pathsMu.RLock()
+	published := len(e.paths) != 0 || len(e.pendingPaths) != 0 || len(e.stagedPaths) != 0 ||
+		len(e.retainedPaths) != 0 || e.nextPathID != 0 || e.nextPathGen != 0
+	e.pathsMu.RUnlock()
+	return published
+}
+
 // AcceptPeerNegotiation validates the peer's directional declaration and
 // freezes it before any path reader can publish sequenced frames.
 func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
-	if err := e.ValidatePeerNegotiation(peer, manifest); err != nil {
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
+	if err := e.validatePeerNegotiation(peer, manifest); err != nil {
 		return err
 	}
-	if err := e.ConfigurePeerGraph(peer.GraphRevision, manifest); err != nil {
+	if err := e.configurePeerGraph(peer.GraphRevision, manifest); err != nil {
 		return err
 	}
 	e.graphMu.Lock()
@@ -309,11 +456,17 @@ func (e *Engine) AcceptPeerNegotiation(peer proto.Negotiation, manifest proto.Gr
 // state. Once HELLO has frozen a peer, retries must be byte-semantically
 // identical even after DATA has started flowing.
 func (e *Engine) ValidatePeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
+	e.sessionEpochMu.Lock()
+	defer e.sessionEpochMu.Unlock()
+	return e.validatePeerNegotiation(peer, manifest)
+}
+
+func (e *Engine) validatePeerNegotiation(peer proto.Negotiation, manifest proto.GraphManifest) error {
 	local := e.LocalNegotiation()
 	if err := validateNegotiationCompatibility(local, peer); err != nil {
 		return err
 	}
-	if peer.SessionEpoch != proto.SessionEpoch(e.flowID) {
+	if peer.SessionEpoch != proto.SessionEpoch(e.FlowID()) {
 		return fmt.Errorf("engine: negotiation session epoch mismatch")
 	}
 	digest, err := manifest.Digest()

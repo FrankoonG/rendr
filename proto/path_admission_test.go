@@ -65,8 +65,8 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	if Version != 3 {
 		t.Fatalf("frame envelope version=%d want=3", Version)
 	}
-	if ProtocolMinor != 7 {
-		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
+	if ProtocolMinor != 10 {
+		t.Fatalf("protocol minor=%d want=10", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePathAdmissionTransaction == 0 || RequiredFeatures&FeaturePathAdmissionTransaction == 0 {
 		t.Fatal("path admission transaction feature is not mandatory")
@@ -79,6 +79,9 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	}
 	if SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not mandatory")
+	}
+	if SupportedFeatures&FeatureLeafMobilityTransaction == 0 || RequiredFeatures&FeatureLeafMobilityTransaction == 0 {
+		t.Fatal("leaf mobility transaction feature is not mandatory")
 	}
 	if PathAdmissionWireVersion != 1 {
 		t.Fatalf("path admission wire version=%d want=1", PathAdmissionWireVersion)

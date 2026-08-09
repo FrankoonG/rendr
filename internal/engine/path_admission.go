@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 )
 
@@ -13,12 +15,40 @@ type pathAdmissionLeafKey struct {
 	serverTX proto.TargetID
 }
 
+type pathAdmissionToken struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newPathAdmissionToken() *pathAdmissionToken {
+	return &pathAdmissionToken{done: make(chan struct{})}
+}
+
+func (t *pathAdmissionToken) complete() {
+	if t != nil {
+		t.once.Do(func() { close(t.done) })
+	}
+}
+
 type pathAdmissionReservation struct {
-	pathID   uint32
-	base     uint64
-	advanced bool
-	bound    bool
-	binding  proto.PathAdmissionBinding
+	pathID    uint32
+	base      uint64
+	advanced  bool
+	bound     bool
+	binding   proto.PathAdmissionBinding
+	deadline  time.Time
+	token     *pathAdmissionToken
+	resources *leafmobility.AdmissionReservation
+}
+
+func (r pathAdmissionReservation) release() {
+	r.resources.Release()
+	r.token.complete()
+}
+
+type pathAdmissionExpiry struct {
+	key      pathAdmissionLeafKey
+	token    *pathAdmissionToken
 	deadline time.Time
 }
 
@@ -147,20 +177,20 @@ func (e *Engine) beginPathAdmissionCommit(pathID uint32, binding proto.PathAdmis
 	return reservation.deadline, nil
 }
 
-func (e *Engine) ensurePathAdmissionDeadlineLocked(pathID uint32) time.Time {
+func (e *Engine) pathAdmissionExpiryLocked(pathID uint32) (pathAdmissionExpiry, bool) {
 	key, ok := e.pathAdmissionByPath[pathID]
 	if !ok {
-		return nowFn().Add(e.limits.MigrationBudget)
+		return pathAdmissionExpiry{}, false
 	}
 	reservation := e.pathAdmissionByLeaf[key]
-	if reservation.pathID != pathID {
-		return nowFn().Add(e.limits.MigrationBudget)
+	if reservation.pathID != pathID || reservation.token == nil {
+		return pathAdmissionExpiry{}, false
 	}
 	if reservation.deadline.IsZero() {
 		reservation.deadline = nowFn().Add(e.limits.MigrationBudget)
 		e.pathAdmissionByLeaf[key] = reservation
 	}
-	return reservation.deadline
+	return pathAdmissionExpiry{key: key, token: reservation.token, deadline: reservation.deadline}, true
 }
 
 func (e *Engine) pathAdmissionRouteLocked(binding proto.PathAdmissionBinding) (pathAdmissionLeafKey, pathAdmissionReservation, *pathSlot, bool) {
@@ -346,17 +376,21 @@ func pathAdmissionKey(side Side, binding PathBinding) (pathAdmissionLeafKey, boo
 	return pathAdmissionLeafKey{clientTX: binding.PeerTXTargetID, serverTX: binding.LocalTXTargetID}, true
 }
 
-func (e *Engine) reservePathAdmissionLocked(pathID uint32, binding PathBinding) error {
+func (e *Engine) reservePathAdmissionLocked(pathID uint32, binding PathBinding, resources *leafmobility.AdmissionReservation) error {
 	key, ok := pathAdmissionKey(e.side, binding)
 	if !ok {
+		resources.Release()
 		return nil
 	}
 	if _, exists := e.pathAdmissionByLeaf[key]; exists {
+		resources.Release()
 		return ErrPathAttachInProgress
 	}
 	e.pathAdmissionByLeaf[key] = pathAdmissionReservation{
-		pathID: pathID,
-		base:   e.pathLeafGeneration[key],
+		pathID:    pathID,
+		base:      e.pathLeafGeneration[key],
+		token:     newPathAdmissionToken(),
+		resources: resources,
 	}
 	e.pathAdmissionByPath[pathID] = key
 	return nil
@@ -414,10 +448,11 @@ func (e *Engine) advancePathAdmissionLocked(pathID uint32) (uint64, error) {
 	if e.pathLeafGeneration[key] != reservation.base {
 		return 0, fmt.Errorf("engine: admission generation changed: current=%d base=%d", e.pathLeafGeneration[key], reservation.base)
 	}
-	e.pathLeafGeneration[key] = reservation.base + 1
+	generation := reservation.base + 1
+	e.pathLeafGeneration[key] = generation
 	reservation.advanced = true
 	e.pathAdmissionByLeaf[key] = reservation
-	return reservation.base + 1, nil
+	return generation, nil
 }
 
 func (e *Engine) releasePathAdmissionLocked(pathID uint32) {
@@ -425,10 +460,25 @@ func (e *Engine) releasePathAdmissionLocked(pathID uint32) {
 	if !ok {
 		return
 	}
-	delete(e.pathAdmissionByPath, pathID)
-	if reservation := e.pathAdmissionByLeaf[key]; reservation.pathID == pathID {
-		delete(e.pathAdmissionByLeaf, key)
+	reservation, ok := e.pathAdmissionByLeaf[key]
+	if !ok || reservation.pathID != pathID {
+		delete(e.pathAdmissionByPath, pathID)
+		return
 	}
+	e.releasePathAdmissionTokenLocked(key, reservation.token)
+}
+
+func (e *Engine) releasePathAdmissionTokenLocked(key pathAdmissionLeafKey, token *pathAdmissionToken) bool {
+	reservation, ok := e.pathAdmissionByLeaf[key]
+	if !ok || reservation.token != token {
+		return false
+	}
+	if mappedKey, mapped := e.pathAdmissionByPath[reservation.pathID]; mapped && mappedKey == key {
+		delete(e.pathAdmissionByPath, reservation.pathID)
+	}
+	delete(e.pathAdmissionByLeaf, key)
+	reservation.release()
+	return true
 }
 
 // CompletePathAdmission releases the one-transaction-per-leaf reservation
@@ -489,15 +539,32 @@ func (e *Engine) completePathAdmissionBinding(binding proto.PathAdmissionBinding
 	return nil
 }
 
-func (e *Engine) completePathAdmissionGeneration(pathID uint32, generation uint64) {
+func (e *Engine) expirePathAdmission(expiry pathAdmissionExpiry) {
+	delay := time.Until(expiry.deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-expiry.token.done:
+		return
+	case <-e.closed:
+		return
+	}
+
 	e.pathsMu.Lock()
-	successor := e.paths[pathID]
-	if successor == nil || successor.gen != generation {
+	reservation, ok := e.pathAdmissionByLeaf[expiry.key]
+	if !ok || reservation.token != expiry.token {
 		e.pathsMu.Unlock()
 		return
 	}
-	retired := e.releasePathPredecessorsLocked(pathID, generation)
-	e.releasePathAdmissionLocked(pathID)
+	var retired []*pathSlot
+	if current := e.paths[reservation.pathID]; current != nil {
+		retired = e.releasePathPredecessorsLocked(current.id, current.gen)
+	}
+	e.releasePathAdmissionTokenLocked(expiry.key, expiry.token)
 	e.pathsMu.Unlock()
 	e.retirePathSet(retired)
 }

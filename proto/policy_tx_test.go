@@ -28,8 +28,8 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 7 {
-		t.Fatalf("protocol minor=%d want=7", ProtocolMinor)
+	if ProtocolMinor != 10 {
+		t.Fatalf("protocol minor=%d want=10", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
@@ -45,6 +45,9 @@ func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
 	}
 	if SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeatureLeafMobilityTransaction == 0 || RequiredFeatures&FeatureLeafMobilityTransaction == 0 {
+		t.Fatal("leaf mobility transaction feature is not required by negotiation")
 	}
 }
 
