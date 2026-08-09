@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -111,13 +112,17 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		return nil, errNoCompiledPath
 	}
 	resolver := d.snapshotFactoryResolver()
+	mobilityCapabilities, err := resolver.mobilityCapabilities(paths, leafmobility.SessionStream)
+	if err != nil {
+		return nil, err
+	}
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 	for index, spec := range paths {
 		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
 	instanceID := d.instanceID()
-	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, false)
+	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, false)
 	if err != nil {
 		return nil, err
 	}
@@ -187,13 +192,17 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		return nil, errNoCompiledPath
 	}
 	resolver := d.snapshotFactoryResolver()
+	mobilityCapabilities, err := resolver.mobilityCapabilities(paths, leafmobility.SessionPacket)
+	if err != nil {
+		return nil, err
+	}
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 	for index, spec := range paths {
 		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
 	}
 
 	instanceID := d.instanceID()
-	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, true)
+	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, true)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +326,7 @@ func (d *sessionDialer) dialInitialPath(
 	plan compiledTarget,
 	tracker *pathStatusTracker,
 	resolver *pathFactoryResolver,
+	mobilityCapabilities []leafmobility.Capability,
 	packetMode bool,
 ) (*engine.Engine, PathSpec, int, proto.HelloAckPayload, uint32, error) {
 	var lastErr error
@@ -334,6 +344,11 @@ func (d *sessionDialer) dialInitialPath(
 		}
 		e := engine.New(engine.SideClient, engine.NewClientFlowID(), d.engineLimits())
 		e.SetLeafMobilityPeerLedger(d.mobilityLedger)
+		if err := e.ConfigureLocalMobilityCapabilities(mobilityCapabilities...); err != nil {
+			_ = pc.Close()
+			_ = e.Close()
+			return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
+		}
 		if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
 			_ = pc.Close()
 			_ = e.Close()

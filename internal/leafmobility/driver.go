@@ -515,6 +515,22 @@ func CapabilityForDriver(driver Driver) (Capability, error) {
 	return Capability{operation: operation}, nil
 }
 
+// CapabilityForClaim derives session-level implementation evidence without
+// exposing the claim's driver. Generic or baseline claims return false; a
+// caller cannot manufacture capability by setting carrier metadata.
+func CapabilityForClaim(claim *Claim) (Capability, bool) {
+	state, driver := claim.stateWithDriver()
+	if driver == nil || !state.HasDriver || !state.Facts.Operations.single() {
+		return Capability{}, false
+	}
+	capability, err := CapabilityForDriver(driver)
+	if err != nil || capability.operation != state.Facts.Operations ||
+		operationForKind(state.Facts.Kind) != capability.operation {
+		return Capability{}, false
+	}
+	return capability, true
+}
+
 func (c Capability) Operation() Operation { return c.operation }
 
 type PlanRequest struct {
@@ -698,6 +714,9 @@ func PlanCandidate(ctx context.Context, claim *Claim, request PlanRequest) (Plan
 	operation := operationForKind(state.Facts.Kind)
 	if operation == 0 || !state.Facts.Operations.Has(operation) || driver == nil {
 		return finalizePlan(base, StageEndpoint, ReasonOperationNotQualified, false), nil
+	}
+	if !operation.SupportsSession(request.Session) {
+		return finalizePlan(base, StageSession, ReasonSessionMismatch, false), nil
 	}
 	if !request.LocalSupport.Has(operation) {
 		return finalizePlan(base, StagePlatform, ReasonLocalUnsupported, false), nil

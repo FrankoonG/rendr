@@ -17,18 +17,128 @@ import (
 )
 
 type leafMobilityEngineFixture struct {
-	client, server       *Engine
-	clientRef, serverRef PathRef
-	clientWire           *memoryPathConn
-	serverWire           *memoryPathConn
-	clientClaim          *leafmobility.Claim
-	serverClaim          *leafmobility.Claim
-	clientDriver         *enginePlanDriver
-	serverDriver         *enginePlanDriver
-	clientResource       leafmobility.Resource
-	serverResource       leafmobility.Resource
-	binding              PathBinding
-	ids                  map[string]proto.TargetID
+	client, server        *Engine
+	clientRef, serverRef  PathRef
+	clientWire            *memoryPathConn
+	serverWire            *memoryPathConn
+	clientClaim           *leafmobility.Claim
+	serverClaim           *leafmobility.Claim
+	clientDriver          *enginePlanDriver
+	serverDriver          *enginePlanDriver
+	clientExecutionDriver *authorityTestExecutionDriver
+	serverExecutionDriver *authorityTestExecutionDriver
+	clientResource        leafmobility.Resource
+	serverResource        leafmobility.Resource
+	binding               PathBinding
+	ids                   map[string]proto.TargetID
+}
+
+var errAuthorityTestFailClosedPending = errors.New("authority test fail-closed cleanup pending")
+
+type authorityTestIncarnationReporter struct{ value atomic.Uint64 }
+
+func newAuthorityTestIncarnationReporter() *authorityTestIncarnationReporter {
+	reporter := &authorityTestIncarnationReporter{}
+	reporter.value.Store(1)
+	return reporter
+}
+
+func (r *authorityTestIncarnationReporter) LeafMobilityIncarnation() uint64 {
+	return r.value.Load()
+}
+
+type authorityTestExecutionDriver struct {
+	base               *enginePlanDriver
+	reporter           *authorityTestIncarnationReporter
+	proveCommit        atomic.Bool
+	failClosedFailures atomic.Int32
+	failClosedCalls    atomic.Int32
+	failClosedEntered  chan struct{}
+	failClosedRelease  chan struct{}
+	failClosedOnce     sync.Once
+}
+
+func newAuthorityTestExecutionDriver(
+	base *enginePlanDriver,
+	reporter *authorityTestIncarnationReporter,
+) *authorityTestExecutionDriver {
+	driver := &authorityTestExecutionDriver{base: base, reporter: reporter}
+	driver.proveCommit.Store(true)
+	return driver
+}
+
+func (d *authorityTestExecutionDriver) Operation() leafmobility.Operation {
+	return d.base.Operation()
+}
+
+func (d *authorityTestExecutionDriver) Preflight(
+	ctx context.Context,
+	request leafmobility.PreflightRequest,
+) (leafmobility.DriverAttempt, leafmobility.PreflightResult, error) {
+	attempt, result, err := d.base.Preflight(ctx, request)
+	if err != nil || attempt == nil {
+		return attempt, result, err
+	}
+	return &authorityTestExecutionAttempt{driver: d, base: attempt}, result, nil
+}
+
+type authorityTestExecutionAttempt struct {
+	driver *authorityTestExecutionDriver
+	base   leafmobility.DriverAttempt
+}
+
+func (a *authorityTestExecutionAttempt) Evidence() leafmobility.AttemptEvidence {
+	return a.base.Evidence()
+}
+
+func (a *authorityTestExecutionAttempt) Prepare(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	return a.base.Prepare(ctx, request)
+}
+
+func (a *authorityTestExecutionAttempt) Cutover(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	return a.base.Cutover(ctx, request)
+}
+
+func (a *authorityTestExecutionAttempt) Commit(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	if err := a.base.Commit(ctx, request); err != nil {
+		return err
+	}
+	if a.driver.proveCommit.Load() {
+		a.driver.reporter.value.Add(1)
+	}
+	return nil
+}
+
+func (a *authorityTestExecutionAttempt) Rollback(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	return a.base.Rollback(ctx, request)
+}
+
+func (a *authorityTestExecutionAttempt) FailClosed(ctx context.Context, request leafmobility.ExecutionRequest) error {
+	a.driver.failClosedCalls.Add(1)
+	for {
+		remaining := a.driver.failClosedFailures.Load()
+		if remaining <= 0 {
+			break
+		}
+		if a.driver.failClosedFailures.CompareAndSwap(remaining, remaining-1) {
+			return errAuthorityTestFailClosedPending
+		}
+	}
+	if a.driver.failClosedEntered != nil {
+		a.driver.failClosedOnce.Do(func() { close(a.driver.failClosedEntered) })
+	}
+	if a.driver.failClosedRelease != nil {
+		select {
+		case <-a.driver.failClosedRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return a.base.FailClosed(ctx, request)
+}
+
+func (a *authorityTestExecutionAttempt) EndpointGenerationChanged() bool {
+	return a.base.EndpointGenerationChanged()
 }
 
 type blockPreparedAckPath struct {
@@ -361,6 +471,16 @@ func leafMobilityCommitStage(frame []byte) proto.LeafMobilityPeerPlanCommitStage
 	return commit.Stage
 }
 
+func assertNoLeafMobilityTerminalPublication(t testing.TB, capture *captureLeafOOBPath) {
+	t.Helper()
+	for _, frame := range capture.captured() {
+		switch stage := leafMobilityCommitStage(frame); stage {
+		case proto.LeafMobilityPeerPlanCommitStageComplete, proto.LeafMobilityPeerPlanCommitStageRolledBack:
+			t.Fatalf("unproven commit published terminal stage %d", stage)
+		}
+	}
+}
+
 func TestEngineLeafMobilityAuthorityRequiresRealPeerTransaction(t *testing.T) {
 	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
 	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xa1)
@@ -378,6 +498,11 @@ func TestEngineLeafMobilityAuthorityRequiresRealPeerTransaction(t *testing.T) {
 	if err := permit.Execute(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if permit.ExecutionState() != leafmobility.ExecutionCommitted ||
+		permit.State() != leafmobility.ResourceTransactionCompleted ||
+		fixture.clientExecutionDriver.reporter.value.Load() <= 1 {
+		t.Fatalf("proven commit state=(%d,%d) incarnation=%d", permit.ExecutionState(), permit.State(), fixture.clientExecutionDriver.reporter.value.Load())
+	}
 	if _, err := fixture.client.SendData([]byte("after-authority")); err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +510,176 @@ func TestEngineLeafMobilityAuthorityRequiresRealPeerTransaction(t *testing.T) {
 	n, err := fixture.server.Recv(buf)
 	if err != nil || string(buf[:n]) != "after-authority" {
 		t.Fatalf("post-transaction data=%q err=%v", buf[:n], err)
+	}
+}
+
+func TestEngineLeafMobilityUnprovenCommitFailsClosed(t *testing.T) {
+	t.Run("execute", func(t *testing.T) {
+		capture := &captureLeafOOBPath{}
+		fixture := newLeafMobilityEngineFixtureWithWrappers(
+			t, leafmobility.Resource{}, leafmobility.Resource{},
+			func(path *memoryPathConn) transport.PathConn {
+				capture.PathConn = path
+				return capture
+			}, nil,
+		)
+		fixture.clientExecutionDriver.proveCommit.Store(false)
+		fixture.clientExecutionDriver.failClosedFailures.Store(1)
+		fixture.clientExecutionDriver.failClosedEntered = make(chan struct{})
+		fixture.clientExecutionDriver.failClosedRelease = make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(fixture.clientExecutionDriver.failClosedRelease) }) }
+		t.Cleanup(release)
+
+		plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xd1)
+		authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		permit, err := authority.Consume()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Execute(context.Background()); !errors.Is(err, ErrLeafMobilityOutcomeUnknown) ||
+			!errors.Is(err, leafmobility.ErrIncarnationUnproven) {
+			t.Fatalf("Execute = %v, want unproven outcome-unknown", err)
+		}
+		if _, err := fixture.client.SendData([]byte("must-not-cross-unproven-commit")); err == nil {
+			t.Fatal("unproven commit left the application send path open")
+		}
+		select {
+		case <-fixture.clientExecutionDriver.failClosedEntered:
+		case <-time.After(time.Second):
+			t.Fatal("retryable fail-closed cleanup did not run")
+		}
+		if calls := fixture.clientDriver.rollbackCalls.Load(); calls != 0 {
+			t.Fatalf("unproven commit invoked Rollback %d time(s)", calls)
+		}
+		if permit.ExecutionState() != leafmobility.ExecutionFailClosedRequired ||
+			permit.State() != leafmobility.ResourceTransactionOutcomeUnknown {
+			t.Fatalf("unproven state=(%d,%d)", permit.ExecutionState(), permit.State())
+		}
+		permit.token.dispatchMu.Lock()
+		fencedSlot := permit.token.dispatchSlot
+		fenced := permit.token.dispatchFenced
+		permit.token.dispatchMu.Unlock()
+		if !fenced || fencedSlot == nil || fencedSlot.txEnabled.Load() {
+			t.Fatalf("unproven commit released DATA fence before cleanup: fenced=%v slot=%p tx=%v",
+				fenced, fencedSlot, fencedSlot != nil && fencedSlot.txEnabled.Load())
+		}
+		assertNoLeafMobilityTerminalPublication(t, capture)
+
+		retired := make(chan error, 1)
+		go func() { retired <- fixture.clientClaim.Retire(plan.Binding) }()
+		select {
+		case err := <-retired:
+			t.Fatalf("cleanup retry released claim ownership: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+		release()
+		select {
+		case err := <-retired:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cleanup proof did not release claim ownership")
+		}
+		eventuallyEngine(t, time.Second, func() bool {
+			return permit.ExecutionState() == leafmobility.ExecutionFailedClosed &&
+				fixture.clientExecutionDriver.failClosedCalls.Load() >= 2
+		})
+		assertNoLeafMobilityTerminalPublication(t, capture)
+	})
+
+	t.Run("watchdog", func(t *testing.T) {
+		capture := &captureLeafOOBPath{}
+		fixture := newLeafMobilityEngineFixtureWithWrappers(
+			t, leafmobility.Resource{}, leafmobility.Resource{},
+			func(path *memoryPathConn) transport.PathConn {
+				capture.PathConn = path
+				return capture
+			}, nil,
+		)
+		fixture.client.limits.MigrationBudget = 300 * time.Millisecond
+		fixture.clientExecutionDriver.proveCommit.Store(false)
+		fixture.clientExecutionDriver.failClosedEntered = make(chan struct{})
+		fixture.clientExecutionDriver.failClosedRelease = make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(fixture.clientExecutionDriver.failClosedRelease) }) }
+		t.Cleanup(release)
+
+		plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xd2)
+		authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		permit, err := authority.Consume()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.Cutover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := permit.CommitDriver(context.Background()); !errors.Is(err, leafmobility.ErrIncarnationUnproven) {
+			t.Fatalf("CommitDriver = %v, want incarnation proof failure", err)
+		}
+		select {
+		case <-fixture.clientExecutionDriver.failClosedEntered:
+		case <-time.After(time.Second):
+			t.Fatal("watchdog did not start fail-closed cleanup")
+		}
+		if fixture.clientDriver.rollbackCalls.Load() != 0 ||
+			permit.State() != leafmobility.ResourceTransactionOutcomeUnknown {
+			t.Fatalf("watchdog rollback/state=%d/%d", fixture.clientDriver.rollbackCalls.Load(), permit.State())
+		}
+		assertNoLeafMobilityTerminalPublication(t, capture)
+		release()
+		eventuallyEngine(t, time.Second, func() bool {
+			return permit.ExecutionState() == leafmobility.ExecutionFailedClosed
+		})
+		assertNoLeafMobilityTerminalPublication(t, capture)
+	})
+}
+
+func TestEngineFailClosedCleanupBacksOffWithoutFalseQuiescence(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientExecutionDriver.proveCommit.Store(false)
+	fixture.clientExecutionDriver.failClosedFailures.Store(1 << 30)
+
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe3)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Execute(context.Background()); !errors.Is(err, ErrLeafMobilityOutcomeUnknown) {
+		t.Fatalf("Execute = %v, want outcome unknown", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if calls := fixture.clientExecutionDriver.failClosedCalls.Load(); calls < 2 || calls > 6 {
+		t.Fatalf("fail-closed calls after backoff window=%d, want [2,6]", calls)
+	}
+	select {
+	case <-fixture.client.Closed():
+		t.Fatal("engine reported quiescence while cleanup ownership was unresolved")
+	default:
+	}
+
+	fixture.clientExecutionDriver.failClosedFailures.Store(0)
+	select {
+	case <-fixture.client.Closed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine did not quiesce after fail-closed cleanup recovered")
+	}
+	if permit.ExecutionState() != leafmobility.ExecutionFailedClosed {
+		t.Fatalf("execution state=%d want failed-closed", permit.ExecutionState())
 	}
 }
 
@@ -1729,6 +2024,64 @@ func TestEngineCloseCancelsPreparedDriverLease(t *testing.T) {
 	}
 }
 
+func TestEngineCloseCancelsBlockedCommitBeforeFenceRelease(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientDriver.commitEntered = make(chan struct{})
+	fixture.clientDriver.commitRelease = make(chan struct{})
+
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe2)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- permit.CommitDriver(context.Background()) }()
+	select {
+	case <-fixture.clientDriver.commitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("driver Commit did not block")
+	}
+
+	permit.token.dispatchMu.Lock()
+	fencedSlot := permit.token.dispatchSlot
+	fenced := permit.token.dispatchFenced
+	permit.token.dispatchMu.Unlock()
+	if !fenced || fencedSlot == nil || fencedSlot.txEnabled.Load() {
+		t.Fatal("blocked Commit did not retain DATA fence")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- fixture.client.Close() }()
+	select {
+	case err := <-commitDone:
+		if err == nil {
+			t.Fatal("blocked Commit succeeded after Engine.Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Close did not cancel blocked Commit")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Engine.Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Close did not quiesce after canceled Commit")
+	}
+	if fixture.clientDriver.rollbackCalls.Load() == 0 {
+		t.Fatal("canceled Commit did not run local rollback cleanup")
+	}
+}
+
 func TestEngineCloseInvalidatesClaimAcrossValidationToDriverGap(t *testing.T) {
 	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
 	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc8)
@@ -2832,19 +3185,21 @@ func newLeafMobilityEngineFixtureWithWrappers(
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 	clientDriver := &enginePlanDriver{operation: leafmobility.OperationTCPRepair, evidence: leafmobility.EvidenceDigest{0xc1}}
 	serverDriver := &enginePlanDriver{operation: leafmobility.OperationTCPRepair, evidence: leafmobility.EvidenceDigest{0xc2}}
-	clientClaim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
+	clientExecutionDriver := newAuthorityTestExecutionDriver(clientDriver, newAuthorityTestIncarnationReporter())
+	serverExecutionDriver := newAuthorityTestExecutionDriver(serverDriver, newAuthorityTestIncarnationReporter())
+	clientClaim := leafmobility.MustNewDrivenClaimWithIncarnation(leafmobility.Facts{
 		Kind: leafmobility.KindRawTCP, Role: leafmobility.RoleDialer,
 		Session: leafmobility.SessionStream, Generation: leafmobility.NextGeneration(),
-	}, clientDriver, clientResource)
-	serverClaim := leafmobility.MustNewDrivenClaim(leafmobility.Facts{
+	}, clientExecutionDriver, clientResource, clientExecutionDriver.reporter)
+	serverClaim := leafmobility.MustNewDrivenClaimWithIncarnation(leafmobility.Facts{
 		Kind: leafmobility.KindRawTCP, Role: leafmobility.RoleAcceptor,
 		Session: leafmobility.SessionStream, Generation: leafmobility.NextGeneration(),
-	}, serverDriver, serverResource)
+	}, serverExecutionDriver, serverResource, serverExecutionDriver.reporter)
 	for _, configured := range []struct {
 		engine *Engine
 		driver leafmobility.Driver
 	}{
-		{client, clientDriver}, {server, serverDriver},
+		{client, clientExecutionDriver}, {server, serverExecutionDriver},
 	} {
 		if err := configured.engine.ConfigureLocalMobilityCapabilities(mustEngineCapability(t, configured.driver)); err != nil {
 			t.Fatal(err)
@@ -2887,6 +3242,7 @@ func newLeafMobilityEngineFixtureWithWrappers(
 		clientWire: clientPath, serverWire: serverBase,
 		clientClaim: clientClaim, serverClaim: serverClaim,
 		clientDriver: clientDriver, serverDriver: serverDriver,
+		clientExecutionDriver: clientExecutionDriver, serverExecutionDriver: serverExecutionDriver,
 		clientResource: clientResource, serverResource: serverResource,
 		binding: binding, ids: ids,
 	}

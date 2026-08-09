@@ -16,6 +16,8 @@ import (
 const (
 	leafMobilityRetryInterval             = 200 * time.Millisecond
 	leafMobilityExecutionWatchdogInterval = 10 * time.Millisecond
+	leafMobilityExecutionCleanupMaxDelay  = 5 * time.Second
+	leafMobilityFailClosedStepTimeout     = 5 * time.Second
 	leafMobilityRecordLimit               = sendHistoryWindow + sendControlReserve
 	leafMobilityOOBRecordLimit            = leafMobilityRecordLimit * 6
 )
@@ -250,6 +252,10 @@ type leafMobilityAuthorityToken struct {
 	execution        *leafmobility.Execution
 	done             chan struct{}
 	once             sync.Once
+	dispatchMu       sync.Mutex
+	dispatchSlot     *pathSlot
+	dispatchFenced   bool
+	localCleanupOnce sync.Once
 }
 
 type LeafMobilityPermit struct {
@@ -357,6 +363,9 @@ func (p *LeafMobilityPermit) watchExecutionTerminal() {
 		switch p.execution.State() {
 		case leafmobility.ExecutionCommitted:
 			err = p.Complete(cleanupCtx)
+		case leafmobility.ExecutionFailClosedRequired:
+			_ = p.failClosedAfterUnprovenCommit(leafmobility.ErrIncarnationUnproven)
+			return
 		case leafmobility.ExecutionAuthorized, leafmobility.ExecutionPrepared,
 			leafmobility.ExecutionCutover, leafmobility.ExecutionRollbackRequired,
 			leafmobility.ExecutionRolledBack:
@@ -388,30 +397,73 @@ func (p *LeafMobilityPermit) watchExecutionTerminal() {
 }
 
 func (p *LeafMobilityPermit) forceLocalExecutionClosed() {
-	if p == nil || p.execution == nil {
+	if p == nil || p.token == nil || p.execution == nil {
 		return
 	}
+	p.token.localCleanupOnce.Do(func() { p.forceLocalExecutionClosedOnce() })
+}
+
+func (p *LeafMobilityPermit) forceLocalExecutionClosedOnce() {
 	p.execution.CancelForward()
+	retryDelay := leafMobilityExecutionWatchdogInterval
 	for {
 		switch p.execution.State() {
 		case leafmobility.ExecutionCommitted:
 			_ = p.execution.FinalizeCommitted()
+			p.token.releaseExecutionDispatch()
 			return
 		case leafmobility.ExecutionRolledBack:
 			_ = p.execution.FinalizeRolledBack()
+			p.token.releaseExecutionDispatch()
 			return
 		case leafmobility.ExecutionFailedClosed, leafmobility.ExecutionInvalid:
+			p.token.releaseExecutionDispatch()
 			return
 		}
 		if err := p.execution.Rollback(context.Background()); err == nil {
 			_ = p.execution.FinalizeRolledBack()
+			p.token.releaseExecutionDispatch()
 			return
 		} else if !errors.Is(err, leafmobility.ErrExecutionBusy) {
-			_ = p.execution.FailClosed()
-			return
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), leafMobilityFailClosedStepTimeout)
+			cleanupErr := p.execution.FailClosed(cleanupCtx)
+			cancel()
+			if cleanupErr == nil {
+				p.token.releaseExecutionDispatch()
+				return
+			}
 		}
-		time.Sleep(leafMobilityExecutionWatchdogInterval)
+		time.Sleep(retryDelay)
+		if retryDelay < leafMobilityExecutionCleanupMaxDelay {
+			retryDelay *= 2
+			if retryDelay > leafMobilityExecutionCleanupMaxDelay {
+				retryDelay = leafMobilityExecutionCleanupMaxDelay
+			}
+		}
 	}
+}
+
+func (p *LeafMobilityPermit) startLocalExecutionCleanup() {
+	if p == nil || p.token == nil || p.token.engine == nil || p.execution == nil {
+		return
+	}
+	cleanup := func() { p.forceLocalExecutionClosed() }
+	if !p.token.engine.startLeafMobilityAsync(cleanup) {
+		go cleanup()
+	}
+}
+
+func (p *LeafMobilityPermit) failClosedAfterUnprovenCommit(cause error) error {
+	if p == nil || p.token == nil || p.token.engine == nil || p.execution == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	terminalErr := fmt.Errorf("%w: irreversible driver commit is unproven: %w", ErrLeafMobilityOutcomeUnknown, cause)
+	p.token.engine.sendClosing.Store(true)
+	p.token.engine.setCloseErr(terminalErr)
+	p.token.outcomeUnknownSerialized(terminalErr)
+	p.startLocalExecutionCleanup()
+	go p.token.engine.Close()
+	return terminalErr
 }
 
 // Rollback resolves an authority that was never consumed by a destructive
@@ -445,10 +497,49 @@ func (p *LeafMobilityPermit) Prepare(ctx context.Context) error {
 	if err := p.validateExecutionSource(); err != nil {
 		return err
 	}
+	if err := p.token.fenceExecutionDispatch(); err != nil {
+		return err
+	}
 	if err := p.execution.Prepare(ctx); err != nil {
 		return err
 	}
 	return p.validateExecutionSource()
+}
+
+func (t *leafMobilityAuthorityToken) fenceExecutionDispatch() error {
+	if t == nil || t.outgoing == nil || t.outgoing.sourceSlot == nil {
+		return leafmobility.ErrAuthorityStale
+	}
+	t.dispatchMu.Lock()
+	defer t.dispatchMu.Unlock()
+	if t.dispatchFenced {
+		return nil
+	}
+	slot := t.outgoing.sourceSlot
+	if slot.id != t.outgoing.source.ID || slot.owner != t.outgoing.source.Owner || !slot.tryFenceDispatch() {
+		return ErrPathTXFenced
+	}
+	t.dispatchSlot = slot
+	t.dispatchFenced = true
+	return nil
+}
+
+func (t *leafMobilityAuthorityToken) releaseExecutionDispatch() {
+	if t == nil {
+		return
+	}
+	t.dispatchMu.Lock()
+	if !t.dispatchFenced {
+		t.dispatchMu.Unlock()
+		return
+	}
+	slot := t.dispatchSlot
+	t.dispatchSlot = nil
+	t.dispatchFenced = false
+	t.dispatchMu.Unlock()
+	if slot != nil {
+		slot.unfenceDispatch()
+	}
 }
 
 func (p *LeafMobilityPermit) Cutover(ctx context.Context) error {
@@ -521,12 +612,18 @@ func (p *LeafMobilityPermit) Execute(ctx context.Context) error {
 		return p.rollbackAfterFailure(ctx, err)
 	}
 	if err := p.CommitDriver(ctx); err != nil {
+		if p.execution.State() == leafmobility.ExecutionFailClosedRequired {
+			return p.failClosedAfterUnprovenCommit(err)
+		}
 		return p.rollbackAfterFailure(ctx, err)
 	}
 	return p.Complete(ctx)
 }
 
 func (p *LeafMobilityPermit) rollbackAfterFailure(ctx context.Context, cause error) error {
+	if p != nil && p.execution != nil && p.execution.State() == leafmobility.ExecutionFailClosedRequired {
+		return p.failClosedAfterUnprovenCommit(cause)
+	}
 	cleanupParent := context.Background()
 	if ctx != nil {
 		cleanupParent = context.WithoutCancel(ctx)
@@ -988,6 +1085,7 @@ func (t *leafMobilityAuthorityToken) finish() {
 	t.once.Do(func() {
 		t.stopExpiry()
 		t.releaseTerminalExecution()
+		t.releaseExecutionDispatch()
 		close(t.done)
 		t.engine.finishOutgoingLeafMobility(t.outgoing)
 	})
@@ -1001,9 +1099,25 @@ func (t *leafMobilityAuthorityToken) outcomeUnknown(cause error) {
 		t.stopExpiry()
 		_ = t.outgoing.resourceTx.MarkOutcomeUnknown()
 		t.releaseTerminalExecution()
+		if t.executionAllowsOutcomeUnknownDispatchRelease() {
+			t.releaseExecutionDispatch()
+		}
 		close(t.done)
 		t.engine.finishOutgoingLeafMobility(t.outgoing)
 	})
+}
+
+func (t *leafMobilityAuthorityToken) executionAllowsOutcomeUnknownDispatchRelease() bool {
+	if t == nil || t.execution == nil {
+		return true
+	}
+	switch t.execution.State() {
+	case leafmobility.ExecutionCommitted, leafmobility.ExecutionRolledBack,
+		leafmobility.ExecutionFailedClosed, leafmobility.ExecutionInvalid:
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *leafMobilityAuthorityToken) releaseTerminalExecution() {

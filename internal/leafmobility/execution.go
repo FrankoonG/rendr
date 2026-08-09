@@ -22,6 +22,11 @@ const (
 	ExecutionCutover
 	ExecutionCommitted
 	ExecutionRollbackRequired
+	// ExecutionFailClosedRequired means Commit returned nil, but the Claim's
+	// physical endpoint reporter did not prove a new incarnation. Commit may
+	// already be irreversible, so rollback is forbidden and only destructive
+	// fail-closed cleanup can release the execution lease.
+	ExecutionFailClosedRequired
 	ExecutionRolledBack
 	ExecutionFailedClosed
 )
@@ -69,6 +74,16 @@ type DriverAttempt interface {
 	Cutover(context.Context, ExecutionRequest) error
 	Commit(context.Context, ExecutionRequest) error
 	Rollback(context.Context, ExecutionRequest) error
+	// FailClosed terminates every driver-owned endpoint and removes every
+	// destructive side effect. It is idempotent and retryable beyond the
+	// bilateral plan deadline; protocol expiry never transfers cleanup
+	// ownership away from the attempt.
+	FailClosed(context.Context, ExecutionRequest) error
+	// EndpointGenerationChanged is sampled only after a successful Rollback.
+	// Commit always creates a new generation. A rollback reports true when it
+	// had to reconstruct or rebind the physical endpoint instead of resuming
+	// the original incarnation.
+	EndpointGenerationChanged() bool
 }
 
 func readAttemptEvidence(attempt DriverAttempt) (evidence AttemptEvidence, err error) {
@@ -91,18 +106,20 @@ type Execution struct {
 }
 
 type executionToken struct {
-	mu              sync.Mutex
-	request         ExecutionRequest
-	attempt         DriverAttempt
-	claim           *Claim
-	issuer          *authorityIssuerToken
-	transaction     *resourceTransactionToken
-	deadline        time.Time
-	forwardDeadline time.Time
-	state           ExecutionState
-	busy            bool
-	leaseHeld       bool
-	stageCancel     context.CancelFunc
+	mu                 sync.Mutex
+	request            ExecutionRequest
+	attempt            DriverAttempt
+	claim              *Claim
+	issuer             *authorityIssuerToken
+	transaction        *resourceTransactionToken
+	deadline           time.Time
+	forwardDeadline    time.Time
+	state              ExecutionState
+	busy               bool
+	leaseHeld          bool
+	incarnationBefore  uint64
+	incarnationTracked bool
+	stageCancel        context.CancelFunc
 }
 
 func newExecution(
@@ -116,9 +133,11 @@ func newExecution(
 	if request.Plan.attempt != nil && !request.Plan.attempt.deadline.IsZero() {
 		deadline = request.Plan.attempt.deadline
 	}
+	incarnationBefore, incarnationTracked := claim.endpointIncarnation()
 	return &Execution{token: &executionToken{
 		attempt: attempt, request: request, claim: claim, issuer: issuer, transaction: token,
 		deadline: deadline, forwardDeadline: executionForwardDeadline(deadline), state: ExecutionAuthorized,
+		incarnationBefore: incarnationBefore, incarnationTracked: incarnationTracked,
 	}}
 }
 
@@ -305,6 +324,15 @@ func (e *Execution) runForwardStep(
 	// Cancellation or topology changes observed afterward cannot make a
 	// committed endpoint rollback-capable again.
 	if err == nil && next == ExecutionCommitted {
+		after, proven := token.claim.endpointIncarnation()
+		if !token.incarnationTracked || !proven || after == token.incarnationBefore {
+			token.mu.Lock()
+			token.busy = false
+			token.state = ExecutionFailClosedRequired
+			token.mu.Unlock()
+			return fmt.Errorf("%w: commit: %w", ErrExecutionDriver, ErrIncarnationUnproven)
+		}
+		token.claim.advanceEndpointGeneration()
 		token.mu.Lock()
 		token.busy = false
 		token.state = ExecutionCommitted
@@ -444,7 +472,7 @@ func (e *Execution) Rollback(ctx context.Context) error {
 			token.mu.Unlock()
 			return ErrExecutionState
 		}
-	case ExecutionCommitted, ExecutionFailedClosed, ExecutionInvalid:
+	case ExecutionCommitted, ExecutionFailClosedRequired, ExecutionFailedClosed, ExecutionInvalid:
 		token.mu.Unlock()
 		return ErrExecutionState
 	default:
@@ -452,9 +480,8 @@ func (e *Execution) Rollback(ctx context.Context) error {
 		return ErrExecutionState
 	}
 	if !token.deadline.After(time.Now()) {
-		token.state = ExecutionFailedClosed
+		token.state = ExecutionRollbackRequired
 		token.mu.Unlock()
-		e.releaseLease()
 		return ErrPlanExpired
 	}
 	token.busy = true
@@ -467,10 +494,26 @@ func (e *Execution) Rollback(ctx context.Context) error {
 		rollbackParent = context.WithoutCancel(ctx)
 	}
 	rollbackCtx, cancel := context.WithDeadline(rollbackParent, token.deadline)
+	generationChanged := false
 	err := invokeDriverStep("rollback", ContextDigest{}, ProbeReference{}, false, false, func() error {
-		return attempt.Rollback(rollbackCtx, request)
+		if err := attempt.Rollback(rollbackCtx, request); err != nil {
+			return err
+		}
+		if token.incarnationTracked {
+			after, ok := token.claim.endpointIncarnation()
+			if !ok {
+				return ErrIncarnationUnproven
+			}
+			generationChanged = after != token.incarnationBefore
+		} else {
+			generationChanged = attempt.EndpointGenerationChanged()
+		}
+		return nil
 	})
 	cancel()
+	if err == nil && generationChanged {
+		token.claim.advanceEndpointGeneration()
+	}
 	token.mu.Lock()
 	token.busy = false
 	if err == nil {
@@ -501,12 +544,15 @@ func (e *Execution) FinalizeRolledBack() error {
 	return nil
 }
 
-// FailClosed releases endpoint ownership after the engine has exhausted its
-// immutable cleanup budget or is itself closing. It never claims rollback
-// success and cannot cross a driver method that is still running.
-func (e *Execution) FailClosed() error {
+// FailClosed asks the driver to terminate all endpoint and quarantine state
+// after rollback can no longer be claimed. Cleanup remains retryable and the
+// Claim lease remains held until the driver proves completion.
+func (e *Execution) FailClosed(ctx context.Context) error {
 	if e == nil || e.token == nil {
 		return ErrExecutionState
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	token := e.token
 	token.mu.Lock()
@@ -515,8 +561,16 @@ func (e *Execution) FailClosed() error {
 		return ErrExecutionBusy
 	}
 	switch token.state {
-	case ExecutionAuthorized, ExecutionPrepared, ExecutionCutover, ExecutionRollbackRequired:
+	case ExecutionAuthorized:
 		token.state = ExecutionFailedClosed
+		token.mu.Unlock()
+		e.releaseLease()
+		return nil
+	case ExecutionPrepared, ExecutionCutover, ExecutionRollbackRequired, ExecutionFailClosedRequired:
+		if interfaceIsNil(token.attempt) {
+			token.mu.Unlock()
+			return ErrExecutionState
+		}
 	case ExecutionFailedClosed:
 		token.mu.Unlock()
 		return nil
@@ -524,7 +578,29 @@ func (e *Execution) FailClosed() error {
 		token.mu.Unlock()
 		return ErrExecutionState
 	}
+	token.busy = true
+	attempt := token.attempt
+	request := token.request
 	token.mu.Unlock()
+
+	err := invokeDriverStep("fail-closed", ContextDigest{}, ProbeReference{}, false, false, func() error {
+		return attempt.FailClosed(ctx, request)
+	})
+	token.mu.Lock()
+	token.busy = false
+	if err == nil {
+		token.state = ExecutionFailedClosed
+	} else if token.state == ExecutionFailClosedRequired {
+		// An unproven nil Commit remains beyond the rollback boundary even when
+		// cleanup needs another attempt.
+		token.state = ExecutionFailClosedRequired
+	} else {
+		token.state = ExecutionRollbackRequired
+	}
+	token.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	e.releaseLease()
 	return nil
 }

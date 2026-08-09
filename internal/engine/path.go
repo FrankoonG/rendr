@@ -33,8 +33,14 @@ type pathDeparture struct {
 	explicitRemoval bool
 	shouldReplay    bool
 	migrated        bool
+	zombieTrip      zombieTripTicket
 	newActive       uint32
 	hasPaths        bool
+}
+
+type zombieTripTicket struct {
+	generation uint64
+	valid      bool
 }
 
 // unwindFencedPathsLocked either makes a still-live predecessor dispatchable
@@ -239,6 +245,9 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 		} else {
 			migratedOk = true
 			e.migrationCount++
+			if !explicitRemoval && (cause == transport.CauseTransportError || cause == transport.CauseUnknown) {
+				departure.zombieTrip = e.accountMigration()
+			}
 		}
 	}
 	departure.migrated = migratedOk
@@ -293,11 +302,9 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 		if departure.shouldReplay {
 			e.requestReplay(e.sendAckNext.Load())
 		}
-		// Successful death-driven migration counts for zombie
-		// accounting. Without a fresh path, fall through to budget.
-		if departure.migrated {
-			e.recordMigration()
-		}
+		// Accounting committed with the replacement topology. Only the
+		// resulting close is deferred until after pathsMu is released.
+		e.tripZombie(departure.zombieTrip)
 		if !departure.hasPaths {
 			go e.startMigrationBudget(departure.err)
 		}
@@ -326,31 +333,56 @@ func (e *Engine) drainDeadSlot(slot *pathSlot) {
 	}
 }
 
-// recordMigration decrements the zombie counter and triggers
-// zombie protection when it hits zero. Cooldown semantics: if the
-// gap since the last migration exceeds ZombieCooldown, the counter
-// is refreshed to ZombieMaxMigrations before being decremented;
-// this prevents long-lived connections with infrequent but legit
-// migrations from accumulating into zombie territory.
+// accountMigration decrements the zombie counter and reports whether zombie
+// protection should trip. Callers hold pathsMu so this bookkeeping commits
+// atomically with publication of the replacement active path. It never closes
+// the engine.
 //
-// Must NOT be called with pathsMu held: the zombie close path
-// goes through Engine.Close which itself takes pathsMu.
-func (e *Engine) recordMigration() {
+// Cooldown semantics: if the gap since the last migration exceeds
+// ZombieCooldown, refresh the counter before decrementing. This prevents
+// infrequent legitimate migrations from accumulating into zombie territory.
+func (e *Engine) accountMigration() zombieTripTicket {
 	e.zombieMu.Lock()
-	if !e.zombieLastMig.IsZero() && nowFn().Sub(e.zombieLastMig) > e.limits.ZombieCooldown {
+	defer e.zombieMu.Unlock()
+	now := nowFn()
+	if !e.zombieLastMig.IsZero() && now.Sub(e.zombieLastMig) > e.limits.ZombieCooldown {
 		e.zombieLeft = e.limits.ZombieMaxMigrations
 	}
 	e.zombieLeft--
-	e.zombieLastMig = nowFn()
-	trip := e.zombieLeft <= 0
-	e.zombieMu.Unlock()
-
-	if trip {
-		go func() {
-			e.setCloseErr(ErrZombie)
-			_ = e.Close()
-		}()
+	e.zombieLastMig = now
+	e.zombieGeneration++
+	return zombieTripTicket{
+		generation: e.zombieGeneration,
+		valid:      e.zombieLeft <= 0,
 	}
+}
+
+// tripZombie performs the destructive half of zombie handling. Callers invoke
+// it only after releasing pathsMu because Engine.Close takes pathsMu itself.
+// A successful generation check and ticket consumption under zombieMu is the
+// linearization point: payload credited before it invalidates the ticket;
+// payload after it observes a close that has already committed.
+func (e *Engine) tripZombie(ticket zombieTripTicket) bool {
+	if !ticket.valid {
+		return false
+	}
+	if hook := e.zombieBeforeTrip; hook != nil {
+		hook()
+	}
+	e.zombieMu.Lock()
+	if ticket.generation != e.zombieGeneration || e.zombieLeft > 0 {
+		e.zombieMu.Unlock()
+		return false
+	}
+	// Consume the exact decision before deferring teardown. The generation
+	// bump makes duplicate calls with this ticket stale.
+	e.zombieGeneration++
+	e.zombieMu.Unlock()
+	go func() {
+		e.setCloseErr(ErrZombie)
+		_ = e.Close()
+	}()
+	return true
 }
 
 // pickAnyActive returns any remaining path id, or 0 if none.

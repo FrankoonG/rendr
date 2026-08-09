@@ -63,6 +63,25 @@ func (o Operation) Has(requested Operation) bool {
 	return requested != 0 && o&requested == requested
 }
 
+// SupportsSession reports whether one specialized operation can preserve the
+// requested application contract. SessionAny is ownership metadata, not a
+// negotiable wire session, and is therefore never accepted here.
+func (o Operation) SupportsSession(session Session) bool {
+	if !o.single() {
+		return false
+	}
+	switch o {
+	case OperationTCPRepair, OperationGVisorLinkRebind:
+		return session == SessionStream
+	case OperationUDPFlowRebind:
+		return session == SessionPacket
+	case OperationQUICCIDRebind:
+		return session == SessionStream || session == SessionPacket
+	default:
+		return false
+	}
+}
+
 type ResourceID [16]byte
 
 // Facts is an immutable-by-convention ownership snapshot.
@@ -86,14 +105,15 @@ type Binding struct {
 }
 
 var (
-	ErrInvalidFacts    = errors.New("leafmobility: invalid facts")
-	ErrInvalidBinding  = errors.New("leafmobility: invalid binding")
-	ErrAlreadyBound    = errors.New("leafmobility: claim already bound")
-	ErrNotBound        = errors.New("leafmobility: claim is not bound")
-	ErrBindingMismatch = errors.New("leafmobility: binding mismatch")
-	ErrRetired         = errors.New("leafmobility: claim is retired")
-	ErrDriverRequired  = errors.New("leafmobility: specialized operation requires a driver")
-	ErrInvalidDriver   = errors.New("leafmobility: invalid driver")
+	ErrInvalidFacts        = errors.New("leafmobility: invalid facts")
+	ErrInvalidBinding      = errors.New("leafmobility: invalid binding")
+	ErrAlreadyBound        = errors.New("leafmobility: claim already bound")
+	ErrNotBound            = errors.New("leafmobility: claim is not bound")
+	ErrBindingMismatch     = errors.New("leafmobility: binding mismatch")
+	ErrRetired             = errors.New("leafmobility: claim is retired")
+	ErrDriverRequired      = errors.New("leafmobility: specialized operation requires a driver")
+	ErrInvalidDriver       = errors.New("leafmobility: invalid driver")
+	ErrIncarnationUnproven = errors.New("leafmobility: physical endpoint incarnation was not proven")
 )
 
 var generationCounter atomic.Uint64
@@ -114,13 +134,21 @@ type Provider interface {
 	LeafMobilityClaim() *Claim
 }
 
+// IncarnationReporter is held by a driven Claim, not by one attempt. It lets
+// execution compare the physical endpoint owner before and after a driver
+// transition instead of trusting driver-local bookkeeping.
+type IncarnationReporter interface {
+	LeafMobilityIncarnation() uint64
+}
+
 // Claim is a pointer-owned, single-bind ownership claim.
 type Claim struct {
-	noCopy   noCopy
-	facts    Facts
-	driver   Driver
-	resource *resourceState
-	issuer   *authorityIssuerToken
+	noCopy      noCopy
+	facts       Facts
+	driver      Driver
+	incarnation IncarnationReporter
+	resource    *resourceState
+	issuer      *authorityIssuerToken
 
 	executionMu       sync.Mutex
 	executionActive   bool
@@ -149,6 +177,30 @@ func NewClaim(facts Facts) (*Claim, error) {
 // concrete in-module driver. The operation comes from the driver rather than
 // caller-supplied facts, so a descriptor cannot manufacture capability.
 func NewDrivenClaim(facts Facts, driver Driver, resource Resource) (*Claim, error) {
+	return newDrivenClaim(facts, driver, resource, nil)
+}
+
+// NewDrivenClaimWithIncarnation additionally binds the claim to the physical
+// endpoint owner's monotonic incarnation reporter.
+func NewDrivenClaimWithIncarnation(
+	facts Facts,
+	driver Driver,
+	resource Resource,
+	incarnation IncarnationReporter,
+) (*Claim, error) {
+	if interfaceIsNil(incarnation) {
+		return nil, fmt.Errorf("%w: nil incarnation reporter", ErrInvalidDriver)
+	}
+	if _, ok := interfaceIdentity(incarnation); !ok {
+		return nil, fmt.Errorf("%w: incarnation reporter must have stable pointer identity", ErrInvalidDriver)
+	}
+	if _, ok := readIncarnation(incarnation); !ok {
+		return nil, ErrIncarnationUnproven
+	}
+	return newDrivenClaim(facts, driver, resource, incarnation)
+}
+
+func newDrivenClaim(facts Facts, driver Driver, resource Resource, incarnation IncarnationReporter) (*Claim, error) {
 	if facts.Operations != 0 {
 		return nil, fmt.Errorf("%w: facts must not predeclare operations %#x", ErrInvalidDriver, facts.Operations)
 	}
@@ -177,7 +229,7 @@ func NewDrivenClaim(facts Facts, driver Driver, resource Resource) (*Claim, erro
 		return nil, fmt.Errorf("%w: kind %d requires operation %#x, got %#x", ErrInvalidDriver, facts.Kind, want, operation)
 	}
 	facts.Operations = operation
-	return &Claim{facts: facts, driver: driver, resource: resource.state}, nil
+	return &Claim{facts: facts, driver: driver, incarnation: incarnation, resource: resource.state}, nil
 }
 
 // MustNewClaim is NewClaim for adapter facts that cannot be invalid at runtime.
@@ -199,9 +251,69 @@ func MustNewDrivenClaim(facts Facts, driver Driver, resource Resource) *Claim {
 	return claim
 }
 
+func MustNewDrivenClaimWithIncarnation(
+	facts Facts,
+	driver Driver,
+	resource Resource,
+	incarnation IncarnationReporter,
+) *Claim {
+	claim, err := NewDrivenClaimWithIncarnation(facts, driver, resource, incarnation)
+	if err != nil {
+		panic(err)
+	}
+	return claim
+}
+
+func readIncarnation(reporter IncarnationReporter) (value uint64, ok bool) {
+	if interfaceIsNil(reporter) {
+		return 0, false
+	}
+	defer func() {
+		if recover() != nil {
+			value, ok = 0, false
+		}
+	}()
+	value = reporter.LeafMobilityIncarnation()
+	return value, value != 0
+}
+
+func (c *Claim) endpointIncarnation() (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.RLock()
+	reporter := c.incarnation
+	c.mu.RUnlock()
+	return readIncarnation(reporter)
+}
+
 // Snapshot returns a value copy of the claimed facts.
 func (c *Claim) Snapshot() Facts {
-	return c.facts
+	if c == nil {
+		return Facts{}
+	}
+	c.mu.RLock()
+	facts := c.facts
+	c.mu.RUnlock()
+	return facts
+}
+
+// advanceEndpointGeneration records the physical incarnation created by one
+// successful specialized commit. The bilateral transaction keeps its old
+// generation as immutable evidence; only future plans observe this value.
+func (c *Claim) advanceEndpointGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	current := c.facts.Generation
+	generation := NextGeneration()
+	for generation == current {
+		generation = NextGeneration()
+	}
+	c.facts.Generation = generation
+	c.mu.Unlock()
+	return generation
 }
 
 // State returns one coherent ownership snapshot. Driver identity is exposed

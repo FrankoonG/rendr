@@ -96,10 +96,14 @@ type policyTxUnitPath struct {
 	deathMu   sync.Mutex
 	deathFn   func(transport.DeathCause, error)
 	deathOnce sync.Once
+	deathDone chan struct{}
 }
 
 func newPolicyTxUnitPath(name string, recorder *policyTxUnitAckRecorder) *policyTxUnitPath {
-	return &policyTxUnitPath{name: name, recorder: recorder, closed: make(chan struct{}), failed: make(chan struct{})}
+	return &policyTxUnitPath{
+		name: name, recorder: recorder,
+		closed: make(chan struct{}), failed: make(chan struct{}), deathDone: make(chan struct{}),
+	}
 }
 
 func (p *policyTxUnitPath) Read([]byte) (int, error) {
@@ -167,8 +171,26 @@ func (p *policyTxUnitPath) notifyFailure(err error) {
 	fn := p.deathFn
 	p.deathMu.Unlock()
 	if fn != nil {
-		p.deathOnce.Do(func() { fn(transport.CauseTransportError, err) })
+		p.deathOnce.Do(func() {
+			fn(transport.CauseTransportError, err)
+			close(p.deathDone)
+		})
 	}
+}
+
+func waitPolicyTxUnitPathDeath(t *testing.T, path *policyTxUnitPath) {
+	t.Helper()
+	select {
+	case <-path.deathDone:
+	case <-time.After(time.Second):
+		t.Fatal("policy path death callback did not complete")
+	}
+}
+
+func policyTxZombieLeft(engine *Engine) int {
+	engine.zombieMu.Lock()
+	defer engine.zombieMu.Unlock()
+	return engine.zombieLeft
 }
 
 type policyTxUnitFixture struct {
@@ -839,13 +861,54 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	if engine.Mode() != dispatchBond || engine.ActivePath() != paths[pathB.Name] {
 		t.Fatalf("bond selection mode/active=%d/%d", engine.Mode(), engine.ActivePath())
 	}
+	type zombieObservation struct {
+		active        uint32
+		beforePayload int
+		afterPayload  int
+	}
+	payloadObserved := make(chan zombieObservation, 1)
+	cancelDeathHook := engine.OnPathDeathSerial(func(event PathDeathEvent) {
+		if event.ID != paths[pathB.Name] {
+			return
+		}
+		observation := zombieObservation{
+			active:        engine.ActivePath(),
+			beforePayload: policyTxZombieLeft(engine),
+		}
+		// Model application payload arriving as soon as the committed fallback
+		// topology becomes observable. This is the former late-accounting gap.
+		engine.markPayload()
+		observation.afterPayload = policyTxZombieLeft(engine)
+		payloadObserved <- observation
+	})
+	defer cancelDeathHook()
+
 	pathHandles[pathB.Name].Fail(errors.New("selected bond path B failed"))
-	waitPathDetached(t, engine, paths[pathB.Name])
-	engine.markPayload()
+	waitPolicyTxUnitPathDeath(t, pathHandles[pathB.Name])
+	observation := <-payloadObserved
+	if observation.active != paths[pathC.Name] {
+		t.Fatalf("first fallback active at payload=%d want=%d", observation.active, paths[pathC.Name])
+	}
+	if want := engine.limits.ZombieMaxMigrations - 1; observation.beforePayload != want {
+		t.Fatalf("first migration accounting at publication=%d want=%d", observation.beforePayload, want)
+	}
+	if observation.afterPayload != engine.limits.ZombieMaxMigrations {
+		t.Fatalf("payload credit=%d want=%d", observation.afterPayload, engine.limits.ZombieMaxMigrations)
+	}
+	if got := policyTxZombieLeft(engine); got != engine.limits.ZombieMaxMigrations {
+		t.Fatalf("payload credit overwritten after first migration: got=%d want=%d", got, engine.limits.ZombieMaxMigrations)
+	}
+
 	pathHandles[pathC.Name].Fail(errors.New("selected bond path C failed"))
-	waitPathDetached(t, engine, paths[pathC.Name])
+	waitPolicyTxUnitPathDeath(t, pathHandles[pathC.Name])
 	if engine.ActivePath() != paths[pathA.Name] {
 		t.Fatalf("fallback active=%d want=%d", engine.ActivePath(), paths[pathA.Name])
+	}
+	if got, want := policyTxZombieLeft(engine), engine.limits.ZombieMaxMigrations-1; got != want {
+		t.Fatalf("second fallback zombie credit=%d want=%d", got, want)
+	}
+	if err := engine.CloseErr(); err != nil {
+		t.Fatalf("second fallback closed after credited payload: %v", err)
 	}
 	engine.pathsMu.RLock()
 	scopeLen := len(engine.dispatchScope)
@@ -866,6 +929,61 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("bond dispatch spun after selected scope death")
+	}
+}
+
+func TestPolicySelectedScopeTwoDeathsWithoutPayloadTripsZombie(t *testing.T) {
+	pathA := policyTxUnitNode(proto.GraphNodeKindPath, "zombie-fallback-a")
+	pathB := policyTxUnitNode(proto.GraphNodeKindPath, "zombie-selected-b")
+	pathC := policyTxUnitNode(proto.GraphNodeKindPath, "zombie-selected-c")
+	bond := policyTxUnitNode(proto.GraphNodeKindBond, "zombie-selected-bond", pathB.ID, pathC.ID)
+	root := policyTxUnitNode(proto.GraphNodeKindSelector, "zombie-root", pathA.ID, bond.ID)
+	manifest := proto.GraphManifest{RootID: root.ID, Nodes: []proto.GraphNode{root, bond, pathA, pathB, pathC}}
+	engine, _, paths, pathHandles := newPolicyTxUnitEngine(t, manifest, root.ID, pathA.Name, pathB.Name, pathC.Name)
+	if err := engine.InitializePolicySelection(root.ID, pathA.ID, "initial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SelectLocalTarget(root.ID, bond.ID, "select-bond"); err != nil {
+		t.Fatal(err)
+	}
+
+	type zombieObservation struct {
+		active uint32
+		left   int
+	}
+	secondMigration := make(chan zombieObservation, 1)
+	cancelDeathHook := engine.OnPathDeathSerial(func(event PathDeathEvent) {
+		if event.ID == paths[pathC.Name] {
+			secondMigration <- zombieObservation{active: engine.ActivePath(), left: policyTxZombieLeft(engine)}
+		}
+	})
+	defer cancelDeathHook()
+
+	pathHandles[pathB.Name].Fail(errors.New("first no-payload path failure"))
+	waitPolicyTxUnitPathDeath(t, pathHandles[pathB.Name])
+	if got := engine.ActivePath(); got != paths[pathC.Name] {
+		t.Fatalf("first no-payload fallback active=%d want=%d", got, paths[pathC.Name])
+	}
+	if got, want := policyTxZombieLeft(engine), engine.limits.ZombieMaxMigrations-1; got != want {
+		t.Fatalf("first no-payload migration accounting=%d want=%d", got, want)
+	}
+
+	pathHandles[pathC.Name].Fail(errors.New("second no-payload path failure"))
+	waitPolicyTxUnitPathDeath(t, pathHandles[pathC.Name])
+	observation := <-secondMigration
+	if observation.active != paths[pathA.Name] {
+		t.Fatalf("second no-payload fallback active at commit=%d want=%d", observation.active, paths[pathA.Name])
+	}
+	if observation.left != 0 {
+		t.Fatalf("second no-payload migration accounting=%d want=0", observation.left)
+	}
+	select {
+	case <-engine.closed:
+	case <-time.After(time.Second):
+		t.Fatal("two no-payload migrations did not close the zombie engine")
+	}
+	if err := engine.CloseErr(); !errors.Is(err, ErrZombie) {
+		t.Fatalf("two no-payload migrations close error=%v want=%v", err, ErrZombie)
 	}
 }
 

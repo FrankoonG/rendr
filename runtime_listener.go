@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 	"github.com/FrankoonG/rendr/transport/tcp"
@@ -97,6 +99,9 @@ type SessionListener struct {
 	carriers map[string]CarrierFamily
 	kinds    map[string]transport.PathSessionKind
 
+	streamMobility []leafmobility.Capability
+	packetMobility []leafmobility.Capability
+
 	sourceMu     sync.Mutex
 	activeSource int
 	sourceErr    error
@@ -126,6 +131,7 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 	seen := make(map[string]struct{}, len(config.Streams)+len(config.Packets)+len(config.Framed))
 	seenObjects := make(map[uintptr]string, len(config.Streams)+len(config.Packets)+len(config.Framed))
 	framedKinds := make(map[string]transport.PathSessionKind, len(config.Framed))
+	var streamMobility, packetMobility mobilityCapabilitySet
 	for index, source := range config.Streams {
 		if source.Name == "" {
 			return nil, fmt.Errorf("rendr: StreamSource[%d] has an empty name", index)
@@ -194,19 +200,55 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 			seenObjects[pointer] = source.Name
 		}
 	}
+	framedByName := make(map[string]FramedSource, len(config.Framed))
+	framedNames := make([]string, 0, len(config.Framed))
+	for _, source := range config.Framed {
+		framedByName[source.Name] = source
+		framedNames = append(framedNames, source.Name)
+	}
+	sort.Strings(framedNames)
+	for _, name := range framedNames {
+		source := framedByName[name]
+		var sourceMobility mobilityCapabilitySet
+		if err := sourceMobility.addImplementation(source.Listener); err != nil {
+			return nil, fmt.Errorf("rendr: FramedSource %q has invalid leaf mobility evidence: %w", source.Name, err)
+		}
+		capabilities := sourceMobility.snapshotAll()
+		kind := framedKinds[name]
+		if kind == transport.PathSessionAny || kind == transport.PathSessionStream {
+			if err := streamMobility.add(capabilities...); err != nil {
+				return nil, err
+			}
+		}
+		if kind == transport.PathSessionAny || kind == transport.PathSessionPacket {
+			if err := packetMobility.add(capabilities...); err != nil {
+				return nil, err
+			}
+		}
+	}
+	streamCapabilities, err := streamMobility.snapshotForSession(leafmobility.SessionStream)
+	if err != nil {
+		return nil, err
+	}
+	packetCapabilities, err := packetMobility.snapshotForSession(leafmobility.SessionPacket)
+	if err != nil {
+		return nil, err
+	}
 
 	l := &SessionListener{
-		runtime:      r,
-		streamAccept: make(chan *acceptedStreamConn, runtimeAcceptQueueSize),
-		packetAccept: make(chan *acceptedPacketConn, runtimeAcceptQueueSize),
-		streamSlots:  make(chan struct{}, runtimeAcceptQueueSize),
-		packetSlots:  make(chan struct{}, runtimeAcceptQueueSize),
-		handshakes:   make(chan struct{}, runtimeHandshakeLimit),
-		activeSource: len(config.Streams) + len(config.Packets) + len(config.Framed),
-		inflight:     make(map[uint64]transport.PathConn),
-		closed:       make(chan struct{}),
-		carriers:     make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)+len(config.Framed)),
-		kinds:        make(map[string]transport.PathSessionKind, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		runtime:        r,
+		streamAccept:   make(chan *acceptedStreamConn, runtimeAcceptQueueSize),
+		packetAccept:   make(chan *acceptedPacketConn, runtimeAcceptQueueSize),
+		streamSlots:    make(chan struct{}, runtimeAcceptQueueSize),
+		packetSlots:    make(chan struct{}, runtimeAcceptQueueSize),
+		handshakes:     make(chan struct{}, runtimeHandshakeLimit),
+		activeSource:   len(config.Streams) + len(config.Packets) + len(config.Framed),
+		inflight:       make(map[uint64]transport.PathConn),
+		closed:         make(chan struct{}),
+		carriers:       make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		kinds:          make(map[string]transport.PathSessionKind, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		streamMobility: streamCapabilities,
+		packetMobility: packetCapabilities,
 	}
 	if err := r.claimListener(l); err != nil {
 		return nil, err
@@ -584,6 +626,14 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 
 	e := engine.New(engine.SideServer, sessionID, l.runtime.engineLimits())
 	e.SetLeafMobilityPeerLedger(l.runtime.mobilityLedger)
+	mobilityCapabilities := l.streamMobility
+	if packetMode {
+		mobilityCapabilities = l.packetMobility
+	}
+	if err := e.ConfigureLocalMobilityCapabilities(mobilityCapabilities...); err != nil {
+		_ = e.Close()
+		return false
+	}
 	engineOwnsPath := false
 	defer func() {
 		if !activated {

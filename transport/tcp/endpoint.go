@@ -38,6 +38,16 @@ type endpointOwner struct {
 	state       chan struct{}
 }
 
+func (o *endpointOwner) LeafMobilityIncarnation() uint64 {
+	if o == nil {
+		return 0
+	}
+	o.mu.Lock()
+	generation := o.generation
+	o.mu.Unlock()
+	return generation
+}
+
 func newEndpointOwner(conn net.Conn) *endpointOwner {
 	return &endpointOwner{
 		conn:       conn,
@@ -368,6 +378,55 @@ func (m *endpointMaintenance) Resume() error {
 	m.done = true
 	o.signalLocked()
 	o.mu.Unlock()
+	return nil
+}
+
+// FailClosed permanently retires the endpoint held by this maintenance lease.
+// Destructive drivers call it only after closing every physical incarnation
+// while any required packet quarantine is still active.
+func (m *endpointMaintenance) FailClosed() error {
+	if m == nil || m.owner == nil {
+		return errEndpointStaleLease
+	}
+	if m.done {
+		return nil
+	}
+	o := m.owner
+	o.mu.Lock()
+	if o.closed {
+		m.done = true
+		o.mu.Unlock()
+		return nil
+	}
+	if o.failed || !o.maintenance || o.conn != m.conn || o.generation != m.generation || o.readActive || o.writeActive {
+		o.mu.Unlock()
+		return errEndpointStaleLease
+	}
+	o.closed = true
+	o.maintenance = false
+	o.maintenanceErr = nil
+	o.conn = nil
+	m.done = true
+	o.signalLocked()
+	o.mu.Unlock()
+	return nil
+}
+
+func (o *endpointOwner) failClosedCurrent(conn net.Conn) error {
+	if o == nil || conn == nil {
+		return errEndpointStaleLease
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return nil
+	}
+	if o.conn != conn || o.readActive || o.writeActive || o.maintenance {
+		return errEndpointStaleLease
+	}
+	o.closed = true
+	o.conn = nil
+	o.signalLocked()
 	return nil
 }
 

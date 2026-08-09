@@ -20,6 +20,8 @@ type enginePlanDriver struct {
 	release         chan struct{}
 	rollbackEntered chan struct{}
 	rollbackRelease chan struct{}
+	commitEntered   chan struct{}
+	commitRelease   chan struct{}
 	prepareCalls    atomic.Int32
 	cutoverCalls    atomic.Int32
 	commitCalls     atomic.Int32
@@ -85,8 +87,22 @@ func (t *enginePlanDriverTransaction) Cutover(context.Context, leafmobility.Exec
 	t.driver.cutoverCalls.Add(1)
 	return nil
 }
-func (t *enginePlanDriverTransaction) Commit(context.Context, leafmobility.ExecutionRequest) error {
+func (t *enginePlanDriverTransaction) Commit(ctx context.Context, _ leafmobility.ExecutionRequest) error {
 	t.driver.commitCalls.Add(1)
+	if t.driver.commitEntered != nil {
+		select {
+		case <-t.driver.commitEntered:
+		default:
+			close(t.driver.commitEntered)
+		}
+	}
+	if t.driver.commitRelease != nil {
+		select {
+		case <-t.driver.commitRelease:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
 	return nil
 }
 func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobility.ExecutionRequest) error {
@@ -107,6 +123,12 @@ func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobili
 	}
 	return nil
 }
+
+func (*enginePlanDriverTransaction) FailClosed(context.Context, leafmobility.ExecutionRequest) error {
+	return nil
+}
+
+func (*enginePlanDriverTransaction) EndpointGenerationChanged() bool { return false }
 
 func TestEnginePlansSpecializedMobilityFromExactFrozenEvidence(t *testing.T) {
 	driver := &enginePlanDriver{operation: leafmobility.OperationTCPRepair, evidence: leafmobility.EvidenceDigest{0x51}}

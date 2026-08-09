@@ -61,10 +61,12 @@ type fakeDriverTransaction struct {
 
 func (t *fakeDriverTransaction) Evidence() AttemptEvidence { return t.evidence }
 
-func (*fakeDriverTransaction) Prepare(context.Context, ExecutionRequest) error  { return nil }
-func (*fakeDriverTransaction) Cutover(context.Context, ExecutionRequest) error  { return nil }
-func (*fakeDriverTransaction) Commit(context.Context, ExecutionRequest) error   { return nil }
-func (*fakeDriverTransaction) Rollback(context.Context, ExecutionRequest) error { return nil }
+func (*fakeDriverTransaction) Prepare(context.Context, ExecutionRequest) error    { return nil }
+func (*fakeDriverTransaction) Cutover(context.Context, ExecutionRequest) error    { return nil }
+func (*fakeDriverTransaction) Commit(context.Context, ExecutionRequest) error     { return nil }
+func (*fakeDriverTransaction) Rollback(context.Context, ExecutionRequest) error   { return nil }
+func (*fakeDriverTransaction) FailClosed(context.Context, ExecutionRequest) error { return nil }
+func (*fakeDriverTransaction) EndpointGenerationChanged() bool                    { return false }
 
 func TestNewDrivenClaimDerivesOperationFromDriver(t *testing.T) {
 	tests := []struct {
@@ -253,6 +255,24 @@ func TestCapabilityRequiresConcreteDriver(t *testing.T) {
 	}
 }
 
+func TestCapabilityForClaimRequiresTheSealedDriver(t *testing.T) {
+	driver := &fakeDriver{operation: OperationTCPRepair}
+	driven := MustNewDrivenClaim(testDrivenFacts(), driver, MustNewResource(ScopeEndpoint))
+	capability, ok := CapabilityForClaim(driven)
+	if !ok || capability.Operation() != OperationTCPRepair {
+		t.Fatalf("CapabilityForClaim(driven) = (%v, %t)", capability.Operation(), ok)
+	}
+	baselineFacts := testDrivenFacts()
+	baselineFacts.Scope = ScopeEndpoint
+	baseline := MustNewClaim(baselineFacts)
+	if capability, ok := CapabilityForClaim(baseline); ok || capability.Operation() != 0 {
+		t.Fatalf("CapabilityForClaim(baseline) = (%v, %t)", capability.Operation(), ok)
+	}
+	if capability, ok := CapabilityForClaim(nil); ok || capability.Operation() != 0 {
+		t.Fatalf("CapabilityForClaim(nil) = (%v, %t)", capability.Operation(), ok)
+	}
+}
+
 func TestNewDrivenClaimRejectsForgedOrMismatchedDriver(t *testing.T) {
 	facts := testDrivenFacts()
 	resource := MustNewResource(ScopeEndpoint)
@@ -357,6 +377,21 @@ func TestPlanCandidateFallbacksDoNotCallDriverPrematurely(t *testing.T) {
 		}
 		plan, err := PlanCandidate(context.Background(), claim, request)
 		assertFallbackPlan(t, plan, err, StageEndpoint, ReasonOperationNotQualified, false)
+	})
+
+	t.Run("operation incompatible with packet session", func(t *testing.T) {
+		driver := &fakeDriver{operation: OperationTCPRepair}
+		facts := testDrivenFacts()
+		facts.Session = SessionAny
+		claim := MustNewDrivenClaim(facts, driver, MustNewResource(ScopeEndpoint))
+		bindDrivenClaim(t, claim, binding)
+		candidate := request
+		candidate.Session = SessionPacket
+		plan, err := PlanCandidate(context.Background(), claim, candidate)
+		assertFallbackPlan(t, plan, err, StageSession, ReasonSessionMismatch, false)
+		if got := driver.preflightCalls.Load(); got != 0 {
+			t.Fatalf("preflight calls=%d want=0", got)
+		}
 	})
 
 	tests := []struct {

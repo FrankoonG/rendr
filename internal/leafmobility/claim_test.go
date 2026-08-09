@@ -59,6 +59,32 @@ func TestOperationHas(t *testing.T) {
 	}
 }
 
+func TestOperationSupportsSession(t *testing.T) {
+	tests := []struct {
+		operation Operation
+		stream    bool
+		packet    bool
+	}{
+		{operation: OperationTCPRepair, stream: true},
+		{operation: OperationQUICCIDRebind, stream: true, packet: true},
+		{operation: OperationUDPFlowRebind, packet: true},
+		{operation: OperationGVisorLinkRebind, stream: true},
+		{operation: 0},
+		{operation: OperationTCPRepair | OperationQUICCIDRebind},
+	}
+	for _, test := range tests {
+		if got := test.operation.SupportsSession(SessionStream); got != test.stream {
+			t.Fatalf("operation %#x stream support=%t want=%t", test.operation, got, test.stream)
+		}
+		if got := test.operation.SupportsSession(SessionPacket); got != test.packet {
+			t.Fatalf("operation %#x packet support=%t want=%t", test.operation, got, test.packet)
+		}
+		if test.operation.SupportsSession(SessionAny) {
+			t.Fatalf("operation %#x accepts SessionAny", test.operation)
+		}
+	}
+}
+
 func TestNewClaimRejectsInvalidFacts(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -147,6 +173,21 @@ func TestClaimFactsAreDefensiveValues(t *testing.T) {
 	snapshot.Generation++
 	if got := claim.Snapshot(); got != want {
 		t.Fatalf("Snapshot() after mutation = %+v, want %+v", got, want)
+	}
+}
+
+func TestClaimEndpointGenerationNeverReusesCallerGeneration(t *testing.T) {
+	facts := testFacts()
+	facts.Generation = NextGeneration() + 1
+	if facts.Generation == 0 {
+		facts.Generation = NextGeneration() + 1
+	}
+	claim := MustNewClaim(facts)
+	if got := claim.advanceEndpointGeneration(); got == facts.Generation {
+		t.Fatalf("advanceEndpointGeneration reused current generation %d", got)
+	}
+	if got := claim.Snapshot().Generation; got == facts.Generation || got == 0 {
+		t.Fatalf("claim generation=%d after advancing from %d", got, facts.Generation)
 	}
 }
 

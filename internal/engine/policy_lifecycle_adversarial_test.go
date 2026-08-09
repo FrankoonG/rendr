@@ -207,6 +207,86 @@ func TestRemovePathLinearizesSynchronousCloseDeathAsClean(t *testing.T) {
 	}
 }
 
+func TestRecoveryZombieAccountingCreditsPayloadBetweenTopologies(t *testing.T) {
+	tests := []struct {
+		name        string
+		markPayload bool
+	}{
+		{name: "payload", markPayload: true},
+		{name: "no-payload", markPayload: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+			t.Cleanup(func() { _ = e.Close() })
+
+			initial := newLifecycleHealthyPath()
+			if _, err := e.AttachPath(initial, transport.PathSpec{Transport: "test", Address: "initial"}); err != nil {
+				t.Fatal(err)
+			}
+			initial.die(transport.CauseTransportError, errors.New("initial path failed"))
+			if got := e.ActivePath(); got != 0 {
+				t.Fatalf("active after initial path death=%d want=0", got)
+			}
+
+			firstRecovery := newLifecycleHealthyPath()
+			if _, err := e.AttachPath(firstRecovery, transport.PathSpec{Transport: "test", Address: "first-recovery"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := e.MigrationCount(); got != 1 {
+				t.Fatalf("first recovery migration count=%d want=1", got)
+			}
+			if got, want := policyTxZombieLeft(e), e.limits.ZombieMaxMigrations-1; got != want {
+				t.Fatalf("first recovery zombie accounting=%d want=%d", got, want)
+			}
+			if test.markPayload {
+				e.markPayload()
+				if got := policyTxZombieLeft(e); got != e.limits.ZombieMaxMigrations {
+					t.Fatalf("recovery payload credit=%d want=%d", got, e.limits.ZombieMaxMigrations)
+				}
+			}
+
+			firstRecovery.die(transport.CauseTransportError, errors.New("first recovery failed"))
+			secondRecovery := newLifecycleHealthyPath()
+			secondID, err := e.AttachPath(secondRecovery, transport.PathSpec{Transport: "test", Address: "second-recovery"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := e.MigrationCount(); got != 2 {
+				t.Fatalf("second recovery migration count=%d want=2", got)
+			}
+
+			if test.markPayload {
+				if got := e.ActivePath(); got != secondID {
+					t.Fatalf("second recovery active=%d want=%d", got, secondID)
+				}
+				if got, want := policyTxZombieLeft(e), e.limits.ZombieMaxMigrations-1; got != want {
+					t.Fatalf("second recovery zombie accounting=%d want=%d", got, want)
+				}
+				if err := e.CloseErr(); err != nil {
+					t.Fatalf("second recovery closed after credited payload: %v", err)
+				}
+				if _, err := e.SendData([]byte("second recovery remains usable")); err != nil {
+					t.Fatalf("send after second recovery: %v", err)
+				}
+				return
+			}
+
+			if got := policyTxZombieLeft(e); got != 0 {
+				t.Fatalf("second no-payload recovery accounting=%d want=0", got)
+			}
+			select {
+			case <-e.closed:
+			case <-time.After(time.Second):
+				t.Fatal("two no-payload recoveries did not close the zombie engine")
+			}
+			if err := e.CloseErr(); !errors.Is(err, ErrZombie) {
+				t.Fatalf("two no-payload recoveries close error=%v want=%v", err, ErrZombie)
+			}
+		})
+	}
+}
+
 func TestConcurrentRemovePathPreservesOneSurvivor(t *testing.T) {
 	e := New(SideClient, [16]byte{0xb3}, Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })

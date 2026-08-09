@@ -207,9 +207,14 @@ type Engine struct {
 	// completes (death -> new active path) and resets on payload
 	// arrival OR if the cooldown window has elapsed since the last
 	// migration (CLAUDE.md hard rule #5).
-	zombieMu      sync.Mutex
-	zombieLeft    int
-	zombieLastMig time.Time
+	zombieMu         sync.Mutex
+	zombieLeft       int
+	zombieLastMig    time.Time
+	zombieGeneration uint64
+	// zombieBeforeTrip is an internal deterministic-test synchronization
+	// point. Tests install it before starting migration activity and never
+	// mutate it concurrently.
+	zombieBeforeTrip func()
 
 	// Selector-mode scheduler. nil until StartSelector is called.
 	selectorMu sync.Mutex
@@ -356,6 +361,9 @@ type pathSlot struct {
 	dispatchDead    bool
 	dispatchFenced  bool
 	dispatchStalled atomic.Bool
+	// dispatchBeforeWritePermit is a deterministic package-test hook. Tests set
+	// it before queue publication to hold a job between the two TX fence checks.
+	dispatchBeforeWritePermit func()
 
 	quit              chan struct{}
 	quitOnce          sync.Once
@@ -400,6 +408,12 @@ func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
 }
 
 func (s *pathSlot) writeDispatchedFrame(frame []byte) (int, error) {
+	if !s.txEnabled.Load() {
+		return 0, ErrPathTXFenced
+	}
+	if s.dispatchBeforeWritePermit != nil {
+		s.dispatchBeforeWritePermit()
+	}
 	if err := s.acquireWrite(context.Background()); err != nil {
 		return 0, err
 	}
@@ -408,6 +422,20 @@ func (s *pathSlot) writeDispatchedFrame(frame []byte) (int, error) {
 		return 0, ErrPathTXFenced
 	}
 	return s.writeFrameOwned(frame)
+}
+
+func (s *pathSlot) tryFenceDispatch() bool {
+	if s == nil {
+		return false
+	}
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	if s.dispatchDead || s.dispatchFenced || !s.txEnabled.Load() {
+		return false
+	}
+	s.dispatchFenced = true
+	s.txEnabled.Store(false)
+	return true
 }
 
 func (s *pathSlot) acquireWrite(ctx context.Context) error {
@@ -990,6 +1018,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		fenced          []*pathSlot
 		oldActive       uint32
 		recoveryEvent   bool
+		zombieTrip      zombieTripTicket
 		superseded      bool
 		admissionExpiry pathAdmissionExpiry
 	)
@@ -1140,6 +1169,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	if recoveryEvent {
 		e.migrationCount++
+		zombieTrip = e.accountMigration()
 	}
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
@@ -1154,7 +1184,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	if recoveryEvent {
 		e.fireMigrateHooks(oldActive, id, "recovery")
-		e.recordMigration()
+		e.tripZombie(zombieTrip)
 	}
 	if superseded {
 		e.requestReplay(e.sendAckNext.Load())

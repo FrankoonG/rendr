@@ -94,13 +94,7 @@ func Wrap(c net.Conn) *PathConn {
 
 func wrapOwned(c *net.TCPConn, role leafmobility.Role) *PathConn {
 	path := Wrap(c)
-	path.claim = leafmobility.MustNewClaim(leafmobility.Facts{
-		Kind:       leafmobility.KindRawTCP,
-		Role:       role,
-		Scope:      leafmobility.ScopeEndpoint,
-		Session:    leafmobility.SessionAny,
-		Generation: leafmobility.NextGeneration(),
-	})
+	path.claim = newOwnedClaim(path.endpoint, role)
 	return path
 }
 

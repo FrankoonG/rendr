@@ -1130,6 +1130,7 @@ func (e *Engine) markPayload() {
 	e.zombieMu.Lock()
 	e.zombieLeft = e.limits.ZombieMaxMigrations
 	e.zombieLastMig = time.Time{}
+	e.zombieGeneration++
 	e.zombieMu.Unlock()
 }
 

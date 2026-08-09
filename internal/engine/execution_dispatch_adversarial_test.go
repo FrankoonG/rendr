@@ -2,14 +2,155 @@ package engine
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
+
+func TestLeafMobilityOutcomeUnknownRetainsFenceForAdmittedData(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientExecutionDriver.proveCommit.Store(false)
+	fixture.clientExecutionDriver.failClosedEntered = make(chan struct{})
+	fixture.clientExecutionDriver.failClosedRelease = make(chan struct{})
+	var releaseCleanup sync.Once
+	release := func() { releaseCleanup.Do(func() { close(fixture.clientExecutionDriver.failClosedRelease) }) }
+	t.Cleanup(release)
+
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe1)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+	precheckReached := make(chan struct{})
+	continueWrite := make(chan struct{})
+	var precheckOnce sync.Once
+	slot.dispatchBeforeWritePermit = func() {
+		precheckOnce.Do(func() { close(precheckReached) })
+		<-continueWrite
+	}
+	frame := make([]byte, proto.HeaderSize+1)
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 0xf1}).Encode(frame[:proto.HeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	frame[len(frame)-1] = 0xa5
+	result := make(chan pathDispatchResult, 1)
+	if !slot.submitDispatch(pathDispatchJob{frame: frame, firstPublication: true, result: result}) {
+		t.Fatal("failed to admit DATA before mobility fence")
+	}
+	select {
+	case <-precheckReached:
+	case <-time.After(time.Second):
+		t.Fatal("DATA did not reach the first TX fence check")
+	}
+
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Cutover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.CommitDriver(context.Background()); !errors.Is(err, leafmobility.ErrIncarnationUnproven) {
+		t.Fatalf("CommitDriver = %v, want unproven incarnation", err)
+	}
+	permit.token.outcomeUnknownSerialized(leafmobility.ErrIncarnationUnproven)
+	select {
+	case <-fixture.clientExecutionDriver.failClosedEntered:
+	case <-time.After(time.Second):
+		t.Fatal("outcome-unknown did not start fail-closed cleanup")
+	}
+	close(continueWrite)
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, ErrPathTXFenced) {
+			t.Fatalf("admitted DATA result=%v, want ErrPathTXFenced", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admitted DATA did not reach the second TX fence check")
+	}
+	release()
+}
+
+func TestLeafMobilityDispatchFenceRejectsQueuedDataBeforeControl(t *testing.T) {
+	local, peer := newMemoryPathPair()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = peer.Close()
+	})
+	slot := &pathSlot{
+		id: 1, owner: 2, conn: local, quit: make(chan struct{}), writePermit: newPathWritePermit(),
+	}
+	slot.txEnabled.Store(true)
+
+	// Hold the physical write permit while DATA callers pass the optimistic
+	// precheck and queue. The post-acquire check must reject all of them after
+	// the mobility fence, leaving the control lane as the only wire writer.
+	<-slot.writePermit
+	const writers = 64
+	start := make(chan struct{})
+	ready := make(chan struct{}, writers)
+	results := make(chan error, writers)
+	for index := 0; index < writers; index++ {
+		go func(value byte) {
+			ready <- struct{}{}
+			<-start
+			_, err := slot.writeDispatchedFrame([]byte{value})
+			results <- err
+		}(byte(index + 1))
+	}
+	for index := 0; index < writers; index++ {
+		<-ready
+	}
+	close(start)
+	time.Sleep(10 * time.Millisecond)
+	if !slot.tryFenceDispatch() {
+		t.Fatal("failed to acquire mobility dispatch fence")
+	}
+	slot.releaseWrite()
+
+	control := []byte("terminal-control")
+	if _, err := slot.writeFrame(control); err != nil {
+		t.Fatalf("control write: %v", err)
+	}
+	for index := 0; index < writers; index++ {
+		if err := <-results; !errors.Is(err, ErrPathTXFenced) {
+			t.Fatalf("queued DATA[%d] error=%v want ErrPathTXFenced", index, err)
+		}
+	}
+	select {
+	case frame := <-peer.in:
+		if !bytes.Equal(frame, control) {
+			t.Fatalf("wire frame=%x want control=%x", frame, control)
+		}
+	default:
+		t.Fatal("control frame was not written")
+	}
+	if len(peer.in) != 0 {
+		t.Fatalf("DATA reached wire behind control: queued=%d", len(peer.in))
+	}
+
+	slot.unfenceDispatch()
+	if _, err := slot.writeDispatchedFrame([]byte("data-after-terminal")); err != nil {
+		t.Fatalf("DATA remained fenced after terminal: %v", err)
+	}
+}
 
 func TestRecursiveDispatchCrossModeTrafficIsNotFlattened(t *testing.T) {
 	tests := []struct {
