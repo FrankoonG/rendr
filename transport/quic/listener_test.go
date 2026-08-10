@@ -122,6 +122,101 @@ func TestDatagramListenerAcceptPathDelegatesToDatagramAccept(t *testing.T) {
 	}
 }
 
+func TestOwnedQUICPathsExposeSocketAccelerationEvidence(t *testing.T) {
+	serverTLS, clientTLS, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := Listen("127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan pathAcceptResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		path, err := listener.AcceptPath(ctx)
+		accepted <- pathAcceptResult{path: path, err: err}
+	}()
+	client, err := (&Transport{ClientTLS: clientTLS}).DialPath(context.Background(), transport.PathSpec{
+		Address: listener.Addr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Write([]byte("acceleration status")); err != nil {
+		t.Fatal(err)
+	}
+	server := awaitPathAccept(t, accepted).path
+	t.Cleanup(func() { _ = server.Close() })
+	assertPathRead(t, server, []byte("acceleration status"))
+
+	for name, value := range map[string]any{
+		"client":   client,
+		"server":   server,
+		"listener": listener,
+	} {
+		observer, ok := value.(transport.DatagramAccelerationObserver)
+		if !ok {
+			t.Fatalf("%s %T does not expose acceleration status", name, value)
+		}
+		status := observer.DatagramAccelerationStatus()
+		if status.Mode == transport.DatagramAccelerationUnknown || status.Cause == "" || status.ProbeGeneration == 0 || status.ProbedAt.IsZero() {
+			t.Fatalf("%s status=%+v", name, status)
+		}
+	}
+}
+
+func TestDialPathCloseReleasesOwnedUDPSocket(t *testing.T) {
+	serverTLS, clientTLS, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := Listen("127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan pathAcceptResult, 1)
+	go func() {
+		path, err := listener.AcceptPath(context.Background())
+		accepted <- pathAcceptResult{path: path, err: err}
+	}()
+	client, err := (&Transport{ClientTLS: clientTLS}).DialPath(context.Background(), transport.PathSpec{Address: listener.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte("admit")); err != nil {
+		t.Fatal(err)
+	}
+	server := awaitPathAccept(t, accepted).path
+	defer server.Close()
+	assertPathRead(t, server, []byte("admit"))
+	local, err := net.ResolveUDPAddr("udp", client.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rebound, bindErr := net.ListenUDP("udp", local)
+		if bindErr == nil {
+			_ = rebound.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("client UDP socket %s was not released: %v", local, bindErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func assertQUICListenerClaim(t *testing.T, path transport.PathConn, session leafmobility.Session) {
 	t.Helper()
 	provider, ok := path.(leafmobility.Provider)

@@ -15,6 +15,7 @@ import (
 	qg "github.com/quic-go/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/internal/udpsocket"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -50,20 +51,13 @@ func New() *Transport {
 //	sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
 const DefaultUDPBufferBytes = 8 * 1024 * 1024
 
-// udpConnWithBuffers opens a UDP socket bound to local (laddr may be
-// nil for an ephemeral port) and sets large send/recv buffers. The
-// returned *net.UDPConn is suitable for handing to qg.Transport.
-func udpConnWithBuffers(laddr *net.UDPAddr) (*net.UDPConn, error) {
-	if laddr == nil {
-		laddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	}
-	c, err := net.ListenUDP("udp", laddr)
-	if err != nil {
-		return nil, err
-	}
-	_ = c.SetReadBuffer(DefaultUDPBufferBytes)
-	_ = c.SetWriteBuffer(DefaultUDPBufferBytes)
-	return c, nil
+// udpSocketWithBuffers opens an evidence-driven UDP socket. The PacketConn
+// view lets rendr enforce active/fallback selection before quic-go inspects
+// the underlying descriptor.
+func udpSocketWithBuffers(ctx context.Context, laddr *net.UDPAddr) (*udpsocket.Socket, error) {
+	return udpsocket.Listen(ctx, udpsocket.Config{
+		Network: "udp", LocalAddr: laddr, BufferBytes: DefaultUDPBufferBytes,
+	})
 }
 
 // DialPath connects to spec.Address (host:port), completes the QUIC
@@ -104,29 +98,34 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 	if err != nil {
 		return nil, fmt.Errorf("quic: resolve %s: %w", spec.Address, err)
 	}
-	udpConn, err := udpConnWithBuffers(nil)
+	udpSocket, err := udpSocketWithBuffers(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("quic: udp listen: %w", err)
 	}
-	tr := &qg.Transport{Conn: udpConn}
+	tr := &qg.Transport{Conn: udpSocket.PacketConn()}
+	release := sync.OnceFunc(func() {
+		_ = tr.Close()
+		_ = udpSocket.Close()
+	})
 	conn, err := tr.Dial(ctx, raddr, cfg, &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
 		EnableDatagrams: useDatagram,
 	})
 	if err != nil {
-		_ = udpConn.Close()
+		release()
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
 	}
 	if useDatagram {
-		return wrapDatagram(conn, false, nil, leafmobility.RoleDialer), nil
+		return wrapDatagram(conn, false, release, leafmobility.RoleDialer, udpSocket), nil
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		_ = conn.CloseWithError(0, "open stream failed")
+		release()
 		return nil, fmt.Errorf("quic: open stream: %w", err)
 	}
-	return wrap(conn, stream, false, nil, leafmobility.RoleDialer), nil
+	return wrap(conn, stream, false, release, leafmobility.RoleDialer, udpSocket), nil
 }
 
 // Probe times the handshake + first-stream open as a coarse RTT
@@ -145,15 +144,20 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 // Accept wraps an externally accepted (connection, stream) pair. It does not
 // grant adapter ownership; Listener uses the private owned wrapper instead.
 func Accept(conn *qg.Conn, stream *qg.Stream) *PathConn {
-	return wrap(conn, stream, true, nil, leafmobility.RoleUnknown)
+	return wrap(conn, stream, true, nil, leafmobility.RoleUnknown, nil)
 }
 
-func wrap(conn *qg.Conn, stream *qg.Stream, server bool, release func(), role leafmobility.Role) *PathConn {
+func wrap(
+	conn *qg.Conn,
+	stream *qg.Stream,
+	server bool,
+	release func(),
+	role leafmobility.Role,
+	udpSocket *udpsocket.Socket,
+) *PathConn {
 	pc := &PathConn{
-		conn:    conn,
-		stream:  stream,
-		server:  server,
-		release: release,
+		conn: conn, stream: stream, server: server, release: release,
+		udpSocket: udpSocket,
 	}
 	if role != leafmobility.RoleUnknown {
 		pc.claim = leafmobility.MustNewClaim(leafmobility.Facts{
@@ -170,11 +174,12 @@ func wrap(conn *qg.Conn, stream *qg.Stream, server bool, release func(), role le
 
 // PathConn implements transport.PathConn over a single QUIC stream.
 type PathConn struct {
-	conn    *qg.Conn
-	stream  *qg.Stream
-	server  bool
-	release func()
-	claim   *leafmobility.Claim
+	conn      *qg.Conn
+	stream    *qg.Stream
+	server    bool
+	release   func()
+	claim     *leafmobility.Claim
+	udpSocket *udpsocket.Socket
 
 	writeMu sync.Mutex
 	readBuf [LengthPrefixSize]byte
@@ -191,11 +196,20 @@ type PathConn struct {
 	deathErr error
 }
 
+var _ transport.DatagramAccelerationObserver = (*PathConn)(nil)
+
 func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 	if p == nil {
 		return nil
 	}
 	return p.claim
+}
+
+func (p *PathConn) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
+	if p == nil || p.udpSocket == nil {
+		return transport.DatagramAccelerationStatus{}
+	}
+	return p.udpSocket.DatagramAccelerationStatus()
 }
 
 // Read returns one framed payload+header concatenated.
@@ -250,7 +264,8 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 	return n, nil
 }
 
-// Close closes the stream then the underlying QUIC connection.
+// Close closes the stream and synchronously completes quic-go's local
+// connection close before releasing the owned transport and UDP socket.
 func (p *PathConn) Close() error {
 	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {

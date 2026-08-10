@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // PathFactory opens one kind of already-framed network path. A factory is
@@ -92,4 +93,40 @@ type IngressQueueStats struct {
 // loss. It must be safe to call concurrently with Read and Close.
 type IngressQueueObserver interface {
 	IngressQueueStats() IngressQueueStats
+}
+
+// DatagramAccelerationMode identifies the socket send treatment selected by
+// rendr. Selection does not prove that the protocol stack produced a batch;
+// callers must use the counters to distinguish eligibility from actual use.
+// It is observation only and cannot request or authorize an offload.
+type DatagramAccelerationMode string
+
+const (
+	DatagramAccelerationUnknown  DatagramAccelerationMode = "unknown"
+	DatagramAccelerationGSO      DatagramAccelerationMode = "gso_active"
+	DatagramAccelerationOrdinary DatagramAccelerationMode = "ordinary_fallback"
+)
+
+// DatagramAccelerationStatus is a syscall-free snapshot of one UDP socket's
+// selected treatment and actual send evidence. GSOSuperPackets counts only
+// successful kernel writes carrying UDP_SEGMENT; a selected mode alone is not
+// proof that the fast path was exercised.
+type DatagramAccelerationStatus struct {
+	Mode                DatagramAccelerationMode
+	Cause               string
+	ProbeGeneration     uint64
+	ProbedAt            time.Time
+	GSOAttempts         uint64
+	GSOSuperPackets     uint64
+	GSOSegments         uint64
+	OrdinaryDatagrams   uint64
+	FallbackTransitions uint64
+}
+
+// DatagramAccelerationObserver is an optional PathConn extension reporting
+// its underlying UDP socket. Accepted QUIC paths share their listener socket,
+// so those paths expose socket-wide aggregate counters rather than per-path
+// counters. It must be safe to call concurrently with transport I/O and Close.
+type DatagramAccelerationObserver interface {
+	DatagramAccelerationStatus() DatagramAccelerationStatus
 }

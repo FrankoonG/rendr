@@ -10,6 +10,7 @@ import (
 	qg "github.com/quic-go/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/internal/udpsocket"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -17,8 +18,9 @@ import (
 // incoming connection: it does the AcceptStream step so callers see
 // a ready-to-use rendr PathConn rather than a bare QUIC connection.
 type Listener struct {
-	ln *qg.Listener
-	tr *qg.Transport
+	ln        *qg.Listener
+	tr        *qg.Transport
+	udpSocket *udpsocket.Socket
 
 	ownershipMu     sync.Mutex
 	closing         bool
@@ -63,11 +65,11 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	udpConn, err := udpConnWithBuffers(laddr)
+	udpSocket, err := udpSocketWithBuffers(context.Background(), laddr)
 	if err != nil {
 		return nil, err
 	}
-	tr := &qg.Transport{Conn: udpConn}
+	tr := &qg.Transport{Conn: udpSocket.PacketConn()}
 	cfg := &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
@@ -79,12 +81,14 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	ln, err := tr.Listen(tlsCfg, cfg)
 	if err != nil {
 		_ = tr.Close()
+		_ = udpSocket.Close()
 		return nil, err
 	}
 	admissionCtx, cancelAdmission := context.WithCancel(context.Background())
 	return &Listener{
 		ln:              ln,
 		tr:              tr,
+		udpSocket:       udpSocket,
 		transportDone:   make(chan struct{}),
 		admissionCtx:    admissionCtx,
 		cancelAdmission: cancelAdmission,
@@ -102,6 +106,20 @@ func ListenDatagram(addr string, tlsCfg *tls.Config) (*DatagramListener, error) 
 
 // Addr returns the underlying UDP address.
 func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
+
+func (l *Listener) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
+	if l == nil || l.udpSocket == nil {
+		return transport.DatagramAccelerationStatus{}
+	}
+	return l.udpSocket.DatagramAccelerationStatus()
+}
+
+func (l *DatagramListener) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
+	if l == nil {
+		return transport.DatagramAccelerationStatus{}
+	}
+	return l.listener.DatagramAccelerationStatus()
+}
 
 // SessionKind reports that stream-backed QUIC paths can carry either rendr
 // application session contract.
@@ -193,7 +211,7 @@ func (l *Listener) Accept(ctx context.Context) (*PathConn, error) {
 		release()
 		return nil, err
 	}
-	return wrap(conn, stream, true, release, leafmobility.RoleAcceptor), nil
+	return wrap(conn, stream, true, release, leafmobility.RoleAcceptor, l.udpSocket), nil
 }
 
 // AcceptPath delegates to Accept.
@@ -220,7 +238,7 @@ func (l *Listener) AcceptDatagram(ctx context.Context) (*datagramPathConn, error
 		release()
 		return nil, err
 	}
-	return wrapDatagram(conn, true, release, leafmobility.RoleAcceptor), nil
+	return wrapDatagram(conn, true, release, leafmobility.RoleAcceptor, l.udpSocket), nil
 }
 
 // AcceptPath delegates to the wrapped listener's DATAGRAM acceptor.

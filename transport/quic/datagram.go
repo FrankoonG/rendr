@@ -12,6 +12,7 @@ import (
 	qg "github.com/quic-go/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/internal/udpsocket"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -39,11 +40,12 @@ const datagramIngressQueueLen = 2048
 // Wire shape: one DATAGRAM frame == one rendr frame. No length
 // prefix - the DATAGRAM boundary IS the frame boundary.
 type datagramPathConn struct {
-	conn    *qg.Conn
-	server  bool
-	recvQ   chan []byte
-	release func()
-	claim   *leafmobility.Claim
+	conn      *qg.Conn
+	server    bool
+	recvQ     chan []byte
+	release   func()
+	claim     *leafmobility.Claim
+	udpSocket *udpsocket.Socket
 
 	writeMu sync.Mutex
 
@@ -63,15 +65,21 @@ type datagramPathConn struct {
 	deathErr error
 }
 
+var _ transport.DatagramAccelerationObserver = (*datagramPathConn)(nil)
+
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
 // the wrapped conn's SendDatagram/ReceiveDatagram calls to work.
-func wrapDatagram(conn *qg.Conn, server bool, release func(), role leafmobility.Role) *datagramPathConn {
+func wrapDatagram(
+	conn *qg.Conn,
+	server bool,
+	release func(),
+	role leafmobility.Role,
+	udpSocket *udpsocket.Socket,
+) *datagramPathConn {
 	p := &datagramPathConn{
-		conn:    conn,
-		server:  server,
-		recvQ:   make(chan []byte, datagramIngressQueueLen),
-		release: release,
+		conn: conn, server: server, recvQ: make(chan []byte, datagramIngressQueueLen),
+		release: release, udpSocket: udpSocket,
 	}
 	if role != leafmobility.RoleUnknown {
 		p.claim = leafmobility.MustNewClaim(leafmobility.Facts{
@@ -90,7 +98,7 @@ func wrapDatagram(conn *qg.Conn, server bool, release func(), role leafmobility.
 // AcceptDatagram wraps an externally accepted DATAGRAM-capable connection and
 // does not grant adapter ownership.
 func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
-	return wrapDatagram(conn, true, nil, leafmobility.RoleUnknown)
+	return wrapDatagram(conn, true, nil, leafmobility.RoleUnknown, nil)
 }
 
 func (p *datagramPathConn) LeafMobilityClaim() *leafmobility.Claim {
@@ -98,6 +106,13 @@ func (p *datagramPathConn) LeafMobilityClaim() *leafmobility.Claim {
 		return nil
 	}
 	return p.claim
+}
+
+func (p *datagramPathConn) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
+	if p == nil || p.udpSocket == nil {
+		return transport.DatagramAccelerationStatus{}
+	}
+	return p.udpSocket.DatagramAccelerationStatus()
 }
 
 // Read pops one DATAGRAM and copies into buf. If buf is smaller than
@@ -186,6 +201,8 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 	return len(frame), nil
 }
 
+// Close synchronously completes quic-go's local connection close before
+// releasing the owned transport and UDP socket.
 func (p *datagramPathConn) Close() error {
 	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
