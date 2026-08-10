@@ -2,34 +2,45 @@ package tun
 
 import (
 	"errors"
-	"net/netip"
 	"testing"
 
 	"github.com/FrankoonG/rendr/virtualif"
 )
 
 func TestConfigNormalizeAndValidate(t *testing.T) {
-	cfg := Config{
-		Enabled:   true,
-		Addresses: []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")},
-	}
+	cfg := Config{Enabled: true}
 	got := cfg.Normalize()
 	if got.MTU != DefaultMTU {
 		t.Fatalf("default MTU=%d want %d", got.MTU, DefaultMTU)
+	}
+	if got.Queues != DefaultQueues {
+		t.Fatalf("default queues=%d want %d", got.Queues, DefaultQueues)
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestConfigValidateRejectsSmallMTU(t *testing.T) {
-	err := Config{Enabled: true, MTU: MinMTU - 1}.Validate()
-	var ve *virtualif.Error
-	if !errors.As(err, &ve) {
-		t.Fatalf("got %T %v, want virtualif.Error", err, err)
+func TestConfigValidateRejectsInvalidQueueCount(t *testing.T) {
+	for _, queues := range []int{-1, MaxQueues + 1} {
+		err := Config{Enabled: true, Queues: queues}.Validate()
+		var ve *virtualif.Error
+		if !errors.As(err, &ve) || ve.Reason != virtualif.ReasonInvalidQueueCount {
+			t.Fatalf("queues=%d error=%T %v", queues, err, err)
+		}
 	}
-	if ve.Reason != virtualif.ReasonInvalidMTU {
-		t.Fatalf("reason=%s want %s", ve.Reason, virtualif.ReasonInvalidMTU)
+}
+
+func TestConfigValidateRejectsSmallMTU(t *testing.T) {
+	for _, mtu := range []int{MinMTU - 1, MaxMTU + 1} {
+		err := Config{Enabled: true, MTU: mtu}.Validate()
+		var ve *virtualif.Error
+		if !errors.As(err, &ve) {
+			t.Fatalf("mtu=%d got %T %v, want virtualif.Error", mtu, err, err)
+		}
+		if ve.Reason != virtualif.ReasonInvalidMTU {
+			t.Fatalf("mtu=%d reason=%s want %s", mtu, ve.Reason, virtualif.ReasonInvalidMTU)
+		}
 	}
 }
 

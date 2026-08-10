@@ -10,6 +10,7 @@ const (
 	ReasonPeerL3IdentityUnsupported ErrorReason = "peer_l3_identity_unsupported"
 	ReasonPeerEgressUnsupported     ErrorReason = "peer_egress_unsupported"
 	ReasonInvalidMTU                ErrorReason = "invalid_mtu"
+	ReasonInvalidQueueCount         ErrorReason = "invalid_queue_count"
 )
 
 // Error is returned by virtual-interface capability probes and setup.

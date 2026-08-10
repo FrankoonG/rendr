@@ -3,6 +3,8 @@
 package tun
 
 import (
+	"context"
+	"errors"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -24,6 +26,15 @@ func TestOpenCreatesEphemeralDeviceWhenAvailable(t *testing.T) {
 	}
 	if dev.MTU() != 1400 {
 		t.Fatalf("MTU=%d want 1400", dev.MTU())
+	}
+}
+
+func TestReadContextCancellationWhileReadGateIsOwned(t *testing.T) {
+	device := &Device{readGate: make(chan struct{}, 1)}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := device.ReadContext(ctx, make([]byte, 1400)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadContext error=%v want context deadline", err)
 	}
 }
 
@@ -91,7 +102,7 @@ func TestDeviceReadsKernelRoutedIPv4Packet(t *testing.T) {
 	}
 }
 
-func runIP(t *testing.T, args ...string) {
+func runIP(t testing.TB, args ...string) {
 	t.Helper()
 	out, err := exec.Command("ip", args...).CombinedOutput()
 	if err != nil {

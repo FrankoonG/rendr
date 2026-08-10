@@ -41,7 +41,7 @@ type ParseErrorHandler func(packet []byte, err error)
 // Pump connects a raw virtual interface to the l3ingress classifier.
 // It owns no routing policy and starts no rendr flows by itself.
 type Pump struct {
-	Device       virtualif.Device
+	Device       virtualif.CancellableDevice
 	Direction    Direction
 	FlowTable    *FlowTable
 	Router       FlowDecisionFunc
@@ -89,8 +89,15 @@ func (p *Pump) Run(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		n, err := p.Device.Read(buf)
+		n, err := p.Device.ReadContext(ctx, buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, io.ErrShortBuffer) && len(buf) < defaultReadBufferSize {
+				buf = make([]byte, defaultReadBufferSize)
+				continue
+			}
 			if errors.Is(err, io.EOF) {
 				return nil
 			}

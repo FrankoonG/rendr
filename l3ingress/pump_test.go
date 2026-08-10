@@ -1,6 +1,7 @@
 package l3ingress
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -240,10 +241,110 @@ func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	}
 }
 
+func TestPumpCancelsContextReaderWithoutClosingDevice(t *testing.T) {
+	device := &contextDevice{started: make(chan struct{})}
+	pump := &Pump{
+		Device: device,
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			t.Fatal("handler ran without a packet")
+			return nil
+		}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- pump.Run(ctx) }()
+	select {
+	case <-device.started:
+	case <-time.After(time.Second):
+		t.Fatal("Pump did not use ContextReader")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error=%v want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pump did not stop after context cancellation")
+	}
+	if device.closed {
+		t.Fatal("Pump closed device while canceling ContextReader")
+	}
+}
+
+func TestPumpRetriesRetainedPacketAfterShortBuffer(t *testing.T) {
+	packet, err := BuildUDPPacket(L3Identity{
+		Proto: ProtocolUDP,
+		SrcIP: netip.MustParseAddr("192.0.2.1"), SrcPort: 1234,
+		DstIP: netip.MustParseAddr("192.0.2.2"), DstPort: 4321,
+	}, bytes.Repeat([]byte{0xa5}, 1800))
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := &retainedPacketDevice{packet: packet, mtu: 1280}
+	pump := &Pump{
+		Device: device,
+		Handler: PacketHandlerFunc(func(_ context.Context, event PacketEvent) error {
+			if !bytes.Equal(event.Packet, packet) {
+				t.Fatalf("packet changed across short-buffer retry: got=%d want=%d", len(event.Packet), len(packet))
+			}
+			return io.EOF
+		}),
+	}
+	if err := pump.Run(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("Run error=%v want handler io.EOF", err)
+	}
+	if len(device.readSizes) != 2 || device.readSizes[0] != device.mtu || device.readSizes[1] != defaultReadBufferSize {
+		t.Fatalf("read buffer sizes=%v want [%d %d]", device.readSizes, device.mtu, defaultReadBufferSize)
+	}
+}
+
 type fakeDevice struct {
 	packets [][]byte
 	mtu     int
 	closed  bool
+}
+
+type contextDevice struct {
+	fakeDevice
+	started chan struct{}
+}
+
+type retainedPacketDevice struct {
+	packet    []byte
+	mtu       int
+	delivered bool
+	readSizes []int
+}
+
+func (d *retainedPacketDevice) Read(p []byte) (int, error) {
+	return d.ReadContext(context.Background(), p)
+}
+
+func (d *retainedPacketDevice) ReadContext(ctx context.Context, p []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	d.readSizes = append(d.readSizes, len(p))
+	if d.delivered {
+		return 0, io.EOF
+	}
+	if len(p) < len(d.packet) {
+		return 0, io.ErrShortBuffer
+	}
+	d.delivered = true
+	return copy(p, d.packet), nil
+}
+
+func (*retainedPacketDevice) Write(p []byte) (int, error) { return len(p), nil }
+func (*retainedPacketDevice) Close() error                { return nil }
+func (*retainedPacketDevice) Name() string                { return "retained0" }
+func (d *retainedPacketDevice) MTU() int                  { return d.mtu }
+
+func (d *contextDevice) ReadContext(ctx context.Context, _ []byte) (int, error) {
+	close(d.started)
+	<-ctx.Done()
+	return 0, ctx.Err()
 }
 
 func (d *fakeDevice) Read(p []byte) (int, error) {
@@ -253,6 +354,13 @@ func (d *fakeDevice) Read(p []byte) (int, error) {
 	next := d.packets[0]
 	d.packets = d.packets[1:]
 	return copy(p, next), nil
+}
+
+func (d *fakeDevice) ReadContext(ctx context.Context, p []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return d.Read(p)
 }
 
 func (d *fakeDevice) Write(p []byte) (int, error) { return len(p), nil }
