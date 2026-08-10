@@ -226,15 +226,28 @@ func TestQUICDatagramRoundTrip(t *testing.T) {
 	}
 
 	// quic-go's internal DATAGRAM receive queue is intentionally only 128
-	// entries. Send a larger burst before reading from the adapter to prove
-	// the dedicated ingress pump drains that queue without silently losing
-	// frames while the engine-facing reader is briefly stalled.
+	// entries. Accumulate more than that in rendr before reading from the
+	// adapter to prove the dedicated ingress pump drains the internal queue
+	// while the engine-facing reader is stalled. DATAGRAM has no peer flow
+	// control, so bound each sender stride below quic-go's queue and wait for
+	// the pump rather than turning this into a scheduler-dependent loss test.
 	const burstFrames = 512
+	const ingressDrainStride = 16
 	burst := make([]byte, 64)
 	for seq := uint64(0); seq < burstFrames; seq++ {
 		binary.BigEndian.PutUint64(burst, seq)
 		if _, err := client.Write(burst); err != nil {
 			t.Fatalf("burst write %d: %v", seq, err)
+		}
+		if (seq+1)%ingressDrainStride == 0 {
+			wantDepth := seq + 1
+			deadline := time.Now().Add(time.Second)
+			for server.IngressQueueStats().Depth < wantDepth {
+				if time.Now().After(deadline) {
+					t.Fatalf("ingress pump stalled after frame %d: stats=%+v", seq, server.IngressQueueStats())
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
 		}
 	}
 	burstRead := make(chan error, 1)

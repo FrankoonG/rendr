@@ -108,8 +108,12 @@ func acquireExecutionContext() (*executionContextLease, error) {
 }
 
 func currentSecurityLabel(path string) (string, error) {
-	value, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	return currentSecurityLabelFrom(path, os.ReadFile)
+}
+
+func currentSecurityLabelFrom(path string, readFile func(string) ([]byte, error)) (string, error) {
+	value, err := readFile(path)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
 		return "unreported", nil
 	}
 	if err != nil {
