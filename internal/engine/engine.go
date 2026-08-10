@@ -88,11 +88,10 @@ type Engine struct {
 	bondPinLeft    int
 	bondStuckSkips uint64 // count of round-robin slots bypassed for RTT
 
-	// migrationCount tracks the number of active-path changes that
-	// happened AFTER the engine first became Active. The initial
-	// assignment of activeID at AttachPath time is not counted.
-	// Both explicit Migrate() and death-driven failover via
-	// onPathDeath increment it. Read under pathsMu.
+	// migrationCount tracks logical active-route changes and in-place leaf
+	// mobility commits after the engine first became Active. The initial
+	// assignment of activeID at AttachPath time is not counted. An in-place
+	// commit reports oldID == newID to preserve the stable logical Path ID.
 	migrationCount uint64
 
 	// migrateHooks is the list of subscriber callbacks invoked
@@ -240,6 +239,16 @@ type Engine struct {
 	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
 	leafTx               *leafMobilityRuntime
 	leafIssuer           *leafmobility.AuthorityIssuer
+	leafRefreshMu        sync.Mutex
+	leafRefreshPending   map[PathRef]leafMobilityRefreshEvent
+	leafRefreshRunning   map[PathRef]struct{}
+	leafRefreshCancel    map[PathRef]context.CancelCauseFunc
+	leafRefreshSeen      map[PathRef]uint64
+	leafRefreshBudget    map[PathRef]leafMobilityRefreshBudget
+	leafRefreshStatus    map[PathRef]LeafMobilityInitiatorSnapshot
+	leafRefreshWake      chan struct{}
+	leafRefreshRetryMu   sync.Mutex
+	leafRefreshRetryWait chan struct{}
 
 	// Per-path RTT probe state. Keys are probe_id, values are the
 	// monotonic time at issue. handlePathProbeReply consumes them.
@@ -298,7 +307,7 @@ type LeafMobilitySnapshot struct {
 	Ref       PathRef
 	Binding   PathBinding
 	Facts     leafmobility.Facts
-	PlannedAt time.Time
+	Initiator LeafMobilityInitiatorSnapshot
 }
 
 var ErrPathAttachInProgress = errors.New("engine: path attach already in progress for leaf")
@@ -366,20 +375,23 @@ type pathSlot struct {
 	// it before queue publication to hold a job between the two TX fence checks.
 	dispatchBeforeWritePermit func()
 
-	quit              chan struct{}
-	quitOnce          sync.Once
-	doneR             chan struct{} // closed when reader goroutine exits
-	doneW             chan struct{} // closed when data writer goroutine exits
-	admissionInbox    chan pathAdmissionMessage
-	admissionDone     chan struct{}
-	admissionOnce     sync.Once
-	admissionRollback atomic.Bool
-	readerStarted     atomic.Bool
-	writerStarted     atomic.Bool
-	proberStarted     atomic.Bool
-	doneP             chan struct{}
-	retireTracked     atomic.Bool
-	retireStarted     atomic.Bool
+	quit                  chan struct{}
+	quitOnce              sync.Once
+	doneR                 chan struct{} // closed when reader goroutine exits
+	doneW                 chan struct{} // closed when data writer goroutine exits
+	admissionInbox        chan pathAdmissionMessage
+	admissionDone         chan struct{}
+	admissionOnce         sync.Once
+	admissionRollback     atomic.Bool
+	readerStarted         atomic.Bool
+	writerStarted         atomic.Bool
+	proberStarted         atomic.Bool
+	doneP                 chan struct{}
+	retireTracked         atomic.Bool
+	retireStarted         atomic.Bool
+	mobilityRefreshMu     sync.Mutex
+	mobilityRefreshCancel func()
+	mobilityRefreshClosed bool
 }
 
 type pathAckWrite struct {
@@ -537,6 +549,7 @@ func (s *pathSlot) noteRecv(at time.Time) {
 // all signal a slot to exit without panicking on a double close.
 func (s *pathSlot) closeQuit() {
 	s.quitOnce.Do(func() {
+		s.cancelMobilityRefresh()
 		s.completeAdmission()
 		s.ackMu.Lock()
 		s.ackClosed = true
@@ -608,6 +621,14 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		policyQueued:            make(map[policyMessageKey]struct{}),
 		leafTx:                  newLeafMobilityRuntime(),
 		leafIssuer:              leafmobility.NewAuthorityIssuer(),
+		leafRefreshPending:      make(map[PathRef]leafMobilityRefreshEvent),
+		leafRefreshRunning:      make(map[PathRef]struct{}),
+		leafRefreshCancel:       make(map[PathRef]context.CancelCauseFunc),
+		leafRefreshSeen:         make(map[PathRef]uint64),
+		leafRefreshBudget:       make(map[PathRef]leafMobilityRefreshBudget),
+		leafRefreshStatus:       make(map[PathRef]LeafMobilityInitiatorSnapshot),
+		leafRefreshWake:         make(chan struct{}, 1),
+		leafRefreshRetryWait:    make(chan struct{}),
 		zombieLeft:              limits.Clamp().ZombieMaxMigrations,
 		probeOutstanding:        make(map[uint64]time.Time),
 		closed:                  make(chan struct{}),
@@ -630,6 +651,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e.startCoreLoop(e.ackWriterLoop)
 	e.startCoreLoop(e.policyLoop)
 	e.startCoreLoop(e.leafMobilityLoop)
+	e.startCoreLoop(e.leafMobilityInitiatorLoop)
 	return e
 }
 
@@ -793,7 +815,12 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 // carrier exclusively.
 func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
 	e.sessionEpochMu.Lock()
-	defer e.sessionEpochMu.Unlock()
+	epochLocked := true
+	defer func() {
+		if epochLocked {
+			e.sessionEpochMu.Unlock()
+		}
+	}()
 	if pc == nil {
 		return 0, errors.New("engine: nil PathConn")
 	}
@@ -947,7 +974,10 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	}
 	e.pendingPaths[id] = slot
 	e.pathsMu.Unlock()
+	e.sessionEpochMu.Unlock()
+	epochLocked = false
 	e.retirePathSet(completedOverlap)
+	e.registerLeafMobilityRefresh(slot)
 	return id, nil
 }
 
@@ -1184,6 +1214,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 
 	go e.pathWriterLoop(slot)
 	go e.proberLoop(slot)
+	e.signalLeafMobilityRetry()
 	for _, existing := range retired {
 		e.retirePathAsync(existing)
 	}
@@ -1419,6 +1450,7 @@ func (e *Engine) Paths() []transport.PathInfo {
 // TopologySnapshot returns one coherent public-observation epoch.
 func (e *Engine) TopologySnapshot() TopologySnapshot {
 	e.pathsMu.RLock()
+	e.leafRefreshMu.Lock()
 	activeID := e.activeID
 	slots := e.pathSlotsLocked()
 	snapshot := TopologySnapshot{
@@ -1430,13 +1462,15 @@ func (e *Engine) TopologySnapshot() TopologySnapshot {
 		if slot.mobilityClaim == nil {
 			continue
 		}
+		facts := slot.mobilityClaim.Snapshot()
 		snapshot.LeafMobility = append(snapshot.LeafMobility, LeafMobilitySnapshot{
 			Ref:       PathRef{ID: slot.id, Owner: slot.owner},
 			Binding:   PathBinding{LocalTXTargetID: slot.localTXTargetID, PeerTXTargetID: slot.peerTXTargetID},
-			Facts:     slot.mobilityFacts,
-			PlannedAt: slot.attached,
+			Facts:     facts,
+			Initiator: e.leafRefreshStatus[PathRef{ID: slot.id, Owner: slot.owner}],
 		})
 	}
+	e.leafRefreshMu.Unlock()
 	e.pathsMu.RUnlock()
 	snapshot.Paths = pathInfos(slots, activeID)
 	return snapshot
@@ -2017,21 +2051,18 @@ func (e *Engine) BondStuckSkips() uint64 {
 	return legacy
 }
 
-// MigrationCount returns the cumulative number of active-path
-// changes since this engine was created, excluding the initial
-// active-path assignment. Both explicit Migrate() calls and
-// death-driven failover via onPathDeath contribute. Production
-// dashboards can use this to gauge churn on a flow.
+// MigrationCount returns the cumulative number of committed migrations since
+// this engine was created, excluding initial activation. In-place leaf
+// mobility contributes even though the logical path ID remains unchanged.
 func (e *Engine) MigrationCount() uint64 {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	return e.migrationCount
 }
 
-// OnMigrate registers fn to be invoked (in a fresh goroutine) every
-// time the engine's active path changes. cause is one of "explicit"
-// (Migrate called by app) or "death" (onPathDeath promoting another
-// path). The returned function cancels the subscription.
+// OnMigrate registers fn to be invoked in a fresh goroutine for every
+// committed migration. oldID equals newID for in-place leaf mobility. The
+// returned function cancels the subscription.
 //
 // Hooks run after pathsMu has been released, so fn may safely call
 // back into the root package's narrow control interfaces.

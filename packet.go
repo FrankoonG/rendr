@@ -120,7 +120,7 @@ func (c *enginePacketConn) RecvDups() uint64        { return c.e.RecvDups() }
 func (c *enginePacketConn) BondStuckSkips() uint64  { return c.e.BondStuckSkips() }
 func (c *enginePacketConn) MigrationCount() uint64  { return c.e.MigrationCount() }
 
-// OnMigrate registers a callback fired on every active-path change.
+// OnMigrate registers a callback fired on every committed migration.
 func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
 }
@@ -155,7 +155,6 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
-	c.status.setMobilityForSpec(spec, planPathConnMobility(c.resolver.carrierFamily(spec.Transport), pc))
 	if err := ctx.Err(); err != nil {
 		_ = pc.Close()
 		return 0, err

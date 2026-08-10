@@ -76,7 +76,7 @@ func TestPathStatusDoesNotDependOnTransportName(t *testing.T) {
 			Transport: transportName,
 			Address:   "example.invalid:443",
 		}, "leaf")
-		return newPathStatusTracker([]PathSpec{spec}, "leaf").snapshot(nil)
+		return newPathStatusTracker([]PathSpec{spec}, "leaf").snapshot(nil, nil)
 	}
 
 	baseline := statusFor("custom")
@@ -109,11 +109,11 @@ func TestAttachedGenericPathHasStableRedialMobilityStatus(t *testing.T) {
 		t.Fatalf("path snapshots=%d/%d want=1/1", len(first.Paths), len(second.Paths))
 	}
 	got := first.Paths[0].Mobility
-	if got.ID != MobilityRedialAttach || got.Reason != MobilityReasonEndpointNotOwned || got.PlannedAt.IsZero() {
+	if got.ID != MobilityRedialAttach || got.State != MobilityStateBaseline || got.Reason != MobilityReasonEndpointNotOwned {
 		t.Fatalf("generic mobility=%+v", got)
 	}
-	if second.Paths[0].Mobility.PlannedAt != got.PlannedAt {
-		t.Fatalf("planned timestamp changed across observations: %v -> %v", got.PlannedAt, second.Paths[0].Mobility.PlannedAt)
+	if !reflect.DeepEqual(second.Paths[0].Mobility, got) {
+		t.Fatalf("generic mobility changed across observations: %+v -> %+v", got, second.Paths[0].Mobility)
 	}
 }
 

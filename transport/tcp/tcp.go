@@ -95,6 +95,8 @@ func Wrap(c net.Conn) *PathConn {
 func wrapOwned(c *net.TCPConn, role leafmobility.Role) *PathConn {
 	path := Wrap(c)
 	path.claim = newOwnedClaim(path.endpoint, role)
+	path.refreshState = leafmobility.NewRefreshSourceState()
+	path.refreshEmitter, _ = leafmobility.NewRefreshEmitterWithSourceState(path.claim, path.refreshState)
 	return path
 }
 
@@ -109,6 +111,12 @@ func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 type PathConn struct {
 	endpoint *endpointOwner
 	claim    *leafmobility.Claim
+
+	refreshMu       sync.Mutex
+	refreshState    *leafmobility.RefreshSourceState
+	refreshEmitter  *leafmobility.RefreshEmitter
+	refreshCallback func(leafmobility.RefreshEvidence)
+	refreshMonitor  pathRefreshMonitor
 
 	readMu  sync.Mutex // preserves partial frame state across endpoint maintenance
 	writeMu sync.Mutex // serialises framed Writes
@@ -218,13 +226,71 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 // Close shuts the socket. After Close, Read and Write return
 // net.ErrClosed. Close idempotency: extra calls are no-ops.
 func (p *PathConn) Close() error {
+	p.stopRefreshMonitor()
+	var closeErr error
 	p.claim.RetireUnbound()
 	if p.dead.CompareAndSwap(false, true) {
-		err := p.endpoint.close()
-		p.publishTerminal(true, err)
-		return err
+		closeErr = p.endpoint.close()
+		p.publishTerminal(true, closeErr)
 	}
-	return nil
+	p.waitRefreshMonitor()
+	return closeErr
+}
+
+// SubscribeLeafMobilityRefresh installs the engine's non-blocking factual
+// refresh callback. The Linux implementation lazily starts one exact
+// route/source monitor only after both peers negotiated the specialized
+// operation; generic TCP paths pay no monitor cost.
+func (p *PathConn) SubscribeLeafMobilityRefresh(ctx context.Context, fn func(leafmobility.RefreshEvidence)) (func(), error) {
+	if p == nil || fn == nil {
+		return nil, errors.New("tcp: invalid leaf mobility refresh subscriber")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+	if p.dead.Load() || p.refreshEmitter == nil {
+		return nil, errors.New("tcp: leaf mobility refresh is unavailable")
+	}
+	if p.refreshCallback != nil || p.refreshMonitor != nil {
+		return nil, errors.New("tcp: leaf mobility refresh subscriber already installed")
+	}
+	p.refreshCallback = fn
+	monitor, err := newPathRefreshMonitor(ctx, p)
+	if err != nil {
+		p.refreshCallback = nil
+		return nil, err
+	}
+	p.refreshMonitor = monitor
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.refreshMu.Lock()
+			p.refreshCallback = nil
+			monitor := p.refreshMonitor
+			p.refreshMu.Unlock()
+			if monitor != nil {
+				monitor.Stop()
+			}
+		})
+	}, nil
+}
+
+func (p *PathConn) CommitLeafMobilityRefresh(evidence leafmobility.RefreshEvidence) error {
+	if p == nil || p.refreshState == nil {
+		return errors.New("tcp: leaf mobility refresh state is unavailable")
+	}
+	p.refreshMu.Lock()
+	monitor := p.refreshMonitor
+	p.refreshMu.Unlock()
+	if monitor == nil {
+		return errors.New("tcp: leaf mobility refresh monitor is unavailable")
+	}
+	return p.refreshState.CommitCurrent(evidence, monitor.Commit)
 }
 
 // CloseWrite half-closes the underlying TCP write side when available.
@@ -297,8 +363,49 @@ func (p *PathConn) declareDeath(err error) {
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}
+	p.stopRefreshMonitor()
 	_ = p.endpoint.close()
 	p.publishTerminal(false, err)
+}
+
+func (p *PathConn) publishRefresh(reason leafmobility.RefreshReason, source leafmobility.RefreshSourceSnapshot) {
+	p.refreshMu.Lock()
+	emitter := p.refreshEmitter
+	callback := p.refreshCallback
+	p.refreshMu.Unlock()
+	if emitter == nil || callback == nil {
+		return
+	}
+	evidence, err := emitter.Observe(reason, source)
+	if err != nil {
+		return
+	}
+	callback(evidence)
+}
+
+func (p *PathConn) stopRefreshMonitor() {
+	if p == nil {
+		return
+	}
+	p.refreshMu.Lock()
+	p.refreshCallback = nil
+	monitor := p.refreshMonitor
+	p.refreshMu.Unlock()
+	if monitor != nil {
+		monitor.Stop()
+	}
+}
+
+func (p *PathConn) waitRefreshMonitor() {
+	if p == nil {
+		return
+	}
+	p.refreshMu.Lock()
+	monitor := p.refreshMonitor
+	p.refreshMu.Unlock()
+	if monitor != nil {
+		<-monitor.Done()
+	}
 }
 
 func (p *PathConn) publishTerminal(local bool, err error) {

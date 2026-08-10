@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -24,6 +25,11 @@ import (
 )
 
 func TestPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T) {
+	runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t)
+}
+
+func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T) {
+	t.Helper()
 	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_TEST") != "1" {
 		t.Skip("set RENDR_TCP_REPAIR_DRIVER_TEST=1 to exercise the real driver")
 	}
@@ -90,6 +96,40 @@ func TestPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T
 		t.Fatalf("cross-namespace rollback retained state: %+v", fixture.attempt)
 	}
 	assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+}
+
+func TestPrivilegedTCPRepairRollbackResourceSlope(t *testing.T) {
+	if os.Getenv("RENDR_TCP_REPAIR_SLOPE_TEST") != "1" {
+		t.Skip("set RENDR_TCP_REPAIR_SLOPE_TEST=1 to exercise rollback resources")
+	}
+	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_NETNS") != "1" {
+		t.Fatal("rollback resource test must run in a dedicated network namespace")
+	}
+	const (
+		cycles       = 200
+		warmupCycles = 20
+	)
+	baseline := sampleRefreshResources(t)
+	var warm refreshResourceSample
+	for cycle := 1; cycle <= cycles; cycle++ {
+		t.Run(fmt.Sprintf("cycle-%03d", cycle), func(t *testing.T) {
+			runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t)
+		})
+		assertNoRefreshQuarantineTables(t)
+		if cycle == warmupCycles {
+			warm = sampleRefreshResources(t)
+		}
+	}
+	end := sampleRefreshResources(t)
+	if end.fds > baseline.fds+4 || end.goroutines > baseline.goroutines+8 {
+		t.Fatalf("rollback resource slope: baseline=%+v end=%+v", baseline, end)
+	}
+	if end.heapInuse > warm.heapInuse+(16<<20) {
+		t.Fatalf("rollback heap slope: warm=%d end=%d", warm.heapInuse, end.heapInuse)
+	}
+	if end.rss > warm.rss+(32<<20) {
+		t.Fatalf("rollback RSS slope: warm=%d end=%d", warm.rss, end.rss)
+	}
 }
 
 func TestPrivilegedTCPRepairDriverMigratesActiveDataWithIndependentControlRoute(t *testing.T) {
@@ -265,6 +305,8 @@ func drivenRepairPath(conn *net.TCPConn, role leafmobility.Role) (*PathConn, *tc
 		Kind: leafmobility.KindRawTCP, Role: role, Session: leafmobility.SessionStream,
 		Generation: leafmobility.NextGeneration(),
 	}, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint), path.endpoint)
+	path.refreshState = leafmobility.NewRefreshSourceState()
+	path.refreshEmitter, _ = leafmobility.NewRefreshEmitterWithSourceState(path.claim, path.refreshState)
 	return path, driver
 }
 

@@ -24,6 +24,21 @@ func (e *Engine) PlanLeafMobilityCandidate(
 	transactionID leafmobility.TransactionID,
 	direction proto.SenderDirection,
 ) (leafmobility.Plan, error) {
+	if e == nil {
+		return leafmobility.Plan{}, ErrStalePathRef
+	}
+	return e.planLeafMobilityCandidateUntil(
+		ctx, ref, transactionID, direction, time.Now().Add(e.limits.MigrationBudget),
+	)
+}
+
+func (e *Engine) planLeafMobilityCandidateUntil(
+	ctx context.Context,
+	ref PathRef,
+	transactionID leafmobility.TransactionID,
+	direction proto.SenderDirection,
+	deadline time.Time,
+) (leafmobility.Plan, error) {
 	if e == nil || ref.ID == 0 || ref.Owner == 0 {
 		return leafmobility.Plan{}, ErrStalePathRef
 	}
@@ -59,7 +74,6 @@ func (e *Engine) PlanLeafMobilityCandidate(
 	if e.Packetized() {
 		session = leafmobility.SessionPacket
 	}
-	deadline := time.Now().Add(e.limits.MigrationBudget)
 	plan, err := leafmobility.PlanCandidate(ctx, claim, leafmobility.PlanRequest{
 		TransactionID: transactionID,
 		Binding:       binding,

@@ -486,6 +486,60 @@ func TestTCPRepairAttemptPrepareInstallsQuarantineUnderMaintenance(t *testing.T)
 	assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
 }
 
+func TestTCPRepairAttemptRejectsRouteChangeAtDestructiveBoundaries(t *testing.T) {
+	baseline := routeObservation{migration: [32]byte{0x31}, factual: [32]byte{0x41}, usable: true}
+	changed := routeObservation{migration: [32]byte{0x32}, factual: [32]byte{0x42}, usable: true}
+
+	t.Run("after preflight before quarantine", func(t *testing.T) {
+		fixture := newRepairDriverFixture(t)
+		fixture.attempt.routeObservation = baseline
+		fixture.attempt.driver.routeObserve = func(context.Context, *net.TCPConn, tcpRouteFlowKey) (routeObservation, error) {
+			return changed, nil
+		}
+		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err == nil {
+			t.Fatal("Prepare accepted a changed replacement route")
+		}
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+			t.Fatal(err)
+		}
+		if events := fixture.trace.snapshot(); len(events) != 0 {
+			t.Fatalf("route change before quarantine invoked kernel operations: %v", events)
+		}
+		assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+	})
+
+	t.Run("after capture before source close", func(t *testing.T) {
+		fixture := newRepairDriverFixture(t)
+		fixture.attempt.routeObservation = baseline
+		observations := 0
+		fixture.attempt.driver.routeObserve = func(context.Context, *net.TCPConn, tcpRouteFlowKey) (routeObservation, error) {
+			observations++
+			if observations == 1 {
+				return baseline, nil
+			}
+			return changed, nil
+		}
+		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err == nil {
+			t.Fatal("Stage closed a source after its replacement route changed")
+		}
+		if fixture.attempt.sourceLease == nil || fixture.attempt.sourceLease.State() != tcprepair.SourceStateRepair {
+			t.Fatalf("route rejection lost recoverable source lease: %+v", fixture.attempt.sourceLease)
+		}
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range fixture.trace.snapshot() {
+			if event == "restore" {
+				t.Fatal("route change before source close invoked replacement restore")
+			}
+		}
+		assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+	})
+}
+
 func TestTCPRepairAttemptPrepareFailuresRollbackMaintenance(t *testing.T) {
 	prepareFailure := errors.New("prepare failure")
 	tests := []struct {

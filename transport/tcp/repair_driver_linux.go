@@ -103,6 +103,8 @@ type tcpRepairDriver struct {
 	quarantine    quarantineManager
 	quarantineErr error
 	newExecutor   repairExecutorFactory
+	routeFlowKey  func(*net.TCPConn) (tcpRouteFlowKey, error)
+	routeObserve  func(context.Context, *net.TCPConn, tcpRouteFlowKey) (routeObservation, error)
 	probeSequence atomic.Uint64
 }
 
@@ -121,6 +123,33 @@ func newTCPRepairDriver(endpoint *endpointOwner) *tcpRepairDriver {
 		driver.quarantine = systemQuarantineManager{manager: manager}
 	}
 	return driver
+}
+
+func (driver *tcpRepairDriver) captureRouteObservation(
+	ctx context.Context,
+	conn *net.TCPConn,
+) (tcpRouteFlowKey, routeObservation, error) {
+	flowKey := tcpRouteFlowKeyForConn
+	if driver != nil && driver.routeFlowKey != nil {
+		flowKey = driver.routeFlowKey
+	}
+	flow, err := flowKey(conn)
+	if err != nil {
+		return tcpRouteFlowKey{}, routeObservation{}, err
+	}
+	observation, err := driver.observeRoute(ctx, conn, flow)
+	return flow, observation, err
+}
+
+func (driver *tcpRepairDriver) observeRoute(
+	ctx context.Context,
+	conn *net.TCPConn,
+	flow tcpRouteFlowKey,
+) (routeObservation, error) {
+	if driver != nil && driver.routeObserve != nil {
+		return driver.routeObserve(ctx, conn, flow)
+	}
+	return observeTCPRouteFlow(ctx, conn, flow)
 }
 
 func (*tcpRepairDriver) Operation() leafmobility.Operation {
@@ -162,6 +191,11 @@ func (driver *tcpRepairDriver) Preflight(
 		return driver.ineligible(request, leafmobility.StagePreflight, leafmobility.ReasonPreflightRejected, false,
 			tcpRepairProbe{ID: leafmobility.ProbeEndpointState, Label: "socket-namespace-mismatch"})
 	}
+	routeFlow, routeObservation, err := driver.captureRouteObservation(ctx, tcpConn)
+	if err != nil {
+		return driver.ineligible(request, leafmobility.StageTuple, leafmobility.ReasonTupleNotPreservable, false,
+			tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: "socket-policy-not-restorable"})
+	}
 	inspection, inspectErr := driver.kernel.Inspect(tcpConn)
 	if inspectErr != nil {
 		stage, reason := classifyRepairInspection(inspectErr)
@@ -174,7 +208,10 @@ func (driver *tcpRepairDriver) Preflight(
 			tcpRepairProbe{ID: leafmobility.ProbeEndpointState, Label: "owner-generation-changed"})
 	}
 	endpointProbe := tcpRepairProbe{ID: leafmobility.ProbeEndpointState, Label: "established", Inspection: inspection}
-	tupleProbe := tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: "ipv4-same-tuple", Inspection: inspection}
+	tupleProbe := tcpRepairProbe{
+		ID: leafmobility.ProbeTuple, Label: "exact-replacement-flow-v2", Inspection: inspection,
+		RouteMigration: routeObservation.migration, RouteFactual: routeObservation.factual,
+	}
 	rollbackProbe := tcpRepairProbe{ID: leafmobility.ProbeRollbackReadiness, Label: "transparent-snapshot-restore-v1", Inspection: inspection}
 	if driver.quarantine == nil || driver.quarantineErr != nil {
 		return driver.ineligible(request, leafmobility.StageQuarantine, leafmobility.ReasonQuarantineUnavailable, false,
@@ -207,12 +244,14 @@ func (driver *tcpRepairDriver) Preflight(
 	}
 	evidence := digestRepairAttempt(request, probes)
 	attempt := &tcpRepairAttempt{
-		driver:          driver,
-		preflight:       request,
-		inspection:      inspection,
-		ownerGeneration: ownerGeneration,
-		evidence:        leafmobility.AttemptEvidence{Digest: evidence, ProbeReferences: probes},
-		stage:           repairAttemptPreflight,
+		driver:           driver,
+		preflight:        request,
+		inspection:       inspection,
+		ownerGeneration:  ownerGeneration,
+		routeFlow:        routeFlow,
+		routeObservation: routeObservation,
+		evidence:         leafmobility.AttemptEvidence{Digest: evidence, ProbeReferences: probes},
+		stage:            repairAttemptPreflight,
 	}
 	return attempt, leafmobility.PreflightResult{
 		Eligible: true, Stage: leafmobility.StagePreflightComplete,
@@ -256,9 +295,11 @@ func tcpRepairPlatformReason(ctx context.Context, request leafmobility.Preflight
 }
 
 type tcpRepairProbe struct {
-	ID         leafmobility.ProbeID
-	Label      string
-	Inspection tcprepair.Inspection
+	ID             leafmobility.ProbeID
+	Label          string
+	Inspection     tcprepair.Inspection
+	RouteMigration [sha256.Size]byte
+	RouteFactual   [sha256.Size]byte
 }
 
 func (driver *tcpRepairDriver) ineligible(
@@ -319,6 +360,8 @@ func digestRepairProbe(request leafmobility.PreflightRequest, observation tcpRep
 	binary.BigEndian.PutUint64(scalar[:], request.Facts.Generation)
 	_, _ = hash.Write(scalar[:])
 	writeRepairInspection(hash, observation.Inspection)
+	_, _ = hash.Write(observation.RouteMigration[:])
+	_, _ = hash.Write(observation.RouteFactual[:])
 	var digest leafmobility.EvidenceDigest
 	copy(digest[:], hash.Sum(nil))
 	return digest
@@ -413,12 +456,14 @@ const (
 type tcpRepairAttempt struct {
 	mu sync.Mutex
 
-	driver          *tcpRepairDriver
-	preflight       leafmobility.PreflightRequest
-	inspection      tcprepair.Inspection
-	ownerGeneration uint64
-	evidence        leafmobility.AttemptEvidence
-	stage           repairAttemptStage
+	driver           *tcpRepairDriver
+	preflight        leafmobility.PreflightRequest
+	inspection       tcprepair.Inspection
+	ownerGeneration  uint64
+	routeFlow        tcpRouteFlowKey
+	routeObservation routeObservation
+	evidence         leafmobility.AttemptEvidence
+	stage            repairAttemptStage
 
 	maintenance           *endpointMaintenance
 	source                *net.TCPConn
@@ -469,6 +514,12 @@ func (attempt *tcpRepairAttempt) Prepare(ctx context.Context, request leafmobili
 		return err
 	}
 	attempt.executor = executor
+	if attempt.routeObservation.migration != ([sha256.Size]byte{}) {
+		currentRoute, routeErr := attempt.driver.observeRoute(ctx, source, attempt.routeFlow)
+		if routeErr != nil || !sameRouteObservation(currentRoute, attempt.routeObservation) {
+			return errors.Join(errors.New("tcp: replacement route changed after preflight"), routeErr)
+		}
+	}
 	var inspection tcprepair.Inspection
 	err = attempt.executor.Do(ctx, func(context.Context) error {
 		var inspectErr error
@@ -535,6 +586,12 @@ func (attempt *tcpRepairAttempt) Stage(
 		return leafmobility.PublicationEvidence{}, errors.New("tcp: repair snapshot tuple changed")
 	}
 	err = attempt.executor.Do(ctx, func(operationCtx context.Context) error {
+		if attempt.routeObservation.migration != ([sha256.Size]byte{}) {
+			currentRoute, routeErr := attempt.driver.observeRoute(operationCtx, attempt.source, attempt.routeFlow)
+			if routeErr != nil || !sameRouteObservation(currentRoute, attempt.routeObservation) {
+				return errors.Join(errors.New("tcp: replacement route changed before source cutover"), routeErr)
+			}
+		}
 		if closeErr := attempt.sourceLease.Close(); closeErr != nil {
 			return fmt.Errorf("tcp: close captured source: %w", closeErr)
 		}
@@ -545,6 +602,13 @@ func (attempt *tcpRepairAttempt) Stage(
 		if restoreErr != nil {
 			return restoreErr
 		}
+		if attempt.routeObservation.migration != ([sha256.Size]byte{}) {
+			replacementRoute, routeErr := attempt.driver.observeRoute(operationCtx, replacement, attempt.routeFlow)
+			if routeErr != nil || !sameRouteObservation(replacementRoute, attempt.routeObservation) {
+				_ = replacement.Close()
+				return errors.Join(errors.New("tcp: replacement route changed after restore"), routeErr)
+			}
+		}
 		attempt.replacement = replacement
 		return nil
 	})
@@ -553,6 +617,10 @@ func (attempt *tcpRepairAttempt) Stage(
 	}
 	attempt.stage = repairAttemptStaged
 	return leafmobility.PublicationEvidence{Digest: leafmobility.EvidenceDigest(attempt.snapshot.Digest())}, nil
+}
+
+func sameRouteObservation(left, right routeObservation) bool {
+	return left.usable && right.usable && left.migration == right.migration
 }
 
 func (attempt *tcpRepairAttempt) Publish(ctx context.Context, request leafmobility.ExecutionRequest) error {

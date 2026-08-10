@@ -99,19 +99,16 @@ type ConnectionObserver interface {
 	// BondStuckRTTMultiplier. Always zero outside bond mode.
 	BondStuckSkips() uint64
 
-	// MigrationCount returns the cumulative number of active-path
-	// changes since this Conn was established (initial activation
-	// is not counted). Both explicit Migrate calls and death-
-	// driven failover contribute. Production dashboards use this
-	// to detect churn that may need human attention.
+	// MigrationCount returns the cumulative number of committed
+	// migrations since this Conn was established (initial activation
+	// is not counted). Explicit target changes, death-driven failover,
+	// and in-place leaf mobility all contribute.
 	MigrationCount() uint64
 
 	// OnMigrate registers fn to fire (in its own goroutine) on every
-	// active-path change. cause is "explicit" for Migrate-driven
-	// transitions and "death" for failover via onPathDeath. The
-	// returned cancel function unsubscribes. Use this instead of
-	// polling MigrationCount when you want push-based notification
-	// (e.g. metrics, structured logs).
+	// committed migration. oldID equals newID for in-place leaf
+	// mobility. The returned cancel function unsubscribes. Use this
+	// instead of polling MigrationCount for push-based observation.
 	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
 
 	// Mode returns the current operational mode

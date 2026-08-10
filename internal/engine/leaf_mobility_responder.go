@@ -134,6 +134,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 			delete(e.leafTx.incoming, prepare.TransactionID)
 		}
 		e.leafTx.mu.Unlock()
+		e.signalLeafMobilityRetry()
 	}()
 	reject := func(code proto.LeafMobilityPeerPlanAckCode, reason string) error {
 		return e.rejectLeafMobilityPrepare(source, seq, prepare, digest, code, reason, deadline)
@@ -356,6 +357,7 @@ func (e *Engine) rejectLeafMobilityPrepare(
 		source: source, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
 	}
 	e.leafTx.mu.Unlock()
+	e.signalLeafMobilityRetry()
 	return e.publishRejectedLeafMobilityPrepare(rejectedLeafMobilityTransaction{
 		source: source, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
 	}, deadline)
@@ -625,6 +627,7 @@ func (e *Engine) completeIncomingLeafMobilityLocked(incoming *incomingLeafMobili
 		retireAfter:   time.Now().Add(e.leafMobilityRecordRetention()),
 	}
 	e.pruneLeafMobilityRecordsLocked(time.Now())
+	e.signalLeafMobilityRetry()
 }
 
 func (e *Engine) replayCompletedLeafMobility(

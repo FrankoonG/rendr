@@ -117,9 +117,6 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		return nil, err
 	}
 	tracker := newPathStatusTracker(paths, plan.primaryName)
-	for index, spec := range paths {
-		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
-	}
 
 	instanceID := d.instanceID()
 	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, false)
@@ -197,9 +194,6 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		return nil, err
 	}
 	tracker := newPathStatusTracker(paths, plan.primaryName)
-	for index, spec := range paths {
-		tracker.setMobility(index, planLeafMobility(resolver.carrierFamily(spec.Transport)))
-	}
 
 	instanceID := d.instanceID()
 	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, true)
@@ -358,7 +352,6 @@ func (d *sessionDialer) dialInitialPath(
 		if packetMode {
 			e.SetPacketMode()
 		}
-		tracker.setMobility(i, planPathConnMobility(resolver.carrierFamily(ps.Transport), pc))
 		tracker.set(i, PathHandshaking, nil)
 		admission, err := engine.PerformClientHelloAdmissionContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps)
 		if err != nil {
@@ -407,7 +400,6 @@ func (d *sessionDialer) attachExtraPath(ctx context.Context, e *engine.Engine, p
 		tracker.set(index, PathUnavailable, err)
 		return 0, err
 	}
-	tracker.setMobility(index, planPathConnMobility(resolver.carrierFamily(ps.Transport), spc))
 	tracker.set(index, PathHandshaking, nil)
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, spc, e, pathSpecName(ps), ps)
 	if err != nil {

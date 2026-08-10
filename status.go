@@ -191,7 +191,6 @@ type pathStatusTracker struct {
 type trackedPathStatus struct {
 	spec      PathSpec
 	state     PathState
-	mobility  MobilityStatus
 	lastError string
 }
 
@@ -225,31 +224,7 @@ func (t *pathStatusTracker) set(index int, state PathState, err error) {
 	}
 }
 
-func (t *pathStatusTracker) setMobility(index int, mobility MobilityStatus) {
-	if t == nil || index < 0 || index >= len(t.paths) {
-		return
-	}
-	t.mu.Lock()
-	t.paths[index].mobility = mobility
-	t.mu.Unlock()
-}
-
-func (t *pathStatusTracker) setMobilityForSpec(spec PathSpec, mobility MobilityStatus) {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for index := range t.paths {
-		tracked := t.paths[index].spec
-		if pathSpecName(tracked) == pathSpecName(spec) && tracked.Transport == spec.Transport && tracked.Address == spec.Address {
-			t.paths[index].mobility = mobility
-			return
-		}
-	}
-}
-
-func (t *pathStatusTracker) snapshot(attached []PathInfo, carrierMaps ...map[string]CarrierFamily) []PathStatus {
+func (t *pathStatusTracker) snapshot(attached []PathInfo, mobilityByPath map[uint32]MobilityStatus, carrierMaps ...map[string]CarrierFamily) []PathStatus {
 	if t == nil {
 		return nil
 	}
@@ -265,20 +240,20 @@ func (t *pathStatusTracker) snapshot(attached []PathInfo, carrierMaps ...map[str
 	for _, tracked := range t.paths {
 		if idx := matchAttachedPath(tracked.spec, attached, used); idx >= 0 {
 			used[idx] = true
-			out = append(out, pathStatusFromInfo(attached[idx], tracked.mobility, carriers))
+			out = append(out, pathStatusFromInfo(attached[idx], mobilityByPath[attached[idx].ID], carriers))
 			continue
 		}
 		out = append(out, PathStatus{
 			Name:      pathSpecName(tracked.spec),
 			Carrier:   carrierForPathSpec(tracked.spec, carriers),
 			State:     tracked.state,
-			Mobility:  tracked.mobility,
+			Mobility:  planLeafMobility(carrierForPathSpec(tracked.spec, carriers)),
 			LastError: tracked.lastError,
 		})
 	}
 	for i, p := range attached {
 		if !used[i] {
-			out = append(out, pathStatusFromInfo(p, MobilityStatus{}, carriers))
+			out = append(out, pathStatusFromInfo(p, mobilityByPath[p.ID], carriers))
 		}
 	}
 	return out
@@ -322,26 +297,18 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 	}
 	topology := e.TopologySnapshot()
 	paths := topology.Paths
-	out := tracker.snapshot(paths, carriers)
+	mobilityByPath := make(map[uint32]MobilityStatus, len(paths))
+	for _, path := range paths {
+		mobilityByPath[path.ID] = planLeafMobility(carrierForPathSpec(path.Spec, carriers))
+	}
+	for _, owned := range topology.LeafMobility {
+		mobilityByPath[owned.Ref.ID] = projectLeafMobility(owned)
+	}
+	out := tracker.snapshot(paths, mobilityByPath, carriers)
 	if out == nil {
 		out = make([]PathStatus, 0, len(paths))
 		for _, p := range paths {
-			out = append(out, pathStatusFromInfo(p, MobilityStatus{}, carriers))
-		}
-	}
-	mobilityByPath := make(map[uint32]MobilityStatus, len(paths))
-	for _, path := range paths {
-		mobilityByPath[path.ID] = planLeafMobilityAt(path.Since)
-	}
-	for _, owned := range topology.LeafMobility {
-		mobilityByPath[owned.Ref.ID] = planLeafMobilityAt(
-			owned.PlannedAt,
-			owned.Facts,
-		)
-	}
-	for index := range out {
-		if mobility, ok := mobilityByPath[out[index].ID]; ok {
-			out[index].Mobility = mobility
+			out = append(out, pathStatusFromInfo(p, mobilityByPath[p.ID], carriers))
 		}
 	}
 	return Status{

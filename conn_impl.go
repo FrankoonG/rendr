@@ -115,10 +115,10 @@ func (c *engineBackedConn) RecvDups() uint64 { return c.e.RecvDups() }
 // BondStuckSkips returns the cumulative bond stuck-skip count.
 func (c *engineBackedConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips() }
 
-// MigrationCount returns the cumulative active-path-change count.
+// MigrationCount returns the cumulative committed-migration count.
 func (c *engineBackedConn) MigrationCount() uint64 { return c.e.MigrationCount() }
 
-// OnMigrate registers a callback fired on every active-path change.
+// OnMigrate registers a callback fired on every committed migration.
 func (c *engineBackedConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
 }
@@ -184,7 +184,6 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
-	c.status.setMobilityForSpec(spec, planPathConnMobility(c.resolver.carrierFamily(spec.Transport), pc))
 	if err := ctx.Err(); err != nil {
 		_ = pc.Close()
 		return 0, err

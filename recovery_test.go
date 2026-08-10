@@ -516,7 +516,7 @@ func TestRecoveryStatusUpdatesAreActorValidated(t *testing.T) {
 	}, []PathSpec{spec}, tracker, retryPolicy{MinBackoff: time.Second, MaxBackoff: time.Second})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		status := tracker.snapshot(nil)
+		status := tracker.snapshot(nil, nil)
 		if len(status) == 1 && status[0].State == PathPending && strings.Contains(status[0].LastError, "injected dial failure") {
 			supervisor.stop()
 			return
@@ -524,7 +524,7 @@ func TestRecoveryStatusUpdatesAreActorValidated(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	supervisor.stop()
-	t.Fatalf("recovery failure was not published through actor: %+v", tracker.snapshot(nil))
+	t.Fatalf("recovery failure was not published through actor: %+v", tracker.snapshot(nil, nil))
 }
 
 func TestRecoveryLeafPathRefChoosesNewestOwner(t *testing.T) {
@@ -626,7 +626,7 @@ func TestCleanRemovalRetiresLateSuccessfulRecoveryAttach(t *testing.T) {
 	if !recoveryLeafAttached(e.Paths(), guard) || e.IsClosed() {
 		t.Fatalf("late cleanup damaged guard/session: paths=%v closed=%t", e.Paths(), e.IsClosed())
 	}
-	statuses := tracker.snapshot(e.Paths())
+	statuses := tracker.snapshot(e.Paths(), nil)
 	if len(statuses) == 0 || statuses[0].State != PathUnavailable {
 		t.Fatalf("stale recovery completion overwrote tombstone status: %+v", statuses)
 	}
@@ -923,7 +923,7 @@ func waitForPacketReplacement(t *testing.T, client *enginePacketConn, server Pac
 			len(serverPaths) == 1 && serverPaths[0].ID != oldServerID {
 			return clientPaths[0].ID, serverPaths[0].ID
 		}
-		for _, path := range client.status.snapshot(clientPaths, client.carriers) {
+		for _, path := range client.status.snapshot(clientPaths, nil, client.carriers) {
 			if path.LastError != "" {
 				observedErrors[path.LastError] = struct{}{}
 			}

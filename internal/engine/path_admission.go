@@ -479,6 +479,7 @@ func (e *Engine) releasePathAdmissionTokenLocked(key pathAdmissionLeafKey, token
 	}
 	delete(e.pathAdmissionByLeaf, key)
 	reservation.release()
+	e.signalLeafMobilityRetry()
 	return true
 }
 

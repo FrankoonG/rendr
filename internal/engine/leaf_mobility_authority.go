@@ -26,6 +26,7 @@ var (
 	ErrLeafMobilityAuthorityBusy         = errors.New("engine: leaf mobility authority is busy")
 	ErrLeafMobilityAdmissionBusy         = errors.New("engine: leaf admission overlaps mobility authority")
 	ErrLeafMobilityRejected              = errors.New("engine: peer rejected leaf mobility transaction")
+	ErrLeafMobilityPeerBusy              = errors.New("engine: peer leaf mobility authority is busy")
 	ErrLeafMobilityOutcomeUnknown        = errors.New("engine: leaf mobility transaction outcome is unknown")
 	errLeafMobilityResponseUnavailable   = errors.New("engine: leaf mobility response route is unavailable")
 	errLeafMobilityResolutionUnpublished = errors.New("engine: leaf mobility resolution was not published")
@@ -920,30 +921,50 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 	ref PathRef,
 	plan leafmobility.Plan,
 ) (*LeafMobilityAuthority, error) {
+	return e.negotiateLeafMobilityAuthority(ctx, ref, plan, false)
+}
+
+func (e *Engine) negotiateLeafMobilityAuthority(
+	ctx context.Context,
+	ref PathRef,
+	plan leafmobility.Plan,
+	gateHeld bool,
+) (*LeafMobilityAuthority, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := plan.Validate(); err != nil {
+		if gateHeld {
+			e.releaseLeafMobilitySendGate()
+		}
 		return nil, err
 	}
 	if plan.Operation == 0 {
+		if gateHeld {
+			e.releaseLeafMobilitySendGate()
+		}
 		return nil, leafmobility.ErrBaselinePlan
 	}
 	claim, sourceSlot, err := e.validateLeafMobilitySource(ref, plan)
 	if err != nil {
+		if gateHeld {
+			e.releaseLeafMobilitySendGate()
+		}
 		return nil, err
 	}
-	select {
-	case e.leafTx.sendGate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-e.closed:
-		return nil, net.ErrClosed
+	if !gateHeld {
+		select {
+		case e.leafTx.sendGate <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-e.closed:
+			return nil, net.ErrClosed
+		}
 	}
 
 	lease := time.Until(plan.Deadline)
 	if lease <= 0 {
-		<-e.leafTx.sendGate
+		e.releaseLeafMobilitySendGate()
 		return nil, leafmobility.ErrPlanExpired
 	}
 	if lease > leafmobility.MaxPlanHorizon {
@@ -961,7 +982,7 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 	}
 	digest, err := prepare.ProposalDigest()
 	if err != nil {
-		<-e.leafTx.sendGate
+		e.releaseLeafMobilitySendGate()
 		return nil, err
 	}
 	outgoing := &outgoingLeafMobilityTransaction{
@@ -1054,6 +1075,10 @@ func (e *Engine) NegotiateLeafMobilityAuthority(
 			if event.ack.Code != proto.LeafMobilityPeerPlanAckCodeAccept {
 				_ = resourceTx.Abort()
 				e.finishOutgoingLeafMobility(outgoing)
+				if event.ack.Code == proto.LeafMobilityPeerPlanAckCodeBusy {
+					return nil, errors.Join(ErrLeafMobilityRejected, ErrLeafMobilityPeerBusy,
+						errors.New(event.ack.Reason))
+				}
 				return nil, fmt.Errorf("%w: %s", ErrLeafMobilityRejected, event.ack.Reason)
 			}
 			deadline := time.Now().Add(time.Duration(binding.LeaseMillis) * time.Millisecond)
@@ -2092,8 +2117,13 @@ func (e *Engine) leafMobilityRecordRetention() time.Duration {
 
 func (e *Engine) releaseLeafMobilityOutgoingGate(outgoing *outgoingLeafMobilityTransaction) {
 	if outgoing != nil && outgoing.gateHeld.CompareAndSwap(true, false) {
-		<-e.leafTx.sendGate
+		e.releaseLeafMobilitySendGate()
 	}
+}
+
+func (e *Engine) releaseLeafMobilitySendGate() {
+	<-e.leafTx.sendGate
+	e.signalLeafMobilityRetry()
 }
 
 func (e *Engine) outgoingCommitFrame(outgoing *outgoingLeafMobilityTransaction) []byte {

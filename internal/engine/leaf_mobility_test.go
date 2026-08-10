@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -14,6 +15,13 @@ type claimedMemoryPath struct {
 }
 
 func (p *claimedMemoryPath) LeafMobilityClaim() *leafmobility.Claim { return p.claim }
+
+func (p *claimedMemoryPath) SubscribeLeafMobilityRefresh(ctx context.Context, fn func(leafmobility.RefreshEvidence)) (func(), error) {
+	if source, ok := p.PathConn.(leafmobility.RefreshSource); ok {
+		return source.SubscribeLeafMobilityRefresh(ctx, fn)
+	}
+	return func() {}, nil
+}
 
 func TestOwnedLeafClaimBindsToOnePhysicalGeneration(t *testing.T) {
 	e, binding := admissionTestEngine(t)
@@ -38,7 +46,7 @@ func TestOwnedLeafClaimBindsToOnePhysicalGeneration(t *testing.T) {
 		t.Fatalf("leaf mobility snapshots=%d want=1", len(snapshot.LeafMobility))
 	}
 	got := snapshot.LeafMobility[0]
-	if got.Ref.ID != id || got.Ref.Owner == 0 || got.Facts.Kind != leafmobility.KindRawTCP || got.PlannedAt.IsZero() {
+	if got.Ref.ID != id || got.Ref.Owner == 0 || got.Facts.Kind != leafmobility.KindRawTCP {
 		t.Fatalf("leaf mobility snapshot=%+v", got)
 	}
 	bound, ok := claim.Binding()

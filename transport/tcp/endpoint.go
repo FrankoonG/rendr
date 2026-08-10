@@ -56,6 +56,16 @@ func newEndpointOwner(conn net.Conn) *endpointOwner {
 	}
 }
 
+func (o *endpointOwner) currentTCPConn() (*net.TCPConn, bool) {
+	if o == nil {
+		return nil, false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	conn, ok := o.conn.(*net.TCPConn)
+	return conn, ok && conn != nil && !o.closed && !o.failed
+}
+
 type endpointRead struct {
 	owner      *endpointOwner
 	conn       net.Conn

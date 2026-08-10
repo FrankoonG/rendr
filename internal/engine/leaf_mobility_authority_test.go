@@ -4473,9 +4473,15 @@ func newLeafMobilityEngineFixtureWithAllWrappers(
 	if wrapSubjectClient != nil {
 		subjectClientConn = wrapSubjectClient(subjectClient)
 	}
+	if sink, ok := subjectClientConn.(interface{ setLeafMobilityTestClaim(*leafmobility.Claim) }); ok {
+		sink.setLeafMobilityTestClaim(clientClaim)
+	}
 	subjectServerConn := transport.PathConn(subjectServer)
 	if wrapSubjectServer != nil {
 		subjectServerConn = wrapSubjectServer(subjectServer)
+	}
+	if sink, ok := subjectServerConn.(interface{ setLeafMobilityTestClaim(*leafmobility.Claim) }); ok {
+		sink.setLeafMobilityTestClaim(serverClaim)
 	}
 	binding := PathBinding{LocalTXTargetID: ids["a"], PeerTXTargetID: ids["a"]}
 	clientID, err := client.AttachPathBound(&claimedMemoryPath{PathConn: subjectClientConn, claim: clientClaim}, transport.PathSpec{Transport: "memory"}, binding)

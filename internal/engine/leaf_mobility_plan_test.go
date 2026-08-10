@@ -14,24 +14,25 @@ import (
 )
 
 type enginePlanDriver struct {
-	operation       leafmobility.Operation
-	calls           atomic.Int32
-	evidence        leafmobility.EvidenceDigest
-	entered         chan struct{}
-	release         chan struct{}
-	rollbackEntered chan struct{}
-	rollbackRelease chan struct{}
-	commitEntered   chan struct{}
-	commitRelease   chan struct{}
-	prepareCalls    atomic.Int32
-	cutoverCalls    atomic.Int32
-	commitCalls     atomic.Int32
-	activateCalls   atomic.Int32
-	activateErr     error
-	rollbackCalls   atomic.Int32
-	evidenceEntered chan struct{}
-	evidenceRelease chan struct{}
-	evidenceOnce    sync.Once
+	operation         leafmobility.Operation
+	calls             atomic.Int32
+	evidence          leafmobility.EvidenceDigest
+	entered           chan struct{}
+	release           chan struct{}
+	rollbackEntered   chan struct{}
+	rollbackRelease   chan struct{}
+	commitEntered     chan struct{}
+	commitRelease     chan struct{}
+	prepareCalls      atomic.Int32
+	cutoverCalls      atomic.Int32
+	commitCalls       atomic.Int32
+	activateCalls     atomic.Int32
+	activateErr       error
+	rollbackCalls     atomic.Int32
+	retryableFailures atomic.Int32
+	evidenceEntered   chan struct{}
+	evidenceRelease   chan struct{}
+	evidenceOnce      sync.Once
 }
 
 func (d *enginePlanDriver) Operation() leafmobility.Operation { return d.operation }
@@ -69,6 +70,18 @@ func (d *enginePlanDriver) Preflight(_ context.Context, request leafmobility.Pre
 	)
 	if err != nil {
 		return nil, leafmobility.PreflightResult{}, err
+	}
+	for {
+		remaining := d.retryableFailures.Load()
+		if remaining <= 0 {
+			break
+		}
+		if d.retryableFailures.CompareAndSwap(remaining, remaining-1) {
+			return nil, leafmobility.PreflightResult{
+				Stage: leafmobility.StagePreflight, Reason: leafmobility.ReasonPreflightRejected,
+				Retryable: true, ProbeReferences: references,
+			}, nil
+		}
 	}
 	result := leafmobility.PreflightResult{
 		Eligible: true, Stage: leafmobility.StagePreflightComplete, EvidenceDigest: d.evidence, ProbeReferences: references,
