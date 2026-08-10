@@ -230,7 +230,10 @@ func runUDPGROProbe(ctx context.Context, deadline time.Time, ops udpProbeOps) (e
 		return udpProbeSemanticf("parse UDP_GRO control: %v", err)
 	}
 	if !found {
-		return udpProbeSemanticf("UDP_GRO control message missing")
+		if err := verifyUDPGROOrdinaryFallback(ctx, deadline, ops, pair, payload, datagram); err != nil {
+			return err
+		}
+		return udpProbeUnsupportedf("UDP_GRO left the controlled GSO stimulus as ordinary datagrams")
 	}
 	if segmentSize != udpProbeSegmentSize {
 		return udpProbeSemanticf("UDP_GRO segment size=%d want %d", segmentSize, udpProbeSegmentSize)
@@ -244,6 +247,40 @@ func runUDPGROProbe(ctx context.Context, deadline time.Time, ops udpProbeOps) (e
 		want := payload[start : start+int(segmentSize)]
 		if !bytes.Equal(got, want) {
 			return udpProbeSemanticf("UDP_GRO reconstructed segment %d payload mismatch", segment)
+		}
+	}
+	return requireNoQueuedUDPDatagram(ops, pair.receiver)
+}
+
+func verifyUDPGROOrdinaryFallback(
+	ctx context.Context,
+	deadline time.Time,
+	ops udpProbeOps,
+	pair udpProbePair,
+	payload []byte,
+	first udpProbeDatagram,
+) error {
+	for segment := range udpProbeSegmentCount {
+		datagram := first
+		if segment != 0 {
+			var err error
+			datagram, err = receiveUDPProbeDatagram(ctx, deadline, ops, pair.receiver)
+			if err != nil {
+				return err
+			}
+		}
+		start := segment * udpProbeSegmentSize
+		want := payload[start : start+udpProbeSegmentSize]
+		if len(datagram.payload) != udpProbeSegmentSize || !bytes.Equal(datagram.payload, want) {
+			return udpProbeSemanticf(
+				"UDP_GRO ordinary fallback datagram %d boundary or payload mismatch: got=%d want=%d",
+				segment, len(datagram.payload), len(want),
+			)
+		}
+		if size, found, err := parseUDPGROControl(datagram.control); err != nil {
+			return udpProbeSemanticf("UDP_GRO ordinary fallback datagram %d control: %v", segment, err)
+		} else if found {
+			return udpProbeSemanticf("UDP_GRO ordinary fallback datagram %d unexpectedly carried segment size %d", segment, size)
 		}
 	}
 	return requireNoQueuedUDPDatagram(ops, pair.receiver)
@@ -521,6 +558,15 @@ type udpProbeDependencyError struct{ cause error }
 func (err *udpProbeDependencyError) Error() string { return err.cause.Error() }
 func (err *udpProbeDependencyError) Unwrap() error { return err.cause }
 
+type udpProbeUnsupportedError struct{ cause error }
+
+func (err *udpProbeUnsupportedError) Error() string { return err.cause.Error() }
+func (err *udpProbeUnsupportedError) Unwrap() error { return err.cause }
+
+func udpProbeUnsupportedf(format string, args ...any) error {
+	return &udpProbeUnsupportedError{cause: fmt.Errorf(format, args...)}
+}
+
 func udpProbeEvidence(id FeatureID, at time.Time, err error) FeatureEvidence {
 	if err == nil {
 		return availableEvidence(id, at, SourceRuntimeRoundTrip)
@@ -528,6 +574,10 @@ func udpProbeEvidence(id FeatureID, at time.Time, err error) FeatureEvidence {
 	var cleanupErr *udpProbeCleanupError
 	if errors.As(err, &cleanupErr) {
 		return cleanupFailureEvidence(id, at, cleanupErr)
+	}
+	var unsupportedErr *udpProbeUnsupportedError
+	if errors.As(err, &unsupportedErr) {
+		return mustEvidence(id, FeatureUnsupported, ReasonPrimitiveUnsupported, at, SourceRuntimeRoundTrip, 0, false)
 	}
 	var semanticErr *udpProbeSemanticError
 	if errors.As(err, &semanticErr) {

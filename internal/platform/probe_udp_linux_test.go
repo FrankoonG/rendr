@@ -55,6 +55,7 @@ type fakeUDPProbeKernel struct {
 	ignoreSegmentControl    bool
 	segmentOrdinaryDatagram bool
 	omitGROControl          bool
+	groOrdinaryFallback     bool
 	ordinaryHasGROControl   bool
 	wrongGROSegmentSize     int
 	corruptGROPayload       bool
@@ -238,6 +239,17 @@ func (kernel *fakeUDPProbeKernel) enqueueFakeUDPSend(receiver *fakeUDPProbeSocke
 		return
 	}
 	if receiver.gro == 1 {
+		if kernel.groOrdinaryFallback {
+			for start := 0; start < len(payload); start += segmentSize {
+				end := min(start+segmentSize, len(payload))
+				segment := append([]byte(nil), payload[start:end]...)
+				if kernel.corruptGROPayload && start == segmentSize && len(segment) != 0 {
+					segment[0] ^= 0xff
+				}
+				receiver.queue = append(receiver.queue, fakeUDPProbeDatagram{payload: segment})
+			}
+			return
+		}
 		coalesced := append([]byte(nil), payload...)
 		if kernel.corruptGROPayload && len(coalesced) > udpProbeSegmentSize {
 			coalesced[udpProbeSegmentSize] ^= 0xff
@@ -390,6 +402,38 @@ func TestProbeUDPGRORequiresControlAndPayloadReconstruction(t *testing.T) {
 			assertFakeUDPProbeClean(t, kernel)
 		})
 	}
+}
+
+func TestProbeUDPGROVerifiedOrdinaryFallbackIsUnsupported(t *testing.T) {
+	tests := []struct {
+		name        string
+		getGROError error
+	}{
+		{name: "readback available"},
+		{name: "readback unavailable", getGROError: unix.ENOPROTOOPT},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			kernel := newFakeUDPProbeKernel()
+			kernel.groOrdinaryFallback = true
+			kernel.getGROErr = test.getGROError
+			evidence := mustProbeUDPGRO(t, kernel)
+			assertSingleUDPFeature(t, evidence, FeatureUDPGRO, FeatureUnsupported, ReasonPrimitiveUnsupported, 0)
+			if evidence.Source != SourceRuntimeRoundTrip {
+				t.Fatalf("unsupported UDP_GRO source=%s want %s", evidence.Source, SourceRuntimeRoundTrip)
+			}
+			assertFakeUDPProbeClean(t, kernel)
+		})
+	}
+}
+
+func TestProbeUDPGROOrdinaryFallbackStillValidatesPayload(t *testing.T) {
+	kernel := newFakeUDPProbeKernel()
+	kernel.groOrdinaryFallback = true
+	kernel.corruptGROPayload = true
+	evidence := mustProbeUDPGRO(t, kernel)
+	assertSingleUDPFeature(t, evidence, FeatureUDPGRO, FeatureProbeFailed, ReasonSemanticMismatch, 0)
+	assertFakeUDPProbeClean(t, kernel)
 }
 
 func TestProbeUDPGROOrdinaryDatagramRejectsFabricatedControl(t *testing.T) {
@@ -560,7 +604,8 @@ func TestProbeUDPRejectsIncompleteOperations(t *testing.T) {
 }
 
 func TestProbeUDPRealLoopback(t *testing.T) {
-	if os.Getenv("RENDR_EXPECT_UDP_OFFLOAD") != "available" {
+	expectation := os.Getenv("RENDR_EXPECT_UDP_OFFLOAD")
+	if expectation == "" {
 		t.Skip("UDP offload expectation is unset")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -570,7 +615,24 @@ func TestProbeUDPRealLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUDPFeature(t, evidence, FeatureUDPGSO, FeatureAvailable, ReasonConfirmed, 0)
-	assertUDPFeature(t, evidence, FeatureUDPGRO, FeatureAvailable, ReasonConfirmed, 0)
+	switch expectation {
+	case "available":
+		assertUDPFeature(t, evidence, FeatureUDPGRO, FeatureAvailable, ReasonConfirmed, 0)
+	case "gso_only":
+		for _, result := range evidence {
+			if result.ID != FeatureUDPGRO {
+				continue
+			}
+			assertSingleUDPFeature(t, result, FeatureUDPGRO, FeatureUnsupported, ReasonPrimitiveUnsupported, 0)
+			if result.Source != SourceRuntimeRoundTrip || result.Retryable {
+				t.Fatalf("UDP_GRO fallback source=%s retryable=%v", result.Source, result.Retryable)
+			}
+			return
+		}
+		t.Fatalf("missing UDP_GRO evidence: %+v", evidence)
+	default:
+		t.Fatalf("unknown RENDR_EXPECT_UDP_OFFLOAD value %q", expectation)
+	}
 }
 
 func mustProbeUDPGRO(t *testing.T, kernel *fakeUDPProbeKernel) FeatureEvidence {

@@ -211,7 +211,8 @@ func TestSystemDetectorTransparentBindExpectation(t *testing.T) {
 }
 
 func TestSystemDetectorUDPOffloadExpectation(t *testing.T) {
-	if os.Getenv("RENDR_EXPECT_UDP_OFFLOAD") != "available" {
+	expectation := os.Getenv("RENDR_EXPECT_UDP_OFFLOAD")
+	if expectation == "" {
 		t.Skip("UDP offload expectation is unset")
 	}
 	detector, err := newSystemDetector()
@@ -222,11 +223,24 @@ func TestSystemDetectorUDPOffloadExpectation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []FeatureID{FeatureUDPGSO, FeatureUDPGRO} {
-		evidence := requireFeature(t, snapshot, id)
-		if evidence.State != FeatureAvailable || evidence.Source != SourceRuntimeRoundTrip {
-			t.Fatalf("%s=%s/%s source=%s, want active available", id, evidence.State, evidence.Reason, evidence.Source)
+	gso := requireFeature(t, snapshot, FeatureUDPGSO)
+	gro := requireFeature(t, snapshot, FeatureUDPGRO)
+	if gso.State != FeatureAvailable || gso.Source != SourceRuntimeRoundTrip {
+		t.Fatalf("%s=%s/%s source=%s, want active available", gso.ID, gso.State, gso.Reason, gso.Source)
+	}
+	switch expectation {
+	case "available":
+		if gro.State != FeatureAvailable || gro.Source != SourceRuntimeRoundTrip {
+			t.Fatalf("%s=%s/%s source=%s, want active available", gro.ID, gro.State, gro.Reason, gro.Source)
 		}
+	case "gso_only":
+		if gro.State != FeatureUnsupported || gro.Reason != ReasonPrimitiveUnsupported ||
+			gro.Source != SourceRuntimeRoundTrip || gro.RawErrno() != 0 || gro.Retryable {
+			t.Fatalf("%s=%s/%s source=%s errno=%v retryable=%v, want verified ordinary fallback",
+				gro.ID, gro.State, gro.Reason, gro.Source, gro.RawErrno(), gro.Retryable)
+		}
+	default:
+		t.Fatalf("unknown RENDR_EXPECT_UDP_OFFLOAD value %q", expectation)
 	}
 }
 
