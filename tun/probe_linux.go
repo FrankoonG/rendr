@@ -5,6 +5,7 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"net"
 
 	"github.com/FrankoonG/rendr/virtualif"
 )
@@ -19,6 +20,7 @@ type probeDevice interface {
 }
 
 type probeOpenFunc func(Config) (probeDevice, error)
+type probeGoneFunc func(string) (bool, error)
 
 // Probe reports whether this process can open the default Linux TUN
 // configuration. The temporary interface disappears before Probe returns.
@@ -31,8 +33,15 @@ func Probe() virtualif.Capability {
 }
 
 func probeConfig(cfg Config, open probeOpenFunc) virtualif.Capability {
+	return probeConfigWithVerifier(cfg, open, probeInterfaceGone)
+}
+
+func probeConfigWithVerifier(cfg Config, open probeOpenFunc, gone probeGoneFunc) virtualif.Capability {
 	if open == nil {
 		return failedProbe(errors.New("nil TUN opener"))
+	}
+	if gone == nil {
+		return failedProbe(errors.New("nil TUN cleanup verifier"))
 	}
 	if !cfg.Enabled {
 		return failedProbe(&virtualif.Error{
@@ -47,6 +56,9 @@ func probeConfig(cfg Config, open probeOpenFunc) virtualif.Capability {
 	normalized := cfg.Normalize()
 	device, err := open(cfg)
 	if err != nil {
+		if device != nil {
+			err = errors.Join(err, closeProbeDevice(device))
+		}
 		return failedProbe(err)
 	}
 	if device == nil {
@@ -63,13 +75,43 @@ func probeConfig(cfg Config, open probeOpenFunc) virtualif.Capability {
 	if actual := device.QueueCount(); actual != normalized.Queues {
 		semanticErr = errors.Join(semanticErr, fmt.Errorf("TUN queues=%d want %d", actual, normalized.Queues))
 	}
-	if cleanupErr := device.Close(); cleanupErr != nil {
-		semanticErr = errors.Join(semanticErr, fmt.Errorf("close temporary TUN: %w", cleanupErr))
+	name := device.Name()
+	semanticErr = errors.Join(semanticErr, closeProbeDevice(device))
+	if name != "" {
+		removed, verifyErr := gone(name)
+		if verifyErr != nil {
+			semanticErr = errors.Join(semanticErr, fmt.Errorf("verify temporary TUN removal: %w", verifyErr))
+		} else if !removed {
+			semanticErr = errors.Join(semanticErr, fmt.Errorf("temporary TUN %q remains after close", name))
+		}
 	}
 	if semanticErr != nil {
 		return failedProbe(semanticErr)
 	}
 	return virtualif.Capability{Available: true}
+}
+
+func closeProbeDevice(device probeDevice) error {
+	if device == nil {
+		return nil
+	}
+	if err := device.Close(); err != nil {
+		return fmt.Errorf("close temporary TUN: %w", err)
+	}
+	return nil
+}
+
+func probeInterfaceGone(name string) (bool, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return false, err
+	}
+	for _, iface := range interfaces {
+		if iface.Name == name {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func failedProbe(err error) virtualif.Capability {

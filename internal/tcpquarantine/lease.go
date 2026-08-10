@@ -53,9 +53,11 @@ type releaseAttempt struct {
 	err  error
 }
 
-// Preflight verifies the nft JSON contract, asks nft to validate the complete
-// install batch in check mode, and then independently proves that the table is
-// absent. It never issues a delete.
+// Preflight requires nft's schema-versioned JSON contract (schema 1, available
+// since nftables 0.9.1), asks nft to validate the complete install batch in
+// check mode, and then independently proves that the table is absent. Older or
+// incompatible userspace fails closed before mutation so the planner can use
+// its negotiated non-TCP_REPAIR path. Preflight never issues a delete.
 func (manager *Manager) Preflight(ctx context.Context, transactionID TransactionID, tuple Tuple) error {
 	if err := validateRequest(ctx, transactionID, tuple); err != nil {
 		return err
