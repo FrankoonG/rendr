@@ -483,22 +483,7 @@ func openTCPRouteNetlinkWorker(
 		err = unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK})
 	}
 	if err == nil {
-		for _, group := range []int{
-			unix.RTNLGRP_LINK,
-			unix.RTNLGRP_IPV4_IFADDR, unix.RTNLGRP_IPV6_IFADDR,
-			unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE,
-			unix.RTNLGRP_IPV4_RULE, unix.RTNLGRP_IPV6_RULE,
-		} {
-			if err = unix.SetsockoptInt(fd, unix.SOL_NETLINK, unix.NETLINK_ADD_MEMBERSHIP, group); err != nil {
-				break
-			}
-		}
-	}
-	if err == nil {
-		if joinErr := unix.SetsockoptInt(fd, unix.SOL_NETLINK, unix.NETLINK_ADD_MEMBERSHIP, unix.RTNLGRP_NEXTHOP); joinErr != nil &&
-			!errors.Is(joinErr, unix.EINVAL) && !errors.Is(joinErr, unix.ENOPROTOOPT) {
-			err = joinErr
-		}
+		err = joinTCPRouteNetlinkGroups(fd, unix.SetsockoptInt)
 	}
 	if err == nil {
 		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20)
@@ -518,6 +503,24 @@ func openTCPRouteNetlinkWorker(
 		return
 	}
 	send(routeNetlinkOpenResult{fd: fd})
+}
+
+func joinTCPRouteNetlinkGroups(fd int, setMembership func(int, int, int, int) error) error {
+	for _, group := range []int{
+		unix.RTNLGRP_LINK,
+		unix.RTNLGRP_IPV4_IFADDR, unix.RTNLGRP_IPV6_IFADDR,
+		unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE,
+		unix.RTNLGRP_IPV4_RULE, unix.RTNLGRP_IPV6_RULE,
+	} {
+		if err := setMembership(fd, unix.SOL_NETLINK, unix.NETLINK_ADD_MEMBERSHIP, group); err != nil {
+			return err
+		}
+	}
+	if err := setMembership(fd, unix.SOL_NETLINK, unix.NETLINK_ADD_MEMBERSHIP, unix.RTNLGRP_NEXTHOP); err != nil &&
+		!errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOPROTOOPT) {
+		return err
+	}
+	return nil
 }
 
 func queryRouteState(

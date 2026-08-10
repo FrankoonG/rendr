@@ -74,7 +74,11 @@ func TestPreflightUsesCheckBatchAndProvesAbsence(t *testing.T) {
 	manager := mustManager(t, runner)
 	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(runnerStep{
-		wantArgs:  []string{"-c", "-f", "-"},
+		wantArgs: nftSchemaProbeArgs(),
+		result:   exactTableResult(t, spec, nil),
+	})
+	runner.append(runnerStep{
+		wantArgs:  preflightInstallArgs(),
 		wantStdin: spec.installBatch(),
 	})
 	runner.append(absentObservationSteps(t, spec)...)
@@ -90,13 +94,125 @@ func TestPreflightNeverDeletesUnexpectedTable(t *testing.T) {
 	manager := mustManager(t, runner)
 	spec := manager.newSpec(testTransactionID(), testTuple())
 	runner.append(
-		runnerStep{wantArgs: []string{"-c", "-f", "-"}, wantStdin: spec.installBatch(), err: errFakeCommand},
+		runnerStep{wantArgs: nftSchemaProbeArgs(), result: exactTableResult(t, spec, nil)},
+		runnerStep{wantArgs: preflightInstallArgs(), wantStdin: spec.installBatch()},
 		runnerStep{wantArgs: spec.listTableArgs(), result: exactTableResult(t, spec, nil)},
 	)
 
 	err := manager.Preflight(context.Background(), testTransactionID(), testTuple())
 	if !errors.Is(err, ErrPreflightStateChanged) {
 		t.Fatalf("Preflight() error = %v, want ErrPreflightStateChanged", err)
+	}
+	runner.assertDone()
+}
+
+func TestPreflightRejectsIncompatibleJSONBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result func(*testing.T, nftSpec) RunResult
+	}{
+		{name: "no JSON output", result: func(*testing.T, nftSpec) RunResult { return RunResult{} }},
+		{
+			name: "future schema",
+			result: func(t *testing.T, spec nftSpec) RunResult {
+				return exactTableResult(t, spec, func(objects []any) {
+					objects[0].(map[string]any)["metainfo"].(map[string]any)["json_schema_version"] = 2
+				})
+			},
+		},
+		{
+			name: "pre-0.9.1 missing metainfo",
+			result: func(t *testing.T, spec nftSpec) RunResult {
+				return exactTableResult(t, spec, func(objects []any) {
+					objects[0] = map[string]any{"table": map[string]any{"family": "inet", "name": "legacy"}}
+				})
+			},
+		},
+		{
+			name: "non-integer schema",
+			result: func(t *testing.T, spec nftSpec) RunResult {
+				return exactTableResult(t, spec, func(objects []any) {
+					objects[0].(map[string]any)["metainfo"].(map[string]any)["json_schema_version"] = "1"
+				})
+			},
+		},
+		{
+			name: "duplicate metainfo",
+			result: func(t *testing.T, spec nftSpec) RunResult {
+				return exactTableResult(t, spec, func(objects []any) {
+					objects[len(objects)-1] = map[string]any{"metainfo": map[string]any{"json_schema_version": 1}}
+				})
+			},
+		},
+		{
+			name: "ambiguous metainfo object",
+			result: func(t *testing.T, spec nftSpec) RunResult {
+				return exactTableResult(t, spec, func(objects []any) {
+					objects[0].(map[string]any)["table"] = map[string]any{"family": "inet", "name": "ambiguous"}
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newScriptedRunner(t)
+			manager := mustManager(t, runner)
+			spec := manager.newSpec(testTransactionID(), testTuple())
+			runner.append(runnerStep{wantArgs: nftSchemaProbeArgs(), result: test.result(t, spec)})
+			runner.append(absentObservationSteps(t, spec)...)
+
+			err := manager.Preflight(context.Background(), testTransactionID(), testTuple())
+			if !errors.Is(err, ErrNFTSemanticPreflight) || !errors.Is(err, ErrNFTSchemaIncompatible) {
+				t.Fatalf("Preflight() error = %v, want typed semantic/schema failure", err)
+			}
+			if got := runner.callCount(); got != 3 {
+				t.Fatalf("Preflight() issued %d commands, want schema plus absence observation", got)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestPreflightSchemaCommandFailureIsTypedAndNonMutating(t *testing.T) {
+	runner := newScriptedRunner(t)
+	manager := mustManager(t, runner)
+	spec := manager.newSpec(testTransactionID(), testTuple())
+	runner.append(runnerStep{wantArgs: nftSchemaProbeArgs(), err: errFakeCommand})
+	runner.append(absentObservationSteps(t, spec)...)
+
+	err := manager.Preflight(context.Background(), testTransactionID(), testTuple())
+	if !errors.Is(err, ErrNFTSemanticPreflight) || !errors.Is(err, errFakeCommand) {
+		t.Fatalf("Preflight() error = %v, want typed command failure", err)
+	}
+	if errors.Is(err, ErrNFTSchemaIncompatible) {
+		t.Fatalf("Preflight() schema command error was misclassified as incompatible JSON: %v", err)
+	}
+	if got := runner.callCount(); got != 3 {
+		t.Fatalf("Preflight() issued %d commands, want schema plus absence observation", got)
+	}
+	runner.assertDone()
+}
+
+func TestPreflightInstallCheckFailureIsTypedAndNonMutating(t *testing.T) {
+	runner := newScriptedRunner(t)
+	manager := mustManager(t, runner)
+	spec := manager.newSpec(testTransactionID(), testTuple())
+	runner.append(
+		runnerStep{wantArgs: nftSchemaProbeArgs(), result: exactTableResult(t, spec, nil)},
+		runnerStep{wantArgs: preflightInstallArgs(), wantStdin: spec.installBatch(), err: errFakeCommand},
+	)
+	runner.append(absentObservationSteps(t, spec)...)
+
+	err := manager.Preflight(context.Background(), testTransactionID(), testTuple())
+	if !errors.Is(err, ErrNFTSemanticPreflight) || !errors.Is(err, errFakeCommand) {
+		t.Fatalf("Preflight() error = %v, want typed install-check failure", err)
+	}
+	if errors.Is(err, ErrNFTSchemaIncompatible) {
+		t.Fatalf("Preflight() install-check error was misclassified as a JSON schema error: %v", err)
+	}
+	if got := runner.callCount(); got != 4 {
+		t.Fatalf("Preflight() issued %d commands, want schema, check, and absence observation", got)
 	}
 	runner.assertDone()
 }

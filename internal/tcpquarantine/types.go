@@ -19,6 +19,8 @@ const (
 var (
 	ErrUnsupportedPlatform      = errors.New("tcpquarantine: nft runner requires linux")
 	ErrNFTExecutableUnavailable = errors.New("tcpquarantine: trusted nft executable is unavailable")
+	ErrNFTSemanticPreflight     = errors.New("tcpquarantine: nft semantic preflight is unavailable")
+	ErrNFTSchemaIncompatible    = errors.New("tcpquarantine: nft JSON schema is incompatible")
 	ErrInvalidTransactionID     = errors.New("tcpquarantine: invalid transaction ID")
 	ErrInvalidTuple             = errors.New("tcpquarantine: invalid IPv4 TCP tuple")
 	ErrCommandOutputTooLarge    = errors.New("tcpquarantine: nft command output too large")

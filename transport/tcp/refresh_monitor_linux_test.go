@@ -4,12 +4,63 @@ package tcp
 
 import (
 	"bytes"
+	"errors"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestJoinTCPRouteNetlinkGroupsOnlyToleratesUnavailableNexthopGroup(t *testing.T) {
+	baseGroups := []int{
+		unix.RTNLGRP_LINK,
+		unix.RTNLGRP_IPV4_IFADDR, unix.RTNLGRP_IPV6_IFADDR,
+		unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE,
+		unix.RTNLGRP_IPV4_RULE, unix.RTNLGRP_IPV6_RULE,
+	}
+	for _, test := range []struct {
+		name      string
+		failGroup int
+		failErr   error
+		wantErr   error
+		wantCalls int
+	}{
+		{name: "all groups available", wantCalls: len(baseGroups) + 1},
+		{name: "old kernel EINVAL", failGroup: unix.RTNLGRP_NEXTHOP, failErr: unix.EINVAL, wantCalls: len(baseGroups) + 1},
+		{name: "old kernel ENOPROTOOPT", failGroup: unix.RTNLGRP_NEXTHOP, failErr: unix.ENOPROTOOPT, wantCalls: len(baseGroups) + 1},
+		{name: "unexpected nexthop failure", failGroup: unix.RTNLGRP_NEXTHOP, failErr: unix.EPERM, wantErr: unix.EPERM, wantCalls: len(baseGroups) + 1},
+		{name: "required group failure", failGroup: unix.RTNLGRP_IPV4_ROUTE, failErr: unix.EINVAL, wantErr: unix.EINVAL, wantCalls: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var groups []int
+			err := joinTCPRouteNetlinkGroups(17, func(fd, level, option, group int) error {
+				if fd != 17 || level != unix.SOL_NETLINK || option != unix.NETLINK_ADD_MEMBERSHIP {
+					t.Fatalf("setsockopt arguments fd=%d level=%d option=%d", fd, level, option)
+				}
+				groups = append(groups, group)
+				if group == test.failGroup {
+					return test.failErr
+				}
+				return nil
+			})
+			if !errors.Is(err, test.wantErr) || (test.wantErr == nil && err != nil) {
+				t.Fatalf("join error=%v want=%v", err, test.wantErr)
+			}
+			if len(groups) != test.wantCalls {
+				t.Fatalf("membership calls=%v want count=%d", groups, test.wantCalls)
+			}
+			for index, group := range baseGroups {
+				if index >= len(groups) {
+					break
+				}
+				if groups[index] != group {
+					t.Fatalf("membership call %d group=%d want=%d", index, groups[index], group)
+				}
+			}
+		})
+	}
+}
 
 func TestNetlinkBatchProcessesTrailingNotifications(t *testing.T) {
 	for _, test := range []struct {

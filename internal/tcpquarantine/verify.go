@@ -51,6 +51,53 @@ type ruleObject struct {
 	Comment string            `json:"comment"`
 }
 
+func verifyNFTSchemaJSON(payload []byte) error {
+	document, err := decodeNFTDocument(payload)
+	if err != nil {
+		return err
+	}
+	metainfo := 0
+	for index, raw := range document.NFTables {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return fmt.Errorf("nftables item %d: %w", index, err)
+		}
+		if len(item) != 1 {
+			return fmt.Errorf("nftables item %d has %d object kinds", index, len(item))
+		}
+		if metadata, ok := item["metainfo"]; ok {
+			if err := verifySchemaMetainfo(metadata); err != nil {
+				return fmt.Errorf("metainfo: %w", err)
+			}
+			metainfo++
+		}
+	}
+	if metainfo != 1 {
+		return fmt.Errorf("expected one metainfo object, found %d", metainfo)
+	}
+	return nil
+}
+
+func verifySchemaMetainfo(raw json.RawMessage) error {
+	var metadata struct {
+		JSONSchemaVersion json.RawMessage `json:"json_schema_version"`
+	}
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return err
+	}
+	if metadata.JSONSchemaVersion == nil {
+		return errors.New("json_schema_version is missing")
+	}
+	version, err := parseUintJSON(metadata.JSONSchemaVersion)
+	if err != nil {
+		return fmt.Errorf("json_schema_version: %w", err)
+	}
+	if version != 1 {
+		return fmt.Errorf("json_schema_version is %d, expected 1", version)
+	}
+	return nil
+}
+
 func verifyTableJSON(payload []byte, spec nftSpec) error {
 	document, err := decodeNFTDocument(payload)
 	if err != nil {

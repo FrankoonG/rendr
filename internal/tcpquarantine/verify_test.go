@@ -2,6 +2,19 @@ package tcpquarantine
 
 import "testing"
 
+func TestVerifyNFTSchemaJSONAcceptsCurrentSchema(t *testing.T) {
+	manager := mustManager(t, newScriptedRunner(t))
+	spec := manager.newSpec(testTransactionID(), testTuple())
+	result := exactTableResult(t, spec, func(objects []any) {
+		metadata := objects[0].(map[string]any)["metainfo"].(map[string]any)
+		metadata["version"] = "1.0.9"
+		metadata["release_name"] = "Old Doc Yak"
+	})
+	if err := verifyNFTSchemaJSON(result.Stdout); err != nil {
+		t.Fatalf("verifyNFTSchemaJSON() error = %v", err)
+	}
+}
+
 func TestVerifyTableJSONAllowsMetadataButRejectsMutatedExpressions(t *testing.T) {
 	manager := mustManager(t, newScriptedRunner(t))
 	spec := manager.newSpec(testTransactionID(), testTuple())

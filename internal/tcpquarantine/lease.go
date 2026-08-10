@@ -53,8 +53,9 @@ type releaseAttempt struct {
 	err  error
 }
 
-// Preflight asks nft to validate the complete install batch in check mode and
-// then independently proves that the table is absent. It never issues a delete.
+// Preflight verifies the nft JSON contract, asks nft to validate the complete
+// install batch in check mode, and then independently proves that the table is
+// absent. It never issues a delete.
 func (manager *Manager) Preflight(ctx context.Context, transactionID TransactionID, tuple Tuple) error {
 	if err := validateRequest(ctx, transactionID, tuple); err != nil {
 		return err
@@ -67,20 +68,32 @@ func (manager *Manager) Preflight(ctx context.Context, transactionID Transaction
 		return err
 	}
 	spec := manager.newSpec(transactionID, tuple)
-	result, runErr := manager.runScoped(ctx, scope, []string{"-c", "-f", "-"}, spec.installBatch())
-	runErr = normalizeRunError("preflight", result, runErr)
+	schemaResult, schemaRunErr := manager.runScoped(ctx, scope, nftSchemaProbeArgs(), nil)
+	schemaRunErr = normalizeRunError("preflight JSON schema", schemaResult, schemaRunErr)
+	var semanticErr error
+	if schemaRunErr != nil {
+		semanticErr = errors.Join(ErrNFTSemanticPreflight, schemaRunErr)
+	} else if err := verifyNFTSchemaJSON(schemaResult.Stdout); err != nil {
+		semanticErr = errors.Join(ErrNFTSemanticPreflight, ErrNFTSchemaIncompatible, err)
+	}
+	if semanticErr == nil {
+		checkResult, checkErr := manager.runScoped(ctx, scope, preflightInstallArgs(), spec.installBatch())
+		if checkErr = normalizeRunError("preflight install check", checkResult, checkErr); checkErr != nil {
+			semanticErr = errors.Join(ErrNFTSemanticPreflight, checkErr)
+		}
+	}
 	observation := manager.observeBounded(ctx, scope, spec)
 
 	switch observation.state {
 	case stateAbsent:
 		if cause := context.Cause(ctx); cause != nil {
-			return errors.Join(cause, runErr)
+			return errors.Join(cause, semanticErr)
 		}
-		return runErr
+		return semanticErr
 	case stateExact, stateMalformed:
-		return fmt.Errorf("tcpquarantine: preflight: %w", errors.Join(ErrPreflightStateChanged, runErr, observation.err))
+		return fmt.Errorf("tcpquarantine: preflight: %w", errors.Join(ErrPreflightStateChanged, semanticErr, observation.err))
 	default:
-		return fmt.Errorf("tcpquarantine: preflight observation: %w", errors.Join(ErrStateUnknown, runErr, observation.err))
+		return fmt.Errorf("tcpquarantine: preflight observation: %w", errors.Join(ErrStateUnknown, semanticErr, observation.err))
 	}
 }
 

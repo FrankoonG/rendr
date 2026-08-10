@@ -170,6 +170,14 @@ func (spec nftSpec) listTableArgs() []string {
 	return []string{"-j", "list", "table", nftFamily, spec.table}
 }
 
+func preflightInstallArgs() []string {
+	return []string{"-c", "-f", "-"}
+}
+
+func nftSchemaProbeArgs() []string {
+	return []string{"-j", "list", "tables"}
+}
+
 func listTablesArgs() []string {
 	return []string{"-j", "list", "tables"}
 }
