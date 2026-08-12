@@ -224,16 +224,18 @@ func TestGVisorPacketLinkConcurrentDelayedActivationConverges(t *testing.T) {
 	serverCandidate := serverPath.link.active
 	serverCandidateLocal := cloneAddr(serverPath.link.pendingRefresh.route.local)
 	serverPath.link.mu.Unlock()
+	clientLinkSecret := clientPath.link.secret
+	serverLinkSecret := serverPath.link.secret
 	barrier := newOuterCommitBarrier()
 	trace := newFinalQualificationTrace(clientCandidateLocal, serverCandidateLocal)
 	if err := clientCandidate.replaceWriter(&commitBarrierPacketWriter{
-		packetWriter: clientCandidate.conn, source: clientCandidateLocal, secret: clientPath.link.secret,
+		packetWriter: clientCandidate.conn, source: clientCandidateLocal, secret: clientLinkSecret,
 		barrier: barrier, trace: trace,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := serverCandidate.replaceWriter(&commitBarrierPacketWriter{
-		packetWriter: serverCandidate.conn, source: serverCandidateLocal, secret: serverPath.link.secret,
+		packetWriter: serverCandidate.conn, source: serverCandidateLocal, secret: serverLinkSecret,
 		barrier: barrier, trace: trace,
 	}); err != nil {
 		t.Fatal(err)
