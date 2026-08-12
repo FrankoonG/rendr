@@ -282,7 +282,7 @@ func TestHelloAdmissionPublishesBothSidesAndCarriesData(t *testing.T) {
 	}()
 
 	admission, err := PerformClientHelloAdmissionContext(context.Background(), clientPath, client,
-		clientInstance, 0, "a", transport.PathSpec{Transport: "memory"})
+		clientInstance, 0, "a", transport.PathSpec{Transport: "memory"}, nil)
 	if err != nil {
 		t.Fatalf("client admission: %v", err)
 	}
@@ -399,6 +399,56 @@ func TestBridgeAdmissionSupersedesSameLeafWithoutDataLoss(t *testing.T) {
 	down := make([]byte, len(wantDown))
 	if n, err := client.Recv(down); err != nil || string(down[:n]) != string(wantDown) {
 		t.Fatalf("downstream=%q err=%v", down[:n], err)
+	}
+}
+
+func TestBridgeAdmissionDistinctSelectorLeafStaysIdle(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	initialClient, initialServer := newMemoryPathPair()
+	client, server := establishHelloAdmissionPairWithGraph(t, initialClient, initialServer, manifest, "a")
+	oldClient, oldServer := client.ActivePath(), server.ActivePath()
+
+	clientB, serverB := newMemoryPathPair()
+	admission := performBridgeAdmissionPairTarget(t, client, server, clientB, serverB, "b")
+	if admission.PathID == oldClient {
+		t.Fatalf("distinct leaf reused initial client path %d", oldClient)
+	}
+	if client.ActivePath() != oldClient || server.ActivePath() != oldServer {
+		t.Fatalf("distinct admission changed active paths client/server=%d/%d want %d/%d",
+			client.ActivePath(), server.ActivePath(), oldClient, oldServer)
+	}
+	for side, engine := range map[string]*Engine{"client": client, "server": server} {
+		desired, effective, ok := engine.localExecutionRuntime().selectedChild(ids["root"])
+		if !ok || desired != ids["a"] || effective != ids["a"] {
+			t.Fatalf("%s selector desired/effective=%x/%x ok=%t want a/a", side, desired, effective, ok)
+		}
+	}
+
+	dataWrites := func(t *testing.T, engine *Engine, targetID proto.TargetID) uint64 {
+		t.Helper()
+		engine.pathsMu.RLock()
+		defer engine.pathsMu.RUnlock()
+		for _, slot := range engine.paths {
+			if slot.localTXTargetID == targetID {
+				return slot.dataWrites.Load()
+			}
+		}
+		t.Fatalf("target %x path is not attached", targetID)
+		return 0
+	}
+	clientBWrites := dataWrites(t, client, ids["b"])
+	serverBWrites := dataWrites(t, server, ids["b"])
+	assertAdmissionPayload(t, client, server, []byte("distinct-leaf-up"))
+	assertAdmissionPayload(t, server, client, []byte("distinct-leaf-down"))
+	clientBAfter := dataWrites(t, client, ids["b"])
+	serverBAfter := dataWrites(t, server, ids["b"])
+	if clientBAfter != clientBWrites || serverBAfter != serverBWrites {
+		t.Fatalf("idle leaf carried DATA: client writes %d->%d server writes %d->%d",
+			clientBWrites, clientBAfter, serverBWrites, serverBAfter)
 	}
 }
 
@@ -735,7 +785,7 @@ func establishHelloAdmissionPairWithGraph(t *testing.T, clientPath, serverPath t
 		serverDone <- helloAdmissionServerResult{engine: server, err: err}
 	}()
 	admission, err := PerformClientHelloAdmissionContext(context.Background(), clientPath, client,
-		clientInstance, 0, initialName, transport.PathSpec{Transport: "memory"})
+		clientInstance, 0, initialName, transport.PathSpec{Transport: "memory"}, nil)
 	if err != nil {
 		_ = client.Close()
 		t.Fatal(err)

@@ -156,6 +156,7 @@ func TestPrivilegedRestorePreservesReceiveSentAndUnsentQueues(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 	defer replacement.Close()
+	assertKeepAliveDisabled(t, replacement)
 	if err := lease.Release(ctx); err != nil {
 		t.Fatalf("release tuple quarantine: %v", err)
 	}
@@ -264,6 +265,7 @@ func TestPrivilegedRestoreSurvivesSourceAddressRemoval(t *testing.T) {
 		t.Fatalf("Restore after source address removal: %v", err)
 	}
 	defer replacement.Close()
+	assertKeepAliveDisabled(t, replacement)
 	assertIPTransparentDisabled(t, replacement)
 	if replacement.LocalAddr().String() != snapshot.Tuple().Local.String() ||
 		replacement.RemoteAddr().String() != snapshot.Tuple().Remote.String() {
@@ -295,6 +297,26 @@ func assertIPTransparentDisabled(t *testing.T, conn *net.TCPConn) {
 	}
 	if value != 0 {
 		t.Fatalf("replacement retained IP_TRANSPARENT=%d", value)
+	}
+}
+
+func assertKeepAliveDisabled(t *testing.T, conn *net.TCPConn) {
+	t.Helper()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatalf("replacement SyscallConn: %v", err)
+	}
+	value := -1
+	if err := raw.Control(func(fd uintptr) {
+		value, err = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_KEEPALIVE)
+	}); err != nil {
+		t.Fatalf("inspect replacement SO_KEEPALIVE: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("get replacement SO_KEEPALIVE: %v", err)
+	}
+	if value != 0 {
+		t.Fatalf("replacement SO_KEEPALIVE=%d want=0", value)
 	}
 }
 

@@ -1,0 +1,7 @@
+//go:build !rendr_experimental_gvisor
+
+package gvisor
+
+import "github.com/FrankoonG/rendr/internal/leafmobility"
+
+func expectedPacketLinkOperation() leafmobility.Operation { return 0 }

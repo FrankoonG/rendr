@@ -163,6 +163,9 @@ func (c *peakTransferController) admitPeerSelection(selectorID, targetID proto.T
 	if suppressed {
 		return fmt.Errorf("rendr: local peak target is temporarily suppressed")
 	}
+	if !c.peakHealthy() {
+		return fmt.Errorf("rendr: local peak target has no fresh healthy quality evidence")
+	}
 	return nil
 }
 

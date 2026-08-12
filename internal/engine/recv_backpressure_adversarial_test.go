@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -182,6 +185,71 @@ func TestRecvBackpressurePacketAckWaitsForDeliveryCapacity(t *testing.T) {
 	}
 }
 
+func TestRecvBackpressureResumesWithoutLossAfterSlowReader(t *testing.T) {
+	flow := NewClientFlowID()
+	client := New(SideClient, flow, Limits{})
+	server := New(SideServer, flow, Limits{})
+	attachRecvAdversarialPair(t, client, server)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	const totalFrames = sendHistoryWindow*3 + 17
+	want := make([]byte, totalFrames)
+	for index := range want {
+		want[index] = byte(index*31 + 7)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		for _, value := range want {
+			if _, err := client.SendData([]byte{value}); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	waitWriteDeadlineCondition(t, 2*time.Second, func() bool {
+		return client.ReplayStats().CreditWaiters > 0
+	}, "slow-reader replay-credit backpressure")
+	select {
+	case err := <-writeDone:
+		t.Fatalf("writer completed before the slow reader resumed: %v", err)
+	default:
+	}
+
+	got := make([]byte, 0, len(want))
+	buffer := make([]byte, 97)
+	for len(got) < len(want) {
+		n, err := server.Recv(buffer)
+		if err != nil {
+			t.Fatalf("receive after releasing backpressure: %v", err)
+		}
+		got = append(got, buffer[:n]...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("slow-reader recovery payload mismatch: got=%d want=%d", len(got), len(want))
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("writer failed after the reader resumed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not resume after the reader drained bounded delivery credit")
+	}
+	waitWriteDeadlineCondition(t, 2*time.Second, func() bool {
+		stats := client.ReplayStats()
+		return stats.FramesInUse == 0 && stats.BytesInUse == 0 && stats.CreditWaiters == 0
+	}, "slow-reader replay-ledger drain")
+	stats := client.ReplayStats()
+	if stats.FramesHighWater > stats.FrameLimit || stats.BytesHighWater > stats.ByteLimit {
+		t.Fatalf("slow-reader replay high water exceeded limits: %+v", stats)
+	}
+}
+
 type recvAdversarialTerminalPath struct {
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -194,7 +262,12 @@ type recvAdversarialTerminalPath struct {
 
 	terminalAckDone  chan struct{}
 	terminalAckOnce  sync.Once
+	terminalAckStart chan struct{}
+	terminalStartOne sync.Once
+	terminalAckGate  <-chan struct{}
 	blockTerminalAck bool
+	byeWrites        atomic.Uint64
+	byeSeen          atomic.Bool
 
 	closeStarted chan struct{}
 	closeRelease chan struct{}
@@ -206,12 +279,13 @@ type recvAdversarialTerminalPath struct {
 
 func newRecvAdversarialTerminalPath() *recvAdversarialTerminalPath {
 	return &recvAdversarialTerminalPath{
-		closed:          make(chan struct{}),
-		preAckStarted:   make(chan struct{}),
-		preAckRelease:   make(chan struct{}),
-		terminalAckDone: make(chan struct{}),
-		closeStarted:    make(chan struct{}),
-		closeRelease:    make(chan struct{}),
+		closed:           make(chan struct{}),
+		preAckStarted:    make(chan struct{}),
+		preAckRelease:    make(chan struct{}),
+		terminalAckDone:  make(chan struct{}),
+		terminalAckStart: make(chan struct{}),
+		closeStarted:     make(chan struct{}),
+		closeRelease:     make(chan struct{}),
 	}
 }
 
@@ -221,6 +295,12 @@ func (p *recvAdversarialTerminalPath) Read([]byte) (int, error) {
 }
 
 func (p *recvAdversarialTerminalPath) Write(frame []byte) (int, error) {
+	if len(frame) >= proto.HeaderSize {
+		if header, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil &&
+			header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlBye {
+			p.byeWrites.Add(1)
+		}
+	}
 	ack, ok := recvAdversarialDecodeAck(frame)
 	if !ok {
 		return len(frame), nil
@@ -235,6 +315,14 @@ func (p *recvAdversarialTerminalPath) Write(frame []byte) (int, error) {
 		}
 	}
 	if ack.NextSeq == 1 {
+		p.terminalStartOne.Do(func() { close(p.terminalAckStart) })
+		if p.terminalAckGate != nil {
+			select {
+			case <-p.terminalAckGate:
+			case <-p.closed:
+				return 0, net.ErrClosed
+			}
+		}
 		if p.blockTerminalAck {
 			<-p.closed
 			return 0, net.ErrClosed
@@ -264,6 +352,8 @@ func (p *recvAdversarialTerminalPath) OnDeath(fn func(transport.DeathCause, erro
 	p.deathFn = fn
 	p.deathMu.Unlock()
 }
+
+func (p *recvAdversarialTerminalPath) MarkByeSeen() { p.byeSeen.Store(true) }
 
 func (p *recvAdversarialTerminalPath) LocalAddr() string  { return "terminal-local" }
 func (p *recvAdversarialTerminalPath) RemoteAddr() string { return "terminal-remote" }
@@ -344,16 +434,34 @@ func TestRecvTerminalAckCompletesBeforeTransportClose(t *testing.T) {
 	case <-path.closeStarted:
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(path.closeRelease)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("terminal receive did not finish after releasing ACK and close")
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("terminal receive did not finish after releasing the ACK writer")
 	}
 	select {
 	case <-path.closeStarted:
+		t.Fatal("normal peer BYE closed the transport before local application Close")
+	default:
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	select {
+	case <-path.closeStarted:
 	case <-time.After(time.Second):
-		t.Fatal("terminal ACK completion did not trigger transport close")
+		t.Fatal("local Close after peer BYE did not release the transport")
+	}
+	close(path.closeRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("local Close after peer BYE: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Close after peer BYE did not finish")
 	}
 
 	terminalOrder := path.terminalOrd.Load()
@@ -379,16 +487,155 @@ func TestRecvTerminalAckBlockedWriteHasBoundedClose(t *testing.T) {
 	}()
 
 	select {
-	case <-path.closeStarted:
-		close(path.closeRelease)
+	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		close(path.closeRelease)
 		_ = e.Close()
-		t.Fatal("terminal ACK handling blocked transport close beyond its bounded deadline")
+		t.Fatal("terminal ACK handling exceeded its bounded write deadline")
 	}
 	select {
-	case <-done:
+	case <-path.closeStarted:
+		t.Fatal("bounded terminal ACK timeout closed the peer half before local Close")
+	default:
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	select {
+	case <-path.closeStarted:
 	case <-time.After(time.Second):
-		t.Fatal("terminal receive remained blocked after transport close unblocked the ACK write")
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("local Close did not unblock the timed-out terminal ACK write")
+	}
+	close(path.closeRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("local Close after timed-out terminal ACK: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Close remained blocked after transport release")
+	}
+}
+
+func TestPeerNormalByeDoesNotExposeEOForSendReciprocalByeBeforeAckAttempt(t *testing.T) {
+	e := New(SideServer, [16]byte{0xb3}, Limits{})
+	path := newRecvAdversarialTerminalPath()
+	ackGate := make(chan struct{})
+	path.terminalAckGate = ackGate
+	slot := attachRecvAdversarialTerminalPath(t, e, path)
+
+	receiveDone := make(chan struct{})
+	go func() {
+		e.onRecvBatch(recvAdversarialTerminalBatch(slot))
+		close(receiveDone)
+	}()
+	select {
+	case <-path.terminalAckStart:
+	case <-time.After(time.Second):
+		close(ackGate)
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("terminal ACK attempt did not start")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := e.Recv(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		close(ackGate)
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatalf("Read exposed terminal state before ACK handoff: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(ackGate)
+	select {
+	case <-receiveDone:
+	case <-time.After(time.Second):
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("terminal receive did not finish after ACK handoff")
+	}
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Read after ACK handoff = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("Read did not expose EOF after ACK handoff")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	select {
+	case <-path.closeStarted:
+	case <-time.After(time.Second):
+		close(path.closeRelease)
+		_ = e.Close()
+		t.Fatal("local Close after peer BYE did not start transport teardown")
+	}
+	close(path.closeRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("local Close after peer BYE: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Close after peer BYE did not finish")
+	}
+	if got := path.byeWrites.Load(); got != 0 {
+		t.Fatalf("local Close emitted %d reciprocal BYE frames", got)
+	}
+}
+
+func TestPeerNormalByeMarksEverySiblingPathCleanBeforeTerminalAck(t *testing.T) {
+	e := New(SideServer, [16]byte{0xb5}, Limits{})
+	first := newRecvAdversarialTerminalPath()
+	firstSlot := attachRecvAdversarialTerminalPath(t, e, first)
+	second := newRecvAdversarialTerminalPath()
+	if _, err := e.AttachPath(second, transport.PathSpec{Transport: "test", Address: "terminal-sibling"}); err != nil {
+		close(first.closeRelease)
+		close(second.closeRelease)
+		_ = e.Close()
+		t.Fatalf("attach sibling terminal path: %v", err)
+	}
+
+	e.onRecvBatch(recvAdversarialTerminalBatch(firstSlot))
+	if !first.byeSeen.Load() || !second.byeSeen.Load() {
+		close(first.closeRelease)
+		close(second.closeRelease)
+		_ = e.Close()
+		t.Fatalf("session BYE markers source/sibling=%t/%t", first.byeSeen.Load(), second.byeSeen.Load())
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	for _, path := range []*recvAdversarialTerminalPath{first, second} {
+		select {
+		case <-path.closeStarted:
+		case <-time.After(time.Second):
+			close(first.closeRelease)
+			close(second.closeRelease)
+			_ = e.Close()
+			t.Fatal("peer-normal Close did not start every sibling teardown")
+		}
+	}
+	close(first.closeRelease)
+	close(second.closeRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("peer-normal sibling Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer-normal sibling Close did not finish")
 	}
 }

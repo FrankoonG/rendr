@@ -115,6 +115,9 @@ func TestAttachedGenericPathHasStableRedialMobilityStatus(t *testing.T) {
 	if !reflect.DeepEqual(second.Paths[0].Mobility, got) {
 		t.Fatalf("generic mobility changed across observations: %+v -> %+v", got, second.Paths[0].Mobility)
 	}
+	if first.Paths[0].LocalAddr == "" || first.Paths[0].RemoteAddr == "" {
+		t.Fatalf("attached path physical endpoints are absent: %+v", first.Paths[0])
+	}
 }
 
 func TestDialerOptionalPathRetryAttachesAfterForwardingFix(t *testing.T) {

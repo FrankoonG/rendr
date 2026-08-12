@@ -7,7 +7,8 @@ import (
 	"sync"
 	"time"
 
-	qg "github.com/quic-go/quic-go"
+	qg "github.com/FrankoonG/quic-go"
+	"github.com/FrankoonG/quic-go/qlogwriter"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/internal/udpsocket"
@@ -54,6 +55,18 @@ var (
 // DATAGRAM-mode at >50k pps should raise the Linux kernel cap with
 // `sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`.
 func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
+	return ListenWithTracer(addr, tlsCfg, nil)
+}
+
+// ListenWithTracer is Listen with standard quic-go per-connection tracing.
+// quic-go invokes tracer once for each accepted connection; the resulting
+// trace remains attached while that connection changes paths and connection
+// IDs. The tracer is observational and cannot initiate mobility.
+func ListenWithTracer(
+	addr string,
+	tlsCfg *tls.Config,
+	tracer func(context.Context, bool, qg.ConnectionID) qlogwriter.Trace,
+) (*Listener, error) {
 	if tlsCfg == nil {
 		st, _, err := devTLSConfig()
 		if err != nil {
@@ -73,6 +86,7 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 	cfg := &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
+		Tracer:          tracer,
 		// Always advertise DATAGRAM support; stream-mode peers
 		// ignore it. Lets the listener serve both stream- and
 		// datagram-mode clients on the same UDP port.
@@ -97,7 +111,17 @@ func Listen(addr string, tlsCfg *tls.Config) (*Listener, error) {
 
 // ListenDatagram binds a UDP socket and exposes DATAGRAM-only framed ingress.
 func ListenDatagram(addr string, tlsCfg *tls.Config) (*DatagramListener, error) {
-	listener, err := Listen(addr, tlsCfg)
+	return ListenDatagramWithTracer(addr, tlsCfg, nil)
+}
+
+// ListenDatagramWithTracer is ListenDatagram with standard quic-go
+// per-connection tracing.
+func ListenDatagramWithTracer(
+	addr string,
+	tlsCfg *tls.Config,
+	tracer func(context.Context, bool, qg.ConnectionID) qlogwriter.Trace,
+) (*DatagramListener, error) {
+	listener, err := ListenWithTracer(addr, tlsCfg, tracer)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +235,14 @@ func (l *Listener) Accept(ctx context.Context) (*PathConn, error) {
 		release()
 		return nil, err
 	}
-	return wrap(conn, stream, true, release, leafmobility.RoleAcceptor, l.udpSocket), nil
+	active := retainedCIDTransport(l.tr, l.udpSocket, addrAsUDP(conn.LocalAddr()))
+	owner, err := newRealCIDOwner(conn, leafmobility.RoleAcceptor, leafmobility.SessionAny, active, routeObservation{}, release)
+	if err != nil {
+		_ = conn.CloseWithError(0, "initialize CID owner failed")
+		release()
+		return nil, err
+	}
+	return wrap(conn, stream, true, owner), nil
 }
 
 // AcceptPath delegates to Accept.
@@ -238,7 +269,14 @@ func (l *Listener) AcceptDatagram(ctx context.Context) (*datagramPathConn, error
 		release()
 		return nil, err
 	}
-	return wrapDatagram(conn, true, release, leafmobility.RoleAcceptor, l.udpSocket), nil
+	active := retainedCIDTransport(l.tr, l.udpSocket, addrAsUDP(conn.LocalAddr()))
+	owner, err := newRealCIDOwner(conn, leafmobility.RoleAcceptor, leafmobility.SessionPacket, active, routeObservation{}, release)
+	if err != nil {
+		_ = conn.CloseWithError(0, "initialize CID owner failed")
+		release()
+		return nil, err
+	}
+	return wrapDatagram(conn, true, owner), nil
 }
 
 // AcceptPath delegates to the wrapped listener's DATAGRAM acceptor.

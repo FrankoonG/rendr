@@ -31,18 +31,20 @@ const (
 	CtrlPathAdmissionCommit  CtrlCode = 0x0C
 	CtrlPathAdmissionAck     CtrlCode = 0x0D
 	CtrlPathAdmissionConfirm CtrlCode = 0x0E
+	CtrlPathRetire           CtrlCode = 0x0F
 	CtrlBridgeTag            CtrlCode = 0x10
 	CtrlBridgeAck            CtrlCode = 0x11
 	CtrlLeafMobilityPrepare  CtrlCode = 0x12
 	CtrlLeafMobilityAck      CtrlCode = 0x13
 	CtrlLeafMobilityCommit   CtrlCode = 0x14
+	CtrlStreamFin            CtrlCode = 0x15
 )
 
 type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 12
+	ProtocolMinor uint16 = 15
 )
 
 type FeatureSet uint64
@@ -87,8 +89,22 @@ const (
 	// a private successor before COMMIT, then publish it only after a correlated
 	// FINAL. The publication digest is echoed through terminal resolution.
 	FeatureLeafMobilityStagedPublication FeatureSet = 1 << 15
+	// FeatureBoundedReplayBudget separates application delivery buffering from
+	// a larger, byte-and-frame bounded network flight domain. Peers lacking the
+	// matching receive bitmap and replay limits can silently discard a valid
+	// suffix, so this behavior is mandatory rather than an optional tuning bit.
+	FeatureBoundedReplayBudget FeatureSet = 1 << 16
+	// FeaturePeerPathRetirement propagates one exact, shared leaf generation
+	// departure over a surviving sequenced route. Datagram carriers cannot
+	// otherwise make a local socket death visible to the peer, which can leave
+	// reverse traffic pinned to a silent black hole.
+	FeaturePeerPathRetirement FeatureSet = 1 << 17
+	// FeatureStreamHalfClose adds a sequenced, directional stream FIN. It is
+	// distinct from BYE: the receiver observes EOF only after all preceding
+	// DATA while the reverse stream remains writable.
+	FeatureStreamHalfClose FeatureSet = 1 << 18
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -261,31 +277,38 @@ type SessionEpoch [16]byte
 type FrameDigest [32]byte
 type AckProof [16]byte
 
+const (
+	ackProofDomain = "rendr-ack-proof-v1\x00"
+	ackChainDomain = "rendr-ack-chain-v1\x00"
+)
+
 func DigestFrame(frame []byte) FrameDigest {
 	return sha256.Sum256(frame)
 }
 
 func InitialAckProof(epoch SessionEpoch, direction SenderDirection, graphRevision uint64, graphDigest GraphDigest) AckProof {
-	h := sha256.New()
-	h.Write([]byte("rendr-ack-proof-v1\x00"))
-	h.Write(epoch[:])
-	h.Write([]byte{byte(direction)})
-	var revision [8]byte
-	binary.BigEndian.PutUint64(revision[:], graphRevision)
-	h.Write(revision[:])
-	h.Write(graphDigest[:])
+	var input [len(ackProofDomain) + len(SessionEpoch{}) + 1 + 8 + len(GraphDigest{})]byte
+	offset := copy(input[:], ackProofDomain)
+	offset += copy(input[offset:], epoch[:])
+	input[offset] = byte(direction)
+	offset++
+	binary.BigEndian.PutUint64(input[offset:offset+8], graphRevision)
+	offset += 8
+	copy(input[offset:], graphDigest[:])
+	digest := sha256.Sum256(input[:])
 	var proof AckProof
-	copy(proof[:], h.Sum(nil))
+	copy(proof[:], digest[:])
 	return proof
 }
 
 func AdvanceAckProof(previous AckProof, frame FrameDigest) AckProof {
-	h := sha256.New()
-	h.Write([]byte("rendr-ack-chain-v1\x00"))
-	h.Write(previous[:])
-	h.Write(frame[:])
+	var input [len(ackChainDomain) + len(AckProof{}) + len(FrameDigest{})]byte
+	offset := copy(input[:], ackChainDomain)
+	offset += copy(input[offset:], previous[:])
+	copy(input[offset:], frame[:])
+	digest := sha256.Sum256(input[:])
 	var proof AckProof
-	copy(proof[:], h.Sum(nil))
+	copy(proof[:], digest[:])
 	return proof
 }
 
@@ -372,6 +395,8 @@ func (c CtrlCode) String() string {
 		return "PATH_ADMISSION_ACK"
 	case CtrlPathAdmissionConfirm:
 		return "PATH_ADMISSION_CONFIRM"
+	case CtrlPathRetire:
+		return "PATH_RETIRE"
 	case CtrlHelloAck:
 		return "HELLO_ACK"
 	case CtrlBridgeTag:
@@ -384,6 +409,8 @@ func (c CtrlCode) String() string {
 		return "LEAF_MOBILITY_ACK"
 	case CtrlLeafMobilityCommit:
 		return "LEAF_MOBILITY_COMMIT"
+	case CtrlStreamFin:
+		return "STREAM_FIN"
 	default:
 		return fmt.Sprintf("ctrl(0x%02x)", uint8(c))
 	}

@@ -65,6 +65,82 @@ func TestRecursiveExplicitMigrateChangesActualDataRoute(t *testing.T) {
 	}
 }
 
+func TestRecursiveExplicitMigrateRefreshesSelectedTargetIncarnation(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	attach := func(name string) (uint32, *captureDispatchPath) {
+		t.Helper()
+		path, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		capture := &captureDispatchPath{PathConn: path}
+		id, err := e.AttachPathBound(capture, transport.PathSpec{Transport: "memory"}, PathBinding{
+			LocalTXTargetID: ids[name], PeerTXTargetID: ids[name],
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id, capture
+	}
+	aID, _ := attach("a")
+	bID, _ := attach("b")
+	if err := e.Migrate(bID); err != nil {
+		t.Fatal(err)
+	}
+	e.policyStateMu.Lock()
+	selectedGeneration := e.policyGeneration
+	e.policyStateMu.Unlock()
+	if err := e.RemovePath(bID); err != nil {
+		t.Fatal(err)
+	}
+	if active := e.ActivePath(); active != aID {
+		t.Fatalf("death failover active=%d want a=%d", active, aID)
+	}
+	recoveredID, recovered := attach("b")
+	if active := e.ActivePath(); active != aID {
+		t.Fatalf("reattach changed active=%d before explicit refresh, want a=%d", active, aID)
+	}
+	migrationsBefore := e.MigrationCount()
+	if err := e.Migrate(recoveredID); err != nil {
+		t.Fatal(err)
+	}
+	if active := e.ActivePath(); active != recoveredID {
+		t.Fatalf("same-target refresh active=%d want recovered=%d", active, recoveredID)
+	}
+	e.policyStateMu.Lock()
+	refreshedGeneration := e.policyGeneration
+	e.policyStateMu.Unlock()
+	if refreshedGeneration != selectedGeneration {
+		t.Fatalf("same-target physical refresh advanced policy generation=%d want %d", refreshedGeneration, selectedGeneration)
+	}
+	if e.MigrationCount() != migrationsBefore+1 {
+		t.Fatalf("same-target physical refresh migrations=%d want %d", e.MigrationCount(), migrationsBefore+1)
+	}
+	if _, err := e.SendData([]byte("recovered")); err != nil {
+		t.Fatal(err)
+	}
+	if sequences := recovered.dataSequences(); len(sequences) == 0 {
+		t.Fatal("recovered incarnation received no DATA")
+	}
+	migrationsAfter := e.MigrationCount()
+	if err := e.Migrate(recoveredID); err != nil {
+		t.Fatal(err)
+	}
+	if e.MigrationCount() != migrationsAfter {
+		t.Fatal("unchanged physical projection counted an extra migration")
+	}
+}
+
 func TestRecursiveReplayHonorsRootSelectorInsteadOfInactiveNestedScope(t *testing.T) {
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "inner"),

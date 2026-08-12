@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,6 +88,812 @@ func TestLeafMobilityOutcomeUnknownRetainsFenceForAdmittedData(t *testing.T) {
 		t.Fatal("admitted DATA did not reach the second TX fence check")
 	}
 	release()
+}
+
+func TestLeafMobilityPrepareDrainsRegisteredProbeWriters(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(*Engine, *pathSlot)
+	}{
+		{
+			name:  "request",
+			start: func(e *Engine, slot *pathSlot) { e.issuePathProbe(slot) },
+		},
+		{
+			name: "reply",
+			start: func(e *Engine, slot *pathSlot) {
+				e.handlePathProbeRequest(slot, proto.ProbePayload{ID: 31, TS: 37}.Encode())
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+			plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe2)
+			authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			permit, err := authority.Consume()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.client.pathsMu.RLock()
+			slot := fixture.client.paths[fixture.clientRef.ID]
+			fixture.client.pathsMu.RUnlock()
+			if slot == nil {
+				t.Fatal("source slot disappeared")
+			}
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var enteredOnce sync.Once
+			var releaseOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+			slot.probeBeforeWritePermit = func() {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+			test.start(fixture.client, slot)
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("probe writer did not reach the pre-permit boundary")
+			}
+
+			prepared := make(chan error, 1)
+			go func() { prepared <- permit.Prepare(context.Background()) }()
+			eventuallyEngine(t, time.Second, func() bool { return !slot.txEnabled.Load() })
+			select {
+			case err := <-prepared:
+				releaseOnce.Do(func() { close(release) })
+				t.Fatalf("Prepare crossed a registered probe writer: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case err := <-prepared:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Prepare did not continue after the probe writer drained")
+			}
+			if err := permit.RolledBack(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLeafMobilityFenceCancelsProbeWaitingForWritePermit(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xeb)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+
+	if err := slot.acquireWrite(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	permitHeld := true
+	defer func() {
+		if permitHeld {
+			slot.releaseWrite()
+		}
+	}()
+
+	atPermit := make(chan struct{})
+	continueToPermit := make(chan struct{})
+	var atPermitOnce sync.Once
+	var continueOnce sync.Once
+	continueProbe := func() { continueOnce.Do(func() { close(continueToPermit) }) }
+	t.Cleanup(continueProbe)
+	slot.probeBeforeWritePermit = func() {
+		atPermitOnce.Do(func() { close(atPermit) })
+		<-continueToPermit
+	}
+	controlsBefore := slot.controlWrites.Load()
+	fixture.client.issuePathProbe(slot)
+	select {
+	case <-atPermit:
+	case <-time.After(time.Second):
+		t.Fatal("probe writer did not register before waiting for the held write permit")
+	}
+
+	fenced := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		fenced <- permit.token.fenceExecutionDispatch(ctx)
+	}()
+	eventuallyEngine(t, time.Second, func() bool { return !slot.txEnabled.Load() })
+	continueProbe()
+	select {
+	case err := <-fenced:
+		if err != nil {
+			t.Fatalf("fenceExecutionDispatch remained pinned behind the application write permit: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fenceExecutionDispatch did not supersede the waiting probe writer")
+	}
+	if writes := slot.controlWrites.Load(); writes != controlsBefore {
+		t.Fatalf("cancelled probe reached the wire: controls=%d->%d", controlsBefore, writes)
+	}
+
+	if err := permit.execution.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	permit.token.releaseExecutionDispatch()
+	if !slot.txEnabled.Load() {
+		t.Fatal("rollback did not reopen TX after the cancelled probe drained")
+	}
+	slot.probeBeforeWritePermit = nil
+	slot.releaseWrite()
+	permitHeld = false
+	time.Sleep(20 * time.Millisecond)
+	if writes := slot.controlWrites.Load(); writes != controlsBefore {
+		t.Fatalf("cancelled probe crossed rollback/unfence: controls=%d->%d", controlsBefore, writes)
+	}
+	permit.token.outcomeUnknownSerialized(leafmobility.ErrAuthorityStale)
+}
+
+func TestLeafMobilityUnfencePublishesProbeGenerationFirst(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+	originalGeneration := slot.probeEndpointGen.Load()
+	slot.probeEvidence.Store(&pathProbeEvidence{
+		generation:  pathProbeGenerationForSlot(slot),
+		firstIssued: time.Now(),
+		issued:      1,
+	})
+	type unfenceObservation struct {
+		generation uint64
+		evidence   *pathProbeEvidence
+	}
+	observed := make(chan unfenceObservation, 1)
+	var observeOnce sync.Once
+	slot.dispatchBeforeUnfence = func() {
+		observeOnce.Do(func() {
+			observed <- unfenceObservation{
+				generation: slot.probeEndpointGen.Load(),
+				evidence:   slot.probeEvidence.Load(),
+			}
+		})
+	}
+
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe3)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Execute(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got unfenceObservation
+	select {
+	case got = <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("successful authority never reopened path TX")
+	}
+	wantGeneration := fixture.clientClaim.Snapshot().Generation
+	if wantGeneration <= originalGeneration {
+		t.Fatalf("claim generation=%d did not advance from %d", wantGeneration, originalGeneration)
+	}
+	if got.generation != wantGeneration {
+		t.Fatalf("generation at unfence=%d want committed claim generation=%d", got.generation, wantGeneration)
+	}
+	if got.evidence != nil {
+		t.Fatalf("old endpoint probe evidence survived unfence: %+v", *got.evidence)
+	}
+}
+
+func TestLeafMobilitySuccessfulUnfenceRejectsPreFenceData(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe4)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+
+	prePermit := make(chan struct{})
+	release := make(chan struct{})
+	var prePermitOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	slot.dispatchBeforeWritePermit = func() {
+		prePermitOnce.Do(func() { close(prePermit) })
+		<-release
+	}
+	frame := make([]byte, proto.HeaderSize+1)
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 0xe4}).Encode(frame[:proto.HeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	frame[len(frame)-1] = 0x5a
+	result := make(chan pathDispatchResult, 1)
+	if !slot.submitDispatch(pathDispatchJob{frame: frame, firstPublication: true, result: result}) {
+		t.Fatal("failed to queue pre-fence DATA")
+	}
+	select {
+	case <-prePermit:
+	case <-time.After(time.Second):
+		t.Fatal("DATA did not reach the pre-permit boundary")
+	}
+	if err := permit.Execute(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !slot.txEnabled.Load() {
+		t.Fatal("successful mobility did not reopen TX")
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, ErrPathTXFenced) {
+			t.Fatalf("pre-fence DATA result=%v want ErrPathTXFenced", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pre-fence DATA did not finish after mobility")
+	}
+	slot.dispatchBeforeWritePermit = nil
+	if _, err := fixture.client.SendData([]byte("post-fence-data")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	n, err := fixture.server.Recv(buf)
+	if err != nil || string(buf[:n]) != "post-fence-data" {
+		t.Fatalf("post-fence DATA=(%q,%v)", buf[:n], err)
+	}
+}
+
+func TestLeafMobilityFailClosedReleaseDoesNotUnfence(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientExecutionDriver.proveCommit.Store(false)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe5)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Stage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	authorizeLeafMobilityPublish(t, permit)
+	if err := permit.PublishDriver(context.Background()); !errors.Is(err, leafmobility.ErrIncarnationUnproven) {
+		t.Fatalf("PublishDriver=%v want unproven incarnation", err)
+	}
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+	var unfences atomic.Int64
+	slot.dispatchBeforeUnfence = func() { unfences.Add(1) }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := permit.execution.FailClosed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	permit.forceLocalExecutionClosed()
+	if got := unfences.Load(); got != 0 {
+		t.Fatalf("fail-closed release attempted %d TX unfence(s)", got)
+	}
+	if slot.txEnabled.Load() {
+		t.Fatal("fail-closed subject TX was reopened")
+	}
+	permit.token.outcomeUnknownSerialized(leafmobility.ErrIncarnationUnproven)
+}
+
+func TestLeafMobilityRollbackRejectsTimedOutPreFenceProbeWriter(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe6)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	slot.probeBeforeWritePermit = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	fixture.client.issuePathProbe(slot)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("probe writer did not reach pre-permit boundary")
+	}
+	executeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := permit.Execute(executeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Execute=%v want probe-drain deadline", err)
+	}
+	if slot.txEnabled.Load() {
+		t.Fatal("rollback reopened source TX before the timed-out probe writer exited")
+	}
+	writesBefore := slot.controlWrites.Load()
+	releaseOnce.Do(func() { close(release) })
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Second)
+	defer drainCancel()
+	if err := slot.waitProbeWriters(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+	if writesAfter := slot.controlWrites.Load(); writesAfter != writesBefore {
+		t.Fatalf("timed-out pre-fence probe crossed rollback: controls=%d->%d", writesBefore, writesAfter)
+	}
+	eventuallyEngine(t, time.Second, slot.txEnabled.Load)
+}
+
+func TestTXFenceDisablesBeforePublishingEpoch(t *testing.T) {
+	local, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = local.Close(); _ = peer.Close() })
+	slot := &pathSlot{conn: local, quit: make(chan struct{}), writePermit: newPathWritePermit()}
+	slot.txEnabled.Store(true)
+	midpoint := make(chan struct{})
+	release := make(chan struct{})
+	var midpointOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	slot.dispatchFenceMidpoint = func() {
+		midpointOnce.Do(func() { close(midpoint) })
+		<-release
+	}
+	fenced := make(chan bool, 1)
+	go func() { fenced <- slot.tryFenceDispatch() }()
+	select {
+	case <-midpoint:
+	case <-time.After(time.Second):
+		t.Fatal("fence did not reach publication midpoint")
+	}
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := slot.writeDispatchedFrame([]byte("must-not-enter-fence-window"))
+		writeResult <- err
+	}()
+	select {
+	case err := <-writeResult:
+		t.Fatalf("direct permit crossed fence publication lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case ok := <-fenced:
+		if !ok {
+			t.Fatal("fence was not established")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fence did not finish")
+	}
+	select {
+	case err := <-writeResult:
+		if !errors.Is(err, ErrPathTXFenced) {
+			t.Fatalf("write at fence midpoint=%v want ErrPathTXFenced", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct permit did not finish after fence publication")
+	}
+	select {
+	case frame := <-peer.in:
+		t.Fatalf("DATA entered wire during fence publication: %x", frame)
+	default:
+	}
+}
+
+func TestDirectDispatchPermitCannotSnapshotFencedEpochAcrossUnfence(t *testing.T) {
+	local, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = local.Close(); _ = peer.Close() })
+	slot := &pathSlot{conn: local, quit: make(chan struct{}), writePermit: newPathWritePermit()}
+	slot.txEnabled.Store(true)
+	if !slot.tryFenceDispatch() {
+		t.Fatal("failed to establish TX fence")
+	}
+
+	snapshotted := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	var snapshotOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSnapshot) }) })
+	slot.dispatchFencePermitSnapshot = func() {
+		snapshotOnce.Do(func() { close(snapshotted) })
+		<-releaseSnapshot
+	}
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := slot.writeDispatchedFrame([]byte("fenced-epoch-data"))
+		writeResult <- err
+	}()
+	select {
+	case <-snapshotted:
+	case <-time.After(time.Second):
+		t.Fatal("direct dispatch did not reach the fence permit snapshot")
+	}
+
+	unfenced := make(chan struct{})
+	go func() {
+		slot.unfenceDispatch()
+		close(unfenced)
+	}()
+	unfencedEarly := false
+	select {
+	case <-unfenced:
+		unfencedEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseSnapshot) })
+	select {
+	case err := <-writeResult:
+		if !errors.Is(err, ErrPathTXFenced) {
+			t.Fatalf("direct dispatch=%v want ErrPathTXFenced", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct dispatch did not leave the fenced permit snapshot")
+	}
+	select {
+	case <-unfenced:
+	case <-time.After(time.Second):
+		t.Fatal("unfence did not continue after the permit decision")
+	}
+	if unfencedEarly {
+		t.Fatal("unfence crossed an in-progress direct fence permit decision")
+	}
+	select {
+	case frame := <-peer.in:
+		t.Fatalf("fenced-epoch DATA reached successor wire: %x", frame)
+	default:
+	}
+}
+
+func TestLeafMobilityRollbackDefersUnfencePastPreWriteProbeWriter(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(*Engine, *pathSlot)
+	}{
+		{name: "request", start: func(e *Engine, slot *pathSlot) { e.issuePathProbe(slot) }},
+		{name: "reply", start: func(e *Engine, slot *pathSlot) {
+			e.handlePathProbeRequest(slot, proto.ProbePayload{ID: 47, TS: 53}.Encode())
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+			plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe7)
+			authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			permit, err := authority.Consume()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.client.pathsMu.RLock()
+			slot := fixture.client.paths[fixture.clientRef.ID]
+			fixture.client.pathsMu.RUnlock()
+			if slot == nil {
+				t.Fatal("source slot disappeared")
+			}
+
+			validated := make(chan struct{})
+			releaseWriter := make(chan struct{})
+			unfenceEntered := make(chan struct{})
+			releaseUnfence := make(chan struct{})
+			var validatedOnce sync.Once
+			var writerReleaseOnce sync.Once
+			var unfenceOnce sync.Once
+			var unfenceReleaseOnce sync.Once
+			t.Cleanup(func() {
+				writerReleaseOnce.Do(func() { close(releaseWriter) })
+				unfenceReleaseOnce.Do(func() { close(releaseUnfence) })
+			})
+			slot.probeAfterFinalValidation = func() {
+				validatedOnce.Do(func() { close(validated) })
+				<-releaseWriter
+			}
+			slot.dispatchBeforeUnfence = func() {
+				unfenceOnce.Do(func() { close(unfenceEntered) })
+				<-releaseUnfence
+			}
+			test.start(fixture.client, slot)
+			select {
+			case <-validated:
+			case <-time.After(time.Second):
+				t.Fatal("probe writer did not reach the post-validation boundary")
+			}
+
+			fenceCtx, cancelFence := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			err = permit.token.fenceExecutionDispatch(fenceCtx)
+			cancelFence()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("fenceExecutionDispatch=%v want probe-drain deadline", err)
+			}
+			if err := permit.execution.Rollback(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			controlsBefore := slot.controlWrites.Load()
+			permit.token.releaseExecutionDispatch()
+			select {
+			case <-unfenceEntered:
+				t.Fatal("rollback unfenced while a post-validation probe writer was still registered")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if slot.txEnabled.Load() {
+				t.Fatal("rollback reopened TX before the probe writer physically completed")
+			}
+
+			writerReleaseOnce.Do(func() { close(releaseWriter) })
+			select {
+			case <-unfenceEntered:
+			case <-time.After(time.Second):
+				t.Fatal("deferred release did not continue after the probe writer completed")
+			}
+			if controlsAfter := slot.controlWrites.Load(); controlsAfter != controlsBefore {
+				t.Fatalf("pre-fence probe crossed rollback: controls=%d->%d", controlsBefore, controlsAfter)
+			}
+			if slot.txEnabled.Load() {
+				t.Fatal("TX reopened before the deferred unfence linearized")
+			}
+			unfenceReleaseOnce.Do(func() { close(releaseUnfence) })
+			eventuallyEngine(t, time.Second, slot.txEnabled.Load)
+			permit.token.outcomeUnknownSerialized(leafmobility.ErrAuthorityStale)
+		})
+	}
+}
+
+func TestDeferredProbeReleaseCannotReopenAfterShutdownWins(t *testing.T) {
+	tests := []struct {
+		name     string
+		shutdown func(*Engine)
+	}{
+		{name: "Close", shutdown: func(e *Engine) { go e.Close() }},
+		{name: "BeginGracefulClose", shutdown: func(e *Engine) { e.BeginGracefulClose() }},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+			plan := engineLeafPlan(t, fixture.client, fixture.clientRef, byte(0xe9+index))
+			authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			permit, err := authority.Consume()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.client.pathsMu.RLock()
+			slot := fixture.client.paths[fixture.clientRef.ID]
+			fixture.client.pathsMu.RUnlock()
+			if slot == nil {
+				t.Fatal("source slot disappeared")
+			}
+
+			validated := make(chan struct{})
+			releaseWriter := make(chan struct{})
+			reopenAttempted := make(chan struct{}, 1)
+			var validatedOnce sync.Once
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseWriter) }) }
+			t.Cleanup(release)
+			slot.probeAfterFinalValidation = func() {
+				validatedOnce.Do(func() { close(validated) })
+				<-releaseWriter
+			}
+			slot.dispatchBeforeUnfence = func() {
+				select {
+				case reopenAttempted <- struct{}{}:
+				default:
+				}
+			}
+			fixture.client.issuePathProbe(slot)
+			select {
+			case <-validated:
+			case <-time.After(time.Second):
+				t.Fatal("probe writer did not reach the post-validation physical-write boundary")
+			}
+
+			fenceCtx, cancelFence := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			err = permit.token.fenceExecutionDispatch(fenceCtx)
+			cancelFence()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("fenceExecutionDispatch=%v want probe-drain deadline", err)
+			}
+			if err := permit.execution.Rollback(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			permit.token.releaseExecutionDispatch()
+			permit.token.dispatchMu.Lock()
+			deferred := permit.token.dispatchFenced && permit.token.dispatchReleasePending
+			permit.token.dispatchMu.Unlock()
+			if !deferred {
+				t.Fatal("probe writer did not force a deferred dispatch release")
+			}
+			if slot.txEnabled.Load() {
+				t.Fatal("deferred release reopened TX before shutdown")
+			}
+
+			asyncDrained := make(chan struct{})
+			go func() {
+				fixture.client.leafTx.asyncWG.Wait()
+				close(asyncDrained)
+			}()
+			probeDrained := make(chan struct{})
+			go func() {
+				slot.probeWriteWG.Wait()
+				close(probeDrained)
+			}()
+
+			test.shutdown(fixture.client)
+			if test.name == "Close" {
+				select {
+				case <-fixture.client.closed:
+				case <-time.After(time.Second):
+					release()
+					t.Fatal("Close did not publish its terminal boundary")
+				}
+			} else if !fixture.client.sendClosing.Load() {
+				t.Fatal("BeginGracefulClose did not publish the no-reopen boundary")
+			}
+			if slot.txEnabled.Load() {
+				t.Fatal("shutdown boundary reopened fenced TX")
+			}
+			if test.name == "BeginGracefulClose" {
+				// BeginGracefulClose does not terminate an in-flight authority by
+				// itself. Resolve this test authority only after the no-reopen
+				// boundary wins so its watchdog and deferred release must both drain.
+				permit.token.outcomeUnknownSerialized(leafmobility.ErrAuthorityStale)
+			}
+
+			release()
+			select {
+			case <-probeDrained:
+			case <-time.After(time.Second):
+				t.Fatal("post-validation probe writer did not drain")
+			}
+			select {
+			case <-asyncDrained:
+			case <-time.After(time.Second):
+				t.Fatal("deferred-release async tracking did not drain")
+			}
+			select {
+			case <-reopenAttempted:
+				t.Fatal("deferred release attempted to unfence after shutdown won")
+			default:
+			}
+			if slot.txEnabled.Load() {
+				t.Fatal("TX reopened after the deferred probe writer exited")
+			}
+
+			if test.name == "BeginGracefulClose" {
+				if err := fixture.client.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-fixture.client.Closed():
+			case <-time.After(2 * time.Second):
+				t.Fatal("engine shutdown did not fully quiesce")
+			}
+		})
+	}
+}
+
+func TestLeafMobilityReleaseLinearizesReopenBeforeClose(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xe8)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.pathsMu.RLock()
+	slot := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatal("source slot disappeared")
+	}
+
+	reopenEntered := make(chan struct{})
+	releaseReopen := make(chan struct{})
+	var reopenOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseReopen) }) })
+	slot.dispatchBeforeUnfence = func() {
+		reopenOnce.Do(func() { close(reopenEntered) })
+		<-releaseReopen
+	}
+	rolledBack := make(chan error, 1)
+	go func() { rolledBack <- permit.RolledBack(context.Background()) }()
+	select {
+	case <-reopenEntered:
+	case <-time.After(time.Second):
+		t.Fatal("rollback release did not reach the reopen boundary")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.client.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close crossed the serialized reopen boundary: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if fixture.client.closing.Load() || fixture.client.sendClosing.Load() {
+		t.Fatal("Close published closing state before the earlier reopen linearized")
+	}
+
+	releaseOnce.Do(func() { close(releaseReopen) })
+	select {
+	case err := <-rolledBack:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rollback did not finish after reopen was released")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after serialized reopen")
+	}
+	if slot.txEnabled.Load() {
+		t.Fatal("TX was enabled after Close linearized")
+	}
 }
 
 func TestLeafMobilityDispatchFenceRejectsQueuedDataBeforeControl(t *testing.T) {

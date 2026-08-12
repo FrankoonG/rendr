@@ -12,6 +12,7 @@ import (
 
 	"github.com/FrankoonG/rendr/internal/engine"
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 	"github.com/FrankoonG/rendr/transport/tcp"
 )
 
@@ -618,6 +619,104 @@ func TestRuntimeListenerBridgeCannotObserveFailedHelloReservation(t *testing.T) 
 	}
 }
 
+func TestRuntimeListenerL3RejectKeepsHandshakeDeadlineThroughBlockedBye(t *testing.T) {
+	const attempts = 64
+	clientEngine := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{}.Clamp())
+	defer clientEngine.Close()
+	graph, err := compileTargetGraph(Path("path", PathSpec{Transport: "blocked", Address: "peer"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientEngine.ConfigureLocalGraph(1, graph.manifest); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := engine.NewInstanceID()
+	clientEngine.SetLocalInstanceID(instanceID)
+	targetID, err := clientEngine.LocalPathTargetID("path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := (proto.HelloPayload{
+		Negotiation:     clientEngine.LocalNegotiation(),
+		FlowID:          clientEngine.FlowID(),
+		InstanceID:      instanceID,
+		Caps:            proto.CapsL3Identity,
+		InitialTargetID: targetID,
+		LocalTXManifest: clientEngine.LocalGraphManifest(),
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	if err := (proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlHello),
+	}).Encode(frame[:proto.HeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	copy(frame[proto.HeaderSize:], payload)
+
+	listener := &SessionListener{
+		handshakes: make(chan struct{}, attempts),
+		kinds: map[string]transport.PathSessionKind{
+			"blocked": transport.PathSessionStream,
+		},
+		inflight: make(map[uint64]transport.PathConn, attempts),
+		closed:   make(chan struct{}),
+	}
+	paths := make([]*blockedRuntimeByePath, 0, attempts)
+	var workers sync.WaitGroup
+	for index := range attempts {
+		path := newBlockedRuntimeByePath(frame)
+		paths = append(paths, path)
+		inflightID := uint64(index + 1)
+		listener.inflightMu.Lock()
+		listener.inflight[inflightID] = path
+		listener.inflightMu.Unlock()
+		listener.handshakes <- struct{}{}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			listener.serveIncoming(
+				inflightID,
+				"blocked",
+				CarrierTCP,
+				path,
+				armPathHandshakeDeadlineAfter(path, 100*time.Millisecond),
+			)
+		}()
+	}
+	defer func() {
+		for _, path := range paths {
+			_ = path.Close()
+		}
+	}()
+	for index, path := range paths {
+		select {
+		case <-path.writeStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("rejection %d never entered the bounded BYE write", index)
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked capability rejections retained handshake slots after their deadlines")
+	}
+	if got := len(listener.handshakes); got != 0 {
+		t.Fatalf("handshake slots retained after rejection=%d", got)
+	}
+	if got := runtimeListenerInflight(listener); got != 0 {
+		t.Fatalf("in-flight paths retained after rejection=%d", got)
+	}
+}
+
 func TestRuntimeListenerAcceptCloseOwnershipLinearization(t *testing.T) {
 	for iteration := 0; iteration < 100; iteration++ {
 		rawListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -843,7 +942,7 @@ func TestRuntimeListenerReusedHelloProposalGetsFreshFinalEpoch(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		admission, err := engine.PerformClientHelloAdmissionContext(ctx, tcp.Wrap(clientRaw), clientEngine,
-			clientInstance, 0, "path", PathSpec{Transport: "pipe"})
+			clientInstance, 0, "path", PathSpec{Transport: "pipe"}, nil)
 		if err != nil {
 			cancel()
 			_ = clientEngine.Close()
@@ -1121,6 +1220,50 @@ type gatedFirstFrameConn struct {
 }
 
 type terminalErrorListener struct{ err error }
+
+type blockedRuntimeByePath struct {
+	frame        []byte
+	read         atomic.Bool
+	writeStarted chan struct{}
+	writeOnce    sync.Once
+	closed       chan struct{}
+	closeOnce    sync.Once
+}
+
+func newBlockedRuntimeByePath(frame []byte) *blockedRuntimeByePath {
+	return &blockedRuntimeByePath{
+		frame:        append([]byte(nil), frame...),
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (p *blockedRuntimeByePath) Read(dst []byte) (int, error) {
+	if p.read.Swap(true) {
+		return 0, io.EOF
+	}
+	if len(dst) < len(p.frame) {
+		return 0, io.ErrShortBuffer
+	}
+	return copy(dst, p.frame), nil
+}
+
+func (p *blockedRuntimeByePath) Write([]byte) (int, error) {
+	p.writeOnce.Do(func() { close(p.writeStarted) })
+	<-p.closed
+	return 0, net.ErrClosed
+}
+
+func (p *blockedRuntimeByePath) Close() error {
+	p.closeOnce.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (*blockedRuntimeByePath) Quality() transport.PathQuality { return transport.PathQuality{} }
+func (*blockedRuntimeByePath) OnDeath(func(transport.DeathCause, error)) {
+}
+func (*blockedRuntimeByePath) LocalAddr() string  { return "blocked-local" }
+func (*blockedRuntimeByePath) RemoteAddr() string { return "blocked-remote" }
 
 func (l *terminalErrorListener) Accept() (net.Conn, error) { return nil, l.err }
 func (l *terminalErrorListener) Close() error              { return nil }

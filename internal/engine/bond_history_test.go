@@ -48,6 +48,31 @@ func newMemoryPathPair() (*memoryPathConn, *memoryPathConn) {
 	return a, b
 }
 
+func TestSendHistoryFrameOwnershipContracts(t *testing.T) {
+	frame := make([]byte, proto.HeaderSize+3)
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 1}).Encode(frame); err != nil {
+		t.Fatal(err)
+	}
+	copy(frame[proto.HeaderSize:], "one")
+
+	borrowed := &Engine{}
+	if err := borrowed.reserveSendFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	if &borrowed.sendHist.entries[0].frame[0] == &frame[0] {
+		t.Fatal("borrowed reserve retained the caller's frame")
+	}
+
+	ownedFrame := append([]byte(nil), frame...)
+	owned := &Engine{}
+	if err := owned.reserveOwnedSendFrame(ownedFrame); err != nil {
+		t.Fatal(err)
+	}
+	if &owned.sendHist.entries[0].frame[0] != &ownedFrame[0] {
+		t.Fatal("owned reserve copied the transferred frame")
+	}
+}
+
 func (p *memoryPathConn) Read(buf []byte) (int, error) {
 	if err := p.failure(); err != nil {
 		p.notifyFailure(err)
@@ -170,6 +195,27 @@ func (p *memoryPathConn) LocalAddr() string  { return "memory-local" }
 func (p *memoryPathConn) RemoteAddr() string { return "memory-remote" }
 func (p *memoryPathConn) Writes() uint64     { return p.writes.Load() }
 func (p *memoryPathConn) Reads() uint64      { return p.reads.Load() }
+
+type accelerationMemoryPath struct {
+	*memoryPathConn
+	status transport.DatagramAccelerationStatus
+}
+
+func (p *accelerationMemoryPath) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
+	return p.status
+}
+
+func TestPathInfosProjectsDatagramAccelerationEvidence(t *testing.T) {
+	local, _ := newMemoryPathPair()
+	want := transport.DatagramAccelerationStatus{
+		Mode: transport.DatagramAccelerationGSO, Cause: "probe_confirmed", ProbeGeneration: 9,
+		BatchCalls: 7, BatchDatagrams: 42, GSOAttempts: 11, GSOSuperPackets: 10, GSOSegments: 80,
+	}
+	info := pathInfos([]*pathSlot{{id: 3, conn: &accelerationMemoryPath{memoryPathConn: local, status: want}}}, 3)
+	if len(info) != 1 || info[0].DatagramAcceleration != want {
+		t.Fatalf("acceleration projection=%+v want %+v", info, want)
+	}
+}
 
 func TestBondRedistributesDeadPathHistory(t *testing.T) {
 	flow := NewClientFlowID()

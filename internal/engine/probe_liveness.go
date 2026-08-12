@@ -1,0 +1,907 @@
+package engine
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"time"
+
+	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
+)
+
+type pathProbeGeneration struct {
+	path               PathRef
+	routeGeneration    uint64
+	endpointGeneration uint64
+}
+
+type pathProbeLifecycle uint8
+
+const (
+	pathProbeReserved pathProbeLifecycle = iota
+	pathProbeQueued
+	pathProbeWriteStarted
+	pathProbeWriteCommitted
+	pathProbeWireTimeout
+	pathProbeDataBlocked
+	pathProbeDataStarved
+	pathProbeWriteStalled
+)
+
+type pathProbeFailure uint8
+
+const (
+	pathProbeFailureNone pathProbeFailure = iota
+	pathProbeFailureWireTimeout
+	pathProbeFailureDataStarved
+	pathProbeFailureWriteStalled
+)
+
+type pathProbeStatus struct {
+	lifecycle pathProbeLifecycle
+	failure   pathProbeFailure
+}
+
+type pathProbeObservation struct {
+	queuedAt            time.Time
+	writeStartedAt      time.Time
+	writeCommittedAt    time.Time
+	writeStallDeadline  time.Time
+	deadline            time.Time
+	generation          pathProbeGeneration
+	slot                *pathSlot
+	quality             transport.PathQuality
+	wireTS              uint64
+	fenceEpoch          uint64
+	lifecycle           pathProbeLifecycle
+	dataStallGeneration uint64
+	dataBlockedAt       time.Time
+	pendingReplyAt      time.Time
+}
+
+// pathProbeEvidence contains only engine-owned same-carrier observations.
+// Issued timestamps and counters begin at successful full-write commit; queue
+// and in-Write time never enter wire liveness or RTT evidence. Transport-owned
+// fields, including loss, remain live through PathConn.Quality.
+type pathProbeEvidence struct {
+	generation      pathProbeGeneration
+	firstIssued     time.Time
+	lastIssued      time.Time
+	lastSuccess     time.Time
+	lastWireTimeout time.Time
+	lastLifecycle   pathProbeLifecycle
+	lastTransition  time.Time
+	quality         transport.PathQuality
+	issued          uint64
+	succeeded       uint64
+	timedOut        uint64
+}
+
+func (lifecycle pathProbeLifecycle) blocksNextProbeWrite() bool {
+	switch lifecycle {
+	case pathProbeReserved, pathProbeQueued, pathProbeWriteStarted, pathProbeDataBlocked, pathProbeDataStarved, pathProbeWriteStalled:
+		return true
+	default:
+		return false
+	}
+}
+
+func pathProbeGenerationForSlot(slot *pathSlot) pathProbeGeneration {
+	if slot == nil {
+		return pathProbeGeneration{}
+	}
+	return pathProbeGeneration{
+		path:               pathRefForSlot(slot),
+		routeGeneration:    slot.routeGeneration.Load(),
+		endpointGeneration: slot.probeEndpointGen.Load(),
+	}
+}
+
+func (slot *pathSlot) quality() transport.PathQuality {
+	if slot == nil || slot.conn == nil {
+		return transport.PathQuality{}
+	}
+	quality := slot.conn.Quality()
+	evidence := slot.probeEvidence.Load()
+	if evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) || evidence.lastSuccess.IsZero() {
+		return quality
+	}
+	quality.RTT = evidence.quality.RTT
+	quality.Jitter = evidence.quality.Jitter
+	quality.At = evidence.quality.At
+	return quality
+}
+
+func (slot *pathSlot) probeSnapshot() (pathProbeEvidence, bool) {
+	if slot == nil {
+		return pathProbeEvidence{}, false
+	}
+	evidence := slot.probeEvidence.Load()
+	if evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) {
+		return pathProbeEvidence{}, false
+	}
+	return *evidence, true
+}
+
+func (slot *pathSlot) probeLiveness(now time.Time, interval time.Duration) qualityState {
+	evidence, ok := slot.probeSnapshot()
+	if !ok || evidence.issued == 0 || evidence.firstIssued.IsZero() {
+		return qualityStateUnknown
+	}
+	base := evidence.firstIssued
+	if evidence.succeeded > 0 && !evidence.lastSuccess.IsZero() {
+		base = evidence.lastSuccess
+	}
+	// Age alone is not path-failure evidence. A queued probe may be waiting
+	// behind a local physical writer for arbitrarily long without ever reaching
+	// the carrier. Only a committed probe whose wire-reply deadline expired may
+	// turn same-carrier liveness stale.
+	if evidence.lastWireTimeout.After(evidence.lastSuccess) &&
+		now.Sub(base) > selectorProbeFreshFor(interval, evidence.quality) {
+		return qualityStateStale
+	}
+	if evidence.succeeded > 0 && now.Sub(base) <= selectorProbeFreshFor(interval, evidence.quality) {
+		return qualityStateFresh
+	}
+	return qualityStateUnknown
+}
+
+func (e *Engine) issuePathProbe(slot *pathSlot) {
+	if e == nil || slot == nil || e.closing.Load() || e.isClosed() {
+		return
+	}
+	queuedAt := nowFn()
+	generation := pathProbeGenerationForSlot(slot)
+	fenceEpoch := slot.txFenceEpoch.Load()
+	quality := slot.quality()
+	e.probeMu.Lock()
+	e.expirePathProbesLocked(queuedAt)
+	if e.closing.Load() || e.isClosed() {
+		e.probeMu.Unlock()
+		return
+	}
+	for _, observation := range e.probeOutstanding {
+		if observation.slot == slot && observation.generation == generation && observation.lifecycle.blocksNextProbeWrite() {
+			e.probeMu.Unlock()
+			return
+		}
+	}
+	id, ok := reservePathProbeID(e.probeOutstanding)
+	if !ok {
+		e.probeMu.Unlock()
+		return
+	}
+	wireTS := uint64(queuedAt.UnixNano())
+	e.probeOutstanding[id] = pathProbeObservation{
+		queuedAt: queuedAt, generation: generation, slot: slot, quality: quality,
+		wireTS: wireTS, fenceEpoch: fenceEpoch, lifecycle: pathProbeReserved,
+	}
+	e.probeMu.Unlock()
+
+	payload := proto.ProbePayload{TS: wireTS, ID: id}.Encode()
+	frame := make([]byte, proto.HeaderSize+len(payload))
+	hdr := proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlPathProbe),
+		Seq:     0,
+	}
+	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
+		e.cancelPathProbeReservation(id, slot)
+		return
+	}
+	copy(frame[proto.HeaderSize:], payload)
+	ready := make(chan struct{})
+	if !e.startPathProbeWrite(slot, id, frame, ready, generation, fenceEpoch) {
+		e.cancelPathProbeReservation(id, slot)
+		return
+	}
+	e.markPathProbeSubmitted(id, slot)
+	close(ready)
+}
+
+func reservePathProbeID(outstanding map[uint64]pathProbeObservation) (uint64, bool) {
+	var encoded [8]byte
+	for attempt := 0; attempt < 8; attempt++ {
+		if _, err := rand.Read(encoded[:]); err != nil {
+			return 0, false
+		}
+		id := binary.BigEndian.Uint64(encoded[:])
+		if id == 0 {
+			continue
+		}
+		if _, exists := outstanding[id]; !exists {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// startProbeWriterLocked registers a probe writer while probeControlMu still
+// excludes close and admission of later writers. probeWriteWG owns final
+// teardown; probeWritersIdle gives a TX fence a context-aware drain boundary.
+func (slot *pathSlot) startProbeWriterLocked() <-chan struct{} {
+	if slot.probePermitCancel == nil {
+		slot.probePermitCancel = make(chan struct{})
+	}
+	if slot.probeWriterCount == 0 {
+		slot.probeWritersIdle = make(chan struct{})
+	}
+	slot.probeWriterCount++
+	slot.probeWriteWG.Add(1)
+	return slot.probePermitCancel
+}
+
+func (slot *pathSlot) finishProbeWriter() {
+	slot.probeControlMu.Lock()
+	slot.probeWriterCount--
+	if slot.probeWriterCount == 0 {
+		close(slot.probeWritersIdle)
+		slot.probeWritersIdle = nil
+	}
+	slot.probeControlMu.Unlock()
+	slot.probeWriteWG.Done()
+}
+
+func (slot *pathSlot) waitProbeWriters(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	slot.probeControlMu.Lock()
+	if slot.probeWriterCount == 0 {
+		slot.probeControlMu.Unlock()
+		return nil
+	}
+	idle := slot.probeWritersIdle
+	slot.probeControlMu.Unlock()
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (slot *pathSlot) probeWritersIdleSignal() (<-chan struct{}, bool) {
+	if slot == nil {
+		return nil, false
+	}
+	slot.probeControlMu.Lock()
+	defer slot.probeControlMu.Unlock()
+	if slot.probeWriterCount == 0 {
+		return nil, false
+	}
+	return slot.probeWritersIdle, true
+}
+
+// cancelProbeWritePermitWaiters revokes only probe writers that have not yet
+// acquired the shared physical write permit. A writer already inside
+// PathConn.Write remains registered and is drained by waitProbeWriters.
+func (slot *pathSlot) cancelProbeWritePermitWaiters() {
+	if slot == nil {
+		return
+	}
+	slot.probeControlMu.Lock()
+	slot.cancelProbeWritePermitWaitersLocked()
+	slot.probeControlMu.Unlock()
+}
+
+func (slot *pathSlot) cancelProbeWritePermitWaitersLocked() {
+	if slot.probePermitCancel != nil {
+		close(slot.probePermitCancel)
+		slot.probePermitCancel = nil
+	}
+}
+
+func (e *Engine) startPathProbeWrite(
+	slot *pathSlot,
+	id uint64,
+	frame []byte,
+	ready <-chan struct{},
+	generation pathProbeGeneration,
+	fenceEpoch uint64,
+) bool {
+	slot.probeControlMu.Lock()
+	if slot.probeControlClosed || !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch ||
+		pathProbeGenerationForSlot(slot) != generation || e.closing.Load() || e.isClosed() {
+		slot.probeControlMu.Unlock()
+		return false
+	}
+	permitCancel := slot.startProbeWriterLocked()
+	slot.probeControlMu.Unlock()
+	go func() {
+		defer slot.finishProbeWriter()
+		select {
+		case <-ready:
+		case <-slot.quit:
+			e.cancelPathProbeReservation(id, slot)
+			return
+		case <-e.closed:
+			e.cancelPathProbeReservation(id, slot)
+			return
+		}
+		if hook := slot.probeBeforeWritePermit; hook != nil {
+			hook()
+		}
+		n, err := slot.writeProbeFrame(frame, fenceEpoch, permitCancel, func() bool {
+			return e.markPathProbeWriteStarted(id, slot, nowFn())
+		})
+		if err == nil && n != len(frame) {
+			err = io.ErrShortWrite
+		}
+		if err != nil && !errors.Is(err, ErrPathTXFenced) {
+			e.failPathProbeControlWrite(slot, err)
+		}
+		e.completePathProbeWrite(id, slot, err, nowFn())
+	}()
+	return true
+}
+
+func (slot *pathSlot) writeProbeFrame(
+	frame []byte,
+	fenceEpoch uint64,
+	permitCancel <-chan struct{},
+	onWriteStart func() bool,
+) (int, error) {
+	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return 0, ErrPathTXFenced
+	}
+	if err := slot.acquireProbeWrite(context.Background(), permitCancel); err != nil {
+		return 0, err
+	}
+	defer slot.releaseWrite()
+	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return 0, ErrPathTXFenced
+	}
+	if hook := slot.probeBeforeConnWrite; hook != nil {
+		hook()
+	}
+	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return 0, ErrPathTXFenced
+	}
+	if hook := slot.probeAfterFinalValidation; hook != nil {
+		hook()
+	}
+	// This is the last engine-controlled boundary before PathConn.Write.
+	// Queue time, permit wait, test hooks, and fence validation are local
+	// scheduling facts and must never enter wire RTT or timeout evidence.
+	if onWriteStart != nil && !onWriteStart() {
+		return 0, ErrPathTXFenced
+	}
+	return slot.writeFrameOwned(frame)
+}
+
+func (slot *pathSlot) acquireProbeWrite(ctx context.Context, permitCancel <-chan struct{}) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-slot.writePermit:
+		return nil
+	case <-permitCancel:
+		return ErrPathTXFenced
+	case <-slot.quit:
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Engine) markPathProbeSubmitted(id uint64, slot *pathSlot) {
+	e.probeMu.Lock()
+	observation, ok := e.probeOutstanding[id]
+	if !ok || observation.slot != slot || observation.generation != pathProbeGenerationForSlot(slot) ||
+		observation.fenceEpoch != slot.txFenceEpoch.Load() || observation.lifecycle != pathProbeReserved {
+		e.probeMu.Unlock()
+		return
+	}
+	observation.lifecycle = pathProbeQueued
+	e.probeOutstanding[id] = observation
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started time.Time) bool {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	observation, ok := e.probeOutstanding[id]
+	if !ok || observation.slot != slot ||
+		observation.generation != pathProbeGenerationForSlot(slot) ||
+		observation.fenceEpoch != slot.txFenceEpoch.Load() ||
+		(observation.lifecycle != pathProbeQueued && observation.lifecycle != pathProbeDataBlocked &&
+			observation.lifecycle != pathProbeDataStarved) {
+		return false
+	}
+	if started.Before(observation.queuedAt) {
+		started = observation.queuedAt
+	}
+	observation.lifecycle = pathProbeWriteStarted
+	observation.writeStartedAt = started
+	observation.writeStallDeadline = started.Add(pathProbeWriteStallFor(started, observation.quality))
+	e.probeOutstanding[id] = observation
+	return true
+}
+
+func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr error, completed time.Time) {
+	e.probeMu.Lock()
+	observation, ok := e.probeOutstanding[id]
+	if !ok || observation.slot != slot {
+		e.probeMu.Unlock()
+		return
+	}
+	if writeErr != nil || observation.generation != pathProbeGenerationForSlot(slot) ||
+		observation.fenceEpoch != slot.txFenceEpoch.Load() {
+		delete(e.probeOutstanding, id)
+		e.probeMu.Unlock()
+		return
+	}
+	if observation.lifecycle != pathProbeWriteStarted && observation.lifecycle != pathProbeWriteStalled {
+		delete(e.probeOutstanding, id)
+		e.probeMu.Unlock()
+		return
+	}
+	if completed.Before(observation.writeStartedAt) {
+		completed = observation.writeStartedAt
+	}
+	observation.lifecycle = pathProbeWriteCommitted
+	observation.writeCommittedAt = completed
+	observation.deadline = completed.Add(selectorProbeFreshFor(e.limits.ProbeInterval, observation.quality))
+	e.recordPathProbeIssuedLocked(observation)
+	switch {
+	case !observation.pendingReplyAt.IsZero() && !observation.pendingReplyAt.After(observation.deadline):
+		delete(e.probeOutstanding, id)
+		e.recordPathProbeSuccessLocked(observation, observation.pendingReplyAt)
+	case !observation.pendingReplyAt.IsZero():
+		delete(e.probeOutstanding, id)
+		e.recordPathProbeTimeoutLocked(observation, observation.pendingReplyAt)
+	default:
+		e.probeOutstanding[id] = observation
+	}
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) cancelPathProbeReservation(id uint64, slot *pathSlot) {
+	e.probeMu.Lock()
+	if observation, ok := e.probeOutstanding[id]; ok && observation.slot == slot {
+		delete(e.probeOutstanding, id)
+	}
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) submitPathProbeControl(
+	slot *pathSlot,
+	frame []byte,
+	generation pathProbeGeneration,
+	fenceEpoch uint64,
+) bool {
+	if e == nil || slot == nil || !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch ||
+		pathProbeGenerationForSlot(slot) != generation || e.closing.Load() || e.isClosed() {
+		return false
+	}
+	slot.probeControlMu.Lock()
+	if slot.probeControlClosed || !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch ||
+		pathProbeGenerationForSlot(slot) != generation || e.closing.Load() || e.isClosed() {
+		slot.probeControlMu.Unlock()
+		return false
+	}
+	slot.probeReplyPending = append(slot.probeReplyPending[:0], frame...)
+	slot.probeReplyGeneration = generation
+	slot.probeReplyFenceEpoch = fenceEpoch
+	if slot.probeReplyRunning {
+		slot.probeControlMu.Unlock()
+		return true
+	}
+	slot.probeReplyRunning = true
+	permitCancel := slot.startProbeWriterLocked()
+	slot.probeControlMu.Unlock()
+	go e.pathProbeReplyWriter(slot, permitCancel)
+	return true
+}
+
+func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct{}) {
+	defer slot.finishProbeWriter()
+	for {
+		if hook := slot.probeBeforeWritePermit; hook != nil {
+			hook()
+		}
+		if err := slot.acquireProbeWrite(context.Background(), permitCancel); err != nil {
+			slot.probeControlMu.Lock()
+			slot.probeReplyPending = nil
+			slot.probeReplyGeneration = pathProbeGeneration{}
+			slot.probeReplyFenceEpoch = 0
+			slot.probeReplyRunning = false
+			slot.probeControlMu.Unlock()
+			return
+		}
+		if !slot.txEnabled.Load() {
+			slot.releaseWrite()
+			slot.probeControlMu.Lock()
+			slot.probeReplyPending = nil
+			slot.probeReplyGeneration = pathProbeGeneration{}
+			slot.probeReplyFenceEpoch = 0
+			slot.probeReplyRunning = false
+			slot.probeControlMu.Unlock()
+			return
+		}
+		slot.probeControlMu.Lock()
+		if slot.probeControlClosed || len(slot.probeReplyPending) == 0 ||
+			slot.probeReplyGeneration != pathProbeGenerationForSlot(slot) ||
+			slot.probeReplyFenceEpoch != slot.txFenceEpoch.Load() {
+			slot.probeReplyPending = nil
+			slot.probeReplyGeneration = pathProbeGeneration{}
+			slot.probeReplyFenceEpoch = 0
+			slot.probeReplyRunning = false
+			slot.probeControlMu.Unlock()
+			slot.releaseWrite()
+			return
+		}
+		frame := append([]byte(nil), slot.probeReplyPending...)
+		generation := slot.probeReplyGeneration
+		fenceEpoch := slot.probeReplyFenceEpoch
+		slot.probeReplyPending = nil
+		slot.probeReplyGeneration = pathProbeGeneration{}
+		slot.probeReplyFenceEpoch = 0
+		slot.probeControlMu.Unlock()
+
+		if hook := slot.probeAfterFinalValidation; hook != nil {
+			hook()
+		}
+		if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch ||
+			pathProbeGenerationForSlot(slot) != generation {
+			slot.releaseWrite()
+			slot.probeControlMu.Lock()
+			slot.probeReplyPending = nil
+			slot.probeReplyGeneration = pathProbeGeneration{}
+			slot.probeReplyFenceEpoch = 0
+			slot.probeReplyRunning = false
+			slot.probeControlMu.Unlock()
+			return
+		}
+		n, err := slot.writeFrameOwned(frame)
+		slot.releaseWrite()
+		if err == nil && n != len(frame) {
+			err = io.ErrShortWrite
+		}
+		if err == nil {
+			continue
+		}
+		e.failPathProbeControlWrite(slot, err)
+		slot.probeControlMu.Lock()
+		slot.probeReplyPending = nil
+		slot.probeReplyGeneration = pathProbeGeneration{}
+		slot.probeReplyFenceEpoch = 0
+		slot.probeReplyRunning = false
+		slot.probeControlMu.Unlock()
+		return
+	}
+}
+
+func (e *Engine) failPathProbeControlWrite(slot *pathSlot, err error) {
+	if slot == nil || err == nil {
+		return
+	}
+	select {
+	case <-slot.quit:
+		return
+	case <-e.closed:
+		return
+	default:
+	}
+	e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
+
+}
+
+func (slot *pathSlot) closeProbeControl() {
+	if slot == nil {
+		return
+	}
+	slot.probeControlMu.Lock()
+	slot.probeControlClosed = true
+	slot.cancelProbeWritePermitWaitersLocked()
+	slot.probeReplyPending = nil
+	slot.probeReplyGeneration = pathProbeGeneration{}
+	slot.probeReplyFenceEpoch = 0
+	slot.probeControlMu.Unlock()
+}
+
+func (e *Engine) recordPathProbeIssuedLocked(observation pathProbeObservation) {
+	if observation.slot == nil || observation.lifecycle != pathProbeWriteCommitted ||
+		observation.writeCommittedAt.IsZero() || observation.generation != pathProbeGenerationForSlot(observation.slot) {
+		return
+	}
+	evidence := pathProbeEvidence{generation: observation.generation}
+	if current := observation.slot.probeEvidence.Load(); current != nil && current.generation == observation.generation {
+		evidence = *current
+	}
+	if evidence.firstIssued.IsZero() {
+		evidence.firstIssued = observation.writeCommittedAt
+	}
+	if evidence.succeeded == 0 {
+		evidence.quality = transport.PathQuality{
+			RTT: observation.quality.RTT, Jitter: observation.quality.Jitter, At: observation.quality.At,
+		}
+	}
+	evidence.lastIssued = observation.writeCommittedAt
+	evidence.lastLifecycle = pathProbeWriteCommitted
+	evidence.lastTransition = observation.writeCommittedAt
+	evidence.issued++
+	observation.slot.probeEvidence.Store(&evidence)
+}
+
+func pathProbeWriteStallFor(at time.Time, quality transport.PathQuality) time.Duration {
+	window := minimumDispatchStallWindow
+	if !quality.At.IsZero() {
+		age := at.Sub(quality.At)
+		if age >= 0 && age <= selectorEvidenceFreshFor {
+			candidate := 4*quality.RTT + 2*quality.Jitter
+			if candidate > window {
+				window = candidate
+			}
+		}
+	}
+	if window > maximumDispatchStallWindow {
+		return maximumDispatchStallWindow
+	}
+	return window
+}
+
+const maximumPathProbeDataStarvationFor = 2 * time.Second
+
+// pathProbeDataStarvationFor requires two full probe cadences after the
+// dispatcher has independently identified one stalled DATA generation. The
+// cap combines with maximumDispatchStallWindow to keep default selector
+// detection inside G4's five-second failover budget.
+func pathProbeDataStarvationFor(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = DefaultLimits().ProbeInterval
+	}
+	if interval >= maximumPathProbeDataStarvationFor/2 {
+		return maximumPathProbeDataStarvationFor
+	}
+	return 2 * interval
+}
+
+// refreshPathProbeBlockStatesLocked classifies local physical-writer stalls
+// without creating wire evidence. A queued probe is data-starved only after
+// the DATA dispatcher has independently marked the permit owner stalled. A
+// probe already inside PathConn.Write has its own write-stalled state.
+func (e *Engine) refreshPathProbeBlockStatesLocked(now time.Time) {
+	for id, observation := range e.probeOutstanding {
+		switch observation.lifecycle {
+		case pathProbeQueued, pathProbeDataBlocked, pathProbeDataStarved:
+			stalledGeneration := uint64(0)
+			if observation.slot != nil && observation.slot.dispatchStalled.Load() {
+				stalledGeneration = observation.slot.dispatchStallGen.Load()
+			}
+			if stalledGeneration == 0 {
+				if observation.lifecycle != pathProbeQueued || observation.dataStallGeneration != 0 || !observation.dataBlockedAt.IsZero() {
+					observation.lifecycle = pathProbeQueued
+					observation.dataStallGeneration = 0
+					observation.dataBlockedAt = time.Time{}
+					e.probeOutstanding[id] = observation
+				}
+				continue
+			}
+			if observation.dataStallGeneration != stalledGeneration {
+				observation.lifecycle = pathProbeDataBlocked
+				observation.dataStallGeneration = stalledGeneration
+				observation.dataBlockedAt = now
+				e.probeOutstanding[id] = observation
+				continue
+			}
+			if observation.lifecycle == pathProbeDataStarved {
+				continue
+			}
+			if now.Before(observation.dataBlockedAt.Add(pathProbeDataStarvationFor(e.limits.ProbeInterval))) {
+				observation.lifecycle = pathProbeDataBlocked
+			} else {
+				observation.lifecycle = pathProbeDataStarved
+			}
+			e.probeOutstanding[id] = observation
+		case pathProbeWriteStarted:
+			if !observation.writeStallDeadline.IsZero() && !now.Before(observation.writeStallDeadline) {
+				observation.lifecycle = pathProbeWriteStalled
+				e.probeOutstanding[id] = observation
+			}
+		}
+	}
+}
+
+func (e *Engine) pathProbeStatuses(now time.Time) map[*pathSlot]pathProbeStatus {
+	statuses := make(map[*pathSlot]pathProbeStatus)
+	if e == nil {
+		return statuses
+	}
+	e.probeMu.Lock()
+	e.expirePathProbesLocked(now)
+	for _, observation := range e.probeOutstanding {
+		if observation.slot == nil || observation.generation != pathProbeGenerationForSlot(observation.slot) {
+			continue
+		}
+		candidate := pathProbeStatus{lifecycle: observation.lifecycle}
+		switch observation.lifecycle {
+		case pathProbeDataStarved:
+			candidate.failure = pathProbeFailureDataStarved
+		case pathProbeWriteStalled:
+			candidate.failure = pathProbeFailureWriteStalled
+		}
+		current := statuses[observation.slot]
+		if pathProbeStatusPriority(candidate) > pathProbeStatusPriority(current) {
+			statuses[observation.slot] = candidate
+		}
+	}
+	e.probeMu.Unlock()
+	return statuses
+}
+
+func pathProbeStatusPriority(status pathProbeStatus) uint8 {
+	switch status.failure {
+	case pathProbeFailureDataStarved:
+		return 7
+	case pathProbeFailureWriteStalled:
+		return 6
+	}
+	switch status.lifecycle {
+	case pathProbeWriteStarted:
+		return 5
+	case pathProbeDataBlocked:
+		return 5
+	case pathProbeQueued:
+		return 4
+	case pathProbeWriteCommitted:
+		return 3
+	case pathProbeReserved:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func (e *Engine) expirePathProbes(now time.Time) {
+	if e == nil {
+		return
+	}
+	e.probeMu.Lock()
+	e.expirePathProbesLocked(now)
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) expirePathProbesLocked(now time.Time) {
+	e.refreshPathProbeBlockStatesLocked(now)
+	for id, observation := range e.probeOutstanding {
+		if observation.lifecycle != pathProbeWriteCommitted || observation.deadline.IsZero() {
+			continue
+		}
+		if now.Before(observation.deadline) {
+			continue
+		}
+		observation.lifecycle = pathProbeWireTimeout
+		e.recordPathProbeTimeoutLocked(observation, now)
+		delete(e.probeOutstanding, id)
+	}
+}
+
+func (e *Engine) recordPathProbeTimeoutLocked(observation pathProbeObservation, at time.Time) {
+	if observation.slot == nil || observation.generation != pathProbeGenerationForSlot(observation.slot) {
+		return
+	}
+	current := observation.slot.probeEvidence.Load()
+	if current == nil || current.generation != observation.generation {
+		return
+	}
+	next := *current
+	next.timedOut++
+	next.lastWireTimeout = at
+	next.lastLifecycle = pathProbeWireTimeout
+	next.lastTransition = at
+	observation.slot.probeEvidence.Store(&next)
+}
+
+func (e *Engine) acceptPathProbeReply(slot *pathSlot, probe proto.ProbePayload, now time.Time) bool {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	e.expirePathProbesLocked(now)
+	observation, ok := e.probeOutstanding[probe.ID]
+	if !ok || observation.slot != slot {
+		return false
+	}
+	if observation.wireTS != probe.TS || observation.fenceEpoch != slot.txFenceEpoch.Load() {
+		return false
+	}
+	if observation.generation != pathProbeGenerationForSlot(slot) {
+		delete(e.probeOutstanding, probe.ID)
+		return false
+	}
+	switch observation.lifecycle {
+	case pathProbeWriteStarted, pathProbeWriteStalled:
+		if now.Before(observation.writeStartedAt) {
+			return false
+		}
+		if observation.pendingReplyAt.IsZero() || now.Before(observation.pendingReplyAt) {
+			observation.pendingReplyAt = now
+			e.probeOutstanding[probe.ID] = observation
+		}
+		return true
+	case pathProbeWriteCommitted:
+		if now.Before(observation.writeCommittedAt) {
+			return false
+		}
+	default:
+		return false
+	}
+	delete(e.probeOutstanding, probe.ID)
+	return e.recordPathProbeSuccessLocked(observation, now)
+}
+
+func (e *Engine) recordPathProbeSuccessLocked(observation pathProbeObservation, now time.Time) bool {
+	slot := observation.slot
+	if slot == nil || observation.generation != pathProbeGenerationForSlot(slot) {
+		return false
+	}
+	current := slot.probeEvidence.Load()
+	if current == nil || current.generation != observation.generation {
+		return false
+	}
+	successAt := now
+	if successAt.Before(observation.writeCommittedAt) {
+		successAt = observation.writeCommittedAt
+	}
+	rttStart := observation.writeCommittedAt
+	if !observation.pendingReplyAt.IsZero() {
+		// A reply observed before Write returned proves that the wire round trip
+		// happened inside the physical Write. In that ordering, commit is only
+		// an upper bound and Write start is the measurable transmission edge.
+		rttStart = observation.writeStartedAt
+	}
+	rtt := now.Sub(rttStart)
+	if rtt <= 0 {
+		rtt = time.Nanosecond
+	}
+	jitter := current.quality.Jitter
+	if current.quality.RTT > 0 {
+		delta := rtt - current.quality.RTT
+		if delta < 0 {
+			delta = -delta
+		}
+		jitter = (jitter*3 + delta) / 4
+	}
+	next := *current
+	next.lastSuccess = successAt
+	next.lastLifecycle = pathProbeWriteCommitted
+	next.lastTransition = successAt
+	next.succeeded++
+	next.quality = transport.PathQuality{RTT: rtt, Jitter: jitter, At: successAt}
+	slot.probeEvidence.Store(&next)
+	return true
+}
+
+func (e *Engine) invalidatePathProbeEvidence(slot *pathSlot) {
+	if e == nil || slot == nil {
+		return
+	}
+	e.probeMu.Lock()
+	for id, observation := range e.probeOutstanding {
+		if observation.slot == slot {
+			delete(e.probeOutstanding, id)
+		}
+	}
+	slot.probeEvidence.Store(nil)
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) clearPathProbeState(slots []*pathSlot) {
+	if e == nil {
+		return
+	}
+	e.probeMu.Lock()
+	e.probeOutstanding = make(map[uint64]pathProbeObservation)
+	for _, slot := range slots {
+		if slot != nil {
+			slot.probeEvidence.Store(nil)
+		}
+	}
+	e.probeMu.Unlock()
+}

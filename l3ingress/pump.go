@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/virtualif"
@@ -18,6 +20,7 @@ type PacketEvent struct {
 	Packet   []byte
 	Meta     PacketMeta
 	Flow     FlowMeta
+	Ref      FlowRef
 	Decision FlowDecision
 	Decided  bool
 }
@@ -38,6 +41,40 @@ func (f PacketHandlerFunc) HandlePacket(ctx context.Context, ev PacketEvent) err
 // ParseErrorHandler observes packets that cannot become a flow.
 type ParseErrorHandler func(packet []byte, err error)
 
+// PacketFailureStage identifies which packet-local Pump operation failed.
+type PacketFailureStage string
+
+const (
+	// PacketFailureResolve means routing or flow-table admission failed.
+	PacketFailureResolve PacketFailureStage = "resolve"
+	// PacketFailureHandle means PacketHandler.HandlePacket rejected the packet
+	// or failed its flow-local work.
+	PacketFailureHandle PacketFailureStage = "handle"
+)
+
+// PacketFailure is bounded evidence for one packet-local failure. Event owns
+// its Packet bytes and may be retained by the caller.
+type PacketFailure struct {
+	Stage PacketFailureStage
+	Event PacketEvent
+	Err   error
+}
+
+// PacketFailureHandler observes packet-local failures. Delivery is best
+// effort: Pump permits at most one callback invocation at a time and records
+// skipped or panicking callbacks in Status. Status counts every failure and
+// retains the latest evidence even when callback delivery is skipped.
+type PacketFailureHandler func(PacketFailure)
+
+// PumpStatus is a concurrency-safe snapshot of packet-local failure evidence.
+type PumpStatus struct {
+	PacketFailures uint64
+	ObserverDrops  uint64
+	ObserverPanics uint64
+	LastFailure    PacketFailure
+	HasLastFailure bool
+}
+
 // Pump connects a raw virtual interface to the l3ingress classifier.
 // It owns no routing policy and starts no rendr flows by itself.
 type Pump struct {
@@ -47,12 +84,35 @@ type Pump struct {
 	Router       FlowDecisionFunc
 	Handler      PacketHandler
 	OnParseError ParseErrorHandler
-	BufferSize   int
-	Now          func() time.Time
+	// OnPacketFailure is optional and must not be used as the authoritative
+	// failure record; Status counts every failure even when this callback is
+	// blocked, skipped, or panics, and retains the latest evidence.
+	OnPacketFailure PacketFailureHandler
+	BufferSize      int
+	Now             func() time.Time
+
+	statusMu     sync.Mutex
+	status       PumpStatus
+	observerBusy atomic.Bool
 }
 
-// Run reads packets until the context is canceled, the device is
-// closed, or the router/handler returns an error.
+// Status returns bounded packet-local failure evidence accumulated by Pump.
+func (p *Pump) Status() PumpStatus {
+	if p == nil {
+		return PumpStatus{}
+	}
+	p.statusMu.Lock()
+	status := p.status
+	p.statusMu.Unlock()
+	if status.HasLastFailure {
+		status.LastFailure = clonePacketFailure(status.LastFailure)
+	}
+	return status
+}
+
+// Run reads packets until the context is canceled or the device reaches a
+// terminal read result. Routing and handler errors reject only their packet;
+// Pump records them in Status and continues serving unrelated flows.
 func (p *Pump) Run(ctx context.Context) error {
 	if p.Device == nil {
 		return errors.New("l3ingress: nil device")
@@ -74,6 +134,7 @@ func (p *Pump) Run(ctx context.Context) error {
 	if now == nil {
 		now = time.Now
 	}
+	onPacketFailure := p.OnPacketFailure
 	direction := p.Direction
 	if direction == 0 {
 		direction = DirectionIngress
@@ -127,11 +188,20 @@ func (p *Pump) Run(ctx context.Context) error {
 		if table != nil {
 			decision, _, snapshot, err := table.Resolve(ctx, flow, len(packet))
 			if err != nil {
-				return err
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				p.recordPacketFailure(onPacketFailure, PacketFailure{
+					Stage: PacketFailureResolve,
+					Event: ev,
+					Err:   err,
+				})
+				continue
 			}
 			ev.Decision = decision
 			ev.Decided = snapshot.Decided
 			ev.Flow = snapshot.Flow
+			ev.Ref = snapshot.Ref
 		}
 		if ev.Decision.Deny {
 			if table != nil {
@@ -141,13 +211,59 @@ func (p *Pump) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := p.Handler.HandlePacket(ctx, ev); err != nil {
-			return err
-		}
+		handlerErr := p.Handler.HandlePacket(ctx, ev)
 		if table != nil {
 			if reason, ok := TCPFlowCloseReason(meta); ok {
 				table.Close(meta.Identity, reason)
 			}
 		}
+		if handlerErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			p.recordPacketFailure(onPacketFailure, PacketFailure{
+				Stage: PacketFailureHandle,
+				Event: ev,
+				Err:   handlerErr,
+			})
+		}
 	}
+}
+
+func (p *Pump) recordPacketFailure(observer PacketFailureHandler, failure PacketFailure) {
+	retained := clonePacketFailure(failure)
+	p.statusMu.Lock()
+	p.status.PacketFailures++
+	p.status.LastFailure = retained
+	p.status.HasLastFailure = true
+	p.statusMu.Unlock()
+
+	if observer == nil {
+		return
+	}
+	if !p.observerBusy.CompareAndSwap(false, true) {
+		p.statusMu.Lock()
+		p.status.ObserverDrops++
+		p.statusMu.Unlock()
+		return
+	}
+	observed := clonePacketFailure(retained)
+	go func() {
+		defer func() {
+			if recover() != nil {
+				p.statusMu.Lock()
+				p.status.ObserverPanics++
+				p.statusMu.Unlock()
+			}
+			p.observerBusy.Store(false)
+		}()
+		observer(observed)
+	}()
+}
+
+func clonePacketFailure(failure PacketFailure) PacketFailure {
+	failure.Event.Packet = append([]byte(nil), failure.Event.Packet...)
+	failure.Event.Flow = cloneFlowMeta(failure.Event.Flow)
+	failure.Event.Decision = cloneDecision(failure.Event.Decision)
+	return failure
 }

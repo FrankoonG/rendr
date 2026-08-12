@@ -63,6 +63,12 @@ type ListenConfig struct {
 	Streams []StreamSource
 	Packets []PacketSource
 	Framed  []FramedSource
+
+	// AcceptL3Identity declares that accepted sessions are consumed by a
+	// peer-side L3 relay which validates the versioned identity envelope and
+	// dispatches an egress. It is a local fact, not an echo of the dialer's
+	// request; leaving it false makes PreserveL3Identity dials fail closed.
+	AcceptL3Identity bool
 }
 
 // acceptedStreamConn restricts the dynamic method set to capabilities an
@@ -73,6 +79,20 @@ type acceptedStreamConn struct {
 	MigrationController
 	ConnectionObserver
 	engine *engine.Engine
+}
+
+// CloseWrite preserves the optional stream half-close surface across the
+// inbound capability wrapper. Embedding Conn alone would restrict the dynamic
+// method set to the base interface and silently turn a peer FIN into a no-op.
+func (c *acceptedStreamConn) CloseWrite() error {
+	if c == nil || c.Conn == nil {
+		return net.ErrClosed
+	}
+	half, ok := c.Conn.(StreamHalfCloser)
+	if !ok {
+		return net.ErrClosed
+	}
+	return half.CloseWrite()
 }
 
 type acceptedPacketConn struct {
@@ -99,8 +119,9 @@ type SessionListener struct {
 	carriers map[string]CarrierFamily
 	kinds    map[string]transport.PathSessionKind
 
-	streamMobility []leafmobility.Capability
-	packetMobility []leafmobility.Capability
+	streamMobility   []leafmobility.Capability
+	packetMobility   []leafmobility.Capability
+	acceptL3Identity bool
 
 	sourceMu     sync.Mutex
 	activeSource int
@@ -236,19 +257,20 @@ func (r *Runtime) Listen(config ListenConfig) (*SessionListener, error) {
 	}
 
 	l := &SessionListener{
-		runtime:        r,
-		streamAccept:   make(chan *acceptedStreamConn, runtimeAcceptQueueSize),
-		packetAccept:   make(chan *acceptedPacketConn, runtimeAcceptQueueSize),
-		streamSlots:    make(chan struct{}, runtimeAcceptQueueSize),
-		packetSlots:    make(chan struct{}, runtimeAcceptQueueSize),
-		handshakes:     make(chan struct{}, runtimeHandshakeLimit),
-		activeSource:   len(config.Streams) + len(config.Packets) + len(config.Framed),
-		inflight:       make(map[uint64]transport.PathConn),
-		closed:         make(chan struct{}),
-		carriers:       make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)+len(config.Framed)),
-		kinds:          make(map[string]transport.PathSessionKind, len(config.Streams)+len(config.Packets)+len(config.Framed)),
-		streamMobility: streamCapabilities,
-		packetMobility: packetCapabilities,
+		runtime:          r,
+		streamAccept:     make(chan *acceptedStreamConn, runtimeAcceptQueueSize),
+		packetAccept:     make(chan *acceptedPacketConn, runtimeAcceptQueueSize),
+		streamSlots:      make(chan struct{}, runtimeAcceptQueueSize),
+		packetSlots:      make(chan struct{}, runtimeAcceptQueueSize),
+		handshakes:       make(chan struct{}, runtimeHandshakeLimit),
+		activeSource:     len(config.Streams) + len(config.Packets) + len(config.Framed),
+		inflight:         make(map[uint64]transport.PathConn),
+		closed:           make(chan struct{}),
+		carriers:         make(map[string]CarrierFamily, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		kinds:            make(map[string]transport.PathSessionKind, len(config.Streams)+len(config.Packets)+len(config.Framed)),
+		streamMobility:   streamCapabilities,
+		packetMobility:   packetCapabilities,
+		acceptL3Identity: config.AcceptL3Identity,
 	}
 	if err := r.claimListener(l); err != nil {
 		return nil, err
@@ -546,19 +568,24 @@ func (l *SessionListener) serveIncoming(inflightID uint64, sourceName string, _ 
 	if !ok {
 		return
 	}
-	// The first-frame deadline has done its job. Admission owns separate 10s
-	// pre-COMMIT and migration-budget post-COMMIT contexts; retaining the
-	// socket deadline would truncate reconciliation.
-	clearHandshakeDeadline()
 	switch code {
 	case proto.CtrlHello:
-		owned = l.handleRuntimeHello(inflightID, sourceName, pc, payload)
+		owned = l.handleRuntimeHello(inflightID, sourceName, pc, payload, clearHandshakeDeadline)
 	case proto.CtrlBridgeTag:
+		// The first-frame deadline has done its job. Bridge admission owns its
+		// own bounded context; retaining the socket deadline would truncate it.
+		clearHandshakeDeadline()
 		owned = l.handleRuntimeBridge(sourceName, pc, payload)
 	}
 }
 
-func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName string, pc transport.PathConn, payload []byte) bool {
+func (l *SessionListener) handleRuntimeHello(
+	inflightID uint64,
+	sourceName string,
+	pc transport.PathConn,
+	payload []byte,
+	clearHandshakeDeadline func(),
+) bool {
 	hello, err := decodeHelloForAdmission(pc, payload)
 	if err != nil {
 		return false
@@ -570,6 +597,17 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	if !l.sourceAllowsSession(sourceName, packetMode) {
 		return false
 	}
+	// PreserveL3Identity is a bilateral requirement, not an advisory feature.
+	// Reject before reserving bridge/admission resources so packet transports
+	// cannot leave a 10-second COMMIT waiter after the caller fails closed.
+	if hello.Caps&proto.CapsL3Identity != 0 && !l.acceptL3Identity {
+		_ = engine.PerformBye(pc, proto.ByeAppRequest, 0)
+		return false
+	}
+	// HELLO admission owns separate pre-COMMIT and migration-budget contexts.
+	// Keep the first-frame deadline armed through every immediate rejection so
+	// a peer that stops reading cannot pin a handshake slot in the BYE write.
+	clearHandshakeDeadline()
 	var reservation engine.BridgeReservation
 	for {
 		reservation, err = l.runtime.bridges.Reserve(hello.FlowID)
@@ -664,7 +702,8 @@ func (l *SessionListener) handleRuntimeHello(inflightID uint64, sourceName strin
 	if err != nil {
 		return false
 	}
-	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello, payload); err != nil {
+	localCaps := eLocalCaps(e, l.acceptL3Identity)
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, localCaps, localTargetID, hello, payload); err != nil {
 		return false
 	}
 	engineOwnsPath = true
@@ -741,7 +780,7 @@ func (l *SessionListener) handleDuplicateRuntimeHello(sourceName string, pc tran
 	if err != nil {
 		return false
 	}
-	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, eLocalCaps(e), localTargetID, hello, proposalWire); err != nil {
+	if err := acknowledgeInitialServerPath(context.Background(), e, pathID, pc, l.runtime.instanceID, eLocalCaps(e, l.acceptL3Identity), localTargetID, hello, proposalWire); err != nil {
 		return false
 	}
 	return true

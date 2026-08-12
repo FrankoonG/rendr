@@ -38,18 +38,14 @@ func TestDetectPolicyContextErrorsBlockSelection(t *testing.T) {
 	}
 }
 
-func TestValidateBatchOwnsExactBoundaries(t *testing.T) {
+func TestValidateBatchReportsExactBoundaries(t *testing.T) {
 	datagrams := [][]byte{bytes.Repeat([]byte{1}, 8), bytes.Repeat([]byte{2}, 8), bytes.Repeat([]byte{3}, 3)}
-	segmentSize, payload, err := validateBatch(datagrams)
+	segmentSize, payloadBytes, err := validateBatch(datagrams)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if segmentSize != 8 || !bytes.Equal(payload, append(append(append([]byte(nil), datagrams[0]...), datagrams[1]...), datagrams[2]...)) {
-		t.Fatalf("segment=%d payload=%x", segmentSize, payload)
-	}
-	payload[0] = 0xff
-	if datagrams[0][0] == 0xff {
-		t.Fatal("validated super-packet aliases caller memory")
+	if segmentSize != 8 || payloadBytes != 19 {
+		t.Fatalf("segment=%d payload_bytes=%d", segmentSize, payloadBytes)
 	}
 }
 

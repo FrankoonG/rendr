@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr"
@@ -61,6 +62,10 @@ func (r *UDPPeerRelay) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if !remote.IsValid() {
+		_ = egressConn.Close()
+		return errors.New("l3session: UDP egress returned an invalid remote address")
+	}
 	defer egressConn.Close()
 	remoteAddr := net.UDPAddrFromAddrPort(remote)
 	if n, err := egressConn.WriteTo(first.Payload, remoteAddr); err != nil {
@@ -85,7 +90,7 @@ func (r *UDPPeerRelay) Run(ctx context.Context) error {
 		errCh <- r.forwardUDPRequests(bridgeCtx, first, egressConn, remoteAddr, size)
 	}()
 	go func() {
-		errCh <- r.forwardUDPReplies(bridgeCtx, egressConn, size)
+		errCh <- r.forwardUDPReplies(bridgeCtx, egressConn, remote, size)
 	}()
 
 	var firstErr error
@@ -135,12 +140,20 @@ func (r *UDPPeerRelay) forwardUDPRequests(
 	}
 }
 
-func (r *UDPPeerRelay) forwardUDPReplies(ctx context.Context, egressConn net.PacketConn, bufferSize int) error {
+func (r *UDPPeerRelay) forwardUDPReplies(
+	ctx context.Context,
+	egressConn net.PacketConn,
+	remote netip.AddrPort,
+	bufferSize int,
+) error {
 	buf := make([]byte, bufferSize)
 	for {
-		n, _, err := egressConn.ReadFrom(buf)
+		n, source, err := egressConn.ReadFrom(buf)
 		if err != nil {
 			return err
+		}
+		if !packetSourceMatches(source, remote) {
+			continue
 		}
 		written, err := r.PacketConn.WriteTo(buf[:n], rendrPeerAddr)
 		if err != nil {
@@ -155,6 +168,24 @@ func (r *UDPPeerRelay) forwardUDPReplies(ctx context.Context, egressConn net.Pac
 		default:
 		}
 	}
+}
+
+func packetSourceMatches(source net.Addr, expected netip.AddrPort) bool {
+	if source == nil || !expected.IsValid() {
+		return false
+	}
+	var actual netip.AddrPort
+	switch address := source.(type) {
+	case *net.UDPAddr:
+		actual = address.AddrPort()
+	default:
+		parsed, err := netip.ParseAddrPort(source.String())
+		if err != nil {
+			return false
+		}
+		actual = parsed
+	}
+	return actual.Addr().Unmap() == expected.Addr().Unmap() && actual.Port() == expected.Port()
 }
 
 func normalizeUDPPeerError(ctx context.Context, err error) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 
@@ -20,6 +21,10 @@ const defaultBufferSize = 64 << 10
 //
 // LocalAddr is the UDP address exposed to the application or used as
 // the source socket for target traffic. Empty means "127.0.0.1:0".
+//
+// BufferSize is the largest datagram the relay accepts. A larger datagram
+// terminates the relay without forwarding its truncated prefix. Zero selects
+// the 64 KiB default; values above 64 KiB are rejected.
 //
 // TargetAddr selects server-side mode: packets received from rendr
 // are written to this UDP target, and replies from the target are
@@ -66,6 +71,7 @@ type Server struct {
 	bufferSize int
 
 	closeOnce sync.Once
+	closeErr  error
 	done      chan struct{}
 
 	relaysMu sync.Mutex
@@ -78,8 +84,11 @@ type Relay struct {
 	udp    net.PacketConn
 	target net.Addr
 
-	closeOnce sync.Once
-	done      chan struct{}
+	stateMu     sync.Mutex
+	stopping    bool
+	terminalErr error
+	closeErr    error
+	done        chan struct{}
 
 	peerMu sync.RWMutex
 	peer   net.Addr
@@ -91,6 +100,10 @@ func Dial(ctx context.Context, cfg DialConfig) (*Relay, error) {
 	if cfg.Runtime == nil {
 		return nil, errors.New("udprelay: Runtime is required")
 	}
+	bufferSize, err := normalizeBufferSize(cfg.BufferSize)
+	if err != nil {
+		return nil, err
+	}
 	pc, err := cfg.Runtime.DialPacket(ctx, cfg.Session)
 	if err != nil {
 		return nil, fmt.Errorf("udprelay: dial packet carrier: %w", err)
@@ -98,7 +111,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*Relay, error) {
 	r, err := Start(ctx, Config{
 		PacketConn: pc,
 		LocalAddr:  cfg.LocalAddr,
-		BufferSize: cfg.BufferSize,
+		BufferSize: bufferSize,
 	})
 	if err != nil {
 		_ = pc.Close()
@@ -116,6 +129,10 @@ func Serve(ctx context.Context, cfg ServeConfig) (*Relay, error) {
 	if cfg.TargetAddr == "" {
 		return nil, errors.New("udprelay: TargetAddr is required")
 	}
+	bufferSize, err := normalizeBufferSize(cfg.BufferSize)
+	if err != nil {
+		return nil, err
+	}
 	pc, err := cfg.Listener.AcceptPacket(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("udprelay: accept packet carrier: %w", err)
@@ -124,7 +141,7 @@ func Serve(ctx context.Context, cfg ServeConfig) (*Relay, error) {
 		PacketConn: pc,
 		LocalAddr:  cfg.LocalAddr,
 		TargetAddr: cfg.TargetAddr,
-		BufferSize: cfg.BufferSize,
+		BufferSize: bufferSize,
 	})
 	if err != nil {
 		_ = pc.Close()
@@ -143,11 +160,15 @@ func Listen(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	if cfg.TargetAddr == "" {
 		return nil, errors.New("udprelay: TargetAddr is required")
 	}
+	bufferSize, err := normalizeBufferSize(cfg.BufferSize)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		listener:   cfg.Listener,
 		localAddr:  cfg.LocalAddr,
 		targetAddr: cfg.TargetAddr,
-		bufferSize: cfg.BufferSize,
+		bufferSize: bufferSize,
 		done:       make(chan struct{}),
 		relays:     make(map[*Relay]struct{}),
 	}
@@ -157,22 +178,23 @@ func Listen(ctx context.Context, cfg ServeConfig) (*Server, error) {
 
 // Close stops accepting new clients and closes all active relays.
 func (s *Server) Close() error {
-	var err error
 	s.closeOnce.Do(func() {
 		close(s.done)
-		if e := s.listener.Close(); e != nil {
-			err = e
-		}
+		s.closeErr = s.listener.Close()
+
 		s.relaysMu.Lock()
+		relays := make([]*Relay, 0, len(s.relays))
 		for r := range s.relays {
-			if e := r.Close(); err == nil && e != nil {
-				err = e
-			}
+			relays = append(relays, r)
 		}
 		s.relays = nil
 		s.relaysMu.Unlock()
+
+		for _, r := range relays {
+			s.closeErr = errors.Join(s.closeErr, r.Close())
+		}
 	})
-	return err
+	return s.closeErr
 }
 
 // Relays returns the current active relay count.
@@ -243,6 +265,10 @@ func Start(ctx context.Context, cfg Config) (*Relay, error) {
 	if cfg.PacketConn == nil {
 		return nil, errors.New("udprelay: PacketConn is required")
 	}
+	bufferSize, err := normalizeBufferSize(cfg.BufferSize)
+	if err != nil {
+		return nil, err
+	}
 	local := cfg.LocalAddr
 	if local == "" {
 		local = "127.0.0.1:0"
@@ -260,20 +286,33 @@ func Start(ctx context.Context, cfg Config) (*Relay, error) {
 			return nil, fmt.Errorf("udprelay: resolve target %s: %w", cfg.TargetAddr, err)
 		}
 	}
-	if cfg.BufferSize <= 0 {
-		cfg.BufferSize = defaultBufferSize
-	}
+	return startRelay(ctx, cfg.PacketConn, udp, target, bufferSize), nil
+}
 
+func normalizeBufferSize(size int) (int, error) {
+	if size <= 0 {
+		return defaultBufferSize, nil
+	}
+	if size > defaultBufferSize {
+		return 0, fmt.Errorf("udprelay: BufferSize %d exceeds maximum %d", size, defaultBufferSize)
+	}
+	return size, nil
+}
+
+func startRelay(ctx context.Context, pc rendr.PacketConn, udp net.PacketConn, target net.Addr, bufferSize int) *Relay {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r := &Relay{
-		pc:     cfg.PacketConn,
+		pc:     pc,
 		udp:    udp,
 		target: target,
 		done:   make(chan struct{}),
 	}
 	go r.closeOnContext(ctx)
-	go r.udpToRendr(cfg.BufferSize)
-	go r.rendrToUDP(cfg.BufferSize)
-	return r, nil
+	go r.udpToRendr(bufferSize)
+	go r.rendrToUDP(bufferSize)
+	return r
 }
 
 // LocalAddr returns the UDP socket address applications should use.
@@ -286,53 +325,65 @@ func (r *Relay) PacketConn() rendr.PacketConn { return r.pc }
 // Done is closed when the relay is stopped.
 func (r *Relay) Done() <-chan struct{} { return r.done }
 
+// Err returns the first forwarding failure that stopped the relay. It returns
+// nil while the relay is healthy and after an explicit or context-driven Close.
+// Callers that need a terminal result should wait for Done before calling Err.
+func (r *Relay) Err() error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	return r.terminalErr
+}
+
 // Close stops the relay and closes both the UDP socket and rendr
-// PacketConn.
+// PacketConn. A concurrent shutdown already in progress is left to its owner;
+// callers can wait for Done when they need to observe its completion.
 func (r *Relay) Close() error {
-	var err error
-	r.closeOnce.Do(func() {
-		close(r.done)
-		if e := r.udp.Close(); e != nil {
-			err = e
-		}
-		if e := r.pc.Close(); err == nil && e != nil {
-			err = e
-		}
-	})
-	return err
+	return r.stop(nil)
 }
 
 func (r *Relay) closeOnContext(ctx context.Context) {
 	select {
 	case <-ctx.Done():
-		_ = r.Close()
+		_ = r.stop(nil)
 	case <-r.done:
 	}
 }
 
 func (r *Relay) udpToRendr(bufSize int) {
-	buf := make([]byte, bufSize)
+	buf := make([]byte, bufSize+1)
 	for {
 		n, addr, err := r.udp.ReadFrom(buf)
-		if err != nil {
+		if err = datagramReadError(n, len(buf), bufSize, err); err != nil {
+			r.fail("UDP to rendr", "read UDP", err)
 			return
 		}
 		if r.target == nil {
+			if addr == nil {
+				r.fail("UDP to rendr", "read UDP", errors.New("missing source address"))
+				return
+			}
 			r.peerMu.Lock()
 			r.peer = addr
 			r.peerMu.Unlock()
 		}
-		if _, err := r.pc.WriteTo(buf[:n], nil); err != nil {
+		written, err := r.pc.WriteTo(buf[:n], nil)
+		if err != nil {
+			r.fail("UDP to rendr", "write carrier", err)
+			return
+		}
+		if written != n {
+			r.fail("UDP to rendr", "write carrier", shortWriteError(written, n))
 			return
 		}
 	}
 }
 
 func (r *Relay) rendrToUDP(bufSize int) {
-	buf := make([]byte, bufSize)
+	buf := make([]byte, bufSize+1)
 	for {
 		n, _, err := r.pc.ReadFrom(buf)
-		if err != nil {
+		if err = datagramReadError(n, len(buf), bufSize, err); err != nil {
+			r.fail("rendr to UDP", "read carrier", err)
 			return
 		}
 		dst := r.target
@@ -344,8 +395,60 @@ func (r *Relay) rendrToUDP(bufSize int) {
 		if dst == nil {
 			continue
 		}
-		if _, err := r.udp.WriteTo(buf[:n], dst); err != nil {
+		written, err := r.udp.WriteTo(buf[:n], dst)
+		if err != nil {
+			r.fail("rendr to UDP", "write UDP", err)
+			return
+		}
+		if written != n {
+			r.fail("rendr to UDP", "write UDP", shortWriteError(written, n))
 			return
 		}
 	}
+}
+
+func (r *Relay) fail(direction, operation string, cause error) {
+	_ = r.stop(fmt.Errorf("udprelay: %s %s: %w", direction, operation, cause))
+}
+
+func (r *Relay) stop(cause error) error {
+	r.stateMu.Lock()
+	if r.stopping {
+		r.stateMu.Unlock()
+		<-r.done
+		r.stateMu.Lock()
+		err := r.closeErr
+		r.stateMu.Unlock()
+		return err
+	}
+	r.stopping = true
+	r.terminalErr = cause
+	r.stateMu.Unlock()
+
+	udpErr := r.udp.Close()
+	carrierErr := r.pc.Close()
+	closeErr := errors.Join(udpErr, carrierErr)
+
+	r.stateMu.Lock()
+	r.closeErr = closeErr
+	close(r.done)
+	r.stateMu.Unlock()
+	return closeErr
+}
+
+func datagramReadError(n, bufferLen, limit int, err error) error {
+	if n < 0 || n > bufferLen {
+		return fmt.Errorf("invalid datagram read count %d for buffer length %d", n, bufferLen)
+	}
+	if n > limit || errors.Is(err, io.ErrShortBuffer) {
+		if err != nil && !errors.Is(err, io.ErrShortBuffer) {
+			return errors.Join(io.ErrShortBuffer, err)
+		}
+		return io.ErrShortBuffer
+	}
+	return err
+}
+
+func shortWriteError(written, want int) error {
+	return fmt.Errorf("%w: wrote %d of %d bytes", io.ErrShortWrite, written, want)
 }

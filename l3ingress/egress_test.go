@@ -80,15 +80,49 @@ func TestEgressRegistryMachineReadableErrors(t *testing.T) {
 	}
 }
 
+func TestEgressRegistryRejectsTypedNilHooksAndConnections(t *testing.T) {
+	reg := NewEgressRegistry()
+	var nilHook *recordingEgress
+	if err := reg.Register("typed-nil", nilHook); err == nil {
+		t.Fatal("registered typed-nil egress hook")
+	}
+	if err := reg.Register("nil-connections", nilConnectionEgress{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := reg.DialTCP(context.Background(), "nil-connections", L3Identity{Proto: ProtocolTCP})
+	if reason, ok := EgressErrorReasonOf(err); !ok || reason != ReasonInvalidEgressConn {
+		t.Fatalf("typed-nil TCP error=%v reason=%q, want invalid_egress_connection", err, reason)
+	}
+	_, _, err = reg.DialUDP(context.Background(), "nil-connections", L3Identity{Proto: ProtocolUDP})
+	if reason, ok := EgressErrorReasonOf(err); !ok || reason != ReasonInvalidEgressConn {
+		t.Fatalf("typed-nil UDP error=%v reason=%q, want invalid_egress_connection", err, reason)
+	}
+}
+
+type nilConnectionEgress struct{}
+
+func (nilConnectionEgress) DialTCP(context.Context, L3Identity) (TCPConn, error) {
+	var conn *net.TCPConn
+	return conn, nil
+}
+
+func (nilConnectionEgress) DialUDP(context.Context, L3Identity) (net.PacketConn, netip.AddrPort, error) {
+	var conn *net.UDPConn
+	return conn, netip.MustParseAddrPort("127.0.0.1:9"), nil
+}
+
 type recordingEgress struct {
 	tcpID     L3Identity
 	udpID     L3Identity
 	udpRemote netip.AddrPort
 }
 
-func (e *recordingEgress) DialTCP(_ context.Context, id L3Identity) (net.Conn, error) {
+func (e *recordingEgress) DialTCP(_ context.Context, id L3Identity) (TCPConn, error) {
 	e.tcpID = id
-	client, server := net.Pipe()
+	client, server, err := newTestTCPConnPair()
+	if err != nil {
+		return nil, err
+	}
 	_ = server.Close()
 	return client, nil
 }

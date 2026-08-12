@@ -25,20 +25,47 @@ import (
 )
 
 func TestPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T) {
-	runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t)
+	_, _ = runPrivilegedTCPRepairRollbackCycle(t, 0)
 }
 
-func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T) {
+func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T) kernel5TCPRollbackStageEvidence {
+	stages, _ := runPrivilegedTCPRepairRollbackCycle(t, 0)
+	return stages
+}
+
+func runPrivilegedTCPRepairRollbackCycle(
+	t *testing.T,
+	cycle int,
+) (kernel5TCPRollbackStageEvidence, kernel5TCPRollbackKernelCycleEvidence) {
 	t.Helper()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var stages kernel5TCPRollbackStageEvidence
 	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_TEST") != "1" {
 		t.Skip("set RENDR_TCP_REPAIR_DRIVER_TEST=1 to exercise the real driver")
 	}
 	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_NETNS") != "1" {
 		t.Fatal("privileged driver test must run in a dedicated network namespace")
 	}
+	if expected := os.Getenv(kernel5NetworkNamespaceEnvironment); expected != "" {
+		actual, err := kernel5TCPNetworkNamespaceIdentity()
+		if err != nil {
+			t.Fatalf("read rollback cycle network namespace: %v", err)
+		}
+		if actual != expected {
+			t.Fatalf("rollback cycle network namespace=%q want=%q", actual, expected)
+		}
+	}
 	fixture := newRepairDriverFixture(t)
+	transaction := newKernel5TCPRollbackTransaction(t)
+	fixture.attempt.preflight.TransactionID = transaction
+	fixture.request.Plan.TransactionID = transaction
 	if err := fixture.source.SetKeepAlive(false); err != nil {
 		t.Fatalf("disable source keepalive: %v", err)
+	}
+	sourceCookie, err := measureKernel5TCPSocketCookie(fixture.source)
+	if err != nil {
+		t.Fatalf("measure rollback source SO_COOKIE: %v", err)
 	}
 	inspection, err := tcprepair.Inspect(fixture.source)
 	if err != nil {
@@ -47,6 +74,9 @@ func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T)
 	manager, err := tcpquarantine.New(tcpquarantine.Config{})
 	if err != nil {
 		t.Fatalf("quarantine manager: %v", err)
+	}
+	recordingManager := &kernel5TCPRollbackRecordingQuarantineManager{
+		delegate: systemQuarantineManager{manager: manager},
 	}
 	digest, err := platform.CurrentRuntimeContextDigest()
 	if err != nil {
@@ -57,7 +87,7 @@ func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T)
 	fixture.attempt.driver = &tcpRepairDriver{
 		endpoint:   fixture.path.endpoint,
 		kernel:     systemRepairKernel{},
-		quarantine: systemQuarantineManager{manager: manager},
+		quarantine: recordingManager,
 		newExecutor: func(ctx context.Context, conn *net.TCPConn, expected leafmobility.ContextDigest) (repairAttemptExecutor, error) {
 			return newRepairNamespaceExecutor(ctx, conn, expected)
 		},
@@ -72,9 +102,19 @@ func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T)
 	if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
 		t.Fatalf("Prepare in namespace A: %v", err)
 	}
+	stages.Prepare++
 	if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err != nil {
 		t.Fatalf("Stage in namespace A: %v", err)
 	}
+	stages.Stage++
+	quarantineRules, quarantineDigest := kernel5TCPRollbackQuarantineEvidence(t)
+	if quarantineRules < 2 {
+		t.Fatalf("real rollback quarantine rules=%d, want both traffic directions", quarantineRules)
+	}
+	if fixture.attempt.snapshot == nil {
+		t.Fatal("real rollback Stage produced no snapshot")
+	}
+	snapshotDigest := fmt.Sprintf("%x", fixture.attempt.snapshot.Digest())
 
 	rolledBack := make(chan error, 1)
 	go func() {
@@ -91,11 +131,18 @@ func runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t *testing.T)
 	if err := <-rolledBack; err != nil {
 		t.Fatalf("Rollback invoked from namespace B: %v", err)
 	}
+	stages.Rollback++
 	if fixture.attempt.stage != repairAttemptRolledBack || fixture.attempt.quarantine != nil ||
 		fixture.attempt.executor != nil {
 		t.Fatalf("cross-namespace rollback retained state: %+v", fixture.attempt)
 	}
-	assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+	forward, reverse := assertKernel5TCPRollbackPayloadRoundTrip(t, fixture.path, fixture.peer, cycle, transaction)
+	stages.Total = stages.Prepare + stages.Stage + stages.Rollback
+	record := finishKernel5TCPRollbackKernelCycle(
+		t, cycle, fixture, recordingManager, inspection, sourceCookie, snapshotDigest,
+		quarantineRules, quarantineDigest, forward, reverse,
+	)
+	return stages, record
 }
 
 func TestPrivilegedTCPRepairRollbackResourceSlope(t *testing.T) {
@@ -105,22 +152,36 @@ func TestPrivilegedTCPRepairRollbackResourceSlope(t *testing.T) {
 	if os.Getenv("RENDR_TCP_REPAIR_DRIVER_NETNS") != "1" {
 		t.Fatal("rollback resource test must run in a dedicated network namespace")
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	const (
 		cycles       = 200
 		warmupCycles = 20
 	)
-	baseline := sampleRefreshResources(t)
+	baseline := sampleKernel5TCPRepairRollbackResources(t)
 	var warm refreshResourceSample
+	completedCycles := 0
+	var completedStages kernel5TCPRollbackStageEvidence
+	records := make([]kernel5TCPRollbackKernelCycleEvidence, 0, cycles)
 	for cycle := 1; cycle <= cycles; cycle++ {
-		t.Run(fmt.Sprintf("cycle-%03d", cycle), func(t *testing.T) {
-			runPrivilegedTCPRepairRollbackStaysInPreparedNetworkNamespace(t)
-		})
+		var cycleStages kernel5TCPRollbackStageEvidence
+		var cycleEvidence kernel5TCPRollbackKernelCycleEvidence
+		if t.Run(fmt.Sprintf("cycle-%03d", cycle), func(t *testing.T) {
+			cycleStages, cycleEvidence = runPrivilegedTCPRepairRollbackCycle(t, cycle)
+		}) {
+			completedCycles++
+			records = append(records, cycleEvidence)
+			completedStages.Prepare += cycleStages.Prepare
+			completedStages.Stage += cycleStages.Stage
+			completedStages.Rollback += cycleStages.Rollback
+			completedStages.Total += cycleStages.Total
+		}
 		assertNoRefreshQuarantineTables(t)
 		if cycle == warmupCycles {
-			warm = sampleRefreshResources(t)
+			warm = sampleKernel5TCPRepairRollbackResources(t)
 		}
 	}
-	end := sampleRefreshResources(t)
+	end := sampleKernel5TCPRepairRollbackResources(t)
 	if end.fds > baseline.fds+4 || end.goroutines > baseline.goroutines+8 {
 		t.Fatalf("rollback resource slope: baseline=%+v end=%+v", baseline, end)
 	}
@@ -130,6 +191,9 @@ func TestPrivilegedTCPRepairRollbackResourceSlope(t *testing.T) {
 	if end.rss > warm.rss+(32<<20) {
 		t.Fatalf("rollback RSS slope: warm=%d end=%d", warm.rss, end.rss)
 	}
+	emitKernel5TCPRepairRollbackKernelEvidence(
+		t, cycles, completedCycles, warmupCycles, completedStages, records, baseline, warm, end,
+	)
 }
 
 func TestPrivilegedTCPRepairDriverMigratesActiveDataWithIndependentControlRoute(t *testing.T) {

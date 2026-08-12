@@ -30,6 +30,12 @@ type Conn interface {
 	Status() Status
 }
 
+// StreamHalfCloser is implemented by rendr stream connections. CloseWrite
+// sends an ordered FIN without closing the receive direction.
+type StreamHalfCloser interface {
+	CloseWrite() error
+}
+
 // PacketConn is the datagram analogue of Conn.
 type PacketConn interface {
 	net.PacketConn
@@ -148,4 +154,23 @@ type ConnStats struct {
 	// PeerInstanceID is the peer's runtime instance id, learned from
 	// HELLO/HELLO_ACK. Zero means unknown or legacy peer.
 	PeerInstanceID InstanceID
+	// TXReplay exposes read-only bounded retransmission occupancy and ACK
+	// progress. Limits are factual implementation bounds, not tuning knobs.
+	TXReplay ReplayStats
+}
+
+// ReplayStats describes the sender's bounded application replay-credit
+// domain. Control-frame reserve is accounted separately by the protocol.
+type ReplayStats struct {
+	FrameLimit         uint64
+	ByteLimit          uint64
+	FramesInUse        uint64
+	BytesInUse         uint64
+	FramesHighWater    uint64
+	BytesHighWater     uint64
+	PublishedNext      uint64
+	AckNext            uint64
+	CreditWaiters      uint64
+	BackpressureEvents uint64
+	Generation         uint64
 }

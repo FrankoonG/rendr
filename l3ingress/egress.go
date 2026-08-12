@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -18,10 +19,18 @@ const (
 	DirectionEgress
 )
 
+// TCPConn is the peer-side stream contract required by TUN-originated TCP
+// flows. A plain net.Conn is insufficient because request EOF must propagate
+// without closing the reverse response direction.
+type TCPConn interface {
+	net.Conn
+	CloseWrite() error
+}
+
 // Egress is implemented by embedding programs that own the final
 // peer-side landing choice for a TUN-originated flow.
 type Egress interface {
-	DialTCP(ctx context.Context, id L3Identity) (net.Conn, error)
+	DialTCP(ctx context.Context, id L3Identity) (TCPConn, error)
 	DialUDP(ctx context.Context, id L3Identity) (net.PacketConn, netip.AddrPort, error)
 }
 
@@ -32,6 +41,7 @@ const (
 	ReasonInvalidEgressName EgressErrorReason = "invalid_egress_name"
 	ReasonEgressNotFound    EgressErrorReason = "egress_not_found"
 	ReasonProtocolMismatch  EgressErrorReason = "protocol_mismatch"
+	ReasonInvalidEgressConn EgressErrorReason = "invalid_egress_connection"
 )
 
 // EgressError keeps peer-side dispatch failures inspectable.
@@ -49,6 +59,8 @@ func (e *EgressError) Error() string {
 		return fmt.Sprintf("l3ingress: egress %q not found", e.Name)
 	case ReasonProtocolMismatch:
 		return fmt.Sprintf("l3ingress: egress %q cannot handle %s identity", e.Name, e.Proto)
+	case ReasonInvalidEgressConn:
+		return fmt.Sprintf("l3ingress: egress %q returned a nil connection", e.Name)
 	default:
 		return "l3ingress: egress error"
 	}
@@ -68,7 +80,7 @@ func NewEgressRegistry() *EgressRegistry {
 
 // Register adds or replaces a named embedding-provided egress hook.
 func (r *EgressRegistry) Register(name string, e Egress) error {
-	if name == "" || e == nil {
+	if name == "" || nilInterface(e) {
 		return &EgressError{Reason: ReasonInvalidEgressName, Name: name}
 	}
 	r.mu.Lock()
@@ -99,7 +111,7 @@ func (r *EgressRegistry) Lookup(name string) (Egress, bool) {
 }
 
 // DialTCP dispatches a TCP identity to the named peer-side egress hook.
-func (r *EgressRegistry) DialTCP(ctx context.Context, name string, id L3Identity) (net.Conn, error) {
+func (r *EgressRegistry) DialTCP(ctx context.Context, name string, id L3Identity) (TCPConn, error) {
 	if id.Proto != ProtocolTCP {
 		return nil, &EgressError{Reason: ReasonProtocolMismatch, Name: name, Proto: id.Proto}
 	}
@@ -107,7 +119,11 @@ func (r *EgressRegistry) DialTCP(ctx context.Context, name string, id L3Identity
 	if err != nil {
 		return nil, err
 	}
-	return e.DialTCP(ctx, id)
+	conn, err := e.DialTCP(ctx, id)
+	if err == nil && nilInterface(conn) {
+		return nil, &EgressError{Reason: ReasonInvalidEgressConn, Name: name, Proto: id.Proto}
+	}
+	return conn, err
 }
 
 // DialUDP dispatches a UDP identity to the named peer-side egress hook.
@@ -119,7 +135,11 @@ func (r *EgressRegistry) DialUDP(ctx context.Context, name string, id L3Identity
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	return e.DialUDP(ctx, id)
+	conn, remote, err := e.DialUDP(ctx, id)
+	if err == nil && nilInterface(conn) {
+		return nil, netip.AddrPort{}, &EgressError{Reason: ReasonInvalidEgressConn, Name: name, Proto: id.Proto}
+	}
+	return conn, remote, err
 }
 
 func (r *EgressRegistry) require(name string) (Egress, error) {
@@ -145,6 +165,15 @@ func EgressErrorReasonOf(err error) (EgressErrorReason, bool) {
 		return "", false
 	}
 	return e.Reason, true
+}
+
+func nilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	kind := reflect.ValueOf(value).Kind()
+	return (kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface ||
+		kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice) && reflect.ValueOf(value).IsNil()
 }
 
 // FlowMeta is passed to an external router before rendr starts a

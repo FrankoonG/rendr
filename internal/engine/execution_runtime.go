@@ -17,10 +17,12 @@ type dispatchRoute struct {
 
 type dispatchTicket struct {
 	routes []dispatchRoute
+	kind   proto.ExecutionKind
 }
 
 type executionRuntime struct {
-	plan *executionPlan
+	plan             *executionPlan
+	flatLeafSelector bool
 
 	mu         sync.Mutex
 	selectors  map[proto.TargetID]*selectorExecutionState
@@ -36,6 +38,11 @@ type selectorExecutionState struct {
 	lastQualityMove  time.Time
 }
 
+type initialSelectorSelection struct {
+	selectorID proto.TargetID
+	targetID   proto.TargetID
+}
+
 type bondExecutionState struct {
 	cursor       uint64
 	currentChild proto.TargetID
@@ -44,17 +51,48 @@ type bondExecutionState struct {
 
 func newExecutionRuntime(plan *executionPlan) *executionRuntime {
 	return &executionRuntime{
-		plan:      plan,
-		selectors: make(map[proto.TargetID]*selectorExecutionState),
-		bonds:     make(map[proto.TargetID]*bondExecutionState),
+		plan:             plan,
+		flatLeafSelector: isFlatLeafSelectorPlan(plan),
+		selectors:        make(map[proto.TargetID]*selectorExecutionState),
+		bonds:            make(map[proto.TargetID]*bondExecutionState),
 	}
+}
+
+func isFlatLeafSelectorPlan(plan *executionPlan) bool {
+	root, ok := plan.rootView()
+	if !ok || root.kind != proto.GraphNodeKindSelector || len(root.children) == 0 {
+		return false
+	}
+	for _, childID := range root.children {
+		child, ok := plan.nodeView(childID)
+		if !ok || child.kind != proto.GraphNodeKindPath {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *executionRuntime) ownsFlatSelectorLeaf(targetID proto.TargetID) bool {
+	if r == nil || !r.flatLeafSelector || targetID == (proto.TargetID{}) {
+		return false
+	}
+	root, ok := r.plan.rootView()
+	if !ok {
+		return false
+	}
+	for _, childID := range root.children {
+		if childID == targetID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *executionRuntime) selectChild(selectorID, childID proto.TargetID) error {
 	if r == nil || r.plan == nil {
 		return fmt.Errorf("engine: execution runtime is not configured")
 	}
-	selector, ok := r.plan.node(selectorID)
+	selector, ok := r.plan.nodeView(selectorID)
 	if !ok || selector.kind != proto.GraphNodeKindSelector {
 		return fmt.Errorf("engine: execution target is not a selector")
 	}
@@ -85,13 +123,126 @@ func (r *executionRuntime) selectedChild(selectorID proto.TargetID) (desired, ef
 	return desired, effective, ok
 }
 
+func (r *executionRuntime) policySwitchLeaves(selectorID, targetID proto.TargetID) map[proto.TargetID]bool {
+	if r == nil || r.plan == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.selectors[selectorID]
+	if state == nil {
+		return nil
+	}
+	current := state.desired
+	if current == (proto.TargetID{}) {
+		current = state.effective
+	}
+	if current == (proto.TargetID{}) || current == targetID {
+		return nil
+	}
+	leaves := make(map[proto.TargetID]bool)
+	var collect func(proto.TargetID)
+	collect = func(candidate proto.TargetID) {
+		node, ok := r.plan.nodeView(candidate)
+		if !ok {
+			return
+		}
+		if node.kind == proto.GraphNodeKindPath {
+			leaves[candidate] = true
+			return
+		}
+		if node.kind == proto.GraphNodeKindSelector {
+			nested := r.selectors[candidate]
+			if nested == nil {
+				return
+			}
+			child := nested.desired
+			if child == (proto.TargetID{}) {
+				child = nested.effective
+			}
+			if child != (proto.TargetID{}) {
+				collect(child)
+			}
+			return
+		}
+		for _, child := range node.children {
+			collect(child)
+		}
+	}
+	collect(current)
+	collect(targetID)
+	return leaves
+}
+
+// initializeSelectorsForLeaf freezes the manifest branch that made a leaf's
+// first physical generation usable. A committed selector branch may only be
+// changed by the policy plane; the data plane must never silently route via a
+// sibling when that branch is temporarily unavailable.
+func (r *executionRuntime) initializeSelectorsForLeaf(leafID proto.TargetID) []initialSelectorSelection {
+	return r.initializeSelectorsForLeafPolicy(leafID, nil)
+}
+
+func (r *executionRuntime) initializeSelectorsForLeafPolicy(
+	leafID proto.TargetID,
+	policySelections map[proto.TargetID]proto.TargetID,
+) []initialSelectorSelection {
+	if r == nil || r.plan == nil || leafID == (proto.TargetID{}) {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	initialized := make([]initialSelectorSelection, 0)
+	r.initializeSelectorBranchLocked(r.plan.rootID, leafID, policySelections, &initialized)
+	return initialized
+}
+
+func (r *executionRuntime) initializeSelectorBranchLocked(
+	id, leafID proto.TargetID,
+	policySelections map[proto.TargetID]proto.TargetID,
+	initialized *[]initialSelectorSelection,
+) bool {
+	node, ok := r.plan.nodeView(id)
+	if !ok {
+		return false
+	}
+	if node.kind == proto.GraphNodeKindPath {
+		return id == leafID
+	}
+	for _, childID := range node.children {
+		if !r.initializeSelectorBranchLocked(childID, leafID, policySelections, initialized) {
+			continue
+		}
+		if node.kind == proto.GraphNodeKindSelector {
+			state := r.selectors[node.targetID]
+			if state == nil {
+				state = &selectorExecutionState{}
+				r.selectors[node.targetID] = state
+			}
+			if state.desired == (proto.TargetID{}) {
+				desired := policySelections[node.targetID]
+				if desired == (proto.TargetID{}) {
+					desired = childID
+					*initialized = append(*initialized, initialSelectorSelection{
+						selectorID: node.targetID,
+						targetID:   childID,
+					})
+				}
+				state.desired = desired
+				state.effective = childID
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (r *executionRuntime) activeLeafTargets(attached map[proto.TargetID]bool) ([]proto.TargetID, proto.ExecutionKind, error) {
 	if r == nil || r.plan == nil {
 		return nil, 0, fmt.Errorf("engine: execution runtime is not configured")
 	}
 	var available func(proto.TargetID) bool
 	available = func(id proto.TargetID) bool {
-		node, ok := r.plan.node(id)
+		node, ok := r.plan.nodeView(id)
 		if !ok {
 			return false
 		}
@@ -105,7 +256,7 @@ func (r *executionRuntime) activeLeafTargets(attached map[proto.TargetID]bool) (
 		}
 		return false
 	}
-	root, ok := r.plan.root()
+	root, ok := r.plan.rootView()
 	if !ok || !available(root.targetID) {
 		return nil, 0, errNoExecutionRoute
 	}
@@ -121,7 +272,7 @@ func (r *executionRuntime) activeLeafTargets(attached map[proto.TargetID]bool) (
 }
 
 func (r *executionRuntime) activeExecutionKindLocked(id proto.TargetID, available func(proto.TargetID) bool) proto.ExecutionKind {
-	node, ok := r.plan.node(id)
+	node, ok := r.plan.nodeView(id)
 	if !ok {
 		return proto.ExecutionKindSelector
 	}
@@ -143,7 +294,7 @@ func (r *executionRuntime) activeExecutionKindLocked(id proto.TargetID, availabl
 }
 
 func (r *executionRuntime) collectActiveLeavesLocked(id proto.TargetID, available func(proto.TargetID) bool, leaves *[]proto.TargetID) {
-	node, ok := r.plan.node(id)
+	node, ok := r.plan.nodeView(id)
 	if !ok || !available(id) {
 		return
 	}
@@ -174,10 +325,24 @@ func (r *executionRuntime) buildTicketObserved(
 	bondPinSize int,
 	bondStuckMultiplier float64,
 ) (dispatchTicket, error) {
+	return r.buildTicketObservedPresence(
+		attached, attached, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier,
+	)
+}
+
+func (r *executionRuntime) buildTicketObservedPresence(
+	eligible map[proto.TargetID]bool,
+	present map[proto.TargetID]bool,
+	qualities map[proto.TargetID]transport.PathQuality,
+	capacities map[proto.TargetID]uint64,
+	packetized bool,
+	bondPinSize int,
+	bondStuckMultiplier float64,
+) (dispatchTicket, error) {
 	if r == nil || r.plan == nil {
 		return dispatchTicket{}, fmt.Errorf("engine: execution runtime is not configured")
 	}
-	root, ok := r.plan.root()
+	root, ok := r.plan.rootView()
 	if !ok {
 		return dispatchTicket{}, fmt.Errorf("engine: execution plan has no root")
 	}
@@ -189,12 +354,12 @@ func (r *executionRuntime) buildTicketObserved(
 			return available[id]
 		}
 		known[id] = true
-		node, exists := r.plan.node(id)
+		node, exists := r.plan.nodeView(id)
 		if !exists {
 			return false
 		}
 		if node.kind == proto.GraphNodeKindPath {
-			available[id] = attached[id]
+			available[id] = eligible[id]
 			return available[id]
 		}
 		for _, childID := range node.children {
@@ -208,10 +373,37 @@ func (r *executionRuntime) buildTicketObserved(
 	if !nodeAvailable(root.targetID) {
 		return dispatchTicket{}, errNoExecutionRoute
 	}
+	presentMemo := make(map[proto.TargetID]bool, len(r.plan.nodes))
+	presentKnown := make(map[proto.TargetID]bool, len(r.plan.nodes))
+	var nodePresent func(proto.TargetID) bool
+	nodePresent = func(id proto.TargetID) bool {
+		if presentKnown[id] {
+			return presentMemo[id]
+		}
+		presentKnown[id] = true
+		node, exists := r.plan.nodeView(id)
+		if !exists {
+			return false
+		}
+		if node.kind == proto.GraphNodeKindPath {
+			presentMemo[id] = present[id]
+			return presentMemo[id]
+		}
+		for _, childID := range node.children {
+			if nodePresent(childID) {
+				presentMemo[id] = true
+				return true
+			}
+		}
+		return false
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	routes, ok := r.buildNodeLocked(root.targetID, false, nodeAvailable, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier)
+	routes, ok := r.buildNodeLocked(
+		root.targetID, false, nodeAvailable, nodePresent, qualities, capacities,
+		packetized, bondPinSize, bondStuckMultiplier,
+	)
 	if !ok || len(routes) == 0 {
 		return dispatchTicket{}, errNoExecutionRoute
 	}
@@ -224,20 +416,24 @@ func (r *executionRuntime) buildTicketObserved(
 		seen[route.targetID] = struct{}{}
 		unique = append(unique, route)
 	}
-	return dispatchTicket{routes: unique}, nil
+	return dispatchTicket{
+		routes: unique,
+		kind:   r.activeExecutionKindLocked(root.targetID, nodeAvailable),
+	}, nil
 }
 
 func (r *executionRuntime) buildNodeLocked(
 	id proto.TargetID,
 	bonded bool,
 	available func(proto.TargetID) bool,
+	present func(proto.TargetID) bool,
 	qualities map[proto.TargetID]transport.PathQuality,
 	capacities map[proto.TargetID]uint64,
 	packetized bool,
 	bondPinSize int,
 	bondStuckMultiplier float64,
 ) ([]dispatchRoute, bool) {
-	node, ok := r.plan.node(id)
+	node, ok := r.plan.nodeView(id)
 	if !ok || !available(id) {
 		return nil, false
 	}
@@ -245,20 +441,20 @@ func (r *executionRuntime) buildNodeLocked(
 	case proto.GraphNodeKindPath:
 		return []dispatchRoute{{targetID: id, bonded: bonded}}, true
 	case proto.GraphNodeKindSelector:
-		childID, ok := r.selectorChildLocked(node, available)
+		childID, ok := r.selectorDispatchChildLocked(node, available, present)
 		if !ok {
 			return nil, false
 		}
-		return r.buildNodeLocked(childID, bonded, available, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier)
+		return r.buildNodeLocked(childID, bonded, available, present, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier)
 	case proto.GraphNodeKindBond:
 		tried := make(map[proto.TargetID]bool, len(node.children))
 		for len(tried) < len(node.children) {
-			childID, ok := r.bondChildLocked(node, available, qualities, capacities, tried, packetized, bondPinSize, bondStuckMultiplier)
+			childID, ok := r.bondChildLocked(node, available, present, qualities, capacities, tried, packetized, bondPinSize, bondStuckMultiplier)
 			if !ok {
 				return nil, false
 			}
 			tried[childID] = true
-			if routes, built := r.buildNodeLocked(childID, true, available, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier); built {
+			if routes, built := r.buildNodeLocked(childID, true, available, present, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier); built {
 				return routes, true
 			}
 		}
@@ -269,7 +465,7 @@ func (r *executionRuntime) buildNodeLocked(
 			if !available(childID) {
 				continue
 			}
-			childRoutes, built := r.buildNodeLocked(childID, bonded, available, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier)
+			childRoutes, built := r.buildNodeLocked(childID, bonded, available, present, qualities, capacities, packetized, bondPinSize, bondStuckMultiplier)
 			if built {
 				routes = append(routes, childRoutes...)
 			}
@@ -307,9 +503,52 @@ func (r *executionRuntime) selectorChildLocked(node executionPlanNode, available
 	return proto.TargetID{}, false
 }
 
+// selectorDispatchChildLocked distinguishes a physically absent selected
+// target from one that is merely excluded by a blocked writer. Hard absence
+// may use the selector's immediate death fallback. A present-but-stalled
+// target must wait for a policy-plane cutover so DATA can never reach a
+// sibling while ActivePath still names the selected target.
+func (r *executionRuntime) selectorDispatchChildLocked(
+	node executionPlanNode,
+	eligible func(proto.TargetID) bool,
+	present func(proto.TargetID) bool,
+) (proto.TargetID, bool) {
+	state := r.selectors[node.targetID]
+	if state == nil {
+		state = &selectorExecutionState{}
+		r.selectors[node.targetID] = state
+	}
+	if state.desired != (proto.TargetID{}) {
+		if eligible(state.desired) {
+			state.effective = state.desired
+			return state.desired, true
+		}
+		if present(state.desired) {
+			state.effective = proto.TargetID{}
+			return proto.TargetID{}, false
+		}
+	}
+	peaks := make(map[proto.TargetID]bool, len(node.peakCandidates))
+	for _, id := range node.peakCandidates {
+		peaks[id] = true
+	}
+	for _, peakPass := range []bool{false, true} {
+		for _, childID := range node.children {
+			if peaks[childID] != peakPass || !eligible(childID) {
+				continue
+			}
+			state.effective = childID
+			return childID, true
+		}
+	}
+	state.effective = proto.TargetID{}
+	return proto.TargetID{}, false
+}
+
 func (r *executionRuntime) bondChildLocked(
 	node executionPlanNode,
 	available func(proto.TargetID) bool,
+	present func(proto.TargetID) bool,
 	qualities map[proto.TargetID]transport.PathQuality,
 	capacities map[proto.TargetID]uint64,
 	excluded map[proto.TargetID]bool,
@@ -335,7 +574,7 @@ func (r *executionRuntime) bondChildLocked(
 		if excluded[childID] || stuck[childID] || !available(childID) {
 			continue
 		}
-		weight := r.aggregateCapacityLocked(childID, available, capacities)
+		weight := r.aggregateCapacityLocked(childID, available, present, capacities)
 		if weight == 0 {
 			weight = 1
 		}
@@ -353,7 +592,7 @@ func (r *executionRuntime) bondChildLocked(
 		if excluded[candidateID] || stuck[candidateID] || !available(candidateID) {
 			continue
 		}
-		weight := r.aggregateCapacityLocked(candidateID, available, capacities)
+		weight := r.aggregateCapacityLocked(candidateID, available, present, capacities)
 		if weight == 0 {
 			weight = 1
 		}
@@ -379,11 +618,16 @@ func (r *executionRuntime) bondChildLocked(
 	return childID, true
 }
 
-func (r *executionRuntime) aggregateCapacityLocked(id proto.TargetID, available func(proto.TargetID) bool, capacities map[proto.TargetID]uint64) uint64 {
+func (r *executionRuntime) aggregateCapacityLocked(
+	id proto.TargetID,
+	available func(proto.TargetID) bool,
+	present func(proto.TargetID) bool,
+	capacities map[proto.TargetID]uint64,
+) uint64 {
 	if !available(id) {
 		return 0
 	}
-	node, ok := r.plan.node(id)
+	node, ok := r.plan.nodeView(id)
 	if !ok {
 		return 0
 	}
@@ -391,15 +635,15 @@ func (r *executionRuntime) aggregateCapacityLocked(id proto.TargetID, available 
 		return capacities[id]
 	}
 	if node.kind == proto.GraphNodeKindSelector {
-		childID, ok := r.selectorChildLocked(node, available)
+		childID, ok := r.selectorDispatchChildLocked(node, available, present)
 		if !ok {
 			return 0
 		}
-		return r.aggregateCapacityLocked(childID, available, capacities)
+		return r.aggregateCapacityLocked(childID, available, present, capacities)
 	}
 	var capacity uint64
 	for _, childID := range node.children {
-		childCapacity := r.aggregateCapacityLocked(childID, available, capacities)
+		childCapacity := r.aggregateCapacityLocked(childID, available, present, capacities)
 		if node.kind == proto.GraphNodeKindRace {
 			if childCapacity > capacity {
 				capacity = childCapacity
@@ -458,7 +702,7 @@ func (r *executionRuntime) bondStuckChildren(
 }
 
 func (r *executionRuntime) aggregateRTT(id proto.TargetID, available func(proto.TargetID) bool, qualities map[proto.TargetID]transport.PathQuality) time.Duration {
-	node, ok := r.plan.node(id)
+	node, ok := r.plan.nodeView(id)
 	if !ok || !available(id) {
 		return 0
 	}

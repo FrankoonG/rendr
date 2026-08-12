@@ -16,6 +16,7 @@ func TestDatagramAccelerationStatusIsObservationOnly(t *testing.T) {
 	status := DatagramAccelerationStatus{
 		Mode: DatagramAccelerationGSO, Cause: "probe_confirmed",
 		ProbeGeneration: 7, ProbedAt: now,
+		BatchCalls: 2, BatchDatagrams: 7,
 		GSOAttempts: 3, GSOSuperPackets: 2, GSOSegments: 8,
 		OrdinaryDatagrams: 1, FallbackTransitions: 1,
 	}

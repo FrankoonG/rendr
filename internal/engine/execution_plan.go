@@ -234,6 +234,15 @@ func (p *executionPlan) root() (executionPlanNode, bool) {
 	return p.node(p.rootID)
 }
 
+// rootView and nodeView return borrowed immutable plan nodes. They are only
+// for engine internals that never expose or mutate the node slices.
+func (p *executionPlan) rootView() (executionPlanNode, bool) {
+	if p == nil {
+		return executionPlanNode{}, false
+	}
+	return p.nodeView(p.rootID)
+}
+
 func (p *executionPlan) hasKind(kind proto.GraphNodeKind) bool {
 	if p == nil {
 		return false
@@ -251,11 +260,22 @@ func (p *executionPlan) node(id proto.TargetID) (executionPlanNode, bool) {
 	if p == nil {
 		return executionPlanNode{}, false
 	}
+	node, ok := p.nodeView(id)
+	if !ok {
+		return executionPlanNode{}, false
+	}
+	return cloneExecutionPlanNode(node), true
+}
+
+func (p *executionPlan) nodeView(id proto.TargetID) (executionPlanNode, bool) {
+	if p == nil {
+		return executionPlanNode{}, false
+	}
 	entry, ok := p.nodes[id]
 	if !ok {
 		return executionPlanNode{}, false
 	}
-	return cloneExecutionPlanNode(entry.node), true
+	return entry.node, true
 }
 
 // leafDescendants returns path leaves in deterministic depth-first child

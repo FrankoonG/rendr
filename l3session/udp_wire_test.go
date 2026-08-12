@@ -27,19 +27,21 @@ func TestUDPEnvelopeRoundTrip(t *testing.T) {
 		},
 	}
 	for _, id := range identities {
-		packet, err := appendUDPEnvelope([]byte("prefix"), id, "vpn-egress", []byte("payload"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(packet[:6]) != "prefix" {
-			t.Fatalf("prefix changed: %q", packet[:6])
-		}
-		decoded, err := decodeUDPEnvelope(packet[6:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if decoded.Identity != id || decoded.Egress != "vpn-egress" || !bytes.Equal(decoded.Payload, []byte("payload")) {
-			t.Fatalf("decoded=%+v", decoded)
+		for _, payload := range [][]byte{[]byte("payload"), nil} {
+			packet, err := appendUDPEnvelope([]byte("prefix"), id, "vpn-egress", payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(packet[:6]) != "prefix" {
+				t.Fatalf("prefix changed: %q", packet[:6])
+			}
+			decoded, err := decodeUDPEnvelope(packet[6:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Identity != id || decoded.Egress != "vpn-egress" || !bytes.Equal(decoded.Payload, payload) {
+				t.Fatalf("decoded=%+v", decoded)
+			}
 		}
 	}
 }

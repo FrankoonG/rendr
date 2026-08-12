@@ -325,6 +325,15 @@ func Restore(ctx context.Context, snapshot *Snapshot) (*net.TCPConn, error) {
 		cleanupErr := errors.Join(closeErr, discardErr)
 		return nil, fmt.Errorf("tcprepair: release restored file: %w", cleanupErr)
 	}
+	// net.FileConn constructs a fresh Go TCPConn after the raw replacement was
+	// validated. Reassert the source eligibility invariant after that wrapper
+	// boundary so a successful replacement remains eligible for a later repair.
+	if err := tcpConn.SetKeepAlive(false); err != nil {
+		return nil, errors.Join(fmt.Errorf("tcprepair: disable restored keepalive: %w", err), tcpConn.Close())
+	}
+	if _, err := Inspect(tcpConn); err != nil {
+		return nil, errors.Join(fmt.Errorf("tcprepair: validate wrapped replacement: %w", err), tcpConn.Close())
+	}
 	return tcpConn, nil
 }
 

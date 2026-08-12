@@ -513,6 +513,11 @@ func (o *endpointOwner) close() error {
 	if conn == nil {
 		return nil
 	}
+	// Some userspace net.Conn implementations return from Close before a
+	// blocked Read has observed endpoint shutdown. An immediate deadline is a
+	// second, independent wakeup edge; the owner is already terminal, so the
+	// deadline cannot leak into a future endpoint generation.
+	_ = conn.SetDeadline(time.Now())
 	return conn.Close()
 }
 

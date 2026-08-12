@@ -116,6 +116,7 @@ func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 		EvidenceReason: leafmobility.RefreshReasonRouteSourceChanged,
 		ObservedAt:     now, UpdatedAt: now.Add(time.Millisecond), Deadline: deadline,
 		Operation: leafmobility.OperationTCPRepair, Fallback: leafmobility.FallbackRedialAttach,
+		TransactionID: leafmobility.TransactionID{0x41, 0x42},
 	}
 	tests := []struct {
 		name       string
@@ -150,6 +151,7 @@ func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 			}
 			got := projectLeafMobility(engine.LeafMobilitySnapshot{Ref: ref, Facts: facts, Initiator: observation})
 			if got.State != test.wantState || got.ID != test.wantID || got.Reason != test.wantReason ||
+				got.TransactionID != [16]byte(base.TransactionID) ||
 				got.EndpointGeneration != facts.Generation || got.EvidenceGeneration != base.EvidenceGeneration ||
 				got.ObservedAt != now || got.UpdatedAt != base.UpdatedAt || got.ExpiresAt != deadline {
 				t.Fatalf("projection=%+v", got)

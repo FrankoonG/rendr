@@ -350,7 +350,8 @@ func TestPolicyTransactionCommitAppliesStateBeforeFinalAck(t *testing.T) {
 	if prepareAck.ack.Phase != proto.PolicyAckPhasePrepare || prepareAck.ack.Code != proto.PolicyAckCodeAccept || prepareAck.ack.Generation != 1 {
 		t.Fatalf("prepare ACK=%+v", prepareAck.ack)
 	}
-	if prepareAck.activePath != fixture.pathA || prepareAck.generation != 0 || prepareAck.selection != (proto.TargetID{}) || !prepareAck.pending {
+	if prepareAck.activePath != fixture.pathA || prepareAck.generation != 0 || prepareAck.selection != fixture.targetA ||
+		prepareAck.ack.CurrentTargetID != fixture.targetA || !prepareAck.pending {
 		t.Fatalf("PREPARE changed owner state: %+v", prepareAck)
 	}
 
@@ -539,7 +540,7 @@ func TestPolicyTransactionExpiryAndSupersededCommit(t *testing.T) {
 			t.Fatalf("expired COMMIT ACK=%+v", expired.ack)
 		}
 		generation, selection, pending, completed := policyTxUnitState(fixture.engine, fixture.selectorID)
-		if generation != 0 || selection != (proto.TargetID{}) || pending || completed != 1 || fixture.engine.ActivePath() != fixture.pathA {
+		if generation != 0 || selection != fixture.targetA || pending || completed != 1 || fixture.engine.ActivePath() != fixture.pathA {
 			t.Fatalf("expired COMMIT state: generation=%d selection=%x pending=%v completed=%d active=%d", generation, selection, pending, completed, fixture.engine.ActivePath())
 		}
 	})
@@ -627,7 +628,7 @@ func TestPolicyTransactionRejectsForeignGraphBinding(t *testing.T) {
 	if len(observations) != 0 {
 		t.Fatalf("foreign binding emitted %d ACKs", len(observations))
 	}
-	if generation, selection, pending, completed := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != (proto.TargetID{}) || pending || completed != 0 {
+	if generation, selection, pending, completed := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != fixture.targetA || pending || completed != 0 {
 		t.Fatalf("foreign binding changed state: generation=%d selection=%x pending=%v completed=%d", generation, selection, pending, completed)
 	}
 }
@@ -718,7 +719,7 @@ func TestPolicyTransactionProposalDigestPreventsExpiryABA(t *testing.T) {
 	if final.ack.Code != proto.PolicyAckCodeSuperseded {
 		t.Fatalf("expired COMMIT ACK=%+v", final.ack)
 	}
-	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != (proto.TargetID{}) || pending {
+	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != fixture.targetA || pending {
 		t.Fatalf("expired proposal mutated state: generation=%d selection=%x pending=%v", generation, selection, pending)
 	}
 }
@@ -753,7 +754,7 @@ func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
 		t.Fatal("reaccepted proposal reused the expired owner reservation")
 	}
 	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation, oldAck.ack.ReservationID)))
-	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != (proto.TargetID{}) || !pending {
+	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != fixture.targetA || !pending {
 		t.Fatalf("delayed old COMMIT changed new pending state: generation=%d selection=%x pending=%v", generation, selection, pending)
 	}
 	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {

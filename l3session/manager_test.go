@@ -158,6 +158,7 @@ func TestManagerRecordsSessionPathSelectionAndMigrations(t *testing.T) {
 	if err := manager.HandlePacket(context.Background(), l3ingress.PacketEvent{
 		Meta:     l3ingress.PacketMeta{Identity: id},
 		Flow:     snapshot.Flow,
+		Ref:      snapshot.Ref,
 		Decision: decision,
 		Decided:  true,
 	}); err != nil {
@@ -203,6 +204,131 @@ func TestManagerRecordsSessionPathSelectionAndMigrations(t *testing.T) {
 			t.Fatalf("snapshot after migrate=%+v ok=%v", snapshot, ok)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManagerStaleSessionTeardownCannotDeleteReplacement(t *testing.T) {
+	id := testIdentity(l3ingress.ProtocolTCP)
+	oldConn := &fakeConn{}
+	newConn := &fakeConn{}
+	oldSession := &Session{
+		Request: l3ingress.SessionRequest{
+			Identity: id,
+			Ref:      l3ingress.FlowRef{Identity: id, Generation: 1},
+		},
+		Conn: oldConn,
+	}
+	newSession := &Session{
+		Request: l3ingress.SessionRequest{
+			Identity: id,
+			Ref:      l3ingress.FlowRef{Identity: id, Generation: 2},
+		},
+		Conn: newConn,
+	}
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
+
+	if err := manager.CloseSession(oldSession); err != nil {
+		t.Fatal(err)
+	}
+	current, ok := manager.Session(id)
+	if !ok || current != newSession {
+		t.Fatalf("stale teardown removed replacement: current=%p ok=%v", current, ok)
+	}
+	if oldConn.closed.Load() != 1 || newConn.closed.Load() != 0 {
+		t.Fatalf("close counts old/new=%d/%d", oldConn.closed.Load(), newConn.closed.Load())
+	}
+	if closed, err := manager.CloseRef(oldSession.Request.Ref); err != nil || closed {
+		t.Fatalf("stale CloseRef closed=%v err=%v", closed, err)
+	}
+	if closed, err := manager.CloseRef(newSession.Request.Ref); err != nil || !closed {
+		t.Fatalf("current CloseRef closed=%v err=%v", closed, err)
+	}
+	if _, ok := manager.Session(id); ok || newConn.closed.Load() != 1 {
+		t.Fatalf("current session remained after CloseRef: present=%v closes=%d", ok, newConn.closed.Load())
+	}
+	if err := newSession.Close(); err != nil || newConn.closed.Load() != 1 {
+		t.Fatalf("Session.Close was not idempotent: err=%v closes=%d", err, newConn.closed.Load())
+	}
+}
+
+func TestManagerStaleClosedSnapshotCannotDeleteReplacement(t *testing.T) {
+	id := testIdentity(l3ingress.ProtocolTCP)
+	oldRef := l3ingress.FlowRef{Identity: id, Generation: 1}
+	newRef := l3ingress.FlowRef{Identity: id, Generation: 2}
+	newConn := &fakeConn{}
+	newSession := &Session{
+		Request: l3ingress.SessionRequest{Identity: id, Ref: newRef},
+		Conn:    newConn,
+	}
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
+
+	manager.ObserveFlow(l3ingress.FlowSnapshot{
+		Ref: oldRef, Flow: l3ingress.FlowMeta{L3Identity: id}, Closed: true,
+		CloseReason: l3ingress.FlowCloseTCPFIN,
+	})
+	if current, ok := manager.Session(id); !ok || current != newSession || newConn.closed.Load() != 0 {
+		t.Fatalf("stale snapshot closed replacement: current=%p ok=%v closes=%d", current, ok, newConn.closed.Load())
+	}
+
+	manager.ObserveFlow(l3ingress.FlowSnapshot{
+		Ref: newRef, Flow: l3ingress.FlowMeta{L3Identity: id}, Closed: true,
+		CloseReason: l3ingress.FlowCloseTCPFIN,
+	})
+	if _, ok := manager.Session(id); ok || newConn.closed.Load() != 1 {
+		t.Fatalf("current snapshot did not close replacement: present=%v closes=%d", ok, newConn.closed.Load())
+	}
+}
+
+func TestManagerOnStartFailureCannotDeleteConcurrentReplacement(t *testing.T) {
+	ln := newTestStreamSessionListener(t, "tcp")
+	defer ln.Close()
+
+	accepted := make(chan rendr.Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := ln.AcceptStream(ctx)
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	id := testIdentity(l3ingress.ProtocolTCP)
+	ref := l3ingress.FlowRef{Identity: id, Generation: 1}
+	replacementConn := &fakeConn{}
+	replacement := &Session{
+		Request: l3ingress.SessionRequest{
+			Identity: id,
+			Ref:      l3ingress.FlowRef{Identity: id, Generation: 2},
+		},
+		Conn: replacementConn,
+	}
+	startErr := errors.New("injected OnStart failure")
+	manager := &Manager{}
+	manager.OnStart = func(_ context.Context, _ *Session) error {
+		manager.mu.Lock()
+		manager.sessions[id] = replacement
+		manager.mu.Unlock()
+		return startErr
+	}
+	event := l3ingress.PacketEvent{
+		Meta: l3ingress.PacketMeta{Identity: id},
+		Flow: l3ingress.FlowMeta{L3Identity: id}, Ref: ref, Decided: true,
+		Decision: l3ingress.FlowDecision{
+			Peer: "peer-a", Egress: "direct",
+			Root: rendr.Path("tcp", rendr.PathSpec{Transport: "tcp", Address: ln.Addr().String()}),
+		},
+	}
+	if err := manager.HandlePacket(context.Background(), event); !errors.Is(err, startErr) {
+		t.Fatalf("HandlePacket error=%v want %v", err, startErr)
+	}
+	server := <-accepted
+	defer server.Close()
+	if current, ok := manager.Session(id); !ok || current != replacement || replacementConn.closed.Load() != 0 {
+		t.Fatalf("OnStart cleanup deleted replacement: current=%p ok=%v closes=%d", current, ok, replacementConn.closed.Load())
+	}
+	if err := manager.CloseAll(); err != nil || replacementConn.closed.Load() != 1 {
+		t.Fatalf("CloseAll err=%v replacement closes=%d", err, replacementConn.closed.Load())
 	}
 }
 

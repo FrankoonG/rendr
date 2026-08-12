@@ -85,7 +85,9 @@ type StreamFactory struct {
 	Carrier CarrierFamily
 	// Dial receives PathSpec.Address and must honor context cancellation. The
 	// returned connection must be an ordered byte stream terminating at the
-	// same rendr peer as every other leaf in the session.
+	// same rendr peer as every other leaf in the session. Its Close method must
+	// return promptly and unblock concurrent I/O; rendr closes a late or
+	// conflicting result before retrying.
 	Dial func(context.Context, string) (net.Conn, error)
 }
 
@@ -95,7 +97,9 @@ type PacketFactory struct {
 	Carrier CarrierFamily
 	// Dial receives PathSpec.Address and must honor context cancellation. The
 	// returned connection must preserve datagram boundaries and provide an MTU
-	// sufficient for rendr flow framing plus the application's payload.
+	// sufficient for rendr flow framing plus the application's payload. Its
+	// Close method must return promptly and unblock concurrent I/O; rendr closes
+	// a late or conflicting result before retrying.
 	Dial func(context.Context, string) (net.PacketConn, error)
 }
 

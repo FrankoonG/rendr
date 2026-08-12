@@ -19,6 +19,14 @@ func (e *Engine) SendData(buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if e.sendWriteClosed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	if err := e.acquireApplicationWritePermit(); err != nil {
+		return 0, err
+	}
+	defer e.releaseApplicationWritePermit()
+	runtime := e.localExecutionRuntime()
 	sent := 0
 	for sent < len(buf) {
 		end := sent + MaxPayload
@@ -26,12 +34,31 @@ func (e *Engine) SendData(buf []byte) (int, error) {
 			end = len(buf)
 		}
 		chunk := buf[sent:end]
-		if err := e.sendFrame(proto.FrameData, 0, chunk); err != nil {
+		published, err := e.sendApplicationDataFrameDirect(chunk, runtime)
+		if published {
+			sent = end
+		}
+		if err != nil {
 			return sent, err
 		}
-		sent = end
 	}
 	return sent, nil
+}
+
+// SendStreamFin closes only the local stream write direction. The FIN shares
+// the DATA sequencer and replay ledger, so the peer cannot observe EOF before
+// every preceding byte. The reverse stream remains usable until full Close.
+func (e *Engine) SendStreamFin() error {
+	if e.packetized {
+		return ErrStreamHalfCloseUnsupported
+	}
+	e.streamFinOnce.Do(func() {
+		e.sendWriteClosed.Store(true)
+		e.streamFinErr = e.sendFrame(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlStreamFin), nil)
+		close(e.streamFinDone)
+	})
+	<-e.streamFinDone
+	return e.streamFinErr
 }
 
 // SendPacket emits exactly one DATA frame carrying buf as payload.
@@ -43,17 +70,46 @@ func (e *Engine) SendData(buf []byte) (int, error) {
 // Hard rule #1 still applies: a migration in flight blocks SendPacket
 // but never surfaces a migration-class error.
 func (e *Engine) SendPacket(buf []byte) error {
+	_, err := e.SendPacketResult(buf)
+	return err
+}
+
+// SendPacketResult reports whether the complete datagram entered the replay
+// ledger before an error. It lets net.PacketConn preserve atomic n semantics:
+// callers observe either zero or the complete datagram length, never a prefix.
+func (e *Engine) SendPacketResult(buf []byte) (bool, error) {
 	if len(buf) > MaxPayload {
-		return ErrPacketTooLarge
+		return false, ErrPacketTooLarge
 	}
-	return e.sendFrame(proto.FrameData, 0, buf)
+	if e.sendWriteClosed.Load() {
+		return false, io.ErrClosedPipe
+	}
+	return e.sendPacketDataFrameConcurrent(buf, e.localExecutionRuntime(), false)
+}
+
+// SendPacketAcceptedResult is the net.PacketConn send path. When a flat
+// selector's active transport supports whole-frame batching and no write
+// deadline is installed, success means the immutable datagram entered the
+// engine's bounded replay and path-dispatch custody. Peer ACK, not local queue
+// admission, releases that custody. Other graph shapes and deadline-bearing
+// writes retain synchronous physical-dispatch semantics.
+func (e *Engine) SendPacketAcceptedResult(buf []byte) (bool, error) {
+	if len(buf) > MaxPayload {
+		return false, ErrPacketTooLarge
+	}
+	if e.sendWriteClosed.Load() {
+		return false, io.ErrClosedPipe
+	}
+	return e.sendPacketDataFrameConcurrent(buf, e.localExecutionRuntime(), true)
 }
 
 // SendBye emits the final sequenced frame. It shares the same sequencer as
 // DATA so a concurrent successful Write is always ordered before the final
 // sequence number and the receiver cannot observe an early clean EOF.
 func (e *Engine) SendBye(reason proto.ByeReason) error {
+	e.sessionEpochMu.Lock()
 	e.sendClosing.Store(true)
+	e.sessionEpochMu.Unlock()
 	e.terminalOnce.Do(func() {
 		e.terminalErr = e.sendTerminalFrame(reason)
 		close(e.terminalDone)
@@ -77,19 +133,32 @@ func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byt
 	if e.sendClosing.Load() {
 		return nil, net.ErrClosed
 	}
+	if t == proto.FrameData && e.sendWriteClosed.Load() {
+		return nil, io.ErrClosedPipe
+	}
 	control := t == proto.FrameCtrl
-	if err := e.acquireSendSlot(control); err != nil {
+	frameBytes := proto.HeaderSize + len(payload)
+	if err := e.acquireSendSlot(control, frameBytes); err != nil {
 		return nil, err
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
 	if e.isClosed() || e.sendClosing.Load() {
-		e.releaseSendSlot(control)
+		e.releaseSendSlot(control, frameBytes)
 		return nil, net.ErrClosed
 	}
+	if t == proto.FrameData && e.sendWriteClosed.Load() {
+		e.releaseSendSlot(control, frameBytes)
+		return nil, io.ErrClosedPipe
+	}
 
-	seq := atomic.AddUint64(&e.sendSeq, 1) - 1
+	seq, err := e.allocateSendSequence(false)
+	if err != nil {
+		e.releaseSendSlot(control, frameBytes)
+		e.beginSequenceExhaustionClose()
+		return nil, err
+	}
 	hdr := proto.Header{
 		Version: proto.Version,
 		Type:    t,
@@ -98,20 +167,26 @@ func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byt
 	}
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
-		e.releaseSendSlot(control)
+		e.releaseSendSlot(control, frameBytes)
 		return nil, err
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
-	if err := e.reserveSendFrame(frame); err != nil {
-		e.releaseSendSlot(control)
+	if err := e.reserveOwnedSendFrame(frame); err != nil {
+		e.releaseSendSlot(control, frameBytes)
 		return nil, err
 	}
 	// Publication means the SEQ has a replay owner and may now be observed by
 	// any path. Advancing before dispatch lets a fast race child ACK while a
 	// slower sibling is still inside Write without having that ACK rejected.
 	e.publishSendSeq(seq + 1)
-	err := e.dispatch(frame, true)
+	err = e.dispatch(frame, true)
+	if errors.Is(err, errSelectorCutoverHandoff) {
+		err = nil
+	}
+	if err == nil {
+		e.armTailReplayForFrame(frame, seq+1)
+	}
 	return frame, err
 }
 
@@ -121,7 +196,9 @@ func (e *Engine) replaySequencedFrame(frame []byte) error {
 	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
-	if e.isClosed() || e.sendClosing.Load() {
+	// sendClosing seals the sequencer against new publications, but already
+	// published immutable ledger entries remain replayable until physical close.
+	if e.isClosed() {
 		return net.ErrClosed
 	}
 	return e.dispatchReplayFrameLocked(frame)
@@ -137,7 +214,11 @@ func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
 	if e.isClosed() {
 		return net.ErrClosed
 	}
-	seq := atomic.AddUint64(&e.sendSeq, 1) - 1
+	seq, err := e.allocateSendSequence(true)
+	if err != nil {
+		e.setCloseErr(err)
+		return err
+	}
 	payload := proto.ByePayload{Reason: reason}.Encode()
 	hdr := proto.Header{
 		Version: proto.Version,
@@ -150,20 +231,54 @@ func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
 		return err
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	if err := e.reserveTerminalFrame(frame); err != nil {
+	if err := e.reserveOwnedTerminalFrame(frame); err != nil {
 		return err
 	}
 	e.publishSendSeq(seq + 1)
-	return e.dispatch(frame, true)
+	err = e.dispatch(frame, true)
+	if errors.Is(err, errSelectorCutoverHandoff) {
+		err = nil
+	}
+	if err == nil {
+		e.armTailReplayForFrame(frame, seq+1)
+	}
+	return err
+}
+
+// allocateSendSequence is called only while sendMu is held. MaxSeq is
+// reserved for the unique terminal BYE so every ordinary DATA/CTRL exhaustion
+// has one representable clean-close frame left.
+func (e *Engine) allocateSendSequence(terminal bool) (uint64, error) {
+	next := atomic.LoadUint64(&e.sendSeq)
+	limit := proto.MaxSeq - 1
+	if terminal {
+		limit = proto.MaxSeq
+	}
+	if next > limit {
+		return 0, ErrSequenceExhausted
+	}
+	atomic.StoreUint64(&e.sendSeq, next+1)
+	return next, nil
+}
+
+func (e *Engine) beginSequenceExhaustionClose() {
+	e.sequenceExhaustOnce.Do(func() {
+		e.setCloseErr(ErrSequenceExhausted)
+		// Publish the no-new-work boundary before releasing sendMu. The
+		// terminal allocator is deliberately independent of sendClosing and can
+		// still consume the reserved final sequence from GracefulClose.
+		e.BeginGracefulClose()
+		go func() { _ = e.GracefulClose(proto.ByeNormal) }()
+	})
 }
 
 func (e *Engine) publishSendSeq(next uint64) {
-	for {
-		cur := e.sendPublishedNext.Load()
-		if next <= cur || e.sendPublishedNext.CompareAndSwap(cur, next) {
-			return
-		}
+	e.sendHistMu.Lock()
+	if next > e.sendPublishedNext.Load() {
+		e.sendPublishedNext.Store(next)
+		e.sendHist.generation++
 	}
+	e.sendHistMu.Unlock()
 }
 
 // dispatch writes a fully-built frame on the path(s) appropriate to
@@ -374,21 +489,36 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 	return nil
 }
 
+type replayRequestKind uint8
+
+const (
+	replayRequestFull replayRequestKind = iota + 1
+	replayRequestBounded
+	replayRequestGap
+)
+
 type replayRequest struct {
 	nextSeq uint64
 	target  uint64
-	gap     bool
+	kind    replayRequestKind
 }
 
 func (e *Engine) requestReplay(nextSeq uint64) {
-	e.queueReplay(replayRequest{nextSeq: nextSeq})
+	e.queueReplay(replayRequest{nextSeq: nextSeq, kind: replayRequestFull})
+}
+
+func (e *Engine) requestReplayRange(nextSeq, target uint64) {
+	if target <= nextSeq {
+		return
+	}
+	e.queueReplay(replayRequest{nextSeq: nextSeq, target: target, kind: replayRequestBounded})
 }
 
 func (e *Engine) requestGapReplay(nextSeq uint64) {
 	request := replayRequest{
 		nextSeq: nextSeq,
 		target:  e.sendPublishedNext.Load(),
-		gap:     true,
+		kind:    replayRequestGap,
 	}
 	if request.target <= request.nextSeq {
 		return
@@ -404,16 +534,24 @@ func (e *Engine) queueReplay(request replayRequest) {
 	} else {
 		pending := e.replayPending
 		switch {
-		case !pending.gap:
+		case pending.kind == replayRequestFull:
 			if request.nextSeq < pending.nextSeq {
 				pending.nextSeq = request.nextSeq
 			}
-		case !request.gap:
+		case request.kind == replayRequestFull:
 			if pending.nextSeq < request.nextSeq {
 				request.nextSeq = pending.nextSeq
 			}
 			pending = request
-		default:
+		case pending.kind == replayRequestBounded || request.kind == replayRequestBounded:
+			if request.nextSeq < pending.nextSeq {
+				pending.nextSeq = request.nextSeq
+			}
+			if request.target > pending.target {
+				pending.target = request.target
+			}
+			pending.kind = replayRequestBounded
+		default: // two cumulative-gap requests
 			if request.nextSeq < pending.nextSeq {
 				pending.nextSeq = request.nextSeq
 			}
@@ -476,28 +614,125 @@ func (e *Engine) publishReplayAck(nextSeq uint64, gap bool) bool {
 func (e *Engine) fullReplayPending() bool {
 	e.replayMu.Lock()
 	defer e.replayMu.Unlock()
-	return e.replayPendingSet && !e.replayPending.gap
+	return e.replayPendingSet && e.replayPending.kind != replayRequestGap
 }
 
 func (e *Engine) replayLoop() {
+	var timer *time.Timer
+	stopTimer := func() {
+		if timer == nil || timer.Stop() {
+			return
+		}
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer stopTimer()
+
 	for {
+		if request, ok := e.takeReplayRequest(); ok {
+			switch request.kind {
+			case replayRequestGap:
+				e.replayGapUntilAcknowledged(request.nextSeq, request.target)
+			case replayRequestBounded:
+				e.replayRangeUntilSent(request.nextSeq, request.target)
+			case replayRequestFull:
+				e.replayUntilSent(request.nextSeq)
+			}
+			continue
+		}
+
+		var timerC <-chan time.Time
+		if due, armed := e.tailReplayDue(nowFn()); armed {
+			wait := due.Sub(nowFn())
+			if wait < 0 {
+				wait = 0
+			}
+			stopTimer()
+			if timer == nil {
+				timer = time.NewTimer(wait)
+			} else {
+				timer.Reset(wait)
+			}
+			timerC = timer.C
+		} else {
+			stopTimer()
+		}
+
 		select {
 		case <-e.closed:
 			return
 		case <-e.replayWake:
-		}
-		for {
-			request, ok := e.takeReplayRequest()
-			if !ok {
-				break
-			}
-			if request.gap {
-				e.replayGapUntilAcknowledged(request.nextSeq, request.target)
-			} else {
-				e.replayUntilSent(request.nextSeq)
+		case <-timerC:
+			if target, ok := e.takeTailReplayAttempt(nowFn()); ok {
+				e.replayTailFrame(target)
 			}
 		}
 	}
+}
+
+func (e *Engine) replayRangeUntilSent(nextSeq, target uint64) {
+	backoff := 10 * time.Millisecond
+	for nextSeq < target {
+		if acked := e.sendAckNext.Load(); nextSeq < acked {
+			nextSeq = acked
+		}
+		if nextSeq >= target {
+			return
+		}
+		if hook := e.boundedReplayBeforeSnapshot; hook != nil {
+			hook()
+		}
+		frames := e.sendHistoryRange(nextSeq, target)
+		if len(frames) == 0 {
+			return
+		}
+		if err := e.redistributeFrames(frames); err == nil {
+			if target == e.sendPublishedNext.Load() {
+				e.armTailReplayForFrame(frames[len(frames)-1], target)
+			}
+			return
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-e.closed:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		if backoff < 200*time.Millisecond {
+			backoff *= 2
+		}
+	}
+}
+
+// replayRangeLocked writes a frozen prefix while the caller owns sendMu.
+// Selector cutover uses this path so no newly published sequence can overtake
+// the replay frontier on the replacement carrier.
+func (e *Engine) replayRangeLocked(nextSeq, target uint64) error {
+	if acked := e.sendAckNext.Load(); nextSeq < acked {
+		nextSeq = acked
+	}
+	if nextSeq >= target {
+		return nil
+	}
+	if hook := e.boundedReplayBeforeSnapshot; hook != nil {
+		hook()
+	}
+	frames := e.sendHistoryRange(nextSeq, target)
+	if len(frames) == 0 {
+		return nil
+	}
+	if err := e.redistributeFramesLocked(frames); err != nil {
+		return err
+	}
+	if target == e.sendPublishedNext.Load() {
+		e.armTailReplayForFrame(frames[len(frames)-1], target)
+	}
+	return nil
 }
 
 // replayGapUntilAcknowledged repairs one cumulative gap at a time. Replaying
@@ -594,6 +829,10 @@ func (e *Engine) replayUntilSent(nextSeq uint64) {
 			return
 		}
 		if err := e.redistributeFrames(frames); err == nil {
+			if lastTarget, ok := sequencedFrameTarget(frames[len(frames)-1]); ok &&
+				lastTarget == e.sendPublishedNext.Load() {
+				e.armTailReplayForFrame(frames[len(frames)-1], lastTarget)
+			}
 			return
 		}
 		timer := time.NewTimer(backoff)
@@ -609,6 +848,17 @@ func (e *Engine) replayUntilSent(nextSeq uint64) {
 			backoff *= 2
 		}
 	}
+}
+
+func sequencedFrameTarget(frame []byte) (uint64, bool) {
+	if len(frame) < proto.HeaderSize {
+		return 0, false
+	}
+	hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		return 0, false
+	}
+	return hdr.Seq + 1, true
 }
 
 func (e *Engine) bondWeightsLocked(ids []uint32) ([]uint16, uint64) {

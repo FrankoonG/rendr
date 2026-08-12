@@ -62,10 +62,14 @@ const (
 )
 
 type MobilityStatus struct {
-	ID                 MobilityID
-	State              MobilityState
-	Reason             MobilityReason
-	Fallback           MobilityID
+	ID       MobilityID
+	State    MobilityState
+	Reason   MobilityReason
+	Fallback MobilityID
+	// TransactionID identifies the negotiated leaf mobility transaction whose
+	// state is shown. It is zero for baseline planning without a transaction.
+	// This value is observation only and cannot be used to authorize work.
+	TransactionID      [16]byte
 	EndpointGeneration uint64
 	EvidenceGeneration uint64
 	ObservedAt         time.Time
@@ -152,6 +156,7 @@ func projectLeafMobility(snapshot engine.LeafMobilitySnapshot) MobilityStatus {
 		ID:                 MobilityRedialAttach,
 		State:              MobilityStateBaseline,
 		Reason:             MobilityReasonRouteSourceChanged,
+		TransactionID:      [16]byte(observation.TransactionID),
 		EndpointGeneration: snapshot.Facts.Generation,
 		EvidenceGeneration: observation.EvidenceGeneration,
 		ObservedAt:         observation.ObservedAt,

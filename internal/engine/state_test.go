@@ -68,8 +68,8 @@ func TestLimitsClampImmutableSchedulerBounds(t *testing.T) {
 		},
 		{
 			name: "bond pin capped by replay window",
-			in:   Limits{BondPinSize: sendHistoryWindow + 1},
-			want: Limits{ProbeInterval: time.Second, BondPinSize: sendHistoryWindow},
+			in:   Limits{BondPinSize: maxBondPinFrames + 1},
+			want: Limits{ProbeInterval: time.Second, BondPinSize: maxBondPinFrames},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -84,7 +84,7 @@ func TestLimitsClampImmutableSchedulerBounds(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), configured)
 	t.Cleanup(func() { _ = e.Close() })
 	configured.ProbeInterval = 30 * time.Second
-	configured.BondPinSize = sendHistoryWindow
+	configured.BondPinSize = maxBondPinFrames
 	if e.limits.ProbeInterval != 10*time.Millisecond || e.limits.BondPinSize != 1 {
 		t.Fatalf("engine scheduler limits mutated with caller copy: (%v,%d)", e.limits.ProbeInterval, e.limits.BondPinSize)
 	}

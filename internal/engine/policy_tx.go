@@ -760,6 +760,10 @@ func (e *Engine) InitializePolicySelection(selectorID, targetID proto.TargetID, 
 // with peer-requested commits, so a local decision after PREPARE supersedes the
 // reservation instead of being overwritten by a stale COMMIT.
 func (e *Engine) SelectLocalTarget(selectorID, targetID proto.TargetID, cause string) error {
+	return e.selectLocalTarget(selectorID, targetID, cause, policySelectionExternal)
+}
+
+func (e *Engine) selectLocalTarget(selectorID, targetID proto.TargetID, cause string, origin policySelectionOrigin) error {
 	e.policyOwnerMu.Lock()
 	defer e.policyOwnerMu.Unlock()
 	if e.sendClosing.Load() || e.isClosed() {
@@ -769,10 +773,26 @@ func (e *Engine) SelectLocalTarget(selectorID, targetID proto.TargetID, cause st
 	if err := validatePolicySelection(binding.manifest, selectorID, targetID); err != nil {
 		return err
 	}
+	if e.policySelectionHeldByLeafMobility(selectorID, targetID) {
+		return errPolicySelectionLeafMobilityHeld
+	}
+	cutoverGeneration := uint64(0)
+	if origin.requiresSelectorCutover() {
+		cutoverGeneration = e.beginSelectorCutover()
+		defer e.finishSelectorCutover(cutoverGeneration)
+	}
 	e.policyStateMu.Lock()
-	if e.policySelections[selectorID] == targetID {
+	sameTarget := e.policySelections[selectorID] == targetID
+	pendingSameSelector := e.policyIncoming != nil && e.policyIncoming.prepare.SelectorID == selectorID
+	if sameTarget && !pendingSameSelector {
 		e.policyStateMu.Unlock()
-		return nil
+		// The logical target can remain selected while its former physical
+		// incarnation dies and later reattaches with a new path ID. Re-project
+		// the same selection against current attachments so explicit migration
+		// and G5 recovery can activate that incarnation without inventing a new
+		// policy generation. If the physical projection is unchanged,
+		// setDispatchPolicyAndSelection remains a true no-op.
+		return e.applyPolicySelectionFromGraphOrigin(binding, selectorID, targetID, cause, origin, cutoverGeneration)
 	}
 	if e.policyGeneration == ^uint64(0) {
 		e.policyStateMu.Unlock()
@@ -780,7 +800,7 @@ func (e *Engine) SelectLocalTarget(selectorID, targetID proto.TargetID, cause st
 	}
 	base := e.policyGeneration
 	e.policyStateMu.Unlock()
-	if err := e.applyPolicySelectionFromGraph(binding, selectorID, targetID, cause); err != nil {
+	if err := e.applyPolicySelectionFromGraphOrigin(binding, selectorID, targetID, cause, origin, cutoverGeneration); err != nil {
 		return err
 	}
 	e.policyStateMu.Lock()
@@ -795,6 +815,16 @@ func (e *Engine) SelectLocalTarget(selectorID, targetID proto.TargetID, cause st
 }
 
 func (e *Engine) applyPolicySelectionFromGraph(binding graphBinding, selectorID, targetID proto.TargetID, cause string) error {
+	return e.applyPolicySelectionFromGraphOrigin(binding, selectorID, targetID, cause, policySelectionExternal, 0)
+}
+
+func (e *Engine) applyPolicySelectionFromGraphOrigin(
+	binding graphBinding,
+	selectorID, targetID proto.TargetID,
+	cause string,
+	origin policySelectionOrigin,
+	cutoverGeneration uint64,
+) error {
 	if !binding.configured {
 		return fmt.Errorf("engine: local graph is not configured")
 	}
@@ -807,6 +837,9 @@ func (e *Engine) applyPolicySelectionFromGraph(binding graphBinding, selectorID,
 	}
 	if err := runtime.plan.validateImmediateChild(selectorID, targetID); err != nil {
 		return err
+	}
+	if e.policySelectionHeldByLeafMobility(selectorID, targetID) {
+		return errPolicySelectionLeafMobilityHeld
 	}
 	target, _ := binding.manifest.Node(targetID)
 	kind := proto.ExecutionKindSelector
@@ -842,7 +875,7 @@ func (e *Engine) applyPolicySelectionFromGraph(binding graphBinding, selectorID,
 	if len(scope) == 0 {
 		return fmt.Errorf("engine: selected target has no attached path")
 	}
-	return e.setDispatchPolicyAndSelection(kind, scope[0], scope, cause, runtime, selectorID, targetID)
+	return e.setDispatchPolicyAndSelection(kind, scope[0], scope, cause, runtime, selectorID, targetID, origin, cutoverGeneration)
 }
 
 func collectGraphLeafNames(manifest proto.GraphManifest, id proto.TargetID, names *[]string) error {

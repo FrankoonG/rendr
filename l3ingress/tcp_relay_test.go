@@ -19,7 +19,10 @@ func TestTCPFlowRelayDispatchesIdentityAndBridgesStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app, endpoint := net.Pipe()
+	app, endpoint, err := newTestTCPConnPair()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer app.Close()
 	relay := &TCPFlowRelay{Egresses: reg}
 	errCh := make(chan error, 1)
@@ -31,8 +34,8 @@ func TestTCPFlowRelayDispatchesIdentityAndBridgesStream(t *testing.T) {
 		t.Fatalf("egress id=%+v want %+v", got, id)
 	}
 	go func() {
-		buf := make([]byte, 5)
-		if _, err := io.ReadFull(egressSide, buf); err != nil {
+		buf, err := io.ReadAll(egressSide)
+		if err != nil {
 			t.Errorf("egress read: %v", err)
 			return
 		}
@@ -43,9 +46,15 @@ func TestTCPFlowRelayDispatchesIdentityAndBridgesStream(t *testing.T) {
 		if _, err := egressSide.Write([]byte("world")); err != nil {
 			t.Errorf("egress write: %v", err)
 		}
+		if err := egressSide.CloseWrite(); err != nil {
+			t.Errorf("egress CloseWrite: %v", err)
+		}
 	}()
 
 	if _, err := app.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, 5)
@@ -54,6 +63,9 @@ func TestTCPFlowRelayDispatchesIdentityAndBridgesStream(t *testing.T) {
 	}
 	if string(got) != "world" {
 		t.Fatalf("app read %q want world", got)
+	}
+	if _, err := app.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("app read after response=%v, want EOF", err)
 	}
 	app.Close()
 	select {
@@ -75,7 +87,10 @@ func TestTCPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 	}
 	relay := &TCPFlowRelay{Egresses: reg}
 
-	app, endpoint := net.Pipe()
+	app, endpoint, err := newTestTCPConnPair()
+	if err != nil {
+		t.Fatal(err)
+	}
 	errCh1 := make(chan error, 1)
 	go func() { errCh1 <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint) }()
 	egressSide := egress.waitConn(t)
@@ -91,7 +106,10 @@ func TestTCPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 		t.Fatal("timed out waiting for first relay shutdown")
 	}
 
-	app2, endpoint2 := net.Pipe()
+	app2, endpoint2, err := newTestTCPConnPair()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer app2.Close()
 	errCh2 := make(chan error, 1)
 	go func() { errCh2 <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint2) }()
@@ -171,15 +189,18 @@ func tcpFlowRelayEvent(id L3Identity) PacketEvent {
 type tcpRelayEgress struct {
 	mu    sync.Mutex
 	id    L3Identity
-	conns chan net.Conn
+	conns chan TCPConn
 	n     int
 }
 
-func (e *tcpRelayEgress) DialTCP(_ context.Context, id L3Identity) (net.Conn, error) {
-	local, remote := net.Pipe()
+func (e *tcpRelayEgress) DialTCP(_ context.Context, id L3Identity) (TCPConn, error) {
+	local, remote, err := newTestTCPConnPair()
+	if err != nil {
+		return nil, err
+	}
 	e.mu.Lock()
 	if e.conns == nil {
-		e.conns = make(chan net.Conn, 4)
+		e.conns = make(chan TCPConn, 4)
 	}
 	e.id = id
 	e.n++
@@ -189,15 +210,50 @@ func (e *tcpRelayEgress) DialTCP(_ context.Context, id L3Identity) (net.Conn, er
 	return local, nil
 }
 
+func newTestTCPConnPair() (TCPConn, TCPConn, error) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, nil, err
+	}
+	accepted := make(chan *net.TCPConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		_ = listener.Close()
+		return nil, nil, err
+	}
+	select {
+	case server := <-accepted:
+		_ = listener.Close()
+		return client, server, nil
+	case err := <-acceptErr:
+		_ = client.Close()
+		_ = listener.Close()
+		return nil, nil, err
+	case <-time.After(time.Second):
+		_ = client.Close()
+		_ = listener.Close()
+		return nil, nil, errors.New("timed out accepting test TCP connection")
+	}
+}
+
 func (e *tcpRelayEgress) DialUDP(context.Context, L3Identity) (net.PacketConn, netip.AddrPort, error) {
 	return nil, netip.AddrPort{}, errors.New("tcp-only egress")
 }
 
-func (e *tcpRelayEgress) waitConn(t *testing.T) net.Conn {
+func (e *tcpRelayEgress) waitConn(t *testing.T) TCPConn {
 	t.Helper()
 	e.mu.Lock()
 	if e.conns == nil {
-		e.conns = make(chan net.Conn, 4)
+		e.conns = make(chan TCPConn, 4)
 	}
 	conns := e.conns
 	e.mu.Unlock()

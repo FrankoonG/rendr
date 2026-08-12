@@ -10,6 +10,7 @@ import (
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
+	"github.com/FrankoonG/rendr/virtualif"
 )
 
 // sessionDialer freezes one Runtime and SessionConfig into the internal
@@ -353,8 +354,14 @@ func (d *sessionDialer) dialInitialPath(
 			e.SetPacketMode()
 		}
 		tracker.set(i, PathHandshaking, nil)
-		admission, err := engine.PerformClientHelloAdmissionContext(ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps)
+		admission, err := engine.PerformClientHelloAdmissionContext(
+			ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps,
+			func(ack proto.HelloAckPayload) error { return d.validatePeerSessionCaps(ack.Caps) },
+		)
 		if err != nil {
+			if d.PreserveL3Identity && errors.Is(err, engine.ErrPathAdmissionRejected) {
+				err = errors.Join(d.validatePeerSessionCaps(0), err)
+			}
 			_ = pc.Close()
 			_ = e.Close()
 			state := pathStateForHandshakeError(err)
@@ -427,6 +434,16 @@ func (d *sessionDialer) helloCaps(packetMode bool) uint32 {
 		caps |= proto.CapsL3Identity
 	}
 	return caps
+}
+
+func (d *sessionDialer) validatePeerSessionCaps(peerCaps uint32) error {
+	if !d.PreserveL3Identity || peerCaps&proto.CapsL3Identity != 0 {
+		return nil
+	}
+	return &virtualif.Error{
+		Op:     "l3 identity capability",
+		Reason: virtualif.ReasonPeerL3IdentityUnsupported,
+	}
 }
 
 // engineLimits packs the session knobs into engine.Limits. The

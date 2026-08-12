@@ -14,7 +14,6 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +34,7 @@ const (
 
 func TestPrivilegedTUNRealIPv4IPv6IO(t *testing.T) {
 	requireRealTUNTest(t)
+	resourcesBefore := sampleKernel5TUNResources(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	features, err := platform.Detect(ctx)
@@ -57,27 +57,44 @@ func TestPrivilegedTUNRealIPv4IPv6IO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer device.Close()
+	t.Cleanup(func() { _ = device.Close() })
 	if device.QueueCount() != 1 || device.MTU() != mtu {
 		t.Fatalf("device queues/mtu=%d/%d want 1/%d", device.QueueCount(), device.MTU(), mtu)
 	}
+	flags, err := unix.FcntlInt(uintptr(device.fds[0]), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatalf("read TUN fd flags: %v", err)
+	}
+	if flags&unix.O_NONBLOCK == 0 {
+		t.Fatalf("TUN fd flags=0x%x missing O_NONBLOCK", flags)
+	}
+	deviceEvidence := captureKernel5TUNDevice(t, device)
+	kernelToTUN := newTUNPayloadAccumulator()
+	tunToKernel := newTUNPayloadAccumulator()
+	shortBufferSignals := 0
+	oversizeRejections := 0
 	assertTUNOpenIsExclusive(t, device)
 	if _, err := device.ReadContext(ctx, make([]byte, mtu-1)); !errors.Is(err, io.ErrShortBuffer) {
 		t.Fatalf("undersized packet buffer error=%v want io.ErrShortBuffer", err)
 	}
+	shortBufferSignals++
 	if _, err := device.Write(make([]byte, mtu+1)); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("oversized raw packet error=%v want EMSGSIZE", err)
 	}
+	oversizeRejections++
 	runIP(t, "link", "set", "dev", device.Name(), "up")
 	ipv4Prefix := netip.MustParsePrefix("198.18.96.1/30")
 	ipv6Prefix := netip.MustParsePrefix("fd00:72:1::1/126")
 	runIP(t, "addr", "add", ipv4Prefix.String(), "dev", device.Name())
 	assertTUNInterfaceState(t, device, mtu, ipv4Prefix)
-	assertReadDoesNotSilentlyTruncate(t, device,
+	replayed := assertReadDoesNotSilentlyTruncate(t, device,
 		netip.MustParseAddr("198.18.96.1"), netip.MustParseAddr("198.18.96.2"), 1400)
+	kernelToTUN.addTransfer(replayed)
+	shortBufferSignals++
 	runIP(t, "-6", "addr", "add", ipv6Prefix.String(), "dev", device.Name(), "nodad")
 	assertTUNInterfaceState(t, device, mtu, ipv4Prefix, ipv6Prefix)
 
+	exactMTUPackets := make([]int, 0, 2)
 	for _, test := range []struct {
 		name    string
 		network string
@@ -88,24 +105,55 @@ func TestPrivilegedTUNRealIPv4IPv6IO(t *testing.T) {
 		{name: "ipv6", network: "udp6", local: netip.MustParseAddr("fd00:72:1::1"), remote: netip.MustParseAddr("fd00:72:1::2")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			assertKernelToTUNUDP(t, device, test.network, test.local, test.remote, []byte("kernel-to-tun-"+test.name))
-			assertTUNToKernelUDP(t, device, test.network, test.local, test.remote, []byte("tun-to-kernel-"+test.name))
+			kernelToTUN.addTransfer(assertKernelToTUNUDP(
+				t, device, test.network, test.local, test.remote, []byte("kernel-to-tun-"+test.name),
+			))
+			tunToKernel.addTransfer(assertTUNToKernelUDP(
+				t, device, test.network, test.local, test.remote, []byte("tun-to-kernel-"+test.name),
+			))
 			headerBytes := 28
 			if test.local.Is6() {
 				headerBytes = 48
 			}
 			boundary := bytes.Repeat([]byte{byte(device.MTU() % 251)}, device.MTU()-headerBytes)
-			packet := assertKernelToTUNUDP(t, device, test.network, test.local, test.remote, boundary)
-			if len(packet) != device.MTU() {
-				t.Fatalf("MTU boundary packet=%d want=%d", len(packet), device.MTU())
+			transfer := assertKernelToTUNUDP(t, device, test.network, test.local, test.remote, boundary)
+			kernelToTUN.addTransfer(transfer)
+			if transfer.packetBytes != device.MTU() {
+				t.Fatalf("MTU boundary packet=%d want=%d", transfer.packetBytes, device.MTU())
 			}
+			exactMTUPackets = append(exactMTUPackets, transfer.packetBytes)
 			assertKernelRejectsOversizeUDP(t, device, test.network, test.local, test.remote, len(boundary)+1)
+			oversizeRejections++
 		})
 	}
+	deviceName := device.Name()
+	if err := device.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitTUNInterfaceGone(t, deviceName)
+	resourcesAfter := sampleKernel5TUNResources(t)
+	emitKernel5TUNEvidence(t, kernel5TUNEvidence{
+		RecordType: kernel5TUNRecordRealIO,
+		TestName:   "TestPrivilegedTUNRealIPv4IPv6IO",
+		Devices:    []kernel5TUNDeviceEvidence{deviceEvidence},
+		Directions: kernel5TUNDirectionsEvidence{
+			KernelToTUN: kernelToTUN.evidence(), TUNToKernel: tunToKernel.evidence(),
+		},
+		Boundaries: kernel5TUNBoundaryEvidence{
+			ExactMTUPacketBytes: exactMTUPackets, OversizeRejections: oversizeRejections,
+			ShortBufferSignals: shortBufferSignals, ReplayedPacketBytes: []int{replayed.packetBytes},
+		},
+		QueuePacketCounts: []int{}, QueueDeviceCycles: []int{}, PublicWriteQueueCalls: []int{},
+		Lifecycle: kernel5TUNLifecycleEvidence{
+			CyclesRequested: 1, CyclesCompleted: 1, InterfacesRemoved: 1,
+			Before: resourcesBefore, After: resourcesAfter,
+		},
+	})
 }
 
 func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 	requireRealTUNTest(t)
+	resourcesBefore := sampleKernel5TUNResources(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	features, err := platform.Detect(ctx)
@@ -121,7 +169,7 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer device.Close()
+	t.Cleanup(func() { _ = device.Close() })
 	if device.QueueCount() != 2 {
 		t.Fatalf("queue count=%d want=2", device.QueueCount())
 	}
@@ -130,13 +178,17 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 	prefix := netip.MustParsePrefix("198.18.97.1/24")
 	runIP(t, "addr", "add", prefix.String(), "dev", device.Name())
 	assertTUNInterfaceState(t, device, 1400, prefix)
+	deviceEvidence := captureKernel5TUNDevice(t, device)
+	kernelToTUN := newTUNPayloadAccumulator()
+	tunToKernel := newTUNPayloadAccumulator()
 
 	const packets = 256
 	local := netip.MustParseAddr("198.18.97.1")
 	remote := netip.MustParseAddr("198.18.97.2")
-	assertKernelToTUNUDP(t, device, "udp4", local, remote, []byte("aggregate-device-read"))
-	assertPublicTUNWriteSequence(t, device, local, remote)
-	assertEachTUNQueueToKernelUDP(t, device, local, remote)
+	kernelToTUN.addTransfer(assertKernelToTUNUDP(t, device, "udp4", local, remote, []byte("aggregate-device-read")))
+	publicWriteBatch, publicWriteQueueCalls := assertPublicTUNWriteSequence(t, device, local, remote)
+	tunToKernel.addBatch(publicWriteBatch)
+	tunToKernel.addBatch(assertEachTUNQueueToKernelUDP(t, device, local, remote))
 	readCtx, stopReaders := context.WithCancel(ctx)
 	observed := make(chan tunQueueObservation, packets*2)
 	errorsCh := make(chan error, 2)
@@ -151,6 +203,7 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 
 	connections := make([]*net.UDPConn, packets)
 	defer closeUDPConnections(connections)
+	distributionBatch := tunPayloadBatch{offered: make([][]byte, packets), observed: make([][]byte, packets)}
 	for sequence := 0; sequence < packets; sequence++ {
 		conn, err := net.DialUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(local, 0)),
 			net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 49000)))
@@ -163,6 +216,7 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 		payload := make([]byte, 8)
 		copy(payload, "RMQ1")
 		binary.BigEndian.PutUint32(payload[4:], uint32(sequence))
+		distributionBatch.offered[sequence] = append([]byte(nil), payload...)
 		if _, err := conn.Write(payload); err != nil {
 			stopReaders()
 			readers.Wait()
@@ -170,20 +224,34 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 		}
 	}
 
-	seen := make(map[uint32]int, packets)
+	seen := make(map[uint32]tunQueueObservation, packets)
 	counts := make([]int, device.QueueCount())
+	sequenceFirst := ^uint32(0)
+	var sequenceLast uint32
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	for len(seen) < packets {
 		select {
 		case got := <-observed:
+			if got.sequence >= packets {
+				stopReaders()
+				readers.Wait()
+				t.Fatalf("multiqueue sequence %d is outside [0,%d)", got.sequence, packets)
+			}
 			if previous, duplicate := seen[got.sequence]; duplicate {
 				stopReaders()
 				readers.Wait()
-				t.Fatalf("sequence %d observed on queues %d and %d", got.sequence, previous, got.queue)
+				t.Fatalf("sequence %d observed on queues %d and %d", got.sequence, previous.queue, got.queue)
 			}
-			seen[got.sequence] = got.queue
+			seen[got.sequence] = got
+			distributionBatch.observed[int(got.sequence)] = append([]byte(nil), got.payload...)
 			counts[got.queue]++
+			if got.sequence < sequenceFirst {
+				sequenceFirst = got.sequence
+			}
+			if got.sequence > sequenceLast {
+				sequenceLast = got.sequence
+			}
 		case err := <-errorsCh:
 			stopReaders()
 			readers.Wait()
@@ -199,26 +267,60 @@ func TestPrivilegedTUNMultiQueueDistributesRealPackets(t *testing.T) {
 	if counts[0] == 0 || counts[1] == 0 {
 		t.Fatalf("kernel did not distribute packets across both queues: %v", counts)
 	}
+	kernelToTUN.addBatch(distributionBatch)
 	representatives := make([]*net.UDPConn, device.QueueCount())
-	for sequence, queue := range seen {
-		if representatives[queue] == nil {
-			representatives[queue] = connections[sequence]
+	for sequence, observation := range seen {
+		if representatives[observation.queue] == nil {
+			representatives[observation.queue] = connections[sequence]
 		}
 	}
-	assertPublicTUNReadAcrossQueues(t, device, representatives, local, remote)
+	kernelToTUN.addBatch(assertPublicTUNReadAcrossQueues(t, device, representatives, local, remote))
+	closeUDPConnections(connections)
+	deviceName := device.Name()
+	if err := device.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitTUNInterfaceGone(t, deviceName)
+	resourcesAfter := sampleKernel5TUNResources(t)
+	emitKernel5TUNEvidence(t, kernel5TUNEvidence{
+		RecordType: kernel5TUNRecordMultiQueue,
+		TestName:   "TestPrivilegedTUNMultiQueueDistributesRealPackets",
+		Devices:    []kernel5TUNDeviceEvidence{deviceEvidence},
+		Directions: kernel5TUNDirectionsEvidence{
+			KernelToTUN: kernelToTUN.evidence(), TUNToKernel: tunToKernel.evidence(),
+		},
+		Boundaries: kernel5TUNBoundaryEvidence{
+			ExactMTUPacketBytes: []int{}, ReplayedPacketBytes: []int{},
+			SequenceFirst: sequenceFirst, SequenceLast: sequenceLast, SequenceCount: len(seen),
+		},
+		QueuePacketCounts:     append([]int(nil), counts...),
+		QueueDeviceCycles:     []int{},
+		PublicWriteQueueCalls: append([]int(nil), publicWriteQueueCalls...),
+		Lifecycle: kernel5TUNLifecycleEvidence{
+			CyclesRequested: 1, CyclesCompleted: 1, InterfacesRemoved: 1,
+			Before: resourcesBefore, After: resourcesAfter,
+		},
+	})
 }
 
 func TestPrivilegedTUNDeviceLifecycleIsBounded(t *testing.T) {
 	requireRealTUNTest(t)
-	baselineFDs := countOpenFDs(t)
-	baselineGoroutines := runtime.NumGoroutine()
+	resourcesBefore := sampleKernel5TUNResources(t)
 	const cycles = 100
+	devices := make([]kernel5TUNDeviceEvidence, 0, cycles)
+	queueCycles := []int{0, 0}
+	completedCycles := 0
+	interfacesRemoved := 0
+	canceledReads := 0
+	closeUnblockedReads := 0
 	for cycle := 0; cycle < cycles; cycle++ {
 		queues := 1 + cycle%2
 		device, err := Open(Config{Enabled: true, Name: "rndrl%d", MTU: 1400, Queues: queues})
 		if err != nil {
 			t.Fatalf("cycle %d open: %v", cycle, err)
 		}
+		devices = append(devices, captureKernel5TUNDevice(t, device))
+		queueCycles[queues-1]++
 		name := device.Name()
 		if cycle == 0 {
 			pollEntered := observeNextPoll(device)
@@ -240,6 +342,7 @@ func TestPrivilegedTUNDeviceLifecycleIsBounded(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("cycle %d canceled read error=%v want context.Canceled", cycle, err)
 				}
+				canceledReads++
 			case <-time.After(time.Second):
 				t.Fatal("ReadContext did not observe cancellation")
 			}
@@ -270,6 +373,7 @@ func TestPrivilegedTUNDeviceLifecycleIsBounded(t *testing.T) {
 				if !errors.Is(err, os.ErrClosed) {
 					t.Fatalf("blocked read error=%v want os.ErrClosed", err)
 				}
+				closeUnblockedReads++
 			case <-time.After(time.Second):
 				t.Fatal("Device.Close did not release blocked Read")
 			}
@@ -285,19 +389,36 @@ func TestPrivilegedTUNDeviceLifecycleIsBounded(t *testing.T) {
 			}
 		}
 		waitTUNInterfaceGone(t, name)
+		interfacesRemoved++
+		completedCycles++
 	}
-	runtime.GC()
-	if current := countOpenFDs(t); current > baselineFDs+2 {
-		t.Fatalf("TUN fd slope baseline=%d current=%d", baselineFDs, current)
+	resourcesAfter := sampleKernel5TUNResources(t)
+	if resourcesAfter.OpenFDs > resourcesBefore.OpenFDs+2 {
+		t.Fatalf("TUN fd slope baseline=%d current=%d", resourcesBefore.OpenFDs, resourcesAfter.OpenFDs)
 	}
-	if current := runtime.NumGoroutine(); current > baselineGoroutines+2 {
-		t.Fatalf("TUN goroutine slope baseline=%d current=%d", baselineGoroutines, current)
+	if resourcesAfter.Goroutines > resourcesBefore.Goroutines+2 {
+		t.Fatalf("TUN goroutine slope baseline=%d current=%d", resourcesBefore.Goroutines, resourcesAfter.Goroutines)
 	}
+	emptyDirection := newTUNPayloadAccumulator().evidence()
+	emitKernel5TUNEvidence(t, kernel5TUNEvidence{
+		RecordType:        kernel5TUNRecordLifecycle,
+		TestName:          "TestPrivilegedTUNDeviceLifecycleIsBounded",
+		Devices:           devices,
+		Directions:        kernel5TUNDirectionsEvidence{KernelToTUN: emptyDirection, TUNToKernel: emptyDirection},
+		Boundaries:        kernel5TUNBoundaryEvidence{ExactMTUPacketBytes: []int{}, ReplayedPacketBytes: []int{}},
+		QueuePacketCounts: []int{}, QueueDeviceCycles: queueCycles, PublicWriteQueueCalls: []int{},
+		Lifecycle: kernel5TUNLifecycleEvidence{
+			CyclesRequested: cycles, CyclesCompleted: completedCycles, InterfacesRemoved: interfacesRemoved,
+			CanceledReads: canceledReads, CloseUnblockedReads: closeUnblockedReads,
+			Before: resourcesBefore, After: resourcesAfter,
+		},
+	})
 }
 
 type tunQueueObservation struct {
 	queue    int
 	sequence uint32
+	payload  []byte
 }
 
 func requireRealTUNTest(t testing.TB) {
@@ -345,7 +466,7 @@ func assertTUNOpenIsExclusive(t testing.TB, device *Device) {
 	}
 }
 
-func assertKernelToTUNUDP(t testing.TB, device *Device, network string, local, remote netip.Addr, payload []byte) []byte {
+func assertKernelToTUNUDP(t testing.TB, device *Device, network string, local, remote netip.Addr, payload []byte) tunPayloadTransfer {
 	t.Helper()
 	conn, err := net.DialUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(local, 0)),
 		net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 48000)))
@@ -372,7 +493,9 @@ func assertKernelToTUNUDP(t testing.TB, device *Device, network string, local, r
 	if !bytes.Equal(got, payload) || len(packet) > device.MTU() {
 		t.Fatalf("kernel->TUN payload=%x want=%x packet=%d mtu=%d", got, payload, len(packet), device.MTU())
 	}
-	return packet
+	return tunPayloadTransfer{
+		offered: append([]byte(nil), payload...), observed: append([]byte(nil), got...), packetBytes: len(packet),
+	}
 }
 
 func assertKernelRejectsOversizeUDP(
@@ -412,7 +535,7 @@ func assertKernelRejectsOversizeUDP(
 	}
 }
 
-func assertTUNToKernelUDP(t testing.TB, device *Device, network string, local, remote netip.Addr, payload []byte) {
+func assertTUNToKernelUDP(t testing.TB, device *Device, network string, local, remote netip.Addr, payload []byte) tunPayloadTransfer {
 	t.Helper()
 	listener, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(local, 0)))
 	if err != nil {
@@ -443,6 +566,9 @@ func assertTUNToKernelUDP(t testing.TB, device *Device, network string, local, r
 	if source.Addr() != remote || source.Port() != 48100 || !bytes.Equal(buffer[:n], payload) {
 		t.Fatalf("TUN->kernel source=%s payload=%x want=%s:%d/%x", source, buffer[:n], remote, 48100, payload)
 	}
+	return tunPayloadTransfer{
+		offered: append([]byte(nil), payload...), observed: append([]byte(nil), buffer[:n]...), packetBytes: len(packet),
+	}
 }
 
 func assertReadDoesNotSilentlyTruncate(
@@ -450,7 +576,7 @@ func assertReadDoesNotSilentlyTruncate(
 	device *Device,
 	local, remote netip.Addr,
 	kernelMTU int,
-) {
+) tunPayloadTransfer {
 	t.Helper()
 	runIP(t, "link", "set", "dev", device.Name(), "mtu", fmt.Sprint(kernelMTU))
 	defer runIP(t, "link", "set", "dev", device.Name(), "mtu", fmt.Sprint(device.MTU()))
@@ -500,9 +626,12 @@ func assertReadDoesNotSilentlyTruncate(
 	if meta.Identity.SrcIP != local || meta.Identity.DstIP != remote || !bytes.Equal(got, payload) {
 		t.Fatalf("replayed oversized packet identity=%s payload=%d want=%s->%s/%d", meta.Identity, len(got), local, remote, len(payload))
 	}
+	return tunPayloadTransfer{
+		offered: append([]byte(nil), payload...), observed: append([]byte(nil), got...), packetBytes: n,
+	}
 }
 
-func assertPublicTUNWriteSequence(t testing.TB, device *Device, local, remote netip.Addr) {
+func assertPublicTUNWriteSequence(t testing.TB, device *Device, local, remote netip.Addr) (tunPayloadBatch, []int) {
 	t.Helper()
 	listener, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(local, 0)))
 	if err != nil {
@@ -513,8 +642,8 @@ func assertPublicTUNWriteSequence(t testing.TB, device *Device, local, remote ne
 	originalWrite := device.write
 	device.write = func(fd int, packet []byte) (int, error) {
 		queue := -1
-		for index, file := range device.files {
-			if int(file.Fd()) == fd {
+		for index := range device.files {
+			if device.fds[index] == fd {
 				queue = index
 				break
 			}
@@ -528,10 +657,12 @@ func assertPublicTUNWriteSequence(t testing.TB, device *Device, local, remote ne
 	defer func() { device.write = originalWrite }()
 	destination := listener.LocalAddr().(*net.UDPAddr).AddrPort()
 	const packets = 32
+	batch := tunPayloadBatch{offered: make([][]byte, 0, packets), observed: make([][]byte, 0, packets)}
 	for sequence := 0; sequence < packets; sequence++ {
 		payload := make([]byte, 8)
 		copy(payload, "RMW1")
 		binary.BigEndian.PutUint32(payload[4:], uint32(sequence))
+		batch.offered = append(batch.offered, append([]byte(nil), payload...))
 		packet, err := l3ingress.BuildUDPPacket(l3ingress.L3Identity{
 			Proto: l3ingress.ProtocolUDP,
 			SrcIP: remote, SrcPort: 48150,
@@ -558,15 +689,17 @@ func assertPublicTUNWriteSequence(t testing.TB, device *Device, local, remote ne
 			source != netip.AddrPortFrom(remote, 48150) {
 			t.Fatalf("public write recv sequence=%d source=%s payload=%x", sequence, source, buffer[:n])
 		}
+		batch.observed = append(batch.observed, append([]byte(nil), buffer[:n]...))
 	}
 	for queue, writes := range queueWrites {
 		if writes == 0 {
 			t.Fatalf("public Write did not exercise TUN queue %d: %v", queue, queueWrites)
 		}
 	}
+	return batch, append([]int(nil), queueWrites...)
 }
 
-func assertEachTUNQueueToKernelUDP(t testing.TB, device *Device, local, remote netip.Addr) {
+func assertEachTUNQueueToKernelUDP(t testing.TB, device *Device, local, remote netip.Addr) tunPayloadBatch {
 	t.Helper()
 	listener, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(local, 0)))
 	if err != nil {
@@ -574,8 +707,10 @@ func assertEachTUNQueueToKernelUDP(t testing.TB, device *Device, local, remote n
 	}
 	defer listener.Close()
 	destination := listener.LocalAddr().(*net.UDPAddr).AddrPort()
+	batch := tunPayloadBatch{offered: make([][]byte, 0, device.QueueCount()), observed: make([][]byte, 0, device.QueueCount())}
 	for queue := 0; queue < device.QueueCount(); queue++ {
 		payload := []byte(fmt.Sprintf("queue-%d-to-kernel", queue))
+		batch.offered = append(batch.offered, append([]byte(nil), payload...))
 		sourcePort := uint16(48200 + queue)
 		packet, err := l3ingress.BuildUDPPacket(l3ingress.L3Identity{
 			Proto: l3ingress.ProtocolUDP,
@@ -600,7 +735,9 @@ func assertEachTUNQueueToKernelUDP(t testing.TB, device *Device, local, remote n
 		if source != netip.AddrPortFrom(remote, sourcePort) || !bytes.Equal(buffer[:n], payload) {
 			t.Fatalf("queue %d source=%s payload=%x want=%s/%x", queue, source, buffer[:n], netip.AddrPortFrom(remote, sourcePort), payload)
 		}
+		batch.observed = append(batch.observed, append([]byte(nil), buffer[:n]...))
 	}
+	return batch
 }
 
 func assertPublicTUNReadAcrossQueues(
@@ -608,8 +745,9 @@ func assertPublicTUNReadAcrossQueues(
 	device *Device,
 	representatives []*net.UDPConn,
 	local, remote netip.Addr,
-) {
+) tunPayloadBatch {
 	t.Helper()
+	batch := tunPayloadBatch{offered: make([][]byte, len(representatives)), observed: make([][]byte, len(representatives))}
 	for queue, conn := range representatives {
 		if conn == nil {
 			t.Fatalf("no kernel flow was observed on queue %d", queue)
@@ -617,6 +755,7 @@ func assertPublicTUNReadAcrossQueues(
 		payload := make([]byte, 8)
 		copy(payload, "RMP1")
 		binary.BigEndian.PutUint32(payload[4:], uint32(queue))
+		batch.offered[queue] = append([]byte(nil), payload...)
 		if _, err := conn.Write(payload); err != nil {
 			t.Fatalf("queue %d public-read stimulus: %v", queue, err)
 		}
@@ -645,7 +784,9 @@ func assertPublicTUNReadAcrossQueues(
 			t.Fatalf("public ReadContext returned invalid/duplicate queue marker %d", queue)
 		}
 		seen[queue] = true
+		batch.observed[queue] = append([]byte(nil), payload...)
 	}
+	return batch
 }
 
 func readMatchingTUNPacket(
@@ -773,7 +914,9 @@ func readTUNQueuePackets(
 		if err != nil || len(payload) != 8 || string(payload[:4]) != "RMQ1" {
 			continue
 		}
-		observation := tunQueueObservation{queue: queue, sequence: binary.BigEndian.Uint32(payload[4:])}
+		observation := tunQueueObservation{
+			queue: queue, sequence: binary.BigEndian.Uint32(payload[4:]), payload: append([]byte(nil), payload...),
+		}
 		select {
 		case observed <- observation:
 		case <-ctx.Done():
@@ -788,7 +931,7 @@ func tryReadTUNQueue(device *Device, queue int, buffer []byte) (int, error) {
 	if device.closed || queue < 0 || queue >= len(device.files) {
 		return 0, os.ErrClosed
 	}
-	return unix.Read(int(device.files[queue].Fd()), buffer)
+	return unix.Read(device.fds[queue], buffer)
 }
 
 func closeUDPConnections(connections []*net.UDPConn) {

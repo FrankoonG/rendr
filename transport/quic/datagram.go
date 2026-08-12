@@ -9,10 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	qg "github.com/quic-go/quic-go"
+	qg "github.com/FrankoonG/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
-	"github.com/FrankoonG/rendr/internal/udpsocket"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -39,13 +38,22 @@ const datagramIngressQueueLen = 2048
 //
 // Wire shape: one DATAGRAM frame == one rendr frame. No length
 // prefix - the DATAGRAM boundary IS the frame boundary.
+type datagramQUICConn interface {
+	SendDatagram([]byte) error
+	SendDatagrams([][]byte) error
+	ReceiveDatagram(context.Context) ([]byte, error)
+	Context() context.Context
+	CloseWithError(qg.ApplicationErrorCode, string) error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
 type datagramPathConn struct {
-	conn      *qg.Conn
-	server    bool
-	recvQ     chan []byte
-	release   func()
-	claim     *leafmobility.Claim
-	udpSocket *udpsocket.Socket
+	conn   datagramQUICConn
+	server bool
+	recvQ  chan []byte
+	owner  *cidOwner
+	claim  *leafmobility.Claim
 
 	writeMu sync.Mutex
 
@@ -66,6 +74,7 @@ type datagramPathConn struct {
 }
 
 var _ transport.DatagramAccelerationObserver = (*datagramPathConn)(nil)
+var _ transport.FrameBatchWriter = (*datagramPathConn)(nil)
 
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
@@ -73,22 +82,14 @@ var _ transport.DatagramAccelerationObserver = (*datagramPathConn)(nil)
 func wrapDatagram(
 	conn *qg.Conn,
 	server bool,
-	release func(),
-	role leafmobility.Role,
-	udpSocket *udpsocket.Socket,
+	owner *cidOwner,
 ) *datagramPathConn {
 	p := &datagramPathConn{
 		conn: conn, server: server, recvQ: make(chan []byte, datagramIngressQueueLen),
-		release: release, udpSocket: udpSocket,
+		owner: owner,
 	}
-	if role != leafmobility.RoleUnknown {
-		p.claim = leafmobility.MustNewClaim(leafmobility.Facts{
-			Kind:       leafmobility.KindQUIC,
-			Role:       role,
-			Scope:      leafmobility.ScopeEndpoint,
-			Session:    leafmobility.SessionPacket,
-			Generation: leafmobility.NextGeneration(),
-		})
+	if owner != nil {
+		p.claim = owner.claim
 	}
 	go p.pumpDatagrams()
 	go p.watchConn()
@@ -98,7 +99,7 @@ func wrapDatagram(
 // AcceptDatagram wraps an externally accepted DATAGRAM-capable connection and
 // does not grant adapter ownership.
 func AcceptDatagram(conn *qg.Conn) *datagramPathConn {
-	return wrapDatagram(conn, true, nil, leafmobility.RoleUnknown, nil)
+	return wrapDatagram(conn, true, nil)
 }
 
 func (p *datagramPathConn) LeafMobilityClaim() *leafmobility.Claim {
@@ -109,10 +110,10 @@ func (p *datagramPathConn) LeafMobilityClaim() *leafmobility.Claim {
 }
 
 func (p *datagramPathConn) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
-	if p == nil || p.udpSocket == nil {
+	if p == nil || p.owner == nil {
 		return transport.DatagramAccelerationStatus{}
 	}
-	return p.udpSocket.DatagramAccelerationStatus()
+	return p.owner.accelerationStatus()
 }
 
 // Read pops one DATAGRAM and copies into buf. If buf is smaller than
@@ -194,6 +195,10 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	if err := p.conn.SendDatagram(frame); err != nil {
+		var tooLarge *qg.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return 0, err
+		}
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
@@ -201,20 +206,54 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 	return len(frame), nil
 }
 
+// WriteFrameBatch submits an engine-built packet DATA run to quic-go without
+// waiting to accumulate more traffic. quic-go copies and atomically queues the
+// complete batch, so an error means that no frame in the batch was accepted.
+func (p *datagramPathConn) WriteFrameBatch(frames [][]byte) (int, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
+	for _, frame := range frames {
+		if len(frame) == 0 || len(frame) > MaxDatagramFrame {
+			return 0, fmt.Errorf("quic-datagram: frame size %d out of range (1..%d)", len(frame), MaxDatagramFrame)
+		}
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.dead.Load() {
+		return 0, net.ErrClosed
+	}
+	var err error
+	if len(frames) == 1 {
+		err = p.conn.SendDatagram(frames[0])
+	} else {
+		err = p.conn.SendDatagrams(frames)
+	}
+	if err != nil {
+		var tooLarge *qg.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return 0, err
+		}
+		p.declareDeath(err)
+		return 0, p.swallow(err)
+	}
+	p.writes.Add(uint64(len(frames)))
+	return len(frames), nil
+}
+
 // Close synchronously completes quic-go's local connection close before
 // releasing the owned transport and UDP socket.
 func (p *datagramPathConn) Close() error {
 	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
-		return nil
+		return p.releaseRetention()
 	}
 	err := p.conn.CloseWithError(0, "rendr local close")
 	p.deathMu.Lock()
 	p.deathErr = err
 	p.deathFn = nil
 	p.deathMu.Unlock()
-	p.releaseRetention()
-	return err
+	return errors.Join(err, p.releaseRetention())
 }
 
 // Reads / Writes expose per-PathConn counters.
@@ -247,12 +286,24 @@ func (p *datagramPathConn) MarkByeSeen()  { p.byeSeen.Store(true) }
 func (p *datagramPathConn) MarkQuiesced() { p.quiesced.Store(true) }
 
 func (p *datagramPathConn) LocalAddr() string {
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		active := p.owner.active
+		p.owner.mu.Unlock()
+		return addrString(active.localAddr())
+	}
 	if a := p.conn.LocalAddr(); a != nil {
 		return a.String()
 	}
 	return ""
 }
 func (p *datagramPathConn) RemoteAddr() string {
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		remote := cloneUDPAddr(p.owner.remote)
+		p.owner.mu.Unlock()
+		return addrString(remote)
+	}
 	if a := p.conn.RemoteAddr(); a != nil {
 		return a.String()
 	}
@@ -261,11 +312,7 @@ func (p *datagramPathConn) RemoteAddr() string {
 
 func (p *datagramPathConn) watchConn() {
 	<-p.conn.Context().Done()
-	cause := context.Cause(p.conn.Context())
-	if cause == context.Canceled {
-		cause = nil
-	}
-	p.declareDeath(cause)
+	p.declareDeath(connectionDeathCause(p.conn.Context()))
 }
 
 func (p *datagramPathConn) classify(err error) transport.DeathCause {
@@ -283,16 +330,34 @@ func (p *datagramPathConn) declareDeath(err error) {
 	fn := p.deathFn
 	p.deathFn = nil
 	p.deathMu.Unlock()
-	p.releaseRetention()
+	_ = p.releaseRetention()
 	if fn != nil {
 		fn(p.classify(err), err)
 	}
 }
 
-func (p *datagramPathConn) releaseRetention() {
-	if p.release != nil {
-		p.release()
+func (p *datagramPathConn) releaseRetention() error {
+	if p.owner == nil {
+		return nil
 	}
+	return p.owner.releaseResources()
+}
+
+func (p *datagramPathConn) SubscribeLeafMobilityRefresh(
+	ctx context.Context,
+	fn func(leafmobility.RefreshEvidence),
+) (func(), error) {
+	if p == nil || p.owner == nil {
+		return nil, errors.New("quic: CID refresh is unavailable")
+	}
+	return p.owner.subscribeRefresh(ctx, fn)
+}
+
+func (p *datagramPathConn) CommitLeafMobilityRefresh(evidence leafmobility.RefreshEvidence) error {
+	if p == nil || p.owner == nil {
+		return errors.New("quic: CID refresh is unavailable")
+	}
+	return p.owner.commitRefresh(evidence)
 }
 
 func (p *datagramPathConn) swallow(err error) error {

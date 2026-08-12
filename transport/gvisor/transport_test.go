@@ -96,6 +96,7 @@ func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 		listen      func() (*Listener, error)
 		clientScope leafmobility.Scope
 		serverScope leafmobility.Scope
+		operations  leafmobility.Operation
 	}{
 		{
 			name:        "process-local",
@@ -105,14 +106,18 @@ func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 		},
 		{
 			name:        "packet-carried",
-			listen:      func() (*Listener, error) { return ListenPacket("127.0.0.1:0") },
+			listen:      func() (*Listener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
 			clientScope: leafmobility.ScopeEndpoint,
-			serverScope: leafmobility.ScopeSharedLink,
+			serverScope: leafmobility.ScopeEndpoint,
+			operations:  expectedPacketLinkOperation(),
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			listener, err := test.listen()
+			if errors.Is(err, ErrOuterPacketUnsupported) {
+				t.Skip("outer UDP packet carriers are unsupported on this platform")
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -120,8 +125,8 @@ func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 			client, server := dialAndAccept(t, listener)
 			defer client.Close()
 			defer server.Close()
-			assertGVisorClaim(t, client, leafmobility.RoleDialer, test.clientScope)
-			assertGVisorClaim(t, server, leafmobility.RoleAcceptor, test.serverScope)
+			assertGVisorClaim(t, client, leafmobility.RoleDialer, test.clientScope, test.operations)
+			assertGVisorClaim(t, server, leafmobility.RoleAcceptor, test.serverScope, test.operations)
 			clientClaim := client.(leafmobility.Provider).LeafMobilityClaim()
 			serverClaim := server.(leafmobility.Provider).LeafMobilityClaim()
 			if err := client.Close(); err != nil {
@@ -137,7 +142,13 @@ func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 	}
 }
 
-func assertGVisorClaim(t *testing.T, path transport.PathConn, role leafmobility.Role, scope leafmobility.Scope) {
+func assertGVisorClaim(
+	t *testing.T,
+	path transport.PathConn,
+	role leafmobility.Role,
+	scope leafmobility.Scope,
+	operations leafmobility.Operation,
+) {
 	t.Helper()
 	provider, ok := path.(leafmobility.Provider)
 	if !ok || provider.LeafMobilityClaim() == nil {
@@ -145,8 +156,11 @@ func assertGVisorClaim(t *testing.T, path transport.PathConn, role leafmobility.
 	}
 	facts := provider.LeafMobilityClaim().Snapshot()
 	if facts.Kind != leafmobility.KindGVisor || facts.Role != role || facts.Scope != scope ||
-		facts.Session != leafmobility.SessionAny || facts.Operations != 0 || facts.Generation == 0 {
+		facts.Session != leafmobility.SessionAny || facts.Operations != operations || facts.Generation == 0 {
 		t.Fatalf("gVisor ownership facts=%+v", facts)
+	}
+	if operations != 0 && facts.ResourceID == (leafmobility.ResourceID{}) {
+		t.Fatalf("driven gVisor ownership has zero resource id: %+v", facts)
 	}
 }
 
@@ -197,11 +211,14 @@ func TestGVisorNilDomainFactoryFailsClosed(t *testing.T) {
 func TestGVisorListenerCloseUnblocksAcceptPath(t *testing.T) {
 	tests := map[string]func() (*Listener, error){
 		"process-local":  func() (*Listener, error) { return NewDomain().Listen("") },
-		"packet-carried": func() (*Listener, error) { return ListenPacket("127.0.0.1:0") },
+		"packet-carried": func() (*Listener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
 	}
 	for name, listen := range tests {
 		t.Run(name, func(t *testing.T) {
 			ln, err := listen()
+			if errors.Is(err, ErrOuterPacketUnsupported) {
+				t.Skip("outer UDP packet carriers are unsupported on this platform")
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -328,7 +345,8 @@ func TestGVisorAcceptCloseRaceCleansUp(t *testing.T) {
 }
 
 func TestGVisorPacketAcceptedPathSurvivesListenerClose(t *testing.T) {
-	ln, err := ListenPacket("127.0.0.1:0")
+	requireOuterPacketSupport(t)
+	ln, err := ListenPacket("127.0.0.1:0", WithTrustedCarrier())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +419,9 @@ func TestRetainedPathConnReleasesOnceAndPreservesOptionalMethods(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
 	var releases atomic.Int32
-	path := newRetainedPathConn(basetcp.Wrap(left), func() { releases.Add(1) })
+	path := newRetainedOwnedPathConn(
+		basetcp.Wrap(left), func() { releases.Add(1) }, leafmobility.RoleDialer, leafmobility.ScopeEndpoint,
+	)
 
 	type engineOptionalMethods interface {
 		Reads() uint64
@@ -522,7 +542,8 @@ func waitForCleanup(t *testing.T, ln *Listener) {
 }
 
 func TestGVisorPacketCarrierRoundTrip(t *testing.T) {
-	ln, err := ListenPacket("127.0.0.1:0")
+	requireOuterPacketSupport(t)
+	ln, err := ListenPacket("127.0.0.1:0", WithTrustedCarrier())
 	if err != nil {
 		t.Fatal(err)
 	}

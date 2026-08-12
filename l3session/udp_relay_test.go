@@ -2,8 +2,11 @@ package l3session
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -221,6 +224,241 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 	}
 }
 
+func TestUDPRelayContextCancellationStopsIdleReplyLoop(t *testing.T) {
+	ln := newTestPacketSessionListener(t, "udpflow")
+	defer ln.Close()
+	accepted := make(chan rendr.PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pc, err := ln.AcceptPacket(ctx)
+		if err == nil {
+			accepted <- pc
+		}
+	}()
+
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40003,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet, err := l3ingress.BuildUDPPacket(id, []byte("query"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := l3ingress.ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPRelay{Device: &packetCaptureDevice{}}
+	defer relay.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := relay.HandlePacket(ctx, l3ingress.PacketEvent{
+		Packet: packet, Meta: meta,
+		Flow: l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
+		Decision: l3ingress.FlowDecision{
+			Peer: "peer-a", Egress: "direct",
+			Root: rendr.Path("udp", rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
+		},
+		Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	defer server.Close()
+	cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, managerPresent := relay.manager().Session(id)
+		relay.mu.Lock()
+		_, replyPresent := relay.sessions[id]
+		_, packetPresent := relay.packets[id]
+		relay.mu.Unlock()
+		if !managerPresent && !replyPresent && !packetPresent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("canceled flow remained manager/reply/packet=%v/%v/%v", managerPresent, replyPresent, packetPresent)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUDPRelayRejectsPacketsAfterClose(t *testing.T) {
+	relay := &UDPRelay{Device: &packetCaptureDevice{}}
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40005,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet, err := l3ingress.BuildUDPPacket(id, []byte("query"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := l3ingress.ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = relay.HandlePacket(context.Background(), l3ingress.PacketEvent{Packet: packet, Meta: meta})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("HandlePacket after Close error=%v, want %v", err, net.ErrClosed)
+	}
+}
+
+func TestUDPRelayCloseFlowUnblocksDeviceWrite(t *testing.T) {
+	ln := newTestPacketSessionListener(t, "udpflow")
+	defer ln.Close()
+	accepted := make(chan rendr.PacketConn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pc, err := ln.AcceptPacket(ctx)
+		if err == nil {
+			accepted <- pc
+		}
+	}()
+
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40004,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet, err := l3ingress.BuildUDPPacket(id, []byte("query"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := l3ingress.ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := newBlockingPacketWriteDevice()
+	relay := &UDPRelay{Device: device}
+	defer relay.Close()
+	if err := relay.HandlePacket(context.Background(), l3ingress.PacketEvent{
+		Packet: packet, Meta: meta,
+		Flow: l3ingress.FlowMeta{L3Identity: id, Direction: l3ingress.DirectionIngress},
+		Decision: l3ingress.FlowDecision{
+			Peer: "peer-a", Egress: "direct",
+			Root: rendr.Path("udp", rendr.PathSpec{Transport: "udpflow", Address: ln.Addr().String()}),
+		},
+		Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	defer server.Close()
+	echoPacket(t, server, id, "query", "answer")
+	select {
+	case <-device.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reply loop never entered device WriteContext")
+	}
+	closed := make(chan bool, 1)
+	go func() { closed <- relay.CloseFlow(id) }()
+	select {
+	case ok := <-closed:
+		if !ok {
+			t.Fatal("CloseFlow returned false")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseFlow remained blocked behind the virtual-interface write")
+	}
+	if _, ok := relay.manager().Session(id); ok {
+		t.Fatal("manager retained session after blocked-write cancellation")
+	}
+	relay.mu.Lock()
+	_, replyPresent := relay.sessions[id]
+	_, packetPresent := relay.packets[id]
+	relay.mu.Unlock()
+	if replyPresent || packetPresent {
+		t.Fatalf("relay retained reply/packet state after CloseFlow=%v/%v", replyPresent, packetPresent)
+	}
+}
+
+func TestUDPReplyLoopTeardownCannotForgetReplacementGeneration(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40001,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	oldConn := &fakeConn{}
+	newConn := &fakeConn{}
+	oldSession := &Session{
+		Request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 1}},
+		Conn:    oldConn,
+	}
+	newSession := &Session{
+		Request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 2}},
+		Conn:    newConn,
+	}
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
+	relay := &UDPRelay{
+		Manager: manager,
+		sessions: map[l3ingress.L3Identity]packetReplyLoop{
+			id: {session: newSession, cancel: func() {}},
+		},
+		packets: map[l3ingress.L3Identity]*Session{id: newSession},
+	}
+	relay.fast.Store(&packetSessionCache{id: id, sess: newSession})
+
+	relay.forgetSession(id, oldSession)
+	if current, ok := manager.Session(id); !ok || current != newSession {
+		t.Fatalf("stale reply loop removed replacement: current=%p ok=%v", current, ok)
+	}
+	if relay.packetSession(id, newSession.Request.Ref) != newSession {
+		t.Fatal("stale reply loop removed replacement packet cache")
+	}
+	if cached := relay.fast.Load(); cached == nil || cached.sess != newSession {
+		t.Fatal("stale reply loop cleared replacement fast cache")
+	}
+	if oldConn.closed.Load() != 1 || newConn.closed.Load() != 0 {
+		t.Fatalf("close counts old/new=%d/%d", oldConn.closed.Load(), newConn.closed.Load())
+	}
+}
+
+func TestUDPRelayRetiresCachedPredecessorBeforeTupleReuse(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.3"), SrcPort: 40002,
+		DstIP: netip.MustParseAddr("198.51.100.54"), DstPort: 53,
+	}
+	oldRef := l3ingress.FlowRef{Identity: id, Generation: 1}
+	newRef := l3ingress.FlowRef{Identity: id, Generation: 2}
+	oldConn := &fakeConn{}
+	oldSession := &Session{
+		Request: l3ingress.SessionRequest{Identity: id, Ref: oldRef, Egress: "old-egress"},
+		Conn:    oldConn,
+	}
+	canceled := make(chan struct{})
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: oldSession}}
+	relay := &UDPRelay{
+		Manager: manager,
+		sessions: map[l3ingress.L3Identity]packetReplyLoop{
+			id: {session: oldSession, cancel: func() { close(canceled) }},
+		},
+		packets: map[l3ingress.L3Identity]*Session{id: oldSession},
+	}
+	relay.fast.Store(&packetSessionCache{id: id, sess: oldSession})
+
+	if got := relay.packetSession(id, newRef); got != nil {
+		t.Fatal("new generation reused predecessor packet session")
+	}
+	relay.retireStalePacketSession(id, newRef)
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("predecessor reply loop was not canceled")
+	}
+	if _, ok := manager.Session(id); ok || oldConn.closed.Load() != 1 {
+		t.Fatalf("predecessor remained in manager: present=%v closes=%d", ok, oldConn.closed.Load())
+	}
+	if relay.packetSession(id, newRef) != nil || relay.fast.Load() != nil {
+		t.Fatal("predecessor cache survived generation retirement")
+	}
+}
+
 func echoPacket(t *testing.T, pc rendr.PacketConn, id l3ingress.L3Identity, want, reply string) {
 	t.Helper()
 	buf := make([]byte, 256)
@@ -251,6 +489,34 @@ func (d *packetCaptureDevice) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+func (d *packetCaptureDevice) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return d.Write(p)
+}
 func (d *packetCaptureDevice) Close() error { return nil }
 func (d *packetCaptureDevice) Name() string { return "packet-capture0" }
 func (d *packetCaptureDevice) MTU() int     { return 1500 }
+
+type blockingPacketWriteDevice struct {
+	writeStarted chan struct{}
+	startOnce    sync.Once
+}
+
+func newBlockingPacketWriteDevice() *blockingPacketWriteDevice {
+	return &blockingPacketWriteDevice{writeStarted: make(chan struct{})}
+}
+
+func (*blockingPacketWriteDevice) Read([]byte) (int, error) { return 0, io.EOF }
+func (*blockingPacketWriteDevice) Write([]byte) (int, error) {
+	panic("UDP relay bypassed WriteContext")
+}
+func (d *blockingPacketWriteDevice) WriteContext(ctx context.Context, _ []byte) (int, error) {
+	d.startOnce.Do(func() { close(d.writeStarted) })
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+func (*blockingPacketWriteDevice) Close() error { return nil }
+func (*blockingPacketWriteDevice) Name() string { return "blocking-packet0" }
+func (*blockingPacketWriteDevice) MTU() int     { return 1500 }

@@ -31,7 +31,7 @@ func currentAck(e *Engine, nextSeq uint64) proto.AckPayload {
 func reserveAckTestFrame(t *testing.T, e *Engine, seq uint64, frameType proto.FrameType) {
 	t.Helper()
 	control := frameType == proto.FrameCtrl
-	if err := e.acquireSendSlot(control); err != nil {
+	if err := e.acquireSendSlot(control, proto.HeaderSize+1); err != nil {
 		t.Fatal(err)
 	}
 	frame := make([]byte, proto.HeaderSize+1)

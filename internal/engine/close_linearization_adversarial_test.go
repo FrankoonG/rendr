@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -31,8 +32,66 @@ type closeLinearizationPath struct {
 	writeGate    <-chan struct{}
 }
 
+// blockingOptionalClosePath models optional transport hooks that are less
+// reliable than the mandatory PathConn.Close contract. Close itself never
+// takes writeMu and therefore still promptly releases a conforming blocked
+// Write.
+type blockingOptionalClosePath struct {
+	*closeLinearizationPath
+
+	writeMu         sync.Mutex
+	blockWrite      bool
+	writeBlocked    chan struct{}
+	writeBlockedOne sync.Once
+
+	markStarted chan struct{}
+	markOne     sync.Once
+	markGate    <-chan struct{}
+
+	closeWriteStarted chan struct{}
+	closeWriteOne     sync.Once
+	closeWriteGate    <-chan struct{}
+}
+
 func newCloseLinearizationPath() *closeLinearizationPath {
 	return &closeLinearizationPath{closed: make(chan struct{})}
+}
+
+func newBlockingOptionalClosePath() *blockingOptionalClosePath {
+	return &blockingOptionalClosePath{
+		closeLinearizationPath: newCloseLinearizationPath(),
+		writeBlocked:           make(chan struct{}),
+		markStarted:            make(chan struct{}),
+		closeWriteStarted:      make(chan struct{}),
+	}
+}
+
+func (p *blockingOptionalClosePath) Write(frame []byte) (int, error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.blockWrite {
+		p.writeBlockedOne.Do(func() { close(p.writeBlocked) })
+		<-p.closed
+		return 0, net.ErrClosed
+	}
+	return p.closeLinearizationPath.Write(frame)
+}
+
+func (p *blockingOptionalClosePath) MarkQuiesced() {
+	p.markOne.Do(func() { close(p.markStarted) })
+	if p.markGate != nil {
+		<-p.markGate
+	}
+}
+
+func (p *blockingOptionalClosePath) CloseWrite() error {
+	p.closeWriteOne.Do(func() { close(p.closeWriteStarted) })
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.closeWriteGate != nil {
+		<-p.closeWriteGate
+	}
+	return nil
 }
 
 func (p *closeLinearizationPath) Read([]byte) (int, error) {
@@ -138,6 +197,14 @@ func attachCloseLinearizationPath(t *testing.T, e *Engine, path *closeLinearizat
 	t.Helper()
 	path.owner = e
 	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "close-linearization"}); err != nil {
+		t.Fatalf("AttachPath: %v", err)
+	}
+}
+
+func attachBlockingOptionalClosePath(t *testing.T, e *Engine, path *blockingOptionalClosePath) {
+	t.Helper()
+	path.owner = e
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "blocking-optional-close"}); err != nil {
 		t.Fatalf("AttachPath: %v", err)
 	}
 }
@@ -278,6 +345,52 @@ func TestConcurrentGracefulCloseSharesFinalFrameAndResult(t *testing.T) {
 	}
 }
 
+func TestGracefulCloseAcceptsConcurrentCleanPeerCompletion(t *testing.T) {
+	for attempt := 0; attempt < 100; attempt++ {
+		e := New(SideClient, [16]byte{0xc5, byte(attempt)}, Limits{MigrationBudget: 250 * time.Millisecond})
+		path := newCloseLinearizationPath()
+		path.byeStarted = make(chan struct{})
+		attachCloseLinearizationPath(t, e, path)
+
+		done := make(chan error, 1)
+		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+		waitCloseLinearizationSignal(t, path.byeStarted, time.Second, "concurrent clean BYE")
+		if err := e.Close(); err != nil {
+			t.Fatalf("attempt %d concurrent clean Close: %v", attempt, err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("attempt %d GracefulClose=%v, want clean completion", attempt, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d GracefulClose did not observe concurrent close", attempt)
+		}
+	}
+}
+
+func TestGracefulClosePreservesConcurrentTerminalReason(t *testing.T) {
+	e := New(SideClient, [16]byte{0xc6}, Limits{MigrationBudget: 250 * time.Millisecond})
+	path := newCloseLinearizationPath()
+	path.byeStarted = make(chan struct{})
+	attachCloseLinearizationPath(t, e, path)
+	done := make(chan error, 1)
+	go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+	waitCloseLinearizationSignal(t, path.byeStarted, time.Second, "terminal-error BYE")
+	e.setCloseErr(ErrZombie)
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrZombie) {
+			t.Fatalf("GracefulClose=%v, want ErrZombie", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GracefulClose did not preserve concurrent terminal error")
+	}
+}
+
 func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc3}, Limits{MigrationBudget: 50 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
@@ -324,6 +437,173 @@ func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("blocked DATA writer did not exit after test gate release")
+	}
+}
+
+func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
+	t.Run("MarkQuiesced", func(t *testing.T) {
+		e := New(SideClient, [16]byte{0xc7, 1}, Limits{MigrationBudget: 50 * time.Millisecond})
+		markGate := make(chan struct{})
+		var releaseMark sync.Once
+		release := func() { releaseMark.Do(func() { close(markGate) }) }
+		t.Cleanup(func() {
+			release()
+			_ = e.Close()
+		})
+
+		path := newBlockingOptionalClosePath()
+		path.autoAckBye = true
+		path.markGate = markGate
+		attachBlockingOptionalClosePath(t, e, path)
+
+		done := make(chan error, 1)
+		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+		waitCloseLinearizationSignal(t, path.markStarted, time.Second, "blocking MarkQuiesced")
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("GracefulClose: %v", err)
+			}
+		case <-time.After(time.Second):
+			_ = e.Close()
+			release()
+			<-done
+			t.Fatal("blocking MarkQuiesced made GracefulClose unbounded")
+		}
+		select {
+		case <-e.Closed():
+		case <-time.After(time.Second):
+			t.Fatal("engine ownership did not quiesce after bounded close")
+		}
+
+		// MarkQuiesced is allowed to return late on the terminally closed old
+		// adapter, but it must not trigger a second optional mutation afterward.
+		release()
+		select {
+		case <-e.quiesceDone:
+		case <-time.After(time.Second):
+			t.Fatal("late MarkQuiesced completion did not release its bounded worker")
+		}
+		select {
+		case <-path.closeWriteStarted:
+			t.Fatal("late MarkQuiesced completion invoked CloseWrite on a retired path")
+		default:
+		}
+	})
+
+	t.Run("CloseWrite", func(t *testing.T) {
+		e := New(SideClient, [16]byte{0xc7, 2}, Limits{MigrationBudget: 50 * time.Millisecond})
+		closeWriteGate := make(chan struct{})
+		var releaseCloseWrite sync.Once
+		release := func() { releaseCloseWrite.Do(func() { close(closeWriteGate) }) }
+		t.Cleanup(func() {
+			release()
+			_ = e.Close()
+		})
+
+		path := newBlockingOptionalClosePath()
+		path.autoAckBye = true
+		path.closeWriteGate = closeWriteGate
+		attachBlockingOptionalClosePath(t, e, path)
+
+		done := make(chan error, 1)
+		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+		waitCloseLinearizationSignal(t, path.closeWriteStarted, time.Second, "blocking CloseWrite")
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("GracefulClose: %v", err)
+			}
+		case <-time.After(time.Second):
+			_ = e.Close()
+			release()
+			<-done
+			t.Fatal("blocking CloseWrite made GracefulClose unbounded")
+		}
+		select {
+		case <-e.Closed():
+		case <-time.After(time.Second):
+			t.Fatal("engine ownership did not quiesce after bounded close")
+		}
+		release()
+		select {
+		case <-e.quiesceDone:
+		case <-time.After(time.Second):
+			t.Fatal("late CloseWrite completion did not release its bounded worker")
+		}
+	})
+
+	t.Run("CloseWriteContendsWithWrite", func(t *testing.T) {
+		e := New(SideClient, [16]byte{0xc7, 3}, Limits{MigrationBudget: 50 * time.Millisecond})
+		t.Cleanup(func() { _ = e.Close() })
+		path := newBlockingOptionalClosePath()
+		path.blockWrite = true
+		attachBlockingOptionalClosePath(t, e, path)
+
+		writeDone := make(chan error, 1)
+		go func() {
+			_, err := e.SendData([]byte("write-holds-transport-lock"))
+			writeDone <- err
+		}()
+		waitCloseLinearizationSignal(t, path.writeBlocked, time.Second, "transport Write lock holder")
+
+		done := make(chan error, 1)
+		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+		waitCloseLinearizationSignal(t, path.closeWriteStarted, time.Second, "contending CloseWrite")
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("GracefulClose reported success without publishing its final frame")
+			}
+		case <-time.After(time.Second):
+			_ = e.Close()
+			<-done
+			t.Fatal("CloseWrite contention prevented required PathConn.Close")
+		}
+		select {
+		case err := <-writeDone:
+			if err == nil {
+				t.Fatal("blocked Write succeeded after required Close")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("required Close did not unblock transport Write")
+		}
+		select {
+		case <-e.quiesceDone:
+		case <-time.After(time.Second):
+			t.Fatal("CloseWrite contender did not drain after required Close")
+		}
+		select {
+		case <-e.Closed():
+		case <-time.After(time.Second):
+			t.Fatal("engine ownership did not drain after contended close")
+		}
+	})
+}
+
+func TestPathOwnedForQuiesceRequiresCurrentActiveSlot(t *testing.T) {
+	e := New(SideClient, [16]byte{0xc7, 4}, Limits{MigrationBudget: 50 * time.Millisecond})
+	t.Cleanup(func() { _ = e.Close() })
+	first := newCloseLinearizationPath()
+	second := newCloseLinearizationPath()
+	attachCloseLinearizationPath(t, e, first)
+	attachCloseLinearizationPath(t, e, second)
+
+	e.pathsMu.RLock()
+	firstSlot := e.paths[1]
+	secondSlot := e.paths[2]
+	e.pathsMu.RUnlock()
+	if firstSlot == nil || secondSlot == nil {
+		t.Fatalf("attached slots first=%v second=%v", firstSlot, secondSlot)
+	}
+	e.pathsMu.Lock()
+	e.activeID = secondSlot.id
+	e.pathsMu.Unlock()
+	if e.pathOwnedForQuiesce(firstSlot) {
+		t.Fatal("retained but inactive path was eligible for optional quiesce hooks")
+	}
+	if !e.pathOwnedForQuiesce(secondSlot) {
+		t.Fatal("current active path was not eligible for optional quiesce hooks")
 	}
 }
 

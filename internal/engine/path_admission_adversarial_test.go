@@ -518,6 +518,155 @@ func TestPathAdmissionActivationDoesNotDeadlockSynchronousDeathCallback(t *testi
 	}
 }
 
+func TestPathAdmissionActivationDoesNotResurrectPredecessorRetiredAfterDrain(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	old, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRef, ok := e.PathRef(oldID)
+	if !ok {
+		t.Fatal("predecessor has no exact path reference")
+	}
+
+	replacement, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, _ := prepareBoundAdmission(t, e, replacement, binding, 0x74)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+
+	var retireErr error
+	e.activationAfterPredecessorDrain = func() {
+		retireErr = e.RetirePath(oldRef, errors.New("peer retired drained predecessor"))
+	}
+	if err := e.ActivateStagedPath(replacementID, true); err != nil {
+		t.Fatalf("ActivateStagedPath: %v", err)
+	}
+	e.activationAfterPredecessorDrain = nil
+	if retireErr != nil {
+		t.Fatalf("RetirePath: %v", retireErr)
+	}
+	assertRetiredPredecessorWasNotResurrected(t, e, oldID, replacementID)
+}
+
+func TestPathAdmissionActivationAcceptsPredecessorRetiredWhileDrainWaits(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	old, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRef, ok := e.PathRef(oldID)
+	if !ok {
+		t.Fatal("predecessor has no exact path reference")
+	}
+	oldSlot := admissionPathSlot(t, e, oldID)
+	if err := oldSlot.acquireWrite(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, _ := prepareBoundAdmission(t, e, replacement, binding, 0x77)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		oldSlot.releaseWrite()
+		t.Fatal(err)
+	}
+
+	activated := make(chan error, 1)
+	go func() { activated <- e.ActivateStagedPath(replacementID, true) }()
+	waitAdmissionCondition(t, time.Second, "predecessor drain fence", func() bool {
+		return oldSlot.maintenance.Load() && !oldSlot.txEnabled.Load()
+	})
+	if err := e.RetirePath(oldRef, errors.New("peer retired predecessor during drain")); err != nil {
+		oldSlot.releaseWrite()
+		t.Fatal(err)
+	}
+	oldSlot.releaseWrite()
+	if err := <-activated; err != nil {
+		t.Fatalf("ActivateStagedPath: %v", err)
+	}
+	assertRetiredPredecessorWasNotResurrected(t, e, oldID, replacementID)
+}
+
+func TestPathAdmissionActivationRejectsRetiredUndrainedProbeWriter(t *testing.T) {
+	e, binding := newAdmissionAdversarialEngine(t, SideClient)
+	oldBase, oldPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	old := newBlockingProbePath(oldBase, 1)
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(old.release) }) })
+	oldID, err := e.AttachPathBound(old, transport.PathSpec{Transport: "memory"}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRef, ok := e.PathRef(oldID)
+	if !ok {
+		t.Fatal("predecessor has no exact path reference")
+	}
+	oldSlot := admissionPathSlot(t, e, oldID)
+	e.issuePathProbe(oldSlot)
+	select {
+	case <-old.started:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not enter predecessor Conn.Write")
+	}
+
+	replacement, replacementPeer := newMemoryPathPair()
+	t.Cleanup(func() { _ = replacementPeer.Close() })
+	replacementID, _ := prepareBoundAdmission(t, e, replacement, binding, 0x78)
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	activated := make(chan error, 1)
+	go func() { activated <- e.activateStagedPathContext(ctx, replacementID, true, true) }()
+	waitAdmissionCondition(t, time.Second, "predecessor probe drain fence", func() bool {
+		return oldSlot.maintenance.Load() && !oldSlot.txEnabled.Load()
+	})
+	if err := e.RetirePath(oldRef, errors.New("retired while probe write remained blocked")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-activated:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("activation error=%v want undrained deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activation did not honor its probe-drain deadline")
+	}
+	e.pathsMu.RLock()
+	published := e.paths[replacementID] != nil
+	e.pathsMu.RUnlock()
+	if published {
+		t.Fatal("successor was published while retired predecessor probe still owned Conn.Write")
+	}
+	releaseOnce.Do(func() { close(old.release) })
+}
+
+func assertRetiredPredecessorWasNotResurrected(t *testing.T, e *Engine, predecessorID, successorID uint32) {
+	t.Helper()
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	if e.paths[predecessorID] != nil || e.retainedPaths[predecessorID] != nil {
+		t.Fatalf("retired predecessor %d was resurrected", predecessorID)
+	}
+	if successor := e.paths[successorID]; successor == nil || !successor.txEnabled.Load() {
+		t.Fatalf("successor %d is not active and TX-enabled", successorID)
+	}
+	if predecessors := e.pathPredecessors[successorID]; len(predecessors) != 0 {
+		t.Fatalf("successor %d retained retired predecessors %v", successorID, predecessors)
+	}
+	if e.activeID != successorID {
+		t.Fatalf("active path=%d want successor=%d", e.activeID, successorID)
+	}
+}
+
 func TestPathAdmissionGracefulCloseDuringFenceReleasesStagedReservation(t *testing.T) {
 	e, binding := newAdmissionAdversarialEngine(t, SideClient)
 	oldBase, oldPeer := newMemoryPathPair()
@@ -941,6 +1090,39 @@ func TestCompletedAdmissionReplayReplacementIsBenign(t *testing.T) {
 	}
 	if err := e.CloseErr(); errors.Is(err, ErrPathAdmissionOutcomeUnknown) {
 		t.Fatalf("stale completed replay closed session as outcome unknown: %v", err)
+	}
+}
+
+func TestUnknownPathAdmissionLinearizesWithCleanClose(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var admissionWon atomic.Bool
+		var closeErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			e.BeginGracefulClose()
+			closeErr = e.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			admissionWon.Store(e.closeForUnknownPathAdmissionIfLive())
+		}()
+		close(start)
+		wg.Wait()
+
+		gotUnknown := errors.Is(e.CloseErr(), ErrPathAdmissionOutcomeUnknown)
+		if admissionWon.Load() != gotUnknown {
+			t.Fatalf("iteration %d: admissionWon=%t closeErr=%v directCloseErr=%v",
+				i, admissionWon.Load(), e.CloseErr(), closeErr)
+		}
+		if closeErr != nil {
+			t.Fatalf("iteration %d: physical Close returned %v", i, closeErr)
+		}
 	}
 }
 

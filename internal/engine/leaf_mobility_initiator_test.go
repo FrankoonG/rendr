@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -131,6 +132,78 @@ func TestLeafMobilityInitiatorExecutesFreshFactualEvent(t *testing.T) {
 		t.Fatalf("coherent topology mobility=%+v", observed)
 	}
 	assertLeafMobilityDataFlow(t, fixture, "after-automatic-commit")
+}
+
+func TestLeafMobilityCommitHookObservesCommittedTransaction(t *testing.T) {
+	var source *initiatorRefreshPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &initiatorRefreshPath{PathConn: path}
+			return source
+		}, nil, nil, nil,
+	)
+	type observation struct {
+		oldID, newID uint32
+		cause        string
+		status       LeafMobilityInitiatorSnapshot
+		present      bool
+	}
+	observed := make(chan observation, 2)
+	cancel := fixture.client.OnMigrate(func(oldID, newID uint32, cause string) {
+		status, present := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		observed <- observation{oldID: oldID, newID: newID, cause: cause, status: status, present: present}
+	})
+	defer cancel()
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowID := fixture.client.FlowID()
+	var previousTransaction leafmobility.TransactionID
+	var previousEndpointGeneration uint64
+	for migration := 1; migration <= 2; migration++ {
+		evidence, observeErr := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+		if observeErr != nil {
+			t.Fatal(observeErr)
+		}
+		if source == nil || !source.publish(evidence) {
+			t.Fatal("refresh source was not subscribed")
+		}
+		select {
+		case got := <-observed:
+			if got.oldID != fixture.clientRef.ID || got.newID != fixture.clientRef.ID ||
+				got.cause != "leaf-mobility" || !got.present ||
+				got.status.Phase != LeafMobilityInitiatorCommitted ||
+				got.status.TransactionID == (leafmobility.TransactionID{}) ||
+				got.status.ResultEndpointGeneration == 0 ||
+				got.status.ResultEndpointGeneration == got.status.SourceEndpointGeneration {
+				t.Fatalf("migration %d callback observation=%+v", migration, got)
+			}
+			if previousTransaction != (leafmobility.TransactionID{}) && got.status.TransactionID == previousTransaction {
+				t.Fatalf("migration %d reused transaction %x", migration, got.status.TransactionID)
+			}
+			if previousEndpointGeneration != 0 && got.status.SourceEndpointGeneration != previousEndpointGeneration {
+				t.Fatalf("migration %d source generation=%d want prior result=%d",
+					migration, got.status.SourceEndpointGeneration, previousEndpointGeneration)
+			}
+			previousTransaction = got.status.TransactionID
+			previousEndpointGeneration = got.status.ResultEndpointGeneration
+		case <-time.After(3 * time.Second):
+			t.Fatalf("committed leaf mobility hook %d did not fire", migration)
+		}
+		if fixture.client.FlowID() != flowID {
+			t.Fatalf("migration %d changed flow identity", migration)
+		}
+		if ref, ok := fixture.client.PathRef(fixture.clientRef.ID); !ok || ref != fixture.clientRef {
+			t.Fatalf("migration %d changed logical path reference: got=%+v ok=%t want=%+v",
+				migration, ref, ok, fixture.clientRef)
+		}
+		if got := fixture.client.MigrationCount(); got != uint64(migration) {
+			t.Fatalf("migration %d count=%d", migration, got)
+		}
+		assertLeafMobilityDataFlow(t, fixture, fmt.Sprintf("between-observed-commits-%d", migration))
+	}
 }
 
 func TestLeafMobilityInitiatorPreservesSynchronousSubscriptionEventUntilActivation(t *testing.T) {
@@ -759,6 +832,12 @@ func TestLeafMobilityInitiatorRetiringDeferredLeafCancelsWorker(t *testing.T) {
 	if !source.publish(evidence) {
 		t.Fatal("refresh source was not subscribed")
 	}
+	fixture.client.pathsMu.RLock()
+	subject := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if subject == nil || subject.mobilityPolicyHolds.Load() == 0 {
+		t.Fatal("deferred factual refresh did not hold its selected policy leaf")
+	}
 	eventuallyEngine(t, time.Second, func() bool {
 		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
 		return ok && status.Phase == LeafMobilityInitiatorDeferred
@@ -771,7 +850,7 @@ func TestLeafMobilityInitiatorRetiringDeferredLeafCancelsWorker(t *testing.T) {
 		_, running := fixture.client.leafRefreshRunning[fixture.clientRef]
 		_, cancel := fixture.client.leafRefreshCancel[fixture.clientRef]
 		fixture.client.leafRefreshMu.Unlock()
-		return !running && !cancel
+		return !running && !cancel && subject.mobilityPolicyHolds.Load() == 0
 	})
 }
 

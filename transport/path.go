@@ -47,8 +47,13 @@ type PathInfo struct {
 	Spec    PathSpec
 	Quality PathQuality
 	Since   time.Time
-	Reads   uint64
-	Writes  uint64
+	// LocalAddr and RemoteAddr are the current physical endpoints reported by
+	// the PathConn. They may change while the logical path ID remains stable
+	// during in-place leaf mobility (for example QUIC CID rebind).
+	LocalAddr  string
+	RemoteAddr string
+	Reads      uint64
+	Writes     uint64
 	// DataWrites and ControlWrites split engine-framed egress so probes and
 	// cumulative ACKs cannot masquerade as application throughput.
 	DataWrites     uint64
@@ -59,7 +64,13 @@ type PathInfo struct {
 	// replay, so comparing the two exposes retransmission overhead without
 	// letting replay masquerade as a scheduler route decision.
 	FirstDataDispatches uint64
-	Active              bool
+	// BatchWriteCalls, BatchWriteFrames, and BatchWriteMax report successful
+	// engine-to-transport FrameBatchWriter submissions. They are zero for
+	// ordinary writes and never include control or replay traffic.
+	BatchWriteCalls  uint64
+	BatchWriteFrames uint64
+	BatchWriteMax    uint64
+	Active           bool
 	// RecvDups: inbound frames on this path whose SEQ was already
 	// delivered or buffered (race-mode duplicates, accidental
 	// retransmits). Sum across all paths equals ConnStats.RecvDups.
@@ -80,6 +91,11 @@ type PathInfo struct {
 	// implements IngressQueueObserver. It is zero for transports without a
 	// distinct observable ingress queue.
 	IngressQueue IngressQueueStats
+	// DatagramAcceleration reports the selected UDP treatment and cumulative
+	// socket evidence when the path implements DatagramAccelerationObserver.
+	// Accepted paths may share listener-wide counters. The zero value means
+	// that the transport doesn't expose datagram acceleration telemetry.
+	DatagramAcceleration DatagramAccelerationStatus
 }
 
 // PathQuality is the most recent measurement of one path.

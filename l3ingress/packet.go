@@ -133,6 +133,10 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 	if len(packet) < totalLen {
 		return PacketMeta{}, parseErr(ReasonShortPacket, fmt.Sprintf("ipv6 total=%d have=%d", totalLen, len(packet)))
 	}
+	// Never let bytes beyond the IPv6 payload-length boundary satisfy an
+	// extension or transport header. A packet buffer may contain trailing data
+	// from a larger read, but those bytes are not part of this datagram.
+	packet = packet[:totalLen]
 	var srcBytes [16]byte
 	var dstBytes [16]byte
 	copy(srcBytes[:], packet[8:24])
@@ -142,7 +146,13 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 	fragmented := false
 	more := false
 	fragOffset := 0
-	for hops := 0; isIPv6Extension(next); hops++ {
+	for hops := 0; ; hops++ {
+		if next == 50 || next == 51 {
+			return PacketMeta{}, parseErr(ReasonUnsupportedProtocol, Protocol(next).String())
+		}
+		if !isIPv6Extension(next) {
+			break
+		}
 		if hops > 8 {
 			return PacketMeta{}, parseErr(ReasonIPv6ExtensionLoop, "too many IPv6 extension headers")
 		}
@@ -232,7 +242,7 @@ func TCPFlowCloseReason(meta PacketMeta) (FlowCloseReason, bool) {
 
 func isIPv6Extension(next byte) bool {
 	switch next {
-	case 0, 43, 44, 50, 51, 60:
+	case 0, 43, 44, 60:
 		return true
 	default:
 		return false

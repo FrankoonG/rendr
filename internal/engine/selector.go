@@ -82,6 +82,7 @@ func (e *Engine) StartSelector(score ScoreFn, tickEvery time.Duration) {
 	e.selector = p
 	e.selectorMu.Unlock()
 
+	e.probeStartOnce.Do(func() { close(e.probeStart) })
 	go p.loop(e, tickEvery)
 }
 
@@ -119,7 +120,7 @@ func (p *selector) evaluate(e *Engine) {
 		if !e.dispatchScopeAllowsLocked(id) {
 			continue
 		}
-		candidates[id] = s.conn.Quality()
+		candidates[id] = s.quality()
 	}
 	e.pathsMu.RUnlock()
 
@@ -189,12 +190,17 @@ func (p *selector) evaluate(e *Engine) {
 
 func (p *selector) evaluateRecursive(e *Engine, runtime *executionRuntime) {
 	now := nowFn()
+	decisions := p.recursiveDecisions(e, runtime, now)
+	p.applyRecursiveDecisions(e, runtime, decisions, now)
+}
+
+func (p *selector) recursiveDecisions(e *Engine, runtime *executionRuntime, now time.Time) []selectorDecision {
 	policy := selectorEvidencePolicy{
 		latencyBandRatio:  e.limits.SelectorHysteresis,
 		latencyBandFloor:  e.limits.SelectorLatencyFloor,
 		minimumConfidence: 1,
 	}
-	decisions := runtime.selectorDecisions(
+	return runtime.selectorDecisions(
 		senderDirection(e.side),
 		e.selectorEvidenceObservations(),
 		now,
@@ -202,9 +208,22 @@ func (p *selector) evaluateRecursive(e *Engine, runtime *executionRuntime) {
 		e.limits.SelectorDwell,
 		e.limits.SelectorCooldown,
 	)
+}
+
+func (p *selector) applyRecursiveDecisions(
+	e *Engine,
+	runtime *executionRuntime,
+	decisions []selectorDecision,
+	now time.Time,
+) (pathDeathApplied bool) {
 	for _, decision := range decisions {
-		if err := e.SelectLocalTarget(decision.selectorID, decision.targetID, decision.cause); err == nil {
+		err := e.selectLocalTarget(decision.selectorID, decision.targetID, decision.cause, decision.origin)
+		if err == nil {
 			runtime.noteSelectorDecision(decision, now)
+			if decision.origin == policySelectionPathDeath {
+				pathDeathApplied = true
+			}
 		}
 	}
+	return pathDeathApplied
 }

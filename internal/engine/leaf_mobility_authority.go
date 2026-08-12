@@ -79,6 +79,7 @@ type leafMobilityAckEvent struct {
 type outgoingLeafMobilityTransaction struct {
 	source            PathRef
 	sourceSlot        *pathSlot
+	policyHold        *leafMobilityPolicyHold
 	prepare           proto.LeafMobilityPeerPlanPrepare
 	digest            proto.LeafMobilityProposalDigest
 	resourceTx        *leafmobility.ResourceTransaction
@@ -142,6 +143,7 @@ type incomingLeafMobilityTransaction struct {
 	plan          leafmobility.Plan
 	claim         *leafmobility.Claim
 	hold          *leafmobility.AdmissionReservation
+	policyHold    *leafMobilityPolicyHold
 	prepared      proto.LeafMobilityPeerPlanAck
 	preparedFrame []byte
 	commit        proto.LeafMobilityPeerPlanCommit
@@ -252,20 +254,21 @@ type LeafMobilityAuthority struct {
 }
 
 type leafMobilityAuthorityToken struct {
-	engine           *Engine
-	outgoing         *outgoingLeafMobilityTransaction
-	expiry           *time.Timer
-	expiryGeneration uint64
-	expiryMu         sync.Mutex
-	resolveMu        sync.Mutex
-	consumed         bool
-	execution        *leafmobility.Execution
-	done             chan struct{}
-	once             sync.Once
-	dispatchMu       sync.Mutex
-	dispatchSlot     *pathSlot
-	dispatchFenced   bool
-	localCleanupOnce sync.Once
+	engine                 *Engine
+	outgoing               *outgoingLeafMobilityTransaction
+	expiry                 *time.Timer
+	expiryGeneration       uint64
+	expiryMu               sync.Mutex
+	resolveMu              sync.Mutex
+	consumed               bool
+	execution              *leafmobility.Execution
+	done                   chan struct{}
+	once                   sync.Once
+	dispatchMu             sync.Mutex
+	dispatchSlot           *pathSlot
+	dispatchFenced         bool
+	dispatchReleasePending bool
+	localCleanupOnce       sync.Once
 }
 
 type LeafMobilityPermit struct {
@@ -487,7 +490,9 @@ func (p *LeafMobilityPermit) failClosedAfterUnprovenCommit(cause error) error {
 		return leafmobility.ErrAuthorityStale
 	}
 	terminalErr := fmt.Errorf("%w: irreversible driver commit is unproven: %w", ErrLeafMobilityOutcomeUnknown, cause)
+	p.token.engine.sessionEpochMu.Lock()
 	p.token.engine.sendClosing.Store(true)
+	p.token.engine.sessionEpochMu.Unlock()
 	p.token.engine.setCloseErr(terminalErr)
 	p.token.outcomeUnknownSerialized(terminalErr)
 	p.startLocalExecutionCleanup()
@@ -526,7 +531,7 @@ func (p *LeafMobilityPermit) Prepare(ctx context.Context) error {
 	if err := p.validateExecutionSource(); err != nil {
 		return err
 	}
-	if err := p.token.fenceExecutionDispatch(); err != nil {
+	if err := p.token.fenceExecutionDispatch(ctx); err != nil {
 		return err
 	}
 	if err := p.execution.Prepare(ctx); err != nil {
@@ -535,21 +540,30 @@ func (p *LeafMobilityPermit) Prepare(ctx context.Context) error {
 	return p.validateExecutionSource()
 }
 
-func (t *leafMobilityAuthorityToken) fenceExecutionDispatch() error {
+func (t *leafMobilityAuthorityToken) fenceExecutionDispatch(ctx context.Context) error {
 	if t == nil || t.outgoing == nil || t.outgoing.sourceSlot == nil {
 		return leafmobility.ErrAuthorityStale
 	}
 	t.dispatchMu.Lock()
-	defer t.dispatchMu.Unlock()
 	if t.dispatchFenced {
-		return nil
+		slot := t.dispatchSlot
+		t.dispatchMu.Unlock()
+		if slot == nil {
+			return leafmobility.ErrAuthorityStale
+		}
+		return slot.waitProbeWriters(ctx)
 	}
 	slot := t.outgoing.sourceSlot
 	if slot.id != t.outgoing.source.ID || slot.owner != t.outgoing.source.Owner || !slot.tryFenceDispatch() {
+		t.dispatchMu.Unlock()
 		return ErrPathTXFenced
 	}
 	t.dispatchSlot = slot
 	t.dispatchFenced = true
+	t.dispatchMu.Unlock()
+	if err := slot.waitProbeWriters(ctx); err != nil {
+		return fmt.Errorf("engine: drain path probes before leaf mobility: %w", err)
+	}
 	return nil
 }
 
@@ -558,15 +572,59 @@ func (t *leafMobilityAuthorityToken) releaseExecutionDispatch() {
 		return
 	}
 	t.dispatchMu.Lock()
-	if !t.dispatchFenced {
+	if !t.dispatchFenced || t.dispatchReleasePending {
 		t.dispatchMu.Unlock()
 		return
 	}
 	slot := t.dispatchSlot
+	if idle, active := slot.probeWritersIdleSignal(); active {
+		t.dispatchReleasePending = true
+		t.dispatchMu.Unlock()
+		t.deferExecutionDispatchRelease(idle)
+		return
+	}
 	t.dispatchSlot = nil
 	t.dispatchFenced = false
 	t.dispatchMu.Unlock()
-	if slot != nil {
+	t.reopenExecutionDispatch(slot)
+}
+
+func (t *leafMobilityAuthorityToken) deferExecutionDispatchRelease(idle <-chan struct{}) {
+	if t == nil || t.engine == nil || idle == nil {
+		return
+	}
+	wait := func() {
+		select {
+		case <-idle:
+		case <-t.engine.closed:
+			return
+		}
+		t.dispatchMu.Lock()
+		t.dispatchReleasePending = false
+		t.dispatchMu.Unlock()
+		t.releaseExecutionDispatch()
+	}
+	_ = t.engine.startLeafMobilityAsync(wait)
+}
+
+func (t *leafMobilityAuthorityToken) reopenExecutionDispatch(slot *pathSlot) {
+	if t == nil || t.engine == nil || slot == nil {
+		return
+	}
+	// Close and every production send-closing transition publish under
+	// sessionEpochMu. Holding the same lock through the physical unfence makes
+	// reopening and shutdown a single total order.
+	t.engine.sessionEpochMu.Lock()
+	defer t.engine.sessionEpochMu.Unlock()
+	reopen := !t.engine.sendClosing.Load() && !t.engine.closing.Load() && !t.engine.isClosed()
+	if t.execution != nil {
+		switch t.execution.State() {
+		case leafmobility.ExecutionFailClosedRequired, leafmobility.ExecutionFailedClosed:
+			reopen = false
+		}
+	}
+	if reopen {
+		t.engine.syncLeafMobilityPathBeforeUnfence(t.outgoing, slot)
 		slot.unfenceDispatch()
 	}
 }
@@ -991,22 +1049,30 @@ func (e *Engine) negotiateLeafMobilityAuthority(
 		released: make(chan leafMobilityAckEvent, 1), preempt: make(chan error, 1),
 	}
 	outgoing.gateHeld.Store(true)
+	outgoing.policyHold = e.acquireLeafMobilityPolicyHold(sourceSlot)
+	if outgoing.policyHold == nil {
+		e.releaseLeafMobilityOutgoingGate(outgoing)
+		return nil, leafmobility.ErrAuthorityStale
+	}
 
 	e.leafTx.mu.Lock()
 	e.pruneLeafMobilityRecordsLocked(time.Now())
 	if len(e.leafTx.actorTerminal) >= leafMobilityRecordLimit {
 		e.leafTx.mu.Unlock()
+		outgoing.policyHold.Release()
 		e.releaseLeafMobilityOutgoingGate(outgoing)
 		return nil, ErrLeafMobilityAuthorityBusy
 	}
 	if err := e.arbitrateOutgoingLeafMobilityLocked(protocolActorSide(e.side)); err != nil {
 		e.leafTx.mu.Unlock()
+		outgoing.policyHold.Release()
 		e.releaseLeafMobilityOutgoingGate(outgoing)
 		return nil, err
 	}
 	resourceTx, err := claim.ReserveResourceTransaction(plan)
 	if err != nil {
 		e.leafTx.mu.Unlock()
+		outgoing.policyHold.Release()
 		e.releaseLeafMobilityOutgoingGate(outgoing)
 		return nil, err
 	}
@@ -2101,6 +2167,9 @@ func (e *Engine) finishOutgoingLeafMobility(outgoing *outgoingLeafMobilityTransa
 	}
 	e.pruneLeafMobilityRecordsLocked(time.Now())
 	e.leafTx.mu.Unlock()
+	if outgoing.policyHold != nil {
+		outgoing.policyHold.Release()
+	}
 	e.releaseLeafMobilityOutgoingGate(outgoing)
 }
 

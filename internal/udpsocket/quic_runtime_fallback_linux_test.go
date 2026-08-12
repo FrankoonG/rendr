@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/FrankoonG/quic-go"
 	"golang.org/x/sys/unix"
 )
 

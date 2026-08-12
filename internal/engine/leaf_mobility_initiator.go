@@ -58,11 +58,18 @@ type LeafMobilityInitiatorSnapshot struct {
 }
 
 type leafMobilityRefreshEvent struct {
-	ref      PathRef
-	claim    *leafmobility.Claim
-	evidence leafmobility.RefreshEvidence
-	snapshot leafmobility.RefreshSnapshot
-	deadline time.Time
+	ref        PathRef
+	claim      *leafmobility.Claim
+	evidence   leafmobility.RefreshEvidence
+	snapshot   leafmobility.RefreshSnapshot
+	deadline   time.Time
+	policyHold *leafMobilityPolicyHold
+}
+
+func (event leafMobilityRefreshEvent) releasePolicyHold() {
+	if event.policyHold != nil {
+		event.policyHold.Release()
+	}
 }
 
 type leafMobilityRefreshBudget struct {
@@ -110,7 +117,7 @@ func (e *Engine) registerLeafMobilityRefresh(slot *pathSlot) {
 		}
 	}()
 	cancel, err := source.SubscribeLeafMobilityRefresh(subscriptionCtx, func(evidence leafmobility.RefreshEvidence) {
-		e.enqueueLeafMobilityRefresh(ref, claim, evidence)
+		e.enqueueLeafMobilityRefresh(ref, slot, claim, evidence)
 	})
 	if err != nil {
 		close(subscriptionDone)
@@ -187,15 +194,34 @@ func (s *pathSlot) cancelMobilityRefresh() {
 	}
 }
 
-func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, claim *leafmobility.Claim, evidence leafmobility.RefreshEvidence) {
+func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, sourceSlot *pathSlot, claim *leafmobility.Claim, evidence leafmobility.RefreshEvidence) {
 	if e == nil || claim == nil || e.closing.Load() {
 		return
 	}
+	initial, err := evidence.ValidateFor(claim, 0)
+	if err != nil {
+		return
+	}
+	var policyHold *leafMobilityPolicyHold
+	if initial.Reason == leafmobility.RefreshReasonRouteSourceChanged && initial.SourceUsable {
+		policyHold = e.acquireSelectedLeafMobilityPolicyHold(sourceSlot)
+	}
+	accepted := false
+	defer func() {
+		if !accepted && policyHold != nil {
+			policyHold.Release()
+		}
+	}()
 	e.pathsMu.RLock()
 	current := e.leafMobilityRefreshClaimPresentLocked(ref, claim)
+	active := e.paths[ref.ID] == sourceSlot && sourceSlot != nil && sourceSlot.owner == ref.Owner && sourceSlot.mobilityClaim == claim
 	e.pathsMu.RUnlock()
 	if !current {
 		return
+	}
+	if !active && policyHold != nil {
+		policyHold.Release()
+		policyHold = nil
 	}
 
 	e.leafRefreshMu.Lock()
@@ -224,8 +250,9 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, claim *leafmobility.Cla
 		budget.sourceGeneration = snapshot.SourceGeneration
 		e.leafRefreshBudget[ref] = budget
 	}
+	previous := e.leafRefreshPending[ref]
 	e.leafRefreshPending[ref] = leafMobilityRefreshEvent{
-		ref: ref, claim: claim, evidence: evidence, snapshot: snapshot, deadline: budget.deadline,
+		ref: ref, claim: claim, evidence: evidence, snapshot: snapshot, deadline: budget.deadline, policyHold: policyHold,
 	}
 	e.leafRefreshStatus[ref] = LeafMobilityInitiatorSnapshot{
 		Ref: ref, EvidenceGeneration: snapshot.Generation,
@@ -234,6 +261,8 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, claim *leafmobility.Cla
 		Deadline: budget.deadline,
 	}
 	e.leafRefreshMu.Unlock()
+	accepted = true
+	previous.releasePolicyHold()
 	select {
 	case e.leafRefreshWake <- struct{}{}:
 	default:
@@ -256,6 +285,7 @@ func (e *Engine) leafMobilityInitiatorLoop() {
 			e.coreWG.Add(1)
 			go func() {
 				defer e.coreWG.Done()
+				defer event.releasePolicyHold()
 				defer e.finishLeafMobilityRefreshWorker(event.ref)
 				e.executeLeafMobilityRefresh(workerCtx, event)
 			}()
@@ -443,8 +473,12 @@ func (e *Engine) executeLeafMobilityRefresh(parent context.Context, event leafMo
 		e.updateLeafMobilityRefresh(event, LeafMobilityInitiatorExecuting, plan, transactionID, nil)
 		err = permit.Execute(ctx)
 		if err == nil {
-			commitErr := e.recordCommittedLeafMobility(event)
+			commitErr, ticket, committed := e.recordCommittedLeafMobility(event)
 			e.finishLeafMobilityRefresh(event, LeafMobilityInitiatorCommitted, plan, transactionID, commitErr)
+			if committed {
+				e.fireMigrateHooks(event.ref.ID, event.ref.ID, "leaf-mobility")
+				e.tripZombie(ticket)
+			}
 			return
 		}
 		phase := LeafMobilityInitiatorFailed
@@ -541,14 +575,14 @@ func leafMobilityInitiatorRetryable(err error) bool {
 		errors.Is(err, leafmobility.ErrAuthorityStale) || errors.Is(err, leafmobility.ErrStalePlan)
 }
 
-func (e *Engine) recordCommittedLeafMobility(event leafMobilityRefreshEvent) error {
+func (e *Engine) recordCommittedLeafMobility(event leafMobilityRefreshEvent) (error, zombieTripTicket, bool) {
 	e.pathsMu.Lock()
 	slot := e.paths[event.ref.ID]
 	if slot == nil || slot.owner != event.ref.Owner || slot.mobilityClaim != event.claim {
 		e.pathsMu.Unlock()
-		return ErrStalePathRef
+		return ErrStalePathRef, zombieTripTicket{}, false
 	}
-	slot.mobilityFacts = event.claim.Snapshot()
+	e.syncPathMobilityFactsLocked(slot, event.claim)
 	committer, _ := slot.conn.(leafmobility.RefreshCommitter)
 	e.migrationCount++
 	ticket := e.accountMigration()
@@ -557,9 +591,35 @@ func (e *Engine) recordCommittedLeafMobility(event leafMobilityRefreshEvent) err
 	if committer != nil {
 		commitErr = committer.CommitLeafMobilityRefresh(event.evidence)
 	}
-	e.fireMigrateHooks(event.ref.ID, event.ref.ID, "leaf-mobility")
-	e.tripZombie(ticket)
-	return commitErr
+	return commitErr, ticket, true
+}
+
+func (e *Engine) syncLeafMobilityPathBeforeUnfence(outgoing *outgoingLeafMobilityTransaction, slot *pathSlot) {
+	if e == nil || outgoing == nil || slot == nil || outgoing.claim == nil {
+		return
+	}
+	e.pathsMu.Lock()
+	current := e.paths[outgoing.source.ID]
+	if current == slot && current.owner == outgoing.source.Owner && current.mobilityClaim == outgoing.claim {
+		e.syncPathMobilityFactsLocked(current, outgoing.claim)
+	}
+	e.pathsMu.Unlock()
+}
+
+// syncPathMobilityFactsLocked updates physical-generation evidence before TX
+// can reopen. Caller holds pathsMu. It is intentionally idempotent because the
+// automatic initiator records migration accounting after authority completion.
+func (e *Engine) syncPathMobilityFactsLocked(slot *pathSlot, claim *leafmobility.Claim) {
+	if slot == nil || claim == nil {
+		return
+	}
+	facts := claim.Snapshot()
+	changed := slot.probeEndpointGen.Load() != facts.Generation
+	slot.mobilityFacts = facts
+	if changed {
+		slot.probeEndpointGen.Store(facts.Generation)
+		e.invalidatePathProbeEvidence(slot)
+	}
 }
 
 func (e *Engine) updateLeafMobilityRefresh(
@@ -643,11 +703,13 @@ func (e *Engine) forgetLeafMobilityRefresh(ref PathRef) {
 	if cancel := e.leafRefreshCancel[ref]; cancel != nil {
 		cancel(ErrStalePathRef)
 	}
+	pending := e.leafRefreshPending[ref]
 	delete(e.leafRefreshPending, ref)
 	delete(e.leafRefreshSeen, ref)
 	delete(e.leafRefreshBudget, ref)
 	delete(e.leafRefreshStatus, ref)
 	e.leafRefreshMu.Unlock()
+	pending.releasePolicyHold()
 }
 
 func (e *Engine) leafMobilityRefreshClaimPresentLocked(ref PathRef, claim *leafmobility.Claim) bool {

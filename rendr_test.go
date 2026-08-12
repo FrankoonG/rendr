@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	gadapter "github.com/FrankoonG/rendr/transport/gvisor"
 )
 
 func testRoot(kind TargetKind, specs []PathSpec) Target {
@@ -382,6 +384,7 @@ func TestSentinelErrorsAreMatchable(t *testing.T) {
 		{"ErrPacketTooLarge", ErrPacketTooLarge, ErrPacketTooLarge},
 		{"ErrRecvWindowExceeded", ErrRecvWindowExceeded, ErrRecvWindowExceeded},
 		{"ErrReadDeadlineExceeded", ErrReadDeadlineExceeded, ErrReadDeadlineExceeded},
+		{"ErrWriteDeadlineExceeded", ErrWriteDeadlineExceeded, ErrWriteDeadlineExceeded},
 	}
 	for _, c := range cases {
 		if !errors.Is(c.got, c.pub) {
@@ -618,6 +621,12 @@ func TestM1DialAcceptRoundTrip(t *testing.T) {
 
 func TestGVisorPacketCarrierDialAcceptRoundTrip(t *testing.T) {
 	ln, err := listenRuntimeGVisorPacket("127.0.0.1:0")
+	if runtime.GOOS != "linux" {
+		if !errors.Is(err, gadapter.ErrOuterPacketUnsupported) {
+			t.Fatalf("non-Linux gVisor packet listener error=%v want ErrOuterPacketUnsupported", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2401,6 +2410,16 @@ func TestAdminConnMigrationCount(t *testing.T) {
 	}
 
 	adm := client.(testConnectionControl)
+	type migrationObservation struct {
+		oldID uint32
+		newID uint32
+		cause string
+	}
+	migrations := make(chan migrationObservation, 8)
+	cancelMigrations := adm.OnMigrate(func(oldID, newID uint32, cause string) {
+		migrations <- migrationObservation{oldID: oldID, newID: newID, cause: cause}
+	})
+	defer cancelMigrations()
 	// Initial active-path assignment does NOT count.
 	if got := adm.MigrationCount(); got != 0 {
 		t.Fatalf("initial MigrationCount=%d want 0", got)
@@ -2424,6 +2443,14 @@ func TestAdminConnMigrationCount(t *testing.T) {
 	if got := adm.MigrationCount(); got != 1 {
 		t.Fatalf("after explicit Migrate: MigrationCount=%d want 1", got)
 	}
+	select {
+	case event := <-migrations:
+		if event.oldID != cur || event.newID != other || event.cause != "explicit" {
+			t.Fatalf("explicit migration event=%+v want %d->%d explicit", event, cur, other)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit migration event did not arrive")
+	}
 
 	// Migrate to the same path is a no-op and must NOT increment.
 	if err := adm.Migrate(other); err != nil {
@@ -2435,17 +2462,29 @@ func TestAdminConnMigrationCount(t *testing.T) {
 
 	// Death-driven failover: kill the active path; engine moves to
 	// one of the remaining two. MigrationCount should now be 2.
-	activeName := pathNameByID(client.Paths(), adm.ActivePath())
+	deadID := adm.ActivePath()
+	activeName := pathNameByID(client.Paths(), deadID)
 	if activeName == "" {
-		t.Fatalf("active path %d has no fixture name", adm.ActivePath())
+		t.Fatalf("active path %d has no fixture name", deadID)
 	}
 	if err := controlled.Fail(activeName); err != nil {
 		t.Fatalf("fail active path: %v", err)
 	}
-	// Give onPathDeath a tick.
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case event := <-migrations:
+		if event.oldID != deadID || event.newID == deadID || event.newID == 0 || event.cause != "death" {
+			t.Fatalf("death migration event=%+v want %d->survivor death", event, deadID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("death migration event did not arrive")
+	}
+	select {
+	case event := <-migrations:
+		t.Fatalf("one path death produced a second migration event: %+v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
 	if got := adm.MigrationCount(); got != 2 {
-		t.Fatalf("after death failover: MigrationCount=%d want 2", got)
+		t.Fatalf("after death failover: MigrationCount=%d want 2; paths=%+v", got, adm.Paths())
 	}
 
 	// Stats() must agree with the dedicated getter.
@@ -3831,12 +3870,16 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 			Path("A", controlled.Spec(ln.Addr().String(), "A")),
 			Path("B", controlled.Spec(ln.Addr().String(), "B")),
 		}),
-		Hysteresis: 0.1,
-		Dwell:      50 * time.Millisecond,
-		Cooldown:   100 * time.Millisecond,
-		// Long probe interval keeps this test's controlled path evidence stable
-		// while the production selector evaluates it.
-		ProbeInterval: 30 * time.Second,
+		Hysteresis:    0.1,
+		Dwell:         50 * time.Millisecond,
+		Cooldown:      100 * time.Millisecond,
+		ProbeInterval: 100 * time.Millisecond,
+	}
+	if err := controlled.SetProbeDelay("A", 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlled.SetProbeDelay("B", 50*time.Millisecond); err != nil {
+		t.Fatal(err)
 	}
 	controlled.Bind(t, d)
 	client, err := d.Dial(context.Background())
@@ -3857,7 +3900,7 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 	p1ID, p2ID := pathsInfo[0].ID, pathsInfo[1].ID
 
 	startActive := observer.ActivePath()
-	// Inject qualities: current is mediocre, the other is much better.
+	// Change same-carrier probe RTTs: current is mediocre, the other is better.
 	startName := pathNameByID(pathsInfo, startActive)
 	var otherID uint32
 	if startActive == p1ID {
@@ -3866,10 +3909,10 @@ func TestM6SelectorAutoMigrateOnQualityChange(t *testing.T) {
 		otherID = p1ID
 	}
 	otherName := pathNameByID(pathsInfo, otherID)
-	if err := controlled.SetQuality(startName, PathQuality{RTT: 100 * time.Millisecond, At: time.Now()}); err != nil {
+	if err := controlled.SetProbeDelay(startName, 100*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	if err := controlled.SetQuality(otherName, PathQuality{RTT: 10 * time.Millisecond, At: time.Now()}); err != nil {
+	if err := controlled.SetProbeDelay(otherName, 10*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4469,6 +4512,186 @@ func TestM2QUICDeathTriggersMigration(t *testing.T) {
 	}
 	if string(buf) != tail {
 		t.Fatalf("post-failover payload: got %q want %q", buf, tail)
+	}
+}
+
+// TestM2QUICDeathDuringInFlightWriteReplaysWithoutApplicationError proves the
+// failure overlaps an application Write rather than landing between two
+// completed calls. The controlled wrapper pauses one published DATA frame at
+// the real QUIC leaf boundary. The peer then closes that carrier, the adapter
+// observes net.ErrClosed, and the engine must replay the frame on the existing
+// survivor without exposing the path failure or changing the byte stream. A
+// selector cutover may complete the application Write before the failed leaf
+// returns because publication has already transferred ownership to the bounded
+// replay ledger; the test therefore proves custody rather than goroutine timing.
+func TestM2QUICDeathDuringInFlightWriteReplaysWithoutApplicationError(t *testing.T) {
+	ln, err := listenRuntimeQUIC("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, acceptErr := ln.Accept(ctx)
+		if acceptErr != nil {
+			t.Errorf("accept: %v", acceptErr)
+			return
+		}
+		accepted <- conn
+	}()
+
+	controlled := newRuntimeControlledQUICTransport(t)
+	dialer := &sessionDialer{
+		Root: Selector("root", []Target{
+			Path("A", controlled.Spec(ln.Addr().String(), "A")),
+			Path("B", controlled.Spec(ln.Addr().String(), "B")),
+		}),
+		MigrationBudget: 3 * time.Second,
+		ProbeInterval:   30 * time.Second,
+	}
+	controlled.Bind(t, dialer)
+
+	client, err := dialer.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+
+	if !waitForNPaths(t, client, server, controlled.Name(), ln.Addr().String(), 2, 8*time.Second) {
+		t.Fatalf("two-path QUIC topology incomplete: client=%d server=%d", len(client.Paths()), len(server.Paths()))
+	}
+
+	observer := client.(ConnectionObserver)
+	killedID := observer.ActivePath()
+	killedName := pathNameByID(client.Paths(), killedID)
+	if killedName == "" {
+		t.Fatalf("active QUIC path %d has no controlled leaf name", killedID)
+	}
+	initial := make(map[uint32]string, len(client.Paths()))
+	for _, path := range client.Paths() {
+		initial[path.ID] = path.Spec.Opts["name"]
+	}
+	peerLocal, err := controlled.LocalAddr(killedName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlled.Block(killedName)
+	gate, err := controlled.ArmNextDataWrite(killedName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Release()
+
+	payload := make([]byte, 32*1024)
+	fillDeterministic(payload, 0x51a7)
+	wantSum := sha256.Sum256(payload)
+	type writeResult struct {
+		n   int
+		err error
+	}
+	writeDone := make(chan writeResult, 1)
+	go func() {
+		n, writeErr := client.Write(payload)
+		writeDone <- writeResult{n: n, err: writeErr}
+	}()
+
+	select {
+	case <-gate.entered:
+	case result := <-writeDone:
+		t.Fatalf("application Write returned before entering the QUIC leaf: n=%d err=%v", result.n, result.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("application Write did not reach the active QUIC leaf")
+	}
+	select {
+	case result := <-writeDone:
+		t.Fatalf("application Write was not held in flight: n=%d err=%v", result.n, result.err)
+	default:
+	}
+	custodyBeforeDeath := observer.Stats().TXReplay
+	if custodyBeforeDeath.PublishedNext <= custodyBeforeDeath.AckNext ||
+		custodyBeforeDeath.FramesInUse == 0 || custodyBeforeDeath.BytesInUse == 0 ||
+		custodyBeforeDeath.Generation == 0 {
+		t.Fatalf("blocked QUIC Write lacks replay custody before carrier death: %+v", custodyBeforeDeath)
+	}
+	custodyFrontier := custodyBeforeDeath.PublishedNext
+
+	migrationsBefore := observer.MigrationCount()
+	if _, err := ln.CloseAcceptedPeerPath("quic", peerLocal); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		attached := false
+		for _, path := range client.Paths() {
+			if path.ID == killedID {
+				attached = true
+				break
+			}
+		}
+		if !attached && observer.ActivePath() != killedID && observer.MigrationCount() > migrationsBefore {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	newActive := observer.ActivePath()
+	newName, preexisting := initial[newActive]
+	if newActive == 0 || newActive == killedID || !preexisting || newName == killedName {
+		t.Fatalf("QUIC failure did not select a pre-existing survivor while Write was blocked: killed=%d/%q active=%d/%q initial=%v",
+			killedID, killedName, newActive, newName, initial)
+	}
+	if observer.MigrationCount() <= migrationsBefore {
+		t.Fatalf("in-flight QUIC failure did not increment MigrationCount: before=%d after=%d",
+			migrationsBefore, observer.MigrationCount())
+	}
+	select {
+	case result := <-writeDone:
+		if result.n != len(payload) || result.err != nil {
+			t.Fatalf("application Write handed off with result=(%d,%v), want (%d,nil)", result.n, result.err, len(payload))
+		}
+		custodyAfterHandoff := observer.Stats().TXReplay
+		if custodyAfterHandoff.PublishedNext < custodyFrontier ||
+			(custodyAfterHandoff.AckNext < custodyFrontier && custodyAfterHandoff.FramesInUse == 0) {
+			t.Fatalf("successful selector handoff lost replay custody: before=%+v after=%+v",
+				custodyBeforeDeath, custodyAfterHandoff)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("application Write did not hand published DATA to replay while the failed leaf remained blocked")
+	}
+
+	received := make([]byte, len(payload))
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadFull(server, received)
+		readDone <- readErr
+	}()
+	select {
+	case readErr := <-readDone:
+		if readErr != nil {
+			t.Fatalf("read replayed payload before old leaf release: %v", readErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("surviving QUIC path did not deliver replay while the failed leaf remained blocked")
+	}
+	if gotSum := sha256.Sum256(received); gotSum != wantSum {
+		t.Fatalf("replayed QUIC payload hash mismatch before old leaf release: got=%x want=%x", gotSum, wantSum)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("replayed QUIC payload changed despite matching length")
+	}
+
+	gate.Release()
+	select {
+	case result := <-gate.result:
+		if !errors.Is(result.err, net.ErrClosed) {
+			t.Fatalf("real QUIC leaf Write result=(%d,%v), want net.ErrClosed", result.n, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("real QUIC leaf Write did not return after carrier death")
 	}
 }
 

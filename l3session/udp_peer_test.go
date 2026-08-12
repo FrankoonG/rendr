@@ -91,7 +91,14 @@ func TestUDPPeerRelayDispatchesIdentityAndBridgesReplies(t *testing.T) {
 		t.Fatalf("egress identity=%s want %s", got, id)
 	}
 
-	egressConn.reads <- []byte("answer")
+	egressConn.reads <- peerTestPacket{
+		payload: []byte("forged"),
+		addr:    net.UDPAddrFromAddrPort(netip.MustParseAddrPort("203.0.113.99:53")),
+	}
+	egressConn.reads <- peerTestPacket{
+		payload: []byte("answer"),
+		addr:    net.UDPAddrFromAddrPort(netip.MustParseAddrPort("198.51.100.20:53")),
+	}
 	buf := make([]byte, 32)
 	n, _, err := client.ReadFrom(buf)
 	if err != nil {
@@ -108,6 +115,29 @@ func TestUDPPeerRelayDispatchesIdentityAndBridgesReplies(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+}
+
+func TestPacketSourceMatchesIPv4AndIPv6(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		expected string
+		actual   string
+		match    bool
+	}{
+		{name: "ipv4", expected: "198.51.100.20:53", actual: "198.51.100.20:53", match: true},
+		{name: "ipv4-wrong-port", expected: "198.51.100.20:53", actual: "198.51.100.20:54"},
+		{name: "ipv6", expected: "[2001:db8::20]:53", actual: "[2001:db8::20]:53", match: true},
+		{name: "ipv6-wrong-address", expected: "[2001:db8::20]:53", actual: "[2001:db8::21]:53"},
+		{name: "mapped-ipv4", expected: "198.51.100.20:53", actual: "[::ffff:198.51.100.20]:53", match: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := netip.MustParseAddrPort(tt.expected)
+			actual := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(tt.actual))
+			if got := packetSourceMatches(actual, expected); got != tt.match {
+				t.Fatalf("packetSourceMatches(%s, %s)=%v want %v", actual, expected, got, tt.match)
+			}
+		})
 	}
 }
 
@@ -139,7 +169,7 @@ type peerTestEgress struct {
 	conn *peerTestPacketConn
 }
 
-func (e *peerTestEgress) DialTCP(context.Context, l3ingress.L3Identity) (net.Conn, error) {
+func (e *peerTestEgress) DialTCP(context.Context, l3ingress.L3Identity) (l3ingress.TCPConn, error) {
 	return nil, errors.New("UDP test egress")
 }
 
@@ -157,7 +187,7 @@ func (e *peerTestEgress) identity() l3ingress.L3Identity {
 }
 
 type peerTestPacketConn struct {
-	reads     chan []byte
+	reads     chan peerTestPacket
 	writes    chan []byte
 	done      chan struct{}
 	deadline  chan struct{}
@@ -165,9 +195,14 @@ type peerTestPacketConn struct {
 	deadOnce  sync.Once
 }
 
+type peerTestPacket struct {
+	payload []byte
+	addr    net.Addr
+}
+
 func newPeerTestPacketConn() *peerTestPacketConn {
 	return &peerTestPacketConn{
-		reads:    make(chan []byte, 4),
+		reads:    make(chan peerTestPacket, 4),
 		writes:   make(chan []byte, 4),
 		done:     make(chan struct{}),
 		deadline: make(chan struct{}),
@@ -176,8 +211,8 @@ func newPeerTestPacketConn() *peerTestPacketConn {
 
 func (c *peerTestPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	select {
-	case payload := <-c.reads:
-		return copy(p, payload), rendrPeerAddr, nil
+	case packet := <-c.reads:
+		return copy(p, packet.payload), packet.addr, nil
 	case <-c.done:
 		return 0, nil, io.EOF
 	case <-c.deadline:

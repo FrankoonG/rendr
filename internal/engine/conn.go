@@ -36,6 +36,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return c.E.SendData(p)
 }
 
+// CloseWrite sends a sequenced directional FIN while keeping reads and the
+// underlying session alive.
+func (c *Conn) CloseWrite() error { return c.E.SendStreamFin() }
+
 // Close tears down the engine.
 func (c *Conn) Close() error { return c.E.Close() }
 
@@ -43,11 +47,11 @@ func (c *Conn) Close() error { return c.E.Close() }
 func (c *Conn) LocalAddr() net.Addr  { return c.LAddr }
 func (c *Conn) RemoteAddr() net.Addr { return c.RAddr }
 
-// SetDeadline sets both the read and write deadlines. The write
-// deadline is currently a no-op; the read deadline is honored by
-// Recv/RecvPacket and returns ErrReadDeadlineExceeded when elapsed.
+// SetDeadline sets both the read and write deadlines.
 func (c *Conn) SetDeadline(t time.Time) error {
-	_ = c.SetWriteDeadline(t)
+	if err := c.SetWriteDeadline(t); err != nil {
+		return err
+	}
 	return c.SetReadDeadline(t)
 }
 
@@ -56,9 +60,6 @@ func (c *Conn) SetDeadline(t time.Time) error {
 // engine; the call itself currently never fails.
 func (c *Conn) SetReadDeadline(t time.Time) error { return c.E.SetReadDeadline(t) }
 
-// SetWriteDeadline is a no-op: rendr Writes never block on receive
-// data, only on path availability inside the migration budget, which
-// is a separate timeout. Honoring an application-level write deadline
-// would require interleaving with the dispatch loop and is deferred
-// until a concrete use case shows up.
-func (c *Conn) SetWriteDeadline(t time.Time) error { return nil }
+// SetWriteDeadline applies to pending and future application DATA writes. It
+// does not cancel protocol control or replay work already owned by the engine.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.E.SetWriteDeadline(t) }

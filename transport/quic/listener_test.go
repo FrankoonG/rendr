@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	qg "github.com/quic-go/quic-go"
+	qg "github.com/FrankoonG/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
@@ -226,7 +226,7 @@ func assertQUICListenerClaim(t *testing.T, path transport.PathConn, session leaf
 	facts := provider.LeafMobilityClaim().Snapshot()
 	if facts.Kind != leafmobility.KindQUIC || facts.Role != leafmobility.RoleAcceptor ||
 		facts.Scope != leafmobility.ScopeEndpoint || facts.Session != session ||
-		facts.Operations != 0 || facts.Generation == 0 {
+		facts.Operations != leafmobility.OperationQUICCIDRebind || facts.Generation == 0 {
 		t.Fatalf("adapter listener QUIC facts=%+v", facts)
 	}
 }

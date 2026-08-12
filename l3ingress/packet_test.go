@@ -95,6 +95,71 @@ func TestParseIPv6UDPIdentity(t *testing.T) {
 	}
 }
 
+func TestParseIPv6RejectsSecurityHeadersBeforePayloadClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		protocol   byte
+		forgedNext byte
+	}{
+		{name: "esp-forged-tcp", protocol: 50, forgedNext: byte(ProtocolTCP)},
+		{name: "ah-forged-udp", protocol: 51, forgedNext: byte(ProtocolUDP)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkt := ipv6Packet(tc.protocol, netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"), 1234, 443)
+			pkt[40] = tc.forgedNext
+			pkt[41] = 0
+
+			_, err := ParsePacket(pkt)
+			assertReason(t, err, ReasonUnsupportedProtocol)
+		})
+	}
+}
+
+func TestParseIPv6RejectsSecurityHeadersAfterExtension(t *testing.T) {
+	for _, protocol := range []byte{50, 51} {
+		pkt := make([]byte, 56)
+		pkt[0] = 0x60
+		binary.BigEndian.PutUint16(pkt[4:6], 16)
+		pkt[6] = 60
+		pkt[40] = protocol
+		pkt[41] = 0
+		pkt[48] = byte(ProtocolUDP)
+		binary.BigEndian.PutUint16(pkt[49:51], 0x1122)
+		binary.BigEndian.PutUint16(pkt[51:53], 0x3344)
+
+		_, err := ParsePacket(pkt)
+		assertReason(t, err, ReasonUnsupportedProtocol)
+	}
+}
+
+func TestParseIPv6SecurityHeaderTruncationIsBounded(t *testing.T) {
+	for _, protocol := range []byte{50, 51} {
+		t.Run(Protocol(protocol).String(), func(t *testing.T) {
+			withoutPayload := make([]byte, 40)
+			withoutPayload[0] = 0x60
+			withoutPayload[6] = protocol
+			_, err := ParsePacket(withoutPayload)
+			assertReason(t, err, ReasonUnsupportedProtocol)
+
+			truncated := append([]byte(nil), withoutPayload...)
+			binary.BigEndian.PutUint16(truncated[4:6], 8)
+			_, err = ParsePacket(truncated)
+			assertReason(t, err, ReasonShortPacket)
+		})
+	}
+}
+
+func TestParseIPv6ExtensionCannotConsumeBytesBeyondDeclaredPayload(t *testing.T) {
+	packet := make([]byte, 48)
+	packet[0] = 0x60
+	packet[6] = 60 // destination options, but declared payload length is zero
+	packet[40] = byte(ProtocolUDP)
+	packet[41] = 0
+
+	_, err := ParsePacket(packet)
+	assertReason(t, err, ReasonShortPacket)
+}
+
 func TestParseRejectsUnsupportedProtocol(t *testing.T) {
 	pkt := ipv4Packet(47, [4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 0, 0)
 	_, err := ParsePacket(pkt)

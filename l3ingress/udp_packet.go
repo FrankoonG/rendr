@@ -39,13 +39,16 @@ func AppendUDPPacket(out []byte, id L3Identity, payload []byte) ([]byte, error) 
 	if !id.SrcIP.IsValid() || !id.DstIP.IsValid() {
 		return nil, parseErr(ReasonInvalidHeader, "invalid udp endpoint address")
 	}
-	if len(payload) > 0xffff-8 {
-		return nil, parseErr(ReasonInvalidHeader, fmt.Sprintf("udp payload too large: %d", len(payload)))
-	}
 	if id.SrcIP.Is4() && id.DstIP.Is4() {
+		if len(payload) > 0xffff-20-8 {
+			return nil, parseErr(ReasonInvalidHeader, fmt.Sprintf("ipv4 udp payload too large: %d", len(payload)))
+		}
 		return appendIPv4UDPPacket(out, id, payload), nil
 	}
 	if id.SrcIP.Is6() && id.DstIP.Is6() {
+		if len(payload) > 0xffff-8 {
+			return nil, parseErr(ReasonInvalidHeader, fmt.Sprintf("ipv6 udp payload too large: %d", len(payload)))
+		}
 		return appendIPv6UDPPacket(out, id, payload), nil
 	}
 	return nil, parseErr(ReasonInvalidHeader, "mixed udp address families")

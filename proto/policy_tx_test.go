@@ -28,8 +28,8 @@ func testPolicyReservationID() PolicyReservationID {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if ProtocolMinor != 12 {
-		t.Fatalf("protocol minor=%d want=12", ProtocolMinor)
+	if ProtocolMinor != 15 {
+		t.Fatalf("protocol minor=%d want=15", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
@@ -361,15 +361,14 @@ func TestPolicyPayloadBoundsAndSemanticValidation(t *testing.T) {
 }
 
 func FuzzDecodePolicyTransactions(f *testing.F) {
-	prepare, _ := (PolicyPrepare{PolicyTransactionBinding: testPolicyBinding(), Action: PolicyActionSelectChild, SelectorID: TargetID{1}, TargetID: TargetID{2}}).Encode()
-	ack, _ := (PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}).Encode()
-	commit, _ := (PolicyCommit{PolicyTransactionBinding: testPolicyBinding(), Generation: 1, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID()}).Encode()
-	f.Add(prepare)
-	f.Add(ack)
-	f.Add(commit)
+	for _, seed := range policyTransactionFuzzSeeds(f) {
+		f.Add(seed.wire)
+		for _, boundary := range protocolFuzzBoundaries(seed.wire) {
+			f.Add(boundary.wire)
+		}
+	}
+	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		_, _ = DecodePolicyPrepare(wire)
-		_, _ = DecodePolicyAck(wire)
-		_, _ = DecodePolicyCommit(wire)
+		_ = exercisePolicyTransactionFuzzWire(t, wire)
 	})
 }

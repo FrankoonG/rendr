@@ -132,13 +132,15 @@ const (
 )
 
 type PathStatus struct {
-	ID        uint32
-	Name      string
-	Carrier   CarrierFamily
-	State     PathState
-	Active    bool
-	Mobility  MobilityStatus
-	LastError string
+	ID         uint32
+	Name       string
+	Carrier    CarrierFamily
+	State      PathState
+	Active     bool
+	LocalAddr  string
+	RemoteAddr string
+	Mobility   MobilityStatus
+	LastError  string
 }
 
 type StatusReporter interface {
@@ -273,12 +275,14 @@ func matchAttachedPath(spec PathSpec, attached []PathInfo, used []bool) int {
 
 func pathStatusFromInfo(p PathInfo, mobility MobilityStatus, carriers map[string]CarrierFamily) PathStatus {
 	return PathStatus{
-		ID:       p.ID,
-		Name:     pathSpecName(p.Spec),
-		Carrier:  carrierForPathSpec(p.Spec, carriers),
-		State:    PathAttached,
-		Active:   p.Active,
-		Mobility: mobility,
+		ID:         p.ID,
+		Name:       pathSpecName(p.Spec),
+		Carrier:    carrierForPathSpec(p.Spec, carriers),
+		State:      PathAttached,
+		Active:     p.Active,
+		LocalAddr:  p.LocalAddr,
+		RemoteAddr: p.RemoteAddr,
+		Mobility:   mobility,
 	}
 }
 

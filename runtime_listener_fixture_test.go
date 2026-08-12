@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 	gadapter "github.com/FrankoonG/rendr/transport/gvisor"
 	qadapter "github.com/FrankoonG/rendr/transport/quic"
@@ -73,7 +74,7 @@ func bindOptionalFramedFactory(tb testing.TB, dialer *sessionDialer, name string
 	case "quic":
 		carrier, factory = CarrierUDP, qadapter.New()
 	case "gvisor":
-		carrier, factory = CarrierUnknown, gadapter.New()
+		carrier, factory = CarrierUnknown, gadapter.New(gadapter.WithTrustedCarrier())
 	default:
 		tb.Fatalf("unknown optional framed factory %q", name)
 	}
@@ -114,12 +115,15 @@ func listenRuntimeGVisorPacket(address string) (*runtimeListenerFixture, error) 
 }
 
 func listenRuntimeSources(sources ...runtimeFixtureSource) (*runtimeListenerFixture, error) {
+	return listenRuntimeSourcesWithConfig(ListenConfig{}, sources...)
+}
+
+func listenRuntimeSourcesWithConfig(config ListenConfig, sources ...runtimeFixtureSource) (*runtimeListenerFixture, error) {
 	runtime, err := NewRuntime(RuntimeConfig{})
 	if err != nil {
 		return nil, err
 	}
 
-	config := ListenConfig{}
 	sourceAddrs := make(map[string]net.Addr, len(sources))
 	streams := make(map[string]*runtimeTrackedStreamListener)
 	framedPaths := make(map[string]*runtimeTrackedPathListener)
@@ -197,7 +201,7 @@ func listenRuntimeSources(sources ...runtimeFixtureSource) (*runtimeListenerFixt
 			framedPaths[source.name] = tracked
 			closers = append(closers, framed.Close)
 		case runtimeFixtureGVisorPacket:
-			framed, listenErr := gadapter.ListenPacket(source.address)
+			framed, listenErr := gadapter.ListenPacket(source.address, gadapter.WithTrustedCarrier())
 			if listenErr != nil {
 				closeSources()
 				return nil, fmt.Errorf("test runtime source %q: %w", source.name, listenErr)
@@ -440,14 +444,15 @@ type runtimeControlledTCPTransport struct {
 	id            string
 	baseTransport string
 
-	mu        sync.Mutex
-	dialCond  *sync.Cond
-	paths     []*runtimeControlledTCPPath
-	blocked   map[string]bool
-	closing   bool
-	dialing   int
-	closeOnce sync.Once
-	dialHook  func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error)
+	mu         sync.Mutex
+	dialCond   *sync.Cond
+	paths      []*runtimeControlledTCPPath
+	blocked    map[string]bool
+	probeDelay map[string]time.Duration
+	closing    bool
+	dialing    int
+	closeOnce  sync.Once
+	dialHook   func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error)
 }
 
 func newRuntimeControlledTCPTransport(t testing.TB) *runtimeControlledTCPTransport {
@@ -464,6 +469,7 @@ func newRuntimeControlledPathTransport(t testing.TB, baseTransport string) *runt
 		id:            fmt.Sprintf("control-%d", runtimeControlledTCPSequence.Add(1)),
 		baseTransport: baseTransport,
 		blocked:       make(map[string]bool),
+		probeDelay:    make(map[string]time.Duration),
 	}
 	tr.dialCond = sync.NewCond(&tr.mu)
 	runtimeControlledTCPMux.mu.Lock()
@@ -542,10 +548,12 @@ func (t *runtimeControlledTCPTransport) dialPath(ctx context.Context, spec trans
 		return nil, err
 	}
 	path := &runtimeControlledTCPPath{
-		raw:  raw,
-		base: base,
-		spec: spec.Clone(),
+		raw:              raw,
+		base:             base,
+		spec:             spec.Clone(),
+		probeDelayClosed: make(chan struct{}),
 	}
+	path.probeDelayNanos.Store(int64(t.probeDelay[pathName]))
 	if t.closing {
 		t.mu.Unlock()
 		_ = path.Close()
@@ -641,6 +649,24 @@ func (t *runtimeControlledTCPTransport) SetQuality(pathName string, quality Path
 	return nil
 }
 
+func (t *runtimeControlledTCPTransport) SetProbeDelay(pathName string, delay time.Duration) error {
+	if delay < 0 {
+		return fmt.Errorf("controlled TCP path %q probe delay is negative: %s", pathName, delay)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closing {
+		return net.ErrClosed
+	}
+	t.probeDelay[pathName] = delay
+	for _, path := range t.paths {
+		if path.spec.Opts["name"] == pathName && !path.closed.Load() {
+			path.probeDelayNanos.Store(int64(delay))
+		}
+	}
+	return nil
+}
+
 func (t *runtimeControlledTCPTransport) close() {
 	t.closeOnce.Do(func() {
 		runtimeControlledTCPMux.mu.Lock()
@@ -661,24 +687,70 @@ func (t *runtimeControlledTCPTransport) close() {
 }
 
 type runtimeControlledTCPPath struct {
-	raw    net.Conn
-	base   transport.PathConn
-	spec   transport.PathSpec
-	closed atomic.Bool
+	raw              net.Conn
+	base             transport.PathConn
+	spec             transport.PathSpec
+	closed           atomic.Bool
+	probeDelayNanos  atomic.Int64
+	probeDelayClosed chan struct{}
+	probeDelayOnce   sync.Once
 
 	qualityMu     sync.RWMutex
 	forcedQuality *transport.PathQuality
+
+	writeGateMu sync.Mutex
+	writeGate   *runtimePathWriteGate
 }
 
-func (p *runtimeControlledTCPPath) Read(buf []byte) (int, error) { return p.base.Read(buf) }
+func (p *runtimeControlledTCPPath) Read(buf []byte) (int, error) {
+	n, err := p.base.Read(buf)
+	if n > 0 && isPathProbeControl(buf[:n], proto.CtrlPathProbeReply) {
+		delay := time.Duration(p.probeDelayNanos.Load())
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-p.probeDelayClosed:
+				return 0, net.ErrClosed
+			}
+		}
+	}
+	return n, err
+}
 
 func (p *runtimeControlledTCPPath) Write(frame []byte) (int, error) {
-	return p.base.Write(frame)
+	p.writeGateMu.Lock()
+	gate := p.writeGate
+	if gate != nil && gate.matches(frame) {
+		p.writeGate = nil
+	} else {
+		gate = nil
+	}
+	p.writeGateMu.Unlock()
+	if gate != nil {
+		close(gate.entered)
+		<-gate.release
+	}
+	n, err := p.base.Write(frame)
+	if gate != nil {
+		gate.result <- runtimePathWriteResult{n: n, err: err}
+	}
+	return n, err
 }
 
 func (p *runtimeControlledTCPPath) Close() error {
 	p.closed.Store(true)
+	p.probeDelayOnce.Do(func() { close(p.probeDelayClosed) })
 	return p.base.Close()
+}
+
+func isPathProbeControl(frame []byte, code proto.CtrlCode) bool {
+	if len(frame) < proto.HeaderSize {
+		return false
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	return err == nil && header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == code
 }
 
 func (p *runtimeControlledTCPPath) Quality() transport.PathQuality {
@@ -746,6 +818,57 @@ func (p *runtimeControlledTCPPath) Fail() error {
 	}
 	p.closed.Store(true)
 	return p.raw.Close()
+}
+
+type runtimePathWriteResult struct {
+	n   int
+	err error
+}
+
+type runtimePathWriteGate struct {
+	entered     chan struct{}
+	release     chan struct{}
+	result      chan runtimePathWriteResult
+	releaseOnce sync.Once
+	frameType   proto.FrameType
+}
+
+func newRuntimePathWriteGate(frameType proto.FrameType) *runtimePathWriteGate {
+	return &runtimePathWriteGate{
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+		result:    make(chan runtimePathWriteResult, 1),
+		frameType: frameType,
+	}
+}
+
+func (g *runtimePathWriteGate) matches(frame []byte) bool {
+	if g == nil || len(frame) < proto.HeaderSize {
+		return false
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	return err == nil && header.Type == g.frameType
+}
+
+func (g *runtimePathWriteGate) Release() {
+	if g != nil {
+		g.releaseOnce.Do(func() { close(g.release) })
+	}
+}
+
+func (t *runtimeControlledTCPTransport) ArmNextDataWrite(pathName string) (*runtimePathWriteGate, error) {
+	path, err := t.path(pathName)
+	if err != nil {
+		return nil, err
+	}
+	gate := newRuntimePathWriteGate(proto.FrameData)
+	path.writeGateMu.Lock()
+	defer path.writeGateMu.Unlock()
+	if path.writeGate != nil {
+		return nil, fmt.Errorf("controlled path %q already has an armed write gate", pathName)
+	}
+	path.writeGate = gate
+	return gate, nil
 }
 
 type runtimeTrackedPacketFactory struct {

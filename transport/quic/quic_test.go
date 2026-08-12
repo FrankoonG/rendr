@@ -6,11 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	qg "github.com/quic-go/quic-go"
+	qg "github.com/FrankoonG/quic-go"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
@@ -123,6 +124,58 @@ func TestQUICRoundTrip(t *testing.T) {
 	}
 }
 
+func TestQUICWatchConnPreservesRemoteApplicationErrorCause(t *testing.T) {
+	pair := newPair(t)
+	if _, err := pair.client.Write([]byte("open-stream")); err != nil {
+		t.Fatal(err)
+	}
+	server := pair.awaitServer(t)
+
+	type deathResult struct {
+		cause transport.DeathCause
+		err   error
+	}
+	death := make(chan deathResult, 1)
+	pair.client.OnDeath(func(cause transport.DeathCause, err error) {
+		death <- deathResult{cause: cause, err: err}
+	})
+
+	const wantCode qg.ApplicationErrorCode = 0x51a7
+	if err := server.conn.CloseWithError(wantCode, "typed remote failure"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-death:
+		if got.cause != transport.CauseTransportError {
+			t.Fatalf("death cause=%v want TransportError", got.cause)
+		}
+		var applicationErr *qg.ApplicationError
+		if !errors.As(got.err, &applicationErr) {
+			t.Fatalf("death error=%T %v, want *quic.ApplicationError", got.err, got.err)
+		}
+		if applicationErr.ErrorCode != wantCode || !applicationErr.Remote {
+			t.Fatalf("application error=%+v want remote code %#x", applicationErr, wantCode)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("client OnDeath did not receive the remote QUIC application error")
+	}
+}
+
+func TestConnectionDeathCauseSuppressesOnlyBareCancellation(t *testing.T) {
+	typed := errors.New("typed transport failure")
+	typedCtx, cancelTyped := context.WithCancelCause(context.Background())
+	cancelTyped(typed)
+	if got := connectionDeathCause(typedCtx); !errors.Is(got, typed) {
+		t.Fatalf("typed cause=%v want %v", got, typed)
+	}
+
+	plainCtx, cancelPlain := context.WithCancel(context.Background())
+	cancelPlain()
+	if got := connectionDeathCause(plainCtx); got != nil {
+		t.Fatalf("bare cancellation cause=%v want nil", got)
+	}
+}
+
 func TestQUICAdapterOwnershipDoesNotUpgradeExternalAccept(t *testing.T) {
 	p := newPair(t)
 	claim := p.client.LeafMobilityClaim()
@@ -131,7 +184,7 @@ func TestQUICAdapterOwnershipDoesNotUpgradeExternalAccept(t *testing.T) {
 	}
 	facts := claim.Snapshot()
 	if facts.Kind != leafmobility.KindQUIC || facts.Role != leafmobility.RoleDialer ||
-		facts.Scope != leafmobility.ScopeEndpoint || facts.Operations != 0 || facts.Generation == 0 {
+		facts.Scope != leafmobility.ScopeEndpoint || facts.Operations != leafmobility.OperationQUICCIDRebind || facts.Generation == 0 {
 		t.Fatalf("adapter-dialed QUIC facts=%+v", facts)
 	}
 	if _, err := p.client.Write([]byte("ownership")); err != nil {

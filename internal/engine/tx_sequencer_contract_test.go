@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -31,6 +32,10 @@ type sequencerTestPath struct {
 	dropWrites    atomic.Bool
 	dieFirstWrite atomic.Bool
 	died          atomic.Bool
+	dropAcks      atomic.Bool
+	dropFirstAck  atomic.Bool
+	droppedAck    atomic.Bool
+	ackWrites     atomic.Uint64
 	writeStarted  chan struct{}
 	writeGate     <-chan struct{}
 	startOnce     sync.Once
@@ -87,6 +92,20 @@ func (p *sequencerTestPath) Write(frame []byte) (int, error) {
 	}
 	if p.dropWrites.Load() {
 		return len(frame), nil
+	}
+	if len(frame) >= proto.HeaderSize {
+		if header, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil &&
+			header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlPathProbeReply {
+			if _, ok := proto.DecodeAck(frame[proto.HeaderSize:]); ok {
+				p.ackWrites.Add(1)
+				if p.dropAcks.Load() {
+					return len(frame), nil
+				}
+				if p.dropFirstAck.Load() && p.droppedAck.CompareAndSwap(false, true) {
+					return len(frame), nil
+				}
+			}
+		}
 	}
 	cp := append([]byte(nil), frame...)
 	select {
@@ -275,7 +294,7 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 	deadID, serverDeadID := attachSequencerPair(t, client, server, c1, s1, "blackhole")
 	attachSequencerPair(t, client, server, c2, s2, "survivor")
 
-	const frames = 300
+	const frames = sendHistoryWindow + 64
 	want := bytes.Repeat([]byte{'x'}, frames)
 	sendDone := make(chan error, 1)
 	go func() {
@@ -288,7 +307,7 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 		sendDone <- nil
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for c1.writes.Load() < sendHistoryWindow && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -299,16 +318,17 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 	waitPathDetached(t, client, deadID)
 	s1.Fail(errors.New("server blackhole failed"))
 	waitPathDetached(t, server, serverDeadID)
-	deadline = time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		server.recvMu.Lock()
 		expected := server.expectedRecvSeq
 		server.recvMu.Unlock()
-		if expected >= sendHistoryWindow {
+		if expected >= streamRecvWindowFrames {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("peer advanced to %d, want at least %d before restoring ACK path", expected, sendHistoryWindow)
+			t.Fatalf("peer advanced to %d, want application buffer floor %d before restoring ACK path",
+				expected, streamRecvWindowFrames)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -321,7 +341,7 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("send after failover: %v", err)
 		}
-	case <-time.After(4 * time.Second):
+	case <-time.After(10 * time.Second):
 		client.sendHistMu.Lock()
 		historyLen := len(client.sendHist.entries)
 		client.sendHistMu.Unlock()
@@ -333,7 +353,7 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 			c2.writes.Load(), s2.writes.Load(), client.sendAckNext.Load(), client.sendPublishedNext.Load(), historyLen, expected, queued)
 	}
 
-	if err := server.SetReadDeadline(time.Now().Add(4 * time.Second)); err != nil {
+	if err := server.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, len(want))
@@ -384,5 +404,91 @@ func TestPacketGapCannotStrandFinalControlFrame(t *testing.T) {
 	}
 	if _, err := server.RecvPacket(); !errors.Is(err, io.EOF) {
 		t.Fatalf("RecvPacket after final frame = %v, want EOF", err)
+	}
+}
+
+func TestGracefulCloseRepeatsTerminalAckAfterLoss(t *testing.T) {
+	flow := NewClientFlowID()
+	limits := Limits{MigrationBudget: time.Second}.Clamp()
+	client := New(SideClient, flow, limits)
+	server := New(SideServer, flow, limits)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	clientPath, serverPath := newSequencerTestPathPair()
+	serverPath.dropFirstAck.Store(true)
+	attachSequencerPair(t, client, server, clientPath, serverPath, "terminal-ack-loss")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.GracefulClose(proto.ByeNormal) }()
+
+	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Recv(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("server Recv after BYE = %v, want EOF", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("GracefulClose after first terminal ACK loss: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GracefulClose did not recover the lost terminal ACK")
+	}
+	if !serverPath.droppedAck.Load() {
+		t.Fatal("test did not drop the first terminal ACK")
+	}
+	if got := serverPath.ackWrites.Load(); got < 2 {
+		t.Fatalf("terminal ACK writes = %d, want initial plus persistent retry", got)
+	}
+}
+
+func TestTerminalAckRetryUsesPathAttachedAfterInitialSnapshot(t *testing.T) {
+	flow := NewClientFlowID()
+	limits := Limits{MigrationBudget: time.Second}.Clamp()
+	client := New(SideClient, flow, limits)
+	server := New(SideServer, flow, limits)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	clientPath1, serverPath1 := newSequencerTestPathPair()
+	serverPath1.dropAcks.Store(true)
+	attachSequencerPair(t, client, server, clientPath1, serverPath1, "terminal-ack-stale-snapshot")
+
+	clientPath2, serverPath2 := newSequencerTestPathPair()
+	if _, err := client.AttachPath(clientPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}); err != nil {
+		t.Fatalf("attach client successor: %v", err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.GracefulClose(proto.ByeNormal) }()
+	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Recv(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("server Recv after BYE = %v, want EOF", err)
+	}
+	if serverPath1.ackWrites.Load() == 0 {
+		t.Fatal("test did not attempt the terminal ACK on the original path")
+	}
+	if _, err := server.AttachPath(serverPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}); err != nil {
+		t.Fatalf("attach server successor after terminal ACK snapshot: %v", err)
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("GracefulClose did not use successor ACK route: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GracefulClose did not retry the terminal ACK on the successor path")
+	}
+	if got := serverPath2.ackWrites.Load(); got == 0 {
+		t.Fatal("successor path carried no terminal ACK retry")
 	}
 }

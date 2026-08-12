@@ -2,6 +2,8 @@ package engine
 
 import (
 	"errors"
+	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,7 +11,34 @@ import (
 
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
+	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 )
+
+func TestSynchronousCleanDeathCallbackDoesNotMakeCloseWaitForItsReader(t *testing.T) {
+	e := New(SideServer, NewClientFlowID(), Limits{}.Clamp())
+	local, peer := net.Pipe()
+	defer peer.Close()
+	path := basetcp.Wrap(local)
+	path.MarkByeSeen()
+	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "tcp", Address: "synchronous-clean-death"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-e.Closed():
+	case <-time.After(time.Second):
+		_ = e.Close()
+		t.Fatal("clean transport death did not quiesce the engine")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("clean transport callback poisoned Close result: %v", err)
+	}
+	if err := e.CloseErr(); !errors.Is(err, io.EOF) {
+		t.Fatalf("CloseErr = %v, want io.EOF", err)
+	}
+}
 
 func TestPreparedPathIsInvisibleUntilBridgeAckCommit(t *testing.T) {
 	manifest, ids := runtimeGraph(t,

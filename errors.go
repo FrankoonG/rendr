@@ -27,10 +27,16 @@ var (
 	ErrRecvWindowExceeded          = engine.ErrRecvWindowExceeded
 	ErrPathAdmissionOutcomeUnknown = engine.ErrPathAdmissionOutcomeUnknown
 	ErrPathAdmissionRejected       = engine.ErrPathAdmissionRejected
+	ErrSequenceExhausted           = engine.ErrSequenceExhausted
 
 	// ErrReadDeadlineExceeded is the sentinel returned by Read /
 	// ReadFrom when a SetReadDeadline-set deadline elapses before
 	// payload is ready. Implements net.Error with Timeout()==true so
 	// idiomatic timeout checks via errors.As work transparently.
 	ErrReadDeadlineExceeded net.Error = engine.ErrReadDeadlineExceeded
+
+	// ErrWriteDeadlineExceeded is returned by Write / WriteTo when an
+	// application write deadline expires. A non-zero byte count means complete
+	// stream frames, or one complete datagram, were already accepted.
+	ErrWriteDeadlineExceeded net.Error = engine.ErrWriteDeadlineExceeded
 )

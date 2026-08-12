@@ -8,10 +8,12 @@
 // QUIC streams are byte-oriented just like TCP, so the 2-byte
 // length prefix is still required.
 //
-// Path-layer migration in rendr remains "swap which PathConn is
-// active". QUIC's own ConnID-based migration (RFC 9000 §9) handles
-// intra-path UDP rebinding (e.g. NIC change) automatically through
-// quic-go; rendr does not generally drive that machinery in M2.
+// Dialed paths own the quic-go connection and a bounded active/standby UDP
+// transport pair. A factual route/source refresh automatically enters rendr's
+// leaf-mobility transaction, which validates a private path with AddPath and
+// Probe before Publish calls Switch on the same QUIC connection. Accepted
+// endpoints provide peer evidence but never initiate unsupported server-side
+// quic-go migration. There is no public mobility selector.
 //
 // Hard rule #2 compliance: a quic-go ApplicationError /
 // TransportError / IdleTimeoutError / HandshakeTimeoutError surfaces

@@ -5,10 +5,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/transport"
 )
 
 // TestM9X5StreamPathFactoryRoundTrip drives an internal session dialer through
@@ -625,3 +629,536 @@ func assertFactoryPacketRoundTrip(t *testing.T, client, server PacketConn, paylo
 		t.Fatalf("packet payload=%q, want %q", got[:n], payload)
 	}
 }
+
+const factoryBoundaryFailureCount = 1000
+
+func TestPathFactoryResolverStreamTrustBoundaryHighCount(t *testing.T) {
+	const factoryID = "hostile-stream"
+	panicValue := &factoryBoundaryPanicValue{}
+	factoryErr := errors.New("stream factory conflict")
+	var calls atomic.Int64
+	var conflictedClosed atomic.Int64
+	var healthy *factoryBoundaryStreamConn
+	resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+		factoryID: func(context.Context, string) (net.Conn, error) {
+			switch call := calls.Add(1); {
+			case call <= factoryBoundaryFailureCount:
+				panic(panicValue)
+			case call <= 2*factoryBoundaryFailureCount:
+				return nil, nil
+			case call <= 3*factoryBoundaryFailureCount:
+				var typedNil *factoryBoundaryStreamConn
+				return typedNil, nil
+			case call <= 4*factoryBoundaryFailureCount:
+				return &factoryBoundaryStreamConn{closeHook: func() { conflictedClosed.Add(1) }}, factoryErr
+			default:
+				healthy = &factoryBoundaryStreamConn{}
+				return healthy, nil
+			}
+		},
+	}}
+	spec := PathSpec{Transport: factoryID, Address: "unused"}
+
+	// The first call has the initial-dial shape; the rest exercise the same
+	// immutable resolver entry point used by recovery retries.
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("panic call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonPanic, panicValue)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("typed-nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("conflicting call returned path %T", path)
+		}
+		if !errors.Is(err, factoryErr) {
+			t.Fatalf("conflicting call error=%v, want %v", err, factoryErr)
+		}
+	}
+	if got := conflictedClosed.Load(); got != factoryBoundaryFailureCount {
+		t.Fatalf("conflicting stream results closed=%d, want %d", got, factoryBoundaryFailureCount)
+	}
+
+	path, err := resolver.dialPath(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("healthy call after failures: %v", err)
+	}
+	if path == nil || healthy == nil {
+		t.Fatalf("healthy call returned path=%T conn=%v", path, healthy)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatalf("close healthy path: %v", err)
+	}
+	if !healthy.closed.Load() {
+		t.Fatal("healthy stream connection was not owned by returned path")
+	}
+	if got, want := calls.Load(), int64(4*factoryBoundaryFailureCount+1); got != want {
+		t.Fatalf("factory calls=%d, want %d", got, want)
+	}
+}
+
+func TestPathFactoryResolverPacketTrustBoundaryHighCount(t *testing.T) {
+	const factoryID = "hostile-packet"
+	panicValue := &factoryBoundaryPanicValue{}
+	factoryErr := errors.New("packet factory conflict")
+	var calls atomic.Int64
+	var conflictedClosed atomic.Int64
+	var healthy *factoryBoundaryPacketConn
+	resolver := &pathFactoryResolver{packet: map[string]packetPathFactory{
+		factoryID: func(context.Context, string) (net.PacketConn, error) {
+			switch call := calls.Add(1); {
+			case call <= factoryBoundaryFailureCount:
+				panic(panicValue)
+			case call <= 2*factoryBoundaryFailureCount:
+				return nil, nil
+			case call <= 3*factoryBoundaryFailureCount:
+				var typedNil *factoryBoundaryPacketConn
+				return typedNil, nil
+			case call <= 4*factoryBoundaryFailureCount:
+				return &factoryBoundaryPacketConn{closeHook: func() { conflictedClosed.Add(1) }}, factoryErr
+			default:
+				healthy = &factoryBoundaryPacketConn{}
+				return healthy, nil
+			}
+		},
+	}}
+	spec := PathSpec{Transport: factoryID, Address: "127.0.0.1:1"}
+
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("panic call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonPanic, panicValue)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("typed-nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("conflicting call returned path %T", path)
+		}
+		if !errors.Is(err, factoryErr) {
+			t.Fatalf("conflicting call error=%v, want %v", err, factoryErr)
+		}
+	}
+	if got := conflictedClosed.Load(); got != factoryBoundaryFailureCount {
+		t.Fatalf("conflicting packet results closed=%d, want %d", got, factoryBoundaryFailureCount)
+	}
+
+	path, err := resolver.dialPath(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("healthy call after failures: %v", err)
+	}
+	if path == nil || healthy == nil {
+		t.Fatalf("healthy call returned path=%T conn=%v", path, healthy)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatalf("close healthy path: %v", err)
+	}
+	if !healthy.closed.Load() {
+		t.Fatal("healthy packet connection was not owned by returned path")
+	}
+	if got, want := calls.Load(), int64(4*factoryBoundaryFailureCount+1); got != want {
+		t.Fatalf("factory calls=%d, want %d", got, want)
+	}
+}
+
+func TestPathFactoryResolverFramedTrustBoundaryHighCount(t *testing.T) {
+	const factoryID = "hostile-framed"
+	panicValue := &factoryBoundaryPanicValue{}
+	factoryErr := errors.New("framed factory conflict")
+	var calls atomic.Int64
+	var conflictedClosed atomic.Int64
+	var healthy *factoryBoundaryPathConn
+	factory := &factoryBoundaryFramedFactory{dial: func(context.Context, PathSpec) (transport.PathConn, error) {
+		switch call := calls.Add(1); {
+		case call <= factoryBoundaryFailureCount:
+			panic(panicValue)
+		case call <= 2*factoryBoundaryFailureCount:
+			return nil, nil
+		case call <= 3*factoryBoundaryFailureCount:
+			var typedNil *factoryBoundaryPathConn
+			return typedNil, nil
+		case call <= 4*factoryBoundaryFailureCount:
+			return &factoryBoundaryPathConn{closeHook: func() { conflictedClosed.Add(1) }}, factoryErr
+		default:
+			healthy = &factoryBoundaryPathConn{}
+			return healthy, nil
+		}
+	}}
+	resolver := &pathFactoryResolver{framed: map[string]transport.PathFactory{factoryID: factory}}
+	spec := PathSpec{Transport: factoryID, Address: "unused"}
+
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("panic call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindFramed, FactoryReasonPanic, panicValue)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindFramed, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("typed-nil call returned path %T", path)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindFramed, FactoryReasonNilResult, nil)
+	}
+	for range factoryBoundaryFailureCount {
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("conflicting call returned path %T", path)
+		}
+		if !errors.Is(err, factoryErr) {
+			t.Fatalf("conflicting call error=%v, want %v", err, factoryErr)
+		}
+	}
+	if got := conflictedClosed.Load(); got != factoryBoundaryFailureCount {
+		t.Fatalf("conflicting framed results closed=%d, want %d", got, factoryBoundaryFailureCount)
+	}
+
+	path, err := resolver.dialPath(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("healthy call after failures: %v", err)
+	}
+	if path != healthy || healthy == nil {
+		t.Fatalf("healthy call returned path=%T want %T", path, healthy)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatalf("close healthy path: %v", err)
+	}
+	if !healthy.closed.Load() {
+		t.Fatal("healthy framed connection was not closed")
+	}
+	if got, want := calls.Load(), int64(4*factoryBoundaryFailureCount+1); got != want {
+		t.Fatalf("factory calls=%d, want %d", got, want)
+	}
+}
+
+func TestPathFactoryResolverPreservesFactoryContextCancellation(t *testing.T) {
+	const factoryID = "cancel-stream"
+	spec := PathSpec{Transport: factoryID, Address: "unused"}
+
+	t.Run("already canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var calls atomic.Int32
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				calls.Add(1)
+				panic("must not be invoked")
+			},
+		}}
+		if _, err := resolver.dialPath(ctx, spec); !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error=%v, want context cancellation", err)
+		}
+		if calls.Load() != 0 {
+			t.Fatalf("canceled dial invoked factory %d times", calls.Load())
+		}
+	})
+
+	t.Run("canceled during panic", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		panicValue := &factoryBoundaryPanicValue{}
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				cancel()
+				panic(panicValue)
+			},
+		}}
+		_, err := resolver.dialPath(ctx, spec)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error=%v, want context cancellation", err)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonPanic, panicValue)
+	})
+
+	t.Run("canceled during nil result", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				cancel()
+				return nil, nil
+			},
+		}}
+		_, err := resolver.dialPath(ctx, spec)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error=%v, want context cancellation", err)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonNilResult, nil)
+	})
+
+	t.Run("canceled during successful result", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		late := &factoryBoundaryStreamConn{}
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				cancel()
+				return late, nil
+			},
+		}}
+		path, err := resolver.dialPath(ctx, spec)
+		if path != nil {
+			t.Fatalf("canceled dial returned a late path %T", path)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error=%v, want context cancellation", err)
+		}
+		if !late.closed.Load() {
+			t.Fatal("late successful factory result was not closed")
+		}
+	})
+
+	t.Run("cleanup panic remains typed", func(t *testing.T) {
+		factoryErr := errors.New("factory returned conflicting error")
+		panicValue := &factoryBoundaryPanicValue{}
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				return &factoryBoundaryStreamConn{closeHook: func() { panic(panicValue) }}, factoryErr
+			},
+		}}
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("conflicting factory returned path %T", path)
+		}
+		if !errors.Is(err, factoryErr) {
+			t.Fatalf("cleanup error=%v, want original %v", err, factoryErr)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonCleanup, panicValue)
+	})
+
+	t.Run("cleanup Goexit remains typed", func(t *testing.T) {
+		factoryErr := errors.New("factory returned conflicting error")
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				return &factoryBoundaryStreamConn{closeHook: runtime.Goexit}, factoryErr
+			},
+		}}
+		path, err := resolver.dialPath(context.Background(), spec)
+		if path != nil {
+			t.Fatalf("conflicting factory returned path %T", path)
+		}
+		if !errors.Is(err, factoryErr) {
+			t.Fatalf("cleanup error=%v, want original %v", err, factoryErr)
+		}
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonCleanup, nil)
+	})
+
+	t.Run("factory cancellation error", func(t *testing.T) {
+		resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+			factoryID: func(context.Context, string) (net.Conn, error) {
+				return nil, context.Canceled
+			},
+		}}
+		if _, err := resolver.dialPath(context.Background(), spec); err != context.Canceled {
+			t.Fatalf("dial error=%v, want unchanged context.Canceled", err)
+		}
+	})
+}
+
+func TestPathFactoryResolverContainsGoexit(t *testing.T) {
+	const factoryID = "goexit-stream"
+	var calls atomic.Int32
+	var healthy *factoryBoundaryStreamConn
+	resolver := &pathFactoryResolver{stream: map[string]streamPathFactory{
+		factoryID: func(context.Context, string) (net.Conn, error) {
+			if calls.Add(1) == 1 {
+				runtime.Goexit()
+				return nil, errors.New("runtime.Goexit returned")
+			}
+			healthy = &factoryBoundaryStreamConn{}
+			return healthy, nil
+		},
+	}}
+	spec := PathSpec{Transport: factoryID, Address: "unused"}
+	path, err := resolver.dialPath(context.Background(), spec)
+	if path != nil {
+		t.Fatalf("runtime.Goexit returned path %T", path)
+	}
+	assertFactoryBoundaryError(t, err, factoryID, FactoryKindStream, FactoryReasonAbnormal, nil)
+
+	path, err = resolver.dialPath(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("healthy call after Goexit: %v", err)
+	}
+	if path == nil || healthy == nil {
+		t.Fatalf("healthy call returned path=%T conn=%v", path, healthy)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatalf("close healthy path: %v", err)
+	}
+}
+
+func TestPathFactoryResolverDoesNotRecoverBuiltinPanic(t *testing.T) {
+	panicValue := &factoryBoundaryPanicValue{}
+	resolver := &pathFactoryResolver{framed: map[string]transport.PathFactory{
+		"tcp": &factoryBoundaryFramedFactory{dial: func(context.Context, PathSpec) (transport.PathConn, error) {
+			panic(panicValue)
+		}},
+	}}
+	defer func() {
+		if recovered := recover(); recovered != panicValue {
+			t.Fatalf("builtin panic recovered=%T, want original %T", recovered, panicValue)
+		}
+	}()
+	_, _ = resolver.dialPath(context.Background(), PathSpec{Transport: "tcp", Address: "unused"})
+	t.Fatal("built-in factory panic was converted to an error")
+}
+
+func assertFactoryBoundaryError(
+	t *testing.T,
+	err error,
+	factoryID string,
+	kind FactoryKind,
+	reason FactoryErrorReason,
+	panicValue any,
+) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("factory call returned nil error")
+	}
+	var factoryErr *FactoryError
+	if !errors.As(err, &factoryErr) {
+		t.Fatalf("factory error type=%T, want *FactoryError: %v", err, err)
+	}
+	if factoryErr.FactoryID != factoryID || factoryErr.Kind != kind || factoryErr.Reason != reason {
+		t.Fatalf("factory error=%+v, want id=%q kind=%q reason=%q", factoryErr, factoryID, kind, reason)
+	}
+	wantPanicType := ""
+	if panicValue != nil {
+		wantPanicType = reflect.TypeOf(panicValue).String()
+	}
+	if factoryErr.PanicType != wantPanicType {
+		t.Fatalf("panic type=%q, want %q", factoryErr.PanicType, wantPanicType)
+	}
+	_ = err.Error()
+}
+
+type factoryBoundaryPanicValue struct{}
+
+func (*factoryBoundaryPanicValue) Error() string {
+	panic("factory panic payload must not be formatted")
+}
+
+type factoryBoundaryAddr string
+
+func (a factoryBoundaryAddr) Network() string { return "factory-boundary" }
+func (a factoryBoundaryAddr) String() string  { return string(a) }
+
+type factoryBoundaryStreamConn struct {
+	closed    atomic.Bool
+	closeHook func()
+}
+
+func (*factoryBoundaryStreamConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *factoryBoundaryStreamConn) Write(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return len(p), nil
+}
+func (c *factoryBoundaryStreamConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) && c.closeHook != nil {
+		c.closeHook()
+	}
+	return nil
+}
+func (*factoryBoundaryStreamConn) LocalAddr() net.Addr              { return factoryBoundaryAddr("local") }
+func (*factoryBoundaryStreamConn) RemoteAddr() net.Addr             { return factoryBoundaryAddr("remote") }
+func (*factoryBoundaryStreamConn) SetDeadline(time.Time) error      { return nil }
+func (*factoryBoundaryStreamConn) SetReadDeadline(time.Time) error  { return nil }
+func (*factoryBoundaryStreamConn) SetWriteDeadline(time.Time) error { return nil }
+
+type factoryBoundaryPacketConn struct {
+	closed    atomic.Bool
+	closeHook func()
+}
+
+func (*factoryBoundaryPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, io.EOF
+}
+func (c *factoryBoundaryPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return len(p), nil
+}
+func (c *factoryBoundaryPacketConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) && c.closeHook != nil {
+		c.closeHook()
+	}
+	return nil
+}
+func (*factoryBoundaryPacketConn) LocalAddr() net.Addr              { return factoryBoundaryAddr("local") }
+func (*factoryBoundaryPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*factoryBoundaryPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*factoryBoundaryPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+type factoryBoundaryFramedFactory struct {
+	dial func(context.Context, PathSpec) (transport.PathConn, error)
+}
+
+func (f *factoryBoundaryFramedFactory) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+	return f.dial(ctx, spec)
+}
+func (*factoryBoundaryFramedFactory) Probe(context.Context, transport.PathSpec) (transport.PathQuality, error) {
+	return transport.PathQuality{}, nil
+}
+
+type factoryBoundaryPathConn struct {
+	closed    atomic.Bool
+	closeHook func()
+}
+
+func (*factoryBoundaryPathConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *factoryBoundaryPathConn) Write(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return len(p), nil
+}
+func (c *factoryBoundaryPathConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) && c.closeHook != nil {
+		c.closeHook()
+	}
+	return nil
+}
+func (*factoryBoundaryPathConn) Quality() transport.PathQuality            { return transport.PathQuality{} }
+func (*factoryBoundaryPathConn) OnDeath(func(transport.DeathCause, error)) {}
+func (*factoryBoundaryPathConn) LocalAddr() string                         { return "local" }
+func (*factoryBoundaryPathConn) RemoteAddr() string                        { return "remote" }

@@ -18,6 +18,7 @@ func TestBuildSessionRequestMapsTCPAndUDP(t *testing.T) {
 	tcpReq, err := BuildSessionRequest(PacketEvent{
 		Meta: PacketMeta{Identity: tcpID},
 		Flow: FlowMeta{L3Identity: tcpID},
+		Ref:  FlowRef{Identity: tcpID, Generation: 7},
 		Decision: FlowDecision{
 			Peer:   "peer-a",
 			Root:   root,
@@ -29,7 +30,7 @@ func TestBuildSessionRequestMapsTCPAndUDP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tcpReq.Kind != SessionKindStream || tcpReq.Identity != tcpID || tcpReq.Peer != "peer-a" || tcpReq.Root != root || tcpReq.Egress != "direct" || !tcpReq.PreserveL3Identity {
+	if tcpReq.Kind != SessionKindStream || tcpReq.Identity != tcpID || tcpReq.Ref.Generation != 7 || tcpReq.Peer != "peer-a" || tcpReq.Root != root || tcpReq.Egress != "direct" || !tcpReq.PreserveL3Identity {
 		t.Fatalf("tcp request=%+v", tcpReq)
 	}
 	tcpReq.Labels["class"] = "mutated"
@@ -57,6 +58,28 @@ func TestBuildSessionRequestMapsTCPAndUDP(t *testing.T) {
 	}
 	if udpReq.Kind != SessionKindPacket || udpReq.Identity != udpID || udpReq.Egress != "dns-egress" || udpReq.Labels["class"] != "bulk" {
 		t.Fatalf("udp request=%+v", udpReq)
+	}
+}
+
+func TestBuildSessionRequestRejectsMismatchedFlowRef(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.41"), SrcPort: 50000,
+		DstIP: netip.MustParseAddr("203.0.113.41"), DstPort: 53,
+	}
+	other := id
+	other.SrcPort++
+	for _, ref := range []FlowRef{
+		{Identity: other, Generation: 1},
+		{Identity: id, Generation: 0},
+	} {
+		_, err := BuildSessionRequest(PacketEvent{
+			Meta: PacketMeta{Identity: id}, Flow: FlowMeta{L3Identity: id}, Ref: ref,
+			Decision: FlowDecision{Peer: "peer-a", Root: "root", Egress: "direct"}, Decided: true,
+		})
+		var sessionErr *SessionError
+		if !errors.As(err, &sessionErr) || sessionErr.Reason != ReasonSessionFlowRefMismatch {
+			t.Fatalf("ref=%+v error=%v, want %s", ref, err, ReasonSessionFlowRefMismatch)
+		}
 	}
 }
 

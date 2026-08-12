@@ -958,20 +958,14 @@ func mutateLeafMobilityWire(wire []byte, index int) []byte {
 }
 
 func FuzzDecodeLeafMobilityPeerPlan(f *testing.F) {
-	prepare, _ := testLeafMobilityPeerPlanPrepare().Encode()
-	ack, _ := testLeafMobilityPeerPlanPreparedAck(f).Encode()
-	commit, _ := testLeafMobilityPeerPlanCommit(f).Encode()
-	f.Add(uint8(1), prepare)
-	f.Add(uint8(2), ack)
-	f.Add(uint8(3), commit)
-	f.Fuzz(func(t *testing.T, kind uint8, wire []byte) {
-		switch kind % 3 {
-		case 0:
-			_, _ = DecodeLeafMobilityPeerPlanPrepare(wire)
-		case 1:
-			_, _ = DecodeLeafMobilityPeerPlanAck(wire)
-		case 2:
-			_, _ = DecodeLeafMobilityPeerPlanCommit(wire)
+	for _, seed := range leafMobilityPeerPlanFuzzSeeds(f) {
+		f.Add(seed.kind, seed.wire)
+		for _, boundary := range protocolFuzzBoundaries(seed.wire) {
+			f.Add(seed.kind, boundary.wire)
 		}
+	}
+	f.Add(uint8(0), []byte{})
+	f.Fuzz(func(t *testing.T, kind uint8, wire []byte) {
+		_ = exerciseLeafMobilityPeerPlanFuzzWire(t, kind, wire)
 	})
 }

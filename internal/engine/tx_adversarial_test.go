@@ -584,20 +584,28 @@ func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
 
 func TestReplayRequestsCoalesceWithoutDroppingLatestTarget(t *testing.T) {
 	e := &Engine{replayWake: make(chan struct{}, 1)}
-	e.queueReplay(replayRequest{nextSeq: 7, target: 10, gap: true})
-	e.queueReplay(replayRequest{nextSeq: 5, target: 20, gap: true})
+	e.queueReplay(replayRequest{nextSeq: 7, target: 10, kind: replayRequestGap})
+	e.queueReplay(replayRequest{nextSeq: 5, target: 20, kind: replayRequestGap})
 	request, ok := e.takeReplayRequest()
-	if !ok || !request.gap || request.nextSeq != 5 || request.target != 20 {
+	if !ok || request.kind != replayRequestGap || request.nextSeq != 5 || request.target != 20 {
 		t.Fatalf("merged gap request=%+v ok=%t", request, ok)
 	}
 
-	e.queueReplay(replayRequest{nextSeq: 9, target: 30, gap: true})
-	e.queueReplay(replayRequest{nextSeq: 4})
-	e.queueReplay(replayRequest{nextSeq: 2, target: 40, gap: true})
-	e.queueReplay(replayRequest{nextSeq: 3})
+	e.queueReplay(replayRequest{nextSeq: 9, target: 30, kind: replayRequestGap})
+	e.queueReplay(replayRequest{nextSeq: 4, kind: replayRequestFull})
+	e.queueReplay(replayRequest{nextSeq: 2, target: 40, kind: replayRequestGap})
+	e.queueReplay(replayRequest{nextSeq: 3, kind: replayRequestFull})
 	request, ok = e.takeReplayRequest()
-	if !ok || request.gap || request.nextSeq != 2 {
+	if !ok || request.kind != replayRequestFull || request.nextSeq != 2 {
 		t.Fatalf("full replay did not dominate gaps: request=%+v ok=%t", request, ok)
+	}
+
+	e.queueReplay(replayRequest{nextSeq: 8, target: 12, kind: replayRequestGap})
+	e.queueReplay(replayRequest{nextSeq: 6, target: 10, kind: replayRequestBounded})
+	e.queueReplay(replayRequest{nextSeq: 7, target: 15, kind: replayRequestGap})
+	request, ok = e.takeReplayRequest()
+	if !ok || request.kind != replayRequestBounded || request.nextSeq != 6 || request.target != 15 {
+		t.Fatalf("bounded replay did not preserve the exact union: request=%+v ok=%t", request, ok)
 	}
 	if _, ok := e.takeReplayRequest(); ok {
 		t.Fatal("coalesced queue retained a duplicate request")

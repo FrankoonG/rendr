@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -140,6 +141,140 @@ func TestRecoveryGenerationReconcilesStartupAndInFlightDeath(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("generation reconciliation lost replacement death: attempts=%d paths=%v", attempts.Load(), e.Paths())
+}
+
+func TestRecoveryStormCoalescesPerLeafAndRejectsTombstonedGenerations(t *testing.T) {
+	e := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{}.Clamp())
+
+	specs := make([]PathSpec, maxSessionRecoveryLeaves)
+	for index := range specs {
+		name := "storm-leaf-" + strconv.Itoa(index)
+		specs[index] = PathSpec{
+			Transport: "storm-test",
+			Address:   "peer-" + strconv.Itoa(index),
+			Opts:      map[string]string{"name": name},
+		}
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var attemptsMu sync.Mutex
+	attempts := make(map[string]int, len(specs))
+	started := make(chan struct{}, len(specs))
+	add := func(ctx context.Context, spec PathSpec) (uint32, error) {
+		name := pathSpecName(spec)
+		attemptsMu.Lock()
+		attempts[name]++
+		attemptsMu.Unlock()
+		current := active.Add(1)
+		for observed := maximum.Load(); current > observed; observed = maximum.Load() {
+			if maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		active.Add(-1)
+		return 0, ctx.Err()
+	}
+	supervisor := newPathRecoverySupervisor(e, nil, add, specs, nil, retryPolicy{
+		MinBackoff: time.Second,
+		MaxBackoff: time.Second,
+	})
+	if supervisor == nil {
+		t.Fatal("recovery supervisor was not created")
+	}
+	t.Cleanup(func() {
+		supervisor.stop()
+		_ = e.Close()
+		select {
+		case <-supervisor.done:
+		case <-time.After(2 * time.Second):
+			t.Error("recovery supervisor did not stop during cleanup")
+		}
+	})
+
+	for range specs {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d/%d initial recovery workers started", active.Load(), len(specs))
+		}
+	}
+	if got := recoveryActiveWorkers(t, supervisor); got != len(specs) {
+		t.Fatalf("active recovery workers=%d want %d", got, len(specs))
+	}
+
+	const duplicateRounds = 64
+	for round := 0; round < duplicateRounds; round++ {
+		for _, spec := range specs {
+			if !supervisor.enqueue(recoveryUpdate{kind: recoveryUpdateDeath, death: engine.PathDeathEvent{
+				Owner: 1,
+				Spec:  spec.Clone(),
+				Cause: transport.CauseTransportError,
+				Err:   errors.New("duplicate storm death"),
+			}}) {
+				t.Fatal("recovery supervisor stopped during duplicate death storm")
+			}
+		}
+	}
+	if got := recoveryActiveWorkers(t, supervisor); got != len(specs) {
+		t.Fatalf("duplicate storm changed active workers=%d want %d", got, len(specs))
+	}
+	attemptsMu.Lock()
+	for _, spec := range specs {
+		if got := attempts[pathSpecName(spec)]; got != 1 {
+			attemptsMu.Unlock()
+			t.Fatalf("leaf %q recovery attempts=%d want 1", pathSpecName(spec), got)
+		}
+	}
+	attemptsMu.Unlock()
+	if got := maximum.Load(); got > int32(len(specs)) {
+		t.Fatalf("maximum concurrent recovery workers=%d want <=%d", got, len(specs))
+	}
+
+	for _, spec := range specs {
+		if !supervisor.enqueue(recoveryUpdate{kind: recoveryUpdateDeath, death: engine.PathDeathEvent{
+			Owner: 2,
+			Spec:  spec.Clone(),
+			Cause: transport.CauseCleanClose,
+		}}) {
+			t.Fatal("recovery supervisor stopped while publishing clean tombstones")
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if recoveryActiveWorkers(t, supervisor) == 0 && active.Load() == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := recoveryActiveWorkers(t, supervisor); got != 0 || active.Load() != 0 {
+		t.Fatalf("tombstones left recovery workers actor=%d dialers=%d", got, active.Load())
+	}
+
+	for round := 0; round < duplicateRounds; round++ {
+		for _, spec := range specs {
+			if !supervisor.enqueue(recoveryUpdate{kind: recoveryUpdateDeath, death: engine.PathDeathEvent{
+				Owner: 1,
+				Spec:  spec.Clone(),
+				Cause: transport.CauseTransportError,
+				Err:   errors.New("stale post-tombstone death"),
+			}}) {
+				t.Fatal("recovery supervisor stopped during stale death storm")
+			}
+		}
+	}
+	if got := recoveryActiveWorkers(t, supervisor); got != 0 {
+		t.Fatalf("stale death storm restarted %d recovery workers", got)
+	}
+	attemptsMu.Lock()
+	defer attemptsMu.Unlock()
+	for _, spec := range specs {
+		if got := attempts[pathSpecName(spec)]; got != 1 {
+			t.Fatalf("stale storm resurrected leaf %q: attempts=%d", pathSpecName(spec), got)
+		}
+	}
 }
 
 func TestCleanRemovalCancelsInFlightRecoveryWithoutResurrection(t *testing.T) {

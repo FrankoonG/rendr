@@ -53,6 +53,11 @@ func (c *engineBackedConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite half-closes the application stream. Callers may discover this
+// optional extension with interface{ CloseWrite() error } while Conn remains a
+// standard net.Conn.
+func (c *engineBackedConn) CloseWrite() error { return c.conn.CloseWrite() }
+
 // Close sends a CTRL_BYE on the active path so the peer surfaces a
 // clean io.EOF rather than tripping its migration machinery, then
 // tears the engine down. BYE failure is non-fatal: if the active
@@ -63,6 +68,7 @@ func (c *engineBackedConn) Close() error {
 		c.peak.stopLoop()
 	}
 	c.closing.Store(true)
+	c.e.BeginGracefulClose()
 	if c.recovery != nil {
 		c.recovery.stop()
 	}
@@ -144,6 +150,18 @@ func (c *engineBackedConn) Stats() ConnStats {
 		CreatedAt:      c.e.CreatedAt(),
 		PeerCaps:       c.e.PeerCaps(),
 		PeerInstanceID: c.e.PeerInstanceID(),
+		TXReplay:       replayStatsFromEngine(c.e.ReplayStats()),
+	}
+}
+
+func replayStatsFromEngine(stats engine.ReplayStats) ReplayStats {
+	return ReplayStats{
+		FrameLimit: stats.FrameLimit, ByteLimit: stats.ByteLimit,
+		FramesInUse: stats.FramesInUse, BytesInUse: stats.BytesInUse,
+		FramesHighWater: stats.FramesHighWater, BytesHighWater: stats.BytesHighWater,
+		PublishedNext: stats.PublishedNext, AckNext: stats.AckNext,
+		CreditWaiters: stats.CreditWaiters, BackpressureEvents: stats.BackpressureEvents,
+		Generation: stats.Generation,
 	}
 }
 

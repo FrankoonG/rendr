@@ -68,6 +68,24 @@ type PathConn interface {
 	RemoteAddr() string
 }
 
+// FrameBatchWriter is an optional PathConn fast path for transports that can
+// submit multiple already-framed packets through one physical write operation.
+// Frames must be accepted in slice order. completed is the exact number of
+// whole frames accepted from the prefix of frames.
+//
+// A return with completed < len(frames) must include a non-nil error. If the
+// transport partially writes the next frame, that frame is not completed and
+// the error applies to it and every suffix frame. A transport must never
+// report a negative completed count or one greater than len(frames).
+//
+// PathConn.Write remains mandatory. The engine uses this extension only for
+// bounded, immediately available packet DATA runs; stream, control, replay,
+// and adapters without this interface retain ordinary Write behavior. Close
+// must promptly unblock WriteFrameBatch under the same rule as PathConn.Write.
+type FrameBatchWriter interface {
+	WriteFrameBatch(frames [][]byte) (completed int, err error)
+}
+
 // OwnedFrameReader is an optional PathConn fast path for transports whose
 // receive API already returns a uniquely owned frame allocation. The returned
 // slice must remain immutable and valid after the next call; ownership passes
@@ -112,10 +130,15 @@ const (
 // successful kernel writes carrying UDP_SEGMENT; a selected mode alone is not
 // proof that the fast path was exercised.
 type DatagramAccelerationStatus struct {
-	Mode                DatagramAccelerationMode
-	Cause               string
-	ProbeGeneration     uint64
-	ProbedAt            time.Time
+	Mode            DatagramAccelerationMode
+	Cause           string
+	ProbeGeneration uint64
+	ProbedAt        time.Time
+	// BatchCalls and BatchDatagrams prove actual multi-message UDP writes.
+	// They are independent of GSO: one sendmmsg call may carry ordinary UDP
+	// messages, GSO super-packets, or both.
+	BatchCalls          uint64
+	BatchDatagrams      uint64
 	GSOAttempts         uint64
 	GSOSuperPackets     uint64
 	GSOSegments         uint64

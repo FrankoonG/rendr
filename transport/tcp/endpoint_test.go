@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -106,6 +107,62 @@ func (*nonTimeoutInterruptConn) SetWriteDeadline(time.Time) error { return nil }
 type rejectingDeadlineConn struct {
 	*uninterruptibleReadConn
 	failure error
+}
+
+type deadlineOnlyCloseConn struct {
+	started     chan struct{}
+	interrupted chan struct{}
+	startOnce   sync.Once
+	wakeOnce    sync.Once
+}
+
+func newDeadlineOnlyCloseConn() *deadlineOnlyCloseConn {
+	return &deadlineOnlyCloseConn{started: make(chan struct{}), interrupted: make(chan struct{})}
+}
+
+func (conn *deadlineOnlyCloseConn) Read([]byte) (int, error) {
+	conn.startOnce.Do(func() { close(conn.started) })
+	<-conn.interrupted
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (*deadlineOnlyCloseConn) Write(buffer []byte) (int, error) { return len(buffer), nil }
+func (*deadlineOnlyCloseConn) Close() error                     { return nil }
+func (*deadlineOnlyCloseConn) LocalAddr() net.Addr              { return nil }
+func (*deadlineOnlyCloseConn) RemoteAddr() net.Addr             { return nil }
+func (conn *deadlineOnlyCloseConn) SetDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		conn.wakeOnce.Do(func() { close(conn.interrupted) })
+	}
+	return nil
+}
+func (*deadlineOnlyCloseConn) SetReadDeadline(time.Time) error  { return nil }
+func (*deadlineOnlyCloseConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestEndpointCloseInterruptsReaderThroughDeadlineAndClose(t *testing.T) {
+	conn := newDeadlineOnlyCloseConn()
+	path := Wrap(conn)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := path.Read(make([]byte, 64))
+		readDone <- err
+	}()
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint reader did not start")
+	}
+	if err := path.Close(); err != nil {
+		t.Fatalf("PathConn.Close: %v", err)
+	}
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("interrupted PathConn.Read = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("endpoint Close did not interrupt the blocked reader")
+	}
 }
 
 func (c *rejectingDeadlineConn) SetReadDeadline(deadline time.Time) error {

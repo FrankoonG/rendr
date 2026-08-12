@@ -45,6 +45,10 @@ type Config struct {
 	LocalAddr   *net.UDPAddr
 	RemoteAddr  *net.UDPAddr
 	BufferBytes int
+	// PinSource keeps packets on the interface that owns LocalAddr even when
+	// the process routing table changes. It is intended for owned mobility
+	// endpoints; wildcard listeners and ordinary UDP sockets leave it false.
+	PinSource bool
 }
 
 type policy struct {
@@ -52,6 +56,7 @@ type policy struct {
 	cause           string
 	probeGeneration uint64
 	probedAt        time.Time
+	gro             bool
 }
 
 type writeMsgFunc func(payload, oob []byte, addr *net.UDPAddr) (int, int, error)
@@ -71,12 +76,15 @@ type Socket struct {
 	probedAt        time.Time
 	writeMsg        writeMsgFunc
 	invalidateGSO   func() error
+	platform        platformState
 
 	gsoAttempts         atomic.Uint64
 	gsoSuperPackets     atomic.Uint64
 	gsoSegments         atomic.Uint64
 	ordinaryDatagrams   atomic.Uint64
 	fallbackTransitions atomic.Uint64
+	batchCalls          atomic.Uint64
+	batchDatagrams      atomic.Uint64
 }
 
 var (
@@ -111,7 +119,7 @@ func Dial(ctx context.Context, config Config) (*Socket, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("udpsocket: %s dial returned %T", config.Network, conn)
 	}
-	return newSocket(udpConn, selected, config.BufferBytes), nil
+	return newSocketConfigured(udpConn, selected, config.BufferBytes, config.LocalAddr, config.PinSource), nil
 }
 
 // Listen obtains factual GSO evidence before opening an unconnected UDP
@@ -145,7 +153,7 @@ func Listen(ctx context.Context, config Config) (*Socket, error) {
 		_ = packetConn.Close()
 		return nil, fmt.Errorf("udpsocket: %s listen returned %T", config.Network, packetConn)
 	}
-	return newSocket(udpConn, selected, config.BufferBytes), nil
+	return newSocketConfigured(udpConn, selected, config.BufferBytes, config.LocalAddr, config.PinSource), nil
 }
 
 func normalizeConfig(config Config) Config {
@@ -199,6 +207,8 @@ func detectPolicyWith(
 		return policy{treatment: treatmentOrdinary, cause: causeProbeFailed}, nil
 	}
 	evidence, ok := snapshot.Feature(platform.FeatureUDPGSO)
+	groEvidence, groOK := snapshot.Feature(platform.FeatureUDPGRO)
+	gro := allowGSO && groOK && groEvidence.State == platform.FeatureAvailable
 	if !allowGSO {
 		return policy{
 			treatment: treatmentOrdinary, cause: causePlatformUnsupported,
@@ -208,7 +218,7 @@ func detectPolicyWith(
 	if allowGSO && ok && evidence.State == platform.FeatureAvailable {
 		return policy{
 			treatment: treatmentGSO, cause: causeProbeConfirmed,
-			probeGeneration: snapshot.Generation, probedAt: evidence.ProbedAt,
+			probeGeneration: snapshot.Generation, probedAt: evidence.ProbedAt, gro: gro,
 		}, nil
 	}
 	cause := causeProbeFailed
@@ -225,6 +235,10 @@ func detectPolicyWith(
 }
 
 func newSocket(conn *net.UDPConn, selected policy, bufferBytes int) *Socket {
+	return newSocketConfigured(conn, selected, bufferBytes, nil, false)
+}
+
+func newSocketConfigured(conn *net.UDPConn, selected policy, bufferBytes int, source *net.UDPAddr, pinSource bool) *Socket {
 	socket := &Socket{
 		conn: conn, probeGeneration: selected.probeGeneration,
 		probedAt: selected.probedAt, writeMsg: conn.WriteMsgUDP,
@@ -232,6 +246,7 @@ func newSocket(conn *net.UDPConn, selected policy, bufferBytes int) *Socket {
 	}
 	socket.mode.Store(uint32(selected.treatment))
 	socket.cause.Store(selected.cause)
+	socket.initPlatform(selected, source, pinSource)
 	if bufferBytes > 0 {
 		_ = conn.SetReadBuffer(bufferBytes)
 		_ = conn.SetWriteBuffer(bufferBytes)
@@ -247,10 +262,10 @@ func (s *Socket) PacketConn() net.PacketConn {
 	return s.view
 }
 
-func (s *Socket) Read(payload []byte) (int, error) { return s.conn.Read(payload) }
+func (s *Socket) Read(payload []byte) (int, error) { return s.readPlatform(payload) }
 
 func (s *Socket) Write(payload []byte) (int, error) {
-	n, err := s.conn.Write(payload)
+	n, err := s.writePlatform(payload, nil)
 	if err == nil && n == len(payload) {
 		s.ordinaryDatagrams.Add(1)
 	} else if err == nil {
@@ -260,11 +275,11 @@ func (s *Socket) Write(payload []byte) (int, error) {
 }
 
 func (s *Socket) ReadFrom(payload []byte) (int, net.Addr, error) {
-	return s.conn.ReadFrom(payload)
+	return s.readFromPlatform(payload)
 }
 
 func (s *Socket) WriteTo(payload []byte, address net.Addr) (int, error) {
-	n, err := s.conn.WriteTo(payload, address)
+	n, err := s.writeToPlatform(payload, address)
 	if err == nil && n == len(payload) {
 		s.ordinaryDatagrams.Add(1)
 	} else if err == nil {
@@ -287,39 +302,35 @@ func (s *Socket) SetWriteBuffer(bytes int) error     { return s.conn.SetWriteBuf
 // bytes were accepted safely transitions this socket to ordinary writes and
 // completes the same batch without surfacing an optional-offload failure.
 func (s *Socket) WriteBatch(datagrams [][]byte, address *net.UDPAddr) (int, error) {
-	segmentSize, payload, err := validateBatch(datagrams)
+	segmentSize, payloadBytes, err := validateBatch(datagrams)
 	if err != nil {
 		return 0, err
 	}
 	if err := s.validateDestination(address); err != nil {
 		return 0, err
 	}
-	return s.writeBatchPlatform(datagrams, payload, segmentSize, address)
+	return s.writeBatchPlatform(datagrams, payloadBytes, segmentSize, address)
 }
 
-func validateBatch(datagrams [][]byte) (int, []byte, error) {
+func validateBatch(datagrams [][]byte) (int, int, error) {
 	if len(datagrams) < 2 || len(datagrams) > MaxGSOSegments {
-		return 0, nil, fmt.Errorf("udpsocket: batch has %d datagrams outside [2,%d]", len(datagrams), MaxGSOSegments)
+		return 0, 0, fmt.Errorf("udpsocket: batch has %d datagrams outside [2,%d]", len(datagrams), MaxGSOSegments)
 	}
 	segmentSize := len(datagrams[0])
 	if segmentSize == 0 || segmentSize > MaxGSOSuperPacket {
-		return 0, nil, fmt.Errorf("udpsocket: invalid segment size %d", segmentSize)
+		return 0, 0, fmt.Errorf("udpsocket: invalid segment size %d", segmentSize)
 	}
 	total := 0
 	for index, datagram := range datagrams {
 		if len(datagram) == 0 || len(datagram) > segmentSize || (index < len(datagrams)-1 && len(datagram) != segmentSize) {
-			return 0, nil, fmt.Errorf("udpsocket: datagram %d size %d does not match segment size %d", index, len(datagram), segmentSize)
+			return 0, 0, fmt.Errorf("udpsocket: datagram %d size %d does not match segment size %d", index, len(datagram), segmentSize)
 		}
 		total += len(datagram)
 		if total > MaxGSOSuperPacket {
-			return 0, nil, fmt.Errorf("udpsocket: super-packet size %d exceeds %d", total, MaxGSOSuperPacket)
+			return 0, 0, fmt.Errorf("udpsocket: super-packet size %d exceeds %d", total, MaxGSOSuperPacket)
 		}
 	}
-	payload := make([]byte, 0, total)
-	for _, datagram := range datagrams {
-		payload = append(payload, datagram...)
-	}
-	return segmentSize, payload, nil
+	return segmentSize, total, nil
 }
 
 func (s *Socket) validateDestination(address *net.UDPAddr) error {
@@ -364,6 +375,7 @@ func (s *Socket) DatagramAccelerationStatus() transport.DatagramAccelerationStat
 	cause, _ := s.cause.Load().(string)
 	return transport.DatagramAccelerationStatus{
 		Mode: mode, Cause: cause, ProbeGeneration: s.probeGeneration, ProbedAt: s.probedAt,
+		BatchCalls: s.batchCalls.Load(), BatchDatagrams: s.batchDatagrams.Load(),
 		GSOAttempts: s.gsoAttempts.Load(), GSOSuperPackets: s.gsoSuperPackets.Load(),
 		GSOSegments: s.gsoSegments.Load(), OrdinaryDatagrams: s.ordinaryDatagrams.Load(),
 		FallbackTransitions: s.fallbackTransitions.Load(),

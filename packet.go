@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,9 @@ func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return 0, nil, err
 	}
 	n := copy(p, pkt)
+	if n != len(pkt) {
+		return n, c.rAddr, io.ErrShortBuffer
+	}
 	if n > 0 && c.peak != nil {
 		c.peak.observeRead(n)
 	}
@@ -62,7 +66,11 @@ func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // WriteTo ignores addr - rendr has only one peer per flow_id. Returns
 // ErrPacketTooLarge if len(p) > engine.MaxPayload.
 func (c *enginePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	if err := c.e.SendPacket(p); err != nil {
+	published, err := c.e.SendPacketAcceptedResult(p)
+	if err != nil {
+		if published {
+			return len(p), err
+		}
 		return 0, err
 	}
 	if c.peak != nil {
@@ -76,6 +84,7 @@ func (c *enginePacketConn) Close() error {
 		c.peak.stopLoop()
 	}
 	c.closing.Store(true)
+	c.e.BeginGracefulClose()
 	if c.recovery != nil {
 		c.recovery.stop()
 	}
@@ -84,14 +93,15 @@ func (c *enginePacketConn) Close() error {
 
 func (c *enginePacketConn) LocalAddr() net.Addr { return c.lAddr }
 
-// SetDeadline / SetReadDeadline route through to the engine. Write
-// deadline is currently a no-op; see engineBackedConn.SetWriteDeadline.
+// SetDeadline / SetReadDeadline / SetWriteDeadline route through to the engine.
 func (c *enginePacketConn) SetDeadline(t time.Time) error {
-	_ = c.SetWriteDeadline(t)
+	if err := c.SetWriteDeadline(t); err != nil {
+		return err
+	}
 	return c.SetReadDeadline(t)
 }
 func (c *enginePacketConn) SetReadDeadline(t time.Time) error  { return c.e.SetReadDeadline(t) }
-func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *enginePacketConn) SetWriteDeadline(t time.Time) error { return c.e.SetWriteDeadline(t) }
 
 func (c *enginePacketConn) Paths() []PathInfo { return c.e.Paths() }
 func (c *enginePacketConn) FlowID() [16]byte  { return c.e.FlowID() }
@@ -191,5 +201,6 @@ func (c *enginePacketConn) Stats() ConnStats {
 		CreatedAt:      c.e.CreatedAt(),
 		PeerCaps:       c.e.PeerCaps(),
 		PeerInstanceID: c.e.PeerInstanceID(),
+		TXReplay:       replayStatsFromEngine(c.e.ReplayStats()),
 	}
 }

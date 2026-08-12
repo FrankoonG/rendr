@@ -2,7 +2,6 @@ package l3session
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -296,74 +295,21 @@ func servePeerWithoutL3Identity(ln net.Listener, stop <-chan struct{}) error {
 	if _, err := path.Write(frame); err != nil {
 		return err
 	}
-	proposalHash := sha256.Sum256(buf[proto.HeaderSize:n])
-	responseHash := sha256.Sum256(ackPayload)
-	binding := proto.PathAdmissionBinding{
-		Kind:                   proto.PathAdmissionKindHello,
-		Direction:              proto.SenderDirectionClientToServer,
-		SessionEpoch:           proto.SessionEpoch(finalEpoch),
-		AdmissionID:            proto.PathAdmissionID(hello.FlowID),
-		InitiatorGraphRevision: hello.GraphRevision,
-		InitiatorGraphDigest:   hello.GraphDigest,
-		InitiatorTargetID:      hello.InitialTargetID,
-		ResponderTargetID:      hello.InitialTargetID,
-		BaseLeafGeneration:     0,
-		ProposalDigest:         proto.PathAdmissionProposalDigest(proposalHash),
-		ResponderPlanDigest:    proto.PathAdmissionPlanDigest(responseHash),
-	}
-	prepared, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhasePrepared, Code: proto.AckOK}).Encode()
+	abortWire, err := readTestAdmissionControl(path, proto.CtrlBye)
 	if err != nil {
 		return err
 	}
-	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, prepared); err != nil {
-		return err
-	}
-	commitWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionCommit)
+	abort, err := proto.DecodeBye(abortWire)
 	if err != nil {
 		return err
 	}
-	commit, err := proto.DecodePathAdmissionCommit(commitWire)
-	if err != nil || commit.PathAdmissionBinding != binding {
-		return errors.New("test peer: invalid path admission COMMIT")
+	if abort.Reason != proto.ByeAppRequest {
+		return errors.New("test peer: L3 capability rejection did not abort admission")
 	}
-	committed, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseCommitted, Code: proto.AckOK}).Encode()
-	if err != nil {
-		return err
+	select {
+	case <-stop:
+	default:
 	}
-	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, committed); err != nil {
-		return err
-	}
-	confirmWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionConfirm)
-	if err != nil {
-		return err
-	}
-	confirm, err := proto.DecodePathAdmissionConfirm(confirmWire)
-	if err != nil || confirm.PathAdmissionBinding != binding {
-		return errors.New("test peer: invalid path admission CONFIRM")
-	}
-	finalAck, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseFinal, Code: proto.AckOK}).Encode()
-	if err != nil {
-		return err
-	}
-	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, finalAck); err != nil {
-		return err
-	}
-	receiptWire, err := readTestAdmissionControl(path, proto.CtrlPathAdmissionAck)
-	if err != nil {
-		return err
-	}
-	receipt, err := proto.DecodePathAdmissionAck(receiptWire)
-	if err != nil || receipt.Phase != proto.PathAdmissionPhaseFinal || receipt.PathAdmissionBinding != binding {
-		return errors.New("test peer: invalid path admission FINAL receipt")
-	}
-	activated, err := (proto.PathAdmissionAck{PathAdmissionBinding: binding, Phase: proto.PathAdmissionPhaseActivated, Code: proto.AckOK}).Encode()
-	if err != nil {
-		return err
-	}
-	if err := writeTestAdmissionControl(path, proto.CtrlPathAdmissionAck, activated); err != nil {
-		return err
-	}
-	<-stop
 	return nil
 }
 

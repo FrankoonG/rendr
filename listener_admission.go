@@ -64,12 +64,12 @@ func acknowledgeInitialServerPath(ctx context.Context, e *engine.Engine, pathID 
 	return nil
 }
 
-func eLocalCaps(e *engine.Engine) uint32 {
+func eLocalCaps(e *engine.Engine, acceptL3Identity bool) uint32 {
 	var caps uint32
 	if e.Packetized() {
 		caps |= proto.CapsPacketMode
 	}
-	if e.PeerCaps()&proto.CapsL3Identity != 0 {
+	if acceptL3Identity {
 		caps |= proto.CapsL3Identity
 	}
 	return caps

@@ -8,24 +8,33 @@ import (
 )
 
 const selectorEvidenceFreshFor = 5 * time.Second
+const minimumSelectorProbeFreshFor = 500 * time.Millisecond
+const maximumSelectorProbeFreshFor = 4 * time.Second
 
 type pathEvidenceObservation struct {
-	targetID      proto.TargetID
-	quality       transport.PathQuality
-	dataProgress  uint64
-	unexpectedDup uint64
-	weight        uint16
-	live          bool
-	gen           uint64
+	targetID       proto.TargetID
+	quality        transport.PathQuality
+	freshFor       time.Duration
+	probeLiveness  qualityState
+	probeLifecycle pathProbeLifecycle
+	probeFailure   pathProbeFailure
+	dataProgress   uint64
+	unexpectedDup  uint64
+	weight         uint16
+	live           bool
+	gen            uint64
 }
 
 type selectorDecision struct {
 	selectorID proto.TargetID
 	targetID   proto.TargetID
 	cause      string
+	origin     policySelectionOrigin
 }
 
 func (e *Engine) selectorEvidenceObservations() map[proto.TargetID]pathEvidenceObservation {
+	now := nowFn()
+	probeStatuses := e.pathProbeStatuses(now)
 	e.pathsMu.RLock()
 	observations := make(map[proto.TargetID]pathEvidenceObservation, len(e.paths))
 	for _, slot := range e.paths {
@@ -36,14 +45,29 @@ func (e *Engine) selectorEvidenceObservations() map[proto.TargetID]pathEvidenceO
 		if exists && previous.gen > slot.gen {
 			continue
 		}
+		quality := slot.quality()
+		probeLiveness := slot.probeLiveness(now, e.limits.ProbeInterval)
+		probeStatus := probeStatuses[slot]
+		if probeStatus.lifecycle == pathProbeReserved {
+			if evidence, ok := slot.probeSnapshot(); ok {
+				probeStatus.lifecycle = evidence.lastLifecycle
+			}
+		}
+		if probeStatus.failure == pathProbeFailureNone && probeLiveness == qualityStateStale {
+			probeStatus.failure = pathProbeFailureWireTimeout
+		}
 		observations[slot.localTXTargetID] = pathEvidenceObservation{
-			targetID:      slot.localTXTargetID,
-			quality:       slot.conn.Quality(),
-			dataProgress:  slot.dataDispatches.Load(),
-			unexpectedDup: slot.recvDups.Load(),
-			weight:        slot.spec.Weight,
-			live:          true,
-			gen:           slot.gen,
+			targetID:       slot.localTXTargetID,
+			quality:        quality,
+			freshFor:       selectorProbeFreshFor(e.limits.ProbeInterval, quality),
+			probeLiveness:  probeLiveness,
+			probeLifecycle: probeStatus.lifecycle,
+			probeFailure:   probeStatus.failure,
+			dataProgress:   slot.dataDispatches.Load(),
+			unexpectedDup:  slot.recvDups.Load(),
+			weight:         slot.spec.Weight,
+			live:           true,
+			gen:            slot.gen,
 		}
 	}
 	e.pathsMu.RUnlock()
@@ -78,8 +102,16 @@ func (r *executionRuntime) selectorDecisions(
 			state = &selectorExecutionState{}
 			r.selectors[selectorID] = state
 		}
+		// A hard path departure may already have projected DATA onto the
+		// manifest-order fallback while desired remains the policy-plane truth.
+		// Preserve that physical projection until the death transaction commits;
+		// otherwise fresh RTT noise can turn one carrier death into two visible
+		// migrations (dead -> fallback -> best sibling).
+		projected := state.effective
 		current := r.effectiveSelectorChildLocked(node, observations)
-		state.effective = current
+		if r.targetLiveLocked(current, observations) {
+			state.effective = current
+		}
 
 		candidates := make([]selectorCandidate, 0, len(node.children))
 		hasLiveNormal := false
@@ -106,14 +138,64 @@ func (r *executionRuntime) selectorDecisions(
 			})
 		}
 		selected, found := selectSelectorCandidate(direction, candidates, policy)
-		if !found || selected.targetID == current {
+		if !found {
 			state.qualityCandidate = proto.TargetID{}
 			state.qualitySince = time.Time{}
 			continue
 		}
 		currentEvidence := r.aggregateTargetEvidenceLocked(current, direction, observations, memo, now)
 		if current == (proto.TargetID{}) || !currentEvidence.live {
-			decisions = append(decisions, selectorDecision{selectorID: selectorID, targetID: selected.targetID, cause: "death"})
+			if projected != (proto.TargetID{}) && projected != current && r.targetLiveLocked(projected, observations) {
+				for _, candidate := range candidates {
+					if candidate.targetID == projected {
+						selected = candidate
+						break
+					}
+				}
+			}
+			if selected.targetID != current {
+				decisions = append(decisions, selectorDecision{
+					selectorID: selectorID,
+					targetID:   selected.targetID,
+					cause:      "death",
+					origin:     policySelectionPathDeath,
+				})
+			}
+			state.qualityCandidate = proto.TargetID{}
+			state.qualitySince = time.Time{}
+			continue
+		}
+		failure := r.aggregateTargetProbeFailureLocked(current, observations)
+		if failure != pathProbeFailureNone {
+			alternatives := make([]selectorCandidate, 0, len(candidates)-1)
+			for _, candidate := range candidates {
+				if candidate.targetID == current ||
+					r.aggregateTargetProbeFailureLocked(candidate.targetID, observations) != pathProbeFailureNone ||
+					candidate.evidence.probeLiveness != qualityStateFresh ||
+					!candidate.evidence.latency.fresh(policy.minimumConfidence) {
+					continue
+				}
+				candidate.current = false
+				alternatives = append(alternatives, candidate)
+			}
+			replacement, replacementFound := selectSelectorCandidate(direction, alternatives, policy)
+			cause, origin, factual := selectorProbeFailureDecision(failure)
+			if !replacementFound || !factual {
+				state.qualityCandidate = proto.TargetID{}
+				state.qualitySince = time.Time{}
+				continue
+			}
+			decisions = append(decisions, selectorDecision{
+				selectorID: selectorID,
+				targetID:   replacement.targetID,
+				cause:      cause,
+				origin:     origin,
+			})
+			state.qualityCandidate = proto.TargetID{}
+			state.qualitySince = time.Time{}
+			continue
+		}
+		if selected.targetID == current {
 			state.qualityCandidate = proto.TargetID{}
 			state.qualitySince = time.Time{}
 			continue
@@ -129,7 +211,12 @@ func (r *executionRuntime) selectorDecisions(
 		if cooldown > 0 && !state.lastQualityMove.IsZero() && now.Sub(state.lastQualityMove) < cooldown {
 			continue
 		}
-		decisions = append(decisions, selectorDecision{selectorID: selectorID, targetID: selected.targetID, cause: "quality"})
+		decisions = append(decisions, selectorDecision{
+			selectorID: selectorID,
+			targetID:   selected.targetID,
+			cause:      "quality",
+			origin:     policySelectionQuality,
+		})
 	}
 	return decisions
 }
@@ -170,7 +257,10 @@ func (r *executionRuntime) collectSelectorIDsLocked(id proto.TargetID, out *[]pr
 func (r *executionRuntime) effectiveSelectorChildLocked(node executionPlanNode, observations map[proto.TargetID]pathEvidenceObservation) proto.TargetID {
 	state := r.selectors[node.targetID]
 	if state != nil {
-		if state.desired != (proto.TargetID{}) && r.targetLiveLocked(state.desired, observations) {
+		// desired is the policy-plane truth even when its evidence disappears.
+		// Returning a live sibling here would make that sibling look committed
+		// and suppress the death decision that is required to authorize a move.
+		if state.desired != (proto.TargetID{}) {
 			return state.desired
 		}
 		if state.effective != (proto.TargetID{}) && r.targetLiveLocked(state.effective, observations) {
@@ -205,6 +295,80 @@ func (r *executionRuntime) targetLiveLocked(id proto.TargetID, observations map[
 		}
 	}
 	return false
+}
+
+func selectorProbeFailureDecision(failure pathProbeFailure) (string, policySelectionOrigin, bool) {
+	switch failure {
+	case pathProbeFailureWireTimeout:
+		return "probe-wire-timeout", policySelectionProbeFailure, true
+	case pathProbeFailureDataStarved:
+		return "probe-starved-data", policySelectionProbeStarvedData, true
+	case pathProbeFailureWriteStalled:
+		return "probe-write-stalled", policySelectionWriteStalled, true
+	default:
+		return "", policySelectionExternal, false
+	}
+}
+
+// aggregateTargetProbeFailureLocked is deliberately separate from quality
+// aggregation. A local writer stall is not a wire RTT/loss sample, and a
+// bond/race target is not failed while any live descendant remains free of a
+// factual probe failure.
+func (r *executionRuntime) aggregateTargetProbeFailureLocked(
+	id proto.TargetID,
+	observations map[proto.TargetID]pathEvidenceObservation,
+) pathProbeFailure {
+	node, ok := r.plan.node(id)
+	if !ok {
+		return pathProbeFailureNone
+	}
+	if node.kind == proto.GraphNodeKindPath {
+		observation := observations[id]
+		if !observation.live {
+			return pathProbeFailureNone
+		}
+		return observation.probeFailure
+	}
+	if node.kind == proto.GraphNodeKindSelector {
+		active := r.effectiveSelectorChildLocked(node, observations)
+		if active == (proto.TargetID{}) {
+			return pathProbeFailureNone
+		}
+		return r.aggregateTargetProbeFailureLocked(active, observations)
+	}
+
+	failure := pathProbeFailureNone
+	hasLiveChild := false
+	for _, childID := range node.children {
+		if !r.targetLiveLocked(childID, observations) {
+			continue
+		}
+		hasLiveChild = true
+		childFailure := r.aggregateTargetProbeFailureLocked(childID, observations)
+		if childFailure == pathProbeFailureNone {
+			return pathProbeFailureNone
+		}
+		if probeFailurePriority(childFailure) > probeFailurePriority(failure) {
+			failure = childFailure
+		}
+	}
+	if !hasLiveChild {
+		return pathProbeFailureNone
+	}
+	return failure
+}
+
+func probeFailurePriority(failure pathProbeFailure) uint8 {
+	switch failure {
+	case pathProbeFailureDataStarved:
+		return 3
+	case pathProbeFailureWriteStalled:
+		return 2
+	case pathProbeFailureWireTimeout:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (r *executionRuntime) aggregateTargetEvidenceLocked(
@@ -248,14 +412,20 @@ func (r *executionRuntime) aggregateTargetEvidenceLocked(
 }
 
 func evidenceFromPathObservation(direction proto.SenderDirection, observation pathEvidenceObservation, now time.Time) schedulingEvidence {
-	evidence := schedulingEvidence{direction: direction, live: observation.live}
+	evidence := schedulingEvidence{
+		direction: direction, live: observation.live, probeLiveness: observation.probeLiveness,
+	}
 	if !observation.live {
 		return evidence
 	}
 	quality := observation.quality
 	if quality.RTT > 0 && !quality.At.IsZero() {
 		state := qualityStateFresh
-		if now.Sub(quality.At) > selectorEvidenceFreshFor {
+		freshFor := observation.freshFor
+		if freshFor <= 0 {
+			freshFor = selectorEvidenceFreshFor
+		}
+		if now.Sub(quality.At) > freshFor {
 			state = qualityStateStale
 		}
 		evidence.latency = latencyEvidence{
@@ -288,4 +458,26 @@ func evidenceFromPathObservation(direction proto.SenderDirection, observation pa
 		}
 	}
 	return evidence
+}
+
+// selectorProbeFreshFor converts successful same-carrier RTT replies into a
+// conservative external liveness window. Three missed default probes fit
+// inside G4's five-second failover budget, while measured RTT and jitter widen
+// the window for legitimately slow paths.
+func selectorProbeFreshFor(interval time.Duration, quality transport.PathQuality) time.Duration {
+	if interval <= 0 {
+		interval = DefaultLimits().ProbeInterval
+	}
+	freshFor := 3 * interval
+	transportBudget := 4*quality.RTT + 2*quality.Jitter + interval
+	if transportBudget > freshFor {
+		freshFor = transportBudget
+	}
+	if freshFor < minimumSelectorProbeFreshFor {
+		freshFor = minimumSelectorProbeFreshFor
+	}
+	if freshFor > maximumSelectorProbeFreshFor {
+		freshFor = maximumSelectorProbeFreshFor
+	}
+	return freshFor
 }

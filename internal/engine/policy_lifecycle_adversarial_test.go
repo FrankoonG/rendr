@@ -565,7 +565,7 @@ func TestPolicyCommitBlockedBySendMuCannotMutateAfterClose(t *testing.T) {
 		t.Fatal("COMMIT remained blocked after close")
 	}
 	generation, selection, _, _ := policyTxUnitState(fixture.engine, fixture.selectorID)
-	if generation != 0 || selection != (proto.TargetID{}) {
+	if generation != 0 || selection != fixture.targetA {
 		t.Fatalf("closed engine committed policy generation=%d selection=%x", generation, selection)
 	}
 }

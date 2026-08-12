@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,12 +28,12 @@ func TestPumpRoutesParsedPackets(t *testing.T) {
 		},
 		Handler: PacketHandlerFunc(func(_ context.Context, ev PacketEvent) error {
 			got = ev
-			return io.EOF
+			return nil
 		}),
 	}
 	err := p.Run(context.Background())
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("Run err=%v want io.EOF", err)
+	if err != nil {
+		t.Fatalf("Run err=%v", err)
 	}
 	wantID := L3Identity{
 		Proto:   ProtocolTCP,
@@ -232,6 +235,291 @@ func TestPumpSkipsDeniedFlow(t *testing.T) {
 	}
 }
 
+func TestPumpRealHandlerFailureDoesNotStopSharedIngress(t *testing.T) {
+	icmp := ipv4Packet(1, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 0, 0)
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("192.0.2.1"), SrcPort: 40000,
+		DstIP: netip.MustParseAddr("192.0.2.53"), DstPort: 53,
+	}
+	udp := mustBuildUDPPacket(t, id, []byte("query-after-failure"))
+	pc := newScriptedPacketConn(nil)
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns", &udpRelayEgress{
+		pc: pc, remote: netip.MustParseAddrPort("192.0.2.53:53"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPFlowRelay{Device: &writeCaptureDevice{}, Egresses: registry}
+	defer relay.Close()
+	failures := make(chan PacketFailure, 1)
+	pump := &Pump{
+		Device: &fakeDevice{packets: [][]byte{icmp, udp}},
+		Router: func(context.Context, FlowMeta) (FlowDecision, error) {
+			return FlowDecision{Egress: "dns"}, nil
+		},
+		Handler: relay,
+		OnPacketFailure: func(failure PacketFailure) {
+			failures <- failure
+		},
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run stopped on flow-local failure: %v", err)
+	}
+
+	select {
+	case failure := <-failures:
+		if failure.Stage != PacketFailureHandle {
+			t.Fatalf("failure stage=%q want %q", failure.Stage, PacketFailureHandle)
+		}
+		if failure.Event.Meta.Identity.Proto != ProtocolICMP || failure.Err == nil {
+			t.Fatalf("failure evidence=%+v", failure)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler failure was not observable")
+	}
+	wrote, _ := pc.writeSnapshot()
+	if string(wrote) != "query-after-failure" {
+		t.Fatalf("subsequent UDP payload=%q", wrote)
+	}
+	status := pump.Status()
+	if status.PacketFailures != 1 || !status.HasLastFailure || status.LastFailure.Err == nil {
+		t.Fatalf("status=%+v", status)
+	}
+	if status.LastFailure.Event.Meta.Identity.Proto != ProtocolICMP {
+		t.Fatalf("last failure protocol=%v want ICMP", status.LastFailure.Event.Meta.Identity.Proto)
+	}
+}
+
+func TestPumpRealDialFailureDoesNotStopSharedIngress(t *testing.T) {
+	failedID := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("192.0.2.1"), SrcPort: 40000,
+		DstIP: netip.MustParseAddr("192.0.2.53"), DstPort: 53,
+	}
+	validID := failedID
+	validID.SrcPort++
+	failedPacket := mustBuildUDPPacket(t, failedID, []byte("missing-egress"))
+	validPacket := mustBuildUDPPacket(t, validID, []byte("query-after-dial-failure"))
+	pc := newScriptedPacketConn(nil)
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns", &udpRelayEgress{
+		pc: pc, remote: netip.MustParseAddrPort("192.0.2.53:53"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPFlowRelay{Device: &writeCaptureDevice{}, Egresses: registry}
+	defer relay.Close()
+	pump := &Pump{
+		Device: &fakeDevice{packets: [][]byte{failedPacket, validPacket}},
+		Router: func(_ context.Context, flow FlowMeta) (FlowDecision, error) {
+			if flow.L3Identity == failedID {
+				return FlowDecision{Egress: "missing"}, nil
+			}
+			return FlowDecision{Egress: "dns"}, nil
+		},
+		Handler: relay,
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run stopped on dial failure: %v", err)
+	}
+	wrote, _ := pc.writeSnapshot()
+	if string(wrote) != "query-after-dial-failure" {
+		t.Fatalf("subsequent UDP payload=%q", wrote)
+	}
+	status := pump.Status()
+	reason, ok := EgressErrorReasonOf(status.LastFailure.Err)
+	if status.PacketFailures != 1 || status.LastFailure.Stage != PacketFailureHandle ||
+		!ok || reason != ReasonEgressNotFound {
+		t.Fatalf("status=%+v reason=%q ok=%v", status, reason, ok)
+	}
+}
+
+func TestPumpFlowCapacityFailureIsPacketLocal(t *testing.T) {
+	first := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 10001, 53)
+	overCapacity := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 10002, 53)
+	table := NewFlowTable(nil, FlowTableOptions{ActiveCapacity: 1})
+	var handled int
+	pump := &Pump{
+		Device:    &fakeDevice{packets: [][]byte{first, overCapacity, first}},
+		FlowTable: table,
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			handled++
+			return nil
+		}),
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run stopped on flow table capacity: %v", err)
+	}
+	if handled != 2 {
+		t.Fatalf("handled=%d want 2", handled)
+	}
+	status := pump.Status()
+	if status.PacketFailures != 1 || status.LastFailure.Stage != PacketFailureResolve ||
+		!errors.Is(status.LastFailure.Err, ErrFlowTableFull) {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+func TestPumpFailureObserverIsResourceBoundedWhenBlocked(t *testing.T) {
+	const failureCount = 2048
+	packet := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 10001, 53)
+	packets := make([][]byte, failureCount)
+	for i := range packets {
+		packets[i] = packet
+	}
+	wantErr := errors.New("flow unavailable")
+	observerEntered := make(chan struct{})
+	releaseObserver := make(chan struct{})
+	observerDone := make(chan struct{})
+	var observerCalls atomic.Int32
+	pump := &Pump{
+		Device: &fakeDevice{packets: packets},
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			return wantErr
+		}),
+		OnPacketFailure: func(PacketFailure) {
+			observerCalls.Add(1)
+			close(observerEntered)
+			<-releaseObserver
+			close(observerDone)
+		},
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run blocked on failure observer: %v", err)
+	}
+	select {
+	case <-observerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("failure observer never ran")
+	}
+	status := pump.Status()
+	if status.PacketFailures != failureCount {
+		t.Fatalf("packet failures=%d want %d", status.PacketFailures, failureCount)
+	}
+	if status.ObserverDrops != failureCount-1 {
+		t.Fatalf("observer drops=%d want %d", status.ObserverDrops, failureCount-1)
+	}
+	if observerCalls.Load() != 1 {
+		t.Fatalf("observer calls=%d want 1", observerCalls.Load())
+	}
+	if !errors.Is(status.LastFailure.Err, wantErr) {
+		t.Fatalf("last failure=%v want %v", status.LastFailure.Err, wantErr)
+	}
+	close(releaseObserver)
+	select {
+	case <-observerDone:
+	case <-time.After(time.Second):
+		t.Fatal("failure observer did not exit after release")
+	}
+}
+
+func TestPumpFailureObserverPanicCannotKillPump(t *testing.T) {
+	packet := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 10001, 53)
+	wantErr := errors.New("first packet rejected")
+	observerDone := make(chan struct{})
+	var handled atomic.Int32
+	pump := &Pump{
+		Device: &fakeDevice{packets: [][]byte{packet, packet}},
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			if handled.Add(1) == 1 {
+				return wantErr
+			}
+			return nil
+		}),
+	}
+	pump.OnPacketFailure = func(failure PacketFailure) {
+		defer close(observerDone)
+		_ = pump.Status()
+		failure.Event.Packet[0] = 0
+		panic("hostile observer")
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run stopped after observer panic: %v", err)
+	}
+	if handled.Load() != 2 {
+		t.Fatalf("handled=%d want 2", handled.Load())
+	}
+	select {
+	case <-observerDone:
+	case <-time.After(time.Second):
+		t.Fatal("failure observer never ran")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := pump.Status()
+		if status.ObserverPanics == 1 {
+			if got := status.LastFailure.Event.Packet[0] >> 4; got != 4 {
+				t.Fatalf("observer mutated retained evidence IP version=%d", got)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("observer panic was not recorded: %+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestPumpContextCancellationWinsOverHandlerFailure(t *testing.T) {
+	packet := ipv4Packet(17, [4]byte{192, 0, 2, 1}, [4]byte{192, 0, 2, 2}, 10001, 53)
+	ctx, cancel := context.WithCancel(context.Background())
+	pump := &Pump{
+		Device: &fakeDevice{packets: [][]byte{packet, packet}},
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			cancel()
+			return errors.New("flow failed while canceling")
+		}),
+	}
+	if err := pump.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error=%v want context.Canceled", err)
+	}
+	if status := pump.Status(); status.PacketFailures != 0 {
+		t.Fatalf("cancellation recorded as packet failure: %+v", status)
+	}
+}
+
+func TestPumpDeviceReadFailureIsTerminal(t *testing.T) {
+	wantErr := errors.New("device read failed")
+	pump := &Pump{
+		Device: &fakeDevice{terminalErr: wantErr},
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			t.Fatal("handler ran without a packet")
+			return nil
+		}),
+	}
+	if err := pump.Run(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Run error=%v want %v", err, wantErr)
+	}
+}
+
+func TestPumpExplicitDeviceCloseIsTerminal(t *testing.T) {
+	device := newCloseBlockingDevice()
+	pump := &Pump{
+		Device: device,
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			t.Fatal("handler ran without a packet")
+			return nil
+		}),
+	}
+	done := make(chan error, 1)
+	go func() { done <- pump.Run(context.Background()) }()
+	select {
+	case <-device.started:
+	case <-time.After(time.Second):
+		t.Fatal("Pump never entered device read")
+	}
+	if err := device.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Run error=%v want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pump did not stop after explicit device close")
+	}
+}
+
 func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	if err := (&Pump{}).Run(context.Background()); err == nil {
 		t.Fatal("nil device accepted")
@@ -288,21 +576,24 @@ func TestPumpRetriesRetainedPacketAfterShortBuffer(t *testing.T) {
 			if !bytes.Equal(event.Packet, packet) {
 				t.Fatalf("packet changed across short-buffer retry: got=%d want=%d", len(event.Packet), len(packet))
 			}
-			return io.EOF
+			return nil
 		}),
 	}
-	if err := pump.Run(context.Background()); !errors.Is(err, io.EOF) {
-		t.Fatalf("Run error=%v want handler io.EOF", err)
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run error=%v", err)
 	}
-	if len(device.readSizes) != 2 || device.readSizes[0] != device.mtu || device.readSizes[1] != defaultReadBufferSize {
-		t.Fatalf("read buffer sizes=%v want [%d %d]", device.readSizes, device.mtu, defaultReadBufferSize)
+	if len(device.readSizes) != 3 || device.readSizes[0] != device.mtu ||
+		device.readSizes[1] != defaultReadBufferSize || device.readSizes[2] != defaultReadBufferSize {
+		t.Fatalf("read buffer sizes=%v want [%d %d %d]", device.readSizes, device.mtu,
+			defaultReadBufferSize, defaultReadBufferSize)
 	}
 }
 
 type fakeDevice struct {
-	packets [][]byte
-	mtu     int
-	closed  bool
+	packets     [][]byte
+	mtu         int
+	closed      bool
+	terminalErr error
 }
 
 type contextDevice struct {
@@ -316,6 +607,39 @@ type retainedPacketDevice struct {
 	delivered bool
 	readSizes []int
 }
+
+type closeBlockingDevice struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newCloseBlockingDevice() *closeBlockingDevice {
+	return &closeBlockingDevice{started: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (d *closeBlockingDevice) Read([]byte) (int, error) {
+	return d.ReadContext(context.Background(), nil)
+}
+
+func (d *closeBlockingDevice) ReadContext(ctx context.Context, _ []byte) (int, error) {
+	d.startOnce.Do(func() { close(d.started) })
+	select {
+	case <-d.closed:
+		return 0, net.ErrClosed
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (*closeBlockingDevice) Write(p []byte) (int, error) { return len(p), nil }
+func (d *closeBlockingDevice) Close() error {
+	d.closeOnce.Do(func() { close(d.closed) })
+	return nil
+}
+func (*closeBlockingDevice) Name() string { return "close-blocking0" }
+func (*closeBlockingDevice) MTU() int     { return 1500 }
 
 func (d *retainedPacketDevice) Read(p []byte) (int, error) {
 	return d.ReadContext(context.Background(), p)
@@ -349,6 +673,9 @@ func (d *contextDevice) ReadContext(ctx context.Context, _ []byte) (int, error) 
 
 func (d *fakeDevice) Read(p []byte) (int, error) {
 	if len(d.packets) == 0 {
+		if d.terminalErr != nil {
+			return 0, d.terminalErr
+		}
 		return 0, io.EOF
 	}
 	next := d.packets[0]

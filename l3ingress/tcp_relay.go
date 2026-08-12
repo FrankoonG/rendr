@@ -22,14 +22,14 @@ type TCPFlowRelay struct {
 
 type tcpFlowSession struct {
 	id       L3Identity
-	endpoint net.Conn
-	egress   net.Conn
+	endpoint TCPConn
+	egress   TCPConn
 	cancel   context.CancelFunc
 }
 
 // Serve relays one classified TCP flow between endpoint and the selected
 // embedding egress until either side closes or ctx is done.
-func (r *TCPFlowRelay) Serve(ctx context.Context, ev PacketEvent, endpoint net.Conn) error {
+func (r *TCPFlowRelay) Serve(ctx context.Context, ev PacketEvent, endpoint TCPConn) error {
 	if endpoint == nil {
 		return errors.New("l3ingress: nil TCP relay endpoint")
 	}
@@ -56,23 +56,7 @@ func (r *TCPFlowRelay) Serve(ctx context.Context, ev PacketEvent, endpoint net.C
 	}
 	defer r.closeSession(session)
 
-	errCh := make(chan error, 2)
-	go func() { errCh <- copyStream(egress, endpoint, r.BufferSize) }()
-	go func() { errCh <- copyStream(endpoint, egress, r.BufferSize) }()
-
-	select {
-	case err := <-errCh:
-		_ = endpoint.Close()
-		_ = egress.Close()
-		if ctxErr := sessionCtx.Err(); ctxErr != nil {
-			err = ctxErr
-		}
-		return streamRelayError(err)
-	case <-sessionCtx.Done():
-		_ = endpoint.Close()
-		_ = egress.Close()
-		return streamRelayError(sessionCtx.Err())
-	}
+	return relayTCPStreams(sessionCtx, endpoint, egress, r.BufferSize)
 }
 
 // Close closes all active TCP relay sessions.
@@ -141,8 +125,46 @@ func copyStream(dst io.Writer, src io.Reader, bufferSize int) error {
 }
 
 func streamRelayError(err error) error {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
+}
+
+func relayTCPStreams(ctx context.Context, left, right TCPConn, bufferSize int) error {
+	results := make(chan error, 2)
+	forward := func(dst, src TCPConn) {
+		err := streamRelayError(copyStream(dst, src, bufferSize))
+		if err == nil {
+			err = streamRelayError(dst.CloseWrite())
+		}
+		results <- err
+	}
+	go forward(right, left)
+	go forward(left, right)
+
+	select {
+	case first := <-results:
+		if first != nil {
+			_ = left.Close()
+			_ = right.Close()
+			return errors.Join(first, <-results)
+		}
+		select {
+		case second := <-results:
+			return second
+		case <-ctx.Done():
+			_ = left.Close()
+			_ = right.Close()
+			<-results
+			return streamRelayError(ctx.Err())
+		}
+	case <-ctx.Done():
+		_ = left.Close()
+		_ = right.Close()
+		<-results
+		<-results
+		return streamRelayError(ctx.Err())
+	}
 }

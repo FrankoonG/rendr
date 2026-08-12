@@ -2,6 +2,8 @@ package engine
 
 import "time"
 
+const maxBondPinFrames = 256
+
 // BridgeState is the lifecycle stage of a single rendr Conn as seen
 // by the server-side bridge table (or the client-side mirror).
 type BridgeState uint8
@@ -141,8 +143,8 @@ func (l Limits) Clamp() Limits {
 	}
 	if l.BondPinSize <= 0 {
 		l.BondPinSize = def.BondPinSize
-	} else if l.BondPinSize > sendHistoryWindow {
-		l.BondPinSize = sendHistoryWindow
+	} else if l.BondPinSize > maxBondPinFrames {
+		l.BondPinSize = maxBondPinFrames
 	}
 	return l
 }

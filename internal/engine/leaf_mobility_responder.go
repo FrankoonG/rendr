@@ -29,6 +29,7 @@ func (e *Engine) arbitrateOutgoingLeafMobilityLocked(localActor proto.LeafMobili
 				incoming.hold.Release()
 				incoming.hold = nil
 			}
+			incoming.releasePolicyHold()
 		}
 	}
 	return nil
@@ -134,6 +135,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 			delete(e.leafTx.incoming, prepare.TransactionID)
 		}
 		e.leafTx.mu.Unlock()
+		incoming.releasePolicyHold()
 		e.signalLeafMobilityRetry()
 	}()
 	reject := func(code proto.LeafMobilityPeerPlanAckCode, reason string) error {
@@ -146,6 +148,18 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 	if !ok {
 		return reject(proto.LeafMobilityPeerPlanAckCodeSuperseded, "bound peer leaf is unavailable")
 	}
+	policyHold := e.acquireLeafMobilityPolicyHold(sourceSlot)
+	if policyHold == nil {
+		return reject(proto.LeafMobilityPeerPlanAckCodeSuperseded, "bound peer leaf changed before policy hold")
+	}
+	e.leafTx.mu.Lock()
+	if e.leafTx.incoming[prepare.TransactionID] != incoming || incoming.state != incomingLeafMobilityPlanning {
+		e.leafTx.mu.Unlock()
+		policyHold.Release()
+		return reject(proto.LeafMobilityPeerPlanAckCodeBusy, "leaf mobility arbitration changed before policy hold")
+	}
+	incoming.policyHold = policyHold
+	e.leafTx.mu.Unlock()
 	planCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	peerPlan, planErr := e.PlanLeafMobilityCandidate(planCtx, source, leafmobility.TransactionID(prepare.TransactionID), prepare.Direction)
 	cancel()
@@ -212,11 +226,13 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 	}
 	reservation, err := newLeafMobilityReservationID()
 	if err != nil {
+		policyHold.Release()
 		hold.Release()
 		return err
 	}
 	generation, err := prepare.ReservedGeneration()
 	if err != nil {
+		policyHold.Release()
 		hold.Release()
 		return err
 	}
@@ -226,6 +242,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		peerPlan.EndpointGeneration, digest, peerDigest, reservation,
 	)
 	if err != nil {
+		policyHold.Release()
 		hold.Release()
 		return err
 	}
@@ -251,6 +268,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		!sourceCurrent || planCurrentErr != nil {
 		e.leafTx.mu.Unlock()
 		e.pathsMu.RUnlock()
+		policyHold.Release()
 		hold.Release()
 		return reject(proto.LeafMobilityPeerPlanAckCodeBusy, "leaf mobility arbitration changed during preflight")
 	}
@@ -261,6 +279,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 	if ledgerErr != nil {
 		e.leafTx.mu.Unlock()
 		e.pathsMu.RUnlock()
+		policyHold.Release()
 		hold.Release()
 		code := proto.LeafMobilityPeerPlanAckCodeStale
 		if errors.Is(ledgerErr, ErrLeafMobilityAuthorityBusy) {
@@ -501,6 +520,7 @@ func (e *Engine) handleLeafMobilityCommitIntent(incoming *incomingLeafMobilityTr
 			incoming.hold.Release()
 			incoming.hold = nil
 		}
+		incoming.releasePolicyHold()
 	}
 	e.leafTx.mu.Unlock()
 	e.pathsMu.RUnlock()
@@ -595,6 +615,7 @@ func (e *Engine) handleLeafMobilityResolution(incoming *incomingLeafMobilityTran
 		}
 		incoming.hold = nil
 	}
+	incoming.releasePolicyHold()
 	e.leafTx.mu.Unlock()
 	return e.publishLeafMobilityReleased(incoming, resolution, released)
 }
@@ -616,6 +637,7 @@ func (e *Engine) publishLeafMobilityReleased(
 }
 
 func (e *Engine) completeIncomingLeafMobilityLocked(incoming *incomingLeafMobilityTransaction) {
+	incoming.releasePolicyHold()
 	delete(e.leafTx.incoming, incoming.prepare.TransactionID)
 	e.leafTx.completed[incoming.prepare.TransactionID] = completedLeafMobilityTransaction{
 		source: incoming.source, sourceSlot: incoming.sourceSlot,
@@ -681,6 +703,7 @@ func (e *Engine) expireIncomingLeafMobilityTransactions(now time.Time) {
 				release = append(release, incoming.hold)
 				incoming.hold = nil
 			}
+			incoming.releasePolicyHold()
 			delete(e.leafTx.incoming, id)
 		case incomingLeafMobilityPrepared:
 			incoming.state = incomingLeafMobilitySuperseded
@@ -688,6 +711,7 @@ func (e *Engine) expireIncomingLeafMobilityTransactions(now time.Time) {
 				release = append(release, incoming.hold)
 				incoming.hold = nil
 			}
+			incoming.releasePolicyHold()
 		case incomingLeafMobilityCommitted:
 			incoming.state = incomingLeafMobilityOutcomeUnknown
 			if incoming.hold != nil {
@@ -696,6 +720,7 @@ func (e *Engine) expireIncomingLeafMobilityTransactions(now time.Time) {
 		case incomingLeafMobilityOutcomeUnknown:
 			if !now.Before(incoming.retireAfter) {
 				incoming.hold = nil
+				incoming.releasePolicyHold()
 				delete(e.leafTx.incoming, id)
 			}
 		case incomingLeafMobilityTerminalPending:
@@ -704,6 +729,7 @@ func (e *Engine) expireIncomingLeafMobilityTransactions(now time.Time) {
 					release = append(release, incoming.hold)
 					incoming.hold = nil
 				}
+				incoming.releasePolicyHold()
 				delete(e.leafTx.incoming, id)
 			}
 		case incomingLeafMobilitySuperseded:
@@ -715,6 +741,7 @@ func (e *Engine) expireIncomingLeafMobilityTransactions(now time.Time) {
 					}
 					incoming.ledgerActive = false
 				}
+				incoming.releasePolicyHold()
 				delete(e.leafTx.incoming, id)
 			}
 		}
@@ -738,6 +765,7 @@ func (e *Engine) releaseIncomingLeafMobilityTransactions() {
 	e.leafTx.mu.Lock()
 	for id, incoming := range e.leafTx.incoming {
 		delete(e.leafTx.incoming, id)
+		incoming.releasePolicyHold()
 		if incoming.ledgerActive {
 			if err := e.leafTx.peerLedger.release(incoming.ledger); err == nil {
 				incoming.ledgerActive = false
@@ -761,4 +789,12 @@ func (e *Engine) releaseIncomingLeafMobilityTransactions() {
 	for _, hold := range poison {
 		hold.Poison()
 	}
+}
+
+func (incoming *incomingLeafMobilityTransaction) releasePolicyHold() {
+	if incoming == nil || incoming.policyHold == nil {
+		return
+	}
+	incoming.policyHold.Release()
+	incoming.policyHold = nil
 }

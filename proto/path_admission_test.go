@@ -65,8 +65,8 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	if Version != 3 {
 		t.Fatalf("frame envelope version=%d want=3", Version)
 	}
-	if ProtocolMinor != 12 {
-		t.Fatalf("protocol minor=%d want=12", ProtocolMinor)
+	if ProtocolMinor != 15 {
+		t.Fatalf("protocol minor=%d want=15", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePathAdmissionTransaction == 0 || RequiredFeatures&FeaturePathAdmissionTransaction == 0 {
 		t.Fatal("path admission transaction feature is not mandatory")
@@ -352,16 +352,14 @@ func TestPathAdmissionPhaseMatchingRejectsMutatedIdentity(t *testing.T) {
 }
 
 func FuzzDecodePathAdmissionTransactions(f *testing.F) {
-	binding := testPathAdmissionBinding()
-	commit, _ := (PathAdmissionCommit{PathAdmissionBinding: binding, Phase: PathAdmissionPhaseCommit}).Encode()
-	ack, _ := (PathAdmissionAck{PathAdmissionBinding: binding, Phase: PathAdmissionPhaseCommitted, Code: AckOK}).Encode()
-	confirm, _ := (PathAdmissionConfirm{PathAdmissionBinding: binding, CommittedGeneration: binding.BaseLeafGeneration + 1}).Encode()
-	f.Add(commit)
-	f.Add(ack)
-	f.Add(confirm)
+	for _, seed := range pathAdmissionFuzzSeeds(f) {
+		f.Add(seed.wire)
+		for _, boundary := range protocolFuzzBoundaries(seed.wire) {
+			f.Add(boundary.wire)
+		}
+	}
+	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		_, _ = DecodePathAdmissionCommit(wire)
-		_, _ = DecodePathAdmissionAck(wire)
-		_, _ = DecodePathAdmissionConfirm(wire)
+		_ = exercisePathAdmissionFuzzWire(t, wire)
 	})
 }

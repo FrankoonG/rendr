@@ -31,6 +31,7 @@ const (
 // Device is a Linux TUN file descriptor implementing virtualif.Device.
 type Device struct {
 	files       []*os.File
+	fds         []int
 	name        string
 	mtu         int
 	readGate    chan struct{}
@@ -48,6 +49,7 @@ type Device struct {
 var (
 	_ virtualif.Device        = (*Device)(nil)
 	_ virtualif.ContextReader = (*Device)(nil)
+	_ virtualif.ContextWriter = (*Device)(nil)
 )
 
 // Open exclusively creates a Linux TUN device. It does not configure routes
@@ -65,17 +67,19 @@ func Open(cfg Config) (*Device, error) {
 	}
 	cfg = cfg.Normalize()
 	files := make([]*os.File, 0, cfg.Queues)
+	fds := make([]int, 0, cfg.Queues)
 	flags := uint16(linuxIFFTun | linuxIFFNoPI | linuxIFFTunExcl)
 	if cfg.Queues > 1 {
 		flags |= linuxIFFMultiQueue
 	}
-	first, name, err := openLinuxTUNQueue(cfg.Name, flags)
+	first, firstFD, name, err := openLinuxTUNQueue(cfg.Name, flags)
 	if err != nil {
 		return nil, err
 	}
 	files = append(files, first)
+	fds = append(fds, firstFD)
 	for queue := 1; queue < cfg.Queues; queue++ {
-		file, actualName, queueErr := openLinuxTUNQueue(name, linuxIFFTun|linuxIFFNoPI|linuxIFFMultiQueue)
+		file, fd, actualName, queueErr := openLinuxTUNQueue(name, linuxIFFTun|linuxIFFNoPI|linuxIFFMultiQueue)
 		if queueErr != nil {
 			return nil, errors.Join(queueErr, closeTUNFiles(files))
 		}
@@ -87,6 +91,7 @@ func Open(cfg Config) (*Device, error) {
 			return nil, errors.Join(attachErr, file.Close(), closeTUNFiles(files))
 		}
 		files = append(files, file)
+		fds = append(fds, fd)
 	}
 	mtu, err := setAndReadInterfaceMTU(name, cfg.MTU)
 	if err != nil {
@@ -96,6 +101,7 @@ func Open(cfg Config) (*Device, error) {
 	readGate <- struct{}{}
 	return &Device{
 		files:      files,
+		fds:        fds,
 		name:       name,
 		mtu:        mtu,
 		readGate:   readGate,
@@ -154,7 +160,7 @@ func (d *Device) ReadContext(ctx context.Context, p []byte) (int, error) {
 		}
 		for offset := 0; offset < len(d.files); offset++ {
 			pollFDs[offset] = unix.PollFd{
-				Fd:     int32(d.files[(start+offset)%len(d.files)].Fd()),
+				Fd:     int32(d.fds[(start+offset)%len(d.fds)]),
 				Events: unix.POLLIN,
 			}
 		}
@@ -222,10 +228,26 @@ func (d *Device) releaseRead() {
 }
 
 func (d *Device) Write(p []byte) (int, error) {
+	return d.WriteContext(context.Background(), p)
+}
+
+// WriteContext writes one complete raw IP packet and lets cancellation stop
+// retries on a temporarily unavailable nonblocking TUN queue.
+func (d *Device) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if ctx == nil {
+		return 0, errors.New("tun: nil write context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}
 	d.mu.RLock()
+	if err := ctx.Err(); err != nil {
+		d.mu.RUnlock()
+		return 0, err
+	}
 	if d.closed || len(d.files) == 0 {
 		d.mu.RUnlock()
 		return 0, os.ErrClosed
@@ -236,7 +258,7 @@ func (d *Device) Write(p []byte) (int, error) {
 	}
 	queue := int(d.writeCursor.Add(1)-1) % len(d.files)
 	d.mu.RUnlock()
-	return d.writeQueue(queue, p)
+	return d.writeQueueContext(ctx, queue, p)
 }
 
 func pollTimeout(ctx context.Context, limit time.Duration) int {
@@ -262,7 +284,11 @@ func (d *Device) readQueue(queue int, p []byte) (int, error) {
 }
 
 func (d *Device) writeQueue(queue int, p []byte) (int, error) {
-	return d.retryQueueIO(queue, func(fd int) (int, error) {
+	return d.writeQueueContext(context.Background(), queue, p)
+}
+
+func (d *Device) writeQueueContext(ctx context.Context, queue int, p []byte) (int, error) {
+	return d.retryQueueIOContext(ctx, queue, func(fd int) (int, error) {
 		write := d.write
 		if write == nil {
 			write = unix.Write
@@ -276,13 +302,28 @@ func (d *Device) writeQueue(queue int, p []byte) (int, error) {
 }
 
 func (d *Device) retryQueueIO(queue int, operation func(int) (int, error)) (int, error) {
+	return d.retryQueueIOContext(context.Background(), queue, operation)
+}
+
+func (d *Device) retryQueueIOContext(
+	ctx context.Context,
+	queue int,
+	operation func(int) (int, error),
+) (int, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		d.mu.RLock()
+		if err := ctx.Err(); err != nil {
+			d.mu.RUnlock()
+			return 0, err
+		}
 		if d.closed || queue < 0 || queue >= len(d.files) {
 			d.mu.RUnlock()
 			return 0, os.ErrClosed
 		}
-		n, err := operation(int(d.files[queue].Fd()))
+		n, err := operation(d.fds[queue])
 		d.mu.RUnlock()
 		if err == nil {
 			return n, nil
@@ -294,11 +335,25 @@ func (d *Device) retryQueueIO(queue int, operation func(int) (int, error)) (int,
 			// Go's epoll integration can reject a TUN fd as "not pollable"
 			// on some kernels after the interface moves network namespaces.
 			// Keep the fd nonblocking so Close remains prompt, and retry with
-			// a bounded sleep instead of routing through os.File's poller.
-			time.Sleep(time.Millisecond)
+			// a cancellable bounded wait instead of routing through os.File's
+			// poller.
+			if err := waitQueueRetry(ctx); err != nil {
+				return 0, err
+			}
 			continue
 		}
 		return n, err
+	}
+}
+
+func waitQueueRetry(ctx context.Context) error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -320,19 +375,33 @@ func (d *Device) QueueCount() int {
 	return len(d.files)
 }
 
-func openLinuxTUNQueue(name string, flags uint16) (*os.File, string, error) {
+func openLinuxTUNQueue(name string, flags uint16) (*os.File, int, string, error) {
 	file, err := os.OpenFile(devNetTun, os.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, "", probeOpenError("tun open", err)
+		return nil, -1, "", probeOpenError("tun open", err)
 	}
 	req, err := newIfReqFlags(name, flags)
 	if err != nil {
-		return nil, "", errors.Join(err, file.Close())
+		return nil, -1, "", errors.Join(err, file.Close())
 	}
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(linuxTunSetIFF), uintptr(unsafe.Pointer(req))); errno != 0 {
-		return nil, "", errors.Join(probeOpenError("tun setiff", errno), file.Close())
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return nil, -1, "", errors.Join(err, file.Close())
 	}
-	return file, ifReqName(req), nil
+	fd := -1
+	var ioctlErr error
+	if err := raw.Control(func(rawFD uintptr) {
+		fd = int(rawFD)
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, rawFD, uintptr(linuxTunSetIFF), uintptr(unsafe.Pointer(req))); errno != 0 {
+			ioctlErr = probeOpenError("tun setiff", errno)
+		}
+	}); err != nil {
+		return nil, -1, "", errors.Join(err, file.Close())
+	}
+	if ioctlErr != nil {
+		return nil, -1, "", errors.Join(ioctlErr, file.Close())
+	}
+	return file, fd, ifReqName(req), nil
 }
 
 func setAndReadInterfaceMTU(name string, mtu int) (actual int, err error) {

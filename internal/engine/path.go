@@ -36,6 +36,7 @@ type pathDeparture struct {
 	zombieTrip      zombieTripTicket
 	newActive       uint32
 	hasPaths        bool
+	peerRetirement  peerPathRetirementNotice
 }
 
 type zombieTripTicket struct {
@@ -108,24 +109,22 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 			e.pathsMu.Unlock()
 			return
 		}
-		e.trackPathRetirementLocked(retained)
-		delete(e.retainedPaths, id)
-		for successorID, predecessorIDs := range e.pathPredecessors {
-			filtered := predecessorIDs[:0]
-			for _, predecessorID := range predecessorIDs {
-				if predecessorID != id {
-					filtered = append(filtered, predecessorID)
-				}
-			}
-			if len(filtered) == 0 {
-				delete(e.pathPredecessors, successorID)
-			} else {
-				e.pathPredecessors[successorID] = filtered
+		var peerRetirement peerPathRetirementNotice
+		if cause != transport.CauseCleanClose {
+			peerRetirement = peerPathRetirementNotice{
+				localTargetID:   retained.localTXTargetID,
+				peerTargetID:    retained.peerTXTargetID,
+				routeGeneration: retained.routeGeneration.Load(),
+				reason:          protoPathRetirementReason(false),
 			}
 		}
+		e.trackPathRetirementLocked(retained)
+		delete(e.retainedPaths, id)
+		e.removePathPredecessorLocked(id)
 		retained.closeQuit()
 		e.pathsMu.Unlock()
 		e.retirePathAsync(retained)
+		e.queuePeerPathRetirement(peerRetirement)
 		return
 	}
 	slot, ok := e.paths[id]
@@ -151,6 +150,10 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 // path generation. The caller holds pathsMu. Carrier shutdown, callbacks, and
 // replay happen later in finishPathDeparture, after the topology commit.
 func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cause transport.DeathCause, err error, explicitRemoval bool) pathDeparture {
+	return e.detachPathLockedWithPeerNotification(slot, runtime, cause, err, explicitRemoval, true)
+}
+
+func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *executionRuntime, cause transport.DeathCause, err error, explicitRemoval, notifyPeer bool) pathDeparture {
 	departure := pathDeparture{
 		slot:            slot,
 		cause:           cause,
@@ -169,6 +172,15 @@ func (e *Engine) detachPathLocked(slot *pathSlot, runtime *executionRuntime, cau
 			Err:            err,
 			Administrative: explicitRemoval,
 		},
+	}
+	if notifyPeer && (explicitRemoval || cause != transport.CauseCleanClose) {
+		departure.peerRetirement = peerPathRetirementNotice{
+			localTargetID:   slot.localTXTargetID,
+			peerTargetID:    slot.peerTXTargetID,
+			routeGeneration: slot.routeGeneration.Load(),
+			reason:          protoPathRetirementReason(explicitRemoval),
+			deferUntil:      e.pathAdmissionOutcomeLocked(slot),
+		}
 	}
 	slot.fenceDispatchForRetirement()
 	e.trackPathRetirementLocked(slot)
@@ -266,6 +278,7 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 	if departure.slot == nil {
 		return
 	}
+	selectorReplayScheduled := false
 	e.firePathDeathHooks(departure.event)
 
 	// A transport may report death while a concurrent Write is blocked and
@@ -273,6 +286,35 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 	// adapter is allowed to invoke OnDeath from inside its own Close method,
 	// and recursively entering a sync.Once-backed Close would deadlock.
 	e.retirePathAsync(departure.slot)
+	if departure.peerRetirement.valid() {
+		e.queuePeerPathRetirement(departure.peerRetirement)
+	}
+	if departure.shouldReplay && !departure.explicitRemoval && departure.hasPaths {
+		if runtime := e.localExecutionRuntime(); runtime != nil {
+			// Physical death commits an immediate data-plane fallback, but the
+			// selector's desired child remains the policy truth until a factual
+			// decision authorizes the move. Build that decision now rather than
+			// waiting for the quality ticker. A successful selector transaction
+			// owns the frozen replay prefix; only a failed transaction falls back
+			// to the generic replay worker.
+			selector := &selector{}
+			now := nowFn()
+			decisions := selector.recursiveDecisions(e, runtime, now)
+			for _, decision := range decisions {
+				if decision.origin == policySelectionPathDeath {
+					selectorReplayScheduled = true
+					break
+				}
+			}
+			if selectorReplayScheduled {
+				go func() {
+					if !selector.applyRecursiveDecisions(e, runtime, decisions, now) {
+						e.requestReplay(e.sendAckNext.Load())
+					}
+				}()
+			}
+		}
+	}
 	if departure.explicitRemoval {
 		// A local administrative removal is clean for lifecycle policy, but it
 		// is not proof that every frame accepted by this carrier was ACKed.
@@ -302,10 +344,13 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 		// remaining paths).
 		if !departure.hasPaths {
 			e.setCloseErr(io.EOF)
-			_ = e.Close()
+			// OnDeath is allowed to run synchronously inside PathConn.Read.
+			// Closing here would make the reaper wait for the reader goroutine
+			// that is still executing this callback.
+			e.requestClose()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		if departure.shouldReplay {
+		if departure.shouldReplay && !selectorReplayScheduled {
 			e.requestReplay(e.sendAckNext.Load())
 		}
 		// Accounting committed with the replacement topology. Only the
@@ -380,14 +425,21 @@ func (e *Engine) tripZombie(ticket zombieTripTicket) bool {
 		e.zombieMu.Unlock()
 		return false
 	}
-	// Consume the exact decision before deferring teardown. The generation
-	// bump makes duplicate calls with this ticket stale.
+	// Consume the exact decision and publish its terminal cause while payload
+	// credit and competing terminal publishers are both excluded. Neither a
+	// stale duplicate ticket nor a later protocol worker can win between these
+	// two halves of the same decision.
 	e.zombieGeneration++
+	e.closeMu.Lock()
+	if hook := e.zombieAtCommit; hook != nil {
+		hook()
+	}
+	if e.closeErr == nil {
+		e.closeErr = ErrZombie
+	}
+	e.closeMu.Unlock()
 	e.zombieMu.Unlock()
-	go func() {
-		e.setCloseErr(ErrZombie)
-		_ = e.Close()
-	}()
+	go func() { _ = e.Close() }()
 	return true
 }
 
@@ -482,7 +534,7 @@ func (e *Engine) waitForPath() error {
 			}
 			if nowFn().After(deadline) {
 				e.setCloseErr(ErrMigrationBudgetExceeded)
-				_ = e.Close()
+				e.requestClose()
 				return ErrMigrationBudgetExceeded
 			}
 		}

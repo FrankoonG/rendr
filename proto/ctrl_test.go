@@ -22,6 +22,36 @@ func testGraphManifest(name string) GraphManifest {
 	return GraphManifest{RootID: id, Nodes: []GraphNode{{ID: id, Kind: GraphNodeKindPath, Name: name}}}
 }
 
+func TestAckProofWireVectorsAndAllocationContract(t *testing.T) {
+	var epoch SessionEpoch
+	for i := range epoch {
+		epoch[i] = byte(i)
+	}
+	var graph GraphDigest
+	for i := range graph {
+		graph[i] = byte(32 + i)
+	}
+	initial := InitialAckProof(epoch, SenderDirectionServerToClient, 0x0102030405060708, graph)
+	if got, want := hex.EncodeToString(initial[:]), "72396cd2d508e76ccc1ad95ee881abf1"; got != want {
+		t.Fatalf("initial ACK proof changed: got %s want %s", got, want)
+	}
+	var frame FrameDigest
+	for i := range frame {
+		frame[i] = byte(64 + i)
+	}
+	advanced := AdvanceAckProof(initial, frame)
+	if got, want := hex.EncodeToString(advanced[:]), "a66de31206f7e7359b253af7d595981d"; got != want {
+		t.Fatalf("advanced ACK proof changed: got %s want %s", got, want)
+	}
+
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_ = InitialAckProof(epoch, SenderDirectionServerToClient, 0x0102030405060708, graph)
+		_ = AdvanceAckProof(initial, frame)
+	}); allocations != 0 {
+		t.Fatalf("ACK proof hot path allocated %.2f objects per pair", allocations)
+	}
+}
+
 func mustHelloWire(t *testing.T, payload HelloPayload) []byte {
 	t.Helper()
 	wire, err := payload.Encode()
@@ -96,8 +126,8 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestLeafMobilityEnvelope(t *testing.T) {
-	if ProtocolMinor != 12 {
-		t.Fatalf("protocol minor=%d want=12", ProtocolMinor)
+	if ProtocolMinor != 15 {
+		t.Fatalf("protocol minor=%d want=15", ProtocolMinor)
 	}
 	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
@@ -116,6 +146,15 @@ func TestLeafMobilityEnvelope(t *testing.T) {
 	}
 	if FeatureLeafMobilityStagedPublication != 1<<15 || SupportedFeatures&FeatureLeafMobilityStagedPublication == 0 || RequiredFeatures&FeatureLeafMobilityStagedPublication == 0 {
 		t.Fatal("staged leaf publication feature is not stable and mandatory")
+	}
+	if FeatureBoundedReplayBudget != 1<<16 || SupportedFeatures&FeatureBoundedReplayBudget == 0 || RequiredFeatures&FeatureBoundedReplayBudget == 0 {
+		t.Fatal("bounded replay budget feature is not stable and mandatory")
+	}
+	if FeaturePeerPathRetirement != 1<<17 || SupportedFeatures&FeaturePeerPathRetirement == 0 || RequiredFeatures&FeaturePeerPathRetirement == 0 {
+		t.Fatal("peer path retirement feature is not stable and mandatory")
+	}
+	if FeatureStreamHalfClose != 1<<18 || SupportedFeatures&FeatureStreamHalfClose == 0 || RequiredFeatures&FeatureStreamHalfClose == 0 {
+		t.Fatal("stream half-close feature is not stable and mandatory")
 	}
 	if NegotiationSize != 80 {
 		t.Fatalf("negotiation size=%d want=80", NegotiationSize)
@@ -275,6 +314,127 @@ func TestStagedPublicationFeaturePreventsMinor11HalfNegotiation(t *testing.T) {
 	}
 }
 
+func TestBoundedReplayBudgetFeaturePreventsMinor12HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x7c}
+	manifest := testGraphManifest("bounded-replay-budget-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	base := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	withoutBoundedReplay := func(n *Negotiation) {
+		n.ProtocolMinor = 12
+		n.Supported &^= FeatureBoundedReplayBudget
+		n.Required &^= FeatureBoundedReplayBudget
+	}
+	legacyWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), withoutBoundedReplay)
+	if _, err := DecodeHello(legacyWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v13 decoder accepted minor-12 HELLO: %v", err)
+	}
+	legacyAckWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}), withoutBoundedReplay)
+	if _, err := DecodeHelloAck(legacyAckWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v13 decoder accepted minor-12 HELLO_ACK: %v", err)
+	}
+	withoutBoundedReplayOnCurrentMinor := func(n *Negotiation) {
+		n.Supported &^= FeatureBoundedReplayBudget
+		n.Required &^= FeatureBoundedReplayBudget
+	}
+	currentWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), withoutBoundedReplayOnCurrentMinor)
+	if _, err := DecodeHello(currentWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v13 decoder accepted same-minor HELLO without bounded replay: %v", err)
+	}
+	missingRequired := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), func(n *Negotiation) {
+		n.Required &^= FeatureBoundedReplayBudget
+	})
+	if _, err := DecodeHello(missingRequired); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v13 decoder emitted a minor-12-half-negotiable HELLO: %v", err)
+	}
+	if legacyV12AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-12 validation accepted minor-13 bounded replay negotiation")
+	}
+}
+
+func TestPeerPathRetirementFeaturePreventsMinor13HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x7d}
+	manifest := testGraphManifest("peer-path-retirement-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	base := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	withoutRetirement := func(n *Negotiation) {
+		n.ProtocolMinor = 13
+		n.Supported &^= FeaturePeerPathRetirement
+		n.Required &^= FeaturePeerPathRetirement
+	}
+	legacyWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), withoutRetirement)
+	if _, err := DecodeHello(legacyWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v14 decoder accepted minor-13 HELLO: %v", err)
+	}
+	legacyAckWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  GraphBinding{Revision: negotiation.GraphRevision, Digest: negotiation.GraphDigest},
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}), withoutRetirement)
+	if _, err := DecodeHelloAck(legacyAckWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v14 decoder accepted minor-13 HELLO_ACK: %v", err)
+	}
+	withoutRetirementOnCurrentMinor := func(n *Negotiation) {
+		n.Supported &^= FeaturePeerPathRetirement
+		n.Required &^= FeaturePeerPathRetirement
+	}
+	currentWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), withoutRetirementOnCurrentMinor)
+	if _, err := DecodeHello(currentWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v14 decoder accepted same-minor HELLO without peer path retirement: %v", err)
+	}
+	missingRequired := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), func(n *Negotiation) {
+		n.Required &^= FeaturePeerPathRetirement
+	})
+	if _, err := DecodeHello(missingRequired); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v14 decoder emitted a minor-13-half-negotiable HELLO: %v", err)
+	}
+	if legacyV13AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-13 validation accepted minor-14 peer retirement negotiation")
+	}
+}
+
+func TestStreamHalfCloseFeaturePreventsMinor14HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x7e}
+	manifest := testGraphManifest("stream-half-close-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	base := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	withoutHalfClose := func(n *Negotiation) {
+		n.ProtocolMinor = 14
+		n.Supported &^= FeatureStreamHalfClose
+		n.Required &^= FeatureStreamHalfClose
+	}
+	legacyWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), withoutHalfClose)
+	if _, err := DecodeHello(legacyWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v15 decoder accepted minor-14 HELLO: %v", err)
+	}
+	currentWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, base), func(n *Negotiation) {
+		n.Supported &^= FeatureStreamHalfClose
+		n.Required &^= FeatureStreamHalfClose
+	})
+	if _, err := DecodeHello(currentWire); !errors.Is(err, ErrNegotiationIncompatible) {
+		t.Fatalf("v15 decoder accepted same-minor HELLO without stream half-close: %v", err)
+	}
+	if legacyV14AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-14 validation accepted minor-15 stream half-close negotiation")
+	}
+}
+
 func TestHigherMinorMayAdvertiseUnknownOptionalFeature(t *testing.T) {
 	flow := [16]byte{0x7b}
 	manifest := testGraphManifest("future-optional-feature")
@@ -307,6 +467,27 @@ func legacyV11AcceptsNegotiation(n Negotiation) bool {
 	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 11 &&
 		n.Required&^legacyV11FeatureMask == 0 && n.Required&^n.Supported == 0 &&
 		legacyV11FeatureMask&^n.Supported == 0
+}
+
+func legacyV12AcceptsNegotiation(n Negotiation) bool {
+	const legacyV12FeatureMask FeatureSet = 0xffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 12 &&
+		n.Required&^legacyV12FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV12FeatureMask&^n.Supported == 0
+}
+
+func legacyV13AcceptsNegotiation(n Negotiation) bool {
+	const legacyV13FeatureMask FeatureSet = 0x1ffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 13 &&
+		n.Required&^legacyV13FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV13FeatureMask&^n.Supported == 0
+}
+
+func legacyV14AcceptsNegotiation(n Negotiation) bool {
+	const legacyV14FeatureMask FeatureSet = 0x3ffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 14 &&
+		n.Required&^legacyV14FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV14FeatureMask&^n.Supported == 0
 }
 
 func TestServerAssignedSessionEpochIsMandatoryOnCurrentMinor(t *testing.T) {
@@ -445,7 +626,7 @@ func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
 		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
 	}
 	helloWire := mustHelloWire(t, hello)
-	wantPrefix, err := hex.DecodeString("0001000c00050004000000000000ffff000000000000ffff")
+	wantPrefix, err := hex.DecodeString("0001000f00050004000000000007ffff000000000007ffff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -829,11 +1010,13 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlPathAdmissionCommit, 0x0C},
 		{CtrlPathAdmissionAck, 0x0D},
 		{CtrlPathAdmissionConfirm, 0x0E},
+		{CtrlPathRetire, 0x0F},
 		{CtrlBridgeTag, 0x10},
 		{CtrlBridgeAck, 0x11},
 		{CtrlLeafMobilityPrepare, 0x12},
 		{CtrlLeafMobilityAck, 0x13},
 		{CtrlLeafMobilityCommit, 0x14},
+		{CtrlStreamFin, 0x15},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -1052,7 +1235,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("0001000c00000000000000000000ffff000000000000ffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("0001000f00000000000000000007ffff000000000007ffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

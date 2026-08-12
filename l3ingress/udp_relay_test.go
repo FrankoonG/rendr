@@ -2,6 +2,7 @@ package l3ingress
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -99,6 +100,37 @@ func TestUDPFlowRelayRequiresDecision(t *testing.T) {
 	}
 }
 
+func TestUDPFlowRelayRejectsPacketsAfterClose(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40000,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egress := &countingUDPEgress{remote: netip.MustParseAddrPort("198.51.100.53:53")}
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns-egress", egress); err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPFlowRelay{Device: &writeCaptureDevice{}, Egresses: registry}
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = relay.HandlePacket(context.Background(), PacketEvent{
+		Packet: packet, Meta: meta, Flow: FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"}, Decided: true,
+	})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("HandlePacket after Close error=%v, want %v", err, net.ErrClosed)
+	}
+	if egress.dials != 0 {
+		t.Fatalf("HandlePacket after Close dialed egress %d times", egress.dials)
+	}
+}
+
 func TestUDPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 	id := L3Identity{
 		Proto:   ProtocolUDP,
@@ -146,13 +178,160 @@ func TestUDPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 	}
 }
 
+func TestUDPFlowRelayDropsRepliesFromUnexpectedSource(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40000,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := &sourceScriptPacketConn{reads: []sourceScriptRead{
+		{payload: []byte("injected"), source: netip.MustParseAddrPort("203.0.113.9:53")},
+		{payload: []byte("answer"), source: netip.MustParseAddrPort("198.51.100.53:53")},
+	}}
+	reg := NewEgressRegistry()
+	if err := reg.Register("dns-egress", &udpRelayEgress{
+		pc: pc, remote: netip.MustParseAddrPort("198.51.100.53:53"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	device := &writeCaptureDevice{writes: make(chan []byte, 2)}
+	relay := &UDPFlowRelay{Device: device, Egresses: reg}
+	defer relay.Close()
+	if err := relay.HandlePacket(context.Background(), PacketEvent{
+		Packet: packet, Meta: meta, Flow: FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"}, Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-device.writes:
+		replyMeta, err := ParsePacket(reply)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := UDPPayload(reply, replyMeta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(payload) != "answer" {
+			t.Fatalf("forwarded payload=%q want trusted answer", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trusted reply was not forwarded")
+	}
+	select {
+	case reply := <-device.writes:
+		t.Fatalf("unexpected-source reply was relabeled and forwarded: %x", reply)
+	default:
+	}
+}
+
+func TestUDPFlowRelayContextCancellationClosesIdleSession(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40000,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egress := &countingUDPEgress{remote: netip.MustParseAddrPort("198.51.100.53:53")}
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns-egress", egress); err != nil {
+		t.Fatal(err)
+	}
+	relay := &UDPFlowRelay{Device: &writeCaptureDevice{}, Egresses: registry}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := relay.HandlePacket(ctx, PacketEvent{
+		Packet: packet, Meta: meta, Flow: FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"}, Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		relay.mu.Lock()
+		_, present := relay.sessions[id]
+		relay.mu.Unlock()
+		if !present && egress.lastClosed() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("canceled idle session present=%v socket_closed=%v", present, egress.lastClosed())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUDPFlowRelayContextCancellationUnblocksDeviceWrite(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP, SrcIP: netip.MustParseAddr("10.0.0.2"), SrcPort: 40001,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := newScriptedPacketConn([]byte("answer"))
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns-egress", &udpRelayEgress{
+		pc: pc, remote: netip.MustParseAddrPort("198.51.100.53:53"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	device := newBlockingUDPWriteDevice()
+	relay := &UDPFlowRelay{Device: device, Egresses: registry}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := relay.HandlePacket(ctx, PacketEvent{
+		Packet: packet, Meta: meta, Flow: FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"}, Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-device.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reply loop never entered device WriteContext")
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		relay.mu.Lock()
+		_, present := relay.sessions[id]
+		relay.mu.Unlock()
+		pc.mu.Lock()
+		closed := pc.closed
+		pc.mu.Unlock()
+		if !present && closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("canceled blocked write retained session/socket: present=%v closed=%v", present, closed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type udpRelayEgress struct {
 	id     L3Identity
 	pc     net.PacketConn
 	remote netip.AddrPort
 }
 
-func (e *udpRelayEgress) DialTCP(context.Context, L3Identity) (net.Conn, error) {
+func (e *udpRelayEgress) DialTCP(context.Context, L3Identity) (TCPConn, error) {
 	return nil, net.ErrClosed
 }
 
@@ -169,6 +348,40 @@ type scriptedPacketConn struct {
 	replied   bool
 	closed    bool
 }
+
+type sourceScriptRead struct {
+	payload []byte
+	source  netip.AddrPort
+}
+
+type sourceScriptPacketConn struct {
+	mu     sync.Mutex
+	reads  []sourceScriptRead
+	closed bool
+}
+
+func (c *sourceScriptPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || len(c.reads) == 0 {
+		return 0, nil, io.EOF
+	}
+	next := c.reads[0]
+	c.reads = c.reads[1:]
+	return copy(p, next.payload), net.UDPAddrFromAddrPort(next.source), nil
+}
+
+func (c *sourceScriptPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (c *sourceScriptPacketConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (*sourceScriptPacketConn) LocalAddr() net.Addr              { return fakeAddr("source-script") }
+func (*sourceScriptPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*sourceScriptPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*sourceScriptPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func newScriptedPacketConn(reply []byte) *scriptedPacketConn {
 	return &scriptedPacketConn{reply: reply}
@@ -219,9 +432,37 @@ func (d *writeCaptureDevice) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+func (d *writeCaptureDevice) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return d.Write(p)
+}
 func (d *writeCaptureDevice) Close() error { return nil }
 func (d *writeCaptureDevice) Name() string { return "capture0" }
 func (d *writeCaptureDevice) MTU() int     { return 1500 }
+
+type blockingUDPWriteDevice struct {
+	writeStarted chan struct{}
+	startOnce    sync.Once
+}
+
+func newBlockingUDPWriteDevice() *blockingUDPWriteDevice {
+	return &blockingUDPWriteDevice{writeStarted: make(chan struct{})}
+}
+
+func (*blockingUDPWriteDevice) Read([]byte) (int, error) { return 0, io.EOF }
+func (*blockingUDPWriteDevice) Write([]byte) (int, error) {
+	panic("UDP relay bypassed WriteContext")
+}
+func (d *blockingUDPWriteDevice) WriteContext(ctx context.Context, _ []byte) (int, error) {
+	d.startOnce.Do(func() { close(d.writeStarted) })
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+func (*blockingUDPWriteDevice) Close() error { return nil }
+func (*blockingUDPWriteDevice) Name() string { return "blocking0" }
+func (*blockingUDPWriteDevice) MTU() int     { return 1500 }
 
 type countingUDPEgress struct {
 	dials  int
@@ -229,7 +470,7 @@ type countingUDPEgress struct {
 	last   *idlePacketConn
 }
 
-func (e *countingUDPEgress) DialTCP(context.Context, L3Identity) (net.Conn, error) {
+func (e *countingUDPEgress) DialTCP(context.Context, L3Identity) (TCPConn, error) {
 	return nil, net.ErrClosed
 }
 

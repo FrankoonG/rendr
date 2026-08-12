@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,15 +11,23 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
-const recvBatchSize = 64
+const (
+	recvBatchSize         = 64
+	recvAckFrameThreshold = 64
+	recvAckMaxDelay       = 10 * time.Millisecond
+)
 
 const recvReorderWindowLimit = 16 * 1024
-const streamRecvWindowFrames = sendHistoryWindow
+
+// streamRecvWindowFrames bounds bytes already admitted for a slow application
+// reader. It is intentionally independent of the network replay/BDP budget:
+// enlarging the latter must not silently enlarge application buffering.
+const streamRecvWindowFrames = 256
 
 // packetRecvWindowBits only needs to cover the sender's bounded unacknowledged
 // ledger. A larger window lets a malicious peer pin the receive floor while
 // forcing one frame-digest allocation per distant packet.
-const packetRecvWindowBits = 512
+const packetRecvWindowBits = 16 * 1024
 
 // Keep transaction digests for the sender's entire bounded replay domain so an
 // exact old phase can recover a lost receipt without being reclassified as an
@@ -48,6 +57,7 @@ type recvFrame struct {
 	slot    *pathSlot
 	hdr     proto.Header
 	payload []byte
+	digest  proto.FrameDigest
 }
 
 func (e *Engine) packetSeenCapLocked() uint64 {
@@ -129,7 +139,7 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 			e.recvDeliver = e.recvDeliver[n:]
 			e.consumeStreamDeliveryLocked(n)
 			wokeReader := e.drainContiguousLocked(nil)
-			ackNext, ackGap, ackProof := e.receiveAckStateLocked()
+			ackNext, ackGap, ackProof := e.receiveAckStateLocked(e.recvTerminal || e.recvStreamEOF)
 			finalErr := e.takeRecvFinalLocked()
 			if wokeReader {
 				e.recvCond.Broadcast()
@@ -137,6 +147,22 @@ func (e *Engine) Recv(buf []byte) (int, error) {
 			e.recvMu.Unlock()
 			e.finishReceiveProgress(ackNext, ackGap, ackProof, finalErr)
 			return n, nil
+		}
+		if e.recvTerminal {
+			err := e.recvFinalErr
+			if err == nil {
+				err = io.EOF
+			}
+			if errors.Is(err, io.EOF) && !e.peerNormalBye.Load() {
+				e.recvCond.Wait()
+				continue
+			}
+			e.recvMu.Unlock()
+			return 0, err
+		}
+		if e.recvStreamEOF {
+			e.recvMu.Unlock()
+			return 0, io.EOF
 		}
 		if e.isClosed() {
 			if err := e.CloseErr(); err != nil {
@@ -184,7 +210,17 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 		}
 		e.recvMu.Lock()
 		deadline := e.recvDeadline
+		terminal := e.recvTerminal
+		terminalErr := e.recvFinalErr
 		e.recvMu.Unlock()
+		if terminal {
+			if terminalErr == nil {
+				terminalErr = io.EOF
+			}
+			if !errors.Is(terminalErr, io.EOF) || e.peerNormalBye.Load() {
+				return nil, terminalErr
+			}
+		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			return nil, ErrReadDeadlineExceeded
 		}
@@ -315,16 +351,19 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 			}
 		}
 
-		if !e.enqueueRecvFrame(slot, hdr, payload) {
+		if !e.enqueueRecvFrame(slot, hdr, payload, proto.DigestFrame(frame)) {
 			return
 		}
 	}
 }
 
-// handlePathProbeRequest echoes the probe back on the same path so
-// the peer can compute its RTT. Best-effort; a failed write just
-// degrades quality measurement, it does not affect the application.
+// handlePathProbeRequest queues the echo on the same path so the reader never
+// waits behind a blocked sender. The path writer treats a partial control frame
+// as transport death because continuing would leave the framed carrier
+// desynchronized.
 func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
+	generation := pathProbeGenerationForSlot(slot)
+	fenceEpoch := slot.txFenceEpoch.Load()
 	hdr := proto.Header{
 		Version: proto.Version,
 		Type:    proto.FrameCtrl,
@@ -336,7 +375,10 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 		return
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	_, _ = slot.writeFrame(frame)
+	if hook := slot.probeRequestBeforeSubmit; hook != nil {
+		hook()
+	}
+	e.submitPathProbeControl(slot, frame, generation, fenceEpoch)
 }
 
 // handlePathProbeReply matches the reply against an outstanding
@@ -353,37 +395,7 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 	if err != nil {
 		return
 	}
-	e.probeMu.Lock()
-	t0, ok := e.probeOutstanding[p.ID]
-	if ok {
-		delete(e.probeOutstanding, p.ID)
-	}
-	e.probeMu.Unlock()
-	if !ok {
-		return
-	}
-	rtt := nowFn().Sub(t0)
-	if setter, ok := slot.conn.(interface {
-		SetQuality(transport.PathQuality)
-		Quality() transport.PathQuality
-	}); ok {
-		prev := setter.Quality()
-		// Light jitter estimate: |new - prev| smoothed.
-		jit := prev.Jitter
-		if prev.RTT != 0 {
-			diff := rtt - prev.RTT
-			if diff < 0 {
-				diff = -diff
-			}
-			jit = (jit*3 + diff) / 4
-		}
-		setter.SetQuality(transport.PathQuality{
-			RTT:    rtt,
-			Jitter: jit,
-			LossPP: prev.LossPP,
-			At:     nowFn(),
-		})
-	}
+	_ = e.acceptPathProbeReply(slot, p, nowFn())
 }
 
 func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
@@ -396,6 +408,9 @@ func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
 		return false
 	}
 	valid, application := e.acknowledgeSendFrames(ack.NextSeq, ack.Proof)
+	if valid {
+		e.noteTailReplayAck(ack.NextSeq)
+	}
 	if valid && e.publishReplayAck(ack.NextSeq, ack.Gap) {
 		select {
 		case e.replayAckWake <- struct{}{}:
@@ -436,12 +451,33 @@ func (e *Engine) sendTerminalAck(nextSeq uint64, gap bool, proof proto.AckProof)
 	}
 }
 
+// retryPeerTerminalAck preserves the receiver's terminal receipt when the
+// application closes immediately after observing peer EOF. The first receipt
+// may have been accepted by a lossy carrier without reaching the peer; one
+// synchronous idempotent replay precedes local teardown while paths still
+// belong to the session.
+func (e *Engine) retryPeerTerminalAck() {
+	e.recvMu.Lock()
+	if !e.recvTerminal || !errors.Is(e.recvFinalErr, io.EOF) {
+		e.recvMu.Unlock()
+		return
+	}
+	nextSeq := e.expectedRecvSeq
+	gap := e.recvHasGapLocked()
+	proof := e.recvProof
+	e.recvMu.Unlock()
+	if nextSeq != 0 || gap {
+		e.sendTerminalAck(nextSeq, gap, proof)
+	}
+}
+
 func (e *Engine) enqueueAck(request ackRequest) bool {
 	if e.isClosed() {
 		return false
 	}
 	e.ackMu.Lock()
-	if pending := e.ackPending; pending != nil {
+	if e.ackPendingSet {
+		pending := &e.ackPending
 		switch {
 		case request.nextSeq < pending.nextSeq:
 			for _, waiter := range request.waiters {
@@ -458,7 +494,8 @@ func (e *Engine) enqueueAck(request ackRequest) bool {
 			request.waiters = append(request.waiters, pending.waiters...)
 		}
 	}
-	e.ackPending = &request
+	e.ackPending = request
+	e.ackPendingSet = true
 	e.ackMu.Unlock()
 	select {
 	case e.ackWake <- struct{}{}:
@@ -476,13 +513,15 @@ func (e *Engine) ackWriterLoop() {
 		}
 		for {
 			e.ackMu.Lock()
-			request := e.ackPending
-			e.ackPending = nil
-			e.ackMu.Unlock()
-			if request == nil {
+			if !e.ackPendingSet {
+				e.ackMu.Unlock()
 				break
 			}
-			e.writeAck(*request)
+			request := e.ackPending
+			e.ackPending = ackRequest{}
+			e.ackPendingSet = false
+			e.ackMu.Unlock()
+			e.writeAck(request)
 			for _, waiter := range request.waiters {
 				close(waiter)
 			}
@@ -559,7 +598,8 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 		slot.ackMu.Unlock()
 		return
 	}
-	if pending := slot.ackPending; pending != nil {
+	if slot.ackPendingSet {
+		pending := &slot.ackPending
 		if pending.terminal && !request.terminal {
 			slot.ackMu.Unlock()
 			return
@@ -571,7 +611,8 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 			}
 		}
 	}
-	slot.ackPending = &request
+	slot.ackPending = request
+	slot.ackPendingSet = true
 	if slot.ackRunning {
 		slot.ackMu.Unlock()
 		return
@@ -588,13 +629,14 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 func (e *Engine) pathAckWriter(slot *pathSlot) {
 	for {
 		slot.ackMu.Lock()
-		request := slot.ackPending
-		slot.ackPending = nil
-		if request == nil {
+		if !slot.ackPendingSet {
 			slot.ackRunning = false
 			slot.ackMu.Unlock()
 			return
 		}
+		request := slot.ackPending
+		slot.ackPending = pathAckWrite{}
+		slot.ackPendingSet = false
 		slot.ackMu.Unlock()
 
 		n, err := slot.writeFrame(request.frame)
@@ -622,9 +664,9 @@ func (e *Engine) pathAckWriter(slot *pathSlot) {
 // arbitrarily far ahead of a slower path and explode the reorder
 // window. Returning false means the engine is closing and the caller
 // should stop reading.
-func (e *Engine) enqueueRecvFrame(slot *pathSlot, hdr proto.Header, payload []byte) bool {
+func (e *Engine) enqueueRecvFrame(slot *pathSlot, hdr proto.Header, payload []byte, digest proto.FrameDigest) bool {
 	select {
-	case slot.recvQ <- recvFrame{slot: slot, hdr: hdr, payload: payload}:
+	case slot.recvQ <- recvFrame{slot: slot, hdr: hdr, payload: payload, digest: digest}:
 		select {
 		case e.recvWake <- struct{}{}:
 		default:
@@ -643,8 +685,9 @@ func (e *Engine) enqueueRecvFrame(slot *pathSlot, hdr proto.Header, payload []by
 // thousands of later frames.
 func (e *Engine) recvLoop() {
 	batch := make([]recvFrame, 0, recvBatchSize)
+	slots := make([]*pathSlot, 0, 4)
 	for {
-		if e.fillRecvBatch(&batch) {
+		if e.fillRecvBatch(&batch, &slots) {
 			e.onRecvBatch(batch)
 			batch = batch[:0]
 			continue
@@ -658,7 +701,7 @@ func (e *Engine) recvLoop() {
 }
 
 func (e *Engine) ackLoop() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(recvAckMaxDelay)
 	defer ticker.Stop()
 	ticks := 0
 	for {
@@ -668,19 +711,28 @@ func (e *Engine) ackLoop() {
 		case <-ticker.C:
 			ticks++
 			e.recvMu.Lock()
-			nextSeq := e.expectedRecvSeq
-			gap := e.recvHasGapLocked()
-			proof := e.recvProof
+			nextSeq, gap, proof := e.receiveAckStateLocked(true)
+			e.recvAckBurstOpen = false
+			terminal := e.recvTerminal && errors.Is(e.recvFinalErr, io.EOF)
+			if nextSeq == 0 && !gap && ticks%10 == 0 && e.expectedRecvSeq != 0 {
+				// Cumulative receipts are intentionally persistent: a path write
+				// can be accepted locally but lost before the peer observes it.
+				// Repeating the current proof also releases replay credit after
+				// an earlier ACK route recovered without a new DATA arrival.
+				nextSeq = e.expectedRecvSeq
+				proof = e.recvProof
+			}
 			e.recvMu.Unlock()
-			if gap || (nextSeq > 0 && ticks%10 == 0) {
+			if terminal || nextSeq != 0 || gap {
 				e.sendAck(nextSeq, gap, proof)
 			}
 		}
 	}
 }
 
-func (e *Engine) fillRecvBatch(batch *[]recvFrame) bool {
-	slots := e.recvSlotsSnapshot()
+func (e *Engine) fillRecvBatch(batch *[]recvFrame, scratch *[]*pathSlot) bool {
+	*scratch = e.recvSlotsSnapshotInto((*scratch)[:0])
+	slots := *scratch
 	if len(slots) == 0 {
 		return false
 	}
@@ -710,34 +762,35 @@ func (e *Engine) fillRecvBatch(batch *[]recvFrame) bool {
 }
 
 func (e *Engine) recvSlotsSnapshot() []*pathSlot {
+	return e.recvSlotsSnapshotInto(nil)
+}
+
+func (e *Engine) recvSlotsSnapshotInto(dst []*pathSlot) []*pathSlot {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
-	return e.receiveSlotsLocked()
+	return e.receiveSlotsAppendLocked(dst)
 }
 
 // receiveSlotsLocked includes staged and retained paths: both are deliberately
 // TX-invisible but must keep accepting sequenced DATA and activation controls
 // throughout the overlap window. Caller holds pathsMu for reading or writing.
 func (e *Engine) receiveSlotsLocked() []*pathSlot {
-	ids := make([]uint32, 0, len(e.paths)+len(e.stagedPaths)+len(e.retainedPaths))
-	slotsByID := make(map[uint32]*pathSlot, cap(ids))
+	return e.receiveSlotsAppendLocked(nil)
+}
+
+func (e *Engine) receiveSlotsAppendLocked(slots []*pathSlot) []*pathSlot {
 	for _, set := range []map[uint32]*pathSlot{e.paths, e.stagedPaths, e.retainedPaths} {
-		for id, slot := range set {
-			ids = append(ids, id)
-			slotsByID[id] = slot
+		for _, slot := range set {
+			slots = append(slots, slot)
 		}
 	}
-	if len(ids) == 0 {
+	if len(slots) == 0 {
 		return nil
 	}
-	for i := 1; i < len(ids); i++ {
-		for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
-			ids[j-1], ids[j] = ids[j], ids[j-1]
+	for i := 1; i < len(slots); i++ {
+		for j := i; j > 0 && slots[j-1].id > slots[j].id; j-- {
+			slots[j-1], slots[j] = slots[j], slots[j-1]
 		}
-	}
-	slots := make([]*pathSlot, 0, len(ids))
-	for _, id := range ids {
-		slots = append(slots, slotsByID[id])
 	}
 	return slots
 }
@@ -754,7 +807,7 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 	e.recvMu.Lock()
 	wokeReader := false
 	for _, frame := range batch {
-		if e.onFrameRecvLocked(frame.slot, frame.hdr, frame.payload, &deliverPackets) {
+		if e.onFrameRecvDigestLocked(frame.slot, frame.hdr, frame.payload, frame.digest, &deliverPackets) {
 			wokeReader = true
 		}
 	}
@@ -766,7 +819,7 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 			return
 		}
 	}
-	ackNext, ackGap, ackProof := e.receiveAckStateLocked()
+	ackNext, ackGap, ackProof := e.receiveAckStateLocked(e.recvTerminal || e.recvStreamEOF)
 	if wokeReader || e.isClosed() {
 		e.recvCond.Broadcast()
 	}
@@ -775,18 +828,22 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 	e.finishReceiveProgress(ackNext, ackGap, ackProof, finalErr)
 }
 
-func (e *Engine) receiveAckStateLocked() (uint64, bool, proto.AckProof) {
-	ackNext := uint64(0)
-	ackGap := false
-	if e.expectedRecvSeq > e.recvAckSent {
-		e.recvAckSent = e.expectedRecvSeq
-		ackNext = e.expectedRecvSeq
+func (e *Engine) receiveAckStateLocked(force bool) (uint64, bool, proto.AckProof) {
+	nextSeq := e.expectedRecvSeq
+	gap := e.recvHasGapLocked()
+	advanced := nextSeq > e.recvAckSent
+	if !advanced && !gap {
+		return 0, false, e.recvProof
 	}
-	if e.recvHasGapLocked() {
-		ackNext = e.expectedRecvSeq
-		ackGap = true
+	if !force && !gap && !e.recvControlAckPending && !e.recvDataAckUrgent && nextSeq-e.recvAckSent < recvAckFrameThreshold {
+		return 0, false, e.recvProof
 	}
-	return ackNext, ackGap, e.recvProof
+	if advanced {
+		e.recvAckSent = nextSeq
+	}
+	e.recvControlAckPending = false
+	e.recvDataAckUrgent = false
+	return nextSeq, gap, e.recvProof
 }
 
 func (e *Engine) takeRecvFinalLocked() error {
@@ -799,8 +856,35 @@ func (e *Engine) takeRecvFinalLocked() error {
 
 func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.AckProof, finalErr error) {
 	if finalErr != nil {
+		if errors.Is(finalErr, io.EOF) {
+			// BYE is session-wide even though one physical slot carried the
+			// frame. Mark every admitted receive route before publishing the
+			// terminal ACK so the peer's ensuing all-path close is classified as
+			// clean on siblings too, rather than spawning migration work.
+			e.markPeerByeSeen()
+		}
 		if nextSeq != 0 || gap {
 			e.sendTerminalAck(nextSeq, gap, proof)
+		}
+		if errors.Is(finalErr, io.EOF) {
+			// BYE terminates the session; STREAM_FIN is the distinct operation
+			// that preserves reverse writes. Publish the peer-BYE exception under
+			// the same epoch lock as path preparation so a racing admission is
+			// either rejected normally or retained solely as an ACK route.
+			e.sessionEpochMu.Lock()
+			e.peerNormalBye.Store(true)
+			e.sendWriteClosed.Store(true)
+			e.sendClosing.Store(true)
+			e.sessionEpochMu.Unlock()
+			e.schedulePeerByeClose()
+			e.recvMu.Lock()
+			e.recvCond.Broadcast()
+			e.recvMu.Unlock()
+			select {
+			case e.recvPacketWake <- struct{}{}:
+			default:
+			}
+			return
 		}
 		e.setCloseErr(finalErr)
 		e.requestClose()
@@ -808,6 +892,48 @@ func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.Ack
 	}
 	if nextSeq != 0 || gap {
 		e.sendAck(nextSeq, gap, proof)
+	}
+}
+
+func (e *Engine) schedulePeerByeClose() {
+	e.peerByeMu.Lock()
+	if e.peerByeCloseDone != nil || e.closing.Load() {
+		e.peerByeMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	e.peerByeCloseDone = done
+	e.peerByeMu.Unlock()
+
+	retention := e.limits.MigrationBudget
+	if retention > 2*time.Second {
+		retention = 2 * time.Second
+	}
+	if retention <= 0 {
+		retention = pathCloseTimeout
+	}
+	retention += pathCloseTimeout
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(retention)
+		defer timer.Stop()
+		select {
+		case <-e.closed:
+			return
+		case <-timer.C:
+			e.requestClose()
+		}
+	}()
+}
+
+func (e *Engine) markPeerByeSeen() {
+	e.pathsMu.RLock()
+	slots := e.receiveSlotsLocked()
+	e.pathsMu.RUnlock()
+	for _, slot := range slots {
+		if marker, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
+			marker.MarkByeSeen()
+		}
 	}
 }
 
@@ -832,7 +958,10 @@ func (e *Engine) recvHasGapLocked() bool {
 // drainer dispatches each in turn so the application stream remains
 // contiguous regardless of how ctrl frames are interleaved.
 func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []byte, deliverPackets *[][]byte) bool {
-	digest := recvFrameDigest(hdr, payload)
+	return e.onFrameRecvDigestLocked(slot, hdr, payload, recvFrameDigest(hdr, payload), deliverPackets)
+}
+
+func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, payload []byte, digest proto.FrameDigest, deliverPackets *[][]byte) bool {
 	if hdr.Seq < e.expectedRecvSeq {
 		// Duplicate (race / redistribute) or out-of-window.
 		e.recvDups++
@@ -885,6 +1014,7 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 				e.packetMarkSeenLocked(hdr.Seq)
 				e.recvFrameProofs[hdr.Seq] = digest
 				e.recvPacketMarks++
+				e.noteRecvDataForAckLocked()
 				*deliverPackets = append(*deliverPackets, payload)
 				e.markPayloadLocked()
 				if n := len(e.recvQueue) + e.recvPacketMarks; n > e.recvQueueHWM {
@@ -915,6 +1045,9 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 		return false
 	}
 
+	if hdr.Type != proto.FrameCtrl {
+		e.noteRecvDataForAckLocked()
+	}
 	e.recvQueue[hdr.Seq] = recvItem{
 		slot:    slot,
 		isCtrl:  hdr.Type == proto.FrameCtrl,
@@ -940,6 +1073,14 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 	}
 
 	return e.drainContiguousLocked(deliverPackets)
+}
+
+func (e *Engine) noteRecvDataForAckLocked() {
+	if e.recvAckBurstOpen {
+		return
+	}
+	e.recvAckBurstOpen = true
+	e.recvDataAckUrgent = true
 }
 
 func isPolicyCtrl(code proto.CtrlCode) bool {
@@ -969,6 +1110,16 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 		if !e.packetized && !item.isCtrl && len(e.recvDeliverFrames) >= streamRecvWindowFrames {
 			break
 		}
+		ctrlCode := proto.CtrlCode(0)
+		if item.isCtrl {
+			ctrlCode = proto.CtrlCodeFromFlags(item.flags)
+			if ctrlCode == proto.CtrlPathRetire && !e.enqueueSequencedPathRetirementLocked(item.payload) {
+				// Do not advance the cumulative proof over control work the
+				// bounded engine worker could not accept. The terminal path will
+				// acknowledge only the prefix already owned by this engine.
+				break
+			}
+		}
 		seq := e.expectedRecvSeq
 		delete(e.recvQueue, seq)
 		e.recvProof = proto.AdvanceAckProof(e.recvProof, item.digest)
@@ -977,14 +1128,22 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 			e.packetAdvanceHeadLocked()
 		}
 		if item.isCtrl {
-			if isReplayableTransactionCtrl(proto.CtrlCodeFromFlags(item.flags)) {
+			e.recvControlAckPending = true
+			if isReplayableTransactionCtrl(ctrlCode) {
 				e.rememberPolicyReplayDigestLocked(seq, item.digest)
 			}
-			e.applyCtrlLocked(item.slot, item.flags, item.payload, false)
+			if ctrlCode != proto.CtrlPathRetire {
+				e.applyCtrlLocked(item.slot, item.flags, item.payload, false)
+			}
 			if e.recvTerminal {
 				break
 			}
 		} else {
+			if e.recvStreamEOF {
+				e.recvFinalErr = fmt.Errorf("%w: DATA after STREAM_FIN", ErrPeerProtocol)
+				e.recvTerminal = true
+				break
+			}
 			if e.packetized {
 				if !item.delivered {
 					// DATA at the SEQ head may still be pending if it
@@ -1058,6 +1217,15 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte, r
 		}
 		e.recvFinalErr = closeErr
 		e.recvTerminal = true
+
+	case proto.CtrlStreamFin:
+		if e.packetized || len(payload) != 0 || e.recvStreamEOF {
+			e.recvFinalErr = fmt.Errorf("%w: invalid STREAM_FIN", ErrPeerProtocol)
+			e.recvTerminal = true
+			return
+		}
+		e.recvStreamEOF = true
+		e.recvCond.Broadcast()
 
 	case proto.CtrlPolicyPrepare:
 		prepare, err := proto.DecodePolicyPrepare(payload)

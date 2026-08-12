@@ -23,6 +23,7 @@ const (
 	ReasonSessionMissingRoot         SessionErrorReason = "missing_root"
 	ReasonSessionMissingEgress       SessionErrorReason = "missing_egress"
 	ReasonSessionIdentityMismatch    SessionErrorReason = "identity_mismatch"
+	ReasonSessionFlowRefMismatch     SessionErrorReason = "flow_ref_mismatch"
 )
 
 // SessionError keeps ingress-to-rendr planning failures inspectable.
@@ -45,6 +46,7 @@ func (e *SessionError) Error() string {
 type SessionRequest struct {
 	Kind               SessionKind
 	Identity           L3Identity
+	Ref                FlowRef
 	Peer               string
 	Root               any
 	Egress             string
@@ -70,6 +72,10 @@ func BuildSessionRequest(ev PacketEvent) (SessionRequest, error) {
 		return SessionRequest{}, sessionErr(ReasonSessionIdentityMismatch,
 			fmt.Sprintf("packet=%s flow=%s", id.String(), ev.Flow.L3Identity.String()))
 	}
+	if ev.Ref != (FlowRef{}) && (ev.Ref.Identity != id || ev.Ref.Generation == 0) {
+		return SessionRequest{}, sessionErr(ReasonSessionFlowRefMismatch,
+			fmt.Sprintf("packet=%s ref=%+v", id.String(), ev.Ref))
+	}
 	var kind SessionKind
 	switch id.Proto {
 	case ProtocolTCP:
@@ -91,6 +97,7 @@ func BuildSessionRequest(ev PacketEvent) (SessionRequest, error) {
 	return SessionRequest{
 		Kind:               kind,
 		Identity:           id,
+		Ref:                ev.Ref,
 		Peer:               ev.Decision.Peer,
 		Root:               ev.Decision.Root,
 		Egress:             ev.Decision.Egress,

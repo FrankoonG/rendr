@@ -26,6 +26,11 @@ type ClientBridgeAdmission struct {
 	PathID uint32
 }
 
+// ClientHelloAckValidator applies caller-owned session requirements after the
+// HELLO_ACK is structurally authenticated but before any path attach or COMMIT
+// can make the admission externally visible.
+type ClientHelloAckValidator func(proto.HelloAckPayload) error
+
 func PerformClientHelloAdmissionContext(
 	ctx context.Context,
 	pc transport.PathConn,
@@ -34,6 +39,7 @@ func PerformClientHelloAdmissionContext(
 	caps uint32,
 	name string,
 	spec transport.PathSpec,
+	validateAck ClientHelloAckValidator,
 ) (ClientHelloAdmission, error) {
 	ctx, cancel := boundedAdmissionContext(ctx)
 	defer cancel()
@@ -70,6 +76,13 @@ func PerformClientHelloAdmissionContext(
 	if peerPacket := ack.Caps&proto.CapsPacketMode != 0; peerPacket != (caps&proto.CapsPacketMode != 0) {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: peer session kind mismatch: packet=%t", ErrPeerProtocol, peerPacket)
 	}
+	if validateAck != nil {
+		if err := validateAck(ack); err != nil {
+			abortErr := writeAdmissionCtrlContext(ctx, pc, proto.CtrlBye,
+				(proto.ByePayload{Reason: proto.ByeAppRequest}).Encode())
+			return ClientHelloAdmission{}, errors.Join(err, abortErr)
+		}
+	}
 	if err := e.AdoptSessionEpoch(ack.FlowID); err != nil {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
@@ -95,8 +108,7 @@ func PerformClientHelloAdmissionContext(
 			return
 		}
 		if commitSent {
-			e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-			_ = e.Close()
+			e.closeForUnknownPathAdmissionIfLive()
 			return
 		}
 		e.AbortPathAttach(pathID, nil)
@@ -166,8 +178,7 @@ func PerformClientBridgeAdmissionContext(
 			return
 		}
 		if commitSent {
-			e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-			_ = e.Close()
+			e.closeForUnknownPathAdmissionIfLive()
 			return
 		}
 		e.AbortPathAttach(pathID, nil)
@@ -354,9 +365,9 @@ func performServerAdmission(
 		if retErr == nil || !postCommit || completed {
 			return
 		}
-		e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-		_ = e.Close()
-		retErr = pathAdmissionOutcomeUnknown(retErr)
+		if e.closeForUnknownPathAdmissionIfLive() {
+			retErr = pathAdmissionOutcomeUnknown(retErr)
+		}
 	}()
 	base, err := e.PathAdmissionBaseGeneration(pathID)
 	if err != nil {
@@ -413,8 +424,6 @@ func performServerAdmission(
 	}
 	confirm, confirmWire, err := waitForAdmissionConfirm(postCommitCtx, e, commit, commitWire, committedWire)
 	if err != nil {
-		e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-		_ = e.Close()
 		return err
 	}
 	finalAck := proto.PathAdmissionAck{
@@ -433,8 +442,6 @@ func performServerAdmission(
 	for {
 		receiptRoute, err := waitForFinalReceipt(postCommitCtx, e, commit, confirm, confirmWire, finalWire)
 		if err != nil {
-			e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
-			_ = e.Close()
 			return err
 		}
 		if !activatedRoute {
@@ -585,6 +592,9 @@ func waitRawCommit(
 				return nil, err
 			}
 			continue
+		}
+		if code == proto.CtrlBye {
+			return nil, admissionByeError(payload)
 		}
 		if code != proto.CtrlPathAdmissionCommit {
 			continue
@@ -886,6 +896,22 @@ func pathAdmissionOutcomeUnknown(err error) error {
 	return fmt.Errorf("%w: %v", ErrPathAdmissionOutcomeUnknown, err)
 }
 
+// closeForUnknownPathAdmissionIfLive linearizes an uncertain committed
+// admission against normal session teardown. If teardown won first, the
+// admission result can no longer affect a live session and must not turn a
+// clean Close into a protocol failure. If admission failure wins, fail closed.
+func (e *Engine) closeForUnknownPathAdmissionIfLive() bool {
+	e.sessionEpochMu.Lock()
+	if e.isClosed() || e.sendClosing.Load() {
+		e.sessionEpochMu.Unlock()
+		return false
+	}
+	e.setCloseErr(ErrPathAdmissionOutcomeUnknown)
+	e.sessionEpochMu.Unlock()
+	_ = e.Close()
+	return true
+}
+
 func admissionByeError(payload []byte) error {
 	bye, err := proto.DecodeBye(payload)
 	if err != nil {
@@ -893,6 +919,9 @@ func admissionByeError(payload []byte) error {
 	}
 	if bye.Reason == proto.ByeProtoVer {
 		return ErrPeerProtoVersion
+	}
+	if bye.Reason == proto.ByeAppRequest {
+		return ErrPathAdmissionRejected
 	}
 	return fmt.Errorf("%w: %d", ErrPeerClosed, bye.Reason)
 }

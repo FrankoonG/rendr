@@ -80,11 +80,12 @@ type speedEvidence struct {
 // schedulingEvidence is one immutable, sender-direction-specific snapshot for
 // a path or aggregate target. It retains no samples or child references.
 type schedulingEvidence struct {
-	direction proto.SenderDirection
-	live      bool
-	latency   latencyEvidence
-	stability stabilityEvidence
-	speed     speedEvidence
+	direction     proto.SenderDirection
+	live          bool
+	probeLiveness qualityState
+	latency       latencyEvidence
+	stability     stabilityEvidence
+	speed         speedEvidence
 }
 
 // aggregateChildEvidence describes one immediate child. Input order is
@@ -131,6 +132,7 @@ func aggregateSchedulingEvidence(kind proto.GraphNodeKind, direction proto.Sende
 			}
 			out.live = out.live || children[i].evidence.live
 		}
+		out.probeLiveness = aggregateCompositeProbeLiveness(children)
 		if kind == proto.GraphNodeKindRace {
 			out.latency = aggregateRaceLatency(children)
 			out.stability = aggregateRaceStability(children)
@@ -146,6 +148,29 @@ func aggregateSchedulingEvidence(kind proto.GraphNodeKind, direction proto.Sende
 	default:
 		return out, false
 	}
+}
+
+// A composite remains externally live while any eligible descendant has a
+// fresh same-carrier probe. One stale bond/race leaf is degradation evidence,
+// not proof that the parent target is blackholed.
+func aggregateCompositeProbeLiveness(children []aggregateChildEvidence) qualityState {
+	hasStale := false
+	for i := range children {
+		child := children[i]
+		if !child.eligible || !child.evidence.live {
+			continue
+		}
+		switch child.evidence.probeLiveness {
+		case qualityStateFresh:
+			return qualityStateFresh
+		case qualityStateStale:
+			hasStale = true
+		}
+	}
+	if hasStale {
+		return qualityStateStale
+	}
+	return qualityStateUnknown
 }
 
 type aggregateMeta struct {

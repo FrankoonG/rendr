@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -73,6 +74,52 @@ func TestExecutionRuntimeNestedSelectorsKeepIndependentState(t *testing.T) {
 	}
 }
 
+func TestExecutionRuntimeFlatSelectorQualificationIsExact(t *testing.T) {
+	flatManifest, flatIDs := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	flat := mustExecutionRuntime(t, flatManifest)
+	if !flat.flatLeafSelector || !flat.ownsFlatSelectorLeaf(flatIDs["a"]) || !flat.ownsFlatSelectorLeaf(flatIDs["b"]) {
+		t.Fatalf("flat selector was not qualified: runtime=%+v", flat)
+	}
+	if flat.ownsFlatSelectorLeaf(proto.DeriveTargetID(proto.GraphNodeKindPath, "other")) {
+		t.Fatal("flat selector accepted a non-child leaf")
+	}
+
+	for _, test := range []struct {
+		name     string
+		manifest proto.GraphManifest
+	}{
+		{name: "bond root", manifest: func() proto.GraphManifest {
+			manifest, _ := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindBond, "root", "a", "b"),
+				runtimeNode(proto.GraphNodeKindPath, "a"),
+				runtimeNode(proto.GraphNodeKindPath, "b"),
+			)
+			return manifest
+		}()},
+		{name: "selector nested group", manifest: func() proto.GraphManifest {
+			manifest, _ := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindSelector, "root", "aggregate", "c"),
+				runtimeNode(proto.GraphNodeKindBond, "aggregate", "a", "b"),
+				runtimeNode(proto.GraphNodeKindPath, "a"),
+				runtimeNode(proto.GraphNodeKindPath, "b"),
+				runtimeNode(proto.GraphNodeKindPath, "c"),
+			)
+			return manifest
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := mustExecutionRuntime(t, test.manifest)
+			if runtime.flatLeafSelector {
+				t.Fatal("non-flat execution graph qualified for the flat selector dispatcher")
+			}
+		})
+	}
+}
+
 func TestExecutionRuntimeBondPinsFourFramesPerChild(t *testing.T) {
 	for _, pinSize := range []int{4, DefaultLimits().BondPinSize} {
 		t.Run(fmt.Sprintf("pin-%d", pinSize), func(t *testing.T) {
@@ -139,7 +186,7 @@ func TestExecutionRuntimeBondPinsFourFramesPerChild(t *testing.T) {
 	})
 }
 
-func TestExecutionRuntimeSelectorDeathBypassesPolicyAndRecoversDesired(t *testing.T) {
+func TestExecutionRuntimeSelectorHardDeathFallsBackAndRecoversDesired(t *testing.T) {
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
@@ -158,6 +205,28 @@ func TestExecutionRuntimeSelectorDeathBypassesPolicyAndRecoversDesired(t *testin
 	}
 	if got := runtimeRouteNames(t, runtime, runtimeAttached(ids, "a", "b"), true); !reflect.DeepEqual(got, []string{"b"}) {
 		t.Fatalf("recovered desired route=%v", got)
+	}
+}
+
+func TestExecutionRuntimeSelectorDispatchStallWaitsForPolicyDecision(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
+		t.Fatal(err)
+	}
+	eligible := runtimeAttached(ids, "b")
+	present := runtimeAttached(ids, "a", "b")
+	ticket, err := runtime.buildTicketObservedPresence(eligible, present, nil, nil, false, 1, 0)
+	if !errors.Is(err, errNoExecutionRoute) || len(ticket.routes) != 0 {
+		t.Fatalf("stalled selected child ticket=%v err=%v want no execution route", ticket.routes, err)
+	}
+	desired, effective, ok := runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["a"] || effective != (proto.TargetID{}) {
+		t.Fatalf("stalled state desired=%x effective=%x ok=%t want a/zero/true", desired, effective, ok)
 	}
 }
 

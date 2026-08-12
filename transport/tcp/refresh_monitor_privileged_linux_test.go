@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -423,6 +424,9 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 		_ = exec.Command("/usr/sbin/ip", "addr", "del", clientIP+"/32", "dev", "lo").Run()
 		_ = exec.Command("/usr/sbin/ip", "addr", "del", serverIP+"/32", "dev", "lo").Run()
 	})
+	if capturePackets {
+		installRefreshLoopbackRateLimit(t)
+	}
 	var capture *refreshTCPCapture
 	if capturePackets {
 		capture = startRefreshTCPCapture(t, clientIP, serverIP)
@@ -431,11 +435,20 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 	clientSocket, serverSocket := refreshMonitorTCPPair(t, clientIP, serverIP)
 	clientPath, clientDriver := drivenRepairPath(clientSocket, leafmobility.RoleDialer)
 	serverPath, serverDriver := drivenRepairPath(serverSocket, leafmobility.RoleAcceptor)
+	var inspectionRecorder *kernel5TCPInspectionRecorder
+	if capturePackets {
+		inspectionRecorder = &kernel5TCPInspectionRecorder{}
+		clientDriver.kernel = kernel5TCPRecordingRepairKernel{
+			delegate: clientDriver.kernel,
+			recorder: inspectionRecorder,
+		}
+	}
 	// The exact stimulus is loss of the client's source address. Keep the peer
 	// as a responder so this case proves one factual event maps to one actor.
 	serverPath.refreshEmitter = nil
 	clientGeneration := clientPath.claim.Snapshot().Generation
 	serverGeneration := serverPath.claim.Snapshot().Generation
+	preTuple := measureKernel5TCPPairTuple(t, clientPath, serverPath)
 
 	flowID := [16]byte{0x71, 0x72, 0x73, 0x74}
 	limits := engine.DefaultLimits()
@@ -487,15 +500,19 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 		t.Fatal("negotiated owned TCP path did not install its route/source monitor")
 	}
 
-	payload := bytes.Repeat([]byte("automatic-source-loss-payload-"), 1<<18)
-	wantDigest := sha256.Sum256(payload)
+	migrationPayload := bytes.Repeat([]byte("automatic-source-loss-payload-"), 1<<18)
+	postCommitPayload := []byte("client-to-committed-replacement")
+	forwardPayload := make([]byte, 0, len(migrationPayload)+len(postCommitPayload))
+	forwardPayload = append(forwardPayload, migrationPayload...)
+	forwardPayload = append(forwardPayload, postCommitPayload...)
+	wantDigest := sha256.Sum256(forwardPayload)
 	receiveResult := make(chan driverReceiveResult, 1)
-	go receiveDriverPayload(serverEngine, len(payload), receiveResult)
+	go receiveDriverPayload(serverEngine, len(forwardPayload), receiveResult)
 	sendResult := make(chan error, 1)
 	baselineWrites := clientPath.Writes()
 	go func() {
-		n, sendErr := clientEngine.SendData(payload)
-		if sendErr == nil && n != len(payload) {
+		n, sendErr := clientEngine.SendData(migrationPayload)
+		if sendErr == nil && n != len(migrationPayload) {
 			sendErr = io.ErrShortWrite
 		}
 		sendResult <- sendErr
@@ -503,9 +520,18 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	waitForDriverWrites(t, ctx, clientPath, baselineWrites+8)
+	if capturePackets {
+		assertRefreshLoopbackRateLimit(t)
+		select {
+		case sendErr := <-sendResult:
+			t.Fatalf("source-loss stimulus did not overlap an active forward send: %v", sendErr)
+		default:
+		}
+	}
 
 	runRefreshIP(t, "addr", "del", clientIP+"/32", "dev", "lo")
 	runRefreshIP(t, "route", "add", "local", clientIP+"/32", "dev", "lo")
+	var committedStatus engine.LeafMobilityInitiatorSnapshot
 	for {
 		status, exists := clientEngine.LeafMobilityInitiatorStatus(clientRef)
 		if exists && status.Phase == engine.LeafMobilityInitiatorCommitted {
@@ -513,6 +539,7 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 				status.Operation != leafmobility.OperationTCPRepair || status.Error != "" {
 				t.Fatalf("automatic initiator status=%+v", status)
 			}
+			committedStatus = status
 			break
 		}
 		if exists && automaticInitiatorFailed(status.Phase) {
@@ -524,27 +551,39 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 		case <-time.After(time.Millisecond):
 		}
 	}
+	replacementCookie, err := measureKernel5TCPPathSocketCookie(clientPath)
+	if err != nil {
+		t.Fatalf("measure committed replacement SO_COOKIE: %v", err)
+	}
 	if err := <-sendResult; err != nil {
 		t.Fatalf("SendData across automatic migration: %v", err)
 	}
+	if n, err := clientEngine.SendData(postCommitPayload); err != nil || n != len(postCommitPayload) {
+		t.Fatalf("SendData on committed replacement=(%d,%v)", n, err)
+	}
 	received := <-receiveResult
-	if received.err != nil || received.bytes != len(payload) || received.digest != wantDigest {
+	if received.err != nil || received.bytes != len(forwardPayload) || received.digest != wantDigest {
 		t.Fatalf("automatic receive bytes=%d digest=%x err=%v", received.bytes, received.digest, received.err)
 	}
-	if clientPath.claim.Snapshot().Generation == clientGeneration {
+	clientGenerationAfter := clientPath.claim.Snapshot().Generation
+	serverGenerationAfter := serverPath.claim.Snapshot().Generation
+	if clientGenerationAfter == clientGeneration {
 		t.Fatalf("automatic migration retained client generation %d", clientGeneration)
 	}
-	if serverPath.claim.Snapshot().Generation != serverGeneration {
-		t.Fatalf("responder generation changed from %d to %d", serverGeneration, serverPath.claim.Snapshot().Generation)
+	if serverGenerationAfter != serverGeneration {
+		t.Fatalf("responder generation changed from %d to %d", serverGeneration, serverGenerationAfter)
 	}
-	if got := clientEngine.MigrationCount(); got != baselineMigrations+1 {
-		t.Fatalf("automatic migration count=%d want=%d", got, baselineMigrations+1)
+	migrationsAfter := clientEngine.MigrationCount()
+	if migrationsAfter != baselineMigrations+1 {
+		t.Fatalf("automatic migration count=%d want=%d", migrationsAfter, baselineMigrations+1)
 	}
+	var committedMigration migrateEvent
 	select {
 	case event := <-migrations:
 		if event.oldID != clientPathID || event.newID != clientPathID || event.cause != "leaf-mobility" {
 			t.Fatalf("automatic migration event=%+v", event)
 		}
+		committedMigration = event
 	case <-ctx.Done():
 		t.Fatalf("automatic migration hook timed out: %v", ctx.Err())
 	}
@@ -566,21 +605,95 @@ func runPrivilegedAutomaticTCPRepairOnSourceLoss(t *testing.T, capturePackets, v
 		t.Fatalf("reverse SendData=(%d,%v)", n, err)
 	}
 	buffer := make([]byte, len(reverse))
-	if n, err := clientEngine.Recv(buffer); err != nil || n != len(reverse) || !bytes.Equal(buffer, reverse) {
-		t.Fatalf("reverse Recv=(%d,%v,%q)", n, err, buffer[:max(n, 0)])
+	reverseBytes, reverseErr := clientEngine.Recv(buffer)
+	if reverseErr != nil || reverseBytes != len(reverse) || !bytes.Equal(buffer, reverse) {
+		t.Fatalf("reverse Recv=(%d,%v,%q)", reverseBytes, reverseErr, buffer[:max(reverseBytes, 0)])
 	}
+	var preInspection, postInspection kernel5TCPInspectionEvidence
+	var sourceCookie uint64
+	if inspectionRecorder != nil {
+		var err error
+		preInspection, sourceCookie, err = inspectionRecorder.singleMeasurement()
+		if err != nil {
+			t.Fatalf("measure captured source TCP_REPAIR state and SO_COOKIE: %v", err)
+		}
+		if sourceCookie == replacementCookie {
+			t.Fatalf("automatic TCP_REPAIR retained kernel socket SO_COOKIE=%d", sourceCookie)
+		}
+	}
+	if os.Getenv(kernel5TCPRepairEvidenceEnvironment) != "" {
+		var err error
+		postInspection, err = measureKernel5TCPCurrentInspection(clientPath, clientDriver.quarantine)
+		if err != nil {
+			t.Fatalf("measure post-migration TCP_REPAIR state: %v", err)
+		}
+	}
+	postTuple := measureKernel5TCPPairTuple(t, clientPath, serverPath)
+	var captureEvidence kernel5TCPCaptureEvidence
 	if capture != nil {
-		packetCount, resetPackets, captureErr := capture.Stop()
+		var captureErr error
+		captureEvidence, captureErr = capture.Stop()
 		if captureErr != nil {
 			t.Fatal(captureErr)
 		}
-		if packetCount < 20 {
-			t.Fatalf("capture oracle observed only %d TCP packets", packetCount)
-		}
-		if resetPackets != 0 {
-			t.Fatalf("capture oracle observed %d TCP RST packets", resetPackets)
+		if err := validateKernel5TCPCaptureEvidence(captureEvidence); err != nil {
+			t.Fatalf("capture oracle evidence is invalid: %v", err)
 		}
 	}
+	reverseDigest := sha256.Sum256(reverse)
+	receivedReverseDigest := sha256.Sum256(buffer[:reverseBytes])
+	transactionID := fmt.Sprintf("%x", committedStatus.TransactionID)
+	emitKernel5TCPRepairEligibleEvidence(t, kernel5TCPRepairEligibleEvidence{
+		TestName:       "TestPrivilegedAutomaticTCPRepairOnSourceLoss",
+		PreTuple:       preTuple,
+		PostTuple:      postTuple,
+		PreInspection:  preInspection,
+		PostInspection: postInspection,
+		SocketIncarnation: kernel5TCPSocketIncarnationEvidence{
+			SourceCookie: sourceCookie, ReplacementCookie: replacementCookie,
+			SourcePhase: kernel5TCPSourceSocketPhase, ReplacementPhase: kernel5TCPReplacementSocketPhase,
+			TransactionID: transactionID, SourceEndpointGeneration: clientGeneration,
+			ReplacementEndpointGeneration: clientGenerationAfter, CanonicalTuple: preTuple.Canonical,
+		},
+		ClaimGenerations: kernel5TCPClaimGenerationEvidence{
+			ActorBefore: clientGeneration, ActorAfter: clientGenerationAfter,
+			PeerBefore: serverGeneration, PeerAfter: serverGenerationAfter,
+			StatusFrom: committedStatus.SourceEndpointGeneration,
+			StatusTo:   committedStatus.ResultEndpointGeneration,
+		},
+		Commit: kernel5TCPCommitEvidence{
+			Phase: "committed", Operation: "tcp_repair_same_peer_tuple", OperationCode: uint8(committedStatus.Operation),
+			Reason: "route_source_changed", ReasonCode: uint8(committedStatus.EvidenceReason),
+			PlanReason: committedStatus.PlanReason.String(), PlanReasonCode: uint16(committedStatus.PlanReason),
+			TransactionID:      transactionID,
+			EvidenceGeneration: committedStatus.EvidenceGeneration,
+		},
+		ForwardPayload: kernel5TCPPayloadEvidence{
+			OfferedBytes: len(forwardPayload), ReceivedBytes: received.bytes,
+			OfferedSHA256: fmt.Sprintf("%x", wantDigest), ReceivedSHA256: fmt.Sprintf("%x", received.digest),
+		},
+		ReversePayload: kernel5TCPPayloadEvidence{
+			OfferedBytes: len(reverse), ReceivedBytes: reverseBytes,
+			OfferedSHA256: fmt.Sprintf("%x", reverseDigest), ReceivedSHA256: fmt.Sprintf("%x", receivedReverseDigest),
+		},
+		BidirectionalReverseSuccess: reverseErr == nil && reverseBytes == len(reverse) && bytes.Equal(buffer[:reverseBytes], reverse),
+		Migration: kernel5TCPMigrationEvidence{
+			Before: baselineMigrations, After: migrationsAfter, Delta: migrationsAfter - baselineMigrations,
+			Events: 1, OldPathID: committedMigration.oldID, NewPathID: committedMigration.newID, Cause: committedMigration.cause,
+		},
+		ControlRoute: kernel5TCPControlRouteEvidence{
+			AttachedPaths: 1,
+			ClientWrites:  clientControl.Writes(), ClientReads: clientControl.Reads(),
+			ServerWrites: serverControl.Writes(), ServerReads: serverControl.Reads(),
+		},
+		InternalCapture: captureEvidence,
+		SourceLoss: kernel5TCPSourceLossEvidence{
+			Observed: true, SourceAddress: clientIP, ReplacementRouteInstalled: true,
+			EvidenceGeneration:       committedStatus.EvidenceGeneration,
+			SourceEndpointGeneration: committedStatus.SourceEndpointGeneration,
+			Reason:                   "route_source_changed",
+		},
+	})
 }
 
 func TestPrivilegedAutomaticTCPRepairResourceSlope(t *testing.T) {
@@ -770,13 +883,18 @@ func binaryNativeUint16(value []byte) uint16 { return binary.NativeEndian.Uint16
 func binaryNativeUint32(value []byte) uint32 { return binary.NativeEndian.Uint32(value) }
 
 type refreshTCPCapture struct {
-	command *exec.Cmd
-	path    string
+	command    *exec.Cmd
+	path       string
+	stderrDone <-chan refreshTCPDumpStderrResult
 
 	stopOnce sync.Once
-	packets  int
-	resets   int
+	evidence kernel5TCPCaptureEvidence
 	err      error
+}
+
+type refreshTCPDumpStderrResult struct {
+	output string
+	err    error
 }
 
 func startRefreshTCPCapture(t testing.TB, clientIP, serverIP string) *refreshTCPCapture {
@@ -787,6 +905,7 @@ func startRefreshTCPCapture(t testing.TB, clientIP, serverIP string) *refreshTCP
 	path := t.TempDir() + "/automatic-repair.pcap"
 	filter := "tcp and ((src host " + clientIP + " and dst host " + serverIP + ") or (src host " + serverIP + " and dst host " + clientIP + "))"
 	command := exec.Command("/usr/bin/tcpdump", "-i", "lo", "-nn", "-U", "-Z", "root", "-w", path, filter)
+	command.Env = refreshTCPCaptureEnvironment()
 	stderr, err := command.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -795,83 +914,183 @@ func startRefreshTCPCapture(t testing.TB, clientIP, serverIP string) *refreshTCP
 		t.Fatal(err)
 	}
 	ready := make(chan error, 1)
+	stderrDone := make(chan refreshTCPDumpStderrResult, 1)
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		var output strings.Builder
 		published := false
 		for scanner.Scan() {
-			if !published && strings.Contains(scanner.Text(), "listening on lo") {
+			line := scanner.Text()
+			output.WriteString(line)
+			output.WriteByte('\n')
+			if !published && strings.Contains(line, "listening on lo") {
 				published = true
 				ready <- nil
 			}
 		}
+		scanErr := scanner.Err()
 		if !published {
-			if scanErr := scanner.Err(); scanErr != nil {
+			if scanErr != nil {
 				ready <- scanErr
 			} else {
 				ready <- errors.New("tcpdump exited before capture became active")
 			}
 		}
+		stderrDone <- refreshTCPDumpStderrResult{output: output.String(), err: scanErr}
 	}()
+	capture := &refreshTCPCapture{command: command, path: path, stderrDone: stderrDone}
+	t.Cleanup(func() { _, _ = capture.Stop() })
 	select {
 	case err := <-ready:
 		if err != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
-		_ = command.Process.Kill()
-		_ = command.Wait()
 		t.Fatal("tcpdump did not confirm an active capture")
 	}
-	capture := &refreshTCPCapture{command: command, path: path}
-	t.Cleanup(func() { _, _, _ = capture.Stop() })
 	return capture
 }
 
-func (c *refreshTCPCapture) Stop() (packets, resets int, err error) {
+func (c *refreshTCPCapture) Stop() (kernel5TCPCaptureEvidence, error) {
 	if c == nil {
-		return 0, 0, errors.New("nil TCP capture oracle")
+		return kernel5TCPCaptureEvidence{}, errors.New("nil TCP capture oracle")
 	}
 	c.stopOnce.Do(func() {
 		if signalErr := c.command.Process.Signal(os.Interrupt); signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-			c.err = signalErr
-			return
+			c.err = errors.Join(c.err, signalErr)
 		}
-		wait := make(chan error, 1)
-		go func() { wait <- c.command.Wait() }()
-		select {
-		case waitErr := <-wait:
-			if waitErr != nil {
-				c.err = waitErr
-				return
+		stderrResult, stderrErr := waitRefreshTCPDumpStderr(c.stderrDone, 2*time.Second)
+		if stderrErr != nil {
+			killErr := c.command.Process.Kill()
+			if errors.Is(killErr, os.ErrProcessDone) {
+				killErr = nil
 			}
-		case <-time.After(2 * time.Second):
-			_ = c.command.Process.Kill()
-			<-wait
-			c.err = errors.New("tcpdump did not stop within two seconds")
-			return
+			stderrResult, stderrErr = waitRefreshTCPDumpStderr(c.stderrDone, 2*time.Second)
+			c.err = errors.Join(c.err, errors.New("tcpdump stderr did not close after interrupt"), killErr, stderrErr)
 		}
-		allPackets, readErr := exec.Command("/usr/bin/tcpdump", "-nn", "-tt", "-r", c.path).Output()
+		c.err = errors.Join(c.err, stderrResult.err, waitRefreshTCPDumpProcess(c.command, 2*time.Second))
+		allPackets, readErr := readRefreshTCPCapture(c.path)
 		if readErr != nil {
-			c.err = readErr
-			return
+			c.err = errors.Join(c.err, readErr)
+		} else if trimmed := bytes.TrimSpace(allPackets); len(trimmed) != 0 {
+			c.evidence.Packets = bytes.Count(trimmed, []byte{'\n'}) + 1
 		}
-		if trimmed := bytes.TrimSpace(allPackets); len(trimmed) != 0 {
-			c.packets = bytes.Count(trimmed, []byte{'\n'}) + 1
-		}
-		resetPackets, readErr := exec.Command(
-			"/usr/bin/tcpdump", "-nn", "-tt", "-r", c.path, "tcp[tcpflags] & tcp-rst != 0",
-		).Output()
+		resetPackets, readErr := readRefreshTCPCapture(c.path, "tcp[tcpflags] & tcp-rst != 0")
 		if readErr != nil {
-			c.err = readErr
-			return
+			c.err = errors.Join(c.err, readErr)
+		} else if trimmed := bytes.TrimSpace(resetPackets); len(trimmed) != 0 {
+			c.evidence.RSTPackets = bytes.Count(trimmed, []byte{'\n'}) + 1
 		}
-		if trimmed := bytes.TrimSpace(resetPackets); len(trimmed) != 0 {
-			c.resets = bytes.Count(trimmed, []byte{'\n'}) + 1
+		statistics, statisticsErr := parseKernel5TCPCaptureStatistics(stderrResult.output)
+		if statisticsErr != nil {
+			c.err = errors.Join(c.err, statisticsErr)
+		} else {
+			c.evidence.KernelStatistics = statistics
+			c.err = errors.Join(c.err, validateKernel5TCPCaptureEvidence(c.evidence))
 		}
 	})
-	return c.packets, c.resets, c.err
+	return c.evidence, c.err
+}
+
+func refreshTCPCaptureEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "LC_ALL=") || strings.HasPrefix(entry, "LANG=") || strings.HasPrefix(entry, "LANGUAGE=") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "LC_ALL=C", "LANG=C")
+}
+
+func waitRefreshTCPDumpStderr(
+	done <-chan refreshTCPDumpStderrResult,
+	timeout time.Duration,
+) (refreshTCPDumpStderrResult, error) {
+	if done == nil {
+		return refreshTCPDumpStderrResult{}, errors.New("tcpdump stderr completion channel is nil")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-done:
+		return result, nil
+	case <-timer.C:
+		return refreshTCPDumpStderrResult{}, errors.New("tcpdump stderr drain timed out")
+	}
+}
+
+func waitRefreshTCPDumpProcess(command *exec.Cmd, timeout time.Duration) error {
+	if command == nil {
+		return errors.New("nil tcpdump command")
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-wait:
+		return err
+	case <-timer.C:
+		killErr := command.Process.Kill()
+		if errors.Is(killErr, os.ErrProcessDone) {
+			killErr = nil
+		}
+		killTimer := time.NewTimer(timeout)
+		defer killTimer.Stop()
+		select {
+		case waitErr := <-wait:
+			return errors.Join(errors.New("tcpdump process reap timed out before kill"), killErr, waitErr)
+		case <-killTimer.C:
+			return errors.Join(errors.New("tcpdump process reap remained blocked after kill"), killErr)
+		}
+	}
+}
+
+func readRefreshTCPCapture(path string, filter ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	arguments := []string{"-nn", "-tt", "-r", path}
+	arguments = append(arguments, filter...)
+	command := exec.CommandContext(ctx, "/usr/bin/tcpdump", arguments...)
+	command.Env = refreshTCPCaptureEnvironment()
+	command.WaitDelay = 250 * time.Millisecond
+	output, err := command.Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("offline tcpdump read timed out: %w", ctx.Err())
+	}
+	if err != nil {
+		return nil, fmt.Errorf("offline tcpdump read: %w", err)
+	}
+	return output, nil
+}
+
+func TestKernel5TCPCaptureCleanupWaitsAreBounded(t *testing.T) {
+	stderrDone := make(chan refreshTCPDumpStderrResult)
+	started := time.Now()
+	if _, err := waitRefreshTCPDumpStderr(stderrDone, 10*time.Millisecond); err == nil {
+		t.Fatal("stderr drain wait unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stderr drain timeout took %v", elapsed)
+	}
+
+	command := exec.Command("/usr/bin/sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+	})
+	started = time.Now()
+	if err := waitRefreshTCPDumpProcess(command, 10*time.Millisecond); err == nil {
+		t.Fatal("process wait unexpectedly completed before the forced timeout")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("process kill/reap timeout took %v", elapsed)
+	}
 }
 
 type refreshRouteTopology struct {
@@ -1075,8 +1294,53 @@ func runRefreshIP(t testing.TB, arguments ...string) {
 	}
 }
 
+const refreshLoopbackQdiscHandle = "72a1:"
+
+func installRefreshLoopbackRateLimit(t testing.TB) {
+	t.Helper()
+	command := exec.Command(
+		"/usr/sbin/tc", "qdisc", "add", "dev", "lo", "root", "handle", refreshLoopbackQdiscHandle,
+		"tbf", "rate", "40mbit", "burst", "65536", "latency", "1s",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("install loopback TCP_REPAIR rate limit: %v (%s)", err, output)
+	}
+	t.Cleanup(func() {
+		command := exec.Command(
+			"/usr/sbin/tc", "qdisc", "del", "dev", "lo", "root", "handle", refreshLoopbackQdiscHandle,
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Errorf("remove loopback TCP_REPAIR rate limit: %v (%s)", err, output)
+		}
+	})
+	assertRefreshLoopbackRateLimit(t)
+}
+
+func assertRefreshLoopbackRateLimit(t testing.TB) {
+	t.Helper()
+	output, err := exec.Command("/usr/sbin/tc", "-j", "qdisc", "show", "dev", "lo").Output()
+	if err != nil {
+		t.Fatalf("inspect loopback TCP_REPAIR rate limit: %v", err)
+	}
+	var qdiscs []struct {
+		Kind   string `json:"kind"`
+		Handle string `json:"handle"`
+		Root   bool   `json:"root"`
+	}
+	if err := json.Unmarshal(output, &qdiscs); err != nil {
+		t.Fatalf("decode loopback TCP_REPAIR rate limit: %v", err)
+	}
+	for _, qdisc := range qdiscs {
+		if qdisc.Root && qdisc.Kind == "tbf" && qdisc.Handle == refreshLoopbackQdiscHandle {
+			return
+		}
+	}
+	t.Fatalf("loopback TCP_REPAIR rate limit is absent or replaced: %s", output)
+}
+
 type refreshResourceSample struct {
 	fds        int
+	rules      int
 	goroutines int
 	heapInuse  uint64
 	rss        uint64

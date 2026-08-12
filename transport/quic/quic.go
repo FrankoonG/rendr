@@ -12,7 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	qg "github.com/quic-go/quic-go"
+	qg "github.com/FrankoonG/quic-go"
+	"github.com/FrankoonG/quic-go/qlogwriter"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/internal/udpsocket"
@@ -24,10 +25,14 @@ import (
 const LengthPrefixSize = 2
 const MaxFrameSize = 1<<16 - 1
 
-// Transport is the QUIC adapter. It owns a tls.Config but no other
-// per-call state; each DialPath opens a fresh QUIC connection.
+// Transport is the QUIC adapter. ClientTLS and Tracer are shared
+// configuration; each DialPath opens a fresh QUIC connection.
 type Transport struct {
 	ClientTLS *tls.Config
+	// Tracer enables standard quic-go connection tracing. quic-go invokes it
+	// once for each connection; the resulting trace remains attached while that
+	// connection changes paths and connection IDs. It is observational only.
+	Tracer func(context.Context, bool, qg.ConnectionID) qlogwriter.Trace
 }
 
 // New returns a Transport using the dev TLS config. Production code
@@ -55,8 +60,12 @@ const DefaultUDPBufferBytes = 8 * 1024 * 1024
 // view lets rendr enforce active/fallback selection before quic-go inspects
 // the underlying descriptor.
 func udpSocketWithBuffers(ctx context.Context, laddr *net.UDPAddr) (*udpsocket.Socket, error) {
+	return udpSocketWithBuffersPinned(ctx, laddr, false)
+}
+
+func udpSocketWithBuffersPinned(ctx context.Context, laddr *net.UDPAddr, pinSource bool) (*udpsocket.Socket, error) {
 	return udpsocket.Listen(ctx, udpsocket.Config{
-		Network: "udp", LocalAddr: laddr, BufferBytes: DefaultUDPBufferBytes,
+		Network: "udp", LocalAddr: laddr, BufferBytes: DefaultUDPBufferBytes, PinSource: pinSource,
 	})
 }
 
@@ -98,34 +107,51 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 	if err != nil {
 		return nil, fmt.Errorf("quic: resolve %s: %w", spec.Address, err)
 	}
-	udpSocket, err := udpSocketWithBuffers(ctx, nil)
+	var local *net.UDPAddr
+	if spec.Local != "" {
+		local, err = net.ResolveUDPAddr("udp", spec.Local)
+		if err != nil {
+			return nil, fmt.Errorf("quic: resolve local %s: %w", spec.Local, err)
+		}
+	}
+	baseline, _ := observeRouteSource(ctx, raddr)
+	if local == nil && baseline.valid() {
+		local = baseline.source
+	}
+	active, err := openCIDTransport(ctx, local)
 	if err != nil {
 		return nil, fmt.Errorf("quic: udp listen: %w", err)
 	}
-	tr := &qg.Transport{Conn: udpSocket.PacketConn()}
-	release := sync.OnceFunc(func() {
-		_ = tr.Close()
-		_ = udpSocket.Close()
-	})
-	conn, err := tr.Dial(ctx, raddr, cfg, &qg.Config{
+	conn, err := active.transport.Dial(ctx, raddr, cfg, &qg.Config{
 		MaxIdleTimeout:  90 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
 		EnableDatagrams: useDatagram,
+		Tracer:          t.Tracer,
 	})
 	if err != nil {
-		release()
+		_ = active.close()
 		return nil, fmt.Errorf("quic: dial %s: %w", spec.Address, err)
 	}
+	session := leafmobility.SessionAny
 	if useDatagram {
-		return wrapDatagram(conn, false, release, leafmobility.RoleDialer, udpSocket), nil
+		session = leafmobility.SessionPacket
+	}
+	owner, err := newRealCIDOwner(conn, leafmobility.RoleDialer, session, active, baseline, nil)
+	if err != nil {
+		_ = conn.CloseWithError(0, "initialize CID owner failed")
+		_ = active.close()
+		return nil, err
+	}
+	if useDatagram {
+		return wrapDatagram(conn, false, owner), nil
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		_ = conn.CloseWithError(0, "open stream failed")
-		release()
+		_ = owner.releaseResources()
 		return nil, fmt.Errorf("quic: open stream: %w", err)
 	}
-	return wrap(conn, stream, false, release, leafmobility.RoleDialer, udpSocket), nil
+	return wrap(conn, stream, false, owner), nil
 }
 
 // Probe times the handshake + first-stream open as a coarse RTT
@@ -144,45 +170,42 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 // Accept wraps an externally accepted (connection, stream) pair. It does not
 // grant adapter ownership; Listener uses the private owned wrapper instead.
 func Accept(conn *qg.Conn, stream *qg.Stream) *PathConn {
-	return wrap(conn, stream, true, nil, leafmobility.RoleUnknown, nil)
+	return wrap(conn, stream, true, nil)
 }
 
 func wrap(
 	conn *qg.Conn,
 	stream *qg.Stream,
 	server bool,
-	release func(),
-	role leafmobility.Role,
-	udpSocket *udpsocket.Socket,
+	owner *cidOwner,
 ) *PathConn {
 	pc := &PathConn{
-		conn: conn, stream: stream, server: server, release: release,
-		udpSocket: udpSocket,
+		conn: conn, stream: stream, server: server, owner: owner,
 	}
-	if role != leafmobility.RoleUnknown {
-		pc.claim = leafmobility.MustNewClaim(leafmobility.Facts{
-			Kind:       leafmobility.KindQUIC,
-			Role:       role,
-			Scope:      leafmobility.ScopeEndpoint,
-			Session:    leafmobility.SessionAny,
-			Generation: leafmobility.NextGeneration(),
-		})
+	if owner != nil {
+		pc.claim = owner.claim
 	}
 	go pc.watchConn()
 	return pc
 }
 
+type quicStream interface {
+	io.Reader
+	io.Writer
+	Close() error
+}
+
 // PathConn implements transport.PathConn over a single QUIC stream.
 type PathConn struct {
-	conn      *qg.Conn
-	stream    *qg.Stream
-	server    bool
-	release   func()
-	claim     *leafmobility.Claim
-	udpSocket *udpsocket.Socket
+	conn   *qg.Conn
+	stream quicStream
+	server bool
+	owner  *cidOwner
+	claim  *leafmobility.Claim
 
-	writeMu sync.Mutex
-	readBuf [LengthPrefixSize]byte
+	readMu   sync.Mutex
+	writeMu  sync.Mutex
+	writeBuf []byte
 
 	qualityMu sync.RWMutex
 	quality   transport.PathQuality
@@ -197,6 +220,7 @@ type PathConn struct {
 }
 
 var _ transport.DatagramAccelerationObserver = (*PathConn)(nil)
+var _ transport.OwnedFrameReader = (*PathConn)(nil)
 
 func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 	if p == nil {
@@ -206,37 +230,56 @@ func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 }
 
 func (p *PathConn) DatagramAccelerationStatus() transport.DatagramAccelerationStatus {
-	if p == nil || p.udpSocket == nil {
+	if p == nil || p.owner == nil {
 		return transport.DatagramAccelerationStatus{}
 	}
-	return p.udpSocket.DatagramAccelerationStatus()
+	return p.owner.accelerationStatus()
 }
 
-// Read returns one framed payload+header concatenated.
-// (See the TCP adapter for the contract.)
+// Read delegates framing to ReadOwnedFrame, then copies one complete frame to
+// the caller. A short destination consumes exactly that frame and reports the
+// standard packet-shaped short-buffer result without killing the QUIC path.
 func (p *PathConn) Read(buf []byte) (int, error) {
-	if _, err := io.ReadFull(p.stream, p.readBuf[:]); err != nil {
-		p.declareDeath(err)
-		return 0, p.swallow(err)
+	frame, err := p.ReadOwnedFrame()
+	if err != nil {
+		return 0, err
 	}
-	n := int(binary.BigEndian.Uint16(p.readBuf[:]))
+	if len(buf) < len(frame) {
+		copy(buf, frame)
+		return len(buf), io.ErrShortBuffer
+	}
+	return copy(buf, frame), nil
+}
+
+// ReadOwnedFrame serializes access to the QUIC stream framing boundary,
+// allocates one exact immutable frame, and reads the payload directly into
+// that allocation. Ownership transfers to the caller.
+func (p *PathConn) ReadOwnedFrame() ([]byte, error) {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+	if p.dead.Load() {
+		return nil, net.ErrClosed
+	}
+	var prefix [LengthPrefixSize]byte
+	if _, err := io.ReadFull(p.stream, prefix[:]); err != nil {
+		p.declareDeath(err)
+		return nil, p.swallow(err)
+	}
+	n := int(binary.BigEndian.Uint16(prefix[:]))
 	if n == 0 {
 		p.declareDeath(errors.New("quic: zero-length frame"))
-		return 0, io.ErrUnexpectedEOF
+		return nil, io.ErrUnexpectedEOF
 	}
 	if n > MaxFrameSize {
 		p.declareDeath(fmt.Errorf("quic: oversize frame %d", n))
-		return 0, io.ErrUnexpectedEOF
+		return nil, io.ErrUnexpectedEOF
 	}
-	if len(buf) < n {
-		p.declareDeath(fmt.Errorf("quic: read buf %d < frame %d", len(buf), n))
-		return 0, io.ErrUnexpectedEOF
-	}
-	if _, err := io.ReadFull(p.stream, buf[:n]); err != nil {
+	frame := make([]byte, n)
+	if _, err := io.ReadFull(p.stream, frame); err != nil {
 		p.declareDeath(err)
-		return 0, p.swallow(err)
+		return nil, p.swallow(err)
 	}
-	return n, nil
+	return frame, nil
 }
 
 // Write frames buf with 2-byte length prefix and pushes it.
@@ -250,18 +293,30 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 
-	var lp [LengthPrefixSize]byte
-	binary.BigEndian.PutUint16(lp[:], uint16(len(frame)))
-	if _, err := p.stream.Write(lp[:]); err != nil {
-		p.declareDeath(err)
-		return 0, net.ErrClosed
+	total := LengthPrefixSize + len(frame)
+	if cap(p.writeBuf) < total {
+		p.writeBuf = make([]byte, total)
+	} else {
+		p.writeBuf = p.writeBuf[:total]
 	}
-	n, err := p.stream.Write(frame)
+	binary.BigEndian.PutUint16(p.writeBuf[:LengthPrefixSize], uint16(len(frame)))
+	copy(p.writeBuf[LengthPrefixSize:], frame)
+	n, err := p.stream.Write(p.writeBuf)
+	if err == nil && n != total {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		p.declareDeath(err)
-		return n, net.ErrClosed
+		payloadWritten := n - LengthPrefixSize
+		if payloadWritten < 0 {
+			payloadWritten = 0
+		}
+		if payloadWritten > len(frame) {
+			payloadWritten = len(frame)
+		}
+		return payloadWritten, net.ErrClosed
 	}
-	return n, nil
+	return len(frame), nil
 }
 
 // Close closes the stream and synchronously completes quic-go's local
@@ -269,16 +324,20 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 func (p *PathConn) Close() error {
 	p.claim.RetireUnbound()
 	if !p.dead.CompareAndSwap(false, true) {
-		return nil
+		return p.releaseRetention()
 	}
-	_ = p.stream.Close()
-	err := p.conn.CloseWithError(0, "rendr local close")
+	if p.stream != nil {
+		_ = p.stream.Close()
+	}
+	var err error
+	if p.conn != nil {
+		err = p.conn.CloseWithError(0, "rendr local close")
+	}
 	p.deathMu.Lock()
 	p.deathErr = err
 	p.deathFn = nil
 	p.deathMu.Unlock()
-	p.releaseRetention()
-	return err
+	return errors.Join(err, p.releaseRetention())
 }
 
 // Quality / SetQuality / MarkByeSeen / MarkQuiesced mirror the TCP
@@ -308,12 +367,24 @@ func (p *PathConn) OnDeath(fn func(cause transport.DeathCause, err error)) {
 func (p *PathConn) MarkByeSeen()  { p.byeSeen.Store(true) }
 func (p *PathConn) MarkQuiesced() { p.quiesced.Store(true) }
 func (p *PathConn) LocalAddr() string {
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		active := p.owner.active
+		p.owner.mu.Unlock()
+		return addrString(active.localAddr())
+	}
 	if a := p.conn.LocalAddr(); a != nil {
 		return a.String()
 	}
 	return ""
 }
 func (p *PathConn) RemoteAddr() string {
+	if p.owner != nil {
+		p.owner.mu.Lock()
+		remote := cloneUDPAddr(p.owner.remote)
+		p.owner.mu.Unlock()
+		return addrString(remote)
+	}
 	if a := p.conn.RemoteAddr(); a != nil {
 		return a.String()
 	}
@@ -325,11 +396,15 @@ func (p *PathConn) RemoteAddr() string {
 // the engine can migrate.
 func (p *PathConn) watchConn() {
 	<-p.conn.Context().Done()
-	cause := context.Cause(p.conn.Context())
+	p.declareDeath(connectionDeathCause(p.conn.Context()))
+}
+
+func connectionDeathCause(ctx context.Context) error {
+	cause := context.Cause(ctx)
 	if cause == context.Canceled {
-		cause = nil
+		return nil
 	}
-	p.declareDeath(cause)
+	return cause
 }
 
 func (p *PathConn) classify(err error) transport.DeathCause {
@@ -341,23 +416,45 @@ func (p *PathConn) declareDeath(err error) {
 	if !p.dead.CompareAndSwap(false, true) {
 		return
 	}
-	_ = p.stream.Close()
-	_ = p.conn.CloseWithError(0, "")
+	if p.stream != nil {
+		_ = p.stream.Close()
+	}
+	if p.conn != nil {
+		_ = p.conn.CloseWithError(0, "")
+	}
 	p.deathMu.Lock()
 	p.deathErr = err
 	fn := p.deathFn
 	p.deathFn = nil
 	p.deathMu.Unlock()
-	p.releaseRetention()
+	_ = p.releaseRetention()
 	if fn != nil {
 		fn(p.classify(err), err)
 	}
 }
 
-func (p *PathConn) releaseRetention() {
-	if p.release != nil {
-		p.release()
+func (p *PathConn) releaseRetention() error {
+	if p.owner == nil {
+		return nil
 	}
+	return p.owner.releaseResources()
+}
+
+func (p *PathConn) SubscribeLeafMobilityRefresh(
+	ctx context.Context,
+	fn func(leafmobility.RefreshEvidence),
+) (func(), error) {
+	if p == nil || p.owner == nil {
+		return nil, errors.New("quic: CID refresh is unavailable")
+	}
+	return p.owner.subscribeRefresh(ctx, fn)
+}
+
+func (p *PathConn) CommitLeafMobilityRefresh(evidence leafmobility.RefreshEvidence) error {
+	if p == nil || p.owner == nil {
+		return errors.New("quic: CID refresh is unavailable")
+	}
+	return p.owner.commitRefresh(evidence)
 }
 
 func (p *PathConn) swallow(err error) error {

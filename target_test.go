@@ -483,8 +483,17 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 		Hysteresis:    0.05,
 		Dwell:         100 * time.Millisecond,
 		Cooldown:      100 * time.Millisecond,
-		ProbeInterval: 30 * time.Second,
+		ProbeInterval: 100 * time.Millisecond,
 		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
+	for name, delay := range map[string]time.Duration{
+		"A": 250 * time.Millisecond,
+		"B": 50 * time.Millisecond,
+		"C": time.Millisecond,
+	} {
+		if err := controlled.SetProbeDelay(name, delay); err != nil {
+			t.Fatal(err)
+		}
 	}
 	controlled.Bind(t, dialer)
 	client, err := dialer.Dial(ctx)
@@ -507,16 +516,6 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 	if ids["A"] == 0 || ids["B"] == 0 || ids["C"] == 0 {
 		t.Fatalf("idsByName=%v", ids)
 	}
-	for name, quality := range map[string]PathQuality{
-		"A": {RTT: 250 * time.Millisecond, At: time.Now()},
-		"B": {RTT: 50 * time.Millisecond, At: time.Now()},
-		"C": {RTT: 1 * time.Millisecond, At: time.Now()},
-	} {
-		if err := controlled.SetQuality(name, quality); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if client.(testConnectionControl).ActivePath() == ids["B"] {
@@ -659,8 +658,18 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		Hysteresis:    0.05,
 		Dwell:         100 * time.Millisecond,
 		Cooldown:      100 * time.Millisecond,
-		ProbeInterval: 30 * time.Second,
+		ProbeInterval: 100 * time.Millisecond,
 		Retry:         retryPolicy{MinBackoff: 5 * time.Second, MaxBackoff: 5 * time.Second},
+	}
+	for name, delay := range map[string]time.Duration{
+		"A": 150 * time.Millisecond,
+		"B": 140 * time.Millisecond,
+		"C": 80 * time.Millisecond,
+		"D": time.Millisecond,
+	} {
+		if err := controlled.SetProbeDelay(name, delay); err != nil {
+			t.Fatal(err)
+		}
 	}
 	controlled.Bind(t, dialer)
 	client, err := dialer.Dial(ctx)
@@ -680,17 +689,6 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 	defer server.Close()
 
 	ids := idsByName(client.Paths())
-	for name, quality := range map[string]PathQuality{
-		"A": {RTT: 150 * time.Millisecond, At: time.Now()},
-		"B": {RTT: 140 * time.Millisecond, At: time.Now()},
-		"C": {RTT: 80 * time.Millisecond, At: time.Now()},
-		"D": {RTT: 1 * time.Millisecond, At: time.Now()},
-	} {
-		if err := controlled.SetQuality(name, quality); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if client.(testConnectionControl).ActivePath() == ids["C"] {
@@ -712,8 +710,9 @@ func TestSelectorPeakTransferCompositeNormalDeathStaysNormal(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("active after C death=%d; wanted A or B, not peak D=%d",
-		client.(testConnectionControl).ActivePath(), ids["D"])
+	t.Fatalf("active after C death=%d; wanted A or B, not peak D=%d; stats=%+v paths=%+v",
+		client.(testConnectionControl).ActivePath(), ids["D"],
+		client.(ConnectionObserver).Stats(), client.Paths())
 }
 
 func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
@@ -816,6 +815,11 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	}()
 
 	controlled := newRuntimeControlledTCPTransport(t)
+	// Keep the same-carrier probe from replacing the deliberately stale
+	// transport evidence during this test's promotion window.
+	if err := controlled.SetProbeDelay("C", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
 	spec := func(name string) PathSpec { return controlled.Spec(ln.Addr().String(), name) }
 	root := Selector("root",
 		[]Target{
@@ -854,6 +858,20 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	backed, ok := client.(*engineBackedConn)
+	if !ok || backed.peak == nil {
+		t.Fatalf("client=%T has no peak-transfer controller", client)
+	}
+	if backed.peak.peakHealthy() {
+		t.Fatalf("stale peak evidence was considered healthy before transfer: peak_ids=%v paths=%+v", backed.peak.peakIDs, client.Paths())
+	}
+	selectorID, peakTargetID, ok := backed.peak.localTargets.selection(peakTransferPeak)
+	if !ok {
+		t.Fatal("peak-transfer target selection is unavailable")
+	}
+	if err := backed.peak.admitPeerSelection(selectorID, peakTargetID, "stale-peer-promotion"); err == nil {
+		t.Fatal("peer promotion bypassed stale local peak evidence")
+	}
 	chunk := make([]byte, 32<<10)
 	for i := 0; i < 48; i++ {
 		if _, err := client.Write(chunk); err != nil {
@@ -866,7 +884,7 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 		t.Fatalf("mode=%v want selector; stale peak evidence should block promotion", got)
 	}
 	if got := client.(testConnectionControl).ActivePath(); got == ids["C"] {
-		t.Fatalf("active path promoted using stale peak evidence C=%d", ids["C"])
+		t.Fatalf("active path promoted using stale peak evidence C=%d healthy=%t peak_ids=%v paths=%+v", ids["C"], backed.peak.peakHealthy(), backed.peak.peakIDs, client.Paths())
 	}
 }
 
