@@ -11,26 +11,57 @@ import (
 // fence control traffic or unrelated selectors.
 type leafMobilityPolicyHold struct {
 	slot *pathSlot
-	once sync.Once
+	mu   sync.Mutex
+	held bool
+	done bool
 }
 
-func holdLeafMobilityPolicy(slot *pathSlot) *leafMobilityPolicyHold {
+func newLeafMobilityPolicyHold(slot *pathSlot) *leafMobilityPolicyHold {
 	if slot == nil {
 		return nil
 	}
-	slot.mobilityPolicyHolds.Add(1)
 	return &leafMobilityPolicyHold{slot: slot}
+}
+
+func holdLeafMobilityPolicy(slot *pathSlot) *leafMobilityPolicyHold {
+	hold := newLeafMobilityPolicyHold(slot)
+	if hold != nil {
+		hold.Promote()
+	}
+	return hold
+}
+
+func (h *leafMobilityPolicyHold) Promote() bool {
+	if h == nil || h.slot == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done {
+		return false
+	}
+	if !h.held {
+		h.slot.mobilityPolicyHolds.Add(1)
+		h.held = true
+	}
+	return true
 }
 
 func (h *leafMobilityPolicyHold) Release() {
 	if h == nil || h.slot == nil {
 		return
 	}
-	h.once.Do(func() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done {
+		return
+	}
+	h.done = true
+	if h.held {
 		if h.slot.mobilityPolicyHolds.Add(-1) < 0 {
 			panic("engine: leaf mobility policy hold underflow")
 		}
-	})
+	}
 }
 
 func (e *Engine) acquireLeafMobilityPolicyHold(slot *pathSlot) *leafMobilityPolicyHold {
@@ -50,23 +81,22 @@ func (e *Engine) acquireSelectedLeafMobilityPolicyHold(slot *pathSlot) *leafMobi
 	if e == nil || slot == nil {
 		return nil
 	}
-	e.policyOwnerMu.Lock()
-	defer e.policyOwnerMu.Unlock()
+	hold := newLeafMobilityPolicyHold(slot)
 	e.pathsMu.RLock()
-	current := e.paths[slot.id]
-	selected := current == slot && current.owner == slot.owner
-	if selected {
-		if len(e.dispatchScope) > 0 {
-			selected = e.dispatchScope[slot.id]
-		} else {
-			selected = e.activeID == slot.id
+	present := false
+	for _, slots := range []map[uint32]*pathSlot{e.paths, e.pendingPaths, e.stagedPaths} {
+		if current := slots[slot.id]; current == slot && current.owner == slot.owner {
+			present = true
+			break
 		}
 	}
-	var hold *leafMobilityPolicyHold
-	if selected {
-		hold = holdLeafMobilityPolicy(slot)
+	if present && e.pathSlotInEffectiveProjectionLocked(e.localExecutionRuntime(), slot) {
+		hold.Promote()
 	}
 	e.pathsMu.RUnlock()
+	if !present {
+		return nil
+	}
 	return hold
 }
 
@@ -92,27 +122,97 @@ func (e *Engine) policySelectionHeldByLeafMobility(selectorID, targetID proto.Ta
 	if runtime == nil || runtime.plan == nil {
 		return false
 	}
-	leaves := runtime.policySwitchLeaves(selectorID, targetID)
-	if len(leaves) == 0 {
-		return false
-	}
 	e.pathsMu.RLock()
-	held := e.policySelectionHeldByLeafMobilityLocked(leaves)
+	held := e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID)
 	e.pathsMu.RUnlock()
 	return held
 }
 
-// policySelectionHeldByLeafMobilityLocked is a defensive final commit check.
-// Hold publication and selector commits are primarily serialized by
-// policyOwnerMu; pathsMu keeps the checked physical generations stable.
-func (e *Engine) policySelectionHeldByLeafMobilityLocked(leaves map[proto.TargetID]bool) bool {
-	if len(leaves) == 0 {
+// policySelectionHeldByLeafMobilityLocked is the final commit check. pathsMu
+// serializes nonblocking refresh hold publication with the physical policy
+// projection; policyOwnerMu continues to serialize competing policy owners.
+func (e *Engine) policySelectionHeldByLeafMobilityLocked(
+	runtime *executionRuntime,
+	selectorID, targetID proto.TargetID,
+) bool {
+	refs := e.policySwitchPhysicalPathRefsLocked(runtime, selectorID, targetID)
+	if len(refs) == 0 {
 		return false
 	}
-	for _, slot := range e.paths {
-		if leaves[slot.localTXTargetID] && slot.mobilityPolicyHolds.Load() > 0 {
+	for ref := range refs {
+		slot := e.paths[ref.ID]
+		if slot != nil && slot.owner == ref.Owner && slot.mobilityPolicyHolds.Load() > 0 {
 			return true
 		}
 	}
 	return false
+}
+
+func (e *Engine) policySwitchPhysicalPathRefsLocked(
+	runtime *executionRuntime,
+	selectorID, targetID proto.TargetID,
+) map[PathRef]bool {
+	if runtime == nil || runtime.plan == nil {
+		return nil
+	}
+	attached := e.attachedLeafTargetsLocked()
+	leaves := runtime.policySwitchLeaves(selectorID, targetID, attached)
+	return e.physicalPathRefsForLeafTargetsLocked(leaves)
+}
+
+func (e *Engine) pathSlotInEffectiveProjectionLocked(runtime *executionRuntime, slot *pathSlot) bool {
+	if slot == nil || e.paths[slot.id] != slot || slot.owner == 0 {
+		return false
+	}
+	if runtime == nil || runtime.plan == nil {
+		if len(e.dispatchScope) > 0 {
+			return e.dispatchScope[slot.id]
+		}
+		return e.activeID == slot.id
+	}
+	leaves := runtime.effectiveLeafTargets(e.attachedLeafTargetsLocked())
+	return leaves[slot.localTXTargetID]
+}
+
+func (e *Engine) attachedLeafTargetsLocked() map[proto.TargetID]bool {
+	attached := make(map[proto.TargetID]bool, len(e.paths))
+	for _, slot := range e.paths {
+		attached[slot.localTXTargetID] = true
+	}
+	return attached
+}
+
+func (e *Engine) physicalPathRefsForLeafTargetsLocked(leaves map[proto.TargetID]bool) map[PathRef]bool {
+	if len(leaves) == 0 {
+		return nil
+	}
+	refs := make(map[PathRef]bool, len(leaves))
+	for _, slot := range e.paths {
+		if leaves[slot.localTXTargetID] {
+			refs[PathRef{ID: slot.id, Owner: slot.owner}] = true
+		}
+	}
+	return refs
+}
+
+// promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked publishes provisional
+// refresh holds when path or policy activation makes their exact physical
+// generations effective. Caller holds policyOwnerMu and pathsMu.
+func (e *Engine) promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime *executionRuntime) {
+	if runtime == nil || runtime.plan == nil {
+		return
+	}
+	leaves := runtime.effectiveLeafTargets(e.attachedLeafTargetsLocked())
+	e.leafRefreshMu.Lock()
+	for ref, pending := range e.leafRefreshPending {
+		if slot := e.paths[ref.ID]; slot != nil && slot.owner == ref.Owner && leaves[slot.localTXTargetID] {
+			pending.policyHold.Promote()
+		}
+	}
+	for ref, running := range e.leafRefreshRunning {
+		if slot := e.paths[ref.ID]; slot != nil && slot.owner == ref.Owner && leaves[slot.localTXTargetID] {
+			running.Promote()
+		}
+	}
+	e.leafRefreshMu.Unlock()
 }

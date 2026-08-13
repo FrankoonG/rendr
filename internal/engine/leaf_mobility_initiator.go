@@ -212,30 +212,42 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, sourceSlot *pathSlot, c
 			policyHold.Release()
 		}
 	}()
+	if hook := e.leafRefreshBeforePublish; hook != nil {
+		hook()
+	}
 	e.pathsMu.RLock()
 	current := e.leafMobilityRefreshClaimPresentLocked(ref, claim)
-	active := e.paths[ref.ID] == sourceSlot && sourceSlot != nil && sourceSlot.owner == ref.Owner && sourceSlot.mobilityClaim == claim
-	e.pathsMu.RUnlock()
 	if !current {
+		e.pathsMu.RUnlock()
 		return
 	}
-	if !active && policyHold != nil {
-		policyHold.Release()
-		policyHold = nil
-	}
-
 	e.leafRefreshMu.Lock()
+	if e.closing.Load() {
+		e.leafRefreshMu.Unlock()
+		e.pathsMu.RUnlock()
+		return
+	}
 	after := e.leafRefreshSeen[ref]
 	snapshot, err := evidence.ValidateFor(claim, after)
 	if err != nil {
 		e.leafRefreshMu.Unlock()
+		e.pathsMu.RUnlock()
 		return
 	}
 	budget := e.leafRefreshBudget[ref]
 	if budget.endpointGeneration == snapshot.EndpointGeneration && budget.incarnation == snapshot.Incarnation &&
 		budget.sourceGeneration == snapshot.SourceGeneration && !budget.deadline.IsZero() {
 		e.leafRefreshMu.Unlock()
+		e.pathsMu.RUnlock()
 		return
+	}
+	// A selector may have activated this leaf after the callback first sampled
+	// it but before the event became visible in leafRefreshPending. Recheck the
+	// effective projection while pathsMu and leafRefreshMu form the same lock
+	// order used by selector promotion. The selector either observes this event
+	// in the queue or this callback observes the committed selector state.
+	if policyHold != nil && e.pathSlotInEffectiveProjectionLocked(e.localExecutionRuntime(), sourceSlot) {
+		policyHold.Promote()
 	}
 	e.leafRefreshSeen[ref] = snapshot.Generation
 	if budget.endpointGeneration != snapshot.EndpointGeneration || budget.incarnation != snapshot.Incarnation || budget.deadline.IsZero() {
@@ -261,6 +273,7 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, sourceSlot *pathSlot, c
 		Deadline: budget.deadline,
 	}
 	e.leafRefreshMu.Unlock()
+	e.pathsMu.RUnlock()
 	accepted = true
 	previous.releasePolicyHold()
 	select {
@@ -301,7 +314,7 @@ func (e *Engine) popLeafMobilityRefresh() (leafMobilityRefreshEvent, context.Con
 			continue
 		}
 		delete(e.leafRefreshPending, ref)
-		e.leafRefreshRunning[ref] = struct{}{}
+		e.leafRefreshRunning[ref] = event.policyHold
 		workerCtx, cancel := context.WithCancelCause(context.Background())
 		e.leafRefreshCancel[ref] = cancel
 		return event, workerCtx, true
@@ -710,6 +723,25 @@ func (e *Engine) forgetLeafMobilityRefresh(ref PathRef) {
 	delete(e.leafRefreshStatus, ref)
 	e.leafRefreshMu.Unlock()
 	pending.releasePolicyHold()
+}
+
+func (e *Engine) closeLeafMobilityRefreshQueue() {
+	e.leafRefreshMu.Lock()
+	pending := make([]leafMobilityRefreshEvent, 0, len(e.leafRefreshPending))
+	for _, event := range e.leafRefreshPending {
+		pending = append(pending, event)
+	}
+	for _, cancel := range e.leafRefreshCancel {
+		cancel(net.ErrClosed)
+	}
+	e.leafRefreshPending = make(map[PathRef]leafMobilityRefreshEvent)
+	e.leafRefreshSeen = make(map[PathRef]uint64)
+	e.leafRefreshBudget = make(map[PathRef]leafMobilityRefreshBudget)
+	e.leafRefreshStatus = make(map[PathRef]LeafMobilityInitiatorSnapshot)
+	e.leafRefreshMu.Unlock()
+	for _, event := range pending {
+		event.releasePolicyHold()
+	}
 }
 
 func (e *Engine) leafMobilityRefreshClaimPresentLocked(ref PathRef, claim *leafmobility.Claim) bool {

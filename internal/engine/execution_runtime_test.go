@@ -203,8 +203,101 @@ func TestExecutionRuntimeSelectorHardDeathFallsBackAndRecoversDesired(t *testing
 	if !ok || desired != ids["b"] || effective != ids["a"] {
 		t.Fatalf("fallback state desired=%x effective=%x ok=%t", desired, effective, ok)
 	}
+	projected := runtime.effectiveLeafTargets(runtimeAttached(ids, "a", "b"))
+	if !projected[ids["b"]] || projected[ids["a"]] || len(projected) != 1 {
+		t.Fatalf("recovered desired projection=%v want only b before first dispatch", projected)
+	}
 	if got := runtimeRouteNames(t, runtime, runtimeAttached(ids, "a", "b"), true); !reflect.DeepEqual(got, []string{"b"}) {
 		t.Fatalf("recovered desired route=%v", got)
+	}
+}
+
+func TestExecutionRuntimePolicySwitchUsesEffectiveSelectorLeaf(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["b"]); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtimeRouteNames(t, runtime, runtimeAttached(ids, "a", "c"), true); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("fallback route=%v want [a]", got)
+	}
+
+	leaves := runtime.policySwitchLeaves(ids["root"], ids["c"], runtimeAttached(ids, "a", "c"))
+	if !leaves[ids["a"]] || !leaves[ids["c"]] || leaves[ids["b"]] {
+		t.Fatalf("policy switch leaves=%v want effective a plus destination c", leaves)
+	}
+}
+
+func TestExecutionRuntimePolicySwitchProjectsNestedEffectiveLeaves(t *testing.T) {
+	root := proto.GraphNode{
+		ID:       proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"),
+		Kind:     proto.GraphNodeKindSelector,
+		Name:     "root",
+		Children: []proto.TargetID{proto.DeriveTargetID(proto.GraphNodeKindBond, "aggregate"), proto.DeriveTargetID(proto.GraphNodeKindPath, "fallback")},
+	}
+	aggregate := proto.GraphNode{
+		ID:       proto.DeriveTargetID(proto.GraphNodeKindBond, "aggregate"),
+		Kind:     proto.GraphNodeKindBond,
+		Name:     "aggregate",
+		Children: []proto.TargetID{proto.DeriveTargetID(proto.GraphNodeKindSelector, "choice"), proto.DeriveTargetID(proto.GraphNodeKindRace, "redundant")},
+	}
+	choice := proto.GraphNode{
+		ID:       proto.DeriveTargetID(proto.GraphNodeKindSelector, "choice"),
+		Kind:     proto.GraphNodeKindSelector,
+		Name:     "choice",
+		Children: []proto.TargetID{proto.DeriveTargetID(proto.GraphNodeKindPath, "a"), proto.DeriveTargetID(proto.GraphNodeKindPath, "b")},
+	}
+	redundant := proto.GraphNode{
+		ID:       proto.DeriveTargetID(proto.GraphNodeKindRace, "redundant"),
+		Kind:     proto.GraphNodeKindRace,
+		Name:     "redundant",
+		Children: []proto.TargetID{proto.DeriveTargetID(proto.GraphNodeKindPath, "c"), proto.DeriveTargetID(proto.GraphNodeKindPath, "d")},
+	}
+	manifest, ids := runtimeGraph(t,
+		root,
+		aggregate,
+		choice,
+		redundant,
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+		runtimeNode(proto.GraphNodeKindPath, "d"),
+		runtimeNode(proto.GraphNodeKindPath, "fallback"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["aggregate"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.selectChild(ids["choice"], ids["b"]); err != nil {
+		t.Fatal(err)
+	}
+	attached := runtimeAttached(ids, "a", "c", "d", "fallback")
+	if _, _, err := runtime.activeLeafTargets(attached); err != nil {
+		t.Fatal(err)
+	}
+
+	leaves := runtime.policySwitchLeaves(ids["root"], ids["fallback"], attached)
+	for _, name := range []string{"a", "c", "d", "fallback"} {
+		if !leaves[ids[name]] {
+			t.Fatalf("policy switch projection omitted effective leaf %s: %v", name, leaves)
+		}
+	}
+	if leaves[ids["b"]] {
+		t.Fatalf("policy switch projection retained unavailable desired leaf b: %v", leaves)
+	}
+	recovered := runtime.effectiveLeafTargets(runtimeAttached(ids, "a", "b", "c", "d", "fallback"))
+	for _, name := range []string{"b", "c", "d"} {
+		if !recovered[ids[name]] {
+			t.Fatalf("recovered nested projection omitted desired leaf %s: %v", name, recovered)
+		}
+	}
+	if recovered[ids["a"]] || recovered[ids["fallback"]] || len(recovered) != 3 {
+		t.Fatalf("recovered nested projection=%v want exactly b/c/d", recovered)
 	}
 }
 

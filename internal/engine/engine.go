@@ -299,7 +299,7 @@ type Engine struct {
 	leafIssuer               *leafmobility.AuthorityIssuer
 	leafRefreshMu            sync.Mutex
 	leafRefreshPending       map[PathRef]leafMobilityRefreshEvent
-	leafRefreshRunning       map[PathRef]struct{}
+	leafRefreshRunning       map[PathRef]*leafMobilityPolicyHold
 	leafRefreshCancel        map[PathRef]context.CancelCauseFunc
 	leafRefreshSeen          map[PathRef]uint64
 	leafRefreshBudget        map[PathRef]leafMobilityRefreshBudget
@@ -307,6 +307,9 @@ type Engine struct {
 	leafRefreshWake          chan struct{}
 	leafRefreshRetryMu       sync.Mutex
 	leafRefreshRetryWait     chan struct{}
+	// leafRefreshBeforePublish is a deterministic package-test hook. Tests set
+	// it before publishing refresh evidence and never mutate it concurrently.
+	leafRefreshBeforePublish func()
 
 	// Per-path RTT probe state. Each probe is bound to the physical path
 	// generation that issued it so a reply arriving on another carrier cannot
@@ -798,7 +801,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		leafTx:                  newLeafMobilityRuntime(),
 		leafIssuer:              leafmobility.NewAuthorityIssuer(),
 		leafRefreshPending:      make(map[PathRef]leafMobilityRefreshEvent),
-		leafRefreshRunning:      make(map[PathRef]struct{}),
+		leafRefreshRunning:      make(map[PathRef]*leafMobilityPolicyHold),
 		leafRefreshCancel:       make(map[PathRef]context.CancelCauseFunc),
 		leafRefreshSeen:         make(map[PathRef]uint64),
 		leafRefreshBudget:       make(map[PathRef]leafMobilityRefreshBudget),
@@ -1431,6 +1434,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 			e.policySelections[selection.selectorID] = selection.targetID
 		}
 		e.policyStateMu.Unlock()
+		e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
 	}
 	if hook := e.activationAfterInitialSelection; hook != nil {
 		hook()
@@ -2134,10 +2138,6 @@ func (e *Engine) setDispatchPolicyAndSelection(
 	if !ok {
 		return fmt.Errorf("engine: invalid execution kind %d", kind)
 	}
-	var heldBranchLeaves map[proto.TargetID]bool
-	if runtime != nil {
-		heldBranchLeaves = runtime.policySwitchLeaves(selectorID, targetID)
-	}
 	// Serialize the policy boundary with sequenced DATA/CTRL publication. Once
 	// this returns, every later frame observes the new mode, scope, and active
 	// path as one state transition.
@@ -2147,7 +2147,7 @@ func (e *Engine) setDispatchPolicyAndSelection(
 		return net.ErrClosed
 	}
 	e.pathsMu.Lock()
-	if e.policySelectionHeldByLeafMobilityLocked(heldBranchLeaves) {
+	if runtime != nil && e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID) {
 		e.pathsMu.Unlock()
 		return errPolicySelectionLeafMobilityHeld
 	}
@@ -2182,6 +2182,7 @@ func (e *Engine) setDispatchPolicyAndSelection(
 		}
 		active = projectedActive
 		scope = projectedScope
+		e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
 	}
 	oldID := e.activeID
 	if active == 0 {
@@ -2577,6 +2578,7 @@ func (e *Engine) Close() error {
 		e.activeID = 0
 		e.dispatchScope = nil
 		e.pathsMu.Unlock()
+		e.closeLeafMobilityRefreshQueue()
 		e.clearPathProbeState(slots)
 		close(e.closed)
 		e.releaseReplayStateOnClose()

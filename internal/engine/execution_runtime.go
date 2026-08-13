@@ -123,55 +123,117 @@ func (r *executionRuntime) selectedChild(selectorID proto.TargetID) (desired, ef
 	return desired, effective, ok
 }
 
-func (r *executionRuntime) policySwitchLeaves(selectorID, targetID proto.TargetID) map[proto.TargetID]bool {
+func (r *executionRuntime) policySwitchLeaves(
+	selectorID, targetID proto.TargetID,
+	attached map[proto.TargetID]bool,
+) map[proto.TargetID]bool {
 	if r == nil || r.plan == nil {
 		return nil
 	}
+	available := r.targetAvailability(attached)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.selectors[selectorID]
-	if state == nil {
+	selector, ok := r.plan.nodeView(selectorID)
+	if !ok || selector.kind != proto.GraphNodeKindSelector {
 		return nil
 	}
-	current := state.desired
-	if current == (proto.TargetID{}) {
-		current = state.effective
-	}
+	current, _ := r.selectorProjectionChildLocked(selector, available)
 	if current == (proto.TargetID{}) || current == targetID {
 		return nil
 	}
 	leaves := make(map[proto.TargetID]bool)
-	var collect func(proto.TargetID)
-	collect = func(candidate proto.TargetID) {
-		node, ok := r.plan.nodeView(candidate)
+	r.collectEffectiveLeafSetLocked(current, available, leaves)
+	r.collectEffectiveLeafSetLocked(targetID, available, leaves)
+	return leaves
+}
+
+func (r *executionRuntime) effectiveLeafTargets(attached map[proto.TargetID]bool) map[proto.TargetID]bool {
+	if r == nil || r.plan == nil {
+		return nil
+	}
+	available := r.targetAvailability(attached)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	leaves := make(map[proto.TargetID]bool)
+	r.collectEffectiveLeafSetLocked(r.plan.rootID, available, leaves)
+	return leaves
+}
+
+func (r *executionRuntime) targetAvailability(attached map[proto.TargetID]bool) func(proto.TargetID) bool {
+	available := make(map[proto.TargetID]bool, len(r.plan.nodes))
+	known := make(map[proto.TargetID]bool, len(r.plan.nodes))
+	var targetAvailable func(proto.TargetID) bool
+	targetAvailable = func(id proto.TargetID) bool {
+		if known[id] {
+			return available[id]
+		}
+		known[id] = true
+		node, ok := r.plan.nodeView(id)
 		if !ok {
-			return
+			return false
 		}
 		if node.kind == proto.GraphNodeKindPath {
-			leaves[candidate] = true
-			return
+			available[id] = attached[id]
+			return available[id]
 		}
-		if node.kind == proto.GraphNodeKindSelector {
-			nested := r.selectors[candidate]
-			if nested == nil {
-				return
+		for _, childID := range node.children {
+			if targetAvailable(childID) {
+				available[id] = true
 			}
-			child := nested.desired
-			if child == (proto.TargetID{}) {
-				child = nested.effective
-			}
-			if child != (proto.TargetID{}) {
-				collect(child)
-			}
-			return
 		}
-		for _, child := range node.children {
-			collect(child)
+		return available[id]
+	}
+	return targetAvailable
+}
+
+func (r *executionRuntime) collectEffectiveLeafSetLocked(
+	id proto.TargetID,
+	available func(proto.TargetID) bool,
+	leaves map[proto.TargetID]bool,
+) {
+	node, ok := r.plan.nodeView(id)
+	if !ok || !available(id) {
+		return
+	}
+	if node.kind == proto.GraphNodeKindPath {
+		leaves[id] = true
+		return
+	}
+	if node.kind == proto.GraphNodeKindSelector {
+		if childID, selected := r.selectorProjectionChildLocked(node, available); selected {
+			r.collectEffectiveLeafSetLocked(childID, available, leaves)
+		}
+		return
+	}
+	for _, childID := range node.children {
+		r.collectEffectiveLeafSetLocked(childID, available, leaves)
+	}
+}
+
+// selectorProjectionChildLocked is the shared non-mutating selector resolver
+// for policy/hold projections. It must match selectorChildLocked: a recovered
+// desired child immediately outranks a stale fallback, followed by non-peak
+// and peak children in manifest order.
+func (r *executionRuntime) selectorProjectionChildLocked(
+	node executionPlanNode,
+	available func(proto.TargetID) bool,
+) (proto.TargetID, bool) {
+	state := r.selectors[node.targetID]
+	if state != nil && state.desired != (proto.TargetID{}) && available(state.desired) {
+		return state.desired, true
+	}
+	peaks := make(map[proto.TargetID]bool, len(node.peakCandidates))
+	for _, id := range node.peakCandidates {
+		peaks[id] = true
+	}
+	for _, peakPass := range []bool{false, true} {
+		for _, childID := range node.children {
+			if peaks[childID] == peakPass && available(childID) {
+				return childID, true
+			}
 		}
 	}
-	collect(current)
-	collect(targetID)
-	return leaves
+	return proto.TargetID{}, false
 }
 
 // initializeSelectorsForLeaf freezes the manifest branch that made a leaf's
@@ -482,22 +544,9 @@ func (r *executionRuntime) selectorChildLocked(node executionPlanNode, available
 		state = &selectorExecutionState{}
 		r.selectors[node.targetID] = state
 	}
-	if state.desired != (proto.TargetID{}) && available(state.desired) {
-		state.effective = state.desired
-		return state.desired, true
-	}
-	peaks := make(map[proto.TargetID]bool, len(node.peakCandidates))
-	for _, id := range node.peakCandidates {
-		peaks[id] = true
-	}
-	for _, peakPass := range []bool{false, true} {
-		for _, childID := range node.children {
-			if peaks[childID] != peakPass || !available(childID) {
-				continue
-			}
-			state.effective = childID
-			return childID, true
-		}
+	if childID, selected := r.selectorProjectionChildLocked(node, available); selected {
+		state.effective = childID
+		return childID, true
 	}
 	state.effective = proto.TargetID{}
 	return proto.TargetID{}, false
