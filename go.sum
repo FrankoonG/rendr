@@ -1,5 +1,5 @@
-github.com/FrankoonG/quic-go v0.59.2-0.20260812164612-6b0f98ac2305 h1:7ukM7zp6YN5Ey8mT5RCWWBQLnjeShf6MfAPkWbJBDjI=
-github.com/FrankoonG/quic-go v0.59.2-0.20260812164612-6b0f98ac2305/go.mod h1:8ZEM83ouZNDO64I5pbDL7GFD46J7HaEGGE98iKivGuA=
+github.com/FrankoonG/quic-go v0.59.2-0.20260813031454-efdd2fd10c9c h1:GQaIrtZb79JZkfmGatvDFgxYjSiC2yQ8Ndeeaak4+Yw=
+github.com/FrankoonG/quic-go v0.59.2-0.20260813031454-efdd2fd10c9c/go.mod h1:8ZEM83ouZNDO64I5pbDL7GFD46J7HaEGGE98iKivGuA=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/google/btree v1.1.2 h1:xf4v41cLI2Z6FxbKm+8Bu+m8ifhj15JuZ9sa0jZCMUU=

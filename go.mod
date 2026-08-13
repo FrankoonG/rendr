@@ -3,7 +3,7 @@ module github.com/FrankoonG/rendr
 go 1.26.3
 
 require (
-	github.com/FrankoonG/quic-go v0.59.2-0.20260812164612-6b0f98ac2305
+	github.com/FrankoonG/quic-go v0.59.2-0.20260813031454-efdd2fd10c9c
 	golang.org/x/net v0.53.0
 	golang.org/x/sys v0.43.0
 	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0
