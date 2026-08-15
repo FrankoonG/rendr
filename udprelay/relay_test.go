@@ -85,16 +85,18 @@ func TestRelayRoundTripOverMigratedPacketConn(t *testing.T) {
 	admin := client.(packetControl)
 	cur := admin.ActivePath()
 	var next uint32
+	var nextName string
 	for _, p := range admin.Paths() {
 		if p.ID != cur {
 			next = p.ID
+			nextName = p.Spec.Opts["name"]
 			break
 		}
 	}
 	if next == 0 {
 		t.Fatal("no alternate packet path")
 	}
-	if err := admin.Migrate(next); err != nil {
+	if err := admin.SelectTarget("root", nextName); err != nil {
 		t.Fatalf("migrate packet path: %v", err)
 	}
 
@@ -194,6 +196,7 @@ func TestServerAcceptsMultipleClients(t *testing.T) {
 		}
 		defer clientRelay.Close()
 		waitServerRelays(t, server, i+1)
+		waitPacketPathNames(t, clientRelay.PacketConn(), []string{"udp-a", "udp-b"}, 3*time.Second)
 
 		app, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
@@ -277,7 +280,34 @@ func waitPacketPaths(t *testing.T, client, server rendr.PacketConn, want int) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("paths did not attach: client=%d server=%d want=%d", len(client.Paths()), len(serverObserver.Stats().Paths), want)
+	t.Fatalf("paths did not attach: client=%d server=%d want=%d client_status=%+v server_status=%+v",
+		len(client.Paths()), len(serverObserver.Stats().Paths), want, client.Status(), server.Status())
+}
+
+func waitPacketPathNames(t *testing.T, conn rendr.PacketConn, names []string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		status := conn.Status()
+		attached := make(map[string]bool, len(status.Paths))
+		for _, path := range status.Paths {
+			if path.State == rendr.PathAttached && path.ID != 0 {
+				attached[path.Name] = true
+			}
+		}
+		complete := true
+		for _, name := range names {
+			if !attached[name] {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("packet paths %v did not attach: status=%+v", names, conn.Status())
 }
 
 func waitServerRelays(t *testing.T, server *Server, want int) {
@@ -296,16 +326,18 @@ func migrateToAlternate(t *testing.T, admin packetControl) {
 	t.Helper()
 	cur := admin.ActivePath()
 	var next uint32
+	var nextName string
 	for _, p := range admin.Paths() {
 		if p.ID != cur {
 			next = p.ID
+			nextName = p.Spec.Opts["name"]
 			break
 		}
 	}
 	if next == 0 {
 		t.Fatal("no alternate packet path")
 	}
-	if err := admin.Migrate(next); err != nil {
+	if err := admin.SelectTarget("root", nextName); err != nil {
 		t.Fatalf("migrate packet path: %v", err)
 	}
 }

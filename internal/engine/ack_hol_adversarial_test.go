@@ -130,6 +130,7 @@ func TestAckBlockedPathDoesNotHeadOfLineBlockHealthyPath(t *testing.T) {
 func TestPacketMissingFloorBoundsProofStateByReplayCredit(t *testing.T) {
 	e := New(SideServer, NewClientFlowID(), Limits{})
 	defer e.Close()
+	configureLeafSelectorRuntime(t, e, "path")
 	e.SetPacketMode()
 
 	// Keep SEQ 0 permanently absent while delivering later packets. The peer

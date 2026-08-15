@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,8 @@ import (
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
+
+var errExecutionRuntimeNotConfigured = errors.New("engine: execution runtime is not configured")
 
 type dispatchRoute struct {
 	targetID proto.TargetID
@@ -31,11 +34,29 @@ type executionRuntime struct {
 }
 
 type selectorExecutionState struct {
-	desired          proto.TargetID
-	effective        proto.TargetID
-	qualityCandidate proto.TargetID
-	qualitySince     time.Time
-	lastQualityMove  time.Time
+	desired               proto.TargetID
+	effective             proto.TargetID
+	generation            uint64
+	peakHeld              bool
+	qualityCandidate      proto.TargetID
+	qualityCurrent        proto.TargetID
+	qualityCandidateSpeed speedEvidence
+	qualityCurrentSpeed   speedEvidence
+	qualityTopologyEpoch  uint64
+	qualitySince          time.Time
+	lastQualityMove       time.Time
+}
+
+func (s *selectorExecutionState) clearQualityCandidate() {
+	if s == nil {
+		return
+	}
+	s.qualityCandidate = proto.TargetID{}
+	s.qualityCurrent = proto.TargetID{}
+	s.qualityCandidateSpeed = speedEvidence{}
+	s.qualityCurrentSpeed = speedEvidence{}
+	s.qualityTopologyEpoch = 0
+	s.qualitySince = time.Time{}
 }
 
 type initialSelectorSelection struct {
@@ -88,6 +109,29 @@ func (r *executionRuntime) ownsFlatSelectorLeaf(targetID proto.TargetID) bool {
 	return false
 }
 
+// flatSelectorDispatchLeaf resolves the sole leaf authorized by a flat
+// selector. Physical path IDs are deliberately absent from this decision:
+// they identify carrier incarnations, while the recursive runtime owns the
+// logical target selection.
+func (r *executionRuntime) flatSelectorDispatchLeaf(
+	eligible, present map[proto.TargetID]bool,
+) (proto.TargetID, bool) {
+	if r == nil || !r.flatLeafSelector || r.plan == nil {
+		return proto.TargetID{}, false
+	}
+	root, ok := r.plan.rootView()
+	if !ok || root.kind != proto.GraphNodeKindSelector {
+		return proto.TargetID{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.selectorDispatchChildLocked(
+		root,
+		func(id proto.TargetID) bool { return eligible[id] },
+		func(id proto.TargetID) bool { return present[id] },
+	)
+}
+
 func (r *executionRuntime) selectChild(selectorID, childID proto.TargetID) error {
 	if r == nil || r.plan == nil {
 		return fmt.Errorf("engine: execution runtime is not configured")
@@ -110,6 +154,102 @@ func (r *executionRuntime) selectChild(selectorID, childID proto.TargetID) error
 	return nil
 }
 
+// commitSelectorChild validates and publishes one selector decision while the
+// caller applies its physical observation projection under the same runtime
+// lock. A failed projection restores the exact prior selector state, so a
+// rejected policy transaction cannot leave DATA using an uncommitted target.
+func (r *executionRuntime) commitSelectorChild(
+	selectorID, childID proto.TargetID,
+	attached map[proto.TargetID]bool,
+	apply func(map[proto.TargetID]bool) error,
+) error {
+	return r.commitSelectorChildOrigin(selectorID, childID, attached, policySelectionExternal, apply)
+}
+
+func (r *executionRuntime) commitSelectorChildOrigin(
+	selectorID, childID proto.TargetID,
+	attached map[proto.TargetID]bool,
+	origin policySelectionOrigin,
+	apply func(map[proto.TargetID]bool) error,
+) error {
+	if r == nil || r.plan == nil {
+		return errExecutionRuntimeNotConfigured
+	}
+	selector, ok := r.plan.nodeView(selectorID)
+	if !ok || selector.kind != proto.GraphNodeKindSelector {
+		return fmt.Errorf("engine: execution target is not a selector")
+	}
+	if err := r.plan.validateImmediateChild(selectorID, childID); err != nil {
+		return err
+	}
+	available := r.targetAvailability(attached)
+	if !available(childID) {
+		return fmt.Errorf("engine: selected target has no attached path")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, existed := r.selectors[selectorID]
+	if !existed {
+		state = &selectorExecutionState{}
+		r.selectors[selectorID] = state
+	}
+	previous := *state
+	changed := state.desired != childID
+	if changed && state.generation == ^uint64(0) {
+		if !existed {
+			delete(r.selectors, selectorID)
+		}
+		return fmt.Errorf("engine: selector generation space exhausted")
+	}
+	state.desired = childID
+	state.effective = childID
+	if changed {
+		state.generation++
+	}
+	switch origin {
+	case policySelectionPeakPromote:
+		state.peakHeld = true
+	case policySelectionPeakReturn:
+		state.peakHeld = false
+	default:
+		if !origin.isFactualFailure() || !selectorHasPeakCandidate(selector, childID) {
+			state.peakHeld = false
+		}
+	}
+	state.clearQualityCandidate()
+
+	leaves := make(map[proto.TargetID]bool)
+	r.collectEffectiveLeafSetLocked(r.plan.rootID, available, leaves)
+	rollback := func() {
+		if existed {
+			*state = previous
+		} else {
+			delete(r.selectors, selectorID)
+		}
+	}
+	if len(leaves) == 0 {
+		rollback()
+		return errNoExecutionRoute
+	}
+	if apply != nil {
+		if err := apply(leaves); err != nil {
+			rollback()
+			return err
+		}
+	}
+	return nil
+}
+
+func selectorHasPeakCandidate(selector executionPlanNode, targetID proto.TargetID) bool {
+	for _, candidate := range selector.peakCandidates {
+		if candidate == targetID {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *executionRuntime) selectedChild(selectorID proto.TargetID) (desired, effective proto.TargetID, ok bool) {
 	if r == nil {
 		return proto.TargetID{}, proto.TargetID{}, false
@@ -121,6 +261,70 @@ func (r *executionRuntime) selectedChild(selectorID proto.TargetID) (desired, ef
 	}
 	r.mu.Unlock()
 	return desired, effective, ok
+}
+
+func (r *executionRuntime) selectorSelection(selectorID proto.TargetID) (desired, effective proto.TargetID, generation uint64, ok bool) {
+	if r == nil {
+		return proto.TargetID{}, proto.TargetID{}, 0, false
+	}
+	r.mu.Lock()
+	state := r.selectors[selectorID]
+	if state != nil {
+		desired, effective, generation, ok = state.desired, state.effective, state.generation, true
+	}
+	r.mu.Unlock()
+	return desired, effective, generation, ok
+}
+
+// rootPublicationAttribution snapshots the logical immediate child selected by
+// the root selector. The caller serializes it with DATA publication through
+// sendMu; nested selector activity is intentionally outside this cohort.
+func (r *executionRuntime) rootPublicationAttribution() (
+	selectorID, desired, effective proto.TargetID,
+	generation uint64,
+	ok bool,
+) {
+	if r == nil || r.plan == nil {
+		return proto.TargetID{}, proto.TargetID{}, proto.TargetID{}, 0, false
+	}
+	root, exists := r.plan.rootView()
+	if !exists || root.kind != proto.GraphNodeKindSelector {
+		return proto.TargetID{}, proto.TargetID{}, proto.TargetID{}, 0, false
+	}
+	r.mu.Lock()
+	state := r.selectors[root.targetID]
+	if state != nil {
+		desired = state.desired
+		effective = state.effective
+		generation = state.generation
+	}
+	r.mu.Unlock()
+	return root.targetID, desired, effective, generation,
+		state != nil && desired != (proto.TargetID{}) && generation != 0
+}
+
+// rootImmediateTarget returns the root selector child containing leafID. The
+// graph is a tree, so exactly one immediate child can own a leaf.
+func (r *executionRuntime) rootImmediateTarget(leafID proto.TargetID) (proto.TargetID, bool) {
+	if r == nil || r.plan == nil || leafID == (proto.TargetID{}) {
+		return proto.TargetID{}, false
+	}
+	root, ok := r.plan.rootView()
+	if !ok || root.kind != proto.GraphNodeKindSelector {
+		return proto.TargetID{}, false
+	}
+	for _, childID := range root.children {
+		entry, exists := r.plan.nodes[childID]
+		if !exists {
+			continue
+		}
+		for _, descendant := range entry.leafIDs {
+			if descendant == leafID {
+				return childID, true
+			}
+		}
+	}
+	return proto.TargetID{}, false
 }
 
 func (r *executionRuntime) policySwitchLeaves(
@@ -157,6 +361,72 @@ func (r *executionRuntime) effectiveLeafTargets(attached map[proto.TargetID]bool
 	leaves := make(map[proto.TargetID]bool)
 	r.collectEffectiveLeafSetLocked(r.plan.rootID, available, leaves)
 	return leaves
+}
+
+// selectorIsEffective reports whether selectorID participates in the current
+// root projection. Selectors below an inactive selector branch are policy
+// state only: changing them must not interrupt an unrelated active dispatch.
+func (r *executionRuntime) selectorIsEffective(selectorID proto.TargetID, attached map[proto.TargetID]bool) bool {
+	if r == nil || r.plan == nil {
+		return false
+	}
+	available := r.targetAvailability(attached)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.selectorIsEffectiveLocked(selectorID, available)
+}
+
+func (r *executionRuntime) selectorIsEffectiveLocked(
+	selectorID proto.TargetID,
+	available func(proto.TargetID) bool,
+) bool {
+	var visit func(proto.TargetID) bool
+	visit = func(id proto.TargetID) bool {
+		if !available(id) {
+			return false
+		}
+		if id == selectorID {
+			return true
+		}
+		node, ok := r.plan.nodeView(id)
+		if !ok || node.kind == proto.GraphNodeKindPath {
+			return false
+		}
+		if node.kind == proto.GraphNodeKindSelector {
+			childID, selected := r.selectorProjectionChildLocked(node, available)
+			return selected && visit(childID)
+		}
+		for _, childID := range node.children {
+			if visit(childID) {
+				return true
+			}
+		}
+		return false
+	}
+	return visit(r.plan.rootID)
+}
+
+// policySelectionChangesEffectiveRoute reports whether selecting targetID
+// changes the current root data-plane projection. A selector below an inactive
+// branch and a desired-state change that preserves the effective fallback are
+// policy-only updates; neither may seize an unrelated dispatch for replay.
+func (r *executionRuntime) policySelectionChangesEffectiveRoute(
+	selectorID, targetID proto.TargetID,
+	attached map[proto.TargetID]bool,
+) bool {
+	if r == nil || r.plan == nil || targetID == (proto.TargetID{}) {
+		return false
+	}
+	available := r.targetAvailability(attached)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	selector, ok := r.plan.nodeView(selectorID)
+	if !ok || selector.kind != proto.GraphNodeKindSelector || !available(targetID) ||
+		!r.selectorIsEffectiveLocked(selectorID, available) {
+		return false
+	}
+	current, selected := r.selectorProjectionChildLocked(selector, available)
+	return selected && current != (proto.TargetID{}) && current != targetID
 }
 
 func (r *executionRuntime) targetAvailability(attached map[proto.TargetID]bool) func(proto.TargetID) bool {
@@ -291,6 +561,7 @@ func (r *executionRuntime) initializeSelectorBranchLocked(
 				}
 				state.desired = desired
 				state.effective = childID
+				state.generation = 1
 			}
 		}
 		return true

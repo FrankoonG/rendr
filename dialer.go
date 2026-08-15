@@ -97,9 +97,9 @@ type sessionDialer struct {
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
-// performs the HELLO handshake on the first path; subsequent paths
-// (attached during the same Dial call or later via the migration
-// API) send BRIDGE_TAG carrying the same flow_id.
+// performs the HELLO handshake on the first usable path; subsequent paths
+// attached by background recovery or the migration API send BRIDGE_TAG
+// carrying the same flow_id.
 //
 // The first usable compiled path establishes the session; the remainder are
 // attached and dispatched by the recursive target executor.
@@ -108,7 +108,7 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	mode, paths := plan.mode, plan.paths
+	paths := plan.paths
 	if len(paths) == 0 {
 		return nil, errNoCompiledPath
 	}
@@ -131,42 +131,41 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 		return nil, err
 	}
 	tracker.set(firstIndex, PathAttached, nil)
-	pathIDs := []uint32{firstID}
-
-	// Attach any additional paths as bridge-tagged add-ons. They sit
-	// idle until Migrate switches to them or the active path dies.
-	for i, ps := range paths {
-		if i == firstIndex {
-			continue
-		}
-		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
-		if err != nil {
-			continue
-		}
-		pathIDs = append(pathIDs, id)
+	if err := ctx.Err(); err != nil {
+		gracefullyCloseAdmittedSession(e)
+		return nil, err
 	}
+	pathIDs := make([]uint32, len(paths))
+	pathIDs[firstIndex] = firstID
 
 	c := &engine.Conn{
 		E:     e,
 		LAddr: addrFromString("rendr-client"),
 		RAddr: addrFromString(first.Address),
 	}
-	bc := newEngineBackedConn(e, c, mode)
+	bc := newEngineBackedConn(e, c)
 	bc.localStatus = d.localStatus
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
+	// Every leaf that did not establish the session is optional startup work.
+	// Recovery owns its context, retries, resolver snapshot, and Close
+	// cancellation, so a slow optional factory cannot delay Dial or inherit the
+	// caller's context after the usable session has already been established.
 	bc.startPathRecovery(paths, d.Retry)
 
-	// Arm the selector scheduler now that all initial paths are
-	// attached. CLAUDE.md hard rule #3 keeps active migration
-	// triggers opt-in; here it is opt-in because the embedder
-	// explicitly chose a Selector root.
+	// Arm peak-transfer policy from the graph. Optional leaves become eligible
+	// as background recovery attaches them.
 	if plan.peakTransfer {
-		bc.startPeakTransfer(plan, pathIDs)
-	} else if mode == ModeSelector {
-		e.StartSelector(nil, 0)
+		if err := bc.startPeakTransfer(plan, pathIDs); err != nil {
+			bc.abortDial()
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupCanceledDial(e, bc.abortDial)
+		return nil, err
 	}
 	return bc, nil
 }
@@ -185,7 +184,7 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	mode, paths := plan.mode, plan.paths
+	paths := plan.paths
 	if len(paths) == 0 {
 		return nil, errNoCompiledPath
 	}
@@ -208,35 +207,58 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 		return nil, err
 	}
 	tracker.set(firstIndex, PathAttached, nil)
-	pathIDs := []uint32{firstID}
-
-	for i, ps := range paths {
-		if i == firstIndex {
-			continue
-		}
-		id, err := d.attachExtraPath(ctx, e, ps, i, tracker, resolver)
-		if err != nil {
-			continue
-		}
-		pathIDs = append(pathIDs, id)
+	if err := ctx.Err(); err != nil {
+		gracefullyCloseAdmittedSession(e)
+		return nil, err
 	}
+	pathIDs := make([]uint32, len(paths))
+	pathIDs[firstIndex] = firstID
 
 	lAddr := addrFromString("rendr-client")
 	rAddr := addrFromString(first.Address)
-	bc := newEnginePacketConn(e, mode, lAddr, rAddr)
+	bc := newEnginePacketConn(e, lAddr, rAddr)
 	bc.localStatus = d.localStatus
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
+	// Optional packet leaves follow the same session-owned recovery lifecycle as
+	// stream leaves and never consume the successful DialPacket caller context.
 	bc.startPathRecovery(paths, d.Retry)
 
 	if plan.peakTransfer {
-		bc.startPeakTransfer(plan, pathIDs)
-	} else if mode == ModeSelector {
-		e.StartSelector(nil, 0)
+		if err := bc.startPeakTransfer(plan, pathIDs); err != nil {
+			bc.abortDial()
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupCanceledDial(e, bc.abortDial)
+		return nil, err
 	}
 	return bc, nil
+}
+
+// gracefullyCloseAdmittedSession preserves the ordered terminal protocol once
+// HELLO admission has published a peer-visible session. The caller still
+// receives its context error; the peer receives normal EOF after prior frames.
+func gracefullyCloseAdmittedSession(e *engine.Engine) {
+	cleanupCanceledDial(e, func() { _ = e.GracefulClose(proto.ByeNormal) })
+}
+
+// cleanupCanceledDial publishes the terminal boundary synchronously, then
+// gives one goroutine sole ownership of graceful teardown. The owner joins the
+// engine's full quiescence before exiting, so a caller cancellation never
+// waits for the terminal ACK window and never abandons session workers.
+func cleanupCanceledDial(e *engine.Engine, cleanup func()) {
+	if e == nil {
+		return
+	}
+	e.BeginGracefulClose()
+	go func() {
+		cleanup()
+		<-e.Closed()
+	}()
 }
 
 func (d *sessionDialer) instanceID() InstanceID {
@@ -398,24 +420,6 @@ func (d *sessionDialer) dialInitialPath(
 		return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: no usable path: %w", lastErr)
 	}
 	return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, errNoCompiledPath
-}
-
-func (d *sessionDialer) attachExtraPath(ctx context.Context, e *engine.Engine, ps PathSpec, index int, tracker *pathStatusTracker, resolver *pathFactoryResolver) (uint32, error) {
-	tracker.set(index, PathDialing, nil)
-	spc, err := resolver.dialPath(ctx, ps)
-	if err != nil {
-		tracker.set(index, PathUnavailable, err)
-		return 0, err
-	}
-	tracker.set(index, PathHandshaking, nil)
-	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, spc, e, pathSpecName(ps), ps)
-	if err != nil {
-		_ = spc.Close()
-		tracker.set(index, pathStateForHandshakeError(err), err)
-		return 0, err
-	}
-	tracker.set(index, PathAttached, nil)
-	return admission.PathID, nil
 }
 
 func pathStateForHandshakeError(err error) PathState {

@@ -16,9 +16,8 @@ import (
 func TestWriteDeadlinePastRejectsBeforePublicationAndCanBeCleared(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe1}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
-	if _, err := e.AttachPath(newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "past"}); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureLeafSelectorRuntime(t, e, "past")
+	attachFixturePath(t, e, newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "past"}, targets["past"])
 	conn := &Conn{E: e}
 	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
@@ -44,6 +43,7 @@ func TestWriteDeadlinePastRejectsBeforePublicationAndCanBeCleared(t *testing.T) 
 func TestWriteDeadlineWakesReplayFrameCreditWait(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe2}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
+	configureLeafSelectorRuntime(t, e, "unavailable")
 	for index := 0; index < sendHistoryWindow; index++ {
 		if err := e.acquireSendSlot(false, 1); err != nil {
 			t.Fatalf("reserve frame %d: %v", index, err)
@@ -70,6 +70,7 @@ func TestWriteDeadlineWakesReplayFrameCreditWait(t *testing.T) {
 func TestWriteDeadlineWakesReplayByteCreditWait(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe3}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
+	configureLeafSelectorRuntime(t, e, "unavailable")
 	if err := e.acquireSendSlot(false, sendHistoryByteLimit); err != nil {
 		t.Fatal(err)
 	}
@@ -244,9 +245,8 @@ func TestWriteDeadlineReturnsOnlyFullyPublishedStreamChunks(t *testing.T) {
 func TestWriteDeadlineExtensionAndClearWakePendingPermitWait(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe7}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
-	if _, err := e.AttachPath(newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "extend"}); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureLeafSelectorRuntime(t, e, "extend")
+	attachFixturePath(t, e, newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "extend"}, targets["extend"])
 	<-e.appWritePermit
 	permitHeld := true
 	defer func() {
@@ -296,9 +296,8 @@ func TestWriteDeadlineExtensionAndClearWakePendingPermitWait(t *testing.T) {
 func TestWriteDeadlineDoesNotApplyToControlOrReplay(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe8}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
-	if _, err := e.AttachPath(newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "control"}); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureLeafSelectorRuntime(t, e, "control")
+	attachFixturePath(t, e, newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "control"}, targets["control"])
 	if err := e.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -507,6 +506,19 @@ func TestRecursiveWriteDeadlineLeavesHealthySiblingForControl(t *testing.T) {
 
 func TestMigrationBudgetBeatsLaterWriteDeadlineWithoutWorkerSelfWait(t *testing.T) {
 	e := New(SideClient, [16]byte{0xe9}, Limits{MigrationBudget: 30 * time.Millisecond})
+	targets := configureLeafSelectorRuntime(t, e, "unavailable")
+	path, peer := newSequencerTestPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	attachFixturePath(t, e, path,
+		transport.PathSpec{Transport: "deadline", Address: "unavailable"},
+		targets["unavailable"],
+	)
+	pathDeath := errors.New("injected last-path death before Write")
+	path.Fail(pathDeath)
+	path.notifyFailure(pathDeath)
+	waitWriteDeadlineCondition(t, time.Second, func() bool {
+		return e.ActivePath() == 0 && e.State() == BridgeMigrating
+	}, "last-path death")
 	if err := e.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -528,9 +540,8 @@ func TestMigrationBudgetBeatsLaterWriteDeadlineWithoutWorkerSelfWait(t *testing.
 func TestConcurrentWriteDeadlineMutationLeavesDeterministicFinalDeadline(t *testing.T) {
 	e := New(SideClient, [16]byte{0xea}, Limits{})
 	t.Cleanup(func() { _ = e.Close() })
-	if _, err := e.AttachPath(newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "mutation"}); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureLeafSelectorRuntime(t, e, "mutation")
+	attachFixturePath(t, e, newReplayBudgetPath(), transport.PathSpec{Transport: "deadline", Address: "mutation"}, targets["mutation"])
 	start := make(chan struct{})
 	done := make(chan struct{}, 32)
 	for worker := 0; worker < cap(done); worker++ {
@@ -570,6 +581,7 @@ func TestConcurrentWriteDeadlineMutationLeavesDeterministicFinalDeadline(t *test
 func TestWriteDeadlineAndCloseRaceCannotDoubleReleaseReplayCredit(t *testing.T) {
 	for iteration := 0; iteration < 100; iteration++ {
 		e := New(SideClient, [16]byte{0xef}, Limits{})
+		configureLeafSelectorRuntime(t, e, "unavailable")
 		if err := e.acquireSendSlot(false, sendHistoryByteLimit); err != nil {
 			t.Fatal(err)
 		}
@@ -744,28 +756,35 @@ func BenchmarkApplicationDataWriterOverhead(b *testing.B) {
 	for _, benchmark := range []struct {
 		name        string
 		application bool
-		recursive   bool
+		selector    bool
 	}{
-		{name: "recursive-deadline-aware", application: true, recursive: true},
-		{name: "recursive-sequencer-direct", application: false, recursive: true},
-		{name: "flat-deadline-aware", application: true},
-		{name: "flat-sequencer-direct", application: false},
+		{name: "path-root-deadline-aware", application: true},
+		{name: "path-root-sequencer-direct", application: false},
+		{name: "selector-root-deadline-aware", application: true, selector: true},
+		{name: "selector-root-sequencer-direct", application: false, selector: true},
 	} {
 		b.Run(benchmark.name, func(b *testing.B) {
 			client := New(SideClient, [16]byte{0xeb}, Limits{})
 			server := New(SideServer, [16]byte{0xeb}, Limits{})
 			pathTarget := proto.DeriveTargetID(proto.GraphNodeKindPath, "write-deadline-benchmark")
-			if benchmark.recursive {
-				manifest := proto.GraphManifest{RootID: pathTarget, Nodes: []proto.GraphNode{{
-					ID: pathTarget, Kind: proto.GraphNodeKindPath, Name: "write-deadline-benchmark",
-				}}}
-				for _, endpoint := range []*Engine{client, server} {
-					if err := endpoint.ConfigureLocalGraph(1, manifest); err != nil {
-						b.Fatal(err)
-					}
-					if err := endpoint.ConfigurePeerGraph(1, manifest); err != nil {
-						b.Fatal(err)
-					}
+			rootTarget := pathTarget
+			nodes := []proto.GraphNode{{
+				ID: pathTarget, Kind: proto.GraphNodeKindPath, Name: "write-deadline-benchmark",
+			}}
+			if benchmark.selector {
+				rootTarget = proto.DeriveTargetID(proto.GraphNodeKindSelector, "write-deadline-benchmark-root")
+				nodes = append([]proto.GraphNode{{
+					ID: rootTarget, Kind: proto.GraphNodeKindSelector, Name: "write-deadline-benchmark-root",
+					Children: []proto.TargetID{pathTarget},
+				}}, nodes...)
+			}
+			manifest := proto.GraphManifest{RootID: rootTarget, Nodes: nodes}
+			for _, endpoint := range []*Engine{client, server} {
+				if err := endpoint.ConfigureLocalGraph(1, manifest); err != nil {
+					b.Fatal(err)
+				}
+				if err := endpoint.ConfigurePeerGraph(1, manifest); err != nil {
+					b.Fatal(err)
 				}
 			}
 			client.SetPacketMode()
@@ -776,21 +795,12 @@ func BenchmarkApplicationDataWriterOverhead(b *testing.B) {
 			})
 			clientPath, serverPath := newSequencerTestPathPair()
 			spec := transport.PathSpec{Transport: "memory", Address: "write-deadline-benchmark"}
-			if benchmark.recursive {
-				binding := PathBinding{LocalTXTargetID: pathTarget, PeerTXTargetID: pathTarget}
-				if _, err := client.AttachPathBound(clientPath, spec, binding); err != nil {
-					b.Fatal(err)
-				}
-				if _, err := server.AttachPathBound(serverPath, spec, binding); err != nil {
-					b.Fatal(err)
-				}
-			} else {
-				if _, err := client.AttachPath(clientPath, spec); err != nil {
-					b.Fatal(err)
-				}
-				if _, err := server.AttachPath(serverPath, spec); err != nil {
-					b.Fatal(err)
-				}
+			binding := PathBinding{LocalTXTargetID: pathTarget, PeerTXTargetID: pathTarget}
+			if _, err := client.AttachPathBound(clientPath, spec, binding); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := server.AttachPathBound(serverPath, spec, binding); err != nil {
+				b.Fatal(err)
 			}
 			payload := make([]byte, 1024)
 			drainDone := make(chan error, 1)

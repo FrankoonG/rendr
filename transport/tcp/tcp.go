@@ -27,6 +27,8 @@ const MaxFrameSize = 1<<16 - 1
 // calls; each call yields an independent PathConn.
 type Transport struct{}
 
+var _ transport.PathQualityReader = (*PathConn)(nil)
+
 // New returns a Transport ready for use.
 func New() *Transport { return &Transport{} }
 
@@ -315,6 +317,15 @@ func (p *PathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
+}
+
+// QualityContext exposes the prompt in-memory quality snapshot to engines that
+// require an explicit cancellation contract.
+func (p *PathConn) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.PathQuality{}, err
+	}
+	return p.Quality(), nil
 }
 
 // SetQuality is invoked by the engine when a new measurement is

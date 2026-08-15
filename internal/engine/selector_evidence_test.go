@@ -10,6 +10,18 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
+type selectorReentrantQualityPath struct {
+	*memoryPathConn
+	onQuality func()
+}
+
+func (p *selectorReentrantQualityPath) Quality() transport.PathQuality {
+	if p.onQuality != nil {
+		p.onQuality()
+	}
+	return p.memoryPathConn.Quality()
+}
+
 func TestRecursiveSelectorDecisionPriorityMatrix(t *testing.T) {
 	now := time.Unix(100, 0)
 	manifest, ids := runtimeGraph(t,
@@ -59,6 +71,103 @@ func TestRecursiveSelectorDecisionPriorityMatrix(t *testing.T) {
 	}
 }
 
+func TestSelectorGoodputCandidateSurvivesDefaultDwellTickJitter(t *testing.T) {
+	base := time.Unix(150, 0)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
+		t.Fatal(err)
+	}
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["a"]: selectorObservation(ids["a"], base, 10*time.Millisecond, 0, 1),
+		ids["b"]: selectorObservation(ids["b"], base, 11*time.Millisecond, 0, 10),
+	}
+	policy := selectorEvidencePolicy{latencyBandRatio: 0.25, latencyBandFloor: time.Millisecond, minimumConfidence: 1}
+	dwell := DefaultLimits().SelectorDwell
+	if decisions := runtime.selectorDecisions(
+		proto.SenderDirectionClientToServer, observations, base, policy, dwell, 0,
+	); len(decisions) != 0 {
+		t.Fatalf("candidate-start decisions=%+v", decisions)
+	}
+	for targetID, observation := range observations {
+		observation.goodput.state = qualityStateStale
+		observation.quality.At = base.Add(dwell + 200*time.Millisecond)
+		observations[targetID] = observation
+	}
+	decisions := runtime.selectorDecisions(
+		proto.SenderDirectionClientToServer, observations, base.Add(dwell+200*time.Millisecond), policy, dwell, 0,
+	)
+	if len(decisions) != 1 || decisions[0].targetID != ids["b"] || decisions[0].origin != policySelectionQuality {
+		t.Fatalf("default-dwell decision=%+v, want b after bounded held speed evidence", decisions)
+	}
+}
+
+func TestSelectorGoodputHoldCannotStartStaleOrOutliveBound(t *testing.T) {
+	base := time.Unix(175, 0)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	policy := selectorEvidencePolicy{latencyBandRatio: 0.25, latencyBandFloor: time.Millisecond, minimumConfidence: 1}
+	dwell := DefaultLimits().SelectorDwell
+	newRuntime := func(t *testing.T) *executionRuntime {
+		t.Helper()
+		runtime := mustExecutionRuntime(t, manifest)
+		if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
+			t.Fatal(err)
+		}
+		return runtime
+	}
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["a"]: selectorObservation(ids["a"], base, 10*time.Millisecond, 0, 1),
+		ids["b"]: selectorObservation(ids["b"], base, 11*time.Millisecond, 0, 10),
+	}
+
+	t.Run("stale cannot start", func(t *testing.T) {
+		for targetID, observation := range observations {
+			observation.goodput.state = qualityStateStale
+			observations[targetID] = observation
+		}
+		runtime := newRuntime(t)
+		if decisions := runtime.selectorDecisions(
+			proto.SenderDirectionClientToServer, observations, base, policy, dwell, 0,
+		); len(decisions) != 0 {
+			t.Fatalf("stale evidence started decision=%+v", decisions)
+		}
+		if state := runtime.selectors[ids["root"]]; state == nil || state.qualityCandidate != (proto.TargetID{}) {
+			t.Fatalf("stale evidence retained quality candidate=%+v", state)
+		}
+	})
+
+	t.Run("hold expires", func(t *testing.T) {
+		fresh := map[proto.TargetID]pathEvidenceObservation{
+			ids["a"]: selectorObservation(ids["a"], base, 10*time.Millisecond, 0, 1),
+			ids["b"]: selectorObservation(ids["b"], base, 11*time.Millisecond, 0, 10),
+		}
+		runtime := newRuntime(t)
+		_ = runtime.selectorDecisions(proto.SenderDirectionClientToServer, fresh, base, policy, dwell, 0)
+		for targetID, observation := range fresh {
+			observation.goodput.state = qualityStateStale
+			observation.quality.At = base.Add(selectorGoodputHoldDuration(dwell) + time.Nanosecond)
+			fresh[targetID] = observation
+		}
+		if decisions := runtime.selectorDecisions(
+			proto.SenderDirectionClientToServer, fresh,
+			base.Add(selectorGoodputHoldDuration(dwell)+time.Nanosecond), policy, dwell, 0,
+		); len(decisions) != 0 {
+			t.Fatalf("expired hold produced decision=%+v", decisions)
+		}
+		if state := runtime.selectors[ids["root"]]; state == nil || state.qualityCandidate != (proto.TargetID{}) {
+			t.Fatalf("expired hold retained quality candidate=%+v", state)
+		}
+	})
+}
+
 func TestRecursiveSelectorUnknownAndStaleCannotEvictFreshCurrent(t *testing.T) {
 	now := time.Unix(200, 0)
 	manifest, ids := runtimeGraph(t,
@@ -89,6 +198,237 @@ func TestRecursiveSelectorUnknownAndStaleCannotEvictFreshCurrent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPeakSelectionHoldsAcrossQualityDwellButNotPathDeath(t *testing.T) {
+	now := time.Unix(225, 0)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "normal", "peak"),
+		runtimeNode(proto.GraphNodeKindPath, "normal"),
+		runtimeNode(proto.GraphNodeKindPath, "peak"),
+	)
+	root, _ := manifest.Node(ids["root"])
+	root.PeakCandidates = []proto.TargetID{ids["peak"]}
+	for i := range manifest.Nodes {
+		if manifest.Nodes[i].ID == root.ID {
+			manifest.Nodes[i] = root
+		}
+	}
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.commitSelectorChildOrigin(ids["root"], ids["peak"], map[proto.TargetID]bool{
+		ids["normal"]: true,
+		ids["peak"]:   true,
+	}, policySelectionPeakPromote, nil); err != nil {
+		t.Fatal(err)
+	}
+	policy := selectorEvidencePolicy{latencyBandRatio: 0.05, latencyBandFloor: time.Millisecond, minimumConfidence: 1}
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["normal"]: selectorObservation(ids["normal"], now, time.Millisecond, 0, 100),
+		ids["peak"]:   selectorObservation(ids["peak"], now, 100*time.Millisecond, 0, 1),
+	}
+	for _, at := range []time.Time{now, now.Add(time.Second), now.Add(10 * time.Second)} {
+		if decisions := runtime.selectorDecisions(proto.SenderDirectionClientToServer, observations, at, policy, 100*time.Millisecond, 100*time.Millisecond); len(decisions) != 0 {
+			t.Fatalf("healthy peak was evicted at %s: %+v", at.Sub(now), decisions)
+		}
+	}
+	delete(observations, ids["peak"])
+	decisions := runtime.selectorDecisions(proto.SenderDirectionClientToServer, observations, now.Add(11*time.Second), policy, time.Hour, time.Hour)
+	if len(decisions) != 1 || decisions[0].targetID != ids["normal"] || decisions[0].origin != policySelectionPathDeath {
+		t.Fatalf("dead peak decisions=%+v want immediate normal path death", decisions)
+	}
+}
+
+func TestRankSelectorClassReturnsBestNormalAndUsesActiveNestedSelector(t *testing.T) {
+	now := time.Unix(240, 0)
+	ids := map[string]proto.TargetID{
+		"root":   proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"),
+		"a":      proto.DeriveTargetID(proto.GraphNodeKindPath, "a"),
+		"nested": proto.DeriveTargetID(proto.GraphNodeKindSelector, "nested"),
+		"bad":    proto.DeriveTargetID(proto.GraphNodeKindPath, "bad"),
+		"good":   proto.DeriveTargetID(proto.GraphNodeKindPath, "good"),
+		"peak":   proto.DeriveTargetID(proto.GraphNodeKindPath, "peak"),
+	}
+	manifest := proto.GraphManifest{
+		RootID: ids["root"],
+		Nodes: []proto.GraphNode{
+			{ID: ids["root"], Kind: proto.GraphNodeKindSelector, Name: "root", Children: []proto.TargetID{ids["a"], ids["nested"], ids["peak"]}, PeakCandidates: []proto.TargetID{ids["peak"]}},
+			{ID: ids["a"], Kind: proto.GraphNodeKindPath, Name: "a"},
+			{ID: ids["nested"], Kind: proto.GraphNodeKindSelector, Name: "nested", Children: []proto.TargetID{ids["bad"], ids["good"]}},
+			{ID: ids["bad"], Kind: proto.GraphNodeKindPath, Name: "bad"},
+			{ID: ids["good"], Kind: proto.GraphNodeKindPath, Name: "good"},
+			{ID: ids["peak"], Kind: proto.GraphNodeKindPath, Name: "peak"},
+		},
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["peak"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.selectChild(ids["nested"], ids["bad"]); err != nil {
+		t.Fatal(err)
+	}
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["a"]:    selectorObservation(ids["a"], now, 50*time.Millisecond, 0, 1),
+		ids["bad"]:  selectorObservation(ids["bad"], now, 200*time.Millisecond, 500, 1),
+		ids["good"]: selectorObservation(ids["good"], now, time.Millisecond, 0, 100),
+		ids["peak"]: selectorObservation(ids["peak"], now, 10*time.Millisecond, 0, 10),
+	}
+	policy := selectorEvidencePolicy{latencyBandRatio: 0.05, latencyBandFloor: time.Millisecond, minimumConfidence: 1}
+	ranked := runtime.rankSelectorClassTargets(ids["root"], false, proto.SenderDirectionClientToServer, observations, now, policy)
+	if len(ranked) != 2 || ranked[0] != ids["a"] || ranked[1] != ids["nested"] {
+		t.Fatalf("normal ranking=%x want a then active-bad nested", ranked)
+	}
+	if err := runtime.selectChild(ids["nested"], ids["good"]); err != nil {
+		t.Fatal(err)
+	}
+	ranked = runtime.rankSelectorClassTargets(ids["root"], false, proto.SenderDirectionClientToServer, observations, now, policy)
+	if len(ranked) != 2 || ranked[0] != ids["nested"] || ranked[1] != ids["a"] {
+		t.Fatalf("normal ranking after nested selection=%x want nested then a", ranked)
+	}
+}
+
+func TestRankPeakTransferTargetsAppliesAdmissionInOneRanking(t *testing.T) {
+	now := time.Unix(245, 0)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "normal", "lossy", "jittery", "healthy"),
+		runtimeNode(proto.GraphNodeKindPath, "normal"),
+		runtimeNode(proto.GraphNodeKindPath, "lossy"),
+		runtimeNode(proto.GraphNodeKindPath, "jittery"),
+		runtimeNode(proto.GraphNodeKindPath, "healthy"),
+	)
+	root, _ := manifest.Node(ids["root"])
+	root.PeakCandidates = []proto.TargetID{ids["lossy"], ids["jittery"], ids["healthy"]}
+	for i := range manifest.Nodes {
+		if manifest.Nodes[i].ID == root.ID {
+			manifest.Nodes[i] = root
+		}
+	}
+	runtime := mustExecutionRuntime(t, manifest)
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["normal"]:  selectorObservation(ids["normal"], now, time.Millisecond, 0, 1),
+		ids["lossy"]:   selectorObservation(ids["lossy"], now, 2*time.Millisecond, peakTransferMaximumLossPP+1, 100),
+		ids["jittery"]: selectorObservation(ids["jittery"], now, 3*time.Millisecond, 0, 90),
+		ids["healthy"]: selectorObservation(ids["healthy"], now, 4*time.Millisecond, peakTransferMaximumLossPP, 80),
+	}
+	jittery := observations[ids["jittery"]]
+	jittery.quality.Jitter = peakTransferMaximumJitter + time.Nanosecond
+	observations[ids["jittery"]] = jittery
+	policy := selectorEvidencePolicy{
+		latencyBandRatio: 0.05, latencyBandFloor: time.Millisecond, minimumConfidence: 1,
+	}
+
+	ranked := runtime.rankPeakTransferTargets(
+		ids["root"], proto.SenderDirectionClientToServer, observations, now, policy,
+	)
+	if len(ranked) != 1 || ranked[0] != ids["healthy"] {
+		t.Fatalf("peak-transfer ranking=%x want only healthy=%x", ranked, ids["healthy"])
+	}
+}
+
+func TestPeakTransferSuppressionIsAppliedBeforeLatencyBandRanking(t *testing.T) {
+	now := time.Unix(246, 0)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "normal", "suppressed", "stable-slow", "stable-fast"),
+		runtimeNode(proto.GraphNodeKindPath, "normal"),
+		runtimeNode(proto.GraphNodeKindPath, "suppressed"),
+		runtimeNode(proto.GraphNodeKindPath, "stable-slow"),
+		runtimeNode(proto.GraphNodeKindPath, "stable-fast"),
+	)
+	root, _ := manifest.Node(ids["root"])
+	root.PeakCandidates = []proto.TargetID{ids["suppressed"], ids["stable-slow"], ids["stable-fast"]}
+	for i := range manifest.Nodes {
+		if manifest.Nodes[i].ID == root.ID {
+			manifest.Nodes[i] = root
+		}
+	}
+	runtime := mustExecutionRuntime(t, manifest)
+	observations := map[proto.TargetID]pathEvidenceObservation{
+		ids["normal"]:      selectorObservation(ids["normal"], now, time.Millisecond, 0, 1),
+		ids["suppressed"]:  selectorObservation(ids["suppressed"], now, time.Millisecond, 0, 1),
+		ids["stable-slow"]: selectorObservation(ids["stable-slow"], now, 10*time.Millisecond, 10, 1),
+		ids["stable-fast"]: selectorObservation(ids["stable-fast"], now, 11*time.Millisecond, 0, 100),
+	}
+	policy := selectorEvidencePolicy{
+		latencyBandRatio: 0.25, latencyBandFloor: time.Millisecond, minimumConfidence: 1,
+	}
+	withoutSuppression := runtime.rankPeakTransferTargets(
+		ids["root"], proto.SenderDirectionClientToServer, observations, now, policy,
+	)
+	if len(withoutSuppression) != 3 || withoutSuppression[0] != ids["suppressed"] ||
+		withoutSuppression[1] != ids["stable-slow"] {
+		t.Fatalf("baseline ranking=%x want suppressed then latency-nearest", withoutSuppression)
+	}
+	withSuppression := runtime.rankSelectorClassTargetsWithAdmission(
+		ids["root"], true, proto.SenderDirectionClientToServer, observations, now, policy, true,
+		map[proto.TargetID]struct{}{ids["suppressed"]: {}},
+	)
+	if len(withSuppression) != 2 || withSuppression[0] != ids["stable-fast"] ||
+		withSuppression[1] != ids["stable-slow"] {
+		t.Fatalf("suppressed ranking=%x want stable-fast then stable-slow", withSuppression)
+	}
+}
+
+func TestSelectorEvidenceSnapshotReleasesTopologyLockAndRejectsMixedProbeGeneration(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+		runtimeNode(proto.GraphNodeKindPath, "path"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	base, peer := newMemoryPathPair()
+	t.Cleanup(func() { _ = peer.Close() })
+	now := time.Now()
+	base.quality = transport.PathQuality{RTT: 50 * time.Millisecond, At: now}
+	path := &selectorReentrantQualityPath{memoryPathConn: base}
+	pathID := attachFixturePath(
+		t, e, path, transport.PathSpec{Transport: "memory", Address: "selector-reentrant-quality"}, ids["path"],
+	)
+	e.pathsMu.RLock()
+	slot := e.paths[pathID]
+	e.pathsMu.RUnlock()
+	seedPathProbeSuccess(e, slot, now, time.Millisecond)
+
+	var once sync.Once
+	path.onQuality = func() {
+		once.Do(func() {
+			e.pathsMu.Lock()
+			slot.probeEndpointGen.Store(slot.probeEndpointGen.Load() + 1)
+			e.advancePathTopologyEpochLocked()
+			e.pathsMu.Unlock()
+		})
+	}
+	type snapshotResult struct {
+		view selectorEvidenceView
+		ok   bool
+	}
+	result := make(chan snapshotResult, 1)
+	go func() {
+		view, ok := e.selectorEvidenceSnapshot()
+		result <- snapshotResult{view: view, ok: ok}
+	}()
+	select {
+	case got := <-result:
+		if !got.ok {
+			t.Fatal("coherent retry did not produce selector evidence")
+		}
+		observation := got.view.observations[ids["path"]]
+		if observation.quality.RTT != 50*time.Millisecond || observation.probeLiveness != qualityStateUnknown {
+			t.Fatalf("mixed predecessor probe evidence survived retry: %+v", observation)
+		}
+		if got.view.topologyEpoch != e.currentPathTopologyEpoch() {
+			t.Fatalf("snapshot epoch=%d current=%d", got.view.topologyEpoch, e.currentPathTopologyEpoch())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PathConn.Quality ran while selector held the topology lock")
 	}
 }
 
@@ -158,6 +498,246 @@ func TestRecursiveSelectorPathDeathCommitsProjectedFallback(t *testing.T) {
 	if len(decisions) != 1 || decisions[0].selectorID != ids["root"] ||
 		decisions[0].targetID != ids["b"] || decisions[0].origin != policySelectionPathDeath {
 		t.Fatalf("decisions=%+v want projected fallback root->b path death", decisions)
+	}
+}
+
+func TestStaleSelectorObservationCannotOverwriteDeathProjection(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	limits := Limits{
+		ProbeInterval:       time.Hour,
+		SelectorDwell:       time.Hour,
+		SelectorCooldown:    time.Hour,
+		ZombieMaxMigrations: 2,
+		ZombieCooldown:      time.Hour,
+	}.Clamp()
+	e := New(SideClient, NewClientFlowID(), limits)
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	sampleAt := time.Now()
+	qualities := map[string]time.Duration{
+		"a": 100 * time.Millisecond,
+		"b": time.Millisecond,
+		"c": 10 * time.Millisecond,
+	}
+	captures := make(map[string]*captureDispatchPath, 3)
+	pathIDs := make(map[string]uint32, 3)
+	for _, name := range []string{"a", "b", "c"} {
+		path, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		path.quality = transport.PathQuality{RTT: qualities[name], At: sampleAt}
+		capture := &captureDispatchPath{PathConn: path}
+		captures[name] = capture
+		pathIDs[name] = attachFixturePath(
+			t, e, capture, transport.PathSpec{Transport: "memory", Address: name}, ids[name],
+		)
+	}
+	if err := e.SelectExplicitTarget(ids["root"], ids["c"], "explicit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendData([]byte("unacknowledged-before-death")); err != nil {
+		t.Fatal(err)
+	}
+	cSequences := captures["c"].dataSequences()
+	if len(cSequences) != 1 {
+		t.Fatalf("initial DATA sequences on c=%v want one frame", cSequences)
+	}
+	publishedSeq := cSequences[0]
+	staleObservations := e.selectorEvidenceObservations()
+	if !staleObservations[ids["c"]].live {
+		t.Fatal("pre-death selector snapshot did not contain live c")
+	}
+
+	runtime := e.localExecutionRuntime()
+	e.pathsMu.Lock()
+	departure := e.detachPathLocked(
+		e.paths[pathIDs["c"]], runtime, transport.CauseTransportError, errors.New("injected selected path death"), false,
+	)
+	e.pathsMu.Unlock()
+	var finishOnce sync.Once
+	finishDeparture := func() { finishOnce.Do(func() { e.finishPathDeparture(departure) }) }
+	defer finishDeparture()
+
+	desired, effective, ok := runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["c"] || effective != ids["a"] || e.ActivePath() != pathIDs["a"] {
+		t.Fatalf(
+			"post-death projection active/desired/effective=%d/%x/%x ok=%t want a/c/a",
+			e.ActivePath(), desired, effective, ok,
+		)
+	}
+	if got := e.MigrationCount(); got != 2 {
+		t.Fatalf("migration count after explicit+physical death=%d want 2", got)
+	}
+
+	decisions := runtime.selectorDecisions(
+		proto.SenderDirectionClientToServer,
+		staleObservations,
+		time.Now(),
+		e.selectorEvidencePolicy(),
+		time.Hour,
+		time.Hour,
+	)
+	if len(decisions) != 0 {
+		t.Fatalf("pre-death snapshot produced an immediate decision: %+v", decisions)
+	}
+	desired, effective, ok = runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["c"] || effective != ids["a"] {
+		t.Fatalf("stale snapshot changed desired/effective=%x/%x ok=%t want c/a", desired, effective, ok)
+	}
+
+	migrations := make(chan struct {
+		oldID, newID uint32
+		cause        string
+	}, 2)
+	cancel := e.OnMigrate(func(oldID, newID uint32, cause string) {
+		migrations <- struct {
+			oldID, newID uint32
+			cause        string
+		}{oldID: oldID, newID: newID, cause: cause}
+	})
+	defer cancel()
+	decisionCommitted := make(chan struct{})
+	var decisionOnce sync.Once
+	e.selectorDecisionAfterCommit = func() {
+		decisionOnce.Do(func() { close(decisionCommitted) })
+	}
+	finishDeparture()
+	select {
+	case <-decisionCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("post-death selector transaction did not commit")
+	}
+
+	desired, effective, ok = runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["a"] || effective != ids["a"] || e.ActivePath() != pathIDs["a"] {
+		t.Fatalf(
+			"aligned fallback active/desired/effective=%d/%x/%x ok=%t want a/a/a",
+			e.ActivePath(), desired, effective, ok,
+		)
+	}
+	if got := e.MigrationCount(); got != 2 {
+		t.Fatalf("stale snapshot caused a second death migration: count=%d want 2", got)
+	}
+	e.zombieMu.Lock()
+	zombieLeft := e.zombieLeft
+	e.zombieMu.Unlock()
+	if zombieLeft != limits.ZombieMaxMigrations-1 || errors.Is(e.CloseErr(), ErrZombie) {
+		t.Fatalf("single death zombie state left/error=%d/%v", zombieLeft, e.CloseErr())
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		aSequences := captures["a"].dataSequences()
+		if len(aSequences) > 0 && aSequences[0] == publishedSeq {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fallback replay DATA sequences on a=%v want first %d", aSequences, publishedSeq)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if bSequences := captures["b"].dataSequences(); len(bSequences) != 0 {
+		t.Fatalf("quality sibling received death replay after stale snapshot: %v", bSequences)
+	}
+	select {
+	case event := <-migrations:
+		if event.oldID != pathIDs["c"] || event.newID != pathIDs["a"] || event.cause != "death" {
+			t.Fatalf("physical death migration=%+v want c->a", event)
+		}
+	default:
+		t.Fatal("physical death migration hook did not fire")
+	}
+	select {
+	case event := <-migrations:
+		t.Fatalf("one path death published a second migration: %+v", event)
+	default:
+	}
+}
+
+func TestEnginePathDeathKeepsPhysicalAndSelectorFallbackAligned(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: time.Hour}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	paths := make(map[string]*lifecycleHealthyPath, 3)
+	pathIDs := make(map[string]uint32, 3)
+	for _, name := range []string{"a", "b", "c"} {
+		path := newLifecycleHealthyPath()
+		paths[name] = path
+		pathIDs[name] = attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
+	}
+	if err := e.SelectExplicitTarget(ids["root"], ids["c"], "explicit"); err != nil {
+		t.Fatal(err)
+	}
+	if e.ActivePath() != pathIDs["c"] {
+		t.Fatalf("explicit active=%d want c=%d", e.ActivePath(), pathIDs["c"])
+	}
+
+	migrations := make(chan struct {
+		oldID, newID uint32
+		cause        string
+	}, 4)
+	cancel := e.OnMigrate(func(oldID, newID uint32, cause string) {
+		migrations <- struct {
+			oldID, newID uint32
+			cause        string
+		}{oldID: oldID, newID: newID, cause: cause}
+	})
+	defer cancel()
+	paths["c"].die(transport.CauseTransportError, errors.New("selected path failed"))
+	select {
+	case event := <-migrations:
+		if event.oldID != pathIDs["c"] || event.newID != pathIDs["a"] || event.cause != "death" {
+			t.Fatalf("death migration=%+v want c->a", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("path death did not publish migration")
+	}
+	var desired, effective proto.TargetID
+	var ok bool
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case event := <-migrations:
+			t.Fatalf("one path death published a second migration: %+v", event)
+		default:
+		}
+		desired, effective, ok = e.localExecutionRuntime().selectedChild(ids["root"])
+		if ok && desired == ids["a"] && effective == ids["a"] {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !ok || desired != ids["a"] || effective != ids["a"] || e.ActivePath() != pathIDs["a"] {
+		t.Fatalf("aligned fallback active/desired/effective=%d/%x/%x ok=%t", e.ActivePath(), desired, effective, ok)
+	}
+	select {
+	case event := <-migrations:
+		t.Fatalf("aligned selector transaction published a second migration: %+v", event)
+	default:
+	}
+	if got := e.MigrationCount(); got != 2 {
+		t.Fatalf("explicit+death migration count=%d want 2", got)
 	}
 }
 
@@ -551,7 +1131,7 @@ func TestRecursiveSelectorStaleCurrentReplaysUnackedHistory(t *testing.T) {
 	migrated := make(chan string, 1)
 	cancel := client.OnMigrate(func(_, _ uint32, cause string) { migrated <- cause })
 	defer cancel()
-	client.StartSelector(nil, time.Millisecond)
+	client.StartSelector(time.Millisecond)
 	deadline := time.Now().Add(time.Second)
 	for client.ActivePath() != bID && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -702,7 +1282,7 @@ func TestRecursiveSelectorSchedulerChangesActualDataRoute(t *testing.T) {
 	if client.ActivePath() != aID {
 		t.Fatalf("initial active path=%d want=%d", client.ActivePath(), aID)
 	}
-	client.StartSelector(nil, 2*time.Millisecond)
+	client.StartSelector(2 * time.Millisecond)
 	deadline := time.Now().Add(time.Second)
 	for client.ActivePath() != bID && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -752,7 +1332,7 @@ func TestRecursiveSelectorChoosesImmediateBondAggregate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	client.StartSelector(nil, time.Millisecond)
+	client.StartSelector(time.Millisecond)
 	deadline := time.Now().Add(time.Second)
 	for {
 		desired, _, ok := client.localExecutionRuntime().selectedChild(ids["root"])
@@ -772,13 +1352,20 @@ func TestRecursiveSelectorChoosesImmediateBondAggregate(t *testing.T) {
 	waitForCapturedFrames(t, captures, map[string]uint64{"a": 0, "b": 2, "c": 2})
 }
 
-func selectorObservation(id proto.TargetID, at time.Time, rtt time.Duration, loss uint16, weight uint16) pathEvidenceObservation {
+func selectorObservation(id proto.TargetID, at time.Time, rtt time.Duration, loss uint16, goodput uint16) pathEvidenceObservation {
 	return pathEvidenceObservation{
 		targetID:      id,
 		quality:       transport.PathQuality{RTT: rtt, At: at, LossPP: loss},
+		loss:          loss,
+		lossAt:        at,
+		lossKnown:     true,
 		probeLiveness: qualityStateFresh,
-		weight:        weight,
-		live:          true,
+		goodput: speedEstimate{
+			state: qualityStateFresh, bytesPerSecond: uint64(goodput),
+			confidence: evidenceConfidenceFull, source: speedSourceDelivered,
+			sampleTime: at, sampleCount: 1,
+		},
+		live: true,
 	}
 }
 

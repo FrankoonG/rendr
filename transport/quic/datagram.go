@@ -21,6 +21,8 @@ import (
 // ceiling. Larger frames must use the stream-mode adapter.
 const MaxDatagramFrame = 1200
 
+var _ transport.PathQualityReader = (*datagramPathConn)(nil)
+
 // datagramIngressQueueLen decouples quic-go's small internal DATAGRAM
 // receive queue from engine framing and reorder work. quic-go intentionally
 // drops incoming DATAGRAMs when its 128-entry queue is full; a dedicated pump
@@ -75,6 +77,11 @@ type datagramPathConn struct {
 
 var _ transport.DatagramAccelerationObserver = (*datagramPathConn)(nil)
 var _ transport.FrameBatchWriter = (*datagramPathConn)(nil)
+
+// MaxFrameSize reports the complete rendr frame budget carried by one QUIC
+// DATAGRAM. The engine subtracts its session-specific DATA envelope before
+// accepting an application packet.
+func (*datagramPathConn) MaxFrameSize() int { return MaxDatagramFrame }
 
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
@@ -264,6 +271,13 @@ func (p *datagramPathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
+}
+
+func (p *datagramPathConn) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.PathQuality{}, err
+	}
+	return p.Quality(), nil
 }
 
 func (p *datagramPathConn) SetQuality(q transport.PathQuality) {

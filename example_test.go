@@ -111,13 +111,13 @@ func ExampleConnectionObserver() {
 	if adm, ok := c.(rendr.ConnectionObserver); ok {
 		s := adm.Stats()
 		fmt.Println("state:", s.State)
-		fmt.Println("mode:", s.Mode)
+		fmt.Println("effective paths:", len(s.EffectivePaths))
 		fmt.Println("paths:", len(s.Paths))
 	}
 	<-srvDone
 	// Output:
 	// state: active
-	// mode: selector
+	// effective paths: 1
 	// paths: 1
 }
 

@@ -3,6 +3,7 @@
 package gvisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -150,6 +151,48 @@ func platformCaptureOuterSocketContext(conn net.PacketConn) (outerSocketContext,
 	}
 	closeOnError = false
 	return outerSocketContext{mu: &sync.Mutex{}, netnsFD: netnsFD, identity: identity}, nil
+}
+
+func platformOpenOuterSuccessorWire(
+	ctx context.Context,
+	active *packetWire,
+	mode outerUDPMode,
+	local *net.UDPAddr,
+) (*packetWire, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var candidate *packetWire
+	err := withOuterSocketNetworkNamespace(ctx, active, func(identity outerNetNSIdentity) error {
+		if err := ctx.Err(); err != nil {
+			return contextCause(ctx)
+		}
+		opened, err := listenOuterUDPWire(mode, local, false)
+		if err != nil {
+			return err
+		}
+		candidate = opened
+		if err := ctx.Err(); err != nil {
+			return contextCause(ctx)
+		}
+		if candidate.socketErr != nil {
+			return candidate.socketErr
+		}
+		candidateIdentity := candidate.socket.identity
+		if !candidateIdentity.valid() || candidateIdentity.device != identity.device ||
+			candidateIdentity.inode != identity.inode ||
+			identity.cookieKnown && (!candidateIdentity.cookieKnown || candidateIdentity.cookie != identity.cookie) {
+			return errors.New("gvisor: successor socket was created in the wrong network namespace")
+		}
+		return nil
+	})
+	if err != nil {
+		if candidate != nil {
+			candidate.close()
+		}
+		return nil, err
+	}
+	return candidate, nil
 }
 
 func platformReleaseOuterSocketContext(context *outerSocketContext) {

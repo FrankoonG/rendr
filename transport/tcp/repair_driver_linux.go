@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,6 +109,14 @@ type tcpRepairDriver struct {
 	probeSequence atomic.Uint64
 }
 
+type tcpRepairAddressFamily uint8
+
+const (
+	tcpRepairAddressFamilyUnknown tcpRepairAddressFamily = iota
+	tcpRepairAddressFamilyIPv4
+	tcpRepairAddressFamilyIPv6
+)
+
 func newTCPRepairDriver(endpoint *endpointOwner) *tcpRepairDriver {
 	driver := &tcpRepairDriver{
 		endpoint: endpoint,
@@ -167,16 +176,6 @@ func (driver *tcpRepairDriver) Preflight(
 	if err != nil {
 		return nil, leafmobility.PreflightResult{}, err
 	}
-	if reason := tcpRepairPlatformReason(ctx, request); reason != leafmobility.ReasonNone {
-		if reason == leafmobility.ReasonTransparentBindUnavailable {
-			return driver.ineligible(request, leafmobility.StageTuple, reason, false,
-				tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: reason.String()})
-		}
-		return nil, leafmobility.PreflightResult{
-			Stage: leafmobility.StagePlatform, Reason: reason, ProbeReferences: platformRefs,
-		}, nil
-	}
-
 	conn, ownerGeneration, ok := driver.endpoint.current()
 	if !ok {
 		return driver.ineligible(request, leafmobility.StageEndpoint, leafmobility.ReasonEndpointNotOwned, false,
@@ -186,6 +185,25 @@ func (driver *tcpRepairDriver) Preflight(
 	if !ok {
 		return driver.ineligible(request, leafmobility.StageEndpoint, leafmobility.ReasonNotRawTCP, false,
 			tcpRepairProbe{ID: leafmobility.ProbeEndpointState, Label: "not-raw-tcp"})
+	}
+	family, endpointTuple, err := tcpRepairEndpointFamily(tcpConn)
+	if err != nil {
+		return driver.ineligible(request, leafmobility.StageTuple, leafmobility.ReasonTupleNotPreservable, false,
+			tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: "incompatible-address-family"})
+	}
+	if family == tcpRepairAddressFamilyIPv6 {
+		return driver.ineligible(request, leafmobility.StageSnapshot, leafmobility.ReasonSnapshotIncomplete, false,
+			tcpRepairProbe{ID: leafmobility.ProbeEndpointState, Label: "owned-raw-tcp6", Inspection: tcprepair.Inspection{Tuple: endpointTuple}},
+			tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: "ipv6-snapshot-unsupported", Inspection: tcprepair.Inspection{Tuple: endpointTuple}})
+	}
+	if reason := tcpRepairPlatformReason(ctx, request, family); reason != leafmobility.ReasonNone {
+		if reason == leafmobility.ReasonTransparentBindUnavailable {
+			return driver.ineligible(request, leafmobility.StageTuple, reason, false,
+				tcpRepairProbe{ID: leafmobility.ProbeTuple, Label: reason.String(), Inspection: tcprepair.Inspection{Tuple: endpointTuple}})
+		}
+		return nil, leafmobility.PreflightResult{
+			Stage: leafmobility.StagePlatform, Reason: reason, ProbeReferences: platformRefs,
+		}, nil
 	}
 	if err := repairSourceMatchesCurrentNamespace(tcpConn); err != nil {
 		return driver.ineligible(request, leafmobility.StagePreflight, leafmobility.ReasonPreflightRejected, false,
@@ -259,9 +277,53 @@ func (driver *tcpRepairDriver) Preflight(
 	}, nil
 }
 
-func tcpRepairPlatformReason(ctx context.Context, request leafmobility.PreflightRequest) leafmobility.Reason {
+func tcpRepairEndpointFamily(conn *net.TCPConn) (tcpRepairAddressFamily, tcprepair.Tuple, error) {
+	if conn == nil {
+		return tcpRepairAddressFamilyUnknown, tcprepair.Tuple{}, errors.New("tcp: nil repair endpoint")
+	}
+	local, localOK := conn.LocalAddr().(*net.TCPAddr)
+	remote, remoteOK := conn.RemoteAddr().(*net.TCPAddr)
+	if !localOK || !remoteOK || local == nil || remote == nil ||
+		local.Port <= 0 || local.Port > 65535 || remote.Port <= 0 || remote.Port > 65535 {
+		return tcpRepairAddressFamilyUnknown, tcprepair.Tuple{}, errors.New("tcp: repair endpoint has invalid TCP addresses")
+	}
+	localIP, localOK := netip.AddrFromSlice(local.IP)
+	remoteIP, remoteOK := netip.AddrFromSlice(remote.IP)
+	if !localOK || !remoteOK {
+		return tcpRepairAddressFamilyUnknown, tcprepair.Tuple{}, errors.New("tcp: repair endpoint has invalid IP addresses")
+	}
+	localIP = localIP.Unmap()
+	remoteIP = remoteIP.Unmap()
+	if localIP.IsUnspecified() || remoteIP.IsUnspecified() || localIP.Is4() != remoteIP.Is4() {
+		return tcpRepairAddressFamilyUnknown, tcprepair.Tuple{}, errors.New("tcp: repair endpoint address families differ")
+	}
+	tuple := tcprepair.Tuple{
+		Local:  netip.AddrPortFrom(localIP, uint16(local.Port)),
+		Remote: netip.AddrPortFrom(remoteIP, uint16(remote.Port)),
+	}
+	if localIP.Is4() {
+		return tcpRepairAddressFamilyIPv4, tuple, nil
+	}
+	return tcpRepairAddressFamilyIPv6, tuple, nil
+}
+
+func tcpRepairPlatformReason(
+	ctx context.Context,
+	request leafmobility.PreflightRequest,
+	family tcpRepairAddressFamily,
+) leafmobility.Reason {
 	snapshot, err := platform.Detect(ctx)
 	if err != nil || leafmobility.ContextDigest(snapshot.RuntimeContextDigest) != request.ContextDigest {
+		return leafmobility.ReasonStateAPIIncomplete
+	}
+	return tcpRepairFeatureReason(snapshot.Feature, family)
+}
+
+func tcpRepairFeatureReason(
+	lookup func(platform.FeatureID) (platform.FeatureEvidence, bool),
+	family tcpRepairAddressFamily,
+) leafmobility.Reason {
+	if lookup == nil {
 		return leafmobility.ReasonStateAPIIncomplete
 	}
 	required := [...]platform.FeatureID{
@@ -272,7 +334,7 @@ func tcpRepairPlatformReason(ctx context.Context, request leafmobility.Preflight
 		platform.FeatureTCPRepairOptions,
 	}
 	for _, feature := range required {
-		evidence, ok := snapshot.Feature(feature)
+		evidence, ok := lookup(feature)
 		if !ok {
 			return leafmobility.ReasonStateAPIIncomplete
 		}
@@ -287,7 +349,15 @@ func tcpRepairPlatformReason(ctx context.Context, request leafmobility.Preflight
 			return leafmobility.ReasonStateAPIIncomplete
 		}
 	}
-	transparent, ok := snapshot.Feature(platform.FeatureTransparentBindV4)
+	transparentFeature := platform.FeatureTransparentBindV4
+	switch family {
+	case tcpRepairAddressFamilyIPv4:
+	case tcpRepairAddressFamilyIPv6:
+		transparentFeature = platform.FeatureTransparentBindV6
+	default:
+		return leafmobility.ReasonStateAPIIncomplete
+	}
+	transparent, ok := lookup(transparentFeature)
 	if !ok || transparent.State != platform.FeatureAvailable {
 		return leafmobility.ReasonTransparentBindUnavailable
 	}
@@ -602,14 +672,15 @@ func (attempt *tcpRepairAttempt) Stage(
 		if restoreErr != nil {
 			return restoreErr
 		}
+		attempt.replacement = replacement
 		if attempt.routeObservation.migration != ([sha256.Size]byte{}) {
 			replacementRoute, routeErr := attempt.driver.observeRoute(operationCtx, replacement, attempt.routeFlow)
 			if routeErr != nil || !sameRouteObservation(replacementRoute, attempt.routeObservation) {
-				_ = replacement.Close()
-				return errors.Join(errors.New("tcp: replacement route changed after restore"), routeErr)
+				discardErr := attempt.discardReplacement()
+				attempt.replacementDiscarding = discardErr != nil && attempt.replacement != nil
+				return errors.Join(errors.New("tcp: replacement route changed after restore"), routeErr, discardErr)
 			}
 		}
-		attempt.replacement = replacement
 		return nil
 	})
 	if err != nil {

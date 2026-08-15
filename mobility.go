@@ -37,6 +37,13 @@ const (
 	MobilityReasonRouteSourceChanged             MobilityReason = "route_source_changed"
 	MobilityReasonRouteSourceUnavailable         MobilityReason = "route_source_unavailable"
 	MobilityReasonRouteSourceRestored            MobilityReason = "route_source_restored"
+	MobilityReasonLinkUnresponsive               MobilityReason = "link_unresponsive"
+	MobilityReasonLocalReadFailure               MobilityReason = "local_read_failure"
+	MobilityReasonLocalWriteFailure              MobilityReason = "local_write_failure"
+	MobilityReasonOuterMTUFailure                MobilityReason = "outer_mtu_failure"
+	MobilityReasonReplayStalled                  MobilityReason = "replay_stalled"
+	MobilityReasonReplayFailure                  MobilityReason = "replay_failure"
+	MobilityReasonLivenessProbeFailure           MobilityReason = "liveness_probe_failure"
 	MobilityReasonAttemptFailedSafely            MobilityReason = "attempt_failed_safely"
 	MobilityReasonPeerRejected                   MobilityReason = "peer_rejected"
 	MobilityReasonEventBudgetExpired             MobilityReason = "event_budget_expired"
@@ -75,6 +82,11 @@ type MobilityStatus struct {
 	ObservedAt         time.Time
 	UpdatedAt          time.Time
 	ExpiresAt          time.Time
+	// Negotiated is the specialized transaction family both peers agreed they
+	// can participate in for this owned leaf. It is not a factual migration
+	// plan: ID remains redial_attach until fresh endpoint preflight and peer
+	// agreement select the specialized operation for one exact transaction.
+	Negotiated MobilityID
 }
 
 func planLeafMobility(_ CarrierFamily, owned ...leafmobility.Facts) MobilityStatus {
@@ -125,6 +137,10 @@ func projectLeafMobility(snapshot engine.LeafMobilitySnapshot) MobilityStatus {
 		if !sourceCurrent {
 			return baseline
 		}
+		if operation := mobilityIDForOperation(snapshot.Facts.Operations); operation != "" {
+			baseline.Negotiated = operation
+			baseline.Fallback = MobilityRedialAttach
+		}
 		baseline.Reason = MobilityReasonAwaitingFactualChange
 		baseline.UpdatedAt = observation.UpdatedAt
 		return baseline
@@ -132,6 +148,10 @@ func projectLeafMobility(snapshot engine.LeafMobilitySnapshot) MobilityStatus {
 	if observation.Phase == engine.LeafMobilityInitiatorSubscriptionUnavailable {
 		if !sourceCurrent {
 			return baseline
+		}
+		if operation := mobilityIDForOperation(snapshot.Facts.Operations); operation != "" {
+			baseline.Negotiated = operation
+			baseline.Fallback = MobilityRedialAttach
 		}
 		baseline.State = MobilityStateSubscriptionUnavailable
 		baseline.Reason = MobilityReasonRefreshSubscriptionUnavailable
@@ -162,12 +182,27 @@ func projectLeafMobility(snapshot engine.LeafMobilitySnapshot) MobilityStatus {
 		ObservedAt:         observation.ObservedAt,
 		UpdatedAt:          observation.UpdatedAt,
 		ExpiresAt:          observation.Deadline,
+		Negotiated:         mobilityIDForOperation(snapshot.Facts.Operations),
 	}
 	switch observation.EvidenceReason {
 	case leafmobility.RefreshReasonRouteSourceUnavailable:
 		projected.Reason = MobilityReasonRouteSourceUnavailable
 	case leafmobility.RefreshReasonRouteSourceRestored:
 		projected.Reason = MobilityReasonRouteSourceRestored
+	case leafmobility.RefreshReasonLinkUnresponsive:
+		projected.Reason = MobilityReasonLinkUnresponsive
+	case leafmobility.RefreshReasonLocalReadFailure:
+		projected.Reason = MobilityReasonLocalReadFailure
+	case leafmobility.RefreshReasonLocalWriteFailure:
+		projected.Reason = MobilityReasonLocalWriteFailure
+	case leafmobility.RefreshReasonOuterMTUFailure:
+		projected.Reason = MobilityReasonOuterMTUFailure
+	case leafmobility.RefreshReasonReplayStalled:
+		projected.Reason = MobilityReasonReplayStalled
+	case leafmobility.RefreshReasonReplayFailure:
+		projected.Reason = MobilityReasonReplayFailure
+	case leafmobility.RefreshReasonLivenessProbeFailure:
+		projected.Reason = MobilityReasonLivenessProbeFailure
 	}
 	if operation := mobilityIDForOperation(observation.Operation); operation != "" {
 		projected.ID = operation

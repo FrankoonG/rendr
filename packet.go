@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +25,6 @@ import (
 // proto.CapsPacketMode.
 type enginePacketConn struct {
 	e           *engine.Engine
-	mode        atomic.Uint32
 	peak        *peakTransferController
 	status      *pathStatusTracker
 	resolver    *pathFactoryResolver
@@ -33,18 +33,16 @@ type enginePacketConn struct {
 	recovery    *pathRecoverySupervisor
 	localStatus func() LocalStatus
 
-	lAddr   net.Addr
-	rAddr   net.Addr
-	closing atomic.Bool
+	lAddr     net.Addr
+	rAddr     net.Addr
+	closing   atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func newEnginePacketConn(e *engine.Engine, mode Mode, lAddr, rAddr net.Addr) *enginePacketConn {
+func newEnginePacketConn(e *engine.Engine, lAddr, rAddr net.Addr) *enginePacketConn {
 	pc := &enginePacketConn{e: e, lAddr: lAddr, rAddr: rAddr}
-	pc.mode.Store(uint32(mode))
-	if kind, ok := mode.executionKind(); ok {
-		_ = e.ConfigureExecution(kind)
-	}
-	e.StartSelector(nil, 0)
+	e.StartSelector(0)
 	return pc
 }
 
@@ -57,15 +55,17 @@ func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if n != len(pkt) {
 		return n, c.rAddr, io.ErrShortBuffer
 	}
-	if n > 0 && c.peak != nil {
-		c.peak.observeRead(n)
-	}
 	return n, c.rAddr, nil
 }
 
 // WriteTo ignores addr - rendr has only one peer per flow_id. Returns
-// ErrPacketTooLarge if len(p) > engine.MaxPayload.
+// ErrPacketTooLarge if p plus the session framing envelope exceeds the
+// engine or carrier frame budget.
 func (c *enginePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return c.writePacket(p)
+}
+
+func (c *enginePacketConn) writePacket(p []byte) (int, error) {
 	published, err := c.e.SendPacketAcceptedResult(p)
 	if err != nil {
 		if published {
@@ -73,22 +73,31 @@ func (c *enginePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		}
 		return 0, err
 	}
-	if c.peak != nil {
-		c.peak.observeWrite(len(p))
-	}
 	return len(p), nil
 }
 
 func (c *enginePacketConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.shutdown(true) })
+	return c.closeErr
+}
+
+func (c *enginePacketConn) abortDial() {
+	c.closeOnce.Do(func() { c.closeErr = c.shutdown(true) })
+}
+
+func (c *enginePacketConn) shutdown(graceful bool) error {
+	c.closing.Store(true)
+	c.e.BeginGracefulClose()
 	if c.peak != nil {
 		c.peak.stopLoop()
 	}
-	c.closing.Store(true)
-	c.e.BeginGracefulClose()
 	if c.recovery != nil {
 		c.recovery.stop()
 	}
-	return c.e.GracefulClose(proto.ByeNormal)
+	if graceful {
+		return c.e.GracefulClose(proto.ByeNormal)
+	}
+	return c.e.Close()
 }
 
 func (c *enginePacketConn) LocalAddr() net.Addr { return c.lAddr }
@@ -110,31 +119,45 @@ func (c *enginePacketConn) Status() Status {
 	if c.localStatus != nil {
 		local = c.localStatus()
 	}
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers, local)
+	status := statusFromEngine(c.e, c.status, c.carriers, local)
+	if c.peak != nil {
+		status.Issues = c.peak.statusIssues()
+	}
+	return status
 }
 
-func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
-	c.peak = newPeakTransferController(c.e, func(m Mode) {
-		c.mode.Store(uint32(m))
-	}, plan, pathIDs)
-	c.peak.start()
+func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) error {
+	c.peak = newPeakTransferController(c.e, plan, pathIDs)
+	if err := c.peak.start(); err != nil {
+		c.peak.stopLoop()
+		return err
+	}
+	return nil
 }
 
 // Optional control and observation methods mirror stream-mode connections.
 // Applications assert only the narrow interface they need.
-func (c *enginePacketConn) Migrate(id uint32) error { return c.e.Migrate(id) }
-func (c *enginePacketConn) ActivePath() uint32      { return c.e.ActivePath() }
-func (c *enginePacketConn) State() string           { return c.e.State().String() }
-func (c *enginePacketConn) RecvQueueHWM() int       { return c.e.RecvQueueHighWaterMark() }
-func (c *enginePacketConn) RecvDups() uint64        { return c.e.RecvDups() }
-func (c *enginePacketConn) BondStuckSkips() uint64  { return c.e.BondStuckSkips() }
-func (c *enginePacketConn) MigrationCount() uint64  { return c.e.MigrationCount() }
+func (c *enginePacketConn) SelectTarget(selectorName, targetName string) error {
+	selectorID, targetID, err := c.graph.resolveSelectorChild(selectorName, targetName)
+	if err != nil && len(c.graph.manifest.Nodes) == 0 {
+		selectorID, targetID, err = resolveSelectorChild(c.e.LocalGraphManifest(), selectorName, targetName)
+	}
+	if err != nil {
+		return err
+	}
+	return c.e.SelectExplicitTarget(selectorID, targetID, "explicit")
+}
+func (c *enginePacketConn) ActivePath() uint32     { return c.e.ActivePath() }
+func (c *enginePacketConn) State() string          { return c.e.State().String() }
+func (c *enginePacketConn) RecvQueueHWM() int      { return c.e.RecvQueueHighWaterMark() }
+func (c *enginePacketConn) RecvDups() uint64       { return c.e.RecvDups() }
+func (c *enginePacketConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips() }
+func (c *enginePacketConn) MigrationCount() uint64 { return c.e.MigrationCount() }
 
 // OnMigrate registers a callback fired on every committed migration.
 func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
 }
-func (c *enginePacketConn) Mode() Mode                 { return Mode(c.mode.Load()) }
 func (c *enginePacketConn) RemovePath(id uint32) error { return c.e.RemovePath(id) }
 
 // AddPath dials through the session-bound factory resolver and attaches a
@@ -185,22 +208,8 @@ func (c *enginePacketConn) startPathRecovery(desired []PathSpec, retry retryPoli
 	c.recovery = newPathRecoverySupervisor(c.e, c.resolver, c.addPath, desired, c.status, retry)
 }
 
-// Stats returns the same coherent snapshot as stream-mode Conn.
+// Stats uses the same topology/replay/root coherence boundary as stream mode;
+// monotonic transport counters are point observations.
 func (c *enginePacketConn) Stats() ConnStats {
-	topology := c.e.TopologySnapshot()
-	return ConnStats{
-		FlowID:         c.e.FlowID(),
-		State:          topology.State.String(),
-		Mode:           Mode(c.mode.Load()),
-		ActivePath:     topology.ActivePath,
-		Paths:          topology.Paths,
-		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
-		RecvDups:       c.e.RecvDups(),
-		BondStuckSkips: c.e.BondStuckSkips(),
-		MigrationCount: topology.MigrationCount,
-		CreatedAt:      c.e.CreatedAt(),
-		PeerCaps:       c.e.PeerCaps(),
-		PeerInstanceID: c.e.PeerInstanceID(),
-		TXReplay:       replayStatsFromEngine(c.e.ReplayStats()),
-	}
+	return connStatsFromEngine(c.e)
 }

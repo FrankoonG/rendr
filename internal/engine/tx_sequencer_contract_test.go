@@ -189,6 +189,14 @@ func attachSequencerPair(t *testing.T, client, server *Engine, c, s *sequencerTe
 	return id, serverID
 }
 
+func attachSequencerPairBound(t *testing.T, client, server *Engine, c, s *sequencerTestPath, name string, targetID proto.TargetID) (uint32, uint32) {
+	t.Helper()
+	spec := transport.PathSpec{Transport: "memory", Address: name}
+	id := attachFixturePath(t, client, c, spec, targetID)
+	serverID := attachFixturePath(t, server, s, spec, targetID)
+	return id, serverID
+}
+
 func TestTXSequenceOwnedBeforePathWrite(t *testing.T) {
 	// The callback-inside-successful-Write edge is deliberately synthetic: it
 	// proves TX journal linearization only. Real carrier failure detection and
@@ -198,12 +206,13 @@ func TestTXSequenceOwnedBeforePathWrite(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "fails-inside-write", "survivor")
 
 	c1, s1 := newSequencerTestPathPair()
 	c2, s2 := newSequencerTestPathPair()
 	c1.dieFirstWrite.Store(true)
-	attachSequencerPair(t, client, server, c1, s1, "fails-inside-write")
-	attachSequencerPair(t, client, server, c2, s2, "survivor")
+	attachSequencerPairBound(t, client, server, c1, s1, "fails-inside-write", targets["fails-inside-write"])
+	attachSequencerPairBound(t, client, server, c2, s2, "survivor", targets["survivor"])
 
 	want := []byte("journal-before-publish:later-frame")
 	if _, err := client.SendData(want[:len("journal-before-publish:")]); err != nil {
@@ -231,13 +240,14 @@ func TestTXFinalFrameLinearizesAfterConcurrentWrite(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "blocked-writer")
 
 	c, s := newSequencerTestPathPair()
 	started := make(chan struct{})
 	gate := make(chan struct{})
 	c.writeStarted = started
 	c.writeGate = gate
-	attachSequencerPair(t, client, server, c, s, "blocked-writer")
+	attachSequencerPairBound(t, client, server, c, s, "blocked-writer", targets["blocked-writer"])
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -286,13 +296,14 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "blackhole", "survivor")
 
 	c1, s1 := newSequencerTestPathPair()
 	c2, s2 := newSequencerTestPathPair()
 	c1.dropWrites.Store(true)
 	s2.dropWrites.Store(true)
-	deadID, serverDeadID := attachSequencerPair(t, client, server, c1, s1, "blackhole")
-	attachSequencerPair(t, client, server, c2, s2, "survivor")
+	deadID, serverDeadID := attachSequencerPairBound(t, client, server, c1, s1, "blackhole", targets["blackhole"])
+	attachSequencerPairBound(t, client, server, c2, s2, "survivor", targets["survivor"])
 
 	const frames = sendHistoryWindow + 64
 	want := bytes.Repeat([]byte{'x'}, frames)
@@ -373,12 +384,13 @@ func TestPacketGapCannotStrandFinalControlFrame(t *testing.T) {
 	server.SetPacketMode()
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "packet-blackhole", "packet-survivor")
 
 	c1, s1 := newSequencerTestPathPair()
 	c2, s2 := newSequencerTestPathPair()
 	c1.dropWrites.Store(true)
-	deadID, serverDeadID := attachSequencerPair(t, client, server, c1, s1, "packet-blackhole")
-	attachSequencerPair(t, client, server, c2, s2, "packet-survivor")
+	deadID, serverDeadID := attachSequencerPairBound(t, client, server, c1, s1, "packet-blackhole", targets["packet-blackhole"])
+	attachSequencerPairBound(t, client, server, c2, s2, "packet-survivor", targets["packet-survivor"])
 
 	want := []byte("packet-before-final")
 	if err := client.SendPacket(want); err != nil {
@@ -416,10 +428,11 @@ func TestGracefulCloseRepeatsTerminalAckAfterLoss(t *testing.T) {
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "terminal-ack-loss")
 
 	clientPath, serverPath := newSequencerTestPathPair()
 	serverPath.dropFirstAck.Store(true)
-	attachSequencerPair(t, client, server, clientPath, serverPath, "terminal-ack-loss")
+	attachSequencerPairBound(t, client, server, clientPath, serverPath, "terminal-ack-loss", targets["terminal-ack-loss"])
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.GracefulClose(proto.ByeNormal) }()
@@ -455,15 +468,14 @@ func TestTerminalAckRetryUsesPathAttachedAfterInitialSnapshot(t *testing.T) {
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "terminal-ack-stale-snapshot", "terminal-ack-successor")
 
 	clientPath1, serverPath1 := newSequencerTestPathPair()
 	serverPath1.dropAcks.Store(true)
-	attachSequencerPair(t, client, server, clientPath1, serverPath1, "terminal-ack-stale-snapshot")
+	attachSequencerPairBound(t, client, server, clientPath1, serverPath1, "terminal-ack-stale-snapshot", targets["terminal-ack-stale-snapshot"])
 
 	clientPath2, serverPath2 := newSequencerTestPathPair()
-	if _, err := client.AttachPath(clientPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}); err != nil {
-		t.Fatalf("attach client successor: %v", err)
-	}
+	attachFixturePath(t, client, clientPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}, targets["terminal-ack-successor"])
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.GracefulClose(proto.ByeNormal) }()
@@ -476,9 +488,7 @@ func TestTerminalAckRetryUsesPathAttachedAfterInitialSnapshot(t *testing.T) {
 	if serverPath1.ackWrites.Load() == 0 {
 		t.Fatal("test did not attempt the terminal ACK on the original path")
 	}
-	if _, err := server.AttachPath(serverPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}); err != nil {
-		t.Fatalf("attach server successor after terminal ACK snapshot: %v", err)
-	}
+	attachFixturePath(t, server, serverPath2, transport.PathSpec{Transport: "memory", Address: "terminal-ack-successor"}, targets["terminal-ack-successor"])
 
 	select {
 	case err := <-closeDone:

@@ -8,14 +8,14 @@ import (
 )
 
 const (
-	PolicyTransactionWireVersion uint8 = 1
+	PolicyTransactionWireVersion uint8 = 3
 	PolicyMaxCauseBytes                = 256
 	PolicyMaxReasonBytes               = 512
 
 	PolicyTransactionBindingSize = 80
 	PolicyPrepareHeaderSize      = 136
-	PolicyAckHeaderSize          = 176
-	PolicyCommitSize             = 136
+	PolicyAckHeaderSize          = 224
+	PolicyCommitSize             = 168
 )
 
 var policyTransactionMagic = [4]byte{'R', 'P', 'T', 'X'}
@@ -60,12 +60,15 @@ func (b PolicyTransactionBinding) Validate() error {
 type PolicyAction uint8
 
 const (
-	PolicyActionInvalid     PolicyAction = 0
-	PolicyActionSelectChild PolicyAction = 1
+	PolicyActionInvalid          PolicyAction = 0
+	PolicyActionSelectChild      PolicyAction = 1
+	PolicyActionSelectBestNormal PolicyAction = 2
+	PolicyActionSelectBestPeak   PolicyAction = 3
 )
 
 type PolicyProposalDigest [32]byte
 type PolicyReservationID [16]byte
+type PolicyCommitChallenge [32]byte
 
 // PolicyPrepare asks the sender owner to reserve generation base+1 for one
 // selector immediate-child change. It does not alter dispatch by itself.
@@ -129,11 +132,20 @@ func (p PolicyPrepare) validate() error {
 	if err := p.PolicyTransactionBinding.Validate(); err != nil {
 		return err
 	}
-	if p.Action != PolicyActionSelectChild {
-		return fmt.Errorf("proto: policy prepare has invalid action %d", p.Action)
+	if p.SelectorID == (TargetID{}) {
+		return fmt.Errorf("proto: policy prepare has zero selector id")
 	}
-	if p.SelectorID == (TargetID{}) || p.TargetID == (TargetID{}) {
-		return fmt.Errorf("proto: policy prepare has zero selector or target id")
+	switch p.Action {
+	case PolicyActionSelectChild:
+		if p.TargetID == (TargetID{}) {
+			return fmt.Errorf("proto: select-child policy prepare has zero target id")
+		}
+	case PolicyActionSelectBestNormal, PolicyActionSelectBestPeak:
+		if p.TargetID != (TargetID{}) {
+			return fmt.Errorf("proto: selector-class policy prepare must not carry a target id")
+		}
+	default:
+		return fmt.Errorf("proto: policy prepare has invalid action %d", p.Action)
 	}
 	if len(p.Cause) > PolicyMaxCauseBytes || !utf8.ValidString(p.Cause) {
 		return fmt.Errorf("proto: policy prepare cause is invalid or exceeds %d bytes", PolicyMaxCauseBytes)
@@ -150,7 +162,7 @@ func (p PolicyPrepare) ProposalDigest() (PolicyProposalDigest, error) {
 		return PolicyProposalDigest{}, err
 	}
 	h := sha256.New()
-	h.Write([]byte("rendr-policy-proposal-v1\x00"))
+	h.Write([]byte("rendr-policy-proposal-v3\x00"))
 	h.Write(wire)
 	var digest PolicyProposalDigest
 	copy(digest[:], h.Sum(nil))
@@ -183,8 +195,10 @@ type PolicyAck struct {
 	Generation        uint64
 	CurrentGeneration uint64
 	CurrentTargetID   TargetID
+	ResolvedTargetID  TargetID
 	ProposalDigest    PolicyProposalDigest
 	ReservationID     PolicyReservationID
+	CommitChallenge   PolicyCommitChallenge
 	Reason            string
 }
 
@@ -201,9 +215,11 @@ func (p PolicyAck) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint64(b[88:96], p.Generation)
 	binary.BigEndian.PutUint64(b[96:104], p.CurrentGeneration)
 	copy(b[104:120], p.CurrentTargetID[:])
-	copy(b[120:152], p.ProposalDigest[:])
-	copy(b[152:168], p.ReservationID[:])
-	binary.BigEndian.PutUint16(b[168:170], uint16(len(p.Reason)))
+	copy(b[120:136], p.ResolvedTargetID[:])
+	copy(b[136:168], p.ProposalDigest[:])
+	copy(b[168:184], p.ReservationID[:])
+	copy(b[184:216], p.CommitChallenge[:])
+	binary.BigEndian.PutUint16(b[216:218], uint16(len(p.Reason)))
 	copy(b[PolicyAckHeaderSize:], p.Reason)
 	return b, nil
 }
@@ -216,10 +232,10 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 	if err != nil {
 		return PolicyAck{}, err
 	}
-	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[170:172]) != 0 || binary.BigEndian.Uint32(wire[172:176]) != 0 {
+	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[218:220]) != 0 || binary.BigEndian.Uint32(wire[220:224]) != 0 {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reserved bytes must be zero")
 	}
-	reasonLen := int(binary.BigEndian.Uint16(wire[168:170]))
+	reasonLen := int(binary.BigEndian.Uint16(wire[216:218]))
 	if reasonLen > PolicyMaxReasonBytes || len(wire)-PolicyAckHeaderSize != reasonLen {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reason length %d does not match payload", reasonLen)
 	}
@@ -232,8 +248,10 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 		Reason:                   string(wire[PolicyAckHeaderSize:]),
 	}
 	copy(p.CurrentTargetID[:], wire[104:120])
-	copy(p.ProposalDigest[:], wire[120:152])
-	copy(p.ReservationID[:], wire[152:168])
+	copy(p.ResolvedTargetID[:], wire[120:136])
+	copy(p.ProposalDigest[:], wire[136:168])
+	copy(p.ReservationID[:], wire[168:184])
+	copy(p.CommitChallenge[:], wire[184:216])
 	if err := p.validate(); err != nil {
 		return PolicyAck{}, err
 	}
@@ -253,11 +271,23 @@ func (p PolicyAck) validate() error {
 	if p.Code == PolicyAckCodeAccept && p.Generation == 0 {
 		return fmt.Errorf("proto: accepted policy ack has zero generation")
 	}
+	if p.Code == PolicyAckCodeAccept && p.ResolvedTargetID == (TargetID{}) {
+		return fmt.Errorf("proto: accepted policy ack has zero resolved target id")
+	}
+	if p.Code != PolicyAckCodeAccept && p.ResolvedTargetID != (TargetID{}) {
+		return fmt.Errorf("proto: rejected policy ack must not carry a resolved target id")
+	}
 	if p.ProposalDigest == (PolicyProposalDigest{}) {
 		return fmt.Errorf("proto: policy ack has zero proposal digest")
 	}
 	if p.Code == PolicyAckCodeAccept && p.ReservationID == (PolicyReservationID{}) {
 		return fmt.Errorf("proto: accepted policy ack has zero reservation id")
+	}
+	if p.Phase == PolicyAckPhasePrepare && p.CommitChallenge != (PolicyCommitChallenge{}) {
+		return fmt.Errorf("proto: prepare policy ack carries a commit challenge")
+	}
+	if p.Phase == PolicyAckPhaseFinal && p.CommitChallenge == (PolicyCommitChallenge{}) {
+		return fmt.Errorf("proto: final policy ack has zero commit challenge")
 	}
 	if len(p.Reason) > PolicyMaxReasonBytes || !utf8.ValidString(p.Reason) {
 		return fmt.Errorf("proto: policy ack reason is invalid or exceeds %d bytes", PolicyMaxReasonBytes)
@@ -273,9 +303,10 @@ func (p PolicyAck) validate() error {
 
 type PolicyCommit struct {
 	PolicyTransactionBinding
-	Generation     uint64
-	ProposalDigest PolicyProposalDigest
-	ReservationID  PolicyReservationID
+	Generation      uint64
+	ProposalDigest  PolicyProposalDigest
+	ReservationID   PolicyReservationID
+	CommitChallenge PolicyCommitChallenge
 }
 
 func (p PolicyCommit) Encode() ([]byte, error) {
@@ -288,6 +319,9 @@ func (p PolicyCommit) Encode() ([]byte, error) {
 	if p.ReservationID == (PolicyReservationID{}) {
 		return nil, fmt.Errorf("proto: policy commit has zero reservation id")
 	}
+	if p.CommitChallenge == (PolicyCommitChallenge{}) {
+		return nil, fmt.Errorf("proto: policy commit has zero challenge")
+	}
 	b, err := encodePolicyTransactionBinding(p.PolicyTransactionBinding, policyTransactionCommit)
 	if err != nil {
 		return nil, err
@@ -295,9 +329,11 @@ func (p PolicyCommit) Encode() ([]byte, error) {
 	b = append(b, make([]byte, 8)...)
 	b = append(b, make([]byte, 32)...)
 	b = append(b, make([]byte, 16)...)
+	b = append(b, make([]byte, 32)...)
 	binary.BigEndian.PutUint64(b[80:88], p.Generation)
 	copy(b[88:120], p.ProposalDigest[:])
 	copy(b[120:136], p.ReservationID[:])
+	copy(b[136:168], p.CommitChallenge[:])
 	return b, nil
 }
 
@@ -312,6 +348,7 @@ func DecodePolicyCommit(wire []byte) (PolicyCommit, error) {
 	p := PolicyCommit{PolicyTransactionBinding: binding, Generation: binary.BigEndian.Uint64(wire[80:88])}
 	copy(p.ProposalDigest[:], wire[88:120])
 	copy(p.ReservationID[:], wire[120:136])
+	copy(p.CommitChallenge[:], wire[136:168])
 	if p.Generation == 0 {
 		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero generation")
 	}
@@ -320,6 +357,9 @@ func DecodePolicyCommit(wire []byte) (PolicyCommit, error) {
 	}
 	if p.ReservationID == (PolicyReservationID{}) {
 		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero reservation id")
+	}
+	if p.CommitChallenge == (PolicyCommitChallenge{}) {
+		return PolicyCommit{}, fmt.Errorf("proto: policy commit has zero challenge")
 	}
 	return p, nil
 }

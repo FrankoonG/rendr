@@ -585,6 +585,7 @@ type linkOwner struct {
 	cleanupOnce            sync.Once
 	admissionTimer         *time.Timer
 	wireFault              bool
+	wireFaultReason        leafmobility.RefreshReason
 	mtuRecovery            *outerMTURecoveryEpisode
 	mtuRecoveryBudget      time.Duration
 	terminalErr            error
@@ -673,7 +674,6 @@ func newLinkOwnerWithReplayBudget(
 	}
 	owner.wires[active] = struct{}{}
 	owner.openCandidate = owner.openUDPCandidate
-	owner.openWire = listenOuterUDPWire
 	owner.observeRoute = observeUDPRouteForWire
 	return owner, nil
 }
@@ -862,7 +862,7 @@ func (owner *linkOwner) onWireReadError(wire *packetWire, err error) {
 	active := !owner.closed && owner.active == wire
 	owner.mu.Unlock()
 	if active && !errors.Is(err, net.ErrClosed) {
-		if !owner.publishWireFailure() {
+		if !owner.publishWireFailure(leafmobility.RefreshReasonLocalReadFailure) {
 			owner.failClosed(err)
 		}
 	}
@@ -956,7 +956,11 @@ func (owner *linkOwner) sendPacket(packet []byte) error {
 		if errors.Is(writeErr, ErrOuterMTU) {
 			recovery = owner.noteOuterMTUFailure(writeErr)
 		}
-		if !owner.publishWireFailure() {
+		faultReason := leafmobility.RefreshReasonLocalWriteFailure
+		if recovery != nil {
+			faultReason = leafmobility.RefreshReasonOuterMTUFailure
+		}
+		if !owner.publishWireFailure(faultReason) {
 			go owner.failClosed(writeErr)
 			return writeErr
 		}
@@ -1833,6 +1837,7 @@ func (owner *linkOwner) handlePathCommit(wire *packetWire, remote net.Addr, fram
 			// earlier one-way blackhole fault suppresses liveness and replay
 			// after the peer has already recovered.
 			owner.wireFault = false
+			owner.wireFaultReason = leafmobility.RefreshReasonInvalid
 			owner.resetLivenessLocked(now)
 			valid, _ := owner.observePeerReceiveNextLocked(control.ReceiveNext)
 			if valid {
@@ -1944,7 +1949,7 @@ func (owner *linkOwner) failReplayStall() {
 	if owner == nil {
 		return
 	}
-	if !owner.publishWireFailure() {
+	if !owner.publishWireFailure(leafmobility.RefreshReasonReplayStalled) {
 		owner.failClosed(errPacketReplayStalled)
 	}
 }
@@ -2953,10 +2958,12 @@ func (owner *linkOwner) openUDPCandidate(
 		return nil, routeObservation{}, fmt.Errorf("gvisor: preserve packet-link bind intent: %w", err)
 	}
 	openWire := owner.openWire
-	if openWire == nil {
-		openWire = listenOuterUDPWire
+	var candidate *packetWire
+	if openWire != nil {
+		candidate, err = openWire(mode, local, false)
+	} else {
+		candidate, err = platformOpenOuterSuccessorWire(ctx, active, mode, local)
 	}
-	candidate, err := openWire(mode, local, false)
 	if err != nil {
 		return nil, routeObservation{}, fmt.Errorf("gvisor: open packet-link successor: %w", err)
 	}
@@ -3215,7 +3222,7 @@ func (owner *linkOwner) probeLiveness(ctx context.Context) {
 	}
 	if now.Sub(owner.livenessLastAck) >= outerLivenessFailure && len(owner.replayPackets) != 0 {
 		owner.mu.Unlock()
-		if !owner.publishWireFailure() {
+		if !owner.publishWireFailure(leafmobility.RefreshReasonLinkUnresponsive) {
 			owner.failClosed(errPacketLivenessTimeout)
 		}
 		return
@@ -3242,7 +3249,7 @@ func (owner *linkOwner) probeLiveness(ctx context.Context) {
 
 	nonce, err := newLinkNonce()
 	if err != nil {
-		owner.publishWireFailure()
+		owner.publishWireFailure(leafmobility.RefreshReasonLivenessProbeFailure)
 		return
 	}
 	owner.mu.Lock()
@@ -3261,7 +3268,7 @@ func (owner *linkOwner) probeLiveness(ctx context.Context) {
 		owner.mu.Lock()
 		delete(owner.livenessPending, nonce)
 		owner.mu.Unlock()
-		owner.publishWireFailure()
+		owner.publishWireFailure(leafmobility.RefreshReasonLocalWriteFailure)
 	}
 }
 
@@ -3417,7 +3424,11 @@ func (owner *linkOwner) dataAckLoop() {
 		case <-owner.dataAckWake:
 			if err := owner.sendDataAck(owner.lifetimeCtx); err != nil && !errors.Is(err, context.Canceled) &&
 				!errors.Is(err, net.ErrClosed) {
-				if !owner.publishWireFailure() {
+				faultReason := leafmobility.RefreshReasonLocalWriteFailure
+				if errors.Is(err, ErrOuterMTU) {
+					faultReason = leafmobility.RefreshReasonOuterMTUFailure
+				}
+				if !owner.publishWireFailure(faultReason) {
 					owner.failClosed(err)
 				}
 			}
@@ -3473,7 +3484,11 @@ func (owner *linkOwner) dataReplayLoop() {
 		case <-owner.dataReplayWake:
 			if err := owner.replayOnCurrent(owner.lifetimeCtx); err != nil && !errors.Is(err, context.Canceled) &&
 				!errors.Is(err, net.ErrClosed) {
-				if !owner.publishWireFailure() {
+				faultReason := leafmobility.RefreshReasonReplayFailure
+				if errors.Is(err, ErrOuterMTU) {
+					faultReason = leafmobility.RefreshReasonOuterMTUFailure
+				}
+				if !owner.publishWireFailure(faultReason) {
 					owner.failClosed(err)
 				}
 			}
@@ -3623,9 +3638,16 @@ func (owner *linkOwner) observeRefresh(ctx context.Context) bool {
 		return false
 	}
 	fault := owner.wireFault
+	faultReason := owner.wireFaultReason
 	base := owner.routeBaseline
 	sent := owner.refreshSent
-	if (fault || observation.digest != base) && observation.digest != sent {
+	if fault && observation.digest != sent {
+		owner.refreshSent = observation.digest
+		owner.mu.Unlock()
+		owner.refreshStateMu.Unlock()
+		return owner.emitRefresh(faultReason, snapshot)
+	}
+	if !fault && observation.digest != base && observation.digest != sent {
 		owner.refreshSent = observation.digest
 		owner.mu.Unlock()
 		owner.refreshStateMu.Unlock()
@@ -3655,9 +3677,23 @@ func (owner *linkOwner) refreshRouteSnapshotCurrentLocked(source outerRefreshRou
 		owner.incarnation == source.incarnation && addrEqualOnWire(source.active, owner.peerRemote, source.remote)
 }
 
-func (owner *linkOwner) publishWireFailure() bool {
+func (owner *linkOwner) publishWireFailure(reason leafmobility.RefreshReason) bool {
+	switch reason {
+	case leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonOuterMTUFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure:
+	default:
+		return false
+	}
 	owner.mu.Lock()
-	owner.wireFault = true
+	if !owner.wireFault {
+		owner.wireFault = true
+		owner.wireFaultReason = reason
+	}
 	owner.mu.Unlock()
 	owner.refreshMu.Lock()
 	available := owner.refreshEmitter != nil && owner.refreshFn != nil
@@ -3719,6 +3755,7 @@ func (owner *linkOwner) commitRefresh(evidence leafmobility.RefreshEvidence) err
 	owner.routeBaseline = digest
 	owner.refreshSent = [sha256.Size]byte{}
 	owner.wireFault = false
+	owner.wireFaultReason = leafmobility.RefreshReasonInvalid
 	owner.pendingRefresh = nil
 	owner.resetLivenessLocked(time.Now())
 	_, err := owner.refreshState.Update(digest)

@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +18,9 @@ type engineBackedConn struct {
 	e    *engine.Engine
 	conn *engine.Conn
 
-	mode        atomic.Uint32 // Mode
-	closing     atomic.Bool   // local-Close in flight; gates BYE send
+	closing     atomic.Bool // local-Close in flight; gates BYE send
+	closeOnce   sync.Once
+	closeErr    error
 	peak        *peakTransferController
 	status      *pathStatusTracker
 	resolver    *pathFactoryResolver
@@ -28,29 +30,17 @@ type engineBackedConn struct {
 	localStatus func() LocalStatus
 }
 
-func newEngineBackedConn(e *engine.Engine, c *engine.Conn, mode Mode) *engineBackedConn {
+func newEngineBackedConn(e *engine.Engine, c *engine.Conn) *engineBackedConn {
 	bc := &engineBackedConn{e: e, conn: c}
-	bc.mode.Store(uint32(mode))
-	if kind, ok := mode.executionKind(); ok {
-		_ = e.ConfigureExecution(kind)
-	}
-	e.StartSelector(nil, 0)
+	e.StartSelector(0)
 	return bc
 }
 
 func (c *engineBackedConn) Read(p []byte) (int, error) {
-	n, err := c.conn.Read(p)
-	if n > 0 && c.peak != nil {
-		c.peak.observeRead(n)
-	}
-	return n, err
+	return c.conn.Read(p)
 }
 func (c *engineBackedConn) Write(p []byte) (int, error) {
-	n, err := c.conn.Write(p)
-	if n > 0 && c.peak != nil {
-		c.peak.observeWrite(n)
-	}
-	return n, err
+	return c.conn.Write(p)
 }
 
 // CloseWrite half-closes the application stream. Callers may discover this
@@ -64,15 +54,27 @@ func (c *engineBackedConn) CloseWrite() error { return c.conn.CloseWrite() }
 // path is already dead the peer will see ordinary transport silence
 // up to its migration budget.
 func (c *engineBackedConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.shutdown(true) })
+	return c.closeErr
+}
+
+func (c *engineBackedConn) abortDial() {
+	c.closeOnce.Do(func() { c.closeErr = c.shutdown(true) })
+}
+
+func (c *engineBackedConn) shutdown(graceful bool) error {
+	c.closing.Store(true)
+	c.e.BeginGracefulClose()
 	if c.peak != nil {
 		c.peak.stopLoop()
 	}
-	c.closing.Store(true)
-	c.e.BeginGracefulClose()
 	if c.recovery != nil {
 		c.recovery.stop()
 	}
-	return c.e.GracefulClose(proto.ByeNormal)
+	if graceful {
+		return c.e.GracefulClose(proto.ByeNormal)
+	}
+	return c.e.Close()
 }
 func (c *engineBackedConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *engineBackedConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
@@ -92,19 +94,33 @@ func (c *engineBackedConn) Status() Status {
 	if c.localStatus != nil {
 		local = c.localStatus()
 	}
-	return statusFromEngine(c.e, Mode(c.mode.Load()), c.status, c.carriers, local)
+	status := statusFromEngine(c.e, c.status, c.carriers, local)
+	if c.peak != nil {
+		status.Issues = c.peak.statusIssues()
+	}
+	return status
 }
 
-func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) {
-	c.peak = newPeakTransferController(c.e, func(m Mode) {
-		c.mode.Store(uint32(m))
-	}, plan, pathIDs)
-	c.peak.start()
+func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) error {
+	c.peak = newPeakTransferController(c.e, plan, pathIDs)
+	if err := c.peak.start(); err != nil {
+		c.peak.stopLoop()
+		return err
+	}
+	return nil
 }
 
-// Migrate switches the active path to id. Embedders request it through the
-// narrow MigrationController interface.
-func (c *engineBackedConn) Migrate(id uint32) error { return c.e.Migrate(id) }
+// SelectTarget selects one immediate child of a selector in the frozen graph.
+func (c *engineBackedConn) SelectTarget(selectorName, targetName string) error {
+	selectorID, targetID, err := c.graph.resolveSelectorChild(selectorName, targetName)
+	if err != nil && len(c.graph.manifest.Nodes) == 0 {
+		selectorID, targetID, err = resolveSelectorChild(c.e.LocalGraphManifest(), selectorName, targetName)
+	}
+	if err != nil {
+		return err
+	}
+	return c.e.SelectExplicitTarget(selectorID, targetID, "explicit")
+}
 
 // ActivePath returns the currently-active path id.
 func (c *engineBackedConn) ActivePath() uint32 { return c.e.ActivePath() }
@@ -129,28 +145,34 @@ func (c *engineBackedConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
 }
 
-// Mode returns the current operational mode.
-func (c *engineBackedConn) Mode() Mode { return Mode(c.mode.Load()) }
-
-// Stats returns a coherent snapshot of the observable state.
-// Paths is filled from engine.Paths() which is taken under a read
-// lock, so the snapshot is consistent across the path set.
+// Stats binds topology, replay occupancy, and root-delivery evidence to one
+// physical topology epoch. Monotonic transport counters remain point
+// observations within that stable boundary.
 func (c *engineBackedConn) Stats() ConnStats {
-	topology := c.e.TopologySnapshot()
+	return connStatsFromEngine(c.e)
+}
+
+func connStatsFromEngine(e *engine.Engine) ConnStats {
+	if e == nil {
+		return ConnStats{}
+	}
+	observation := e.ConnectionObservation()
+	topology := observation.Topology
 	return ConnStats{
-		FlowID:         c.e.FlowID(),
+		FlowID:         e.FlowID(),
 		State:          topology.State.String(),
-		Mode:           Mode(c.mode.Load()),
 		ActivePath:     topology.ActivePath,
+		EffectivePaths: append([]uint32(nil), topology.EffectivePaths...),
 		Paths:          topology.Paths,
-		RecvQueueHWM:   c.e.RecvQueueHighWaterMark(),
-		RecvDups:       c.e.RecvDups(),
-		BondStuckSkips: c.e.BondStuckSkips(),
+		RecvQueueHWM:   observation.RecvQueueHWM,
+		RecvDups:       observation.RecvDups,
+		BondStuckSkips: observation.BondStuckSkips,
 		MigrationCount: topology.MigrationCount,
-		CreatedAt:      c.e.CreatedAt(),
-		PeerCaps:       c.e.PeerCaps(),
-		PeerInstanceID: c.e.PeerInstanceID(),
-		TXReplay:       replayStatsFromEngine(c.e.ReplayStats()),
+		CreatedAt:      e.CreatedAt(),
+		PeerCaps:       e.PeerCaps(),
+		PeerInstanceID: e.PeerInstanceID(),
+		TXReplay:       replayStatsFromEngine(observation.Replay),
+		RootDelivery:   rootDeliveryStatsFromSnapshot(observation.RootDelivery),
 	}
 }
 
@@ -162,6 +184,16 @@ func replayStatsFromEngine(stats engine.ReplayStats) ReplayStats {
 		PublishedNext: stats.PublishedNext, AckNext: stats.AckNext,
 		CreditWaiters: stats.CreditWaiters, BackpressureEvents: stats.BackpressureEvents,
 		Generation: stats.Generation,
+	}
+}
+
+func rootDeliveryStatsFromSnapshot(snapshot engine.TargetDeliverySnapshot) RootDeliveryStats {
+	return RootDeliveryStats{
+		TargetName: snapshot.TargetName, SelectorName: snapshot.SelectorName,
+		SelectorGeneration: snapshot.SelectorGeneration,
+		EvidenceEpoch:      snapshot.EvidenceEpoch, Attributable: snapshot.Attributable,
+		PublishedBytes: snapshot.PublishedBytes, AckedBytes: snapshot.AckedBytes,
+		DemandBytes: snapshot.DemandBytes,
 	}
 }
 

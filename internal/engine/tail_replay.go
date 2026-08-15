@@ -24,16 +24,27 @@ type tailReplayLease struct {
 	ackNext  uint64
 	due      time.Time
 	deadline time.Time
+	initial  time.Duration
+	maximum  time.Duration
 	backoff  time.Duration
 	armed    bool
 }
 
-func (e *Engine) tailReplayTiming() (time.Duration, time.Duration) {
+type tailReplayPublicationRoute struct {
+	targetID   proto.TargetID
+	pathID     uint32
+	generation uint64
+	delay      time.Duration
+	recorded   bool
+}
+
+func (e *Engine) tailReplayTiming(target uint64) (time.Duration, time.Duration) {
 	initial := e.tailReplayInitialDelay
 	if initial <= 0 {
 		initial = defaultTailReplayInitialDelay
 	}
-	if observed := e.tailReplayObservedDelay(); observed > initial {
+	if route, ok := e.tailReplayPublicationRoute(target); ok && route.delay > initial {
+		observed := route.delay
 		initial = observed
 	}
 	maximum := e.tailReplayMaxBackoff
@@ -43,41 +54,85 @@ func (e *Engine) tailReplayTiming() (time.Duration, time.Duration) {
 	return initial, maximum
 }
 
-func (e *Engine) tailReplayObservedDelay() time.Duration {
-	mode := e.mode.Load()
-	e.pathsMu.RLock()
-	slots := make([]*pathSlot, 0, len(e.paths))
-	for id, slot := range e.paths {
-		if mode == dispatchSelector && id != e.activeID {
-			continue
-		}
-		if mode != dispatchSelector && len(e.dispatchScope) != 0 && !e.dispatchScope[id] {
-			continue
-		}
-		slots = append(slots, slot)
+func (e *Engine) noteTailReplayPublication(frame []byte, slot *pathSlot) {
+	if slot == nil || len(frame) < proto.HeaderSize {
+		return
 	}
-	e.pathsMu.RUnlock()
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		return
+	}
+	route := tailReplayPublicationRoute{
+		targetID: slot.localTXTargetID, pathID: slot.id, generation: slot.gen,
+		delay: boundedTailReplayQualityDelay(tailReplayProbeQuality(slot)), recorded: true,
+	}
+	e.sendHistMu.Lock()
+	entries := e.sendHist.entries
+	if len(entries) == 0 || header.Seq < entries[0].seq {
+		e.sendHistMu.Unlock()
+		return
+	}
+	offset := header.Seq - entries[0].seq
+	if offset >= uint64(len(entries)) || entries[offset].seq != header.Seq {
+		e.sendHistMu.Unlock()
+		return
+	}
+	current := &entries[offset].tailRoute
+	// Race publications can be accepted by more than one leaf. The earliest
+	// plausible ACK is the minimum observed delay. Unknown quality remains a
+	// valid route record and falls back to the configured default pacing.
+	changed := !current.recorded || (route.delay > 0 && (current.delay == 0 || route.delay < current.delay))
+	if changed {
+		*current = route
+	}
+	e.sendHistMu.Unlock()
+	if changed {
+		e.tightenTailReplayLease(header.Seq+1, route.delay)
+	}
+}
 
-	observed := time.Duration(0)
-	for _, slot := range slots {
-		delay := boundedTailReplayQualityDelay(tailReplayProbeQuality(slot))
-		if delay == 0 {
-			continue
-		}
-		if mode == dispatchRace {
-			if observed == 0 || delay < observed {
-				observed = delay
-			}
-			continue
-		}
-		// A bond frame may have used any eligible child, while a selector has
-		// exactly one active child. The conservative maximum prevents either
-		// mode from retransmitting before its healthy carrier can ACK.
-		if delay > observed {
-			observed = delay
+func (e *Engine) tightenTailReplayLease(target uint64, observed time.Duration) {
+	initial := e.tailReplayInitialDelay
+	if initial <= 0 {
+		initial = defaultTailReplayInitialDelay
+	}
+	if observed > initial {
+		initial = observed
+	}
+	maximum := e.tailReplayMaxBackoff
+	if maximum < initial {
+		maximum = initial
+	}
+	now := nowFn()
+	e.replayMu.Lock()
+	lease := &e.tailReplay
+	if lease.armed && lease.target == target && (lease.initial <= 0 || initial < lease.initial) {
+		lease.initial = initial
+		lease.maximum = maximum
+		lease.backoff = initial
+		if earlier := now.Add(initial); earlier.Before(lease.due) {
+			lease.due = earlier
 		}
 	}
-	return observed
+	e.replayMu.Unlock()
+}
+
+func (e *Engine) tailReplayPublicationRoute(target uint64) (tailReplayPublicationRoute, bool) {
+	if target == 0 {
+		return tailReplayPublicationRoute{}, false
+	}
+	seq := target - 1
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	entries := e.sendHist.entries
+	if len(entries) == 0 || seq < entries[0].seq {
+		return tailReplayPublicationRoute{}, false
+	}
+	offset := seq - entries[0].seq
+	if offset >= uint64(len(entries)) || entries[offset].seq != seq || !entries[offset].tailRoute.recorded {
+		return tailReplayPublicationRoute{}, false
+	}
+	return entries[offset].tailRoute, true
 }
 
 func tailReplayProbeQuality(slot *pathSlot) transport.PathQuality {
@@ -112,6 +167,22 @@ func boundedTailReplayQualityDelay(quality transport.PathQuality) time.Duration 
 	return delay
 }
 
+func tailReplayAttemptDue(now time.Time, delay time.Duration, deadline time.Time) time.Time {
+	due := now.Add(delay)
+	if due.Before(deadline) {
+		return due
+	}
+	// If pacing would consume the entire retry lease, schedule the first
+	// attempt halfway through the remaining budget. This preserves both
+	// healthy-path pacing and the hard rule that retries do not start after the
+	// migration budget has expired.
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return now
+	}
+	return now.Add(remaining / 2)
+}
+
 // armTailReplay publishes no new work. It only gives the existing replay
 // worker a bounded lease over [ackNext,target), resetting the idle timer when a
 // newer frame is published. Consequently a busy stream relies on normal
@@ -126,12 +197,9 @@ func (e *Engine) armTailReplay(target uint64) {
 		return
 	}
 	now := nowFn()
-	initial, _ := e.tailReplayTiming()
+	initial, maximum := e.tailReplayTiming(target)
 	deadline := now.Add(e.limits.MigrationBudget)
-	due := now.Add(initial)
-	if due.After(deadline) {
-		due = deadline
-	}
+	due := tailReplayAttemptDue(now, initial, deadline)
 
 	e.replayMu.Lock()
 	if !e.tailReplay.armed || target > e.tailReplay.target {
@@ -140,6 +208,8 @@ func (e *Engine) armTailReplay(target uint64) {
 			ackNext:  ackNext,
 			due:      due,
 			deadline: deadline,
+			initial:  initial,
+			maximum:  maximum,
 			backoff:  initial,
 			armed:    true,
 		}
@@ -172,10 +242,13 @@ func (e *Engine) armTailReplayForFrame(frame []byte, target uint64) {
 // postpone recovery of a still-unacknowledged tail.
 func (e *Engine) noteTailReplayAck(nextSeq uint64) {
 	now := nowFn()
-	initial, _ := e.tailReplayTiming()
 	changed := false
 	e.replayMu.Lock()
 	if e.tailReplay.armed {
+		initial := e.tailReplay.initial
+		if initial <= 0 {
+			initial = defaultTailReplayInitialDelay
+		}
 		switch {
 		case nextSeq >= e.tailReplay.target:
 			e.tailReplay = tailReplayLease{}
@@ -183,10 +256,7 @@ func (e *Engine) noteTailReplayAck(nextSeq uint64) {
 		case nextSeq > e.tailReplay.ackNext:
 			e.tailReplay.ackNext = nextSeq
 			e.tailReplay.backoff = initial
-			e.tailReplay.due = now.Add(initial)
-			if e.tailReplay.due.After(e.tailReplay.deadline) {
-				e.tailReplay.due = e.tailReplay.deadline
-			}
+			e.tailReplay.due = tailReplayAttemptDue(now, initial, e.tailReplay.deadline)
 			changed = true
 		}
 	}
@@ -229,7 +299,6 @@ func (e *Engine) tailReplayDue(now time.Time) (time.Time, bool) {
 // one attempt can therefore exist, even if thousands of publications coalesce
 // while the worker is busy.
 func (e *Engine) takeTailReplayAttempt(now time.Time) (uint64, bool) {
-	initial, maximum := e.tailReplayTiming()
 	e.replayMu.Lock()
 	defer e.replayMu.Unlock()
 	lease := &e.tailReplay
@@ -239,6 +308,14 @@ func (e *Engine) takeTailReplayAttempt(now time.Time) (uint64, bool) {
 	}
 	if now.Before(lease.due) {
 		return 0, false
+	}
+	initial := lease.initial
+	if initial <= 0 {
+		initial = defaultTailReplayInitialDelay
+	}
+	maximum := lease.maximum
+	if maximum < initial {
+		maximum = initial
 	}
 	backoff := lease.backoff
 	if backoff <= 0 {
@@ -269,7 +346,7 @@ func (e *Engine) tailReplayAttemptCurrent(target uint64) bool {
 // directly. This bounds duplicate traffic to one immutable ledger frame per
 // backoff interval.
 func (e *Engine) replayTailFrame(target uint64) {
-	if target == 0 {
+	if target == 0 || e.ActivePath() == 0 {
 		return
 	}
 	seq := target - 1

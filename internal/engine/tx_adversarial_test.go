@@ -173,20 +173,25 @@ func txAdversarialRecvError(t *testing.T, e *Engine, timeout time.Duration) erro
 func TestTxAdversarialFullLedgerDoesNotBlockExplicitMigrate(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa1}, Limits{})
 	defer e.Close()
+	targets := configureLeafSelectorRuntime(t, e, "first", "second")
 
 	first := newTxAdversarialPath()
 	second := newTxAdversarialPath()
-	if _, err := e.AttachPath(first, transport.PathSpec{Transport: "adversarial", Address: "first"}); err != nil {
+	if _, err := e.AttachPathBound(first, transport.PathSpec{Transport: "adversarial", Address: "first"}, PathBinding{
+		LocalTXTargetID: targets["first"], PeerTXTargetID: targets["first"],
+	}); err != nil {
 		t.Fatalf("attach first path: %v", err)
 	}
-	secondID, err := e.AttachPath(second, transport.PathSpec{Transport: "adversarial", Address: "second"})
+	secondID, err := e.AttachPathBound(second, transport.PathSpec{Transport: "adversarial", Address: "second"}, PathBinding{
+		LocalTXTargetID: targets["second"], PeerTXTargetID: targets["second"],
+	})
 	if err != nil {
 		t.Fatalf("attach second path: %v", err)
 	}
 	txAdversarialFillDataLedger(t, e)
 
 	done := make(chan error, 1)
-	go func() { done <- e.Migrate(secondID) }()
+	go func() { done <- e.SelectExplicitTarget(targets["root"], targets["second"], "explicit") }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -208,10 +213,9 @@ func TestTxAdversarialFullLedgerDoesNotBlockExplicitMigrate(t *testing.T) {
 
 func TestTxAdversarialFinalCloseBoundedWithFullLedger(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa2}, Limits{})
+	targets := configureLeafSelectorRuntime(t, e, "close")
 	path := newTxAdversarialPath()
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "close"}); err != nil {
-		t.Fatalf("attach path: %v", err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "close"}, targets["close"])
 	txAdversarialFillDataLedger(t, e)
 
 	type closeResult struct {
@@ -312,31 +316,40 @@ func TestTxAdversarialNonNormalOrMalformedByeIsNotClean(t *testing.T) {
 func TestTxAdversarialOneShotReplayWriteFailureRetriesWithoutTraffic(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa5}, Limits{})
 	defer e.Close()
-	path := newTxAdversarialPath()
+	targets := configureLeafSelectorRuntime(t, e, "replay-primary", "replay-successor")
+	primary := newTxAdversarialPath()
+	successor := newTxAdversarialPath()
 
 	var dataAttempts atomic.Int32
 	replaySucceeded := make(chan struct{})
 	var replaySucceededOnce sync.Once
-	path.writeFn = func(frame []byte) (int, error) {
+	countAttempt := func(frame []byte) (int32, bool) {
 		if len(frame) < proto.HeaderSize {
-			return len(frame), nil
+			return 0, false
 		}
 		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 		if err != nil || hdr.Type != proto.FrameData || hdr.Seq != 0 {
-			return len(frame), nil
+			return 0, false
 		}
-		switch dataAttempts.Add(1) {
-		case 2:
+		return dataAttempts.Add(1), true
+	}
+	primary.writeFn = func(frame []byte) (int, error) {
+		attempt, counted := countAttempt(frame)
+		if counted && attempt == 2 {
 			return 0, errors.New("injected one-shot replay write failure")
-		case 3:
+		}
+		return len(frame), nil
+	}
+	successor.writeFn = func(frame []byte) (int, error) {
+		attempt, counted := countAttempt(frame)
+		if counted && attempt == 3 {
 			replaySucceededOnce.Do(func() { close(replaySucceeded) })
 		}
 		return len(frame), nil
 	}
 
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "replay-retry"}); err != nil {
-		t.Fatalf("attach path: %v", err)
-	}
+	attachFixturePath(t, e, primary, transport.PathSpec{Transport: "adversarial", Address: "replay-primary"}, targets["replay-primary"])
+	attachFixturePath(t, e, successor, transport.PathSpec{Transport: "adversarial", Address: "replay-successor"}, targets["replay-successor"])
 	if _, err := e.SendData([]byte("unacknowledged")); err != nil {
 		t.Fatalf("initial SendData: %v", err)
 	}
@@ -352,10 +365,116 @@ func TestTxAdversarialOneShotReplayWriteFailureRetriesWithoutTraffic(t *testing.
 	}
 }
 
+func TestSelectorCommitSurvivesOneShotCutoverReplayFailure(t *testing.T) {
+	e := New(SideClient, [16]byte{0xa5, 0x51}, Limits{MigrationBudget: 2 * time.Second, ProbeInterval: time.Hour}.Clamp())
+	defer e.Close()
+	targets := configureLeafSelectorRuntime(t, e, "cutover-primary", "cutover-successor")
+	primary := newCloseReleasedWritePath()
+	successor := newTxAdversarialPath()
+
+	firstFenced := make(chan struct{})
+	replayBlocked := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	var replayAttempts atomic.Uint64
+	successor.writeFn = func(frame []byte) (int, error) {
+		if len(frame) < proto.HeaderSize {
+			return len(frame), nil
+		}
+		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || hdr.Type != proto.FrameData || hdr.Seq != 0 {
+			return len(frame), nil
+		}
+		switch replayAttempts.Add(1) {
+		case 1:
+			close(firstFenced)
+			return 0, ErrPathTXFenced
+		case 2:
+			close(replayBlocked)
+			select {
+			case <-releaseReplay:
+				return len(frame), nil
+			case <-successor.closed:
+				return 0, net.ErrClosed
+			}
+		default:
+			return len(frame), nil
+		}
+	}
+
+	attachFixturePath(t, e, primary, transport.PathSpec{Transport: "adversarial", Address: "cutover-primary"}, targets["cutover-primary"])
+	successorID := attachFixturePath(t, e, successor, transport.PathSpec{Transport: "adversarial", Address: "cutover-successor"}, targets["cutover-successor"])
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("cutover-replay-owned"))
+		writeDone <- err
+	}()
+	select {
+	case <-primary.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("primary DATA write did not start")
+	}
+
+	selectDone := make(chan error, 1)
+	go func() {
+		selectDone <- e.SelectExplicitTarget(targets["root"], targets["cutover-successor"], "cutover-replay-failure")
+	}()
+	select {
+	case <-firstFenced:
+	case <-time.After(time.Second):
+		t.Fatal("cutover replay did not encounter the injected TX fence")
+	}
+	select {
+	case <-replayBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("cutover replay did not retry after the TX fence")
+	}
+	if !e.policyOwnerMu.TryLock() {
+		t.Fatal("committed replay retained policy owner lock")
+	}
+	e.policyOwnerMu.Unlock()
+	if e.policyCutoverMu.TryLock() {
+		e.policyCutoverMu.Unlock()
+		t.Fatal("committed replay released cutover serialization before replay completed")
+	}
+	close(releaseReplay)
+	select {
+	case err := <-selectDone:
+		if err != nil {
+			t.Fatalf("selector cutover after transient replay fence: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selector cutover did not finish after replay was released")
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("application observed selector cutover: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("application frame did not hand off to selector cutover")
+	}
+	e.policyStateMu.Lock()
+	generation, selected := e.policyGeneration, e.policySelections[targets["root"]]
+	e.policyStateMu.Unlock()
+	if generation != 1 || selected != targets["cutover-successor"] || e.ActivePath() != successorID {
+		t.Fatalf("committed state generation/target/active=%d/%x/%d", generation, selected, e.ActivePath())
+	}
+	if got := replayAttempts.Load(); got < 2 {
+		t.Fatalf("cutover replay attempts=%d want at least 2", got)
+	}
+	e.zombieMu.Lock()
+	zombieLeft := e.zombieLeft
+	e.zombieMu.Unlock()
+	if zombieLeft != e.limits.ZombieMaxMigrations {
+		t.Fatalf("transient TX fence consumed zombie budget: got=%d want=%d", zombieLeft, e.limits.ZombieMaxMigrations)
+	}
+}
+
 func TestGapReplayFollowsCurrentCumulativeGapState(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa6}, Limits{})
 	defer e.Close()
 	e.gapReplayBackoff = time.Second
+	targets := configureLeafSelectorRuntime(t, e, "gap-frontier")
 	path := newTxAdversarialPath()
 
 	var mu sync.Mutex
@@ -384,9 +503,7 @@ func TestGapReplayFollowsCurrentCumulativeGapState(t *testing.T) {
 		}
 		return len(frame), nil
 	}
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "gap-frontier"}); err != nil {
-		t.Fatal(err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "gap-frontier"}, targets["gap-frontier"])
 	for i := 0; i < 4; i++ {
 		if _, err := e.SendData([]byte{byte(i)}); err != nil {
 			t.Fatal(err)
@@ -518,6 +635,7 @@ func TestReplayACKStateConcurrentPathReaders(t *testing.T) {
 func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa7}, Limits{})
 	defer e.Close()
+	targets := configureLeafSelectorRuntime(t, e, "full-preempts-gap")
 	path := newTxAdversarialPath()
 
 	var mu sync.Mutex
@@ -538,9 +656,7 @@ func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
 		}
 		return len(frame), nil
 	}
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "full-preempts-gap"}); err != nil {
-		t.Fatal(err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "full-preempts-gap"}, targets["full-preempts-gap"])
 	for i := 0; i < 4; i++ {
 		if _, err := e.SendData([]byte{byte(i)}); err != nil {
 			t.Fatal(err)
@@ -620,17 +736,12 @@ func TestTxAdversarialSolePathRecoveryDeliversLastUnackedTail(t *testing.T) {
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "old", "replacement")
 
 	oldClient, oldServer := newMemoryPathPair()
 	oldClient.dropWrites.Store(true)
-	oldClientID, err := client.AttachPath(oldClient, transport.PathSpec{Transport: "memory", Address: "old"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldServerID, err := server.AttachPath(oldServer, transport.PathSpec{Transport: "memory", Address: "old"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	oldClientID := attachFixturePath(t, client, oldClient, transport.PathSpec{Transport: "memory", Address: "old"}, targets["old"])
+	oldServerID := attachFixturePath(t, server, oldServer, transport.PathSpec{Transport: "memory", Address: "old"}, targets["old"])
 
 	tail := []byte("last-unacknowledged-tail")
 	if _, err := client.SendData(tail); err != nil {
@@ -644,12 +755,8 @@ func TestTxAdversarialSolePathRecoveryDeliversLastUnackedTail(t *testing.T) {
 	var releaseGate sync.Once
 	releaseRead := func() { releaseGate.Do(func() { close(readGate) }) }
 	defer releaseRead()
-	if _, err := server.AttachPath(&txAdversarialGatedReadPath{PathConn: newServer, gate: readGate}, transport.PathSpec{Transport: "memory", Address: "replacement"}); err != nil {
-		t.Fatalf("attach server replacement: %v", err)
-	}
-	if _, err := client.AttachPath(newClient, transport.PathSpec{Transport: "memory", Address: "replacement"}); err != nil {
-		t.Fatalf("attach client replacement: %v", err)
-	}
+	attachFixturePath(t, server, &txAdversarialGatedReadPath{PathConn: newServer, gate: readGate}, transport.PathSpec{Transport: "memory", Address: "replacement"}, targets["replacement"])
+	attachFixturePath(t, client, newClient, transport.PathSpec{Transport: "memory", Address: "replacement"}, targets["replacement"])
 	if got := client.MigrationCount(); got != 1 {
 		t.Fatalf("client recovery migrations = %d, want 1", got)
 	}

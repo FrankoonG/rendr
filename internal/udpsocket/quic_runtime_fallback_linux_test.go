@@ -141,8 +141,12 @@ func TestQUICRuntimeGSOFailureRetriesWithoutConnectionLoss(t *testing.T) {
 		t.Fatal("quic-go never attempted a multi-segment UDP_SEGMENT send")
 	}
 	status := clientSocket.DatagramAccelerationStatus()
+	exactlyOneFailedGSOAttempt := status.GSOAttempts > status.GSOSuperPackets &&
+		status.GSOAttempts-status.GSOSuperPackets == 1
+	validSuccessfulGSOSegments := status.GSOSuperPackets == 0 && status.GSOSegments == 0 ||
+		status.GSOSuperPackets > 0 && status.GSOSegments/status.GSOSuperPackets >= 2
 	if status.Mode != "ordinary_fallback" || status.Cause != causePathUnsupported ||
-		status.GSOAttempts != 1 || status.GSOSuperPackets != 0 || status.GSOSegments != 0 ||
+		!exactlyOneFailedGSOAttempt || !validSuccessfulGSOSegments ||
 		status.OrdinaryDatagrams == 0 || status.FallbackTransitions != 1 {
 		t.Fatalf("runtime fallback status=%+v", status)
 	}

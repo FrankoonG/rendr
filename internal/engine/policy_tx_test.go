@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,11 +16,37 @@ import (
 
 const policyTxUnitRevision = 17
 
+func TestPolicyCommitChallengeEntropyFailsClosed(t *testing.T) {
+	want := bytes.Repeat([]byte{0xa5}, len(proto.PolicyCommitChallenge{}))
+	challenge, err := readPolicyCommitChallenge(bytes.NewReader(want))
+	if err != nil {
+		t.Fatalf("read challenge: %v", err)
+	}
+	if !bytes.Equal(challenge[:], want) {
+		t.Fatalf("challenge=%x want=%x", challenge, want)
+	}
+	for _, test := range []struct {
+		name   string
+		reader *bytes.Reader
+	}{
+		{name: "all-zero", reader: bytes.NewReader(make([]byte, len(proto.PolicyCommitChallenge{})))},
+		{name: "short", reader: bytes.NewReader(make([]byte, len(proto.PolicyCommitChallenge{})-1))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := readPolicyCommitChallenge(test.reader); err == nil {
+				t.Fatal("accepted invalid challenge entropy")
+			}
+		})
+	}
+	if _, err := readPolicyCommitChallenge(nil); err == nil {
+		t.Fatal("accepted nil challenge entropy source")
+	}
+}
+
 type policyTxUnitAckObservation struct {
 	ack        proto.PolicyAck
 	pathName   string
 	activePath uint32
-	mode       uint32
 	generation uint64
 	selection  proto.TargetID
 	pending    bool
@@ -56,7 +84,6 @@ func (r *policyTxUnitAckRecorder) record(pathName string, frame []byte) {
 		ack:        ack,
 		pathName:   pathName,
 		activePath: r.engine.ActivePath(),
-		mode:       r.engine.Mode(),
 	}
 	r.engine.policyStateMu.Lock()
 	observation.generation = r.engine.policyGeneration
@@ -85,18 +112,24 @@ func (r *policyTxUnitAckRecorder) snapshot() ([]policyTxUnitAckObservation, erro
 }
 
 type policyTxUnitPath struct {
-	name      string
-	recorder  *policyTxUnitAckRecorder
-	closed    chan struct{}
-	closeOnce sync.Once
-	failed    chan struct{}
-	failOnce  sync.Once
-	failMu    sync.Mutex
-	failErr   error
-	deathMu   sync.Mutex
-	deathFn   func(transport.DeathCause, error)
-	deathOnce sync.Once
-	deathDone chan struct{}
+	name        string
+	recorder    *policyTxUnitAckRecorder
+	dataWrites  atomic.Uint64
+	writeMu     sync.Mutex
+	beforeWrite func([]byte)
+	qualityMu   sync.RWMutex
+	quality     transport.PathQuality
+	qualityHook func()
+	closed      chan struct{}
+	closeOnce   sync.Once
+	failed      chan struct{}
+	failOnce    sync.Once
+	failMu      sync.Mutex
+	failErr     error
+	deathMu     sync.Mutex
+	deathFn     func(transport.DeathCause, error)
+	deathOnce   sync.Once
+	deathDone   chan struct{}
 }
 
 func newPolicyTxUnitPath(name string, recorder *policyTxUnitAckRecorder) *policyTxUnitPath {
@@ -127,8 +160,25 @@ func (p *policyTxUnitPath) Write(frame []byte) (int, error) {
 		return 0, net.ErrClosed
 	default:
 	}
+	p.writeMu.Lock()
+	beforeWrite := p.beforeWrite
+	p.writeMu.Unlock()
+	if beforeWrite != nil {
+		beforeWrite(frame)
+	}
+	if len(frame) >= proto.HeaderSize {
+		if header, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil && header.Type == proto.FrameData {
+			p.dataWrites.Add(1)
+		}
+	}
 	p.recorder.record(p.name, frame)
 	return len(frame), nil
+}
+
+func (p *policyTxUnitPath) SetBeforeWrite(fn func([]byte)) {
+	p.writeMu.Lock()
+	p.beforeWrite = fn
+	p.writeMu.Unlock()
 }
 
 func (p *policyTxUnitPath) Close() error {
@@ -136,7 +186,28 @@ func (p *policyTxUnitPath) Close() error {
 	return nil
 }
 
-func (p *policyTxUnitPath) Quality() transport.PathQuality { return transport.PathQuality{} }
+func (p *policyTxUnitPath) Quality() transport.PathQuality {
+	p.qualityMu.RLock()
+	quality := p.quality
+	hook := p.qualityHook
+	p.qualityMu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+	return quality
+}
+
+func (p *policyTxUnitPath) SetQuality(quality transport.PathQuality) {
+	p.qualityMu.Lock()
+	p.quality = quality
+	p.qualityMu.Unlock()
+}
+
+func (p *policyTxUnitPath) SetQualityHook(hook func()) {
+	p.qualityMu.Lock()
+	p.qualityHook = hook
+	p.qualityMu.Unlock()
+}
 func (p *policyTxUnitPath) OnDeath(fn func(transport.DeathCause, error)) {
 	p.deathMu.Lock()
 	p.deathFn = fn
@@ -243,19 +314,20 @@ func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorI
 	if err := engine.ConfigurePeerGraph(policyTxUnitRevision, manifest); err != nil {
 		t.Fatalf("ConfigurePeerGraph: %v", err)
 	}
-	if err := engine.ConfigureExecution(proto.ExecutionKindSelector); err != nil {
-		t.Fatalf("ConfigureExecution: %v", err)
-	}
 	recorder := &policyTxUnitAckRecorder{engine: engine, selectorID: selectorID}
 	paths := make(map[string]uint32, len(leafNames))
 	pathHandles := make(map[string]*policyTxUnitPath, len(leafNames))
 	for _, name := range leafNames {
 		path := newPolicyTxUnitPath(name, recorder)
-		id, err := engine.AttachPath(path, transport.PathSpec{
+		node, ok := manifest.NodeByName(name)
+		if !ok || node.Kind != proto.GraphNodeKindPath {
+			t.Fatalf("manifest path %q is missing", name)
+		}
+		id, err := engine.AttachPathBound(path, transport.PathSpec{
 			Transport: "policy-tx-unit",
 			Address:   name,
 			Opts:      map[string]string{"name": name},
-		})
+		}, PathBinding{LocalTXTargetID: node.ID, PeerTXTargetID: node.ID})
 		if err != nil {
 			t.Fatalf("AttachPath(%q): %v", name, err)
 		}
@@ -291,6 +363,15 @@ func policyTxUnitPrepare(engine *Engine, txByte byte, base uint64, selectorID, t
 	}
 }
 
+func policyTxUnitClassPrepare(engine *Engine, txByte byte, base uint64, selectorID proto.TargetID, peak bool) proto.PolicyPrepare {
+	prepare := policyTxUnitPrepare(engine, txByte, base, selectorID, proto.TargetID{})
+	prepare.Action = proto.PolicyActionSelectBestNormal
+	if peak {
+		prepare.Action = proto.PolicyActionSelectBestPeak
+	}
+	return prepare
+}
+
 func policyTxUnitCommit(t *testing.T, prepare proto.PolicyPrepare, generation uint64, reservation proto.PolicyReservationID) proto.PolicyCommit {
 	t.Helper()
 	digest, err := prepare.ProposalDigest()
@@ -302,6 +383,7 @@ func policyTxUnitCommit(t *testing.T, prepare proto.PolicyPrepare, generation ui
 		Generation:               generation,
 		ProposalDigest:           digest,
 		ReservationID:            reservation,
+		CommitChallenge:          proto.PolicyCommitChallenge{0xa5, prepare.TransactionID[0]},
 	}
 }
 
@@ -365,11 +447,663 @@ func TestPolicyTransactionCommitAppliesStateBeforeFinalAck(t *testing.T) {
 	if finalAck.ack.Generation != 1 || finalAck.ack.CurrentGeneration != 1 || finalAck.ack.CurrentTargetID != fixture.targetB {
 		t.Fatalf("final ACK does not prove committed state: %+v", finalAck.ack)
 	}
+	if finalAck.ack.CommitChallenge != commit.CommitChallenge {
+		t.Fatalf("final ACK challenge=%x want COMMIT challenge=%x", finalAck.ack.CommitChallenge, commit.CommitChallenge)
+	}
 	if finalAck.pathName != fixture.nameB || finalAck.activePath != fixture.pathB {
 		t.Fatalf("final ACK was published before dispatch changed: path=%q active=%d want %q/%d", finalAck.pathName, finalAck.activePath, fixture.nameB, fixture.pathB)
 	}
 	if finalAck.generation != 1 || finalAck.selection != fixture.targetB || finalAck.pending || finalAck.completed != 1 {
 		t.Fatalf("final ACK was published before transaction state committed: %+v", finalAck)
+	}
+}
+
+func TestIncomingExactChildCommitOwnsBlockedDataBeforeFinalAck(t *testing.T) {
+	const (
+		rootName = "incoming-exact-cutover-root"
+		nameA    = "incoming-exact-cutover-a"
+		nameB    = "incoming-exact-cutover-b"
+	)
+	pathA := policyTxUnitNode(proto.GraphNodeKindPath, nameA)
+	pathB := policyTxUnitNode(proto.GraphNodeKindPath, nameB)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, rootName, pathA.ID, pathB.ID)
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, pathA, pathB}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
+	prepare := policyTxUnitPrepare(e, 0x47, 0, selector.ID, pathB.ID)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+
+	aStarted := make(chan struct{})
+	bReplayStarted := make(chan struct{})
+	releaseA := make(chan struct{})
+	releaseB := make(chan struct{})
+	var aStartOnce, bStartOnce, releaseAOnce, releaseBOnce sync.Once
+	t.Cleanup(func() {
+		releaseBOnce.Do(func() { close(releaseB) })
+		releaseAOnce.Do(func() { close(releaseA) })
+	})
+	handles[nameA].SetBeforeWrite(func(frame []byte) {
+		if len(frame) < proto.HeaderSize {
+			return
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || header.Type != proto.FrameData {
+			return
+		}
+		aStartOnce.Do(func() { close(aStarted) })
+		<-releaseA
+	})
+	handles[nameB].SetBeforeWrite(func(frame []byte) {
+		if len(frame) < proto.HeaderSize {
+			return
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || header.Type != proto.FrameData {
+			return
+		}
+		bStartOnce.Do(func() { close(bReplayStarted) })
+		<-releaseB
+	})
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("incoming exact child owns this DATA"))
+		writeDone <- err
+	}()
+	select {
+	case <-aStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DATA did not block on the former selected child")
+	}
+
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- e.handlePolicyCommit(commit) }()
+	select {
+	case <-bReplayStarted:
+	case <-time.After(time.Second):
+		t.Fatal("incoming exact-child commit did not replay blocked DATA on child B")
+	}
+	select {
+	case writeErr := <-writeDone:
+		if writeErr != nil {
+			t.Fatalf("application write observed incoming cutover: %v", writeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("application write did not transfer custody to incoming cutover")
+	}
+	observations, err := recorder.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, observation := range observations {
+		if observation.ack.Phase == proto.PolicyAckPhaseFinal && observation.ack.Code == proto.PolicyAckCodeAccept {
+			t.Fatal("successful FINAL overtook blocked DATA replay")
+		}
+	}
+
+	releaseBOnce.Do(func() { close(releaseB) })
+	select {
+	case commitErr := <-commitDone:
+		if commitErr != nil {
+			t.Fatal(commitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("incoming exact-child commit did not finish after replay")
+	}
+	observations, err = recorder.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final *policyTxUnitAckObservation
+	for i := range observations {
+		if observations[i].ack.Phase == proto.PolicyAckPhaseFinal {
+			final = &observations[i]
+		}
+	}
+	if final == nil || final.ack.Code != proto.PolicyAckCodeAccept || final.ack.CurrentTargetID != pathB.ID {
+		t.Fatalf("final ACK=%+v want accepted child B", final)
+	}
+	if final.activePath != paths[nameB] || e.ActivePath() != paths[nameB] || handles[nameB].dataWrites.Load() == 0 {
+		t.Fatalf("final route/active/B writes=%d/%d/%d want %d/%d/>0",
+			final.activePath, e.ActivePath(), handles[nameB].dataWrites.Load(), paths[nameB], paths[nameB])
+	}
+	releaseAOnce.Do(func() { close(releaseA) })
+}
+
+func TestIncomingInactiveExactChildCommitRejectsTopologyEpochDrift(t *testing.T) {
+	const (
+		rootName  = "incoming-nested-epoch-root"
+		innerName = "incoming-nested-epoch-inner"
+		nameA     = "incoming-nested-epoch-a"
+		nameB     = "incoming-nested-epoch-b"
+		nameC     = "incoming-nested-epoch-c"
+	)
+	pathA := policyTxUnitNode(proto.GraphNodeKindPath, nameA)
+	pathB := policyTxUnitNode(proto.GraphNodeKindPath, nameB)
+	pathC := policyTxUnitNode(proto.GraphNodeKindPath, nameC)
+	inner := policyTxUnitNode(proto.GraphNodeKindSelector, innerName, pathB.ID, pathC.ID)
+	root := policyTxUnitNode(proto.GraphNodeKindSelector, rootName, pathA.ID, inner.ID)
+	manifest := proto.GraphManifest{
+		RootID: root.ID,
+		Nodes:  []proto.GraphNode{root, inner, pathA, pathB, pathC},
+	}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, root.ID, nameA, nameB, nameC)
+	if active := e.ActivePath(); active != paths[nameA] {
+		t.Fatalf("initial active=%d want A=%d", active, paths[nameA])
+	}
+
+	prepare := policyTxUnitPrepare(e, 0x48, 0, inner.ID, pathC.ID)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+
+	admissionEntered := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	bDataStarted := make(chan struct{})
+	releaseB := make(chan struct{})
+	var admissionOnce, releaseAdmissionOnce, bDataOnce, releaseBOnce sync.Once
+	t.Cleanup(func() {
+		e.SetPeerPolicyAdmission(nil)
+		releaseAdmissionOnce.Do(func() { close(releaseAdmission) })
+		releaseBOnce.Do(func() { close(releaseB) })
+	})
+	e.SetPeerPolicyAdmission(func(selectorID, targetID proto.TargetID, cause string) error {
+		admissionOnce.Do(func() { close(admissionEntered) })
+		<-releaseAdmission
+		return nil
+	})
+	handles[nameB].SetBeforeWrite(func(frame []byte) {
+		if len(frame) < proto.HeaderSize {
+			return
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || header.Type != proto.FrameData {
+			return
+		}
+		bDataOnce.Do(func() { close(bDataStarted) })
+		<-releaseB
+	})
+
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- e.handlePolicyCommit(commit) }()
+	awaitSignal(t, admissionEntered, "incoming exact-child commit admission")
+
+	handles[nameA].Fail(errors.New("injected root A death during admission"))
+	waitPolicyTxUnitPathDeath(t, handles[nameA])
+	eventuallyEngine(t, time.Second, func() bool { return e.ActivePath() == paths[nameB] })
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("must remain owned by fallback B"))
+		writeDone <- err
+	}()
+	awaitSignal(t, bDataStarted, "fallback B DATA dispatch")
+
+	releaseAdmissionOnce.Do(func() { close(releaseAdmission) })
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale incoming exact-child commit did not terminate")
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("fallback B DATA custody returned an application error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback B DATA did not transfer to replay-ledger custody")
+	}
+	if got := handles[nameB].dataWrites.Load(); got != 0 {
+		t.Fatalf("fallback B completed %d physical DATA writes before release", got)
+	}
+
+	observations, err := recorder.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final *policyTxUnitAckObservation
+	for i := range observations {
+		if observations[i].ack.Phase == proto.PolicyAckPhaseFinal {
+			final = &observations[i]
+		}
+	}
+	if final == nil || final.ack.Code != proto.PolicyAckCodeReject {
+		t.Fatalf("topology-stale FINAL=%+v want explicit rejection", final)
+	}
+	if final.ack.Code == proto.PolicyAckCodeAccept || final.ack.CurrentTargetID == pathC.ID {
+		t.Fatalf("topology-stale commit published C: %+v", final.ack)
+	}
+	if got := handles[nameC].dataWrites.Load(); got != 0 {
+		t.Fatalf("stale target C received %d DATA writes", got)
+	}
+	runtime := e.localExecutionRuntime()
+	runtime.mu.Lock()
+	innerDesired := runtime.selectors[inner.ID].desired
+	runtime.mu.Unlock()
+	if innerDesired != pathB.ID {
+		t.Fatalf("inactive selector committed across topology drift: desired=%x want B=%x", innerDesired, pathB.ID)
+	}
+
+	releaseBOnce.Do(func() { close(releaseB) })
+	eventuallyEngine(t, time.Second, func() bool { return handles[nameB].dataWrites.Load() > 0 })
+}
+
+func TestPolicyClassSelectionFreezesOwnerChoiceAndRejectsStaleCommit(t *testing.T) {
+	const (
+		nameA = "policy-class-a"
+		nameB = "policy-class-b"
+		nameP = "policy-class-peak"
+	)
+	pathA := policyTxUnitNode(proto.GraphNodeKindPath, nameA)
+	pathB := policyTxUnitNode(proto.GraphNodeKindPath, nameB)
+	pathP := policyTxUnitNode(proto.GraphNodeKindPath, nameP)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-class-root", pathA.ID, pathB.ID, pathP.ID)
+	selector.PeakCandidates = []proto.TargetID{pathP.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, pathA, pathB, pathP}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB, nameP)
+	now := time.Now()
+	handles[nameA].SetQuality(transport.PathQuality{RTT: 50 * time.Millisecond, At: now})
+	handles[nameB].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, At: now})
+	handles[nameP].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+
+	prepare := policyTxUnitClassPrepare(e, 0x41, 0, selector.ID, false)
+	first := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if first.ack.Code != proto.PolicyAckCodeAccept || first.ack.ResolvedTargetID != pathB.ID ||
+		first.ack.CurrentTargetID != pathA.ID || first.activePath != paths[nameA] {
+		t.Fatalf("class PREPARE=%+v active=%d want frozen B with active A", first.ack, first.activePath)
+	}
+
+	// A retransmitted PREPARE must replay the original reservation even after
+	// the quality order changes; silently resolving again would make COMMIT
+	// ambiguous under the same proposal digest.
+	handles[nameA].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[nameB].SetQuality(transport.PathQuality{RTT: 100 * time.Millisecond, At: now})
+	replayed := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if replayed.ack.ResolvedTargetID != pathB.ID || replayed.ack.ReservationID != first.ack.ReservationID ||
+		replayed.ack.Generation != first.ack.Generation {
+		t.Fatalf("duplicate PREPARE changed frozen result: first=%+v replay=%+v", first.ack, replayed.ack)
+	}
+
+	// The frozen target must still satisfy its class evidence at COMMIT. A stale
+	// target is rejected rather than replaced behind the requester's back.
+	handles[nameB].SetQuality(transport.PathQuality{RTT: 100 * time.Millisecond, At: now.Add(-time.Hour)})
+	commit := policyTxUnitCommit(t, prepare, first.ack.Generation, first.ack.ReservationID)
+	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
+	if final.ack.Code != proto.PolicyAckCodeReject || final.ack.ResolvedTargetID != (proto.TargetID{}) {
+		t.Fatalf("stale class COMMIT=%+v want reject without resolved target", final.ack)
+	}
+	generation, selected, pending, _ := policyTxUnitState(e, selector.ID)
+	if generation != 0 || selected != pathA.ID || pending || e.ActivePath() != paths[nameA] {
+		t.Fatalf("rejected class COMMIT changed owner: generation=%d selected=%x pending=%t active=%d", generation, selected, pending, e.ActivePath())
+	}
+}
+
+func TestPolicyClassSelectionCommitsExactPeakAndMarksHold(t *testing.T) {
+	const (
+		nameN = "policy-class-normal"
+		nameP = "policy-class-peak"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, nameN)
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, nameP)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-class-peak-root", normal.ID, peak.ID)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameN, nameP)
+	now := time.Now()
+	handles[nameN].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[nameP].SetQuality(transport.PathQuality{RTT: 20 * time.Millisecond, At: now})
+
+	prepare := policyTxUnitClassPrepare(e, 0x42, 0, selector.ID, true)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if prepared.ack.Code != proto.PolicyAckCodeAccept || prepared.ack.ResolvedTargetID != peak.ID {
+		t.Fatalf("peak PREPARE=%+v", prepared.ack)
+	}
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
+	if final.ack.Code != proto.PolicyAckCodeAccept || final.ack.ResolvedTargetID != peak.ID ||
+		final.ack.CurrentTargetID != peak.ID || e.ActivePath() != paths[nameP] {
+		t.Fatalf("peak FINAL=%+v active=%d want peak=%d", final.ack, e.ActivePath(), paths[nameP])
+	}
+	runtime := e.localExecutionRuntime()
+	runtime.mu.Lock()
+	held := runtime.selectors[selector.ID] != nil && runtime.selectors[selector.ID].peakHeld
+	runtime.mu.Unlock()
+	if !held {
+		t.Fatal("peer-owned peak commit did not establish selector peak hold")
+	}
+}
+
+func TestPolicyPeakClassAdmissionFiltersBeforeOwnerRanking(t *testing.T) {
+	const (
+		normalName     = "policy-admission-normal"
+		suppressedName = "policy-admission-suppressed"
+		stableSlowName = "policy-admission-stable-slow"
+		stableFastName = "policy-admission-stable-fast"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, normalName)
+	suppressed := policyTxUnitNode(proto.GraphNodeKindPath, suppressedName)
+	stableSlow := policyTxUnitNode(proto.GraphNodeKindPath, stableSlowName)
+	stableFast := policyTxUnitNode(proto.GraphNodeKindPath, stableFastName)
+	selector := policyTxUnitNode(
+		proto.GraphNodeKindSelector, "policy-admission-root",
+		normal.ID, suppressed.ID, stableSlow.ID, stableFast.ID,
+	)
+	selector.PeakCandidates = []proto.TargetID{suppressed.ID, stableSlow.ID, stableFast.ID}
+	manifest := proto.GraphManifest{
+		RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, suppressed, stableSlow, stableFast},
+	}
+	e, recorder, _, handles := newPolicyTxUnitEngine(
+		t, manifest, selector.ID, normalName, suppressedName, stableSlowName, stableFastName,
+	)
+	now := time.Now()
+	handles[normalName].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[suppressedName].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[stableSlowName].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, LossPP: 10, At: now})
+	handles[stableFastName].SetQuality(transport.PathQuality{RTT: 11 * time.Millisecond, At: now})
+	e.SetPeerPolicyAdmission(func(_ proto.TargetID, targetID proto.TargetID, _ string) error {
+		if targetID == suppressed.ID {
+			return errors.New("candidate is capacity-suppressed")
+		}
+		return nil
+	})
+
+	prepare := policyTxUnitClassPrepare(e, 0x44, 0, selector.ID, true)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if prepared.ack.Code != proto.PolicyAckCodeAccept || prepared.ack.ResolvedTargetID != stableFast.ID {
+		t.Fatalf("peak PREPARE=%+v want stable candidate after pre-ranking suppression", prepared.ack)
+	}
+	e.policyStateMu.Lock()
+	pending := e.policyIncoming
+	e.policyStateMu.Unlock()
+	if pending == nil || pending.decisionTopologyEpoch != e.currentPathTopologyEpoch() {
+		t.Fatalf("class decision epoch=%v current=%d", pending, e.currentPathTopologyEpoch())
+	}
+}
+
+func TestPolicyPeakClassCommitRejectsPreparedTopologyEpochDrift(t *testing.T) {
+	const (
+		normalName = "policy-class-epoch-normal"
+		peakName   = "policy-class-epoch-peak"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, normalName)
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, peakName)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-class-epoch-root", normal.ID, peak.ID)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, normalName, peakName)
+	now := time.Now()
+	handles[normalName].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[peakName].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, At: now})
+
+	prepare := policyTxUnitClassPrepare(e, 0x45, 0, selector.ID, true)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if prepared.ack.Code != proto.PolicyAckCodeAccept || prepared.ack.ResolvedTargetID != peak.ID {
+		t.Fatalf("peak PREPARE=%+v", prepared.ack)
+	}
+	e.pathsMu.Lock()
+	peakSlot := e.paths[paths[peakName]]
+	peakSlot.probeEndpointGen.Store(peakSlot.probeEndpointGen.Load() + 1)
+	e.advancePathTopologyEpochLocked()
+	e.pathsMu.Unlock()
+
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
+	if final.ack.Code != proto.PolicyAckCodeReject || final.ack.ResolvedTargetID != (proto.TargetID{}) {
+		t.Fatalf("topology-stale FINAL=%+v want rejection", final.ack)
+	}
+	generation, selected, pending, _ := policyTxUnitState(e, selector.ID)
+	if generation != 0 || selected != normal.ID || pending || e.ActivePath() != paths[normalName] {
+		t.Fatalf(
+			"stale class commit changed owner generation=%d selected=%x pending=%t active=%d",
+			generation, selected, pending, e.ActivePath(),
+		)
+	}
+}
+
+func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
+	const (
+		nameN = "policy-expiry-normal"
+		nameP = "policy-expiry-peak"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, nameN)
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, nameP)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-expiry-root", normal.ID, peak.ID)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameN, nameP)
+	now := time.Now()
+	handles[nameN].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[nameP].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, At: now})
+
+	primaryWriteEntered := make(chan struct{})
+	releasePrimaryWrite := make(chan struct{})
+	defer func() {
+		select {
+		case <-releasePrimaryWrite:
+		default:
+			close(releasePrimaryWrite)
+		}
+	}()
+	var primaryWriteOnce sync.Once
+	handles[nameN].SetBeforeWrite(func(frame []byte) {
+		if len(frame) < proto.HeaderSize {
+			return
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || header.Type != proto.FrameData {
+			return
+		}
+		primaryWriteOnce.Do(func() { close(primaryWriteEntered) })
+		<-releasePrimaryWrite
+	})
+	prepare := policyTxUnitClassPrepare(e, 0x43, 0, selector.ID, true)
+	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if prepared.ack.Code != proto.PolicyAckCodeAccept || prepared.ack.ResolvedTargetID != peak.ID {
+		t.Fatalf("peak PREPARE=%+v", prepared.ack)
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("unacknowledged-before-policy-cutover"))
+		sendDone <- err
+	}()
+	select {
+	case <-primaryWriteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("initial DATA did not block on the normal target")
+	}
+
+	replayEntered := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseReplay:
+		default:
+			close(releaseReplay)
+		}
+	}()
+	var replayOnce sync.Once
+	e.boundedReplayBeforeSnapshot = func() {
+		replayOnce.Do(func() { close(replayEntered) })
+		<-releaseReplay
+	}
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- e.handlePolicyCommit(commit) }()
+	select {
+	case <-replayEntered:
+	case <-time.After(time.Second):
+		t.Fatal("committed policy did not enter cutover replay")
+	}
+
+	e.expirePreparedPolicy(time.Now().Add(policyTransactionTTL))
+	e.policyStateMu.Lock()
+	pending := e.policyIncoming
+	generation := e.policyGeneration
+	selected := e.policySelections[selector.ID]
+	completed := len(e.policyCompleted)
+	e.policyStateMu.Unlock()
+	if pending == nil || !pending.committed || generation != 1 || selected != peak.ID || completed != 0 {
+		t.Fatalf("expiry changed committed replay state: pending=%+v generation=%d selected=%x completed=%d", pending, generation, selected, completed)
+	}
+	close(releaseReplay)
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatalf("handlePolicyCommit: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("policy commit did not finish after replay release")
+	}
+	close(releasePrimaryWrite)
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatalf("handed-off application write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handed-off application write did not return")
+	}
+
+	generation, selected, pendingExists, completed := policyTxUnitState(e, selector.ID)
+	if generation != 1 || selected != peak.ID || pendingExists || completed != 1 || e.ActivePath() != paths[nameP] {
+		t.Fatalf("final committed state generation=%d selected=%x pending=%t completed=%d active=%d", generation, selected, pendingExists, completed, e.ActivePath())
+	}
+}
+
+func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.T) {
+	const (
+		nameNormal = "policy-observer-normal"
+		namePeak   = "policy-observer-peak"
+		cause      = "peak-transfer"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, nameNormal)
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, namePeak)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-observer-root", normal.ID, peak.ID)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
+	e, _, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameNormal, namePeak)
+
+	primaryWriteEntered := make(chan struct{})
+	releasePrimaryWrite := make(chan struct{})
+	var primaryWriteOnce, releasePrimaryOnce sync.Once
+	t.Cleanup(func() { releasePrimaryOnce.Do(func() { close(releasePrimaryWrite) }) })
+	handles[nameNormal].SetBeforeWrite(func(frame []byte) {
+		if len(frame) < proto.HeaderSize {
+			return
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err != nil || header.Type != proto.FrameData {
+			return
+		}
+		primaryWriteOnce.Do(func() { close(primaryWriteEntered) })
+		<-releasePrimaryWrite
+	})
+
+	sendDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("unacknowledged-before-peak-cutover"))
+		sendDone <- err
+	}()
+	select {
+	case <-primaryWriteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("initial DATA did not block on the normal target")
+	}
+
+	type peakObservation struct {
+		selectorID proto.TargetID
+		targetID   proto.TargetID
+		peak       bool
+		cause      string
+	}
+	observed := make(chan peakObservation, 2)
+	e.SetPeakPolicyObserver(func(selectorID, targetID proto.TargetID, peak bool, cause string) {
+		observed <- peakObservation{selectorID: selectorID, targetID: targetID, peak: peak, cause: cause}
+	})
+
+	replayInjected := make(chan struct{})
+	var (
+		replayOnce       sync.Once
+		savedRuntime     *executionRuntime
+		runtimeWithdrawn bool
+	)
+	restoreRuntime := func() {
+		e.graphMu.Lock()
+		if runtimeWithdrawn {
+			e.localExec = savedRuntime
+			runtimeWithdrawn = false
+		}
+		e.graphMu.Unlock()
+	}
+	defer restoreRuntime()
+	e.boundedReplayBeforeSnapshot = func() {
+		replayOnce.Do(func() {
+			e.graphMu.Lock()
+			savedRuntime = e.localExec
+			e.localExec = nil
+			runtimeWithdrawn = true
+			e.graphMu.Unlock()
+			close(replayInjected)
+		})
+	}
+
+	err := e.SelectPeakTransferTarget(selector.ID, peak.ID, true, cause)
+	restoreRuntime()
+	releasePrimaryOnce.Do(func() { close(releasePrimaryWrite) })
+	if !errors.Is(err, ErrPolicyOutcomeUnknown) {
+		t.Fatalf("SelectPeakTransferTarget error=%v want %v", err, ErrPolicyOutcomeUnknown)
+	}
+	select {
+	case <-replayInjected:
+	default:
+		t.Fatal("peak policy did not reach the injected post-commit replay failure")
+	}
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatalf("handed-off application write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handed-off application write did not return")
+	}
+
+	generation, selected, pending, _ := policyTxUnitState(e, selector.ID)
+	if generation != 1 || selected != peak.ID || pending || e.ActivePath() != paths[namePeak] {
+		t.Fatalf("committed state generation=%d selected=%x pending=%t active=%d want generation=1 target=%x active=%d",
+			generation, selected, pending, e.ActivePath(), peak.ID, paths[namePeak])
+	}
+	desired, effective, ok := savedRuntime.selectedChild(selector.ID)
+	if !ok || desired != peak.ID || effective != peak.ID {
+		t.Fatalf("committed runtime desired=%x effective=%x ok=%t want peak=%x", desired, effective, ok, peak.ID)
+	}
+	select {
+	case got := <-observed:
+		if got.selectorID != selector.ID || got.targetID != peak.ID || !got.peak || got.cause != cause {
+			t.Fatalf("peak observation=%+v want selector=%x target=%x peak=true cause=%q", got, selector.ID, peak.ID, cause)
+		}
+	default:
+		t.Fatal("committed peak policy was not observed after replay failure")
+	}
+	select {
+	case got := <-observed:
+		t.Fatalf("committed peak policy was observed more than once: %+v", got)
+	default:
+	}
+
+	if err := e.selectLocalTarget(
+		selector.ID, normal.ID, "probe-starved-data", policySelectionProbeStarvedData,
+	); err != nil {
+		t.Fatalf("factual peak departure: %v", err)
+	}
+	select {
+	case got := <-observed:
+		if got.selectorID != selector.ID || got.targetID != normal.ID || got.peak || got.cause != "probe-starved-data" {
+			t.Fatalf("factual departure observation=%+v want selector=%x target=%x peak=false", got, selector.ID, normal.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("factual peak departure was not observed")
 	}
 }
 
@@ -557,6 +1291,198 @@ func TestPolicyTransactionExpiryAndSupersededCommit(t *testing.T) {
 	})
 }
 
+func TestPolicyCommitCannotCrossReservationExpiryWhileWaitingForOwner(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 12, 0, fixture.selectorID, fixture.targetB)
+	prepareAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID)
+
+	fixture.engine.policyStateMu.Lock()
+	fixture.engine.policyIncoming.expires = time.Now().Add(40 * time.Millisecond)
+	expires := fixture.engine.policyIncoming.expires
+	fixture.engine.policyStateMu.Unlock()
+	reachedOwner := make(chan struct{})
+	var reachedOnce sync.Once
+	fixture.engine.policyCommitBeforeOwnerLock = func() {
+		reachedOnce.Do(func() { close(reachedOwner) })
+	}
+	fixture.engine.policyOwnerMu.Lock()
+	result := make(chan error, 1)
+	go func() { result <- fixture.engine.handlePolicyCommit(commit) }()
+	select {
+	case <-reachedOwner:
+	case <-time.After(time.Second):
+		fixture.engine.policyOwnerMu.Unlock()
+		t.Fatal("COMMIT did not pass its initial expiry check")
+	}
+	if wait := time.Until(expires) + time.Millisecond; wait > 0 {
+		time.Sleep(wait)
+	}
+	fixture.engine.policyOwnerMu.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired COMMIT remained blocked")
+	}
+
+	observations, err := fixture.recorder.snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) < 2 {
+		t.Fatalf("policy ACK observations=%d, want prepare and final", len(observations))
+	}
+	final := observations[len(observations)-1]
+	if final.ack.Phase != proto.PolicyAckPhaseFinal || final.ack.Code != proto.PolicyAckCodeSuperseded {
+		t.Fatalf("post-lock expiry ACK=%+v", final.ack)
+	}
+	generation, selection, pending, completed := policyTxUnitState(fixture.engine, fixture.selectorID)
+	if generation != 0 || selection != fixture.targetA || pending || completed != 1 || fixture.engine.ActivePath() != fixture.pathA {
+		t.Fatalf("expired COMMIT state: generation=%d selection=%x pending=%v completed=%d active=%d",
+			generation, selection, pending, completed, fixture.engine.ActivePath())
+	}
+}
+
+func TestSchedulerBookkeepingCannotOverwriteNewerExplicitSelection(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	runtime := fixture.engine.localExecutionRuntime()
+	reachedCommit := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	var hookOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCommit) }) })
+	fixture.engine.selectorDecisionAfterCommit = func() {
+		hookOnce.Do(func() { close(reachedCommit) })
+		<-releaseCommit
+	}
+	decisionDone := make(chan bool, 1)
+	now := time.Now()
+	go func() {
+		decisionDone <- (&selector{}).applyRecursiveDecisions(fixture.engine, runtime, []selectorDecision{{
+			selectorID: fixture.selectorID,
+			targetID:   fixture.targetB,
+			cause:      "quality",
+			origin:     policySelectionQuality,
+		}}, now)
+	}()
+	select {
+	case <-reachedCommit:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler decision did not reach committed bookkeeping")
+	}
+	explicitDone := make(chan error, 1)
+	go func() {
+		explicitDone <- fixture.engine.SelectExplicitTarget(fixture.selectorID, fixture.targetA, "explicit-newer")
+	}()
+	select {
+	case err := <-explicitDone:
+		t.Fatalf("explicit selection crossed scheduler bookkeeping: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseCommit) })
+	select {
+	case <-decisionDone:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler decision did not finish")
+	}
+	select {
+	case err := <-explicitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("newer explicit selection did not finish")
+	}
+	desired, effective, ok := runtime.selectedChild(fixture.selectorID)
+	generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID)
+	if !ok || desired != fixture.targetA || effective != fixture.targetA || generation != 2 ||
+		selection != fixture.targetA || pending || fixture.engine.ActivePath() != fixture.pathA {
+		t.Fatalf("newer selection diverged: desired=%x effective=%x ok=%t generation=%d selection=%x pending=%t active=%d",
+			desired, effective, ok, generation, selection, pending, fixture.engine.ActivePath())
+	}
+}
+
+func TestSchedulerDecisionCannotCommitAcrossTopologyEpoch(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	runtime := fixture.engine.localExecutionRuntime()
+	decisionEpoch := fixture.engine.currentPathTopologyEpoch()
+	fixture.engine.pathsMu.Lock()
+	fixture.engine.advancePathTopologyEpochLocked()
+	fixture.engine.pathsMu.Unlock()
+
+	beforeMigrations := fixture.engine.MigrationCount()
+	applied := (&selector{}).applyRecursiveDecisions(
+		fixture.engine,
+		runtime,
+		[]selectorDecision{{
+			selectorID: fixture.selectorID, targetID: fixture.targetB,
+			cause: "quality", origin: policySelectionQuality,
+			topologyEpoch: decisionEpoch,
+		}},
+		time.Now(),
+	)
+	if applied {
+		t.Fatal("stale quality decision was reported as a path-death commit")
+	}
+	desired, effective, _, ok := runtime.selectorSelection(fixture.selectorID)
+	generation, selection, pending, completed := policyTxUnitState(fixture.engine, fixture.selectorID)
+	cutoverPending, _ := fixture.engine.selectorCutoverSnapshot()
+	if !ok || desired != fixture.targetA || effective != fixture.targetA ||
+		generation != 0 || selection != fixture.targetA || pending || completed != 0 ||
+		fixture.engine.ActivePath() != fixture.pathA || fixture.engine.MigrationCount() != beforeMigrations ||
+		cutoverPending {
+		t.Fatalf(
+			"stale decision changed state desired/effective=%x/%x ok=%t generation=%d selection=%x pending/completed=%t/%d active=%d migrations=%d cutover=%t",
+			desired, effective, ok, generation, selection, pending, completed,
+			fixture.engine.ActivePath(), fixture.engine.MigrationCount(), cutoverPending,
+		)
+	}
+}
+
+func TestPeakTransferDecisionCannotCommitAcrossEndpointGeneration(t *testing.T) {
+	const (
+		normalName = "peak-epoch-normal"
+		peakName   = "peak-epoch-candidate"
+	)
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, normalName)
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, peakName)
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "peak-epoch-root", normal.ID, peak.ID)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
+	e, _, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, normalName, peakName)
+	now := time.Now()
+	handles[normalName].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
+	handles[peakName].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, At: now})
+
+	e.peakTransferDecisionBeforeCommit = func() {
+		e.pathsMu.Lock()
+		slot := e.paths[paths[peakName]]
+		slot.probeEndpointGen.Store(slot.probeEndpointGen.Load() + 1)
+		e.advancePathTopologyEpochLocked()
+		e.pathsMu.Unlock()
+	}
+	beforeMigrations := e.MigrationCount()
+	selected, err := e.SelectBestLocalPeakTransferTarget(selector.ID, nil, "peak-transfer")
+	if !errors.Is(err, errStaleSelectorEvidence) || selected != (proto.TargetID{}) {
+		t.Fatalf("selection=(%x,%v) want zero/%v", selected, err, errStaleSelectorEvidence)
+	}
+	desired, effective, _, ok := e.localExecutionRuntime().selectorSelection(selector.ID)
+	generation, policyTarget, pending, completed := policyTxUnitState(e, selector.ID)
+	if !ok || desired != normal.ID || effective != normal.ID || generation != 0 ||
+		policyTarget != normal.ID || pending || completed != 0 || e.ActivePath() != paths[normalName] ||
+		e.MigrationCount() != beforeMigrations {
+		t.Fatalf(
+			"stale peak decision changed state desired/effective=%x/%x ok=%t generation=%d target=%x pending/completed=%t/%d active=%d migrations=%d",
+			desired, effective, ok, generation, policyTarget, pending, completed,
+			e.ActivePath(), e.MigrationCount(),
+		)
+	}
+}
+
 func TestPolicyTransactionCompletedCacheIsBounded(t *testing.T) {
 	engine := &Engine{policyCompleted: make(map[[16]byte]completedPolicyTransaction)}
 	const extra = 3
@@ -671,8 +1597,12 @@ func TestPolicyTransactionRejectsNonImmediateSelectorChild(t *testing.T) {
 	if finalAck.ack.Code != proto.PolicyAckCodeAccept || finalAck.ack.CurrentTargetID != bond.ID {
 		t.Fatalf("immediate group target was not committed: %+v", finalAck.ack)
 	}
-	if finalAck.mode != dispatchBond || finalAck.activePath != paths[nameB] || finalAck.pathName != nameB {
-		t.Fatalf("bond child was not applied before final ACK: mode=%d active=%d path=%q", finalAck.mode, finalAck.activePath, finalAck.pathName)
+	if finalAck.activePath != paths[nameB] || finalAck.pathName != nameB {
+		t.Fatalf("bond child was not applied before final ACK: active=%d path=%q", finalAck.activePath, finalAck.pathName)
+	}
+	desired, effective, ok := engine.localExecutionRuntime().selectedChild(selector.ID)
+	if !ok || desired != bond.ID || effective != bond.ID {
+		t.Fatalf("committed selector state desired=%x effective=%x ok=%t", desired, effective, ok)
 	}
 }
 
@@ -741,7 +1671,7 @@ func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
 			t.Fatal(err)
 		}
 		fixture.engine.policyStateMu.Lock()
-		ack := fixture.engine.policyRejectLocked(stale.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, fixture.selectorID, "base generation is stale")
+		ack := fixture.engine.policyRejectLocked(stale.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, fixture.selectorID, "base generation is stale")
 		fixture.engine.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: stale, digest: digest, prepareAck: ack})
 		fixture.engine.policyStateMu.Unlock()
 	}
@@ -765,7 +1695,7 @@ func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
 	}
 }
 
-func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
+func TestPolicyFinalAckRequiresCommitReceipt(t *testing.T) {
 	fixture := newPolicyTxUnitFixture(t)
 	peer := fixture.engine.peerGraphBinding()
 	prepare := proto.PolicyPrepare{
@@ -796,6 +1726,7 @@ func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
 		PolicyTransactionBinding: prepare.PolicyTransactionBinding,
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               1,
+		ResolvedTargetID:         fixture.targetB,
 		ProposalDigest:           digest,
 		ReservationID:            proto.PolicyReservationID{1},
 	}
@@ -805,6 +1736,7 @@ func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
 	finalAck.Phase = proto.PolicyAckPhaseFinal
 	finalAck.CurrentGeneration = 1
 	finalAck.CurrentTargetID = fixture.targetB
+	finalAck.CommitChallenge = proto.PolicyCommitChallenge{0x44}
 	for i := 0; i < 32; i++ {
 		if err := fixture.engine.handlePolicyAck(prepareAck); err != nil {
 			t.Fatal(err)
@@ -813,8 +1745,24 @@ func TestPolicyAckPhaseMailboxesCannotDisplaceFinalAck(t *testing.T) {
 	if err := fixture.engine.handlePolicyAck(finalAck); err != nil {
 		t.Fatal(err)
 	}
+	if len(tx.prepareAcks) != 1 || len(tx.finalAcks) != 0 {
+		t.Fatalf("early FINAL mailbox depths=%d/%d want=1/0", len(tx.prepareAcks), len(tx.finalAcks))
+	}
+	fixture.engine.policyStateMu.Lock()
+	tx.commitChallenge = finalAck.CommitChallenge
+	tx.commitDispatched = true
+	fixture.engine.policyStateMu.Unlock()
+	changed := finalAck
+	changed.CommitChallenge[1] = 1
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyAck(changed))
+	if len(tx.finalAcks) != 0 {
+		t.Fatal("mismatched FINAL entered the commit mailbox")
+	}
+	if err := fixture.engine.handlePolicyAck(finalAck); err != nil {
+		t.Fatal(err)
+	}
 	if len(tx.prepareAcks) != 1 || len(tx.finalAcks) != 1 {
-		t.Fatalf("phase mailbox depths=%d/%d want=1/1", len(tx.prepareAcks), len(tx.finalAcks))
+		t.Fatalf("bound phase mailbox depths=%d/%d want=1/1", len(tx.prepareAcks), len(tx.finalAcks))
 	}
 }
 
@@ -824,9 +1772,8 @@ func TestPolicyInboxCoalescesExactDuplicatePhase(t *testing.T) {
 		policyQueued: make(map[policyMessageKey]struct{}),
 	}
 	key := policyMessageKey{
-		kind:          policyMessagePrepare,
-		transactionID: [16]byte{91},
-		digest:        proto.PolicyProposalDigest{1},
+		kind: policyMessagePrepare, seq: 91,
+		frameDigest: proto.FrameDigest{1},
 	}
 	message := policyMessage{kind: policyMessagePrepare, key: key}
 	for i := 0; i < 1024; i++ {
@@ -845,6 +1792,53 @@ func TestPolicyInboxCoalescesExactDuplicatePhase(t *testing.T) {
 	}
 }
 
+func TestPolicyInboxDoesNotCoalesceDifferentFrameReceipt(t *testing.T) {
+	e := &Engine{
+		policyInbox:  make(chan policyMessage, 2),
+		policyQueued: make(map[policyMessageKey]struct{}),
+	}
+	first := policyMessage{
+		kind: policyMessageCommit,
+		key:  policyMessageKey{kind: policyMessageCommit, seq: 7, frameDigest: proto.FrameDigest{1}},
+	}
+	second := first
+	second.key.frameDigest[0] = 2
+	if !e.enqueuePolicyMessageLocked(first) || !e.enqueuePolicyMessageLocked(second) {
+		t.Fatal("distinct policy frame receipt was rejected")
+	}
+	if got := len(e.policyInbox); got != 2 {
+		t.Fatalf("distinct policy receipts coalesced to depth=%d", got)
+	}
+}
+
+func TestCompletedPolicyCommitRejectsChangedReservation(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 0x92, 0, fixture.selectorID, fixture.targetB)
+	prepared := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyCommit(commit)
+	})
+	commit.ReservationID[0] ^= 0xff
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(commit))
+}
+
+func TestCompletedPolicyCommitRejectsChangedChallenge(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 0x93, 0, fixture.selectorID, fixture.targetB)
+	prepared := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyCommit(commit)
+	})
+	commit.CommitChallenge[31] ^= 1
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(commit))
+}
+
 func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	pathA := policyTxUnitNode(proto.GraphNodeKindPath, "scope-fallback-a")
 	pathB := policyTxUnitNode(proto.GraphNodeKindPath, "scope-selected-b")
@@ -859,8 +1853,8 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 	if err := engine.SelectLocalTarget(root.ID, bond.ID, "select-bond"); err != nil {
 		t.Fatal(err)
 	}
-	if engine.Mode() != dispatchBond || engine.ActivePath() != paths[pathB.Name] {
-		t.Fatalf("bond selection mode/active=%d/%d", engine.Mode(), engine.ActivePath())
+	if engine.ActivePath() != paths[pathB.Name] {
+		t.Fatalf("bond selection active=%d want=%d", engine.ActivePath(), paths[pathB.Name])
 	}
 	type zombieObservation struct {
 		active        uint32
@@ -912,12 +1906,12 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 		t.Fatalf("second fallback closed after credited payload: %v", err)
 	}
 	engine.pathsMu.RLock()
-	scopeLen := len(engine.dispatchScope)
-	scopeHasFallback := engine.dispatchScope[paths[pathA.Name]]
+	projected := engine.localExecutionRuntime().effectiveLeafTargets(engine.attachedLeafTargetsLocked())
 	engine.pathsMu.RUnlock()
-	if scopeLen != 1 || !scopeHasFallback {
-		t.Fatalf("recursive death fallback scope len=%d has-A=%v", scopeLen, scopeHasFallback)
+	if len(projected) != 1 || !projected[pathA.ID] {
+		t.Fatalf("recursive death fallback leaves=%v want only A", projected)
 	}
+	writesBefore := pathHandles[pathA.Name].dataWrites.Load()
 	done := make(chan error, 1)
 	go func() {
 		_, err := engine.SendData([]byte("fallback"))
@@ -930,6 +1924,13 @@ func TestPolicySelectedScopeDeathFallsBackWithoutSpin(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("bond dispatch spun after selected scope death")
+	}
+	deadline := time.Now().Add(time.Second)
+	for pathHandles[pathA.Name].dataWrites.Load() <= writesBefore && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if writes := pathHandles[pathA.Name].dataWrites.Load(); writes <= writesBefore {
+		t.Fatalf("fallback DATA did not reach A after cutover handoff: writes %d -> %d", writesBefore, writes)
 	}
 }
 

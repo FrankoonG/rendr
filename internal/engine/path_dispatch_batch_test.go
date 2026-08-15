@@ -100,7 +100,7 @@ func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 	e, slot, path := newBatchDispatchHarness(t, true)
 	waiters := make([]*applicationDispatchWaiter, maximumPathDispatchBatch)
 	for i := range waiters {
-		waiters[i] = queueBatchApplicationJob(t, slot, uint64(i), true)
+		waiters[i] = queueBatchApplicationJob(t, e, slot, uint64(i), true)
 	}
 	startBatchDispatchHarness(t, e, slot)
 	for i, waiter := range waiters {
@@ -235,7 +235,7 @@ func TestPathWriterBatchPartialBoundaryCompletesOnlyWholePrefix(t *testing.T) {
 	}
 	waiters := make([]*applicationDispatchWaiter, 8)
 	for i := range waiters {
-		waiters[i] = queueBatchApplicationJob(t, slot, uint64(i), true)
+		waiters[i] = queueBatchApplicationJob(t, e, slot, uint64(i), true)
 	}
 	startBatchDispatchHarness(t, e, slot)
 	for i, waiter := range waiters {
@@ -261,6 +261,113 @@ func TestPathWriterBatchPartialBoundaryCompletesOnlyWholePrefix(t *testing.T) {
 	}
 }
 
+func TestPathWriterBatchPartialAttributionCommitsOnlyCompletedPrefix(t *testing.T) {
+	injected := errors.New("injected partial attribution failure")
+	e, slot, path := newBatchDispatchHarness(t, true)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+		runtimeNode(proto.GraphNodeKindPath, "path"),
+	)
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	slot.localTXTargetID = ids["path"]
+	path.batchHook = func(frames [][]byte) (int, error) { return 5, injected }
+
+	waiters := make([]*applicationDispatchWaiter, 8)
+	for i := range waiters {
+		frame := executionDataFrame(t, uint64(i), []byte{byte(i)})
+		if err := e.acquireSendSlot(false, len(frame)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reserveOwnedSendFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+		e.publishSendSeq(uint64(i + 1))
+		waiters[i] = queueBatchApplicationFrame(t, e, slot, frame, true)
+	}
+	startBatchDispatchHarness(t, e, slot)
+	for i, waiter := range waiters {
+		result := awaitBatchDispatchResult(t, waiter)
+		if i < 5 && result.err != nil {
+			t.Fatalf("completed frame %d: %v", i, result.err)
+		}
+		if i >= 5 && !errors.Is(result.err, injected) {
+			t.Fatalf("suffix frame %d error=%v", i, result.err)
+		}
+	}
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	for index := range e.sendHist.entries {
+		entry := e.sendHist.entries[index]
+		if index < 5 {
+			if !entry.deliveryRouteSeen || !entry.deliveryAttributable || entry.deliveryRouteTarget != ids["path"] {
+				t.Fatalf("completed entry %d attribution=%+v", index, entry)
+			}
+			continue
+		}
+		if entry.deliveryRouteSeen || entry.rootRouteSeen || entry.batchAttribution != nil {
+			t.Fatalf("incomplete suffix entry %d retained provisional attribution=%+v", index, entry)
+		}
+	}
+}
+
+func TestBatchAckBeforeZeroCompletedReturnPreservesUniqueDelivery(t *testing.T) {
+	manifest, _ := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+		runtimeNode(proto.GraphNodeKindPath, "path"),
+	)
+	flow := NewClientFlowID()
+	client := New(SideClient, flow, Limits{}.Clamp())
+	server := New(SideServer, flow, Limits{}.Clamp())
+	client.SetPacketMode()
+	server.SetPacketMode()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	configureRecursivePair(t, client, server, manifest)
+	clientBase, serverPath := newMemoryPathPair()
+	batchPath := newRecordingFrameBatchPath(clientBase)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	batchPath.batchHook = func(frames [][]byte) (int, error) {
+		if len(frames) != 1 {
+			return 0, errors.New("unexpected batch size")
+		}
+		if _, err := clientBase.Write(frames[0]); err != nil {
+			return 0, err
+		}
+		<-release
+		return 0, errors.New("adapter returned stale completion count")
+	}
+	attachRecursivePath(t, client, server, "path", batchPath, serverPath)
+	if err := client.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- client.SendPacket([]byte("acked-before-batch-return")) }()
+	awaitSignal(t, batchPath.batchStarted, "batch start")
+	eventuallyEngine(t, time.Second, func() bool { return client.sendAckNext.Load() >= 1 })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("peer ACK did not linearize packet success: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("packet remained blocked after proof-valid ACK")
+	}
+	releaseOnce.Do(func() { close(release) })
+	eventuallyEngine(t, time.Second, func() bool {
+		return client.ApplicationDelivery().AckedPayloadBytes == uint64(len("acked-before-batch-return"))
+	})
+	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := server.RecvPacket()
+	if err != nil || string(packet) != "acked-before-batch-return" {
+		t.Fatalf("packet=%q err=%v", packet, err)
+	}
+}
+
 func TestPathWriterFenceDuringBatchWaitsForIndivisiblePhysicalCall(t *testing.T) {
 	e, slot, path := newBatchDispatchHarness(t, true)
 	release := make(chan struct{})
@@ -274,7 +381,7 @@ func TestPathWriterFenceDuringBatchWaitsForIndivisiblePhysicalCall(t *testing.T)
 	}
 	waiters := make([]*applicationDispatchWaiter, 4)
 	for i := range waiters {
-		waiters[i] = queueBatchApplicationJob(t, slot, uint64(i), true)
+		waiters[i] = queueBatchApplicationJob(t, e, slot, uint64(i), true)
 	}
 	startBatchDispatchHarness(t, e, slot)
 	awaitSignal(t, path.batchStarted, "batch start")
@@ -316,7 +423,7 @@ func TestPathWriterCloseFailsBlockedBatchPerJob(t *testing.T) {
 	}
 	waiters := make([]*applicationDispatchWaiter, 3)
 	for i := range waiters {
-		waiters[i] = queueBatchApplicationJob(t, slot, uint64(i), true)
+		waiters[i] = queueBatchApplicationJob(t, e, slot, uint64(i), true)
 	}
 	startBatchDispatchHarness(t, e, slot)
 	awaitSignal(t, path.batchStarted, "batch start")
@@ -333,10 +440,10 @@ func TestPathWriterCloseFailsBlockedBatchPerJob(t *testing.T) {
 
 func TestPathWriterBatchStopsAtMixedControlAndDataBoundary(t *testing.T) {
 	e, slot, path := newBatchDispatchHarness(t, true)
-	first := queueBatchApplicationJob(t, slot, 0, true)
-	second := queueBatchApplicationJob(t, slot, 1, true)
+	first := queueBatchApplicationJob(t, e, slot, 0, true)
+	second := queueBatchApplicationJob(t, e, slot, 1, true)
 	controlResult := queueBatchControlJob(t, slot, 2)
-	third := queueBatchApplicationJob(t, slot, 3, true)
+	third := queueBatchApplicationJob(t, e, slot, 3, true)
 	startBatchDispatchHarness(t, e, slot)
 	for _, waiter := range []*applicationDispatchWaiter{first, second} {
 		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
@@ -369,7 +476,7 @@ func TestPathWriterBatchDoesNotWaitForAnotherFrame(t *testing.T) {
 	e.packetWritesInFlight.Store(1)
 	e.pathDispatchBatchYield = func() { t.Fatal("single packet writer yielded to build a batch") }
 	startBatchDispatchHarness(t, e, slot)
-	waiter := queueBatchApplicationJob(t, slot, 0, true)
+	waiter := queueBatchApplicationJob(t, e, slot, 0, true)
 	awaitSignal(t, path.batchStarted, "single-frame batch without a following job")
 	if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
 		t.Fatal(result.err)
@@ -390,10 +497,10 @@ func TestPathWriterYieldsOnlyForExistingConcurrentPacketWriter(t *testing.T) {
 	var second *applicationDispatchWaiter
 	var once sync.Once
 	e.pathDispatchBatchYield = func() {
-		once.Do(func() { second = queueBatchApplicationJob(t, slot, 1, true) })
+		once.Do(func() { second = queueBatchApplicationJob(t, e, slot, 1, true) })
 	}
 	startBatchDispatchHarness(t, e, slot)
-	first := queueBatchApplicationJob(t, slot, 0, true)
+	first := queueBatchApplicationJob(t, e, slot, 0, true)
 	if result := awaitBatchDispatchResult(t, first); result.err != nil {
 		t.Fatal(result.err)
 	}
@@ -412,7 +519,7 @@ func TestPathWriterYieldsOnlyForExistingConcurrentPacketWriter(t *testing.T) {
 func TestPathWriterFallsBackForOrdinaryPathConn(t *testing.T) {
 	e, slot, _ := newBatchDispatchHarness(t, false)
 	startBatchDispatchHarness(t, e, slot)
-	waiter := queueBatchApplicationJob(t, slot, 0, true)
+	waiter := queueBatchApplicationJob(t, e, slot, 0, true)
 	if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
 		t.Fatal(result.err)
 	}
@@ -439,7 +546,7 @@ func TestPathWriterBatchExtensionLeavesStreamAndReplayWritesOrdinary(t *testing.
 		e.packetized = false
 		e.recvMu.Unlock()
 		startBatchDispatchHarness(t, e, slot)
-		waiter := queueBatchApplicationJob(t, slot, 0, true)
+		waiter := queueBatchApplicationJob(t, e, slot, 0, true)
 		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
 			t.Fatal(result.err)
 		}
@@ -752,6 +859,247 @@ func TestAcceptedPacketReturnsAfterBoundedCustodyBeforePhysicalCompletion(t *tes
 	})
 }
 
+func TestAcceptedPacketRouteSnapshotDoesNotDeadlockReplacementActivation(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{MigrationBudget: time.Second}.Clamp())
+	e.SetPacketMode()
+	e.tailReplayInitialDelay = time.Hour
+	e.tailReplayMaxBackoff = time.Hour
+	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
+	binding := PathBinding{LocalTXTargetID: targets["path"], PeerTXTargetID: targets["path"]}
+
+	oldBase, oldPeer := newMemoryPathPair()
+	oldPath := newRecordingFrameBatchPath(oldBase)
+	t.Cleanup(func() { _ = oldPeer.Close() })
+	if _, err := e.AttachPathBound(oldPath, transport.PathSpec{
+		Transport: "memory", Address: "packet-lock-order-old",
+	}, binding); err != nil {
+		t.Fatal(err)
+	}
+	newBase, newPeer := newMemoryPathPair()
+	newPath := newRecordingFrameBatchPath(newBase)
+	t.Cleanup(func() { _ = newPeer.Close() })
+	replacementID, err := e.PreparePathBound(newPath, transport.PathSpec{
+		Transport: "memory", Address: "packet-lock-order-new",
+	}, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+
+	routeSnapshotted := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	var snapshotOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseAdmission) }) })
+	e.acceptedPacketAfterRouteSnapshot = func() {
+		snapshotOnce.Do(func() {
+			close(routeSnapshotted)
+			<-releaseAdmission
+		})
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		_, sendErr := e.SendPacketAcceptedResult([]byte("replacement-lock-order"))
+		sendDone <- sendErr
+	}()
+	awaitSignal(t, routeSnapshotted, "accepted packet route snapshot")
+
+	activated := make(chan error, 1)
+	go func() { activated <- e.ActivateStagedPath(replacementID, false) }()
+	select {
+	case activateErr := <-activated:
+		if activateErr != nil {
+			t.Fatal(activateErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement activation deadlocked behind accepted packet custody")
+	}
+	if active := e.ActivePath(); active != replacementID {
+		t.Fatalf("active path=%d want replacement=%d", active, replacementID)
+	}
+
+	releaseOnce.Do(func() { close(releaseAdmission) })
+	select {
+	case sendErr := <-sendDone:
+		if sendErr != nil {
+			t.Fatalf("accepted packet after replacement: %v", sendErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted packet remained blocked after replacement activation")
+	}
+	awaitSignal(t, newPath.batchStarted, "replacement packet dispatch")
+	if batches, _, _ := oldPath.snapshot(); len(batches) != 0 {
+		t.Fatalf("retired incarnation accepted packet batches: %v", batches)
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		batches, _, _ := newPath.snapshot()
+		for _, batch := range batches {
+			for _, seq := range batch {
+				if seq == 0 {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
+func TestAcceptedPacketRouteEpochRedispatchesAcrossDifferentLeafRecovery(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	flow := NewClientFlowID()
+	client := New(SideClient, flow, Limits{MigrationBudget: time.Second}.Clamp())
+	server := New(SideServer, flow, Limits{MigrationBudget: time.Second}.Clamp())
+	client.SetPacketMode()
+	server.SetPacketMode()
+	client.tailReplayInitialDelay = time.Hour
+	client.tailReplayMaxBackoff = time.Hour
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	configureRecursivePair(t, client, server, manifest)
+
+	clientABase, serverA := newMemoryPathPair()
+	clientA := newRecordingFrameBatchPath(clientABase)
+	clientAID := attachFixturePath(t, client, clientA,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-a-client"}, ids["a"])
+	serverAID := attachFixturePath(t, server, serverA,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-a-server"}, ids["a"])
+	oldClientB, oldServerB := newMemoryPathPair()
+	clientBID := attachFixturePath(t, client, oldClientB,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-old-b-client"}, ids["b"])
+	serverBID := attachFixturePath(t, server, oldServerB,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-old-b-server"}, ids["b"])
+	if err := client.SelectExplicitTarget(ids["root"], ids["b"], "select-old-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SelectExplicitTarget(ids["root"], ids["b"], "select-old-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Administrative removal preserves B as the desired selector child while
+	// the data plane falls back to A. The peer retirement may remove server B
+	// before the symmetric call reaches it, so revalidate that exact path ID.
+	if err := client.RemovePath(clientBID); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := server.PathRef(serverBID); present {
+		if err := server.RemovePath(serverBID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		_, present := server.PathRef(serverBID)
+		return !present
+	})
+	if client.ActivePath() != clientAID || server.ActivePath() != serverAID {
+		t.Fatalf("fallback active client/server=%d/%d want A=%d/%d",
+			client.ActivePath(), server.ActivePath(), clientAID, serverAID)
+	}
+
+	newClientBBase, newServerB := newMemoryPathPair()
+	newClientB := newRecordingFrameBatchPath(newClientBBase)
+	if _, err := server.AttachPathBound(newServerB,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-new-b-server"},
+		PathBinding{LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"]}); err != nil {
+		t.Fatal(err)
+	}
+	replacementID, err := client.PreparePathBound(newClientB,
+		transport.PathSpec{Transport: "memory", Address: "route-epoch-new-b-client"},
+		PathBinding{LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.StagePathAttach(replacementID); err != nil {
+		t.Fatal(err)
+	}
+
+	routeSnapshotted := make(chan struct{})
+	releaseRoute := make(chan struct{})
+	var routeOnce, releaseRouteOnce sync.Once
+	t.Cleanup(func() {
+		releaseRouteOnce.Do(func() { close(releaseRoute) })
+	})
+	client.acceptedPacketAfterRouteSnapshot = func() {
+		routeOnce.Do(func() {
+			close(routeSnapshotted)
+			<-releaseRoute
+		})
+	}
+
+	// Hold replay request publication until the epoch-stale accepted writer has
+	// redispatched on B and received its ACK. This isolates the custody race:
+	// the subsequent recovery replay observes the advanced ACK frontier and
+	// must not physically publish the same DATA a second time.
+	client.replayMu.Lock()
+	var replayUnlockOnce sync.Once
+	unlockReplay := func() { replayUnlockOnce.Do(func() { client.replayMu.Unlock() }) }
+	t.Cleanup(unlockReplay)
+
+	sendDone := make(chan error, 1)
+	go func() {
+		_, sendErr := client.SendPacketAcceptedResult([]byte("different-leaf-recovery"))
+		sendDone <- sendErr
+	}()
+	awaitSignal(t, routeSnapshotted, "fallback A route snapshot")
+
+	activated := make(chan error, 1)
+	go func() { activated <- client.ActivateStagedPath(replacementID, false) }()
+	eventuallyEngine(t, time.Second, func() bool { return client.ActivePath() == replacementID })
+
+	releaseRouteOnce.Do(func() { close(releaseRoute) })
+	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := server.RecvPacket()
+	if err != nil || string(packet) != "different-leaf-recovery" {
+		t.Fatalf("server packet=%q err=%v", packet, err)
+	}
+	target := client.sendPublishedNext.Load()
+	ackDone := make(chan bool, 1)
+	go func() { ackDone <- client.notePeerAck(currentAck(client, target)) }()
+	eventuallyEngine(t, time.Second, func() bool { return client.sendAckNext.Load() == target })
+	unlockReplay()
+	select {
+	case valid := <-ackDone:
+		if !valid {
+			t.Fatal("proof-valid recovery ACK was rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery ACK did not finish after replay release")
+	}
+	select {
+	case sendErr := <-sendDone:
+		if sendErr != nil {
+			t.Fatal(sendErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted packet did not redispatch after B recovery")
+	}
+	select {
+	case activateErr := <-activated:
+		if activateErr != nil {
+			t.Fatal(activateErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("different-leaf B recovery did not finish after replay release")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := server.RecvDups(); got != 0 {
+		t.Fatalf("recovery produced %d duplicate packet deliveries", got)
+	}
+
+	if got := clientABase.dataWrites.Load(); got != 0 {
+		t.Fatalf("stale fallback A published %d DATA frames", got)
+	}
+	if got := newClientBBase.dataWrites.Load(); got != 1 {
+		t.Fatalf("recovered B physical DATA publications=%d want 1", got)
+	}
+}
+
 func TestAcceptedPacketLinearizesBeforeGracefulClose(t *testing.T) {
 	manifest, _ := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
@@ -960,11 +1308,31 @@ func startBatchDispatchHarness(t *testing.T, e *Engine, slot *pathSlot) {
 	go e.pathWriterLoop(slot)
 }
 
-func queueBatchApplicationJob(t *testing.T, slot *pathSlot, seq uint64, firstPublication bool) *applicationDispatchWaiter {
+func queueBatchApplicationJob(
+	t *testing.T,
+	e *Engine,
+	slot *pathSlot,
+	seq uint64,
+	firstPublication bool,
+) *applicationDispatchWaiter {
+	t.Helper()
+	return queueBatchApplicationFrame(
+		t, e, slot, executionDataFrame(t, seq, []byte{byte(seq)}), firstPublication,
+	)
+}
+
+func queueBatchApplicationFrame(
+	t *testing.T,
+	e *Engine,
+	slot *pathSlot,
+	frame []byte,
+	firstPublication bool,
+) *applicationDispatchWaiter {
 	t.Helper()
 	waiter := acquireApplicationDispatchWaiter()
 	job := pathDispatchJob{
-		frame:            executionDataFrame(t, seq, []byte{byte(seq)}),
+		frame:            frame,
+		topologyEpoch:    e.currentPathTopologyEpoch(),
 		firstPublication: firstPublication,
 		applicationWait:  waiter,
 		generation:       slot.dispatchNextGen.Add(1),

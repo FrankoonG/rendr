@@ -23,6 +23,8 @@ import (
 // adapter discards oversize writes.
 const MaxDatagram = 1400
 
+var _ transport.PathQualityReader = (*PathConn)(nil)
+
 // Transport opens framed paths over opaque UDP. spec.Opts
 // recognised keys:
 //
@@ -221,6 +223,13 @@ func (p *PathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
+}
+
+func (p *PathConn) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.PathQuality{}, err
+	}
+	return p.Quality(), nil
 }
 
 func (p *PathConn) SetQuality(q transport.PathQuality) {

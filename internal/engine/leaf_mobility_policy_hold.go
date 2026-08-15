@@ -10,21 +10,22 @@ import (
 // stable while that leaf's endpoint transaction is in flight. It does not
 // fence control traffic or unrelated selectors.
 type leafMobilityPolicyHold struct {
-	slot *pathSlot
-	mu   sync.Mutex
-	held bool
-	done bool
+	slot         *pathSlot
+	faultDerived bool
+	mu           sync.Mutex
+	held         bool
+	done         bool
 }
 
-func newLeafMobilityPolicyHold(slot *pathSlot) *leafMobilityPolicyHold {
+func newLeafMobilityPolicyHold(slot *pathSlot, faultDerived bool) *leafMobilityPolicyHold {
 	if slot == nil {
 		return nil
 	}
-	return &leafMobilityPolicyHold{slot: slot}
+	return &leafMobilityPolicyHold{slot: slot, faultDerived: faultDerived}
 }
 
 func holdLeafMobilityPolicy(slot *pathSlot) *leafMobilityPolicyHold {
-	hold := newLeafMobilityPolicyHold(slot)
+	hold := newLeafMobilityPolicyHold(slot, false)
 	if hold != nil {
 		hold.Promote()
 	}
@@ -41,6 +42,9 @@ func (h *leafMobilityPolicyHold) Promote() bool {
 		return false
 	}
 	if !h.held {
+		if h.faultDerived {
+			h.slot.mobilityFaultPolicyHolds.Add(1)
+		}
 		h.slot.mobilityPolicyHolds.Add(1)
 		h.held = true
 	}
@@ -61,6 +65,9 @@ func (h *leafMobilityPolicyHold) Release() {
 		if h.slot.mobilityPolicyHolds.Add(-1) < 0 {
 			panic("engine: leaf mobility policy hold underflow")
 		}
+		if h.faultDerived && h.slot.mobilityFaultPolicyHolds.Add(-1) < 0 {
+			panic("engine: leaf mobility fault policy hold underflow")
+		}
 	}
 }
 
@@ -77,11 +84,11 @@ func (e *Engine) acquireLeafMobilityPolicyHold(slot *pathSlot) *leafMobilityPoli
 // acquireSelectedLeafMobilityPolicyHold linearizes a factual endpoint-change
 // event with selector commits. If policy already moved elsewhere, the event
 // may still refresh the inactive endpoint but must not pin the new branch.
-func (e *Engine) acquireSelectedLeafMobilityPolicyHold(slot *pathSlot) *leafMobilityPolicyHold {
+func (e *Engine) acquireSelectedLeafMobilityPolicyHold(slot *pathSlot, faultDerived bool) *leafMobilityPolicyHold {
 	if e == nil || slot == nil {
 		return nil
 	}
-	hold := newLeafMobilityPolicyHold(slot)
+	hold := newLeafMobilityPolicyHold(slot, faultDerived)
 	e.pathsMu.RLock()
 	present := false
 	for _, slots := range []map[uint32]*pathSlot{e.paths, e.pendingPaths, e.stagedPaths} {
@@ -117,13 +124,16 @@ func (e *Engine) acquireLeafMobilityPolicyHoldOwned(slot *pathSlot) *leafMobilit
 	return holdLeafMobilityPolicy(slot)
 }
 
-func (e *Engine) policySelectionHeldByLeafMobility(selectorID, targetID proto.TargetID) bool {
+func (e *Engine) policySelectionHeldByLeafMobility(
+	selectorID, targetID proto.TargetID,
+	origin policySelectionOrigin,
+) bool {
 	runtime := e.localExecutionRuntime()
 	if runtime == nil || runtime.plan == nil {
 		return false
 	}
 	e.pathsMu.RLock()
-	held := e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID)
+	held := e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID, origin)
 	e.pathsMu.RUnlock()
 	return held
 }
@@ -134,6 +144,7 @@ func (e *Engine) policySelectionHeldByLeafMobility(selectorID, targetID proto.Ta
 func (e *Engine) policySelectionHeldByLeafMobilityLocked(
 	runtime *executionRuntime,
 	selectorID, targetID proto.TargetID,
+	origin policySelectionOrigin,
 ) bool {
 	refs := e.policySwitchPhysicalPathRefsLocked(runtime, selectorID, targetID)
 	if len(refs) == 0 {
@@ -141,7 +152,14 @@ func (e *Engine) policySelectionHeldByLeafMobilityLocked(
 	}
 	for ref := range refs {
 		slot := e.paths[ref.ID]
-		if slot != nil && slot.owner == ref.Owner && slot.mobilityPolicyHolds.Load() > 0 {
+		if slot == nil || slot.owner != ref.Owner {
+			continue
+		}
+		holds := slot.mobilityPolicyHolds.Load()
+		if origin.isFactualFailure() {
+			holds -= slot.mobilityFaultPolicyHolds.Load()
+		}
+		if holds > 0 {
 			return true
 		}
 	}
@@ -165,10 +183,7 @@ func (e *Engine) pathSlotInEffectiveProjectionLocked(runtime *executionRuntime, 
 		return false
 	}
 	if runtime == nil || runtime.plan == nil {
-		if len(e.dispatchScope) > 0 {
-			return e.dispatchScope[slot.id]
-		}
-		return e.activeID == slot.id
+		return false
 	}
 	leaves := runtime.effectiveLeafTargets(e.attachedLeafTargetsLocked())
 	return leaves[slot.localTXTargetID]

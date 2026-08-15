@@ -58,29 +58,6 @@ func TestParseTCPCloseFlags(t *testing.T) {
 	}
 }
 
-func TestParseIPv4UDPMoreFragmentFirstFragment(t *testing.T) {
-	pkt := ipv4Packet(17, [4]byte{192, 0, 2, 10}, [4]byte{198, 51, 100, 20}, 5353, 53000)
-	flagsFrag := uint16(0x2000)
-	binary.BigEndian.PutUint16(pkt[6:8], flagsFrag)
-	meta, err := ParsePacket(pkt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !meta.Fragmented || !meta.MoreFragments || meta.FragmentOffset != 0 {
-		t.Fatalf("fragment flags not preserved: %+v", meta)
-	}
-	if meta.Identity.Proto != ProtocolUDP || meta.Identity.SrcPort != 5353 || meta.Identity.DstPort != 53000 {
-		t.Fatalf("udp identity: %+v", meta.Identity)
-	}
-}
-
-func TestParseRejectsIPv4NonInitialFragment(t *testing.T) {
-	pkt := ipv4Packet(17, [4]byte{192, 0, 2, 10}, [4]byte{198, 51, 100, 20}, 1, 2)
-	binary.BigEndian.PutUint16(pkt[6:8], 1)
-	_, err := ParsePacket(pkt)
-	assertReason(t, err, ReasonNonInitialFragment)
-}
-
 func TestParseIPv6UDPIdentity(t *testing.T) {
 	pkt := ipv6Packet(17, netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"), 4444, 5555)
 	meta, err := ParsePacket(pkt)

@@ -1,4 +1,4 @@
-//go:build rendr_experimental_gvisor
+//go:build linux && amd64 && rendr_experimental_gvisor
 
 package gvisor
 

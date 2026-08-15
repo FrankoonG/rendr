@@ -365,8 +365,9 @@ func TestMobilityCapabilityRuntimeNegotiatesProviderUnionAndRoundTripsStream(t *
 	); err != nil {
 		t.Fatalf("server frozen peer negotiation does not carry provider union: %v", err)
 	}
-	if len(client.Paths()) != 2 || len(server.Paths()) != 2 {
-		t.Fatalf("attached path count = client:%d server:%d, want 2 on both", len(client.Paths()), len(server.Paths()))
+	if !waitForRuntimePathCount(client, server, 2, 3*time.Second) {
+		t.Fatalf("provider paths did not converge after background attachment: client_status=%+v server_status=%+v",
+			client.Status(), server.Status())
 	}
 	assertMobilityCapabilityStreamRoundTrip(t, client, server, []byte("provider-union"))
 }

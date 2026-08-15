@@ -491,7 +491,11 @@ func (p *LeafMobilityPermit) failClosedAfterUnprovenCommit(cause error) error {
 	}
 	terminalErr := fmt.Errorf("%w: irreversible driver commit is unproven: %w", ErrLeafMobilityOutcomeUnknown, cause)
 	p.token.engine.sessionEpochMu.Lock()
+	p.token.engine.policyLifecycleMu.Lock()
+	p.token.engine.policyStateMu.Lock()
 	p.token.engine.sendClosing.Store(true)
+	p.token.engine.policyStateMu.Unlock()
+	p.token.engine.policyLifecycleMu.Unlock()
 	p.token.engine.sessionEpochMu.Unlock()
 	p.token.engine.setCloseErr(terminalErr)
 	p.token.outcomeUnknownSerialized(terminalErr)

@@ -105,9 +105,7 @@ func TestMaximumDataQualificationUsesFullDataBudget(t *testing.T) {
 			t.Fatalf("qualification leg %d frame=%+v err=%v", index, frame, err)
 		}
 	}
-	peer.mu.Lock()
-	pending := peer.pendingPeer
-	peer.mu.Unlock()
+	pending := waitForPeerQualification(t, peer, 2, control)
 	if pending == nil || !pending.qualified || pending.generation != 2 || pending.control != control {
 		t.Fatalf("peer maximum-DATA proof=%+v", pending)
 	}
@@ -193,15 +191,34 @@ func TestPublishCandidateRequalifiesMaximumData(t *testing.T) {
 				t.Fatal("failed qualification replaced the active packet wire")
 			}
 			if published {
-				peer.mu.Lock()
-				qualified := peer.pendingPeer != nil && peer.pendingPeer.qualified
-				peer.mu.Unlock()
-				if !qualified {
+				pending := waitForPeerQualification(t, peer, 2, control)
+				if pending == nil || !pending.qualified || pending.generation != 2 || pending.control != control {
 					t.Fatal("publication did not leave a fresh peer-received maximum-DATA proof")
 				}
 			}
 		})
 	}
+}
+
+func waitForPeerQualification(t testing.TB, peer *linkOwner, generation uint64, control outerControl) *peerCandidate {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var last *peerCandidate
+	for time.Now().Before(deadline) {
+		peer.mu.Lock()
+		pending := peer.pendingPeer
+		if pending != nil {
+			snapshot := *pending
+			last = &snapshot
+		}
+		peer.mu.Unlock()
+		if last != nil && last.qualified && last.generation == generation && last.control == control {
+			return last
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for peer qualification generation=%d control=%+v; last=%+v", generation, control, last)
+	return nil
 }
 
 func TestMaximumDataQualificationRejectsLocalSendOnly(t *testing.T) {

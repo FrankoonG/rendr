@@ -70,6 +70,132 @@ func TestLeafMobilityRefreshCallbackHoldsSelectorBeforePlanning(t *testing.T) {
 	); err != nil {
 		t.Fatalf("selection after automatic mobility completion remained held: %v", err)
 	}
+	testTypedLeafMobilityFaultReasonsRequirePolicyHold(t)
+}
+
+func TestLinkUnresponsiveRefreshHoldsSelectorBeforePlanning(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason leafmobility.RefreshReason
+	}{
+		{"link-unresponsive", leafmobility.RefreshReasonLinkUnresponsive},
+		{"local-read-failure", leafmobility.RefreshReasonLocalReadFailure},
+		{"local-write-failure", leafmobility.RefreshReasonLocalWriteFailure},
+		{"replay-stalled", leafmobility.RefreshReasonReplayStalled},
+		{"replay-failure", leafmobility.RefreshReasonReplayFailure},
+		{"liveness-probe-failure", leafmobility.RefreshReasonLivenessProbeFailure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testFaultRefreshAllowsFactualSelectorFailover(t, test.reason)
+		})
+	}
+}
+
+func testFaultRefreshAllowsFactualSelectorFailover(t *testing.T, reason leafmobility.RefreshReason) {
+	var source *initiatorRefreshPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &initiatorRefreshPath{PathConn: path}
+			return source
+		}, nil, nil, nil,
+	)
+	fixture.clientDriver.retryableFailures.Store(100)
+
+	fixture.client.pathsMu.RLock()
+	subject := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	if subject == nil {
+		t.Fatal("missing subject path slot")
+	}
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(reason)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("fault refresh source was not subscribed")
+	}
+	if holds := subject.mobilityPolicyHolds.Load(); holds == 0 {
+		t.Fatal("fault refresh callback returned without a selector policy hold")
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorDeferred
+	})
+	if err := fixture.client.SelectLocalTarget(
+		fixture.ids["root"], fixture.ids["c"], "ordinary-policy-move",
+	); !errors.Is(err, errPolicySelectionLeafMobilityHeld) {
+		t.Fatalf("ordinary selection during fault planning=%v, want %v", err, errPolicySelectionLeafMobilityHeld)
+	}
+
+	started := time.Now()
+	if err := fixture.client.selectLocalTarget(
+		fixture.ids["root"], fixture.ids["c"], "probe-wire-timeout", policySelectionProbeFailure,
+	); err != nil {
+		t.Fatalf("factual failover during fault planning: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Fatalf("factual failover took %v, want <200ms", elapsed)
+	}
+	assertSelectorTarget(t, fixture.client, fixture.ids["root"], fixture.ids["c"])
+	if active := fixture.client.ActivePath(); active != fixture.clientControlRef.ID {
+		t.Fatalf("active path after factual failover=%d, want healthy C path %d", active, fixture.clientControlRef.ID)
+	}
+	assertLeafMobilityDataFlow(t, fixture, "fault-failover-to-c")
+	if err := fixture.client.RetirePath(fixture.clientRef, errors.New("stop retryable fault planner")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testTypedLeafMobilityFaultReasonsRequirePolicyHold(t *testing.T) {
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonRouteSourceChanged,
+		leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonOuterMTUFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure,
+	} {
+		if !leafMobilityRefreshRequiresPolicyHold(reason) {
+			t.Fatalf("fault reason %d does not retain selector policy", reason)
+		}
+	}
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure,
+	} {
+		if !leafMobilityRefreshIsLeafFault(reason) {
+			t.Fatalf("actual leaf fault reason %d cannot bypass its planner hold", reason)
+		}
+	}
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonRouteSourceChanged,
+		leafmobility.RefreshReasonOuterMTUFailure,
+	} {
+		if leafMobilityRefreshIsLeafFault(reason) {
+			t.Fatalf("non-fault transaction reason %d can bypass its policy hold", reason)
+		}
+	}
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonInvalid,
+		leafmobility.RefreshReasonRouteSourceUnavailable,
+		leafmobility.RefreshReasonRouteSourceRestored,
+	} {
+		if leafMobilityRefreshRequiresPolicyHold(reason) {
+			t.Fatalf("non-executable reason %d retained selector policy", reason)
+		}
+	}
 }
 
 func TestLeafMobilityRefreshCallbackDoesNotWaitForPolicyOwner(t *testing.T) {

@@ -1,4 +1,4 @@
-//go:build rendr_experimental_gvisor
+//go:build linux && amd64 && rendr_experimental_gvisor
 
 package gvisor
 
@@ -259,6 +259,7 @@ func runGVisorOwnedEndpointBlackholeRebind(
 		if exists && status.Phase == engine.LeafMobilityInitiatorCommitted {
 			if status.EvidenceGeneration == 0 || status.SourceEndpointGeneration == 0 ||
 				status.ResultEndpointGeneration <= status.SourceEndpointGeneration ||
+				status.EvidenceReason != leafmobility.RefreshReasonLinkUnresponsive ||
 				status.Operation != leafmobility.OperationGVisorLinkRebind || status.Error != "" {
 				t.Fatalf("automatic gVisor initiator status=%+v", status)
 			}
@@ -678,10 +679,12 @@ func terminalGVisorInitiatorFailure(phase engine.LeafMobilityInitiatorPhase) boo
 }
 
 type packetBlackholeRelay struct {
-	conn   *net.UDPConn
-	server *net.UDPAddr
-	done   chan struct{}
-	wait   sync.WaitGroup
+	conn      *net.UDPConn
+	server    *net.UDPAddr
+	done      chan struct{}
+	wait      sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 
 	mu             sync.Mutex
 	client         *net.UDPAddr
@@ -717,17 +720,16 @@ func newPacketBlackholeRelay(t testing.TB, server net.Addr) *packetBlackholeRela
 
 func (relay *packetBlackholeRelay) Addr() net.Addr { return relay.conn.LocalAddr() }
 
-func (relay *packetBlackholeRelay) Close() {
+func (relay *packetBlackholeRelay) Close() error {
 	if relay == nil {
-		return
+		return nil
 	}
-	select {
-	case <-relay.done:
-	default:
+	relay.closeOnce.Do(func() {
 		close(relay.done)
-		_ = relay.conn.Close()
-	}
-	relay.wait.Wait()
+		relay.closeErr = relay.conn.Close()
+		relay.wait.Wait()
+	})
+	return relay.closeErr
 }
 
 func (relay *packetBlackholeRelay) run() {

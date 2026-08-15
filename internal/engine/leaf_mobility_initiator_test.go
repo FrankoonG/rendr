@@ -132,6 +132,49 @@ func TestLeafMobilityInitiatorExecutesFreshFactualEvent(t *testing.T) {
 		t.Fatalf("coherent topology mobility=%+v", observed)
 	}
 	assertLeafMobilityDataFlow(t, fixture, "after-automatic-commit")
+	testLeafMobilityInitiatorPreservesTypedRefreshReason(t)
+}
+
+func testLeafMobilityInitiatorPreservesTypedRefreshReason(t *testing.T) {
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonOuterMTUFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure,
+	} {
+		t.Run(fmt.Sprintf("reason-%d", reason), func(t *testing.T) {
+			var source *initiatorRefreshPath
+			fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+				t, leafmobility.Resource{}, leafmobility.Resource{},
+				func(path *memoryPathConn) transport.PathConn {
+					source = &initiatorRefreshPath{PathConn: path}
+					return source
+				}, nil, nil, nil,
+			)
+			emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := emitter.Observe(reason)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source == nil || !source.publish(evidence) {
+				t.Fatal("typed refresh source was not subscribed")
+			}
+			eventuallyEngine(t, 3*time.Second, func() bool {
+				status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+				return ok && status.EvidenceGeneration != 0 && status.EvidenceReason == reason
+			})
+			status, _ := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+			if status.EvidenceReason != reason {
+				t.Fatalf("engine reason=%d want=%d status=%+v", status.EvidenceReason, reason, status)
+			}
+		})
+	}
 }
 
 func TestLeafMobilityCommitHookObservesCommittedTransaction(t *testing.T) {

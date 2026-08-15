@@ -193,11 +193,13 @@ func policyTransactionFuzzSeeds(t testing.TB) []protocolFuzzSeed {
 		Phase:                    PolicyAckPhasePrepare,
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
+		ResolvedTargetID:         TargetID{2},
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),
 	}
 	finalAccepted := accepted
 	finalAccepted.Phase = PolicyAckPhaseFinal
+	finalAccepted.CommitChallenge = testPolicyCommitChallenge()
 	rejected := PolicyAck{
 		PolicyTransactionBinding: binding,
 		Phase:                    PolicyAckPhasePrepare,
@@ -210,12 +212,14 @@ func policyTransactionFuzzSeeds(t testing.TB) []protocolFuzzSeed {
 	finalRejected := rejected
 	finalRejected.Phase = PolicyAckPhaseFinal
 	finalRejected.Code = PolicyAckCodeReject
+	finalRejected.CommitChallenge = testPolicyCommitChallenge()
 	finalRejected.Reason = "final rejection"
 	commit := PolicyCommit{
 		PolicyTransactionBinding: binding,
 		Generation:               1,
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),
+		CommitChallenge:          testPolicyCommitChallenge(),
 	}
 	return []protocolFuzzSeed{
 		{name: "prepare-empty-cause", kind: uint8(policyTransactionPrepare), wire: mustProtocolFuzzWire(t, "prepare-empty-cause", prepare)},

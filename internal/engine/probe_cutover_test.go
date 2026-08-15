@@ -2,6 +2,7 @@ package engine
 
 import (
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -87,6 +88,146 @@ func (p *probeCutoverCapturePath) dataSequences() []uint64 {
 		}
 	}
 	return sequences
+}
+
+func (p *probeCutoverCapturePath) frameHeaders() []proto.Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	headers := make([]proto.Header, 0, len(p.frames))
+	for _, frame := range p.frames {
+		if len(frame) < proto.HeaderSize {
+			continue
+		}
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err == nil {
+			headers = append(headers, header)
+		}
+	}
+	return headers
+}
+
+func TestBeginSelectorCutoverRejectsGenerationExhaustionBeforeMutation(t *testing.T) {
+	wake := make(chan struct{})
+	e := &Engine{selectorCutoverGeneration: ^uint64(0), selectorCutoverWake: wake}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		e.beginSelectorCutover()
+	}()
+	if recovered == nil {
+		t.Fatal("selector cutover generation exhaustion did not panic")
+	}
+	if e.selectorCutoverGeneration != ^uint64(0) || e.selectorCutoverPending ||
+		e.selectorCutoverHandedOff || e.selectorCutoverWake != wake {
+		t.Fatalf("exhausted cutover mutated state: generation=%d pending=%t handed_off=%t wake_changed=%t",
+			e.selectorCutoverGeneration, e.selectorCutoverPending,
+			e.selectorCutoverHandedOff, e.selectorCutoverWake != wake)
+	}
+	select {
+	case <-wake:
+		t.Fatal("exhausted cutover closed the existing wake channel")
+	default:
+	}
+}
+
+func TestDetachedStreamStartedDuringPendingCutoverIsHandedOff(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	generation := e.beginSelectorCutover()
+	baseline, handedOffAtStart := e.beginDetachedStreamDispatch()
+	defer e.completeDetachedStreamDispatch()
+	defer e.finishSelectorCutover(generation)
+
+	if !handedOffAtStart {
+		t.Fatal("dispatch started during pending cutover did not inherit handoff")
+	}
+	if !e.detachedStreamDispatchHandedOff(baseline, handedOffAtStart) {
+		t.Fatal("dispatch started during pending cutover escaped replay custody")
+	}
+}
+
+func TestDetachedStreamPublishedDuringPendingCutoverWaitsForReplay(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
+	path := newProbeCutoverCapturePath()
+	attachFixturePath(t, e, path,
+		transport.PathSpec{Transport: "memory", Address: "pending-cutover"},
+		targets["path"],
+	)
+
+	generation := e.beginSelectorCutover()
+	payload := []byte("published-during-pending-cutover")
+	if n, err := e.SendData(payload); n != len(payload) || err != nil {
+		t.Fatalf("SendData=(%d,%v), want (%d,nil)", n, err, len(payload))
+	}
+	if got := path.dataSequences(); len(got) != 0 {
+		t.Fatalf("pending-cutover dispatcher wrote before replay handoff: %v", got)
+	}
+	e.finishSelectorCutoverWithReplay(generation)
+	eventuallyEngine(t, time.Second, func() bool {
+		return slices.Equal(path.dataSequences(), []uint64{0})
+	})
+}
+
+func TestSelectorCutoverReplayPrecedesTerminalPublication(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
+	path := newProbeCutoverCapturePath()
+	attachFixturePath(t, e, path,
+		transport.PathSpec{Transport: "memory", Address: "terminal-order"},
+		targets["path"],
+	)
+
+	generation := e.beginSelectorCutover()
+	payload := []byte("replay-before-bye")
+	if n, err := e.SendData(payload); n != len(payload) || err != nil {
+		t.Fatalf("SendData=(%d,%v), want (%d,nil)", n, err, len(payload))
+	}
+	replayEntered := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseReplay) }) })
+	e.boundedReplayBeforeSnapshot = func() {
+		enterOnce.Do(func() { close(replayEntered) })
+		<-releaseReplay
+	}
+	finishDone := make(chan struct{})
+	go func() {
+		e.finishSelectorCutoverWithReplay(generation)
+		close(finishDone)
+	}()
+	select {
+	case <-replayEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cutover did not enter replay while holding the send sequencer")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	time.Sleep(20 * time.Millisecond)
+	if got := path.frameHeaders(); len(got) != 0 {
+		t.Fatalf("terminal publication overtook blocked replay: %+v", got)
+	}
+	releaseOnce.Do(func() { close(releaseReplay) })
+	select {
+	case <-finishDone:
+	case <-time.After(time.Second):
+		t.Fatal("cutover replay did not finish")
+	}
+	eventuallyEngine(t, time.Second, func() bool { return len(path.frameHeaders()) >= 2 })
+	headers := path.frameHeaders()
+	if headers[0].Type != proto.FrameData || headers[0].Seq != 0 ||
+		headers[1].Type != proto.FrameCtrl || headers[1].Seq != 1 ||
+		proto.CtrlCodeFromFlags(headers[1].Flags) != proto.CtrlBye {
+		t.Fatalf("physical order=%+v, want DATA seq0 then BYE seq1", headers)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("GracefulClose did not finish its bounded ACK wait")
+	}
 }
 
 func TestRecursiveProbeStarvedDataSelectionPreemptsBlockedDataDispatch(t *testing.T) {

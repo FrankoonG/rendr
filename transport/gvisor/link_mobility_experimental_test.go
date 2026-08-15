@@ -1,4 +1,4 @@
-//go:build rendr_experimental_gvisor
+//go:build linux && amd64 && rendr_experimental_gvisor
 
 package gvisor
 
@@ -20,59 +20,6 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 )
-
-func TestGVisorExperimentalProviderAndEndpointClaimsAgree(t *testing.T) {
-	for name, provider := range map[string]leafmobility.ImplementationProvider{
-		"transport": New(),
-		"listener":  mustPacketListener(t),
-	} {
-		t.Run(name, func(t *testing.T) {
-			capabilities, err := leafmobility.CapabilitiesForImplementationProvider(provider)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(capabilities) != 1 || capabilities[0].Operation() != leafmobility.OperationGVisorLinkRebind {
-				t.Fatalf("capabilities=%v", capabilities)
-			}
-		})
-	}
-
-	listener := mustPacketListener(t)
-	defer listener.Close()
-	client, server := dialAndAccept(t, listener)
-	defer client.Close()
-	defer server.Close()
-	for name, path := range map[string]transport.PathConn{"client": client, "server": server} {
-		claim := path.(leafmobility.Provider).LeafMobilityClaim()
-		capability, ok := leafmobility.CapabilityForClaim(claim)
-		if !ok || capability.Operation() != leafmobility.OperationGVisorLinkRebind {
-			t.Fatalf("%s endpoint claim has no packet-link capability", name)
-		}
-		facts := claim.Snapshot()
-		if facts.Scope != leafmobility.ScopeEndpoint || facts.ResourceID == (leafmobility.ResourceID{}) {
-			t.Fatalf("%s endpoint facts=%+v", name, facts)
-		}
-	}
-}
-
-func TestGVisorClosedPacketOwnerRejectsClaimConstruction(t *testing.T) {
-	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	owner, err := newLinkOwner(
-		linkID{1}, linkSecret{2}, leafmobility.RoleDialer, [4]byte{10, 64, 1, 1},
-		newPacketWire(conn, false), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, nil,
-		func([]byte) {},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	owner.close()
-	if _, err := newPacketLinkClaim(owner, leafmobility.RoleDialer); err == nil {
-		t.Fatal("closed packet owner created a driven claim")
-	}
-}
 
 func TestGVisorPacketLinkRebindPreservesBidirectionalPayload(t *testing.T) {
 	listener := mustPacketListener(t)
@@ -988,7 +935,7 @@ func TestGVisorRefreshCallbackCannotBlockCarrierAndCancelDisablesSpecializedRetr
 		t.Fatal("refresh callback was not dispatched")
 	}
 	cancel()
-	if path.link.publishWireFailure() {
+	if path.link.publishWireFailure(leafmobility.RefreshReasonLocalWriteFailure) {
 		t.Fatal("canceled refresh subscription still claimed specialized retry ownership")
 	}
 	if replacementCancel, subscribeErr := path.SubscribeLeafMobilityRefresh(

@@ -28,8 +28,13 @@ type policyAckInterceptPath struct {
 }
 
 type policyControlDrop struct {
-	code    proto.CtrlCode
-	dropped atomic.Uint32
+	code                 proto.CtrlCode
+	dropAll              bool
+	deliverBeforeRelease bool
+	observed             chan proto.PolicyCommit
+	release              chan struct{}
+	observedOnce         sync.Once
+	dropped              atomic.Uint32
 }
 
 type policyControlDropPath struct {
@@ -41,8 +46,35 @@ func (p *policyControlDropPath) Read(b []byte) (int, error) { return p.inner.Rea
 func (p *policyControlDropPath) Write(frame []byte) (int, error) {
 	if len(frame) >= proto.HeaderSize {
 		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
-		if err == nil && header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == p.drop.code && p.drop.dropped.CompareAndSwap(0, 1) {
-			return len(frame), nil
+		if err == nil && header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == p.drop.code {
+			observe := func() {
+				if p.drop.observed == nil || p.drop.code != proto.CtrlPolicyCommit {
+					return
+				}
+				commit, decodeErr := proto.DecodePolicyCommit(frame[proto.HeaderSize:])
+				if decodeErr == nil {
+					p.drop.observedOnce.Do(func() { p.drop.observed <- commit })
+				}
+			}
+			if p.drop.deliverBeforeRelease {
+				n, writeErr := p.inner.Write(frame)
+				observe()
+				if p.drop.release != nil {
+					<-p.drop.release
+				}
+				return n, writeErr
+			}
+			observe()
+			if p.drop.release != nil {
+				<-p.drop.release
+			}
+			if p.drop.dropAll {
+				p.drop.dropped.Add(1)
+				return len(frame), nil
+			}
+			if p.drop.dropped.CompareAndSwap(0, 1) {
+				return len(frame), nil
+			}
 		}
 	}
 	return p.inner.Write(frame)
@@ -225,6 +257,215 @@ func TestPolicyTransactionRecoversLostRequestPhasesWithSameSequence(t *testing.T
 	}
 }
 
+func TestDroppedCommitAndForgedFinalCannotAuthorizeSuccess(t *testing.T) {
+	drop := &policyControlDrop{
+		code:     proto.CtrlPolicyCommit,
+		dropAll:  true,
+		observed: make(chan proto.PolicyCommit, 1),
+		release:  make(chan struct{}),
+	}
+	client, server, selectorID, targetA, targetB, serverA, _ := newPolicyE2EPairWithDrops(t, nil, drop)
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- client.RequestPeerSelection(ctx, selectorID, targetB, "forged-final-before-commit-receipt")
+	}()
+
+	var commit proto.PolicyCommit
+	select {
+	case commit = <-drop.observed:
+	case <-time.After(time.Second):
+		close(drop.release)
+		t.Fatal("requester did not publish COMMIT to the blackhole")
+	}
+	client.policyStateMu.Lock()
+	tx := client.policyOutgoing
+	if tx == nil {
+		client.policyStateMu.Unlock()
+		close(drop.release)
+		t.Fatal("outgoing transaction disappeared while COMMIT write was blocked")
+	}
+	if tx.commitDispatched {
+		client.policyStateMu.Unlock()
+		close(drop.release)
+		t.Fatal("COMMIT became dispatched before its write returned")
+	}
+	digest := tx.digest
+	client.policyStateMu.Unlock()
+	forged := proto.PolicyAck{
+		PolicyTransactionBinding: commit.PolicyTransactionBinding,
+		Phase:                    proto.PolicyAckPhaseFinal,
+		Code:                     proto.PolicyAckCodeAccept,
+		Generation:               commit.Generation,
+		CurrentGeneration:        commit.Generation,
+		CurrentTargetID:          targetB,
+		ResolvedTargetID:         targetB,
+		ProposalDigest:           digest,
+		ReservationID:            commit.ReservationID,
+		CommitChallenge:          commit.CommitChallenge,
+	}
+	if err := client.handlePolicyAck(forged); err != nil {
+		close(drop.release)
+		t.Fatalf("early forged FINAL should be ignored, got %v", err)
+	}
+	client.policyStateMu.Lock()
+	queuedFinals := len(tx.finalAcks)
+	client.policyStateMu.Unlock()
+	if queuedFinals != 0 {
+		close(drop.release)
+		t.Fatal("early forged FINAL entered the authorization mailbox")
+	}
+	close(drop.release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrPolicyOutcomeUnknown) {
+			t.Fatalf("dropped COMMIT result=%v want ErrPolicyOutcomeUnknown", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dropped COMMIT transaction did not respect its deadline")
+	}
+	if drop.dropped.Load() < 2 {
+		t.Fatalf("dropped COMMIT count=%d, retry stimulus did not occur", drop.dropped.Load())
+	}
+	server.policyStateMu.Lock()
+	generation := server.policyGeneration
+	selection := server.policySelections[selectorID]
+	server.policyStateMu.Unlock()
+	if generation != 0 || selection != targetA || server.ActivePath() != serverA {
+		t.Fatalf("forged FINAL changed owner generation=%d selection=%x active=%d", generation, selection, server.ActivePath())
+	}
+}
+
+func TestLegitimateFinalAtCustodyBeforeCommitWriteReturnRequiresReplay(t *testing.T) {
+	commitGate := &policyControlDrop{
+		code:                 proto.CtrlPolicyCommit,
+		deliverBeforeRelease: true,
+		observed:             make(chan proto.PolicyCommit, 1),
+		release:              make(chan struct{}),
+	}
+	finalDrop := &policyAckIntercept{
+		phase:   proto.PolicyAckPhaseFinal,
+		drop:    true,
+		seen:    make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	client, server, selectorID, _, targetB, _, serverB := newPolicyE2EPairWithDrops(t, finalDrop, commitGate)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- client.RequestPeerSelection(ctx, selectorID, targetB, "legitimate-early-final-custody")
+	}()
+
+	var commit proto.PolicyCommit
+	select {
+	case commit = <-commitGate.observed:
+	case <-time.After(time.Second):
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatal("COMMIT was not delivered before its Write return gate")
+	}
+	deadline := time.Now().Add(time.Second)
+	for server.ActivePath() != serverB {
+		if time.Now().After(deadline) {
+			close(commitGate.release)
+			close(finalDrop.release)
+			t.Fatal("owner did not commit before requester COMMIT Write returned")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	client.policyStateMu.Lock()
+	tx := client.policyOutgoing
+	if tx == nil || tx.commitDispatched {
+		client.policyStateMu.Unlock()
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatalf("outgoing transaction before custody tx=%p commit-dispatched=%t", tx, tx != nil && tx.commitDispatched)
+	}
+	digest := tx.digest
+	client.policyStateMu.Unlock()
+	earlyFinal := proto.PolicyAck{
+		PolicyTransactionBinding: commit.PolicyTransactionBinding,
+		Phase:                    proto.PolicyAckPhaseFinal,
+		Code:                     proto.PolicyAckCodeAccept,
+		Generation:               commit.Generation,
+		CurrentGeneration:        commit.Generation,
+		CurrentTargetID:          targetB,
+		ResolvedTargetID:         targetB,
+		ProposalDigest:           digest,
+		ReservationID:            commit.ReservationID,
+		CommitChallenge:          commit.CommitChallenge,
+	}
+	earlyWire, err := earlyFinal.Encode()
+	if err != nil {
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatal(err)
+	}
+	earlyHeader := proto.Header{
+		Version: proto.Version,
+		Type:    proto.FrameCtrl,
+		Flags:   proto.FlagsForCtrl(proto.CtrlPolicyAck),
+		Seq:     0x7f00,
+	}
+	earlyMessage := policyMessage{
+		kind: policyMessageAck,
+		key: policyMessageKey{
+			kind:        policyMessageAck,
+			seq:         earlyHeader.Seq,
+			frameDigest: recvFrameDigest(earlyHeader, earlyWire),
+		},
+		ack:  earlyFinal,
+		done: make(chan error, 1),
+	}
+	client.recvMu.Lock()
+	queued := client.enqueuePolicyMessageLocked(earlyMessage)
+	client.recvMu.Unlock()
+	if !queued {
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatal("legitimate early FINAL did not enter policy custody")
+	}
+	select {
+	case err := <-earlyMessage.done:
+		if err != nil {
+			close(commitGate.release)
+			close(finalDrop.release)
+			t.Fatalf("early FINAL custody result: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatal("early FINAL custody did not complete")
+	}
+	client.policyStateMu.Lock()
+	queuedFinals := len(tx.finalAcks)
+	commitDispatched := tx.commitDispatched
+	client.policyStateMu.Unlock()
+	if queuedFinals != 0 || commitDispatched {
+		close(commitGate.release)
+		close(finalDrop.release)
+		t.Fatalf("early FINAL authorized before COMMIT return: mailbox=%d dispatched=%t", queuedFinals, commitDispatched)
+	}
+
+	close(commitGate.release)
+	close(finalDrop.release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("RequestPeerSelection after exact replay: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("policy transaction did not converge after exact COMMIT/FINAL replay")
+	}
+	if finalDrop.dropped.Load() != 1 {
+		t.Fatalf("dropped initial owner FINAL count=%d want=1", finalDrop.dropped.Load())
+	}
+}
+
 func TestPolicyAckBlackholeReusesOneControlSequence(t *testing.T) {
 	intercept := &policyAckIntercept{
 		phase:   proto.PolicyAckPhasePrepare,
@@ -295,9 +536,6 @@ func newPolicyE2EPairWithDrops(t *testing.T, intercept *policyAckIntercept, clie
 		if err := e.ConfigurePeerGraph(1, manifest); err != nil {
 			t.Fatal(err)
 		}
-		if err := e.ConfigureExecution(proto.ExecutionKindSelector); err != nil {
-			t.Fatal(err)
-		}
 	}
 
 	for _, path := range []struct {
@@ -313,14 +551,19 @@ func newPolicyE2EPairWithDrops(t *testing.T, intercept *policyAckIntercept, clie
 		if clientDrop != nil {
 			clientWrapped = &policyControlDropPath{inner: clientPath, drop: clientDrop}
 		}
-		if _, err := client.AttachPath(clientWrapped, spec); err != nil {
+		targetID := pathA.ID
+		if path.name == pathB.Name {
+			targetID = pathB.ID
+		}
+		binding := PathBinding{LocalTXTargetID: targetID, PeerTXTargetID: targetID}
+		if _, err := client.AttachPathBound(clientWrapped, spec, binding); err != nil {
 			t.Fatal(err)
 		}
 		wrapped := transport.PathConn(serverPath)
 		if intercept != nil {
 			wrapped = &policyAckInterceptPath{inner: serverPath, intercept: intercept}
 		}
-		attached, err := server.AttachPath(wrapped, spec)
+		attached, err := server.AttachPathBound(wrapped, spec, binding)
 		if err != nil {
 			t.Fatal(err)
 		}

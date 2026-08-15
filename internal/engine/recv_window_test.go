@@ -45,6 +45,7 @@ func TestPacketMarksDoNotTripRecvQueueOverflow(t *testing.T) {
 func TestRecvQueueOverflowClosesConnection(t *testing.T) {
 	e := New(SideServer, [16]byte{4}, Limits{})
 	defer e.Close()
+	configureLeafSelectorRuntime(t, e, "path")
 
 	e.recvMu.Lock()
 	for i := 0; i < recvReorderWindowLimit; i++ {

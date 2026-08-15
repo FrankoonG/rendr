@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,20 +75,6 @@ type Engine struct {
 	seenAttachFIFO          [][16]byte
 	created                 time.Time
 
-	// Mode is the dispatcher selector: 1=selector, 2=bond, 3=race.
-	// Loaded by dispatch() to decide single-path vs all-paths send.
-	mode atomic.Uint32
-
-	// bondCursor is the round-robin index for bond dispatch.
-	// bondPinLeft is how many more consecutive frames must stay on
-	// the current path before bondCursor advances. Path pinning is
-	// the M8 mitigation for reorder-window blow-up under RTT skew
-	// (path pinning, see dispatchBond). When bondPinLeft hits 0 we
-	// bump bondCursor and refill bondPinLeft from limits.BondPinSize.
-	bondCursor     uint64
-	bondPinLeft    int
-	bondStuckSkips uint64 // count of round-robin slots bypassed for RTT
-
 	// migrationCount tracks logical active-route changes and in-place leaf
 	// mobility commits after the engine first became Active. The initial
 	// assignment of activeID at AttachPath time is not counted. An in-place
@@ -120,29 +107,29 @@ type Engine struct {
 	pathLeafGeneration      map[pathAdmissionLeafKey]uint64
 	nextPathID              uint32
 	nextPathGen             uint64
+	pathTopologyEpoch       atomic.Uint64
 	activeID                uint32
-	// dispatchScope optionally limits race/bond dispatch and death
-	// failover to a policy-selected target group. nil means all paths.
-	dispatchScope map[uint32]bool
 
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
 	// active at the time.
-	sendMu               sequencerMutex
-	sendSeq              uint64
-	sendAckNext          atomic.Uint64
-	sendPublishedNext    atomic.Uint64
-	sendProof            proto.AckProof
-	sendAckProof         proto.AckProof
-	sendHistMu           sync.Mutex
-	sendHist             sendHistory
-	sendSlots            chan struct{}
-	sendControlSlots     chan struct{}
-	sendCreditWake       chan struct{}
-	packetWritesInFlight atomic.Int64
-	writeDeadlineMu      sync.Mutex
-	writeDeadlineState   atomic.Pointer[applicationWriteDeadlineState]
-	appWritePermit       chan struct{}
+	sendMu                  sequencerMutex
+	sendSeq                 uint64
+	sendAckNext             atomic.Uint64
+	sendPublishedNext       atomic.Uint64
+	sendProof               proto.AckProof
+	sendAckProof            proto.AckProof
+	sendHistMu              sync.Mutex
+	sendHist                sendHistory
+	sendSlots               chan struct{}
+	sendControlSlots        chan struct{}
+	sendCreditWake          chan struct{}
+	packetWritesInFlight    atomic.Int64
+	packetFrameLimit        atomic.Int64
+	lastApplicationDispatch atomic.Pointer[applicationDispatchDemandEvidence]
+	writeDeadlineMu         sync.Mutex
+	writeDeadlineState      atomic.Pointer[applicationWriteDeadlineState]
+	appWritePermit          chan struct{}
 	// flatSelectorDispatchTimer is reused only while sendMu and the
 	// application write permit serialize a flat-selector DATA dispatch.
 	flatSelectorDispatchTimer *time.Timer
@@ -155,6 +142,19 @@ type Engine struct {
 	// boundedReplayBeforeSnapshot is a deterministic package-test hook.
 	// Tests install it before queuing replay and never mutate it concurrently.
 	boundedReplayBeforeSnapshot func()
+	// connectionObservationAfterTopology is a deterministic package-test hook.
+	// It runs after the first topology sample and before replay/root sampling.
+	connectionObservationAfterTopology func()
+	// connectionObservationFallbackLocked is a deterministic package-test hook.
+	// It runs after the coherent fallback acquires pathsMu and before it samples
+	// replay/root state. Tests install it before concurrent activity.
+	connectionObservationFallbackLocked func()
+	// peakTransferDecisionBeforeCommit is a deterministic package-test hook.
+	// It runs after a topology-bound peak decision and before policy commit.
+	peakTransferDecisionBeforeCommit func()
+	// acceptedPacketAfterRouteSnapshot is a deterministic package-test hook.
+	// It runs after route lookup and before accepted-packet cutover custody.
+	acceptedPacketAfterRouteSnapshot func()
 	// activationAfterPredecessorDrain is a deterministic package-test hook.
 	// Tests install it before activation and never mutate it concurrently.
 	activationAfterPredecessorDrain func()
@@ -203,7 +203,16 @@ type Engine struct {
 	recvAckSent           uint64
 	recvDeliver           []byte // pending bytes for the next Read (stream)
 	recvDeliverFrames     []int  // remaining bytes per admitted stream DATA frame
-	packetized            bool   // when true, drainer routes payload to recvPacketCh
+	recvUniqueBytes       uint64
+	recvRootCohort        rootDeliveryCohort
+	recvRootCohortBytes   uint64
+	recvRootDemandBytes   uint64
+	recvRootEvidenceEpoch uint64
+	recvRootTopologyEpoch uint64
+	recvRootAttributable  bool
+	recvRootTargets       map[uint64]proto.TargetID
+	recvRootTargetOrder   []uint64
+	packetized            bool // when true, drainer routes payload to recvPacketCh
 	recvPathCursor        uint64
 	recvSeenBits          []uint64
 	recvSeenHead          uint64
@@ -219,9 +228,13 @@ type Engine struct {
 	recvControlAckPending bool
 	recvDataAckUrgent     bool
 	recvAckBurstOpen      bool
-	recvFrameProofs       map[uint64]proto.FrameDigest
+	recvFrameProofs       map[uint64]recvPacketProof
+	recvDeliveredDigests  map[uint64]proto.FrameDigest
+	recvDeliveredOrder    []uint64
 	policyReplayDigests   map[uint64]proto.FrameDigest
 	policyReplayOrder     []uint64
+	recvPolicyPhases      map[recvPolicyPhaseKey]recvPolicyPhaseReceipt
+	recvPolicyPhaseOrder  []recvPolicyPhaseKey
 	recvDroppedThrough    uint64
 
 	// recvDeadline is the application-set read deadline (zero = none).
@@ -267,30 +280,47 @@ type Engine struct {
 	// Directional policy transactions are serialized independently from the
 	// data sequencer. The inbox preserves receive order while network writes
 	// and path-death failover remain outside policyStateMu.
-	policySendGate            chan struct{}
-	policyOwnerMu             sync.Mutex
-	policyStateMu             sync.Mutex
-	policyGeneration          uint64
-	policyPeerGeneration      uint64
-	policyOutgoing            *outgoingPolicyTransaction
-	policyIncoming            *incomingPolicyTransaction
-	policySelections          map[proto.TargetID]proto.TargetID
-	policyCompleted           map[[16]byte]completedPolicyTransaction
-	policyCompletedOrder      [][16]byte
-	policyInbox               chan policyMessage
-	policyQueueMu             sync.Mutex
-	policyQueued              map[policyMessageKey]struct{}
-	policyAdmissionMu         sync.RWMutex
-	policyAdmission           func(selectorID, targetID proto.TargetID, cause string) error
-	selectorCutoverMu         sync.Mutex
-	selectorCutoverGeneration uint64
-	selectorCutoverPending    bool
-	selectorCutoverHandedOff  bool
+	policySendGate       chan struct{}
+	policyCutoverMu      sync.Mutex
+	policyLifecycleMu    sync.Mutex
+	policyTerminalMu     sync.Mutex
+	policyTerminal       atomic.Bool
+	policyOwnerMu        sync.Mutex
+	policyStateMu        sync.Mutex
+	policyGeneration     uint64
+	policyObservationGen atomic.Uint64
+	policyPeerGeneration uint64
+	policyOutgoing       *outgoingPolicyTransaction
+	policyIncoming       *incomingPolicyTransaction
+	policySelections     map[proto.TargetID]proto.TargetID
+	policyCompleted      map[[16]byte]completedPolicyTransaction
+	policyCompletedOrder [][16]byte
+	policyInbox          chan policyMessage
+	policyQueueMu        sync.Mutex
+	policyQueued         map[policyMessageKey]struct{}
+	policyAdmissionMu    sync.RWMutex
+	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
+	peakPolicyObserverMu sync.RWMutex
+	peakPolicyObserver   func(selectorID, targetID proto.TargetID, peak bool, cause string)
+	// Deterministic package-test hooks installed before concurrent activity.
+	selectorDecisionAfterCommit func()
+	policyCommitBeforeOwnerLock func()
+	policyCommitAfterPublish    func()
+	selectorCutoverMu           sync.Mutex
+	selectorCutoverGeneration   uint64
+	detachedDispatchHandoffGen  uint64
+	selectorCutoverPending      bool
+	selectorCutoverHandedOff    bool
 	// acceptedPacketDispatches counts public PacketConn writes that have
 	// returned after bounded queue admission but whose physical path job has
 	// not completed. selectorCutoverMu linearizes admission against cutover so
 	// a quality switch replays every such ACK-uncovered frame.
 	acceptedPacketDispatches uint64
+	// detachedStreamDispatches counts stream DATA frames that have left the
+	// global sequencer after immutable publication but are still awaiting
+	// physical dispatch. appWritePermit preserves stream-call order; this count
+	// makes every cutover own the corresponding replay prefix immediately.
+	detachedStreamDispatches uint64
 	selectorCutoverWake      chan struct{}
 	pathRetirementInbox      chan pathRetirementWork
 	pathRetirementMu         sync.Mutex
@@ -361,11 +391,14 @@ type PathRef struct {
 // Per-path counters remain atomic observations, but membership, active path,
 // lifecycle state, and migration count are read under one pathsMu hold.
 type TopologySnapshot struct {
-	State          BridgeState
-	ActivePath     uint32
-	Paths          []transport.PathInfo
-	LeafMobility   []LeafMobilitySnapshot
-	MigrationCount uint64
+	Epoch            uint64
+	PolicyGeneration uint64
+	State            BridgeState
+	ActivePath       uint32
+	EffectivePaths   []uint32
+	Paths            []transport.PathInfo
+	LeafMobility     []LeafMobilitySnapshot
+	MigrationCount   uint64
 }
 
 // LeafMobilitySnapshot is engine-internal ownership evidence bound to one
@@ -386,6 +419,7 @@ type pathSlot struct {
 	id              uint32
 	gen             uint64
 	owner           uint64
+	topologyEpoch   atomic.Uint64
 	conn            transport.PathConn
 	spec            transport.PathSpec
 	localTXTargetID proto.TargetID
@@ -406,16 +440,17 @@ type pathSlot struct {
 	// mobilityPolicyHolds prevents selector policy from moving away from the
 	// branch containing this leaf while an in-place endpoint transaction owns
 	// it. Control dispatch and unrelated selector branches remain available.
-	mobilityPolicyHolds atomic.Int32
-	txEnabled           atomic.Bool
-	txFenceEpoch        atomic.Uint64
-	writePermit         chan struct{}
-	ackMu               sync.Mutex
-	ackPending          pathAckWrite
-	ackPendingSet       bool
-	ackRunning          bool
-	ackClosed           bool
-	ackWG               sync.WaitGroup
+	mobilityPolicyHolds      atomic.Int32
+	mobilityFaultPolicyHolds atomic.Int32
+	txEnabled                atomic.Bool
+	txFenceEpoch             atomic.Uint64
+	writePermit              chan struct{}
+	ackMu                    sync.Mutex
+	ackPending               pathAckWrite
+	ackPendingSet            bool
+	ackRunning               bool
+	ackClosed                bool
+	ackWG                    sync.WaitGroup
 
 	// recvDups counts inbound frames on THIS path whose SEQ had
 	// already been delivered or buffered. Used per-path so monitoring
@@ -434,25 +469,36 @@ type pathSlot struct {
 	// stamped after a successful dispatch write to this slot's
 	// socket. Engine-level (not probe-level): both data and ctrl
 	// writes bump it.
-	lastSendUnixNano     atomic.Int64
-	dataWrites           atomic.Uint64
-	controlWrites        atomic.Uint64
-	dataDispatches       atomic.Uint64
-	firstDataDispatches  atomic.Uint64
-	batchWriteCalls      atomic.Uint64
-	batchWriteFrames     atomic.Uint64
-	batchWriteMax        atomic.Uint64
-	probeEvidence        atomic.Pointer[pathProbeEvidence]
-	probeEndpointGen     atomic.Uint64
-	probeControlMu       sync.Mutex
-	probeControlClosed   bool
-	probeReplyPending    []byte
-	probeReplyGeneration pathProbeGeneration
-	probeReplyFenceEpoch uint64
-	probeReplyRunning    bool
-	probeWriteWG         sync.WaitGroup
-	probeWriterCount     int
-	probeWritersIdle     chan struct{}
+	lastSendUnixNano       atomic.Int64
+	dataWrites             atomic.Uint64
+	controlWrites          atomic.Uint64
+	dataDispatches         atomic.Uint64
+	firstDataDispatches    atomic.Uint64
+	batchWriteCalls        atomic.Uint64
+	batchWriteFrames       atomic.Uint64
+	batchWriteMax          atomic.Uint64
+	probeEvidence          atomic.Pointer[pathProbeEvidence]
+	probeEndpointGen       atomic.Uint64
+	probeControlMu         sync.Mutex
+	probeControlClosed     bool
+	probeReplyPending      []byte
+	probeReplyGeneration   pathProbeGeneration
+	probeReplyFenceEpoch   uint64
+	probeReplyRunning      bool
+	probeWriteWG           sync.WaitGroup
+	probeWriterCount       int
+	probeWritersIdle       chan struct{}
+	qualityObserverMu      sync.Mutex
+	qualityObserverStarted bool
+	qualityObserverStopped bool
+	qualityObserverRequest chan struct{}
+	qualityObserverWake    chan struct{}
+	qualityObserverStop    chan struct{}
+	qualityObserverDone    chan struct{}
+	qualityObserverCancel  context.CancelFunc
+	qualityObserverSeq     uint64
+	qualityObserverSample  transport.PathQuality
+	qualityObserverSampled bool
 	// probePermitCancel is the cancellation boundary for probe writers that
 	// registered in the current open TX epoch but have not acquired the shared
 	// physical write permit yet. It is protected by probeControlMu.
@@ -562,6 +608,14 @@ func (s *pathSlot) acquireDispatchFencePermit() (uint64, bool) {
 }
 
 func (s *pathSlot) writeDispatchedFrameEpoch(frame []byte, fenceEpoch uint64) (int, error) {
+	return s.writeDispatchedFrameEpochObserved(frame, fenceEpoch, nil)
+}
+
+func (s *pathSlot) writeDispatchedFrameEpochObserved(
+	frame []byte,
+	fenceEpoch uint64,
+	beforeWrite func(),
+) (int, error) {
 	if !s.txEnabled.Load() || s.txFenceEpoch.Load() != fenceEpoch {
 		return 0, ErrPathTXFenced
 	}
@@ -574,6 +628,9 @@ func (s *pathSlot) writeDispatchedFrameEpoch(frame []byte, fenceEpoch uint64) (i
 	defer s.releaseWrite()
 	if !s.txEnabled.Load() || s.txFenceEpoch.Load() != fenceEpoch {
 		return 0, ErrPathTXFenced
+	}
+	if beforeWrite != nil {
+		beforeWrite()
 	}
 	return s.writeFrameOwned(frame)
 }
@@ -713,6 +770,7 @@ func (s *pathSlot) noteRecv(at time.Time) {
 // all signal a slot to exit without panicking on a double close.
 func (s *pathSlot) closeQuit() {
 	s.quitOnce.Do(func() {
+		s.stopQualityObserver()
 		s.cancelMobilityRefresh()
 		s.completeAdmission()
 		s.closeProbeControl()
@@ -777,8 +835,11 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		recvPacketWake:          make(chan struct{}, 1),
 		recvWake:                make(chan struct{}, 1),
 		recvQueue:               make(map[uint64]recvItem),
-		recvFrameProofs:         make(map[uint64]proto.FrameDigest),
+		recvFrameProofs:         make(map[uint64]recvPacketProof),
+		recvRootTargets:         make(map[uint64]proto.TargetID),
+		recvDeliveredDigests:    make(map[uint64]proto.FrameDigest),
 		policyReplayDigests:     make(map[uint64]proto.FrameDigest),
+		recvPolicyPhases:        make(map[recvPolicyPhaseKey]recvPolicyPhaseReceipt),
 		sendSlots:               make(chan struct{}, sendHistoryWindow),
 		sendControlSlots:        make(chan struct{}, sendControlReserve),
 		sendCreditWake:          make(chan struct{}),
@@ -817,6 +878,7 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		terminalDone:            make(chan struct{}),
 		streamFinDone:           make(chan struct{}),
 	}
+	e.pathTopologyEpoch.Store(1)
 	e.writeDeadlineState.Store(newApplicationWriteDeadlineState(time.Time{}))
 	e.appWritePermit <- struct{}{}
 	e.recvCond = sync.NewCond(&e.recvMu)
@@ -1012,6 +1074,11 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		_ = pc.Close()
 		return 0, err
 	}
+	pathFrameLimit, frameLimitKnown, err := e.validatePacketPathFrameLimit(pc)
+	if err != nil {
+		_ = pc.Close()
+		return 0, err
+	}
 	var (
 		mobilityClaim *leafmobility.Claim
 		mobilityFacts leafmobility.Facts
@@ -1131,6 +1198,9 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			e.releasePathAdmissionLocked(id)
 			return rejectLocked(fmt.Errorf("engine: bind owned leaf: %w", err))
 		}
+	}
+	if frameLimitKnown {
+		e.tightenPacketFrameLimit(pathFrameLimit)
 	}
 	slot := &pathSlot{
 		id:              id,
@@ -1389,10 +1459,6 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		existingID := existing.id
 		superseded = true
 		delete(e.paths, existingID)
-		if e.dispatchScope[existingID] {
-			delete(e.dispatchScope, existingID)
-			e.dispatchScope[id] = true
-		}
 		if retainPredecessor && !existing.deathPending.Load() {
 			e.retainedPaths[existingID] = existing
 			e.pathPredecessors[id] = append(e.pathPredecessors[id], existingID)
@@ -1409,35 +1475,45 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	slot.writerStarted.Store(true)
 	slot.proberStarted.Store(true)
 	e.paths[id] = slot
-	if e.activeID == 0 {
-		e.activeID = id
-		recoveryEvent = e.State() == BridgeMigrating
-		if e.State() == BridgeInit || e.State() == BridgeMigrating {
-			e.setState(BridgeActive)
-		}
-	} else if _, activeStillPresent := e.paths[e.activeID]; !activeStillPresent {
-		e.activeID = id
-		recoveryEvent = true
-	}
-	if recoveryEvent {
-		e.migrationCount++
-		zombieTrip = e.accountMigration()
-	}
+	e.advancePathTopologyEpochLocked()
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
 		slot.completeAdmission()
 	}
 	if runtime != nil {
+		if e.activeID == 0 {
+			e.activeID = id
+			recoveryEvent = e.State() == BridgeMigrating
+			if e.State() == BridgeInit || e.State() == BridgeMigrating {
+				e.setState(BridgeActive)
+			}
+		} else if _, activeStillPresent := e.paths[e.activeID]; !activeStillPresent {
+			e.activeID = id
+			recoveryEvent = true
+		}
 		e.policyStateMu.Lock()
 		initialized := runtime.initializeSelectorsForLeafPolicy(slot.localTXTargetID, e.policySelections)
 		for _, selection := range initialized {
 			e.policySelections[selection.selectorID] = selection.targetID
 		}
 		e.policyStateMu.Unlock()
+		projectedActive := e.projectRecursiveRepresentativeLocked(runtime)
+		if projectedActive != 0 && projectedActive != e.activeID {
+			e.activeID = projectedActive
+			recoveryEvent = oldActive != 0
+		}
 		e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
+	}
+	newActive := e.activeID
+	if recoveryEvent {
+		e.migrationCount++
+		zombieTrip = e.accountMigration()
 	}
 	if hook := e.activationAfterInitialSelection; hook != nil {
 		hook()
+	}
+	if recoveryEvent || superseded {
+		e.handoffDetachedStreamDispatchesForReplay()
 	}
 	e.pathsMu.Unlock()
 	releasePolicyOwner()
@@ -1449,11 +1525,15 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		e.retirePathAsync(existing)
 	}
 	if recoveryEvent {
-		e.fireMigrateHooks(oldActive, id, "recovery")
+		e.fireMigrateHooks(oldActive, newActive, "recovery")
 		e.tripZombie(zombieTrip)
 	}
-	if superseded {
-		e.requestReplay(e.sendAckNext.Load())
+	if recoveryEvent || superseded {
+		// Recovery owns only the prefix that existed when the replacement was
+		// published. A full replay request snapshots later and can absorb a new
+		// application frame that is already dispatching on this healthy path,
+		// producing an avoidable duplicate physical write.
+		e.requestReplayRange(e.sendAckNext.Load(), e.sendPublishedNext.Load())
 	}
 	if retainPredecessor {
 		go e.expirePathAdmission(admissionExpiry)
@@ -1570,6 +1650,8 @@ func (e *Engine) retireSupersededPath(slot *pathSlot) {
 		e.setRetirementStage(slot, "prober")
 		<-slot.doneP
 	}
+	e.setRetirementStage(slot, "quality-observer")
+	slot.waitQualityObserver()
 	e.setRetirementStage(slot, "probe-writer")
 	slot.probeWriteWG.Wait()
 	e.setRetirementStage(slot, "ack-writer")
@@ -1650,6 +1732,48 @@ func (e *Engine) nextPathGenerationLocked() uint64 {
 	return e.nextPathGen
 }
 
+// currentPathTopologyEpoch identifies one physical TX topology. The logical
+// graph is immutable, but active carriers and owned endpoint incarnations can
+// change beneath it. Performance evidence is valid only within one epoch.
+func (e *Engine) currentPathTopologyEpoch() uint64 {
+	epoch := e.pathTopologyEpoch.Load()
+	if epoch == 0 {
+		return 1
+	}
+	return epoch
+}
+
+// advancePathTopologyEpochLocked invalidates physical performance evidence.
+// Every caller holds pathsMu while committing an active carrier-set or owned
+// endpoint-incarnation change; readers need only the atomic epoch and never
+// acquire pathsMu below the replay lock.
+func (e *Engine) advancePathTopologyEpochLocked() uint64 {
+	// Accepted packet dispatch snapshots paths under pathsMu, releases it, and
+	// then takes selectorCutoverMu before queue admission. Publishing the epoch
+	// under that same mutex gives topology changes one linearization point
+	// without ever acquiring pathsMu below selectorCutoverMu: either the packet
+	// validates and submits first, or it observes the new epoch and redispatches.
+	e.selectorCutoverMu.Lock()
+	defer e.selectorCutoverMu.Unlock()
+	for {
+		observed := e.pathTopologyEpoch.Load()
+		current := observed
+		if current == 0 {
+			current = 1
+		}
+		if current == ^uint64(0) {
+			panic("engine: path topology epoch exhausted")
+		}
+		next := current + 1
+		if e.pathTopologyEpoch.CompareAndSwap(observed, next) {
+			for _, slot := range e.paths {
+				slot.topologyEpoch.Store(next)
+			}
+			return next
+		}
+	}
+}
+
 // proberLoop keeps the historical fixed observation cadence. Enabling selector
 // additionally starts one immediate probe per attached generation, because
 // selector is the consumer that turns missed replies into a hard failover.
@@ -1694,19 +1818,51 @@ func (e *Engine) Paths() []transport.PathInfo {
 	activeID := e.activeID
 	slots := e.pathSlotsLocked()
 	e.pathsMu.RUnlock()
-	return pathInfos(slots, activeID)
+	return pathInfos(slots, activeID, e.limits.ProbeInterval)
 }
 
 // TopologySnapshot returns one coherent public-observation epoch.
 func (e *Engine) TopologySnapshot() TopologySnapshot {
+	runtime := e.localExecutionRuntime()
 	e.pathsMu.RLock()
+	snapshot, slots := e.topologySnapshotLocked(runtime)
+	e.pathsMu.RUnlock()
+	snapshot.Paths = pathInfos(slots, snapshot.ActivePath, e.limits.ProbeInterval)
+	return snapshot
+}
+
+// topologySnapshotLocked captures structural topology while the caller holds
+// pathsMu for reading or writing. Transport-local counters and quality are
+// intentionally projected later as point observations, outside engine locks.
+func (e *Engine) topologySnapshotLocked(runtime *executionRuntime) (TopologySnapshot, []*pathSlot) {
 	e.leafRefreshMu.Lock()
 	activeID := e.activeID
 	slots := e.pathSlotsLocked()
 	snapshot := TopologySnapshot{
-		State:          BridgeState(e.state.Load()),
-		ActivePath:     activeID,
-		MigrationCount: e.migrationCount,
+		Epoch:            e.currentPathTopologyEpoch(),
+		PolicyGeneration: e.policyObservationGen.Load(),
+		State:            BridgeState(e.state.Load()),
+		ActivePath:       activeID,
+		MigrationCount:   e.migrationCount,
+	}
+	if runtime != nil {
+		attached := e.attachedLeafTargetsLocked()
+		leaves := runtime.effectiveLeafTargets(attached)
+		latest := make(map[proto.TargetID]*pathSlot, len(leaves))
+		for _, slot := range e.paths {
+			if !leaves[slot.localTXTargetID] {
+				continue
+			}
+			if current := latest[slot.localTXTargetID]; current == nil || slot.gen > current.gen {
+				latest[slot.localTXTargetID] = slot
+			}
+		}
+		for _, slot := range latest {
+			snapshot.EffectivePaths = append(snapshot.EffectivePaths, slot.id)
+		}
+		sort.Slice(snapshot.EffectivePaths, func(i, j int) bool {
+			return snapshot.EffectivePaths[i] < snapshot.EffectivePaths[j]
+		})
 	}
 	for _, slot := range slots {
 		if slot.mobilityClaim == nil {
@@ -1721,9 +1877,18 @@ func (e *Engine) TopologySnapshot() TopologySnapshot {
 		})
 	}
 	e.leafRefreshMu.Unlock()
+	return snapshot, slots
+}
+
+func (e *Engine) topologyObservationStable(snapshot TopologySnapshot) bool {
+	e.pathsMu.RLock()
+	stable := e.currentPathTopologyEpoch() == snapshot.Epoch &&
+		BridgeState(e.state.Load()) == snapshot.State &&
+		e.activeID == snapshot.ActivePath &&
+		e.migrationCount == snapshot.MigrationCount &&
+		e.policyObservationGen.Load() == snapshot.PolicyGeneration
 	e.pathsMu.RUnlock()
-	snapshot.Paths = pathInfos(slots, activeID)
-	return snapshot
+	return stable
 }
 
 func (e *Engine) pathSlotsLocked() []*pathSlot {
@@ -1734,13 +1899,15 @@ func (e *Engine) pathSlotsLocked() []*pathSlot {
 	return slots
 }
 
-func pathInfos(slots []*pathSlot, activeID uint32) []transport.PathInfo {
+func pathInfos(slots []*pathSlot, activeID uint32, probeInterval time.Duration) []transport.PathInfo {
+	qualities := observePathQualities(slots, selectorQualityObservationBudget)
+	observedAt := nowFn()
 	out := make([]transport.PathInfo, 0, len(slots))
 	for _, s := range slots {
 		pi := transport.PathInfo{
 			ID:         s.id,
 			Spec:       s.spec.Clone(),
-			Quality:    s.quality(),
+			Quality:    publicPathQuality(s, qualities[s], observedAt, probeInterval),
 			Since:      s.attached,
 			LocalAddr:  s.conn.LocalAddr(),
 			RemoteAddr: s.conn.RemoteAddr(),
@@ -1778,143 +1945,19 @@ func pathInfos(slots []*pathSlot, activeID uint32) []transport.PathInfo {
 	return out
 }
 
-// Migrate switches the active path to id. Returns an error if id is
-// unknown or already dead. The new path becomes the destination of
-// all subsequent sends. Unacked frames from the bounded send history
-// are replayed on the new active path; recv-side dedup makes already
-// delivered frames harmless while filling gaps left on the old path.
-func (e *Engine) Migrate(id uint32) error {
-	if runtime := e.localExecutionRuntime(); runtime != nil {
-		return e.migrateRecursiveSelectorPath(id, runtime)
+func publicPathQuality(
+	slot *pathSlot,
+	adapter transport.PathQuality,
+	now time.Time,
+	probeInterval time.Duration,
+) transport.PathQuality {
+	evidence, ok := slot.probeSnapshot()
+	if !ok || evidence.lastSuccess.IsZero() || evidence.quality.RTT <= 0 || evidence.quality.At.IsZero() ||
+		now.Before(evidence.quality.At) ||
+		now.Sub(evidence.quality.At) > selectorProbeFreshFor(probeInterval, evidence.quality) {
+		return adapter
 	}
-	return e.migrateOwnerDecision(id, true, "explicit")
-}
-
-func (e *Engine) migrateRecursiveSelectorPath(id uint32, runtime *executionRuntime) error {
-	e.pathsMu.RLock()
-	slot := e.paths[id]
-	targetID := proto.TargetID{}
-	if slot != nil {
-		targetID = slot.localTXTargetID
-	}
-	e.pathsMu.RUnlock()
-	if slot == nil {
-		return fmt.Errorf("engine: migrate to unknown path %d", id)
-	}
-	root, ok := runtime.plan.root()
-	if !ok || root.kind != proto.GraphNodeKindSelector {
-		return fmt.Errorf("engine: path migration requires a selector root")
-	}
-	if err := runtime.plan.validateImmediateChild(root.targetID, targetID); err != nil {
-		return fmt.Errorf("engine: path %d is not a directly selectable root target: %w", id, err)
-	}
-	if err := e.SelectLocalTarget(root.targetID, targetID, "explicit"); err != nil {
-		return err
-	}
-	return e.redistributeFrames(e.sendHistorySnapshot(e.sendAckNext.Load()))
-}
-
-func (e *Engine) migrateOwnerDecision(id uint32, clearScope bool, cause string) error {
-	e.policyOwnerMu.Lock()
-	defer e.policyOwnerMu.Unlock()
-	if err := e.migrate(id, clearScope, cause); err != nil {
-		return err
-	}
-	e.recordPathPolicyDecision(id)
-	return nil
-}
-
-func (e *Engine) recordPathPolicyDecision(id uint32) {
-	binding := e.localGraphBinding()
-	root, ok := binding.manifest.Node(binding.manifest.RootID)
-	if !ok || root.Kind != proto.GraphNodeKindSelector {
-		return
-	}
-	e.pathsMu.RLock()
-	slot := e.paths[id]
-	targetID := proto.TargetID{}
-	if slot != nil {
-		targetID = slot.localTXTargetID
-	}
-	e.pathsMu.RUnlock()
-	node, ok := binding.manifest.Node(targetID)
-	if !ok || node.Kind != proto.GraphNodeKindPath {
-		return
-	}
-	immediate := false
-	for _, childID := range root.Children {
-		if childID == node.ID {
-			immediate = true
-			break
-		}
-	}
-	if !immediate {
-		return
-	}
-	e.policyStateMu.Lock()
-	defer e.policyStateMu.Unlock()
-	if e.policySelections[root.ID] == node.ID {
-		return
-	}
-	if e.policyGeneration != ^uint64(0) {
-		e.policyGeneration++
-	}
-	e.policySelections[root.ID] = node.ID
-}
-
-func (e *Engine) migrate(id uint32, clearScope bool, cause string) error {
-	e.sendMu.Lock()
-	defer e.sendMu.Unlock()
-
-	if e.isClosed() {
-		return net.ErrClosed
-	}
-
-	e.pathsMu.RLock()
-	slot, ok := e.paths[id]
-	if !ok {
-		e.pathsMu.RUnlock()
-		return fmt.Errorf("engine: migrate to unknown path %d", id)
-	}
-	if e.activeID == id {
-		e.pathsMu.RUnlock()
-		return nil
-	}
-	gen := slot.gen
-	e.pathsMu.RUnlock()
-
-	replay := e.sendHistorySnapshot(e.sendAckNext.Load())
-	for _, frame := range replay {
-		n, err := slot.writeDispatchedFrame(frame)
-		if err != nil {
-			return err
-		}
-		if n != len(frame) {
-			return io.ErrShortWrite
-		}
-		slot.lastSendUnixNano.Store(nowFn().UnixNano())
-	}
-
-	e.pathsMu.Lock()
-	current, ok := e.paths[id]
-	if !ok || current != slot || current.gen != gen {
-		e.pathsMu.Unlock()
-		return fmt.Errorf("engine: migration target %d changed during replay", id)
-	}
-	oldID := e.activeID
-	e.activeID = id
-	if clearScope {
-		e.dispatchScope = nil
-	}
-	e.migrationCount++
-	e.setState(BridgeActive)
-	e.pathsMu.Unlock()
-
-	if cause == "" {
-		cause = "explicit"
-	}
-	e.fireMigrateHooks(oldID, id, cause)
-	return nil
+	return selectorEvidenceQuality(adapter, evidence, true)
 }
 
 // isClosed checks the lifecycle.
@@ -1991,8 +2034,12 @@ func (e *Engine) GracefulClose(reason proto.ByeReason) error {
 // physical teardown.
 func (e *Engine) BeginGracefulClose() {
 	e.sessionEpochMu.Lock()
+	e.policyLifecycleMu.Lock()
+	e.policyStateMu.Lock()
 	e.sendWriteClosed.Store(true)
 	e.sendClosing.Store(true)
+	e.policyStateMu.Unlock()
+	e.policyLifecycleMu.Unlock()
 	e.sessionEpochMu.Unlock()
 }
 
@@ -2057,32 +2104,29 @@ func (e *Engine) closeOutcome(operationErr, teardownErr error) error {
 	return errors.Join(operationErr, teardownErr, terminalErr)
 }
 
-// Internal dispatch identifiers are deliberately separate from both the
-// public API mode and the wire-level proto.ExecutionKind.
-const (
-	dispatchSelector uint32 = 1
-	dispatchBond     uint32 = 2
-	dispatchRace     uint32 = 3
-)
-
 type policySelectionOrigin uint8
 
 const (
 	policySelectionExternal policySelectionOrigin = iota
+	policySelectionExplicit
 	policySelectionQuality
 	policySelectionPathDeath
+	policySelectionPathDeathReplayed
 	policySelectionProbeFailure
 	policySelectionProbeStarvedData
 	policySelectionWriteStalled
+	policySelectionPeakPromote
+	policySelectionPeakReturn
 )
 
 func (origin policySelectionOrigin) requiresSelectorCutover() bool {
-	return origin == policySelectionQuality || origin.isFactualFailure()
+	return origin == policySelectionExplicit || origin == policySelectionQuality ||
+		origin == policySelectionPeakPromote || origin == policySelectionPeakReturn || origin.isFactualFailure()
 }
 
 func (origin policySelectionOrigin) isFactualFailure() bool {
 	switch origin {
-	case policySelectionPathDeath, policySelectionProbeFailure, policySelectionProbeStarvedData, policySelectionWriteStalled:
+	case policySelectionPathDeath, policySelectionPathDeathReplayed, policySelectionProbeFailure, policySelectionProbeStarvedData, policySelectionWriteStalled:
 		return true
 	default:
 		return false
@@ -2094,113 +2138,71 @@ func (origin policySelectionOrigin) chargesZombieBudget() bool {
 	// follow-up selector transaction only aligns desired policy with the
 	// committed data-plane fallback; charging it again can trip zombie on one
 	// carrier failure when a nested selector chooses another leaf internally.
-	return origin.isFactualFailure() && origin != policySelectionPathDeath
+	return origin.isFactualFailure() && origin != policySelectionPathDeath && origin != policySelectionPathDeathReplayed
 }
 
-// ConfigureExecution sets the initial sender executor using an explicit wire
-// mapping. Runtime policy transitions use SetDispatchPolicy.
-func (e *Engine) ConfigureExecution(kind proto.ExecutionKind) error {
-	mode, ok := dispatchForExecutionKind(kind)
-	if !ok {
-		return fmt.Errorf("engine: invalid execution kind %d", kind)
-	}
-	e.pathsMu.Lock()
-	e.dispatchScope = nil
-	e.pathsMu.Unlock()
-	e.mode.Store(mode)
-	return nil
-}
-
-// Mode returns the current dispatcher mode.
-func (e *Engine) Mode() uint32 { return e.mode.Load() }
-
-// setDispatchPolicy updates the temporary flat dispatcher at one sender
-// boundary. Callers must own policyOwnerMu when this is a runtime decision;
-// initialization runs before the engine is exposed to the application.
-func (e *Engine) setDispatchPolicy(kind proto.ExecutionKind, active uint32, scope []uint32, cause string) error {
-	return e.setDispatchPolicyAndSelection(
-		kind, active, scope, cause, nil, proto.TargetID{}, proto.TargetID{}, policySelectionExternal, 0,
-	)
-}
-
-func (e *Engine) setDispatchPolicyAndSelection(
-	kind proto.ExecutionKind,
-	active uint32,
-	scope []uint32,
+func (e *Engine) commitRecursiveSelection(
 	cause string,
 	runtime *executionRuntime,
 	selectorID proto.TargetID,
 	targetID proto.TargetID,
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
+	expectedEvidence selectorEvidenceCommit,
+	committed func(publishRoute func()) error,
 ) error {
-	mode, ok := dispatchForExecutionKind(kind)
-	if !ok {
-		return fmt.Errorf("engine: invalid execution kind %d", kind)
+	if runtime == nil || runtime.plan == nil {
+		return errExecutionRuntimeNotConfigured
 	}
-	// Serialize the policy boundary with sequenced DATA/CTRL publication. Once
-	// this returns, every later frame observes the new mode, scope, and active
-	// path as one state transition.
+	// Serialize the selector decision with sequenced DATA/CTRL publication.
+	// Recursive target state is the only DATA routing authority; activeID is a
+	// representative physical path retained for observation and mobility.
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 	if e.isClosed() || e.sendClosing.Load() {
 		return net.ErrClosed
 	}
 	e.pathsMu.Lock()
-	if runtime != nil && e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID) {
+	if err := e.validateSelectorEvidenceCommitLocked(expectedEvidence); err != nil {
+		e.pathsMu.Unlock()
+		return err
+	}
+	if runtime != nil && e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID, origin) {
 		e.pathsMu.Unlock()
 		return errPolicySelectionLeafMobilityHeld
 	}
-	if len(scope) > 0 {
-		for _, id := range scope {
-			if _, ok := e.paths[id]; !ok {
-				e.pathsMu.Unlock()
-				return fmt.Errorf("engine: policy references unknown path %d", id)
-			}
-		}
-	}
-	if active != 0 {
-		if _, ok := e.paths[active]; !ok {
-			e.pathsMu.Unlock()
-			return fmt.Errorf("engine: policy activates unknown path %d", active)
-		}
-	}
-	if runtime != nil {
-		if err := runtime.selectChild(selectorID, targetID); err != nil {
-			e.pathsMu.Unlock()
-			return err
-		}
-		effectiveKind, projectedActive, projectedScope, err := e.projectRecursiveDispatchLocked(runtime)
-		if err != nil {
-			e.pathsMu.Unlock()
-			return err
-		}
-		mode, ok = dispatchForExecutionKind(effectiveKind)
-		if !ok {
-			e.pathsMu.Unlock()
-			return fmt.Errorf("engine: invalid effective execution kind %d", effectiveKind)
-		}
-		active = projectedActive
-		scope = projectedScope
-		e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
-	}
 	oldID := e.activeID
-	if active == 0 {
-		active = e.pickAnyActiveFromScopeLocked(scope)
-	}
-	if active != 0 {
-		e.activeID = active
-		e.setState(BridgeActive)
-	}
-	if len(scope) == 0 {
-		e.dispatchScope = nil
-	} else {
-		next := make(map[uint32]bool, len(scope))
-		for _, id := range scope {
-			next[id] = true
+	attached := e.attachedLeafTargetsLocked()
+	if err := runtime.commitSelectorChildOrigin(selectorID, targetID, attached, origin, func(leaves map[proto.TargetID]bool) error {
+		e.policyLifecycleMu.Lock()
+		defer e.policyLifecycleMu.Unlock()
+		if e.closing.Load() || e.sendClosing.Load() || e.isClosed() {
+			return net.ErrClosed
 		}
-		e.dispatchScope = next
+		active := e.representativePathForLeavesLocked(leaves)
+		if active == 0 {
+			return errNoExecutionRoute
+		}
+		publishRoute := func() {
+			e.activeID = active
+			e.setState(BridgeActive)
+		}
+		if committed != nil {
+			if err := committed(publishRoute); err != nil {
+				return err
+			}
+		} else {
+			publishRoute()
+		}
+		if hook := e.policyCommitAfterPublish; hook != nil {
+			hook()
+		}
+		return nil
+	}); err != nil {
+		e.pathsMu.Unlock()
+		return err
 	}
+	e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
 	changed := oldID != e.activeID && e.activeID != 0
 	var zombieTrip zombieTripTicket
 	if changed {
@@ -2209,11 +2211,10 @@ func (e *Engine) setDispatchPolicyAndSelection(
 			zombieTrip = e.accountMigration()
 		}
 	}
-	e.mode.Store(mode)
 	newID := e.activeID
 	e.pathsMu.Unlock()
 	handedOff := e.selectorCutoverDidHandoff(cutoverGeneration)
-	if handedOff || origin.isFactualFailure() {
+	if handedOff || (origin.isFactualFailure() && origin != policySelectionPathDeathReplayed) || (changed && origin == policySelectionExplicit) {
 		// The route commit and its frozen replay prefix are one sequencer
 		// transaction. Releasing sendMu before replay would let later application
 		// SEQs overtake this prefix and provoke a gap-replay storm on the new
@@ -2222,6 +2223,7 @@ func (e *Engine) setDispatchPolicyAndSelection(
 		// excluded.
 		e.finishSelectorCutover(cutoverGeneration)
 		if err := e.replayRangeLocked(e.sendAckNext.Load(), e.sendPublishedNext.Load()); err != nil {
+			e.requestReplayRange(e.sendAckNext.Load(), e.sendPublishedNext.Load())
 			return err
 		}
 	}
@@ -2237,43 +2239,47 @@ func (e *Engine) setDispatchPolicyAndSelection(
 	return nil
 }
 
-// projectRecursiveDispatchLocked maps the root's effective target subtree to
-// the transitional flat observability fields. Caller must hold pathsMu.
-func (e *Engine) projectRecursiveDispatchLocked(runtime *executionRuntime) (proto.ExecutionKind, uint32, []uint32, error) {
-	attached := make(map[proto.TargetID]bool, len(e.paths))
+// representativePathForLeavesLocked returns one physical path for status,
+// hooks, quiesce and mobility. Recursive execution, never this representative,
+// remains authoritative for DATA routing. Caller holds pathsMu.
+func (e *Engine) representativePathForLeavesLocked(leaves map[proto.TargetID]bool) uint32 {
+	latest := make(map[proto.TargetID]*pathSlot, len(leaves))
 	for _, slot := range e.paths {
-		attached[slot.localTXTargetID] = true
+		if !leaves[slot.localTXTargetID] {
+			continue
+		}
+		if current := latest[slot.localTXTargetID]; current == nil || slot.gen > current.gen {
+			latest[slot.localTXTargetID] = slot
+		}
 	}
-	leafTargets, kind, err := runtime.activeLeafTargets(attached)
+	if current := e.paths[e.activeID]; current != nil && latest[current.localTXTargetID] == current {
+		return current.id
+	}
+	var selected uint32
+	for _, slot := range latest {
+		if selected == 0 || slot.id < selected {
+			selected = slot.id
+		}
+	}
+	return selected
+}
+
+// projectRecursiveRepresentativeLocked refreshes the observation path after a
+// physical topology change without mutating selector policy. Caller holds
+// pathsMu.
+func (e *Engine) projectRecursiveRepresentativeLocked(runtime *executionRuntime) uint32 {
+	if runtime == nil || runtime.plan == nil {
+		return 0
+	}
+	leafIDs, _, err := runtime.activeLeafTargets(e.attachedLeafTargetsLocked())
 	if err != nil {
-		return 0, 0, nil, err
+		return 0
 	}
-	leafSet := make(map[proto.TargetID]bool, len(leafTargets))
-	for _, leafID := range leafTargets {
-		leafSet[leafID] = true
+	leaves := make(map[proto.TargetID]bool, len(leafIDs))
+	for _, leafID := range leafIDs {
+		leaves[leafID] = true
 	}
-	scope := make([]uint32, 0, len(leafTargets))
-	for pathID, slot := range e.paths {
-		if leafSet[slot.localTXTargetID] {
-			scope = append(scope, pathID)
-		}
-	}
-	for i := 1; i < len(scope); i++ {
-		for j := i; j > 0 && scope[j] < scope[j-1]; j-- {
-			scope[j], scope[j-1] = scope[j-1], scope[j]
-		}
-	}
-	active := uint32(0)
-	for _, pathID := range scope {
-		if pathID == e.activeID {
-			active = pathID
-			break
-		}
-	}
-	if active == 0 && len(scope) > 0 {
-		active = scope[0]
-	}
-	return kind, active, scope, nil
+	return e.representativePathForLeavesLocked(leaves)
 }
 
 // SetPeerPolicyAdmission installs a bounded, local sender-side admission
@@ -2292,6 +2298,31 @@ func (e *Engine) admitPeerPolicy(selectorID, targetID proto.TargetID, cause stri
 		return nil
 	}
 	return fn(selectorID, targetID, cause)
+}
+
+// SetPeakPolicyObserver installs a sender-local observer for committed
+// PeakTransfer phase changes. The observer cannot influence the transaction;
+// it starts or closes bounded capacity accounting after commit.
+func (e *Engine) SetPeakPolicyObserver(fn func(selectorID, targetID proto.TargetID, peak bool, cause string)) {
+	e.peakPolicyObserverMu.Lock()
+	e.peakPolicyObserver = fn
+	e.peakPolicyObserverMu.Unlock()
+}
+
+func (e *Engine) observePeakPolicy(selectorID, targetID proto.TargetID, origin policySelectionOrigin, cause string) {
+	if origin != policySelectionPeakPromote && origin != policySelectionPeakReturn && !origin.isFactualFailure() {
+		return
+	}
+	peak := origin == policySelectionPeakPromote
+	if origin.isFactualFailure() {
+		peak = policyTargetIsPeak(e.localGraphBinding().manifest, selectorID, targetID)
+	}
+	e.peakPolicyObserverMu.RLock()
+	fn := e.peakPolicyObserver
+	e.peakPolicyObserverMu.RUnlock()
+	if fn != nil {
+		fn(selectorID, targetID, peak, cause)
+	}
 }
 
 // SetReadDeadline sets a deadline after which a blocked Recv/RecvPacket
@@ -2395,13 +2426,10 @@ const defaultBondPinSize = 8
 // caused recursive dispatch to retry the immutable frame on another route.
 // RTT by itself never increments this counter or excludes a bond child.
 func (e *Engine) BondStuckSkips() uint64 {
-	e.pathsMu.RLock()
-	legacy := e.bondStuckSkips
-	e.pathsMu.RUnlock()
 	if runtime := e.localExecutionRuntime(); runtime != nil {
-		return legacy + runtime.stuckSkips.Load()
+		return runtime.stuckSkips.Load()
 	}
-	return legacy
+	return 0
 }
 
 // MigrationCount returns the cumulative number of committed migrations since
@@ -2533,9 +2561,13 @@ func (e *Engine) Close() error {
 			e.retryPeerTerminalAck()
 		}
 		e.sessionEpochMu.Lock()
+		e.policyLifecycleMu.Lock()
+		e.policyStateMu.Lock()
 		e.closing.Store(true)
 		e.sendClosing.Store(true)
 		e.sendWriteClosed.Store(true)
+		e.policyStateMu.Unlock()
+		e.policyLifecycleMu.Unlock()
 		e.sessionEpochMu.Unlock()
 		e.leafTx.writerMu.Lock()
 		e.leafTx.writerClosing = true
@@ -2576,7 +2608,6 @@ func (e *Engine) Close() error {
 		e.completedPathAdmissions = make(map[proto.PathAdmissionBinding]*completedPathAdmission)
 		e.pathLeafGeneration = make(map[pathAdmissionLeafKey]uint64)
 		e.activeID = 0
-		e.dispatchScope = nil
 		e.pathsMu.Unlock()
 		e.closeLeafMobilityRefreshQueue()
 		e.clearPathProbeState(slots)
@@ -2612,6 +2643,7 @@ func (e *Engine) Close() error {
 				if slot.proberStarted.Load() {
 					<-slot.doneP
 				}
+				slot.waitQualityObserver()
 				slot.probeWriteWG.Wait()
 				slot.ackWG.Wait()
 			}
@@ -2848,6 +2880,14 @@ func (e *Engine) RemovePath(id uint32) error {
 		}
 		departure := e.detachPathLocked(current, runtime, transport.CauseCleanClose, nil, true)
 		e.pathsMu.Unlock()
+		// Keep the topology commit and its frozen unacknowledged prefix in one
+		// send transaction. Otherwise PATH_RETIRE may consume the next SEQ and
+		// overtake the replay, provoking an avoidable cumulative-gap retry of
+		// the same DATA frame. A failed publication retains ledger ownership and
+		// is retried by finishPathDeparture after sendMu is released.
+		departure.replayCommitted = e.replayRangeLocked(
+			e.sendAckNext.Load(), e.sendPublishedNext.Load(),
+		) == nil
 		e.sendMu.Unlock()
 		e.finishPathDeparture(departure)
 		return nil
@@ -2884,6 +2924,11 @@ func (e *Engine) RetirePath(ref PathRef, reason error) error {
 	}
 	departure := e.detachPathLocked(slot, runtime, transport.CauseCleanClose, reason, true)
 	e.pathsMu.Unlock()
+	if departure.hasPaths {
+		departure.replayCommitted = e.replayRangeLocked(
+			e.sendAckNext.Load(), e.sendPublishedNext.Load(),
+		) == nil
+	}
 	e.sendMu.Unlock()
 	e.finishPathDeparture(departure)
 	return nil

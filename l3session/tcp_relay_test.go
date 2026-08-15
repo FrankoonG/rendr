@@ -316,17 +316,8 @@ func TestTCPRelayPreservesFlowAcrossStreamMigration(t *testing.T) {
 		t.Fatalf("missing stream session: ok=%v sess=%+v", ok, sess)
 	}
 	admin := sess.Conn.(streamControl)
-	var pathB uint32
-	for _, p := range admin.Paths() {
-		if p.Spec.Opts["name"] == "tcp-b" {
-			pathB = p.ID
-			break
-		}
-	}
-	if pathB == 0 {
-		t.Fatalf("path tcp-b not attached: %+v", admin.Paths())
-	}
-	if err := admin.Migrate(pathB); err != nil {
+	_ = waitForSessionPathAttached(t, admin, "tcp-b", 3*time.Second)
+	if err := admin.SelectTarget("root", "tcp-b"); err != nil {
 		t.Fatal(err)
 	}
 	twoDone := startEchoStream(t, egressApp, "two", "ack-two")

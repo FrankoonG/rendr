@@ -42,7 +42,6 @@ type bridgeTableEntry struct {
 	state      BridgeEntryState
 	engine     *Engine
 	changed    chan struct{}
-	legacy     bool
 }
 
 // BridgeTable owns the bounded server-side flow publication lifecycle. entries
@@ -119,7 +118,7 @@ func (b *BridgeTable) AssignSession(reservation BridgeReservation, sessionID [16
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	entry, ok := b.matchLocked(reservation)
-	if !ok || entry.state != BridgeEntryReserved || entry.legacy {
+	if !ok || entry.state != BridgeEntryReserved {
 		return ErrBridgeStaleReservation
 	}
 	return b.assignSessionLocked(entry, sessionID)
@@ -135,7 +134,7 @@ func (b *BridgeTable) ActivateSession(reservation BridgeReservation, sessionID [
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	entry, ok := b.matchLocked(reservation)
-	if !ok || entry.state != BridgeEntryReserved || entry.legacy {
+	if !ok || entry.state != BridgeEntryReserved {
 		return ErrBridgeStaleReservation
 	}
 	if err := b.assignSessionLocked(entry, sessionID); err != nil {
@@ -247,7 +246,7 @@ func (b *BridgeTable) Abort(reservation BridgeReservation) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	entry, ok := b.matchLocked(reservation)
-	if !ok || entry.state != BridgeEntryReserved || entry.legacy {
+	if !ok || entry.state != BridgeEntryReserved {
 		return false
 	}
 	delete(b.entries, reservation.flowID)
@@ -266,7 +265,7 @@ func (b *BridgeTable) RemoveActive(reservation BridgeReservation, e *Engine) boo
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	entry, ok := b.matchLocked(reservation)
-	if !ok || entry.state != BridgeEntryActive || entry.engine != e || entry.legacy {
+	if !ok || entry.state != BridgeEntryActive || entry.engine != e {
 		return false
 	}
 	delete(b.entries, reservation.flowID)
@@ -283,57 +282,6 @@ func (b *BridgeTable) matchLocked(reservation BridgeReservation) (*bridgeTableEn
 		return nil, false
 	}
 	return entry, true
-}
-
-// Put is a transitional internal wrapper for pre-Runtime listeners. Entries
-// created here are tagged legacy so ID-only Remove cannot affect transactional
-// reservations. New code must use Reserve followed by Activate.
-func (b *BridgeTable) Put(id [16]byte, e *Engine) bool {
-	if e == nil {
-		return false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, exists := b.entries[id]; exists || len(b.entries) >= b.capacity {
-		return false
-	}
-	if _, exists := b.sessions[id]; exists {
-		return false
-	}
-	if b.nextGeneration == ^uint64(0) {
-		return false
-	}
-	b.nextGeneration++
-	changed := make(chan struct{})
-	close(changed)
-	entry := &bridgeTableEntry{
-		generation: b.nextGeneration,
-		sessionID:  id,
-		state:      BridgeEntryActive,
-		engine:     e,
-		changed:    changed,
-		legacy:     true,
-	}
-	b.entries[id] = entry
-	b.sessions[id] = entry
-	return true
-}
-
-// Get is a transitional internal wrapper for pre-Runtime listeners.
-func (b *BridgeTable) Get(id [16]byte) (*Engine, bool) {
-	return b.Lookup(id)
-}
-
-// Remove is a transitional internal wrapper for pre-Runtime listeners. It can
-// remove only legacy Put entries and therefore cannot weaken token ownership.
-func (b *BridgeTable) Remove(id [16]byte) {
-	b.mu.Lock()
-	entry, ok := b.entries[id]
-	if ok && entry.legacy {
-		delete(b.entries, id)
-		delete(b.sessions, entry.sessionID)
-	}
-	b.mu.Unlock()
 }
 
 // Len returns the number of reserved and active entries charged to capacity.

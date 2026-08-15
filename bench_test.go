@@ -20,7 +20,7 @@ func BenchmarkStreamThroughputTCP(b *testing.B) {
 }
 
 // BenchmarkStreamThroughputTCPWithMigration measures the same payload
-// throughput with explicit Migrate() calls every migrateEvery bytes.
+// throughput with explicit target selections every migrateEvery bytes.
 // Compare with the no-migration baseline to gauge G1 overhead.
 //
 //	go test -bench=BenchmarkStreamThroughputTCPWithMigration -benchtime=2s
@@ -41,7 +41,7 @@ func BenchmarkStreamThroughputTCPWithMigration(b *testing.B) {
 // benchStream drives b.N write/read pairs of `chunk` bytes between
 // loopback rendr Conns. nPaths sets how many TCP paths the client
 // attaches; migrateEvery==0 disables explicit migration, otherwise
-// the client calls MigrationController.Migrate after every `migrateEvery`
+// the client calls MigrationController.SelectTarget after every `migrateEvery`
 // transferred bytes. b.SetBytes is set to chunk so go test reports
 // MB/s; b.ResetTimer skips setup cost from the measurement.
 func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
@@ -118,7 +118,7 @@ func benchStream(b *testing.B, nPaths int, migrateEvery int, chunk int) {
 				cur := observer.ActivePath()
 				for _, p := range client.Paths() {
 					if p.ID != cur {
-						_ = migrator.Migrate(p.ID)
+						_ = migrator.SelectTarget("root", pathNameByID(client.Paths(), p.ID))
 						break
 					}
 				}

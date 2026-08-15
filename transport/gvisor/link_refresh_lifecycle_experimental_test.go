@@ -1,9 +1,10 @@
-//go:build rendr_experimental_gvisor
+//go:build linux && amd64 && rendr_experimental_gvisor
 
 package gvisor
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -70,8 +71,71 @@ func TestGVisorRefreshContextCancellationClearsSubscriberAndAllowsResubscribe(t 
 	waitRefreshLoopDone(t, "second monitor", secondMonitorDone)
 	waitRefreshLoopDone(t, "second dispatcher", secondDispatchDone)
 
-	if path.link.publishWireFailure() {
+	if path.link.publishWireFailure(leafmobility.RefreshReasonLocalWriteFailure) {
 		t.Fatal("canceled refresh subscriber accepted a later wire failure")
+	}
+}
+
+func TestGVisorWireFaultEvidencePreservesFirstTypedCause(t *testing.T) {
+	for _, reason := range []leafmobility.RefreshReason{
+		leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonOuterMTUFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure,
+	} {
+		t.Run("reason-"+strconv.Itoa(int(reason)), func(t *testing.T) {
+			listener := mustPacketListener(t)
+			client, server := dialAndAccept(t, listener)
+			t.Cleanup(func() {
+				if err := client.Close(); err != nil {
+					t.Errorf("close typed-fault client: %v", err)
+				}
+				if err := server.Close(); err != nil {
+					t.Errorf("close typed-fault server: %v", err)
+				}
+			})
+			path := client.(*retainedPathConn)
+			claim := path.LeafMobilityClaim()
+			binding := leafmobility.Binding{
+				FlowID: [16]byte{92, byte(reason)}, LocalTargetID: [16]byte{92, 2}, PeerTargetID: [16]byte{92, 3},
+				PathID: uint32(92 + reason), Owner: uint64(192 + reason),
+			}
+			issuer := leafmobility.NewAuthorityIssuer()
+			if err := issuer.BindClaim(claim, binding); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = claim.Retire(binding) })
+			events := make(chan leafmobility.RefreshEvidence, 1)
+			cancel, err := path.SubscribeLeafMobilityRefresh(context.Background(), func(evidence leafmobility.RefreshEvidence) {
+				events <- evidence
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancel()
+			path.link.mu.Lock()
+			path.link.routeBaseline = [32]byte{0xff}
+			path.link.mu.Unlock()
+			if !path.link.publishWireFailure(reason) {
+				t.Fatalf("typed wire fault %d was not published", reason)
+			}
+			path.link.publishWireFailure(leafmobility.RefreshReasonLinkUnresponsive)
+			select {
+			case evidence := <-events:
+				snapshot, validateErr := evidence.ValidateFor(claim, 0)
+				if validateErr != nil {
+					t.Fatal(validateErr)
+				}
+				if snapshot.Reason != reason {
+					t.Fatalf("wire fault reason=%d want first cause=%d", snapshot.Reason, reason)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("typed wire fault %d produced no evidence", reason)
+			}
+		})
 	}
 }
 

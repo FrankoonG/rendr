@@ -2,6 +2,7 @@ package leafmobility
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,6 +177,47 @@ func TestRefreshEvidenceCarriesUnavailableAndRestoredSourceFacts(t *testing.T) {
 	if !restoredSnapshot.SourceUsable || restoredSnapshot.Reason != RefreshReasonRouteSourceRestored ||
 		restoredSnapshot.SourceGeneration == snapshot.SourceGeneration {
 		t.Fatalf("restored snapshot=%+v unavailable=%+v", restoredSnapshot, snapshot)
+	}
+	testRefreshEvidenceCarriesTypedUsableFaultWithoutChangingSource(t)
+}
+
+func testRefreshEvidenceCarriesTypedUsableFaultWithoutChangingSource(t *testing.T) {
+	reasons := []RefreshReason{
+		RefreshReasonLinkUnresponsive,
+		RefreshReasonLocalReadFailure,
+		RefreshReasonLocalWriteFailure,
+		RefreshReasonOuterMTUFailure,
+		RefreshReasonReplayStalled,
+		RefreshReasonReplayFailure,
+		RefreshReasonLivenessProbeFailure,
+	}
+	for _, reason := range reasons {
+		t.Run(fmt.Sprint(reason), func(t *testing.T) {
+			claim, _ := newRefreshTestClaim(t, 1)
+			state := NewRefreshSourceState()
+			baseline, err := state.Update([32]byte{0x61})
+			if err != nil {
+				t.Fatal(err)
+			}
+			emitter, err := NewRefreshEmitterWithSourceState(claim, state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := emitter.Observe(reason, baseline)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := evidence.ValidateFor(claim, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !snapshot.SourceUsable || snapshot.Reason != reason {
+				t.Fatalf("typed fault snapshot=%+v want reason=%d", snapshot, reason)
+			}
+			if _, err := state.DigestForCommit(evidence); err != nil {
+				t.Fatalf("unchanged usable source cannot commit: %v", err)
+			}
+		})
 	}
 }
 

@@ -280,17 +280,18 @@ func sessionPathNames(sess *Session) []string {
 }
 
 func selectedPathNames(stats rendr.ConnStats) []string {
-	if stats.Mode == rendr.ModeBond || stats.Mode == rendr.ModeRace {
-		return pathNames(stats.Paths)
+	effective := make(map[uint32]bool, len(stats.EffectivePaths))
+	for _, id := range stats.EffectivePaths {
+		effective[id] = true
 	}
-	active := make([]rendr.PathInfo, 0, 1)
+	active := make([]rendr.PathInfo, 0, len(effective))
 	for _, p := range stats.Paths {
-		if p.Active || p.ID == stats.ActivePath {
+		if effective[p.ID] {
 			active = append(active, p)
 		}
 	}
 	if len(active) == 0 {
-		return pathNames(stats.Paths)
+		return nil
 	}
 	return pathNames(active)
 }

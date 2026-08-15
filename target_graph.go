@@ -180,9 +180,54 @@ func graphNodeKind(kind TargetKind) (proto.GraphNodeKind, error) {
 	}
 }
 
-// compileDialPlan derives the temporary flat dispatcher input from the same
-// immutable snapshot that owns the protocol digest. M4 replaces this flat
-// projection with recursive executors; no caller may walk Root a second time.
+// resolveSelectorChild resolves the public logical selection surface against
+// the exact immutable graph used to configure the engine. Selection is scoped
+// to an immediate child so a child group remains one target and cannot be
+// confused with one of its physical leaves.
+func (g compiledTargetGraph) resolveSelectorChild(selectorName, targetName string) (proto.TargetID, proto.TargetID, error) {
+	return resolveSelectorChild(g.manifest, selectorName, targetName)
+}
+
+func resolveSelectorChild(manifest proto.GraphManifest, selectorName, targetName string) (proto.TargetID, proto.TargetID, error) {
+	if len(manifest.Nodes) == 0 {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: target selection is unavailable because the session has no compiled target graph")
+	}
+	if selectorName == "" {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: selector name is empty")
+	}
+	var selector, target proto.GraphNode
+	selectorFound, targetFound := false, false
+	for _, node := range manifest.Nodes {
+		if node.Name == selectorName {
+			selector, selectorFound = node, true
+		}
+		if node.Name == targetName {
+			target, targetFound = node, true
+		}
+	}
+	if !selectorFound {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: selector target %q is not in the session graph", selectorName)
+	}
+	if selector.Kind != proto.GraphNodeKindSelector {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: target %q is %s, not a selector", selectorName, selector.Kind)
+	}
+	if targetName == "" {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: target name is empty for selector %q", selectorName)
+	}
+	if !targetFound {
+		return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: target %q is not in the session graph", targetName)
+	}
+	for _, childID := range selector.Children {
+		if childID == target.ID {
+			return selector.ID, target.ID, nil
+		}
+	}
+	return proto.TargetID{}, proto.TargetID{}, fmt.Errorf("rendr: target %q is not an immediate child of selector %q", targetName, selectorName)
+}
+
+// compileDialPlan derives carrier dial order and recovery configuration from
+// the same immutable graph that owns recursive execution and the wire digest.
+// No caller may walk the mutable Target input a second time.
 func (g compiledTargetGraph) compileDialPlan() (compiledTarget, error) {
 	if g.root == nil {
 		return compiledTarget{}, errNilTarget
@@ -202,17 +247,12 @@ func compileGraphNodeForDial(node *targetGraphNode) (compiledTarget, error) {
 			return compiledTarget{}, fmt.Errorf("rendr: path target %q has no path spec", node.name)
 		}
 		return compiledTarget{
-			mode:     ModeSelector,
 			paths:    []PathSpec{clonePathSpec(*node.path)},
 			pathPeak: []bool{false},
 		}, nil
 	}
 
-	mode, err := modeForTargetKind(node.kind)
-	if err != nil {
-		return compiledTarget{}, err
-	}
-	out := compiledTarget{mode: mode, peakTransfer: node.peak != nil}
+	out := compiledTarget{peakTransfer: node.peak != nil}
 	peakNames := make(map[string]bool)
 	if node.peak != nil {
 		out.peakOptions = clonePeakTransfer(*node.peak)
@@ -237,34 +277,11 @@ func compileGraphNodeForDial(node *targetGraphNode) (compiledTarget, error) {
 			out.pathPeak = append(out.pathPeak, childPeak || nestedPeak)
 		}
 		out.peakTransfer = out.peakTransfer || childPlan.peakTransfer
-		out.runtimeNested = out.runtimeNested || child.kind != TargetKindPath || childPlan.runtimeNested
-		if childPeak && out.peakMode == 0 {
-			out.peakMode = childPlan.mode
-		}
-		if out.peakMode == 0 && childPlan.peakMode != 0 {
-			out.peakMode = childPlan.peakMode
-		}
 	}
 	if len(out.paths) == 0 {
 		return compiledTarget{}, errEmptyGroupTarget
 	}
-	if out.peakTransfer && out.peakMode == 0 {
-		out.peakMode = ModeSelector
-	}
 	return out, nil
-}
-
-func modeForTargetKind(kind TargetKind) (Mode, error) {
-	switch kind {
-	case TargetKindSelector:
-		return ModeSelector, nil
-	case TargetKindBond:
-		return ModeBond, nil
-	case TargetKindRace:
-		return ModeRace, nil
-	default:
-		return 0, fmt.Errorf("rendr: unknown target kind %q", kind)
-	}
 }
 
 func (g compiledTargetGraph) resolvePathSpec(spec PathSpec, attached []PathInfo) (PathSpec, error) {
@@ -402,6 +419,9 @@ func (c *targetGraphCompiler) compileGroup(group GroupTarget, depth int) (*targe
 	if group.Peak != nil && group.Kind != TargetKindSelector {
 		return nil, fmt.Errorf("rendr: PeakTransfer is only valid on selector target %q", group.TargetName)
 	}
+	if group.Peak != nil && depth != 1 {
+		return nil, fmt.Errorf("rendr: PeakTransfer selector %q must be the target graph root", group.TargetName)
+	}
 
 	node := &targetGraphNode{kind: group.Kind, name: group.TargetName}
 	c.nodesByName[node.name] = node
@@ -503,7 +523,6 @@ type canonicalTargetPeak struct {
 	SaturationFor   int64    `json:"saturation_for_ns"`
 	ReturnRatio     uint64   `json:"return_ratio_bits"`
 	ReturnFor       int64    `json:"return_for_ns"`
-	ProbeBudget     int64    `json:"probe_budget"`
 }
 
 func (c *targetGraphCompiler) canonicalGraph(root *targetGraphNode) canonicalTargetGraph {
@@ -550,7 +569,6 @@ func canonicalizeTargetNode(node *targetGraphNode) canonicalTargetNode {
 			SaturationFor:   int64(node.peak.SaturationFor),
 			ReturnRatio:     math.Float64bits(node.peak.ReturnRatio),
 			ReturnFor:       int64(node.peak.ReturnFor),
-			ProbeBudget:     node.peak.ProbeBudget,
 		}
 	}
 	canonical.Children = make([]canonicalTargetNode, 0, len(node.children))

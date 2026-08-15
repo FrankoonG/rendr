@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -21,6 +22,7 @@ type pathRecoverySupervisor struct {
 	tracker  *pathStatusTracker
 	updates  chan recoveryUpdate
 	done     chan struct{}
+	stopOnce sync.Once
 	minDelay time.Duration
 	maxDelay time.Duration
 }
@@ -486,14 +488,10 @@ func (s *pathRecoverySupervisor) stop() {
 	if s == nil {
 		return
 	}
-	reply := make(chan int, 1)
-	if !s.enqueue(recoveryUpdate{kind: recoveryUpdateStop, reply: reply}) {
-		return
-	}
-	select {
-	case <-reply:
-	case <-s.done:
-	}
+	s.stopOnce.Do(func() {
+		_ = s.enqueue(recoveryUpdate{kind: recoveryUpdateStop})
+	})
+	<-s.done
 }
 
 func recoveryLeafKey(spec PathSpec) string {

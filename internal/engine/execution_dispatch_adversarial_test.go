@@ -1316,6 +1316,50 @@ func TestRecursivePolicySelectionIsOneSequencedBoundary(t *testing.T) {
 	}
 }
 
+func TestFlatSelectorFastPathIgnoresObservationalActivePath(t *testing.T) {
+	for _, packetized := range []bool{false, true} {
+		name := "stream"
+		if packetized {
+			name = "packet"
+		}
+		t.Run(name, func(t *testing.T) {
+			manifest, ids := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+				runtimeNode(proto.GraphNodeKindPath, "a"),
+				runtimeNode(proto.GraphNodeKindPath, "b"),
+			)
+			client, server, captures := newRecursiveEnginePair(t, manifest, "a", "b")
+			if packetized {
+				client.SetPacketMode()
+				server.SetPacketMode()
+			}
+
+			client.pathsMu.Lock()
+			for pathID, slot := range client.paths {
+				if slot.localTXTargetID == ids["b"] {
+					// activeID is retained for status and migration hooks. Corrupting
+					// it must not override the recursive selector's desired leaf A.
+					client.activeID = pathID
+					break
+				}
+			}
+			client.pathsMu.Unlock()
+
+			if packetized {
+				if err := client.SendPacket([]byte("recursive-authority")); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := client.SendData([]byte("recursive-authority")); err != nil {
+				t.Fatal(err)
+			}
+			waitForCapturedFrames(t, captures, map[string]uint64{"a": 1, "b": 0})
+			if got := captures["b"].dataSequences(); len(got) != 0 {
+				t.Fatalf("observational active path overrode selector: b DATA=%v", got)
+			}
+		})
+	}
+}
+
 func TestRecursiveDispatchDeepGraphPreservesEveryBoundary(t *testing.T) {
 	a := runtimeNode(proto.GraphNodeKindPath, "a")
 	b := runtimeNode(proto.GraphNodeKindPath, "b")

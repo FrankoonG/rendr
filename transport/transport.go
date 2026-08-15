@@ -51,8 +51,9 @@ const (
 type PathConn interface {
 	io.ReadWriteCloser
 
-	// Quality returns the latest measurement. May return a zero
-	// PathQuality if the transport has not yet probed.
+	// Quality returns the latest measurement for direct caller diagnostics.
+	// May return a zero PathQuality if the transport has not yet probed. The
+	// engine uses PathQualityReader instead so observation is cancellable.
 	Quality() PathQuality
 
 	// OnDeath registers a callback the transport invokes exactly
@@ -66,6 +67,14 @@ type PathConn interface {
 	// not key off them.
 	LocalAddr() string
 	RemoteAddr() string
+}
+
+// PathQualityReader is the optional cancellable quality-observation extension
+// used by the engine. Implementations must return promptly after ctx is done.
+// The engine does not call PathConn.Quality because third-party legacy methods
+// may block without a cancellation boundary.
+type PathQualityReader interface {
+	QualityContext(ctx context.Context) (PathQuality, error)
 }
 
 // FrameBatchWriter is an optional PathConn fast path for transports that can

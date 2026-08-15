@@ -89,7 +89,6 @@ type PeakTransfer struct {
 	SaturationFor   time.Duration
 	ReturnRatio     float64
 	ReturnFor       time.Duration
-	ProbeBudget     int64
 }
 
 func (p PeakTransfer) applySelector(g *GroupTarget) {
@@ -98,18 +97,15 @@ func (p PeakTransfer) applySelector(g *GroupTarget) {
 	g.Peak = &cp
 }
 
-// compiledTarget is the temporary M3 bridge to the flat engine. It preserves
-// enough graph metadata for current selection behavior, but it is not the M4
-// recursive group executor.
+// compiledTarget owns the immutable graph plus the ordered leaf dial plan.
+// Runtime scheduling always uses graph; paths contains carrier configuration
+// only for initial dial and recovery.
 type compiledTarget struct {
-	mode          Mode
 	paths         []PathSpec
 	pathPeak      []bool
 	primaryName   string
 	peakTransfer  bool
-	peakMode      Mode
 	peakOptions   PeakTransfer
-	runtimeNested bool
 	graph         compiledTargetGraph
 	graphRevision uint64
 	runtimeConfig RuntimeConfig

@@ -97,16 +97,27 @@ func configureFastTailReplay(e *Engine) {
 	e.tailReplayMaxBackoff = 20 * time.Millisecond
 }
 
+func recordTailReplayTestPublication(t *testing.T, e *Engine, seq uint64, slot *pathSlot) uint64 {
+	t.Helper()
+	frame := make([]byte, proto.HeaderSize)
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: seq}).Encode(frame); err != nil {
+		t.Fatal(err)
+	}
+	e.sendHistMu.Lock()
+	e.sendHist.entries = append(e.sendHist.entries, sendHistoryEntry{seq: seq, frame: frame})
+	e.sendHistMu.Unlock()
+	e.noteTailReplayPublication(frame, slot)
+	return seq + 1
+}
+
 func TestTailReplayDefaultPacingIncludesObservedRTTAndJitter(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
+	ids := configureLeafSelectorRuntime(t, e, "high-rtt")
 	path, peer := newMemoryPathPair()
 	t.Cleanup(func() { _ = peer.Close() })
 	path.quality = transport.PathQuality{RTT: 400 * time.Millisecond, Jitter: 50 * time.Millisecond, At: time.Now()}
-	pathID, err := e.AttachPath(path, transport.PathSpec{Transport: "memory", Address: "high-rtt"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	pathID := attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: "high-rtt"}, ids["high-rtt"])
 	e.pathsMu.RLock()
 	slot := e.paths[pathID]
 	e.pathsMu.RUnlock()
@@ -117,17 +128,103 @@ func TestTailReplayDefaultPacingIncludesObservedRTTAndJitter(t *testing.T) {
 		})
 	}
 	storeQuality(path.quality)
-	initial, maximum := e.tailReplayTiming()
+	target := recordTailReplayTestPublication(t, e, 0, slot)
+	initial, maximum := e.tailReplayTiming(target)
 	if initial != 900*time.Millisecond || maximum != defaultTailReplayMaxBackoff {
 		t.Fatalf("tail replay timing=%s/%s want 900ms/%s", initial, maximum, defaultTailReplayMaxBackoff)
 	}
 
 	path.quality = transport.PathQuality{RTT: 3 * time.Second, Jitter: time.Second, At: time.Now()}
 	storeQuality(path.quality)
-	initial, maximum = e.tailReplayTiming()
+	target = recordTailReplayTestPublication(t, e, 1, slot)
+	initial, maximum = e.tailReplayTiming(target)
 	if initial != maximumTailReplayInitialDelay || maximum != maximumTailReplayInitialDelay {
 		t.Fatalf("clamped tail replay timing=%s/%s want %s", initial, maximum, maximumTailReplayInitialDelay)
 	}
+}
+
+func TestTailReplayPacingUsesActualPublicationRoutes(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		kind         proto.GraphNodeKind
+		publications []string
+		want         time.Duration
+	}{
+		{name: "race-uses-fastest-published-copy", kind: proto.GraphNodeKindRace, publications: []string{"slow", "fast"}, want: 300 * time.Millisecond},
+		{name: "bond-fast-child-ignores-unrelated-slow-child", kind: proto.GraphNodeKindBond, publications: []string{"fast"}, want: 300 * time.Millisecond},
+		{name: "bond-slow-child-retains-its-own-pacing", kind: proto.GraphNodeKindBond, publications: []string{"slow"}, want: 1500 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			direct := runtimeNode(proto.GraphNodeKindPath, "direct")
+			fast := runtimeNode(proto.GraphNodeKindPath, "fast")
+			slow := runtimeNode(proto.GraphNodeKindPath, "slow")
+			aggregate := proto.GraphNode{
+				ID: proto.DeriveTargetID(test.kind, "aggregate"), Kind: test.kind, Name: "aggregate",
+				Children: []proto.TargetID{fast.ID, slow.ID},
+			}
+			root := proto.GraphNode{
+				ID: proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"), Kind: proto.GraphNodeKindSelector, Name: "root",
+				Children: []proto.TargetID{direct.ID, aggregate.ID},
+			}
+			manifest, ids := runtimeGraph(t, root, direct, aggregate, fast, slow)
+			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+			t.Cleanup(func() { _ = e.Close() })
+			if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+				t.Fatal(err)
+			}
+
+			qualities := map[string]transport.PathQuality{
+				"direct": {RTT: time.Second, At: time.Now()},
+				"fast":   {RTT: 150 * time.Millisecond, At: time.Now()},
+				"slow":   {RTT: 700 * time.Millisecond, Jitter: 50 * time.Millisecond, At: time.Now()},
+			}
+			slots := make(map[string]*pathSlot, 3)
+			for _, name := range []string{"direct", "fast", "slow"} {
+				path, peer := newMemoryPathPair()
+				t.Cleanup(func() { _ = peer.Close() })
+				pathID := attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
+				storeTailReplayProbeQuality(t, e, pathID, qualities[name])
+				e.pathsMu.RLock()
+				slots[name] = e.paths[pathID]
+				e.pathsMu.RUnlock()
+			}
+			if err := e.SelectLocalTarget(ids["root"], ids["aggregate"], "test"); err != nil {
+				t.Fatal(err)
+			}
+			target := uint64(0)
+			for _, name := range test.publications {
+				if target == 0 {
+					target = recordTailReplayTestPublication(t, e, 0, slots[name])
+					continue
+				}
+				e.sendHistMu.Lock()
+				frame := append([]byte(nil), e.sendHist.entries[0].frame...)
+				e.sendHistMu.Unlock()
+				e.noteTailReplayPublication(frame, slots[name])
+			}
+			initial, _ := e.tailReplayTiming(target)
+			if initial != test.want {
+				t.Fatalf("nested %s tail pacing=%s want=%s", test.kind, initial, test.want)
+			}
+		})
+	}
+}
+
+func storeTailReplayProbeQuality(t *testing.T, e *Engine, pathID uint32, quality transport.PathQuality) {
+	t.Helper()
+	e.pathsMu.RLock()
+	slot := e.paths[pathID]
+	e.pathsMu.RUnlock()
+	if slot == nil {
+		t.Fatalf("tail replay path %d is missing", pathID)
+	}
+	slot.probeEvidence.Store(&pathProbeEvidence{
+		generation: pathProbeGenerationForSlot(slot), firstIssued: quality.At, lastIssued: quality.At,
+		lastSuccess: quality.At, quality: quality, issued: 1, succeeded: 1,
+	})
 }
 
 func TestTailReplayArmingRespectsStreamAndPacketContracts(t *testing.T) {
@@ -166,12 +263,9 @@ func TestTailReplayArmingRespectsStreamAndPacketContracts(t *testing.T) {
 
 func attachTailReplayPair(t *testing.T, client, server *Engine, clientPath, serverPath transport.PathConn, name string) {
 	t.Helper()
-	if _, err := client.AttachPath(clientPath, transport.PathSpec{Transport: "memory", Address: name}); err != nil {
-		t.Fatalf("attach client %s: %v", name, err)
-	}
-	if _, err := server.AttachPath(serverPath, transport.PathSpec{Transport: "memory", Address: name}); err != nil {
-		t.Fatalf("attach server %s: %v", name, err)
-	}
+	ids := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, name)
+	attachFixturePath(t, client, clientPath, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
 }
 
 func requireExactTailReplay(t *testing.T, path *tailReplayInterceptPath) {
@@ -365,6 +459,33 @@ func TestTailReplayLeaseIsBoundedAndSingleFlight(t *testing.T) {
 	}
 	if client.MigrationCount() != 0 || client.CloseErr() != nil || client.IsClosed() {
 		t.Fatalf("silent retry expiry changed session state: migrations=%d error=%v closed=%t", client.MigrationCount(), client.CloseErr(), client.IsClosed())
+	}
+}
+
+func TestTailReplayLongDelaySchedulesAttemptBeforeBudgetExpiry(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	now := time.Now()
+	deadline := now.Add(20 * time.Millisecond)
+	due := tailReplayAttemptDue(now, time.Second, deadline)
+	if due.Before(now) || !due.Before(deadline) {
+		t.Fatalf("clamped due=%v want [%v,%v)", due, now, deadline)
+	}
+	e.replayMu.Lock()
+	e.tailReplay = tailReplayLease{
+		target: 1, ackNext: 0, due: due, deadline: deadline,
+		initial: time.Second, maximum: time.Second, backoff: time.Second, armed: true,
+	}
+	e.replayMu.Unlock()
+
+	if got, ok := e.tailReplayDue(now); !ok || !got.Equal(due) {
+		t.Fatalf("budget-clamped due=(%v,%t), want (%v,true)", got, ok, due)
+	}
+	if target, ok := e.takeTailReplayAttempt(due); !ok || target != 1 {
+		t.Fatalf("in-budget attempt=(%d,%t), want (1,true)", target, ok)
+	}
+	if target, ok := e.takeTailReplayAttempt(deadline); ok || target != 0 {
+		t.Fatalf("post-budget attempt=(%d,%t), want (0,false)", target, ok)
 	}
 }
 

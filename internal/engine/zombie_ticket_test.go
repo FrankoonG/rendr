@@ -39,25 +39,22 @@ func TestZombieDeathTripRevalidatesPayloadFromDeathHook(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 			t.Cleanup(func() { _ = e.Close() })
+			targets := configureLeafSelectorRuntime(t, e, "failed", "survivor")
 
 			failed := newLifecycleHealthyPath()
-			failedID, err := e.AttachPath(failed, transport.PathSpec{Transport: "test", Address: "failed"})
-			if err != nil {
-				t.Fatal(err)
-			}
+			failedID := attachFixturePath(t, e, failed, transport.PathSpec{Transport: "test", Address: "failed"}, targets["failed"])
 			survivor := newLifecycleHealthyPath()
-			survivorID, err := e.AttachPath(survivor, transport.PathSpec{Transport: "test", Address: "survivor"})
-			if err != nil {
-				t.Fatal(err)
-			}
+			survivorID := attachFixturePath(t, e, survivor, transport.PathSpec{Transport: "test", Address: "survivor"}, targets["survivor"])
 			setZombieLeftForTrip(t, e)
 
 			hookCalls := 0
+			var activeAtDeathHook uint32
 			cancel := e.OnPathDeathSerial(func(event PathDeathEvent) {
 				if event.ID != failedID {
 					return
 				}
 				hookCalls++
+				activeAtDeathHook = e.ActivePath()
 				if test.creditPayload {
 					e.markPayload()
 				}
@@ -68,8 +65,8 @@ func TestZombieDeathTripRevalidatesPayloadFromDeathHook(t *testing.T) {
 			if hookCalls != 1 {
 				t.Fatalf("death hook calls=%d want=1", hookCalls)
 			}
-			if got := e.ActivePath(); got != survivorID {
-				t.Fatalf("active path=%d want survivor %d", got, survivorID)
+			if activeAtDeathHook != survivorID {
+				t.Fatalf("active path at death hook=%d want survivor %d", activeAtDeathHook, survivorID)
 			}
 
 			if !test.creditPayload {
@@ -88,6 +85,30 @@ func TestZombieDeathTripRevalidatesPayloadFromDeathHook(t *testing.T) {
 	}
 }
 
+func TestPathDeathPublishesFallbackBeforeAsyncPolicyAlignment(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "failed", "survivor")
+
+	failed := newLifecycleHealthyPath()
+	failedID := attachFixturePath(t, e, failed, transport.PathSpec{Transport: "test", Address: "failed"}, targets["failed"])
+	survivor := newLifecycleHealthyPath()
+	survivorID := attachFixturePath(t, e, survivor, transport.PathSpec{Transport: "test", Address: "survivor"}, targets["survivor"])
+	if got := e.ActivePath(); got != failedID {
+		t.Fatalf("initial active path=%d want failed %d", got, failedID)
+	}
+
+	// Block the asynchronous policy transaction. The physical-death commit
+	// itself must still publish its immediate fallback before OnDeath returns.
+	e.sendMu.Lock()
+	failed.die(transport.CauseTransportError, errors.New("injected death"))
+	if got := e.ActivePath(); got != survivorID {
+		e.sendMu.Unlock()
+		t.Fatalf("active path before policy alignment=%d want survivor %d", got, survivorID)
+	}
+	e.sendMu.Unlock()
+}
+
 func TestZombieRecoveryTripRevalidatesPayloadAfterPublication(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -99,11 +120,10 @@ func TestZombieRecoveryTripRevalidatesPayloadAfterPublication(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 			t.Cleanup(func() { _ = e.Close() })
+			targets := configureLeafSelectorRuntime(t, e, "path")
 
 			initial := newLifecycleHealthyPath()
-			if _, err := e.AttachPath(initial, transport.PathSpec{Transport: "test", Address: "initial"}); err != nil {
-				t.Fatal(err)
-			}
+			attachFixturePath(t, e, initial, transport.PathSpec{Transport: "test", Address: "initial"}, targets["path"])
 			initial.die(transport.CauseTransportError, errors.New("initial path failed"))
 			if got := e.ActivePath(); got != 0 {
 				t.Fatalf("active path after death=%d want=0", got)
@@ -125,7 +145,11 @@ func TestZombieRecoveryTripRevalidatesPayloadAfterPublication(t *testing.T) {
 			}
 
 			recovery := newLifecycleHealthyPath()
-			pendingID, err := e.PreparePathBound(recovery, transport.PathSpec{Transport: "test", Address: "recovery"}, PathBinding{})
+			pendingID, err := e.PreparePathBound(
+				recovery,
+				transport.PathSpec{Transport: "test", Address: "recovery"},
+				PathBinding{LocalTXTargetID: targets["path"], PeerTXTargetID: targets["path"]},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}

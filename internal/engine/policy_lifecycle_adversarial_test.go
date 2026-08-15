@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -219,20 +220,21 @@ func TestRecoveryZombieAccountingCreditsPayloadBetweenTopologies(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 			t.Cleanup(func() { _ = e.Close() })
+			ids := configureLeafSelectorRuntime(t, e, "recovery")
+			attach := func(path transport.PathConn, address string) uint32 {
+				t.Helper()
+				return attachFixturePath(t, e, path, transport.PathSpec{Transport: "test", Address: address}, ids["recovery"])
+			}
 
 			initial := newLifecycleHealthyPath()
-			if _, err := e.AttachPath(initial, transport.PathSpec{Transport: "test", Address: "initial"}); err != nil {
-				t.Fatal(err)
-			}
+			attach(initial, "initial")
 			initial.die(transport.CauseTransportError, errors.New("initial path failed"))
 			if got := e.ActivePath(); got != 0 {
 				t.Fatalf("active after initial path death=%d want=0", got)
 			}
 
 			firstRecovery := newLifecycleHealthyPath()
-			if _, err := e.AttachPath(firstRecovery, transport.PathSpec{Transport: "test", Address: "first-recovery"}); err != nil {
-				t.Fatal(err)
-			}
+			attach(firstRecovery, "first-recovery")
 			if got := e.MigrationCount(); got != 1 {
 				t.Fatalf("first recovery migration count=%d want=1", got)
 			}
@@ -248,10 +250,7 @@ func TestRecoveryZombieAccountingCreditsPayloadBetweenTopologies(t *testing.T) {
 
 			firstRecovery.die(transport.CauseTransportError, errors.New("first recovery failed"))
 			secondRecovery := newLifecycleHealthyPath()
-			secondID, err := e.AttachPath(secondRecovery, transport.PathSpec{Transport: "test", Address: "second-recovery"})
-			if err != nil {
-				t.Fatal(err)
-			}
+			secondID := attach(secondRecovery, "second-recovery")
 			if got := e.MigrationCount(); got != 2 {
 				t.Fatalf("second recovery migration count=%d want=2", got)
 			}
@@ -373,15 +372,11 @@ func TestRemovePathAfterSurvivorFaultReturnsLastPathWithoutEOF(t *testing.T) {
 func TestSurvivorFaultAfterRemovePathStartsMigrationNotEOF(t *testing.T) {
 	e := New(SideClient, [16]byte{0xb5}, Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "removed", "survivor")
 	removed := newLifecycleHealthyPath()
-	removedID, err := e.AttachPath(removed, transport.PathSpec{Transport: "test", Address: "removed"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	removedID := attachFixturePath(t, e, removed, transport.PathSpec{Transport: "test", Address: "removed"}, targets["removed"])
 	survivor := newLifecycleHealthyPath()
-	if _, err := e.AttachPath(survivor, transport.PathSpec{Transport: "test", Address: "survivor"}); err != nil {
-		t.Fatal(err)
-	}
+	attachFixturePath(t, e, survivor, transport.PathSpec{Transport: "test", Address: "survivor"}, targets["survivor"])
 	if err := e.RemovePath(removedID); err != nil {
 		t.Fatal(err)
 	}
@@ -397,11 +392,16 @@ func TestSurvivorFaultAfterRemovePathStartsMigrationNotEOF(t *testing.T) {
 func TestTopologySnapshotRemainsCoherentDuringMigration(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
-	aID, err := e.AttachPath(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "a"})
+	targets := configureLeafSelectorRuntime(t, e, "a", "b")
+	_, err := e.AttachPathBound(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "a"}, PathBinding{
+		LocalTXTargetID: targets["a"], PeerTXTargetID: targets["a"],
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	bID, err := e.AttachPath(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "b"})
+	_, err = e.AttachPathBound(newLifecycleHealthyPath(), transport.PathSpec{Transport: "snapshot", Address: "b"}, PathBinding{
+		LocalTXTargetID: targets["b"], PeerTXTargetID: targets["b"],
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,11 +418,11 @@ func TestTopologySnapshotRemainsCoherentDuringMigration(t *testing.T) {
 				return
 			default:
 			}
-			id := aID
+			targetID := targets["a"]
 			if i%2 == 0 {
-				id = bID
+				targetID = targets["b"]
 			}
-			if err := e.Migrate(id); err != nil {
+			if err := e.SelectLocalTarget(targets["root"], targetID, "snapshot"); err != nil {
 				migrateErr <- err
 				return
 			}
@@ -567,6 +567,325 @@ func TestPolicyCommitBlockedBySendMuCannotMutateAfterClose(t *testing.T) {
 	generation, selection, _, _ := policyTxUnitState(fixture.engine, fixture.selectorID)
 	if generation != 0 || selection != fixture.targetA {
 		t.Fatalf("closed engine committed policy generation=%d selection=%x", generation, selection)
+	}
+}
+
+func TestPolicyCommitThatWinsLifecyclePublishesWholeStateBeforeGracefulClose(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 94, 0, fixture.selectorID, fixture.targetB)
+	prepareAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepareAck.ack.Generation, prepareAck.ack.ReservationID)
+
+	reachedPublish := make(chan struct{})
+	releasePublish := make(chan struct{})
+	var reachedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releasePublish) }) })
+	fixture.engine.policyCommitAfterPublish = func() {
+		reachedOnce.Do(func() { close(reachedPublish) })
+		<-releasePublish
+	}
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- fixture.engine.handlePolicyCommit(commit) }()
+	select {
+	case <-reachedPublish:
+	case <-time.After(time.Second):
+		t.Fatal("COMMIT did not reach lifecycle publication point")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		fixture.engine.BeginGracefulClose()
+		close(closeDone)
+	}()
+	waitForPolicyCloseAtLifecycle(t, fixture.engine)
+	select {
+	case <-closeDone:
+		t.Fatal("graceful close crossed an in-flight policy publication")
+	default:
+	}
+	releaseOnce.Do(func() { close(releasePublish) })
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("graceful close did not finish after policy publication")
+	}
+	var commitErr error
+	select {
+	case commitErr = <-commitDone:
+		if commitErr != nil && !errors.Is(commitErr, net.ErrClosed) {
+			t.Fatalf("COMMIT result=%v", commitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("COMMIT did not finish after lifecycle publication")
+	}
+
+	desired, effective, _, ok := fixture.engine.localExecutionRuntime().selectorSelection(fixture.selectorID)
+	fixture.engine.policyStateMu.Lock()
+	generation := fixture.engine.policyGeneration
+	selection := fixture.engine.policySelections[fixture.selectorID]
+	pending := fixture.engine.policyIncoming
+	completed, completedOK := fixture.engine.policyCompleted[commit.TransactionID]
+	completedCount := len(fixture.engine.policyCompleted)
+	fixture.engine.policyStateMu.Unlock()
+	if !ok || desired != fixture.targetB || effective != fixture.targetB ||
+		generation != 1 || selection != fixture.targetB || fixture.engine.ActivePath() != fixture.pathB {
+		t.Fatalf("commit/close publication desired/effective=%x/%x ok=%t generation=%d selection=%x active=%d",
+			desired, effective, ok, generation, selection, fixture.engine.ActivePath())
+	}
+
+	// policyIncoming is transaction custody, not part of the committed selector
+	// publication. Graceful close may win after route publication but before
+	// replay and FINAL bookkeeping. That terminal outcome must retain the exact
+	// committed transaction; a fully finalized outcome must retain its exact ACK.
+	if pending != nil {
+		if !errors.Is(commitErr, net.ErrClosed) || !pending.committed ||
+			pending.prepare.TransactionID != commit.TransactionID || pending.generation != commit.Generation ||
+			pending.resolved != fixture.targetB || completedOK || completedCount != 0 {
+			t.Fatalf("commit/close pending custody err=%v committed=%t transaction=%x generation=%d resolved=%x completed=%t/%d",
+				commitErr, pending.committed, pending.prepare.TransactionID, pending.generation,
+				pending.resolved, completedOK, completedCount)
+		}
+		return
+	}
+	if !completedOK || completedCount != 1 || completed.finalAck.Code != proto.PolicyAckCodeAccept ||
+		completed.finalAck.Generation != commit.Generation || completed.finalAck.CurrentTargetID != fixture.targetB {
+		t.Fatalf("commit/close completed custody err=%v completed=%t/%d ack=%+v",
+			commitErr, completedOK, completedCount, completed.finalAck)
+	}
+}
+
+func waitForPolicyCloseAtLifecycle(t *testing.T, engine *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if !engine.sessionEpochMu.TryLock() {
+			return
+		}
+		engine.sessionEpochMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("graceful close did not reach the policy lifecycle boundary")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestQueuedPolicyWorkCannotCrossRecvTerminal(t *testing.T) {
+	for _, kind := range []policyMessageKind{policyMessagePrepare, policyMessageCommit} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			assertQueuedPolicyWorkCannotCrossTerminal(t, kind, func(engine *Engine) {
+				engine.publishRecvTerminalLocked(io.EOF)
+			})
+		})
+	}
+}
+
+func TestQueuedPolicyWorkCannotCrossPathRetireTerminal(t *testing.T) {
+	for _, kind := range []policyMessageKind{policyMessagePrepare, policyMessageCommit} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			assertQueuedPolicyWorkCannotCrossTerminal(t, kind, func(engine *Engine) {
+				if engine.enqueueSequencedPathRetirementLocked([]byte{0xff}) {
+					t.Fatal("malformed PATH_RETIRE unexpectedly entered receive custody")
+				}
+			})
+		})
+	}
+}
+
+func assertQueuedPolicyWorkCannotCrossTerminal(t *testing.T, kind policyMessageKind, publishTerminal func(*Engine)) {
+	t.Helper()
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, byte(0xb0+kind), 0, fixture.selectorID, fixture.targetB)
+	message := policyMessage{kind: kind}
+	switch kind {
+	case policyMessagePrepare:
+		message.prepare = prepare
+	case policyMessageCommit:
+		prepared := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+			return fixture.engine.handlePolicyPrepare(prepare)
+		})
+		message.commit = policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	}
+	message.key = policyMessageKey{kind: kind, seq: uint64(0x700) + uint64(kind), frameDigest: proto.FrameDigest{byte(kind)}}
+	message.done = make(chan error, 1)
+
+	fixture.engine.policyStateMu.Lock()
+	beforeGeneration := fixture.engine.policyGeneration
+	beforeSelection := fixture.engine.policySelections[fixture.selectorID]
+	beforePending := fixture.engine.policyIncoming
+	beforeCompleted := len(fixture.engine.policyCompleted)
+	beforeActive := fixture.engine.ActivePath()
+
+	// Keep the worker blocked on policy state while proving that this exact
+	// receipt has already left the FIFO. Receive terminal must remain free to
+	// publish before the worker reaches its mutation boundary.
+	fixture.engine.recvMu.Lock()
+	if !fixture.engine.enqueuePolicyMessageLocked(message) {
+		fixture.engine.recvMu.Unlock()
+		fixture.engine.policyStateMu.Unlock()
+		t.Fatal("failed to enqueue policy work")
+	}
+	fixture.engine.recvMu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for {
+		fixture.engine.policyQueueMu.Lock()
+		_, queued := fixture.engine.policyQueued[message.key]
+		fixture.engine.policyQueueMu.Unlock()
+		if !queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			fixture.engine.policyStateMu.Unlock()
+			t.Fatal("policy worker did not dequeue receipt")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fixture.engine.recvMu.Lock()
+	publishTerminal(fixture.engine)
+	fixture.engine.recvMu.Unlock()
+	fixture.engine.policyStateMu.Unlock()
+
+	select {
+	case err := <-message.done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("queued policy result=%v want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued policy work did not leave terminal gate")
+	}
+
+	fixture.engine.policyStateMu.Lock()
+	generation := fixture.engine.policyGeneration
+	selection := fixture.engine.policySelections[fixture.selectorID]
+	pending := fixture.engine.policyIncoming
+	completed := len(fixture.engine.policyCompleted)
+	fixture.engine.policyStateMu.Unlock()
+	if generation != beforeGeneration || selection != beforeSelection || pending != beforePending ||
+		completed != beforeCompleted || fixture.engine.ActivePath() != beforeActive {
+		t.Fatalf("terminal-crossing mutation generation=%d/%d selection=%x/%x pending=%p/%p completed=%d/%d active=%d/%d",
+			generation, beforeGeneration, selection, beforeSelection, pending, beforePending,
+			completed, beforeCompleted, fixture.engine.ActivePath(), beforeActive)
+	}
+}
+
+func TestPolicyExpiryCannotMutateAfterCloseLinearization(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 0xb8, 0, fixture.selectorID, fixture.targetB)
+	policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	fixture.engine.policyStateMu.Lock()
+	fixture.engine.policyIncoming.expires = time.Now().Add(time.Hour)
+	fixture.engine.policyStateMu.Unlock()
+	if err := fixture.engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.engine.policyStateMu.Lock()
+	beforeGeneration := fixture.engine.policyGeneration
+	beforeSelection := fixture.engine.policySelections[fixture.selectorID]
+	beforePending := fixture.engine.policyIncoming
+	beforeCompleted := len(fixture.engine.policyCompleted)
+	beforeOrder := len(fixture.engine.policyCompletedOrder)
+	fixture.engine.policyStateMu.Unlock()
+	fixture.engine.expirePreparedPolicy(time.Now().Add(2 * time.Hour))
+	fixture.engine.policyStateMu.Lock()
+	defer fixture.engine.policyStateMu.Unlock()
+	if fixture.engine.policyGeneration != beforeGeneration ||
+		fixture.engine.policySelections[fixture.selectorID] != beforeSelection ||
+		fixture.engine.policyIncoming != beforePending ||
+		len(fixture.engine.policyCompleted) != beforeCompleted ||
+		len(fixture.engine.policyCompletedOrder) != beforeOrder {
+		t.Fatalf("expiry mutated closed policy state generation=%d/%d selection=%x/%x pending=%p/%p completed=%d/%d order=%d/%d",
+			fixture.engine.policyGeneration, beforeGeneration,
+			fixture.engine.policySelections[fixture.selectorID], beforeSelection,
+			fixture.engine.policyIncoming, beforePending,
+			len(fixture.engine.policyCompleted), beforeCompleted,
+			len(fixture.engine.policyCompletedOrder), beforeOrder)
+	}
+}
+
+func TestPolicyExpiryWaitsForConcurrentCloseLinearization(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 0xb9, 0, fixture.selectorID, fixture.targetB)
+	policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+
+	fixture.engine.policyStateMu.Lock()
+	beforeGeneration := fixture.engine.policyGeneration
+	beforeSelection := fixture.engine.policySelections[fixture.selectorID]
+	beforePending := fixture.engine.policyIncoming
+	beforeCompleted := len(fixture.engine.policyCompleted)
+	beforeOrder := len(fixture.engine.policyCompletedOrder)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- fixture.engine.Close() }()
+	waitForPolicyCloseLocks(t, fixture.engine)
+
+	expiryDone := make(chan struct{})
+	go func() {
+		fixture.engine.expirePreparedPolicy(time.Now().Add(2 * time.Hour))
+		close(expiryDone)
+	}()
+	select {
+	case <-expiryDone:
+		fixture.engine.policyStateMu.Unlock()
+		t.Fatal("expiry crossed the in-progress Close lifecycle boundary")
+	case <-time.After(20 * time.Millisecond):
+	}
+	fixture.engine.policyStateMu.Unlock()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after state lock release")
+	}
+	select {
+	case <-expiryDone:
+	case <-time.After(time.Second):
+		t.Fatal("expiry did not leave the closed lifecycle boundary")
+	}
+
+	fixture.engine.policyStateMu.Lock()
+	defer fixture.engine.policyStateMu.Unlock()
+	if fixture.engine.policyGeneration != beforeGeneration ||
+		fixture.engine.policySelections[fixture.selectorID] != beforeSelection ||
+		fixture.engine.policyIncoming != beforePending ||
+		len(fixture.engine.policyCompleted) != beforeCompleted ||
+		len(fixture.engine.policyCompletedOrder) != beforeOrder {
+		t.Fatalf("concurrent expiry mutated closed policy state generation=%d/%d selection=%x/%x pending=%p/%p completed=%d/%d order=%d/%d",
+			fixture.engine.policyGeneration, beforeGeneration,
+			fixture.engine.policySelections[fixture.selectorID], beforeSelection,
+			fixture.engine.policyIncoming, beforePending,
+			len(fixture.engine.policyCompleted), beforeCompleted,
+			len(fixture.engine.policyCompletedOrder), beforeOrder)
+	}
+}
+
+func waitForPolicyCloseLocks(t *testing.T, engine *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		sessionHeld := !engine.sessionEpochMu.TryLock()
+		if !sessionHeld {
+			engine.sessionEpochMu.Unlock()
+		}
+		lifecycleHeld := !engine.policyLifecycleMu.TryLock()
+		if !lifecycleHeld {
+			engine.policyLifecycleMu.Unlock()
+		}
+		if sessionHeld && lifecycleHeld {
+			return
+		}
+		if time.Now().After(deadline) {
+			engine.policyStateMu.Unlock()
+			t.Fatal("Close did not acquire session and policy lifecycle locks")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

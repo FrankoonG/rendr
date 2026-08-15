@@ -437,22 +437,25 @@ func (m *runtimeControlledTCPMuxTransport) Probe(ctx context.Context, spec trans
 	return controller.probe(ctx, spec)
 }
 
-// runtimeControlledTCPTransport is a test-owned path adapter. It retains
-// carrier handles so tests can bind faults and observations to named leaves
-// without an engine backdoor.
+// runtimeControlledTCPTransport is a test-owned dialing path adapter. It
+// retains only dial-side carrier generations; listener-owned peer endpoints
+// are outside this controller. Tests can bind faults and observations to
+// named leaves without an engine backdoor.
 type runtimeControlledTCPTransport struct {
 	id            string
 	baseTransport string
 
-	mu         sync.Mutex
-	dialCond   *sync.Cond
-	paths      []*runtimeControlledTCPPath
-	blocked    map[string]bool
-	probeDelay map[string]time.Duration
-	closing    bool
-	dialing    int
-	closeOnce  sync.Once
-	dialHook   func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error)
+	mu              sync.Mutex
+	dialCond        *sync.Cond
+	dialGenerations []*runtimeControlledTCPPath
+	blocked         map[string]bool
+	probeDelay      map[string]time.Duration
+	dataPaths       map[string]*runtimeControlledTCPDataPath
+	qualities       map[string]PathQuality
+	closing         bool
+	dialing         int
+	closeOnce       sync.Once
+	dialHook        func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error)
 }
 
 func newRuntimeControlledTCPTransport(t testing.TB) *runtimeControlledTCPTransport {
@@ -470,6 +473,8 @@ func newRuntimeControlledPathTransport(t testing.TB, baseTransport string) *runt
 		baseTransport: baseTransport,
 		blocked:       make(map[string]bool),
 		probeDelay:    make(map[string]time.Duration),
+		dataPaths:     make(map[string]*runtimeControlledTCPDataPath),
+		qualities:     make(map[string]PathQuality),
 	}
 	tr.dialCond = sync.NewCond(&tr.mu)
 	runtimeControlledTCPMux.mu.Lock()
@@ -547,11 +552,20 @@ func (t *runtimeControlledTCPTransport) dialPath(ctx context.Context, spec trans
 		t.mu.Unlock()
 		return nil, err
 	}
+	dataPath := t.dataPaths[pathName]
+	if dataPath == nil {
+		dataPath = newRuntimeControlledTCPDataPath()
+		t.dataPaths[pathName] = dataPath
+	}
 	path := &runtimeControlledTCPPath{
 		raw:              raw,
 		base:             base,
 		spec:             spec.Clone(),
+		dataPath:         dataPath,
 		probeDelayClosed: make(chan struct{}),
+	}
+	if quality, ok := t.qualities[pathName]; ok {
+		path.SetTestQuality(quality)
 	}
 	path.probeDelayNanos.Store(int64(t.probeDelay[pathName]))
 	if t.closing {
@@ -559,7 +573,7 @@ func (t *runtimeControlledTCPTransport) dialPath(ctx context.Context, spec trans
 		_ = path.Close()
 		return nil, net.ErrClosed
 	}
-	t.paths = append(t.paths, path)
+	t.dialGenerations = append(t.dialGenerations, path)
 	t.mu.Unlock()
 	return path, nil
 }
@@ -596,11 +610,11 @@ func (t *runtimeControlledTCPTransport) probe(ctx context.Context, spec transpor
 	return quality, err
 }
 
-func (t *runtimeControlledTCPTransport) path(pathName string) (*runtimeControlledTCPPath, error) {
+func (t *runtimeControlledTCPTransport) latestDialGeneration(pathName string) (*runtimeControlledTCPPath, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for i := len(t.paths) - 1; i >= 0; i-- {
-		path := t.paths[i]
+	for i := len(t.dialGenerations) - 1; i >= 0; i-- {
+		path := t.dialGenerations[i]
 		if path.spec.Opts["name"] == pathName && !path.closed.Load() {
 			return path, nil
 		}
@@ -612,8 +626,8 @@ func (t *runtimeControlledTCPTransport) Fail(pathName string) error {
 	t.mu.Lock()
 	t.blocked[pathName] = true
 	var selected *runtimeControlledTCPPath
-	for i := len(t.paths) - 1; i >= 0; i-- {
-		path := t.paths[i]
+	for i := len(t.dialGenerations) - 1; i >= 0; i-- {
+		path := t.dialGenerations[i]
 		if path.spec.Opts["name"] == pathName && !path.closed.Load() {
 			selected = path
 			break
@@ -633,7 +647,7 @@ func (t *runtimeControlledTCPTransport) Block(pathName string) {
 }
 
 func (t *runtimeControlledTCPTransport) LocalAddr(pathName string) (string, error) {
-	path, err := t.path(pathName)
+	path, err := t.latestDialGeneration(pathName)
 	if err != nil {
 		return "", err
 	}
@@ -641,11 +655,21 @@ func (t *runtimeControlledTCPTransport) LocalAddr(pathName string) (string, erro
 }
 
 func (t *runtimeControlledTCPTransport) SetQuality(pathName string, quality PathQuality) error {
-	path, err := t.path(pathName)
-	if err != nil {
-		return err
+	t.mu.Lock()
+	if t.qualities == nil {
+		t.qualities = make(map[string]PathQuality)
 	}
-	path.SetTestQuality(quality)
+	t.qualities[pathName] = quality
+	paths := make([]*runtimeControlledTCPPath, 0, 2)
+	for _, path := range t.dialGenerations {
+		if path.spec.Opts["name"] == pathName && !path.closed.Load() {
+			paths = append(paths, path)
+		}
+	}
+	t.mu.Unlock()
+	for _, path := range paths {
+		path.SetTestQuality(quality)
+	}
 	return nil
 }
 
@@ -659,12 +683,65 @@ func (t *runtimeControlledTCPTransport) SetProbeDelay(pathName string, delay tim
 		return net.ErrClosed
 	}
 	t.probeDelay[pathName] = delay
-	for _, path := range t.paths {
+	for _, path := range t.dialGenerations {
 		if path.spec.Opts["name"] == pathName && !path.closed.Load() {
 			path.probeDelayNanos.Store(int64(delay))
 		}
 	}
 	return nil
+}
+
+// SetDataWriteRate shapes only complete DATA frames written on pathName. A
+// zero rate disables shaping. The setting applies to current and future dials.
+func (t *runtimeControlledTCPTransport) SetDataWriteRate(pathName string, bytesPerSecond uint64) error {
+	dataPath, err := t.dataPath(pathName, true)
+	if err != nil {
+		return err
+	}
+	dataPath.mu.Lock()
+	dataPath.writeBytesPerSecond = bytesPerSecond
+	dataPath.mu.Unlock()
+	return nil
+}
+
+// SetDataReadRate shapes only complete DATA frames read on pathName. A zero
+// rate disables shaping. The setting applies to current and future dials.
+func (t *runtimeControlledTCPTransport) SetDataReadRate(pathName string, bytesPerSecond uint64) error {
+	dataPath, err := t.dataPath(pathName, true)
+	if err != nil {
+		return err
+	}
+	dataPath.mu.Lock()
+	dataPath.readBytesPerSecond = bytesPerSecond
+	dataPath.mu.Unlock()
+	return nil
+}
+
+// PathStats returns one coherent snapshot for the logical named path. Its
+// counters span every physical dial made for that path name.
+func (t *runtimeControlledTCPTransport) PathStats(pathName string) (runtimeControlledTCPPathStats, error) {
+	dataPath, err := t.dataPath(pathName, false)
+	if err != nil {
+		return runtimeControlledTCPPathStats{}, err
+	}
+	return dataPath.snapshot(), nil
+}
+
+func (t *runtimeControlledTCPTransport) dataPath(pathName string, create bool) (*runtimeControlledTCPDataPath, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if create && t.closing {
+		return nil, net.ErrClosed
+	}
+	dataPath := t.dataPaths[pathName]
+	if dataPath == nil && create {
+		dataPath = newRuntimeControlledTCPDataPath()
+		t.dataPaths[pathName] = dataPath
+	}
+	if dataPath == nil {
+		return nil, fmt.Errorf("controlled TCP path %q has no DATA statistics", pathName)
+	}
+	return dataPath, nil
 }
 
 func (t *runtimeControlledTCPTransport) close() {
@@ -677,8 +754,8 @@ func (t *runtimeControlledTCPTransport) close() {
 		for t.dialing != 0 {
 			t.dialCond.Wait()
 		}
-		paths := append([]*runtimeControlledTCPPath(nil), t.paths...)
-		t.paths = nil
+		paths := append([]*runtimeControlledTCPPath(nil), t.dialGenerations...)
+		t.dialGenerations = nil
 		t.mu.Unlock()
 		for _, path := range paths {
 			_ = path.Close()
@@ -690,6 +767,7 @@ type runtimeControlledTCPPath struct {
 	raw              net.Conn
 	base             transport.PathConn
 	spec             transport.PathSpec
+	dataPath         *runtimeControlledTCPDataPath
 	closed           atomic.Bool
 	probeDelayNanos  atomic.Int64
 	probeDelayClosed chan struct{}
@@ -704,7 +782,12 @@ type runtimeControlledTCPPath struct {
 
 func (p *runtimeControlledTCPPath) Read(buf []byte) (int, error) {
 	n, err := p.base.Read(buf)
-	if n > 0 && isPathProbeControl(buf[:n], proto.CtrlPathProbeReply) {
+	if n > 0 && isDataFrame(buf[:n]) {
+		p.dataPath.recordReadBytes(uint64(n))
+		if delayErr := p.delayData(n, false); delayErr != nil {
+			return 0, delayErr
+		}
+	} else if n > 0 && isPathProbeControl(buf[:n], proto.CtrlPathProbeReply) {
 		delay := time.Duration(p.probeDelayNanos.Load())
 		if delay > 0 {
 			timer := time.NewTimer(delay)
@@ -732,7 +815,18 @@ func (p *runtimeControlledTCPPath) Write(frame []byte) (int, error) {
 		close(gate.entered)
 		<-gate.release
 	}
+	if isDataFrame(frame) {
+		if err := p.delayData(len(frame), true); err != nil {
+			if gate != nil {
+				gate.result <- runtimePathWriteResult{err: err}
+			}
+			return 0, err
+		}
+	}
 	n, err := p.base.Write(frame)
+	if n > 0 && isDataFrame(frame) {
+		p.dataPath.recordWriteBytes(uint64(n))
+	}
 	if gate != nil {
 		gate.result <- runtimePathWriteResult{n: n, err: err}
 	}
@@ -740,9 +834,21 @@ func (p *runtimeControlledTCPPath) Write(frame []byte) (int, error) {
 }
 
 func (p *runtimeControlledTCPPath) Close() error {
+	p.signalClosed()
+	return p.base.Close()
+}
+
+func (p *runtimeControlledTCPPath) signalClosed() {
 	p.closed.Store(true)
 	p.probeDelayOnce.Do(func() { close(p.probeDelayClosed) })
-	return p.base.Close()
+}
+
+func isDataFrame(frame []byte) bool {
+	if len(frame) < proto.HeaderSize {
+		return false
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	return err == nil && header.Type == proto.FrameData
 }
 
 func isPathProbeControl(frame []byte, code proto.CtrlCode) bool {
@@ -763,6 +869,15 @@ func (p *runtimeControlledTCPPath) Quality() transport.PathQuality {
 	}
 	p.qualityMu.RUnlock()
 	return p.base.Quality()
+}
+
+func (p *runtimeControlledTCPPath) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	select {
+	case <-ctx.Done():
+		return transport.PathQuality{}, ctx.Err()
+	default:
+		return p.Quality(), nil
+	}
 }
 
 func (p *runtimeControlledTCPPath) SetQuality(quality transport.PathQuality) {
@@ -816,8 +931,152 @@ func (p *runtimeControlledTCPPath) Fail() error {
 	if p.raw == nil {
 		return errors.New("controlled path has no raw carrier fault handle")
 	}
-	p.closed.Store(true)
+	p.signalClosed()
 	return p.raw.Close()
+}
+
+type runtimeControlledTCPPathStats struct {
+	DataWriteBytesPerSecond uint64
+	DataReadBytesPerSecond  uint64
+	PhysicalDataBytes       uint64
+	PhysicalDataWriteBytes  uint64
+	PhysicalDataReadBytes   uint64
+	DelayedDataWrites       uint64
+	DelayedDataReads        uint64
+	DataWriteBlocked        time.Duration
+	DataReadBlocked         time.Duration
+	CumulativeDataBlocked   time.Duration
+}
+
+type runtimeControlledTCPDataPath struct {
+	mu sync.Mutex
+
+	writeTurn chan struct{}
+	readTurn  chan struct{}
+
+	writeBytesPerSecond uint64
+	readBytesPerSecond  uint64
+	physicalWriteBytes  uint64
+	physicalReadBytes   uint64
+	delayedWrites       uint64
+	delayedReads        uint64
+	writeBlocked        time.Duration
+	readBlocked         time.Duration
+}
+
+func newRuntimeControlledTCPDataPath() *runtimeControlledTCPDataPath {
+	p := &runtimeControlledTCPDataPath{
+		writeTurn: make(chan struct{}, 1),
+		readTurn:  make(chan struct{}, 1),
+	}
+	p.writeTurn <- struct{}{}
+	p.readTurn <- struct{}{}
+	return p
+}
+
+func (p *runtimeControlledTCPDataPath) snapshot() runtimeControlledTCPPathStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return runtimeControlledTCPPathStats{
+		DataWriteBytesPerSecond: p.writeBytesPerSecond,
+		DataReadBytesPerSecond:  p.readBytesPerSecond,
+		PhysicalDataBytes:       p.physicalWriteBytes + p.physicalReadBytes,
+		PhysicalDataWriteBytes:  p.physicalWriteBytes,
+		PhysicalDataReadBytes:   p.physicalReadBytes,
+		DelayedDataWrites:       p.delayedWrites,
+		DelayedDataReads:        p.delayedReads,
+		DataWriteBlocked:        p.writeBlocked,
+		DataReadBlocked:         p.readBlocked,
+		CumulativeDataBlocked:   p.writeBlocked + p.readBlocked,
+	}
+}
+
+func (p *runtimeControlledTCPDataPath) rate(write bool) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if write {
+		return p.writeBytesPerSecond
+	}
+	return p.readBytesPerSecond
+}
+
+func (p *runtimeControlledTCPDataPath) recordWriteBytes(n uint64) {
+	p.mu.Lock()
+	p.physicalWriteBytes += n
+	p.mu.Unlock()
+}
+
+func (p *runtimeControlledTCPDataPath) recordReadBytes(n uint64) {
+	p.mu.Lock()
+	p.physicalReadBytes += n
+	p.mu.Unlock()
+}
+
+func (p *runtimeControlledTCPDataPath) beginDelay(write bool) {
+	p.mu.Lock()
+	if write {
+		p.delayedWrites++
+	} else {
+		p.delayedReads++
+	}
+	p.mu.Unlock()
+}
+
+func (p *runtimeControlledTCPDataPath) addBlocked(write bool, blocked time.Duration) {
+	p.mu.Lock()
+	if write {
+		p.writeBlocked += blocked
+	} else {
+		p.readBlocked += blocked
+	}
+	p.mu.Unlock()
+}
+
+func runtimeControlledTCPDataDelay(frameBytes int, bytesPerSecond uint64) time.Duration {
+	if frameBytes <= 0 || bytesPerSecond == 0 {
+		return 0
+	}
+	// Every supported fixture carrier bounds a complete frame far below the
+	// point where this nanosecond conversion can overflow uint64.
+	nanoseconds := uint64(frameBytes) * uint64(time.Second)
+	return time.Duration((nanoseconds-1)/bytesPerSecond + 1)
+}
+
+func (p *runtimeControlledTCPPath) delayData(frameBytes int, write bool) error {
+	if p == nil || p.dataPath == nil {
+		return nil
+	}
+	if runtimeControlledTCPDataDelay(frameBytes, p.dataPath.rate(write)) <= 0 {
+		return nil
+	}
+	p.dataPath.beginDelay(write)
+	started := time.Now()
+	turn := p.dataPath.readTurn
+	if write {
+		turn = p.dataPath.writeTurn
+	}
+	select {
+	case <-turn:
+		defer func() { turn <- struct{}{} }()
+	case <-p.probeDelayClosed:
+		p.dataPath.addBlocked(write, time.Since(started))
+		return net.ErrClosed
+	}
+	delay := runtimeControlledTCPDataDelay(frameBytes, p.dataPath.rate(write))
+	if delay <= 0 {
+		p.dataPath.addBlocked(write, time.Since(started))
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	var err error
+	select {
+	case <-timer.C:
+	case <-p.probeDelayClosed:
+		err = net.ErrClosed
+	}
+	p.dataPath.addBlocked(write, time.Since(started))
+	return err
 }
 
 type runtimePathWriteResult struct {
@@ -857,7 +1116,7 @@ func (g *runtimePathWriteGate) Release() {
 }
 
 func (t *runtimeControlledTCPTransport) ArmNextDataWrite(pathName string) (*runtimePathWriteGate, error) {
-	path, err := t.path(pathName)
+	path, err := t.latestDialGeneration(pathName)
 	if err != nil {
 		return nil, err
 	}
@@ -1116,6 +1375,235 @@ func TestRuntimeControlledTransportCloseJoinsInFlightDial(t *testing.T) {
 	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := peer.Read(make([]byte, 1)); err == nil {
 		t.Fatal("late dial carrier remained open after controlled transport close")
+	}
+}
+
+func TestRuntimeControlledTCPDataShapingAndStats(t *testing.T) {
+	controlled := newRuntimeControlledTCPTransport(t)
+	client, server := net.Pipe()
+	peer := tadapter.Wrap(server)
+	defer peer.Close()
+	controlled.dialHook = func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error) {
+		return tadapter.Wrap(client), client, nil
+	}
+
+	dataFrame := runtimeControlledTCPTestFrame(t, proto.FrameData, 0, 32)
+	rate := uint64(len(dataFrame)) * 50 // One frame takes 20ms.
+	if err := controlled.SetDataWriteRate("A", rate); err != nil {
+		t.Fatal(err)
+	}
+	dialed, err := controlled.dialPath(context.Background(), controlled.Spec("unused", "A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := dialed.(*runtimeControlledTCPPath)
+	if err := controlled.SetDataReadRate("A", rate); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, code := range []proto.CtrlCode{
+		proto.CtrlHello, proto.CtrlHelloAck, proto.CtrlPathProbe, proto.CtrlPathProbeReply,
+	} {
+		control := runtimeControlledTCPTestFrame(t, proto.FrameCtrl, proto.FlagsForCtrl(code), 8)
+		runtimeControlledTCPWriteAndReceive(t, path, peer, control)
+		runtimeControlledTCPWriteAndReceive(t, peer, path, control)
+	}
+	stats, err := controlled.PathStats("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PhysicalDataBytes != 0 || stats.DelayedDataWrites != 0 || stats.DelayedDataReads != 0 {
+		t.Fatalf("control frames changed DATA stats: %+v", stats)
+	}
+
+	writeStarted := time.Now()
+	runtimeControlledTCPWriteAndReceive(t, path, peer, dataFrame)
+	writeElapsed := time.Since(writeStarted)
+	readStarted := time.Now()
+	runtimeControlledTCPWriteAndReceive(t, peer, path, dataFrame)
+	readElapsed := time.Since(readStarted)
+	if writeElapsed < 15*time.Millisecond || readElapsed < 15*time.Millisecond {
+		t.Fatalf("DATA delay write=%s read=%s, want each near 20ms", writeElapsed, readElapsed)
+	}
+
+	stats, err = controlled.PathStats("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.DataWriteBytesPerSecond != rate || stats.DataReadBytesPerSecond != rate {
+		t.Fatalf("configured DATA rates = (%d,%d), want (%d,%d)", stats.DataWriteBytesPerSecond, stats.DataReadBytesPerSecond, rate, rate)
+	}
+	if stats.PhysicalDataWriteBytes != uint64(len(dataFrame)) || stats.PhysicalDataReadBytes != uint64(len(dataFrame)) {
+		t.Fatalf("physical DATA bytes write=%d read=%d, want %d each", stats.PhysicalDataWriteBytes, stats.PhysicalDataReadBytes, len(dataFrame))
+	}
+	if stats.PhysicalDataBytes != 2*uint64(len(dataFrame)) {
+		t.Fatalf("total physical DATA bytes=%d, want %d", stats.PhysicalDataBytes, 2*len(dataFrame))
+	}
+	if stats.DelayedDataWrites != 1 || stats.DelayedDataReads != 1 {
+		t.Fatalf("delayed DATA calls write=%d read=%d, want 1 each", stats.DelayedDataWrites, stats.DelayedDataReads)
+	}
+	if stats.DataWriteBlocked < 15*time.Millisecond || stats.DataReadBlocked < 15*time.Millisecond {
+		t.Fatalf("blocked DATA duration write=%s read=%s, want each near 20ms", stats.DataWriteBlocked, stats.DataReadBlocked)
+	}
+	if stats.CumulativeDataBlocked != stats.DataWriteBlocked+stats.DataReadBlocked {
+		t.Fatalf("cumulative blocked=%s, want %s", stats.CumulativeDataBlocked, stats.DataWriteBlocked+stats.DataReadBlocked)
+	}
+}
+
+func TestRuntimeControlledTCPDataDelayIsCloseCancellable(t *testing.T) {
+	t.Run("write", func(t *testing.T) {
+		controlled := newRuntimeControlledTCPTransport(t)
+		client, server := net.Pipe()
+		defer server.Close()
+		controlled.dialHook = func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error) {
+			return tadapter.Wrap(client), client, nil
+		}
+		if err := controlled.SetDataWriteRate("A", 1); err != nil {
+			t.Fatal(err)
+		}
+		dialed, err := controlled.dialPath(context.Background(), controlled.Spec("unused", "A"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dataFrame := runtimeControlledTCPTestFrame(t, proto.FrameData, 0, 8)
+		gate, err := controlled.ArmNextDataWrite("A")
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := dialed.Write(dataFrame)
+			result <- err
+		}()
+		select {
+		case <-gate.entered:
+		case <-time.After(time.Second):
+			t.Fatal("DATA write did not enter gate")
+		}
+		gate.Release()
+		deadline := time.Now().Add(time.Second)
+		for {
+			stats, statsErr := controlled.PathStats("A")
+			if statsErr != nil {
+				t.Fatal(statsErr)
+			}
+			if stats.DelayedDataWrites == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("DATA write did not enter shaping delay")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		controlled.close()
+		select {
+		case err := <-result:
+			if !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("cancelled DATA write error=%v, want %v", err, net.ErrClosed)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("close did not cancel DATA write delay")
+		}
+		stats, err := controlled.PathStats("A")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.DelayedDataWrites != 1 || stats.PhysicalDataWriteBytes != 0 {
+			t.Fatalf("cancelled DATA write stats: %+v", stats)
+		}
+	})
+
+	t.Run("read", func(t *testing.T) {
+		controlled := newRuntimeControlledTCPTransport(t)
+		client, server := net.Pipe()
+		peer := tadapter.Wrap(server)
+		defer peer.Close()
+		controlled.dialHook = func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error) {
+			return tadapter.Wrap(client), client, nil
+		}
+		if err := controlled.SetDataReadRate("A", 1); err != nil {
+			t.Fatal(err)
+		}
+		dialed, err := controlled.dialPath(context.Background(), controlled.Spec("unused", "A"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dataFrame := runtimeControlledTCPTestFrame(t, proto.FrameData, 0, 8)
+		readResult := make(chan error, 1)
+		go func() {
+			buf := make([]byte, len(dataFrame))
+			_, err := dialed.Read(buf)
+			readResult <- err
+		}()
+		if _, err := peer.Write(dataFrame); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(time.Second)
+		for {
+			stats, statsErr := controlled.PathStats("A")
+			if statsErr != nil {
+				t.Fatal(statsErr)
+			}
+			if stats.PhysicalDataReadBytes == uint64(len(dataFrame)) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("DATA read did not enter shaping delay")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		controlled.close()
+		select {
+		case err := <-readResult:
+			if !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("cancelled DATA read error=%v, want %v", err, net.ErrClosed)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("close did not cancel DATA read delay")
+		}
+		stats, err := controlled.PathStats("A")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.DelayedDataReads != 1 || stats.PhysicalDataReadBytes != uint64(len(dataFrame)) {
+			t.Fatalf("cancelled DATA read stats: %+v", stats)
+		}
+	})
+}
+
+func runtimeControlledTCPTestFrame(t testing.TB, frameType proto.FrameType, flags uint16, payloadBytes int) []byte {
+	t.Helper()
+	frame := make([]byte, proto.HeaderSize+payloadBytes)
+	if err := (proto.Header{Version: proto.Version, Type: frameType, Last: true, Flags: flags, Seq: 1}).Encode(frame); err != nil {
+		t.Fatal(err)
+	}
+	for i := proto.HeaderSize; i < len(frame); i++ {
+		frame[i] = byte(i)
+	}
+	return frame
+}
+
+func runtimeControlledTCPWriteAndReceive(t testing.TB, writer, reader transport.PathConn, frame []byte) {
+	t.Helper()
+	readResult := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(frame))
+		n, err := reader.Read(buf)
+		if err == nil && (n != len(frame) || !reflect.DeepEqual(buf[:n], frame)) {
+			err = fmt.Errorf("received frame length/content mismatch: got %d bytes", n)
+		}
+		readResult <- err
+	}()
+	if n, err := writer.Write(frame); err != nil || n != len(frame) {
+		t.Fatalf("write frame = (%d,%v), want (%d,nil)", n, err, len(frame))
+	}
+	select {
+	case err := <-readResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frame receive timed out")
 	}
 }
 

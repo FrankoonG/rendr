@@ -641,6 +641,78 @@ func TestRecoveryStopCancelsWorkerWithoutRestart(t *testing.T) {
 	}
 }
 
+func TestRecoveryStopJoinsDelayedCancellationWorker(t *testing.T) {
+	e := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{}.Clamp())
+	defer e.Close()
+	spec := PathSpec{Transport: "stop-join-test", Address: "leaf", Opts: map[string]string{"name": "leaf"}}
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+	supervisor := newPathRecoverySupervisor(e, nil, func(ctx context.Context, _ PathSpec) (uint32, error) {
+		startOnce.Do(func() { close(started) })
+		<-ctx.Done()
+		cancelOnce.Do(func() { close(canceled) })
+		<-release
+		close(exited)
+		return 0, ctx.Err()
+	}, []PathSpec{spec}, nil, retryPolicy{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		supervisor.stop()
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("recovery worker did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		supervisor.stop()
+		close(stopped)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("recovery stop did not cancel worker context")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("recovery stop returned before delayed worker cleanup")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("delayed recovery worker did not exit")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("recovery stop did not join completed worker")
+	}
+
+	// A second stop is an idempotent join, not another actor message.
+	joinedAgain := make(chan struct{})
+	go func() {
+		supervisor.stop()
+		close(joinedAgain)
+	}()
+	select {
+	case <-joinedAgain:
+	case <-time.After(time.Second):
+		t.Fatal("idempotent recovery stop blocked")
+	}
+}
+
 func TestRecoveryStatusUpdatesAreActorValidated(t *testing.T) {
 	e := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
@@ -780,23 +852,35 @@ func TestCleanRemovalRetiresLateSuccessfulRecoveryAttach(t *testing.T) {
 }
 
 func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
+	guard := PathSpec{Transport: "last-path-test", Address: "guard", Opts: map[string]string{"name": "guard"}}
+	leaf := PathSpec{Transport: "last-path-test", Address: "leaf", Opts: map[string]string{"name": "leaf"}}
+	plan, err := compileTargetForDial(Selector("root", []Target{
+		Path("guard", guard),
+		Path("leaf", leaf),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	e := engine.New(engine.SideClient, engine.NewClientFlowID(), engine.Limits{}.Clamp())
 	defer e.Close()
-	attach := func(spec PathSpec) (uint32, net.Conn) {
+	if err := e.ConfigureLocalGraph(1, plan.graph.manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, plan.graph.manifest); err != nil {
+		t.Fatal(err)
+	}
+	attach := func(spec PathSpec) (uint32, *recoveryNonblockingPath) {
 		t.Helper()
-		local, peer := net.Pipe()
-		id, err := e.AttachPath(tcp.Wrap(local), spec)
+		path := newRecoveryNonblockingPath()
+		id, err := e.AttachPath(path, spec)
 		if err != nil {
-			_ = local.Close()
-			_ = peer.Close()
+			_ = path.Close()
 			t.Fatal(err)
 		}
-		return id, peer
+		return id, path
 	}
-	guard := PathSpec{Transport: "last-path-test", Address: "guard", Opts: map[string]string{"name": "guard"}}
-	guardID, guardPeer := attach(guard)
-	defer guardPeer.Close()
-	leaf := PathSpec{Transport: "last-path-test", Address: "leaf", Opts: map[string]string{"name": "leaf"}}
+	guardID, guardPath := attach(guard)
+	defer guardPath.Close()
 
 	started := make(chan struct{})
 	releaseAttach := make(chan struct{})
@@ -807,23 +891,23 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 		releaseOnce.Do(func() { close(releaseAttach) })
 		returnOnce.Do(func() { close(allowReturn) })
 	})
-	var latePeer net.Conn
-	var latePeerMu sync.Mutex
+	var latePath *recoveryNonblockingPath
+	var latePathMu sync.Mutex
 	defer func() {
-		latePeerMu.Lock()
-		defer latePeerMu.Unlock()
-		if latePeer != nil {
-			_ = latePeer.Close()
+		latePathMu.Lock()
+		defer latePathMu.Unlock()
+		if latePath != nil {
+			_ = latePath.Close()
 		}
 	}()
 	add := func(context.Context, PathSpec) (uint32, error) {
 		startOnce.Do(func() { close(started) })
 		<-releaseAttach
-		local, peer := net.Pipe()
-		latePeerMu.Lock()
-		latePeer = peer
-		latePeerMu.Unlock()
-		id, err := e.AttachPath(tcp.Wrap(local), leaf)
+		path := newRecoveryNonblockingPath()
+		latePathMu.Lock()
+		latePath = path
+		latePathMu.Unlock()
+		id, err := e.AttachPath(path, leaf)
 		if err != nil {
 			return 0, err
 		}
@@ -840,8 +924,8 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("recovery attempt did not start")
 	}
-	manualID, manualPeer := attach(leaf)
-	defer manualPeer.Close()
+	manualID, manualPath := attach(leaf)
+	defer manualPath.Close()
 	if err := e.RemovePath(manualID); err != nil {
 		t.Fatal(err)
 	}
@@ -875,6 +959,54 @@ func TestCleanRemovalRetiresLateRecoveryThatBecomesLastPath(t *testing.T) {
 	}
 	if e.IsClosed() || errors.Is(e.CloseErr(), io.EOF) {
 		t.Fatalf("stale last-path retirement manufactured EOF: closed=%t err=%v", e.IsClosed(), e.CloseErr())
+	}
+	latePathMu.Lock()
+	retiredPath := latePath
+	latePathMu.Unlock()
+	if retiredPath == nil || !retiredPath.isClosed() {
+		t.Fatal("stale last-path carrier remained open after exact retirement")
+	}
+}
+
+type recoveryNonblockingPath struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newRecoveryNonblockingPath() *recoveryNonblockingPath {
+	return &recoveryNonblockingPath{closed: make(chan struct{})}
+}
+
+func (p *recoveryNonblockingPath) Read([]byte) (int, error) {
+	<-p.closed
+	return 0, net.ErrClosed
+}
+
+func (p *recoveryNonblockingPath) Write(b []byte) (int, error) {
+	select {
+	case <-p.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(b), nil
+	}
+}
+
+func (p *recoveryNonblockingPath) Close() error {
+	p.closeOnce.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (*recoveryNonblockingPath) Quality() transport.PathQuality            { return transport.PathQuality{} }
+func (*recoveryNonblockingPath) OnDeath(func(transport.DeathCause, error)) {}
+func (*recoveryNonblockingPath) LocalAddr() string                         { return "local" }
+func (*recoveryNonblockingPath) RemoteAddr() string                        { return "remote" }
+
+func (p *recoveryNonblockingPath) isClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
 	}
 }
 

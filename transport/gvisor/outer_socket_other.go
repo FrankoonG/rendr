@@ -2,7 +2,10 @@
 
 package gvisor
 
-import "net"
+import (
+	"context"
+	"net"
+)
 
 type outerSocketContext struct{}
 
@@ -16,6 +19,15 @@ func platformConfigureOuterUDPPMTU(*net.UDPConn, outerUDPMode) error {
 
 func platformCaptureOuterSocketContext(net.PacketConn) (outerSocketContext, error) {
 	return outerSocketContext{}, ErrOuterPacketUnsupported
+}
+
+func platformOpenOuterSuccessorWire(
+	context.Context,
+	*packetWire,
+	outerUDPMode,
+	*net.UDPAddr,
+) (*packetWire, error) {
+	return nil, ErrOuterPacketUnsupported
 }
 
 func platformReleaseOuterSocketContext(*outerSocketContext) {}

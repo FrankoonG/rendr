@@ -1,4 +1,4 @@
-//go:build rendr_experimental_gvisor
+//go:build linux && amd64 && rendr_experimental_gvisor
 
 package gvisor
 
@@ -24,7 +24,9 @@ import (
 
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
+	basetcp "github.com/FrankoonG/rendr/transport/tcp"
 )
 
 const (
@@ -46,20 +48,102 @@ func TestGVisorKernel5PublicRuntimeSilentBlackholeRebind(t *testing.T) {
 }
 
 func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
+	return runPublicRuntimeGVisorBlackholeScenario(t, publicRuntimeGVisorScenario{})
+}
+
+type publicRuntimeBlackholeRelay interface {
+	Addr() net.Addr
+	Close() error
+	DropEstablishedClient(testing.TB) string
+	PreData() uint64
+	PostData() uint64
+	ServerPreData() uint64
+	ServerPostData() uint64
+	ReplacementTuple() string
+}
+
+type publicRuntimeGVisorScenario struct {
+	packetOptions         []PacketOption
+	relayFactory          func(testing.TB, net.Addr) publicRuntimeBlackholeRelay
+	requireUnacknowledged bool
+	requireCrossedActors  bool
+	observation           *publicRuntimeGVisorObservation
+}
+
+type publicRuntimeGVisorObservation struct {
+	ClientCreatedAtBefore time.Time
+	ClientCreatedAtAfter  time.Time
+	ServerCreatedAtBefore time.Time
+	ServerCreatedAtAfter  time.Time
+	ClientTXAtBlackhole   rendr.ReplayStats
+	ServerTXAtBlackhole   rendr.ReplayStats
+	StatusReason          rendr.MobilityReason
+	StatusNegotiated      rendr.MobilityID
+	ClientCrossed         rendr.MobilityStatus
+	ServerCrossed         rendr.MobilityStatus
+	Control               publicK5ControlSummary
+	ProductionFactory     bool
+	ProductionListener    bool
+}
+
+func runPublicRuntimeGVisorBlackholeScenario(t *testing.T, scenario publicRuntimeGVisorScenario) publicK5GVisorEvidence {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	packetListener, err := ListenPacket("127.0.0.1:0", WithTrustedCarrier())
+	packetOptions := scenario.packetOptions
+	if len(packetOptions) == 0 {
+		packetOptions = []PacketOption{WithTrustedCarrier()}
+	}
+	packetListener, err := ListenPacket("127.0.0.1:0", packetOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := newPacketBlackholeRelay(t, packetListener.Addr())
-	controlListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	relayFactory := scenario.relayFactory
+	if relayFactory == nil {
+		relayFactory = func(t testing.TB, server net.Addr) publicRuntimeBlackholeRelay {
+			return newPacketBlackholeRelay(t, server)
+		}
+	}
+	relay := relayFactory(t, packetListener.Addr())
+	dataFactory := packetListener.Factory()
+	productionFactory := reflect.TypeOf(dataFactory) == reflect.TypeOf((*Transport)(nil))
+	productionListener := reflect.TypeOf(packetListener) == reflect.TypeOf((*Listener)(nil))
+	for name, value := range map[string]any{"factory": dataFactory, "listener": packetListener} {
+		provider, ok := value.(leafmobility.ImplementationProvider)
+		if !ok {
+			t.Fatalf("production gVisor %s %T has no mobility implementation provider", name, value)
+		}
+		capabilities, capabilityErr := leafmobility.CapabilitiesForImplementationProvider(provider)
+		if capabilityErr != nil || len(capabilities) != 1 ||
+			capabilities[0].Operation() != leafmobility.OperationGVisorLinkRebind {
+			t.Fatalf("production gVisor %s capabilities=%v err=%v", name, capabilities, capabilityErr)
+		}
+	}
+	if !productionFactory || !productionListener {
+		t.Fatalf("T5.6 did not install production gVisor providers factory=%T listener=%T", dataFactory, packetListener)
+	}
+	observedClientPath := make(chan *retainedPathConn, 1)
+	stopObservingClientPath := dataFactory.setPacketPathObserver(func(path *retainedPathConn) {
+		select {
+		case observedClientPath <- path:
+		default:
+		}
+	})
+	defer stopObservingClientPath()
+
+	controlBaseListener, err := basetcp.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		relay.Close()
+		_ = relay.Close()
 		_ = packetListener.Close()
 		t.Fatal(err)
+	}
+	controlTrace := &publicK5ControlTrace{}
+	if scenario.requireCrossedActors {
+		controlTrace.crossedPrepare = newPublicK5CrossedPrepareGate()
+	}
+	controlListener := &publicK5ControlListener{
+		base: controlBaseListener, trace: controlTrace, writer: publicK5ControlServer,
 	}
 
 	runtimeConfig := rendr.DefaultRuntimeConfig()
@@ -70,15 +154,12 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	if err != nil {
 		t.Fatal(err)
 	}
-	responderListener := newPublicK5ResponderListener(packetListener)
 	sessionListener, err := serverRuntime.Listen(rendr.ListenConfig{
-		Streams: []rendr.StreamSource{{
-			Name: publicK5GVisorControlName, Carrier: rendr.CarrierTCP, Listener: controlListener,
+		Framed: []rendr.FramedSource{
+			{Name: publicK5GVisorDataFactoryName, Carrier: rendr.CarrierUDP, Listener: packetListener},
+			{Name: publicK5GVisorControlName, Carrier: rendr.CarrierTCP, Listener: controlListener},
 		}},
-		Framed: []rendr.FramedSource{{
-			Name: publicK5GVisorDataFactoryName, Carrier: rendr.CarrierUDP, Listener: responderListener,
-		}},
-	})
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,9 +168,16 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observedFactory := newPublicK5ObservedFactory(packetListener.Factory())
 	if err := clientRuntime.RegisterFramedFactory(publicK5GVisorDataFactoryName, rendr.FramedFactory{
-		Carrier: rendr.CarrierUDP, Factory: observedFactory,
+		Carrier: rendr.CarrierUDP, Factory: dataFactory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controlFactory := &publicK5ControlFactory{
+		base: basetcp.New(), trace: controlTrace, writer: publicK5ControlClient,
+	}
+	if err := clientRuntime.RegisterFramedFactory(publicK5GVisorControlName, rendr.FramedFactory{
+		Carrier: rendr.CarrierTCP, Factory: controlFactory,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +186,7 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 			Transport: publicK5GVisorDataFactoryName, Address: relay.Addr().String(),
 		}),
 		rendr.Path("control", rendr.PathSpec{
-			Transport: "tcp", Address: controlListener.Addr().String(),
+			Transport: publicK5GVisorControlName, Address: controlListener.Addr().String(),
 		}),
 	})
 	client, err := clientRuntime.Dial(ctx, rendr.SessionConfig{Root: root})
@@ -109,7 +197,14 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientPath := observedFactory.path(t, ctx)
+	publicK5WaitForAttachedPaths(t, ctx, client, []string{"gvisor-data", "control"}, 5*time.Second)
+	publicK5WaitForAttachedPaths(t, ctx, server, []string{"gvisor-data", "control"}, 5*time.Second)
+	var clientPath *retainedPathConn
+	select {
+	case clientPath = <-observedClientPath:
+	case <-ctx.Done():
+		t.Fatalf("observe production Runtime gVisor path: %v", ctx.Err())
+	}
 	serverOwner := publicK5ServerOwner(t, packetListener, clientPath.link.virtualIP)
 
 	clientObserver, ok := client.(rendr.ConnectionObserver)
@@ -119,6 +214,11 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	serverObserver, ok := server.(rendr.ConnectionObserver)
 	if !ok {
 		t.Fatalf("public server %T does not implement ConnectionObserver", server)
+	}
+	clientCreatedAtBefore := clientObserver.Stats().CreatedAt
+	serverCreatedAtBefore := serverObserver.Stats().CreatedAt
+	if clientCreatedAtBefore.IsZero() || serverCreatedAtBefore.IsZero() {
+		t.Fatal("public Runtime returned zero connection CreatedAt")
 	}
 	clientClaim := clientPath.LeafMobilityClaim()
 	if clientClaim == nil {
@@ -198,6 +298,13 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	if relay.PreData() == 0 || relay.ServerPreData() == 0 {
 		t.Fatalf("outer DATA before blackhole client/server=%d/%d", relay.PreData(), relay.ServerPreData())
 	}
+	var clientTXAtBlackhole, serverTXAtBlackhole rendr.ReplayStats
+	if scenario.requireUnacknowledged {
+		release()
+		clientTXAtBlackhole, serverTXAtBlackhole = publicK5WaitForUnacknowledgedData(
+			t, ctx, clientObserver, serverObserver, clientGenerated, serverGenerated,
+		)
+	}
 	clientGeneratedAtBlackhole := clientGenerated.Load() * publicK5GVisorPayloadBytes
 	serverGeneratedAtBlackhole := serverGenerated.Load() * publicK5GVisorPayloadBytes
 	clientReceivedAtBlackhole := clientReceived.bytes.Load()
@@ -205,6 +312,15 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	outerTupleDropped := relay.DropEstablishedClient(t)
 	blackholeUnixNano := time.Now().UnixNano()
 	release()
+	var clientCrossed, serverCrossed rendr.MobilityStatus
+	if scenario.requireCrossedActors {
+		controller, ok := relay.(interface{ ReleaseReplacement(testing.TB) })
+		if !ok {
+			t.Fatalf("crossed-actor treatment relay %T cannot release held replacement tuples", relay)
+		}
+		clientCrossed, serverCrossed = publicK5WaitForCrossedInitiators(t, ctx, client, server)
+		controller.ReleaseReplacement(t)
+	}
 
 	event := publicK5WaitForMigration(t, ctx, events)
 	if event.OldID != binding.PathID || event.NewID != binding.PathID || event.Cause != "leaf-mobility" {
@@ -260,6 +376,23 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	}
 	transactionID := hex.EncodeToString(committedPeer.control.Transaction[:])
 	agreementDigest := hex.EncodeToString(committedPeer.control.Agreement[:])
+	winnerTransaction := [16]byte(committedPeer.control.Transaction)
+	winnerAgreement := [32]byte(committedPeer.control.Agreement)
+	if statusAfter.Mobility.TransactionID != winnerTransaction {
+		t.Fatalf("public mobility status transaction=%x owner transaction=%x",
+			statusAfter.Mobility.TransactionID, winnerTransaction)
+	}
+	controlSummary := controlTrace.summarize(winnerTransaction, winnerAgreement, serverCrossed.TransactionID)
+	if scenario.requireCrossedActors {
+		if clientCrossed.TransactionID != winnerTransaction ||
+			serverCrossed.TransactionID == ([16]byte{}) || serverCrossed.TransactionID == winnerTransaction {
+			t.Fatalf("production crossed arbitration client=%x server=%x winner=%x",
+				clientCrossed.TransactionID, serverCrossed.TransactionID, winnerTransaction)
+		}
+		if !controlSummary.valid() {
+			t.Fatalf("sibling control path lacks exact winning/crossed transaction frames: %+v", controlSummary)
+		}
+	}
 
 	clientControlAfter := publicK5PathCounters(t, client.Paths(), "control")
 	serverControlAfter := publicK5PathCounters(t, server.Paths(), "control")
@@ -297,6 +430,10 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 		statusAfter.Mobility.State != rendr.MobilityStateCommitted ||
 		statusAfter.Mobility.EndpointGeneration != claimAfter.Generation || statusAfter.Mobility.EvidenceGeneration == 0 {
 		t.Fatalf("public mobility status=%+v claim=%+v", statusAfter.Mobility, claimAfter)
+	}
+	if scenario.observation != nil && (statusAfter.Mobility.Reason != rendr.MobilityReasonLinkUnresponsive ||
+		statusAfter.Mobility.Negotiated != rendr.MobilityGVisorPacketLinkRebind) {
+		t.Fatalf("T5.6 public mobility reason/negotiation=%+v", statusAfter.Mobility)
 	}
 	if clientObserver.MigrationCount() != migrationsBefore+1 || serverObserver.MigrationCount() > 1 {
 		t.Fatalf("public migration counts client=%d/%d server=%d", migrationsBefore,
@@ -337,7 +474,9 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	if err := sessionListener.Close(); err != nil {
 		t.Fatalf("close public Runtime listener: %v", err)
 	}
-	relay.Close()
+	if err := relay.Close(); err != nil {
+		t.Fatalf("close public blackhole relay: %v", err)
+	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelCleanup()
 	publicK5WaitClosed(t, cleanupCtx, clientPath.link.done, "client packet-link owner")
@@ -355,6 +494,23 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	refreshAfter := processRefreshCallbackBudget.snapshot()
 	clientApp = appClient.snapshot()
 	serverApp = appServer.snapshot()
+	clientCreatedAtAfter := clientObserver.Stats().CreatedAt
+	serverCreatedAtAfter := serverObserver.Stats().CreatedAt
+	if scenario.observation != nil {
+		scenario.observation.ClientCreatedAtBefore = clientCreatedAtBefore
+		scenario.observation.ClientCreatedAtAfter = clientCreatedAtAfter
+		scenario.observation.ServerCreatedAtBefore = serverCreatedAtBefore
+		scenario.observation.ServerCreatedAtAfter = serverCreatedAtAfter
+		scenario.observation.ClientTXAtBlackhole = clientTXAtBlackhole
+		scenario.observation.ServerTXAtBlackhole = serverTXAtBlackhole
+		scenario.observation.StatusReason = statusAfter.Mobility.Reason
+		scenario.observation.StatusNegotiated = statusAfter.Mobility.Negotiated
+		scenario.observation.ClientCrossed = clientCrossed
+		scenario.observation.ServerCrossed = serverCrossed
+		scenario.observation.Control = controlSummary
+		scenario.observation.ProductionFactory = productionFactory
+		scenario.observation.ProductionListener = productionListener
+	}
 
 	return publicK5GVisorEvidence{
 		Schema: publicK5GVisorSchema, Test: "TestGVisorKernel5PublicRuntimeSilentBlackholeRebind",
@@ -371,9 +527,15 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 		MigrationEventCount: 1, MigrationOldPathID: event.OldID, MigrationNewPathID: event.NewID,
 		MigrationCause: event.Cause, BlackholeUnixNano: blackholeUnixNano, MigrationUnixNano: event.AtUnixNano,
 		StatusMobilityID: string(statusAfter.Mobility.ID), StatusMobilityState: string(statusAfter.Mobility.State),
-		StatusEndpointGeneration: statusAfter.Mobility.EndpointGeneration,
-		StatusEvidenceGeneration: statusAfter.Mobility.EvidenceGeneration,
-		ClaimKind:                uint8(claimBefore.Kind), ClaimRole: uint8(claimBefore.Role), ClaimScope: uint8(claimBefore.Scope),
+		StatusTransactionID:       hex.EncodeToString(statusAfter.Mobility.TransactionID[:]),
+		StatusEndpointGeneration:  statusAfter.Mobility.EndpointGeneration,
+		StatusEvidenceGeneration:  statusAfter.Mobility.EvidenceGeneration,
+		ProductionFactoryProvider: productionFactory, ProductionListenerProvider: productionListener,
+		ResponderInitiatorSuppressed: false,
+		ClientCrossedTransactionID:   hex.EncodeToString(clientCrossed.TransactionID[:]),
+		ServerCrossedTransactionID:   hex.EncodeToString(serverCrossed.TransactionID[:]),
+		Control:                      controlSummary,
+		ClaimKind:                    uint8(claimBefore.Kind), ClaimRole: uint8(claimBefore.Role), ClaimScope: uint8(claimBefore.Scope),
 		ClaimSession: uint8(claimBefore.Session), ClaimOperations: uint8(claimBefore.Operations),
 		ClaimResourceIDBefore: fmt.Sprintf("%x", claimBefore.ResourceID), ClaimResourceIDAfter: fmt.Sprintf("%x", claimAfter.ResourceID),
 		ClaimEndpointGenerationBefore: claimBefore.Generation, ClaimEndpointGenerationAfter: claimAfter.Generation,
@@ -415,6 +577,36 @@ func runPublicRuntimeGVisorBlackhole(t *testing.T) publicK5GVisorEvidence {
 	}
 }
 
+func publicK5WaitForUnacknowledgedData(
+	t testing.TB,
+	ctx context.Context,
+	client, server rendr.ConnectionObserver,
+	clientGenerated, serverGenerated *atomic.Uint64,
+) (rendr.ReplayStats, rendr.ReplayStats) {
+	t.Helper()
+	ticker := time.NewTicker(100 * time.Microsecond)
+	defer ticker.Stop()
+	for {
+		clientStats := client.Stats()
+		serverStats := server.Stats()
+		clientFrames := clientGenerated.Load()
+		serverFrames := serverGenerated.Load()
+		if clientFrames > publicK5GVisorCutoverFrames && serverFrames > publicK5GVisorCutoverFrames &&
+			clientFrames < publicK5GVisorFrames && serverFrames < publicK5GVisorFrames &&
+			clientStats.TXReplay.FramesInUse > 0 && clientStats.TXReplay.BytesInUse > 0 &&
+			serverStats.TXReplay.FramesInUse > 0 && serverStats.TXReplay.BytesInUse > 0 {
+			return clientStats.TXReplay, serverStats.TXReplay
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("wait for active unacknowledged T5.6 data: generated=%d/%d client=%+v server=%+v err=%v",
+				clientFrames, serverFrames, clientStats.TXReplay, serverStats.TXReplay, ctx.Err())
+			return rendr.ReplayStats{}, rendr.ReplayStats{}
+		}
+	}
+}
+
 type publicK5GVisorEvidence struct {
 	Schema string `json:"schema"`
 	Nonce  string `json:"nonce"`
@@ -447,26 +639,33 @@ type publicK5GVisorEvidence struct {
 	BlackholeUnixNano    int64  `json:"blackhole_unix_nano"`
 	MigrationUnixNano    int64  `json:"migration_unix_nano"`
 
-	StatusMobilityID               string `json:"status_mobility_id"`
-	StatusMobilityState            string `json:"status_mobility_state"`
-	StatusEndpointGeneration       uint64 `json:"status_endpoint_generation"`
-	StatusEvidenceGeneration       uint64 `json:"status_evidence_generation"`
-	ClaimKind                      uint8  `json:"claim_kind"`
-	ClaimRole                      uint8  `json:"claim_role"`
-	ClaimScope                     uint8  `json:"claim_scope"`
-	ClaimSession                   uint8  `json:"claim_session"`
-	ClaimOperations                uint8  `json:"claim_operations"`
-	ClaimResourceIDBefore          string `json:"claim_resource_id_before"`
-	ClaimResourceIDAfter           string `json:"claim_resource_id_after"`
-	ClaimEndpointGenerationBefore  uint64 `json:"claim_endpoint_generation_before"`
-	ClaimEndpointGenerationAfter   uint64 `json:"claim_endpoint_generation_after"`
-	ClaimExecutionGenerationBefore uint64 `json:"claim_execution_generation_before"`
-	ClaimExecutionGenerationAfter  uint64 `json:"claim_execution_generation_after"`
-	ClaimBindingFlowID             string `json:"claim_binding_flow_id"`
-	ClaimBindingLocalTargetID      string `json:"claim_binding_local_target_id"`
-	ClaimBindingPeerTargetID       string `json:"claim_binding_peer_target_id"`
-	ClaimBindingPathID             uint32 `json:"claim_binding_path_id"`
-	ClaimBindingOwner              uint64 `json:"claim_binding_owner"`
+	StatusMobilityID               string                 `json:"status_mobility_id"`
+	StatusMobilityState            string                 `json:"status_mobility_state"`
+	StatusTransactionID            string                 `json:"status_transaction_id"`
+	StatusEndpointGeneration       uint64                 `json:"status_endpoint_generation"`
+	StatusEvidenceGeneration       uint64                 `json:"status_evidence_generation"`
+	ProductionFactoryProvider      bool                   `json:"production_factory_provider"`
+	ProductionListenerProvider     bool                   `json:"production_listener_provider"`
+	ResponderInitiatorSuppressed   bool                   `json:"responder_initiator_suppressed"`
+	ClientCrossedTransactionID     string                 `json:"client_crossed_transaction_id,omitempty"`
+	ServerCrossedTransactionID     string                 `json:"server_crossed_transaction_id,omitempty"`
+	Control                        publicK5ControlSummary `json:"control"`
+	ClaimKind                      uint8                  `json:"claim_kind"`
+	ClaimRole                      uint8                  `json:"claim_role"`
+	ClaimScope                     uint8                  `json:"claim_scope"`
+	ClaimSession                   uint8                  `json:"claim_session"`
+	ClaimOperations                uint8                  `json:"claim_operations"`
+	ClaimResourceIDBefore          string                 `json:"claim_resource_id_before"`
+	ClaimResourceIDAfter           string                 `json:"claim_resource_id_after"`
+	ClaimEndpointGenerationBefore  uint64                 `json:"claim_endpoint_generation_before"`
+	ClaimEndpointGenerationAfter   uint64                 `json:"claim_endpoint_generation_after"`
+	ClaimExecutionGenerationBefore uint64                 `json:"claim_execution_generation_before"`
+	ClaimExecutionGenerationAfter  uint64                 `json:"claim_execution_generation_after"`
+	ClaimBindingFlowID             string                 `json:"claim_binding_flow_id"`
+	ClaimBindingLocalTargetID      string                 `json:"claim_binding_local_target_id"`
+	ClaimBindingPeerTargetID       string                 `json:"claim_binding_peer_target_id"`
+	ClaimBindingPathID             uint32                 `json:"claim_binding_path_id"`
+	ClaimBindingOwner              uint64                 `json:"claim_binding_owner"`
 
 	LinkIDBefore           string `json:"link_id_before"`
 	LinkIDAfter            string `json:"link_id_after"`
@@ -590,103 +789,290 @@ type publicK5OwnerCloseSnapshot struct {
 	PeerReceiveNext   uint64
 }
 
-type publicK5ObservedFactory struct {
+type publicK5ControlWriter uint8
+
+const (
+	publicK5ControlClient publicK5ControlWriter = iota + 1
+	publicK5ControlServer
+)
+
+type publicK5ControlRecord struct {
+	Writer      publicK5ControlWriter
+	Code        proto.CtrlCode
+	Transaction [16]byte
+	Actor       proto.LeafMobilityActorSide
+	Agreement   [32]byte
+	AckPhase    proto.LeafMobilityPeerPlanAckPhase
+	AckCode     proto.LeafMobilityPeerPlanAckCode
+	CommitStage proto.LeafMobilityPeerPlanCommitStage
+}
+
+type publicK5ControlTrace struct {
+	mu             sync.Mutex
+	records        []publicK5ControlRecord
+	malformed      uint64
+	crossedPrepare *publicK5CrossedPrepareGate
+}
+
+type publicK5ControlSummary struct {
+	MobilityFrames             uint64
+	MalformedFrames            uint64
+	AgreementMismatches        uint64
+	OtherActorFrames           uint64
+	WinningPrepareFrames       uint64
+	WinningPreparedFrames      uint64
+	WinningCommitFrames        uint64
+	WinningFinalFrames         uint64
+	WinningCompleteFrames      uint64
+	WinningReleasedFrames      uint64
+	CrossedServerTransactions  uint64
+	CrossedServerPrepareFrames uint64
+	CrossedServerBusyFrames    uint64
+	CrossedPrepareBarrier      bool
+}
+
+type publicK5CrossedPrepareGate struct {
+	mu     sync.Mutex
+	seen   map[publicK5ControlWriter]bool
+	ready  chan struct{}
+	closed bool
+}
+
+func newPublicK5CrossedPrepareGate() *publicK5CrossedPrepareGate {
+	return &publicK5CrossedPrepareGate{
+		seen: make(map[publicK5ControlWriter]bool, 2), ready: make(chan struct{}),
+	}
+}
+
+func (gate *publicK5CrossedPrepareGate) wait(writer publicK5ControlWriter, frame []byte) error {
+	if gate == nil {
+		return nil
+	}
+	header, err := proto.DecodeHeader(frame)
+	if err != nil || header.Type != proto.FrameCtrl ||
+		proto.CtrlCodeFromFlags(header.Flags) != proto.CtrlLeafMobilityPrepare {
+		return nil
+	}
+	prepare, err := proto.DecodeLeafMobilityPeerPlanPrepare(frame[proto.HeaderSize:])
+	if err != nil {
+		return err
+	}
+	if (writer == publicK5ControlClient && prepare.ActorSide != proto.LeafMobilityActorClient) ||
+		(writer == publicK5ControlServer && prepare.ActorSide != proto.LeafMobilityActorServer) {
+		return fmt.Errorf("control PREPARE writer=%d actor=%d", writer, prepare.ActorSide)
+	}
+	gate.mu.Lock()
+	gate.seen[writer] = true
+	if len(gate.seen) == 2 && !gate.closed {
+		gate.closed = true
+		close(gate.ready)
+	}
+	ready := gate.ready
+	gate.mu.Unlock()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return nil
+	case <-timer.C:
+		return errors.New("crossed automatic PREPARE barrier timed out")
+	}
+}
+
+func (gate *publicK5CrossedPrepareGate) completed() bool {
+	if gate == nil {
+		return false
+	}
+	gate.mu.Lock()
+	completed := gate.closed && len(gate.seen) == 2
+	gate.mu.Unlock()
+	return completed
+}
+
+func (trace *publicK5ControlTrace) record(writer publicK5ControlWriter, frame []byte) {
+	header, err := proto.DecodeHeader(frame)
+	if err != nil || header.Type != proto.FrameCtrl {
+		return
+	}
+	code := proto.CtrlCodeFromFlags(header.Flags)
+	if code != proto.CtrlLeafMobilityPrepare && code != proto.CtrlLeafMobilityAck && code != proto.CtrlLeafMobilityCommit {
+		return
+	}
+	record := publicK5ControlRecord{Writer: writer, Code: code}
+	payload := frame[proto.HeaderSize:]
+	switch code {
+	case proto.CtrlLeafMobilityPrepare:
+		message, decodeErr := proto.DecodeLeafMobilityPeerPlanPrepare(payload)
+		if decodeErr == nil {
+			record.Transaction = message.TransactionID
+			record.Actor = message.ActorSide
+		}
+		err = decodeErr
+	case proto.CtrlLeafMobilityAck:
+		message, decodeErr := proto.DecodeLeafMobilityPeerPlanAck(payload)
+		if decodeErr == nil {
+			record.Transaction = message.TransactionID
+			record.Actor = message.ActorSide
+			record.Agreement = message.AgreementDigest
+			record.AckPhase = message.Phase
+			record.AckCode = message.Code
+			record.CommitStage = message.Stage
+		}
+		err = decodeErr
+	case proto.CtrlLeafMobilityCommit:
+		message, decodeErr := proto.DecodeLeafMobilityPeerPlanCommit(payload)
+		if decodeErr == nil {
+			record.Transaction = message.TransactionID
+			record.Actor = message.ActorSide
+			record.Agreement = message.AgreementDigest
+			record.CommitStage = message.Stage
+		}
+		err = decodeErr
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if err != nil {
+		trace.malformed++
+		return
+	}
+	trace.records = append(trace.records, record)
+}
+
+func (trace *publicK5ControlTrace) summarize(
+	winner [16]byte,
+	agreement [32]byte,
+	crossedServer [16]byte,
+) publicK5ControlSummary {
+	trace.mu.Lock()
+	records := append([]publicK5ControlRecord(nil), trace.records...)
+	summary := publicK5ControlSummary{
+		MalformedFrames: trace.malformed, CrossedPrepareBarrier: trace.crossedPrepare.completed(),
+	}
+	trace.mu.Unlock()
+	serverTransactions := make(map[[16]byte]struct{})
+	for _, record := range records {
+		summary.MobilityFrames++
+		if record.Transaction == winner {
+			if record.Code != proto.CtrlLeafMobilityPrepare && record.Agreement != agreement {
+				summary.AgreementMismatches++
+				continue
+			}
+			switch record.Code {
+			case proto.CtrlLeafMobilityPrepare:
+				if record.Writer == publicK5ControlClient && record.Actor == proto.LeafMobilityActorClient {
+					summary.WinningPrepareFrames++
+				}
+			case proto.CtrlLeafMobilityAck:
+				if record.Writer != publicK5ControlServer || record.AckCode != proto.LeafMobilityPeerPlanAckCodeAccept {
+					break
+				}
+				switch record.AckPhase {
+				case proto.LeafMobilityPeerPlanAckPhasePrepared:
+					summary.WinningPreparedFrames++
+				case proto.LeafMobilityPeerPlanAckPhaseFinal:
+					summary.WinningFinalFrames++
+				case proto.LeafMobilityPeerPlanAckPhaseReleased:
+					summary.WinningReleasedFrames++
+				}
+			case proto.CtrlLeafMobilityCommit:
+				if record.Writer != publicK5ControlClient {
+					break
+				}
+				switch record.CommitStage {
+				case proto.LeafMobilityPeerPlanCommitStageCommit:
+					summary.WinningCommitFrames++
+				case proto.LeafMobilityPeerPlanCommitStageComplete:
+					summary.WinningCompleteFrames++
+				}
+			}
+			continue
+		}
+		if record.Actor == proto.LeafMobilityActorServer {
+			serverTransactions[record.Transaction] = struct{}{}
+			if crossedServer != ([16]byte{}) && record.Transaction == crossedServer {
+				switch {
+				case record.Code == proto.CtrlLeafMobilityPrepare && record.Writer == publicK5ControlServer:
+					summary.CrossedServerPrepareFrames++
+				case record.Code == proto.CtrlLeafMobilityAck && record.Writer == publicK5ControlClient &&
+					record.AckPhase == proto.LeafMobilityPeerPlanAckPhasePrepared &&
+					record.AckCode == proto.LeafMobilityPeerPlanAckCodeBusy:
+					summary.CrossedServerBusyFrames++
+				}
+			}
+			continue
+		}
+		summary.OtherActorFrames++
+	}
+	summary.CrossedServerTransactions = uint64(len(serverTransactions))
+	return summary
+}
+
+func (summary publicK5ControlSummary) valid() bool {
+	return summary.MobilityFrames > 0 && summary.MalformedFrames == 0 &&
+		summary.AgreementMismatches == 0 && summary.OtherActorFrames == 0 &&
+		summary.WinningPrepareFrames > 0 && summary.WinningPreparedFrames > 0 &&
+		summary.WinningCommitFrames > 0 && summary.WinningFinalFrames > 0 &&
+		summary.WinningCompleteFrames > 0 && summary.WinningReleasedFrames > 0 &&
+		summary.CrossedServerTransactions > 0 && summary.CrossedServerPrepareFrames > 0 &&
+		summary.CrossedServerBusyFrames > 0 && summary.CrossedPrepareBarrier
+}
+
+type publicK5ControlPath struct {
+	transport.PathConn
+	trace  *publicK5ControlTrace
+	writer publicK5ControlWriter
+}
+
+func (path *publicK5ControlPath) Write(frame []byte) (int, error) {
+	if err := path.trace.crossedPrepare.wait(path.writer, frame); err != nil {
+		return 0, err
+	}
+	n, err := path.PathConn.Write(frame)
+	if err == nil && n == len(frame) {
+		path.trace.record(path.writer, frame)
+	}
+	return n, err
+}
+
+type publicK5ControlFactory struct {
 	base   transport.PathFactory
-	once   sync.Once
-	pathCh chan *retainedPathConn
+	trace  *publicK5ControlTrace
+	writer publicK5ControlWriter
 }
 
-type publicK5ResponderListener struct {
-	base *Listener
-	mu   sync.Mutex
-	stop []func()
-}
-
-func newPublicK5ResponderListener(base *Listener) *publicK5ResponderListener {
-	return &publicK5ResponderListener{base: base}
-}
-
-func (listener *publicK5ResponderListener) AcceptPath(ctx context.Context) (transport.PathConn, error) {
-	path, err := listener.base.AcceptPath(ctx)
-	if err != nil {
-		return nil, err
-	}
-	source, ok := path.(leafmobility.RefreshSource)
-	if !ok {
-		_ = path.Close()
-		return nil, errors.New("gvisor public evidence: responder path has no mobility refresh source")
-	}
-	stop, err := source.SubscribeLeafMobilityRefresh(context.Background(), func(leafmobility.RefreshEvidence) {})
-	if err != nil {
-		_ = path.Close()
-		return nil, fmt.Errorf("gvisor public evidence: suppress responder initiator: %w", err)
-	}
-	listener.mu.Lock()
-	listener.stop = append(listener.stop, stop)
-	listener.mu.Unlock()
-	return path, nil
-}
-
-func (*publicK5ResponderListener) SessionKind() transport.PathSessionKind {
-	return transport.PathSessionAny
-}
-
-func (listener *publicK5ResponderListener) Addr() net.Addr {
-	return listener.base.Addr()
-}
-
-func (listener *publicK5ResponderListener) LeafMobilityImplementation() leafmobility.ImplementationEvidence {
-	return gvisorLinkImplementationEvidence(listener)
-}
-
-func (listener *publicK5ResponderListener) Close() error {
-	err := listener.base.Close()
-	listener.mu.Lock()
-	stops := append([]func(){}, listener.stop...)
-	listener.stop = nil
-	listener.mu.Unlock()
-	for _, stop := range stops {
-		stop()
-	}
-	return err
-}
-
-func newPublicK5ObservedFactory(base transport.PathFactory) *publicK5ObservedFactory {
-	return &publicK5ObservedFactory{base: base, pathCh: make(chan *retainedPathConn, 1)}
-}
-
-func (factory *publicK5ObservedFactory) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+func (factory *publicK5ControlFactory) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
 	path, err := factory.base.DialPath(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
-	retained, ok := path.(*retainedPathConn)
-	if !ok || retained.link == nil {
-		_ = path.Close()
-		return nil, fmt.Errorf("gvisor public evidence: path type %T is not an owned packet link", path)
-	}
-	factory.once.Do(func() { factory.pathCh <- retained })
-	return path, nil
+	return &publicK5ControlPath{PathConn: path, trace: factory.trace, writer: factory.writer}, nil
 }
 
-func (factory *publicK5ObservedFactory) Probe(ctx context.Context, spec transport.PathSpec) (transport.PathQuality, error) {
+func (factory *publicK5ControlFactory) Probe(ctx context.Context, spec transport.PathSpec) (transport.PathQuality, error) {
 	return factory.base.Probe(ctx, spec)
 }
 
-func (factory *publicK5ObservedFactory) LeafMobilityImplementation() leafmobility.ImplementationEvidence {
-	return gvisorLinkImplementationEvidence(factory)
+type publicK5ControlListener struct {
+	base   transport.PathListener
+	trace  *publicK5ControlTrace
+	writer publicK5ControlWriter
 }
 
-func (factory *publicK5ObservedFactory) path(t testing.TB, ctx context.Context) *retainedPathConn {
-	t.Helper()
-	select {
-	case path := <-factory.pathCh:
-		return path
-	case <-ctx.Done():
-		t.Fatalf("observe public Runtime gVisor path: %v", ctx.Err())
-		return nil
+func (listener *publicK5ControlListener) AcceptPath(ctx context.Context) (transport.PathConn, error) {
+	path, err := listener.base.AcceptPath(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return &publicK5ControlPath{PathConn: path, trace: listener.trace, writer: listener.writer}, nil
 }
+
+func (listener *publicK5ControlListener) SessionKind() transport.PathSessionKind {
+	return listener.base.SessionKind()
+}
+
+func (listener *publicK5ControlListener) Addr() net.Addr { return listener.base.Addr() }
+
+func (listener *publicK5ControlListener) Close() error { return listener.base.Close() }
 
 type publicK5AppConn struct {
 	net.Conn
@@ -872,6 +1258,58 @@ func publicK5WaitForCutoverProgress(
 	}
 }
 
+func publicK5WaitForCrossedInitiators(
+	t testing.TB,
+	ctx context.Context,
+	client, server rendr.Conn,
+) (rendr.MobilityStatus, rendr.MobilityStatus) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		clientMobility, clientOK := publicK5NamedMobility(client.Status(), "gvisor-data")
+		serverMobility, serverOK := publicK5NamedMobility(server.Status(), "gvisor-data")
+		clientReady := clientOK && publicK5CrossedMobilityActive(clientMobility)
+		serverReady := serverOK && publicK5CrossedMobilityActive(serverMobility)
+		if clientReady && serverReady {
+			if clientMobility.TransactionID == serverMobility.TransactionID {
+				t.Fatalf("crossed initiators reused transaction %x", clientMobility.TransactionID)
+			}
+			return clientMobility, serverMobility
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("wait for unsuppressed crossed gVisor initiators: client=%+v server=%+v err=%v",
+				clientMobility, serverMobility, ctx.Err())
+			return rendr.MobilityStatus{}, rendr.MobilityStatus{}
+		}
+	}
+}
+
+func publicK5CrossedMobilityActive(status rendr.MobilityStatus) bool {
+	if status.TransactionID == ([16]byte{}) || status.Reason != rendr.MobilityReasonLinkUnresponsive ||
+		status.Negotiated != rendr.MobilityGVisorPacketLinkRebind {
+		return false
+	}
+	switch status.State {
+	case rendr.MobilityStatePending, rendr.MobilityStateDeferred, rendr.MobilityStatePlanning,
+		rendr.MobilityStateNegotiating, rendr.MobilityStateExecuting:
+		return true
+	default:
+		return false
+	}
+}
+
+func publicK5NamedMobility(status rendr.Status, name string) (rendr.MobilityStatus, bool) {
+	for _, path := range status.Paths {
+		if path.Name == name {
+			return path.Mobility, true
+		}
+	}
+	return rendr.MobilityStatus{}, false
+}
+
 func publicK5WaitForMigration(t testing.TB, ctx context.Context, events <-chan publicK5MigrationEvent) publicK5MigrationEvent {
 	t.Helper()
 	select {
@@ -909,6 +1347,40 @@ func publicK5PathStatus(t testing.TB, status rendr.Status, pathID uint32) rendr.
 	}
 	t.Fatalf("public status has no path %d: %+v", pathID, status.Paths)
 	return rendr.PathStatus{}
+}
+
+func publicK5WaitForAttachedPaths(t testing.TB, ctx context.Context, conn rendr.Conn, names []string, within time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(within)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status := conn.Status()
+		attached := make(map[string]bool, len(status.Paths))
+		for _, path := range status.Paths {
+			if path.State == rendr.PathAttached && path.ID != 0 {
+				attached[path.Name] = true
+			}
+		}
+		complete := true
+		for _, name := range names {
+			if !attached[name] {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("public Runtime paths %v did not attach: status=%+v", names, status)
+		case <-ctx.Done():
+			t.Fatalf("public Runtime paths %v did not attach before context ended: status=%+v err=%v", names, status, ctx.Err())
+		}
+	}
 }
 
 func publicK5PathCounters(t testing.TB, paths []rendr.PathInfo, name string) publicK5PathCounter {
@@ -975,8 +1447,7 @@ func writePublicK5GVisorEvidence(t testing.TB, evidence publicK5GVisorEvidence) 
 	}
 }
 
-var _ transport.PathFactory = (*publicK5ObservedFactory)(nil)
-var _ leafmobility.ImplementationProvider = (*publicK5ObservedFactory)(nil)
-var _ transport.PathListener = (*publicK5ResponderListener)(nil)
-var _ leafmobility.ImplementationProvider = (*publicK5ResponderListener)(nil)
+var _ transport.PathFactory = (*publicK5ControlFactory)(nil)
+var _ transport.PathListener = (*publicK5ControlListener)(nil)
+var _ transport.PathConn = (*publicK5ControlPath)(nil)
 var _ net.Conn = (*publicK5AppConn)(nil)

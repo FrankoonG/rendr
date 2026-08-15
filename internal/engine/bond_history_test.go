@@ -29,7 +29,10 @@ type memoryPathConn struct {
 	dropWrites atomic.Bool
 	quality    transport.PathQuality
 	writes     atomic.Uint64
+	dataWrites atomic.Uint64
 	reads      atomic.Uint64
+	framesMu   sync.Mutex
+	frames     []proto.Header
 }
 
 func newMemoryPathPair() (*memoryPathConn, *memoryPathConn) {
@@ -101,6 +104,16 @@ func (p *memoryPathConn) Write(frame []byte) (int, error) {
 	case <-p.closed:
 		return 0, net.ErrClosed
 	default:
+	}
+	if len(frame) >= proto.HeaderSize {
+		if header, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil {
+			p.framesMu.Lock()
+			p.frames = append(p.frames, header)
+			p.framesMu.Unlock()
+			if header.Type == proto.FrameData {
+				p.dataWrites.Add(1)
+			}
+		}
 	}
 	if p.dropWrites.Load() {
 		p.writes.Add(1)
@@ -194,7 +207,14 @@ func waitPathDetached(t *testing.T, e *Engine, id uint32) {
 func (p *memoryPathConn) LocalAddr() string  { return "memory-local" }
 func (p *memoryPathConn) RemoteAddr() string { return "memory-remote" }
 func (p *memoryPathConn) Writes() uint64     { return p.writes.Load() }
-func (p *memoryPathConn) Reads() uint64      { return p.reads.Load() }
+func (p *memoryPathConn) DataWrites() uint64 { return p.dataWrites.Load() }
+
+func (p *memoryPathConn) FrameHeaders() []proto.Header {
+	p.framesMu.Lock()
+	defer p.framesMu.Unlock()
+	return append([]proto.Header(nil), p.frames...)
+}
+func (p *memoryPathConn) Reads() uint64 { return p.reads.Load() }
 
 type accelerationMemoryPath struct {
 	*memoryPathConn
@@ -211,7 +231,10 @@ func TestPathInfosProjectsDatagramAccelerationEvidence(t *testing.T) {
 		Mode: transport.DatagramAccelerationGSO, Cause: "probe_confirmed", ProbeGeneration: 9,
 		BatchCalls: 7, BatchDatagrams: 42, GSOAttempts: 11, GSOSuperPackets: 10, GSOSegments: 80,
 	}
-	info := pathInfos([]*pathSlot{{id: 3, conn: &accelerationMemoryPath{memoryPathConn: local, status: want}}}, 3)
+	info := pathInfos(
+		[]*pathSlot{{id: 3, conn: &accelerationMemoryPath{memoryPathConn: local, status: want}}},
+		3, DefaultLimits().ProbeInterval,
+	)
 	if len(info) != 1 || info[0].DatagramAcceleration != want {
 		t.Fatalf("acceleration projection=%+v want %+v", info, want)
 	}
@@ -223,39 +246,22 @@ func TestBondRedistributesDeadPathHistory(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
-
-	if err := client.ConfigureExecution(proto.ExecutionKindBond); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindBond, "path-1", "path-2")
 	c1, s1 := newMemoryPathPair()
 	c2, s2 := newMemoryPathPair()
 	c1.dropWrites.Store(true)
 
-	deadID, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"})
-	if err != nil {
-		t.Fatalf("attach client path 1: %v", err)
-	}
-	if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
-		t.Fatalf("attach server path 1: %v", err)
-	}
-	if _, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach client path 2: %v", err)
-	}
-	if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach server path 2: %v", err)
-	}
-
-	client.pathsMu.Lock()
-	client.bondCursor = ^uint64(0)
-	client.bondPinLeft = 0
-	client.pathsMu.Unlock()
+	deadID := attachFixturePath(t, client, c1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, server, s1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, client, c2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
+	attachFixturePath(t, server, s2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
 
 	payload := []byte("lost-on-dead-bond-path")
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
-	if c1.Writes() != 1 || c2.Writes() != 0 {
-		t.Fatalf("test did not route first frame to dropped path: c1=%d c2=%d", c1.Writes(), c2.Writes())
+	if c1.DataWrites() != 1 || c2.DataWrites() != 0 {
+		t.Fatalf("test did not route first DATA frame to dropped path: c1=%d c2=%d", c1.DataWrites(), c2.DataWrites())
 	}
 
 	failMemoryPath(t, client, deadID, c1, errors.New("path-1 transport failed"))
@@ -278,38 +284,21 @@ func TestBondRedistributionSkipsAckedHistory(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
-
-	if err := client.ConfigureExecution(proto.ExecutionKindBond); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindBond, "path-1", "path-2")
 	c1, s1 := newMemoryPathPair()
 	c2, s2 := newMemoryPathPair()
 
-	deadID, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"})
-	if err != nil {
-		t.Fatalf("attach client path 1: %v", err)
-	}
-	if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
-		t.Fatalf("attach server path 1: %v", err)
-	}
-	if _, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach client path 2: %v", err)
-	}
-	if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach server path 2: %v", err)
-	}
-
-	client.pathsMu.Lock()
-	client.bondCursor = ^uint64(0)
-	client.bondPinLeft = 0
-	client.pathsMu.Unlock()
+	deadID := attachFixturePath(t, client, c1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, server, s1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, client, c2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
+	attachFixturePath(t, server, s2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
 
 	payload := []byte("acked-bond-frame")
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
-	if c1.Writes() != 1 || c2.Writes() != 0 {
-		t.Fatalf("test did not route first frame to path 1: c1=%d c2=%d", c1.Writes(), c2.Writes())
+	if c1.DataWrites() != 1 || c2.DataWrites() != 0 {
+		t.Fatalf("test did not route first DATA frame to path 1: c1=%d c2=%d", c1.DataWrites(), c2.DataWrites())
 	}
 
 	if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -333,8 +322,8 @@ func TestBondRedistributionSkipsAckedHistory(t *testing.T) {
 
 	failMemoryPath(t, client, deadID, c1, errors.New("path-1 transport failed"))
 	time.Sleep(100 * time.Millisecond)
-	if got := c2.Writes(); got != 0 {
-		t.Fatalf("acked frame was redistributed to survivor: c2 writes=%d, want 0", got)
+	if got := c2.DataWrites(); got != 0 {
+		t.Fatalf("acked DATA frame was redistributed to survivor: c2 writes=%d, want 0", got)
 	}
 }
 
@@ -344,31 +333,23 @@ func TestSelectorRedistributesUnackedFrameOnPathDeath(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "path-1", "path-2")
 
 	c1, s1 := newMemoryPathPair()
 	c2, s2 := newMemoryPathPair()
 	c1.dropWrites.Store(true)
 
-	deadID, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"})
-	if err != nil {
-		t.Fatalf("attach client path 1: %v", err)
-	}
-	if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
-		t.Fatalf("attach server path 1: %v", err)
-	}
-	if _, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach client path 2: %v", err)
-	}
-	if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-		t.Fatalf("attach server path 2: %v", err)
-	}
+	deadID := attachFixturePath(t, client, c1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, server, s1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+	attachFixturePath(t, client, c2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
+	attachFixturePath(t, server, s2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
 
 	payload := []byte("lost-on-dead-selector-path")
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
-	if c1.Writes() != 1 || c2.Writes() != 0 {
-		t.Fatalf("test did not route first frame to dropped active path: c1=%d c2=%d", c1.Writes(), c2.Writes())
+	if c1.DataWrites() != 1 || c2.DataWrites() != 0 {
+		t.Fatalf("test did not route first DATA frame to dropped active path: c1=%d c2=%d", c1.DataWrites(), c2.DataWrites())
 	}
 
 	failMemoryPath(t, client, deadID, c1, errors.New("path-1 transport failed"))
@@ -404,38 +385,21 @@ func TestRemovePathReplaysUnackedFrame(t *testing.T) {
 			server := New(SideServer, flow, Limits{}.Clamp())
 			defer client.Close()
 			defer server.Close()
-			if err := client.ConfigureExecution(kind); err != nil {
-				t.Fatal(err)
-			}
+			targets := configureSymmetricLeafGroupRuntime(t, client, server, graphKindForExecutionFixture(t, kind), "path-1", "path-2")
 			c1, s1 := newMemoryPathPair()
 			c2, s2 := newMemoryPathPair()
 			c1.dropWrites.Store(true)
-			removedID, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
-				t.Fatal(err)
-			}
-			if kind == proto.ExecutionKindBond {
-				client.pathsMu.Lock()
-				client.bondCursor = ^uint64(0)
-				client.bondPinLeft = 0
-				client.pathsMu.Unlock()
-			}
+			removedID := attachFixturePath(t, client, c1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+			attachFixturePath(t, server, s1, transport.PathSpec{Transport: "memory", Address: "path-1"}, targets["path-1"])
+			attachFixturePath(t, client, c2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
+			attachFixturePath(t, server, s2, transport.PathSpec{Transport: "memory", Address: "path-2"}, targets["path-2"])
 
 			payload := []byte("unacked-before-clean-remove")
 			if _, err := client.SendData(payload); err != nil {
 				t.Fatal(err)
 			}
-			if c1.Writes() != 1 || c2.Writes() != 0 {
-				t.Fatalf("initial route writes: removed=%d survivor=%d", c1.Writes(), c2.Writes())
+			if c1.DataWrites() != 1 || c2.DataWrites() != 0 {
+				t.Fatalf("initial DATA route writes: removed=%d survivor=%d", c1.DataWrites(), c2.DataWrites())
 			}
 			if err := client.RemovePath(removedID); err != nil {
 				t.Fatal(err)
@@ -457,8 +421,31 @@ func TestRemovePathReplaysUnackedFrame(t *testing.T) {
 			if got := client.sendAckNext.Load(); got < 1 {
 				t.Fatalf("replayed frame was not acknowledged: sendAckNext=%d", got)
 			}
-			if got := c2.Writes(); got != 1 {
-				t.Fatalf("surviving path writes=%d, want one replay", got)
+			if got := c2.DataWrites(); got != 1 {
+				t.Fatalf("surviving path DATA writes=%d, want one replay", got)
+			}
+			deadline = time.Now().Add(time.Second)
+			dataIndex, retireIndex := -1, -1
+			for time.Now().Before(deadline) {
+				for index, header := range c2.FrameHeaders() {
+					if header.Type == proto.FrameData && dataIndex < 0 {
+						dataIndex = index
+					}
+					if header.Type == proto.FrameCtrl &&
+						proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlPathRetire && retireIndex < 0 {
+						retireIndex = index
+					}
+				}
+				if dataIndex >= 0 && retireIndex >= 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if dataIndex < 0 || retireIndex < 0 {
+				t.Fatalf("missing replay/retirement publication: data=%d retire=%d headers=%+v", dataIndex, retireIndex, c2.FrameHeaders())
+			}
+			if dataIndex >= retireIndex {
+				t.Fatalf("PATH_RETIRE overtook frozen DATA replay: data index=%d retire index=%d headers=%+v", dataIndex, retireIndex, c2.FrameHeaders())
 			}
 			if got := server.RecvDups(); got != 0 {
 				t.Fatalf("server duplicate frames=%d, want 0", got)
@@ -473,22 +460,32 @@ func TestExplicitMigrateReplaysUnackedFrames(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	clientTargets := configureLeafSelectorRuntime(t, client, "path-1", "path-2")
+	serverTargets := configureLeafSelectorRuntime(t, server, "path-1", "path-2")
 
 	c1, s1 := newMemoryPathPair()
 	c2, s2 := newMemoryPathPair()
 	c1.dropWrites.Store(true)
 
-	if _, err := client.AttachPath(c1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
+	if _, err := client.AttachPathBound(c1, transport.PathSpec{Transport: "memory", Address: "path-1"}, PathBinding{
+		LocalTXTargetID: clientTargets["path-1"], PeerTXTargetID: clientTargets["path-1"],
+	}); err != nil {
 		t.Fatalf("attach client path 1: %v", err)
 	}
-	if _, err := server.AttachPath(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}); err != nil {
+	if _, err := server.AttachPathBound(s1, transport.PathSpec{Transport: "memory", Address: "path-1"}, PathBinding{
+		LocalTXTargetID: serverTargets["path-1"], PeerTXTargetID: serverTargets["path-1"],
+	}); err != nil {
 		t.Fatalf("attach server path 1: %v", err)
 	}
-	targetID, err := client.AttachPath(c2, transport.PathSpec{Transport: "memory", Address: "path-2"})
+	_, err := client.AttachPathBound(c2, transport.PathSpec{Transport: "memory", Address: "path-2"}, PathBinding{
+		LocalTXTargetID: clientTargets["path-2"], PeerTXTargetID: clientTargets["path-2"],
+	})
 	if err != nil {
 		t.Fatalf("attach client path 2: %v", err)
 	}
-	if _, err := server.AttachPath(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}); err != nil {
+	if _, err := server.AttachPathBound(s2, transport.PathSpec{Transport: "memory", Address: "path-2"}, PathBinding{
+		LocalTXTargetID: serverTargets["path-2"], PeerTXTargetID: serverTargets["path-2"],
+	}); err != nil {
 		t.Fatalf("attach server path 2: %v", err)
 	}
 
@@ -496,8 +493,8 @@ func TestExplicitMigrateReplaysUnackedFrames(t *testing.T) {
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
-	if err := client.Migrate(targetID); err != nil {
-		t.Fatalf("Migrate: %v", err)
+	if err := client.SelectExplicitTarget(clientTargets["root"], clientTargets["path-2"], "explicit"); err != nil {
+		t.Fatalf("SelectExplicitTarget: %v", err)
 	}
 
 	if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {

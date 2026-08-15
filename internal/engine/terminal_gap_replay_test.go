@@ -41,6 +41,7 @@ func (p *terminalGapDropPath) Write(frame []byte) (int, error) {
 
 func attachTerminalGapTestPair(t *testing.T, client, server *Engine, dropSeq uint64, name string) (*terminalGapDropPath, *sequencerTestPath) {
 	t.Helper()
+	ids := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, name)
 	clientPath, serverPath := newSequencerTestPathPair()
 	dropPath := &terminalGapDropPath{
 		sequencerTestPath: clientPath,
@@ -48,12 +49,8 @@ func attachTerminalGapTestPair(t *testing.T, client, server *Engine, dropSeq uin
 		dropped:           make(chan struct{}),
 		replayed:          make(chan struct{}),
 	}
-	if _, err := client.AttachPath(dropPath, transport.PathSpec{Transport: "memory", Address: name}); err != nil {
-		t.Fatalf("attach client path: %v", err)
-	}
-	if _, err := server.AttachPath(serverPath, transport.PathSpec{Transport: "memory", Address: name}); err != nil {
-		t.Fatalf("attach server path: %v", err)
-	}
+	attachFixturePath(t, client, dropPath, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
 	return dropPath, serverPath
 }
 

@@ -296,6 +296,8 @@ func TestDialerCustomLimitsApplied(t *testing.T) {
 // support (commit 690fa60) integrates correctly through engine
 // packet mode.
 func TestM2QUICDatagramPacketRoundTrip(t *testing.T) {
+	t.Run("PeakTransfer payload budget", testPeakTransferQUICDatagramPayloadBudget)
+
 	ln, err := listenRuntimeQUICDatagram("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -930,7 +932,7 @@ func TestM1PlannedMigration(t *testing.T) {
 	if _, err := client.Write(want[:half]); err != nil {
 		t.Fatalf("write first half: %v", err)
 	}
-	if err := migrator.Migrate(otherID); err != nil {
+	if err := migrator.SelectTarget("root", pathNameByID(client.Paths(), otherID)); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := client.Write(want[half:]); err != nil {
@@ -1339,7 +1341,7 @@ func TestM1G1Sketch(t *testing.T) {
 				}
 			}
 			if other != 0 {
-				if err := migrator.Migrate(other); err != nil {
+				if err := migrator.SelectTarget("root", pathNameByID(client.Paths(), other)); err != nil {
 					t.Fatalf("migrate %d: %v", mi, err)
 				}
 				t.Logf("migrate %d at %d bytes -> path %d", mi, written, other)
@@ -1461,7 +1463,7 @@ func TestM1G2Sketch(t *testing.T) {
 					}
 				}
 				if other != 0 {
-					if err := migrator.Migrate(other); err == nil {
+					if err := migrator.SelectTarget("root", pathNameByID(client.Paths(), other)); err == nil {
 						migCount.Add(1)
 					}
 				}
@@ -1742,7 +1744,7 @@ func TestM8BondPathDeathContinuesOnSurvivor(t *testing.T) {
 // TestAdminConnStatsSnapshot: Stats() returns a coherent view of
 // flow id, mode, state, active path, the path list, and recv-queue
 // HWM in one call. Fields must be internally consistent (same
-// flow id everywhere, ActivePath in Paths if non-zero, Mode
+// flow id everywhere, ActivePath in Paths if non-zero, EffectivePaths
 // reflecting the executor selected by the root target).
 func TestAdminConnStatsSnapshot(t *testing.T) {
 	ln, err := listenRuntimeTCP("127.0.0.1:0")
@@ -1792,14 +1794,14 @@ func TestAdminConnStatsSnapshot(t *testing.T) {
 	if s.State != "active" {
 		t.Errorf("Stats.State: got %q want %q", s.State, "active")
 	}
-	if s.Mode != ModeSelector {
-		t.Errorf("Stats.Mode: got %v want %v", s.Mode, ModeSelector)
-	}
 	if s.ActivePath == 0 {
 		t.Error("Stats.ActivePath should be non-zero after dial")
 	}
 	if len(s.Paths) < 2 {
 		t.Errorf("Stats.Paths: got %d want >=2", len(s.Paths))
+	}
+	if len(s.EffectivePaths) != 1 || s.EffectivePaths[0] != s.ActivePath {
+		t.Errorf("Stats.EffectivePaths=%v ActivePath=%d, want one selector leaf", s.EffectivePaths, s.ActivePath)
 	}
 	// ActivePath must appear in Paths.
 	found := false
@@ -2307,7 +2309,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 			break
 		}
 	}
-	if err := adm.Migrate(next); err != nil {
+	if err := adm.SelectTarget("root", pathNameByID(client.Paths(), next)); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	select {
@@ -2352,7 +2354,7 @@ func TestAdminConnOnMigrate(t *testing.T) {
 	if third == 0 {
 		t.Skip("only one path remains; cannot test cancel branch")
 	}
-	if err := adm.Migrate(third); err != nil {
+	if err := adm.SelectTarget("root", pathNameByID(client.Paths(), third)); err != nil {
 		t.Fatalf("Migrate post-cancel: %v", err)
 	}
 	select {
@@ -2437,7 +2439,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 	if other == 0 {
 		t.Fatal("no other path to migrate to")
 	}
-	if err := adm.Migrate(other); err != nil {
+	if err := adm.SelectTarget("root", pathNameByID(client.Paths(), other)); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	if got := adm.MigrationCount(); got != 1 {
@@ -2453,7 +2455,7 @@ func TestAdminConnMigrationCount(t *testing.T) {
 	}
 
 	// Migrate to the same path is a no-op and must NOT increment.
-	if err := adm.Migrate(other); err != nil {
+	if err := adm.SelectTarget("root", pathNameByID(client.Paths(), other)); err != nil {
 		t.Fatalf("Migrate same: %v", err)
 	}
 	if got := adm.MigrationCount(); got != 1 {
@@ -3083,7 +3085,7 @@ func TestM5UDPFlowPlannedMigration(t *testing.T) {
 	if _, err := client.Write(want[:half]); err != nil {
 		t.Fatalf("write first half: %v", err)
 	}
-	if err := migrator.Migrate(other); err != nil {
+	if err := migrator.SelectTarget("root", pathNameByID(client.Paths(), other)); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := client.Write(want[half:]); err != nil {
@@ -3410,7 +3412,7 @@ func TestM5PacketRejectOversize(t *testing.T) {
 }
 
 // TestM5PacketSurvivesPlannedMigration: packet mode preserves
-// boundaries and zero-loss delivery through an explicit Migrate()
+// boundaries and zero-loss delivery through an explicit target selection
 // between two attached udpflow paths. Packet transports are not
 // required to deliver in strict send order; the contract here is
 // that every application packet arrives exactly once.
@@ -3485,7 +3487,7 @@ func TestM5PacketSurvivesPlannedMigration(t *testing.T) {
 	if other == 0 {
 		t.Fatal("no other path to migrate to")
 	}
-	if err := bc.e.Migrate(other); err != nil {
+	if err := bc.SelectTarget("root", pathNameByID(bc.Paths(), other)); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -3625,7 +3627,7 @@ func TestM5PacketStreamUnderMigration(t *testing.T) {
 						}
 					}
 					if other != 0 {
-						_ = bc.e.Migrate(other)
+						_ = bc.SelectTarget("root", pathNameByID(bc.Paths(), other))
 					}
 				}
 			}
@@ -4040,7 +4042,7 @@ func TestM2G1SketchQUIC(t *testing.T) {
 				}
 			}
 			if other != 0 {
-				if err := migrator.Migrate(other); err != nil {
+				if err := migrator.SelectTarget("root", pathNameByID(client.Paths(), other)); err != nil {
 					t.Fatalf("migrate %d: %v", mi, err)
 				}
 				t.Logf("quic-migrate %d at %d bytes -> path %d", mi, written, other)
@@ -4203,7 +4205,7 @@ func TestM2MixedTCPQUICMigration(t *testing.T) {
 	if _, err := client.Write(want[:half]); err != nil {
 		t.Fatalf("write tcp half: %v", err)
 	}
-	if err := admin.Migrate(quicPath); err != nil {
+	if err := admin.SelectTarget("root", pathNameByID(client.Paths(), quicPath)); err != nil {
 		t.Fatalf("migrate to quic path: %v", err)
 	}
 	if _, err := client.Write(want[half:]); err != nil {
@@ -4294,7 +4296,7 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		t.Fatalf("missing mixed paths: tcp=%d quic=%d paths=%+v", tcpPath, quicPath, client.Paths())
 	}
 	if admin.ActivePath() != tcpPath {
-		if err := admin.Migrate(tcpPath); err != nil {
+		if err := admin.SelectTarget("root", pathNameByID(client.Paths(), tcpPath)); err != nil {
 			t.Fatalf("selector tcp path: %v", err)
 		}
 	}

@@ -13,16 +13,35 @@
 //	  VER 2 bits, current value 3
 //	  T   1 bit, 0=DATA 1=CTRL
 //	  F   1 bit, last-frame-of-message (reliable streams only)
-//	  FLAGS 12 bits, mode-dependent; for CTRL frames the low 8 bits are
-//	                 the control code (see Ctrl* constants).
+//	  FLAGS 12 bits, frame-type-dependent. For CTRL frames the low 8 bits
+//	                 are the control code (see Ctrl* constants). For DATA
+//	                 under a PeakTransfer selector root, bits 0..9 are the
+//	                 one-based immediate-child ordinal and bit 10 says the
+//	                 selected child was effective at publication. Bit 11 says
+//	                 the sender had sustained unacknowledged application demand.
+//	                 DATA under every other root requires FLAGS=0.
 //	  SEQ 48 bits, big-endian, monotonically increasing per-Conn,
 //	               spanning both DATA and CTRL frames.
+//
+// Protocol minor 17 prefixes DATA under a PeakTransfer selector root with the
+// sender's non-zero 8-byte selector generation. The receiver strips this prefix
+// before application delivery, so stream bytes and packet boundaries are
+// unchanged. Self-description preserves packet out-of-order delivery without a
+// separate control-frame ordering dependency.
+//
+// Protocol minor 18 permits byte-exact policy transaction frames to enter a
+// bounded control FIFO when received, before a lower DATA gap closes. The
+// cumulative ACK proof and stream application-delivery frontier remain ordered
+// by SEQ; packet sessions retain their documented out-of-order delivery.
+//
+// Protocol minor 19 binds every FINAL policy acknowledgement to a fresh,
+// requester-generated challenge first disclosed by the matching COMMIT.
 //
 // Wire framing on a TCP byte-stream path prepends a 2-byte big-endian
 // length to each frame. QUIC paths use one frame per STREAM/DATAGRAM
 // and need no length prefix. The length prefix is the transport
 // adapter's responsibility, not part of the Frame.
 //
-// Any change to bytes on the wire MUST bump Version. See CLAUDE.md
-// hard rule #7.
+// Reassigning existing fields requires a mandatory protocol-minor feature;
+// changing the frame envelope bytes requires bumping Version.
 package proto

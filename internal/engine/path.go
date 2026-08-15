@@ -32,6 +32,7 @@ type pathDeparture struct {
 	err             error
 	explicitRemoval bool
 	shouldReplay    bool
+	replayCommitted bool
 	migrated        bool
 	zombieTrip      zombieTripTicket
 	newActive       uint32
@@ -224,11 +225,8 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 		restored.maintenance.Store(false)
 		restored.unfenceDispatch()
 		e.paths[restored.id] = restored
-		if e.dispatchScope[slot.id] {
-			delete(e.dispatchScope, slot.id)
-			e.dispatchScope[restored.id] = true
-		}
 	}
+	e.advancePathTopologyEpochLocked()
 	if restored == nil || !e.transferPathAdmissionLocked(slot.id, restored.id) {
 		e.releasePathAdmissionLocked(slot.id)
 	}
@@ -240,22 +238,11 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 			e.activeID = restored.id
 			migratedOk = true
 		} else if runtime != nil {
-			kind, active, scope, projectErr := e.projectRecursiveDispatchLocked(runtime)
-			if projectErr == nil {
-				e.activeID = active
-				e.dispatchScope = make(map[uint32]bool, len(scope))
-				for _, pathID := range scope {
-					e.dispatchScope[pathID] = true
-				}
-				if mode, valid := dispatchForExecutionKind(kind); valid {
-					e.mode.Store(mode)
-				}
-			} else {
-				e.activeID = 0
-				e.dispatchScope = nil
-			}
+			e.activeID = e.projectRecursiveRepresentativeLocked(runtime)
 		} else {
-			e.activeID = e.pickAnyActive()
+			// Path publication requires a frozen execution runtime. Keep this
+			// defensive branch fail closed if that invariant is ever violated.
+			e.activeID = 0
 		}
 		newActive = e.activeID
 		if e.activeID == 0 {
@@ -298,8 +285,7 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 			// owns the frozen replay prefix; only a failed transaction falls back
 			// to the generic replay worker.
 			selector := &selector{}
-			now := nowFn()
-			decisions := selector.recursiveDecisions(e, runtime, now)
+			decisions, now := selector.recursiveDecisions(e, runtime)
 			for _, decision := range decisions {
 				if decision.origin == policySelectionPathDeath {
 					selectorReplayScheduled = true
@@ -307,18 +293,21 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 				}
 			}
 			if selectorReplayScheduled {
+				replayCommitted := departure.replayCommitted
 				go func() {
-					if !selector.applyRecursiveDecisions(e, runtime, decisions, now) {
+					if !selector.applyRecursiveDecisionsWithReplay(e, runtime, decisions, now, !replayCommitted) && !replayCommitted {
 						e.requestReplay(e.sendAckNext.Load())
 					}
 				}()
 			}
 		}
 	}
-	if departure.explicitRemoval {
+	if departure.explicitRemoval && departure.hasPaths && !departure.replayCommitted {
 		// A local administrative removal is clean for lifecycle policy, but it
 		// is not proof that every frame accepted by this carrier was ACKed.
-		// Replay from the cumulative ACK head on the surviving route.
+		// RemovePath normally commits that frozen prefix before returning. A
+		// failed synchronous publication, or a lower-level administrative
+		// departure that did not own sendMu, falls back to the replay worker.
 		e.requestReplay(e.sendAckNext.Load())
 	}
 
@@ -350,7 +339,7 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 			e.requestClose()
 		}
 	case transport.CauseTransportError, transport.CauseUnknown:
-		if departure.shouldReplay && !selectorReplayScheduled {
+		if departure.shouldReplay && departure.hasPaths && !selectorReplayScheduled {
 			e.requestReplay(e.sendAckNext.Load())
 		}
 		// Accounting committed with the replacement topology. Only the
@@ -441,48 +430,6 @@ func (e *Engine) tripZombie(ticket zombieTripTicket) bool {
 	e.zombieMu.Unlock()
 	go func() { _ = e.Close() }()
 	return true
-}
-
-// pickAnyActive returns any remaining path id, or 0 if none.
-// Caller must hold pathsMu.
-func (e *Engine) pickAnyActive() uint32 {
-	if id := e.pickAnyActiveFromScopeLocked(nil); id != 0 {
-		return id
-	}
-	// If the selected policy group is exhausted but other paths remain,
-	// clear only the effective flat scope and fall back immediately. The
-	// graph-level desired selection remains in policySelections for recovery;
-	// death failover must never spin behind dwell or policy cooldown.
-	if len(e.dispatchScope) != 0 {
-		e.dispatchScope = nil
-	}
-	for id := range e.paths {
-		return id
-	}
-	return 0
-}
-
-func (e *Engine) pickAnyActiveFromScopeLocked(scope []uint32) uint32 {
-	if len(scope) > 0 {
-		for _, id := range scope {
-			if _, ok := e.paths[id]; ok {
-				return id
-			}
-		}
-		return 0
-	}
-	if len(e.dispatchScope) > 0 {
-		for id := range e.dispatchScope {
-			if _, ok := e.paths[id]; ok {
-				return id
-			}
-		}
-		return 0
-	}
-	for id := range e.paths {
-		return id
-	}
-	return 0
 }
 
 // startMigrationBudget runs as a goroutine after the last path died.

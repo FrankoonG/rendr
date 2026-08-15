@@ -687,6 +687,7 @@ func (l *SessionListener) handleRuntimeHello(
 	if err := e.MirrorPeerGraphForLocal(); err != nil {
 		return false
 	}
+	installPeakTransferPeerAdmission(e)
 	e.SetLocalInstanceID(l.runtime.instanceID)
 	e.SetPeerKind(engine.PeerRendr)
 	if err := e.SetPeerInstanceID(hello.InstanceID); err != nil {
@@ -717,11 +718,10 @@ func (l *SessionListener) handleRuntimeHello(
 		l.runtime.bridges.RemoveActive(reservation, e)
 	}()
 
-	mode := modeFromManifest(hello.LocalTXManifest)
 	laddr := addrFromString(pc.LocalAddr())
 	raddr := addrFromString(pc.RemoteAddr())
 	if packetMode {
-		base := newEnginePacketConn(e, mode, laddr, raddr)
+		base := newEnginePacketConn(e, laddr, raddr)
 		base.localStatus = l.runtime.LocalStatus
 		base.carriers = l.carriers
 		conn := &acceptedPacketConn{
@@ -741,7 +741,7 @@ func (l *SessionListener) handleRuntimeHello(
 		}
 		return true
 	}
-	base := newEngineBackedConn(e, &engine.Conn{E: e, LAddr: laddr, RAddr: raddr}, mode)
+	base := newEngineBackedConn(e, &engine.Conn{E: e, LAddr: laddr, RAddr: raddr})
 	base.localStatus = l.runtime.LocalStatus
 	base.carriers = l.carriers
 	conn := &acceptedStreamConn{
@@ -855,21 +855,6 @@ func (l *SessionListener) sourceAllowsSession(sourceName string, packetMode bool
 		return packetMode
 	default:
 		return false
-	}
-}
-
-func modeFromManifest(manifest proto.GraphManifest) Mode {
-	root, ok := manifest.Node(manifest.RootID)
-	if !ok {
-		return ModeSelector
-	}
-	switch root.Kind {
-	case proto.GraphNodeKindBond:
-		return ModeBond
-	case proto.GraphNodeKindRace:
-		return ModeRace
-	default:
-		return ModeSelector
 	}
 }
 

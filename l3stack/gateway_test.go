@@ -144,16 +144,18 @@ func testGatewayTCPFlow(
 		t.Fatal(err)
 	}
 	var next uint32
+	var nextName string
 	for _, path := range admin.Paths() {
 		if path.ID != admin.ActivePath() {
 			next = path.ID
+			nextName = path.Spec.Opts["name"]
 			break
 		}
 	}
 	if next == 0 {
 		t.Fatalf("no inactive TCP path: %+v", admin.Paths())
 	}
-	if err := admin.Migrate(next); err != nil {
+	if err := admin.SelectTarget("root", nextName); err != nil {
 		t.Fatalf("migrate TUN TCP flow: %v", err)
 	}
 	if _, err := client.Write(request[split:]); err != nil {
@@ -841,16 +843,18 @@ func testGatewayUDPFlow(t *testing.T, id l3ingress.L3Identity) {
 
 	admin := waitGatewayPacketControl(t, gateway, id, 2)
 	var next uint32
+	var nextName string
 	for _, path := range admin.Paths() {
 		if path.ID != admin.ActivePath() {
 			next = path.ID
+			nextName = path.Spec.Opts["name"]
 			break
 		}
 	}
 	if next == 0 {
 		t.Fatalf("no inactive UDP path: %+v", admin.Paths())
 	}
-	if err := admin.Migrate(next); err != nil {
+	if err := admin.SelectTarget("root", nextName); err != nil {
 		t.Fatalf("migrate TUN UDP flow: %v", err)
 	}
 	second := []byte("query-after-migration")

@@ -203,8 +203,10 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, sourceSlot *pathSlot, c
 		return
 	}
 	var policyHold *leafMobilityPolicyHold
-	if initial.Reason == leafmobility.RefreshReasonRouteSourceChanged && initial.SourceUsable {
-		policyHold = e.acquireSelectedLeafMobilityPolicyHold(sourceSlot)
+	if leafMobilityRefreshRequiresPolicyHold(initial.Reason) && initial.SourceUsable {
+		policyHold = e.acquireSelectedLeafMobilityPolicyHold(
+			sourceSlot, leafMobilityRefreshIsLeafFault(initial.Reason),
+		)
 	}
 	accepted := false
 	defer func() {
@@ -281,6 +283,36 @@ func (e *Engine) enqueueLeafMobilityRefresh(ref PathRef, sourceSlot *pathSlot, c
 	default:
 	}
 	e.signalLeafMobilityRetry()
+}
+
+func leafMobilityRefreshRequiresPolicyHold(reason leafmobility.RefreshReason) bool {
+	switch reason {
+	case leafmobility.RefreshReasonRouteSourceChanged,
+		leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonOuterMTUFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+func leafMobilityRefreshIsLeafFault(reason leafmobility.RefreshReason) bool {
+	switch reason {
+	case leafmobility.RefreshReasonLinkUnresponsive,
+		leafmobility.RefreshReasonLocalReadFailure,
+		leafmobility.RefreshReasonLocalWriteFailure,
+		leafmobility.RefreshReasonReplayStalled,
+		leafmobility.RefreshReasonReplayFailure,
+		leafmobility.RefreshReasonLivenessProbeFailure:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *Engine) leafMobilityInitiatorLoop() {
@@ -632,6 +664,7 @@ func (e *Engine) syncPathMobilityFactsLocked(slot *pathSlot, claim *leafmobility
 	if changed {
 		slot.probeEndpointGen.Store(facts.Generation)
 		e.invalidatePathProbeEvidence(slot)
+		e.advancePathTopologyEpochLocked()
 	}
 }
 

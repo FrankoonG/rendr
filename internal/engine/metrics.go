@@ -43,6 +43,7 @@ type stabilityEvidence struct {
 	failures             uint64
 	migrationFailures    uint64
 	loss                 uint64
+	lossKnown            bool
 	reorder              uint64
 	unexpectedDuplicates uint64
 	sampleTime           time.Time
@@ -307,8 +308,14 @@ func aggregateRaceStability(children []aggregateChildEvidence) stabilityEvidence
 	var out stabilityEvidence
 	var meta aggregateMeta
 	set := false
+	lossKnown := true
+	hasEligible := false
 	for i := range children {
 		child := children[i]
+		if child.eligible && child.evidence.live {
+			hasEligible = true
+			lossKnown = lossKnown && child.evidence.stability.lossKnown
+		}
 		value := child.evidence.stability
 		if !child.eligible || value.state != state || !value.observed() {
 			continue
@@ -334,6 +341,7 @@ func aggregateRaceStability(children []aggregateChildEvidence) stabilityEvidence
 		return stabilityEvidence{}
 	}
 	out.state = state
+	out.lossKnown = hasEligible && lossKnown
 	out.confidence = meta.confidence
 	out.sampleTime = meta.sampleTime
 	out.sampleCount = meta.sampleCount
@@ -364,6 +372,7 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 	var meta aggregateMeta
 	state := qualityStateFresh
 	set := false
+	lossKnown := true
 	for i := range children {
 		child := children[i]
 		if !child.eligible {
@@ -373,6 +382,7 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 		if !value.observed() {
 			return stabilityEvidence{}
 		}
+		lossKnown = lossKnown && value.lossKnown
 		if value.state == qualityStateStale {
 			state = qualityStateStale
 		}
@@ -389,6 +399,7 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 		return stabilityEvidence{}
 	}
 	out.state = state
+	out.lossKnown = lossKnown
 	out.confidence = meta.confidence
 	out.sampleTime = meta.sampleTime
 	out.sampleCount = meta.sampleCount

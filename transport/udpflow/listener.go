@@ -27,6 +27,8 @@ const (
 	readRetryMaxBackoff     = 100 * time.Millisecond
 )
 
+var _ transport.PathQualityReader = (*ServerPathConn)(nil)
+
 // ErrListenerRead identifies a terminal failure of the listener's shared
 // PacketConn receive path. Accept returns an error wrapping this sentinel and
 // the underlying read error.
@@ -439,6 +441,13 @@ func (p *ServerPathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
+}
+
+func (p *ServerPathConn) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.PathQuality{}, err
+	}
+	return p.Quality(), nil
 }
 
 func (p *ServerPathConn) SetQuality(q transport.PathQuality) {

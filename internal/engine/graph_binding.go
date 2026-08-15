@@ -21,10 +21,91 @@ type PathBinding struct {
 // graphBinding identifies one direction's immutable sender graph. A session
 // has two bindings because each peer owns its own transmit policy graph.
 type graphBinding struct {
-	revision   uint64
-	digest     proto.GraphDigest
-	manifest   proto.GraphManifest
-	configured bool
+	revision                  uint64
+	digest                    proto.GraphDigest
+	manifest                  proto.GraphManifest
+	rootSelectorID            proto.TargetID
+	rootTracksLocalDelivery   bool
+	rootTracksWireAttribution bool
+	rootOrdinals              map[proto.TargetID]uint16
+	rootTargets               []proto.TargetID
+	rootLeafOwners            map[proto.TargetID]proto.TargetID
+	names                     map[proto.TargetID]string
+	leaves                    map[proto.TargetID]struct{}
+	kinds                     map[proto.TargetID]proto.GraphNodeKind
+	parents                   map[proto.TargetID]proto.TargetID
+	ancestors                 map[proto.TargetID][]proto.TargetID
+	configured                bool
+}
+
+func newGraphBinding(revision uint64, digest proto.GraphDigest, manifest proto.GraphManifest) graphBinding {
+	binding := graphBinding{
+		revision: revision, digest: digest, manifest: manifest,
+		names:   make(map[proto.TargetID]string),
+		leaves:  make(map[proto.TargetID]struct{}),
+		kinds:   make(map[proto.TargetID]proto.GraphNodeKind),
+		parents: make(map[proto.TargetID]proto.TargetID), configured: true,
+	}
+	for _, node := range manifest.Nodes {
+		binding.names[node.ID] = node.Name
+		binding.kinds[node.ID] = node.Kind
+		if node.Kind == proto.GraphNodeKindPath {
+			binding.leaves[node.ID] = struct{}{}
+		}
+		for _, childID := range node.Children {
+			binding.parents[childID] = node.ID
+		}
+	}
+	binding.ancestors = make(map[proto.TargetID][]proto.TargetID, len(manifest.Nodes))
+	for _, node := range manifest.Nodes {
+		chain := make([]proto.TargetID, 0, proto.GraphManifestMaxDepth)
+		current := node.ID
+		for len(chain) <= proto.GraphManifestMaxDepth {
+			chain = append(chain, current)
+			if current == manifest.RootID {
+				binding.ancestors[node.ID] = chain
+				break
+			}
+			parent, exists := binding.parents[current]
+			if !exists {
+				break
+			}
+			current = parent
+		}
+	}
+	root, ok := manifest.Node(manifest.RootID)
+	if !ok || root.Kind != proto.GraphNodeKindSelector {
+		return binding
+	}
+	binding.rootSelectorID = root.ID
+	binding.rootTracksLocalDelivery = true
+	binding.rootTracksWireAttribution = proto.RootTracksDataAttribution(manifest)
+	binding.rootTargets = append([]proto.TargetID(nil), root.Children...)
+	binding.rootLeafOwners = make(map[proto.TargetID]proto.TargetID)
+	if binding.rootTracksWireAttribution {
+		binding.rootOrdinals = make(map[proto.TargetID]uint16, len(root.Children))
+	}
+	for index, childID := range root.Children {
+		if binding.rootTracksWireAttribution {
+			binding.rootOrdinals[childID] = uint16(index + 1)
+		}
+		binding.collectRootLeafOwners(childID, childID)
+	}
+	return binding
+}
+
+func (b *graphBinding) collectRootLeafOwners(id, owner proto.TargetID) {
+	node, ok := b.manifest.Node(id)
+	if !ok {
+		return
+	}
+	if node.Kind == proto.GraphNodeKindPath {
+		b.rootLeafOwners[id] = owner
+		return
+	}
+	for _, childID := range node.Children {
+		b.collectRootLeafOwners(childID, owner)
+	}
 }
 
 func (e *Engine) localGraphBinding() graphBinding {
@@ -41,11 +122,116 @@ func (e *Engine) localExecutionRuntime() *executionRuntime {
 	return runtime
 }
 
+func (e *Engine) requireLocalExecutionRuntime() (*executionRuntime, error) {
+	runtime := e.localExecutionRuntime()
+	if runtime == nil {
+		return nil, errExecutionRuntimeNotConfigured
+	}
+	return runtime, nil
+}
+
 func (e *Engine) peerGraphBinding() graphBinding {
 	e.graphMu.RLock()
 	binding := e.peerGraph
 	e.graphMu.RUnlock()
 	return binding
+}
+
+func (b graphBinding) dataFlagsForRootTarget(targetID proto.TargetID, committed, demand bool) (uint16, error) {
+	if !b.configured {
+		return 0, fmt.Errorf("engine: graph is not configured")
+	}
+	if !b.rootTracksWireAttribution {
+		if targetID != (proto.TargetID{}) || committed || demand {
+			return 0, fmt.Errorf("engine: untracked root has DATA target attribution")
+		}
+		return 0, nil
+	}
+	flags, ok := b.rootOrdinals[targetID]
+	if !ok || flags == 0 {
+		return 0, fmt.Errorf("engine: DATA target is not a root selector child")
+	}
+	return proto.DataFlagsForRootOrdinal(flags, committed, demand)
+}
+
+func (b graphBinding) rootTargetFromDataFlags(flags uint16) (proto.TargetID, bool, bool, error) {
+	if !b.configured {
+		return proto.TargetID{}, false, false, fmt.Errorf("engine: graph is not configured")
+	}
+	if !b.rootTracksWireAttribution {
+		if flags != 0 {
+			return proto.TargetID{}, false, false, fmt.Errorf("engine: untracked root has non-zero DATA flags")
+		}
+		return proto.TargetID{}, false, false, nil
+	}
+	ordinal, committed, demand, err := proto.RootOrdinalFromDataFlags(flags)
+	if err != nil || int(ordinal) > len(b.rootTargets) {
+		return proto.TargetID{}, false, false, fmt.Errorf("engine: DATA root selector ordinal is invalid")
+	}
+	return b.rootTargets[int(ordinal)-1], committed, demand, nil
+}
+
+func (b graphBinding) rootTargetForLeaf(leafID proto.TargetID) (proto.TargetID, bool) {
+	if !b.rootTracksLocalDelivery {
+		return proto.TargetID{}, false
+	}
+	targetID, ok := b.rootLeafOwners[leafID]
+	return targetID, ok
+}
+
+func (b graphBinding) targetName(targetID proto.TargetID) (string, bool) {
+	if !b.configured || targetID == (proto.TargetID{}) {
+		return "", false
+	}
+	name, ok := b.names[targetID]
+	return name, ok && name != ""
+}
+
+func (b graphBinding) containsLeaf(leafID proto.TargetID) bool {
+	if !b.configured || leafID == (proto.TargetID{}) {
+		return false
+	}
+	_, ok := b.leaves[leafID]
+	return ok
+}
+
+func (b graphBinding) containsTarget(targetID proto.TargetID) bool {
+	if !b.configured || targetID == (proto.TargetID{}) {
+		return false
+	}
+	_, ok := b.kinds[targetID]
+	return ok
+}
+
+func (b graphBinding) targetKind(targetID proto.TargetID) (proto.GraphNodeKind, bool) {
+	kind, ok := b.kinds[targetID]
+	return kind, ok
+}
+
+// targetAncestors returns target followed by its parents through the root.
+// Graph validation guarantees one parent per non-root node and bounded depth.
+func (b graphBinding) targetAncestors(targetID proto.TargetID) ([]proto.TargetID, bool) {
+	ancestors, ok := b.ancestors[targetID]
+	return ancestors, ok
+}
+
+func (b graphBinding) commonTargetAncestor(left, right proto.TargetID) (proto.TargetID, bool) {
+	leftAncestors, ok := b.targetAncestors(left)
+	if !ok {
+		return proto.TargetID{}, false
+	}
+	rightAncestors, ok := b.targetAncestors(right)
+	if !ok {
+		return proto.TargetID{}, false
+	}
+	for _, targetID := range rightAncestors {
+		for _, candidate := range leftAncestors {
+			if candidate == targetID {
+				return targetID, true
+			}
+		}
+	}
+	return proto.TargetID{}, false
 }
 
 // ConfigureLocalMobilityCapabilities freezes driver-backed session families
@@ -125,7 +311,7 @@ func (e *Engine) ConfigureLocalGraph(revision uint64, manifest proto.GraphManife
 		}
 		return fmt.Errorf("engine: local graph is already configured")
 	}
-	binding := graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
+	binding := newGraphBinding(revision, digest, owned)
 	negotiation := proto.NewNegotiation(proto.SessionEpoch(e.FlowID()))
 	negotiation.GraphRevision = revision
 	negotiation.GraphDigest = digest
@@ -281,7 +467,7 @@ func (e *Engine) configurePeerGraph(revision uint64, manifest proto.GraphManifes
 		}
 		return fmt.Errorf("engine: peer graph is already configured")
 	}
-	e.peerGraph = graphBinding{revision: revision, digest: digest, manifest: owned, configured: true}
+	e.peerGraph = newGraphBinding(revision, digest, owned)
 	e.graphMu.Unlock()
 	e.recvProof = proto.InitialAckProof(proto.SessionEpoch(e.FlowID()), peerSenderDirection(e.side), revision, digest)
 	return nil
@@ -324,6 +510,19 @@ func (e *Engine) PeerGraphManifest() proto.GraphManifest {
 		return proto.GraphManifest{}
 	}
 	return manifest
+}
+
+// PathTargetBindings returns the immutable logical target identities currently
+// bound to one physical path. It is an observation API for direction-aware
+// policy controllers; routing remains owned by the recursive executor.
+func (e *Engine) PathTargetBindings(pathID uint32) (localTX, peerTX proto.TargetID, ok bool) {
+	e.pathsMu.RLock()
+	slot := e.paths[pathID]
+	if slot != nil {
+		localTX, peerTX, ok = slot.localTXTargetID, slot.peerTXTargetID, true
+	}
+	e.pathsMu.RUnlock()
+	return localTX, peerTX, ok
 }
 
 func (e *Engine) LocalPathTargetID(name string) (proto.TargetID, error) {

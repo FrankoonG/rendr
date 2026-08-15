@@ -59,6 +59,9 @@ func (r *Runtime) releaseListener(listener *SessionListener) {
 }
 
 // SessionConfig describes one stream or packet session. Root is mandatory.
+// Its normalized depth-first leaf order is the initial dial preference: Dial
+// falls through definitive failures until one leaf establishes the session,
+// then attaches remaining leaves through session-owned background recovery.
 // No field selects a mobility implementation; leaf planning remains owned by
 // rendr and negotiated with the peer.
 type SessionConfig struct {
@@ -233,6 +236,9 @@ func (r *Runtime) Config() RuntimeConfig {
 	return r.config
 }
 
+// Dial establishes a stream session from the first usable leaf in Root's
+// normalized depth-first order. Once established, optional leaf attachment no
+// longer consumes ctx or delays the returned Conn.
 func (r *Runtime) Dial(ctx context.Context, config SessionConfig) (Conn, error) {
 	dialer, err := r.sessionDialer(config)
 	if err != nil {
@@ -241,6 +247,8 @@ func (r *Runtime) Dial(ctx context.Context, config SessionConfig) (Conn, error) 
 	return dialer.Dial(ctx)
 }
 
+// DialPacket is the packet-session analogue of Dial and uses the same ordered
+// initial fallback and background optional-attachment contract.
 func (r *Runtime) DialPacket(ctx context.Context, config SessionConfig) (PacketConn, error) {
 	dialer, err := r.sessionDialer(config)
 	if err != nil {

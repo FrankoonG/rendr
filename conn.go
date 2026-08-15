@@ -45,11 +45,16 @@ type PacketConn interface {
 	Status() Status
 }
 
-// MigrationController is the optional explicit migration surface shared by
-// stream and packet sessions. Normal applications do not need this interface;
-// rendr's scheduler and recovery planner migrate automatically.
+// MigrationController is the optional explicit selector-control surface shared
+// by stream and packet sessions. Normal applications do not need this
+// interface; rendr's scheduler and recovery planner select targets
+// automatically.
 type MigrationController interface {
-	Migrate(pathID uint32) error
+	// SelectTarget selects one immediate child of the named selector. Both
+	// arguments are logical target names from the session's frozen Target graph;
+	// they are never physical path IDs. targetName may name a Path, Bond, Race,
+	// or nested Selector target.
+	SelectTarget(selectorName, targetName string) error
 }
 
 // PathController is the optional dynamic path-set surface shared by stream
@@ -117,16 +122,11 @@ type ConnectionObserver interface {
 	// instead of polling MigrationCount for push-based observation.
 	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
 
-	// Mode returns the current operational mode
-	// (selector/race/bond).
-	Mode() Mode
-
-	// Stats returns a coherent one-call snapshot of everything a
-	// monitoring layer wants to see: flow id, mode, lifecycle
-	// state, path list (with per-path counters + quality), active
-	// path id, and recv-queue high-water mark. The contents are
-	// also obtainable individually but Stats avoids torn reads
-	// across getters.
+	// Stats returns a one-call observation. Topology membership and lifecycle,
+	// replay occupancy, and root-delivery evidence share one stable physical
+	// topology epoch. Per-path transport counters and quality, plus monotonic
+	// receive and scheduler counters, are point observations within that
+	// boundary rather than one transactionally frozen sample.
 	Stats() ConnStats
 }
 
@@ -134,10 +134,13 @@ type ConnectionObserver interface {
 // Layout is stable; fields are added to the end for forward
 // compatibility.
 type ConnStats struct {
-	FlowID         [16]byte
-	State          string
-	Mode           Mode
-	ActivePath     uint32
+	FlowID     [16]byte
+	State      string
+	ActivePath uint32
+	// EffectivePaths identifies the newest physical incarnation of every leaf
+	// currently authorized by the recursive target graph. A selector normally
+	// yields one ID; bond and race branches may yield several.
+	EffectivePaths []uint32
 	Paths          []PathInfo
 	RecvQueueHWM   int
 	RecvDups       uint64
@@ -157,6 +160,10 @@ type ConnStats struct {
 	// TXReplay exposes read-only bounded retransmission occupancy and ACK
 	// progress. Limits are factual implementation bounds, not tuning knobs.
 	TXReplay ReplayStats
+	// RootDelivery reports proof-valid unique application bytes for the local
+	// sender's currently published root-selector generation. It is zero for a
+	// non-selector root or before the first selector DATA publication.
+	RootDelivery RootDeliveryStats
 }
 
 // ReplayStats describes the sender's bounded application replay-credit
@@ -173,4 +180,19 @@ type ReplayStats struct {
 	CreditWaiters      uint64
 	BackpressureEvents uint64
 	Generation         uint64
+}
+
+// RootDeliveryStats is read-only sender evidence for one root selector's
+// current immediate child. Names come from the connection's frozen local
+// graph; physical path IDs and protocol-internal target identities are not
+// exposed.
+type RootDeliveryStats struct {
+	TargetName         string
+	SelectorName       string
+	SelectorGeneration uint64
+	EvidenceEpoch      uint64
+	Attributable       bool
+	PublishedBytes     uint64
+	AckedBytes         uint64
+	DemandBytes        uint64
 }

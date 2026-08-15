@@ -18,6 +18,13 @@ const (
 	RefreshReasonRouteSourceChanged     RefreshReason = 1
 	RefreshReasonRouteSourceUnavailable RefreshReason = 2
 	RefreshReasonRouteSourceRestored    RefreshReason = 3
+	RefreshReasonLinkUnresponsive       RefreshReason = 4
+	RefreshReasonLocalReadFailure       RefreshReason = 5
+	RefreshReasonLocalWriteFailure      RefreshReason = 6
+	RefreshReasonOuterMTUFailure        RefreshReason = 7
+	RefreshReasonReplayStalled          RefreshReason = 8
+	RefreshReasonReplayFailure          RefreshReason = 9
+	RefreshReasonLivenessProbeFailure   RefreshReason = 10
 )
 
 var (
@@ -320,6 +327,19 @@ func (snapshot RefreshSourceSnapshot) currentFor(state *RefreshSourceState) bool
 }
 
 func (r RefreshReason) valid() bool {
-	return r == RefreshReasonRouteSourceChanged || r == RefreshReasonRouteSourceUnavailable ||
-		r == RefreshReasonRouteSourceRestored
+	switch r {
+	case RefreshReasonRouteSourceChanged,
+		RefreshReasonRouteSourceUnavailable,
+		RefreshReasonRouteSourceRestored,
+		RefreshReasonLinkUnresponsive,
+		RefreshReasonLocalReadFailure,
+		RefreshReasonLocalWriteFailure,
+		RefreshReasonOuterMTUFailure,
+		RefreshReasonReplayStalled,
+		RefreshReasonReplayFailure,
+		RefreshReasonLivenessProbeFailure:
+		return true
+	default:
+		return false
+	}
 }

@@ -14,8 +14,10 @@ const (
 	ReasonUnsupportedIPVersion ParseReason = "unsupported_ip_version"
 	ReasonInvalidHeader        ParseReason = "invalid_header"
 	ReasonUnsupportedProtocol  ParseReason = "unsupported_protocol"
-	ReasonNonInitialFragment   ParseReason = "non_initial_fragment"
-	ReasonIPv6ExtensionLoop    ParseReason = "ipv6_extension_loop"
+	// ReasonFragmentedPacket rejects every complete IPv4 fragmentation marker
+	// and IPv6 Fragment header, including IPv6 atomic fragments.
+	ReasonFragmentedPacket  ParseReason = "fragmented_packet"
+	ReasonIPv6ExtensionLoop ParseReason = "ipv6_extension_loop"
 )
 
 const (
@@ -44,21 +46,18 @@ func (e *ParseError) Error() string {
 // PacketMeta is the parsed L3/L4 identity plus offsets into the
 // original packet. Packet is never retained by ParsePacket.
 type PacketMeta struct {
-	Identity       L3Identity
-	IPVersion      int
-	HeaderLen      int
-	PayloadOffset  int
-	PayloadLen     int
-	Fragmented     bool
-	MoreFragments  bool
-	FragmentOffset int
-	TCPFlags       uint8
+	Identity      L3Identity
+	IPVersion     int
+	HeaderLen     int
+	PayloadOffset int
+	PayloadLen    int
+	TCPFlags      uint8
 }
 
 // ParsePacket classifies one raw IP packet as read from a TUN device.
 // It currently extracts TCP/UDP ports and ICMP identities for IPv4 and
-// IPv6. Non-initial fragments are rejected because they do not carry
-// enough L4 header bytes to create a stable flow identity.
+// IPv6. Fragmented packets are rejected before classification because
+// l3ingress does not own a complete, resource-bounded reassembly policy.
 func ParsePacket(packet []byte) (PacketMeta, error) {
 	if len(packet) < 1 {
 		return PacketMeta{}, parseErr(ReasonShortPacket, "missing IP version")
@@ -94,8 +93,8 @@ func parseIPv4(packet []byte) (PacketMeta, error) {
 	frag := binary.BigEndian.Uint16(packet[6:8])
 	more := frag&0x2000 != 0
 	offset := int(frag&0x1fff) * 8
-	if offset != 0 {
-		return PacketMeta{}, parseErr(ReasonNonInitialFragment, fmt.Sprintf("ipv4 offset=%d", offset))
+	if more || offset != 0 {
+		return PacketMeta{}, parseErr(ReasonFragmentedPacket, fmt.Sprintf("ipv4 offset=%d more=%t", offset, more))
 	}
 	var src4 [4]byte
 	var dst4 [4]byte
@@ -110,13 +109,10 @@ func parseIPv4(packet []byte) (PacketMeta, error) {
 			SrcIP: src,
 			DstIP: dst,
 		},
-		IPVersion:      4,
-		HeaderLen:      ihl,
-		PayloadOffset:  ihl,
-		PayloadLen:     totalLen - ihl,
-		Fragmented:     more,
-		MoreFragments:  more,
-		FragmentOffset: offset,
+		IPVersion:     4,
+		HeaderLen:     ihl,
+		PayloadOffset: ihl,
+		PayloadLen:    totalLen - ihl,
 	}
 	if err := fillPorts(packet[:totalLen], &meta, ihl); err != nil {
 		return PacketMeta{}, err
@@ -143,9 +139,6 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 	copy(dstBytes[:], packet[24:40])
 	next := packet[6]
 	off := 40
-	fragmented := false
-	more := false
-	fragOffset := 0
 	for hops := 0; ; hops++ {
 		if next == 50 || next == 51 {
 			return PacketMeta{}, parseErr(ReasonUnsupportedProtocol, Protocol(next).String())
@@ -153,23 +146,17 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 		if !isIPv6Extension(next) {
 			break
 		}
-		if hops > 8 {
-			return PacketMeta{}, parseErr(ReasonIPv6ExtensionLoop, "too many IPv6 extension headers")
-		}
 		if next == 44 {
 			if len(packet) < off+8 {
 				return PacketMeta{}, parseErr(ReasonShortPacket, "ipv6 fragment header")
 			}
 			frag := binary.BigEndian.Uint16(packet[off+2 : off+4])
-			fragOffset = int((frag>>3)&0x1fff) * 8
-			more = frag&0x1 != 0
-			fragmented = true
-			next = packet[off]
-			off += 8
-			if fragOffset != 0 {
-				return PacketMeta{}, parseErr(ReasonNonInitialFragment, fmt.Sprintf("ipv6 offset=%d", fragOffset))
-			}
-			continue
+			fragOffset := int((frag>>3)&0x1fff) * 8
+			more := frag&0x1 != 0
+			return PacketMeta{}, parseErr(ReasonFragmentedPacket, fmt.Sprintf("ipv6 offset=%d more=%t", fragOffset, more))
+		}
+		if hops > 8 {
+			return PacketMeta{}, parseErr(ReasonIPv6ExtensionLoop, "too many IPv6 extension headers")
 		}
 		if len(packet) < off+2 {
 			return PacketMeta{}, parseErr(ReasonShortPacket, "ipv6 extension header")
@@ -187,13 +174,10 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 			SrcIP: netip.AddrFrom16(srcBytes),
 			DstIP: netip.AddrFrom16(dstBytes),
 		},
-		IPVersion:      6,
-		HeaderLen:      off,
-		PayloadOffset:  off,
-		PayloadLen:     totalLen - off,
-		Fragmented:     fragmented,
-		MoreFragments:  more,
-		FragmentOffset: fragOffset,
+		IPVersion:     6,
+		HeaderLen:     off,
+		PayloadOffset: off,
+		PayloadLen:    totalLen - off,
 	}
 	if err := fillPorts(packet[:totalLen], &meta, off); err != nil {
 		return PacketMeta{}, err

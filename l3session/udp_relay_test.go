@@ -202,17 +202,8 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 		t.Fatalf("missing packet session: ok=%v sess=%+v", ok, sess)
 	}
 	admin := sess.PacketConn.(packetControl)
-	var pathB uint32
-	for _, p := range admin.Paths() {
-		if p.Spec.Opts["name"] == "udp-b" {
-			pathB = p.ID
-			break
-		}
-	}
-	if pathB == 0 {
-		t.Fatalf("path udp-b not attached: %+v", admin.Paths())
-	}
-	if err := admin.Migrate(pathB); err != nil {
+	_ = waitForSessionPathAttached(t, admin, "udp-b", 3*time.Second)
+	if err := admin.SelectTarget("root", "udp-b"); err != nil {
 		t.Fatal(err)
 	}
 

@@ -17,7 +17,7 @@ func TestPacketWriteDeadlinePreservesAtomicPublishedLength(t *testing.T) {
 		configurePublicWriteDeadlineGraph(t, e)
 		e.SetPacketMode()
 		t.Cleanup(func() { _ = e.Close() })
-		packet := newEnginePacketConn(e, ModeSelector, nil, nil)
+		packet := newEnginePacketConn(e, nil, nil)
 		if err := packet.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
 			t.Fatal(err)
 		}
@@ -31,7 +31,7 @@ func TestPacketWriteDeadlinePreservesAtomicPublishedLength(t *testing.T) {
 		configurePublicWriteDeadlineGraph(t, e)
 		e.SetPacketMode()
 		t.Cleanup(func() { _ = e.Close() })
-		packet := newEnginePacketConn(e, ModeSelector, nil, nil)
+		packet := newEnginePacketConn(e, nil, nil)
 		if err := packet.SetWriteDeadline(time.Now().Add(40 * time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}

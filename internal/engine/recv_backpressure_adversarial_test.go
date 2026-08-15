@@ -79,13 +79,11 @@ func (p *recvAdversarialMemoryPath) RemoteAddr() string { return "recv-adversari
 
 func attachRecvAdversarialPair(t *testing.T, client, server *Engine) {
 	t.Helper()
+	const leafName = "backpressure"
+	ids := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, leafName)
 	clientPath, serverPath := newRecvAdversarialMemoryPathPair()
-	if _, err := client.AttachPath(clientPath, transport.PathSpec{Transport: "test", Address: "server"}); err != nil {
-		t.Fatalf("attach client path: %v", err)
-	}
-	if _, err := server.AttachPath(serverPath, transport.PathSpec{Transport: "test", Address: "client"}); err != nil {
-		t.Fatalf("attach server path: %v", err)
-	}
+	attachFixturePath(t, client, clientPath, transport.PathSpec{Transport: "test", Address: "server"}, ids[leafName])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "test", Address: "client"}, ids[leafName])
 }
 
 func TestRecvBackpressureBoundsUnconsumedStreamAndAckFrontier(t *testing.T) {

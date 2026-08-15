@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -193,20 +194,16 @@ func closeLinearizationAckThrough(e *Engine, nextSeq uint64) bool {
 	})
 }
 
-func attachCloseLinearizationPath(t *testing.T, e *Engine, path *closeLinearizationPath) {
+func attachCloseLinearizationPath(t *testing.T, e *Engine, path *closeLinearizationPath, targetID proto.TargetID) {
 	t.Helper()
 	path.owner = e
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "close-linearization"}); err != nil {
-		t.Fatalf("AttachPath: %v", err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "close-linearization"}, targetID)
 }
 
-func attachBlockingOptionalClosePath(t *testing.T, e *Engine, path *blockingOptionalClosePath) {
+func attachBlockingOptionalClosePath(t *testing.T, e *Engine, path *blockingOptionalClosePath, targetID proto.TargetID) {
 	t.Helper()
 	path.owner = e
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "adversarial", Address: "blocking-optional-close"}); err != nil {
-		t.Fatalf("AttachPath: %v", err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "blocking-optional-close"}, targetID)
 }
 
 func waitCloseLinearizationSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, label string) {
@@ -218,9 +215,62 @@ func waitCloseLinearizationSignal(t *testing.T, ch <-chan struct{}, timeout time
 	}
 }
 
+func TestCloseWaitsForReservedSequencedPublicationBeforeReplayCleanup(t *testing.T) {
+	e := New(SideClient, [16]byte{0xc9}, Limits{MigrationBudget: 250 * time.Millisecond})
+	targets := configureLeafSelectorRuntime(t, e, "path")
+	path := newCloseLinearizationPath()
+	attachCloseLinearizationPath(t, e, path, targets["path"])
+
+	// Hold the ledger lock so the publisher owns sendMu but cannot finish its
+	// replay reservation. Close must first publish cancellation, then wait for
+	// this sequencer owner before it clears the ledger.
+	e.sendHistMu.Lock()
+	sendDone := make(chan error, 1)
+	go func() {
+		_, err := e.sendFrameTracked(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlHeartbeat), nil)
+		sendDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadUint64(&e.sendSeq) == 0 {
+		if time.Now().After(deadline) {
+			e.sendHistMu.Unlock()
+			t.Fatal("publisher did not acquire sequencer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.Close() }()
+	select {
+	case <-e.closed:
+	case <-time.After(time.Second):
+		e.sendHistMu.Unlock()
+		t.Fatal("Close did not publish cancellation while publisher was reserved")
+	}
+	e.sendHistMu.Unlock()
+
+	select {
+	case err := <-sendDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("reserved publication error=%v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reserved publication did not leave sequencer after cancellation")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after reserved publication left sequencer")
+	}
+}
+
 func TestGracefulCloseRejectsDataAfterFinalSequenceLinearizes(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc1}, Limits{MigrationBudget: 250 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
 
 	byeGate := make(chan struct{})
 	var releaseBye sync.Once
@@ -228,7 +278,7 @@ func TestGracefulCloseRejectsDataAfterFinalSequenceLinearizes(t *testing.T) {
 	path := newCloseLinearizationPath()
 	path.byeStarted = make(chan struct{})
 	path.byeGate = byeGate
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
@@ -289,9 +339,92 @@ func TestGracefulCloseRejectsDataAfterFinalSequenceLinearizes(t *testing.T) {
 	}
 }
 
+func TestGracefulCloseLinearizesAfterInFlightApplicationSendData(t *testing.T) {
+	e := New(SideClient, [16]byte{0xc8}, Limits{MigrationBudget: 500 * time.Millisecond})
+	writeGate := make(chan struct{})
+	var releaseWrite sync.Once
+	release := func() { releaseWrite.Do(func() { close(writeGate) }) }
+	t.Cleanup(func() {
+		release()
+		_ = e.Close()
+	})
+	targets := configureLeafSelectorRuntime(t, e, "path")
+
+	path := newCloseLinearizationPath()
+	path.writeStarted = make(chan struct{})
+	path.writeGate = writeGate
+	path.autoAckBye = true
+	attachCloseLinearizationPath(t, e, path, targets["path"])
+
+	type writeResult struct {
+		n   int
+		err error
+	}
+	payload := []byte("application-write-before-close")
+	writeDone := make(chan writeResult, 1)
+	go func() {
+		n, err := e.SendData(payload)
+		writeDone <- writeResult{n: n, err: err}
+	}()
+	waitCloseLinearizationSignal(t, path.writeStarted, time.Second, "application SendData path write")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.GracefulClose(proto.ByeNormal) }()
+	deadline := time.Now().Add(time.Second)
+	for !e.sendClosing.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !e.sendClosing.Load() {
+		t.Fatal("graceful close did not publish its no-new-work boundary")
+	}
+	release()
+
+	select {
+	case result := <-writeDone:
+		if result.err != nil || result.n != len(payload) {
+			t.Fatalf("in-flight SendData=(%d,%v), want (%d,nil)", result.n, result.err, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight application SendData did not resolve")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("GracefulClose after in-flight SendData: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GracefulClose did not resolve after application SendData")
+	}
+
+	var (
+		dataSeqs []uint64
+		byeSeqs  []uint64
+	)
+	for _, hdr := range path.snapshotHeaders() {
+		switch {
+		case hdr.Type == proto.FrameData:
+			dataSeqs = append(dataSeqs, hdr.Seq)
+		case hdr.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(hdr.Flags) == proto.CtrlBye:
+			byeSeqs = append(byeSeqs, hdr.Seq)
+		}
+	}
+	if len(dataSeqs) == 0 {
+		t.Fatal("application SendData never reached the path")
+	}
+	if len(byeSeqs) != 1 {
+		t.Fatalf("BYE sequences=%v, want exactly one", byeSeqs)
+	}
+	for _, seq := range dataSeqs {
+		if seq >= byeSeqs[0] {
+			t.Fatalf("application DATA sequence %d did not linearize before BYE %d", seq, byeSeqs[0])
+		}
+	}
+}
+
 func TestConcurrentGracefulCloseSharesFinalFrameAndResult(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc2}, Limits{MigrationBudget: 250 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
 
 	byeGate := make(chan struct{})
 	var releaseBye sync.Once
@@ -300,7 +433,7 @@ func TestConcurrentGracefulCloseSharesFinalFrameAndResult(t *testing.T) {
 	path.byeStarted = make(chan struct{})
 	path.byeGate = byeGate
 	path.autoAckBye = true
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 
 	const callers = 16
 	start := make(chan struct{})
@@ -348,9 +481,10 @@ func TestConcurrentGracefulCloseSharesFinalFrameAndResult(t *testing.T) {
 func TestGracefulCloseAcceptsConcurrentCleanPeerCompletion(t *testing.T) {
 	for attempt := 0; attempt < 100; attempt++ {
 		e := New(SideClient, [16]byte{0xc5, byte(attempt)}, Limits{MigrationBudget: 250 * time.Millisecond})
+		targets := configureLeafSelectorRuntime(t, e, "path")
 		path := newCloseLinearizationPath()
 		path.byeStarted = make(chan struct{})
-		attachCloseLinearizationPath(t, e, path)
+		attachCloseLinearizationPath(t, e, path, targets["path"])
 
 		done := make(chan error, 1)
 		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
@@ -371,9 +505,10 @@ func TestGracefulCloseAcceptsConcurrentCleanPeerCompletion(t *testing.T) {
 
 func TestGracefulClosePreservesConcurrentTerminalReason(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc6}, Limits{MigrationBudget: 250 * time.Millisecond})
+	targets := configureLeafSelectorRuntime(t, e, "path")
 	path := newCloseLinearizationPath()
 	path.byeStarted = make(chan struct{})
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 	done := make(chan error, 1)
 	go func() { done <- e.GracefulClose(proto.ByeNormal) }()
 	waitCloseLinearizationSignal(t, path.byeStarted, time.Second, "terminal-error BYE")
@@ -394,6 +529,7 @@ func TestGracefulClosePreservesConcurrentTerminalReason(t *testing.T) {
 func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc3}, Limits{MigrationBudget: 50 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
 
 	writeGate := make(chan struct{})
 	var releaseWrite sync.Once
@@ -401,7 +537,7 @@ func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 	path := newCloseLinearizationPath()
 	path.writeStarted = make(chan struct{})
 	path.writeGate = writeGate
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -425,9 +561,9 @@ func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 	}
 
 	select {
-	case <-e.Closed():
+	case <-e.closed:
 	default:
-		t.Error("bounded graceful-close failure left the engine open")
+		t.Error("bounded graceful-close failure did not publish the close boundary")
 	}
 	releaseWrite.Do(func() { close(writeGate) })
 	select {
@@ -438,11 +574,17 @@ func TestGracefulCloseIsBoundedBehindPermanentlyBlockedWrite(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("blocked DATA writer did not exit after test gate release")
 	}
+	select {
+	case <-e.Closed():
+	case <-time.After(time.Second):
+		t.Fatal("engine did not fully quiesce after the hostile writer was released")
+	}
 }
 
 func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 	t.Run("MarkQuiesced", func(t *testing.T) {
 		e := New(SideClient, [16]byte{0xc7, 1}, Limits{MigrationBudget: 50 * time.Millisecond})
+		targets := configureLeafSelectorRuntime(t, e, "path")
 		markGate := make(chan struct{})
 		var releaseMark sync.Once
 		release := func() { releaseMark.Do(func() { close(markGate) }) }
@@ -454,7 +596,7 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		path := newBlockingOptionalClosePath()
 		path.autoAckBye = true
 		path.markGate = markGate
-		attachBlockingOptionalClosePath(t, e, path)
+		attachBlockingOptionalClosePath(t, e, path, targets["path"])
 
 		done := make(chan error, 1)
 		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
@@ -493,6 +635,7 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 
 	t.Run("CloseWrite", func(t *testing.T) {
 		e := New(SideClient, [16]byte{0xc7, 2}, Limits{MigrationBudget: 50 * time.Millisecond})
+		targets := configureLeafSelectorRuntime(t, e, "path")
 		closeWriteGate := make(chan struct{})
 		var releaseCloseWrite sync.Once
 		release := func() { releaseCloseWrite.Do(func() { close(closeWriteGate) }) }
@@ -504,7 +647,7 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		path := newBlockingOptionalClosePath()
 		path.autoAckBye = true
 		path.closeWriteGate = closeWriteGate
-		attachBlockingOptionalClosePath(t, e, path)
+		attachBlockingOptionalClosePath(t, e, path, targets["path"])
 
 		done := make(chan error, 1)
 		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
@@ -535,25 +678,50 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 
 	t.Run("CloseWriteContendsWithWrite", func(t *testing.T) {
 		e := New(SideClient, [16]byte{0xc7, 3}, Limits{MigrationBudget: 50 * time.Millisecond})
-		t.Cleanup(func() { _ = e.Close() })
+		markGate := make(chan struct{})
+		var releaseMark sync.Once
+		release := func() { releaseMark.Do(func() { close(markGate) }) }
+		t.Cleanup(func() {
+			release()
+			_ = e.Close()
+		})
+		targets := configureLeafSelectorRuntime(t, e, "path")
 		path := newBlockingOptionalClosePath()
-		path.blockWrite = true
-		attachBlockingOptionalClosePath(t, e, path)
-
-		writeDone := make(chan error, 1)
-		go func() {
-			_, err := e.SendData([]byte("write-holds-transport-lock"))
-			writeDone <- err
-		}()
-		waitCloseLinearizationSignal(t, path.writeBlocked, time.Second, "transport Write lock holder")
+		path.autoAckBye = true
+		path.markGate = markGate
+		attachBlockingOptionalClosePath(t, e, path, targets["path"])
 
 		done := make(chan error, 1)
 		go func() { done <- e.GracefulClose(proto.ByeNormal) }()
+		waitCloseLinearizationSignal(t, path.markStarted, time.Second, "pre-contention MarkQuiesced")
+		path.writeMu.Lock()
+		path.blockWrite = true
+		path.writeMu.Unlock()
+
+		e.pathsMu.RLock()
+		slot := e.paths[e.activeID]
+		e.pathsMu.RUnlock()
+		if slot == nil {
+			t.Fatal("explicit selector leaf was not attached")
+		}
+		frame := make([]byte, proto.HeaderSize+1)
+		if err := (proto.Header{Version: proto.Version, Type: proto.FrameData}).Encode(frame[:proto.HeaderSize]); err != nil {
+			t.Fatal(err)
+		}
+		frame[len(frame)-1] = 0xa5
+		writeDone := make(chan pathDispatchResult, 1)
+		generation := slot.dispatchNextGen.Add(1)
+		if !slot.submitDispatch(pathDispatchJob{frame: frame, result: writeDone, generation: generation}) {
+			t.Fatal("could not submit the lock-holding leaf write")
+		}
+		waitCloseLinearizationSignal(t, path.writeBlocked, time.Second, "transport Write lock holder")
+
+		release()
 		waitCloseLinearizationSignal(t, path.closeWriteStarted, time.Second, "contending CloseWrite")
 		select {
 		case err := <-done:
-			if err == nil {
-				t.Fatal("GracefulClose reported success without publishing its final frame")
+			if err != nil {
+				t.Fatalf("GracefulClose after published BYE: %v", err)
 			}
 		case <-time.After(time.Second):
 			_ = e.Close()
@@ -561,8 +729,8 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 			t.Fatal("CloseWrite contention prevented required PathConn.Close")
 		}
 		select {
-		case err := <-writeDone:
-			if err == nil {
+		case result := <-writeDone:
+			if result.err == nil {
 				t.Fatal("blocked Write succeeded after required Close")
 			}
 		case <-time.After(time.Second):
@@ -584,10 +752,11 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 func TestPathOwnedForQuiesceRequiresCurrentActiveSlot(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc7, 4}, Limits{MigrationBudget: 50 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "first", "second")
 	first := newCloseLinearizationPath()
 	second := newCloseLinearizationPath()
-	attachCloseLinearizationPath(t, e, first)
-	attachCloseLinearizationPath(t, e, second)
+	attachCloseLinearizationPath(t, e, first, targets["first"])
+	attachCloseLinearizationPath(t, e, second, targets["second"])
 
 	e.pathsMu.RLock()
 	firstSlot := e.paths[1]
@@ -610,11 +779,12 @@ func TestPathOwnedForQuiesceRequiresCurrentActiveSlot(t *testing.T) {
 func TestGracefulCloseHasTerminalCreditBeyondReplayCapacity(t *testing.T) {
 	e := New(SideClient, [16]byte{0xc4}, Limits{MigrationBudget: 250 * time.Millisecond})
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
 
 	path := newCloseLinearizationPath()
 	path.byeStarted = make(chan struct{})
 	path.autoAckBye = true
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 
 	for i := 0; i < sendHistoryWindow; i++ {
 		if err := e.SendPacket([]byte{byte(i)}); err != nil {

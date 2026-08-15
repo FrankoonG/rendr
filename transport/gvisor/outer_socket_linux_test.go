@@ -220,6 +220,10 @@ func TestLinuxOuterRouteEvidenceRejectsWrongCapturedNetNS(t *testing.T) {
 	if observation, err := observeUDPRouteForWire(ctx, wire, receiver.LocalAddr()); err == nil {
 		t.Fatalf("wrong network namespace identity produced evidence=%+v", observation)
 	}
+
+	t.Run("successor socket uses active socket namespace", func(t *testing.T) {
+		testLinuxOuterSuccessorSocketUsesActiveSocketNetworkNamespace(t)
+	})
 }
 
 func TestLinuxOuterRouteZonesAcceptNumericAndRejectConflict(t *testing.T) {

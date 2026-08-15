@@ -233,6 +233,69 @@ func TestExecutionRuntimePolicySwitchUsesEffectiveSelectorLeaf(t *testing.T) {
 	}
 }
 
+func TestPolicySelectionRouteChangeFactExcludesInactiveNestedSelector(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "inner"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindSelector, "inner", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	attached := runtimeAttached(ids, "a", "b", "c")
+	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.selectChild(ids["inner"], ids["b"]); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.policySelectionChangesEffectiveRoute(ids["inner"], ids["c"], attached) {
+		t.Fatal("inactive nested selector was treated as a data-plane cutover")
+	}
+	if err := runtime.selectChild(ids["root"], ids["inner"]); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.policySelectionChangesEffectiveRoute(ids["inner"], ids["c"], attached) {
+		t.Fatal("active nested selector route change did not require cutover custody")
+	}
+	if runtime.policySelectionChangesEffectiveRoute(ids["inner"], ids["b"], attached) {
+		t.Fatal("same effective child was treated as a route change")
+	}
+}
+
+func TestExecutionRuntimeFailedSelectorCommitRestoresState(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtimeRouteNames(t, runtime, runtimeAttached(ids, "a", "b"), true); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("initial route=%v", got)
+	}
+	injected := errors.New("injected projection failure")
+	err := runtime.commitSelectorChild(ids["root"], ids["b"], runtimeAttached(ids, "a", "b"), func(map[proto.TargetID]bool) error {
+		return injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("commit error=%v want=%v", err, injected)
+	}
+	desired, effective, ok := runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["a"] || effective != ids["a"] {
+		t.Fatalf("failed commit state desired=%x effective=%x ok=%t", desired, effective, ok)
+	}
+	if err := runtime.commitSelectorChild(ids["root"], ids["b"], runtimeAttached(ids, "a"), nil); err == nil {
+		t.Fatal("commit accepted a target without an attached leaf")
+	}
+	desired, effective, ok = runtime.selectedChild(ids["root"])
+	if !ok || desired != ids["a"] || effective != ids["a"] {
+		t.Fatalf("unavailable commit state desired=%x effective=%x ok=%t", desired, effective, ok)
+	}
+}
+
 func TestExecutionRuntimePolicySwitchProjectsNestedEffectiveLeaves(t *testing.T) {
 	root := proto.GraphNode{
 		ID:       proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"),

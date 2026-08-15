@@ -23,6 +23,9 @@ import (
 // LengthPrefixSize and MaxFrameSize match the TCP adapter so the
 // proto.Frame envelope is wire-identical regardless of transport.
 const LengthPrefixSize = 2
+
+var _ transport.PathQualityReader = (*PathConn)(nil)
+
 const MaxFrameSize = 1<<16 - 1
 
 // Transport is the QUIC adapter. ClientTLS and Tracer are shared
@@ -346,6 +349,13 @@ func (p *PathConn) Quality() transport.PathQuality {
 	p.qualityMu.RLock()
 	defer p.qualityMu.RUnlock()
 	return p.quality
+}
+
+func (p *PathConn) QualityContext(ctx context.Context) (transport.PathQuality, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.PathQuality{}, err
+	}
+	return p.Quality(), nil
 }
 
 func (p *PathConn) SetQuality(q transport.PathQuality) {

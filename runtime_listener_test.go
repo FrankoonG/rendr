@@ -16,6 +16,65 @@ import (
 	"github.com/FrankoonG/rendr/transport/tcp"
 )
 
+func TestRuntimeControlledTCPTransportSetQualityUpdatesEveryLiveDialGeneration(t *testing.T) {
+	path := func(name string) *runtimeControlledTCPPath {
+		return &runtimeControlledTCPPath{spec: transport.PathSpec{Opts: map[string]string{"name": name}}}
+	}
+	firstGeneration := path("shared")
+	redialGeneration := path("shared")
+	otherName := path("other")
+	retiredGeneration := path("shared")
+	retiredGeneration.closed.Store(true)
+	controlled := &runtimeControlledTCPTransport{dialGenerations: []*runtimeControlledTCPPath{
+		firstGeneration, redialGeneration, otherName, retiredGeneration,
+	}}
+
+	want := PathQuality{RTT: 17 * time.Millisecond, Jitter: 3 * time.Millisecond, LossPP: 2, At: time.Now()}
+	if err := controlled.SetQuality("shared", want); err != nil {
+		t.Fatal(err)
+	}
+	for name, generation := range map[string]*runtimeControlledTCPPath{
+		"first": firstGeneration, "redial": redialGeneration,
+	} {
+		generation.qualityMu.RLock()
+		got := generation.forcedQuality
+		generation.qualityMu.RUnlock()
+		if got == nil || *got != want {
+			t.Fatalf("%s dial generation quality=%v want=%v", name, got, want)
+		}
+	}
+	for name, generation := range map[string]*runtimeControlledTCPPath{
+		"other-name": otherName, "retired": retiredGeneration,
+	} {
+		generation.qualityMu.RLock()
+		got := generation.forcedQuality
+		generation.qualityMu.RUnlock()
+		if got != nil {
+			t.Fatalf("%s dial generation unexpectedly updated: %v", name, *got)
+		}
+	}
+}
+
+func TestRuntimeControlledTCPTransportSetQualityAppliesToFutureDialGeneration(t *testing.T) {
+	controlled := newRuntimeControlledTCPTransport(t)
+	want := PathQuality{RTT: 23 * time.Millisecond, Jitter: 4 * time.Millisecond, LossPP: 7, At: time.Now()}
+	if err := controlled.SetQuality("future", want); err != nil {
+		t.Fatal(err)
+	}
+	controlled.dialHook = func(context.Context, transport.PathSpec) (transport.PathConn, net.Conn, error) {
+		dialSide, acceptedPeer := net.Pipe()
+		t.Cleanup(func() { _ = acceptedPeer.Close() })
+		return tcp.Wrap(dialSide), dialSide, nil
+	}
+	path, err := controlled.dialPath(context.Background(), controlled.Spec("unused", "future"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := path.Quality(); got != want {
+		t.Fatalf("future dial generation quality=%v want=%v", got, want)
+	}
+}
+
 func TestRuntimeListenerCrossSourceBridgeAndCloseIsolation(t *testing.T) {
 	first, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -270,7 +329,7 @@ func TestRuntimeListenerCrossStreamPacketSourceBridge(t *testing.T) {
 	assertStatusCarrier(t, server.Status(), "packet", CarrierUDP)
 
 	clientPacketID := runtimeListenerPathID(t, client.Paths(), "packet")
-	if err := client.(*engineBackedConn).Migrate(clientPacketID); err != nil {
+	if err := client.(*engineBackedConn).SelectTarget("root", "packet"); err != nil {
 		t.Fatal(err)
 	}
 	assertStreamRoundTrip(t, client, server, []byte("stream-over-packet-leaf"))
@@ -279,8 +338,7 @@ func TestRuntimeListenerCrossStreamPacketSourceBridge(t *testing.T) {
 		t.Fatalf("packet-backed leaf carried no DATA: %+v", clientPacket)
 	}
 
-	serverPacketID := runtimeListenerPathID(t, server.Paths(), "packet")
-	if err := server.(MigrationController).Migrate(serverPacketID); err != nil {
+	if err := server.(MigrationController).SelectTarget("root", "packet"); err != nil {
 		t.Fatal(err)
 	}
 	assertStreamRoundTrip(t, server, client, []byte("reverse-over-packet-leaf"))

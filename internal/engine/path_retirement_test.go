@@ -480,7 +480,7 @@ func TestPeerPathRetirementQueueSaturationStopsACKFrontier(t *testing.T) {
 		payload: wire,
 		digest:  recvFrameDigest(hdr, wire),
 	}
-	packets := make([][]byte, 0)
+	packets := make([]recvPacketDelivery, 0)
 	receiver.drainContiguousLocked(&packets)
 	after := receiver.expectedRecvSeq
 	terminal := receiver.recvTerminal
@@ -612,6 +612,188 @@ func TestPeerPathRetirementDefersAcrossAdmissionOutcome(t *testing.T) {
 	if oldRetained {
 		t.Fatal("completed admission retained its predecessor")
 	}
+}
+
+func TestPeerPathRetirementReplaysFrozenPrefixBeforeLaterPublication(t *testing.T) {
+	tests := []struct {
+		name     string
+		reason   proto.PathRetirementReason
+		publish  func(*Engine) error
+		wantType proto.FrameType
+		wantCtrl proto.CtrlCode
+	}{
+		{
+			name:     "administrative-data",
+			reason:   proto.PathRetirementReasonAdministrative,
+			publish:  func(e *Engine) error { _, err := e.SendData([]byte("later-data")); return err },
+			wantType: proto.FrameData,
+		},
+		{
+			name:     "administrative-fin",
+			reason:   proto.PathRetirementReasonAdministrative,
+			publish:  (*Engine).SendStreamFin,
+			wantType: proto.FrameCtrl,
+			wantCtrl: proto.CtrlStreamFin,
+		},
+		{
+			name:     "transport-data",
+			reason:   proto.PathRetirementReasonTransport,
+			publish:  func(e *Engine) error { _, err := e.SendData([]byte("later-data")); return err },
+			wantType: proto.FrameData,
+		},
+		{
+			name:     "transport-fin",
+			reason:   proto.PathRetirementReasonTransport,
+			publish:  (*Engine).SendStreamFin,
+			wantType: proto.FrameCtrl,
+			wantCtrl: proto.CtrlStreamFin,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e, retiredID, survivor := newPeerRetirementOrderingFixture(t)
+			retirement := pathRetirementPayloadForReceiverPath(t, e, retiredID, test.reason)
+
+			replayEntered := make(chan struct{})
+			releaseReplay := make(chan struct{})
+			var replayOnce, releaseReplayOnce sync.Once
+			defer releaseReplayOnce.Do(func() { close(releaseReplay) })
+			e.boundedReplayBeforeSnapshot = func() {
+				replayOnce.Do(func() { close(replayEntered) })
+				<-releaseReplay
+			}
+
+			departureEntered := make(chan struct{})
+			releaseDeparture := make(chan struct{})
+			var departureOnce sync.Once
+			publicationDone := make(chan error, 1)
+			e.OnPathDeathSerial(func(event PathDeathEvent) {
+				if event.ID != retiredID {
+					return
+				}
+				departureOnce.Do(func() { close(departureEntered) })
+				<-releaseDeparture
+			})
+			go func() {
+				<-departureEntered
+				publicationDone <- test.publish(e)
+				close(releaseDeparture)
+			}()
+
+			applyDone := make(chan error, 1)
+			go func() { applyDone <- e.applyPeerPathRetirement(retirement) }()
+
+			select {
+			case <-replayEntered:
+			case <-departureEntered:
+				t.Fatal("later publication entered before frozen prefix replay")
+			case <-time.After(time.Second):
+				t.Fatal("peer retirement did not take frozen replay ownership")
+			}
+			select {
+			case <-departureEntered:
+				t.Fatal("later publication entered before frozen prefix replay")
+			default:
+			}
+
+			releaseReplayOnce.Do(func() { close(releaseReplay) })
+			select {
+			case err := <-applyDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("peer retirement deadlocked while handing off replay ownership")
+			}
+			select {
+			case err := <-publicationDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("later publication did not complete after frozen replay")
+			}
+
+			assertPeerRetirementPublicationOrder(t, survivor, test.wantType, test.wantCtrl)
+		})
+	}
+}
+
+func newPeerRetirementOrderingFixture(t *testing.T) (*Engine, uint32, *memoryPathConn) {
+	t.Helper()
+	manifest, _ := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "retired", "survivor"),
+		runtimeNode(proto.GraphNodeKindPath, "retired"),
+		runtimeNode(proto.GraphNodeKindPath, "survivor"),
+	)
+	e, _ := newStandaloneRetirementEngine(t, manifest)
+
+	retired, retiredPeer := newMemoryPathPair()
+	survivor, survivorPeer := newMemoryPathPair()
+	t.Cleanup(func() {
+		_ = retiredPeer.Close()
+		_ = survivorPeer.Close()
+	})
+	retiredID, err := e.AttachPath(retired, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "retired"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.AttachPath(survivor, transport.PathSpec{Transport: "memory", Opts: map[string]string{"name": "survivor"}}); err != nil {
+		t.Fatal(err)
+	}
+	if e.ActivePath() != retiredID {
+		t.Fatalf("retired path %d was not initially active: active=%d", retiredID, e.ActivePath())
+	}
+
+	retired.dropWrites.Store(true)
+	if _, err := e.SendData([]byte("frozen-prefix")); err != nil {
+		t.Fatal(err)
+	}
+	if got := survivor.DataWrites(); got != 0 {
+		t.Fatalf("survivor received frozen prefix before retirement: writes=%d", got)
+	}
+	return e, retiredID, survivor
+}
+
+func assertPeerRetirementPublicationOrder(t *testing.T, survivor *memoryPathConn, laterType proto.FrameType, laterCtrl proto.CtrlCode) {
+	t.Helper()
+	eventuallyEngine(t, time.Second, func() bool {
+		return len(peerRetirementOrderedFrames(survivor, laterType, laterCtrl)) >= 2
+	})
+	frames := peerRetirementOrderedFrames(survivor, laterType, laterCtrl)
+	// Allow the asynchronous factual selector decision to settle, then prove it
+	// did not replay the already committed prefix a second time.
+	time.Sleep(20 * time.Millisecond)
+	frames = peerRetirementOrderedFrames(survivor, laterType, laterCtrl)
+	if len(frames) != 2 {
+		t.Fatalf("survivor publications=%+v want exactly frozen prefix then later frame", frames)
+	}
+	if frames[0].Seq != 0 || frames[0].Type != proto.FrameData {
+		t.Fatalf("first survivor publication=%+v want frozen DATA SEQ 0", frames[0])
+	}
+	if frames[1].Seq != 1 || frames[1].Type != laterType ||
+		(laterType == proto.FrameCtrl && proto.CtrlCodeFromFlags(frames[1].Flags) != laterCtrl) {
+		t.Fatalf("second survivor publication=%+v want later type=%v ctrl=%v SEQ 1", frames[1], laterType, laterCtrl)
+	}
+}
+
+func peerRetirementOrderedFrames(path *memoryPathConn, laterType proto.FrameType, laterCtrl proto.CtrlCode) []proto.Header {
+	path.framesMu.Lock()
+	defer path.framesMu.Unlock()
+	frames := make([]proto.Header, 0, 2)
+	for _, header := range path.frames {
+		if header.Type == proto.FrameData {
+			if header.Seq == 0 || (header.Seq == 1 && laterType == proto.FrameData) {
+				frames = append(frames, header)
+			}
+			continue
+		}
+		if header.Seq == 1 && header.Type == laterType && proto.CtrlCodeFromFlags(header.Flags) == laterCtrl {
+			frames = append(frames, header)
+		}
+	}
+	return frames
 }
 
 type pathRetirementCounter struct {

@@ -104,13 +104,31 @@ const (
 )
 
 type Status struct {
-	FlowID   [16]byte
-	State    string
-	Protocol SessionProtocol
-	Local    CapabilitySet
-	Kernel   KernelFeatures
-	Peer     PeerStatus
-	Paths    []PathStatus
+	FlowID         [16]byte
+	State          string
+	Protocol       SessionProtocol
+	EffectivePaths []uint32
+	Issues         []StatusIssue
+	Local          CapabilitySet
+	Kernel         KernelFeatures
+	Peer           PeerStatus
+	Paths          []PathStatus
+}
+
+// StatusIssueID is a stable machine-readable identifier for a currently
+// active session-level problem that is not owned by one physical path.
+type StatusIssueID string
+
+const (
+	StatusIssuePeerPolicyInitialization StatusIssueID = "peer_policy_initialization"
+	StatusIssuePeerPolicyOutcomeUnknown StatusIssueID = "peer_policy_outcome_unknown"
+)
+
+// StatusIssue reports one active diagnostic. LastError is display-oriented;
+// callers make decisions from ID and the ordinary connection/path state.
+type StatusIssue struct {
+	ID        StatusIssueID
+	LastError string
 }
 
 type PeerStatus struct {
@@ -286,7 +304,7 @@ func pathStatusFromInfo(p PathInfo, mobility MobilityStatus, carriers map[string
 	}
 }
 
-func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carriers map[string]CarrierFamily, localStatuses ...LocalStatus) Status {
+func statusFromEngine(e *engine.Engine, tracker *pathStatusTracker, carriers map[string]CarrierFamily, localStatuses ...LocalStatus) Status {
 	local := coreLocalStatus()
 	if len(localStatuses) != 0 {
 		local = localStatuses[0].snapshot(time.Now())
@@ -316,13 +334,14 @@ func statusFromEngine(e *engine.Engine, _ Mode, tracker *pathStatusTracker, carr
 		}
 	}
 	return Status{
-		FlowID:   e.FlowID(),
-		State:    topology.State.String(),
-		Protocol: sessionProtocolForEngine(e),
-		Local:    local.Caps,
-		Kernel:   local.Kernel,
-		Peer:     peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
-		Paths:    out,
+		FlowID:         e.FlowID(),
+		State:          topology.State.String(),
+		Protocol:       sessionProtocolForEngine(e),
+		EffectivePaths: append([]uint32(nil), topology.EffectivePaths...),
+		Local:          local.Caps,
+		Kernel:         local.Kernel,
+		Peer:           peerStatus(peerKind, e.PeerInstanceID(), e.PeerCaps()),
+		Paths:          out,
 	}
 }
 

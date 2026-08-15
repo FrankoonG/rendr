@@ -59,16 +59,32 @@ func NewDomain() *Domain {
 	return &Domain{listeners: make(map[string]*Listener)}
 }
 
-// Transport is the gVisor netstack-backed TCP adapter. A transport returned
-// by New dials real outer UDP packet carriers. Domain.Factory returns a
-// transport bound to one explicit process-local Domain.
+// DomainFactory resolves process-local listeners in one explicit Domain. It
+// deliberately has no specialized mobility implementation method because its
+// paths have no replaceable outer packet link.
+type DomainFactory struct {
+	domain *Domain
+}
+
+var _ transport.PathFactory = (*DomainFactory)(nil)
+
+// LocalListener is a process-local gVisor TCP listener. It deliberately does
+// not expose packet-link mobility implementation evidence.
+type LocalListener struct {
+	listener *Listener
+}
+
+var _ transport.PathListener = (*LocalListener)(nil)
+
+// Transport is the gVisor netstack-backed TCP adapter for real outer UDP
+// packet carriers.
 type Transport struct {
-	domain           *Domain
-	processLocal     bool
-	packetSecurity   packetSecurity
-	packetConfigErr  error
-	replayBudgetOnce sync.Once
-	replayBudget     *packetReplayBudget
+	packetSecurity    packetSecurity
+	packetConfigErr   error
+	replayBudgetOnce  sync.Once
+	replayBudget      *packetReplayBudget
+	observePacketMu   sync.RWMutex
+	observePacketPath func(*retainedPathConn)
 }
 
 // New returns a gVisor transport for real outer UDP packet carriers. Packet
@@ -95,16 +111,15 @@ func NewPacket(options ...PacketOption) (*Transport, error) {
 }
 
 // Factory returns a path factory scoped to d's process-local listeners.
-func (d *Domain) Factory() *Transport { return &Transport{domain: d, processLocal: true} }
+func (d *Domain) Factory() *DomainFactory { return &DomainFactory{domain: d} }
 
 // Available reports whether process-local gVisor carriers are compiled in. Use
 // PacketAvailable for real outer UDP packet carriers. Neither method says
 // whether a particular session is eligible for packet-link rebinding.
 func Available() error { return nil }
 
-// DialPath uses the explicit Domain when this Transport came from
-// Domain.Factory; otherwise it connects through a real outer UDP packet
-// carrier. Each dial creates a fresh gVisor TCP connection.
+// DialPath connects through a real outer UDP packet carrier. Each dial creates
+// a fresh gVisor TCP connection.
 func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
 	if t == nil {
 		return nil, errors.New("gvisor: nil Transport")
@@ -112,25 +127,58 @@ func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (tran
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if t.processLocal {
-		if t.domain == nil {
-			return nil, errors.New("gvisor: process-local factory has nil Domain")
-		}
-		t.domain.mu.RLock()
-		l, exists := t.domain.listeners[spec.Address]
-		t.domain.mu.RUnlock()
-		if !exists || l == nil {
-			return nil, fmt.Errorf("gvisor: process-local listener %q is unavailable", spec.Address)
-		}
-		return l.dial(ctx)
-	}
 	if t.packetConfigErr != nil {
 		return nil, t.packetConfigErr
 	}
 	if t.packetSecurity.mode == packetTrustUnset {
 		return nil, ErrPacketTrustRequired
 	}
-	return dialPacketCarrier(ctx, spec.Address, t.packetSecurity, t.packetReplayBudget())
+	path, err := dialPacketCarrier(ctx, spec.Address, t.packetSecurity, t.packetReplayBudget())
+	if err != nil {
+		return nil, err
+	}
+	t.observePacketMu.RLock()
+	observer := t.observePacketPath
+	t.observePacketMu.RUnlock()
+	if observer != nil {
+		observer(path)
+	}
+	return path, nil
+}
+
+// DialPath resolves and dials a listener in the factory's process-local
+// Domain.
+func (f *DomainFactory) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+	if f == nil || f.domain == nil {
+		return nil, errors.New("gvisor: process-local factory has nil Domain")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	f.domain.mu.RLock()
+	listener, exists := f.domain.listeners[spec.Address]
+	f.domain.mu.RUnlock()
+	if !exists || listener == nil {
+		return nil, fmt.Errorf("gvisor: process-local listener %q is unavailable", spec.Address)
+	}
+	return listener.dial(ctx)
+}
+
+func (t *Transport) setPacketPathObserver(observer func(*retainedPathConn)) func() {
+	if t == nil {
+		return func() {}
+	}
+	t.observePacketMu.Lock()
+	t.observePacketPath = observer
+	t.observePacketMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.observePacketMu.Lock()
+			t.observePacketPath = nil
+			t.observePacketMu.Unlock()
+		})
+	}
 }
 
 func (t *Transport) packetReplayBudget() *packetReplayBudget {
@@ -151,6 +199,18 @@ func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transpo
 	}
 	rtt := time.Since(start)
 	_ = pc.Close()
+	return transport.PathQuality{RTT: rtt, At: time.Now()}, nil
+}
+
+// Probe dials, captures handshake RTT, and closes.
+func (f *DomainFactory) Probe(ctx context.Context, spec transport.PathSpec) (transport.PathQuality, error) {
+	start := time.Now()
+	path, err := f.DialPath(ctx, spec)
+	if err != nil {
+		return transport.PathQuality{}, err
+	}
+	rtt := time.Since(start)
+	_ = path.Close()
 	return transport.PathQuality{RTT: rtt, At: time.Now()}, nil
 }
 
@@ -204,7 +264,7 @@ type acceptResult struct {
 // Listen creates a process-local gVisor TCP listener in d. If addr is empty, a
 // unique address is allocated within the Domain. The returned address is a
 // Domain-local key, not an OS socket address.
-func (d *Domain) Listen(addr string) (*Listener, error) {
+func (d *Domain) Listen(addr string) (*LocalListener, error) {
 	if d == nil {
 		return nil, errors.New("gvisor: nil Domain")
 	}
@@ -278,7 +338,7 @@ func (d *Domain) Listen(addr string) (*Listener, error) {
 	d.mu.Unlock()
 	reserved = false
 	go l.acceptLoop()
-	return l, nil
+	return &LocalListener{listener: l}, nil
 }
 
 // ListenPacket creates a gVisor TCP listener whose virtual link is
@@ -417,6 +477,49 @@ func (*Listener) SessionKind() transport.PathSessionKind {
 	return transport.PathSessionAny
 }
 
+// Accept returns the next process-local gVisor path.
+func (l *LocalListener) Accept(ctx context.Context) (transport.PathConn, error) {
+	if l == nil || l.listener == nil {
+		return nil, net.ErrClosed
+	}
+	return l.listener.Accept(ctx)
+}
+
+// AcceptPath returns the next process-local gVisor path.
+func (l *LocalListener) AcceptPath(ctx context.Context) (transport.PathConn, error) {
+	return l.Accept(ctx)
+}
+
+// SessionKind reports the process-local gVisor framed session contract.
+func (*LocalListener) SessionKind() transport.PathSessionKind {
+	return transport.PathSessionAny
+}
+
+// Close stops process-local admission and releases the listener after retained
+// paths close.
+func (l *LocalListener) Close() error {
+	if l == nil || l.listener == nil {
+		return nil
+	}
+	return l.listener.Close()
+}
+
+// Addr returns the Domain-local listener key.
+func (l *LocalListener) Addr() net.Addr {
+	if l == nil || l.listener == nil {
+		return addr("")
+	}
+	return l.listener.Addr()
+}
+
+// Factory returns the process-local factory paired with this listener.
+func (l *LocalListener) Factory() *DomainFactory {
+	if l == nil || l.listener == nil {
+		return &DomainFactory{}
+	}
+	return &DomainFactory{domain: l.listener.domain}
+}
+
 func (l *Listener) acceptLoop() {
 	defer l.finishAdmission()
 	for {
@@ -533,16 +636,14 @@ func (l *Listener) Addr() net.Addr {
 	return addr(l.addr)
 }
 
-// Factory returns the client path factory paired with this listener. For a
-// process-local listener it retains the explicit Domain; for a packet-carrier
-// listener it dials the listener's real UDP address.
+// Factory returns the outer-packet client path factory paired with this
+// listener.
 func (l *Listener) Factory() *Transport {
 	if l == nil {
-		return &Transport{processLocal: true}
+		return &Transport{}
 	}
 	return &Transport{
-		domain: l.domain, processLocal: l.domain != nil, packetSecurity: l.packetSecurity,
-		replayBudget: l.clientReplayBudget,
+		packetSecurity: l.packetSecurity, replayBudget: l.clientReplayBudget,
 	}
 }
 
@@ -578,7 +679,7 @@ func dialPacketCarrier(
 	remote string,
 	security packetSecurity,
 	replayBudget *packetReplayBudget,
-) (transport.PathConn, error) {
+) (*retainedPathConn, error) {
 	raddr, err := net.ResolveUDPAddr("udp", remote)
 	if err != nil {
 		return nil, fmt.Errorf("gvisor: resolve udp %q: %w", remote, err)

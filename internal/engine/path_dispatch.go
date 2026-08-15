@@ -24,6 +24,8 @@ const maximumDispatchStallWindow = 2 * time.Second
 type pathDispatchJob struct {
 	frame            []byte
 	bonded           bool
+	routePlanned     bool
+	topologyEpoch    uint64
 	firstPublication bool
 	acceptedPacket   bool
 	result           chan<- pathDispatchResult
@@ -118,6 +120,11 @@ type pathDispatchResult struct {
 	err  error
 }
 
+type detachedStreamDispatchLease struct {
+	handoffBaseline  uint64
+	handedOffAtStart bool
+}
+
 func (s *pathSlot) submitDispatch(job pathDispatchJob) bool {
 	s.dispatchMu.Lock()
 	defer s.dispatchMu.Unlock()
@@ -207,7 +214,8 @@ func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob)
 		select {
 		case candidate := <-slot.dispatchQ:
 			seq, compatible := packetApplicationDispatchSequence(candidate)
-			if !compatible || candidate.fenceEpoch != first.fenceEpoch || seq != lastSeq+1 {
+			if !compatible || candidate.fenceEpoch != first.fenceEpoch ||
+				candidate.topologyEpoch != first.topologyEpoch || seq != lastSeq+1 {
 				pending = &candidate
 				goto drained
 			}
@@ -237,9 +245,24 @@ drained:
 		}
 		return pending, true
 	}
+	receipts := make([]*batchDispatchAttributionReceipt, len(jobs))
+	for i := range jobs {
+		if !jobs[i].routePlanned {
+			receipts[i] = e.beginApplicationBatchDispatch(
+				jobs[i].frame, slot, jobs[i].topologyEpoch,
+			)
+		}
+	}
+	cohorts := make([]rootDeliveryCohort, len(frames))
+	for i, frame := range frames {
+		cohorts[i] = e.applicationRootCohortFromFrame(frame)
+	}
+	started := nowFn()
 	completed, batchErr := writer.WriteFrameBatch(frames)
+	finished := nowFn()
 	slot.releaseWrite()
 	completed, batchErr = classifyFrameBatchResult(len(jobs), completed, batchErr)
+	e.resolveApplicationBatchDispatch(receipts, completed)
 	if completed > 0 {
 		slot.batchWriteCalls.Add(1)
 		slot.batchWriteFrames.Add(uint64(completed))
@@ -247,7 +270,11 @@ drained:
 		slot.dataWrites.Add(uint64(completed))
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		for i := 0; i < completed; i++ {
+			e.noteApplicationDispatchDuration(
+				cohorts[i], jobs[i].topologyEpoch, started, finished, true,
+			)
 			slot.recordDispatch(jobs[i].frame, jobs[i].firstPublication)
+			e.noteTailReplayPublication(jobs[i].frame, slot)
 		}
 	}
 	if batchErr != nil && !errors.Is(batchErr, ErrPathTXFenced) {
@@ -284,6 +311,17 @@ func packetApplicationDispatchSequence(job pathDispatchJob) (uint64, bool) {
 	return header.Seq, true
 }
 
+func applicationDispatchAckTarget(frame []byte) (uint64, bool) {
+	if len(frame) < proto.HeaderSize {
+		return 0, false
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil || header.Type != proto.FrameData || header.Seq == proto.MaxSeq {
+		return 0, false
+	}
+	return header.Seq + 1, true
+}
+
 func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 	if completed < 0 || completed > total {
 		return 0, errors.New("engine: frame batch writer returned invalid completed count")
@@ -295,13 +333,22 @@ func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 }
 
 func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
-	n, err := slot.writeDispatchedFrameEpoch(job.frame, job.fenceEpoch)
+	cohort := e.applicationRootCohortFromFrame(job.frame)
+	started := nowFn()
+	n, err := slot.writeDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, func() {
+		e.noteApplicationDispatchRouteAtEpoch(job.frame, slot, job.topologyEpoch)
+	})
+	finished := nowFn()
 	if err == nil && n != len(job.frame) {
 		err = io.ErrShortWrite
 	}
+	e.noteApplicationDispatchDuration(
+		cohort, job.topologyEpoch, started, finished, err == nil,
+	)
 	if err == nil {
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		slot.recordDispatch(job.frame, job.firstPublication)
+		e.noteTailReplayPublication(job.frame, slot)
 	} else if !errors.Is(err, ErrPathTXFenced) {
 		// Some third-party PathConn implementations cannot reliably invoke
 		// OnDeath after a failed Write. The generation check makes this
@@ -344,17 +391,59 @@ func (e *Engine) rejectQueuedDispatches(slot *pathSlot) {
 }
 
 func (e *Engine) dispatchRecursive(frame []byte, runtime *executionRuntime, firstPublication bool) error {
-	return e.dispatchRecursiveMode(frame, runtime, firstPublication, false)
+	return e.dispatchRecursiveMode(frame, runtime, firstPublication, false, nil, false)
 }
 
 func (e *Engine) dispatchRecursiveApplication(frame []byte, runtime *executionRuntime, firstPublication bool) error {
-	return e.dispatchRecursiveMode(frame, runtime, firstPublication, true)
+	return e.dispatchRecursiveMode(frame, runtime, firstPublication, true, nil, false)
 }
 
-func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, firstPublication, application bool) error {
+func (e *Engine) dispatchRecursiveReplayPreemptingControl(frame []byte, runtime *executionRuntime) error {
+	return e.dispatchRecursiveMode(frame, runtime, true, false, nil, true)
+}
+
+func (e *Engine) dispatchDetachedStreamApplication(
+	frame []byte,
+	runtime *executionRuntime,
+	firstPublication bool,
+	handoffBaseline uint64,
+	handedOffAtStart bool,
+) error {
+	return e.dispatchRecursiveMode(
+		frame, runtime, firstPublication, true,
+		&detachedStreamDispatchLease{
+			handoffBaseline:  handoffBaseline,
+			handedOffAtStart: handedOffAtStart,
+		},
+		false,
+	)
+}
+
+func (e *Engine) dispatchRecursiveMode(
+	frame []byte,
+	runtime *executionRuntime,
+	firstPublication, application bool,
+	detached *detachedStreamDispatchLease,
+	replayPreemptingControl bool,
+) error {
 	deadline := nowFn().Add(e.limits.MigrationBudget)
+	ackTarget, trackACK := applicationDispatchAckTarget(frame)
+	acknowledged := func() bool {
+		return trackACK && e.applicationDispatchAcknowledged(ackTarget)
+	}
+	handedOff := func() bool {
+		return detached != nil &&
+			e.detachedStreamDispatchHandedOff(
+				detached.handoffBaseline, detached.handedOffAtStart,
+			)
+	}
+	if handedOff() {
+		return errSelectorCutoverHandoff
+	}
 	if application {
-		if handled, err := e.dispatchFlatSelectorApplication(frame, runtime, firstPublication, deadline); handled {
+		if handled, err := e.dispatchFlatSelectorApplication(
+			frame, runtime, firstPublication, deadline, detached,
+		); handled {
 			return err
 		}
 	}
@@ -365,18 +454,42 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 		}
 	}
 	for {
+		if handedOff() {
+			return errSelectorCutoverHandoff
+		}
+		if acknowledged() {
+			return nil
+		}
 		if e.isClosed() {
+			if acknowledged() {
+				return nil
+			}
+			if err := e.CloseErr(); err != nil {
+				return err
+			}
 			return net.ErrClosed
 		}
-		if pending, _ := e.selectorCutoverSnapshot(); pending && e.handoffSelectorCutoverDispatch() {
-			return errSelectorCutoverHandoff
+		if !replayPreemptingControl {
+			pending, _ := e.selectorCutoverSnapshot()
+			if pending {
+				if acknowledged() {
+					return nil
+				}
+				if e.handoffSelectorCutoverDispatch() {
+					return errSelectorCutoverHandoff
+				}
+			}
 		}
 		if application {
 			if _, _, expired := e.writeDeadlineSnapshot(); expired {
+				if acknowledged() {
+					return nil
+				}
 				return ErrWriteDeadlineExceeded
 			}
 		}
 		e.pathsMu.RLock()
+		topologyEpoch := e.currentPathTopologyEpoch()
 		attached := make(map[proto.TargetID]bool, len(e.paths))
 		present := make(map[proto.TargetID]bool, len(e.paths))
 		latest := make(map[proto.TargetID]*pathSlot, len(e.paths))
@@ -393,11 +506,14 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 			attached[slot.localTXTargetID] = true
 			if previous := latest[slot.localTXTargetID]; previous == nil || slot.gen > previous.gen {
 				latest[slot.localTXTargetID] = slot
-				qualities[slot.localTXTargetID] = slot.quality()
+				qualities[slot.localTXTargetID] = slot.latestObservedQuality()
 				capacities[slot.localTXTargetID] = uint64(slot.spec.Weight)
 			}
 		}
 		e.pathsMu.RUnlock()
+		if handedOff() {
+			return errSelectorCutoverHandoff
+		}
 
 		selectorPresence := present
 		if controlFallback {
@@ -413,17 +529,25 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 		)
 		if err != nil {
 			if err != errNoExecutionRoute {
+				if acknowledged() {
+					return nil
+				}
 				return err
 			}
-			if err := e.waitForExecutionProgressMode(deadline, application); err != nil {
+			if err := e.waitForExecutionProgressModeAcknowledged(deadline, application, ackTarget); err != nil {
 				return err
 			}
 			continue
+		}
+		multiRoute := len(ticket.routes) > 1
+		if multiRoute {
+			e.noteApplicationDispatchPlanAtEpoch(frame, ticket.routes, topologyEpoch)
 		}
 
 		results := make(chan pathDispatchResult, len(ticket.routes))
 		submitted := 0
 		submittedSlots := make(map[*pathSlot]uint64, len(ticket.routes))
+		submittedBonded := make(map[*pathSlot]bool, len(ticket.routes))
 		for _, route := range ticket.routes {
 			slot := latest[route.targetID]
 			if slot == nil {
@@ -433,16 +557,22 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 			if slot.submitDispatch(pathDispatchJob{
 				frame:            frame,
 				bonded:           route.bonded,
+				routePlanned:     multiRoute,
+				topologyEpoch:    topologyEpoch,
 				firstPublication: firstPublication,
 				result:           results,
 				generation:       generation,
 			}) {
 				submitted++
 				submittedSlots[slot] = generation
+				submittedBonded[slot] = route.bonded
 			}
 		}
 		if submitted == 0 {
-			if err := e.waitForExecutionProgressMode(deadline, application); err != nil {
+			if handedOff() {
+				return errSelectorCutoverHandoff
+			}
+			if err := e.waitForExecutionProgressModeAcknowledged(deadline, application, ackTarget); err != nil {
 				return err
 			}
 			continue
@@ -450,6 +580,9 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 
 		remainingBudget := deadline.Sub(nowFn())
 		if remainingBudget <= 0 {
+			if acknowledged() {
+				return nil
+			}
 			return e.executionBudgetExceeded()
 		}
 		budgetTimer := time.NewTimer(remainingBudget)
@@ -464,8 +597,29 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 		for slot, generation := range submittedSlots {
 			pending[slot] = generation
 		}
-		cutoverPending, cutoverWake := e.selectorCutoverSnapshot()
+		var ackWake <-chan struct{}
+		if trackACK {
+			acknowledged, wake := e.sendAcknowledgementSnapshot(ackTarget)
+			if acknowledged {
+				stopDeadlineTimer(budgetTimer)
+				stopDeadlineTimer(stallTimer)
+				stopDeadlineTimer(appTimer)
+				return nil
+			}
+			ackWake = wake
+		}
+		cutoverPending := false
+		var cutoverWake <-chan struct{}
+		if !replayPreemptingControl {
+			cutoverPending, cutoverWake = e.selectorCutoverSnapshot()
+		}
 		if cutoverPending {
+			if acknowledged() {
+				stopDeadlineTimer(budgetTimer)
+				stopDeadlineTimer(stallTimer)
+				stopDeadlineTimer(appTimer)
+				return nil
+			}
 			e.markDispatchPending(pending)
 			stopDeadlineTimer(budgetTimer)
 			stopDeadlineTimer(stallTimer)
@@ -473,22 +627,53 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 			e.handoffSelectorCutoverDispatch()
 			return errSelectorCutoverHandoff
 		}
+		if handedOff() {
+			e.markDispatchPending(pending)
+			stopDeadlineTimer(budgetTimer)
+			stopDeadlineTimer(stallTimer)
+			stopDeadlineTimer(appTimer)
+			return errSelectorCutoverHandoff
+		}
 		if appExpired {
+			if acknowledged() {
+				stopDeadlineTimer(budgetTimer)
+				stopDeadlineTimer(stallTimer)
+				stopDeadlineTimer(appTimer)
+				return nil
+			}
 			e.markDispatchPending(pending)
 			stopDeadlineTimer(budgetTimer)
 			stopDeadlineTimer(stallTimer)
 			return ErrWriteDeadlineExceeded
 		}
 		stalled := false
-		strictSelector := ticket.kind == proto.ExecutionKindSelector && len(ticket.routes) == 1 && !ticket.routes[0].bonded
+		strictSelector := application && ticket.kind == proto.ExecutionKindSelector &&
+			len(ticket.routes) == 1 && !ticket.routes[0].bonded
 		remaining := submitted
 		for remaining > 0 && !stalled {
 			select {
+			case <-ackWake:
+				acknowledged, wake := e.sendAcknowledgementSnapshot(ackTarget)
+				ackWake = wake
+				if acknowledged {
+					stopDeadlineTimer(budgetTimer)
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return nil
+				}
 			case result := <-results:
 				remaining--
 				delete(pending, result.slot)
 				if result.err == nil {
 					if application {
+						if trackACK {
+							if acknowledged, _ := e.sendAcknowledgementSnapshot(ackTarget); acknowledged {
+								stopDeadlineTimer(budgetTimer)
+								stopDeadlineTimer(stallTimer)
+								stopDeadlineTimer(appTimer)
+								return nil
+							}
+						}
 						if _, _, expired := e.writeDeadlineSnapshot(); expired {
 							e.markDispatchPending(pending)
 							stopDeadlineTimer(budgetTimer)
@@ -503,8 +688,14 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 					return nil
 				}
 			case <-stallTimerC:
+				if acknowledged() {
+					stopDeadlineTimer(budgetTimer)
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return nil
+				}
 				for slot, generation := range pending {
-					if !slot.dispatchStalled.Load() {
+					if submittedBonded[slot] && !slot.dispatchStalled.Load() {
 						runtime.stuckSkips.Add(1)
 					}
 					slot.markDispatchStalled(generation)
@@ -520,8 +711,21 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 				}
 				stalled = true
 			case <-cutoverWake:
+				if handedOff() {
+					e.markDispatchPending(pending)
+					stopDeadlineTimer(budgetTimer)
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return errSelectorCutoverHandoff
+				}
 				cutoverPending, cutoverWake = e.selectorCutoverSnapshot()
 				if cutoverPending {
+					if acknowledged() {
+						stopDeadlineTimer(budgetTimer)
+						stopDeadlineTimer(stallTimer)
+						stopDeadlineTimer(appTimer)
+						return nil
+					}
 					e.markDispatchPending(pending)
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
@@ -530,11 +734,30 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 					return errSelectorCutoverHandoff
 				}
 			case <-e.closed:
+				if acknowledged() {
+					stopDeadlineTimer(budgetTimer)
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return nil
+				}
 				stopDeadlineTimer(budgetTimer)
 				stopDeadlineTimer(stallTimer)
 				stopDeadlineTimer(appTimer)
+				if err := e.CloseErr(); err != nil {
+					return err
+				}
 				return net.ErrClosed
 			case <-budgetTimer.C:
+				if handedOff() {
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return errSelectorCutoverHandoff
+				}
+				if acknowledged() {
+					stopDeadlineTimer(stallTimer)
+					stopDeadlineTimer(appTimer)
+					return nil
+				}
 				stopDeadlineTimer(stallTimer)
 				stopDeadlineTimer(appTimer)
 				return e.executionBudgetExceeded()
@@ -542,6 +765,11 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 				stopDeadlineTimer(appTimer)
 				appTimer, appTimerC, appWake, appExpired = e.applicationDispatchDeadline(application)
 				if appExpired {
+					if acknowledged() {
+						stopDeadlineTimer(budgetTimer)
+						stopDeadlineTimer(stallTimer)
+						return nil
+					}
 					e.markDispatchPending(pending)
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
@@ -550,6 +778,11 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 			case <-appTimerC:
 				appTimer, appTimerC, appWake, appExpired = e.applicationDispatchDeadline(application)
 				if appExpired {
+					if acknowledged() {
+						stopDeadlineTimer(budgetTimer)
+						stopDeadlineTimer(stallTimer)
+						return nil
+					}
 					e.markDispatchPending(pending)
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
@@ -563,7 +796,7 @@ func (e *Engine) dispatchRecursiveMode(frame []byte, runtime *executionRuntime, 
 		if stalled {
 			continue
 		}
-		if err := e.waitForExecutionProgressMode(deadline, application); err != nil {
+		if err := e.waitForExecutionProgressModeAcknowledged(deadline, application, ackTarget); err != nil {
 			return err
 		}
 	}
@@ -578,8 +811,8 @@ const (
 )
 
 // dispatchFlatSelectorApplication avoids rebuilding an immutable recursive
-// ticket for the common root-selector-with-path-children shape. The committed
-// active path remains the sole route. Blocking writes still run on the path
+// ticket for the common root-selector-with-path-children shape. The recursive
+// selector remains the sole route authority. Blocking writes still run on the path
 // writer and retain the same stall, cutover, migration-budget, and application
 // deadline semantics as the general dispatcher.
 //
@@ -590,7 +823,17 @@ func (e *Engine) dispatchFlatSelectorApplication(
 	runtime *executionRuntime,
 	firstPublication bool,
 	migrationDeadline time.Time,
+	detached *detachedStreamDispatchLease,
 ) (bool, error) {
+	handedOff := func() bool {
+		return detached != nil &&
+			e.detachedStreamDispatchHandedOff(
+				detached.handoffBaseline, detached.handedOffAtStart,
+			)
+	}
+	if handedOff() {
+		return true, errSelectorCutoverHandoff
+	}
 	if runtime == nil || !runtime.flatLeafSelector {
 		return false, nil
 	}
@@ -601,19 +844,23 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		return true, net.ErrClosed
 	}
 
-	e.pathsMu.RLock()
-	slot := e.paths[e.activeID]
-	eligible := slot != nil && runtime.ownsFlatSelectorLeaf(slot.localTXTargetID) &&
-		e.dispatchScopeAllowsLocked(slot.id) && !slot.dispatchStalled.Load()
-	e.pathsMu.RUnlock()
-	if !eligible {
+	slot, topologyEpoch := e.flatSelectorDispatchSlot(runtime, false)
+	if slot == nil {
 		return false, nil
+	}
+	if handedOff() {
+		return true, errSelectorCutoverHandoff
 	}
 
 	waiter := acquireApplicationDispatchWaiter()
+	ackTarget, trackACK := applicationDispatchAckTarget(frame)
+	acknowledged := func() bool {
+		return trackACK && e.applicationDispatchAcknowledged(ackTarget)
+	}
 	generation := slot.dispatchNextGen.Add(1)
 	if !slot.submitDispatch(pathDispatchJob{
 		frame:            frame,
+		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
 		applicationWait:  waiter,
 		generation:       generation,
@@ -621,12 +868,24 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		releaseApplicationDispatchWaiter(waiter)
 		return false, nil
 	}
-
 	stallDeadline := nowFn().Add(e.executionStallWindowForSlot(slot))
 	stalled := false
 	for {
+		if handedOff() {
+			slot.markDispatchStalled(generation)
+			abandonApplicationDispatchWaiter(waiter)
+			return true, errSelectorCutoverHandoff
+		}
+		if acknowledged() {
+			abandonApplicationDispatchWaiter(waiter)
+			return true, nil
+		}
 		applicationDeadline, applicationWake, expired := e.writeDeadlineSnapshot()
 		if expired {
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
 			slot.markDispatchStalled(generation)
 			abandonApplicationDispatchWaiter(waiter)
 			return true, ErrWriteDeadlineExceeded
@@ -647,6 +906,10 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		cutoverPending, cutoverWake := e.selectorCutoverSnapshot()
 		if cutoverPending {
 			e.stopFlatSelectorDispatchTimer()
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
 			slot.markDispatchStalled(generation)
 			if e.handoffSelectorCutoverDispatch() {
 				abandonApplicationDispatchWaiter(waiter)
@@ -654,24 +917,58 @@ func (e *Engine) dispatchFlatSelectorApplication(
 			}
 			continue
 		}
+		var ackWake <-chan struct{}
+		if trackACK {
+			acknowledged, wake := e.sendAcknowledgementSnapshot(ackTarget)
+			if acknowledged {
+				e.stopFlatSelectorDispatchTimer()
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
+			ackWake = wake
+		}
 
 		select {
+		case <-ackWake:
+			acknowledged, _ := e.sendAcknowledgementSnapshot(ackTarget)
+			if acknowledged {
+				e.stopFlatSelectorDispatchTimer()
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
 		case dispatchResult := <-waiter.done:
 			e.stopFlatSelectorDispatchTimer()
 			releaseApplicationDispatchWaiter(waiter)
 			if dispatchResult.err != nil {
+				if trackACK {
+					if acknowledged, _ := e.sendAcknowledgementSnapshot(ackTarget); acknowledged {
+						return true, nil
+					}
+				}
 				return false, nil
+			}
+			if trackACK {
+				if acknowledged, _ := e.sendAcknowledgementSnapshot(ackTarget); acknowledged {
+					return true, nil
+				}
 			}
 			if _, _, expired := e.writeDeadlineSnapshot(); expired {
 				return true, ErrWriteDeadlineExceeded
 			}
 			return true, nil
 		case <-timerC:
+			if handedOff() {
+				slot.markDispatchStalled(generation)
+				abandonApplicationDispatchWaiter(waiter)
+				return true, errSelectorCutoverHandoff
+			}
+			if acknowledged() {
+				e.stopFlatSelectorDispatchTimer()
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
 			switch waitReason {
 			case flatSelectorWaitStall:
-				if !slot.dispatchStalled.Load() {
-					runtime.stuckSkips.Add(1)
-				}
 				slot.markDispatchStalled(generation)
 				stalled = true
 			case flatSelectorWaitApplicationDeadline:
@@ -689,7 +986,16 @@ func (e *Engine) dispatchFlatSelectorApplication(
 			e.stopFlatSelectorDispatchTimer()
 		case <-cutoverWake:
 			e.stopFlatSelectorDispatchTimer()
+			if handedOff() {
+				slot.markDispatchStalled(generation)
+				abandonApplicationDispatchWaiter(waiter)
+				return true, errSelectorCutoverHandoff
+			}
 			if pending, _ := e.selectorCutoverSnapshot(); pending {
+				if acknowledged() {
+					abandonApplicationDispatchWaiter(waiter)
+					return true, nil
+				}
 				slot.markDispatchStalled(generation)
 				if e.handoffSelectorCutoverDispatch() {
 					abandonApplicationDispatchWaiter(waiter)
@@ -698,6 +1004,10 @@ func (e *Engine) dispatchFlatSelectorApplication(
 			}
 		case <-e.closed:
 			e.stopFlatSelectorDispatchTimer()
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(waiter)
+				return true, nil
+			}
 			abandonApplicationDispatchWaiter(waiter)
 			return true, net.ErrClosed
 		}
@@ -720,34 +1030,41 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 	if runtime == nil || !runtime.flatLeafSelector || !e.Packetized() {
 		return false, nil
 	}
+	// Route lookup must not run below selectorCutoverMu. Every physical topology
+	// commit publishes its epoch while holding pathsMu -> selectorCutoverMu, so
+	// the lock-free gap below is closed by the epoch check after custody is
+	// acquired. If this dispatch wins the mutex, queue admission linearizes
+	// before the topology commit; if the commit wins, this frame is redispatched.
+	slot, topologyEpoch := e.flatSelectorDispatchSlot(runtime, true)
+	if slot == nil {
+		return false, nil
+	}
+	if hook := e.acceptedPacketAfterRouteSnapshot; hook != nil {
+		hook()
+	}
+
 	e.selectorCutoverMu.Lock()
 	defer e.selectorCutoverMu.Unlock()
 	if e.selectorCutoverPending {
 		e.selectorCutoverHandedOff = true
 		return true, errSelectorCutoverHandoff
 	}
+	if e.currentPathTopologyEpoch() != topologyEpoch {
+		return false, nil
+	}
 	if e.isClosed() {
 		return true, net.ErrClosed
 	}
 
-	e.pathsMu.RLock()
-	slot := e.paths[e.activeID]
-	batchCapable := false
-	if slot != nil {
-		_, batchCapable = slot.conn.(transport.FrameBatchWriter)
-	}
-	eligible := slot != nil && batchCapable && runtime.ownsFlatSelectorLeaf(slot.localTXTargetID) &&
-		e.dispatchScopeAllowsLocked(slot.id) && !slot.dispatchStalled.Load()
-	e.pathsMu.RUnlock()
-	if !eligible {
-		return false, nil
-	}
-
 	generation := slot.dispatchNextGen.Add(1)
 	if !slot.submitDispatch(pathDispatchJob{
-		frame: frame, firstPublication: firstPublication, acceptedPacket: true, generation: generation,
+		frame: frame, topologyEpoch: topologyEpoch, firstPublication: firstPublication,
+		acceptedPacket: true, generation: generation,
 	}) {
 		return false, nil
+	}
+	if firstPublication {
+		e.noteTailReplayPublication(frame, slot)
 	}
 	e.acceptedPacketDispatches++
 	return true, nil
@@ -760,6 +1077,7 @@ type flatSelectorPacketDispatch struct {
 	generation        uint64
 	migrationDeadline time.Time
 	stallDeadline     time.Time
+	ackTarget         uint64
 }
 
 var flatSelectorPacketTimerPool = sync.Pool{New: func() any {
@@ -788,12 +1106,8 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 		return nil, true, net.ErrClosed
 	}
 
-	e.pathsMu.RLock()
-	slot := e.paths[e.activeID]
-	eligible := slot != nil && runtime.ownsFlatSelectorLeaf(slot.localTXTargetID) &&
-		e.dispatchScopeAllowsLocked(slot.id) && !slot.dispatchStalled.Load()
-	e.pathsMu.RUnlock()
-	if !eligible {
+	slot, topologyEpoch := e.flatSelectorDispatchSlot(runtime, false)
+	if slot == nil {
 		return nil, false, nil
 	}
 
@@ -801,6 +1115,7 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 	generation := slot.dispatchNextGen.Add(1)
 	if !slot.submitDispatch(pathDispatchJob{
 		frame:            frame,
+		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
 		applicationWait:  waiter,
 		generation:       generation,
@@ -808,11 +1123,56 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 		releaseApplicationDispatchWaiter(waiter)
 		return nil, false, nil
 	}
+	ackTarget, _ := applicationDispatchAckTarget(frame)
 	return &flatSelectorPacketDispatch{
 		runtime: runtime, slot: slot, waiter: waiter, generation: generation,
 		migrationDeadline: migrationDeadline,
 		stallDeadline:     nowFn().Add(e.executionStallWindowForSlot(slot)),
+		ackTarget:         ackTarget,
 	}, true, nil
+}
+
+// flatSelectorDispatchSlot projects the recursive selector decision onto the
+// newest usable physical incarnation of its chosen leaf. activeID is an
+// observational compatibility field and must never participate in routing.
+func (e *Engine) flatSelectorDispatchSlot(
+	runtime *executionRuntime,
+	requireBatch bool,
+) (*pathSlot, uint64) {
+	if runtime == nil || !runtime.flatLeafSelector {
+		return nil, 0
+	}
+	e.pathsMu.RLock()
+	topologyEpoch := e.currentPathTopologyEpoch()
+	eligible := make(map[proto.TargetID]bool, len(e.paths))
+	present := make(map[proto.TargetID]bool, len(e.paths))
+	latest := make(map[proto.TargetID]*pathSlot, len(e.paths))
+	for _, slot := range e.paths {
+		targetID := slot.localTXTargetID
+		if targetID == (proto.TargetID{}) || !runtime.ownsFlatSelectorLeaf(targetID) {
+			continue
+		}
+		present[targetID] = true
+		if slot.dispatchStalled.Load() {
+			continue
+		}
+		if requireBatch {
+			if _, ok := slot.conn.(transport.FrameBatchWriter); !ok {
+				continue
+			}
+		}
+		eligible[targetID] = true
+		if previous := latest[targetID]; previous == nil || slot.gen > previous.gen {
+			latest[targetID] = slot
+		}
+	}
+	e.pathsMu.RUnlock()
+
+	targetID, ok := runtime.flatSelectorDispatchLeaf(eligible, present)
+	if !ok {
+		return nil, topologyEpoch
+	}
+	return latest[targetID], topologyEpoch
 }
 
 func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDispatch) error {
@@ -825,9 +1185,20 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 		flatSelectorPacketTimerPool.Put(timer)
 	}()
 	stalled := false
+	acknowledged := func() bool {
+		return dispatch.ackTarget != 0 && e.applicationDispatchAcknowledged(dispatch.ackTarget)
+	}
 	for {
+		if acknowledged() {
+			abandonApplicationDispatchWaiter(dispatch.waiter)
+			return nil
+		}
 		applicationDeadline, applicationWake, expired := e.writeDeadlineSnapshot()
 		if expired {
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
 			dispatch.slot.markDispatchStalled(dispatch.generation)
 			abandonApplicationDispatchWaiter(dispatch.waiter)
 			return ErrWriteDeadlineExceeded
@@ -848,6 +1219,10 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 		cutoverPending, cutoverWake := e.selectorCutoverSnapshot()
 		if cutoverPending {
 			stopDeadlineTimer(timer)
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
 			dispatch.slot.markDispatchStalled(dispatch.generation)
 			if e.handoffSelectorCutoverDispatch() {
 				abandonApplicationDispatchWaiter(dispatch.waiter)
@@ -855,24 +1230,52 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 			}
 			continue
 		}
+		var ackWake <-chan struct{}
+		if dispatch.ackTarget != 0 {
+			acknowledged, wake := e.sendAcknowledgementSnapshot(dispatch.ackTarget)
+			if acknowledged {
+				stopDeadlineTimer(timer)
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
+			ackWake = wake
+		}
 
 		select {
+		case <-ackWake:
+			acknowledged, _ := e.sendAcknowledgementSnapshot(dispatch.ackTarget)
+			if acknowledged {
+				stopDeadlineTimer(timer)
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
 		case result := <-dispatch.waiter.done:
 			stopDeadlineTimer(timer)
 			releaseApplicationDispatchWaiter(dispatch.waiter)
 			if result.err != nil {
+				if dispatch.ackTarget != 0 {
+					if acknowledged, _ := e.sendAcknowledgementSnapshot(dispatch.ackTarget); acknowledged {
+						return nil
+					}
+				}
 				return errFlatSelectorPacketRedispatch
+			}
+			if dispatch.ackTarget != 0 {
+				if acknowledged, _ := e.sendAcknowledgementSnapshot(dispatch.ackTarget); acknowledged {
+					return nil
+				}
 			}
 			if _, _, expired := e.writeDeadlineSnapshot(); expired {
 				return ErrWriteDeadlineExceeded
 			}
 			return nil
 		case <-timer.C:
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
 			switch waitReason {
 			case flatSelectorWaitStall:
-				if !dispatch.slot.dispatchStalled.Load() {
-					dispatch.runtime.stuckSkips.Add(1)
-				}
 				dispatch.slot.markDispatchStalled(dispatch.generation)
 				stalled = true
 			case flatSelectorWaitApplicationDeadline:
@@ -891,6 +1294,10 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 		case <-cutoverWake:
 			stopDeadlineTimer(timer)
 			if pending, _ := e.selectorCutoverSnapshot(); pending {
+				if acknowledged() {
+					abandonApplicationDispatchWaiter(dispatch.waiter)
+					return nil
+				}
 				dispatch.slot.markDispatchStalled(dispatch.generation)
 				if e.handoffSelectorCutoverDispatch() {
 					abandonApplicationDispatchWaiter(dispatch.waiter)
@@ -899,6 +1306,10 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 			}
 		case <-e.closed:
 			stopDeadlineTimer(timer)
+			if acknowledged() {
+				abandonApplicationDispatchWaiter(dispatch.waiter)
+				return nil
+			}
 			abandonApplicationDispatchWaiter(dispatch.waiter)
 			return net.ErrClosed
 		}
@@ -951,7 +1362,7 @@ func (e *Engine) executionStallWindowForSlot(slot *pathSlot) time.Duration {
 	if slot == nil {
 		return window
 	}
-	quality := slot.quality()
+	quality := slot.latestObservedQuality()
 	if quality.At.IsZero() || nowFn().Sub(quality.At) > selectorEvidenceFreshFor {
 		return window
 	}
@@ -969,11 +1380,29 @@ func (e *Engine) waitForExecutionProgress(deadline time.Time) error {
 }
 
 func (e *Engine) waitForExecutionProgressMode(deadline time.Time, application bool) error {
+	return e.waitForExecutionProgressModeAcknowledged(deadline, application, 0)
+}
+
+func (e *Engine) waitForExecutionProgressModeAcknowledged(
+	deadline time.Time,
+	application bool,
+	ackTarget uint64,
+) error {
+	acknowledged := func() bool { return e.applicationDispatchAcknowledged(ackTarget) }
+	if acknowledged() {
+		return nil
+	}
 	if !nowFn().Before(deadline) {
+		if acknowledged() {
+			return nil
+		}
 		return e.executionBudgetExceeded()
 	}
 	appTimer, appTimerC, appWake, expired := e.applicationDispatchDeadline(application)
 	if expired {
+		if acknowledged() {
+			return nil
+		}
 		return ErrWriteDeadlineExceeded
 	}
 	defer stopDeadlineTimer(appTimer)
@@ -981,6 +1410,9 @@ func (e *Engine) waitForExecutionProgressMode(deadline time.Time, application bo
 	defer timer.Stop()
 	select {
 	case <-e.closed:
+		if acknowledged() {
+			return nil
+		}
 		if err := e.CloseErr(); err != nil {
 			return err
 		}
@@ -991,6 +1423,9 @@ func (e *Engine) waitForExecutionProgressMode(deadline time.Time, application bo
 		return nil
 	case <-appTimerC:
 		if _, _, expired := e.writeDeadlineSnapshot(); expired {
+			if acknowledged() {
+				return nil
+			}
 			return ErrWriteDeadlineExceeded
 		}
 		return nil

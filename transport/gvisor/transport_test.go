@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -17,6 +18,11 @@ import (
 )
 
 const testTimeout = 5 * time.Second
+
+type testGVisorListener interface {
+	transport.PathListener
+	Addr() net.Addr
+}
 
 func TestGVisorTransportRoundTrip(t *testing.T) {
 	ln, err := NewDomain().Listen("")
@@ -93,20 +99,20 @@ func TestGVisorDomainsIsolateSameAddress(t *testing.T) {
 func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 	tests := []struct {
 		name        string
-		listen      func() (*Listener, error)
+		listen      func() (testGVisorListener, error)
 		clientScope leafmobility.Scope
 		serverScope leafmobility.Scope
 		operations  leafmobility.Operation
 	}{
 		{
 			name:        "process-local",
-			listen:      func() (*Listener, error) { return NewDomain().Listen("") },
+			listen:      func() (testGVisorListener, error) { return NewDomain().Listen("") },
 			clientScope: leafmobility.ScopeProcessLocal,
 			serverScope: leafmobility.ScopeProcessLocal,
 		},
 		{
 			name:        "packet-carried",
-			listen:      func() (*Listener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
+			listen:      func() (testGVisorListener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
 			clientScope: leafmobility.ScopeEndpoint,
 			serverScope: leafmobility.ScopeEndpoint,
 			operations:  expectedPacketLinkOperation(),
@@ -140,6 +146,44 @@ func TestGVisorAdapterPublishesScopedOwnershipClaims(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("process-local descriptor and negotiation stay undriven", func(t *testing.T) {
+		testGVisorProcessLocalDescriptorMatchesUndrivenClaims(t)
+	})
+}
+
+func testGVisorProcessLocalDescriptorMatchesUndrivenClaims(t *testing.T) {
+	domain := NewDomain()
+	listener, err := domain.Listen("descriptor-contract")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	factory := domain.Factory()
+	for name, value := range map[string]any{
+		"domain factory": factory,
+		"local listener": listener,
+	} {
+		if _, ok := value.(leafmobility.ImplementationProvider); ok {
+			t.Fatalf("%s %T advertised gvisor_packet_link_rebind without an outer link", name, value)
+		}
+	}
+
+	client, server := dialAndAccept(t, listener)
+	defer client.Close()
+	defer server.Close()
+	assertGVisorClaim(t, client, leafmobility.RoleDialer, leafmobility.ScopeProcessLocal, 0)
+	assertGVisorClaim(t, server, leafmobility.RoleAcceptor, leafmobility.ScopeProcessLocal, 0)
+	for name, path := range map[string]transport.PathConn{"dialed": client, "accepted": server} {
+		facts := path.(leafmobility.Provider).LeafMobilityClaim().Snapshot()
+		if facts.Operations != 0 || facts.ResourceID != (leafmobility.ResourceID{}) {
+			t.Fatalf("%s process-local claim contradicts factory descriptor: %+v", name, facts)
+		}
+	}
+
+	t.Run("wire negotiation and public status", func(t *testing.T) {
+		testProcessLocalDescriptorsAndHelloMatchUndrivenClaims(t)
+	})
 }
 
 func assertGVisorClaim(
@@ -168,7 +212,7 @@ func TestGVisorDomainConcurrentDuplicateListen(t *testing.T) {
 	domain := NewDomain()
 	start := make(chan struct{})
 	type result struct {
-		listener *Listener
+		listener *LocalListener
 		err      error
 	}
 	results := make(chan result, 2)
@@ -209,9 +253,9 @@ func TestGVisorNilDomainFactoryFailsClosed(t *testing.T) {
 }
 
 func TestGVisorListenerCloseUnblocksAcceptPath(t *testing.T) {
-	tests := map[string]func() (*Listener, error){
-		"process-local":  func() (*Listener, error) { return NewDomain().Listen("") },
-		"packet-carried": func() (*Listener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
+	tests := map[string]func() (testGVisorListener, error){
+		"process-local":  func() (testGVisorListener, error) { return NewDomain().Listen("") },
+		"packet-carried": func() (testGVisorListener, error) { return ListenPacket("127.0.0.1:0", WithTrustedCarrier()) },
 	}
 	for name, listen := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -477,7 +521,7 @@ func TestGVisorListenerSessionKind(t *testing.T) {
 	}
 }
 
-func dialAndAccept(t *testing.T, ln *Listener) (transport.PathConn, transport.PathConn) {
+func dialAndAccept(t *testing.T, ln testGVisorListener) (transport.PathConn, transport.PathConn) {
 	t.Helper()
 	type result struct {
 		path transport.PathConn
@@ -488,7 +532,7 @@ func dialAndAccept(t *testing.T, ln *Listener) (transport.PathConn, transport.Pa
 		path, err := ln.AcceptPath(context.Background())
 		accepted <- result{path: path, err: err}
 	}()
-	client, err := ln.Factory().DialPath(context.Background(), transport.PathSpec{
+	client, err := testGVisorFactory(ln).DialPath(context.Background(), transport.PathSpec{
 		Transport: "gvisor",
 		Address:   ln.Addr().String(),
 	})
@@ -523,21 +567,43 @@ func assertRoundTrip(t *testing.T, sender, receiver transport.PathConn, want []b
 	}
 }
 
-func assertNotCleaned(t *testing.T, ln *Listener) {
+func assertNotCleaned(t *testing.T, ln testGVisorListener) {
 	t.Helper()
 	select {
-	case <-ln.cleanupDone:
+	case <-testGVisorBaseListener(ln).cleanupDone:
 		t.Fatal("listener cleaned shared resources while an accepted path was active")
 	default:
 	}
 }
 
-func waitForCleanup(t *testing.T, ln *Listener) {
+func waitForCleanup(t *testing.T, ln testGVisorListener) {
 	t.Helper()
 	select {
-	case <-ln.cleanupDone:
+	case <-testGVisorBaseListener(ln).cleanupDone:
 	case <-time.After(testTimeout):
 		t.Fatal("listener shared-resource cleanup timed out")
+	}
+}
+
+func testGVisorFactory(listener testGVisorListener) transport.PathFactory {
+	switch value := listener.(type) {
+	case *LocalListener:
+		return value.Factory()
+	case *Listener:
+		return value.Factory()
+	default:
+		panic(fmt.Sprintf("unexpected gVisor listener %T", listener))
+	}
+}
+
+func testGVisorBaseListener(listener testGVisorListener) *Listener {
+	switch value := listener.(type) {
+	case *LocalListener:
+		return value.listener
+	case *Listener:
+		return value
+	default:
+		panic(fmt.Sprintf("unexpected gVisor listener %T", listener))
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
+	"github.com/FrankoonG/rendr/transport"
 )
 
 func TestSequenceExhaustionReservesFinalSequenceForTerminalClose(t *testing.T) {
@@ -33,10 +34,11 @@ func TestSequenceExhaustionReservesFinalSequenceForTerminalClose(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			engine := New(SideClient, NewClientFlowID(), Limits{MigrationBudget: 250 * time.Millisecond})
 			t.Cleanup(func() { _ = engine.Close() })
+			targets := configureLeafSelectorRuntime(t, engine, "path")
 			path := newCloseLinearizationPath()
 			path.autoAckBye = true
 			path.byeStarted = make(chan struct{})
-			attachCloseLinearizationPath(t, engine, path)
+			attachCloseLinearizationPath(t, engine, path, targets["path"])
 			atomic.StoreUint64(&engine.sendSeq, proto.MaxSeq-1)
 
 			if err := test.send(engine); err != nil {
@@ -76,6 +78,7 @@ func TestSequenceExhaustionReservesFinalSequenceForTerminalClose(t *testing.T) {
 func TestSequenceExhaustionAndConcurrentCloseShareOneTerminalFrame(t *testing.T) {
 	engine := New(SideClient, NewClientFlowID(), Limits{MigrationBudget: 250 * time.Millisecond})
 	t.Cleanup(func() { _ = engine.Close() })
+	targets := configureLeafSelectorRuntime(t, engine, "path")
 	byeGate := make(chan struct{})
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(byeGate) }) })
@@ -83,7 +86,7 @@ func TestSequenceExhaustionAndConcurrentCloseShareOneTerminalFrame(t *testing.T)
 	path.autoAckBye = true
 	path.byeStarted = make(chan struct{})
 	path.byeGate = byeGate
-	attachCloseLinearizationPath(t, engine, path)
+	attachCloseLinearizationPath(t, engine, path, targets["path"])
 	atomic.StoreUint64(&engine.sendSeq, proto.MaxSeq)
 
 	if _, err := engine.SendData([]byte("exhaust")); !errors.Is(err, ErrSequenceExhausted) {
@@ -135,6 +138,7 @@ func TestSequenceExhaustionRealPeerProvesMaxSequence(t *testing.T) {
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "path")
 
 	const boundary = proto.MaxSeq - 1
 	client.sendMu.Lock()
@@ -160,7 +164,15 @@ func TestSequenceExhaustionRealPeerProvesMaxSequence(t *testing.T) {
 	server.recvAckSent = boundary
 	server.recvMu.Unlock()
 
-	dropPath, serverPath := attachTerminalGapTestPair(t, client, server, boundary, "sequence-boundary-peer")
+	clientPath, serverPath := newSequencerTestPathPair()
+	dropPath := &terminalGapDropPath{
+		sequencerTestPath: clientPath,
+		dropSeq:           boundary,
+		dropped:           make(chan struct{}),
+		replayed:          make(chan struct{}),
+	}
+	attachFixturePath(t, client, dropPath, transport.PathSpec{Transport: "memory", Address: "sequence-boundary-peer"}, targets["path"])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "memory", Address: "sequence-boundary-peer"}, targets["path"])
 
 	payload := []byte("max-sequence-payload")
 	if _, err := client.SendData(payload); err != nil {

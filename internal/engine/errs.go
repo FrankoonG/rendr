@@ -15,6 +15,7 @@ var (
 	ErrGracefulCloseTimeout            = errors.New("rendr: graceful close was not acknowledged")
 	ErrPolicyRejected                  = errors.New("rendr: peer rejected policy transaction")
 	ErrPolicyOutcomeUnknown            = errors.New("rendr: policy transaction outcome is unknown")
+	ErrSelectorDecisionUnavailable     = errors.New("rendr: selector decision is temporarily unavailable")
 	ErrPathAdmissionOutcomeUnknown     = errors.New("rendr: path admission outcome is unknown")
 	ErrPathAdmissionRejected           = errors.New("rendr: path admission rejected")
 	ErrSequenceExhausted               = errors.New("rendr: frame sequence space exhausted")
@@ -26,12 +27,10 @@ var (
 	// the connection should call Close instead.
 	ErrLastPath = errors.New("rendr: cannot remove the only attached path")
 
-	// ErrPacketTooLarge is returned by SendPacket when len(payload)
-	// exceeds engine.MaxPayload. The wire format caps a single DATA
-	// frame at MaxPayload; packet mode preserves boundaries 1-to-1
-	// and so a packet that does not fit is rejected rather than
-	// silently fragmented.
-	ErrPacketTooLarge = errors.New("rendr: packet exceeds MaxPayload")
+	// ErrPacketTooLarge is returned when a packet plus the session DATA
+	// envelope cannot fit the engine or carrier frame budget. Packet mode
+	// preserves boundaries 1-to-1, so it rejects instead of fragmenting.
+	ErrPacketTooLarge = errors.New("rendr: packet exceeds session payload budget")
 
 	// ErrStreamHalfCloseUnsupported is returned when a directional stream FIN
 	// is requested for a packet session.

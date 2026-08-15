@@ -105,9 +105,19 @@ func (slot *pathSlot) quality() transport.PathQuality {
 	if slot == nil || slot.conn == nil {
 		return transport.PathQuality{}
 	}
-	quality := slot.conn.Quality()
+	quality := observePathQualities(
+		[]*pathSlot{slot}, selectorQualityObservationBudget,
+	)[slot]
 	evidence := slot.probeEvidence.Load()
 	if evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) || evidence.lastSuccess.IsZero() {
+		return quality
+	}
+	// Engine probes and adapter telemetry are independent timing sources for
+	// the same physical generation. A historical probe must not permanently
+	// mask a newer adapter observation, especially when an intentionally sparse
+	// probe cadence exceeds the selector freshness window. Probe timeout state
+	// remains authoritative through probeLiveness/pathProbeStatuses.
+	if !quality.At.IsZero() && quality.At.After(evidence.quality.At) {
 		return quality
 	}
 	quality.RTT = evidence.quality.RTT
@@ -157,7 +167,7 @@ func (e *Engine) issuePathProbe(slot *pathSlot) {
 	queuedAt := nowFn()
 	generation := pathProbeGenerationForSlot(slot)
 	fenceEpoch := slot.txFenceEpoch.Load()
-	quality := slot.quality()
+	quality := observePathQualities([]*pathSlot{slot}, selectorQualityObservationBudget)[slot]
 	e.probeMu.Lock()
 	e.expirePathProbesLocked(queuedAt)
 	if e.closing.Load() || e.isClosed() {

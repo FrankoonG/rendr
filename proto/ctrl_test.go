@@ -126,8 +126,8 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestLeafMobilityEnvelope(t *testing.T) {
-	if ProtocolMinor != 15 {
-		t.Fatalf("protocol minor=%d want=15", ProtocolMinor)
+	if ProtocolMinor != 19 {
+		t.Fatalf("protocol minor=%d want=19", ProtocolMinor)
 	}
 	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
@@ -155,6 +155,18 @@ func TestLeafMobilityEnvelope(t *testing.T) {
 	}
 	if FeatureStreamHalfClose != 1<<18 || SupportedFeatures&FeatureStreamHalfClose == 0 || RequiredFeatures&FeatureStreamHalfClose == 0 {
 		t.Fatal("stream half-close feature is not stable and mandatory")
+	}
+	if FeaturePolicyClassSelection != 1<<19 || SupportedFeatures&FeaturePolicyClassSelection == 0 || RequiredFeatures&FeaturePolicyClassSelection == 0 {
+		t.Fatal("policy class selection feature is not stable and mandatory")
+	}
+	if FeatureDataRootSelectorAttribution != 1<<20 || SupportedFeatures&FeatureDataRootSelectorAttribution == 0 || RequiredFeatures&FeatureDataRootSelectorAttribution == 0 {
+		t.Fatal("DATA root selector attribution feature is not stable and mandatory")
+	}
+	if FeaturePolicyEarlyCustody != 1<<21 || SupportedFeatures&FeaturePolicyEarlyCustody == 0 || RequiredFeatures&FeaturePolicyEarlyCustody == 0 {
+		t.Fatal("policy early-custody feature is not stable and mandatory")
+	}
+	if FeaturePolicyCommitChallenge != 1<<22 || SupportedFeatures&FeaturePolicyCommitChallenge == 0 || RequiredFeatures&FeaturePolicyCommitChallenge == 0 {
+		t.Fatal("policy commit-challenge feature is not stable and mandatory")
 	}
 	if NegotiationSize != 80 {
 		t.Fatalf("negotiation size=%d want=80", NegotiationSize)
@@ -435,6 +447,153 @@ func TestStreamHalfCloseFeaturePreventsMinor14HalfNegotiation(t *testing.T) {
 	}
 }
 
+func TestDataRootSelectorAttributionPreventsMinor16HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x7f}
+	manifest := testGraphManifest("data-root-selector-attribution-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  negotiation.GraphBinding(),
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "minor 16", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 16
+			n.Supported &^= FeatureDataRootSelectorAttribution
+			n.Required &^= FeatureDataRootSelectorAttribution
+		}},
+		{name: "feature unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeatureDataRootSelectorAttribution
+			n.Required &^= FeatureDataRootSelectorAttribution
+		}},
+		{name: "feature not required", mutate: func(n *Negotiation) {
+			n.Required &^= FeatureDataRootSelectorAttribution
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, hello), test.mutate)
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, ack), test.mutate)
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+	if legacyV16AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-16 validation accepted minor-17 DATA attribution negotiation")
+	}
+}
+
+func TestPolicyEarlyCustodyPreventsMinor17HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x80}
+	manifest := testGraphManifest("policy-early-custody-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  negotiation.GraphBinding(),
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "minor 17", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 17
+			n.Supported &^= FeaturePolicyEarlyCustody
+			n.Required &^= FeaturePolicyEarlyCustody
+		}},
+		{name: "feature unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeaturePolicyEarlyCustody
+			n.Required &^= FeaturePolicyEarlyCustody
+		}},
+		{name: "feature not required", mutate: func(n *Negotiation) {
+			n.Required &^= FeaturePolicyEarlyCustody
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, hello), test.mutate)
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, ack), test.mutate)
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+	if legacyV17AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-17 validation accepted minor-18 early-custody negotiation")
+	}
+}
+
+func TestPolicyCommitChallengePreventsMinor18HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x81}
+	manifest := testGraphManifest("policy-commit-challenge-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  negotiation.GraphBinding(),
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "minor 18", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 18
+			n.Supported &^= FeaturePolicyCommitChallenge
+			n.Required &^= FeaturePolicyCommitChallenge
+		}},
+		{name: "feature unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeaturePolicyCommitChallenge
+			n.Required &^= FeaturePolicyCommitChallenge
+		}},
+		{name: "feature not required", mutate: func(n *Negotiation) {
+			n.Required &^= FeaturePolicyCommitChallenge
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, hello), test.mutate)
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, ack), test.mutate)
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+	if legacyV18AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-18 validation accepted minor-19 commit-challenge negotiation")
+	}
+}
+
 func TestHigherMinorMayAdvertiseUnknownOptionalFeature(t *testing.T) {
 	flow := [16]byte{0x7b}
 	manifest := testGraphManifest("future-optional-feature")
@@ -488,6 +647,27 @@ func legacyV14AcceptsNegotiation(n Negotiation) bool {
 	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 14 &&
 		n.Required&^legacyV14FeatureMask == 0 && n.Required&^n.Supported == 0 &&
 		legacyV14FeatureMask&^n.Supported == 0
+}
+
+func legacyV16AcceptsNegotiation(n Negotiation) bool {
+	const legacyV16FeatureMask FeatureSet = 0xfffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 16 &&
+		n.Required&^legacyV16FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV16FeatureMask&^n.Supported == 0
+}
+
+func legacyV17AcceptsNegotiation(n Negotiation) bool {
+	const legacyV17FeatureMask FeatureSet = 0x1fffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 17 &&
+		n.Required&^legacyV17FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV17FeatureMask&^n.Supported == 0
+}
+
+func legacyV18AcceptsNegotiation(n Negotiation) bool {
+	const legacyV18FeatureMask FeatureSet = 0x3fffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 18 &&
+		n.Required&^legacyV18FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV18FeatureMask&^n.Supported == 0
 }
 
 func TestServerAssignedSessionEpochIsMandatoryOnCurrentMinor(t *testing.T) {
@@ -626,7 +806,7 @@ func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
 		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
 	}
 	helloWire := mustHelloWire(t, hello)
-	wantPrefix, err := hex.DecodeString("0001000f00050004000000000007ffff000000000007ffff")
+	wantPrefix, err := hex.DecodeString("000100130005000400000000007fffff00000000007fffff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1235,7 +1415,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("0001000f00000000000000000007ffff000000000007ffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("000100130000000000000000007fffff00000000007fffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

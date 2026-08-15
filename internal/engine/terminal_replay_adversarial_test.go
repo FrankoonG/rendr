@@ -7,7 +7,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,12 +91,10 @@ func (p *terminalReplayClosePath) OnDeath(fn func(transport.DeathCause, error)) 
 func (*terminalReplayClosePath) LocalAddr() string  { return "terminal-replay-local" }
 func (*terminalReplayClosePath) RemoteAddr() string { return "terminal-replay-remote" }
 
-func attachTerminalReplayClosePath(t *testing.T, e *Engine, path *terminalReplayClosePath) {
+func attachTerminalReplayClosePath(t *testing.T, e *Engine, path *terminalReplayClosePath, targetID proto.TargetID) {
 	t.Helper()
 	path.owner = e
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "test", Address: "terminal-replay"}); err != nil {
-		t.Fatal(err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "test", Address: "terminal-replay"}, targetID)
 }
 
 func TestConcurrentGracefulAndCloseWaitForTeardownAndShareCarrierError(t *testing.T) {
@@ -105,11 +102,12 @@ func TestConcurrentGracefulAndCloseWaitForTeardownAndShareCarrierError(t *testin
 	writeRelease := make(chan struct{})
 	closeRelease := make(chan struct{})
 	e := New(SideClient, [16]byte{0xd1}, Limits{MigrationBudget: time.Second}.Clamp())
+	targets := configureLeafSelectorRuntime(t, e, "path")
 	path := newTerminalReplayClosePath()
 	path.closeErr = carrierErr
 	path.writeRelease = writeRelease
 	path.closeRelease = closeRelease
-	attachTerminalReplayClosePath(t, e, path)
+	attachTerminalReplayClosePath(t, e, path, targets["path"])
 
 	gracefulDone := make(chan error, 1)
 	go func() { gracefulDone <- e.GracefulClose(proto.ByeNormal) }()
@@ -152,10 +150,11 @@ func TestConcurrentGracefulClosePreservesTeardownTimeout(t *testing.T) {
 	writeRelease := make(chan struct{})
 	closeRelease := make(chan struct{})
 	e := New(SideClient, [16]byte{0xd2}, Limits{MigrationBudget: time.Second}.Clamp())
+	targets := configureLeafSelectorRuntime(t, e, "path")
 	path := newTerminalReplayClosePath()
 	path.writeRelease = writeRelease
 	path.closeRelease = closeRelease
-	attachTerminalReplayClosePath(t, e, path)
+	attachTerminalReplayClosePath(t, e, path, targets["path"])
 
 	gracefulDone := make(chan error, 1)
 	go func() { gracefulDone <- e.GracefulClose(proto.ByeNormal) }()
@@ -197,10 +196,12 @@ func TestPeerEOFFollowedByImmediateAppCloseRetriesDroppedTerminalACK(t *testing.
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "path")
 
 	clientPath, serverPath := newSequencerTestPathPair()
 	serverPath.dropFirstAck.Store(true)
-	attachSequencerPair(t, client, server, clientPath, serverPath, "peer-eof-immediate-close")
+	attachFixturePath(t, client, clientPath, transport.PathSpec{Transport: "memory", Address: "peer-eof-immediate-close"}, targets["path"])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "memory", Address: "peer-eof-immediate-close"}, targets["path"])
 
 	clientClose := make(chan error, 1)
 	go func() { clientClose <- client.GracefulClose(proto.ByeNormal) }()
@@ -232,10 +233,17 @@ func TestPeerEOFFollowedByImmediateAppCloseRetriesDroppedTerminalACK(t *testing.
 	}
 }
 
+func setTerminalReplayZombieLeftForTrip(e *Engine) {
+	e.zombieMu.Lock()
+	e.zombieLeft = 1
+	e.zombieLastMig = time.Time{}
+	e.zombieMu.Unlock()
+}
+
 func TestZombieTicketCommitSerializesCompetingTerminalCause(t *testing.T) {
 	e := New(SideClient, [16]byte{0xd4}, Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
-	setZombieLeftForTrip(t, e)
+	setTerminalReplayZombieLeftForTrip(e)
 	ticket := e.accountMigration()
 	commitEntered := make(chan struct{})
 	commitRelease := make(chan struct{})
@@ -275,8 +283,9 @@ func TestZombieTicketCommitSerializesCompetingTerminalCause(t *testing.T) {
 func TestReplayStatsCannotMixOccupancyAndACKGenerations(t *testing.T) {
 	e := New(SideClient, [16]byte{0xd5}, Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "path")
 	path := newCloseLinearizationPath()
-	attachCloseLinearizationPath(t, e, path)
+	attachCloseLinearizationPath(t, e, path, targets["path"])
 	if err := e.SendPacket([]byte("snapshot")); err != nil {
 		t.Fatal(err)
 	}
@@ -306,10 +315,9 @@ func TestReplayStatsCannotMixOccupancyAndACKGenerations(t *testing.T) {
 
 func TestCloseReleasesReplayPayloadCreditsAndWakesWaiters(t *testing.T) {
 	e := New(SideClient, [16]byte{0xd6}, Limits{}.Clamp())
+	targets := configureLeafSelectorRuntime(t, e, "path")
 	path := newReplayBudgetPath()
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "test", Address: "close-replay"}); err != nil {
-		t.Fatal(err)
-	}
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "test", Address: "close-replay"}, targets["path"])
 	payload := bytes.Repeat([]byte{0x6d}, 1024)
 	if _, err := e.SendData(payload); err != nil {
 		t.Fatal(err)
@@ -396,6 +404,36 @@ func (p *retiredCloseErrorPath) Close() error {
 	return errors.Join(p.err, err)
 }
 
+type terminalReplayRecordingPath struct {
+	*sequencerTestPath
+
+	mu      sync.Mutex
+	headers []proto.Header
+}
+
+func (p *terminalReplayRecordingPath) Write(frame []byte) (int, error) {
+	if len(frame) >= proto.HeaderSize {
+		if header, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil {
+			p.mu.Lock()
+			p.headers = append(p.headers, header)
+			p.mu.Unlock()
+		}
+	}
+	return p.sequencerTestPath.Write(frame)
+}
+
+func (p *terminalReplayRecordingPath) streamFINSequences() []uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var sequences []uint64
+	for _, header := range p.headers {
+		if header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlStreamFin {
+			sequences = append(sequences, header.Seq)
+		}
+	}
+	return sequences
+}
+
 func TestRetiredPathCloseErrorIsReportedBySessionClose(t *testing.T) {
 	retiredErr := errors.New("injected retired path close failure")
 	e := New(SideClient, [16]byte{0xd7}, Limits{}.Clamp())
@@ -429,12 +467,17 @@ func TestStreamFINReplaysAcrossCarrierFailureExactlyOnce(t *testing.T) {
 		_ = client.Close()
 		_ = server.Close()
 	})
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "fin-failure", "fin-survivor")
 
-	failedClient, failedServer := newSequencerTestPathPair()
-	survivorClient, survivorServer := newSequencerTestPathPair()
+	failedClientBase, failedServer := newSequencerTestPathPair()
+	survivorClientBase, survivorServer := newSequencerTestPathPair()
+	failedClient := &terminalReplayRecordingPath{sequencerTestPath: failedClientBase}
+	survivorClient := &terminalReplayRecordingPath{sequencerTestPath: survivorClientBase}
 	failedClient.dieFirstWrite.Store(true)
-	failedClientID, failedServerID := attachSequencerPair(t, client, server, failedClient, failedServer, "fin-failure")
-	attachSequencerPair(t, client, server, survivorClient, survivorServer, "fin-survivor")
+	failedClientID := attachFixturePath(t, client, failedClient, transport.PathSpec{Transport: "memory", Address: "fin-failure"}, targets["fin-failure"])
+	failedServerID := attachFixturePath(t, server, failedServer, transport.PathSpec{Transport: "memory", Address: "fin-failure"}, targets["fin-failure"])
+	attachFixturePath(t, client, survivorClient, transport.PathSpec{Transport: "memory", Address: "fin-survivor"}, targets["fin-survivor"])
+	attachFixturePath(t, server, survivorServer, transport.PathSpec{Transport: "memory", Address: "fin-survivor"}, targets["fin-survivor"])
 
 	if err := client.SendStreamFin(); err != nil {
 		t.Fatalf("SendStreamFin across path death: %v", err)
@@ -448,11 +491,21 @@ func TestStreamFINReplaysAcrossCarrierFailureExactlyOnce(t *testing.T) {
 	if _, err := server.Recv(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("replayed FIN Recv=%v, want EOF", err)
 	}
+	failedFINs := failedClient.streamFINSequences()
+	survivorFINs := survivorClient.streamFINSequences()
+	if len(failedFINs) == 0 || len(survivorFINs) == 0 {
+		t.Fatalf("FIN attempts failed/survivor=%v/%v, want both carriers exercised", failedFINs, survivorFINs)
+	}
+	finSequence := failedFINs[0]
+	for _, attempts := range [][]uint64{failedFINs, survivorFINs} {
+		for _, sequence := range attempts {
+			if sequence != finSequence {
+				t.Fatalf("FIN attempts failed/survivor=%v/%v, want one unique sequence", failedFINs, survivorFINs)
+			}
+		}
+	}
 	if err := client.SendStreamFin(); err != nil {
 		t.Fatalf("idempotent SendStreamFin: %v", err)
-	}
-	if seq := atomic.LoadUint64(&client.sendSeq); seq != 1 {
-		t.Fatalf("idempotent FIN allocated %d sequences, want 1", seq)
 	}
 	if failedClient.writes.Load() == 0 || survivorClient.writes.Load() == 0 {
 		t.Fatalf("FIN dispatches failed/survivor=%d/%d, want both carriers exercised",
@@ -476,4 +529,49 @@ func TestStreamFINReplaysAcrossCarrierFailureExactlyOnce(t *testing.T) {
 	if !bytes.Equal(got, response) {
 		t.Fatalf("reverse payload=%q want=%q", got, response)
 	}
+}
+
+func TestStreamFINIdempotenceHasOneLogicalPublication(t *testing.T) {
+	e := New(SideClient, [16]byte{0xd9}, Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	targets := configureLeafSelectorRuntime(t, e, "fin")
+	path := newLifecycleHealthyPath()
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: "fin"}, targets["fin"])
+
+	if err := e.SendStreamFin(); err != nil {
+		t.Fatal(err)
+	}
+	e.sendHistMu.Lock()
+	publications := streamFINLedgerSequences(e.sendHist.entries)
+	e.sendHistMu.Unlock()
+	if len(publications) != 1 {
+		t.Fatalf("logical FIN publications=%v want exactly one", publications)
+	}
+	sequenceAfterFirst := e.sendPublishedNext.Load()
+	if err := e.SendStreamFin(); err != nil {
+		t.Fatalf("idempotent FIN: %v", err)
+	}
+	e.sendHistMu.Lock()
+	after := streamFINLedgerSequences(e.sendHist.entries)
+	e.sendHistMu.Unlock()
+	if len(after) != 1 || after[0] != publications[0] {
+		t.Fatalf("idempotent FIN changed ledger: before=%v after=%v", publications, after)
+	}
+	if published := e.sendPublishedNext.Load(); published != sequenceAfterFirst {
+		t.Fatalf("idempotent FIN advanced publication frontier %d -> %d", sequenceAfterFirst, published)
+	}
+}
+
+func streamFINLedgerSequences(entries []sendHistoryEntry) []uint64 {
+	var sequences []uint64
+	for _, entry := range entries {
+		if len(entry.frame) < proto.HeaderSize {
+			continue
+		}
+		header, err := proto.DecodeHeader(entry.frame[:proto.HeaderSize])
+		if err == nil && header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlStreamFin {
+			sequences = append(sequences, header.Seq)
+		}
+	}
+	return sequences
 }

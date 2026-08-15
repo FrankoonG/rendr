@@ -54,9 +54,8 @@ func TestReplayBudgetPublishesBeyondLegacyFrameCliff(t *testing.T) {
 	}
 	e := New(SideClient, [16]byte{0xb1}, Limits{})
 	defer e.Close()
-	if _, err := e.AttachPath(newReplayBudgetPath(), transport.PathSpec{Transport: "budget", Address: "path"}); err != nil {
-		t.Fatal(err)
-	}
+	ids := configureLeafSelectorRuntime(t, e, "path")
+	attachFixturePath(t, e, newReplayBudgetPath(), transport.PathSpec{Transport: "budget", Address: "path"}, ids["path"])
 	for sequence := 0; sequence <= legacyFrameLimit; sequence++ {
 		if err := e.SendPacket([]byte{byte(sequence)}); err != nil {
 			t.Fatalf("publish frame %d: %v", sequence, err)
@@ -83,6 +82,7 @@ func TestReplayBudgetRecoversHighBDPFlightAfterPathDeath(t *testing.T) {
 	limits := Limits{MigrationBudget: 3 * time.Second}.Clamp()
 	client := New(SideClient, flow, limits)
 	server := New(SideServer, flow, limits)
+	ids := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "high-bdp", "survivor")
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = server.Close()
@@ -93,8 +93,14 @@ func TestReplayBudgetRecoversHighBDPFlightAfterPathDeath(t *testing.T) {
 	// Successful writes are held in the simulated path BDP and never reach the
 	// peer. Killing the path discards that entire unacknowledged flight.
 	delayedClient.dropWrites.Store(true)
-	deadClientID, deadServerID := attachSequencerPair(t, client, server, delayedClient, delayedServer, "high-bdp")
-	attachSequencerPair(t, client, server, survivorClient, survivorServer, "survivor")
+	deadClientID := attachFixturePath(t, client, delayedClient,
+		transport.PathSpec{Transport: "memory", Address: "high-bdp"}, ids["high-bdp"])
+	deadServerID := attachFixturePath(t, server, delayedServer,
+		transport.PathSpec{Transport: "memory", Address: "high-bdp"}, ids["high-bdp"])
+	attachFixturePath(t, client, survivorClient,
+		transport.PathSpec{Transport: "memory", Address: "survivor"}, ids["survivor"])
+	attachFixturePath(t, server, survivorServer,
+		transport.PathSpec{Transport: "memory", Address: "survivor"}, ids["survivor"])
 
 	want := make([]byte, highBDPReplayFrames*highBDPPayloadSize)
 	for frameIndex := 0; frameIndex < highBDPReplayFrames; frameIndex++ {

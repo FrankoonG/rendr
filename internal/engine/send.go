@@ -22,11 +22,14 @@ func (e *Engine) SendData(buf []byte) (int, error) {
 	if e.sendWriteClosed.Load() {
 		return 0, io.ErrClosedPipe
 	}
+	runtime, err := e.requireLocalExecutionRuntime()
+	if err != nil {
+		return 0, err
+	}
 	if err := e.acquireApplicationWritePermit(); err != nil {
 		return 0, err
 	}
 	defer e.releaseApplicationWritePermit()
-	runtime := e.localExecutionRuntime()
 	sent := 0
 	for sent < len(buf) {
 		end := sent + MaxPayload
@@ -52,6 +55,9 @@ func (e *Engine) SendStreamFin() error {
 	if e.packetized {
 		return ErrStreamHalfCloseUnsupported
 	}
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return err
+	}
 	e.streamFinOnce.Do(func() {
 		e.sendWriteClosed.Store(true)
 		e.streamFinErr = e.sendFrame(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlStreamFin), nil)
@@ -62,9 +68,10 @@ func (e *Engine) SendStreamFin() error {
 }
 
 // SendPacket emits exactly one DATA frame carrying buf as payload.
-// Returns ErrPacketTooLarge if len(buf) > MaxPayload. Unlike SendData,
-// this never fragments: packet-boundary semantics require the receiver
-// see the same byte boundary the sender drew. Zero-length buf is
+// Returns ErrPacketTooLarge if buf plus the session DATA envelope exceeds
+// either MaxPayload or the tightest admitted path frame budget. Unlike
+// SendData, this never fragments: packet-boundary semantics require the
+// receiver see the same byte boundary the sender drew. Zero-length buf is
 // legal and produces a zero-payload DATA frame (keepalive shape).
 //
 // Hard rule #1 still applies: a migration in flight blocks SendPacket
@@ -78,13 +85,17 @@ func (e *Engine) SendPacket(buf []byte) error {
 // ledger before an error. It lets net.PacketConn preserve atomic n semantics:
 // callers observe either zero or the complete datagram length, never a prefix.
 func (e *Engine) SendPacketResult(buf []byte) (bool, error) {
-	if len(buf) > MaxPayload {
-		return false, ErrPacketTooLarge
+	if err := e.validatePacketPayloadSize(len(buf)); err != nil {
+		return false, err
 	}
 	if e.sendWriteClosed.Load() {
 		return false, io.ErrClosedPipe
 	}
-	return e.sendPacketDataFrameConcurrent(buf, e.localExecutionRuntime(), false)
+	runtime, err := e.requireLocalExecutionRuntime()
+	if err != nil {
+		return false, err
+	}
+	return e.sendPacketDataFrameConcurrent(buf, runtime, false)
 }
 
 // SendPacketAcceptedResult is the net.PacketConn send path. When a flat
@@ -94,21 +105,32 @@ func (e *Engine) SendPacketResult(buf []byte) (bool, error) {
 // admission, releases that custody. Other graph shapes and deadline-bearing
 // writes retain synchronous physical-dispatch semantics.
 func (e *Engine) SendPacketAcceptedResult(buf []byte) (bool, error) {
-	if len(buf) > MaxPayload {
-		return false, ErrPacketTooLarge
+	if err := e.validatePacketPayloadSize(len(buf)); err != nil {
+		return false, err
 	}
 	if e.sendWriteClosed.Load() {
 		return false, io.ErrClosedPipe
 	}
-	return e.sendPacketDataFrameConcurrent(buf, e.localExecutionRuntime(), true)
+	runtime, err := e.requireLocalExecutionRuntime()
+	if err != nil {
+		return false, err
+	}
+	return e.sendPacketDataFrameConcurrent(buf, runtime, true)
 }
 
 // SendBye emits the final sequenced frame. It shares the same sequencer as
 // DATA so a concurrent successful Write is always ordered before the final
 // sequence number and the receiver cannot observe an early clean EOF.
 func (e *Engine) SendBye(reason proto.ByeReason) error {
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return err
+	}
 	e.sessionEpochMu.Lock()
+	e.policyLifecycleMu.Lock()
+	e.policyStateMu.Lock()
 	e.sendClosing.Store(true)
+	e.policyStateMu.Unlock()
+	e.policyLifecycleMu.Unlock()
 	e.sessionEpochMu.Unlock()
 	e.terminalOnce.Do(func() {
 		e.terminalErr = e.sendTerminalFrame(reason)
@@ -130,11 +152,26 @@ func (e *Engine) sendFrame(t proto.FrameType, flags uint16, payload []byte) erro
 // immutable bytes owned by the replay ledger. Transaction retries can
 // redispatch these bytes without allocating another SEQ or control slot.
 func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byte) ([]byte, error) {
+	return e.sendFrameTrackedMode(t, flags, payload, false)
+}
+
+// sendFrameTrackedDetached publishes a sequenced frame under sendMu, then
+// releases the sequencer before waiting for physical dispatch. It is reserved
+// for controls whose caller treats replay-ledger custody as acceptance. Other
+// protocol transactions keep synchronous sendMu ownership through dispatch.
+func (e *Engine) sendFrameTrackedDetached(t proto.FrameType, flags uint16, payload []byte) ([]byte, error) {
+	return e.sendFrameTrackedMode(t, flags, payload, true)
+}
+
+func (e *Engine) sendFrameTrackedMode(t proto.FrameType, flags uint16, payload []byte, detached bool) ([]byte, error) {
 	if e.sendClosing.Load() {
 		return nil, net.ErrClosed
 	}
 	if t == proto.FrameData && e.sendWriteClosed.Load() {
 		return nil, io.ErrClosedPipe
+	}
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return nil, err
 	}
 	control := t == proto.FrameCtrl
 	frameBytes := proto.HeaderSize + len(payload)
@@ -142,22 +179,85 @@ func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byt
 		return nil, err
 	}
 	e.sendMu.Lock()
-	defer e.sendMu.Unlock()
+	sendLocked := true
+	defer func() {
+		if sendLocked {
+			e.sendMu.Unlock()
+		}
+	}()
 
+	frame, seq, err := e.publishTrackedFrameLocked(t, flags, payload, frameBytes)
+	if err != nil {
+		return nil, err
+	}
+	if detached {
+		e.sendMu.Unlock()
+		sendLocked = false
+	}
+	// Publication means the SEQ has a replay owner and may now be observed by
+	// any path. Advancing before dispatch lets a fast race child ACK while a
+	// slower sibling is still inside Write without having that ACK rejected.
+	err = e.dispatchTrackedFrame(frame, seq)
+	return frame, err
+}
+
+// sendFrameTrackedPreemptingReplay publishes a control frame that must make
+// progress even when a selector cutover is synchronously replaying DATA on a
+// blocked carrier. The temporary cutover wakes that replay and transfers its
+// immutable prefix back to the ledger. Once this goroutine owns sendMu it
+// closes the cutover and publishes the control before bounded replay resumes.
+func (e *Engine) sendFrameTrackedPreemptingReplay(t proto.FrameType, flags uint16, payload []byte) ([]byte, error) {
+	if t != proto.FrameCtrl {
+		return nil, errors.New("engine: only control frames may preempt replay")
+	}
+	if e.sendClosing.Load() {
+		return nil, net.ErrClosed
+	}
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return nil, err
+	}
+	frameBytes := proto.HeaderSize + len(payload)
+	if err := e.acquireSendSlot(true, frameBytes); err != nil {
+		return nil, err
+	}
+
+	cutoverGeneration := e.beginSelectorCutover()
+	e.sendMu.Lock()
+	handedOff := e.selectorCutoverDidHandoff(cutoverGeneration)
+	replayTarget := e.sendPublishedNext.Load()
+	e.finishSelectorCutover(cutoverGeneration)
+
+	frame, seq, err := e.publishTrackedFrameLocked(t, flags, payload, frameBytes)
+	if err == nil {
+		err = e.dispatchTrackedReplayPreemptingControl(frame, seq)
+	}
+	e.sendMu.Unlock()
+
+	if handedOff {
+		e.requestReplayRange(e.sendAckNext.Load(), replayTarget)
+	}
+	return frame, err
+}
+
+// publishTrackedFrameLocked allocates one sequence and transfers the complete
+// immutable frame into replay-ledger custody. The caller owns sendMu and has
+// already reserved the matching send slot.
+func (e *Engine) publishTrackedFrameLocked(t proto.FrameType, flags uint16, payload []byte, frameBytes int) ([]byte, uint64, error) {
+	control := t == proto.FrameCtrl
 	if e.isClosed() || e.sendClosing.Load() {
 		e.releaseSendSlot(control, frameBytes)
-		return nil, net.ErrClosed
+		return nil, 0, net.ErrClosed
 	}
 	if t == proto.FrameData && e.sendWriteClosed.Load() {
 		e.releaseSendSlot(control, frameBytes)
-		return nil, io.ErrClosedPipe
+		return nil, 0, io.ErrClosedPipe
 	}
 
 	seq, err := e.allocateSendSequence(false)
 	if err != nil {
 		e.releaseSendSlot(control, frameBytes)
 		e.beginSequenceExhaustionClose()
-		return nil, err
+		return nil, 0, err
 	}
 	hdr := proto.Header{
 		Version: proto.Version,
@@ -168,26 +268,39 @@ func (e *Engine) sendFrameTracked(t proto.FrameType, flags uint16, payload []byt
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
 		e.releaseSendSlot(control, frameBytes)
-		return nil, err
+		return nil, 0, err
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
-	if err := e.reserveOwnedSendFrame(frame); err != nil {
+	if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
 		e.releaseSendSlot(control, frameBytes)
-		return nil, err
+		return nil, 0, err
 	}
-	// Publication means the SEQ has a replay owner and may now be observed by
-	// any path. Advancing before dispatch lets a fast race child ACK while a
-	// slower sibling is still inside Write without having that ACK rejected.
-	e.publishSendSeq(seq + 1)
-	err = e.dispatch(frame, true)
+	return frame, seq, nil
+}
+
+func (e *Engine) dispatchTrackedFrame(frame []byte, seq uint64) error {
+	err := e.dispatch(frame, true)
+	return e.finishTrackedFrameDispatch(frame, seq, err)
+}
+
+func (e *Engine) dispatchTrackedReplayPreemptingControl(frame []byte, seq uint64) error {
+	runtime := e.localExecutionRuntime()
+	if runtime == nil {
+		return errExecutionRuntimeNotConfigured
+	}
+	err := e.dispatchRecursiveReplayPreemptingControl(frame, runtime)
+	return e.finishTrackedFrameDispatch(frame, seq, err)
+}
+
+func (e *Engine) finishTrackedFrameDispatch(frame []byte, seq uint64, err error) error {
 	if errors.Is(err, errSelectorCutoverHandoff) {
 		err = nil
 	}
 	if err == nil {
 		e.armTailReplayForFrame(frame, seq+1)
 	}
-	return frame, err
+	return err
 }
 
 func (e *Engine) replaySequencedFrame(frame []byte) error {
@@ -209,6 +322,9 @@ func (e *Engine) dispatchReplayFrameLocked(frame []byte) error {
 }
 
 func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return err
+	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 	if e.isClosed() {
@@ -231,10 +347,9 @@ func (e *Engine) sendTerminalFrame(reason proto.ByeReason) error {
 		return err
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	if err := e.reserveOwnedTerminalFrame(frame); err != nil {
+	if err := e.reserveAndPublishOwnedTerminalFrame(frame); err != nil {
 		return err
 	}
-	e.publishSendSeq(seq + 1)
 	err = e.dispatch(frame, true)
 	if errors.Is(err, errSelectorCutoverHandoff) {
 		err = nil
@@ -274,193 +389,35 @@ func (e *Engine) beginSequenceExhaustionClose() {
 
 func (e *Engine) publishSendSeq(next uint64) {
 	e.sendHistMu.Lock()
-	if next > e.sendPublishedNext.Load() {
-		e.sendPublishedNext.Store(next)
-		e.sendHist.generation++
-	}
+	e.publishSendSeqLocked(next)
 	e.sendHistMu.Unlock()
 }
 
-// dispatch writes a fully-built frame on the path(s) appropriate to
-// the current Mode:
-//
-//	selector / 0 (default) - write on the single active path
-//	race                - write on every attached path
-//	bond                - round-robin frame-level across all paths
-//
-// The race path returns nil as long as at least one path succeeded
-// (receiver dedup handles duplicates). It returns
-// ErrMigrationBudgetExceeded only when there are no usable paths
-// after the budget.
+func (e *Engine) publishSendSeqLocked(next uint64) {
+	current := e.sendPublishedNext.Load()
+	if next > current {
+		if next == 0 {
+			panic("engine: zero sequenced publication frontier")
+		}
+		entry := e.sendHistoryEntryLocked(next - 1)
+		if entry == nil {
+			panic("engine: sequenced publication is missing its replay owner")
+		}
+		e.publishRootAttributionLocked(entry)
+		e.sendPublishedNext.Store(next)
+		e.sendHist.generation++
+	}
+}
+
+// dispatch writes one immutable frame through the configured recursive target
+// graph. There is no flat mode fallback: an engine without a runtime cannot
+// infer target ownership from physical path IDs.
 func (e *Engine) dispatch(frame []byte, firstPublication bool) error {
-	if runtime := e.localExecutionRuntime(); runtime != nil {
-		return e.dispatchRecursive(frame, runtime, firstPublication)
+	runtime := e.localExecutionRuntime()
+	if runtime == nil {
+		return errExecutionRuntimeNotConfigured
 	}
-	switch e.mode.Load() {
-	case dispatchRace:
-		return e.dispatchRace(frame, firstPublication)
-	case dispatchBond:
-		return e.dispatchBond(frame, firstPublication)
-	default:
-		return e.dispatchSingle(frame, firstPublication)
-	}
-}
-
-func (e *Engine) dispatchSingle(frame []byte, firstPublication bool) error {
-	for {
-		if e.isClosed() {
-			return net.ErrClosed
-		}
-		e.pathsMu.RLock()
-		id := e.activeID
-		var slot *pathSlot
-		if id != 0 {
-			if s, ok := e.paths[id]; ok {
-				slot = s
-			}
-		}
-		e.pathsMu.RUnlock()
-
-		if slot == nil {
-			if err := e.waitForPath(); err != nil {
-				return err
-			}
-			continue
-		}
-
-		n, err := slot.writeDispatchedFrame(frame)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				continue
-			}
-			return err
-		}
-		if n != len(frame) {
-			return io.ErrShortWrite
-		}
-		if slot != nil {
-			slot.lastSendUnixNano.Store(nowFn().UnixNano())
-			slot.recordDispatch(frame, firstPublication)
-		}
-		return nil
-	}
-}
-
-// dispatchBond writes one frame to one path, with path-pinning:
-// after picking a path, the next bondPinSize-1 frames stay on it
-// before bondCursor advances. This bounds reorder-window growth
-// under RTT skew between paths.
-//
-// A path whose latest probe RTT exceeds best_rtt *
-// BondStuckRTTMultiplier (default 3x) is skipped on round-robin;
-// if the currently-pinned path goes stuck mid-window, the pin is
-// broken early and the cursor advances. Paths with zero RTT
-// (unmeasured: fresh attach, no probe reply yet) are never
-// considered stuck.
-//
-// PathSpec.Weight controls each path's share of pin windows. A zero
-// weight means 1. Redistribute-on-death replays only frames newer
-// than the peer's latest cumulative ACK, with the bounded recent
-// window as the conservative fallback when no ACK has arrived yet.
-func (e *Engine) dispatchBond(frame []byte, firstPublication bool) error {
-	for {
-		if e.isClosed() {
-			return net.ErrClosed
-		}
-		e.pathsMu.Lock()
-		if len(e.paths) == 0 {
-			e.pathsMu.Unlock()
-			if err := e.waitForPath(); err != nil {
-				return err
-			}
-			continue
-		}
-		// Stable order so round-robin is deterministic across paths.
-		ids := make([]uint32, 0, len(e.paths))
-		for id := range e.paths {
-			if !e.dispatchScopeAllowsLocked(id) {
-				continue
-			}
-			ids = append(ids, id)
-		}
-		if len(ids) == 0 {
-			e.pathsMu.Unlock()
-			if err := e.waitForPath(); err != nil {
-				return err
-			}
-			continue
-		}
-		for i := 1; i < len(ids); i++ {
-			for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
-				ids[j-1], ids[j] = ids[j], ids[j-1]
-			}
-		}
-		weights, totalWeight := e.bondWeightsLocked(ids)
-		stuck := e.computeBondStuckMask(ids)
-
-		// If pin window still has frames AND current path is not
-		// stuck, keep using it.
-		idx := -1
-		if e.bondPinLeft > 0 {
-			cur := bondWeightedIndex(weights, totalWeight, e.bondCursor)
-			if !stuck[cur] {
-				idx = cur
-			} else {
-				// Mid-pin: pinned path went stuck, force re-pick.
-				e.bondStuckSkips++
-			}
-		}
-		if idx < 0 {
-			// Pin expired OR current went stuck. Advance until we
-			// land on a non-stuck path, or give up after one full
-			// rotation (all paths stuck).
-			pin := e.limits.BondPinSize
-			if e.Packetized() {
-				// Packet-mode bond on QUIC DATAGRAM is the G3 hot
-				// path: per-path 8-frame pinning creates avoidable
-				// microbursts that can overflow datagram queues and
-				// manifest as one missing SEQ that stalls the strict
-				// reorder window behind it. Stream-mode keeps the
-				// default pinning; packet-mode smooths to frame-by-
-				// frame round-robin.
-				pin = 1
-			}
-			chosen := -1
-			for i := uint64(0); i < totalWeight; i++ {
-				e.bondCursor++
-				j := bondWeightedIndex(weights, totalWeight, e.bondCursor)
-				if !stuck[j] {
-					chosen = j
-					break
-				}
-				// Path skipped because it is stuck.
-				e.bondStuckSkips++
-			}
-			if chosen < 0 {
-				chosen = bondWeightedIndex(weights, totalWeight, e.bondCursor)
-			}
-			idx = chosen
-			e.bondPinLeft = pin
-		}
-		e.bondPinLeft--
-		slot := e.paths[ids[idx]]
-		e.pathsMu.Unlock()
-
-		n, err := slot.writeDispatchedFrame(frame)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				// Path died mid-write; pick again.
-				continue
-			}
-			return err
-		}
-		if n != len(frame) {
-			return io.ErrShortWrite
-		}
-		slot.lastSendUnixNano.Store(nowFn().UnixNano())
-		slot.recordDispatch(frame, firstPublication)
-		return nil
-	}
+	return e.dispatchRecursive(frame, runtime, firstPublication)
 }
 
 func (e *Engine) redistributeFrames(frames [][]byte) error {
@@ -479,11 +436,6 @@ func (e *Engine) redistributeFramesLocked(frames [][]byte) error {
 		}
 		if err := e.dispatchReplayFrameLocked(frame); err != nil {
 			return err
-		}
-		if len(frame) >= proto.HeaderSize {
-			if hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize]); err == nil {
-				e.publishSendSeq(hdr.Seq + 1)
-			}
 		}
 	}
 	return nil
@@ -688,11 +640,13 @@ func (e *Engine) replayRangeUntilSent(nextSeq, target uint64) {
 		if len(frames) == 0 {
 			return
 		}
-		if err := e.redistributeFrames(frames); err == nil {
-			if target == e.sendPublishedNext.Load() {
-				e.armTailReplayForFrame(frames[len(frames)-1], target)
+		if e.ActivePath() != 0 {
+			if err := e.redistributeFrames(frames); err == nil {
+				if target == e.sendPublishedNext.Load() {
+					e.armTailReplayForFrame(frames[len(frames)-1], target)
+				}
+				return
 			}
-			return
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -767,7 +721,9 @@ func (e *Engine) replayGapUntilAcknowledged(nextSeq, target uint64) {
 		if len(frame) == 0 {
 			return
 		}
-		_ = e.replaySequencedFrame(frame)
+		if e.ActivePath() != 0 {
+			_ = e.replaySequencedFrame(frame)
+		}
 
 		timer := time.NewTimer(backoff)
 	waitForProgress:
@@ -828,12 +784,14 @@ func (e *Engine) replayUntilSent(nextSeq uint64) {
 		if len(frames) == 0 {
 			return
 		}
-		if err := e.redistributeFrames(frames); err == nil {
-			if lastTarget, ok := sequencedFrameTarget(frames[len(frames)-1]); ok &&
-				lastTarget == e.sendPublishedNext.Load() {
-				e.armTailReplayForFrame(frames[len(frames)-1], lastTarget)
+		if e.ActivePath() != 0 {
+			if err := e.redistributeFrames(frames); err == nil {
+				if lastTarget, ok := sequencedFrameTarget(frames[len(frames)-1]); ok &&
+					lastTarget == e.sendPublishedNext.Load() {
+					e.armTailReplayForFrame(frames[len(frames)-1], lastTarget)
+				}
+				return
 			}
-			return
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -859,91 +817,4 @@ func sequencedFrameTarget(frame []byte) (uint64, bool) {
 		return 0, false
 	}
 	return hdr.Seq + 1, true
-}
-
-func (e *Engine) bondWeightsLocked(ids []uint32) ([]uint16, uint64) {
-	weights := make([]uint16, len(ids))
-	var total uint64
-	for i, id := range ids {
-		w := uint16(1)
-		if s, ok := e.paths[id]; ok && s.spec.Weight > 0 {
-			w = s.spec.Weight
-		}
-		weights[i] = w
-		total += uint64(w)
-	}
-	if total == 0 {
-		return weights, uint64(len(ids))
-	}
-	return weights, total
-}
-
-func bondWeightedIndex(weights []uint16, total uint64, cursor uint64) int {
-	if len(weights) == 0 {
-		return 0
-	}
-	if total == 0 {
-		return int(cursor % uint64(len(weights)))
-	}
-	slot := cursor % total
-	var acc uint64
-	for i, w := range weights {
-		acc += uint64(w)
-		if slot < acc {
-			return i
-		}
-	}
-	return len(weights) - 1
-}
-
-// computeBondStuckMask is retained for the transitional flat dispatcher.
-// Latency alone cannot exclude a bond member; recursive dispatch performs
-// evidence-based writer-stall quarantine instead.
-func (e *Engine) computeBondStuckMask(ids []uint32) []bool {
-	return make([]bool, len(ids))
-}
-
-// dispatchRace writes the same frame on every attached path.
-// At least one success is required; if every path errors, the
-// engine waits inside the migration budget for a fresh path.
-func (e *Engine) dispatchRace(frame []byte, firstPublication bool) error {
-	for {
-		if e.isClosed() {
-			return net.ErrClosed
-		}
-		e.pathsMu.RLock()
-		slots := make([]*pathSlot, 0, len(e.paths))
-		for _, s := range e.paths {
-			if !e.dispatchScopeAllowsLocked(s.id) {
-				continue
-			}
-			slots = append(slots, s)
-		}
-		e.pathsMu.RUnlock()
-
-		if len(slots) == 0 {
-			if err := e.waitForPath(); err != nil {
-				return err
-			}
-			continue
-		}
-
-		anyOk := false
-		now := nowFn().UnixNano()
-		for _, s := range slots {
-			if n, err := s.writeDispatchedFrame(frame); err == nil && n == len(frame) {
-				anyOk = true
-				s.lastSendUnixNano.Store(now)
-				s.recordDispatch(frame, firstPublication)
-			}
-		}
-		if anyOk {
-			return nil
-		}
-		// All paths failed. Loop and let waitForPath enforce budget.
-	}
-}
-
-func (e *Engine) dispatchScopeAllowsLocked(id uint32) bool {
-	return len(e.dispatchScope) == 0 || e.dispatchScope[id]
 }

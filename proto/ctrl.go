@@ -44,7 +44,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 15
+	ProtocolMinor uint16 = 19
 )
 
 type FeatureSet uint64
@@ -103,8 +103,23 @@ const (
 	// distinct from BYE: the receiver observes EOF only after all preceding
 	// DATA while the reverse stream remains writable.
 	FeatureStreamHalfClose FeatureSet = 1 << 18
+	// FeaturePolicyClassSelection lets a requester ask the sender owner to
+	// resolve and freeze its best normal or peak selector child at PREPARE.
+	FeaturePolicyClassSelection FeatureSet = 1 << 19
+	// FeatureDataRootSelectorAttribution assigns PeakTransfer-root DATA a
+	// one-based immediate-child ordinal plus an 8-byte selector-generation
+	// prefix. Ordinary roots retain zero flags and no payload overhead.
+	FeatureDataRootSelectorAttribution FeatureSet = 1 << 20
+	// FeaturePolicyEarlyCustody lets bounded, byte-exact policy frames enter
+	// their transaction FIFO before an unrelated DATA gap reaches cumulative
+	// ACK order. Application delivery and ACK proof remain strictly sequenced.
+	FeaturePolicyEarlyCustody FeatureSet = 1 << 21
+	// FeaturePolicyCommitChallenge binds FINAL authorization to an
+	// unpredictable requester nonce first disclosed in COMMIT. A FINAL received
+	// before that COMMIT can therefore never authorize a policy transition.
+	FeaturePolicyCommitChallenge FeatureSet = 1 << 22
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose | FeaturePolicyClassSelection | FeatureDataRootSelectorAttribution | FeaturePolicyEarlyCustody | FeaturePolicyCommitChallenge
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 

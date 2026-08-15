@@ -11,11 +11,13 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/internal/platform"
 	"github.com/FrankoonG/rendr/internal/tcpquarantine"
 	"github.com/FrankoonG/rendr/internal/tcprepair"
 	"github.com/FrankoonG/rendr/proto"
@@ -361,6 +363,200 @@ func newRepairDriverTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return client, result.conn
 }
 
+func newRepairDriverTCP6Pair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp6", &net.TCPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatalf("listen TCP6 pair: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan struct {
+		conn *net.TCPConn
+		err  error
+	}, 1)
+	go func() {
+		conn, acceptErr := listener.AcceptTCP()
+		accepted <- struct {
+			conn *net.TCPConn
+			err  error
+		}{conn: conn, err: acceptErr}
+	}()
+	client, err := net.DialTCP("tcp6", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("dial TCP6 pair: %v", err)
+	}
+	result := <-accepted
+	if result.err != nil {
+		_ = client.Close()
+		t.Fatalf("accept TCP6 pair: %v", result.err)
+	}
+	_ = listener.Close()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = result.conn.Close()
+	})
+	return client, result.conn
+}
+
+func TestTCPRepairPreflightRejectsIPv6AtSnapshotBoundary(t *testing.T) {
+	source, peer := newRepairDriverTCP6Pair(t)
+	path := wrapOwned(source, leafmobility.RoleDialer)
+	t.Cleanup(func() { _ = path.Close() })
+
+	trace := &repairDriverTrace{}
+	kernel := &fakeRepairKernel{trace: trace}
+	manager := &fakeQuarantineManager{trace: trace}
+	executorCalls := 0
+	driver := &tcpRepairDriver{
+		endpoint:   path.endpoint,
+		kernel:     kernel,
+		quarantine: manager,
+		newExecutor: func(context.Context, *net.TCPConn, leafmobility.ContextDigest) (repairAttemptExecutor, error) {
+			executorCalls++
+			return nil, errors.New("unexpected executor creation")
+		},
+		routeFlowKey: func(*net.TCPConn) (tcpRouteFlowKey, error) {
+			return tcpRouteFlowKey{}, errors.New("unexpected route inspection")
+		},
+	}
+
+	now := time.Now()
+	contextDigest := leafmobility.ContextDigest{0x51}
+	request := leafmobility.PreflightRequest{
+		PlanRequest: leafmobility.PlanRequest{
+			TransactionID: leafmobility.TransactionID{0x52},
+			Deadline:      now.Add(5 * time.Second),
+		},
+		Facts:         path.claim.Snapshot(),
+		ContextDigest: contextDigest,
+		PlatformProbe: leafmobility.ProbeReference{
+			ID: leafmobility.ProbePlatformSnapshot, Revision: platform.ProbeRevision, Generation: 1,
+			ObservedNano: now.UnixNano(), ExpiresNano: now.Add(5 * time.Second).UnixNano(),
+			ContextDigest: contextDigest, Digest: leafmobility.EvidenceDigest{0x53},
+		},
+	}
+	_, generationBefore, maintenanceBefore, terminalBefore := repairEndpointState(path.endpoint)
+	attempt, result, err := driver.Preflight(context.Background(), request)
+	if err != nil {
+		t.Fatalf("IPv6 Preflight: %v", err)
+	}
+	if attempt != nil {
+		t.Fatalf("IPv6 Preflight returned executable attempt %T", attempt)
+	}
+	if result.Eligible || result.Stage != leafmobility.StageSnapshot ||
+		result.Reason != leafmobility.ReasonSnapshotIncomplete || result.Retryable {
+		t.Fatalf("IPv6 Preflight result=%+v, want non-retryable snapshot_incomplete", result)
+	}
+	if family, _, familyErr := tcpRepairEndpointFamily(source); familyErr != nil || family != tcpRepairAddressFamilyIPv6 {
+		t.Fatalf("endpoint family=%d error=%v, want IPv6", family, familyErr)
+	}
+	if executorCalls != 0 {
+		t.Fatalf("executor creations=%d, want 0", executorCalls)
+	}
+	assertRepairDriverEvents(t, trace)
+	_, generationAfter, maintenanceAfter, terminalAfter := repairEndpointState(path.endpoint)
+	if generationAfter != generationBefore || maintenanceBefore || maintenanceAfter || terminalBefore || terminalAfter {
+		t.Fatalf("endpoint changed across IPv6 preflight: generation=%d/%d maintenance=%t/%t terminal=%t/%t",
+			generationBefore, generationAfter, maintenanceBefore, maintenanceAfter, terminalBefore, terminalAfter)
+	}
+	facts := path.claim.Snapshot()
+	facts.Operations = 0
+	facts.Scope = leafmobility.ScopeUnknown
+	facts.ResourceID = leafmobility.ResourceID{}
+	claim := leafmobility.MustNewDrivenClaimWithIncarnation(
+		facts, driver, leafmobility.MustNewResource(leafmobility.ScopeEndpoint), path.endpoint,
+	)
+	binding := leafmobility.Binding{
+		FlowID: [16]byte{0x61}, LocalTargetID: [16]byte{0x62}, PeerTargetID: [16]byte{0x63},
+		PathID: 7, Owner: 11,
+	}
+	issuer := leafmobility.NewAuthorityIssuer()
+	if err := issuer.BindClaim(claim, binding); err != nil {
+		t.Fatalf("bind IPv6 claim: %v", err)
+	}
+	plan, err := leafmobility.PlanCandidate(context.Background(), claim, leafmobility.PlanRequest{
+		TransactionID: leafmobility.TransactionID{0x64},
+		Binding:       binding,
+		Direction:     proto.SenderDirectionClientToServer,
+		Session:       leafmobility.SessionStream,
+		Deadline:      time.Now().Add(5 * time.Second),
+		LocalSupport:  leafmobility.OperationTCPRepair,
+		PeerSupport:   leafmobility.OperationTCPRepair,
+	})
+	if err != nil {
+		t.Fatalf("plan IPv6 mobility: %v", err)
+	}
+	if plan.Operation != 0 || plan.Fallback != leafmobility.FallbackRedialAttach ||
+		plan.Stage != leafmobility.StageSnapshot || plan.Reason != leafmobility.ReasonSnapshotIncomplete || plan.Retryable {
+		t.Fatalf("IPv6 plan=%+v, want redial_attach snapshot_incomplete fallback", plan)
+	}
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("validate IPv6 fallback plan: %v", err)
+	}
+	if executorCalls != 0 {
+		t.Fatalf("executor creations after planning=%d, want 0", executorCalls)
+	}
+	assertRepairDriverEvents(t, trace)
+	assertRepairPathRoundTrip(t, path, peer)
+}
+
+func TestTCPRepairPlatformCapabilityMatchesEndpointFamily(t *testing.T) {
+	at := time.Now()
+	available := func(id platform.FeatureID) platform.FeatureEvidence {
+		evidence, err := platform.NewEvidence(
+			id, platform.FeatureAvailable, platform.ReasonConfirmed, at, platform.SourceRuntimeSyscall, 0, false,
+		)
+		if err != nil {
+			t.Fatalf("available evidence for %s: %v", id, err)
+		}
+		return evidence
+	}
+	unsupported := func(id platform.FeatureID) platform.FeatureEvidence {
+		evidence, err := platform.NewEvidence(
+			id, platform.FeatureUnsupported, platform.ReasonPrimitiveUnsupported,
+			at, platform.SourceRuntimeSyscall, 0, false,
+		)
+		if err != nil {
+			t.Fatalf("unsupported evidence for %s: %v", id, err)
+		}
+		return evidence
+	}
+	features := map[platform.FeatureID]platform.FeatureEvidence{}
+	for _, id := range []platform.FeatureID{
+		platform.FeatureTCPRepairPermission,
+		platform.FeatureTCPRepairBase,
+		platform.FeatureTCPRepairQueueSeq,
+		platform.FeatureTCPRepairWindow,
+		platform.FeatureTCPRepairOptions,
+		platform.FeatureTransparentBindV4,
+		platform.FeatureTransparentBindV6,
+	} {
+		features[id] = available(id)
+	}
+	lookup := func(id platform.FeatureID) (platform.FeatureEvidence, bool) {
+		evidence, ok := features[id]
+		return evidence, ok
+	}
+
+	features[platform.FeatureTransparentBindV4] = unsupported(platform.FeatureTransparentBindV4)
+	if reason := tcpRepairFeatureReason(lookup, tcpRepairAddressFamilyIPv6); reason != leafmobility.ReasonNone {
+		t.Fatalf("IPv6 platform reason=%s with only IPv4 unavailable", reason)
+	}
+	if reason := tcpRepairFeatureReason(lookup, tcpRepairAddressFamilyIPv4); reason != leafmobility.ReasonTransparentBindUnavailable {
+		t.Fatalf("IPv4 platform reason=%s, want transparent_bind_unavailable", reason)
+	}
+
+	features[platform.FeatureTransparentBindV4] = available(platform.FeatureTransparentBindV4)
+	features[platform.FeatureTransparentBindV6] = unsupported(platform.FeatureTransparentBindV6)
+	if reason := tcpRepairFeatureReason(lookup, tcpRepairAddressFamilyIPv4); reason != leafmobility.ReasonNone {
+		t.Fatalf("IPv4 platform reason=%s with only IPv6 unavailable", reason)
+	}
+	if reason := tcpRepairFeatureReason(lookup, tcpRepairAddressFamilyIPv6); reason != leafmobility.ReasonTransparentBindUnavailable {
+		t.Fatalf("IPv6 platform reason=%s, want transparent_bind_unavailable", reason)
+	}
+}
+
 func configurePrivateRepairReplacement(t *testing.T, fixture *repairDriverFixture) (*net.TCPConn, *net.TCPConn) {
 	t.Helper()
 	replacement, peer := newRepairDriverTCPPair(t)
@@ -537,6 +733,63 @@ func TestTCPRepairAttemptRejectsRouteChangeAtDestructiveBoundaries(t *testing.T)
 			}
 		}
 		assertRepairPathRoundTrip(t, fixture.path, fixture.peer)
+	})
+
+	t.Run("after restore retains uncertain replacement before rollback", func(t *testing.T) {
+		closeFailure := errors.New("replacement close state unknown")
+		fixture := newRepairDriverFixture(t)
+		fixture.attempt.routeObservation = baseline
+		observations := 0
+		fixture.attempt.driver.routeObserve = func(context.Context, *net.TCPConn, tcpRouteFlowKey) (routeObservation, error) {
+			observations++
+			if observations < 3 {
+				return baseline, nil
+			}
+			return changed, nil
+		}
+		replacementA, replacementAPeer := newRepairDriverTCPPair(t)
+		replacementB, replacementBPeer := newRepairDriverTCPPair(t)
+		t.Cleanup(func() {
+			_ = replacementAPeer.Close()
+			_ = replacementBPeer.Close()
+		})
+		restoreCalls := 0
+		fixture.kernel.restoreFn = func(context.Context, *tcprepair.Snapshot) (*net.TCPConn, error) {
+			restoreCalls++
+			if restoreCalls == 1 {
+				return replacementA, nil
+			}
+			return replacementB, nil
+		}
+		closeCalls := 0
+		fixture.attempt.closeReplacement = func(conn *net.TCPConn) error {
+			if conn != replacementA {
+				return conn.Close()
+			}
+			closeCalls++
+			if closeCalls == 1 {
+				return closeFailure
+			}
+			return conn.Close()
+		}
+		if err := fixture.attempt.Prepare(context.Background(), fixture.request); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.attempt.Stage(context.Background(), fixture.request); err == nil || !strings.Contains(err.Error(), "route changed after restore") || !errors.Is(err, closeFailure) {
+			t.Fatalf("Stage=%v, want route drift plus uncertain close", err)
+		}
+		if fixture.attempt.replacement != replacementA || !fixture.attempt.replacementDiscarding {
+			t.Fatalf("route-drifted replacement ownership was lost: replacement=%p discarding=%t",
+				fixture.attempt.replacement, fixture.attempt.replacementDiscarding)
+		}
+		if err := fixture.attempt.Rollback(context.Background(), fixture.request); err != nil {
+			t.Fatalf("Rollback after route drift: %v", err)
+		}
+		conn, _, available := fixture.path.endpoint.current()
+		if !available || conn != replacementB || restoreCalls != 2 || closeCalls != 2 {
+			t.Fatalf("rollback owner=%p available=%t restores=%d closes=%d", conn, available, restoreCalls, closeCalls)
+		}
+		assertRepairPathRoundTrip(t, fixture.path, replacementBPeer)
 	})
 }
 

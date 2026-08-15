@@ -372,39 +372,6 @@ func TestBridgeTableAbortWakesWaiterWithoutFollowingABA(t *testing.T) {
 	}
 }
 
-func TestBridgeTableTransitionalWrappersCannotRemoveTransaction(t *testing.T) {
-	table := NewBridgeTableWithCapacity(2)
-	transactionalID := [16]byte{0x61}
-	reservation, err := table.Reserve(transactionalID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transactionalEngine := new(Engine)
-	if err := table.Activate(reservation, transactionalEngine); err != nil {
-		t.Fatal(err)
-	}
-	table.Remove(transactionalID)
-	if got, ok := table.Get(transactionalID); !ok || got != transactionalEngine {
-		t.Fatalf("legacy Remove disturbed transaction: (%p, %v)", got, ok)
-	}
-
-	legacyID := [16]byte{0x62}
-	legacyEngine := new(Engine)
-	if !table.Put(legacyID, legacyEngine) {
-		t.Fatal("legacy Put failed")
-	}
-	if got, ok := table.Get(legacyID); !ok || got != legacyEngine {
-		t.Fatalf("legacy Get = (%p, %v)", got, ok)
-	}
-	table.Remove(legacyID)
-	if e, ok := table.Get(legacyID); ok || e != nil {
-		t.Fatalf("legacy Remove left entry: (%p, %v)", e, ok)
-	}
-	if !table.Put(legacyID, legacyEngine) {
-		t.Fatal("legacy wrapper could not reuse an inactive ID")
-	}
-}
-
 func TestBridgeTableRejectsForeignAndZeroReservations(t *testing.T) {
 	first := NewBridgeTableWithCapacity(1)
 	second := NewBridgeTableWithCapacity(1)

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -16,14 +17,11 @@ func TestStreamHalfCloseKeepsReverseDirectionAlive(t *testing.T) {
 	server := New(SideServer, flow, Limits{}.Clamp())
 	defer client.Close()
 	defer server.Close()
+	targets := configureSymmetricLeafGroupRuntime(t, client, server, proto.GraphNodeKindSelector, "half-close")
 
 	clientPath, serverPath := newMemoryPathPair()
-	if _, err := client.AttachPath(clientPath, transport.PathSpec{Transport: "memory", Address: "half-close"}); err != nil {
-		t.Fatalf("attach client path: %v", err)
-	}
-	if _, err := server.AttachPath(serverPath, transport.PathSpec{Transport: "memory", Address: "half-close"}); err != nil {
-		t.Fatalf("attach server path: %v", err)
-	}
+	attachFixturePath(t, client, clientPath, transport.PathSpec{Transport: "memory", Address: "half-close"}, targets["half-close"])
+	attachFixturePath(t, server, serverPath, transport.PathSpec{Transport: "memory", Address: "half-close"}, targets["half-close"])
 
 	clientConn := &Conn{E: client}
 	serverConn := &Conn{E: server}

@@ -1,4 +1,4 @@
-//go:build linux && amd64 && rendr_experimental_tcprepair
+//go:build linux && amd64
 
 package tcp
 

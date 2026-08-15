@@ -105,12 +105,11 @@ func TestSelectorProbeFreshWindowMeetsDefaultG4BudgetAndWidensForSlowPath(t *tes
 func TestProberIssuesFirstProbeImmediately(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: time.Second}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
+	ids := configureLeafSelectorRuntime(t, e, "probe")
 	path, peer := newMemoryPathPair()
 	t.Cleanup(func() { _ = peer.Close() })
-	if _, err := e.AttachPath(path, transport.PathSpec{Transport: "memory"}); err != nil {
-		t.Fatal(err)
-	}
-	e.StartSelector(nil, time.Second)
+	attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: "probe"}, ids["probe"])
+	e.StartSelector(time.Second)
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for {
 		e.probeMu.Lock()
@@ -200,6 +199,39 @@ func TestProbeTimeoutAndTransportQualityRemainIndependent(t *testing.T) {
 	}
 	if calls := path.setterCalls.Load(); calls != 0 {
 		t.Fatalf("engine invoked undocumented SetQuality %d times", calls)
+	}
+}
+
+func TestNewerTransportTimingSupersedesOlderEngineProbe(t *testing.T) {
+	path := &probeQualityPath{}
+	slot := &pathSlot{id: 61, owner: 66, conn: path}
+	generation := pathProbeGenerationForSlot(slot)
+	probeAt := time.Unix(100, 0)
+	slot.probeEvidence.Store(&pathProbeEvidence{
+		generation:  generation,
+		lastSuccess: probeAt,
+		quality: transport.PathQuality{
+			RTT: 10 * time.Millisecond, Jitter: time.Millisecond, At: probeAt,
+		},
+	})
+
+	newer := transport.PathQuality{
+		RTT: 80 * time.Millisecond, Jitter: 7 * time.Millisecond,
+		LossPP: 23, At: probeAt.Add(time.Second),
+	}
+	path.setTransportQuality(newer)
+	if got := slot.quality(); got != newer {
+		t.Fatalf("newer transport timing=%+v want %+v", got, newer)
+	}
+
+	older := transport.PathQuality{
+		RTT: 90 * time.Millisecond, Jitter: 8 * time.Millisecond,
+		LossPP: 29, At: probeAt.Add(-time.Second),
+	}
+	path.setTransportQuality(older)
+	got := slot.quality()
+	if got.RTT != 10*time.Millisecond || got.Jitter != time.Millisecond || got.At != probeAt || got.LossPP != older.LossPP {
+		t.Fatalf("older transport timing did not retain newer probe overlay: %+v", got)
 	}
 }
 
@@ -1384,18 +1416,16 @@ func testProbePartialWriteRetiresPath(t *testing.T, code proto.CtrlCode, issue, 
 	t.Helper()
 	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
+	ids := configureLeafSelectorRuntime(t, e, "partial")
 	base, peer := newMemoryPathPair()
 	t.Cleanup(func() { _ = base.Close(); _ = peer.Close() })
 	partial := &partialProbeWritePath{PathConn: base, code: code, withError: withError}
-	id, err := e.AttachPath(partial, transport.PathSpec{Transport: "probe-partial"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	id := attachFixturePath(t, e, partial, transport.PathSpec{Transport: "probe-partial", Address: "partial"}, ids["partial"])
 	e.pathsMu.RLock()
 	slot := e.paths[id]
 	e.pathsMu.RUnlock()
 	if issue {
-		e.StartSelector(nil, time.Second)
+		e.StartSelector(time.Second)
 	} else {
 		e.handlePathProbeRequest(slot, proto.ProbePayload{ID: 3}.Encode())
 	}
@@ -1410,6 +1440,8 @@ func testProbePartialWriteRetiresPath(t *testing.T, code proto.CtrlCode, issue, 
 }
 
 func TestCloseClearsOutstandingProbeStateAndPathEvidence(t *testing.T) {
+	t.Run("waits for cancellable quality observer cleanup", testCloseWaitsForQualityObserverCleanup)
+
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	path, peer := newMemoryPathPair()
 	t.Cleanup(func() { _ = peer.Close() })

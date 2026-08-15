@@ -159,6 +159,9 @@ func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 			if got.Fallback != MobilityRedialAttach {
 				t.Fatalf("fallback=%q want=%q", got.Fallback, MobilityRedialAttach)
 			}
+			if got.Negotiated != MobilityTCPRepairSamePeerTuple {
+				t.Fatalf("negotiated=%q want=%q", got.Negotiated, MobilityTCPRepairSamePeerTuple)
+			}
 		})
 	}
 
@@ -171,6 +174,30 @@ func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 			t.Fatalf("unavailable projection=%+v", got)
 		}
 	})
+
+	for _, test := range []struct {
+		name string
+		in   leafmobility.RefreshReason
+		want MobilityReason
+	}{
+		{name: "link unresponsive", in: leafmobility.RefreshReasonLinkUnresponsive, want: MobilityReasonLinkUnresponsive},
+		{name: "local read", in: leafmobility.RefreshReasonLocalReadFailure, want: MobilityReasonLocalReadFailure},
+		{name: "local write", in: leafmobility.RefreshReasonLocalWriteFailure, want: MobilityReasonLocalWriteFailure},
+		{name: "outer MTU", in: leafmobility.RefreshReasonOuterMTUFailure, want: MobilityReasonOuterMTUFailure},
+		{name: "replay stalled", in: leafmobility.RefreshReasonReplayStalled, want: MobilityReasonReplayStalled},
+		{name: "replay failure", in: leafmobility.RefreshReasonReplayFailure, want: MobilityReasonReplayFailure},
+		{name: "liveness probe", in: leafmobility.RefreshReasonLivenessProbeFailure, want: MobilityReasonLivenessProbeFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observation := base
+			observation.Phase = engine.LeafMobilityInitiatorExecuting
+			observation.EvidenceReason = test.in
+			got := projectLeafMobility(engine.LeafMobilitySnapshot{Ref: ref, Facts: facts, Initiator: observation})
+			if got.State != MobilityStateExecuting || got.Reason != test.want || got.ExpiresAt != deadline {
+				t.Fatalf("typed fault projection=%+v", got)
+			}
+		})
+	}
 
 	t.Run("restored physical baseline", func(t *testing.T) {
 		observation := base
@@ -199,7 +226,7 @@ func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 			snapshot := engine.LeafMobilitySnapshot{Ref: ref, Facts: facts, Initiator: observation}
 			mutate.fn(&snapshot)
 			got := projectLeafMobility(snapshot)
-			if got.State != MobilityStateBaseline || got.ID != MobilityRedialAttach || got.EvidenceGeneration != 0 {
+			if got.State != MobilityStateBaseline || got.ID != MobilityRedialAttach || got.Negotiated != "" || got.EvidenceGeneration != 0 {
 				t.Fatalf("stale evidence was published: %+v", got)
 			}
 		})
@@ -228,9 +255,23 @@ func TestLeafMobilitySubscriptionProjection(t *testing.T) {
 			},
 		})
 		if got.State != test.wantState || got.Reason != test.wantReason || got.ID != MobilityRedialAttach ||
+			got.Negotiated != MobilityTCPRepairSamePeerTuple || got.Fallback != MobilityRedialAttach ||
 			got.EndpointGeneration != facts.Generation || got.UpdatedAt != updated || got.EvidenceGeneration != 0 {
 			t.Fatalf("phase=%d status=%+v", test.phase, got)
 		}
+	}
+}
+
+func TestLeafMobilityIdleProjectionRequiresNegotiatedInitiator(t *testing.T) {
+	ref := engine.PathRef{ID: 7, Owner: 9}
+	facts := leafmobility.Facts{
+		Kind: leafmobility.KindRawTCP, Role: leafmobility.RoleDialer, Scope: leafmobility.ScopeEndpoint,
+		Session: leafmobility.SessionStream, Operations: leafmobility.OperationTCPRepair, Generation: 23,
+	}
+	got := projectLeafMobility(engine.LeafMobilitySnapshot{Ref: ref, Facts: facts})
+	if got.ID != MobilityRedialAttach || got.Negotiated != "" || got.Fallback != "" || got.State != MobilityStateBaseline ||
+		got.Reason != MobilityReasonPeerAgreementNotNegotiated {
+		t.Fatalf("unnegotiated ownership projected as specialized mobility: %+v", got)
 	}
 }
 

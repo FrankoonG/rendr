@@ -235,13 +235,16 @@ func (e *Engine) abandonApplicationSendReservation() {
 }
 
 func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executionRuntime) (bool, error) {
+	if runtime == nil {
+		return false, errExecutionRuntimeNotConfigured
+	}
 	if e.sendClosing.Load() {
 		return false, net.ErrClosed
 	}
 	if e.sendWriteClosed.Load() {
 		return false, io.ErrClosedPipe
 	}
-	frameBytes := proto.HeaderSize + len(payload)
+	frameBytes := e.applicationWireFrameBytes(len(payload))
 	if err := e.acquireApplicationSendSlot(frameBytes); err != nil {
 		return false, err
 	}
@@ -249,7 +252,12 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 		e.releaseSendSlot(false, frameBytes)
 		return false, err
 	}
-	defer e.sendMu.Unlock()
+	sendLocked := true
+	defer func() {
+		if sendLocked {
+			e.sendMu.Unlock()
+		}
+	}()
 	if e.isClosed() || e.sendClosing.Load() {
 		e.releaseSendSlot(false, frameBytes)
 		return false, net.ErrClosed
@@ -275,18 +283,24 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 		e.releaseSendSlot(false, frameBytes)
 		return false, ErrWriteDeadlineExceeded
 	}
-	frame, err := e.buildAndPublishApplicationDataFrame(payload)
+	frame, err := e.buildAndPublishApplicationDataFrame(payload, runtime)
 	e.writeDeadlineMu.Unlock()
 	if err != nil {
 		e.releaseSendSlot(false, frameBytes)
 		return false, err
 	}
-	var dispatchErr error
-	if runtime != nil {
-		dispatchErr = e.dispatchRecursiveApplication(frame, runtime, true)
-	} else {
-		dispatchErr = e.dispatch(frame, true)
-	}
+	// The sequencer protects immutable publication, not physical carrier
+	// latency. appWritePermit still orders stream calls, while the replay
+	// ledger and receiver SEQ reorder preserve wire order if a later control
+	// frame overtakes this DATA on a congested path. Releasing here lets policy
+	// and recovery controls preempt a blocked DATA dispatch.
+	handoffBaseline, handedOffAtStart := e.beginDetachedStreamDispatch()
+	e.sendMu.Unlock()
+	sendLocked = false
+	defer e.completeDetachedStreamDispatch()
+	dispatchErr := e.dispatchDetachedStreamApplication(
+		frame, runtime, true, handoffBaseline, handedOffAtStart,
+	)
 	if errors.Is(dispatchErr, errSelectorCutoverHandoff) {
 		dispatchErr = nil
 	}
@@ -306,6 +320,9 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 // Stream writes keep their application-wide permit because their byte-call
 // ordering and partial-write semantics are different.
 func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executionRuntime, acceptQueued bool) (bool, error) {
+	if runtime == nil {
+		return false, errExecutionRuntimeNotConfigured
+	}
 	if e.sendClosing.Load() {
 		return false, net.ErrClosed
 	}
@@ -314,7 +331,7 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 	}
 	e.packetWritesInFlight.Add(1)
 	defer e.packetWritesInFlight.Add(-1)
-	frameBytes := proto.HeaderSize + len(payload)
+	frameBytes := e.applicationWireFrameBytes(len(payload))
 	if err := e.acquireApplicationSendSlot(frameBytes); err != nil {
 		return false, err
 	}
@@ -354,7 +371,7 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 		return false, ErrWriteDeadlineExceeded
 	}
 	deadlineAtPublication := e.writeDeadlineLocked()
-	frame, err := e.buildAndPublishApplicationDataFrame(payload)
+	frame, err := e.buildAndPublishApplicationDataFrame(payload, runtime)
 	if err != nil {
 		e.writeDeadlineMu.Unlock()
 		e.releaseSendSlot(false, frameBytes)
@@ -436,21 +453,24 @@ func (e *Engine) releaseApplicationWritePermit() {
 
 // buildAndPublishApplicationDataFrame is called with sendMu and
 // writeDeadlineMu held. It performs no network I/O.
-func (e *Engine) buildAndPublishApplicationDataFrame(payload []byte) ([]byte, error) {
+func (e *Engine) buildAndPublishApplicationDataFrame(payload []byte, runtime *executionRuntime) ([]byte, error) {
+	flags, wirePayload, attribution, err := e.encodeApplicationPayload(payload, runtime)
+	if err != nil {
+		return nil, err
+	}
 	seq, err := e.allocateSendSequence(false)
 	if err != nil {
 		e.beginSequenceExhaustionClose()
 		return nil, err
 	}
-	frame := make([]byte, proto.HeaderSize+len(payload))
-	header := proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: seq}
+	frame := make([]byte, proto.HeaderSize+len(wirePayload))
+	header := proto.Header{Version: proto.Version, Type: proto.FrameData, Flags: flags, Seq: seq}
 	if err := header.Encode(frame[:proto.HeaderSize]); err != nil {
 		return nil, err
 	}
-	copy(frame[proto.HeaderSize:], payload)
-	if err := e.reserveOwnedSendFrame(frame); err != nil {
+	copy(frame[proto.HeaderSize:], wirePayload)
+	if err := e.reserveAndPublishOwnedApplicationFrame(frame, attribution, len(payload)); err != nil {
 		return nil, err
 	}
-	e.publishSendSeq(seq + 1)
 	return frame, nil
 }

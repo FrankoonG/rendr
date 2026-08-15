@@ -2,7 +2,11 @@ package rendr
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
+	"errors"
+	"net"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -41,18 +45,17 @@ func TestCompileTargetGraphCanonicalGolden(t *testing.T) {
 		SaturationFor:   2 * time.Second,
 		ReturnRatio:     0.5,
 		ReturnFor:       3 * time.Second,
-		ProbeBudget:     9,
 	})
 
 	graph, err := compileTargetGraph(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantCanonical = `{"version":1,"root":{"kind":"selector","name":"root","peak":{"targets":["bulk","fast"],"saturation_ratio_bits":4605380978949069210,"saturation_for_ns":2000000000,"return_ratio_bits":4602678819172646912,"return_for_ns":3000000000,"probe_budget":9},"children":[{"kind":"path","name":"primary","path":{"carrier":"tcp","address":"edge.example:443","local":"source-a","weight":7,"options":[{"key":"alpn","value":"rendr"},{"key":"name","value":"primary"},{"key":"zeta","value":"last"}]}},{"kind":"bond","name":"bulk","children":[{"kind":"path","name":"bulk-a","path":{"carrier":"quic","address":"bulk-a.example:443","local":"","weight":0,"options":[{"key":"name","value":"bulk-a"}]}},{"kind":"path","name":"bulk-b","path":{"carrier":"tcp","address":"bulk-b.example:443","local":"","weight":2,"options":[{"key":"name","value":"bulk-b"}]}},{"kind":"path","name":"bulk-c","path":{"carrier":"tcp","address":"bulk-c.example:443","local":"","weight":3,"options":[{"key":"name","value":"bulk-c"}]}}]},{"kind":"race","name":"fast","children":[{"kind":"path","name":"fast-a","path":{"carrier":"udp","address":"fast-a.example:443","local":"","weight":0,"options":[{"key":"name","value":"fast-a"}]}},{"kind":"path","name":"fast-b","path":{"carrier":"udp","address":"fast-b.example:443","local":"","weight":0,"options":[{"key":"name","value":"fast-b"}]}}]}]},"flattened":[{"kind":"bond","name":"bulk-inner"},{"kind":"race","name":"fast-inner"}]}`
+	const wantCanonical = `{"version":1,"root":{"kind":"selector","name":"root","peak":{"targets":["bulk","fast"],"saturation_ratio_bits":4605380978949069210,"saturation_for_ns":2000000000,"return_ratio_bits":4602678819172646912,"return_for_ns":3000000000},"children":[{"kind":"path","name":"primary","path":{"carrier":"tcp","address":"edge.example:443","local":"source-a","weight":7,"options":[{"key":"alpn","value":"rendr"},{"key":"name","value":"primary"},{"key":"zeta","value":"last"}]}},{"kind":"bond","name":"bulk","children":[{"kind":"path","name":"bulk-a","path":{"carrier":"quic","address":"bulk-a.example:443","local":"","weight":0,"options":[{"key":"name","value":"bulk-a"}]}},{"kind":"path","name":"bulk-b","path":{"carrier":"tcp","address":"bulk-b.example:443","local":"","weight":2,"options":[{"key":"name","value":"bulk-b"}]}},{"kind":"path","name":"bulk-c","path":{"carrier":"tcp","address":"bulk-c.example:443","local":"","weight":3,"options":[{"key":"name","value":"bulk-c"}]}}]},{"kind":"race","name":"fast","children":[{"kind":"path","name":"fast-a","path":{"carrier":"udp","address":"fast-a.example:443","local":"","weight":0,"options":[{"key":"name","value":"fast-a"}]}},{"kind":"path","name":"fast-b","path":{"carrier":"udp","address":"fast-b.example:443","local":"","weight":0,"options":[{"key":"name","value":"fast-b"}]}}]}]},"flattened":[{"kind":"bond","name":"bulk-inner"},{"kind":"race","name":"fast-inner"}]}`
 	if got := string(graph.canonical); got != wantCanonical {
 		t.Fatalf("canonical graph mismatch\n got: %s\nwant: %s", got, wantCanonical)
 	}
-	const wantLocalDigest = "e86418596b40e1305a05e3379b3ca001c7946fd450f0af313903242fb0ba180a"
+	const wantLocalDigest = "de06385e9b3658b4727c98342f31942ff264eeadeb2db45376e6bfc7115b7689"
 	if got := hex.EncodeToString(graph.localDigest[:]); got != wantLocalDigest {
 		t.Fatalf("local digest=%s want %s", got, wantLocalDigest)
 	}
@@ -127,6 +130,36 @@ func TestCompileTargetGraphCanonicalGolden(t *testing.T) {
 		if bytes.Contains(wire, []byte(localOnly)) {
 			t.Fatalf("local-only value %q entered wire manifest", localOnly)
 		}
+	}
+}
+
+func TestResolveSelectorChildSelectsNestedGroupAsOneTarget(t *testing.T) {
+	graph, err := compileTargetGraph(Selector("root", []Target{
+		Path("A", PathSpec{}),
+		Bond("bulk", []Target{
+			Path("B", PathSpec{}),
+			Path("C", PathSpec{}),
+		}),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectorID, targetID, err := graph.resolveSelectorChild("root", "bulk")
+	if err != nil {
+		t.Fatalf("select bond group: %v", err)
+	}
+	if selectorID != proto.DeriveTargetID(proto.GraphNodeKindSelector, "root") {
+		t.Fatalf("selector id=%x", selectorID)
+	}
+	if targetID != proto.DeriveTargetID(proto.GraphNodeKindBond, "bulk") {
+		t.Fatalf("target id=%x; bond group was not selected as one target", targetID)
+	}
+	if _, _, err := graph.resolveSelectorChild("root", "B"); err == nil || !strings.Contains(err.Error(), "not an immediate child") {
+		t.Fatalf("nested leaf selection error=%v", err)
+	}
+	if _, _, err := graph.resolveSelectorChild("bulk", "B"); err == nil || !strings.Contains(err.Error(), "not a selector") {
+		t.Fatalf("non-selector selection error=%v", err)
 	}
 }
 
@@ -298,6 +331,114 @@ func TestCompileTargetGraphPreservesNestedSelectors(t *testing.T) {
 	}
 	if nested.digest == flat.digest {
 		t.Fatal("selector/selector and flat selector have the same digest")
+	}
+}
+
+func TestCompileTargetGraphRejectsNonRootPeakTransfer(t *testing.T) {
+	peakSelector := func(name, path string) Target {
+		return Selector(name, []Target{Path(path, PathSpec{})}, PeakTransfer{Targets: []string{path}})
+	}
+	tests := []struct {
+		name string
+		root Target
+		want string
+	}{
+		{
+			name: "selector ancestor",
+			root: Selector("root-selector", []Target{peakSelector("offending-selector", "a")}),
+			want: `rendr: PeakTransfer selector "offending-selector" must be the target graph root`,
+		},
+		{
+			name: "bond ancestor",
+			root: Bond("root-bond", []Target{peakSelector("offending-selector", "a")}),
+			want: `rendr: PeakTransfer selector "offending-selector" must be the target graph root`,
+		},
+		{
+			name: "race ancestor",
+			root: Race("root-race", []Target{peakSelector("offending-selector", "a")}),
+			want: `rendr: PeakTransfer selector "offending-selector" must be the target graph root`,
+		},
+		{
+			name: "root and descendant policies",
+			root: Selector("root-selector", []Target{
+				Path("normal", PathSpec{}),
+				peakSelector("descendant-selector", "descendant-peak"),
+			}, PeakTransfer{Targets: []string{"descendant-selector"}}),
+			want: `rendr: PeakTransfer selector "descendant-selector" must be the target graph root`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := compileTargetGraph(test.root)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error=%v want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNonRootPeakTransferFailsBeforeDialing(t *testing.T) {
+	const factoryName = "counting"
+	calls := 0
+	dialer := sessionDialer{
+		Root: Bond("root", []Target{
+			Selector("offending-selector", []Target{
+				Path("leaf", PathSpec{Transport: factoryName}),
+			}, PeakTransfer{Targets: []string{"leaf"}}),
+		}),
+		streamFactories: map[string]streamPathFactory{
+			factoryName: func(context.Context, string) (net.Conn, error) {
+				calls++
+				return nil, errors.New("factory must not be called")
+			},
+		},
+	}
+
+	_, err := dialer.Dial(context.Background())
+	want := `rendr: invalid SessionConfig: rendr: PeakTransfer selector "offending-selector" must be the target graph root`
+	if err == nil || err.Error() != want {
+		t.Fatalf("error=%v want %q", err, want)
+	}
+	if calls != 0 {
+		t.Fatalf("factory calls=%d want 0", calls)
+	}
+}
+
+func TestCompileTargetGraphAcceptsRootPeakTransferWithRecursiveChildren(t *testing.T) {
+	root := Selector("root", []Target{
+		Race("normal", []Target{
+			Selector("normal-selector", []Target{
+				Bond("normal-bond", []Target{Path("normal-a", PathSpec{}), Path("normal-b", PathSpec{})}),
+			}),
+		}),
+		Bond("peak", []Target{
+			Race("peak-race", []Target{
+				Selector("peak-selector", []Target{Path("peak-a", PathSpec{}), Path("peak-b", PathSpec{})}),
+			}),
+		}),
+	}, PeakTransfer{Targets: []string{"peak"}})
+
+	graph, err := compileTargetGraph(root)
+	if err != nil {
+		t.Fatalf("compile valid root PeakTransfer graph: %v", err)
+	}
+	plan, err := graph.compileDialPlan()
+	if err != nil {
+		t.Fatalf("compile valid root PeakTransfer dial plan: %v", err)
+	}
+	got := make(map[string]bool, len(plan.paths))
+	for i, path := range plan.paths {
+		got[pathSpecName(path)] = plan.pathPeak[i]
+	}
+	want := map[string]bool{
+		"normal-a": false,
+		"normal-b": false,
+		"peak-a":   true,
+		"peak-b":   true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("path peak placement=%v want %v", got, want)
 	}
 }
 

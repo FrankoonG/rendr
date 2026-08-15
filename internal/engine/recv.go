@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -29,6 +30,8 @@ const streamRecvWindowFrames = 256
 // forcing one frame-digest allocation per distant packet.
 const packetRecvWindowBits = 16 * 1024
 
+const recvAttributionHistoryLimit = sendHistoryWindow + sendControlReserve + 1
+
 // Keep transaction digests for the sender's entire bounded replay domain so an
 // exact old phase can recover a lost receipt without being reclassified as an
 // unsolicited new transaction.
@@ -38,15 +41,33 @@ const policyReplayDigestLimit = sendHistoryWindow + sendControlReserve
 // hold the payload bytes; ctrl frames hold the flags so the in-order
 // drainer can dispatch them after the SEQ space catches up.
 type recvItem struct {
-	slot    *pathSlot
-	isCtrl  bool
-	flags   uint16
-	payload []byte
-	digest  proto.FrameDigest
+	slot          *pathSlot
+	topologyEpoch uint64
+	isCtrl        bool
+	ctrlApplied   bool
+	flags         uint16
+	cohort        rootDeliveryCohort
+	attributable  bool
+	demand        bool
+	bytes         int
+	payload       []byte
+	digest        proto.FrameDigest
 	// packet-mode data may be delivered as soon as the first copy
 	// arrives; delivered tracks that early handoff so later SEQ-floor
 	// advancement can retire the slot without delivering twice.
 	delivered bool
+}
+
+type recvPolicyPhaseKey struct {
+	kind          policyMessageKind
+	phase         proto.PolicyAckPhase
+	transactionID [16]byte
+}
+
+type recvPolicyPhaseReceipt struct {
+	seq            uint64
+	frameDigest    proto.FrameDigest
+	proposalDigest proto.PolicyProposalDigest
 }
 
 // recvFrame is one decoded frame handed off by a path reader to the
@@ -54,10 +75,30 @@ type recvItem struct {
 // the aggregator batches reorder/dedup work so G3-scale fan-in no
 // longer serialises four path goroutines on one mutex per frame.
 type recvFrame struct {
-	slot    *pathSlot
-	hdr     proto.Header
-	payload []byte
-	digest  proto.FrameDigest
+	slot          *pathSlot
+	topologyEpoch uint64
+	hdr           proto.Header
+	payload       []byte
+	digest        proto.FrameDigest
+}
+
+type recvPacketProof struct {
+	digest        proto.FrameDigest
+	topologyEpoch uint64
+	cohort        rootDeliveryCohort
+	attributable  bool
+	demand        bool
+	bytes         int
+	deliverySeen  bool
+}
+
+type recvPacketDelivery struct {
+	payload       []byte
+	topologyEpoch uint64
+	cohort        rootDeliveryCohort
+	attributable  bool
+	demand        bool
+	bytes         int
 }
 
 func (e *Engine) packetSeenCapLocked() uint64 {
@@ -112,8 +153,15 @@ func (e *Engine) packetConsumeHeadLocked() {
 	word := idx / 64
 	bit := idx % 64
 	e.recvSeenBits[word] &^= uint64(1) << bit
-	if digest, ok := e.recvFrameProofs[e.expectedRecvSeq]; ok {
-		e.recvProof = proto.AdvanceAckProof(e.recvProof, digest)
+	if item, ok := e.recvFrameProofs[e.expectedRecvSeq]; ok {
+		e.recvProof = proto.AdvanceAckProof(e.recvProof, item.digest)
+		e.rememberDeliveredDigestLocked(e.expectedRecvSeq, item.digest)
+		if !item.deliverySeen {
+			e.commitUniqueTargetDeliveryLocked(
+				item.cohort, item.topologyEpoch,
+				item.attributable, item.demand, item.bytes,
+			)
+		}
 		delete(e.recvFrameProofs, e.expectedRecvSeq)
 	}
 	if e.recvPacketMarks > 0 {
@@ -192,6 +240,159 @@ func (e *Engine) consumeStreamDeliveryLocked(n int) {
 	}
 }
 
+func (e *Engine) validateTargetDeliveryCohortLocked(cohort rootDeliveryCohort) error {
+	if cohort.targetID == (proto.TargetID{}) {
+		return nil
+	}
+	if targetID, exists := e.recvRootTargets[cohort.generation]; exists {
+		if targetID != cohort.targetID {
+			return fmt.Errorf("selector generation %d changed target from %x to %x",
+				cohort.generation, targetID, cohort.targetID)
+		}
+		return nil
+	}
+	e.recvRootTargets[cohort.generation] = cohort.targetID
+	e.recvRootTargetOrder = append(e.recvRootTargetOrder, cohort.generation)
+	for len(e.recvRootTargetOrder) > recvAttributionHistoryLimit {
+		oldest := e.recvRootTargetOrder[0]
+		e.recvRootTargetOrder = e.recvRootTargetOrder[1:]
+		delete(e.recvRootTargets, oldest)
+	}
+	return nil
+}
+
+func (e *Engine) commitUniqueTargetDeliveryLocked(
+	cohort rootDeliveryCohort,
+	topologyEpoch uint64,
+	attributable, demand bool,
+	bytes int,
+) {
+	if bytes <= 0 {
+		return
+	}
+	if cohort.targetID == (proto.TargetID{}) {
+		e.recvUniqueBytes = saturatingAddUint64(e.recvUniqueBytes, uint64(bytes))
+		return
+	}
+	currentTopologyEpoch := e.currentPathTopologyEpoch()
+	if topologyEpoch == 0 || topologyEpoch != currentTopologyEpoch {
+		e.recvUniqueBytes = saturatingAddUint64(e.recvUniqueBytes, uint64(bytes))
+		return
+	}
+	if e.recvRootCohort.targetID != (proto.TargetID{}) {
+		if cohort.selectorID != e.recvRootCohort.selectorID {
+			return
+		}
+		switch {
+		case cohort.generation < e.recvRootCohort.generation:
+			// Packet delivery is intentionally out of order. Keep delivering a
+			// valid older packet, but never let it move current capacity evidence
+			// back to an obsolete selector generation.
+			e.recvUniqueBytes = saturatingAddUint64(e.recvUniqueBytes, uint64(bytes))
+			return
+		}
+	}
+	e.recvUniqueBytes = saturatingAddUint64(e.recvUniqueBytes, uint64(bytes))
+	if e.recvRootCohort != cohort || e.recvRootAttributable != attributable ||
+		e.recvRootTopologyEpoch != topologyEpoch {
+		e.recvRootCohort = cohort
+		e.recvRootCohortBytes = 0
+		e.recvRootDemandBytes = 0
+		e.recvRootAttributable = attributable
+		e.recvRootTopologyEpoch = topologyEpoch
+		e.recvRootEvidenceEpoch++
+		if e.recvRootEvidenceEpoch == 0 {
+			e.recvRootEvidenceEpoch++
+		}
+	}
+	if e.recvRootAttributable {
+		e.recvRootCohortBytes = saturatingAddUint64(e.recvRootCohortBytes, uint64(bytes))
+		if demand {
+			e.recvRootDemandBytes = saturatingAddUint64(e.recvRootDemandBytes, uint64(bytes))
+		}
+	}
+}
+
+func (e *Engine) failTargetDeliveryAttributionLocked(err error) {
+	if err == nil || e.recvTerminal {
+		return
+	}
+	e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid DATA target attribution: %v", ErrPeerProtocol, err))
+}
+
+// publishRecvTerminalLocked linearizes receive-terminal publication against
+// policy handlers that may already have left the receive queue. Caller holds
+// recvMu; policyTerminalMu must not already be held.
+func (e *Engine) publishRecvTerminalLocked(err error) {
+	e.policyTerminalMu.Lock()
+	e.recvFinalErr = err
+	e.recvTerminal = true
+	e.policyTerminal.Store(true)
+	e.policyTerminalMu.Unlock()
+}
+
+func (e *Engine) rememberDeliveredDigestLocked(seq uint64, digest proto.FrameDigest) {
+	if _, exists := e.recvDeliveredDigests[seq]; exists {
+		return
+	}
+	e.recvDeliveredDigests[seq] = digest
+	e.recvDeliveredOrder = append(e.recvDeliveredOrder, seq)
+	for len(e.recvDeliveredOrder) > recvAttributionHistoryLimit {
+		oldest := e.recvDeliveredOrder[0]
+		e.recvDeliveredOrder = e.recvDeliveredOrder[1:]
+		delete(e.recvDeliveredDigests, oldest)
+	}
+}
+
+// PeerTargetDelivery returns unique DATA accepted into bounded session
+// delivery custody for one immediate child of the peer's root selector.
+// Application read cadence, replay attempts, and race duplicates do not
+// advance it.
+func (e *Engine) PeerTargetDelivery(targetID proto.TargetID) TargetDeliverySnapshot {
+	topologyEpoch := e.currentPathTopologyEpoch()
+	e.recvMu.Lock()
+	snapshot := e.peerTargetDeliveryAtEpochLocked(targetID, topologyEpoch)
+	e.recvMu.Unlock()
+	if e.currentPathTopologyEpoch() != topologyEpoch {
+		snapshot.Attributable = false
+		snapshot.PublishedBytes = 0
+		snapshot.AckedBytes = 0
+		snapshot.DemandBytes = 0
+	}
+	return snapshot
+}
+
+func (e *Engine) peerTargetDeliveryLocked(targetID proto.TargetID) TargetDeliverySnapshot {
+	return e.peerTargetDeliveryAtEpochLocked(targetID, e.currentPathTopologyEpoch())
+}
+
+func (e *Engine) peerTargetDeliveryAtEpochLocked(
+	targetID proto.TargetID,
+	topologyEpoch uint64,
+) TargetDeliverySnapshot {
+	cohort := e.recvRootCohort
+	snapshot := TargetDeliverySnapshot{
+		SelectorID:         cohort.selectorID,
+		TargetID:           targetID,
+		SelectorGeneration: cohort.generation,
+		EvidenceEpoch:      e.recvRootEvidenceEpoch,
+		Attributable: e.recvRootAttributable &&
+			topologyEpoch != 0 && e.recvRootTopologyEpoch == topologyEpoch,
+		DemandBytes: e.recvRootDemandBytes,
+	}
+	if targetID == (proto.TargetID{}) {
+		snapshot.TargetID = cohort.targetID
+		targetID = cohort.targetID
+	}
+	if cohort.targetID == targetID && snapshot.Attributable {
+		snapshot.AckedBytes = e.recvRootCohortBytes
+		snapshot.PublishedBytes = snapshot.AckedBytes
+	} else {
+		snapshot.Attributable = false
+	}
+	return snapshot
+}
+
 // RecvPacket pops the oldest pending packet from the engine's packet
 // queue. Blocks until at least one packet is available or the engine
 // is dead. Only valid when SetPacketMode was called; callers using
@@ -266,7 +467,7 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 func (e *Engine) readerLoop(slot *pathSlot) {
 	defer close(slot.doneR)
 
-	buf := make([]byte, MaxPayload+proto.HeaderSize)
+	buf := make([]byte, MaxPayload+proto.HeaderSize+proto.DataRootGenerationSize)
 	for {
 		select {
 		case <-slot.quit:
@@ -274,6 +475,7 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		default:
 		}
 
+		frameEndpointGeneration := slot.probeEndpointGen.Load()
 		frame := buf[:0]
 		owned := false
 		var err error
@@ -287,6 +489,13 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		}
 		if err != nil {
 			return
+		}
+		frameTopologyEpoch := slot.topologyEpoch.Load()
+		if slot.probeEndpointGen.Load() != frameEndpointGeneration {
+			// A read spanning an in-place endpoint replacement remains valid
+			// session data, but cannot prove which physical incarnation carried
+			// it. Preserve delivery while excluding it from capacity evidence.
+			frameTopologyEpoch = 0
 		}
 		// Stamp last-recv after a successful read but before any
 		// version / framing rejection: from the path's perspective,
@@ -351,7 +560,9 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 			}
 		}
 
-		if !e.enqueueRecvFrame(slot, hdr, payload, proto.DigestFrame(frame)) {
+		if !e.enqueueRecvFrame(
+			slot, frameTopologyEpoch, hdr, payload, proto.DigestFrame(frame),
+		) {
 			return
 		}
 	}
@@ -664,9 +875,18 @@ func (e *Engine) pathAckWriter(slot *pathSlot) {
 // arbitrarily far ahead of a slower path and explode the reorder
 // window. Returning false means the engine is closing and the caller
 // should stop reading.
-func (e *Engine) enqueueRecvFrame(slot *pathSlot, hdr proto.Header, payload []byte, digest proto.FrameDigest) bool {
+func (e *Engine) enqueueRecvFrame(
+	slot *pathSlot,
+	topologyEpoch uint64,
+	hdr proto.Header,
+	payload []byte,
+	digest proto.FrameDigest,
+) bool {
 	select {
-	case slot.recvQ <- recvFrame{slot: slot, hdr: hdr, payload: payload, digest: digest}:
+	case slot.recvQ <- recvFrame{
+		slot: slot, topologyEpoch: topologyEpoch,
+		hdr: hdr, payload: payload, digest: digest,
+	}:
 		select {
 		case e.recvWake <- struct{}{}:
 		default:
@@ -803,17 +1023,28 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 	if len(batch) == 0 {
 		return
 	}
-	deliverPackets := make([][]byte, 0, len(batch))
+	deliverPackets := make([]recvPacketDelivery, 0, len(batch))
 	e.recvMu.Lock()
 	wokeReader := false
 	for _, frame := range batch {
-		if e.onFrameRecvDigestLocked(frame.slot, frame.hdr, frame.payload, frame.digest, &deliverPackets) {
+		if e.recvTerminal || e.closing.Load() {
+			break
+		}
+		if e.onFrameRecvDigestLocked(
+			frame.slot, frame.topologyEpoch, frame.hdr,
+			frame.payload, frame.digest, &deliverPackets,
+		) {
 			wokeReader = true
 		}
 	}
-	for _, pkt := range deliverPackets {
+	for _, delivery := range deliverPackets {
 		select {
-		case e.recvPacketCh <- pkt:
+		case e.recvPacketCh <- delivery.payload:
+			e.commitUniqueTargetDeliveryLocked(
+				delivery.cohort, delivery.topologyEpoch,
+				delivery.attributable, delivery.demand, delivery.bytes,
+			)
+			e.markPayloadLocked()
 		case <-e.closed:
 			e.recvMu.Unlock()
 			return
@@ -872,9 +1103,13 @@ func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.Ack
 			// the same epoch lock as path preparation so a racing admission is
 			// either rejected normally or retained solely as an ACK route.
 			e.sessionEpochMu.Lock()
+			e.policyLifecycleMu.Lock()
+			e.policyStateMu.Lock()
 			e.peerNormalBye.Store(true)
 			e.sendWriteClosed.Store(true)
 			e.sendClosing.Store(true)
+			e.policyStateMu.Unlock()
+			e.policyLifecycleMu.Unlock()
 			e.sessionEpochMu.Unlock()
 			e.schedulePeerByeClose()
 			e.recvMu.Lock()
@@ -958,15 +1193,58 @@ func (e *Engine) recvHasGapLocked() bool {
 // drainer dispatches each in turn so the application stream remains
 // contiguous regardless of how ctrl frames are interleaved.
 func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []byte, deliverPackets *[][]byte) bool {
-	return e.onFrameRecvDigestLocked(slot, hdr, payload, recvFrameDigest(hdr, payload), deliverPackets)
+	deliveries := make([]recvPacketDelivery, 0, 1)
+	topologyEpoch := e.currentPathTopologyEpoch()
+	if slot != nil && slot.topologyEpoch.Load() != 0 {
+		topologyEpoch = slot.topologyEpoch.Load()
+	}
+	woke := e.onFrameRecvDigestLocked(
+		slot, topologyEpoch, hdr, payload, recvFrameDigest(hdr, payload), &deliveries,
+	)
+	for _, delivery := range deliveries {
+		if deliverPackets != nil {
+			*deliverPackets = append(*deliverPackets, delivery.payload)
+		}
+		e.commitUniqueTargetDeliveryLocked(
+			delivery.cohort, delivery.topologyEpoch,
+			delivery.attributable, delivery.demand, delivery.bytes,
+		)
+		e.markPayloadLocked()
+	}
+	return woke
 }
 
-func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, payload []byte, digest proto.FrameDigest, deliverPackets *[][]byte) bool {
+func (e *Engine) onFrameRecvDigestLocked(
+	slot *pathSlot,
+	topologyEpoch uint64,
+	hdr proto.Header,
+	payload []byte,
+	digest proto.FrameDigest,
+	deliverPackets *[]recvPacketDelivery,
+) bool {
+	if e.recvTerminal || e.closing.Load() {
+		return false
+	}
+	var cohort rootDeliveryCohort
+	var attributable bool
+	var demand bool
+	if hdr.Type == proto.FrameData {
+		var err error
+		payload, cohort, attributable, demand, err = e.decodePeerApplicationPayload(slot, hdr.Flags, payload)
+		if err != nil {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid DATA target attribution: %v", ErrPeerProtocol, err))
+			return false
+		}
+	}
 	if hdr.Seq < e.expectedRecvSeq {
 		// Duplicate (race / redistribute) or out-of-window.
 		e.recvDups++
 		if slot != nil {
 			slot.recvDups.Add(1)
+		}
+		if accepted, ok := e.recvDeliveredDigests[hdr.Seq]; ok && accepted != digest {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: altered frame reused delivered sequence %d", ErrPeerProtocol, hdr.Seq))
+			return false
 		}
 		// Policy phases are transaction-idempotent and cache their exact
 		// responses. Re-deliver an already-sequenced phase to the policy
@@ -976,11 +1254,13 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 		if hdr.Type == proto.FrameCtrl && isReplayableTransactionCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
 			if accepted, ok := e.policyReplayDigests[hdr.Seq]; ok {
 				if accepted != digest {
-					e.recvFinalErr = fmt.Errorf("%w: altered policy frame reused sequence %d", ErrPeerProtocol, hdr.Seq)
-					e.recvTerminal = true
+					e.publishRecvTerminalLocked(fmt.Errorf("%w: altered policy frame reused sequence %d", ErrPeerProtocol, hdr.Seq))
 					return false
 				}
-				e.applyCtrlLocked(slot, hdr.Flags, payload, true)
+				e.applyPolicyCtrlAtCustodyLocked(hdr.Seq, recvItem{
+					slot: slot, isCtrl: true, flags: hdr.Flags,
+					payload: payload, digest: digest,
+				})
 			}
 		}
 		return false
@@ -998,6 +1278,10 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 			}
 			if delta < cap {
 				if e.packetSeenLocked(hdr.Seq) {
+					if accepted, ok := e.recvFrameProofs[hdr.Seq]; ok && accepted.digest != digest {
+						e.publishRecvTerminalLocked(fmt.Errorf("%w: altered DATA reused packet sequence %d", ErrPeerProtocol, hdr.Seq))
+						return false
+					}
 					e.recvDups++
 					if slot != nil {
 						slot.recvDups.Add(1)
@@ -1011,12 +1295,23 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 					}
 					return false
 				}
+				if err := e.validateTargetDeliveryCohortLocked(cohort); err != nil {
+					e.failTargetDeliveryAttributionLocked(err)
+					return false
+				}
 				e.packetMarkSeenLocked(hdr.Seq)
-				e.recvFrameProofs[hdr.Seq] = digest
+				e.recvFrameProofs[hdr.Seq] = recvPacketProof{
+					digest: digest, topologyEpoch: topologyEpoch,
+					cohort: cohort, attributable: attributable, demand: demand,
+					bytes: len(payload), deliverySeen: true,
+				}
 				e.recvPacketMarks++
 				e.noteRecvDataForAckLocked()
-				*deliverPackets = append(*deliverPackets, payload)
-				e.markPayloadLocked()
+				*deliverPackets = append(*deliverPackets, recvPacketDelivery{
+					payload: payload, topologyEpoch: topologyEpoch,
+					cohort: cohort, attributable: attributable,
+					demand: demand, bytes: len(payload),
+				})
 				if n := len(e.recvQueue) + e.recvPacketMarks; n > e.recvQueueHWM {
 					e.recvQueueHWM = n
 				}
@@ -1027,12 +1322,20 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 		}
 	}
 
-	if _, exists := e.recvQueue[hdr.Seq]; exists {
+	if existing, exists := e.recvQueue[hdr.Seq]; exists {
 		// Same SEQ already buffered (race-mode in-flight duplicate):
 		// keep the first copy, count the second.
+		if existing.digest != digest {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: altered frame reused sequence %d", ErrPeerProtocol, hdr.Seq))
+			return false
+		}
 		e.recvDups++
 		if slot != nil {
 			slot.recvDups.Add(1)
+		}
+		if existing.ctrlApplied && existing.isCtrl &&
+			isPolicyCtrl(proto.CtrlCodeFromFlags(existing.flags)) {
+			e.applyPolicyCtrlAtCustodyLocked(hdr.Seq, existing)
 		}
 		return false
 	}
@@ -1044,16 +1347,26 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 		}()
 		return false
 	}
+	if hdr.Type == proto.FrameData {
+		if err := e.validateTargetDeliveryCohortLocked(cohort); err != nil {
+			e.failTargetDeliveryAttributionLocked(err)
+			return false
+		}
+	}
 
 	if hdr.Type != proto.FrameCtrl {
 		e.noteRecvDataForAckLocked()
 	}
 	e.recvQueue[hdr.Seq] = recvItem{
-		slot:    slot,
-		isCtrl:  hdr.Type == proto.FrameCtrl,
-		flags:   hdr.Flags,
-		payload: payload,
-		digest:  digest,
+		slot: slot, topologyEpoch: topologyEpoch,
+		isCtrl: hdr.Type == proto.FrameCtrl, flags: hdr.Flags,
+		cohort: cohort, attributable: attributable, demand: demand,
+		bytes: len(payload), payload: payload, digest: digest,
+	}
+	if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
+		item := e.recvQueue[hdr.Seq]
+		item.ctrlApplied = e.applyPolicyCtrlAtCustodyLocked(hdr.Seq, item)
+		e.recvQueue[hdr.Seq] = item
 	}
 	if e.packetized && hdr.Type != proto.FrameCtrl {
 		// Packet mode follows datagram semantics: preserve packet
@@ -1062,11 +1375,14 @@ func (e *Engine) onFrameRecvDigestLocked(slot *pathSlot, hdr proto.Header, paylo
 		// lightweight marker in recvQueue so control-frame ordering and
 		// duplicate suppression still have a shared SEQ view.
 		item := e.recvQueue[hdr.Seq]
-		*deliverPackets = append(*deliverPackets, item.payload)
+		*deliverPackets = append(*deliverPackets, recvPacketDelivery{
+			payload: item.payload, topologyEpoch: item.topologyEpoch,
+			cohort: item.cohort, attributable: item.attributable,
+			demand: item.demand, bytes: item.bytes,
+		})
 		item.payload = nil
 		item.delivered = true
 		e.recvQueue[hdr.Seq] = item
-		e.markPayloadLocked()
 	}
 	if n := len(e.recvQueue) + e.recvPacketMarks; n > e.recvQueueHWM {
 		e.recvQueueHWM = n
@@ -1095,7 +1411,200 @@ func isReplayableTransactionCtrl(code proto.CtrlCode) bool {
 	return isPolicyCtrl(code)
 }
 
-func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
+// applyPolicyCtrlAtCustodyLocked admits policy work as soon as its exact frame
+// enters the bounded receive window. DATA delivery and cumulative ACK proof
+// remain ordered by SEQ. This prevents an unrelated slow DATA frame from
+// consuming the whole policy transaction TTL.
+//
+// PREPARE and ACK are causally self-contained. COMMIT is admitted early only
+// after the matching PREPARE has entered the policy FIFO; otherwise it remains
+// in recvQueue until that PREPARE arrives or normal SEQ order reaches it.
+// Caller holds recvMu.
+func (e *Engine) applyPolicyCtrlAtCustodyLocked(seq uint64, item recvItem) bool {
+	if e.recvTerminal || e.closing.Load() || e.isClosed() {
+		return false
+	}
+	code := proto.CtrlCodeFromFlags(item.flags)
+	switch code {
+	case proto.CtrlPolicyPrepare:
+		prepare, err := proto.DecodePolicyPrepare(item.payload)
+		if err != nil {
+			e.failPolicyCtrlCustodyLocked("PREPARE", err)
+			return false
+		}
+		digest, err := prepare.ProposalDigest()
+		if err != nil {
+			e.failPolicyCtrlCustodyLocked("PREPARE", err)
+			return false
+		}
+		key := recvPolicyPhaseKey{
+			kind: policyMessagePrepare, transactionID: prepare.TransactionID,
+		}
+		receipt := recvPolicyPhaseReceipt{
+			seq: seq, frameDigest: item.digest, proposalDigest: digest,
+		}
+		if !e.validateRecvPolicyPhaseLocked(key, receipt) {
+			return false
+		}
+		message := policyMessage{
+			kind: policyMessagePrepare,
+			key: policyMessageKey{
+				kind: policyMessagePrepare, seq: seq, frameDigest: item.digest,
+			},
+			prepare: prepare,
+		}
+		if !e.enqueuePolicyMessageLocked(message) {
+			return false
+		}
+		e.rememberRecvPolicyPhaseLocked(key, receipt)
+		e.applyDeferredPolicyCommitsLocked(seq, prepare.TransactionID, digest)
+		return true
+
+	case proto.CtrlPolicyAck:
+		ack, err := proto.DecodePolicyAck(item.payload)
+		if err != nil {
+			e.failPolicyCtrlCustodyLocked("ACK", err)
+			return false
+		}
+		key := recvPolicyPhaseKey{
+			kind: policyMessageAck, phase: ack.Phase, transactionID: ack.TransactionID,
+		}
+		receipt := recvPolicyPhaseReceipt{
+			seq: seq, frameDigest: item.digest, proposalDigest: ack.ProposalDigest,
+		}
+		if !e.validateRecvPolicyPhaseLocked(key, receipt) {
+			return false
+		}
+		message := policyMessage{
+			kind: policyMessageAck,
+			key: policyMessageKey{
+				kind: policyMessageAck, seq: seq, frameDigest: item.digest,
+			},
+			ack: ack,
+		}
+		if !e.enqueuePolicyMessageLocked(message) {
+			return false
+		}
+		e.rememberRecvPolicyPhaseLocked(key, receipt)
+		return true
+
+	case proto.CtrlPolicyCommit:
+		commit, err := proto.DecodePolicyCommit(item.payload)
+		if err != nil {
+			e.failPolicyCtrlCustodyLocked("COMMIT", err)
+			return false
+		}
+		key := recvPolicyPhaseKey{
+			kind: policyMessageCommit, transactionID: commit.TransactionID,
+		}
+		receipt := recvPolicyPhaseReceipt{
+			seq: seq, frameDigest: item.digest, proposalDigest: commit.ProposalDigest,
+		}
+		if !e.validateRecvPolicyPhaseLocked(key, receipt) {
+			return false
+		}
+		prepare, ok := e.recvPolicyPhases[recvPolicyPhaseKey{
+			kind: policyMessagePrepare, transactionID: commit.TransactionID,
+		}]
+		if !ok {
+			if seq == e.expectedRecvSeq {
+				e.failPolicyCtrlCustodyLocked("COMMIT", fmt.Errorf("matching PREPARE was not received at a lower sequence"))
+			}
+			return false
+		}
+		if prepare.proposalDigest != commit.ProposalDigest || prepare.seq >= seq {
+			e.failPolicyCtrlCustodyLocked("COMMIT", fmt.Errorf("does not follow its exact PREPARE"))
+			return false
+		}
+		message := policyMessage{
+			kind: policyMessageCommit,
+			key: policyMessageKey{
+				kind: policyMessageCommit, seq: seq, frameDigest: item.digest,
+			},
+			commit: commit,
+		}
+		if !e.enqueuePolicyMessageLocked(message) {
+			return false
+		}
+		e.rememberRecvPolicyPhaseLocked(key, receipt)
+		return true
+	}
+	return false
+}
+
+func (e *Engine) validateRecvPolicyPhaseLocked(
+	key recvPolicyPhaseKey,
+	receipt recvPolicyPhaseReceipt,
+) bool {
+	if current, exists := e.recvPolicyPhases[key]; exists && current != receipt {
+		e.failPolicyCtrlCustodyLocked("phase", fmt.Errorf("transaction phase changed sequence or payload"))
+		return false
+	}
+	return true
+}
+
+func (e *Engine) rememberRecvPolicyPhaseLocked(
+	key recvPolicyPhaseKey,
+	receipt recvPolicyPhaseReceipt,
+) {
+	if _, exists := e.recvPolicyPhases[key]; exists {
+		return
+	}
+	e.recvPolicyPhases[key] = receipt
+	e.recvPolicyPhaseOrder = append(e.recvPolicyPhaseOrder, key)
+	for len(e.recvPolicyPhaseOrder) > policyReplayDigestLimit {
+		oldest := e.recvPolicyPhaseOrder[0]
+		e.recvPolicyPhaseOrder = e.recvPolicyPhaseOrder[1:]
+		delete(e.recvPolicyPhases, oldest)
+	}
+}
+
+func (e *Engine) failPolicyCtrlCustodyLocked(phase string, err error) {
+	if e.recvTerminal {
+		return
+	}
+	e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid POLICY_%s: %v", ErrPeerProtocol, phase, err))
+}
+
+// applyDeferredPolicyCommitsLocked preserves PREPARE-before-COMMIT FIFO
+// causality when different paths deliver the outer SEQ frames out of order.
+// Caller holds recvMu.
+func (e *Engine) applyDeferredPolicyCommitsLocked(
+	prepareSeq uint64,
+	transactionID [16]byte,
+	digest proto.PolicyProposalDigest,
+) {
+	seqs := make([]uint64, 0, 1)
+	for seq, item := range e.recvQueue {
+		if item.ctrlApplied || !item.isCtrl ||
+			proto.CtrlCodeFromFlags(item.flags) != proto.CtrlPolicyCommit {
+			continue
+		}
+		commit, err := proto.DecodePolicyCommit(item.payload)
+		if err == nil && commit.TransactionID == transactionID &&
+			commit.ProposalDigest == digest {
+			if seq <= prepareSeq {
+				e.failPolicyCtrlCustodyLocked("COMMIT", fmt.Errorf("sequence %d does not follow PREPARE sequence %d", seq, prepareSeq))
+				return
+			}
+			seqs = append(seqs, seq)
+		}
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	for _, seq := range seqs {
+		item, ok := e.recvQueue[seq]
+		if !ok || item.ctrlApplied {
+			continue
+		}
+		item.ctrlApplied = e.applyPolicyCtrlAtCustodyLocked(seq, item)
+		e.recvQueue[seq] = item
+		if e.recvTerminal || !item.ctrlApplied {
+			return
+		}
+	}
+}
+
+func (e *Engine) drainContiguousLocked(deliverPackets *[]recvPacketDelivery) bool {
 	wokeReader := false
 	for {
 		item, ok := e.recvQueue[e.expectedRecvSeq]
@@ -1119,10 +1628,18 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 				// acknowledge only the prefix already owned by this engine.
 				break
 			}
+			if isPolicyCtrl(ctrlCode) && !item.ctrlApplied {
+				item.ctrlApplied = e.applyPolicyCtrlAtCustodyLocked(e.expectedRecvSeq, item)
+				e.recvQueue[e.expectedRecvSeq] = item
+				if !item.ctrlApplied {
+					break
+				}
+			}
 		}
 		seq := e.expectedRecvSeq
 		delete(e.recvQueue, seq)
 		e.recvProof = proto.AdvanceAckProof(e.recvProof, item.digest)
+		e.rememberDeliveredDigestLocked(seq, item.digest)
 		e.expectedRecvSeq++
 		if e.packetized {
 			e.packetAdvanceHeadLocked()
@@ -1132,7 +1649,7 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 			if isReplayableTransactionCtrl(ctrlCode) {
 				e.rememberPolicyReplayDigestLocked(seq, item.digest)
 			}
-			if ctrlCode != proto.CtrlPathRetire {
+			if ctrlCode != proto.CtrlPathRetire && !isPolicyCtrl(ctrlCode) {
 				e.applyCtrlLocked(item.slot, item.flags, item.payload, false)
 			}
 			if e.recvTerminal {
@@ -1140,18 +1657,24 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 			}
 		} else {
 			if e.recvStreamEOF {
-				e.recvFinalErr = fmt.Errorf("%w: DATA after STREAM_FIN", ErrPeerProtocol)
-				e.recvTerminal = true
+				e.publishRecvTerminalLocked(fmt.Errorf("%w: DATA after STREAM_FIN", ErrPeerProtocol))
 				break
 			}
 			if e.packetized {
 				if !item.delivered {
 					// DATA at the SEQ head may still be pending if it
 					// arrived in-order; preserve boundaries 1:1.
-					*deliverPackets = append(*deliverPackets, item.payload)
-					e.markPayloadLocked()
+					*deliverPackets = append(*deliverPackets, recvPacketDelivery{
+						payload: item.payload, topologyEpoch: item.topologyEpoch,
+						cohort: item.cohort, attributable: item.attributable,
+						demand: item.demand, bytes: item.bytes,
+					})
 				}
 			} else {
+				e.commitUniqueTargetDeliveryLocked(
+					item.cohort, item.topologyEpoch,
+					item.attributable, item.demand, item.bytes,
+				)
 				e.recvDeliver = append(e.recvDeliver, item.payload...)
 				e.recvDeliverFrames = append(e.recvDeliverFrames, len(item.payload))
 				e.markPayloadLocked()
@@ -1160,6 +1683,15 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[][]byte) bool {
 		}
 	}
 	return wokeReader
+}
+
+func rootHasImmediateChild(root proto.GraphNode, targetID proto.TargetID) bool {
+	for _, childID := range root.Children {
+		if childID == targetID {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) rememberPolicyReplayDigestLocked(seq uint64, digest proto.FrameDigest) {
@@ -1215,66 +1747,15 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte, r
 				closeErr = ErrPeerClosed
 			}
 		}
-		e.recvFinalErr = closeErr
-		e.recvTerminal = true
+		e.publishRecvTerminalLocked(closeErr)
 
 	case proto.CtrlStreamFin:
 		if e.packetized || len(payload) != 0 || e.recvStreamEOF {
-			e.recvFinalErr = fmt.Errorf("%w: invalid STREAM_FIN", ErrPeerProtocol)
-			e.recvTerminal = true
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid STREAM_FIN", ErrPeerProtocol))
 			return
 		}
 		e.recvStreamEOF = true
 		e.recvCond.Broadcast()
-
-	case proto.CtrlPolicyPrepare:
-		prepare, err := proto.DecodePolicyPrepare(payload)
-		var digest proto.PolicyProposalDigest
-		if err == nil {
-			digest, err = prepare.ProposalDigest()
-		}
-		message := policyMessage{
-			kind:    policyMessagePrepare,
-			key:     policyMessageKey{kind: policyMessagePrepare, transactionID: prepare.TransactionID, digest: digest},
-			prepare: prepare,
-		}
-		if err != nil || !e.enqueuePolicyMessageLocked(message) {
-			if err != nil {
-				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_PREPARE: %v", ErrPeerProtocol, err)
-				e.recvTerminal = true
-			}
-			return
-		}
-
-	case proto.CtrlPolicyAck:
-		ack, err := proto.DecodePolicyAck(payload)
-		message := policyMessage{
-			kind: policyMessageAck,
-			key:  policyMessageKey{kind: policyMessageAck, phase: ack.Phase, transactionID: ack.TransactionID, digest: ack.ProposalDigest},
-			ack:  ack,
-		}
-		if err != nil || !e.enqueuePolicyMessageLocked(message) {
-			if err != nil {
-				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_ACK: %v", ErrPeerProtocol, err)
-				e.recvTerminal = true
-			}
-			return
-		}
-
-	case proto.CtrlPolicyCommit:
-		commit, err := proto.DecodePolicyCommit(payload)
-		message := policyMessage{
-			kind:   policyMessageCommit,
-			key:    policyMessageKey{kind: policyMessageCommit, transactionID: commit.TransactionID, digest: commit.ProposalDigest},
-			commit: commit,
-		}
-		if err != nil || !e.enqueuePolicyMessageLocked(message) {
-			if err != nil {
-				e.recvFinalErr = fmt.Errorf("%w: malformed POLICY_COMMIT: %v", ErrPeerProtocol, err)
-				e.recvTerminal = true
-			}
-			return
-		}
 
 	case proto.CtrlMigrateNotify,
 		proto.CtrlHeartbeat,

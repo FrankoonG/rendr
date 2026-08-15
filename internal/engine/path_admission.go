@@ -345,10 +345,7 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 	predecessor.maintenance.Store(false)
 	predecessor.unfenceDispatch()
 	e.paths[predecessor.id] = predecessor
-	if e.dispatchScope[current.id] {
-		delete(e.dispatchScope, current.id)
-		e.dispatchScope[predecessor.id] = true
-	}
+	e.advancePathTopologyEpochLocked()
 	wasActive := e.activeID == current.id
 	if wasActive {
 		e.activeID = predecessor.id
@@ -685,10 +682,7 @@ func (e *Engine) promoteCompletedPathAdmissionRouteLocked(entry *completedPathAd
 	predecessor.maintenance.Store(false)
 	predecessor.unfenceDispatch()
 	e.paths[predecessor.id] = predecessor
-	if e.dispatchScope[current.id] {
-		delete(e.dispatchScope, current.id)
-		e.dispatchScope[predecessor.id] = true
-	}
+	e.advancePathTopologyEpochLocked()
 	wasActive := e.activeID == current.id
 	if wasActive {
 		e.activeID = predecessor.id

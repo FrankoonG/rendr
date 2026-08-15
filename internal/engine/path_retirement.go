@@ -176,8 +176,7 @@ func (e *Engine) enqueueSequencedPathRetirementLocked(payload []byte) bool {
 	if err == nil {
 		return true
 	}
-	e.recvFinalErr = fmt.Errorf("%w: PATH_RETIRE enqueue failed: %w", ErrPeerProtocol, err)
-	e.recvTerminal = true
+	e.publishRecvTerminalLocked(fmt.Errorf("%w: PATH_RETIRE enqueue failed: %w", ErrPeerProtocol, err))
 	return false
 }
 
@@ -322,7 +321,7 @@ func (e *Engine) sendPeerPathRetirement(notice peerPathRetirementNotice) error {
 	if err != nil {
 		return err
 	}
-	frame, err := e.sendFrameTracked(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPathRetire), payload)
+	frame, err := e.sendFrameTrackedDetached(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPathRetire), payload)
 	if len(frame) != 0 {
 		// The replay ledger owns the frame even when the first dispatch reports
 		// a transport failure. Path recovery will publish the exact bytes.
@@ -500,6 +499,16 @@ func (e *Engine) applyPeerPathRetirementOnce(p proto.PathRetirementPayload) (<-c
 			administrative, false,
 		)
 		e.pathsMu.Unlock()
+		// The peer retirement and its frozen unacknowledged prefix are one
+		// sequencer transaction. finishPathDeparture invokes lifecycle hooks and
+		// may schedule asynchronous recovery; either can otherwise publish a
+		// later DATA/FIN before this prefix reaches the surviving route. Failed
+		// publication keeps replay-ledger ownership for the existing retry path.
+		if departure.hasPaths {
+			departure.replayCommitted = e.replayRangeLocked(
+				e.sendAckNext.Load(), e.sendPublishedNext.Load(),
+			) == nil
+		}
 		e.sendMu.Unlock()
 		e.finishPathDeparture(departure)
 		return nil, nil
