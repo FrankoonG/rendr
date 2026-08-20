@@ -591,6 +591,7 @@ func TestProbeDataStarvationRequiresSameDispatchGenerationHighCount(t *testing.T
 	if _, ok := slot.probeSnapshot(); ok {
 		t.Fatal("DATA-starvation age created wire evidence")
 	}
+
 }
 
 func TestProbeReplyIsRejectedBeforePhysicalWriteStarts(t *testing.T) {
@@ -778,6 +779,291 @@ func TestProbeSingleFlightEndsAtWriteCommitNotReply(t *testing.T) {
 }
 
 func TestCommittedProbeTimeoutAllowsRecoveryProbe(t *testing.T) {
+	t.Run("physical write witness preserves replay order and token bounds", func(t *testing.T) {
+		e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+		t.Cleanup(func() { _ = e.Close() })
+		slot := &pathSlot{id: 90, owner: 900}
+		slot.txEnabled.Store(true)
+		token := e.pathDataWriteToken(slot, slot.txFenceEpoch.Load())
+		for _, seq := range []uint64{11, 3, 9, 3} {
+			slot.noteFirstDataWriteSequence(seq, token)
+		}
+		if next, ok := slot.earliestDataWriteAfter(4, token); !ok || next != 10 {
+			t.Fatalf("replay-order witness=(%d,%t), want (10,true)", next, ok)
+		}
+		if next, ok := slot.earliestDataWriteAfter(10, token); !ok || next != 12 {
+			t.Fatalf("later witness=(%d,%t), want (12,true)", next, ok)
+		}
+		for seq := uint64(0); seq < sendHistoryWindow+17; seq++ {
+			slot.noteFirstDataWriteSequence(seq, token)
+		}
+		slot.dataWriteMu.Lock()
+		witnessCount := len(slot.dataWriteWitness.sequences)
+		slot.dataWriteMu.Unlock()
+		if witnessCount != sendHistoryWindow {
+			t.Fatalf("bounded witness entries=%d want %d", witnessCount, sendHistoryWindow)
+		}
+
+		slot.txFenceEpoch.Add(1)
+		newToken := e.pathDataWriteToken(slot, slot.txFenceEpoch.Load())
+		slot.noteFirstDataWriteSequence(42, newToken)
+		if _, ok := slot.earliestDataWriteAfter(0, token); ok {
+			t.Fatal("old fence token retained access to a reset write witness")
+		}
+		if next, ok := slot.earliestDataWriteAfter(0, newToken); !ok || next != 43 {
+			t.Fatalf("new fence witness=(%d,%t), want (43,true)", next, ok)
+		}
+	})
+
+	t.Run("flat selector wire progress defers only causal expiry", func(t *testing.T) {
+		progress := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
+		t.Cleanup(func() { _ = progress.Close() })
+		ids := configureLeafSelectorRuntime(t, progress, "a", "b")
+		aBase, aPeer := newMemoryPathPair()
+		bBase, bPeer := newMemoryPathPair()
+		t.Cleanup(func() { _ = aPeer.Close(); _ = bPeer.Close() })
+		aID := attachFixturePath(t, progress, aBase, transport.PathSpec{Transport: "memory", Address: "a"}, ids["a"])
+		bID := attachFixturePath(t, progress, bBase, transport.PathSpec{Transport: "memory", Address: "b"}, ids["b"])
+		progress.pathsMu.RLock()
+		aSlot, bSlot := progress.paths[aID], progress.paths[bID]
+		progress.pathsMu.RUnlock()
+
+		commit := func(id uint64, slot *pathSlot, at time.Time) pathProbeObservation {
+			t.Helper()
+			generation := pathProbeGenerationForSlot(slot)
+			progress.probeMu.Lock()
+			progress.probeOutstanding[id] = pathProbeObservation{
+				queuedAt: at.Add(-time.Second), generation: generation, slot: slot,
+				wireTS: id, lifecycle: pathProbeQueued,
+			}
+			progress.probeMu.Unlock()
+			if !progress.markPathProbeWriteStarted(id, slot, at.Add(-time.Millisecond)) {
+				t.Fatalf("probe %d did not enter physical Write", id)
+			}
+			progress.completePathProbeWrite(id, slot, nil, at)
+			progress.probeMu.Lock()
+			observation, ok := progress.probeOutstanding[id]
+			progress.probeMu.Unlock()
+			if !ok || observation.lifecycle != pathProbeWriteCommitted {
+				t.Fatalf("probe %d commit observation=%+v present=%t", id, observation, ok)
+			}
+			return observation
+		}
+		publishOn := func(seq uint64, slot *pathSlot, ackAt time.Time) {
+			t.Helper()
+			reserveAckTestFrame(t, progress, seq, proto.FrameData)
+			progress.sendPublishedNext.Store(seq + 1)
+			progress.sendAckNext.Store(seq)
+			progress.sendACKProgress.Store(&sendACKProgressObservation{next: seq, at: ackAt})
+			frame := make([]byte, proto.HeaderSize+1)
+			if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: seq}).Encode(frame[:proto.HeaderSize]); err != nil {
+				t.Fatal(err)
+			}
+			progress.noteApplicationDispatchRoute(frame, slot)
+			slot.noteFirstDataWriteSequence(seq, progress.pathDataWriteToken(slot, slot.txFenceEpoch.Load()))
+		}
+
+		committedAt := time.Unix(4_000, 0)
+		publishOn(0, aSlot, committedAt.Add(-time.Second))
+		first := commit(101, aSlot, committedAt)
+		if first.wireAckBaseline != 0 || first.wireDataWitnessNext != 1 ||
+			first.wireMigrationEpoch != 0 || !first.wireProgressTracked {
+			t.Fatalf("initial wire progress=%+v", first)
+		}
+		progress.sendACKProgress.Store(&sendACKProgressObservation{
+			next: 1, at: first.writeCommittedAt,
+		})
+		if observed, causal := progress.flatSelectorCausalACK(first, first.deadline); causal {
+			t.Fatalf("ACK at the write-commit boundary became causal: %+v", observed)
+		}
+		ackAt := committedAt.Add(minimumSelectorProbeFreshFor / 2)
+		progress.sendACKProgress.Store(&sendACKProgressObservation{next: 1, at: ackAt})
+		progress.expirePathProbes(first.deadline)
+		progress.probeMu.Lock()
+		deferred, retained := progress.probeOutstanding[101]
+		progress.probeMu.Unlock()
+		if !retained || !deferred.deadline.After(first.deadline) ||
+			deferred.wireAckBaseline != 1 || !deferred.wireProgressDeferred ||
+			deferred.deadline != ackAt.Add(minimumSelectorProbeFreshFor) ||
+			deferred.deadline.After(first.writeStartedAt.Add(maximumCommittedProbeLifetime)) {
+			t.Fatalf("causal progress did not defer expiry: %+v retained=%t", deferred, retained)
+		}
+		if evidence, ok := aSlot.probeSnapshot(); !ok || evidence.timedOut != 0 {
+			t.Fatalf("deferred probe evidence=%+v present=%t", evidence, ok)
+		}
+		progress.expirePathProbes(deferred.deadline.Add(-time.Nanosecond))
+		progress.probeMu.Lock()
+		_, retained = progress.probeOutstanding[101]
+		progress.probeMu.Unlock()
+		if !retained {
+			t.Fatal("deferred probe expired before its refreshed deadline")
+		}
+		progress.sendACKProgress.Store(&sendACKProgressObservation{
+			next: 2, at: deferred.deadline.Add(-time.Millisecond),
+		})
+		progress.expirePathProbes(deferred.deadline)
+		progress.probeMu.Lock()
+		_, retained = progress.probeOutstanding[101]
+		progress.probeMu.Unlock()
+		if retained {
+			t.Fatal("probe with no further progress survived its refreshed deadline")
+		}
+		if evidence, ok := aSlot.probeSnapshot(); !ok || evidence.timedOut != 1 {
+			t.Fatalf("eventual timeout evidence=%+v present=%t", evidence, ok)
+		}
+
+		publishOn(1, aSlot, committedAt.Add(time.Hour-time.Second))
+		backup := commit(102, bSlot, committedAt.Add(time.Hour))
+		progress.sendACKProgress.Store(&sendACKProgressObservation{next: 2, at: backup.writeCommittedAt.Add(minimumSelectorProbeFreshFor / 2)})
+		progress.expirePathProbes(backup.deadline)
+		progress.probeMu.Lock()
+		_, retained = progress.probeOutstanding[102]
+		progress.probeMu.Unlock()
+		if retained {
+			t.Fatal("another leaf's DATA progress masked the probed leaf timeout")
+		}
+		if evidence, ok := bSlot.probeSnapshot(); !ok || evidence.timedOut != 1 {
+			t.Fatalf("backup timeout evidence=%+v present=%t", evidence, ok)
+		}
+
+		publishOn(2, aSlot, committedAt.Add(2*time.Hour-time.Second))
+		staleRoute := commit(103, aSlot, committedAt.Add(2*time.Hour))
+		progress.migrationEpoch.Add(1)
+		progress.sendACKProgress.Store(&sendACKProgressObservation{
+			next: 3, at: staleRoute.writeCommittedAt.Add(minimumSelectorProbeFreshFor / 2),
+		})
+		progress.expirePathProbes(staleRoute.deadline)
+		progress.probeMu.Lock()
+		_, retained = progress.probeOutstanding[103]
+		progress.probeMu.Unlock()
+		if retained {
+			t.Fatal("ACK from a later migration epoch masked the stale route timeout")
+		}
+
+		lateCommitAt := committedAt.Add(3 * time.Hour)
+		publishOn(3, aSlot, lateCommitAt.Add(-time.Second))
+		late := commit(104, aSlot, lateCommitAt)
+		progress.sendACKProgress.Store(&sendACKProgressObservation{
+			next: 4, at: late.writeCommittedAt.Add(100 * time.Millisecond),
+		})
+		progress.expirePathProbes(late.writeCommittedAt.Add(2 * time.Second))
+		progress.probeMu.Lock()
+		_, retained = progress.probeOutstanding[104]
+		progress.probeMu.Unlock()
+		if retained {
+			t.Fatal("stale progress observed after its bounded deadline deferred timeout")
+		}
+	})
+
+	invalidations := []struct {
+		name string
+		do   func(*Engine, *pathSlot)
+	}{
+		{name: "migration epoch", do: func(e *Engine, _ *pathSlot) { e.migrationEpoch.Add(1) }},
+		{name: "TX fence epoch", do: func(_ *Engine, slot *pathSlot) { slot.txFenceEpoch.Add(1) }},
+		{name: "path generation", do: func(_ *Engine, slot *pathSlot) { slot.routeGeneration.Add(1) }},
+	}
+	for _, invalidation := range invalidations {
+		t.Run("deferred progress is revoked by "+invalidation.name, func(t *testing.T) {
+			e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
+			t.Cleanup(func() { _ = e.Close() })
+			ids := configureLeafSelectorRuntime(t, e, "path")
+			base, peer := newMemoryPathPair()
+			t.Cleanup(func() { _ = peer.Close() })
+			pathID := attachFixturePath(t, e, base, transport.PathSpec{Transport: "memory", Address: "path"}, ids["path"])
+			e.pathsMu.RLock()
+			slot := e.paths[pathID]
+			e.pathsMu.RUnlock()
+
+			started := time.Unix(5_000, 0)
+			reserveAckTestFrame(t, e, 0, proto.FrameData)
+			e.sendPublishedNext.Store(1)
+			e.sendAckNext.Store(0)
+			slot.noteFirstDataWriteSequence(0, e.pathDataWriteToken(slot, slot.txFenceEpoch.Load()))
+			const probeID = 201
+			generation := pathProbeGenerationForSlot(slot)
+			e.probeMu.Lock()
+			e.probeOutstanding[probeID] = pathProbeObservation{
+				queuedAt: started.Add(-time.Second), generation: generation, slot: slot,
+				wireTS: probeID, fenceEpoch: slot.txFenceEpoch.Load(), lifecycle: pathProbeQueued,
+			}
+			e.probeMu.Unlock()
+			if !e.markPathProbeWriteStarted(probeID, slot, started) {
+				t.Fatal("probe did not enter physical Write")
+			}
+			e.completePathProbeWrite(probeID, slot, nil, started.Add(time.Millisecond))
+			e.probeMu.Lock()
+			committed, ok := e.probeOutstanding[probeID]
+			e.probeMu.Unlock()
+			if !ok || !committed.wireProgressTracked {
+				t.Fatalf("committed tracked probe=%+v present=%t", committed, ok)
+			}
+			ackAt := committed.writeStartedAt.Add(minimumSelectorProbeFreshFor / 2)
+			e.sendACKProgress.Store(&sendACKProgressObservation{next: 1, at: ackAt})
+			e.expirePathProbes(committed.deadline)
+			e.probeMu.Lock()
+			deferred, ok := e.probeOutstanding[probeID]
+			e.probeMu.Unlock()
+			if !ok || !deferred.wireProgressDeferred {
+				t.Fatalf("probe did not earn one causal extension: %+v present=%t", deferred, ok)
+			}
+
+			invalidation.do(e, slot)
+			e.expirePathProbes(deferred.deadline.Add(-time.Nanosecond))
+			e.probeMu.Lock()
+			_, retained := e.probeOutstanding[probeID]
+			e.probeMu.Unlock()
+			if retained {
+				t.Fatal("invalidated progress extension remained outstanding")
+			}
+			if evidence := slot.probeEvidence.Load(); evidence != nil && evidence.timedOut != 0 {
+				t.Fatalf("invalidated observation published timeout evidence: %+v", *evidence)
+			}
+			if evidence, ok := slot.probeSnapshot(); ok {
+				t.Fatalf("invalidated token remained visible through probeSnapshot: %+v", evidence)
+			}
+			if e.acceptPathProbeReply(slot, proto.ProbePayload{ID: probeID, TS: probeID}, deferred.deadline) {
+				t.Fatal("invalidated observation accepted a late reply")
+			}
+		})
+	}
+
+	t.Run("slow physical Write consumes the five second total budget", func(t *testing.T) {
+		e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
+		t.Cleanup(func() { _ = e.Close() })
+		ids := configureLeafSelectorRuntime(t, e, "path")
+		base, peer := newMemoryPathPair()
+		t.Cleanup(func() { _ = peer.Close() })
+		pathID := attachFixturePath(t, e, base, transport.PathSpec{Transport: "memory", Address: "path"}, ids["path"])
+		e.pathsMu.RLock()
+		slot := e.paths[pathID]
+		e.pathsMu.RUnlock()
+
+		started := time.Unix(6_000, 0)
+		completed := started.Add(maximumCommittedProbeLifetime + time.Millisecond)
+		const probeID = 301
+		e.probeMu.Lock()
+		e.probeOutstanding[probeID] = pathProbeObservation{
+			queuedAt: started.Add(-time.Second), generation: pathProbeGenerationForSlot(slot), slot: slot,
+			wireTS: probeID, fenceEpoch: slot.txFenceEpoch.Load(), lifecycle: pathProbeQueued,
+		}
+		e.probeMu.Unlock()
+		if !e.markPathProbeWriteStarted(probeID, slot, started) {
+			t.Fatal("slow probe did not enter physical Write")
+		}
+		e.completePathProbeWrite(probeID, slot, nil, completed)
+		e.probeMu.Lock()
+		_, retained := e.probeOutstanding[probeID]
+		e.probeMu.Unlock()
+		if retained {
+			t.Fatal("slow Write survived beyond its total probe lifetime")
+		}
+		evidence := slot.probeEvidence.Load()
+		if evidence == nil || evidence.issued != 1 || evidence.timedOut != 1 || evidence.lastWireTimeout != completed {
+			t.Fatalf("slow-Write timeout evidence=%+v", evidence)
+		}
+	})
+
 	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
 	base, peer := newMemoryPathPair()
@@ -1481,7 +1767,8 @@ func seedOutstandingProbe(t *testing.T, e *Engine, slot *pathSlot, id uint64, is
 	t.Helper()
 	generation := pathProbeGenerationForSlot(slot)
 	evidence := pathProbeEvidence{
-		generation: generation, firstIssued: issued, lastIssued: issued,
+		generation: generation, fenceEpoch: slot.txFenceEpoch.Load(), fenceTracked: true,
+		firstIssued: issued, lastIssued: issued,
 		lastLifecycle: pathProbeWriteCommitted, lastTransition: issued, issued: 1,
 	}
 	slot.probeEvidence.Store(&evidence)
@@ -1489,7 +1776,7 @@ func seedOutstandingProbe(t *testing.T, e *Engine, slot *pathSlot, id uint64, is
 	e.probeOutstanding[id] = pathProbeObservation{
 		queuedAt: issued, writeStartedAt: issued, writeCommittedAt: issued,
 		deadline: issued.Add(maximumSelectorProbeFreshFor), generation: generation, slot: slot,
-		lifecycle: pathProbeWriteCommitted,
+		fenceEpoch: slot.txFenceEpoch.Load(), lifecycle: pathProbeWriteCommitted,
 	}
 	e.probeMu.Unlock()
 }

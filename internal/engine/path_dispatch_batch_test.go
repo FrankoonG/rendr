@@ -98,6 +98,25 @@ func (p *recordingFrameBatchPath) Close() error {
 
 func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 	e, slot, path := newBatchDispatchHarness(t, true)
+	witnessPublished := make(chan struct{}, 1)
+	e.pathDispatchBatchBeforePermitRelease = func(observed *pathSlot) {
+		if observed != slot {
+			t.Errorf("batch witness slot=%p want %p", observed, slot)
+		}
+		select {
+		case <-slot.writePermit:
+			t.Error("batch released the physical write permit before publishing DATA witnesses")
+		default:
+		}
+		token := e.pathDataWriteToken(slot, slot.txFenceEpoch.Load())
+		if next, ok := slot.earliestDataWriteAfter(maximumPathDispatchBatch-1, token); !ok || next != maximumPathDispatchBatch {
+			t.Errorf("in-permit DATA witness=(%d,%t), want (%d,true)", next, ok, maximumPathDispatchBatch)
+		}
+		select {
+		case witnessPublished <- struct{}{}:
+		default:
+		}
+	}
 	waiters := make([]*applicationDispatchWaiter, maximumPathDispatchBatch)
 	for i := range waiters {
 		waiters[i] = queueBatchApplicationJob(t, e, slot, uint64(i), true)
@@ -122,8 +141,17 @@ func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 	if len(ordinary) != 0 {
 		t.Fatalf("ordinary writes=%v want none", ordinary)
 	}
+	select {
+	case <-witnessPublished:
+	default:
+		t.Fatal("batch never published its DATA witness before permit release")
+	}
 	if got := slot.dataWrites.Load(); got != maximumPathDispatchBatch {
 		t.Fatalf("data writes=%d", got)
+	}
+	token := e.pathDataWriteToken(slot, slot.txFenceEpoch.Load())
+	if next, ok := slot.earliestDataWriteAfter(maximumPathDispatchBatch-1, token); !ok || next != maximumPathDispatchBatch {
+		t.Fatalf("last written DATA witness=(%d,%t), want (%d,true)", next, ok, maximumPathDispatchBatch)
 	}
 	if got := slot.dataDispatches.Load(); got != maximumPathDispatchBatch {
 		t.Fatalf("data dispatches=%d", got)
@@ -139,6 +167,14 @@ func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 	}
 	if got := slot.batchWriteMax.Load(); got != maximumPathDispatchBatch {
 		t.Fatalf("batch write max=%d want %d", got, maximumPathDispatchBatch)
+	}
+
+	replay := queueBatchApplicationJob(t, e, slot, 999, false)
+	if result := awaitBatchDispatchResult(t, replay); result.err != nil {
+		t.Fatalf("replay dispatch: %v", result.err)
+	}
+	if next, ok := slot.earliestDataWriteAfter(maximumPathDispatchBatch, token); ok {
+		t.Fatalf("replay-only DATA became a causal path witness: next=%d", next)
 	}
 }
 

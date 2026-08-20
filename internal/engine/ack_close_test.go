@@ -3,6 +3,7 @@ package engine
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/FrankoonG/rendr/proto"
 )
@@ -55,10 +56,17 @@ func TestPeerAckClampedToSentSeq(t *testing.T) {
 	if got := e.sendAckNext.Load(); got != 0 {
 		t.Fatalf("future ACK advanced sendAckNext to %d, want 0", got)
 	}
+	if progress := e.sendACKProgress.Load(); progress != nil {
+		t.Fatalf("future ACK created probe progress %+v", *progress)
+	}
 
-	e.notePeerAck(currentAck(e, 2))
+	receivedAt := time.Unix(12_345, 678)
+	e.notePeerAckAt(currentAck(e, 2), receivedAt)
 	if got := e.sendAckNext.Load(); got != 2 {
 		t.Fatalf("valid ACK advanced sendAckNext to %d, want 2", got)
+	}
+	if progress := e.sendACKProgress.Load(); progress == nil || progress.next != 2 || progress.at != receivedAt {
+		t.Fatalf("valid ACK probe progress=%+v", progress)
 	}
 }
 

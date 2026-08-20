@@ -257,11 +257,25 @@ drained:
 	for i, frame := range frames {
 		cohorts[i] = e.applicationRootCohortFromFrame(frame)
 	}
+	writeToken := e.pathDataWriteToken(slot, first.fenceEpoch)
 	started := nowFn()
 	completed, batchErr := writer.WriteFrameBatch(frames)
 	finished := nowFn()
-	slot.releaseWrite()
 	completed, batchErr = classifyFrameBatchResult(len(jobs), completed, batchErr)
+	// Publish each successful first DATA write before releasing the permit. A
+	// following probe can then bind ACK progress to a path-unique predecessor.
+	for i := 0; i < completed; i++ {
+		if jobs[i].firstPublication && len(jobs[i].frame) >= proto.HeaderSize {
+			if header, err := proto.DecodeHeader(jobs[i].frame[:proto.HeaderSize]); err == nil &&
+				header.Type == proto.FrameData {
+				slot.noteFirstDataWriteSequence(header.Seq, writeToken)
+			}
+		}
+	}
+	if e.pathDispatchBatchBeforePermitRelease != nil {
+		e.pathDispatchBatchBeforePermitRelease(slot)
+	}
+	slot.releaseWrite()
 	e.resolveApplicationBatchDispatch(receipts, completed)
 	if completed > 0 {
 		slot.batchWriteCalls.Add(1)
@@ -334,9 +348,19 @@ func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 
 func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	cohort := e.applicationRootCohortFromFrame(job.frame)
+	var writeToken pathDataWriteToken
 	started := nowFn()
 	n, err := slot.writeDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, func() {
 		e.noteApplicationDispatchRouteAtEpoch(job.frame, slot, job.topologyEpoch)
+		writeToken = e.pathDataWriteToken(slot, job.fenceEpoch)
+	}, func(n int, writeErr error) {
+		if !job.firstPublication || writeErr != nil || n != len(job.frame) || len(job.frame) < proto.HeaderSize {
+			return
+		}
+		header, decodeErr := proto.DecodeHeader(job.frame[:proto.HeaderSize])
+		if decodeErr == nil && header.Type == proto.FrameData {
+			slot.noteFirstDataWriteSequence(header.Seq, writeToken)
+		}
 	})
 	finished := nowFn()
 	if err == nil && n != len(job.frame) {

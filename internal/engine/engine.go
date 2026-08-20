@@ -80,6 +80,10 @@ type Engine struct {
 	// assignment of activeID at AttachPath time is not counted. An in-place
 	// commit reports oldID == newID to preserve the stable logical Path ID.
 	migrationCount uint64
+	// migrationEpoch is the lock-free invalidation token used by probe
+	// observations. migrationCount remains the authoritative public counter
+	// under pathsMu.
+	migrationEpoch atomic.Uint64
 
 	// migrateHooks is the list of subscriber callbacks invoked
 	// (each in its own goroutine) when activeID changes. Registered
@@ -116,6 +120,7 @@ type Engine struct {
 	sendMu                  sequencerMutex
 	sendSeq                 uint64
 	sendAckNext             atomic.Uint64
+	sendACKProgress         atomic.Pointer[sendACKProgressObservation]
 	sendPublishedNext       atomic.Uint64
 	sendProof               proto.AckProof
 	sendAckProof            proto.AckProof
@@ -140,6 +145,9 @@ type Engine struct {
 	// pathDispatchBatchYield is a deterministic package-test hook. Production
 	// uses runtime.Gosched when concurrent packet writers already exist.
 	pathDispatchBatchYield func()
+	// pathDispatchBatchBeforePermitRelease is a deterministic package-test hook
+	// invoked after exact DATA witnesses are published while writePermit is held.
+	pathDispatchBatchBeforePermitRelease func(*pathSlot)
 	// boundedReplayBeforeSnapshot is a deterministic package-test hook.
 	// Tests install it before queuing replay and never mutate it concurrently.
 	boundedReplayBeforeSnapshot func()
@@ -447,23 +455,40 @@ type LeafMobilitySnapshot struct {
 	Initiator LeafMobilityInitiatorSnapshot
 }
 
+type pathDataWriteToken struct {
+	generation     pathProbeGeneration
+	migrationEpoch uint64
+	fenceEpoch     uint64
+}
+
+func (token pathDataWriteToken) valid() bool {
+	return token.generation.path != (PathRef{})
+}
+
+type pathDataWriteWitness struct {
+	token     pathDataWriteToken
+	sequences []uint64
+	head      int
+}
+
 var ErrPathAttachInProgress = errors.New("engine: path attach already in progress for leaf")
 var ErrPathTXFenced = fmt.Errorf("%w: engine path is TX-fenced", net.ErrClosed)
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
-	id              uint32
-	gen             uint64
-	owner           uint64
-	topologyEpoch   atomic.Uint64
-	conn            transport.PathConn
-	spec            transport.PathSpec
-	localTXTargetID proto.TargetID
-	peerTXTargetID  proto.TargetID
-	routeGeneration atomic.Uint64
-	mobilityClaim   *leafmobility.Claim
-	mobilityFacts   leafmobility.Facts
-	attached        time.Time
+	id                   uint32
+	gen                  uint64
+	owner                uint64
+	topologyEpoch        atomic.Uint64
+	conn                 transport.PathConn
+	spec                 transport.PathSpec
+	localTXTargetID      proto.TargetID
+	peerTXTargetID       proto.TargetID
+	migrationEpochSource *atomic.Uint64
+	routeGeneration      atomic.Uint64
+	mobilityClaim        *leafmobility.Claim
+	mobilityFacts        leafmobility.Facts
+	attached             time.Time
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
@@ -507,6 +532,8 @@ type pathSlot struct {
 	// writes bump it.
 	lastSendUnixNano       atomic.Int64
 	dataWrites             atomic.Uint64
+	dataWriteMu            sync.Mutex
+	dataWriteWitness       pathDataWriteWitness
 	controlWrites          atomic.Uint64
 	dataDispatches         atomic.Uint64
 	firstDataDispatches    atomic.Uint64
@@ -621,6 +648,74 @@ func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
 	return n, err
 }
 
+func (e *Engine) pathDataWriteToken(slot *pathSlot, fenceEpoch uint64) pathDataWriteToken {
+	if e == nil || slot == nil || !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return pathDataWriteToken{}
+	}
+	for attempts := 0; attempts < 3; attempts++ {
+		generation := pathProbeGenerationForSlot(slot)
+		migrationEpoch := e.migrationEpoch.Load()
+		if generation.path == (PathRef{}) || !slot.txEnabled.Load() ||
+			slot.txFenceEpoch.Load() != fenceEpoch {
+			return pathDataWriteToken{}
+		}
+		if generation == pathProbeGenerationForSlot(slot) && migrationEpoch == e.migrationEpoch.Load() {
+			return pathDataWriteToken{
+				generation: generation, migrationEpoch: migrationEpoch, fenceEpoch: fenceEpoch,
+			}
+		}
+	}
+	return pathDataWriteToken{}
+}
+
+// noteFirstDataWriteSequence records a DATA sequence whose first physical
+// publication succeeded on this leaf while it held the write permit. Replay
+// writes are deliberately excluded: their ACK may have originated from an
+// earlier delivery on another leaf.
+func (s *pathSlot) noteFirstDataWriteSequence(seq uint64, token pathDataWriteToken) {
+	if s == nil || seq > proto.MaxSeq || !token.valid() {
+		return
+	}
+	s.dataWriteMu.Lock()
+	defer s.dataWriteMu.Unlock()
+	witness := &s.dataWriteWitness
+	if witness.token != token {
+		witness.token = token
+		witness.sequences = witness.sequences[:0]
+		witness.head = 0
+	}
+	if len(witness.sequences) < sendHistoryWindow {
+		witness.sequences = append(witness.sequences, seq)
+		return
+	}
+	witness.sequences[witness.head] = seq
+	witness.head = (witness.head + 1) % len(witness.sequences)
+}
+
+func (s *pathSlot) earliestDataWriteAfter(ackNext uint64, token pathDataWriteToken) (uint64, bool) {
+	if s == nil || !token.valid() {
+		return 0, false
+	}
+	s.dataWriteMu.Lock()
+	defer s.dataWriteMu.Unlock()
+	if s.dataWriteWitness.token != token {
+		return 0, false
+	}
+	var earliest uint64
+	found := false
+	for _, seq := range s.dataWriteWitness.sequences {
+		if seq < ackNext || seq > proto.MaxSeq || found && seq >= earliest {
+			continue
+		}
+		earliest = seq
+		found = true
+	}
+	if !found {
+		return 0, false
+	}
+	return earliest + 1, true
+}
+
 func (s *pathSlot) writeDispatchedFrame(frame []byte) (int, error) {
 	fenceEpoch, ok := s.acquireDispatchFencePermit()
 	if !ok {
@@ -644,13 +739,14 @@ func (s *pathSlot) acquireDispatchFencePermit() (uint64, bool) {
 }
 
 func (s *pathSlot) writeDispatchedFrameEpoch(frame []byte, fenceEpoch uint64) (int, error) {
-	return s.writeDispatchedFrameEpochObserved(frame, fenceEpoch, nil)
+	return s.writeDispatchedFrameEpochObserved(frame, fenceEpoch, nil, nil)
 }
 
 func (s *pathSlot) writeDispatchedFrameEpochObserved(
 	frame []byte,
 	fenceEpoch uint64,
 	beforeWrite func(),
+	afterWrite func(int, error),
 ) (int, error) {
 	if !s.txEnabled.Load() || s.txFenceEpoch.Load() != fenceEpoch {
 		return 0, ErrPathTXFenced
@@ -668,7 +764,11 @@ func (s *pathSlot) writeDispatchedFrameEpochObserved(
 	if beforeWrite != nil {
 		beforeWrite()
 	}
-	return s.writeFrameOwned(frame)
+	n, err := s.writeFrameOwned(frame)
+	if afterWrite != nil {
+		afterWrite(n, err)
+	}
+	return n, err
 }
 
 func (s *pathSlot) tryFenceDispatch() bool {
@@ -1243,25 +1343,26 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		e.tightenPacketFrameLimit(pathFrameLimit)
 	}
 	slot := &pathSlot{
-		id:              id,
-		gen:             generation,
-		owner:           generation,
-		conn:            pc,
-		spec:            spec.Clone(),
-		localTXTargetID: binding.LocalTXTargetID,
-		peerTXTargetID:  binding.PeerTXTargetID,
-		mobilityClaim:   mobilityClaim,
-		mobilityFacts:   mobilityFacts,
-		attached:        time.Now(),
-		recvQ:           make(chan recvFrame, recvQSize),
-		dispatchQ:       make(chan pathDispatchJob, pathDispatchQueueSize),
-		writePermit:     newPathWritePermit(),
-		quit:            make(chan struct{}),
-		doneR:           make(chan struct{}),
-		doneW:           make(chan struct{}),
-		doneP:           make(chan struct{}),
-		admissionInbox:  make(chan pathAdmissionMessage, pathAdmissionInboxSize),
-		admissionDone:   make(chan struct{}),
+		id:                   id,
+		gen:                  generation,
+		owner:                generation,
+		conn:                 pc,
+		spec:                 spec.Clone(),
+		localTXTargetID:      binding.LocalTXTargetID,
+		peerTXTargetID:       binding.PeerTXTargetID,
+		migrationEpochSource: &e.migrationEpoch,
+		mobilityClaim:        mobilityClaim,
+		mobilityFacts:        mobilityFacts,
+		attached:             time.Now(),
+		recvQ:                make(chan recvFrame, recvQSize),
+		dispatchQ:            make(chan pathDispatchJob, pathDispatchQueueSize),
+		writePermit:          newPathWritePermit(),
+		quit:                 make(chan struct{}),
+		doneR:                make(chan struct{}),
+		doneW:                make(chan struct{}),
+		doneP:                make(chan struct{}),
+		admissionInbox:       make(chan pathAdmissionMessage, pathAdmissionInboxSize),
+		admissionDone:        make(chan struct{}),
 	}
 	slot.probeEndpointGen.Store(mobilityFacts.Generation)
 	if completedKeyOK {
@@ -1546,7 +1647,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 	}
 	newActive := e.activeID
 	if recoveryEvent {
-		e.migrationCount++
+		e.recordMigrationLocked()
 		zombieTrip = e.accountMigration()
 	}
 	if hook := e.activationAfterInitialSelection; hook != nil {
@@ -2247,7 +2348,7 @@ func (e *Engine) commitRecursiveSelection(
 	changed := oldID != e.activeID && e.activeID != 0
 	var zombieTrip zombieTripTicket
 	if changed {
-		e.migrationCount++
+		e.recordMigrationLocked()
 		if origin.chargesZombieBudget() {
 			zombieTrip = e.accountMigration()
 		}
@@ -2492,6 +2593,13 @@ func (e *Engine) MigrationCount() uint64 {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	return e.migrationCount
+}
+
+// recordMigrationLocked advances both the public count and the lock-free
+// invalidation token. Callers hold pathsMu for writing.
+func (e *Engine) recordMigrationLocked() {
+	e.migrationCount++
+	e.migrationEpoch.Add(1)
 }
 
 // OnMigrate registers fn to be invoked in a fresh goroutine for every

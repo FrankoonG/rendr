@@ -349,7 +349,7 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 	wasActive := e.activeID == current.id
 	if wasActive {
 		e.activeID = predecessor.id
-		e.migrationCount++
+		e.recordMigrationLocked()
 	}
 	if !e.transferPathAdmissionLocked(current.id, predecessor.id) {
 		e.pathsMu.Unlock()
@@ -686,7 +686,7 @@ func (e *Engine) promoteCompletedPathAdmissionRouteLocked(entry *completedPathAd
 	wasActive := e.activeID == current.id
 	if wasActive {
 		e.activeID = predecessor.id
-		e.migrationCount++
+		e.recordMigrationLocked()
 	}
 	entry.successor = source
 	return completedPathAdmissionPromotion{

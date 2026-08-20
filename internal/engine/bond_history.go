@@ -1495,6 +1495,17 @@ func (e *Engine) applicationDispatchAcknowledged(target uint64) bool {
 // It reports whether the ACK proves delivery of application payload; control
 // progress alone must not refresh zombie protection.
 func (e *Engine) acknowledgeSendFrames(nextSeq uint64, proof proto.AckProof) (valid bool, application bool) {
+	return e.acknowledgeSendFramesAt(nextSeq, proof, nowFn())
+}
+
+func (e *Engine) acknowledgeSendFramesAt(
+	nextSeq uint64,
+	proof proto.AckProof,
+	receivedAt time.Time,
+) (valid bool, application bool) {
+	if receivedAt.IsZero() {
+		receivedAt = nowFn()
+	}
 	// The local graph is immutable before any DATA publication. Snapshot it
 	// outside the replay hot lock so ACK processing never nests graphMu below
 	// sendHistMu.
@@ -1532,7 +1543,7 @@ func (e *Engine) acknowledgeSendFrames(nextSeq uint64, proof proto.AckProof) (va
 		return false, application
 	}
 	e.sendAckProof = proof
-	now := nowFn()
+	now := receivedAt
 	e.resetTargetDeliveryScratchLocked()
 	for i := 0; i < cut; i++ {
 		entry := e.sendHist.entries[i]
@@ -1594,6 +1605,7 @@ func (e *Engine) acknowledgeSendFrames(nextSeq uint64, proof proto.AckProof) (va
 	// growth, so retirement cost is proportional only to the released prefix.
 	e.sendHist.entries = e.sendHist.entries[cut:]
 	e.sendAckNext.Store(nextSeq)
+	e.sendACKProgress.Store(&sendACKProgressObservation{next: nextSeq, at: now})
 	e.sendHist.generation++
 	wake := e.sendCreditWake
 	e.sendCreditWake = make(chan struct{})

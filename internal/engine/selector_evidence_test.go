@@ -1484,7 +1484,8 @@ func seedPathProbeSuccess(e *Engine, slot *pathSlot, at time.Time, rtt time.Dura
 	generation := pathProbeGenerationForSlot(slot)
 	e.probeMu.Lock()
 	slot.probeEvidence.Store(&pathProbeEvidence{
-		generation: generation, firstIssued: at, lastIssued: at, lastSuccess: at,
+		generation: generation, fenceEpoch: slot.txFenceEpoch.Load(), fenceTracked: true,
+		firstIssued: at, lastIssued: at, lastSuccess: at,
 		lastLifecycle: pathProbeWriteCommitted, lastTransition: at,
 		quality: transport.PathQuality{RTT: rtt, At: at}, issued: 1, succeeded: 1,
 	})

@@ -46,21 +46,31 @@ type pathProbeStatus struct {
 	failure   pathProbeFailure
 }
 
+type sendACKProgressObservation struct {
+	next uint64
+	at   time.Time
+}
+
 type pathProbeObservation struct {
-	queuedAt            time.Time
-	writeStartedAt      time.Time
-	writeCommittedAt    time.Time
-	writeStallDeadline  time.Time
-	deadline            time.Time
-	generation          pathProbeGeneration
-	slot                *pathSlot
-	quality             transport.PathQuality
-	wireTS              uint64
-	fenceEpoch          uint64
-	lifecycle           pathProbeLifecycle
-	dataStallGeneration uint64
-	dataBlockedAt       time.Time
-	pendingReplyAt      time.Time
+	queuedAt             time.Time
+	writeStartedAt       time.Time
+	writeCommittedAt     time.Time
+	writeStallDeadline   time.Time
+	deadline             time.Time
+	generation           pathProbeGeneration
+	slot                 *pathSlot
+	quality              transport.PathQuality
+	wireTS               uint64
+	fenceEpoch           uint64
+	lifecycle            pathProbeLifecycle
+	dataStallGeneration  uint64
+	dataBlockedAt        time.Time
+	wireAckBaseline      uint64
+	wireDataWitnessNext  uint64
+	wireMigrationEpoch   uint64
+	wireProgressTracked  bool
+	wireProgressDeferred bool
+	pendingReplyAt       time.Time
 }
 
 // pathProbeEvidence contains only engine-owned same-carrier observations.
@@ -68,17 +78,21 @@ type pathProbeObservation struct {
 // and in-Write time never enter wire liveness or RTT evidence. Transport-owned
 // fields, including loss, remain live through PathConn.Quality.
 type pathProbeEvidence struct {
-	generation      pathProbeGeneration
-	firstIssued     time.Time
-	lastIssued      time.Time
-	lastSuccess     time.Time
-	lastWireTimeout time.Time
-	lastLifecycle   pathProbeLifecycle
-	lastTransition  time.Time
-	quality         transport.PathQuality
-	issued          uint64
-	succeeded       uint64
-	timedOut        uint64
+	generation       pathProbeGeneration
+	fenceEpoch       uint64
+	fenceTracked     bool
+	migrationEpoch   uint64
+	migrationTracked bool
+	firstIssued      time.Time
+	lastIssued       time.Time
+	lastSuccess      time.Time
+	lastWireTimeout  time.Time
+	lastLifecycle    pathProbeLifecycle
+	lastTransition   time.Time
+	quality          transport.PathQuality
+	issued           uint64
+	succeeded        uint64
+	timedOut         uint64
 }
 
 func (lifecycle pathProbeLifecycle) blocksNextProbeWrite() bool {
@@ -109,7 +123,7 @@ func (slot *pathSlot) quality() transport.PathQuality {
 		[]*pathSlot{slot}, selectorQualityObservationBudget,
 	)[slot]
 	evidence := slot.probeEvidence.Load()
-	if evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) || evidence.lastSuccess.IsZero() {
+	if !slot.probeEvidenceCurrent(evidence) || evidence.lastSuccess.IsZero() {
 		return quality
 	}
 	// Engine probes and adapter telemetry are independent timing sources for
@@ -131,10 +145,28 @@ func (slot *pathSlot) probeSnapshot() (pathProbeEvidence, bool) {
 		return pathProbeEvidence{}, false
 	}
 	evidence := slot.probeEvidence.Load()
-	if evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) {
+	if !slot.probeEvidenceCurrent(evidence) {
 		return pathProbeEvidence{}, false
 	}
 	return *evidence, true
+}
+
+func (slot *pathSlot) probeEvidenceCurrent(evidence *pathProbeEvidence) bool {
+	if slot == nil || evidence == nil || evidence.generation != pathProbeGenerationForSlot(slot) ||
+		evidence.fenceTracked && evidence.fenceEpoch != slot.txFenceEpoch.Load() {
+		return false
+	}
+	if !evidence.migrationTracked {
+		return true
+	}
+	return slot.migrationEpochSource != nil && slot.migrationEpochSource.Load() == evidence.migrationEpoch
+}
+
+func pathProbeEvidenceMatchesObservation(evidence *pathProbeEvidence, observation pathProbeObservation) bool {
+	return evidence != nil && evidence.generation == observation.generation &&
+		evidence.fenceTracked && evidence.fenceEpoch == observation.fenceEpoch &&
+		evidence.migrationTracked == observation.wireProgressTracked &&
+		(!evidence.migrationTracked || evidence.migrationEpoch == observation.wireMigrationEpoch)
 }
 
 func (slot *pathSlot) probeLiveness(now time.Time, interval time.Duration) qualityState {
@@ -338,7 +370,7 @@ func (e *Engine) startPathProbeWrite(
 			hook()
 		}
 		n, err := slot.writeProbeFrame(frame, fenceEpoch, permitCancel, func() bool {
-			return e.markPathProbeWriteStarted(id, slot, nowFn())
+			return e.markPathProbeWriteStarted(id, slot, time.Time{})
 		})
 		if err == nil && n != len(frame) {
 			err = io.ErrShortWrite
@@ -415,6 +447,7 @@ func (e *Engine) markPathProbeSubmitted(id uint64, slot *pathSlot) {
 }
 
 func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started time.Time) bool {
+	baseline, progressRelevant := e.flatSelectorProgressBaseline(slot)
 	e.probeMu.Lock()
 	defer e.probeMu.Unlock()
 	observation, ok := e.probeOutstanding[id]
@@ -422,8 +455,12 @@ func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started ti
 		observation.generation != pathProbeGenerationForSlot(slot) ||
 		observation.fenceEpoch != slot.txFenceEpoch.Load() ||
 		(observation.lifecycle != pathProbeQueued && observation.lifecycle != pathProbeDataBlocked &&
-			observation.lifecycle != pathProbeDataStarved) {
+			observation.lifecycle != pathProbeDataStarved) ||
+		progressRelevant && baseline.migrationEpoch != e.migrationEpoch.Load() {
 		return false
+	}
+	if started.IsZero() {
+		started = nowFn()
 	}
 	if started.Before(observation.queuedAt) {
 		started = observation.queuedAt
@@ -431,6 +468,16 @@ func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started ti
 	observation.lifecycle = pathProbeWriteStarted
 	observation.writeStartedAt = started
 	observation.writeStallDeadline = started.Add(pathProbeWriteStallFor(started, observation.quality))
+	// markPathProbeWriteStarted runs while this probe owns the path's physical
+	// write permit, immediately before PathConn.Write. Capture the DATA
+	// predecessor and ACK baseline here; after the permit is released a DATA
+	// writer may legitimately advance the leaf before completion is recorded.
+	if progressRelevant {
+		observation.wireAckBaseline = baseline.ackNext
+		observation.wireDataWitnessNext = baseline.dataNext
+		observation.wireMigrationEpoch = baseline.migrationEpoch
+		observation.wireProgressTracked = true
+	}
 	e.probeOutstanding[id] = observation
 	return true
 }
@@ -442,8 +489,7 @@ func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr erro
 		e.probeMu.Unlock()
 		return
 	}
-	if writeErr != nil || observation.generation != pathProbeGenerationForSlot(slot) ||
-		observation.fenceEpoch != slot.txFenceEpoch.Load() {
+	if writeErr != nil || !e.pathProbeObservationCurrent(observation) {
 		delete(e.probeOutstanding, id)
 		e.probeMu.Unlock()
 		return
@@ -459,6 +505,10 @@ func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr erro
 	observation.lifecycle = pathProbeWriteCommitted
 	observation.writeCommittedAt = completed
 	observation.deadline = completed.Add(selectorProbeFreshFor(e.limits.ProbeInterval, observation.quality))
+	maximumDeadline := observation.writeStartedAt.Add(maximumCommittedProbeLifetime)
+	if observation.deadline.After(maximumDeadline) {
+		observation.deadline = maximumDeadline
+	}
 	e.recordPathProbeIssuedLocked(observation)
 	switch {
 	case !observation.pendingReplyAt.IsZero() && !observation.pendingReplyAt.After(observation.deadline):
@@ -467,6 +517,9 @@ func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr erro
 	case !observation.pendingReplyAt.IsZero():
 		delete(e.probeOutstanding, id)
 		e.recordPathProbeTimeoutLocked(observation, observation.pendingReplyAt)
+	case !completed.Before(observation.deadline):
+		delete(e.probeOutstanding, id)
+		e.recordPathProbeTimeoutLocked(observation, completed)
 	default:
 		e.probeOutstanding[id] = observation
 	}
@@ -622,10 +675,26 @@ func (e *Engine) recordPathProbeIssuedLocked(observation pathProbeObservation) {
 		observation.writeCommittedAt.IsZero() || observation.generation != pathProbeGenerationForSlot(observation.slot) {
 		return
 	}
-	evidence := pathProbeEvidence{generation: observation.generation}
-	if current := observation.slot.probeEvidence.Load(); current != nil && current.generation == observation.generation {
-		evidence = *current
+	evidence := pathProbeEvidence{
+		generation: observation.generation, fenceEpoch: observation.fenceEpoch, fenceTracked: true,
+		migrationEpoch: observation.wireMigrationEpoch, migrationTracked: observation.wireProgressTracked,
 	}
+	if current := observation.slot.probeEvidence.Load(); current != nil && current.generation == observation.generation {
+		if observation.slot.probeEvidenceCurrent(current) {
+			evidence = *current
+		} else {
+			// Counters are lifetime diagnostics for the physical generation. Token
+			// rollover invalidates liveness timestamps, not those aggregate totals.
+			evidence.issued = current.issued
+			evidence.succeeded = current.succeeded
+			evidence.timedOut = current.timedOut
+		}
+	}
+	evidence.generation = observation.generation
+	evidence.fenceEpoch = observation.fenceEpoch
+	evidence.fenceTracked = true
+	evidence.migrationEpoch = observation.wireMigrationEpoch
+	evidence.migrationTracked = observation.wireProgressTracked
 	if evidence.firstIssued.IsZero() {
 		evidence.firstIssued = observation.writeCommittedAt
 	}
@@ -720,6 +789,101 @@ func (e *Engine) refreshPathProbeBlockStatesLocked(now time.Time) {
 	}
 }
 
+type flatSelectorProgressBaseline struct {
+	ackNext        uint64
+	dataNext       uint64
+	migrationEpoch uint64
+}
+
+func (e *Engine) flatSelectorProgressBaseline(slot *pathSlot) (flatSelectorProgressBaseline, bool) {
+	if e == nil || slot == nil {
+		return flatSelectorProgressBaseline{}, false
+	}
+	runtime := e.localExecutionRuntime()
+	if runtime == nil || !runtime.flatLeafSelector {
+		return flatSelectorProgressBaseline{}, false
+	}
+	for attempts := 0; attempts < 3; attempts++ {
+		fenceEpoch := slot.txFenceEpoch.Load()
+		token := e.pathDataWriteToken(slot, fenceEpoch)
+		if !token.valid() {
+			return flatSelectorProgressBaseline{}, false
+		}
+		baseline := flatSelectorProgressBaseline{
+			ackNext:        e.sendAckNext.Load(),
+			migrationEpoch: token.migrationEpoch,
+		}
+		dataNext, witnessed := slot.earliestDataWriteAfter(baseline.ackNext, token)
+		if witnessed {
+			baseline.dataNext = dataNext
+		}
+		if token == e.pathDataWriteToken(slot, fenceEpoch) {
+			return baseline, witnessed
+		}
+	}
+	return flatSelectorProgressBaseline{}, false
+}
+
+func (e *Engine) pathProbeObservationCurrent(observation pathProbeObservation) bool {
+	if e == nil || observation.slot == nil ||
+		observation.generation != pathProbeGenerationForSlot(observation.slot) ||
+		observation.fenceEpoch != observation.slot.txFenceEpoch.Load() {
+		return false
+	}
+	return !observation.wireProgressTracked || e.migrationEpoch.Load() == observation.wireMigrationEpoch
+}
+
+func (e *Engine) flatSelectorCausalACK(
+	observation pathProbeObservation,
+	now time.Time,
+) (sendACKProgressObservation, bool) {
+	if !observation.wireProgressTracked || observation.wireDataWitnessNext == 0 ||
+		!e.pathProbeObservationCurrent(observation) {
+		return sendACKProgressObservation{}, false
+	}
+	runtime := e.localExecutionRuntime()
+	if runtime == nil || !runtime.flatLeafSelector {
+		return sendACKProgressObservation{}, false
+	}
+	progress := e.sendACKProgress.Load()
+	if progress == nil || progress.next <= observation.wireAckBaseline ||
+		progress.next < observation.wireDataWitnessNext ||
+		!progress.at.After(observation.writeCommittedAt) || progress.at.After(now) ||
+		!e.pathProbeObservationCurrent(observation) {
+		return sendACKProgressObservation{}, false
+	}
+	return *progress, true
+}
+
+const maximumCommittedProbeLifetime = 5 * time.Second
+
+func (e *Engine) refreshCommittedProbeDeadlineForProgress(
+	observation *pathProbeObservation,
+	now time.Time,
+) bool {
+	if observation == nil || observation.lifecycle != pathProbeWriteCommitted ||
+		observation.deadline.IsZero() || now.Before(observation.deadline) ||
+		observation.wireProgressDeferred || !e.pathProbeObservationCurrent(*observation) {
+		return false
+	}
+	progress, causal := e.flatSelectorCausalACK(*observation, now)
+	if !causal {
+		return false
+	}
+	deadline := progress.at.Add(selectorProbeFreshFor(e.limits.ProbeInterval, observation.quality))
+	maximum := observation.writeStartedAt.Add(maximumCommittedProbeLifetime)
+	if deadline.After(maximum) {
+		deadline = maximum
+	}
+	if !deadline.After(now) || !deadline.After(observation.deadline) {
+		return false
+	}
+	observation.wireAckBaseline = progress.next
+	observation.wireProgressDeferred = true
+	observation.deadline = deadline
+	return true
+}
+
 func (e *Engine) pathProbeStatuses(now time.Time) map[*pathSlot]pathProbeStatus {
 	statuses := make(map[*pathSlot]pathProbeStatus)
 	if e == nil {
@@ -780,12 +944,21 @@ func (e *Engine) expirePathProbes(now time.Time) {
 }
 
 func (e *Engine) expirePathProbesLocked(now time.Time) {
+	for id, observation := range e.probeOutstanding {
+		if !e.pathProbeObservationCurrent(observation) {
+			delete(e.probeOutstanding, id)
+		}
+	}
 	e.refreshPathProbeBlockStatesLocked(now)
 	for id, observation := range e.probeOutstanding {
 		if observation.lifecycle != pathProbeWriteCommitted || observation.deadline.IsZero() {
 			continue
 		}
 		if now.Before(observation.deadline) {
+			continue
+		}
+		if e.refreshCommittedProbeDeadlineForProgress(&observation, now) {
+			e.probeOutstanding[id] = observation
 			continue
 		}
 		observation.lifecycle = pathProbeWireTimeout
@@ -795,11 +968,11 @@ func (e *Engine) expirePathProbesLocked(now time.Time) {
 }
 
 func (e *Engine) recordPathProbeTimeoutLocked(observation pathProbeObservation, at time.Time) {
-	if observation.slot == nil || observation.generation != pathProbeGenerationForSlot(observation.slot) {
+	if !e.pathProbeObservationCurrent(observation) {
 		return
 	}
 	current := observation.slot.probeEvidence.Load()
-	if current == nil || current.generation != observation.generation {
+	if !observation.slot.probeEvidenceCurrent(current) || !pathProbeEvidenceMatchesObservation(current, observation) {
 		return
 	}
 	next := *current
@@ -818,11 +991,7 @@ func (e *Engine) acceptPathProbeReply(slot *pathSlot, probe proto.ProbePayload, 
 	if !ok || observation.slot != slot {
 		return false
 	}
-	if observation.wireTS != probe.TS || observation.fenceEpoch != slot.txFenceEpoch.Load() {
-		return false
-	}
-	if observation.generation != pathProbeGenerationForSlot(slot) {
-		delete(e.probeOutstanding, probe.ID)
+	if observation.wireTS != probe.TS || !e.pathProbeObservationCurrent(observation) {
 		return false
 	}
 	switch observation.lifecycle {
@@ -848,11 +1017,11 @@ func (e *Engine) acceptPathProbeReply(slot *pathSlot, probe proto.ProbePayload, 
 
 func (e *Engine) recordPathProbeSuccessLocked(observation pathProbeObservation, now time.Time) bool {
 	slot := observation.slot
-	if slot == nil || observation.generation != pathProbeGenerationForSlot(slot) {
+	if slot == nil || !e.pathProbeObservationCurrent(observation) {
 		return false
 	}
 	current := slot.probeEvidence.Load()
-	if current == nil || current.generation != observation.generation {
+	if !slot.probeEvidenceCurrent(current) || !pathProbeEvidenceMatchesObservation(current, observation) {
 		return false
 	}
 	successAt := now

@@ -249,7 +249,7 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 			e.setState(BridgeMigrating)
 		} else {
 			migratedOk = true
-			e.migrationCount++
+			e.recordMigrationLocked()
 			if !explicitRemoval && (cause == transport.CauseTransportError || cause == transport.CauseUnknown) {
 				departure.zombieTrip = e.accountMigration()
 			}

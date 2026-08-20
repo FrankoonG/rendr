@@ -629,7 +629,7 @@ func (e *Engine) recordCommittedLeafMobility(event leafMobilityRefreshEvent) (er
 	}
 	e.syncPathMobilityFactsLocked(slot, event.claim)
 	committer, _ := slot.conn.(leafmobility.RefreshCommitter)
-	e.migrationCount++
+	e.recordMigrationLocked()
 	ticket := e.accountMigration()
 	e.pathsMu.Unlock()
 	var commitErr error

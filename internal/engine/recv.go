@@ -596,8 +596,9 @@ func (e *Engine) handlePathProbeRequest(slot *pathSlot, payload []byte) {
 // probe and, if found, updates the path's quality with the measured
 // RTT.
 func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
+	receivedAt := nowFn()
 	if ack, ok := proto.DecodeAck(payload); ok {
-		if e.notePeerAck(ack) && ack.Gap {
+		if e.notePeerAckAt(ack, receivedAt) && ack.Gap {
 			e.requestGapReplay(ack.NextSeq)
 		}
 		return
@@ -606,10 +607,14 @@ func (e *Engine) handlePathProbeReply(slot *pathSlot, payload []byte) {
 	if err != nil {
 		return
 	}
-	_ = e.acceptPathProbeReply(slot, p, nowFn())
+	_ = e.acceptPathProbeReply(slot, p, receivedAt)
 }
 
 func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
+	return e.notePeerAckAt(ack, nowFn())
+}
+
+func (e *Engine) notePeerAckAt(ack proto.AckPayload, receivedAt time.Time) bool {
 	binding := e.localGraphBinding()
 	if ack.SessionEpoch != proto.SessionEpoch(e.FlowID()) ||
 		ack.Direction != senderDirection(e.side) ||
@@ -618,7 +623,7 @@ func (e *Engine) notePeerAck(ack proto.AckPayload) bool {
 		ack.NextSeq > e.sendPublishedNext.Load() {
 		return false
 	}
-	valid, application := e.acknowledgeSendFrames(ack.NextSeq, ack.Proof)
+	valid, application := e.acknowledgeSendFramesAt(ack.NextSeq, ack.Proof, receivedAt)
 	if valid {
 		e.noteTailReplayAck(ack.NextSeq)
 	}
