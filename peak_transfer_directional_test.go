@@ -295,7 +295,7 @@ func TestPeakTransferPeerInitializationCannotOverrideNewRXPhase(t *testing.T) {
 	fixture.controller.mu.Lock()
 	fixture.controller.peerInitializationErr = errors.New("injected stale initialization retry")
 	fixture.controller.mu.Unlock()
-	selected, err := fixture.controller.beginPeakObservation(true, nil, "new-rx-demand")
+	selected, _, err := fixture.controller.beginPeakObservation(true, nil, "new-rx-demand")
 	if err != nil {
 		t.Fatalf("new RX peak phase: %v", err)
 	}
@@ -575,14 +575,14 @@ func TestPeerClassSelectionReturnsSenderResolvedTarget(t *testing.T) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	resolved, err := fixture.client.RequestPeerSelectionClass(ctx, fixture.peerSelector, true, "class-e2e")
+	resolved, _, err := fixture.client.RequestPeerSelectionClass(ctx, fixture.peerSelector, true, "class-e2e")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resolved != fixture.peerPeak || fixture.server.ActivePath() != fixture.serverPeakPath {
 		t.Fatalf("resolved/active=%x/%d want peer peak %x/%d", resolved, fixture.server.ActivePath(), fixture.peerPeak, fixture.serverPeakPath)
 	}
-	resolved, err = fixture.client.RequestPeerSelectionClass(ctx, fixture.peerSelector, false, "class-e2e-return")
+	resolved, _, err = fixture.client.RequestPeerSelectionClass(ctx, fixture.peerSelector, false, "class-e2e-return")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -805,6 +805,55 @@ func TestPeakTransferPolicyFailureDoesNotDivergeControllerState(t *testing.T) {
 	})
 }
 
+func TestPeakTransferRetryableReturnUsesObservationBackoff(t *testing.T) {
+	fixture := newPeakDirectionalFixture(t,
+		Selector("client-root", []Target{
+			Path("client-normal", PathSpec{}), Path("client-peak", PathSpec{}),
+		}, PeakTransfer{Targets: []string{"client-peak"}}),
+		Selector("server-root", []Target{
+			Path("server-normal", PathSpec{}), Path("server-peak", PathSpec{}),
+		}, PeakTransfer{Targets: []string{"server-peak"}}),
+	)
+	controller := fixture.controller
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		return engine.ErrSelectorDecisionUnavailable
+	}
+	t.Cleanup(func() { controller.policyApplyForTest = nil })
+
+	for _, test := range []struct {
+		name   string
+		bytes  uint64
+		demand uint64
+		bps    float64
+	}{
+		{name: "failed capacity verification", bytes: defaultPeakMinSampleBytes, demand: defaultPeakMinSampleBytes, bps: 1},
+		{name: "idle demand return"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now()
+			controller.tx = peakTransferDirection{
+				onPeak:           true,
+				activePeakTarget: fixture.localPeak,
+				normalPeakBps:    100,
+				peakStarted:      now.Add(-time.Second),
+				returnSince:      now.Add(-time.Second),
+			}
+			controller.evaluatePassive(
+				now, test.bytes, test.demand, test.bps,
+				defaultPeakWindow, fixture.localPeak, false,
+			)
+			after := time.Now()
+			retryAfter := controller.tx.policyRetryAfter
+			if !retryAfter.After(after) || retryAfter.After(after.Add(2*defaultPeakWindow)) {
+				t.Fatalf("retry deadline=%v after=%v, want short observation backoff", retryAfter, after)
+			}
+			if controller.tx.lastPolicyError != engine.ErrSelectorDecisionUnavailable.Error() {
+				t.Fatalf("last policy error=%q want selector decision unavailable", controller.tx.lastPolicyError)
+			}
+		})
+	}
+}
+
 func TestPeakTransferSlowCandidateSuppressesOnlyThatCandidate(t *testing.T) {
 	fixture := newPeakDirectionalFixture(t,
 		Selector("client-root", []Target{
@@ -845,5 +894,222 @@ func TestPeakTransferSlowCandidateSuppressesOnlyThatCandidate(t *testing.T) {
 	selected, ok := fixture.controller.selectHealthyPeakTarget(false)
 	if !ok || selected != peaks[1] {
 		t.Fatalf("next candidate=%x,%t want healthy sibling %x", selected, ok, peaks[1])
+	}
+}
+
+func TestPeerPeakCommitGenerationRejectsOlderDeliveryCohort(t *testing.T) {
+	selectorID := proto.DeriveTargetID(proto.GraphNodeKindSelector, "peer-generation-root")
+	normalID := proto.DeriveTargetID(proto.GraphNodeKindPath, "peer-generation-normal")
+	peakID := proto.DeriveTargetID(proto.GraphNodeKindPath, "peer-generation-peak")
+	controller := &peakTransferController{
+		peerTargets: peakTransferTargets{
+			selectorID: selectorID, normalTargetID: normalID,
+			normalTargetIDs: []proto.TargetID{normalID},
+			peakTargetIDs:   []proto.TargetID{peakID},
+		},
+		rx: peakTransferDirection{
+			onPeak: true, activePeakTarget: peakID,
+			actualTarget: normalID, actualSelectorGeneration: 2,
+		},
+	}
+
+	controller.mu.Lock()
+	notePeerPolicyCommitLocked(&controller.rx, peakID, 3)
+	controller.mu.Unlock()
+	controller.reconcileActualTarget(true, selectorID, normalID, 2)
+	controller.reconcileActualTarget(true, selectorID, normalID, 3)
+	controller.evaluatePassive(
+		time.Now(), defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		1, defaultPeakWindow, normalID, true,
+	)
+
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if !controller.rx.onPeak || controller.rx.activePeakTarget != peakID ||
+		controller.rx.actualTarget != peakID || controller.rx.actualSelectorGeneration != 3 {
+		t.Fatalf("older normal cohort overrode committed peer peak generation: %+v", controller.rx)
+	}
+}
+
+func TestPeakPolicyObserverRejectsStaleAndUnversionedCallbacks(t *testing.T) {
+	selectorID := proto.DeriveTargetID(proto.GraphNodeKindSelector, "observer-generation-root")
+	normalID := proto.DeriveTargetID(proto.GraphNodeKindPath, "observer-generation-normal")
+	peakID := proto.DeriveTargetID(proto.GraphNodeKindPath, "observer-generation-peak")
+	targets := peakTransferTargets{
+		selectorID: selectorID, normalTargetID: normalID,
+		normalTargetIDs: []proto.TargetID{normalID},
+		peakTargetIDs:   []proto.TargetID{peakID},
+	}
+	controller := &peakTransferController{
+		localTargets: targets,
+		tx: peakTransferDirection{
+			onPeak: true, activePeakTarget: peakID,
+			actualTarget: peakID, actualSelectorGeneration: 3,
+		},
+	}
+	controller.observeCommittedPeakPolicy(selectorID, normalID, 2, false, "peak-return")
+	controller.observeCommittedPeakPolicy(selectorID, normalID, 0, false, "peak-return")
+	if !controller.tx.onPeak || controller.tx.activePeakTarget != peakID ||
+		controller.tx.actualTarget != peakID || controller.tx.actualSelectorGeneration != 3 {
+		t.Fatalf("stale/unversioned observer overwrote generation 3: %+v", controller.tx)
+	}
+	controller.observeCommittedPeakPolicy(selectorID, normalID, 4, false, "peak-return")
+	if controller.tx.onPeak || controller.tx.actualTarget != normalID ||
+		controller.tx.actualSelectorGeneration != 4 {
+		t.Fatalf("newer observer did not publish normal generation 4: %+v", controller.tx)
+	}
+}
+
+func TestPeakObservationCannotOverwriteNewerCommittedCallback(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "phase-guard-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "phase-guard-normal")
+	peakB := proto.DeriveTargetID(proto.GraphNodeKindPath, "phase-guard-peak-b")
+	peakC := proto.DeriveTargetID(proto.GraphNodeKindPath, "phase-guard-peak-c")
+	controller := &peakTransferController{
+		localTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peakB, peakC},
+		},
+	}
+	controller.tx.actualTarget = normal
+	controller.tx.actualSelectorGeneration = 1
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		controller.observeCommittedPeakPolicy(selector, peakC, 3, true, "newer-factual-commit")
+		return nil
+	}
+
+	selected, intentPhase, err := controller.beginPeakObservation(false, nil, "older-peak-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected != peakB {
+		t.Fatalf("older policy selected=%x want=%x", selected, peakB)
+	}
+	controller.mu.Lock()
+	state := controller.tx
+	controller.mu.Unlock()
+	if state.phaseGeneration == intentPhase || !state.onPeak || state.activePeakTarget != peakC ||
+		state.actualTarget != peakC || state.actualSelectorGeneration != 3 {
+		t.Fatalf("older promotion overwrote newer callback: intent_phase=%d state=%+v", intentPhase, state)
+	}
+}
+
+func TestPeakOutcomeUnknownCannotOverwriteFactualCommit(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "unknown-guard-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "unknown-guard-normal")
+	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "unknown-guard-peak")
+	controller := &peakTransferController{
+		opts: PeakTransfer{SaturationFor: time.Millisecond, SaturationRatio: 0.5},
+		localTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peak},
+		},
+	}
+	now := time.Now()
+	controller.tx.actualTarget = normal
+	controller.tx.actualSelectorGeneration = 1
+	controller.tx.normalPeakBps = 8 << 20
+	controller.tx.normalBytes = defaultPeakMinBytes
+	controller.tx.saturatedSince = now.Add(-time.Second)
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		controller.observeCommittedPeakPolicy(selector, peak, 2, true, "committed-before-replay-error")
+		return engine.ErrPolicyOutcomeUnknown
+	}
+
+	controller.evaluatePassiveWithPending(
+		now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		8<<20, defaultPeakWindow, normal, false, false,
+	)
+	controller.mu.Lock()
+	state := controller.tx
+	controller.mu.Unlock()
+	if !state.onPeak || state.activePeakTarget != peak || state.actualTarget != peak ||
+		state.actualSelectorGeneration != 2 || state.policyOutcomeUncertain || state.lastPolicyError != "" {
+		t.Fatalf("post-commit error overwrote factual callback: %+v", state)
+	}
+}
+
+func TestPeakReturnCannotResetNewerCommittedCallback(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "return-guard-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "return-guard-normal")
+	peakB := proto.DeriveTargetID(proto.GraphNodeKindPath, "return-guard-peak-b")
+	peakC := proto.DeriveTargetID(proto.GraphNodeKindPath, "return-guard-peak-c")
+	controller := &peakTransferController{
+		localTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peakB, peakC},
+		},
+	}
+	now := time.Now()
+	controller.tx.onPeak = true
+	controller.tx.activePeakTarget = peakB
+	controller.tx.actualTarget = peakB
+	controller.tx.actualSelectorGeneration = 2
+	controller.tx.normalPeakBps = 8 << 20
+	controller.tx.returnSince = now.Add(-time.Second)
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		controller.observeCommittedPeakPolicy(selector, peakC, 3, true, "newer-factual-commit")
+		return nil
+	}
+
+	controller.evaluatePassiveWithPending(
+		now, 1, 0, 1, defaultPeakWindow, peakB, false, false,
+	)
+	controller.mu.Lock()
+	state := controller.tx
+	controller.mu.Unlock()
+	if !state.onPeak || state.activePeakTarget != peakC || state.actualTarget != peakC ||
+		state.actualSelectorGeneration != 3 {
+		t.Fatalf("older return reset newer callback: %+v", state)
+	}
+}
+
+func TestPeakRXZeroProgressCannotStartIdleReturn(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "rx-zero-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "rx-zero-normal")
+	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "rx-zero-peak")
+	controller := &peakTransferController{
+		peerTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peak},
+		},
+	}
+	controller.rx.onPeak = true
+	controller.rx.activePeakTarget = peak
+	controller.rx.actualTarget = peak
+	controller.rx.actualSelectorGeneration = 2
+	controller.rx.normalPeakBps = 8 << 20
+	var transitions int
+	controller.policyApplyForTest = func(rx bool, choice peakTransferChoice, targetID proto.TargetID, cause string) error {
+		if !rx || choice != peakTransferNormal || targetID != normal || cause != "peak-return" {
+			t.Fatalf("unexpected policy transition rx=%t choice=%d target=%x cause=%q", rx, choice, targetID, cause)
+		}
+		transitions++
+		return nil
+	}
+
+	now := time.Now()
+	controller.evaluatePassiveWithPending(now, 0, 0, 0, defaultPeakWindow, peak, false, true)
+	controller.evaluatePassiveWithPending(now.Add(2*time.Second), 0, 0, 0, defaultPeakWindow, peak, false, true)
+	controller.mu.Lock()
+	returnSince := controller.rx.returnSince
+	onPeak := controller.rx.onPeak
+	controller.mu.Unlock()
+	if transitions != 0 || !onPeak || !returnSince.IsZero() {
+		t.Fatalf("RX zero progress started idle return: transitions=%d on_peak=%t return_since=%s", transitions, onPeak, returnSince)
+	}
+
+	lowDemandAt := now.Add(3 * time.Second)
+	controller.evaluatePassiveWithPending(lowDemandAt, 1, 0, 1, defaultPeakWindow, peak, false, true)
+	controller.evaluatePassiveWithPending(lowDemandAt.Add(time.Second), 0, 0, 0, defaultPeakWindow, peak, false, true)
+	controller.mu.Lock()
+	onPeak = controller.rx.onPeak
+	controller.mu.Unlock()
+	if transitions != 1 || onPeak {
+		t.Fatalf("delivered low demand did not permit RX return: transitions=%d on_peak=%t", transitions, onPeak)
 	}
 }

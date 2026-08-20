@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"reflect"
@@ -32,11 +33,11 @@ func testPolicyCommitChallenge() PolicyCommitChallenge {
 }
 
 func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
-	if PolicyTransactionWireVersion != 3 {
-		t.Fatalf("policy transaction wire version=%d want=3", PolicyTransactionWireVersion)
+	if PolicyTransactionWireVersion != 4 {
+		t.Fatalf("policy transaction wire version=%d want=4", PolicyTransactionWireVersion)
 	}
-	if ProtocolMinor != 19 {
-		t.Fatalf("protocol minor=%d want=19", ProtocolMinor)
+	if ProtocolMinor != 20 {
+		t.Fatalf("protocol minor=%d want=20", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")
@@ -64,6 +65,9 @@ func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
 	}
 	if SupportedFeatures&FeaturePolicyCommitChallenge == 0 || RequiredFeatures&FeaturePolicyCommitChallenge == 0 {
 		t.Fatal("policy commit-challenge feature is not required by negotiation")
+	}
+	if SupportedFeatures&FeaturePolicySelectorGeneration == 0 || RequiredFeatures&FeaturePolicySelectorGeneration == 0 {
+		t.Fatal("policy selector-generation feature is not required by negotiation")
 	}
 }
 
@@ -188,6 +192,7 @@ func TestPolicyAckRoundTrip(t *testing.T) {
 		Code:                     PolicyAckCodeAccept,
 		Generation:               12,
 		CurrentGeneration:        11,
+		SelectorGeneration:       7,
 		CurrentTargetID:          TargetID{6},
 		ResolvedTargetID:         TargetID{5},
 		ProposalDigest:           testPolicyProposalDigest(),
@@ -215,6 +220,123 @@ func TestPolicyAckRoundTrip(t *testing.T) {
 	if err != nil || got != rejected {
 		t.Fatalf("reject=%+v err=%v want %+v", got, err, rejected)
 	}
+	rejected.SelectorGeneration = 0
+	wire, err = rejected.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = DecodePolicyAck(wire)
+	if err != nil || got != rejected {
+		t.Fatalf("zero-selector reject=%+v err=%v want %+v", got, err, rejected)
+	}
+}
+
+func TestPolicyAckV4LayoutAndReservedBytes(t *testing.T) {
+	want := PolicyAck{
+		PolicyTransactionBinding: testPolicyBinding(),
+		Phase:                    PolicyAckPhaseFinal,
+		Code:                     PolicyAckCodeAccept,
+		Generation:               0x0102030405060708,
+		CurrentGeneration:        0x1112131415161718,
+		SelectorGeneration:       0x2122232425262728,
+		CurrentTargetID:          TargetID{0x31},
+		ResolvedTargetID:         TargetID{0x41},
+		ProposalDigest:           PolicyProposalDigest{0x51},
+		ReservationID:            PolicyReservationID{0x61},
+		CommitChallenge:          PolicyCommitChallenge{0x71},
+	}
+	wire, err := want.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != PolicyAckHeaderSize || PolicyAckHeaderSize != 232 {
+		t.Fatalf("ACK size=%d header=%d want=232", len(wire), PolicyAckHeaderSize)
+	}
+	if wire[4] != 4 || wire[80] != byte(want.Phase) || wire[81] != byte(want.Code) {
+		t.Fatalf("ACK prefix version=%d phase=%d code=%d", wire[4], wire[80], wire[81])
+	}
+	if got := binary.BigEndian.Uint64(wire[88:96]); got != want.Generation {
+		t.Fatalf("generation=%x want=%x", got, want.Generation)
+	}
+	if got := binary.BigEndian.Uint64(wire[96:104]); got != want.CurrentGeneration {
+		t.Fatalf("current generation=%x want=%x", got, want.CurrentGeneration)
+	}
+	if got := binary.BigEndian.Uint64(wire[104:112]); got != want.SelectorGeneration {
+		t.Fatalf("selector generation=%x want=%x", got, want.SelectorGeneration)
+	}
+	if !bytes.Equal(wire[112:128], want.CurrentTargetID[:]) ||
+		!bytes.Equal(wire[128:144], want.ResolvedTargetID[:]) ||
+		!bytes.Equal(wire[144:176], want.ProposalDigest[:]) ||
+		!bytes.Equal(wire[176:192], want.ReservationID[:]) ||
+		!bytes.Equal(wire[192:224], want.CommitChallenge[:]) {
+		t.Fatal("ACK semantic field offsets do not match the v4 layout")
+	}
+	if got := binary.BigEndian.Uint16(wire[224:226]); got != 0 {
+		t.Fatalf("reason length=%d want=0", got)
+	}
+
+	for _, bounds := range [][2]int{{82, 88}, {226, 232}} {
+		for index := bounds[0]; index < bounds[1]; index++ {
+			t.Run(fmt.Sprintf("reserved-%d", index), func(t *testing.T) {
+				mutated := append([]byte(nil), wire...)
+				mutated[index] = 1
+				if _, err := DecodePolicyAck(mutated); err == nil || !strings.Contains(err.Error(), "reserved bytes") {
+					t.Fatalf("reserved-byte mutation decoded: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestPolicyAckSelectorGenerationIsMandatoryAndWireBound(t *testing.T) {
+	ack := PolicyAck{
+		PolicyTransactionBinding: testPolicyBinding(),
+		Phase:                    PolicyAckPhasePrepare,
+		Code:                     PolicyAckCodeAccept,
+		Generation:               12,
+		SelectorGeneration:       7,
+		CurrentTargetID:          TargetID{4},
+		ResolvedTargetID:         TargetID{5},
+		ProposalDigest:           testPolicyProposalDigest(),
+		ReservationID:            testPolicyReservationID(),
+	}
+	first, err := ack.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	zero := ack
+	zero.SelectorGeneration = 0
+	if _, err := zero.Encode(); err == nil {
+		t.Fatal("encoded accepted ACK with zero selector generation")
+	}
+	zeroWire := append([]byte(nil), first...)
+	clear(zeroWire[104:112])
+	if _, err := DecodePolicyAck(zeroWire); err == nil {
+		t.Fatal("decoded accepted ACK with zero selector generation")
+	}
+	zero = ack
+	zero.CurrentTargetID = TargetID{}
+	if _, err := zero.Encode(); err == nil {
+		t.Fatal("encoded accepted ACK with zero current target")
+	}
+
+	changed := ack
+	changed.SelectorGeneration++
+	second, err := changed.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first, second) || sha256.Sum256(first) == sha256.Sum256(second) {
+		t.Fatal("selector-generation mutation did not change the ACK wire digest")
+	}
+	decoded, err := DecodePolicyAck(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SelectorGeneration != changed.SelectorGeneration {
+		t.Fatalf("decoded selector generation=%d want=%d", decoded.SelectorGeneration, changed.SelectorGeneration)
+	}
 }
 
 func TestPolicyCommitRoundTrip(t *testing.T) {
@@ -238,6 +360,8 @@ func TestPolicyCommitChallengeIsPhaseBoundAndMandatory(t *testing.T) {
 		Phase:                    PolicyAckPhasePrepare,
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
+		SelectorGeneration:       1,
+		CurrentTargetID:          TargetID{1},
 		ResolvedTargetID:         TargetID{2},
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),
@@ -301,6 +425,7 @@ func TestPolicyTransactionWireStability(t *testing.T) {
 		Code:                     PolicyAckCodeAccept,
 		Generation:               12,
 		CurrentGeneration:        12,
+		SelectorGeneration:       9,
 		CurrentTargetID:          prepare.TargetID,
 		ResolvedTargetID:         prepare.TargetID,
 		ProposalDigest:           digest,
@@ -319,9 +444,9 @@ func TestPolicyTransactionWireStability(t *testing.T) {
 		wire []byte
 		want string
 	}{
-		{name: "prepare", wire: prepareWire, want: "b604b299d63ee0ad2857900360291b51c2cbd3d6b1fea590fec9aaf80285de3d"},
-		{name: "ack", wire: ackWire, want: "5c8cd925a28436ee2194fe37854e747008e184c48f2c30e2eb1712d7de76a7a0"},
-		{name: "commit", wire: commitWire, want: "51d991f53c4f1de7847718f8c2ed900c54b04c6d469f3894e253ed9d776448cd"},
+		{name: "prepare", wire: prepareWire, want: "225fc40b463990fec7343b8fa9996c205cec8c0a4daddb5d2886495f55bdbba2"},
+		{name: "ack", wire: ackWire, want: "19f7c783b0394081d91855f3136d2dffca40f611cfd56fd6d981fcf26774279f"},
+		{name: "commit", wire: commitWire, want: "3808e9c0eb535d0ee7bf8700610a47323c4457a5c539297a929265265ffe3f6f"},
 	}
 	for _, test := range tests {
 		if got := sha256.Sum256(test.wire); test.want != fmt.Sprintf("%x", got) {
@@ -343,6 +468,8 @@ func TestPolicyPayloadsRejectMalformedAndTrailing(t *testing.T) {
 		Phase:                    PolicyAckPhaseFinal,
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
+		SelectorGeneration:       1,
+		CurrentTargetID:          TargetID{1},
 		ResolvedTargetID:         TargetID{2},
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),
@@ -391,9 +518,9 @@ func TestPolicyPayloadsRejectMalformedAndTrailing(t *testing.T) {
 		})
 	}
 	legacy := append([]byte(nil), prepare...)
-	legacy[4] = 2
+	legacy[4] = 3
 	if _, err := DecodePolicyPrepare(legacy); err == nil {
-		t.Fatal("v3 decoder accepted a policy transaction v2 envelope")
+		t.Fatal("v4 decoder accepted a policy transaction v3 envelope")
 	}
 }
 
@@ -410,6 +537,8 @@ func TestPolicyPayloadsRejectLegacyWireVersion(t *testing.T) {
 		Phase:                    PolicyAckPhaseFinal,
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
+		SelectorGeneration:       1,
+		CurrentTargetID:          TargetID{1},
 		ResolvedTargetID:         TargetID{2},
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),
@@ -434,9 +563,9 @@ func TestPolicyPayloadsRejectLegacyWireVersion(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			legacy := append([]byte(nil), test.wire...)
-			legacy[4] = 2
+			legacy[4] = 3
 			if err := test.decode(legacy); err == nil {
-				t.Fatal("accepted policy transaction wire v2")
+				t.Fatal("accepted policy transaction wire v3")
 			}
 		})
 	}
@@ -471,7 +600,7 @@ func TestPolicyPayloadBoundsAndSemanticValidation(t *testing.T) {
 		}
 	}
 
-	acceptedWithReason := PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, ResolvedTargetID: TargetID{2}, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID(), Reason: "no"}
+	acceptedWithReason := PolicyAck{PolicyTransactionBinding: testPolicyBinding(), Phase: PolicyAckPhasePrepare, Code: PolicyAckCodeAccept, Generation: 1, SelectorGeneration: 1, CurrentTargetID: TargetID{1}, ResolvedTargetID: TargetID{2}, ProposalDigest: testPolicyProposalDigest(), ReservationID: testPolicyReservationID(), Reason: "no"}
 	if _, err := acceptedWithReason.Encode(); err == nil {
 		t.Fatal("accepted success ACK with reason")
 	}

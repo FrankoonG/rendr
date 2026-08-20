@@ -44,7 +44,7 @@ type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 19
+	ProtocolMinor uint16 = 20
 )
 
 type FeatureSet uint64
@@ -118,8 +118,11 @@ const (
 	// unpredictable requester nonce first disclosed in COMMIT. A FINAL received
 	// before that COMMIT can therefore never authorize a policy transition.
 	FeaturePolicyCommitChallenge FeatureSet = 1 << 22
+	// FeaturePolicySelectorGeneration makes every accepted policy ACK carry the
+	// committed selector execution generation that DATA attribution uses.
+	FeaturePolicySelectorGeneration FeatureSet = 1 << 23
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose | FeaturePolicyClassSelection | FeatureDataRootSelectorAttribution | FeaturePolicyEarlyCustody | FeaturePolicyCommitChallenge
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose | FeaturePolicyClassSelection | FeatureDataRootSelectorAttribution | FeaturePolicyEarlyCustody | FeaturePolicyCommitChallenge | FeaturePolicySelectorGeneration
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 

@@ -37,6 +37,12 @@
 // Protocol minor 19 binds every FINAL policy acknowledgement to a fresh,
 // requester-generated challenge first disclosed by the matching COMMIT.
 //
+// Protocol minor 20 makes policy ACK wire version 4 mandatory. Every accepted
+// PREPARE and FINAL carries the non-zero selector execution generation used by
+// DATA root attribution. Requesters validate an unchanged target at the same
+// generation and a changed target at exactly the next generation; older peers
+// fail feature negotiation instead of being decoded under the new layout.
+//
 // Wire framing on a TCP byte-stream path prepends a 2-byte big-endian
 // length to each frame. QUIC paths use one frame per STREAM/DATAGRAM
 // and need no length prefix. The length prefix is the transport

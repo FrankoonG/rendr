@@ -10,6 +10,20 @@ import (
 
 func TestPolicyEarlyCustodyDoesNotAdvanceAckAcrossDataGap(t *testing.T) {
 	fixture := newPolicyTxUnitFixture(t)
+	readDone := make(chan struct {
+		n   int
+		err error
+		buf []byte
+	}, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, err := fixture.engine.Recv(buf)
+		readDone <- struct {
+			n   int
+			err error
+			buf []byte
+		}{n: n, err: err, buf: append([]byte(nil), buf[:n]...)}
+	}()
 	prepare := policyTxUnitPrepare(
 		fixture.engine, 0x81, 0, fixture.selectorID, fixture.targetB,
 	)
@@ -40,6 +54,11 @@ func TestPolicyEarlyCustodyDoesNotAdvanceAckAcrossDataGap(t *testing.T) {
 	if expected != 0 || proof != initialProof {
 		t.Fatalf("policy custody advanced cumulative proof: next=%d proof=%x initial=%x", expected, proof, initialProof)
 	}
+	select {
+	case result := <-readDone:
+		t.Fatalf("policy custody advanced application delivery across DATA gap: n=%d err=%v", result.n, result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
 
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -62,12 +81,23 @@ func TestPolicyEarlyCustodyDoesNotAdvanceAckAcrossDataGap(t *testing.T) {
 	expected = fixture.engine.expectedRecvSeq
 	_, queued = fixture.engine.recvQueue[prepareHeader.Seq]
 	proof = fixture.engine.recvProof
+	if woke {
+		fixture.engine.recvCond.Broadcast()
+	}
 	fixture.engine.recvMu.Unlock()
 	if !woke {
 		t.Fatal("closing the DATA gap did not wake the application reader")
 	}
 	if expected != 2 || queued || proof == initialProof {
 		t.Fatalf("ordered drain next=%d prepareQueued=%t proof=%x", expected, queued, proof)
+	}
+	select {
+	case result := <-readDone:
+		if result.err != nil || result.n != len("ordered-data") || string(result.buf) != "ordered-data" {
+			t.Fatalf("ordered application delivery=(%d,%v,%q)", result.n, result.err, result.buf)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("application delivery did not resume after closing DATA gap")
 	}
 	time.Sleep(10 * time.Millisecond)
 	observations, decodeErr := fixture.recorder.snapshot()

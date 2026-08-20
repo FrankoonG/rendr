@@ -30,8 +30,8 @@ func TestListenerPeakAdmissionSuppressesOnlyCapacityRejectedTarget(t *testing.T)
 		peakTargetIDs:   []proto.TargetID{firstPeak, secondPeak},
 	}}
 
-	admission.observe(selectorID, firstPeak, true, "peak-transfer-rx")
-	admission.observe(selectorID, normalID, false, "peak-verify-failed-rx")
+	admission.observe(selectorID, firstPeak, 1, true, "peak-transfer-rx")
+	admission.observe(selectorID, normalID, 2, false, "peak-verify-failed-rx")
 	if err := admission.admit(selectorID, firstPeak, "peak-transfer-rx"); err == nil {
 		t.Fatal("capacity-rejected listener target remained admissible")
 	}
@@ -39,8 +39,8 @@ func TestListenerPeakAdmissionSuppressesOnlyCapacityRejectedTarget(t *testing.T)
 		t.Fatalf("healthy sibling inherited failed candidate suppression: %v", err)
 	}
 
-	admission.observe(selectorID, secondPeak, true, "peak-transfer-rx")
-	admission.observe(selectorID, normalID, false, "peak-return-rx")
+	admission.observe(selectorID, secondPeak, 3, true, "peak-transfer-rx")
+	admission.observe(selectorID, normalID, 4, false, "peak-return-rx")
 	if err := admission.admit(selectorID, secondPeak, "peak-transfer-rx"); err != nil {
 		t.Fatalf("ordinary return incorrectly suppressed candidate: %v", err)
 	}
@@ -576,7 +576,7 @@ func TestRuntimeListenerPeakAdmissionRejectsUnhealthyFirstCandidate(t *testing.T
 	if err := client.e.RequestPeerSelection(requestCtx, selectorID, firstID, "listener-unhealthy-exact"); err == nil {
 		t.Fatal("listener admitted an unhealthy exact peak candidate")
 	}
-	resolved, err := client.e.RequestPeerSelectionClass(requestCtx, selectorID, true, "listener-healthy-class")
+	resolved, _, err := client.e.RequestPeerSelectionClass(requestCtx, selectorID, true, "listener-healthy-class")
 	if err != nil {
 		t.Fatal(err)
 	}

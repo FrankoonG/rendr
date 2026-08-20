@@ -8,8 +8,8 @@ import (
 )
 
 func currentAck(e *Engine, nextSeq uint64) proto.AckPayload {
-	proof := e.sendAckProof
 	e.sendHistMu.Lock()
+	proof := e.sendAckProof
 	for _, entry := range e.sendHist.entries {
 		if entry.seq+1 == nextSeq {
 			proof = entry.proof

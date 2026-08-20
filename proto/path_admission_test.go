@@ -65,8 +65,8 @@ func TestPathAdmissionProtocolAndControlCodeStability(t *testing.T) {
 	if Version != 3 {
 		t.Fatalf("frame envelope version=%d want=3", Version)
 	}
-	if ProtocolMinor != 19 {
-		t.Fatalf("protocol minor=%d want=19", ProtocolMinor)
+	if ProtocolMinor != 20 {
+		t.Fatalf("protocol minor=%d want=20", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePathAdmissionTransaction == 0 || RequiredFeatures&FeaturePathAdmissionTransaction == 0 {
 		t.Fatal("path admission transaction feature is not mandatory")

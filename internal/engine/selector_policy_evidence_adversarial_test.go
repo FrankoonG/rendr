@@ -182,6 +182,31 @@ func TestPeakDecisionRejectsCapturedEvidenceThatExpiresBeforeCommit(t *testing.T
 	}
 }
 
+func TestNormalPeakReturnWithoutFreshEvidenceIsRetryable(t *testing.T) {
+	normal := policyTxUnitNode(proto.GraphNodeKindPath, "retryable-normal")
+	peak := policyTxUnitNode(proto.GraphNodeKindPath, "retryable-peak")
+	selector := policyTxUnitNode(
+		proto.GraphNodeKindSelector, "retryable-selector", normal.ID, peak.ID,
+	)
+	selector.PeakCandidates = []proto.TargetID{peak.ID}
+	manifest := proto.GraphManifest{
+		RootID: selector.ID,
+		Nodes:  []proto.GraphNode{selector, normal, peak},
+	}
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	selected, err := e.SelectBestLocalPeakTransferNormalTarget(
+		selector.ID, "retryable-normal-evidence",
+	)
+	if selected != (proto.TargetID{}) || !errors.Is(err, ErrSelectorDecisionUnavailable) {
+		t.Fatalf("normal return=(%x,%v), want zero/%v", selected, err, ErrSelectorDecisionUnavailable)
+	}
+}
+
 func TestPolicyCommitRechecksEvidenceFreshnessAtPublication(t *testing.T) {
 	var clock atomic.Int64
 	start := time.Now()

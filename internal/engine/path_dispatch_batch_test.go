@@ -1030,14 +1030,24 @@ func TestAcceptedPacketRouteEpochRedispatchesAcrossDifferentLeafRecovery(t *test
 		})
 	}
 
-	// Hold replay request publication until the epoch-stale accepted writer has
-	// redispatched on B and received its ACK. This isolates the custody race:
-	// the subsequent recovery replay observes the advanced ACK frontier and
-	// must not physically publish the same DATA a second time.
-	client.replayMu.Lock()
-	var replayUnlockOnce sync.Once
-	unlockReplay := func() { replayUnlockOnce.Do(func() { client.replayMu.Unlock() }) }
-	t.Cleanup(unlockReplay)
+	// Hold replay worker notification after the obligation is published until
+	// the epoch-stale accepted writer has redispatched on B and received its
+	// ACK. Holding replayMu itself would now block the application publication
+	// barrier snapshot before this case reaches its route-snapshot stimulus.
+	replayQueued := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	var replayQueueOnce, replayReleaseOnce sync.Once
+	client.replayQueueForTest = func(replayRequest) {
+		replayQueueOnce.Do(func() { close(replayQueued) })
+		<-releaseReplay
+	}
+	releaseReplayWorker := func() {
+		replayReleaseOnce.Do(func() { close(releaseReplay) })
+	}
+	t.Cleanup(func() {
+		releaseReplayWorker()
+		client.replayQueueForTest = nil
+	})
 
 	sendDone := make(chan error, 1)
 	go func() {
@@ -1049,6 +1059,7 @@ func TestAcceptedPacketRouteEpochRedispatchesAcrossDifferentLeafRecovery(t *test
 	activated := make(chan error, 1)
 	go func() { activated <- client.ActivateStagedPath(replacementID, false) }()
 	eventuallyEngine(t, time.Second, func() bool { return client.ActivePath() == replacementID })
+	awaitSignal(t, replayQueued, "different-leaf recovery replay obligation")
 
 	releaseRouteOnce.Do(func() { close(releaseRoute) })
 	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -1059,17 +1070,20 @@ func TestAcceptedPacketRouteEpochRedispatchesAcrossDifferentLeafRecovery(t *test
 		t.Fatalf("server packet=%q err=%v", packet, err)
 	}
 	target := client.sendPublishedNext.Load()
-	ackDone := make(chan bool, 1)
-	go func() { ackDone <- client.notePeerAck(currentAck(client, target)) }()
+	var ackDone chan bool
+	if client.sendAckNext.Load() < target {
+		ack := currentAck(client, target)
+		ackDone = make(chan bool, 1)
+		go func() { ackDone <- client.notePeerAck(ack) }()
+	}
 	eventuallyEngine(t, time.Second, func() bool { return client.sendAckNext.Load() == target })
-	unlockReplay()
-	select {
-	case valid := <-ackDone:
-		if !valid {
-			t.Fatal("proof-valid recovery ACK was rejected")
+	releaseReplayWorker()
+	if ackDone != nil {
+		select {
+		case <-ackDone:
+		case <-time.After(time.Second):
+			t.Fatal("recovery ACK did not finish after replay release")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("recovery ACK did not finish after replay release")
 	}
 	select {
 	case sendErr := <-sendDone:

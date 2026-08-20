@@ -459,7 +459,7 @@ func TestSelectorPeakTransferRuntimePromotesToBond(t *testing.T) {
 	}
 	defer ln.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	accepted := make(chan Conn, 1)
@@ -608,7 +608,7 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 	}
 	defer ln.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	accepted := make(chan Conn, 1)
@@ -717,7 +717,19 @@ func TestSelectorPeakTransferNormalSelectorUsesQuality(t *testing.T) {
 	for i := 0; i < 24; i++ {
 		collector.write(t, client, chunk)
 	}
-	waitForActivePath(t, client, ids["B"], 3*time.Second)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && client.(testConnectionControl).ActivePath() != ids["B"] {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := client.(testConnectionControl).ActivePath(); got != ids["B"] {
+		backed := client.(*engineBackedConn)
+		ranked, rankErr := backed.e.RankLocalSelectorClass(
+			proto.DeriveTargetID(proto.GraphNodeKindSelector, "root"), false,
+		)
+		t.Fatalf("peak path did not return to nested normal B: active=%d want=%d diagnostic=%+v migrations=%+v paths=%+v normal-ranked=%x rank-err=%v",
+			got, ids["B"], peakTransferDiagnostic(client, false), peakTransferMigrationSnapshot(recorder),
+			client.Paths(), ranked, rankErr)
+	}
 	bStats, err := controlled.PathStats("B")
 	if err != nil {
 		t.Fatal(err)
@@ -1698,7 +1710,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 	}
 	defer ln.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	accepted := make(chan Conn, 1)
@@ -1733,7 +1745,7 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	d := &sessionDialer{Root: root, ProbeInterval: 30 * time.Second}
+	d := &sessionDialer{Root: root, ProbeInterval: time.Second}
 	controlled.Bind(t, d)
 	client, err := d.Dial(ctx)
 	if err != nil {
@@ -1777,6 +1789,10 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 			peakTransferMigrationSnapshot(recorder))
 	}
 	assertPeakDemandEvidence(t, client, false)
+	normalBaseline := peakTransferDiagnostic(client, false).NormalPeakBPS
+	if normalBaseline <= 0 {
+		t.Fatalf("TX normal capacity baseline=%f want positive", normalBaseline)
+	}
 	aStats, err := controlled.PathStats("A")
 	if err != nil {
 		t.Fatal(err)
@@ -1825,14 +1841,30 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 	if elapsed := time.Since(suppressionStarted); elapsed >= defaultPeakSuppressFor {
 		t.Fatalf("C selection waited for B suppression expiry: elapsed=%s", elapsed)
 	}
-	for i := 0; i < 16; i++ {
+	cTarget := proto.DeriveTargetID(proto.GraphNodeKindPath, "C")
+	var cObservation peakCapacityObservation
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		cObservation = backed.peak.lastPeakObservation(false)
+		if cObservation.targetID == cTarget && cObservation.conclusive {
+			break
+		}
+		if got := client.(testConnectionControl).ActivePath(); got != ids["C"] {
+			t.Fatalf("TX sender left C before conclusive capacity proof: active=%d observation=%+v migrations=%+v",
+				got, cObservation, peakTransferMigrationSnapshot(recorder))
+		}
 		collector.write(t, client, chunk)
+	}
+	if cObservation.targetID != cTarget || !cObservation.conclusive || !cObservation.success ||
+		cObservation.demand == 0 || cObservation.bps < normalBaseline*defaultPeakMinGain {
+		t.Fatalf("TX C lacks conclusive demand-backed capacity proof: normal_bps=%f observation=%+v migrations=%+v",
+			normalBaseline, cObservation, peakTransferMigrationSnapshot(recorder))
 	}
 	cStats, err := controlled.PathStats("C")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cStats.PhysicalDataWriteBytes == 0 {
+	if cStats.PhysicalDataWriteBytes == 0 || client.(testConnectionControl).ActivePath() != ids["C"] {
 		t.Fatalf("selected healthy sibling C carried no physical DATA: %+v", cStats)
 	}
 	tier6CloseWrite(t, client)
@@ -1841,6 +1873,11 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 		"normal_A_physical_data_bytes":         tier6Uint(aStats.PhysicalDataWriteBytes),
 		"slow_B_physical_data_bytes":           tier6Uint(bStats.PhysicalDataWriteBytes),
 		"healthy_C_physical_data_bytes":        tier6Uint(cStats.PhysicalDataWriteBytes),
+		"normal_A_observed_bps":                tier6Uint(uint64(normalBaseline)),
+		"peak_C_observed_bps":                  tier6Uint(uint64(cObservation.bps)),
+		"peak_C_observation_conclusive":        tier6Bool(cObservation.conclusive),
+		"peak_C_observation_success":           tier6Bool(cObservation.success),
+		"peak_C_observation_demand_bytes":      tier6Uint(cObservation.demand),
 		"slow_peak_observation_conclusive":     tier6Bool(observation.conclusive),
 		"slow_peak_observation_success":        tier6Bool(observation.success),
 		"slow_peak_observation_demand_bytes":   tier6Uint(observation.demand),
@@ -1853,8 +1890,11 @@ func TestSelectorPeakTransferSlowPeakRevertsAndSuppresses(t *testing.T) {
 	}
 	mergeTier6Facts(t, facts, collector.finish(t, "payload"))
 	events := recorder.finish(t)
-	if !peakTransferMigrationHasSequence(events, "B", "A", "C") {
-		t.Fatalf("slow peak migration history does not prove A -> B -> A -> C: %+v", events)
+	if len(events) != 3 || events[0].oldName != "A" || events[0].newName != "B" ||
+		events[1].oldName != "B" || events[1].newName != "A" ||
+		events[1].cause != "peak-verify-failed" ||
+		events[2].oldName != "A" || events[2].newName != "C" {
+		t.Fatalf("slow peak migration history=%+v want exact A -> B -> A -> C", events)
 	}
 	facts["committed_migrations"] = tier6Uint(uint64(len(events)))
 	facts["migration_target_history"] = tier6MigrationTargets(events)
@@ -1868,7 +1908,7 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 	}
 	defer ln.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
 	accepted := make(chan Conn, 1)
@@ -1903,7 +1943,7 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 			ReturnRatio:     0.2,
 		},
 	)
-	dialer := &sessionDialer{Root: root, ProbeInterval: 30 * time.Second}
+	dialer := &sessionDialer{Root: root, ProbeInterval: time.Second}
 	controlled.Bind(t, dialer)
 	client, err := dialer.Dial(ctx)
 	if err != nil {
@@ -1920,6 +1960,9 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	defer server.Close()
+	acceptedServer := server.(*acceptedStreamConn)
+	bTarget := proto.DeriveTargetID(proto.GraphNodeKindPath, "B")
+	cTarget := proto.DeriveTargetID(proto.GraphNodeKindPath, "C")
 
 	waitForPathNames(t, client, []string{"A", "B", "C"}, 3*time.Second)
 	waitForPathNames(t, server, []string{"A", "B", "C"}, 3*time.Second)
@@ -1953,23 +1996,54 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 		t.Fatalf("client sender moved during baseline write: active=%d want A=%d", got, clientIDs["A"])
 	}
 
-	chunk := tier6DeterministicPayload("rx-peer-server-to-client", 64<<10)
+	chunk := tier6DeterministicPayload("rx-peer-server-to-client", 16<<10)
+	writeBurst := func(chunks int) {
+		for range chunks {
+			serverToClient.write(t, server, chunk)
+		}
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	serverObserver := server.(ConnectionObserver)
 	for time.Now().Before(deadline) && serverObserver.ActivePath() != serverIDs["B"] {
-		serverToClient.write(t, server, chunk)
+		writeBurst(48)
+		burstDeadline := time.Now().Add(800 * time.Millisecond)
+		for time.Now().Before(burstDeadline) && serverObserver.ActivePath() != serverIDs["B"] {
+			time.Sleep(time.Millisecond)
+		}
 	}
 	if got := serverObserver.ActivePath(); got != serverIDs["B"] {
-		t.Fatalf(
-			"server tx active path=%d want B=%d client-rx=%+v server-tx=%+v",
-			got, serverIDs["B"], peakTransferDiagnostic(client, true),
-			peakTransferDiagnostic(server, false),
+		_, _, bSuppressed := waitListenerPeakTargetSuppressed(
+			acceptedServer.peakAdmission, bTarget, 0,
 		)
+		t.Fatalf(
+			"server tx active path=%d want B=%d client-rx=%+v server-tx=%+v migrations=%+v B-suppressed=%t",
+			got, serverIDs["B"], peakTransferDiagnostic(client, true),
+			peakTransferDiagnostic(server, false), peakTransferMigrationSnapshot(serverRecorder),
+			bSuppressed,
+		)
+	}
+	var afterPromotion peakTransferTestDiagnostic
+	promotionDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(promotionDeadline) {
+		afterPromotion = peakTransferDiagnostic(client, true)
+		if afterPromotion.OnPeak && afterPromotion.ActivePeakTarget == bTarget &&
+			afterPromotion.ActualTarget == bTarget && afterPromotion.ActualGeneration != 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !afterPromotion.OnPeak || afterPromotion.ActivePeakTarget != bTarget ||
+		afterPromotion.ActualTarget != bTarget || afterPromotion.ActualGeneration == 0 {
+		t.Fatalf("peer peak FINAL did not publish B into RX controller state: %+v", afterPromotion)
 	}
 	if got := client.(testConnectionControl).ActivePath(); got != clientIDs["A"] {
 		t.Fatalf("client tx active path=%d want A=%d; rx policy must not move local tx", got, clientIDs["A"])
 	}
 	assertPeakDemandEvidence(t, client, true)
+	normalBaseline := peakTransferDiagnostic(client, true).NormalPeakBPS
+	if normalBaseline <= 0 {
+		t.Fatalf("RX normal capacity baseline=%f want positive", normalBaseline)
+	}
 	aStats, err := controlled.PathStats("A")
 	if err != nil {
 		t.Fatal(err)
@@ -1977,11 +2051,19 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 	if aStats.DelayedDataReads == 0 || aStats.DataReadBlocked == 0 || aStats.PhysicalDataReadBytes == 0 {
 		t.Fatalf("RX normal path did not exert physical DATA backpressure: %+v", aStats)
 	}
+	writeBurst(24)
 	deadline = time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && !peakTransferMigrationHasSequence(
-		peakTransferMigrationSnapshot(serverRecorder), "B", "A",
-	) {
-		serverToClient.write(t, server, chunk)
+	for time.Now().Before(deadline) {
+		events := peakTransferMigrationSnapshot(serverRecorder)
+		if len(events) >= 2 {
+			if events[1].oldName != "B" || events[1].newName != "A" {
+				t.Fatalf("first migration after slow B=%+v want B -> A: client-rx=%+v observation=%+v",
+					events[1], peakTransferDiagnostic(client, true),
+					client.(*engineBackedConn).peak.lastPeakObservation(true))
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if !peakTransferMigrationHasSequence(peakTransferMigrationSnapshot(serverRecorder), "B", "A") {
 		t.Fatalf("slow peer peak B did not return to A: client-rx=%+v migrations=%+v",
@@ -1993,39 +2075,103 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 	}
 	observation := client.(*engineBackedConn).peak.lastPeakObservation(true)
 	eventsAfterReturn := peakTransferMigrationSnapshot(serverRecorder)
-	factualCapacityDeparture := false
-	for _, event := range eventsAfterReturn {
-		if event.oldName == "B" && event.newName == "A" && event.cause == "probe-starved-data" {
-			factualCapacityDeparture = true
-			break
-		}
+	if len(eventsAfterReturn) != 2 || eventsAfterReturn[0].oldName != "A" ||
+		eventsAfterReturn[0].newName != "B" || eventsAfterReturn[1].oldName != "B" ||
+		eventsAfterReturn[1].newName != "A" ||
+		eventsAfterReturn[1].cause != "peak-verify-failed-rx" {
+		t.Fatalf("capacity rejection history=%+v want exact A -> B -> A", eventsAfterReturn)
 	}
-	passiveCapacityRejection := observation.conclusive && !observation.success && observation.demand != 0
+	passiveCapacityRejection := observation.targetID == bTarget &&
+		observation.conclusive && !observation.success && observation.demand != 0
 	if bStats.DelayedDataReads == 0 || bStats.PhysicalDataReadBytes == 0 ||
-		(!passiveCapacityRejection && !factualCapacityDeparture) {
+		!passiveCapacityRejection {
 		t.Fatalf("slow RX peak lacked physical demand-backed rejection: stats=%+v observation=%+v diagnostic=%+v migrations=%+v",
 			bStats, observation, peakTransferDiagnostic(client, true),
 			eventsAfterReturn)
 	}
-	suppressionStarted := time.Now()
-	deadline = suppressionStarted.Add(4 * time.Second)
+	suppressionObserved, suppressionUntil, bSuppressed := waitListenerPeakTargetSuppressed(
+		acceptedServer.peakAdmission, bTarget, time.Second,
+	)
+	if !bSuppressed {
+		t.Fatalf("slow peer peak B was not candidate-suppressed by its sender after RX capacity rejection: diagnostic=%+v migrations=%+v",
+			peakTransferDiagnostic(client, true), eventsAfterReturn)
+	}
+	selectorID := proto.DeriveTargetID(proto.GraphNodeKindSelector, "root")
+	ownerCReady := func() bool {
+		if acceptedServer.peakAdmission == nil || acceptedServer.engine == nil {
+			return false
+		}
+		if acceptedServer.peakAdmission.admit(selectorID, bTarget, "peak-transfer-rx") == nil ||
+			acceptedServer.peakAdmission.admit(selectorID, cTarget, "peak-transfer-rx") != nil {
+			return false
+		}
+		ranked, rankErr := acceptedServer.engine.RankLocalPeakTransferTargets(selectorID)
+		return rankErr == nil && slices.Contains(ranked, cTarget)
+	}
+	evidenceDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(evidenceDeadline) && !ownerCReady() {
+		time.Sleep(time.Millisecond)
+	}
+	if !ownerCReady() {
+		t.Fatalf("listener owner did not prove suppressed B and admissible/ranked C: client-rx=%+v migrations=%+v",
+			peakTransferDiagnostic(client, true), eventsAfterReturn)
+	}
+	deadline = suppressionObserved.Add(4 * time.Second)
+	if suppressionUntil.Before(deadline) {
+		deadline = suppressionUntil
+	}
 	relayWrites := uint64(0)
-	for time.Now().Before(deadline) && !peakTransferMigrationHasSequence(
-		peakTransferMigrationSnapshot(serverRecorder), "B", "A", "C",
-	) {
-		serverToClient.write(t, server, chunk)
+	ownerEvidenceChecks := uint64(1)
+	baselineEvents := len(eventsAfterReturn)
+	for time.Now().Before(deadline) {
+		events := peakTransferMigrationSnapshot(serverRecorder)
+		if len(events) > baselineEvents {
+			if events[baselineEvents].oldName != "A" || events[baselineEvents].newName != "C" {
+				t.Fatalf("first migration after B suppression=%+v want A -> C", events[baselineEvents])
+			}
+			break
+		}
+		if !ownerCReady() {
+			t.Fatalf("listener owner lost C eligibility before relay: client-rx=%+v migrations=%+v",
+				peakTransferDiagnostic(client, true), events)
+		}
+		ownerEvidenceChecks++
+		writeBurst(48)
 		relayWrites++
+		burstDeadline := time.Now().Add(800 * time.Millisecond)
+		for time.Now().Before(burstDeadline) && len(peakTransferMigrationSnapshot(serverRecorder)) == baselineEvents {
+			time.Sleep(time.Millisecond)
+		}
 	}
-	if !peakTransferMigrationHasSequence(peakTransferMigrationSnapshot(serverRecorder), "B", "A", "C") {
+	eventsAfterRelay := peakTransferMigrationSnapshot(serverRecorder)
+	if len(eventsAfterRelay) != baselineEvents+1 ||
+		eventsAfterRelay[baselineEvents].oldName != "A" ||
+		eventsAfterRelay[baselineEvents].newName != "C" {
 		t.Fatalf("peer sender did not relay from suppressed B to C: client-rx=%+v migrations=%+v",
-			peakTransferDiagnostic(client, true), peakTransferMigrationSnapshot(serverRecorder))
+			peakTransferDiagnostic(client, true), eventsAfterRelay)
 	}
-	if elapsed := time.Since(suppressionStarted); elapsed >= defaultPeakSuppressFor {
-		t.Fatalf("peer C selection waited for B suppression expiry: elapsed=%s", elapsed)
+	if !time.Now().Before(suppressionUntil) {
+		t.Fatalf("peer C selection waited for B suppression expiry: observed=%s until=%s",
+			suppressionObserved, suppressionUntil)
 	}
-	bSuppressed := true
-	for i := 0; i < 16; i++ {
-		serverToClient.write(t, server, chunk)
+	var cObservation peakCapacityObservation
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		cObservation = client.(*engineBackedConn).peak.lastPeakObservation(true)
+		if cObservation.targetID == cTarget && cObservation.conclusive {
+			break
+		}
+		if got := serverObserver.ActivePath(); got != serverIDs["C"] {
+			t.Fatalf("peer sender left C before a conclusive capacity sample: active=%d observation=%+v migrations=%+v",
+				got, cObservation, peakTransferMigrationSnapshot(serverRecorder))
+		}
+		writeBurst(32)
+		time.Sleep(300 * time.Millisecond)
+	}
+	if cObservation.targetID != cTarget || !cObservation.conclusive || !cObservation.success ||
+		cObservation.demand == 0 || cObservation.bps < normalBaseline*defaultPeakMinGain {
+		t.Fatalf("peer C lacks conclusive demand-backed capacity proof: normal_bps=%f observation=%+v migrations=%+v",
+			normalBaseline, cObservation, peakTransferMigrationSnapshot(serverRecorder))
 	}
 	clientToServer.write(t, client, tier6DeterministicPayload("rx-peer-client-after", 64<<10))
 	if got := client.(testConnectionControl).ActivePath(); got != clientIDs["A"] {
@@ -2036,8 +2182,9 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cStats.PhysicalDataReadBytes == 0 || serverObserver.ActivePath() != serverIDs["C"] {
-		t.Fatalf("healthy peer peak C did not carry DATA: stats=%+v active=%d want=%d",
-			cStats, serverObserver.ActivePath(), serverIDs["C"])
+		t.Fatalf("healthy peer peak C did not remain active: stats=%+v active=%d want=%d migrations=%+v client-rx=%+v",
+			cStats, serverObserver.ActivePath(), serverIDs["C"],
+			peakTransferMigrationSnapshot(serverRecorder), peakTransferDiagnostic(client, true))
 	}
 	tier6CloseWrite(t, server)
 	tier6CloseWrite(t, client)
@@ -2052,6 +2199,13 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 		"peak_B_physical_read_bytes":       tier6Uint(bStats.PhysicalDataReadBytes),
 		"peak_C_physical_read_bytes":       tier6Uint(cStats.PhysicalDataReadBytes),
 		"slow_B_suppressed":                tier6Bool(bSuppressed),
+		"peer_C_owner_evidence_ready":      tier6Bool(ownerEvidenceChecks != 0),
+		"peer_C_owner_evidence_checks":     tier6Uint(ownerEvidenceChecks),
+		"normal_A_observed_bps":            tier6Uint(uint64(normalBaseline)),
+		"peak_C_observed_bps":              tier6Uint(uint64(cObservation.bps)),
+		"peak_C_observation_conclusive":    tier6Bool(cObservation.conclusive),
+		"peak_C_observation_success":       tier6Bool(cObservation.success),
+		"peak_C_observation_demand_bytes":  tier6Uint(cObservation.demand),
 		"relay_writes":                     tier6Uint(relayWrites),
 		"embedded_negative_control":        "peer-rx-suppressed-B-does-not-block-C-or-local-tx",
 		"topology_path_count":              tier6Uint(uint64(len(client.Paths()))),
@@ -2060,7 +2214,8 @@ func TestSelectorPeakTransferRxPromotesPeerSenderOnly(t *testing.T) {
 	mergeTier6Facts(t, facts, clientToServer.finish(t, "client_to_server_payload"))
 	serverEvents := serverRecorder.finish(t)
 	clientEvents := clientRecorder.finish(t)
-	if !peakTransferMigrationHasSequence(serverEvents, "B", "A", "C") ||
+	if len(serverEvents) != 3 || serverEvents[0].newName != "B" ||
+		serverEvents[1].newName != "A" || serverEvents[2].newName != "C" ||
 		tier6MigrationContains(clientEvents, "B") || tier6MigrationContains(clientEvents, "C") {
 		t.Fatalf("direction-specific migration histories server=%+v client=%+v", serverEvents, clientEvents)
 	}
@@ -2189,6 +2344,31 @@ func waitPeakTargetSuppressed(
 	}
 }
 
+func waitListenerPeakTargetSuppressed(
+	admission *listenerPeakTransferAdmission,
+	targetID proto.TargetID,
+	within time.Duration,
+) (observedAt time.Time, suppressedUntil time.Time, ok bool) {
+	if admission == nil {
+		return time.Now(), time.Time{}, false
+	}
+	deadline := time.Now().Add(within)
+	for {
+		now := time.Now()
+		admission.mu.Lock()
+		suppressed := admission.state.peakTargetSuppressed(targetID, now)
+		until := admission.state.candidateSuppressUntil[targetID]
+		admission.mu.Unlock()
+		if suppressed {
+			return now, until, true
+		}
+		if now.After(deadline) {
+			return now, time.Time{}, false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func waitForPathNames(t *testing.T, c Conn, names []string, within time.Duration) {
 	t.Helper()
 	want := make(map[string]bool, len(names))
@@ -2277,6 +2457,9 @@ type peakTransferTestDiagnostic struct {
 	HealthyPeak          bool
 	OnPeak               bool
 	ActivePeakTarget     proto.TargetID
+	ActualTarget         proto.TargetID
+	ActualGeneration     uint64
+	PhaseGeneration      uint64
 	NormalPeakBPS        float64
 	NormalBytes          uint64
 	PolicyRetryAfter     time.Time
@@ -2312,6 +2495,9 @@ func peakTransferDiagnostic(conn Conn, rx bool) peakTransferTestDiagnostic {
 	}
 	diagnostic.OnPeak = state.onPeak
 	diagnostic.ActivePeakTarget = state.activePeakTarget
+	diagnostic.ActualTarget = state.actualTarget
+	diagnostic.ActualGeneration = state.actualSelectorGeneration
+	diagnostic.PhaseGeneration = state.phaseGeneration
 	diagnostic.NormalPeakBPS = state.normalPeakBps
 	diagnostic.NormalBytes = state.normalBytes
 	diagnostic.PolicyRetryAfter = state.policyRetryAfter

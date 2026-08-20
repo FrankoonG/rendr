@@ -28,6 +28,7 @@ type pathDispatchJob struct {
 	topologyEpoch    uint64
 	firstPublication bool
 	acceptedPacket   bool
+	custodyTicket    uint64
 	result           chan<- pathDispatchResult
 	applicationWait  *applicationDispatchWaiter
 	generation       uint64
@@ -121,8 +122,7 @@ type pathDispatchResult struct {
 }
 
 type detachedStreamDispatchLease struct {
-	handoffBaseline  uint64
-	handedOffAtStart bool
+	custodyTicket uint64
 }
 
 func (s *pathSlot) submitDispatch(job pathDispatchJob) bool {
@@ -361,7 +361,7 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 func (e *Engine) completePathDispatch(slot *pathSlot, job pathDispatchJob, err error) {
 	result := pathDispatchResult{slot: slot, err: err}
 	if job.acceptedPacket {
-		e.completeAcceptedPacketDispatch()
+		e.completeAcceptedPacketDispatch(job.custodyTicket)
 	}
 	if job.applicationWait != nil {
 		completeApplicationDispatchWaiter(job.applicationWait, result)
@@ -398,22 +398,24 @@ func (e *Engine) dispatchRecursiveApplication(frame []byte, runtime *executionRu
 	return e.dispatchRecursiveMode(frame, runtime, firstPublication, true, nil, false)
 }
 
-func (e *Engine) dispatchRecursiveReplayPreemptingControl(frame []byte, runtime *executionRuntime) error {
-	return e.dispatchRecursiveMode(frame, runtime, true, false, nil, true)
+func (e *Engine) dispatchRecursiveReplayPreemptingControl(
+	frame []byte,
+	runtime *executionRuntime,
+	firstPublication bool,
+) error {
+	return e.dispatchRecursiveMode(frame, runtime, firstPublication, false, nil, true)
 }
 
 func (e *Engine) dispatchDetachedStreamApplication(
 	frame []byte,
 	runtime *executionRuntime,
 	firstPublication bool,
-	handoffBaseline uint64,
-	handedOffAtStart bool,
+	custodyTicket uint64,
 ) error {
 	return e.dispatchRecursiveMode(
 		frame, runtime, firstPublication, true,
 		&detachedStreamDispatchLease{
-			handoffBaseline:  handoffBaseline,
-			handedOffAtStart: handedOffAtStart,
+			custodyTicket: custodyTicket,
 		},
 		false,
 	)
@@ -433,9 +435,7 @@ func (e *Engine) dispatchRecursiveMode(
 	}
 	handedOff := func() bool {
 		return detached != nil &&
-			e.detachedStreamDispatchHandedOff(
-				detached.handoffBaseline, detached.handedOffAtStart,
-			)
+			e.detachedStreamDispatchHandedOff(detached.custodyTicket)
 	}
 	if handedOff() {
 		return errSelectorCutoverHandoff
@@ -470,12 +470,12 @@ func (e *Engine) dispatchRecursiveMode(
 			return net.ErrClosed
 		}
 		if !replayPreemptingControl {
-			pending, _ := e.selectorCutoverSnapshot()
-			if pending {
+			cutoverGeneration, _ := e.selectorCutoverDispatchSnapshot()
+			if cutoverGeneration != 0 {
 				if acknowledged() {
 					return nil
 				}
-				if e.handoffSelectorCutoverDispatch() {
+				if e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication) {
 					return errSelectorCutoverHandoff
 				}
 			}
@@ -608,12 +608,12 @@ func (e *Engine) dispatchRecursiveMode(
 			}
 			ackWake = wake
 		}
-		cutoverPending := false
+		cutoverGeneration := uint64(0)
 		var cutoverWake <-chan struct{}
 		if !replayPreemptingControl {
-			cutoverPending, cutoverWake = e.selectorCutoverSnapshot()
+			cutoverGeneration, cutoverWake = e.selectorCutoverDispatchSnapshot()
 		}
-		if cutoverPending {
+		if cutoverGeneration != 0 {
 			if acknowledged() {
 				stopDeadlineTimer(budgetTimer)
 				stopDeadlineTimer(stallTimer)
@@ -624,7 +624,7 @@ func (e *Engine) dispatchRecursiveMode(
 			stopDeadlineTimer(budgetTimer)
 			stopDeadlineTimer(stallTimer)
 			stopDeadlineTimer(appTimer)
-			e.handoffSelectorCutoverDispatch()
+			e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication)
 			return errSelectorCutoverHandoff
 		}
 		if handedOff() {
@@ -718,8 +718,8 @@ func (e *Engine) dispatchRecursiveMode(
 					stopDeadlineTimer(appTimer)
 					return errSelectorCutoverHandoff
 				}
-				cutoverPending, cutoverWake = e.selectorCutoverSnapshot()
-				if cutoverPending {
+				cutoverGeneration, cutoverWake = e.selectorCutoverDispatchSnapshot()
+				if cutoverGeneration != 0 {
 					if acknowledged() {
 						stopDeadlineTimer(budgetTimer)
 						stopDeadlineTimer(stallTimer)
@@ -730,7 +730,7 @@ func (e *Engine) dispatchRecursiveMode(
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
 					stopDeadlineTimer(appTimer)
-					e.handoffSelectorCutoverDispatch()
+					e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication)
 					return errSelectorCutoverHandoff
 				}
 			case <-e.closed:
@@ -827,9 +827,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 ) (bool, error) {
 	handedOff := func() bool {
 		return detached != nil &&
-			e.detachedStreamDispatchHandedOff(
-				detached.handoffBaseline, detached.handedOffAtStart,
-			)
+			e.detachedStreamDispatchHandedOff(detached.custodyTicket)
 	}
 	if handedOff() {
 		return true, errSelectorCutoverHandoff
@@ -837,7 +835,8 @@ func (e *Engine) dispatchFlatSelectorApplication(
 	if runtime == nil || !runtime.flatLeafSelector {
 		return false, nil
 	}
-	if pending, _ := e.selectorCutoverSnapshot(); pending && e.handoffSelectorCutoverDispatch() {
+	if generation, _ := e.selectorCutoverDispatchSnapshot(); generation != 0 &&
+		e.handoffSelectorCutoverDispatch(generation, !firstPublication) {
 		return true, errSelectorCutoverHandoff
 	}
 	if e.isClosed() {
@@ -903,15 +902,15 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		}
 		timerC := e.resetFlatSelectorDispatchTimer(waitDeadline)
 
-		cutoverPending, cutoverWake := e.selectorCutoverSnapshot()
-		if cutoverPending {
+		cutoverGeneration, cutoverWake := e.selectorCutoverDispatchSnapshot()
+		if cutoverGeneration != 0 {
 			e.stopFlatSelectorDispatchTimer()
 			if acknowledged() {
 				abandonApplicationDispatchWaiter(waiter)
 				return true, nil
 			}
 			slot.markDispatchStalled(generation)
-			if e.handoffSelectorCutoverDispatch() {
+			if e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication) {
 				abandonApplicationDispatchWaiter(waiter)
 				return true, errSelectorCutoverHandoff
 			}
@@ -991,13 +990,13 @@ func (e *Engine) dispatchFlatSelectorApplication(
 				abandonApplicationDispatchWaiter(waiter)
 				return true, errSelectorCutoverHandoff
 			}
-			if pending, _ := e.selectorCutoverSnapshot(); pending {
+			if cutoverGeneration, _ := e.selectorCutoverDispatchSnapshot(); cutoverGeneration != 0 {
 				if acknowledged() {
 					abandonApplicationDispatchWaiter(waiter)
 					return true, nil
 				}
 				slot.markDispatchStalled(generation)
-				if e.handoffSelectorCutoverDispatch() {
+				if e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication) {
 					abandonApplicationDispatchWaiter(waiter)
 					return true, errSelectorCutoverHandoff
 				}
@@ -1047,6 +1046,9 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 	defer e.selectorCutoverMu.Unlock()
 	if e.selectorCutoverPending {
 		e.selectorCutoverHandedOff = true
+		if firstPublication {
+			e.selectorCutoverReplayRequired = true
+		}
 		return true, errSelectorCutoverHandoff
 	}
 	if e.currentPathTopologyEpoch() != topologyEpoch {
@@ -1057,16 +1059,17 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 	}
 
 	generation := slot.dispatchNextGen.Add(1)
+	custodyTicket := e.nextDispatchCustodyTicketLocked()
 	if !slot.submitDispatch(pathDispatchJob{
 		frame: frame, topologyEpoch: topologyEpoch, firstPublication: firstPublication,
-		acceptedPacket: true, generation: generation,
+		acceptedPacket: true, custodyTicket: custodyTicket, generation: generation,
 	}) {
 		return false, nil
 	}
 	if firstPublication {
 		e.noteTailReplayPublication(frame, slot)
 	}
-	e.acceptedPacketDispatches++
+	e.admitAcceptedPacketDispatchLocked(custodyTicket)
 	return true, nil
 }
 
@@ -1074,6 +1077,7 @@ type flatSelectorPacketDispatch struct {
 	runtime           *executionRuntime
 	slot              *pathSlot
 	waiter            *applicationDispatchWaiter
+	firstPublication  bool
 	generation        uint64
 	migrationDeadline time.Time
 	stallDeadline     time.Time
@@ -1099,7 +1103,8 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 	if runtime == nil || !runtime.flatLeafSelector || !e.Packetized() {
 		return nil, false, nil
 	}
-	if pending, _ := e.selectorCutoverSnapshot(); pending && e.handoffSelectorCutoverDispatch() {
+	if generation, _ := e.selectorCutoverDispatchSnapshot(); generation != 0 &&
+		e.handoffSelectorCutoverDispatch(generation, !firstPublication) {
 		return nil, true, errSelectorCutoverHandoff
 	}
 	if e.isClosed() {
@@ -1126,6 +1131,7 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 	ackTarget, _ := applicationDispatchAckTarget(frame)
 	return &flatSelectorPacketDispatch{
 		runtime: runtime, slot: slot, waiter: waiter, generation: generation,
+		firstPublication:  firstPublication,
 		migrationDeadline: migrationDeadline,
 		stallDeadline:     nowFn().Add(e.executionStallWindowForSlot(slot)),
 		ackTarget:         ackTarget,
@@ -1216,15 +1222,15 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 		}
 		resetPooledDispatchTimer(timer, waitDeadline)
 
-		cutoverPending, cutoverWake := e.selectorCutoverSnapshot()
-		if cutoverPending {
+		cutoverGeneration, cutoverWake := e.selectorCutoverDispatchSnapshot()
+		if cutoverGeneration != 0 {
 			stopDeadlineTimer(timer)
 			if acknowledged() {
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return nil
 			}
 			dispatch.slot.markDispatchStalled(dispatch.generation)
-			if e.handoffSelectorCutoverDispatch() {
+			if e.handoffSelectorCutoverDispatch(cutoverGeneration, !dispatch.firstPublication) {
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return errSelectorCutoverHandoff
 			}
@@ -1293,13 +1299,13 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 			stopDeadlineTimer(timer)
 		case <-cutoverWake:
 			stopDeadlineTimer(timer)
-			if pending, _ := e.selectorCutoverSnapshot(); pending {
+			if cutoverGeneration, _ := e.selectorCutoverDispatchSnapshot(); cutoverGeneration != 0 {
 				if acknowledged() {
 					abandonApplicationDispatchWaiter(dispatch.waiter)
 					return nil
 				}
 				dispatch.slot.markDispatchStalled(dispatch.generation)
-				if e.handoffSelectorCutoverDispatch() {
+				if e.handoffSelectorCutoverDispatch(cutoverGeneration, !dispatch.firstPublication) {
 					abandonApplicationDispatchWaiter(dispatch.waiter)
 					return errSelectorCutoverHandoff
 				}

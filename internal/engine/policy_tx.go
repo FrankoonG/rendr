@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ const (
 	policyRetryInterval  = 200 * time.Millisecond
 	policyTransactionTTL = 5 * time.Second
 	policyCompletedLimit = 8
+	policyTombstoneLimit = policyReplayDigestLimit
 )
 
 type outgoingPolicyTransaction struct {
@@ -41,7 +43,7 @@ type incomingPolicyTransaction struct {
 	expires                 time.Time
 	committed               bool
 	prepareAck              proto.PolicyAck
-	prepareFrame            []byte
+	prepareReplay           *policyReplayRecord
 }
 
 type completedPolicyTransaction struct {
@@ -50,8 +52,19 @@ type completedPolicyTransaction struct {
 	prepareAck          proto.PolicyAck
 	finalAck            proto.PolicyAck
 	finalNeedsChallenge bool
-	prepareFrame        []byte
-	finalFrame          []byte
+	prepareReplay       *policyReplayRecord
+	finalReplay         *policyReplayRecord
+}
+
+// policyTransactionTombstone retains only immutable request identities after
+// the byte-exact response owner leaves the short completed cache. Exact late
+// duplicates inside the receive replay horizon are then ignored instead of
+// minting a second ACK sequence; changed content remains a protocol violation.
+type policyTransactionTombstone struct {
+	prepareSeen   bool
+	prepareDigest proto.PolicyProposalDigest
+	commitSeen    bool
+	commitDigest  proto.FrameDigest
 }
 
 type policyMessageKind uint8
@@ -111,22 +124,50 @@ func (e *Engine) unlockPolicyMutation() {
 // generation; the requester never chooses it. One outgoing transaction is
 // allowed at a time, independently from an incoming transaction.
 func (e *Engine) RequestPeerSelection(ctx context.Context, selectorID, targetID proto.TargetID, cause string) error {
-	return e.requestPeerSelection(ctx, proto.PolicyActionSelectChild, selectorID, targetID, cause, nil)
+	_, err := e.RequestPeerSelectionGeneration(ctx, selectorID, targetID, cause)
+	return err
+}
+
+// RequestPeerSelectionGeneration is the exact-target form used by controllers
+// that also consume DATA attribution. Its generation is owned by this selector
+// execution state, not by the global policy-transaction ledger.
+func (e *Engine) RequestPeerSelectionGeneration(
+	ctx context.Context,
+	selectorID, targetID proto.TargetID,
+	cause string,
+) (uint64, error) {
+	var selectorGeneration uint64
+	err := e.requestPeerSelection(
+		ctx, proto.PolicyActionSelectChild, selectorID, targetID, cause,
+		func(_ proto.TargetID, _, committedSelectorGeneration uint64) {
+			selectorGeneration = committedSelectorGeneration
+		},
+	)
+	return selectorGeneration, err
 }
 
 // RequestPeerSelectionClass asks the opposite sender owner to resolve its best
 // fresh normal or peak child. PREPARE freezes the resolved target, and the
-// returned ID is valid only after the owner's FINAL proves that exact commit.
-func (e *Engine) RequestPeerSelectionClass(ctx context.Context, selectorID proto.TargetID, peak bool, cause string) (proto.TargetID, error) {
+// returned ID and selector generation are valid only after the owner's FINAL
+// proves that exact commit. The generation is directly comparable with DATA
+// root-attribution generations; the global policy generation is not.
+func (e *Engine) RequestPeerSelectionClass(
+	ctx context.Context,
+	selectorID proto.TargetID,
+	peak bool,
+	cause string,
+) (proto.TargetID, uint64, error) {
 	action := proto.PolicyActionSelectBestNormal
 	if peak {
 		action = proto.PolicyActionSelectBestPeak
 	}
 	var resolved proto.TargetID
-	err := e.requestPeerSelection(ctx, action, selectorID, proto.TargetID{}, cause, func(targetID proto.TargetID) {
+	var selectorGeneration uint64
+	err := e.requestPeerSelection(ctx, action, selectorID, proto.TargetID{}, cause, func(targetID proto.TargetID, _, committedSelectorGeneration uint64) {
 		resolved = targetID
+		selectorGeneration = committedSelectorGeneration
 	})
-	return resolved, err
+	return resolved, selectorGeneration, err
 }
 
 func (e *Engine) requestPeerSelection(
@@ -134,7 +175,7 @@ func (e *Engine) requestPeerSelection(
 	action proto.PolicyAction,
 	selectorID, targetID proto.TargetID,
 	cause string,
-	committed func(proto.TargetID),
+	committed func(proto.TargetID, uint64, uint64),
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -224,6 +265,8 @@ func (e *Engine) requestPeerSelection(
 	defer retry.Stop()
 	commitSent := false
 	var generation uint64
+	var prepareSelectorGeneration uint64
+	var prepareCurrentTarget proto.TargetID
 	var reservation proto.PolicyReservationID
 	var resolvedTarget proto.TargetID
 	var commitFrame []byte
@@ -280,7 +323,19 @@ func (e *Engine) requestPeerSelection(
 				if err := validatePolicyResolvedTarget(peer.manifest, tx.prepare, ack.ResolvedTargetID); err != nil {
 					return e.policyProtocolError(fmt.Errorf("owner resolved invalid policy target: %w", err))
 				}
+				if err := validatePolicySelection(peer.manifest, tx.prepare.SelectorID, ack.CurrentTargetID); err != nil {
+					return e.policyProtocolError(fmt.Errorf("owner reported invalid current policy target: %w", err))
+				}
+				if err := validatePolicyPrepareDeliverySnapshot(
+					tx.prepare.SelectorID,
+					ack,
+					e.PeerTargetDelivery(proto.TargetID{}),
+				); err != nil {
+					return e.policyProtocolError(err)
+				}
 				generation = ack.Generation
+				prepareSelectorGeneration = ack.SelectorGeneration
+				prepareCurrentTarget = ack.CurrentTargetID
 				reservation = ack.ReservationID
 				resolvedTarget = ack.ResolvedTargetID
 				challenge, challengeErr := newPolicyCommitChallenge()
@@ -329,13 +384,78 @@ func (e *Engine) requestPeerSelection(
 				ack.CommitChallenge != tx.commitChallenge {
 				return e.policyProtocolError(fmt.Errorf("COMMIT_ACK does not prove requested policy state"))
 			}
+			if err := validatePolicyFinalSelectorGeneration(
+				prepareCurrentTarget,
+				resolvedTarget,
+				prepareSelectorGeneration,
+				ack.SelectorGeneration,
+			); err != nil {
+				return e.policyProtocolError(err)
+			}
 			e.recordPeerPolicyGeneration(generation)
 			if committed != nil {
-				committed(resolvedTarget)
+				committed(resolvedTarget, generation, ack.SelectorGeneration)
 			}
 			return nil
 		}
 	}
+}
+
+func validatePolicyFinalSelectorGeneration(
+	prepareTarget, finalTarget proto.TargetID,
+	prepareGeneration, finalGeneration uint64,
+) error {
+	if prepareTarget == finalTarget {
+		if finalGeneration != prepareGeneration {
+			return fmt.Errorf(
+				"FINAL selector generation changed without a target change: prepare=%d final=%d",
+				prepareGeneration,
+				finalGeneration,
+			)
+		}
+		return nil
+	}
+	if prepareGeneration == ^uint64(0) {
+		return fmt.Errorf("FINAL selector generation cannot advance from exhausted PREPARE generation")
+	}
+	want := prepareGeneration + 1
+	if finalGeneration != want {
+		return fmt.Errorf(
+			"FINAL selector generation does not exactly advance with target change: prepare=%d final=%d want=%d",
+			prepareGeneration,
+			finalGeneration,
+			want,
+		)
+	}
+	return nil
+}
+
+func validatePolicyPrepareDeliverySnapshot(
+	selectorID proto.TargetID,
+	ack proto.PolicyAck,
+	snapshot TargetDeliverySnapshot,
+) error {
+	if !snapshot.Attributable || snapshot.SelectorID == (proto.TargetID{}) ||
+		snapshot.TargetID == (proto.TargetID{}) || snapshot.SelectorGeneration == 0 ||
+		snapshot.SelectorID != selectorID {
+		return nil
+	}
+	if ack.SelectorGeneration < snapshot.SelectorGeneration {
+		return fmt.Errorf(
+			"PREPARE selector generation %d trails observed DATA generation %d",
+			ack.SelectorGeneration,
+			snapshot.SelectorGeneration,
+		)
+	}
+	if ack.SelectorGeneration == snapshot.SelectorGeneration && ack.CurrentTargetID != snapshot.TargetID {
+		return fmt.Errorf(
+			"PREPARE current target %x contradicts observed DATA target %x at generation %d",
+			ack.CurrentTargetID,
+			snapshot.TargetID,
+			snapshot.SelectorGeneration,
+		)
+	}
+	return nil
 }
 
 type policyFrameResult struct {
@@ -372,7 +492,7 @@ func (e *Engine) sendPolicyPrepare(p proto.PolicyPrepare) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.sendFrameTracked(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyPrepare), payload)
+	return e.sendFrameTrackedPreemptingReplay(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyPrepare), payload)
 }
 
 func (e *Engine) sendPolicyAck(p proto.PolicyAck) ([]byte, error) {
@@ -380,15 +500,11 @@ func (e *Engine) sendPolicyAck(p proto.PolicyAck) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.sendFrameTracked(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyAck), payload)
+	return e.sendFrameTrackedPreemptingReplay(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyAck), payload)
 }
 
 func (e *Engine) sendPolicyAckPreemptingReplay(p proto.PolicyAck) ([]byte, error) {
-	payload, err := p.Encode()
-	if err != nil {
-		return nil, err
-	}
-	return e.sendFrameTrackedPreemptingReplay(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyAck), payload)
+	return e.sendPolicyAck(p)
 }
 
 func (e *Engine) sendPolicyCommit(p proto.PolicyCommit) ([]byte, error) {
@@ -396,7 +512,24 @@ func (e *Engine) sendPolicyCommit(p proto.PolicyCommit) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.sendFrameTracked(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyCommit), payload)
+	return e.sendFrameTrackedPreemptingReplay(proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyCommit), payload)
+}
+
+func (e *Engine) sendPolicyFinalWithExistingCutover(
+	p proto.PolicyAck,
+	cutoverGeneration uint64,
+) ([]byte, error) {
+	if p.Phase != proto.PolicyAckPhaseFinal {
+		return nil, errors.New("engine: existing cutover may publish only a policy FINAL")
+	}
+	payload, err := p.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return e.sendFrameTrackedWithExistingCutover(
+		proto.FrameCtrl, proto.FlagsForCtrl(proto.CtrlPolicyAck), payload,
+		cutoverGeneration,
+	)
 }
 
 func (e *Engine) enqueuePolicyMessageLocked(message policyMessage) bool {
@@ -486,14 +619,21 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		e.policyStateMu.Unlock()
 		return net.ErrClosed
 	}
+	if tombstone, ok := e.policyTombstones[prepare.TransactionID]; ok {
+		e.policyStateMu.Unlock()
+		if !tombstone.prepareSeen || tombstone.prepareDigest != digest {
+			return policyViolation(fmt.Errorf("policy transaction id reused after PREPARE response retirement"))
+		}
+		return nil
+	}
 	if completed, ok := e.policyCompleted[prepare.TransactionID]; ok {
 		if completed.prepare != prepare || completed.digest != digest {
 			e.policyStateMu.Unlock()
 			return policyViolation(fmt.Errorf("policy transaction id reused with different PREPARE"))
 		}
-		ack, frame := completed.prepareAck, completed.prepareFrame
+		ack, replay := completed.prepareAck, completed.prepareReplay
 		e.policyStateMu.Unlock()
-		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, frame)
+		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, replay)
 	}
 	if pending := e.policyIncoming; pending != nil {
 		if pending.prepare.TransactionID == prepare.TransactionID {
@@ -501,19 +641,25 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 				e.policyStateMu.Unlock()
 				return policyViolation(fmt.Errorf("policy transaction id reused while pending"))
 			}
-			ack, frame := pending.prepareAck, pending.prepareFrame
+			ack, replay := pending.prepareAck, pending.prepareReplay
 			e.policyStateMu.Unlock()
-			return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, frame)
+			return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, replay)
 		}
 		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeBusy, 0, prepare.SelectorID, "another policy transaction is pending")
+		e.rememberPolicyCompletedLocked(completedPolicyTransaction{
+			prepare: prepare, digest: digest, prepareAck: ack,
+		})
 		e.policyStateMu.Unlock()
-		_, err := e.sendPolicyAck(ack)
-		return err
+		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
 	e.policyStateMu.Unlock()
 
 	resolvedTarget, decisionEvidence, decisionRequiresCutover, resolveErr :=
 		e.resolveIncomingPolicyTarget(prepare, graph.manifest)
+	_, _, selectorGenerationAtPrepare, selectorGenerationOK := e.SelectorSelection(prepare.SelectorID)
+	if resolveErr == nil && (!selectorGenerationOK || selectorGenerationAtPrepare == 0) {
+		resolveErr = errors.New("engine: selector has no committed execution generation")
+	}
 
 	// Target resolution reads path evidence and may invoke admission callbacks,
 	// so it runs outside policyStateMu. Recheck every owner invariant before
@@ -522,14 +668,21 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 	if !e.lockPolicyMutation() {
 		return net.ErrClosed
 	}
+	if tombstone, ok := e.policyTombstones[prepare.TransactionID]; ok {
+		e.unlockPolicyMutation()
+		if !tombstone.prepareSeen || tombstone.prepareDigest != digest {
+			return policyViolation(fmt.Errorf("policy transaction id reused after PREPARE response retirement"))
+		}
+		return nil
+	}
 	if completed, ok := e.policyCompleted[prepare.TransactionID]; ok {
 		if completed.prepare != prepare || completed.digest != digest {
 			e.unlockPolicyMutation()
 			return policyViolation(fmt.Errorf("policy transaction id reused with different PREPARE"))
 		}
-		ack, frame := completed.prepareAck, completed.prepareFrame
+		ack, replay := completed.prepareAck, completed.prepareReplay
 		e.unlockPolicyMutation()
-		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, frame)
+		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, replay)
 	}
 	if pending := e.policyIncoming; pending != nil {
 		if pending.prepare.TransactionID == prepare.TransactionID {
@@ -537,14 +690,16 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 				e.unlockPolicyMutation()
 				return policyViolation(fmt.Errorf("policy transaction id reused while pending"))
 			}
-			ack, frame := pending.prepareAck, pending.prepareFrame
+			ack, replay := pending.prepareAck, pending.prepareReplay
 			e.unlockPolicyMutation()
-			return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, frame)
+			return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, replay)
 		}
 		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeBusy, 0, prepare.SelectorID, "another policy transaction is pending")
+		e.rememberPolicyCompletedLocked(completedPolicyTransaction{
+			prepare: prepare, digest: digest, prepareAck: ack,
+		})
 		e.unlockPolicyMutation()
-		_, err := e.sendPolicyAck(ack)
-		return err
+		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
 	if prepare.BaseGeneration != e.policyGeneration {
 		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeStale, 0, prepare.SelectorID, "base generation is stale")
@@ -576,6 +731,7 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               generation,
 		CurrentGeneration:        e.policyGeneration,
+		SelectorGeneration:       selectorGenerationAtPrepare,
 		CurrentTargetID:          e.policySelections[prepare.SelectorID],
 		ResolvedTargetID:         resolvedTarget,
 		ProposalDigest:           digest,
@@ -664,9 +820,20 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	if err := e.validateIncomingPolicyBinding(commit.PolicyTransactionBinding); err != nil {
 		return policyViolation(err)
 	}
+	commitDigest, err := policyCommitFrameDigest(commit)
+	if err != nil {
+		return policyViolation(err)
+	}
 
 	if !e.lockPolicyMutation() {
 		return net.ErrClosed
+	}
+	if tombstone, ok := e.policyTombstones[commit.TransactionID]; ok {
+		e.unlockPolicyMutation()
+		if !tombstone.commitSeen || tombstone.commitDigest != commitDigest {
+			return policyViolation(fmt.Errorf("policy transaction id reused after COMMIT response retirement"))
+		}
+		return nil
 	}
 	if completed, ok := e.policyCompleted[commit.TransactionID]; ok {
 		if completed.finalAck.Phase == proto.PolicyAckPhaseInvalid {
@@ -682,28 +849,37 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		if completed.finalNeedsChallenge {
 			completed.finalAck.CommitChallenge = commit.CommitChallenge
 			completed.finalNeedsChallenge = false
-			completed.finalFrame = nil
+			e.retirePolicyReplayRecord(completed.finalReplay)
+			completed.finalReplay = nil
 			e.policyCompleted[commit.TransactionID] = completed
 		} else if completed.finalAck.CommitChallenge != commit.CommitChallenge {
 			e.unlockPolicyMutation()
 			return policyViolation(fmt.Errorf("policy transaction id reused with different COMMIT challenge"))
 		}
-		ack, frame := completed.finalAck, completed.finalFrame
+		ack, replay := completed.finalAck, completed.finalReplay
 		e.unlockPolicyMutation()
-		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, frame)
+		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, replay)
 	}
 	pending := e.policyIncoming
 	if pending == nil {
 		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, commit.ReservationID, commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeSuperseded, commit.Generation, proto.TargetID{}, "prepared transaction is no longer pending")
+		e.rememberPolicyCompletedLocked(completedPolicyTransaction{
+			prepare:  proto.PolicyPrepare{PolicyTransactionBinding: commit.PolicyTransactionBinding},
+			digest:   commit.ProposalDigest,
+			finalAck: ack,
+		})
 		e.unlockPolicyMutation()
-		_, err := e.sendPolicyAck(ack)
-		return err
+		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
 	}
 	if pending.prepare.TransactionID != commit.TransactionID {
 		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, commit.ProposalDigest, commit.ReservationID, commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeBusy, commit.Generation, proto.TargetID{}, "another policy transaction is pending")
+		e.rememberPolicyCompletedLocked(completedPolicyTransaction{
+			prepare:  proto.PolicyPrepare{PolicyTransactionBinding: commit.PolicyTransactionBinding},
+			digest:   commit.ProposalDigest,
+			finalAck: ack,
+		})
 		e.unlockPolicyMutation()
-		_, err := e.sendPolicyAck(ack)
-		return err
+		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
 	}
 	if pending.generation != commit.Generation || pending.digest != commit.ProposalDigest || pending.reservation != commit.ReservationID {
 		e.unlockPolicyMutation()
@@ -716,7 +892,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		e.policyCompleted[commit.TransactionID] = completed
 		ack := completed.finalAck
 		e.unlockPolicyMutation()
-		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, completed.finalFrame)
+		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, completed.finalReplay)
 	}
 	prepare := pending.prepare
 	e.unlockPolicyMutation()
@@ -768,7 +944,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			e.policyIncoming = nil
 		}
 		ack := e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, pending.reservation, commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeStale, commit.Generation, prepare.SelectorID, "owner state changed after PREPARE")
-		completed := completedPolicyTransaction{prepare: prepare, digest: pending.digest, prepareAck: pending.prepareAck, prepareFrame: pending.prepareFrame, finalAck: ack}
+		completed := completedPolicyTransaction{prepare: prepare, digest: pending.digest, prepareAck: pending.prepareAck, prepareReplay: pending.prepareReplay, finalAck: ack}
 		e.rememberPolicyCompletedLocked(completed)
 		e.unlockPolicyMutation()
 		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
@@ -780,7 +956,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		e.policyCompleted[commit.TransactionID] = completed
 		ack := completed.finalAck
 		e.unlockPolicyMutation()
-		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, completed.finalFrame)
+		return e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, completed.finalReplay)
 	}
 	e.unlockPolicyMutation()
 
@@ -793,7 +969,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		cutoverGeneration = e.beginSelectorCutover()
 		defer func() {
 			if cutoverGeneration != 0 {
-				e.finishSelectorCutoverWithReplay(cutoverGeneration)
+				e.finishSelectorCutoverForControl(cutoverGeneration)
 			}
 		}()
 	}
@@ -826,7 +1002,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 		return nil
 	}
 	if applyErr == nil {
-		applyErr = e.applyPolicySelectionFromGraphOriginCommittedEvidence(
+		applyErr = e.applyPolicySelectionFromGraphOriginCommittedEvidenceDeferredReplay(
 			pending.graph,
 			prepare.SelectorID,
 			pending.resolved,
@@ -837,11 +1013,20 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			commitPolicy,
 		)
 	}
+	committedSelectorGeneration := uint64(0)
 	if committed {
-		e.observePeakPolicy(prepare.SelectorID, pending.resolved, origin, prepare.Cause)
+		_, effective, generation, ok := e.SelectorSelection(prepare.SelectorID)
+		if !ok || generation == 0 || effective != pending.resolved {
+			panic("engine: committed policy state has no matching selector generation")
+		}
+		committedSelectorGeneration = generation
+		e.observePeakPolicy(
+			prepare.SelectorID, pending.resolved, committedSelectorGeneration,
+			origin, prepare.Cause,
+		)
 	}
-	if cutoverGeneration != 0 {
-		e.finishSelectorCutoverWithReplay(cutoverGeneration)
+	if !committed && cutoverGeneration != 0 {
+		e.finishSelectorCutoverForControl(cutoverGeneration)
 		cutoverGeneration = 0
 	}
 
@@ -867,6 +1052,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			Code:                     proto.PolicyAckCodeAccept,
 			Generation:               commit.Generation,
 			CurrentGeneration:        commit.Generation,
+			SelectorGeneration:       committedSelectorGeneration,
 			CurrentTargetID:          pending.resolved,
 			ResolvedTargetID:         pending.resolved,
 			ProposalDigest:           pending.digest,
@@ -876,15 +1062,25 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 	e.policyIncoming = nil
 	e.rememberPolicyCompletedLocked(completedPolicyTransaction{
-		prepare:      prepare,
-		digest:       pending.digest,
-		prepareAck:   pending.prepareAck,
-		prepareFrame: pending.prepareFrame,
-		finalAck:     ack,
+		prepare:       prepare,
+		digest:        pending.digest,
+		prepareAck:    pending.prepareAck,
+		prepareReplay: pending.prepareReplay,
+		finalAck:      ack,
 	})
 	e.unlockPolicyMutation()
 	releaseOwner()
-	ackErr := e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
+	var ackErr error
+	if committed && cutoverGeneration != 0 {
+		generation := cutoverGeneration
+		ackErr = e.publishPolicyFinalWithExistingCutover(commit.TransactionID, ack, generation)
+		if e.selectorCutoverGenerationPending(generation) {
+			e.finishSelectorCutoverForControl(generation)
+		}
+		cutoverGeneration = 0
+	} else {
+		ackErr = e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
+	}
 	if committed && applyErr != nil {
 		return errors.Join(ackErr, fmt.Errorf("%w: committed policy replay: %v", ErrPolicyOutcomeUnknown, applyErr))
 	}
@@ -912,7 +1108,7 @@ func (e *Engine) rejectIncomingPolicyCommitAfterValidation(
 		)
 		completed := completedPolicyTransaction{
 			prepare: prepare, digest: pending.digest, prepareAck: pending.prepareAck,
-			prepareFrame: pending.prepareFrame, finalAck: ack,
+			prepareReplay: pending.prepareReplay, finalAck: ack,
 		}
 		e.rememberPolicyCompletedLocked(completed)
 		e.unlockPolicyMutation()
@@ -935,7 +1131,7 @@ func (e *Engine) rejectIncomingPolicyCommitAfterValidation(
 	e.policyIncoming = nil
 	e.rememberPolicyCompletedLocked(completedPolicyTransaction{
 		prepare: prepare, digest: pending.digest, prepareAck: pending.prepareAck,
-		prepareFrame: pending.prepareFrame, finalAck: ack,
+		prepareReplay: pending.prepareReplay, finalAck: ack,
 	})
 	e.unlockPolicyMutation()
 	return e.publishPolicyAckPreemptingReplay(commit.TransactionID, proto.PolicyAckPhaseFinal, ack)
@@ -962,38 +1158,98 @@ func (e *Engine) policyRejectLocked(binding proto.PolicyTransactionBinding, dige
 	}
 }
 
-func (e *Engine) publishPolicyAck(transactionID [16]byte, phase proto.PolicyAckPhase, ack proto.PolicyAck, replay []byte) error {
-	if len(replay) != 0 {
-		return e.replaySequencedFrame(replay)
+func (e *Engine) publishPolicyAck(
+	transactionID [16]byte,
+	phase proto.PolicyAckPhase,
+	ack proto.PolicyAck,
+	replay *policyReplayRecord,
+) error {
+	if replay != nil {
+		return e.replayPolicyRecord(replay)
 	}
-	frame, err := e.sendPolicyAck(ack)
-	return e.recordPublishedPolicyAck(transactionID, phase, frame, err)
+	record, err := e.reservePolicyAckReplayRecord(transactionID, phase, ack)
+	if err != nil {
+		return err
+	}
+	frame, sendErr := e.sendPolicyAck(ack)
+	return e.recordPublishedPolicyAck(transactionID, phase, record, frame, sendErr)
 }
 
 func (e *Engine) publishPolicyAckPreemptingReplay(transactionID [16]byte, phase proto.PolicyAckPhase, ack proto.PolicyAck) error {
-	frame, err := e.sendPolicyAckPreemptingReplay(ack)
-	return e.recordPublishedPolicyAck(transactionID, phase, frame, err)
-}
-
-func (e *Engine) recordPublishedPolicyAck(transactionID [16]byte, phase proto.PolicyAckPhase, frame []byte, err error) error {
-	if len(frame) == 0 {
+	record, err := e.reservePolicyAckReplayRecord(transactionID, phase, ack)
+	if err != nil {
 		return err
 	}
+	frame, sendErr := e.sendPolicyAckPreemptingReplay(ack)
+	return e.recordPublishedPolicyAck(transactionID, phase, record, frame, sendErr)
+}
+
+func (e *Engine) publishPolicyFinalWithExistingCutover(
+	transactionID [16]byte,
+	ack proto.PolicyAck,
+	cutoverGeneration uint64,
+) error {
+	record, err := e.reservePolicyAckReplayRecord(transactionID, proto.PolicyAckPhaseFinal, ack)
+	if err != nil {
+		return err
+	}
+	frame, sendErr := e.sendPolicyFinalWithExistingCutover(ack, cutoverGeneration)
+	return e.recordPublishedPolicyAck(
+		transactionID, proto.PolicyAckPhaseFinal, record, frame, sendErr,
+	)
+}
+
+func (e *Engine) reservePolicyAckReplayRecord(
+	transactionID [16]byte,
+	phase proto.PolicyAckPhase,
+	ack proto.PolicyAck,
+) (*policyReplayRecord, error) {
+	payload, err := ack.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return e.reservePolicyReplayRecord(transactionID, phase, proto.HeaderSize+len(payload))
+}
+
+func (e *Engine) recordPublishedPolicyAck(
+	transactionID [16]byte,
+	phase proto.PolicyAckPhase,
+	record *policyReplayRecord,
+	frame []byte,
+	err error,
+) error {
+	if len(frame) == 0 {
+		e.retirePolicyReplayRecord(record)
+		return err
+	}
+	if bindErr := e.bindPolicyReplayRecord(record, frame); bindErr != nil {
+		e.retirePolicyReplayRecord(record)
+		return errors.Join(err, bindErr)
+	}
 	if !e.lockPolicyMutation() {
+		e.retirePolicyReplayRecord(record)
 		return errors.Join(err, net.ErrClosed)
 	}
+	installed := false
 	if pending := e.policyIncoming; pending != nil && pending.prepare.TransactionID == transactionID && phase == proto.PolicyAckPhasePrepare {
-		pending.prepareFrame = append([]byte(nil), frame...)
+		pending.prepareReplay = record
+		installed = true
 	}
 	if completed, ok := e.policyCompleted[transactionID]; ok {
 		if phase == proto.PolicyAckPhasePrepare {
-			completed.prepareFrame = append([]byte(nil), frame...)
+			completed.prepareReplay = record
 		} else {
-			completed.finalFrame = append([]byte(nil), frame...)
+			completed.finalReplay = record
 		}
 		e.policyCompleted[transactionID] = completed
+		installed = true
 	}
 	e.unlockPolicyMutation()
+	if !installed {
+		e.retirePolicyReplayRecord(record)
+	} else if err == nil {
+		e.markPolicyReplayPublished(record, e.policyReplayTime())
+	}
 	return err
 }
 
@@ -1016,7 +1272,7 @@ func (e *Engine) expirePolicyIncomingLocked(pending *incomingPolicyTransaction) 
 		prepare:             pending.prepare,
 		digest:              pending.digest,
 		prepareAck:          pending.prepareAck,
-		prepareFrame:        pending.prepareFrame,
+		prepareReplay:       pending.prepareReplay,
 		finalAck:            ack,
 		finalNeedsChallenge: true,
 	}
@@ -1046,15 +1302,72 @@ func (e *Engine) expirePreparedPolicy(now time.Time) {
 
 func (e *Engine) rememberPolicyCompletedLocked(completed completedPolicyTransaction) {
 	id := completed.prepare.TransactionID
-	if _, exists := e.policyCompleted[id]; !exists {
+	if previous, exists := e.policyCompleted[id]; !exists {
 		e.policyCompletedOrder = append(e.policyCompletedOrder, id)
+	} else {
+		if previous.prepareReplay != completed.prepareReplay {
+			e.retirePolicyReplayRecord(previous.prepareReplay)
+		}
+		if previous.finalReplay != completed.finalReplay {
+			e.retirePolicyReplayRecord(previous.finalReplay)
+		}
 	}
 	e.policyCompleted[id] = completed
 	for len(e.policyCompletedOrder) > policyCompletedLimit {
 		oldest := e.policyCompletedOrder[0]
 		e.policyCompletedOrder = e.policyCompletedOrder[1:]
+		retired := e.policyCompleted[oldest]
 		delete(e.policyCompleted, oldest)
+		e.rememberPolicyTombstoneLocked(retired)
+		e.retirePolicyReplayRecord(retired.prepareReplay)
+		e.retirePolicyReplayRecord(retired.finalReplay)
 	}
+}
+
+func (e *Engine) rememberPolicyTombstoneLocked(completed completedPolicyTransaction) {
+	id := completed.prepare.TransactionID
+	if id == ([16]byte{}) {
+		panic("engine: policy tombstone has zero transaction id")
+	}
+	tombstone := policyTransactionTombstone{
+		prepareSeen:   completed.prepare.SelectorID != (proto.TargetID{}),
+		prepareDigest: completed.digest,
+	}
+	if completed.finalAck.Phase != proto.PolicyAckPhaseInvalid && !completed.finalNeedsChallenge {
+		commit := proto.PolicyCommit{
+			PolicyTransactionBinding: completed.finalAck.PolicyTransactionBinding,
+			Generation:               completed.finalAck.Generation,
+			ProposalDigest:           completed.finalAck.ProposalDigest,
+			ReservationID:            completed.finalAck.ReservationID,
+			CommitChallenge:          completed.finalAck.CommitChallenge,
+		}
+		digest, err := policyCommitFrameDigest(commit)
+		if err != nil {
+			panic(fmt.Sprintf("engine: invalid completed policy COMMIT identity: %v", err))
+		}
+		tombstone.commitSeen = true
+		tombstone.commitDigest = digest
+	}
+	if _, exists := e.policyTombstones[id]; !exists {
+		if e.policyTombstones == nil {
+			e.policyTombstones = make(map[[16]byte]policyTransactionTombstone)
+		}
+		e.policyTombstoneOrder = append(e.policyTombstoneOrder, id)
+	}
+	e.policyTombstones[id] = tombstone
+	for len(e.policyTombstoneOrder) > policyTombstoneLimit {
+		oldest := e.policyTombstoneOrder[0]
+		e.policyTombstoneOrder = e.policyTombstoneOrder[1:]
+		delete(e.policyTombstones, oldest)
+	}
+}
+
+func policyCommitFrameDigest(commit proto.PolicyCommit) (proto.FrameDigest, error) {
+	wire, err := commit.Encode()
+	if err != nil {
+		return proto.FrameDigest{}, err
+	}
+	return proto.FrameDigest(sha256.Sum256(wire)), nil
 }
 
 func (e *Engine) recordPeerPolicyGeneration(generation uint64) {
@@ -1435,6 +1748,16 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 	if err := validatePolicySelection(binding.manifest, selectorID, targetID); err != nil {
 		return err
 	}
+	runtime := e.localExecutionRuntime()
+	observeCommitted := func() {
+		if runtime == nil {
+			return
+		}
+		_, effective, generation, ok := runtime.selectorSelection(selectorID)
+		if ok && generation != 0 && effective == targetID {
+			e.observePeakPolicy(selectorID, targetID, generation, origin, cause)
+		}
+	}
 	if e.policySelectionHeldByLeafMobility(selectorID, targetID, origin) {
 		return errPolicySelectionLeafMobilityHeld
 	}
@@ -1471,7 +1794,7 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 		if afterCommit != nil {
 			afterCommit()
 		}
-		e.observePeakPolicy(selectorID, targetID, origin, cause)
+		observeCommitted()
 		return nil
 	}
 	if e.policyGeneration == ^uint64(0) {
@@ -1513,7 +1836,7 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 			// this point. Replay failure makes the call outcome unsafe to report as
 			// success, but suppressing the observer would leave the policy owner
 			// permanently projecting the pre-commit target.
-			e.observePeakPolicy(selectorID, targetID, origin, cause)
+			observeCommitted()
 			return fmt.Errorf("%w: committed policy replay: %v", ErrPolicyOutcomeUnknown, err)
 		}
 		return err
@@ -1524,7 +1847,7 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 	if afterCommit != nil {
 		afterCommit()
 	}
-	e.observePeakPolicy(selectorID, targetID, origin, cause)
+	observeCommitted()
 	return nil
 }
 
@@ -1568,6 +1891,37 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidence(
 	expectedEvidence selectorEvidenceCommit,
 	committed func(publishRoute func()) error,
 ) error {
+	return e.applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
+		binding, selectorID, targetID, cause, origin, cutoverGeneration,
+		expectedEvidence, committed, false,
+	)
+}
+
+func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidenceDeferredReplay(
+	binding graphBinding,
+	selectorID, targetID proto.TargetID,
+	cause string,
+	origin policySelectionOrigin,
+	cutoverGeneration uint64,
+	expectedEvidence selectorEvidenceCommit,
+	committed func(publishRoute func()) error,
+) error {
+	return e.applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
+		binding, selectorID, targetID, cause, origin, cutoverGeneration,
+		expectedEvidence, committed, true,
+	)
+}
+
+func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
+	binding graphBinding,
+	selectorID, targetID proto.TargetID,
+	cause string,
+	origin policySelectionOrigin,
+	cutoverGeneration uint64,
+	expectedEvidence selectorEvidenceCommit,
+	committed func(publishRoute func()) error,
+	deferCutoverReplay bool,
+) error {
 	if !binding.configured {
 		return fmt.Errorf("engine: local graph is not configured")
 	}
@@ -1586,7 +1940,7 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidence(
 	}
 	return e.commitRecursiveSelection(
 		cause, runtime, selectorID, targetID, origin, cutoverGeneration,
-		expectedEvidence, committed,
+		expectedEvidence, committed, deferCutoverReplay,
 	)
 }
 
@@ -1652,7 +2006,16 @@ func (e *Engine) policyProtocolError(err error) error {
 		return nil
 	}
 	wrapped := fmt.Errorf("%w: %v", ErrPeerProtocol, err)
+	// Seal every publication path before returning the protocol error. Close is
+	// intentionally asynchronous because it joins path workers, but callers must
+	// never observe a window in which DATA or another policy phase can publish
+	// after a fail-closed decision.
+	e.sendClosing.Store(true)
+	e.sendWriteClosed.Store(true)
+	e.policyTerminalMu.Lock()
+	e.policyTerminal.Store(true)
+	e.policyTerminalMu.Unlock()
 	e.setCloseErr(wrapped)
-	go e.Close()
+	e.requestClose()
 	return wrapped
 }

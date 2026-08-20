@@ -299,6 +299,7 @@ func TestDroppedCommitAndForgedFinalCannotAuthorizeSuccess(t *testing.T) {
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               commit.Generation,
 		CurrentGeneration:        commit.Generation,
+		SelectorGeneration:       2,
 		CurrentTargetID:          targetB,
 		ResolvedTargetID:         targetB,
 		ProposalDigest:           digest,
@@ -393,6 +394,7 @@ func TestLegitimateFinalAtCustodyBeforeCommitWriteReturnRequiresReplay(t *testin
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               commit.Generation,
 		CurrentGeneration:        commit.Generation,
+		SelectorGeneration:       2,
 		CurrentTargetID:          targetB,
 		ResolvedTargetID:         targetB,
 		ProposalDigest:           digest,
@@ -491,6 +493,89 @@ func TestPolicyAckBlackholeReusesOneControlSequence(t *testing.T) {
 	}
 }
 
+func TestPolicyClassFinalCarriesSelectorGenerationUsedByData(t *testing.T) {
+	client, server, selectorID, targetA, targetB, _, _ := newPolicyPeakE2EPair(t)
+	policyGeneration := func() uint64 {
+		server.policyStateMu.Lock()
+		defer server.policyStateMu.Unlock()
+		return server.policyGeneration
+	}
+	selection := func() (proto.TargetID, uint64) {
+		_, effective, generation, ok := server.SelectorSelection(selectorID)
+		if !ok {
+			t.Fatal("server selector selection is unavailable")
+		}
+		return effective, generation
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for request := 0; request < 3; request++ {
+		generation, err := client.RequestPeerSelectionGeneration(
+			ctx, selectorID, targetA, "test-selector-generation-domain",
+		)
+		if err != nil {
+			t.Fatalf("same-target request %d: %v", request+1, err)
+		}
+		if generation != 1 {
+			t.Fatalf("same-target request %d selector generation=%d want=1", request+1, generation)
+		}
+	}
+	if got := policyGeneration(); got != 3 {
+		t.Fatalf("global policy generation=%d want=3", got)
+	}
+	if effective, generation := selection(); effective != targetA || generation != 1 {
+		t.Fatalf("diverged generation state target=%x generation=%d want target A generation 1", effective, generation)
+	}
+
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		ranked, err := server.RankLocalPeakTransferTargets(selectorID)
+		return err == nil && len(ranked) == 1 && ranked[0] == targetB
+	})
+	resolved, selectorGeneration, err := client.RequestPeerSelectionClass(
+		ctx, selectorID, true, "test-selector-generation-domain-class",
+	)
+	if err != nil {
+		t.Fatalf("class request: %v", err)
+	}
+	if resolved != targetB || selectorGeneration != 2 {
+		t.Fatalf("class result target=%x selector generation=%d want target B generation 2", resolved, selectorGeneration)
+	}
+	if got := policyGeneration(); got != 4 {
+		t.Fatalf("global policy generation=%d want=4", got)
+	}
+	if effective, generation := selection(); effective != targetB || generation != selectorGeneration {
+		t.Fatalf("committed selection target=%x generation=%d want target B generation %d", effective, generation, selectorGeneration)
+	}
+
+	payload := []byte("selector-generation-wire-proof")
+	if n, err := server.SendData(payload); err != nil || n != len(payload) {
+		t.Fatalf("server SendData=(%d,%v) want=(%d,nil)", n, err, len(payload))
+	}
+	got := make([]byte, len(payload))
+	if n, err := client.Recv(got); err != nil || n != len(payload) || string(got) != string(payload) {
+		t.Fatalf("client Recv=(%d,%v,%q) want=(%d,nil,%q)", n, err, got, len(payload), payload)
+	}
+	delivery := client.PeerTargetDelivery(targetB)
+	if !delivery.Attributable || delivery.SelectorID != selectorID ||
+		delivery.TargetID != targetB || delivery.SelectorGeneration != selectorGeneration ||
+		delivery.AckedBytes != uint64(len(payload)) {
+		t.Fatalf("DATA attribution=%+v want target B selector generation %d and %d bytes", delivery, selectorGeneration, len(payload))
+	}
+}
+
+func newPolicyPeakE2EPair(t *testing.T) (
+	client *Engine,
+	server *Engine,
+	selectorID proto.TargetID,
+	targetA proto.TargetID,
+	targetB proto.TargetID,
+	serverA uint32,
+	serverB uint32,
+) {
+	return newPolicyE2EPairConfigured(t, nil, nil, true)
+}
+
 func newPolicyE2EPair(t *testing.T, intercept *policyAckIntercept) (
 	client *Engine,
 	server *Engine,
@@ -512,6 +597,23 @@ func newPolicyE2EPairWithDrops(t *testing.T, intercept *policyAckIntercept, clie
 	serverA uint32,
 	serverB uint32,
 ) {
+	return newPolicyE2EPairConfigured(t, intercept, clientDrop, false)
+}
+
+func newPolicyE2EPairConfigured(
+	t *testing.T,
+	intercept *policyAckIntercept,
+	clientDrop *policyControlDrop,
+	peakTargetB bool,
+) (
+	client *Engine,
+	server *Engine,
+	selectorID proto.TargetID,
+	targetA proto.TargetID,
+	targetB proto.TargetID,
+	serverA uint32,
+	serverB uint32,
+) {
 	t.Helper()
 	pathA := proto.GraphNode{ID: proto.DeriveTargetID(proto.GraphNodeKindPath, "policy-a"), Kind: proto.GraphNodeKindPath, Name: "policy-a"}
 	pathB := proto.GraphNode{ID: proto.DeriveTargetID(proto.GraphNodeKindPath, "policy-b"), Kind: proto.GraphNodeKindPath, Name: "policy-b"}
@@ -520,6 +622,9 @@ func newPolicyE2EPairWithDrops(t *testing.T, intercept *policyAckIntercept, clie
 		Kind:     proto.GraphNodeKindSelector,
 		Name:     "policy-root",
 		Children: []proto.TargetID{pathA.ID, pathB.ID},
+	}
+	if peakTargetB {
+		selector.PeakCandidates = []proto.TargetID{pathB.ID}
 	}
 	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, pathA, pathB}}
 	flow := [16]byte{0x91, 0x10}

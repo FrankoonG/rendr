@@ -9,7 +9,7 @@ import (
 )
 
 func TestPacketRecvWindowCoversReplayCreditWithoutAllocationAmplification(t *testing.T) {
-	const maximumPublishedWithoutAck = sendHistoryWindow + sendControlReserve + 1
+	const maximumPublishedWithoutAck = sendHistoryWindow + sendControlReserve + sendPolicyFinalReserve + 1
 	if packetRecvWindowBits < maximumPublishedWithoutAck {
 		t.Fatalf("packetRecvWindowBits=%d, want >= replay credit %d", packetRecvWindowBits, maximumPublishedWithoutAck)
 	}

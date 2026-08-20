@@ -772,6 +772,10 @@ type runtimeControlledTCPPath struct {
 	probeDelayNanos  atomic.Int64
 	probeDelayClosed chan struct{}
 	probeDelayOnce   sync.Once
+	readMu           sync.Mutex
+	probePumpMu      sync.Mutex
+	probeDelayFIFO   *runtimeControlledTCPProbeDelayFIFO
+	probeClock       runtimeControlledTCPProbeClock
 
 	qualityMu     sync.RWMutex
 	forcedQuality *transport.PathQuality
@@ -781,22 +785,31 @@ type runtimeControlledTCPPath struct {
 }
 
 func (p *runtimeControlledTCPPath) Read(buf []byte) (int, error) {
-	n, err := p.base.Read(buf)
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+
+	fifo := p.loadProbeDelayFIFO()
+	var (
+		n   int
+		err error
+	)
+	if fifo != nil {
+		n, err = fifo.Read(buf)
+	} else {
+		n, err = p.base.Read(buf)
+		arrivedAt := p.probeDelayClock().Now()
+		if n > 0 && time.Duration(p.probeDelayNanos.Load()) > 0 {
+			fifo, startErr := p.startProbeDelayFIFO(buf[:n], arrivedAt, err)
+			if startErr != nil {
+				return 0, startErr
+			}
+			n, err = fifo.Read(buf)
+		}
+	}
 	if n > 0 && isDataFrame(buf[:n]) {
 		p.dataPath.recordReadBytes(uint64(n))
 		if delayErr := p.delayData(n, false); delayErr != nil {
 			return 0, delayErr
-		}
-	} else if n > 0 && isPathProbeControl(buf[:n], proto.CtrlPathProbeReply) {
-		delay := time.Duration(p.probeDelayNanos.Load())
-		if delay > 0 {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-			case <-p.probeDelayClosed:
-				return 0, net.ErrClosed
-			}
 		}
 	}
 	return n, err
@@ -835,12 +848,66 @@ func (p *runtimeControlledTCPPath) Write(frame []byte) (int, error) {
 
 func (p *runtimeControlledTCPPath) Close() error {
 	p.signalClosed()
-	return p.base.Close()
+	err := p.base.Close()
+	p.waitProbeDelayPump()
+	return err
 }
 
 func (p *runtimeControlledTCPPath) signalClosed() {
 	p.closed.Store(true)
 	p.probeDelayOnce.Do(func() { close(p.probeDelayClosed) })
+}
+
+func (p *runtimeControlledTCPPath) loadProbeDelayFIFO() *runtimeControlledTCPProbeDelayFIFO {
+	p.probePumpMu.Lock()
+	defer p.probePumpMu.Unlock()
+	return p.probeDelayFIFO
+}
+
+func (p *runtimeControlledTCPPath) startProbeDelayFIFO(first []byte, arrivedAt time.Time, sourceErr error) (*runtimeControlledTCPProbeDelayFIFO, error) {
+	p.probePumpMu.Lock()
+	defer p.probePumpMu.Unlock()
+	if p.probeDelayFIFO != nil {
+		return p.probeDelayFIFO, nil
+	}
+	if p.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	fifo := newRuntimeControlledTCPProbeDelayFIFO(
+		p.base,
+		&p.probeDelayNanos,
+		p.probeDelayClock(),
+		runtimeControlledTCPProbeQueueLimits{
+			frames: runtimeControlledTCPProbeQueueMaxFrames,
+			bytes:  runtimeControlledTCPProbeQueueMaxBytes,
+		},
+		p.probeDelayClosed,
+	)
+	if err := fifo.enqueue(first, arrivedAt); err != nil {
+		return nil, err
+	}
+	if sourceErr != nil {
+		fifo.finishSource(sourceErr)
+	}
+	p.probeDelayFIFO = fifo
+	fifo.start()
+	return fifo, nil
+}
+
+func (p *runtimeControlledTCPPath) probeDelayClock() runtimeControlledTCPProbeClock {
+	if p.probeClock != nil {
+		return p.probeClock
+	}
+	return runtimeControlledTCPRealProbeClock{}
+}
+
+func (p *runtimeControlledTCPPath) waitProbeDelayPump() {
+	p.probePumpMu.Lock()
+	fifo := p.probeDelayFIFO
+	p.probePumpMu.Unlock()
+	if fifo != nil {
+		fifo.wait()
+	}
 }
 
 func isDataFrame(frame []byte) bool {
@@ -857,6 +924,298 @@ func isPathProbeControl(frame []byte, code proto.CtrlCode) bool {
 	}
 	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 	return err == nil && header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == code
+}
+
+const (
+	runtimeControlledTCPProbeQueueMaxFrames = 128
+	runtimeControlledTCPProbeQueueMaxBytes  = 2 << 20
+)
+
+var errRuntimeControlledTCPProbeQueueOverflow = errors.New("controlled TCP probe-delay queue overflow")
+
+type runtimeControlledTCPProbeClock interface {
+	Now() time.Time
+	NewTimerAt(time.Time) runtimeControlledTCPProbeTimer
+}
+
+type runtimeControlledTCPProbeTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type runtimeControlledTCPRealProbeClock struct{}
+
+func (runtimeControlledTCPRealProbeClock) Now() time.Time { return time.Now() }
+
+func (runtimeControlledTCPRealProbeClock) NewTimerAt(deadline time.Time) runtimeControlledTCPProbeTimer {
+	delay := time.Until(deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	return runtimeControlledTCPRealProbeTimer{Timer: time.NewTimer(delay)}
+}
+
+type runtimeControlledTCPRealProbeTimer struct {
+	*time.Timer
+}
+
+func (t runtimeControlledTCPRealProbeTimer) C() <-chan time.Time { return t.Timer.C }
+
+type runtimeControlledTCPProbeQueueLimits struct {
+	frames int
+	bytes  int
+}
+
+type runtimeControlledTCPProbeFrame struct {
+	frame     []byte
+	releaseAt time.Time
+}
+
+// runtimeControlledTCPProbeDelayFIFO keeps physical arrival independent from
+// delayed delivery. Only an exact probe-reply payload receives artificial
+// latency; later frames remain FIFO-ordered behind it without each adding the
+// same delay again.
+type runtimeControlledTCPProbeDelayFIFO struct {
+	base   transport.PathConn
+	delay  *atomic.Int64
+	clock  runtimeControlledTCPProbeClock
+	limits runtimeControlledTCPProbeQueueLimits
+	closed <-chan struct{}
+
+	readMu sync.Mutex
+	mu     sync.Mutex
+	frames []runtimeControlledTCPProbeFrame
+	head   int
+	bytes  int
+
+	fatalErr      error
+	sourceErr     error
+	sourceStopped bool
+	wake          chan struct{}
+	space         chan struct{}
+	done          chan struct{}
+	startOnce     sync.Once
+	started       atomic.Bool
+}
+
+func newRuntimeControlledTCPProbeDelayFIFO(
+	base transport.PathConn,
+	delay *atomic.Int64,
+	clock runtimeControlledTCPProbeClock,
+	limits runtimeControlledTCPProbeQueueLimits,
+	closed <-chan struct{},
+) *runtimeControlledTCPProbeDelayFIFO {
+	return &runtimeControlledTCPProbeDelayFIFO{
+		base:   base,
+		delay:  delay,
+		clock:  clock,
+		limits: limits,
+		closed: closed,
+		wake:   make(chan struct{}, 1),
+		space:  make(chan struct{}, 1),
+		done:   make(chan struct{}),
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) start() {
+	q.startOnce.Do(func() {
+		q.started.Store(true)
+		go q.pump()
+	})
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) wait() {
+	if q != nil && q.started.Load() {
+		<-q.done
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) pump() {
+	defer close(q.done)
+	q.mu.Lock()
+	stopped := q.sourceStopped
+	q.mu.Unlock()
+	if stopped {
+		return
+	}
+
+	buf := make([]byte, tadapter.MaxFrameSize)
+	for {
+		if !q.waitForPumpCapacity(len(buf)) {
+			return
+		}
+		n, err := q.base.Read(buf)
+		arrivedAt := q.clock.Now()
+		if n > 0 {
+			if enqueueErr := q.enqueue(buf[:n], arrivedAt); enqueueErr != nil {
+				_ = q.base.Close()
+				return
+			}
+		}
+		if err != nil {
+			q.finishSource(err)
+			return
+		}
+		if n == 0 {
+			q.finishSource(errors.New("controlled TCP probe-delay pump read made no progress"))
+			_ = q.base.Close()
+			return
+		}
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) waitForPumpCapacity(maxFrameBytes int) bool {
+	for {
+		q.mu.Lock()
+		queuedFrames := len(q.frames) - q.head
+		capacity := q.fatalErr == nil && !q.sourceStopped &&
+			queuedFrames < q.limits.frames && maxFrameBytes <= q.limits.bytes-q.bytes
+		q.mu.Unlock()
+		if capacity {
+			return true
+		}
+		select {
+		case <-q.space:
+		case <-q.closed:
+			return false
+		}
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) enqueue(frame []byte, arrivedAt time.Time) error {
+	delay := time.Duration(q.delay.Load())
+	releaseAt := arrivedAt
+	if delay > 0 && isExactPathProbeReply(frame) {
+		releaseAt = arrivedAt.Add(delay)
+	}
+	owned := append([]byte(nil), frame...)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.fatalErr != nil {
+		return q.fatalErr
+	}
+	queuedFrames := len(q.frames) - q.head
+	if queuedFrames >= q.limits.frames || len(owned) > q.limits.bytes-q.bytes {
+		q.fatalErr = fmt.Errorf(
+			"%w: queued_frames=%d frame_bytes=%d queued_bytes=%d limits=(%d,%d)",
+			errRuntimeControlledTCPProbeQueueOverflow,
+			queuedFrames,
+			len(owned),
+			q.bytes,
+			q.limits.frames,
+			q.limits.bytes,
+		)
+		q.signalLocked()
+		return q.fatalErr
+	}
+	if q.head > 0 && len(q.frames) == cap(q.frames) {
+		copy(q.frames, q.frames[q.head:])
+		q.frames = q.frames[:queuedFrames]
+		q.head = 0
+	}
+	q.frames = append(q.frames, runtimeControlledTCPProbeFrame{frame: owned, releaseAt: releaseAt})
+	q.bytes += len(owned)
+	if queuedFrames == 0 {
+		q.signalLocked()
+	}
+	return nil
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) finishSource(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	q.mu.Lock()
+	if !q.sourceStopped {
+		q.sourceStopped = true
+		q.sourceErr = err
+		q.signalLocked()
+	}
+	q.mu.Unlock()
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) signalLocked() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) Read(buf []byte) (int, error) {
+	q.readMu.Lock()
+	defer q.readMu.Unlock()
+
+	for {
+		q.mu.Lock()
+		if q.fatalErr != nil {
+			err := q.fatalErr
+			q.mu.Unlock()
+			return 0, err
+		}
+		select {
+		case <-q.closed:
+			q.mu.Unlock()
+			return 0, net.ErrClosed
+		default:
+		}
+
+		if q.head < len(q.frames) {
+			head := q.frames[q.head]
+			wait := head.releaseAt.Sub(q.clock.Now())
+			if wait <= 0 {
+				q.frames[q.head] = runtimeControlledTCPProbeFrame{}
+				q.head++
+				q.bytes -= len(head.frame)
+				if q.head == len(q.frames) {
+					q.frames = q.frames[:0]
+					q.head = 0
+				}
+				q.signalSpaceLocked()
+				q.mu.Unlock()
+				if len(buf) < len(head.frame) {
+					copy(buf, head.frame)
+					return len(buf), io.ErrShortBuffer
+				}
+				return copy(buf, head.frame), nil
+			}
+			q.mu.Unlock()
+			timer := q.clock.NewTimerAt(head.releaseAt)
+			select {
+			case <-timer.C():
+			case <-q.wake:
+			case <-q.closed:
+			}
+			timer.Stop()
+			continue
+		}
+
+		if q.sourceStopped {
+			err := q.sourceErr
+			q.mu.Unlock()
+			return 0, err
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.wake:
+		case <-q.closed:
+		}
+	}
+}
+
+func (q *runtimeControlledTCPProbeDelayFIFO) signalSpaceLocked() {
+	select {
+	case q.space <- struct{}{}:
+	default:
+	}
+}
+
+func isExactPathProbeReply(frame []byte) bool {
+	if !isPathProbeControl(frame, proto.CtrlPathProbeReply) {
+		return false
+	}
+	_, err := proto.DecodeProbe(frame[proto.HeaderSize:])
+	return err == nil
 }
 
 func (p *runtimeControlledTCPPath) Quality() transport.PathQuality {
@@ -932,7 +1291,9 @@ func (p *runtimeControlledTCPPath) Fail() error {
 		return errors.New("controlled path has no raw carrier fault handle")
 	}
 	p.signalClosed()
-	return p.raw.Close()
+	err := p.raw.Close()
+	p.waitProbeDelayPump()
+	return err
 }
 
 type runtimeControlledTCPPathStats struct {

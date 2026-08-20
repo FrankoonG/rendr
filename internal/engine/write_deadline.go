@@ -294,12 +294,15 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 	// ledger and receiver SEQ reorder preserve wire order if a later control
 	// frame overtakes this DATA on a congested path. Releasing here lets policy
 	// and recovery controls preempt a blocked DATA dispatch.
-	handoffBaseline, handedOffAtStart := e.beginDetachedStreamDispatch()
+	if hook := e.applicationDataBeforeDetachedCustody; hook != nil {
+		hook()
+	}
+	custodyTicket := e.beginDetachedStreamDispatch()
 	e.sendMu.Unlock()
 	sendLocked = false
-	defer e.completeDetachedStreamDispatch()
+	defer e.completeDetachedStreamDispatch(custodyTicket)
 	dispatchErr := e.dispatchDetachedStreamApplication(
-		frame, runtime, true, handoffBaseline, handedOffAtStart,
+		frame, runtime, true, custodyTicket,
 	)
 	if errors.Is(dispatchErr, errSelectorCutoverHandoff) {
 		dispatchErr = nil

@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	PolicyTransactionWireVersion uint8 = 3
+	PolicyTransactionWireVersion uint8 = 4
 	PolicyMaxCauseBytes                = 256
 	PolicyMaxReasonBytes               = 512
 
 	PolicyTransactionBindingSize = 80
 	PolicyPrepareHeaderSize      = 136
-	PolicyAckHeaderSize          = 224
+	PolicyAckHeaderSize          = 232
 	PolicyCommitSize             = 168
 )
 
@@ -162,7 +162,7 @@ func (p PolicyPrepare) ProposalDigest() (PolicyProposalDigest, error) {
 		return PolicyProposalDigest{}, err
 	}
 	h := sha256.New()
-	h.Write([]byte("rendr-policy-proposal-v3\x00"))
+	h.Write([]byte("rendr-policy-proposal-v4\x00"))
 	h.Write(wire)
 	var digest PolicyProposalDigest
 	copy(digest[:], h.Sum(nil))
@@ -188,18 +188,31 @@ const (
 	PolicyAckCodeSuperseded PolicyAckCode = 5
 )
 
+// PolicyAck v4 uses a 232-byte fixed header followed by Reason:
+//
+//	0:80    transaction binding
+//	80:82   phase and code
+//	82:88   reserved
+//	88:112  policy, current-policy, and selector generations
+//	112:144 current and resolved target IDs
+//	144:176 proposal digest
+//	176:192 reservation ID
+//	192:224 commit challenge
+//	224:226 reason length
+//	226:232 reserved
 type PolicyAck struct {
 	PolicyTransactionBinding
-	Phase             PolicyAckPhase
-	Code              PolicyAckCode
-	Generation        uint64
-	CurrentGeneration uint64
-	CurrentTargetID   TargetID
-	ResolvedTargetID  TargetID
-	ProposalDigest    PolicyProposalDigest
-	ReservationID     PolicyReservationID
-	CommitChallenge   PolicyCommitChallenge
-	Reason            string
+	Phase              PolicyAckPhase
+	Code               PolicyAckCode
+	Generation         uint64
+	CurrentGeneration  uint64
+	SelectorGeneration uint64
+	CurrentTargetID    TargetID
+	ResolvedTargetID   TargetID
+	ProposalDigest     PolicyProposalDigest
+	ReservationID      PolicyReservationID
+	CommitChallenge    PolicyCommitChallenge
+	Reason             string
 }
 
 func (p PolicyAck) Encode() ([]byte, error) {
@@ -214,12 +227,13 @@ func (p PolicyAck) Encode() ([]byte, error) {
 	b[80], b[81] = byte(p.Phase), byte(p.Code)
 	binary.BigEndian.PutUint64(b[88:96], p.Generation)
 	binary.BigEndian.PutUint64(b[96:104], p.CurrentGeneration)
-	copy(b[104:120], p.CurrentTargetID[:])
-	copy(b[120:136], p.ResolvedTargetID[:])
-	copy(b[136:168], p.ProposalDigest[:])
-	copy(b[168:184], p.ReservationID[:])
-	copy(b[184:216], p.CommitChallenge[:])
-	binary.BigEndian.PutUint16(b[216:218], uint16(len(p.Reason)))
+	binary.BigEndian.PutUint64(b[104:112], p.SelectorGeneration)
+	copy(b[112:128], p.CurrentTargetID[:])
+	copy(b[128:144], p.ResolvedTargetID[:])
+	copy(b[144:176], p.ProposalDigest[:])
+	copy(b[176:192], p.ReservationID[:])
+	copy(b[192:224], p.CommitChallenge[:])
+	binary.BigEndian.PutUint16(b[224:226], uint16(len(p.Reason)))
 	copy(b[PolicyAckHeaderSize:], p.Reason)
 	return b, nil
 }
@@ -232,10 +246,10 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 	if err != nil {
 		return PolicyAck{}, err
 	}
-	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[218:220]) != 0 || binary.BigEndian.Uint32(wire[220:224]) != 0 {
+	if binary.BigEndian.Uint16(wire[82:84]) != 0 || binary.BigEndian.Uint32(wire[84:88]) != 0 || binary.BigEndian.Uint16(wire[226:228]) != 0 || binary.BigEndian.Uint32(wire[228:232]) != 0 {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reserved bytes must be zero")
 	}
-	reasonLen := int(binary.BigEndian.Uint16(wire[216:218]))
+	reasonLen := int(binary.BigEndian.Uint16(wire[224:226]))
 	if reasonLen > PolicyMaxReasonBytes || len(wire)-PolicyAckHeaderSize != reasonLen {
 		return PolicyAck{}, fmt.Errorf("proto: policy ack reason length %d does not match payload", reasonLen)
 	}
@@ -245,13 +259,14 @@ func DecodePolicyAck(wire []byte) (PolicyAck, error) {
 		Code:                     PolicyAckCode(wire[81]),
 		Generation:               binary.BigEndian.Uint64(wire[88:96]),
 		CurrentGeneration:        binary.BigEndian.Uint64(wire[96:104]),
+		SelectorGeneration:       binary.BigEndian.Uint64(wire[104:112]),
 		Reason:                   string(wire[PolicyAckHeaderSize:]),
 	}
-	copy(p.CurrentTargetID[:], wire[104:120])
-	copy(p.ResolvedTargetID[:], wire[120:136])
-	copy(p.ProposalDigest[:], wire[136:168])
-	copy(p.ReservationID[:], wire[168:184])
-	copy(p.CommitChallenge[:], wire[184:216])
+	copy(p.CurrentTargetID[:], wire[112:128])
+	copy(p.ResolvedTargetID[:], wire[128:144])
+	copy(p.ProposalDigest[:], wire[144:176])
+	copy(p.ReservationID[:], wire[176:192])
+	copy(p.CommitChallenge[:], wire[192:224])
 	if err := p.validate(); err != nil {
 		return PolicyAck{}, err
 	}
@@ -270,6 +285,12 @@ func (p PolicyAck) validate() error {
 	}
 	if p.Code == PolicyAckCodeAccept && p.Generation == 0 {
 		return fmt.Errorf("proto: accepted policy ack has zero generation")
+	}
+	if p.Code == PolicyAckCodeAccept && p.SelectorGeneration == 0 {
+		return fmt.Errorf("proto: accepted policy ack has zero selector generation")
+	}
+	if p.Code == PolicyAckCodeAccept && p.CurrentTargetID == (TargetID{}) {
+		return fmt.Errorf("proto: accepted policy ack has zero current target id")
 	}
 	if p.Code == PolicyAckCodeAccept && p.ResolvedTargetID == (TargetID{}) {
 		return fmt.Errorf("proto: accepted policy ack has zero resolved target id")

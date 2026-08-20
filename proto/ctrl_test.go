@@ -126,8 +126,8 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestLeafMobilityEnvelope(t *testing.T) {
-	if ProtocolMinor != 19 {
-		t.Fatalf("protocol minor=%d want=19", ProtocolMinor)
+	if ProtocolMinor != 20 {
+		t.Fatalf("protocol minor=%d want=20", ProtocolMinor)
 	}
 	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
@@ -167,6 +167,9 @@ func TestLeafMobilityEnvelope(t *testing.T) {
 	}
 	if FeaturePolicyCommitChallenge != 1<<22 || SupportedFeatures&FeaturePolicyCommitChallenge == 0 || RequiredFeatures&FeaturePolicyCommitChallenge == 0 {
 		t.Fatal("policy commit-challenge feature is not stable and mandatory")
+	}
+	if FeaturePolicySelectorGeneration != 1<<23 || SupportedFeatures&FeaturePolicySelectorGeneration == 0 || RequiredFeatures&FeaturePolicySelectorGeneration == 0 {
+		t.Fatal("policy selector-generation feature is not stable and mandatory")
 	}
 	if NegotiationSize != 80 {
 		t.Fatalf("negotiation size=%d want=80", NegotiationSize)
@@ -594,6 +597,53 @@ func TestPolicyCommitChallengePreventsMinor18HalfNegotiation(t *testing.T) {
 	}
 }
 
+func TestPolicySelectorGenerationPreventsMinor19HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x82}
+	manifest := testGraphManifest("policy-selector-generation-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  negotiation.GraphBinding(),
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "minor 19", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 19
+		}},
+		{name: "feature unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeaturePolicySelectorGeneration
+			n.Required &^= FeaturePolicySelectorGeneration
+		}},
+		{name: "feature not required", mutate: func(n *Negotiation) {
+			n.Required &^= FeaturePolicySelectorGeneration
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, hello), test.mutate)
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, ack), test.mutate)
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+	if legacyV19AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-19 validation accepted minor-20 selector-generation negotiation")
+	}
+}
+
 func TestHigherMinorMayAdvertiseUnknownOptionalFeature(t *testing.T) {
 	flow := [16]byte{0x7b}
 	manifest := testGraphManifest("future-optional-feature")
@@ -668,6 +718,13 @@ func legacyV18AcceptsNegotiation(n Negotiation) bool {
 	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 18 &&
 		n.Required&^legacyV18FeatureMask == 0 && n.Required&^n.Supported == 0 &&
 		legacyV18FeatureMask&^n.Supported == 0
+}
+
+func legacyV19AcceptsNegotiation(n Negotiation) bool {
+	const legacyV19FeatureMask FeatureSet = 0x7fffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 19 &&
+		n.Required&^legacyV19FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV19FeatureMask&^n.Supported == 0
 }
 
 func TestServerAssignedSessionEpochIsMandatoryOnCurrentMinor(t *testing.T) {
@@ -806,7 +863,7 @@ func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
 		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
 	}
 	helloWire := mustHelloWire(t, hello)
-	wantPrefix, err := hex.DecodeString("000100130005000400000000007fffff00000000007fffff")
+	wantPrefix, err := hex.DecodeString("00010014000500040000000000ffffff0000000000ffffff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1415,7 +1472,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("000100130000000000000000007fffff00000000007fffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("00010014000000000000000000ffffff0000000000ffffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

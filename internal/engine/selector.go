@@ -220,7 +220,10 @@ func (e *Engine) SelectBestLocalPeakTransferNormalTarget(
 		return proto.TargetID{}, err
 	}
 	if len(ranked) == 0 {
-		return proto.TargetID{}, fmt.Errorf("engine: selector normal class has no fresh healthy target")
+		return proto.TargetID{}, fmt.Errorf(
+			"%w: normal class has no fresh healthy target",
+			ErrSelectorDecisionUnavailable,
+		)
 	}
 	targetID := ranked[0]
 	if err := e.selectLocalTargetCommittedAtEvidence(

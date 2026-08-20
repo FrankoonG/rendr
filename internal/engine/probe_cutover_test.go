@@ -130,21 +130,276 @@ func TestBeginSelectorCutoverRejectsGenerationExhaustionBeforeMutation(t *testin
 	}
 }
 
+func TestSelectorCutoverLeasesAreExclusive(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	first := e.beginSelectorCutover()
+	secondReady := make(chan uint64, 1)
+	secondWaiting := make(chan struct{})
+	var secondWaitingOnce sync.Once
+	e.selectorCutoverBeforeWait = func(generation uint64) {
+		if generation != first {
+			t.Errorf("second cutover waited on generation=%d want %d", generation, first)
+		}
+		secondWaitingOnce.Do(func() { close(secondWaiting) })
+	}
+	go func() { secondReady <- e.beginSelectorCutover() }()
+	select {
+	case <-secondWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("second cutover did not reach the owned generation")
+	}
+	select {
+	case second := <-secondReady:
+		e.finishSelectorCutover(second)
+		t.Fatalf("concurrent cutover replaced generation %d with %d", first, second)
+	default:
+	}
+
+	e.finishSelectorCutover(first)
+	var second uint64
+	select {
+	case second = <-secondReady:
+	case <-time.After(time.Second):
+		t.Fatal("second cutover did not acquire after first finished")
+	}
+	if second != first+1 {
+		t.Fatalf("second cutover generation=%d want %d", second, first+1)
+	}
+	if e.handoffSelectorCutoverDispatch(first, false) {
+		t.Fatal("stale first-generation handoff was accepted by the second lease")
+	}
+	if e.selectorCutoverDidHandoff(second) {
+		t.Fatal("stale first-generation handoff contaminated the second lease")
+	}
+	e.finishSelectorCutover(first)
+	if pending, _ := e.selectorCutoverSnapshot(); !pending {
+		t.Fatal("stale first-generation finish closed the second lease")
+	}
+	if !e.handoffSelectorCutoverDispatch(second, false) || !e.selectorCutoverDidHandoff(second) {
+		t.Fatal("current-generation handoff was not recorded")
+	}
+	e.finishSelectorCutover(second)
+}
+
+func TestWaitingSelectorCutoverStopsOnClose(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	first := e.beginSelectorCutover()
+	if first == 0 {
+		t.Fatal("first selector cutover was not acquired")
+	}
+	waiting := make(chan struct{})
+	var waitingOnce sync.Once
+	e.selectorCutoverBeforeWait = func(generation uint64) {
+		if generation != first {
+			t.Errorf("waiting on generation=%d want %d", generation, first)
+		}
+		waitingOnce.Do(func() { close(waiting) })
+	}
+	result := make(chan uint64, 1)
+	go func() { result <- e.beginSelectorCutover() }()
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("second selector cutover did not enter the wait")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case generation := <-result:
+		if generation != 0 {
+			t.Fatalf("closed selector cutover returned generation=%d want 0", generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting selector cutover ignored Close")
+	}
+}
+
+func TestPolicyFinalWithExistingCutoverLinearizesPublicationAndDetachedCustody(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	e := fixture.engine
+	e.tailReplayInitialDelay = time.Hour
+	e.tailReplayMaxBackoff = time.Hour
+
+	published := make(chan struct{})
+	releasePublication := make(chan struct{})
+	var publishedOnce, releaseOnce sync.Once
+	e.applicationDataBeforeDetachedCustody = func() {
+		publishedOnce.Do(func() { close(published) })
+		<-releasePublication
+	}
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releasePublication) }) })
+
+	sendDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("linearized-prefix-owner"))
+		sendDone <- err
+	}()
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("DATA did not reach the publication/custody boundary")
+	}
+	generation := e.beginSelectorCutover()
+
+	prepare := policyTxUnitPrepare(e, 0xd1, 0, fixture.selectorID, fixture.targetB)
+	digest, err := prepare.ProposalDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalAck := proto.PolicyAck{
+		PolicyTransactionBinding: prepare.PolicyTransactionBinding,
+		Phase:                    proto.PolicyAckPhaseFinal,
+		Code:                     proto.PolicyAckCodeAccept,
+		Generation:               1,
+		CurrentGeneration:        1,
+		SelectorGeneration:       1,
+		CurrentTargetID:          fixture.targetB,
+		ResolvedTargetID:         fixture.targetB,
+		ProposalDigest:           digest,
+		ReservationID:            proto.PolicyReservationID{0xd1},
+		CommitChallenge:          proto.PolicyCommitChallenge{0xd2},
+	}
+	finishDone := make(chan error, 1)
+	go func() {
+		_, sendErr := e.sendPolicyFinalWithExistingCutover(finalAck, generation)
+		finishDone <- sendErr
+	}()
+	select {
+	case sendErr := <-finishDone:
+		t.Fatalf("FINAL crossed a DATA publication still outside cutover custody: %v", sendErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(releasePublication) })
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatalf("SendData observed cutover: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendData did not transfer its published frame to replay custody")
+	}
+	select {
+	case sendErr := <-finishDone:
+		if sendErr != nil {
+			t.Fatalf("FINAL publication: %v", sendErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FINAL did not complete after publication custody settled")
+	}
+	eventuallyEngine(t, time.Second, func() bool { return fixture.handleA.dataWrites.Load() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	frames := fixture.handleA.Frames()
+	dataSequences := make([]uint64, 0, 1)
+	finalIndex, dataIndex := -1, -1
+	for i, frame := range frames {
+		if len(frame) < proto.HeaderSize {
+			continue
+		}
+		header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if decodeErr != nil {
+			continue
+		}
+		if header.Type == proto.FrameData {
+			dataSequences = append(dataSequences, header.Seq)
+			if dataIndex < 0 {
+				dataIndex = i
+			}
+		}
+		if header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlPolicyAck {
+			ack, decodeErr := proto.DecodePolicyAck(frame[proto.HeaderSize:])
+			if decodeErr == nil && ack.Phase == proto.PolicyAckPhaseFinal {
+				finalIndex = i
+			}
+		}
+	}
+	if !slices.Equal(dataSequences, []uint64{0}) {
+		t.Fatalf("SEQ ownership duplicated across direct dispatch and replay: %v", dataSequences)
+	}
+	if finalIndex < 0 || dataIndex < 0 || finalIndex >= dataIndex {
+		t.Fatalf("physical order final/data=%d/%d, want FINAL before replayed DATA", finalIndex, dataIndex)
+	}
+}
+
 func TestDetachedStreamStartedDuringPendingCutoverIsHandedOff(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
 
 	generation := e.beginSelectorCutover()
-	baseline, handedOffAtStart := e.beginDetachedStreamDispatch()
-	defer e.completeDetachedStreamDispatch()
+	ticket := e.beginDetachedStreamDispatch()
+	defer e.completeDetachedStreamDispatch(ticket)
 	defer e.finishSelectorCutover(generation)
 
-	if !handedOffAtStart {
-		t.Fatal("dispatch started during pending cutover did not inherit handoff")
-	}
-	if !e.detachedStreamDispatchHandedOff(baseline, handedOffAtStart) {
+	if !e.detachedStreamDispatchHandedOff(ticket) {
 		t.Fatal("dispatch started during pending cutover escaped replay custody")
 	}
+}
+
+func TestDispatchCustodyIsClaimedByOnlyOneSequentialCutover(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	detached := e.beginDetachedStreamDispatch()
+	e.selectorCutoverMu.Lock()
+	accepted := e.nextDispatchCustodyTicketLocked()
+	e.admitAcceptedPacketDispatchLocked(accepted)
+	e.selectorCutoverMu.Unlock()
+
+	first := e.beginSelectorCutover()
+	if !e.selectorCutoverDidHandoff(first) || !e.detachedStreamDispatchHandedOff(detached) {
+		t.Fatal("first generation did not claim both outstanding dispatch kinds")
+	}
+	e.finishSelectorCutover(first)
+	second := e.beginSelectorCutover()
+	if e.selectorCutoverDidHandoff(second) {
+		t.Fatal("second generation reclaimed dispatches already owned by first")
+	}
+	e.finishSelectorCutover(second)
+
+	e.completeDetachedStreamDispatch(detached)
+	e.completeAcceptedPacketDispatch(accepted)
+}
+
+func TestNewDispatchAfterClaimBelongsToNextCutover(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	firstTicket := e.beginDetachedStreamDispatch()
+	first := e.beginSelectorCutover()
+	e.finishSelectorCutover(first)
+	secondTicket := e.beginDetachedStreamDispatch()
+	second := e.beginSelectorCutover()
+	if !e.selectorCutoverDidHandoff(second) ||
+		!e.detachedStreamDispatchHandedOff(firstTicket) ||
+		!e.detachedStreamDispatchHandedOff(secondTicket) {
+		t.Fatal("second generation did not claim the newly admitted dispatch")
+	}
+	e.finishSelectorCutover(second)
+	e.completeDetachedStreamDispatch(firstTicket)
+	e.completeDetachedStreamDispatch(secondTicket)
+}
+
+func TestReplayOwnedHandoffDoesNotMintAnotherReplayObligation(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+
+	replayGeneration := e.beginSelectorCutover()
+	if !e.handoffSelectorCutoverDispatch(replayGeneration, true) ||
+		!e.selectorCutoverDidHandoff(replayGeneration) ||
+		e.selectorCutoverRequiresReplay(replayGeneration) {
+		t.Fatal("replay-owned handoff minted another replay obligation")
+	}
+	e.finishSelectorCutover(replayGeneration)
+
+	freshGeneration := e.beginSelectorCutover()
+	if !e.handoffSelectorCutoverDispatch(freshGeneration, false) ||
+		!e.selectorCutoverRequiresReplay(freshGeneration) {
+		t.Fatal("fresh publication handoff did not retain replay responsibility")
+	}
+	e.finishSelectorCutover(freshGeneration)
 }
 
 func TestDetachedStreamPublishedDuringPendingCutoverWaitsForReplay(t *testing.T) {

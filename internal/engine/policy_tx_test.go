@@ -45,6 +45,7 @@ func TestPolicyCommitChallengeEntropyFailsClosed(t *testing.T) {
 
 type policyTxUnitAckObservation struct {
 	ack        proto.PolicyAck
+	seq        uint64
 	pathName   string
 	activePath uint32
 	generation uint64
@@ -82,6 +83,7 @@ func (r *policyTxUnitAckRecorder) record(pathName string, frame []byte) {
 
 	observation := policyTxUnitAckObservation{
 		ack:        ack,
+		seq:        header.Seq,
 		pathName:   pathName,
 		activePath: r.engine.ActivePath(),
 	}
@@ -115,6 +117,8 @@ type policyTxUnitPath struct {
 	name        string
 	recorder    *policyTxUnitAckRecorder
 	dataWrites  atomic.Uint64
+	framesMu    sync.Mutex
+	frames      [][]byte
 	writeMu     sync.Mutex
 	beforeWrite func([]byte)
 	qualityMu   sync.RWMutex
@@ -171,6 +175,9 @@ func (p *policyTxUnitPath) Write(frame []byte) (int, error) {
 			p.dataWrites.Add(1)
 		}
 	}
+	p.framesMu.Lock()
+	p.frames = append(p.frames, append([]byte(nil), frame...))
+	p.framesMu.Unlock()
 	p.recorder.record(p.name, frame)
 	return len(frame), nil
 }
@@ -179,6 +186,16 @@ func (p *policyTxUnitPath) SetBeforeWrite(fn func([]byte)) {
 	p.writeMu.Lock()
 	p.beforeWrite = fn
 	p.writeMu.Unlock()
+}
+
+func (p *policyTxUnitPath) Frames() [][]byte {
+	p.framesMu.Lock()
+	defer p.framesMu.Unlock()
+	frames := make([][]byte, len(p.frames))
+	for i := range p.frames {
+		frames[i] = append([]byte(nil), p.frames[i]...)
+	}
+	return frames
 }
 
 func (p *policyTxUnitPath) Close() error {
@@ -274,6 +291,8 @@ type policyTxUnitFixture struct {
 	pathB      uint32
 	nameA      string
 	nameB      string
+	handleA    *policyTxUnitPath
+	handleB    *policyTxUnitPath
 }
 
 func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
@@ -290,7 +309,7 @@ func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
 		RootID: selector.ID,
 		Nodes:  []proto.GraphNode{selector, pathA, pathB},
 	}
-	engine, recorder, paths, _ := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
+	engine, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameA, nameB)
 	return &policyTxUnitFixture{
 		engine:     engine,
 		recorder:   recorder,
@@ -301,6 +320,8 @@ func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
 		pathB:      paths[nameB],
 		nameA:      nameA,
 		nameB:      nameB,
+		handleA:    handles[nameA],
+		handleB:    handles[nameB],
 	}
 }
 
@@ -400,10 +421,112 @@ func policyTxUnitRequireAck(t *testing.T, recorder *policyTxUnitAckRecorder, cal
 	if err != nil {
 		t.Fatalf("decode policy ACK: %v", err)
 	}
-	if len(after) != len(before)+1 {
-		t.Fatalf("policy ACK count=%d, want %d", len(after), len(before)+1)
+	if len(after) <= len(before) {
+		t.Fatalf("policy ACK count=%d, want at least %d", len(after), len(before)+1)
 	}
-	return after[len(before)]
+	newObservations := after[len(before):]
+	novel := make([]policyTxUnitAckObservation, 0, 1)
+	for _, observation := range newObservations {
+		seen := false
+		for _, prior := range before {
+			if observation.ack == prior.ack {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			novel = append(novel, observation)
+		}
+	}
+	if len(novel) > 1 {
+		t.Fatalf("policy handler published multiple novel ACKs: %+v", novel)
+	}
+	if len(novel) == 1 {
+		return novel[0]
+	}
+	// An idempotent duplicate transaction legitimately republishes the exact
+	// cached ACK. Any concurrent prefix replay is also byte-identical, so the
+	// first new observation is the response owned by this call.
+	return newObservations[0]
+}
+
+func policyTxUnitRequireExactReplayAck(
+	t *testing.T,
+	recorder *policyTxUnitAckRecorder,
+	want proto.PolicyAck,
+	call func() error,
+) policyTxUnitAckObservation {
+	t.Helper()
+	before, err := recorder.snapshot()
+	if err != nil {
+		t.Fatalf("decode prior policy ACK: %v", err)
+	}
+	if err := call(); err != nil {
+		t.Fatalf("policy handler: %v", err)
+	}
+	after, err := recorder.snapshot()
+	if err != nil {
+		t.Fatalf("decode policy ACK: %v", err)
+	}
+	if len(after) <= len(before) {
+		t.Fatalf("policy ACK count=%d, want at least %d", len(after), len(before)+1)
+	}
+	var exact policyTxUnitAckObservation
+	foundExact := false
+	for _, observation := range after[len(before):] {
+		if observation.ack == want {
+			exact = observation
+			foundExact = true
+			continue
+		}
+		known := false
+		for _, prior := range before {
+			if observation.ack == prior.ack {
+				known = true
+				break
+			}
+		}
+		if !known {
+			t.Fatalf("policy replay published unexpected novel ACK=%+v want %+v", observation.ack, want)
+		}
+	}
+	if foundExact {
+		return exact
+	}
+	t.Fatalf("policy replay did not publish exact ACK=%+v; new observations=%+v", want, after[len(before):])
+	return policyTxUnitAckObservation{}
+}
+
+func policyTxUnitRequireNoNewAckSequence(
+	t *testing.T,
+	recorder *policyTxUnitAckRecorder,
+	call func() error,
+) {
+	t.Helper()
+	before, err := recorder.snapshot()
+	if err != nil {
+		t.Fatalf("decode prior policy ACK: %v", err)
+	}
+	known := make(map[uint64]proto.PolicyAck, len(before))
+	for _, observation := range before {
+		known[observation.seq] = observation.ack
+	}
+	if err := call(); err != nil {
+		t.Fatalf("policy handler: %v", err)
+	}
+	after, err := recorder.snapshot()
+	if err != nil {
+		t.Fatalf("decode policy ACK: %v", err)
+	}
+	for _, observation := range after[len(before):] {
+		ack, exists := known[observation.seq]
+		if !exists {
+			t.Fatalf("policy handler minted ACK seq=%d ack=%+v", observation.seq, observation.ack)
+		}
+		if ack != observation.ack {
+			t.Fatalf("policy handler changed ACK at seq=%d: got=%+v want=%+v", observation.seq, observation.ack, ack)
+		}
+	}
 }
 
 func policyTxUnitRequireViolation(t *testing.T, err error) {
@@ -458,7 +581,42 @@ func TestPolicyTransactionCommitAppliesStateBeforeFinalAck(t *testing.T) {
 	}
 }
 
-func TestIncomingExactChildCommitOwnsBlockedDataBeforeFinalAck(t *testing.T) {
+func TestIncomingCommitReplaysPreviouslyDispatchedUnackedData(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	fixture.engine.tailReplayInitialDelay = time.Hour
+	fixture.engine.tailReplayMaxBackoff = time.Hour
+
+	payload := []byte("unacknowledged before committed route change")
+	if n, err := fixture.engine.SendData(payload); n != len(payload) || err != nil {
+		t.Fatalf("SendData=(%d,%v), want (%d,nil)", n, err, len(payload))
+	}
+	if got := fixture.handleA.dataWrites.Load(); got != 1 {
+		t.Fatalf("old child DATA writes=%d want 1", got)
+	}
+	if got := fixture.handleB.dataWrites.Load(); got != 0 {
+		t.Fatalf("new child received DATA before commit: %d", got)
+	}
+
+	prepare := policyTxUnitPrepare(fixture.engine, 0x46, 0, fixture.selectorID, fixture.targetB)
+	prepared := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyCommit(commit)
+	})
+	if final.ack.Phase != proto.PolicyAckPhaseFinal || final.ack.Code != proto.PolicyAckCodeAccept {
+		t.Fatalf("final ACK=%+v", final.ack)
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		return fixture.handleB.dataWrites.Load() == 1
+	})
+	if got := fixture.handleA.dataWrites.Load(); got != 1 {
+		t.Fatalf("old child DATA was duplicated after commit: %d", got)
+	}
+}
+
+func TestIncomingExactChildCommitPublishesFinalBeforeBlockedDataReplay(t *testing.T) {
 	const (
 		rootName = "incoming-exact-cutover-root"
 		nameA    = "incoming-exact-cutover-a"
@@ -519,11 +677,6 @@ func TestIncomingExactChildCommitOwnsBlockedDataBeforeFinalAck(t *testing.T) {
 	commitDone := make(chan error, 1)
 	go func() { commitDone <- e.handlePolicyCommit(commit) }()
 	select {
-	case <-bReplayStarted:
-	case <-time.After(time.Second):
-		t.Fatal("incoming exact-child commit did not replay blocked DATA on child B")
-	}
-	select {
 	case writeErr := <-writeDone:
 		if writeErr != nil {
 			t.Fatalf("application write observed incoming cutover: %v", writeErr)
@@ -531,26 +684,30 @@ func TestIncomingExactChildCommitOwnsBlockedDataBeforeFinalAck(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("application write did not transfer custody to incoming cutover")
 	}
+	var observations []policyTxUnitAckObservation
+	deadline := time.Now().Add(time.Second)
+	for {
+		var err error
+		observations, err = recorder.snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for i := range observations {
+			if observations[i].ack.Phase == proto.PolicyAckPhaseFinal && observations[i].ack.Code == proto.PolicyAckCodeAccept {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("successful FINAL remained blocked behind DATA replay")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	observations, err := recorder.snapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, observation := range observations {
-		if observation.ack.Phase == proto.PolicyAckPhaseFinal && observation.ack.Code == proto.PolicyAckCodeAccept {
-			t.Fatal("successful FINAL overtook blocked DATA replay")
-		}
-	}
-
-	releaseBOnce.Do(func() { close(releaseB) })
-	select {
-	case commitErr := <-commitDone:
-		if commitErr != nil {
-			t.Fatal(commitErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("incoming exact-child commit did not finish after replay")
-	}
-	observations, err = recorder.snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,9 +720,60 @@ func TestIncomingExactChildCommitOwnsBlockedDataBeforeFinalAck(t *testing.T) {
 	if final == nil || final.ack.Code != proto.PolicyAckCodeAccept || final.ack.CurrentTargetID != pathB.ID {
 		t.Fatalf("final ACK=%+v want accepted child B", final)
 	}
-	if final.activePath != paths[nameB] || e.ActivePath() != paths[nameB] || handles[nameB].dataWrites.Load() == 0 {
-		t.Fatalf("final route/active/B writes=%d/%d/%d want %d/%d/>0",
-			final.activePath, e.ActivePath(), handles[nameB].dataWrites.Load(), paths[nameB], paths[nameB])
+	if final.activePath != paths[nameB] || e.ActivePath() != paths[nameB] || e.MigrationCount() != 1 {
+		t.Fatalf("final route/active/migrations=%d/%d/%d want %d/%d/1",
+			final.activePath, e.ActivePath(), e.MigrationCount(), paths[nameB], paths[nameB])
+	}
+	select {
+	case <-bReplayStarted:
+	case <-time.After(time.Second):
+		t.Fatal("committed cutover did not start ordered DATA replay on child B")
+	}
+	select {
+	case commitErr := <-commitDone:
+		if commitErr != nil {
+			t.Fatal(commitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("policy worker remained blocked behind asynchronous prefix replay")
+	}
+	frontierBeforeLater := e.sendPublishedNext.Load()
+	laterDone := make(chan error, 1)
+	go func() {
+		_, err := e.SendData([]byte("later DATA must stay behind the frozen prefix"))
+		laterDone <- err
+	}()
+	select {
+	case err := <-laterDone:
+		t.Fatalf("later DATA crossed the blocked prefix replay: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if got := e.sendPublishedNext.Load(); got != frontierBeforeLater {
+		t.Fatalf("later DATA published at frontier %d while frozen prefix stopped at %d", got, frontierBeforeLater)
+	}
+	releaseBOnce.Do(func() { close(releaseB) })
+	eventuallyEngine(t, time.Second, func() bool { return handles[nameB].dataWrites.Load() > 0 })
+	select {
+	case laterErr := <-laterDone:
+		if laterErr != nil {
+			t.Fatalf("later DATA failed after replay barrier: %v", laterErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("later DATA did not resume after replay barrier")
+	}
+	frames := handles[nameB].Frames()
+	dataSeqs := make([]uint64, 0, 2)
+	for _, frame := range frames {
+		if len(frame) < proto.HeaderSize {
+			continue
+		}
+		header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if decodeErr == nil && header.Type == proto.FrameData {
+			dataSeqs = append(dataSeqs, header.Seq)
+		}
+	}
+	if len(dataSeqs) < 2 || dataSeqs[0] >= dataSeqs[1] {
+		t.Fatalf("new route DATA sequence order=%v, want frozen prefix before later publication", dataSeqs)
 	}
 	releaseAOnce.Do(func() { close(releaseA) })
 }
@@ -720,6 +928,10 @@ func TestPolicyClassSelectionFreezesOwnerChoiceAndRejectsStaleCommit(t *testing.
 	// ambiguous under the same proposal digest.
 	handles[nameA].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
 	handles[nameB].SetQuality(transport.PathQuality{RTT: 100 * time.Millisecond, At: now})
+	e.policyStateMu.Lock()
+	prepareReplay := e.policyIncoming.prepareReplay
+	e.policyStateMu.Unlock()
+	allowPolicyReplayNow(e, prepareReplay)
 	replayed := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
 	if replayed.ack.ResolvedTargetID != pathB.ID || replayed.ack.ReservationID != first.ack.ReservationID ||
 		replayed.ack.Generation != first.ack.Generation {
@@ -943,9 +1155,12 @@ func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
 	generation := e.policyGeneration
 	selected := e.policySelections[selector.ID]
 	completed := len(e.policyCompleted)
+	completedTx, completedOK := e.policyCompleted[prepare.TransactionID]
 	e.policyStateMu.Unlock()
-	if pending == nil || !pending.committed || generation != 1 || selected != peak.ID || completed != 0 {
-		t.Fatalf("expiry changed committed replay state: pending=%+v generation=%d selected=%x completed=%d", pending, generation, selected, completed)
+	if pending != nil || generation != 1 || selected != peak.ID || completed != 1 || !completedOK ||
+		completedTx.finalAck.Code != proto.PolicyAckCodeAccept || completedTx.finalAck.Generation != 1 {
+		t.Fatalf("expiry changed committed replay state: pending=%+v generation=%d selected=%x completed=%d final=%+v",
+			pending, generation, selected, completed, completedTx.finalAck)
 	}
 	close(releaseReplay)
 	select {
@@ -1015,12 +1230,16 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 	type peakObservation struct {
 		selectorID proto.TargetID
 		targetID   proto.TargetID
+		generation uint64
 		peak       bool
 		cause      string
 	}
 	observed := make(chan peakObservation, 2)
-	e.SetPeakPolicyObserver(func(selectorID, targetID proto.TargetID, peak bool, cause string) {
-		observed <- peakObservation{selectorID: selectorID, targetID: targetID, peak: peak, cause: cause}
+	e.SetPeakPolicyObserver(func(selectorID, targetID proto.TargetID, generation uint64, peak bool, cause string) {
+		observed <- peakObservation{
+			selectorID: selectorID, targetID: targetID, generation: generation,
+			peak: peak, cause: cause,
+		}
 	})
 
 	replayInjected := make(chan struct{})
@@ -1080,7 +1299,7 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 	}
 	select {
 	case got := <-observed:
-		if got.selectorID != selector.ID || got.targetID != peak.ID || !got.peak || got.cause != cause {
+		if got.selectorID != selector.ID || got.targetID != peak.ID || got.generation != 2 || !got.peak || got.cause != cause {
 			t.Fatalf("peak observation=%+v want selector=%x target=%x peak=true cause=%q", got, selector.ID, peak.ID, cause)
 		}
 	default:
@@ -1099,7 +1318,7 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 	}
 	select {
 	case got := <-observed:
-		if got.selectorID != selector.ID || got.targetID != normal.ID || got.peak || got.cause != "probe-starved-data" {
+		if got.selectorID != selector.ID || got.targetID != normal.ID || got.generation != 3 || got.peak || got.cause != "probe-starved-data" {
 			t.Fatalf("factual departure observation=%+v want selector=%x target=%x peak=false", got, selector.ID, normal.ID)
 		}
 	case <-time.After(time.Second):
@@ -1113,7 +1332,11 @@ func TestPolicyTransactionDuplicatePrepareAndCommitAreIdempotent(t *testing.T) {
 	firstPrepare := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyPrepare(prepare)
 	})
-	duplicatePrepare := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+	fixture.engine.policyStateMu.Lock()
+	prepareReplay := fixture.engine.policyIncoming.prepareReplay
+	fixture.engine.policyStateMu.Unlock()
+	allowPolicyReplayNow(fixture.engine, prepareReplay)
+	duplicatePrepare := policyTxUnitRequireExactReplayAck(t, fixture.recorder, firstPrepare.ack, func() error {
 		return fixture.engine.handlePolicyPrepare(prepare)
 	})
 	if duplicatePrepare.ack != firstPrepare.ack {
@@ -1124,7 +1347,11 @@ func TestPolicyTransactionDuplicatePrepareAndCommitAreIdempotent(t *testing.T) {
 	firstFinal := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyCommit(commit)
 	})
-	duplicateFinal := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+	fixture.engine.policyStateMu.Lock()
+	finalReplay := fixture.engine.policyCompleted[prepare.TransactionID].finalReplay
+	fixture.engine.policyStateMu.Unlock()
+	allowPolicyReplayNow(fixture.engine, finalReplay)
+	duplicateFinal := policyTxUnitRequireExactReplayAck(t, fixture.recorder, firstFinal.ack, func() error {
 		return fixture.engine.handlePolicyCommit(commit)
 	})
 	if duplicateFinal.ack != firstFinal.ack {
@@ -1137,6 +1364,61 @@ func TestPolicyTransactionDuplicatePrepareAndCommitAreIdempotent(t *testing.T) {
 	if got := fixture.engine.MigrationCount(); got != 1 {
 		t.Fatalf("duplicate COMMIT applied dispatch %d times, want 1", got)
 	}
+}
+
+func TestPolicyCompletedEvictionTombstonesExactLateDuplicates(t *testing.T) {
+	fixture := newPolicyTxUnitFixture(t)
+	prepare := policyTxUnitPrepare(fixture.engine, 0x31, 0, fixture.selectorID, fixture.targetB)
+	prepared := policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(prepare)
+	})
+	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
+	policyTxUnitRequireAck(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyCommit(commit)
+	})
+
+	fixture.engine.policyStateMu.Lock()
+	for i := 0; i < policyCompletedLimit; i++ {
+		filler := prepare
+		filler.TransactionID = [16]byte{0x80, byte(i), byte(i >> 8)}
+		digest, err := filler.ProposalDigest()
+		if err != nil {
+			fixture.engine.policyStateMu.Unlock()
+			t.Fatal(err)
+		}
+		fixture.engine.rememberPolicyCompletedLocked(completedPolicyTransaction{
+			prepare: filler,
+			digest:  digest,
+		})
+	}
+	_, completed := fixture.engine.policyCompleted[prepare.TransactionID]
+	tombstone, tombstoned := fixture.engine.policyTombstones[prepare.TransactionID]
+	fixture.engine.policyStateMu.Unlock()
+	if completed || !tombstoned || !tombstone.prepareSeen || !tombstone.commitSeen {
+		t.Fatalf("evicted transaction completed=%t tombstoned=%t tombstone=%+v", completed, tombstoned, tombstone)
+	}
+
+	policyTxUnitRequireNoNewAckSequence(t, fixture.recorder, func() error {
+		if err := fixture.engine.handlePolicyPrepare(prepare); err != nil {
+			return err
+		}
+		return fixture.engine.handlePolicyCommit(commit)
+	})
+
+	changedPrepare := prepare
+	changedPrepare.Cause = "changed-after-retirement"
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyPrepare(changedPrepare))
+	changedCommit := commit
+	changedCommit.CommitChallenge[0] ^= 0xff
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(changedCommit))
+}
+
+func allowPolicyReplayNow(e *Engine, record *policyReplayRecord) {
+	e.policyReplayMu.Lock()
+	if record != nil {
+		record.lastTry = time.Time{}
+	}
+	e.policyReplayMu.Unlock()
 }
 
 func TestPolicyTransactionRejectsTxIDReuseWithDifferentContent(t *testing.T) {
@@ -1224,11 +1506,23 @@ func TestPolicyTransactionCrossedTransactionsAreBusy(t *testing.T) {
 		if busyPrepare.ack.Phase != proto.PolicyAckPhasePrepare || busyPrepare.ack.Code != proto.PolicyAckCodeBusy {
 			t.Fatalf("crossed PREPARE ACK=%+v", busyPrepare.ack)
 		}
-		busyCommit := policyTxUnitRequireAck(t, fixture.recorder, func() error {
-			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, crossed, firstAck.ack.Generation, firstAck.ack.ReservationID))
+		fixture.engine.policyStateMu.Lock()
+		busyReplay := fixture.engine.policyCompleted[crossed.TransactionID].prepareReplay
+		fixture.engine.policyStateMu.Unlock()
+		allowPolicyReplayNow(fixture.engine, busyReplay)
+		busyReplayAck := policyTxUnitRequireExactReplayAck(t, fixture.recorder, busyPrepare.ack, func() error {
+			return fixture.engine.handlePolicyPrepare(crossed)
 		})
-		if busyCommit.ack.Phase != proto.PolicyAckPhaseFinal || busyCommit.ack.Code != proto.PolicyAckCodeBusy {
-			t.Fatalf("crossed COMMIT ACK=%+v", busyCommit.ack)
+		if busyReplayAck.seq != busyPrepare.seq {
+			t.Fatalf("crossed PREPARE replay seq=%d want=%d", busyReplayAck.seq, busyPrepare.seq)
+		}
+		beforeCommit, _ := fixture.recorder.snapshot()
+		policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(
+			policyTxUnitCommit(t, crossed, firstAck.ack.Generation, firstAck.ack.ReservationID),
+		))
+		afterCommit, _ := fixture.recorder.snapshot()
+		if len(afterCommit) != len(beforeCommit) {
+			t.Fatal("COMMIT after rejected PREPARE emitted an ACK")
 		}
 		final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 			return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, first, firstAck.ack.Generation, firstAck.ack.ReservationID))
@@ -1504,6 +1798,9 @@ func TestPolicyTransactionCompletedCacheIsBounded(t *testing.T) {
 	if len(engine.policyCompleted) != policyCompletedLimit || len(engine.policyCompletedOrder) != policyCompletedLimit {
 		t.Fatalf("completed cache map/order=%d/%d want %d/%d", len(engine.policyCompleted), len(engine.policyCompletedOrder), policyCompletedLimit, policyCompletedLimit)
 	}
+	if len(engine.policyTombstones) != extra || len(engine.policyTombstoneOrder) != extra {
+		t.Fatalf("tombstone map/order=%d/%d want %d/%d", len(engine.policyTombstones), len(engine.policyTombstoneOrder), extra, extra)
+	}
 	for _, evicted := range inserted[:extra] {
 		if _, ok := engine.policyCompleted[evicted]; ok {
 			t.Fatalf("old completed transaction %x was not evicted", evicted)
@@ -1515,6 +1812,33 @@ func TestPolicyTransactionCompletedCacheIsBounded(t *testing.T) {
 		}
 		if _, ok := engine.policyCompleted[want]; !ok {
 			t.Fatalf("recent completed transaction %x was evicted", want)
+		}
+	}
+}
+
+func TestPolicyTransactionTombstonesAreBounded(t *testing.T) {
+	engine := &Engine{}
+	const extra = 3
+	inserted := make([][16]byte, policyTombstoneLimit+extra)
+	engine.policyStateMu.Lock()
+	for i := range inserted {
+		inserted[i] = [16]byte{byte(i), byte(i >> 8), 1}
+		engine.rememberPolicyTombstoneLocked(completedPolicyTransaction{
+			prepare: proto.PolicyPrepare{
+				PolicyTransactionBinding: proto.PolicyTransactionBinding{TransactionID: inserted[i]},
+			},
+		})
+	}
+	engine.policyStateMu.Unlock()
+
+	engine.policyStateMu.Lock()
+	defer engine.policyStateMu.Unlock()
+	if len(engine.policyTombstones) != policyTombstoneLimit || len(engine.policyTombstoneOrder) != policyTombstoneLimit {
+		t.Fatalf("tombstone map/order=%d/%d want %d/%d", len(engine.policyTombstones), len(engine.policyTombstoneOrder), policyTombstoneLimit, policyTombstoneLimit)
+	}
+	for _, evicted := range inserted[:extra] {
+		if _, ok := engine.policyTombstones[evicted]; ok {
+			t.Fatalf("old policy tombstone %x was not evicted", evicted)
 		}
 	}
 }
@@ -1654,7 +1978,7 @@ func TestPolicyTransactionProposalDigestPreventsExpiryABA(t *testing.T) {
 	}
 }
 
-func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
+func TestPolicyTombstonePreventsExactCacheEvictionABA(t *testing.T) {
 	fixture := newPolicyTxUnitFixture(t)
 	oldPrepare := policyTxUnitPrepare(fixture.engine, 42, 0, fixture.selectorID, fixture.targetB)
 	oldAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
@@ -1676,16 +2000,29 @@ func TestPolicyReservationPreventsExactCacheEvictionABA(t *testing.T) {
 		fixture.engine.policyStateMu.Unlock()
 	}
 
+	policyTxUnitRequireNoNewAckSequence(t, fixture.recorder, func() error {
+		return fixture.engine.handlePolicyPrepare(oldPrepare)
+	})
+	changed := oldPrepare
+	changed.Cause = "changed-after-cache-eviction"
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyPrepare(changed))
+	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(
+		policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation, oldAck.ack.ReservationID),
+	))
+	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != fixture.targetA || pending {
+		t.Fatalf("tombstoned transaction changed state: generation=%d selection=%x pending=%v", generation, selection, pending)
+	}
+
 	newPrepare := oldPrepare
+	newPrepare.TransactionID = [16]byte{43}
 	newAck := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyPrepare(newPrepare)
 	})
 	if newAck.ack.ReservationID == oldAck.ack.ReservationID {
-		t.Fatal("reaccepted proposal reused the expired owner reservation")
+		t.Fatal("new transaction reused the expired owner reservation")
 	}
-	policyTxUnitRequireViolation(t, fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, oldPrepare, oldAck.ack.Generation, oldAck.ack.ReservationID)))
 	if generation, selection, pending, _ := policyTxUnitState(fixture.engine, fixture.selectorID); generation != 0 || selection != fixture.targetA || !pending {
-		t.Fatalf("delayed old COMMIT changed new pending state: generation=%d selection=%x pending=%v", generation, selection, pending)
+		t.Fatalf("new transaction did not obtain pending state: generation=%d selection=%x pending=%v", generation, selection, pending)
 	}
 	final := policyTxUnitRequireAck(t, fixture.recorder, func() error {
 		return fixture.engine.handlePolicyCommit(policyTxUnitCommit(t, newPrepare, newAck.ack.Generation, newAck.ack.ReservationID))
@@ -1726,6 +2063,7 @@ func TestPolicyFinalAckRequiresCommitReceipt(t *testing.T) {
 		PolicyTransactionBinding: prepare.PolicyTransactionBinding,
 		Code:                     proto.PolicyAckCodeAccept,
 		Generation:               1,
+		SelectorGeneration:       1,
 		ResolvedTargetID:         fixture.targetB,
 		ProposalDigest:           digest,
 		ReservationID:            proto.PolicyReservationID{1},
@@ -1735,6 +2073,7 @@ func TestPolicyFinalAckRequiresCommitReceipt(t *testing.T) {
 	finalAck := base
 	finalAck.Phase = proto.PolicyAckPhaseFinal
 	finalAck.CurrentGeneration = 1
+	finalAck.SelectorGeneration = 2
 	finalAck.CurrentTargetID = fixture.targetB
 	finalAck.CommitChallenge = proto.PolicyCommitChallenge{0x44}
 	for i := 0; i < 32; i++ {

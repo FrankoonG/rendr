@@ -193,6 +193,8 @@ func policyTransactionFuzzSeeds(t testing.TB) []protocolFuzzSeed {
 		Phase:                    PolicyAckPhasePrepare,
 		Code:                     PolicyAckCodeAccept,
 		Generation:               1,
+		SelectorGeneration:       1,
+		CurrentTargetID:          TargetID{1},
 		ResolvedTargetID:         TargetID{2},
 		ProposalDigest:           testPolicyProposalDigest(),
 		ReservationID:            testPolicyReservationID(),

@@ -38,22 +38,56 @@ func (m *sequencerMutex) Unlock() {
 
 func (m *sequencerMutex) lockApplication(e *Engine) error {
 	m.initialize()
-	select {
-	case <-m.permit:
-		return nil
-	default:
-	}
 	for {
-		deadline, wake, expired := e.writeDeadlineSnapshot()
+		select {
+		case <-m.permit:
+		default:
+			acquired := false
+			for !acquired {
+				deadline, wake, expired := e.writeDeadlineSnapshot()
+				if expired {
+					return ErrWriteDeadlineExceeded
+				}
+				timer, timerC := writeDeadlineTimer(deadline)
+				select {
+				case <-m.permit:
+					stopDeadlineTimer(timer)
+					acquired = true
+				case <-wake:
+					stopDeadlineTimer(timer)
+				case <-timerC:
+				case <-e.closed:
+					stopDeadlineTimer(timer)
+					if err := e.CloseErr(); err != nil {
+						return err
+					}
+					return net.ErrClosed
+				}
+			}
+		}
+
+		target, replayWake := e.replayPublicationBarrierSnapshot()
+		if target == 0 {
+			return nil
+		}
+		if e.sendAckNext.Load() >= target {
+			e.completeReplayPublicationBarrier(e.sendAckNext.Load())
+			return nil
+		}
+
+		// Policy controls must remain able to preempt the replay that owns this
+		// barrier. Return the sequencer permit while only the application caller
+		// waits, then re-acquire and revalidate before allocating its SEQ.
+		m.Unlock()
+		deadline, deadlineWake, expired := e.writeDeadlineSnapshot()
 		if expired {
 			return ErrWriteDeadlineExceeded
 		}
 		timer, timerC := writeDeadlineTimer(deadline)
 		select {
-		case <-m.permit:
+		case <-replayWake:
 			stopDeadlineTimer(timer)
-			return nil
-		case <-wake:
+		case <-deadlineWake:
 			stopDeadlineTimer(timer)
 		case <-timerC:
 		case <-e.closed:

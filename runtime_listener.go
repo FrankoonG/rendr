@@ -78,7 +78,8 @@ type acceptedStreamConn struct {
 	Conn
 	MigrationController
 	ConnectionObserver
-	engine *engine.Engine
+	engine        *engine.Engine
+	peakAdmission *listenerPeakTransferAdmission
 }
 
 // CloseWrite preserves the optional stream half-close surface across the
@@ -687,7 +688,7 @@ func (l *SessionListener) handleRuntimeHello(
 	if err := e.MirrorPeerGraphForLocal(); err != nil {
 		return false
 	}
-	installPeakTransferPeerAdmission(e)
+	peakAdmission := installPeakTransferPeerAdmission(e)
 	e.SetLocalInstanceID(l.runtime.instanceID)
 	e.SetPeerKind(engine.PeerRendr)
 	if err := e.SetPeerInstanceID(hello.InstanceID); err != nil {
@@ -749,6 +750,7 @@ func (l *SessionListener) handleRuntimeHello(
 		MigrationController: base,
 		ConnectionObserver:  base,
 		engine:              e,
+		peakAdmission:       peakAdmission,
 	}
 	if l.publishStream(inflightID, conn) {
 		slotHeld = false

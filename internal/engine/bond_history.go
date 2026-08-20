@@ -21,7 +21,16 @@ const (
 	// metadata. Both credits must be available before publication.
 	sendHistoryByteLimit = 64 << 20
 )
-const sendControlReserve = 8
+const (
+	sendControlReserve = 8
+	// One FINAL can sit immediately beyond an already-ACKed PREPARE while a
+	// preceding DATA gap blocks cumulative ACK. Every later committed policy
+	// transaction necessarily retains one PREPARE response in the ordinary
+	// control reserve, so that reserve plus the first FINAL is the exact bounded
+	// emergency cardinality. Keep this coupled to the causal credit, not the
+	// independent completed-transaction cache size.
+	sendPolicyFinalReserve = sendControlReserve + 1
+)
 const unknownApplicationBytes = ^uint64(0)
 
 const (
@@ -145,6 +154,7 @@ type sendHistoryEntry struct {
 	frame                 []byte
 	application           bool
 	control               bool
+	policyFinal           bool
 	terminal              bool
 	priorProof            proto.AckProof
 	proof                 proto.AckProof
@@ -210,22 +220,26 @@ type batchDispatchAttributionReceipt struct {
 // observe it. Caller holds sendMu, while ACK processing owns sendHistMu so it
 // can release backpressure without waiting behind an in-flight path write.
 func (e *Engine) reserveSendFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, false, false, false, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, false, false, false, false, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 func (e *Engine) reserveTerminalFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, true, false, false, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, true, false, false, false, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 // reserveOwnedSendFrame transfers an otherwise-unaliased frame to the replay
 // ledger. PathConn.Write follows io.Writer and may neither retain nor mutate
 // the borrowed bytes, so dispatch can read the ledger-owned frame directly.
 func (e *Engine) reserveOwnedSendFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, false, true, false, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, false, true, false, false, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 func (e *Engine) reserveAndPublishOwnedSendFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, false, true, true, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, false, true, true, false, rootDataAttribution{}, unknownApplicationBytes)
+}
+
+func (e *Engine) reserveAndPublishOwnedPolicyFinalFrame(frame []byte) error {
+	return e.reserveSendFrameClass(frame, false, true, true, true, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 func (e *Engine) reserveOwnedApplicationFrame(
@@ -236,7 +250,7 @@ func (e *Engine) reserveOwnedApplicationFrame(
 	if applicationBytes < 0 {
 		return errors.New("engine: negative application payload size")
 	}
-	return e.reserveSendFrameClass(frame, false, true, false, attribution, uint64(applicationBytes))
+	return e.reserveSendFrameClass(frame, false, true, false, false, attribution, uint64(applicationBytes))
 }
 
 func (e *Engine) reserveAndPublishOwnedApplicationFrame(
@@ -247,20 +261,20 @@ func (e *Engine) reserveAndPublishOwnedApplicationFrame(
 	if applicationBytes < 0 {
 		return errors.New("engine: negative application payload size")
 	}
-	return e.reserveSendFrameClass(frame, false, true, true, attribution, uint64(applicationBytes))
+	return e.reserveSendFrameClass(frame, false, true, true, false, attribution, uint64(applicationBytes))
 }
 
 func (e *Engine) reserveOwnedTerminalFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, true, true, false, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, true, true, false, false, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 func (e *Engine) reserveAndPublishOwnedTerminalFrame(frame []byte) error {
-	return e.reserveSendFrameClass(frame, true, true, true, rootDataAttribution{}, unknownApplicationBytes)
+	return e.reserveSendFrameClass(frame, true, true, true, false, rootDataAttribution{}, unknownApplicationBytes)
 }
 
 func (e *Engine) reserveSendFrameClass(
 	frame []byte,
-	terminal, takeOwnership, publish bool,
+	terminal, takeOwnership, publish, policyFinal bool,
 	attribution rootDataAttribution,
 	applicationBytes uint64,
 ) error {
@@ -279,6 +293,7 @@ func (e *Engine) reserveSendFrameClass(
 		seq:           hdr.Seq,
 		frame:         ledgerFrame,
 		control:       hdr.Type == proto.FrameCtrl,
+		policyFinal:   policyFinal,
 		terminal:      terminal,
 		priorProof:    e.sendProof,
 		rootCohort:    attribution.cohort,
@@ -300,7 +315,10 @@ func (e *Engine) reserveSendFrameClass(
 	if e.closing.Load() {
 		return net.ErrClosed
 	}
-	limit := sendHistoryWindow + sendControlReserve
+	if policyFinal && !entry.control {
+		return errors.New("engine: policy FINAL replay credit used by non-control frame")
+	}
+	limit := sendHistoryWindow + sendControlReserve + sendPolicyFinalReserve
 	if terminal {
 		limit++
 	}
@@ -389,7 +407,7 @@ func (e *Engine) rollbackReservedSendFrame(seq uint64) bool {
 	e.sendHist.entries = e.sendHist.entries[:last]
 	e.sendHistMu.Unlock()
 	if !entry.terminal {
-		e.releaseSendSlot(entry.control, len(entry.frame))
+		e.releaseSendCredit(entry.control, entry.policyFinal, len(entry.frame))
 	}
 	return true
 }
@@ -502,7 +520,33 @@ func (e *Engine) acquireSendSlot(control bool, frameBytes int) error {
 	}
 }
 
+func (e *Engine) acquirePolicyFinalSlot() error {
+	select {
+	case e.sendPolicyFinalSlots <- struct{}{}:
+		return nil
+	case <-e.closed:
+		return net.ErrClosed
+	}
+}
+
 func (e *Engine) releaseSendSlot(control bool, frameBytes int) {
+	e.releaseSendCredit(control, false, frameBytes)
+}
+
+func (e *Engine) releaseSendCredit(control, policyFinal bool, frameBytes int) {
+	if policyFinal {
+		e.sendHistMu.Lock()
+		select {
+		case <-e.sendPolicyFinalSlots:
+		default:
+			if !e.closing.Load() {
+				e.sendHistMu.Unlock()
+				panic("engine: policy FINAL replay credit invariant violated")
+			}
+		}
+		e.sendHistMu.Unlock()
+		return
+	}
 	if control {
 		e.sendHistMu.Lock()
 		select {
@@ -1371,6 +1415,15 @@ control:
 		select {
 		case <-e.sendControlSlots:
 		default:
+			goto policyFinal
+		}
+	}
+
+policyFinal:
+	for {
+		select {
+		case <-e.sendPolicyFinalSlots:
+		default:
 			e.sendHistMu.Unlock()
 			return
 		}
@@ -1489,7 +1542,11 @@ func (e *Engine) acknowledgeSendFrames(nextSeq uint64, proof proto.AckProof) (va
 			continue
 		}
 		if entry.control {
-			<-e.sendControlSlots
+			if entry.policyFinal {
+				<-e.sendPolicyFinalSlots
+			} else {
+				<-e.sendControlSlots
+			}
 			e.sendHist.entries[i] = sendHistoryEntry{}
 			continue
 		}
@@ -1542,5 +1599,6 @@ func (e *Engine) acknowledgeSendFrames(nextSeq uint64, proof proto.AckProof) (va
 	e.sendCreditWake = make(chan struct{})
 	close(wake)
 	e.sendHistMu.Unlock()
+	e.completeReplayPublicationBarrier(nextSeq)
 	return true, application
 }

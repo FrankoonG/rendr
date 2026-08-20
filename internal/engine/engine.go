@@ -123,6 +123,7 @@ type Engine struct {
 	sendHist                sendHistory
 	sendSlots               chan struct{}
 	sendControlSlots        chan struct{}
+	sendPolicyFinalSlots    chan struct{}
 	sendCreditWake          chan struct{}
 	packetWritesInFlight    atomic.Int64
 	packetFrameLimit        atomic.Int64
@@ -142,6 +143,13 @@ type Engine struct {
 	// boundedReplayBeforeSnapshot is a deterministic package-test hook.
 	// Tests install it before queuing replay and never mutate it concurrently.
 	boundedReplayBeforeSnapshot func()
+	// replayPublicationBeforeComplete is a deterministic package-test hook.
+	// It runs after a replay has covered its frozen frontier but before the
+	// generation-bound publication barrier is completed.
+	replayPublicationBeforeComplete func(replayPublicationBarrierToken)
+	// replayQueueForTest observes coalesced replay obligations after publication.
+	// Tests install it before concurrent activity and never mutate it later.
+	replayQueueForTest func(replayRequest)
 	// connectionObservationAfterTopology is a deterministic package-test hook.
 	// It runs after the first topology sample and before replay/root sampling.
 	connectionObservationAfterTopology func()
@@ -155,6 +163,14 @@ type Engine struct {
 	// acceptedPacketAfterRouteSnapshot is a deterministic package-test hook.
 	// It runs after route lookup and before accepted-packet cutover custody.
 	acceptedPacketAfterRouteSnapshot func()
+	// applicationDataBeforeDetachedCustody is a deterministic package-test
+	// hook. It runs after DATA publication while sendMu is still held and before
+	// the detached dispatch acquires selector-cutover custody.
+	applicationDataBeforeDetachedCustody func()
+	// selectorCutoverBeforeWait is a deterministic package-test hook. It runs
+	// after a contender observes the currently owned generation and before it
+	// waits for that generation to finish.
+	selectorCutoverBeforeWait func(uint64)
 	// activationAfterPredecessorDrain is a deterministic package-test hook.
 	// Tests install it before activation and never mutate it concurrently.
 	activationAfterPredecessorDrain func()
@@ -177,12 +193,19 @@ type Engine struct {
 	replayAckGap                    bool
 	replayAckSeen                   bool
 	replayAckVersion                uint64
-	replayWake                      chan struct{}
-	replayAckWake                   chan struct{}
-	gapReplayBackoff                time.Duration
-	tailReplay                      tailReplayLease
-	tailReplayInitialDelay          time.Duration
-	tailReplayMaxBackoff            time.Duration
+	// replayPublicationBarrier blocks later application SEQ publication until
+	// its exact frozen-prefix generation has either been sent on the committed
+	// route or cumulatively acknowledged. Policy controls retain their
+	// independent progress lane and may preempt a blocked replay.
+	replayPublicationBarrier    replayPublicationBarrierToken
+	replayPublicationGeneration uint64
+	replayPublicationWake       chan struct{}
+	replayWake                  chan struct{}
+	replayAckWake               chan struct{}
+	gapReplayBackoff            time.Duration
+	tailReplay                  tailReplayLease
+	tailReplayInitialDelay      time.Duration
+	tailReplayMaxBackoff        time.Duration
 	// tailReplayBeforeDispatch is a deterministic package-test hook. Tests
 	// install it before publishing frames and never mutate it concurrently.
 	tailReplayBeforeDispatch func(seq, target uint64)
@@ -298,28 +321,41 @@ type Engine struct {
 	policyInbox          chan policyMessage
 	policyQueueMu        sync.Mutex
 	policyQueued         map[policyMessageKey]struct{}
+	policyReplayMu       sync.Mutex
+	policyReplayRecords  map[policyReplayKey]*policyReplayRecord
+	policyReplayCount    int
+	policyReplayBytes    int
+	policyTombstones     map[[16]byte]policyTransactionTombstone
+	policyTombstoneOrder [][16]byte
+	// policyReplayNow is a deterministic package-test clock installed before
+	// policy response publication. Production leaves it nil and uses nowFn.
+	policyReplayNow      func() time.Time
 	policyAdmissionMu    sync.RWMutex
 	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
 	peakPolicyObserverMu sync.RWMutex
-	peakPolicyObserver   func(selectorID, targetID proto.TargetID, peak bool, cause string)
+	peakPolicyObserver   func(selectorID, targetID proto.TargetID, selectorGeneration uint64, peak bool, cause string)
 	// Deterministic package-test hooks installed before concurrent activity.
-	selectorDecisionAfterCommit func()
-	policyCommitBeforeOwnerLock func()
-	policyCommitAfterPublish    func()
-	selectorCutoverMu           sync.Mutex
-	selectorCutoverGeneration   uint64
-	detachedDispatchHandoffGen  uint64
-	selectorCutoverPending      bool
-	selectorCutoverHandedOff    bool
+	selectorDecisionAfterCommit   func()
+	policyCommitBeforeOwnerLock   func()
+	policyCommitAfterPublish      func()
+	selectorCutoverMu             sync.Mutex
+	selectorCutoverGeneration     uint64
+	dispatchTicketIssued          uint64
+	dispatchTicketClaimedThrough  uint64
+	dispatchTicketsUnclaimed      uint64
+	selectorCutoverPending        bool
+	selectorCutoverHandedOff      bool
+	selectorCutoverReplayRequired bool
 	// acceptedPacketDispatches counts public PacketConn writes that have
 	// returned after bounded queue admission but whose physical path job has
 	// not completed. selectorCutoverMu linearizes admission against cutover so
-	// a quality switch replays every such ACK-uncovered frame.
+	// a quality switch replays every such ACK-uncovered frame. Ticket custody,
+	// rather than this diagnostic count, determines which cutover owns it.
 	acceptedPacketDispatches uint64
 	// detachedStreamDispatches counts stream DATA frames that have left the
 	// global sequencer after immutable publication but are still awaiting
 	// physical dispatch. appWritePermit preserves stream-call order; this count
-	// makes every cutover own the corresponding replay prefix immediately.
+	// lets exactly one cutover own the corresponding replay prefix.
 	detachedStreamDispatches uint64
 	selectorCutoverWake      chan struct{}
 	pathRetirementInbox      chan pathRetirementWork
@@ -842,10 +878,12 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		recvPolicyPhases:        make(map[recvPolicyPhaseKey]recvPolicyPhaseReceipt),
 		sendSlots:               make(chan struct{}, sendHistoryWindow),
 		sendControlSlots:        make(chan struct{}, sendControlReserve),
+		sendPolicyFinalSlots:    make(chan struct{}, sendPolicyFinalReserve),
 		sendCreditWake:          make(chan struct{}),
 		appWritePermit:          make(chan struct{}, 1),
 		replayWake:              make(chan struct{}, 1),
 		replayAckWake:           make(chan struct{}, 1),
+		replayPublicationWake:   make(chan struct{}),
 		gapReplayBackoff:        10 * time.Millisecond,
 		tailReplayInitialDelay:  defaultTailReplayInitialDelay,
 		tailReplayMaxBackoff:    defaultTailReplayMaxBackoff,
@@ -855,6 +893,8 @@ func New(side Side, flowID [16]byte, limits Limits) *Engine {
 		policySelections:        make(map[proto.TargetID]proto.TargetID),
 		policyCompleted:         make(map[[16]byte]completedPolicyTransaction),
 		policyQueued:            make(map[policyMessageKey]struct{}),
+		policyReplayRecords:     make(map[policyReplayKey]*policyReplayRecord),
+		policyTombstones:        make(map[[16]byte]policyTransactionTombstone),
 		selectorCutoverWake:     make(chan struct{}),
 		pathRetirementInbox:     make(chan pathRetirementWork, pathRetirementInboxSize),
 		pathRetirementQueued:    make(map[pathRetirementWorkKey]struct{}),
@@ -2150,6 +2190,7 @@ func (e *Engine) commitRecursiveSelection(
 	cutoverGeneration uint64,
 	expectedEvidence selectorEvidenceCommit,
 	committed func(publishRoute func()) error,
+	deferCutoverReplay bool,
 ) error {
 	if runtime == nil || runtime.plan == nil {
 		return errExecutionRuntimeNotConfigured
@@ -2221,10 +2262,12 @@ func (e *Engine) commitRecursiveSelection(
 		// carrier. Finish this exact cutover generation so recursive dispatch may
 		// use the committed route, then replay while later publications remain
 		// excluded.
-		e.finishSelectorCutover(cutoverGeneration)
-		if err := e.replayRangeLocked(e.sendAckNext.Load(), e.sendPublishedNext.Load()); err != nil {
-			e.requestReplayRange(e.sendAckNext.Load(), e.sendPublishedNext.Load())
-			return err
+		if !deferCutoverReplay {
+			e.finishSelectorCutover(cutoverGeneration)
+			if err := e.replayRangeLocked(e.sendAckNext.Load(), e.sendPublishedNext.Load()); err != nil {
+				e.requestReplayRange(e.sendAckNext.Load(), e.sendPublishedNext.Load())
+				return err
+			}
 		}
 	}
 	if changed {
@@ -2303,14 +2346,24 @@ func (e *Engine) admitPeerPolicy(selectorID, targetID proto.TargetID, cause stri
 // SetPeakPolicyObserver installs a sender-local observer for committed
 // PeakTransfer phase changes. The observer cannot influence the transaction;
 // it starts or closes bounded capacity accounting after commit.
-func (e *Engine) SetPeakPolicyObserver(fn func(selectorID, targetID proto.TargetID, peak bool, cause string)) {
+func (e *Engine) SetPeakPolicyObserver(
+	fn func(selectorID, targetID proto.TargetID, selectorGeneration uint64, peak bool, cause string),
+) {
 	e.peakPolicyObserverMu.Lock()
 	e.peakPolicyObserver = fn
 	e.peakPolicyObserverMu.Unlock()
 }
 
-func (e *Engine) observePeakPolicy(selectorID, targetID proto.TargetID, origin policySelectionOrigin, cause string) {
+func (e *Engine) observePeakPolicy(
+	selectorID, targetID proto.TargetID,
+	selectorGeneration uint64,
+	origin policySelectionOrigin,
+	cause string,
+) {
 	if origin != policySelectionPeakPromote && origin != policySelectionPeakReturn && !origin.isFactualFailure() {
+		return
+	}
+	if selectorGeneration == 0 {
 		return
 	}
 	peak := origin == policySelectionPeakPromote
@@ -2321,7 +2374,7 @@ func (e *Engine) observePeakPolicy(selectorID, targetID proto.TargetID, origin p
 	fn := e.peakPolicyObserver
 	e.peakPolicyObserverMu.RUnlock()
 	if fn != nil {
-		fn(selectorID, targetID, peak, cause)
+		fn(selectorID, targetID, selectorGeneration, peak, cause)
 	}
 }
 
@@ -2612,7 +2665,9 @@ func (e *Engine) Close() error {
 		e.closeLeafMobilityRefreshQueue()
 		e.clearPathProbeState(slots)
 		close(e.closed)
+		e.releaseReplayPublicationBarrierOnClose()
 		e.releaseReplayStateOnClose()
+		e.releasePolicyReplayStateOnClose()
 		// Wake any Read goroutine waiting on data.
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()

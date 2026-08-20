@@ -30,12 +30,12 @@ const streamRecvWindowFrames = 256
 // forcing one frame-digest allocation per distant packet.
 const packetRecvWindowBits = 16 * 1024
 
-const recvAttributionHistoryLimit = sendHistoryWindow + sendControlReserve + 1
+const recvAttributionHistoryLimit = sendHistoryWindow + sendControlReserve + sendPolicyFinalReserve + 1
 
 // Keep transaction digests for the sender's entire bounded replay domain so an
 // exact old phase can recover a lost receipt without being reclassified as an
 // unsolicited new transaction.
-const policyReplayDigestLimit = sendHistoryWindow + sendControlReserve
+const policyReplayDigestLimit = sendHistoryWindow + sendControlReserve + sendPolicyFinalReserve
 
 // recvItem is one frame waiting in the reorder buffer. Data frames
 // hold the payload bytes; ctrl frames hold the flags so the in-order

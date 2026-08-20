@@ -224,6 +224,7 @@ func (e *Engine) sendFrameTrackedPreemptingReplay(t proto.FrameType, flags uint1
 	cutoverGeneration := e.beginSelectorCutover()
 	e.sendMu.Lock()
 	handedOff := e.selectorCutoverDidHandoff(cutoverGeneration)
+	replayRequired := handedOff && e.selectorCutoverRequiresReplay(cutoverGeneration)
 	replayTarget := e.sendPublishedNext.Load()
 	e.finishSelectorCutover(cutoverGeneration)
 
@@ -233,9 +234,63 @@ func (e *Engine) sendFrameTrackedPreemptingReplay(t proto.FrameType, flags uint1
 	}
 	e.sendMu.Unlock()
 
-	if handedOff {
+	if replayRequired {
 		e.requestReplayRange(e.sendAckNext.Load(), replayTarget)
 	}
+	return frame, err
+}
+
+// sendFrameTrackedWithExistingCutover publishes one correlated policy FINAL
+// inside the cutover that committed its owner state. The pre-FINAL frontier is
+// frozen under sendMu; only after the FINAL is physically dispatched does the
+// exact generation end. A publication barrier then keeps later application
+// sequences behind the asynchronously replayed prefix without blocking policy
+// controls that may be needed to recover the route.
+func (e *Engine) sendFrameTrackedWithExistingCutover(
+	t proto.FrameType,
+	flags uint16,
+	payload []byte,
+	cutoverGeneration uint64,
+) ([]byte, error) {
+	if t != proto.FrameCtrl {
+		return nil, errors.New("engine: only control frames may publish inside a cutover")
+	}
+	if e.sendClosing.Load() {
+		return nil, net.ErrClosed
+	}
+	if _, err := e.requireLocalExecutionRuntime(); err != nil {
+		return nil, err
+	}
+	frameBytes := proto.HeaderSize + len(payload)
+	if err := e.acquirePolicyFinalSlot(); err != nil {
+		return nil, err
+	}
+
+	e.sendMu.Lock()
+	if !e.selectorCutoverGenerationPending(cutoverGeneration) {
+		e.releaseSendCredit(true, true, frameBytes)
+		e.sendMu.Unlock()
+		return nil, errors.New("engine: policy FINAL lost its selector cutover generation")
+	}
+	replayTarget := e.sendPublishedNext.Load()
+	frame, seq, err := e.publishTrackedPolicyFinalFrameLocked(t, flags, payload, frameBytes)
+	if err == nil {
+		err = e.dispatchTrackedReplayPreemptingControl(frame, seq)
+	}
+	// A committed route change invalidates the physical placement of every
+	// pre-FINAL frame that is still unacknowledged. This is true even when no
+	// dispatcher happened to observe the cutover and hand off concurrently.
+	// Install the barrier before ending the cutover so no application publisher
+	// can observe an unprotected interval between the two ownership domains.
+	var replayBarrier replayPublicationBarrierToken
+	if replayTarget > e.sendAckNext.Load() {
+		replayBarrier = e.installReplayPublicationBarrier(replayTarget)
+	}
+	e.finishSelectorCutover(cutoverGeneration)
+	if replayBarrier.valid() {
+		e.requestReplayPublicationBarrier(replayBarrier)
+	}
+	e.sendMu.Unlock()
 	return frame, err
 }
 
@@ -243,19 +298,34 @@ func (e *Engine) sendFrameTrackedPreemptingReplay(t proto.FrameType, flags uint1
 // immutable frame into replay-ledger custody. The caller owns sendMu and has
 // already reserved the matching send slot.
 func (e *Engine) publishTrackedFrameLocked(t proto.FrameType, flags uint16, payload []byte, frameBytes int) ([]byte, uint64, error) {
+	return e.publishTrackedFrameClassLocked(t, flags, payload, frameBytes, false)
+}
+
+func (e *Engine) publishTrackedPolicyFinalFrameLocked(t proto.FrameType, flags uint16, payload []byte, frameBytes int) ([]byte, uint64, error) {
+	return e.publishTrackedFrameClassLocked(t, flags, payload, frameBytes, true)
+}
+
+func (e *Engine) publishTrackedFrameClassLocked(
+	t proto.FrameType,
+	flags uint16,
+	payload []byte,
+	frameBytes int,
+	policyFinal bool,
+) ([]byte, uint64, error) {
 	control := t == proto.FrameCtrl
+	releaseCredit := func() { e.releaseSendCredit(control, policyFinal, frameBytes) }
 	if e.isClosed() || e.sendClosing.Load() {
-		e.releaseSendSlot(control, frameBytes)
+		releaseCredit()
 		return nil, 0, net.ErrClosed
 	}
 	if t == proto.FrameData && e.sendWriteClosed.Load() {
-		e.releaseSendSlot(control, frameBytes)
+		releaseCredit()
 		return nil, 0, io.ErrClosedPipe
 	}
 
 	seq, err := e.allocateSendSequence(false)
 	if err != nil {
-		e.releaseSendSlot(control, frameBytes)
+		releaseCredit()
 		e.beginSequenceExhaustionClose()
 		return nil, 0, err
 	}
@@ -267,13 +337,17 @@ func (e *Engine) publishTrackedFrameLocked(t proto.FrameType, flags uint16, payl
 	}
 	frame := make([]byte, proto.HeaderSize+len(payload))
 	if err := hdr.Encode(frame[:proto.HeaderSize]); err != nil {
-		e.releaseSendSlot(control, frameBytes)
+		releaseCredit()
 		return nil, 0, err
 	}
 	copy(frame[proto.HeaderSize:], payload)
 
-	if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
-		e.releaseSendSlot(control, frameBytes)
+	reserve := e.reserveAndPublishOwnedSendFrame
+	if policyFinal {
+		reserve = e.reserveAndPublishOwnedPolicyFinalFrame
+	}
+	if err := reserve(frame); err != nil {
+		releaseCredit()
 		return nil, 0, err
 	}
 	return frame, seq, nil
@@ -289,7 +363,7 @@ func (e *Engine) dispatchTrackedReplayPreemptingControl(frame []byte, seq uint64
 	if runtime == nil {
 		return errExecutionRuntimeNotConfigured
 	}
-	err := e.dispatchRecursiveReplayPreemptingControl(frame, runtime)
+	err := e.dispatchRecursiveReplayPreemptingControl(frame, runtime, true)
 	return e.finishTrackedFrameDispatch(frame, seq, err)
 }
 
@@ -307,6 +381,9 @@ func (e *Engine) replaySequencedFrame(frame []byte) error {
 	if len(frame) < proto.HeaderSize {
 		return proto.ErrBadHeader
 	}
+	if isPolicyControlFrame(frame) {
+		return e.replaySequencedPolicyControl(frame)
+	}
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 	// sendClosing seals the sequencer against new publications, but already
@@ -315,6 +392,47 @@ func (e *Engine) replaySequencedFrame(frame []byte) error {
 		return net.ErrClosed
 	}
 	return e.dispatchReplayFrameLocked(frame)
+}
+
+func isPolicyControlFrame(frame []byte) bool {
+	if len(frame) < proto.HeaderSize {
+		return false
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil || header.Type != proto.FrameCtrl {
+		return false
+	}
+	switch proto.CtrlCodeFromFlags(header.Flags) {
+	case proto.CtrlPolicyPrepare, proto.CtrlPolicyAck, proto.CtrlPolicyCommit:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) replaySequencedPolicyControl(frame []byte) error {
+	cutoverGeneration := e.beginSelectorCutover()
+	e.sendMu.Lock()
+	if e.isClosed() {
+		e.finishSelectorCutover(cutoverGeneration)
+		e.sendMu.Unlock()
+		return net.ErrClosed
+	}
+	handedOff := e.selectorCutoverDidHandoff(cutoverGeneration)
+	replayRequired := handedOff && e.selectorCutoverRequiresReplay(cutoverGeneration)
+	replayTarget := e.sendPublishedNext.Load()
+	e.finishSelectorCutover(cutoverGeneration)
+	runtime := e.localExecutionRuntime()
+	if runtime == nil {
+		e.sendMu.Unlock()
+		return errExecutionRuntimeNotConfigured
+	}
+	err := e.dispatchRecursiveReplayPreemptingControl(frame, runtime, false)
+	e.sendMu.Unlock()
+	if replayRequired {
+		e.requestReplayRange(e.sendAckNext.Load(), replayTarget)
+	}
+	return err
 }
 
 func (e *Engine) dispatchReplayFrameLocked(frame []byte) error {
@@ -450,9 +568,19 @@ const (
 )
 
 type replayRequest struct {
-	nextSeq uint64
-	target  uint64
-	kind    replayRequestKind
+	nextSeq            uint64
+	target             uint64
+	kind               replayRequestKind
+	publicationBarrier replayPublicationBarrierToken
+}
+
+type replayPublicationBarrierToken struct {
+	generation uint64
+	frontier   uint64
+}
+
+func (t replayPublicationBarrierToken) valid() bool {
+	return t.generation != 0 && t.frontier != 0
 }
 
 func (e *Engine) requestReplay(nextSeq uint64) {
@@ -464,6 +592,123 @@ func (e *Engine) requestReplayRange(nextSeq, target uint64) {
 		return
 	}
 	e.queueReplay(replayRequest{nextSeq: nextSeq, target: target, kind: replayRequestBounded})
+}
+
+func (e *Engine) requestReplayPublicationBarrier(barrier replayPublicationBarrierToken) {
+	if !barrier.valid() {
+		return
+	}
+	nextSeq := e.sendAckNext.Load()
+	if barrier.frontier <= nextSeq {
+		e.completeReplayPublicationBarrier(nextSeq)
+		return
+	}
+	e.queueReplay(replayRequest{
+		nextSeq:            nextSeq,
+		target:             barrier.frontier,
+		kind:               replayRequestBounded,
+		publicationBarrier: barrier,
+	})
+}
+
+// installReplayPublicationBarrier records an exclusive frozen-prefix frontier
+// and returns its exact generation token.
+// Callers install it while holding sendMu, before exposing a route-changing
+// FINAL. Later application publishers recheck it after acquiring sendMu, so a
+// publisher that raced the installation cannot allocate a sequence beyond the
+// prefix. Every installation advances the generation, including the same
+// frontier, because an older physical replay cannot prove a newer route.
+func (e *Engine) installReplayPublicationBarrier(target uint64) replayPublicationBarrierToken {
+	if target == 0 || e.isClosed() || e.sendClosing.Load() || e.sendAckNext.Load() >= target {
+		return replayPublicationBarrierToken{}
+	}
+	e.replayMu.Lock()
+	defer e.replayMu.Unlock()
+	if e.isClosed() || e.sendClosing.Load() || e.sendAckNext.Load() >= target {
+		return replayPublicationBarrierToken{}
+	}
+	if e.replayPublicationWake == nil {
+		e.replayPublicationWake = make(chan struct{})
+	}
+	if target < e.replayPublicationBarrier.frontier {
+		target = e.replayPublicationBarrier.frontier
+	}
+	if e.replayPublicationGeneration == ^uint64(0) {
+		panic("engine: replay publication generation exhausted")
+	}
+	e.replayPublicationGeneration++
+	barrier := replayPublicationBarrierToken{
+		generation: e.replayPublicationGeneration,
+		frontier:   target,
+	}
+	e.replayPublicationBarrier = barrier
+	return barrier
+}
+
+func (e *Engine) replayPublicationBarrierSnapshot() (uint64, <-chan struct{}) {
+	e.replayMu.Lock()
+	if e.replayPublicationWake == nil {
+		e.replayPublicationWake = make(chan struct{})
+	}
+	target, wake := e.replayPublicationBarrier.frontier, e.replayPublicationWake
+	e.replayMu.Unlock()
+	return target, wake
+}
+
+// completeReplayPublicationBarrier releases the current barrier only when the
+// cumulative peer ACK independently proves its complete frozen prefix arrived.
+// Replay completion uses the generation-bound method below.
+func (e *Engine) completeReplayPublicationBarrier(frontier uint64) {
+	if frontier == 0 {
+		return
+	}
+	e.replayMu.Lock()
+	barrier := e.replayPublicationBarrier
+	if !barrier.valid() || frontier < barrier.frontier ||
+		e.sendAckNext.Load() < barrier.frontier {
+		e.replayMu.Unlock()
+		return
+	}
+	e.completeReplayPublicationBarrierLocked()
+	e.replayMu.Unlock()
+}
+
+// completeReplayPublicationBarrierForReplay requires the exact token installed
+// for the replayed route. Frontier equality alone is insufficient: a delayed
+// completion from an older replay may race a newer barrier at the same value.
+func (e *Engine) completeReplayPublicationBarrierForReplay(
+	barrier replayPublicationBarrierToken,
+	frontier uint64,
+) {
+	if !barrier.valid() || frontier < barrier.frontier {
+		return
+	}
+	if hook := e.replayPublicationBeforeComplete; hook != nil {
+		hook(barrier)
+	}
+	e.replayMu.Lock()
+	if e.replayPublicationBarrier != barrier {
+		e.replayMu.Unlock()
+		return
+	}
+	e.completeReplayPublicationBarrierLocked()
+	e.replayMu.Unlock()
+}
+
+func (e *Engine) releaseReplayPublicationBarrierOnClose() {
+	e.replayMu.Lock()
+	if e.replayPublicationBarrier.valid() {
+		e.completeReplayPublicationBarrierLocked()
+	}
+	e.replayMu.Unlock()
+}
+
+func (e *Engine) completeReplayPublicationBarrierLocked() {
+	e.replayPublicationBarrier = replayPublicationBarrierToken{}
+	if e.replayPublicationWake != nil {
+		close(e.replayPublicationWake)
+	}
+	e.replayPublicationWake = make(chan struct{})
 }
 
 func (e *Engine) requestGapReplay(nextSeq uint64) {
@@ -485,6 +730,10 @@ func (e *Engine) queueReplay(request replayRequest) {
 		e.replayPendingSet = true
 	} else {
 		pending := e.replayPending
+		publicationBarrier := newerReplayPublicationBarrier(
+			pending.publicationBarrier,
+			request.publicationBarrier,
+		)
 		switch {
 		case pending.kind == replayRequestFull:
 			if request.nextSeq < pending.nextSeq {
@@ -511,13 +760,25 @@ func (e *Engine) queueReplay(request replayRequest) {
 				pending.target = request.target
 			}
 		}
+		pending.publicationBarrier = publicationBarrier
 		e.replayPending = pending
+	}
+	hook := e.replayQueueForTest
+	if hook != nil {
+		hook(request)
 	}
 	e.replayMu.Unlock()
 	select {
 	case e.replayWake <- struct{}{}:
 	default:
 	}
+}
+
+func newerReplayPublicationBarrier(a, b replayPublicationBarrierToken) replayPublicationBarrierToken {
+	if b.generation > a.generation {
+		return b
+	}
+	return a
 }
 
 func (e *Engine) takeReplayRequest() (replayRequest, bool) {
@@ -588,9 +849,13 @@ func (e *Engine) replayLoop() {
 			case replayRequestGap:
 				e.replayGapUntilAcknowledged(request.nextSeq, request.target)
 			case replayRequestBounded:
-				e.replayRangeUntilSent(request.nextSeq, request.target)
+				e.replayRangeUntilSent(
+					request.nextSeq,
+					request.target,
+					request.publicationBarrier,
+				)
 			case replayRequestFull:
-				e.replayUntilSent(request.nextSeq)
+				e.replayUntilSent(request.nextSeq, request.publicationBarrier)
 			}
 			continue
 		}
@@ -624,13 +889,18 @@ func (e *Engine) replayLoop() {
 	}
 }
 
-func (e *Engine) replayRangeUntilSent(nextSeq, target uint64) {
+func (e *Engine) replayRangeUntilSent(
+	nextSeq,
+	target uint64,
+	publicationBarrier replayPublicationBarrierToken,
+) {
 	backoff := 10 * time.Millisecond
 	for nextSeq < target {
 		if acked := e.sendAckNext.Load(); nextSeq < acked {
 			nextSeq = acked
 		}
 		if nextSeq >= target {
+			e.completeReplayPublicationBarrier(target)
 			return
 		}
 		if hook := e.boundedReplayBeforeSnapshot; hook != nil {
@@ -638,10 +908,14 @@ func (e *Engine) replayRangeUntilSent(nextSeq, target uint64) {
 		}
 		frames := e.sendHistoryRange(nextSeq, target)
 		if len(frames) == 0 {
+			if e.sendAckNext.Load() >= target {
+				e.completeReplayPublicationBarrier(target)
+			}
 			return
 		}
 		if e.ActivePath() != 0 {
 			if err := e.redistributeFrames(frames); err == nil {
+				e.completeReplayPublicationBarrierForReplay(publicationBarrier, target)
 				if target == e.sendPublishedNext.Load() {
 					e.armTailReplayForFrame(frames[len(frames)-1], target)
 				}
@@ -774,7 +1048,10 @@ func (e *Engine) replayGapUntilAcknowledged(nextSeq, target uint64) {
 	}
 }
 
-func (e *Engine) replayUntilSent(nextSeq uint64) {
+func (e *Engine) replayUntilSent(
+	nextSeq uint64,
+	publicationBarrier replayPublicationBarrierToken,
+) {
 	backoff := 10 * time.Millisecond
 	for {
 		if acked := e.sendAckNext.Load(); nextSeq < acked {
@@ -782,13 +1059,16 @@ func (e *Engine) replayUntilSent(nextSeq uint64) {
 		}
 		frames := e.sendHistorySnapshot(nextSeq)
 		if len(frames) == 0 {
+			e.completeReplayPublicationBarrier(e.sendAckNext.Load())
 			return
 		}
 		if e.ActivePath() != 0 {
 			if err := e.redistributeFrames(frames); err == nil {
-				if lastTarget, ok := sequencedFrameTarget(frames[len(frames)-1]); ok &&
-					lastTarget == e.sendPublishedNext.Load() {
-					e.armTailReplayForFrame(frames[len(frames)-1], lastTarget)
+				if lastTarget, ok := sequencedFrameTarget(frames[len(frames)-1]); ok {
+					e.completeReplayPublicationBarrierForReplay(publicationBarrier, lastTarget)
+					if lastTarget == e.sendPublishedNext.Load() {
+						e.armTailReplayForFrame(frames[len(frames)-1], lastTarget)
+					}
 				}
 				return
 			}

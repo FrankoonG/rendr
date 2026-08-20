@@ -214,7 +214,7 @@ func TestReplayBudgetRecoversHighBDPFlightAfterPathDeath(t *testing.T) {
 }
 
 func TestReplayBudgetStaysBelowFatalReceiveWindow(t *testing.T) {
-	maxSequencedFlight := sendHistoryWindow + sendControlReserve + 1
+	maxSequencedFlight := sendHistoryWindow + sendControlReserve + sendPolicyFinalReserve + 1
 	if maxSequencedFlight >= recvReorderWindowLimit {
 		t.Fatalf("maximum replay flight=%d can reach fatal receive window=%d",
 			maxSequencedFlight, recvReorderWindowLimit)
