@@ -29,6 +29,23 @@ type frameDispatchTraceSpan struct {
 	connection *frameDispatchTraceConn
 }
 
+type panicDispatchTracer struct {
+	finish bool
+}
+
+type panicDispatchSpan struct{}
+
+func (tracer panicDispatchTracer) BeginFrameDispatch(transport.FrameDispatchAuthorization) transport.FrameDispatchSpan {
+	if !tracer.finish {
+		panic("begin dispatch panic")
+	}
+	return panicDispatchSpan{}
+}
+
+func (panicDispatchSpan) FinishFrameDispatch(transport.FrameDispatchCompletion) {
+	panic("finish dispatch panic")
+}
+
 func (connection *frameDispatchTraceConn) BeginFrameDispatch(
 	authorization transport.FrameDispatchAuthorization,
 ) transport.FrameDispatchSpan {
@@ -59,6 +76,65 @@ func (connection *frameDispatchTraceConn) Write(payload []byte) (int, error) {
 		payload = payload[:maxWrite]
 	}
 	return connection.Conn.Write(payload)
+}
+
+func TestPathConnContainsDispatchTracerPanicAndPreservesEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		finish bool
+	}{
+		{name: "begin"},
+		{name: "finish", finish: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, peer := net.Pipe()
+			path := Wrap(raw)
+			path.dispatchTracer = panicDispatchTracer{finish: test.finish}
+			t.Cleanup(func() {
+				_ = path.Close()
+				_ = peer.Close()
+			})
+			frames := [][]byte{
+				dispatchTestFrame(t, 6, []byte("panic-contained")),
+				dispatchTestFrame(t, 7, []byte("endpoint-remains-usable")),
+			}
+			drained := make(chan error, 1)
+			go func() {
+				for _, frame := range frames {
+					wire := make([]byte, LengthPrefixSize+len(frame))
+					if _, err := io.ReadFull(peer, wire); err != nil {
+						drained <- err
+						return
+					}
+				}
+				drained <- nil
+			}()
+			for index, frame := range frames {
+				sequence := uint64(6 + index)
+				if n, err := path.WriteFrameDispatch(frame, dispatchTestAuthorization(frame, sequence)); err != nil || n != len(frame) {
+					t.Fatalf("dispatch %d after tracer panic=(%d,%v), want (%d,nil)", index, n, err, len(frame))
+				}
+			}
+			if err := <-drained; err != nil {
+				t.Fatal(err)
+			}
+			path.endpoint.mu.Lock()
+			writeActive := path.endpoint.writeActive
+			path.endpoint.mu.Unlock()
+			if writeActive {
+				t.Fatal("dispatch tracer panic retained the endpoint write lease")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			maintenance, err := path.endpoint.beginMaintenance(ctx)
+			if err != nil {
+				t.Fatalf("maintenance after tracer panic: %v", err)
+			}
+			if err := maintenance.Resume(); err != nil {
+				t.Fatalf("resume after tracer panic: %v", err)
+			}
+		})
+	}
 }
 
 func TestPathConnForwardsFrameDispatchTraceToWrappedConn(t *testing.T) {

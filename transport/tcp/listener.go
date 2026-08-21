@@ -17,6 +17,7 @@ import (
 // acquire this ownership claim.
 type Listener struct {
 	listener  *net.TCPListener
+	config    Config
 	accept    chan struct{}
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -26,14 +27,33 @@ type Listener struct {
 // NewListener transfers admission ownership of listener to a framed TCP path
 // listener. Closing Listener does not close paths it has already returned.
 func NewListener(listener *net.TCPListener) (*Listener, error) {
+	return NewListenerWithConfig(listener, Config{})
+}
+
+// NewListenerWithConfig validates config, then transfers admission ownership of
+// listener and applies config independently to every accepted path. On error,
+// ownership remains with the caller.
+func NewListenerWithConfig(listener *net.TCPListener, config Config) (*Listener, error) {
 	if listener == nil {
 		return nil, errors.New("tcp: nil TCPListener")
 	}
-	return newOwnedListener(listener), nil
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
+	return newOwnedListener(listener, config), nil
 }
 
 // Listen creates an owned raw TCP path listener.
 func Listen(network, address string) (*Listener, error) {
+	return ListenWithConfig(network, address, Config{})
+}
+
+// ListenWithConfig creates an owned raw TCP path listener whose accepted paths
+// use config.
+func ListenWithConfig(network, address string, config Config) (*Listener, error) {
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
 	addr, err := net.ResolveTCPAddr(network, address)
 	if err != nil {
 		return nil, fmt.Errorf("tcp: resolve listen address: %w", err)
@@ -42,13 +62,13 @@ func Listen(network, address string) (*Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tcp: listen %s: %w", address, err)
 	}
-	return newOwnedListener(listener), nil
+	return newOwnedListener(listener, config), nil
 }
 
-func newOwnedListener(listener *net.TCPListener) *Listener {
+func newOwnedListener(listener *net.TCPListener, config Config) *Listener {
 	accept := make(chan struct{}, 1)
 	accept <- struct{}{}
-	return &Listener{listener: listener, accept: accept, closed: make(chan struct{})}
+	return &Listener{listener: listener, config: config, accept: accept, closed: make(chan struct{})}
 }
 
 // AcceptPath accepts one concrete raw TCP socket and honors cancellation by
@@ -123,7 +143,22 @@ func (l *Listener) AcceptPath(ctx context.Context) (transport.PathConn, error) {
 	default:
 	}
 	_ = conn.SetKeepAlive(false)
-	return wrapOwned(conn, leafmobility.RoleAcceptor), nil
+	tracer, err := l.config.configurePath(conn, PathRoleAcceptor)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	select {
+	case <-l.closed:
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	default:
+	}
+	return wrapOwnedConfigured(conn, leafmobility.RoleAcceptor, tracer), nil
 }
 
 func (*Listener) SessionKind() transport.PathSessionKind {

@@ -24,9 +24,11 @@ const LengthPrefixSize = 2
 // 16-bit length can encode.
 const MaxFrameSize = 1<<16 - 1
 
-// Transport is the TCP adapter. It carries no state across DialPath
-// calls; each call yields an independent PathConn.
-type Transport struct{}
+// Transport is the TCP adapter. Config is immutable after construction; each
+// DialPath call still yields an independent PathConn.
+type Transport struct {
+	config Config
+}
 
 var _ transport.PathQualityReader = (*PathConn)(nil)
 var _ transport.FrameDispatchWriter = (*PathConn)(nil)
@@ -34,6 +36,15 @@ var _ dispatchtrust.OwnedFrameWriter = (*PathConn)(nil)
 
 // New returns a Transport ready for use.
 func New() *Transport { return &Transport{} }
+
+// NewWithConfig returns a Transport with optional socket tuning and path-local
+// DATA dispatch diagnostics. It never grants caller ownership of the raw socket.
+func NewWithConfig(config Config) (*Transport, error) {
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
+	return &Transport{config: config}, nil
+}
 
 // DialPath dials a TCP socket and wraps it in a PathConn.
 //
@@ -51,7 +62,22 @@ func New() *Transport { return &Transport{} }
 //
 // rendr's engine has its own protocol-layer liveness via PathProbe;
 // kernel TCP keepalive is both redundant and harmful here.
-func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+func (t *Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transport.PathConn, error) {
+	return t.dialPath(ctx, spec, true)
+}
+
+func (t *Transport) dialPath(
+	ctx context.Context,
+	spec transport.PathSpec,
+	traceDispatch bool,
+) (transport.PathConn, error) {
+	config := Config{}
+	if t != nil {
+		config = t.config
+	}
+	if !traceDispatch {
+		config = config.withoutDispatchTracer()
+	}
 	d := net.Dialer{KeepAlive: -1}
 	if spec.Local != "" {
 		la, err := net.ResolveTCPAddr("tcp", spec.Local)
@@ -73,14 +99,23 @@ func (*Transport) DialPath(ctx context.Context, spec transport.PathSpec) (transp
 		return nil, fmt.Errorf("tcp: dial returned %T, want *net.TCPConn", c)
 	}
 	_ = tc.SetKeepAlive(false)
-	return wrapOwned(tc, leafmobility.RoleDialer), nil
+	tracer, err := config.configurePath(tc, PathRoleDialer)
+	if err != nil {
+		_ = tc.Close()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = tc.Close()
+		return nil, err
+	}
+	return wrapOwnedConfigured(tc, leafmobility.RoleDialer, tracer), nil
 }
 
 // Probe dials, captures handshake RTT, and closes. M1 placeholder;
 // M6 will swap this for a cheap echo.
 func (t *Transport) Probe(ctx context.Context, spec transport.PathSpec) (transport.PathQuality, error) {
 	start := time.Now()
-	pc, err := t.DialPath(ctx, spec)
+	pc, err := t.dialPath(ctx, spec, false)
 	if err != nil {
 		return transport.PathQuality{}, err
 	}
@@ -98,8 +133,13 @@ func Wrap(c net.Conn) *PathConn {
 }
 
 func wrapOwned(c *net.TCPConn, role leafmobility.Role) *PathConn {
+	return wrapOwnedConfigured(c, role, nil)
+}
+
+func wrapOwnedConfigured(c *net.TCPConn, role leafmobility.Role, tracer transport.FrameDispatchTracer) *PathConn {
 	path := Wrap(c)
 	path.claim = newOwnedClaim(path.endpoint, role)
+	path.dispatchTracer = tracer
 	path.refreshState = leafmobility.NewRefreshSourceState()
 	path.refreshEmitter, _ = leafmobility.NewRefreshEmitterWithSourceState(path.claim, path.refreshState)
 	return path
@@ -116,6 +156,8 @@ func (p *PathConn) LeafMobilityClaim() *leafmobility.Claim {
 type PathConn struct {
 	endpoint *endpointOwner
 	claim    *leafmobility.Claim
+
+	dispatchTracer transport.FrameDispatchTracer
 
 	refreshMu       sync.Mutex
 	refreshState    *leafmobility.RefreshSourceState
@@ -276,63 +318,71 @@ func (p *PathConn) writeFrameDispatchFull(
 		frameStart := frameOffset
 		physicalOccurrence++
 		startedAt := time.Now()
-		var span transport.FrameDispatchSpan
-		if tracer, ok := write.conn.(transport.FrameDispatchTracer); ok {
-			physical := authorization
-			physical.PhysicalOccurrence = physicalOccurrence
-			physical.EndpointGeneration = write.generation
-			physical.FrameOffset = frameStart
-			span = tracer.BeginFrameDispatch(physical)
-		}
-
 		attempted := false
 		writeCalls := 0
 		var writeErr error
-		for prefixOffset < len(prefix) || frameOffset < len(frame) {
-			part := frame[frameOffset:]
-			writingFrame := true
-			if prefixOffset < len(prefix) {
-				part = prefix[prefixOffset:]
-				writingFrame = false
+		complete := false
+		interrupted := false
+		func() {
+			defer func() { interrupted = write.finish(writeErr, complete) }()
+			var span transport.FrameDispatchSpan
+			tracer := p.dispatchTracer
+			if tracer == nil {
+				tracer, _ = write.conn.(transport.FrameDispatchTracer)
 			}
-			attempted = true
-			writeCalls++
-			n, err := write.conn.Write(part)
-			if n < 0 || n > len(part) {
-				writeErr = fmt.Errorf("tcp: endpoint returned invalid write count %d for %d bytes", n, len(part))
-				break
+			if tracer != nil {
+				physical := authorization
+				physical.PhysicalOccurrence = physicalOccurrence
+				physical.EndpointGeneration = write.generation
+				physical.FrameOffset = frameStart
+				span = beginFrameDispatch(tracer, physical)
 			}
-			if writingFrame {
-				frameOffset += n
-			} else {
-				prefixOffset += n
+
+			for prefixOffset < len(prefix) || frameOffset < len(frame) {
+				part := frame[frameOffset:]
+				writingFrame := true
+				if prefixOffset < len(prefix) {
+					part = prefix[prefixOffset:]
+					writingFrame = false
+				}
+				attempted = true
+				writeCalls++
+				n, err := write.conn.Write(part)
+				if n < 0 || n > len(part) {
+					writeErr = fmt.Errorf("tcp: endpoint returned invalid write count %d for %d bytes", n, len(part))
+					break
+				}
+				if writingFrame {
+					frameOffset += n
+				} else {
+					prefixOffset += n
+				}
+				if err != nil {
+					writeErr = err
+					break
+				}
+				if n == 0 {
+					writeErr = errors.New("tcp: endpoint write made no progress")
+					break
+				}
 			}
-			if err != nil {
-				writeErr = err
-				break
+			complete = prefixOffset == len(prefix) && frameOffset == len(frame)
+			completedAt := time.Now()
+			if span != nil {
+				attemptState := transport.FrameDispatchAttemptUnknown
+				if attempted {
+					attemptState = transport.FrameDispatchAttempted
+				}
+				finishFrameDispatch(span, transport.FrameDispatchCompletion{
+					StartedAt: startedAt, CompletedAt: completedAt, FrameBytes: len(frame),
+					BytesWritten: frameOffset - frameStart, BytesWrittenKnown: true,
+					WriteCalls:   writeCalls,
+					AttemptState: attemptState, WriteAttempted: attempted,
+					WholeFrameAccepted: frameStart == 0 && frameOffset == len(frame),
+					BatchIndex:         0, BatchSize: 1, Err: writeErr,
+				})
 			}
-			if n == 0 {
-				writeErr = errors.New("tcp: endpoint write made no progress")
-				break
-			}
-		}
-		complete := prefixOffset == len(prefix) && frameOffset == len(frame)
-		completedAt := time.Now()
-		if span != nil {
-			attemptState := transport.FrameDispatchAttemptUnknown
-			if attempted {
-				attemptState = transport.FrameDispatchAttempted
-			}
-			span.FinishFrameDispatch(transport.FrameDispatchCompletion{
-				StartedAt: startedAt, CompletedAt: completedAt, FrameBytes: len(frame),
-				BytesWritten: frameOffset - frameStart, BytesWrittenKnown: true,
-				WriteCalls:   writeCalls,
-				AttemptState: attemptState, WriteAttempted: attempted,
-				WholeFrameAccepted: frameStart == 0 && frameOffset == len(frame),
-				BatchIndex:         0, BatchSize: 1, Err: writeErr,
-			})
-		}
-		interrupted := write.finish(writeErr, complete)
+		}()
 		if complete && (writeErr == nil || interrupted) {
 			return nil
 		}
@@ -347,6 +397,23 @@ func (p *PathConn) writeFrameDispatchFull(
 		}
 	}
 	return nil
+}
+
+func beginFrameDispatch(
+	tracer transport.FrameDispatchTracer,
+	authorization transport.FrameDispatchAuthorization,
+) (span transport.FrameDispatchSpan) {
+	defer func() {
+		if recover() != nil {
+			span = nil
+		}
+	}()
+	return tracer.BeginFrameDispatch(authorization)
+}
+
+func finishFrameDispatch(span transport.FrameDispatchSpan, completion transport.FrameDispatchCompletion) {
+	defer func() { _ = recover() }()
+	span.FinishFrameDispatch(completion)
 }
 
 // Close shuts the socket. After Close, Read and Write return
