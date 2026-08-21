@@ -10,40 +10,22 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
-type observationBarrierPath struct {
-	*lifecycleHealthyPath
-	armed   atomic.Bool
-	once    sync.Once
-	entered chan struct{}
-	release chan struct{}
-}
-
-func newObservationBarrierPath() *observationBarrierPath {
-	return &observationBarrierPath{
-		lifecycleHealthyPath: newLifecycleHealthyPath(),
-		entered:              make(chan struct{}),
-		release:              make(chan struct{}),
-	}
-}
-
-func (p *observationBarrierPath) Quality() transport.PathQuality {
-	if p.armed.Load() {
-		p.once.Do(func() {
-			close(p.entered)
-			<-p.release
-		})
-	}
-	return transport.PathQuality{}
-}
-
 func TestConnectionObservationRetriesAcrossTopologyEpochChange(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
 	targets := configureLeafSelectorRuntime(t, e, "a", "b")
-	barrier := newObservationBarrierPath()
+	observationEntered := make(chan struct{})
+	releaseObservation := make(chan struct{})
+	var hookOnce atomic.Bool
+	e.connectionObservationAfterTopology = func() {
+		if hookOnce.CompareAndSwap(false, true) {
+			close(observationEntered)
+			<-releaseObservation
+		}
+	}
 	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(barrier.release) }) })
-	attachFixturePath(t, e, barrier,
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseObservation) }) })
+	attachFixturePath(t, e, newLifecycleHealthyPath(),
 		transport.PathSpec{Transport: "memory", Address: "observation-a"},
 		targets["a"],
 	)
@@ -59,19 +41,18 @@ func TestConnectionObservationRetriesAcrossTopologyEpochChange(t *testing.T) {
 		t.Fatalf("pre-change root delivery is not attributable: %+v", before)
 	}
 
-	barrier.armed.Store(true)
 	done := make(chan ConnectionObservationSnapshot, 1)
 	go func() { done <- e.ConnectionObservation() }()
 	select {
-	case <-barrier.entered:
+	case <-observationEntered:
 	case <-time.After(time.Second):
-		t.Fatal("observation did not reach the transport-quality barrier")
+		t.Fatal("observation did not reach the post-topology barrier")
 	}
 	attachFixturePath(t, e, newLifecycleHealthyPath(),
 		transport.PathSpec{Transport: "memory", Address: "observation-b"},
 		targets["b"],
 	)
-	releaseOnce.Do(func() { close(barrier.release) })
+	releaseOnce.Do(func() { close(releaseObservation) })
 
 	select {
 	case snapshot := <-done:

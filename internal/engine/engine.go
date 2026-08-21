@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/dispatchtrust"
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
@@ -117,21 +118,30 @@ type Engine struct {
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
 	// active at the time.
-	sendMu                  sequencerMutex
-	sendSeq                 uint64
-	sendAckNext             atomic.Uint64
-	sendACKProgress         atomic.Pointer[sendACKProgressObservation]
-	sendPublishedNext       atomic.Uint64
-	sendProof               proto.AckProof
-	sendAckProof            proto.AckProof
-	sendHistMu              sync.Mutex
-	sendHist                sendHistory
-	sendSlots               chan struct{}
-	sendControlSlots        chan struct{}
-	sendPolicyFinalSlots    chan struct{}
-	sendCreditWake          chan struct{}
-	packetWritesInFlight    atomic.Int64
-	packetFrameLimit        atomic.Int64
+	sendMu                     sequencerMutex
+	sendSeq                    uint64
+	sendAckNext                atomic.Uint64
+	sendACKProgress            atomic.Pointer[sendACKProgressObservation]
+	sendPublishedNext          atomic.Uint64
+	sendProof                  proto.AckProof
+	sendAckProof               proto.AckProof
+	sendHistMu                 sync.Mutex
+	sendHist                   sendHistory
+	sendSlots                  chan struct{}
+	sendControlSlots           chan struct{}
+	sendPolicyFinalSlots       chan struct{}
+	sendCreditWake             chan struct{}
+	packetWritesInFlight       atomic.Int64
+	packetFrameLimit           atomic.Int64
+	frameDispatchAdmissionNext atomic.Uint64
+	frameDispatchAttemptNext   atomic.Uint64
+	frameDispatchLeaseNext     atomic.Uint64
+	// frameDispatchLeases is protected by sendHistMu. It tracks callbacks that
+	// were authorized from one coherent ledger snapshot; it does not pin history
+	// or prevent a later cumulative ACK from retiring entries. Each job already
+	// owns immutable frame bytes, and batch attribution receipts are installed
+	// while the same authorization lock is held.
+	frameDispatchLeases     map[uint64]struct{}
 	lastApplicationDispatch atomic.Pointer[applicationDispatchDemandEvidence]
 	writeDeadlineMu         sync.Mutex
 	writeDeadlineState      atomic.Pointer[applicationWriteDeadlineState]
@@ -148,9 +158,23 @@ type Engine struct {
 	// pathDispatchBatchBeforePermitRelease is a deterministic package-test hook
 	// invoked after exact DATA witnesses are published while writePermit is held.
 	pathDispatchBatchBeforePermitRelease func(*pathSlot)
+	// frameDispatchBatchAfterValidation is a deterministic package-test hook
+	// invoked under sendHistMu after each batch item is validated. Tests use it
+	// to prove ACK processing cannot interleave the coherent batch snapshot.
+	frameDispatchBatchAfterValidation func(int)
+	// frameDispatchBatchAfterLease is a deterministic package-test hook invoked
+	// after the coherent lease is registered and sendHistMu has been released,
+	// but before any tracer or physical batch callback.
+	frameDispatchBatchAfterLease func()
+	// acknowledgeSendFramesBeforeLock is a deterministic package-test hook
+	// invoked immediately before cumulative ACK processing takes sendHistMu.
+	acknowledgeSendFramesBeforeLock func()
 	// boundedReplayBeforeSnapshot is a deterministic package-test hook.
 	// Tests install it before queuing replay and never mutate it concurrently.
 	boundedReplayBeforeSnapshot func()
+	// boundedReplayAfterSnapshot is a deterministic package-test hook invoked
+	// after the immutable replay batch has been copied from send history.
+	boundedReplayAfterSnapshot func()
 	// replayPublicationBeforeComplete is a deterministic package-test hook.
 	// It runs after a replay has covered its frozen frontier but before the
 	// generation-bound publication barrier is completed.
@@ -636,6 +660,30 @@ func (s *pathSlot) writeFrame(frame []byte) (int, error) {
 
 func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
 	n, err := s.conn.Write(frame)
+	s.recordFrameWrite(frame, n, err)
+	return n, err
+}
+
+func (s *pathSlot) writeFrameDispatchOwned(
+	frame []byte,
+	authorization transport.FrameDispatchAuthorization,
+) (int, error) {
+	if writer, ok := s.conn.(dispatchtrust.OwnedFrameWriter); ok {
+		n, err := dispatchtrust.Write(writer, frame, authorization)
+		s.recordFrameWrite(frame, n, err)
+		return n, err
+	}
+	writer, ok := s.conn.(transport.FrameDispatchWriter)
+	if !ok {
+		return s.writeFrameOwned(frame)
+	}
+	borrowed := append([]byte(nil), frame...)
+	n, err := writer.WriteFrameDispatch(borrowed, authorization)
+	s.recordFrameWrite(frame, n, err)
+	return n, err
+}
+
+func (s *pathSlot) recordFrameWrite(frame []byte, n int, err error) {
 	if err == nil && n == len(frame) && len(frame) >= proto.HeaderSize {
 		if header, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize]); decodeErr == nil {
 			if header.Type == proto.FrameData {
@@ -645,7 +693,6 @@ func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
 			}
 		}
 	}
-	return n, err
 }
 
 func (e *Engine) pathDataWriteToken(slot *pathSlot, fenceEpoch uint64) pathDataWriteToken {
@@ -742,10 +789,15 @@ func (s *pathSlot) writeDispatchedFrameEpoch(frame []byte, fenceEpoch uint64) (i
 	return s.writeDispatchedFrameEpochObserved(frame, fenceEpoch, nil, nil)
 }
 
+type dispatchedFrameWrite struct {
+	authorization transport.FrameDispatchAuthorization
+	atomic        bool
+}
+
 func (s *pathSlot) writeDispatchedFrameEpochObserved(
 	frame []byte,
 	fenceEpoch uint64,
-	beforeWrite func(),
+	beforeWrite func() (dispatchedFrameWrite, error),
 	afterWrite func(int, error),
 ) (int, error) {
 	if !s.txEnabled.Load() || s.txFenceEpoch.Load() != fenceEpoch {
@@ -761,14 +813,39 @@ func (s *pathSlot) writeDispatchedFrameEpochObserved(
 	if !s.txEnabled.Load() || s.txFenceEpoch.Load() != fenceEpoch {
 		return 0, ErrPathTXFenced
 	}
+	var prepared dispatchedFrameWrite
 	if beforeWrite != nil {
-		beforeWrite()
+		var err error
+		prepared, err = beforeWrite()
+		if err != nil {
+			return 0, err
+		}
 	}
-	n, err := s.writeFrameOwned(frame)
+	var n int
+	var err error
+	if prepared.atomic {
+		n, err = s.writeFrameDispatchOwned(frame, prepared.authorization)
+	} else {
+		n, err = s.writeFrameOwned(frame)
+	}
+	n, err = normalizeFrameWriteResult(len(frame), n, err)
 	if afterWrite != nil {
 		afterWrite(n, err)
 	}
 	return n, err
+}
+
+func normalizeFrameWriteResult(frameBytes, written int, err error) (int, error) {
+	if written < 0 || written > frameBytes {
+		return written, errors.Join(err, fmt.Errorf(
+			"engine: PathConn returned invalid write count %d for %d-byte frame",
+			written, frameBytes,
+		))
+	}
+	if err == nil && written != frameBytes {
+		err = io.ErrShortWrite
+	}
+	return written, err
 }
 
 func (s *pathSlot) tryFenceDispatch() bool {

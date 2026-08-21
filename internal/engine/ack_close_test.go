@@ -45,6 +45,20 @@ func reserveAckTestFrame(t *testing.T, e *Engine, seq uint64, frameType proto.Fr
 	}
 }
 
+func reservePublishedTestFrame(t *testing.T, e *Engine, frame []byte) {
+	t.Helper()
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.acquireSendSlot(header.Type == proto.FrameCtrl, len(frame)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reserveAndPublishOwnedSendFrame(append([]byte(nil), frame...)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPeerAckClampedToSentSeq(t *testing.T) {
 	e := New(SideClient, [16]byte{2}, Limits{})
 	reserveAckTestFrame(t, e, 0, proto.FrameData)

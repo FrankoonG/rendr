@@ -122,9 +122,7 @@ func TestPacketLinkChallengeRoundTripUsesCandidateTuple(t *testing.T) {
 		t.Fatalf("challenge round trip: %v; server pending=%+v generation=%d remote=%v",
 			err, pending, peerGeneration, peerRemote)
 	}
-	serverOwner.mu.Lock()
-	pending := serverOwner.pendingPeer
-	serverOwner.mu.Unlock()
+	pending := waitForPeerQualification(t, serverOwner, generation, control)
 	if pending == nil || pending.generation != generation || pending.control != control {
 		t.Fatalf("server pending challenge=%+v", pending)
 	}

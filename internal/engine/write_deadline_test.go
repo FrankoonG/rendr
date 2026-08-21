@@ -305,10 +305,11 @@ func TestWriteDeadlineDoesNotApplyToControlOrReplay(t *testing.T) {
 		t.Fatalf("control inherited application deadline: %v", err)
 	}
 	frame := make([]byte, proto.HeaderSize+1)
-	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 0}).Encode(frame[:proto.HeaderSize]); err != nil {
+	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 1}).Encode(frame[:proto.HeaderSize]); err != nil {
 		t.Fatal(err)
 	}
 	frame[proto.HeaderSize] = 1
+	reservePublishedTestFrame(t, e, frame)
 	if err := e.replaySequencedFrame(frame); err != nil {
 		t.Fatalf("replay inherited application deadline: %v", err)
 	}

@@ -546,6 +546,7 @@ func TestRecursiveReplayHonorsRootSelectorInsteadOfInactiveNestedScope(t *testin
 	}
 
 	frame := executionDataFrame(t, 77, []byte("replay"))
+	reservePublishedTestFrame(t, e, frame)
 	if err := e.redistributeFrames([][]byte{frame}); err != nil {
 		t.Fatal(err)
 	}

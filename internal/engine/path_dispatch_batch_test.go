@@ -1,14 +1,17 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/dispatchtrust"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -23,8 +26,176 @@ type recordingFrameBatchPath struct {
 	batchStarted   chan struct{}
 	batchStartOnce sync.Once
 	batchHook      func([][]byte) (int, error)
+	authorizations []FrameDispatchAuthorization
+	completions    []FrameDispatchCompletion
 	closed         chan struct{}
 	closeOnce      sync.Once
+}
+
+type recordingFrameBatchSpan struct {
+	path *recordingFrameBatchPath
+}
+
+type atomicRecordingFrameBatchPath struct {
+	*recordingFrameBatchPath
+	atomicWrites int
+}
+
+type mutatingFrameDispatchPath struct {
+	transport.PathConn
+	mutated bool
+}
+
+type ownedFrameDispatchPath struct {
+	transport.PathConn
+	ownedFrame *byte
+	owned      bool
+	fallback   bool
+}
+
+func (p *ownedFrameDispatchPath) WriteFrameDispatch(
+	frame []byte,
+	_ FrameDispatchAuthorization,
+) (int, error) {
+	p.fallback = true
+	return len(frame), nil
+}
+
+func (p *ownedFrameDispatchPath) WriteOwnedFrameDispatch(
+	_ dispatchtrust.Token,
+	frame []byte,
+	_ FrameDispatchAuthorization,
+) (int, error) {
+	p.owned = true
+	if len(frame) != 0 {
+		p.ownedFrame = &frame[0]
+	}
+	return len(frame), nil
+}
+
+func (p *mutatingFrameDispatchPath) WriteFrameDispatch(
+	frame []byte,
+	_ FrameDispatchAuthorization,
+) (int, error) {
+	if len(frame) != 0 {
+		frame[0] ^= 0xff
+		p.mutated = true
+	}
+	return len(frame), nil
+}
+
+func (p *atomicRecordingFrameBatchPath) WriteFrameDispatch(
+	frame []byte,
+	authorization FrameDispatchAuthorization,
+) (int, error) {
+	span := p.BeginFrameDispatch(authorization)
+	started := time.Now()
+	n, err := p.recordingFrameBatchPath.Write(frame)
+	finished := time.Now()
+	span.FinishFrameDispatch(FrameDispatchCompletion{
+		StartedAt: started, CompletedAt: finished, FrameBytes: len(frame),
+		BytesWritten: n, BytesWrittenKnown: true,
+		AttemptState: FrameDispatchAttempted, WriteAttempted: true,
+		WholeFrameAccepted: n == len(frame), BatchIndex: 0, BatchSize: 1, Err: err,
+	})
+	p.mu.Lock()
+	p.atomicWrites++
+	p.mu.Unlock()
+	return n, err
+}
+
+func TestFrameDispatchWriterCannotMutateReplayOwnedFrame(t *testing.T) {
+	t.Run("external writer receives defensive copy", func(t *testing.T) {
+		e, slot, _ := newBatchDispatchHarness(t, false)
+		mutating := &mutatingFrameDispatchPath{PathConn: slot.conn}
+		slot.conn = mutating
+		frame := executionDataFrame(t, 0, []byte("immutable replay owner"))
+		want := append([]byte(nil), frame...)
+		waiter := queueBatchApplicationFrame(t, e, slot, frame, true)
+		startBatchDispatchHarness(t, e, slot)
+		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !mutating.mutated {
+			t.Fatal("adversarial dispatch writer did not mutate its borrowed input")
+		}
+		e.sendHistMu.Lock()
+		defer e.sendHistMu.Unlock()
+		entry := e.sendHistoryEntryLocked(0)
+		if entry == nil {
+			t.Fatal("dispatch writer retired replay-owned frame without an ACK")
+		}
+		if !bytes.Equal(entry.frame, want) || proto.DigestFrame(entry.frame) != proto.DigestFrame(want) {
+			t.Fatalf("dispatch writer corrupted replay-owned frame: entry=%x want=%x", entry.frame, want)
+		}
+	})
+
+	t.Run("sealed writer receives owned frame", func(t *testing.T) {
+		e, slot, _ := newBatchDispatchHarness(t, false)
+		owned := &ownedFrameDispatchPath{PathConn: slot.conn}
+		slot.conn = owned
+		frame := executionDataFrame(t, 0, []byte("sealed owned dispatch"))
+		waiter := queueBatchApplicationFrame(t, e, slot, frame, true)
+		startBatchDispatchHarness(t, e, slot)
+		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !owned.owned || owned.fallback {
+			t.Fatalf("owned/fallback=%t/%t, want true/false", owned.owned, owned.fallback)
+		}
+		if owned.ownedFrame == nil || owned.ownedFrame != &frame[0] {
+			t.Fatal("sealed writer did not receive the replay-owned backing array")
+		}
+	})
+}
+
+func BenchmarkFrameDispatchAuthorizationMetadata(b *testing.B) {
+	for _, payloadBytes := range []int{1024, MaxPayload} {
+		b.Run(fmt.Sprintf("payload-%d", payloadBytes), func(b *testing.B) {
+			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+			b.Cleanup(func() { _ = e.Close() })
+			frame := make([]byte, proto.HeaderSize+payloadBytes)
+			if err := (proto.Header{Version: proto.Version, Type: proto.FrameData}).Encode(frame); err != nil {
+				b.Fatal(err)
+			}
+			if err := e.acquireSendSlot(false, len(frame)); err != nil {
+				b.Fatal(err)
+			}
+			if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
+				b.Fatal(err)
+			}
+			admission, err := e.admitFrameDispatch(frame, true)
+			if err != nil {
+				b.Fatal(err)
+			}
+			digest := proto.DigestFrame(frame)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				e.sendHistMu.Lock()
+				_, data, retired, err := e.authorizeFrameDispatchLocked(frame, digest, admission)
+				e.sendHistMu.Unlock()
+				if err != nil || !data || retired {
+					b.Fatalf("authorization data/retired/error=%t/%t/%v", data, retired, err)
+				}
+			}
+		})
+	}
+}
+
+func (p *recordingFrameBatchPath) BeginFrameDispatch(
+	authorization FrameDispatchAuthorization,
+) FrameDispatchSpan {
+	p.mu.Lock()
+	p.authorizations = append(p.authorizations, authorization)
+	p.mu.Unlock()
+	return &recordingFrameBatchSpan{path: p}
+}
+
+func (span *recordingFrameBatchSpan) FinishFrameDispatch(completion FrameDispatchCompletion) {
+	span.path.mu.Lock()
+	span.path.completions = append(span.path.completions, completion)
+	span.path.mu.Unlock()
 }
 
 func newRecordingFrameBatchPath(path transport.PathConn) *recordingFrameBatchPath {
@@ -89,6 +260,16 @@ func (p *recordingFrameBatchPath) snapshot() ([][]uint64, []proto.FrameType, []u
 		batches[i] = append([]uint64(nil), p.batches[i]...)
 	}
 	return batches, append([]proto.FrameType(nil), p.ordinaryTypes...), append([]uint64(nil), p.ordinarySeqs...)
+}
+
+func (p *recordingFrameBatchPath) traceSnapshot() (
+	[]FrameDispatchAuthorization,
+	[]FrameDispatchCompletion,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]FrameDispatchAuthorization(nil), p.authorizations...),
+		append([]FrameDispatchCompletion(nil), p.completions...)
 }
 
 func (p *recordingFrameBatchPath) Close() error {
@@ -169,12 +350,254 @@ func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 		t.Fatalf("batch write max=%d want %d", got, maximumPathDispatchBatch)
 	}
 
-	replay := queueBatchApplicationJob(t, e, slot, 999, false)
+	replay := queueBatchApplicationJob(t, e, slot, maximumPathDispatchBatch, false)
 	if result := awaitBatchDispatchResult(t, replay); result.err != nil {
 		t.Fatalf("replay dispatch: %v", result.err)
 	}
 	if next, ok := slot.earliestDataWriteAfter(maximumPathDispatchBatch, token); ok {
 		t.Fatalf("replay-only DATA became a causal path witness: next=%d", next)
+	}
+}
+
+func TestPathWriterDisablesBatchWhenAtomicDispatchWriterIsPresent(t *testing.T) {
+	e, slot, recording := newBatchDispatchHarness(t, true)
+	atomicPath := &atomicRecordingFrameBatchPath{recordingFrameBatchPath: recording}
+	slot.conn = atomicPath
+	waiters := []*applicationDispatchWaiter{
+		queueBatchApplicationJob(t, e, slot, 0, true),
+		queueBatchApplicationJob(t, e, slot, 1, true),
+	}
+	startBatchDispatchHarness(t, e, slot)
+	for _, waiter := range waiters {
+		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
+			t.Fatalf("atomic dispatch: %v", result.err)
+		}
+	}
+	batches, _, sequences := recording.snapshot()
+	recording.mu.Lock()
+	atomicWrites := atomicPath.atomicWrites
+	recording.mu.Unlock()
+	if len(batches) != 0 || atomicWrites != 2 || !equalBatchSequences(sequences, []uint64{0, 1}) {
+		t.Fatalf("batches/atomic/ordinary=%v/%d/%v want none/2/[0 1]", batches, atomicWrites, sequences)
+	}
+}
+
+func TestPathWriterBatchSuppressesACKRetiredDATAReplay(t *testing.T) {
+	e, slot, path := newBatchDispatchHarness(t, true)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	slot.dispatchBeforeWritePermit = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	frames := [][]byte{
+		executionDataFrame(t, 0, []byte{0}),
+		executionDataFrame(t, 1, []byte{1}),
+	}
+	admissions := make([]frameDispatchAdmission, len(frames))
+	for i, frame := range frames {
+		if err := e.acquireSendSlot(false, len(frame)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		admissions[i], err = e.admitFrameDispatch(frame, false)
+		if err != nil {
+			t.Fatalf("admit replay %d: %v", i, err)
+		}
+	}
+	retired := queueBatchApplicationFrameWithAdmission(t, e, slot, frames[0], false, admissions[0])
+	unacknowledged := queueBatchApplicationFrameWithAdmission(t, e, slot, frames[1], false, admissions[1])
+	startBatchDispatchHarness(t, e, slot)
+	awaitSignal(t, entered, "batch final write boundary")
+	if !e.notePeerAck(currentAck(e, 1)) {
+		t.Fatal("proof-valid cumulative ACK was rejected")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if result := awaitBatchDispatchResult(t, retired); result.err != nil {
+		t.Fatalf("retired replay: %v", result.err)
+	}
+	if result := awaitBatchDispatchResult(t, unacknowledged); result.err != nil {
+		t.Fatalf("unacknowledged replay: %v", result.err)
+	}
+
+	batches, ordinary, _ := path.snapshot()
+	if len(batches) != 1 || !equalBatchSequences(batches[0], []uint64{1}) {
+		t.Fatalf("batch DATA=%v want [[1]]", batches)
+	}
+	if len(ordinary) != 0 {
+		t.Fatalf("ordinary writes=%v want none", ordinary)
+	}
+}
+
+func TestPathWriterBatchPublishesNoTraceWhenAnyAdmissionFails(t *testing.T) {
+	e, slot, path := newBatchDispatchHarness(t, true)
+	validFrame := executionDataFrame(t, 0, []byte("valid"))
+	valid := queueBatchApplicationFrame(t, e, slot, validFrame, true)
+	invalidFrame := executionDataFrame(t, 1, []byte("invalid"))
+	invalid := queueBatchApplicationFrameWithAdmission(
+		t, e, slot, invalidFrame, true, frameDispatchAdmission{},
+	)
+	startBatchDispatchHarness(t, e, slot)
+	for name, waiter := range map[string]*applicationDispatchWaiter{
+		"valid prefix":   valid,
+		"invalid suffix": invalid,
+	} {
+		if result := awaitBatchDispatchResult(t, waiter); !errors.Is(result.err, errFrameDispatchAdmission) {
+			t.Fatalf("%s result=%v want admission failure", name, result.err)
+		}
+	}
+	batches, ordinary, _ := path.snapshot()
+	authorizations, completions := path.traceSnapshot()
+	if len(batches) != 0 || len(ordinary) != 0 || len(authorizations) != 0 || len(completions) != 0 {
+		t.Fatalf("batches/ordinary/authorizations/completions=%v/%v/%d/%d, want no physical attempt",
+			batches, ordinary, len(authorizations), len(completions))
+	}
+}
+
+func TestPathWriterBatchTraceBindsCompletedPrefix(t *testing.T) {
+	e, slot, path := newBatchDispatchHarness(t, true)
+	writeErr := errors.New("batch suffix failed")
+	path.batchHook = func([][]byte) (int, error) { return 1, writeErr }
+	first := queueBatchApplicationJob(t, e, slot, 0, true)
+	second := queueBatchApplicationJob(t, e, slot, 1, true)
+	third := queueBatchApplicationJob(t, e, slot, 2, true)
+	startBatchDispatchHarness(t, e, slot)
+	if result := awaitBatchDispatchResult(t, first); result.err != nil {
+		t.Fatalf("completed prefix result: %v", result.err)
+	}
+	if result := awaitBatchDispatchResult(t, second); !errors.Is(result.err, writeErr) {
+		t.Fatalf("incomplete suffix result=%v want %v", result.err, writeErr)
+	}
+	if result := awaitBatchDispatchResult(t, third); !errors.Is(result.err, writeErr) {
+		t.Fatalf("unattempted suffix result=%v want %v", result.err, writeErr)
+	}
+	authorizations, completions := path.traceSnapshot()
+	if len(authorizations) != 3 || len(completions) != 3 {
+		t.Fatalf("authorization/completion=%d/%d", len(authorizations), len(completions))
+	}
+	if authorizations[0].AttemptID == 0 || authorizations[1].AttemptID <= authorizations[0].AttemptID ||
+		authorizations[2].AttemptID <= authorizations[1].AttemptID {
+		t.Fatalf("attempt identities=%d/%d/%d", authorizations[0].AttemptID,
+			authorizations[1].AttemptID, authorizations[2].AttemptID)
+	}
+	for index, completion := range completions {
+		if completion.BatchIndex != index || completion.BatchSize != 3 ||
+			completion.StartedAt.IsZero() || completion.CompletedAt.Before(completion.StartedAt) {
+			t.Fatalf("completion[%d]=%+v", index, completion)
+		}
+	}
+	if firstCompletion := completions[0]; !firstCompletion.BytesWrittenKnown ||
+		firstCompletion.BytesWritten != firstCompletion.FrameBytes ||
+		firstCompletion.AttemptState != FrameDispatchAttempted || !firstCompletion.WriteAttempted ||
+		!firstCompletion.WholeFrameAccepted ||
+		firstCompletion.Err != nil {
+		t.Fatalf("completed prefix=%+v", firstCompletion)
+	}
+	for index, suffix := range completions[1:] {
+		if suffix.AttemptState != FrameDispatchAttemptUnknown || suffix.WriteAttempted ||
+			suffix.BytesWrittenKnown || suffix.WholeFrameAccepted || !errors.Is(suffix.Err, writeErr) {
+			t.Fatalf("unknown suffix[%d]=%+v", index+1, suffix)
+		}
+	}
+}
+
+func TestPathWriterBatchLeaseLinearizesBeforeConcurrentACKRetirement(t *testing.T) {
+	e, slot, path := newBatchDispatchHarness(t, true)
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+		runtimeNode(proto.GraphNodeKindPath, "path"),
+	)
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	slot.localTXTargetID = ids["path"]
+	frames := [][]byte{
+		executionDataFrame(t, 0, []byte("first")),
+		executionDataFrame(t, 1, []byte("second")),
+	}
+	admissions := make([]frameDispatchAdmission, len(frames))
+	for index, frame := range frames {
+		if err := e.acquireSendSlot(false, len(frame)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		admissions[index], err = e.admitFrameDispatch(frame, false)
+		if err != nil {
+			t.Fatalf("admit frame %d: %v", index, err)
+		}
+	}
+	ack := currentAck(e, 2)
+	first := queueBatchApplicationFrameWithAdmission(t, e, slot, frames[0], false, admissions[0])
+	second := queueBatchApplicationFrameWithAdmission(t, e, slot, frames[1], false, admissions[1])
+
+	ackAttempting := make(chan struct{})
+	ackDone := make(chan bool, 1)
+	var startACK sync.Once
+	var acknowledgeHook sync.Once
+	e.acknowledgeSendFramesBeforeLock = func() {
+		acknowledgeHook.Do(func() { close(ackAttempting) })
+	}
+	e.frameDispatchBatchAfterValidation = func(index int) {
+		if index == 1 {
+			select {
+			case <-ackDone:
+				t.Error("cumulative ACK retired the ledger between coherent batch item validations")
+			default:
+			}
+			return
+		}
+		if index != 0 {
+			return
+		}
+		startACK.Do(func() {
+			go func() {
+				ackDone <- e.notePeerAck(ack)
+			}()
+		})
+		<-ackAttempting
+	}
+	e.frameDispatchBatchAfterLease = func() {
+		select {
+		case accepted := <-ackDone:
+			if !accepted {
+				t.Error("proof-valid cumulative ACK was rejected")
+			}
+		case <-time.After(time.Second):
+			t.Error("ACK remained blocked after coherent batch lease registration")
+		}
+	}
+	startBatchDispatchHarness(t, e, slot)
+	if result := awaitBatchDispatchResult(t, first); result.err != nil {
+		t.Fatalf("first leased dispatch: %v", result.err)
+	}
+	if result := awaitBatchDispatchResult(t, second); result.err != nil {
+		t.Fatalf("second leased dispatch: %v", result.err)
+	}
+
+	batches, ordinary, _ := path.snapshot()
+	if len(batches) != 1 || !equalBatchSequences(batches[0], []uint64{0, 1}) || len(ordinary) != 0 {
+		t.Fatalf("physical batch/ordinary=%v/%v want [[0 1]]/none", batches, ordinary)
+	}
+	e.sendHistMu.Lock()
+	activeLeases := len(e.frameDispatchLeases)
+	e.sendHistMu.Unlock()
+	if activeLeases != 0 {
+		t.Fatalf("active frame dispatch leases=%d want 0", activeLeases)
+	}
+	e.sendHistMu.Lock()
+	acked := e.sendHist.targetDelivery[ids["path"]].totalAcked
+	e.sendHistMu.Unlock()
+	if want := uint64(len("first") + len("second")); acked != want {
+		t.Fatalf("ACK-retired batch attribution=%d want %d", acked, want)
 	}
 }
 
@@ -598,8 +1021,9 @@ func TestPathWriterBatchExtensionLeavesStreamAndReplayWritesOrdinary(t *testing.
 	t.Run("packet replay", func(t *testing.T) {
 		e, slot, path := newBatchDispatchHarness(t, true)
 		result := make(chan pathDispatchResult, 1)
+		frame := executionDataFrame(t, 8, []byte("replay"))
 		if !slot.submitDispatch(pathDispatchJob{
-			frame:  executionDataFrame(t, 8, []byte("replay")),
+			frame: frame, admission: ensureBatchTestFrameAdmission(t, e, frame, false),
 			result: result, generation: slot.dispatchNextGen.Add(1),
 		}) {
 			t.Fatal("failed to queue replay dispatch")
@@ -1378,12 +1802,27 @@ func queueBatchApplicationFrame(
 	frame []byte,
 	firstPublication bool,
 ) *applicationDispatchWaiter {
+	admission := ensureBatchTestFrameAdmission(t, e, frame, firstPublication)
+	return queueBatchApplicationFrameWithAdmission(
+		t, e, slot, frame, firstPublication, admission,
+	)
+}
+
+func queueBatchApplicationFrameWithAdmission(
+	t *testing.T,
+	e *Engine,
+	slot *pathSlot,
+	frame []byte,
+	firstPublication bool,
+	admission frameDispatchAdmission,
+) *applicationDispatchWaiter {
 	t.Helper()
 	waiter := acquireApplicationDispatchWaiter()
 	job := pathDispatchJob{
 		frame:            frame,
 		topologyEpoch:    e.currentPathTopologyEpoch(),
 		firstPublication: firstPublication,
+		admission:        admission,
 		applicationWait:  waiter,
 		generation:       slot.dispatchNextGen.Add(1),
 	}
@@ -1392,6 +1831,46 @@ func queueBatchApplicationFrame(
 		t.Fatal("failed to queue packet application dispatch")
 	}
 	return waiter
+}
+
+func ensureBatchTestFrameAdmission(
+	t *testing.T,
+	e *Engine,
+	frame []byte,
+	firstPublication bool,
+) frameDispatchAdmission {
+	t.Helper()
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil || header.Type != proto.FrameData {
+		t.Fatalf("invalid batch test DATA: %v", err)
+	}
+	e.sendHistMu.Lock()
+	entry := e.sendHistoryEntryLocked(header.Seq)
+	publishedNext := e.sendPublishedNext.Load()
+	e.sendHistMu.Unlock()
+	if entry != nil {
+		if proto.DigestFrame(entry.frame) != proto.DigestFrame(frame) {
+			t.Fatalf("batch test sequence %d already has a different ledger frame", header.Seq)
+		}
+	} else {
+		for sequence := publishedNext; sequence <= header.Seq; sequence++ {
+			owned := frame
+			if sequence != header.Seq {
+				owned = executionDataFrame(t, sequence, []byte{byte(sequence)})
+			}
+			if err := e.acquireSendSlot(false, len(owned)); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.reserveAndPublishOwnedSendFrame(append([]byte(nil), owned...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	admission, err := e.admitFrameDispatch(frame, firstPublication)
+	if err != nil {
+		t.Fatalf("admit batch test DATA %d: %v", header.Seq, err)
+	}
+	return admission
 }
 
 func queueBatchControlJob(t *testing.T, slot *pathSlot, seq uint64) <-chan pathDispatchResult {

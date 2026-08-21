@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/dispatchtrust"
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
@@ -28,6 +29,8 @@ const MaxFrameSize = 1<<16 - 1
 type Transport struct{}
 
 var _ transport.PathQualityReader = (*PathConn)(nil)
+var _ transport.FrameDispatchWriter = (*PathConn)(nil)
+var _ dispatchtrust.OwnedFrameWriter = (*PathConn)(nil)
 
 // New returns a Transport ready for use.
 func New() *Transport { return &Transport{} }
@@ -202,6 +205,35 @@ func (p *PathConn) Read(buf []byte) (int, error) {
 // 2-byte length prefix and sends it. Concurrent Writes are
 // serialised so a frame is never interleaved with another.
 func (p *PathConn) Write(frame []byte) (int, error) {
+	return p.writeFrame(frame, nil)
+}
+
+// WriteFrameDispatch binds engine authorization to each exact endpoint
+// incarnation used by this logical framed write. Unlike a separate tracer
+// lookup followed by Write, endpoint maintenance cannot replace the connection
+// in the gap between authorization and physical I/O.
+func (p *PathConn) WriteFrameDispatch(
+	frame []byte,
+	authorization transport.FrameDispatchAuthorization,
+) (int, error) {
+	return p.writeFrame(frame, &authorization)
+}
+
+// WriteOwnedFrameDispatch is the module-private zero-copy variant used by the
+// engine for replay-ledger-owned bytes. The synchronous write never retains or
+// mutates frame.
+func (p *PathConn) WriteOwnedFrameDispatch(
+	_ dispatchtrust.Token,
+	frame []byte,
+	authorization transport.FrameDispatchAuthorization,
+) (int, error) {
+	return p.writeFrame(frame, &authorization)
+}
+
+func (p *PathConn) writeFrame(
+	frame []byte,
+	authorization *transport.FrameDispatchAuthorization,
+) (int, error) {
 	if len(frame) == 0 || len(frame) > MaxFrameSize {
 		return 0, fmt.Errorf("tcp: frame size %d out of range (1..%d)", len(frame), MaxFrameSize)
 	}
@@ -213,16 +245,108 @@ func (p *PathConn) Write(frame []byte) (int, error) {
 	}
 	var lp [LengthPrefixSize]byte
 	binary.BigEndian.PutUint16(lp[:], uint16(len(frame)))
-	if err := p.writeFull(lp[:]); err != nil {
-		p.declareDeath(err)
-		return 0, p.swallow(err)
+	var err error
+	if authorization == nil {
+		if err = p.writeFull(lp[:]); err == nil {
+			err = p.writeFull(frame)
+		}
+	} else {
+		err = p.writeFrameDispatchFull(lp[:], frame, *authorization)
 	}
-	if err := p.writeFull(frame); err != nil {
+	if err != nil {
 		p.declareDeath(err)
 		return 0, p.swallow(err)
 	}
 	p.writes.Add(1)
 	return len(frame), nil
+}
+
+func (p *PathConn) writeFrameDispatchFull(
+	prefix []byte,
+	frame []byte,
+	authorization transport.FrameDispatchAuthorization,
+) error {
+	prefixOffset, frameOffset := 0, 0
+	physicalOccurrence := uint64(0)
+	for prefixOffset < len(prefix) || frameOffset < len(frame) {
+		write, err := p.endpoint.acquireWrite()
+		if err != nil {
+			return err
+		}
+		frameStart := frameOffset
+		physicalOccurrence++
+		startedAt := time.Now()
+		var span transport.FrameDispatchSpan
+		if tracer, ok := write.conn.(transport.FrameDispatchTracer); ok {
+			physical := authorization
+			physical.PhysicalOccurrence = physicalOccurrence
+			physical.EndpointGeneration = write.generation
+			physical.FrameOffset = frameStart
+			span = tracer.BeginFrameDispatch(physical)
+		}
+
+		attempted := false
+		writeCalls := 0
+		var writeErr error
+		for prefixOffset < len(prefix) || frameOffset < len(frame) {
+			part := frame[frameOffset:]
+			writingFrame := true
+			if prefixOffset < len(prefix) {
+				part = prefix[prefixOffset:]
+				writingFrame = false
+			}
+			attempted = true
+			writeCalls++
+			n, err := write.conn.Write(part)
+			if n < 0 || n > len(part) {
+				writeErr = fmt.Errorf("tcp: endpoint returned invalid write count %d for %d bytes", n, len(part))
+				break
+			}
+			if writingFrame {
+				frameOffset += n
+			} else {
+				prefixOffset += n
+			}
+			if err != nil {
+				writeErr = err
+				break
+			}
+			if n == 0 {
+				writeErr = errors.New("tcp: endpoint write made no progress")
+				break
+			}
+		}
+		complete := prefixOffset == len(prefix) && frameOffset == len(frame)
+		completedAt := time.Now()
+		if span != nil {
+			attemptState := transport.FrameDispatchAttemptUnknown
+			if attempted {
+				attemptState = transport.FrameDispatchAttempted
+			}
+			span.FinishFrameDispatch(transport.FrameDispatchCompletion{
+				StartedAt: startedAt, CompletedAt: completedAt, FrameBytes: len(frame),
+				BytesWritten: frameOffset - frameStart, BytesWrittenKnown: true,
+				WriteCalls:   writeCalls,
+				AttemptState: attemptState, WriteAttempted: attempted,
+				WholeFrameAccepted: frameStart == 0 && frameOffset == len(frame),
+				BatchIndex:         0, BatchSize: 1, Err: writeErr,
+			})
+		}
+		interrupted := write.finish(writeErr, complete)
+		if complete && (writeErr == nil || interrupted) {
+			return nil
+		}
+		if writeErr != nil {
+			if interrupted {
+				continue
+			}
+			if !p.endpoint.markFailure(write.generation) {
+				continue
+			}
+			return writeErr
+		}
+	}
+	return nil
 }
 
 // Close shuts the socket. After Close, Read and Write return

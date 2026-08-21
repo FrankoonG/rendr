@@ -152,6 +152,7 @@ type ConnectionObservationSnapshot struct {
 type sendHistoryEntry struct {
 	seq                   uint64
 	frame                 []byte
+	frameDigest           proto.FrameDigest
 	application           bool
 	control               bool
 	policyFinal           bool
@@ -289,9 +290,11 @@ func (e *Engine) reserveSendFrameClass(
 	if !takeOwnership {
 		ledgerFrame = append([]byte(nil), frame...)
 	}
+	frameDigest := proto.DigestFrame(frame)
 	entry := sendHistoryEntry{
 		seq:           hdr.Seq,
 		frame:         ledgerFrame,
+		frameDigest:   frameDigest,
 		control:       hdr.Type == proto.FrameCtrl,
 		policyFinal:   policyFinal,
 		terminal:      terminal,
@@ -308,7 +311,7 @@ func (e *Engine) reserveSendFrameClass(
 		}
 		entry.application = entry.applicationBytes != 0
 	}
-	entry.proof = proto.AdvanceAckProof(e.sendProof, proto.DigestFrame(frame))
+	entry.proof = proto.AdvanceAckProof(e.sendProof, frameDigest)
 
 	e.sendHistMu.Lock()
 	defer e.sendHistMu.Unlock()
@@ -917,6 +920,23 @@ func (e *Engine) beginApplicationBatchDispatch(
 	slot *pathSlot,
 	topologyEpoch uint64,
 ) *batchDispatchAttributionReceipt {
+	binding := e.localGraphBinding()
+	started := nowFn()
+	e.sendHistMu.Lock()
+	receipt := e.beginApplicationBatchDispatchLocked(frame, slot, topologyEpoch, binding, started)
+	e.sendHistMu.Unlock()
+	return receipt
+}
+
+// beginApplicationBatchDispatchLocked creates the receipt before a cumulative
+// ACK can detach the replay entry. The caller holds sendHistMu.
+func (e *Engine) beginApplicationBatchDispatchLocked(
+	frame []byte,
+	slot *pathSlot,
+	topologyEpoch uint64,
+	binding graphBinding,
+	started time.Time,
+) *batchDispatchAttributionReceipt {
 	if slot == nil || len(frame) < proto.HeaderSize {
 		return nil
 	}
@@ -924,15 +944,11 @@ func (e *Engine) beginApplicationBatchDispatch(
 	if err != nil || header.Type != proto.FrameData {
 		return nil
 	}
-	binding := e.localGraphBinding()
 	if !binding.containsLeaf(slot.localTXTargetID) {
 		return nil
 	}
-	started := nowFn()
-	e.sendHistMu.Lock()
 	entry := e.sendHistoryEntryLocked(header.Seq)
 	if entry == nil {
-		e.sendHistMu.Unlock()
 		return nil
 	}
 	record := entry.batchAttribution
@@ -947,7 +963,6 @@ func (e *Engine) beginApplicationBatchDispatch(
 		entry.batchAttribution = record
 	}
 	record.pending++
-	e.sendHistMu.Unlock()
 	return &batchDispatchAttributionReceipt{
 		record: record, targetID: slot.localTXTargetID,
 		topologyEpoch: topologyEpoch, started: started,
@@ -1510,6 +1525,9 @@ func (e *Engine) acknowledgeSendFramesAt(
 	// outside the replay hot lock so ACK processing never nests graphMu below
 	// sendHistMu.
 	binding := e.localGraphBinding()
+	if e.acknowledgeSendFramesBeforeLock != nil {
+		e.acknowledgeSendFramesBeforeLock()
+	}
 	e.sendHistMu.Lock()
 	current := e.sendAckNext.Load()
 	if nextSeq < current {

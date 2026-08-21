@@ -75,6 +75,22 @@ type admissionBlockingSuccessfulWritePath struct {
 	writeOnce sync.Once
 }
 
+type admissionDataDropPath struct {
+	transport.PathConn
+	dropped atomic.Uint64
+}
+
+func (p *admissionDataDropPath) Write(frame []byte) (int, error) {
+	if len(frame) >= proto.HeaderSize {
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err == nil && header.Type == proto.FrameData {
+			p.dropped.Add(1)
+			return len(frame), nil
+		}
+	}
+	return p.PathConn.Write(frame)
+}
+
 func (p *admissionBlockingSuccessfulWritePath) Write(frame []byte) (int, error) {
 	p.writeOnce.Do(func() { close(p.entered) })
 	<-p.release
@@ -407,8 +423,8 @@ func TestPathAdmissionCloseQuiescesEveryLifecycleSet(t *testing.T) {
 
 func TestPathAdmissionRetainedActivationReplaysUnackedDataOnce(t *testing.T) {
 	client, server, clientBinding, serverBinding := newAdmissionAdversarialEnginePair(t)
-	oldClient, oldServer := newMemoryPathPair()
-	oldClient.dropWrites.Store(true)
+	oldClientBase, oldServer := newMemoryPathPair()
+	oldClient := &admissionDataDropPath{PathConn: oldClientBase}
 	if _, err := client.AttachPathBound(oldClient, transport.PathSpec{Transport: "memory"}, clientBinding); err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +445,9 @@ func TestPathAdmissionRetainedActivationReplaysUnackedDataOnce(t *testing.T) {
 	payload := []byte("unacked-immediately-before-retained-activation")
 	if _, err := client.SendData(payload); err != nil {
 		t.Fatalf("SendData on predecessor: %v", err)
+	}
+	if got := oldClient.dropped.Load(); got != 1 {
+		t.Fatalf("predecessor dropped DATA writes=%d, want 1", got)
 	}
 	if got := newClient.dataSequences(); len(got) != 0 {
 		t.Fatalf("staged successor carried DATA before activation: %v", got)

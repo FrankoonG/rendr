@@ -51,6 +51,19 @@ func newMemoryPathPair() (*memoryPathConn, *memoryPathConn) {
 	return a, b
 }
 
+func TestMemoryPathConnRejectsWriteAfterPeerClose(t *testing.T) {
+	local, peer := newMemoryPathPair()
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1000; i++ {
+		n, err := local.Write([]byte("control"))
+		if n != 0 || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("write %d after peer close = (%d, %v), want (0, net.ErrClosed)", i, n, err)
+		}
+	}
+}
+
 func TestSendHistoryFrameOwnershipContracts(t *testing.T) {
 	frame := make([]byte, proto.HeaderSize+3)
 	if err := (proto.Header{Version: proto.Version, Type: proto.FrameData, Seq: 1}).Encode(frame); err != nil {
@@ -65,6 +78,12 @@ func TestSendHistoryFrameOwnershipContracts(t *testing.T) {
 	if &borrowed.sendHist.entries[0].frame[0] == &frame[0] {
 		t.Fatal("borrowed reserve retained the caller's frame")
 	}
+	wantDigest := proto.DigestFrame(frame)
+	wantProof := proto.AdvanceAckProof(proto.AckProof{}, wantDigest)
+	if entry := borrowed.sendHist.entries[0]; entry.frameDigest != wantDigest || entry.proof != wantProof {
+		t.Fatalf("borrowed reservation digest/proof=%x/%x want %x/%x",
+			entry.frameDigest, entry.proof, wantDigest, wantProof)
+	}
 
 	ownedFrame := append([]byte(nil), frame...)
 	owned := &Engine{}
@@ -73,6 +92,10 @@ func TestSendHistoryFrameOwnershipContracts(t *testing.T) {
 	}
 	if &owned.sendHist.entries[0].frame[0] != &ownedFrame[0] {
 		t.Fatal("owned reserve copied the transferred frame")
+	}
+	if entry := owned.sendHist.entries[0]; entry.frameDigest != wantDigest || entry.proof != wantProof {
+		t.Fatalf("owned reservation digest/proof=%x/%x want %x/%x",
+			entry.frameDigest, entry.proof, wantDigest, wantProof)
 	}
 }
 
@@ -99,6 +122,14 @@ func (p *memoryPathConn) Write(frame []byte) (int, error) {
 	if err := p.failure(); err != nil {
 		p.notifyFailure(err)
 		return 0, err
+	}
+	// A buffered peer inbox and a closed peer are both ready select cases.
+	// Reject a peer that was already closed before this write so a test cannot
+	// report a successful control-frame delivery into an abandoned inbox.
+	select {
+	case <-p.peer.closed:
+		return 0, net.ErrClosed
+	default:
 	}
 	select {
 	case <-p.closed:

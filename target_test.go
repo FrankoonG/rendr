@@ -1175,6 +1175,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 	}
 	healthyDecisionQuality := badDecisionQuality
 	healthyDecisionQuality.LossPP = 0
+	healthyDecisionQuality.At = time.Now()
 	if err := controlled.SetQuality("C", healthyDecisionQuality); err != nil {
 		t.Fatal(err)
 	}
@@ -1184,6 +1185,10 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 	}
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) && client.(testConnectionControl).ActivePath() != ids["C"] {
+		healthyDecisionQuality.At = time.Now()
+		if err := controlled.SetQuality("C", healthyDecisionQuality); err != nil {
+			t.Fatal(err)
+		}
 		collector.write(t, client, chunk)
 	}
 	if got := client.(testConnectionControl).ActivePath(); got != ids["C"] {

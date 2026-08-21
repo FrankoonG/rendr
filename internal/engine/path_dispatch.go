@@ -21,12 +21,74 @@ const maximumPathDispatchBatchYields = maximumPathDispatchBatch - 1
 const minimumDispatchStallWindow = 100 * time.Millisecond
 const maximumDispatchStallWindow = 2 * time.Second
 
+var (
+	errFrameRetiredBeforeWrite = errors.New("engine: DATA frame retired before physical write")
+	errFrameDispatchAdmission  = errors.New("engine: DATA dispatch lacks replay-ledger admission")
+)
+
+type FrameDispatchKind = transport.FrameDispatchKind
+type FrameDispatchAttemptState = transport.FrameDispatchAttemptState
+
+const (
+	FrameDispatchKindUnknown       = transport.FrameDispatchKindUnknown
+	FrameDispatchKindInitialCohort = transport.FrameDispatchKindInitialCohort
+	FrameDispatchKindReplay        = transport.FrameDispatchKindReplay
+	FrameDispatchAttemptUnknown    = transport.FrameDispatchAttemptUnknown
+	FrameDispatchAttempted         = transport.FrameDispatchAttempted
+	FrameDispatchNotAttempted      = transport.FrameDispatchNotAttempted
+)
+
+type frameDispatchAdmission struct {
+	owner            *Engine
+	id               uint64
+	sequence         uint64
+	digest           proto.FrameDigest
+	frameBytes       int
+	ledgerGeneration uint64
+	kind             FrameDispatchKind
+}
+
+type FrameDispatchAuthorization = transport.FrameDispatchAuthorization
+type FrameDispatchCompletion = transport.FrameDispatchCompletion
+type FrameDispatchSpan = transport.FrameDispatchSpan
+type FrameDispatchTracer = transport.FrameDispatchTracer
+
+type physicalFrameDispatch struct {
+	authorization FrameDispatchAuthorization
+	data          bool
+}
+
+// frameDispatchLease gives one coherent ledger snapshot permission to reach a
+// physical callback after sendHistMu is released. A later ACK may reclaim the
+// immutable history because each leased job already owns its frame bytes and
+// digest; batch attribution receipts are created under the same authorization
+// lock before that ACK can detach their records.
+type frameDispatchLease uint64
+
+func (e *Engine) releaseFrameDispatchLease(lease *frameDispatchLease) {
+	if e == nil || lease == nil || *lease == 0 {
+		return
+	}
+	id := uint64(*lease)
+	e.sendHistMu.Lock()
+	if _, ok := e.frameDispatchLeases[id]; !ok {
+		e.sendHistMu.Unlock()
+		panic("engine: frame dispatch lease released without ownership")
+	}
+	delete(e.frameDispatchLeases, id)
+	e.sendHistMu.Unlock()
+	*lease = 0
+}
+
 type pathDispatchJob struct {
 	frame            []byte
 	bonded           bool
 	routePlanned     bool
 	topologyEpoch    uint64
 	firstPublication bool
+	admission        frameDispatchAdmission
+	preparedDispatch physicalFrameDispatch
+	dispatchPrepared bool
 	acceptedPacket   bool
 	custodyTicket    uint64
 	result           chan<- pathDispatchResult
@@ -184,7 +246,8 @@ func (e *Engine) pathWriterLoop(slot *pathSlot) {
 
 func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob) (*pathDispatchJob, bool) {
 	writer, ok := slot.conn.(transport.FrameBatchWriter)
-	if !ok || !e.Packetized() {
+	_, atomicDispatch := slot.conn.(transport.FrameDispatchWriter)
+	if !ok || atomicDispatch || !e.Packetized() {
 		return nil, false
 	}
 	firstSeq, ok := packetApplicationDispatchSequence(first)
@@ -245,23 +308,85 @@ drained:
 		}
 		return pending, true
 	}
-	receipts := make([]*batchDispatchAttributionReceipt, len(jobs))
-	for i := range jobs {
-		if !jobs[i].routePlanned {
-			receipts[i] = e.beginApplicationBatchDispatch(
-				jobs[i].frame, slot, jobs[i].topologyEpoch,
-			)
+	allJobs := jobs
+	prepared, retired, preparedReceipts, lease, err := e.preparePhysicalFrameDispatchBatch(allJobs, slot)
+	if err != nil {
+		slot.releaseWrite()
+		for _, queued := range allJobs {
+			e.completePathDispatch(slot, queued, err)
 		}
+		return pending, true
+	}
+	defer func() {
+		if lease != 0 {
+			e.releaseFrameDispatchLease(&lease)
+		}
+	}()
+	if lease != 0 && e.frameDispatchBatchAfterLease != nil {
+		e.frameDispatchBatchAfterLease()
+	}
+	jobs = make([]pathDispatchJob, 0, len(allJobs))
+	frames = make([][]byte, 0, len(allJobs))
+	dispatches := make([]physicalFrameDispatch, 0, len(allJobs))
+	receipts := make([]*batchDispatchAttributionReceipt, 0, len(allJobs))
+	for i, job := range allJobs {
+		if retired[i] {
+			continue
+		}
+		jobs = append(jobs, job)
+		frames = append(frames, job.frame)
+		dispatches = append(dispatches, prepared[i])
+		receipts = append(receipts, preparedReceipts[i])
+	}
+	if len(jobs) == 0 {
+		slot.releaseWrite()
+		for _, job := range allJobs {
+			e.completePathDispatch(slot, job, nil)
+		}
+		return pending, true
 	}
 	cohorts := make([]rootDeliveryCohort, len(frames))
 	for i, frame := range frames {
 		cohorts[i] = e.applicationRootCohortFromFrame(frame)
+	}
+	spans := make([]FrameDispatchSpan, len(dispatches))
+	for i := range dispatches {
+		spans[i] = beginPhysicalFrameDispatch(slot, dispatches[i])
 	}
 	writeToken := e.pathDataWriteToken(slot, first.fenceEpoch)
 	started := nowFn()
 	completed, batchErr := writer.WriteFrameBatch(frames)
 	finished := nowFn()
 	completed, batchErr = classifyFrameBatchResult(len(jobs), completed, batchErr)
+	for i, span := range spans {
+		if span == nil {
+			continue
+		}
+		completion := FrameDispatchCompletion{
+			StartedAt: started, CompletedAt: finished, FrameBytes: len(frames[i]),
+			AttemptState: FrameDispatchAttemptUnknown,
+			BatchIndex:   i, BatchSize: len(frames),
+		}
+		if i < completed {
+			completion.BytesWritten = len(frames[i])
+			completion.BytesWrittenKnown = true
+			completion.AttemptState = FrameDispatchAttempted
+			completion.WriteAttempted = true
+			completion.WholeFrameAccepted = true
+		} else {
+			completion.Err = batchErr
+		}
+		if completed == len(frames) && batchErr != nil && i == len(frames)-1 {
+			completion.Err = batchErr
+		}
+		span.FinishFrameDispatch(completion)
+	}
+	// The transport callback and every tracer completion are now outside the
+	// ACK-retirement race. Release before publishing per-job results so tests and
+	// callers cannot observe a completed dispatch with a leaked lease.
+	if lease != 0 {
+		e.releaseFrameDispatchLease(&lease)
+	}
 	// Publish each successful first DATA write before releasing the permit. A
 	// following probe can then bind ACK progress to a path-unique predecessor.
 	for i := 0; i < completed; i++ {
@@ -296,10 +421,14 @@ drained:
 		// and applies only to the first incomplete frame and its suffix.
 		e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, batchErr)
 	}
-	for i, job := range jobs {
+	written := 0
+	for i, job := range allJobs {
 		var err error
-		if i >= completed {
-			err = batchErr
+		if !retired[i] {
+			if written >= completed {
+				err = batchErr
+			}
+			written++
 		}
 		e.completePathDispatch(slot, job, err)
 	}
@@ -336,6 +465,343 @@ func applicationDispatchAckTarget(frame []byte) (uint64, bool) {
 	return header.Seq + 1, true
 }
 
+func (e *Engine) admitFrameDispatch(frame []byte, firstPublication bool) (frameDispatchAdmission, error) {
+	if len(frame) < proto.HeaderSize {
+		return frameDispatchAdmission{}, proto.ErrBadHeader
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		return frameDispatchAdmission{}, err
+	}
+	if header.Type != proto.FrameData {
+		return frameDispatchAdmission{}, nil
+	}
+	if header.Seq == proto.MaxSeq {
+		return frameDispatchAdmission{}, errFrameDispatchAdmission
+	}
+	digest := proto.DigestFrame(frame)
+	e.sendHistMu.Lock()
+	entry := e.sendHistoryEntryLocked(header.Seq)
+	ackNext := e.sendAckNext.Load()
+	publishedNext := e.sendPublishedNext.Load()
+	if entry == nil {
+		e.sendHistMu.Unlock()
+		if ackNext > header.Seq {
+			return frameDispatchAdmission{}, errFrameRetiredBeforeWrite
+		}
+		return frameDispatchAdmission{}, errFrameDispatchAdmission
+	}
+	if entry.frameDigest != digest || publishedNext <= header.Seq {
+		e.sendHistMu.Unlock()
+		return frameDispatchAdmission{}, errFrameDispatchAdmission
+	}
+	ledgerGeneration := e.sendHist.generation
+	e.sendHistMu.Unlock()
+	kind := FrameDispatchKindReplay
+	if firstPublication {
+		kind = FrameDispatchKindInitialCohort
+	}
+	return frameDispatchAdmission{
+		owner: e, id: nextFrameDispatchIdentity(&e.frameDispatchAdmissionNext), sequence: header.Seq,
+		digest: digest, frameBytes: len(frame), ledgerGeneration: ledgerGeneration, kind: kind,
+	}, nil
+}
+
+func (e *Engine) authorizeFrameDispatch(
+	frame []byte,
+	admission frameDispatchAdmission,
+) (FrameDispatchAuthorization, bool, bool, error) {
+	digest := proto.DigestFrame(frame)
+	e.sendHistMu.Lock()
+	authorization, data, retired, err := e.authorizeFrameDispatchLocked(frame, digest, admission)
+	e.sendHistMu.Unlock()
+	return authorization, data, retired, err
+}
+
+// authorizeFrameDispatchLocked validates one immutable frame against the
+// current replay ledger. The caller owns sendHistMu; keeping the complete batch
+// under this lock prevents a cumulative ACK from retiring a suffix between
+// per-item checks.
+func (e *Engine) authorizeFrameDispatchLocked(
+	frame []byte,
+	digest proto.FrameDigest,
+	admission frameDispatchAdmission,
+) (FrameDispatchAuthorization, bool, bool, error) {
+	if len(frame) < proto.HeaderSize {
+		return FrameDispatchAuthorization{}, false, false, proto.ErrBadHeader
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		return FrameDispatchAuthorization{}, false, false, err
+	}
+	if header.Type != proto.FrameData {
+		return FrameDispatchAuthorization{}, false, false, nil
+	}
+	if admission.owner != e || admission.id == 0 || admission.sequence != header.Seq ||
+		admission.digest != digest || admission.frameBytes != len(frame) || admission.ledgerGeneration == 0 ||
+		(admission.kind != FrameDispatchKindInitialCohort && admission.kind != FrameDispatchKindReplay) {
+		return FrameDispatchAuthorization{}, true, false, errFrameDispatchAdmission
+	}
+	publishedNext := e.sendPublishedNext.Load()
+	ackNext := e.sendAckNext.Load()
+	ledgerGeneration := e.sendHist.generation
+	entry := e.sendHistoryEntryLocked(header.Seq)
+	if publishedNext <= header.Seq || admission.ledgerGeneration > ledgerGeneration ||
+		(entry == nil && ackNext <= header.Seq) ||
+		(entry != nil && entry.frameDigest != digest) {
+		return FrameDispatchAuthorization{}, true, false, errFrameDispatchAdmission
+	}
+	authorizedAt := nowFn()
+	authorization := FrameDispatchAuthorization{
+		Sequence: header.Seq, PublishedNext: publishedNext, AckNext: ackNext,
+		AdmissionLedgerGeneration: admission.ledgerGeneration, LedgerGeneration: ledgerGeneration,
+		AdmissionID: admission.id,
+		AttemptID:   nextFrameDispatchIdentity(&e.frameDispatchAttemptNext), Kind: admission.kind,
+		AuthorizedAt: authorizedAt, FrameBytes: len(frame), FrameDigest: digest,
+	}
+	retired := ackNext > header.Seq
+	return authorization, true, retired, nil
+}
+
+func nextFrameDispatchIdentity(counter *atomic.Uint64) uint64 {
+	for {
+		if identity := counter.Add(1); identity != 0 {
+			return identity
+		}
+	}
+}
+
+func (e *Engine) preparePhysicalFrameDispatch(
+	job pathDispatchJob,
+) (physicalFrameDispatch, frameDispatchLease, error) {
+	digest := proto.DigestFrame(job.frame)
+	e.sendHistMu.Lock()
+	dispatch := job.preparedDispatch
+	retired := false
+	if job.dispatchPrepared {
+		if err := e.validatePreparedFrameDispatch(job.frame, digest, job.admission, dispatch); err != nil {
+			e.sendHistMu.Unlock()
+			return physicalFrameDispatch{}, 0, err
+		}
+	} else {
+		authorization, data, itemRetired, err := e.authorizeFrameDispatchLocked(job.frame, digest, job.admission)
+		if err != nil {
+			e.sendHistMu.Unlock()
+			return physicalFrameDispatch{}, 0, err
+		}
+		dispatch = physicalFrameDispatch{authorization: authorization, data: data}
+		retired = itemRetired
+	}
+	if dispatch.data {
+		expectedKind := FrameDispatchKindReplay
+		if job.firstPublication {
+			expectedKind = FrameDispatchKindInitialCohort
+		}
+		if dispatch.authorization.Kind != expectedKind {
+			e.sendHistMu.Unlock()
+			return physicalFrameDispatch{}, 0, errFrameDispatchAdmission
+		}
+	}
+	var lease frameDispatchLease
+	if dispatch.data && !retired {
+		lease = e.newFrameDispatchLeaseLocked()
+	}
+	e.sendHistMu.Unlock()
+	if retired {
+		return physicalFrameDispatch{}, 0, errFrameRetiredBeforeWrite
+	}
+	return dispatch, lease, nil
+}
+
+// newFrameDispatchLeaseLocked registers one callback lease. The caller holds
+// sendHistMu.
+func (e *Engine) newFrameDispatchLeaseLocked() frameDispatchLease {
+	leaseID := nextFrameDispatchIdentity(&e.frameDispatchLeaseNext)
+	if e.frameDispatchLeases == nil {
+		e.frameDispatchLeases = make(map[uint64]struct{})
+	}
+	if _, duplicate := e.frameDispatchLeases[leaseID]; duplicate {
+		panic("engine: duplicate frame dispatch lease identity")
+	}
+	e.frameDispatchLeases[leaseID] = struct{}{}
+	return frameDispatchLease(leaseID)
+}
+
+func (e *Engine) preparePhysicalFrameDispatchBatch(
+	jobs []pathDispatchJob,
+	batchSlot *pathSlot,
+) ([]physicalFrameDispatch, []bool, []*batchDispatchAttributionReceipt, frameDispatchLease, error) {
+	dispatches := make([]physicalFrameDispatch, len(jobs))
+	retired := make([]bool, len(jobs))
+	receipts := make([]*batchDispatchAttributionReceipt, len(jobs))
+	if len(jobs) == 0 {
+		return dispatches, retired, receipts, 0, nil
+	}
+	var binding graphBinding
+	var attributionStarted time.Time
+	if batchSlot != nil {
+		binding = e.localGraphBinding()
+		attributionStarted = nowFn()
+	}
+	var digestStorage [maximumPathDispatchBatch]proto.FrameDigest
+	var digests []proto.FrameDigest
+	if len(jobs) <= len(digestStorage) {
+		digests = digestStorage[:len(jobs)]
+	} else {
+		digests = make([]proto.FrameDigest, len(jobs))
+	}
+	for index := range jobs {
+		digests[index] = proto.DigestFrame(jobs[index].frame)
+	}
+
+	e.sendHistMu.Lock()
+	leasedDATA := 0
+	for index, job := range jobs {
+		dispatch := job.preparedDispatch
+		itemRetired := false
+		if job.dispatchPrepared {
+			if err := e.validatePreparedFrameDispatch(job.frame, digests[index], job.admission, dispatch); err != nil {
+				e.sendHistMu.Unlock()
+				return nil, nil, nil, 0, err
+			}
+		} else {
+			authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digests[index], job.admission)
+			if err != nil {
+				e.sendHistMu.Unlock()
+				return nil, nil, nil, 0, err
+			}
+			dispatch = physicalFrameDispatch{authorization: authorization, data: data}
+			itemRetired = retired
+		}
+		data := dispatch.data
+		if data {
+			expectedKind := FrameDispatchKindReplay
+			if job.firstPublication {
+				expectedKind = FrameDispatchKindInitialCohort
+			}
+			if dispatch.authorization.Kind != expectedKind {
+				e.sendHistMu.Unlock()
+				return nil, nil, nil, 0, errFrameDispatchAdmission
+			}
+		}
+		dispatches[index] = dispatch
+		retired[index] = itemRetired
+		if data && !itemRetired {
+			leasedDATA++
+		}
+		if e.frameDispatchBatchAfterValidation != nil {
+			e.frameDispatchBatchAfterValidation(index)
+		}
+	}
+
+	var lease frameDispatchLease
+	if leasedDATA != 0 {
+		lease = e.newFrameDispatchLeaseLocked()
+	}
+	if batchSlot != nil {
+		for index, job := range jobs {
+			if retired[index] || job.routePlanned {
+				continue
+			}
+			receipts[index] = e.beginApplicationBatchDispatchLocked(
+				job.frame, batchSlot, job.topologyEpoch, binding, attributionStarted,
+			)
+		}
+	}
+	e.sendHistMu.Unlock()
+	return dispatches, retired, receipts, lease, nil
+}
+
+// prepareLogicalFrameDispatchFanout commits every child of one race ticket in
+// a single replay-ledger snapshot. A fast child may ACK before a slower path
+// writer runs, but that later write still belongs to the already-committed race
+// cohort and therefore must not be mistaken for a new ACK-retired replay.
+func (e *Engine) prepareLogicalFrameDispatchFanout(
+	jobs []pathDispatchJob,
+) ([]physicalFrameDispatch, error) {
+	dispatches := make([]physicalFrameDispatch, len(jobs))
+	if len(jobs) < 2 {
+		return nil, errors.New("engine: frame dispatch fanout requires at least two paths")
+	}
+	var digestStorage [maximumPathDispatchBatch]proto.FrameDigest
+	var digests []proto.FrameDigest
+	if len(jobs) <= len(digestStorage) {
+		digests = digestStorage[:len(jobs)]
+	} else {
+		digests = make([]proto.FrameDigest, len(jobs))
+	}
+	firstFrame := jobs[0].frame
+	firstDigest := proto.DigestFrame(firstFrame)
+	for index := range jobs {
+		frame := jobs[index].frame
+		if len(frame) == len(firstFrame) && (len(frame) == 0 || &frame[0] == &firstFrame[0]) {
+			digests[index] = firstDigest
+			continue
+		}
+		digests[index] = proto.DigestFrame(frame)
+	}
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	for index, job := range jobs {
+		authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digests[index], job.admission)
+		if err != nil {
+			return nil, err
+		}
+		if retired {
+			return nil, errFrameRetiredBeforeWrite
+		}
+		dispatches[index] = physicalFrameDispatch{authorization: authorization, data: data}
+	}
+	return dispatches, nil
+}
+
+func (e *Engine) validatePreparedFrameDispatch(
+	frame []byte,
+	digest proto.FrameDigest,
+	admission frameDispatchAdmission,
+	dispatch physicalFrameDispatch,
+) error {
+	if len(frame) < proto.HeaderSize {
+		return proto.ErrBadHeader
+	}
+	header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+	if err != nil {
+		return err
+	}
+	if header.Type != proto.FrameData {
+		if dispatch.data {
+			return errFrameDispatchAdmission
+		}
+		return nil
+	}
+	authorization := dispatch.authorization
+	if !dispatch.data || admission.owner != e || admission.id == 0 ||
+		admission.sequence != header.Seq || admission.digest != digest || admission.frameBytes != len(frame) ||
+		authorization.Sequence != header.Seq || authorization.PublishedNext <= header.Seq ||
+		authorization.AckNext > header.Seq ||
+		authorization.AdmissionLedgerGeneration != admission.ledgerGeneration ||
+		authorization.LedgerGeneration < authorization.AdmissionLedgerGeneration ||
+		authorization.AdmissionID != admission.id || authorization.AttemptID == 0 ||
+		authorization.PhysicalOccurrence != 0 || authorization.EndpointGeneration != 0 || authorization.FrameOffset != 0 ||
+		authorization.Kind != admission.kind || authorization.AuthorizedAt.IsZero() ||
+		authorization.FrameBytes != len(frame) || authorization.FrameDigest != digest {
+		return errFrameDispatchAdmission
+	}
+	return nil
+}
+
+func beginPhysicalFrameDispatch(slot *pathSlot, dispatch physicalFrameDispatch) FrameDispatchSpan {
+	if dispatch.data {
+		if tracer, ok := slot.conn.(FrameDispatchTracer); ok {
+			authorization := dispatch.authorization
+			authorization.PhysicalOccurrence = 1
+			authorization.FrameOffset = 0
+			return tracer.BeginFrameDispatch(authorization)
+		}
+	}
+	return nil
+}
+
 func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 	if completed < 0 || completed > total {
 		return 0, errors.New("engine: frame batch writer returned invalid completed count")
@@ -349,11 +815,41 @@ func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	cohort := e.applicationRootCohortFromFrame(job.frame)
 	var writeToken pathDataWriteToken
+	var dispatchSpan FrameDispatchSpan
+	var dispatchLease frameDispatchLease
+	var physicalStarted time.Time
 	started := nowFn()
-	n, err := slot.writeDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, func() {
+	n, err := slot.writeDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, func() (dispatchedFrameWrite, error) {
+		dispatch, lease, err := e.preparePhysicalFrameDispatch(job)
+		if err != nil {
+			return dispatchedFrameWrite{}, err
+		}
+		dispatchLease = lease
+		prepared := dispatchedFrameWrite{}
+		if dispatch.data {
+			if _, ok := slot.conn.(transport.FrameDispatchWriter); ok {
+				prepared.atomic = true
+				prepared.authorization = dispatch.authorization
+			} else {
+				dispatchSpan = beginPhysicalFrameDispatch(slot, dispatch)
+			}
+		}
 		e.noteApplicationDispatchRouteAtEpoch(job.frame, slot, job.topologyEpoch)
 		writeToken = e.pathDataWriteToken(slot, job.fenceEpoch)
+		physicalStarted = nowFn()
+		return prepared, nil
 	}, func(n int, writeErr error) {
+		completedAt := nowFn()
+		if dispatchSpan != nil {
+			dispatchSpan.FinishFrameDispatch(FrameDispatchCompletion{
+				StartedAt: physicalStarted, CompletedAt: completedAt,
+				FrameBytes: len(job.frame), BytesWritten: n, BytesWrittenKnown: true,
+				WriteCalls:   1,
+				AttemptState: FrameDispatchAttempted, WriteAttempted: true,
+				WholeFrameAccepted: n == len(job.frame),
+				BatchIndex:         0, BatchSize: 1, Err: writeErr,
+			})
+		}
 		if !job.firstPublication || writeErr != nil || n != len(job.frame) || len(job.frame) < proto.HeaderSize {
 			return
 		}
@@ -362,7 +858,14 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 			slot.noteFirstDataWriteSequence(header.Seq, writeToken)
 		}
 	})
+	if dispatchLease != 0 {
+		e.releaseFrameDispatchLease(&dispatchLease)
+	}
 	finished := nowFn()
+	if errors.Is(err, errFrameRetiredBeforeWrite) {
+		e.completePathDispatch(slot, job, nil)
+		return
+	}
 	if err == nil && n != len(job.frame) {
 		err = io.ErrShortWrite
 	}
@@ -373,7 +876,7 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		slot.recordDispatch(job.frame, job.firstPublication)
 		e.noteTailReplayPublication(job.frame, slot)
-	} else if !errors.Is(err, ErrPathTXFenced) {
+	} else if !errors.Is(err, ErrPathTXFenced) && !errors.Is(err, errFrameDispatchAdmission) {
 		// Some third-party PathConn implementations cannot reliably invoke
 		// OnDeath after a failed Write. The generation check makes this
 		// synthetic report idempotent with a concurrent transport callback.
@@ -464,9 +967,16 @@ func (e *Engine) dispatchRecursiveMode(
 	if handedOff() {
 		return errSelectorCutoverHandoff
 	}
+	admission, err := e.admitFrameDispatch(frame, firstPublication)
+	if errors.Is(err, errFrameRetiredBeforeWrite) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	if application {
 		if handled, err := e.dispatchFlatSelectorApplication(
-			frame, runtime, firstPublication, deadline, detached,
+			frame, runtime, firstPublication, admission, deadline, detached,
 		); handled {
 			return err
 		}
@@ -568,28 +1078,56 @@ func (e *Engine) dispatchRecursiveMode(
 			e.noteApplicationDispatchPlanAtEpoch(frame, ticket.routes, topologyEpoch)
 		}
 
-		results := make(chan pathDispatchResult, len(ticket.routes))
-		submitted := 0
-		submittedSlots := make(map[*pathSlot]uint64, len(ticket.routes))
-		submittedBonded := make(map[*pathSlot]bool, len(ticket.routes))
+		type routeCandidate struct {
+			slot *pathSlot
+			job  pathDispatchJob
+		}
+		candidates := make([]routeCandidate, 0, len(ticket.routes))
 		for _, route := range ticket.routes {
 			slot := latest[route.targetID]
 			if slot == nil {
 				continue
 			}
 			generation := slot.dispatchNextGen.Add(1)
-			if slot.submitDispatch(pathDispatchJob{
+			candidates = append(candidates, routeCandidate{slot: slot, job: pathDispatchJob{
 				frame:            frame,
 				bonded:           route.bonded,
 				routePlanned:     multiRoute,
 				topologyEpoch:    topologyEpoch,
 				firstPublication: firstPublication,
-				result:           results,
+				admission:        admission,
 				generation:       generation,
-			}) {
+			}})
+		}
+		if len(candidates) > 1 {
+			jobs := make([]pathDispatchJob, len(candidates))
+			for index := range candidates {
+				jobs[index] = candidates[index].job
+			}
+			dispatches, err := e.prepareLogicalFrameDispatchFanout(jobs)
+			if errors.Is(err, errFrameRetiredBeforeWrite) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			for index := range candidates {
+				candidates[index].job.preparedDispatch = dispatches[index]
+				candidates[index].job.dispatchPrepared = true
+			}
+		}
+
+		results := make(chan pathDispatchResult, len(candidates))
+		submitted := 0
+		submittedSlots := make(map[*pathSlot]uint64, len(candidates))
+		submittedBonded := make(map[*pathSlot]bool, len(candidates))
+		for index := range candidates {
+			candidate := &candidates[index]
+			candidate.job.result = results
+			if candidate.slot.submitDispatch(candidate.job) {
 				submitted++
-				submittedSlots[slot] = generation
-				submittedBonded[slot] = route.bonded
+				submittedSlots[candidate.slot] = candidate.job.generation
+				submittedBonded[candidate.slot] = candidate.job.bonded
 			}
 		}
 		if submitted == 0 {
@@ -846,6 +1384,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 	frame []byte,
 	runtime *executionRuntime,
 	firstPublication bool,
+	admission frameDispatchAdmission,
 	migrationDeadline time.Time,
 	detached *detachedStreamDispatchLease,
 ) (bool, error) {
@@ -885,6 +1424,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		frame:            frame,
 		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
+		admission:        admission,
 		applicationWait:  waiter,
 		generation:       generation,
 	}) {
@@ -1053,6 +1593,13 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 	if runtime == nil || !runtime.flatLeafSelector || !e.Packetized() {
 		return false, nil
 	}
+	admission, admissionErr := e.admitFrameDispatch(frame, firstPublication)
+	if errors.Is(admissionErr, errFrameRetiredBeforeWrite) {
+		return true, nil
+	}
+	if admissionErr != nil {
+		return true, admissionErr
+	}
 	// Route lookup must not run below selectorCutoverMu. Every physical topology
 	// commit publishes its epoch while holding pathsMu -> selectorCutoverMu, so
 	// the lock-free gap below is closed by the epoch check after custody is
@@ -1086,6 +1633,7 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 	custodyTicket := e.nextDispatchCustodyTicketLocked()
 	if !slot.submitDispatch(pathDispatchJob{
 		frame: frame, topologyEpoch: topologyEpoch, firstPublication: firstPublication,
+		admission:      admission,
 		acceptedPacket: true, custodyTicket: custodyTicket, generation: generation,
 	}) {
 		return false, nil
@@ -1127,6 +1675,13 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 	if runtime == nil || !runtime.flatLeafSelector || !e.Packetized() {
 		return nil, false, nil
 	}
+	admission, admissionErr := e.admitFrameDispatch(frame, firstPublication)
+	if errors.Is(admissionErr, errFrameRetiredBeforeWrite) {
+		return nil, true, nil
+	}
+	if admissionErr != nil {
+		return nil, true, admissionErr
+	}
 	if generation, _ := e.selectorCutoverDispatchSnapshot(); generation != 0 &&
 		e.handoffSelectorCutoverDispatch(generation, !firstPublication) {
 		return nil, true, errSelectorCutoverHandoff
@@ -1146,6 +1701,7 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 		frame:            frame,
 		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
+		admission:        admission,
 		applicationWait:  waiter,
 		generation:       generation,
 	}) {

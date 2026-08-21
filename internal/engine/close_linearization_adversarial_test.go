@@ -705,7 +705,10 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 			t.Fatal("explicit selector leaf was not attached")
 		}
 		frame := make([]byte, proto.HeaderSize+1)
-		if err := (proto.Header{Version: proto.Version, Type: proto.FrameData}).Encode(frame[:proto.HeaderSize]); err != nil {
+		if err := (proto.Header{
+			Version: proto.Version, Type: proto.FrameCtrl,
+			Flags: proto.FlagsForCtrl(proto.CtrlHeartbeat),
+		}).Encode(frame[:proto.HeaderSize]); err != nil {
 			t.Fatal(err)
 		}
 		frame[len(frame)-1] = 0xa5

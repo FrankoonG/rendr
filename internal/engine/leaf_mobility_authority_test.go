@@ -3627,10 +3627,13 @@ func TestEngineLeafMobilityOOBReplayFailsOverControlRouteWithoutChangingSubject(
 	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
 		t.Fatal(err)
 	}
-	subject, subjectPeer := newMemoryPathPair()
-	first, firstPeer := newMemoryPathPair()
-	second, secondPeer := newMemoryPathPair()
+	subjectBase, subjectPeer := newMemoryPathPair()
+	firstBase, firstPeer := newMemoryPathPair()
+	secondBase, secondPeer := newMemoryPathPair()
 	t.Cleanup(func() { _ = subjectPeer.Close(); _ = firstPeer.Close(); _ = secondPeer.Close() })
+	subject := &captureLeafOOBPath{PathConn: subjectBase}
+	first := &captureLeafOOBPath{PathConn: firstBase}
+	second := &captureLeafOOBPath{PathConn: secondBase}
 	subjectID, err := e.AttachPathBound(subject, transport.PathSpec{Transport: "memory"}, PathBinding{
 		LocalTXTargetID: ids["a"], PeerTXTargetID: ids["a"],
 	})
@@ -3652,35 +3655,30 @@ func TestEngineLeafMobilityOOBReplayFailsOverControlRouteWithoutChangingSubject(
 	if !ok {
 		t.Fatal("missing subject path")
 	}
-	first.dropWrites.Store(true)
+	firstBase.dropWrites.Store(true)
 	frame, err := e.sendLeafMobilityFrameAt(ref, proto.CtrlLeafMobilityPrepare, []byte{1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	first.dropWrites.Store(false)
+	firstBase.dropWrites.Store(false)
 	if err := e.RemovePath(firstID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.replayLeafMobilityFrame(ref, frame); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case got := <-secondPeer.in:
-		if string(got) != string(frame) {
-			t.Fatal("replacement control route received altered replay")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("replacement control route did not receive replay")
+	firstFrames := first.captured()
+	if len(firstFrames) != 1 || !bytes.Equal(firstFrames[0], frame) {
+		t.Fatalf("retired control route frames=%d exact=%t, want one initial publication only",
+			len(firstFrames), len(firstFrames) == 1 && bytes.Equal(firstFrames[0], frame))
 	}
-	select {
-	case <-firstPeer.in:
-		t.Fatal("retired control route received replay")
-	default:
+	secondFrames := second.captured()
+	if len(secondFrames) != 1 || !bytes.Equal(secondFrames[0], frame) {
+		t.Fatalf("replacement control route frames=%d exact=%t, want one exact replay",
+			len(secondFrames), len(secondFrames) == 1 && bytes.Equal(secondFrames[0], frame))
 	}
-	select {
-	case <-subjectPeer.in:
-		t.Fatal("leaf mobility replay was published on its subject path")
-	default:
+	if subjectFrames := subject.captured(); len(subjectFrames) != 0 {
+		t.Fatalf("subject path received %d leaf mobility publications, want zero", len(subjectFrames))
 	}
 }
 

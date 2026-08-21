@@ -615,10 +615,6 @@ func (p *selectorReentrantQualityPath) QualityContext(ctx context.Context) (tran
 	return promptTestQualityContext(ctx, p.Quality)
 }
 
-func (p *observationBarrierPath) QualityContext(ctx context.Context) (transport.PathQuality, error) {
-	return promptTestQualityContext(ctx, p.Quality)
-}
-
 func (p *qualityDeathPath) QualityContext(ctx context.Context) (transport.PathQuality, error) {
 	return promptTestQualityContext(ctx, p.Quality)
 }

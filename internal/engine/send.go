@@ -954,6 +954,9 @@ func (e *Engine) replayRangeLocked(nextSeq, target uint64) error {
 	if len(frames) == 0 {
 		return nil
 	}
+	if hook := e.boundedReplayAfterSnapshot; hook != nil {
+		hook()
+	}
 	if err := e.redistributeFramesLocked(frames); err != nil {
 		return err
 	}
