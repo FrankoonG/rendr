@@ -134,9 +134,7 @@ func newPeakDirectionalFixture(t *testing.T, localRoot, peerRoot Target) *peakDi
 		t.Fatal("peer peak target is unavailable")
 	}
 	peerNormalNode, _ := peerPlan.graph.manifest.Node(peerTargets.normalTargetID)
-	pathIDs := make([]uint32, 0, 1+len(localTargets.peakTargetIDs))
 	clientNormalPath, serverNormalPath := attach(localTargets.normalTargetID, peerTargets.normalTargetID, localNormalNode.Name, peerNormalNode.Name)
-	pathIDs = append(pathIDs, clientNormalPath)
 	clientPeakPath := uint32(0)
 	serverPeakPath := uint32(0)
 	for i, localPeakID := range localTargets.peakTargetIDs {
@@ -148,7 +146,6 @@ func newPeakDirectionalFixture(t *testing.T, localRoot, peerRoot Target) *peakDi
 		localPeakNode, _ := localPlan.graph.manifest.Node(localPeakID)
 		peerPeakNode, _ := peerPlan.graph.manifest.Node(peerPeakID)
 		attachedClientPath, attachedServerPath := attach(localPeakID, peerPeakID, localPeakNode.Name, peerPeakNode.Name)
-		pathIDs = append(pathIDs, attachedClientPath)
 		if i == 0 {
 			clientPeakPath = attachedClientPath
 			serverPeakPath = attachedServerPath
@@ -161,7 +158,7 @@ func newPeakDirectionalFixture(t *testing.T, localRoot, peerRoot Target) *peakDi
 		t.Fatalf("initialize server policy: %v", err)
 	}
 	installPeakTransferPeerAdmission(server)
-	controller := newPeakTransferController(client, localPlan, pathIDs)
+	controller := newPeakTransferController(client, localPlan)
 	return &peakDirectionalFixture{
 		client: client, server: server, controller: controller,
 		localGraph:  localPlan.graph,
@@ -250,12 +247,13 @@ func TestPeakTransferRetryDeadlineStartsAfterPolicyCompletion(t *testing.T) {
 		Selector("retry-client-root", []Target{
 			Path("retry-client-normal", PathSpec{}),
 			Path("retry-client-peak", PathSpec{}),
-		}, PeakTransfer{Targets: []string{"retry-client-peak"}, SaturationFor: time.Nanosecond}),
+		}, PeakTransfer{Targets: []string{"retry-client-peak"}}),
 		Selector("retry-server-root", []Target{
 			Path("retry-server-normal", PathSpec{}),
 			Path("retry-server-peak", PathSpec{}),
 		}, PeakTransfer{Targets: []string{"retry-server-peak"}}),
 	)
+	fixture.controller.tuning.PeakPromoteAfter = time.Nanosecond
 	startedAt := time.Now()
 	fixture.controller.tx.normalBytes = defaultPeakMinBytes
 	fixture.controller.tx.normalPeakBps = 100
@@ -322,12 +320,13 @@ func TestPeakTransferDirectionWorkersDoNotBlockEachOther(t *testing.T) {
 		Selector("workers-client-root", []Target{
 			Path("workers-client-normal", PathSpec{}),
 			Path("workers-client-peak", PathSpec{}),
-		}, PeakTransfer{Targets: []string{"workers-client-peak"}, SaturationFor: time.Nanosecond}),
+		}, PeakTransfer{Targets: []string{"workers-client-peak"}}),
 		Selector("workers-server-root", []Target{
 			Path("workers-server-normal", PathSpec{}),
 			Path("workers-server-peak", PathSpec{}),
-		}, PeakTransfer{Targets: []string{"workers-server-peak"}, SaturationFor: time.Nanosecond}),
+		}, PeakTransfer{Targets: []string{"workers-server-peak"}}),
 	)
+	fixture.controller.tuning.PeakPromoteAfter = time.Nanosecond
 	old := time.Now().Add(-time.Second)
 	fixture.controller.mu.Lock()
 	fixture.controller.tx.normalBytes = defaultPeakMinBytes
@@ -487,10 +486,7 @@ func TestPeakTransferPeerAdmissionUsesOwnerJitterWithoutCrossRoleBorrowing(t *te
 }
 
 func TestPeakTransferControllerOwnsBothSenderDirectionsIndependently(t *testing.T) {
-	peak := PeakTransfer{
-		SaturationFor: time.Nanosecond,
-		ReturnFor:     time.Nanosecond,
-	}
+	peak := PeakTransfer{}
 	localPeak := peak
 	localPeak.Targets = []string{"client-peak"}
 	peerPeak := peak
@@ -505,6 +501,10 @@ func TestPeakTransferControllerOwnsBothSenderDirectionsIndependently(t *testing.
 			Path("server-peak", PathSpec{}),
 		}, peerPeak),
 	)
+	fixture.controller.tuning = SelectorTuning{
+		PeakPromoteAfter: time.Nanosecond,
+		PeakReturnAfter:  time.Nanosecond,
+	}
 
 	promote := func(rx bool, now time.Time) {
 		state := &fixture.controller.tx
@@ -621,13 +621,14 @@ func TestPeakTransferAutomaticRXUsesPeerOwnedPeakRanking(t *testing.T) {
 					Path("client-normal", PathSpec{}),
 					Path("client-peak-1", PathSpec{}),
 					Path("client-peak-2", PathSpec{}),
-				}, PeakTransfer{Targets: []string{"client-peak-1", "client-peak-2"}, SaturationFor: time.Nanosecond}),
+				}, PeakTransfer{Targets: []string{"client-peak-1", "client-peak-2"}}),
 				Selector("server-root", []Target{
 					Path("server-normal", PathSpec{}),
 					Path("server-peak-1", PathSpec{}),
 					Path("server-peak-2", PathSpec{}),
-				}, PeakTransfer{Targets: []string{"server-peak-1", "server-peak-2"}, SaturationFor: time.Nanosecond}),
+				}, PeakTransfer{Targets: []string{"server-peak-1", "server-peak-2"}}),
 			)
+			fixture.controller.tuning.PeakPromoteAfter = time.Nanosecond
 			peaks := fixture.controller.peerTargets.peakTargetIDs
 			if len(peaks) != 2 {
 				t.Fatalf("peer peak candidates=%x want two", peaks)
@@ -731,12 +732,18 @@ func TestPeakTransferPolicyFailureDoesNotDivergeControllerState(t *testing.T) {
 		applyErr    error
 		wantOnPeak  bool
 		wantUnknown bool
-		wantRetry   bool
+		wantIntent  bool
 	}{
-		{name: "promote rejected", operation: "promote", applyErr: engine.ErrPolicyRejected, wantRetry: true},
-		{name: "promote outcome unknown", operation: "promote", applyErr: engine.ErrPolicyOutcomeUnknown, wantUnknown: true, wantRetry: true},
-		{name: "return rejected", operation: "return", applyErr: engine.ErrPolicyRejected, wantOnPeak: true, wantRetry: true},
-		{name: "return outcome unknown", operation: "return", applyErr: engine.ErrPolicyOutcomeUnknown, wantOnPeak: true, wantUnknown: true, wantRetry: true},
+		{name: "promote rejected", operation: "promote", applyErr: engine.ErrPolicyRejected},
+		{name: "promote stale", operation: "promote", applyErr: &engine.PolicyRejectionError{
+			Phase: proto.PolicyAckPhaseFinal, Code: proto.PolicyAckCodeStale, Reason: "topology changed",
+		}, wantIntent: true},
+		{name: "promote outcome unknown", operation: "promote", applyErr: engine.ErrPolicyOutcomeUnknown, wantUnknown: true, wantIntent: true},
+		{name: "return rejected", operation: "return", applyErr: engine.ErrPolicyRejected, wantOnPeak: true},
+		{name: "return busy", operation: "return", applyErr: &engine.PolicyRejectionError{
+			Phase: proto.PolicyAckPhasePrepare, Code: proto.PolicyAckCodeBusy, Reason: "transaction pending",
+		}, wantOnPeak: true, wantIntent: true},
+		{name: "return outcome unknown", operation: "return", applyErr: engine.ErrPolicyOutcomeUnknown, wantOnPeak: true, wantUnknown: true, wantIntent: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			controller := fixture.controller
@@ -761,9 +768,15 @@ func TestPeakTransferPolicyFailureDoesNotDivergeControllerState(t *testing.T) {
 				t.Fatalf("state on_peak/unknown=%t/%t want %t/%t", controller.tx.onPeak,
 					controller.tx.policyOutcomeUncertain, test.wantOnPeak, test.wantUnknown)
 			}
-			if got := controller.tx.policyRetryAfter.After(now); got != test.wantRetry {
-				t.Fatalf("retry scheduled=%t want %t (retry_after=%v)", got, test.wantRetry,
-					controller.tx.policyRetryAfter)
+			if !controller.tx.policyRetryAfter.After(now) {
+				t.Fatalf("policy failure did not install bounded backoff: %v", controller.tx.policyRetryAfter)
+			}
+			if got := controller.tx.policyRetryIntent.valid(); got != test.wantIntent {
+				t.Fatalf("autonomous retry intent=%t want %t (state=%+v)", got, test.wantIntent,
+					controller.tx)
+			}
+			if !test.wantIntent && controller.retryPendingPolicy(controller.tx.policyRetryAfter, false) {
+				t.Fatal("terminal rejection triggered an autonomous policy retry")
 			}
 			if test.wantUnknown {
 				retryAt := controller.tx.policyRetryAfter
@@ -805,6 +818,344 @@ func TestPeakTransferPolicyFailureDoesNotDivergeControllerState(t *testing.T) {
 	})
 }
 
+func TestPeakTransferRetryablePromotionRetainsDemandIntent(t *testing.T) {
+	fixture := newPeakDirectionalFixture(t,
+		Selector("client-root", []Target{
+			Path("client-normal", PathSpec{}), Path("client-peak", PathSpec{}),
+		}, PeakTransfer{Targets: []string{"client-peak"}}),
+		Selector("server-root", []Target{
+			Path("server-normal", PathSpec{}), Path("server-peak", PathSpec{}),
+		}, PeakTransfer{Targets: []string{"server-peak"}}),
+	)
+	controller := fixture.controller
+	now := time.Now()
+	controller.tx.normalBytes = defaultPeakMinBytes
+	controller.tx.normalPeakBps = 100
+	controller.tx.saturatedSince = now.Add(-time.Second)
+	applyErr := error(engine.ErrSelectorDecisionUnavailable)
+	var transitions int
+	controller.policyApplyForTest = func(_ bool, choice peakTransferChoice, targetID proto.TargetID, _ string) error {
+		transitions++
+		if choice != peakTransferPeak || targetID != fixture.localPeak {
+			t.Fatalf("transition=(%v,%x), want peak %x", choice, targetID, fixture.localPeak)
+		}
+		return applyErr
+	}
+	t.Cleanup(func() { controller.policyApplyForTest = nil })
+
+	controller.evaluatePassive(
+		now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		100, defaultPeakWindow, controller.localTargets.normalTargetID, false,
+	)
+	if transitions != 1 || !controller.tx.promotionRetryPending || controller.tx.onPeak {
+		t.Fatalf("retryable failure lost promotion intent: transitions=%d state=%+v", transitions, controller.tx)
+	}
+
+	applyErr = nil
+	retryAt := controller.tx.policyRetryAfter
+	controller.evaluatePassive(
+		retryAt, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		1, defaultPeakWindow, controller.localTargets.normalTargetID, false,
+	)
+	if transitions != 2 || !controller.tx.onPeak || controller.tx.promotionRetryPending {
+		t.Fatalf("low-throughput retry did not commit prior demand intent: transitions=%d state=%+v", transitions, controller.tx)
+	}
+}
+
+func TestPeakTransferRetryablePromotionRetriesWithoutNewDelivery(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "retry-promotion-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-promotion-normal")
+	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-promotion-peak")
+	controller := &peakTransferController{
+		tuning: SelectorTuning{PeakPromoteAfter: time.Millisecond},
+		peerTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peak},
+		},
+	}
+	now := time.Now()
+	controller.rx.actualTarget = normal
+	controller.rx.actualSelectorGeneration = 1
+	controller.rx.normalPeakBps = 100
+	controller.rx.normalBytes = defaultPeakMinBytes
+	controller.rx.saturatedSince = now.Add(-time.Second)
+	var transitions int
+	controller.policyApplyForTest = func(rx bool, choice peakTransferChoice, targetID proto.TargetID, cause string) error {
+		transitions++
+		if !rx || choice != peakTransferPeak || targetID != peak || cause != "peak-transfer" {
+			t.Fatalf("transition=(%t,%d,%x,%q), want RX peak %x", rx, choice, targetID, cause, peak)
+		}
+		switch transitions {
+		case 1:
+			return &engine.PolicyRejectionError{
+				Phase: proto.PolicyAckPhasePrepare, Code: proto.PolicyAckCodeBusy, Reason: "transaction pending",
+			}
+		case 2:
+			return &engine.PolicyRejectionError{
+				Phase: proto.PolicyAckPhaseFinal, Code: proto.PolicyAckCodeStale, Reason: "topology changed",
+			}
+		case 3:
+			return &engine.PolicyRejectionError{
+				Phase: proto.PolicyAckPhaseFinal, Code: proto.PolicyAckCodeSuperseded, Reason: "transaction expired",
+			}
+		}
+		return nil
+	}
+
+	controller.evaluatePassiveWithPending(
+		now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		100, defaultPeakWindow, normal, false, true,
+	)
+	if transitions != 1 || !controller.rx.policyRetryIntent.valid() || controller.rx.onPeak {
+		t.Fatalf("retryable promotion state transitions=%d state=%+v", transitions, controller.rx)
+	}
+	for transitions < 4 {
+		retryAt := controller.rx.policyRetryAfter
+		if !controller.retryPendingPolicy(retryAt, true) {
+			t.Fatalf("due promotion intent was not retried at transition %d", transitions)
+		}
+	}
+	if transitions != 4 || !controller.rx.onPeak || controller.rx.activePeakTarget != peak ||
+		controller.rx.policyRetryIntent.valid() {
+		t.Fatalf("promotion retry transitions=%d state=%+v", transitions, controller.rx)
+	}
+}
+
+func TestPeakTransferRetryableCapacityReturnRetriesWithoutNewDelivery(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "retry-return-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-return-normal")
+	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-return-peak")
+	controller := &peakTransferController{
+		peerTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peak},
+		},
+	}
+	now := time.Now()
+	controller.rx = peakTransferDirection{
+		onPeak: true, activePeakTarget: peak, actualTarget: peak,
+		actualSelectorGeneration: 2, normalPeakBps: 100,
+		peakStarted: now.Add(-time.Second),
+	}
+	var transitions int
+	controller.policyApplyForTest = func(rx bool, choice peakTransferChoice, targetID proto.TargetID, cause string) error {
+		transitions++
+		if !rx || choice != peakTransferNormal || targetID != normal || cause != "peak-verify-failed" {
+			t.Fatalf("transition=(%t,%d,%x,%q), want RX normal %x", rx, choice, targetID, cause, normal)
+		}
+		if transitions == 1 {
+			return engine.ErrSelectorDecisionUnavailable
+		}
+		return nil
+	}
+
+	controller.evaluatePassiveWithPending(
+		now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		1, defaultPeakSaturationFor, peak, false, true,
+	)
+	retryAt := controller.rx.policyRetryAfter
+	if transitions != 1 || !controller.rx.policyRetryIntent.valid() || !controller.rx.onPeak {
+		t.Fatalf("retryable capacity return transitions=%d state=%+v", transitions, controller.rx)
+	}
+	if !controller.retryPendingPolicy(retryAt, true) {
+		t.Fatal("due capacity-return intent was not retried")
+	}
+	if transitions != 2 || controller.rx.onPeak || controller.rx.policyRetryIntent.valid() ||
+		!controller.rx.peakTargetSuppressed(peak, retryAt) {
+		t.Fatalf("capacity-return retry transitions=%d state=%+v", transitions, controller.rx)
+	}
+}
+
+func TestPeakTransferRetryReservesPhaseBeforeFactualCallback(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "retry-aba-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-aba-normal")
+	peakB := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-aba-peak-b")
+	peakC := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-aba-peak-c")
+	now := time.Now()
+	controller := &peakTransferController{
+		localTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peakB, peakC},
+		},
+		tx: peakTransferDirection{
+			actualTarget: normal, actualSelectorGeneration: 1,
+			policyRetryAfter: now,
+			policyRetryIntent: peakPolicyRetryIntent{
+				choice: peakTransferPeak, cause: "peak-transfer",
+				expectedTarget: normal, expectedGeneration: 1,
+			},
+		},
+	}
+	var reserved uint64
+	controller.policyRetryReservedForTest = func(rx bool, phase uint64) {
+		if rx {
+			t.Fatal("TX retry was reserved as RX")
+		}
+		reserved = phase
+		controller.observeCommittedPeakPolicy(selector, peakC, 2, true, "newer-factual-commit")
+	}
+	var policyCalls int
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		policyCalls++
+		return nil
+	}
+
+	if !controller.retryPendingPolicy(now, false) {
+		t.Fatal("due retry intent was not consumed")
+	}
+	controller.mu.Lock()
+	state := controller.tx
+	controller.mu.Unlock()
+	if reserved == 0 || state.phaseGeneration == reserved {
+		t.Fatalf("factual callback did not supersede reserved phase: reserved=%d state=%+v", reserved, state)
+	}
+	if policyCalls != 0 || !state.onPeak || state.activePeakTarget != peakC ||
+		state.actualTarget != peakC || state.actualSelectorGeneration != 2 ||
+		state.policyRetryIntent.valid() {
+		t.Fatalf("stale retry crossed factual callback: calls=%d state=%+v", policyCalls, state)
+	}
+}
+
+func TestPeakTransferRetryBackoffIsBoundedAndResets(t *testing.T) {
+	state := peakTransferDirection{}
+	err := &engine.PolicyRejectionError{
+		Phase: proto.PolicyAckPhaseFinal, Code: proto.PolicyAckCodeStale, Reason: "topology changed",
+	}
+	now := time.Now()
+	previous := time.Duration(0)
+	for attempt := 0; attempt < 10; attempt++ {
+		state.recordPolicyFailure(err, now, peakTransferPeak, "peak-transfer")
+		delay := state.policyRetryAfter.Sub(now)
+		if attempt == 0 && delay != defaultPeakWindow {
+			t.Fatalf("first retry delay=%v want %v", delay, defaultPeakWindow)
+		}
+		if delay < previous || delay > defaultPeakSuppressFor {
+			t.Fatalf("retry delay attempt %d=%v previous=%v cap=%v", attempt, delay, previous, defaultPeakSuppressFor)
+		}
+		previous = delay
+	}
+	if previous != defaultPeakSuppressFor {
+		t.Fatalf("retry delay cap=%v want %v", previous, defaultPeakSuppressFor)
+	}
+	state.clearPolicyRetry()
+	state.recordPolicyFailure(err, now, peakTransferPeak, "peak-transfer")
+	if delay := state.policyRetryAfter.Sub(now); delay != defaultPeakWindow {
+		t.Fatalf("successful-state reset left retry delay=%v want %v", delay, defaultPeakWindow)
+	}
+}
+
+func TestPeakTransferDirectionTickObservesAfterRetry(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "retry-observe-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-observe-normal")
+	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-observe-peak")
+	now := time.Now()
+	controller := &peakTransferController{
+		localTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal}, peakTargetIDs: []proto.TargetID{peak},
+		},
+		tx: peakTransferDirection{
+			actualTarget: normal, actualSelectorGeneration: 1,
+			policyRetryAfter: now,
+			policyRetryIntent: peakPolicyRetryIntent{
+				choice: peakTransferPeak, cause: "peak-transfer",
+				expectedTarget: normal, expectedGeneration: 1,
+			},
+		},
+	}
+	var retries, observations int
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		retries++
+		return &engine.PolicyRejectionError{
+			Phase: proto.PolicyAckPhasePrepare, Code: proto.PolicyAckCodeBusy, Reason: "pending",
+		}
+	}
+	controller.directionObserveForTest = func(time.Time, bool) { observations++ }
+
+	controller.runDirectionTick(now, false)
+	if retries != 1 || observations != 1 {
+		t.Fatalf("direction tick retries/observations=%d/%d want 1/1", retries, observations)
+	}
+}
+
+func TestPeakTransferPeerInitializationStopsOnPermanentReject(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "init-reject-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "init-reject-normal")
+	controller := &peakTransferController{
+		peerTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal, normalTargetIDs: []proto.TargetID{normal},
+		},
+	}
+	initialization := peakPeerInitialization{
+		selectorID: selector, retryDelay: defaultPeakWindow, active: true,
+	}
+	var calls int
+	controller.peerInitializationForTest = func(
+		_ context.Context, gotSelector proto.TargetID, peak bool, cause string,
+	) (proto.TargetID, uint64, error) {
+		calls++
+		if gotSelector != selector || peak || cause != "selector-rx" {
+			t.Fatalf("initialization request=(%x,%t,%q)", gotSelector, peak, cause)
+		}
+		return proto.TargetID{}, 0, &engine.PolicyRejectionError{
+			Phase: proto.PolicyAckPhasePrepare, Code: proto.PolicyAckCodeReject, Reason: "permanent",
+		}
+	}
+
+	controller.advancePeerInitialization(&initialization, time.Now())
+	controller.advancePeerInitialization(&initialization, time.Now().Add(time.Hour))
+	if calls != 1 || initialization.active || initialization.retryAt != (time.Time{}) {
+		t.Fatalf("permanent initialization rejection calls/active/retry=%d/%t/%v", calls, initialization.active, initialization.retryAt)
+	}
+	controller.mu.Lock()
+	err := controller.peerInitializationErr
+	controller.mu.Unlock()
+	if !errors.Is(err, engine.ErrPolicyRejected) || engine.IsRetryablePolicyRejection(err) {
+		t.Fatalf("permanent initialization error=%v", err)
+	}
+}
+
+func TestPeakTransferRetryIntentCannotOverwriteNewerFactualTarget(t *testing.T) {
+	selector := proto.DeriveTargetID(proto.GraphNodeKindSelector, "retry-stale-selector")
+	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-stale-normal")
+	peakB := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-stale-peak-b")
+	peakC := proto.DeriveTargetID(proto.GraphNodeKindPath, "retry-stale-peak-c")
+	controller := &peakTransferController{
+		peerTargets: peakTransferTargets{
+			selectorID: selector, normalTargetID: normal,
+			normalTargetIDs: []proto.TargetID{normal},
+			peakTargetIDs:   []proto.TargetID{peakB, peakC},
+		},
+	}
+	now := time.Now()
+	controller.rx = peakTransferDirection{
+		onPeak: true, activePeakTarget: peakB, actualTarget: peakB,
+		actualSelectorGeneration: 2, normalPeakBps: 100,
+		peakStarted: now.Add(-time.Second),
+	}
+	var transitions int
+	controller.policyApplyForTest = func(bool, peakTransferChoice, proto.TargetID, string) error {
+		transitions++
+		return engine.ErrSelectorDecisionUnavailable
+	}
+	controller.evaluatePassiveWithPending(
+		now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		1, defaultPeakSaturationFor, peakB, false, true,
+	)
+	retryAt := controller.rx.policyRetryAfter
+	controller.reconcileActualTarget(true, selector, peakC, 3)
+	if controller.retryPendingPolicy(retryAt, true) {
+		t.Fatal("stale capacity-return intent retried after a newer factual commit")
+	}
+	if transitions != 1 || !controller.rx.onPeak || controller.rx.activePeakTarget != peakC ||
+		controller.rx.actualSelectorGeneration != 3 {
+		t.Fatalf("newer factual target was overwritten: transitions=%d state=%+v", transitions, controller.rx)
+	}
+}
+
 func TestPeakTransferRetryableReturnUsesObservationBackoff(t *testing.T) {
 	fixture := newPeakDirectionalFixture(t,
 		Selector("client-root", []Target{
@@ -842,6 +1193,12 @@ func TestPeakTransferRetryableReturnUsesObservationBackoff(t *testing.T) {
 				now, test.bytes, test.demand, test.bps,
 				defaultPeakWindow, fixture.localPeak, false,
 			)
+			if test.demand != 0 {
+				controller.evaluatePassive(
+					now.Add(defaultPeakWindow), test.bytes, test.demand, test.bps,
+					defaultPeakWindow, fixture.localPeak, false,
+				)
+			}
 			after := time.Now()
 			retryAfter := controller.tx.policyRetryAfter
 			if !retryAfter.After(after) || retryAfter.After(after.Add(2*defaultPeakWindow)) {
@@ -883,6 +1240,8 @@ func TestPeakTransferSlowCandidateSuppressesOnlyThatCandidate(t *testing.T) {
 		return nil
 	}
 	fixture.controller.evaluatePassive(now, defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
+		1, defaultPeakWindow, peaks[0], false)
+	fixture.controller.evaluatePassive(now.Add(defaultPeakWindow), defaultPeakMinSampleBytes, defaultPeakMinSampleBytes,
 		1, defaultPeakWindow, peaks[0], false)
 	fixture.controller.policyApplyForTest = nil
 	if fixture.controller.tx.onPeak || !fixture.controller.tx.peakTargetSuppressed(peaks[0], now) {
@@ -1000,7 +1359,7 @@ func TestPeakOutcomeUnknownCannotOverwriteFactualCommit(t *testing.T) {
 	normal := proto.DeriveTargetID(proto.GraphNodeKindPath, "unknown-guard-normal")
 	peak := proto.DeriveTargetID(proto.GraphNodeKindPath, "unknown-guard-peak")
 	controller := &peakTransferController{
-		opts: PeakTransfer{SaturationFor: time.Millisecond, SaturationRatio: 0.5},
+		tuning: SelectorTuning{PeakPromoteAfter: time.Millisecond},
 		localTargets: peakTransferTargets{
 			selectorID: selector, normalTargetID: normal,
 			normalTargetIDs: []proto.TargetID{normal},

@@ -13,7 +13,11 @@ import (
 	"github.com/FrankoonG/rendr/l3ingress"
 )
 
-const defaultUDPPeerBufferSize = 64 << 10
+const (
+	maxUDPPeerPayloadSize        = 1<<16 - 1 - 8
+	defaultUDPPeerBufferSize     = udpEnvelopeHeaderSize + l3ingress.IdentityWireSize + udpEnvelopeMaxEgressName + maxUDPPeerPayloadSize
+	udpPeerWorkerShutdownTimeout = time.Second
+)
 
 // UDPPeerRelay terminates one TUN-originated rendr packet session and
 // dispatches its preserved identity to an embedding-provided UDP egress.
@@ -21,7 +25,11 @@ const defaultUDPPeerBufferSize = 64 << 10
 type UDPPeerRelay struct {
 	PacketConn rendr.PacketConn
 	Egresses   *l3ingress.EgressRegistry
+	// BufferSize may raise the per-direction read buffer above the largest UDP
+	// envelope. Smaller positive values are promoted to that safe floor.
 	BufferSize int
+
+	dataPlaneExecutor *dataPlaneCallbackExecutor
 }
 
 // Run bridges packets until the context is canceled or either side closes.
@@ -37,85 +45,147 @@ func (r *UDPPeerRelay) Run(ctx context.Context) error {
 	if err := l3ingress.RequirePeerEgress(r.Egresses != nil); err != nil {
 		return err
 	}
+	rendrPacket := newDataPlanePacket(r.PacketConn, "UDPPeerRelay rendr PacketConn", nil)
 	size := r.BufferSize
-	if size <= 0 {
+	if size < defaultUDPPeerBufferSize {
 		size = defaultUDPPeerBufferSize
 	}
-	if size < udpEnvelopeHeaderSize+l3ingress.IdentityWireSize+1 {
-		return fmt.Errorf("l3session: UDP peer buffer size %d is too small", size)
-	}
 
-	stopFirstRead := context.AfterFunc(ctx, func() {
-		_ = r.PacketConn.SetReadDeadline(time.Now())
-	})
+	stopFirstRead := context.AfterFunc(ctx, func() { _ = rendrPacket.setReadDeadline(time.Now()) })
 	buf := make([]byte, size)
-	n, _, err := r.PacketConn.ReadFrom(buf)
+	n, _, readErr := rendrPacket.readFrom(ctx, buf)
 	stopFirstRead()
-	if err != nil {
-		return normalizeUDPPeerError(ctx, err)
+	if n < 0 || n > len(buf) {
+		return errors.Join(readErr, fmt.Errorf("l3session: invalid first rendr UDP read count %d", n))
+	}
+	if n == 0 && readErr != nil {
+		return normalizeUDPPeerError(ctx, readErr)
 	}
 	first, err := decodeUDPEnvelope(buf[:n])
 	if err != nil {
 		return err
 	}
-	egressConn, remote, err := r.Egresses.DialUDP(ctx, first.Egress, first.Identity)
+	cleanup, err := reserveDataPlaneCleanupWithExecutor(
+		dataPlaneExecutorOrProcess(r.dataPlaneExecutor),
+		"UDPPeerRelay egress PacketConn Close",
+	)
 	if err != nil {
 		return err
 	}
-	if !remote.IsValid() {
-		_ = egressConn.Close()
-		return errors.New("l3session: UDP egress returned an invalid remote address")
+	egressConn, remote, err := r.Egresses.DialUDP(ctx, first.Egress, first.Identity)
+	if err != nil {
+		cleanup.Release()
+		return err
 	}
-	defer egressConn.Close()
-	remoteAddr := net.UDPAddrFromAddrPort(remote)
-	if n, err := egressConn.WriteTo(first.Payload, remoteAddr); err != nil {
+	egressPacket := newDataPlanePacketWithCloseAuthority(
+		egressConn,
+		"UDPPeerRelay egress PacketConn",
+		cleanup.Bind(egressConn.Close),
+	)
+	closeEgress := egressPacket.close
+	remote, remoteOK := canonicalAddrPort(remote)
+	if !remoteOK {
+		return errors.Join(
+			errors.New("l3session: UDP egress returned an invalid remote address"),
+			closeEgress(),
+		)
+	}
+	defer closeEgress()
+	if n, err := egressPacket.writeTo(ctx, first.Payload, net.UDPAddrFromAddrPort(remote)); err != nil {
 		return fmt.Errorf("l3session: write first UDP egress payload: %w", err)
 	} else if n != len(first.Payload) {
 		return fmt.Errorf("l3session: short first UDP egress write: %d of %d", n, len(first.Payload))
+	}
+	if readErr != nil {
+		return normalizeUDPPeerError(ctx, readErr)
 	}
 
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stopIO := context.AfterFunc(bridgeCtx, func() {
-		now := time.Now()
-		_ = r.PacketConn.SetReadDeadline(now)
-		_ = r.PacketConn.SetWriteDeadline(now)
-		_ = egressConn.SetReadDeadline(now)
-		_ = egressConn.SetWriteDeadline(now)
+		_ = rendrPacket.interrupt()
+		_ = egressPacket.interrupt()
 	})
 	defer stopIO()
 
-	errCh := make(chan error, 2)
+	type workerResult struct {
+		direction string
+		err       error
+	}
+	errCh := make(chan workerResult, 2)
 	go func() {
-		errCh <- r.forwardUDPRequests(bridgeCtx, first, egressConn, remoteAddr, size)
+		errCh <- workerResult{
+			direction: "request forwarding",
+			err:       r.forwardUDPRequests(bridgeCtx, first, rendrPacket, egressPacket, remote, size),
+		}
 	}()
 	go func() {
-		errCh <- r.forwardUDPReplies(bridgeCtx, egressConn, remote, size)
+		errCh <- workerResult{
+			direction: "reply forwarding",
+			err:       r.forwardUDPReplies(bridgeCtx, rendrPacket, egressPacket, remote, size),
+		}
 	}()
 
-	var firstErr error
+	remaining := 2
+	var relayErr error
 	select {
-	case firstErr = <-errCh:
+	case result := <-errCh:
+		relayErr = normalizeUDPPeerWorkerError(bridgeCtx, result.direction, result.err)
+		remaining--
 	case <-ctx.Done():
-		firstErr = ctx.Err()
+		// The parent Done channel can win this select before cancellation has
+		// propagated into bridgeCtx. Normalize against the context whose Done
+		// channel was actually observed so pure caller cancellation stays clean.
+		relayErr = normalizeUDPPeerError(ctx, ctx.Err())
 	}
 	cancel()
-	secondErr := <-errCh
-	return errors.Join(normalizeUDPPeerError(bridgeCtx, firstErr), normalizeUDPPeerError(bridgeCtx, secondErr))
+	closeErr := closeEgress()
+	if closeErr != nil {
+		closeErr = fmt.Errorf("l3session: close UDP peer egress: %w", closeErr)
+	}
+
+	timer := time.NewTimer(udpPeerWorkerShutdownTimeout)
+	defer timer.Stop()
+	for remaining > 0 {
+		select {
+		case result := <-errCh:
+			relayErr = errors.Join(relayErr, normalizeUDPPeerWorkerError(bridgeCtx, result.direction, result.err))
+			remaining--
+		case <-timer.C:
+			return errors.Join(
+				relayErr,
+				closeErr,
+				fmt.Errorf("l3session: UDP peer shutdown timed out with %d worker(s) still running", remaining),
+			)
+		}
+	}
+	return errors.Join(relayErr, closeErr)
+}
+
+func normalizeUDPPeerWorkerError(ctx context.Context, direction string, err error) error {
+	err = normalizeUDPPeerError(ctx, err)
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("l3session: UDP peer %s: %w", direction, err)
 }
 
 func (r *UDPPeerRelay) forwardUDPRequests(
 	ctx context.Context,
 	first udpEnvelope,
-	egressConn net.PacketConn,
-	remote net.Addr,
+	rendrPacket *dataPlanePacket,
+	egressPacket *dataPlanePacket,
+	remote netip.AddrPort,
 	bufferSize int,
 ) error {
 	buf := make([]byte, bufferSize)
 	for {
-		n, _, err := r.PacketConn.ReadFrom(buf)
-		if err != nil {
-			return err
+		n, _, readErr := rendrPacket.readFrom(ctx, buf)
+		if n < 0 || n > len(buf) {
+			return errors.Join(readErr, fmt.Errorf("l3session: invalid rendr UDP request read count %d", n))
+		}
+		if n == 0 && readErr != nil {
+			return readErr
 		}
 		envelope, err := decodeUDPEnvelope(buf[:n])
 		if err != nil {
@@ -125,12 +195,15 @@ func (r *UDPPeerRelay) forwardUDPRequests(
 			return fmt.Errorf("l3session: UDP session identity or egress changed: got %s/%q want %s/%q",
 				envelope.Identity, envelope.Egress, first.Identity, first.Egress)
 		}
-		written, err := egressConn.WriteTo(envelope.Payload, remote)
+		written, err := egressPacket.writeTo(ctx, envelope.Payload, net.UDPAddrFromAddrPort(remote))
 		if err != nil {
 			return err
 		}
 		if written != len(envelope.Payload) {
 			return fmt.Errorf("l3session: short UDP egress write: %d of %d", written, len(envelope.Payload))
+		}
+		if readErr != nil {
+			return readErr
 		}
 		select {
 		case <-ctx.Done():
@@ -142,25 +215,35 @@ func (r *UDPPeerRelay) forwardUDPRequests(
 
 func (r *UDPPeerRelay) forwardUDPReplies(
 	ctx context.Context,
-	egressConn net.PacketConn,
+	rendrPacket *dataPlanePacket,
+	egressPacket *dataPlanePacket,
 	remote netip.AddrPort,
 	bufferSize int,
 ) error {
 	buf := make([]byte, bufferSize)
 	for {
-		n, source, err := egressConn.ReadFrom(buf)
-		if err != nil {
-			return err
+		n, source, readErr := egressPacket.readFrom(ctx, buf)
+		if n < 0 || n > len(buf) {
+			return errors.Join(readErr, fmt.Errorf("l3session: invalid UDP egress reply read count %d", n))
+		}
+		if n == 0 && readErr != nil {
+			return readErr
 		}
 		if !packetSourceMatches(source, remote) {
+			if readErr != nil {
+				return readErr
+			}
 			continue
 		}
-		written, err := r.PacketConn.WriteTo(buf[:n], rendrPeerAddr)
+		written, err := rendrPacket.writeTo(ctx, buf[:n], nil)
 		if err != nil {
 			return err
 		}
 		if written != n {
 			return fmt.Errorf("l3session: short rendr UDP reply write: %d of %d", written, n)
+		}
+		if readErr != nil {
+			return readErr
 		}
 		select {
 		case <-ctx.Done():
@@ -171,26 +254,21 @@ func (r *UDPPeerRelay) forwardUDPReplies(
 }
 
 func packetSourceMatches(source net.Addr, expected netip.AddrPort) bool {
-	if source == nil || !expected.IsValid() {
+	actual, actualOK := canonicalUDPAddr(source)
+	expected, expectedOK := canonicalAddrPort(expected)
+	if !actualOK || !expectedOK {
 		return false
 	}
-	var actual netip.AddrPort
-	switch address := source.(type) {
-	case *net.UDPAddr:
-		actual = address.AddrPort()
-	default:
-		parsed, err := netip.ParseAddrPort(source.String())
-		if err != nil {
-			return false
-		}
-		actual = parsed
-	}
-	return actual.Addr().Unmap() == expected.Addr().Unmap() && actual.Port() == expected.Port()
+	return actual == expected
 }
 
 func normalizeUDPPeerError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
+	}
+	var callbackErr *CallbackError
+	if errors.As(err, &callbackErr) {
+		return err
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return nil

@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -101,8 +102,8 @@ func (c *engineBackedConn) Status() Status {
 	return status
 }
 
-func (c *engineBackedConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) error {
-	c.peak = newPeakTransferController(c.e, plan, pathIDs)
+func (c *engineBackedConn) startPeakTransfer(plan compiledTarget) error {
+	c.peak = newPeakTransferController(c.e, plan)
 	if err := c.peak.start(); err != nil {
 		c.peak.stopLoop()
 		return err
@@ -140,9 +141,82 @@ func (c *engineBackedConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips()
 // MigrationCount returns the cumulative committed-migration count.
 func (c *engineBackedConn) MigrationCount() uint64 { return c.e.MigrationCount() }
 
+// OnMigrationEvent registers a typed committed-migration callback.
+func (c *engineBackedConn) OnMigrationEvent(fn func(MigrationEvent)) MigrationEventSubscription {
+	if fn == nil {
+		return c.e.OnMigrationEvent(nil)
+	}
+	return c.e.OnMigrationEvent(func(event engine.MigrationEvent) {
+		fn(migrationEventFromEngine(event))
+	})
+}
+
 // OnMigrate registers a callback fired on every committed migration.
 func (c *engineBackedConn) OnMigrate(fn func(uint32, uint32, string)) func() {
 	return c.e.OnMigrate(fn)
+}
+
+func migrationEventFromEngine(event engine.MigrationEvent) MigrationEvent {
+	probeGenerations := make([]MigrationProbeGeneration, len(event.Evidence.ProbeGenerations))
+	for index, generation := range event.Evidence.ProbeGenerations {
+		probeGenerations[index] = MigrationProbeGeneration{
+			PathID:             generation.PathID,
+			PathOwner:          generation.PathOwner,
+			PathGeneration:     generation.PathGeneration,
+			RouteGeneration:    generation.RouteGeneration,
+			EndpointGeneration: generation.EndpointGeneration,
+			PeerMobilityEpoch:  generation.PeerMobilityEpoch,
+			HealthRevision:     generation.HealthRevision,
+		}
+	}
+	return MigrationEvent{
+		OldPathID:   event.OldPathID,
+		NewPathID:   event.NewPathID,
+		Cause:       event.Cause,
+		Ordinal:     event.Ordinal,
+		CommittedAt: event.CommittedAt,
+		Evidence: MigrationEvidence{
+			Kind:                      MigrationEvidenceKind(event.Evidence.Kind),
+			TransactionID:             event.Evidence.TransactionID,
+			RefreshEvidenceGeneration: event.Evidence.RefreshEvidenceGeneration,
+			SourceEndpointGeneration:  event.Evidence.SourceEndpointGeneration,
+			ResultEndpointGeneration:  event.Evidence.ResultEndpointGeneration,
+			TopologyEpoch:             event.Evidence.TopologyEpoch,
+			HealthEpoch:               event.Evidence.HealthEpoch,
+			Source:                    migrationPathBindingFromEngine(event.Evidence.Source),
+			Result:                    migrationPathBindingFromEngine(event.Evidence.Result),
+			Selector: MigrationSelectorBinding{
+				SelectorID:        event.Evidence.Selector.SelectorID,
+				TargetID:          event.Evidence.Selector.TargetID,
+				Origin:            event.Evidence.Selector.Origin,
+				CutoverGeneration: event.Evidence.Selector.CutoverGeneration,
+				CapturedAt:        event.Evidence.Selector.CapturedAt,
+				ValidUntil:        event.Evidence.Selector.ValidUntil,
+			},
+			Leaf: MigrationLeafBinding{
+				RefreshReason:           event.Evidence.Leaf.RefreshReason,
+				RefreshObservedAt:       event.Evidence.Leaf.RefreshObservedAt,
+				RefreshSourceGeneration: event.Evidence.Leaf.RefreshSourceGeneration,
+				RefreshSourceUsable:     event.Evidence.Leaf.RefreshSourceUsable,
+				RefreshIncarnation:      event.Evidence.Leaf.RefreshIncarnation,
+			},
+			ProbeGenerations: probeGenerations,
+		},
+	}
+}
+
+func migrationPathBindingFromEngine(binding engine.MigrationPathBinding) MigrationPathBinding {
+	return MigrationPathBinding{
+		PathID:             binding.PathID,
+		PathOwner:          binding.PathOwner,
+		PathGeneration:     binding.PathGeneration,
+		RouteGeneration:    binding.RouteGeneration,
+		EndpointGeneration: binding.EndpointGeneration,
+		PeerMobilityEpoch:  binding.PeerMobilityEpoch,
+		HealthRevision:     binding.HealthRevision,
+		LocalTargetID:      binding.LocalTargetID,
+		PeerTargetID:       binding.PeerTargetID,
+	}
 }
 
 // Stats binds topology, replay occupancy, and root-delivery evidence to one
@@ -230,21 +304,27 @@ func (c *engineBackedConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
-	pc, err := c.resolver.dialPath(ctx, spec)
+	lease, err := c.resolver.dialPathForAdoption(ctx, spec)
 	if err != nil {
 		return 0, err
 	}
+	pc := lease.Path()
 	if err := ctx.Err(); err != nil {
-		_ = pc.Close()
-		return 0, err
+		return 0, errors.Join(err, lease.Close())
 	}
 	if c.closing.Load() {
-		_ = pc.Close()
-		return 0, net.ErrClosed
+		return 0, errors.Join(net.ErrClosed, lease.Close())
 	}
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, pc, c.e, pathSpecName(spec), spec)
+	if admission.EngineOwnsPath {
+		err = errors.Join(err, lease.ReleaseToEngine())
+	} else if err == nil {
+		err = errors.New("rendr: successful bridge admission did not transfer path ownership")
+	}
 	if err != nil {
-		_ = pc.Close()
+		if !admission.EngineOwnsPath {
+			err = errors.Join(err, lease.Close())
+		}
 		return 0, err
 	}
 	return admission.PathID, nil

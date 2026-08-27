@@ -73,7 +73,7 @@ func TestPeakTransferConcurrentCloseHighCount(t *testing.T) {
 
 				var closeConn func() error
 				if packet {
-					conn := newEnginePacketConn(e, nil, nil)
+					conn := newEnginePacketConn(e, nil)
 					conn.peak = fixture.controller
 					closeConn = conn.Close
 				} else {
@@ -146,7 +146,7 @@ func TestPeakTransferStartReturnsLocalInitializationError(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.BeginGracefulClose()
-	controller := newPeakTransferController(e, plan, nil)
+	controller := newPeakTransferController(e, plan)
 	if err := controller.start(); err == nil {
 		t.Fatal("PeakTransfer start ignored local initialization failure")
 	}
@@ -333,6 +333,7 @@ func (p *peakPolicyDropPath) Write(frame []byte) (int, error) {
 
 func (p *peakPolicyDropPath) Close() error                   { return p.inner.Close() }
 func (p *peakPolicyDropPath) Quality() transport.PathQuality { return p.inner.Quality() }
+func (p *peakPolicyDropPath) MaxFrameSize() int              { return testPacketPathFrameSize(p.inner) }
 func (p *peakPolicyDropPath) QualityContext(ctx context.Context) (transport.PathQuality, error) {
 	reader, ok := p.inner.(transport.PathQualityReader)
 	if !ok {
@@ -464,6 +465,9 @@ type listenerPeakQualityPath struct {
 }
 
 func (p *listenerPeakQualityPath) Quality() transport.PathQuality { return p.quality }
+func (p *listenerPeakQualityPath) MaxFrameSize() int {
+	return testPacketPathFrameSize(p.PathConn)
+}
 
 func (p *listenerPeakQualityPath) QualityContext(ctx context.Context) (transport.PathQuality, error) {
 	select {

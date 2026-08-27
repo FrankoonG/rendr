@@ -3,6 +3,7 @@ package leafmobility
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -42,6 +43,20 @@ func (p *implementationTestProvider) LeafMobilityImplementation() Implementation
 
 type promotedImplementationProvider struct {
 	*implementationTestProvider
+}
+
+type reboundImplementationProvider struct {
+	evidence ImplementationEvidence
+}
+
+func (p *reboundImplementationProvider) LeafMobilityImplementation() ImplementationEvidence {
+	return p.evidence
+}
+
+type invalidImplementationProvider struct{}
+
+func (p *invalidImplementationProvider) LeafMobilityImplementation() ImplementationEvidence {
+	return ImplementationEvidence{ownerType: reflect.TypeOf(p)}
 }
 
 func TestImplementationEvidenceRequiresExactDynamicOwner(t *testing.T) {
@@ -109,6 +124,78 @@ func TestImplementationEvidenceRejectsInvalidDrivers(t *testing.T) {
 	}
 	if _, err := CapabilitiesForImplementationProvider(nilOwner); !errors.Is(err, ErrInvalidImplementationEvidence) {
 		t.Fatalf("nil provider error=%v", err)
+	}
+}
+
+func TestRebindImplementationEvidenceRejectsNilParticipants(t *testing.T) {
+	source := &implementationTestProvider{drivers: []Driver{
+		&implementationTestDriver{operation: OperationQUICCIDRebind},
+	}}
+	var nilOwner *reboundImplementationProvider
+	if _, err := RebindImplementationEvidence(nilOwner, source); !errors.Is(err, ErrInvalidImplementationEvidence) {
+		t.Fatalf("nil owner error=%v", err)
+	}
+
+	owner := &reboundImplementationProvider{}
+	var nilSource *implementationTestProvider
+	if _, err := RebindImplementationEvidence(owner, nilSource); !errors.Is(err, ErrInvalidImplementationEvidence) {
+		t.Fatalf("nil source error=%v", err)
+	}
+}
+
+func TestRebindImplementationEvidenceRejectsInvalidAndPromotedSources(t *testing.T) {
+	owner := &reboundImplementationProvider{}
+	if _, err := RebindImplementationEvidence(owner, &invalidImplementationProvider{}); !errors.Is(err, ErrInvalidImplementationEvidence) {
+		t.Fatalf("invalid source error=%v", err)
+	}
+
+	exact := &implementationTestProvider{drivers: []Driver{
+		&implementationTestDriver{operation: OperationTCPRepair},
+	}}
+	promoted := &promotedImplementationProvider{implementationTestProvider: exact}
+	if _, err := RebindImplementationEvidence(owner, promoted); !errors.Is(err, ErrImplementationOwnerMismatch) {
+		t.Fatalf("promoted source error=%v, want owner mismatch", err)
+	}
+}
+
+func TestRebindImplementationEvidenceSealsExactOwnerAndCopiesCapabilities(t *testing.T) {
+	tcpDriver := &implementationTestDriver{operation: OperationTCPRepair}
+	quicDriver := &implementationTestDriver{operation: OperationQUICCIDRebind}
+	source := &implementationTestProvider{drivers: []Driver{quicDriver, tcpDriver}}
+	owner := &reboundImplementationProvider{}
+
+	evidence, err := RebindImplementationEvidence(owner, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.evidence = evidence
+
+	capabilities, err := CapabilitiesForImplementationProvider(owner)
+	if err != nil {
+		t.Fatalf("rebound provider: %v", err)
+	}
+	if got := capabilityOperations(capabilities); len(got) != 2 ||
+		got[0] != OperationTCPRepair || got[1] != OperationQUICCIDRebind {
+		t.Fatalf("rebound capabilities=%v", got)
+	}
+
+	// The rebound owner keeps a value snapshot independent of both future
+	// source evidence and slices returned to consumers.
+	tcpDriver.operation = OperationUDPFlowRebind
+	source.drivers = source.drivers[:1]
+	capabilities[0] = Capability{}
+	again, err := CapabilitiesForImplementationProvider(owner)
+	if err != nil {
+		t.Fatalf("rebound provider after source mutation: %v", err)
+	}
+	if got := capabilityOperations(again); len(got) != 2 ||
+		got[0] != OperationTCPRepair || got[1] != OperationQUICCIDRebind {
+		t.Fatalf("rebound capabilities after mutation=%v", got)
+	}
+
+	promotedOwner := &struct{ *reboundImplementationProvider }{owner}
+	if _, err := CapabilitiesForImplementationProvider(promotedOwner); !errors.Is(err, ErrImplementationOwnerMismatch) {
+		t.Fatalf("promoted rebound owner error=%v, want owner mismatch", err)
 	}
 }
 

@@ -149,7 +149,7 @@ func TestPacketLinkDataCannotPoisonPeerTuple(t *testing.T) {
 	packet[0] = 0x45
 	copy(packet[12:16], owner.virtualIP[:])
 	copy(packet[16:20], serverIPv4[:])
-	datagram, err := encodeOuterData(owner.id, 1, 1, packet, owner.secret)
+	datagram, err := encodeOuterData(owner.id, 1, 1, packet, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestPacketLinkDataCannotPoisonPeerTuple(t *testing.T) {
 	owner.active = candidate
 	owner.activationPending = true
 	owner.mu.Unlock()
-	publishedData, err := encodeOuterData(owner.id, 1, 2, packet, owner.secret)
+	publishedData, err := encodeOuterData(owner.id, 1, 2, packet, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestPacketLinkDataCannotPoisonPeerTuple(t *testing.T) {
 	owner.mu.Lock()
 	owner.activationPending = false
 	owner.mu.Unlock()
-	activatedData, err := encodeOuterData(owner.id, 1, 3, packet, owner.secret)
+	activatedData, err := encodeOuterData(owner.id, 1, 3, packet, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,8 @@ func TestPacketLinkChallengeDoesNotPublishTuple(t *testing.T) {
 	}
 	payload, _ := marshalOuterControl(control)
 	challenge, err := encodeOuterControl(outerFrame{
-		Type: outerTypePathChallenge, LinkID: owner.id, Generation: 2, Payload: payload,
+		Type: outerTypePathChallenge, Sender: peerOuterRole(owner.role),
+		LinkID: owner.id, Generation: 2, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +244,8 @@ func TestPacketLinkChallengeDoesNotPublishTuple(t *testing.T) {
 	markPendingPeerQualified(t, owner, candidate, 2, control)
 
 	commit, err := encodeOuterControl(outerFrame{
-		Type: outerTypePathCommit, LinkID: owner.id, Generation: 2, Payload: payload,
+		Type: outerTypePathCommit, Sender: peerOuterRole(owner.role),
+		LinkID: owner.id, Generation: 2, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		t.Fatal(err)
@@ -387,7 +389,7 @@ func TestPacketLinkConcurrentStaleTrafficCannotRevertCommit(t *testing.T) {
 	packet[0] = 0x45
 	copy(packet[12:16], owner.virtualIP[:])
 	copy(packet[16:20], serverIPv4[:])
-	staleData, err := encodeOuterData(owner.id, 1, 1, packet, owner.secret)
+	staleData, err := encodeOuterData(owner.id, 1, 1, packet, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +494,7 @@ func mustOuterControl(
 		t.Fatal(err)
 	}
 	wire, err := encodeOuterControl(outerFrame{
-		Type: typ, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: typ, Sender: peerOuterRole(owner.role), LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		t.Fatal(err)
@@ -910,7 +912,7 @@ func TestPacketLinkQueueAppliesBoundedLosslessBackpressure(t *testing.T) {
 	active.writeMu.RUnlock()
 	packet := testInnerPacket(owner, packetMTU)
 	blocked := newBlockingPacketWriter(original)
-	blocked.trackPacket(owner.secret, packet)
+	blocked.trackPacket(owner.secret, owner.role, packet)
 	if err := active.replaceWriter(blocked); err != nil {
 		t.Fatal(err)
 	}
@@ -1239,7 +1241,8 @@ func TestPacketLinkDuplicateDataACKRequestsBoundedReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: outerTypeDataAck, LinkID: owner.id, Generation: 1, Payload: payload,
+		Type: outerTypeDataAck, Sender: peerOuterRole(owner.role),
+		LinkID: owner.id, Generation: 1, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		t.Fatal(err)
@@ -1314,7 +1317,8 @@ func TestPacketLinkAuthenticatedControlReplayIsProgressAndRateBounded(t *testing
 			t.Fatal(err)
 		}
 		challenge, err := encodeOuterControl(outerFrame{
-			Type: outerTypeLivenessChallenge, LinkID: owner.id, Generation: 1, Payload: payload,
+			Type: outerTypeLivenessChallenge, Sender: peerOuterRole(owner.role),
+			LinkID: owner.id, Generation: 1, Payload: payload,
 		}, owner.secret)
 		if err != nil {
 			t.Fatal(err)
@@ -1398,7 +1402,8 @@ func mustOuterDataAck(t testing.TB, owner *linkOwner, receiveNext uint64) []byte
 		t.Fatal(err)
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: outerTypeDataAck, LinkID: owner.id, Generation: owner.peerGeneration, Payload: payload,
+		Type: outerTypeDataAck, Sender: peerOuterRole(owner.role),
+		LinkID: owner.id, Generation: owner.peerGeneration, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		t.Fatal(err)
@@ -1562,6 +1567,7 @@ type blockingPacketWriter struct {
 
 	trackMu        sync.Mutex
 	trackSecret    linkSecret
+	trackSender    leafmobility.Role
 	trackedPayload []byte
 	trackSequences map[uint64]struct{}
 }
@@ -1584,9 +1590,10 @@ func (writer *blockingPacketWriter) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
-func (writer *blockingPacketWriter) trackPacket(secret linkSecret, packet []byte) {
+func (writer *blockingPacketWriter) trackPacket(secret linkSecret, sender leafmobility.Role, packet []byte) {
 	writer.trackMu.Lock()
 	writer.trackSecret = secret
+	writer.trackSender = sender
 	writer.trackedPayload = append([]byte(nil), packet...)
 	writer.trackSequences = make(map[uint64]struct{})
 	writer.trackMu.Unlock()
@@ -1601,13 +1608,14 @@ func (writer *blockingPacketWriter) trackedPacketSequences() int {
 func (writer *blockingPacketWriter) recordTrackedPacket(datagram []byte) {
 	writer.trackMu.Lock()
 	secret := writer.trackSecret
+	sender := writer.trackSender
 	want := append([]byte(nil), writer.trackedPayload...)
 	tracking := writer.trackSequences != nil
 	writer.trackMu.Unlock()
 	if !tracking {
 		return
 	}
-	frame, err := decodeOuter(datagram, secret)
+	frame, err := decodeOuter(datagram, secret, sender)
 	if err != nil || frame.Type != outerTypeData {
 		return
 	}

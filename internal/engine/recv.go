@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,9 @@ type recvItem struct {
 	isCtrl        bool
 	ctrlApplied   bool
 	flags         uint16
+	arrivalOrder  uint64
+	stateEpoch    uint64
+	statePending  bool
 	cohort        rootDeliveryCohort
 	attributable  bool
 	demand        bool
@@ -85,6 +89,8 @@ type recvFrame struct {
 type recvPacketProof struct {
 	digest        proto.FrameDigest
 	topologyEpoch uint64
+	stateEpoch    uint64
+	leafID        proto.TargetID
 	cohort        rootDeliveryCohort
 	attributable  bool
 	demand        bool
@@ -95,6 +101,8 @@ type recvPacketProof struct {
 type recvPacketDelivery struct {
 	payload       []byte
 	topologyEpoch uint64
+	stateEpoch    uint64
+	leafID        proto.TargetID
 	cohort        rootDeliveryCohort
 	attributable  bool
 	demand        bool
@@ -158,7 +166,7 @@ func (e *Engine) packetConsumeHeadLocked() {
 		e.rememberDeliveredDigestLocked(e.expectedRecvSeq, item.digest)
 		if !item.deliverySeen {
 			e.commitUniqueTargetDeliveryLocked(
-				item.cohort, item.topologyEpoch,
+				item.cohort, item.topologyEpoch, item.stateEpoch, item.leafID,
 				item.attributable, item.demand, item.bytes,
 			)
 		}
@@ -264,12 +272,15 @@ func (e *Engine) validateTargetDeliveryCohortLocked(cohort rootDeliveryCohort) e
 func (e *Engine) commitUniqueTargetDeliveryLocked(
 	cohort rootDeliveryCohort,
 	topologyEpoch uint64,
+	stateEpoch uint64,
+	leafID proto.TargetID,
 	attributable, demand bool,
 	bytes int,
 ) {
 	if bytes <= 0 {
 		return
 	}
+	e.commitPeerSelectorDeliveryLocked(stateEpoch, leafID, topologyEpoch, demand, bytes)
 	if cohort.targetID == (proto.TargetID{}) {
 		e.recvUniqueBytes = saturatingAddUint64(e.recvUniqueBytes, uint64(bytes))
 		return
@@ -409,11 +420,31 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 			return p, nil
 		default:
 		}
+		if hook := e.recvPacketBeforeTerminalLock; hook != nil {
+			hook()
+		}
 		e.recvMu.Lock()
+		// Packet delivery and receive-terminal publication both occur under
+		// recvMu. Recheck the queue while holding that lock so an already
+		// admitted DATA frame cannot be overtaken by its following terminal.
+		select {
+		case p := <-e.recvPacketCh:
+			e.recvMu.Unlock()
+			return p, nil
+		default:
+		}
 		deadline := e.recvDeadline
 		terminal := e.recvTerminal
 		terminalErr := e.recvFinalErr
+		packetWake := e.recvPacketWake
+		if packetWake == nil {
+			packetWake = make(chan struct{})
+			e.recvPacketWake = packetWake
+		}
 		e.recvMu.Unlock()
+		if hook := e.recvPacketBeforeWait; hook != nil {
+			hook()
+		}
 		if terminal {
 			if terminalErr == nil {
 				terminalErr = io.EOF
@@ -423,7 +454,13 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 			}
 		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			return nil, ErrReadDeadlineExceeded
+			if hook := e.recvPacketDeadlineBeforeRevalidate; hook != nil {
+				hook()
+			}
+			if e.packetReadDeadlineExpired(packetWake, deadline) {
+				return nil, ErrReadDeadlineExceeded
+			}
+			continue
 		}
 		var (
 			timer  *time.Timer
@@ -439,7 +476,7 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 				timer.Stop()
 			}
 			return p, nil
-		case <-e.recvPacketWake:
+		case <-packetWake:
 			if timer != nil {
 				timer.Stop()
 			}
@@ -458,16 +495,28 @@ func (e *Engine) RecvPacket() ([]byte, error) {
 			}
 			return nil, net.ErrClosed
 		case <-timerC:
-			return nil, ErrReadDeadlineExceeded
+			if hook := e.recvPacketDeadlineBeforeRevalidate; hook != nil {
+				hook()
+			}
+			if e.packetReadDeadlineExpired(packetWake, deadline) {
+				return nil, ErrReadDeadlineExceeded
+			}
+			continue
 		}
 	}
 }
 
 // readerLoop is one goroutine per attached PathConn.
 func (e *Engine) readerLoop(slot *pathSlot) {
+	callbackGuard := pathDispatchCallbackGuard{}
+	defer func() {
+		if callbackErr := callbackGuard.goexitError(); callbackErr != nil {
+			e.failPathControlWrite(slot, callbackErr)
+		}
+	}()
 	defer close(slot.doneR)
 
-	buf := make([]byte, MaxPayload+proto.HeaderSize+proto.DataRootGenerationSize)
+	buf := make([]byte, MaxPayload+proto.HeaderSize+proto.DataSelectorStateEpochSize)
 	for {
 		select {
 		case <-slot.quit:
@@ -480,14 +529,17 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		owned := false
 		var err error
 		if reader, ok := slot.conn.(transport.OwnedFrameReader); ok {
-			frame, err = reader.ReadOwnedFrame()
+			frame, err = readExternalOwnedFrameGuarded(reader, &callbackGuard)
 			owned = true
 		} else {
 			var n int
-			n, err = slot.conn.Read(buf)
+			n, err = readExternalPathConnGuarded(slot.conn, buf, &callbackGuard)
 			frame = buf[:n]
 		}
 		if err != nil {
+			if pathCallbackFailedAbnormally(err) {
+				e.failPathControlWrite(slot, err)
+			}
 			return
 		}
 		frameTopologyEpoch := slot.topologyEpoch.Load()
@@ -501,11 +553,10 @@ func (e *Engine) readerLoop(slot *pathSlot) {
 		// version / framing rejection: from the path's perspective,
 		// "something arrived" is the signal monitoring cares about.
 		slot.noteRecv(nowFn())
-		if len(frame) < proto.HeaderSize {
-			return
-		}
-		hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		hdr, err := proto.DecodeHeader(frame)
 		if err != nil {
+			e.setCloseErr(fmt.Errorf("%w: malformed frame header: %v", ErrPeerProtocol, err))
+			go e.Close()
 			return
 		}
 		if hdr.Version != proto.Version {
@@ -843,10 +894,36 @@ func (e *Engine) enqueuePathAck(slot *pathSlot, request pathAckWrite) {
 }
 
 func (e *Engine) pathAckWriter(slot *pathSlot) {
+	callbackGuard := pathDispatchCallbackGuard{}
+	var currentResult chan<- bool
+	defer func() {
+		callbackErr := callbackGuard.goexitError()
+		slot.ackMu.Lock()
+		if callbackErr != nil {
+			if currentResult != nil {
+				select {
+				case currentResult <- false:
+				default:
+				}
+			}
+			if slot.ackPendingSet && slot.ackPending.result != nil {
+				select {
+				case slot.ackPending.result <- false:
+				default:
+				}
+			}
+			slot.ackPending = pathAckWrite{}
+			slot.ackPendingSet = false
+		}
+		slot.ackRunning = false
+		slot.ackMu.Unlock()
+		if callbackErr != nil {
+			e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, callbackErr)
+		}
+	}()
 	for {
 		slot.ackMu.Lock()
 		if !slot.ackPendingSet {
-			slot.ackRunning = false
 			slot.ackMu.Unlock()
 			return
 		}
@@ -855,7 +932,8 @@ func (e *Engine) pathAckWriter(slot *pathSlot) {
 		slot.ackPendingSet = false
 		slot.ackMu.Unlock()
 
-		n, err := slot.writeFrame(request.frame)
+		currentResult = request.result
+		n, err := slot.writeFrameGuarded(request.frame, &callbackGuard)
 		ok := err == nil && n == len(request.frame)
 		if request.result != nil {
 			select {
@@ -863,6 +941,7 @@ func (e *Engine) pathAckWriter(slot *pathSlot) {
 			default:
 			}
 		}
+		currentResult = nil
 		if !ok {
 			select {
 			case <-slot.quit:
@@ -871,6 +950,10 @@ func (e *Engine) pathAckWriter(slot *pathSlot) {
 				return
 			default:
 			}
+			if pathCallbackFailedAbnormally(err) {
+				e.failPathControlWrite(slot, err)
+			}
+			return
 		}
 	}
 }
@@ -1046,7 +1129,7 @@ func (e *Engine) onRecvBatch(batch []recvFrame) {
 		select {
 		case e.recvPacketCh <- delivery.payload:
 			e.commitUniqueTargetDeliveryLocked(
-				delivery.cohort, delivery.topologyEpoch,
+				delivery.cohort, delivery.topologyEpoch, delivery.stateEpoch, delivery.leafID,
 				delivery.attributable, delivery.demand, delivery.bytes,
 			)
 			e.markPayloadLocked()
@@ -1094,9 +1177,11 @@ func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.Ack
 	if finalErr != nil {
 		if errors.Is(finalErr, io.EOF) {
 			// BYE is session-wide even though one physical slot carried the
-			// frame. Mark every admitted receive route before publishing the
-			// terminal ACK so the peer's ensuing all-path close is classified as
-			// clean on siblings too, rather than spawning migration work.
+			// frame. Give every admitted receive route one bounded MarkByeSeen
+			// invocation before publishing the terminal ACK, so the peer's ensuing
+			// all-path close is classified as clean on siblings rather than
+			// spawning migration work. A callback that outlives its deadline keeps
+			// a lifecycle ticket but cannot indefinitely withhold the ACK.
 			e.markPeerByeSeen()
 		}
 		if nextSeq != 0 || gap {
@@ -1119,11 +1204,8 @@ func (e *Engine) finishReceiveProgress(nextSeq uint64, gap bool, proof proto.Ack
 			e.schedulePeerByeClose()
 			e.recvMu.Lock()
 			e.recvCond.Broadcast()
+			e.wakePacketReadersLocked()
 			e.recvMu.Unlock()
-			select {
-			case e.recvPacketWake <- struct{}{}:
-			default:
-			}
 			return
 		}
 		e.setCloseErr(finalErr)
@@ -1170,10 +1252,140 @@ func (e *Engine) markPeerByeSeen() {
 	e.pathsMu.RLock()
 	slots := e.receiveSlotsLocked()
 	e.pathsMu.RUnlock()
+	if hook := e.markPeerByeSeenAfterSnapshot; hook != nil {
+		hook()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), externalPathValueCallbackTimeout)
+	defer cancel()
+	type invocation struct {
+		marker interface{ MarkByeSeen() }
+		lease  *externalPathCallbackLease
+		slot   *pathSlot
+	}
+	invocations := make([]invocation, 0, len(slots))
+	// Revalidate and reserve callback authority while pathsMu still proves the
+	// exact pointer/generation is receive-owned. A slot retired after the first
+	// snapshot can never acquire authority here.
+	e.pathsMu.RLock()
 	for _, slot := range slots {
-		if marker, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
-			marker.MarkByeSeen()
+		if !e.receiveSlotCurrentLocked(slot) || slot.conn == nil {
+			continue
 		}
+		marker, ok := slot.conn.(interface{ MarkByeSeen() })
+		if !ok {
+			continue
+		}
+		lease, err := acquireExternalPathCallbackLease("PathConn.MarkByeSeen", slot.conn)
+		if err != nil {
+			continue
+		}
+		if !e.admitPathByeCallbackLocked(slot) {
+			lease.release()
+			continue
+		}
+		invocations = append(invocations, invocation{marker: marker, lease: lease, slot: slot})
+	}
+	e.pathsMu.RUnlock()
+
+	done := make(chan struct{}, len(invocations))
+	for _, call := range invocations {
+		call := call
+		go func() {
+			defer func() {
+				<-call.lease.completion()
+				e.finishPathByeCallback(call.slot)
+			}()
+			_ = invokeExternalPathErrorCallbackWithLease(ctx, "PathConn.MarkByeSeen", call.lease, func() error {
+				call.marker.MarkByeSeen()
+				return nil
+			})
+			done <- struct{}{}
+		}()
+	}
+	for range invocations {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (e *Engine) receiveSlotCurrentLocked(slot *pathSlot) bool {
+	if e == nil || slot == nil {
+		return false
+	}
+	return e.paths[slot.id] == slot || e.stagedPaths[slot.id] == slot || e.retainedPaths[slot.id] == slot
+}
+
+// admitPathByeCallbackLocked transfers exact-generation callback authority to
+// a Close-tracked ticket. Callers hold pathsMu for the current-slot proof;
+// Close crosses that same lock before waiting on byeCallbackWG.
+func (e *Engine) admitPathByeCallbackLocked(slot *pathSlot) bool {
+	if e == nil || slot == nil || !slot.beginByeCallback() {
+		return false
+	}
+	e.byeCallbackWG.Add(1)
+	return true
+}
+
+func (e *Engine) finishPathByeCallback(slot *pathSlot) {
+	slot.endByeCallback()
+	e.byeCallbackWG.Done()
+}
+
+func (e *Engine) finishPathByeCallbackAfterLease(slot *pathSlot, lease *externalPathCallbackLease) {
+	select {
+	case <-lease.completion():
+		e.finishPathByeCallback(slot)
+	default:
+		go func() {
+			<-lease.completion()
+			e.finishPathByeCallback(slot)
+		}()
+	}
+}
+
+func (e *Engine) markPathByeSeen(slot *pathSlot) {
+	e.markPathByeSeenWithFailurePolicy(slot, true)
+}
+
+func (e *Engine) markPathByeSeenWithFailurePolicy(slot *pathSlot, retireOnFailure bool) {
+	if e == nil || slot == nil || slot.conn == nil {
+		return
+	}
+	marker, ok := slot.conn.(interface{ MarkByeSeen() })
+	if !ok {
+		return
+	}
+	e.pathsMu.RLock()
+	if !e.receiveSlotCurrentLocked(slot) {
+		e.pathsMu.RUnlock()
+		return
+	}
+	lease, leaseErr := acquireExternalPathCallbackLease("PathConn.MarkByeSeen", slot.conn)
+	if leaseErr == nil && !e.admitPathByeCallbackLocked(slot) {
+		lease.release()
+		leaseErr = net.ErrClosed
+	}
+	e.pathsMu.RUnlock()
+	if leaseErr != nil {
+		if retireOnFailure {
+			go e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, leaseErr)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), externalPathValueCallbackTimeout)
+	err := invokeExternalPathErrorCallbackWithLease(ctx, "PathConn.MarkByeSeen", lease, func() error {
+		marker.MarkByeSeen()
+		return nil
+	})
+	cancel()
+	e.finishPathByeCallbackAfterLease(slot, lease)
+	if err != nil && retireOnFailure {
+		// applyCtrlLocked may hold recvMu here. Exact-generation retirement is
+		// deliberately deferred until terminal publication releases that lock.
+		go e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
 	}
 }
 
@@ -1211,7 +1423,7 @@ func (e *Engine) onFrameRecvLocked(slot *pathSlot, hdr proto.Header, payload []b
 			*deliverPackets = append(*deliverPackets, delivery.payload)
 		}
 		e.commitUniqueTargetDeliveryLocked(
-			delivery.cohort, delivery.topologyEpoch,
+			delivery.cohort, delivery.topologyEpoch, delivery.stateEpoch, delivery.leafID,
 			delivery.attributable, delivery.demand, delivery.bytes,
 		)
 		e.markPayloadLocked()
@@ -1231,12 +1443,18 @@ func (e *Engine) onFrameRecvDigestLocked(
 		return false
 	}
 	var cohort rootDeliveryCohort
+	var stateEpoch uint64
 	var attributable bool
 	var demand bool
+	statePending := false
 	if hdr.Type == proto.FrameData {
 		var err error
-		payload, cohort, attributable, demand, err = e.decodePeerApplicationPayload(slot, hdr.Flags, payload)
-		if err != nil {
+		wirePayload := payload
+		payload, stateEpoch, cohort, attributable, demand, err = e.decodePeerApplicationPayload(slot, hdr.Seq, hdr.Flags, wirePayload)
+		if errors.Is(err, errPeerSelectorStatePending) {
+			statePending = true
+			payload = wirePayload
+		} else if err != nil {
 			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid DATA target attribution: %v", ErrPeerProtocol, err))
 			return false
 		}
@@ -1271,7 +1489,7 @@ func (e *Engine) onFrameRecvDigestLocked(
 		return false
 	}
 
-	if e.packetized && hdr.Type != proto.FrameCtrl {
+	if e.packetized && hdr.Type != proto.FrameCtrl && !statePending {
 		cap := e.packetSeenCapLocked()
 		if cap > 0 {
 			delta := hdr.Seq - e.expectedRecvSeq
@@ -1307,6 +1525,7 @@ func (e *Engine) onFrameRecvDigestLocked(
 				e.packetMarkSeenLocked(hdr.Seq)
 				e.recvFrameProofs[hdr.Seq] = recvPacketProof{
 					digest: digest, topologyEpoch: topologyEpoch,
+					stateEpoch: stateEpoch, leafID: slotPeerTargetID(slot),
 					cohort: cohort, attributable: attributable, demand: demand,
 					bytes: len(payload), deliverySeen: true,
 				}
@@ -1314,6 +1533,7 @@ func (e *Engine) onFrameRecvDigestLocked(
 				e.noteRecvDataForAckLocked()
 				*deliverPackets = append(*deliverPackets, recvPacketDelivery{
 					payload: payload, topologyEpoch: topologyEpoch,
+					stateEpoch: stateEpoch, leafID: slotPeerTargetID(slot),
 					cohort: cohort, attributable: attributable,
 					demand: demand, bytes: len(payload),
 				})
@@ -1352,28 +1572,74 @@ func (e *Engine) onFrameRecvDigestLocked(
 		}()
 		return false
 	}
-	if hdr.Type == proto.FrameData {
+	if e.packetized && hdr.Type == proto.FrameData && statePending {
+		cap := e.packetSeenCapLocked()
+		if cap > 0 && hdr.Seq-e.expectedRecvSeq >= cap {
+			if hdr.Seq > e.recvDroppedThrough {
+				e.recvDroppedThrough = hdr.Seq
+			}
+			return false
+		}
+	}
+	if hdr.Type == proto.FrameData && !statePending {
 		if err := e.validateTargetDeliveryCohortLocked(cohort); err != nil {
 			e.failTargetDeliveryAttributionLocked(err)
 			return false
 		}
 	}
 
-	if hdr.Type != proto.FrameCtrl {
+	if hdr.Type != proto.FrameCtrl && !statePending {
 		e.noteRecvDataForAckLocked()
+	}
+	e.recvArrivalNext++
+	if e.recvArrivalNext == 0 {
+		e.publishRecvTerminalLocked(fmt.Errorf("%w: receive arrival sequence exhausted", ErrPeerProtocol))
+		return false
+	}
+	if statePending {
+		if len(payload) > sendHistoryByteLimit-e.recvSelectorStatePendingBytes {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: pending selector-state DATA exceeds receive byte budget", ErrPeerProtocol))
+			return false
+		}
+		e.recvSelectorStatePendingBytes += len(payload)
 	}
 	e.recvQueue[hdr.Seq] = recvItem{
 		slot: slot, topologyEpoch: topologyEpoch,
-		isCtrl: hdr.Type == proto.FrameCtrl, flags: hdr.Flags,
+		isCtrl: hdr.Type == proto.FrameCtrl, flags: hdr.Flags, arrivalOrder: e.recvArrivalNext,
+		stateEpoch: stateEpoch, statePending: statePending,
 		cohort: cohort, attributable: attributable, demand: demand,
-		bytes: len(payload), payload: payload, digest: digest,
+		bytes: len(payload) - func() int {
+			if statePending {
+				return proto.DataSelectorStateEpochSize
+			}
+			return 0
+		}(), payload: payload, digest: digest,
 	}
-	if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
+	woke := false
+	if hdr.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(hdr.Flags) == proto.CtrlSelectorState {
+		if err := proto.ValidateSelectorStateCtrlFlags(hdr.Flags); err != nil {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid SELECTOR_STATE flags: %v", ErrPeerProtocol, err))
+			return false
+		}
+		state, err := e.decodePeerSelectorState(payload)
+		if err != nil {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid SELECTOR_STATE: %v", ErrPeerProtocol, err))
+			return false
+		}
+		if err := e.rememberPeerSelectorStateLocked(state, hdr.Seq); err != nil {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: invalid SELECTOR_STATE transition: %v", ErrPeerProtocol, err))
+			return false
+		}
+		item := e.recvQueue[hdr.Seq]
+		item.ctrlApplied = true
+		item.stateEpoch = state.payload.StateEpoch
+		e.recvQueue[hdr.Seq] = item
+	} else if hdr.Type == proto.FrameCtrl && isPolicyCtrl(proto.CtrlCodeFromFlags(hdr.Flags)) {
 		item := e.recvQueue[hdr.Seq]
 		item.ctrlApplied = e.applyPolicyCtrlAtCustodyLocked(hdr.Seq, item)
 		e.recvQueue[hdr.Seq] = item
 	}
-	if e.packetized && hdr.Type != proto.FrameCtrl {
+	if e.packetized && hdr.Type != proto.FrameCtrl && !statePending {
 		// Packet mode follows datagram semantics: preserve packet
 		// boundaries, dedupe by SEQ, but do not block application
 		// delivery behind an unrelated missing earlier SEQ. Keep a
@@ -1382,6 +1648,7 @@ func (e *Engine) onFrameRecvDigestLocked(
 		item := e.recvQueue[hdr.Seq]
 		*deliverPackets = append(*deliverPackets, recvPacketDelivery{
 			payload: item.payload, topologyEpoch: item.topologyEpoch,
+			stateEpoch: item.stateEpoch, leafID: slotPeerTargetID(item.slot),
 			cohort: item.cohort, attributable: item.attributable,
 			demand: item.demand, bytes: item.bytes,
 		})
@@ -1393,7 +1660,87 @@ func (e *Engine) onFrameRecvDigestLocked(
 		e.recvQueueHWM = n
 	}
 
-	return e.drainContiguousLocked(deliverPackets)
+	if e.drainContiguousLocked(deliverPackets) {
+		woke = true
+	}
+	if err := e.prunePeerSelectorStatesLocked(); err != nil {
+		e.publishRecvTerminalLocked(fmt.Errorf("%w: %v", ErrPeerProtocol, err))
+		return false
+	}
+	return woke
+}
+
+// resolvePendingSelectorDataLocked validates DATA that reached custody before
+// its referenced selector-state control. Packet delivery follows original
+// ingress custody order rather than map or outer-SEQ order; stream delivery
+// remains governed by the ordinary contiguous drainer. Caller holds recvMu.
+func (e *Engine) resolvePendingSelectorDataLocked(
+	stateEpoch uint64,
+	deliverPackets *[]recvPacketDelivery,
+) bool {
+	record := e.recvSelectorStates[stateEpoch]
+	if record == nil || record.state == nil {
+		return false
+	}
+	seqs := make([]uint64, 0)
+	for seq, item := range e.recvQueue {
+		if item.statePending && item.stateEpoch == stateEpoch {
+			seqs = append(seqs, seq)
+		}
+	}
+	sort.Slice(seqs, func(i, j int) bool {
+		return e.recvQueue[seqs[i]].arrivalOrder < e.recvQueue[seqs[j]].arrivalOrder
+	})
+	woke := false
+	for _, seq := range seqs {
+		item, ok := e.recvQueue[seq]
+		if !ok || !item.statePending || item.stateEpoch != stateEpoch {
+			continue
+		}
+		if seq <= record.controlSeq {
+			e.publishRecvTerminalLocked(fmt.Errorf(
+				"%w: DATA sequence %d references selector state published at sequence %d",
+				ErrPeerProtocol, seq, record.controlSeq,
+			))
+			return false
+		}
+		payload, decodedEpoch, cohort, attributable, demand, err :=
+			e.decodePeerApplicationPayload(item.slot, seq, item.flags, item.payload)
+		if err != nil || decodedEpoch != stateEpoch {
+			e.publishRecvTerminalLocked(fmt.Errorf(
+				"%w: deferred DATA selector-state validation failed: %v", ErrPeerProtocol, err,
+			))
+			return false
+		}
+		if err := e.validateTargetDeliveryCohortLocked(cohort); err != nil {
+			e.failTargetDeliveryAttributionLocked(err)
+			return false
+		}
+		if len(item.payload) > e.recvSelectorStatePendingBytes {
+			e.publishRecvTerminalLocked(fmt.Errorf("%w: pending selector-state byte accounting underflow", ErrPeerProtocol))
+			return false
+		}
+		e.recvSelectorStatePendingBytes -= len(item.payload)
+		item.payload = payload
+		item.bytes = len(payload)
+		item.cohort = cohort
+		item.attributable = attributable
+		item.demand = demand
+		item.statePending = false
+		e.noteRecvDataForAckLocked()
+		if e.packetized {
+			*deliverPackets = append(*deliverPackets, recvPacketDelivery{
+				payload: item.payload, topologyEpoch: item.topologyEpoch,
+				stateEpoch: item.stateEpoch, leafID: slotPeerTargetID(item.slot), cohort: item.cohort,
+				attributable: item.attributable, demand: item.demand, bytes: item.bytes,
+			})
+			item.payload = nil
+			item.delivered = true
+			woke = true
+		}
+		e.recvQueue[seq] = item
+	}
+	return woke
 }
 
 func (e *Engine) noteRecvDataForAckLocked() {
@@ -1621,6 +1968,9 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[]recvPacketDelivery) boo
 			}
 			break
 		}
+		if item.statePending {
+			break
+		}
 		if !e.packetized && !item.isCtrl && len(e.recvDeliverFrames) >= streamRecvWindowFrames {
 			break
 		}
@@ -1637,6 +1987,14 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[]recvPacketDelivery) boo
 				item.ctrlApplied = e.applyPolicyCtrlAtCustodyLocked(e.expectedRecvSeq, item)
 				e.recvQueue[e.expectedRecvSeq] = item
 				if !item.ctrlApplied {
+					break
+				}
+			}
+			if ctrlCode == proto.CtrlSelectorState {
+				if err := e.activatePeerSelectorStateLocked(item.stateEpoch, e.expectedRecvSeq); err != nil {
+					e.publishRecvTerminalLocked(fmt.Errorf(
+						"%w: invalid SELECTOR_STATE activation: %v", ErrPeerProtocol, err,
+					))
 					break
 				}
 			}
@@ -1657,6 +2015,10 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[]recvPacketDelivery) boo
 			if ctrlCode != proto.CtrlPathRetire && !isPolicyCtrl(ctrlCode) {
 				e.applyCtrlLocked(item.slot, item.flags, item.payload, false)
 			}
+			if ctrlCode == proto.CtrlSelectorState &&
+				e.resolvePendingSelectorDataLocked(item.stateEpoch, deliverPackets) {
+				wokeReader = true
+			}
 			if e.recvTerminal {
 				break
 			}
@@ -1671,13 +2033,14 @@ func (e *Engine) drainContiguousLocked(deliverPackets *[]recvPacketDelivery) boo
 					// arrived in-order; preserve boundaries 1:1.
 					*deliverPackets = append(*deliverPackets, recvPacketDelivery{
 						payload: item.payload, topologyEpoch: item.topologyEpoch,
+						stateEpoch: item.stateEpoch, leafID: slotPeerTargetID(item.slot),
 						cohort: item.cohort, attributable: item.attributable,
 						demand: item.demand, bytes: item.bytes,
 					})
 				}
 			} else {
 				e.commitUniqueTargetDeliveryLocked(
-					item.cohort, item.topologyEpoch,
+					item.cohort, item.topologyEpoch, item.stateEpoch, slotPeerTargetID(item.slot),
 					item.attributable, item.demand, item.bytes,
 				)
 				e.recvDeliver = append(e.recvDeliver, item.payload...)
@@ -1739,9 +2102,16 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte, r
 			switch bye.Reason {
 			case proto.ByeNormal:
 				closeErr = io.EOF
-				if pc, ok := slot.conn.(interface{ MarkByeSeen() }); ok {
-					pc.MarkByeSeen()
-				}
+				// Publish the clean receive terminal before entering transport code.
+				// Path death classification shares this ordering boundary, so a
+				// hostile MarkByeSeen callback cannot turn an already ordered peer
+				// BYE into migration or zombie accounting. peerNormalBye remains the
+				// later terminal-ACK handoff gate for application-visible EOF.
+				e.peerNormalByeOrderMu.Lock()
+				e.publishRecvTerminalLocked(closeErr)
+				e.peerNormalByeOrdered.Store(true)
+				e.peerNormalByeOrderMu.Unlock()
+				return
 			case proto.ByeMigBudget:
 				closeErr = ErrMigrationBudgetExceeded
 			case proto.ByeZombie:
@@ -1761,6 +2131,11 @@ func (e *Engine) applyCtrlLocked(slot *pathSlot, flags uint16, payload []byte, r
 		}
 		e.recvStreamEOF = true
 		e.recvCond.Broadcast()
+
+	case proto.CtrlSelectorState:
+		// Selector state is decoded in bounded custody and activated only when
+		// this control joins the contiguous receive prefix.
+		_ = payload
 
 	case proto.CtrlMigrateNotify,
 		proto.CtrlHeartbeat,

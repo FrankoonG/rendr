@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	goruntime "runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,7 +52,11 @@ type transactionalTestAttempt struct {
 	prepareExit     chan struct{}
 	publishEnter    chan struct{}
 	publishExit     chan struct{}
+	rollbackEnter   chan struct{}
+	rollbackExit    chan struct{}
+	rollbackOnce    sync.Once
 	panicPrepare    bool
+	goexitStep      string
 	publishHook     func()
 	activateHook    func()
 	rollbackHook    func()
@@ -86,6 +91,7 @@ func (a *transactionalTestAttempt) Prepare(ctx context.Context, request Executio
 	if a.panicPrepare {
 		panic("forced prepare panic")
 	}
+	a.maybeGoexit("prepare")
 	return a.prepareErr
 }
 
@@ -95,6 +101,7 @@ func (a *transactionalTestAttempt) Stage(context.Context, ExecutionRequest) (Pub
 	if publication.Digest == (EvidenceDigest{}) && a.stageErr == nil && !a.zeroPublication {
 		publication.Digest = EvidenceDigest{0x51}
 	}
+	a.maybeGoexit("stage")
 	return publication, a.stageErr
 }
 
@@ -109,6 +116,7 @@ func (a *transactionalTestAttempt) Publish(context.Context, ExecutionRequest) er
 	if a.publishHook != nil {
 		a.publishHook()
 	}
+	a.maybeGoexit("publish")
 	return a.publishErr
 }
 
@@ -117,6 +125,7 @@ func (a *transactionalTestAttempt) Activate(context.Context, ExecutionRequest) e
 	if a.activateHook != nil {
 		a.activateHook()
 	}
+	a.maybeGoexit("activate")
 	return a.activateErr
 }
 
@@ -124,6 +133,20 @@ func (a *transactionalTestAttempt) Rollback(ctx context.Context, _ ExecutionRequ
 	a.rollbackCalls.Add(1)
 	if a.rollbackHook != nil {
 		a.rollbackHook()
+	}
+	a.maybeGoexit("rollback")
+	if a.rollbackEnter != nil {
+		a.rollbackOnce.Do(func() { close(a.rollbackEnter) })
+	}
+	if a.rollbackExit != nil {
+		select {
+		case <-a.rollbackExit:
+		case <-ctx.Done():
+			a.mu.Lock()
+			a.rollbackCtxErr = ctx.Err()
+			a.mu.Unlock()
+			return ctx.Err()
+		}
 	}
 	a.mu.Lock()
 	a.rollbackCtxErr = ctx.Err()
@@ -151,7 +174,14 @@ func (reporter *testIncarnationReporter) LeafMobilityIncarnation() uint64 {
 
 func (a *transactionalTestAttempt) FailClosed(context.Context, ExecutionRequest) error {
 	a.failClosedCalls.Add(1)
+	a.maybeGoexit("fail-closed")
 	return a.failClosedErr
+}
+
+func (a *transactionalTestAttempt) maybeGoexit(step string) {
+	if a.goexitStep == step {
+		goruntime.Goexit()
+	}
 }
 
 func (a *transactionalTestAttempt) EndpointGenerationChanged() bool {
@@ -655,7 +685,7 @@ func TestExecutionPublishAdvancesOnlyFutureEndpointGeneration(t *testing.T) {
 	}
 }
 
-func TestExecutionSuccessfulPublishIsIrreversibleAfterConcurrentCancellation(t *testing.T) {
+func TestExecutionCanceledPublishFailsClosedEvenIfDriverReturnsSuccess(t *testing.T) {
 	reporter := newTestIncarnationReporter()
 	attempt := &transactionalTestAttempt{
 		publishEnter: make(chan struct{}), publishExit: make(chan struct{}),
@@ -690,19 +720,17 @@ func TestExecutionSuccessfulPublishIsIrreversibleAfterConcurrentCancellation(t *
 	}
 	cancel()
 	close(attempt.publishExit)
-	if err := <-result; err != nil {
-		t.Fatalf("successful driver publish was downgraded: %v", err)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled driver publish=%v want cancellation", err)
 	}
-	if execution.State() != ExecutionPublished {
-		t.Fatalf("state=%d want published", execution.State())
+	waitExecutionDriverCall(t, execution)
+	if execution.State() != ExecutionFailClosedRequired {
+		t.Fatalf("state=%d want fail-closed-required", execution.State())
 	}
 	if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionState) {
-		t.Fatalf("rollback after published driver=%v", err)
+		t.Fatalf("rollback after canceled publish=%v", err)
 	}
-	if err := execution.Activate(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := execution.FinalizePublished(); err != nil {
+	if err := execution.FailClosed(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1014,7 +1042,7 @@ func TestExecutionRollbackAdvancesGenerationOnlyAfterReconstruction(t *testing.T
 	}
 }
 
-func TestExecutionRollbackIgnoresCallerCancellation(t *testing.T) {
+func TestExecutionRollbackIgnoresCallerCancellationForOwnedCleanup(t *testing.T) {
 	forced := errors.New("forced prepare failure")
 	attempt := &transactionalTestAttempt{prepareErr: forced}
 	driver := &transactionalTestDriver{
@@ -1031,14 +1059,94 @@ func TestExecutionRollbackIgnoresCallerCancellation(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := execution.Rollback(canceled); err != nil {
-		t.Fatal(err)
+		t.Fatalf("canceled caller prevented owned rollback: %v", err)
+	}
+	if calls := attempt.rollbackCalls.Load(); calls != 1 {
+		t.Fatalf("pre-canceled rollback invoked driver %d time(s), want 1", calls)
+	}
+	if execution.State() != ExecutionRolledBack {
+		t.Fatalf("state=%d want rolled-back", execution.State())
 	}
 	finalizeRolledBackExecution(t, execution)
-	attempt.mu.Lock()
-	rollbackCtxErr := attempt.rollbackCtxErr
-	attempt.mu.Unlock()
-	if rollbackCtxErr != nil {
-		t.Fatalf("driver inherited caller cancellation: %v", rollbackCtxErr)
+}
+
+func TestExecutionClaimRetirementCancelsBlockedRollback(t *testing.T) {
+	forced := errors.New("forced prepare failure")
+	attempt := &transactionalTestAttempt{
+		prepareErr:    forced,
+		rollbackEnter: make(chan struct{}),
+		rollbackExit:  make(chan struct{}),
+	}
+	driver := &transactionalTestDriver{
+		operation: OperationTCPRepair,
+		result: PreflightResult{
+			Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{0x2e}, ProbeReferences: testProbeReferences(0x2e),
+		},
+		attempt: attempt,
+	}
+	issuer, claim, plan, transaction := executableClaimFixture(t, driver)
+	execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.Prepare(context.Background()); !errors.Is(err, forced) {
+		t.Fatalf("prepare error=%v want=%v", err, forced)
+	}
+	rollbackResult := make(chan error, 1)
+	go func() { rollbackResult <- execution.Rollback(context.Background()) }()
+	select {
+	case <-attempt.rollbackEnter:
+	case <-time.After(time.Second):
+		t.Fatal("Rollback did not enter the driver")
+	}
+	stale := plan.Binding
+	stale.Owner++
+	if _, err := claim.RequestRetireState(stale); !errors.Is(err, ErrBindingMismatch) {
+		t.Fatalf("stale retirement error=%v want=%v", err, ErrBindingMismatch)
+	}
+	select {
+	case err := <-rollbackResult:
+		t.Fatalf("stale retirement canceled rollback: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	active, err := claim.RequestRetireState(plan.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !active {
+		t.Fatal("exact retirement did not observe the active execution lease")
+	}
+	select {
+	case err := <-rollbackResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("rollback error=%v want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact claim retirement did not cancel rollback")
+	}
+	if execution.State() != ExecutionRollbackRequired {
+		t.Fatalf("state=%d want rollback-required", execution.State())
+	}
+	retired := make(chan error, 1)
+	go func() { retired <- claim.Retire(plan.Binding) }()
+	select {
+	case err := <-retired:
+		t.Fatalf("retirement returned before fail-closed cleanup: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := execution.FailClosed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-retired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not finish after fail-closed cleanup")
+	}
+	if calls := attempt.failClosedCalls.Load(); calls != 1 {
+		t.Fatalf("fail-closed calls=%d want=1", calls)
 	}
 }
 
@@ -1064,6 +1172,194 @@ func TestExecutionAttemptPanicRequiresRollback(t *testing.T) {
 	finalizeRolledBackExecution(t, execution)
 	if execution.State() != ExecutionRolledBack {
 		t.Fatalf("panic rollback state=%d", execution.State())
+	}
+}
+
+func TestExecutionDriverGoexitHasDeterministicStateAndLease(t *testing.T) {
+	newDriver := func(attempt *transactionalTestAttempt, evidence byte) Driver {
+		return &transactionalTestDriver{
+			operation: OperationTCPRepair,
+			result: PreflightResult{
+				Eligible: true, Stage: StagePreflightComplete, EvidenceDigest: EvidenceDigest{evidence},
+				ProbeReferences: testProbeReferences(evidence),
+			},
+			attempt: attempt,
+		}
+	}
+
+	t.Run("prepare requires rollback", func(t *testing.T) {
+		attempt := &transactionalTestAttempt{goexitStep: "prepare"}
+		execution := consumeExecutableClaim(t, newDriver(attempt, 0x81))
+		if err := execution.Prepare(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Prepare error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionRollbackRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+		assertExecutionStateAndLease(t, execution, ExecutionRolledBack, false)
+	})
+
+	t.Run("stage requires rollback", func(t *testing.T) {
+		attempt := &transactionalTestAttempt{goexitStep: "stage"}
+		execution := consumeExecutableClaim(t, newDriver(attempt, 0x82))
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Stage(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Stage error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionRollbackRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+		assertExecutionStateAndLease(t, execution, ExecutionRolledBack, false)
+	})
+
+	t.Run("publish before owner swap requires rollback", func(t *testing.T) {
+		reporter := newTestIncarnationReporter()
+		attempt := &transactionalTestAttempt{goexitStep: "publish"}
+		issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, newDriver(attempt, 0x83), reporter)
+		execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Stage(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		authorizeExecutionPublish(t, execution, transaction)
+		if err := execution.Publish(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Publish error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionRollbackRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+		assertExecutionStateAndLease(t, execution, ExecutionRolledBack, false)
+	})
+
+	t.Run("publish after owner swap requires fail closed", func(t *testing.T) {
+		reporter := newTestIncarnationReporter()
+		attempt := &transactionalTestAttempt{
+			goexitStep:  "publish",
+			publishHook: func() { reporter.value.Add(1) },
+		}
+		issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, newDriver(attempt, 0x84), reporter)
+		execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Stage(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		authorizeExecutionPublish(t, execution, transaction)
+		if err := execution.Publish(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Publish error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionFailClosedRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.FailClosed(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionFailedClosed, false)
+	})
+
+	t.Run("activate remains retryable", func(t *testing.T) {
+		reporter := newTestIncarnationReporter()
+		attempt := &transactionalTestAttempt{publishHook: func() { reporter.value.Add(1) }}
+		issuer, claim, plan, transaction := executableClaimFixtureWithReporter(t, newDriver(attempt, 0x85), reporter)
+		execution, err := issuer.ConsumeExecution(claim, transaction, plan, testPeerAgreement(plan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.Stage(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		authorizeExecutionPublish(t, execution, transaction)
+		if err := execution.Publish(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		attempt.goexitStep = "activate"
+		if err := execution.Activate(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Activate error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionActivationRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.Activate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := execution.FinalizePublished(); err != nil {
+			t.Fatal(err)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionActivated, false)
+	})
+
+	t.Run("rollback remains required", func(t *testing.T) {
+		forced := errors.New("forced prepare failure")
+		attempt := &transactionalTestAttempt{prepareErr: forced}
+		execution := consumeExecutableClaim(t, newDriver(attempt, 0x86))
+		if err := execution.Prepare(context.Background()); !errors.Is(err, forced) {
+			t.Fatalf("Prepare error=%v want=%v", err, forced)
+		}
+		attempt.goexitStep = "rollback"
+		if err := execution.Rollback(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("Rollback error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionRollbackRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		finalizeRolledBackExecution(t, execution)
+		assertExecutionStateAndLease(t, execution, ExecutionRolledBack, false)
+	})
+
+	t.Run("fail closed remains required", func(t *testing.T) {
+		attempt := &transactionalTestAttempt{}
+		execution := consumeExecutableClaim(t, newDriver(attempt, 0x87))
+		if err := execution.Prepare(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		attempt.goexitStep = "fail-closed"
+		if err := execution.FailClosed(context.Background()); !errors.Is(err, ErrExecutionDriverGoexit) {
+			t.Fatalf("FailClosed error=%v want=%v", err, ErrExecutionDriverGoexit)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionFailClosedRequired, true)
+		attempt.goexitStep = ""
+		if err := execution.FailClosed(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExecutionStateAndLease(t, execution, ExecutionFailedClosed, false)
+	})
+}
+
+func assertExecutionStateAndLease(t testing.TB, execution *Execution, wantState ExecutionState, wantLease bool) {
+	t.Helper()
+	token := execution.token
+	token.mu.Lock()
+	state, busy, leaseHeld := token.state, token.busy, token.leaseHeld
+	token.mu.Unlock()
+	token.claim.executionMu.Lock()
+	claimActive := token.claim.executionActive
+	token.claim.executionMu.Unlock()
+	if state != wantState || busy || leaseHeld != wantLease || claimActive != wantLease {
+		t.Fatalf("state/busy/token-lease/claim-lease=%d/%v/%v/%v want=%d/false/%v/%v",
+			state, busy, leaseHeld, claimActive, wantState, wantLease, wantLease)
 	}
 }
 
@@ -1218,10 +1514,32 @@ func TestExecutionRevalidatesAuthorityAtEveryStage(t *testing.T) {
 		if execution.State() != ExecutionRollbackRequired {
 			t.Fatalf("state=%d want rollback-required", execution.State())
 		}
-		if err := execution.Rollback(context.Background()); err != nil {
+		deadline := time.Now().Add(time.Second)
+		for {
+			err := execution.Rollback(context.Background())
+			if !errors.Is(err, ErrExecutionBusy) {
+				if err != nil {
+					t.Fatalf("bounded rollback after retirement=%v", err)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("canceled prepare callback did not release its execution gate")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		attempt.mu.Lock()
+		rollbackCtxErr := attempt.rollbackCtxErr
+		attempt.mu.Unlock()
+		if !errors.Is(rollbackCtxErr, context.Canceled) {
+			t.Fatalf("retired rollback context=%v want cancellation", rollbackCtxErr)
+		}
+		if calls := attempt.rollbackCalls.Load(); calls != 1 {
+			t.Fatalf("retired rollback calls=%d want=1", calls)
+		}
+		if err := execution.FinalizeRolledBack(); err != nil {
 			t.Fatal(err)
 		}
-		finalizeRolledBackExecution(t, execution)
 		select {
 		case err := <-retired:
 			if err != nil {
@@ -1266,8 +1584,15 @@ func TestExecutionForwardDeadlineLeavesRollbackWindow(t *testing.T) {
 	if execution.State() != ExecutionRollbackRequired {
 		t.Fatalf("state=%d want rollback-required", execution.State())
 	}
-	if err := execution.Rollback(context.Background()); err != nil {
-		t.Fatal(err)
+	for {
+		err := execution.Rollback(context.Background())
+		if !errors.Is(err, ErrExecutionBusy) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	finalizeRolledBackExecution(t, execution)
 	if !time.Now().Before(plan.Deadline) {

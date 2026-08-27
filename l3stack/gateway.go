@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,16 @@ const (
 // does not terminate unrelated sessions or the virtual interface pump.
 type FlowErrorHandler func(l3ingress.L3Identity, error)
 
+// CallbackStatus is bounded evidence for optional Gateway callback failures.
+type CallbackStatus struct {
+	Drops       uint64
+	Panics      uint64
+	Goexits     uint64
+	Timeouts    uint64
+	LastFailure l3ingress.CallbackError
+	HasFailure  bool
+}
+
 // Config assembles one virtual-interface ingress gateway.
 type Config struct {
 	Device  virtualif.FullDuplexCancellableDevice
@@ -50,6 +61,9 @@ type Config struct {
 	FlowTable    *l3ingress.FlowTable
 	OnParseError l3ingress.ParseErrorHandler
 	OnFlowError  FlowErrorHandler
+	// ObserverTimeout bounds OnParseError and OnFlowError. Zero selects the
+	// l3ingress observer default.
+	ObserverTimeout time.Duration
 
 	TCPMaxInFlight int
 	LinkQueue      int
@@ -66,11 +80,15 @@ type Config struct {
 // It does not own Device; the embedding application controls interface policy
 // and lifetime.
 type Gateway struct {
-	device       virtualif.FullDuplexCancellableDevice
-	table        *l3ingress.FlowTable
-	router       l3ingress.FlowDecisionFunc
-	onParseError l3ingress.ParseErrorHandler
-	onFlowError  FlowErrorHandler
+	device          virtualif.FullDuplexCancellableDevice
+	table           *l3ingress.FlowTable
+	router          l3ingress.FlowDecisionFunc
+	onParseError    l3ingress.ParseErrorHandler
+	onFlowError     FlowErrorHandler
+	observerTimeout time.Duration
+	flowErrorBusy   atomic.Bool
+	callbackMu      sync.Mutex
+	callbackStatus  CallbackStatus
 
 	link  *channel.Endpoint
 	stack *stack.Stack
@@ -102,10 +120,21 @@ type Gateway struct {
 	stackClosing bool
 	stackClose   sync.Once
 	stackWait    sync.Once
+	teardownOnce sync.Once
+	teardownErr  error
+	teardownOps  gatewayTeardownOps
 }
 
 type tcpAdmission struct {
 	cancel context.CancelFunc
+}
+
+type gatewayTeardownOps struct {
+	closeLink    func()
+	closeUDP     func() error
+	closeManager func() error
+	closeStack   func()
+	waitStack    func()
 }
 
 // New creates an idle gateway. Run performs packet I/O.
@@ -118,6 +147,9 @@ func New(config Config) (*Gateway, error) {
 	}
 	if config.TCPPeerReadyTimeout < 0 {
 		return nil, errors.New("l3stack: negative TCP peer readiness timeout")
+	}
+	if config.ObserverTimeout < 0 {
+		return nil, errors.New("l3stack: negative observer timeout")
 	}
 	flowLifetime, err := normalizeFlowLifetimeTuning(config.FlowLifetime)
 	if err != nil {
@@ -137,6 +169,10 @@ func New(config Config) (*Gateway, error) {
 	maxInFlight := config.TCPMaxInFlight
 	if maxInFlight <= 0 {
 		maxInFlight = defaultTCPMaxInFlight
+	}
+	observerTimeout := config.ObserverTimeout
+	if observerTimeout == 0 {
+		observerTimeout = l3ingress.DefaultFlowObserverTimeout
 	}
 	link := channel.New(queue, uint32(config.Device.MTU()), "")
 	netstack := stack.New(stack.Options{
@@ -167,7 +203,8 @@ func New(config Config) (*Gateway, error) {
 	g := &Gateway{
 		device: config.Device, table: table, router: config.Router,
 		onParseError: config.OnParseError, onFlowError: config.OnFlowError,
-		link: link, stack: netstack, manager: manager,
+		observerTimeout: observerTimeout,
+		link:            link, stack: netstack, manager: manager,
 		flowLifetime: flowLifetime,
 		reapCadence:  flowReapCadence(flowLifetime),
 		pending:      make(map[l3ingress.FlowRef]l3ingress.PacketEvent),
@@ -178,6 +215,13 @@ func New(config Config) (*Gateway, error) {
 	g.udp = &l3session.UDPRelay{
 		Device: config.Device, Manager: manager,
 		ReplyActivity: gatewayUDPReplyActivity{gateway: g},
+	}
+	g.teardownOps = gatewayTeardownOps{
+		closeLink:    g.link.Close,
+		closeUDP:     g.udp.Close,
+		closeManager: g.manager.CloseAll,
+		closeStack:   g.closeTCPStack,
+		waitStack:    g.waitTCPStack,
 	}
 	forwarder := gtcp.NewForwarder(netstack, 0, maxInFlight, g.acceptTCP)
 	netstack.SetTransportProtocolHandler(gtcp.ProtocolNumber, forwarder.HandlePacket)
@@ -198,11 +242,11 @@ func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = runCtx
 	g.cancel = cancel
 	if g.closed.Load() {
-		g.runErr = net.ErrClosed
-		close(g.done)
 		g.runMu.Unlock()
 		cancel()
-		return net.ErrClosed
+		err := errors.Join(net.ErrClosed, g.teardown(nil))
+		g.finishRun(err)
+		return err
 	}
 	g.runMu.Unlock()
 
@@ -210,7 +254,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	go func() { outboundDone <- g.pumpOutbound(runCtx) }()
 	pump := l3ingress.Pump{
 		Device: g.device, Handler: g, Direction: l3ingress.DirectionIngress,
-		OnParseError: g.onParseError,
+		OnParseError: g.onParseError, ObserverTimeout: g.observerTimeout,
 	}
 	pumpDone := make(chan error, 1)
 	go func() { pumpDone <- pump.Run(runCtx) }()
@@ -236,26 +280,17 @@ runLoop:
 			break runLoop
 		}
 	}
-	g.stopTCPFlows()
 	cancel()
-	g.link.Close()
-	udpErr := g.udp.Close()
-	managerErr := g.manager.CloseAll()
-	g.closeTCPStack()
-	if !pumpReturned {
-		pumpErr = <-pumpDone
-	}
-	if !outboundReturned {
-		outboundErr = <-outboundDone
-	}
-	g.flows.Wait()
-	g.waitTCPStack()
-	g.closeTrackedFlows(l3ingress.FlowCloseDeviceClosed)
-	err := errors.Join(normalizeRunError(runCtx, pumpErr), normalizeRunError(runCtx, outboundErr), udpErr, managerErr)
-	g.runMu.Lock()
-	g.runErr = err
-	close(g.done)
-	g.runMu.Unlock()
+	teardownErr := g.teardown(func() {
+		if !pumpReturned {
+			pumpErr = <-pumpDone
+		}
+		if !outboundReturned {
+			outboundErr = <-outboundDone
+		}
+	})
+	err := errors.Join(normalizeRunError(runCtx, pumpErr), normalizeRunError(runCtx, outboundErr), teardownErr)
+	g.finishRun(err)
 	return err
 }
 
@@ -267,8 +302,9 @@ func (g *Gateway) Close() error {
 	if !g.closed.CompareAndSwap(false, true) {
 		if g.started.Load() {
 			<-g.done
+			return g.result()
 		}
-		return g.result()
+		return g.teardown(nil)
 	}
 	g.runMu.Lock()
 	cancel := g.cancel
@@ -280,20 +316,51 @@ func (g *Gateway) Close() error {
 		<-g.done
 		return g.result()
 	}
-	g.stopTCPFlows()
-	g.link.Close()
-	err := errors.Join(g.udp.Close(), g.manager.CloseAll())
-	g.closeTCPStack()
-	g.flows.Wait()
-	g.waitTCPStack()
-	g.closeTrackedFlows(l3ingress.FlowCloseDeviceClosed)
-	return err
+	return g.teardown(nil)
+}
+
+// teardown releases every gateway-owned resource once. Only Run supplies an
+// I/O join: Close invokes teardown directly only when it observed no Run.
+func (g *Gateway) teardown(waitForRunIO func()) error {
+	g.teardownOnce.Do(func() {
+		g.stopTCPFlows()
+		g.teardownOps.closeLink()
+		udpErr := g.teardownOps.closeUDP()
+		managerErr := g.teardownOps.closeManager()
+		g.teardownOps.closeStack()
+		if waitForRunIO != nil {
+			waitForRunIO()
+		}
+		g.flows.Wait()
+		g.teardownOps.waitStack()
+		g.closeTrackedFlows(l3ingress.FlowCloseDeviceClosed)
+		g.teardownErr = errors.Join(udpErr, managerErr)
+	})
+	return g.teardownErr
+}
+
+func (g *Gateway) finishRun(err error) {
+	g.runMu.Lock()
+	g.runErr = err
+	close(g.done)
+	g.runMu.Unlock()
 }
 
 func (g *Gateway) result() error {
 	g.runMu.Lock()
 	defer g.runMu.Unlock()
 	return g.runErr
+}
+
+// CallbackStatus returns bounded OnFlowError failure evidence. OnParseError
+// evidence belongs to the l3ingress Pump that executes that callback.
+func (g *Gateway) CallbackStatus() CallbackStatus {
+	if g == nil {
+		return CallbackStatus{}
+	}
+	g.callbackMu.Lock()
+	defer g.callbackMu.Unlock()
+	return g.callbackStatus
 }
 
 // HandlePacket implements l3ingress.PacketHandler.
@@ -770,8 +837,94 @@ func (g *Gateway) pumpOutbound(ctx context.Context) error {
 }
 
 func (g *Gateway) reportFlowError(id l3ingress.L3Identity, err error) {
-	if err != nil && g.onFlowError != nil {
-		g.onFlowError(id, err)
+	if g == nil || err == nil || g.onFlowError == nil {
+		return
+	}
+	if !g.flowErrorBusy.CompareAndSwap(false, true) {
+		g.recordFlowErrorCallbackFailure(&l3ingress.CallbackError{
+			Callback: "FlowErrorHandler",
+			Reason:   l3ingress.CallbackFailureSaturated,
+		})
+		return
+	}
+	releaseProcess, ok := tryAcquireL3StackOptionalCallback()
+	if !ok {
+		g.flowErrorBusy.Store(false)
+		g.recordFlowErrorCallbackFailure(&l3ingress.CallbackError{
+			Callback: "FlowErrorHandler",
+			Reason:   l3ingress.CallbackFailureSaturated,
+		})
+		return
+	}
+	done := make(chan struct{})
+	callback := g.onFlowError
+	go func() {
+		returned := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				g.recordFlowErrorCallbackFailure(flowErrorCallbackPanic(recovered))
+			} else if !returned {
+				g.recordFlowErrorCallbackFailure(&l3ingress.CallbackError{
+					Callback: "FlowErrorHandler",
+					Reason:   l3ingress.CallbackFailureGoexit,
+				})
+			}
+			releaseProcess()
+			g.flowErrorBusy.Store(false)
+			close(done)
+		}()
+		callback(id, err)
+		returned = true
+	}()
+	timeout := g.observerTimeout
+	if timeout <= 0 {
+		timeout = l3ingress.DefaultFlowObserverTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer stopAndDrainTimer(timer)
+	select {
+	case <-done:
+	case <-timer.C:
+		select {
+		case <-done:
+		default:
+			g.recordFlowErrorCallbackFailure(&l3ingress.CallbackError{
+				Callback: "FlowErrorHandler",
+				Reason:   l3ingress.CallbackFailureTimeout,
+			})
+		}
+	}
+}
+
+func (g *Gateway) recordFlowErrorCallbackFailure(failure *l3ingress.CallbackError) {
+	if g == nil || failure == nil {
+		return
+	}
+	g.callbackMu.Lock()
+	switch failure.Reason {
+	case l3ingress.CallbackFailurePanic:
+		g.callbackStatus.Panics++
+	case l3ingress.CallbackFailureGoexit:
+		g.callbackStatus.Goexits++
+	case l3ingress.CallbackFailureTimeout:
+		g.callbackStatus.Timeouts++
+	case l3ingress.CallbackFailureSaturated:
+		g.callbackStatus.Drops++
+	}
+	g.callbackStatus.LastFailure = *failure
+	g.callbackStatus.HasFailure = true
+	g.callbackMu.Unlock()
+}
+
+func flowErrorCallbackPanic(recovered any) *l3ingress.CallbackError {
+	panicType := "<nil>"
+	if typ := reflect.TypeOf(recovered); typ != nil {
+		panicType = typ.String()
+	}
+	return &l3ingress.CallbackError{
+		Callback:  "FlowErrorHandler",
+		Reason:    l3ingress.CallbackFailurePanic,
+		PanicType: panicType,
 	}
 }
 

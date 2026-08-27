@@ -91,6 +91,12 @@ func (p *txAdversarialPath) Write(frame []byte) (int, error) {
 	return len(frame), nil
 }
 
+func (p *txAdversarialPath) setWriteFn(fn func([]byte) (int, error)) {
+	p.writeMu.Lock()
+	p.writeFn = fn
+	p.writeMu.Unlock()
+}
+
 func (p *txAdversarialPath) Close() error {
 	p.closeOnce.Do(func() { close(p.closed) })
 	return nil
@@ -170,6 +176,11 @@ func txAdversarialRecvError(t *testing.T, e *Engine, timeout time.Duration) erro
 	}
 }
 
+// This is a deadlock oracle, not a migration-latency qualification. Replaying
+// the full bounded window is O(window) and race instrumentation can amplify it
+// under package-wide contention.
+const txAdversarialDeadlockTimeout = 15 * time.Second
+
 func TestTxAdversarialFullLedgerDoesNotBlockExplicitMigrate(t *testing.T) {
 	e := New(SideClient, [16]byte{0xa1}, Limits{})
 	defer e.Close()
@@ -189,18 +200,71 @@ func TestTxAdversarialFullLedgerDoesNotBlockExplicitMigrate(t *testing.T) {
 		t.Fatalf("attach second path: %v", err)
 	}
 	txAdversarialFillDataLedger(t, e)
+	stats := e.ReplayStats()
+	if stats.FramesInUse != stats.FrameLimit || stats.FrameLimit != sendHistoryWindow || stats.CreditWaiters != 0 {
+		t.Fatalf("full replay ledger precondition is not proven: %+v", stats)
+	}
+
+	replayStarted := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	var replayOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseReplay) }) }
+	t.Cleanup(release)
+	second.setWriteFn(func(frame []byte) (int, error) {
+		if len(frame) >= proto.HeaderSize {
+			hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+			if err == nil && hdr.Type == proto.FrameData {
+				replayOnce.Do(func() {
+					close(replayStarted)
+					<-releaseReplay
+				})
+			}
+		}
+		return len(frame), nil
+	})
 
 	done := make(chan error, 1)
 	go func() { done <- e.SelectExplicitTarget(targets["root"], targets["second"], "explicit") }()
+	select {
+	case <-replayStarted:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Migrate with full replay ledger: %v", err)
+		}
+		t.Fatal("explicit Migrate returned before replaying the full ledger")
+	case <-time.After(txAdversarialDeadlockTimeout):
+		release()
+		_ = e.Close()
+		<-done
+		t.Fatal("explicit Migrate did not reach successor replay with full credits occupied")
+	}
+
+	if got := e.ActivePath(); got != secondID {
+		t.Fatalf("active path during replay = %d, want committed second path %d", got, secondID)
+	}
+	stats = e.ReplayStats()
+	if stats.FramesInUse != stats.FrameLimit || stats.CreditWaiters != 0 {
+		t.Fatalf("migration acquired new replay credit before successor write: %+v", stats)
+	}
+	if !e.policyOwnerMu.TryLock() {
+		t.Fatal("successor replay retained the policy owner lock")
+	}
+	e.policyOwnerMu.Unlock()
+	e.sendMu.initialize()
+	if permits := len(e.sendMu.permit); permits != 0 {
+		t.Fatalf("successor replay exposed %d sequencer permits, want none", permits)
+	}
+	release()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Migrate with full replay ledger: %v", err)
 		}
-	case <-time.After(750 * time.Millisecond):
+	case <-time.After(txAdversarialDeadlockTimeout):
 		_ = e.Close()
 		<-done
-		t.Fatal("explicit Migrate blocked behind a full data replay ledger")
+		t.Fatal("explicit Migrate did not finish bounded full-ledger replay")
 	}
 
 	if got := e.ActivePath(); got != secondID {
@@ -235,7 +299,7 @@ func TestTxAdversarialFinalCloseBoundedWithFullLedger(t *testing.T) {
 		if result.closeErr != nil {
 			t.Fatalf("final Close: %v", result.closeErr)
 		}
-	case <-time.After(750 * time.Millisecond):
+	case <-time.After(txAdversarialDeadlockTimeout):
 		_ = e.Close()
 		<-done
 		t.Fatal("final close blocked behind a full data replay ledger")
@@ -333,20 +397,20 @@ func TestTxAdversarialOneShotReplayWriteFailureRetriesWithoutTraffic(t *testing.
 		}
 		return dataAttempts.Add(1), true
 	}
-	primary.writeFn = func(frame []byte) (int, error) {
+	primary.setWriteFn(func(frame []byte) (int, error) {
 		attempt, counted := countAttempt(frame)
 		if counted && attempt == 2 {
 			return 0, errors.New("injected one-shot replay write failure")
 		}
 		return len(frame), nil
-	}
-	successor.writeFn = func(frame []byte) (int, error) {
+	})
+	successor.setWriteFn(func(frame []byte) (int, error) {
 		attempt, counted := countAttempt(frame)
 		if counted && attempt == 3 {
 			replaySucceededOnce.Do(func() { close(replaySucceeded) })
 		}
 		return len(frame), nil
-	}
+	})
 
 	attachFixturePath(t, e, primary, transport.PathSpec{Transport: "adversarial", Address: "replay-primary"}, targets["replay-primary"])
 	attachFixturePath(t, e, successor, transport.PathSpec{Transport: "adversarial", Address: "replay-successor"}, targets["replay-successor"])
@@ -376,7 +440,7 @@ func TestSelectorCommitSurvivesOneShotCutoverReplayFailure(t *testing.T) {
 	replayBlocked := make(chan struct{})
 	releaseReplay := make(chan struct{})
 	var replayAttempts atomic.Uint64
-	successor.writeFn = func(frame []byte) (int, error) {
+	successor.setWriteFn(func(frame []byte) (int, error) {
 		if len(frame) < proto.HeaderSize {
 			return len(frame), nil
 		}
@@ -399,7 +463,7 @@ func TestSelectorCommitSurvivesOneShotCutoverReplayFailure(t *testing.T) {
 		default:
 			return len(frame), nil
 		}
-	}
+	})
 
 	attachFixturePath(t, e, primary, transport.PathSpec{Transport: "adversarial", Address: "cutover-primary"}, targets["cutover-primary"])
 	successorID := attachFixturePath(t, e, successor, transport.PathSpec{Transport: "adversarial", Address: "cutover-successor"}, targets["cutover-successor"])
@@ -481,7 +545,7 @@ func TestGapReplayFollowsCurrentCumulativeGapState(t *testing.T) {
 	attempts := make(map[uint64]int)
 	changed := make(chan struct{}, 32)
 	thirdSeq0 := make(chan struct{}, 1)
-	path.writeFn = func(frame []byte) (int, error) {
+	path.setWriteFn(func(frame []byte) (int, error) {
 		if len(frame) >= proto.HeaderSize {
 			hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 			if err == nil && hdr.Type == proto.FrameData {
@@ -502,7 +566,7 @@ func TestGapReplayFollowsCurrentCumulativeGapState(t *testing.T) {
 			}
 		}
 		return len(frame), nil
-	}
+	})
 	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "gap-frontier"}, targets["gap-frontier"])
 	for i := 0; i < 4; i++ {
 		if _, err := e.SendData([]byte{byte(i)}); err != nil {
@@ -641,7 +705,7 @@ func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
 	var mu sync.Mutex
 	attempts := make(map[uint64]int)
 	changed := make(chan struct{}, 64)
-	path.writeFn = func(frame []byte) (int, error) {
+	path.setWriteFn(func(frame []byte) (int, error) {
 		if len(frame) >= proto.HeaderSize {
 			hdr, err := proto.DecodeHeader(frame[:proto.HeaderSize])
 			if err == nil && hdr.Type == proto.FrameData {
@@ -655,7 +719,7 @@ func TestFullReplayPreemptsActiveGapRepair(t *testing.T) {
 			}
 		}
 		return len(frame), nil
-	}
+	})
 	attachFixturePath(t, e, path, transport.PathSpec{Transport: "adversarial", Address: "full-preempts-gap"}, targets["full-preempts-gap"])
 	for i := 0; i < 4; i++ {
 		if _, err := e.SendData([]byte{byte(i)}); err != nil {

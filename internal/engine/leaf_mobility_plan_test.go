@@ -14,25 +14,29 @@ import (
 )
 
 type enginePlanDriver struct {
-	operation         leafmobility.Operation
-	calls             atomic.Int32
-	evidence          leafmobility.EvidenceDigest
-	entered           chan struct{}
-	release           chan struct{}
-	rollbackEntered   chan struct{}
-	rollbackRelease   chan struct{}
-	commitEntered     chan struct{}
-	commitRelease     chan struct{}
-	prepareCalls      atomic.Int32
-	cutoverCalls      atomic.Int32
-	commitCalls       atomic.Int32
-	activateCalls     atomic.Int32
-	activateErr       error
-	rollbackCalls     atomic.Int32
-	retryableFailures atomic.Int32
-	evidenceEntered   chan struct{}
-	evidenceRelease   chan struct{}
-	evidenceOnce      sync.Once
+	operation             leafmobility.Operation
+	calls                 atomic.Int32
+	evidence              leafmobility.EvidenceDigest
+	entered               chan struct{}
+	release               chan struct{}
+	rollbackEntered       chan struct{}
+	rollbackRelease       chan struct{}
+	rollbackIgnoreContext bool
+	stageEntered          chan struct{}
+	stageRelease          chan struct{}
+	commitEntered         chan struct{}
+	commitRelease         chan struct{}
+	prepareCalls          atomic.Int32
+	cutoverCalls          atomic.Int32
+	commitCalls           atomic.Int32
+	activateCalls         atomic.Int32
+	activateErr           error
+	rollbackCalls         atomic.Int32
+	failClosedCalls       atomic.Int32
+	retryableFailures     atomic.Int32
+	evidenceEntered       chan struct{}
+	evidenceRelease       chan struct{}
+	evidenceOnce          sync.Once
 }
 
 func (d *enginePlanDriver) Operation() leafmobility.Operation { return d.operation }
@@ -110,8 +114,22 @@ func (t *enginePlanDriverTransaction) Prepare(context.Context, leafmobility.Exec
 	t.driver.prepareCalls.Add(1)
 	return nil
 }
-func (t *enginePlanDriverTransaction) Stage(context.Context, leafmobility.ExecutionRequest) (leafmobility.PublicationEvidence, error) {
+func (t *enginePlanDriverTransaction) Stage(ctx context.Context, _ leafmobility.ExecutionRequest) (leafmobility.PublicationEvidence, error) {
 	t.driver.cutoverCalls.Add(1)
+	if t.driver.stageEntered != nil {
+		select {
+		case <-t.driver.stageEntered:
+		default:
+			close(t.driver.stageEntered)
+		}
+	}
+	if t.driver.stageRelease != nil {
+		select {
+		case <-t.driver.stageRelease:
+		case <-ctx.Done():
+			return leafmobility.PublicationEvidence{}, context.Cause(ctx)
+		}
+	}
 	return leafmobility.PublicationEvidence{Digest: leafmobility.EvidenceDigest{0x71}}, nil
 }
 func (t *enginePlanDriverTransaction) Publish(ctx context.Context, _ leafmobility.ExecutionRequest) error {
@@ -146,6 +164,10 @@ func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobili
 		}
 	}
 	if t.driver.rollbackRelease != nil {
+		if t.driver.rollbackIgnoreContext {
+			<-t.driver.rollbackRelease
+			return nil
+		}
 		select {
 		case <-t.driver.rollbackRelease:
 		case <-ctx.Done():
@@ -155,7 +177,8 @@ func (t *enginePlanDriverTransaction) Rollback(ctx context.Context, _ leafmobili
 	return nil
 }
 
-func (*enginePlanDriverTransaction) FailClosed(context.Context, leafmobility.ExecutionRequest) error {
+func (t *enginePlanDriverTransaction) FailClosed(context.Context, leafmobility.ExecutionRequest) error {
+	t.driver.failClosedCalls.Add(1)
 	return nil
 }
 

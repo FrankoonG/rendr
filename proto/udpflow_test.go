@@ -50,6 +50,7 @@ func TestUDPFlowFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	want.Header.PayloadSize = uint32(len(want.Payload))
 	if got.Header != want.Header {
 		t.Errorf("header mismatch: %+v vs %+v", got.Header, want.Header)
 	}
@@ -62,15 +63,29 @@ func TestUDPFlowFrameRoundTrip(t *testing.T) {
 // without bumping UDPFlowVersion violates CLAUDE.md hard rule #7.
 func TestUDPFlowWireStability(t *testing.T) {
 	h := UDPFlowHeader{
-		Version: UDPFlowVersion,
-		FlowID:  [UDPFlowIDSize]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77},
+		Version:     UDPFlowVersion,
+		FlowID:      [UDPFlowIDSize]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77},
+		PayloadSize: 0x01020304,
 	}
 	var buf [UDPFlowHeaderSize]byte
 	if err := h.Encode(buf[:]); err != nil {
 		t.Fatal(err)
 	}
-	want := []byte{0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
+	want := []byte{0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x01, 0x02, 0x03, 0x04}
 	if !bytes.Equal(buf[:], want) {
 		t.Fatalf("wire drift:\n got=%x\nwant=%x\n(bumping UDPFlowVersion is required if intentional)", buf, want)
+	}
+}
+
+func TestUDPFlowFrameRejectsSilentPayloadTruncation(t *testing.T) {
+	wire, err := (UDPFlowFrame{
+		Header:  UDPFlowHeader{Version: UDPFlowVersion, FlowID: [UDPFlowIDSize]byte{1}},
+		Payload: bytes.Repeat([]byte{0xa5}, 64),
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeUDPFlowFrame(wire[:len(wire)-1]); err == nil {
+		t.Fatal("silently truncated UDP-flow datagram was accepted as a complete frame")
 	}
 }

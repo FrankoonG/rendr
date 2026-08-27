@@ -365,7 +365,7 @@ func waitGatewayTCPAdmissionCleanup(t *testing.T, gateway *Gateway, id l3ingress
 	t.Fatalf("readiness cleanup pending=%d admissions=%d session=%v active=%v", pending, admissions, session, active)
 }
 
-func TestGatewayShutdownWaitsForForwarderCallbackEnteredBeforeStop(t *testing.T) {
+func TestGatewayShutdownDoesNotWaitForHostileForwarderCallback(t *testing.T) {
 	serverRuntime, err := rendr.NewRuntime(rendr.DefaultRuntimeConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +409,7 @@ func TestGatewayShutdownWaitsForForwarderCallbackEnteredBeforeStop(t *testing.T)
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseCallback) }) }
 	defer release()
-	gateway.manager.OnStart = func(context.Context, *l3session.Session) error {
+	gateway.manager.OnStart = func(context.Context, l3session.PendingSessionView) error {
 		close(callbackEntered)
 		<-releaseCallback
 		return nil
@@ -449,18 +449,13 @@ func TestGatewayShutdownWaitsForForwarderCallbackEnteredBeforeStop(t *testing.T)
 	stopGateway()
 	select {
 	case err := <-gatewayDone:
-		t.Fatalf("Gateway.Run returned before entered callback drained: %v", err)
-	case <-time.After(75 * time.Millisecond):
-	}
-	release()
-	select {
-	case err := <-gatewayDone:
 		if err != nil {
-			t.Fatalf("Gateway.Run after callback release: %v", err)
+			t.Fatalf("Gateway.Run after cancellation: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Gateway.Run did not finish after entered callback drained")
+		t.Fatal("Gateway.Run waited for a callback that ignored cancellation")
 	}
+	release()
 	clientStack.Close()
 	clientLink.Close()
 	select {

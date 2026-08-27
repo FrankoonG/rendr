@@ -222,6 +222,10 @@ type PathConn struct {
 	deathErr error
 }
 
+// MaxFrameSize reports the largest complete rendr frame accepted by one QUIC
+// stream record. Packet sessions use this contract; stream sessions ignore it.
+func (*PathConn) MaxFrameSize() int { return MaxFrameSize }
+
 var _ transport.DatagramAccelerationObserver = (*PathConn)(nil)
 var _ transport.OwnedFrameReader = (*PathConn)(nil)
 
@@ -400,6 +404,8 @@ func (p *PathConn) RemoteAddr() string {
 	}
 	return ""
 }
+
+var _ transport.PacketPathConn = (*PathConn)(nil)
 
 // watchConn observes the QUIC connection's context: if it dies for
 // any reason (idle, application close, network) we report death so

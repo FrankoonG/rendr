@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -34,15 +33,15 @@ func attributedDataFrame(
 	t *testing.T,
 	manifest proto.GraphManifest,
 	targetID proto.TargetID,
-	generation, seq uint64,
+	stateEpoch, seq uint64,
 	payload []byte,
 ) (proto.Header, []byte, []byte) {
 	t.Helper()
-	flags, err := proto.DataFlagsForRootTarget(manifest, targetID, true, true)
+	flags, err := proto.DataFlagsForSelectorState(true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wirePayload, err := proto.EncodeDataRootGeneration(generation, payload)
+	wirePayload, err := proto.EncodeDataSelectorStateEpoch(stateEpoch, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +52,36 @@ func attributedDataFrame(
 	}
 	copy(frame[proto.HeaderSize:], wirePayload)
 	return header, wirePayload, frame
+}
+
+func peerSelectorStateFrame(
+	t *testing.T,
+	e *Engine,
+	manifest proto.GraphManifest,
+	targetID proto.TargetID,
+	generation, stateEpoch, seq uint64,
+) (proto.Header, []byte) {
+	t.Helper()
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := proto.SelectorStatePayload{
+		SessionEpoch: proto.SessionEpoch(e.FlowID()), Direction: peerSenderDirection(e.side),
+		GraphRevision: 1, GraphDigest: digest, StateEpoch: stateEpoch,
+		Entries: []proto.SelectorStateEntry{{
+			SelectorID: manifest.RootID, DesiredTargetID: targetID,
+			EffectiveTargetID: targetID, Generation: generation,
+		}},
+	}
+	wire, err := proto.EncodeSelectorState(payload, manifest, proto.GraphBinding{Revision: 1, Digest: digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proto.Header{
+		Version: proto.Version, Type: proto.FrameCtrl,
+		Flags: proto.FlagsForCtrl(proto.CtrlSelectorState), Seq: seq,
+	}, wire
 }
 
 func TestApplicationDeliveryRequiresProofValidPeerAck(t *testing.T) {
@@ -130,6 +159,33 @@ func TestApplicationDeliveryExcludesUnpublishedReservation(t *testing.T) {
 	}
 }
 
+func TestShortDispatchClearsOlderDemandEvidenceWithoutAllocation(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	epoch := e.currentPathTopologyEpoch()
+	finished := nowFn()
+	pressured := &applicationDispatchDemandEvidence{
+		topologyEpoch: epoch, finished: finished, duration: 2 * time.Millisecond,
+	}
+	retained := false
+	allocations := testing.AllocsPerRun(1000, func() {
+		e.lastApplicationDispatch.Store(pressured)
+		e.noteApplicationDispatchDuration(
+			rootDeliveryCohort{}, epoch, finished.Add(time.Millisecond),
+			finished.Add(time.Millisecond+time.Microsecond), true,
+		)
+		if e.lastApplicationDispatch.Load() != nil {
+			retained = true
+		}
+	})
+	if retained {
+		t.Fatal("sub-threshold dispatch retained older evidence")
+	}
+	if allocations != 0 {
+		t.Fatalf("sub-threshold evidence clear allocations/run=%.2f want 0", allocations)
+	}
+}
+
 func TestPacketTargetDeliveryIgnoresLateOlderGeneration(t *testing.T) {
 	manifest, normalID, _ := peakDeliveryManifest(t)
 	e := New(SideServer, NewClientFlowID(), Limits{}.Clamp())
@@ -140,25 +196,29 @@ func TestPacketTargetDeliveryIgnoresLateOlderGeneration(t *testing.T) {
 	e.SetPacketMode()
 	slot := &pathSlot{peerTXTargetID: normalID}
 
-	newHeader, newWire, _ := attributedDataFrame(t, manifest, normalID, 2, 1, []byte("new"))
-	oldHeader, oldWire, _ := attributedDataFrame(t, manifest, normalID, 1, 0, []byte("old"))
+	oldStateHeader, oldStateWire := peerSelectorStateFrame(t, e, manifest, normalID, 1, 1, 0)
+	newStateHeader, newStateWire := peerSelectorStateFrame(t, e, manifest, normalID, 2, 2, 2)
+	newHeader, newWire, _ := attributedDataFrame(t, manifest, normalID, 2, 3, []byte("new"))
+	oldHeader, oldWire, _ := attributedDataFrame(t, manifest, normalID, 1, 1, []byte("old"))
 	delivered := make([][]byte, 0, 2)
 	e.recvMu.Lock()
-	if !e.onFrameRecvLocked(slot, newHeader, newWire, &delivered) {
+	e.onFrameRecvLocked(slot, oldStateHeader, oldStateWire, &delivered)
+	e.onFrameRecvLocked(slot, newStateHeader, newStateWire, &delivered)
+	if e.onFrameRecvLocked(slot, newHeader, newWire, &delivered) {
 		e.recvMu.Unlock()
-		t.Fatal("newer out-of-order packet was not accepted")
+		t.Fatal("newer packet was delivered before its selector-state predecessor chain")
 	}
-	newSnapshot := e.peerTargetDeliveryLocked(proto.TargetID{})
 	if !e.onFrameRecvLocked(slot, oldHeader, oldWire, &delivered) {
 		e.recvMu.Unlock()
-		t.Fatal("valid older packet was not delivered")
+		t.Fatal("valid older packet did not release the selector-state chain")
 	}
+	newSnapshot := e.peerTargetDeliveryLocked(proto.TargetID{})
 	after := e.peerTargetDeliveryLocked(proto.TargetID{})
 	unique := e.recvUniqueBytes
 	terminal := e.recvTerminal
 	e.recvMu.Unlock()
 
-	if len(delivered) != 2 || string(delivered[0]) != "new" || string(delivered[1]) != "old" {
+	if len(delivered) != 2 || string(delivered[0]) != "old" || string(delivered[1]) != "new" {
 		t.Fatalf("packet delivery=%q", delivered)
 	}
 	if terminal {
@@ -173,7 +233,7 @@ func TestPacketTargetDeliveryIgnoresLateOlderGeneration(t *testing.T) {
 	}
 }
 
-func TestPacketTargetDeliveryRejectsTargetChangeWithinGeneration(t *testing.T) {
+func TestPacketTargetDeliveryAlternateLeafWithinStateIsUnattributable(t *testing.T) {
 	manifest, normalID, peakID := peakDeliveryManifest(t)
 	e := New(SideServer, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
@@ -184,27 +244,37 @@ func TestPacketTargetDeliveryRejectsTargetChangeWithinGeneration(t *testing.T) {
 	normalSlot := &pathSlot{peerTXTargetID: normalID}
 	peakSlot := &pathSlot{peerTXTargetID: peakID}
 
-	peakHeader, peakWire, _ := attributedDataFrame(t, manifest, peakID, 7, 1, []byte("peak"))
-	normalHeader, normalWire, _ := attributedDataFrame(t, manifest, normalID, 7, 0, []byte("normal"))
+	stateHeader, stateWire := peerSelectorStateFrame(t, e, manifest, peakID, 7, 1, 0)
+	peakHeader, peakWire, _ := attributedDataFrame(t, manifest, peakID, 1, 2, []byte("peak"))
+	normalHeader, normalWire, _ := attributedDataFrame(t, manifest, normalID, 1, 1, []byte("normal"))
 	delivered := make([][]byte, 0, 2)
 	e.recvMu.Lock()
+	e.onFrameRecvLocked(peakSlot, stateHeader, stateWire, &delivered)
 	if !e.onFrameRecvLocked(peakSlot, peakHeader, peakWire, &delivered) {
 		e.recvMu.Unlock()
 		t.Fatal("first packet was not accepted")
 	}
-	if e.onFrameRecvLocked(normalSlot, normalHeader, normalWire, &delivered) {
+	before := e.peerTargetDeliveryLocked(proto.TargetID{})
+	if !e.onFrameRecvLocked(normalSlot, normalHeader, normalWire, &delivered) {
 		e.recvMu.Unlock()
-		t.Fatal("target substitution became application-readable")
+		t.Fatal("alternate replay leaf was not application-readable")
 	}
+	snapshot := e.peerTargetDeliveryLocked(proto.TargetID{})
 	terminalErr := e.recvFinalErr
 	terminal := e.recvTerminal
 	e.recvMu.Unlock()
 
-	if !terminal || !errors.Is(terminalErr, ErrPeerProtocol) {
-		t.Fatalf("target substitution terminal=%t err=%v", terminal, terminalErr)
+	if terminal || terminalErr != nil {
+		t.Fatalf("alternate replay leaf terminal=%t err=%v", terminal, terminalErr)
 	}
-	if len(delivered) != 1 || string(delivered[0]) != "peak" {
-		t.Fatalf("target substitution delivery=%q", delivered)
+	if len(delivered) != 2 || string(delivered[0]) != "peak" || string(delivered[1]) != "normal" {
+		t.Fatalf("alternate replay delivery=%q", delivered)
+	}
+	if !before.Attributable || before.TargetID != peakID || before.AckedBytes != uint64(len("peak")) {
+		t.Fatalf("selected leaf was not attributable before alternate delivery: %+v", before)
+	}
+	if snapshot.Attributable || snapshot.TargetID != peakID || snapshot.AckedBytes != 0 {
+		t.Fatalf("alternate physical leaf remained attributable: %+v", snapshot)
 	}
 }
 
@@ -219,14 +289,16 @@ func TestPeerTargetDeliveryDoesNotCrossPhysicalTopologyEpoch(t *testing.T) {
 	oldEpoch := e.currentPathTopologyEpoch()
 	slot := &pathSlot{peerTXTargetID: normalID}
 	slot.topologyEpoch.Store(oldEpoch)
+	stateHeader, stateWire := peerSelectorStateFrame(t, e, manifest, normalID, 1, 1, 0)
 	oldHeader, oldWire, _ := attributedDataFrame(
-		t, manifest, normalID, 1, 1, []byte("old-topology-delayed"),
+		t, manifest, normalID, 1, 2, []byte("old-topology-delayed"),
 	)
 	newHeader, newWire, _ := attributedDataFrame(
-		t, manifest, normalID, 1, 0, []byte("new-topology-frontier"),
+		t, manifest, normalID, 1, 1, []byte("new-topology-frontier"),
 	)
 
 	e.recvMu.Lock()
+	e.onFrameRecvLocked(slot, stateHeader, stateWire, nil)
 	if e.onFrameRecvLocked(slot, oldHeader, oldWire, nil) {
 		e.recvMu.Unlock()
 		t.Fatal("out-of-order old-topology frame became readable before its gap closed")
@@ -268,13 +340,25 @@ func TestDispatchDurationEvidenceSurvivesEarlyPeerAck(t *testing.T) {
 	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
 		t.Fatal(err)
 	}
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.rememberSendSelectorStateLocked(newSelectorStateRecord(proto.SelectorStatePayload{
+		SessionEpoch: proto.SessionEpoch(e.FlowID()), Direction: senderDirection(e.side),
+		GraphRevision: 1, GraphDigest: digest, StateEpoch: 1,
+		Entries: []proto.SelectorStateEntry{{
+			SelectorID: manifest.RootID, DesiredTargetID: normalID,
+			EffectiveTargetID: normalID, Generation: 1,
+		}},
+	}, nil))
 	_, _, frame := attributedDataFrame(t, manifest, normalID, 1, 0, []byte("payload"))
 	cohort := rootDeliveryCohort{selectorID: manifest.RootID, targetID: normalID, generation: 1}
 	if err := e.acquireSendSlot(false, len(frame)); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.reserveOwnedApplicationFrame(frame, rootDataAttribution{
-		cohort: cohort, committed: true,
+		cohort: cohort, committed: true, stateEpoch: 1,
 	}, len("payload")); err != nil {
 		t.Fatal(err)
 	}

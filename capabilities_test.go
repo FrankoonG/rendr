@@ -173,12 +173,12 @@ func TestRuntimeDialPacketRejectsPeerWithoutL3IdentityCapabilityHighCount(t *tes
 	var closed atomic.Int64
 	if err := runtime.RegisterPacketFactory("l3-close-tracked-udp", PacketFactory{
 		Carrier: CarrierUDP,
-		Dial: func(context.Context, string) (net.PacketConn, error) {
+		Dial: func(_ context.Context, address string) (PacketEndpoint, error) {
 			conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 			if err != nil {
-				return nil, err
+				return PacketEndpoint{}, err
 			}
-			return &l3CloseTrackedPacketConn{PacketConn: conn, closed: &closed}, nil
+			return testPacketEndpointForAddress(&l3CloseTrackedPacketConn{PacketConn: conn, closed: &closed}, address)
 		},
 	}); err != nil {
 		t.Fatal(err)

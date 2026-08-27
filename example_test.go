@@ -8,6 +8,7 @@ import (
 	"net"
 
 	"github.com/FrankoonG/rendr"
+	"github.com/FrankoonG/rendr/transport/udpflow"
 )
 
 // ExampleRuntime_Dial demonstrates the smallest useful rendr setup:
@@ -135,9 +136,10 @@ func ExampleRuntime_DialPacket() {
 		log.Fatal(err)
 	}
 	ln, err := serverRuntime.Listen(rendr.ListenConfig{Packets: []rendr.PacketSource{{
-		Name:    "packet",
-		Carrier: rendr.CarrierUDP,
-		Conn:    rawPacketConn,
+		Name:            "packet",
+		Carrier:         rendr.CarrierUDP,
+		Conn:            rawPacketConn,
+		MaxDatagramSize: 1400,
 	}}})
 	if err != nil {
 		_ = rawPacketConn.Close()
@@ -199,8 +201,17 @@ func newPacketRuntime() (*rendr.Runtime, error) {
 	listenConfig := &net.ListenConfig{}
 	if err := runtime.RegisterPacketFactory("packet", rendr.PacketFactory{
 		Carrier: rendr.CarrierUDP,
-		Dial: func(ctx context.Context, _ string) (net.PacketConn, error) {
-			return listenConfig.ListenPacket(ctx, "udp", "127.0.0.1:0")
+		Dial: func(ctx context.Context, address string) (rendr.PacketEndpoint, error) {
+			conn, err := listenConfig.ListenPacket(ctx, "udp", "127.0.0.1:0")
+			if err != nil {
+				return rendr.PacketEndpoint{}, err
+			}
+			peer, err := net.ResolveUDPAddr("udp", address)
+			if err != nil {
+				_ = conn.Close()
+				return rendr.PacketEndpoint{}, err
+			}
+			return rendr.PacketEndpoint{Conn: conn, Peer: peer, MaxDatagramSize: udpflow.MaxDatagram}, nil
 		},
 	}); err != nil {
 		return nil, err

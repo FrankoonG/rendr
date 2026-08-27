@@ -1,6 +1,7 @@
 package l3session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -102,7 +103,7 @@ func TestUDPRelayForwardsPayloadThroughRendrPacketSession(t *testing.T) {
 		t.Fatal("timed out waiting for relay reply")
 	}
 
-	if sess, ok := relay.manager().Session(id); !ok || sess.PacketConn == nil {
+	if sess, ok := relay.manager().Session(id); !ok || sess.PacketConn() == nil {
 		t.Fatalf("missing packet session: ok=%v sess=%+v", ok, sess)
 	}
 	if !relay.CloseFlow(id) {
@@ -198,10 +199,10 @@ func TestUDPRelayPreservesFlowAcrossPacketMigration(t *testing.T) {
 	readReply("ack-one")
 
 	sess, ok := relay.manager().Session(id)
-	if !ok || sess.PacketConn == nil {
+	if !ok || sess.PacketConn() == nil {
 		t.Fatalf("missing packet session: ok=%v sess=%+v", ok, sess)
 	}
-	admin := sess.PacketConn.(packetControl)
+	admin := sess.PacketConn().(packetControl)
 	_ = waitForSessionPathAttached(t, admin, "udp-b", 3*time.Second)
 	if err := admin.SelectTarget("root", "udp-b"); err != nil {
 		t.Fatal(err)
@@ -378,12 +379,12 @@ func TestUDPReplyLoopTeardownCannotForgetReplacementGeneration(t *testing.T) {
 	oldConn := &fakeConn{}
 	newConn := &fakeConn{}
 	oldSession := &Session{
-		Request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 1}},
-		Conn:    oldConn,
+		request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 1}},
+		conn:    oldConn,
 	}
 	newSession := &Session{
-		Request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 2}},
-		Conn:    newConn,
+		request: l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 2}},
+		conn:    newConn,
 	}
 	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
 	relay := &UDPRelay{
@@ -399,7 +400,7 @@ func TestUDPReplyLoopTeardownCannotForgetReplacementGeneration(t *testing.T) {
 	if current, ok := manager.Session(id); !ok || current != newSession {
 		t.Fatalf("stale reply loop removed replacement: current=%p ok=%v", current, ok)
 	}
-	if relay.packetSession(id, newSession.Request.Ref) != newSession {
+	if relay.packetSession(id, newSession.Request().Ref) != newSession {
 		t.Fatal("stale reply loop removed replacement packet cache")
 	}
 	if cached := relay.fast.Load(); cached == nil || cached.sess != newSession {
@@ -419,8 +420,8 @@ func TestUDPRelayRetiresCachedPredecessorBeforeTupleReuse(t *testing.T) {
 	newRef := l3ingress.FlowRef{Identity: id, Generation: 2}
 	oldConn := &fakeConn{}
 	oldSession := &Session{
-		Request: l3ingress.SessionRequest{Identity: id, Ref: oldRef, Egress: "old-egress"},
-		Conn:    oldConn,
+		request: l3ingress.SessionRequest{Identity: id, Ref: oldRef, Egress: "old-egress"},
+		conn:    oldConn,
 	}
 	canceled := make(chan struct{})
 	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: oldSession}}
@@ -447,6 +448,43 @@ func TestUDPRelayRetiresCachedPredecessorBeforeTupleReuse(t *testing.T) {
 	}
 	if relay.packetSession(id, newRef) != nil || relay.fast.Load() != nil {
 		t.Fatal("predecessor cache survived generation retirement")
+	}
+}
+
+func TestUDPRelaySmallBufferCannotConsumeLargeReply(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP,
+		SrcIP: netip.MustParseAddr("2001:db8::50"), SrcPort: 53000,
+		DstIP: netip.MustParseAddr("2001:db8::53"), DstPort: 53,
+	}
+	payload := bytes.Repeat([]byte{0x6d}, maxUDPPeerPayloadSize)
+	packetConn := &udpIdleTestPacketConn{payload: payload}
+	sess := &Session{
+		request:    l3ingress.SessionRequest{Identity: id, Ref: l3ingress.FlowRef{Identity: id, Generation: 1}},
+		packetConn: packetConn,
+	}
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: sess}}
+	device := &packetCaptureDevice{writes: make(chan []byte, 1)}
+	relay := &UDPRelay{
+		Device: device, Manager: manager, BufferSize: 128,
+		packets: map[l3ingress.L3Identity]*Session{id: sess},
+	}
+	relay.readReplies(context.Background(), id, sess)
+	select {
+	case packet := <-device.writes:
+		meta, err := l3ingress.ParsePacket(packet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := l3ingress.UDPPayload(packet, meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("reply payload length=%d want %d", len(got), len(payload))
+		}
+	default:
+		t.Fatal("large reply was consumed without delivery")
 	}
 }
 

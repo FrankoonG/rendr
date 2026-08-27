@@ -36,8 +36,8 @@ func TestPolicyTransactionsAreRequiredByNegotiation(t *testing.T) {
 	if PolicyTransactionWireVersion != 4 {
 		t.Fatalf("policy transaction wire version=%d want=4", PolicyTransactionWireVersion)
 	}
-	if ProtocolMinor != 20 {
-		t.Fatalf("protocol minor=%d want=20", ProtocolMinor)
+	if ProtocolMinor != 22 {
+		t.Fatalf("protocol minor=%d want=22", ProtocolMinor)
 	}
 	if SupportedFeatures&FeaturePolicyTransaction == 0 || RequiredFeatures&FeaturePolicyTransaction == 0 {
 		t.Fatal("policy transaction feature is not required by negotiation")

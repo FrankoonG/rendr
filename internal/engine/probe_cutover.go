@@ -8,25 +8,30 @@ var errSelectorCutoverHandoff = errors.New("engine: selector cutover owns publis
 // physical writer. The frame is already in the replay ledger, so the selector
 // can take sendMu and replay it after committing the new route.
 func (e *Engine) beginSelectorCutover() uint64 {
-	e.selectorCutoverMu.Lock()
-	defer e.selectorCutoverMu.Unlock()
-	for e.selectorCutoverPending {
-		if hook := e.selectorCutoverBeforeWait; hook != nil {
-			hook(e.selectorCutoverGeneration)
+	for {
+		generation, wake, reserved := e.tryBeginSelectorCutover()
+		if reserved {
+			return generation
 		}
-		wake := e.selectorCutoverWake
-		e.selectorCutoverMu.Unlock()
-		select {
-		case <-wake:
-		case <-e.closed:
-			e.selectorCutoverMu.Lock()
+		if !e.waitForSelectorCutoverReservation(generation, wake) {
 			return 0
 		}
-		e.selectorCutoverMu.Lock()
+	}
+}
+
+// tryBeginSelectorCutover either reserves the exact next cutover generation or
+// returns the wake channel for the generation currently owning dispatch. It
+// never waits, so callers may use it at the tail of a larger validated lock
+// order and must release every outer lock before waiting on wake.
+func (e *Engine) tryBeginSelectorCutover() (generation uint64, wake <-chan struct{}, reserved bool) {
+	e.selectorCutoverMu.Lock()
+	defer e.selectorCutoverMu.Unlock()
+	if e.selectorCutoverPending {
+		return e.selectorCutoverGeneration, e.selectorCutoverWake, false
 	}
 	select {
 	case <-e.closed:
-		return 0
+		return 0, nil, false
 	default:
 	}
 	if e.selectorCutoverGeneration == ^uint64(0) {
@@ -38,7 +43,25 @@ func (e *Engine) beginSelectorCutover() uint64 {
 	e.selectorCutoverReplayRequired = e.selectorCutoverHandedOff
 	close(e.selectorCutoverWake)
 	e.selectorCutoverWake = make(chan struct{})
-	return e.selectorCutoverGeneration
+	return e.selectorCutoverGeneration, nil, true
+}
+
+func (e *Engine) waitForSelectorCutoverReservation(
+	generation uint64,
+	wake <-chan struct{},
+) bool {
+	if wake == nil {
+		return false
+	}
+	if hook := e.selectorCutoverBeforeWait; hook != nil {
+		hook(generation)
+	}
+	select {
+	case <-wake:
+		return true
+	case <-e.closed:
+		return false
+	}
 }
 
 func (e *Engine) finishSelectorCutover(generation uint64) {

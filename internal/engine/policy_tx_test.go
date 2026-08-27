@@ -43,6 +43,53 @@ func TestPolicyCommitChallengeEntropyFailsClosed(t *testing.T) {
 	}
 }
 
+func TestPolicyRejectionPreservesWireClassification(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		code      proto.PolicyAckCode
+		retryable bool
+	}{
+		{name: "reject", code: proto.PolicyAckCodeReject},
+		{name: "busy", code: proto.PolicyAckCodeBusy, retryable: true},
+		{name: "stale", code: proto.PolicyAckCodeStale, retryable: true},
+		{name: "superseded", code: proto.PolicyAckCodeSuperseded, retryable: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ack := proto.PolicyAck{
+				Phase:  proto.PolicyAckPhaseFinal,
+				Code:   test.code,
+				Reason: "classified rejection",
+			}
+			err := policyRejectionFromAck(ack)
+			if !errors.Is(err, ErrPolicyRejected) {
+				t.Fatalf("error=%v does not preserve ErrPolicyRejected", err)
+			}
+			var rejection *PolicyRejectionError
+			if !errors.As(err, &rejection) {
+				t.Fatalf("error=%v has no PolicyRejectionError", err)
+			}
+			if rejection.Phase != ack.Phase || rejection.Code != ack.Code ||
+				rejection.Reason != ack.Reason {
+				t.Fatalf("rejection=%+v want phase=%d code=%d reason=%q",
+					rejection, ack.Phase, ack.Code, ack.Reason)
+			}
+			if got := IsRetryablePolicyRejection(err); got != test.retryable {
+				t.Fatalf("retryable=%t want %t for code=%d", got, test.retryable, test.code)
+			}
+		})
+	}
+
+	if IsRetryablePolicyRejection(ErrPolicyRejected) {
+		t.Fatal("untyped policy rejection was treated as retryable")
+	}
+	if got := policyAckCodeForFailure(errStaleSelectorEvidence); got != proto.PolicyAckCodeStale {
+		t.Fatalf("stale selector evidence code=%d want %d", got, proto.PolicyAckCodeStale)
+	}
+	if got := policyAckCodeForFailure(errors.New("permanent policy failure")); got != proto.PolicyAckCodeReject {
+		t.Fatalf("permanent policy failure code=%d want %d", got, proto.PolicyAckCodeReject)
+	}
+}
+
 type policyTxUnitAckObservation struct {
 	ack        proto.PolicyAck
 	seq        uint64
@@ -326,9 +373,28 @@ func newPolicyTxUnitFixture(t *testing.T) *policyTxUnitFixture {
 }
 
 func newPolicyTxUnitEngine(t *testing.T, manifest proto.GraphManifest, selectorID proto.TargetID, leafNames ...string) (*Engine, *policyTxUnitAckRecorder, map[string]uint32, map[string]*policyTxUnitPath) {
+	return newPolicyTxUnitEngineWithOptions(
+		t, Limits{}.Clamp(), false, manifest, selectorID, leafNames...,
+	)
+}
+
+func newPolicyTxUnitEngineWithOptions(
+	t *testing.T,
+	limits Limits,
+	suppressImmediateProbe bool,
+	manifest proto.GraphManifest,
+	selectorID proto.TargetID,
+	leafNames ...string,
+) (*Engine, *policyTxUnitAckRecorder, map[string]uint32, map[string]*policyTxUnitPath) {
 	t.Helper()
-	engine := New(SideServer, [16]byte{0xa7, 0x31}, Limits{}.Clamp())
+	engine := New(SideServer, [16]byte{0xa7, 0x31}, limits.Clamp())
 	t.Cleanup(func() { _ = engine.Close() })
+	if suppressImmediateProbe {
+		// Selector normally closes probeStart while the graph is configured.
+		// Consume that one-shot signal before configuration so this fixture can
+		// isolate transaction expiry from independent health-evidence changes.
+		engine.probeStartOnce.Do(func() {})
+	}
 	if err := engine.ConfigureLocalGraph(policyTxUnitRevision, manifest); err != nil {
 		t.Fatalf("ConfigureLocalGraph: %v", err)
 	}
@@ -877,8 +943,8 @@ func TestIncomingInactiveExactChildCommitRejectsTopologyEpochDrift(t *testing.T)
 			final = &observations[i]
 		}
 	}
-	if final == nil || final.ack.Code != proto.PolicyAckCodeReject {
-		t.Fatalf("topology-stale FINAL=%+v want explicit rejection", final)
+	if final == nil || final.ack.Code != proto.PolicyAckCodeStale {
+		t.Fatalf("topology-stale FINAL=%+v want stale rejection", final)
 	}
 	if final.ack.Code == proto.PolicyAckCodeAccept || final.ack.CurrentTargetID == pathC.ID {
 		t.Fatalf("topology-stale commit published C: %+v", final.ack)
@@ -939,16 +1005,45 @@ func TestPolicyClassSelectionFreezesOwnerChoiceAndRejectsStaleCommit(t *testing.
 	}
 
 	// The frozen target must still satisfy its class evidence at COMMIT. A stale
-	// target is rejected rather than replaced behind the requester's back.
+	// target is retryably rejected rather than replaced behind the requester's back.
 	handles[nameB].SetQuality(transport.PathQuality{RTT: 100 * time.Millisecond, At: now.Add(-time.Hour)})
 	commit := policyTxUnitCommit(t, prepare, first.ack.Generation, first.ack.ReservationID)
 	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
-	if final.ack.Code != proto.PolicyAckCodeReject || final.ack.ResolvedTargetID != (proto.TargetID{}) {
-		t.Fatalf("stale class COMMIT=%+v want reject without resolved target", final.ack)
+	if final.ack.Code != proto.PolicyAckCodeStale || final.ack.ResolvedTargetID != (proto.TargetID{}) {
+		t.Fatalf("stale class COMMIT=%+v want retryable stale without resolved target", final.ack)
+	}
+	if rejection := policyRejectionFromAck(final.ack); !IsRetryablePolicyRejection(rejection) {
+		t.Fatalf("stale class COMMIT rejection is not retryable: %v", rejection)
 	}
 	generation, selected, pending, _ := policyTxUnitState(e, selector.ID)
 	if generation != 0 || selected != pathA.ID || pending || e.ActivePath() != paths[nameA] {
 		t.Fatalf("rejected class COMMIT changed owner: generation=%d selected=%x pending=%t active=%d", generation, selected, pending, e.ActivePath())
+	}
+}
+
+func TestPolicyPrepareUnavailableClassIsRetryableStale(t *testing.T) {
+	pathA := policyTxUnitNode(proto.GraphNodeKindPath, "policy-unavailable-a")
+	pathB := policyTxUnitNode(proto.GraphNodeKindPath, "policy-unavailable-b")
+	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-unavailable-root", pathA.ID, pathB.ID)
+	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, pathA, pathB}}
+	e, recorder, paths, handles := newPolicyTxUnitEngine(
+		t, manifest, selector.ID, "policy-unavailable-a", "policy-unavailable-b",
+	)
+	staleAt := time.Now().Add(-time.Hour)
+	handles["policy-unavailable-a"].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: staleAt})
+	handles["policy-unavailable-b"].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: staleAt})
+
+	prepare := policyTxUnitClassPrepare(e, 0x43, 0, selector.ID, false)
+	ack := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
+	if ack.ack.Phase != proto.PolicyAckPhasePrepare || ack.ack.Code != proto.PolicyAckCodeStale {
+		t.Fatalf("unavailable class PREPARE=%+v want stale", ack.ack)
+	}
+	if rejection := policyRejectionFromAck(ack.ack); !IsRetryablePolicyRejection(rejection) {
+		t.Fatalf("unavailable class rejection is not retryable: %v", rejection)
+	}
+	if generation, selected, pending, _ := policyTxUnitState(e, selector.ID); generation != 0 ||
+		selected != pathA.ID || pending || e.ActivePath() != paths["policy-unavailable-a"] {
+		t.Fatalf("unavailable PREPARE changed state: generation=%d selected=%x pending=%t active=%d", generation, selected, pending, e.ActivePath())
 	}
 }
 
@@ -1062,8 +1157,8 @@ func TestPolicyPeakClassCommitRejectsPreparedTopologyEpochDrift(t *testing.T) {
 
 	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
 	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
-	if final.ack.Code != proto.PolicyAckCodeReject || final.ack.ResolvedTargetID != (proto.TargetID{}) {
-		t.Fatalf("topology-stale FINAL=%+v want rejection", final.ack)
+	if final.ack.Code != proto.PolicyAckCodeStale || final.ack.ResolvedTargetID != (proto.TargetID{}) {
+		t.Fatalf("topology-stale FINAL=%+v want stale rejection", final.ack)
 	}
 	generation, selected, pending, _ := policyTxUnitState(e, selector.ID)
 	if generation != 0 || selected != normal.ID || pending || e.ActivePath() != paths[normalName] {
@@ -1084,46 +1179,31 @@ func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
 	selector := policyTxUnitNode(proto.GraphNodeKindSelector, "policy-expiry-root", normal.ID, peak.ID)
 	selector.PeakCandidates = []proto.TargetID{peak.ID}
 	manifest := proto.GraphManifest{RootID: selector.ID, Nodes: []proto.GraphNode{selector, normal, peak}}
-	e, recorder, paths, handles := newPolicyTxUnitEngine(t, manifest, selector.ID, nameN, nameP)
+	e, recorder, paths, handles := newPolicyTxUnitEngineWithOptions(
+		t, Limits{ProbeInterval: time.Hour}, true, manifest, selector.ID, nameN, nameP,
+	)
+	// A delayed PREPARE-ACK tail replay must not masquerade as the cutover
+	// replay whose committed generation this test fences below.
+	e.tailReplayInitialDelay = time.Hour
+	e.tailReplayMaxBackoff = time.Hour
 	now := time.Now()
 	handles[nameN].SetQuality(transport.PathQuality{RTT: time.Millisecond, At: now})
 	handles[nameP].SetQuality(transport.PathQuality{RTT: 10 * time.Millisecond, At: now})
+	payload := []byte("unacknowledged-before-policy-cutover")
+	if n, err := e.SendData(payload); n != len(payload) || err != nil {
+		t.Fatalf("SendData=(%d,%v), want (%d,nil)", n, err, len(payload))
+	}
+	if got := handles[nameN].dataWrites.Load(); got != 1 {
+		t.Fatalf("normal target DATA writes=%d want 1", got)
+	}
+	if got := handles[nameP].dataWrites.Load(); got != 0 {
+		t.Fatalf("peak target received DATA before commit: %d", got)
+	}
 
-	primaryWriteEntered := make(chan struct{})
-	releasePrimaryWrite := make(chan struct{})
-	defer func() {
-		select {
-		case <-releasePrimaryWrite:
-		default:
-			close(releasePrimaryWrite)
-		}
-	}()
-	var primaryWriteOnce sync.Once
-	handles[nameN].SetBeforeWrite(func(frame []byte) {
-		if len(frame) < proto.HeaderSize {
-			return
-		}
-		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
-		if err != nil || header.Type != proto.FrameData {
-			return
-		}
-		primaryWriteOnce.Do(func() { close(primaryWriteEntered) })
-		<-releasePrimaryWrite
-	})
 	prepare := policyTxUnitClassPrepare(e, 0x43, 0, selector.ID, true)
 	prepared := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyPrepare(prepare) })
 	if prepared.ack.Code != proto.PolicyAckCodeAccept || prepared.ack.ResolvedTargetID != peak.ID {
 		t.Fatalf("peak PREPARE=%+v", prepared.ack)
-	}
-	sendDone := make(chan error, 1)
-	go func() {
-		_, err := e.SendData([]byte("unacknowledged-before-policy-cutover"))
-		sendDone <- err
-	}()
-	select {
-	case <-primaryWriteEntered:
-	case <-time.After(time.Second):
-		t.Fatal("initial DATA did not block on the normal target")
 	}
 
 	replayEntered := make(chan struct{})
@@ -1136,7 +1216,15 @@ func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
 		}
 	}()
 	var replayOnce sync.Once
-	e.boundedReplayBeforeSnapshot = func() {
+	e.replayPublicationBeforeComplete = func(_ replayPublicationBarrierToken) {
+		e.policyStateMu.Lock()
+		completedTx, completed := e.policyCompleted[prepare.TransactionID]
+		committed := completed && completedTx.finalAck.Code == proto.PolicyAckCodeAccept &&
+			completedTx.finalAck.Generation == prepared.ack.Generation
+		e.policyStateMu.Unlock()
+		if !committed {
+			return
+		}
 		replayOnce.Do(func() { close(replayEntered) })
 		<-releaseReplay
 	}
@@ -1146,6 +1234,26 @@ func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
 	select {
 	case <-replayEntered:
 	case <-time.After(time.Second):
+		e.sendHistMu.Lock()
+		historyEntries := len(e.sendHist.entries)
+		e.sendHistMu.Unlock()
+		e.replayMu.Lock()
+		replayPending := e.replayPending
+		replayPendingSet := e.replayPendingSet
+		replayBarrier := e.replayPublicationBarrier
+		e.replayMu.Unlock()
+		e.policyStateMu.Lock()
+		completedTx := e.policyCompleted[prepare.TransactionID]
+		e.policyStateMu.Unlock()
+		select {
+		case err := <-commitDone:
+			t.Fatalf(
+				"committed cutover did not schedule replay after commit returned: %v; final=%+v ack=%d published=%d history=%d replay_pending=%t request=%+v barrier=%+v",
+				err, completedTx.finalAck, e.sendAckNext.Load(), e.sendPublishedNext.Load(), historyEntries,
+				replayPendingSet, replayPending, replayBarrier,
+			)
+		default:
+		}
 		t.Fatal("committed policy did not enter cutover replay")
 	}
 
@@ -1170,15 +1278,6 @@ func TestCommittedPolicyCannotExpireDuringCutoverReplay(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("policy commit did not finish after replay release")
-	}
-	close(releasePrimaryWrite)
-	select {
-	case err := <-sendDone:
-		if err != nil {
-			t.Fatalf("handed-off application write: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("handed-off application write did not return")
 	}
 
 	generation, selected, pendingExists, completed := policyTxUnitState(e, selector.ID)
@@ -1244,9 +1343,11 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 
 	replayInjected := make(chan struct{})
 	var (
-		replayOnce       sync.Once
-		savedRuntime     *executionRuntime
-		runtimeWithdrawn bool
+		replayOnce           sync.Once
+		replayHookCalls      atomic.Int32
+		injectedBeforeCommit atomic.Bool
+		savedRuntime         *executionRuntime
+		runtimeWithdrawn     bool
 	)
 	restoreRuntime := func() {
 		e.graphMu.Lock()
@@ -1257,7 +1358,18 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 		e.graphMu.Unlock()
 	}
 	defer restoreRuntime()
-	e.boundedReplayBeforeSnapshot = func() {
+	// The before-snapshot hook is also loaded by the older asynchronous replay
+	// already draining the blocked write. The after-snapshot hook is exclusive
+	// to the synchronous selector cutover whose post-commit failure is under test.
+	e.boundedReplayAfterSnapshot = func() {
+		replayHookCalls.Add(1)
+		e.policyStateMu.Lock()
+		committed := e.policyGeneration == 1 && e.policySelections[selector.ID] == peak.ID
+		e.policyStateMu.Unlock()
+		if !committed {
+			injectedBeforeCommit.Store(true)
+			return
+		}
 		replayOnce.Do(func() {
 			e.graphMu.Lock()
 			savedRuntime = e.localExec
@@ -1271,6 +1383,12 @@ func TestPeakPolicyObserverSeesCommittedTargetWhenCutoverReplayFails(t *testing.
 	err := e.SelectPeakTransferTarget(selector.ID, peak.ID, true, cause)
 	restoreRuntime()
 	releasePrimaryOnce.Do(func() { close(releasePrimaryWrite) })
+	if injectedBeforeCommit.Load() {
+		t.Fatal("cutover replay failure hook ran before the peak policy committed")
+	}
+	if got := replayHookCalls.Load(); got != 1 {
+		t.Fatalf("cutover replay failure hook calls=%d want 1", got)
+	}
 	if !errors.Is(err, ErrPolicyOutcomeUnknown) {
 		t.Fatalf("SelectPeakTransferTarget error=%v want %v", err, ErrPolicyOutcomeUnknown)
 	}

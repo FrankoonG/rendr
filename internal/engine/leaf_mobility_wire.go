@@ -18,7 +18,10 @@ import (
 // the mobility subject and currently eligible to carry its OOB control frame.
 var ErrLeafMobilityControlRouteUnavailable = errors.New("engine: leaf mobility control route unavailable")
 
-const leafMobilityControlRouteAttemptLimit = time.Second
+const (
+	leafMobilityControlRouteAttemptLimit = time.Second
+	leafMobilityResponseRetryInterval    = 5 * time.Millisecond
+)
 
 type leafMobilityControlCandidate struct {
 	ref                  PathRef
@@ -65,18 +68,20 @@ func (e *Engine) routeLeafMobilityOOB(slot *pathSlot, header proto.Header, paylo
 	if binding.SessionEpoch != proto.SessionEpoch(e.FlowID()) {
 		return nil
 	}
-	subject, ok := e.resolveLeafMobilitySubject(binding)
+	subject, subjectSlot, ok := e.resolveLeafMobilitySubject(binding)
 	if !ok {
 		return nil
 	}
-	if control == subject || e.leafMobilityControlConflictsWithBinding(slot, binding) ||
-		e.leafMobilityControlConflictsWithSubject(slot, subject) {
+	conflictsBinding := e.leafMobilityControlConflictsWithBinding(slot, binding)
+	conflictsSubject := e.leafMobilityControlConflictsWithSubject(slot, subject)
+	if control == subject || conflictsBinding || conflictsSubject {
 		// A stale exact frame can legitimately arrive after its former path was
 		// replaced. It is not an independent control route, so drop it without
 		// authorizing state or turning a harmless replay into a session close.
 		return nil
 	}
 	message.source = subject
+	message.sourceSlot = subjectSlot
 	key := leafMobilityOOBKey{source: subject, seq: header.Seq}
 	digest := recvFrameDigest(header, payload)
 	now := time.Now()
@@ -147,13 +152,14 @@ func (e *Engine) leafMobilityControlConflictsWithBinding(
 		proto.LeafMobilityResourceID(resourceID) == binding.ResourceID
 }
 
-func (e *Engine) resolveLeafMobilitySubject(binding proto.LeafMobilityPeerPlanBinding) (PathRef, bool) {
+func (e *Engine) resolveLeafMobilitySubject(binding proto.LeafMobilityPeerPlanBinding) (PathRef, *pathSlot, bool) {
 	localTarget, peerTarget := binding.SubjectClientTargetID, binding.SubjectServerTargetID
 	if e.side == SideServer {
 		localTarget, peerTarget = peerTarget, localTarget
 	}
 	e.pathsMu.RLock()
 	var subject PathRef
+	var subjectSlot *pathSlot
 	for _, slots := range []map[uint32]*pathSlot{e.paths, e.retainedPaths, e.stagedPaths} {
 		for _, candidate := range slots {
 			if candidate.localTXTargetID != localTarget || candidate.peerTXTargetID != peerTarget ||
@@ -162,14 +168,15 @@ func (e *Engine) resolveLeafMobilitySubject(binding proto.LeafMobilityPeerPlanBi
 			}
 			if subject.ID != 0 && subject != pathRefForSlot(candidate) {
 				e.pathsMu.RUnlock()
-				return PathRef{}, false
+				return PathRef{}, nil, false
 			}
 			subject = pathRefForSlot(candidate)
+			subjectSlot = candidate
 		}
 	}
 	e.pathsMu.RUnlock()
 	if subject.ID != 0 {
-		return subject, true
+		return subject, subjectSlot, true
 	}
 
 	// A transaction keeps its exact subject owner after administrative
@@ -180,25 +187,36 @@ func (e *Engine) resolveLeafMobilitySubject(binding proto.LeafMobilityPeerPlanBi
 	defer e.leafTx.mu.Unlock()
 	if outgoing := e.leafTx.outgoing; outgoing != nil &&
 		outgoing.prepare.LeafMobilityPeerPlanBinding == binding {
-		return outgoing.source, true
+		return outgoing.source, outgoing.sourceSlot, true
 	}
 	if incoming := e.leafTx.incoming[binding.TransactionID]; incoming != nil &&
 		incoming.prepare.LeafMobilityPeerPlanBinding == binding {
-		return incoming.source, true
+		return incoming.source, incoming.sourceSlot, true
 	}
 	if completed, ok := e.leafTx.completed[binding.TransactionID]; ok &&
 		completed.prepare.LeafMobilityPeerPlanBinding == binding {
-		return completed.source, true
+		return completed.source, completed.sourceSlot, true
 	}
 	if rejected, ok := e.leafTx.rejected[binding.TransactionID]; ok &&
 		rejected.prepare.LeafMobilityPeerPlanBinding == binding {
-		return rejected.source, true
+		return rejected.source, rejected.sourceSlot, true
 	}
 	if terminal, ok := e.leafTx.actorTerminal[binding.TransactionID]; ok &&
 		terminal.prepare.LeafMobilityPeerPlanBinding == binding {
-		return terminal.source, true
+		return terminal.source, terminal.sourceSlot, true
 	}
-	return PathRef{}, false
+	if source, slot, ok := e.leafTx.activeClientWinnerForServerPrepareLocked(binding); ok {
+		return source, slot, true
+	}
+	// A client-priority transaction can finish and advance the subject route
+	// generation before the crossed server PREPARE is dispatched from the
+	// sibling control path. Keep destructive lookup generation-exact, but let
+	// the completed client tombstone identify that one stale proposal so the
+	// responder can publish its immutable Busy decision.
+	if source, slot, ok := e.leafTx.completedClientWinnerForServerPrepareLocked(binding); ok {
+		return source, slot, true
+	}
+	return PathRef{}, nil, false
 }
 
 func (e *Engine) validateLeafMobilitySource(ref PathRef, plan leafmobility.Plan) (*leafmobility.Claim, *pathSlot, error) {
@@ -542,31 +560,94 @@ func (e *Engine) sendLeafMobilityAckBoundedOnSlot(
 	case <-e.closed:
 		return nil, net.ErrClosed
 	}
-	frame, sendErr, pending := e.sendLeafMobilityFrameWithContext(ctx, func(writeCtx context.Context) ([]byte, error) {
-		return e.sendLeafMobilityFrameOnSlotContext(writeCtx, ref, sourceSlot, proto.CtrlLeafMobilityAck, payload, func(frame []byte) error {
-			if onPublish != nil {
-				onPublish(frame)
+	routeRetryUntil := time.Now().Add(leafMobilityControlRouteAttemptLimit)
+	if deadline.Before(routeRetryUntil) {
+		routeRetryUntil = deadline
+	}
+	var frame []byte
+	for {
+		retryWake := e.leafMobilityRetryChannel()
+		attemptFrame, sendErr, pending := e.sendLeafMobilityFrameWithContext(ctx, func(writeCtx context.Context) ([]byte, error) {
+			if len(frame) != 0 {
+				controlRoutes, routeErr := e.leafMobilityControlRoutesWithSubject(ref, sourceSlot)
+				if routeErr != nil {
+					return frame, routeErr
+				}
+				return frame, e.writeLeafMobilityFrameOnControlRoutes(writeCtx, ref, controlRoutes, frame)
 			}
-			return nil
+			return e.sendLeafMobilityFrameOnSlotContext(writeCtx, ref, sourceSlot, proto.CtrlLeafMobilityAck, payload, func(published []byte) error {
+				if onPublish != nil {
+					onPublish(published)
+				}
+				return nil
+			})
 		})
-	})
-	if pending == nil {
-		<-e.leafTx.responseGate
-		return frame, leafMobilityResponseWriteError(sendErr)
+		if len(frame) == 0 && len(attemptFrame) != 0 {
+			frame = attemptFrame
+		}
+		if pending != nil {
+			select {
+			case outcome := <-pending:
+				if len(frame) == 0 && len(outcome.frame) != 0 {
+					frame = outcome.frame
+				}
+				<-e.leafTx.responseGate
+				return frame, leafMobilityResponseWriteError(outcome.err)
+			case <-time.After(time.Second):
+				cleanup := func() {
+					<-pending
+					<-e.leafTx.responseGate
+				}
+				if !e.startLeafMobilityAsync(cleanup) {
+					cleanup()
+				}
+				return frame, leafMobilityResponseWriteError(sendErr)
+			}
+		}
+		if sendErr == nil {
+			<-e.leafTx.responseGate
+			return frame, nil
+		}
+		if !leafMobilityResponseRouteRetryable(sendErr) {
+			<-e.leafTx.responseGate
+			return frame, leafMobilityResponseWriteError(sendErr)
+		}
+		retryDelay := time.Until(routeRetryUntil)
+		if retryDelay <= 0 {
+			<-e.leafTx.responseGate
+			return frame, leafMobilityResponseWriteError(sendErr)
+		}
+		if retryDelay > leafMobilityResponseRetryInterval {
+			retryDelay = leafMobilityResponseRetryInterval
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-retryWake:
+			stopLeafMobilityResponseTimer(timer)
+		case <-timer.C:
+		case <-ctx.Done():
+			stopLeafMobilityResponseTimer(timer)
+			<-e.leafTx.responseGate
+			return frame, leafMobilityResponseWriteError(ctx.Err())
+		case <-e.closed:
+			stopLeafMobilityResponseTimer(timer)
+			<-e.leafTx.responseGate
+			return frame, net.ErrClosed
+		}
+	}
+}
+
+func leafMobilityResponseRouteRetryable(err error) bool {
+	return err == ErrLeafMobilityControlRouteUnavailable || err == ErrStalePathRef
+}
+
+func stopLeafMobilityResponseTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
 	}
 	select {
-	case outcome := <-pending:
-		<-e.leafTx.responseGate
-		return outcome.frame, leafMobilityResponseWriteError(outcome.err)
-	case <-time.After(time.Second):
-		cleanup := func() {
-			<-pending
-			<-e.leafTx.responseGate
-		}
-		if !e.startLeafMobilityAsync(cleanup) {
-			cleanup()
-		}
-		return nil, leafMobilityResponseWriteError(sendErr)
+	case <-timer.C:
+	default:
 	}
 }
 
@@ -846,7 +927,7 @@ func (e *Engine) writeLeafMobilityFrameOnControlRoutes(
 	for index, candidate := range candidates {
 		attemptCtx, cancel := leafMobilityControlRouteAttemptContext(ctx, len(candidates)-index)
 		err := e.writeLeafMobilityFrameToControlSlot(
-			attemptCtx, subject, candidate, frame, index+1 < len(candidates),
+			attemptCtx, subject, candidate, frame,
 		)
 		cancel()
 		if err == nil {
@@ -888,17 +969,11 @@ func leafMobilityControlRouteAttemptContext(parent context.Context, remainingCan
 	return context.WithTimeout(parent, budget)
 }
 
-type leafMobilityControlWriteResult struct {
-	n   int
-	err error
-}
-
 func (e *Engine) writeLeafMobilityFrameToControlSlot(
 	ctx context.Context,
 	subject PathRef,
 	candidate leafMobilityControlCandidate,
 	frame []byte,
-	hasFallback bool,
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -923,24 +998,9 @@ func (e *Engine) writeLeafMobilityFrameToControlSlot(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !hasFallback {
-		n, err := candidate.slot.writeFrameOwned(frame)
-		if err != nil {
-			return err
-		}
-		if n != len(frame) {
-			return io.ErrShortWrite
-		}
-		candidate.slot.lastSendUnixNano.Store(nowFn().UnixNano())
-		return nil
-	}
-
-	result := make(chan leafMobilityControlWriteResult, 1)
-	go func() {
-		n, err := candidate.slot.writeFrameOwned(frame)
-		result <- leafMobilityControlWriteResult{n: n, err: err}
-	}()
-	var outcome leafMobilityControlWriteResult
+	result := make(chan pathCallbackWriteResult, 1)
+	go candidate.slot.writeFrameOwnedResult(frame, result)
+	var outcome pathCallbackWriteResult
 	select {
 	case outcome = <-result:
 	case <-ctx.Done():
@@ -948,15 +1008,21 @@ func (e *Engine) writeLeafMobilityFrameToControlSlot(
 		case outcome = <-result:
 			// Prefer an already observable write completion at the deadline.
 		default:
-			_ = candidate.slot.conn.Close()
+			// PathConn.Close must promptly unblock Write. Await that exact
+			// invocation before releasing the write permit or reporting the
+			// outcome as unknown to the transaction owner.
+			_ = candidate.slot.closeConn()
 			outcome = <-result
+			e.failPathControlWrite(candidate.slot, ctx.Err())
 			return ctx.Err()
 		}
 	}
 	if outcome.err != nil {
+		e.failPathControlWrite(candidate.slot, outcome.err)
 		return outcome.err
 	}
 	if outcome.n != len(frame) {
+		e.failPathControlWrite(candidate.slot, io.ErrShortWrite)
 		return io.ErrShortWrite
 	}
 	candidate.slot.lastSendUnixNano.Store(nowFn().UnixNano())

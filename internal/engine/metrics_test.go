@@ -246,13 +246,11 @@ func TestSchedulingEvidenceAggregatesByNodeKind(t *testing.T) {
 			want: second,
 		},
 		{
-			name: "race exposes first-arrival and unique maximum",
+			name: "race leaves outcome quality unknown without direct samples",
 			kind: proto.GraphNodeKindRace,
 			want: schedulingEvidence{
 				direction: direction,
 				live:      true,
-				latency:   metricsTestLatency(qualityStateFresh, 10, 5, 8, 2, 8_000, 80, 0),
-				stability: metricsTestStability(qualityStateFresh, 200, 1, 1, 2, 3, 3, 8_000, 80, 0),
 				speed: speedEvidence{
 					uniqueGoodput: metricsTestSpeed(qualityStateFresh, 100, 8_000, 80, 0, speedSourceAggregate),
 					capacity:      metricsTestSpeed(qualityStateFresh, 200, 8_000, 80, 0, speedSourceAggregate),
@@ -288,6 +286,39 @@ func TestSchedulingEvidenceAggregatesByNodeKind(t *testing.T) {
 	}
 }
 
+func TestSchedulingEvidenceRaceDoesNotManufactureCrossChildSample(t *testing.T) {
+	direction := proto.SenderDirectionClientToServer
+	fast := metricsTestAggregateEvidence(direction, 12, 4, 8, 9, 10, 7, 5, 8, 6, 11, 50, 80, 9_000, 100, 0)
+	stable := metricsTestAggregateEvidence(direction, 20, 2, 15, 1, 1_000_000, 0, 0, 0, 0, 0, 60, 90, 9_000, 100, 0)
+
+	got, ok := aggregateSchedulingEvidence(proto.GraphNodeKindRace, direction, []aggregateChildEvidence{
+		{evidence: fast, eligible: true},
+		{evidence: stable, eligible: true},
+	})
+	if !ok {
+		t.Fatal("race rejected valid children")
+	}
+	if got.latency.state != qualityStateUnknown || got.stability.state != qualityStateUnknown {
+		t.Fatalf("race inferred target quality from children: latency=%+v stability=%+v", got.latency, got.stability)
+	}
+}
+
+func TestSchedulingEvidenceLifetimeProgressDoesNotRankPaths(t *testing.T) {
+	direction := proto.SenderDirectionClientToServer
+	earlier := metricsTestCandidate("progress-earlier", 0, 10*time.Millisecond, 0, 100)
+	later := metricsTestCandidate("progress-later", 1, 10*time.Millisecond, 0, 100)
+	earlier.evidence.stability.progress = 1
+	later.evidence.stability.progress = 1_000_000
+
+	selected, ok := selectSelectorCandidate(direction, []selectorCandidate{later, earlier}, selectorEvidencePolicy{
+		latencyBandRatio: 0.25,
+		latencyBandFloor: time.Millisecond,
+	})
+	if !ok || selected.targetID != earlier.targetID {
+		t.Fatalf("selected=%x ok=%v, want earlier target %x; lifetime progress must not outrank manifest order", selected.targetID, ok, earlier.targetID)
+	}
+}
+
 func TestSchedulingEvidenceAggregateFreshness(t *testing.T) {
 	direction := proto.SenderDirectionClientToServer
 	fresh := metricsTestAggregateEvidence(direction, 10, 5, 8, 2, 100, 0, 0, 0, 0, 0, 100, 150, 9_000, 100, 0)
@@ -307,19 +338,19 @@ func TestSchedulingEvidenceAggregateFreshness(t *testing.T) {
 		goodputState   qualityState
 	}{
 		{
-			name:           "race uses fresh eligible evidence",
+			name:           "race child freshness cannot create target outcomes",
 			kind:           proto.GraphNodeKindRace,
 			children:       []aggregateChildEvidence{{evidence: stale, eligible: true}, {evidence: fresh, eligible: true}},
-			latencyState:   qualityStateFresh,
-			stabilityState: qualityStateFresh,
+			latencyState:   qualityStateUnknown,
+			stabilityState: qualityStateUnknown,
 			goodputState:   qualityStateFresh,
 		},
 		{
-			name:           "race reports stale when no fresh evidence exists",
+			name:           "race stale children still cannot create target outcomes",
 			kind:           proto.GraphNodeKindRace,
 			children:       []aggregateChildEvidence{{evidence: stale, eligible: true}, {evidence: unknown, eligible: true}},
-			latencyState:   qualityStateStale,
-			stabilityState: qualityStateStale,
+			latencyState:   qualityStateUnknown,
+			stabilityState: qualityStateUnknown,
 			goodputState:   qualityStateStale,
 		},
 		{
@@ -501,6 +532,7 @@ func metricsTestStability(state qualityState, progress, failures, migrationFailu
 	return stabilityEvidence{
 		state:                state,
 		progress:             progress,
+		progressKnown:        true,
 		failures:             failures,
 		migrationFailures:    migrationFailures,
 		loss:                 loss,

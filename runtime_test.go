@@ -67,7 +67,7 @@ func TestRuntimeFactoryDescriptorsValidateFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	streamDial := func(context.Context, string) (net.Conn, error) { return nil, net.ErrClosed }
-	packetDial := func(context.Context, string) (net.PacketConn, error) { return nil, net.ErrClosed }
+	packetDial := func(context.Context, string) (PacketEndpoint, error) { return PacketEndpoint{}, net.ErrClosed }
 	if err := runtime.RegisterStreamFactory("", StreamFactory{Dial: streamDial}); err == nil {
 		t.Fatal("empty stream factory name accepted")
 	}

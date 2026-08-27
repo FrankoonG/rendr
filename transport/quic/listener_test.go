@@ -368,6 +368,48 @@ func TestDatagramListenerCloseUnblocksAccept(t *testing.T) {
 	}
 }
 
+func TestStreamListenerRepeatedAcceptTimeoutsDoNotDelayClose(t *testing.T) {
+	serverTLS, _, err := devTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := Listen("127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for iteration := 0; iteration < 200; iteration++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		path, acceptErr := listener.AcceptPath(ctx)
+		cancel()
+		if path != nil {
+			_ = path.Close()
+			t.Fatalf("iteration %d returned an unexpected path", iteration)
+		}
+		if !errors.Is(acceptErr, context.DeadlineExceeded) {
+			t.Fatalf("iteration %d error = %v, want context deadline", iteration, acceptErr)
+		}
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- listener.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close exceeded the Runtime listener callback budget after repeated AcceptPath timeouts")
+	}
+	awaitTransportRelease(t, listener)
+	listener.ownershipMu.Lock()
+	retained := listener.retained
+	listener.ownershipMu.Unlock()
+	if retained != 0 {
+		t.Fatalf("listener retained %d timed-out AcceptPath leases", retained)
+	}
+}
+
 func TestStreamListenerPartialConnectionTimeoutDoesNotPoisonAccept(t *testing.T) {
 	serverTLS, clientTLS, err := devTLSConfig()
 	if err != nil {

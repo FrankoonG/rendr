@@ -31,10 +31,11 @@ type Runtime struct {
 	contextDigest  [32]byte
 	statusMu       sync.RWMutex
 
-	mu              sync.RWMutex
-	streamFactories map[string]StreamFactory
-	packetFactories map[string]PacketFactory
-	framedFactories map[string]FramedFactory
+	mu                    sync.RWMutex
+	streamFactories       map[string]StreamFactory
+	packetFactories       map[string]PacketFactory
+	framedFactories       map[string]FramedFactory
+	factoryCallbackBudget *factoryCallbackBudget
 
 	listenMu sync.Mutex
 	listener *SessionListener
@@ -94,22 +95,55 @@ type StreamFactory struct {
 	Dial func(context.Context, string) (net.Conn, error)
 }
 
+// PacketEndpoint is the caller-owned result of PacketFactory.Dial. Address is
+// deliberately not interpreted by rendr: the factory receives that opaque
+// token and returns a datagram socket plus its single peer. Before adoption,
+// rendr snapshots Peer and never retains the original object. Standard
+// *net.UDPAddr, *net.IPAddr, *net.UnixAddr, and *net.TCPAddr values are deep
+// copied and WriteTo receives a fresh value of the same concrete type. Other
+// address types become an immutable udpflow.PeerIdentity; Conn must implement
+// PacketPeerSnapshotAcceptor to acknowledge that custom representation.
+type PacketEndpoint struct {
+	Conn net.PacketConn
+	Peer net.Addr
+	// MaxDatagramSize is the largest complete datagram Conn can send and receive
+	// atomically. rendr's udpflow header consumes part of this budget. It must be
+	// a positive factual limit; zero, negative, or structurally impossible values
+	// fail factory adoption. rendr may choose a smaller adapter limit, but it
+	// never guesses a larger one.
+	MaxDatagramSize int
+}
+
+// PacketPeerSnapshotAcceptor is required when PacketEndpoint.Peer has a custom
+// concrete type. AcceptPacketPeerSnapshot runs inside the same bounded factory
+// callback as Dial. Returning nil promises that future WriteTo calls accept the
+// supplied immutable snapshot and successful ReadFrom calls return that same
+// snapshot for datagrams from the peer. rendr does not invoke methods on
+// caller-owned addresses after adoption. Rejection or panic fails adoption.
+type PacketPeerSnapshotAcceptor interface {
+	AcceptPacketPeerSnapshot(net.Addr) error
+}
+
 type PacketFactory struct {
 	// Carrier reports the factual network family beneath Dial. It does not
 	// request a mobility backend or assert ownership of the returned socket.
 	Carrier CarrierFamily
 	// Dial receives PathSpec.Address and must honor context cancellation. The
-	// returned connection must preserve datagram boundaries and provide an MTU
-	// sufficient for rendr flow framing plus the application's payload. Its
-	// Close method must return promptly and unblock concurrent I/O; rendr closes
-	// a late or conflicting result before retrying.
-	Dial func(context.Context, string) (net.PacketConn, error)
+	// returned endpoint must preserve datagram boundaries and report their
+	// factual atomic limit in PacketEndpoint.MaxDatagramSize. Peer is read only
+	// during bounded admission; the original object is never passed to WriteTo.
+	// Conn.Close must return promptly and unblock concurrent I/O; rendr closes a
+	// late or conflicting Conn before retrying.
+	Dial func(context.Context, string) (PacketEndpoint, error)
 }
 
-// FramedFactory registers an advanced carrier whose Factory already
-// returns a transport.PathConn with rendr frame boundaries. It is intended for
-// optional adapters such as QUIC and gVisor. Like the generic factories, it
-// states only carrier facts and never grants owned mobility.
+// FramedFactory registers an advanced carrier whose Factory already returns a
+// transport.PathConn with rendr frame boundaries. Packet sessions additionally
+// require each returned path to implement transport.PacketPathConn; missing or
+// invalid frame capacity fails admission. Stream sessions require only
+// transport.PathConn. It is intended for optional adapters such as QUIC and
+// gVisor. Like the generic factories, it states only carrier facts and never
+// grants owned mobility.
 type FramedFactory struct {
 	Carrier CarrierFamily
 	Factory transport.PathFactory
@@ -140,15 +174,16 @@ func newRuntimeContextWithProbe(ctx context.Context, config RuntimeConfig, probe
 		localStatus.Kernel = failedKernelFeatures(time.Now())
 	}
 	return &Runtime{
-		config:          normalized,
-		instanceID:      engine.NewInstanceID(),
-		bridges:         engine.NewBridgeTable(),
-		mobilityLedger:  engine.NewLeafMobilityPeerLedger(),
-		localStatus:     localStatus.snapshot(time.Now()),
-		contextDigest:   localStatus.Kernel.contextDigest,
-		streamFactories: make(map[string]StreamFactory),
-		packetFactories: make(map[string]PacketFactory),
-		framedFactories: make(map[string]FramedFactory),
+		config:                normalized,
+		instanceID:            engine.NewInstanceID(),
+		bridges:               engine.NewBridgeTable(),
+		mobilityLedger:        engine.NewLeafMobilityPeerLedger(),
+		localStatus:           localStatus.snapshot(time.Now()),
+		contextDigest:         localStatus.Kernel.contextDigest,
+		streamFactories:       make(map[string]StreamFactory),
+		packetFactories:       make(map[string]PacketFactory),
+		framedFactories:       make(map[string]FramedFactory),
+		factoryCallbackBudget: newFactoryCallbackBudget(maxRuntimeFactoryCallbacks),
 	}, nil
 }
 
@@ -382,16 +417,17 @@ func (r *Runtime) sessionDialer(config SessionConfig) (*sessionDialer, error) {
 	}
 	r.mu.RUnlock()
 	return &sessionDialer{
-		Root:               config.Root,
-		Runtime:            r.config,
-		PreserveL3Identity: config.PreserveL3Identity,
-		InstanceID:         r.instanceID,
-		streamFactories:    streams,
-		packetFactories:    packets,
-		framedFactories:    framed,
-		factoryCarriers:    carriers,
-		mobilityLedger:     r.mobilityLedger,
-		localStatus:        r.LocalStatus,
+		Root:                  config.Root,
+		Runtime:               r.config,
+		PreserveL3Identity:    config.PreserveL3Identity,
+		InstanceID:            r.instanceID,
+		streamFactories:       streams,
+		packetFactories:       packets,
+		framedFactories:       framed,
+		factoryCarriers:       carriers,
+		factoryCallbackBudget: r.factoryCallbackBudget,
+		mobilityLedger:        r.mobilityLedger,
+		localStatus:           r.LocalStatus,
 	}, nil
 }
 

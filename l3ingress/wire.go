@@ -1,13 +1,20 @@
 package l3ingress
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/virtualif"
 )
+
+// ErrNonCanonicalIdentity means an identity has more than one routing or wire
+// representation. The codec rejects aliases instead of silently normalizing
+// session keys.
+var ErrNonCanonicalIdentity = errors.New("l3ingress: non-canonical identity")
 
 const (
 	identityWireVersion = 1
@@ -47,8 +54,8 @@ func (id L3Identity) AppendBinary(dst []byte) ([]byte, error) {
 
 // DecodeIdentity decodes one fixed-size L3Identity metadata record.
 func DecodeIdentity(b []byte) (L3Identity, error) {
-	if len(b) < IdentityWireSize {
-		return L3Identity{}, fmt.Errorf("l3ingress: identity metadata too short: %d < %d", len(b), IdentityWireSize)
+	if len(b) != IdentityWireSize {
+		return L3Identity{}, fmt.Errorf("l3ingress: identity metadata size %d, want %d", len(b), IdentityWireSize)
 	}
 	if b[0] != identityWireVersion {
 		return L3Identity{}, fmt.Errorf("l3ingress: unsupported identity metadata version %d", b[0])
@@ -76,6 +83,13 @@ func DecodeIdentity(b []byte) (L3Identity, error) {
 		id.DstIP = netip.AddrFrom16(dst16)
 	default:
 		return L3Identity{}, fmt.Errorf("l3ingress: unsupported address family %d", family)
+	}
+	canonical, err := id.EncodeBinary()
+	if err != nil {
+		return L3Identity{}, err
+	}
+	if !bytes.Equal(canonical, b) {
+		return L3Identity{}, fmt.Errorf("%w: reserved or padding bytes are non-zero", ErrNonCanonicalIdentity)
 	}
 	return id, nil
 }
@@ -107,6 +121,12 @@ func RequirePeerEgress(ok bool) error {
 func identityAddrBytes(id L3Identity) (byte, [16]byte, [16]byte, error) {
 	var src [16]byte
 	var dst [16]byte
+	if err := requireCanonicalWireAddr("source", id.SrcIP); err != nil {
+		return 0, src, dst, err
+	}
+	if err := requireCanonicalWireAddr("destination", id.DstIP); err != nil {
+		return 0, src, dst, err
+	}
 	if id.SrcIP.Is4() && id.DstIP.Is4() {
 		src4 := id.SrcIP.As4()
 		dst4 := id.DstIP.As4()
@@ -120,4 +140,17 @@ func identityAddrBytes(id L3Identity) (byte, [16]byte, [16]byte, error) {
 		return addrFamily6, src, dst, nil
 	}
 	return 0, src, dst, fmt.Errorf("l3ingress: mixed or invalid address families: %s -> %s", id.SrcIP, id.DstIP)
+}
+
+func requireCanonicalWireAddr(endpoint string, addr netip.Addr) error {
+	if !addr.IsValid() {
+		return fmt.Errorf("%w: invalid %s address", ErrNonCanonicalIdentity, endpoint)
+	}
+	if addr.Zone() != "" {
+		return fmt.Errorf("%w: %s address zone is not representable", ErrNonCanonicalIdentity, endpoint)
+	}
+	if addr.Is4In6() || addr.Unmap() != addr {
+		return fmt.Errorf("%w: %s address is an IPv4 alias", ErrNonCanonicalIdentity, endpoint)
+	}
+	return nil
 }

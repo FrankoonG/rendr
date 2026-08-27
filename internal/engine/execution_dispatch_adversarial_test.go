@@ -1473,6 +1473,8 @@ type captureDispatchPath struct {
 	seqs []uint64
 }
 
+func (p *captureDispatchPath) MaxFrameSize() int { return testPacketFrameSize(p.PathConn) }
+
 func (p *captureDispatchPath) Write(frame []byte) (int, error) {
 	n, err := p.PathConn.Write(frame)
 	if err == nil && n == len(frame) && len(frame) >= proto.HeaderSize {

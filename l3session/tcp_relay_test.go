@@ -312,10 +312,10 @@ func TestTCPRelayPreservesFlowAcrossStreamMigration(t *testing.T) {
 	waitEcho(t, oneDone, "one")
 
 	sess, ok := relay.manager().Session(id)
-	if !ok || sess.Conn == nil {
+	if !ok || sess.Conn() == nil {
 		t.Fatalf("missing stream session: ok=%v sess=%+v", ok, sess)
 	}
-	admin := sess.Conn.(streamControl)
+	admin := sess.Conn().(streamControl)
 	_ = waitForSessionPathAttached(t, admin, "tcp-b", 3*time.Second)
 	if err := admin.SelectTarget("root", "tcp-b"); err != nil {
 		t.Fatal(err)

@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -70,8 +71,14 @@ func publishRootDeliveryTestFrame(
 	if err := e.acquireSendSlot(false, frameBytes); err != nil {
 		t.Fatal(err)
 	}
-	e.sendMu.Lock()
-	frame, err := e.buildAndPublishApplicationDataFrame(payload, runtime)
+	selectorState, selectorStateCredit, err := e.lockApplicationSendWithSelectorState(runtime)
+	if err != nil {
+		e.releaseSendSlot(false, frameBytes)
+		t.Fatal(err)
+	}
+	_, frame, err := e.buildAndPublishApplicationBundle(
+		payload, runtime, selectorState, selectorStateCredit,
+	)
 	e.sendMu.Unlock()
 	if err != nil {
 		e.releaseSendSlot(false, frameBytes)
@@ -115,13 +122,77 @@ func selectRootDeliveryTestTarget(
 	}
 }
 
+type rootDeliveryTestWireOracle struct {
+	manifest     proto.GraphManifest
+	binding      proto.GraphBinding
+	sessionEpoch proto.SessionEpoch
+	direction    proto.SenderDirection
+	states       map[uint64]proto.SelectorStatePayload
+}
+
+func newRootDeliveryTestWireOracle(
+	t *testing.T,
+	e *Engine,
+	manifest proto.GraphManifest,
+) *rootDeliveryTestWireOracle {
+	t.Helper()
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &rootDeliveryTestWireOracle{
+		manifest:     manifest,
+		binding:      proto.GraphBinding{Revision: 1, Digest: digest},
+		sessionEpoch: proto.SessionEpoch(e.FlowID()),
+		direction:    senderDirection(e.side),
+		states:       make(map[uint64]proto.SelectorStatePayload),
+	}
+}
+
+func (o *rootDeliveryTestWireOracle) observeSelectorState(t *testing.T, wire []byte) {
+	t.Helper()
+	state, err := proto.DecodeSelectorState(wire, o.manifest, o.binding)
+	if err != nil {
+		t.Fatalf("decode SELECTOR_STATE: %v", err)
+	}
+	if state.SessionEpoch != o.sessionEpoch || state.Direction != o.direction {
+		t.Fatalf("SELECTOR_STATE binding=%x/%d, want %x/%d",
+			state.SessionEpoch, state.Direction, o.sessionEpoch, o.direction)
+	}
+	if previous, exists := o.states[state.StateEpoch]; exists && !reflect.DeepEqual(previous, state) {
+		t.Fatalf("SELECTOR_STATE epoch %d changed payload", state.StateEpoch)
+	}
+	o.states[state.StateEpoch] = state
+}
+
+func (o *rootDeliveryTestWireOracle) rootState(
+	t *testing.T,
+	stateEpoch uint64,
+) (uint64, bool) {
+	t.Helper()
+	state, ok := o.states[stateEpoch]
+	if !ok {
+		t.Fatalf("DATA references unpublished SELECTOR_STATE epoch %d", stateEpoch)
+	}
+	for _, entry := range state.Entries {
+		if entry.SelectorID == o.manifest.RootID {
+			return entry.Generation, entry.DesiredTargetID == entry.EffectiveTargetID
+		}
+	}
+	t.Fatalf("SELECTOR_STATE epoch %d omits root selector", stateEpoch)
+	return 0, false
+}
+
 func readRootDeliveryTestDataFrame(
 	t *testing.T,
 	peer *sequencerTestPath,
-	peak bool,
+	oracle *rootDeliveryTestWireOracle,
 	wantPayload []byte,
 ) ([]byte, uint64, bool) {
 	t.Helper()
+	tracked := proto.GraphTracksSelectorState(oracle.manifest)
+	var pendingFrame []byte
+	var pendingStateEpoch uint64
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	for {
@@ -131,26 +202,47 @@ func readRootDeliveryTestDataFrame(
 				continue
 			}
 			header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
-			if err != nil || header.Type != proto.FrameData {
+			if err != nil {
+				continue
+			}
+			if header.Type == proto.FrameCtrl && proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlSelectorState {
+				if err := proto.ValidateSelectorStateCtrlFlags(header.Flags); err != nil {
+					t.Fatalf("invalid SELECTOR_STATE flags: %v", err)
+				}
+				oracle.observeSelectorState(t, frame[proto.HeaderSize:])
+				if len(pendingFrame) != 0 && oracle.states[pendingStateEpoch].StateEpoch != 0 {
+					generation, committed := oracle.rootState(t, pendingStateEpoch)
+					return pendingFrame, generation, committed
+				}
+				continue
+			}
+			if header.Type != proto.FrameData {
 				continue
 			}
 			payload := frame[proto.HeaderSize:]
-			generation := uint64(0)
-			committed := false
-			if peak {
-				_, committed, _, err = proto.RootOrdinalFromDataFlags(header.Flags)
+			stateEpoch := uint64(0)
+			if tracked {
+				_, err = proto.DemandFromDataFlags(tracked, header.Flags)
 				if err != nil {
 					t.Fatalf("decode PeakTransfer DATA flags 0x%x: %v", header.Flags, err)
 				}
-				generation, payload, err = proto.DecodeDataRootGeneration(payload)
+				stateEpoch, payload, err = proto.DecodeDataSelectorStateEpoch(payload)
 				if err != nil {
-					t.Fatalf("decode PeakTransfer DATA generation: %v", err)
+					t.Fatalf("decode PeakTransfer DATA state epoch: %v", err)
 				}
 			} else if header.Flags != 0 {
 				t.Fatalf("plain selector DATA flags=0x%x, want zero", header.Flags)
 			}
 			if bytes.Equal(payload, wantPayload) {
-				return frame, generation, committed
+				if !tracked {
+					return frame, 0, false
+				}
+				if _, ok := oracle.states[stateEpoch]; ok {
+					generation, committed := oracle.rootState(t, stateEpoch)
+					return frame, generation, committed
+				}
+				pendingFrame = append([]byte(nil), frame...)
+				pendingStateEpoch = stateEpoch
 			}
 		case <-timer.C:
 			t.Fatalf("timed out waiting for DATA payload %q", wantPayload)
@@ -277,7 +369,8 @@ func TestRootDeliveryPostEstablishmentLossRecoversPublishedWrite(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("published Write did not recover after matching route attach")
 			}
-			firstFrame, firstWireGeneration, _ := readRootDeliveryTestDataFrame(t, recoveryPeer, peak, firstPayload)
+			wireOracle := newRootDeliveryTestWireOracle(t, e, manifest)
+			firstFrame, firstWireGeneration, _ := readRootDeliveryTestDataFrame(t, recoveryPeer, wireOracle, firstPayload)
 			if peak && firstWireGeneration != 1 {
 				t.Fatalf("recovered first wire generation=%d, want 1", firstWireGeneration)
 			}
@@ -288,7 +381,7 @@ func TestRootDeliveryPostEstablishmentLossRecoversPublishedWrite(t *testing.T) {
 			if n, err := (&Conn{E: e}).Write(settledPayload); n != len(settledPayload) || err != nil {
 				t.Fatalf("settled Write=(%d,%v), want (%d,nil)", n, err, len(settledPayload))
 			}
-			settledFrame, settledWireGeneration, committed := readRootDeliveryTestDataFrame(t, recoveryPeer, peak, settledPayload)
+			settledFrame, settledWireGeneration, committed := readRootDeliveryTestDataFrame(t, recoveryPeer, wireOracle, settledPayload)
 			if peak && (settledWireGeneration != 1 || !committed) {
 				t.Fatalf("settled PeakTransfer generation/committed=%d/%t, want 1/true", settledWireGeneration, committed)
 			}

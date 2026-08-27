@@ -2,6 +2,7 @@ package engine
 
 import (
 	"net"
+	goruntime "runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -24,6 +25,31 @@ type selectorStallSuccessPath struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type selectorDataCloseReleasedPath struct {
+	*probeCutoverCapturePath
+	dataWriteStarted chan struct{}
+	dataWriteOnce    sync.Once
+}
+
+func newSelectorDataCloseReleasedPath() *selectorDataCloseReleasedPath {
+	return &selectorDataCloseReleasedPath{
+		probeCutoverCapturePath: newProbeCutoverCapturePath(),
+		dataWriteStarted:        make(chan struct{}),
+	}
+}
+
+func (p *selectorDataCloseReleasedPath) Write(frame []byte) (int, error) {
+	if len(frame) >= proto.HeaderSize {
+		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])
+		if err == nil && header.Type == proto.FrameData {
+			p.dataWriteOnce.Do(func() { close(p.dataWriteStarted) })
+			<-p.closed
+			return 0, net.ErrClosed
+		}
+	}
+	return p.probeCutoverCapturePath.Write(frame)
 }
 
 func (p *selectorStallSuccessPath) Write(frame []byte) (int, error) {
@@ -594,10 +620,11 @@ func TestRecursiveProbeStarvedDataSelectionPreemptsBlockedDataDispatch(t *testin
 		}
 	}
 	e.probeMu.Unlock()
-	if queuedOnA != 1 || queued.lifecycle != pathProbeDataStarved || queued.dataStallGeneration == 0 ||
-		queued.dataStallGeneration != aSlot.dispatchStallGen.Load() || !queued.deadline.IsZero() ||
+	stall, stalled := aSlot.currentDispatchStall()
+	if queuedOnA != 1 || queued.lifecycle != pathProbeDataStarved || !stalled ||
+		queued.dataStallGeneration != stall.generation || !queued.deadline.IsZero() ||
 		!queued.writeStartedAt.IsZero() || !queued.writeCommittedAt.IsZero() {
-		t.Fatalf("factual queued observation=%+v outstanding-on-A=%d dispatch-generation=%d", queued, queuedOnA, aSlot.dispatchStallGen.Load())
+		t.Fatalf("factual queued observation=%+v outstanding-on-A=%d dispatch=%+v present=%t", queued, queuedOnA, stall, stalled)
 	}
 	select {
 	case active := <-bDataActive:
@@ -865,7 +892,7 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 		runtimeNode(proto.GraphNodeKindPath, "b"),
 	)
 	limits := Limits{
-		ProbeInterval:        10 * time.Millisecond,
+		ProbeInterval:        time.Hour,
 		SelectorDwell:        time.Second,
 		SelectorCooldown:     time.Hour,
 		SelectorHysteresis:   0.25,
@@ -873,6 +900,10 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 	}.Clamp()
 	e := New(SideClient, NewClientFlowID(), limits)
 	t.Cleanup(func() { _ = e.Close() })
+	// This case seeds exact probe evidence itself. Prevent an automatic probe
+	// control write from taking the hostile path's one blocked Write before the
+	// DATA stimulus whose cutover preemption is under test.
+	e.probeStartOnce.Do(func() {})
 	e.tailReplayInitialDelay = time.Hour
 	e.tailReplayMaxBackoff = time.Hour
 	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
@@ -882,7 +913,7 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	blocked := newCloseReleasedWritePath()
+	blocked := newSelectorDataCloseReleasedPath()
 	healthy := newProbeCutoverCapturePath()
 	aID, err := e.AttachPath(blocked, transport.PathSpec{Transport: "test", Address: "a", Opts: map[string]string{"name": "a"}})
 	if err != nil {
@@ -909,6 +940,11 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 	}
 	state.qualitySince = now.Add(-time.Hour)
 	runtime.mu.Unlock()
+	migrationEvents := make(chan MigrationEvent, 1)
+	migrationSubscription := e.OnMigrationEvent(func(event MigrationEvent) {
+		migrationEvents <- event
+	})
+	defer migrationSubscription.Cancel()
 
 	writeResult := make(chan error, 1)
 	go func() {
@@ -916,7 +952,7 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 		writeResult <- err
 	}()
 	select {
-	case <-blocked.writeStarted:
+	case <-blocked.dataWriteStarted:
 	case <-time.After(time.Second):
 		t.Fatal("path A DATA write did not block")
 	}
@@ -928,7 +964,22 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 	select {
 	case <-evaluated:
 	case <-time.After(time.Second):
-		t.Fatal("quality selection remained blocked behind DATA dispatch")
+		desired, effective, selectorGeneration, selectionOK := runtime.selectorSelection(ids["root"])
+		aStall, aStalled := aSlot.currentDispatchStall()
+		bStall, bStalled := bSlot.currentDispatchStall()
+		cutoverGeneration, _ := e.selectorCutoverDispatchSnapshot()
+		stack := make([]byte, 1<<20)
+		stack = stack[:goruntime.Stack(stack, true)]
+		t.Fatalf("quality selection remained blocked behind DATA dispatch: "+
+			"active=%d migrations=%d selection=%t/%x/%x/%d cutover=%d "+
+			"A_stall=%t/%+v A_dispatch=%d/%d queue=%d "+
+			"B_stall=%t/%+v B_dispatch=%d/%d queue=%d B_frames=%+v "+
+			"ack/published=%d/%d\n%s",
+			e.ActivePath(), e.MigrationCount(), selectionOK, desired, effective, selectorGeneration,
+			cutoverGeneration,
+			aStalled, aStall, aSlot.dispatchDoneGen.Load(), aSlot.dispatchNextGen.Load(), len(aSlot.dispatchQ),
+			bStalled, bStall, bSlot.dispatchDoneGen.Load(), bSlot.dispatchNextGen.Load(), len(bSlot.dispatchQ),
+			healthy.frameHeaders(), e.sendAckNext.Load(), e.sendPublishedNext.Load(), stack)
 	}
 	select {
 	case err := <-writeResult:
@@ -940,6 +991,18 @@ func TestRecursiveQualitySelectionPreemptsBlockedDataDispatch(t *testing.T) {
 	}
 	if e.ActivePath() != bID || e.MigrationCount() != 1 {
 		t.Fatalf("quality cutover active/migrations=%d/%d want %d/1", e.ActivePath(), e.MigrationCount(), bID)
+	}
+	event := receiveMigrationEvent(t, migrationEvents)
+	if event.OldPathID != aID || event.NewPathID != bID || event.Cause != "quality" ||
+		event.Evidence.Kind != MigrationEvidenceSelector || event.Evidence.TopologyEpoch == 0 ||
+		len(event.Evidence.ProbeGenerations) != 2 {
+		t.Fatalf("quality cutover event=%+v", event)
+	}
+	first, second := event.Evidence.ProbeGenerations[0], event.Evidence.ProbeGenerations[1]
+	if first.PathID != aID || second.PathID != bID || first.PathOwner == 0 || second.PathOwner == 0 ||
+		first.PathGeneration == 0 || second.PathGeneration == 0 ||
+		first.RouteGeneration == 0 || second.RouteGeneration == 0 {
+		t.Fatalf("quality cutover generation vector=%+v", event.Evidence.ProbeGenerations)
 	}
 	deadline := time.Now().Add(time.Second)
 	for len(healthy.dataSequences()) == 0 && time.Now().Before(deadline) {

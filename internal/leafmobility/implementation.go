@@ -78,6 +78,30 @@ func MustNewImplementationEvidence(owner ImplementationProvider, drivers ...Driv
 	return evidence
 }
 
+// RebindImplementationEvidence validates source's exact-owner evidence, then
+// snapshots its canonical capabilities into evidence sealed to owner. It is
+// intended only for internal wrappers that deliberately preserve a concrete
+// implementation provider without relying on embedded method promotion.
+func RebindImplementationEvidence(
+	owner ImplementationProvider,
+	source ImplementationProvider,
+) (ImplementationEvidence, error) {
+	capabilities, err := CapabilitiesForImplementationProvider(source)
+	if err != nil {
+		return ImplementationEvidence{}, fmt.Errorf("leafmobility: validate delegated implementation: %w", err)
+	}
+	if interfaceIsNil(owner) {
+		return ImplementationEvidence{}, fmt.Errorf("%w: nil rebound owner", ErrInvalidImplementationEvidence)
+	}
+
+	evidence := ImplementationEvidence{
+		ownerType: reflect.TypeOf(owner),
+		count:     uint8(len(capabilities)),
+	}
+	copy(evidence.capabilities[:], capabilities)
+	return evidence, nil
+}
+
 // CapabilitiesForImplementationProvider validates that evidence was minted by
 // the provider's exact dynamic type and returns an independent capability
 // slice. A wrapper that only promotes an embedded provider method is rejected.

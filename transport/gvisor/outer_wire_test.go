@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 )
 
 func TestOuterDataCodecRoundTrip(t *testing.T) {
 	id := linkID{1, 2, 3}
 	secret := linkSecret{4, 5, 6}
 	payload := bytes.Repeat([]byte{0x5a}, packetMTU)
-	wire, err := encodeOuterData(id, 7, 19, payload, secret)
+	wire, err := encodeOuterData(id, 7, 19, payload, secret, leafmobility.RoleDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +20,7 @@ func TestOuterDataCodecRoundTrip(t *testing.T) {
 	if len(wire) != wantWireSize {
 		t.Fatalf("wire length=%d want=%d", len(wire), wantWireSize)
 	}
-	frame, err := decodeOuter(wire, secret)
+	frame, err := decodeOuter(wire, secret, leafmobility.RoleDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +36,7 @@ func TestOuterDataCodecRoundTrip(t *testing.T) {
 	if payload[len(payload)-1] != 0x5a {
 		t.Fatal("decoded DATA aliases caller wire storage")
 	}
-	if _, err := decodeOuter(wire, secret); !errors.Is(err, errOuterAuthentication) {
+	if _, err := decodeOuter(wire, secret, leafmobility.RoleDialer); !errors.Is(err, errOuterAuthentication) {
 		t.Fatalf("tampered DATA error=%v want authentication failure", err)
 	}
 }
@@ -62,12 +64,12 @@ func TestOuterAuthenticatedControlCodec(t *testing.T) {
 	} {
 		t.Run(string(rune('0'+typ)), func(t *testing.T) {
 			wire, err := encodeOuterControl(outerFrame{
-				Type: typ, LinkID: id, Generation: 11, Payload: payload,
+				Type: typ, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 11, Payload: payload,
 			}, secret)
 			if err != nil {
 				t.Fatal(err)
 			}
-			frame, err := decodeOuter(wire, secret)
+			frame, err := decodeOuter(wire, secret, leafmobility.RoleDialer)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -80,10 +82,10 @@ func TestOuterAuthenticatedControlCodec(t *testing.T) {
 			}
 			corrupt := append([]byte(nil), wire...)
 			corrupt[outerHeaderSize] ^= 1
-			if _, err := decodeOuter(corrupt, secret); !errors.Is(err, errOuterAuthentication) {
+			if _, err := decodeOuter(corrupt, secret, leafmobility.RoleDialer); !errors.Is(err, errOuterAuthentication) {
 				t.Fatalf("corrupt control error=%v want authentication failure", err)
 			}
-			if _, err := decodeOuter(wire, linkSecret{99}); !errors.Is(err, errOuterAuthentication) {
+			if _, err := decodeOuter(wire, linkSecret{99}, leafmobility.RoleDialer); !errors.Is(err, errOuterAuthentication) {
 				t.Fatalf("wrong-secret error=%v want authentication failure", err)
 			}
 		})
@@ -99,12 +101,13 @@ func TestOuterProgressControlCodec(t *testing.T) {
 		t.Fatal(err)
 	}
 	wire, err := encodeOuterControl(outerFrame{
-		Type: outerTypeLivenessChallenge, LinkID: id, Generation: 3, Payload: payload,
+		Type: outerTypeLivenessChallenge, Sender: leafmobility.RoleDialer,
+		LinkID: id, Generation: 3, Payload: payload,
 	}, secret)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame, err := decodeOuter(wire, secret)
+	frame, err := decodeOuter(wire, secret, leafmobility.RoleDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,12 +121,13 @@ func TestOuterProgressControlCodec(t *testing.T) {
 		t.Fatal(err)
 	}
 	wire, err = encodeOuterControl(outerFrame{
-		Type: outerTypeDataAck, LinkID: id, Generation: 4, Payload: ackPayload,
+		Type: outerTypeDataAck, Sender: leafmobility.RoleDialer,
+		LinkID: id, Generation: 4, Payload: ackPayload,
 	}, secret)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame, err = decodeOuter(wire, secret)
+	frame, err = decodeOuter(wire, secret, leafmobility.RoleDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +155,7 @@ func TestOuterAdmissionCodecBindsNonceAndSecret(t *testing.T) {
 	}
 	proof := security.admissionProof(id, clientPublic, nonce, cookie)
 	request, err := encodeOuter(outerFrame{
-		Type: outerTypeOpen, LinkID: id, Generation: 1,
+		Type: outerTypeOpen, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 1,
 		Payload: marshalOpen(clientPublic, nonce, cookie, proof),
 	}, linkSecret{})
 	if err != nil {
@@ -169,7 +173,7 @@ func TestOuterAdmissionCodecBindsNonceAndSecret(t *testing.T) {
 		!security.validateAdmissionProof(id, gotPublic, gotNonce, gotCookie, gotProof) {
 		t.Fatalf("OPEN admission binding mismatch")
 	}
-	if _, err := decodeOuter(request, linkSecret{}); err != nil {
+	if _, err := decodeOuter(request, linkSecret{}, leafmobility.RoleDialer); err != nil {
 		t.Fatal(err)
 	}
 	serverSecret, err := deriveLinkSecret(serverPrivate, clientPublic, id, nonce, security)
@@ -179,7 +183,7 @@ func TestOuterAdmissionCodecBindsNonceAndSecret(t *testing.T) {
 
 	ip := [4]byte{10, 64, 0, 1}
 	response, err := encodeOuterControl(outerFrame{
-		Type: outerTypeOpenAck, LinkID: id, Generation: 1,
+		Type: outerTypeOpenAck, Sender: leafmobility.RoleAcceptor, LinkID: id, Generation: 1,
 		Payload: marshalOpenAck(serverPublic, ip, nonce),
 	}, serverSecret)
 	if err != nil {
@@ -197,8 +201,29 @@ func TestOuterAdmissionCodecBindsNonceAndSecret(t *testing.T) {
 	if err != nil || clientSecret != serverSecret {
 		t.Fatalf("derived secret mismatch err=%v", err)
 	}
-	if _, err := decodeOuter(response, clientSecret); err != nil {
+	if _, err := decodeOuter(response, clientSecret, leafmobility.RoleAcceptor); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOuterCodecRejectsAuthenticatedReflection(t *testing.T) {
+	secret := linkSecret{0x91}
+	payload, err := marshalOuterLiveness(outerLiveness{Nonce: linkNonce{0x92}, ReceiveNext: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := encodeOuterControl(outerFrame{
+		Type: outerTypeLivenessChallenge, Sender: leafmobility.RoleAcceptor,
+		LinkID: linkID{0x93}, Generation: 1, Payload: payload,
+	}, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeOuter(wire, secret, leafmobility.RoleDialer); !errors.Is(err, errOuterSender) {
+		t.Fatalf("self-reflected acceptor frame error=%v, want sender rejection", err)
+	}
+	if _, err := decodeOuter(wire, secret, leafmobility.RoleAcceptor); err != nil {
+		t.Fatalf("peer acceptor frame rejected by dialer: %v", err)
 	}
 }
 
@@ -209,7 +234,8 @@ func TestOuterCodecRejectsMalformedEnvelopeBeforeAllocation(t *testing.T) {
 		Transaction: linkTransaction{1}, Agreement: linkAgreement{2}, Nonce: linkNonce{3}, ReceiveNext: 1,
 	})
 	valid, err := encodeOuterControl(outerFrame{
-		Type: outerTypePathCommit, LinkID: id, Generation: 2, Payload: control,
+		Type: outerTypePathCommit, Sender: leafmobility.RoleDialer,
+		LinkID: id, Generation: 2, Payload: control,
 	}, secret)
 	if err != nil {
 		t.Fatal(err)
@@ -218,6 +244,7 @@ func TestOuterCodecRejectsMalformedEnvelopeBeforeAllocation(t *testing.T) {
 		"short":           valid[:outerHeaderSize-1],
 		"bad-magic":       append([]byte(nil), valid...),
 		"bad-version":     append([]byte(nil), valid...),
+		"bad-sender":      append([]byte(nil), valid...),
 		"reserved":        append([]byte(nil), valid...),
 		"zero-link":       append([]byte(nil), valid...),
 		"zero-generation": append([]byte(nil), valid...),
@@ -225,12 +252,13 @@ func TestOuterCodecRejectsMalformedEnvelopeBeforeAllocation(t *testing.T) {
 	}
 	tests["bad-magic"][0] ^= 1
 	tests["bad-version"][4]++
-	tests["reserved"][6] = 1
+	tests["bad-sender"][6] = 0
+	tests["reserved"][7] = 1
 	clear(tests["zero-link"][8:24])
 	clear(tests["zero-generation"][24:32])
 	for name, wire := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeOuter(wire, secret); err == nil {
+			if _, err := decodeOuter(wire, secret, leafmobility.RoleDialer); err == nil {
 				t.Fatal("malformed outer datagram was accepted")
 			}
 		})
@@ -240,10 +268,10 @@ func TestOuterCodecRejectsMalformedEnvelopeBeforeAllocation(t *testing.T) {
 func FuzzOuterCodec(f *testing.F) {
 	f.Add([]byte("short"))
 	id := linkID{1}
-	wire, _ := encodeOuterData(id, 1, 1, []byte{0x45}, linkSecret{1})
+	wire, _ := encodeOuterData(id, 1, 1, []byte{0x45}, linkSecret{1}, leafmobility.RoleDialer)
 	f.Add(wire)
 	f.Fuzz(func(t *testing.T, candidate []byte) {
-		frame, err := decodeOuter(candidate, linkSecret{1})
+		frame, err := decodeOuter(candidate, linkSecret{1}, leafmobility.RoleDialer)
 		if err != nil {
 			return
 		}

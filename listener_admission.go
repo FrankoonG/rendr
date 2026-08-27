@@ -32,7 +32,7 @@ func rejectIncompatibleNegotiation(pc transport.PathConn, err error) {
 	}
 }
 
-func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID) (uint32, proto.TargetID, error) {
+func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, peerTargetID proto.TargetID, peerReceiveFrameCapacity uint32) (uint32, proto.TargetID, error) {
 	peerName, err := e.PeerPathName(peerTargetID)
 	if err != nil {
 		return 0, proto.TargetID{}, err
@@ -41,9 +41,15 @@ func attachServerPath(e *engine.Engine, pc transport.PathConn, spec PathSpec, pe
 	if err != nil {
 		return 0, proto.TargetID{}, err
 	}
+	localReceiveFrameCapacity, err := e.InspectPacketPathFrameCapacity(pc)
+	if err != nil {
+		return 0, proto.TargetID{}, err
+	}
 	id, err := e.PreparePathBound(pc, spec, engine.PathBinding{
-		LocalTXTargetID: localTargetID,
-		PeerTXTargetID:  peerTargetID,
+		LocalTXTargetID:           localTargetID,
+		PeerTXTargetID:            peerTargetID,
+		LocalReceiveFrameCapacity: localReceiveFrameCapacity,
+		PeerReceiveFrameCapacity:  peerReceiveFrameCapacity,
 	})
 	return id, localTargetID, err
 }

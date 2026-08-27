@@ -72,6 +72,13 @@ type RefreshSourceSnapshot struct {
 	usable     bool
 }
 
+// RefreshSourceLineage is an opaque, comparable source-state identity. One
+// subscription accepts exactly one lineage, so process-wide evidence
+// generations from unrelated publishers cannot supersede each other.
+type RefreshSourceLineage struct {
+	state *RefreshSourceState
+}
+
 // RefreshEmitter mints evidence bound to one exact Claim. It may be created
 // before the Claim is bound, but Observe succeeds only for a live, bound Claim
 // whose physical incarnation can be read.
@@ -266,6 +273,7 @@ func (e RefreshEvidence) ValidateFor(claim *Claim, afterGeneration uint64) (Refr
 		Generation:         e.generation,
 		EndpointGeneration: e.endpointGeneration,
 		Incarnation:        e.incarnation,
+		SourceLineage:      RefreshSourceLineage{state: e.token.source},
 		SourceGeneration:   e.source.generation,
 		SourceUsable:       e.source.usable,
 		Reason:             e.reason,
@@ -278,6 +286,7 @@ type RefreshSnapshot struct {
 	Generation         uint64
 	EndpointGeneration uint64
 	Incarnation        uint64
+	SourceLineage      RefreshSourceLineage
 	SourceGeneration   uint64
 	SourceUsable       bool
 	Reason             RefreshReason

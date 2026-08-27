@@ -124,6 +124,9 @@ func planLeafMobility(_ CarrierFamily, owned ...leafmobility.Facts) MobilityStat
 
 func projectLeafMobility(snapshot engine.LeafMobilitySnapshot) MobilityStatus {
 	baseline := planLeafMobility(CarrierUnknown, snapshot.Facts)
+	if snapshot.Facts.Generation != 0 && !snapshot.AttachedAt.IsZero() {
+		baseline.UpdatedAt = snapshot.AttachedAt
+	}
 	observation := snapshot.Initiator
 	if observation.Ref != snapshot.Ref {
 		return baseline

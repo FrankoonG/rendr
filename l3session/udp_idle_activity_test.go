@@ -141,8 +141,8 @@ func runUDPIdleReplyLoop(
 	t.Helper()
 	packetConn := &udpIdleTestPacketConn{payload: []byte("reply")}
 	session := &Session{
-		Request:    l3ingress.SessionRequest{Identity: ref.Identity, Ref: ref},
-		PacketConn: packetConn,
+		request:    l3ingress.SessionRequest{Identity: ref.Identity, Ref: ref},
+		packetConn: packetConn,
 	}
 	manager := &Manager{
 		FlowTable: table,

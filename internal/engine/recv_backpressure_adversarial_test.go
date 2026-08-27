@@ -24,6 +24,10 @@ type recvAdversarialMemoryPath struct {
 	deathFn   func(transport.DeathCause, error)
 }
 
+func (p *recvAdversarialMemoryPath) MaxFrameSize() int {
+	return 1<<16 - 1
+}
+
 func newRecvAdversarialMemoryPathPair() (*recvAdversarialMemoryPath, *recvAdversarialMemoryPath) {
 	a := &recvAdversarialMemoryPath{
 		in:     make(chan []byte, sendHistoryWindow*4),
@@ -209,9 +213,18 @@ func TestRecvBackpressureResumesWithoutLossAfterSlowReader(t *testing.T) {
 		writeDone <- nil
 	}()
 
-	waitWriteDeadlineCondition(t, 2*time.Second, func() bool {
-		return client.ReplayStats().CreditWaiters > 0
-	}, "slow-reader replay-credit backpressure")
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && client.ReplayStats().CreditWaiters == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.ReplayStats(); stats.CreditWaiters == 0 {
+		server.recvMu.Lock()
+		peerExpected := server.expectedRecvSeq
+		peerUnread := len(server.recvDeliver)
+		server.recvMu.Unlock()
+		t.Fatalf("slow-reader replay-credit backpressure was not reached: sender=%+v peer_expected=%d peer_unread=%d",
+			stats, peerExpected, peerUnread)
+	}
 	select {
 	case err := <-writeDone:
 		t.Fatalf("writer completed before the slow reader resumed: %v", err)

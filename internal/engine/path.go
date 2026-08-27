@@ -3,14 +3,29 @@ package engine
 import (
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/transport"
 )
 
-// nowFn is overridable in tests; production calls time.Now.
-var nowFn = time.Now
+type engineNowSource struct {
+	call func() time.Time
+}
+
+var engineNowOverride atomic.Pointer[engineNowSource]
+
+// nowFn uses the production wall clock unless a package test atomically
+// installs an immutable source. The indirection keeps engine-owned goroutines
+// race-safe while deterministic boundary tests advance their clock.
+func nowFn() time.Time {
+	if source := engineNowOverride.Load(); source != nil {
+		return source.call()
+	}
+	return time.Now()
+}
 
 // debugPathDeath gates a diagnostic stderr line inside onPathDeath.
 // Enabled via RENDR_DEBUG_PATH_DEATH=1; used to bisect chaos-induced
@@ -34,10 +49,23 @@ type pathDeparture struct {
 	shouldReplay    bool
 	replayCommitted bool
 	migrated        bool
+	migrationEvent  migrationEventDispatch
 	zombieTrip      zombieTripTicket
+	migrationBudget migrationBudgetEpisode
 	newActive       uint32
 	hasPaths        bool
 	peerRetirement  peerPathRetirementNotice
+}
+
+// migrationBudgetEpisode identifies one uninterrupted period with no active
+// path. Its generation and deadline are both owned by pathsMu.
+type migrationBudgetEpisode struct {
+	generation uint64
+	deadline   time.Time
+}
+
+func (episode migrationBudgetEpisode) valid() bool {
+	return episode.generation != 0 && !episode.deadline.IsZero()
 }
 
 type zombieTripTicket struct {
@@ -77,8 +105,19 @@ func (e *Engine) onPathDeath(id uint32, owner uint64, cause transport.DeathCause
 	if debugPathDeath {
 		fmt.Fprintf(os.Stderr, "[rendr-engine] path %d died: cause=%v err=%v\n", id, cause, err)
 	}
+	// Linearize physical death against receive-terminal publication. Once a
+	// normal peer BYE is ordered, carrier teardown belongs to that clean session
+	// close and must not mutate topology, emit path-death hooks, or charge the
+	// migration/zombie budgets. If death acquires this boundary first, it remains
+	// a factual transport failure and completes its topology commit normally.
+	e.peerNormalByeOrderMu.Lock()
+	if e.peerNormalByeOrdered.Load() {
+		e.peerNormalByeOrderMu.Unlock()
+		return
+	}
 	runtime := e.localExecutionRuntime()
 	e.pathsMu.Lock()
+	e.peerNormalByeOrderMu.Unlock()
 	if staged, ok := e.stagedPaths[id]; ok {
 		if staged.owner != owner {
 			e.pathsMu.Unlock()
@@ -196,30 +235,27 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 	delete(e.pathPredecessors, slot.id)
 	var restored *pathSlot
 	rollbackAllowed := slot.admissionRollback.Load()
+	if rollbackAllowed {
+		for _, predecessorID := range predecessorIDs {
+			candidate := e.retainedPaths[predecessorID]
+			if candidate != nil && (restored == nil || candidate.gen > restored.gen) {
+				restored = candidate
+			}
+		}
+	}
 	for _, predecessorID := range predecessorIDs {
 		candidate := e.retainedPaths[predecessorID]
 		if candidate == nil {
 			continue
 		}
-		delete(e.retainedPaths, predecessorID)
-		if !rollbackAllowed {
-			e.trackPathRetirementLocked(candidate)
-			candidate.closeQuit()
-			e.retirePathAsync(candidate)
+		if candidate == restored {
+			delete(e.retainedPaths, predecessorID)
 			continue
 		}
-		if restored == nil || candidate.gen > restored.gen {
-			if restored != nil {
-				e.trackPathRetirementLocked(restored)
-				restored.closeQuit()
-				e.retirePathAsync(restored)
-			}
-			restored = candidate
-		} else {
-			e.trackPathRetirementLocked(candidate)
-			candidate.closeQuit()
-			e.retirePathAsync(candidate)
-		}
+		e.trackPathRetirementLocked(candidate)
+		delete(e.retainedPaths, predecessorID)
+		candidate.closeQuit()
+		e.retirePathAsync(candidate)
 	}
 	if restored != nil {
 		restored.maintenance.Store(false)
@@ -249,7 +285,12 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 			e.setState(BridgeMigrating)
 		} else {
 			migratedOk = true
-			e.recordMigrationLocked()
+			evidence := e.routeMigrationEvidenceLocked()
+			evidence.Source = migrationPathBindingForSlot(slot)
+			evidence.Result = e.migrationPathBindingLocked(newActive)
+			departure.migrationEvent = e.recordMigrationLocked(
+				slot.id, newActive, "death", evidence,
+			)
 			if !explicitRemoval && (cause == transport.CauseTransportError || cause == transport.CauseUnknown) {
 				departure.zombieTrip = e.accountMigration()
 			}
@@ -258,12 +299,26 @@ func (e *Engine) detachPathLockedWithPeerNotification(slot *pathSlot, runtime *e
 	departure.migrated = migratedOk
 	departure.newActive = newActive
 	departure.hasPaths = len(e.paths) > 0
+	if e.activeID != 0 {
+		e.endMigrationBudgetLocked()
+	}
+	if !departure.hasPaths && (explicitRemoval ||
+		cause == transport.CauseTransportError || cause == transport.CauseUnknown) {
+		departure.migrationBudget = e.beginMigrationBudgetLocked()
+	}
 	return departure
 }
 
 func (e *Engine) finishPathDeparture(departure pathDeparture) {
 	if departure.slot == nil {
 		return
+	}
+	// The topology commit reserved this exact observer prefix. Publish it
+	// before any lifecycle continuation: serial hooks are trusted to enqueue
+	// bounded work, but a blocked or abnormal hook must not strand a factual
+	// migration or its reservation.
+	if departure.migrated {
+		e.deliverMigrationEvent(departure.migrationEvent)
 	}
 	selectorReplayScheduled := false
 	e.firePathDeathHooks(departure.event)
@@ -285,17 +340,12 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 			// owns the frozen replay prefix; only a failed transaction falls back
 			// to the generic replay worker.
 			selector := &selector{}
-			decisions, now := selector.recursiveDecisions(e, runtime)
-			for _, decision := range decisions {
-				if decision.origin == policySelectionPathDeath {
-					selectorReplayScheduled = true
-					break
-				}
-			}
+			decisions, _ := e.pathDeathAlignmentDecisions(runtime)
+			selectorReplayScheduled = len(decisions) != 0
 			if selectorReplayScheduled {
 				replayCommitted := departure.replayCommitted
 				go func() {
-					if !selector.applyRecursiveDecisionsWithReplay(e, runtime, decisions, now, !replayCommitted) && !replayCommitted {
+					if !selector.reconcilePathDeathProjection(e, runtime, !replayCommitted) && !replayCommitted {
 						e.requestReplay(e.sendAckNext.Load())
 					}
 				}()
@@ -311,16 +361,12 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 		e.requestReplay(e.sendAckNext.Load())
 	}
 
-	if departure.migrated {
-		e.fireMigrateHooks(departure.slot.id, departure.newActive, "death")
-	}
-
 	if departure.explicitRemoval {
 		// RemovePath commits only with a real survivor. If a concurrent fault
 		// consumes that survivor immediately afterward, preserve transport-loss
 		// semantics; an administrative action must never manufacture clean EOF.
 		if !departure.hasPaths {
-			go e.startMigrationBudget(departure.err)
+			go e.startMigrationBudget(departure.migrationBudget)
 		}
 		return
 	}
@@ -346,7 +392,7 @@ func (e *Engine) finishPathDeparture(departure pathDeparture) {
 		// resulting close is deferred until after pathsMu is released.
 		e.tripZombie(departure.zombieTrip)
 		if !departure.hasPaths {
-			go e.startMigrationBudget(departure.err)
+			go e.startMigrationBudget(departure.migrationBudget)
 		}
 	}
 }
@@ -432,11 +478,94 @@ func (e *Engine) tripZombie(ticket zombieTripTicket) bool {
 	return true
 }
 
-// startMigrationBudget runs as a goroutine after the last path died.
-// It either signals close (budget exceeded) or returns once a fresh
-// path attaches.
-func (e *Engine) startMigrationBudget(reason error) {
-	deadline := nowFn().Add(e.limits.MigrationBudget)
+// beginMigrationBudgetLocked returns the current zero-path episode or starts a
+// fresh one. The deadline is captured at the topology transition, not when its
+// asynchronous watcher happens to run. Caller holds pathsMu for writing.
+func (e *Engine) beginMigrationBudgetLocked() migrationBudgetEpisode {
+	if e.activeID != 0 || e.closing.Load() {
+		return migrationBudgetEpisode{}
+	}
+	if !e.zeroPathDeadline.IsZero() {
+		return migrationBudgetEpisode{
+			generation: e.zeroPathGeneration,
+			deadline:   e.zeroPathDeadline,
+		}
+	}
+	e.zeroPathGeneration++
+	if e.zeroPathGeneration == 0 {
+		e.zeroPathGeneration++
+	}
+	e.zeroPathDeadline = nowFn().Add(e.limits.MigrationBudget)
+	return migrationBudgetEpisode{
+		generation: e.zeroPathGeneration,
+		deadline:   e.zeroPathDeadline,
+	}
+}
+
+// endMigrationBudgetLocked invalidates the current zero-path episode when a
+// recovered active path is published. Caller holds pathsMu for writing.
+func (e *Engine) endMigrationBudgetLocked() {
+	if e.zeroPathDeadline.IsZero() {
+		return
+	}
+	e.zeroPathGeneration++
+	if e.zeroPathGeneration == 0 {
+		e.zeroPathGeneration++
+	}
+	e.zeroPathDeadline = time.Time{}
+}
+
+func (e *Engine) migrationBudgetEpisodeCurrent(episode migrationBudgetEpisode) bool {
+	if !episode.valid() {
+		return false
+	}
+	e.pathsMu.RLock()
+	current := e.activeID == 0 && !e.closing.Load() &&
+		e.zeroPathGeneration == episode.generation &&
+		e.zeroPathDeadline.Equal(episode.deadline)
+	e.pathsMu.RUnlock()
+	return current
+}
+
+// expireMigrationBudget performs the destructive timeout decision. The final
+// revalidation and the closing publication share pathsMu with path activation:
+// whichever commits first is authoritative.
+func (e *Engine) expireMigrationBudget(episode migrationBudgetEpisode) bool {
+	if !episode.valid() || nowFn().Before(episode.deadline) {
+		return false
+	}
+	if hook := e.migrationBudgetBeforeExpiryCommit; hook != nil {
+		hook(episode)
+	}
+	e.pathsMu.Lock()
+	if e.activeID != 0 || e.closing.Load() ||
+		e.zeroPathGeneration != episode.generation ||
+		!e.zeroPathDeadline.Equal(episode.deadline) ||
+		nowFn().Before(episode.deadline) {
+		e.pathsMu.Unlock()
+		return false
+	}
+	// Consume the episode and reject any attach that was prepared before this
+	// point but has not yet published its active path.
+	e.zeroPathGeneration++
+	if e.zeroPathGeneration == 0 {
+		e.zeroPathGeneration++
+	}
+	e.zeroPathDeadline = time.Time{}
+	e.setCloseErr(ErrMigrationBudgetExceeded)
+	e.closing.Store(true)
+	e.pathsMu.Unlock()
+	e.requestClose()
+	return true
+}
+
+// startMigrationBudget runs as a goroutine after the last path died. It either
+// commits close after the exact episode expires or returns when recovery makes
+// that episode stale.
+func (e *Engine) startMigrationBudget(episode migrationBudgetEpisode) {
+	if !episode.valid() {
+		return
+	}
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -444,15 +573,10 @@ func (e *Engine) startMigrationBudget(reason error) {
 		case <-e.closed:
 			return
 		case <-tick.C:
-			e.pathsMu.RLock()
-			has := len(e.paths) > 0
-			e.pathsMu.RUnlock()
-			if has {
+			if !e.migrationBudgetEpisodeCurrent(episode) {
 				return
 			}
-			if nowFn().After(deadline) {
-				e.setCloseErr(ErrMigrationBudgetExceeded)
-				_ = e.Close()
+			if !nowFn().Before(episode.deadline) && e.expireMigrationBudget(episode) {
 				return
 			}
 		}
@@ -462,10 +586,26 @@ func (e *Engine) startMigrationBudget(reason error) {
 // waitForPath blocks until a path attaches or the budget elapses.
 // Called from the send loop when there is no active path.
 func (e *Engine) waitForPath() error {
-	deadline := nowFn().Add(e.limits.MigrationBudget)
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	for {
+		e.pathsMu.Lock()
+		if e.activeID != 0 {
+			e.pathsMu.Unlock()
+			return nil
+		}
+		if e.closing.Load() {
+			e.pathsMu.Unlock()
+			if err := e.CloseErr(); err != nil {
+				return err
+			}
+			return net.ErrClosed
+		}
+		episode := e.beginMigrationBudgetLocked()
+		e.pathsMu.Unlock()
+		if !nowFn().Before(episode.deadline) && e.expireMigrationBudget(episode) {
+			return ErrMigrationBudgetExceeded
+		}
 		select {
 		case <-e.closed:
 			if err := e.CloseErr(); err != nil {
@@ -473,17 +613,6 @@ func (e *Engine) waitForPath() error {
 			}
 			return nil
 		case <-tick.C:
-			e.pathsMu.RLock()
-			id := e.activeID
-			e.pathsMu.RUnlock()
-			if id != 0 {
-				return nil
-			}
-			if nowFn().After(deadline) {
-				e.setCloseErr(ErrMigrationBudgetExceeded)
-				e.requestClose()
-				return ErrMigrationBudgetExceeded
-			}
 		}
 	}
 }

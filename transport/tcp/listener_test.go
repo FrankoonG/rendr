@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
@@ -51,14 +50,14 @@ func TestOwnedListenerCreatesAcceptorClaim(t *testing.T) {
 	if !ok || provider.LeafMobilityClaim() == nil {
 		t.Fatal("owned listener path has no claim")
 	}
-	facts := provider.LeafMobilityClaim().Snapshot()
-	wantOperations := leafmobility.Operation(0)
-	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
-		wantOperations = leafmobility.OperationTCPRepair
-	}
+	state := provider.LeafMobilityClaim().State()
+	facts := state.Facts
 	if facts.Kind != leafmobility.KindRawTCP || facts.Role != leafmobility.RoleAcceptor ||
-		facts.Scope != leafmobility.ScopeEndpoint || facts.Operations != wantOperations {
-		t.Fatalf("acceptor facts=%+v", facts)
+		facts.Scope != leafmobility.ScopeEndpoint {
+		t.Fatalf("acceptor state=%+v", state)
+	}
+	if state.HasDriver != facts.Operations.Has(leafmobility.OperationTCPRepair) {
+		t.Fatalf("acceptor driver/operations disagree: %+v", state)
 	}
 }
 

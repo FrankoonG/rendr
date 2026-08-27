@@ -4,7 +4,9 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +17,15 @@ const (
 	// DefaultFlowTableClosedCapacity bounds retained diagnostic snapshots when
 	// the caller leaves ClosedCapacity unset.
 	DefaultFlowTableClosedCapacity = 4096
+	// DefaultFlowRouterConcurrency bounds external routing decisions that can
+	// remain in flight when a callback ignores cancellation.
+	DefaultFlowRouterConcurrency = 64
+	// DefaultFlowRouterTimeout bounds a routing decision even when Resolve's
+	// caller did not install a deadline.
+	DefaultFlowRouterTimeout = 5 * time.Second
+	// DefaultFlowObserverTimeout preserves synchronous delivery for ordinary
+	// observers without allowing diagnostics to stall flow lifecycle forever.
+	DefaultFlowObserverTimeout = 100 * time.Millisecond
 )
 
 var (
@@ -26,6 +37,55 @@ var (
 	// operation.
 	ErrFlowGenerationExhausted = errors.New("l3ingress: flow generation exhausted")
 )
+
+// CallbackFailureReason classifies an external L3 callback failure without
+// retaining or formatting an untrusted panic payload.
+type CallbackFailureReason string
+
+const (
+	CallbackFailurePanic     CallbackFailureReason = "panic"
+	CallbackFailureGoexit    CallbackFailureReason = "goexit"
+	CallbackFailureTimeout   CallbackFailureReason = "timeout"
+	CallbackFailureSaturated CallbackFailureReason = "saturated"
+)
+
+// CallbackError is a machine-readable failure at an external callback
+// boundary. PanicType contains only the recovered value's dynamic type.
+type CallbackError struct {
+	Callback  string
+	Reason    CallbackFailureReason
+	PanicType string
+}
+
+func (e *CallbackError) Error() string {
+	if e == nil {
+		return "l3ingress: external callback failed"
+	}
+	message := "l3ingress: " + e.Callback + " callback " + string(e.Reason)
+	if e.PanicType != "" {
+		message += " (panic type " + e.PanicType + ")"
+	}
+	return message
+}
+
+// Unwrap lets timeout failures participate in errors.Is without exposing a
+// callback-owned error value.
+func (e *CallbackError) Unwrap() error {
+	if e != nil && e.Reason == CallbackFailureTimeout {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// CallbackStatus is bounded evidence for optional observer failures.
+type CallbackStatus struct {
+	Drops       uint64
+	Panics      uint64
+	Goexits     uint64
+	Timeouts    uint64
+	LastFailure CallbackError
+	HasFailure  bool
+}
 
 // FlowCloseReason is a machine-readable reason for ending a tracked
 // ingress flow.
@@ -45,6 +105,15 @@ type FlowTableOptions struct {
 	Observer       FlowObserver
 	ActiveCapacity int
 	ClosedCapacity int
+	// RouterTimeout bounds state-authoritative routing callbacks. Zero selects
+	// the package default. Executor capacity is an internal safety limit, not a
+	// caller-tunable policy setting.
+	RouterTimeout time.Duration
+	// ObserverTimeout bounds synchronous observation. A timed-out observer
+	// keeps its sole execution slot until it actually returns.
+	ObserverTimeout time.Duration
+
+	routerConcurrency int
 }
 
 // FlowRef identifies one activation generation of an L3 flow. Callers that
@@ -88,18 +157,26 @@ func (f FlowObserverFunc) ObserveFlow(snapshot FlowSnapshot) {
 // FlowTable caches the external routing decision for each L3 flow and
 // keeps basic lifecycle counters for later TUN adapters and embedders.
 type FlowTable struct {
-	mu             sync.Mutex
-	router         FlowDecisionFunc
-	now            func() time.Time
-	observer       FlowObserver
-	activeCapacity int
-	closedCapacity int
-	nextGeneration uint64
-	active         map[L3Identity]*flowRecord
-	activeOrder    list.List
-	pending        map[L3Identity]*flowPending
-	closed         map[L3Identity]*closedRecord
-	closedOrder    list.List
+	mu              sync.Mutex
+	router          FlowDecisionFunc
+	now             func() time.Time
+	observer        FlowObserver
+	activeCapacity  int
+	closedCapacity  int
+	nextGeneration  uint64
+	active          map[L3Identity]*flowRecord
+	activeOrder     list.List
+	pending         map[L3Identity]*flowPending
+	closed          map[L3Identity]*closedRecord
+	closedOrder     list.List
+	routerSlots     chan struct{}
+	routerTimeout   time.Duration
+	routerActiveMu  sync.Mutex
+	routerActive    map[L3Identity]struct{}
+	observerTimeout time.Duration
+	observerBusy    atomic.Bool
+	callbackMu      sync.Mutex
+	callbackStatus  CallbackStatus
 }
 
 type flowRecord struct {
@@ -117,7 +194,10 @@ type flowRecord struct {
 }
 
 type flowPending struct {
-	done chan struct{}
+	done     chan struct{}
+	err      error
+	shareErr bool
+	waiters  atomic.Int32
 }
 
 type closedRecord struct {
@@ -138,6 +218,15 @@ func NewFlowTable(router FlowDecisionFunc, opts FlowTableOptions) *FlowTable {
 	if opts.ClosedCapacity < 0 {
 		panic("l3ingress: closed flow table capacity must not be negative")
 	}
+	if opts.routerConcurrency < 0 {
+		panic("l3ingress: router concurrency must not be negative")
+	}
+	if opts.RouterTimeout < 0 {
+		panic("l3ingress: router timeout must not be negative")
+	}
+	if opts.ObserverTimeout < 0 {
+		panic("l3ingress: observer timeout must not be negative")
+	}
 	activeCapacity := opts.ActiveCapacity
 	if activeCapacity == 0 {
 		activeCapacity = DefaultFlowTableActiveCapacity
@@ -146,15 +235,34 @@ func NewFlowTable(router FlowDecisionFunc, opts FlowTableOptions) *FlowTable {
 	if closedCapacity == 0 {
 		closedCapacity = DefaultFlowTableClosedCapacity
 	}
+	routerConcurrency := opts.routerConcurrency
+	if routerConcurrency == 0 {
+		routerConcurrency = DefaultFlowRouterConcurrency
+	}
+	if routerConcurrency > DefaultFlowRouterConcurrency {
+		routerConcurrency = DefaultFlowRouterConcurrency
+	}
+	routerTimeout := opts.RouterTimeout
+	if routerTimeout == 0 {
+		routerTimeout = DefaultFlowRouterTimeout
+	}
+	observerTimeout := opts.ObserverTimeout
+	if observerTimeout == 0 {
+		observerTimeout = DefaultFlowObserverTimeout
+	}
 	return &FlowTable{
-		router:         router,
-		now:            now,
-		observer:       opts.Observer,
-		activeCapacity: activeCapacity,
-		closedCapacity: closedCapacity,
-		active:         make(map[L3Identity]*flowRecord),
-		pending:        make(map[L3Identity]*flowPending),
-		closed:         make(map[L3Identity]*closedRecord),
+		router:          router,
+		now:             now,
+		observer:        opts.Observer,
+		activeCapacity:  activeCapacity,
+		closedCapacity:  closedCapacity,
+		active:          make(map[L3Identity]*flowRecord),
+		pending:         make(map[L3Identity]*flowPending),
+		closed:          make(map[L3Identity]*closedRecord),
+		routerSlots:     make(chan struct{}, routerConcurrency),
+		routerTimeout:   routerTimeout,
+		routerActive:    make(map[L3Identity]struct{}),
+		observerTimeout: observerTimeout,
 	}
 }
 
@@ -182,12 +290,18 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 			return decision, false, snap, nil
 		}
 		if pending := t.pending[id]; pending != nil {
+			pending.waiters.Add(1)
 			done := pending.done
 			t.mu.Unlock()
 			select {
 			case <-done:
+				pending.waiters.Add(-1)
+				if pending.shareErr {
+					return FlowDecision{}, false, FlowSnapshot{}, pending.err
+				}
 				continue
 			case <-ctx.Done():
+				pending.waiters.Add(-1)
 				return FlowDecision{}, false, FlowSnapshot{}, ctx.Err()
 			}
 		}
@@ -207,9 +321,11 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		t.mu.Unlock()
 
 		published := false
+		var pendingErr error
+		sharePendingErr := false
 		defer func() {
 			if !published {
-				t.releasePending(id, pending)
+				t.releasePending(id, pending, pendingErr, sharePendingErr)
 			}
 		}()
 
@@ -221,8 +337,10 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		decided := false
 		if t.router != nil {
 			var err error
-			decision, err = t.router(ctx, flow)
+			decision, err = t.invokeRouter(ctx, id, flow)
 			if err != nil {
+				pendingErr = err
+				sharePendingErr = shareFlowResolveError(err)
 				return FlowDecision{}, false, FlowSnapshot{}, err
 			}
 			decision = cloneDecision(decision)
@@ -242,6 +360,8 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		t.mu.Lock()
 		if t.pending[id] != pending {
 			t.mu.Unlock()
+			pendingErr = ErrFlowTableFull
+			sharePendingErr = true
 			return FlowDecision{}, false, FlowSnapshot{}, ErrFlowTableFull
 		}
 		delete(t.pending, id)
@@ -254,6 +374,17 @@ func (t *FlowTable) Resolve(ctx context.Context, flow FlowMeta, packetLen int) (
 		t.observe(snap)
 		return cloneDecision(decision), true, snap, nil
 	}
+}
+
+// CallbackStatus returns bounded observer failure evidence. Router failures
+// are returned directly by Resolve and therefore are not duplicated here.
+func (t *FlowTable) CallbackStatus() CallbackStatus {
+	if t == nil {
+		return CallbackStatus{}
+	}
+	t.callbackMu.Lock()
+	defer t.callbackMu.Unlock()
+	return t.callbackStatus
 }
 
 // Snapshot returns one active flow snapshot.
@@ -415,13 +546,26 @@ func (t *FlowTable) recordPaths(ref FlowRef, paths []string, migrated, requireGe
 	return snap, true
 }
 
-func (t *FlowTable) releasePending(id L3Identity, pending *flowPending) {
+func (t *FlowTable) releasePending(id L3Identity, pending *flowPending, err error, shareErr bool) {
 	t.mu.Lock()
 	if t.pending[id] == pending {
 		delete(t.pending, id)
+		pending.err = err
+		pending.shareErr = shareErr
 		close(pending.done)
 	}
 	t.mu.Unlock()
+}
+
+func shareFlowResolveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var callbackErr *CallbackError
+	if errors.As(err, &callbackErr) {
+		return true
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func (t *FlowTable) closeRecordLocked(rec *flowRecord, reason FlowCloseReason, closedAt time.Time) FlowSnapshot {
@@ -456,7 +600,186 @@ func (t *FlowTable) observe(snapshot FlowSnapshot) {
 	if t == nil || t.observer == nil {
 		return
 	}
-	t.observer.ObserveFlow(cloneSnapshot(snapshot))
+	if !t.observerBusy.CompareAndSwap(false, true) {
+		t.recordObserverFailure(&CallbackError{
+			Callback: "FlowObserver.ObserveFlow",
+			Reason:   CallbackFailureSaturated,
+		})
+		return
+	}
+	releaseProcess, ok := tryAcquireL3IngressCallback(l3IngressCallbackOptional)
+	if !ok {
+		t.observerBusy.Store(false)
+		t.recordObserverFailure(&CallbackError{
+			Callback: "FlowObserver.ObserveFlow",
+			Reason:   CallbackFailureSaturated,
+		})
+		return
+	}
+	done := make(chan struct{})
+	observed := cloneSnapshot(snapshot)
+	go func() {
+		returned := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.recordObserverFailure(callbackPanicError("FlowObserver.ObserveFlow", recovered))
+			} else if !returned {
+				t.recordObserverFailure(&CallbackError{
+					Callback: "FlowObserver.ObserveFlow",
+					Reason:   CallbackFailureGoexit,
+				})
+			}
+			releaseProcess()
+			t.observerBusy.Store(false)
+			close(done)
+		}()
+		t.observer.ObserveFlow(observed)
+		returned = true
+	}()
+	timer := time.NewTimer(t.observerTimeout)
+	defer stopFlowCallbackTimer(timer)
+	select {
+	case <-done:
+	case <-timer.C:
+		select {
+		case <-done:
+		default:
+			t.recordObserverFailure(&CallbackError{
+				Callback: "FlowObserver.ObserveFlow",
+				Reason:   CallbackFailureTimeout,
+			})
+		}
+	}
+}
+
+type flowDecisionCallbackResult struct {
+	decision FlowDecision
+	err      error
+}
+
+func (t *FlowTable) invokeRouter(ctx context.Context, id L3Identity, flow FlowMeta) (FlowDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return FlowDecision{}, err
+	}
+	if !t.reserveRouterIdentity(id) {
+		return FlowDecision{}, &CallbackError{
+			Callback: "FlowDecisionFunc",
+			Reason:   CallbackFailureSaturated,
+		}
+	}
+	select {
+	case t.routerSlots <- struct{}{}:
+	default:
+		t.releaseRouterIdentity(id)
+		return FlowDecision{}, &CallbackError{
+			Callback: "FlowDecisionFunc",
+			Reason:   CallbackFailureSaturated,
+		}
+	}
+	releaseProcess, ok := tryAcquireL3IngressCallback(l3IngressCallbackAuthoritative)
+	if !ok {
+		<-t.routerSlots
+		t.releaseRouterIdentity(id)
+		return FlowDecision{}, &CallbackError{
+			Callback: "FlowDecisionFunc",
+			Reason:   CallbackFailureSaturated,
+		}
+	}
+	callbackCtx, cancel := context.WithTimeout(ctx, t.routerTimeout)
+	defer cancel()
+	results := make(chan flowDecisionCallbackResult, 1)
+	router := t.router
+	go func() {
+		result := flowDecisionCallbackResult{err: &CallbackError{
+			Callback: "FlowDecisionFunc",
+			Reason:   CallbackFailureGoexit,
+		}}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result.err = callbackPanicError("FlowDecisionFunc", recovered)
+			}
+			releaseProcess()
+			<-t.routerSlots
+			t.releaseRouterIdentity(id)
+			results <- result
+		}()
+		result.decision, result.err = router(callbackCtx, cloneFlowMeta(flow))
+	}()
+	select {
+	case result := <-results:
+		return result.decision, result.err
+	case <-callbackCtx.Done():
+		select {
+		case result := <-results:
+			return result.decision, result.err
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return FlowDecision{}, err
+		}
+		return FlowDecision{}, &CallbackError{
+			Callback: "FlowDecisionFunc",
+			Reason:   CallbackFailureTimeout,
+		}
+	}
+}
+
+func (t *FlowTable) reserveRouterIdentity(id L3Identity) bool {
+	t.routerActiveMu.Lock()
+	defer t.routerActiveMu.Unlock()
+	if _, exists := t.routerActive[id]; exists {
+		return false
+	}
+	t.routerActive[id] = struct{}{}
+	return true
+}
+
+func (t *FlowTable) releaseRouterIdentity(id L3Identity) {
+	t.routerActiveMu.Lock()
+	delete(t.routerActive, id)
+	t.routerActiveMu.Unlock()
+}
+
+func (t *FlowTable) recordObserverFailure(failure *CallbackError) {
+	if t == nil || failure == nil {
+		return
+	}
+	t.callbackMu.Lock()
+	switch failure.Reason {
+	case CallbackFailurePanic:
+		t.callbackStatus.Panics++
+	case CallbackFailureGoexit:
+		t.callbackStatus.Goexits++
+	case CallbackFailureTimeout:
+		t.callbackStatus.Timeouts++
+	case CallbackFailureSaturated:
+		t.callbackStatus.Drops++
+	}
+	t.callbackStatus.LastFailure = *failure
+	t.callbackStatus.HasFailure = true
+	t.callbackMu.Unlock()
+}
+
+func callbackPanicError(callback string, recovered any) *CallbackError {
+	panicType := "<nil>"
+	if typ := reflect.TypeOf(recovered); typ != nil {
+		panicType = typ.String()
+	}
+	return &CallbackError{
+		Callback:  callback,
+		Reason:    CallbackFailurePanic,
+		PanicType: panicType,
+	}
+}
+
+func stopFlowCallbackTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
 }
 
 func (r *flowRecord) snapshot() FlowSnapshot {

@@ -17,15 +17,23 @@ func PerformClientHelloAck(pc transport.PathConn, e *Engine, instanceID proto.In
 	if err != nil {
 		return proto.HelloAckPayload{}, err
 	}
+	localReceiveCapacity, err := e.InspectPacketPathFrameCapacity(pc)
+	if err != nil {
+		return proto.HelloAckPayload{}, err
+	}
 	payload, err := (proto.HelloPayload{
-		Negotiation:     e.LocalNegotiation(),
-		FlowID:          flowID,
-		InstanceID:      instanceID,
-		Caps:            caps,
-		InitialTargetID: targetID,
-		LocalTXManifest: e.LocalGraphManifest(),
+		Negotiation:          e.LocalNegotiation(),
+		FlowID:               flowID,
+		InstanceID:           instanceID,
+		Caps:                 caps,
+		InitialTargetID:      targetID,
+		ReceiveFrameCapacity: localReceiveCapacity,
+		LocalTXManifest:      e.LocalGraphManifest(),
 	}).Encode()
 	if err != nil {
+		return proto.HelloAckPayload{}, err
+	}
+	if err := validatePacketHandshakeFrame(proto.CtrlHello, payload, localReceiveCapacity); err != nil {
 		return proto.HelloAckPayload{}, err
 	}
 	if err := writeCtrl(pc, proto.CtrlHello, 0, payload, 0); err != nil {
@@ -51,6 +59,9 @@ func PerformClientHelloAck(pc transport.PathConn, e *Engine, instanceID proto.In
 	}
 	if ack.AcceptedPeerTargetID != targetID {
 		return proto.HelloAckPayload{}, fmt.Errorf("engine: HELLO_ACK accepted a different local target")
+	}
+	if err := ack.ValidatePeerReceiveFrameCapacity(localReceiveCapacity); err != nil {
+		return proto.HelloAckPayload{}, err
 	}
 	if err := e.AcceptPeerNegotiation(ack.Negotiation, ack.LocalTXManifest); err != nil {
 		return proto.HelloAckPayload{}, err
@@ -82,10 +93,10 @@ func PerformClientHelloAckContext(ctx context.Context, pc transport.PathConn, e 
 	case value := <-result:
 		return value.ack, value.err
 	case <-ctx.Done():
-		_ = pc.Close()
+		_ = closeExternalPathConn(pc)
 		return proto.HelloAckPayload{}, ctx.Err()
 	case <-e.Closed():
-		_ = pc.Close()
+		_ = closeExternalPathConn(pc)
 		return proto.HelloAckPayload{}, net.ErrClosed
 	}
 }
@@ -95,7 +106,11 @@ func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (p
 	if err != nil {
 		return proto.BridgeAckPayload{}, err
 	}
-	tag := newBridgeTagPayload(e, targetID)
+	localReceiveCapacity, err := e.InspectPacketPathFrameCapacity(pc)
+	if err != nil {
+		return proto.BridgeAckPayload{}, err
+	}
+	tag := newBridgeTagPayload(e, targetID, localReceiveCapacity)
 	payload := tag.Encode()
 	if err := writeCtrl(pc, proto.CtrlBridgeTag, 0, payload, 0); err != nil {
 		return proto.BridgeAckPayload{}, err
@@ -131,6 +146,9 @@ func PerformClientBridgeTagAck(pc transport.PathConn, e *Engine, name string) (p
 	if _, err := e.PeerPathName(ack.ResponderTargetID); err != nil {
 		return ack, fmt.Errorf("engine: BRIDGE_ACK responder target: %w", err)
 	}
+	if err := ack.ValidatePacketCapacities(e.Packetized(), localReceiveCapacity); err != nil {
+		return ack, err
+	}
 	return ack, nil
 }
 
@@ -159,10 +177,10 @@ func PerformClientBridgeTagAckContext(ctx context.Context, pc transport.PathConn
 	case value := <-result:
 		return value.ack, value.err
 	case <-ctx.Done():
-		_ = pc.Close()
+		_ = closeExternalPathConn(pc)
 		return proto.BridgeAckPayload{}, ctx.Err()
 	case <-e.Closed():
-		_ = pc.Close()
+		_ = closeExternalPathConn(pc)
 		return proto.BridgeAckPayload{}, net.ErrClosed
 	}
 }
@@ -193,7 +211,7 @@ func PerformBridgeAck(pc transport.PathConn, tag proto.BridgeTagPayload, instanc
 // declares the independently selected responder-TX leaf. Rejection paths may
 // use PerformBridgeAck because the responder identity is ignored unless OK.
 func PerformBridgeAckForTarget(pc transport.PathConn, tag proto.BridgeTagPayload, instanceID proto.InstanceID, responderTargetID proto.TargetID, code proto.AckCode, reason string) error {
-	payload := proto.BridgeAckPayload{
+	ack := proto.BridgeAckPayload{
 		BridgeID:          tag.BridgeID,
 		AttachID:          tag.AttachID,
 		InstanceID:        instanceID,
@@ -205,11 +223,27 @@ func PerformBridgeAckForTarget(pc transport.PathConn, tag proto.BridgeTagPayload
 		ResponderTargetID: responderTargetID,
 		Code:              code,
 		Reason:            reason,
-	}.Encode()
+	}
+	if tag.ReceiveFrameCapacity != 0 {
+		reporter, ok := pc.(transport.PacketPathConn)
+		if !ok {
+			return fmt.Errorf("%w: bridge responder has no packet capacity", ErrPacketPathCapacityUnavailable)
+		}
+		limit, err := invokeExternalPathValueCallbackForTarget("PathConn.MaxFrameSize", reporter, reporter.MaxFrameSize)
+		if err != nil {
+			return err
+		}
+		if limit <= 0 || uint64(limit) > uint64(^uint32(0)) {
+			return fmt.Errorf("%w: bridge responder capacity %d", ErrPacketPathCapacityUnavailable, limit)
+		}
+		ack.ReceiveFrameCapacity = uint32(limit)
+		ack.AcceptedPeerReceiveFrameCapacity = tag.ReceiveFrameCapacity
+	}
+	payload := ack.Encode()
 	return writeCtrl(pc, proto.CtrlBridgeAck, 0, payload, 0)
 }
 
-func newBridgeTagPayload(e *Engine, targetID proto.TargetID) proto.BridgeTagPayload {
+func newBridgeTagPayload(e *Engine, targetID proto.TargetID, receiveFrameCapacity uint32) proto.BridgeTagPayload {
 	negotiation := e.LocalNegotiation()
 	return proto.BridgeTagPayload{
 		BridgeID:               e.FlowID(),
@@ -221,6 +255,7 @@ func newBridgeTagPayload(e *Engine, targetID proto.TargetID) proto.BridgeTagPayl
 		GraphRevision:          negotiation.GraphRevision,
 		GraphDigest:            negotiation.GraphDigest,
 		TargetID:               targetID,
+		ReceiveFrameCapacity:   receiveFrameCapacity,
 	}
 }
 
@@ -243,6 +278,9 @@ func (e *Engine) ValidateBridgeBinding(tag proto.BridgeTagPayload) error {
 	}
 	if tag.Direction != peerSenderDirection(e.side) {
 		return fmt.Errorf("engine: bridge sender direction mismatch")
+	}
+	if err := tag.ValidatePacketCapacity(e.Packetized()); err != nil {
+		return err
 	}
 	node, ok := binding.manifest.Node(tag.TargetID)
 	if !ok || node.Kind != proto.GraphNodeKindPath {
@@ -279,11 +317,26 @@ func PerformBye(pc transport.PathConn, reason proto.ByeReason, seq uint64) error
 // initial control frame (HELLO or BRIDGE_TAG) before allocating an
 // engine.
 func ReadFirstFrame(pc transport.PathConn) (proto.Header, []byte, error) {
-	buf := make([]byte, MaxPayload+proto.HeaderSize)
-	n, err := pc.Read(buf)
-	if err != nil {
-		return proto.Header{}, nil, err
+	return readFirstFrameContext(context.Background(), pc)
+}
+
+func readFirstFrameContext(ctx context.Context, pc transport.PathConn) (proto.Header, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	buf := make([]byte, MaxPayload+proto.HeaderSize)
+	outcome, boundaryErr := invokeExternalPathValueCallbackContext(ctx, externalPathReadOperation, pc, func() pathCallbackWriteResult {
+		guard := pathDispatchCallbackGuard{}
+		n, err := readExternalPathConnGuarded(pc, buf, &guard)
+		return pathCallbackWriteResult{n: n, err: err}
+	})
+	if boundaryErr != nil {
+		return proto.Header{}, nil, boundaryErr
+	}
+	if outcome.err != nil {
+		return proto.Header{}, nil, outcome.err
+	}
+	n := outcome.n
 	if n < proto.HeaderSize {
 		return proto.Header{}, nil, errors.New("engine: short first frame")
 	}
@@ -303,6 +356,13 @@ func ReadFirstFrame(pc transport.PathConn) (proto.Header, []byte, error) {
 // engine's send mutex; callers using this during handshake have
 // exclusive access to the brand-new PathConn.
 func writeCtrl(pc transport.PathConn, code proto.CtrlCode, flagsExtra uint16, payload []byte, seq uint64) error {
+	return writeCtrlContext(context.Background(), pc, code, flagsExtra, payload, seq)
+}
+
+func writeCtrlContext(ctx context.Context, pc transport.PathConn, code proto.CtrlCode, flagsExtra uint16, payload []byte, seq uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	hdr := proto.Header{
 		Version: proto.Version,
 		Type:    proto.FrameCtrl,
@@ -314,9 +374,16 @@ func writeCtrl(pc transport.PathConn, code proto.CtrlCode, flagsExtra uint16, pa
 		return err
 	}
 	copy(frame[proto.HeaderSize:], payload)
-	n, err := pc.Write(frame)
-	if err == nil && n != len(frame) {
+	outcome, boundaryErr := invokeExternalPathValueCallbackContext(ctx, externalPathWriteOperation, pc, func() pathCallbackWriteResult {
+		guard := pathDispatchCallbackGuard{}
+		n, err := writeExternalPathConnGuarded(pc, frame, &guard)
+		return pathCallbackWriteResult{n: n, err: err}
+	})
+	if boundaryErr != nil {
+		return boundaryErr
+	}
+	if outcome.err == nil && outcome.n != len(frame) {
 		return io.ErrShortWrite
 	}
-	return err
+	return outcome.err
 }

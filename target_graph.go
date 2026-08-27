@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"math"
 	"reflect"
 	"sort"
 
@@ -12,7 +11,7 @@ import (
 )
 
 const (
-	targetGraphCanonicalVersion = 1
+	targetGraphCanonicalVersion = 2
 	targetGraphMaxDepth         = 32
 	targetGraphMaxNodes         = 1024
 )
@@ -247,15 +246,13 @@ func compileGraphNodeForDial(node *targetGraphNode) (compiledTarget, error) {
 			return compiledTarget{}, fmt.Errorf("rendr: path target %q has no path spec", node.name)
 		}
 		return compiledTarget{
-			paths:    []PathSpec{clonePathSpec(*node.path)},
-			pathPeak: []bool{false},
+			paths: []PathSpec{clonePathSpec(*node.path)},
 		}, nil
 	}
 
 	out := compiledTarget{peakTransfer: node.peak != nil}
 	peakNames := make(map[string]bool)
 	if node.peak != nil {
-		out.peakOptions = clonePeakTransfer(*node.peak)
 		for _, name := range node.peak.Targets {
 			peakNames[name] = true
 		}
@@ -271,11 +268,7 @@ func compileGraphNodeForDial(node *targetGraphNode) (compiledTarget, error) {
 		if err != nil {
 			return compiledTarget{}, err
 		}
-		childPeak := peakNames[child.name]
 		out.paths = append(out.paths, childPlan.paths...)
-		for _, nestedPeak := range childPlan.pathPeak {
-			out.pathPeak = append(out.pathPeak, childPeak || nestedPeak)
-		}
 		out.peakTransfer = out.peakTransfer || childPlan.peakTransfer
 	}
 	if len(out.paths) == 0 {
@@ -419,9 +412,6 @@ func (c *targetGraphCompiler) compileGroup(group GroupTarget, depth int) (*targe
 	if group.Peak != nil && group.Kind != TargetKindSelector {
 		return nil, fmt.Errorf("rendr: PeakTransfer is only valid on selector target %q", group.TargetName)
 	}
-	if group.Peak != nil && depth != 1 {
-		return nil, fmt.Errorf("rendr: PeakTransfer selector %q must be the target graph root", group.TargetName)
-	}
 
 	node := &targetGraphNode{kind: group.Kind, name: group.TargetName}
 	c.nodesByName[node.name] = node
@@ -518,11 +508,7 @@ type canonicalTargetOption struct {
 }
 
 type canonicalTargetPeak struct {
-	Targets         []string `json:"targets"`
-	SaturationRatio uint64   `json:"saturation_ratio_bits"`
-	SaturationFor   int64    `json:"saturation_for_ns"`
-	ReturnRatio     uint64   `json:"return_ratio_bits"`
-	ReturnFor       int64    `json:"return_for_ns"`
+	Targets []string `json:"targets"`
 }
 
 func (c *targetGraphCompiler) canonicalGraph(root *targetGraphNode) canonicalTargetGraph {
@@ -564,11 +550,7 @@ func canonicalizeTargetNode(node *targetGraphNode) canonicalTargetNode {
 		targets := append([]string(nil), node.peak.Targets...)
 		sort.Strings(targets)
 		canonical.Peak = &canonicalTargetPeak{
-			Targets:         targets,
-			SaturationRatio: math.Float64bits(node.peak.SaturationRatio),
-			SaturationFor:   int64(node.peak.SaturationFor),
-			ReturnRatio:     math.Float64bits(node.peak.ReturnRatio),
-			ReturnFor:       int64(node.peak.ReturnFor),
+			Targets: targets,
 		}
 	}
 	canonical.Children = make([]canonicalTargetNode, 0, len(node.children))

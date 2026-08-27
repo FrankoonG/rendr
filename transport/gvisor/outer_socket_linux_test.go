@@ -406,14 +406,14 @@ func TestLinuxSuccessorReceiverRejectsKernelTruncatedDatagram(t *testing.T) {
 	owner.startReceiver(wire)
 
 	truncatedPrefix, err := encodeOuterData(
-		owner.id, 1, 1, inboundTestPacket(owner, packetMTU, 0xa1), owner.secret,
+		owner.id, 1, 1, inboundTestPacket(owner, packetMTU, 0xa1), owner.secret, peerOuterRole(owner.role),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	oversized := append(truncatedPrefix, 0xde, 0xad)
 	validPacket := inboundTestPacket(owner, packetMTU, 0xb2)
-	valid, err := encodeOuterData(owner.id, 1, 1, validPacket, owner.secret)
+	valid, err := encodeOuterData(owner.id, 1, 1, validPacket, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}

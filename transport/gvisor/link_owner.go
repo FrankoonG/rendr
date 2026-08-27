@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -610,6 +611,7 @@ type linkOwner struct {
 	refreshCallbackGen  uint64
 	pendingRefresh      *localRefreshCommit
 
+	// Initialized before publication; runtime reads and writes must hold mu.
 	openCandidate func(context.Context, net.Addr) (*packetWire, routeObservation, error)
 	openWire      func(outerUDPMode, *net.UDPAddr, bool) (*packetWire, error)
 	observeRoute  outerRouteObserver
@@ -931,7 +933,9 @@ func (owner *linkOwner) sendPacket(packet []byte) error {
 		generation := owner.localGeneration
 		changed, done := owner.change, owner.done
 		owner.mu.Unlock()
-		encoded, err := encodeOuterData(owner.id, generation, replay.sequence, replay.packet, owner.secret)
+		encoded, err := encodeOuterData(
+			owner.id, generation, replay.sequence, replay.packet, owner.secret, owner.role,
+		)
 		if err != nil {
 			owner.sendMu.Unlock()
 			return err
@@ -1247,7 +1251,7 @@ func (owner *linkOwner) handleDatagram(wire *packetWire, remote net.Addr, datagr
 	if err != nil || header.LinkID != owner.id {
 		return
 	}
-	frame, err := decodeOuter(datagram, owner.secret)
+	frame, err := decodeOuter(datagram, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		return
 	}
@@ -1633,7 +1637,7 @@ func (owner *linkOwner) sendMaximumDataQualification(
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: typ, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: typ, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -1846,7 +1850,10 @@ func (owner *linkOwner) handlePathCommit(wire *packetWire, remote net.Addr, fram
 		}
 	}
 	if newCommit && !deferSourceUpdate && owner.refreshState != nil {
-		_, _ = owner.refreshState.Update(committedRoute.digest)
+		digest := owner.refreshSourceDigestLocked(committedRoute)
+		if _, updateErr := owner.refreshState.Update(digest); updateErr != nil {
+			owner.refreshState.Invalidate()
+		}
 	}
 	owner.mu.Unlock()
 	owner.refreshStateMu.Unlock()
@@ -1970,7 +1977,7 @@ func (owner *linkOwner) sendLiveness(
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: typ, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: typ, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -2050,7 +2057,7 @@ func (owner *linkOwner) sendControl(
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: typ, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: typ, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -2159,23 +2166,33 @@ func (owner *linkOwner) stageCandidate(
 	ctx context.Context,
 	maintenance *linkMaintenance,
 	control outerControl,
+	source linkAttemptOwnerSnapshot,
 ) (*packetWire, uint64, routeObservation, error) {
 	if maintenance == nil || maintenance.owner != owner {
 		return nil, 0, routeObservation{}, errors.New("gvisor: invalid packet-link maintenance lease")
 	}
 	owner.mu.Lock()
-	if owner.closed || owner.closing || !owner.maintenance || owner.incarnation != maintenance.incarnation {
+	if !owner.maintenance || owner.incarnation != maintenance.incarnation || !source.currentLocked(owner) {
 		owner.mu.Unlock()
-		return nil, 0, routeObservation{}, errors.New("gvisor: stale packet-link maintenance lease")
+		return nil, 0, routeObservation{}, errors.New("gvisor: stale packet-link source before staging")
 	}
-	remote := cloneAddr(owner.peerRemote)
-	proposedGeneration := owner.localGeneration + 1
+	remote := cloneAddr(source.remote)
+	proposedGeneration := source.localGeneration + 1
+	openCandidate := owner.openCandidate
 	owner.mu.Unlock()
 	if proposedGeneration == 0 {
 		return nil, 0, routeObservation{}, errors.New("gvisor: packet-link generation exhausted")
 	}
-	candidate, observation, err := owner.openCandidate(ctx, remote)
+	if openCandidate == nil {
+		return nil, 0, routeObservation{}, errors.New("gvisor: packet-link candidate opener unavailable")
+	}
+	stageCtx, stopSourceWatch := source.watch(ctx, owner)
+	defer stopSourceWatch()
+	candidate, observation, err := openCandidate(stageCtx, remote)
 	if err != nil {
+		if errors.Is(context.Cause(stageCtx), errLinkAttemptSourceChanged) {
+			return nil, 0, routeObservation{}, errLinkAttemptSourceChanged
+		}
 		return nil, 0, routeObservation{}, err
 	}
 	if candidate == nil || candidate.conn == nil || candidate.shared {
@@ -2188,16 +2205,26 @@ func (owner *linkOwner) stageCandidate(
 		candidate.close()
 		return nil, 0, routeObservation{}, fmt.Errorf("gvisor: qualify packet-link successor: %w", err)
 	}
-	challengeSent, challengeErr := owner.challengeCandidate(ctx, candidate, remote, proposedGeneration, control)
+	challengeSent, challengeErr := owner.challengeCandidate(stageCtx, candidate, remote, proposedGeneration, control)
+	if errors.Is(context.Cause(stageCtx), errLinkAttemptSourceChanged) {
+		if challengeSent {
+			return candidate, proposedGeneration, observation, errLinkAttemptSourceChanged
+		}
+		candidate.close()
+		return nil, 0, routeObservation{}, errLinkAttemptSourceChanged
+	}
 	if challengeErr != nil && !challengeSent {
 		candidate.close()
 		return nil, 0, routeObservation{}, challengeErr
 	}
 	owner.mu.Lock()
-	if owner.closed || owner.closing || !owner.maintenance || owner.incarnation != maintenance.incarnation {
+	if !owner.maintenance || owner.incarnation != maintenance.incarnation || !source.currentLocked(owner) {
 		owner.mu.Unlock()
+		if challengeSent {
+			return candidate, proposedGeneration, observation, errLinkAttemptSourceChanged
+		}
 		candidate.close()
-		return nil, 0, routeObservation{}, errors.New("gvisor: packet-link owner changed during staging")
+		return nil, 0, routeObservation{}, errLinkAttemptSourceChanged
 	}
 	owner.wires[candidate] = struct{}{}
 	owner.mu.Unlock()
@@ -2294,7 +2321,7 @@ func (owner *linkOwner) exchangeMaximumDataQualification(
 		return outerQualification{}, false, err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: requestType, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: requestType, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return outerQualification{}, false, err
@@ -2346,7 +2373,7 @@ func (owner *linkOwner) exchangeMaximumDataQualification(
 			if n != outerMaxDatagramSize || !addrEqualOnWire(candidate, source, remote) {
 				continue
 			}
-			frame, decodeErr := decodeOuter(buffer[:n], owner.secret)
+			frame, decodeErr := decodeOuter(buffer[:n], owner.secret, peerOuterRole(owner.role))
 			if decodeErr != nil || frame.Type != responseType || frame.LinkID != owner.id ||
 				frame.Generation != generation {
 				continue
@@ -2439,19 +2466,24 @@ func (owner *linkOwner) publishCandidate(
 	generation uint64,
 	control outerControl,
 	expectedRoute routeObservation,
+	source linkAttemptOwnerSnapshot,
 ) error {
 	if owner == nil || maintenance == nil || maintenance.owner != owner || candidate == nil ||
 		control == (outerControl{}) {
 		return errors.New("gvisor: invalid packet-link publish")
 	}
 	owner.mu.Lock()
-	valid := !owner.closed && !owner.closing && owner.maintenance &&
-		owner.incarnation == maintenance.incarnation && owner.localGeneration+1 == generation &&
+	sourceCurrent := source.currentLocked(owner)
+	valid := owner.maintenance && owner.incarnation == maintenance.incarnation && sourceCurrent &&
+		owner.localGeneration+1 == generation &&
 		candidate.error() == nil
-	remote := cloneAddr(owner.peerRemote)
+	remote := cloneAddr(source.remote)
 	_, staged := owner.wires[candidate]
 	private := staged && owner.active != candidate && !owner.activationPending
 	owner.mu.Unlock()
+	if !sourceCurrent {
+		return errors.New("gvisor: packet-link source changed before publication")
+	}
 	if !valid || !private {
 		return errors.New("gvisor: packet-link publish state changed")
 	}
@@ -2479,7 +2511,10 @@ func (owner *linkOwner) publishCandidate(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if owner.closed || owner.closing || !owner.maintenance || owner.incarnation != maintenance.incarnation ||
+	if !source.currentLocked(owner) {
+		return errors.New("gvisor: packet-link source changed during publication")
+	}
+	if !owner.maintenance || owner.incarnation != maintenance.incarnation ||
 		owner.localGeneration+1 != generation || candidate.error() != nil {
 		return errors.New("gvisor: packet-link publish state changed")
 	}
@@ -2650,6 +2685,7 @@ func (owner *linkOwner) rollbackCandidate(
 	candidate *packetWire,
 	generation uint64,
 	control outerControl,
+	remote net.Addr,
 ) error {
 	if owner == nil || maintenance == nil || maintenance.owner != owner {
 		return errors.New("gvisor: invalid packet-link rollback")
@@ -2661,7 +2697,7 @@ func (owner *linkOwner) rollbackCandidate(
 	}
 	owner.mu.Unlock()
 	if candidate != nil {
-		if err := owner.cancelPeerCandidate(ctx, candidate, generation, control); err != nil {
+		if err := owner.cancelPeerCandidate(ctx, candidate, generation, control, remote); err != nil {
 			return err
 		}
 		owner.mu.Lock()
@@ -2678,12 +2714,14 @@ func (owner *linkOwner) cancelPeerCandidate(
 	candidate *packetWire,
 	generation uint64,
 	control outerControl,
+	remote net.Addr,
 ) error {
-	if candidate == nil || generation == 0 || control == (outerControl{}) {
+	if candidate == nil || generation == 0 || control == (outerControl{}) || remote == nil {
 		return errors.New("gvisor: invalid peer candidate cancellation")
 	}
+	remote = cloneAddr(remote)
 	if !candidate.receiving.Load() {
-		return owner.cancelPeerCandidateDirect(ctx, candidate, generation, control)
+		return owner.cancelPeerCandidateDirect(ctx, candidate, generation, control, remote)
 	}
 	key := controlKey{typ: outerTypePathAbortAck, generation: generation, control: control}
 	waiter, cancelWaiter, err := owner.registerWaiter(key)
@@ -2697,7 +2735,6 @@ func (owner *linkOwner) cancelPeerCandidate(
 			owner.mu.Unlock()
 			return net.ErrClosed
 		}
-		remote := cloneAddr(owner.peerRemote)
 		owner.mu.Unlock()
 		if err := owner.sendControl(ctx, candidate, remote, outerTypePathAbort, generation, control); err != nil {
 			return err
@@ -2737,13 +2774,18 @@ func (owner *linkOwner) cancelPeerCandidateDirect(
 	candidate *packetWire,
 	generation uint64,
 	control outerControl,
+	remote net.Addr,
 ) error {
+	if remote == nil {
+		return errors.New("gvisor: packet-link rollback has no qualified peer remote")
+	}
+	remote = cloneAddr(remote)
 	payload, err := marshalOuterControl(control)
 	if err != nil {
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: outerTypePathAbort, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: outerTypePathAbort, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -2759,7 +2801,6 @@ func (owner *linkOwner) cancelPeerCandidateDirect(
 			owner.mu.Unlock()
 			return net.ErrClosed
 		}
-		remote := cloneAddr(owner.peerRemote)
 		owner.mu.Unlock()
 		n, writeErr := candidate.writeTo(ctx, datagram, remote)
 		if writeErr != nil || n != len(datagram) {
@@ -2786,7 +2827,7 @@ func (owner *linkOwner) cancelPeerCandidateDirect(
 				}
 				return readErr
 			}
-			frame, decodeErr := decodeOuter(buffer[:n], owner.secret)
+			frame, decodeErr := decodeOuter(buffer[:n], owner.secret, peerOuterRole(owner.role))
 			if decodeErr != nil || frame.Type != outerTypePathAbortAck || frame.LinkID != owner.id ||
 				frame.Generation != generation || !addrEqualOnWire(candidate, source, remote) {
 				continue
@@ -3010,7 +3051,7 @@ func (owner *linkOwner) subscribeRefresh(
 		owner.mu.Unlock()
 		return nil, errors.New("gvisor: packet-link changed during refresh subscription")
 	}
-	if _, err := owner.refreshState.Update(observation.digest); err != nil {
+	if _, err := owner.refreshState.Update(owner.refreshSourceDigestLocked(observation)); err != nil {
 		owner.mu.Unlock()
 		return nil, err
 	}
@@ -3220,7 +3261,7 @@ func (owner *linkOwner) probeLiveness(ctx context.Context) {
 		owner.mu.Unlock()
 		return
 	}
-	if now.Sub(owner.livenessLastAck) >= outerLivenessFailure && len(owner.replayPackets) != 0 {
+	if now.Sub(owner.livenessLastAck) >= owner.livenessFailureThreshold() && len(owner.replayPackets) != 0 {
 		owner.mu.Unlock()
 		if !owner.publishWireFailure(leafmobility.RefreshReasonLinkUnresponsive) {
 			owner.failClosed(errPacketLivenessTimeout)
@@ -3270,6 +3311,17 @@ func (owner *linkOwner) probeLiveness(ctx context.Context) {
 		owner.mu.Unlock()
 		owner.publishWireFailure(leafmobility.RefreshReasonLocalWriteFailure)
 	}
+}
+
+func (owner *linkOwner) livenessFailureThreshold() time.Duration {
+	if owner != nil && owner.role == leafmobility.RoleAcceptor {
+		// Both endpoints observe a silent shared-link blackhole. Give the
+		// dialer one monitor tick to publish the protocol's client-priority
+		// transaction before the acceptor starts a redundant server actor.
+		// Asymmetric route/read/write failures bypass this liveness threshold.
+		return outerLivenessFailure + outerLivenessTick
+	}
+	return outerLivenessFailure
 }
 
 func (owner *linkOwner) resetLivenessLocked(now time.Time) {
@@ -3455,7 +3507,7 @@ func (owner *linkOwner) sendDataAck(ctx context.Context) error {
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: outerTypeDataAck, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: outerTypeDataAck, Sender: owner.role, LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -3540,7 +3592,9 @@ func (owner *linkOwner) replayOnCurrent(ctx context.Context) error {
 		remote := cloneAddr(owner.peerRemote)
 		generation := owner.localGeneration
 		owner.mu.Unlock()
-		encoded, err := encodeOuterData(owner.id, generation, replay.sequence, replay.packet, owner.secret)
+		encoded, err := encodeOuterData(
+			owner.id, generation, replay.sequence, replay.packet, owner.secret, owner.role,
+		)
 		if err == nil {
 			var n int
 			n, err = wire.writeTo(ctx, encoded, remote)
@@ -3578,7 +3632,9 @@ func (owner *linkOwner) replayOnCandidate(
 	}
 	owner.mu.Unlock()
 	for _, replay := range packets {
-		encoded, err := encodeOuterData(owner.id, generation, replay.sequence, replay.packet, owner.secret)
+		encoded, err := encodeOuterData(
+			owner.id, generation, replay.sequence, replay.packet, owner.secret, owner.role,
+		)
 		if err != nil {
 			return err
 		}
@@ -3631,7 +3687,7 @@ func (owner *linkOwner) observeRefresh(ctx context.Context) bool {
 		}
 		return stateErr == nil
 	}
-	snapshot, stateErr := owner.refreshState.Update(observation.digest)
+	snapshot, stateErr := owner.refreshState.Update(owner.refreshSourceDigestLocked(observation))
 	if stateErr != nil {
 		owner.mu.Unlock()
 		owner.refreshStateMu.Unlock()
@@ -3669,6 +3725,32 @@ type outerRefreshRouteSnapshot struct {
 	remote                          net.Addr
 	localGeneration, peerGeneration uint64
 	incarnation                     uint64
+}
+
+// refreshSourceDigestLocked binds route evidence to the exact packet-link
+// owner generation. A relay can preserve the server-visible UDP tuple while a
+// peer commit advances generation, so route evidence alone cannot revoke an
+// already-minted mobility attempt.
+func (owner *linkOwner) refreshSourceDigestLocked(observation routeObservation) [sha256.Size]byte {
+	if owner == nil || observation.digest == ([sha256.Size]byte{}) || owner.id == (linkID{}) ||
+		owner.incarnation == 0 || owner.localGeneration == 0 || owner.peerGeneration == 0 {
+		return [sha256.Size]byte{}
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("GVRS1"))
+	_, _ = hash.Write(owner.id[:])
+	_, _ = hash.Write(owner.virtualIP[:])
+	var scalar [8]byte
+	binary.BigEndian.PutUint64(scalar[:], owner.incarnation)
+	_, _ = hash.Write(scalar[:])
+	binary.BigEndian.PutUint64(scalar[:], owner.localGeneration)
+	_, _ = hash.Write(scalar[:])
+	binary.BigEndian.PutUint64(scalar[:], owner.peerGeneration)
+	_, _ = hash.Write(scalar[:])
+	_, _ = hash.Write(observation.digest[:])
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 func (owner *linkOwner) refreshRouteSnapshotCurrentLocked(source outerRefreshRouteSnapshot) bool {
@@ -3751,14 +3833,14 @@ func (owner *linkOwner) commitRefresh(evidence leafmobility.RefreshEvidence) err
 		owner.mu.Unlock()
 		return errors.New("gvisor: staged packet-link refresh baseline is no longer current")
 	}
-	digest := pending.route.digest
-	owner.routeBaseline = digest
+	routeDigest := pending.route.digest
+	owner.routeBaseline = routeDigest
 	owner.refreshSent = [sha256.Size]byte{}
 	owner.wireFault = false
 	owner.wireFaultReason = leafmobility.RefreshReasonInvalid
 	owner.pendingRefresh = nil
 	owner.resetLivenessLocked(time.Now())
-	_, err := owner.refreshState.Update(digest)
+	_, err := owner.refreshState.Update(owner.refreshSourceDigestLocked(pending.route))
 	owner.mu.Unlock()
 	return err
 }

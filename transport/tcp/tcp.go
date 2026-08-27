@@ -194,6 +194,11 @@ type PathConn struct {
 	reads  atomic.Uint64
 }
 
+// MaxFrameSize reports the largest complete rendr frame accepted by the
+// length-prefixed stream carrier. It is used only when this path carries a
+// packet session.
+func (*PathConn) MaxFrameSize() int { return MaxFrameSize }
+
 // Writes returns the cumulative count of successful Write calls
 // that put a framed unit on the wire.
 func (p *PathConn) Writes() uint64 { return p.writes.Load() }
@@ -665,6 +670,8 @@ func (p *PathConn) RemoteAddr() string {
 	}
 	return ""
 }
+
+var _ transport.PacketPathConn = (*PathConn)(nil)
 
 func (p *PathConn) readFull(buf []byte) error {
 	for offset := 0; offset < len(buf); {

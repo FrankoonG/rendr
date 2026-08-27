@@ -78,9 +78,9 @@ func TestMobilityCapabilityCollectorIgnoresGenericFactoryMetadata(t *testing.T) 
 	}
 	if err := runtime.RegisterPacketFactory("quic-cid-rebind", PacketFactory{
 		Carrier: CarrierTCP,
-		Dial: func(context.Context, string) (net.PacketConn, error) {
+		Dial: func(context.Context, string) (PacketEndpoint, error) {
 			packetDials.Add(1)
-			return nil, errors.New("unexpected packet dial")
+			return PacketEndpoint{}, errors.New("unexpected packet dial")
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestMobilityCapabilityListenerIgnoresGenericSources(t *testing.T) {
 
 	listener, err := runtime.Listen(ListenConfig{
 		Streams: []StreamSource{{Name: "tcp-repair", Carrier: CarrierTCP, Listener: stream}},
-		Packets: []PacketSource{{Name: "quic-cid", Carrier: CarrierUDP, Conn: packet}},
+		Packets: []PacketSource{{Name: "quic-cid", Carrier: CarrierUDP, Conn: packet, MaxDatagramSize: 1400}},
 	})
 	if err != nil {
 		t.Fatal(err)

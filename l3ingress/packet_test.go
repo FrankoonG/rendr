@@ -148,6 +148,58 @@ func TestParseRejectsShortPacket(t *testing.T) {
 	assertReason(t, err, ReasonShortPacket)
 }
 
+func TestParseRejectsUndersizedTransportHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		version   int
+		protocol  Protocol
+		headerLen int
+	}{
+		{name: "ipv4-tcp", version: 4, protocol: ProtocolTCP, headerLen: 19},
+		{name: "ipv4-udp", version: 4, protocol: ProtocolUDP, headerLen: 7},
+		{name: "ipv6-tcp", version: 6, protocol: ProtocolTCP, headerLen: 19},
+		{name: "ipv6-udp", version: 6, protocol: ProtocolUDP, headerLen: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParsePacket(undersizedTransportPacket(tc.version, tc.protocol, tc.headerLen))
+			assertReason(t, err, ReasonShortPacket)
+		})
+	}
+}
+
+func TestParseRejectsInvalidTransportDeclaredLengths(t *testing.T) {
+	t.Run("tcp data offset below minimum", func(t *testing.T) {
+		packet := ipv4Packet(byte(ProtocolTCP), [4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
+		packet[32] = 4 << 4
+		_, err := ParsePacket(packet)
+		assertReason(t, err, ReasonInvalidHeader)
+	})
+
+	t.Run("tcp data offset beyond IP payload", func(t *testing.T) {
+		packet := ipv4Packet(byte(ProtocolTCP), [4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
+		packet[32] = 15 << 4
+		_, err := ParsePacket(packet)
+		assertReason(t, err, ReasonShortPacket)
+	})
+
+	for _, test := range []struct {
+		name   string
+		length uint16
+		reason ParseReason
+	}{
+		{name: "udp below header", length: 7, reason: ReasonInvalidHeader},
+		{name: "udp beyond IP payload", length: 21, reason: ReasonShortPacket},
+		{name: "udp leaves undeclared IP bytes", length: 8, reason: ReasonInvalidHeader},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packet := ipv4Packet(byte(ProtocolUDP), [4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 53)
+			binary.BigEndian.PutUint16(packet[24:26], test.length)
+			_, err := ParsePacket(packet)
+			assertReason(t, err, test.reason)
+		})
+	}
+}
+
 func assertReason(t *testing.T, err error, reason ParseReason) {
 	t.Helper()
 	var pe *ParseError
@@ -169,6 +221,12 @@ func ipv4Packet(proto byte, src, dst [4]byte, srcPort, dstPort uint16) []byte {
 	copy(pkt[16:20], dst[:])
 	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
 	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	if Protocol(proto) == ProtocolTCP {
+		pkt[32] = 5 << 4
+	}
+	if Protocol(proto) == ProtocolUDP {
+		binary.BigEndian.PutUint16(pkt[24:26], uint16(len(pkt)-20))
+	}
 	return pkt
 }
 
@@ -183,5 +241,40 @@ func ipv6Packet(proto byte, src, dst netip.Addr, srcPort, dstPort uint16) []byte
 	copy(pkt[24:40], dst16[:])
 	binary.BigEndian.PutUint16(pkt[40:42], srcPort)
 	binary.BigEndian.PutUint16(pkt[42:44], dstPort)
+	if Protocol(proto) == ProtocolTCP {
+		pkt[52] = 5 << 4
+	}
+	if Protocol(proto) == ProtocolUDP {
+		binary.BigEndian.PutUint16(pkt[44:46], uint16(len(pkt)-40))
+	}
 	return pkt
+}
+
+func undersizedTransportPacket(version int, protocol Protocol, headerLen int) []byte {
+	if version == 4 {
+		packet := make([]byte, 20+headerLen)
+		packet[0] = 0x45
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		packet[8] = 64
+		packet[9] = byte(protocol)
+		if protocol == ProtocolTCP && headerLen > 12 {
+			packet[32] = 5 << 4
+		}
+		if protocol == ProtocolUDP && headerLen >= 8 {
+			binary.BigEndian.PutUint16(packet[24:26], uint16(headerLen))
+		}
+		return packet
+	}
+	packet := make([]byte, 40+headerLen)
+	packet[0] = 0x60
+	packet[6] = byte(protocol)
+	packet[7] = 64
+	binary.BigEndian.PutUint16(packet[4:6], uint16(headerLen))
+	if protocol == ProtocolTCP && headerLen > 12 {
+		packet[52] = 5 << 4
+	}
+	if protocol == ProtocolUDP && headerLen >= 8 {
+		binary.BigEndian.PutUint16(packet[44:46], uint16(headerLen))
+	}
+	return packet
 }

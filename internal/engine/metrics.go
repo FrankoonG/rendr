@@ -35,11 +35,13 @@ type latencyEvidence struct {
 }
 
 // stabilityEvidence is a vector over one bounded scheduling window. Progress
-// is unique delivered payload and is preferred high; all other fields are
-// adverse event counts and are preferred low.
+// is preferred high only when both candidates have observed progress; absence
+// of progress evidence is not equivalent to a measured zero. All other fields
+// are adverse event counts and are preferred low.
 type stabilityEvidence struct {
 	state                qualityState
 	progress             uint64
+	progressKnown        bool
 	failures             uint64
 	migrationFailures    uint64
 	loss                 uint64
@@ -201,61 +203,9 @@ func (m *aggregateMeta) include(confidence evidenceConfidence, sampleTime time.T
 }
 
 func aggregateRaceLatency(children []aggregateChildEvidence) latencyEvidence {
-	state := raceLatencyState(children)
-	if state == qualityStateUnknown {
-		return latencyEvidence{}
-	}
-
-	var out latencyEvidence
-	var meta aggregateMeta
-	set := false
-	for i := range children {
-		child := children[i]
-		value := child.evidence.latency
-		if !child.eligible || !child.evidence.live || value.state != state || !value.observed() {
-			continue
-		}
-		if !set {
-			out.latest = value.latest
-			out.minimum = value.minimum
-			out.ewma = value.ewma
-			out.jitter = value.jitter
-			set = true
-		} else {
-			out.latest = minDuration(out.latest, value.latest)
-			out.minimum = minDuration(out.minimum, value.minimum)
-			out.ewma = minDuration(out.ewma, value.ewma)
-			out.jitter = minDuration(out.jitter, value.jitter)
-		}
-		meta.include(value.confidence, value.sampleTime, value.sampleCount)
-	}
-	if !set {
-		return latencyEvidence{}
-	}
-	out.state = state
-	out.confidence = meta.confidence
-	out.sampleTime = meta.sampleTime
-	out.sampleCount = meta.sampleCount
-	return out
-}
-
-func raceLatencyState(children []aggregateChildEvidence) qualityState {
-	hasStale := false
-	for i := range children {
-		child := children[i]
-		value := child.evidence.latency
-		if !child.eligible || !child.evidence.live || !value.observed() {
-			continue
-		}
-		if value.state == qualityStateFresh {
-			return qualityStateFresh
-		}
-		hasStale = true
-	}
-	if hasStale {
-		return qualityStateStale
-	}
-	return qualityStateUnknown
+	// First-arrival latency requires an observed winning delivery. Child RTTs
+	// and cumulative ACKs do not identify that event.
+	return latencyEvidence{}
 }
 
 func aggregateBondLatency(children []aggregateChildEvidence) latencyEvidence {
@@ -300,71 +250,9 @@ func aggregateBondLatency(children []aggregateChildEvidence) latencyEvidence {
 }
 
 func aggregateRaceStability(children []aggregateChildEvidence) stabilityEvidence {
-	state := raceStabilityState(children)
-	if state == qualityStateUnknown {
-		return stabilityEvidence{}
-	}
-
-	var out stabilityEvidence
-	var meta aggregateMeta
-	set := false
-	lossKnown := true
-	hasEligible := false
-	for i := range children {
-		child := children[i]
-		if child.eligible && child.evidence.live {
-			hasEligible = true
-			lossKnown = lossKnown && child.evidence.stability.lossKnown
-		}
-		value := child.evidence.stability
-		if !child.eligible || value.state != state || !value.observed() {
-			continue
-		}
-		if !set {
-			out.progress = value.progress
-			out.failures = value.failures
-			out.migrationFailures = value.migrationFailures
-			out.loss = value.loss
-			out.reorder = value.reorder
-			set = true
-		} else {
-			out.progress = maxUint64(out.progress, value.progress)
-			out.failures = minUint64(out.failures, value.failures)
-			out.migrationFailures = minUint64(out.migrationFailures, value.migrationFailures)
-			out.loss = minUint64(out.loss, value.loss)
-			out.reorder = minUint64(out.reorder, value.reorder)
-		}
-		out.unexpectedDuplicates = saturatingAddUint64(out.unexpectedDuplicates, value.unexpectedDuplicates)
-		meta.include(value.confidence, value.sampleTime, value.sampleCount)
-	}
-	if !set {
-		return stabilityEvidence{}
-	}
-	out.state = state
-	out.lossKnown = hasEligible && lossKnown
-	out.confidence = meta.confidence
-	out.sampleTime = meta.sampleTime
-	out.sampleCount = meta.sampleCount
-	return out
-}
-
-func raceStabilityState(children []aggregateChildEvidence) qualityState {
-	hasStale := false
-	for i := range children {
-		child := children[i]
-		value := child.evidence.stability
-		if !child.eligible || !value.observed() {
-			continue
-		}
-		if value.state == qualityStateFresh {
-			return qualityStateFresh
-		}
-		hasStale = true
-	}
-	if hasStale {
-		return qualityStateStale
-	}
-	return qualityStateUnknown
+	// Joint race failure requires a closed logical outcome cohort. Marginal
+	// child loss and successful cumulative ACKs cannot establish that cohort.
+	return stabilityEvidence{}
 }
 
 func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence {
@@ -372,6 +260,7 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 	var meta aggregateMeta
 	state := qualityStateFresh
 	set := false
+	progressKnown := true
 	lossKnown := true
 	for i := range children {
 		child := children[i]
@@ -386,7 +275,11 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 		if value.state == qualityStateStale {
 			state = qualityStateStale
 		}
-		out.progress = saturatingAddUint64(out.progress, value.progress)
+		if value.progressKnown {
+			out.progress = saturatingAddUint64(out.progress, value.progress)
+		} else {
+			progressKnown = false
+		}
 		out.failures = saturatingAddUint64(out.failures, value.failures)
 		out.migrationFailures = saturatingAddUint64(out.migrationFailures, value.migrationFailures)
 		out.loss = saturatingAddUint64(out.loss, value.loss)
@@ -399,6 +292,7 @@ func aggregateBondStability(children []aggregateChildEvidence) stabilityEvidence
 		return stabilityEvidence{}
 	}
 	out.state = state
+	out.progressKnown = progressKnown
 	out.lossKnown = lossKnown
 	out.confidence = meta.confidence
 	out.sampleTime = meta.sampleTime
@@ -734,12 +628,6 @@ func protectedCurrent(ctx selectorComparisonContext, candidate selectorCandidate
 }
 
 func compareStabilityVector(left, right stabilityEvidence) int {
-	if left.progress != right.progress {
-		if left.progress > right.progress {
-			return -1
-		}
-		return 1
-	}
 	if left.failures != right.failures {
 		if left.failures < right.failures {
 			return -1

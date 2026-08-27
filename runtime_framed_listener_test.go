@@ -254,12 +254,16 @@ func TestPathHandshakeDeadlineClosesOrCancels(t *testing.T) {
 	})
 
 	t.Run("clear cancels timeout", func(t *testing.T) {
+		baseline := len(runtimeListenerProcessCallbackPermits.pathCloseCalls)
 		pathConn, peer := net.Pipe()
 		defer peer.Close()
 		path := transporttcp.Wrap(pathConn)
 		clear := armPathHandshakeDeadlineAfter(path, 10*time.Millisecond)
 		clear()
 		clear()
+		if got := len(runtimeListenerProcessCallbackPermits.pathCloseCalls); got != baseline {
+			t.Fatalf("cleared handshake cleanup reservations=%d want=%d", got, baseline)
+		}
 		if err := peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}

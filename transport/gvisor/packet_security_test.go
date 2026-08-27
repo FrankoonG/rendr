@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -180,7 +181,7 @@ func requestRawAdmissionCookie(
 	if !addrEqual(source, remote) {
 		t.Fatalf("cookie source=%v want=%v", source, remote)
 	}
-	frame, err := decodeOuter(buffer[:n], linkSecret{})
+	frame, err := decodeOuter(buffer[:n], linkSecret{}, leafmobility.RoleAcceptor)
 	if err != nil || frame.Type != outerTypeCookie || frame.LinkID != id {
 		t.Fatalf("cookie frame=%+v err=%v", frame, err)
 	}
@@ -228,7 +229,7 @@ func rawOpenDatagram(
 ) []byte {
 	t.Helper()
 	datagram, err := encodeOuter(outerFrame{
-		Type: outerTypeOpen, LinkID: id, Generation: 1,
+		Type: outerTypeOpen, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 1,
 		Payload: marshalOpen(public, nonce, cookie, outerProof{}),
 	}, linkSecret{})
 	if err != nil {

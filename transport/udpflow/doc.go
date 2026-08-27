@@ -1,7 +1,7 @@
 // Package udpflow is the opaque-UDP transport adapter.
 //
 // Each PathConn wraps a single (local UDP socket, remote endpoint)
-// pair. Every outbound datagram carries an 8-byte UDPFlowHeader
+// pair. Every outbound datagram carries a versioned UDPFlowHeader
 // (proto.UDPFlowHeader) so the peer can route the datagram to the
 // correct rendr engine by flow_id alone, independent of the
 // originating 4-tuple. That is the migration primitive: the same

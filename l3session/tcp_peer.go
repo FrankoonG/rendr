@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
 
 	rendr "github.com/FrankoonG/rendr"
 	"github.com/FrankoonG/rendr/l3ingress"
@@ -18,6 +17,8 @@ type TCPPeerRelay struct {
 	Conn       rendr.Conn
 	Egresses   *l3ingress.EgressRegistry
 	BufferSize int
+
+	dataPlaneExecutor *dataPlaneCallbackExecutor
 }
 
 func (r *TCPPeerRelay) Run(ctx context.Context) error {
@@ -27,9 +28,7 @@ func (r *TCPPeerRelay) Run(ctx context.Context) error {
 	if r.Conn == nil {
 		return errors.New("l3session: nil TCP peer Conn")
 	}
-	stopFirstRead := context.AfterFunc(ctx, func() { _ = r.Conn.SetReadDeadline(time.Now()) })
-	envelope, err := readTCPEnvelope(r.Conn)
-	stopFirstRead()
+	envelope, err := readTCPEnvelopeContext(ctx, r.Conn)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -45,8 +44,17 @@ func (r *TCPPeerRelay) Run(ctx context.Context) error {
 		statusErr := writeTCPReadyContext(ctx, stream, tcpReadyEgressUnavailable)
 		return errors.Join(err, statusErr)
 	}
+	cleanup, err := reserveDataPlaneCleanupWithExecutor(
+		dataPlaneExecutorOrProcess(r.dataPlaneExecutor),
+		"TCPPeerRelay egress Close",
+	)
+	if err != nil {
+		statusErr := writeTCPReadyContext(ctx, stream, tcpReadyEgressUnavailable)
+		return errors.Join(err, statusErr)
+	}
 	egress, err := r.Egresses.DialTCP(ctx, envelope.Egress, envelope.Identity)
 	if err != nil {
+		cleanup.Release()
 		status := tcpReadyEgressDialFailed
 		if _, ok := l3ingress.EgressErrorReasonOf(err); ok {
 			status = tcpReadyEgressUnavailable
@@ -54,11 +62,33 @@ func (r *TCPPeerRelay) Run(ctx context.Context) error {
 		statusErr := writeTCPReadyContext(ctx, stream, status)
 		return errors.Join(err, statusErr)
 	}
-	defer egress.Close()
+	egressClose := cleanup.Bind(egress.Close)
 	if err := writeTCPReadyContext(ctx, stream, tcpReadyOK); err != nil {
-		return err
+		return errors.Join(err, egressClose.Close())
 	}
-	return relayTCP(ctx, stream, egress, r.BufferSize)
+	return relayTCPWithCloseAuthorities(
+		ctx,
+		stream,
+		egress,
+		r.BufferSize,
+		stream.Close,
+		egress.Close,
+		nil,
+		egressClose,
+	)
+}
+
+func readTCPEnvelopeContext(ctx context.Context, conn net.Conn) (tcpEnvelope, error) {
+	stream := newDataPlaneStream(conn, "TCP peer envelope", conn.Close)
+	stopInterrupt := context.AfterFunc(ctx, func() { _ = stream.interrupt() })
+	defer stopInterrupt()
+	envelope, err := invokeDataPlaneCallback(ctx, dataPlaneProcessExecutor, "TCP peer envelope Read", dataPlaneReadCallback,
+		func() (tcpEnvelope, error) { return readTCPEnvelope(conn) })
+	if err != nil && ctx != nil && ctx.Err() != nil {
+		_ = stream.interrupt()
+		return tcpEnvelope{}, ctx.Err()
+	}
+	return envelope, err
 }
 
 func writeTCPReadyContext(ctx context.Context, conn net.Conn, status tcpReadyStatus) error {

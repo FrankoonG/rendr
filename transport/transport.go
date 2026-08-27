@@ -69,6 +69,21 @@ type PathConn interface {
 	RemoteAddr() string
 }
 
+// PacketPathConn is a framed path that can carry packet sessions. MaxFrameSize
+// is the largest complete rendr frame the path promises to accept at the time
+// of admission. It must be positive and include the rendr frame header and any
+// control payload; it excludes carrier-specific encapsulation.
+//
+// Packet sessions fail closed when a PathConn does not implement this
+// interface, or when MaxFrameSize returns a non-positive or otherwise
+// insufficient value. Stream sessions do not query this method. A path that
+// loses an advertised capacity after admission must fail its writes so the
+// engine can retire it without weakening the session-wide replay contract.
+type PacketPathConn interface {
+	PathConn
+	MaxFrameSize() int
+}
+
 // PathQualityReader is the optional cancellable quality-observation extension
 // used by the engine. Implementations must return promptly after ctx is done.
 // The engine does not call PathConn.Quality because third-party legacy methods
@@ -93,6 +108,19 @@ type PathQualityReader interface {
 // must promptly unblock WriteFrameBatch under the same rule as PathConn.Write.
 type FrameBatchWriter interface {
 	WriteFrameBatch(frames [][]byte) (completed int, err error)
+}
+
+// BorrowedFrameBatchWriter opts into the allocation-free batch callback. The
+// outer slice and every frame are borrowed only until the method returns: an
+// implementation must not mutate them, retain them, or access them
+// asynchronously. WriteBorrowedFrameBatch has the same ordered-prefix result
+// contract as FrameBatchWriter.WriteFrameBatch.
+//
+// The separate method keeps legacy FrameBatchWriter implementations safe when
+// they retain the outer slice header for synchronous post-call diagnostics.
+type BorrowedFrameBatchWriter interface {
+	FrameBatchWriter
+	WriteBorrowedFrameBatch(frames [][]byte) (completed int, err error)
 }
 
 // OwnedFrameReader is an optional PathConn fast path for transports whose

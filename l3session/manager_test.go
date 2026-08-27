@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,10 +42,10 @@ func TestManagerStartsOneSessionPerFlow(t *testing.T) {
 	}
 	var started atomic.Int32
 	manager := &Manager{
-		OnStart: func(_ context.Context, sess *Session) error {
+		OnStart: func(_ context.Context, view PendingSessionView) error {
 			started.Add(1)
-			if sess.Request.Identity != id {
-				t.Fatalf("identity=%s want %s", sess.Request.Identity, id)
+			if got := view.Request().Identity; got != id {
+				return errors.New("OnStart received the wrong identity")
 			}
 			return nil
 		},
@@ -89,7 +90,7 @@ func TestManagerClosesSessionOnFlowClose(t *testing.T) {
 	id := testIdentity(l3ingress.ProtocolTCP)
 	conn := &fakeConn{}
 	manager := &Manager{}
-	if !manager.add(id, &Session{Conn: conn}) {
+	if !manager.add(id, &Session{conn: conn}) {
 		t.Fatal("add failed")
 	}
 
@@ -180,7 +181,7 @@ func TestManagerRecordsSessionPathSelectionAndMigrations(t *testing.T) {
 	if !ok {
 		t.Fatal("missing session")
 	}
-	admin := sess.Conn.(streamControl)
+	admin := sess.Conn().(streamControl)
 	_ = waitForSessionPathAttached(t, admin, "tcp-b", 3*time.Second)
 	if err := admin.SelectTarget("root", "tcp-b"); err != nil {
 		t.Fatal(err)
@@ -203,18 +204,18 @@ func TestManagerStaleSessionTeardownCannotDeleteReplacement(t *testing.T) {
 	oldConn := &fakeConn{}
 	newConn := &fakeConn{}
 	oldSession := &Session{
-		Request: l3ingress.SessionRequest{
+		request: l3ingress.SessionRequest{
 			Identity: id,
 			Ref:      l3ingress.FlowRef{Identity: id, Generation: 1},
 		},
-		Conn: oldConn,
+		conn: oldConn,
 	}
 	newSession := &Session{
-		Request: l3ingress.SessionRequest{
+		request: l3ingress.SessionRequest{
 			Identity: id,
 			Ref:      l3ingress.FlowRef{Identity: id, Generation: 2},
 		},
-		Conn: newConn,
+		conn: newConn,
 	}
 	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
 
@@ -228,10 +229,10 @@ func TestManagerStaleSessionTeardownCannotDeleteReplacement(t *testing.T) {
 	if oldConn.closed.Load() != 1 || newConn.closed.Load() != 0 {
 		t.Fatalf("close counts old/new=%d/%d", oldConn.closed.Load(), newConn.closed.Load())
 	}
-	if closed, err := manager.CloseRef(oldSession.Request.Ref); err != nil || closed {
+	if closed, err := manager.CloseRef(oldSession.Request().Ref); err != nil || closed {
 		t.Fatalf("stale CloseRef closed=%v err=%v", closed, err)
 	}
-	if closed, err := manager.CloseRef(newSession.Request.Ref); err != nil || !closed {
+	if closed, err := manager.CloseRef(newSession.Request().Ref); err != nil || !closed {
 		t.Fatalf("current CloseRef closed=%v err=%v", closed, err)
 	}
 	if _, ok := manager.Session(id); ok || newConn.closed.Load() != 1 {
@@ -242,14 +243,70 @@ func TestManagerStaleSessionTeardownCannotDeleteReplacement(t *testing.T) {
 	}
 }
 
+func TestOwnedSessionCloseWaitsForDurableSharedCompletion(t *testing.T) {
+	id := testIdentity(l3ingress.ProtocolTCP)
+	closeErr := errors.New("injected owned transport close result")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	conn := &delayedOwnedCloseConn{
+		closeStarted: started,
+		closeRelease: release,
+		closeErr:     closeErr,
+	}
+	sess := &Session{
+		request: l3ingress.SessionRequest{Identity: id},
+		conn:    conn,
+	}
+	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: sess}}
+	prepared := &PreparedTCP{manager: manager, session: sess}
+
+	results := make(chan error, 2)
+	go func() { results <- manager.CloseAll() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("owned transport Close did not start")
+	}
+	go func() { results <- prepared.Close() }()
+
+	timer := time.NewTimer(dataPlaneCloseTimeout + 2*dataPlaneControlTimeout)
+	select {
+	case err := <-results:
+		timer.Stop()
+		t.Fatalf("owned Close returned before durable completion: %v", err)
+	case <-timer.C:
+	}
+	close(release)
+	for index := 0; index < 2; index++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, closeErr) {
+				t.Fatalf("Close result %d = %v, want shared %v", index, err, closeErr)
+			}
+			var callbackErr *CallbackError
+			if errors.As(err, &callbackErr) && callbackErr.Reason == CallbackFailureTimeout {
+				t.Fatalf("owned Close result %d was misclassified as callback timeout: %v", index, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Close result %d did not observe durable completion", index)
+		}
+	}
+	if got := conn.closed.Load(); got != 1 {
+		t.Fatalf("owned transport Close calls = %d, want 1", got)
+	}
+	if _, ok := manager.Session(id); ok {
+		t.Fatal("durably closed Session remained in Manager")
+	}
+}
+
 func TestManagerStaleClosedSnapshotCannotDeleteReplacement(t *testing.T) {
 	id := testIdentity(l3ingress.ProtocolTCP)
 	oldRef := l3ingress.FlowRef{Identity: id, Generation: 1}
 	newRef := l3ingress.FlowRef{Identity: id, Generation: 2}
 	newConn := &fakeConn{}
 	newSession := &Session{
-		Request: l3ingress.SessionRequest{Identity: id, Ref: newRef},
-		Conn:    newConn,
+		request: l3ingress.SessionRequest{Identity: id, Ref: newRef},
+		conn:    newConn,
 	}
 	manager := &Manager{sessions: map[l3ingress.L3Identity]*Session{id: newSession}}
 
@@ -288,15 +345,15 @@ func TestManagerOnStartFailureCannotDeleteConcurrentReplacement(t *testing.T) {
 	ref := l3ingress.FlowRef{Identity: id, Generation: 1}
 	replacementConn := &fakeConn{}
 	replacement := &Session{
-		Request: l3ingress.SessionRequest{
+		request: l3ingress.SessionRequest{
 			Identity: id,
 			Ref:      l3ingress.FlowRef{Identity: id, Generation: 2},
 		},
-		Conn: replacementConn,
+		conn: replacementConn,
 	}
 	startErr := errors.New("injected OnStart failure")
 	manager := &Manager{}
-	manager.OnStart = func(_ context.Context, _ *Session) error {
+	manager.OnStart = func(_ context.Context, _ PendingSessionView) error {
 		manager.mu.Lock()
 		manager.sessions[id] = replacement
 		manager.mu.Unlock()
@@ -338,6 +395,21 @@ func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 func (f *fakeConn) Paths() []rendr.PathInfo          { return nil }
 func (f *fakeConn) FlowID() [16]byte                 { return [16]byte{} }
 func (f *fakeConn) Status() rendr.Status             { return rendr.Status{} }
+
+type delayedOwnedCloseConn struct {
+	fakeConn
+	closeStarted chan struct{}
+	closeRelease <-chan struct{}
+	closeErr     error
+	startOnce    sync.Once
+}
+
+func (c *delayedOwnedCloseConn) Close() error {
+	c.closed.Add(1)
+	c.startOnce.Do(func() { close(c.closeStarted) })
+	<-c.closeRelease
+	return c.closeErr
+}
 
 func sameStrings(got, want []string) bool {
 	if len(got) != len(want) {

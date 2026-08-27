@@ -92,7 +92,13 @@ func appendIPv6UDPPacket(dst []byte, id L3Identity, payload []byte) []byte {
 	binary.BigEndian.PutUint16(pkt[42:44], id.DstPort)
 	binary.BigEndian.PutUint16(pkt[44:46], uint16(payloadLen))
 	copy(pkt[48:], payload)
-	binary.BigEndian.PutUint16(pkt[46:48], udpIPv6Checksum(pkt, payloadLen))
+	udpChecksum := udpIPv6Checksum(pkt, payloadLen)
+	if udpChecksum == 0 {
+		// RFC 8200 requires a non-zero UDP checksum for IPv6. In one's
+		// complement arithmetic, an all-zero result is transmitted as 0xffff.
+		udpChecksum = 0xffff
+	}
+	binary.BigEndian.PutUint16(pkt[46:48], udpChecksum)
 	return dst
 }
 

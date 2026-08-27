@@ -99,6 +99,25 @@ func TestLeafMobilityBaselineDoesNotFabricateEventTiming(t *testing.T) {
 	}
 }
 
+func TestLeafMobilityOwnedBaselineUsesFactualAttachTime(t *testing.T) {
+	attachedAt := time.Unix(321, 654)
+	status := projectLeafMobility(engine.LeafMobilitySnapshot{
+		Ref:        engine.PathRef{ID: 3, Owner: 5},
+		AttachedAt: attachedAt,
+		Facts: leafmobility.Facts{
+			Kind:       leafmobility.KindRawTCP,
+			Role:       leafmobility.RoleDialer,
+			Scope:      leafmobility.ScopeEndpoint,
+			Session:    leafmobility.SessionStream,
+			Generation: 7,
+		},
+	})
+	if status.UpdatedAt != attachedAt || !status.ObservedAt.IsZero() ||
+		!status.ExpiresAt.IsZero() || status.EvidenceGeneration != 0 {
+		t.Fatalf("owned baseline timing=%+v, want factual attach time only", status)
+	}
+}
+
 func TestLeafMobilityInitiatorProjectionIsGenerationBound(t *testing.T) {
 	ref := engine.PathRef{ID: 7, Owner: 9}
 	now := time.Unix(123, 456)

@@ -83,12 +83,13 @@ func TestHelloCarriesCanonicalBoundedLocalTXManifest(t *testing.T) {
 	manifest, leaves := graphHandshakeManifest("client-root", GraphNodeKindSelector, "client-a", "client-b")
 	negotiation := graphHandshakeNegotiation(t, flow, 7, manifest)
 	want := HelloPayload{
-		Negotiation:     negotiation,
-		FlowID:          flow,
-		InstanceID:      InstanceID{0x11},
-		Caps:            CapsPacketMode,
-		LocalTXManifest: manifest,
-		InitialTargetID: leaves[0],
+		Negotiation:          negotiation,
+		FlowID:               flow,
+		InstanceID:           InstanceID{0x11},
+		Caps:                 CapsPacketMode,
+		ReceiveFrameCapacity: 1200,
+		LocalTXManifest:      manifest,
+		InitialTargetID:      leaves[0],
 	}
 
 	got, err := DecodeHello(mustEncodeGraphHandshakeHello(t, want))

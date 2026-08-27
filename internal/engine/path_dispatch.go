@@ -3,20 +3,23 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/internal/dispatchtrust"
 	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
 const pathDispatchQueueSize = 64
-const maximumPathDispatchBatch = 16
-const maximumPathDispatchBatchYields = maximumPathDispatchBatch - 1
+const maximumPathDispatchBatch = 32
+const maximumPathDispatchBatchYields = 15
 
 const minimumDispatchStallWindow = 100 * time.Millisecond
 const maximumDispatchStallWindow = 2 * time.Second
@@ -25,6 +28,120 @@ var (
 	errFrameRetiredBeforeWrite = errors.New("engine: DATA frame retired before physical write")
 	errFrameDispatchAdmission  = errors.New("engine: DATA dispatch lacks replay-ledger admission")
 )
+
+type pathDispatchCallbackPanicError struct {
+	operation     string
+	recoveredType string
+}
+
+func (err *pathDispatchCallbackPanicError) Error() string {
+	return fmt.Sprintf("engine: transport %s callback panicked with %s", err.operation, err.recoveredType)
+}
+
+func newPathDispatchCallbackPanicError(operation string, recovered any) *pathDispatchCallbackPanicError {
+	return &pathDispatchCallbackPanicError{
+		operation:     operation,
+		recoveredType: fmt.Sprintf("%T", recovered),
+	}
+}
+
+type pathDispatchCallbackGoexitError struct {
+	operation string
+}
+
+func (err *pathDispatchCallbackGoexitError) Error() string {
+	return fmt.Sprintf("engine: transport %s callback called runtime.Goexit", err.operation)
+}
+
+type pathDispatchCallbackDeadlineError struct {
+	operation string
+	cause     error
+}
+
+func (err *pathDispatchCallbackDeadlineError) Error() string {
+	reason := "was canceled"
+	if errors.Is(err.cause, context.DeadlineExceeded) {
+		reason = "exceeded its deadline"
+	}
+	return fmt.Sprintf("engine: transport %s callback %s", err.operation, reason)
+}
+
+func (err *pathDispatchCallbackDeadlineError) Unwrap() error { return err.cause }
+
+type pathDispatchCallbackBusyError struct {
+	operation string
+}
+
+func (err *pathDispatchCallbackBusyError) Error() string {
+	return fmt.Sprintf("engine: transport %s callback already has an in-flight invocation", err.operation)
+}
+
+type pathDispatchCallbackCapacityError struct {
+	operation string
+}
+
+func (err *pathDispatchCallbackCapacityError) Error() string {
+	return fmt.Sprintf("engine: transport %s callback capacity is exhausted", err.operation)
+}
+
+type pathDispatchCallbackReadCountError struct {
+	operation  string
+	count      int
+	bufferSize int
+	cause      error
+}
+
+func (err *pathDispatchCallbackReadCountError) Error() string {
+	return fmt.Sprintf(
+		"engine: transport %s callback returned invalid byte count %d for %d-byte buffer",
+		err.operation, err.count, err.bufferSize,
+	)
+}
+
+func (err *pathDispatchCallbackReadCountError) Unwrap() error { return err.cause }
+
+type pathDispatchCallbackGuard struct {
+	goexitOperation string
+}
+
+type pathCallbackWriteResult struct {
+	n   int
+	err error
+}
+
+func (guard *pathDispatchCallbackGuard) recordGoexit(operation string) {
+	if guard != nil && guard.goexitOperation == "" {
+		guard.goexitOperation = operation
+	}
+}
+
+func (guard *pathDispatchCallbackGuard) goexitError() *pathDispatchCallbackGoexitError {
+	if guard == nil || guard.goexitOperation == "" {
+		return nil
+	}
+	return &pathDispatchCallbackGoexitError{operation: guard.goexitOperation}
+}
+
+func pathCallbackFailedAbnormally(err error) bool {
+	var panicErr *pathDispatchCallbackPanicError
+	var goexitErr *pathDispatchCallbackGoexitError
+	var readCountErr *pathDispatchCallbackReadCountError
+	return errors.As(err, &panicErr) || errors.As(err, &goexitErr) || errors.As(err, &readCountErr)
+}
+
+func (e *Engine) failPathControlWrite(slot *pathSlot, err error) {
+	if e == nil || slot == nil || err == nil {
+		return
+	}
+	select {
+	case <-slot.quit:
+		return
+	case <-e.closed:
+		return
+	default:
+	}
+	e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
+}
 
 type FrameDispatchKind = transport.FrameDispatchKind
 type FrameDispatchAttemptState = transport.FrameDispatchAttemptState
@@ -81,20 +198,191 @@ func (e *Engine) releaseFrameDispatchLease(lease *frameDispatchLease) {
 }
 
 type pathDispatchJob struct {
-	frame            []byte
-	bonded           bool
-	routePlanned     bool
-	topologyEpoch    uint64
-	firstPublication bool
-	admission        frameDispatchAdmission
-	preparedDispatch physicalFrameDispatch
-	dispatchPrepared bool
-	acceptedPacket   bool
-	custodyTicket    uint64
-	result           chan<- pathDispatchResult
-	applicationWait  *applicationDispatchWaiter
-	generation       uint64
-	fenceEpoch       uint64
+	frame                         []byte
+	bonded                        bool
+	capacityQualification         bool
+	capacityQualificationPressure bool
+	capacityQualificationComplete bool
+	routePlanned                  bool
+	topologyEpoch                 uint64
+	firstPublication              bool
+	admission                     frameDispatchAdmission
+	preparedDispatch              physicalFrameDispatch
+	dispatchPrepared              bool
+	acceptedPacket                bool
+	custodyTicket                 uint64
+	result                        chan<- pathDispatchResult
+	applicationWait               *applicationDispatchWaiter
+	generation                    uint64
+	pathGeneration                pathProbeGeneration
+	fenceEpoch                    uint64
+	submittedAt                   time.Time
+	// beforePublication is a deterministic package-test hook. Tests install it
+	// before submission and never mutate it concurrently.
+	beforePublication func()
+}
+
+// pathDispatchBatchScratch is single-goroutine state owned by one pathSlot's
+// writer. The fixed protocol batch limit bounds its memory independently of
+// traffic volume. reset must run after callback-abnormal handling so replay
+// payloads, waiters, callbacks and tracer spans are never retained while idle.
+type pathDispatchBatchScratch struct {
+	jobs             [maximumPathDispatchBatch]pathDispatchJob
+	prepared         [maximumPathDispatchBatch]physicalFrameDispatch
+	retired          [maximumPathDispatchBatch]bool
+	receiptValues    [maximumPathDispatchBatch]batchDispatchAttributionReceipt
+	preparedReceipts [maximumPathDispatchBatch]*batchDispatchAttributionReceipt
+	activeIndices    [maximumPathDispatchBatch]int
+	frames           [maximumPathDispatchBatch][]byte
+	receipts         [maximumPathDispatchBatch]*batchDispatchAttributionReceipt
+	cohorts          [maximumPathDispatchBatch]rootDeliveryCohort
+	spans            [maximumPathDispatchBatch]FrameDispatchSpan
+}
+
+func (scratch *pathDispatchBatchScratch) reset(jobCount, activeCount int) {
+	if scratch == nil {
+		return
+	}
+	if jobCount < 0 || jobCount > maximumPathDispatchBatch ||
+		activeCount < 0 || activeCount > jobCount {
+		panic("engine: invalid path dispatch batch scratch extent")
+	}
+	clear(scratch.jobs[:jobCount])
+	clear(scratch.prepared[:jobCount])
+	clear(scratch.retired[:jobCount])
+	clear(scratch.receiptValues[:jobCount])
+	clear(scratch.preparedReceipts[:jobCount])
+	clear(scratch.activeIndices[:activeCount])
+	clear(scratch.frames[:activeCount])
+	clear(scratch.receipts[:activeCount])
+	clear(scratch.cohorts[:activeCount])
+	clear(scratch.spans[:activeCount])
+}
+
+type pathDispatchIdentity struct {
+	generation     uint64
+	pathGeneration pathProbeGeneration
+}
+
+type pathDispatchStallSnapshot struct {
+	identity pathDispatchIdentity
+	// cutoverHandoff excludes an in-flight writer after selector custody has
+	// moved to bounded replay. It is a routing fence, not evidence that the
+	// carrier became unhealthy.
+	cutoverHandoff bool
+}
+
+// pathDispatchStallState publishes one immutable stall fact. Load remains a
+// cheap predicate for routing call sites; generation-sensitive consumers use
+// snapshot so the fact cannot tear across independent atomics.
+type pathDispatchStallState struct {
+	state atomic.Pointer[pathDispatchStallSnapshot]
+}
+
+func (s *pathDispatchStallState) Load() bool {
+	return s != nil && s.state.Load() != nil
+}
+
+func (s *pathDispatchStallState) snapshot() *pathDispatchStallSnapshot {
+	if s == nil {
+		return nil
+	}
+	return s.state.Load()
+}
+
+func (s *pathSlot) currentDispatchStall() (pathDispatchIdentity, bool) {
+	_, identity, ok := s.healthEvidenceSnapshot()
+	return identity, ok
+}
+
+func (s *pathSlot) healthEvidenceSnapshot() (uint64, pathDispatchIdentity, bool) {
+	if s == nil {
+		return 0, pathDispatchIdentity{}, false
+	}
+	s.healthEvidenceMu.Lock()
+	defer s.healthEvidenceMu.Unlock()
+	revision := s.healthEvidenceRevisionLocked()
+	stall := s.dispatchStalled.snapshot()
+	if stall == nil || stall.cutoverHandoff {
+		return revision, pathDispatchIdentity{}, false
+	}
+	return revision, stall.identity, true
+}
+
+func (s *pathSlot) cutoverDispatchStalled() bool {
+	if s == nil {
+		return false
+	}
+	stall := s.dispatchStalled.snapshot()
+	return stall != nil && stall.cutoverHandoff
+}
+
+func (s *pathSlot) healthEvidenceRevisionLocked() uint64 {
+	if s.healthEvidenceRevision == 0 {
+		s.healthEvidenceRevision = 1
+	}
+	return s.healthEvidenceRevision
+}
+
+func (s *pathSlot) advanceHealthEvidenceRevisionLocked() uint64 {
+	current := s.healthEvidenceRevisionLocked()
+	if current == ^uint64(0) {
+		panic("engine: health evidence revision exhausted")
+	}
+	advanceHealthEvidenceEpoch(s.healthEvidenceEpochSrc)
+	s.healthEvidenceRevision = current + 1
+	return s.healthEvidenceRevision
+}
+
+func (s *pathSlot) lockHealthEvidenceMutation() func() {
+	if s == nil {
+		panic("engine: health evidence mutation on nil path")
+	}
+	if hook := s.healthEvidenceBeforeGate; hook != nil {
+		hook()
+	}
+	if s.healthEvidenceCommitMu != nil {
+		s.healthEvidenceCommitMu.RLock()
+	}
+	s.healthEvidenceMu.Lock()
+	return func() {
+		s.healthEvidenceMu.Unlock()
+		if s.healthEvidenceCommitMu != nil {
+			s.healthEvidenceCommitMu.RUnlock()
+		}
+	}
+}
+
+func (s *pathSlot) mutateHealthEvidence(mutate func()) {
+	unlock := s.lockHealthEvidenceMutation()
+	defer unlock()
+	s.advanceHealthEvidenceRevisionLocked()
+	if mutate != nil {
+		mutate()
+	}
+}
+
+func advanceHealthEvidenceEpoch(epoch *atomic.Uint64) {
+	if epoch == nil {
+		return
+	}
+	for {
+		current := epoch.Load()
+		if current == 0 || current == ^uint64(0) {
+			panic("engine: health evidence epoch is invalid or exhausted")
+		}
+		if epoch.CompareAndSwap(current, current+1) {
+			return
+		}
+	}
+}
+
+func (s *pathSlot) advanceHealthEvidenceRevision() uint64 {
+	var revision uint64
+	s.mutateHealthEvidence(func() {
+		revision = s.healthEvidenceRevision
+	})
+	return revision
 }
 
 const (
@@ -152,29 +440,115 @@ func completeApplicationDispatchWaiter(waiter *applicationDispatchWaiter, result
 	releaseApplicationDispatchWaiter(waiter)
 }
 
-func (s *pathSlot) markDispatchStalled(generation uint64) {
-	if s == nil || generation == 0 {
-		return
+func (s *pathSlot) nextDispatchGeneration() uint64 {
+	if s == nil {
+		panic("engine: dispatch generation on nil path")
 	}
-	s.dispatchStalled.Store(true)
-	s.dispatchStallGen.Store(generation)
-	if s.dispatchDoneGen.Load() >= generation && s.dispatchStallGen.CompareAndSwap(generation, 0) {
-		s.dispatchStalled.Store(false)
+	for {
+		current := s.dispatchNextGen.Load()
+		if current == ^uint64(0) {
+			panic("engine: dispatch generation exhausted")
+		}
+		generation := current + 1
+		if s.dispatchNextGen.CompareAndSwap(current, generation) {
+			return generation
+		}
 	}
 }
 
-func (s *pathSlot) completeDispatch(generation uint64) {
-	if s == nil || generation == 0 {
+func (s *pathSlot) markDispatchStalled(identity pathDispatchIdentity) {
+	s.markDispatchStall(identity, false)
+}
+
+func (s *pathSlot) markDispatchCutoverHandoff(identity pathDispatchIdentity) {
+	s.markDispatchStall(identity, true)
+}
+
+func (s *pathSlot) markDispatchStall(identity pathDispatchIdentity, cutoverHandoff bool) {
+	if s == nil || identity.generation == 0 {
+		return
+	}
+	unlock := s.lockHealthEvidenceMutation()
+	defer unlock()
+	if s.dispatchDoneGen.Load() >= identity.generation {
 		return
 	}
 	for {
+		current := s.dispatchStalled.state.Load()
+		if s.dispatchDoneGen.Load() >= identity.generation {
+			return
+		}
+		if current != nil {
+			if current.identity.generation > identity.generation {
+				return
+			}
+			if current.identity.generation == identity.generation {
+				if !current.cutoverHandoff || cutoverHandoff {
+					return
+				}
+				// A factual observation upgrades an earlier custody-only fence.
+				candidate := &pathDispatchStallSnapshot{identity: identity}
+				if !s.dispatchStalled.state.CompareAndSwap(current, candidate) {
+					continue
+				}
+				if pathProbeGenerationForSlot(s) == identity.pathGeneration {
+					s.advanceHealthEvidenceRevisionLocked()
+				}
+				return
+			}
+			// Never erase an unresolved factual stall merely because a newer
+			// dispatch was handed to cutover replay.
+			candidateCutoverHandoff := cutoverHandoff
+			if !current.cutoverHandoff && candidateCutoverHandoff {
+				candidateCutoverHandoff = false
+			}
+			candidate := &pathDispatchStallSnapshot{
+				identity: identity, cutoverHandoff: candidateCutoverHandoff,
+			}
+			if !s.dispatchStalled.state.CompareAndSwap(current, candidate) {
+				continue
+			}
+			if !candidate.cutoverHandoff && pathProbeGenerationForSlot(s) == identity.pathGeneration {
+				s.advanceHealthEvidenceRevisionLocked()
+			}
+			return
+		}
+		candidate := &pathDispatchStallSnapshot{
+			identity: identity, cutoverHandoff: cutoverHandoff,
+		}
+		if !s.dispatchStalled.state.CompareAndSwap(current, candidate) {
+			continue
+		}
+		if !candidate.cutoverHandoff && pathProbeGenerationForSlot(s) == identity.pathGeneration {
+			s.advanceHealthEvidenceRevisionLocked()
+		}
+		return
+	}
+}
+
+func (s *pathSlot) completeDispatch(identity pathDispatchIdentity) {
+	if s == nil || identity.generation == 0 {
+		return
+	}
+	unlock := s.lockHealthEvidenceMutation()
+	defer unlock()
+	for {
 		completed := s.dispatchDoneGen.Load()
-		if generation <= completed || s.dispatchDoneGen.CompareAndSwap(completed, generation) {
+		if identity.generation <= completed || s.dispatchDoneGen.CompareAndSwap(completed, identity.generation) {
 			break
 		}
 	}
-	if s.dispatchStallGen.CompareAndSwap(generation, 0) {
-		s.dispatchStalled.Store(false)
+	for {
+		current := s.dispatchStalled.state.Load()
+		if current == nil || current.identity != identity {
+			return
+		}
+		if s.dispatchStalled.state.CompareAndSwap(current, nil) {
+			if !current.cutoverHandoff && pathProbeGenerationForSlot(s) == identity.pathGeneration {
+				s.advanceHealthEvidenceRevisionLocked()
+			}
+			return
+		}
 	}
 }
 
@@ -183,45 +557,70 @@ type pathDispatchResult struct {
 	err  error
 }
 
+type pathDispatchBatchOutcome struct {
+	pending    pathDispatchJob
+	hasPending bool
+	handled    bool
+}
+
 type detachedStreamDispatchLease struct {
 	custodyTicket uint64
 }
 
 func (s *pathSlot) submitDispatch(job pathDispatchJob) bool {
+	_, submitted := s.submitDispatchTracked(job)
+	return submitted
+}
+
+func (s *pathSlot) submitDispatchTracked(job pathDispatchJob) (pathDispatchIdentity, bool) {
 	s.dispatchMu.Lock()
 	defer s.dispatchMu.Unlock()
 	if s.dispatchDead || s.dispatchFenced {
-		return false
+		return pathDispatchIdentity{}, false
+	}
+	if job.generation == 0 {
+		job.generation = s.nextDispatchGeneration()
+	}
+	job.pathGeneration = pathProbeGenerationForSlot(s)
+	identity := pathDispatchIdentity{
+		generation:     job.generation,
+		pathGeneration: job.pathGeneration,
 	}
 	job.fenceEpoch = s.txFenceEpoch.Load()
+	if job.beforePublication != nil {
+		job.beforePublication()
+	}
+	job.submittedAt = nowFn()
 	select {
 	case s.dispatchQ <- job:
-		return true
+		return identity, true
 	default:
-		return false
+		return pathDispatchIdentity{}, false
 	}
 }
 
 func (e *Engine) pathWriterLoop(slot *pathSlot) {
 	defer close(slot.doneW)
-	var pending *pathDispatchJob
+	var pending pathDispatchJob
+	hasPending := false
 	for {
-		if pending != nil {
+		if hasPending {
 			select {
 			case <-slot.quit:
-				e.completeRejectedDispatch(slot, *pending)
+				e.completeRejectedDispatch(slot, pending)
 				e.rejectQueuedDispatches(slot)
 				return
 			case <-e.closed:
-				e.completeRejectedDispatch(slot, *pending)
+				e.completeRejectedDispatch(slot, pending)
 				e.rejectQueuedDispatches(slot)
 				return
 			default:
 			}
-			job := *pending
-			pending = nil
-			if next, ok := e.executePathDispatchBatch(slot, job); ok {
-				pending = next
+			job := pending
+			pending = pathDispatchJob{}
+			hasPending = false
+			if outcome := e.executePathDispatchBatch(slot, job); outcome.handled {
+				pending, hasPending = outcome.pending, outcome.hasPending
 			} else {
 				e.executePathDispatch(slot, job)
 			}
@@ -229,8 +628,8 @@ func (e *Engine) pathWriterLoop(slot *pathSlot) {
 		}
 		select {
 		case job := <-slot.dispatchQ:
-			if next, ok := e.executePathDispatchBatch(slot, job); ok {
-				pending = next
+			if outcome := e.executePathDispatchBatch(slot, job); outcome.handled {
+				pending, hasPending = outcome.pending, outcome.hasPending
 			} else {
 				e.executePathDispatch(slot, job)
 			}
@@ -244,34 +643,67 @@ func (e *Engine) pathWriterLoop(slot *pathSlot) {
 	}
 }
 
-func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob) (*pathDispatchJob, bool) {
+func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob) pathDispatchBatchOutcome {
+	var scratch *pathDispatchBatchScratch
+	usedJobs, usedActive := 0, 0
+	defer func() {
+		if scratch != nil {
+			scratch.reset(usedJobs, usedActive)
+		}
+	}()
+	callbackGuard := pathDispatchCallbackGuard{}
+	var (
+		abnormalJobs     []pathDispatchJob
+		abnormalRetired  []bool
+		abnormalReceipts []*batchDispatchAttributionReceipt
+		pending          pathDispatchJob
+		hasPending       bool
+	)
+	defer func() {
+		if callbackErr := callbackGuard.goexitError(); callbackErr != nil {
+			e.failPathDispatchCallback(
+				slot, callbackErr, abnormalJobs, abnormalRetired,
+				pending, hasPending, abnormalReceipts,
+			)
+		}
+	}()
+
 	writer, ok := slot.conn.(transport.FrameBatchWriter)
 	_, atomicDispatch := slot.conn.(transport.FrameDispatchWriter)
 	if !ok || atomicDispatch || !e.Packetized() {
-		return nil, false
+		return pathDispatchBatchOutcome{}
 	}
 	firstSeq, ok := packetApplicationDispatchSequence(first)
 	if !ok {
-		return nil, false
+		return pathDispatchBatchOutcome{}
 	}
 	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != first.fenceEpoch {
 		e.completePathDispatch(slot, first, ErrPathTXFenced)
-		return nil, true
+		return pathDispatchBatchOutcome{handled: true}
 	}
 	if slot.dispatchBeforeWritePermit != nil {
 		slot.dispatchBeforeWritePermit()
 	}
 	if err := slot.acquireWrite(context.Background()); err != nil {
 		e.completePathDispatch(slot, first, err)
-		return nil, true
+		return pathDispatchBatchOutcome{handled: true}
 	}
+	writePermitHeld := true
+	defer func() {
+		if writePermitHeld {
+			slot.releaseWrite()
+		}
+	}()
 
-	jobs := make([]pathDispatchJob, 1, maximumPathDispatchBatch)
+	scratch = slot.dispatchBatchScratch
+	if scratch == nil {
+		scratch = &pathDispatchBatchScratch{}
+		slot.dispatchBatchScratch = scratch
+	}
+	jobs := scratch.jobs[:1]
 	jobs[0] = first
-	frames := make([][]byte, 1, maximumPathDispatchBatch)
-	frames[0] = first.frame
+	usedJobs = 1
 	lastSeq := firstSeq
-	var pending *pathDispatchJob
 	yields := 0
 	for len(jobs) < maximumPathDispatchBatch {
 		select {
@@ -279,11 +711,12 @@ func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob)
 			seq, compatible := packetApplicationDispatchSequence(candidate)
 			if !compatible || candidate.fenceEpoch != first.fenceEpoch ||
 				candidate.topologyEpoch != first.topologyEpoch || seq != lastSeq+1 {
-				pending = &candidate
+				pending = candidate
+				hasPending = true
 				goto drained
 			}
 			jobs = append(jobs, candidate)
-			frames = append(frames, candidate.frame)
+			usedJobs = len(jobs)
 			lastSeq = seq
 		default:
 			if yields < maximumPathDispatchBatchYields &&
@@ -303,61 +736,93 @@ func (e *Engine) executePathDispatchBatch(slot *pathSlot, first pathDispatchJob)
 drained:
 	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != first.fenceEpoch {
 		slot.releaseWrite()
+		writePermitHeld = false
 		for _, job := range jobs {
 			e.completePathDispatch(slot, job, ErrPathTXFenced)
 		}
-		return pending, true
+		return pathDispatchBatchOutcome{pending: pending, hasPending: hasPending, handled: true}
 	}
 	allJobs := jobs
-	prepared, retired, preparedReceipts, lease, err := e.preparePhysicalFrameDispatchBatch(allJobs, slot)
+	prepared := scratch.prepared[:len(allJobs)]
+	retired := scratch.retired[:len(allJobs)]
+	receiptValues := scratch.receiptValues[:len(allJobs)]
+	preparedReceipts := scratch.preparedReceipts[:len(allJobs)]
+	lease, err := e.preparePhysicalFrameDispatchBatch(
+		allJobs, slot, prepared, retired, receiptValues, preparedReceipts,
+	)
 	if err != nil {
 		slot.releaseWrite()
+		writePermitHeld = false
 		for _, queued := range allJobs {
 			e.completePathDispatch(slot, queued, err)
 		}
-		return pending, true
+		return pathDispatchBatchOutcome{pending: pending, hasPending: hasPending, handled: true}
 	}
 	defer func() {
 		if lease != 0 {
 			e.releaseFrameDispatchLease(&lease)
 		}
 	}()
+	abnormalJobs = allJobs
+	abnormalRetired = retired
+	abnormalReceipts = preparedReceipts
 	if lease != 0 && e.frameDispatchBatchAfterLease != nil {
 		e.frameDispatchBatchAfterLease()
 	}
-	jobs = make([]pathDispatchJob, 0, len(allJobs))
-	frames = make([][]byte, 0, len(allJobs))
-	dispatches := make([]physicalFrameDispatch, 0, len(allJobs))
-	receipts := make([]*batchDispatchAttributionReceipt, 0, len(allJobs))
+	activeIndices := scratch.activeIndices[:0]
+	frames := scratch.frames[:0]
+	receipts := scratch.receipts[:0]
 	for i, job := range allJobs {
 		if retired[i] {
 			continue
 		}
-		jobs = append(jobs, job)
+		activeIndices = append(activeIndices, i)
 		frames = append(frames, job.frame)
-		dispatches = append(dispatches, prepared[i])
 		receipts = append(receipts, preparedReceipts[i])
+		usedActive = len(activeIndices)
 	}
-	if len(jobs) == 0 {
+	if len(activeIndices) == 0 {
 		slot.releaseWrite()
+		writePermitHeld = false
 		for _, job := range allJobs {
 			e.completePathDispatch(slot, job, nil)
 		}
-		return pending, true
+		return pathDispatchBatchOutcome{pending: pending, hasPending: hasPending, handled: true}
 	}
-	cohorts := make([]rootDeliveryCohort, len(frames))
+	cohorts := scratch.cohorts[:len(frames)]
 	for i, frame := range frames {
 		cohorts[i] = e.applicationRootCohortFromFrame(frame)
 	}
-	spans := make([]FrameDispatchSpan, len(dispatches))
-	for i := range dispatches {
-		spans[i] = beginPhysicalFrameDispatch(slot, dispatches[i])
+	spans := scratch.spans[:len(activeIndices)]
+	for i, originalIndex := range activeIndices {
+		spans[i] = beginPhysicalFrameDispatch(slot, prepared[originalIndex], &callbackGuard)
 	}
 	writeToken := e.pathDataWriteToken(slot, first.fenceEpoch)
 	started := nowFn()
-	completed, batchErr := writer.WriteFrameBatch(frames)
+	completed, batchErr := writeExternalFrameBatchGuarded(writer, frames, &callbackGuard)
 	finished := nowFn()
-	completed, batchErr = classifyFrameBatchResult(len(jobs), completed, batchErr)
+	completed, batchErr = classifyFrameBatchResult(len(activeIndices), completed, batchErr)
+	var perFrameService, serviceRemainder time.Duration
+	if service := finished.Sub(started); completed > 0 && service > 0 {
+		perFrameService = service / time.Duration(completed)
+		serviceRemainder = service % time.Duration(completed)
+	}
+	for index := 0; index < completed; index++ {
+		service := perFrameService
+		if index == 0 {
+			service += serviceRemainder
+		}
+		receipts[index].noteCapacityPressure(applicationDispatchPressureObservation{
+			startedAt: started, completedAt: finished, serviceDuration: service,
+		})
+		job := allJobs[activeIndices[index]]
+		if job.capacityQualification {
+			receipts[index].noteCapacityQualificationPressure(
+				started, finished, job.capacityQualificationPressure,
+				job.capacityQualificationComplete,
+			)
+		}
+	}
 	for i, span := range spans {
 		if span == nil {
 			continue
@@ -379,7 +844,7 @@ drained:
 		if completed == len(frames) && batchErr != nil && i == len(frames)-1 {
 			completion.Err = batchErr
 		}
-		span.FinishFrameDispatch(completion)
+		finishPhysicalFrameDispatch(span, completion, &callbackGuard)
 	}
 	// The transport callback and every tracer completion are now outside the
 	// ACK-retirement race. Release before publishing per-job results so tests and
@@ -390,8 +855,9 @@ drained:
 	// Publish each successful first DATA write before releasing the permit. A
 	// following probe can then bind ACK progress to a path-unique predecessor.
 	for i := 0; i < completed; i++ {
-		if jobs[i].firstPublication && len(jobs[i].frame) >= proto.HeaderSize {
-			if header, err := proto.DecodeHeader(jobs[i].frame[:proto.HeaderSize]); err == nil &&
+		job := allJobs[activeIndices[i]]
+		if job.firstPublication && len(job.frame) >= proto.HeaderSize {
+			if header, err := proto.DecodeHeader(job.frame[:proto.HeaderSize]); err == nil &&
 				header.Type == proto.FrameData {
 				slot.noteFirstDataWriteSequence(header.Seq, writeToken)
 			}
@@ -401,6 +867,7 @@ drained:
 		e.pathDispatchBatchBeforePermitRelease(slot)
 	}
 	slot.releaseWrite()
+	writePermitHeld = false
 	e.resolveApplicationBatchDispatch(receipts, completed)
 	if completed > 0 {
 		slot.batchWriteCalls.Add(1)
@@ -409,11 +876,12 @@ drained:
 		slot.dataWrites.Add(uint64(completed))
 		slot.lastSendUnixNano.Store(nowFn().UnixNano())
 		for i := 0; i < completed; i++ {
+			job := allJobs[activeIndices[i]]
 			e.noteApplicationDispatchDuration(
-				cohorts[i], jobs[i].topologyEpoch, started, finished, true,
+				cohorts[i], job.topologyEpoch, started, finished, true,
 			)
-			slot.recordDispatch(jobs[i].frame, jobs[i].firstPublication)
-			e.noteTailReplayPublication(jobs[i].frame, slot)
+			slot.recordDispatch(job.frame, job.firstPublication)
+			e.noteTailReplayPublication(job.frame, slot)
 		}
 	}
 	if batchErr != nil && !errors.Is(batchErr, ErrPathTXFenced) {
@@ -432,7 +900,7 @@ drained:
 		}
 		e.completePathDispatch(slot, job, err)
 	}
-	return pending, true
+	return pathDispatchBatchOutcome{pending: pending, hasPending: hasPending, handled: true}
 }
 
 func updateAtomicMaximum(value *atomic.Uint64, candidate uint64) {
@@ -479,7 +947,6 @@ func (e *Engine) admitFrameDispatch(frame []byte, firstPublication bool) (frameD
 	if header.Seq == proto.MaxSeq {
 		return frameDispatchAdmission{}, errFrameDispatchAdmission
 	}
-	digest := proto.DigestFrame(frame)
 	e.sendHistMu.Lock()
 	entry := e.sendHistoryEntryLocked(header.Seq)
 	ackNext := e.sendAckNext.Load()
@@ -490,6 +957,10 @@ func (e *Engine) admitFrameDispatch(frame []byte, firstPublication bool) (frameD
 			return frameDispatchAdmission{}, errFrameRetiredBeforeWrite
 		}
 		return frameDispatchAdmission{}, errFrameDispatchAdmission
+	}
+	digest := entry.frameDigest
+	if !sameFrameBacking(frame, entry.frame) {
+		digest = proto.DigestFrame(frame)
 	}
 	if entry.frameDigest != digest || publishedNext <= header.Seq {
 		e.sendHistMu.Unlock()
@@ -511,11 +982,32 @@ func (e *Engine) authorizeFrameDispatch(
 	frame []byte,
 	admission frameDispatchAdmission,
 ) (FrameDispatchAuthorization, bool, bool, error) {
-	digest := proto.DigestFrame(frame)
 	e.sendHistMu.Lock()
+	digest, _ := e.frameDigestForDispatchLocked(frame, admission)
 	authorization, data, retired, err := e.authorizeFrameDispatchLocked(frame, digest, admission)
 	e.sendHistMu.Unlock()
 	return authorization, data, retired, err
+}
+
+// frameDigestForDispatchLocked reuses the ledger digest only when admission
+// still names the exact immutable backing array owned by that ledger entry.
+// A copied or substituted slice takes the full digest path and remains subject
+// to the same admission checks. The caller holds sendHistMu.
+func (e *Engine) frameDigestForDispatchLocked(
+	frame []byte,
+	admission frameDispatchAdmission,
+) (proto.FrameDigest, bool) {
+	if admission.owner == e && admission.id != 0 && admission.frameBytes == len(frame) {
+		entry := e.sendHistoryEntryLocked(admission.sequence)
+		if entry != nil && entry.frameDigest == admission.digest && sameFrameBacking(frame, entry.frame) {
+			return admission.digest, true
+		}
+	}
+	return proto.DigestFrame(frame), false
+}
+
+func sameFrameBacking(left, right []byte) bool {
+	return len(left) == len(right) && len(left) != 0 && &left[0] == &right[0]
 }
 
 // authorizeFrameDispatchLocked validates one immutable frame against the
@@ -574,8 +1066,8 @@ func nextFrameDispatchIdentity(counter *atomic.Uint64) uint64 {
 func (e *Engine) preparePhysicalFrameDispatch(
 	job pathDispatchJob,
 ) (physicalFrameDispatch, frameDispatchLease, error) {
-	digest := proto.DigestFrame(job.frame)
 	e.sendHistMu.Lock()
+	digest, _ := e.frameDigestForDispatchLocked(job.frame, job.admission)
 	dispatch := job.preparedDispatch
 	retired := false
 	if job.dispatchPrepared {
@@ -630,12 +1122,17 @@ func (e *Engine) newFrameDispatchLeaseLocked() frameDispatchLease {
 func (e *Engine) preparePhysicalFrameDispatchBatch(
 	jobs []pathDispatchJob,
 	batchSlot *pathSlot,
-) ([]physicalFrameDispatch, []bool, []*batchDispatchAttributionReceipt, frameDispatchLease, error) {
-	dispatches := make([]physicalFrameDispatch, len(jobs))
-	retired := make([]bool, len(jobs))
-	receipts := make([]*batchDispatchAttributionReceipt, len(jobs))
+	dispatches []physicalFrameDispatch,
+	retired []bool,
+	receiptValues []batchDispatchAttributionReceipt,
+	receipts []*batchDispatchAttributionReceipt,
+) (frameDispatchLease, error) {
+	if len(dispatches) != len(jobs) || len(retired) != len(jobs) ||
+		len(receiptValues) != len(jobs) || len(receipts) != len(jobs) {
+		panic("engine: physical frame batch scratch has inconsistent lengths")
+	}
 	if len(jobs) == 0 {
-		return dispatches, retired, receipts, 0, nil
+		return 0, nil
 	}
 	var binding graphBinding
 	var attributionStarted time.Time
@@ -643,32 +1140,22 @@ func (e *Engine) preparePhysicalFrameDispatchBatch(
 		binding = e.localGraphBinding()
 		attributionStarted = nowFn()
 	}
-	var digestStorage [maximumPathDispatchBatch]proto.FrameDigest
-	var digests []proto.FrameDigest
-	if len(jobs) <= len(digestStorage) {
-		digests = digestStorage[:len(jobs)]
-	} else {
-		digests = make([]proto.FrameDigest, len(jobs))
-	}
-	for index := range jobs {
-		digests[index] = proto.DigestFrame(jobs[index].frame)
-	}
-
 	e.sendHistMu.Lock()
 	leasedDATA := 0
 	for index, job := range jobs {
+		digest, _ := e.frameDigestForDispatchLocked(job.frame, job.admission)
 		dispatch := job.preparedDispatch
 		itemRetired := false
 		if job.dispatchPrepared {
-			if err := e.validatePreparedFrameDispatch(job.frame, digests[index], job.admission, dispatch); err != nil {
+			if err := e.validatePreparedFrameDispatch(job.frame, digest, job.admission, dispatch); err != nil {
 				e.sendHistMu.Unlock()
-				return nil, nil, nil, 0, err
+				return 0, err
 			}
 		} else {
-			authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digests[index], job.admission)
+			authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digest, job.admission)
 			if err != nil {
 				e.sendHistMu.Unlock()
-				return nil, nil, nil, 0, err
+				return 0, err
 			}
 			dispatch = physicalFrameDispatch{authorization: authorization, data: data}
 			itemRetired = retired
@@ -681,7 +1168,7 @@ func (e *Engine) preparePhysicalFrameDispatchBatch(
 			}
 			if dispatch.authorization.Kind != expectedKind {
 				e.sendHistMu.Unlock()
-				return nil, nil, nil, 0, errFrameDispatchAdmission
+				return 0, errFrameDispatchAdmission
 			}
 		}
 		dispatches[index] = dispatch
@@ -703,13 +1190,14 @@ func (e *Engine) preparePhysicalFrameDispatchBatch(
 			if retired[index] || job.routePlanned {
 				continue
 			}
-			receipts[index] = e.beginApplicationBatchDispatchLocked(
+			receipts[index] = e.beginApplicationBatchDispatchLockedInto(
 				job.frame, batchSlot, job.topologyEpoch, binding, attributionStarted,
+				&receiptValues[index],
 			)
 		}
 	}
 	e.sendHistMu.Unlock()
-	return dispatches, retired, receipts, lease, nil
+	return lease, nil
 }
 
 // prepareLogicalFrameDispatchFanout commits every child of one race ticket in
@@ -723,27 +1211,11 @@ func (e *Engine) prepareLogicalFrameDispatchFanout(
 	if len(jobs) < 2 {
 		return nil, errors.New("engine: frame dispatch fanout requires at least two paths")
 	}
-	var digestStorage [maximumPathDispatchBatch]proto.FrameDigest
-	var digests []proto.FrameDigest
-	if len(jobs) <= len(digestStorage) {
-		digests = digestStorage[:len(jobs)]
-	} else {
-		digests = make([]proto.FrameDigest, len(jobs))
-	}
-	firstFrame := jobs[0].frame
-	firstDigest := proto.DigestFrame(firstFrame)
-	for index := range jobs {
-		frame := jobs[index].frame
-		if len(frame) == len(firstFrame) && (len(frame) == 0 || &frame[0] == &firstFrame[0]) {
-			digests[index] = firstDigest
-			continue
-		}
-		digests[index] = proto.DigestFrame(frame)
-	}
 	e.sendHistMu.Lock()
 	defer e.sendHistMu.Unlock()
 	for index, job := range jobs {
-		authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digests[index], job.admission)
+		digest, _ := e.frameDigestForDispatchLocked(job.frame, job.admission)
+		authorization, data, retired, err := e.authorizeFrameDispatchLocked(job.frame, digest, job.admission)
 		if err != nil {
 			return nil, err
 		}
@@ -790,16 +1262,233 @@ func (e *Engine) validatePreparedFrameDispatch(
 	return nil
 }
 
-func beginPhysicalFrameDispatch(slot *pathSlot, dispatch physicalFrameDispatch) FrameDispatchSpan {
+func beginPhysicalFrameDispatch(
+	slot *pathSlot,
+	dispatch physicalFrameDispatch,
+	guard *pathDispatchCallbackGuard,
+) FrameDispatchSpan {
 	if dispatch.data {
 		if tracer, ok := slot.conn.(FrameDispatchTracer); ok {
 			authorization := dispatch.authorization
 			authorization.PhysicalOccurrence = 1
 			authorization.FrameOffset = 0
-			return tracer.BeginFrameDispatch(authorization)
+			return beginExternalFrameDispatch(tracer, authorization, guard)
 		}
 	}
 	return nil
+}
+
+func beginExternalFrameDispatch(
+	tracer FrameDispatchTracer,
+	authorization FrameDispatchAuthorization,
+	guard *pathDispatchCallbackGuard,
+) (span FrameDispatchSpan) {
+	returned := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			span = nil
+		} else if !returned {
+			guard.recordGoexit("FrameDispatchTracer.BeginFrameDispatch")
+		}
+	}()
+	span = tracer.BeginFrameDispatch(authorization)
+	returned = true
+	return span
+}
+
+func finishPhysicalFrameDispatch(
+	span FrameDispatchSpan,
+	completion FrameDispatchCompletion,
+	guard *pathDispatchCallbackGuard,
+) {
+	if span == nil {
+		return
+	}
+	returned := false
+	defer func() {
+		if recover() == nil && !returned {
+			guard.recordGoexit("FrameDispatchSpan.FinishFrameDispatch")
+		}
+	}()
+	span.FinishFrameDispatch(completion)
+	returned = true
+}
+
+func writeExternalFrameBatch(
+	writer transport.FrameBatchWriter,
+	frames [][]byte,
+) (completed int, err error) {
+	return writeExternalFrameBatchGuarded(writer, frames, nil)
+}
+
+func writeExternalFrameBatchGuarded(
+	writer transport.FrameBatchWriter,
+	frames [][]byte,
+	guard *pathDispatchCallbackGuard,
+) (completed int, err error) {
+	callbackFrames := frames
+	borrowed, borrowedOK := writer.(transport.BorrowedFrameBatchWriter)
+	if !borrowedOK {
+		// Legacy implementations received a fresh exact-length outer slice before
+		// the writer-local scratch path existed. Preserve that lifetime contract;
+		// only explicit BorrowedFrameBatchWriter implementations see scratch.
+		callbackFrames = append([][]byte(nil), frames...)
+	}
+	returned := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			completed = 0
+			err = newPathDispatchCallbackPanicError("FrameBatchWriter.WriteFrameBatch", recovered)
+		} else if !returned {
+			guard.recordGoexit("FrameBatchWriter.WriteFrameBatch")
+		}
+	}()
+	if borrowedOK {
+		completed, err = borrowed.WriteBorrowedFrameBatch(callbackFrames)
+	} else {
+		completed, err = writer.WriteFrameBatch(callbackFrames)
+	}
+	returned = true
+	return completed, err
+}
+
+func writeExternalPathConn(conn transport.PathConn, frame []byte) (n int, err error) {
+	return writeExternalPathConnGuarded(conn, frame, nil)
+}
+
+func writeExternalPathConnGuarded(
+	conn transport.PathConn,
+	frame []byte,
+	guard *pathDispatchCallbackGuard,
+) (n int, err error) {
+	returned := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			n = 0
+			err = newPathDispatchCallbackPanicError("PathConn.Write", recovered)
+		} else if !returned {
+			guard.recordGoexit("PathConn.Write")
+		}
+	}()
+	n, err = conn.Write(frame)
+	returned = true
+	return n, err
+}
+
+func writeExternalFrameDispatch(
+	writer transport.FrameDispatchWriter,
+	frame []byte,
+	authorization FrameDispatchAuthorization,
+) (n int, err error) {
+	return writeExternalFrameDispatchGuarded(writer, frame, authorization, nil)
+}
+
+func writeExternalFrameDispatchGuarded(
+	writer transport.FrameDispatchWriter,
+	frame []byte,
+	authorization FrameDispatchAuthorization,
+	guard *pathDispatchCallbackGuard,
+) (n int, err error) {
+	returned := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			n = 0
+			err = newPathDispatchCallbackPanicError("FrameDispatchWriter.WriteFrameDispatch", recovered)
+		} else if !returned {
+			guard.recordGoexit("FrameDispatchWriter.WriteFrameDispatch")
+		}
+	}()
+	n, err = writer.WriteFrameDispatch(frame, authorization)
+	returned = true
+	return n, err
+}
+
+func writeExternalOwnedFrameDispatch(
+	writer dispatchtrust.OwnedFrameWriter,
+	frame []byte,
+	authorization FrameDispatchAuthorization,
+) (n int, err error) {
+	return writeExternalOwnedFrameDispatchGuarded(writer, frame, authorization, nil)
+}
+
+func writeExternalOwnedFrameDispatchGuarded(
+	writer dispatchtrust.OwnedFrameWriter,
+	frame []byte,
+	authorization FrameDispatchAuthorization,
+	guard *pathDispatchCallbackGuard,
+) (n int, err error) {
+	returned := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			n = 0
+			err = newPathDispatchCallbackPanicError("OwnedFrameWriter.WriteOwnedFrameDispatch", recovered)
+		} else if !returned {
+			guard.recordGoexit("OwnedFrameWriter.WriteOwnedFrameDispatch")
+		}
+	}()
+	n, err = dispatchtrust.Write(writer, frame, authorization)
+	returned = true
+	return n, err
+}
+
+func writeContainedDispatchFrame(
+	slot *pathSlot,
+	frame []byte,
+	prepared dispatchedFrameWrite,
+	guard *pathDispatchCallbackGuard,
+) (int, error) {
+	var n int
+	var err error
+	if prepared.atomic {
+		if writer, ok := slot.conn.(dispatchtrust.OwnedFrameWriter); ok {
+			n, err = writeExternalOwnedFrameDispatchGuarded(writer, frame, prepared.authorization, guard)
+		} else if writer, ok := slot.conn.(transport.FrameDispatchWriter); ok {
+			borrowed := append([]byte(nil), frame...)
+			n, err = writeExternalFrameDispatchGuarded(writer, borrowed, prepared.authorization, guard)
+		} else {
+			n, err = writeExternalPathConnGuarded(slot.conn, frame, guard)
+		}
+	} else {
+		n, err = writeExternalPathConnGuarded(slot.conn, frame, guard)
+	}
+	slot.recordFrameWrite(frame, n, err)
+	return n, err
+}
+
+func (slot *pathSlot) writeContainedDispatchedFrameEpochObserved(
+	frame []byte,
+	fenceEpoch uint64,
+	guard *pathDispatchCallbackGuard,
+	beforeWrite func() (dispatchedFrameWrite, error),
+	afterWrite func(int, error),
+) (int, error) {
+	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return 0, ErrPathTXFenced
+	}
+	if slot.dispatchBeforeWritePermit != nil {
+		slot.dispatchBeforeWritePermit()
+	}
+	if err := slot.acquireWrite(context.Background()); err != nil {
+		return 0, err
+	}
+	defer slot.releaseWrite()
+	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
+		return 0, ErrPathTXFenced
+	}
+	var prepared dispatchedFrameWrite
+	if beforeWrite != nil {
+		var err error
+		prepared, err = beforeWrite()
+		if err != nil {
+			return 0, err
+		}
+	}
+	n, err := writeContainedDispatchFrame(slot, frame, prepared, guard)
+	n, err = normalizeFrameWriteResult(len(frame), n, err)
+	if afterWrite != nil {
+		afterWrite(n, err)
+	}
+	return n, err
 }
 
 func classifyFrameBatchResult(total, completed int, err error) (int, error) {
@@ -813,13 +1502,29 @@ func classifyFrameBatchResult(total, completed int, err error) (int, error) {
 }
 
 func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
+	callbackGuard := pathDispatchCallbackGuard{}
 	cohort := e.applicationRootCohortFromFrame(job.frame)
 	var writeToken pathDataWriteToken
 	var dispatchSpan FrameDispatchSpan
 	var dispatchLease frameDispatchLease
+	var attributionReceipt *batchDispatchAttributionReceipt
+	defer func() {
+		if dispatchLease != 0 {
+			e.releaseFrameDispatchLease(&dispatchLease)
+		}
+		if attributionReceipt != nil && !attributionReceipt.resolved {
+			e.resolveApplicationBatchDispatch([]*batchDispatchAttributionReceipt{attributionReceipt}, 0)
+		}
+		if callbackErr := callbackGuard.goexitError(); callbackErr != nil {
+			e.failPathDispatchCallback(
+				slot, callbackErr, []pathDispatchJob{job}, nil,
+				pathDispatchJob{}, false, nil,
+			)
+		}
+	}()
 	var physicalStarted time.Time
 	started := nowFn()
-	n, err := slot.writeDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, func() (dispatchedFrameWrite, error) {
+	n, err := slot.writeContainedDispatchedFrameEpochObserved(job.frame, job.fenceEpoch, &callbackGuard, func() (dispatchedFrameWrite, error) {
 		dispatch, lease, err := e.preparePhysicalFrameDispatch(job)
 		if err != nil {
 			return dispatchedFrameWrite{}, err
@@ -831,24 +1536,28 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 				prepared.atomic = true
 				prepared.authorization = dispatch.authorization
 			} else {
-				dispatchSpan = beginPhysicalFrameDispatch(slot, dispatch)
+				dispatchSpan = beginPhysicalFrameDispatch(slot, dispatch, &callbackGuard)
 			}
 		}
-		e.noteApplicationDispatchRouteAtEpoch(job.frame, slot, job.topologyEpoch)
+		if !job.routePlanned {
+			attributionReceipt = e.beginApplicationBatchDispatch(
+				job.frame, slot, job.topologyEpoch,
+			)
+		}
 		writeToken = e.pathDataWriteToken(slot, job.fenceEpoch)
 		physicalStarted = nowFn()
 		return prepared, nil
 	}, func(n int, writeErr error) {
 		completedAt := nowFn()
 		if dispatchSpan != nil {
-			dispatchSpan.FinishFrameDispatch(FrameDispatchCompletion{
+			finishPhysicalFrameDispatch(dispatchSpan, FrameDispatchCompletion{
 				StartedAt: physicalStarted, CompletedAt: completedAt,
 				FrameBytes: len(job.frame), BytesWritten: n, BytesWrittenKnown: true,
 				WriteCalls:   1,
 				AttemptState: FrameDispatchAttempted, WriteAttempted: true,
 				WholeFrameAccepted: n == len(job.frame),
 				BatchIndex:         0, BatchSize: 1, Err: writeErr,
-			})
+			}, &callbackGuard)
 		}
 		if !job.firstPublication || writeErr != nil || n != len(job.frame) || len(job.frame) < proto.HeaderSize {
 			return
@@ -869,6 +1578,28 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	if err == nil && n != len(job.frame) {
 		err = io.ErrShortWrite
 	}
+	attributed := 0
+	if attributionReceipt != nil && !physicalStarted.IsZero() {
+		// Preserve the prior route-attempt semantics even when a physical write
+		// fails. A later replay through another target must not turn an
+		// ambiguous partial attempt into leaf-specific capacity evidence.
+		attributed = 1
+	}
+	if err == nil {
+		attributionReceipt.noteCapacityPressure(applicationDispatchPressureObservation{
+			startedAt: physicalStarted, completedAt: finished,
+			serviceDuration: finished.Sub(physicalStarted),
+		})
+		if job.capacityQualification {
+			attributionReceipt.noteCapacityQualificationPressure(
+				physicalStarted, finished, job.capacityQualificationPressure,
+				job.capacityQualificationComplete,
+			)
+		}
+	}
+	e.resolveApplicationBatchDispatch(
+		[]*batchDispatchAttributionReceipt{attributionReceipt}, attributed,
+	)
 	e.noteApplicationDispatchDuration(
 		cohort, job.topologyEpoch, started, finished, err == nil,
 	)
@@ -885,8 +1616,46 @@ func (e *Engine) executePathDispatch(slot *pathSlot, job pathDispatchJob) {
 	e.completePathDispatch(slot, job, err)
 }
 
+func (e *Engine) failPathDispatchCallback(
+	slot *pathSlot,
+	err error,
+	jobs []pathDispatchJob,
+	retired []bool,
+	pending pathDispatchJob,
+	hasPending bool,
+	receipts []*batchDispatchAttributionReceipt,
+) {
+	e.resolveApplicationBatchDispatch(receipts, 0)
+	e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
+	for index, job := range jobs {
+		jobErr := err
+		if index < len(retired) && retired[index] {
+			jobErr = nil
+		}
+		e.completePathDispatch(slot, job, jobErr)
+	}
+	if hasPending {
+		e.completePathDispatch(slot, pending, err)
+	}
+	for {
+		select {
+		case job := <-slot.dispatchQ:
+			e.completePathDispatch(slot, job, err)
+		default:
+			return
+		}
+	}
+}
+
 func (e *Engine) completePathDispatch(slot *pathSlot, job pathDispatchJob, err error) {
 	result := pathDispatchResult{slot: slot, err: err}
+	if slot.dispatchBeforeCompletePublication != nil {
+		slot.dispatchBeforeCompletePublication()
+	}
+	slot.completeDispatch(pathDispatchIdentity{
+		generation:     job.generation,
+		pathGeneration: job.pathGeneration,
+	})
 	if job.acceptedPacket {
 		e.completeAcceptedPacketDispatch(job.custodyTicket)
 	}
@@ -899,7 +1668,6 @@ func (e *Engine) completePathDispatch(slot *pathSlot, job pathDispatchJob, err e
 			e.requestReplayRange(header.Seq, header.Seq+1)
 		}
 	}
-	slot.completeDispatch(job.generation)
 }
 
 func (e *Engine) completeRejectedDispatch(slot *pathSlot, job pathDispatchJob) {
@@ -946,6 +1714,386 @@ func (e *Engine) dispatchDetachedStreamApplication(
 		},
 		false,
 	)
+}
+
+const (
+	bondCapacityWeightScale       uint64             = (1 << 16) - 1
+	bondCapacityMinimumConfidence evidenceConfidence = evidenceConfidenceFull / 4
+)
+
+type recursiveDispatchSnapshot struct {
+	topologyEpoch uint64
+	latest        map[proto.TargetID]*pathSlot
+	capacities    map[proto.TargetID]uint64
+	projection    *recursiveDispatchProjection
+}
+
+// recursiveDispatchProjection is an immutable, revision-bound view of the
+// physical leaves and their scheduling evidence. Its maps are never exposed to
+// mutation. A topology, health, ACK-evidence, or exact time-freshness boundary
+// invalidates the whole projection before it can authorize another ticket.
+type recursiveDispatchProjection struct {
+	topologyEpoch    uint64
+	healthEpoch      uint64
+	evidenceRevision uint64
+	capacityRevision uint64
+	builtAt          time.Time
+	validUntil       time.Time
+	eligibleLeaves   map[proto.TargetID]bool
+	presentLeaves    map[proto.TargetID]bool
+	eligibleNodes    map[proto.TargetID]bool
+	presentNodes     map[proto.TargetID]bool
+	latest           map[proto.TargetID]*pathSlot
+	qualities        map[proto.TargetID]transport.PathQuality
+	scheduling       bondSchedulingContext
+}
+
+func (projection *recursiveDispatchProjection) currentAt(
+	topologyEpoch, healthEpoch, evidenceRevision, capacityRevision uint64,
+	now time.Time,
+) bool {
+	if projection == nil || projection.topologyEpoch != topologyEpoch ||
+		projection.healthEpoch != healthEpoch || projection.evidenceRevision != evidenceRevision ||
+		projection.capacityRevision != capacityRevision ||
+		now.IsZero() || now.Before(projection.builtAt) {
+		return false
+	}
+	return projection.validUntil.IsZero() || now.Before(projection.validUntil)
+}
+
+func (projection *recursiveDispatchProjection) reusableAt(
+	topologyEpoch, healthEpoch, capacityRevision uint64,
+	now time.Time,
+) bool {
+	if projection == nil || projection.topologyEpoch != topologyEpoch ||
+		projection.healthEpoch != healthEpoch || projection.capacityRevision != capacityRevision ||
+		now.IsZero() || now.Before(projection.builtAt) {
+		return false
+	}
+	return projection.validUntil.IsZero() || now.Before(projection.validUntil)
+}
+
+// withEvidenceRevision advances an ACK-only authority frontier. Capacity has
+// its own revision, so unchanged topology, health, eligibility and weight maps
+// remain immutable and can be shared without an O(paths) rebuild.
+func (projection *recursiveDispatchProjection) withEvidenceRevision(
+	e *Engine,
+	evidenceRevision uint64,
+	now time.Time,
+) *recursiveDispatchProjection {
+	if projection == nil {
+		return nil
+	}
+	next := *projection
+	next.evidenceRevision = evidenceRevision
+	next.builtAt = now
+	next.scheduling = projection.scheduling
+	next.scheduling.now = now
+	next.scheduling.evidenceSource = e
+	next.scheduling.evidenceRevision = evidenceRevision
+	return &next
+}
+
+func bondPriorWeight(slot *pathSlot) uint64 {
+	if slot == nil || slot.spec.Weight == 0 {
+		return 1
+	}
+	return uint64(slot.spec.Weight)
+}
+
+// scaleBondCapacityWeight returns ceil(value*scale/maximum) without allowing
+// a raw bytes-per-second sample to enter the scheduler's cursor domain.
+func scaleBondCapacityWeight(value, maximum, scale uint64) uint64 {
+	if value == 0 || maximum == 0 || scale == 0 {
+		return 0
+	}
+	if value > maximum {
+		value = maximum
+	}
+	hi, lo := bits.Mul64(value, scale)
+	quotient, remainder := bits.Div64(hi, lo, maximum)
+	if remainder != 0 {
+		quotient++
+	}
+	if quotient > scale {
+		return scale
+	}
+	return quotient
+}
+
+// bondDispatchScheduling retains raw topology-bound capacity evidence. Each
+// recursive bond normalizes only its own immediate-child aggregates; doing it
+// here would let a stalled leaf or an unselected selector sibling compress an
+// unrelated bond domain before the graph semantics are known.
+func bondDispatchScheduling(
+	latest map[proto.TargetID]*pathSlot,
+	delivered map[proto.TargetID]speedEstimate,
+	acknowledged map[proto.TargetID]uint64,
+	now time.Time,
+	topologyEpoch uint64,
+) bondSchedulingContext {
+	staticWeights := make(map[proto.TargetID]uint64, len(latest))
+	effectiveWeights := make(map[proto.TargetID]uint64, len(latest))
+	observed := make(map[proto.TargetID]bool, len(latest))
+	leafIdentity := make(map[proto.TargetID]bondLeafIdentity, len(latest))
+	for targetID, slot := range latest {
+		prior := bondPriorWeight(slot)
+		staticWeights[targetID] = prior
+		effectiveWeights[targetID] = prior
+		leafIdentity[targetID] = bondLeafIdentity{
+			targetID: targetID, pathID: slot.id, owner: slot.owner, generation: slot.gen,
+			routeGeneration: slot.routeGeneration.Load(),
+		}
+		estimate, exists := delivered[targetID]
+		if !exists {
+			continue
+		}
+		if !bondCapacityEstimateFreshAt(estimate, now) {
+			continue
+		}
+		effectiveWeights[targetID] = estimate.bytesPerSecond
+		observed[targetID] = true
+	}
+	return bondSchedulingContext{
+		now: now, topologyEpoch: topologyEpoch,
+		staticWeights: staticWeights, effectiveWeights: effectiveWeights,
+		observed: observed, acknowledged: acknowledged, leafIdentity: leafIdentity,
+		evidenceAware: true,
+	}
+}
+
+func bondDispatchCapacities(
+	latest map[proto.TargetID]*pathSlot,
+	delivered map[proto.TargetID]speedEstimate,
+	now time.Time,
+) map[proto.TargetID]uint64 {
+	return bondDispatchScheduling(latest, delivered, nil, now, 0).effectiveWeights
+}
+
+func earlierProjectionBoundary(current, candidate time.Time) time.Time {
+	if candidate.IsZero() || (!current.IsZero() && !candidate.Before(current)) {
+		return current
+	}
+	return candidate
+}
+
+func bondEvidenceProjectionBoundary(
+	delivered map[proto.TargetID]speedEstimate,
+	now time.Time,
+) time.Time {
+	var boundary time.Time
+	for _, estimate := range delivered {
+		if estimate.sampleTime.IsZero() {
+			continue
+		}
+		if estimate.sampleTime.After(now) {
+			boundary = earlierProjectionBoundary(boundary, estimate.sampleTime)
+			continue
+		}
+		expires := estimate.sampleTime.Add(selectorEvidenceFreshFor + time.Nanosecond)
+		if now.Before(expires) {
+			boundary = earlierProjectionBoundary(boundary, expires)
+		}
+	}
+	return boundary
+}
+
+func executionNodeAvailability(
+	plan *executionPlan,
+	leaves map[proto.TargetID]bool,
+) map[proto.TargetID]bool {
+	result := make(map[proto.TargetID]bool, len(plan.nodes))
+	known := make(map[proto.TargetID]bool, len(plan.nodes))
+	var available func(proto.TargetID) bool
+	available = func(targetID proto.TargetID) bool {
+		if known[targetID] {
+			return result[targetID]
+		}
+		known[targetID] = true
+		node, ok := plan.nodeView(targetID)
+		if !ok {
+			return false
+		}
+		if node.kind == proto.GraphNodeKindPath {
+			result[targetID] = leaves[targetID]
+			return result[targetID]
+		}
+		for _, childID := range node.children {
+			if available(childID) {
+				result[targetID] = true
+				break
+			}
+		}
+		return result[targetID]
+	}
+	for _, targetID := range plan.nodeIDs {
+		available(targetID)
+	}
+	return result
+}
+
+func (e *Engine) buildRecursiveDispatchProjection(
+	runtime *executionRuntime,
+	now time.Time,
+	topologyEpoch, healthEpoch, evidenceRevision, capacityRevision uint64,
+	delivered map[proto.TargetID]speedEstimate,
+	acknowledged map[proto.TargetID]uint64,
+) (*recursiveDispatchProjection, bool) {
+	if runtime == nil || runtime.plan == nil || now.IsZero() {
+		return nil, false
+	}
+	e.pathsMu.RLock()
+	if topologyEpoch != 0 && e.currentPathTopologyEpoch() != topologyEpoch {
+		e.pathsMu.RUnlock()
+		return nil, false
+	}
+	projection := &recursiveDispatchProjection{
+		topologyEpoch: topologyEpoch, healthEpoch: healthEpoch,
+		evidenceRevision: evidenceRevision, capacityRevision: capacityRevision, builtAt: now,
+		eligibleLeaves: make(map[proto.TargetID]bool, len(e.paths)),
+		presentLeaves:  make(map[proto.TargetID]bool, len(e.paths)),
+		latest:         make(map[proto.TargetID]*pathSlot, len(e.paths)),
+		qualities:      make(map[proto.TargetID]transport.PathQuality, len(e.paths)),
+	}
+	for _, slot := range e.paths {
+		targetID := slot.localTXTargetID
+		if targetID == (proto.TargetID{}) {
+			continue
+		}
+		projection.presentLeaves[targetID] = true
+		if slot.dispatchStalled.Load() {
+			continue
+		}
+		projection.eligibleLeaves[targetID] = true
+		if previous := projection.latest[targetID]; previous == nil || slot.gen > previous.gen {
+			quality, transition := slot.schedulingQualityProjection(now, e.limits.ProbeInterval)
+			projection.latest[targetID] = slot
+			projection.qualities[targetID] = quality
+			projection.validUntil = earlierProjectionBoundary(projection.validUntil, transition)
+		}
+	}
+	e.pathsMu.RUnlock()
+	projection.eligibleNodes = executionNodeAvailability(runtime.plan, projection.eligibleLeaves)
+	projection.presentNodes = executionNodeAvailability(runtime.plan, projection.presentLeaves)
+	projection.scheduling = bondDispatchScheduling(
+		projection.latest, delivered, acknowledged, now, topologyEpoch,
+	)
+	projection.scheduling.healthEpoch = healthEpoch
+	projection.scheduling.capacityRevision = capacityRevision
+	projection.scheduling.evidenceSource = e
+	projection.scheduling.evidenceRevision = evidenceRevision
+	projection.validUntil = earlierProjectionBoundary(
+		projection.validUntil, bondEvidenceProjectionBoundary(delivered, now),
+	)
+	if topologyEpoch != 0 && (e.currentPathTopologyEpoch() != topologyEpoch ||
+		e.healthEvidenceEpoch.Load() != healthEpoch ||
+		e.bondEvidenceRevision.Load() != evidenceRevision ||
+		e.bondCapacityRevision.Load() != capacityRevision) {
+		return nil, false
+	}
+	return projection, true
+}
+
+func (e *Engine) recursiveDispatchTicket(
+	runtime *executionRuntime,
+	controlFallback bool,
+	now time.Time,
+) (dispatchTicket, recursiveDispatchSnapshot, error) {
+	ticket, snapshot, err := e.reserveRecursiveDispatchTicket(runtime, controlFallback, now)
+	if err != nil {
+		return dispatchTicket{}, snapshot, err
+	}
+	routes := append([]dispatchRoute(nil), ticket.routes...)
+	ticket.finalizeScheduling(true)
+	ticket.routes = routes
+	return ticket, snapshot, nil
+}
+
+func (e *Engine) reserveRecursiveDispatchTicket(
+	runtime *executionRuntime,
+	controlFallback bool,
+	now time.Time,
+) (dispatchTicket, recursiveDispatchSnapshot, error) {
+	if runtime == nil {
+		return dispatchTicket{}, recursiveDispatchSnapshot{}, errExecutionRuntimeNotConfigured
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		topologyEpoch := e.currentPathTopologyEpoch()
+		healthEpoch := e.healthEvidenceEpoch.Load()
+		evidenceRevision := e.bondEvidenceRevision.Load()
+		capacityRevision := e.bondCapacityRevision.Load()
+		projection := runtime.cachedRecursiveDispatchProjection(
+			topologyEpoch, healthEpoch, evidenceRevision, capacityRevision, now,
+		)
+		if projection == nil {
+			base := runtime.cachedRecursiveDispatchProjectionBase(
+				topologyEpoch, healthEpoch, capacityRevision, now,
+			)
+			if base != nil && base.evidenceRevision != evidenceRevision {
+				projection = base.withEvidenceRevision(e, evidenceRevision, now)
+				if !projection.currentAt(
+					e.currentPathTopologyEpoch(), e.healthEvidenceEpoch.Load(),
+					e.bondEvidenceRevision.Load(), e.bondCapacityRevision.Load(), now,
+				) {
+					projection = nil
+				} else {
+					runtime.cacheRecursiveDispatchProjection(projection)
+				}
+			}
+		}
+		if projection == nil {
+			var delivered map[proto.TargetID]speedEstimate
+			var acknowledged map[proto.TargetID]uint64
+			if runtime.hasBond {
+				var cached bool
+				delivered, acknowledged, cached = runtime.cachedBondDeliveryEvidence(
+					topologyEpoch, evidenceRevision, now,
+				)
+				if !cached {
+					runtime.bondEvidenceRebuilds.Add(1)
+					var valid bool
+					delivered, acknowledged, valid = e.targetBondSchedulingEvidenceAtEpoch(now, topologyEpoch)
+					if !valid || e.bondEvidenceRevision.Load() != evidenceRevision {
+						continue
+					}
+					runtime.cacheBondDeliveryEvidence(
+						topologyEpoch, evidenceRevision, now, delivered, acknowledged,
+					)
+				}
+			}
+			var built bool
+			projection, built = e.buildRecursiveDispatchProjection(
+				runtime, now, topologyEpoch, healthEpoch, evidenceRevision, capacityRevision,
+				delivered, acknowledged,
+			)
+			if !built {
+				continue
+			}
+			if runtime.hasBond {
+				runtime.cacheRecursiveDispatchProjection(projection)
+			}
+		}
+		ticket, err := runtime.reserveTicketFromProjection(
+			projection, controlFallback, e.Packetized(),
+			e.limits.BondPinSize, e.limits.BondStuckRTTMultiplier,
+		)
+		if err != nil {
+			return dispatchTicket{}, recursiveDispatchSnapshot{}, err
+		}
+		if !projection.currentAt(
+			e.currentPathTopologyEpoch(), e.healthEvidenceEpoch.Load(),
+			e.bondEvidenceRevision.Load(), e.bondCapacityRevision.Load(), now,
+		) {
+			ticket.finalizeSchedulingStale()
+			continue
+		}
+		return ticket, recursiveDispatchSnapshot{
+			topologyEpoch: projection.topologyEpoch,
+			latest:        projection.latest, capacities: projection.scheduling.effectiveWeights,
+			projection: projection,
+		}, nil
+	}
+	return dispatchTicket{}, recursiveDispatchSnapshot{}, errNoExecutionRoute
 }
 
 func (e *Engine) dispatchRecursiveMode(
@@ -1022,45 +2170,11 @@ func (e *Engine) dispatchRecursiveMode(
 				return ErrWriteDeadlineExceeded
 			}
 		}
-		e.pathsMu.RLock()
-		topologyEpoch := e.currentPathTopologyEpoch()
-		attached := make(map[proto.TargetID]bool, len(e.paths))
-		present := make(map[proto.TargetID]bool, len(e.paths))
-		latest := make(map[proto.TargetID]*pathSlot, len(e.paths))
-		qualities := make(map[proto.TargetID]transport.PathQuality, len(e.paths))
-		capacities := make(map[proto.TargetID]uint64, len(e.paths))
-		for _, slot := range e.paths {
-			if slot.localTXTargetID == (proto.TargetID{}) {
-				continue
-			}
-			present[slot.localTXTargetID] = true
-			if slot.dispatchStalled.Load() {
-				continue
-			}
-			attached[slot.localTXTargetID] = true
-			if previous := latest[slot.localTXTargetID]; previous == nil || slot.gen > previous.gen {
-				latest[slot.localTXTargetID] = slot
-				qualities[slot.localTXTargetID] = slot.latestObservedQuality()
-				capacities[slot.localTXTargetID] = uint64(slot.spec.Weight)
-			}
-		}
-		e.pathsMu.RUnlock()
+		ticket, snapshot, err := e.reserveRecursiveDispatchTicket(runtime, controlFallback, nowFn())
 		if handedOff() {
+			ticket.finalizeScheduling(false)
 			return errSelectorCutoverHandoff
 		}
-
-		selectorPresence := present
-		if controlFallback {
-			// Sequenced recovery/control traffic may escape a blocked selected
-			// carrier so FIN, policy, and retirement cannot deadlock behind
-			// application DATA. DATA, including replay, always uses physical
-			// presence and therefore requires an authorized selector cutover.
-			selectorPresence = attached
-		}
-		ticket, err := runtime.buildTicketObservedPresence(
-			attached, selectorPresence, qualities, capacities, e.Packetized(),
-			e.limits.BondPinSize, e.limits.BondStuckRTTMultiplier,
-		)
 		if err != nil {
 			if err != errNoExecutionRoute {
 				if acknowledged() {
@@ -1073,30 +2187,39 @@ func (e *Engine) dispatchRecursiveMode(
 			}
 			continue
 		}
+		topologyEpoch := snapshot.topologyEpoch
+		latest := snapshot.latest
 		multiRoute := len(ticket.routes) > 1
+		// routes aliases runtime scratch until the scheduling reservation is
+		// finalized. Capture every value needed after finalization while the
+		// reservation still owns runtime.mu.
+		strictSelector := application && ticket.kind == proto.ExecutionKindSelector &&
+			len(ticket.routes) == 1 && !ticket.routes[0].bonded
 		if multiRoute {
 			e.noteApplicationDispatchPlanAtEpoch(frame, ticket.routes, topologyEpoch)
 		}
 
 		type routeCandidate struct {
-			slot *pathSlot
-			job  pathDispatchJob
+			routeIndex int
+			slot       *pathSlot
+			job        pathDispatchJob
 		}
 		candidates := make([]routeCandidate, 0, len(ticket.routes))
-		for _, route := range ticket.routes {
+		for routeIndex, route := range ticket.routes {
 			slot := latest[route.targetID]
 			if slot == nil {
 				continue
 			}
-			generation := slot.dispatchNextGen.Add(1)
-			candidates = append(candidates, routeCandidate{slot: slot, job: pathDispatchJob{
-				frame:            frame,
-				bonded:           route.bonded,
-				routePlanned:     multiRoute,
-				topologyEpoch:    topologyEpoch,
-				firstPublication: firstPublication,
-				admission:        admission,
-				generation:       generation,
+			candidates = append(candidates, routeCandidate{routeIndex: routeIndex, slot: slot, job: pathDispatchJob{
+				frame:                         frame,
+				bonded:                        route.bonded,
+				capacityQualification:         route.capacityQualification,
+				capacityQualificationPressure: route.capacityQualificationPressure,
+				capacityQualificationComplete: route.capacityQualificationComplete,
+				routePlanned:                  multiRoute,
+				topologyEpoch:                 topologyEpoch,
+				firstPublication:              firstPublication,
+				admission:                     admission,
 			}})
 		}
 		if len(candidates) > 1 {
@@ -1106,9 +2229,11 @@ func (e *Engine) dispatchRecursiveMode(
 			}
 			dispatches, err := e.prepareLogicalFrameDispatchFanout(jobs)
 			if errors.Is(err, errFrameRetiredBeforeWrite) {
+				ticket.finalizeScheduling(false)
 				return nil
 			}
 			if err != nil {
+				ticket.finalizeScheduling(false)
 				return err
 			}
 			for index := range candidates {
@@ -1119,17 +2244,41 @@ func (e *Engine) dispatchRecursiveMode(
 
 		results := make(chan pathDispatchResult, len(candidates))
 		submitted := 0
-		submittedSlots := make(map[*pathSlot]uint64, len(candidates))
+		submittedSlots := make(map[*pathSlot]pathDispatchIdentity, len(candidates))
 		submittedBonded := make(map[*pathSlot]bool, len(candidates))
+		if hook := e.recursiveDispatchBeforeAdmission; hook != nil {
+			hook(snapshot.projection)
+		}
+		e.selectorCutoverMu.Lock()
+		if !replayPreemptingControl && e.selectorCutoverPending {
+			e.selectorCutoverHandedOff = true
+			if firstPublication {
+				e.selectorCutoverReplayRequired = true
+			}
+			e.selectorCutoverMu.Unlock()
+			ticket.finalizeScheduling(false)
+			return errSelectorCutoverHandoff
+		}
+		if snapshot.projection != nil && !snapshot.projection.currentAt(
+			e.currentPathTopologyEpoch(), e.healthEvidenceEpoch.Load(),
+			e.bondEvidenceRevision.Load(), e.bondCapacityRevision.Load(), nowFn(),
+		) {
+			e.selectorCutoverMu.Unlock()
+			ticket.finalizeSchedulingStale()
+			continue
+		}
 		for index := range candidates {
 			candidate := &candidates[index]
 			candidate.job.result = results
-			if candidate.slot.submitDispatch(candidate.job) {
+			if identity, ok := candidate.slot.submitDispatchTracked(candidate.job); ok {
 				submitted++
-				submittedSlots[candidate.slot] = candidate.job.generation
+				ticket.markRouteAdmitted(candidate.routeIndex)
+				submittedSlots[candidate.slot] = identity
 				submittedBonded[candidate.slot] = candidate.job.bonded
 			}
 		}
+		e.selectorCutoverMu.Unlock()
+		ticket.finalizeSchedulingAdmitted()
 		if submitted == 0 {
 			if handedOff() {
 				return errSelectorCutoverHandoff
@@ -1155,9 +2304,9 @@ func (e *Engine) dispatchRecursiveMode(
 		stallTimer := time.NewTimer(e.executionStallWindow(stallWindowSlots))
 		stallTimerC := stallTimer.C
 		appTimer, appTimerC, appWake, appExpired := e.applicationDispatchDeadline(application)
-		pending := make(map[*pathSlot]uint64, submitted)
-		for slot, generation := range submittedSlots {
-			pending[slot] = generation
+		pending := make(map[*pathSlot]pathDispatchIdentity, submitted)
+		for slot, identity := range submittedSlots {
+			pending[slot] = identity
 		}
 		var ackWake <-chan struct{}
 		if trackACK {
@@ -1182,7 +2331,7 @@ func (e *Engine) dispatchRecursiveMode(
 				stopDeadlineTimer(appTimer)
 				return nil
 			}
-			e.markDispatchPending(pending)
+			e.markDispatchCutoverPending(pending)
 			stopDeadlineTimer(budgetTimer)
 			stopDeadlineTimer(stallTimer)
 			stopDeadlineTimer(appTimer)
@@ -1190,7 +2339,7 @@ func (e *Engine) dispatchRecursiveMode(
 			return errSelectorCutoverHandoff
 		}
 		if handedOff() {
-			e.markDispatchPending(pending)
+			e.markDispatchCutoverPending(pending)
 			stopDeadlineTimer(budgetTimer)
 			stopDeadlineTimer(stallTimer)
 			stopDeadlineTimer(appTimer)
@@ -1209,8 +2358,6 @@ func (e *Engine) dispatchRecursiveMode(
 			return ErrWriteDeadlineExceeded
 		}
 		stalled := false
-		strictSelector := application && ticket.kind == proto.ExecutionKindSelector &&
-			len(ticket.routes) == 1 && !ticket.routes[0].bonded
 		remaining := submitted
 		for remaining > 0 && !stalled {
 			select {
@@ -1256,11 +2403,11 @@ func (e *Engine) dispatchRecursiveMode(
 					stopDeadlineTimer(appTimer)
 					return nil
 				}
-				for slot, generation := range pending {
+				for slot, identity := range pending {
 					if submittedBonded[slot] && !slot.dispatchStalled.Load() {
 						runtime.stuckSkips.Add(1)
 					}
-					slot.markDispatchStalled(generation)
+					slot.markDispatchStalled(identity)
 				}
 				if strictSelector {
 					// The selected target still owns this immutable frame. Its
@@ -1274,7 +2421,7 @@ func (e *Engine) dispatchRecursiveMode(
 				stalled = true
 			case <-cutoverWake:
 				if handedOff() {
-					e.markDispatchPending(pending)
+					e.markDispatchCutoverPending(pending)
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
 					stopDeadlineTimer(appTimer)
@@ -1288,7 +2435,7 @@ func (e *Engine) dispatchRecursiveMode(
 						stopDeadlineTimer(appTimer)
 						return nil
 					}
-					e.markDispatchPending(pending)
+					e.markDispatchCutoverPending(pending)
 					stopDeadlineTimer(budgetTimer)
 					stopDeadlineTimer(stallTimer)
 					stopDeadlineTimer(appTimer)
@@ -1419,15 +2566,14 @@ func (e *Engine) dispatchFlatSelectorApplication(
 	acknowledged := func() bool {
 		return trackACK && e.applicationDispatchAcknowledged(ackTarget)
 	}
-	generation := slot.dispatchNextGen.Add(1)
-	if !slot.submitDispatch(pathDispatchJob{
+	identity, submitted := slot.submitDispatchTracked(pathDispatchJob{
 		frame:            frame,
 		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
 		admission:        admission,
 		applicationWait:  waiter,
-		generation:       generation,
-	}) {
+	})
+	if !submitted {
 		releaseApplicationDispatchWaiter(waiter)
 		return false, nil
 	}
@@ -1435,7 +2581,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 	stalled := false
 	for {
 		if handedOff() {
-			slot.markDispatchStalled(generation)
+			slot.markDispatchCutoverHandoff(identity)
 			abandonApplicationDispatchWaiter(waiter)
 			return true, errSelectorCutoverHandoff
 		}
@@ -1449,7 +2595,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 				abandonApplicationDispatchWaiter(waiter)
 				return true, nil
 			}
-			slot.markDispatchStalled(generation)
+			slot.markDispatchStalled(identity)
 			abandonApplicationDispatchWaiter(waiter)
 			return true, ErrWriteDeadlineExceeded
 		}
@@ -1473,7 +2619,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 				abandonApplicationDispatchWaiter(waiter)
 				return true, nil
 			}
-			slot.markDispatchStalled(generation)
+			slot.markDispatchStalled(identity)
 			if e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication) {
 				abandonApplicationDispatchWaiter(waiter)
 				return true, errSelectorCutoverHandoff
@@ -1521,7 +2667,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 			return true, nil
 		case <-timerC:
 			if handedOff() {
-				slot.markDispatchStalled(generation)
+				slot.markDispatchCutoverHandoff(identity)
 				abandonApplicationDispatchWaiter(waiter)
 				return true, errSelectorCutoverHandoff
 			}
@@ -1532,16 +2678,16 @@ func (e *Engine) dispatchFlatSelectorApplication(
 			}
 			switch waitReason {
 			case flatSelectorWaitStall:
-				slot.markDispatchStalled(generation)
+				slot.markDispatchStalled(identity)
 				stalled = true
 			case flatSelectorWaitApplicationDeadline:
 				if _, _, expired := e.writeDeadlineSnapshot(); expired {
-					slot.markDispatchStalled(generation)
+					slot.markDispatchStalled(identity)
 					abandonApplicationDispatchWaiter(waiter)
 					return true, ErrWriteDeadlineExceeded
 				}
 			case flatSelectorWaitMigrationBudget:
-				slot.markDispatchStalled(generation)
+				slot.markDispatchStalled(identity)
 				abandonApplicationDispatchWaiter(waiter)
 				return true, e.executionBudgetExceeded()
 			}
@@ -1550,7 +2696,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 		case <-cutoverWake:
 			e.stopFlatSelectorDispatchTimer()
 			if handedOff() {
-				slot.markDispatchStalled(generation)
+				slot.markDispatchCutoverHandoff(identity)
 				abandonApplicationDispatchWaiter(waiter)
 				return true, errSelectorCutoverHandoff
 			}
@@ -1559,7 +2705,7 @@ func (e *Engine) dispatchFlatSelectorApplication(
 					abandonApplicationDispatchWaiter(waiter)
 					return true, nil
 				}
-				slot.markDispatchStalled(generation)
+				slot.markDispatchCutoverHandoff(identity)
 				if e.handoffSelectorCutoverDispatch(cutoverGeneration, !firstPublication) {
 					abandonApplicationDispatchWaiter(waiter)
 					return true, errSelectorCutoverHandoff
@@ -1629,12 +2775,11 @@ func (e *Engine) acceptFlatSelectorPacketDispatch(
 		return true, net.ErrClosed
 	}
 
-	generation := slot.dispatchNextGen.Add(1)
 	custodyTicket := e.nextDispatchCustodyTicketLocked()
 	if !slot.submitDispatch(pathDispatchJob{
 		frame: frame, topologyEpoch: topologyEpoch, firstPublication: firstPublication,
 		admission:      admission,
-		acceptedPacket: true, custodyTicket: custodyTicket, generation: generation,
+		acceptedPacket: true, custodyTicket: custodyTicket,
 	}) {
 		return false, nil
 	}
@@ -1650,7 +2795,7 @@ type flatSelectorPacketDispatch struct {
 	slot              *pathSlot
 	waiter            *applicationDispatchWaiter
 	firstPublication  bool
-	generation        uint64
+	identity          pathDispatchIdentity
 	migrationDeadline time.Time
 	stallDeadline     time.Time
 	ackTarget         uint64
@@ -1696,21 +2841,20 @@ func (e *Engine) startFlatSelectorPacketDispatch(
 	}
 
 	waiter := acquireApplicationDispatchWaiter()
-	generation := slot.dispatchNextGen.Add(1)
-	if !slot.submitDispatch(pathDispatchJob{
+	identity, submitted := slot.submitDispatchTracked(pathDispatchJob{
 		frame:            frame,
 		topologyEpoch:    topologyEpoch,
 		firstPublication: firstPublication,
 		admission:        admission,
 		applicationWait:  waiter,
-		generation:       generation,
-	}) {
+	})
+	if !submitted {
 		releaseApplicationDispatchWaiter(waiter)
 		return nil, false, nil
 	}
 	ackTarget, _ := applicationDispatchAckTarget(frame)
 	return &flatSelectorPacketDispatch{
-		runtime: runtime, slot: slot, waiter: waiter, generation: generation,
+		runtime: runtime, slot: slot, waiter: waiter, identity: identity,
 		firstPublication:  firstPublication,
 		migrationDeadline: migrationDeadline,
 		stallDeadline:     nowFn().Add(e.executionStallWindowForSlot(slot)),
@@ -1728,8 +2872,18 @@ func (e *Engine) flatSelectorDispatchSlot(
 	if runtime == nil || !runtime.flatLeafSelector {
 		return nil, 0
 	}
-	e.pathsMu.RLock()
 	topologyEpoch := e.currentPathTopologyEpoch()
+	healthEpoch := e.healthEvidenceEpoch.Load()
+	if slot, cached := runtime.cachedFlatSelectorDispatchSlot(
+		topologyEpoch, healthEpoch, requireBatch,
+	); cached && e.currentPathTopologyEpoch() == topologyEpoch &&
+		e.healthEvidenceEpoch.Load() == healthEpoch && !slot.dispatchStalled.Load() {
+		return slot, topologyEpoch
+	}
+
+	e.pathsMu.RLock()
+	topologyEpoch = e.currentPathTopologyEpoch()
+	healthEpoch = e.healthEvidenceEpoch.Load()
 	eligible := make(map[proto.TargetID]bool, len(e.paths))
 	present := make(map[proto.TargetID]bool, len(e.paths))
 	latest := make(map[proto.TargetID]*pathSlot, len(e.paths))
@@ -1754,11 +2908,19 @@ func (e *Engine) flatSelectorDispatchSlot(
 	}
 	e.pathsMu.RUnlock()
 
-	targetID, ok := runtime.flatSelectorDispatchLeaf(eligible, present)
-	if !ok {
+	if e.currentPathTopologyEpoch() != topologyEpoch ||
+		e.healthEvidenceEpoch.Load() != healthEpoch {
 		return nil, topologyEpoch
 	}
-	return latest[targetID], topologyEpoch
+	slot := runtime.resolveFlatSelectorDispatchSlot(
+		eligible, present, latest, topologyEpoch, healthEpoch, requireBatch,
+	)
+	if e.currentPathTopologyEpoch() != topologyEpoch ||
+		e.healthEvidenceEpoch.Load() != healthEpoch ||
+		(slot != nil && slot.dispatchStalled.Load()) {
+		return nil, topologyEpoch
+	}
+	return slot, topologyEpoch
 }
 
 func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDispatch) error {
@@ -1785,7 +2947,7 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return nil
 			}
-			dispatch.slot.markDispatchStalled(dispatch.generation)
+			dispatch.slot.markDispatchStalled(dispatch.identity)
 			abandonApplicationDispatchWaiter(dispatch.waiter)
 			return ErrWriteDeadlineExceeded
 		}
@@ -1809,7 +2971,7 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return nil
 			}
-			dispatch.slot.markDispatchStalled(dispatch.generation)
+			dispatch.slot.markDispatchCutoverHandoff(dispatch.identity)
 			if e.handoffSelectorCutoverDispatch(cutoverGeneration, !dispatch.firstPublication) {
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return errSelectorCutoverHandoff
@@ -1862,16 +3024,16 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 			}
 			switch waitReason {
 			case flatSelectorWaitStall:
-				dispatch.slot.markDispatchStalled(dispatch.generation)
+				dispatch.slot.markDispatchStalled(dispatch.identity)
 				stalled = true
 			case flatSelectorWaitApplicationDeadline:
 				if _, _, expired := e.writeDeadlineSnapshot(); expired {
-					dispatch.slot.markDispatchStalled(dispatch.generation)
+					dispatch.slot.markDispatchStalled(dispatch.identity)
 					abandonApplicationDispatchWaiter(dispatch.waiter)
 					return ErrWriteDeadlineExceeded
 				}
 			case flatSelectorWaitMigrationBudget:
-				dispatch.slot.markDispatchStalled(dispatch.generation)
+				dispatch.slot.markDispatchStalled(dispatch.identity)
 				abandonApplicationDispatchWaiter(dispatch.waiter)
 				return e.executionBudgetExceeded()
 			}
@@ -1884,7 +3046,7 @@ func (e *Engine) waitFlatSelectorPacketDispatch(dispatch *flatSelectorPacketDisp
 					abandonApplicationDispatchWaiter(dispatch.waiter)
 					return nil
 				}
-				dispatch.slot.markDispatchStalled(dispatch.generation)
+				dispatch.slot.markDispatchCutoverHandoff(dispatch.identity)
 				if e.handoffSelectorCutoverDispatch(cutoverGeneration, !dispatch.firstPublication) {
 					abandonApplicationDispatchWaiter(dispatch.waiter)
 					return errSelectorCutoverHandoff
@@ -1948,8 +3110,8 @@ func (e *Engine) executionStallWindowForSlot(slot *pathSlot) time.Duration {
 	if slot == nil {
 		return window
 	}
-	quality := slot.latestObservedQuality()
-	if quality.At.IsZero() || nowFn().Sub(quality.At) > selectorEvidenceFreshFor {
+	quality := slot.latestSchedulingQuality(nowFn(), e.limits.ProbeInterval)
+	if quality == (transport.PathQuality{}) {
 		return window
 	}
 	if candidate := 4*quality.RTT + 2*quality.Jitter; candidate > window {
@@ -2030,9 +3192,15 @@ func (e *Engine) applicationDispatchDeadline(enabled bool) (*time.Timer, <-chan 
 	return timer, timerC, wake, expired
 }
 
-func (e *Engine) markDispatchPending(pending map[*pathSlot]uint64) {
-	for slot, generation := range pending {
-		slot.markDispatchStalled(generation)
+func (e *Engine) markDispatchPending(pending map[*pathSlot]pathDispatchIdentity) {
+	for slot, identity := range pending {
+		slot.markDispatchStalled(identity)
+	}
+}
+
+func (e *Engine) markDispatchCutoverPending(pending map[*pathSlot]pathDispatchIdentity) {
+	for slot, identity := range pending {
+		slot.markDispatchCutoverHandoff(identity)
 	}
 }
 

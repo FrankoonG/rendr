@@ -35,7 +35,73 @@ func (e *Engine) arbitrateOutgoingLeafMobilityLocked(localActor proto.LeafMobili
 	return nil
 }
 
+func (r *leafMobilityRuntime) completedClientWinnerForServerPrepareLocked(
+	binding proto.LeafMobilityPeerPlanBinding,
+) (PathRef, *pathSlot, bool) {
+	if binding.ActorSide != proto.LeafMobilityActorServer {
+		return PathRef{}, nil, false
+	}
+	var source PathRef
+	var sourceSlot *pathSlot
+	for _, terminal := range r.actorTerminal {
+		if !completedClientTerminalSupersedesServerPrepare(terminal, binding) {
+			continue
+		}
+		if source.ID != 0 && source != terminal.source {
+			return PathRef{}, nil, false
+		}
+		source = terminal.source
+		sourceSlot = terminal.sourceSlot
+	}
+	return source, sourceSlot, source.ID != 0
+}
+
+func (r *leafMobilityRuntime) activeClientWinnerForServerPrepareLocked(
+	binding proto.LeafMobilityPeerPlanBinding,
+) (PathRef, *pathSlot, bool) {
+	if r.outgoing == nil ||
+		!clientPrepareSupersedesServerPrepare(r.outgoing.prepare.LeafMobilityPeerPlanBinding, binding) {
+		return PathRef{}, nil, false
+	}
+	return r.outgoing.source, r.outgoing.sourceSlot, r.outgoing.source.ID != 0
+}
+
+func completedClientTerminalSupersedesServerPrepare(
+	terminal actorLeafMobilityTombstone,
+	binding proto.LeafMobilityPeerPlanBinding,
+) bool {
+	return terminal.resolution.Stage == proto.LeafMobilityPeerPlanCommitStageComplete &&
+		terminal.releasedAck.Phase == proto.LeafMobilityPeerPlanAckPhaseReleased &&
+		terminal.releasedAck.Code == proto.LeafMobilityPeerPlanAckCodeAccept &&
+		clientPrepareSupersedesServerPrepare(terminal.prepare.LeafMobilityPeerPlanBinding, binding)
+}
+
+func clientPrepareSupersedesServerPrepare(winner, binding proto.LeafMobilityPeerPlanBinding) bool {
+	return winner.ActorSide == proto.LeafMobilityActorClient &&
+		binding.ActorSide == proto.LeafMobilityActorServer &&
+		winner.CoordinatorSide == binding.CoordinatorSide &&
+		winner.SessionKind == binding.SessionKind &&
+		winner.Operation == binding.Operation && winner.Fallback == binding.Fallback &&
+		winner.SessionEpoch == binding.SessionEpoch &&
+		winner.ClientGraph == binding.ClientGraph && winner.ServerGraph == binding.ServerGraph &&
+		winner.SubjectClientTargetID == binding.SubjectClientTargetID &&
+		winner.SubjectServerTargetID == binding.SubjectServerTargetID &&
+		winner.BaseGeneration == binding.BaseGeneration &&
+		winner.ResourceScope == binding.ResourceScope &&
+		winner.SubjectRouteGeneration == binding.SubjectRouteGeneration
+}
+
 func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed bool, prepare proto.LeafMobilityPeerPlanPrepare) error {
+	return e.handleLeafMobilityPrepareOnSlot(source, nil, seq, replayed, prepare)
+}
+
+func (e *Engine) handleLeafMobilityPrepareOnSlot(
+	source PathRef,
+	sourceSlot *pathSlot,
+	seq uint64,
+	replayed bool,
+	prepare proto.LeafMobilityPeerPlanPrepare,
+) error {
 	if seq == 0 {
 		return fmt.Errorf("leaf mobility PREPARE has zero OOB message sequence")
 	}
@@ -58,7 +124,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		if len(rejected.frame) == 0 {
 			return e.republishRejectedLeafMobilityPrepare(rejected)
 		}
-		return e.replayLeafMobilityResponse(source, rejected.frame, rejected.retireAfter)
+		return e.replayLeafMobilityResponseOnSlot(source, rejected.sourceSlot, rejected.frame, rejected.retireAfter)
 	}
 	if completed, ok := e.leafTx.completed[prepare.TransactionID]; ok {
 		e.leafTx.mu.Unlock()
@@ -71,7 +137,9 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 			}
 			return fmt.Errorf("completed leaf mobility prepare changed route")
 		}
-		return e.replayLeafMobilityResponse(source, completed.preparedFrame, now.Add(e.limits.MigrationBudget))
+		return e.replayLeafMobilityResponseOnSlot(
+			source, completed.sourceSlot, completed.preparedFrame, now.Add(e.limits.MigrationBudget),
+		)
 	}
 	if incoming := e.leafTx.incoming[prepare.TransactionID]; incoming != nil {
 		frame := append([]byte(nil), incoming.preparedFrame...)
@@ -94,7 +162,15 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 			}
 			return e.publishIncomingLeafMobilityPrepared(incoming, source, prepared, deadline)
 		}
-		return e.replayLeafMobilityResponse(source, frame, deadline)
+		return e.replayLeafMobilityResponseOnSlot(source, incoming.sourceSlot, frame, deadline)
+	}
+	if winner, _, ok := e.leafTx.completedClientWinnerForServerPrepareLocked(prepare.LeafMobilityPeerPlanBinding); ok &&
+		winner == source {
+		e.leafTx.mu.Unlock()
+		return e.rejectLeafMobilityPrepareOnSlot(source, sourceSlot, seq, prepare, digest,
+			proto.LeafMobilityPeerPlanAckCodeBusy,
+			"simultaneous server transaction lost completed client arbitration",
+			now.Add(time.Second))
 	}
 	if len(e.leafTx.incoming)+len(e.leafTx.completed)+len(e.leafTx.rejected) >= leafMobilityRecordLimit {
 		e.leafTx.mu.Unlock()
@@ -106,12 +182,21 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		localActor := outgoing.prepare.ActorSide
 		if localActor == proto.LeafMobilityActorClient || outgoing.commitIssued.Load() {
 			e.leafTx.mu.Unlock()
-			return e.rejectLeafMobilityPrepare(source, seq, prepare, digest, proto.LeafMobilityPeerPlanAckCodeBusy, "simultaneous transaction lost arbitration", now.Add(time.Second))
+			return e.rejectLeafMobilityPrepareOnSlot(source, sourceSlot, seq, prepare, digest, proto.LeafMobilityPeerPlanAckCodeBusy, "simultaneous transaction lost arbitration", now.Add(time.Second))
 		}
 		if prepare.ActorSide == proto.LeafMobilityActorClient {
-			select {
-			case outgoing.preempt <- ErrLeafMobilityAuthorityBusy:
-			default:
+			outgoing.requestPreemption(ErrLeafMobilityAuthorityBusy)
+			if outgoing.authority != nil {
+				e.leafTx.mu.Unlock()
+				// A PREPARED local server transaction may need a correlated
+				// rollback receipt before releasing its resource. The same inbox
+				// processes that receipt, so waiting here would deadlock it. Keep
+				// this rejection immutable and let the preferred client retry with
+				// a fresh transaction after cancellation completes.
+				return e.rejectLeafMobilityPrepareOnSlot(source, sourceSlot, seq, prepare, digest,
+					proto.LeafMobilityPeerPlanAckCodeBusy,
+					"preferred client preempted a prepared server transaction; retry",
+					now.Add(time.Second))
 			}
 			// The client is the deterministic winner. Keep one Planning record
 			// while the local server proposal observes preemption; do not emit a
@@ -119,7 +204,7 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		}
 	}
 	incoming := &incomingLeafMobilityTransaction{
-		source: source, prepare: prepare, prepareSeq: seq, digest: digest, deadline: deadline,
+		source: source, sourceSlot: sourceSlot, prepare: prepare, prepareSeq: seq, digest: digest, deadline: deadline,
 		retireAfter: deadline.Add(e.leafMobilityRecordRetention()), state: incomingLeafMobilityPlanning,
 	}
 	e.leafTx.incoming[prepare.TransactionID] = incoming
@@ -139,15 +224,19 @@ func (e *Engine) handleLeafMobilityPrepare(source PathRef, seq uint64, replayed 
 		e.signalLeafMobilityRetry()
 	}()
 	reject := func(code proto.LeafMobilityPeerPlanAckCode, reason string) error {
-		return e.rejectLeafMobilityPrepare(source, seq, prepare, digest, code, reason, deadline)
+		return e.rejectLeafMobilityPrepareOnSlot(source, sourceSlot, seq, prepare, digest, code, reason, deadline)
 	}
 	if err := e.validateIncomingLeafMobilityBinding(source, prepare.LeafMobilityPeerPlanBinding); err != nil {
 		return reject(proto.LeafMobilityPeerPlanAckCodeReject, err.Error())
 	}
-	claim, sourceSlot, ok := e.leafClaimForRef(source)
+	claim, currentSourceSlot, ok := e.leafClaimForRef(source)
 	if !ok {
 		return reject(proto.LeafMobilityPeerPlanAckCodeSuperseded, "bound peer leaf is unavailable")
 	}
+	if sourceSlot != nil && sourceSlot != currentSourceSlot {
+		return reject(proto.LeafMobilityPeerPlanAckCodeSuperseded, "bound peer leaf owner changed before preflight")
+	}
+	sourceSlot = currentSourceSlot
 	policyHold := e.acquireLeafMobilityPolicyHold(sourceSlot)
 	if policyHold == nil {
 		return reject(proto.LeafMobilityPeerPlanAckCodeSuperseded, "bound peer leaf changed before policy hold")
@@ -307,7 +396,7 @@ func (e *Engine) publishIncomingLeafMobilityPrepared(
 	prepared proto.LeafMobilityPeerPlanAck,
 	deadline time.Time,
 ) error {
-	_, err := e.sendLeafMobilityAckBounded(source, prepared, deadline, func(frame []byte) {
+	_, err := e.sendLeafMobilityAckBoundedOnSlot(source, incoming.sourceSlot, prepared, deadline, func(frame []byte) {
 		e.leafTx.mu.Lock()
 		if e.leafTx.incoming[prepared.TransactionID] == incoming &&
 			incoming.prepared == prepared && len(incoming.preparedFrame) == 0 {
@@ -332,6 +421,19 @@ func (r *leafMobilityRuntime) outgoingBlocksIncomingLocked(remoteActor proto.Lea
 
 func (e *Engine) rejectLeafMobilityPrepare(
 	source PathRef,
+	seq uint64,
+	prepare proto.LeafMobilityPeerPlanPrepare,
+	digest proto.LeafMobilityProposalDigest,
+	code proto.LeafMobilityPeerPlanAckCode,
+	reason string,
+	deadline time.Time,
+) error {
+	return e.rejectLeafMobilityPrepareOnSlot(source, nil, seq, prepare, digest, code, reason, deadline)
+}
+
+func (e *Engine) rejectLeafMobilityPrepareOnSlot(
+	source PathRef,
+	sourceSlot *pathSlot,
 	seq uint64,
 	prepare proto.LeafMobilityPeerPlanPrepare,
 	digest proto.LeafMobilityProposalDigest,
@@ -365,7 +467,7 @@ func (e *Engine) rejectLeafMobilityPrepare(
 		if len(frame) == 0 {
 			return e.publishRejectedLeafMobilityPrepare(existing, deadline)
 		}
-		return e.replayLeafMobilityResponse(source, frame, existing.retireAfter)
+		return e.replayLeafMobilityResponseOnSlot(source, existing.sourceSlot, frame, existing.retireAfter)
 	}
 	if len(e.leafTx.incoming)+len(e.leafTx.completed)+len(e.leafTx.rejected) >= leafMobilityRecordLimit {
 		e.leafTx.mu.Unlock()
@@ -373,12 +475,12 @@ func (e *Engine) rejectLeafMobilityPrepare(
 	}
 	delete(e.leafTx.incoming, prepare.TransactionID)
 	e.leafTx.rejected[prepare.TransactionID] = rejectedLeafMobilityTransaction{
-		source: source, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
+		source: source, sourceSlot: sourceSlot, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
 	}
 	e.leafTx.mu.Unlock()
 	e.signalLeafMobilityRetry()
 	return e.publishRejectedLeafMobilityPrepare(rejectedLeafMobilityTransaction{
-		source: source, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
+		source: source, sourceSlot: sourceSlot, prepare: prepare, prepareSeq: seq, digest: digest, ack: ack, retireAfter: retireAfter,
 	}, deadline)
 }
 
@@ -394,7 +496,7 @@ func (e *Engine) publishRejectedLeafMobilityPrepare(
 	rejected rejectedLeafMobilityTransaction,
 	deadline time.Time,
 ) error {
-	_, err := e.sendLeafMobilityAckBounded(rejected.source, rejected.ack, deadline, func(frame []byte) {
+	_, err := e.sendLeafMobilityAckBoundedOnSlot(rejected.source, rejected.sourceSlot, rejected.ack, deadline, func(frame []byte) {
 		e.leafTx.mu.Lock()
 		if current, ok := e.leafTx.rejected[rejected.prepare.TransactionID]; ok &&
 			current.prepare == rejected.prepare && current.prepareSeq == rejected.prepareSeq &&
@@ -609,15 +711,65 @@ func (e *Engine) handleLeafMobilityResolution(incoming *incomingLeafMobilityTran
 	incoming.resolutionSeq = seq
 	incoming.released = released
 	incoming.state = incomingLeafMobilityTerminalPending
+	peerCommitted := resolution.Stage == proto.LeafMobilityPeerPlanCommitStageComplete &&
+		incoming.final.Code == proto.LeafMobilityPeerPlanAckCodeAccept
 	if incoming.hold != nil {
 		if !incoming.hold.ReconcilePoison() {
 			incoming.hold.Release()
 		}
 		incoming.hold = nil
 	}
-	incoming.releasePolicyHold()
+	var policyHold *leafMobilityPolicyHold
+	if peerCommitted {
+		// Keep the selector branch pinned until the peer-route epoch and probe
+		// invalidation are both visible. A delayed probe from the predecessor
+		// epoch must not regain authority in the release window.
+		policyHold = incoming.policyHold
+		incoming.policyHold = nil
+	} else {
+		incoming.releasePolicyHold()
+	}
 	e.leafTx.mu.Unlock()
+	if peerCommitted {
+		e.commitPeerLeafMobilityEpoch(incoming)
+	}
+	if policyHold != nil {
+		policyHold.Release()
+	}
 	return e.publishLeafMobilityReleased(incoming, resolution, released)
+}
+
+// A successful peer-side endpoint migration changes the physical route seen by
+// this engine even though its local endpoint generation does not advance. The
+// local peer epoch makes both existing and delayed predecessor probes stale.
+func (e *Engine) commitPeerLeafMobilityEpoch(incoming *incomingLeafMobilityTransaction) {
+	if e == nil || incoming == nil || incoming.source.ID == 0 {
+		return
+	}
+	e.pathsMu.Lock()
+	slot := e.paths[incoming.source.ID]
+	current := slot != nil && slot.owner == incoming.source.Owner &&
+		slot == incoming.sourceSlot && slot.mobilityClaim == incoming.claim
+	if current {
+		slot.retireLegacyQualityEvidence()
+		// Dispatch submission snapshots the physical generation and publishes the
+		// job while holding dispatchMu. Advance the peer epoch under the same
+		// boundary so every job is wholly predecessor or wholly successor.
+		func() {
+			slot.dispatchMu.Lock()
+			defer slot.dispatchMu.Unlock()
+			currentEpoch := slot.peerMobilityEpoch.Load()
+			if currentEpoch == ^uint64(0) {
+				panic("engine: peer mobility epoch exhausted")
+			}
+			slot.peerMobilityEpoch.Store(currentEpoch + 1)
+		}()
+		e.advancePathTopologyEpochLocked()
+	}
+	e.pathsMu.Unlock()
+	if current {
+		e.invalidatePredecessorPathProbeEvidence(slot)
+	}
 }
 
 func (e *Engine) publishLeafMobilityReleased(

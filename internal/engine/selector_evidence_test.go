@@ -432,13 +432,95 @@ func TestSelectorEvidenceSnapshotReleasesTopologyLockAndRejectsMixedProbeGenerat
 	}
 }
 
+func TestSelectorEvidenceCommitRejectsProbeTokenRollover(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Engine, *pathSlot)
+	}{
+		{
+			name: "TX fence epoch",
+			mutate: func(_ *Engine, slot *pathSlot) {
+				slot.txFenceEpoch.Add(1)
+			},
+		},
+		{
+			name: "migration epoch",
+			mutate: func(e *Engine, _ *pathSlot) {
+				e.migrationEpoch.Add(1)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest, ids := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+				runtimeNode(proto.GraphNodeKindPath, "path"),
+			)
+			e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+			t.Cleanup(func() { _ = e.Close() })
+			if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+				t.Fatal(err)
+			}
+			path, peer := newMemoryPathPair()
+			t.Cleanup(func() { _ = peer.Close() })
+			pathID := attachFixturePath(
+				t, e, path, transport.PathSpec{Transport: "memory", Address: test.name}, ids["path"],
+			)
+			e.pathsMu.RLock()
+			slot := e.paths[pathID]
+			e.pathsMu.RUnlock()
+			if slot == nil {
+				t.Fatal("attached selector path is missing")
+			}
+
+			view, ok := e.selectorEvidenceSnapshot()
+			if !ok {
+				t.Fatal("selector evidence snapshot was unavailable")
+			}
+			commit := view.commitEvidence()
+			e.pathsMu.Lock()
+			e.healthEvidenceCommitMu.Lock()
+			baselineErr := e.validateSelectorEvidenceCommitLocked(commit)
+			e.healthEvidenceCommitMu.Unlock()
+			e.pathsMu.Unlock()
+			if baselineErr != nil {
+				t.Fatalf("fresh selector evidence failed validation: %v", baselineErr)
+			}
+
+			test.mutate(e, slot)
+			e.pathsMu.Lock()
+			e.healthEvidenceCommitMu.Lock()
+			err := e.validateSelectorEvidenceCommitLocked(commit)
+			e.healthEvidenceCommitMu.Unlock()
+			e.pathsMu.Unlock()
+			if !errors.Is(err, errStaleSelectorEvidence) {
+				t.Fatalf("selector commit after %s rollover error=%v want %v", test.name, err, errStaleSelectorEvidence)
+			}
+		})
+	}
+}
+
 func TestRecursiveSelectorMissingCurrentIsFactualPathDeath(t *testing.T) {
 	now := time.Unix(250, 0)
+	policy := selectorEvidencePolicy{
+		latencyBandRatio: 0.25, latencyBandFloor: time.Millisecond, minimumConfidence: 1,
+	}
 	manifest, ids := runtimeGraph(t,
 		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b"),
 		runtimeNode(proto.GraphNodeKindPath, "a"),
 		runtimeNode(proto.GraphNodeKindPath, "b"),
 	)
+	root, _ := manifest.Node(ids["root"])
+	root.PeakCandidates = []proto.TargetID{ids["b"]}
+	for index := range manifest.Nodes {
+		if manifest.Nodes[index].ID == root.ID {
+			manifest.Nodes[index] = root
+			break
+		}
+	}
 	runtime := mustExecutionRuntime(t, manifest)
 	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
 		t.Fatal(err)
@@ -449,7 +531,7 @@ func TestRecursiveSelectorMissingCurrentIsFactualPathDeath(t *testing.T) {
 			ids["b"]: selectorObservation(ids["b"], now, 20*time.Millisecond, 0, 1),
 		},
 		now,
-		selectorEvidencePolicy{latencyBandRatio: 0.25, latencyBandFloor: time.Millisecond, minimumConfidence: 1},
+		policy,
 		time.Hour,
 		time.Hour,
 	)
@@ -457,8 +539,158 @@ func TestRecursiveSelectorMissingCurrentIsFactualPathDeath(t *testing.T) {
 		decisions[0].targetID != ids["b"] || decisions[0].cause != "death" ||
 		decisions[0].origin != policySelectionPathDeath || !decisions[0].origin.requiresSelectorCutover() ||
 		!decisions[0].origin.isFactualFailure() || decisions[0].origin.chargesZombieBudget() {
-		t.Fatalf("decisions=%+v want factual root->b path death", decisions)
+		t.Fatalf("decisions=%+v want detached normal root->peak-b factual path death", decisions)
 	}
+
+	attachedRuntime := mustExecutionRuntime(t, manifest)
+	if err := attachedRuntime.selectChild(ids["root"], ids["a"]); err != nil {
+		t.Fatal(err)
+	}
+	attached := map[proto.TargetID]bool{ids["a"]: true, ids["b"]: true}
+	decisions = attachedRuntime.selectorDecisionFor(
+		ids["root"],
+		proto.SenderDirectionClientToServer,
+		map[proto.TargetID]pathEvidenceObservation{
+			ids["b"]: selectorObservation(ids["b"], now, 20*time.Millisecond, 0, 1),
+		},
+		attached,
+		now,
+		policy,
+		time.Hour,
+		time.Hour,
+	)
+	if len(decisions) != 0 {
+		t.Fatalf("temporarily unobserved but attached normal target crossed into peak class: %+v", decisions)
+	}
+
+	for _, nested := range []struct {
+		kind proto.GraphNodeKind
+		name string
+	}{
+		{kind: proto.GraphNodeKindSelector, name: "inner"},
+		{kind: proto.GraphNodeKindBond, name: "aggregate"},
+		{kind: proto.GraphNodeKindRace, name: "redundant"},
+	} {
+		t.Run("nested "+nested.kind.String(), func(t *testing.T) {
+			nestedManifest, nestedIDs := runtimeGraph(t,
+				runtimeNode(proto.GraphNodeKindSelector, "nested-root", nested.name, "peak"),
+				runtimeNode(nested.kind, nested.name, "nested-a", "nested-b"),
+				runtimeNode(proto.GraphNodeKindPath, "nested-a"),
+				runtimeNode(proto.GraphNodeKindPath, "nested-b"),
+				runtimeNode(proto.GraphNodeKindPath, "peak"),
+			)
+			nestedRoot, _ := nestedManifest.Node(nestedIDs["nested-root"])
+			nestedRoot.PeakCandidates = []proto.TargetID{nestedIDs["peak"]}
+			for index := range nestedManifest.Nodes {
+				if nestedManifest.Nodes[index].ID == nestedRoot.ID {
+					nestedManifest.Nodes[index] = nestedRoot
+					break
+				}
+			}
+			nestedRuntime := mustExecutionRuntime(t, nestedManifest)
+			if err := nestedRuntime.selectChild(nestedIDs["nested-root"], nestedIDs[nested.name]); err != nil {
+				t.Fatal(err)
+			}
+			if nested.kind == proto.GraphNodeKindSelector {
+				if err := nestedRuntime.selectChild(nestedIDs[nested.name], nestedIDs["nested-a"]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			peakOnly := map[proto.TargetID]pathEvidenceObservation{
+				nestedIDs["peak"]: selectorObservation(nestedIDs["peak"], now, 20*time.Millisecond, 0, 1),
+			}
+			decisions := nestedRuntime.selectorDecisionFor(
+				nestedIDs["nested-root"], proto.SenderDirectionClientToServer,
+				peakOnly,
+				map[proto.TargetID]bool{nestedIDs["nested-a"]: true, nestedIDs["peak"]: true},
+				now, policy, time.Hour, time.Hour,
+			)
+			if len(decisions) != 0 {
+				t.Fatalf("attached descendant crossed normal aggregate into peak class: %+v", decisions)
+			}
+			decisions = nestedRuntime.selectorDecisionFor(
+				nestedIDs["nested-root"], proto.SenderDirectionClientToServer,
+				peakOnly,
+				map[proto.TargetID]bool{nestedIDs["peak"]: true},
+				now, policy, time.Hour, time.Hour,
+			)
+			if len(decisions) != 1 || decisions[0].selectorID != nestedIDs["nested-root"] ||
+				decisions[0].targetID != nestedIDs["peak"] || decisions[0].origin != policySelectionPathDeath {
+				t.Fatalf("detached normal aggregate decisions=%+v want factual peak fallback", decisions)
+			}
+		})
+	}
+
+	t.Run("cutover handoff snapshot retains attached normal class", func(t *testing.T) {
+		snapshotManifest, snapshotIDs := runtimeGraph(t,
+			runtimeNode(proto.GraphNodeKindSelector, "snapshot-root", "snapshot-a", "snapshot-c"),
+			runtimeNode(proto.GraphNodeKindPath, "snapshot-a"),
+			runtimeNode(proto.GraphNodeKindPath, "snapshot-c"),
+		)
+		snapshotRoot, _ := snapshotManifest.Node(snapshotIDs["snapshot-root"])
+		snapshotRoot.PeakCandidates = []proto.TargetID{snapshotIDs["snapshot-c"]}
+		for index := range snapshotManifest.Nodes {
+			if snapshotManifest.Nodes[index].ID == snapshotRoot.ID {
+				snapshotManifest.Nodes[index] = snapshotRoot
+				break
+			}
+		}
+		e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+		t.Cleanup(func() { _ = e.Close() })
+		if err := e.ConfigureLocalGraph(1, snapshotManifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.ConfigurePeerGraph(1, snapshotManifest); err != nil {
+			t.Fatal(err)
+		}
+		var aSlot *pathSlot
+		for _, name := range []string{"snapshot-a", "snapshot-c"} {
+			path, peer := newMemoryPathPair()
+			t.Cleanup(func() { _ = peer.Close() })
+			path.quality = transport.PathQuality{RTT: 20 * time.Millisecond, At: time.Now()}
+			pathID := attachFixturePath(
+				t, e, path, transport.PathSpec{Transport: "memory", Address: name}, snapshotIDs[name],
+			)
+			if name == "snapshot-a" {
+				e.pathsMu.RLock()
+				aSlot = e.paths[pathID]
+				e.pathsMu.RUnlock()
+			}
+		}
+		if aSlot == nil {
+			t.Fatal("normal snapshot path is missing")
+		}
+		runtime := e.localExecutionRuntime()
+		if err := runtime.selectChild(snapshotIDs["snapshot-root"], snapshotIDs["snapshot-a"]); err != nil {
+			t.Fatal(err)
+		}
+		identity := pathDispatchIdentity{
+			generation: aSlot.nextDispatchGeneration(), pathGeneration: pathProbeGenerationForSlot(aSlot),
+		}
+		aSlot.markDispatchCutoverHandoff(identity)
+		defer aSlot.completeDispatch(identity)
+
+		view, ok := e.selectorEvidenceSnapshotForSelector(runtime, snapshotIDs["snapshot-root"])
+		if !ok {
+			t.Fatal("cutover handoff selector snapshot was unavailable")
+		}
+		if !view.attached[snapshotIDs["snapshot-a"]] || !view.attached[snapshotIDs["snapshot-c"]] {
+			t.Fatalf("snapshot attached=%v want normal and peak leaves", view.attached)
+		}
+		if _, observed := view.observations[snapshotIDs["snapshot-a"]]; observed {
+			t.Fatal("cutover-handoff normal path unexpectedly produced scheduling evidence")
+		}
+		if peak, observed := view.observations[snapshotIDs["snapshot-c"]]; !observed || !peak.live {
+			t.Fatalf("peak observation=%+v present=%t want live", peak, observed)
+		}
+		decisions := runtime.selectorDecisionFor(
+			snapshotIDs["snapshot-root"], proto.SenderDirectionClientToServer,
+			view.observations, view.attached, view.capturedAt, policy, time.Hour, time.Hour,
+		)
+		if len(decisions) != 0 {
+			t.Fatalf("zero-demand cutover handoff crossed into peak class: %+v", decisions)
+		}
+	})
 }
 
 func TestRecursiveSelectorPathDeathCommitsProjectedFallback(t *testing.T) {
@@ -557,6 +789,17 @@ func TestStaleSelectorObservationCannotOverwriteDeathProjection(t *testing.T) {
 	if !staleObservations[ids["c"]].live {
 		t.Fatal("pre-death selector snapshot did not contain live c")
 	}
+	migrations := make(chan struct {
+		oldID, newID uint32
+		cause        string
+	}, 2)
+	cancel := e.OnMigrate(func(oldID, newID uint32, cause string) {
+		migrations <- struct {
+			oldID, newID uint32
+			cause        string
+		}{oldID: oldID, newID: newID, cause: cause}
+	})
+	defer cancel()
 
 	runtime := e.localExecutionRuntime()
 	e.pathsMu.Lock()
@@ -595,17 +838,6 @@ func TestStaleSelectorObservationCannotOverwriteDeathProjection(t *testing.T) {
 		t.Fatalf("stale snapshot changed desired/effective=%x/%x ok=%t want c/a", desired, effective, ok)
 	}
 
-	migrations := make(chan struct {
-		oldID, newID uint32
-		cause        string
-	}, 2)
-	cancel := e.OnMigrate(func(oldID, newID uint32, cause string) {
-		migrations <- struct {
-			oldID, newID uint32
-			cause        string
-		}{oldID: oldID, newID: newID, cause: cause}
-	})
-	defer cancel()
 	decisionCommitted := make(chan struct{})
 	var decisionOnce sync.Once
 	e.selectorDecisionAfterCommit = func() {
@@ -654,13 +886,8 @@ func TestStaleSelectorObservationCannotOverwriteDeathProjection(t *testing.T) {
 		if event.oldID != pathIDs["c"] || event.newID != pathIDs["a"] || event.cause != "death" {
 			t.Fatalf("physical death migration=%+v want c->a", event)
 		}
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("physical death migration hook did not fire")
-	}
-	select {
-	case event := <-migrations:
-		t.Fatalf("one path death published a second migration: %+v", event)
-	default:
 	}
 }
 
@@ -738,6 +965,132 @@ func TestEnginePathDeathKeepsPhysicalAndSelectorFallbackAligned(t *testing.T) {
 	}
 	if got := e.MigrationCount(); got != 2 {
 		t.Fatalf("explicit+death migration count=%d want 2", got)
+	}
+}
+
+func TestEnginePathDeathAlignmentIgnoresUnrelatedHealthRevision(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: time.Hour}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ConfigurePeerGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	paths := make(map[string]*lifecycleHealthyPath, 3)
+	pathIDs := make(map[string]uint32, 3)
+	for _, name := range []string{"a", "b", "c"} {
+		path := newLifecycleHealthyPath()
+		paths[name] = path
+		pathIDs[name] = attachFixturePath(t, e, path, transport.PathSpec{Transport: "memory", Address: name}, ids[name])
+	}
+	if err := e.SelectExplicitTarget(ids["root"], ids["c"], "explicit"); err != nil {
+		t.Fatal(err)
+	}
+
+	e.pathsMu.RLock()
+	survivor := e.paths[pathIDs["a"]]
+	e.pathsMu.RUnlock()
+	if survivor == nil {
+		t.Fatal("survivor path is not attached")
+	}
+	mutated := make(chan struct{})
+	var mutateOnce sync.Once
+	e.selectorHealthBeforeCommitGate = func() {
+		mutateOnce.Do(func() {
+			survivor.mutateHealthEvidence(nil)
+			close(mutated)
+		})
+	}
+	t.Cleanup(func() { e.selectorHealthBeforeCommitGate = nil })
+
+	paths["c"].die(transport.CauseTransportError, errors.New("selected path failed"))
+	select {
+	case <-mutated:
+	case <-time.After(time.Second):
+		t.Fatal("selector alignment did not reach the commit gate")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		desired, effective, ok := e.localExecutionRuntime().selectedChild(ids["root"])
+		if ok && desired == ids["a"] && effective == ids["a"] && e.ActivePath() == pathIDs["a"] {
+			if got := e.MigrationCount(); got != 2 {
+				t.Fatalf("explicit+death migration count=%d want 2", got)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	desired, effective, ok := e.localExecutionRuntime().selectedChild(ids["root"])
+	t.Fatalf("health revision blocked topology alignment active/desired/effective=%d/%x/%x ok=%t",
+		e.ActivePath(), desired, effective, ok)
+}
+
+func TestPathDeathAlignmentCannotOverwriteNewerExplicitSelection(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "a", "b", "c"),
+		runtimeNode(proto.GraphNodeKindPath, "a"),
+		runtimeNode(proto.GraphNodeKindPath, "b"),
+		runtimeNode(proto.GraphNodeKindPath, "c"),
+	)
+	runtime := mustExecutionRuntime(t, manifest)
+	all := runtimeAttached(ids, "a", "b", "c")
+	if err := runtime.commitSelectorChildOrigin(
+		ids["root"], ids["a"], all, policySelectionExplicit, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.commitSelectorChildOrigin(
+		ids["root"], ids["c"], all, policySelectionExplicit, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model the physical projection performed when c has departed: desired
+	// remains c until the asynchronous policy-plane alignment commits, while
+	// DATA already uses manifest-order fallback a.
+	runtime.mu.Lock()
+	runtime.selectors[ids["root"]].effective = ids["a"]
+	runtime.mu.Unlock()
+	decisions := runtime.pathDeathAlignmentDecisions(runtimeAttached(ids, "a", "b"))
+	if len(decisions) != 1 || decisions[0].targetID != ids["a"] ||
+		!decisions[0].selectorState.bound {
+		t.Fatalf("path-death decisions=%+v want one state-bound fallback to a", decisions)
+	}
+
+	if err := runtime.commitSelectorChildOrigin(
+		ids["root"], ids["b"], runtimeAttached(ids, "a", "b"),
+		policySelectionExplicit, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	applied := false
+	err := runtime.commitSelectorChildOriginAtState(
+		ids["root"], decisions[0].targetID, runtimeAttached(ids, "a", "b"),
+		decisions[0].origin, decisions[0].selectorState,
+		func(map[proto.TargetID]bool) error {
+			applied = true
+			return nil
+		},
+	)
+	if !errors.Is(err, errStaleSelectorEvidence) {
+		t.Fatalf("stale path-death decision error=%v want %v", err, errStaleSelectorEvidence)
+	}
+	if applied {
+		t.Fatal("stale path-death decision reached physical route publication")
+	}
+	desired, effective, generation, ok := runtime.selectorSelection(ids["root"])
+	if !ok || desired != ids["b"] || effective != ids["b"] || generation != 3 {
+		t.Fatalf(
+			"newer explicit selection desired/effective/generation=%x/%x/%d ok=%t want b/b/3",
+			desired, effective, generation, ok,
+		)
 	}
 }
 
@@ -917,8 +1270,8 @@ func TestFirstAttachedLeafInitializesSelectorPreferenceWithoutDispatchFallback(t
 		t.Fatalf("temporary fallback routes=%+v err=%v want no route", ticket.routes, err)
 	}
 	desired, effective, _ = runtime.selectedChild(ids["root"])
-	if desired != ids["a"] || effective != (proto.TargetID{}) {
-		t.Fatalf("unavailable desired/effective=%x/%x want a/zero", desired, effective)
+	if desired != ids["a"] || effective != ids["a"] {
+		t.Fatalf("stalled desired/effective=%x/%x want a/a", desired, effective)
 	}
 	e.pathsMu.RLock()
 	aSlot, bSlot := e.paths[aID], e.paths[bID]

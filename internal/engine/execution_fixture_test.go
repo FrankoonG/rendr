@@ -45,7 +45,17 @@ func configureSymmetricLeafGroupRuntime(t *testing.T, client, server *Engine, ki
 
 func attachFixturePath(t *testing.T, e *Engine, pc transport.PathConn, spec transport.PathSpec, targetID proto.TargetID) uint32 {
 	t.Helper()
-	id, err := e.AttachPathBound(pc, spec, PathBinding{LocalTXTargetID: targetID, PeerTXTargetID: targetID})
+	binding := PathBinding{LocalTXTargetID: targetID, PeerTXTargetID: targetID}
+	if e.Packetized() {
+		packetPath, ok := pc.(transport.PacketPathConn)
+		if !ok {
+			t.Fatalf("packet fixture path %q has no capacity contract", spec.Address)
+		}
+		capacity := packetPath.MaxFrameSize()
+		binding.LocalReceiveFrameCapacity = uint32(capacity)
+		binding.PeerReceiveFrameCapacity = uint32(capacity)
+	}
+	id, err := e.AttachPathBound(pc, spec, binding)
 	if err != nil {
 		t.Fatalf("attach fixture path %q: %v", spec.Address, err)
 	}

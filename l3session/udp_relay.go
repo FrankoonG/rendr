@@ -60,6 +60,9 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 	if ev.Meta.Identity.Proto != l3ingress.ProtocolUDP {
 		return fmt.Errorf("l3session: UDP relay cannot handle %s", ev.Meta.Identity.Proto)
 	}
+	if err := requireCanonicalIdentity(ev.Meta.Identity, l3ingress.ProtocolUDP); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	closed := r.closed
 	r.mu.Unlock()
@@ -85,7 +88,7 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 		}
 		var ok bool
 		sess, ok = manager.Session(id)
-		if !ok || sess.PacketConn == nil {
+		if !ok || sess.packetConn == nil {
 			return errors.New("l3session: UDP relay missing packet session")
 		}
 		if !r.setPacketSession(id, sess) || !r.startReplyLoop(ctx, id, sess) {
@@ -93,11 +96,12 @@ func (r *UDPRelay) HandlePacket(ctx context.Context, ev l3ingress.PacketEvent) e
 			return net.ErrClosed
 		}
 	}
-	wirePacket, err := appendUDPEnvelope(nil, id, sess.Request.Egress, payload)
+	wirePacket, err := appendUDPEnvelope(nil, id, sess.request.Egress, payload)
 	if err != nil {
 		return err
 	}
-	written, err := sess.PacketConn.WriteTo(wirePacket, rendrPeerAddr)
+	packet := newDataPlanePacket(sess.packetConn, "UDPRelay rendr PacketConn", nil)
+	written, err := packet.writeTo(ctx, wirePacket, nil)
 	if err == nil && written != len(wirePacket) {
 		return fmt.Errorf("l3session: short rendr UDP request write: %d of %d", written, len(wirePacket))
 	}
@@ -141,7 +145,7 @@ func (r *UDPRelay) CloseFlowRef(ref l3ingress.FlowRef) bool {
 func (r *UDPRelay) closeFlow(id l3ingress.L3Identity, ref l3ingress.FlowRef) bool {
 	r.mu.Lock()
 	sess := r.packets[id]
-	if sess == nil || ref != (l3ingress.FlowRef{}) && sess.Request.Ref != ref {
+	if sess == nil || ref != (l3ingress.FlowRef{}) && sess.request.Ref != ref {
 		r.mu.Unlock()
 		return false
 	}
@@ -284,7 +288,7 @@ func sessionMatchesFlowRef(sess *Session, ref l3ingress.FlowRef) bool {
 	if sess == nil {
 		return false
 	}
-	return ref == (l3ingress.FlowRef{}) || sess.Request.Ref == ref
+	return ref == (l3ingress.FlowRef{}) || sess.request.Ref == ref
 }
 
 func (r *UDPRelay) setPacketSession(id l3ingress.L3Identity, sess *Session) bool {
@@ -303,13 +307,14 @@ func (r *UDPRelay) setPacketSession(id l3ingress.L3Identity, sess *Session) bool
 
 func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, sess *Session) {
 	defer r.forgetSession(id, sess)
+	packetConn := newDataPlanePacket(sess.packetConn, "UDPRelay rendr PacketConn", nil)
 	stopOnCancel := context.AfterFunc(ctx, func() {
-		_ = sess.PacketConn.SetReadDeadline(time.Now())
+		_ = packetConn.setReadDeadline(time.Now())
 	})
 	defer stopOnCancel()
 	size := r.BufferSize
-	if size <= 0 {
-		size = 64 << 10
+	if size < maxUDPPeerPayloadSize {
+		size = maxUDPPeerPayloadSize
 	}
 	buf := make([]byte, size)
 	replyID := id.Reverse()
@@ -320,32 +325,39 @@ func (r *UDPRelay) readReplies(ctx context.Context, id l3ingress.L3Identity, ses
 			return
 		default:
 		}
-		n, _, err := sess.PacketConn.ReadFrom(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		n, _, readErr := packetConn.readFrom(ctx, buf)
+		if n < 0 || n > len(buf) {
+			return
+		}
+		if n == 0 && readErr != nil {
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, net.ErrClosed) {
 				return
 			}
 			return
 		}
 		packet = packet[:0]
-		packet, err = l3ingress.AppendUDPPacket(packet, replyID, buf[:n])
-		if err != nil {
+		var appendErr error
+		packet, appendErr = l3ingress.AppendUDPPacket(packet, replyID, buf[:n])
+		if appendErr != nil {
 			return
 		}
-		if r.ReplyActivity != nil && !r.ReplyActivity.BeginUDPReply(sess.Request.Ref) {
+		if r.ReplyActivity != nil && !r.ReplyActivity.BeginUDPReply(sess.request.Ref) {
 			return
 		}
 		written, writeErr := r.Device.WriteContext(ctx, packet)
 		delivered := writeErr == nil && written == len(packet)
 		if r.ReplyActivity != nil {
-			r.ReplyActivity.EndUDPReply(sess.Request.Ref, delivered)
+			r.ReplyActivity.EndUDPReply(sess.request.Ref, delivered)
 		} else if delivered {
-			r.manager().FlowTable.TouchRef(sess.Request.Ref)
+			r.manager().FlowTable.TouchRef(sess.request.Ref)
 		}
 		if writeErr != nil {
 			return
 		}
 		if written != len(packet) {
+			return
+		}
+		if readErr != nil {
 			return
 		}
 	}

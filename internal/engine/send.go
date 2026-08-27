@@ -521,6 +521,23 @@ func (e *Engine) publishSendSeqLocked(next uint64) {
 		if entry == nil {
 			panic("engine: sequenced publication is missing its replay owner")
 		}
+		if next == current+1 {
+			if entry.application {
+				e.sendHist.pendingApplicationBytes = saturatingAddUint64(
+					e.sendHist.pendingApplicationBytes, entry.applicationBytes,
+				)
+			}
+		} else {
+			for index := range e.sendHist.entries {
+				published := &e.sendHist.entries[index]
+				if published.seq < current || published.seq >= next || !published.application {
+					continue
+				}
+				e.sendHist.pendingApplicationBytes = saturatingAddUint64(
+					e.sendHist.pendingApplicationBytes, published.applicationBytes,
+				)
+			}
+		}
 		e.publishRootAttributionLocked(entry)
 		e.sendPublishedNext.Store(next)
 		e.sendHist.generation++

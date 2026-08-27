@@ -248,10 +248,17 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 	if err := e.acquireApplicationSendSlot(frameBytes); err != nil {
 		return false, err
 	}
-	if err := e.sendMu.lockApplication(e); err != nil {
+	selectorState, selectorStateCredit, err := e.lockApplicationSendWithSelectorState(runtime)
+	if err != nil {
 		e.releaseSendSlot(false, frameBytes)
 		return false, err
 	}
+	selectorStateCreditOwned := selectorStateCredit
+	defer func() {
+		if selectorStateCreditOwned {
+			e.releaseSendSlot(true, 0)
+		}
+	}()
 	sendLocked := true
 	defer func() {
 		if sendLocked {
@@ -283,7 +290,10 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 		e.releaseSendSlot(false, frameBytes)
 		return false, ErrWriteDeadlineExceeded
 	}
-	frame, err := e.buildAndPublishApplicationDataFrame(payload, runtime)
+	stateFrame, frame, err := e.buildAndPublishApplicationBundle(
+		payload, runtime, selectorState, selectorStateCredit,
+	)
+	selectorStateCreditOwned = false
 	e.writeDeadlineMu.Unlock()
 	if err != nil {
 		e.releaseSendSlot(false, frameBytes)
@@ -301,9 +311,13 @@ func (e *Engine) sendApplicationDataFrameDirect(payload []byte, runtime *executi
 	e.sendMu.Unlock()
 	sendLocked = false
 	defer e.completeDetachedStreamDispatch(custodyTicket)
+	stateDispatchErr := e.dispatchSelectorStateFrame(stateFrame)
 	dispatchErr := e.dispatchDetachedStreamApplication(
 		frame, runtime, true, custodyTicket,
 	)
+	if dispatchErr == nil && stateDispatchErr != nil {
+		dispatchErr = stateDispatchErr
+	}
 	if errors.Is(dispatchErr, errSelectorCutoverHandoff) {
 		dispatchErr = nil
 	}
@@ -338,10 +352,17 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 	if err := e.acquireApplicationSendSlot(frameBytes); err != nil {
 		return false, err
 	}
-	if err := e.sendMu.lockApplication(e); err != nil {
+	selectorState, selectorStateCredit, err := e.lockApplicationSendWithSelectorState(runtime)
+	if err != nil {
 		e.releaseSendSlot(false, frameBytes)
 		return false, err
 	}
+	selectorStateCreditOwned := selectorStateCredit
+	defer func() {
+		if selectorStateCreditOwned {
+			e.releaseSendSlot(true, 0)
+		}
+	}()
 	sendLocked := true
 	defer func() {
 		if sendLocked {
@@ -374,12 +395,35 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 		return false, ErrWriteDeadlineExceeded
 	}
 	deadlineAtPublication := e.writeDeadlineLocked()
-	frame, err := e.buildAndPublishApplicationDataFrame(payload, runtime)
+	// Path admission uses the same lock while lowering the session frame
+	// budget. Revalidate here, after this writer owns the sequencer, and retain
+	// the lock until the immutable packet is in replay custody. The optimistic
+	// public-entry check alone is insufficient because a narrower path can be
+	// admitted while this writer waits for sendMu.
+	if hook := e.packetPublicationBeforeBudgetLock; hook != nil {
+		hook()
+	}
+	e.packetFrameLimitMu.Lock()
+	if hook := e.packetPublicationAfterBudgetLock; hook != nil {
+		hook()
+	}
+	if err := e.validatePacketPayloadSize(len(payload)); err != nil {
+		e.packetFrameLimitMu.Unlock()
+		e.writeDeadlineMu.Unlock()
+		e.releaseSendSlot(false, frameBytes)
+		return false, err
+	}
+	stateFrame, frame, err := e.buildAndPublishApplicationBundle(
+		payload, runtime, selectorState, selectorStateCredit,
+	)
+	e.packetFrameLimitMu.Unlock()
+	selectorStateCreditOwned = false
 	if err != nil {
 		e.writeDeadlineMu.Unlock()
 		e.releaseSendSlot(false, frameBytes)
 		return false, err
 	}
+	stateDispatchErr := e.dispatchSelectorStateFrame(stateFrame)
 	if acceptQueued && deadlineAtPublication.IsZero() {
 		handled, acceptErr := e.acceptFlatSelectorPacketDispatch(frame, runtime, true)
 		if handled {
@@ -390,6 +434,9 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 			sendLocked = false
 			if errors.Is(acceptErr, errSelectorCutoverHandoff) {
 				acceptErr = nil
+			}
+			if acceptErr == nil && stateDispatchErr != nil {
+				acceptErr = stateDispatchErr
 			}
 			return true, acceptErr
 		}
@@ -425,6 +472,9 @@ func (e *Engine) sendPacketDataFrameConcurrent(payload []byte, runtime *executio
 	if errors.Is(dispatchErr, errSelectorCutoverHandoff) {
 		dispatchErr = nil
 	}
+	if dispatchErr == nil && stateDispatchErr != nil {
+		dispatchErr = stateDispatchErr
+	}
 	if dispatchErr == nil {
 		hdr, decodeErr := proto.DecodeHeader(frame[:proto.HeaderSize])
 		if decodeErr == nil {
@@ -456,24 +506,3 @@ func (e *Engine) releaseApplicationWritePermit() {
 
 // buildAndPublishApplicationDataFrame is called with sendMu and
 // writeDeadlineMu held. It performs no network I/O.
-func (e *Engine) buildAndPublishApplicationDataFrame(payload []byte, runtime *executionRuntime) ([]byte, error) {
-	flags, wirePayload, attribution, err := e.encodeApplicationPayload(payload, runtime)
-	if err != nil {
-		return nil, err
-	}
-	seq, err := e.allocateSendSequence(false)
-	if err != nil {
-		e.beginSequenceExhaustionClose()
-		return nil, err
-	}
-	frame := make([]byte, proto.HeaderSize+len(wirePayload))
-	header := proto.Header{Version: proto.Version, Type: proto.FrameData, Flags: flags, Seq: seq}
-	if err := header.Encode(frame[:proto.HeaderSize]); err != nil {
-		return nil, err
-	}
-	copy(frame[proto.HeaderSize:], wirePayload)
-	if err := e.reserveAndPublishOwnedApplicationFrame(frame, attribution, len(payload)); err != nil {
-		return nil, err
-	}
-	return frame, nil
-}

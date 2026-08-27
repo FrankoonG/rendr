@@ -173,6 +173,18 @@ func (p *memoryPathConn) Close() error {
 
 func (p *memoryPathConn) Quality() transport.PathQuality { return p.quality }
 
+// MaxFrameSize makes the in-memory fixture an explicit packet carrier. Stream
+// tests remain unaffected because stream engines never query packet capacity.
+func (*memoryPathConn) MaxFrameSize() int { return 1<<16 - 1 }
+
+func testPacketFrameSize(path transport.PathConn) int {
+	packetPath, ok := path.(transport.PacketPathConn)
+	if !ok {
+		panic("engine test adapter hid an explicit packet frame capacity")
+	}
+	return packetPath.MaxFrameSize()
+}
+
 func (p *memoryPathConn) OnDeath(fn func(transport.DeathCause, error)) {
 	p.deathMu.Lock()
 	p.deathFn = fn

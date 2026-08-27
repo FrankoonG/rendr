@@ -118,6 +118,57 @@ func TestRefreshEvidenceTracksAdapterSourceGeneration(t *testing.T) {
 	}
 }
 
+func TestRefreshEvidenceExposesOpaqueSourceLineage(t *testing.T) {
+	claim, _ := newRefreshTestClaim(t, 1)
+	firstState := NewRefreshSourceState()
+	firstSnapshot, err := firstState.Update([32]byte{0x31})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEmitter, err := NewRefreshEmitterWithSourceState(claim, firstState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEvidence, err := firstEmitter.Observe(RefreshReasonRouteSourceChanged, firstSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstEvidence.ValidateFor(claim, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatedEvidence, err := firstEmitter.Observe(RefreshReasonRouteSourceChanged, firstSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := repeatedEvidence.ValidateFor(claim, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondState := NewRefreshSourceState()
+	secondSnapshot, err := secondState.Update([32]byte{0x32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEmitter, err := NewRefreshEmitterWithSourceState(claim, secondState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEvidence, err := secondEmitter.Observe(RefreshReasonRouteSourceChanged, secondSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := secondEvidence.ValidateFor(claim, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SourceLineage == (RefreshSourceLineage{}) ||
+		first.SourceLineage != repeated.SourceLineage ||
+		first.SourceLineage == second.SourceLineage {
+		t.Fatalf("source lineages first=%+v repeated=%+v second=%+v", first, repeated, second)
+	}
+}
+
 func TestRefreshEvidenceCarriesUnavailableAndRestoredSourceFacts(t *testing.T) {
 	claim, _ := newRefreshTestClaim(t, 1)
 	state := NewRefreshSourceState()

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -177,12 +178,14 @@ func TestGVisorPacketLinkConcurrentDelayedActivationConverges(t *testing.T) {
 	trace := newFinalQualificationTrace(clientCandidateLocal, serverCandidateLocal)
 	if err := clientCandidate.replaceWriter(&commitBarrierPacketWriter{
 		packetWriter: clientCandidate.conn, source: clientCandidateLocal, secret: clientLinkSecret,
+		sender:  clientPath.link.role,
 		barrier: barrier, trace: trace,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := serverCandidate.replaceWriter(&commitBarrierPacketWriter{
 		packetWriter: serverCandidate.conn, source: serverCandidateLocal, secret: serverLinkSecret,
+		sender:  serverPath.link.role,
 		barrier: barrier, trace: trace,
 	}); err != nil {
 		t.Fatal(err)
@@ -253,6 +256,267 @@ func TestGVisorPacketLinkConcurrentDelayedActivationConverges(t *testing.T) {
 	}
 }
 
+func TestGVisorPacketLinkAttemptRejectsPeerGenerationAdvanceBeforePublication(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		phase string
+	}{
+		{name: "before-stage", phase: "before-stage"},
+		{name: "during-stage", phase: "during-stage"},
+		{name: "before-publish", phase: "before-publish"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener := mustPacketListener(t)
+			client, server := dialAndAccept(t, listener)
+			defer client.Close()
+			defer server.Close()
+			clientPath := client.(*retainedPathConn)
+			serverPath := server.(*retainedPathConn)
+			owner := clientPath.link
+			fixture := newLinkExecutionFixture(t, clientPath, byte(0x90+len(test.name)))
+
+			owner.mu.Lock()
+			activeBefore := owner.active
+			wireCountBefore := len(owner.wires)
+			originalOpen := owner.openCandidate
+			owner.mu.Unlock()
+			var openCalls atomic.Uint64
+			var opened *packetWire
+			openedReady := make(chan struct{})
+			releaseOpen := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseOpen) }) }
+			t.Cleanup(release)
+			owner.openCandidate = func(ctx context.Context, remote net.Addr) (*packetWire, routeObservation, error) {
+				openCalls.Add(1)
+				candidate, observation, err := originalOpen(ctx, remote)
+				if err == nil && test.phase == "during-stage" {
+					opened = candidate
+					close(openedReady)
+					select {
+					case <-releaseOpen:
+					case <-ctx.Done():
+					}
+				}
+				return candidate, observation, err
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := fixture.execution.Prepare(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			var stageErr error
+			switch test.phase {
+			case "before-stage":
+				advanceTestPeerGeneration(owner, serverPath.link)
+				stageErr = fixture.execution.Stage(ctx)
+			case "during-stage":
+				staged := make(chan error, 1)
+				go func() { staged <- fixture.execution.Stage(ctx) }()
+				select {
+				case <-openedReady:
+				case <-time.After(2 * time.Second):
+					t.Fatal("candidate open did not reach the injected generation race")
+				}
+				advanceTestPeerGeneration(owner, serverPath.link)
+				select {
+				case stageErr = <-staged:
+				case <-time.After(time.Second):
+					t.Fatal("peer generation advance did not cancel blocked Stage")
+				}
+			case "before-publish":
+				if err := fixture.execution.Stage(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.execution.PublicationDigest(); err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.transaction.MarkCommitPublished(); err != nil {
+					t.Fatal(err)
+				}
+				disposition, err := fixture.execution.ResolveFinalAcceptance(true)
+				if err != nil || disposition != leafmobility.FinalAcceptancePublishAllowed {
+					t.Fatalf("ResolveFinalAcceptance disposition=%d err=%v", disposition, err)
+				}
+				advanceTestPeerGeneration(owner, serverPath.link)
+				stageErr = fixture.execution.Publish(ctx)
+			}
+			if stageErr == nil || !strings.Contains(stageErr.Error(), "packet-link source") {
+				t.Fatalf("%s error=%v, want stale packet-link source", test.phase, stageErr)
+			}
+			if test.phase == "before-stage" && openCalls.Load() != 0 {
+				t.Fatalf("stale source opened %d candidates before Stage", openCalls.Load())
+			}
+			if test.phase != "before-stage" && openCalls.Load() != 1 {
+				t.Fatalf("%s candidate opens=%d want=1", test.phase, openCalls.Load())
+			}
+			if err := fixture.execution.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.execution.FinalizeRolledBack(); err != nil {
+				t.Fatal(err)
+			}
+			finishLinkResolution(t, fixture.transaction, leafmobility.ResolutionRolledBack)
+
+			owner.mu.Lock()
+			activeAfter := owner.active
+			wireCountAfter := len(owner.wires)
+			maintenance := owner.maintenance
+			_, candidateRetained := owner.wires[opened]
+			owner.mu.Unlock()
+			if activeAfter != activeBefore || wireCountAfter != wireCountBefore || maintenance || candidateRetained {
+				t.Fatalf("%s cleanup active_same=%t wires=%d/%d maintenance=%t candidate_retained=%t",
+					test.phase, activeAfter == activeBefore, wireCountBefore, wireCountAfter, maintenance, candidateRetained)
+			}
+			assertRoundTrip(t, client, server, []byte("peer generation advance rollback preserves payload"))
+			assertRoundTrip(t, server, client, []byte("peer generation advance rollback preserves reverse payload"))
+		})
+	}
+}
+
+func advanceTestPeerGeneration(local, peer *linkOwner) {
+	local.mu.Lock()
+	local.peerGeneration++
+	local.signalChangedLocked()
+	local.mu.Unlock()
+	peer.mu.Lock()
+	peer.localGeneration++
+	peer.signalChangedLocked()
+	peer.mu.Unlock()
+}
+
+func TestGVisorPacketLinkSourceChangeAfterQualificationAbortsPeerImmediately(t *testing.T) {
+	listener := mustPacketListener(t)
+	client, server := dialAndAccept(t, listener)
+	defer client.Close()
+	defer server.Close()
+	clientPath := client.(*retainedPathConn)
+	serverPath := server.(*retainedPathConn)
+	owner, peer := clientPath.link, serverPath.link
+
+	owner.mu.Lock()
+	activeBefore := owner.active
+	wireCountBefore := len(owner.wires)
+	originalOpen := owner.openCandidate
+	owner.mu.Unlock()
+	arrived := make(chan struct{})
+	releaseDone := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseDone) }) }
+	t.Cleanup(release)
+	var candidate *packetWire
+	owner.openCandidate = func(ctx context.Context, remote net.Addr) (*packetWire, routeObservation, error) {
+		wire, observation, err := originalOpen(ctx, remote)
+		if err != nil {
+			return nil, routeObservation{}, err
+		}
+		wire.conn = &gateQualificationDonePacketConn{
+			PacketConn: wire.conn, secret: owner.secret, sender: peerOuterRole(owner.role),
+			arrived: arrived, release: releaseDone,
+		}
+		candidate = wire
+		return wire, observation, nil
+	}
+
+	fixture := newLinkExecutionFixture(t, clientPath, 0xa4)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fixture.execution.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stageResult := make(chan error, 1)
+	go func() { stageResult <- fixture.execution.Stage(ctx) }()
+	select {
+	case <-arrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("candidate did not receive the peer's final qualification proof")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		peer.mu.Lock()
+		pending := peer.pendingPeer
+		qualified := pending != nil && pending.qualified
+		peer.mu.Unlock()
+		if qualified {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("peer did not retain the accepted candidate before source change")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	peer.mu.Lock()
+	replayBefore := len(peer.peerReplay)
+	peer.mu.Unlock()
+
+	advanceTestPeerGeneration(owner, peer)
+	release()
+	select {
+	case err := <-stageResult:
+		if err == nil || !errors.Is(err, errLinkAttemptSourceChanged) {
+			t.Fatalf("Stage error=%v, want source-generation change", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source-generation change did not terminate Stage")
+	}
+	owner.openCandidate = originalOpen
+	if candidate == nil {
+		t.Fatal("qualified candidate was not retained as rollback evidence")
+	}
+	if err := fixture.execution.Rollback(ctx); err != nil {
+		t.Fatalf("authenticated rollback after source change: %v", err)
+	}
+	if err := fixture.execution.FinalizeRolledBack(); err != nil {
+		t.Fatal(err)
+	}
+	finishLinkResolution(t, fixture.transaction, leafmobility.ResolutionRolledBack)
+
+	peer.mu.Lock()
+	pendingAfter := peer.pendingPeer
+	replayAfter := len(peer.peerReplay)
+	peer.mu.Unlock()
+	owner.mu.Lock()
+	activeAfter := owner.active
+	wireCountAfter := len(owner.wires)
+	maintenance := owner.maintenance
+	_, candidateRetained := owner.wires[candidate]
+	snapshot := snapshotLinkAttemptOwnerLocked(owner)
+	receiveNext := owner.receiveNext
+	owner.mu.Unlock()
+	if pendingAfter != nil || replayAfter != replayBefore+1 {
+		t.Fatalf("peer cleanup pending=%+v replay=%d/%d", pendingAfter, replayBefore, replayAfter)
+	}
+	if activeAfter != activeBefore || wireCountAfter != wireCountBefore || maintenance || candidateRetained {
+		t.Fatalf("local cleanup active_same=%t wires=%d/%d maintenance=%t candidate_retained=%t",
+			activeAfter == activeBefore, wireCountBefore, wireCountAfter, maintenance, candidateRetained)
+	}
+
+	maintenanceLease, err := owner.beginMaintenance(ctx, snapshot.incarnation)
+	if err != nil {
+		t.Fatalf("immediate retry maintenance: %v", err)
+	}
+	retryControl := outerControl{
+		Transaction: linkTransaction{0xa5}, Agreement: linkAgreement{0xa5}, Nonce: linkNonce{0xa5},
+		ReceiveNext: receiveNext,
+	}
+	retryCandidate, retryGeneration, _, err := owner.stageCandidate(
+		ctx, maintenanceLease, retryControl, snapshot,
+	)
+	if err != nil {
+		maintenanceLease.release()
+		t.Fatalf("immediate retry was blocked by stale peer state: %v", err)
+	}
+	if err := owner.rollbackCandidate(
+		ctx, maintenanceLease, retryCandidate, retryGeneration, retryControl, snapshot.remote,
+	); err != nil {
+		t.Fatalf("immediate retry cleanup: %v", err)
+	}
+	assertRoundTrip(t, client, server, []byte("post-qualification source change retained predecessor"))
+	assertRoundTrip(t, server, client, []byte("post-qualification source change retained reverse payload"))
+}
+
 type outerCommitBarrier struct {
 	arrived chan struct{}
 	release chan struct{}
@@ -310,11 +574,16 @@ func newFinalQualificationTrace(left, right net.Addr) *finalQualificationTrace {
 	}
 }
 
-func (trace *finalQualificationTrace) record(source, remote net.Addr, datagram []byte, secret linkSecret) {
+func (trace *finalQualificationTrace) record(
+	source, remote net.Addr,
+	datagram []byte,
+	secret linkSecret,
+	sender leafmobility.Role,
+) {
 	if trace == nil || len(datagram) != outerMaxDatagramSize {
 		return
 	}
-	frame, err := decodeOuter(datagram, secret)
+	frame, err := decodeOuter(datagram, secret, sender)
 	if err != nil || frame.Type < outerTypeQualificationRequest || frame.Type > outerTypeQualificationDone {
 		return
 	}
@@ -376,14 +645,15 @@ type commitBarrierPacketWriter struct {
 	packetWriter
 	source  net.Addr
 	secret  linkSecret
+	sender  leafmobility.Role
 	barrier *outerCommitBarrier
 	trace   *finalQualificationTrace
 	once    sync.Once
 }
 
 func (writer *commitBarrierPacketWriter) WriteTo(datagram []byte, remote net.Addr) (int, error) {
-	writer.trace.record(writer.source, remote, datagram, writer.secret)
-	frame, err := decodeOuter(datagram, writer.secret)
+	writer.trace.record(writer.source, remote, datagram, writer.secret, writer.sender)
+	frame, err := decodeOuter(datagram, writer.secret, writer.sender)
 	if err == nil && frame.Type == outerTypePathCommit {
 		writer.once.Do(writer.barrier.wait)
 	}
@@ -431,6 +701,7 @@ func TestGVisorCommittedCandidateBecomesRefreshBaselineWithoutTickerDelay(t *tes
 	}
 
 	owner.mu.Lock()
+	ownerSource := snapshotLinkAttemptOwnerLocked(owner)
 	owner.maintenance = true
 	owner.wires[candidate] = struct{}{}
 	maintenance := &linkMaintenance{owner: owner, incarnation: owner.incarnation}
@@ -441,7 +712,7 @@ func TestGVisorCommittedCandidateBecomesRefreshBaselineWithoutTickerDelay(t *tes
 	}
 	ctx, stop := context.WithTimeout(context.Background(), 3*time.Second)
 	defer stop()
-	if err := owner.publishCandidate(ctx, maintenance, candidate, 2, control, candidateRoute); err != nil {
+	if err := owner.publishCandidate(ctx, maintenance, candidate, 2, control, candidateRoute, ownerSource); err != nil {
 		t.Fatal(err)
 	}
 	if err := owner.activateCandidate(ctx, maintenance, candidate, 2, control); err != nil {
@@ -510,11 +781,18 @@ func TestGVisorPeerCommitLinearizesAgainstStaleRefreshObservation(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer cancel()
+	preCommitEvidence, err := owner.refreshEmitter.Observe(leafmobility.RefreshReasonLinkUnresponsive)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	stalePeer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 43382}
-	committedPeer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 43383}
+	// A relay can keep the server-visible tuple unchanged while authenticating
+	// a new peer generation. The generation advance must still revoke evidence
+	// minted for the predecessor.
+	committedPeer := cloneAddr(initialPeer).(*net.UDPAddr)
 	staleRoute := mustOuterRouteObservation(t, outerUDPIPv4, local, stalePeer, 1, 1260)
-	committedRoute := mustOuterRouteObservation(t, outerUDPIPv4, local, committedPeer, 1, 1260)
+	committedRoute := initialRoute
 	observationStarted := make(chan struct{})
 	releaseObservation := make(chan struct{})
 	var blockOnce atomic.Bool
@@ -547,6 +825,9 @@ func TestGVisorPeerCommitLinearizesAgainstStaleRefreshObservation(t *testing.T) 
 	}
 	owner.mu.Unlock()
 	owner.handleDatagram(wire, committedPeer, mustOuterControl(t, owner, outerTypePathCommit, 2, control))
+	if _, err := preCommitEvidence.ValidateFor(claim, 0); !errors.Is(err, leafmobility.ErrRefreshEvidenceStale) {
+		t.Fatalf("pre-commit refresh evidence error=%v, want stale", err)
+	}
 	evidence, err := owner.refreshEmitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
 	if err != nil {
 		t.Fatal(err)
@@ -1247,6 +1528,28 @@ func (conn *failFirstReadPacketConn) ReadFrom(packet []byte) (int, net.Addr, err
 		return n, remote, nil
 	}
 	return conn.PacketConn.ReadFrom(packet)
+}
+
+type gateQualificationDonePacketConn struct {
+	net.PacketConn
+	secret  linkSecret
+	sender  leafmobility.Role
+	arrived chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (conn *gateQualificationDonePacketConn) ReadFrom(packet []byte) (int, net.Addr, error) {
+	n, remote, err := conn.PacketConn.ReadFrom(packet)
+	if err != nil {
+		return n, remote, err
+	}
+	frame, decodeErr := decodeOuter(packet[:n], conn.secret, conn.sender)
+	if decodeErr == nil && frame.Type == outerTypeQualificationDone {
+		conn.once.Do(func() { close(conn.arrived) })
+		<-conn.release
+	}
+	return n, remote, nil
 }
 
 // newLinkExecutionFixture exercises the leaf driver boundary after peer

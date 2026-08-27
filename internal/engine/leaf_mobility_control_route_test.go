@@ -77,7 +77,7 @@ func TestLeafMobilityExactFrameFallsThroughFailedControlRoute(t *testing.T) {
 	if len(frames) != 2 || string(frames[0]) != string(frame) || string(frames[1]) != string(frame) {
 		t.Fatalf("control B frames=%x, want two exact copies of %x", frames, frame)
 	}
-	if subject.writes.Load() != 0 || controlA.attempts.Load() != 2 || controlB.writes.Load() != 2 {
+	if subject.writes.Load() != 0 || controlA.attempts.Load() != 1 || controlB.writes.Load() != 2 {
 		t.Fatalf("writes subject=%d controlA-attempts=%d controlB=%d",
 			subject.writes.Load(), controlA.attempts.Load(), controlB.writes.Load())
 	}
@@ -152,7 +152,11 @@ func TestLeafMobilityControlRouteExcludesDispatchStalledPath(t *testing.T) {
 	_, subjectRef := addLeafMobilityControlRouteTestPath(e, 1, 1, nil)
 	stalled, stalledRef := addLeafMobilityControlRouteTestPath(e, 2, 2, nil)
 	healthy, _ := addLeafMobilityControlRouteTestPath(e, 3, 3, nil)
-	e.paths[stalledRef.ID].dispatchStalled.Store(true)
+	stalledSlot := e.paths[stalledRef.ID]
+	stalledSlot.markDispatchStalled(pathDispatchIdentity{
+		generation:     stalledSlot.nextDispatchGeneration(),
+		pathGeneration: pathProbeGenerationForSlot(stalledSlot),
+	})
 
 	if _, err := e.sendLeafMobilityFrameAt(subjectRef, proto.CtrlLeafMobilityPrepare, []byte{1}, nil); err != nil {
 		t.Fatal(err)
@@ -478,7 +482,13 @@ func newLeafMobilityControlRouteTestEngine(side Side) (*Engine, [16]byte) {
 	return &Engine{
 		side: side, flowID: flow, paths: make(map[uint32]*pathSlot),
 		retainedPaths: make(map[uint32]*pathSlot), stagedPaths: make(map[uint32]*pathSlot),
-		leafTx: newLeafMobilityRuntime(), closed: make(chan struct{}),
+		pathPredecessors:     make(map[uint32][]uint32),
+		pathAdmissionByLeaf:  make(map[pathAdmissionLeafKey]pathAdmissionReservation),
+		pathAdmissionByPath:  make(map[uint32]pathAdmissionLeafKey),
+		pathRetirementInbox:  make(chan pathRetirementWork, pathRetirementInboxSize),
+		pathRetirementQueued: make(map[pathRetirementWorkKey]struct{}),
+		retireDebug:          make(map[*pathSlot]string),
+		leafTx:               newLeafMobilityRuntime(), closed: make(chan struct{}),
 	}, flow
 }
 
@@ -506,6 +516,7 @@ func controlRouteTestSlot(
 	slot := &pathSlot{
 		id: id, owner: owner, localTXTargetID: local, peerTXTargetID: peer,
 		conn: conn, writePermit: make(chan struct{}, 1), quit: make(chan struct{}),
+		admissionDone: make(chan struct{}),
 	}
 	slot.writePermit <- struct{}{}
 	slot.routeGeneration.Store(generation)

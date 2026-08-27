@@ -52,7 +52,8 @@ type TCPRelay struct {
 	BufferSize       int
 	PeerReadyTimeout time.Duration
 
-	owned Manager
+	owned             Manager
+	dataPlaneExecutor *dataPlaneCallbackExecutor
 }
 
 // PreparedTCP is a peer-validated rendr stream whose final egress is already
@@ -92,26 +93,29 @@ func (r *TCPRelay) Prepare(ctx context.Context, ev l3ingress.PacketEvent) (*Prep
 	if id.Proto != l3ingress.ProtocolTCP {
 		return nil, fmt.Errorf("l3session: TCP relay cannot handle %s", id.Proto)
 	}
+	if err := requireCanonicalIdentity(id, l3ingress.ProtocolTCP); err != nil {
+		return nil, err
+	}
 	manager := r.manager()
 	sess, err := manager.EnsureSession(readyCtx, ev)
 	if err != nil {
 		return nil, err
 	}
-	if sess == nil || sess.Conn == nil {
+	if sess == nil || sess.conn == nil {
 		return nil, errors.New("l3session: TCP relay missing stream session")
 	}
-	if ev.Ref != (l3ingress.FlowRef{}) && sess.Request.Ref != ev.Ref {
+	if ev.Ref != (l3ingress.FlowRef{}) && sess.request.Ref != ev.Ref {
 		_ = manager.CloseSession(sess)
 		return nil, fmt.Errorf("%w: prepared=%+v requested=%+v", ErrSessionGenerationConflict,
-			sess.Request.Ref, ev.Ref)
+			sess.request.Ref, ev.Ref)
 	}
-	stream, ok := sess.Conn.(l3ingress.TCPConn)
+	stream, ok := sess.conn.(l3ingress.TCPConn)
 	if !ok {
 		_ = manager.CloseSession(sess)
-		return nil, fmt.Errorf("%w: rendr stream %T", ErrTCPHalfCloseUnsupported, sess.Conn)
+		return nil, fmt.Errorf("%w: rendr stream %T", ErrTCPHalfCloseUnsupported, sess.conn)
 	}
 	prepared := &PreparedTCP{owner: r, manager: manager, session: sess, conn: stream}
-	header, err := encodeTCPEnvelope(id, sess.Request.Egress)
+	header, err := encodeTCPEnvelope(id, sess.request.Egress)
 	if err != nil {
 		_ = prepared.Close()
 		return nil, err
@@ -137,7 +141,7 @@ func (p *PreparedTCP) FlowRef() l3ingress.FlowRef {
 	if p == nil || p.session == nil {
 		return l3ingress.FlowRef{}
 	}
-	return p.session.Request.Ref
+	return p.session.request.Ref
 }
 
 // Close releases a prepared stream that was rejected locally or has finished
@@ -157,12 +161,21 @@ func (r *TCPRelay) Serve(ctx context.Context, ev l3ingress.PacketEvent, endpoint
 	if endpoint == nil {
 		return errors.New("l3session: nil TCP relay endpoint")
 	}
-	prepared, err := r.Prepare(ctx, ev)
+	cleanup, err := reserveDataPlaneCleanupWithExecutor(
+		dataPlaneExecutorOrProcess(r.dataPlaneExecutor),
+		"TCPRelay endpoint Close",
+	)
 	if err != nil {
-		_ = endpoint.Close()
+		// No ownership was accepted, so the caller remains responsible for
+		// endpoint when cleanup capacity is unavailable.
 		return err
 	}
-	return r.ServePrepared(ctx, prepared, endpoint)
+	endpointClose := cleanup.Bind(endpoint.Close)
+	prepared, err := r.Prepare(ctx, ev)
+	if err != nil {
+		return errors.Join(err, endpointClose.Close())
+	}
+	return r.servePrepared(ctx, prepared, endpoint, endpointClose)
 }
 
 // ServePrepared joins a peer-ready stream to the accepted userspace TCP
@@ -178,22 +191,51 @@ func (r *TCPRelay) ServePrepared(ctx context.Context, prepared *PreparedTCP, end
 		_ = prepared.Close()
 		return errors.New("l3session: nil TCP relay endpoint")
 	}
+	cleanup, err := reserveDataPlaneCleanupWithExecutor(
+		dataPlaneExecutorOrProcess(r.dataPlaneExecutor),
+		"TCPRelay endpoint Close",
+	)
+	if err != nil {
+		// The caller may retry or close both values because neither has been
+		// adopted when reservation fails.
+		return err
+	}
+	return r.servePrepared(ctx, prepared, endpoint, cleanup.Bind(endpoint.Close))
+}
+
+func (r *TCPRelay) servePrepared(
+	ctx context.Context,
+	prepared *PreparedTCP,
+	endpoint net.Conn,
+	endpointClose *dataPlaneCloseAuthority,
+) error {
 	if _, ok := endpoint.(l3ingress.TCPConn); !ok {
-		_ = endpoint.Close()
-		_ = prepared.Close()
-		return fmt.Errorf("%w: local endpoint %T", ErrTCPHalfCloseUnsupported, endpoint)
+		return errors.Join(
+			fmt.Errorf("%w: local endpoint %T", ErrTCPHalfCloseUnsupported, endpoint),
+			endpointClose.Close(),
+			prepared.Close(),
+		)
 	}
 	prepared.serveMu.Lock()
 	if prepared.served {
 		prepared.serveMu.Unlock()
-		_ = endpoint.Close()
-		return errors.New("l3session: prepared TCP stream already consumed")
+		return errors.Join(
+			errors.New("l3session: prepared TCP stream already consumed"),
+			endpointClose.Close(),
+		)
 	}
 	prepared.served = true
 	prepared.serveMu.Unlock()
-	defer endpoint.Close()
-	defer prepared.Close()
-	return relayTCP(ctx, endpoint, prepared.conn, r.BufferSize)
+	return relayTCPWithCloseAuthorities(
+		ctx,
+		endpoint,
+		prepared.conn,
+		r.BufferSize,
+		endpoint.Close,
+		prepared.Close,
+		endpointClose,
+		nil,
+	)
 }
 
 // ObserveFlow implements l3ingress.FlowObserver.
@@ -222,10 +264,17 @@ func (r *TCPRelay) manager() *Manager {
 	return &r.owned
 }
 
-func writeAll(dst io.Writer, payload []byte) error {
+func writeAllContext(ctx context.Context, conn net.Conn, payload []byte) error {
+	stream := newDataPlaneStream(conn, "TCP handshake", conn.Close)
+	stopInterrupt := context.AfterFunc(ctx, func() { _ = stream.interrupt() })
+	defer stopInterrupt()
 	for len(payload) != 0 {
-		n, err := dst.Write(payload)
+		n, err := stream.write(ctx, payload)
 		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				_ = stream.interrupt()
+				return ctx.Err()
+			}
 			return err
 		}
 		if n <= 0 || n > len(payload) {
@@ -236,37 +285,17 @@ func writeAll(dst io.Writer, payload []byte) error {
 	return nil
 }
 
-func writeAllContext(ctx context.Context, conn net.Conn, payload []byte) error {
-	done := make(chan error, 1)
-	go func() { done <- writeAll(conn, payload) }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		interruptTCP(conn)
-		<-done
-		return ctx.Err()
-	}
-}
-
 func readTCPReadyContext(ctx context.Context, conn net.Conn) (tcpReadyStatus, error) {
-	type result struct {
-		status tcpReadyStatus
-		err    error
-	}
-	done := make(chan result, 1)
-	go func() {
-		status, err := readTCPReady(conn)
-		done <- result{status: status, err: err}
-	}()
-	select {
-	case got := <-done:
-		return got.status, got.err
-	case <-ctx.Done():
-		interruptTCP(conn)
-		<-done
+	stream := newDataPlaneStream(conn, "TCP ready handshake", conn.Close)
+	stopInterrupt := context.AfterFunc(ctx, func() { _ = stream.interrupt() })
+	defer stopInterrupt()
+	status, err := invokeDataPlaneCallback(ctx, dataPlaneProcessExecutor, "TCP ready handshake Read", dataPlaneReadCallback,
+		func() (tcpReadyStatus, error) { return readTCPReady(conn) })
+	if err != nil && ctx != nil && ctx.Err() != nil {
+		_ = stream.interrupt()
 		return tcpReadyInvalid, ctx.Err()
 	}
+	return status, err
 }
 
 func tcpReadyError(status tcpReadyStatus) error {
@@ -287,60 +316,111 @@ func tcpReadyError(status tcpReadyStatus) error {
 }
 
 func relayTCP(ctx context.Context, left, right net.Conn, bufferSize int) error {
+	return relayTCPWithClosers(ctx, left, right, bufferSize, left.Close, right.Close)
+}
+
+func relayTCPWithClosers(
+	ctx context.Context,
+	left, right net.Conn,
+	bufferSize int,
+	closeLeft, closeRight func() error,
+) (relayErr error) {
+	return relayTCPWithCloseAuthorities(
+		ctx,
+		left,
+		right,
+		bufferSize,
+		closeLeft,
+		closeRight,
+		nil,
+		nil,
+	)
+}
+
+func relayTCPWithCloseAuthorities(
+	ctx context.Context,
+	left, right net.Conn,
+	bufferSize int,
+	closeLeft, closeRight func() error,
+	leftCloseAuth, rightCloseAuth *dataPlaneCloseAuthority,
+) (relayErr error) {
 	if ctx == nil {
 		return errors.New("l3session: nil TCP relay context")
 	}
+	bridgeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	leftStream := newDataPlaneStream(left, "TCP relay left", closeLeft)
+	if leftCloseAuth != nil {
+		leftStream = newDataPlaneStreamWithCloseAuthority(left, "TCP relay left", leftCloseAuth)
+	}
+	rightStream := newDataPlaneStream(right, "TCP relay right", closeRight)
+	if rightCloseAuth != nil {
+		rightStream = newDataPlaneStreamWithCloseAuthority(right, "TCP relay right", rightCloseAuth)
+	}
+	defer func() {
+		relayErr = errors.Join(relayErr, leftStream.close(), rightStream.close())
+	}()
 	type result struct{ err error }
 	results := make(chan result, 2)
-	forward := func(direction string, dst, src net.Conn) {
-		err := copyTCPDirection(direction, dst, src, bufferSize)
+	forward := func(direction string, dst, src *dataPlaneStream) {
+		err := copyTCPDirection(bridgeCtx, direction, dst, src, bufferSize)
 		if err == nil {
-			if closeErr := closeWrite(dst); closeErr != nil {
+			if closeErr := dst.closeWrite(); closeErr != nil {
 				err = newTCPRelayFailure(ErrTCPDestinationCloseWriteFailed, direction, closeErr)
 			}
 		}
 		results <- result{err: err}
 	}
-	go forward("left_to_right", right, left)
-	go forward("right_to_left", left, right)
+	go forward("left_to_right", rightStream, leftStream)
+	go forward("right_to_left", leftStream, rightStream)
 
 	var first result
 	select {
 	case first = <-results:
 	case <-ctx.Done():
-		interruptTCP(left, right)
+		cancel()
+		interruptErr := errors.Join(leftStream.interrupt(), rightStream.interrupt())
 		<-results
 		<-results
-		return ctx.Err()
+		return errors.Join(ctx.Err(), interruptErr)
 	}
 	if first.err != nil {
-		interruptTCP(left, right)
+		cancel()
+		interruptErr := errors.Join(leftStream.interrupt(), rightStream.interrupt())
 		second := <-results
-		return errors.Join(first.err, second.err)
+		return errors.Join(first.err, second.err, interruptErr)
 	}
 
 	select {
 	case second := <-results:
 		if second.err != nil {
-			interruptTCP(left, right)
+			cancel()
+			return errors.Join(second.err, leftStream.interrupt(), rightStream.interrupt())
 		}
-		return second.err
+		return nil
 	case <-ctx.Done():
-		interruptTCP(left, right)
+		cancel()
+		interruptErr := errors.Join(leftStream.interrupt(), rightStream.interrupt())
 		<-results
-		return ctx.Err()
+		return errors.Join(ctx.Err(), interruptErr)
 	}
 }
 
-func copyTCPDirection(direction string, dst net.Conn, src net.Conn, bufferSize int) error {
+func copyTCPDirection(
+	ctx context.Context,
+	direction string,
+	dst *dataPlaneStream,
+	src *dataPlaneStream,
+	bufferSize int,
+) error {
 	if bufferSize <= 0 {
 		bufferSize = 32 << 10
 	}
 	buf := make([]byte, bufferSize)
 	for {
-		n, readErr := src.Read(buf)
+		n, readErr := src.read(ctx, buf)
 		if n > 0 {
-			if err := writeAll(dst, buf[:n]); err != nil {
+			if err := writeAllDataPlane(ctx, dst, buf[:n]); err != nil {
 				return newTCPRelayFailure(ErrTCPDestinationWriteFailed, direction, err)
 			}
 		}
@@ -354,6 +434,20 @@ func copyTCPDirection(direction string, dst net.Conn, src net.Conn, bufferSize i
 			return newTCPRelayFailure(ErrTCPSourceReadFailed, direction, io.ErrNoProgress)
 		}
 	}
+}
+
+func writeAllDataPlane(ctx context.Context, dst *dataPlaneStream, payload []byte) error {
+	for len(payload) != 0 {
+		n, err := dst.write(ctx, payload)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(payload) {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 type tcpRelayFailure struct {
@@ -372,21 +466,4 @@ func (e *tcpRelayFailure) Error() string {
 
 func (e *tcpRelayFailure) Unwrap() []error {
 	return []error{e.kind, e.cause}
-}
-
-func interruptTCP(conns ...net.Conn) {
-	now := time.Now()
-	for _, conn := range conns {
-		if conn != nil {
-			_ = conn.SetDeadline(now)
-			_ = conn.Close()
-		}
-	}
-}
-
-func closeWrite(conn net.Conn) error {
-	if half, ok := conn.(interface{ CloseWrite() error }); ok {
-		return half.CloseWrite()
-	}
-	return fmt.Errorf("%w: %T", ErrTCPHalfCloseUnsupported, conn)
 }

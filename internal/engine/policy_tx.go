@@ -315,7 +315,7 @@ func (e *Engine) requestPeerSelection(
 				}
 				if ack.Code != proto.PolicyAckCodeAccept {
 					e.recordPeerPolicyGeneration(ack.CurrentGeneration)
-					return fmt.Errorf("%w: %s", ErrPolicyRejected, ack.Reason)
+					return policyRejectionFromAck(ack)
 				}
 				if base == ^uint64(0) || ack.Generation != base+1 || ack.CurrentGeneration != base {
 					return e.policyProtocolError(fmt.Errorf("owner assigned invalid generation %d from base %d", ack.Generation, base))
@@ -377,7 +377,7 @@ func (e *Engine) requestPeerSelection(
 			}
 			if ack.Code != proto.PolicyAckCodeAccept {
 				e.recordPeerPolicyGeneration(ack.CurrentGeneration)
-				return fmt.Errorf("%w: %s", ErrPolicyRejected, ack.Reason)
+				return policyRejectionFromAck(ack)
 			}
 			if ack.Generation != generation || ack.CurrentGeneration != generation || ack.CurrentTargetID != resolvedTarget ||
 				ack.ResolvedTargetID != resolvedTarget || ack.ReservationID != reservation ||
@@ -658,7 +658,7 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		e.resolveIncomingPolicyTarget(prepare, graph.manifest)
 	_, _, selectorGenerationAtPrepare, selectorGenerationOK := e.SelectorSelection(prepare.SelectorID)
 	if resolveErr == nil && (!selectorGenerationOK || selectorGenerationAtPrepare == 0) {
-		resolveErr = errors.New("engine: selector has no committed execution generation")
+		resolveErr = fmt.Errorf("%w: selector has no committed execution generation", ErrSelectorDecisionUnavailable)
 	}
 
 	// Target resolution reads path evidence and may invoke admission callbacks,
@@ -708,7 +708,7 @@ func (e *Engine) handlePolicyPrepare(prepare proto.PolicyPrepare) error {
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
 	}
 	if resolveErr != nil {
-		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, proto.PolicyAckCodeReject, 0, prepare.SelectorID, resolveErr.Error())
+		ack := e.policyRejectLocked(prepare.PolicyTransactionBinding, digest, proto.PolicyReservationID{}, proto.PolicyCommitChallenge{}, proto.PolicyAckPhasePrepare, policyAckCodeForFailure(resolveErr), 0, prepare.SelectorID, resolveErr.Error())
 		e.rememberPolicyCompletedLocked(completedPolicyTransaction{prepare: prepare, digest: digest, prepareAck: ack})
 		e.unlockPolicyMutation()
 		return e.publishPolicyAck(prepare.TransactionID, proto.PolicyAckPhasePrepare, ack, nil)
@@ -898,6 +898,10 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	e.unlockPolicyMutation()
 	validationTopologyEpoch := e.currentPathTopologyEpoch()
 	commitEvidence, applyErr := e.validateIncomingPolicyCommitTarget(prepare, pending.resolved)
+	if applyErr != nil && pending.decisionEvidence.bound() &&
+		pending.decisionEvidence.topologyEpoch != e.currentPathTopologyEpoch() {
+		applyErr = fmt.Errorf("%w: commit target revalidation failed: %v", errStaleSelectorEvidence, applyErr)
+	}
 	if applyErr == nil && pending.decisionEvidence.physicallyBound() &&
 		!pending.decisionEvidence.physicalEqual(commitEvidence) {
 		applyErr = errStaleSelectorEvidence
@@ -966,7 +970,18 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			!pending.decisionEvidence.physicallyBound() {
 			decisionEvidence = selectorEvidenceCommit{}
 		}
-		cutoverGeneration = e.beginSelectorCutover()
+		if policyOriginUsesQualityEvidence(origin) && decisionEvidence.selectorState.bound {
+			var err error
+			cutoverGeneration, err = e.beginValidatedQualityDecisionCutover(
+				e.localExecutionRuntime(), prepare.SelectorID, pending.resolved, decisionEvidence,
+			)
+			if err != nil {
+				releaseOwner()
+				return e.rejectIncomingPolicyCommitAfterValidation(commit, pending, err)
+			}
+		} else {
+			cutoverGeneration = e.beginSelectorCutover()
+		}
 		defer func() {
 			if cutoverGeneration != 0 {
 				e.finishSelectorCutoverForControl(cutoverGeneration)
@@ -975,7 +990,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 
 	committed := false
-	commitPolicy := func(publishRoute func()) error {
+	commitPolicy := func(publishRoute func() error) error {
 		if !e.lockPolicyMutation() {
 			return net.ErrClosed
 		}
@@ -991,10 +1006,13 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			e.unlockPolicyMutation()
 			return err
 		}
+		if err := publishRoute(); err != nil {
+			e.unlockPolicyMutation()
+			return err
+		}
 		e.policyGeneration = commit.Generation
 		e.policySelections[prepare.SelectorID] = pending.resolved
 		pending.committed = true
-		publishRoute()
 		e.policyObservationGen.Store(commit.Generation)
 		committed = true
 		e.unlockPolicyMutation()
@@ -1020,10 +1038,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 			panic("engine: committed policy state has no matching selector generation")
 		}
 		committedSelectorGeneration = generation
-		e.observePeakPolicy(
-			prepare.SelectorID, pending.resolved, committedSelectorGeneration,
-			origin, prepare.Cause,
-		)
+		e.clearInactiveSelectorQualityCandidates(e.localExecutionRuntime())
 	}
 	if !committed && cutoverGeneration != 0 {
 		e.finishSelectorCutoverForControl(cutoverGeneration)
@@ -1044,7 +1059,7 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	}
 	var ack proto.PolicyAck
 	if !committed {
-		ack = e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, pending.reservation, commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeReject, commit.Generation, prepare.SelectorID, applyErr.Error())
+		ack = e.policyRejectLocked(commit.PolicyTransactionBinding, pending.digest, pending.reservation, commit.CommitChallenge, proto.PolicyAckPhaseFinal, policyAckCodeForFailure(applyErr), commit.Generation, prepare.SelectorID, applyErr.Error())
 	} else {
 		ack = proto.PolicyAck{
 			PolicyTransactionBinding: commit.PolicyTransactionBinding,
@@ -1081,6 +1096,16 @@ func (e *Engine) handlePolicyCommit(commit proto.PolicyCommit) error {
 	} else {
 		ackErr = e.publishPolicyAck(commit.TransactionID, proto.PolicyAckPhaseFinal, ack, nil)
 	}
+	// The route, policy generation, completed replay record, and first FINAL
+	// publication are factual before third-party observation begins. A hostile
+	// observer can therefore produce diagnostics, but can neither roll back the
+	// commit nor withhold its terminal proof from the requester.
+	if committed {
+		e.observePeakPolicy(
+			prepare.SelectorID, pending.resolved, committedSelectorGeneration,
+			origin, prepare.Cause,
+		)
+	}
 	if committed && applyErr != nil {
 		return errors.Join(ackErr, fmt.Errorf("%w: committed policy replay: %v", ErrPolicyOutcomeUnknown, applyErr))
 	}
@@ -1103,7 +1128,7 @@ func (e *Engine) rejectIncomingPolicyCommitAfterValidation(
 		}
 		ack := e.policyRejectLocked(
 			commit.PolicyTransactionBinding, pending.digest, pending.reservation,
-			commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeReject,
+			commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeStale,
 			commit.Generation, prepare.SelectorID, reason.Error(),
 		)
 		completed := completedPolicyTransaction{
@@ -1125,7 +1150,7 @@ func (e *Engine) rejectIncomingPolicyCommitAfterValidation(
 	}
 	ack := e.policyRejectLocked(
 		commit.PolicyTransactionBinding, pending.digest, pending.reservation,
-		commit.CommitChallenge, proto.PolicyAckPhaseFinal, proto.PolicyAckCodeReject,
+		commit.CommitChallenge, proto.PolicyAckPhaseFinal, policyAckCodeForFailure(reason),
 		commit.Generation, prepare.SelectorID, reason.Error(),
 	)
 	e.policyIncoming = nil
@@ -1135,6 +1160,21 @@ func (e *Engine) rejectIncomingPolicyCommitAfterValidation(
 	})
 	e.unlockPolicyMutation()
 	return e.publishPolicyAckPreemptingReplay(commit.TransactionID, proto.PolicyAckPhaseFinal, ack)
+}
+
+func policyRejectionFromAck(ack proto.PolicyAck) error {
+	return &PolicyRejectionError{
+		Phase:  ack.Phase,
+		Code:   ack.Code,
+		Reason: ack.Reason,
+	}
+}
+
+func policyAckCodeForFailure(err error) proto.PolicyAckCode {
+	if errors.Is(err, ErrSelectorDecisionUnavailable) {
+		return proto.PolicyAckCodeStale
+	}
+	return proto.PolicyAckCodeReject
 }
 
 func (e *Engine) policyRejectLocked(binding proto.PolicyTransactionBinding, digest proto.PolicyProposalDigest, reservation proto.PolicyReservationID, challenge proto.PolicyCommitChallenge, phase proto.PolicyAckPhase, code proto.PolicyAckCode, generation uint64, selectorID proto.TargetID, reason string) proto.PolicyAck {
@@ -1494,10 +1534,13 @@ func (e *Engine) resolveIncomingPolicyTarget(
 		var evidence selectorEvidenceCommit
 		if policyTargetIsPeak(manifest, prepare.SelectorID, prepare.TargetID) {
 			ranked, view, err := e.rankLocalSelectorClass(prepare.SelectorID, true, nil, true)
-			if err != nil || !selectorTargetRanked(ranked, prepare.TargetID) {
-				return proto.TargetID{}, selectorEvidenceCommit{}, false, fmt.Errorf("engine: explicit peak target has no fresh admissible evidence")
+			if err != nil {
+				return proto.TargetID{}, selectorEvidenceCommit{}, false, err
 			}
-			evidence = view.commitEvidence()
+			if !selectorTargetRanked(ranked, prepare.TargetID) {
+				return proto.TargetID{}, selectorEvidenceCommit{}, false, fmt.Errorf("%w: explicit peak target has no fresh admissible evidence", ErrSelectorDecisionUnavailable)
+			}
+			evidence = e.selectorEvidenceCommitFor(view, prepare.SelectorID)
 		}
 		requiresCutover, topologyEpoch, err := e.policySelectionCutoverSnapshot(
 			prepare.SelectorID, prepare.TargetID,
@@ -1525,9 +1568,9 @@ func (e *Engine) resolveIncomingPolicyTarget(
 		return proto.TargetID{}, selectorEvidenceCommit{}, false, err
 	}
 	if len(ranked) == 0 {
-		return proto.TargetID{}, selectorEvidenceCommit{}, false, fmt.Errorf("engine: no sender-owned target in the requested class passed admission")
+		return proto.TargetID{}, selectorEvidenceCommit{}, false, fmt.Errorf("%w: no sender-owned target in the requested class passed admission", ErrSelectorDecisionUnavailable)
 	}
-	return ranked[0], view.commitEvidence(), true, nil
+	return ranked[0], e.selectorEvidenceCommitFor(view, prepare.SelectorID), true, nil
 }
 
 func (e *Engine) policySelectionCutoverSnapshot(
@@ -1558,17 +1601,23 @@ func (e *Engine) validateIncomingPolicyCommitTarget(
 			e.localGraphBinding().manifest, prepare.SelectorID, targetID,
 		)) {
 		ranked, view, err := e.rankLocalSelectorClass(prepare.SelectorID, true, nil, true)
-		if err != nil || !selectorTargetRanked(ranked, targetID) {
-			return selectorEvidenceCommit{}, fmt.Errorf("engine: resolved peak target is no longer fresh and admissible")
+		if err != nil {
+			return selectorEvidenceCommit{}, err
 		}
-		evidence = view.commitEvidence()
+		if !selectorTargetRanked(ranked, targetID) {
+			return selectorEvidenceCommit{}, fmt.Errorf("%w: resolved peak target is no longer fresh and admissible", ErrSelectorDecisionUnavailable)
+		}
+		evidence = e.selectorEvidenceCommitFor(view, prepare.SelectorID)
 	} else if prepare.Action != proto.PolicyActionSelectChild {
 		peak := prepare.Action == proto.PolicyActionSelectBestPeak
 		ranked, view, err := e.rankLocalSelectorClass(prepare.SelectorID, peak, nil, false)
-		if err != nil || !selectorTargetRanked(ranked, targetID) {
-			return selectorEvidenceCommit{}, fmt.Errorf("engine: resolved selector-class target is no longer fresh and healthy")
+		if err != nil {
+			return selectorEvidenceCommit{}, err
 		}
-		evidence = view.commitEvidence()
+		if !selectorTargetRanked(ranked, targetID) {
+			return selectorEvidenceCommit{}, fmt.Errorf("%w: resolved selector-class target is no longer fresh and healthy", ErrSelectorDecisionUnavailable)
+		}
+		evidence = e.selectorEvidenceCommitFor(view, prepare.SelectorID)
 	}
 	if err := e.admitPeerPolicy(prepare.SelectorID, targetID, prepare.Cause); err != nil {
 		return selectorEvidenceCommit{}, err
@@ -1635,6 +1684,11 @@ func policyOriginForAction(action proto.PolicyAction) policySelectionOrigin {
 	}
 }
 
+func policyOriginUsesQualityEvidence(origin policySelectionOrigin) bool {
+	return origin == policySelectionQuality || origin == policySelectionPeakPromote ||
+		origin == policySelectionPeakReturn
+}
+
 // InitializePolicySelection installs generation zero before the connection is
 // exposed to application traffic. It records the selector child without
 // consuming a runtime generation, matching the initial graph negotiation.
@@ -1647,7 +1701,7 @@ func (e *Engine) InitializePolicySelection(selectorID, targetID proto.TargetID, 
 	if err := validatePolicySelection(binding.manifest, selectorID, targetID); err != nil {
 		return err
 	}
-	commitInitial := func(publishRoute func()) error {
+	commitInitial := func(publishRoute func() error) error {
 		e.policyStateMu.Lock()
 		defer e.policyStateMu.Unlock()
 		if e.closing.Load() || e.sendClosing.Load() || e.isClosed() {
@@ -1659,8 +1713,10 @@ func (e *Engine) InitializePolicySelection(selectorID, targetID proto.TargetID, 
 		if current := e.policySelections[selectorID]; current != (proto.TargetID{}) && current != targetID {
 			return fmt.Errorf("engine: initial policy selection is already configured")
 		}
+		if err := publishRoute(); err != nil {
+			return err
+		}
 		e.policySelections[selectorID] = targetID
-		publishRoute()
 		return nil
 	}
 	return e.applyPolicySelectionFromGraphOriginCommitted(
@@ -1753,6 +1809,7 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 		if runtime == nil {
 			return
 		}
+		e.clearInactiveSelectorQualityCandidates(runtime)
 		_, effective, generation, ok := runtime.selectorSelection(selectorID)
 		if ok && generation != 0 && effective == targetID {
 			e.observePeakPolicy(selectorID, targetID, generation, origin, cause)
@@ -1771,7 +1828,17 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 		requiresCutover = runtime != nil && runtime.selectorIsEffective(selectorID, attached)
 	}
 	if requiresCutover {
-		cutoverGeneration = e.beginSelectorCutover()
+		if policyOriginUsesQualityEvidence(origin) && expectedEvidence.selectorState.bound {
+			var err error
+			cutoverGeneration, err = e.beginValidatedQualityDecisionCutover(
+				runtime, selectorID, targetID, expectedEvidence,
+			)
+			if err != nil {
+				return err
+			}
+		} else {
+			cutoverGeneration = e.beginSelectorCutover()
+		}
 		defer func() { e.finishSelectorCutoverWithReplay(cutoverGeneration) }()
 	}
 	e.policyStateMu.Lock()
@@ -1804,7 +1871,7 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 	base := e.policyGeneration
 	e.policyStateMu.Unlock()
 	committed := false
-	commitPolicy := func(publishRoute func()) error {
+	commitPolicy := func(publishRoute func() error) error {
 		e.policyStateMu.Lock()
 		if e.closing.Load() || e.sendClosing.Load() || e.isClosed() {
 			e.policyStateMu.Unlock()
@@ -1814,9 +1881,12 @@ func (e *Engine) selectLocalTargetCommittedAtEvidence(
 			e.policyStateMu.Unlock()
 			panic("engine: policy generation changed while owner lock was held")
 		}
+		if err := publishRoute(); err != nil {
+			e.policyStateMu.Unlock()
+			return err
+		}
 		e.policyGeneration = base + 1
 		e.policySelections[selectorID] = targetID
-		publishRoute()
 		e.policyObservationGen.Store(base + 1)
 		committed = true
 		e.policyStateMu.Unlock()
@@ -1874,7 +1944,7 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommitted(
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
 	expectedTopologyEpoch uint64,
-	committed func(publishRoute func()) error,
+	committed func(publishRoute func() error) error,
 ) error {
 	return e.applyPolicySelectionFromGraphOriginCommittedEvidence(
 		binding, selectorID, targetID, cause, origin, cutoverGeneration,
@@ -1889,7 +1959,7 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidence(
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
 	expectedEvidence selectorEvidenceCommit,
-	committed func(publishRoute func()) error,
+	committed func(publishRoute func() error) error,
 ) error {
 	return e.applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
 		binding, selectorID, targetID, cause, origin, cutoverGeneration,
@@ -1904,7 +1974,7 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidenceDeferredRep
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
 	expectedEvidence selectorEvidenceCommit,
-	committed func(publishRoute func()) error,
+	committed func(publishRoute func() error) error,
 ) error {
 	return e.applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
 		binding, selectorID, targetID, cause, origin, cutoverGeneration,
@@ -1919,7 +1989,7 @@ func (e *Engine) applyPolicySelectionFromGraphOriginCommittedEvidenceMode(
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
 	expectedEvidence selectorEvidenceCommit,
-	committed func(publishRoute func()) error,
+	committed func(publishRoute func() error) error,
 	deferCutoverReplay bool,
 ) error {
 	if !binding.configured {

@@ -1,6 +1,7 @@
 package l3session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,6 +165,170 @@ func TestUDPPeerRelayRejectsMetadataChange(t *testing.T) {
 	}
 }
 
+func TestUDPPeerRelayCancellationClosesEgressBeforeJoiningWorkers(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP,
+		SrcIP: netip.MustParseAddr("192.0.2.10"), DstIP: netip.MustParseAddr("198.51.100.20"),
+		SrcPort: 42000, DstPort: 53,
+	}
+	first, err := appendUDPEnvelope(nil, id, "vpn", []byte("query"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetConn := newBlockingRendrPacketConn(first)
+	defer packetConn.Close()
+	egressConn := newPeerTestPacketConn()
+	egressConn.ignoreReadDeadlines = true
+	registry := l3ingress.NewEgressRegistry()
+	if err := registry.Register("vpn", &peerTestEgress{conn: egressConn}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (&UDPPeerRelay{PacketConn: packetConn, Egresses: registry}).Run(ctx)
+	}()
+	select {
+	case <-egressConn.writes:
+	case <-time.After(time.Second):
+		t.Fatal("UDP peer relay did not start egress forwarding")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not terminate after cancellation")
+	}
+	if got := egressConn.closeCalls.Load(); got != 1 {
+		t.Fatalf("egress Close calls=%d want 1", got)
+	}
+	if got := packetConn.closeCalls.Load(); got != 0 {
+		t.Fatalf("caller-owned rendr PacketConn Close calls=%d want 0", got)
+	}
+}
+
+func TestUDPPeerRelayCancellationBoundsUncooperativeRendrWorker(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP,
+		SrcIP: netip.MustParseAddr("192.0.2.10"), DstIP: netip.MustParseAddr("198.51.100.20"),
+		SrcPort: 42000, DstPort: 53,
+	}
+	first, err := appendUDPEnvelope(nil, id, "vpn", []byte("query"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetConn := newBlockingRendrPacketConn(first)
+	packetConn.ignoreReadDeadlines = true
+	egressConn := newPeerTestPacketConn()
+	registry := l3ingress.NewEgressRegistry()
+	if err := registry.Register("vpn", &peerTestEgress{conn: egressConn}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (&UDPPeerRelay{PacketConn: packetConn, Egresses: registry}).Run(ctx)
+	}()
+	select {
+	case <-egressConn.writes:
+	case <-time.After(time.Second):
+		t.Fatal("UDP peer relay did not start egress forwarding")
+	}
+	select {
+	case <-packetConn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("UDP peer relay did not enter the uncooperative ReadFrom")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		assertSessionCallbackReason(t, err, CallbackFailureTimeout)
+		if elapsed := time.Since(started); elapsed > 3*udpPeerWorkerShutdownTimeout {
+			t.Fatalf("Run shutdown elapsed=%s want <=%s", elapsed, 3*udpPeerWorkerShutdownTimeout)
+		}
+	case <-time.After(3 * udpPeerWorkerShutdownTimeout):
+		t.Fatal("Run remained blocked behind uncooperative caller-owned PacketConn")
+	}
+	if got := packetConn.closeCalls.Load(); got != 0 {
+		t.Fatalf("caller-owned rendr PacketConn Close calls=%d want 0", got)
+	}
+	if got := egressConn.closeCalls.Load(); got != 1 {
+		t.Fatalf("egress Close calls=%d want 1", got)
+	}
+	if err := packetConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUDPPeerRelaySmallBufferDoesNotTruncateDatagrams(t *testing.T) {
+	id := l3ingress.L3Identity{
+		Proto: l3ingress.ProtocolUDP,
+		SrcIP: netip.MustParseAddr("192.0.2.10"), DstIP: netip.MustParseAddr("198.51.100.20"),
+		SrcPort: 42000, DstPort: 53,
+	}
+	requestPayload := bytes.Repeat([]byte{0xa5}, maxUDPPeerPayloadSize)
+	egressName := strings.Repeat("e", udpEnvelopeMaxEgressName)
+	first, err := appendUDPEnvelope(nil, id, egressName, requestPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetConn := newBlockingRendrPacketConn(first)
+	defer packetConn.Close()
+	egressConn := newPeerTestPacketConn()
+	registry := l3ingress.NewEgressRegistry()
+	if err := registry.Register(egressName, &peerTestEgress{conn: egressConn}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (&UDPPeerRelay{
+			PacketConn: packetConn,
+			Egresses:   registry,
+			BufferSize: 128,
+		}).Run(ctx)
+	}()
+	select {
+	case got := <-egressConn.writes:
+		if !bytes.Equal(got, requestPayload) {
+			t.Errorf("request payload length=%d want %d", len(got), len(requestPayload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UDP peer relay did not forward request")
+	}
+
+	replyPayload := bytes.Repeat([]byte{0x5a}, maxUDPPeerPayloadSize)
+	egressConn.reads <- peerTestPacket{
+		payload: replyPayload,
+		addr:    net.UDPAddrFromAddrPort(netip.MustParseAddrPort("198.51.100.20:53")),
+	}
+	select {
+	case got := <-packetConn.writes:
+		if !bytes.Equal(got, replyPayload) {
+			t.Errorf("reply payload length=%d want %d", len(got), len(replyPayload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UDP peer relay did not forward reply")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not terminate after cancellation")
+	}
+}
+
 type peerTestEgress struct {
 	mu   sync.Mutex
 	id   l3ingress.L3Identity
@@ -187,12 +353,14 @@ func (e *peerTestEgress) identity() l3ingress.L3Identity {
 }
 
 type peerTestPacketConn struct {
-	reads     chan peerTestPacket
-	writes    chan []byte
-	done      chan struct{}
-	deadline  chan struct{}
-	closeOnce sync.Once
-	deadOnce  sync.Once
+	reads               chan peerTestPacket
+	writes              chan []byte
+	done                chan struct{}
+	deadline            chan struct{}
+	closeOnce           sync.Once
+	deadOnce            sync.Once
+	closeCalls          atomic.Int32
+	ignoreReadDeadlines bool
 }
 
 type peerTestPacket struct {
@@ -230,6 +398,7 @@ func (c *peerTestPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 func (c *peerTestPacketConn) Close() error {
+	c.closeCalls.Add(1)
 	c.closeOnce.Do(func() { close(c.done) })
 	return nil
 }
@@ -239,6 +408,9 @@ func (c *peerTestPacketConn) SetDeadline(t time.Time) error {
 	return c.SetWriteDeadline(t)
 }
 func (c *peerTestPacketConn) SetReadDeadline(t time.Time) error {
+	if c.ignoreReadDeadlines {
+		return nil
+	}
 	if !t.IsZero() && !t.After(time.Now()) {
 		c.deadOnce.Do(func() { close(c.deadline) })
 	}
@@ -273,3 +445,35 @@ func (c *scriptedRendrPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 func (c *scriptedRendrPacketConn) Paths() []rendr.PathInfo { return nil }
 func (c *scriptedRendrPacketConn) FlowID() [16]byte        { return [16]byte{1} }
 func (c *scriptedRendrPacketConn) Status() rendr.Status    { return rendr.Status{} }
+
+type blockingRendrPacketConn struct {
+	*peerTestPacketConn
+	packets     chan []byte
+	readStarted chan struct{}
+	readOnce    sync.Once
+}
+
+func newBlockingRendrPacketConn(packets ...[]byte) *blockingRendrPacketConn {
+	c := &blockingRendrPacketConn{
+		peerTestPacketConn: newPeerTestPacketConn(),
+		packets:            make(chan []byte, len(packets)),
+		readStarted:        make(chan struct{}),
+	}
+	for _, packet := range packets {
+		c.packets <- packet
+	}
+	return c
+}
+
+func (c *blockingRendrPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case packet := <-c.packets:
+		return copy(p, packet), rendrPeerAddr, nil
+	default:
+		c.readOnce.Do(func() { close(c.readStarted) })
+		return c.peerTestPacketConn.ReadFrom(p)
+	}
+}
+func (c *blockingRendrPacketConn) Paths() []rendr.PathInfo { return nil }
+func (c *blockingRendrPacketConn) FlowID() [16]byte        { return [16]byte{1} }
+func (c *blockingRendrPacketConn) Status() rendr.Status    { return rendr.Status{} }

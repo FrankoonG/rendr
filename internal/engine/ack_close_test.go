@@ -64,7 +64,7 @@ func TestPeerAckClampedToSentSeq(t *testing.T) {
 	reserveAckTestFrame(t, e, 0, proto.FrameData)
 	reserveAckTestFrame(t, e, 1, proto.FrameData)
 	atomic.StoreUint64(&e.sendSeq, 2)
-	e.sendPublishedNext.Store(2)
+	e.publishSendSeq(2)
 
 	e.notePeerAck(currentAck(e, 3))
 	if got := e.sendAckNext.Load(); got != 0 {
@@ -87,8 +87,8 @@ func TestPeerAckClampedToSentSeq(t *testing.T) {
 func TestPeerAckRefreshesZombieCounterOnlyForApplicationData(t *testing.T) {
 	e := New(SideClient, [16]byte{3}, Limits{})
 	atomic.StoreUint64(&e.sendSeq, 1)
-	e.sendPublishedNext.Store(1)
 	reserveAckTestFrame(t, e, 0, proto.FrameData)
+	e.publishSendSeq(1)
 
 	e.zombieMu.Lock()
 	e.zombieLeft = 1
@@ -113,8 +113,8 @@ func TestPeerAckRefreshesZombieCounterOnlyForApplicationData(t *testing.T) {
 func TestControlOnlyAckDoesNotRefreshZombieCounter(t *testing.T) {
 	e := New(SideClient, [16]byte{4}, Limits{})
 	atomic.StoreUint64(&e.sendSeq, 1)
-	e.sendPublishedNext.Store(1)
 	reserveAckTestFrame(t, e, 0, proto.FrameCtrl)
+	e.publishSendSeq(1)
 	e.zombieMu.Lock()
 	e.zombieLeft = 1
 	e.zombieMu.Unlock()
@@ -157,7 +157,7 @@ func TestPeerAckRejectsExactFrontierWithoutFrameProof(t *testing.T) {
 	e := New(SideClient, [16]byte{6}, Limits{})
 	reserveAckTestFrame(t, e, 0, proto.FrameData)
 	atomic.StoreUint64(&e.sendSeq, 1)
-	e.sendPublishedNext.Store(1)
+	e.publishSendSeq(1)
 
 	ack := currentAck(e, 1)
 	ack.Proof[0] ^= 0xff

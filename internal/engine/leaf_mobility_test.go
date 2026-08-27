@@ -23,6 +23,13 @@ func (p *claimedMemoryPath) SubscribeLeafMobilityRefresh(ctx context.Context, fn
 	return func() {}, nil
 }
 
+func (p *claimedMemoryPath) CommitLeafMobilityRefresh(evidence leafmobility.RefreshEvidence) error {
+	if committer, ok := p.PathConn.(leafmobility.RefreshCommitter); ok {
+		return committer.CommitLeafMobilityRefresh(evidence)
+	}
+	return nil
+}
+
 func TestOwnedLeafClaimBindsToOnePhysicalGeneration(t *testing.T) {
 	e, binding := admissionTestEngine(t)
 	t.Cleanup(func() { _ = e.Close() })

@@ -100,7 +100,7 @@ func TestMaximumDataQualificationUsesFullDataBudget(t *testing.T) {
 			len(writes), firstDatagramSize(writes), outerMaxDatagramSize)
 	}
 	for index, wantType := range []outerType{outerTypeQualificationRequest, outerTypeQualificationConfirm} {
-		frame, err := decodeOuter(writes[index], owner.secret)
+		frame, err := decodeOuter(writes[index], owner.secret, owner.role)
 		if err != nil || frame.Type != wantType || frame.Generation != 2 {
 			t.Fatalf("qualification leg %d frame=%+v err=%v", index, frame, err)
 		}
@@ -156,13 +156,14 @@ func TestPublishCandidateRequalifiesMaximumData(t *testing.T) {
 				return current, nil
 			}
 			owner.mu.Lock()
+			ownerSource := snapshotLinkAttemptOwnerLocked(owner)
 			owner.maintenance = true
 			owner.wires[candidate] = struct{}{}
 			maintenance := &linkMaintenance{owner: owner, incarnation: owner.incarnation}
 			owner.mu.Unlock()
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
-			err := owner.publishCandidate(ctx, maintenance, candidate, 2, control, expected)
+			err := owner.publishCandidate(ctx, maintenance, candidate, 2, control, expected, ownerSource)
 			if test.wantRouteErr && (err == nil || errors.Is(err, ErrOuterMTU)) {
 				t.Fatalf("route evidence change error=%v", err)
 			}
@@ -334,7 +335,7 @@ func TestMaximumDataQualificationRejectsStaleAndCrossCandidateReplies(t *testing
 	defer crossConn.Close()
 	candidate := newPacketWire(initiatorConn, false)
 	defer candidate.close()
-	owner := &linkOwner{id: linkID{41}, secret: linkSecret{42}}
+	owner := &linkOwner{id: linkID{41}, secret: linkSecret{42}, role: leafmobility.RoleDialer}
 	control := outerControl{
 		Transaction: linkTransaction{43}, Agreement: linkAgreement{44}, Nonce: linkNonce{45}, ReceiveNext: 1,
 	}
@@ -346,7 +347,7 @@ func TestMaximumDataQualificationRejectsStaleAndCrossCandidateReplies(t *testing
 			peerResult <- readErr
 			return
 		}
-		frame, decodeErr := decodeOuter(buffer[:n], owner.secret)
+		frame, decodeErr := decodeOuter(buffer[:n], owner.secret, owner.role)
 		if decodeErr != nil || frame.Type != outerTypeQualificationRequest {
 			peerResult <- errors.Join(errors.New("invalid qualification request"), decodeErr)
 			return
@@ -374,7 +375,7 @@ func TestMaximumDataQualificationRejectsStaleAndCrossCandidateReplies(t *testing
 		}
 		_ = responderConn.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
 		if n, _, earlyErr := responderConn.ReadFrom(buffer); earlyErr == nil {
-			early, _ := decodeOuter(buffer[:n], owner.secret)
+			early, _ := decodeOuter(buffer[:n], owner.secret, owner.role)
 			peerResult <- fmt.Errorf("stale/cross-candidate reply accepted early as type=%d", early.Type)
 			return
 		} else if timeout, ok := earlyErr.(net.Error); !ok || !timeout.Timeout() {
@@ -393,7 +394,7 @@ func TestMaximumDataQualificationRejectsStaleAndCrossCandidateReplies(t *testing
 			peerResult <- readErr
 			return
 		}
-		confirmFrame, decodeErr := decodeOuter(buffer[:n], owner.secret)
+		confirmFrame, decodeErr := decodeOuter(buffer[:n], owner.secret, owner.role)
 		confirm, parseErr := parseOuterQualification(confirmFrame.Type, confirmFrame.Payload)
 		if decodeErr != nil || parseErr != nil || confirmFrame.Type != outerTypeQualificationConfirm ||
 			confirm != response {
@@ -627,7 +628,7 @@ func sendQualificationTestFrame(
 		return err
 	}
 	datagram, err := encodeOuterControl(outerFrame{
-		Type: typ, LinkID: owner.id, Generation: generation, Payload: payload,
+		Type: typ, Sender: peerOuterRole(owner.role), LinkID: owner.id, Generation: generation, Payload: payload,
 	}, owner.secret)
 	if err != nil {
 		return err
@@ -702,13 +703,15 @@ func TestSuccessorReceiverRejectsTruncatedOversizedDatagram(t *testing.T) {
 	owner.startReceiver(wire)
 
 	truncatedPrefix := inboundTestPacket(owner, packetMTU, 0xa1)
-	oversized, err := encodeOuterData(owner.id, 1, 1, truncatedPrefix, owner.secret)
+	oversized, err := encodeOuterData(
+		owner.id, 1, 1, truncatedPrefix, owner.secret, peerOuterRole(owner.role),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	oversized = append(oversized, 0xde, 0xad)
 	validPacket := inboundTestPacket(owner, packetMTU, 0xb2)
-	valid, err := encodeOuterData(owner.id, 1, 1, validPacket, owner.secret)
+	valid, err := encodeOuterData(owner.id, 1, 1, validPacket, owner.secret, peerOuterRole(owner.role))
 	if err != nil {
 		t.Fatal(err)
 	}

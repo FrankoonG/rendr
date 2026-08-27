@@ -374,6 +374,12 @@ func TestExecutionRuntimeSelectorDispatchStallWaitsForPolicyDecision(t *testing.
 	if err := runtime.selectChild(ids["root"], ids["a"]); err != nil {
 		t.Fatal(err)
 	}
+	if ticket, err := runtime.buildTicketObservedPresence(
+		runtimeAttached(ids, "a", "b"), runtimeAttached(ids, "a", "b"),
+		nil, nil, false, 1, 0,
+	); err != nil || len(ticket.routes) != 1 || ticket.routes[0].targetID != ids["a"] {
+		t.Fatalf("initial selected child ticket=%v err=%v want a", ticket.routes, err)
+	}
 	eligible := runtimeAttached(ids, "b")
 	present := runtimeAttached(ids, "a", "b")
 	ticket, err := runtime.buildTicketObservedPresence(eligible, present, nil, nil, false, 1, 0)
@@ -381,8 +387,8 @@ func TestExecutionRuntimeSelectorDispatchStallWaitsForPolicyDecision(t *testing.
 		t.Fatalf("stalled selected child ticket=%v err=%v want no execution route", ticket.routes, err)
 	}
 	desired, effective, ok := runtime.selectedChild(ids["root"])
-	if !ok || desired != ids["a"] || effective != (proto.TargetID{}) {
-		t.Fatalf("stalled state desired=%x effective=%x ok=%t want a/zero/true", desired, effective, ok)
+	if !ok || desired != ids["a"] || effective != ids["a"] {
+		t.Fatalf("stalled state desired=%x effective=%x ok=%t want a/a/true", desired, effective, ok)
 	}
 }
 

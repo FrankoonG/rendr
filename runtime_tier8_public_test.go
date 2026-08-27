@@ -265,24 +265,26 @@ func TestRuntimeTier8OrderedFallbackRedialAttachPublicContract(t *testing.T) {
 	}
 	select {
 	case err := <-clientClosed:
-		factory.releaseCloseRecovery()
-		t.Fatalf("client Close returned before delayed recovery cleanup: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	factory.releaseCloseRecovery()
-	if err := tier8WaitSignal(testCtx, factory.aCloseRecoveryExited, "joined A recovery worker"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-clientClosed:
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("client Close: %v", err)
 		}
 	case <-testCtx.Done():
-		t.Fatal("client Close did not join delayed recovery cleanup")
+		factory.releaseCloseRecovery()
+		t.Fatal("client Close waited for a recovery factory that ignored cancellation")
 	}
-	if active := factory.active.Load(); active != 0 {
-		t.Fatalf("client Close returned with %d factory workers still active", active)
+	if active := factory.active.Load(); active != 1 {
+		factory.releaseCloseRecovery()
+		t.Fatalf("active factory calls after bounded Close=%d want 1 orphan", active)
+	}
+	factory.releaseCloseRecovery()
+	if err := tier8WaitSignal(testCtx, factory.aCloseRecoveryExited, "late A recovery worker exit"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tier8Wait(testCtx, func() (bool, string) {
+		return factory.active.Load() == 0,
+			fmt.Sprintf("active_factory_calls=%d", factory.active.Load())
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := server.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("server Close: %v", err)

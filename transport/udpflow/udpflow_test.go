@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 // TestUDPFlowDialAndWrite: a manual UDP "peer" sets up at 127.0.0.1
 // then DialPath produces a PathConn aimed at it. The first Write
-// must arrive as a single datagram beginning with the 8-byte flow
+// must arrive as a single datagram beginning with the UDP-flow
 // header followed by the rendr frame bytes verbatim.
 func TestUDPFlowDialAndWrite(t *testing.T) {
 	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -63,6 +64,7 @@ func TestUDPFlowDialAndWrite(t *testing.T) {
 	want := append([]byte{
 		proto.UDPFlowVersion,                     // VER
 		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // FLOW_ID
+		0x00, 0x00, 0x00, 0x0A, // PAYLOAD_LEN
 	}, frame...) //nolint:gocritic // intentional concat
 	if !bytes.Equal(buf[:got], want) {
 		t.Fatalf("on-wire datagram mismatch:\n got=%x\nwant=%x", buf[:got], want)
@@ -80,7 +82,7 @@ func TestUDPFlowDialAndWrite(t *testing.T) {
 }
 
 // TestUDPFlowDialReadRoundTrip: the peer echoes back the same
-// datagram; DialPath's PathConn.Read should strip the 8-byte
+// datagram; DialPath's PathConn.Read should strip the UDP-flow
 // header and return the rendr frame bytes.
 func TestUDPFlowDialReadRoundTrip(t *testing.T) {
 	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -291,4 +293,163 @@ func TestUDPFlowRandomFlowID(t *testing.T) {
 	if pc.FlowID() == zero {
 		t.Fatal("random flow id came out all-zero")
 	}
+
+	t.Run("wrap error retains caller ownership", func(t *testing.T) {
+		raw := &wrapOwnershipPacketConn{}
+		wrapped, err := WrapFromSpec(raw, transport.PathSpec{Address: "not-a-host-port"}, MaxDatagram)
+		if err == nil || wrapped != nil {
+			t.Fatalf("WrapFromSpec result/error=%v/%v want nil/non-nil", wrapped, err)
+		}
+		if closes := raw.closes.Load(); closes != 0 {
+			t.Fatalf("WrapFromSpec error closed caller PacketConn %d times", closes)
+		}
+		if err := raw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if closes := raw.closes.Load(); closes != 1 {
+			t.Fatalf("caller cleanup count=%d want=1", closes)
+		}
+	})
 }
+
+func TestPacketAsConnDropsWrongAndHostileSourcesWithMatchingFlowID(t *testing.T) {
+	flowID := [proto.UDPFlowIDSize]byte{1, 2, 3, 4, 5, 6, 7}
+	peer := udpflowTestAddr("peer")
+	snapshot, err := SnapshotPeer(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &sourceFilteringPacketConn{reads: make(chan sourceFilteringRead, 3)}
+	path, err := Wrap(raw, snapshot, flowID, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer path.Close()
+	if claim := path.LeafMobilityClaim(); claim != nil {
+		t.Fatalf("external PacketConn wrapper fabricated ownership claim: %+v", claim.Snapshot())
+	}
+
+	var hostileCalls atomic.Int32
+	raw.reads <- sourceFilteringRead{packet: udpflowTestPacket(t, flowID, []byte("wrong-source")), source: udpflowTestAddr("attacker")}
+	raw.reads <- sourceFilteringRead{packet: udpflowTestPacket(t, flowID, []byte("panic-source")), source: hostileUDPFlowAddr{calls: &hostileCalls}}
+	raw.reads <- sourceFilteringRead{packet: udpflowTestPacket(t, flowID, []byte("accepted")), source: snapshot.Identity()}
+
+	buffer := make([]byte, 64)
+	n, err := path.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "accepted" {
+		t.Fatalf("accepted payload=%q want accepted", got)
+	}
+	if got := raw.readCalls.Load(); got != 3 {
+		t.Fatalf("ReadFrom calls=%d want 3", got)
+	}
+	if got := hostileCalls.Load(); got != 0 {
+		t.Fatalf("runtime matching invoked hostile source address methods %d times", got)
+	}
+}
+
+func TestPacketAsConnStandardPeerRejectsCustomStringSpoofWithoutCallbacks(t *testing.T) {
+	flowID := [proto.UDPFlowIDSize]byte{7, 6, 5, 4, 3, 2, 1}
+	peer := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 4242, Zone: "zone"}
+	snapshot, err := SnapshotPeer(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &sourceFilteringPacketConn{reads: make(chan sourceFilteringRead, 2)}
+	path, err := Wrap(raw, snapshot, flowID, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer path.Close()
+	var hostileCalls atomic.Int32
+	raw.reads <- sourceFilteringRead{
+		packet: udpflowTestPacket(t, flowID, []byte("spoof")),
+		source: hostileUDPFlowAddr{calls: &hostileCalls},
+	}
+	raw.reads <- sourceFilteringRead{
+		packet: udpflowTestPacket(t, flowID, []byte("accepted")),
+		source: &net.UDPAddr{IP: net.ParseIP("192.0.2.10").To4(), Port: 4242, Zone: "zone"},
+	}
+	buffer := make([]byte, 64)
+	n, err := path.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "accepted" {
+		t.Fatalf("accepted payload=%q want accepted", got)
+	}
+	if got := hostileCalls.Load(); got != 0 {
+		t.Fatalf("runtime matching invoked custom string spoof methods %d times", got)
+	}
+}
+
+func udpflowTestPacket(t *testing.T, flowID [proto.UDPFlowIDSize]byte, payload []byte) []byte {
+	t.Helper()
+	packet := make([]byte, proto.UDPFlowHeaderSize+len(payload))
+	header := proto.UDPFlowHeader{Version: proto.UDPFlowVersion, FlowID: flowID, PayloadSize: uint32(len(payload))}
+	if err := header.Encode(packet[:proto.UDPFlowHeaderSize]); err != nil {
+		t.Fatal(err)
+	}
+	copy(packet[proto.UDPFlowHeaderSize:], payload)
+	return packet
+}
+
+type udpflowTestAddr string
+
+func (udpflowTestAddr) Network() string     { return "udpflow-test" }
+func (addr udpflowTestAddr) String() string { return string(addr) }
+
+type hostileUDPFlowAddr struct{ calls *atomic.Int32 }
+
+func (addr hostileUDPFlowAddr) Network() string {
+	addr.calls.Add(1)
+	panic("hostile Network")
+}
+func (addr hostileUDPFlowAddr) String() string {
+	addr.calls.Add(1)
+	panic("hostile String")
+}
+
+type sourceFilteringRead struct {
+	packet []byte
+	source net.Addr
+	err    error
+}
+
+type sourceFilteringPacketConn struct {
+	reads     chan sourceFilteringRead
+	readCalls atomic.Int32
+	closed    atomic.Bool
+}
+
+func (conn *sourceFilteringPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
+	conn.readCalls.Add(1)
+	result := <-conn.reads
+	return copy(buffer, result.packet), result.source, result.err
+}
+func (*sourceFilteringPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	return len(payload), nil
+}
+func (conn *sourceFilteringPacketConn) Close() error {
+	conn.closed.Store(true)
+	return nil
+}
+func (*sourceFilteringPacketConn) LocalAddr() net.Addr              { return udpflowTestAddr("local") }
+func (*sourceFilteringPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*sourceFilteringPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*sourceFilteringPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+type wrapOwnershipPacketConn struct{ closes atomic.Int32 }
+
+func (*wrapOwnershipPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
+func (*wrapOwnershipPacketConn) WriteTo([]byte, net.Addr) (int, error)  { return 0, net.ErrClosed }
+func (pc *wrapOwnershipPacketConn) Close() error {
+	pc.closes.Add(1)
+	return nil
+}
+func (*wrapOwnershipPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (*wrapOwnershipPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*wrapOwnershipPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*wrapOwnershipPacketConn) SetWriteDeadline(time.Time) error { return nil }

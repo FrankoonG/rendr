@@ -24,6 +24,10 @@ type tailReplayInterceptPath struct {
 	frames        [][]byte
 }
 
+func (p *tailReplayInterceptPath) MaxFrameSize() int {
+	return testPacketFrameSize(p.PathConn)
+}
+
 func newTailReplayInterceptPath(path transport.PathConn, match func([]byte) bool, drop int64) *tailReplayInterceptPath {
 	p := &tailReplayInterceptPath{PathConn: path, match: match}
 	p.dropRemaining.Store(drop)

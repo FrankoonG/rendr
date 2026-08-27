@@ -81,6 +81,86 @@ func TestUDPFlowRelayDispatchesPayloadAndWritesReply(t *testing.T) {
 	}
 }
 
+func TestUDPFlowRelayDeliversNBeforeTerminalReadError(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP,
+		SrcIP: netip.MustParseAddr("10.0.0.22"), SrcPort: 41000,
+		DstIP: netip.MustParseAddr("198.51.100.53"), DstPort: 53,
+	}
+	packet := mustBuildUDPPacket(t, id, []byte("query"))
+	meta, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalErr := errors.New("egress final read terminal")
+	pc := newScriptedPacketConn([]byte("answer-final"))
+	pc.replyErr = terminalErr
+	registry := NewEgressRegistry()
+	if err := registry.Register("dns-egress", &udpRelayEgress{
+		pc: pc, remote: netip.MustParseAddrPort("198.51.100.53:53"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	device := &writeCaptureDevice{writes: make(chan []byte, 1)}
+	relay := &UDPFlowRelay{Device: device, Egresses: registry}
+	if err := relay.HandlePacket(context.Background(), PacketEvent{
+		Packet: packet, Meta: meta,
+		Flow:     FlowMeta{L3Identity: id, Direction: DirectionIngress},
+		Decision: FlowDecision{Egress: "dns-egress"}, Decided: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-device.writes:
+		replyMeta, err := ParsePacket(reply)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := UDPPayload(reply, replyMeta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(payload) != "answer-final" {
+			t.Fatalf("reply payload=%q", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final egress reply was not delivered")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := relay.Close()
+		if errors.Is(err, terminalErr) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay close error=%v want terminal error", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pc.mu.Lock()
+	readCalls := pc.readCalls
+	pc.mu.Unlock()
+	if readCalls != 1 {
+		t.Fatalf("ReadFrom calls=%d want 1", readCalls)
+	}
+}
+
+func TestUDPReplySourceMatchingRejectsTextSpoofWithoutCallbacks(t *testing.T) {
+	expected := netip.MustParseAddrPort("198.51.100.53:53")
+	spoof := &spoofingUDPReplyAddr{value: expected.String()}
+
+	if udpReplySourceMatches(spoof, expected) {
+		t.Fatal("custom textual address matched an IP/UDP egress peer")
+	}
+	if spoof.networkCalls != 0 || spoof.stringCalls != 0 {
+		t.Fatalf("custom address callbacks invoked: Network=%d String=%d", spoof.networkCalls, spoof.stringCalls)
+	}
+	var nilUDP *net.UDPAddr
+	if udpReplySourceMatches(nilUDP, expected) {
+		t.Fatal("typed nil UDP address matched an IP/UDP egress peer")
+	}
+}
+
 func TestUDPFlowRelayRequiresDecision(t *testing.T) {
 	id := L3Identity{
 		Proto:   ProtocolUDP,
@@ -257,7 +337,7 @@ func TestUDPFlowRelayContextCancellationClosesIdleSession(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		relay.mu.Lock()
-		_, present := relay.sessions[id]
+		_, present := relay.sessions[legacyRelayFlowKey(id)]
 		relay.mu.Unlock()
 		if !present && egress.lastClosed() {
 			break
@@ -307,7 +387,7 @@ func TestUDPFlowRelayContextCancellationUnblocksDeviceWrite(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		relay.mu.Lock()
-		_, present := relay.sessions[id]
+		_, present := relay.sessions[legacyRelayFlowKey(id)]
 		relay.mu.Unlock()
 		pc.mu.Lock()
 		closed := pc.closed
@@ -345,8 +425,26 @@ type scriptedPacketConn struct {
 	wrote     []byte
 	writeAddr net.Addr
 	reply     []byte
+	replyErr  error
+	readCalls int
 	replied   bool
 	closed    bool
+}
+
+type spoofingUDPReplyAddr struct {
+	value        string
+	networkCalls int
+	stringCalls  int
+}
+
+func (a *spoofingUDPReplyAddr) Network() string {
+	a.networkCalls++
+	return "udp"
+}
+
+func (a *spoofingUDPReplyAddr) String() string {
+	a.stringCalls++
+	return a.value
 }
 
 type sourceScriptRead struct {
@@ -390,11 +488,12 @@ func newScriptedPacketConn(reply []byte) *scriptedPacketConn {
 func (c *scriptedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.readCalls++
 	if c.closed || c.replied {
 		return 0, nil, io.EOF
 	}
 	c.replied = true
-	return copy(p, c.reply), &net.UDPAddr{IP: net.ParseIP("198.51.100.53"), Port: 53}, nil
+	return copy(p, c.reply), &net.UDPAddr{IP: net.ParseIP("198.51.100.53"), Port: 53}, c.replyErr
 }
 
 func (c *scriptedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

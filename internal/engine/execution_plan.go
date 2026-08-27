@@ -29,6 +29,7 @@ type executionPlanNode struct {
 	weight         uint16
 	children       []proto.TargetID
 	peakCandidates []proto.TargetID
+	peakSet        map[proto.TargetID]struct{}
 }
 
 type executionPlanLeaf struct {
@@ -71,6 +72,10 @@ func compileExecutionPlan(manifest proto.GraphManifest) (*executionPlan, error) 
 			return nil, fmt.Errorf("engine: duplicate execution target name %q (%x and %x)", node.Name, previous, node.ID)
 		}
 
+		peakSet := make(map[proto.TargetID]struct{}, len(node.PeakCandidates))
+		for _, targetID := range node.PeakCandidates {
+			peakSet[targetID] = struct{}{}
+		}
 		entry := executionPlanEntry{node: executionPlanNode{
 			targetID:       node.ID,
 			kind:           node.Kind,
@@ -78,6 +83,7 @@ func compileExecutionPlan(manifest proto.GraphManifest) (*executionPlan, error) 
 			weight:         node.Weight,
 			children:       append([]proto.TargetID(nil), node.Children...),
 			peakCandidates: append([]proto.TargetID(nil), node.PeakCandidates...),
+			peakSet:        peakSet,
 		}}
 		plan.nodes[node.ID] = entry
 		plan.nodeIDs = append(plan.nodeIDs, node.ID)
@@ -330,5 +336,12 @@ func (p *executionPlan) validateImmediateChild(parentID, childID proto.TargetID)
 func cloneExecutionPlanNode(node executionPlanNode) executionPlanNode {
 	node.children = append([]proto.TargetID(nil), node.children...)
 	node.peakCandidates = append([]proto.TargetID(nil), node.peakCandidates...)
+	if len(node.peakSet) != 0 {
+		peaks := make(map[proto.TargetID]struct{}, len(node.peakSet))
+		for targetID := range node.peakSet {
+			peaks[targetID] = struct{}{}
+		}
+		node.peakSet = peaks
+	}
 	return node
 }

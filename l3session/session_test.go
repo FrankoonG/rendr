@@ -65,8 +65,8 @@ func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-	if sess.Conn == nil || sess.PacketConn != nil {
-		t.Fatalf("session shape conn=%T packet=%T", sess.Conn, sess.PacketConn)
+	if sess.Conn() == nil || sess.PacketConn() != nil {
+		t.Fatalf("session shape conn=%T packet=%T", sess.Conn(), sess.PacketConn())
 	}
 
 	server := <-accepted
@@ -87,11 +87,11 @@ func TestStarterStreamSessionPreservesL3Capability(t *testing.T) {
 			t.Errorf("server write: %v", err)
 		}
 	}()
-	if _, err := sess.Conn.Write([]byte("hello")); err != nil {
+	if _, err := sess.Conn().Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, 5)
-	if _, err := io.ReadFull(sess.Conn, got); err != nil {
+	if _, err := io.ReadFull(sess.Conn(), got); err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != "world" {
@@ -129,8 +129,8 @@ func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-	if sess.Conn != nil || sess.PacketConn == nil {
-		t.Fatalf("session shape conn=%T packet=%T", sess.Conn, sess.PacketConn)
+	if sess.Conn() != nil || sess.PacketConn() == nil {
+		t.Fatalf("session shape conn=%T packet=%T", sess.Conn(), sess.PacketConn())
 	}
 
 	server := <-accepted
@@ -152,11 +152,11 @@ func TestStarterPacketSessionPreservesL3Capability(t *testing.T) {
 			t.Errorf("server writeto: %v", err)
 		}
 	}()
-	if _, err := sess.PacketConn.WriteTo([]byte("ping"), dummyAddr("peer")); err != nil {
+	if _, err := sess.PacketConn().WriteTo([]byte("ping"), nil); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 32)
-	n, _, err := sess.PacketConn.ReadFrom(buf)
+	n, _, err := sess.PacketConn().ReadFrom(buf)
 	if err != nil {
 		t.Fatal(err)
 	}

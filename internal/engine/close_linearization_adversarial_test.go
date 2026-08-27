@@ -603,8 +603,9 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		waitCloseLinearizationSignal(t, path.markStarted, time.Second, "blocking MarkQuiesced")
 		select {
 		case err := <-done:
-			if err != nil {
-				t.Fatalf("GracefulClose: %v", err)
+			var deadlineErr *pathDispatchCallbackDeadlineError
+			if !errors.As(err, &deadlineErr) || deadlineErr.operation != "PathConn.MarkQuiesced" {
+				t.Fatalf("GracefulClose error=%v want MarkQuiesced deadline", err)
 			}
 		case <-time.After(time.Second):
 			_ = e.Close()
@@ -618,14 +619,14 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 			t.Fatal("engine ownership did not quiesce after bounded close")
 		}
 
-		// MarkQuiesced is allowed to return late on the terminally closed old
-		// adapter, but it must not trigger a second optional mutation afterward.
-		release()
 		select {
 		case <-e.quiesceDone:
 		case <-time.After(time.Second):
-			t.Fatal("late MarkQuiesced completion did not release its bounded worker")
+			t.Fatal("MarkQuiesced timeout retained its quiesce worker")
 		}
+		// MarkQuiesced may return late on the terminally closed old adapter, but
+		// its revoked worker must not trigger a second optional mutation.
+		release()
 		select {
 		case <-path.closeWriteStarted:
 			t.Fatal("late MarkQuiesced completion invoked CloseWrite on a retired path")
@@ -654,8 +655,9 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		waitCloseLinearizationSignal(t, path.closeWriteStarted, time.Second, "blocking CloseWrite")
 		select {
 		case err := <-done:
-			if err != nil {
-				t.Fatalf("GracefulClose: %v", err)
+			var deadlineErr *pathDispatchCallbackDeadlineError
+			if !errors.As(err, &deadlineErr) || deadlineErr.operation != "PathConn.CloseWrite" {
+				t.Fatalf("GracefulClose error=%v want CloseWrite deadline", err)
 			}
 		case <-time.After(time.Second):
 			_ = e.Close()
@@ -668,12 +670,12 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("engine ownership did not quiesce after bounded close")
 		}
-		release()
 		select {
 		case <-e.quiesceDone:
 		case <-time.After(time.Second):
-			t.Fatal("late CloseWrite completion did not release its bounded worker")
+			t.Fatal("CloseWrite timeout retained its quiesce worker")
 		}
+		release()
 	})
 
 	t.Run("CloseWriteContendsWithWrite", func(t *testing.T) {
@@ -723,8 +725,9 @@ func TestGracefulCloseBoundsBlockingOptionalTransportHooks(t *testing.T) {
 		waitCloseLinearizationSignal(t, path.closeWriteStarted, time.Second, "contending CloseWrite")
 		select {
 		case err := <-done:
-			if err != nil {
-				t.Fatalf("GracefulClose after published BYE: %v", err)
+			var deadlineErr *pathDispatchCallbackDeadlineError
+			if !errors.As(err, &deadlineErr) || deadlineErr.operation != "PathConn.CloseWrite" {
+				t.Fatalf("GracefulClose error=%v want contended CloseWrite deadline", err)
 			}
 		case <-time.After(time.Second):
 			_ = e.Close()

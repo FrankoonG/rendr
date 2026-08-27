@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -88,12 +90,13 @@ type sessionDialer struct {
 	Retry retryPolicy
 
 	// Factory maps are immutable snapshots of the owning Runtime registry.
-	streamFactories map[string]streamPathFactory
-	packetFactories map[string]packetPathFactory
-	framedFactories map[string]transport.PathFactory
-	factoryCarriers map[string]CarrierFamily
-	mobilityLedger  *engine.LeafMobilityPeerLedger
-	localStatus     func() LocalStatus
+	streamFactories       map[string]streamPathFactory
+	packetFactories       map[string]packetPathFactory
+	framedFactories       map[string]transport.PathFactory
+	factoryCarriers       map[string]CarrierFamily
+	factoryCallbackBudget *factoryCallbackBudget
+	mobilityLedger        *engine.LeafMobilityPeerLedger
+	localStatus           func() LocalStatus
 }
 
 // Dial establishes a rendr Conn using d's configuration. The engine
@@ -112,6 +115,14 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	if len(paths) == 0 {
 		return nil, errNoCompiledPath
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cleanupAuthority, err := reserveCanceledDialCleanup()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { cleanupAuthority.release() }()
 	resolver := d.snapshotFactoryResolver()
 	mobilityCapabilities, err := resolver.mobilityCapabilities(paths, leafmobility.SessionStream)
 	if err != nil {
@@ -120,24 +131,25 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	instanceID := d.instanceID()
-	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, false)
+	e, first, firstIndex, ack, _, err := d.dialInitialPath(
+		ctx, instanceID, paths, plan, tracker, resolver, &cleanupAuthority,
+		mobilityCapabilities, false,
+	)
 	if err != nil {
 		return nil, err
 	}
+	failureCleanup := newAdmittedDialFailureCleanup(e, cleanupAuthority)
+	defer failureCleanup.finish()
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	if err := e.SetPeerInstanceID(ack.InstanceID); err != nil {
-		_ = e.Close()
 		return nil, err
 	}
 	tracker.set(firstIndex, PathAttached, nil)
 	if err := ctx.Err(); err != nil {
-		gracefullyCloseAdmittedSession(e)
+		failureCleanup.setCleanup(func() { _ = e.GracefulClose(proto.ByeNormal) })
 		return nil, err
 	}
-	pathIDs := make([]uint32, len(paths))
-	pathIDs[firstIndex] = firstID
-
 	c := &engine.Conn{
 		E:     e,
 		LAddr: addrFromString("rendr-client"),
@@ -149,6 +161,7 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
+	failureCleanup.setCleanup(bc.abortDial)
 	// Every leaf that did not establish the session is optional startup work.
 	// Recovery owns its context, retries, resolver snapshot, and Close
 	// cancellation, so a slow optional factory cannot delay Dial or inherit the
@@ -158,15 +171,14 @@ func (d *sessionDialer) Dial(ctx context.Context) (Conn, error) {
 	// Arm peak-transfer policy from the graph. Optional leaves become eligible
 	// as background recovery attaches them.
 	if plan.peakTransfer {
-		if err := bc.startPeakTransfer(plan, pathIDs); err != nil {
-			bc.abortDial()
+		if err := bc.startPeakTransfer(plan); err != nil {
 			return nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		cleanupCanceledDial(e, bc.abortDial)
 		return nil, err
 	}
+	failureCleanup.disarm()
 	return bc, nil
 }
 
@@ -188,6 +200,14 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	if len(paths) == 0 {
 		return nil, errNoCompiledPath
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cleanupAuthority, err := reserveCanceledDialCleanup()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { cleanupAuthority.release() }()
 	resolver := d.snapshotFactoryResolver()
 	mobilityCapabilities, err := resolver.mobilityCapabilities(paths, leafmobility.SessionPacket)
 	if err != nil {
@@ -196,69 +216,279 @@ func (d *sessionDialer) DialPacket(ctx context.Context) (PacketConn, error) {
 	tracker := newPathStatusTracker(paths, plan.primaryName)
 
 	instanceID := d.instanceID()
-	e, first, firstIndex, ack, firstID, err := d.dialInitialPath(ctx, instanceID, paths, plan, tracker, resolver, mobilityCapabilities, true)
+	e, _, firstIndex, ack, _, err := d.dialInitialPath(
+		ctx, instanceID, paths, plan, tracker, resolver, &cleanupAuthority,
+		mobilityCapabilities, true,
+	)
 	if err != nil {
 		return nil, err
 	}
+	failureCleanup := newAdmittedDialFailureCleanup(e, cleanupAuthority)
+	defer failureCleanup.finish()
 	e.SetPeerKind(engine.PeerRendr)
 	e.SetPeerCaps(ack.Caps)
 	if err := e.SetPeerInstanceID(ack.InstanceID); err != nil {
-		_ = e.Close()
 		return nil, err
 	}
 	tracker.set(firstIndex, PathAttached, nil)
 	if err := ctx.Err(); err != nil {
-		gracefullyCloseAdmittedSession(e)
+		failureCleanup.setCleanup(func() { _ = e.GracefulClose(proto.ByeNormal) })
 		return nil, err
 	}
-	pathIDs := make([]uint32, len(paths))
-	pathIDs[firstIndex] = firstID
-
 	lAddr := addrFromString("rendr-client")
-	rAddr := addrFromString(first.Address)
-	bc := newEnginePacketConn(e, lAddr, rAddr)
+	bc := newEnginePacketConn(e, lAddr)
 	bc.localStatus = d.localStatus
 	bc.status = tracker
 	bc.resolver = resolver
 	bc.carriers = resolver.carrier
 	bc.graph = plan.graph
+	failureCleanup.setCleanup(bc.abortDial)
 	// Optional packet leaves follow the same session-owned recovery lifecycle as
 	// stream leaves and never consume the successful DialPacket caller context.
 	bc.startPathRecovery(paths, d.Retry)
 
 	if plan.peakTransfer {
-		if err := bc.startPeakTransfer(plan, pathIDs); err != nil {
-			bc.abortDial()
+		if err := bc.startPeakTransfer(plan); err != nil {
 			return nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		cleanupCanceledDial(e, bc.abortDial)
 		return nil, err
 	}
+	failureCleanup.disarm()
 	return bc, nil
 }
 
-// gracefullyCloseAdmittedSession preserves the ordered terminal protocol once
-// HELLO admission has published a peer-visible session. The caller still
-// receives its context error; the peer receives normal EOF after prior frames.
-func gracefullyCloseAdmittedSession(e *engine.Engine) {
-	cleanupCanceledDial(e, func() { _ = e.GracefulClose(proto.ByeNormal) })
+type admittedDialFailureCleanup struct {
+	e         *engine.Engine
+	authority *canceledDialCleanupReservation
+	cleanup   func()
+	armed     bool
+}
+
+func newAdmittedDialFailureCleanup(
+	e *engine.Engine,
+	authority *canceledDialCleanupReservation,
+) *admittedDialFailureCleanup {
+	return &admittedDialFailureCleanup{
+		e: e, authority: authority, armed: true,
+		cleanup: func() { _ = e.Close() },
+	}
+}
+
+func (c *admittedDialFailureCleanup) setCleanup(cleanup func()) {
+	if c != nil && cleanup != nil {
+		c.cleanup = cleanup
+	}
+}
+
+func (c *admittedDialFailureCleanup) disarm() {
+	if c != nil {
+		c.armed = false
+	}
+}
+
+func (c *admittedDialFailureCleanup) finish() {
+	if c == nil || !c.armed {
+		return
+	}
+	c.armed = false
+	cleanupCanceledDial(c.e, c.authority, c.cleanup)
+}
+
+const (
+	canceledDialCleanupWorkerLimit = 64
+	// Every in-flight Dial reserves one authority before consulting a factory.
+	// This matches the process bridge baseline while keeping hostile cleanup
+	// execution fixed at a much smaller concurrency limit.
+	canceledDialCleanupAuthorityLimit = engine.DefaultBridgeTableCapacity
+	canceledDialCleanupQueueCapacity  = canceledDialCleanupAuthorityLimit -
+		canceledDialCleanupWorkerLimit
+)
+
+type canceledDialCleanupReservationState uint32
+
+const (
+	canceledDialCleanupReserved canceledDialCleanupReservationState = iota
+	canceledDialCleanupSubmitted
+	canceledDialCleanupReleased
+	canceledDialCleanupCompleted
+)
+
+type canceledDialCleanupExecutor struct {
+	workerLimit int
+	permits     chan struct{}
+
+	mu        sync.Mutex
+	workers   int
+	queue     []*canceledDialCleanupJob
+	queueHead int
+	queueLen  int
+}
+
+type canceledDialCleanupReservation struct {
+	executor *canceledDialCleanupExecutor
+	state    atomic.Uint32
+}
+
+type canceledDialCleanupJob struct {
+	engine      *engine.Engine
+	cleanup     func()
+	reservation *canceledDialCleanupReservation
+}
+
+var processCanceledDialCleanupExecutor = newCanceledDialCleanupExecutor(
+	canceledDialCleanupWorkerLimit,
+	canceledDialCleanupQueueCapacity,
+)
+
+func newCanceledDialCleanupExecutor(workerLimit, queueCapacity int) *canceledDialCleanupExecutor {
+	if workerLimit <= 0 || queueCapacity < 0 {
+		panic("rendr: invalid canceled Dial cleanup executor limits")
+	}
+	authorityLimit := workerLimit + queueCapacity
+	return &canceledDialCleanupExecutor{
+		workerLimit: workerLimit,
+		permits:     make(chan struct{}, authorityLimit),
+		// A completed worker releases its authority before it dequeues the next
+		// job. During that handoff a new Dial can legitimately reserve the freed
+		// permit while every old queue cell is still occupied. Size storage to the
+		// full authority limit; permits, not queue cells, remain the admission
+		// bound and workerLimit remains the execution bound.
+		queue: make([]*canceledDialCleanupJob, authorityLimit),
+	}
+}
+
+func reserveCanceledDialCleanup() (*canceledDialCleanupReservation, error) {
+	return processCanceledDialCleanupExecutor.reserve()
+}
+
+func (e *canceledDialCleanupExecutor) reserve() (*canceledDialCleanupReservation, error) {
+	select {
+	case e.permits <- struct{}{}:
+		return &canceledDialCleanupReservation{executor: e}, nil
+	default:
+		return nil, ErrDialCleanupCapacity
+	}
+}
+
+func (r *canceledDialCleanupReservation) release() {
+	if r == nil || !r.state.CompareAndSwap(
+		uint32(canceledDialCleanupReserved),
+		uint32(canceledDialCleanupReleased),
+	) {
+		return
+	}
+	<-r.executor.permits
+}
+
+func (r *canceledDialCleanupReservation) submit(e *engine.Engine, cleanup func()) {
+	if r == nil || !r.state.CompareAndSwap(
+		uint32(canceledDialCleanupReserved),
+		uint32(canceledDialCleanupSubmitted),
+	) {
+		panic("rendr: canceled Dial cleanup authority submitted without a reservation")
+	}
+	r.executor.submit(&canceledDialCleanupJob{
+		engine: e, cleanup: cleanup, reservation: r,
+	})
+}
+
+func (r *canceledDialCleanupReservation) complete() {
+	if !r.state.CompareAndSwap(
+		uint32(canceledDialCleanupSubmitted),
+		uint32(canceledDialCleanupCompleted),
+	) {
+		panic("rendr: canceled Dial cleanup authority completed without ownership")
+	}
+	<-r.executor.permits
+}
+
+func (e *canceledDialCleanupExecutor) submit(job *canceledDialCleanupJob) {
+	e.mu.Lock()
+	if e.workers < e.workerLimit {
+		e.workers++
+		e.mu.Unlock()
+		go e.runWorker(job)
+		return
+	}
+	if e.queueLen >= len(e.queue) {
+		e.mu.Unlock()
+		panic("rendr: canceled Dial cleanup queue exceeded reserved capacity")
+	}
+	index := (e.queueHead + e.queueLen) % len(e.queue)
+	e.queue[index] = job
+	e.queueLen++
+	e.mu.Unlock()
+}
+
+func (e *canceledDialCleanupExecutor) runWorker(job *canceledDialCleanupJob) {
+	normalExit := false
+	defer func() {
+		_ = recover()
+		if normalExit {
+			return
+		}
+		// runtime.Goexit and an escaped internal panic both run this defer.
+		// Replace this exact worker slot only when queued authority remains.
+		if next := e.takeNextWorkerJob(); next != nil {
+			go e.runWorker(next)
+		}
+	}()
+	for job != nil {
+		job.run()
+		job = e.takeNextWorkerJob()
+	}
+	normalExit = true
+}
+
+func (e *canceledDialCleanupExecutor) takeNextWorkerJob() *canceledDialCleanupJob {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.queueLen == 0 {
+		e.workers--
+		return nil
+	}
+	job := e.queue[e.queueHead]
+	e.queue[e.queueHead] = nil
+	e.queueHead = (e.queueHead + 1) % len(e.queue)
+	e.queueLen--
+	return job
+}
+
+func (j *canceledDialCleanupJob) run() {
+	returned := false
+	defer func() {
+		_ = recover()
+		if !returned {
+			// A panic or runtime.Goexit in the higher-level cleanup must not
+			// abandon the already admitted engine. Close is idempotent and is
+			// the final authority when graceful teardown exited abnormally.
+			_ = j.engine.Close()
+		}
+		<-j.engine.Closed()
+		j.reservation.complete()
+	}()
+	j.cleanup()
+	returned = true
+	<-j.engine.Closed()
 }
 
 // cleanupCanceledDial publishes the terminal boundary synchronously, then
-// gives one goroutine sole ownership of graceful teardown. The owner joins the
-// engine's full quiescence before exiting, so a caller cancellation never
-// waits for the terminal ACK window and never abandons session workers.
-func cleanupCanceledDial(e *engine.Engine, cleanup func()) {
+// transfers the pre-reserved authority to the process-bounded cleanup
+// executor. The caller never waits for the terminal ACK window; the authority
+// is not reusable until the engine's full quiescence is proven.
+func cleanupCanceledDial(
+	e *engine.Engine,
+	authority *canceledDialCleanupReservation,
+	cleanup func(),
+) {
 	if e == nil {
+		authority.release()
 		return
 	}
 	e.BeginGracefulClose()
-	go func() {
-		cleanup()
-		<-e.Closed()
-	}()
+	authority.submit(e, cleanup)
 }
 
 func (d *sessionDialer) instanceID() InstanceID {
@@ -321,11 +551,6 @@ func (d *sessionDialer) applyPrimary(ct compiledTarget, root Target, primary str
 	ps := ct.paths[idx]
 	copy(ct.paths[1:idx+1], ct.paths[0:idx])
 	ct.paths[0] = ps
-	if len(ct.pathPeak) == len(ct.paths) {
-		peak := ct.pathPeak[idx]
-		copy(ct.pathPeak[1:idx+1], ct.pathPeak[0:idx])
-		ct.pathPeak[0] = peak
-	}
 	return ct, nil
 }
 
@@ -343,6 +568,7 @@ func (d *sessionDialer) dialInitialPath(
 	plan compiledTarget,
 	tracker *pathStatusTracker,
 	resolver *pathFactoryResolver,
+	cleanupAuthority **canceledDialCleanupReservation,
 	mobilityCapabilities []leafmobility.Capability,
 	packetMode bool,
 ) (*engine.Engine, PathSpec, int, proto.HelloAckPayload, uint32, error) {
@@ -350,7 +576,7 @@ func (d *sessionDialer) dialInitialPath(
 	primaryPolicy := d.effectivePrimaryPolicy()
 	for i, ps := range paths {
 		tracker.set(i, PathDialing, nil)
-		pc, err := resolver.dialPath(ctx, ps)
+		lease, err := resolver.dialPathForAdoption(ctx, ps)
 		if err != nil {
 			tracker.set(i, PathUnavailable, err)
 			lastErr = err
@@ -359,16 +585,15 @@ func (d *sessionDialer) dialInitialPath(
 			}
 			continue
 		}
+		pc := lease.Path()
 		e := engine.New(engine.SideClient, engine.NewClientFlowID(), d.engineLimits())
 		e.SetLeafMobilityPeerLedger(d.mobilityLedger)
 		if err := e.ConfigureLocalMobilityCapabilities(mobilityCapabilities...); err != nil {
-			_ = pc.Close()
-			_ = e.Close()
+			err = errors.Join(err, lease.Close(), e.Close())
 			return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
 		}
 		if err := e.ConfigureLocalGraph(plan.graphRevision, plan.graph.manifest); err != nil {
-			_ = pc.Close()
-			_ = e.Close()
+			err = errors.Join(err, lease.Close(), e.Close())
 			return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
 		}
 		e.SetLocalInstanceID(instanceID)
@@ -380,20 +605,56 @@ func (d *sessionDialer) dialInitialPath(
 			ctx, pc, e, instanceID, d.helloCaps(packetMode), pathSpecName(ps), ps,
 			func(ack proto.HelloAckPayload) error { return d.validatePeerSessionCaps(ack.Caps) },
 		)
+		if admission.EngineOwnsPath {
+			err = errors.Join(err, lease.ReleaseToEngine())
+		} else if err == nil {
+			err = errors.New("rendr: successful initial path admission did not transfer path ownership")
+		}
 		if err != nil {
 			if d.PreserveL3Identity && errors.Is(err, engine.ErrPathAdmissionRejected) {
 				err = errors.Join(d.validatePeerSessionCaps(0), err)
 			}
-			_ = pc.Close()
-			_ = e.Close()
+			if !admission.EngineOwnsPath {
+				err = errors.Join(err, lease.Close())
+			}
+			if admission.EngineOwnsPath {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					err = errors.Join(err, ctxErr)
+				}
+				tracker.set(i, pathStateForHandshakeError(err), err)
+				cleanupCanceledDial(e, *cleanupAuthority, func() { _ = e.Close() })
+				if ctx.Err() != nil {
+					return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
+						fmt.Errorf("rendr: initial path %q admission canceled: %w", pathSpecName(ps), err)
+				}
+				// COMMIT crossed the wire, so the listener may already have
+				// published this session even though its terminal ACTIVATED proof
+				// was lost. Starting a new proposal on another path would turn one
+				// Dial into two server application sessions.
+				if errors.Is(err, engine.ErrPathAdmissionOutcomeUnknown) {
+					return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
+						fmt.Errorf("rendr: initial path %q admission outcome is unknown: %w", pathSpecName(ps), err)
+				}
+				if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
+					return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
+						fmt.Errorf("rendr: primary path %q handshake failed: %w", plan.primaryName, err)
+				}
+				lastErr = err
+				if i+1 < len(paths) {
+					nextAuthority, reserveErr := reserveCanceledDialCleanup()
+					if reserveErr != nil {
+						return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
+							fmt.Errorf("rendr: reserve cleanup authority after path %q failed: %w",
+								pathSpecName(ps), errors.Join(err, reserveErr))
+					}
+					*cleanupAuthority = nextAuthority
+				}
+				continue
+			}
+			err = errors.Join(err, e.Close())
 			state := pathStateForHandshakeError(err)
 			tracker.set(i, state, err)
 			lastErr = err
-			// COMMIT crossed the wire, so the listener may already have
-			// published this session even though its terminal ACTIVATED proof
-			// was lost. Starting a new proposal on another path would turn one
-			// Dial into two server application sessions. The caller must observe
-			// the typed uncertain outcome instead of an unsafe fallback.
 			if errors.Is(err, engine.ErrPathAdmissionOutcomeUnknown) {
 				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0,
 					fmt.Errorf("rendr: initial path %q admission outcome is unknown: %w", pathSpecName(ps), err)
@@ -403,18 +664,7 @@ func (d *sessionDialer) dialInitialPath(
 			}
 			continue
 		}
-		ack := admission.Ack
-		if peerPacketMode := ack.Caps&proto.CapsPacketMode != 0; peerPacketMode != packetMode {
-			err = fmt.Errorf("rendr: peer session kind mismatch: packet=%t", peerPacketMode)
-			_ = e.Close()
-			tracker.set(i, PathNative, err)
-			lastErr = err
-			if pathSpecName(ps) == plan.primaryName && primaryPolicy == primaryRequire {
-				return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, err
-			}
-			continue
-		}
-		return e, ps, i, ack, admission.PathID, nil
+		return e, ps, i, admission.Ack, admission.PathID, nil
 	}
 	if lastErr != nil {
 		return nil, PathSpec{}, -1, proto.HelloAckPayload{}, 0, fmt.Errorf("rendr: no usable path: %w", lastErr)

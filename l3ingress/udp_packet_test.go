@@ -112,6 +112,55 @@ func TestBuildUDPPacketRoundTripIPv6(t *testing.T) {
 	}
 }
 
+func TestBuildUDPPacketIPv6EncodesComputedZeroChecksumAsFFFF(t *testing.T) {
+	id := L3Identity{
+		Proto: ProtocolUDP,
+		SrcIP: netip.MustParseAddr("2001:db8:1::10"), SrcPort: 31000,
+		DstIP: netip.MustParseAddr("2001:db8:2::20"), DstPort: 32000,
+	}
+	var packet []byte
+	for candidate := 0; candidate <= 0xffff; candidate++ {
+		payload := []byte{byte(candidate >> 8), byte(candidate)}
+		got := mustBuildUDPPacket(t, id, payload)
+		probe := append([]byte(nil), got...)
+		probe[46], probe[47] = 0, 0
+		if independentUDPv6Checksum(probe) == 0 {
+			packet = got
+			break
+		}
+	}
+	if packet == nil {
+		t.Fatal("failed to brute-force an IPv6 UDP checksum-zero payload")
+	}
+	if got := binary.BigEndian.Uint16(packet[46:48]); got != 0xffff {
+		t.Fatalf("wire checksum=%#04x want 0xffff", got)
+	}
+	if got := independentUDPv6Checksum(packet); got != 0 {
+		t.Fatalf("independent checksum verification=%#04x want 0", got)
+	}
+}
+
+func independentUDPv6Checksum(packet []byte) uint16 {
+	udpLen := int(binary.BigEndian.Uint16(packet[44:46]))
+	words := make([]byte, 40+udpLen)
+	copy(words[0:16], packet[8:24])
+	copy(words[16:32], packet[24:40])
+	binary.BigEndian.PutUint32(words[32:36], uint32(udpLen))
+	words[39] = 17
+	copy(words[40:], packet[40:40+udpLen])
+	var sum uint64
+	for index := 0; index+1 < len(words); index += 2 {
+		sum += uint64(words[index])<<8 | uint64(words[index+1])
+	}
+	if len(words)%2 != 0 {
+		sum += uint64(words[len(words)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
 func TestBuildUDPPacketIPv4PayloadBoundary(t *testing.T) {
 	id := L3Identity{
 		Proto:   ProtocolUDP,

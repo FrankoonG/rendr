@@ -1,6 +1,7 @@
 package leafmobility
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -150,10 +151,12 @@ type Claim struct {
 	resource    *resourceState
 	issuer      *authorityIssuerToken
 
-	executionMu       sync.Mutex
-	executionActive   bool
-	executionRetiring bool
-	executionDone     chan struct{}
+	executionMu           sync.Mutex
+	executionActive       bool
+	executionRetiring     bool
+	executionDone         chan struct{}
+	executionRetireCtx    context.Context
+	executionRetireCancel context.CancelFunc
 
 	mu                sync.RWMutex
 	binding           Binding
@@ -170,7 +173,7 @@ func NewClaim(facts Facts) (*Claim, error) {
 	if facts.Operations != 0 {
 		return nil, fmt.Errorf("%w: operations %#x", ErrDriverRequired, facts.Operations)
 	}
-	return &Claim{facts: facts}, nil
+	return newClaim(facts), nil
 }
 
 // NewDrivenClaim creates a claim whose specialized operation is backed by a
@@ -229,7 +232,20 @@ func newDrivenClaim(facts Facts, driver Driver, resource Resource, incarnation I
 		return nil, fmt.Errorf("%w: kind %d requires operation %#x, got %#x", ErrInvalidDriver, facts.Kind, want, operation)
 	}
 	facts.Operations = operation
-	return &Claim{facts: facts, driver: driver, incarnation: incarnation, resource: resource.state}, nil
+	claim := newClaim(facts)
+	claim.driver = driver
+	claim.incarnation = incarnation
+	claim.resource = resource.state
+	return claim, nil
+}
+
+func newClaim(facts Facts) *Claim {
+	retireCtx, retireCancel := context.WithCancel(context.Background())
+	return &Claim{
+		facts:                 facts,
+		executionRetireCtx:    retireCtx,
+		executionRetireCancel: retireCancel,
+	}
 }
 
 // MustNewClaim is NewClaim for adapter facts that cannot be invalid at runtime.
@@ -412,6 +428,7 @@ func (c *Claim) RequestRetireState(binding Binding) (bool, error) {
 	c.retired = true
 	c.revokeResourceTransactionLocked()
 	c.mu.Unlock()
+	c.executionRetireCancel()
 	return c.executionActive, nil
 }
 
@@ -433,12 +450,22 @@ func (c *Claim) RetireUnbound() bool {
 	c.retired = true
 	c.revokeResourceTransactionLocked()
 	c.mu.Unlock()
+	c.executionRetireCancel()
 	done := c.executionDone
 	c.executionMu.Unlock()
 	if done != nil {
 		<-done
 	}
 	return true
+}
+
+func (c *Claim) executionRetirementContext() context.Context {
+	if c == nil || c.executionRetireCtx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	return c.executionRetireCtx
 }
 
 func (c *Claim) acquireExecutionLease() bool {

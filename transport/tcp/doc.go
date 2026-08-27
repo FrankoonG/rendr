@@ -13,4 +13,9 @@
 // Hard rule #2 compliance: io.EOF on a quiesced (peer-sent-BYE)
 // stream is CleanClose; everything else is TransportError. See
 // transport.Classify.
+//
+// The default adapter owns sockets and reports raw-TCP ownership without
+// linking the optional Linux TCP_REPAIR implementation. Building with
+// rendr_experimental_tcprepair adds the sealed driver, implementation
+// provider, and route/source refresh monitor to owned Linux/amd64 endpoints.
 package tcp

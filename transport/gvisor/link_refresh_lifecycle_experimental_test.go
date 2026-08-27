@@ -11,6 +11,14 @@ import (
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 )
 
+func TestGVisorLivenessElectionGivesDialerOneTickPriority(t *testing.T) {
+	dialer := (&linkOwner{role: leafmobility.RoleDialer}).livenessFailureThreshold()
+	acceptor := (&linkOwner{role: leafmobility.RoleAcceptor}).livenessFailureThreshold()
+	if dialer != outerLivenessFailure || acceptor != outerLivenessFailure+outerLivenessTick {
+		t.Fatalf("liveness election thresholds dialer=%v acceptor=%v", dialer, acceptor)
+	}
+}
+
 func TestGVisorRefreshContextCancellationClearsSubscriberAndAllowsResubscribe(t *testing.T) {
 	listener := mustPacketListener(t)
 	client, server := dialAndAccept(t, listener)

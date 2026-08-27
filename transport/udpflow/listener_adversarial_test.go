@@ -56,11 +56,8 @@ func (c *listenerScriptPacketConn) ReadFrom(buf []byte) (int, net.Addr, error) {
 	case <-c.closed:
 		return 0, nil, net.ErrClosed
 	case result := <-c.results:
-		if result.err != nil {
-			return 0, nil, result.err
-		}
 		n := copy(buf, result.packet.data)
-		return n, result.packet.addr, nil
+		return n, result.packet.addr, result.err
 	}
 }
 
@@ -182,7 +179,7 @@ func listenerFlowID(n uint64) [proto.UDPFlowIDSize]byte {
 func listenerDatagram(t *testing.T, flowID [proto.UDPFlowIDSize]byte, payload []byte) []byte {
 	t.Helper()
 	datagram := make([]byte, proto.UDPFlowHeaderSize+len(payload))
-	hdr := proto.UDPFlowHeader{Version: proto.UDPFlowVersion, FlowID: flowID}
+	hdr := proto.UDPFlowHeader{Version: proto.UDPFlowVersion, FlowID: flowID, PayloadSize: uint32(len(payload))}
 	if err := hdr.Encode(datagram[:proto.UDPFlowHeaderSize]); err != nil {
 		t.Fatal(err)
 	}
@@ -251,12 +248,12 @@ func listenerEventually(t *testing.T, condition func() bool, message string) {
 }
 
 func TestNewListenerFromPacketConnUsesGenericAddresses(t *testing.T) {
-	if _, err := NewListenerFromPacketConn(nil); err == nil {
+	if _, err := NewListenerFromPacketConn(nil, MaxDatagram); err == nil {
 		t.Fatal("NewListenerFromPacketConn(nil) succeeded")
 	}
 
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +306,7 @@ func TestNewListenerFromPacketConnUsesGenericAddresses(t *testing.T) {
 
 func TestListenerFlowChurnDoesNotLeakEntries(t *testing.T) {
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +340,7 @@ func TestListenerFlowChurnDoesNotLeakEntries(t *testing.T) {
 
 func TestListenerAcceptQueueSaturationDoesNotBlockExistingFlow(t *testing.T) {
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +399,7 @@ func TestListenerAcceptQueueSaturationDoesNotBlockExistingFlow(t *testing.T) {
 
 func TestListenerFlowTableIsBounded(t *testing.T) {
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +432,7 @@ func TestListenerFlowTableIsBounded(t *testing.T) {
 
 func TestListenerStaleCloseDoesNotDeleteReplacementFlow(t *testing.T) {
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +478,7 @@ func TestListenerStaleCloseDoesNotDeleteReplacementFlow(t *testing.T) {
 
 func TestListenerCloseDrainsAcceptedFlow(t *testing.T) {
 	conn := newListenerMemoryPacketConn()
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +544,7 @@ func TestListenerCloseDrainsAcceptedFlow(t *testing.T) {
 func TestListenerConcurrentCloseAndDeath(t *testing.T) {
 	for iteration := 0; iteration < 32; iteration++ {
 		conn := newListenerMemoryPacketConn()
-		l, err := NewListenerFromPacketConn(conn)
+		l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -609,7 +606,7 @@ func TestListenerPermanentReadFailureIsTerminal(t *testing.T) {
 		addr: peer,
 	}}
 
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +679,7 @@ func TestListenerTemporaryReadBurstBacksOffAndRecovers(t *testing.T) {
 		addr: listenerTestAddr("temporary-peer"),
 	}}
 
-	l, err := NewListenerFromPacketConn(conn)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,10 +688,6 @@ func TestListenerTemporaryReadBurstBacksOffAndRecovers(t *testing.T) {
 		t.Fatalf("recovered payload = %q", got)
 	}
 
-	if got := conn.readCount.Load(); got != 5 {
-		// The fifth call is blocked waiting for the next packet after recovery.
-		t.Fatalf("ReadFrom call count = %d, want 5", got)
-	}
 	callTimes := make([]time.Time, 0, 5)
 	for len(callTimes) < 5 {
 		select {
@@ -703,6 +696,10 @@ func TestListenerTemporaryReadBurstBacksOffAndRecovers(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out collecting ReadFrom call times")
 		}
+	}
+	if got := conn.readCount.Load(); got != 5 {
+		// The fifth call is blocked waiting for the next packet after recovery.
+		t.Fatalf("ReadFrom call count = %d, want 5", got)
 	}
 	for i, want := range []time.Duration{
 		readRetryInitialBackoff,
@@ -720,4 +717,189 @@ func TestListenerTemporaryReadBurstBacksOffAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	listenerEventually(t, func() bool { return conn.closeCount.Load() == 1 }, "recovered listener did not close PacketConn")
+}
+
+func TestListenerDeliversFinalDatagramBeforeTerminalReadError(t *testing.T) {
+	conn := newListenerScriptPacketConn()
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	flowID := listenerFlowID(7001)
+	peer := listenerTestAddr("final-peer")
+	conn.results <- listenerReadResult{packet: listenerTestPacket{
+		data: listenerDatagram(t, flowID, []byte("first")), addr: peer,
+	}}
+	server := listenerAccept(t, l)
+	if got := string(listenerRead(t, server)); got != "first" {
+		t.Fatalf("first payload=%q", got)
+	}
+
+	terminalErr := errors.New("final packet terminal error")
+	conn.results <- listenerReadResult{
+		packet: listenerTestPacket{data: listenerDatagram(t, flowID, []byte("final")), addr: peer},
+		err:    terminalErr,
+	}
+	if got := string(listenerRead(t, server)); got != "final" {
+		t.Fatalf("final payload=%q", got)
+	}
+	if _, err := server.Read(make([]byte, MaxDatagram)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("read after final payload=%v want net.ErrClosed", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = l.Accept(ctx)
+	if !errors.Is(err, ErrListenerRead) || !errors.Is(err, terminalErr) {
+		t.Fatalf("terminal accept error=%v", err)
+	}
+	if got := conn.readCount.Load(); got != 2 {
+		t.Fatalf("ReadFrom calls=%d want 2", got)
+	}
+}
+
+func TestListenerAcceptsNewFlowFinalDatagramBeforeTerminalReadError(t *testing.T) {
+	conn := newListenerScriptPacketConn()
+	flowID := listenerFlowID(7004)
+	peer := listenerTestAddr("new-final-peer")
+	terminalErr := errors.New("new flow final packet terminal error")
+	conn.results <- listenerReadResult{
+		packet: listenerTestPacket{data: listenerDatagram(t, flowID, []byte("only-final")), addr: peer},
+		err:    terminalErr,
+	}
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	server := listenerAccept(t, l)
+	if got := string(listenerRead(t, server)); got != "only-final" {
+		t.Fatalf("final payload=%q", got)
+	}
+	if _, err := server.Read(make([]byte, MaxDatagram)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("read after final payload=%v want net.ErrClosed", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = l.Accept(ctx)
+	if !errors.Is(err, ErrListenerRead) || !errors.Is(err, terminalErr) {
+		t.Fatalf("terminal accept error=%v", err)
+	}
+	if got := conn.readCount.Load(); got != 1 {
+		t.Fatalf("ReadFrom calls=%d want 1", got)
+	}
+}
+
+func TestListenerStagesFinalDatagramWhenFlowInboxIsFull(t *testing.T) {
+	conn := newListenerScriptPacketConn()
+	conn.results = make(chan listenerReadResult, inboxSize+4)
+	conn.readCalls = make(chan time.Time, inboxSize+4)
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	flowID := listenerFlowID(7005)
+	peer := listenerTestAddr("full-inbox-peer")
+	conn.results <- listenerReadResult{packet: listenerTestPacket{
+		data: listenerDatagram(t, flowID, []byte("initial")), addr: peer,
+	}}
+	server := listenerAccept(t, l)
+	if got := string(listenerRead(t, server)); got != "initial" {
+		t.Fatalf("initial payload=%q", got)
+	}
+	for index := 0; index < inboxSize; index++ {
+		conn.results <- listenerReadResult{packet: listenerTestPacket{
+			data: listenerDatagram(t, flowID, []byte{byte(index)}), addr: peer,
+		}}
+	}
+	terminalErr := errors.New("full inbox terminal error")
+	conn.results <- listenerReadResult{
+		packet: listenerTestPacket{data: listenerDatagram(t, flowID, []byte("staged-final")), addr: peer},
+		err:    terminalErr,
+	}
+	listenerEventually(t, func() bool {
+		return conn.readCount.Load() == inboxSize+2
+	}, "listener did not consume the terminal read")
+	for index := 0; index < inboxSize; index++ {
+		got := listenerRead(t, server)
+		if len(got) != 1 || got[0] != byte(index) {
+			t.Fatalf("queued payload %d=%v", index, got)
+		}
+	}
+	if got := string(listenerRead(t, server)); got != "staged-final" {
+		t.Fatalf("staged terminal payload=%q", got)
+	}
+	if _, err := server.Read(make([]byte, MaxDatagram)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("read after staged payload=%v want net.ErrClosed", err)
+	}
+	if got := conn.readCount.Load(); got != inboxSize+2 {
+		t.Fatalf("ReadFrom calls=%d want %d", got, inboxSize+2)
+	}
+}
+
+func TestListenerRejectsPortableOversizeDatagramWithoutPrefixDelivery(t *testing.T) {
+	conn := newListenerScriptPacketConn()
+	flowID := listenerFlowID(7002)
+	conn.results <- listenerReadResult{packet: listenerTestPacket{
+		data: listenerDatagram(t, flowID, bytes.Repeat([]byte{0xa5}, MaxDatagram)),
+		addr: listenerTestAddr("oversize-peer"),
+	}}
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = l.Accept(ctx)
+	if !errors.Is(err, ErrListenerRead) || !errors.Is(err, ErrTruncatedPacket) {
+		t.Fatalf("Accept error=%v want listener/truncated error", err)
+	}
+	if got := listenerFlowCount(l); got != 0 {
+		t.Fatalf("oversize prefix created %d flows", got)
+	}
+}
+
+type listenerTruncatedMessageConn struct {
+	*listenerScriptPacketConn
+	datagram []byte
+	peer     *net.UDPAddr
+	once     sync.Once
+}
+
+func (c *listenerTruncatedMessageConn) ReadMsgUDP(payload, _ []byte) (int, int, int, *net.UDPAddr, error) {
+	used := false
+	c.once.Do(func() { used = true })
+	if used {
+		return copy(payload, c.datagram), 0, packetMSGTruncated, c.peer, nil
+	}
+	<-c.closed
+	return 0, 0, 0, nil, net.ErrClosed
+}
+
+func TestListenerRejectsMessageTruncationFlagWithoutPrefixDelivery(t *testing.T) {
+	flowID := listenerFlowID(7003)
+	conn := &listenerTruncatedMessageConn{
+		listenerScriptPacketConn: newListenerScriptPacketConn(),
+		datagram:                 listenerDatagram(t, flowID, bytes.Repeat([]byte{0x5a}, MaxDatagram)),
+		peer:                     &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 32001},
+	}
+	l, err := NewListenerFromPacketConn(conn, MaxDatagram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = l.Accept(ctx)
+	if !errors.Is(err, ErrListenerRead) || !errors.Is(err, ErrTruncatedPacket) {
+		t.Fatalf("Accept error=%v want listener/truncated error", err)
+	}
+	if got := listenerFlowCount(l); got != 0 {
+		t.Fatalf("MSG_TRUNC prefix created %d flows", got)
+	}
 }

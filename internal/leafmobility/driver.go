@@ -648,21 +648,30 @@ type driverAttemptKey struct {
 }
 
 type driverAttemptRecord struct {
+	id       uint64
 	deadline time.Time
 	attempt  DriverAttempt
 }
 
 var driverAttemptRegistry = struct {
 	sync.Mutex
+	nextID uint64
 	active map[driverAttemptKey]driverAttemptRecord
 }{active: make(map[driverAttemptKey]driverAttemptRecord)}
 
 var (
-	ErrInvalidPlanRequest = errors.New("leafmobility: invalid plan request")
-	ErrInvalidPlan        = errors.New("leafmobility: invalid plan")
-	ErrStalePlan          = errors.New("leafmobility: stale plan")
-	ErrPlanExpired        = errors.New("leafmobility: plan deadline expired")
-	ErrBaselinePlan       = errors.New("leafmobility: baseline plan has no specialized transaction")
+	ErrInvalidPlanRequest     = errors.New("leafmobility: invalid plan request")
+	ErrInvalidPlan            = errors.New("leafmobility: invalid plan")
+	ErrStalePlan              = errors.New("leafmobility: stale plan")
+	ErrPlanExpired            = errors.New("leafmobility: plan deadline expired")
+	ErrBaselinePlan           = errors.New("leafmobility: baseline plan has no specialized transaction")
+	ErrDriverPreflightBusy    = errors.New("leafmobility: driver preflight is already running")
+	ErrDriverPreflightPanic   = errors.New("leafmobility: driver preflight panicked")
+	ErrDriverPreflightGoexit  = errors.New("leafmobility: driver preflight called runtime.Goexit")
+	ErrDriverEvidenceBusy     = errors.New("leafmobility: driver evidence is already running")
+	ErrDriverEvidencePanic    = errors.New("leafmobility: driver evidence panicked")
+	ErrDriverEvidenceGoexit   = errors.New("leafmobility: driver evidence called runtime.Goexit")
+	ErrDriverCallbackCapacity = errors.New("leafmobility: driver callback capacity is exhausted")
 )
 
 const MaxPlanHorizon = 90 * time.Second
@@ -804,12 +813,138 @@ func registerDriverAttempt(attempt DriverAttempt, deadline time.Time) (time.Time
 		driverAttemptRegistry.Unlock()
 		return time.Time{}, false
 	}
-	driverAttemptRegistry.active[key] = driverAttemptRecord{deadline: monotonicDeadline, attempt: attempt}
+	driverAttemptRegistry.nextID++
+	if driverAttemptRegistry.nextID == 0 {
+		driverAttemptRegistry.nextID++
+	}
+	recordID := driverAttemptRegistry.nextID
+	driverAttemptRegistry.active[key] = driverAttemptRecord{
+		id: recordID, deadline: monotonicDeadline, attempt: attempt,
+	}
 	driverAttemptRegistry.Unlock()
+	scheduleDriverAttemptExpiry(key, recordID, monotonicDeadline)
 	return monotonicDeadline, true
 }
 
+func scheduleDriverAttemptExpiry(key driverAttemptKey, recordID uint64, deadline time.Time) {
+	delay := time.Until(deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	time.AfterFunc(delay, func() {
+		expireDriverAttemptRecord(key, recordID, deadline)
+	})
+}
+
+func expireDriverAttemptRecord(key driverAttemptKey, recordID uint64, deadline time.Time) {
+	now := time.Now()
+	if deadline.After(now) {
+		scheduleDriverAttemptExpiry(key, recordID, deadline)
+		return
+	}
+	driverAttemptRegistry.Lock()
+	record, exists := driverAttemptRegistry.active[key]
+	if exists && record.id == recordID && !record.deadline.After(now) {
+		delete(driverAttemptRegistry.active, key)
+	}
+	driverAttemptRegistry.Unlock()
+}
+
 func invokeDriverPreflight(
+	ctx context.Context,
+	driver Driver,
+	request PlanRequest,
+	facts Facts,
+) (preflight PreflightRequest, attempt DriverAttempt, result PreflightResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return PreflightRequest{}, nil, PreflightResult{}, err
+	}
+	key, ok := driverPreflightIdentity(driver)
+	if !ok {
+		return PreflightRequest{}, nil, PreflightResult{}, ErrInvalidDriver
+	}
+	call := &driverPreflightCall{done: make(chan struct{})}
+	driverPreflightRegistry.Lock()
+	if active := driverPreflightRegistry.active[key]; active != nil {
+		select {
+		case <-active.done:
+			delete(driverPreflightRegistry.active, key)
+		default:
+			driverPreflightRegistry.Unlock()
+			return PreflightRequest{}, nil, PreflightResult{}, ErrDriverPreflightBusy
+		}
+	}
+	if !acquireDriverCallbackPermit() {
+		driverPreflightRegistry.Unlock()
+		return PreflightRequest{}, nil, PreflightResult{}, ErrDriverCallbackCapacity
+	}
+	driverPreflightRegistry.active[key] = call
+	driverPreflightRegistry.Unlock()
+
+	go func() {
+		defer releaseDriverCallbackPermit()
+		returned := false
+		defer func() {
+			if !returned {
+				call.outcome = driverPreflightOutcome{err: errors.Join(ErrInvalidDriver, ErrDriverPreflightGoexit)}
+			}
+			close(call.done)
+			driverPreflightRegistry.Lock()
+			if driverPreflightRegistry.active[key] == call {
+				delete(driverPreflightRegistry.active, key)
+			}
+			driverPreflightRegistry.Unlock()
+		}()
+		call.outcome.preflight, call.outcome.attempt, call.outcome.result, call.outcome.err =
+			invokeDriverPreflightLocked(ctx, driver, request, facts)
+		returned = true
+	}()
+
+	select {
+	case <-call.done:
+		if err := ctx.Err(); err != nil {
+			return PreflightRequest{}, nil, PreflightResult{}, err
+		}
+		return call.outcome.preflight, call.outcome.attempt, call.outcome.result, call.outcome.err
+	case <-ctx.Done():
+		return PreflightRequest{}, nil, PreflightResult{}, ctx.Err()
+	}
+}
+
+type driverPreflightKey struct {
+	typeOf reflect.Type
+	ptr    uintptr
+}
+
+type driverPreflightOutcome struct {
+	preflight PreflightRequest
+	attempt   DriverAttempt
+	result    PreflightResult
+	err       error
+}
+
+type driverPreflightCall struct {
+	done    chan struct{}
+	outcome driverPreflightOutcome
+}
+
+var driverPreflightRegistry = struct {
+	sync.Mutex
+	active map[driverPreflightKey]*driverPreflightCall
+}{active: make(map[driverPreflightKey]*driverPreflightCall)}
+
+func driverPreflightIdentity(driver Driver) (driverPreflightKey, bool) {
+	ptr, ok := interfaceIdentity(driver)
+	if !ok {
+		return driverPreflightKey{}, false
+	}
+	return driverPreflightKey{typeOf: reflect.TypeOf(driver), ptr: ptr}, true
+}
+
+func invokeDriverPreflightLocked(
 	ctx context.Context,
 	driver Driver,
 	request PlanRequest,
@@ -822,7 +957,7 @@ func invokeDriverPreflight(
 			preflight = PreflightRequest{}
 			attempt = nil
 			result = PreflightResult{}
-			err = fmt.Errorf("%w: preflight panicked: %v", ErrInvalidDriver, recovered)
+			err = errors.Join(ErrInvalidDriver, ErrDriverPreflightPanic)
 		}
 	}()
 	contextDigest, err := currentExecutionContextDigest()

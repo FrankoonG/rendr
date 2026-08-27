@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"time"
 
@@ -42,15 +43,41 @@ type selectorDecision struct {
 	cause         string
 	origin        policySelectionOrigin
 	topologyEpoch uint64
+	selectorState selectorStateExpectation
 	evidence      selectorEvidenceCommit
 }
 
+type selectorStateExpectation struct {
+	bound      bool
+	selectorID proto.TargetID
+	desired    proto.TargetID
+	effective  proto.TargetID
+	generation uint64
+}
+
+func selectorStateExpectationFor(
+	selectorID proto.TargetID,
+	state *selectorExecutionState,
+) selectorStateExpectation {
+	if state == nil {
+		return selectorStateExpectation{}
+	}
+	return selectorStateExpectation{
+		bound: true, selectorID: selectorID, desired: state.desired,
+		effective: state.effective, generation: state.generation,
+	}
+}
+
 type selectorEvidenceView struct {
-	observations  map[proto.TargetID]pathEvidenceObservation
-	topologyEpoch uint64
-	capturedAt    time.Time
-	validUntil    time.Time
-	generations   []selectorPathGenerationBinding
+	observations   map[proto.TargetID]pathEvidenceObservation
+	attached       map[proto.TargetID]bool
+	selectorState  selectorStateExpectation
+	topologyEpoch  uint64
+	healthEpoch    uint64
+	migrationEpoch uint64
+	capturedAt     time.Time
+	validUntil     time.Time
+	generations    []selectorPathGenerationBinding
 }
 
 type selectorPathGenerationBinding struct {
@@ -59,13 +86,18 @@ type selectorPathGenerationBinding struct {
 	owner           uint64
 	slotGeneration  uint64
 	probeGeneration pathProbeGeneration
+	healthRevision  uint64
+	txFenceEpoch    uint64
 }
 
 type selectorEvidenceCommit struct {
-	topologyEpoch uint64
-	capturedAt    time.Time
-	validUntil    time.Time
-	generations   []selectorPathGenerationBinding
+	topologyEpoch  uint64
+	healthEpoch    uint64
+	migrationEpoch uint64
+	capturedAt     time.Time
+	validUntil     time.Time
+	generations    []selectorPathGenerationBinding
+	selectorState  selectorStateExpectation
 }
 
 type selectorPathEvidenceSample struct {
@@ -77,6 +109,8 @@ type selectorPathEvidenceSample struct {
 	probeEvidence    pathProbeEvidence
 	hasProbeEvidence bool
 	probeStatus      pathProbeStatus
+	healthRevision   uint64
+	txFenceEpoch     uint64
 	dataProgress     uint64
 	unexpectedDup    uint64
 }
@@ -90,8 +124,32 @@ func (e *Engine) selectorEvidenceObservations() map[proto.TargetID]pathEvidenceO
 }
 
 func (e *Engine) selectorEvidenceSnapshot() (selectorEvidenceView, bool) {
+	return e.selectorEvidenceSnapshotForTargets(nil)
+}
+
+func (e *Engine) selectorEvidenceSnapshotForSelector(
+	runtime *executionRuntime,
+	selectorID proto.TargetID,
+) (selectorEvidenceView, bool) {
+	if runtime == nil || runtime.plan == nil {
+		return selectorEvidenceView{}, false
+	}
+	entry, ok := runtime.plan.nodes[selectorID]
+	if !ok || entry.node.kind != proto.GraphNodeKindSelector {
+		return selectorEvidenceView{}, false
+	}
+	targets := make(map[proto.TargetID]bool, len(entry.leafIDs))
+	for _, targetID := range entry.leafIDs {
+		targets[targetID] = true
+	}
+	return e.selectorEvidenceSnapshotForTargets(targets)
+}
+
+func (e *Engine) selectorEvidenceSnapshotForTargets(
+	targets map[proto.TargetID]bool,
+) (selectorEvidenceView, bool) {
 	for attempt := 0; attempt < 3; attempt++ {
-		view, ok := e.selectorEvidenceSnapshotOnce()
+		view, ok := e.selectorEvidenceSnapshotOnce(targets)
 		if ok {
 			return view, true
 		}
@@ -99,16 +157,51 @@ func (e *Engine) selectorEvidenceSnapshot() (selectorEvidenceView, bool) {
 	return selectorEvidenceView{}, false
 }
 
-func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
-	topologyEpoch := e.currentPathTopologyEpoch()
+// pathDeathAlignmentDecisions binds the selector policy-plane repair to the
+// physical topology that already projected each dead desired child onto its
+// immediate fallback. Health evidence is deliberately absent: it may choose a
+// future quality move, but it cannot invalidate the factual death projection.
+func (e *Engine) pathDeathAlignmentDecisions(runtime *executionRuntime) ([]selectorDecision, time.Time) {
+	if runtime == nil || runtime.plan == nil {
+		return nil, time.Time{}
+	}
 	e.pathsMu.RLock()
-	if e.currentPathTopologyEpoch() != topologyEpoch {
+	topologyEpoch := e.currentPathTopologyEpoch()
+	attached := e.attachedLeafTargetsLocked()
+	decisions := runtime.pathDeathAlignmentDecisions(attached)
+	e.pathsMu.RUnlock()
+	now := nowFn()
+	for i := range decisions {
+		decisions[i].topologyEpoch = topologyEpoch
+		decisions[i].evidence = selectorEvidenceCommit{
+			topologyEpoch: topologyEpoch,
+			selectorState: decisions[i].selectorState,
+		}
+	}
+	return decisions, now
+}
+
+func (e *Engine) selectorEvidenceSnapshotOnce(
+	targets map[proto.TargetID]bool,
+) (selectorEvidenceView, bool) {
+	topologyEpoch := e.currentPathTopologyEpoch()
+	migrationEpoch := e.migrationEpoch.Load()
+	e.pathsMu.RLock()
+	if e.currentPathTopologyEpoch() != topologyEpoch || e.migrationEpoch.Load() != migrationEpoch {
 		e.pathsMu.RUnlock()
 		return selectorEvidenceView{}, false
 	}
 	latest := make(map[proto.TargetID]selectorPathEvidenceSample, len(e.paths))
+	attached := make(map[proto.TargetID]bool, len(e.paths))
 	for _, slot := range e.paths {
 		if slot.localTXTargetID == (proto.TargetID{}) {
+			continue
+		}
+		attached[slot.localTXTargetID] = true
+		if targets != nil && !targets[slot.localTXTargetID] {
+			continue
+		}
+		if slot.cutoverDispatchStalled() {
 			continue
 		}
 		previous, exists := latest[slot.localTXTargetID]
@@ -120,6 +213,7 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 			targetID:        slot.localTXTargetID,
 			slotGeneration:  slot.gen,
 			probeGeneration: pathProbeGenerationForSlot(slot),
+			txFenceEpoch:    slot.txFenceEpoch.Load(),
 			dataProgress:    slot.dataDispatches.Load(),
 			unexpectedDup:   slot.recvDups.Load(),
 		}
@@ -146,9 +240,11 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 	}
 	e.probeMu.Lock()
 	e.expirePathProbesLocked(capturedAt)
+	healthEpoch := e.healthEvidenceEpoch.Load()
 	probeStable := true
 	for i := range samples {
-		if pathProbeGenerationForSlot(samples[i].slot) != samples[i].probeGeneration {
+		if pathProbeGenerationForSlot(samples[i].slot) != samples[i].probeGeneration ||
+			samples[i].slot.txFenceEpoch.Load() != samples[i].txFenceEpoch {
 			probeStable = false
 			break
 		}
@@ -162,7 +258,21 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 			candidate := pathProbeStatus{lifecycle: observation.lifecycle}
 			switch observation.lifecycle {
 			case pathProbeDataStarved:
+				revision, stall, stalled := observation.slot.healthEvidenceSnapshot()
+				if !stalled || stall.pathGeneration != observation.generation ||
+					stall.generation != observation.dataStallGeneration {
+					continue
+				}
 				candidate.failure = pathProbeFailureDataStarved
+				for i := range samples {
+					if samples[i].slot == observation.slot {
+						if samples[i].healthRevision != 0 && samples[i].healthRevision != revision {
+							probeStable = false
+						}
+						samples[i].healthRevision = revision
+						break
+					}
+				}
 			case pathProbeWriteStalled:
 				candidate.failure = pathProbeFailureWriteStalled
 			}
@@ -175,13 +285,24 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 			}
 		}
 		for i := range samples {
+			revision, _, _ := samples[i].slot.healthEvidenceSnapshot()
+			if samples[i].healthRevision != 0 && samples[i].healthRevision != revision {
+				probeStable = false
+				break
+			}
+			samples[i].healthRevision = revision
 			evidence := samples[i].slot.probeEvidence.Load()
-			if evidence == nil || evidence.generation != samples[i].probeGeneration {
+			if evidence == nil || !samples[i].slot.probeEvidenceCurrent(evidence) ||
+				evidence.generation != samples[i].probeGeneration ||
+				evidence.fenceEpoch != samples[i].txFenceEpoch {
 				continue
 			}
 			samples[i].probeEvidence = *evidence
 			samples[i].hasProbeEvidence = true
 		}
+	}
+	if e.migrationEpoch.Load() != migrationEpoch {
+		probeStable = false
 	}
 	e.probeMu.Unlock()
 	if !probeStable {
@@ -197,12 +318,20 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 	// A mutation may update a generation before it publishes the new epoch, so
 	// an atomic epoch check alone is not a sufficient read barrier.
 	e.pathsMu.RLock()
-	stable := e.currentPathTopologyEpoch() == topologyEpoch
+	stable := e.currentPathTopologyEpoch() == topologyEpoch &&
+		e.migrationEpoch.Load() == migrationEpoch
 	if stable {
 		for i := range samples {
 			current := e.paths[samples[i].slot.id]
+			if current == nil {
+				stable = false
+				break
+			}
+			revision, _, _ := current.healthEvidenceSnapshot()
 			if current != samples[i].slot || current.gen != samples[i].slotGeneration ||
-				pathProbeGenerationForSlot(current) != samples[i].probeGeneration {
+				pathProbeGenerationForSlot(current) != samples[i].probeGeneration ||
+				current.txFenceEpoch.Load() != samples[i].txFenceEpoch ||
+				revision != samples[i].healthRevision {
 				stable = false
 				break
 			}
@@ -218,7 +347,13 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 	generationBindings := make([]selectorPathGenerationBinding, 0, len(samples))
 	for i := range samples {
 		sample := &samples[i]
-		quality := selectorEvidenceQuality(sample.quality, sample.probeEvidence, sample.hasProbeEvidence)
+		probeQuality := transport.PathQuality{}
+		if sample.hasProbeEvidence && !sample.probeEvidence.lastSuccess.IsZero() {
+			probeQuality = sample.probeEvidence.quality
+		}
+		quality := mergeSchedulingQuality(
+			sample.quality, probeQuality, capturedAt, e.limits.ProbeInterval,
+		)
 		loss, lossAt, lossKnown := selectorLossEvidence(
 			sample.quality, sample.probeEvidence, sample.hasProbeEvidence, capturedAt,
 		)
@@ -252,6 +387,7 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 		generationBindings = append(generationBindings, selectorPathGenerationBinding{
 			targetID: sample.targetID, pathID: sample.slot.id, owner: sample.slot.owner,
 			slotGeneration: sample.slotGeneration, probeGeneration: sample.probeGeneration,
+			healthRevision: sample.healthRevision, txFenceEpoch: sample.txFenceEpoch,
 		})
 		if quality.RTT > 0 && !quality.At.IsZero() && !quality.At.After(capturedAt) {
 			expires := quality.At.Add(selectorProbeFreshFor(e.limits.ProbeInterval, quality))
@@ -286,18 +422,65 @@ func (e *Engine) selectorEvidenceSnapshotOnce() (selectorEvidenceView, bool) {
 		return selectorEvidenceView{}, false
 	}
 	return selectorEvidenceView{
-		observations: observations, topologyEpoch: topologyEpoch, capturedAt: capturedAt,
+		observations: observations, attached: attached,
+		topologyEpoch: topologyEpoch, healthEpoch: healthEpoch,
+		migrationEpoch: migrationEpoch, capturedAt: capturedAt,
 		validUntil: validUntil, generations: generationBindings,
 	}, true
 }
 
 func (v selectorEvidenceView) commitEvidence() selectorEvidenceCommit {
 	return selectorEvidenceCommit{
-		topologyEpoch: v.topologyEpoch,
-		capturedAt:    v.capturedAt,
-		validUntil:    v.validUntil,
-		generations:   append([]selectorPathGenerationBinding(nil), v.generations...),
+		topologyEpoch:  v.topologyEpoch,
+		healthEpoch:    v.healthEpoch,
+		migrationEpoch: v.migrationEpoch,
+		capturedAt:     v.capturedAt,
+		validUntil:     v.validUntil,
+		generations:    append([]selectorPathGenerationBinding(nil), v.generations...),
 	}
+}
+
+func (v selectorEvidenceView) commitEvidenceForSelector(
+	plan *executionPlan,
+	selectorID proto.TargetID,
+	state selectorStateExpectation,
+) selectorEvidenceCommit {
+	commit := v.commitEvidence()
+	commit.selectorState = state
+	if plan == nil {
+		commit.generations = nil
+		return commit
+	}
+	entry, ok := plan.nodes[selectorID]
+	if !ok || entry.node.kind != proto.GraphNodeKindSelector {
+		commit.generations = nil
+		return commit
+	}
+	dependencies := make(map[proto.TargetID]bool, len(entry.leafIDs))
+	for _, targetID := range entry.leafIDs {
+		dependencies[targetID] = true
+	}
+	filtered := make([]selectorPathGenerationBinding, 0, len(commit.generations))
+	for _, binding := range commit.generations {
+		if dependencies[binding.targetID] {
+			filtered = append(filtered, binding)
+		}
+	}
+	commit.generations = filtered
+	return commit
+}
+
+func (e *Engine) selectorEvidenceCommitFor(
+	view selectorEvidenceView,
+	selectorID proto.TargetID,
+) selectorEvidenceCommit {
+	runtime := e.localExecutionRuntime()
+	if runtime == nil {
+		commit := view.commitEvidence()
+		commit.generations = nil
+		return commit
+	}
+	return view.commitEvidenceForSelector(runtime.plan, selectorID, view.selectorState)
 }
 
 func (c selectorEvidenceCommit) bound() bool {
@@ -310,6 +493,7 @@ func (c selectorEvidenceCommit) physicallyBound() bool {
 
 func (c selectorEvidenceCommit) physicalEqual(other selectorEvidenceCommit) bool {
 	if !c.bound() || !other.bound() || c.topologyEpoch != other.topologyEpoch ||
+		c.migrationEpoch != other.migrationEpoch || c.selectorState != other.selectorState ||
 		len(c.generations) != len(other.generations) {
 		return false
 	}
@@ -322,26 +506,140 @@ func (c selectorEvidenceCommit) physicalEqual(other selectorEvidenceCommit) bool
 }
 
 func (e *Engine) validateSelectorEvidenceCommitLocked(commit selectorEvidenceCommit) error {
+	return e.validateSelectorEvidenceCommitAtLocked(commit, nowFn())
+}
+
+func (e *Engine) validateSelectorEvidenceCommitAtLocked(commit selectorEvidenceCommit, now time.Time) error {
 	if !commit.bound() {
 		return nil
 	}
 	if e.currentPathTopologyEpoch() != commit.topologyEpoch {
 		return errStaleSelectorEvidence
 	}
-	now := nowFn()
 	if !commit.capturedAt.IsZero() &&
 		(now.Before(commit.capturedAt) || commit.validUntil.IsZero() || !now.Before(commit.validUntil)) {
 		return fmt.Errorf("%w: evidence freshness expired", ErrSelectorDecisionUnavailable)
 	}
+	if len(commit.generations) != 0 && e.migrationEpoch.Load() != commit.migrationEpoch {
+		return errStaleSelectorEvidence
+	}
 	for _, expected := range commit.generations {
 		current := e.paths[expected.pathID]
-		if current == nil || current.owner != expected.owner || current.gen != expected.slotGeneration ||
+		if current == nil {
+			return errStaleSelectorEvidence
+		}
+		revision, _, _ := current.healthEvidenceSnapshot()
+		if current.owner != expected.owner || current.gen != expected.slotGeneration ||
 			current.localTXTargetID != expected.targetID ||
-			pathProbeGenerationForSlot(current) != expected.probeGeneration {
+			pathProbeGenerationForSlot(current) != expected.probeGeneration ||
+			current.txFenceEpoch.Load() != expected.txFenceEpoch ||
+			revision != expected.healthRevision {
 			return errStaleSelectorEvidence
 		}
 	}
+	if len(commit.generations) != 0 && e.migrationEpoch.Load() != commit.migrationEpoch {
+		return errStaleSelectorEvidence
+	}
 	return nil
+}
+
+func (e *Engine) beginValidatedQualityDecisionCutover(
+	runtime *executionRuntime,
+	selectorID, targetID proto.TargetID,
+	commit selectorEvidenceCommit,
+) (uint64, error) {
+	if runtime == nil || !commit.selectorState.bound {
+		return 0, errStaleSelectorEvidence
+	}
+	for {
+		generation, wake, reserved, err := e.tryBeginValidatedQualityDecisionCutover(
+			runtime, selectorID, targetID, commit,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if reserved {
+			return generation, nil
+		}
+		if !e.waitForSelectorCutoverReservation(generation, wake) {
+			return 0, net.ErrClosed
+		}
+		// The previous cutover may have changed topology, migration, selector
+		// state, or relevant path revisions. Retry only from a full validation.
+	}
+}
+
+func (e *Engine) tryBeginValidatedQualityDecisionCutover(
+	runtime *executionRuntime,
+	selectorID, targetID proto.TargetID,
+	commit selectorEvidenceCommit,
+) (generation uint64, wake <-chan struct{}, reserved bool, err error) {
+	// Canonical quality publication order matches commitRecursiveSelection:
+	// pathsMu -> healthEvidenceCommitMu -> executionRuntime.mu. The final
+	// selectorCutoverMu acquisition is strictly nonblocking. No caller may wait
+	// for an existing cutover while retaining any lock in this chain.
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	e.healthEvidenceCommitMu.Lock()
+	defer e.healthEvidenceCommitMu.Unlock()
+	attached := e.attachedLeafTargetsLocked()
+	available := runtime.targetAvailability(attached)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if err := runtime.validateQualityDecisionCurrentLocked(
+		selectorID, targetID, commit.selectorState, available,
+	); err != nil {
+		return 0, nil, false, err
+	}
+	if err := e.validateSelectorEvidenceCommitLocked(commit); err != nil {
+		return 0, nil, false, err
+	}
+	generation, wake, reserved = e.tryBeginSelectorCutover()
+	return generation, wake, reserved, nil
+}
+
+func (r *executionRuntime) validateQualityDecisionCurrentLocked(
+	selectorID, targetID proto.TargetID,
+	expected selectorStateExpectation,
+	available func(proto.TargetID) bool,
+) error {
+	if r == nil || r.plan == nil || !expected.bound || expected.selectorID != selectorID {
+		return errStaleSelectorEvidence
+	}
+	state := r.selectors[selectorID]
+	if state == nil || state.desired != expected.desired || state.effective != expected.effective ||
+		state.generation != expected.generation || !available(targetID) ||
+		!r.selectorIsEffectiveLocked(selectorID, available) {
+		return errStaleSelectorEvidence
+	}
+	return nil
+}
+
+func (r *executionRuntime) clearInactiveQualityCandidates(attached map[proto.TargetID]bool) {
+	if r == nil || r.plan == nil {
+		return
+	}
+	available := r.targetAvailability(attached)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	selectors := make([]proto.TargetID, 0)
+	r.collectSelectorIDsLocked(r.plan.rootID, &selectors)
+	for _, selectorID := range selectors {
+		state := r.selectors[selectorID]
+		if state != nil && !r.selectorIsEffectiveLocked(selectorID, available) {
+			state.clearQualityCandidate()
+		}
+	}
+}
+
+func (e *Engine) clearInactiveSelectorQualityCandidates(runtime *executionRuntime) {
+	if runtime == nil {
+		return
+	}
+	e.pathsMu.RLock()
+	attached := e.attachedLeafTargetsLocked()
+	e.pathsMu.RUnlock()
+	runtime.clearInactiveQualityCandidates(attached)
 }
 
 func selectorEvidenceQuality(
@@ -377,7 +675,8 @@ func selectorLossEvidence(
 	if !hasProbe || probe.generation == (pathProbeGeneration{}) {
 		return loss, sampledAt, known
 	}
-	total := saturatingAddUint64(probe.succeeded, probe.timedOut)
+	_, succeeded, timedOut := probe.currentTokenCounters()
+	total := saturatingAddUint64(succeeded, timedOut)
 	probeAt := probe.lastTransition
 	if probeAt.IsZero() || probe.lastSuccess.After(probeAt) {
 		probeAt = probe.lastSuccess
@@ -389,8 +688,8 @@ func selectorLossEvidence(
 		return loss, sampledAt, known
 	}
 	probeLoss := uint64(1000)
-	if probe.timedOut <= ^uint64(0)/1000 {
-		probeLoss = probe.timedOut * 1000 / total
+	if timedOut <= ^uint64(0)/1000 {
+		probeLoss = timedOut * 1000 / total
 	}
 	if probeLoss > 1000 {
 		probeLoss = 1000
@@ -407,11 +706,12 @@ func selectorProbeLiveness(
 	now time.Time,
 	interval time.Duration,
 ) qualityState {
-	if !hasEvidence || evidence.issued == 0 || evidence.firstIssued.IsZero() {
+	issued, succeeded, _ := evidence.currentTokenCounters()
+	if !hasEvidence || issued == 0 || evidence.firstIssued.IsZero() {
 		return qualityStateUnknown
 	}
 	base := evidence.firstIssued
-	if evidence.succeeded > 0 && !evidence.lastSuccess.IsZero() {
+	if succeeded > 0 && !evidence.lastSuccess.IsZero() {
 		base = evidence.lastSuccess
 	}
 	if now.Before(base) {
@@ -421,7 +721,7 @@ func selectorProbeLiveness(
 		now.Sub(base) > selectorProbeFreshFor(interval, evidence.quality) {
 		return qualityStateStale
 	}
-	if evidence.succeeded > 0 && now.Sub(base) <= selectorProbeFreshFor(interval, evidence.quality) {
+	if succeeded > 0 && now.Sub(base) <= selectorProbeFreshFor(interval, evidence.quality) {
 		return qualityStateFresh
 	}
 	return qualityStateUnknown
@@ -435,9 +735,48 @@ func (r *executionRuntime) selectorDecisions(
 	dwell time.Duration,
 	cooldown time.Duration,
 ) []selectorDecision {
+	return r.selectorDecisionsScoped(
+		direction, observations, nil, proto.TargetID{}, now, policy, dwell, cooldown,
+	)
+}
+
+func (r *executionRuntime) selectorDecisionFor(
+	selectorID proto.TargetID,
+	direction proto.SenderDirection,
+	observations map[proto.TargetID]pathEvidenceObservation,
+	attached map[proto.TargetID]bool,
+	now time.Time,
+	policy selectorEvidencePolicy,
+	dwell time.Duration,
+	cooldown time.Duration,
+) []selectorDecision {
+	return r.selectorDecisionsScoped(
+		direction, observations, attached, selectorID, now, policy, dwell, cooldown,
+	)
+}
+
+func (r *executionRuntime) selectorDecisionsScoped(
+	direction proto.SenderDirection,
+	observations map[proto.TargetID]pathEvidenceObservation,
+	attached map[proto.TargetID]bool,
+	onlySelector proto.TargetID,
+	now time.Time,
+	policy selectorEvidencePolicy,
+	dwell time.Duration,
+	cooldown time.Duration,
+) []selectorDecision {
 	if r == nil || r.plan == nil {
 		return nil
 	}
+	if attached == nil {
+		attached = make(map[proto.TargetID]bool, len(observations))
+		for targetID, observation := range observations {
+			if observation.live {
+				attached[targetID] = true
+			}
+		}
+	}
+	projectionAvailable := r.targetAvailability(attached)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -446,6 +785,9 @@ func (r *executionRuntime) selectorDecisions(
 	r.collectSelectorIDsLocked(r.plan.rootID, &selectors)
 	decisions := make([]selectorDecision, 0, len(selectors))
 	for _, selectorID := range selectors {
+		if onlySelector != (proto.TargetID{}) && selectorID != onlySelector {
+			continue
+		}
 		node, ok := r.plan.node(selectorID)
 		if !ok {
 			continue
@@ -463,6 +805,12 @@ func (r *executionRuntime) selectorDecisions(
 		if state.qualityTopologyEpoch != 0 &&
 			decisionTopologyEpoch != 0 && state.qualityTopologyEpoch != decisionTopologyEpoch {
 			state.clearQualityCandidate()
+		}
+		if !r.selectorIsEffectiveLocked(selectorID, projectionAvailable) {
+			// Candidate time cannot accrue while the selector's aggregate is not
+			// part of the root projection. Activation starts a fresh dwell window.
+			state.clearQualityCandidate()
+			continue
 		}
 		// A hard path departure may already have projected DATA onto the
 		// manifest-order fallback while desired remains the policy-plane truth.
@@ -484,9 +832,10 @@ func (r *executionRuntime) selectorDecisions(
 		for _, childID := range node.children {
 			// A nested selector's committed child can die before its own death
 			// decision settles. The target still has a normal route while any
-			// descendant is live; aggregate evidence intentionally describes only
-			// the committed child and must not authorize a transient class change.
-			if !peaks[childID] && r.targetLiveLocked(childID, observations) {
+			// descendant remains attached; aggregate evidence intentionally
+			// describes only the committed child and must not authorize a transient
+			// class change when a bounded observation is temporarily unavailable.
+			if !peaks[childID] && projectionAvailable(childID) {
 				hasLiveNormal = true
 			}
 		}
@@ -611,6 +960,57 @@ func (r *executionRuntime) selectorDecisions(
 			origin:     policySelectionQuality,
 		})
 	}
+	for i := range decisions {
+		decisions[i].selectorState = selectorStateExpectationFor(
+			decisions[i].selectorID, r.selectors[decisions[i].selectorID],
+		)
+	}
+	return decisions
+}
+
+func (r *executionRuntime) pathDeathAlignmentDecisions(
+	attached map[proto.TargetID]bool,
+) []selectorDecision {
+	if r == nil || r.plan == nil {
+		return nil
+	}
+	var available func(proto.TargetID) bool
+	available = func(id proto.TargetID) bool {
+		node, ok := r.plan.nodeView(id)
+		if !ok {
+			return false
+		}
+		if node.kind == proto.GraphNodeKindPath {
+			return attached[id]
+		}
+		for _, childID := range node.children {
+			if available(childID) {
+				return true
+			}
+		}
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	selectors := make([]proto.TargetID, 0)
+	r.collectSelectorIDsLocked(r.plan.rootID, &selectors)
+	decisions := make([]selectorDecision, 0, len(selectors))
+	for _, selectorID := range selectors {
+		state := r.selectors[selectorID]
+		if state == nil || state.desired == (proto.TargetID{}) ||
+			state.effective == (proto.TargetID{}) || state.desired == state.effective ||
+			available(state.desired) || !available(state.effective) {
+			continue
+		}
+		decisions = append(decisions, selectorDecision{
+			selectorID:    selectorID,
+			targetID:      state.effective,
+			cause:         "death",
+			origin:        policySelectionPathDeath,
+			selectorState: selectorStateExpectationFor(selectorID, state),
+		})
+	}
 	return decisions
 }
 
@@ -668,14 +1068,30 @@ func (r *executionRuntime) rankSelectorClassTargetsWithAdmission(
 	peakTransferAdmission bool,
 	excluded map[proto.TargetID]struct{},
 ) []proto.TargetID {
+	ranked, _ := r.rankSelectorClassTargetsWithAdmissionAtState(
+		selectorID, peak, direction, observations, now, policy, peakTransferAdmission, excluded,
+	)
+	return ranked
+}
+
+func (r *executionRuntime) rankSelectorClassTargetsWithAdmissionAtState(
+	selectorID proto.TargetID,
+	peak bool,
+	direction proto.SenderDirection,
+	observations map[proto.TargetID]pathEvidenceObservation,
+	now time.Time,
+	policy selectorEvidencePolicy,
+	peakTransferAdmission bool,
+	excluded map[proto.TargetID]struct{},
+) ([]proto.TargetID, selectorStateExpectation) {
 	if r == nil || r.plan == nil || !direction.Valid() {
-		return nil
+		return nil, selectorStateExpectation{}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	node, ok := r.plan.node(selectorID)
 	if !ok || node.kind != proto.GraphNodeKindSelector {
-		return nil
+		return nil, selectorStateExpectation{}
 	}
 	peaks := make(map[proto.TargetID]bool, len(node.peakCandidates))
 	for _, id := range node.peakCandidates {
@@ -712,7 +1128,7 @@ func (r *executionRuntime) rankSelectorClassTargetsWithAdmission(
 	for i := range candidates {
 		ranked[i] = candidates[i].targetID
 	}
-	return ranked
+	return ranked, selectorStateExpectationFor(selectorID, r.selectors[selectorID])
 }
 
 func selectorClassEvidenceHealthy(evidence schedulingEvidence, minimumConfidence evidenceConfidence) bool {
@@ -795,6 +1211,17 @@ func (r *executionRuntime) collectSelectorIDsLocked(id proto.TargetID, out *[]pr
 	for _, childID := range node.children {
 		r.collectSelectorIDsLocked(childID, out)
 	}
+}
+
+func (r *executionRuntime) selectorIDs() []proto.TargetID {
+	if r == nil || r.plan == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	selectors := make([]proto.TargetID, 0)
+	r.collectSelectorIDsLocked(r.plan.rootID, &selectors)
+	return selectors
 }
 
 func (r *executionRuntime) effectiveSelectorChildLocked(node executionPlanNode, observations map[proto.TargetID]pathEvidenceObservation) proto.TargetID {
@@ -950,7 +1377,9 @@ func (r *executionRuntime) aggregateTargetEvidenceLocked(
 	if !valid {
 		evidence = schedulingEvidence{direction: direction}
 	}
-	if observation := observations[id]; (node.kind == proto.GraphNodeKindBond || node.kind == proto.GraphNodeKindRace) && observation.goodput.observed() {
+	observation := observations[id]
+	if (node.kind == proto.GraphNodeKindBond || node.kind == proto.GraphNodeKindRace) &&
+		observation.goodput.observed() {
 		evidence.speed.uniqueGoodput = observation.goodput
 	}
 	memo[id] = evidence
@@ -988,9 +1417,10 @@ func evidenceFromPathObservation(direction proto.SenderDirection, observation pa
 			sampleCount: 1,
 		}
 		evidence.stability = stabilityEvidence{
-			state:    state,
-			progress: 1,
-			loss:     uint64(observation.loss),
+			state:         state,
+			progress:      observation.dataProgress,
+			progressKnown: observation.dataProgress > 0,
+			loss:          uint64(observation.loss),
 			lossKnown: observation.lossKnown && !observation.lossAt.IsZero() &&
 				!observation.lossAt.After(now) && now.Sub(observation.lossAt) <= selectorEvidenceFreshFor,
 			sampleTime:  observation.lossAt,

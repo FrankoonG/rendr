@@ -31,16 +31,20 @@ import (
 )
 
 const (
-	t56CaseID                = "T5.6-gvisor-packet-carrier-unprivileged"
-	t56EvidenceMarker        = "RENDR_T5_EVIDENCE_JSON="
-	t56EvidenceSchema        = "tier5-capability-v1"
-	t56ControlEvidenceSchema = "tier5-control-v1"
-	t56RunIDEnv              = "RENDR_T56_RUN_ID"
-	t56PSKEnv                = "RENDR_T56_TEST_PSK"
-	t56WrongPSKEnv           = "RENDR_T56_WRONG_PSK"
-	t56ControlMobilityBudget = 2 * time.Second
-	t56ControlMargin         = 500 * time.Millisecond
-	t56ResourceIterations    = 8
+	t56CaseID                    = "T5.6-gvisor-packet-carrier-unprivileged"
+	t56EvidenceMarker            = "RENDR_T5_EVIDENCE_JSON="
+	t56EvidenceSchema            = "tier5-capability-v3"
+	t56ControlEvidenceSchema     = "tier5-control-v2"
+	t56RunIDEnv                  = "RENDR_T56_RUN_ID"
+	t56PSKEnv                    = "RENDR_T56_TEST_PSK"
+	t56WrongPSKEnv               = "RENDR_T56_WRONG_PSK"
+	t56ControlMobilityBudget     = 2 * time.Second
+	t56ControlTransactionBudget  = 5 * time.Second
+	t56ControlMargin             = 500 * time.Millisecond
+	t56TerminalObservationMargin = 2 * time.Second
+	t56ResourceIterations        = 8
+	t56ResourceStageBudget       = 100 * time.Millisecond
+	t56ResourceTransactionBudget = 5 * time.Second
 )
 
 var (
@@ -137,7 +141,7 @@ func TestGVisorT56NoBlackholeHasZeroAutomaticMigrations(t *testing.T) {
 }
 
 func TestGVisorT56TotalBlackholeCannotCommit(t *testing.T) {
-	fixture := newT56EngineFixture(t, t56ControlMobilityBudget)
+	fixture := newT56EngineFixture(t, t56ControlTransactionBudget)
 	closed := false
 	defer func() {
 		if !closed {
@@ -146,121 +150,105 @@ func TestGVisorT56TotalBlackholeCannotCommit(t *testing.T) {
 			}
 		}
 	}()
-
+	clientPath := fixture.clientPath
 	payload := bytes.Repeat([]byte{0x74}, 16<<10)
 	t56EngineRoundTrip(t, fixture.client, fixture.server, payload)
+	t56EngineRoundTrip(t, fixture.server, fixture.client, payload)
+
+	outerBefore := observedOuterLocalTuple(t, clientPath.link)
+	claimBefore := clientPath.LeafMobilityClaim().Snapshot()
+	incarnationBefore := clientPath.link.LeafMobilityIncarnation()
+	activeBefore := fixture.client.ActivePath()
+	migrationsBefore := fixture.client.MigrationCount()
+	candidateOpen := t56BoundCandidateOpen(t, clientPath.link, t56ControlMobilityBudget)
 	fixture.relay.DropAllClientTuples(t)
-
-	type writerResult struct {
-		attempts uint64
-		writes   uint64
-		err      error
+	started := time.Now()
+	t56PublishLinkUnresponsive(t, clientPath)
+	status := t56WaitInitiatorPhase(t, fixture.client, fixture.clientRef,
+		t56ControlTransactionBudget+t56TerminalObservationMargin, engine.LeafMobilityInitiatorFailClosed)
+	totalElapsed := time.Since(started)
+	candidateElapsed, candidateErr, candidateCalls := candidateOpen.snapshot(t)
+	if candidateCalls != 1 || candidateErr != nil {
+		t.Fatalf("total-blackhole candidate open calls/error=%d/%v elapsed=%v, want one successful invocation",
+			candidateCalls, candidateErr, candidateElapsed)
 	}
-	stopWriter := make(chan struct{})
-	writerStarted := make(chan struct{})
-	writeDone := make(chan writerResult, 1)
-	go func() {
-		close(writerStarted)
-		var attempts, writes uint64
-		for {
-			select {
-			case <-stopWriter:
-				writeDone <- writerResult{attempts: attempts, writes: writes}
-				return
-			default:
-			}
-			attempts++
-			if _, err := fixture.client.SendData(payload); err != nil {
-				writeDone <- writerResult{attempts: attempts, writes: writes, err: err}
-				return
-			}
-			writes++
-		}
-	}()
-	<-writerStarted
-
-	observedFault := false
-	var firstStatus engine.LeafMobilityInitiatorSnapshot
-	var terminal engine.LeafMobilityInitiatorSnapshot
-	deadlineImmutable := true
-	observationStarted := time.Time{}
-	for {
-		fixture.clientPath.link.mu.Lock()
-		observedFault = observedFault || fixture.clientPath.link.wireFault
-		fixture.clientPath.link.mu.Unlock()
-		status, exists := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
-		if exists && status.EvidenceReason == leafmobility.RefreshReasonLinkUnresponsive &&
-			!status.ObservedAt.IsZero() && !status.Deadline.IsZero() {
-			if firstStatus.ObservedAt.IsZero() {
-				firstStatus = status
-				observationStarted = status.ObservedAt
-			} else if status.Deadline != firstStatus.Deadline {
-				deadlineImmutable = false
-			}
-			if t56TerminalNonCommitPhase(status.Phase) {
-				terminal = status
-			}
-		}
-		if exists && status.Phase == engine.LeafMobilityInitiatorCommitted {
-			t.Fatalf("total blackhole committed packet-link mobility: %+v", status)
-		}
-		if fixture.client.MigrationCount() != 0 || fixture.server.MigrationCount() != 0 {
-			t.Fatalf("total blackhole migration count client/server=%d/%d",
-				fixture.client.MigrationCount(), fixture.server.MigrationCount())
-		}
-		if !firstStatus.Deadline.IsZero() && time.Now().After(firstStatus.Deadline.Add(t56ControlMargin)) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	if candidateElapsed <= 0 || candidateElapsed > t56ControlMobilityBudget+t56ControlMargin {
+		t.Fatalf("total-blackhole candidate open elapsed=%v budget=%v", candidateElapsed, t56ControlMobilityBudget)
 	}
+	if status.TransactionID == (leafmobility.TransactionID{}) || status.Error == "" ||
+		!strings.Contains(status.Error, "driver execution failed: stage:") ||
+		!strings.Contains(status.Error, "driver execution failed: rollback:") ||
+		!t56StageFailureIsTimeout(status.Error) ||
+		!t56RollbackFailureIsTimeout(status.Error) {
+		t.Fatalf("total-blackhole engine transaction status=%+v", status)
+	}
+	transactionBudget := status.Deadline.Sub(status.ObservedAt)
+	if status.ObservedAt.IsZero() || status.Deadline.IsZero() || transactionBudget != t56ControlTransactionBudget ||
+		totalElapsed < t56ControlTransactionBudget || totalElapsed > t56ControlTransactionBudget+t56TerminalObservationMargin {
+		t.Fatalf("total-blackhole transaction observed/deadline/elapsed=%v/%v/%v budget=%v",
+			status.ObservedAt, status.Deadline, totalElapsed, t56ControlTransactionBudget)
+	}
+	wire := t56SummarizeFailClosedTransaction(t, fixture.controlTrace, status.TransactionID)
 	state := fixture.relay.snapshot()
-	if !observedFault || firstStatus.ObservedAt.IsZero() || terminal.ObservedAt.IsZero() ||
-		state.DroppedTotal == 0 || state.NewClientTuples == 0 {
-		t.Fatalf("total-blackhole stimulus fault=%t first=%+v terminal=%+v relay=%+v",
-			observedFault, firstStatus, terminal, state)
+	if state.DroppedTotal == 0 || state.NewClientTuples == 0 {
+		t.Fatalf("total-blackhole did not drop a replacement candidate: %+v", state)
 	}
-	budgetDelta := firstStatus.Deadline.Sub(firstStatus.ObservedAt)
-	if budgetDelta != t56ControlMobilityBudget || !deadlineImmutable ||
-		time.Since(observationStarted) < t56ControlMobilityBudget+t56ControlMargin {
-		t.Fatalf("total-blackhole budget observation delta=%v immutable=%t observed=%v",
-			budgetDelta, deadlineImmutable, time.Since(observationStarted))
+	fixture.relay.RestoreAllClientTuples(t)
+
+	claimAfter := clientPath.LeafMobilityClaim().Snapshot()
+	incarnationAfter := clientPath.link.LeafMobilityIncarnation()
+	outerAfter := observedOuterLocalTuple(t, clientPath.link)
+	if claimAfter.ResourceID != claimBefore.ResourceID || claimAfter.Generation != claimBefore.Generation ||
+		incarnationAfter != incarnationBefore || outerAfter != outerBefore ||
+		fixture.client.ActivePath() != activeBefore || fixture.client.MigrationCount() != migrationsBefore {
+		t.Fatalf("total-blackhole changed predecessor claim/incarnation/tuple before=%+v/%d/%s after=%+v/%d/%s",
+			claimBefore, incarnationBefore, outerBefore, claimAfter, incarnationAfter, outerAfter)
 	}
-	clientMigrations := fixture.client.MigrationCount()
-	serverMigrations := fixture.server.MigrationCount()
-	close(stopWriter)
+	t56EngineRoundTrip(t, fixture.client, fixture.server, payload)
+	t56EngineRoundTrip(t, fixture.server, fixture.client, payload)
 	if err := fixture.close(); err != nil {
 		t.Fatalf("cleanup total-blackhole T5.6 control: %v", err)
 	}
 	closed = true
-	var writer writerResult
-	select {
-	case writer = <-writeDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("total-blackhole writer did not join after engine cleanup")
+	links, addresses, pending := t56ListenerPacketState(fixture.listener)
+	cleanupComplete := t56Closed(fixture.client.Closed()) && t56Closed(fixture.server.Closed()) &&
+		t56Closed(fixture.listener.cleanupDone) && links == 0 && addresses == 0 && pending == 0
+	if !cleanupComplete {
+		t.Fatalf("total-blackhole cleanup incomplete engines/listener=%t/%t/%t state=%d/%d/%d",
+			t56Closed(fixture.client.Closed()), t56Closed(fixture.server.Closed()),
+			t56Closed(fixture.listener.cleanupDone), links, addresses, pending)
 	}
-	if writer.err != nil && !errors.Is(writer.err, net.ErrClosed) &&
-		!errors.Is(writer.err, io.ErrClosedPipe) && !errors.Is(writer.err, context.Canceled) &&
-		!errors.Is(writer.err, engine.ErrMigrationBudgetExceeded) {
-		t.Fatalf("total-blackhole writer error=%v", writer.err)
-	}
-	t56EmitEvidence(t, t56ControlEvidence(t, "total-blackhole-budget", map[string]string{
-		"budget_source":                   "injected_engine_limits",
-		"mobility_budget_ns":              strconv.FormatInt(t56ControlMobilityBudget.Nanoseconds(), 10),
-		"observation_margin_ns":           strconv.FormatInt(t56ControlMargin.Nanoseconds(), 10),
-		"observation_duration_ns":         strconv.FormatInt(time.Since(observationStarted).Nanoseconds(), 10),
-		"deadline_budget_delta_ns":        strconv.FormatInt(budgetDelta.Nanoseconds(), 10),
-		"deadline_immutable":              strconv.FormatBool(deadlineImmutable),
-		"fault_reason":                    "link_unresponsive",
-		"terminal_phase":                  t56InitiatorPhase(terminal.Phase),
-		"terminal_non_commit":             "true",
-		"writer_started":                  "true",
-		"writer_joined":                   "true",
-		"writer_attempts":                 strconv.FormatUint(writer.attempts, 10),
-		"writer_writes":                   strconv.FormatUint(writer.writes, 10),
+	t56EmitEvidence(t, t56ControlEvidence(t, "total-blackhole-stage", map[string]string{
+		"candidate_open_budget_ns":        strconv.FormatInt(t56ControlMobilityBudget.Nanoseconds(), 10),
+		"candidate_open_elapsed_ns":       strconv.FormatInt(candidateElapsed.Nanoseconds(), 10),
+		"candidate_open_succeeded":        "true",
+		"transaction_deadline_ns":         strconv.FormatInt(t56ControlTransactionBudget.Nanoseconds(), 10),
+		"transaction_elapsed_ns":          strconv.FormatInt(totalElapsed.Nanoseconds(), 10),
+		"transaction_id":                  hex.EncodeToString(status.TransactionID[:]),
+		"initiator_phase":                 t56InitiatorPhase(status.Phase),
+		"bilateral_prepare_frames":        strconv.FormatUint(wire.Prepare, 10),
+		"bilateral_prepared_frames":       strconv.FormatUint(wire.Prepared, 10),
+		"bilateral_commit_frames":         strconv.FormatUint(wire.Commit, 10),
+		"bilateral_complete_frames":       strconv.FormatUint(wire.Complete, 10),
+		"bilateral_rolled_back_frames":    strconv.FormatUint(wire.RolledBack, 10),
+		"bilateral_released_frames":       strconv.FormatUint(wire.Released, 10),
+		"stage_error_is_timeout":          "true",
+		"rollback_error_is_timeout":       "true",
+		"publication_evidence_available":  "false",
+		"fail_closed_without_publication": "true",
+		"rollback_acknowledged":           "false",
+		"predecessor_roundtrip_restored":  "true",
+		"engine_path_unchanged":           "true",
+		"cleanup_complete":                strconv.FormatBool(cleanupComplete),
+		"endpoint_generation_before":      strconv.FormatUint(claimBefore.Generation, 10),
+		"endpoint_generation_after":       strconv.FormatUint(claimAfter.Generation, 10),
+		"endpoint_incarnation_before":     strconv.FormatUint(incarnationBefore, 10),
+		"endpoint_incarnation_after":      strconv.FormatUint(incarnationAfter, 10),
 		"relay_total_drops":               strconv.FormatUint(state.DroppedTotal, 10),
 		"relay_new_client_tuples":         strconv.FormatUint(state.NewClientTuples, 10),
-		"client_migrations":               strconv.FormatUint(clientMigrations, 10),
-		"server_migrations":               strconv.FormatUint(serverMigrations, 10),
+		"listener_links_after":            strconv.Itoa(links),
+		"listener_addresses_after":        strconv.Itoa(addresses),
+		"listener_pending_after":          strconv.Itoa(pending),
 		"close_errors":                    "0",
 		"control_total_blackhole_commits": "0",
 	}), nil)
@@ -268,6 +256,7 @@ func TestGVisorT56TotalBlackholeCannotCommit(t *testing.T) {
 
 func TestGVisorT56MissingAndWrongPSKCannotAllocateSession(t *testing.T) {
 	requireOuterPacketSupport(t)
+	missingPSKRejected := false
 	if listener, err := ListenPacket("127.0.0.1:0"); listener != nil || !errors.Is(err, ErrPacketTrustRequired) {
 		if listener != nil {
 			if closeErr := listener.Close(); closeErr != nil {
@@ -275,6 +264,8 @@ func TestGVisorT56MissingAndWrongPSKCannotAllocateSession(t *testing.T) {
 			}
 		}
 		t.Fatalf("missing-PSK listener=(%v,%v)", listener, err)
+	} else {
+		missingPSKRejected = true
 	}
 
 	psk := t56PSK(t, t56PSKEnv)
@@ -319,6 +310,7 @@ func TestGVisorT56MissingAndWrongPSKCannotAllocateSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wrongBefore := relay.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	path, dialErr := wrong.DialPath(ctx, transport.PathSpec{Address: relay.Addr().String()})
@@ -329,6 +321,16 @@ func TestGVisorT56MissingAndWrongPSKCannotAllocateSession(t *testing.T) {
 	}
 	if dialErr == nil || path != nil {
 		t.Fatalf("wrong PSK DialPath=(%v,%v)", path, dialErr)
+	}
+	wrongAfter := relay.snapshot()
+	wrongDatagrams := wrongAfter.ClientDatagrams - wrongBefore.ClientDatagrams
+	wrongOpens := wrongAfter.ClientOpenDatagrams - wrongBefore.ClientOpenDatagrams
+	wrongCookies := wrongAfter.ServerCookieDatagrams - wrongBefore.ServerCookieDatagrams
+	wrongOpenACKs := wrongAfter.ServerOpenACKDatagrams - wrongBefore.ServerOpenACKDatagrams
+	admissionReached := wrongDatagrams > 0 && wrongOpens > 0 && wrongCookies > 0
+	if !admissionReached || wrongOpenACKs != 0 {
+		t.Fatalf("wrong-PSK packet traversal datagrams/OPEN/COOKIE/OPEN_ACK=%d/%d/%d/%d",
+			wrongDatagrams, wrongOpens, wrongCookies, wrongOpenACKs)
 	}
 	listener.packetMu.RLock()
 	wrongLinks, wrongAddresses, wrongPending :=
@@ -359,26 +361,34 @@ func TestGVisorT56MissingAndWrongPSKCannotAllocateSession(t *testing.T) {
 			links, addresses, pending)
 	}
 	t56EmitEvidence(t, t56ControlEvidence(t, "psk-admission", map[string]string{
-		"configured_listener":               "true",
-		"unauthenticated_open_attempts":     "1",
-		"unauthenticated_datagrams":         strconv.FormatUint(unauthDatagrams, 10),
-		"cookie_challenges":                 strconv.FormatUint(cookieChallenges, 10),
-		"wrong_auth_dial_attempts":          "1",
-		"unauthenticated_rejected":          "true",
-		"wrong_auth_rejected":               "true",
-		"control_missing_psk_sessions":      strconv.Itoa(unauthLinks),
-		"control_wrong_psk_sessions":        strconv.Itoa(wrongLinks),
-		"unauthenticated_links_after":       strconv.Itoa(unauthLinks),
-		"unauthenticated_addresses_after":   strconv.Itoa(unauthAddresses),
-		"unauthenticated_pending_after":     strconv.Itoa(unauthPending),
-		"wrong_auth_links_before_close":     strconv.Itoa(wrongLinks),
-		"wrong_auth_addresses_before_close": strconv.Itoa(wrongAddresses),
-		"wrong_auth_pending_before_close":   strconv.Itoa(wrongPending),
-		"listener_links_after":              strconv.Itoa(links),
-		"listener_addresses_after":          strconv.Itoa(addresses),
-		"listener_pending_after":            strconv.Itoa(pending),
-		"secret_derived_evidence":           "false",
-		"close_errors":                      "0",
+		"configured_listener":                   "true",
+		"missing_psk_configuration_rejected":    strconv.FormatBool(missingPSKRejected),
+		"missing_psk_listener_started":          "false",
+		"unauthenticated_open_attempts":         "1",
+		"unauthenticated_datagrams":             strconv.FormatUint(unauthDatagrams, 10),
+		"cookie_challenges":                     strconv.FormatUint(cookieChallenges, 10),
+		"wrong_auth_dial_attempts":              "1",
+		"wrong_auth_datagrams_to_admission":     strconv.FormatUint(wrongDatagrams, 10),
+		"wrong_auth_open_to_admission":          strconv.FormatUint(wrongOpens, 10),
+		"wrong_auth_cookie_challenges":          strconv.FormatUint(wrongCookies, 10),
+		"wrong_auth_open_acks":                  strconv.FormatUint(wrongOpenACKs, 10),
+		"wrong_auth_admission_boundary_reached": strconv.FormatBool(admissionReached),
+		"wrong_auth_rejected_before_allocation": "true",
+		"unauthenticated_rejected":              "true",
+		"wrong_auth_rejected":                   "true",
+		"control_missing_psk_sessions":          strconv.Itoa(unauthLinks),
+		"control_wrong_psk_sessions":            strconv.Itoa(wrongLinks),
+		"unauthenticated_links_after":           strconv.Itoa(unauthLinks),
+		"unauthenticated_addresses_after":       strconv.Itoa(unauthAddresses),
+		"unauthenticated_pending_after":         strconv.Itoa(unauthPending),
+		"wrong_auth_links_before_close":         strconv.Itoa(wrongLinks),
+		"wrong_auth_addresses_before_close":     strconv.Itoa(wrongAddresses),
+		"wrong_auth_pending_before_close":       strconv.Itoa(wrongPending),
+		"listener_links_after":                  strconv.Itoa(links),
+		"listener_addresses_after":              strconv.Itoa(addresses),
+		"listener_pending_after":                strconv.Itoa(pending),
+		"secret_derived_evidence":               "false",
+		"close_errors":                          "0",
 	}), psk, wrongPSK)
 }
 
@@ -389,15 +399,92 @@ func TestGVisorT56RepeatedControlResourceSlope(t *testing.T) {
 	samples := []t56ResourceSample{baseline}
 	allClosed := true
 	closeErrors := uint64(0)
+	successCycles := uint64(0)
+	nonCommitCycles := uint64(0)
+	rolledBackTransactions := uint64(0)
+	failedTransactions := uint64(0)
+	failClosedTransactions := uint64(0)
+	successGenerationAdvances := uint64(0)
+	nonCommitGenerationStable := uint64(0)
+	transactionGoroutinesJoined := true
 	for iteration := 0; iteration < t56ResourceIterations; iteration++ {
-		fixture := newT56EngineFixture(t, t56ControlMobilityBudget)
 		payload := bytes.Repeat([]byte{byte(iteration + 1)}, 2048)
-		t56EngineRoundTrip(t, fixture.client, fixture.server, payload)
-		t56EngineRoundTrip(t, fixture.server, fixture.client, payload)
-		if err := fixture.close(); err != nil {
+		success := newT56EngineFixture(t, t56ResourceTransactionBudget)
+		successBefore := success.clientPath.LeafMobilityClaim().Snapshot()
+		success.relay.DropEstablishedClient(t)
+		success.relay.ReleaseReplacement(t)
+		t56PublishLinkUnresponsive(t, success.clientPath)
+		successStatus := t56WaitInitiatorPhase(t, success.client, success.clientRef,
+			t56ResourceTransactionBudget+t56ControlMargin, engine.LeafMobilityInitiatorCommitted)
+		successAfter := success.clientPath.LeafMobilityClaim().Snapshot()
+		if successStatus.TransactionID == (leafmobility.TransactionID{}) || successStatus.Error != "" ||
+			success.client.MigrationCount() != 1 || successAfter.Generation <= successBefore.Generation {
+			t.Fatalf("resource success iteration %d status=%+v migration=%d generation=%d->%d",
+				iteration, successStatus, success.client.MigrationCount(), successBefore.Generation, successAfter.Generation)
+		}
+		t56EngineRoundTrip(t, success.client, success.server, payload)
+		t56EngineRoundTrip(t, success.server, success.client, payload)
+		successCycles++
+		successGenerationAdvances++
+		if err := success.close(); err != nil {
 			allClosed = false
+			transactionGoroutinesJoined = false
 			closeErrors++
-			t.Errorf("resource iteration %d cleanup: %v", iteration, err)
+			t.Errorf("resource success iteration %d cleanup: %v", iteration, err)
+		}
+
+		failure := newT56EngineFixture(t, t56ResourceTransactionBudget)
+		failureBefore := failure.clientPath.LeafMobilityClaim().Snapshot()
+		candidateOpen := t56FailCandidateOpenAtBudget(t, failure.clientPath.link, t56ResourceStageBudget)
+		t56PublishLinkUnresponsive(t, failure.clientPath)
+		failureStatus := t56WaitInitiatorTerminalNonCommit(t, failure.client, failure.clientRef,
+			t56ResourceTransactionBudget+t56TerminalObservationMargin)
+		candidateElapsed, candidateErr, candidateCalls := candidateOpen.snapshot(t)
+		if candidateCalls != 1 || !errors.Is(candidateErr, context.DeadlineExceeded) ||
+			candidateElapsed < t56ResourceStageBudget ||
+			candidateElapsed > t56ResourceStageBudget+t56ControlMargin ||
+			failureStatus.TransactionID == (leafmobility.TransactionID{}) ||
+			!strings.Contains(failureStatus.Error, "driver execution failed: stage:") ||
+			!t56StageFailureIsTimeout(failureStatus.Error) {
+			t.Fatalf("resource non-commit iteration %d status=%+v candidate-open=%d/%v/%v",
+				iteration, failureStatus, candidateCalls, candidateElapsed, candidateErr)
+		}
+		switch failureStatus.Phase {
+		case engine.LeafMobilityInitiatorRolledBack:
+			rolledBackTransactions++
+		case engine.LeafMobilityInitiatorFailed:
+			if !t56RollbackFailureIsFactual(failureStatus.Error) {
+				t.Fatalf("resource failed iteration %d has no factual rollback failure: %+v", iteration, failureStatus)
+			}
+			failedTransactions++
+		case engine.LeafMobilityInitiatorFailClosed:
+			if !t56RollbackFailureIsTimeout(failureStatus.Error) {
+				t.Fatalf("resource fail-closed iteration %d has no rollback timeout: %+v", iteration, failureStatus)
+			}
+			failClosedTransactions++
+		default:
+			t.Fatalf("resource iteration %d unexpected non-commit phase=%s", iteration, t56InitiatorPhase(failureStatus.Phase))
+		}
+		if failureStatus.Deadline.Sub(failureStatus.ObservedAt) != t56ResourceTransactionBudget ||
+			failureStatus.UpdatedAt.After(failureStatus.Deadline.Add(t56TerminalObservationMargin)) {
+			t.Fatalf("resource non-commit iteration %d observed/deadline/updated=%v/%v/%v",
+				iteration, failureStatus.ObservedAt, failureStatus.Deadline, failureStatus.UpdatedAt)
+		}
+		t56SummarizeNonCommitTransaction(t, failure.controlTrace, failureStatus.TransactionID)
+		failureAfter := failure.clientPath.LeafMobilityClaim().Snapshot()
+		if failure.client.MigrationCount() != 0 || failureAfter.Generation != failureBefore.Generation {
+			t.Fatalf("resource non-commit iteration %d migration=%d generation=%d->%d",
+				iteration, failure.client.MigrationCount(), failureBefore.Generation, failureAfter.Generation)
+		}
+		t56EngineRoundTrip(t, failure.client, failure.server, payload)
+		t56EngineRoundTrip(t, failure.server, failure.client, payload)
+		nonCommitCycles++
+		nonCommitGenerationStable++
+		if err := failure.close(); err != nil {
+			allClosed = false
+			transactionGoroutinesJoined = false
+			closeErrors++
+			t.Errorf("resource non-commit iteration %d cleanup: %v", iteration, err)
 		}
 		runtime.GC()
 		time.Sleep(25 * time.Millisecond)
@@ -408,11 +495,25 @@ func TestGVisorT56RepeatedControlResourceSlope(t *testing.T) {
 	goroutineSlope := t56ResourceSlope(samples, func(sample t56ResourceSample) uint64 { return sample.Goroutines })
 	heapSlope := t56ResourceSlope(samples, func(sample t56ResourceSample) uint64 { return sample.HeapInuse })
 	fdPeak, goroutinePeak, heapPeak := t56ResourcePeaks(samples)
-	valid := allClosed && closeErrors == 0 && final.FDs <= baseline.FDs+2 &&
+	valid := allClosed && transactionGoroutinesJoined && closeErrors == 0 &&
+		successCycles == t56ResourceIterations && nonCommitCycles == t56ResourceIterations &&
+		rolledBackTransactions+failedTransactions+failClosedTransactions == t56ResourceIterations &&
+		successGenerationAdvances == t56ResourceIterations && nonCommitGenerationStable == t56ResourceIterations &&
+		final.FDs <= baseline.FDs+2 &&
 		final.Goroutines <= baseline.Goroutines+4 && final.HeapInuse <= baseline.HeapInuse+(32<<20) &&
 		fdSlope <= 1 && goroutineSlope <= 1 && heapSlope <= 4<<20
 	evidence := t56ControlEvidence(t, "bounded-resource-slope", map[string]string{
 		"control_resource_iterations":      strconv.Itoa(t56ResourceIterations),
+		"successful_mobility_cycles":       strconv.FormatUint(successCycles, 10),
+		"noncommit_failure_cycles":         strconv.FormatUint(nonCommitCycles, 10),
+		"successful_transactions":          strconv.FormatUint(successCycles, 10),
+		"noncommit_transactions":           strconv.FormatUint(nonCommitCycles, 10),
+		"rolled_back_transactions":         strconv.FormatUint(rolledBackTransactions, 10),
+		"failed_transactions":              strconv.FormatUint(failedTransactions, 10),
+		"fail_closed_transactions":         strconv.FormatUint(failClosedTransactions, 10),
+		"success_generation_advances":      strconv.FormatUint(successGenerationAdvances, 10),
+		"noncommit_generation_stable":      strconv.FormatUint(nonCommitGenerationStable, 10),
+		"transaction_goroutines_joined":    strconv.FormatBool(transactionGoroutinesJoined),
 		"fd_baseline":                      strconv.FormatUint(baseline.FDs, 10),
 		"fd_final":                         strconv.FormatUint(final.FDs, 10),
 		"fd_peak":                          strconv.FormatUint(fdPeak, 10),
@@ -458,6 +559,13 @@ type t56OpaqueUDPRelay struct {
 	droppedOld             uint64
 	droppedTotal           uint64
 	newClientTuples        uint64
+	clientDatagrams        uint64
+	serverDatagrams        uint64
+	clientOpenDatagrams    uint64
+	serverCookieDatagrams  uint64
+	serverOpenACKDatagrams uint64
+	clientTCP              tcpPacketSummary
+	serverTCP              tcpPacketSummary
 }
 
 type t56OpaqueRelaySnapshot struct {
@@ -472,6 +580,11 @@ type t56OpaqueRelaySnapshot struct {
 	DroppedOld             uint64
 	DroppedTotal           uint64
 	NewClientTuples        uint64
+	ClientDatagrams        uint64
+	ServerDatagrams        uint64
+	ClientOpenDatagrams    uint64
+	ServerCookieDatagrams  uint64
+	ServerOpenACKDatagrams uint64
 }
 
 func newT56OpaqueUDPRelay(t testing.TB, server net.Addr) *t56OpaqueUDPRelay {
@@ -526,7 +639,17 @@ func (relay *t56OpaqueUDPRelay) run() {
 }
 
 func (relay *t56OpaqueUDPRelay) forwardServer(packet []byte) {
+	header, headerErr := decodeOuterHeader(packet)
 	relay.mu.Lock()
+	relay.serverDatagrams++
+	if headerErr == nil {
+		switch header.Type {
+		case outerTypeCookie:
+			relay.serverCookieDatagrams++
+		case outerTypeOpenAck:
+			relay.serverOpenACKDatagrams++
+		}
+	}
 	client := cloneUDPAddr(relay.client)
 	if relay.dropTotal {
 		relay.droppedTotal++
@@ -542,17 +665,25 @@ func (relay *t56OpaqueUDPRelay) forwardServer(packet []byte) {
 		return
 	}
 	relay.mu.Lock()
-	if post {
-		relay.serverForwardedAfter++
-		relay.serverAfterDestination = client.String()
-	} else {
-		relay.serverForwardedBefore++
+	if header.Type == outerTypeData {
+		if post {
+			relay.serverForwardedAfter++
+			relay.serverAfterDestination = client.String()
+		} else {
+			relay.serverForwardedBefore++
+		}
+		relay.serverTCP.record(header.Payload, post)
 	}
 	relay.mu.Unlock()
 }
 
 func (relay *t56OpaqueUDPRelay) forwardClient(packet []byte, source *net.UDPAddr) {
+	header, headerErr := decodeOuterHeader(packet)
 	relay.mu.Lock()
+	relay.clientDatagrams++
+	if headerErr == nil && header.Type == outerTypeOpen {
+		relay.clientOpenDatagrams++
+	}
 	if relay.client == nil {
 		relay.client = cloneUDPAddr(source)
 	}
@@ -582,15 +713,23 @@ func (relay *t56OpaqueUDPRelay) forwardClient(packet []byte, source *net.UDPAddr
 		return
 	}
 	relay.mu.Lock()
-	if post {
-		relay.clientForwardedAfter++
-	} else {
-		relay.clientForwardedBefore++
+	if header.Type == outerTypeData {
+		if post {
+			relay.clientForwardedAfter++
+		} else {
+			relay.clientForwardedBefore++
+		}
+		relay.clientTCP.record(header.Payload, post)
 	}
 	relay.mu.Unlock()
 }
 
 func (relay *t56OpaqueUDPRelay) DropEstablishedClient(t testing.TB) string {
+	dropped, _ := relay.DropEstablishedClientAt(t)
+	return dropped
+}
+
+func (relay *t56OpaqueUDPRelay) DropEstablishedClientAt(t testing.TB) (string, time.Time) {
 	t.Helper()
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
@@ -600,7 +739,7 @@ func (relay *t56OpaqueUDPRelay) DropEstablishedClient(t testing.TB) string {
 	relay.dropped = cloneUDPAddr(relay.client)
 	relay.dropOld = true
 	relay.dropTotal = true
-	return relay.dropped.String()
+	return relay.dropped.String(), time.Now()
 }
 
 func (relay *t56OpaqueUDPRelay) ReleaseReplacement(t testing.TB) {
@@ -625,6 +764,17 @@ func (relay *t56OpaqueUDPRelay) DropAllClientTuples(t testing.TB) {
 	relay.dropTotal = true
 }
 
+func (relay *t56OpaqueUDPRelay) RestoreAllClientTuples(t testing.TB) {
+	t.Helper()
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	if !relay.dropOld || !relay.dropTotal || relay.dropped == nil {
+		t.Fatal("opaque relay has no total client blackhole to restore")
+	}
+	relay.dropOld = false
+	relay.dropTotal = false
+}
+
 func (relay *t56OpaqueUDPRelay) PreData() uint64 {
 	return relay.snapshot().ClientForwardedBefore
 }
@@ -645,6 +795,12 @@ func (relay *t56OpaqueUDPRelay) ReplacementTuple() string {
 	return relay.snapshot().ReplacementTuple
 }
 
+func (relay *t56OpaqueUDPRelay) TCPSummaries() (tcpPacketSummary, tcpPacketSummary) {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return relay.clientTCP, relay.serverTCP
+}
+
 func (relay *t56OpaqueUDPRelay) snapshot() t56OpaqueRelaySnapshot {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
@@ -661,6 +817,9 @@ func (relay *t56OpaqueUDPRelay) snapshot() t56OpaqueRelaySnapshot {
 		ServerForwardedBefore: relay.serverForwardedBefore, ServerForwardedAfter: relay.serverForwardedAfter,
 		ServerAfterDestination: relay.serverAfterDestination,
 		DroppedOld:             relay.droppedOld, DroppedTotal: relay.droppedTotal, NewClientTuples: relay.newClientTuples,
+		ClientDatagrams: relay.clientDatagrams, ServerDatagrams: relay.serverDatagrams,
+		ClientOpenDatagrams: relay.clientOpenDatagrams, ServerCookieDatagrams: relay.serverCookieDatagrams,
+		ServerOpenACKDatagrams: relay.serverOpenACKDatagrams,
 	}
 }
 
@@ -670,19 +829,35 @@ func (snapshot t56OpaqueRelaySnapshot) treatmentValid() bool {
 		snapshot.ClientForwardedBefore > 0 && snapshot.ClientForwardedAfter > 0 &&
 		snapshot.ServerForwardedBefore > 0 && snapshot.ServerForwardedAfter > 0 &&
 		snapshot.ServerAfterDestination == snapshot.ReplacementTuple &&
-		snapshot.DroppedOld > 0 && snapshot.DroppedTotal > 0 && snapshot.NewClientTuples > 0
+		snapshot.DroppedTotal > 0 && snapshot.NewClientTuples > 0
 }
 
 type t56EngineFixture struct {
-	listener   *Listener
-	relay      *t56OpaqueUDPRelay
-	client     *engine.Engine
-	server     *engine.Engine
-	clientPath *retainedPathConn
-	clientRef  engine.PathRef
-	serverRef  engine.PathRef
-	closeOnce  sync.Once
-	closeErr   error
+	listener     *Listener
+	relay        *t56OpaqueUDPRelay
+	client       *engine.Engine
+	server       *engine.Engine
+	clientPath   *retainedPathConn
+	serverPath   *retainedPathConn
+	clientRef    engine.PathRef
+	serverRef    engine.PathRef
+	controlTrace *publicK5ControlTrace
+	closeOnce    sync.Once
+	closeErr     error
+}
+
+type t56ControlTracePath struct {
+	transport.PathConn
+	trace  *publicK5ControlTrace
+	writer publicK5ControlWriter
+}
+
+func (path *t56ControlTracePath) Write(frame []byte) (int, error) {
+	n, err := path.PathConn.Write(frame)
+	if err == nil && n == len(frame) {
+		path.trace.record(path.writer, frame)
+	}
+	return n, err
 }
 
 func newT56EngineFixture(t testing.TB, mobilityBudget time.Duration) *t56EngineFixture {
@@ -719,11 +894,18 @@ func newT56EngineFixture(t testing.TB, mobilityBudget time.Duration) *t56EngineF
 		t.Fatal(err)
 	}
 	clientControlConn, serverControlConn := net.Pipe()
+	controlTrace := &publicK5ControlTrace{}
 	controlBinding := engine.PathBinding{LocalTXTargetID: controlTargetID, PeerTXTargetID: controlTargetID}
-	if _, err := client.AttachPathBound(basetcp.Wrap(clientControlConn), transport.PathSpec{Transport: "control"}, controlBinding); err != nil {
+	clientControl := &t56ControlTracePath{
+		PathConn: basetcp.Wrap(clientControlConn), trace: controlTrace, writer: publicK5ControlClient,
+	}
+	serverControl := &t56ControlTracePath{
+		PathConn: basetcp.Wrap(serverControlConn), trace: controlTrace, writer: publicK5ControlServer,
+	}
+	if _, err := client.AttachPathBound(clientControl, transport.PathSpec{Transport: "control"}, controlBinding); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.AttachPathBound(basetcp.Wrap(serverControlConn), transport.PathSpec{Transport: "control"}, controlBinding); err != nil {
+	if _, err := server.AttachPathBound(serverControl, transport.PathSpec{Transport: "control"}, controlBinding); err != nil {
 		t.Fatal(err)
 	}
 	ref, ok := client.PathRef(pathID)
@@ -736,7 +918,8 @@ func newT56EngineFixture(t testing.TB, mobilityBudget time.Duration) *t56EngineF
 	}
 	return &t56EngineFixture{
 		listener: listener, relay: relay, client: client, server: server,
-		clientPath: clientPath, clientRef: ref, serverRef: serverRef,
+		clientPath: clientPath, serverPath: serverPath, clientRef: ref, serverRef: serverRef,
+		controlTrace: controlTrace,
 	}
 }
 
@@ -969,6 +1152,328 @@ func t56EngineRoundTrip(t testing.TB, sender, receiver *engine.Engine, payload [
 	}
 }
 
+type t56CandidateStageObservation struct {
+	done     chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	calls    uint64
+	started  time.Time
+	finished time.Time
+	err      error
+}
+
+func t56BoundCandidateOpen(t testing.TB, owner *linkOwner, budget time.Duration) *t56CandidateStageObservation {
+	t.Helper()
+	if owner == nil || budget <= 0 {
+		t.Fatalf("invalid T5.6 bounded candidate opener owner=%p budget=%v", owner, budget)
+	}
+	observation := &t56CandidateStageObservation{done: make(chan struct{})}
+	owner.mu.Lock()
+	base := owner.openCandidate
+	if base == nil {
+		owner.mu.Unlock()
+		t.Fatal("T5.6 packet-link candidate opener is unavailable")
+	}
+	owner.openCandidate = func(ctx context.Context, remote net.Addr) (*packetWire, routeObservation, error) {
+		started := time.Now()
+		stageCtx, cancel := context.WithTimeout(ctx, budget)
+		candidate, route, err := base(stageCtx, remote)
+		cancel()
+		finished := time.Now()
+		observation.mu.Lock()
+		observation.calls++
+		observation.mu.Unlock()
+		observation.once.Do(func() {
+			observation.mu.Lock()
+			observation.started = started
+			observation.finished = finished
+			observation.err = err
+			observation.mu.Unlock()
+			close(observation.done)
+		})
+		return candidate, route, err
+	}
+	owner.mu.Unlock()
+	return observation
+}
+
+func t56FailCandidateOpenAtBudget(
+	t testing.TB,
+	owner *linkOwner,
+	budget time.Duration,
+) *t56CandidateStageObservation {
+	t.Helper()
+	if owner == nil || budget <= 0 {
+		t.Fatalf("invalid T5.6 failing candidate opener owner=%p budget=%v", owner, budget)
+	}
+	observation := &t56CandidateStageObservation{done: make(chan struct{})}
+	owner.mu.Lock()
+	if owner.openCandidate == nil {
+		owner.mu.Unlock()
+		t.Fatal("T5.6 packet-link candidate opener is unavailable")
+	}
+	owner.openCandidate = func(ctx context.Context, _ net.Addr) (*packetWire, routeObservation, error) {
+		started := time.Now()
+		timer := time.NewTimer(budget)
+		var err error
+		select {
+		case <-timer.C:
+			err = context.DeadlineExceeded
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			err = context.Cause(ctx)
+		}
+		finished := time.Now()
+		observation.mu.Lock()
+		observation.calls++
+		observation.mu.Unlock()
+		observation.once.Do(func() {
+			observation.mu.Lock()
+			observation.started = started
+			observation.finished = finished
+			observation.err = err
+			observation.mu.Unlock()
+			close(observation.done)
+		})
+		return nil, routeObservation{}, err
+	}
+	owner.mu.Unlock()
+	return observation
+}
+
+func (observation *t56CandidateStageObservation) snapshot(t testing.TB) (time.Duration, error, uint64) {
+	t.Helper()
+	select {
+	case <-observation.done:
+	case <-time.After(t56ControlTransactionBudget + t56ControlMargin):
+		t.Fatal("T5.6 bounded candidate Stage was never invoked")
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	return observation.finished.Sub(observation.started), observation.err, observation.calls
+}
+
+func t56PublishLinkUnresponsive(t testing.TB, path *retainedPathConn) {
+	t.Helper()
+	if path == nil || path.link == nil ||
+		!path.link.publishWireFailure(leafmobility.RefreshReasonLinkUnresponsive) {
+		t.Fatal("T5.6 packet-link refresh stimulus was not accepted")
+	}
+}
+
+func t56WaitInitiatorPhase(
+	t testing.TB,
+	eng *engine.Engine,
+	ref engine.PathRef,
+	timeout time.Duration,
+	want engine.LeafMobilityInitiatorPhase,
+) engine.LeafMobilityInitiatorSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last engine.LeafMobilityInitiatorSnapshot
+	for time.Now().Before(deadline) {
+		if status, ok := eng.LeafMobilityInitiatorStatus(ref); ok {
+			last = status
+			if status.Phase == want {
+				return status
+			}
+			if t56TerminalNonCommitPhase(status.Phase) && status.Phase != want {
+				t.Fatalf("T5.6 automatic transaction phase=%s, want %s: %+v",
+					t56InitiatorPhase(status.Phase), t56InitiatorPhase(want), status)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("T5.6 automatic transaction timed out waiting for %s; last=%+v", t56InitiatorPhase(want), last)
+	return engine.LeafMobilityInitiatorSnapshot{}
+}
+
+func t56WaitInitiatorTerminalNonCommit(
+	t testing.TB,
+	eng *engine.Engine,
+	ref engine.PathRef,
+	timeout time.Duration,
+) engine.LeafMobilityInitiatorSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last engine.LeafMobilityInitiatorSnapshot
+	for time.Now().Before(deadline) {
+		if status, ok := eng.LeafMobilityInitiatorStatus(ref); ok {
+			last = status
+			switch status.Phase {
+			case engine.LeafMobilityInitiatorRolledBack,
+				engine.LeafMobilityInitiatorFailed,
+				engine.LeafMobilityInitiatorFailClosed:
+				return status
+			case engine.LeafMobilityInitiatorCommitted:
+				t.Fatalf("T5.6 failure stimulus committed unexpectedly: %+v", status)
+			case engine.LeafMobilityInitiatorRejected,
+				engine.LeafMobilityInitiatorExpired:
+				t.Fatalf("T5.6 failure stimulus terminated before driver execution: %+v", status)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("T5.6 automatic transaction timed out waiting for a non-commit terminal phase; last=%+v", last)
+	return engine.LeafMobilityInitiatorSnapshot{}
+}
+
+type t56FailClosedWireSummary struct {
+	Prepare    uint64
+	Prepared   uint64
+	Commit     uint64
+	Complete   uint64
+	RolledBack uint64
+	Released   uint64
+}
+
+func t56SummarizeNonCommitTransaction(
+	t testing.TB,
+	trace *publicK5ControlTrace,
+	transaction leafmobility.TransactionID,
+) t56FailClosedWireSummary {
+	t.Helper()
+	if trace == nil || transaction == (leafmobility.TransactionID{}) {
+		t.Fatal("T5.6 non-commit transaction trace is unavailable")
+	}
+	want := [16]byte(transaction)
+	var summary t56FailClosedWireSummary
+	for _, record := range trace.snapshot() {
+		if record.Transaction != want {
+			continue
+		}
+		if record.Actor != proto.LeafMobilityActorClient {
+			t.Fatalf("T5.6 non-commit transaction has actor=%d, want client", record.Actor)
+		}
+		switch record.Code {
+		case proto.CtrlLeafMobilityPrepare:
+			if record.Writer != publicK5ControlClient {
+				t.Fatal("T5.6 non-commit PREPARE was not written by client")
+			}
+			summary.Prepare++
+		case proto.CtrlLeafMobilityAck:
+			switch {
+			case record.AckPhase == proto.LeafMobilityPeerPlanAckPhasePrepared &&
+				record.AckCode == proto.LeafMobilityPeerPlanAckCodeAccept && record.Writer == publicK5ControlServer:
+				summary.Prepared++
+			case record.AckPhase == proto.LeafMobilityPeerPlanAckPhaseReleased &&
+				record.AckCode == proto.LeafMobilityPeerPlanAckCodeAccept &&
+				record.CommitStage == proto.LeafMobilityPeerPlanCommitStageRolledBack &&
+				record.Writer == publicK5ControlServer:
+				summary.Released++
+			default:
+				t.Fatalf("T5.6 non-commit transaction contains contradictory ACK %+v", record.Ack)
+			}
+		case proto.CtrlLeafMobilityCommit:
+			if record.Writer != publicK5ControlClient {
+				t.Fatal("T5.6 non-commit resolution was not written by client")
+			}
+			switch record.CommitStage {
+			case proto.LeafMobilityPeerPlanCommitStageCommit:
+				summary.Commit++
+			case proto.LeafMobilityPeerPlanCommitStageComplete:
+				summary.Complete++
+			case proto.LeafMobilityPeerPlanCommitStageRolledBack:
+				summary.RolledBack++
+			default:
+				t.Fatalf("T5.6 non-commit transaction contains stage=%d", record.CommitStage)
+			}
+		}
+	}
+	trace.mu.Lock()
+	malformed := trace.malformed
+	trace.mu.Unlock()
+	if malformed != 0 || summary.Prepare == 0 || summary.Prepared == 0 ||
+		summary.Commit != 0 || summary.Complete != 0 {
+		t.Fatalf("T5.6 bilateral non-commit wire summary=%+v malformed=%d", summary, malformed)
+	}
+	return summary
+}
+
+func t56SummarizeFailClosedTransaction(
+	t testing.TB,
+	trace *publicK5ControlTrace,
+	transaction leafmobility.TransactionID,
+) t56FailClosedWireSummary {
+	t.Helper()
+	summary := t56SummarizeNonCommitTransaction(t, trace, transaction)
+	if summary.RolledBack != 0 || summary.Released != 0 {
+		t.Fatalf("T5.6 fail-closed transaction falsely acknowledged rollback: %+v", summary)
+	}
+	return summary
+}
+
+func t56RollbackFailureIsTimeout(statusError string) bool {
+	const marker = "driver execution failed: rollback:"
+	index := strings.Index(statusError, marker)
+	if index < 0 {
+		return false
+	}
+	rollbackError := statusError[index+len(marker):]
+	return strings.Contains(rollbackError, context.DeadlineExceeded.Error()) ||
+		strings.Contains(rollbackError, "i/o timeout")
+}
+
+func t56RollbackFailureIsFactual(statusError string) bool {
+	return strings.Contains(statusError, "driver execution failed: rollback:") ||
+		strings.Contains(statusError, leafmobility.ErrExecutionBusy.Error())
+}
+
+func TestT56RollbackFailureClassifier(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		statusError string
+		want        bool
+	}{
+		{name: "wrapped rollback", statusError: "driver execution failed: rollback: context deadline exceeded", want: true},
+		{name: "rollback busy", statusError: "driver execution failed: stage: context deadline exceeded\nleafmobility: driver execution is busy", want: true},
+		{name: "stage only", statusError: "driver execution failed: stage: context deadline exceeded", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := t56RollbackFailureIsFactual(test.statusError); got != test.want {
+				t.Fatalf("t56RollbackFailureIsFactual(%q)=%t, want %t", test.statusError, got, test.want)
+			}
+		})
+	}
+}
+
+func t56StageFailureIsTimeout(statusError string) bool {
+	const marker = "driver execution failed: stage:"
+	index := strings.Index(statusError, marker)
+	if index < 0 {
+		return false
+	}
+	stageError := statusError[index+len(marker):]
+	if lineEnd := strings.IndexByte(stageError, '\n'); lineEnd >= 0 {
+		stageError = stageError[:lineEnd]
+	}
+	return strings.Contains(stageError, context.DeadlineExceeded.Error()) ||
+		strings.Contains(stageError, "i/o timeout")
+}
+
+func t56ListenerPacketState(listener *Listener) (int, int, int) {
+	if listener == nil {
+		return 0, 0, 0
+	}
+	listener.packetMu.RLock()
+	defer listener.packetMu.RUnlock()
+	return len(listener.packetLinks), len(listener.packetByIP), len(listener.packetPending)
+}
+
+func t56Closed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
 func t56TerminalNonCommitPhase(phase engine.LeafMobilityInitiatorPhase) bool {
 	switch phase {
 	case engine.LeafMobilityInitiatorRolledBack,
@@ -1052,7 +1557,7 @@ func t56UnauthenticatedAdmissionAttempt(t testing.TB, listenerAddress net.Addr) 
 	send := func(cookie outerCookie) {
 		t.Helper()
 		wire, encodeErr := encodeOuter(outerFrame{
-			Type: outerTypeOpen, LinkID: id, Generation: 1,
+			Type: outerTypeOpen, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 1,
 			Payload: marshalOpen(public, nonce, cookie, outerProof{}),
 		}, linkSecret{})
 		if encodeErr != nil {
@@ -1071,7 +1576,7 @@ func t56UnauthenticatedAdmissionAttempt(t testing.TB, listenerAddress net.Addr) 
 	if err != nil {
 		t.Fatalf("read admission cookie: %v", err)
 	}
-	frame, err := decodeOuter(buffer[:n], linkSecret{})
+	frame, err := decodeOuter(buffer[:n], linkSecret{}, leafmobility.RoleAcceptor)
 	if err != nil || frame.Type != outerTypeCookie || frame.LinkID != id {
 		t.Fatalf("unauthenticated admission cookie frame=%+v err=%v", frame, err)
 	}
@@ -1208,28 +1713,47 @@ func t56TreatmentEvidence(
 	set("packet_trust_configured", true)
 	set("relay_kind", "opaque_udp_tuple_router")
 	set("relay_psk_access", false)
-	set("relay_protocol_bytes_inspected", 0)
-	set("select_target_calls", 0)
-	set("manual_migration_calls", 0)
+	set("relay_protocol_inspection", "outer_type_and_inner_tcp_headers")
+	set("relay_authentication_verified", false)
+	set("automatic_phase_select_target_calls", 0)
+	set("automatic_phase_manual_migration_calls", 0)
 	set("production_factory_provider", observation.ProductionFactory)
 	set("production_listener_provider", observation.ProductionListener)
 	set("test_wrapper_provider", false)
 	set("responder_initiator_suppressed", false)
 	set("crossed_actor_rule", "client_priority")
 	set("crossed_actor_schedule", "first_prepare_bilateral_barrier")
-	set("crossed_actor_election_intervention", false)
-	set("client_crossed_transaction_id", hex.EncodeToString(observation.ClientCrossed.TransactionID[:]))
-	set("server_crossed_transaction_id", hex.EncodeToString(observation.ServerCrossed.TransactionID[:]))
+	set("crossed_actor_schedule_injected", true)
+	set("client_crossed_transaction_id", hex.EncodeToString(observation.Control.CrossedClientTransaction[:]))
+	set("server_crossed_transaction_id", hex.EncodeToString(observation.Control.CrossedServerTransaction[:]))
 	set("migration_count_before", result.MigrationCountBefore)
 	set("migration_count_after", result.MigrationCountAfter)
 	set("migration_event_count", result.MigrationEventCount)
+	set("client_migration_ledger_json", t56MigrationLedgerJSON(result.ClientMigrationEvents))
+	set("generic_failover_events", result.GenericFailoverEvents)
+	set("generic_failover_cause", result.GenericFailoverCause)
+	set("server_migration_count_before", result.ServerMigrationCountBefore)
+	set("server_migration_count_after", result.ServerMigrationCountAfter)
+	set("server_migration_event_count", len(result.ServerMigrationEvents))
+	set("server_migration_ledger_json", t56MigrationLedgerJSON(result.ServerMigrationEvents))
+	set("server_generic_failover_events", result.ServerGenericFailoverEvents)
+	set("server_generic_failover_cause", result.ServerGenericFailoverCause)
 	set("migration_old_path_id", result.MigrationOldPathID)
 	set("migration_new_path_id", result.MigrationNewPathID)
 	set("migration_cause", result.MigrationCause)
 	set("blackhole_unix_nano", result.BlackholeUnixNano)
 	set("migration_unix_nano", result.MigrationUnixNano)
-	set("recovery_nanoseconds", result.MigrationUnixNano-result.BlackholeUnixNano)
+	set("recovery_nanoseconds", result.RecoveryNanoseconds)
 	set("path_id", result.PathID)
+	set("path_owner", result.PathOwner)
+	set("control_path_id", result.ControlPathID)
+	set("server_data_path_id", result.ServerDataPathID)
+	set("server_path_owner", result.ServerPathOwner)
+	set("server_control_path_id", result.ServerControlPathID)
+	set("client_data_binding_before_json", t56MigrationPathBindingJSON(result.ClientDataBindingBefore))
+	set("client_control_binding_before_json", t56MigrationPathBindingJSON(result.ClientControlBindingBefore))
+	set("server_data_binding_before_json", t56MigrationPathBindingJSON(result.ServerDataBindingBefore))
+	set("server_control_binding_before_json", t56MigrationPathBindingJSON(result.ServerControlBindingBefore))
 	set("status_mobility_id", result.StatusMobilityID)
 	set("status_mobility_state", result.StatusMobilityState)
 	set("status_mobility_reason", observation.StatusReason)
@@ -1258,6 +1782,13 @@ func t56TreatmentEvidence(
 	set("claim_resource_id_after", result.ClaimResourceIDAfter)
 	set("claim_endpoint_generation_before", result.ClaimEndpointGenerationBefore)
 	set("claim_endpoint_generation_after", result.ClaimEndpointGenerationAfter)
+	set("claim_binding_local_target_id", result.ClaimBindingLocalTargetID)
+	set("claim_binding_peer_target_id", result.ClaimBindingPeerTargetID)
+	set("server_claim_endpoint_generation_before", result.ServerClaimEndpointGenerationBefore)
+	set("outer_incarnation_before", result.OuterIncarnationBefore)
+	set("outer_incarnation_after", result.OuterIncarnationAfter)
+	set("outer_generation_before", result.OuterGenerationBefore)
+	set("outer_generation_after", result.OuterGenerationAfter)
 	set("outer_tuple_before", result.OuterTupleBefore)
 	set("outer_tuple_dropped", result.OuterTupleDropped)
 	set("outer_tuple_after", result.OuterTupleAfter)
@@ -1276,12 +1807,16 @@ func t56TreatmentEvidence(
 	set("server_unacked_bytes_at_blackhole", observation.ServerTXAtBlackhole.BytesInUse)
 	set("client_control_reads_before", result.ClientControlBefore.Reads)
 	set("client_control_reads_after", result.ClientControlAfter.Reads)
-	set("client_control_writes_before", result.ClientControlBefore.Writes)
-	set("client_control_writes_after", result.ClientControlAfter.Writes)
+	set("client_control_writes_before", result.ClientControlBefore.ControlWrites)
+	set("client_control_writes_after", result.ClientControlAfter.ControlWrites)
+	set("client_control_data_writes_before", result.ClientControlBefore.DataWrites)
+	set("client_control_data_writes_after", result.ClientControlAfter.DataWrites)
 	set("server_control_reads_before", result.ServerControlBefore.Reads)
 	set("server_control_reads_after", result.ServerControlAfter.Reads)
-	set("server_control_writes_before", result.ServerControlBefore.Writes)
-	set("server_control_writes_after", result.ServerControlAfter.Writes)
+	set("server_control_writes_before", result.ServerControlBefore.ControlWrites)
+	set("server_control_writes_after", result.ServerControlAfter.ControlWrites)
+	set("server_control_data_writes_before", result.ServerControlBefore.DataWrites)
+	set("server_control_data_writes_after", result.ServerControlAfter.DataWrites)
 	set("control_path_name", publicK5GVisorControlName)
 	set("control_mobility_frames", observation.Control.MobilityFrames)
 	set("control_malformed_frames", observation.Control.MalformedFrames)
@@ -1296,7 +1831,50 @@ func t56TreatmentEvidence(
 	set("control_crossed_server_transactions", observation.Control.CrossedServerTransactions)
 	set("control_crossed_server_prepare_frames", observation.Control.CrossedServerPrepareFrames)
 	set("control_crossed_server_busy_frames", observation.Control.CrossedServerBusyFrames)
+	set("control_crossed_server_progression_frames", observation.Control.CrossedServerProgressionFrames)
 	set("control_crossed_prepare_barrier", observation.Control.CrossedPrepareBarrier)
+	set("post_commit_epoch_started_unix_nano", result.PostCommitData.StartedUnixNano)
+	set("post_commit_select_target_calls", result.PostCommitData.SelectTargetCalls)
+	set("post_commit_client_active_before", result.PostCommitData.ClientActiveBefore)
+	set("post_commit_client_active_after", result.PostCommitData.ClientActiveAfter)
+	set("post_commit_server_active_before", result.PostCommitData.ServerActiveBefore)
+	set("post_commit_server_active_after", result.PostCommitData.ServerActiveAfter)
+	set("post_commit_client_data_path_id", result.PostCommitData.ClientDataPathID)
+	set("post_commit_server_data_path_id", result.PostCommitData.ServerDataPathID)
+	set("post_commit_client_migration_before", result.PostCommitData.ClientMigrationBefore)
+	set("post_commit_client_migration_after", result.PostCommitData.ClientMigrationAfter)
+	set("post_commit_server_migration_before", result.PostCommitData.ServerMigrationBefore)
+	set("post_commit_server_migration_after", result.PostCommitData.ServerMigrationAfter)
+	set("post_commit_client_active_final", result.PostCommitData.ClientActiveFinal)
+	set("post_commit_server_active_final", result.PostCommitData.ServerActiveFinal)
+	set("post_commit_client_migration_final", result.PostCommitData.ClientMigrationFinal)
+	set("post_commit_server_migration_final", result.PostCommitData.ServerMigrationFinal)
+	set("post_commit_client_selection_ledger_json", t56MigrationLedgerJSON(result.PostCommitData.ClientSelectionEvents))
+	set("post_commit_server_selection_ledger_json", t56MigrationLedgerJSON(result.PostCommitData.ServerSelectionEvents))
+	set("post_commit_client_published_next", result.PostCommitData.ClientPublishedNext)
+	set("post_commit_server_published_next", result.PostCommitData.ServerPublishedNext)
+	set("post_commit_client_outer_data_before", result.PostCommitData.ClientOuterDataBefore)
+	set("post_commit_client_outer_data_after", result.PostCommitData.ClientOuterDataAfter)
+	set("post_commit_server_outer_data_before", result.PostCommitData.ServerOuterDataBefore)
+	set("post_commit_server_outer_data_after", result.PostCommitData.ServerOuterDataAfter)
+	set("post_commit_client_inner_payload_before", result.PostCommitData.ClientInnerPayloadBefore)
+	set("post_commit_client_inner_payload_after", result.PostCommitData.ClientInnerPayloadAfter)
+	set("post_commit_server_inner_payload_before", result.PostCommitData.ServerInnerPayloadBefore)
+	set("post_commit_server_inner_payload_after", result.PostCommitData.ServerInnerPayloadAfter)
+	set("post_commit_client_control_data_before", result.PostCommitData.ClientControlDataBefore)
+	set("post_commit_client_control_data_after", result.PostCommitData.ClientControlDataAfter)
+	set("post_commit_server_control_data_before", result.PostCommitData.ServerControlDataBefore)
+	set("post_commit_server_control_data_after", result.PostCommitData.ServerControlDataAfter)
+	set("post_commit_client_control_sequence_count", len(result.PostCommitData.ClientControlEpochSequences))
+	set("post_commit_server_control_sequence_count", len(result.PostCommitData.ServerControlEpochSequences))
+	set("post_commit_client_offered_bytes", result.PostCommitData.ClientOfferedBytes)
+	set("post_commit_client_received_bytes", result.PostCommitData.ClientReceivedBytes)
+	set("post_commit_server_offered_bytes", result.PostCommitData.ServerOfferedBytes)
+	set("post_commit_server_received_bytes", result.PostCommitData.ServerReceivedBytes)
+	set("post_commit_client_offered_sha256", result.PostCommitData.ClientOfferedSHA256)
+	set("post_commit_client_received_sha256", result.PostCommitData.ClientReceivedSHA256)
+	set("post_commit_server_offered_sha256", result.PostCommitData.ServerOfferedSHA256)
+	set("post_commit_server_received_sha256", result.PostCommitData.ServerReceivedSHA256)
 	set("client_offered_bytes", result.ClientOfferedBytes)
 	set("client_received_bytes", result.ClientReceivedBytes)
 	set("server_offered_bytes", result.ServerOfferedBytes)
@@ -1329,6 +1907,22 @@ func t56TreatmentEvidence(
 	set("server_replay_entries_after", result.ServerReplayEntriesAfter)
 	set("refresh_callbacks_active_after", result.RefreshCallbacksActiveAfter)
 	return evidence
+}
+
+func t56MigrationLedgerJSON(events []publicK5MigrationEvent) string {
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		panic(fmt.Sprintf("encode T5.6 migration ledger: %v", err))
+	}
+	return string(encoded)
+}
+
+func t56MigrationPathBindingJSON(binding publicK5MigrationPathBinding) string {
+	encoded, err := json.Marshal(binding)
+	if err != nil {
+		panic(fmt.Sprintf("encode T5.6 path binding: %v", err))
+	}
+	return string(encoded)
 }
 
 func t56OpaqueToken(value string) string {

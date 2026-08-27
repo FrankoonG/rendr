@@ -1106,16 +1106,19 @@ func TestRuntimeAutomaticallyRedialsDeadGenericPacketLeaf(t *testing.T) {
 	var carriers recoveryCarrierTracker
 	if err := runtime.RegisterPacketFactory("recover-packet", PacketFactory{
 		Carrier: CarrierUDP,
-		Dial: func(context.Context, string) (net.PacketConn, error) {
+		Dial: func(_ context.Context, address string) (PacketEndpoint, error) {
 			attempt := attempts.Add(1)
 			if attempt == 2 || attempt == 3 {
-				return nil, &net.DNSError{Err: "injected packet recovery dial failure", IsTemporary: true}
+				return PacketEndpoint{}, &net.DNSError{Err: "injected packet recovery dial failure", IsTemporary: true}
 			}
 			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 			if err == nil {
 				carriers.track(conn)
 			}
-			return conn, err
+			if err != nil {
+				return PacketEndpoint{}, err
+			}
+			return testPacketEndpointForAddress(conn, address)
 		},
 	}); err != nil {
 		t.Fatal(err)

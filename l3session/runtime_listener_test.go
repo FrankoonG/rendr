@@ -122,7 +122,7 @@ func TestRuntimePacketListenerL3IdentityCapabilityIsLocalFact(t *testing.T) {
 			}
 			listener, err := serverRuntime.Listen(rendr.ListenConfig{
 				AcceptL3Identity: accept,
-				Packets:          []rendr.PacketSource{{Name: "udpflow", Carrier: rendr.CarrierUDP, Conn: raw}},
+				Packets:          []rendr.PacketSource{{Name: "udpflow", Carrier: rendr.CarrierUDP, Conn: raw, MaxDatagramSize: 1400}},
 			})
 			if err != nil {
 				_ = raw.Close()
@@ -225,9 +225,10 @@ func newTestPacketSessionListener(t *testing.T, sourceName string) *rendr.Sessio
 		t.Fatal(err)
 	}
 	listener, err := runtime.Listen(rendr.ListenConfig{AcceptL3Identity: true, Packets: []rendr.PacketSource{{
-		Name:    sourceName,
-		Carrier: rendr.CarrierUDP,
-		Conn:    rawPacketConn,
+		Name:            sourceName,
+		Carrier:         rendr.CarrierUDP,
+		Conn:            rawPacketConn,
+		MaxDatagramSize: 1400,
 	}}})
 	if err != nil {
 		_ = rawPacketConn.Close()

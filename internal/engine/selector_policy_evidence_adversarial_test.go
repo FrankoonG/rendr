@@ -157,9 +157,7 @@ func TestPeakDecisionRejectsCapturedEvidenceThatExpiresBeforeCommit(t *testing.T
 	var clock atomic.Int64
 	start := time.Unix(1_000, 0)
 	clock.Store(start.UnixNano())
-	previousNow := nowFn
-	nowFn = func() time.Time { return time.Unix(0, clock.Load()) }
-	t.Cleanup(func() { nowFn = previousNow })
+	installEngineNowForTest(t, func() time.Time { return time.Unix(0, clock.Load()) })
 	e, _, selector, normal, _, paths, _ := policyEvidencePeakFixture(t, "captured-at")
 
 	e.pathsMu.RLock()
@@ -211,9 +209,7 @@ func TestPolicyCommitRechecksEvidenceFreshnessAtPublication(t *testing.T) {
 	var clock atomic.Int64
 	start := time.Now()
 	clock.Store(start.UnixNano())
-	previousNow := nowFn
-	nowFn = func() time.Time { return time.Unix(0, clock.Load()) }
-	t.Cleanup(func() { nowFn = previousNow })
+	installEngineNowForTest(t, func() time.Time { return time.Unix(0, clock.Load()) })
 	e, recorder, selector, normal, peak, _, _ := policyEvidencePeakFixture(t, "final-evidence")
 
 	prepare := policyTxUnitPrepare(e, 0xb5, 0, selector.ID, peak.ID)
@@ -370,8 +366,8 @@ func TestExplicitPeakCommitRejectsEndpointGenerationChangedByAdmission(t *testin
 
 	commit := policyTxUnitCommit(t, prepare, prepared.ack.Generation, prepared.ack.ReservationID)
 	final := policyTxUnitRequireAck(t, recorder, func() error { return e.handlePolicyCommit(commit) })
-	if final.ack.Code == proto.PolicyAckCodeAccept {
-		t.Fatalf("explicit peak COMMIT crossed endpoint generation: %+v", final.ack)
+	if final.ack.Code != proto.PolicyAckCodeStale {
+		t.Fatalf("explicit peak COMMIT endpoint-generation ACK=%+v, want stale", final.ack)
 	}
 }
 

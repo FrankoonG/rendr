@@ -1,6 +1,11 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/FrankoonG/rendr/proto"
+)
 
 // Sentinel errors the engine surfaces upward. The top-level rendr
 // package re-exports these as rendr.ErrMigrationBudgetExceeded etc.
@@ -19,6 +24,7 @@ var (
 	ErrPathAdmissionOutcomeUnknown     = errors.New("rendr: path admission outcome is unknown")
 	ErrPathAdmissionRejected           = errors.New("rendr: path admission rejected")
 	ErrSequenceExhausted               = errors.New("rendr: frame sequence space exhausted")
+	ErrSelectorStateEpochExhausted     = errors.New("rendr: selector state epoch space exhausted")
 	errPathAdmissionRouteChanged       = errors.New("engine: path admission route changed")
 	errPolicySelectionLeafMobilityHeld = errors.New("engine: selector branch is held by leaf mobility")
 
@@ -32,6 +38,11 @@ var (
 	// preserves boundaries 1-to-1, so it rejects instead of fragmenting.
 	ErrPacketTooLarge = errors.New("rendr: packet exceeds session payload budget")
 
+	// ErrPacketPathCapacityUnavailable is returned when packet admission cannot
+	// obtain a positive complete-frame capacity from transport.PacketPathConn.
+	// Unknown capacity is never interpreted as unlimited.
+	ErrPacketPathCapacityUnavailable = errors.New("rendr: packet path frame capacity is unavailable")
+
 	// ErrStreamHalfCloseUnsupported is returned when a directional stream FIN
 	// is requested for a packet session.
 	ErrStreamHalfCloseUnsupported = errors.New("rendr: stream half-close is unavailable in packet mode")
@@ -41,3 +52,35 @@ var (
 	// buffer would otherwise grow without limit.
 	ErrRecvWindowExceeded = errors.New("rendr: receive reorder window exceeded")
 )
+
+// PolicyRejectionError preserves the peer's wire-level policy rejection.
+// Unwrap keeps errors.Is(err, ErrPolicyRejected) compatible for callers that
+// do not need to distinguish retryable transaction races from final rejects.
+type PolicyRejectionError struct {
+	Phase  proto.PolicyAckPhase
+	Code   proto.PolicyAckCode
+	Reason string
+}
+
+func (e *PolicyRejectionError) Error() string {
+	return fmt.Sprintf("%v (phase=%d code=%d): %s", ErrPolicyRejected, e.Phase, e.Code, e.Reason)
+}
+
+func (e *PolicyRejectionError) Unwrap() error {
+	return ErrPolicyRejected
+}
+
+// IsRetryablePolicyRejection reports whether a fresh transaction may resolve
+// the peer state represented by err. An explicit Reject is terminal.
+func IsRetryablePolicyRejection(err error) bool {
+	var rejection *PolicyRejectionError
+	if !errors.As(err, &rejection) {
+		return false
+	}
+	switch rejection.Code {
+	case proto.PolicyAckCodeBusy, proto.PolicyAckCodeStale, proto.PolicyAckCodeSuperseded:
+		return true
+	default:
+		return false
+	}
+}

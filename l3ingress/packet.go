@@ -188,16 +188,33 @@ func parseIPv6(packet []byte) (PacketMeta, error) {
 func fillPorts(packet []byte, meta *PacketMeta, off int) error {
 	switch meta.Identity.Proto {
 	case ProtocolTCP:
-		if len(packet) < off+14 {
-			return parseErr(ReasonShortPacket, "tcp header flags")
+		if len(packet) < off+20 {
+			return parseErr(ReasonShortPacket, fmt.Sprintf("tcp header need=20 have=%d", len(packet)-off))
+		}
+		headerLen := int(packet[off+12]>>4) * 4
+		if headerLen < 20 {
+			return parseErr(ReasonInvalidHeader, fmt.Sprintf("tcp data offset=%d", headerLen))
+		}
+		if len(packet) < off+headerLen {
+			return parseErr(ReasonShortPacket, fmt.Sprintf("tcp header need=%d have=%d", headerLen, len(packet)-off))
 		}
 		meta.Identity.SrcPort = binary.BigEndian.Uint16(packet[off : off+2])
 		meta.Identity.DstPort = binary.BigEndian.Uint16(packet[off+2 : off+4])
 		meta.TCPFlags = packet[off+13]
 		return nil
 	case ProtocolUDP:
-		if len(packet) < off+4 {
-			return parseErr(ReasonShortPacket, fmt.Sprintf("%s header ports", meta.Identity.Proto))
+		if len(packet) < off+8 {
+			return parseErr(ReasonShortPacket, fmt.Sprintf("udp header need=8 have=%d", len(packet)-off))
+		}
+		udpLen := int(binary.BigEndian.Uint16(packet[off+4 : off+6]))
+		if udpLen < 8 {
+			return parseErr(ReasonInvalidHeader, fmt.Sprintf("udp length=%d", udpLen))
+		}
+		if len(packet) < off+udpLen {
+			return parseErr(ReasonShortPacket, fmt.Sprintf("udp length=%d have=%d", udpLen, len(packet)-off))
+		}
+		if udpLen != len(packet)-off {
+			return parseErr(ReasonInvalidHeader, fmt.Sprintf("udp length=%d ip payload=%d", udpLen, len(packet)-off))
 		}
 		meta.Identity.SrcPort = binary.BigEndian.Uint16(packet[off : off+2])
 		meta.Identity.DstPort = binary.BigEndian.Uint16(packet[off+2 : off+4])

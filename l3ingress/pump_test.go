@@ -529,6 +529,41 @@ func TestPumpRequiresDeviceAndHandler(t *testing.T) {
 	}
 }
 
+func TestPumpRejectsUndersizedTransportHeadersBeforeFlowAdmission(t *testing.T) {
+	packets := [][]byte{
+		undersizedTransportPacket(4, ProtocolTCP, 19),
+		undersizedTransportPacket(4, ProtocolUDP, 7),
+		undersizedTransportPacket(6, ProtocolTCP, 19),
+		undersizedTransportPacket(6, ProtocolUDP, 7),
+	}
+	var routerCalls int
+	var handlerCalls int
+	table := NewFlowTable(func(context.Context, FlowMeta) (FlowDecision, error) {
+		routerCalls++
+		return FlowDecision{}, nil
+	}, FlowTableOptions{})
+	pump := &Pump{
+		Device:    &fakeDevice{packets: packets},
+		FlowTable: table,
+		Handler: PacketHandlerFunc(func(context.Context, PacketEvent) error {
+			handlerCalls++
+			return nil
+		}),
+	}
+	if err := pump.Run(context.Background()); err != nil {
+		t.Fatalf("Run error=%v", err)
+	}
+	if routerCalls != 0 {
+		t.Fatalf("router calls=%d want 0", routerCalls)
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("handler calls=%d want 0", handlerCalls)
+	}
+	if snapshots := table.Snapshots(); len(snapshots) != 0 {
+		t.Fatalf("flow snapshots=%d want 0", len(snapshots))
+	}
+}
+
 func TestPumpCancelsContextReaderWithoutClosingDevice(t *testing.T) {
 	device := &contextDevice{started: make(chan struct{})}
 	pump := &Pump{

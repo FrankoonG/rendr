@@ -20,6 +20,8 @@ type packetPipelinePath struct {
 	data    atomic.Uint64
 }
 
+func (p *packetPipelinePath) MaxFrameSize() int { return testPacketFrameSize(p.PathConn) }
+
 func (p *packetPipelinePath) Write(frame []byte) (int, error) {
 	if len(frame) >= proto.HeaderSize {
 		header, err := proto.DecodeHeader(frame[:proto.HeaderSize])

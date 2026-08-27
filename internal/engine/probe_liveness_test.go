@@ -145,6 +145,98 @@ func TestProbeWithoutFirstReplyBecomesHardStaleWithinG4Budget(t *testing.T) {
 	}
 }
 
+func TestProbeTokenRolloverDoesNotInheritHistoricalFreshness(t *testing.T) {
+	tests := []struct {
+		name     string
+		rollover func(*Engine, *pathSlot)
+	}{
+		{
+			name: "TX fence epoch",
+			rollover: func(_ *Engine, slot *pathSlot) {
+				slot.txFenceEpoch.Add(1)
+			},
+		},
+		{
+			name: "migration epoch",
+			rollover: func(e *Engine, _ *pathSlot) {
+				e.migrationEpoch.Add(1)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: time.Second}.Clamp())
+			t.Cleanup(func() { _ = e.Close() })
+			slot := &pathSlot{id: 40, owner: 400, migrationEpochSource: &e.migrationEpoch}
+			generation := pathProbeGenerationForSlot(slot)
+			oldSuccess := time.Unix(10_000, 0)
+			slot.probeEvidence.Store(&pathProbeEvidence{
+				generation: generation, fenceEpoch: slot.txFenceEpoch.Load(), fenceTracked: true,
+				migrationEpoch: e.migrationEpoch.Load(), migrationTracked: true,
+				firstIssued: oldSuccess.Add(-time.Second), lastIssued: oldSuccess,
+				lastSuccess: oldSuccess, lastWireTimeout: oldSuccess.Add(-time.Millisecond),
+				lastLifecycle: pathProbeWriteCommitted, lastTransition: oldSuccess,
+				quality: transport.PathQuality{RTT: 10 * time.Millisecond, At: oldSuccess},
+				issued:  4, succeeded: 3, timedOut: 1,
+			})
+
+			test.rollover(e, slot)
+			committedAt := oldSuccess.Add(time.Hour)
+			observation := pathProbeObservation{
+				slot: slot, generation: generation,
+				fenceEpoch:         slot.txFenceEpoch.Load(),
+				wireMigrationEpoch: e.migrationEpoch.Load(), wireProgressTracked: true,
+				lifecycle: pathProbeWriteCommitted, writeCommittedAt: committedAt,
+				quality: transport.PathQuality{RTT: 20 * time.Millisecond, At: committedAt},
+			}
+			e.probeMu.Lock()
+			e.recordPathProbeIssuedLocked(observation)
+			e.probeMu.Unlock()
+
+			evidence, ok := slot.probeSnapshot()
+			if !ok {
+				t.Fatal("new probe token evidence was unavailable")
+			}
+			if evidence.issued != 5 || evidence.succeeded != 3 || evidence.timedOut != 1 {
+				t.Fatalf("cumulative diagnostics=%+v want issued/succeeded/timedOut 5/3/1", evidence)
+			}
+			if state := slot.probeLiveness(committedAt.Add(time.Millisecond), e.limits.ProbeInterval); state != qualityStateUnknown {
+				t.Fatalf("new unanswered token liveness=%d want unknown", state)
+			}
+			if state := selectorProbeLiveness(evidence, true, committedAt.Add(time.Millisecond), e.limits.ProbeInterval); state != qualityStateUnknown {
+				t.Fatalf("selector liveness from new unanswered token=%d want unknown", state)
+			}
+			if loss, at, known := selectorLossEvidence(
+				transport.PathQuality{}, evidence, true, committedAt.Add(time.Millisecond),
+			); known {
+				t.Fatalf("historical token produced current loss=%d at %v", loss, at)
+			}
+
+			replyAt := committedAt.Add(20 * time.Millisecond)
+			accepted := false
+			e.probeMu.Lock()
+			slot.mutateHealthEvidence(func() {
+				accepted = e.recordPathProbeSuccessLocked(observation, replyAt)
+			})
+			e.probeMu.Unlock()
+			if !accepted {
+				t.Fatal("first reply for the new probe token was rejected")
+			}
+			evidence, ok = slot.probeSnapshot()
+			if !ok || evidence.issued != 5 || evidence.succeeded != 4 || evidence.timedOut != 1 {
+				t.Fatalf("post-reply cumulative diagnostics=%+v available=%t", evidence, ok)
+			}
+			if state := slot.probeLiveness(replyAt, e.limits.ProbeInterval); state != qualityStateFresh {
+				t.Fatalf("new token liveness after first reply=%d want fresh", state)
+			}
+			loss, _, known := selectorLossEvidence(transport.PathQuality{}, evidence, true, replyAt)
+			if !known || loss != 0 {
+				t.Fatalf("new token loss after first reply=%d known=%t want 0/true", loss, known)
+			}
+		})
+	}
+}
+
 func TestProbeReplyCannotCrossEndpointGeneration(t *testing.T) {
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
 	t.Cleanup(func() { _ = e.Close() })
@@ -435,9 +527,8 @@ func TestProbeReplyQueueDoesNotBlockReaderBehindDataWrite(t *testing.T) {
 	blocked := newBlockingProbePath(base, 1)
 	slot := startProbeTestWriter(t, e, &pathSlot{id: 11, owner: 110, conn: blocked})
 	result := make(chan pathDispatchResult, 1)
-	generation := slot.dispatchNextGen.Add(1)
 	if !slot.submitDispatch(pathDispatchJob{
-		frame: makeProbeTestFrame(t, proto.CtrlPathProbeReply, 1), result: result, generation: generation,
+		frame: makeProbeTestFrame(t, proto.CtrlPathProbeReply, 1), result: result,
 	}) {
 		t.Fatal("submit blocking control frame")
 	}
@@ -476,10 +567,10 @@ func TestProbeReplyBeforeQueuedWriteStartsIsRejected(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
 	t.Cleanup(release)
 	result := make(chan pathDispatchResult, 1)
-	generation := slot.dispatchNextGen.Add(1)
-	if !slot.submitDispatch(pathDispatchJob{
-		frame: makeProbeTestFrame(t, proto.CtrlPathProbeReply, 4), result: result, generation: generation,
-	}) {
+	dispatchIdentity, submitted := slot.submitDispatchTracked(pathDispatchJob{
+		frame: makeProbeTestFrame(t, proto.CtrlPathProbeReply, 4), result: result,
+	})
+	if !submitted {
 		t.Fatal("submit blocking predecessor frame")
 	}
 	select {
@@ -506,7 +597,7 @@ func TestProbeReplyBeforeQueuedWriteStartsIsRejected(t *testing.T) {
 		e.probeMu.Unlock()
 		return observation.lifecycle == pathProbeQueued
 	})
-	slot.markDispatchStalled(generation)
+	slot.markDispatchStalled(dispatchIdentity)
 	blockedAt := time.Now()
 	status := e.pathProbeStatuses(blockedAt)[slot]
 	if status.lifecycle != pathProbeDataBlocked || status.failure != pathProbeFailureNone {
@@ -564,8 +655,10 @@ func TestProbeDataStarvationRequiresSameDispatchGenerationHighCount(t *testing.T
 	starvationFor := pathProbeDataStarvationFor(e.limits.ProbeInterval)
 	for dispatchGeneration := uint64(1); dispatchGeneration <= generations; dispatchGeneration++ {
 		observedAt := queuedAt.Add(time.Duration(dispatchGeneration) * starvationFor)
-		slot.dispatchStallGen.Store(dispatchGeneration)
-		slot.dispatchStalled.Store(true)
+		slot.markDispatchStalled(pathDispatchIdentity{
+			generation:     dispatchGeneration,
+			pathGeneration: generation,
+		})
 		status := e.pathProbeStatuses(observedAt)[slot]
 		if status.lifecycle != pathProbeDataBlocked || status.failure != pathProbeFailureNone {
 			t.Fatalf("generation %d initial status=%+v", dispatchGeneration, status)
@@ -592,6 +685,204 @@ func TestProbeDataStarvationRequiresSameDispatchGenerationHighCount(t *testing.T
 		t.Fatal("DATA-starvation age created wire evidence")
 	}
 
+}
+
+func TestPredecessorProbeInvalidationSnapshotsGenerationUnderProbeLock(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	slot := &pathSlot{id: 27, owner: 270}
+	predecessor := pathProbeGenerationForSlot(slot)
+	predecessorEvidence := &pathProbeEvidence{generation: predecessor, issued: 1}
+	slot.probeEvidence.Store(predecessorEvidence)
+
+	const predecessorID, successorID = uint64(0x2701), uint64(0x2702)
+	e.probeMu.Lock()
+	e.probeOutstanding[predecessorID] = pathProbeObservation{
+		generation: predecessor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	attempting := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(attempting)
+		e.probeMu.Lock()
+		e.invalidatePredecessorPathProbeEvidenceLocked(slot)
+		e.probeMu.Unlock()
+		close(done)
+	}()
+	<-attempting
+
+	// Publish a successor while the delayed cleanup is waiting for probeMu.
+	// Its generation snapshot must be taken only after that lock is acquired.
+	slot.peerMobilityEpoch.Add(1)
+	successor := pathProbeGenerationForSlot(slot)
+	successorEvidence := &pathProbeEvidence{generation: successor, issued: 1}
+	e.probeOutstanding[successorID] = pathProbeObservation{
+		generation: successor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	slot.probeEvidence.Store(successorEvidence)
+	e.probeMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delayed predecessor cleanup did not finish")
+	}
+	e.probeMu.Lock()
+	_, predecessorPresent := e.probeOutstanding[predecessorID]
+	observedSuccessor, successorPresent := e.probeOutstanding[successorID]
+	e.probeMu.Unlock()
+	if predecessorPresent {
+		t.Fatal("predecessor observation survived delayed cleanup")
+	}
+	if !successorPresent || observedSuccessor.generation != successor {
+		t.Fatalf("successor observation was erased: %+v present=%t", observedSuccessor, successorPresent)
+	}
+	if got := slot.probeEvidence.Load(); got != successorEvidence {
+		t.Fatalf("successor evidence was erased: %p want %p", got, successorEvidence)
+	}
+}
+
+func TestProbeDataStarvationDoesNotCrossPeerMobilityGeneration(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	slot := &pathSlot{id: 28, owner: 280}
+	predecessor := pathProbeGenerationForSlot(slot)
+	queuedAt := time.Unix(7_000, 0)
+	const predecessorID, successorID = uint64(0x2801), uint64(0x2802)
+
+	predecessorDispatch := pathDispatchIdentity{
+		generation:     slot.nextDispatchGeneration(),
+		pathGeneration: predecessor,
+	}
+	slot.markDispatchStalled(predecessorDispatch)
+	e.probeMu.Lock()
+	e.probeOutstanding[predecessorID] = pathProbeObservation{
+		queuedAt: queuedAt, generation: predecessor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	e.probeMu.Unlock()
+	blockedAt := queuedAt.Add(time.Millisecond)
+	if status := e.pathProbeStatuses(blockedAt)[slot]; status.lifecycle != pathProbeDataBlocked {
+		t.Fatalf("predecessor initial stall status=%+v", status)
+	}
+	starvationFor := pathProbeDataStarvationFor(e.limits.ProbeInterval)
+	if status := e.pathProbeStatuses(blockedAt.Add(starvationFor))[slot]; status.failure != pathProbeFailureDataStarved {
+		t.Fatalf("predecessor stall did not become factual failure: %+v", status)
+	}
+
+	slot.peerMobilityEpoch.Add(1)
+	successor := pathProbeGenerationForSlot(slot)
+	e.invalidatePredecessorPathProbeEvidence(slot)
+	if got, ok := slot.currentDispatchStall(); !ok || got != predecessorDispatch {
+		t.Fatalf("route commit changed physical custody got=%+v present=%t want=%+v",
+			got, ok, predecessorDispatch)
+	}
+
+	e.probeMu.Lock()
+	_, predecessorPresent := e.probeOutstanding[predecessorID]
+	outstandingAfterCleanup := len(e.probeOutstanding)
+	e.probeOutstanding[successorID] = pathProbeObservation{
+		queuedAt: blockedAt, generation: successor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	e.probeMu.Unlock()
+	if predecessorPresent {
+		t.Fatal("predecessor probe remained authoritative after peer mobility commit")
+	}
+	if outstandingAfterCleanup != 0 {
+		t.Fatalf("predecessor cleanup retained %d non-wire probe states", outstandingAfterCleanup)
+	}
+
+	farPastStarvation := blockedAt.Add(100 * starvationFor)
+	if status := e.pathProbeStatuses(farPastStarvation)[slot]; status.lifecycle != pathProbeQueued || status.failure != pathProbeFailureNone {
+		t.Fatalf("predecessor custody became successor probe failure: %+v", status)
+	}
+	e.probeMu.Lock()
+	ignored := e.probeOutstanding[successorID]
+	e.probeMu.Unlock()
+	if ignored.dataStallGeneration != 0 || !ignored.dataBlockedAt.IsZero() {
+		t.Fatalf("successor probe aged against predecessor custody: %+v", ignored)
+	}
+	if got, ok := slot.currentDispatchStall(); !ok || got != predecessorDispatch {
+		t.Fatal("probe classification cleared predecessor physical custody")
+	}
+
+	slot.completeDispatch(predecessorDispatch)
+	if status := e.pathProbeStatuses(farPastStarvation.Add(time.Millisecond))[slot]; status.lifecycle != pathProbeQueued || status.failure != pathProbeFailureNone {
+		t.Fatalf("successor probe did not remain queued after predecessor completion: %+v", status)
+	}
+
+	successorDispatch := pathDispatchIdentity{
+		generation:     slot.nextDispatchGeneration(),
+		pathGeneration: successor,
+	}
+	slot.markDispatchStalled(successorDispatch)
+	successorBlockedAt := farPastStarvation.Add(time.Second)
+	if status := e.pathProbeStatuses(successorBlockedAt)[slot]; status.lifecycle != pathProbeDataBlocked {
+		t.Fatalf("genuine successor stall initial status=%+v", status)
+	}
+	if status := e.pathProbeStatuses(successorBlockedAt.Add(starvationFor))[slot]; status.lifecycle != pathProbeDataStarved || status.failure != pathProbeFailureDataStarved {
+		t.Fatalf("genuine successor stall did not produce failure: %+v", status)
+	}
+}
+
+func TestSuccessorDispatchStallBeforePredecessorCleanupIsClassifiable(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{ProbeInterval: 10 * time.Millisecond}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	slot := &pathSlot{id: 29, owner: 290, dispatchQ: make(chan pathDispatchJob, 1)}
+	predecessor := pathProbeGenerationForSlot(slot)
+	const predecessorID, successorID = uint64(0x2901), uint64(0x2902)
+	queuedAt := time.Unix(8_000, 0)
+
+	e.probeMu.Lock()
+	e.probeOutstanding[predecessorID] = pathProbeObservation{
+		queuedAt: queuedAt, generation: predecessor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	e.probeMu.Unlock()
+
+	// Model the responder ordering that triggered the adversarial finding: the
+	// peer epoch advances, successor DATA enters custody and stalls, and only
+	// then does terminal cleanup acquire probeMu.
+	slot.peerMobilityEpoch.Add(1)
+	successor := pathProbeGenerationForSlot(slot)
+	successorDispatch, submitted := slot.submitDispatchTracked(pathDispatchJob{})
+	if !submitted {
+		t.Fatal("successor dispatch was not admitted")
+	}
+	if successorDispatch.pathGeneration != successor {
+		t.Fatalf("successor dispatch generation=%+v want %+v", successorDispatch.pathGeneration, successor)
+	}
+	slot.markDispatchStalled(successorDispatch)
+	e.probeMu.Lock()
+	e.probeOutstanding[successorID] = pathProbeObservation{
+		queuedAt: queuedAt, generation: successor, slot: slot, lifecycle: pathProbeQueued,
+	}
+	e.probeMu.Unlock()
+
+	e.invalidatePredecessorPathProbeEvidence(slot)
+	e.probeMu.Lock()
+	_, predecessorPresent := e.probeOutstanding[predecessorID]
+	observedSuccessor, successorPresent := e.probeOutstanding[successorID]
+	outstandingAfterCleanup := len(e.probeOutstanding)
+	e.probeMu.Unlock()
+	if predecessorPresent || !successorPresent || observedSuccessor.generation != successor {
+		t.Fatalf("cleanup predecessor/successor presence=%t/%t successor=%+v", predecessorPresent, successorPresent, observedSuccessor)
+	}
+	if outstandingAfterCleanup != 1 {
+		t.Fatalf("cleanup retained %d probe states, want one wire successor", outstandingAfterCleanup)
+	}
+
+	blockedAt := queuedAt.Add(time.Millisecond)
+	if status := e.pathProbeStatuses(blockedAt)[slot]; status.lifecycle != pathProbeDataBlocked || status.failure != pathProbeFailureNone {
+		t.Fatalf("successor initial stall status=%+v", status)
+	}
+	starvedAt := blockedAt.Add(pathProbeDataStarvationFor(e.limits.ProbeInterval))
+	if status := e.pathProbeStatuses(starvedAt)[slot]; status.lifecycle != pathProbeDataStarved || status.failure != pathProbeFailureDataStarved {
+		t.Fatalf("successor stall was suppressed as predecessor custody: %+v", status)
+	}
+	job := <-slot.dispatchQ
+	if job.pathGeneration != successor || job.generation != successorDispatch.generation {
+		t.Fatalf("queued successor identity=(%d,%+v) want %+v", job.generation, job.pathGeneration, successorDispatch)
+	}
+	slot.completeDispatch(successorDispatch)
 }
 
 func TestProbeReplyIsRejectedBeforePhysicalWriteStarts(t *testing.T) {
@@ -852,7 +1143,7 @@ func TestCommittedProbeTimeoutAllowsRecoveryProbe(t *testing.T) {
 		publishOn := func(seq uint64, slot *pathSlot, ackAt time.Time) {
 			t.Helper()
 			reserveAckTestFrame(t, progress, seq, proto.FrameData)
-			progress.sendPublishedNext.Store(seq + 1)
+			progress.publishSendSeq(seq + 1)
 			progress.sendAckNext.Store(seq)
 			progress.sendACKProgress.Store(&sendACKProgressObservation{next: seq, at: ackAt})
 			frame := make([]byte, proto.HeaderSize+1)
@@ -977,7 +1268,7 @@ func TestCommittedProbeTimeoutAllowsRecoveryProbe(t *testing.T) {
 
 			started := time.Unix(5_000, 0)
 			reserveAckTestFrame(t, e, 0, proto.FrameData)
-			e.sendPublishedNext.Store(1)
+			e.publishSendSeq(1)
 			e.sendAckNext.Store(0)
 			slot.noteFirstDataWriteSequence(0, e.pathDataWriteToken(slot, slot.txFenceEpoch.Load()))
 			const probeID = 201

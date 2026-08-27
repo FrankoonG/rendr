@@ -276,12 +276,18 @@ func (e *Engine) activatePathAdmissionRouteContext(ctx context.Context, binding 
 // transferPathAdmissionLocked preserves a bound transaction when its
 // successor dies and a retained predecessor becomes the live route.
 func (e *Engine) transferPathAdmissionLocked(fromPathID, toPathID uint32) bool {
+	return e.transferPathAdmissionToSlotLocked(fromPathID, toPathID, e.paths[toPathID])
+}
+
+// transferPathAdmissionToSlotLocked moves transaction ownership before a
+// retained predecessor is republished in e.paths. Caller holds pathsMu, so a
+// successful transfer and the following topology commit are one transaction.
+func (e *Engine) transferPathAdmissionToSlotLocked(fromPathID, toPathID uint32, to *pathSlot) bool {
 	key, ok := e.pathAdmissionByPath[fromPathID]
 	if !ok {
 		return false
 	}
 	reservation := e.pathAdmissionByLeaf[key]
-	to := e.paths[toPathID]
 	if reservation.pathID != fromPathID || to == nil {
 		return false
 	}
@@ -336,6 +342,10 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 		e.pathsMu.Unlock()
 		return fmt.Errorf("%w: terminal source %d is outside the current transaction route", errPathAdmissionRouteChanged, source.ID)
 	}
+	if !e.transferPathAdmissionToSlotLocked(current.id, predecessor.id, predecessor) {
+		e.pathsMu.Unlock()
+		return fmt.Errorf("engine: terminal admission transaction did not follow predecessor")
+	}
 
 	e.trackPathRetirementLocked(current)
 	delete(e.paths, current.id)
@@ -347,19 +357,21 @@ func (e *Engine) promotePathAdmissionRoute(binding proto.PathAdmissionBinding, s
 	e.paths[predecessor.id] = predecessor
 	e.advancePathTopologyEpochLocked()
 	wasActive := e.activeID == current.id
+	var migrationEvent migrationEventDispatch
 	if wasActive {
 		e.activeID = predecessor.id
-		e.recordMigrationLocked()
-	}
-	if !e.transferPathAdmissionLocked(current.id, predecessor.id) {
-		e.pathsMu.Unlock()
-		return fmt.Errorf("engine: terminal admission transaction did not follow predecessor")
+		evidence := e.routeMigrationEvidenceLocked()
+		evidence.Source = migrationPathBindingForSlot(current)
+		evidence.Result = migrationPathBindingForSlot(predecessor)
+		migrationEvent = e.recordMigrationLocked(
+			current.id, predecessor.id, "admission-terminal-route", evidence,
+		)
 	}
 	e.pathsMu.Unlock()
 	e.retirePathAsync(current)
 	e.requestReplay(e.sendAckNext.Load())
 	if wasActive {
-		e.fireMigrateHooks(current.id, predecessor.id, "admission-terminal-route")
+		e.deliverMigrationEvent(migrationEvent)
 	}
 	return nil
 }
@@ -490,6 +502,7 @@ func (e *Engine) CompletePathAdmission(pathID uint32) {
 		return
 	}
 	retired := e.releasePathPredecessorsLocked(pathID, successor.gen)
+	e.confirmPacketPathCapacityRetirementsLocked(retired)
 	e.releasePathAdmissionLocked(pathID)
 	e.pathsMu.Unlock()
 	e.retirePathSet(retired)
@@ -525,6 +538,7 @@ func (e *Engine) completePathAdmissionBinding(binding proto.PathAdmissionBinding
 	var retired []*pathSlot
 	if !retainPredecessors || len(e.pathPredecessors[pathID]) == 0 {
 		retired = e.releasePathPredecessorsLocked(pathID, successor.gen)
+		e.confirmPacketPathCapacityRetirementsLocked(retired)
 	} else {
 		// The responder keeps predecessors RX/control-capable for terminal
 		// replay, but local successor death alone is not peer proof that the
@@ -634,10 +648,11 @@ func (e *Engine) rememberCompletedPathAdmissionLocked(slot *pathSlot, binding pr
 }
 
 type completedPathAdmissionPromotion struct {
-	retired   *pathSlot
-	oldPathID uint32
-	newPathID uint32
-	migrated  bool
+	retired        *pathSlot
+	oldPathID      uint32
+	newPathID      uint32
+	migrated       bool
+	migrationEvent migrationEventDispatch
 }
 
 // promoteCompletedPathAdmissionRouteLocked validates and, when required,
@@ -684,13 +699,20 @@ func (e *Engine) promoteCompletedPathAdmissionRouteLocked(entry *completedPathAd
 	e.paths[predecessor.id] = predecessor
 	e.advancePathTopologyEpochLocked()
 	wasActive := e.activeID == current.id
+	var migrationEvent migrationEventDispatch
 	if wasActive {
 		e.activeID = predecessor.id
-		e.recordMigrationLocked()
+		evidence := e.routeMigrationEvidenceLocked()
+		evidence.Source = migrationPathBindingForSlot(current)
+		evidence.Result = migrationPathBindingForSlot(predecessor)
+		migrationEvent = e.recordMigrationLocked(
+			current.id, predecessor.id, "admission-terminal-replay-route", evidence,
+		)
 	}
 	entry.successor = source
 	return completedPathAdmissionPromotion{
 		retired: current, oldPathID: current.id, newPathID: predecessor.id, migrated: wasActive,
+		migrationEvent: migrationEvent,
 	}, true
 }
 
@@ -701,7 +723,7 @@ func (e *Engine) finishCompletedPathAdmissionPromotion(promotion completedPathAd
 	e.retirePathAsync(promotion.retired)
 	e.requestReplay(e.sendAckNext.Load())
 	if promotion.migrated {
-		e.fireMigrateHooks(promotion.oldPathID, promotion.newPathID, "admission-terminal-replay-route")
+		e.deliverMigrationEvent(promotion.migrationEvent)
 	}
 }
 

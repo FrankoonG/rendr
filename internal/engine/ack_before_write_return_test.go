@@ -138,9 +138,8 @@ func TestApplicationWriteCompletesOnAckBeforePathWriteReturns(t *testing.T) {
 	}
 
 	time.Sleep(client.executionStallWindowForSlot(slot) + 25*time.Millisecond)
-	if slot.dispatchStalled.Load() || slot.dispatchStallGen.Load() != 0 {
-		t.Fatalf("ACK-completed dispatch was marked stalled: stalled=%t generation=%d",
-			slot.dispatchStalled.Load(), slot.dispatchStallGen.Load())
+	if stall, ok := slot.currentDispatchStall(); ok {
+		t.Fatalf("ACK-completed dispatch was marked stalled: %+v", stall)
 	}
 	select {
 	case <-blocked.returned:

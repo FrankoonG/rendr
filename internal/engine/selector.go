@@ -82,23 +82,33 @@ func (p *selector) evaluateRecursive(e *Engine, runtime *executionRuntime) {
 
 func (p *selector) recursiveDecisions(e *Engine, runtime *executionRuntime) ([]selectorDecision, time.Time) {
 	policy := e.selectorEvidencePolicy()
-	view, ok := e.selectorEvidenceSnapshot()
-	if !ok {
-		return nil, time.Time{}
+	var decisions []selectorDecision
+	var evaluatedAt time.Time
+	for _, selectorID := range runtime.selectorIDs() {
+		view, ok := e.selectorEvidenceSnapshotForSelector(runtime, selectorID)
+		if !ok {
+			continue
+		}
+		selectorDecisions := runtime.selectorDecisionFor(
+			selectorID,
+			senderDirection(e.side),
+			view.observations,
+			view.attached,
+			view.capturedAt,
+			policy,
+			e.limits.SelectorDwell,
+			e.limits.SelectorCooldown,
+		)
+		for i := range selectorDecisions {
+			selectorDecisions[i].topologyEpoch = view.topologyEpoch
+			selectorDecisions[i].evidence = view.commitEvidenceForSelector(
+				runtime.plan, selectorID, selectorDecisions[i].selectorState,
+			)
+		}
+		decisions = append(decisions, selectorDecisions...)
+		evaluatedAt = view.capturedAt
 	}
-	decisions := runtime.selectorDecisions(
-		senderDirection(e.side),
-		view.observations,
-		view.capturedAt,
-		policy,
-		e.limits.SelectorDwell,
-		e.limits.SelectorCooldown,
-	)
-	for i := range decisions {
-		decisions[i].topologyEpoch = view.topologyEpoch
-		decisions[i].evidence = view.commitEvidence()
-	}
-	return decisions, view.capturedAt
+	return decisions, evaluatedAt
 }
 
 func (e *Engine) selectorEvidencePolicy() selectorEvidencePolicy {
@@ -163,11 +173,11 @@ func (e *Engine) rankLocalSelectorClass(
 	if runtime == nil {
 		return nil, selectorEvidenceView{}, errExecutionRuntimeNotConfigured
 	}
-	view, ok := e.selectorEvidenceSnapshot()
+	view, ok := e.selectorEvidenceSnapshotForSelector(runtime, selectorID)
 	if !ok {
 		return nil, selectorEvidenceView{}, fmt.Errorf("%w: evidence changed during snapshot", ErrSelectorDecisionUnavailable)
 	}
-	ranked := runtime.rankSelectorClassTargetsWithAdmission(
+	ranked, state := runtime.rankSelectorClassTargetsWithAdmissionAtState(
 		selectorID,
 		peak,
 		senderDirection(e.side),
@@ -177,6 +187,7 @@ func (e *Engine) rankLocalSelectorClass(
 		peakTransferAdmission,
 		excluded,
 	)
+	view.selectorState = state
 	return ranked, view, nil
 }
 
@@ -202,7 +213,8 @@ func (e *Engine) SelectBestLocalPeakTransferTarget(
 	}
 	targetID := ranked[0]
 	if err := e.selectLocalTargetCommittedAtEvidence(
-		selectorID, targetID, cause, policySelectionPeakPromote, view.commitEvidence(), nil,
+		selectorID, targetID, cause, policySelectionPeakPromote,
+		e.selectorEvidenceCommitFor(view, selectorID), nil,
 	); err != nil {
 		return proto.TargetID{}, err
 	}
@@ -225,9 +237,13 @@ func (e *Engine) SelectBestLocalPeakTransferNormalTarget(
 			ErrSelectorDecisionUnavailable,
 		)
 	}
+	if hook := e.peakTransferDecisionBeforeCommit; hook != nil {
+		hook()
+	}
 	targetID := ranked[0]
 	if err := e.selectLocalTargetCommittedAtEvidence(
-		selectorID, targetID, cause, policySelectionPeakReturn, view.commitEvidence(), nil,
+		selectorID, targetID, cause, policySelectionPeakReturn,
+		e.selectorEvidenceCommitFor(view, selectorID), nil,
 	); err != nil {
 		return proto.TargetID{}, err
 	}
@@ -341,12 +357,11 @@ func (e *Engine) PeerTargetTiming(targetID proto.TargetID) (rtt, jitter time.Dur
 		}
 	}
 	e.pathsMu.RUnlock()
-	qualities := observePathQualities(slots, selectorQualityObservationBudget)
+	_ = observePathQualities(slots, selectorQualityObservationBudget)
 	now := nowFn()
 	for _, slot := range slots {
-		quality := qualities[slot]
-		if quality.RTT <= 0 || quality.At.IsZero() ||
-			now.Sub(quality.At) > selectorProbeFreshFor(e.limits.ProbeInterval, quality) {
+		quality := slot.latestSchedulingQuality(now, e.limits.ProbeInterval)
+		if quality.RTT <= 0 {
 			continue
 		}
 		if !ok || 4*quality.RTT+2*quality.Jitter > 4*rtt+2*jitter {
@@ -382,7 +397,10 @@ func (p *selector) applyRecursiveDecisionsWithReplay(
 		}
 		evidence := decision.evidence
 		if !evidence.bound() && decision.topologyEpoch != 0 {
-			evidence = selectorEvidenceCommit{topologyEpoch: decision.topologyEpoch}
+			evidence = selectorEvidenceCommit{
+				topologyEpoch: decision.topologyEpoch,
+				selectorState: decision.selectorState,
+			}
 		}
 		err := e.selectLocalTargetCommittedAtEvidence(
 			decision.selectorID,
@@ -404,4 +422,25 @@ func (p *selector) applyRecursiveDecisionsWithReplay(
 		}
 	}
 	return pathDeathApplied
+}
+
+const selectorPathDeathAlignmentAttempts = 8
+
+func (p *selector) reconcilePathDeathProjection(
+	e *Engine,
+	runtime *executionRuntime,
+	replayPathDeath bool,
+) bool {
+	applied := false
+	for attempt := 0; attempt < selectorPathDeathAlignmentAttempts; attempt++ {
+		decisions, now := e.pathDeathAlignmentDecisions(runtime)
+		if len(decisions) == 0 {
+			return applied
+		}
+		if p.applyRecursiveDecisionsWithReplay(e, runtime, decisions, now, replayPathDeath) {
+			applied = true
+			replayPathDeath = false
+		}
+	}
+	return applied
 }

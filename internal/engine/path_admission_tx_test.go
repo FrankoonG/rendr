@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +50,192 @@ func TestBridgeAdmissionRejectionIsNotProtocolViolation(t *testing.T) {
 	if got := len(server.Paths()); got != 1 {
 		t.Fatalf("rejected bridge published server path: %v", server.Paths())
 	}
+	t.Run("adopted validation rejection reports engine ownership", testClientAdmissionAdoptedRejectionOwnership)
+	t.Run("pre-adoption cancellation retains caller cleanup", testClientAdmissionPreAdoptionCancellationOwnership)
+	t.Run("post-adoption cancellation retains engine cleanup", testClientAdmissionPostAdoptionCancellationOwnership)
+}
+
+func newClientAdmissionOwnershipEngine(t *testing.T) (*Engine, proto.TargetID, proto.InstanceID) {
+	t.Helper()
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	ids := configureLeafSelectorRuntime(t, e, "a")
+	e.SetLocalInstanceID(proto.InstanceID{1})
+	peerInstance := proto.InstanceID{2}
+	if err := e.SetPeerInstanceID(peerInstance); err != nil {
+		t.Fatal(err)
+	}
+	return e, ids["a"], peerInstance
+}
+
+func testClientAdmissionPreAdoptionCancellationOwnership(t *testing.T) {
+	client, _, _ := newClientAdmissionOwnershipEngine(t)
+	base, peer := newMemoryPathPair()
+	path := &cleanupCapacityPath{PathConn: base}
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = peer.Close()
+	})
+	proposalSeen := make(chan struct{})
+	go func() {
+		_, _, _ = ReadFirstFrame(peer)
+		close(proposalSeen)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	admission, err := PerformClientBridgeAdmissionContext(ctx, path, client, "a", transport.PathSpec{Transport: "memory"})
+	if !errors.Is(err, context.DeadlineExceeded) || admission.EngineOwnsPath {
+		t.Fatalf("pre-adoption cancellation error/ownership=%v/%t", err, admission.EngineOwnsPath)
+	}
+	select {
+	case <-proposalSeen:
+	case <-time.After(time.Second):
+		t.Fatal("bridge proposal was not received")
+	}
+	if got := path.closed.Load(); got != 0 {
+		t.Fatalf("admission helper closed caller-owned path %d times", got)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := path.closed.Load(); got != 1 {
+		t.Fatalf("caller cleanup calls=%d want=1", got)
+	}
+}
+
+func testClientAdmissionPostAdoptionCancellationOwnership(t *testing.T) {
+	client, targetID, peerInstance := newClientAdmissionOwnershipEngine(t)
+	base, peer := newMemoryPathPair()
+	path := &cleanupCapacityPath{PathConn: base}
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = peer.Close()
+	})
+	peerDone := make(chan error, 1)
+	go func() {
+		hdr, proposal, err := ReadFirstFrame(peer)
+		if err == nil {
+			err = validateAdmissionHeader(hdr, proto.CtrlBridgeTag)
+		}
+		var tag proto.BridgeTagPayload
+		if err == nil {
+			tag, err = proto.DecodeBridgeTag(proposal)
+		}
+		if err == nil {
+			err = PerformBridgeAckForTarget(peer, tag, peerInstance, targetID, proto.AckOK, "")
+		}
+		peerDone <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	admission, err := PerformClientBridgeAdmissionContext(ctx, path, client, "a", transport.PathSpec{Transport: "memory"})
+	if !errors.Is(err, context.DeadlineExceeded) || !admission.EngineOwnsPath {
+		t.Fatalf("post-adoption cancellation error/ownership=%v/%t", err, admission.EngineOwnsPath)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatal(err)
+	}
+	eventuallyEngine(t, time.Second, func() bool { return path.closed.Load() == 1 })
+	if got := path.closed.Load(); got != 1 {
+		t.Fatalf("engine cleanup calls=%d want=1", got)
+	}
+}
+
+type rejectedClientAdmissionPath struct {
+	transport.PathConn
+	closeStarted  chan struct{}
+	closeRelease  chan struct{}
+	closeOnce     sync.Once
+	closeCalls    atomic.Int32
+	capacityCalls atomic.Int32
+}
+
+func (path *rejectedClientAdmissionPath) MaxFrameSize() int {
+	if path.capacityCalls.Add(1) == 1 {
+		return 1<<16 - 1
+	}
+	return 1
+}
+
+func (path *rejectedClientAdmissionPath) Close() error {
+	path.closeCalls.Add(1)
+	path.closeOnce.Do(func() { close(path.closeStarted) })
+	<-path.closeRelease
+	return path.PathConn.Close()
+}
+
+func testClientAdmissionAdoptedRejectionOwnership(t *testing.T) {
+	client := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	ids := configureLeafSelectorRuntime(t, client, "a")
+	client.SetPacketMode()
+	client.SetLocalInstanceID(proto.InstanceID{1})
+	peerInstance := proto.InstanceID{2}
+	if err := client.SetPeerInstanceID(peerInstance); err != nil {
+		t.Fatal(err)
+	}
+	base, peer := newMemoryPathPair()
+	path := &rejectedClientAdmissionPath{
+		PathConn:     base,
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(path.closeRelease) }) }
+	t.Cleanup(func() {
+		release()
+		_ = client.Close()
+		_ = peer.Close()
+	})
+
+	peerDone := make(chan error, 1)
+	go func() {
+		hdr, proposal, err := ReadFirstFrame(peer)
+		if err == nil {
+			err = validateAdmissionHeader(hdr, proto.CtrlBridgeTag)
+		}
+		var tag proto.BridgeTagPayload
+		if err == nil {
+			tag, err = proto.DecodeBridgeTag(proposal)
+		}
+		if err == nil {
+			err = PerformBridgeAckForTarget(peer, tag, peerInstance, ids["a"], proto.AckOK, "")
+		}
+		peerDone <- err
+	}()
+	type result struct {
+		admission ClientBridgeAdmission
+		err       error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		admission, err := PerformClientBridgeAdmissionContext(
+			context.Background(), path, client, "a", transport.PathSpec{Transport: "memory"},
+		)
+		resultCh <- result{admission: admission, err: err}
+	}()
+	select {
+	case <-path.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("adopted client path cleanup did not start")
+	}
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(pathCloseTimeout + 250*time.Millisecond):
+		t.Fatal("client admission was pinned by adopted path cleanup")
+	}
+	if got.err == nil || !got.admission.EngineOwnsPath {
+		t.Fatalf("client admission error/ownership=%v/%t want non-nil/true", got.err, got.admission.EngineOwnsPath)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatal(err)
+	}
+	// This is the production caller rule: only pre-adoption errors are closed
+	// by the caller. The engine-owned callback must remain the sole closer.
+	if !got.admission.EngineOwnsPath {
+		_ = path.Close()
+	}
+	release()
+	eventuallyEngine(t, time.Second, func() bool { return path.closeCalls.Load() == 1 })
 }
 
 func TestBridgeAdmissionMalformedAndMismatchedAckAreProtocolFailures(t *testing.T) {
@@ -285,6 +472,9 @@ func TestHelloAdmissionPublishesBothSidesAndCarriesData(t *testing.T) {
 		clientInstance, 0, "a", transport.PathSpec{Transport: "memory"}, nil)
 	if err != nil {
 		t.Fatalf("client admission: %v", err)
+	}
+	if !admission.EngineOwnsPath {
+		t.Fatal("successful hello admission did not report engine path ownership")
 	}
 	if client.PeerInstanceID() != admission.Ack.InstanceID {
 		t.Fatal("client admission returned before publishing peer identity")
@@ -663,6 +853,9 @@ func performBridgeAdmissionPairTarget(t *testing.T, client, server *Engine, clie
 		transport.PathSpec{Transport: "memory"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !admission.EngineOwnsPath {
+		t.Fatal("successful bridge admission did not report engine path ownership")
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)

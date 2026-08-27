@@ -109,12 +109,15 @@ func TestCtrlCodeFromFlags(t *testing.T) {
 	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlLeafMobilityCommit)); got != CtrlLeafMobilityCommit {
 		t.Fatalf("leaf_mobility_commit round-trip: got %v want %v", got, CtrlLeafMobilityCommit)
 	}
+	if got := CtrlCodeFromFlags(FlagsForCtrl(CtrlSelectorState)); got != CtrlSelectorState {
+		t.Fatalf("selector_state round-trip: got %v want %v", got, CtrlSelectorState)
+	}
 }
 
 func TestHelloRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	manifest := testGraphManifest("path")
-	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: 0xAABB_CCDD, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: 0xAABB_CCDD, InitialTargetID: manifest.RootID, ReceiveFrameCapacity: 1200, LocalTXManifest: manifest}
 	wire := mustHelloWire(t, want)
 	got, err := DecodeHello(wire)
 	if err != nil {
@@ -126,8 +129,8 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestLeafMobilityEnvelope(t *testing.T) {
-	if ProtocolMinor != 20 {
-		t.Fatalf("protocol minor=%d want=20", ProtocolMinor)
+	if ProtocolMinor != 22 {
+		t.Fatalf("protocol minor=%d want=22", ProtocolMinor)
 	}
 	if FeatureLeafMobilityEnvelope != 1<<10 || SupportedFeatures&FeatureLeafMobilityEnvelope == 0 || RequiredFeatures&FeatureLeafMobilityEnvelope == 0 {
 		t.Fatal("leaf mobility envelope feature is not stable and mandatory")
@@ -170,6 +173,12 @@ func TestLeafMobilityEnvelope(t *testing.T) {
 	}
 	if FeaturePolicySelectorGeneration != 1<<23 || SupportedFeatures&FeaturePolicySelectorGeneration == 0 || RequiredFeatures&FeaturePolicySelectorGeneration == 0 {
 		t.Fatal("policy selector-generation feature is not stable and mandatory")
+	}
+	if FeatureSelectorStateVector != 1<<24 || SupportedFeatures&FeatureSelectorStateVector == 0 || RequiredFeatures&FeatureSelectorStateVector == 0 {
+		t.Fatal("selector state vector feature is not stable and mandatory")
+	}
+	if FeatureDirectionalPacketCapacity != 1<<25 || SupportedFeatures&FeatureDirectionalPacketCapacity == 0 || RequiredFeatures&FeatureDirectionalPacketCapacity == 0 {
+		t.Fatal("directional packet capacity feature is not stable and mandatory")
 	}
 	if NegotiationSize != 80 {
 		t.Fatalf("negotiation size=%d want=80", NegotiationSize)
@@ -644,6 +653,56 @@ func TestPolicySelectorGenerationPreventsMinor19HalfNegotiation(t *testing.T) {
 	}
 }
 
+func TestSelectorStateVectorPreventsMinor20HalfNegotiation(t *testing.T) {
+	flow := [16]byte{0x83}
+	manifest := testGraphManifest("selector-state-vector-feature")
+	negotiation := testNegotiationFor(flow, manifest)
+	hello := HelloPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
+	}
+	ack := HelloAckPayload{
+		Negotiation: negotiation, FlowID: flow, InstanceID: InstanceID{1},
+		InitialTargetID:      manifest.RootID,
+		AcceptedPeerBinding:  negotiation.GraphBinding(),
+		AcceptedPeerTargetID: manifest.RootID,
+		LocalTXManifest:      manifest,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Negotiation)
+	}{
+		{name: "minor 20 with v21 feature", mutate: func(n *Negotiation) {
+			n.ProtocolMinor = 20
+		}},
+		{name: "feature unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeatureSelectorStateVector
+			n.Required &^= FeatureSelectorStateVector
+		}},
+		{name: "feature required but unsupported", mutate: func(n *Negotiation) {
+			n.Supported &^= FeatureSelectorStateVector
+		}},
+		{name: "feature not required", mutate: func(n *Negotiation) {
+			n.Required &^= FeatureSelectorStateVector
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			helloWire := mutateNegotiationWireForDecodeTest(t, mustHelloWire(t, hello), test.mutate)
+			if _, err := DecodeHello(helloWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+			ackWire := mutateNegotiationWireForDecodeTest(t, mustHelloAckWire(t, ack), test.mutate)
+			if _, err := DecodeHelloAck(ackWire); !errors.Is(err, ErrNegotiationIncompatible) {
+				t.Fatalf("HELLO_ACK error=%v want=%v", err, ErrNegotiationIncompatible)
+			}
+		})
+	}
+	if legacyV20AcceptsNegotiation(negotiation) {
+		t.Fatal("minor-20 validation accepted minor-21 selector-state negotiation")
+	}
+}
+
 func TestHigherMinorMayAdvertiseUnknownOptionalFeature(t *testing.T) {
 	flow := [16]byte{0x7b}
 	manifest := testGraphManifest("future-optional-feature")
@@ -725,6 +784,13 @@ func legacyV19AcceptsNegotiation(n Negotiation) bool {
 	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 19 &&
 		n.Required&^legacyV19FeatureMask == 0 && n.Required&^n.Supported == 0 &&
 		legacyV19FeatureMask&^n.Supported == 0
+}
+
+func legacyV20AcceptsNegotiation(n Negotiation) bool {
+	const legacyV20FeatureMask FeatureSet = 0xffffff
+	return n.ProtocolMajor == 1 && n.ProtocolMinor >= 20 &&
+		n.Required&^legacyV20FeatureMask == 0 && n.Required&^n.Supported == 0 &&
+		legacyV20FeatureMask&^n.Supported == 0
 }
 
 func TestServerAssignedSessionEpochIsMandatoryOnCurrentMinor(t *testing.T) {
@@ -863,7 +929,7 @@ func TestLeafMobilityEnvelopeRoundTripAndEncodeValidation(t *testing.T) {
 		InitialTargetID: manifest.RootID, LocalTXManifest: manifest,
 	}
 	helloWire := mustHelloWire(t, hello)
-	wantPrefix, err := hex.DecodeString("00010014000500040000000000ffffff0000000000ffffff")
+	wantPrefix, err := hex.DecodeString("00010016000500040000000003ffffff0000000003ffffff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -984,14 +1050,16 @@ func TestBridgeTagRoundTrip(t *testing.T) {
 func TestHelloAckRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	want := HelloAckPayload{
-		Negotiation:          testNegotiation(flow),
-		FlowID:               flow,
-		InstanceID:           InstanceID{5, 6, 7, 8},
-		Caps:                 0xAABB_CCDD,
-		InitialTargetID:      testGraphManifest("path").RootID,
-		AcceptedPeerBinding:  GraphBinding{Revision: 1, Digest: testNegotiation(flow).GraphDigest},
-		AcceptedPeerTargetID: testGraphManifest("path").RootID,
-		LocalTXManifest:      testGraphManifest("path"),
+		Negotiation:                      testNegotiation(flow),
+		FlowID:                           flow,
+		InstanceID:                       InstanceID{5, 6, 7, 8},
+		Caps:                             0xAABB_CCDD,
+		ReceiveFrameCapacity:             1200,
+		AcceptedPeerReceiveFrameCapacity: 1180,
+		InitialTargetID:                  testGraphManifest("path").RootID,
+		AcceptedPeerBinding:              GraphBinding{Revision: 1, Digest: testNegotiation(flow).GraphDigest},
+		AcceptedPeerTargetID:             testGraphManifest("path").RootID,
+		LocalTXManifest:                  testGraphManifest("path"),
 	}
 	wire := mustHelloAckWire(t, want)
 	got, err := DecodeHelloAck(wire)
@@ -1029,7 +1097,7 @@ func TestBridgeAckRoundTrip(t *testing.T) {
 func TestHelloPathNameRoundTrip(t *testing.T) {
 	flow := [16]byte{1, 2, 3, 4}
 	manifest := testGraphManifest("A")
-	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: CapsPacketMode, InitialTargetID: manifest.RootID, LocalTXManifest: manifest}
+	want := HelloPayload{Negotiation: testNegotiationFor(flow, manifest), FlowID: flow, InstanceID: InstanceID{1}, Caps: CapsPacketMode, InitialTargetID: manifest.RootID, ReceiveFrameCapacity: 1200, LocalTXManifest: manifest}
 	wire := mustHelloWire(t, want)
 	got, err := DecodeHello(wire)
 	if err != nil {
@@ -1254,6 +1322,7 @@ func TestCtrlCodeStability(t *testing.T) {
 		{CtrlLeafMobilityAck, 0x13},
 		{CtrlLeafMobilityCommit, 0x14},
 		{CtrlStreamFin, 0x15},
+		{CtrlSelectorState, 0x16},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -1392,6 +1461,7 @@ func TestBridgeTagWireStability(t *testing.T) {
 		0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
 		0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
 		0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
+		0x00, 0x00, 0x00, 0x00,
 	}
 	if !bytes.Equal(p.Encode(), want) {
 		t.Fatalf("bridge_tag wire drift:\n got=%x\nwant=%x", p.Encode(), want)
@@ -1472,7 +1542,7 @@ func TestHelloWireStability(t *testing.T) {
 		0x01, 0x02, 0x03, 0x04,
 	}
 	var err error
-	want, err = hex.DecodeString("00010014000000000000000000ffffff0000000000ffffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e0190000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
+	want, err = hex.DecodeString("00010016000000000000000003ffffff0000000003ffffff00112233445566778899aabbccddeeff0000000000000001d74e06a99ea594a5106805da30032ef33e038536aad785038229b47bc8e6c31600112233445566778899aabbccddeeff101112131415161718191a1b1c1d1e1f01020304143288a952e5b7a301f4c23d0b09e019000000000000003452474d4601000001143288a952e5b7a301f4c23d0b09e019143288a952e5b7a301f4c23d0b09e019010400000000000070617468")
 	if err != nil {
 		t.Fatal(err)
 	}

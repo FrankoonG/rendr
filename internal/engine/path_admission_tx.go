@@ -17,13 +17,15 @@ const (
 )
 
 type ClientHelloAdmission struct {
-	Ack    proto.HelloAckPayload
-	PathID uint32
+	Ack            proto.HelloAckPayload
+	PathID         uint32
+	EngineOwnsPath bool
 }
 
 type ClientBridgeAdmission struct {
-	Ack    proto.BridgeAckPayload
-	PathID uint32
+	Ack            proto.BridgeAckPayload
+	PathID         uint32
+	EngineOwnsPath bool
 }
 
 // ClientHelloAckValidator applies caller-owned session requirements after the
@@ -50,16 +52,24 @@ func PerformClientHelloAdmissionContext(
 	if err != nil {
 		return ClientHelloAdmission{}, err
 	}
+	localReceiveCapacity, err := e.InspectPacketPathFrameCapacity(pc)
+	if err != nil {
+		return ClientHelloAdmission{}, err
+	}
 	hello := proto.HelloPayload{
-		Negotiation:     e.LocalNegotiation(),
-		FlowID:          e.FlowID(),
-		InstanceID:      instanceID,
-		Caps:            caps,
-		InitialTargetID: localTargetID,
-		LocalTXManifest: e.LocalGraphManifest(),
+		Negotiation:          e.LocalNegotiation(),
+		FlowID:               e.FlowID(),
+		InstanceID:           instanceID,
+		Caps:                 caps,
+		InitialTargetID:      localTargetID,
+		ReceiveFrameCapacity: localReceiveCapacity,
+		LocalTXManifest:      e.LocalGraphManifest(),
 	}
 	proposalWire, err := hello.Encode()
 	if err != nil {
+		return ClientHelloAdmission{}, err
+	}
+	if err := validatePacketHandshakeFrame(proto.CtrlHello, proposalWire, localReceiveCapacity); err != nil {
 		return ClientHelloAdmission{}, err
 	}
 	responseWire, err := sendProposalReadResponse(ctx, pc, proto.CtrlHello, proposalWire, proto.CtrlHelloAck)
@@ -72,6 +82,9 @@ func PerformClientHelloAdmissionContext(
 	}
 	if err := validateClientHelloAck(e, hello, ack); err != nil {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
+	}
+	if err := validatePacketHandshakeFrame(proto.CtrlHelloAck, responseWire, localReceiveCapacity, ack.ReceiveFrameCapacity); err != nil {
+		return ClientHelloAdmission{}, err
 	}
 	if peerPacket := ack.Caps&proto.CapsPacketMode != 0; peerPacket != (caps&proto.CapsPacketMode != 0) {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: peer session kind mismatch: packet=%t", ErrPeerProtocol, peerPacket)
@@ -94,12 +107,15 @@ func PerformClientHelloAdmissionContext(
 	if err := e.installPeerInstanceID(ack.InstanceID); err != nil {
 		return ClientHelloAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
-	pathID, err := e.PreparePathBound(pc, spec, PathBinding{
-		LocalTXTargetID: localTargetID,
-		PeerTXTargetID:  ack.InitialTargetID,
+	pathID, adopted, err := e.PreparePathBoundWithOwnership(pc, spec, PathBinding{
+		LocalTXTargetID:           localTargetID,
+		PeerTXTargetID:            ack.InitialTargetID,
+		LocalReceiveFrameCapacity: localReceiveCapacity,
+		PeerReceiveFrameCapacity:  ack.ReceiveFrameCapacity,
 	})
+	admission := ClientHelloAdmission{EngineOwnsPath: adopted}
 	if err != nil {
-		return ClientHelloAdmission{}, err
+		return admission, err
 	}
 	success := false
 	commitSent := false
@@ -118,18 +134,20 @@ func PerformClientHelloAdmissionContext(
 		hello.GraphRevision, hello.GraphDigest, hello.InitialTargetID, ack.InitialTargetID,
 		proposalWire, responseWire, proto.CtrlHello, proto.CtrlHelloAck)
 	if err != nil {
-		return ClientHelloAdmission{}, err
+		return admission, err
 	}
 	if err := e.StagePathAttach(pathID); err != nil {
-		return ClientHelloAdmission{}, err
+		return admission, err
 	}
 	commitSent = true
 	admittedPathID, err := performClientAdmission(e, pathID, commit)
 	if err != nil {
-		return ClientHelloAdmission{}, pathAdmissionOutcomeUnknown(err)
+		return admission, pathAdmissionOutcomeUnknown(err)
 	}
 	success = true
-	return ClientHelloAdmission{Ack: ack, PathID: admittedPathID}, nil
+	admission.Ack = ack
+	admission.PathID = admittedPathID
+	return admission, nil
 }
 
 func PerformClientBridgeAdmissionContext(
@@ -148,8 +166,15 @@ func PerformClientBridgeAdmissionContext(
 	if err != nil {
 		return ClientBridgeAdmission{}, err
 	}
-	tag := newBridgeTagPayload(e, localTargetID)
+	localReceiveCapacity, err := e.InspectPacketPathFrameCapacity(pc)
+	if err != nil {
+		return ClientBridgeAdmission{}, err
+	}
+	tag := newBridgeTagPayload(e, localTargetID, localReceiveCapacity)
 	proposalWire := tag.Encode()
+	if err := validatePacketHandshakeFrame(proto.CtrlBridgeTag, proposalWire, localReceiveCapacity); err != nil {
+		return ClientBridgeAdmission{}, err
+	}
 	responseWire, err := sendProposalReadResponse(ctx, pc, proto.CtrlBridgeTag, proposalWire, proto.CtrlBridgeAck)
 	if err != nil {
 		return ClientBridgeAdmission{}, err
@@ -164,12 +189,18 @@ func PerformClientBridgeAdmissionContext(
 	if err := validateClientBridgeAck(e, tag, ack); err != nil {
 		return ClientBridgeAdmission{}, fmt.Errorf("%w: %v", ErrPeerProtocol, err)
 	}
-	pathID, err := e.PreparePathBound(pc, spec, PathBinding{
-		LocalTXTargetID: localTargetID,
-		PeerTXTargetID:  ack.ResponderTargetID,
-	})
-	if err != nil {
+	if err := validatePacketHandshakeFrame(proto.CtrlBridgeAck, responseWire, localReceiveCapacity, ack.ReceiveFrameCapacity); err != nil {
 		return ClientBridgeAdmission{}, err
+	}
+	pathID, adopted, err := e.PreparePathBoundWithOwnership(pc, spec, PathBinding{
+		LocalTXTargetID:           localTargetID,
+		PeerTXTargetID:            ack.ResponderTargetID,
+		LocalReceiveFrameCapacity: localReceiveCapacity,
+		PeerReceiveFrameCapacity:  ack.ReceiveFrameCapacity,
+	})
+	admission := ClientBridgeAdmission{EngineOwnsPath: adopted}
+	if err != nil {
+		return admission, err
 	}
 	success := false
 	commitSent := false
@@ -188,18 +219,20 @@ func PerformClientBridgeAdmissionContext(
 		tag.GraphRevision, tag.GraphDigest, tag.TargetID, ack.ResponderTargetID,
 		proposalWire, responseWire, proto.CtrlBridgeTag, proto.CtrlBridgeAck)
 	if err != nil {
-		return ClientBridgeAdmission{}, err
+		return admission, err
 	}
 	if err := e.StagePathAttach(pathID); err != nil {
-		return ClientBridgeAdmission{}, err
+		return admission, err
 	}
 	commitSent = true
 	admittedPathID, err := performClientAdmission(e, pathID, commit)
 	if err != nil {
-		return ClientBridgeAdmission{}, pathAdmissionOutcomeUnknown(err)
+		return admission, pathAdmissionOutcomeUnknown(err)
 	}
 	success = true
-	return ClientBridgeAdmission{Ack: ack, PathID: admittedPathID}, nil
+	admission.Ack = ack
+	admission.PathID = admittedPathID
+	return admission, nil
 }
 
 func PerformServerHelloAdmission(
@@ -213,18 +246,30 @@ func PerformServerHelloAdmission(
 	hello proto.HelloPayload,
 	proposalWire []byte,
 ) error {
+	localReceiveCapacity, peerReceiveCapacity, err := e.preparedPacketPathCapacities(pathID)
+	if err != nil {
+		return err
+	}
+	if e.Packetized() && peerReceiveCapacity != hello.ReceiveFrameCapacity {
+		return fmt.Errorf("%w: HELLO capacity %d does not match prepared peer capacity %d", ErrPeerProtocol, hello.ReceiveFrameCapacity, peerReceiveCapacity)
+	}
 	ack := proto.HelloAckPayload{
-		Negotiation:          e.LocalNegotiation(),
-		FlowID:               e.FlowID(),
-		InstanceID:           instanceID,
-		Caps:                 caps,
-		InitialTargetID:      localTargetID,
-		AcceptedPeerBinding:  proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
-		AcceptedPeerTargetID: peerTargetID,
-		LocalTXManifest:      e.LocalGraphManifest(),
+		Negotiation:                      e.LocalNegotiation(),
+		FlowID:                           e.FlowID(),
+		InstanceID:                       instanceID,
+		Caps:                             caps,
+		InitialTargetID:                  localTargetID,
+		AcceptedPeerBinding:              proto.GraphBinding{Revision: hello.GraphRevision, Digest: hello.GraphDigest},
+		AcceptedPeerTargetID:             peerTargetID,
+		ReceiveFrameCapacity:             localReceiveCapacity,
+		AcceptedPeerReceiveFrameCapacity: peerReceiveCapacity,
+		LocalTXManifest:                  e.LocalGraphManifest(),
 	}
 	responseWire, err := ack.Encode()
 	if err != nil {
+		return err
+	}
+	if err := validatePacketHandshakeFrame(proto.CtrlHelloAck, responseWire, localReceiveCapacity, peerReceiveCapacity); err != nil {
 		return err
 	}
 	return performServerAdmission(ctx, pc, e, pathID, proto.PathAdmissionKindHello,
@@ -243,19 +288,31 @@ func PerformServerBridgeAdmission(
 	tag proto.BridgeTagPayload,
 	proposalWire []byte,
 ) error {
+	localReceiveCapacity, peerReceiveCapacity, err := e.preparedPacketPathCapacities(pathID)
+	if err != nil {
+		return err
+	}
+	if e.Packetized() && peerReceiveCapacity != tag.ReceiveFrameCapacity {
+		return fmt.Errorf("%w: BRIDGE_TAG capacity %d does not match prepared peer capacity %d", ErrPeerProtocol, tag.ReceiveFrameCapacity, peerReceiveCapacity)
+	}
 	ack := proto.BridgeAckPayload{
-		BridgeID:          tag.BridgeID,
-		AttachID:          tag.AttachID,
-		InstanceID:        instanceID,
-		SessionEpoch:      tag.SessionEpoch,
-		Direction:         tag.Direction,
-		GraphRevision:     tag.GraphRevision,
-		GraphDigest:       tag.GraphDigest,
-		TargetID:          tag.TargetID,
-		ResponderTargetID: localTargetID,
-		Code:              proto.AckOK,
+		BridgeID:                         tag.BridgeID,
+		AttachID:                         tag.AttachID,
+		InstanceID:                       instanceID,
+		SessionEpoch:                     tag.SessionEpoch,
+		Direction:                        tag.Direction,
+		GraphRevision:                    tag.GraphRevision,
+		GraphDigest:                      tag.GraphDigest,
+		TargetID:                         tag.TargetID,
+		ResponderTargetID:                localTargetID,
+		ReceiveFrameCapacity:             localReceiveCapacity,
+		AcceptedPeerReceiveFrameCapacity: peerReceiveCapacity,
+		Code:                             proto.AckOK,
 	}
 	responseWire := ack.Encode()
+	if err := validatePacketHandshakeFrame(proto.CtrlBridgeAck, responseWire, localReceiveCapacity, peerReceiveCapacity); err != nil {
+		return err
+	}
 	return performServerAdmission(ctx, pc, e, pathID, proto.PathAdmissionKindBridge,
 		tag.SessionEpoch, proto.PathAdmissionID(tag.AttachID), tag.Direction,
 		tag.GraphRevision, tag.GraphDigest, tag.TargetID, localTargetID,
@@ -265,21 +322,21 @@ func PerformServerBridgeAdmission(
 func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmissionCommit) (uint32, error) {
 	deadline, err := e.beginPathAdmissionCommit(pathID, commit.PathAdmissionBinding)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: begin client admission COMMIT: %w", err)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	commitWire, err := commit.Encode()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: encode client admission COMMIT: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionCommit, commitWire); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: write client admission COMMIT: %w", err)
 	}
 	if _, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseCommitted, func() error {
 		return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionCommit, commitWire)
 	}); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: await client admission COMMITTED: %w", err)
 	}
 	confirm := proto.PathAdmissionConfirm{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -287,18 +344,18 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	}
 	confirmWire, err := confirm.Encode()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: encode client admission CONFIRM: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionConfirm, confirmWire); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: write client admission CONFIRM: %w", err)
 	}
 	if _, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseFinal, func() error {
 		return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionConfirm, confirmWire)
 	}); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: await client admission FINAL: %w", err)
 	}
 	if err := e.activatePathAdmissionRouteContext(ctx, commit.PathAdmissionBinding, true, true); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: activate client admission route: %w", err)
 	}
 	receipt := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -307,23 +364,23 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	}
 	receiptWire, err := receipt.Encode()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: encode client admission FINAL receipt: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, receiptWire); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: write client admission FINAL receipt: %w", err)
 	}
 	for {
 		activatedRoute, err := waitForAdmissionAck(ctx, e, commit, proto.PathAdmissionPhaseActivated, func() error {
 			return e.WritePathAdmissionControlBindingContext(ctx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, receiptWire)
 		})
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("engine: await client admission ACTIVATED: %w", err)
 		}
 		if err := e.promotePathAdmissionRoute(commit.PathAdmissionBinding, activatedRoute); err != nil {
 			if errors.Is(err, errPathAdmissionRouteChanged) {
 				continue
 			}
-			return 0, err
+			return 0, fmt.Errorf("engine: promote client admission route: %w", err)
 		}
 		break
 	}
@@ -335,7 +392,7 @@ func performClientAdmission(e *Engine, pathID uint32, commit proto.PathAdmission
 	// already learned that this side activated when it received FINAL, so an
 	// ACK-of-ACTIVATED would add only an unsatisfiable last-message ambiguity.
 	if err := e.completePathAdmissionBindingRoute(commit.PathAdmissionBinding, false); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("engine: complete client admission: %w", err)
 	}
 	return admittedPathID, nil
 }
@@ -362,6 +419,9 @@ func performServerAdmission(
 	postCommit := false
 	completed := false
 	defer func() {
+		if retErr != nil && debugPathDeath {
+			fmt.Printf("[rendr-engine] server path admission failed: %v\n", retErr)
+		}
 		if retErr == nil || !postCommit || completed {
 			return
 		}
@@ -371,12 +431,12 @@ func performServerAdmission(
 	}()
 	base, err := e.PathAdmissionBaseGeneration(pathID)
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: read server admission base: %w", err)
 	}
 	commit := admissionCommit(kind, epoch, admissionID, direction, revision, graphDigest,
 		initiatorTargetID, responderTargetID, base, proposalWire, responseWire)
 	if err := e.BindPathAdmission(pathID, commit.PathAdmissionBinding); err != nil {
-		return err
+		return fmt.Errorf("engine: bind server admission: %w", err)
 	}
 	prepared := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -385,7 +445,7 @@ func performServerAdmission(
 	}
 	preparedWire, err := prepared.Encode()
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: encode server admission PREPARED: %w", err)
 	}
 	writePrepared := func() error {
 		if err := writeAdmissionCtrlContext(ctx, pc, responseCode, responseWire); err != nil {
@@ -394,19 +454,19 @@ func performServerAdmission(
 		return writeAdmissionCtrlContext(ctx, pc, proto.CtrlPathAdmissionAck, preparedWire)
 	}
 	if err := writePrepared(); err != nil {
-		return err
+		return fmt.Errorf("engine: write server admission PREPARED: %w", err)
 	}
 	commitWire, err := waitRawCommit(ctx, pc, proposalCode, proposalWire, writePrepared, commit)
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: await server admission COMMIT: %w", err)
 	}
 	postCommit = true
 	deadline, err := e.beginPathAdmissionCommit(pathID, commit.PathAdmissionBinding)
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: begin server admission COMMIT: %w", err)
 	}
 	if err := e.StagePathAttach(pathID); err != nil {
-		return err
+		return fmt.Errorf("engine: stage server admission path: %w", err)
 	}
 	postCommitCtx, postCommitCancel := context.WithDeadline(context.Background(), deadline)
 	defer postCommitCancel()
@@ -417,14 +477,14 @@ func performServerAdmission(
 	}
 	committedWire, err := committed.Encode()
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: encode server admission COMMITTED: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, committedWire); err != nil {
-		return err
+		return fmt.Errorf("engine: write server admission COMMITTED: %w", err)
 	}
 	confirm, confirmWire, err := waitForAdmissionConfirm(postCommitCtx, e, commit, commitWire, committedWire)
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: await server admission CONFIRM: %w", err)
 	}
 	finalAck := proto.PathAdmissionAck{
 		PathAdmissionBinding: commit.PathAdmissionBinding,
@@ -433,20 +493,20 @@ func performServerAdmission(
 	}
 	finalWire, err := finalAck.Encode()
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: encode server admission FINAL: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, finalWire); err != nil {
-		return err
+		return fmt.Errorf("engine: write server admission FINAL: %w", err)
 	}
 	activatedRoute := false
 	for {
 		receiptRoute, err := waitForFinalReceipt(postCommitCtx, e, commit, confirm, confirmWire, finalWire)
 		if err != nil {
-			return err
+			return fmt.Errorf("engine: await server admission FINAL receipt: %w", err)
 		}
 		if !activatedRoute {
 			if err := e.activatePathAdmissionRouteContext(postCommitCtx, commit.PathAdmissionBinding, true, true); err != nil {
-				return err
+				return fmt.Errorf("engine: activate server admission route: %w", err)
 			}
 			activatedRoute = true
 		}
@@ -454,7 +514,7 @@ func performServerAdmission(
 			if errors.Is(err, errPathAdmissionRouteChanged) {
 				continue
 			}
-			return err
+			return fmt.Errorf("engine: promote server admission route: %w", err)
 		}
 		break
 	}
@@ -465,20 +525,20 @@ func performServerAdmission(
 	}
 	activatedWire, err := activated.Encode()
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: encode server admission ACTIVATED: %w", err)
 	}
 	// Install the replay response before releasing the live reservation. If
 	// ACTIVATED is lost after a successful local write, the initiator retries
 	// its byte-identical FINAL receipt and the completed path replays the same
 	// terminal proof.
 	if err := e.rememberCompletedPathAdmissionRoute(commit.PathAdmissionBinding, proto.PathAdmissionPhaseFinal, activatedWire); err != nil {
-		return err
+		return fmt.Errorf("engine: remember server admission terminal replay: %w", err)
 	}
 	if err := e.WritePathAdmissionControlBindingContext(postCommitCtx, commit.PathAdmissionBinding, proto.CtrlPathAdmissionAck, activatedWire); err != nil {
-		return err
+		return fmt.Errorf("engine: write server admission ACTIVATED: %w", err)
 	}
 	if err := e.completePathAdmissionBindingRoute(commit.PathAdmissionBinding, true); err != nil {
-		return err
+		return fmt.Errorf("engine: complete server admission: %w", err)
 	}
 	completed = true
 	return nil
@@ -763,6 +823,16 @@ func validateClientHelloAck(e *Engine, hello proto.HelloPayload, ack proto.Hello
 	if ack.AcceptedPeerTargetID != hello.InitialTargetID {
 		return fmt.Errorf("engine: HELLO_ACK accepted a different local target")
 	}
+	if err := ack.ValidatePeerReceiveFrameCapacity(hello.ReceiveFrameCapacity); err != nil {
+		return err
+	}
+	if e.Packetized() {
+		if err := e.validatePacketFrameCapacity(int(ack.ReceiveFrameCapacity)); err != nil {
+			return fmt.Errorf("peer receive capacity: %w", err)
+		}
+	} else if ack.ReceiveFrameCapacity != 0 || ack.AcceptedPeerReceiveFrameCapacity != 0 {
+		return fmt.Errorf("engine: stream HELLO_ACK declares packet capacity")
+	}
 	return nil
 }
 
@@ -778,6 +848,14 @@ func validateClientBridgeAck(e *Engine, tag proto.BridgeTagPayload, ack proto.Br
 	if _, err := e.PeerPathName(ack.ResponderTargetID); err != nil {
 		return fmt.Errorf("engine: BRIDGE_ACK responder target: %w", err)
 	}
+	if err := ack.ValidatePacketCapacities(e.Packetized(), tag.ReceiveFrameCapacity); err != nil {
+		return err
+	}
+	if e.Packetized() {
+		if err := e.validatePacketFrameCapacity(int(ack.ReceiveFrameCapacity)); err != nil {
+			return fmt.Errorf("peer receive capacity: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -788,31 +866,13 @@ type rawAdmissionResult struct {
 }
 
 func writeAdmissionCtrlContext(ctx context.Context, pc transport.PathConn, code proto.CtrlCode, payload []byte) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result := make(chan error, 1)
-	go func() {
-		result <- writeCtrl(pc, code, 0, payload, 0)
-	}()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		select {
-		case err := <-result:
-			return err
-		default:
-		}
-		go func() { _ = pc.Close() }()
-		return ctx.Err()
-	}
+	return writeCtrlContext(ctx, pc, code, 0, payload, 0)
 }
 
 func readRawAdmission(ctx context.Context, pc transport.PathConn, resend func() error) (proto.Header, []byte, error) {
 	result := make(chan rawAdmissionResult, 1)
 	go func() {
-		hdr, payload, err := ReadFirstFrame(pc)
+		hdr, payload, err := readFirstFrameContext(ctx, pc)
 		result <- rawAdmissionResult{hdr: hdr, payload: payload, err: err}
 	}()
 	ticker := time.NewTicker(pathAdmissionRetryInterval)
@@ -824,12 +884,10 @@ func readRawAdmission(ctx context.Context, pc transport.PathConn, resend func() 
 		case <-ticker.C:
 			if resend != nil {
 				if err := resend(); err != nil {
-					_ = pc.Close()
 					return proto.Header{}, nil, err
 				}
 			}
 		case <-ctx.Done():
-			_ = pc.Close()
 			return proto.Header{}, nil, ctx.Err()
 		}
 	}

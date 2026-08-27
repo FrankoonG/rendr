@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -425,15 +426,15 @@ func waitGatewayStreamControl(
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if session, ok := gateway.manager.Session(id); ok && session.Conn != nil {
-			if admin, ok := session.Conn.(gatewayStreamControl); ok && len(admin.Paths()) >= wantPaths {
+		if session, ok := gateway.manager.Session(id); ok && session.Conn() != nil {
+			if admin, ok := session.Conn().(gatewayStreamControl); ok && len(admin.Paths()) >= wantPaths {
 				return admin
 			}
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if session, ok := gateway.manager.Session(id); ok && session.Conn != nil {
-		t.Fatalf("TUN TCP flow has %d paths, want %d", len(session.Conn.Paths()), wantPaths)
+	if session, ok := gateway.manager.Session(id); ok && session.Conn() != nil {
+		t.Fatalf("TUN TCP flow has %d paths, want %d", len(session.Conn().Paths()), wantPaths)
 	}
 	t.Fatalf("TUN TCP flow %s did not start", id)
 	return nil
@@ -513,6 +514,104 @@ func TestGatewayConcurrentRunCloseDoesNotDeadlock(t *testing.T) {
 			t.Fatalf("attempt %d: Close blocked", attempt)
 		}
 		_ = device.Close()
+	}
+}
+
+func TestGatewayRunClosePublicationRaceCleansOwnedResourcesExactlyOnce(t *testing.T) {
+	gateway, device := newIdleGateway(t)
+	defer device.Close()
+
+	type teardownCounts struct {
+		link, udp, manager, stackClose, stackWait atomic.Int32
+	}
+	var counts teardownCounts
+	original := gateway.teardownOps
+	gateway.teardownOps = gatewayTeardownOps{
+		closeLink: func() {
+			counts.link.Add(1)
+			original.closeLink()
+		},
+		closeUDP: func() error {
+			counts.udp.Add(1)
+			return original.closeUDP()
+		},
+		closeManager: func() error {
+			counts.manager.Add(1)
+			return original.closeManager()
+		},
+		closeStack: func() {
+			counts.stackClose.Add(1)
+			original.closeStack()
+		},
+		waitStack: func() {
+			counts.stackWait.Add(1)
+			original.waitStack()
+		},
+	}
+
+	// Hold publication after Run marks itself started. Close then observes a
+	// started gateway before Run has published cancel, reproducing the exact
+	// lifecycle window that previously skipped every owned-resource cleanup.
+	gateway.runMu.Lock()
+	runMuLocked := true
+	defer func() {
+		if runMuLocked {
+			gateway.runMu.Unlock()
+		}
+	}()
+	runDone := make(chan error, 1)
+	go func() { runDone <- gateway.Run(context.Background()) }()
+	waitGatewayAtomicState(t, &gateway.started, true, "Run did not publish started")
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- gateway.Close() }()
+	waitGatewayAtomicState(t, &gateway.closed, true, "Close did not publish closed")
+	if gateway.cancel != nil {
+		t.Fatal("Run published cancel before the forced lifecycle boundary")
+	}
+	gateway.runMu.Unlock()
+	runMuLocked = false
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Run error = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run blocked at the forced Close interleaving")
+	}
+	select {
+	case err := <-closeDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Close error = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked at the forced Run interleaving")
+	}
+	if err := gateway.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("repeated Close error = %v, want net.ErrClosed", err)
+	}
+
+	for name, got := range map[string]int32{
+		"link close":      counts.link.Load(),
+		"UDP relay":       counts.udp.Load(),
+		"session manager": counts.manager.Load(),
+		"stack close":     counts.stackClose.Load(),
+		"stack wait":      counts.stackWait.Load(),
+	} {
+		if got != 1 {
+			t.Errorf("%s cleanup calls = %d, want 1", name, got)
+		}
+	}
+}
+
+func waitGatewayAtomicState(t *testing.T, state *atomic.Bool, want bool, failure string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for state.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatal(failure)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -766,7 +865,7 @@ func testGatewayUDPFlow(t *testing.T, id l3ingress.L3Identity) {
 	}
 	listener, err := serverRuntime.Listen(rendr.ListenConfig{
 		AcceptL3Identity: true,
-		Packets:          []rendr.PacketSource{{Name: "udpflow", Carrier: rendr.CarrierUDP, Conn: rawPacketConn}},
+		Packets:          []rendr.PacketSource{{Name: "udpflow", Carrier: rendr.CarrierUDP, Conn: rawPacketConn, MaxDatagramSize: 1400}},
 	})
 	if err != nil {
 		_ = rawPacketConn.Close()
@@ -927,15 +1026,15 @@ func waitGatewayPacketControl(
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if session, ok := gateway.manager.Session(id); ok && session.PacketConn != nil {
-			if admin, ok := session.PacketConn.(gatewayPacketControl); ok && len(admin.Paths()) >= wantPaths {
+		if session, ok := gateway.manager.Session(id); ok && session.PacketConn() != nil {
+			if admin, ok := session.PacketConn().(gatewayPacketControl); ok && len(admin.Paths()) >= wantPaths {
 				return admin
 			}
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if session, ok := gateway.manager.Session(id); ok && session.PacketConn != nil {
-		t.Fatalf("TUN UDP flow has %d paths, want %d", len(session.PacketConn.Paths()), wantPaths)
+	if session, ok := gateway.manager.Session(id); ok && session.PacketConn() != nil {
+		t.Fatalf("TUN UDP flow has %d paths, want %d", len(session.PacketConn().Paths()), wantPaths)
 	}
 	t.Fatalf("TUN UDP flow %s did not start", id)
 	return nil

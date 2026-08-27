@@ -17,6 +17,7 @@ type pathProbeGeneration struct {
 	path               PathRef
 	routeGeneration    uint64
 	endpointGeneration uint64
+	peerMobilityEpoch  uint64
 }
 
 type pathProbeLifecycle uint8
@@ -78,21 +79,42 @@ type pathProbeObservation struct {
 // and in-Write time never enter wire liveness or RTT evidence. Transport-owned
 // fields, including loss, remain live through PathConn.Quality.
 type pathProbeEvidence struct {
-	generation       pathProbeGeneration
-	fenceEpoch       uint64
-	fenceTracked     bool
-	migrationEpoch   uint64
-	migrationTracked bool
-	firstIssued      time.Time
-	lastIssued       time.Time
-	lastSuccess      time.Time
-	lastWireTimeout  time.Time
-	lastLifecycle    pathProbeLifecycle
-	lastTransition   time.Time
-	quality          transport.PathQuality
-	issued           uint64
-	succeeded        uint64
-	timedOut         uint64
+	generation        pathProbeGeneration
+	fenceEpoch        uint64
+	fenceTracked      bool
+	migrationEpoch    uint64
+	migrationTracked  bool
+	tokenStatsTracked bool
+	firstIssued       time.Time
+	lastIssued        time.Time
+	lastSuccess       time.Time
+	lastWireTimeout   time.Time
+	lastLifecycle     pathProbeLifecycle
+	lastTransition    time.Time
+	quality           transport.PathQuality
+	issued            uint64
+	succeeded         uint64
+	timedOut          uint64
+	tokenIssued       uint64
+	tokenSucceeded    uint64
+	tokenTimedOut     uint64
+}
+
+func (e pathProbeEvidence) currentTokenCounters() (issued, succeeded, timedOut uint64) {
+	if e.tokenStatsTracked {
+		return e.tokenIssued, e.tokenSucceeded, e.tokenTimedOut
+	}
+	return e.issued, e.succeeded, e.timedOut
+}
+
+func (e *pathProbeEvidence) trackCurrentTokenCounters() {
+	if e == nil || e.tokenStatsTracked {
+		return
+	}
+	e.tokenIssued = e.issued
+	e.tokenSucceeded = e.succeeded
+	e.tokenTimedOut = e.timedOut
+	e.tokenStatsTracked = true
 }
 
 func (lifecycle pathProbeLifecycle) blocksNextProbeWrite() bool {
@@ -104,6 +126,33 @@ func (lifecycle pathProbeLifecycle) blocksNextProbeWrite() bool {
 	}
 }
 
+func pathProbeLifecycleCarriesHealthFact(lifecycle pathProbeLifecycle) bool {
+	switch lifecycle {
+	case pathProbeDataBlocked, pathProbeDataStarved, pathProbeWriteStalled, pathProbeWireTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// mutatePathProbeLifecycleLocked runs while probeMu owns the observation.
+// The shared commit gate and per-slot lock remain held until mutate has
+// published the complete lifecycle transition.
+func (e *Engine) mutatePathProbeLifecycleLocked(
+	slot *pathSlot,
+	before, after pathProbeLifecycle,
+	mutate func(),
+) {
+	if slot == nil || before == after ||
+		(!pathProbeLifecycleCarriesHealthFact(before) && !pathProbeLifecycleCarriesHealthFact(after)) {
+		if mutate != nil {
+			mutate()
+		}
+		return
+	}
+	slot.mutateHealthEvidence(mutate)
+}
+
 func pathProbeGenerationForSlot(slot *pathSlot) pathProbeGeneration {
 	if slot == nil {
 		return pathProbeGeneration{}
@@ -112,6 +161,7 @@ func pathProbeGenerationForSlot(slot *pathSlot) pathProbeGeneration {
 		path:               pathRefForSlot(slot),
 		routeGeneration:    slot.routeGeneration.Load(),
 		endpointGeneration: slot.probeEndpointGen.Load(),
+		peerMobilityEpoch:  slot.peerMobilityEpoch.Load(),
 	}
 }
 
@@ -171,11 +221,12 @@ func pathProbeEvidenceMatchesObservation(evidence *pathProbeEvidence, observatio
 
 func (slot *pathSlot) probeLiveness(now time.Time, interval time.Duration) qualityState {
 	evidence, ok := slot.probeSnapshot()
-	if !ok || evidence.issued == 0 || evidence.firstIssued.IsZero() {
+	issued, succeeded, _ := evidence.currentTokenCounters()
+	if !ok || issued == 0 || evidence.firstIssued.IsZero() {
 		return qualityStateUnknown
 	}
 	base := evidence.firstIssued
-	if evidence.succeeded > 0 && !evidence.lastSuccess.IsZero() {
+	if succeeded > 0 && !evidence.lastSuccess.IsZero() {
 		base = evidence.lastSuccess
 	}
 	// Age alone is not path-failure evidence. A queued probe may be waiting
@@ -186,7 +237,7 @@ func (slot *pathSlot) probeLiveness(now time.Time, interval time.Duration) quali
 		now.Sub(base) > selectorProbeFreshFor(interval, evidence.quality) {
 		return qualityStateStale
 	}
-	if evidence.succeeded > 0 && now.Sub(base) <= selectorProbeFreshFor(interval, evidence.quality) {
+	if succeeded > 0 && now.Sub(base) <= selectorProbeFreshFor(interval, evidence.quality) {
 		return qualityStateFresh
 	}
 	return qualityStateUnknown
@@ -199,7 +250,8 @@ func (e *Engine) issuePathProbe(slot *pathSlot) {
 	queuedAt := nowFn()
 	generation := pathProbeGenerationForSlot(slot)
 	fenceEpoch := slot.txFenceEpoch.Load()
-	quality := observePathQualities([]*pathSlot{slot}, selectorQualityObservationBudget)[slot]
+	adapterQuality := observePathQualities([]*pathSlot{slot}, selectorQualityObservationBudget)[slot]
+	quality := slot.probeTimingQuality(adapterQuality, queuedAt, e.limits.ProbeInterval)
 	e.probeMu.Lock()
 	e.expirePathProbesLocked(queuedAt)
 	if e.closing.Load() || e.isClosed() {
@@ -356,6 +408,13 @@ func (e *Engine) startPathProbeWrite(
 	permitCancel := slot.startProbeWriterLocked()
 	slot.probeControlMu.Unlock()
 	go func() {
+		callbackGuard := pathDispatchCallbackGuard{}
+		defer func() {
+			if callbackErr := callbackGuard.goexitError(); callbackErr != nil {
+				e.completePathProbeWrite(id, slot, callbackErr, nowFn())
+				e.failPathProbeControlWrite(slot, callbackErr)
+			}
+		}()
 		defer slot.finishProbeWriter()
 		select {
 		case <-ready:
@@ -369,7 +428,7 @@ func (e *Engine) startPathProbeWrite(
 		if hook := slot.probeBeforeWritePermit; hook != nil {
 			hook()
 		}
-		n, err := slot.writeProbeFrame(frame, fenceEpoch, permitCancel, func() bool {
+		n, err := slot.writeProbeFrame(frame, fenceEpoch, permitCancel, &callbackGuard, func() bool {
 			return e.markPathProbeWriteStarted(id, slot, time.Time{})
 		})
 		if err == nil && n != len(frame) {
@@ -387,6 +446,7 @@ func (slot *pathSlot) writeProbeFrame(
 	frame []byte,
 	fenceEpoch uint64,
 	permitCancel <-chan struct{},
+	callbackGuard *pathDispatchCallbackGuard,
 	onWriteStart func() bool,
 ) (int, error) {
 	if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch {
@@ -414,7 +474,7 @@ func (slot *pathSlot) writeProbeFrame(
 	if onWriteStart != nil && !onWriteStart() {
 		return 0, ErrPathTXFenced
 	}
-	return slot.writeFrameOwned(frame)
+	return slot.writeFrameOwnedGuarded(frame, callbackGuard)
 }
 
 func (slot *pathSlot) acquireProbeWrite(ctx context.Context, permitCancel <-chan struct{}) error {
@@ -465,6 +525,7 @@ func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started ti
 	if started.Before(observation.queuedAt) {
 		started = observation.queuedAt
 	}
+	previousLifecycle := observation.lifecycle
 	observation.lifecycle = pathProbeWriteStarted
 	observation.writeStartedAt = started
 	observation.writeStallDeadline = started.Add(pathProbeWriteStallFor(started, observation.quality))
@@ -478,7 +539,9 @@ func (e *Engine) markPathProbeWriteStarted(id uint64, slot *pathSlot, started ti
 		observation.wireMigrationEpoch = baseline.migrationEpoch
 		observation.wireProgressTracked = true
 	}
-	e.probeOutstanding[id] = observation
+	e.mutatePathProbeLifecycleLocked(slot, previousLifecycle, observation.lifecycle, func() {
+		e.probeOutstanding[id] = observation
+	})
 	return true
 }
 
@@ -490,12 +553,16 @@ func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr erro
 		return
 	}
 	if writeErr != nil || !e.pathProbeObservationCurrent(observation) {
-		delete(e.probeOutstanding, id)
+		e.mutatePathProbeLifecycleLocked(slot, observation.lifecycle, pathProbeReserved, func() {
+			delete(e.probeOutstanding, id)
+		})
 		e.probeMu.Unlock()
 		return
 	}
 	if observation.lifecycle != pathProbeWriteStarted && observation.lifecycle != pathProbeWriteStalled {
-		delete(e.probeOutstanding, id)
+		e.mutatePathProbeLifecycleLocked(slot, observation.lifecycle, pathProbeReserved, func() {
+			delete(e.probeOutstanding, id)
+		})
 		e.probeMu.Unlock()
 		return
 	}
@@ -509,27 +576,31 @@ func (e *Engine) completePathProbeWrite(id uint64, slot *pathSlot, writeErr erro
 	if observation.deadline.After(maximumDeadline) {
 		observation.deadline = maximumDeadline
 	}
-	e.recordPathProbeIssuedLocked(observation)
-	switch {
-	case !observation.pendingReplyAt.IsZero() && !observation.pendingReplyAt.After(observation.deadline):
-		delete(e.probeOutstanding, id)
-		e.recordPathProbeSuccessLocked(observation, observation.pendingReplyAt)
-	case !observation.pendingReplyAt.IsZero():
-		delete(e.probeOutstanding, id)
-		e.recordPathProbeTimeoutLocked(observation, observation.pendingReplyAt)
-	case !completed.Before(observation.deadline):
-		delete(e.probeOutstanding, id)
-		e.recordPathProbeTimeoutLocked(observation, completed)
-	default:
-		e.probeOutstanding[id] = observation
-	}
+	slot.mutateHealthEvidence(func() {
+		e.recordPathProbeIssuedLocked(observation)
+		switch {
+		case !observation.pendingReplyAt.IsZero() && !observation.pendingReplyAt.After(observation.deadline):
+			delete(e.probeOutstanding, id)
+			e.recordPathProbeSuccessLocked(observation, observation.pendingReplyAt)
+		case !observation.pendingReplyAt.IsZero():
+			delete(e.probeOutstanding, id)
+			e.recordPathProbeTimeoutLocked(observation, observation.pendingReplyAt)
+		case !completed.Before(observation.deadline):
+			delete(e.probeOutstanding, id)
+			e.recordPathProbeTimeoutLocked(observation, completed)
+		default:
+			e.probeOutstanding[id] = observation
+		}
+	})
 	e.probeMu.Unlock()
 }
 
 func (e *Engine) cancelPathProbeReservation(id uint64, slot *pathSlot) {
 	e.probeMu.Lock()
 	if observation, ok := e.probeOutstanding[id]; ok && observation.slot == slot {
-		delete(e.probeOutstanding, id)
+		e.mutatePathProbeLifecycleLocked(slot, observation.lifecycle, pathProbeReserved, func() {
+			delete(e.probeOutstanding, id)
+		})
 	}
 	e.probeMu.Unlock()
 }
@@ -565,7 +636,23 @@ func (e *Engine) submitPathProbeControl(
 }
 
 func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct{}) {
-	defer slot.finishProbeWriter()
+	callbackGuard := pathDispatchCallbackGuard{}
+	writePermitHeld := false
+	defer func() {
+		if writePermitHeld {
+			slot.releaseWrite()
+		}
+		slot.finishProbeWriter()
+		if callbackErr := callbackGuard.goexitError(); callbackErr != nil {
+			slot.probeControlMu.Lock()
+			slot.probeReplyPending = nil
+			slot.probeReplyGeneration = pathProbeGeneration{}
+			slot.probeReplyFenceEpoch = 0
+			slot.probeReplyRunning = false
+			slot.probeControlMu.Unlock()
+			e.failPathProbeControlWrite(slot, callbackErr)
+		}
+	}()
 	for {
 		if hook := slot.probeBeforeWritePermit; hook != nil {
 			hook()
@@ -579,8 +666,10 @@ func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct
 			slot.probeControlMu.Unlock()
 			return
 		}
+		writePermitHeld = true
 		if !slot.txEnabled.Load() {
 			slot.releaseWrite()
+			writePermitHeld = false
 			slot.probeControlMu.Lock()
 			slot.probeReplyPending = nil
 			slot.probeReplyGeneration = pathProbeGeneration{}
@@ -599,6 +688,7 @@ func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct
 			slot.probeReplyRunning = false
 			slot.probeControlMu.Unlock()
 			slot.releaseWrite()
+			writePermitHeld = false
 			return
 		}
 		frame := append([]byte(nil), slot.probeReplyPending...)
@@ -615,6 +705,7 @@ func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct
 		if !slot.txEnabled.Load() || slot.txFenceEpoch.Load() != fenceEpoch ||
 			pathProbeGenerationForSlot(slot) != generation {
 			slot.releaseWrite()
+			writePermitHeld = false
 			slot.probeControlMu.Lock()
 			slot.probeReplyPending = nil
 			slot.probeReplyGeneration = pathProbeGeneration{}
@@ -623,8 +714,9 @@ func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct
 			slot.probeControlMu.Unlock()
 			return
 		}
-		n, err := slot.writeFrameOwned(frame)
+		n, err := slot.writeFrameOwnedGuarded(frame, &callbackGuard)
 		slot.releaseWrite()
+		writePermitHeld = false
 		if err == nil && n != len(frame) {
 			err = io.ErrShortWrite
 		}
@@ -643,18 +735,7 @@ func (e *Engine) pathProbeReplyWriter(slot *pathSlot, permitCancel <-chan struct
 }
 
 func (e *Engine) failPathProbeControlWrite(slot *pathSlot, err error) {
-	if slot == nil || err == nil {
-		return
-	}
-	select {
-	case <-slot.quit:
-		return
-	case <-e.closed:
-		return
-	default:
-	}
-	e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, err)
-
+	e.failPathControlWrite(slot, err)
 }
 
 func (slot *pathSlot) closeProbeControl() {
@@ -682,6 +763,7 @@ func (e *Engine) recordPathProbeIssuedLocked(observation pathProbeObservation) {
 	if current := observation.slot.probeEvidence.Load(); current != nil && current.generation == observation.generation {
 		if observation.slot.probeEvidenceCurrent(current) {
 			evidence = *current
+			evidence.trackCurrentTokenCounters()
 		} else {
 			// Counters are lifetime diagnostics for the physical generation. Token
 			// rollover invalidates liveness timestamps, not those aggregate totals.
@@ -695,10 +777,11 @@ func (e *Engine) recordPathProbeIssuedLocked(observation pathProbeObservation) {
 	evidence.fenceTracked = true
 	evidence.migrationEpoch = observation.wireMigrationEpoch
 	evidence.migrationTracked = observation.wireProgressTracked
+	evidence.tokenStatsTracked = true
 	if evidence.firstIssued.IsZero() {
 		evidence.firstIssued = observation.writeCommittedAt
 	}
-	if evidence.succeeded == 0 {
+	if evidence.tokenSucceeded == 0 {
 		evidence.quality = transport.PathQuality{
 			RTT: observation.quality.RTT, Jitter: observation.quality.Jitter, At: observation.quality.At,
 		}
@@ -707,6 +790,7 @@ func (e *Engine) recordPathProbeIssuedLocked(observation pathProbeObservation) {
 	evidence.lastLifecycle = pathProbeWriteCommitted
 	evidence.lastTransition = observation.writeCommittedAt
 	evidence.issued++
+	evidence.tokenIssued++
 	observation.slot.probeEvidence.Store(&evidence)
 }
 
@@ -745,45 +829,62 @@ func pathProbeDataStarvationFor(interval time.Duration) time.Duration {
 
 // refreshPathProbeBlockStatesLocked classifies local physical-writer stalls
 // without creating wire evidence. A queued probe is data-starved only after
-// the DATA dispatcher has independently marked the permit owner stalled. A
-// probe already inside PathConn.Write has its own write-stalled state.
+// the DATA dispatcher has independently marked the permit owner stalled in the
+// same path generation. A predecessor-generation stall remains routing
+// custody, but it cannot become successor health evidence. A probe already inside
+// PathConn.Write has its own write-stalled state.
 func (e *Engine) refreshPathProbeBlockStatesLocked(now time.Time) {
 	for id, observation := range e.probeOutstanding {
 		switch observation.lifecycle {
 		case pathProbeQueued, pathProbeDataBlocked, pathProbeDataStarved:
-			stalledGeneration := uint64(0)
-			if observation.slot != nil && observation.slot.dispatchStalled.Load() {
-				stalledGeneration = observation.slot.dispatchStallGen.Load()
-			}
-			if stalledGeneration == 0 {
+			_, stall, stalled := observation.slot.healthEvidenceSnapshot()
+			if !stalled || stall.pathGeneration != observation.generation {
 				if observation.lifecycle != pathProbeQueued || observation.dataStallGeneration != 0 || !observation.dataBlockedAt.IsZero() {
+					previousLifecycle := observation.lifecycle
 					observation.lifecycle = pathProbeQueued
 					observation.dataStallGeneration = 0
 					observation.dataBlockedAt = time.Time{}
-					e.probeOutstanding[id] = observation
+					e.mutatePathProbeLifecycleLocked(observation.slot, previousLifecycle, observation.lifecycle, func() {
+						e.probeOutstanding[id] = observation
+					})
 				}
 				continue
 			}
-			if observation.dataStallGeneration != stalledGeneration {
+			if observation.dataStallGeneration != stall.generation {
+				previousLifecycle := observation.lifecycle
 				observation.lifecycle = pathProbeDataBlocked
-				observation.dataStallGeneration = stalledGeneration
+				observation.dataStallGeneration = stall.generation
 				observation.dataBlockedAt = now
-				e.probeOutstanding[id] = observation
+				if previousLifecycle == observation.lifecycle {
+					observation.slot.mutateHealthEvidence(func() {
+						e.probeOutstanding[id] = observation
+					})
+				} else {
+					e.mutatePathProbeLifecycleLocked(observation.slot, previousLifecycle, observation.lifecycle, func() {
+						e.probeOutstanding[id] = observation
+					})
+				}
 				continue
 			}
 			if observation.lifecycle == pathProbeDataStarved {
 				continue
 			}
+			previousLifecycle := observation.lifecycle
 			if now.Before(observation.dataBlockedAt.Add(pathProbeDataStarvationFor(e.limits.ProbeInterval))) {
 				observation.lifecycle = pathProbeDataBlocked
 			} else {
 				observation.lifecycle = pathProbeDataStarved
 			}
-			e.probeOutstanding[id] = observation
+			e.mutatePathProbeLifecycleLocked(observation.slot, previousLifecycle, observation.lifecycle, func() {
+				e.probeOutstanding[id] = observation
+			})
 		case pathProbeWriteStarted:
 			if !observation.writeStallDeadline.IsZero() && !now.Before(observation.writeStallDeadline) {
+				previousLifecycle := observation.lifecycle
 				observation.lifecycle = pathProbeWriteStalled
-				e.probeOutstanding[id] = observation
+				e.mutatePathProbeLifecycleLocked(observation.slot, previousLifecycle, observation.lifecycle, func() {
+					e.probeOutstanding[id] = observation
+				})
 			}
 		}
 	}
@@ -946,7 +1047,9 @@ func (e *Engine) expirePathProbes(now time.Time) {
 func (e *Engine) expirePathProbesLocked(now time.Time) {
 	for id, observation := range e.probeOutstanding {
 		if !e.pathProbeObservationCurrent(observation) {
-			delete(e.probeOutstanding, id)
+			e.mutatePathProbeLifecycleLocked(observation.slot, observation.lifecycle, pathProbeReserved, func() {
+				delete(e.probeOutstanding, id)
+			})
 		}
 	}
 	e.refreshPathProbeBlockStatesLocked(now)
@@ -958,12 +1061,16 @@ func (e *Engine) expirePathProbesLocked(now time.Time) {
 			continue
 		}
 		if e.refreshCommittedProbeDeadlineForProgress(&observation, now) {
-			e.probeOutstanding[id] = observation
+			observation.slot.mutateHealthEvidence(func() {
+				e.probeOutstanding[id] = observation
+			})
 			continue
 		}
-		observation.lifecycle = pathProbeWireTimeout
-		e.recordPathProbeTimeoutLocked(observation, now)
-		delete(e.probeOutstanding, id)
+		observation.slot.mutateHealthEvidence(func() {
+			observation.lifecycle = pathProbeWireTimeout
+			e.recordPathProbeTimeoutLocked(observation, now)
+			delete(e.probeOutstanding, id)
+		})
 	}
 }
 
@@ -976,7 +1083,9 @@ func (e *Engine) recordPathProbeTimeoutLocked(observation pathProbeObservation, 
 		return
 	}
 	next := *current
+	next.trackCurrentTokenCounters()
 	next.timedOut++
+	next.tokenTimedOut++
 	next.lastWireTimeout = at
 	next.lastLifecycle = pathProbeWireTimeout
 	next.lastTransition = at
@@ -1011,8 +1120,12 @@ func (e *Engine) acceptPathProbeReply(slot *pathSlot, probe proto.ProbePayload, 
 	default:
 		return false
 	}
-	delete(e.probeOutstanding, probe.ID)
-	return e.recordPathProbeSuccessLocked(observation, now)
+	accepted := false
+	slot.mutateHealthEvidence(func() {
+		delete(e.probeOutstanding, probe.ID)
+		accepted = e.recordPathProbeSuccessLocked(observation, now)
+	})
+	return accepted
 }
 
 func (e *Engine) recordPathProbeSuccessLocked(observation pathProbeObservation, now time.Time) bool {
@@ -1048,10 +1161,12 @@ func (e *Engine) recordPathProbeSuccessLocked(observation pathProbeObservation, 
 		jitter = (jitter*3 + delta) / 4
 	}
 	next := *current
+	next.trackCurrentTokenCounters()
 	next.lastSuccess = successAt
 	next.lastLifecycle = pathProbeWriteCommitted
 	next.lastTransition = successAt
 	next.succeeded++
+	next.tokenSucceeded++
 	next.quality = transport.PathQuality{RTT: rtt, Jitter: jitter, At: successAt}
 	slot.probeEvidence.Store(&next)
 	return true
@@ -1062,13 +1177,70 @@ func (e *Engine) invalidatePathProbeEvidence(slot *pathSlot) {
 		return
 	}
 	e.probeMu.Lock()
-	for id, observation := range e.probeOutstanding {
+	changed := slot.probeEvidence.Load() != nil
+	for _, observation := range e.probeOutstanding {
 		if observation.slot == slot {
-			delete(e.probeOutstanding, id)
+			changed = true
 		}
 	}
-	slot.probeEvidence.Store(nil)
+	if changed {
+		slot.mutateHealthEvidence(func() {
+			for id, observation := range e.probeOutstanding {
+				if observation.slot == slot {
+					delete(e.probeOutstanding, id)
+				}
+			}
+			slot.probeEvidence.Store(nil)
+		})
+	} else {
+		slot.probeEvidence.Store(nil)
+	}
 	e.probeMu.Unlock()
+}
+
+// invalidatePredecessorPathProbeEvidence removes only observations from before
+// a committed in-place route generation. A valid successor probe may complete
+// concurrently with terminal mobility processing and must remain available.
+func (e *Engine) invalidatePredecessorPathProbeEvidence(slot *pathSlot) {
+	if e == nil || slot == nil {
+		return
+	}
+	e.probeMu.Lock()
+	e.invalidatePredecessorPathProbeEvidenceLocked(slot)
+	e.probeMu.Unlock()
+}
+
+func (e *Engine) invalidatePredecessorPathProbeEvidenceLocked(slot *pathSlot) {
+	// Caller holds probeMu. Taking the generation snapshot here is what makes a
+	// successor publication ordered before cleanup survive that cleanup.
+	current := pathProbeGenerationForSlot(slot)
+	changed := false
+	for _, observation := range e.probeOutstanding {
+		if observation.slot != slot {
+			continue
+		}
+		if observation.generation != current {
+			changed = true
+		}
+	}
+	evidence := slot.probeEvidence.Load()
+	if evidence != nil && evidence.generation != current {
+		changed = true
+	}
+	// This cleanup is called after an in-place route/endpoint generation
+	// publication. Advance even when no predecessor probe object survived.
+	if changed || current != (pathProbeGeneration{}) {
+		slot.mutateHealthEvidence(func() {
+			for id, observation := range e.probeOutstanding {
+				if observation.slot == slot && observation.generation != current {
+					delete(e.probeOutstanding, id)
+				}
+			}
+			if evidence != nil && evidence.generation != current {
+				slot.probeEvidence.CompareAndSwap(evidence, nil)
+			}
+		})
+	}
 }
 
 func (e *Engine) clearPathProbeState(slots []*pathSlot) {
@@ -1076,11 +1248,29 @@ func (e *Engine) clearPathProbeState(slots []*pathSlot) {
 		return
 	}
 	e.probeMu.Lock()
-	e.probeOutstanding = make(map[uint64]pathProbeObservation)
-	for _, slot := range slots {
-		if slot != nil {
-			slot.probeEvidence.Store(nil)
+	e.healthEvidenceCommitMu.RLock()
+	changed := make(map[*pathSlot]bool)
+	for _, observation := range e.probeOutstanding {
+		if observation.slot != nil {
+			changed[observation.slot] = true
 		}
 	}
+	for _, slot := range slots {
+		if slot != nil {
+			if slot.probeEvidence.Load() != nil {
+				changed[slot] = true
+			}
+			if changed[slot] {
+				slot.healthEvidenceMu.Lock()
+				slot.advanceHealthEvidenceRevisionLocked()
+				slot.probeEvidence.Store(nil)
+				slot.healthEvidenceMu.Unlock()
+			} else {
+				slot.probeEvidence.Store(nil)
+			}
+		}
+	}
+	e.probeOutstanding = make(map[uint64]pathProbeObservation)
+	e.healthEvidenceCommitMu.RUnlock()
 	e.probeMu.Unlock()
 }

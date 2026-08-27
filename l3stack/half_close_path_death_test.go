@@ -193,8 +193,8 @@ func TestGatewayTCPHalfClosePathDeath(t *testing.T) {
 	if !ok {
 		t.Fatalf("application TCP endpoint %T does not support CloseWrite", app)
 	}
-	if _, ok := clientSession.Conn.(rendr.StreamHalfCloser); !ok {
-		t.Fatalf("client rendr Conn %T does not support CloseWrite", clientSession.Conn)
+	if _, ok := clientSession.Conn().(rendr.StreamHalfCloser); !ok {
+		t.Fatalf("client rendr Conn %T does not support CloseWrite", clientSession.Conn())
 	}
 	if _, ok := serverConn.(rendr.StreamHalfCloser); !ok {
 		t.Fatalf("accepted rendr Conn %T does not support CloseWrite", serverConn)
@@ -203,7 +203,7 @@ func TestGatewayTCPHalfClosePathDeath(t *testing.T) {
 
 	appHandle := reflect.ValueOf(app).Pointer()
 	appLocal, appRemote := app.LocalAddr().String(), app.RemoteAddr().String()
-	rendrConn := clientSession.Conn
+	rendrConn := clientSession.Conn()
 	flowID := rendrConn.FlowID()
 	rendrLocal, rendrRemote := halfCloseAddr(rendrConn.LocalAddr()), halfCloseAddr(rendrConn.RemoteAddr())
 	egressHandle, err := halfCloseSocketHandle(egressApp)
@@ -382,16 +382,16 @@ func TestGatewayTCPHalfClosePathDeath(t *testing.T) {
 	}
 
 	currentSession, ok := gateway.manager.Session(id)
-	if !ok || currentSession != clientSession || currentSession.Conn != rendrConn {
+	if !ok || currentSession != clientSession || currentSession.Conn() != rendrConn {
 		t.Fatalf("application rendr session was replaced: before=%p/%p after=%p/%p", clientSession, rendrConn, currentSession, func() rendr.Conn {
 			if currentSession == nil {
 				return nil
 			}
-			return currentSession.Conn
+			return currentSession.Conn()
 		}())
 	}
-	if currentSession.Conn.FlowID() != flowID || serverConn.FlowID() != flowID {
-		t.Fatalf("flow ID changed across death: client=%x server=%x want=%x", currentSession.Conn.FlowID(), serverConn.FlowID(), flowID)
+	if currentSession.Conn().FlowID() != flowID || serverConn.FlowID() != flowID {
+		t.Fatalf("flow ID changed across death: client=%x server=%x want=%x", currentSession.Conn().FlowID(), serverConn.FlowID(), flowID)
 	}
 	if reflect.ValueOf(app).Pointer() != appHandle || app.LocalAddr().String() != appLocal || app.RemoteAddr().String() != appRemote {
 		t.Fatalf("application TCP handle/address changed: handle=%x/%x local=%q/%q remote=%q/%q",
@@ -483,8 +483,8 @@ func waitHalfCloseGatewaySession(
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if session, ok := gateway.manager.Session(id); ok && session.Conn != nil {
-			if control, ok := session.Conn.(halfCloseStreamControl); ok && len(control.Paths()) >= wantPaths {
+		if session, ok := gateway.manager.Session(id); ok && session.Conn() != nil {
+			if control, ok := session.Conn().(halfCloseStreamControl); ok && len(control.Paths()) >= wantPaths {
 				return session, control
 			}
 		}

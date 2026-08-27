@@ -36,10 +36,12 @@ const unknownApplicationBytes = ^uint64(0)
 const (
 	selectorGoodputMinimumWindow = 250 * time.Millisecond
 	selectorGoodputMinimumBytes  = 32 << 10
+	batchAttributionRecordCache  = 64
 )
 
 type sendHistory struct {
-	entries []sendHistoryEntry
+	entries        []sendHistoryEntry
+	entriesBacking []sendHistoryEntry
 	// reservedFrames counts acquired application-frame credits, including a
 	// writer that is still waiting for byte credit or sendMu publication.
 	reservedFrames int
@@ -56,22 +58,41 @@ type sendHistory struct {
 	// ackedApplicationBytes is the cumulative unique DATA payload proven by
 	// the peer's contiguous ACK frontier. Socket writes, replay attempts, and
 	// control frames never advance it.
-	ackedApplicationBytes uint64
-	rootCohort            rootDeliveryCohort
-	rootAckedBytes        uint64
-	rootPublishedBytes    uint64
-	rootDemandAckedBytes  uint64
-	rootEvidenceEpoch     uint64
-	rootTopologyEpoch     uint64
-	rootAttributable      bool
+	ackedApplicationBytes   uint64
+	pendingApplicationBytes uint64
+	rootCohort              rootDeliveryCohort
+	rootAckedBytes          uint64
+	rootPublishedBytes      uint64
+	rootDemandAckedBytes    uint64
+	rootEvidenceEpoch       uint64
+	rootTopologyEpoch       uint64
+	rootAttributable        bool
 	// rootPendingDispatches counts ACK-retired batch receipts whose physical
 	// result can still invalidate the current generation.
 	rootPendingDispatches      uint64
 	rootCommitted              bool
+	selectorPendingDispatches  uint64
+	selectorDelivery           map[proto.TargetID]selectorDeliveryEvidence
 	targetDelivery             map[proto.TargetID]targetDeliveryEvidence
 	targetDeliveryScratch      map[proto.TargetID]uint64
+	targetCapacityScratch      map[proto.TargetID]targetCapacityObservation
 	targetDeliveryTouched      []proto.TargetID
 	targetDeliveryScratchEpoch uint64
+	batchRecordNext            uint64
+	batchRecordFreeCount       int
+	batchRecordFree            [batchAttributionRecordCache]*batchDispatchAttributionRecord
+}
+
+type targetCapacityObservation struct {
+	seen                        bool
+	attributable                bool
+	qualification               bool
+	senderQualification         bool
+	senderQualificationComplete bool
+	bytes                       uint64
+	serviceNanos                uint64
+	started                     time.Time
+	completed                   time.Time
 }
 
 // targetDeliveryEvidence is sender-owned, ACK-confirmed telemetry for one
@@ -80,17 +101,46 @@ type sendHistory struct {
 // to each ancestor, so race copies remain unique and bond parents see their
 // actual aggregate goodput.
 type targetDeliveryEvidence struct {
-	topologyEpoch uint64
-	totalAcked    uint64
-	windowAcked   uint64
-	windowStart   time.Time
-	estimate      speedEstimate
+	topologyEpoch                             uint64
+	totalAcked                                uint64
+	windowAcked                               uint64
+	windowStart                               time.Time
+	estimate                                  speedEstimate
+	capacityWindowAcked                       uint64
+	capacityWindowServiceNanos                uint64
+	capacityWindowQualification               bool
+	capacityWindowSenderQualification         bool
+	capacityWindowSenderQualificationComplete bool
+	capacityWindowStart                       time.Time
+	capacityWindowEnd                         time.Time
+	capacityWindowAnchorACK                   time.Time
+	capacityWindowLastACK                     time.Time
+	capacityWindowACKSamples                  uint64
+	capacityEstimate                          speedEstimate
 }
 
 type rootDeliveryCohort struct {
 	selectorID proto.TargetID
 	targetID   proto.TargetID
 	generation uint64
+}
+
+type selectorFrameAttribution struct {
+	cohort        rootDeliveryCohort
+	committed     bool
+	evidenceEpoch uint64
+	topologyEpoch uint64
+}
+
+type selectorDeliveryEvidence struct {
+	cohort           rootDeliveryCohort
+	stateEpoch       uint64
+	evidenceEpoch    uint64
+	topologyEpoch    uint64
+	attributable     bool
+	publishedBytes   uint64
+	ackedBytes       uint64
+	demandAckedBytes uint64
 }
 
 // ReplayStats is a coherent read-only snapshot of the bounded application
@@ -150,40 +200,60 @@ type ConnectionObservationSnapshot struct {
 }
 
 type sendHistoryEntry struct {
-	seq                   uint64
-	frame                 []byte
-	frameDigest           proto.FrameDigest
-	application           bool
-	control               bool
-	policyFinal           bool
-	terminal              bool
-	priorProof            proto.AckProof
-	proof                 proto.AckProof
-	tailRoute             tailReplayPublicationRoute
-	rootCohort            rootDeliveryCohort
-	rootCommitted         bool
-	rootDemand            bool
-	rootRouteSeen         bool
-	rootRouteTarget       proto.TargetID
-	rootEvidenceEpoch     uint64
-	rootTopologyEpoch     uint64
-	rootAttributable      bool
-	deliveryRouteSeen     bool
-	deliveryRouteTarget   proto.TargetID
-	deliveryTopologyEpoch uint64
-	deliveryAttributable  bool
-	batchAttribution      *batchDispatchAttributionRecord
-	applicationBytes      uint64
+	seq                                         uint64
+	frame                                       []byte
+	frameDigest                                 proto.FrameDigest
+	application                                 bool
+	control                                     bool
+	policyFinal                                 bool
+	terminal                                    bool
+	priorProof                                  proto.AckProof
+	proof                                       proto.AckProof
+	tailRoute                                   tailReplayPublicationRoute
+	rootCohort                                  rootDeliveryCohort
+	rootCommitted                               bool
+	rootDemand                                  bool
+	selectorStateEpoch                          uint64
+	selectorAttributions                        []selectorFrameAttribution
+	rootRouteSeen                               bool
+	rootRouteTarget                             proto.TargetID
+	rootEvidenceEpoch                           uint64
+	rootTopologyEpoch                           uint64
+	rootAttributable                            bool
+	deliveryRouteSeen                           bool
+	deliveryRouteTarget                         proto.TargetID
+	deliveryRouteStarted                        time.Time
+	deliveryTopologyEpoch                       uint64
+	deliveryAttributable                        bool
+	deliveryCapacitySeen                        bool
+	deliveryCapacityAttributable                bool
+	deliveryCapacityQualification               bool
+	deliveryCapacitySenderQualification         bool
+	deliveryCapacitySenderQualificationComplete bool
+	deliveryCapacityServiceNanos                uint64
+	deliveryCapacityStarted                     time.Time
+	deliveryCapacityCompleted                   time.Time
+	batchAttribution                            *batchDispatchAttributionRecord
+	applicationBytes                            uint64
 }
 
 type applicationDispatchRouteState struct {
-	topologyEpoch        uint64
-	rootRouteSeen        bool
-	rootRouteTarget      proto.TargetID
-	rootAttributable     bool
-	deliveryRouteSeen    bool
-	deliveryRouteTarget  proto.TargetID
-	deliveryAttributable bool
+	topologyEpoch                               uint64
+	rootRouteSeen                               bool
+	rootRouteTarget                             proto.TargetID
+	rootAttributable                            bool
+	deliveryRouteSeen                           bool
+	deliveryRouteTarget                         proto.TargetID
+	deliveryRouteStarted                        time.Time
+	deliveryAttributable                        bool
+	deliveryCapacitySeen                        bool
+	deliveryCapacityAttributable                bool
+	deliveryCapacityQualification               bool
+	deliveryCapacitySenderQualification         bool
+	deliveryCapacitySenderQualificationComplete bool
+	deliveryCapacityServiceNanos                uint64
+	deliveryCapacityStarted                     time.Time
+	deliveryCapacityCompleted                   time.Time
 }
 
 // batchDispatchAttributionRecord outlives a replay-ledger entry when a valid
@@ -191,6 +261,7 @@ type applicationDispatchRouteState struct {
 // provisional attempts for the same SEQ share one record and settle exactly
 // once after every physical result is known.
 type batchDispatchAttributionRecord struct {
+	id       uint64
 	seq      uint64
 	pending  int
 	detached bool
@@ -199,22 +270,126 @@ type batchDispatchAttributionRecord struct {
 	state    applicationDispatchRouteState
 	binding  graphBinding
 
-	applicationBytes   uint64
-	rootCohort         rootDeliveryCohort
-	rootCommitted      bool
-	rootDemand         bool
-	rootEvidenceEpoch  uint64
-	rootTopologyEpoch  uint64
-	rootPendingTracked bool
-	routeStarted       time.Time
+	applicationBytes       uint64
+	rootCohort             rootDeliveryCohort
+	rootCommitted          bool
+	rootDemand             bool
+	rootEvidenceEpoch      uint64
+	rootTopologyEpoch      uint64
+	rootPendingTracked     bool
+	selectorAttributions   []selectorFrameAttribution
+	selectorPendingTracked bool
+	routeStarted           time.Time
+}
+
+func (e *Engine) acquireBatchDispatchAttributionRecordLocked() *batchDispatchAttributionRecord {
+	if e.sendHist.batchRecordNext == ^uint64(0) {
+		panic("engine: batch dispatch attribution identity exhausted")
+	}
+	e.sendHist.batchRecordNext++
+	var record *batchDispatchAttributionRecord
+	if count := e.sendHist.batchRecordFreeCount; count != 0 {
+		index := count - 1
+		record = e.sendHist.batchRecordFree[index]
+		e.sendHist.batchRecordFree[index] = nil
+		e.sendHist.batchRecordFreeCount = index
+	} else {
+		record = &batchDispatchAttributionRecord{}
+	}
+	*record = batchDispatchAttributionRecord{id: e.sendHist.batchRecordNext}
+	return record
+}
+
+func (e *Engine) releaseBatchDispatchAttributionRecordLocked(
+	record *batchDispatchAttributionRecord,
+) {
+	if record == nil {
+		return
+	}
+	if record.pending != 0 {
+		panic("engine: released batch dispatch attribution with pending receipts")
+	}
+	*record = batchDispatchAttributionRecord{}
+	if e.closing.Load() {
+		return
+	}
+	if e.sendHist.batchRecordFreeCount == len(e.sendHist.batchRecordFree) {
+		return
+	}
+	index := e.sendHist.batchRecordFreeCount
+	e.sendHist.batchRecordFree[index] = record
+	e.sendHist.batchRecordFreeCount++
 }
 
 type batchDispatchAttributionReceipt struct {
 	record        *batchDispatchAttributionRecord
+	recordID      uint64
 	targetID      proto.TargetID
 	topologyEpoch uint64
 	started       time.Time
+	capacity      targetCapacityObservation
 	resolved      bool
+}
+
+type applicationDispatchPressureObservation struct {
+	startedAt       time.Time
+	completedAt     time.Time
+	serviceDuration time.Duration
+}
+
+// noteCapacityPressure records writer occupancy, not a capacity conclusion.
+// A later cumulative ACK proves the unique frame was delivered, and a complete
+// observation window decides whether this occupancy was sustained rather than
+// sparse per-call overhead.
+func (r *batchDispatchAttributionReceipt) noteCapacityPressure(
+	observation applicationDispatchPressureObservation,
+) {
+	if r == nil || r.resolved || r.capacity.serviceNanos != 0 {
+		return
+	}
+	if observation.startedAt.IsZero() || observation.completedAt.IsZero() ||
+		observation.completedAt.Before(observation.startedAt) {
+		return
+	}
+	service := observation.serviceDuration
+	if service <= 0 {
+		service = observation.completedAt.Sub(observation.startedAt)
+	}
+	if service <= 0 {
+		return
+	}
+	r.capacity.seen = true
+	r.capacity.attributable = true
+	r.capacity.serviceNanos = uint64(service)
+	r.capacity.started = observation.startedAt
+	r.capacity.completed = observation.completedAt
+}
+
+// noteCapacityQualificationPressure marks a frame selected after the bounded
+// qualification episode proved sustained sender demand. The eventual peer ACK
+// still owns delivery truth; this marker only permits a conservative capacity
+// floor when buffered writes provide no useful syscall-occupancy signal.
+func (r *batchDispatchAttributionReceipt) noteCapacityQualificationPressure(
+	started, completed time.Time,
+	pressure bool,
+	complete bool,
+) {
+	if r == nil || r.resolved || started.IsZero() || completed.IsZero() ||
+		completed.Before(started) {
+		return
+	}
+	r.capacity.seen = true
+	r.capacity.attributable = true
+	r.capacity.qualification = true
+	r.capacity.senderQualification = r.capacity.senderQualification || pressure
+	r.capacity.senderQualificationComplete =
+		r.capacity.senderQualificationComplete || complete
+	if r.capacity.started.IsZero() || started.Before(r.capacity.started) {
+		r.capacity.started = started
+	}
+	if r.capacity.completed.IsZero() || completed.After(r.capacity.completed) {
+		r.capacity.completed = completed
+	}
 }
 
 // reserveSendFrame gives a sequence number a replay owner before any path can
@@ -292,16 +467,18 @@ func (e *Engine) reserveSendFrameClass(
 	}
 	frameDigest := proto.DigestFrame(frame)
 	entry := sendHistoryEntry{
-		seq:           hdr.Seq,
-		frame:         ledgerFrame,
-		frameDigest:   frameDigest,
-		control:       hdr.Type == proto.FrameCtrl,
-		policyFinal:   policyFinal,
-		terminal:      terminal,
-		priorProof:    e.sendProof,
-		rootCohort:    attribution.cohort,
-		rootCommitted: attribution.committed,
-		rootDemand:    attribution.demand,
+		seq:                  hdr.Seq,
+		frame:                ledgerFrame,
+		frameDigest:          frameDigest,
+		control:              hdr.Type == proto.FrameCtrl,
+		policyFinal:          policyFinal,
+		terminal:             terminal,
+		priorProof:           e.sendProof,
+		rootCohort:           attribution.cohort,
+		rootCommitted:        attribution.committed,
+		rootDemand:           attribution.demand,
+		selectorStateEpoch:   attribution.stateEpoch,
+		selectorAttributions: attribution.selectorAttributions,
 	}
 	if hdr.Type == proto.FrameData {
 		if applicationBytes == unknownApplicationBytes {
@@ -328,7 +505,13 @@ func (e *Engine) reserveSendFrameClass(
 	if len(e.sendHist.entries) >= limit {
 		return errors.New("engine: replay ledger capacity invariant violated")
 	}
+	e.ensureSendHistoryAppendCapacityLocked()
+	grew := len(e.sendHist.entries) == cap(e.sendHist.entries)
 	e.sendHist.entries = append(e.sendHist.entries, entry)
+	if grew || cap(e.sendHist.entriesBacking) == 0 {
+		// append moved every active entry to the beginning of a new allocation.
+		e.sendHist.entriesBacking = e.sendHist.entries[:0]
+	}
 	e.sendProof = entry.proof
 	if publish {
 		e.publishSendSeqLocked(hdr.Seq + 1)
@@ -336,7 +519,25 @@ func (e *Engine) reserveSendFrameClass(
 	return nil
 }
 
+// ensureSendHistoryAppendCapacityLocked rebases a partially retired ledger
+// only when its tail has no append capacity. Cumulative ACK processing can
+// advance the active slice through a backing array while a small BDP suffix
+// remains live; compacting that suffix avoids allocating a replacement array
+// every few packets without copying on every ACK. The caller holds sendHistMu.
+func (e *Engine) ensureSendHistoryAppendCapacityLocked() {
+	if len(e.sendHist.entries) < cap(e.sendHist.entries) ||
+		cap(e.sendHist.entriesBacking) <= len(e.sendHist.entries) {
+		return
+	}
+	backing := e.sendHist.entriesBacking[:cap(e.sendHist.entriesBacking)]
+	active := len(e.sendHist.entries)
+	copy(backing[:active], e.sendHist.entries)
+	clear(backing[active:])
+	e.sendHist.entries = backing[:active]
+}
+
 func (e *Engine) publishRootAttributionLocked(entry *sendHistoryEntry) {
+	e.publishSelectorAttributionLocked(entry)
 	if entry == nil || entry.rootCohort.targetID == (proto.TargetID{}) {
 		return
 	}
@@ -634,13 +835,7 @@ func (e *Engine) ApplicationDelivery() ApplicationDeliverySnapshot {
 	publishedNext := e.sendPublishedNext.Load()
 	ackNext := e.sendAckNext.Load()
 	acked := e.sendHist.ackedApplicationBytes
-	pending := uint64(0)
-	for _, entry := range e.sendHist.entries {
-		if entry.seq >= publishedNext || !entry.application {
-			continue
-		}
-		pending = saturatingAddUint64(pending, sendHistoryApplicationBytes(entry))
-	}
+	pending := e.sendHist.pendingApplicationBytes
 	snapshot := ApplicationDeliverySnapshot{
 		PublishedNext:         publishedNext,
 		AckNext:               ackNext,
@@ -884,7 +1079,7 @@ func (e *Engine) noteApplicationDispatchTargets(
 	noteTarget := func(routeTarget proto.TargetID) {
 		noteApplicationDispatchTarget(
 			&state, binding, routeTarget, topologyEpoch,
-			rootCohort, rootCommitted, entry.rootTopologyEpoch,
+			rootCohort, rootCommitted, entry.rootTopologyEpoch, now,
 		)
 	}
 	if single != (proto.TargetID{}) {
@@ -937,6 +1132,22 @@ func (e *Engine) beginApplicationBatchDispatchLocked(
 	binding graphBinding,
 	started time.Time,
 ) *batchDispatchAttributionReceipt {
+	return e.beginApplicationBatchDispatchLockedInto(
+		frame, slot, topologyEpoch, binding, started, nil,
+	)
+}
+
+// beginApplicationBatchDispatchLockedInto optionally builds the receipt in
+// caller-owned bounded scratch. The receipt remains valid until its physical
+// dispatch result is resolved. The caller holds sendHistMu.
+func (e *Engine) beginApplicationBatchDispatchLockedInto(
+	frame []byte,
+	slot *pathSlot,
+	topologyEpoch uint64,
+	binding graphBinding,
+	started time.Time,
+	receipt *batchDispatchAttributionReceipt,
+) *batchDispatchAttributionReceipt {
 	if slot == nil || len(frame) < proto.HeaderSize {
 		return nil
 	}
@@ -953,20 +1164,28 @@ func (e *Engine) beginApplicationBatchDispatchLocked(
 	}
 	record := entry.batchAttribution
 	if record == nil {
-		record = &batchDispatchAttributionRecord{
+		record = e.acquireBatchDispatchAttributionRecordLocked()
+		recordID := record.id
+		*record = batchDispatchAttributionRecord{
+			id:  recordID,
 			seq: header.Seq, state: applicationDispatchRouteStateFromEntry(entry), binding: binding,
 			applicationBytes: entry.applicationBytes, rootCohort: entry.rootCohort,
 			rootCommitted: entry.rootCommitted, rootDemand: entry.rootDemand,
-			rootEvidenceEpoch: entry.rootEvidenceEpoch,
-			rootTopologyEpoch: entry.rootTopologyEpoch,
+			rootEvidenceEpoch:    entry.rootEvidenceEpoch,
+			rootTopologyEpoch:    entry.rootTopologyEpoch,
+			selectorAttributions: entry.selectorAttributions,
 		}
 		entry.batchAttribution = record
 	}
 	record.pending++
-	return &batchDispatchAttributionReceipt{
-		record: record, targetID: slot.localTXTargetID,
+	if receipt == nil {
+		receipt = &batchDispatchAttributionReceipt{}
+	}
+	*receipt = batchDispatchAttributionReceipt{
+		record: record, recordID: record.id, targetID: slot.localTXTargetID,
 		topologyEpoch: topologyEpoch, started: started,
 	}
+	return receipt
 }
 
 func (e *Engine) resolveApplicationBatchDispatch(
@@ -978,12 +1197,17 @@ func (e *Engine) resolveApplicationBatchDispatch(
 	}
 	e.sendHistMu.Lock()
 	e.resetTargetDeliveryScratchLocked()
+	evidenceChanged := false
 	for index, receipt := range receipts {
 		if receipt == nil || receipt.record == nil || receipt.resolved {
 			continue
 		}
-		receipt.resolved = true
 		record := receipt.record
+		if receipt.recordID == 0 || record.id != receipt.recordID {
+			receipt.resolved = true
+			continue
+		}
+		receipt.resolved = true
 		if record.pending <= 0 {
 			e.sendHistMu.Unlock()
 			panic("engine: batch attribution receipt resolved more than once")
@@ -993,7 +1217,9 @@ func (e *Engine) resolveApplicationBatchDispatch(
 			noteApplicationDispatchTarget(
 				&record.state, record.binding, receipt.targetID, receipt.topologyEpoch,
 				record.rootCohort, record.rootCommitted, record.rootTopologyEpoch,
+				receipt.started,
 			)
+			noteApplicationDispatchCapacity(&record.state, receipt.capacity)
 			if record.routeStarted.IsZero() || receipt.started.Before(record.routeStarted) {
 				record.routeStarted = receipt.started
 			}
@@ -1008,19 +1234,29 @@ func (e *Engine) resolveApplicationBatchDispatch(
 				e.sendHist.rootPendingDispatches--
 			}
 		}
+		if record.selectorPendingTracked {
+			record.selectorPendingTracked = false
+			if e.sendHist.selectorPendingDispatches != 0 {
+				e.sendHist.selectorPendingDispatches--
+			}
+		}
 		if record.detached {
 			if record.acked && !e.closing.Load() {
 				e.settleAcknowledgedDispatchStateLocked(
 					record.binding, record.state, record.applicationBytes,
-					record.rootCohort, record.rootDemand, record.rootEvidenceEpoch,
+					record.rootCohort, record.rootDemand, record.selectorAttributions,
+					record.rootEvidenceEpoch,
 					record.rootTopologyEpoch,
 					record.routeStarted, record.ackedAt,
 				)
+				evidenceChanged = true
 			}
+			e.releaseBatchDispatchAttributionRecordLocked(record)
 			continue
 		}
 		entry := e.sendHistoryEntryLocked(record.seq)
 		if entry == nil || entry.batchAttribution != record {
+			e.releaseBatchDispatchAttributionRecordLocked(record)
 			continue
 		}
 		applyApplicationDispatchRouteState(entry, record.state)
@@ -1034,8 +1270,12 @@ func (e *Engine) resolveApplicationBatchDispatch(
 		if record.state.rootRouteSeen && !record.state.rootAttributable {
 			e.sendHist.invalidateRootEvidenceEpochLocked(record.rootEvidenceEpoch)
 		}
+		e.releaseBatchDispatchAttributionRecordLocked(record)
 	}
 	e.flushTargetDeliveryScratchLocked(nowFn())
+	if evidenceChanged {
+		e.bondEvidenceRevision.Add(1)
+	}
 	e.sendHistMu.Unlock()
 }
 
@@ -1046,9 +1286,19 @@ func applicationDispatchRouteStateFromEntry(entry *sendHistoryEntry) application
 	return applicationDispatchRouteState{
 		topologyEpoch: entry.deliveryTopologyEpoch,
 		rootRouteSeen: entry.rootRouteSeen, rootRouteTarget: entry.rootRouteTarget,
-		rootAttributable:  entry.rootAttributable,
-		deliveryRouteSeen: entry.deliveryRouteSeen, deliveryRouteTarget: entry.deliveryRouteTarget,
-		deliveryAttributable: entry.deliveryAttributable,
+		rootAttributable:                            entry.rootAttributable,
+		deliveryRouteSeen:                           entry.deliveryRouteSeen,
+		deliveryRouteTarget:                         entry.deliveryRouteTarget,
+		deliveryRouteStarted:                        entry.deliveryRouteStarted,
+		deliveryAttributable:                        entry.deliveryAttributable,
+		deliveryCapacitySeen:                        entry.deliveryCapacitySeen,
+		deliveryCapacityAttributable:                entry.deliveryCapacityAttributable,
+		deliveryCapacityQualification:               entry.deliveryCapacityQualification,
+		deliveryCapacitySenderQualification:         entry.deliveryCapacitySenderQualification,
+		deliveryCapacitySenderQualificationComplete: entry.deliveryCapacitySenderQualificationComplete,
+		deliveryCapacityServiceNanos:                entry.deliveryCapacityServiceNanos,
+		deliveryCapacityStarted:                     entry.deliveryCapacityStarted,
+		deliveryCapacityCompleted:                   entry.deliveryCapacityCompleted,
 	}
 }
 
@@ -1058,8 +1308,46 @@ func applyApplicationDispatchRouteState(entry *sendHistoryEntry, state applicati
 	entry.rootAttributable = state.rootAttributable
 	entry.deliveryRouteSeen = state.deliveryRouteSeen
 	entry.deliveryRouteTarget = state.deliveryRouteTarget
+	entry.deliveryRouteStarted = state.deliveryRouteStarted
 	entry.deliveryTopologyEpoch = state.topologyEpoch
 	entry.deliveryAttributable = state.deliveryAttributable
+	entry.deliveryCapacitySeen = state.deliveryCapacitySeen
+	entry.deliveryCapacityAttributable = state.deliveryCapacityAttributable
+	entry.deliveryCapacityQualification = state.deliveryCapacityQualification
+	entry.deliveryCapacitySenderQualification = state.deliveryCapacitySenderQualification
+	entry.deliveryCapacitySenderQualificationComplete = state.deliveryCapacitySenderQualificationComplete
+	entry.deliveryCapacityServiceNanos = state.deliveryCapacityServiceNanos
+	entry.deliveryCapacityStarted = state.deliveryCapacityStarted
+	entry.deliveryCapacityCompleted = state.deliveryCapacityCompleted
+}
+
+func noteApplicationDispatchCapacity(
+	state *applicationDispatchRouteState,
+	observation targetCapacityObservation,
+) {
+	if state == nil {
+		return
+	}
+	if state.deliveryCapacitySeen {
+		// One logical DATA frame with more than one physical writer observation
+		// cannot assign unique ACKed bytes to either writer without double count.
+		state.deliveryCapacityAttributable = false
+		return
+	}
+	state.deliveryCapacitySeen = true
+	state.deliveryCapacityAttributable = false
+	if (observation.serviceNanos == 0 && !observation.senderQualification) ||
+		observation.started.IsZero() ||
+		observation.completed.IsZero() || observation.completed.Before(observation.started) {
+		return
+	}
+	state.deliveryCapacityAttributable = true
+	state.deliveryCapacityQualification = observation.qualification
+	state.deliveryCapacitySenderQualification = observation.senderQualification
+	state.deliveryCapacitySenderQualificationComplete = observation.senderQualificationComplete
+	state.deliveryCapacityServiceNanos = observation.serviceNanos
+	state.deliveryCapacityStarted = observation.started
+	state.deliveryCapacityCompleted = observation.completed
 }
 
 func noteApplicationDispatchTarget(
@@ -1070,6 +1358,7 @@ func noteApplicationDispatchTarget(
 	rootCohort rootDeliveryCohort,
 	rootCommitted bool,
 	rootTopologyEpoch uint64,
+	dispatchStarted time.Time,
 ) {
 	if state == nil {
 		return
@@ -1099,6 +1388,10 @@ func noteApplicationDispatchTarget(
 		} else {
 			state.deliveryRouteTarget = common
 		}
+	}
+	if !dispatchStarted.IsZero() &&
+		(state.deliveryRouteStarted.IsZero() || dispatchStarted.Before(state.deliveryRouteStarted)) {
+		state.deliveryRouteStarted = dispatchStarted
 	}
 	if rootCohort.targetID == (proto.TargetID{}) {
 		return
@@ -1138,8 +1431,12 @@ func (e *Engine) resetTargetDeliveryScratchLocked() {
 	if e.sendHist.targetDeliveryScratch == nil {
 		e.sendHist.targetDeliveryScratch = make(map[proto.TargetID]uint64)
 	}
+	if e.sendHist.targetCapacityScratch == nil {
+		e.sendHist.targetCapacityScratch = make(map[proto.TargetID]targetCapacityObservation)
+	}
 	for _, targetID := range e.sendHist.targetDeliveryTouched {
 		delete(e.sendHist.targetDeliveryScratch, targetID)
+		delete(e.sendHist.targetCapacityScratch, targetID)
 	}
 	e.sendHist.targetDeliveryTouched = e.sendHist.targetDeliveryTouched[:0]
 	e.sendHist.targetDeliveryScratchEpoch = e.currentPathTopologyEpoch()
@@ -1162,6 +1459,11 @@ func (e *Engine) addAcknowledgedTargetDeliveryLocked(
 	if routeStarted.IsZero() || acknowledgedAt.Before(routeStarted) {
 		routeStarted = acknowledgedAt
 	}
+	if state.deliveryCapacitySeen && !state.deliveryCapacityAttributable {
+		e.invalidateAcknowledgedTargetCapacityLocked(
+			binding, state.deliveryRouteTarget, state.topologyEpoch,
+		)
+	}
 	e.beginTargetDeliveryWindowsLocked(
 		binding, state.deliveryRouteTarget, state.topologyEpoch, routeStarted,
 	)
@@ -1170,7 +1472,8 @@ func (e *Engine) addAcknowledgedTargetDeliveryLocked(
 		return
 	}
 	for _, targetID := range ancestors {
-		if kind, exists := binding.targetKind(targetID); !exists || kind == proto.GraphNodeKindSelector {
+		kind, exists := binding.targetKind(targetID)
+		if !exists || kind == proto.GraphNodeKindSelector {
 			continue
 		}
 		if _, touched := e.sendHist.targetDeliveryScratch[targetID]; !touched {
@@ -1179,6 +1482,71 @@ func (e *Engine) addAcknowledgedTargetDeliveryLocked(
 		e.sendHist.targetDeliveryScratch[targetID] = saturatingAddUint64(
 			e.sendHist.targetDeliveryScratch[targetID], applicationBytes,
 		)
+		if kind == proto.GraphNodeKindPath && targetID == state.deliveryRouteTarget {
+			capacity := e.sendHist.targetCapacityScratch[targetID]
+			if !capacity.seen {
+				capacity.attributable = true
+			}
+			capacity.seen = true
+			capacity.bytes = saturatingAddUint64(capacity.bytes, applicationBytes)
+			if !state.deliveryCapacitySeen || !state.deliveryCapacityAttributable ||
+				(state.deliveryCapacityServiceNanos == 0 &&
+					!state.deliveryCapacitySenderQualification) {
+				capacity.attributable = false
+				e.sendHist.targetCapacityScratch[targetID] = capacity
+				continue
+			}
+			capacity.senderQualification = capacity.senderQualification ||
+				state.deliveryCapacitySenderQualification
+			capacity.qualification = capacity.qualification ||
+				state.deliveryCapacityQualification
+			capacity.senderQualificationComplete = capacity.senderQualificationComplete ||
+				state.deliveryCapacitySenderQualificationComplete
+			capacity.serviceNanos = saturatingAddUint64(
+				capacity.serviceNanos, state.deliveryCapacityServiceNanos,
+			)
+			if capacity.started.IsZero() || state.deliveryCapacityStarted.Before(capacity.started) {
+				capacity.started = state.deliveryCapacityStarted
+			}
+			if capacity.completed.IsZero() || state.deliveryCapacityCompleted.After(capacity.completed) {
+				capacity.completed = state.deliveryCapacityCompleted
+			}
+			e.sendHist.targetCapacityScratch[targetID] = capacity
+		}
+	}
+}
+
+func (e *Engine) invalidateAcknowledgedTargetCapacityLocked(
+	binding graphBinding,
+	targetID proto.TargetID,
+	topologyEpoch uint64,
+) {
+	if targetID == (proto.TargetID{}) || topologyEpoch == 0 ||
+		topologyEpoch != e.sendHist.targetDeliveryScratchEpoch {
+		return
+	}
+	for leafID := range binding.leaves {
+		ancestors, ok := binding.targetAncestors(leafID)
+		if !ok {
+			continue
+		}
+		descendant := false
+		for _, ancestorID := range ancestors {
+			if ancestorID == targetID {
+				descendant = true
+				break
+			}
+		}
+		if !descendant {
+			continue
+		}
+		if _, touched := e.sendHist.targetDeliveryScratch[leafID]; !touched {
+			e.sendHist.targetDeliveryTouched = append(e.sendHist.targetDeliveryTouched, leafID)
+			e.sendHist.targetDeliveryScratch[leafID] = 0
+		}
+		e.sendHist.targetCapacityScratch[leafID] = targetCapacityObservation{
+			seen: true, attributable: false,
+		}
 	}
 }
 
@@ -1188,12 +1556,20 @@ func (e *Engine) settleAcknowledgedDispatchStateLocked(
 	applicationBytes uint64,
 	rootCohort rootDeliveryCohort,
 	rootDemand bool,
+	selectorAttributions []selectorFrameAttribution,
 	rootEvidenceEpoch uint64,
 	rootTopologyEpoch uint64,
 	routeStarted, acknowledgedAt time.Time,
 ) {
+	if !state.deliveryRouteStarted.IsZero() &&
+		(routeStarted.IsZero() || state.deliveryRouteStarted.Before(routeStarted)) {
+		routeStarted = state.deliveryRouteStarted
+	}
 	e.addAcknowledgedTargetDeliveryLocked(
 		binding, state, applicationBytes, routeStarted, acknowledgedAt,
+	)
+	e.settleSelectorDeliveryLocked(
+		binding, state, selectorAttributions, applicationBytes, rootDemand,
 	)
 	if applicationBytes == 0 || rootCohort.targetID == (proto.TargetID{}) {
 		return
@@ -1224,15 +1600,28 @@ func (e *Engine) flushTargetDeliveryScratchLocked(now time.Time) {
 	if topologyEpoch != e.sendHist.targetDeliveryScratchEpoch {
 		for _, targetID := range e.sendHist.targetDeliveryTouched {
 			delete(e.sendHist.targetDeliveryScratch, targetID)
+			delete(e.sendHist.targetCapacityScratch, targetID)
 		}
 		e.sendHist.targetDeliveryTouched = e.sendHist.targetDeliveryTouched[:0]
 		return
 	}
 	for _, targetID := range e.sendHist.targetDeliveryTouched {
-		e.addTargetDeliveryLocked(
-			targetID, topologyEpoch, e.sendHist.targetDeliveryScratch[targetID], now,
+		if delivered := e.sendHist.targetDeliveryScratch[targetID]; delivered != 0 {
+			e.addTargetDeliveryLocked(targetID, topologyEpoch, delivered, now)
+			e.sampleTargetDeliveryLocked(targetID, now)
+		}
+		capacity := e.sendHist.targetCapacityScratch[targetID]
+		if !capacity.seen {
+			continue
+		}
+		if !capacity.attributable {
+			e.resetTargetCapacityWindowLocked(targetID)
+			continue
+		}
+		e.addTargetCapacityDeliveryLocked(
+			targetID, topologyEpoch, capacity, now,
 		)
-		e.sampleTargetDeliveryLocked(targetID, now)
+		e.sampleTargetCapacityLocked(targetID, now)
 	}
 }
 
@@ -1249,7 +1638,9 @@ func (e *Engine) beginTargetDeliveryWindowLocked(
 	}
 	state := e.sendHist.targetDelivery[targetID]
 	if state.topologyEpoch != topologyEpoch {
-		state = targetDeliveryEvidence{topologyEpoch: topologyEpoch, windowStart: now}
+		state = targetDeliveryEvidence{
+			topologyEpoch: topologyEpoch, windowStart: now,
+		}
 		e.sendHist.targetDelivery[targetID] = state
 		return
 	}
@@ -1257,8 +1648,13 @@ func (e *Engine) beginTargetDeliveryWindowLocked(
 		now.Sub(state.windowStart) > selectorEvidenceFreshFor {
 		state.windowStart = now
 		state.windowAcked = state.totalAcked
+		resetTargetCapacityWindow(&state)
 		if !state.estimate.sampleTime.IsZero() && now.Before(state.estimate.sampleTime) {
 			state.estimate = speedEstimate{}
+		}
+		if !state.capacityEstimate.sampleTime.IsZero() && now.Before(state.capacityEstimate.sampleTime) {
+			state.capacityEstimate = speedEstimate{}
+			e.bondCapacityRevision.Add(1)
 		}
 		e.sendHist.targetDelivery[targetID] = state
 	}
@@ -1278,16 +1674,96 @@ func (e *Engine) addTargetDeliveryLocked(
 	}
 	state := e.sendHist.targetDelivery[targetID]
 	if state.topologyEpoch != topologyEpoch {
-		state = targetDeliveryEvidence{topologyEpoch: topologyEpoch, windowStart: now}
+		state = targetDeliveryEvidence{
+			topologyEpoch: topologyEpoch, windowStart: now,
+		}
 	}
 	if state.windowStart.IsZero() || now.Before(state.windowStart) {
 		state.windowStart = now
 		state.windowAcked = state.totalAcked
+		resetTargetCapacityWindow(&state)
 		if !state.estimate.sampleTime.IsZero() && now.Before(state.estimate.sampleTime) {
 			state.estimate = speedEstimate{}
 		}
 	}
 	state.totalAcked = saturatingAddUint64(state.totalAcked, bytes)
+	e.sendHist.targetDelivery[targetID] = state
+}
+
+func (e *Engine) addTargetCapacityDeliveryLocked(
+	targetID proto.TargetID,
+	topologyEpoch uint64,
+	observation targetCapacityObservation,
+	acknowledgedAt time.Time,
+) {
+	if targetID == (proto.TargetID{}) || topologyEpoch == 0 || !observation.seen ||
+		!observation.attributable || observation.bytes == 0 ||
+		(observation.serviceNanos == 0 && !observation.senderQualification) ||
+		observation.started.IsZero() ||
+		observation.completed.IsZero() || observation.completed.Before(observation.started) ||
+		acknowledgedAt.IsZero() {
+		return
+	}
+	if e.sendHist.targetDelivery == nil {
+		e.sendHist.targetDelivery = make(map[proto.TargetID]targetDeliveryEvidence)
+	}
+	state := e.sendHist.targetDelivery[targetID]
+	if state.topologyEpoch != topologyEpoch {
+		state = targetDeliveryEvidence{
+			topologyEpoch: topologyEpoch, windowStart: observation.started,
+		}
+	}
+	// A qualification cohort is not allowed to publish ordinary writer-
+	// occupancy capacity before the bounded scheduler episode reaches its
+	// pressure phase. Reset at that boundary so the final ACK cannot mix sparse
+	// exploratory frames with the sustained-demand measurement.
+	if observation.qualification && observation.senderQualification &&
+		!state.capacityWindowSenderQualification {
+		resetTargetCapacityWindow(&state)
+	}
+	if state.capacityWindowACKSamples == 0 ||
+		acknowledgedAt.Before(state.capacityWindowLastACK) ||
+		(!state.capacityWindowLastACK.IsZero() &&
+			acknowledgedAt.Sub(state.capacityWindowLastACK) > selectorEvidenceFreshFor) {
+		resetTargetCapacityWindow(&state)
+		state.capacityWindowAnchorACK = acknowledgedAt
+		state.capacityWindowLastACK = acknowledgedAt
+		state.capacityWindowACKSamples = 1
+		state.capacityWindowServiceNanos = observation.serviceNanos
+		state.capacityWindowQualification = observation.qualification
+		state.capacityWindowSenderQualification = observation.senderQualification
+		state.capacityWindowSenderQualificationComplete = observation.senderQualificationComplete
+		state.capacityWindowStart = observation.started
+		state.capacityWindowEnd = observation.completed
+		e.sendHist.targetDelivery[targetID] = state
+		return
+	}
+	if !acknowledgedAt.After(state.capacityWindowLastACK) {
+		e.sendHist.targetDelivery[targetID] = state
+		return
+	}
+	if state.capacityWindowStart.IsZero() || observation.started.Before(state.capacityWindowStart) {
+		state.capacityWindowStart = observation.started
+	}
+	state.capacityWindowAcked = saturatingAddUint64(
+		state.capacityWindowAcked, observation.bytes,
+	)
+	state.capacityWindowServiceNanos = saturatingAddUint64(
+		state.capacityWindowServiceNanos, observation.serviceNanos,
+	)
+	state.capacityWindowQualification =
+		state.capacityWindowQualification || observation.qualification
+	state.capacityWindowSenderQualification =
+		state.capacityWindowSenderQualification || observation.senderQualification
+	state.capacityWindowSenderQualificationComplete =
+		state.capacityWindowSenderQualificationComplete || observation.senderQualificationComplete
+	if state.capacityWindowEnd.IsZero() || observation.completed.After(state.capacityWindowEnd) {
+		state.capacityWindowEnd = observation.completed
+	}
+	state.capacityWindowLastACK = acknowledgedAt
+	state.capacityWindowACKSamples = saturatingAddUint64(
+		state.capacityWindowACKSamples, 1,
+	)
 	e.sendHist.targetDelivery[targetID] = state
 }
 
@@ -1311,6 +1787,108 @@ func (e *Engine) sampleTargetDeliveryLocked(targetID proto.TargetID, now time.Ti
 		state.windowAcked = state.totalAcked
 	}
 	e.sendHist.targetDelivery[targetID] = state
+}
+
+func (e *Engine) sampleTargetCapacityLocked(targetID proto.TargetID, now time.Time) {
+	state := e.sendHist.targetDelivery[targetID]
+	previousEstimate := state.capacityEstimate
+	if state.capacityWindowACKSamples < 2 {
+		return
+	}
+	ackElapsed := state.capacityWindowLastACK.Sub(state.capacityWindowAnchorACK)
+	physicalElapsed := state.capacityWindowEnd.Sub(state.capacityWindowStart)
+	serviceElapsed := capacityServiceDuration(state.capacityWindowServiceNanos)
+	elapsed := ackElapsed
+	if physicalElapsed > elapsed {
+		elapsed = physicalElapsed
+	}
+	if serviceElapsed > elapsed {
+		elapsed = serviceElapsed
+	}
+	if state.capacityWindowSenderQualificationComplete && elapsed < selectorGoodputMinimumWindow {
+		// A completed qualification token budget proves offered sender demand,
+		// but not a faster drain interval than the normal confidence window.
+		// Flooring elapsed is conservative and cannot inflate the estimate.
+		elapsed = selectorGoodputMinimumWindow
+	}
+	delivered := state.capacityWindowAcked
+	if state.capacityWindowQualification &&
+		!state.capacityWindowSenderQualificationComplete {
+		e.sendHist.targetDelivery[targetID] = state
+		return
+	}
+	if elapsed >= selectorGoodputMinimumWindow && delivered >= selectorGoodputMinimumBytes {
+		// Two distinct cumulative ACK observations establish a drain cohort.
+		// Physical service remains a conservative lower bound on elapsed time;
+		// buffered syscall completion alone can never inflate the result.
+		ready := state.capacityWindowSenderQualificationComplete ||
+			bondCapacityWindowPressured(elapsed, state.capacityWindowServiceNanos)
+		if ready {
+			rate := bytesPerSecond(delivered, elapsed)
+			if rate != 0 {
+				if state.capacityEstimate.sampleCount != 0 {
+					rate = smoothGoodput(state.capacityEstimate.bytesPerSecond, rate)
+				}
+				state.capacityEstimate = speedEstimate{
+					state: qualityStateFresh, bytesPerSecond: rate,
+					confidence: goodputConfidence(delivered, elapsed), source: speedSourceDelivered,
+					sampleTime:  now,
+					sampleCount: saturatingAddUint64(state.capacityEstimate.sampleCount, 1),
+				}
+			}
+		}
+		if ready || !state.capacityWindowSenderQualification {
+			resetTargetCapacityWindow(&state)
+		}
+	}
+	e.sendHist.targetDelivery[targetID] = state
+	if state.capacityEstimate != previousEstimate {
+		e.bondCapacityRevision.Add(1)
+	}
+}
+
+func resetTargetCapacityWindow(state *targetDeliveryEvidence) {
+	if state == nil {
+		return
+	}
+	state.capacityWindowAcked = 0
+	state.capacityWindowServiceNanos = 0
+	state.capacityWindowQualification = false
+	state.capacityWindowSenderQualification = false
+	state.capacityWindowSenderQualificationComplete = false
+	state.capacityWindowStart = time.Time{}
+	state.capacityWindowEnd = time.Time{}
+	state.capacityWindowAnchorACK = time.Time{}
+	state.capacityWindowLastACK = time.Time{}
+	state.capacityWindowACKSamples = 0
+}
+
+func (e *Engine) resetTargetCapacityWindowLocked(targetID proto.TargetID) {
+	state, ok := e.sendHist.targetDelivery[targetID]
+	if !ok {
+		return
+	}
+	resetTargetCapacityWindow(&state)
+	e.sendHist.targetDelivery[targetID] = state
+}
+
+func bondCapacityWindowPressured(elapsed time.Duration, serviceNanos uint64) bool {
+	if elapsed < selectorGoodputMinimumWindow || serviceNanos == 0 {
+		return false
+	}
+	windowNanos := uint64(elapsed)
+	required := windowNanos / 4
+	if windowNanos%4 != 0 {
+		required++
+	}
+	return serviceNanos >= required
+}
+
+func capacityServiceDuration(serviceNanos uint64) time.Duration {
+	if serviceNanos > math.MaxInt64 {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(serviceNanos)
 }
 
 func (e *Engine) targetDeliverySpeeds(now time.Time) map[proto.TargetID]speedEstimate {
@@ -1343,7 +1921,7 @@ func (e *Engine) targetDeliverySpeedsAtEpoch(
 				state.windowStart = now
 				state.windowAcked = state.totalAcked
 				e.sendHist.targetDelivery[targetID] = state
-				continue
+				estimate = speedEstimate{}
 			case now.Sub(estimate.sampleTime) > selectorEvidenceFreshFor:
 				estimate.state = qualityStateStale
 			}
@@ -1358,6 +1936,109 @@ func (e *Engine) targetDeliverySpeedsAtEpoch(
 		return nil, false
 	}
 	return out, true
+}
+
+// targetCapacitySpeedsAtEpoch returns only ACK-confirmed delivery estimates
+// whose dispatch window also carried sender-owned pressure. Allocation-limited
+// goodput remains available to selector telemetry through targetDeliverySpeeds,
+// but cannot steer bond capacity.
+func (e *Engine) targetCapacitySpeedsAtEpoch(
+	now time.Time,
+	topologyEpoch uint64,
+) (map[proto.TargetID]speedEstimate, bool) {
+	out, _, valid := e.targetBondSchedulingEvidenceAtEpoch(now, topologyEpoch)
+	return out, valid
+}
+
+func (e *Engine) bondQualificationAcknowledgedAtRevision(
+	childID proto.TargetID,
+	identity bondQualificationIdentity,
+	topologyEpoch, evidenceRevision uint64,
+) (uint64, bool) {
+	if e == nil || topologyEpoch == 0 || evidenceRevision == 0 ||
+		e.currentPathTopologyEpoch() != topologyEpoch ||
+		e.bondEvidenceRevision.Load() != evidenceRevision {
+		return 0, false
+	}
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	if e.currentPathTopologyEpoch() != topologyEpoch ||
+		e.bondEvidenceRevision.Load() != evidenceRevision {
+		return 0, false
+	}
+	acknowledged := func(targetID proto.TargetID) (uint64, bool) {
+		state, exists := e.sendHist.targetDelivery[targetID]
+		return state.totalAcked, exists && state.topologyEpoch == topologyEpoch
+	}
+	if total, exists := acknowledged(childID); exists {
+		return total, true
+	}
+	for index := len(identity.selectors) - 1; index >= 0; index-- {
+		if total, exists := acknowledged(identity.selectors[index].targetID); exists {
+			return total, true
+		}
+	}
+	var total uint64
+	for _, leaf := range identity.leaves {
+		if leafAcknowledged, exists := acknowledged(leaf.targetID); exists {
+			total = saturatingAddUint64(total, leafAcknowledged)
+		}
+	}
+	return total, true
+}
+
+func (e *Engine) targetBondSchedulingEvidenceAtEpoch(
+	now time.Time,
+	topologyEpoch uint64,
+) (map[proto.TargetID]speedEstimate, map[proto.TargetID]uint64, bool) {
+	if topologyEpoch == 0 || e.currentPathTopologyEpoch() != topologyEpoch {
+		return nil, nil, false
+	}
+	e.sendHistMu.Lock()
+	if len(e.sendHist.targetDelivery) == 0 {
+		e.sendHistMu.Unlock()
+		return nil, nil, e.currentPathTopologyEpoch() == topologyEpoch
+	}
+	out := make(map[proto.TargetID]speedEstimate, len(e.sendHist.targetDelivery))
+	acknowledged := make(map[proto.TargetID]uint64, len(e.sendHist.targetDelivery))
+	capacityChanged := false
+	for targetID, state := range e.sendHist.targetDelivery {
+		if state.topologyEpoch != topologyEpoch {
+			continue
+		}
+		acknowledged[targetID] = state.totalAcked
+		estimate := state.capacityEstimate
+		if !estimate.sampleTime.IsZero() {
+			switch {
+			case now.Before(estimate.sampleTime):
+				state.capacityEstimate = speedEstimate{}
+				resetTargetCapacityWindow(&state)
+				e.sendHist.targetDelivery[targetID] = state
+				capacityChanged = true
+				continue
+			case now.Sub(estimate.sampleTime) > selectorEvidenceFreshFor:
+				if state.capacityEstimate.state != qualityStateStale {
+					state.capacityEstimate.state = qualityStateStale
+					e.sendHist.targetDelivery[targetID] = state
+					capacityChanged = true
+				}
+				estimate = state.capacityEstimate
+			}
+		}
+		if estimate.observed() {
+			out[targetID] = estimate
+		}
+	}
+	if capacityChanged {
+		e.bondCapacityRevision.Add(1)
+		e.bondEvidenceRevision.Add(1)
+	}
+	valid := e.currentPathTopologyEpoch() == topologyEpoch
+	e.sendHistMu.Unlock()
+	if !valid {
+		return nil, nil, false
+	}
+	return out, acknowledged, true
 }
 
 func bytesPerSecond(bytes uint64, elapsed time.Duration) uint64 {
@@ -1408,11 +2089,18 @@ func (e *Engine) releaseReplayStateOnClose() {
 		e.sendHist.entries[i] = sendHistoryEntry{}
 	}
 	e.sendHist.entries = nil
+	e.sendHist.entriesBacking = nil
 	e.sendHist.reservedFrames = 0
 	e.sendHist.reservedBytes = 0
+	e.sendHist.pendingApplicationBytes = 0
+	e.sendHist.selectorDelivery = nil
+	e.sendHist.selectorPendingDispatches = 0
 	e.sendHist.targetDelivery = nil
 	e.sendHist.targetDeliveryScratch = nil
+	e.sendHist.targetCapacityScratch = nil
 	e.sendHist.targetDeliveryTouched = nil
+	clear(e.sendHist.batchRecordFree[:])
+	e.sendHist.batchRecordFreeCount = 0
 	e.sendHist.generation++
 	wake := e.sendCreditWake
 	e.sendCreditWake = make(chan struct{})
@@ -1518,6 +2206,7 @@ func (e *Engine) acknowledgeSendFramesAt(
 	proof proto.AckProof,
 	receivedAt time.Time,
 ) (valid bool, application bool) {
+	var confirmedRetirements []proto.PathRetirementPayload
 	if receivedAt.IsZero() {
 		receivedAt = nowFn()
 	}
@@ -1571,6 +2260,13 @@ func (e *Engine) acknowledgeSendFramesAt(
 			continue
 		}
 		if entry.control {
+			if header, err := proto.DecodeHeader(entry.frame); err == nil &&
+				proto.CtrlCodeFromFlags(header.Flags) == proto.CtrlPathRetire &&
+				len(entry.frame) >= proto.HeaderSize {
+				if retirement, err := proto.DecodePathRetirement(entry.frame[proto.HeaderSize:]); err == nil {
+					confirmedRetirements = append(confirmedRetirements, retirement)
+				}
+			}
 			if entry.policyFinal {
 				<-e.sendPolicyFinalSlots
 			} else {
@@ -1585,6 +2281,11 @@ func (e *Engine) acknowledgeSendFramesAt(
 		}
 		applicationBytes := sendHistoryApplicationBytes(entry)
 		e.sendHist.ackedApplicationBytes = saturatingAddUint64(e.sendHist.ackedApplicationBytes, applicationBytes)
+		if applicationBytes > e.sendHist.pendingApplicationBytes {
+			e.sendHistMu.Unlock()
+			panic("engine: acknowledged application bytes exceed published pending bytes")
+		}
+		e.sendHist.pendingApplicationBytes -= applicationBytes
 		if record := entry.batchAttribution; record != nil {
 			record.detached = true
 			record.acked = true
@@ -1595,19 +2296,27 @@ func (e *Engine) acknowledgeSendFramesAt(
 				e.sendHist.rootPendingDispatches++
 				record.rootPendingTracked = true
 			}
+			if record.pending != 0 && !record.selectorPendingTracked &&
+				len(record.selectorAttributions) != 0 {
+				e.sendHist.selectorPendingDispatches++
+				record.selectorPendingTracked = true
+			}
 			if record.pending == 0 {
 				e.settleAcknowledgedDispatchStateLocked(
 					record.binding, record.state, record.applicationBytes,
-					record.rootCohort, record.rootDemand, record.rootEvidenceEpoch,
+					record.rootCohort, record.rootDemand, record.selectorAttributions,
+					record.rootEvidenceEpoch,
 					record.rootTopologyEpoch,
 					record.routeStarted, now,
 				)
+				e.releaseBatchDispatchAttributionRecordLocked(record)
 			}
 		} else {
 			state := applicationDispatchRouteStateFromEntry(&entry)
 			e.settleAcknowledgedDispatchStateLocked(
 				binding, state, applicationBytes,
-				entry.rootCohort, entry.rootDemand, entry.rootEvidenceEpoch,
+				entry.rootCohort, entry.rootDemand, entry.selectorAttributions,
+				entry.rootEvidenceEpoch,
 				entry.rootTopologyEpoch,
 				now, now,
 			)
@@ -1618,17 +2327,32 @@ func (e *Engine) acknowledgeSendFramesAt(
 		e.sendHist.entries[i] = sendHistoryEntry{}
 	}
 	e.flushTargetDeliveryScratchLocked(now)
-	// Reslicing avoids copying every still-unacknowledged frame on each
-	// cumulative ACK. Append occasionally compacts through Go's amortized
-	// growth, so retirement cost is proportional only to the released prefix.
-	e.sendHist.entries = e.sendHist.entries[cut:]
+	// Preserve the backing store when the ACK drains the complete ledger. A
+	// plain entries[cut:] has zero capacity in that common low-BDP case, which
+	// forces the next frame to allocate another sendHistoryEntry array. Partial
+	// retirement still reslices without copying the unacknowledged suffix.
+	if cut == len(e.sendHist.entries) {
+		if cap(e.sendHist.entriesBacking) != 0 {
+			e.sendHist.entries = e.sendHist.entriesBacking[:0]
+		} else {
+			e.sendHist.entries = e.sendHist.entries[:0]
+		}
+	} else {
+		e.sendHist.entries = e.sendHist.entries[cut:]
+	}
 	e.sendAckNext.Store(nextSeq)
 	e.sendACKProgress.Store(&sendACKProgressObservation{next: nextSeq, at: now})
 	e.sendHist.generation++
 	wake := e.sendCreditWake
 	e.sendCreditWake = make(chan struct{})
 	close(wake)
+	if application {
+		e.bondEvidenceRevision.Add(1)
+	}
 	e.sendHistMu.Unlock()
+	for _, retirement := range confirmedRetirements {
+		e.confirmLocalPacketPathRetirement(retirement)
+	}
 	e.completeReplayPublicationBarrier(nextSeq)
 	return true, application
 }

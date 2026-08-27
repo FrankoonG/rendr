@@ -2,6 +2,8 @@ package rendr
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -33,23 +35,62 @@ type enginePacketConn struct {
 	recovery    *pathRecoverySupervisor
 	localStatus func() LocalStatus
 
-	lAddr     net.Addr
-	rAddr     net.Addr
-	closing   atomic.Bool
-	closeOnce sync.Once
-	closeErr  error
+	lAddr    net.Addr
+	rAddr    net.Addr
+	closing  atomic.Bool
+	readGate sync.RWMutex
+	// readPacketBeforeReturn is a deterministic package-test hook installed
+	// before activity and never mutated concurrently.
+	readPacketBeforeReturn func()
+	// readPacketAfterOpenCheck is a deterministic package-test hook installed
+	// before activity. It runs while ReadFrom owns readGate after observing the
+	// connection open, which exposes the read-wins Close linearization boundary.
+	readPacketAfterOpenCheck func()
+	closeOnce                sync.Once
+	closeErr                 error
 }
 
-func newEnginePacketConn(e *engine.Engine, lAddr, rAddr net.Addr) *enginePacketConn {
-	pc := &enginePacketConn{e: e, lAddr: lAddr, rAddr: rAddr}
+func newEnginePacketConn(e *engine.Engine, lAddr net.Addr) *enginePacketConn {
+	pc := &enginePacketConn{e: e, lAddr: lAddr, rAddr: newPacketSessionAddr(e.FlowID())}
 	e.StartSelector(0)
 	return pc
 }
 
+// packetSessionAddr is the immutable application-level identity of the remote
+// endpoint for one framed packet session. It is deliberately independent of
+// every opaque path token and physical leaf address, and therefore remains
+// stable across fallback and migration on both endpoints.
+type packetSessionAddr struct {
+	flowID [16]byte
+}
+
+func newPacketSessionAddr(flowID [16]byte) packetSessionAddr {
+	return packetSessionAddr{flowID: flowID}
+}
+
+func (packetSessionAddr) Network() string { return "rendr-packet" }
+func (addr packetSessionAddr) String() string {
+	return "rendr-packet:" + hex.EncodeToString(addr.flowID[:])
+}
+
 func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.closing.Load() {
+		return 0, nil, net.ErrClosed
+	}
 	pkt, err := c.e.RecvPacket()
 	if err != nil {
 		return 0, nil, err
+	}
+	if hook := c.readPacketBeforeReturn; hook != nil {
+		hook()
+	}
+	c.readGate.RLock()
+	defer c.readGate.RUnlock()
+	if c.closing.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	if hook := c.readPacketAfterOpenCheck; hook != nil {
+		hook()
 	}
 	n := copy(p, pkt)
 	if n != len(pkt) {
@@ -58,11 +99,32 @@ func (c *enginePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return n, c.rAddr, nil
 }
 
-// WriteTo ignores addr - rendr has only one peer per flow_id. Returns
-// ErrPacketTooLarge if p plus the session framing envelope exceeds the
-// engine or carrier frame budget.
-func (c *enginePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+// WriteTo accepts nil as shorthand for the session peer. A non-nil address
+// must name the exact logical peer; rendr never silently redirects a datagram.
+// ErrPacketTooLarge is returned if p plus the session framing envelope exceeds
+// the engine or carrier frame budget.
+func (c *enginePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if !nilFactoryResult(addr) {
+		expectedNetwork, expectedAddress, expected, expectedOK := packetSessionAddrIdentity(c.rAddr)
+		actualNetwork, actualAddress, actual, actualOK := packetSessionAddrIdentity(addr)
+		if !expectedOK || !actualOK || expected.flowID != actual.flowID {
+			return 0, &PacketDestinationError{
+				ExpectedNetwork: expectedNetwork,
+				ExpectedAddress: expectedAddress,
+				ActualNetwork:   actualNetwork,
+				ActualAddress:   actualAddress,
+			}
+		}
+	}
 	return c.writePacket(p)
+}
+
+func packetSessionAddrIdentity(addr net.Addr) (network, address string, identity packetSessionAddr, ok bool) {
+	identity, ok = addr.(packetSessionAddr)
+	if !ok {
+		return "", "", packetSessionAddr{}, false
+	}
+	return identity.Network(), identity.String(), identity, true
 }
 
 func (c *enginePacketConn) writePacket(p []byte) (int, error) {
@@ -86,7 +148,9 @@ func (c *enginePacketConn) abortDial() {
 }
 
 func (c *enginePacketConn) shutdown(graceful bool) error {
+	c.readGate.Lock()
 	c.closing.Store(true)
+	c.readGate.Unlock()
 	c.e.BeginGracefulClose()
 	if c.peak != nil {
 		c.peak.stopLoop()
@@ -100,7 +164,8 @@ func (c *enginePacketConn) shutdown(graceful bool) error {
 	return c.e.Close()
 }
 
-func (c *enginePacketConn) LocalAddr() net.Addr { return c.lAddr }
+func (c *enginePacketConn) LocalAddr() net.Addr  { return c.lAddr }
+func (c *enginePacketConn) RemoteAddr() net.Addr { return c.rAddr }
 
 // SetDeadline / SetReadDeadline / SetWriteDeadline route through to the engine.
 func (c *enginePacketConn) SetDeadline(t time.Time) error {
@@ -126,8 +191,8 @@ func (c *enginePacketConn) Status() Status {
 	return status
 }
 
-func (c *enginePacketConn) startPeakTransfer(plan compiledTarget, pathIDs []uint32) error {
-	c.peak = newPeakTransferController(c.e, plan, pathIDs)
+func (c *enginePacketConn) startPeakTransfer(plan compiledTarget) error {
+	c.peak = newPeakTransferController(c.e, plan)
 	if err := c.peak.start(); err != nil {
 		c.peak.stopLoop()
 		return err
@@ -153,6 +218,16 @@ func (c *enginePacketConn) RecvQueueHWM() int      { return c.e.RecvQueueHighWat
 func (c *enginePacketConn) RecvDups() uint64       { return c.e.RecvDups() }
 func (c *enginePacketConn) BondStuckSkips() uint64 { return c.e.BondStuckSkips() }
 func (c *enginePacketConn) MigrationCount() uint64 { return c.e.MigrationCount() }
+
+// OnMigrationEvent registers a typed committed-migration callback.
+func (c *enginePacketConn) OnMigrationEvent(fn func(MigrationEvent)) MigrationEventSubscription {
+	if fn == nil {
+		return c.e.OnMigrationEvent(nil)
+	}
+	return c.e.OnMigrationEvent(func(event engine.MigrationEvent) {
+		fn(migrationEventFromEngine(event))
+	})
+}
 
 // OnMigrate registers a callback fired on every committed migration.
 func (c *enginePacketConn) OnMigrate(fn func(uint32, uint32, string)) func() {
@@ -184,21 +259,27 @@ func (c *enginePacketConn) addPath(ctx context.Context, spec PathSpec) (uint32, 
 	if err != nil {
 		return 0, err
 	}
-	pc, err := c.resolver.dialPath(ctx, spec)
+	lease, err := c.resolver.dialPathForAdoption(ctx, spec)
 	if err != nil {
 		return 0, err
 	}
+	pc := lease.Path()
 	if err := ctx.Err(); err != nil {
-		_ = pc.Close()
-		return 0, err
+		return 0, errors.Join(err, lease.Close())
 	}
 	if c.closing.Load() {
-		_ = pc.Close()
-		return 0, net.ErrClosed
+		return 0, errors.Join(net.ErrClosed, lease.Close())
 	}
 	admission, err := engine.PerformClientBridgeAdmissionContext(ctx, pc, c.e, pathSpecName(spec), spec)
+	if admission.EngineOwnsPath {
+		err = errors.Join(err, lease.ReleaseToEngine())
+	} else if err == nil {
+		err = errors.New("rendr: successful bridge admission did not transfer path ownership")
+	}
 	if err != nil {
-		_ = pc.Close()
+		if !admission.EngineOwnsPath {
+			err = errors.Join(err, lease.Close())
+		}
 		return 0, err
 	}
 	return admission.PathID, nil

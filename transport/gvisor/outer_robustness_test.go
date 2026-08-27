@@ -14,12 +14,12 @@ import (
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 )
 
-func TestOuterV4LiteralWireBudgets(t *testing.T) {
+func TestOuterV6LiteralWireBudgets(t *testing.T) {
 	values := map[string]struct {
 		got  int
 		want int
 	}{
-		"version":             {int(outerVersion), 5},
+		"version":             {int(outerVersion), 6},
 		"process-local-mtu":   {processLocalMTU, 1500},
 		"ipv6-minimum-mtu":    {outerIPv6MinimumMTU, 1280},
 		"ipv6-header":         {outerIPv6HeaderSize, 40},
@@ -90,40 +90,44 @@ func TestOuterV4LiteralWireBudgets(t *testing.T) {
 	}{
 		{
 			name: "open",
-			frame: outerFrame{Type: outerTypeOpen, LinkID: id, Generation: 1, Payload: marshalOpen(
+			frame: outerFrame{Type: outerTypeOpen, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 1, Payload: marshalOpen(
 				linkPublicKey{1}, linkNonce{2}, outerCookie{3}, outerProof{4},
 			)},
 			want: 128,
 		},
 		{
 			name: "cookie", frame: outerFrame{
-				Type: outerTypeCookie, LinkID: id, Generation: 1, Payload: cookiePayload,
+				Type: outerTypeCookie, Sender: leafmobility.RoleAcceptor, LinkID: id, Generation: 1, Payload: cookiePayload,
 			}, want: 64,
 		},
 		{
 			name: "open-ack", frame: outerFrame{
-				Type: outerTypeOpenAck, LinkID: id, Generation: 1,
+				Type: outerTypeOpenAck, Sender: leafmobility.RoleAcceptor, LinkID: id, Generation: 1,
 				Payload: marshalOpenAck(linkPublicKey{1}, [4]byte{10, 64, 0, 1}, linkNonce{2}),
 			}, key: secret, want: 100,
 		},
 		{
 			name: "path-control", frame: outerFrame{
-				Type: outerTypePathChallenge, LinkID: id, Generation: 1, Payload: controlPayload,
+				Type: outerTypePathChallenge, Sender: leafmobility.RoleDialer,
+				LinkID: id, Generation: 1, Payload: controlPayload,
 			}, key: secret, want: 120,
 		},
 		{
 			name: "liveness-control", frame: outerFrame{
-				Type: outerTypeLivenessChallenge, LinkID: id, Generation: 1, Payload: livenessPayload,
+				Type: outerTypeLivenessChallenge, Sender: leafmobility.RoleDialer,
+				LinkID: id, Generation: 1, Payload: livenessPayload,
 			}, key: secret, want: 72,
 		},
 		{
 			name: "data-ack", frame: outerFrame{
-				Type: outerTypeDataAck, LinkID: id, Generation: 1, Payload: dataAckPayload,
+				Type: outerTypeDataAck, Sender: leafmobility.RoleDialer,
+				LinkID: id, Generation: 1, Payload: dataAckPayload,
 			}, key: secret, want: 56,
 		},
 		{
 			name: "qualification", frame: outerFrame{
-				Type: outerTypeQualificationRequest, LinkID: id, Generation: 1, Payload: qualificationPayload,
+				Type: outerTypeQualificationRequest, Sender: leafmobility.RoleDialer,
+				LinkID: id, Generation: 1, Payload: qualificationPayload,
 			}, key: secret, want: 1232,
 		},
 	}
@@ -140,18 +144,20 @@ func TestOuterV4LiteralWireBudgets(t *testing.T) {
 	}
 }
 
-func TestOuterV4DataMaximumAndOversizeRejection(t *testing.T) {
+func TestOuterV6DataMaximumAndOversizeRejection(t *testing.T) {
 	id := linkID{1}
 	secret := linkSecret{2}
 	maximum := bytes.Repeat([]byte{0x45}, 1176)
-	wire, err := encodeOuterData(id, 1, 1, maximum, secret)
+	wire, err := encodeOuterData(id, 1, 1, maximum, secret, leafmobility.RoleDialer)
 	if err != nil {
 		t.Fatalf("encode 1176-byte DATA: %v", err)
 	}
 	if len(wire) != 1232 {
 		t.Fatalf("1176-byte DATA wire=%d want 1232", len(wire))
 	}
-	if _, err := encodeOuterData(id, 1, 1, append(maximum, 0), secret); !errors.Is(err, errOuterControlMismatch) {
+	if _, err := encodeOuterData(
+		id, 1, 1, append(maximum, 0), secret, leafmobility.RoleDialer,
+	); !errors.Is(err, errOuterControlMismatch) {
 		t.Fatalf("encode 1177-byte DATA error=%v want size rejection", err)
 	}
 
@@ -159,6 +165,7 @@ func TestOuterV4DataMaximumAndOversizeRejection(t *testing.T) {
 	copy(oversizeWire[:4], outerMagic[:])
 	oversizeWire[4] = outerVersion
 	oversizeWire[5] = byte(outerTypeData)
+	oversizeWire[6] = byte(leafmobility.RoleDialer)
 	oversizeWire[8] = 1
 	oversizeWire[31] = 1
 	oversizeWire[outerHeaderSize+outerDataSequenceSize-1] = 1
@@ -167,7 +174,7 @@ func TestOuterV4DataMaximumAndOversizeRejection(t *testing.T) {
 	}
 }
 
-func TestOuterV4MaximumDataQualificationMutationsFailClosed(t *testing.T) {
+func TestOuterV6MaximumDataQualificationMutationsFailClosed(t *testing.T) {
 	id, secret := linkID{9}, linkSecret{8}
 	context, err := qualificationRebindContext(outerControl{
 		Transaction: linkTransaction{7}, Agreement: linkAgreement{6}, Nonce: linkNonce{5}, ReceiveNext: 1,
@@ -211,14 +218,16 @@ func TestOuterV4MaximumDataQualificationMutationsFailClosed(t *testing.T) {
 	}
 }
 
-func TestOuterV4RejectsVersion3(t *testing.T) {
-	wire, err := encodeOuterData(linkID{1}, 1, 1, []byte{0x45}, linkSecret{2})
+func TestOuterV6RejectsVersion5(t *testing.T) {
+	wire, err := encodeOuterData(
+		linkID{1}, 1, 1, []byte{0x45}, linkSecret{2}, leafmobility.RoleDialer,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire[4] = 3
-	if _, err := decodeOuter(wire, linkSecret{2}); !errors.Is(err, errOuterVersion) {
-		t.Fatalf("decode v3 error=%v want unsupported version", err)
+	wire[4] = 5
+	if _, err := decodeOuter(wire, linkSecret{2}, leafmobility.RoleDialer); !errors.Is(err, errOuterVersion) {
+		t.Fatalf("decode v5 error=%v want unsupported version", err)
 	}
 }
 

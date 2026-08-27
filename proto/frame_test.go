@@ -66,8 +66,8 @@ func TestVersionConstants(t *testing.T) {
 	if Version != 3 {
 		t.Errorf("proto.Version drifted: got %d want 3", Version)
 	}
-	if UDPFlowVersion != 1 {
-		t.Errorf("proto.UDPFlowVersion drifted: got %d want 1", UDPFlowVersion)
+	if UDPFlowVersion != 2 {
+		t.Errorf("proto.UDPFlowVersion drifted: got %d want 2", UDPFlowVersion)
 	}
 }
 

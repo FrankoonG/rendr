@@ -1611,6 +1611,7 @@ func TestEngineClosedWaitsForDetachedPathExecutionCleanup(t *testing.T) {
 	)
 	fixture.clientDriver.rollbackEntered = make(chan struct{})
 	fixture.clientDriver.rollbackRelease = make(chan struct{})
+	fixture.clientDriver.rollbackIgnoreContext = true
 	var releaseOnce sync.Once
 	releaseRollback := func() { releaseOnce.Do(func() { close(fixture.clientDriver.rollbackRelease) }) }
 	t.Cleanup(releaseRollback)
@@ -2522,6 +2523,7 @@ func TestEngineCloseIsBoundedWhileDriverRollbackIsBlocked(t *testing.T) {
 	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
 	fixture.clientDriver.rollbackEntered = make(chan struct{})
 	fixture.clientDriver.rollbackRelease = make(chan struct{})
+	fixture.clientDriver.rollbackIgnoreContext = true
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(fixture.clientDriver.rollbackRelease) }) }
 	t.Cleanup(release)
@@ -2557,6 +2559,48 @@ func TestEngineCloseIsBoundedWhileDriverRollbackIsBlocked(t *testing.T) {
 	case <-fixture.client.Closed():
 	case <-time.After(2 * time.Second):
 		t.Fatal("background shutdown did not finish after rollback release")
+	}
+}
+
+func TestEngineCloseCancelsContextAwareRollbackOnClaimRetirement(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.clientDriver.rollbackEntered = make(chan struct{})
+	fixture.clientDriver.rollbackRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(fixture.clientDriver.rollbackRelease) }) }
+	t.Cleanup(release)
+	plan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xc8)
+	authority, err := fixture.client.NegotiateLeafMobilityAuthority(context.Background(), fixture.clientRef, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permit, err := authority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := permit.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.client.Close() }()
+	select {
+	case <-fixture.clientDriver.rollbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("close did not request local rollback")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close did not quiesce after canceling context-aware rollback: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel context-aware rollback")
+	}
+	if state := permit.ExecutionState(); state != leafmobility.ExecutionFailedClosed {
+		t.Fatalf("execution state=%d want failed-closed", state)
+	}
+	if calls := fixture.clientDriver.failClosedCalls.Load(); calls != 1 {
+		t.Fatalf("fail-closed calls=%d want=1", calls)
 	}
 }
 
@@ -3107,8 +3151,14 @@ func TestEngineLeafMobilityPreparedACKPreCallbackFailureRepublishesExactly(t *te
 		ReservationID:               reservation,
 	}
 	const prepareSeq = uint64(0xe301)
+	fixture.server.pathsMu.RLock()
+	subjectSlot := fixture.server.paths[fixture.serverRef.ID]
+	fixture.server.pathsMu.RUnlock()
+	if subjectSlot == nil {
+		t.Fatal("server subject slot is unavailable")
+	}
 	incoming := &incomingLeafMobilityTransaction{
-		source: fixture.serverRef, prepare: prepare, prepareSeq: prepareSeq, digest: digest,
+		source: fixture.serverRef, sourceSlot: subjectSlot, prepare: prepare, prepareSeq: prepareSeq, digest: digest,
 		prepared: prepared, deadline: time.Now().Add(5 * time.Second),
 		retireAfter: time.Now().Add(10 * time.Second), state: incomingLeafMobilityPrepared,
 	}
@@ -3155,6 +3205,21 @@ func TestEngineLeafMobilityPreparedACKPreCallbackFailureRepublishesExactly(t *te
 	if !ok {
 		t.Fatal("replacement control route has no exact ref")
 	}
+	originalRouteGeneration := subjectSlot.routeGeneration.Load()
+	fixture.server.pathsMu.Lock()
+	subjectSlot.routeGeneration.Store(originalRouteGeneration + 1)
+	delete(fixture.server.paths, fixture.serverRef.ID)
+	fixture.server.pathsMu.Unlock()
+	detached := true
+	defer func() {
+		if !detached {
+			return
+		}
+		fixture.server.pathsMu.Lock()
+		subjectSlot.routeGeneration.Store(originalRouteGeneration)
+		fixture.server.paths[fixture.serverRef.ID] = subjectSlot
+		fixture.server.pathsMu.Unlock()
+	}()
 	if err := fixture.server.handleLeafMobilityPrepare(fixture.serverRef, prepareSeq, true, prepare); err != nil {
 		t.Fatal(err)
 	}
@@ -3175,6 +3240,11 @@ func TestEngineLeafMobilityPreparedACKPreCallbackFailureRepublishesExactly(t *te
 	if len(frames) != 2 || !bytes.Equal(frames[0], frames[1]) {
 		t.Fatal("cached PREPARED ACK was not replayed byte-exactly")
 	}
+	fixture.server.pathsMu.Lock()
+	subjectSlot.routeGeneration.Store(originalRouteGeneration)
+	fixture.server.paths[fixture.serverRef.ID] = subjectSlot
+	fixture.server.pathsMu.Unlock()
+	detached = false
 	if err := fixture.server.replayLeafMobilityResponse(fixture.serverRef, nil, time.Now().Add(time.Second)); !errors.Is(err, errLeafMobilityResponseUnavailable) {
 		t.Fatalf("empty cached replay error=%v want response unavailable", err)
 	}
@@ -3786,6 +3856,134 @@ func TestEngineLeafMobilityBusyIsImmutableForTransactionID(t *testing.T) {
 	}
 }
 
+func TestEngineLeafMobilityLateCrossedServerPrepareGetsClientPriorityBusy(t *testing.T) {
+	for _, state := range []string{"active-after-publish", "completed"} {
+		t.Run(state, func(t *testing.T) {
+			capture := &captureLeafAckPath{}
+			fixture := newLeafMobilityEngineFixtureWithWrappers(
+				t, leafmobility.Resource{}, leafmobility.Resource{},
+				func(path *memoryPathConn) transport.PathConn { capture.PathConn = path; return capture }, nil,
+			)
+
+			clientPlan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xca)
+			serverPlan := engineLeafPlan(t, fixture.server, fixture.serverRef, 0xcb)
+			leaseMillis := func(plan leafmobility.Plan) uint32 {
+				lease := min(time.Until(plan.Deadline), leafmobility.MaxPlanHorizon)
+				return uint32(lease / time.Millisecond)
+			}
+			clientPrepare := proto.LeafMobilityPeerPlanPrepare{
+				LeafMobilityPeerPlanBinding: fixture.client.canonicalLeafMobilityBinding(clientPlan, leaseMillis(clientPlan)),
+				ActorEndpointGeneration:     clientPlan.EndpointGeneration,
+				ActorPlanDigest:             proto.LeafMobilityPlanDigest(clientPlan.LocalDigest),
+			}
+			serverPrepare := proto.LeafMobilityPeerPlanPrepare{
+				LeafMobilityPeerPlanBinding: fixture.server.canonicalLeafMobilityBinding(serverPlan, leaseMillis(serverPlan)),
+				ActorEndpointGeneration:     serverPlan.EndpointGeneration,
+				ActorPlanDigest:             proto.LeafMobilityPlanDigest(serverPlan.LocalDigest),
+			}
+			if clientPrepare.SubjectRouteGeneration != serverPrepare.SubjectRouteGeneration {
+				t.Fatalf("crossed route generations client/server=%d/%d",
+					clientPrepare.SubjectRouteGeneration, serverPrepare.SubjectRouteGeneration)
+			}
+			fixture.client.pathsMu.Lock()
+			subject := fixture.client.paths[fixture.clientRef.ID]
+			control := fixture.client.paths[fixture.clientControlRef.ID]
+			subject.routeGeneration.Store(serverPrepare.SubjectRouteGeneration + 1)
+			delete(fixture.client.paths, fixture.clientRef.ID)
+			fixture.client.pathsMu.Unlock()
+			control.dispatchMu.Lock()
+			control.dispatchFenced = true
+			control.dispatchMu.Unlock()
+			controlReleased := make(chan struct{})
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				control.dispatchMu.Lock()
+				control.dispatchFenced = false
+				control.dispatchMu.Unlock()
+				fixture.client.signalLeafMobilityRetry()
+				close(controlReleased)
+			}()
+			defer func() {
+				<-controlReleased
+				fixture.client.pathsMu.Lock()
+				fixture.client.paths[fixture.clientRef.ID] = subject
+				fixture.client.pathsMu.Unlock()
+			}()
+
+			fixture.client.leafTx.mu.Lock()
+			if state == "active-after-publish" {
+				fixture.client.leafTx.outgoing = &outgoingLeafMobilityTransaction{
+					source: fixture.clientRef, sourceSlot: subject, prepare: clientPrepare,
+				}
+			} else {
+				fixture.client.leafTx.actorTerminal[clientPrepare.TransactionID] = actorLeafMobilityTombstone{
+					source: fixture.clientRef, sourceSlot: subject, prepare: clientPrepare,
+					resolution: proto.LeafMobilityPeerPlanCommit{
+						LeafMobilityPeerPlanBinding: clientPrepare.LeafMobilityPeerPlanBinding,
+						Stage:                       proto.LeafMobilityPeerPlanCommitStageComplete,
+					},
+					releasedAck: proto.LeafMobilityPeerPlanAck{
+						LeafMobilityPeerPlanBinding: clientPrepare.LeafMobilityPeerPlanBinding,
+						Phase:                       proto.LeafMobilityPeerPlanAckPhaseReleased,
+						Code:                        proto.LeafMobilityPeerPlanAckCodeAccept,
+					},
+					retireAfter: time.Now().Add(time.Second),
+				}
+			}
+			fixture.client.leafTx.mu.Unlock()
+
+			payload, err := serverPrepare.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			header := proto.Header{
+				Version: proto.Version, Type: proto.FrameCtrl,
+				Flags: proto.FlagsForCtrl(proto.CtrlLeafMobilityPrepare), Seq: 0xcafe,
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := fixture.client.routeLeafMobilityOOB(control, header, payload); err != nil {
+					t.Fatal(err)
+				}
+				eventuallyEngine(t, time.Second, func() bool { return len(capture.captured()) == attempt+1 })
+			}
+			fixture.client.leafTx.mu.Lock()
+			if state == "active-after-publish" {
+				fixture.client.leafTx.outgoing = nil
+			}
+			incoming, rejected := len(fixture.client.leafTx.incoming), len(fixture.client.leafTx.rejected)
+			fixture.client.leafTx.mu.Unlock()
+
+			frames := capture.captured()
+			if len(frames) != 2 || !bytes.Equal(frames[0], frames[1]) {
+				t.Fatalf("late crossed Busy frames=%d exact=%t", len(frames), len(frames) == 2 && bytes.Equal(frames[0], frames[1]))
+			}
+			ack, err := proto.DecodeLeafMobilityPeerPlanAck(frames[0][proto.HeaderSize:])
+			if err != nil || ack.Code != proto.LeafMobilityPeerPlanAckCodeBusy || ack.TransactionID != serverPrepare.TransactionID {
+				t.Fatalf("late crossed Busy ACK=%+v error=%v", ack, err)
+			}
+			if incoming != 0 || rejected != 1 || fixture.clientDriver.prepareCalls.Load() != 0 ||
+				fixture.clientDriver.cutoverCalls.Load() != 0 || fixture.clientDriver.commitCalls.Load() != 0 {
+				t.Fatalf("late crossed rejection incoming=%d rejected=%d driver=%d/%d/%d",
+					incoming, rejected, fixture.clientDriver.prepareCalls.Load(),
+					fixture.clientDriver.cutoverCalls.Load(), fixture.clientDriver.commitCalls.Load())
+			}
+		})
+	}
+}
+
+func TestLeafMobilityResponseRouteRetryableRejectsWriteFailure(t *testing.T) {
+	if !leafMobilityResponseRouteRetryable(ErrLeafMobilityControlRouteUnavailable) {
+		t.Fatal("pure control-route unavailability is not retryable")
+	}
+	if !leafMobilityResponseRouteRetryable(ErrStalePathRef) {
+		t.Fatal("pure stale subject lookup is not retryable")
+	}
+	writeErr := errors.New("control write failed")
+	if leafMobilityResponseRouteRetryable(errors.Join(ErrLeafMobilityControlRouteUnavailable, writeErr)) {
+		t.Fatal("a real control write failure was classified as a route-state retry")
+	}
+}
+
 func TestEngineLeafMobilityInvalidBindingsCannotPoisonPeerLedgerCapacity(t *testing.T) {
 	capture := &captureLeafAckPath{}
 	fixture := newLeafMobilityEngineFixtureWithWrappers(
@@ -3869,6 +4067,72 @@ func TestEngineLeafMobilityClientPreemptsServerDuringIncomingPreflight(t *testin
 	if err := clientOutcome.authority.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestEngineLeafMobilityClientPreemptsPreparedServerDuringStage(t *testing.T) {
+	fixture := newLeafMobilityEngineFixture(t, leafmobility.Resource{}, leafmobility.Resource{}, nil)
+	fixture.serverDriver.stageEntered = make(chan struct{})
+	fixture.serverDriver.stageRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStage := func() { releaseOnce.Do(func() { close(fixture.serverDriver.stageRelease) }) }
+	t.Cleanup(releaseStage)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverPlan := engineLeafPlan(t, fixture.server, fixture.serverRef, 0xd1)
+	serverAuthority, err := fixture.server.NegotiateLeafMobilityAuthority(ctx, fixture.serverRef, serverPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPermit, err := serverAuthority.Consume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- serverPermit.Execute(ctx) }()
+	select {
+	case <-fixture.serverDriver.stageEntered:
+	case <-time.After(time.Second):
+		t.Fatal("server transaction did not reach blocked Stage")
+	}
+
+	clientPlan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xd2)
+	firstAuthority, firstErr := fixture.client.NegotiateLeafMobilityAuthority(ctx, fixture.clientRef, clientPlan)
+	if firstAuthority != nil || !errors.Is(firstErr, ErrLeafMobilityPeerBusy) {
+		t.Fatalf("first preferred-client attempt authority=%v error=%v, want immutable peer-busy retry", firstAuthority, firstErr)
+	}
+	select {
+	case serverErr := <-serverResult:
+		if serverErr == nil || !errors.Is(serverErr, ErrLeafMobilityAuthorityBusy) {
+			t.Fatalf("preempted server execution error=%v", serverErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client priority did not cancel the prepared server Stage")
+	}
+	if state := serverPermit.State(); state != leafmobility.ResourceTransactionRolledBack {
+		t.Fatalf("preempted server transaction state=%d want rolled back", state)
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		fixture.server.leafTx.mu.Lock()
+		defer fixture.server.leafTx.mu.Unlock()
+		return fixture.server.leafTx.outgoing == nil
+	})
+
+	retryPlan := engineLeafPlan(t, fixture.client, fixture.clientRef, 0xd3)
+	clientAuthority, err := fixture.client.NegotiateLeafMobilityAuthority(ctx, fixture.clientRef, retryPlan)
+	if err != nil || clientAuthority == nil {
+		t.Fatalf("preferred-client retry authority=%v error=%v", clientAuthority, err)
+	}
+	if err := clientAuthority.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.serverDriver.cutoverCalls.Load() != 1 || fixture.serverDriver.rollbackCalls.Load() != 1 ||
+		fixture.serverDriver.commitCalls.Load() != 0 {
+		t.Fatalf("server stage/rollback/publish=%d/%d/%d want 1/1/0",
+			fixture.serverDriver.cutoverCalls.Load(), fixture.serverDriver.rollbackCalls.Load(),
+			fixture.serverDriver.commitCalls.Load())
+	}
+	assertLeafMobilityDataFlow(t, fixture, "after-prepared-server-preemption")
 }
 
 func TestEngineLeafMobilityOldOOBReplayOnReplacementRouteCannotAuthorizeOrClose(t *testing.T) {
@@ -4412,6 +4676,24 @@ func newLeafMobilityEngineFixtureWithAllWrappers(
 	wrapControlClient func(*memoryPathConn) transport.PathConn,
 	wrapControlServer func(*memoryPathConn) transport.PathConn,
 ) leafMobilityEngineFixture {
+	return newLeafMobilityEngineFixtureWithAllWrappersAndLimits(
+		t, clientResource, serverResource,
+		wrapSubjectClient, wrapSubjectServer, wrapControlClient, wrapControlServer,
+		Limits{}, Limits{},
+	)
+}
+
+func newLeafMobilityEngineFixtureWithAllWrappersAndLimits(
+	t *testing.T,
+	clientResource leafmobility.Resource,
+	serverResource leafmobility.Resource,
+	wrapSubjectClient func(*memoryPathConn) transport.PathConn,
+	wrapSubjectServer func(*memoryPathConn) transport.PathConn,
+	wrapControlClient func(*memoryPathConn) transport.PathConn,
+	wrapControlServer func(*memoryPathConn) transport.PathConn,
+	clientLimits Limits,
+	serverLimits Limits,
+) leafMobilityEngineFixture {
 	t.Helper()
 	if clientResource.Snapshot().ID == (leafmobility.ResourceID{}) {
 		clientResource = leafmobility.MustNewResource(leafmobility.ScopeEndpoint)
@@ -4426,8 +4708,8 @@ func newLeafMobilityEngineFixtureWithAllWrappers(
 		runtimeNode(proto.GraphNodeKindPath, "c"),
 	)
 	flow := NewClientFlowID()
-	client := New(SideClient, flow, Limits{}.Clamp())
-	server := New(SideServer, flow, Limits{}.Clamp())
+	client := New(SideClient, flow, clientLimits.Clamp())
+	server := New(SideServer, flow, serverLimits.Clamp())
 	clientInstance := proto.InstanceID{0xc1}
 	serverInstance := proto.InstanceID{0xc2}
 	client.SetLocalInstanceID(clientInstance)

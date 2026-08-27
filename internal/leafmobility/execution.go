@@ -5,8 +5,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"reflect"
 	goruntime "runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/proto"
@@ -46,10 +50,11 @@ const (
 )
 
 var (
-	ErrExecutionState       = errors.New("leafmobility: invalid driver execution state")
-	ErrExecutionBusy        = errors.New("leafmobility: driver execution is busy")
-	ErrExecutionDriver      = errors.New("leafmobility: driver execution failed")
-	ErrExecutionDriverPanic = errors.New("leafmobility: driver execution panicked")
+	ErrExecutionState        = errors.New("leafmobility: invalid driver execution state")
+	ErrExecutionBusy         = errors.New("leafmobility: driver execution is busy")
+	ErrExecutionDriver       = errors.New("leafmobility: driver execution failed")
+	ErrExecutionDriverPanic  = errors.New("leafmobility: driver execution panicked")
+	ErrExecutionDriverGoexit = errors.New("leafmobility: driver execution called runtime.Goexit")
 )
 
 // PeerAgreement is the correlated FINAL evidence supplied by the engine that
@@ -113,17 +118,250 @@ type DriverAttempt interface {
 	EndpointGenerationChanged() bool
 }
 
-func readAttemptEvidence(attempt DriverAttempt) (evidence AttemptEvidence, err error) {
+type driverEvidenceOutcome struct {
+	evidence AttemptEvidence
+	err      error
+}
+
+type driverEvidenceCall struct {
+	done    chan struct{}
+	outcome driverEvidenceOutcome
+}
+
+var driverEvidenceRegistry = struct {
+	sync.Mutex
+	active map[driverAttemptKey]*driverEvidenceCall
+}{active: make(map[driverAttemptKey]*driverEvidenceCall)}
+
+func readAttemptEvidence(attempt DriverAttempt) (AttemptEvidence, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), driverEvidenceCallbackTimeout)
+	defer cancel()
+	return invokeDriverEvidence(ctx, attempt)
+}
+
+func invokeDriverEvidence(ctx context.Context, attempt DriverAttempt) (AttemptEvidence, error) {
 	if interfaceIsNil(attempt) {
 		return AttemptEvidence{}, ErrInvalidDriver
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			evidence = AttemptEvidence{}
-			err = fmt.Errorf("%w: attempt evidence panicked: %v", ErrInvalidDriver, recovered)
-		}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return AttemptEvidence{}, errors.Join(ErrInvalidDriver, err)
+	}
+	ptr, ok := interfaceIdentity(attempt)
+	if !ok {
+		return AttemptEvidence{}, ErrInvalidDriver
+	}
+	key := driverAttemptKey{typeOf: reflect.TypeOf(attempt), ptr: ptr}
+	call := &driverEvidenceCall{done: make(chan struct{})}
+	driverEvidenceRegistry.Lock()
+	if active := driverEvidenceRegistry.active[key]; active != nil {
+		driverEvidenceRegistry.Unlock()
+		return AttemptEvidence{}, errors.Join(ErrInvalidDriver, ErrDriverEvidenceBusy)
+	}
+	if !acquireDriverCallbackPermit() {
+		driverEvidenceRegistry.Unlock()
+		return AttemptEvidence{}, errors.Join(ErrInvalidDriver, ErrDriverCallbackCapacity)
+	}
+	driverEvidenceRegistry.active[key] = call
+	driverEvidenceRegistry.Unlock()
+
+	go func() {
+		returned := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				call.outcome = driverEvidenceOutcome{err: errors.Join(ErrInvalidDriver, ErrDriverEvidencePanic)}
+			} else if !returned {
+				call.outcome = driverEvidenceOutcome{err: errors.Join(ErrInvalidDriver, ErrDriverEvidenceGoexit)}
+			}
+			releaseDriverCallbackPermit()
+			driverEvidenceRegistry.Lock()
+			if driverEvidenceRegistry.active[key] == call {
+				delete(driverEvidenceRegistry.active, key)
+			}
+			driverEvidenceRegistry.Unlock()
+			close(call.done)
+		}()
+		call.outcome.evidence = attempt.Evidence()
+		returned = true
 	}()
-	return attempt.Evidence(), nil
+
+	select {
+	case <-call.done:
+		return call.outcome.evidence, call.outcome.err
+	case <-ctx.Done():
+		select {
+		case <-call.done:
+			return call.outcome.evidence, call.outcome.err
+		default:
+			return AttemptEvidence{}, errors.Join(ErrInvalidDriver, ctx.Err())
+		}
+	}
+}
+
+type driverCallbackError struct {
+	kind   error
+	cause  error
+	step   string
+	detail string
+}
+
+func (e *driverCallbackError) Error() string {
+	if e == nil {
+		return "leafmobility: driver callback failed"
+	}
+	message := "leafmobility: driver callback failed"
+	if e.kind != nil {
+		message = e.kind.Error()
+	}
+	if e.step != "" {
+		message += ": " + e.step
+	}
+	if e.detail != "" {
+		message += ": " + e.detail
+	}
+	return message
+}
+
+func (e *driverCallbackError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	if e.cause == nil {
+		return []error{e.kind}
+	}
+	return []error{e.kind, e.cause}
+}
+
+func newDriverCallbackError(kind error, step string, cause error) error {
+	return &driverCallbackError{
+		kind: kind, cause: cause, step: step,
+		detail: trustedDriverCallbackCause(cause),
+	}
+}
+
+// trustedDriverCallbackCause preserves factual infrastructure diagnostics
+// without invoking Error or Is on an arbitrary driver-owned value. Driver
+// causes remain available through errors.Is/errors.As via Unwrap.
+func trustedDriverCallbackCause(cause error) string {
+	return trustedDriverCallbackCauseAtDepth(cause, 0)
+}
+
+func trustedDriverCallbackCauseAtDepth(cause error, depth int) string {
+	const maxTrustedDriverCallbackCauseDepth = 16
+	if cause == nil {
+		return ""
+	}
+	if depth >= maxTrustedDriverCallbackCauseDepth {
+		return ""
+	}
+	typeOf := reflect.TypeOf(cause)
+	if typeOf == nil {
+		return ""
+	}
+	if typeOf.Comparable() {
+		switch cause {
+		case context.Canceled:
+			return context.Canceled.Error()
+		case context.DeadlineExceeded:
+			return context.DeadlineExceeded.Error()
+		case os.ErrDeadlineExceeded:
+			return os.ErrDeadlineExceeded.Error()
+		case ErrDriverCallbackCapacity:
+			return ErrDriverCallbackCapacity.Error()
+		case ErrIncarnationUnproven:
+			return ErrIncarnationUnproven.Error()
+		case ErrPlanExpired:
+			return ErrPlanExpired.Error()
+		}
+	}
+	switch typed := cause.(type) {
+	case *net.OpError:
+		return trustedDriverCallbackCauseAtDepth(typed.Err, depth+1)
+	case *os.PathError:
+		return trustedDriverCallbackCauseAtDepth(typed.Err, depth+1)
+	case *os.SyscallError:
+		return trustedDriverCallbackCauseAtDepth(typed.Err, depth+1)
+	}
+	base := typeOf
+	if base.Kind() == reflect.Pointer {
+		base = base.Elem()
+	}
+	if base.PkgPath() == "fmt" && base.Name() == "wrapError" {
+		if wrapped, ok := cause.(interface{ Unwrap() error }); ok {
+			return trustedDriverCallbackCauseAtDepth(wrapped.Unwrap(), depth+1)
+		}
+	}
+	if (base.PkgPath() == "fmt" && base.Name() == "wrapErrors") ||
+		(base.PkgPath() == "errors" && base.Name() == "joinError") {
+		if wrapped, ok := cause.(interface{ Unwrap() []error }); ok {
+			for _, child := range wrapped.Unwrap() {
+				if detail := trustedDriverCallbackCauseAtDepth(child, depth+1); detail != "" {
+					return detail
+				}
+			}
+		}
+	}
+	return ""
+}
+
+type driverStepResult struct {
+	publication PublicationEvidence
+	err         error
+}
+
+type driverStepCall struct {
+	done chan struct{}
+
+	mu             sync.Mutex
+	completed      bool
+	result         driverStepResult
+	reconciliation driverCallReconciliation
+	generation     *atomic.Bool
+	onDone         func()
+}
+
+type driverCallReconciliation uint8
+
+const (
+	driverCallReconcileNone driverCallReconciliation = iota
+	driverCallReconcileRollback
+	driverCallReconcileFailClosed
+)
+
+func (call *driverStepCall) complete(result driverStepResult) {
+	call.mu.Lock()
+	call.result = result
+	call.completed = true
+	onDone := call.onDone
+	call.mu.Unlock()
+	if onDone != nil {
+		onDone()
+	}
+	close(call.done)
+}
+
+func (call *driverStepCall) installReconciliation(
+	reconciliation driverCallReconciliation,
+	generation *atomic.Bool,
+	onDone func(),
+) bool {
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	call.reconciliation = reconciliation
+	call.generation = generation
+	if call.completed {
+		return true
+	}
+	call.onDone = onDone
+	return false
+}
+
+func (call *driverStepCall) reconciliationResult() (driverCallReconciliation, *atomic.Bool, error) {
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	return call.reconciliation, call.generation, call.result.err
 }
 
 // Execution is a copy-safe, single-use wrapper around one exact preflight
@@ -148,6 +386,8 @@ type executionToken struct {
 	incarnationTracked bool
 	publication        PublicationEvidence
 	stageCancel        context.CancelFunc
+	driverCall         *driverStepCall
+	cleanupPermitHeld  bool
 }
 
 func newExecution(
@@ -170,9 +410,66 @@ func newExecution(
 }
 
 const (
-	minRollbackReserve = 100 * time.Millisecond
-	maxRollbackReserve = 5 * time.Second
+	minRollbackReserve            = 100 * time.Millisecond
+	maxRollbackReserve            = 5 * time.Second
+	driverCallbackLimit           = 64
+	driverCleanupCallbackLimit    = 64
+	driverEvidenceCallbackTimeout = 100 * time.Millisecond
+	driverCanceledCallbackGrace   = 100 * time.Millisecond
 )
+
+var driverCallbackPermits = make(chan struct{}, driverCallbackLimit)
+var driverCleanupCallbackPermits = make(chan struct{}, driverCleanupCallbackLimit)
+
+func acquireDriverCallbackPermit() bool {
+	select {
+	case driverCallbackPermits <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseDriverCallbackPermit() {
+	select {
+	case <-driverCallbackPermits:
+	default:
+		panic("leafmobility: driver callback permit released without ownership")
+	}
+}
+
+func acquireDriverCleanupCallbackPermit() bool {
+	select {
+	case driverCleanupCallbackPermits <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseDriverCleanupCallbackPermit() {
+	select {
+	case <-driverCleanupCallbackPermits:
+	default:
+		panic("leafmobility: driver cleanup callback permit released without ownership")
+	}
+}
+
+type driverCallbackClass uint8
+
+const (
+	driverCallbackNormal driverCallbackClass = iota
+	driverCallbackCleanup
+)
+
+func driverStepCallbackPermits(class driverCallbackClass) (acquire func() bool, release func()) {
+	if class == driverCallbackCleanup {
+		// Every issued Execution reserves this capacity before destructive work.
+		// Cleanup keeps that reservation until terminal ownership is released.
+		return func() bool { return true }, func() {}
+	}
+	return acquireDriverCallbackPermit, releaseDriverCallbackPermit
+}
 
 func executionForwardDeadline(deadline time.Time) time.Time {
 	remaining := time.Until(deadline)
@@ -194,9 +491,85 @@ func (e *Execution) State() ExecutionState {
 		return ExecutionInvalid
 	}
 	e.token.mu.Lock()
+	e.token.reapDriverCallLocked()
 	state := e.token.state
 	e.token.mu.Unlock()
 	return state
+}
+
+func (token *executionToken) reapDriverCallLocked() {
+	if token == nil || token.driverCall == nil {
+		return
+	}
+	select {
+	case <-token.driverCall.done:
+		token.driverCall = nil
+		token.busy = false
+	default:
+	}
+}
+
+func (token *executionToken) retainDriverCallLocked(
+	call *driverStepCall,
+	reconciliation driverCallReconciliation,
+	generation *atomic.Bool,
+) bool {
+	if token == nil {
+		return false
+	}
+	if call == nil {
+		token.driverCall = nil
+		token.busy = false
+		return false
+	}
+	token.driverCall = call
+	token.busy = true
+	completed := call.installReconciliation(reconciliation, generation, func() {
+		token.reconcileDriverCall(call)
+	})
+	if completed {
+		return token.reconcileDriverCallLocked(call)
+	}
+	return false
+}
+
+func (token *executionToken) reconcileDriverCall(call *driverStepCall) {
+	if token == nil || call == nil {
+		return
+	}
+	token.mu.Lock()
+	releaseLease := token.reconcileDriverCallLocked(call)
+	token.mu.Unlock()
+	if releaseLease {
+		releaseExecutionTokenLease(token)
+	}
+}
+
+func (token *executionToken) reconcileDriverCallLocked(call *driverStepCall) bool {
+	if token == nil || call == nil || token.driverCall != call {
+		return false
+	}
+	reconciliation, generation, err := call.reconciliationResult()
+	token.driverCall = nil
+	token.busy = false
+	switch reconciliation {
+	case driverCallReconcileRollback:
+		if err == nil {
+			if generation != nil && generation.Load() {
+				token.claim.advanceEndpointGeneration()
+			}
+			token.state = ExecutionRolledBack
+		} else {
+			token.state = ExecutionRollbackRequired
+		}
+	case driverCallReconcileFailClosed:
+		if err == nil {
+			token.state = ExecutionFailedClosed
+			return true
+		}
+		token.state = ExecutionFailClosedRequired
+	}
+	return false
 }
 
 // ForwardDeadline is the immutable end of destructive forward work. The
@@ -224,30 +597,29 @@ func (e *Execution) Deadline() time.Time {
 }
 
 func (e *Execution) Prepare(ctx context.Context) error {
-	return e.runForwardStep(ctx, ExecutionAuthorized, ExecutionPrepared, "prepare", func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) error {
-		return attempt.Prepare(ctx, request)
-	})
+	_, err := e.runForwardStep(
+		ctx, ExecutionAuthorized, ExecutionPrepared, "prepare",
+		func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) (PublicationEvidence, error) {
+			return PublicationEvidence{}, attempt.Prepare(ctx, request)
+		}, nil,
+	)
+	return err
 }
 
 func (e *Execution) Stage(ctx context.Context) error {
-	var publication PublicationEvidence
-	err := e.runForwardStep(ctx, ExecutionPrepared, ExecutionStaged, "stage", func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) error {
-		var stageErr error
-		publication, stageErr = attempt.Stage(ctx, request)
-		if stageErr == nil && publication.Digest == (EvidenceDigest{}) {
-			return fmt.Errorf("%w: stage returned zero publication evidence", ErrExecutionDriver)
-		}
-		if stageErr == nil {
-			e.token.mu.Lock()
-			e.token.publication = publication
-			e.token.mu.Unlock()
-		}
-		return stageErr
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err := e.runForwardStep(
+		ctx, ExecutionPrepared, ExecutionStaged, "stage",
+		func(attempt DriverAttempt, ctx context.Context, request ExecutionRequest) (PublicationEvidence, error) {
+			publication, stageErr := attempt.Stage(ctx, request)
+			if stageErr == nil && publication.Digest == (EvidenceDigest{}) {
+				return PublicationEvidence{}, fmt.Errorf("%w: stage returned zero publication evidence", ErrExecutionDriver)
+			}
+			return publication, stageErr
+		}, func(token *executionToken, publication PublicationEvidence) {
+			token.publication = publication
+		},
+	)
+	return err
 }
 
 // PublicationDigest binds the private successor evidence to the exact peer
@@ -287,6 +659,7 @@ func (e *Execution) ResolveFinalAcceptance(allowPublish bool) (FinalAcceptanceDi
 	}
 	token := e.token
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy {
 		token.mu.Unlock()
 		return FinalAcceptanceInvalid, ErrExecutionBusy
@@ -422,35 +795,49 @@ func (e *Execution) runForwardStep(
 	ctx context.Context,
 	want, next ExecutionState,
 	name string,
-	step func(DriverAttempt, context.Context, ExecutionRequest) error,
-) error {
+	step func(DriverAttempt, context.Context, ExecutionRequest) (PublicationEvidence, error),
+	commit func(*executionToken, PublicationEvidence),
+) (PublicationEvidence, error) {
 	if e == nil || e.token == nil {
-		return ErrExecutionState
+		return PublicationEvidence{}, ErrExecutionState
 	}
 	token := e.token
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy {
 		token.mu.Unlock()
-		return ErrExecutionBusy
+		return PublicationEvidence{}, ErrExecutionBusy
 	}
 	if token.state != want || interfaceIsNil(token.attempt) {
 		token.mu.Unlock()
-		return ErrExecutionState
+		return PublicationEvidence{}, ErrExecutionState
 	}
 	token.busy = true
 	attempt := token.attempt
 	request := token.request
 	token.mu.Unlock()
 	if want == ExecutionAuthorized {
+		if !acquireDriverCleanupCallbackPermit() {
+			token.mu.Lock()
+			token.busy = false
+			token.mu.Unlock()
+			return PublicationEvidence{}, newDriverCallbackError(
+				ErrExecutionDriver, name, ErrDriverCallbackCapacity,
+			)
+		}
+		token.mu.Lock()
+		token.cleanupPermitHeld = true
+		token.mu.Unlock()
 		if !token.claim.acquireExecutionLease() {
 			token.mu.Lock()
 			token.busy = false
 			token.state = ExecutionRolledBack
 			token.mu.Unlock()
-			return ErrAuthorityStale
+			e.releaseLease()
+			return PublicationEvidence{}, ErrAuthorityStale
 		}
 		token.mu.Lock()
 		token.leaseHeld = true
@@ -464,11 +851,12 @@ func (e *Execution) runForwardStep(
 			token.busy = false
 			token.state = ExecutionRollbackRequired
 			token.mu.Unlock()
-			return ErrExecutionState
+			return PublicationEvidence{}, ErrExecutionState
 		}
 	}
 
-	if err := e.validateAuthorityCurrent(ResourceTransactionExecutionStaged); err != nil {
+	authorityErr := e.validateAuthorityCurrent(ResourceTransactionExecutionStaged)
+	if authorityErr != nil {
 		token.mu.Lock()
 		token.busy = false
 		if want == ExecutionAuthorized {
@@ -480,7 +868,7 @@ func (e *Execution) runForwardStep(
 		if want == ExecutionAuthorized {
 			e.releaseLease()
 		}
-		return err
+		return PublicationEvidence{}, authorityErr
 	}
 	if !token.forwardDeadline.After(time.Now()) {
 		token.mu.Lock()
@@ -494,7 +882,7 @@ func (e *Execution) runForwardStep(
 		if want == ExecutionAuthorized {
 			e.releaseLease()
 		}
-		return ErrPlanExpired
+		return PublicationEvidence{}, ErrPlanExpired
 	}
 	stageCtx, cancel := context.WithDeadline(ctx, token.forwardDeadline)
 	if err := stageCtx.Err(); err != nil {
@@ -510,36 +898,47 @@ func (e *Execution) runForwardStep(
 		if want == ExecutionAuthorized {
 			e.releaseLease()
 		}
-		return err
+		return PublicationEvidence{}, err
 	}
 	token.mu.Lock()
 	token.stageCancel = cancel
 	token.mu.Unlock()
 	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
 	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
-	err := invokeDriverStep(name, expectedContext, expectedPlatform, true, true, func() error {
+	publication, call, err := invokeDriverStep(stageCtx, name, expectedContext, expectedPlatform, true, true, driverCallbackNormal, false, func() (PublicationEvidence, error) {
 		return step(attempt, stageCtx, request)
 	})
-	stageContextErr := stageCtx.Err()
 	token.mu.Lock()
 	token.stageCancel = nil
 	token.mu.Unlock()
-	cancel()
+	stageContextErr := stageCtx.Err()
 	if err == nil && stageContextErr != nil {
-		err = fmt.Errorf("%w: %s deadline: %w", ErrExecutionDriver, name, stageContextErr)
+		err = newDriverCallbackError(ErrExecutionDriver, name, stageContextErr)
 	}
 	if err == nil {
 		err = e.validateAuthorityCurrent(ResourceTransactionExecutionStaged)
 	}
+	cancel()
+	if err == nil && !token.forwardDeadline.After(time.Now()) {
+		err = ErrPlanExpired
+	}
 	token.mu.Lock()
-	token.busy = false
 	if err != nil {
 		token.state = ExecutionRollbackRequired
+		token.retainDriverCallLocked(call, driverCallReconcileNone, nil)
 	} else {
+		token.busy = false
+		token.driverCall = nil
+		if commit != nil {
+			commit(token, publication)
+		}
 		token.state = next
 	}
 	token.mu.Unlock()
-	return err
+	if err != nil {
+		return PublicationEvidence{}, err
+	}
+	return publication, nil
 }
 
 // Publish crosses the only local owner-swap boundary. A driver error with an
@@ -554,6 +953,7 @@ func (e *Execution) Publish(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy || token.state != ExecutionPublishAuthorized || interfaceIsNil(token.attempt) || !token.leaseHeld {
 		token.mu.Unlock()
 		return ErrExecutionState
@@ -561,12 +961,13 @@ func (e *Execution) Publish(ctx context.Context) error {
 	token.busy = true
 	attempt, request := token.attempt, token.request
 	token.mu.Unlock()
-	if err := e.validateAuthorityCurrent(ResourceTransactionPublishAuthorized); err != nil {
+	authorityErr := e.validateAuthorityCurrent(ResourceTransactionPublishAuthorized)
+	if authorityErr != nil {
 		token.mu.Lock()
 		token.busy = false
 		token.state = ExecutionRollbackRequired
 		token.mu.Unlock()
-		return err
+		return authorityErr
 	}
 	if !token.forwardDeadline.After(time.Now()) {
 		token.mu.Lock()
@@ -576,38 +977,52 @@ func (e *Execution) Publish(ctx context.Context) error {
 		return ErrPlanExpired
 	}
 	stageCtx, cancel := context.WithDeadline(ctx, token.forwardDeadline)
+	if err := stageCtx.Err(); err != nil {
+		cancel()
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionRollbackRequired
+		token.mu.Unlock()
+		return err
+	}
 	token.mu.Lock()
 	token.stageCancel = cancel
 	token.mu.Unlock()
 	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
 	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
-	err := invokeDriverStep("publish", expectedContext, expectedPlatform, true, false, func() error {
-		return attempt.Publish(stageCtx, request)
+	_, call, err := invokeDriverStep(stageCtx, "publish", expectedContext, expectedPlatform, true, false, driverCallbackNormal, false, func() (PublicationEvidence, error) {
+		return PublicationEvidence{}, attempt.Publish(stageCtx, request)
 	})
 	token.mu.Lock()
 	token.stageCancel = nil
 	token.mu.Unlock()
+	stageContextErr := stageCtx.Err()
 	cancel()
+	if err == nil && stageContextErr != nil {
+		err = newDriverCallbackError(ErrExecutionDriver, "publish", stageContextErr)
+	}
+	uncertain := call != nil
 	after, proven := token.claim.endpointIncarnation()
 	unchanged := token.incarnationTracked && proven && after == token.incarnationBefore
 	changed := token.incarnationTracked && proven && after != token.incarnationBefore
-	if changed {
+	if changed || uncertain {
 		token.claim.advanceEndpointGeneration()
 	}
 	if err != nil {
 		token.mu.Lock()
-		token.busy = false
-		if unchanged {
+		if unchanged && !uncertain {
 			token.state = ExecutionRollbackRequired
 		} else {
 			token.state = ExecutionFailClosedRequired
 		}
+		token.retainDriverCallLocked(call, driverCallReconcileNone, nil)
 		token.mu.Unlock()
 		return err
 	}
 	if !changed {
 		token.mu.Lock()
 		token.busy = false
+		token.driverCall = nil
 		token.state = ExecutionFailClosedRequired
 		token.mu.Unlock()
 		return fmt.Errorf("%w: publish: %w", ErrExecutionDriver, ErrIncarnationUnproven)
@@ -615,12 +1030,14 @@ func (e *Execution) Publish(ctx context.Context) error {
 	if err := token.transaction.markPublished(); err != nil {
 		token.mu.Lock()
 		token.busy = false
+		token.driverCall = nil
 		token.state = ExecutionFailClosedRequired
 		token.mu.Unlock()
 		return fmt.Errorf("%w: publish transaction: %w", ErrExecutionDriver, err)
 	}
 	token.mu.Lock()
 	token.busy = false
+	token.driverCall = nil
 	token.state = ExecutionPublished
 	token.mu.Unlock()
 	return nil
@@ -637,6 +1054,7 @@ func (e *Execution) Activate(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy || (token.state != ExecutionPublished && token.state != ExecutionActivationRequired) ||
 		interfaceIsNil(token.attempt) || !token.leaseHeld {
 		token.mu.Unlock()
@@ -653,18 +1071,38 @@ func (e *Execution) Activate(ctx context.Context) error {
 		return err
 	}
 	stageCtx, cancel := context.WithDeadline(ctx, token.deadline)
+	if err := stageCtx.Err(); err != nil {
+		cancel()
+		token.mu.Lock()
+		token.busy = false
+		token.state = ExecutionActivationRequired
+		token.mu.Unlock()
+		return err
+	}
+	token.mu.Lock()
+	token.stageCancel = cancel
+	token.mu.Unlock()
 	expectedContext, _ := request.Plan.ProbeReferences.contextDigest()
 	expectedPlatform, _ := request.Plan.ProbeReferences.platformReference()
-	err := invokeDriverStep("activate", expectedContext, expectedPlatform, true, true, func() error {
-		return attempt.Activate(stageCtx, request)
+	_, call, err := invokeDriverStep(stageCtx, "activate", expectedContext, expectedPlatform, true, true, driverCallbackNormal, false, func() (PublicationEvidence, error) {
+		return PublicationEvidence{}, attempt.Activate(stageCtx, request)
 	})
-	cancel()
 	token.mu.Lock()
-	token.busy = false
+	token.stageCancel = nil
+	token.mu.Unlock()
+	stageContextErr := stageCtx.Err()
+	cancel()
+	if err == nil && stageContextErr != nil {
+		err = newDriverCallbackError(ErrExecutionDriver, "activate", stageContextErr)
+	}
+	token.mu.Lock()
 	if err == nil {
+		token.busy = false
+		token.driverCall = nil
 		token.state = ExecutionActivated
 	} else {
 		token.state = ExecutionActivationRequired
+		token.retainDriverCallLocked(call, driverCallReconcileNone, nil)
 	}
 	token.mu.Unlock()
 	return err
@@ -677,6 +1115,7 @@ func (e *Execution) FinalizePublished() error {
 		return ErrExecutionState
 	}
 	e.token.mu.Lock()
+	e.token.reapDriverCallLocked()
 	if e.token.state != ExecutionActivated || e.token.busy {
 		e.token.mu.Unlock()
 		return ErrExecutionState
@@ -693,6 +1132,7 @@ func (e *Execution) CancelForward() {
 		return
 	}
 	e.token.mu.Lock()
+	e.token.reapDriverCallLocked()
 	cancel := e.token.stageCancel
 	e.token.mu.Unlock()
 	if cancel != nil {
@@ -704,16 +1144,26 @@ func (e *Execution) releaseLease() {
 	if e == nil || e.token == nil {
 		return
 	}
-	token := e.token
-	token.mu.Lock()
-	if !token.leaseHeld {
-		token.mu.Unlock()
+	releaseExecutionTokenLease(e.token)
+}
+
+func releaseExecutionTokenLease(token *executionToken) {
+	if token == nil {
 		return
 	}
+	token.mu.Lock()
+	leaseHeld := token.leaseHeld
+	cleanupPermitHeld := token.cleanupPermitHeld
 	token.leaseHeld = false
+	token.cleanupPermitHeld = false
 	claim := token.claim
 	token.mu.Unlock()
-	claim.releaseExecutionLease()
+	if leaseHeld {
+		claim.releaseExecutionLease()
+	}
+	if cleanupPermitHeld {
+		releaseDriverCleanupCallbackPermit()
+	}
 }
 
 func (e *Execution) validateAuthorityCurrent(want ResourceTransactionState) error {
@@ -791,6 +1241,7 @@ func (e *Execution) Rollback(ctx context.Context) error {
 	}
 	token := e.token
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy {
 		token.mu.Unlock()
 		return ErrExecutionBusy
@@ -828,39 +1279,58 @@ func (e *Execution) Rollback(ctx context.Context) error {
 	request := token.request
 	token.mu.Unlock()
 
-	rollbackParent := context.Background()
+	rollbackDeadline := token.deadline
 	if ctx != nil {
-		rollbackParent = context.WithoutCancel(ctx)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(rollbackDeadline) {
+			rollbackDeadline = callerDeadline
+		}
 	}
-	rollbackCtx, cancel := context.WithDeadline(rollbackParent, token.deadline)
-	generationChanged := false
-	err := invokeDriverStep("rollback", ContextDigest{}, ProbeReference{}, false, false, func() error {
+	// Local ownership cleanup ignores a caller's explicit cancellation but
+	// preserves its earlier deadline. Claim retirement remains an independent
+	// authoritative cancellation boundary below.
+	rollbackCtx, cancel := context.WithDeadline(context.Background(), rollbackDeadline)
+	retirementCtx := token.claim.executionRetirementContext()
+	stopRetirementCancel := context.AfterFunc(retirementCtx, cancel)
+	if retirementCtx.Err() != nil {
+		cancel()
+	}
+	var generationChanged atomic.Bool
+	_, call, err := invokeDriverStep(rollbackCtx, "rollback", ContextDigest{}, ProbeReference{}, false, false, driverCallbackCleanup, true, func() (PublicationEvidence, error) {
 		if err := attempt.Rollback(rollbackCtx, request); err != nil {
-			return err
+			return PublicationEvidence{}, err
 		}
 		if token.incarnationTracked {
 			after, ok := token.claim.endpointIncarnation()
 			if !ok {
-				return ErrIncarnationUnproven
+				return PublicationEvidence{}, ErrIncarnationUnproven
 			}
-			generationChanged = after != token.incarnationBefore
+			generationChanged.Store(after != token.incarnationBefore)
 		} else {
-			generationChanged = attempt.EndpointGenerationChanged()
+			generationChanged.Store(attempt.EndpointGenerationChanged())
 		}
-		return nil
+		return PublicationEvidence{}, nil
 	})
+	stopRetirementCancel()
 	cancel()
-	if err == nil && generationChanged {
-		token.claim.advanceEndpointGeneration()
-	}
 	token.mu.Lock()
-	token.busy = false
+	releaseLease := false
 	if err == nil {
+		if generationChanged.Load() {
+			token.claim.advanceEndpointGeneration()
+		}
+		token.busy = false
+		token.driverCall = nil
 		token.state = ExecutionRolledBack
 	} else {
 		token.state = ExecutionRollbackRequired
+		releaseLease = token.retainDriverCallLocked(
+			call, driverCallReconcileRollback, &generationChanged,
+		)
 	}
 	token.mu.Unlock()
+	if releaseLease {
+		releaseExecutionTokenLease(token)
+	}
 	if err == nil {
 		return nil
 	}
@@ -874,6 +1344,7 @@ func (e *Execution) FinalizeRolledBack() error {
 		return ErrExecutionState
 	}
 	e.token.mu.Lock()
+	e.token.reapDriverCallLocked()
 	if e.token.state != ExecutionRolledBack || e.token.busy {
 		e.token.mu.Unlock()
 		return ErrExecutionState
@@ -895,6 +1366,7 @@ func (e *Execution) FailClosed(ctx context.Context) error {
 	}
 	token := e.token
 	token.mu.Lock()
+	token.reapDriverCallLocked()
 	if token.busy {
 		token.mu.Unlock()
 		return ErrExecutionBusy
@@ -925,20 +1397,34 @@ func (e *Execution) FailClosed(ctx context.Context) error {
 	request := token.request
 	token.mu.Unlock()
 
-	err := invokeDriverStep("fail-closed", ContextDigest{}, ProbeReference{}, false, false, func() error {
-		return attempt.FailClosed(ctx, request)
+	cleanupCtx := ctx
+	cancel := func() {}
+	if deadline, ok := cleanupCtx.Deadline(); !ok || time.Until(deadline) > maxRollbackReserve {
+		cleanupCtx, cancel = context.WithTimeout(cleanupCtx, maxRollbackReserve)
+	}
+	_, call, err := invokeDriverStep(cleanupCtx, "fail-closed", ContextDigest{}, ProbeReference{}, false, false, driverCallbackCleanup, true, func() (PublicationEvidence, error) {
+		return PublicationEvidence{}, attempt.FailClosed(cleanupCtx, request)
 	})
+	cancel()
 	token.mu.Lock()
-	token.busy = false
+	releaseLease := false
 	if err == nil {
+		token.busy = false
+		token.driverCall = nil
 		token.state = ExecutionFailedClosed
 	} else {
 		// Once the driver has entered FailClosed, cleanup may already have
 		// terminated the physical endpoint. Failure can only be retried through
 		// FailClosed; Rollback must never be reopened.
 		token.state = ExecutionFailClosedRequired
+		releaseLease = token.retainDriverCallLocked(
+			call, driverCallReconcileFailClosed, nil,
+		)
 	}
 	token.mu.Unlock()
+	if releaseLease {
+		releaseExecutionTokenLease(token)
+	}
 	if err != nil {
 		return err
 	}
@@ -947,44 +1433,98 @@ func (e *Execution) FailClosed(ctx context.Context) error {
 }
 
 func invokeDriverStep(
+	ctx context.Context,
 	name string,
 	expectedContext ContextDigest,
 	expectedPlatform ProbeReference,
 	verifyBefore bool,
 	verifyAfter bool,
-	step func() error,
-) (err error) {
+	class driverCallbackClass,
+	allowCanceledStart bool,
+	step func() (PublicationEvidence, error),
+) (PublicationEvidence, *driverStepCall, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	initialErr := ctx.Err()
+	if initialErr != nil && !allowCanceledStart {
+		return PublicationEvidence{}, nil, newDriverCallbackError(ErrExecutionDriver, name, initialErr)
+	}
+	acquirePermit, releasePermit := driverStepCallbackPermits(class)
+	if !acquirePermit() {
+		return PublicationEvidence{}, nil, newDriverCallbackError(ErrExecutionDriver, name, ErrDriverCallbackCapacity)
+	}
+	call := &driverStepCall{done: make(chan struct{})}
+	go func() {
+		defer releasePermit()
+		returned := false
+		var result driverStepResult
+		defer func() {
+			if !returned {
+				result = driverStepResult{err: newDriverCallbackError(ErrExecutionDriverGoexit, name, nil)}
+			}
+			call.complete(result)
+		}()
+		result = invokeDriverStepLocked(
+			name, expectedContext, expectedPlatform, verifyBefore, verifyAfter, step,
+		)
+		returned = true
+	}()
+	select {
+	case <-call.done:
+		return call.result.publication, nil, call.result.err
+	case <-ctx.Done():
+		timer := time.NewTimer(driverCanceledCallbackGrace)
+		defer timer.Stop()
+		select {
+		case <-call.done:
+			return call.result.publication, nil, call.result.err
+		case <-timer.C:
+			return PublicationEvidence{}, call, newDriverCallbackError(ErrExecutionDriver, name, ctx.Err())
+		}
+	}
+}
+
+func invokeDriverStepLocked(
+	name string,
+	expectedContext ContextDigest,
+	expectedPlatform ProbeReference,
+	verifyBefore bool,
+	verifyAfter bool,
+	step func() (PublicationEvidence, error),
+) (result driverStepResult) {
 	goruntime.LockOSThread()
 	defer goruntime.UnlockOSThread()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("%w: %s: %v", ErrExecutionDriverPanic, name, recovered)
+			result = driverStepResult{err: newDriverCallbackError(ErrExecutionDriverPanic, name, nil)}
 		}
 	}()
 	if verifyBefore {
 		current, contextErr := currentExecutionContextDigest()
 		if contextErr != nil || current != expectedContext {
-			return fmt.Errorf("%w: %s execution context changed", ErrExecutionDriver, name)
+			return driverStepResult{err: newDriverCallbackError(ErrExecutionDriver, name, errors.New("execution context changed"))}
 		}
 		if expectedPlatform != (ProbeReference{}) {
 			if !platformReferenceMatchesCurrent(context.Background(), expectedPlatform) {
-				return fmt.Errorf("%w: %s platform evidence changed", ErrExecutionDriver, name)
+				return driverStepResult{err: newDriverCallbackError(ErrExecutionDriver, name, errors.New("platform evidence changed"))}
 			}
 		}
 	}
-	if err := step(); err != nil {
-		return fmt.Errorf("%w: %s: %w", ErrExecutionDriver, name, err)
+	publication, err := step()
+	if err != nil {
+		return driverStepResult{err: newDriverCallbackError(ErrExecutionDriver, name, err)}
 	}
 	if verifyAfter {
 		current, contextErr := currentExecutionContextDigest()
 		if contextErr != nil || current != expectedContext {
-			return fmt.Errorf("%w: %s execution context changed", ErrExecutionDriver, name)
+			return driverStepResult{err: newDriverCallbackError(ErrExecutionDriver, name, errors.New("execution context changed"))}
 		}
 		if expectedPlatform != (ProbeReference{}) {
 			if !platformReferenceMatchesCurrent(context.Background(), expectedPlatform) {
-				return fmt.Errorf("%w: %s platform evidence changed", ErrExecutionDriver, name)
+				return driverStepResult{err: newDriverCallbackError(ErrExecutionDriver, name, errors.New("platform evidence changed"))}
 			}
 		}
 	}
-	return nil
+	return driverStepResult{publication: publication}
 }

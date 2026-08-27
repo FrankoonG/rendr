@@ -291,23 +291,20 @@ func pathAdmissionControlFrame(code proto.CtrlCode, payload []byte) ([]byte, err
 	return frame, nil
 }
 
-type pathAdmissionWriteResult struct {
-	n   int
-	err error
-}
-
 func (e *Engine) writePathFrameContext(ctx context.Context, slot *pathSlot, frame []byte) (int, error) {
 	if err := slot.acquireWrite(ctx); err != nil {
 		return 0, err
 	}
-	result := make(chan pathAdmissionWriteResult, 1)
+	result := make(chan pathCallbackWriteResult, 1)
 	go func() {
 		defer slot.releaseWrite()
-		n, err := slot.writeFrameOwned(frame)
-		result <- pathAdmissionWriteResult{n: n, err: err}
+		slot.writeFrameOwnedResult(frame, result)
 	}()
 	select {
 	case got := <-result:
+		if pathCallbackFailedAbnormally(got.err) {
+			e.failPathControlWrite(slot, got.err)
+		}
 		return got.n, got.err
 	case <-ctx.Done():
 		select {
@@ -315,7 +312,7 @@ func (e *Engine) writePathFrameContext(ctx context.Context, slot *pathSlot, fram
 			return got.n, got.err
 		default:
 		}
-		go e.onPathDeath(slot.id, slot.owner, transport.CauseTransportError, ctx.Err())
+		go e.failPathControlWrite(slot, ctx.Err())
 		return 0, ctx.Err()
 	}
 }

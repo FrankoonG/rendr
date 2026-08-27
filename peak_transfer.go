@@ -1,9 +1,12 @@
 package rendr
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,6 +26,7 @@ const (
 	defaultPeakMinGain        = 0.90
 	defaultPeakMinBytes       = 256 << 10
 	defaultPeakMinSampleBytes = 32 << 10
+	defaultPeakFailureSamples = 2
 	peakMaximumLossPP         = 50
 	peakMaximumJitter         = 200 * time.Millisecond
 	peakQualityFreshFor       = 5 * time.Second
@@ -31,12 +35,10 @@ const (
 type peakTransferController struct {
 	e *engine.Engine
 
-	normalIDs    []uint32
-	peakIDs      []uint32
-	opts         PeakTransfer
 	tuning       SelectorTuning
 	localTargets peakTransferTargets
 	peerTargets  peakTransferTargets
+	additional   []*peakTransferController
 
 	mu sync.Mutex
 	tx peakTransferDirection
@@ -48,6 +50,10 @@ type peakTransferController struct {
 	policyApplyForTest func(bool, peakTransferChoice, proto.TargetID, string) error
 	// directionObserveForTest is installed before concurrent use.
 	directionObserveForTest func(time.Time, bool)
+	// policyRetryReservedForTest is installed before concurrent use.
+	policyRetryReservedForTest func(bool, uint64)
+	// peerInitializationForTest is installed before concurrent use.
+	peerInitializationForTest func(context.Context, proto.TargetID, bool, string) (proto.TargetID, uint64, error)
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -62,6 +68,18 @@ const (
 	peakTransferPeak
 )
 
+type peakPolicyRetryIntent struct {
+	choice             peakTransferChoice
+	cause              string
+	expectedTarget     proto.TargetID
+	expectedGeneration uint64
+	expectedPeakTarget proto.TargetID
+}
+
+func (intent peakPolicyRetryIntent) valid() bool {
+	return (intent.choice == peakTransferNormal || intent.choice == peakTransferPeak) && intent.cause != ""
+}
+
 type peakTransferTargets struct {
 	selectorID      proto.TargetID
 	normalTargetID  proto.TargetID
@@ -71,15 +89,52 @@ type peakTransferTargets struct {
 
 func peakTargetsFromManifest(manifest proto.GraphManifest) peakTransferTargets {
 	root, ok := manifest.Node(manifest.RootID)
-	if !ok || root.Kind != proto.GraphNodeKindSelector || len(root.PeakCandidates) == 0 {
+	if !ok {
 		return peakTransferTargets{}
 	}
-	peaks := make(map[proto.TargetID]struct{}, len(root.PeakCandidates))
-	for _, id := range root.PeakCandidates {
+	return peakTargetsForSelectorNode(root)
+}
+
+func peakTargetSetsFromManifest(manifest proto.GraphManifest) []peakTransferTargets {
+	targets := make([]peakTransferTargets, 0)
+	for _, node := range manifest.Nodes {
+		compiled := peakTargetsForSelectorNode(node)
+		if compiled.selectorID != (proto.TargetID{}) {
+			targets = append(targets, compiled)
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return bytes.Compare(targets[i].selectorID[:], targets[j].selectorID[:]) < 0
+	})
+	return targets
+}
+
+func orderedPeakTargetSets(manifest proto.GraphManifest) []peakTransferTargets {
+	sets := peakTargetSetsFromManifest(manifest)
+	root := peakTargetsFromManifest(manifest)
+	if root.selectorID == (proto.TargetID{}) {
+		return sets
+	}
+	ordered := make([]peakTransferTargets, 0, len(sets))
+	ordered = append(ordered, root)
+	for _, targets := range sets {
+		if targets.selectorID != root.selectorID {
+			ordered = append(ordered, targets)
+		}
+	}
+	return ordered
+}
+
+func peakTargetsForSelectorNode(selector proto.GraphNode) peakTransferTargets {
+	if selector.Kind != proto.GraphNodeKindSelector || len(selector.PeakCandidates) == 0 {
+		return peakTransferTargets{}
+	}
+	peaks := make(map[proto.TargetID]struct{}, len(selector.PeakCandidates))
+	for _, id := range selector.PeakCandidates {
 		peaks[id] = struct{}{}
 	}
-	targets := peakTransferTargets{selectorID: root.ID}
-	for _, id := range root.Children {
+	targets := peakTransferTargets{selectorID: selector.ID}
+	for _, id := range selector.Children {
 		if _, peak := peaks[id]; peak {
 			targets.peakTargetIDs = append(targets.peakTargetIDs, id)
 			continue
@@ -138,66 +193,104 @@ type peakTransferDirection struct {
 	normalBytes              uint64
 	peakVerified             bool
 	peakStarted              time.Time
+	peakStartedFromCommit    bool
 	demandSuppressUntil      time.Time
 	candidateSuppressUntil   map[proto.TargetID]time.Time
 	policyRetryAfter         time.Time
+	policyRetryDelay         time.Duration
 	lastPolicyError          string
 	saturatedSince           time.Time
 	returnSince              time.Time
 	policyOutcomeUncertain   bool
+	promotionRetryPending    bool
+	policyRetryIntent        peakPolicyRetryIntent
 	cursor                   peakDeliveryCursor
 	lastObservation          peakCapacityObservation
+	capacityFailureTarget    proto.TargetID
+	capacityFailureSamples   uint8
 }
 
-func newPeakTransferController(e *engine.Engine, plan compiledTarget, pathIDs []uint32) *peakTransferController {
+func newPeakTransferController(e *engine.Engine, plan compiledTarget) *peakTransferController {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &peakTransferController{
-		e: e, opts: plan.peakOptions, tuning: plan.runtimeConfig.Selector,
+		e: e, tuning: plan.runtimeConfig.Selector,
 		ctx: ctx, cancel: cancel,
 	}
-	for i, id := range pathIDs {
-		if id == 0 {
-			continue
+	localSets := orderedPeakTargetSets(plan.graph.manifest)
+	peerSets := orderedPeakTargetSets(e.PeerGraphManifest())
+	count := len(localSets)
+	if len(peerSets) > count {
+		count = len(peerSets)
+	}
+	for index := 0; index < count; index++ {
+		member := c
+		if index != 0 {
+			member = &peakTransferController{
+				e: e, tuning: plan.runtimeConfig.Selector, ctx: ctx, cancel: cancel,
+			}
+			c.additional = append(c.additional, member)
 		}
-		if i < len(plan.pathPeak) && plan.pathPeak[i] {
-			c.peakIDs = append(c.peakIDs, id)
-		} else {
-			c.normalIDs = append(c.normalIDs, id)
+		if index < len(localSets) {
+			member.localTargets = localSets[index]
+		}
+		if index < len(peerSets) {
+			member.peerTargets = peerSets[index]
 		}
 	}
-	c.localTargets = peakTargetsFromManifest(plan.graph.manifest)
-	c.peerTargets = peakTargetsFromManifest(e.PeerGraphManifest())
 	return c
 }
 
 func (c *peakTransferController) start() error {
-	if c == nil || c.e == nil || len(c.localTargets.normalTargetIDs) == 0 ||
-		len(c.localTargets.peakTargetIDs) == 0 || c.localTargets.selectorID == (proto.TargetID{}) {
+	if c == nil || c.e == nil {
 		return nil
 	}
-	if selectorID, targetID, ok := c.localTargets.selection(peakTransferNormal); ok {
-		if err := c.e.InitializePolicySelection(selectorID, targetID, "selector"); err != nil {
-			c.cancel()
-			return fmt.Errorf("rendr: initialize local PeakTransfer selection: %w", err)
+	members := c.members()
+	active := false
+	for _, member := range members {
+		if selectorID, targetID, ok := member.localTargets.selection(peakTransferNormal); ok {
+			active = true
+			if err := c.e.InitializePolicySelection(selectorID, targetID, "selector"); err != nil {
+				c.cancel()
+				return fmt.Errorf("rendr: initialize local PeakTransfer selection: %w", err)
+			}
 		}
+		if _, _, ok := member.peerTargets.selection(peakTransferNormal); ok {
+			active = true
+		}
+	}
+	if !active {
+		return nil
 	}
 	c.e.SetPeerPolicyAdmission(c.admitPeerSelection)
 	c.e.SetPeakPolicyObserver(c.observeCommittedPeakPolicy)
 	c.e.StartSelector(0)
-	peerSelectorID := proto.TargetID{}
-	if selectorID, _, ok := c.peerTargets.selection(peakTransferNormal); ok {
-		peerSelectorID = selectorID
+	for _, member := range members {
+		if _, _, ok := member.localTargets.selection(peakTransferNormal); ok {
+			c.workers.Add(1)
+			go func(worker *peakTransferController) {
+				defer c.workers.Done()
+				worker.directionLoop(false, proto.TargetID{})
+			}(member)
+		}
+		if peerSelectorID, _, ok := member.peerTargets.selection(peakTransferNormal); ok {
+			c.workers.Add(1)
+			go func(worker *peakTransferController, selectorID proto.TargetID) {
+				defer c.workers.Done()
+				worker.directionLoop(true, selectorID)
+			}(member, peerSelectorID)
+		}
 	}
-	c.workers.Add(2)
-	go func() {
-		defer c.workers.Done()
-		c.directionLoop(false, proto.TargetID{})
-	}()
-	go func() {
-		defer c.workers.Done()
-		c.directionLoop(true, peerSelectorID)
-	}()
 	return nil
+}
+
+func (c *peakTransferController) members() []*peakTransferController {
+	if c == nil {
+		return nil
+	}
+	members := make([]*peakTransferController, 0, 1+len(c.additional))
+	members = append(members, c)
+	members = append(members, c.additional...)
+	return members
 }
 
 func (c *peakTransferController) stopLoop() {
@@ -214,9 +307,11 @@ func (c *peakTransferController) stopLoop() {
 		}
 	})
 	c.workers.Wait()
-	c.mu.Lock()
-	c.peerInitializationErr = nil
-	c.mu.Unlock()
+	for _, member := range c.members() {
+		member.mu.Lock()
+		member.peerInitializationErr = nil
+		member.mu.Unlock()
+	}
 }
 
 type peakPeerInitialization struct {
@@ -251,16 +346,106 @@ func (c *peakTransferController) directionLoop(rx bool, peerSelectorID proto.Tar
 			return
 		case <-ticker.C:
 			now := time.Now()
-			if c.directionObserveForTest != nil {
-				c.directionObserveForTest(now, rx)
-			} else {
-				c.observeDelivery(now, rx)
-			}
+			c.runDirectionTick(now, rx)
 			if rx {
 				c.advancePeerInitialization(&initialization, time.Now())
 			}
 		}
 	}
+}
+
+func (c *peakTransferController) runDirectionTick(now time.Time, rx bool) {
+	c.retryPendingPolicy(now, rx)
+	if c.directionObserveForTest != nil {
+		c.directionObserveForTest(now, rx)
+		return
+	}
+	c.observeDelivery(now, rx)
+}
+
+func (c *peakTransferController) retryPendingPolicy(now time.Time, rx bool) bool {
+	c.mu.Lock()
+	state := &c.tx
+	if rx {
+		state = &c.rx
+	}
+	intent := state.policyRetryIntent
+	if !intent.valid() || now.Before(state.policyRetryAfter) {
+		c.mu.Unlock()
+		return false
+	}
+	if state.actualTarget != intent.expectedTarget ||
+		state.actualSelectorGeneration != intent.expectedGeneration ||
+		(intent.choice == peakTransferPeak && state.onPeak) ||
+		(intent.choice == peakTransferNormal &&
+			(!state.onPeak || state.activePeakTarget != intent.expectedPeakTarget)) {
+		state.clearPolicyRetry()
+		c.mu.Unlock()
+		return false
+	}
+	excluded := make([]proto.TargetID, 0)
+	if intent.choice == peakTransferPeak {
+		targets := c.localTargets.peakTargetIDs
+		if rx {
+			targets = c.peerTargets.peakTargetIDs
+		}
+		for _, targetID := range targets {
+			if state.peakTargetSuppressed(targetID, now) {
+				excluded = append(excluded, targetID)
+			}
+		}
+	}
+	failedTarget := state.activePeakTarget
+	state.policyRetryIntent = peakPolicyRetryIntent{}
+	state.policyOutcomeUncertain = false
+	intentPhase := c.reservePolicyIntentLocked(state, rx)
+	c.mu.Unlock()
+	if c.policyRetryReservedForTest != nil {
+		c.policyRetryReservedForTest(rx, intentPhase)
+	}
+
+	var (
+		err error
+	)
+	if intent.choice == peakTransferPeak {
+		_, _, err = c.beginPeakObservationAtPhase(rx, excluded, intent.cause, intentPhase)
+	} else {
+		_, _, err = c.applyPolicyTransitionAtPhase(
+			rx, peakTransferNormal, proto.TargetID{}, intent.cause, intentPhase,
+		)
+	}
+	completedAt := time.Now()
+	c.mu.Lock()
+	state = &c.tx
+	if rx {
+		state = &c.rx
+	}
+	if state.phaseGeneration != intentPhase {
+		c.mu.Unlock()
+		return true
+	}
+	if err != nil {
+		state.recordPolicyFailure(err, completedAt, intent.choice, intent.cause)
+		if intent.choice == peakTransferPeak {
+			state.promotionRetryPending = state.policyRetryIntent.valid()
+		}
+		c.mu.Unlock()
+		return true
+	}
+	state.clearPolicyRetry()
+	if intent.choice == peakTransferPeak {
+		state.promotionRetryPending = false
+		c.mu.Unlock()
+		return true
+	}
+	state.resetAfterReturn()
+	if peakVerificationFailed(intent.cause) {
+		state.suppressPeakTarget(failedTarget, completedAt.Add(defaultPeakSuppressFor))
+	} else {
+		state.demandSuppressUntil = completedAt.Add(defaultPeakSuppressFor)
+	}
+	c.mu.Unlock()
+	return true
 }
 
 func (c *peakTransferController) advancePeerInitialization(
@@ -283,11 +468,11 @@ func (c *peakTransferController) advancePeerInitialization(
 	}
 	c.mu.Unlock()
 
-	targetID, generation, err := c.e.RequestPeerSelectionClass(
-		c.policyContext(), initialization.selectorID, false, "selector-rx",
+	targetID, generation, err := c.requestPeerInitialization(
+		c.policyContext(), initialization.selectorID,
 	)
 	completedAt := time.Now()
-	if c.policyContext().Err() != nil || c.e.IsClosed() {
+	if c.policyContext().Err() != nil || (c.e != nil && c.e.IsClosed()) {
 		initialization.active = false
 		return
 	}
@@ -312,6 +497,10 @@ func (c *peakTransferController) advancePeerInitialization(
 		c.rx.policyRetryAfter = completedAt.Add(defaultPeakWindow)
 		return
 	}
+	if errors.Is(err, engine.ErrPolicyRejected) && !engine.IsRetryablePolicyRejection(err) {
+		initialization.active = false
+		return
+	}
 	initialization.retryAt = completedAt.Add(initialization.retryDelay)
 	if initialization.retryDelay < defaultPeakSuppressFor {
 		initialization.retryDelay *= 2
@@ -319,6 +508,19 @@ func (c *peakTransferController) advancePeerInitialization(
 			initialization.retryDelay = defaultPeakSuppressFor
 		}
 	}
+}
+
+func (c *peakTransferController) requestPeerInitialization(
+	ctx context.Context,
+	selectorID proto.TargetID,
+) (proto.TargetID, uint64, error) {
+	if c.peerInitializationForTest != nil {
+		return c.peerInitializationForTest(ctx, selectorID, false, "selector-rx")
+	}
+	if c.e == nil {
+		return proto.TargetID{}, 0, errors.New("rendr: peer selector is unavailable")
+	}
+	return c.e.RequestPeerSelectionClass(ctx, selectorID, false, "selector-rx")
 }
 
 func (c *peakTransferController) directionPhase(rx bool) uint64 {
@@ -335,12 +537,21 @@ func (c *peakTransferController) markPolicyIntent(rx bool) uint64 {
 	state := &c.tx
 	if rx {
 		state = &c.rx
+	}
+	phase := c.reservePolicyIntentLocked(state, rx)
+	c.mu.Unlock()
+	return phase
+}
+
+func (c *peakTransferController) reservePolicyIntentLocked(
+	state *peakTransferDirection,
+	rx bool,
+) uint64 {
+	if rx {
 		c.peerInitializationErr = nil
 	}
 	advancePeakDirectionPhaseLocked(state)
-	phase := state.phaseGeneration
-	c.mu.Unlock()
-	return phase
+	return state.phaseGeneration
 }
 
 func advancePeakDirectionPhaseLocked(state *peakTransferDirection) {
@@ -361,20 +572,34 @@ func (c *peakTransferController) statusIssues() []StatusIssue {
 	if c == nil {
 		return nil
 	}
-	c.mu.Lock()
-	err := c.peerInitializationErr
-	c.mu.Unlock()
-	if err == nil {
-		return nil
+	issues := make([]StatusIssue, 0)
+	for _, member := range c.members() {
+		member.mu.Lock()
+		err := member.peerInitializationErr
+		member.mu.Unlock()
+		if err == nil {
+			continue
+		}
+		id := StatusIssuePeerPolicyInitialization
+		if errors.Is(err, engine.ErrPolicyOutcomeUnknown) {
+			id = StatusIssuePeerPolicyOutcomeUnknown
+		}
+		issues = append(issues, StatusIssue{ID: id, LastError: err.Error()})
 	}
-	id := StatusIssuePeerPolicyInitialization
-	if errors.Is(err, engine.ErrPolicyOutcomeUnknown) {
-		id = StatusIssuePeerPolicyOutcomeUnknown
-	}
-	return []StatusIssue{{ID: id, LastError: err.Error()}}
+	return issues
 }
 
 func (c *peakTransferController) admitPeerSelection(selectorID, targetID proto.TargetID, _ string) error {
+	for _, member := range c.members() {
+		if member.localTargets.selectorID != selectorID {
+			continue
+		}
+		return member.admitPeerSelectionOne(selectorID, targetID)
+	}
+	return nil
+}
+
+func (c *peakTransferController) admitPeerSelectionOne(selectorID, targetID proto.TargetID) error {
 	wantSelector, _, ok := c.localTargets.selection(peakTransferPeak)
 	if !ok || selectorID != wantSelector || !c.localTargets.isPeakTarget(targetID) {
 		return nil
@@ -394,10 +619,11 @@ func (c *peakTransferController) admitPeerSelection(selectorID, targetID proto.T
 }
 
 type listenerPeakTransferAdmission struct {
-	mu      sync.Mutex
-	e       *engine.Engine
-	targets peakTransferTargets
-	state   peakTransferDirection
+	mu         sync.Mutex
+	e          *engine.Engine
+	targets    peakTransferTargets
+	state      peakTransferDirection
+	additional []*listenerPeakTransferAdmission
 }
 
 // installPeakTransferPeerAdmission gives a listener-owned sender the same
@@ -407,21 +633,45 @@ func installPeakTransferPeerAdmission(e *engine.Engine) *listenerPeakTransferAdm
 	if e == nil {
 		return nil
 	}
-	targets := peakTargetsFromManifest(e.LocalGraphManifest())
-	if targets.selectorID == (proto.TargetID{}) || len(targets.peakTargetIDs) == 0 {
+	targetSets := orderedPeakTargetSets(e.LocalGraphManifest())
+	if len(targetSets) == 0 {
 		return nil
 	}
-	admission := &listenerPeakTransferAdmission{e: e, targets: targets}
+	admission := &listenerPeakTransferAdmission{e: e, targets: targetSets[0]}
+	for _, targets := range targetSets[1:] {
+		admission.additional = append(admission.additional, &listenerPeakTransferAdmission{
+			e: e, targets: targets,
+		})
+	}
 	e.SetPeerPolicyAdmission(admission.admit)
 	e.SetPeakPolicyObserver(admission.observe)
 	return admission
+}
+
+func (a *listenerPeakTransferAdmission) members() []*listenerPeakTransferAdmission {
+	if a == nil {
+		return nil
+	}
+	members := make([]*listenerPeakTransferAdmission, 0, 1+len(a.additional))
+	members = append(members, a)
+	members = append(members, a.additional...)
+	return members
 }
 
 func (a *listenerPeakTransferAdmission) admit(
 	selectorID, targetID proto.TargetID,
 	_ string,
 ) error {
-	if a == nil || selectorID != a.targets.selectorID || !a.targets.isPeakTarget(targetID) {
+	for _, member := range a.members() {
+		if selectorID == member.targets.selectorID {
+			return member.admitOne(selectorID, targetID)
+		}
+	}
+	return nil
+}
+
+func (a *listenerPeakTransferAdmission) admitOne(selectorID, targetID proto.TargetID) error {
+	if selectorID != a.targets.selectorID || !a.targets.isPeakTarget(targetID) {
 		return nil
 	}
 	if a.e != nil {
@@ -508,9 +758,20 @@ func (a *listenerPeakTransferAdmission) observe(
 	peak bool,
 	cause string,
 ) {
-	if a == nil || selectorID != a.targets.selectorID {
-		return
+	for _, member := range a.members() {
+		if selectorID == member.targets.selectorID {
+			member.observeOne(selectorID, targetID, selectorGeneration, peak, cause)
+			return
+		}
 	}
+}
+
+func (a *listenerPeakTransferAdmission) observeOne(
+	selectorID, targetID proto.TargetID,
+	selectorGeneration uint64,
+	peak bool,
+	cause string,
+) {
 	a.mu.Lock()
 	if !peakDirectionGenerationAccepts(&a.state, targetID, selectorGeneration) {
 		a.mu.Unlock()
@@ -533,12 +794,18 @@ func (c *peakTransferController) observeDelivery(now time.Time, rx bool) {
 	}
 	var snapshot engine.TargetDeliverySnapshot
 	if rx {
-		snapshot = c.e.PeerTargetDelivery(proto.TargetID{})
+		snapshot = c.e.PeerTargetDeliveryForSelector(c.peerTargets.selectorID, proto.TargetID{})
 	} else {
-		snapshot = c.e.TargetApplicationDelivery(proto.TargetID{})
+		snapshot = c.e.TargetApplicationDeliveryForSelector(c.localTargets.selectorID, proto.TargetID{})
 	}
 	if snapshot.SelectorID == (proto.TargetID{}) || snapshot.TargetID == (proto.TargetID{}) ||
 		snapshot.SelectorGeneration == 0 || snapshot.EvidenceEpoch == 0 || !snapshot.Attributable {
+		if !rx && snapshot.SelectorID != (proto.TargetID{}) && snapshot.TargetID != (proto.TargetID{}) &&
+			snapshot.SelectorGeneration != 0 && snapshot.EvidenceEpoch != 0 {
+			pending := c.e.ApplicationDelivery().PendingPayloadBytes
+			c.observeUnattributableTXIdle(now, snapshot, pending)
+			return
+		}
 		c.resetDeliveryCursor(rx)
 		return
 	}
@@ -562,7 +829,6 @@ func (c *peakTransferController) observeDelivery(now time.Time, rx bool) {
 	if !cursor.matches(snapshot) {
 		*cursor = cursorFromDelivery(snapshot, now)
 		if state.onPeak {
-			state.peakStarted = time.Time{}
 			state.returnSince = time.Time{}
 		}
 		c.mu.Unlock()
@@ -585,12 +851,51 @@ func (c *peakTransferController) observeDelivery(now time.Time, rx bool) {
 
 	bps := 0.0
 	if elapsed > 0 {
-		bps = float64(bytes*8) / elapsed.Seconds()
+		bps = float64(bytes) * 8 / elapsed.Seconds()
 	}
 	c.evaluatePassiveWithPending(
 		now, bytes, demand, bps, elapsed, snapshot.TargetID,
 		snapshot.PublishedBytes > snapshot.AckedBytes, rx,
 	)
+}
+
+// observeUnattributableTXIdle handles a narrow post-replay state: unique DATA
+// was delivered, but cross-root replay correctly invalidated target-specific
+// attribution. A stable identity/epoch plus an empty application replay ledger
+// proves that demand is idle without pretending the replay belonged to the
+// peak target. RX has no equivalent sender-side pending-byte proof and never
+// enters this path.
+func (c *peakTransferController) observeUnattributableTXIdle(
+	now time.Time,
+	snapshot engine.TargetDeliverySnapshot,
+	pendingPayloadBytes uint64,
+) {
+	c.mu.Lock()
+	state := &c.tx
+	identityCurrent := state.onPeak && state.activePeakTarget == snapshot.TargetID &&
+		state.actualTarget == snapshot.TargetID &&
+		state.actualSelectorGeneration == snapshot.SelectorGeneration &&
+		c.localTargets.selectorID == snapshot.SelectorID
+	if !identityCurrent || pendingPayloadBytes != 0 {
+		state.cursor = peakDeliveryCursor{}
+		state.returnSince = time.Time{}
+		c.mu.Unlock()
+		return
+	}
+	if !state.cursor.matches(snapshot) {
+		state.cursor = cursorFromDelivery(snapshot, now)
+		state.returnSince = time.Time{}
+		c.mu.Unlock()
+		return
+	}
+	elapsed := now.Sub(state.cursor.at)
+	if elapsed < c.observationWindow(false, snapshot.TargetID) {
+		c.mu.Unlock()
+		return
+	}
+	state.cursor = cursorFromDelivery(snapshot, now)
+	c.mu.Unlock()
+	c.evaluatePassiveWithPending(now, 0, 0, 0, elapsed, snapshot.TargetID, false, false)
 }
 
 func (c *peakTransferController) reconcileActualTarget(
@@ -635,6 +940,9 @@ func reconcilePeakDirectionLocked(
 	}
 	changed := state.actualTarget != targetID ||
 		(selectorGeneration != 0 && state.actualSelectorGeneration != selectorGeneration)
+	if changed {
+		state.clearPolicyRetry()
+	}
 	if selectorGeneration != 0 {
 		state.actualSelectorGeneration = selectorGeneration
 	}
@@ -644,9 +952,12 @@ func reconcilePeakDirectionLocked(
 			state.onPeak = true
 			state.activePeakTarget = targetID
 			state.peakVerified = false
-			state.peakStarted = time.Time{}
+			state.peakStarted = time.Now()
+			state.peakStartedFromCommit = true
 			state.returnSince = time.Time{}
 			state.cursor = peakDeliveryCursor{}
+			state.promotionRetryPending = false
+			state.resetCapacityFailureEvidence()
 			changed = true
 		}
 		return changed
@@ -697,8 +1008,10 @@ func (c *peakTransferController) resetDeliveryCursor(rx bool) {
 	c.mu.Lock()
 	if rx {
 		c.rx.cursor = peakDeliveryCursor{}
+		c.rx.resetCapacityFailureEvidence()
 	} else {
 		c.tx.cursor = peakDeliveryCursor{}
+		c.tx.resetCapacityFailureEvidence()
 	}
 	c.mu.Unlock()
 }
@@ -798,6 +1111,7 @@ func (c *peakTransferController) evaluateNormalLocked(
 ) {
 	if demand == 0 || bytes == 0 || bps <= 0 {
 		state.saturatedSince = time.Time{}
+		state.promotionRetryPending = false
 		c.mu.Unlock()
 		return
 	}
@@ -811,11 +1125,8 @@ func (c *peakTransferController) evaluateNormalLocked(
 		c.mu.Unlock()
 		return
 	}
-	ratio := c.opts.SaturationRatio
-	if ratio <= 0 {
-		ratio = defaultPeakSaturation
-	}
-	if bps < state.normalPeakBps*ratio {
+	ratio := defaultPeakSaturation
+	if bps < state.normalPeakBps*ratio && !state.promotionRetryPending {
 		state.saturatedSince = time.Time{}
 		c.mu.Unlock()
 		return
@@ -823,12 +1134,9 @@ func (c *peakTransferController) evaluateNormalLocked(
 	if state.saturatedSince.IsZero() {
 		state.saturatedSince = now.Add(-duration)
 	}
-	needFor := c.opts.SaturationFor
+	needFor := c.tuning.PeakPromoteAfter
 	if needFor <= 0 {
-		needFor = c.tuning.PeakPromoteAfter
-		if needFor <= 0 {
-			needFor = defaultPeakSaturationFor
-		}
+		needFor = defaultPeakSaturationFor
 	}
 	if now.Sub(state.saturatedSince) < needFor || now.Before(state.demandSuppressUntil) ||
 		now.Before(state.policyRetryAfter) {
@@ -874,19 +1182,13 @@ func (c *peakTransferController) evaluateNormalLocked(
 		return
 	}
 	if err != nil {
-		state.lastPolicyError = err.Error()
-		if errors.Is(err, engine.ErrPolicyOutcomeUnknown) {
-			state.policyOutcomeUncertain = true
-			state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
-		} else if peakPolicyDecisionRetryable(err) {
-			state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
+		state.recordPolicyFailure(err, completedAt, peakTransferPeak, "peak-transfer")
+		state.promotionRetryPending = state.policyRetryIntent.valid()
+		if state.promotionRetryPending {
 			state.saturatedSince = completedAt.Add(-needFor)
-		} else {
-			state.policyRetryAfter = completedAt.Add(defaultPeakSuppressFor)
 		}
 	} else {
-		state.lastPolicyError = ""
-		state.policyRetryAfter = time.Time{}
+		state.clearPolicyRetry()
 	}
 	c.mu.Unlock()
 }
@@ -914,15 +1216,53 @@ func (c *peakTransferController) evaluatePeakLocked(
 	if state.peakStarted.IsZero() {
 		state.peakStarted = now.Add(-duration)
 	}
-	conclusive := demand >= defaultPeakMinSampleBytes && bytes != 0 && state.normalPeakBps > 0
+	if state.peakStartedFromCommit && (demand != 0 || pending) {
+		if now.Sub(state.peakStarted) < defaultPeakSaturationFor {
+			state.returnSince = time.Time{}
+			c.mu.Unlock()
+			return
+		}
+	}
+	sampled, success := peakCapacitySampleVerdict(bytes, demand, bps, duration, state.normalPeakBps, pending)
+	conclusive := sampled && success
+	if sampled && !success {
+		if state.capacityFailureTarget != state.activePeakTarget {
+			state.resetCapacityFailureEvidence()
+			state.capacityFailureTarget = state.activePeakTarget
+		}
+		if state.capacityFailureSamples < ^uint8(0) {
+			state.capacityFailureSamples++
+		}
+		conclusive = state.capacityFailureSamples >= defaultPeakFailureSamples ||
+			duration >= defaultPeakSaturationFor
+		state.lastObservation = peakCapacityObservation{
+			targetID: state.activePeakTarget, bytes: bytes, demand: demand,
+			duration: duration, bps: bps, conclusive: conclusive,
+		}
+		if !conclusive {
+			// One low window can be the partial window immediately after a
+			// policy cutover. It is active demand, not an idle-return signal.
+			state.returnSince = time.Time{}
+			c.mu.Unlock()
+			return
+		}
+	} else if sampled {
+		state.resetCapacityFailureEvidence()
+	} else if !pending {
+		state.resetCapacityFailureEvidence()
+	}
 	if conclusive {
-		success := bps >= state.normalPeakBps*defaultPeakMinGain
 		state.lastObservation = peakCapacityObservation{
 			targetID: state.activePeakTarget, bytes: bytes, demand: demand,
 			duration: duration, bps: bps, conclusive: true, success: success,
 		}
 		if !success {
+			if now.Before(state.policyRetryAfter) {
+				c.mu.Unlock()
+				return
+			}
 			failedTarget := state.activePeakTarget
+			state.policyRetryIntent = peakPolicyRetryIntent{}
 			c.mu.Unlock()
 			_, intentPhase, err := c.applyPolicyTransition(rx, peakTransferNormal, proto.TargetID{}, "peak-verify-failed")
 			completedAt := time.Now()
@@ -936,19 +1276,12 @@ func (c *peakTransferController) evaluatePeakLocked(
 				return
 			}
 			if err != nil {
-				state.lastPolicyError = err.Error()
-				if errors.Is(err, engine.ErrPolicyOutcomeUnknown) {
-					state.policyOutcomeUncertain = true
-					state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
-				} else if peakPolicyDecisionRetryable(err) {
-					state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
-				} else {
-					state.policyRetryAfter = completedAt.Add(defaultPeakSuppressFor)
-				}
+				state.recordPolicyFailure(
+					err, completedAt, peakTransferNormal, "peak-verify-failed",
+				)
 				c.mu.Unlock()
 				return
 			}
-			state.lastPolicyError = ""
 			state.resetAfterReturn()
 			state.suppressPeakTarget(failedTarget, completedAt.Add(defaultPeakSuppressFor))
 			c.mu.Unlock()
@@ -999,35 +1332,47 @@ func (c *peakTransferController) evaluatePeakLocked(
 		return
 	}
 	if err != nil {
-		state.lastPolicyError = err.Error()
-		if errors.Is(err, engine.ErrPolicyOutcomeUnknown) {
-			state.policyOutcomeUncertain = true
-			state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
-		} else if peakPolicyDecisionRetryable(err) {
-			state.policyRetryAfter = completedAt.Add(defaultPeakWindow)
-		} else {
-			state.policyRetryAfter = completedAt.Add(defaultPeakSuppressFor)
-		}
+		state.recordPolicyFailure(err, completedAt, peakTransferNormal, "peak-return")
 		c.mu.Unlock()
 		return
 	}
-	state.lastPolicyError = ""
 	state.resetAfterReturn()
 	state.demandSuppressUntil = completedAt.Add(defaultPeakSuppressFor)
 	c.mu.Unlock()
 }
 
-func (c *peakTransferController) returnRatio() float64 {
-	if c.opts.ReturnRatio > 0 {
-		return c.opts.ReturnRatio
+// peakCapacitySampleVerdict validates one demand-backed capacity sample. A
+// success is immediately useful; a failure is only a strike. The controller
+// requires consecutive strikes because the first window after a policy cutover
+// can contain only a fraction of the new path's steady-state traffic.
+func peakCapacitySampleVerdict(
+	bytes, demand uint64,
+	bps float64,
+	duration time.Duration,
+	normalPeakBps float64,
+	pending bool,
+) (sampled, success bool) {
+	if bytes == 0 || (!pending && demand < defaultPeakMinSampleBytes) || duration <= 0 ||
+		bps < 0 || math.IsNaN(bps) || math.IsInf(bps, 0) ||
+		normalPeakBps <= 0 || math.IsNaN(normalPeakBps) || math.IsInf(normalPeakBps, 0) {
+		return false, false
 	}
+
+	minimumBps := normalPeakBps * defaultPeakMinGain
+	if math.IsInf(minimumBps, 0) {
+		return false, false
+	}
+	if bps >= minimumBps {
+		return true, true
+	}
+	return true, false
+}
+
+func (c *peakTransferController) returnRatio() float64 {
 	return defaultPeakReturn
 }
 
 func (c *peakTransferController) returnFor() time.Duration {
-	if c.opts.ReturnFor > 0 {
-		return c.opts.ReturnFor
-	}
 	if c.tuning.PeakReturnAfter > 0 {
 		return c.tuning.PeakReturnAfter
 	}
@@ -1039,11 +1384,69 @@ func (state *peakTransferDirection) resetAfterReturn() {
 	state.activePeakTarget = proto.TargetID{}
 	state.peakVerified = false
 	state.peakStarted = time.Time{}
+	state.peakStartedFromCommit = false
 	state.returnSince = time.Time{}
 	state.cursor = peakDeliveryCursor{}
+	state.clearPolicyRetry()
+	state.resetCapacityFailureEvidence()
+}
+
+func (state *peakTransferDirection) clearPolicyRetry() {
 	state.policyRetryAfter = time.Time{}
+	state.policyRetryDelay = 0
 	state.policyOutcomeUncertain = false
+	state.promotionRetryPending = false
+	state.policyRetryIntent = peakPolicyRetryIntent{}
 	state.lastPolicyError = ""
+}
+
+func (state *peakTransferDirection) recordPolicyFailure(
+	err error,
+	completedAt time.Time,
+	choice peakTransferChoice,
+	cause string,
+) {
+	state.lastPolicyError = err.Error()
+	state.policyRetryIntent = peakPolicyRetryIntent{}
+	switch {
+	case errors.Is(err, engine.ErrPolicyOutcomeUnknown):
+		state.policyOutcomeUncertain = true
+		state.policyRetryAfter = completedAt.Add(state.nextPolicyRetryDelay())
+	case peakPolicyDecisionRetryable(err):
+		state.policyOutcomeUncertain = false
+		state.policyRetryAfter = completedAt.Add(state.nextPolicyRetryDelay())
+	default:
+		state.policyOutcomeUncertain = false
+		state.policyRetryDelay = 0
+		state.policyRetryAfter = completedAt.Add(defaultPeakSuppressFor)
+		return
+	}
+	state.policyRetryIntent = peakPolicyRetryIntent{
+		choice:             choice,
+		cause:              cause,
+		expectedTarget:     state.actualTarget,
+		expectedGeneration: state.actualSelectorGeneration,
+		expectedPeakTarget: state.activePeakTarget,
+	}
+}
+
+func (state *peakTransferDirection) nextPolicyRetryDelay() time.Duration {
+	delay := state.policyRetryDelay
+	if delay <= 0 {
+		delay = defaultPeakWindow
+	} else if delay < defaultPeakSuppressFor {
+		delay *= 2
+		if delay > defaultPeakSuppressFor {
+			delay = defaultPeakSuppressFor
+		}
+	}
+	state.policyRetryDelay = delay
+	return delay
+}
+
+func (state *peakTransferDirection) resetCapacityFailureEvidence() {
+	state.capacityFailureTarget = proto.TargetID{}
+	state.capacityFailureSamples = 0
 }
 
 func (c *peakTransferController) beginPeakObservation(
@@ -1051,9 +1454,21 @@ func (c *peakTransferController) beginPeakObservation(
 	excluded []proto.TargetID,
 	cause string,
 ) (proto.TargetID, uint64, error) {
+	intentPhase := c.markPolicyIntent(rx)
+	return c.beginPeakObservationAtPhase(rx, excluded, cause, intentPhase)
+}
+
+func (c *peakTransferController) beginPeakObservationAtPhase(
+	rx bool,
+	excluded []proto.TargetID,
+	cause string,
+	intentPhase uint64,
+) (proto.TargetID, uint64, error) {
+	if !c.policyIntentCurrent(rx, intentPhase) {
+		return proto.TargetID{}, intentPhase, nil
+	}
 	var (
 		appliedTarget proto.TargetID
-		intentPhase   uint64
 		err           error
 	)
 	if rx || c.policyApplyForTest != nil {
@@ -1074,9 +1489,10 @@ func (c *peakTransferController) beginPeakObservation(
 				}
 			}
 		}
-		appliedTarget, intentPhase, err = c.applyPolicyTransition(rx, peakTransferPeak, targetID, cause)
+		appliedTarget, _, err = c.applyPolicyTransitionAtPhase(
+			rx, peakTransferPeak, targetID, cause, intentPhase,
+		)
 	} else {
-		intentPhase = c.markPolicyIntent(false)
 		appliedTarget, err = c.e.SelectBestLocalPeakTransferTarget(
 			c.localTargets.selectorID, excluded, cause,
 		)
@@ -1097,13 +1513,31 @@ func (c *peakTransferController) beginPeakObservation(
 	state.activePeakTarget = appliedTarget
 	state.peakVerified = false
 	state.peakStarted = time.Time{}
+	state.peakStartedFromCommit = false
 	state.returnSince = time.Time{}
 	state.cursor = peakDeliveryCursor{}
+	state.promotionRetryPending = false
+	state.resetCapacityFailureEvidence()
 	c.mu.Unlock()
 	return appliedTarget, intentPhase, nil
 }
 
 func (c *peakTransferController) observeCommittedPeakPolicy(
+	selectorID, targetID proto.TargetID,
+	selectorGeneration uint64,
+	peak bool,
+	cause string,
+) {
+	for _, member := range c.members() {
+		if member.localTargets.selectorID != selectorID {
+			continue
+		}
+		member.observeCommittedPeakPolicyOne(selectorID, targetID, selectorGeneration, peak, cause)
+		return
+	}
+}
+
+func (c *peakTransferController) observeCommittedPeakPolicyOne(
 	selectorID, targetID proto.TargetID,
 	selectorGeneration uint64,
 	peak bool,
@@ -1142,7 +1576,7 @@ func peakVerificationFailed(cause string) bool {
 
 func peakPolicyDecisionRetryable(err error) bool {
 	return errors.Is(err, engine.ErrSelectorDecisionUnavailable) ||
-		errors.Is(err, engine.ErrPolicyRejected)
+		engine.IsRetryablePolicyRejection(err)
 }
 
 func (c *peakTransferController) lastPeakObservation(rx bool) peakCapacityObservation {
@@ -1188,6 +1622,19 @@ func (c *peakTransferController) applyPolicyTransition(
 	cause string,
 ) (proto.TargetID, uint64, error) {
 	intentPhase := c.markPolicyIntent(rx)
+	return c.applyPolicyTransitionAtPhase(rx, choice, targetID, cause, intentPhase)
+}
+
+func (c *peakTransferController) applyPolicyTransitionAtPhase(
+	rx bool,
+	choice peakTransferChoice,
+	targetID proto.TargetID,
+	cause string,
+	intentPhase uint64,
+) (proto.TargetID, uint64, error) {
+	if !c.policyIntentCurrent(rx, intentPhase) {
+		return proto.TargetID{}, intentPhase, nil
+	}
 	if c.policyApplyForTest != nil {
 		targets := c.localTargets
 		if rx {
@@ -1237,6 +1684,17 @@ func (c *peakTransferController) applyPolicyTransition(
 		return proto.TargetID{}, intentPhase, err
 	}
 	return targetID, intentPhase, nil
+}
+
+func (c *peakTransferController) policyIntentCurrent(rx bool, intentPhase uint64) bool {
+	c.mu.Lock()
+	state := &c.tx
+	if rx {
+		state = &c.rx
+	}
+	current := state.phaseGeneration == intentPhase
+	c.mu.Unlock()
+	return current
 }
 
 func (c *peakTransferController) applyPolicyTarget(rx bool, choice peakTransferChoice, targetID proto.TargetID, cause string) error {

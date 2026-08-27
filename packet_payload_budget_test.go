@@ -6,6 +6,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/proto"
+	transportquic "github.com/FrankoonG/rendr/transport/quic"
 )
 
 func testPeakTransferQUICDatagramPayloadBudget(t *testing.T) {
@@ -76,9 +79,10 @@ func testPeakTransferQUICDatagramPayloadBudget(t *testing.T) {
 	}
 
 	before := client.Paths()
-	assertDelivered("1184-byte boundary", bytes.Repeat([]byte{0x84}, 1184))
+	payloadLimit := transportquic.MaxDatagramFrame - proto.HeaderSize - proto.DataSelectorStateEpochSize
+	assertDelivered("QUIC DATAGRAM payload boundary", bytes.Repeat([]byte{0x84}, payloadLimit))
 
-	for _, size := range []int{1185, 1192} {
+	for _, size := range []int{payloadLimit + 1, payloadLimit + 8} {
 		payload := bytes.Repeat([]byte{byte(size)}, size)
 		n, err := client.WriteTo(payload, nil)
 		if n != 0 || !errors.Is(err, ErrPacketTooLarge) {

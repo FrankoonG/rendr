@@ -14,7 +14,9 @@ import (
 	"github.com/FrankoonG/rendr/internal/leafmobility"
 )
 
-const gvisorLinkProbeRevision uint32 = 2
+const gvisorLinkProbeRevision uint32 = 3
+
+var errLinkAttemptSourceChanged = errors.New("gvisor: packet-link source changed")
 
 type linkDriver struct {
 	owner         *linkOwner
@@ -43,6 +45,7 @@ func (driver *linkDriver) Preflight(
 	}
 	incarnation := owner.incarnation
 	localGeneration := owner.localGeneration
+	peerGeneration := owner.peerGeneration
 	active := owner.active
 	remote := cloneAddr(owner.peerRemote)
 	virtualIP := owner.virtualIP
@@ -59,17 +62,20 @@ func (driver *linkDriver) Preflight(
 		wireFault = true
 	}
 	endpointProbe := linkProbe{
-		ID: leafmobility.ProbeEndpointState, Label: "owned-gvisor-endpoint-v2",
-		Incarnation: incarnation, LocalGeneration: localGeneration, LinkID: owner.id, VirtualIP: virtualIP,
+		ID: leafmobility.ProbeEndpointState, Label: "owned-gvisor-endpoint-v3",
+		Incarnation: incarnation, LocalGeneration: localGeneration, PeerGeneration: peerGeneration,
+		LinkID: owner.id, VirtualIP: virtualIP,
 	}
 	tupleProbe := linkProbe{
-		ID: leafmobility.ProbeTuple, Label: "authenticated-outer-successor-v2",
-		Incarnation: incarnation, LocalGeneration: localGeneration, LinkID: owner.id, VirtualIP: virtualIP,
+		ID: leafmobility.ProbeTuple, Label: "authenticated-outer-successor-v3",
+		Incarnation: incarnation, LocalGeneration: localGeneration, PeerGeneration: peerGeneration,
+		LinkID: owner.id, VirtualIP: virtualIP,
 		Local: active.conn.LocalAddr().String(), Remote: remote.String(), Route: observation.digest,
 	}
 	rollbackProbe := linkProbe{
-		ID: leafmobility.ProbeRollbackReadiness, Label: "prepublish-predecessor-retained-v2",
-		Incarnation: incarnation, LocalGeneration: localGeneration, LinkID: owner.id, VirtualIP: virtualIP,
+		ID: leafmobility.ProbeRollbackReadiness, Label: "prepublish-predecessor-retained-v3",
+		Incarnation: incarnation, LocalGeneration: localGeneration, PeerGeneration: peerGeneration,
+		LinkID: owner.id, VirtualIP: virtualIP,
 	}
 	probes, err := driver.references(request, endpointProbe, tupleProbe, rollbackProbe)
 	if err != nil {
@@ -80,7 +86,7 @@ func (driver *linkDriver) Preflight(
 		driver: driver, preflight: request, evidence: leafmobility.AttemptEvidence{
 			Digest: evidence, ProbeReferences: probes,
 		},
-		incarnation: incarnation, localGeneration: localGeneration, active: active,
+		incarnation: incarnation, localGeneration: localGeneration, peerGeneration: peerGeneration, active: active,
 		remote: remote, route: observation, wireFault: wireFault, stage: linkAttemptPreflight,
 	}
 	return attempt, leafmobility.PreflightResult{
@@ -94,6 +100,7 @@ type linkProbe struct {
 	Label           string
 	Incarnation     uint64
 	LocalGeneration uint64
+	PeerGeneration  uint64
 	LinkID          linkID
 	VirtualIP       [4]byte
 	Local           string
@@ -163,6 +170,8 @@ func digestLinkProbe(request leafmobility.PreflightRequest, probe linkProbe) lea
 	_, _ = hash.Write(scalar[:])
 	binary.BigEndian.PutUint64(scalar[:], probe.LocalGeneration)
 	_, _ = hash.Write(scalar[:])
+	binary.BigEndian.PutUint64(scalar[:], probe.PeerGeneration)
+	_, _ = hash.Write(scalar[:])
 	_, _ = hash.Write(probe.LinkID[:])
 	_, _ = hash.Write(probe.VirtualIP[:])
 	writeLinkString(hash, probe.Local)
@@ -223,6 +232,7 @@ type linkAttempt struct {
 	evidence        leafmobility.AttemptEvidence
 	incarnation     uint64
 	localGeneration uint64
+	peerGeneration  uint64
 	active          *packetWire
 	remote          net.Addr
 	route           routeObservation
@@ -236,6 +246,79 @@ type linkAttempt struct {
 	control     outerControl
 	nonce       linkNonce
 	published   bool
+}
+
+type linkAttemptOwnerSnapshot struct {
+	incarnation, localGeneration, peerGeneration uint64
+	active                                       *packetWire
+	remote                                       net.Addr
+}
+
+func snapshotLinkAttemptOwnerLocked(owner *linkOwner) linkAttemptOwnerSnapshot {
+	if owner == nil {
+		return linkAttemptOwnerSnapshot{}
+	}
+	return linkAttemptOwnerSnapshot{
+		incarnation: owner.incarnation, localGeneration: owner.localGeneration,
+		peerGeneration: owner.peerGeneration, active: owner.active, remote: cloneAddr(owner.peerRemote),
+	}
+}
+
+func (attempt *linkAttempt) ownerSnapshot() linkAttemptOwnerSnapshot {
+	return linkAttemptOwnerSnapshot{
+		incarnation: attempt.incarnation, localGeneration: attempt.localGeneration,
+		peerGeneration: attempt.peerGeneration, active: attempt.active, remote: attempt.remote,
+	}
+}
+
+func (snapshot linkAttemptOwnerSnapshot) currentLocked(owner *linkOwner) bool {
+	return owner != nil && !owner.closed && !owner.closing && owner.incarnation == snapshot.incarnation &&
+		owner.localGeneration == snapshot.localGeneration && owner.peerGeneration == snapshot.peerGeneration &&
+		owner.active == snapshot.active && addrEqualOnWire(snapshot.active, owner.peerRemote, snapshot.remote)
+}
+
+func (snapshot linkAttemptOwnerSnapshot) watch(
+	ctx context.Context,
+	owner *linkOwner,
+) (context.Context, func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	watched, cancel := context.WithCancelCause(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			owner.mu.Lock()
+			current := snapshot.currentLocked(owner)
+			changed := owner.change
+			ownerDone := owner.done
+			owner.mu.Unlock()
+			if !current {
+				cancel(errLinkAttemptSourceChanged)
+				return
+			}
+			select {
+			case <-changed:
+			case <-ownerDone:
+				cancel(net.ErrClosed)
+				return
+			case <-watched.Done():
+				return
+			case <-stop:
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return watched, func() {
+		once.Do(func() {
+			close(stop)
+			cancel(context.Canceled)
+			<-done
+		})
+	}
 }
 
 func (attempt *linkAttempt) Evidence() leafmobility.AttemptEvidence {
@@ -261,8 +344,7 @@ func (attempt *linkAttempt) Prepare(ctx context.Context, request leafmobility.Ex
 	owner := attempt.driver.owner
 	owner.bindOuterMTURecoveryDeadline(request.Plan.Deadline)
 	owner.mu.Lock()
-	current := owner.active == attempt.active && owner.localGeneration == attempt.localGeneration &&
-		addrEqualOnWire(attempt.active, owner.peerRemote, attempt.remote) && !owner.closed && !owner.closing
+	current := attempt.ownerSnapshot().currentLocked(owner)
 	owner.mu.Unlock()
 	if !current {
 		maintenance.release()
@@ -302,7 +384,7 @@ func (attempt *linkAttempt) Stage(
 	control.ReceiveNext = attempt.driver.owner.receiveNext
 	attempt.driver.owner.mu.Unlock()
 	candidate, generation, observation, err := attempt.driver.owner.stageCandidate(
-		ctx, attempt.maintenance, control,
+		ctx, attempt.maintenance, control, attempt.ownerSnapshot(),
 	)
 	attempt.candidate = candidate
 	attempt.candidateAt = observation
@@ -328,6 +410,7 @@ func (attempt *linkAttempt) Publish(ctx context.Context, request leafmobility.Ex
 	}
 	if err := attempt.driver.owner.publishCandidate(
 		ctx, attempt.maintenance, attempt.candidate, attempt.generation, attempt.control, attempt.candidateAt,
+		attempt.ownerSnapshot(),
 	); err != nil {
 		return err
 	}
@@ -372,7 +455,7 @@ func (attempt *linkAttempt) Rollback(ctx context.Context, request leafmobility.E
 	}
 	if attempt.maintenance != nil {
 		if err := attempt.driver.owner.rollbackCandidate(
-			ctx, attempt.maintenance, attempt.candidate, attempt.generation, attempt.control,
+			ctx, attempt.maintenance, attempt.candidate, attempt.generation, attempt.control, attempt.remote,
 		); err != nil {
 			return err
 		}

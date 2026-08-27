@@ -15,11 +15,12 @@ import (
 	"github.com/FrankoonG/rendr/transport"
 )
 
-// MaxDatagramFrame is the largest single rendr frame the DATAGRAM
-// variant will pass through. QUIC DATAGRAM is bounded by path MTU
-// minus QUIC + UDP/IP headers; ~1200 bytes is the typical safe
-// ceiling. Larger frames must use the stream-mode adapter.
-const MaxDatagramFrame = 1200
+// MaxDatagramFrame is the stable rendr frame budget required from every QUIC
+// DATAGRAM leaf. It fits the conservative worst-case short-header payload at
+// QUIC's 1200-byte minimum packet size. A peer or path reporting less capacity
+// is rejected at admission instead of shrinking an established packet session
+// below frames that may already be in replay custody.
+const MaxDatagramFrame = 1152
 
 var _ transport.PathQualityReader = (*datagramPathConn)(nil)
 
@@ -43,6 +44,7 @@ const datagramIngressQueueLen = 2048
 type datagramQUICConn interface {
 	SendDatagram([]byte) error
 	SendDatagrams([][]byte) error
+	MaxDatagramPayloadSize() int64
 	ReceiveDatagram(context.Context) ([]byte, error)
 	Context() context.Context
 	CloseWithError(qg.ApplicationErrorCode, string) error
@@ -78,10 +80,33 @@ type datagramPathConn struct {
 var _ transport.DatagramAccelerationObserver = (*datagramPathConn)(nil)
 var _ transport.FrameBatchWriter = (*datagramPathConn)(nil)
 
-// MaxFrameSize reports the complete rendr frame budget carried by one QUIC
-// DATAGRAM. The engine subtracts its session-specific DATA envelope before
-// accepting an application packet.
-func (*datagramPathConn) MaxFrameSize() int { return MaxDatagramFrame }
+// MaxFrameSize reports a stable complete-frame budget only when the current
+// QUIC connection can support it. The engine subtracts its session-specific
+// DATA envelope before accepting an application packet.
+func (p *datagramPathConn) MaxFrameSize() int {
+	if p == nil || p.conn == nil || p.dead.Load() || p.datagramPayloadCapacity() < MaxDatagramFrame {
+		return 0
+	}
+	return MaxDatagramFrame
+}
+
+func (p *datagramPathConn) datagramPayloadCapacity() int {
+	if p == nil || p.conn == nil {
+		return 0
+	}
+	capacity := p.conn.MaxDatagramPayloadSize()
+	if capacity <= 0 {
+		return 0
+	}
+	if capacity > int64(^uint(0)>>1) {
+		return int(^uint(0) >> 1)
+	}
+	return int(capacity)
+}
+
+func datagramCapacityError(capacity int) error {
+	return &qg.DatagramTooLargeError{MaxDatagramPayloadSize: int64(capacity)}
+}
 
 // wrapDatagram wraps a freshly-negotiated DATAGRAM-capable QUIC
 // connection. EnableDatagrams MUST have been true on both sides for
@@ -201,6 +226,9 @@ func (p *datagramPathConn) Write(frame []byte) (int, error) {
 	if p.dead.Load() {
 		return 0, net.ErrClosed
 	}
+	if capacity := p.datagramPayloadCapacity(); len(frame) > capacity {
+		return 0, datagramCapacityError(capacity)
+	}
 	if err := p.conn.SendDatagram(frame); err != nil {
 		var tooLarge *qg.DatagramTooLargeError
 		if errors.As(err, &tooLarge) {
@@ -229,6 +257,12 @@ func (p *datagramPathConn) WriteFrameBatch(frames [][]byte) (int, error) {
 	defer p.writeMu.Unlock()
 	if p.dead.Load() {
 		return 0, net.ErrClosed
+	}
+	capacity := p.datagramPayloadCapacity()
+	for _, frame := range frames {
+		if len(frame) > capacity {
+			return 0, datagramCapacityError(capacity)
+		}
 	}
 	var err error
 	if len(frames) == 1 {
@@ -279,6 +313,8 @@ func (p *datagramPathConn) QualityContext(ctx context.Context) (transport.PathQu
 	}
 	return p.Quality(), nil
 }
+
+var _ transport.PacketPathConn = (*datagramPathConn)(nil)
 
 func (p *datagramPathConn) SetQuality(q transport.PathQuality) {
 	p.qualityMu.Lock()

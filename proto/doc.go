@@ -43,6 +43,12 @@
 // generation and a changed target at exactly the next generation; older peers
 // fail feature negotiation instead of being decoded under the new layout.
 //
+// Protocol minor 21 adds the mandatory SELECTOR_STATE control message. It
+// publishes a canonical, complete selector vector bound to one session,
+// sender direction, graph, and non-zero state epoch. Minor-20 peers cannot
+// satisfy the mandatory feature contract and fail negotiation before state is
+// allocated.
+//
 // Wire framing on a TCP byte-stream path prepends a 2-byte big-endian
 // length to each frame. QUIC paths use one frame per STREAM/DATAGRAM
 // and need no length prefix. The length prefix is the transport

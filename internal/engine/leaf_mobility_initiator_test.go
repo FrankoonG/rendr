@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/FrankoonG/rendr/internal/leafmobility"
+	"github.com/FrankoonG/rendr/proto"
 	"github.com/FrankoonG/rendr/transport"
 )
 
@@ -23,9 +26,78 @@ type initiatorRefreshPath struct {
 	emitOnSubscribe bool
 }
 
+type failingRefreshCommitPath struct {
+	*initiatorRefreshPath
+	err   error
+	calls atomic.Int32
+}
+
+func (p *failingRefreshCommitPath) CommitLeafMobilityRefresh(leafmobility.RefreshEvidence) error {
+	p.calls.Add(1)
+	return p.err
+}
+
+type blockingRefreshCommitPath struct {
+	*initiatorRefreshPath
+	entered      chan struct{}
+	release      chan struct{}
+	closeEntered chan struct{}
+	enteredOnce  sync.Once
+	closeOnce    sync.Once
+	calls        atomic.Int32
+	closeCalls   atomic.Int32
+}
+
+func (p *blockingRefreshCommitPath) CommitLeafMobilityRefresh(leafmobility.RefreshEvidence) error {
+	p.calls.Add(1)
+	p.enteredOnce.Do(func() { close(p.entered) })
+	<-p.release
+	return nil
+}
+
+func (p *blockingRefreshCommitPath) Close() error {
+	p.closeCalls.Add(1)
+	if p.closeEntered != nil {
+		p.closeOnce.Do(func() { close(p.closeEntered) })
+	}
+	if p.initiatorRefreshPath == nil || p.PathConn == nil {
+		return nil
+	}
+	return p.PathConn.Close()
+}
+
+type goexitRefreshCommitPath struct {
+	*initiatorRefreshPath
+	calls atomic.Int32
+}
+
+func (p *goexitRefreshCommitPath) CommitLeafMobilityRefresh(leafmobility.RefreshEvidence) error {
+	p.calls.Add(1)
+	runtime.Goexit()
+	return nil
+}
+
+type panickingRefreshCommitPath struct {
+	*initiatorRefreshPath
+	panicValue any
+	calls      atomic.Int32
+}
+
+func (p *panickingRefreshCommitPath) CommitLeafMobilityRefresh(leafmobility.RefreshEvidence) error {
+	p.calls.Add(1)
+	panic(p.panicValue)
+}
+
 type blockingRefreshPath struct {
 	transport.PathConn
 	entered chan struct{}
+	once    sync.Once
+}
+
+type blockBeforePreparedRefreshPath struct {
+	transport.PathConn
+	reached chan struct{}
+	release chan struct{}
 	once    sync.Once
 }
 
@@ -40,6 +112,14 @@ func (p *blockingRefreshPath) SubscribeLeafMobilityRefresh(ctx context.Context, 
 	p.once.Do(func() { close(p.entered) })
 	<-ctx.Done()
 	return nil, context.Cause(ctx)
+}
+
+func (p *blockBeforePreparedRefreshPath) Write(frame []byte) (int, error) {
+	if leafMobilityAckPhase(frame) == proto.LeafMobilityPeerPlanAckPhasePrepared {
+		p.once.Do(func() { close(p.reached) })
+		<-p.release
+	}
+	return p.PathConn.Write(frame)
 }
 
 func (p *initiatorRefreshPath) setLeafMobilityTestClaim(claim *leafmobility.Claim) { p.claim = claim }
@@ -82,6 +162,42 @@ func (p *initiatorRefreshPath) publish(evidence leafmobility.RefreshEvidence) bo
 	}
 	callback(evidence)
 	return true
+}
+
+func TestLeafMobilitySourceBindingMustPrecedeDestructiveExecution(t *testing.T) {
+	event := leafMobilityRefreshEvent{
+		ref:      PathRef{ID: 7, Owner: 11},
+		snapshot: leafmobility.RefreshSnapshot{EndpointGeneration: 13},
+	}
+	valid := MigrationPathBinding{
+		PathID: 7, PathOwner: 11, PathGeneration: 17, RouteGeneration: 19,
+		EndpointGeneration: 13, LocalTargetID: [16]byte{1}, PeerTargetID: [16]byte{2},
+	}
+	if !validLeafMobilitySourceBinding(event, valid) {
+		t.Fatalf("valid pre-execution source binding was rejected: %+v", valid)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*MigrationPathBinding)
+	}{
+		{name: "missing", mutate: func(binding *MigrationPathBinding) { *binding = MigrationPathBinding{} }},
+		{name: "wrong path", mutate: func(binding *MigrationPathBinding) { binding.PathID++ }},
+		{name: "wrong owner", mutate: func(binding *MigrationPathBinding) { binding.PathOwner++ }},
+		{name: "missing path generation", mutate: func(binding *MigrationPathBinding) { binding.PathGeneration = 0 }},
+		{name: "missing route generation", mutate: func(binding *MigrationPathBinding) { binding.RouteGeneration = 0 }},
+		{name: "stale endpoint generation", mutate: func(binding *MigrationPathBinding) { binding.EndpointGeneration-- }},
+		{name: "missing local target", mutate: func(binding *MigrationPathBinding) { binding.LocalTargetID = [16]byte{} }},
+		{name: "missing peer target", mutate: func(binding *MigrationPathBinding) { binding.PeerTargetID = [16]byte{} }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			binding := valid
+			test.mutate(&binding)
+			if validLeafMobilitySourceBinding(event, binding) {
+				t.Fatalf("invalid pre-execution source binding was accepted: %+v", binding)
+			}
+		})
+	}
 }
 
 func TestLeafMobilityInitiatorExecutesFreshFactualEvent(t *testing.T) {
@@ -133,6 +249,175 @@ func TestLeafMobilityInitiatorExecutesFreshFactualEvent(t *testing.T) {
 	}
 	assertLeafMobilityDataFlow(t, fixture, "after-automatic-commit")
 	testLeafMobilityInitiatorPreservesTypedRefreshReason(t)
+}
+
+func TestLeafMobilitySuccessfulPeerCommitInvalidatesResponderProbeEvidence(t *testing.T) {
+	var source *initiatorRefreshPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &initiatorRefreshPath{PathConn: path}
+			return source
+		}, nil, nil, nil,
+	)
+
+	fixture.server.pathsMu.RLock()
+	serverSlot := fixture.server.paths[fixture.serverRef.ID]
+	fixture.server.pathsMu.RUnlock()
+	if serverSlot == nil {
+		t.Fatal("missing responder subject slot")
+	}
+	peerEpochBefore := serverSlot.peerMobilityEpoch.Load()
+	topologyEpochBefore := fixture.server.pathTopologyEpoch.Load()
+	endpointGenerationBefore := serverSlot.probeEndpointGen.Load()
+	routeGenerationBefore := serverSlot.routeGeneration.Load()
+	migrationCountBefore := fixture.server.MigrationCount()
+	dispatchIdentity := pathDispatchIdentity{
+		generation:     serverSlot.nextDispatchGeneration(),
+		pathGeneration: pathProbeGenerationForSlot(serverSlot),
+	}
+	serverSlot.markDispatchStalled(dispatchIdentity)
+	dispatchGeneration := dispatchIdentity.generation
+	generation := pathProbeGenerationForSlot(serverSlot)
+	serverSlot.probeEvidence.Store(&pathProbeEvidence{
+		generation: generation, fenceEpoch: serverSlot.txFenceEpoch.Load(), fenceTracked: true,
+		firstIssued: time.Now(), lastIssued: time.Now(), lastLifecycle: pathProbeDataStarved, issued: 1,
+	})
+	const probeID = uint64(0x5151)
+	fixture.server.probeMu.Lock()
+	fixture.server.probeOutstanding[probeID] = pathProbeObservation{
+		queuedAt: time.Now(), generation: generation, slot: serverSlot,
+		fenceEpoch: serverSlot.txFenceEpoch.Load(), lifecycle: pathProbeDataStarved,
+		dataStallGeneration: dispatchGeneration, dataBlockedAt: time.Now().Add(-time.Second),
+	}
+	fixture.server.probeMu.Unlock()
+	if status := fixture.server.pathProbeStatuses(time.Now())[serverSlot]; status.failure != pathProbeFailureDataStarved {
+		t.Fatalf("precondition responder probe status=%+v", status)
+	}
+
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonLinkUnresponsive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted
+	})
+	eventuallyEngine(t, time.Second, func() bool {
+		fixture.server.probeMu.Lock()
+		_, outstanding := fixture.server.probeOutstanding[probeID]
+		fixture.server.probeMu.Unlock()
+		return !outstanding && serverSlot.probeEvidence.Load() == nil &&
+			serverSlot.peerMobilityEpoch.Load() == peerEpochBefore+1
+	})
+	if got := fixture.server.pathTopologyEpoch.Load(); got == 0 || got == topologyEpochBefore {
+		t.Fatalf("peer commit topology epoch=%d, before=%d", got, topologyEpochBefore)
+	}
+	if got := serverSlot.probeEndpointGen.Load(); got != endpointGenerationBefore {
+		t.Fatalf("peer commit changed local endpoint generation=%d, want %d", got, endpointGenerationBefore)
+	}
+	if got := serverSlot.routeGeneration.Load(); got != routeGenerationBefore {
+		t.Fatalf("peer commit changed local route generation=%d, want %d", got, routeGenerationBefore)
+	}
+	if got := fixture.server.MigrationCount(); got != migrationCountBefore {
+		t.Fatalf("peer commit changed local migration count=%d, want %d", got, migrationCountBefore)
+	}
+	if stall, ok := serverSlot.currentDispatchStall(); !ok || stall != dispatchIdentity {
+		t.Fatalf("peer commit changed physical dispatch custody got=%+v present=%t want=%+v",
+			stall, ok, dispatchIdentity)
+	}
+	if status := fixture.server.pathProbeStatuses(time.Now())[serverSlot]; status.failure != pathProbeFailureNone {
+		t.Fatalf("peer commit retained responder probe failure=%+v", status)
+	}
+
+	// Model a probe writer that captured its generation before COMPLETE but
+	// published evidence after the first invalidation pass. The peer epoch must
+	// keep that delayed evidence permanently non-authoritative.
+	const delayedProbeID = probeID + 1
+	serverSlot.probeEvidence.Store(&pathProbeEvidence{
+		generation: generation, fenceEpoch: serverSlot.txFenceEpoch.Load(), fenceTracked: true,
+		firstIssued: time.Now(), lastIssued: time.Now(), lastLifecycle: pathProbeDataStarved, issued: 1,
+	})
+	fixture.server.probeMu.Lock()
+	fixture.server.probeOutstanding[delayedProbeID] = pathProbeObservation{
+		queuedAt: time.Now(), generation: generation, slot: serverSlot,
+		fenceEpoch: serverSlot.txFenceEpoch.Load(), lifecycle: pathProbeDataStarved,
+		dataStallGeneration: dispatchGeneration, dataBlockedAt: time.Now().Add(-time.Second),
+	}
+	fixture.server.probeMu.Unlock()
+	if status := fixture.server.pathProbeStatuses(time.Now())[serverSlot]; status.failure != pathProbeFailureNone {
+		t.Fatalf("delayed predecessor probe regained selector authority=%+v", status)
+	}
+	if _, current := serverSlot.probeSnapshot(); current {
+		t.Fatal("delayed predecessor probe evidence remained current after peer epoch advance")
+	}
+}
+
+func TestLeafMobilityInitiatorAbortsAuthorityWhenEvidenceChangesDuringNegotiation(t *testing.T) {
+	var source *initiatorRefreshPath
+	blocker := &blockBeforePreparedRefreshPath{reached: make(chan struct{}), release: make(chan struct{})}
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &initiatorRefreshPath{PathConn: path}
+			return source
+		}, nil, nil,
+		func(path *memoryPathConn) transport.PathConn {
+			blocker.PathConn = path
+			return blocker
+		},
+	)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(blocker.release) }) }
+	t.Cleanup(release)
+
+	state := leafmobility.NewRefreshSourceState()
+	initial, err := state.Update([32]byte{0x91})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitter, err := leafmobility.NewRefreshEmitterWithSourceState(fixture.clientClaim, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	select {
+	case <-blocker.reached:
+	case <-time.After(time.Second):
+		t.Fatal("automatic negotiation did not reach PREPARED publication")
+	}
+	if _, err := state.Update([32]byte{0x92}); err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorSuperseded
+	})
+	if fixture.clientDriver.prepareCalls.Load() != 0 || fixture.clientDriver.cutoverCalls.Load() != 0 ||
+		fixture.clientDriver.commitCalls.Load() != 0 || fixture.clientDriver.activateCalls.Load() != 0 {
+		t.Fatalf("stale authority reached driver prepare/stage/publish/activate=%d/%d/%d/%d",
+			fixture.clientDriver.prepareCalls.Load(), fixture.clientDriver.cutoverCalls.Load(),
+			fixture.clientDriver.commitCalls.Load(), fixture.clientDriver.activateCalls.Load())
+	}
+	if fixture.client.MigrationCount() != 0 {
+		t.Fatalf("stale authority recorded %d migrations", fixture.client.MigrationCount())
+	}
+	assertLeafMobilityDataFlow(t, fixture, "after-stale-automatic-authority-abort")
 }
 
 func testLeafMobilityInitiatorPreservesTypedRefreshReason(t *testing.T) {
@@ -187,17 +472,13 @@ func TestLeafMobilityCommitHookObservesCommittedTransaction(t *testing.T) {
 		}, nil, nil, nil,
 	)
 	type observation struct {
-		oldID, newID uint32
-		cause        string
-		status       LeafMobilityInitiatorSnapshot
-		present      bool
+		event MigrationEvent
 	}
 	observed := make(chan observation, 2)
-	cancel := fixture.client.OnMigrate(func(oldID, newID uint32, cause string) {
-		status, present := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
-		observed <- observation{oldID: oldID, newID: newID, cause: cause, status: status, present: present}
+	subscription := fixture.client.OnMigrationEvent(func(event MigrationEvent) {
+		observed <- observation{event: event}
 	})
-	defer cancel()
+	defer subscription.Cancel()
 	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
 	if err != nil {
 		t.Fatal(err)
@@ -215,23 +496,49 @@ func TestLeafMobilityCommitHookObservesCommittedTransaction(t *testing.T) {
 		}
 		select {
 		case got := <-observed:
-			if got.oldID != fixture.clientRef.ID || got.newID != fixture.clientRef.ID ||
-				got.cause != "leaf-mobility" || !got.present ||
-				got.status.Phase != LeafMobilityInitiatorCommitted ||
-				got.status.TransactionID == (leafmobility.TransactionID{}) ||
-				got.status.ResultEndpointGeneration == 0 ||
-				got.status.ResultEndpointGeneration == got.status.SourceEndpointGeneration {
-				t.Fatalf("migration %d callback observation=%+v", migration, got)
+			eventuallyEngine(t, 3*time.Second, func() bool {
+				status, present := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+				return present && status.Phase == LeafMobilityInitiatorCommitted
+			})
+			status, present := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+			if got.event.OldPathID != fixture.clientRef.ID || got.event.NewPathID != fixture.clientRef.ID ||
+				got.event.Cause != "leaf-mobility" || !present ||
+				status.TransactionID == (leafmobility.TransactionID{}) ||
+				status.ResultEndpointGeneration == 0 ||
+				status.ResultEndpointGeneration == status.SourceEndpointGeneration ||
+				got.event.Evidence.Kind != MigrationEvidenceLeafMobility ||
+				got.event.Evidence.TransactionID != [16]byte(status.TransactionID) ||
+				got.event.Evidence.RefreshEvidenceGeneration != status.EvidenceGeneration ||
+				got.event.Evidence.SourceEndpointGeneration != status.SourceEndpointGeneration ||
+				got.event.Evidence.ResultEndpointGeneration != status.ResultEndpointGeneration ||
+				got.event.Evidence.Source.PathID != fixture.clientRef.ID ||
+				got.event.Evidence.Result.PathID != fixture.clientRef.ID ||
+				got.event.Evidence.Source.PathOwner != fixture.clientRef.Owner ||
+				got.event.Evidence.Result.PathOwner != fixture.clientRef.Owner ||
+				got.event.Evidence.Source.EndpointGeneration != status.SourceEndpointGeneration ||
+				got.event.Evidence.Result.EndpointGeneration != status.ResultEndpointGeneration ||
+				got.event.Evidence.Source.HealthRevision == 0 ||
+				got.event.Evidence.Result.HealthRevision <= got.event.Evidence.Source.HealthRevision ||
+				got.event.Evidence.Source.PathGeneration == 0 || got.event.Evidence.Result.PathGeneration == 0 ||
+				got.event.Evidence.Source.LocalTargetID == ([16]byte{}) || got.event.Evidence.Result.LocalTargetID == ([16]byte{}) ||
+				got.event.Evidence.Leaf.RefreshReason != "route_source_changed" ||
+				got.event.Evidence.Leaf.RefreshObservedAt.IsZero() ||
+				got.event.Evidence.Leaf.RefreshSourceGeneration == 0 ||
+				!got.event.Evidence.Leaf.RefreshSourceUsable || got.event.Evidence.Leaf.RefreshIncarnation == 0 ||
+				got.event.Evidence.Selector != (MigrationSelectorBinding{}) ||
+				got.event.Evidence.TopologyEpoch == 0 || len(got.event.Evidence.ProbeGenerations) != 0 ||
+				got.event.Ordinal != uint64(migration) {
+				t.Fatalf("migration %d callback observation=%+v status=%+v", migration, got, status)
 			}
-			if previousTransaction != (leafmobility.TransactionID{}) && got.status.TransactionID == previousTransaction {
-				t.Fatalf("migration %d reused transaction %x", migration, got.status.TransactionID)
+			if previousTransaction != (leafmobility.TransactionID{}) && status.TransactionID == previousTransaction {
+				t.Fatalf("migration %d reused transaction %x", migration, status.TransactionID)
 			}
-			if previousEndpointGeneration != 0 && got.status.SourceEndpointGeneration != previousEndpointGeneration {
+			if previousEndpointGeneration != 0 && status.SourceEndpointGeneration != previousEndpointGeneration {
 				t.Fatalf("migration %d source generation=%d want prior result=%d",
-					migration, got.status.SourceEndpointGeneration, previousEndpointGeneration)
+					migration, status.SourceEndpointGeneration, previousEndpointGeneration)
 			}
-			previousTransaction = got.status.TransactionID
-			previousEndpointGeneration = got.status.ResultEndpointGeneration
+			previousTransaction = status.TransactionID
+			previousEndpointGeneration = status.ResultEndpointGeneration
 		case <-time.After(3 * time.Second):
 			t.Fatalf("committed leaf mobility hook %d did not fire", migration)
 		}
@@ -246,6 +553,405 @@ func TestLeafMobilityCommitHookObservesCommittedTransaction(t *testing.T) {
 			t.Fatalf("migration %d count=%d", migration, got)
 		}
 		assertLeafMobilityDataFlow(t, fixture, fmt.Sprintf("between-observed-commits-%d", migration))
+	}
+}
+
+func TestLeafMobilityCommittedEventPrecedesBlockingRefreshBaseline(t *testing.T) {
+	var source *blockingRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &blockingRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+				entered:              make(chan struct{}),
+				release:              make(chan struct{}),
+			}
+			return source
+		}, nil, nil, nil,
+	)
+	t.Cleanup(func() {
+		select {
+		case <-source.release:
+		default:
+			close(source.release)
+		}
+	})
+	events := make(chan MigrationEvent, 1)
+	subscription := fixture.client.OnMigrationEvent(func(event MigrationEvent) { events <- event })
+	defer subscription.Cancel()
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	select {
+	case <-source.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("refresh baseline callback did not block")
+	}
+	event := receiveMigrationEvent(t, events)
+	if event.Evidence.Kind != MigrationEvidenceLeafMobility || fixture.client.MigrationCount() != 1 {
+		t.Fatalf("event/count before baseline release=%+v/%d", event, fixture.client.MigrationCount())
+	}
+	close(source.release)
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted && status.Error == ""
+	})
+}
+
+func TestLeafMobilityRefreshBaselineDeadlineReleasesWorkerAndSerializesNextCommit(t *testing.T) {
+	limits := Limits{MigrationBudget: 350 * time.Millisecond}
+	var source *blockingRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappersAndLimits(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &blockingRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+				entered:              make(chan struct{}),
+				release:              make(chan struct{}),
+			}
+			return source
+		}, nil, nil, nil, limits, limits,
+	)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(source.release) }) }
+	t.Cleanup(release)
+
+	events := make(chan MigrationEvent, 2)
+	subscription := fixture.client.OnMigrationEvent(func(event MigrationEvent) { events <- event })
+	defer subscription.Cancel()
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEvidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot, err := firstEvidence.ValidateFor(fixture.clientClaim, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(firstEvidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	select {
+	case <-source.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("refresh baseline callback did not enter")
+	}
+	_ = receiveMigrationEvent(t, events)
+	eventuallyEngine(t, 2*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted &&
+			status.EvidenceGeneration == firstSnapshot.Generation &&
+			strings.Contains(status.Error, leafMobilityRefreshCommitOp) &&
+			strings.Contains(status.Error, "deadline")
+	})
+	fixture.client.pathsMu.RLock()
+	subject := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	fixture.client.leafRefreshMu.Lock()
+	_, running := fixture.client.leafRefreshRunning[fixture.clientRef]
+	_, workerCancel := fixture.client.leafRefreshCancel[fixture.clientRef]
+	fixture.client.leafRefreshMu.Unlock()
+	var policyHolds int32
+	if subject != nil {
+		policyHolds = subject.mobilityPolicyHolds.Load()
+	}
+	if running || workerCancel || subject == nil || policyHolds != 0 {
+		t.Fatalf("timed-out committer retained running/cancel/subject/holds=%t/%t/%t/%d",
+			running, workerCancel, subject != nil, policyHolds)
+	}
+	assertLeafMobilityDataFlow(t, fixture, "after-blocked-refresh-baseline-timeout")
+
+	secondEvidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshot, err := secondEvidence.ValidateFor(fixture.clientClaim, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !source.publish(secondEvidence) {
+		t.Fatal("refresh source unsubscribed after callback timeout")
+	}
+	eventuallyEngine(t, time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.EvidenceGeneration == secondSnapshot.Generation &&
+			status.Phase == LeafMobilityInitiatorDeferred && source.calls.Load() == 1
+	})
+	if got := fixture.client.MigrationCount(); got != 1 {
+		t.Fatalf("new transaction crossed orphaned baseline callback: migrations=%d", got)
+	}
+
+	release()
+	_ = receiveMigrationEvent(t, events)
+	committed := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		if ok && status.Phase == LeafMobilityInitiatorCommitted &&
+			status.EvidenceGeneration == secondSnapshot.Generation && status.Error == "" {
+			committed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !committed {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		fixture.client.leafRefreshMu.Lock()
+		_, pending := fixture.client.leafRefreshPending[fixture.clientRef]
+		_, running := fixture.client.leafRefreshRunning[fixture.clientRef]
+		fixture.client.leafRefreshMu.Unlock()
+		t.Fatalf("second baseline did not commit: status=%+v present=%t pending/running=%t/%t migrations/calls=%d/%d",
+			status, ok, pending, running, fixture.client.MigrationCount(), source.calls.Load())
+	}
+	if got := fixture.client.MigrationCount(); got != 2 || source.calls.Load() != 2 {
+		t.Fatalf("serialized callback migrations/calls=%d/%d want 2/2", got, source.calls.Load())
+	}
+}
+
+func TestLeafMobilityRefreshTerminalStatusWaitsForWorkerOwnershipRelease(t *testing.T) {
+	limits := Limits{MigrationBudget: 350 * time.Millisecond}
+	var source *blockingRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappersAndLimits(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &blockingRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+				entered:              make(chan struct{}),
+				release:              make(chan struct{}),
+			}
+			return source
+		}, nil, nil, nil, limits, limits,
+	)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(source.release) }) }
+	t.Cleanup(release)
+
+	terminalStatusEntered := make(chan struct{})
+	releaseTerminalStatus := make(chan struct{})
+	var releaseStatusOnce sync.Once
+	unblockStatus := func() { releaseStatusOnce.Do(func() { close(releaseTerminalStatus) }) }
+	t.Cleanup(unblockStatus)
+	var armTerminalStatus atomic.Bool
+	fixture.client.leafRefreshStatusBeforeWrite = func() {
+		if armTerminalStatus.CompareAndSwap(true, false) {
+			close(terminalStatusEntered)
+			<-releaseTerminalStatus
+		}
+	}
+
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	select {
+	case <-source.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("refresh baseline callback did not enter")
+	}
+	armTerminalStatus.Store(true)
+	select {
+	case <-terminalStatusEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal refresh status did not reach its publication boundary")
+	}
+
+	fixture.client.pathsMu.RLock()
+	subject := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	fixture.client.leafRefreshMu.Lock()
+	_, running := fixture.client.leafRefreshRunning[fixture.clientRef]
+	_, workerCancel := fixture.client.leafRefreshCancel[fixture.clientRef]
+	fixture.client.leafRefreshMu.Unlock()
+	var policyHolds int32
+	if subject != nil {
+		policyHolds = subject.mobilityPolicyHolds.Load()
+	}
+	if running || workerCancel || subject == nil || policyHolds != 0 {
+		t.Fatalf("terminal publication retained running/cancel/subject/holds=%t/%t/%t/%d",
+			running, workerCancel, subject != nil, policyHolds)
+	}
+
+	unblockStatus()
+	eventuallyEngine(t, time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted &&
+			strings.Contains(status.Error, leafMobilityRefreshCommitOp) &&
+			strings.Contains(status.Error, "deadline")
+	})
+}
+
+func TestLeafMobilityRefreshBaselineGoexitIsTerminalAndReleasesOwnership(t *testing.T) {
+	var source *goexitRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &goexitRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+			}
+			return source
+		}, nil, nil, nil,
+	)
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted &&
+			strings.Contains(status.Error, leafMobilityRefreshCommitOp) &&
+			strings.Contains(status.Error, "runtime.Goexit")
+	})
+	fixture.client.pathsMu.RLock()
+	subject := fixture.client.paths[fixture.clientRef.ID]
+	fixture.client.pathsMu.RUnlock()
+	fixture.client.leafRefreshMu.Lock()
+	_, running := fixture.client.leafRefreshRunning[fixture.clientRef]
+	_, workerCancel := fixture.client.leafRefreshCancel[fixture.clientRef]
+	fixture.client.leafRefreshMu.Unlock()
+	var policyHolds int32
+	if subject != nil {
+		policyHolds = subject.mobilityPolicyHolds.Load()
+	}
+	if running || workerCancel || subject == nil || policyHolds != 0 || source.calls.Load() != 1 {
+		t.Fatalf("Goexit committer retained running/cancel/subject/holds/calls=%t/%t/%t/%d/%d",
+			running, workerCancel, subject != nil, policyHolds, source.calls.Load())
+	}
+}
+
+func TestLeafMobilityRefreshBaselinePanicKeepsOneFactualCommit(t *testing.T) {
+	panicErr := errors.New("injected refresh baseline panic")
+	var source *panickingRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &panickingRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+				panicValue:           panicErr,
+			}
+			return source
+		}, nil, nil, nil,
+	)
+	events := make(chan MigrationEvent, 2)
+	subscription := fixture.client.OnMigrationEvent(func(event MigrationEvent) { events <- event })
+	defer subscription.Cancel()
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	event := receiveMigrationEvent(t, events)
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted &&
+			strings.Contains(status.Error, fmt.Sprintf("%T", panicErr))
+	})
+	status, _ := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+	if strings.Contains(status.Error, panicErr.Error()) {
+		t.Fatalf("panic diagnostic exposed untrusted payload: %q", status.Error)
+	}
+	if fixture.client.MigrationCount() != 1 || source.calls.Load() != 1 ||
+		event.Evidence.Kind != MigrationEvidenceLeafMobility {
+		t.Fatalf("panic commit count/calls/event=%d/%d/%+v", fixture.client.MigrationCount(), source.calls.Load(), event)
+	}
+	if !source.publish(evidence) {
+		t.Fatal("refresh source unsubscribed after contained panic")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if fixture.client.MigrationCount() != 1 || source.calls.Load() != 1 {
+		t.Fatalf("replayed evidence duplicated panic commit count/calls=%d/%d",
+			fixture.client.MigrationCount(), source.calls.Load())
+	}
+	select {
+	case duplicate := <-events:
+		t.Fatalf("replayed evidence emitted duplicate event: %+v", duplicate)
+	default:
+	}
+}
+
+func TestLeafMobilityRefreshBaselineFailureKeepsOneFactualCommit(t *testing.T) {
+	baselineErr := errors.New("injected refresh baseline failure")
+	var source *failingRefreshCommitPath
+	fixture := newLeafMobilityEngineFixtureWithAllWrappers(
+		t, leafmobility.Resource{}, leafmobility.Resource{},
+		func(path *memoryPathConn) transport.PathConn {
+			source = &failingRefreshCommitPath{
+				initiatorRefreshPath: &initiatorRefreshPath{PathConn: path},
+				err:                  baselineErr,
+			}
+			return source
+		}, nil, nil, nil,
+	)
+	events := make(chan MigrationEvent, 2)
+	subscription := fixture.client.OnMigrationEvent(func(event MigrationEvent) { events <- event })
+	defer subscription.Cancel()
+	emitter, err := leafmobility.NewRefreshEmitter(fixture.clientClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := emitter.Observe(leafmobility.RefreshReasonRouteSourceChanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source == nil || !source.publish(evidence) {
+		t.Fatal("refresh source was not subscribed")
+	}
+	event := receiveMigrationEvent(t, events)
+	eventuallyEngine(t, 3*time.Second, func() bool {
+		status, ok := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+		return ok && status.Phase == LeafMobilityInitiatorCommitted && strings.Contains(status.Error, baselineErr.Error())
+	})
+	status, _ := fixture.client.LeafMobilityInitiatorStatus(fixture.clientRef)
+	if fixture.client.MigrationCount() != 1 || source.calls.Load() != 1 ||
+		event.Evidence.Kind != MigrationEvidenceLeafMobility ||
+		event.Evidence.TransactionID != [16]byte(status.TransactionID) ||
+		event.Evidence.RefreshEvidenceGeneration != status.EvidenceGeneration ||
+		event.Evidence.SourceEndpointGeneration != status.SourceEndpointGeneration ||
+		event.Evidence.ResultEndpointGeneration != status.ResultEndpointGeneration {
+		t.Fatalf("baseline failure count/calls/event/status=%d/%d/%+v/%+v",
+			fixture.client.MigrationCount(), source.calls.Load(), event, status)
+	}
+	if !source.publish(evidence) {
+		t.Fatal("refresh source unsubscribed after committed baseline failure")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if fixture.client.MigrationCount() != 1 || source.calls.Load() != 1 {
+		t.Fatalf("replayed evidence duplicated commit count/calls=%d/%d",
+			fixture.client.MigrationCount(), source.calls.Load())
+	}
+	select {
+	case duplicate := <-events:
+		t.Fatalf("replayed evidence emitted duplicate event: %+v", duplicate)
+	default:
 	}
 }
 
@@ -440,6 +1146,81 @@ func TestLeafMobilityInitiatorRetirementCancelsAndForgets(t *testing.T) {
 	if calls := fixture.clientDriver.calls.Load(); calls > 1 {
 		t.Fatalf("retirement allowed %d preflights", calls)
 	}
+
+	t.Run("status publication cannot outlive its exact generation", func(t *testing.T) {
+		var raceSource *initiatorRefreshPath
+		raceFixture := newLeafMobilityEngineFixtureWithAllWrappers(
+			t, leafmobility.Resource{}, leafmobility.Resource{},
+			func(path *memoryPathConn) transport.PathConn {
+				raceSource = &initiatorRefreshPath{PathConn: path}
+				return raceSource
+			}, nil, nil, nil,
+		)
+		if raceSource == nil {
+			t.Fatal("missing refresh source")
+		}
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		unblock := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(unblock)
+		var block atomic.Bool
+		block.Store(true)
+		raceFixture.client.leafRefreshStatusBeforeWrite = func() {
+			if block.CompareAndSwap(true, false) {
+				close(entered)
+				<-release
+			}
+		}
+		recorded := make(chan struct{})
+		go func() {
+			raceFixture.client.recordLeafMobilityInitiator(LeafMobilityInitiatorSnapshot{
+				Ref: raceFixture.clientRef, EvidenceGeneration: ^uint64(0),
+				Phase: LeafMobilityInitiatorFailed, UpdatedAt: time.Now(),
+			})
+			close(recorded)
+		}()
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("status publication did not reach the generation/write boundary")
+		}
+		retired := make(chan error, 1)
+		go func() {
+			retired <- raceFixture.client.RetirePath(
+				raceFixture.clientRef, errors.New("retire during status publication"),
+			)
+		}()
+		var retireErr error
+		premature := false
+		select {
+		case retireErr = <-retired:
+			premature = true
+		case <-time.After(20 * time.Millisecond):
+		}
+		unblock()
+		select {
+		case <-recorded:
+		case <-time.After(time.Second):
+			t.Fatal("status publication did not finish")
+		}
+		if !premature {
+			select {
+			case retireErr = <-retired:
+			case <-time.After(time.Second):
+				t.Fatal("retirement did not follow status publication")
+			}
+		}
+		if retireErr != nil {
+			t.Fatal(retireErr)
+		}
+		if premature {
+			t.Fatal("path retirement crossed an in-flight exact-generation status publication")
+		}
+		if _, ok := raceFixture.client.LeafMobilityInitiatorStatus(raceFixture.clientRef); ok {
+			t.Fatal("retired generation was recreated by a stale status publication")
+		}
+	})
 }
 
 func TestLeafMobilityInitiatorBilateralSimultaneousEventConverges(t *testing.T) {

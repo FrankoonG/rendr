@@ -157,7 +157,7 @@ func listenRuntimeSourcesWithConfig(config ListenConfig, sources ...runtimeFixtu
 				return nil, fmt.Errorf("test runtime source %q: %w", source.name, listenErr)
 			}
 			config.Packets = append(config.Packets, PacketSource{
-				Name: source.name, Carrier: CarrierUDP, Conn: raw,
+				Name: source.name, Carrier: CarrierUDP, Conn: raw, MaxDatagramSize: 1400,
 			})
 			sourceAddr = raw.LocalAddr()
 			closers = append(closers, raw.Close)
@@ -293,6 +293,22 @@ func (l *runtimeListenerFixture) CloseAcceptedPath(source string, ordinal int) e
 		return tracked.closeAccepted(ordinal)
 	}
 	return fmt.Errorf("test runtime source %q does not expose accepted paths", source)
+}
+
+// CloseSource stops future admissions for one named fixture source without
+// closing paths that it already accepted. This lets fault tests distinguish a
+// permanent carrier outage from a reconnectable physical incarnation.
+func (l *runtimeListenerFixture) CloseSource(source string) error {
+	if l == nil {
+		return net.ErrClosed
+	}
+	if tracked := l.streams[source]; tracked != nil {
+		return tracked.Listener.Close()
+	}
+	if tracked := l.framed[source]; tracked != nil {
+		return tracked.PathListener.Close()
+	}
+	return fmt.Errorf("test runtime source %q is unavailable", source)
 }
 
 // CloseAcceptedPeerPath closes the one accepted carrier whose peer endpoint
@@ -1497,21 +1513,21 @@ type runtimeTrackedPacketFactory struct {
 	blocked bool
 }
 
-func (f *runtimeTrackedPacketFactory) Dial(context.Context, string) (net.PacketConn, error) {
+func (f *runtimeTrackedPacketFactory) Dial(_ context.Context, address string) (PacketEndpoint, error) {
 	f.mu.Lock()
 	blocked := f.blocked
 	f.mu.Unlock()
 	if blocked {
-		return nil, errors.New("tracked packet factory is blocked")
+		return PacketEndpoint{}, errors.New("tracked packet factory is blocked")
 	}
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
-		return nil, err
+		return PacketEndpoint{}, err
 	}
 	f.mu.Lock()
 	f.conns = append(f.conns, conn)
 	f.mu.Unlock()
-	return conn, nil
+	return testPacketEndpointForAddress(conn, address)
 }
 
 func (f *runtimeTrackedPacketFactory) Fail(ordinal int) error {
@@ -2020,7 +2036,7 @@ func TestUDPFlowListenerFailKeepsPacketAcceptChannelOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener, err := runtime.Listen(ListenConfig{Packets: []PacketSource{{
-		Name: "terminal-udp", Carrier: CarrierUDP, Conn: &runtimeFailingPacketConn{err: boom},
+		Name: "terminal-udp", Carrier: CarrierUDP, Conn: &runtimeFailingPacketConn{err: boom}, MaxDatagramSize: 1400,
 	}}})
 	if err != nil {
 		t.Fatal(err)

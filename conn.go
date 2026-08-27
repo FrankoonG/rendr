@@ -116,10 +116,21 @@ type ConnectionObserver interface {
 	// and in-place leaf mobility all contribute.
 	MigrationCount() uint64
 
-	// OnMigrate registers fn to fire (in its own goroutine) on every
-	// committed migration. oldID equals newID for in-place leaf
-	// mobility. The returned cancel function unsubscribes. Use this
-	// instead of polling MigrationCount for push-based observation.
+	// OnMigrationEvent registers one bounded asynchronous subscription.
+	// AfterOrdinal is captured atomically with registration; only later commits
+	// are delivered. Callbacks are serialized per subscription, but Ordinal is
+	// authoritative across subscriptions. A slow callback is detached with
+	// ErrMigrationObserverLagged instead of consuming unbounded resources. Each
+	// connection bounds registered subscriptions. Idle subscriptions consume no
+	// callback goroutine; the process separately bounds callbacks that are
+	// actually executing. If an event cannot acquire an immediate execution slot,
+	// its subscription terminates with ErrMigrationObserverLimit.
+	OnMigrationEvent(fn func(MigrationEvent)) MigrationEventSubscription
+
+	// OnMigrate registers a best-effort compatibility notification. oldID
+	// equals newID for in-place leaf mobility. It cannot expose observer lag or
+	// callback failure and may stop after either; embedders that require a
+	// complete, ordered stream must use OnMigrationEvent.
 	OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func())
 
 	// Stats returns a one-call observation. Topology membership and lifecycle,
@@ -128,6 +139,115 @@ type ConnectionObserver interface {
 	// receive and scheduler counters, are point observations within that
 	// boundary rather than one transactionally frozen sample.
 	Stats() ConnStats
+}
+
+// MigrationEventSubscription controls one bounded event stream. Cancel is
+// idempotent and excludes future commits while preserving events already
+// reserved at their commit boundary. Done closes when no callback can run
+// again. Err is nil after normal cancellation and reports a stable terminal
+// observer error after lag, callback-capacity exhaustion, or abnormal callback
+// termination.
+type MigrationEventSubscription interface {
+	AfterOrdinal() uint64
+	Err() error
+	Done() <-chan struct{}
+	Cancel()
+}
+
+// MigrationEvent is an immutable fact recorded when migration accounting
+// commits. Ordinal starts at one for each connection and equals
+// MigrationCount immediately after the corresponding commit. CommittedAt is
+// non-zero and monotonically increasing in Ordinal order.
+//
+// Event callbacks are delivered asynchronously. One subscription invokes its
+// callback serially in Ordinal order; different subscriptions progress
+// independently, so callers that merge them must retain Ordinal.
+type MigrationEvent struct {
+	OldPathID   uint32
+	NewPathID   uint32
+	Cause       string
+	Ordinal     uint64
+	CommittedAt time.Time
+	Evidence    MigrationEvidence
+}
+
+// MigrationEvidenceKind identifies the factual authority behind one committed
+// migration event. It is independent of the display-oriented Cause string.
+type MigrationEvidenceKind uint8
+
+const (
+	MigrationEvidenceRoute MigrationEvidenceKind = iota + 1
+	MigrationEvidenceSelector
+	MigrationEvidenceLeafMobility
+)
+
+// MigrationEvidence binds a committed event to the endpoint or selector facts
+// that authorized it. Leaf-mobility events carry exact transaction and
+// endpoint generations. Selector events carry the complete sorted generation
+// vector that was revalidated at commit; explicit selections intentionally
+// have an empty vector. Fields irrelevant to Kind are zero.
+type MigrationEvidence struct {
+	Kind                      MigrationEvidenceKind
+	TransactionID             [16]byte
+	RefreshEvidenceGeneration uint64
+	SourceEndpointGeneration  uint64
+	ResultEndpointGeneration  uint64
+	TopologyEpoch             uint64
+	HealthEpoch               uint64
+	Source                    MigrationPathBinding
+	Result                    MigrationPathBinding
+	Selector                  MigrationSelectorBinding
+	Leaf                      MigrationLeafBinding
+	ProbeGenerations          []MigrationProbeGeneration
+}
+
+// MigrationPathBinding identifies one exact physical path incarnation at the
+// migration commit boundary. Target IDs bind the physical path back to the
+// frozen recursive graph.
+type MigrationPathBinding struct {
+	PathID             uint32
+	PathOwner          uint64
+	PathGeneration     uint64
+	RouteGeneration    uint64
+	EndpointGeneration uint64
+	PeerMobilityEpoch  uint64
+	HealthRevision     uint64
+	LocalTargetID      [16]byte
+	PeerTargetID       [16]byte
+}
+
+// MigrationSelectorBinding identifies the exact selector transaction and the
+// freshness lease used for a selector migration. CapturedAt/ValidUntil are
+// zero for explicit selections that intentionally do not consume probes.
+type MigrationSelectorBinding struct {
+	SelectorID        [16]byte
+	TargetID          [16]byte
+	Origin            string
+	CutoverGeneration uint64
+	CapturedAt        time.Time
+	ValidUntil        time.Time
+}
+
+// MigrationLeafBinding identifies the factual refresh observation that
+// initiated an in-place leaf mobility transaction.
+type MigrationLeafBinding struct {
+	RefreshReason           string
+	RefreshObservedAt       time.Time
+	RefreshSourceGeneration uint64
+	RefreshSourceUsable     bool
+	RefreshIncarnation      uint64
+}
+
+// MigrationProbeGeneration is one physical path entry in a selector commit's
+// immutable evidence vector. Entries are sorted by path identity.
+type MigrationProbeGeneration struct {
+	PathID             uint32
+	PathOwner          uint64
+	PathGeneration     uint64
+	RouteGeneration    uint64
+	EndpointGeneration uint64
+	PeerMobilityEpoch  uint64
+	HealthRevision     uint64
 }
 
 // ConnStats is the one-call snapshot returned by ConnectionObserver.Stats.

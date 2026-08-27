@@ -218,9 +218,10 @@ func TestRuntimeListenerPacketSessionSurvivesListenerClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener, err := serverRuntime.Listen(ListenConfig{Packets: []PacketSource{{
-		Name:    "packet-ingress",
-		Carrier: CarrierUDP,
-		Conn:    serverSocket,
+		Name:            "packet-ingress",
+		Carrier:         CarrierUDP,
+		Conn:            serverSocket,
+		MaxDatagramSize: 1400,
 	}}})
 	if err != nil {
 		t.Fatal(err)
@@ -233,8 +234,8 @@ func TestRuntimeListenerPacketSessionSurvivesListenerClose(t *testing.T) {
 	}
 	if err := clientRuntime.RegisterPacketFactory("packet", PacketFactory{
 		Carrier: CarrierUDP,
-		Dial: func(context.Context, string) (net.PacketConn, error) {
-			return net.ListenPacket("udp", "127.0.0.1:0")
+		Dial: func(_ context.Context, address string) (PacketEndpoint, error) {
+			return newTestUDPPacketEndpoint(address)
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -278,7 +279,7 @@ func TestRuntimeListenerCrossStreamPacketSourceBridge(t *testing.T) {
 	}
 	listener, err := serverRuntime.Listen(ListenConfig{
 		Streams: []StreamSource{{Name: "stream-ingress", Carrier: CarrierTCP, Listener: streamListener}},
-		Packets: []PacketSource{{Name: "packet-ingress", Carrier: CarrierUDP, Conn: packetSocket}},
+		Packets: []PacketSource{{Name: "packet-ingress", Carrier: CarrierUDP, Conn: packetSocket, MaxDatagramSize: 1400}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -299,8 +300,8 @@ func TestRuntimeListenerCrossStreamPacketSourceBridge(t *testing.T) {
 	}
 	if err := clientRuntime.RegisterPacketFactory("packet", PacketFactory{
 		Carrier: CarrierUDP,
-		Dial: func(context.Context, string) (net.PacketConn, error) {
-			return net.ListenPacket("udp", "127.0.0.1:0")
+		Dial: func(_ context.Context, address string) (PacketEndpoint, error) {
+			return newTestUDPPacketEndpoint(address)
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -720,28 +721,26 @@ func TestRuntimeListenerL3RejectKeepsHandshakeDeadlineThroughBlockedBye(t *testi
 		kinds: map[string]transport.PathSessionKind{
 			"blocked": transport.PathSessionStream,
 		},
-		inflight: make(map[uint64]transport.PathConn, attempts),
+		inflight: make(map[uint64]*runtimeListenerInflightClaim, attempts),
 		closed:   make(chan struct{}),
 	}
 	paths := make([]*blockedRuntimeByePath, 0, attempts)
 	var workers sync.WaitGroup
-	for index := range attempts {
+	for range attempts {
 		path := newBlockedRuntimeByePath(frame)
 		paths = append(paths, path)
-		inflightID := uint64(index + 1)
-		listener.inflightMu.Lock()
-		listener.inflight[inflightID] = path
-		listener.inflightMu.Unlock()
-		listener.handshakes <- struct{}{}
+		claim := claimRuntimeListenerPath(t, listener, "blocked", path)
+		clearDeadline := armClaimedPathHandshakeDeadline(claim, 100*time.Millisecond)
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			listener.serveIncoming(
-				inflightID,
-				"blocked",
+				claim,
 				CarrierTCP,
-				path,
-				armPathHandshakeDeadlineAfter(path, 100*time.Millisecond),
+				func() error {
+					clearDeadline()
+					return nil
+				},
 			)
 		}()
 	}

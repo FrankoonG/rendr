@@ -234,9 +234,10 @@ func newPacketSessionListener(t *testing.T, sourceName string) *rendr.SessionLis
 		t.Fatal(err)
 	}
 	listener, err := runtime.Listen(rendr.ListenConfig{Packets: []rendr.PacketSource{{
-		Name:    sourceName,
-		Carrier: rendr.CarrierUDP,
-		Conn:    rawPacketConn,
+		Name:            sourceName,
+		Carrier:         rendr.CarrierUDP,
+		Conn:            rawPacketConn,
+		MaxDatagramSize: 1400,
 	}}})
 	if err != nil {
 		_ = rawPacketConn.Close()

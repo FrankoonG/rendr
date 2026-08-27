@@ -94,6 +94,7 @@ func TestTCPFlowRelayCloseFlowAllowsReopen(t *testing.T) {
 	errCh1 := make(chan error, 1)
 	go func() { errCh1 <- relay.Serve(context.Background(), tcpFlowRelayEvent(id), endpoint) }()
 	egressSide := egress.waitConn(t)
+	waitForTCPRelaySession(t, relay, id)
 	closeActiveFlow(t, relay, id)
 	_ = app.Close()
 	_ = egressSide.Close()

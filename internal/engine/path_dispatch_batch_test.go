@@ -32,6 +32,10 @@ type recordingFrameBatchPath struct {
 	closeOnce      sync.Once
 }
 
+func (p *recordingFrameBatchPath) MaxFrameSize() int {
+	return testPacketFrameSize(p.PathConn)
+}
+
 type recordingFrameBatchSpan struct {
 	path *recordingFrameBatchPath
 }
@@ -180,6 +184,145 @@ func BenchmarkFrameDispatchAuthorizationMetadata(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestFrameDispatchDigestFastPathRequiresLedgerOwnedBacking(t *testing.T) {
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	frame := executionDataFrame(t, 0, []byte("immutable-ledger-frame"))
+	if err := e.acquireSendSlot(false, len(frame)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	admission, err := e.admitFrameDispatch(frame, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendHistMu.Lock()
+	digest, reused := e.frameDigestForDispatchLocked(frame, admission)
+	clone := append([]byte(nil), frame...)
+	cloneDigest, cloneReused := e.frameDigestForDispatchLocked(clone, admission)
+	mutated := append([]byte(nil), frame...)
+	mutated[len(mutated)-1] ^= 0xff
+	mutatedDigest, mutatedReused := e.frameDigestForDispatchLocked(mutated, admission)
+	e.sendHistMu.Unlock()
+
+	if !reused || digest != admission.digest {
+		t.Fatalf("owned backing digest/reused=%x/%t", digest, reused)
+	}
+	if cloneReused || cloneDigest != admission.digest {
+		t.Fatalf("equal copied frame digest/reused=%x/%t", cloneDigest, cloneReused)
+	}
+	if mutatedReused || mutatedDigest == admission.digest {
+		t.Fatalf("mutated copied frame digest/reused=%x/%t", mutatedDigest, mutatedReused)
+	}
+}
+
+func TestPathDispatchBatchScratchResetDropsReferences(t *testing.T) {
+	frame := []byte("replay-owned payload")
+	waiter := &applicationDispatchWaiter{done: make(chan pathDispatchResult, 1)}
+	receipt := &batchDispatchAttributionReceipt{record: &batchDispatchAttributionRecord{}}
+	span := &recordingFrameBatchSpan{}
+	result := make(chan pathDispatchResult, 1)
+
+	scratch := &pathDispatchBatchScratch{}
+	for _, index := range []int{0, maximumPathDispatchBatch - 1} {
+		scratch.jobs[index] = pathDispatchJob{
+			frame: frame, applicationWait: waiter, result: result,
+			beforePublication: func() {},
+		}
+		scratch.receiptValues[index] = *receipt
+		scratch.preparedReceipts[index] = &scratch.receiptValues[index]
+		scratch.frames[index] = frame
+		scratch.receipts[index] = &scratch.receiptValues[index]
+		scratch.spans[index] = span
+	}
+
+	scratch.reset(maximumPathDispatchBatch, maximumPathDispatchBatch)
+	for _, index := range []int{0, maximumPathDispatchBatch - 1} {
+		if scratch.jobs[index].frame != nil || scratch.jobs[index].applicationWait != nil ||
+			scratch.jobs[index].result != nil || scratch.jobs[index].beforePublication != nil {
+			t.Fatalf("reset retained job-owned state at slot %d", index)
+		}
+		if scratch.receiptValues[index] != (batchDispatchAttributionReceipt{}) ||
+			scratch.preparedReceipts[index] != nil || scratch.frames[index] != nil ||
+			scratch.receipts[index] != nil || scratch.spans[index] != nil {
+			t.Fatalf("reset retained batch attribution or transport callback state at slot %d", index)
+		}
+	}
+}
+
+func TestBatchAttributionRecordReuseRejectsStaleReceipt(t *testing.T) {
+	manifest, ids := runtimeGraph(t,
+		runtimeNode(proto.GraphNodeKindSelector, "root", "path"),
+		runtimeNode(proto.GraphNodeKindPath, "path"),
+	)
+	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
+	t.Cleanup(func() { _ = e.Close() })
+	if err := e.ConfigureLocalGraph(1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	slot := &pathSlot{localTXTargetID: ids["path"]}
+	publish := func(seq uint64) []byte {
+		t.Helper()
+		frame := executionDataFrame(t, seq, []byte{byte(seq)})
+		if err := e.acquireSendSlot(false, len(frame)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.reserveAndPublishOwnedSendFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+
+	first := e.beginApplicationBatchDispatch(
+		publish(0), slot, e.currentPathTopologyEpoch(),
+	)
+	if first == nil || first.record == nil || first.recordID == 0 {
+		t.Fatalf("first receipt=%+v", first)
+	}
+	firstRecord, firstID := first.record, first.recordID
+	e.resolveApplicationBatchDispatch([]*batchDispatchAttributionReceipt{first}, 1)
+
+	second := e.beginApplicationBatchDispatch(
+		publish(1), slot, e.currentPathTopologyEpoch(),
+	)
+	if second == nil || second.record == nil {
+		t.Fatal("second dispatch did not create attribution")
+	}
+	if second.record != firstRecord {
+		t.Fatal("bounded attribution cache did not reuse its released record")
+	}
+	if second.recordID == firstID {
+		t.Fatalf("reused record identity did not advance: %d", second.recordID)
+	}
+
+	stale := *first
+	stale.resolved = false
+	e.resolveApplicationBatchDispatch([]*batchDispatchAttributionReceipt{&stale}, 1)
+	if !stale.resolved {
+		t.Fatal("stale receipt was not consumed")
+	}
+	e.sendHistMu.Lock()
+	pending := second.record.pending
+	entry := e.sendHistoryEntryLocked(1)
+	stillAttached := entry != nil && entry.batchAttribution == second.record
+	e.sendHistMu.Unlock()
+	if pending != 1 || !stillAttached {
+		t.Fatalf("stale receipt changed reused record: pending=%d attached=%t", pending, stillAttached)
+	}
+
+	e.resolveApplicationBatchDispatch([]*batchDispatchAttributionReceipt{second}, 1)
+	e.sendHistMu.Lock()
+	entry = e.sendHistoryEntryLocked(1)
+	freeCount := e.sendHist.batchRecordFreeCount
+	e.sendHistMu.Unlock()
+	if entry == nil || entry.batchAttribution != nil || freeCount != 1 {
+		t.Fatalf("second record settlement entry=%+v free=%d", entry, freeCount)
 	}
 }
 
@@ -356,6 +499,45 @@ func TestPathWriterBatchesOrderedSixteenPacketDataFrames(t *testing.T) {
 	}
 	if next, ok := slot.earliestDataWriteAfter(maximumPathDispatchBatch, token); ok {
 		t.Fatalf("replay-only DATA became a causal path witness: next=%d", next)
+	}
+}
+
+func TestLegacyFrameBatchWriterMayRetainOuterSliceAcrossScratchReuse(t *testing.T) {
+	e, slot, path := newBatchDispatchHarness(t, true)
+	var retained [][]byte
+	path.batchHook = func(frames [][]byte) (int, error) {
+		if retained == nil {
+			retained = frames
+		}
+		return path.writeWholeFrames(frames)
+	}
+
+	waiters := make([]*applicationDispatchWaiter, maximumPathDispatchBatch)
+	for index := range waiters {
+		waiters[index] = queueBatchApplicationJob(t, e, slot, uint64(index), true)
+	}
+	startBatchDispatchHarness(t, e, slot)
+	for index, waiter := range waiters {
+		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
+			t.Fatalf("initial frame %d: %v", index, result.err)
+		}
+	}
+	if len(retained) != maximumPathDispatchBatch {
+		t.Fatalf("retained outer batch len=%d want %d", len(retained), maximumPathDispatchBatch)
+	}
+	if slot.dispatchBatchScratch == nil || &retained[0] == &slot.dispatchBatchScratch.frames[0] {
+		t.Fatal("legacy FrameBatchWriter received the reusable outer scratch slice")
+	}
+
+	next := queueBatchApplicationJob(t, e, slot, maximumPathDispatchBatch, true)
+	if result := awaitBatchDispatchResult(t, next); result.err != nil {
+		t.Fatalf("scratch-reuse frame: %v", result.err)
+	}
+	for index, frame := range retained {
+		header, err := decodeBatchTestHeader(frame)
+		if err != nil || header.Seq != uint64(index) {
+			t.Fatalf("retained frame %d header=%+v error=%v", index, header, err)
+		}
 	}
 }
 
@@ -1000,10 +1182,7 @@ func TestPathWriterFallsBackForOrdinaryPathConn(t *testing.T) {
 
 func TestPathWriterBatchExtensionLeavesStreamAndReplayWritesOrdinary(t *testing.T) {
 	t.Run("stream application", func(t *testing.T) {
-		e, slot, path := newBatchDispatchHarness(t, true)
-		e.recvMu.Lock()
-		e.packetized = false
-		e.recvMu.Unlock()
+		e, slot, path := newStreamBatchDispatchHarness(t, true)
 		startBatchDispatchHarness(t, e, slot)
 		waiter := queueBatchApplicationJob(t, e, slot, 0, true)
 		if result := awaitBatchDispatchResult(t, waiter); result.err != nil {
@@ -1326,10 +1505,14 @@ func TestAcceptedPacketRouteSnapshotDoesNotDeadlockReplacementActivation(t *test
 	e.tailReplayMaxBackoff = time.Hour
 	t.Cleanup(func() { _ = e.Close() })
 	targets := configureLeafSelectorRuntime(t, e, "path")
-	binding := PathBinding{LocalTXTargetID: targets["path"], PeerTXTargetID: targets["path"]}
 
 	oldBase, oldPeer := newMemoryPathPair()
 	oldPath := newRecordingFrameBatchPath(oldBase)
+	capacity := uint32(oldPath.MaxFrameSize())
+	binding := PathBinding{
+		LocalTXTargetID: targets["path"], PeerTXTargetID: targets["path"],
+		LocalReceiveFrameCapacity: capacity, PeerReceiveFrameCapacity: capacity,
+	}
 	t.Cleanup(func() { _ = oldPeer.Close() })
 	if _, err := e.AttachPathBound(oldPath, transport.PathSpec{
 		Transport: "memory", Address: "packet-lock-order-old",
@@ -1462,14 +1645,22 @@ func TestAcceptedPacketRouteEpochRedispatchesAcrossDifferentLeafRecovery(t *test
 
 	newClientBBase, newServerB := newMemoryPathPair()
 	newClientB := newRecordingFrameBatchPath(newClientBBase)
+	clientCapacity := uint32(newClientB.MaxFrameSize())
+	serverCapacity := uint32(newServerB.MaxFrameSize())
 	if _, err := server.AttachPathBound(newServerB,
 		transport.PathSpec{Transport: "memory", Address: "route-epoch-new-b-server"},
-		PathBinding{LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"]}); err != nil {
+		PathBinding{
+			LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"],
+			LocalReceiveFrameCapacity: serverCapacity, PeerReceiveFrameCapacity: clientCapacity,
+		}); err != nil {
 		t.Fatal(err)
 	}
 	replacementID, err := client.PreparePathBound(newClientB,
 		transport.PathSpec{Transport: "memory", Address: "route-epoch-new-b-client"},
-		PathBinding{LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"]})
+		PathBinding{
+			LocalTXTargetID: ids["b"], PeerTXTargetID: ids["b"],
+			LocalReceiveFrameCapacity: clientCapacity, PeerReceiveFrameCapacity: serverCapacity,
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1742,9 +1933,19 @@ func TestAcceptedPacketInFlightForcesSelectorCutoverReplay(t *testing.T) {
 }
 
 func newBatchDispatchHarness(t *testing.T, batch bool) (*Engine, *pathSlot, *recordingFrameBatchPath) {
+	return newBatchDispatchHarnessMode(t, batch, true)
+}
+
+func newStreamBatchDispatchHarness(t *testing.T, batch bool) (*Engine, *pathSlot, *recordingFrameBatchPath) {
+	return newBatchDispatchHarnessMode(t, batch, false)
+}
+
+func newBatchDispatchHarnessMode(t *testing.T, batch, packetized bool) (*Engine, *pathSlot, *recordingFrameBatchPath) {
 	t.Helper()
 	e := New(SideClient, NewClientFlowID(), Limits{}.Clamp())
-	e.SetPacketMode()
+	if packetized {
+		e.SetPacketMode()
+	}
 	path, peer := newMemoryPathPair()
 	recording := newRecordingFrameBatchPath(path)
 	var conn transport.PathConn = recording

@@ -1,6 +1,7 @@
 package rendr
 
 import (
+	"errors"
 	"net"
 
 	"github.com/FrankoonG/rendr/internal/engine"
@@ -16,18 +17,29 @@ import (
 // callers can errors.Is against rendr.ErrFoo and have it match what
 // the engine returned.
 var (
-	ErrMigrationBudgetExceeded     = engine.ErrMigrationBudgetExceeded
-	ErrZombie                      = engine.ErrZombie
-	ErrPeerProtoVersion            = engine.ErrPeerProtoVersion
-	ErrPeerProtocol                = engine.ErrPeerProtocol
-	ErrPeerClosed                  = engine.ErrPeerClosed
-	ErrGracefulCloseTimeout        = engine.ErrGracefulCloseTimeout
-	ErrLastPath                    = engine.ErrLastPath
-	ErrPacketTooLarge              = engine.ErrPacketTooLarge
-	ErrRecvWindowExceeded          = engine.ErrRecvWindowExceeded
-	ErrPathAdmissionOutcomeUnknown = engine.ErrPathAdmissionOutcomeUnknown
-	ErrPathAdmissionRejected       = engine.ErrPathAdmissionRejected
-	ErrSequenceExhausted           = engine.ErrSequenceExhausted
+	// ErrDialCleanupCapacity means the process cannot reserve another durable
+	// teardown owner before a Dial would invoke external or peer-visible work.
+	ErrDialCleanupCapacity             = errors.New("rendr: canceled Dial cleanup authority is at capacity")
+	ErrMigrationBudgetExceeded         = engine.ErrMigrationBudgetExceeded
+	ErrZombie                          = engine.ErrZombie
+	ErrPeerProtoVersion                = engine.ErrPeerProtoVersion
+	ErrPeerProtocol                    = engine.ErrPeerProtocol
+	ErrPeerClosed                      = engine.ErrPeerClosed
+	ErrGracefulCloseTimeout            = engine.ErrGracefulCloseTimeout
+	ErrLastPath                        = engine.ErrLastPath
+	ErrPacketTooLarge                  = engine.ErrPacketTooLarge
+	ErrPacketPathCapacityUnavailable   = engine.ErrPacketPathCapacityUnavailable
+	ErrRecvWindowExceeded              = engine.ErrRecvWindowExceeded
+	ErrPathAdmissionOutcomeUnknown     = engine.ErrPathAdmissionOutcomeUnknown
+	ErrPathAdmissionRejected           = engine.ErrPathAdmissionRejected
+	ErrSequenceExhausted               = engine.ErrSequenceExhausted
+	ErrSelectorStateEpochExhausted     = engine.ErrSelectorStateEpochExhausted
+	ErrMigrationObserverLagged         = engine.ErrMigrationObserverLagged
+	ErrMigrationObserverCallbackFailed = engine.ErrMigrationObserverCallbackFailed
+	ErrMigrationObserverLimit          = engine.ErrMigrationObserverLimit
+	// ErrPacketDestinationMismatch is returned when PacketConn.WriteTo is
+	// given a non-nil address other than the session's logical peer.
+	ErrPacketDestinationMismatch = errors.New("rendr: packet destination does not match session peer")
 
 	// ErrReadDeadlineExceeded is the sentinel returned by Read /
 	// ReadFrom when a SetReadDeadline-set deadline elapses before
@@ -40,3 +52,20 @@ var (
 	// stream frames, or one complete datagram, were already accepted.
 	ErrWriteDeadlineExceeded net.Error = engine.ErrWriteDeadlineExceeded
 )
+
+// PacketDestinationError describes a rejected PacketConn.WriteTo destination.
+// It unwraps to ErrPacketDestinationMismatch for errors.Is checks.
+type PacketDestinationError struct {
+	ExpectedNetwork string
+	ExpectedAddress string
+	ActualNetwork   string
+	ActualAddress   string
+}
+
+func (e *PacketDestinationError) Error() string {
+	return ErrPacketDestinationMismatch.Error()
+}
+
+func (e *PacketDestinationError) Unwrap() error {
+	return ErrPacketDestinationMismatch
+}

@@ -49,7 +49,7 @@ func encodeTCPEnvelope(id l3ingress.L3Identity, egress string) ([]byte, error) {
 	// Byte 5 is reserved flags and must remain zero in version 2.
 	binary.BigEndian.PutUint16(wire[6:8], uint16(len(egress)))
 	var err error
-	wire, err = id.AppendBinary(wire)
+	wire, err = appendCanonicalIdentity(wire, id, l3ingress.ProtocolTCP)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +75,7 @@ func readTCPEnvelope(r io.Reader) (tcpEnvelope, error) {
 	if egressLen < 1 || egressLen > tcpEnvelopeMaxEgressName {
 		return tcpEnvelope{}, fmt.Errorf("l3session: invalid TCP envelope egress length %d", egressLen)
 	}
-	id, err := l3ingress.DecodeIdentity(fixed[tcpEnvelopeHeaderSize:])
+	id, err := decodeCanonicalIdentity(fixed[tcpEnvelopeHeaderSize:], l3ingress.ProtocolTCP)
 	if err != nil {
 		return tcpEnvelope{}, err
 	}

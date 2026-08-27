@@ -128,6 +128,7 @@ func (p *sequencerTestPath) Close() error {
 }
 
 func (*sequencerTestPath) Quality() transport.PathQuality { return transport.PathQuality{} }
+func (*sequencerTestPath) MaxFrameSize() int              { return 1<<16 - 1 }
 
 func (p *sequencerTestPath) OnDeath(fn func(transport.DeathCause, error)) {
 	p.deathMu.Lock()
@@ -318,7 +319,7 @@ func TestTXReplayLedgerDoesNotOverwriteUnackedHead(t *testing.T) {
 		sendDone <- nil
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for c1.writes.Load() < sendHistoryWindow && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}

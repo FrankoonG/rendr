@@ -38,13 +38,18 @@ const (
 	CtrlLeafMobilityAck      CtrlCode = 0x13
 	CtrlLeafMobilityCommit   CtrlCode = 0x14
 	CtrlStreamFin            CtrlCode = 0x15
+	CtrlSelectorState        CtrlCode = 0x16
+	// CtrlCodeLimit is the exclusive upper bound of the contiguous v1 control
+	// code space. PacketControlFrameBoundFor deliberately indexes this range so
+	// adding a code without a capacity classification fails package tests.
+	CtrlCodeLimit CtrlCode = 0x17
 )
 
 type InstanceID [16]byte
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 20
+	ProtocolMinor uint16 = 22
 )
 
 type FeatureSet uint64
@@ -121,8 +126,16 @@ const (
 	// FeaturePolicySelectorGeneration makes every accepted policy ACK carry the
 	// committed selector execution generation that DATA attribution uses.
 	FeaturePolicySelectorGeneration FeatureSet = 1 << 23
+	// FeatureSelectorStateVector adds a canonical full-graph selector state
+	// control message. The vector binds every selector's desired and effective
+	// immediate child to one sender direction and state epoch.
+	FeatureSelectorStateVector FeatureSet = 1 << 24
+	// FeatureDirectionalPacketCapacity binds each packet path's factual receive
+	// frame capacity into HELLO/BRIDGE admission. The peer echoes the declaration
+	// so each sender can prove its exact directional TX budget.
+	FeatureDirectionalPacketCapacity FeatureSet = 1 << 25
 
-	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose | FeaturePolicyClassSelection | FeatureDataRootSelectorAttribution | FeaturePolicyEarlyCustody | FeaturePolicyCommitChallenge | FeaturePolicySelectorGeneration
+	SupportedFeatures FeatureSet = FeatureReplayLedger | FeatureDirectionalACK | FeatureStrictDecode | FeaturePolicyTransaction | FeaturePolicyReservation | FeatureDirectionalPathBinding | FeatureRecursiveExecutor | FeaturePathAdmissionTransaction | FeaturePathAdmissionTerminalCommit | FeaturePathAdmissionCrossRouteTerminal | FeatureLeafMobilityEnvelope | FeatureLeafMobilityTransaction | FeatureLeafMobilityOOBTransaction | FeatureServerAssignedSessionEpoch | FeatureLeafMobilityTypedExecution | FeatureLeafMobilityStagedPublication | FeatureBoundedReplayBudget | FeaturePeerPathRetirement | FeatureStreamHalfClose | FeaturePolicyClassSelection | FeatureDataRootSelectorAttribution | FeaturePolicyEarlyCustody | FeaturePolicyCommitChallenge | FeaturePolicySelectorGeneration | FeatureSelectorStateVector | FeatureDirectionalPacketCapacity
 	RequiredFeatures  FeatureSet = SupportedFeatures
 )
 
@@ -429,6 +442,8 @@ func (c CtrlCode) String() string {
 		return "LEAF_MOBILITY_COMMIT"
 	case CtrlStreamFin:
 		return "STREAM_FIN"
+	case CtrlSelectorState:
+		return "SELECTOR_STATE"
 	default:
 		return fmt.Sprintf("ctrl(0x%02x)", uint8(c))
 	}
@@ -465,14 +480,15 @@ const (
 // manifest.
 type HelloPayload struct {
 	Negotiation
-	FlowID          [16]byte
-	InstanceID      InstanceID
-	Caps            uint32
-	InitialTargetID TargetID
-	LocalTXManifest GraphManifest
+	FlowID               [16]byte
+	InstanceID           InstanceID
+	Caps                 uint32
+	InitialTargetID      TargetID
+	ReceiveFrameCapacity uint32
+	LocalTXManifest      GraphManifest
 }
 
-const HelloPayloadSize = NegotiationSize + 56
+const HelloPayloadSize = NegotiationSize + 60
 
 func (p HelloPayload) Encode() ([]byte, error) {
 	if err := validateNegotiation(p.Negotiation); err != nil {
@@ -480,6 +496,9 @@ func (p HelloPayload) Encode() ([]byte, error) {
 	}
 	if p.InstanceID == (InstanceID{}) {
 		return nil, fmt.Errorf("proto: hello has zero instance id")
+	}
+	if err := validateDeclaredPacketCapacity(p.Caps, p.ReceiveFrameCapacity, "hello"); err != nil {
+		return nil, err
 	}
 	manifest, err := p.LocalTXManifest.Encode()
 	if err != nil {
@@ -498,7 +517,8 @@ func (p HelloPayload) Encode() ([]byte, error) {
 	copy(b[96:112], p.InstanceID[:])
 	binary.BigEndian.PutUint32(b[112:116], p.Caps)
 	copy(b[116:132], p.InitialTargetID[:])
-	binary.BigEndian.PutUint32(b[132:136], uint32(len(manifest)))
+	binary.BigEndian.PutUint32(b[132:136], p.ReceiveFrameCapacity)
+	binary.BigEndian.PutUint32(b[136:140], uint32(len(manifest)))
 	b = append(b, manifest...)
 	return b, nil
 }
@@ -520,10 +540,14 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 	}
 	p.Caps = binary.BigEndian.Uint32(b[112:116])
 	copy(p.InitialTargetID[:], b[116:132])
+	p.ReceiveFrameCapacity = binary.BigEndian.Uint32(b[132:136])
+	if err := validateDeclaredPacketCapacity(p.Caps, p.ReceiveFrameCapacity, "hello"); err != nil {
+		return HelloPayload{}, err
+	}
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
 		return HelloPayload{}, fmt.Errorf("proto: hello session epoch does not match flow id")
 	}
-	manifestLen := int(binary.BigEndian.Uint32(b[132:136]))
+	manifestLen := int(binary.BigEndian.Uint32(b[136:140]))
 	if manifestLen != len(b)-HelloPayloadSize || manifestLen > GraphManifestMaxWireBytes {
 		return HelloPayload{}, fmt.Errorf("proto: hello graph length %d does not match remaining payload %d", manifestLen, len(b)-HelloPayloadSize)
 	}
@@ -543,16 +567,18 @@ func DecodeHello(b []byte) (HelloPayload, error) {
 
 type HelloAckPayload struct {
 	Negotiation
-	FlowID               [16]byte
-	InstanceID           InstanceID
-	Caps                 uint32
-	InitialTargetID      TargetID
-	AcceptedPeerBinding  GraphBinding
-	AcceptedPeerTargetID TargetID
-	LocalTXManifest      GraphManifest
+	FlowID                           [16]byte
+	InstanceID                       InstanceID
+	Caps                             uint32
+	InitialTargetID                  TargetID
+	AcceptedPeerBinding              GraphBinding
+	AcceptedPeerTargetID             TargetID
+	ReceiveFrameCapacity             uint32
+	AcceptedPeerReceiveFrameCapacity uint32
+	LocalTXManifest                  GraphManifest
 }
 
-const HelloAckPayloadSize = NegotiationSize + 112
+const HelloAckPayloadSize = NegotiationSize + 120
 
 func (p HelloAckPayload) Encode() ([]byte, error) {
 	if err := validateNegotiation(p.Negotiation); err != nil {
@@ -560,6 +586,12 @@ func (p HelloAckPayload) Encode() ([]byte, error) {
 	}
 	if p.InstanceID == (InstanceID{}) {
 		return nil, fmt.Errorf("proto: hello_ack has zero instance id")
+	}
+	if err := validateDeclaredPacketCapacity(p.Caps, p.ReceiveFrameCapacity, "hello_ack"); err != nil {
+		return nil, err
+	}
+	if packet := p.Caps&CapsPacketMode != 0; packet != (p.AcceptedPeerReceiveFrameCapacity != 0) {
+		return nil, fmt.Errorf("proto: hello_ack peer receive capacity does not match session kind")
 	}
 	manifest, err := p.LocalTXManifest.Encode()
 	if err != nil {
@@ -587,7 +619,9 @@ func (p HelloAckPayload) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint64(b[132:140], p.AcceptedPeerBinding.Revision)
 	copy(b[140:172], p.AcceptedPeerBinding.Digest[:])
 	copy(b[172:188], p.AcceptedPeerTargetID[:])
-	binary.BigEndian.PutUint32(b[188:192], uint32(len(manifest)))
+	binary.BigEndian.PutUint32(b[188:192], p.ReceiveFrameCapacity)
+	binary.BigEndian.PutUint32(b[192:196], p.AcceptedPeerReceiveFrameCapacity)
+	binary.BigEndian.PutUint32(b[196:200], uint32(len(manifest)))
 	b = append(b, manifest...)
 	return b, nil
 }
@@ -612,6 +646,14 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	p.AcceptedPeerBinding.Revision = binary.BigEndian.Uint64(b[132:140])
 	copy(p.AcceptedPeerBinding.Digest[:], b[140:172])
 	copy(p.AcceptedPeerTargetID[:], b[172:188])
+	p.ReceiveFrameCapacity = binary.BigEndian.Uint32(b[188:192])
+	p.AcceptedPeerReceiveFrameCapacity = binary.BigEndian.Uint32(b[192:196])
+	if err := validateDeclaredPacketCapacity(p.Caps, p.ReceiveFrameCapacity, "hello_ack"); err != nil {
+		return HelloAckPayload{}, err
+	}
+	if packet := p.Caps&CapsPacketMode != 0; packet != (p.AcceptedPeerReceiveFrameCapacity != 0) {
+		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack peer receive capacity does not match session kind")
+	}
 	if p.SessionEpoch != SessionEpoch(p.FlowID) {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack session epoch does not match flow id")
 	}
@@ -621,7 +663,7 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 	if p.AcceptedPeerTargetID == (TargetID{}) {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack has zero accepted peer target")
 	}
-	manifestLen := int(binary.BigEndian.Uint32(b[188:192]))
+	manifestLen := int(binary.BigEndian.Uint32(b[196:200]))
 	if manifestLen != len(b)-HelloAckPayloadSize || manifestLen > GraphManifestMaxWireBytes {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack graph length %d does not match remaining payload %d", manifestLen, len(b)-HelloAckPayloadSize)
 	}
@@ -637,6 +679,27 @@ func DecodeHelloAck(b []byte) (HelloAckPayload, error) {
 		return HelloAckPayload{}, fmt.Errorf("proto: hello_ack initial target is not a path in the graph")
 	}
 	return p, nil
+}
+
+// ValidatePeerReceiveFrameCapacity proves that HELLO_ACK echoed the exact
+// receive capacity sent by the initiator. A zero expected value is valid only
+// for stream sessions.
+func (p HelloAckPayload) ValidatePeerReceiveFrameCapacity(expected uint32) error {
+	if p.AcceptedPeerReceiveFrameCapacity != expected {
+		return fmt.Errorf("proto: hello_ack accepted peer receive capacity %d, want %d", p.AcceptedPeerReceiveFrameCapacity, expected)
+	}
+	return nil
+}
+
+func validateDeclaredPacketCapacity(caps, capacity uint32, message string) error {
+	packet := caps&CapsPacketMode != 0
+	if packet && capacity == 0 {
+		return fmt.Errorf("proto: %s packet session has zero receive frame capacity", message)
+	}
+	if !packet && capacity != 0 {
+		return fmt.Errorf("proto: %s stream session declares packet receive capacity %d", message, capacity)
+	}
+	return nil
 }
 
 func validateGraphNegotiation(negotiation Negotiation, manifest GraphManifest) error {
@@ -764,9 +827,10 @@ type BridgeTagPayload struct {
 	GraphRevision          uint64
 	GraphDigest            GraphDigest
 	TargetID               TargetID
+	ReceiveFrameCapacity   uint32
 }
 
-const BridgeTagPayloadSize = 144
+const BridgeTagPayloadSize = 148
 
 func (p BridgeTagPayload) Encode() []byte {
 	b := make([]byte, BridgeTagPayloadSize)
@@ -779,7 +843,20 @@ func (p BridgeTagPayload) Encode() []byte {
 	binary.BigEndian.PutUint64(b[88:96], p.GraphRevision)
 	copy(b[96:128], p.GraphDigest[:])
 	copy(b[128:144], p.TargetID[:])
+	binary.BigEndian.PutUint32(b[144:148], p.ReceiveFrameCapacity)
 	return b
+}
+
+// ValidatePacketCapacity rejects a missing packet capacity or a packet
+// capacity attached to a stream candidate.
+func (p BridgeTagPayload) ValidatePacketCapacity(packet bool) error {
+	if packet && p.ReceiveFrameCapacity == 0 {
+		return fmt.Errorf("proto: bridge_tag packet receive capacity is missing")
+	}
+	if !packet && p.ReceiveFrameCapacity != 0 {
+		return fmt.Errorf("proto: bridge_tag stream session declares packet capacity")
+	}
+	return nil
 }
 
 func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
@@ -799,6 +876,7 @@ func DecodeBridgeTag(b []byte) (BridgeTagPayload, error) {
 	p.GraphRevision = binary.BigEndian.Uint64(b[88:96])
 	copy(p.GraphDigest[:], b[96:128])
 	copy(p.TargetID[:], b[128:144])
+	p.ReceiveFrameCapacity = binary.BigEndian.Uint32(b[144:148])
 	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
 		return BridgeTagPayload{}, fmt.Errorf("proto: bridge_tag session epoch does not match bridge id")
 	}
@@ -847,20 +925,25 @@ func (c AckCode) String() string {
 }
 
 type BridgeAckPayload struct {
-	BridgeID          [16]byte
-	AttachID          [16]byte
-	InstanceID        InstanceID
-	SessionEpoch      SessionEpoch
-	Direction         SenderDirection
-	GraphRevision     uint64
-	GraphDigest       GraphDigest
-	TargetID          TargetID
-	ResponderTargetID TargetID
-	Code              AckCode
-	Reason            string
+	BridgeID                         [16]byte
+	AttachID                         [16]byte
+	InstanceID                       InstanceID
+	SessionEpoch                     SessionEpoch
+	Direction                        SenderDirection
+	GraphRevision                    uint64
+	GraphDigest                      GraphDigest
+	TargetID                         TargetID
+	ResponderTargetID                TargetID
+	ReceiveFrameCapacity             uint32
+	AcceptedPeerReceiveFrameCapacity uint32
+	Code                             AckCode
+	Reason                           string
 }
 
-const BridgeAckPayloadSize = 145
+const (
+	BridgeAckPayloadSize = 153
+	BridgeAckMaxSize     = BridgeAckPayloadSize + 1 + 255
+)
 
 func (p BridgeAckPayload) Encode() []byte {
 	b := make([]byte, BridgeAckPayloadSize)
@@ -873,7 +956,9 @@ func (p BridgeAckPayload) Encode() []byte {
 	copy(b[80:112], p.GraphDigest[:])
 	copy(b[112:128], p.TargetID[:])
 	copy(b[128:144], p.ResponderTargetID[:])
-	b[144] = byte(p.Code)
+	binary.BigEndian.PutUint32(b[144:148], p.ReceiveFrameCapacity)
+	binary.BigEndian.PutUint32(b[148:152], p.AcceptedPeerReceiveFrameCapacity)
+	b[152] = byte(p.Code)
 	if p.Reason != "" {
 		b = appendString8(b, p.Reason)
 	}
@@ -897,7 +982,9 @@ func DecodeBridgeAck(b []byte) (BridgeAckPayload, error) {
 	copy(p.GraphDigest[:], b[80:112])
 	copy(p.TargetID[:], b[112:128])
 	copy(p.ResponderTargetID[:], b[128:144])
-	p.Code = AckCode(b[144])
+	p.ReceiveFrameCapacity = binary.BigEndian.Uint32(b[144:148])
+	p.AcceptedPeerReceiveFrameCapacity = binary.BigEndian.Uint32(b[148:152])
+	p.Code = AckCode(b[152])
 	if p.SessionEpoch != SessionEpoch(p.BridgeID) {
 		return BridgeAckPayload{}, fmt.Errorf("proto: bridge_ack session epoch does not match bridge id")
 	}
@@ -916,6 +1003,28 @@ func DecodeBridgeAck(b []byte) (BridgeAckPayload, error) {
 		return BridgeAckPayload{}, err
 	}
 	return p, nil
+}
+
+// ValidatePacketCapacities rejects a missing packet capacity, a packet
+// capacity on a stream session, or an ACK that did not echo the proposal.
+func (p BridgeAckPayload) ValidatePacketCapacities(packet bool, expectedPeer uint32) error {
+	if packet {
+		if p.ReceiveFrameCapacity == 0 || p.AcceptedPeerReceiveFrameCapacity == 0 {
+			return fmt.Errorf("proto: bridge_ack packet capacity is missing")
+		}
+	} else if p.ReceiveFrameCapacity != 0 || p.AcceptedPeerReceiveFrameCapacity != 0 {
+		return fmt.Errorf("proto: bridge_ack stream session declares packet capacity")
+	}
+	return p.ValidatePeerReceiveFrameCapacity(expectedPeer)
+}
+
+// ValidatePeerReceiveFrameCapacity proves that BRIDGE_ACK echoed the exact
+// receive capacity sent by BRIDGE_TAG.
+func (p BridgeAckPayload) ValidatePeerReceiveFrameCapacity(expected uint32) error {
+	if p.AcceptedPeerReceiveFrameCapacity != expected {
+		return fmt.Errorf("proto: bridge_ack accepted peer receive capacity %d, want %d", p.AcceptedPeerReceiveFrameCapacity, expected)
+	}
+	return nil
 }
 
 // ExecutionKind is the wire-level group executor selected by a policy

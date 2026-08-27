@@ -781,7 +781,7 @@ func openPacketLink(
 		}
 		proof := security.admissionProof(id, public, nonce, cookie)
 		request, err := encodeOuter(outerFrame{
-			Type: outerTypeOpen, LinkID: id, Generation: 1,
+			Type: outerTypeOpen, Sender: leafmobility.RoleDialer, LinkID: id, Generation: 1,
 			Payload: marshalOpen(public, nonce, cookie, proof),
 		}, linkSecret{})
 		if err != nil {
@@ -833,7 +833,7 @@ func openPacketLink(
 			if secretErr != nil {
 				continue
 			}
-			if _, decodeErr := decodeOuter(buf[:n], secret); decodeErr == nil {
+			if _, decodeErr := decodeOuter(buf[:n], secret, leafmobility.RoleAcceptor); decodeErr == nil {
 				observation, observeErr := observeUDPRouteForWire(ctx, wire, remote)
 				if observeErr != nil {
 					return [4]byte{}, linkSecret{}, fmt.Errorf(
@@ -847,7 +847,7 @@ func openPacketLink(
 				if contextErr != nil {
 					return [4]byte{}, linkSecret{}, contextErr
 				}
-				qualifier := &linkOwner{id: id, secret: secret}
+				qualifier := &linkOwner{id: id, secret: secret, role: leafmobility.RoleDialer}
 				if _, qualifyErr := qualifier.runMaximumDataQualification(
 					ctx, wire, remote, 1, outerQualificationAdmission, qualificationContext,
 				); qualifyErr != nil {
@@ -878,6 +878,8 @@ type retainedPathConn struct {
 	deathErr   error
 	deathFn    func(transport.DeathCause, error)
 }
+
+var _ transport.PacketPathConn = (*retainedPathConn)(nil)
 
 func newRetainedPathConn(
 	path *basetcp.PathConn,
@@ -1197,7 +1199,7 @@ func (l *Listener) handlePacketOpen(remote net.Addr, datagram []byte, header out
 	if err != nil {
 		return
 	}
-	frame, err := decodeOuter(datagram, linkSecret{})
+	frame, err := decodeOuter(datagram, linkSecret{}, leafmobility.RoleDialer)
 	if err != nil || frame.Type != outerTypeOpen || frame.Generation != 1 {
 		return
 	}
@@ -1257,7 +1259,7 @@ func (l *Listener) handlePacketOpen(remote net.Addr, datagram []byte, header out
 		return
 	}
 	ack, err := encodeOuterControl(outerFrame{
-		Type: outerTypeOpenAck, LinkID: frame.LinkID, Generation: 1,
+		Type: outerTypeOpenAck, Sender: leafmobility.RoleAcceptor, LinkID: frame.LinkID, Generation: 1,
 		Payload: marshalOpenAck(serverPublic, virtualIP, nonce),
 	}, secret)
 	if err != nil {
@@ -1297,7 +1299,7 @@ func (l *Listener) sendPacketCookie(remote net.Addr, id linkID, cookie outerCook
 		return err
 	}
 	datagram, err := encodeOuter(outerFrame{
-		Type: outerTypeCookie, LinkID: id, Generation: 1, Payload: payload,
+		Type: outerTypeCookie, Sender: leafmobility.RoleAcceptor, LinkID: id, Generation: 1, Payload: payload,
 	}, linkSecret{})
 	if err != nil {
 		return err

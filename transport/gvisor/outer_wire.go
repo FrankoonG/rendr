@@ -8,10 +8,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	"github.com/FrankoonG/rendr/internal/leafmobility"
 )
 
 const (
-	outerVersion         = uint8(5)
+	outerVersion         = uint8(6)
 	outerHeaderSize      = 32
 	outerAuthTagSize     = 16
 	outerSecretSize      = 32
@@ -88,6 +90,7 @@ type outerProof [outerProofSize]byte
 
 type outerFrame struct {
 	Type       outerType
+	Sender     leafmobility.Role
 	LinkID     linkID
 	Generation uint64
 	Payload    []byte
@@ -133,6 +136,7 @@ type outerQualification struct {
 var (
 	errOuterMalformed       = errors.New("gvisor: malformed outer datagram")
 	errOuterVersion         = errors.New("gvisor: unsupported outer datagram version")
+	errOuterSender          = errors.New("gvisor: unexpected outer datagram sender")
 	errOuterAuthentication  = errors.New("gvisor: outer datagram authentication failed")
 	errOuterControlMismatch = errors.New("gvisor: outer control payload mismatch")
 )
@@ -213,12 +217,15 @@ func encodeOuterData(
 	sequence uint64,
 	packet []byte,
 	secret linkSecret,
+	sender leafmobility.Role,
 ) ([]byte, error) {
 	payload, err := marshalOuterData(sequence, packet)
 	if err != nil {
 		return nil, err
 	}
-	return encodeOuter(outerFrame{Type: outerTypeData, LinkID: id, Generation: generation, Payload: payload}, secret)
+	return encodeOuter(outerFrame{
+		Type: outerTypeData, Sender: sender, LinkID: id, Generation: generation, Payload: payload,
+	}, secret)
 }
 
 func encodeOuterControl(frame outerFrame, secret linkSecret) ([]byte, error) {
@@ -229,7 +236,8 @@ func encodeOuterControl(frame outerFrame, secret linkSecret) ([]byte, error) {
 }
 
 func encodeOuter(frame outerFrame, secret linkSecret) ([]byte, error) {
-	if !frame.Type.valid() || frame.LinkID == (linkID{}) || frame.Generation == 0 {
+	if !frame.Type.valid() || !validOuterSender(frame.Type, frame.Sender) ||
+		frame.LinkID == (linkID{}) || frame.Generation == 0 {
 		return nil, errOuterMalformed
 	}
 	if frame.Type.authenticated() && secret == (linkSecret{}) {
@@ -246,6 +254,7 @@ func encodeOuter(frame outerFrame, secret linkSecret) ([]byte, error) {
 	copy(wire[0:4], outerMagic[:])
 	wire[4] = outerVersion
 	wire[5] = byte(frame.Type)
+	wire[6] = byte(frame.Sender)
 	copy(wire[8:24], frame.LinkID[:])
 	binary.BigEndian.PutUint64(wire[24:32], frame.Generation)
 	copy(wire[outerHeaderSize:], frame.Payload)
@@ -263,12 +272,16 @@ func decodeOuterHeader(wire []byte) (outerFrame, error) {
 	if wire[4] != outerVersion {
 		return outerFrame{}, errOuterVersion
 	}
-	if wire[6] != 0 || wire[7] != 0 {
+	if wire[7] != 0 {
 		return outerFrame{}, errOuterMalformed
 	}
-	frame := outerFrame{Type: outerType(wire[5]), Generation: binary.BigEndian.Uint64(wire[24:32])}
+	frame := outerFrame{
+		Type: outerType(wire[5]), Sender: leafmobility.Role(wire[6]),
+		Generation: binary.BigEndian.Uint64(wire[24:32]),
+	}
 	copy(frame.LinkID[:], wire[8:24])
-	if !frame.Type.valid() || frame.LinkID == (linkID{}) || frame.Generation == 0 {
+	if !frame.Type.valid() || !validOuterSender(frame.Type, frame.Sender) ||
+		frame.LinkID == (linkID{}) || frame.Generation == 0 {
 		return outerFrame{}, errOuterMalformed
 	}
 	tagSize := 0
@@ -285,10 +298,13 @@ func decodeOuterHeader(wire []byte) (outerFrame, error) {
 	return frame, nil
 }
 
-func decodeOuter(wire []byte, secret linkSecret) (outerFrame, error) {
+func decodeOuter(wire []byte, secret linkSecret, expectedSender leafmobility.Role) (outerFrame, error) {
 	frame, err := decodeOuterHeader(wire)
 	if err != nil {
 		return outerFrame{}, err
+	}
+	if frame.Sender != expectedSender {
+		return outerFrame{}, errOuterSender
 	}
 	if !frame.Type.authenticated() {
 		frame.Payload = append([]byte(nil), frame.Payload...)
@@ -304,6 +320,28 @@ func decodeOuter(wire []byte, secret linkSecret) (outerFrame, error) {
 	}
 	frame.Payload = append([]byte(nil), frame.Payload...)
 	return frame, nil
+}
+
+func validOuterSender(typ outerType, role leafmobility.Role) bool {
+	switch typ {
+	case outerTypeOpen:
+		return role == leafmobility.RoleDialer
+	case outerTypeCookie, outerTypeOpenAck:
+		return role == leafmobility.RoleAcceptor
+	default:
+		return role == leafmobility.RoleDialer || role == leafmobility.RoleAcceptor
+	}
+}
+
+func peerOuterRole(role leafmobility.Role) leafmobility.Role {
+	switch role {
+	case leafmobility.RoleDialer:
+		return leafmobility.RoleAcceptor
+	case leafmobility.RoleAcceptor:
+		return leafmobility.RoleDialer
+	default:
+		return leafmobility.RoleUnknown
+	}
 }
 
 func validateOuterPayload(typ outerType, payload []byte) error {

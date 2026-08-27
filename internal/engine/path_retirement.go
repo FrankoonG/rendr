@@ -478,6 +478,7 @@ func (e *Engine) applyPeerPathRetirementOnce(p proto.PathRetirementPayload) (<-c
 		return match.wait, nil
 	}
 	if match.slot == nil {
+		e.confirmPeerPacketPathRetirementLocked(p)
 		e.pathsMu.Unlock()
 		e.sendMu.Unlock()
 		if p.RouteGeneration > currentGeneration {
@@ -498,6 +499,7 @@ func (e *Engine) applyPeerPathRetirementOnce(p proto.PathRetirementPayload) (<-c
 			fmt.Errorf("peer retired path generation %d", p.RouteGeneration),
 			administrative, false,
 		)
+		e.confirmPeerPacketPathRetirementLocked(p)
 		e.pathsMu.Unlock()
 		// The peer retirement and its frozen unacknowledged prefix are one
 		// sequencer transaction. finishPathDeparture invokes lifecycle hooks and
@@ -517,6 +519,7 @@ func (e *Engine) applyPeerPathRetirementOnce(p proto.PathRetirementPayload) (<-c
 		match.slot.fenceDispatchForRetirement()
 		e.trackPathRetirementLocked(match.slot)
 		delete(e.retainedPaths, match.mapPathID)
+		e.confirmPeerPacketPathRetirementLocked(p)
 		e.removePathPredecessorLocked(match.slot.id)
 		if !match.slot.requestMobilityClaimRetirement() {
 			match.slot.closeQuit()

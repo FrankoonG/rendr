@@ -4338,16 +4338,29 @@ func TestM2TCPPathDeathFailsOverToUDPBackedStream(t *testing.T) {
 		sendHash.Write(buf[:n])
 		sent += n
 		if !killed && sent >= killAt {
+			if err := ln.CloseSource("tcp"); err != nil {
+				t.Fatalf("close TCP ingress: %v", err)
+			}
 			if err := ln.CloseAcceptedPath("tcp", 0); err != nil {
 				t.Fatalf("close accepted TCP path: %v", err)
 			}
 			killed = true
+			activeCarrier := func() string {
+				activeID := admin.ActivePath()
+				for _, path := range client.Paths() {
+					if path.ID == activeID {
+						return path.Spec.Transport
+					}
+				}
+				return ""
+			}
 			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) && admin.ActivePath() != quicPath {
+			for time.Now().Before(deadline) && activeCarrier() != "quic" {
 				time.Sleep(10 * time.Millisecond)
 			}
-			if got := admin.ActivePath(); got != quicPath {
-				t.Fatalf("active path after tcp death=%d, want quic path %d", got, quicPath)
+			if carrier := activeCarrier(); carrier != "quic" {
+				t.Fatalf("active path after tcp death=%d carrier=%q, want quic; original quic=%d paths=%+v",
+					admin.ActivePath(), carrier, quicPath, client.Paths())
 			}
 		}
 	}

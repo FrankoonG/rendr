@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	realTUNTestEnvironment = "RENDR_TUN_REAL_IO_TEST"
-	realTUNTestNetNSID     = "RENDR_TUN_REAL_IO_NETNS_ID"
+	realTUNTestEnvironment   = "RENDR_TUN_REAL_IO_TEST"
+	realTUNTestNetNSID       = "RENDR_TUN_REAL_IO_NETNS_ID"
+	realTUNTestParentNetNSID = "RENDR_TUN_REAL_IO_PARENT_NETNS_ID"
 )
 
 func TestPrivilegedTUNRealIPv4IPv6IO(t *testing.T) {
@@ -433,15 +434,19 @@ func requireRealTUNTest(t testing.TB) {
 		t.Fatalf("ip command is mandatory: %v", err)
 	}
 	selfNS := networkNamespaceIdentity(t, "/proc/self/ns/net")
-	initNS := networkNamespaceIdentity(t, "/proc/1/ns/net")
-	if selfNS == initNS {
-		t.Fatalf("real TUN packet I/O is not isolated: self netns %s equals init netns", selfNS)
-	}
 	expectedNS := os.Getenv(realTUNTestNetNSID)
 	if expectedNS == "" || expectedNS != selfNS {
 		t.Fatalf("network namespace identity=%q want harness-provided %q", selfNS, expectedNS)
 	}
-	t.Logf("isolated network namespace=%s (init=%s)", selfNS, initNS)
+	parentNS := os.Getenv(realTUNTestParentNetNSID)
+	if parentNS == "" {
+		t.Fatal("harness did not provide the parent network namespace identity")
+	}
+	if selfNS == parentNS {
+		t.Fatalf("real TUN packet I/O is not isolated: self netns %s equals harness parent", selfNS)
+	}
+	initNS := networkNamespaceIdentity(t, "/proc/1/ns/net")
+	t.Logf("isolated network namespace=%s (harness parent=%s, contained init=%s)", selfNS, parentNS, initNS)
 }
 
 func assertTUNOpenIsExclusive(t testing.TB, device *Device) {

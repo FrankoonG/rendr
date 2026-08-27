@@ -37,7 +37,7 @@ func appendUDPEnvelope(dst []byte, id l3ingress.L3Identity, egress string, paylo
 	// Byte 5 is reserved flags and must remain zero in version 1.
 	binary.BigEndian.PutUint16(dst[start+6:start+8], uint16(len(egress)))
 	var err error
-	dst, err = id.AppendBinary(dst)
+	dst, err = appendCanonicalIdentity(dst, id, l3ingress.ProtocolUDP)
 	if err != nil {
 		return dst[:start], err
 	}
@@ -70,7 +70,7 @@ func decodeUDPEnvelope(packet []byte) (udpEnvelope, error) {
 	if payloadStart > len(packet) {
 		return udpEnvelope{}, fmt.Errorf("l3session: UDP envelope egress overruns packet: need %d have %d", payloadStart, len(packet))
 	}
-	id, err := l3ingress.DecodeIdentity(packet[identityStart:egressStart])
+	id, err := decodeCanonicalIdentity(packet[identityStart:egressStart], l3ingress.ProtocolUDP)
 	if err != nil {
 		return udpEnvelope{}, err
 	}

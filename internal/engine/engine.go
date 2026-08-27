@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,22 @@ const MaxPayload = 32 * 1024
 const maxSessionPaths = 64
 const maxSeenAttachIDs = 1024
 const pathCloseTimeout = 250 * time.Millisecond
+
+type engineTeardownDeadlineError struct {
+	after      time.Duration
+	stage      string
+	retirement string
+}
+
+func (err *engineTeardownDeadlineError) Error() string {
+	return fmt.Sprintf(
+		"engine: shutdown did not quiesce after %s (stage=%s retire=%s)",
+		err.after, err.stage, err.retirement,
+	)
+}
+
+func (err *engineTeardownDeadlineError) Unwrap() error { return context.DeadlineExceeded }
+func (err *engineTeardownDeadlineError) Timeout() bool { return true }
 
 // Side indicates whether this engine is the dialing (client) side or
 // the listening (server) side. The only behavioural difference in M1
@@ -81,20 +98,30 @@ type Engine struct {
 	// assignment of activeID at AttachPath time is not counted. An in-place
 	// commit reports oldID == newID to preserve the stable logical Path ID.
 	migrationCount uint64
+	// lastMigrationCommittedAt keeps the public event timestamp monotonic even
+	// if the host wall clock regresses or has coarse resolution.
+	lastMigrationCommittedAt time.Time
 	// migrationEpoch is the lock-free invalidation token used by probe
 	// observations. migrationCount remains the authoritative public counter
 	// under pathsMu.
 	migrationEpoch atomic.Uint64
+	// healthEvidenceEpoch is the cross-path invalidation frontier for selector
+	// evidence. Per-path revisions identify the changed slot; this epoch prevents
+	// a commit from assembling revisions observed at different instants.
+	healthEvidenceEpoch atomic.Uint64
+	// healthEvidenceCommitMu is the selector commit linearization gate. Health
+	// facts mutate under RLock; a selector holds Lock from final validation
+	// through route publication and migration accounting.
+	healthEvidenceCommitMu sync.RWMutex
 
-	// migrateHooks is the list of subscriber callbacks invoked
-	// (each in its own goroutine) when activeID changes. Registered
-	// via OnMigrate; cancelled via the returned cancel function.
-	// Held under pathsMu - same as migrationCount.
-	migrateHooks         map[uint64]func(oldID, newID uint32, cause string)
-	migrateHookID        uint64
-	pathDeathHooks       map[uint64]func(PathDeathEvent)
-	pathDeathSerialHooks map[uint64]func(PathDeathEvent)
-	pathDeathHookID      uint64
+	// migrationEventSubscribers are reserved atomically with migrationCount.
+	// Each subscriber owns one bounded worker and queue; events never allocate
+	// a goroutine per callback. Held under pathsMu.
+	migrationEventSubscribers  map[uint64]*migrationEventSubscriber
+	migrationEventSubscriberID uint64
+	pathDeathHooks             map[uint64]func(PathDeathEvent)
+	pathDeathSerialHooks       map[uint64]func(PathDeathEvent)
+	pathDeathHookID            uint64
 
 	// Path management. activeID == 0 means "no active path".
 	pathsMu      sync.RWMutex
@@ -114,28 +141,52 @@ type Engine struct {
 	nextPathGen             uint64
 	pathTopologyEpoch       atomic.Uint64
 	activeID                uint32
+	// zeroPathGeneration and zeroPathDeadline identify one continuous interval
+	// with no active path. Recovery invalidates the interval under pathsMu, so a
+	// stale timeout worker cannot close a newly recovered session.
+	zeroPathGeneration uint64
+	zeroPathDeadline   time.Time
+	// migrationBudgetBeforeExpiryCommit is a deterministic package-test hook.
+	// Tests install it before an episode starts and never mutate it concurrently.
+	migrationBudgetBeforeExpiryCommit func(migrationBudgetEpisode)
 
 	// Send state: one global SEQ counter, plus a single-flight
 	// serialise so frames go out in SEQ order on whatever path is
 	// active at the time.
-	sendMu                     sequencerMutex
-	sendSeq                    uint64
-	sendAckNext                atomic.Uint64
-	sendACKProgress            atomic.Pointer[sendACKProgressObservation]
-	sendPublishedNext          atomic.Uint64
-	sendProof                  proto.AckProof
-	sendAckProof               proto.AckProof
-	sendHistMu                 sync.Mutex
-	sendHist                   sendHistory
-	sendSlots                  chan struct{}
-	sendControlSlots           chan struct{}
-	sendPolicyFinalSlots       chan struct{}
-	sendCreditWake             chan struct{}
-	packetWritesInFlight       atomic.Int64
-	packetFrameLimit           atomic.Int64
-	frameDispatchAdmissionNext atomic.Uint64
-	frameDispatchAttemptNext   atomic.Uint64
-	frameDispatchLeaseNext     atomic.Uint64
+	sendMu            sequencerMutex
+	sendSeq           uint64
+	sendAckNext       atomic.Uint64
+	sendACKProgress   atomic.Pointer[sendACKProgressObservation]
+	sendPublishedNext atomic.Uint64
+	sendProof         proto.AckProof
+	sendAckProof      proto.AckProof
+	// sendSelectorStateEpoch is a lock-free hint used before sendMu. The
+	// immutable publication and history themselves are owned by sendMu.
+	sendSelectorStateEpoch   atomic.Uint64
+	sendSelectorState        *selectorStateRecord
+	sendSelectorStates       map[uint64]*selectorStateRecord
+	sendSelectorStateOrder   []uint64
+	sendHistMu               sync.Mutex
+	sendHist                 sendHistory
+	bondEvidenceRevision     atomic.Uint64
+	bondCapacityRevision     atomic.Uint64
+	sendSlots                chan struct{}
+	sendControlSlots         chan struct{}
+	sendPolicyFinalSlots     chan struct{}
+	sendCreditWake           chan struct{}
+	packetWritesInFlight     atomic.Int64
+	packetFrameLimitMu       sync.Mutex
+	packetFrameLimit         atomic.Int64
+	packetRetiredFrameLimits map[packetPathCapacityRetirementKey]int
+	// packetPublicationBeforeBudgetLock and packetPublicationAfterBudgetLock
+	// are deterministic package-test hooks. Tests install them before any
+	// packet writer starts and never mutate them concurrently.
+	packetPublicationBeforeBudgetLock func()
+	packetPublicationAfterBudgetLock  func()
+	packetActivationBeforeBudgetRaise func()
+	frameDispatchAdmissionNext        atomic.Uint64
+	frameDispatchAttemptNext          atomic.Uint64
+	frameDispatchLeaseNext            atomic.Uint64
 	// frameDispatchLeases is protected by sendHistMu. It tracks callbacks that
 	// were authorized from one coherent ledger snapshot; it does not pin history
 	// or prevent a later cumulative ACK from retiring entries. Each job already
@@ -166,6 +217,10 @@ type Engine struct {
 	// after the coherent lease is registered and sendHistMu has been released,
 	// but before any tracer or physical batch callback.
 	frameDispatchBatchAfterLease func()
+	// recursiveDispatchBeforeAdmission is a deterministic package-test hook.
+	// It runs after route preparation and immediately before the complete
+	// projection authority barrier that linearizes physical queue admission.
+	recursiveDispatchBeforeAdmission func(*recursiveDispatchProjection)
 	// acknowledgeSendFramesBeforeLock is a deterministic package-test hook
 	// invoked immediately before cumulative ACK processing takes sendHistMu.
 	acknowledgeSendFramesBeforeLock func()
@@ -248,49 +303,76 @@ type Engine struct {
 
 	// Recv state: reorder buffer keyed by SEQ. expectedRecvSeq is the
 	// next SEQ the application should observe.
-	recvMu                sync.Mutex
-	recvCond              *sync.Cond
-	recvPacketCh          chan []byte
-	recvPacketWake        chan struct{}
-	recvWake              chan struct{}
-	recvQueue             map[uint64]recvItem
-	expectedRecvSeq       uint64
-	recvAckSent           uint64
-	recvDeliver           []byte // pending bytes for the next Read (stream)
-	recvDeliverFrames     []int  // remaining bytes per admitted stream DATA frame
-	recvUniqueBytes       uint64
-	recvRootCohort        rootDeliveryCohort
-	recvRootCohortBytes   uint64
-	recvRootDemandBytes   uint64
-	recvRootEvidenceEpoch uint64
-	recvRootTopologyEpoch uint64
-	recvRootAttributable  bool
-	recvRootTargets       map[uint64]proto.TargetID
-	recvRootTargetOrder   []uint64
-	packetized            bool // when true, drainer routes payload to recvPacketCh
-	recvPathCursor        uint64
-	recvSeenBits          []uint64
-	recvSeenHead          uint64
-	recvPacketMarks       int
-	recvFinalErr          error
-	recvTerminal          bool
-	recvStreamEOF         bool
-	recvFinalHandled      bool
-	peerNormalBye         atomic.Bool
-	peerByeMu             sync.Mutex
-	peerByeCloseDone      chan struct{}
-	recvProof             proto.AckProof
-	recvControlAckPending bool
-	recvDataAckUrgent     bool
-	recvAckBurstOpen      bool
-	recvFrameProofs       map[uint64]recvPacketProof
-	recvDeliveredDigests  map[uint64]proto.FrameDigest
-	recvDeliveredOrder    []uint64
-	policyReplayDigests   map[uint64]proto.FrameDigest
-	policyReplayOrder     []uint64
-	recvPolicyPhases      map[recvPolicyPhaseKey]recvPolicyPhaseReceipt
-	recvPolicyPhaseOrder  []recvPolicyPhaseKey
-	recvDroppedThrough    uint64
+	recvMu       sync.Mutex
+	recvCond     *sync.Cond
+	recvPacketCh chan []byte
+	// recvPacketWake is a generation channel. Deadline and terminal changes
+	// close the current generation and install a fresh channel under recvMu so
+	// every concurrent packet reader observes the update.
+	recvPacketWake chan struct{}
+	// recvPacketBeforeTerminalLock is a deterministic package-test hook. It
+	// runs after the optimistic packet dequeue and before the queue/terminal
+	// decision is linearized under recvMu.
+	recvPacketBeforeTerminalLock func()
+	// recvPacketBeforeWait is a deterministic package-test hook installed
+	// before activity and never mutated concurrently.
+	recvPacketBeforeWait func()
+	// recvPacketDeadlineBeforeRevalidate is a deterministic package-test hook.
+	// It runs after a reader-local deadline appears to have expired and before
+	// that snapshot is revalidated against the current generation under recvMu.
+	recvPacketDeadlineBeforeRevalidate func()
+	recvWake                           chan struct{}
+	recvQueue                          map[uint64]recvItem
+	expectedRecvSeq                    uint64
+	recvAckSent                        uint64
+	recvDeliver                        []byte // pending bytes for the next Read (stream)
+	recvDeliverFrames                  []int  // remaining bytes per admitted stream DATA frame
+	recvUniqueBytes                    uint64
+	recvRootCohort                     rootDeliveryCohort
+	recvRootCohortBytes                uint64
+	recvRootDemandBytes                uint64
+	recvRootEvidenceEpoch              uint64
+	recvRootTopologyEpoch              uint64
+	recvRootAttributable               bool
+	recvRootTargets                    map[uint64]proto.TargetID
+	recvRootTargetOrder                []uint64
+	recvSelectorStates                 map[uint64]*recvSelectorStateRecord
+	recvSelectorStateOrder             []uint64
+	recvSelectorStateLatestEpoch       uint64
+	recvSelectorStateLatestSeq         uint64
+	recvSelectorStatePendingBytes      int
+	recvSelectorDelivery               map[proto.TargetID]selectorDeliveryEvidence
+	recvArrivalNext                    uint64
+	packetized                         bool // when true, drainer routes payload to recvPacketCh
+	packetMode                         atomic.Bool
+	recvPathCursor                     uint64
+	recvSeenBits                       []uint64
+	recvSeenHead                       uint64
+	recvPacketMarks                    int
+	recvFinalErr                       error
+	recvTerminal                       bool
+	recvStreamEOF                      bool
+	recvFinalHandled                   bool
+	peerNormalBye                      atomic.Bool
+	peerNormalByeOrdered               atomic.Bool
+	peerNormalByeOrderMu               sync.Mutex
+	// markPeerByeSeenAfterSnapshot is a deterministic package-test hook. Tests
+	// use it to retire one snapshotted generation before exact revalidation.
+	markPeerByeSeenAfterSnapshot func()
+	peerByeMu                    sync.Mutex
+	peerByeCloseDone             chan struct{}
+	recvProof                    proto.AckProof
+	recvControlAckPending        bool
+	recvDataAckUrgent            bool
+	recvAckBurstOpen             bool
+	recvFrameProofs              map[uint64]recvPacketProof
+	recvDeliveredDigests         map[uint64]proto.FrameDigest
+	recvDeliveredOrder           []uint64
+	policyReplayDigests          map[uint64]proto.FrameDigest
+	policyReplayOrder            []uint64
+	recvPolicyPhases             map[recvPolicyPhaseKey]recvPolicyPhaseReceipt
+	recvPolicyPhaseOrder         []recvPolicyPhaseKey
+	recvDroppedThrough           uint64
 
 	// recvDeadline is the application-set read deadline (zero = none).
 	// When non-zero, Recv / RecvPacket return a timeout error if no
@@ -363,21 +445,25 @@ type Engine struct {
 	// policy response publication. Production leaves it nil and uses nowFn.
 	policyReplayNow      func() time.Time
 	policyAdmissionMu    sync.RWMutex
-	policyAdmission      func(selectorID, targetID proto.TargetID, cause string) error
+	policyAdmission      *peerPolicyAdmissionCallback
 	peakPolicyObserverMu sync.RWMutex
-	peakPolicyObserver   func(selectorID, targetID proto.TargetID, selectorGeneration uint64, peak bool, cause string)
+	peakPolicyObserver   *peakPolicyObserverCallback
+	policyCallbackDiagMu sync.Mutex
+	policyCallbackDiag   PolicyCallbackDiagnostic
 	// Deterministic package-test hooks installed before concurrent activity.
-	selectorDecisionAfterCommit   func()
-	policyCommitBeforeOwnerLock   func()
-	policyCommitAfterPublish      func()
-	selectorCutoverMu             sync.Mutex
-	selectorCutoverGeneration     uint64
-	dispatchTicketIssued          uint64
-	dispatchTicketClaimedThrough  uint64
-	dispatchTicketsUnclaimed      uint64
-	selectorCutoverPending        bool
-	selectorCutoverHandedOff      bool
-	selectorCutoverReplayRequired bool
+	selectorDecisionAfterCommit    func()
+	policyCommitBeforeOwnerLock    func()
+	policyCommitAfterPublish       func()
+	selectorHealthBeforeCommitGate func()
+	selectorHealthAfterValidation  func()
+	selectorCutoverMu              sync.Mutex
+	selectorCutoverGeneration      uint64
+	dispatchTicketIssued           uint64
+	dispatchTicketClaimedThrough   uint64
+	dispatchTicketsUnclaimed       uint64
+	selectorCutoverPending         bool
+	selectorCutoverHandedOff       bool
+	selectorCutoverReplayRequired  bool
 	// acceptedPacketDispatches counts public PacketConn writes that have
 	// returned after bounded queue admission but whose physical path job has
 	// not completed. selectorCutoverMu linearizes admission against cutover so
@@ -408,6 +494,10 @@ type Engine struct {
 	// leafRefreshBeforePublish is a deterministic package-test hook. Tests set
 	// it before publishing refresh evidence and never mutate it concurrently.
 	leafRefreshBeforePublish func()
+	// leafRefreshStatusBeforeWrite is a deterministic package-test hook at the
+	// exact-generation validation/write boundary. Tests never mutate it while
+	// a status publication is in flight.
+	leafRefreshStatusBeforeWrite func()
 
 	// Per-path RTT probe state. Each probe is bound to the physical path
 	// generation that issued it so a reply arriving on another carrier cannot
@@ -418,23 +508,36 @@ type Engine struct {
 	probeStartOnce   sync.Once
 
 	// Lifecycle.
-	closing       atomic.Bool
-	closeOnce     sync.Once
-	closed        chan struct{} // internal cancellation
-	quiesced      chan struct{} // public completion after owned loops stop
-	coreWG        sync.WaitGroup
-	retireWG      sync.WaitGroup
-	retireDebugMu sync.Mutex
-	retireDebug   map[*pathSlot]string
-	closeResult   error
-	closeErr      error
-	teardownErr   error
-	closeMu       sync.Mutex
-	gracefulOnce  sync.Once
-	gracefulDone  chan struct{}
-	gracefulErr   error
-	quiesceOnce   sync.Once
-	quiesceDone   chan struct{}
+	closing   atomic.Bool
+	closeOnce sync.Once
+	closed    chan struct{} // internal cancellation
+	quiesced  chan struct{} // public completion after owned loops stop
+	coreWG    sync.WaitGroup
+	retireWG  sync.WaitGroup
+	// BYE callback tickets are added only while pathsMu proves the exact slot is
+	// still receive-owned. Close crosses pathsMu before waiting, which closes the
+	// Add set without imposing a fixed callback-capacity limit on live paths.
+	byeCallbackWG sync.WaitGroup
+	// Refresh registration starts under sessionEpochMu before Close can stop
+	// admission. Cancellation starts before a registration or retired-path
+	// owner finishes, so waiting in this order gives teardown a closed set.
+	leafRefreshRegistrationWG sync.WaitGroup
+	leafRefreshCancelWG       sync.WaitGroup
+	// A cleanup reservation becomes engine-owned before a pathSlot exists.
+	// Admission registers that interval under sessionEpochMu so Close cannot
+	// publish quiescence while a rejected carrier callback is still alive.
+	pathAdmissionCleanupWG sync.WaitGroup
+	retireDebugMu          sync.Mutex
+	retireDebug            map[*pathSlot]string
+	closeResult            error
+	closeErr               error
+	teardownErr            error
+	closeMu                sync.Mutex
+	gracefulOnce           sync.Once
+	gracefulDone           chan struct{}
+	gracefulErr            error
+	quiesceOnce            sync.Once
+	quiesceDone            chan struct{}
 }
 
 // PathDeathEvent is an internal immutable snapshot emitted after one path is
@@ -473,10 +576,11 @@ type TopologySnapshot struct {
 // physical path generation. Root status code may inspect it, but public path
 // APIs never expose the sealed claim itself.
 type LeafMobilitySnapshot struct {
-	Ref       PathRef
-	Binding   PathBinding
-	Facts     leafmobility.Facts
-	Initiator LeafMobilityInitiatorSnapshot
+	Ref        PathRef
+	Binding    PathBinding
+	Facts      leafmobility.Facts
+	AttachedAt time.Time
+	Initiator  LeafMobilityInitiatorSnapshot
 }
 
 type pathDataWriteToken struct {
@@ -500,19 +604,24 @@ var ErrPathTXFenced = fmt.Errorf("%w: engine path is TX-fenced", net.ErrClosed)
 
 // pathSlot tracks one attached path and its reader goroutine.
 type pathSlot struct {
-	id                   uint32
-	gen                  uint64
-	owner                uint64
-	topologyEpoch        atomic.Uint64
-	conn                 transport.PathConn
-	spec                 transport.PathSpec
-	localTXTargetID      proto.TargetID
-	peerTXTargetID       proto.TargetID
-	migrationEpochSource *atomic.Uint64
-	routeGeneration      atomic.Uint64
-	mobilityClaim        *leafmobility.Claim
-	mobilityFacts        leafmobility.Facts
-	attached             time.Time
+	id                        uint32
+	gen                       uint64
+	owner                     uint64
+	topologyEpoch             atomic.Uint64
+	conn                      transport.PathConn
+	packetFrameLimit          int
+	localReceiveFrameCapacity uint32
+	peerReceiveFrameCapacity  uint32
+	packetCapacityCommitted   bool
+	spec                      transport.PathSpec
+	localTXTargetID           proto.TargetID
+	peerTXTargetID            proto.TargetID
+	migrationEpochSource      *atomic.Uint64
+	routeGeneration           atomic.Uint64
+	peerMobilityEpoch         atomic.Uint64
+	mobilityClaim             *leafmobility.Claim
+	mobilityFacts             leafmobility.Facts
+	attached                  time.Time
 	// maintenance marks a slot as being intentionally torn down and
 	// replaced (e.g. TCP_REPAIR rebuild). Death callbacks from the old
 	// socket are ignored while this is true.
@@ -566,26 +675,35 @@ type pathSlot struct {
 	batchWriteMax          atomic.Uint64
 	probeEvidence          atomic.Pointer[pathProbeEvidence]
 	probeEndpointGen       atomic.Uint64
-	probeControlMu         sync.Mutex
-	probeControlClosed     bool
-	probeReplyPending      []byte
-	probeReplyGeneration   pathProbeGeneration
-	probeReplyFenceEpoch   uint64
-	probeReplyRunning      bool
-	probeWriteWG           sync.WaitGroup
-	probeWriterCount       int
-	probeWritersIdle       chan struct{}
-	qualityObserverMu      sync.Mutex
-	qualityObserverStarted bool
-	qualityObserverStopped bool
-	qualityObserverRequest chan struct{}
-	qualityObserverWake    chan struct{}
-	qualityObserverStop    chan struct{}
-	qualityObserverDone    chan struct{}
-	qualityObserverCancel  context.CancelFunc
-	qualityObserverSeq     uint64
-	qualityObserverSample  transport.PathQuality
-	qualityObserverSampled bool
+	healthEvidenceMu       sync.Mutex
+	healthEvidenceRevision uint64
+	healthEvidenceEpochSrc *atomic.Uint64
+	healthEvidenceCommitMu *sync.RWMutex
+	// healthEvidenceBeforeGate is a deterministic package-test hook. It runs
+	// immediately before a health mutation attempts the shared commit gate.
+	healthEvidenceBeforeGate func()
+	probeControlMu           sync.Mutex
+	probeControlClosed       bool
+	probeReplyPending        []byte
+	probeReplyGeneration     pathProbeGeneration
+	probeReplyFenceEpoch     uint64
+	probeReplyRunning        bool
+	probeWriteWG             sync.WaitGroup
+	probeWriterCount         int
+	probeWritersIdle         chan struct{}
+	qualityObserverMu        sync.Mutex
+	qualityObserverStarted   bool
+	qualityObserverStopped   bool
+	qualityObserverRequest   chan struct{}
+	qualityObserverWake      chan struct{}
+	qualityObserverStop      chan struct{}
+	qualityObserverDone      chan struct{}
+	qualityObserverCancel    context.CancelFunc
+	qualityObserverSeq       uint64
+	qualityObserverSample    transport.PathQuality
+	qualityObserverGen       pathProbeGeneration
+	qualityObserverSampled   bool
+	legacyQualityRetired     atomic.Bool
 	// probePermitCancel is the cancellation boundary for probe writers that
 	// registered in the current open TX epoch but have not acquired the shared
 	// physical write permit yet. It is protected by probeControlMu.
@@ -600,14 +718,18 @@ type pathSlot struct {
 	// before activity and never mutated concurrently.
 	probeBeforeConnWrite func()
 
-	dispatchMu       sync.Mutex
-	dispatchQ        chan pathDispatchJob
-	dispatchDead     bool
-	dispatchFenced   bool
-	dispatchStalled  atomic.Bool
-	dispatchNextGen  atomic.Uint64
-	dispatchDoneGen  atomic.Uint64
-	dispatchStallGen atomic.Uint64
+	dispatchMu      sync.Mutex
+	dispatchQ       chan pathDispatchJob
+	dispatchDead    bool
+	dispatchFenced  bool
+	dispatchStalled pathDispatchStallState
+	// dispatchBatchScratch is owned exclusively by pathWriter. Keeping one
+	// fixed-size workspace per packet path avoids per-batch slice allocation;
+	// executePathDispatchBatch clears every pointer-bearing cell before the
+	// workspace can become idle.
+	dispatchBatchScratch *pathDispatchBatchScratch
+	dispatchNextGen      atomic.Uint64
+	dispatchDoneGen      atomic.Uint64
 	// dispatchBeforeWritePermit is a deterministic package-test hook. Tests set
 	// it before queue publication to hold a job between the two TX fence checks.
 	dispatchBeforeWritePermit func()
@@ -620,6 +742,9 @@ type pathSlot struct {
 	// dispatchFencePermitSnapshot is a deterministic package-test hook invoked
 	// while dispatchMu still protects a direct/replay permit decision.
 	dispatchFencePermitSnapshot func()
+	// dispatchBeforeCompletePublication is a deterministic package-test hook
+	// installed before activity and never mutated concurrently.
+	dispatchBeforeCompletePublication func()
 	// probeAfterFinalValidation is a deterministic package-test hook invoked
 	// while a registered probe writer owns writePermit, immediately before the
 	// physical PathConn.Write.
@@ -639,9 +764,18 @@ type pathSlot struct {
 	doneP                 chan struct{}
 	retireTracked         atomic.Bool
 	retireStarted         atomic.Bool
+	retirementPermit      *externalPathRetirementPermit
+	callbackAuthority     *externalPathCallbackOwner
 	mobilityRefreshMu     sync.Mutex
 	mobilityRefreshCancel func()
 	mobilityRefreshClosed bool
+	cleanupReservation    *externalPathDurableCallbackReservation
+	cleanupOnce           sync.Once
+	cleanupErr            error
+	byeCallbackMu         sync.Mutex
+	byeCallbackRetired    bool
+	byeCallbackActive     int
+	byeCallbacksDone      chan struct{}
 }
 
 type pathAckWrite struct {
@@ -651,17 +785,36 @@ type pathAckWrite struct {
 }
 
 func (s *pathSlot) writeFrame(frame []byte) (int, error) {
+	return s.writeFrameGuarded(frame, nil)
+}
+
+func (s *pathSlot) writeFrameGuarded(frame []byte, guard *pathDispatchCallbackGuard) (int, error) {
 	if err := s.acquireWrite(context.Background()); err != nil {
 		return 0, err
 	}
 	defer s.releaseWrite()
-	return s.writeFrameOwned(frame)
+	return s.writeFrameOwnedGuarded(frame, guard)
 }
 
 func (s *pathSlot) writeFrameOwned(frame []byte) (int, error) {
-	n, err := s.conn.Write(frame)
+	return s.writeFrameOwnedGuarded(frame, nil)
+}
+
+func (s *pathSlot) writeFrameOwnedGuarded(frame []byte, guard *pathDispatchCallbackGuard) (int, error) {
+	n, err := writeExternalPathConnGuarded(s.conn, frame, guard)
 	s.recordFrameWrite(frame, n, err)
 	return n, err
+}
+
+func (s *pathSlot) writeFrameOwnedResult(frame []byte, result chan<- pathCallbackWriteResult) {
+	guard := pathDispatchCallbackGuard{}
+	defer func() {
+		if callbackErr := guard.goexitError(); callbackErr != nil {
+			result <- pathCallbackWriteResult{err: callbackErr}
+		}
+	}()
+	n, err := s.writeFrameOwnedGuarded(frame, &guard)
+	result <- pathCallbackWriteResult{n: n, err: err}
 }
 
 func (s *pathSlot) writeFrameDispatchOwned(
@@ -669,7 +822,7 @@ func (s *pathSlot) writeFrameDispatchOwned(
 	authorization transport.FrameDispatchAuthorization,
 ) (int, error) {
 	if writer, ok := s.conn.(dispatchtrust.OwnedFrameWriter); ok {
-		n, err := dispatchtrust.Write(writer, frame, authorization)
+		n, err := writeExternalOwnedFrameDispatch(writer, frame, authorization)
 		s.recordFrameWrite(frame, n, err)
 		return n, err
 	}
@@ -678,7 +831,7 @@ func (s *pathSlot) writeFrameDispatchOwned(
 		return s.writeFrameOwned(frame)
 	}
 	borrowed := append([]byte(nil), frame...)
-	n, err := writer.WriteFrameDispatch(borrowed, authorization)
+	n, err := writeExternalFrameDispatch(writer, borrowed, authorization)
 	s.recordFrameWrite(frame, n, err)
 	return n, err
 }
@@ -978,11 +1131,107 @@ func (s *pathSlot) noteRecv(at time.Time) {
 	}
 }
 
+func (s *pathSlot) closeConn() error {
+	if s == nil || s.conn == nil {
+		if s != nil && s.cleanupReservation != nil {
+			s.cleanupReservation.releaseReservation()
+		}
+		return nil
+	}
+	s.cleanupOnce.Do(func() {
+		if s.cleanupReservation == nil {
+			reservation, err := reserveExternalPathCleanup(s.conn)
+			if err != nil {
+				s.cleanupErr = err
+				return
+			}
+			s.cleanupReservation = reservation
+		}
+		s.cleanupErr = closeExternalPathConnReserved(s.conn, s.cleanupReservation)
+	})
+	return s.cleanupErr
+}
+
+func (s *pathSlot) waitConnCleanup() {
+	if s == nil {
+		return
+	}
+	_ = s.closeConn()
+	if s.cleanupReservation != nil {
+		<-s.cleanupReservation.completion()
+	}
+}
+
+func (s *pathSlot) lateConnCleanupError() error {
+	if s == nil || s.cleanupReservation == nil {
+		return nil
+	}
+	return s.cleanupReservation.lateTerminalError()
+}
+
+// beginByeCallback is the exact-generation authority linearization point. It
+// is called only while pathsMu proves this slot is still receive-owned;
+// closeQuit retires the authority before topology ownership is released.
+func (s *pathSlot) beginByeCallback() bool {
+	if s == nil {
+		return false
+	}
+	s.byeCallbackMu.Lock()
+	defer s.byeCallbackMu.Unlock()
+	if s.byeCallbackRetired {
+		return false
+	}
+	if s.byeCallbackActive == 0 {
+		s.byeCallbacksDone = make(chan struct{})
+	}
+	s.byeCallbackActive++
+	return true
+}
+
+func (s *pathSlot) endByeCallback() {
+	if s == nil {
+		return
+	}
+	s.byeCallbackMu.Lock()
+	if s.byeCallbackActive <= 0 {
+		s.byeCallbackMu.Unlock()
+		panic("engine: path BYE callback ticket underflow")
+	}
+	s.byeCallbackActive--
+	if s.byeCallbackActive == 0 {
+		close(s.byeCallbacksDone)
+		s.byeCallbacksDone = nil
+	}
+	s.byeCallbackMu.Unlock()
+}
+
+func (s *pathSlot) retireByeCallbacks() {
+	if s == nil {
+		return
+	}
+	s.byeCallbackMu.Lock()
+	s.byeCallbackRetired = true
+	s.byeCallbackMu.Unlock()
+}
+
+func (s *pathSlot) waitByeCallbacks() {
+	if s == nil {
+		return
+	}
+	s.byeCallbackMu.Lock()
+	done := s.byeCallbacksDone
+	s.byeCallbackMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
 // closeQuit is idempotent: multiple paths into the engine
 // (Engine.Close, onPathDeath, an explicit migration tear-down) can
 // all signal a slot to exit without panicking on a double close.
 func (s *pathSlot) closeQuit() {
 	s.quitOnce.Do(func() {
+		s.retireByeCallbacks()
 		s.stopQualityObserver()
 		s.cancelMobilityRefresh()
 		s.completeAdmission()
@@ -1030,72 +1279,79 @@ func (s *pathSlot) completeAdmission() {
 // path. A server is constructed directly with that final epoch.
 func New(side Side, flowID [16]byte, limits Limits) *Engine {
 	e := &Engine{
-		side:                    side,
-		flowID:                  flowID,
-		limits:                  limits.Clamp(),
-		created:                 time.Now(),
-		paths:                   make(map[uint32]*pathSlot),
-		pendingPaths:            make(map[uint32]*pathSlot),
-		stagedPaths:             make(map[uint32]*pathSlot),
-		retainedPaths:           make(map[uint32]*pathSlot),
-		pathPredecessors:        make(map[uint32][]uint32),
-		pathAdmissionByLeaf:     make(map[pathAdmissionLeafKey]pathAdmissionReservation),
-		pathAdmissionByPath:     make(map[uint32]pathAdmissionLeafKey),
-		completedPathAdmissions: make(map[proto.PathAdmissionBinding]*completedPathAdmission),
-		pathLeafGeneration:      make(map[pathAdmissionLeafKey]uint64),
-		seenAttach:              make(map[[16]byte]struct{}),
-		recvPacketCh:            make(chan []byte, 16384),
-		recvPacketWake:          make(chan struct{}, 1),
-		recvWake:                make(chan struct{}, 1),
-		recvQueue:               make(map[uint64]recvItem),
-		recvFrameProofs:         make(map[uint64]recvPacketProof),
-		recvRootTargets:         make(map[uint64]proto.TargetID),
-		recvDeliveredDigests:    make(map[uint64]proto.FrameDigest),
-		policyReplayDigests:     make(map[uint64]proto.FrameDigest),
-		recvPolicyPhases:        make(map[recvPolicyPhaseKey]recvPolicyPhaseReceipt),
-		sendSlots:               make(chan struct{}, sendHistoryWindow),
-		sendControlSlots:        make(chan struct{}, sendControlReserve),
-		sendPolicyFinalSlots:    make(chan struct{}, sendPolicyFinalReserve),
-		sendCreditWake:          make(chan struct{}),
-		appWritePermit:          make(chan struct{}, 1),
-		replayWake:              make(chan struct{}, 1),
-		replayAckWake:           make(chan struct{}, 1),
-		replayPublicationWake:   make(chan struct{}),
-		gapReplayBackoff:        10 * time.Millisecond,
-		tailReplayInitialDelay:  defaultTailReplayInitialDelay,
-		tailReplayMaxBackoff:    defaultTailReplayMaxBackoff,
-		ackWake:                 make(chan struct{}, 1),
-		policyInbox:             make(chan policyMessage, 64),
-		policySendGate:          make(chan struct{}, 1),
-		policySelections:        make(map[proto.TargetID]proto.TargetID),
-		policyCompleted:         make(map[[16]byte]completedPolicyTransaction),
-		policyQueued:            make(map[policyMessageKey]struct{}),
-		policyReplayRecords:     make(map[policyReplayKey]*policyReplayRecord),
-		policyTombstones:        make(map[[16]byte]policyTransactionTombstone),
-		selectorCutoverWake:     make(chan struct{}),
-		pathRetirementInbox:     make(chan pathRetirementWork, pathRetirementInboxSize),
-		pathRetirementQueued:    make(map[pathRetirementWorkKey]struct{}),
-		retireDebug:             make(map[*pathSlot]string),
-		leafTx:                  newLeafMobilityRuntime(),
-		leafIssuer:              leafmobility.NewAuthorityIssuer(),
-		leafRefreshPending:      make(map[PathRef]leafMobilityRefreshEvent),
-		leafRefreshRunning:      make(map[PathRef]*leafMobilityPolicyHold),
-		leafRefreshCancel:       make(map[PathRef]context.CancelCauseFunc),
-		leafRefreshSeen:         make(map[PathRef]uint64),
-		leafRefreshBudget:       make(map[PathRef]leafMobilityRefreshBudget),
-		leafRefreshStatus:       make(map[PathRef]LeafMobilityInitiatorSnapshot),
-		leafRefreshWake:         make(chan struct{}, 1),
-		leafRefreshRetryWait:    make(chan struct{}),
-		zombieLeft:              limits.Clamp().ZombieMaxMigrations,
-		probeOutstanding:        make(map[uint64]pathProbeObservation),
-		probeStart:              make(chan struct{}),
-		closed:                  make(chan struct{}),
-		quiesced:                make(chan struct{}),
-		gracefulDone:            make(chan struct{}),
-		terminalDone:            make(chan struct{}),
-		streamFinDone:           make(chan struct{}),
+		side:                     side,
+		flowID:                   flowID,
+		limits:                   limits.Clamp(),
+		created:                  time.Now(),
+		paths:                    make(map[uint32]*pathSlot),
+		pendingPaths:             make(map[uint32]*pathSlot),
+		stagedPaths:              make(map[uint32]*pathSlot),
+		retainedPaths:            make(map[uint32]*pathSlot),
+		pathPredecessors:         make(map[uint32][]uint32),
+		pathAdmissionByLeaf:      make(map[pathAdmissionLeafKey]pathAdmissionReservation),
+		pathAdmissionByPath:      make(map[uint32]pathAdmissionLeafKey),
+		completedPathAdmissions:  make(map[proto.PathAdmissionBinding]*completedPathAdmission),
+		pathLeafGeneration:       make(map[pathAdmissionLeafKey]uint64),
+		packetRetiredFrameLimits: make(map[packetPathCapacityRetirementKey]int),
+		seenAttach:               make(map[[16]byte]struct{}),
+		recvPacketCh:             make(chan []byte, 16384),
+		recvPacketWake:           make(chan struct{}),
+		recvWake:                 make(chan struct{}, 1),
+		recvQueue:                make(map[uint64]recvItem),
+		recvFrameProofs:          make(map[uint64]recvPacketProof),
+		recvRootTargets:          make(map[uint64]proto.TargetID),
+		recvSelectorStates:       make(map[uint64]*recvSelectorStateRecord),
+		recvSelectorDelivery:     make(map[proto.TargetID]selectorDeliveryEvidence),
+		sendSelectorStates:       make(map[uint64]*selectorStateRecord),
+		recvDeliveredDigests:     make(map[uint64]proto.FrameDigest),
+		policyReplayDigests:      make(map[uint64]proto.FrameDigest),
+		recvPolicyPhases:         make(map[recvPolicyPhaseKey]recvPolicyPhaseReceipt),
+		sendSlots:                make(chan struct{}, sendHistoryWindow),
+		sendControlSlots:         make(chan struct{}, sendControlReserve),
+		sendPolicyFinalSlots:     make(chan struct{}, sendPolicyFinalReserve),
+		sendCreditWake:           make(chan struct{}),
+		appWritePermit:           make(chan struct{}, 1),
+		replayWake:               make(chan struct{}, 1),
+		replayAckWake:            make(chan struct{}, 1),
+		replayPublicationWake:    make(chan struct{}),
+		gapReplayBackoff:         10 * time.Millisecond,
+		tailReplayInitialDelay:   defaultTailReplayInitialDelay,
+		tailReplayMaxBackoff:     defaultTailReplayMaxBackoff,
+		ackWake:                  make(chan struct{}, 1),
+		policyInbox:              make(chan policyMessage, 64),
+		policySendGate:           make(chan struct{}, 1),
+		policySelections:         make(map[proto.TargetID]proto.TargetID),
+		policyCompleted:          make(map[[16]byte]completedPolicyTransaction),
+		policyQueued:             make(map[policyMessageKey]struct{}),
+		policyReplayRecords:      make(map[policyReplayKey]*policyReplayRecord),
+		policyTombstones:         make(map[[16]byte]policyTransactionTombstone),
+		selectorCutoverWake:      make(chan struct{}),
+		pathRetirementInbox:      make(chan pathRetirementWork, pathRetirementInboxSize),
+		pathRetirementQueued:     make(map[pathRetirementWorkKey]struct{}),
+		retireDebug:              make(map[*pathSlot]string),
+		leafTx:                   newLeafMobilityRuntime(),
+		leafIssuer:               leafmobility.NewAuthorityIssuer(),
+		leafRefreshPending:       make(map[PathRef]leafMobilityRefreshEvent),
+		leafRefreshRunning:       make(map[PathRef]*leafMobilityPolicyHold),
+		leafRefreshCancel:        make(map[PathRef]context.CancelCauseFunc),
+		leafRefreshSeen:          make(map[PathRef]uint64),
+		leafRefreshBudget:        make(map[PathRef]leafMobilityRefreshBudget),
+		leafRefreshStatus:        make(map[PathRef]LeafMobilityInitiatorSnapshot),
+		leafRefreshWake:          make(chan struct{}, 1),
+		leafRefreshRetryWait:     make(chan struct{}),
+		zombieLeft:               limits.Clamp().ZombieMaxMigrations,
+		probeOutstanding:         make(map[uint64]pathProbeObservation),
+		probeStart:               make(chan struct{}),
+		closed:                   make(chan struct{}),
+		quiesced:                 make(chan struct{}),
+		gracefulDone:             make(chan struct{}),
+		terminalDone:             make(chan struct{}),
+		streamFinDone:            make(chan struct{}),
 	}
 	e.pathTopologyEpoch.Store(1)
+	e.healthEvidenceEpoch.Store(1)
+	e.bondEvidenceRevision.Store(1)
+	e.bondCapacityRevision.Store(1)
 	e.writeDeadlineState.Store(newApplicationWriteDeadlineState(time.Time{}))
 	e.appWritePermit <- struct{}{}
 	e.recvCond = sync.NewCond(&e.recvMu)
@@ -1248,21 +1504,54 @@ func (e *Engine) setState(s BridgeState) { e.state.Store(uint32(s)) }
 // If no path was previously active, the new path becomes active.
 // AttachPath spawns the per-path reader goroutine.
 func (e *Engine) AttachPath(pc transport.PathConn, spec transport.PathSpec) (uint32, error) {
-	binding, err := e.InferPathBinding(spec)
+	if pc == nil {
+		return 0, errors.New("engine: nil PathConn")
+	}
+	cleanup, admissionCleanup, err := e.reservePathAdmissionCleanup(pc)
 	if err != nil {
-		if pc != nil {
-			_ = pc.Close()
-		}
+		// Capacity rejection precedes ownership transfer. The caller still owns
+		// pc and may close or retry it after resources become available.
 		return 0, err
 	}
-	return e.AttachPathBound(pc, spec, binding)
+	binding, err := e.InferPathBinding(spec)
+	if err != nil {
+		admissionCleanup.reject(pc)
+		return 0, err
+	}
+	if e.Packetized() {
+		capacity, capacityErr := e.InspectPacketPathFrameCapacity(pc)
+		if capacityErr != nil {
+			admissionCleanup.reject(pc)
+			return 0, capacityErr
+		}
+		binding.LocalReceiveFrameCapacity = capacity
+		binding.PeerReceiveFrameCapacity = capacity
+	}
+	return e.attachPathBoundReserved(pc, spec, binding, cleanup, admissionCleanup)
 }
 
 // AttachPathBound registers a path with its independently negotiated sender
 // graph leaves. Binding validation happens before any path ID, callback, or
 // goroutine is allocated.
 func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
-	id, err := e.PreparePathBound(pc, spec, binding)
+	if pc == nil {
+		return 0, errors.New("engine: nil PathConn")
+	}
+	cleanup, admissionCleanup, err := e.reservePathAdmissionCleanup(pc)
+	if err != nil {
+		return 0, err
+	}
+	return e.attachPathBoundReserved(pc, spec, binding, cleanup, admissionCleanup)
+}
+
+func (e *Engine) attachPathBoundReserved(
+	pc transport.PathConn,
+	spec transport.PathSpec,
+	binding PathBinding,
+	cleanup *externalPathDurableCallbackReservation,
+	admissionCleanup *pathAdmissionCleanupTicket,
+) (uint32, error) {
+	id, err := e.preparePathBoundReserved(pc, spec, binding, cleanup, admissionCleanup)
 	if err != nil {
 		return 0, err
 	}
@@ -1277,6 +1566,38 @@ func (e *Engine) AttachPathBound(pc transport.PathConn, spec transport.PathSpec,
 // DATA dispatch. The server uses this phase while BRIDGE_ACK still owns the
 // carrier exclusively.
 func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec, binding PathBinding) (uint32, error) {
+	id, _, err := e.PreparePathBoundWithOwnership(pc, spec, binding)
+	return id, err
+}
+
+// PreparePathBoundWithOwnership is the ownership-explicit form used by an
+// acceptor that already owns pc. adopted is false only when rejection happened
+// before the engine reserved durable cleanup authority; in that case the
+// caller must retain and eventually close pc. Once adopted is true, every
+// return path leaves cleanup ownership with the engine, including errors.
+func (e *Engine) PreparePathBoundWithOwnership(
+	pc transport.PathConn,
+	spec transport.PathSpec,
+	binding PathBinding,
+) (id uint32, adopted bool, err error) {
+	if pc == nil {
+		return 0, false, errors.New("engine: nil PathConn")
+	}
+	cleanup, admissionCleanup, err := e.reservePathAdmissionCleanup(pc)
+	if err != nil {
+		return 0, false, err
+	}
+	id, err = e.preparePathBoundReserved(pc, spec, binding, cleanup, admissionCleanup)
+	return id, true, err
+}
+
+func (e *Engine) preparePathBoundReserved(
+	pc transport.PathConn,
+	spec transport.PathSpec,
+	binding PathBinding,
+	cleanup *externalPathDurableCallbackReservation,
+	admissionCleanup *pathAdmissionCleanupTicket,
+) (uint32, error) {
 	e.sessionEpochMu.Lock()
 	epochLocked := true
 	defer func() {
@@ -1284,16 +1605,8 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			e.sessionEpochMu.Unlock()
 		}
 	}()
-	if pc == nil {
-		return 0, errors.New("engine: nil PathConn")
-	}
 	if err := e.validatePathBinding(binding); err != nil {
-		_ = pc.Close()
-		return 0, err
-	}
-	pathFrameLimit, frameLimitKnown, err := e.validatePacketPathFrameLimit(pc)
-	if err != nil {
-		_ = pc.Close()
+		admissionCleanup.reject(pc)
 		return 0, err
 	}
 	var (
@@ -1306,6 +1619,16 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			mobilityFacts = mobilityClaim.Snapshot()
 		}
 	}
+	pathFrameLimit, frameLimitKnown, err := e.validatePacketPathFrameLimit(
+		pc, binding, admissionCleanup.callbackAuthority,
+	)
+	if err != nil {
+		if mobilityClaim != nil {
+			mobilityClaim.RetireUnbound()
+		}
+		admissionCleanup.reject(pc)
+		return 0, err
+	}
 	e.pathsMu.Lock()
 	var (
 		completedKey     pathAdmissionLeafKey
@@ -1316,7 +1639,10 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 	rejectLocked := func(err error) (uint32, error) {
 		e.pathsMu.Unlock()
 		e.retirePathSet(completedOverlap)
-		_ = pc.Close()
+		if mobilityClaim != nil {
+			mobilityClaim.RetireUnbound()
+		}
+		admissionCleanup.reject(pc)
 		return 0, err
 	}
 
@@ -1400,10 +1726,16 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 		return rejectLocked(err)
 	}
 	recvQSize := 64
-	if e.Packetized() {
+	if frameLimitKnown {
 		recvQSize = 1024
 	}
 	generation := e.nextPathGenerationLocked()
+	if frameLimitKnown {
+		if err = e.preflightPacketPathFrameLimit(pathFrameLimit); err != nil {
+			e.releasePathAdmissionLocked(id)
+			return rejectLocked(err)
+		}
+	}
 	if mobilityClaim != nil {
 		if err := e.leafIssuer.BindClaim(mobilityClaim, leafmobility.Binding{
 			FlowID:        e.FlowID(),
@@ -1416,41 +1748,51 @@ func (e *Engine) PreparePathBound(pc transport.PathConn, spec transport.PathSpec
 			return rejectLocked(fmt.Errorf("engine: bind owned leaf: %w", err))
 		}
 	}
-	if frameLimitKnown {
-		e.tightenPacketFrameLimit(pathFrameLimit)
-	}
+	attachedAt := time.Now()
 	slot := &pathSlot{
-		id:                   id,
-		gen:                  generation,
-		owner:                generation,
-		conn:                 pc,
-		spec:                 spec.Clone(),
-		localTXTargetID:      binding.LocalTXTargetID,
-		peerTXTargetID:       binding.PeerTXTargetID,
-		migrationEpochSource: &e.migrationEpoch,
-		mobilityClaim:        mobilityClaim,
-		mobilityFacts:        mobilityFacts,
-		attached:             time.Now(),
-		recvQ:                make(chan recvFrame, recvQSize),
-		dispatchQ:            make(chan pathDispatchJob, pathDispatchQueueSize),
-		writePermit:          newPathWritePermit(),
-		quit:                 make(chan struct{}),
-		doneR:                make(chan struct{}),
-		doneW:                make(chan struct{}),
-		doneP:                make(chan struct{}),
-		admissionInbox:       make(chan pathAdmissionMessage, pathAdmissionInboxSize),
-		admissionDone:        make(chan struct{}),
+		id:                        id,
+		gen:                       generation,
+		owner:                     generation,
+		conn:                      pc,
+		packetFrameLimit:          pathFrameLimit,
+		localReceiveFrameCapacity: binding.LocalReceiveFrameCapacity,
+		peerReceiveFrameCapacity:  binding.PeerReceiveFrameCapacity,
+		spec:                      spec.Clone(),
+		localTXTargetID:           binding.LocalTXTargetID,
+		peerTXTargetID:            binding.PeerTXTargetID,
+		migrationEpochSource:      &e.migrationEpoch,
+		mobilityClaim:             mobilityClaim,
+		mobilityFacts:             mobilityFacts,
+		attached:                  attachedAt,
+		cleanupReservation:        cleanup,
+		recvQ:                     make(chan recvFrame, recvQSize),
+		dispatchQ:                 make(chan pathDispatchJob, pathDispatchQueueSize),
+		writePermit:               newPathWritePermit(),
+		quit:                      make(chan struct{}),
+		doneR:                     make(chan struct{}),
+		doneW:                     make(chan struct{}),
+		doneP:                     make(chan struct{}),
+		admissionInbox:            make(chan pathAdmissionMessage, pathAdmissionInboxSize),
+		admissionDone:             make(chan struct{}),
+		healthEvidenceRevision:    1,
+		healthEvidenceEpochSrc:    &e.healthEvidenceEpoch,
+		healthEvidenceCommitMu:    &e.healthEvidenceCommitMu,
 	}
 	slot.probeEndpointGen.Store(mobilityFacts.Generation)
 	if completedKeyOK {
 		completedOverlap = e.retireCompletedAdmissionPredecessorsLocked(completedKey)
 	}
 	e.pendingPaths[id] = slot
+	admissionCleanup.transferToSlot(slot)
+	e.leafRefreshRegistrationWG.Add(1)
 	e.pathsMu.Unlock()
 	e.sessionEpochMu.Unlock()
 	epochLocked = false
 	e.retirePathSet(completedOverlap)
-	e.registerLeafMobilityRefresh(slot)
+	func() {
+		defer e.leafRefreshRegistrationWG.Done()
+		e.registerLeafMobilityRefresh(slot)
+	}()
 	return id, nil
 }
 
@@ -1480,22 +1822,34 @@ func (e *Engine) StagePathAttach(id uint32) error {
 		return fmt.Errorf("engine: stage unknown pending path %d", id)
 	}
 	if e.pathAdmissionClosed() {
+		e.trackPathRetirementLocked(slot)
+		slot.closeQuit()
 		delete(e.pendingPaths, id)
 		e.releasePathAdmissionLocked(id)
 		e.pathsMu.Unlock()
-		slot.retireMobilityClaim()
-		_ = slot.conn.Close()
+		e.retirePathAsync(slot)
 		return net.ErrClosed
 	}
 	delete(e.pendingPaths, id)
-	slot.readerStarted.Store(true)
 	e.stagedPaths[id] = slot
 	e.pathsMu.Unlock()
 
 	owner := slot.owner
-	slot.conn.OnDeath(func(cause transport.DeathCause, err error) {
+	err := registerExternalPathDeathAuthority(slot.conn, slot.callbackAuthority, func(cause transport.DeathCause, err error) {
 		e.onPathDeath(id, owner, cause, err)
 	})
+	if err != nil {
+		e.onPathDeath(id, owner, transport.CauseTransportError, err)
+		return err
+	}
+	e.pathsMu.Lock()
+	if e.stagedPaths[id] != slot || slot.owner != owner || e.pathAdmissionClosed() {
+		e.pathsMu.Unlock()
+		e.onPathDeath(id, owner, transport.CauseTransportError, net.ErrClosed)
+		return net.ErrClosed
+	}
+	slot.readerStarted.Store(true)
+	e.pathsMu.Unlock()
 	go e.readerLoop(slot)
 	return nil
 }
@@ -1520,13 +1874,19 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		ctx = context.Background()
 	}
 	var (
-		retired         []*pathSlot
-		fenced          []*pathSlot
-		oldActive       uint32
-		recoveryEvent   bool
-		zombieTrip      zombieTripTicket
-		superseded      bool
-		admissionExpiry pathAdmissionExpiry
+		retired           []*pathSlot
+		fenced            []*pathSlot
+		oldActive         uint32
+		oldActiveBinding  MigrationPathBinding
+		replacedPathID    uint32
+		replacedBinding   MigrationPathBinding
+		recoveryEvent     bool
+		zombieEligible    bool
+		migrationEvent    migrationEventDispatch
+		zombieTrip        zombieTripTicket
+		superseded        bool
+		replacedEffective bool
+		admissionExpiry   pathAdmissionExpiry
 	)
 	e.pathsMu.Lock()
 	slot := e.stagedPaths[id]
@@ -1535,12 +1895,12 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		return fmt.Errorf("engine: activate unknown staged path %d", id)
 	}
 	if e.pathAdmissionClosed() {
+		e.trackPathRetirementLocked(slot)
 		delete(e.stagedPaths, id)
 		slot.closeQuit()
 		e.releasePathAdmissionLocked(id)
 		e.pathsMu.Unlock()
-		slot.retireMobilityClaim()
-		_ = slot.conn.Close()
+		e.retirePathAsync(slot)
 		return net.ErrClosed
 	}
 	// Fence new application dispatches while pathsMu still protects the active
@@ -1592,6 +1952,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		deaths := e.unwindFencedPathsLocked(fenced)
 		retireSlot := slot
 		if slot != nil {
+			e.trackPathRetirementLocked(slot)
 			delete(e.stagedPaths, id)
 			slot.closeQuit()
 			e.releasePathAdmissionLocked(id)
@@ -1599,13 +1960,12 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		e.pathsMu.Unlock()
 		releasePolicyOwner()
 		if retireSlot != nil {
-			retireSlot.retireMobilityClaim()
+			e.retirePathAsync(retireSlot)
 		}
 		e.processDeferredPathDeaths(deaths)
 		if slot == nil {
 			return fmt.Errorf("engine: staged path %d changed during activation", id)
 		}
-		_ = slot.conn.Close()
 		return net.ErrClosed
 	}
 	liveFenced := make([]*pathSlot, 0, len(fenced))
@@ -1624,6 +1984,15 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		liveFenced = append(liveFenced, existing)
 	}
 	fenced = liveFenced
+	if runtime != nil {
+		effectiveLeaves := runtime.effectiveLeafTargets(e.attachedLeafTargetsLocked())
+		for _, existing := range fenced {
+			if effectiveLeaves[existing.localTXTargetID] {
+				replacedEffective = true
+				break
+			}
+		}
+	}
 	// A native in-place repair may have advanced the generation while this
 	// admission waited for its peer. Rebase under the same lock that publishes
 	// the successor; no competing staged attach for this leaf is permitted.
@@ -1650,7 +2019,11 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		return fmt.Errorf("engine: path %d route generation is unavailable", id)
 	}
 	if routeGeneration != 0 {
-		slot.routeGeneration.Store(routeGeneration)
+		if slot.routeGeneration.Load() != routeGeneration {
+			slot.mutateHealthEvidence(func() {
+				slot.routeGeneration.Store(routeGeneration)
+			})
+		}
 	}
 	if retainPredecessor {
 		var ok bool
@@ -1663,36 +2036,66 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 			return fmt.Errorf("engine: path %d admission reservation changed during activation", id)
 		}
 	}
+	frameLimitAdmission, err := e.beginPacketPathFrameLimitAdmission(slot.packetFrameLimit)
+	if err != nil {
+		if rollbackAllowed {
+			deaths := e.unwindFencedPathsLocked(fenced)
+			e.pathsMu.Unlock()
+			releasePolicyOwner()
+			e.processDeferredPathDeaths(deaths)
+			return err
+		}
+		e.pathsMu.Unlock()
+		releasePolicyOwner()
+		failClosedErr := fmt.Errorf("engine: packet path capacity became incompatible after peer activation: %w", err)
+		e.setCloseErr(failClosedErr)
+		e.requestClose()
+		return failClosedErr
+	}
+	defer frameLimitAdmission.abort()
+	// Freeze the predecessor binding while it is still topology-owned. A
+	// non-retaining activation removes it below, so looking it up afterward
+	// would manufacture a zero Source binding for a factual cutover.
+	oldActive = e.activeID
+	oldActiveBinding = e.migrationPathBindingLocked(oldActive)
+	for _, existing := range fenced {
+		if replacedPathID == 0 || existing.gen > replacedBinding.PathGeneration {
+			replacedPathID = existing.id
+			replacedBinding = migrationPathBindingForSlot(existing)
+		}
+	}
 	// Keep at most one older receive generation per logical leaf.
 	for retainedID, existing := range e.retainedPaths {
 		if !sameBoundLeaf(slot, existing) {
 			continue
 		}
-		delete(e.retainedPaths, retainedID)
 		e.trackPathRetirementLocked(existing)
+		delete(e.retainedPaths, retainedID)
 		existing.closeQuit()
 		retired = append(retired, existing)
 	}
 	for _, existing := range fenced {
 		existingID := existing.id
 		superseded = true
-		delete(e.paths, existingID)
 		if retainPredecessor && !existing.deathPending.Load() {
+			delete(e.paths, existingID)
 			e.retainedPaths[existingID] = existing
 			e.pathPredecessors[id] = append(e.pathPredecessors[id], existingID)
 		} else {
 			e.trackPathRetirementLocked(existing)
+			delete(e.paths, existingID)
 			existing.closeQuit()
 			retired = append(retired, existing)
 		}
 	}
 	delete(e.stagedPaths, id)
-	oldActive = e.activeID
 	slot.unfenceDispatch()
 	slot.admissionRollback.Store(rollbackAllowed)
 	slot.writerStarted.Store(true)
 	slot.proberStarted.Store(true)
 	e.paths[id] = slot
+	slot.packetCapacityCommitted = slot.packetFrameLimit > 0
+	e.commitPacketPathFrameLimitActivationLocked(frameLimitAdmission, slot)
 	e.advancePathTopologyEpochLocked()
 	if !retainPredecessor {
 		e.releasePathAdmissionLocked(id)
@@ -1702,12 +2105,14 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		if e.activeID == 0 {
 			e.activeID = id
 			recoveryEvent = e.State() == BridgeMigrating
+			zombieEligible = recoveryEvent
 			if e.State() == BridgeInit || e.State() == BridgeMigrating {
 				e.setState(BridgeActive)
 			}
 		} else if _, activeStillPresent := e.paths[e.activeID]; !activeStillPresent {
 			e.activeID = id
 			recoveryEvent = true
+			zombieEligible = true
 		}
 		e.policyStateMu.Lock()
 		initialized := runtime.initializeSelectorsForLeafPolicy(slot.localTXTargetID, e.policySelections)
@@ -1719,13 +2124,43 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		if projectedActive != 0 && projectedActive != e.activeID {
 			e.activeID = projectedActive
 			recoveryEvent = oldActive != 0
+			zombieEligible = recoveryEvent
 		}
 		e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
 	}
+	if e.activeID != 0 {
+		e.endMigrationBudgetLocked()
+	}
 	newActive := e.activeID
+	eventOldPathID := oldActive
+	eventNewPathID := newActive
+	eventSourceBinding := oldActiveBinding
+	eventResultBinding := e.migrationPathBindingLocked(newActive)
+	if superseded {
+		// Composite executors keep one representative activeID for status only.
+		// Replacing another bond/race leaf is still a factual physical migration
+		// and must identify that exact predecessor and successor.
+		recoveryEvent = true
+		// Telemetry records every physical leaf replacement, but zombie
+		// protection applies only when that leaf belonged to the effective DATA
+		// projection. Replacing an inactive selector sibling cannot prove a dead
+		// end-to-end session merely because no payload was expected on that leaf.
+		zombieEligible = zombieEligible || replacedEffective
+		eventOldPathID = replacedPathID
+		eventNewPathID = id
+		eventSourceBinding = replacedBinding
+		eventResultBinding = migrationPathBindingForSlot(slot)
+	}
 	if recoveryEvent {
-		e.recordMigrationLocked()
-		zombieTrip = e.accountMigration()
+		evidence := e.routeMigrationEvidenceLocked()
+		evidence.Source = eventSourceBinding
+		evidence.Result = eventResultBinding
+		migrationEvent = e.recordMigrationLocked(
+			eventOldPathID, eventNewPathID, "recovery", evidence,
+		)
+		if zombieEligible {
+			zombieTrip = e.accountMigration()
+		}
 	}
 	if hook := e.activationAfterInitialSelection; hook != nil {
 		hook()
@@ -1743,7 +2178,7 @@ func (e *Engine) activateStagedPathContext(ctx context.Context, id uint32, retai
 		e.retirePathAsync(existing)
 	}
 	if recoveryEvent {
-		e.fireMigrateHooks(oldActive, newActive, "recovery")
+		e.deliverMigrationEvent(migrationEvent)
 		e.tripZombie(zombieTrip)
 	}
 	if recoveryEvent || superseded {
@@ -1768,6 +2203,7 @@ func (e *Engine) ReleasePathPredecessors(successorID uint32) {
 		return
 	}
 	retired := e.releasePathPredecessorsLocked(successorID, successor.gen)
+	e.confirmPacketPathCapacityRetirementsLocked(retired)
 	e.pathsMu.Unlock()
 	e.retirePathSet(retired)
 }
@@ -1789,6 +2225,7 @@ func (e *Engine) DisablePathAdmissionRollback(pathID uint32) error {
 func (e *Engine) releasePathPredecessors(successorID uint32, successorGen uint64) {
 	e.pathsMu.Lock()
 	retired := e.releasePathPredecessorsLocked(successorID, successorGen)
+	e.confirmPacketPathCapacityRetirementsLocked(retired)
 	e.pathsMu.Unlock()
 	e.retirePathSet(retired)
 }
@@ -1804,8 +2241,8 @@ func (e *Engine) releasePathPredecessorsLocked(successorID uint32, successorGen 
 	retired := make([]*pathSlot, 0, len(ids))
 	for _, predecessorID := range ids {
 		if predecessor := e.retainedPaths[predecessorID]; predecessor != nil {
-			delete(e.retainedPaths, predecessorID)
 			e.trackPathRetirementLocked(predecessor)
+			delete(e.retainedPaths, predecessorID)
 			predecessor.closeQuit()
 			retired = append(retired, predecessor)
 		}
@@ -1854,8 +2291,15 @@ func (e *Engine) retireSupersededPath(slot *pathSlot) {
 	slot.retireMobilityClaim()
 	e.setRetirementStage(slot, "quit")
 	slot.closeQuit()
+	e.setRetirementStage(slot, "lifecycle-callback")
+	slot.callbackAuthority.waitRetired()
 	e.setRetirementStage(slot, "carrier-close")
-	e.recordTeardownErr(slot.conn.Close())
+	e.recordTeardownErr(slot.closeConn())
+	e.setRetirementStage(slot, "carrier-callback")
+	slot.waitConnCleanup()
+	e.recordTeardownErr(slot.lateConnCleanupError())
+	e.setRetirementStage(slot, "bye-callback")
+	slot.waitByeCallbacks()
 	if slot.readerStarted.Load() {
 		e.setRetirementStage(slot, "reader")
 		<-slot.doneR
@@ -1909,7 +2353,36 @@ func (e *Engine) retirementDebugSnapshot() string {
 // reaper set before pathsMu is released. Close cannot begin waiting until it
 // has crossed the same lock, so every detached reaper ticket precedes Wait.
 func (e *Engine) trackPathRetirementLocked(slot *pathSlot) {
-	if slot != nil && slot.retireTracked.CompareAndSwap(false, true) {
+	if slot == nil {
+		return
+	}
+	e.trackPacketPathCapacityRetirementLocked(slot)
+	if slot.retirementPermit == nil {
+		// Package-level protocol tests may install a synthetic slot directly and
+		// therefore bypass production admission. Keep those fixtures bounded by
+		// the same process authority without weakening the public admission path,
+		// which always transfers its already-held permit onto the slot.
+		permit, err := externalPathRetirements.reserve()
+		if err != nil {
+			panic(fmt.Sprintf("engine: reserve synthetic path retirement permit: %v", err))
+		}
+		slot.retirementPermit = permit
+	}
+	if slot.retirementPermit.executor == nil || !slot.retirementPermit.active.Load() {
+		panic("engine: path reached logical retirement with invalid process authority")
+	}
+	// Remove diagnostics and pending policy work while pathsMu still fixes the
+	// exact generation in topology. A concurrent publication either committed
+	// before this point and is removed here, or observes the later topology
+	// removal and cannot recreate state for the retired PathRef.
+	e.forgetLeafMobilityRefresh(PathRef{ID: slot.id, Owner: slot.owner})
+	// No exact-generation callback authority may be acquired after the slot's
+	// retirement ticket is published, even when claim draining delays quit.
+	if slot.callbackAuthority != nil {
+		slot.callbackAuthority.retire()
+	}
+	slot.retireByeCallbacks()
+	if slot.retireTracked.CompareAndSwap(false, true) {
 		e.retireWG.Add(1)
 		e.retireDebugMu.Lock()
 		e.retireDebug[slot] = "tracked"
@@ -1934,15 +2407,12 @@ func (e *Engine) retirePathAsync(slot *pathSlot) {
 		return
 	}
 	slot.requestMobilityClaimRetirement()
-	go func() {
-		defer func() {
-			e.retireDebugMu.Lock()
-			delete(e.retireDebug, slot)
-			e.retireDebugMu.Unlock()
-			e.retireWG.Done()
-		}()
-		e.retireSupersededPath(slot)
-	}()
+	if err := slot.retirementPermit.executor.enqueue(e, slot); err != nil {
+		// Capacity is reserved before path adoption. Reaching this branch means
+		// internal ownership was corrupted; a synchronous retirement would let a
+		// hostile reader pin an arbitrary producer and is therefore forbidden.
+		panic(fmt.Sprintf("engine: enqueue admitted path retirement: %v", err))
+	}
 }
 
 func (e *Engine) nextPathGenerationLocked() uint64 {
@@ -2088,10 +2558,11 @@ func (e *Engine) topologySnapshotLocked(runtime *executionRuntime) (TopologySnap
 		}
 		facts := slot.mobilityClaim.Snapshot()
 		snapshot.LeafMobility = append(snapshot.LeafMobility, LeafMobilitySnapshot{
-			Ref:       PathRef{ID: slot.id, Owner: slot.owner},
-			Binding:   PathBinding{LocalTXTargetID: slot.localTXTargetID, PeerTXTargetID: slot.peerTXTargetID},
-			Facts:     facts,
-			Initiator: e.leafRefreshStatus[PathRef{ID: slot.id, Owner: slot.owner}],
+			Ref:        PathRef{ID: slot.id, Owner: slot.owner},
+			Binding:    PathBinding{LocalTXTargetID: slot.localTXTargetID, PeerTXTargetID: slot.peerTXTargetID},
+			Facts:      facts,
+			AttachedAt: slot.attached,
+			Initiator:  e.leafRefreshStatus[PathRef{ID: slot.id, Owner: slot.owner}],
 		})
 	}
 	e.leafRefreshMu.Unlock()
@@ -2122,27 +2593,19 @@ func pathInfos(slots []*pathSlot, activeID uint32, probeInterval time.Duration) 
 	observedAt := nowFn()
 	out := make([]transport.PathInfo, 0, len(slots))
 	for _, s := range slots {
+		diagnostics, _ := observePathDiagnostics(s)
 		pi := transport.PathInfo{
-			ID:         s.id,
-			Spec:       s.spec.Clone(),
-			Quality:    publicPathQuality(s, qualities[s], observedAt, probeInterval),
-			Since:      s.attached,
-			LocalAddr:  s.conn.LocalAddr(),
-			RemoteAddr: s.conn.RemoteAddr(),
-			Active:     s.id == activeID,
-		}
-		if rw, ok := s.conn.(interface {
-			Reads() uint64
-			Writes() uint64
-		}); ok {
-			pi.Reads = rw.Reads()
-			pi.Writes = rw.Writes()
-		}
-		if observer, ok := s.conn.(transport.IngressQueueObserver); ok {
-			pi.IngressQueue = observer.IngressQueueStats()
-		}
-		if observer, ok := s.conn.(transport.DatagramAccelerationObserver); ok {
-			pi.DatagramAcceleration = observer.DatagramAccelerationStatus()
+			ID:                   s.id,
+			Spec:                 s.spec.Clone(),
+			Quality:              publicPathQuality(s, qualities[s], observedAt, probeInterval),
+			Since:                s.attached,
+			LocalAddr:            diagnostics.localAddr,
+			RemoteAddr:           diagnostics.remoteAddr,
+			Reads:                diagnostics.reads,
+			Writes:               diagnostics.writes,
+			IngressQueue:         diagnostics.ingressQueue,
+			DatagramAcceleration: diagnostics.datagramAcceleration,
+			Active:               s.id == activeID,
 		}
 		pi.RecvDups = s.recvDups.Load()
 		pi.DataWrites = s.dataWrites.Load()
@@ -2163,19 +2626,56 @@ func pathInfos(slots []*pathSlot, activeID uint32, probeInterval time.Duration) 
 	return out
 }
 
+type pathDiagnosticSnapshot struct {
+	localAddr            string
+	remoteAddr           string
+	reads                uint64
+	writes               uint64
+	ingressQueue         transport.IngressQueueStats
+	datagramAcceleration transport.DatagramAccelerationStatus
+}
+
+func observePathDiagnostics(slot *pathSlot) (pathDiagnosticSnapshot, error) {
+	if slot == nil || slot.conn == nil {
+		return pathDiagnosticSnapshot{}, nil
+	}
+	return invokeExternalPathValueCallbackForTarget("PathConn.Diagnostics", slot.conn, func() pathDiagnosticSnapshot {
+		snapshot := pathDiagnosticSnapshot{
+			localAddr:  slot.conn.LocalAddr(),
+			remoteAddr: slot.conn.RemoteAddr(),
+		}
+		if rw, ok := slot.conn.(interface {
+			Reads() uint64
+			Writes() uint64
+		}); ok {
+			snapshot.reads = rw.Reads()
+			snapshot.writes = rw.Writes()
+		}
+		if observer, ok := slot.conn.(transport.IngressQueueObserver); ok {
+			snapshot.ingressQueue = observer.IngressQueueStats()
+		}
+		if observer, ok := slot.conn.(transport.DatagramAccelerationObserver); ok {
+			snapshot.datagramAcceleration = observer.DatagramAccelerationStatus()
+		}
+		return snapshot
+	})
+}
+
 func publicPathQuality(
 	slot *pathSlot,
 	adapter transport.PathQuality,
 	now time.Time,
 	probeInterval time.Duration,
 ) transport.PathQuality {
-	evidence, ok := slot.probeSnapshot()
-	if !ok || evidence.lastSuccess.IsZero() || evidence.quality.RTT <= 0 || evidence.quality.At.IsZero() ||
-		now.Before(evidence.quality.At) ||
-		now.Sub(evidence.quality.At) > selectorProbeFreshFor(probeInterval, evidence.quality) {
-		return adapter
+	if slot == nil || now.IsZero() {
+		return transport.PathQuality{}
 	}
-	return selectorEvidenceQuality(adapter, evidence, true)
+	probe := transport.PathQuality{}
+	evidence, ok := slot.probeSnapshot()
+	if ok && !evidence.lastSuccess.IsZero() {
+		probe = evidence.quality
+	}
+	return mergeSchedulingQuality(adapter, probe, now, probeInterval)
 }
 
 // isClosed checks the lifecycle.
@@ -2315,7 +2815,7 @@ func (e *Engine) runGracefulClose(reason proto.ByeReason) error {
 }
 
 func (e *Engine) closeOutcome(operationErr, teardownErr error) error {
-	terminalErr := e.CloseErr()
+	terminalErr := e.terminalCloseError()
 	if errors.Is(terminalErr, io.EOF) {
 		terminalErr = nil
 	}
@@ -2367,70 +2867,121 @@ func (e *Engine) commitRecursiveSelection(
 	origin policySelectionOrigin,
 	cutoverGeneration uint64,
 	expectedEvidence selectorEvidenceCommit,
-	committed func(publishRoute func()) error,
+	committed func(publishRoute func() error) error,
 	deferCutoverReplay bool,
 ) error {
 	if runtime == nil || runtime.plan == nil {
 		return errExecutionRuntimeNotConfigured
 	}
+	var migrationEvent migrationEventDispatch
+	var migrationCommittedAt time.Time
+	var zombieTrip zombieTripTicket
+	var changed bool
 	// Serialize the selector decision with sequenced DATA/CTRL publication.
 	// Recursive target state is the only DATA routing authority; activeID is a
 	// representative physical path retained for observation and mobility.
 	e.sendMu.Lock()
-	defer e.sendMu.Unlock()
+	defer func() {
+		e.sendMu.Unlock()
+		if changed {
+			e.deliverMigrationEvent(migrationEvent)
+			if origin.chargesZombieBudget() {
+				e.tripZombie(zombieTrip)
+			}
+		}
+	}()
 	if e.isClosed() || e.sendClosing.Load() {
 		return net.ErrClosed
 	}
 	e.pathsMu.Lock()
+	if hook := e.selectorHealthBeforeCommitGate; hook != nil {
+		hook()
+	}
+	e.healthEvidenceCommitMu.Lock()
 	if err := e.validateSelectorEvidenceCommitLocked(expectedEvidence); err != nil {
+		e.healthEvidenceCommitMu.Unlock()
 		e.pathsMu.Unlock()
 		return err
 	}
+	if hook := e.selectorHealthAfterValidation; hook != nil {
+		hook()
+	}
 	if runtime != nil && e.policySelectionHeldByLeafMobilityLocked(runtime, selectorID, targetID, origin) {
+		e.healthEvidenceCommitMu.Unlock()
 		e.pathsMu.Unlock()
 		return errPolicySelectionLeafMobilityHeld
 	}
 	oldID := e.activeID
 	attached := e.attachedLeafTargetsLocked()
-	if err := runtime.commitSelectorChildOrigin(selectorID, targetID, attached, origin, func(leaves map[proto.TargetID]bool) error {
-		e.policyLifecycleMu.Lock()
-		defer e.policyLifecycleMu.Unlock()
-		if e.closing.Load() || e.sendClosing.Load() || e.isClosed() {
-			return net.ErrClosed
-		}
-		active := e.representativePathForLeavesLocked(leaves)
-		if active == 0 {
-			return errNoExecutionRoute
-		}
-		publishRoute := func() {
-			e.activeID = active
-			e.setState(BridgeActive)
-		}
-		if committed != nil {
-			if err := committed(publishRoute); err != nil {
-				return err
+	if err := runtime.commitSelectorChildOriginAtState(
+		selectorID, targetID, attached, origin, expectedEvidence.selectorState,
+		func(leaves map[proto.TargetID]bool) error {
+			e.policyLifecycleMu.Lock()
+			defer e.policyLifecycleMu.Unlock()
+			if e.closing.Load() || e.sendClosing.Load() || e.isClosed() {
+				return net.ErrClosed
 			}
-		} else {
-			publishRoute()
-		}
-		if hook := e.policyCommitAfterPublish; hook != nil {
-			hook()
-		}
-		return nil
-	}); err != nil {
+			active := e.representativePathForLeavesLocked(leaves)
+			if active == 0 {
+				return errNoExecutionRoute
+			}
+			routePublished := false
+			publishRoute := func() error {
+				committedAt := e.nextMigrationCommittedAtLocked(nowFn())
+				if err := e.validateSelectorEvidenceCommitAtLocked(expectedEvidence, committedAt); err != nil {
+					return err
+				}
+				e.activeID = active
+				e.setState(BridgeActive)
+				migrationCommittedAt = committedAt
+				routePublished = true
+				return nil
+			}
+			if committed != nil {
+				if err := committed(publishRoute); err != nil {
+					return err
+				}
+			} else {
+				if err := publishRoute(); err != nil {
+					return err
+				}
+			}
+			if !routePublished {
+				return fmt.Errorf("engine: selector commit returned without publishing route")
+			}
+			if hook := e.policyCommitAfterPublish; hook != nil {
+				hook()
+			}
+			return nil
+		},
+	); err != nil {
+		e.healthEvidenceCommitMu.Unlock()
 		e.pathsMu.Unlock()
 		return err
 	}
 	e.promoteEffectiveLeafMobilityRefreshPolicyHoldsLocked(runtime)
-	changed := oldID != e.activeID && e.activeID != 0
-	var zombieTrip zombieTripTicket
+	changed = oldID != e.activeID && e.activeID != 0
 	if changed {
-		e.recordMigrationLocked()
+		if cause == "" {
+			cause = "policy"
+		}
+		evidence := e.selectorMigrationEvidenceLocked(expectedEvidence)
+		evidence.Selector = MigrationSelectorBinding{
+			SelectorID:        [16]byte(selectorID),
+			TargetID:          [16]byte(targetID),
+			Origin:            migrationSelectorOriginName(origin),
+			CutoverGeneration: cutoverGeneration,
+			CapturedAt:        expectedEvidence.capturedAt,
+			ValidUntil:        expectedEvidence.validUntil,
+		}
+		migrationEvent = e.recordMigrationAtLocked(
+			oldID, e.activeID, cause, evidence, migrationCommittedAt,
+		)
 		if origin.chargesZombieBudget() {
 			zombieTrip = e.accountMigration()
 		}
 	}
-	newID := e.activeID
+	e.healthEvidenceCommitMu.Unlock()
 	e.pathsMu.Unlock()
 	handedOff := e.selectorCutoverDidHandoff(cutoverGeneration)
 	if handedOff || (origin.isFactualFailure() && origin != policySelectionPathDeathReplayed) || (changed && origin == policySelectionExplicit) {
@@ -2447,15 +2998,6 @@ func (e *Engine) commitRecursiveSelection(
 				return err
 			}
 		}
-	}
-	if changed {
-		if cause == "" {
-			cause = "policy"
-		}
-		e.fireMigrateHooks(oldID, newID, cause)
-	}
-	if changed && origin.chargesZombieBudget() {
-		e.tripZombie(zombieTrip)
 	}
 	return nil
 }
@@ -2503,22 +3045,80 @@ func (e *Engine) projectRecursiveRepresentativeLocked(runtime *executionRuntime)
 	return e.representativePathForLeavesLocked(leaves)
 }
 
+const (
+	policyExternalCallbackBudget = 50 * time.Millisecond
+	policyAdmissionCallbackOp    = "PolicyAdmission"
+	peakPolicyObserverCallbackOp = "PeakPolicyObserver"
+)
+
+type peerPolicyAdmissionCallback struct {
+	fn func(selectorID, targetID proto.TargetID, cause string) error
+}
+
+type peakPolicyObserverCallback struct {
+	fn func(selectorID, targetID proto.TargetID, selectorGeneration uint64, peak bool, cause string)
+}
+
+// PolicyCallbackDiagnostic is the bounded diagnostic state for abnormal
+// third-party policy callback exits. Ordinary admission rejection is policy
+// input and is not counted as a callback failure.
+type PolicyCallbackDiagnostic struct {
+	Failures  uint64
+	LastError error
+}
+
+// PolicyCallbackDiagnostics returns a stable snapshot without retaining an
+// unbounded history of callback failures.
+func (e *Engine) PolicyCallbackDiagnostics() PolicyCallbackDiagnostic {
+	if e == nil {
+		return PolicyCallbackDiagnostic{}
+	}
+	e.policyCallbackDiagMu.Lock()
+	defer e.policyCallbackDiagMu.Unlock()
+	return e.policyCallbackDiag
+}
+
+func (e *Engine) recordPolicyCallbackDiagnostic(err error) {
+	if e == nil || err == nil {
+		return
+	}
+	e.policyCallbackDiagMu.Lock()
+	if e.policyCallbackDiag.Failures != ^uint64(0) {
+		e.policyCallbackDiag.Failures++
+	}
+	e.policyCallbackDiag.LastError = err
+	e.policyCallbackDiagMu.Unlock()
+}
+
 // SetPeerPolicyAdmission installs a bounded, local sender-side admission
 // check for advisory peer selection requests. A nil function clears it.
 func (e *Engine) SetPeerPolicyAdmission(fn func(selectorID, targetID proto.TargetID, cause string) error) {
 	e.policyAdmissionMu.Lock()
-	e.policyAdmission = fn
+	if fn == nil {
+		e.policyAdmission = nil
+	} else {
+		e.policyAdmission = &peerPolicyAdmissionCallback{fn: fn}
+	}
 	e.policyAdmissionMu.Unlock()
 }
 
 func (e *Engine) admitPeerPolicy(selectorID, targetID proto.TargetID, cause string) error {
 	e.policyAdmissionMu.RLock()
-	fn := e.policyAdmission
+	callback := e.policyAdmission
 	e.policyAdmissionMu.RUnlock()
-	if fn == nil {
+	if callback == nil || callback.fn == nil {
 		return nil
 	}
-	return fn(selectorID, targetID, cause)
+	ctx, cancel := context.WithTimeout(context.Background(), policyExternalCallbackBudget)
+	defer cancel()
+	err := invokeExternalPathErrorCallbackContext(
+		ctx, policyAdmissionCallbackOp, callback,
+		func() error { return callback.fn(selectorID, targetID, cause) },
+	)
+	if externalPathCallbackBoundaryError(err) {
+		e.recordPolicyCallbackDiagnostic(err)
+	}
+	return err
 }
 
 // SetPeakPolicyObserver installs a sender-local observer for committed
@@ -2528,7 +3128,11 @@ func (e *Engine) SetPeakPolicyObserver(
 	fn func(selectorID, targetID proto.TargetID, selectorGeneration uint64, peak bool, cause string),
 ) {
 	e.peakPolicyObserverMu.Lock()
-	e.peakPolicyObserver = fn
+	if fn == nil {
+		e.peakPolicyObserver = nil
+	} else {
+		e.peakPolicyObserver = &peakPolicyObserverCallback{fn: fn}
+	}
 	e.peakPolicyObserverMu.Unlock()
 }
 
@@ -2549,10 +3153,21 @@ func (e *Engine) observePeakPolicy(
 		peak = policyTargetIsPeak(e.localGraphBinding().manifest, selectorID, targetID)
 	}
 	e.peakPolicyObserverMu.RLock()
-	fn := e.peakPolicyObserver
+	callback := e.peakPolicyObserver
 	e.peakPolicyObserverMu.RUnlock()
-	if fn != nil {
-		fn(selectorID, targetID, selectorGeneration, peak, cause)
+	if callback != nil && callback.fn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), policyExternalCallbackBudget)
+		defer cancel()
+		err := invokeExternalPathErrorCallbackContext(
+			ctx, peakPolicyObserverCallbackOp, callback,
+			func() error {
+				callback.fn(selectorID, targetID, selectorGeneration, peak, cause)
+				return nil
+			},
+		)
+		if err != nil {
+			e.recordPolicyCallbackDiagnostic(err)
+		}
 	}
 }
 
@@ -2572,35 +3187,40 @@ func (e *Engine) SetReadDeadline(t time.Time) error {
 	}
 	e.recvDeadline = t
 	if t.IsZero() {
-		select {
-		case e.recvPacketWake <- struct{}{}:
-		default:
-		}
+		e.wakePacketReadersLocked()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		e.recvCond.Broadcast()
-		select {
-		case e.recvPacketWake <- struct{}{}:
-		default:
-		}
+		e.wakePacketReadersLocked()
 		return nil
 	}
 	e.recvDeadlineTimer = time.AfterFunc(d, func() {
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()
+		e.wakePacketReadersLocked()
 		e.recvMu.Unlock()
-		select {
-		case e.recvPacketWake <- struct{}{}:
-		default:
-		}
 	})
-	select {
-	case e.recvPacketWake <- struct{}{}:
-	default:
-	}
+	e.wakePacketReadersLocked()
 	return nil
+}
+
+func (e *Engine) wakePacketReadersLocked() {
+	previous := e.recvPacketWake
+	e.recvPacketWake = make(chan struct{})
+	if previous != nil {
+		close(previous)
+	}
+}
+
+func (e *Engine) packetReadDeadlineExpired(packetWake chan struct{}, deadline time.Time) bool {
+	e.recvMu.Lock()
+	defer e.recvMu.Unlock()
+	return e.recvPacketWake == packetWake &&
+		e.recvDeadline.Equal(deadline) &&
+		!deadline.IsZero() &&
+		!time.Now().Before(deadline)
 }
 
 // timeoutError implements net.Error with Timeout()==true.
@@ -2609,6 +3229,7 @@ type timeoutError struct{}
 func (timeoutError) Error() string   { return "rendr: read deadline exceeded" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
+func (timeoutError) Unwrap() error   { return os.ErrDeadlineExceeded }
 
 // ErrReadDeadlineExceeded is the sentinel returned by Recv/RecvPacket
 // when SetReadDeadline's deadline elapses before payload is ready.
@@ -2636,14 +3257,13 @@ func (e *Engine) SetPacketMode() {
 	if e.recvSeenBits == nil {
 		e.recvSeenBits = make([]uint64, packetRecvWindowBits/64)
 	}
+	e.packetMode.Store(true)
 	e.recvMu.Unlock()
 }
 
 // Packetized reports whether the engine is in packet-boundary mode.
 func (e *Engine) Packetized() bool {
-	e.recvMu.Lock()
-	defer e.recvMu.Unlock()
-	return e.packetized
+	return e.packetMode.Load()
 }
 
 // defaultBondPinSize is the number of consecutive frames bond
@@ -2670,38 +3290,6 @@ func (e *Engine) MigrationCount() uint64 {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
 	return e.migrationCount
-}
-
-// recordMigrationLocked advances both the public count and the lock-free
-// invalidation token. Callers hold pathsMu for writing.
-func (e *Engine) recordMigrationLocked() {
-	e.migrationCount++
-	e.migrationEpoch.Add(1)
-}
-
-// OnMigrate registers fn to be invoked in a fresh goroutine for every
-// committed migration. oldID equals newID for in-place leaf mobility. The
-// returned function cancels the subscription.
-//
-// Hooks run after pathsMu has been released, so fn may safely call
-// back into the root package's narrow control interfaces.
-func (e *Engine) OnMigrate(fn func(oldID, newID uint32, cause string)) (cancel func()) {
-	if fn == nil {
-		return func() {}
-	}
-	e.pathsMu.Lock()
-	if e.migrateHooks == nil {
-		e.migrateHooks = make(map[uint64]func(uint32, uint32, string))
-	}
-	e.migrateHookID++
-	id := e.migrateHookID
-	e.migrateHooks[id] = fn
-	e.pathsMu.Unlock()
-	return func() {
-		e.pathsMu.Lock()
-		delete(e.migrateHooks, id)
-		e.pathsMu.Unlock()
-	}
 }
 
 // OnPathDeath registers an internal lifecycle subscriber. Callbacks run in
@@ -2771,24 +3359,6 @@ func (e *Engine) firePathDeathHooks(event PathDeathEvent) {
 	}
 }
 
-// fireMigrateHooks snapshots the hook set and invokes each fn in its
-// own goroutine. Caller must NOT hold pathsMu.
-func (e *Engine) fireMigrateHooks(oldID, newID uint32, cause string) {
-	e.pathsMu.RLock()
-	if len(e.migrateHooks) == 0 {
-		e.pathsMu.RUnlock()
-		return
-	}
-	hooks := make([]func(uint32, uint32, string), 0, len(e.migrateHooks))
-	for _, fn := range e.migrateHooks {
-		hooks = append(hooks, fn)
-	}
-	e.pathsMu.RUnlock()
-	for _, fn := range hooks {
-		go fn(oldID, newID, cause)
-	}
-}
-
 // Close tears down the engine, closing all attached paths.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
@@ -2813,22 +3383,31 @@ func (e *Engine) Close() error {
 		e.setState(BridgeClosing)
 		e.pathsMu.Lock()
 		slots := make([]*pathSlot, 0, len(e.paths)+len(e.pendingPaths)+len(e.stagedPaths)+len(e.retainedPaths))
+		migrationSubscribers := make([]*migrationEventSubscriber, 0, len(e.migrationEventSubscribers))
+		for _, subscriber := range e.migrationEventSubscribers {
+			migrationSubscribers = append(migrationSubscribers, subscriber)
+		}
+		e.migrationEventSubscribers = nil
 		for _, s := range e.paths {
+			e.trackPathRetirementLocked(s)
 			s.closeQuit()
 			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.pendingPaths {
+			e.trackPathRetirementLocked(s)
 			s.closeQuit()
 			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.stagedPaths {
+			e.trackPathRetirementLocked(s)
 			s.closeQuit()
 			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
 		}
 		for _, s := range e.retainedPaths {
+			e.trackPathRetirementLocked(s)
 			s.closeQuit()
 			s.requestMobilityClaimRetirement()
 			slots = append(slots, s)
@@ -2847,6 +3426,9 @@ func (e *Engine) Close() error {
 		e.pathLeafGeneration = make(map[pathAdmissionLeafKey]uint64)
 		e.activeID = 0
 		e.pathsMu.Unlock()
+		for _, subscriber := range migrationSubscribers {
+			subscriber.stopAccepting()
+		}
 		e.closeLeafMobilityRefreshQueue()
 		e.clearPathProbeState(slots)
 		close(e.closed)
@@ -2857,38 +3439,17 @@ func (e *Engine) Close() error {
 		e.recvMu.Lock()
 		e.recvCond.Broadcast()
 		e.recvMu.Unlock()
-		results := make(chan struct{}, len(slots))
 		var reapStage atomic.Value
-		reapStage.Store("path-close")
+		reapStage.Store("retired-paths")
 		for _, s := range slots {
-			go func(slot *pathSlot) {
-				slot.retireMobilityClaim()
-				e.recordTeardownErr(slot.conn.Close())
-				results <- struct{}{}
-			}(s)
+			e.retirePathAsync(s)
 		}
 		reaped := make(chan struct{}, 1)
 		go func() {
-			for range slots {
-				<-results
-			}
-			reapStage.Store("path-workers")
-			for _, slot := range slots {
-				if slot.readerStarted.Load() {
-					<-slot.doneR
-				}
-				if slot.writerStarted.Load() {
-					<-slot.doneW
-				}
-				if slot.proberStarted.Load() {
-					<-slot.doneP
-				}
-				slot.waitQualityObserver()
-				slot.probeWriteWG.Wait()
-				slot.ackWG.Wait()
-			}
 			reapStage.Store("core-loops")
 			e.coreWG.Wait()
+			reapStage.Store("bye-callbacks")
+			e.byeCallbackWG.Wait()
 			reapStage.Store("peer-bye-retention")
 			e.peerByeMu.Lock()
 			peerByeDone := e.peerByeCloseDone
@@ -2902,6 +3463,12 @@ func (e *Engine) Close() error {
 			e.leafTx.asyncWG.Wait()
 			reapStage.Store("retired-paths")
 			e.retireWG.Wait()
+			reapStage.Store("pre-slot-cleanup")
+			e.pathAdmissionCleanupWG.Wait()
+			reapStage.Store("leaf-refresh-registration")
+			e.leafRefreshRegistrationWG.Wait()
+			reapStage.Store("leaf-refresh-cancellation")
+			e.leafRefreshCancelWG.Wait()
 			reapStage.Store("peer-ledger")
 			e.releaseLeafMobilityPeerLedgerSession()
 			e.selectorMu.Lock()
@@ -2923,20 +3490,39 @@ func (e *Engine) Close() error {
 		case <-reaped:
 		case <-timer.C:
 			stage := reapStage.Load().(string)
-			timeoutErr = fmt.Errorf("engine: shutdown did not quiesce after %s (stage=%s retire=%s)", pathCloseTimeout, stage, e.retirementDebugSnapshot())
+			timeoutErr = &engineTeardownDeadlineError{
+				after: pathCloseTimeout, stage: stage, retirement: e.retirementDebugSnapshot(),
+			}
 		}
-		e.closeResult = errors.Join(timeoutErr, e.teardownError())
+		if timeoutErr != nil {
+			e.closeMu.Lock()
+			e.closeResult = errors.Join(e.closeResult, timeoutErr)
+			e.closeMu.Unlock()
+		}
 	})
-	return e.closeResult
+	return e.closeTeardownError()
 }
 
 func (e *Engine) requestClose() {
 	go e.Close()
 }
 
-// CloseErr returns the recorded close cause once the engine is dead;
-// returns nil while still alive or on a clean close.
+// CloseErr returns the terminal session cause. Once shutdown starts, it also
+// includes teardown failures, including failures recorded after an earlier
+// bounded Close call returned.
 func (e *Engine) CloseErr() error {
+	e.closeMu.Lock()
+	defer e.closeMu.Unlock()
+	if !e.closing.Load() {
+		return e.closeErr
+	}
+	if e.closeResult == nil && e.teardownErr == nil {
+		return e.closeErr
+	}
+	return errors.Join(e.closeErr, e.closeResult, e.teardownErr)
+}
+
+func (e *Engine) terminalCloseError() error {
 	e.closeMu.Lock()
 	defer e.closeMu.Unlock()
 	return e.closeErr
@@ -2955,6 +3541,12 @@ func (e *Engine) teardownError() error {
 	e.closeMu.Lock()
 	defer e.closeMu.Unlock()
 	return e.teardownErr
+}
+
+func (e *Engine) closeTeardownError() error {
+	e.closeMu.Lock()
+	defer e.closeMu.Unlock()
+	return errors.Join(e.closeResult, e.teardownErr)
 }
 
 // Closed returns a channel that is closed only after engine-owned path and
@@ -3006,7 +3598,16 @@ func (e *Engine) runPathQuiesceHooks(slot *pathSlot) {
 		return
 	}
 	if q, ok := slot.conn.(interface{ MarkQuiesced() }); ok {
-		q.MarkQuiesced()
+		ctx, cancel := context.WithTimeout(context.Background(), externalPathValueCallbackTimeout)
+		err := invokeExternalPathErrorCallbackContext(ctx, "PathConn.MarkQuiesced", slot.conn, func() error {
+			q.MarkQuiesced()
+			return nil
+		})
+		cancel()
+		if err != nil {
+			e.recordTeardownErr(err)
+			return
+		}
 	}
 	// A hook that outlives Close owns only the retired adapter it was invoked
 	// on. Never continue to another optional method after that ownership ended.
@@ -3014,7 +3615,12 @@ func (e *Engine) runPathQuiesceHooks(slot *pathSlot) {
 		return
 	}
 	if cw, ok := slot.conn.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
+		ctx, cancel := context.WithTimeout(context.Background(), externalPathValueCallbackTimeout)
+		err := invokeExternalPathErrorCallbackContext(ctx, "PathConn.CloseWrite", slot.conn, cw.CloseWrite)
+		cancel()
+		if externalPathCallbackBoundaryError(err) {
+			e.recordTeardownErr(err)
+		}
 	}
 }
 
@@ -3181,10 +3787,13 @@ func (e *Engine) AbortPathAttach(id uint32, cause error) {
 	e.pathsMu.Lock()
 	pending := e.pendingPaths[id]
 	if pending != nil {
+		e.trackPathRetirementLocked(pending)
+		pending.closeQuit()
 		delete(e.pendingPaths, id)
 	}
 	staged := e.stagedPaths[id]
 	if staged != nil {
+		e.trackPathRetirementLocked(staged)
 		delete(e.stagedPaths, id)
 		staged.closeQuit()
 	}
@@ -3194,14 +3803,11 @@ func (e *Engine) AbortPathAttach(id uint32, cause error) {
 	slot := e.paths[id]
 	e.pathsMu.Unlock()
 	if pending != nil {
-		pending.retireMobilityClaim()
-		_ = pending.conn.Close()
+		e.retirePathAsync(pending)
 		return
 	}
 	if staged != nil {
-		staged.retireMobilityClaim()
-		_ = staged.conn.Close()
-		e.drainDeadSlot(staged)
+		e.retirePathAsync(staged)
 		return
 	}
 	if slot != nil {

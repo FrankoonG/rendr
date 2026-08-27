@@ -2,13 +2,13 @@ package rendr
 
 import (
 	"errors"
-	"time"
 )
 
 // Target is one node in a rendr policy graph.
 //
-// A Path, Selector, Race, or Bond is a Target. Parent groups always see a child
-// group as one logical target; group internals are execution details.
+// A Path, Selector, Race, or Bond is a Target. Selector children and cross-mode
+// child groups remain one logical target. Nested Race-in-Race and Bond-in-Bond
+// groups are flattened into the parent execution set.
 type Target interface {
 	Name() string
 	targetNode()
@@ -79,16 +79,8 @@ type SelectorOption interface {
 
 // PeakTransfer marks selector children that should only be used as
 // peak-transfer candidates unless normal targets are unavailable.
-//
-// The minimal public form is Targets. The tuning fields are optional and keep
-// zero-value defaults until the runtime policy layer consumes them.
 type PeakTransfer struct {
 	Targets []string
-
-	SaturationRatio float64
-	SaturationFor   time.Duration
-	ReturnRatio     float64
-	ReturnFor       time.Duration
 }
 
 func (p PeakTransfer) applySelector(g *GroupTarget) {
@@ -102,10 +94,8 @@ func (p PeakTransfer) applySelector(g *GroupTarget) {
 // only for initial dial and recovery.
 type compiledTarget struct {
 	paths         []PathSpec
-	pathPeak      []bool
 	primaryName   string
 	peakTransfer  bool
-	peakOptions   PeakTransfer
 	graph         compiledTargetGraph
 	graphRevision uint64
 	runtimeConfig RuntimeConfig

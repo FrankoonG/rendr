@@ -41,13 +41,14 @@ const (
 )
 
 type leafMobilityMessage struct {
-	kind     leafMobilityMessageKind
-	source   PathRef
-	seq      uint64
-	replayed bool
-	prepare  proto.LeafMobilityPeerPlanPrepare
-	ack      proto.LeafMobilityPeerPlanAck
-	commit   proto.LeafMobilityPeerPlanCommit
+	kind       leafMobilityMessageKind
+	source     PathRef
+	sourceSlot *pathSlot
+	seq        uint64
+	replayed   bool
+	prepare    proto.LeafMobilityPeerPlanPrepare
+	ack        proto.LeafMobilityPeerPlanAck
+	commit     proto.LeafMobilityPeerPlanCommit
 }
 
 type leafMobilityMessageKey struct {
@@ -101,6 +102,9 @@ type outgoingLeafMobilityTransaction struct {
 	final             chan leafMobilityAckEvent
 	released          chan leafMobilityAckEvent
 	preempt           chan error
+	preemptCtx        context.Context
+	preemptCancel     context.CancelCauseFunc
+	preempted         atomic.Bool
 	deadline          time.Time
 	gateHeld          atomic.Bool
 	commitIssued      atomic.Bool
@@ -111,6 +115,62 @@ type outgoingLeafMobilityTransaction struct {
 	recoveryOnce      sync.Once
 	recoveryWriteMu   sync.Mutex
 	recoveryWrite     <-chan leafMobilityFrameResult
+}
+
+func (outgoing *outgoingLeafMobilityTransaction) requestPreemption(cause error) {
+	if outgoing == nil {
+		return
+	}
+	if cause == nil {
+		cause = ErrLeafMobilityAuthorityBusy
+	}
+	if outgoing.preempted.CompareAndSwap(false, true) && outgoing.preemptCancel != nil {
+		outgoing.preemptCancel(cause)
+	}
+	select {
+	case outgoing.preempt <- cause:
+	default:
+	}
+}
+
+func (outgoing *outgoingLeafMobilityTransaction) preemptionError() error {
+	if outgoing == nil || !outgoing.preempted.Load() {
+		return nil
+	}
+	if outgoing.preemptCtx != nil {
+		if cause := context.Cause(outgoing.preemptCtx); cause != nil {
+			return cause
+		}
+	}
+	return ErrLeafMobilityAuthorityBusy
+}
+
+func (outgoing *outgoingLeafMobilityTransaction) forwardContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancelCause := context.WithCancelCause(parent)
+	if outgoing == nil {
+		return ctx, func() { cancelCause(context.Canceled) }
+	}
+	if err := outgoing.preemptionError(); err != nil {
+		cancelCause(err)
+		return ctx, func() { cancelCause(context.Canceled) }
+	}
+	if outgoing.preemptCtx == nil {
+		return ctx, func() { cancelCause(context.Canceled) }
+	}
+	stop := context.AfterFunc(outgoing.preemptCtx, func() {
+		cause := context.Cause(outgoing.preemptCtx)
+		if cause == nil {
+			cause = ErrLeafMobilityAuthorityBusy
+		}
+		cancelCause(cause)
+	})
+	return ctx, func() {
+		stop()
+		cancelCause(context.Canceled)
+	}
 }
 
 type outgoingLeafMobilityRecoveryPhase uint8
@@ -180,6 +240,7 @@ type completedLeafMobilityTransaction struct {
 
 type rejectedLeafMobilityTransaction struct {
 	source      PathRef
+	sourceSlot  *pathSlot
 	prepare     proto.LeafMobilityPeerPlanPrepare
 	prepareSeq  uint64
 	digest      proto.LeafMobilityProposalDigest
@@ -190,6 +251,7 @@ type rejectedLeafMobilityTransaction struct {
 
 type actorLeafMobilityTombstone struct {
 	source      PathRef
+	sourceSlot  *pathSlot
 	digest      proto.LeafMobilityProposalDigest
 	prepare     proto.LeafMobilityPeerPlanPrepare
 	commit      proto.LeafMobilityPeerPlanCommit
@@ -294,6 +356,10 @@ func (a *LeafMobilityAuthority) Consume() (*LeafMobilityPermit, error) {
 		token.resolveMu.Unlock()
 		return nil, leafmobility.ErrAuthorityStale
 	default:
+	}
+	if err := token.outgoing.preemptionError(); err != nil {
+		token.resolveMu.Unlock()
+		return nil, err
 	}
 	if token.consumed {
 		token.resolveMu.Unlock()
@@ -532,13 +598,15 @@ func (p *LeafMobilityPermit) Prepare(ctx context.Context) error {
 	if p == nil || p.execution == nil {
 		return leafmobility.ErrAuthorityStale
 	}
+	forwardCtx, cancel := p.token.outgoing.forwardContext(ctx)
+	defer cancel()
 	if err := p.validateExecutionSource(); err != nil {
 		return err
 	}
-	if err := p.token.fenceExecutionDispatch(ctx); err != nil {
+	if err := p.token.fenceExecutionDispatch(forwardCtx); err != nil {
 		return err
 	}
-	if err := p.execution.Prepare(ctx); err != nil {
+	if err := p.execution.Prepare(forwardCtx); err != nil {
 		return err
 	}
 	return p.validateExecutionSource()
@@ -637,10 +705,12 @@ func (p *LeafMobilityPermit) Stage(ctx context.Context) error {
 	if p == nil || p.execution == nil {
 		return leafmobility.ErrAuthorityStale
 	}
+	forwardCtx, cancel := p.token.outgoing.forwardContext(ctx)
+	defer cancel()
 	if err := p.validateExecutionSource(); err != nil {
 		return err
 	}
-	if err := p.execution.Stage(ctx); err != nil {
+	if err := p.execution.Stage(forwardCtx); err != nil {
 		return err
 	}
 	return p.validateExecutionSource()
@@ -676,6 +746,8 @@ func (t *leafMobilityAuthorityToken) authorizePublish(ctx context.Context) error
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	forwardCtx, cancelForward := t.outgoing.forwardContext(ctx)
+	defer cancelForward()
 	t.resolveMu.Lock()
 	rearmExpiry := true
 	defer func() {
@@ -689,6 +761,9 @@ func (t *leafMobilityAuthorityToken) authorizePublish(ctx context.Context) error
 		rearmExpiry = false
 		return leafmobility.ErrAuthorityStale
 	default:
+	}
+	if err := t.outgoing.preemptionError(); err != nil {
+		return err
 	}
 	if !t.consumed || t.execution.State() != leafmobility.ExecutionStaged {
 		return leafmobility.ErrExecutionState
@@ -714,7 +789,7 @@ func (t *leafMobilityAuthorityToken) authorizePublish(ctx context.Context) error
 		PublicationDigest:           publicationDigest,
 	}
 	t.stopExpiry()
-	txCtx, cancel := context.WithDeadline(ctx, t.outgoing.deadline)
+	txCtx, cancel := context.WithDeadline(forwardCtx, t.outgoing.deadline)
 	defer cancel()
 	_, sendErr, pending := t.engine.sendLeafMobilityFrameWithContext(txCtx, func(writeCtx context.Context) ([]byte, error) {
 		return t.engine.sendLeafMobilityCommitForOutgoingContext(writeCtx, t.outgoing, t.outgoing.commit, func(frame []byte) error {
@@ -722,6 +797,9 @@ func (t *leafMobilityAuthorityToken) authorizePublish(ctx context.Context) error
 			defer t.engine.leafTx.mu.Unlock()
 			if t.engine.leafTx.outgoing != t.outgoing {
 				return leafmobility.ErrAuthorityStale
+			}
+			if err := t.outgoing.preemptionError(); err != nil {
+				return err
 			}
 			if err := t.outgoing.resourceTx.MarkCommitPublished(); err != nil {
 				return err
@@ -859,6 +937,9 @@ func reconcileLeafMobilityFinalRejected(tx *leafmobility.ResourceTransaction) (b
 func (p *LeafMobilityPermit) validateExecutionSource() error {
 	if p == nil || p.token == nil || p.token.engine == nil || p.token.outgoing == nil {
 		return leafmobility.ErrAuthorityStale
+	}
+	if err := p.token.outgoing.preemptionError(); err != nil {
+		return err
 	}
 	p.token.engine.pathsMu.RLock()
 	err := p.token.engine.validateLeafMobilityAuthoritySourceLocked(p.token.outgoing)
@@ -1047,10 +1128,12 @@ func (e *Engine) negotiateLeafMobilityAuthority(
 		e.releaseLeafMobilitySendGate()
 		return nil, err
 	}
+	preemptCtx, preemptCancel := context.WithCancelCause(context.Background())
 	outgoing := &outgoingLeafMobilityTransaction{
 		source: ref, sourceSlot: sourceSlot, prepare: prepare, digest: digest, deadline: plan.Deadline,
 		prepared: make(chan leafMobilityAckEvent, 1), final: make(chan leafMobilityAckEvent, 1),
 		released: make(chan leafMobilityAckEvent, 1), preempt: make(chan error, 1),
+		preemptCtx: preemptCtx, preemptCancel: preemptCancel,
 	}
 	outgoing.gateHeld.Store(true)
 	outgoing.policyHold = e.acquireLeafMobilityPolicyHold(sourceSlot)
@@ -2158,11 +2241,14 @@ func (e *Engine) finishOutgoingLeafMobility(outgoing *outgoingLeafMobilityTransa
 	if outgoing == nil {
 		return
 	}
+	if outgoing.preemptCancel != nil {
+		outgoing.preemptCancel(context.Canceled)
+	}
 	e.leafTx.mu.Lock()
 	if e.leafTx.outgoing == outgoing {
 		e.leafTx.outgoing = nil
 		e.leafTx.actorTerminal[outgoing.prepare.TransactionID] = actorLeafMobilityTombstone{
-			source: outgoing.source, digest: outgoing.digest,
+			source: outgoing.source, sourceSlot: outgoing.sourceSlot, digest: outgoing.digest,
 			prepare: outgoing.prepare, commit: outgoing.commit, resolution: outgoing.resolution,
 			preparedSeq: outgoing.preparedSeq, finalSeq: outgoing.finalSeq, releasedSeq: outgoing.releasedSeq,
 			preparedAck: outgoing.preparedAck, finalAck: outgoing.finalAck, releasedAck: outgoing.releasedAck,
@@ -2250,7 +2336,7 @@ func (e *Engine) leafMobilityLoop() {
 			var err error
 			switch message.kind {
 			case leafMobilityMessagePrepare:
-				err = e.handleLeafMobilityPrepare(message.source, message.seq, message.replayed, message.prepare)
+				err = e.handleLeafMobilityPrepareOnSlot(message.source, message.sourceSlot, message.seq, message.replayed, message.prepare)
 			case leafMobilityMessageAck:
 				err = e.handleLeafMobilityAck(message.source, message.seq, message.replayed, message.ack)
 			case leafMobilityMessageCommit:

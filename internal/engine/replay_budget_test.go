@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -221,6 +222,202 @@ func TestReplayBudgetStaysBelowFatalReceiveWindow(t *testing.T) {
 	}
 	if sendHistoryWindow > packetRecvWindowBits {
 		t.Fatalf("packet replay flight=%d exceeds receive bitmap=%d", sendHistoryWindow, packetRecvWindowBits)
+	}
+}
+
+func TestAcknowledgedReplayLedgerReusesEmptyBackingStore(t *testing.T) {
+	e := New(SideClient, [16]byte{0xbd}, Limits{})
+	defer e.Close()
+
+	frame := make([]byte, proto.HeaderSize+1)
+	initialCapacity := 0
+	var initialBacking *sendHistoryEntry
+	for sequence := uint64(0); sequence < 1024; sequence++ {
+		if err := (proto.Header{
+			Version: proto.Version,
+			Type:    proto.FrameData,
+			Seq:     sequence,
+		}).Encode(frame[:proto.HeaderSize]); err != nil {
+			t.Fatalf("encode frame %d: %v", sequence, err)
+		}
+		frame[proto.HeaderSize] = byte(sequence)
+		e.sendMu.Lock()
+		if err := e.acquireApplicationSendSlot(len(frame)); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("reserve frame %d credit: %v", sequence, err)
+		}
+		if err := e.reserveAndPublishOwnedApplicationFrame(
+			frame, rootDataAttribution{}, 1,
+		); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("publish frame %d: %v", sequence, err)
+		}
+		proof := e.sendProof
+		e.sendMu.Unlock()
+		if valid, application := e.acknowledgeSendFrames(sequence+1, proof); !valid || !application {
+			t.Fatalf("acknowledge frame %d: valid/application=%t/%t", sequence, valid, application)
+		}
+
+		e.sendHistMu.Lock()
+		entries, capacity := len(e.sendHist.entries), cap(e.sendHist.entries)
+		var backing *sendHistoryEntry
+		if capacity != 0 {
+			backing = &e.sendHist.entries[:capacity][0]
+		}
+		e.sendHistMu.Unlock()
+		if entries != 0 {
+			t.Fatalf("acknowledged ledger entries=%d, want 0", entries)
+		}
+		if sequence == 0 {
+			initialCapacity = capacity
+			if initialCapacity == 0 {
+				t.Fatal("drained replay ledger discarded its backing store")
+			}
+			initialBacking = backing
+			continue
+		}
+		if capacity != initialCapacity {
+			t.Fatalf("drained replay ledger capacity=%d, want stable %d", capacity, initialCapacity)
+		}
+		if backing != initialBacking {
+			t.Fatal("drained replay ledger replaced an equal-capacity backing store")
+		}
+	}
+}
+
+func TestAcknowledgedReplayLedgerClearsRetainedBackingStore(t *testing.T) {
+	e := New(SideClient, [16]byte{0xbe}, Limits{})
+	defer e.Close()
+
+	const frameCount = 64
+	e.sendMu.Lock()
+	for sequence := uint64(0); sequence < frameCount; sequence++ {
+		frame := make([]byte, proto.HeaderSize+1)
+		if err := (proto.Header{
+			Version: proto.Version,
+			Type:    proto.FrameData,
+			Seq:     sequence,
+		}).Encode(frame[:proto.HeaderSize]); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("encode frame %d: %v", sequence, err)
+		}
+		frame[proto.HeaderSize] = byte(sequence)
+		if err := e.acquireApplicationSendSlot(len(frame)); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("reserve frame %d credit: %v", sequence, err)
+		}
+		if err := e.reserveAndPublishOwnedApplicationFrame(
+			frame, rootDataAttribution{}, 1,
+		); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("publish frame %d: %v", sequence, err)
+		}
+	}
+	proof := e.sendProof
+	e.sendMu.Unlock()
+	if valid, application := e.acknowledgeSendFrames(frameCount, proof); !valid || !application {
+		t.Fatalf("acknowledge high-water ledger: valid/application=%t/%t", valid, application)
+	}
+
+	e.sendHistMu.Lock()
+	defer e.sendHistMu.Unlock()
+	if len(e.sendHist.entries) != 0 || cap(e.sendHist.entries) < frameCount {
+		t.Fatalf("drained ledger len/cap=%d/%d, want 0/>=%d", len(e.sendHist.entries), cap(e.sendHist.entries), frameCount)
+	}
+	for index, entry := range e.sendHist.entries[:cap(e.sendHist.entries)] {
+		if !reflect.DeepEqual(entry, sendHistoryEntry{}) {
+			t.Fatalf("retained replay backing entry %d still owns state: %+v", index, entry)
+		}
+	}
+}
+
+func TestPartiallyAcknowledgedReplayLedgerRebasesWithoutAllocationChurn(t *testing.T) {
+	backing := make([]sendHistoryEntry, 8)
+	for index := range backing {
+		backing[index] = sendHistoryEntry{frame: []byte{byte(index)}}
+	}
+	wantActive := append([]sendHistoryEntry(nil), backing[4:]...)
+	rebase := &Engine{}
+	rebase.sendHist.entriesBacking = backing[:0]
+	rebase.sendHist.entries = backing[4:]
+	rebase.ensureSendHistoryAppendCapacityLocked()
+	if &rebase.sendHist.entries[0] != &backing[0] || !reflect.DeepEqual(rebase.sendHist.entries, wantActive) {
+		t.Fatalf("rebase did not preserve the active suffix in the original backing: %+v", rebase.sendHist.entries)
+	}
+	for index, entry := range backing[len(wantActive):] {
+		if !reflect.DeepEqual(entry, sendHistoryEntry{}) {
+			t.Fatalf("rebase retained duplicate reference at backing slot %d: %+v", index+len(wantActive), entry)
+		}
+	}
+
+	e := New(SideClient, [16]byte{0xbf}, Limits{})
+	defer e.Close()
+
+	const (
+		inFlight   = uint64(4)
+		frameCount = uint64(1024)
+	)
+	proofs := make([]proto.AckProof, frameCount)
+	publish := func(sequence uint64) {
+		t.Helper()
+		frame := make([]byte, proto.HeaderSize+1)
+		if err := (proto.Header{
+			Version: proto.Version,
+			Type:    proto.FrameData,
+			Seq:     sequence,
+		}).Encode(frame[:proto.HeaderSize]); err != nil {
+			t.Fatalf("encode frame %d: %v", sequence, err)
+		}
+		frame[proto.HeaderSize] = byte(sequence)
+		e.sendMu.Lock()
+		if err := e.acquireApplicationSendSlot(len(frame)); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("reserve frame %d credit: %v", sequence, err)
+		}
+		if err := e.reserveAndPublishOwnedApplicationFrame(
+			frame, rootDataAttribution{}, 1,
+		); err != nil {
+			e.sendMu.Unlock()
+			t.Fatalf("publish frame %d: %v", sequence, err)
+		}
+		proofs[sequence] = e.sendProof
+		e.sendMu.Unlock()
+	}
+
+	for sequence := uint64(0); sequence < inFlight; sequence++ {
+		publish(sequence)
+	}
+	var stableBacking *sendHistoryEntry
+	stableCapacity := 0
+	for sequence := inFlight; sequence < frameCount; sequence++ {
+		publish(sequence)
+		frontier := sequence - inFlight + 1
+		if valid, application := e.acknowledgeSendFrames(frontier, proofs[frontier-1]); !valid || !application {
+			t.Fatalf("acknowledge frontier %d: valid/application=%t/%t", frontier, valid, application)
+		}
+
+		e.sendHistMu.Lock()
+		if len(e.sendHist.entries) != int(inFlight) {
+			e.sendHistMu.Unlock()
+			t.Fatalf("frontier %d ledger len=%d want %d", frontier, len(e.sendHist.entries), inFlight)
+		}
+		capacity := cap(e.sendHist.entriesBacking)
+		var backing *sendHistoryEntry
+		if capacity != 0 {
+			backing = &e.sendHist.entriesBacking[:capacity][0]
+		}
+		e.sendHistMu.Unlock()
+		if sequence == 16 {
+			stableBacking, stableCapacity = backing, capacity
+			if stableBacking == nil || stableCapacity <= int(inFlight) {
+				t.Fatalf("warm ledger backing/capacity=%p/%d", stableBacking, stableCapacity)
+			}
+		} else if sequence > 16 && (backing != stableBacking || capacity != stableCapacity) {
+			t.Fatalf("partial ACK replaced stable backing at sequence %d: %p/%d want %p/%d", sequence, backing, capacity, stableBacking, stableCapacity)
+		}
+	}
+	if valid, application := e.acknowledgeSendFrames(frameCount, proofs[frameCount-1]); !valid || !application {
+		t.Fatalf("final acknowledge: valid/application=%t/%t", valid, application)
 	}
 }
 

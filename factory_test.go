@@ -164,10 +164,8 @@ func TestM9X5AddStreamFactoryValidation(t *testing.T) {
 
 // TestM9X5PacketPathFactoryRoundTrip drives a packet-mode session dialer
 // entirely through an AddPacketPathFactory-registered source. The
-// factory returns a *net.UDPConn produced by net.ListenUDP (which
-// satisfies net.PacketConn). rendr's udpflow.WrapFromSpec then
-// resolves spec.Address as the peer for WriteTo and generates a
-// random flow_id. Asserts:
+// factory returns a PacketEndpoint whose Conn is produced by net.ListenUDP
+// and whose Peer is supplied explicitly by caller code. Asserts:
 //   - DialPacket succeeds via factory-supplied PacketConn
 //   - WriteTo / ReadFrom round-trip with rendr packet-mode framing
 //   - factory is invoked exactly once (single path)
@@ -191,9 +189,9 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 	}()
 
 	var dials atomic.Int32
-	factory := func(ctx context.Context, addr string) (net.PacketConn, error) {
+	factory := func(ctx context.Context, addr string) (PacketEndpoint, error) {
 		dials.Add(1)
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		return newTestUDPPacketEndpoint(addr)
 	}
 
 	d := &sessionDialer{Root: selectorRoot(
@@ -212,6 +210,16 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
+	wrong := packetContractAddr{network: "rendr", value: "wrong-peer", padding: []byte{1}}
+	if n, err := client.WriteTo([]byte("must-not-send"), wrong); n != 0 || !errors.Is(err, ErrPacketDestinationMismatch) {
+		t.Fatalf("mismatched WriteTo=(%d,%v), want (0, ErrPacketDestinationMismatch)", n, err)
+	} else {
+		var destinationErr *PacketDestinationError
+		if !errors.As(err, &destinationErr) || destinationErr.ActualNetwork != "" || destinationErr.ActualAddress != "" {
+			t.Fatalf("mismatched destination error=%T %+v", err, destinationErr)
+		}
+	}
+
 	want := []byte("packet-factory round trip")
 	if _, err := client.WriteTo(want, nil); err != nil {
 		t.Fatal(err)
@@ -226,6 +234,18 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 	}
 	if string(buf[:n]) != string(want) {
 		t.Fatalf("payload: got %q want %q", buf[:n], want)
+	}
+	remote := client.(*enginePacketConn).RemoteAddr()
+	wantExact := []byte("packet-factory exact peer")
+	if _, err := client.WriteTo(wantExact, remote); err != nil {
+		t.Fatalf("WriteTo exact logical peer: %v", err)
+	}
+	n, _, err = server.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != string(wantExact) {
+		t.Fatalf("exact-peer payload: got %q want %q", buf[:n], wantExact)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("factory invoked %d times, want 1", dials.Load())
@@ -244,7 +264,7 @@ func TestM9X5PacketPathFactoryRoundTrip(t *testing.T) {
 // shadow conflict with stream factory of the same name.
 func TestM9X5AddPacketFactoryValidation(t *testing.T) {
 	d := &sessionDialer{}
-	dummy := func(context.Context, string) (net.PacketConn, error) { return nil, nil }
+	dummy := func(context.Context, string) (PacketEndpoint, error) { return PacketEndpoint{}, nil }
 	if err := d.AddPacketPathFactory("", dummy); err == nil {
 		t.Fatal("empty name should error")
 	}
@@ -346,9 +366,9 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 
 	const transportName = "snapshot-packet"
 	var originalCalls, mutatedCalls, lateCalls atomic.Int32
-	original := func(context.Context, string) (net.PacketConn, error) {
+	original := func(_ context.Context, address string) (PacketEndpoint, error) {
 		originalCalls.Add(1)
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		return newTestUDPPacketEndpoint(address)
 	}
 	d := &sessionDialer{Root: selectorRoot([]PathSpec{
 		{Transport: transportName, Address: ln.Addr().String()},
@@ -373,14 +393,14 @@ func TestPacketFactoryResolverAddPathUsesSessionSnapshot(t *testing.T) {
 	waitFactoryClientPathCount(t, client, 1)
 
 	d.packetFactories = map[string]packetPathFactory{
-		transportName: func(context.Context, string) (net.PacketConn, error) {
+		transportName: func(context.Context, string) (PacketEndpoint, error) {
 			mutatedCalls.Add(1)
-			return nil, errors.New("mutated packet factory must not run")
+			return PacketEndpoint{}, errors.New("mutated packet factory must not run")
 		},
 	}
-	if err := d.AddPacketPathFactory("late-packet", func(context.Context, string) (net.PacketConn, error) {
+	if err := d.AddPacketPathFactory("late-packet", func(context.Context, string) (PacketEndpoint, error) {
 		lateCalls.Add(1)
-		return nil, errors.New("late packet factory must not run")
+		return PacketEndpoint{}, errors.New("late packet factory must not run")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -467,12 +487,12 @@ func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 
 	const transportName = "retry-packet"
 	var originalCalls, mutatedCalls atomic.Int32
-	original := func(context.Context, string) (net.PacketConn, error) {
+	original := func(_ context.Context, address string) (PacketEndpoint, error) {
 		call := originalCalls.Add(1)
 		if call == 2 {
-			return nil, errors.New("injected initial packet extra-path failure")
+			return PacketEndpoint{}, errors.New("injected initial packet extra-path failure")
 		}
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		return newTestUDPPacketEndpoint(address)
 	}
 	d := &sessionDialer{
 		Root: selectorRoot([]PathSpec{
@@ -493,9 +513,9 @@ func TestPacketFactoryResolverRetryUsesSessionSnapshot(t *testing.T) {
 	defer server.Close()
 
 	d.packetFactories = map[string]packetPathFactory{
-		transportName: func(context.Context, string) (net.PacketConn, error) {
+		transportName: func(context.Context, string) (PacketEndpoint, error) {
 			mutatedCalls.Add(1)
-			return nil, errors.New("mutated retry packet factory must not run")
+			return PacketEndpoint{}, errors.New("mutated retry packet factory must not run")
 		},
 	}
 	waitFactoryPathCount(t, client, server, 2)
@@ -721,20 +741,24 @@ func TestPathFactoryResolverPacketTrustBoundaryHighCount(t *testing.T) {
 	var conflictedClosed atomic.Int64
 	var healthy *factoryBoundaryPacketConn
 	resolver := &pathFactoryResolver{packet: map[string]packetPathFactory{
-		factoryID: func(context.Context, string) (net.PacketConn, error) {
+		factoryID: func(context.Context, string) (PacketEndpoint, error) {
 			switch call := calls.Add(1); {
 			case call <= factoryBoundaryFailureCount:
 				panic(panicValue)
 			case call <= 2*factoryBoundaryFailureCount:
-				return nil, nil
+				return PacketEndpoint{}, nil
 			case call <= 3*factoryBoundaryFailureCount:
 				var typedNil *factoryBoundaryPacketConn
-				return typedNil, nil
+				return PacketEndpoint{Conn: typedNil, Peer: factoryBoundaryAddr("peer")}, nil
 			case call <= 4*factoryBoundaryFailureCount:
-				return &factoryBoundaryPacketConn{closeHook: func() { conflictedClosed.Add(1) }}, factoryErr
+				return PacketEndpoint{
+					Conn:            &factoryBoundaryPacketConn{closeHook: func() { conflictedClosed.Add(1) }},
+					Peer:            factoryBoundaryAddr("peer"),
+					MaxDatagramSize: testPacketMaxDatagramSize,
+				}, factoryErr
 			default:
 				healthy = &factoryBoundaryPacketConn{}
-				return healthy, nil
+				return PacketEndpoint{Conn: healthy, Peer: factoryBoundaryAddr("peer"), MaxDatagramSize: testPacketMaxDatagramSize}, nil
 			}
 		},
 	}}
@@ -752,14 +776,14 @@ func TestPathFactoryResolverPacketTrustBoundaryHighCount(t *testing.T) {
 		if path != nil {
 			t.Fatalf("nil call returned path %T", path)
 		}
-		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonNilResult, nil)
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonInvalidPacketConn, nil)
 	}
 	for range factoryBoundaryFailureCount {
 		path, err := resolver.dialPath(context.Background(), spec)
 		if path != nil {
 			t.Fatalf("typed-nil call returned path %T", path)
 		}
-		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonNilResult, nil)
+		assertFactoryBoundaryError(t, err, factoryID, FactoryKindPacket, FactoryReasonInvalidPacketConn, nil)
 	}
 	for range factoryBoundaryFailureCount {
 		path, err := resolver.dialPath(context.Background(), spec)
@@ -1080,6 +1104,23 @@ type factoryBoundaryAddr string
 func (a factoryBoundaryAddr) Network() string { return "factory-boundary" }
 func (a factoryBoundaryAddr) String() string  { return string(a) }
 
+func newTestUDPPacketEndpoint(address string) (PacketEndpoint, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return PacketEndpoint{}, err
+	}
+	return testPacketEndpointForAddress(conn, address)
+}
+
+func testPacketEndpointForAddress(conn net.PacketConn, address string) (PacketEndpoint, error) {
+	peer, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		_ = conn.Close()
+		return PacketEndpoint{}, err
+	}
+	return PacketEndpoint{Conn: conn, Peer: peer, MaxDatagramSize: testPacketMaxDatagramSize}, nil
+}
+
 type factoryBoundaryStreamConn struct {
 	closed    atomic.Bool
 	closeHook func()
@@ -1128,6 +1169,9 @@ func (*factoryBoundaryPacketConn) LocalAddr() net.Addr              { return fac
 func (*factoryBoundaryPacketConn) SetDeadline(time.Time) error      { return nil }
 func (*factoryBoundaryPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (*factoryBoundaryPacketConn) SetWriteDeadline(time.Time) error { return nil }
+func (*factoryBoundaryPacketConn) AcceptPacketPeerSnapshot(net.Addr) error {
+	return nil
+}
 
 type factoryBoundaryFramedFactory struct {
 	dial func(context.Context, PathSpec) (transport.PathConn, error)
