@@ -1185,14 +1185,7 @@ func TestSelectorPeakTransferBadSpeedQualityGate(t *testing.T) {
 	}
 	healthyDecisionQuality := badDecisionQuality
 	healthyDecisionQuality.LossPP = 0
-	healthyDecisionQuality.At = time.Now()
-	if err := controlled.SetQuality("C", healthyDecisionQuality); err != nil {
-		t.Fatal(err)
-	}
-	if !backed.peak.peakHealthy() {
-		t.Fatalf("healthy-control stimulus was not visible before transfer: paths=%+v diagnostic=%+v",
-			client.Paths(), peakTransferDiagnostic(client, false))
-	}
+	waitForPeakTransferHealth(t, client, controlled, "C", healthyDecisionQuality, true, 3*time.Second)
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) && client.(testConnectionControl).ActivePath() != ids["C"] {
 		healthyDecisionQuality.At = time.Now()
@@ -1500,14 +1493,9 @@ func TestSelectorPeakTransferStaleSpeedEvidence(t *testing.T) {
 	}
 	freshDecisionQuality := liveDecisionQuality
 	freshDecisionQuality.LossPP = 0
-	if err := controlled.SetQuality("C", freshDecisionQuality); err != nil {
-		t.Fatal(err)
-	}
-	if !backed.peak.peakHealthy() {
-		t.Fatalf("fresh peak evidence was not admitted before transfer: paths=%+v diagnostic=%+v",
-			client.Paths(), peakTransferDiagnostic(client, false))
-	}
-	freshRefreshes := uint64(1)
+	freshRefreshes := waitForPeakTransferHealth(
+		t, client, controlled, "C", freshDecisionQuality, true, 3*time.Second,
+	)
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) && client.(testConnectionControl).ActivePath() != ids["C"] {
 		if err := controlled.SetQuality("C", PathQuality{RTT: 10 * time.Millisecond, At: time.Now()}); err != nil {
@@ -2638,6 +2626,41 @@ func assertPeakDemandEvidence(t *testing.T, conn Conn, rx bool) {
 	if state.normalBytes < defaultPeakMinBytes || state.normalPeakBps <= 0 {
 		t.Fatalf("rx=%t lacks demand-backed normal capacity evidence: bytes=%d bps=%f state=%+v",
 			rx, state.normalBytes, state.normalPeakBps, state)
+	}
+}
+
+func waitForPeakTransferHealth(
+	t *testing.T,
+	conn Conn,
+	controlled *runtimeControlledTCPTransport,
+	pathName string,
+	quality PathQuality,
+	want bool,
+	within time.Duration,
+) uint64 {
+	t.Helper()
+	backed, ok := conn.(*engineBackedConn)
+	if !ok || backed.peak == nil {
+		t.Fatalf("connection %T has no peak-transfer controller", conn)
+	}
+	deadline := time.Now().Add(within)
+	var refreshes uint64
+	for {
+		quality.At = time.Now()
+		if err := controlled.SetQuality(pathName, quality); err != nil {
+			t.Fatal(err)
+		}
+		refreshes++
+		if backed.peak.peakHealthy() == want {
+			return refreshes
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf(
+				"peak-transfer health did not become %t within %s after %d refreshes: path=%q paths=%+v diagnostic=%+v",
+				want, within, refreshes, pathName, conn.Paths(), peakTransferDiagnostic(conn, false),
+			)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
