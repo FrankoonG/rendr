@@ -78,7 +78,8 @@ func testPeakTransferQUICDatagramPayloadBudget(t *testing.T) {
 		}
 	}
 
-	before := client.Paths()
+	waitFactoryClientPathCount(t, client, 2)
+	before := idsByName(client.Paths())
 	payloadLimit := transportquic.MaxDatagramFrame - proto.HeaderSize - proto.DataSelectorStateEpochSize
 	assertDelivered("QUIC DATAGRAM payload boundary", bytes.Repeat([]byte{0x84}, payloadLimit))
 
@@ -91,13 +92,13 @@ func testPeakTransferQUICDatagramPayloadBudget(t *testing.T) {
 		assertDelivered("post-rejection health", []byte{byte(size), 0x5a})
 	}
 
-	after := client.Paths()
+	after := idsByName(client.Paths())
 	if len(after) != len(before) {
 		t.Fatalf("oversize rejection changed live path count: before=%+v after=%+v", before, after)
 	}
-	for index := range before {
-		if after[index].ID != before[index].ID {
-			t.Fatalf("oversize rejection replaced path: before=%+v after=%+v", before, after)
+	for name, id := range before {
+		if after[name] != id {
+			t.Fatalf("oversize rejection replaced path %q: before=%+v after=%+v", name, before, after)
 		}
 	}
 }
