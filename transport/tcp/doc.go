@@ -14,8 +14,10 @@
 // stream is CleanClose; everything else is TransportError. See
 // transport.Classify.
 //
-// The default adapter owns sockets and reports raw-TCP ownership without
-// linking the optional Linux TCP_REPAIR implementation. Building with
-// rendr_experimental_tcprepair adds the sealed driver, implementation
-// provider, and route/source refresh monitor to owned Linux/amd64 endpoints.
+// On Linux/amd64, owned dialer and listener endpoints include the sealed
+// TCP_REPAIR driver, implementation provider, and route/source refresh monitor.
+// Fresh endpoint, kernel, permission, tuple, quarantine, and peer-agreement
+// checks still decide whether a leaf may use TCP_REPAIR; otherwise the
+// negotiated framed redial/attach fallback remains authoritative. Generic Wrap
+// connections and other platforms never acquire owned TCP_REPAIR authority.
 package tcp
