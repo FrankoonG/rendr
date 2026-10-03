@@ -1,43 +1,16 @@
-# Build outputs
-/bin/
-/dist/
-/artifacts/
-/.tmp/
-
-# IDE state
-/.idea/
-/.vscode/
-
-# Internal-only files kept out of the public repo.
-# These contain design notes, lessons from prior projects, test
-# methodology, operational inventory, and a chaos harness whose
-# contents reveal internal test approach. The Go library code is
-# public; the prose + harness layer is not.
+# Private material never enters this repository: project agent instructions,
+# planning documents, local scripts, private test assets and reports.
 /CLAUDE.md
 /AGENTS.md
 /docs/
-/chaos/
-/xray/CHECKLIST.md
-
-# Local tooling
-/.tools/
-
-# Reproducible test artifacts live here per CLAUDE.md; do not check in
 /test/
-
-# Go test cache and coverage
-/coverage.out
-/coverage.html
-
-# regress suite outputs (junit.xml / SUMMARY.md / raw / last_phase1.json
-# are produced per-run and not versioned)
 /reports/
+/scripts/
+/chaos/
+/.claude/
+/.agents/
+/.gotmp/
+/.idea/
 
-# xray-core source clone for code research; ad-hoc local-only
-/.xray-research/
-
-# scripts/ is mostly local-only bypass utilities used during
-# development on Windows; the only file checked in is the official
-# regress.sh entrypoint per docs/regression-suite.md §13.
-/scripts/*
-!/scripts/regress.sh
+# Local build outputs.
+/bin/
