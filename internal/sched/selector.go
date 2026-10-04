@@ -2,6 +2,11 @@ package sched
 
 import "time"
 
+// maxFactories is the Peer factory limit (1–16 carriers per Peer). The
+// selector keeps one dwell clock per factory in fixed arrays, and a race
+// never has more candidates.
+const maxFactories = 16
+
 // SelectorParams are the selector quality parameters (plan §4). Band, Floor,
 // Dwell and Cooldown are owner-fixed; Fresh is Probe.Fresh.
 type SelectorParams struct {
@@ -13,11 +18,18 @@ type SelectorParams struct {
 }
 
 // Selector is the quality-switch state of one dialer selector session: the
-// dwell candidate, when its qualification began, and the time of the last
+// dwell candidates (every qualifying challenger, each with the start of its
+// continuous qualification against the incumbent) and the time of the last
 // quality switch. It is a value type owned by the session actor.
 type Selector struct {
 	p SelectorParams
-	// unexported state is defined by the implementation.
+
+	inc      int                     // the incumbent the dwell clocks run against
+	qual     uint32                  // bit i: factory i qualified at the latest evaluation
+	since    [maxFactories]time.Time // start of factory i's continuous qualification
+	seen     [maxFactories]time.Time // factory i's newest unloaded sample at the latest evaluation
+	lastQual time.Time               // last quality switch (valid when hasQual)
+	hasQual  bool                    // D7: no quality switch yet → the first needs no cooldown
 }
 
 // NewSelector returns a selector with no candidate and no previous quality
@@ -33,28 +45,148 @@ type Verdict struct {
 
 // Evaluate applies the quality rule at now. active is the active factory;
 // sum and failed are indexed by factory; summaries are classified with
-// Classify(·, now, Fresh). The challenger is the best-ranked factory other
-// than active that is not failed and is EvFresh (Unknown, Stale and Held
-// evidence never challenge: L28). It qualifies iff
+// Classify(·, now, Fresh). A challenger is a factory other than active that
+// is not failed, is EvFresh and whose newest sample is unloaded (Unknown,
+// Stale and Held evidence never challenge: L28; a path this Peer's own
+// sessions are loading is no quality target even while its pre-load value
+// is still Fresh: §8.4). It qualifies iff
 //   - active is EvFresh, or EvHeld with RTT > 0 (compared by its held
 //     value): ch.RTT ≤ act.RTT×(1−Band) and act.RTT − ch.RTT ≥ Floor; or
 //   - active is EvStale or EvUnknown (a fresh challenger replaces an
 //     unmeasured incumbent).
 //
-// An EvHeld active without a value is never replaced (§8). The same
-// challenger must qualify at every evaluation for Dwell; a different
-// challenger or a non-qualifying evaluation restarts the dwell. A switch is
-// also held back until Cooldown has elapsed since the last quality switch.
-// Wake is the earliest of the dwell end, the cooldown end and the next
-// ageing change (NextChange) of any factory's evidence.
+// An EvHeld active without a value is never replaced (§8). Every challenger
+// has its own dwell: it starts at the first evaluation at which the
+// challenger qualifies against this incumbent and restarts whenever an
+// evaluation finds it not qualifying, or finds that its evidence expired
+// since the previous evaluation (stale evidence never extends a dwell, even
+// when the caller missed the ageing Wake: L29). Rank changes among
+// qualifying challengers restart nothing, so near-equal challengers cannot
+// keep each other's dwell from completing. The switch goes to the
+// best-ranked challenger (lowest RTT, ties by index) whose own dwell is
+// complete, once Cooldown has elapsed since the last quality switch. Wake
+// is the earliest of the next dwell end, the cooldown end and the next
+// ageing change (NextChange) of any factory's evidence. Factories beyond
+// the 16-factory Peer limit never challenge.
 func (s *Selector) Evaluate(now time.Time, active int, sum []Summary, failed []bool) Verdict {
-	panic("unimplemented: M1b")
+	v := Verdict{Wake: s.ageWake(now, sum)}
+	if active < 0 || active >= len(sum) {
+		// No active factory to defend: the session is not routing through a
+		// quality-managed lane (opening phase, no-path episode). Nothing to do.
+		s.qual = 0
+		return v
+	}
+	if active != s.inc {
+		// The incumbent changed without Switched: qualification is measured
+		// against one incumbent, so every dwell restarts.
+		s.qual, s.inc = 0, active
+	}
+	n := min(len(sum), maxFactories)
+	s.qual &= 1<<n - 1 // factories no longer present keep no clock
+	act := Classify(sum[active], now, s.p.Fresh)
+	best := -1
+	var bestRTT time.Duration
+	var dwellEnd time.Time // earliest end of a dwell still running
+	for i := 0; i < n; i++ {
+		if i == active {
+			continue
+		}
+		bit := uint32(1) << i
+		ev, ok := s.challenger(now, i, sum, failed)
+		if !ok || !s.qualifies(act, ev) {
+			s.qual &^= bit
+			continue
+		}
+		if s.qual&bit == 0 || s.gap(i, sum[i].At) {
+			s.qual |= bit
+			s.since[i] = now
+		}
+		s.seen[i] = sum[i].At
+		if end := s.since[i].Add(s.p.Dwell); now.Before(end) {
+			dwellEnd = earlier(dwellEnd, end)
+			continue
+		}
+		if best < 0 || ev.RTT < bestRTT {
+			best, bestRTT = i, ev.RTT
+		}
+	}
+	if best < 0 {
+		v.Wake = earlier(v.Wake, dwellEnd)
+		return v
+	}
+	if s.hasQual {
+		if end := s.lastQual.Add(s.p.Cooldown); now.Before(end) {
+			v.Wake = earlier(v.Wake, end)
+			return v
+		}
+	}
+	v.Switch, v.To = true, best
+	return v
+}
+
+// challenger returns factory i's evidence and whether it may challenge: not
+// failed, EvFresh with a positive value, and its newest sample unloaded.
+// The last condition is §8.4: when a sibling session starts loading a
+// path, Classify keeps reporting its pre-load value as Fresh for up to
+// Probe.Fresh, but a path this Peer saturates must not become a quality
+// target (ranking for Dial and failover is unaffected).
+func (s *Selector) challenger(now time.Time, i int, sum []Summary, failed []bool) (Evidence, bool) {
+	if i < len(failed) && failed[i] {
+		return Evidence{}, false
+	}
+	ev := Classify(sum[i], now, s.p.Fresh)
+	return ev, ev.State == EvFresh && ev.RTT > 0 && !sum[i].LoadedAt.After(sum[i].At)
+}
+
+// gap reports whether factory i's evidence may have been Stale at some
+// instant since the previous evaluation, which saw its newest unloaded
+// sample at s.seen[i]: the sample now newest (at) arrived only after that
+// one had aged out (Classify turns it Stale at seen + Fresh + 1 ns), or it
+// is older than the one seen (a new probe incarnation, Reset). A caller
+// that evaluates at every Verdict.Wake never sees a gap here, because the
+// ageing instant itself clears the challenger; the check keeps a late
+// caller from extending a dwell across stale evidence (L29).
+func (s *Selector) gap(i int, at time.Time) bool {
+	return at.Before(s.seen[i]) || at.After(s.seen[i].Add(s.p.Fresh+1))
+}
+
+// qualifies applies the band and floor to a Fresh challenger ch against the
+// active factory's evidence act.
+func (s *Selector) qualifies(act, ch Evidence) bool {
+	switch act.State {
+	case EvFresh, EvHeld:
+		if act.RTT <= 0 {
+			return false // Held without a value is never replaced (§8)
+		}
+		return float64(ch.RTT) <= float64(act.RTT)*(1-s.p.Band) && act.RTT-ch.RTT >= s.p.Floor
+	}
+	return true // Unknown or Stale incumbent: any Fresh challenger replaces it
+}
+
+// ageWake is the earliest ageing change of any factory's evidence after now.
+func (s *Selector) ageWake(now time.Time, sum []Summary) time.Time {
+	var w time.Time
+	for i := range sum {
+		w = earlier(w, NextChange(sum[i], now, s.p.Fresh))
+	}
+	return w
+}
+
+// earlier returns the earlier of two times, a zero time meaning "never".
+func earlier(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
 }
 
 // Switched records that the active factory changed at now. quality reports a
-// quality switch (it starts the cooldown); any change clears the dwell
-// candidate. Death switches pass quality=false and neither need nor start a
-// cooldown (D7).
+// quality switch (it starts the cooldown); any change restarts every dwell.
+// Death switches pass quality=false and neither need nor start a cooldown
+// (D7).
 func (s *Selector) Switched(now time.Time, quality bool) {
-	panic("unimplemented: M1b")
+	s.qual = 0
+	if quality {
+		s.lastQual, s.hasQual = now, true
+	}
 }
