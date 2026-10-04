@@ -361,37 +361,10 @@ func activeSub(c net.Conn) (uint32, string) {
 	return uint32(cs.ID), cs.Name
 }
 
-// sessionDonePoll and sessionDoneMax bound the Status poll that stands in
-// for a Done channel.
-const (
-	sessionDonePoll = 10 * time.Millisecond
-	sessionDoneMax  = time.Minute
-)
-
-// sessionDone is closed once the session has fully ended: the Conn's Done
-// channel when it has one, else a Status poll until StateEnded. The poll
-// ends at the latest with the fixture (Runtime.Close ends every session) and
-// gives up after sessionDoneMax (the channel then never closes). The poll is
-// a stand-in until Conn.Done (design AA2) is on the branch; it is weaker
-// (StateEnded can precede Done by the carriers' wind-down), so it goes, with
-// sessionDonePoll and sessionDoneMax, once Done is there.
+// sessionDone is the Conn's Done channel (design §11.3, AA2): closed once
+// the session has fully ended.
 func sessionDone(c net.Conn) <-chan struct{} {
-	if d, ok := c.(interface{ Done() <-chan struct{} }); ok {
-		return d.Done()
-	}
-	rc := c.(*rendr.Conn)
-	ch := make(chan struct{})
-	go func() {
-		deadline := time.Now().Add(sessionDoneMax)
-		for rc.Status().State != rendr.StateEnded {
-			if !time.Now().Before(deadline) {
-				return
-			}
-			time.Sleep(sessionDonePoll)
-		}
-		close(ch)
-	}()
-	return ch
+	return c.(*rendr.Conn).Done()
 }
 
 // serverSessions: sessions the passive Runtime still holds.

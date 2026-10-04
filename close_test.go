@@ -242,12 +242,16 @@ func TestEventCallbackMayClose_L53(t *testing.T) {
 			mu       sync.Mutex
 			seen     []uint64
 			closeErr = make(chan error, 2)
+			queued   = make(chan struct{}) // all five events are in the queue
 		)
 		rt = wpTestRuntime(t, Config{OnEvent: func(ev Event) {
 			mu.Lock()
 			seen = append(seen, ev.Seq)
 			mu.Unlock()
 			if ev.Seq == 2 {
+				// The Close below must find events 3..5 queued: the worker
+				// runs concurrently with the Emit loop.
+				<-queued
 				closeErr <- rt.Close()
 				_ = rt.Status()
 				closeErr <- rt.Close() // nested: returns at once
@@ -256,6 +260,7 @@ func TestEventCallbackMayClose_L53(t *testing.T) {
 		for i := range 5 {
 			rt.ev.Emit(session.Event{Kind: session.EventCarrierUp, Session: wpSID(i), Carrier: uint32(i + 1), Time: time.Now()})
 		}
+		close(queued)
 		other := make(chan error, 1)
 		go func() {
 			synctest.Wait()

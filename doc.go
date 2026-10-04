@@ -20,6 +20,9 @@
 //     after a session failure they are not guaranteed.
 //   - Close returns at once; the session lingers in the background (at most
 //     Linger) to deliver what was written, then finishes or resets.
+//     Conn.Done is closed once it has fully ended. For a clean end, read
+//     until io.EOF, Close, wait on Done, and only then close the Runtime:
+//     Runtime.Close resets every session that has not ended.
 //   - Deadlines follow net.Conn and never end the session.
 //
 // Security model: rendr provides no confidentiality and no authentication.
