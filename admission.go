@@ -179,10 +179,12 @@ func (r lnRegistry) Orphaned(s *session.Session, on bool) {
 }
 
 // Ended replaces the entry by a tombstone answering v for the session's
-// TombstoneTTL and releases its MaxSessions unit and backlog slot.
+// TombstoneTTL and releases its MaxSessions unit and backlog slot. The
+// session is recorded for Runtime.Close first (noteEnded), so that Close's
+// snapshot finds it in the table or in its draining list.
 func (r lnRegistry) Ended(s *session.Session, v session.Verdict) {
 	rt := r.ln.rt
+	rt.noteEnded(s)
 	rt.table.ended(passiveKeyOf(s), s, v, time.Now())
 	r.ln.leavePending(s)
-	rt.noteEnded(s)
 }

@@ -24,14 +24,16 @@ import (
 // so the unbuffered pipe never blocks both ends.
 
 // wpTestRuntime builds a Runtime for a test from cfg and ov (nil: none),
-// failing the test on error. Inside a synctest bubble the caller closes it
-// before the bubble ends.
+// failing the test on error. The test closes it; a cleanup closes it again
+// (Close is idempotent), so that a failed test still ends its bubble
+// without goroutines left behind.
 func wpTestRuntime(t testing.TB, cfg Config, ov *testhooks.Overrides) *Runtime {
 	t.Helper()
 	rt, err := newRuntime(cfg, ov)
 	if err != nil {
 		t.Fatalf("newRuntime: %v", err)
 	}
+	t.Cleanup(func() { rt.Close() })
 	return rt
 }
 
@@ -259,6 +261,30 @@ func wpJoin(sid [16]byte, mode uint8, rxNext uint64) []byte {
 	b := make([]byte, wire.JoinLen)
 	wire.PutJoin(b, &wire.Join{SID: sid, Mode: mode, RxNext: rxNext})
 	return b
+}
+
+// wpRst encodes an RST payload.
+func wpRst(code uint32, msg string) []byte {
+	b := make([]byte, wire.RstFixedLen+len(msg))
+	wire.PutRst(b, &wire.Rst{Code: code, Msg: []byte(msg)})
+	return b
+}
+
+// drain reads frames until the passive ends the carrier and returns their
+// types. The passive closes in the L05 order — its CLOSE, then it reads
+// until our EOF — so drain closes our end once it read that CLOSE.
+func (d *wpDialer) drain() []wire.Type {
+	var seen []wire.Type
+	for {
+		f, err := d.recv()
+		if err != nil {
+			return seen
+		}
+		seen = append(seen, f.Type)
+		if f.Type == wire.TypeClose {
+			d.close()
+		}
+	}
 }
 
 // wpPing encodes a PING (or PONG) payload.

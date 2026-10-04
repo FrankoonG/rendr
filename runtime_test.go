@@ -184,8 +184,8 @@ func TestRuntimeEnvWiring(t *testing.T) {
 			t.Fatalf("%s session env not wired", env.name)
 		}
 	}
-	if _, ok := p.env.Registry.(peerRegistry); !ok {
-		t.Fatalf("peer registry %T", p.env.Registry)
+	if p.env.Registry != nil {
+		t.Fatalf("the Peer's Env template has Registry %T; every Dial sets its own", p.env.Registry)
 	}
 	if r, ok := ln.env.Registry.(lnRegistry); !ok || r.ln != ln {
 		t.Fatalf("listener registry %T", ln.env.Registry)

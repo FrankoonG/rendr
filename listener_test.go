@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // fakeListener is a scripted net.Listener source (L50). Accept returns a
@@ -241,6 +242,101 @@ func TestAcceptCloseRace_L50(t *testing.T) {
 			rt.Close()
 		})
 	}
+
+	// With three pending sessions queued (scripted OPENs): the ownership of
+	// each is either still in the queue or with the application (L50).
+	// Every Accept returns exactly one of a PendingConn or an error; a
+	// session the application took is confirmed (its dialer gets
+	// OPEN_ACK(OK)) unless Close refused it first (Confirm: net.ErrClosed,
+	// dialer GOING_AWAY); a session still queued is refused GOING_AWAY.
+	// Each dialer gets exactly one answer, OK only for a confirmed session,
+	// and no slot or unit survives the Runtime. Both outcomes occur.
+	var oks, refusals int
+	for i := range 100 {
+		synctest.Test(t, func(t *testing.T) {
+			rt := wpTestRuntime(t, Config{}, nil)
+			ln := wpListen(t, rt, ListenConfig{})
+			const sessions = 3
+			answers := make(chan wire.AckStatus, sessions)
+			var dialers sync.WaitGroup
+			for k := range sessions {
+				d := wpConnect(t, ln, wpInst(0x50), uint32(k+1))
+				d.hello(rt)
+				d.send(wire.TypeOpen, 0, wpOpen(wpSID(100*i+k), wire.KindStream, 1, nil))
+				dialers.Go(func() {
+					f := d.expect(wire.TypeOpenAck)
+					a, err := wire.ParseOpenAck(f.Payload)
+					if err != nil {
+						t.Errorf("OPEN_ACK: %v", err)
+					}
+					answers <- a.Status
+					d.drain()
+				})
+			}
+			synctest.Wait()
+			var mu sync.Mutex
+			var confirmed []*Conn
+			var accepters sync.WaitGroup
+			for range 4 {
+				accepters.Go(func() {
+					for {
+						pc, err := ln.Accept(context.Background())
+						if (pc == nil) == (err == nil) {
+							t.Error("Accept returned both or neither")
+							return
+						}
+						if err != nil {
+							if !errors.Is(err, net.ErrClosed) {
+								t.Errorf("Accept: %v", err)
+							}
+							return
+						}
+						c, err := pc.Confirm()
+						switch {
+						case err == nil:
+							mu.Lock()
+							confirmed = append(confirmed, c)
+							mu.Unlock()
+						case !errors.Is(err, net.ErrClosed):
+							t.Errorf("Confirm: %v", err)
+						}
+					}
+				})
+			}
+			if i%2 == 1 {
+				synctest.Wait() // the Accepts run first
+			}
+			ln.Close()
+			accepters.Wait()
+			dialersDone := make(chan struct{})
+			go func() {
+				dialers.Wait()
+				close(dialersDone)
+			}()
+			ok := 0
+			for range sessions {
+				switch st := <-answers; st {
+				case wire.StatusOK:
+					ok++
+					oks++
+				case wire.StatusGoingAway:
+					refusals++
+				default:
+					t.Fatalf("run %d: a pending session was answered %d", i, st)
+				}
+			}
+			if ok != len(confirmed) {
+				t.Fatalf("run %d: %d dialers got OK, %d sessions confirmed", i, ok, len(confirmed))
+			}
+			rt.Close()
+			<-dialersDone
+			wpNoState(t, rt)
+		})
+	}
+	if oks == 0 || refusals == 0 {
+		t.Fatalf("over 100 runs: %d sessions confirmed, %d refused; want both outcomes", oks, refusals)
+	}
+	t.Logf("over 100 runs: %d sessions confirmed, %d refused", oks, refusals)
 }
 
 // TestBlockedSourceAbandoned_L50: a source whose Accept ignores Close
@@ -373,5 +469,177 @@ func TestListenerSourceFailureIsolated_L50(t *testing.T) {
 		ln.Close()
 		rt.Close()
 		wpNoState(t, rt)
+	})
+}
+
+// TestListenerCloseKeepsAccepted_L50: closing a Listener never touches a
+// session it already handed to the application (L50). A confirmed session
+// keeps carrying data both ways after Listener.Close, while Accept returns
+// net.ErrClosed; when its carrier is then killed, the dialer's JOIN arrives
+// through another Listener of the same Runtime and is routed to the
+// session by the Runtime's table (a carrier may arrive on any source):
+// the session fails over (one death migration on both ends) and every byte
+// arrives intact.
+func TestListenerCloseKeepsAccepted_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := wpTestRuntime(t, Config{}, nil)
+		p := wpTestRuntime(t, Config{}, nil)
+		ln1, ln2 := wpListen(t, p, ListenConfig{}), wpListen(t, p, ListenConfig{})
+		var route atomic.Pointer[Listener]
+		route.Store(ln1)
+		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: func(c net.Conn) error { return route.Load().Handle(c) }})
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc, sc := e2eOpen(t, peer, ln1, DialOptions{})
+		e2eExchange(t, dc, sc, 512<<10, 1)
+
+		start := time.Now()
+		if err := ln1.Close(); err != nil || time.Since(start) != 0 {
+			t.Fatalf("Listener.Close = %v after %v", err, time.Since(start))
+		}
+		if pc, err := ln1.Accept(context.Background()); pc != nil || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept after Close: %v, %v", pc, err)
+		}
+		e2eExchange(t, dc, sc, 512<<10, 2)
+
+		route.Store(ln2)
+		if n := link.Kill(); n != 1 {
+			t.Fatalf("killed %d carriers", n)
+		}
+		e2eExchange(t, dc, sc, 2<<20, 3)
+		for _, c := range []*Conn{dc, sc} {
+			st := c.Status()
+			if st.Migrations.Death != 1 || st.State != StateOpen || len(liveCarriers(st)) != 1 {
+				t.Fatalf("%v after the failover: %+v", st.Role, st)
+			}
+		}
+		if n := link.Stats().Dials; n != 2 {
+			t.Fatalf("%d carrier dials, want the first and the JOIN", n)
+		}
+		e2eFinish(t, dc, sc)
+		d.Close()
+		p.Close()
+		link.Close()
+		wpNoState(t, d)
+		wpNoState(t, p)
+	})
+}
+
+// liveCarriers returns the carriers of st that are not dead.
+func liveCarriers(st SessionStatus) []CarrierStatus {
+	var out []CarrierStatus
+	for _, c := range st.Carriers {
+		if c.State != CarrierDead {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestListenerClosePendingGoingAway_L50: Listener.Close answers every
+// session that is still pending OPEN_ACK(GOING_AWAY) at once — one the
+// application accepted but did not decide and one still queued — and
+// returns within 100 ms (L50). The dialers' Dials return ErrCapacity, the
+// dialer's Peer records the instance as gone away (D21), Confirm of the
+// accepted PendingConn and Accept return net.ErrClosed, and the passive
+// keeps two GOING_AWAY tombstones and no pending slot.
+func TestListenerClosePendingGoingAway_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
+		peer := e.peer()
+		r1 := e2eDialAsync(context.Background(), peer, DialOptions{})
+		pc, err := e.ln.Accept(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2 := e2eDialAsync(context.Background(), peer, DialOptions{Mode: ModeBond})
+		synctest.Wait()
+		if st := e.p.Status(); st.Sessions.Pending != 2 || st.AcceptBacklog[0] != 2 {
+			t.Fatalf("before Close: %+v", st)
+		}
+		start := time.Now()
+		if err := e.ln.Close(); err != nil || time.Since(start) > 100*time.Millisecond {
+			t.Fatalf("Listener.Close = %v after %v", err, time.Since(start))
+		}
+		for i, res := range []<-chan dialResult{r1, r2} {
+			if r := <-res; r.c != nil || !errors.Is(r.err, ErrCapacity) {
+				t.Fatalf("Dial %d of a pending session at Listener.Close: %v, %v", i+1, r.c, r.err)
+			}
+		}
+		if !peer.goneAway(e.p.InstanceID()) {
+			t.Fatal("the Peer did not record the instance that answered GOING_AWAY")
+		}
+		if c, err := pc.Confirm(); c != nil || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Confirm after Listener.Close: %v, %v", c, err)
+		}
+		if pc2, err := e.ln.Accept(context.Background()); pc2 != nil || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept after Listener.Close: %v, %v", pc2, err)
+		}
+		synctest.Wait()
+		if st := e.p.Status(); st.Sessions != (SessionCounts{Tombstones: 2}) || st.AcceptBacklog[0] != 0 {
+			t.Fatalf("after Close: %+v", st)
+		}
+		e.close()
+	})
+}
+
+// TestCarriersFromTwoSources_L50: carriers of one session may arrive
+// through different sources of a Listener (L50: sessions are found by the
+// Runtime, not by the source): a bond session over two factories whose
+// carriers reach the passive through two FromListener sources holds both
+// carriers in the one session on both ends, both carry data, and 8 MiB
+// cross each way intact.
+func TestCarriersFromTwoSources_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := wpTestRuntime(t, Config{}, nil)
+		p := wpTestRuntime(t, Config{}, nil)
+		srcA, srcB := newFakeListener(), newFakeListener()
+		ln := wpListen(t, p, ListenConfig{Sources: []Source{FromListener(srcA), FromListener(srcB)}})
+		push := func(src *fakeListener) func(net.Conn) error {
+			return func(c net.Conn) error {
+				src.conns <- c
+				return nil
+			}
+		}
+		la := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: push(srcA)})
+		lb := rendrtest.NewLink(rendrtest.LinkConfig{Name: "b", Accept: push(srcB)})
+		for _, l := range []*rendrtest.Link{la, lb} {
+			l.SetDelay(time.Millisecond, 0)
+		}
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(la), e2eCarrier(lb)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc, sc := e2eOpen(t, peer, ln, DialOptions{Mode: ModeBond})
+		time.Sleep(100 * time.Millisecond) // the second member joins
+		e2eExchange(t, dc, sc, 8<<20, 5)
+		for _, c := range []*Conn{dc, sc} {
+			st := c.Status()
+			live := liveCarriers(st)
+			if len(live) != 2 {
+				t.Fatalf("%v holds %d live carriers, want 2: %+v", st.Role, len(live), st.Carriers)
+			}
+			for _, cs := range live {
+				if cs.TxBytes == 0 || cs.State != CarrierMember {
+					t.Fatalf("%v carrier %d: %+v", st.Role, cs.ID, cs)
+				}
+			}
+		}
+		if la.Stats().Session.Bytes == 0 || lb.Stats().Session.Bytes == 0 || srcA.accepts.Load() < 2 || srcB.accepts.Load() < 2 {
+			t.Fatalf("sources: A accepted %d (%d session bytes), B %d (%d)", srcA.accepts.Load(), la.Stats().Session.Bytes,
+				srcB.accepts.Load(), lb.Stats().Session.Bytes)
+		}
+		e2eFinish(t, dc, sc)
+		d.Close()
+		p.Close()
+		la.Close()
+		lb.Close()
+		wpNoState(t, d)
+		wpNoState(t, p)
+		if srcA.closes.Load() != 1 || srcB.closes.Load() != 1 {
+			t.Fatalf("sources closed %d and %d times", srcA.closes.Load(), srcB.closes.Load())
+		}
 	})
 }

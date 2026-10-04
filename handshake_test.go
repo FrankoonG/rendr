@@ -1,6 +1,7 @@
 package rendr
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestSilentHandshakesReleased_L48: the handshake deadline (accept time +
@@ -136,11 +138,42 @@ func TestLegitAdmittedUnderSlowloris_L48(t *testing.T) {
 		if st := rt.Status(); st.HandshakeEvictions != silent-slots+1 || st.Handshakes != slots-1 || st.Sessionless != 1 {
 			t.Fatalf("after the legit carriers: %+v", st)
 		}
+
+		// A legitimate OPEN of a real dialer Runtime reaches the application:
+		// Accept returns it within 100 ms, and the session carries data.
+		dl := wpTestRuntime(t, Config{}, nil)
+		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "legit", Accept: ln.Handle})
+		peer, err := dl.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t0 = time.Now()
+		res := e2eDialAsync(context.Background(), peer, DialOptions{})
+		pc, err := ln.Accept(context.Background())
+		if err != nil || time.Since(t0) > 100*time.Millisecond {
+			t.Fatalf("legit OPEN accepted after %v: %v", time.Since(t0), err)
+		}
+		sc, err := pc.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-res
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		e2eExchange(t, r.c, sc, 64<<10, 48)
+		synctest.Wait()
+		if st := rt.Status(); st.HandshakeEvictions != silent-slots+1 || st.Handshakes != slots-1 || st.Sessions.Open != 1 {
+			t.Fatalf("after the legit OPEN: %+v", st)
+		}
 		p.close()
 		j.close()
+		dl.Close()
 		rt.Close()
+		link.Close()
 		wg.Wait()
 		wpNoState(t, rt)
+		wpNoState(t, dl)
 		if st := rt.Status(); st.Abandoned != 0 {
 			t.Fatalf("abandoned %d", st.Abandoned)
 		}

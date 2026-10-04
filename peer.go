@@ -64,12 +64,11 @@ type Peer struct {
 	factories []carrier.Factory // the snapshot every session dials with (L20); never modified
 	names     []string          // factory names in configuration order (PeerStatus)
 	health    *carrier.Health   // nil for a single factory (no probing, design §7.8)
-	env       session.Env       // the Env of this Peer's sessions (Registry: peerRegistry)
+	env       session.Env       // the Env template of this Peer's sessions; each Dial adds its own Registry (dialReg)
 
 	mu     sync.Mutex // a leaf (design §3.2)
 	closed bool
-	gone   [][16]byte           // instances that sent GOAWAY or answered GOING_AWAY, oldest first (LRU, D21)
-	holds  map[SessionID]func() // Health holds of this Peer's sessions (released at their end)
+	gone   [][16]byte // instances that sent GOAWAY or answered GOING_AWAY, oldest first (LRU, D21)
 }
 
 // goneAwayLimit bounds a Peer's gone-away instance set (D21).
@@ -86,7 +85,6 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 		rt:        rt,
 		factories: make([]carrier.Factory, n),
 		names:     make([]string, n),
-		holds:     make(map[SessionID]func()),
 	}
 	seen := make(map[string]struct{}, n)
 	for i, c := range cfg.Carriers {
@@ -115,11 +113,10 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 		p.names[i] = sc.Name
 	}
 	p.env = session.Env{
-		Carrier:  &rt.cenv,
-		Events:   rt.ev, // a nil *eventQueue discards every event
-		Registry: peerRegistry{p},
-		Rand:     rt.eff.rand,
-		Hooks:    rt.eff.hooks,
+		Carrier: &rt.cenv,
+		Events:  rt.ev, // a nil *eventQueue discards every event
+		Rand:    rt.eff.rand,
+		Hooks:   rt.eff.hooks,
 	}
 	if n >= 2 {
 		p.health = carrier.NewHealth(&rt.cenv, p.factories, rt.eff.health)
@@ -193,64 +190,6 @@ func (p *Peer) noteGoAway(inst [16]byte) {
 		p.gone = p.gone[:len(p.gone)-1]
 	}
 	p.gone = append(p.gone, inst)
-}
-
-// hold keeps the Peer's probing alive for session sid (design §7.8: a Peer
-// is in use while it has a live session). It is taken before the session
-// exists, so the session's end always finds it, and released by unhold at a
-// Dial failure or at the session's end, whichever comes first.
-func (p *Peer) hold(sid SessionID) {
-	if p.health == nil {
-		return
-	}
-	release := p.health.Hold()
-	p.mu.Lock()
-	p.holds[sid] = release
-	p.mu.Unlock()
-}
-
-// unhold releases the hold of session sid (idempotent).
-func (p *Peer) unhold(sid SessionID) {
-	if p.health == nil {
-		return
-	}
-	p.mu.Lock()
-	release := p.holds[sid]
-	delete(p.holds, sid)
-	p.mu.Unlock()
-	if release != nil {
-		release()
-	}
-}
-
-// peerRegistry is the session.Registry of a Peer's (dialer) sessions: it
-// keeps their table entries (MaxSessions units, the Lingering count) and
-// releases the Peer's health hold at their end.
-type peerRegistry struct{ p *Peer }
-
-var _ session.Registry = peerRegistry{}
-
-// Opened is a passive-side transition: a dialer session is attached by
-// Peer.Dial when Dial returns.
-func (peerRegistry) Opened(*session.Session) {}
-
-// Lingering moves the session into (or out of) the Lingering count.
-func (r peerRegistry) Lingering(s *session.Session, on bool) {
-	r.p.rt.table.setLingering(dialerKey(SessionID(s.ID())), s, on)
-}
-
-// Orphaned counts only passive sessions (SessionCounts.Orphaned).
-func (peerRegistry) Orphaned(*session.Session, bool) {}
-
-// Ended removes the dialer entry (releasing its MaxSessions unit unless
-// Peer.Dial's failure path already did), releases the Peer's health hold
-// and remembers the session until its Done closes, for Runtime.Close.
-func (r peerRegistry) Ended(s *session.Session, _ session.Verdict) {
-	sid := SessionID(s.ID())
-	rt := r.p.rt
-	rt.table.ended(dialerKey(sid), s, session.Verdict{}, time.Now())
-	r.p.unhold(sid)
-	rt.noteEnded(s)
 }
 
 // PeerStatus is the health layer's view of a Peer.

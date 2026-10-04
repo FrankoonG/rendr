@@ -22,16 +22,44 @@ import (
 
 // startHandshake runs the handshake of nc, accepted at at, on its own
 // goroutine; the caller already counted it in rt.hsg. It never blocks on
-// nc: an evicted handshake's conn is closed on a guarded goroutine.
+// nc: an evicted handshake's conn is closed on a goroutine of its own.
 func (rt *Runtime) startHandshake(ln *Listener, nc net.Conn, at time.Time) {
 	if _, owned := nc.(*carrier.OwnedTCP); !owned {
 		nc = &onceConn{Conn: nc}
 	}
 	slot, evicted := rt.hs.admit(nc)
 	if evicted != nil {
-		carrier.CloseConn(&rt.cenv, evicted) // SetDeadline(now) + Close: its ReadHello fails at once
+		rt.closeHandshakeConn(evicted) // SetDeadline(now) + Close: its ReadHello fails at once
 	}
 	go rt.handshake(ln, slot, nc, at)
+}
+
+// closeHandshakeConn closes the conn of an unfinished handshake (eviction,
+// Runtime.Close's drain) on a goroutine of the handshake group: the
+// handshake goroutine's own read then fails at once, and Runtime.Close's
+// bounded join covers the closer like the handshake itself, so a Close the
+// embedder never returns from is counted in Status.Abandoned before
+// Runtime.Close returns (L52), exactly as a handshake stuck in a Read.
+func (rt *Runtime) closeHandshakeConn(nc net.Conn) {
+	rt.hsg.add()
+	go func() {
+		defer rt.hsg.done(rt.abandon)
+		closeNow(nc)
+	}()
+}
+
+// closeNow unblocks and closes an embedder conn: SetDeadline(now), then
+// Close. A panic in either call is contained, and Close runs even when
+// SetDeadline calls runtime.Goexit (L51).
+func closeNow(nc net.Conn) {
+	defer func() {
+		defer func() { _ = recover() }()
+		_ = nc.Close()
+	}()
+	func() {
+		defer func() { _ = recover() }()
+		_ = nc.SetDeadline(time.Now())
+	}()
 }
 
 // handshake is one handshake goroutine. Every path closes nc exactly once:

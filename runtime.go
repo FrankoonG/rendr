@@ -53,7 +53,7 @@ type Runtime struct {
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
 const (
-	closeSlack   = 250 * time.Millisecond // beyond the sessions' own bound (Kill bound + AbandonWait)
+	closeSlack   = 250 * time.Millisecond // beyond the sessions' and probe runs' own bound
 	minPruneAt   = 64                     // draining list prune threshold floor
 	maxFactories = wire.MaxSchedIDs       // carriers per Peer (MaxCarriersPerSession ≤ 16)
 )
@@ -212,9 +212,15 @@ func (rt *Runtime) Close() error {
 
 	t0 := time.Now()
 	wait := rt.eff.timing.AbandonWait
-	killAt := t0.Add(min(time.Second, rt.eff.cfg.DeadMax))
-	bound := killAt.Add(wait + closeSlack) // the sessions' own close bound (§4.7) plus slack
-	joinBy := t0.Add(wait)                 // handshakes, accept loops, in-flight Dials
+	kill := min(time.Second, rt.eff.cfg.DeadMax)
+	killAt := t0.Add(kill)
+	// The own bound of a session after Shutdown and of a Peer's probe run
+	// after Health.Close (design §4.7, §0.9 X2): lanes whose CLOSE is
+	// unwritten are killed at the Kill bound and their stuck parts
+	// abandoned AbandonWait later; dial attempts still running are
+	// abandoned 2·AbandonWait after their cancellation.
+	bound := t0.Add(max(kill+wait, 2*wait) + closeSlack)
+	joinBy := t0.Add(wait) // handshakes, accept loops, in-flight Dials
 
 	// Step 2: every Listener (sources closed once, pending → GOING_AWAY).
 	var refuse []*session.Session
@@ -237,19 +243,24 @@ func (rt *Runtime) Close() error {
 			p.shutdown()
 		}()
 	}
-	// Step 5: sessionless carriers; unfinished handshakes are closed.
+	// Step 5: sessionless carriers; unfinished handshakes are closed (their
+	// closers join the handshake group: a stuck embedder Close is counted
+	// by the join below, before Close returns).
 	for _, c := range sl {
 		c.GoAway()
 	}
 	for _, nc := range rt.hs.drain() {
-		carrier.CloseConn(&rt.cenv, nc)
+		rt.closeHandshakeConn(nc)
 	}
 
 	// Step 7 (W14: before the event queue). After the handshakes, accept
 	// loops and in-flight Dials no session can appear any more; one that
 	// a racing handshake or Dial created after the snapshot of step 3 saw
 	// closing and shut it down itself (admitOpen, Peer.Dial), so the second
-	// snapshot (live or ended) is only joined.
+	// snapshot (live or ended) is only joined. A failed Dial's session
+	// withdrawing in the background is in it too: its Dial stays a member
+	// of rt.dial until the session's Registry.Ended (dialReg), and Ended
+	// records the session for this snapshot before it leaves the table.
 	for _, ln := range lns {
 		ln.loops.wait(joinBy, rt.abandon)
 	}
@@ -322,7 +333,9 @@ func (rt *Runtime) gate(*wire.Preface) wire.PrefaceStatus {
 // noteEnded records an ended session until its Done closes, so that Close
 // joins it even when it no longer has a table entry (a passive tombstone
 // keeps no session; a dialer entry is removed; a failed Dial never had
-// one). Sessions whose Done closed are pruned when the list doubled.
+// one). The Registries call it before they remove the table entry, so a
+// session is always in the table or in this list (or both) for Close's
+// snapshot. Sessions whose Done closed are pruned when the list doubled.
 func (rt *Runtime) noteEnded(s *session.Session) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()

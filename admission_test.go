@@ -2,7 +2,10 @@ package rendr
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -334,6 +337,121 @@ func TestTombstoneRejectsReplay_L47(t *testing.T) {
 		synctest.Wait()
 		wpNoState(t, rt)
 		rt.Close()
+	})
+
+	// The tombstones of real sessions, each ended by its own verdict path:
+	// Reject, AcceptTimeout, Listener.Close (GOING_AWAY), an opened session
+	// reset by its dialer, and a pending session the dialer withdrew. The
+	// replays arrive through another Listener of the same Runtime (the
+	// table is the Runtime's, L50).
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{})
+		timed := wpListen(t, rt, ListenConfig{AcceptTimeout: 200 * time.Millisecond})
+		closing := wpListen(t, rt, ListenConfig{})
+		inst := wpInst(0xe4)
+		id := uint32(1)
+		open := func(l *Listener, sid [16]byte) *wpDialer {
+			d := wpConnect(t, l, inst, id)
+			id++
+			d.hello(rt)
+			d.send(wire.TypeOpen, 0, wpOpen(sid, wire.KindStream, 1, nil))
+			return d
+		}
+		accept := func(l *Listener) *PendingConn {
+			pc, err := l.Accept(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return pc
+		}
+		var wg sync.WaitGroup
+		finish := func(d *wpDialer, f func()) {
+			wg.Go(func() {
+				f()
+				d.drain()
+			})
+		}
+
+		rej := open(ln, wpSID(1))
+		finish(rej, func() { rej.expectOpenAck(wire.StatusRejected, 7) })
+		if err := accept(ln).Reject(7, "no route"); err != nil {
+			t.Fatal(err)
+		}
+
+		late := open(timed, wpSID(2))
+		finish(late, func() { late.expectOpenAck(wire.StatusCapacity, wire.CodeAcceptTimeout) })
+
+		away := open(closing, wpSID(3))
+		finish(away, func() { away.expectOpenAck(wire.StatusGoingAway, 0) })
+		synctest.Wait()
+		closing.Close()
+
+		reset := open(ln, wpSID(4))
+		pc := accept(ln)
+		finish(reset, func() {
+			reset.expectOpenAck(wire.StatusOK, 0)
+			reset.send(wire.TypeRst, 0, wpRst(uint32(AbortClosed), "bye"))
+		})
+		sc, err := pc.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		gone := open(ln, wpSID(5))
+		pc = accept(ln)
+		gone.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+		finish(gone, func() {})
+		synctest.Wait()
+		if _, err := pc.Confirm(); !errors.Is(err, ErrSessionLost) {
+			t.Fatalf("Confirm of a withdrawn session: %v", err)
+		}
+		time.Sleep(time.Second) // past the AcceptTimeout of sid 2
+		wg.Wait()
+		synctest.Wait()
+		var ae *AbortError
+		if _, err := sc.Read(make([]byte, 1)); !errors.As(err, &ae) || ae.Code != AbortClosed || !ae.Remote {
+			t.Fatalf("the reset session's Read: %v", err)
+		}
+		if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 5}) || st.AcceptBacklog[0] != 0 || rt.table.inUse() != 0 {
+			t.Fatalf("after the verdicts: %+v (units %d)", st, rt.table.inUse())
+		}
+
+		replays := []struct {
+			sid  int
+			st   wire.AckStatus
+			code uint32
+			msg  string
+		}{
+			{1, wire.StatusRejected, 7, "no route"},
+			{2, wire.StatusCapacity, wire.CodeAcceptTimeout, ""},
+			{3, wire.StatusGoingAway, 0, ""},
+			{4, wire.StatusUnknownSession, 0, ""},
+			{5, wire.StatusUnknownSession, 0, ""},
+		}
+		for _, r := range replays {
+			for range 2 {
+				d := open(timed, wpSID(r.sid))
+				if a := d.expectOpenAck(r.st, r.code); string(a.Msg) != r.msg {
+					t.Fatalf("sid %d: message %q, want %q", r.sid, a.Msg, r.msg)
+				}
+				d.expectEOF()
+				d.close()
+			}
+			j := wpConnect(t, ln, inst, id)
+			id++
+			j.hello(rt)
+			j.send(wire.TypeJoin, 0, wpJoin(wpSID(r.sid), 1, 0))
+			j.expectJoinAck(wire.StatusUnknownSession)
+			j.expectEOF()
+			j.close()
+		}
+		synctest.Wait()
+		if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 5}) || st.AcceptBacklog[0] != 0 || rt.table.inUse() != 0 {
+			t.Fatalf("the replays changed the state: %+v", st)
+		}
+		rt.Close()
+		wpNoState(t, rt)
 	})
 }
 

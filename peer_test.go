@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -87,12 +88,17 @@ func TestNewPeerValidation(t *testing.T) {
 	}
 }
 
-// TestFactorySnapshotFrozen_L20 (the Peer half; the end-to-end half with
-// live sessions follows the session actor): NewPeer deep-copies the
-// carrier list, so changing the caller's PeerConfig afterwards changes
-// neither the Peer nor the factory snapshot every Dial hands to its
-// session; the snapshot carries the configuration order as indexes and the
-// per-Dial Params (NoPathGrace override clamped to 3 s, backoff cap, retain).
+// TestFactorySnapshotFrozen_L20: a session dials only with the snapshot
+// taken at Dial (L20). NewPeer deep-copies the carrier list, so changing
+// the caller's PeerConfig afterwards changes neither the Peer nor the
+// factory snapshot every Dial hands to its session; the snapshot carries
+// the configuration order as indexes and the per-Dial Params (NoPathGrace
+// override clamped to 3 s, backoff cap, retain). End to end: after Dial
+// the caller replaces the factory of the same name in its PeerConfig; when
+// the session's carrier is killed, its redial still calls the original
+// factory (both ends count one death migration, every byte arrives), never
+// the replacement, which only a new Peer built from the changed config
+// uses.
 func TestFactorySnapshotFrozen_L20(t *testing.T) {
 	rt := wpTestRuntime(t, Config{}, nil)
 	defer rt.Close()
@@ -124,6 +130,41 @@ func TestFactorySnapshotFrozen_L20(t *testing.T) {
 	if ps := p.spec(SessionID(wpSID(2)), DialOptions{}).Params; ps.Mode != session.ModeSelector || ps.Grace != rt.eff.cfg.NoPathGrace {
 		t.Fatalf("default Dial params %+v", ps)
 	}
+
+	synctest.Test(t, func(t *testing.T) {
+		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "orig", "repl")
+		orig, repl := e.links[0], e.links[1]
+		cfg := PeerConfig{Carriers: []Carrier{StreamCarrier{Name: "a", Dial: orig.Dial}}}
+		peer, err := e.d.NewPeer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc, sc := e2eOpen(t, peer, e.ln, DialOptions{})
+		cfg.Carriers[0] = StreamCarrier{Name: "a", Dial: repl.Dial}
+		if n := orig.Kill(); n != 1 {
+			t.Fatalf("killed %d carriers", n)
+		}
+		e2eExchange(t, dc, sc, 1<<20, 20)
+		if o, r := orig.Stats().Dials, repl.Stats().Dials; o != 2 || r != 0 {
+			t.Fatalf("factory calls: original %d, replacement %d; want 2 and 0", o, r)
+		}
+		for _, c := range []*Conn{dc, sc} {
+			if st := c.Status(); st.Migrations.Death != 1 {
+				t.Fatalf("%v: %+v", st.Role, st.Migrations)
+			}
+		}
+		p2, err := e.d.NewPeer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc2, sc2 := e2eOpen(t, p2, e.ln, DialOptions{})
+		if n := repl.Stats().Dials; n != 1 {
+			t.Fatalf("the new Peer called the replacement %d times", n)
+		}
+		e2eFinish(t, dc, sc)
+		e2eFinish(t, dc2, sc2)
+		e.close()
+	})
 }
 
 // TestDialPrechecks: Peer.Dial refuses before any factory call, any
