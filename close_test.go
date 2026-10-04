@@ -573,9 +573,9 @@ func (c *malConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
 // lane's CLOSE is stuck behind a write that ignores deadlines and Close
 // (C24): the lane is killed at the close bound and its writer, stuck in
 // the embedder's Write, is the only goroutine left. Further cases: a dial
-// attempt stuck in a deaf conn's Read, and an admission refusal stuck in
-// the embedder's Write. When the embedder calls finally return, the pool
-// empties.
+// attempt stuck in a deaf conn's Read, an admission refusal stuck in the
+// embedder's Write, and a PREFACE_ACK refusal stuck in the embedder's Write.
+// When the embedder calls finally return, the pool empties.
 func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: 500 * time.Millisecond})
@@ -735,6 +735,69 @@ func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 			t.Fatalf("abandoned %d at Close's return, want the refusal stuck in the embedder's Write", n)
 		}
 		d.expectEOF()
+		sw.free()
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 || rt.Status().Abandoned != 0 || sw.closes.Load() != 1 {
+			t.Fatalf("after the Write returned: %v, abandoned %d, conn closed %d times", left, rt.Status().Abandoned, sw.closes.Load())
+		}
+		wpNoState(t, rt)
+	})
+
+	// A PREFACE_ACK refusal whose write ignores deadlines and Close (design
+	// §0.11 Z3 and note 2): another major's PREFACE is answered
+	// PREFACE_ACK(VERSION), written inline on the handshake goroutine and in
+	// its slot, and that write blocks in the embedder. Past the handshake
+	// deadline, the drain bound and AbandonWait the carrier's last resort
+	// closes the conn (once; the dialer sees EOF instead of an answer), which
+	// does not end the Write. Runtime.Close then gives the handshake the
+	// close bound and counts the goroutine stuck in the Write in
+	// Status.Abandoned before it returns, exactly once: by the handshake
+	// group's join, not by the carrier's last resort as well (that counted 2
+	// for 1). When the Write finally returns nothing is left and the conn was
+	// closed exactly once. The exact Close duration and the attribution of
+	// the count pin the current design: Z3's optional follow-up (counting a
+	// stuck ReadHello refusal before Runtime.Close, as goWatched does) would
+	// also end the goroutine's membership of the handshake group, so Close
+	// would no longer wait for it, and must update both.
+	synctest.Test(t, func(t *testing.T) {
+		const wait = 500 * time.Millisecond
+		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: wait})
+		ln := wpListen(t, rt, ListenConfig{})
+		a, b := net.Pipe()
+		sw := &stuckWriteConn{Conn: a, release: make(chan struct{})}
+		sw.writes.Store(1) // every Write blocks: the refusal is the conn's first
+		t.Cleanup(sw.free)
+		if err := ln.Handle(sw); err != nil {
+			t.Fatal(err)
+		}
+		d := &wpDialer{t: t, nc: b, inst: wpInst(0x66), id: 1, txFseq: wire.FirstFseq, rxFseq: wire.FirstFseq}
+		t.Cleanup(d.close)
+		p := wpPreface(d.inst, d.id)
+		p[4] = 3 // another major: PREFACE_ACK(VERSION)
+
+		// The write returns once the handshake read the PREFACE.
+		if _, err := d.nc.Write(wpRecrc(p)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n, st := sw.writes.Load(), rt.Status(); n != 2 || st.Handshakes != 1 {
+			t.Fatalf("stimulus: %d writes, %d handshake slots; want the refusal stuck in its write, in its slot", n-1, st.Handshakes)
+		}
+		time.Sleep(rt.eff.cfg.Handshake.Timeout + time.Second + wait) // past the refusal's last resort
+		synctest.Wait()
+		if n, st := sw.closes.Load(), rt.Status(); n != 1 || st.Handshakes != 1 {
+			t.Fatalf("stimulus: conn closed %d times by the last resort, %d handshake slots; want closed once, the Write still stuck in its slot", n, st.Handshakes)
+		}
+		d.expectEOF()
+		start := time.Now()
+		rt.Close()
+		kill := min(time.Second, rt.eff.cfg.DeadMax)
+		if el := time.Since(start); el != kill+wait {
+			t.Fatalf("Runtime.Close took %v, want the close bound %v plus AbandonWait %v", el, kill, wait)
+		}
+		if n := rt.Status().Abandoned; n != 1 {
+			t.Fatalf("abandoned %d at Close's return, want the refusal stuck in the embedder's Write counted once", n)
+		}
 		sw.free()
 		synctest.Wait()
 		if n, left := rendrGoroutines(); n != 0 || rt.Status().Abandoned != 0 || sw.closes.Load() != 1 {
