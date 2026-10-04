@@ -57,12 +57,14 @@ var (
 // on an OwnedTCP, a drain bounded by min(deadline, 1 s), Close) on the
 // calling handshake goroutine, in its slot, so that the dialer reads the
 // answer instead of a reset; on a conn that ignores its deadlines, towards
-// a dialer that neither reads nor closes, that goroutine is adopted by the
-// abandoned-call pool AbandonWait after both bounds and the conn is closed
-// then as the last resort (design §0.8 V2), which returns the refusal on a
-// conn that honours Close; PREFACE_ACK(OK) is written right after the
-// PREFACE is validated (P18); a PING first frame's pad is streamed (never
-// allocated by its length) and must be zero; when a conn call runs
+// a dialer that neither reads nor closes, the conn is closed AbandonWait
+// after both bounds as the last resort (design §0.8 V2), which returns the
+// refusal on a conn that honours Close; ReadHello never counts the calling
+// goroutine in the abandoned-call pool — the caller's owner joins it and
+// counts it once if it stays stuck (root's handshake group), as for a
+// handshake stuck in a Read (L52); PREFACE_ACK(OK) is written right after
+// the PREFACE is validated (P18); a PING first frame's pad is streamed
+// (never allocated by its length) and must be zero; when a conn call runs
 // runtime.Goexit on the caller's goroutine, nc is still closed exactly
 // once (L51; the caller's own deferred cleanup must release its handshake
 // slot).
@@ -233,7 +235,8 @@ func readHelloPing(nc net.Conn, hdr []byte, n int) (wire.Ping, error) {
 // refuse writes a non-OK PREFACE_ACK and closes k's conn in the L05 order
 // on the handshake goroutine, in its slot (writeAndCloseInline: the write
 // bounded by the handshake deadline, the drain by min(deadline, 1 s), the
-// last resort on a conn that ignores its deadlines, design §0.8 V2).
+// last resort on a conn that ignores its deadlines, design §0.8 V2; the
+// goroutine is counted by its owner, never here).
 func refuse(env *Env, k *closeOnce, deadline time.Time, status wire.PrefaceStatus, carrierID uint32) {
 	var ab [wire.PrefaceLen]byte
 	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: status, Instance: env.Local, CarrierID: carrierID})

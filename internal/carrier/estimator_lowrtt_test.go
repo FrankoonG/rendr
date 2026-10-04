@@ -129,20 +129,31 @@ func ltLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration
 
 // TestCapLimitedFlowReachesLinkRate_L32 (design §0.9 X4): a bulk transfer
 // that starts at the 128 KiB capacity floor, between two real carriers over
-// a 64 MiB/s link with a 0.5 ms or 1 ms one-way delay (an RTT of a few
-// milliseconds, below the 5 ms a backlog interval needs, with every PING a
-// cap-hit PING): the PINGs accumulate one backlog interval until it can be
-// judged, so the sender says BUSY, takes a rate sample and raises its
-// capacity above the floor, and the transfer reaches at least 90% of the
-// link rate, every byte intact and in order, with a rate estimate that
-// never exceeds the link rate (plus sampling slack). (With the interval
-// restarted at every PING commit the sender stayed at 128 KiB per RTT:
-// about 50% of this link at 1 ms and 65% at 0.5 ms.)
+// a 64 MiB/s link with a 0.5 ms or 1 ms one-way delay, or a 512 MiB/s link
+// with a 0.25 ms one — an RTT at the floor of about 3–4 ms, or under 1 ms on
+// the fast link: below the 5 ms a backlog interval needs, with every PING a
+// cap-hit PING — reaches at least 90% of the link rate, every byte intact
+// and in order, with a rate estimate that never exceeds the link rate (plus
+// sampling slack): the PINGs accumulate one backlog interval until it can
+// be judged, so the sender says BUSY, takes a rate sample and raises its
+// capacity above the floor. (With the interval restarted at every PING
+// commit the sender stayed at 128 KiB per RTT: about 50% of the 64 MiB/s
+// link at 1 ms and 65% at 0.5 ms. The fast link also needs the busy time of
+// the unjudged PING intervals: with only the last RTT's counted, it stays
+// under 25% of a 5 ms interval there, though not at 3–4 ms;
+// TestBusyJudgedBelowMinSampleRTT_L32 pins that accumulation directly.)
 func TestCapLimitedFlowReachesLinkRate_L32(t *testing.T) {
-	const rate = 64 << 20  // bytes/s per direction
-	const total = 32 << 20 // half a second at the link rate
-	for _, delay := range []time.Duration{500 * time.Microsecond, time.Millisecond} {
-		t.Run(delay.String(), func(t *testing.T) {
+	for _, tc := range []struct {
+		rate  float64       // bytes/s per direction
+		delay time.Duration // one way
+		total uint64        // bytes: half a second at 64 MiB/s, an eighth at 512 MiB/s
+	}{
+		{64 << 20, 500 * time.Microsecond, 32 << 20},
+		{64 << 20, time.Millisecond, 32 << 20},
+		{512 << 20, 250 * time.Microsecond, 64 << 20},
+	} {
+		rate, delay, total := tc.rate, tc.delay, tc.total
+		t.Run(fmt.Sprintf("%dMiBps/%v", int(rate)>>20, delay), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				envD, envP := phEnvs()
 				sink := newLtSink(total)
@@ -182,7 +193,7 @@ func TestCapLimitedFlowReachesLinkRate_L32(t *testing.T) {
 				took := doneAt.Sub(start)
 				got := float64(total) / took.Seconds()
 				t.Logf("%d MiB in %v: %.1f MiB/s of a %d MiB/s link; cap peaked at %d KiB, rate at %.1f MiB/s (peak %.1f), srtt %v, minRTT %v",
-					total>>20, took, got/(1<<20), rate>>20, maxCap>>10, st.Rate/(1<<20), maxRate/(1<<20), st.SRTT, st.MinRTT)
+					total>>20, took, got/(1<<20), int(rate)>>20, maxCap>>10, st.Rate/(1<<20), maxRate/(1<<20), st.SRTT, st.MinRTT)
 				if bad != "" || next != total {
 					t.Fatalf("data: %d bytes in order, violation %q", next, bad)
 				}
@@ -199,10 +210,10 @@ func TestCapLimitedFlowReachesLinkRate_L32(t *testing.T) {
 					t.Fatalf("the sender never judged its backlog: Backlogged seen %v, rate %.0f, cap peaked at %d (floor %d)", backlogged, st.Rate, maxCap, envD.Timing.CapFloor)
 				}
 				if maxRate > 1.2*rate {
-					t.Fatalf("the rate estimate peaked at %.1f MiB/s on a %d MiB/s link", maxRate/(1<<20), rate>>20)
+					t.Fatalf("the rate estimate peaked at %.1f MiB/s on a %d MiB/s link", maxRate/(1<<20), int(rate)>>20)
 				}
 				if got < 0.9*rate {
-					t.Fatalf("throughput %.1f MiB/s, want ≥ 90%% of the %d MiB/s link", got/(1<<20), rate>>20)
+					t.Fatalf("throughput %.1f MiB/s, want ≥ 90%% of the %d MiB/s link", got/(1<<20), int(rate)>>20)
 				}
 				dc.Kill(CauseLocalClose, "test end")
 				pc.Kill(CauseLocalClose, "test end")
