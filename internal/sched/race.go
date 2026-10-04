@@ -3,7 +3,7 @@ package sched
 import "time"
 
 // maxRaceOrder is the Peer factory limit: a race never has more candidates.
-const maxRaceOrder = 16
+const maxRaceOrder = maxFactories
 
 // Race is the staggered candidate race used by the dialer for the opening
 // phase of Dial and for selector death failover (plan §3.2): the first

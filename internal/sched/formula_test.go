@@ -47,6 +47,28 @@ func TestDeathDeadlineTable_L25(t *testing.T) {
 	if got := DeathDeadline(10*ms, 0, 0, 5*time.Second, 4*time.Second); got != 4*time.Second {
 		t.Errorf("inverted bounds: %v, want the upper bound", got)
 	}
+	// An upper bound of MaxInt64 (death detection disabled by an unclamped
+	// test timing) is returned as such: through float64 it would round up
+	// to 2⁶³ and wrap to a huge negative deadline that kills every carrier
+	// at once.
+	const forever = time.Duration(math.MaxInt64)
+	for _, tc := range []struct {
+		name      string
+		got, want time.Duration
+	}{
+		{"D: tiny rate, unbounded", DeathDeadline(time.Second, 1<<62, 1e-300, 0, forever), forever},
+		{"D: huge srtt, unbounded", DeathDeadline(forever/2, 0, 0, 0, forever), forever},
+		{"D: infinite estimate, unbounded", DeathDeadline(time.Second, 1, math.SmallestNonzeroFloat64, 0, forever), forever},
+		{"D: ordinary srtt, unbounded", DeathDeadline(time.Second, 0, 0, 0, forever), 3 * time.Second},
+		{"D: min and max MaxInt64", DeathDeadline(time.Second, 0, 0, forever, forever), forever},
+		{"D: huge srtt, ordinary bounds", DeathDeadline(forever/2, 0, 0, dmin, dmax), dmax},
+		{"stall: tiny rate, unbounded", StallWindow(time.Second, 1<<30, 1e-300, 0, forever), forever},
+		{"stall: ordinary srtt, unbounded", StallWindow(time.Second, 0, 0, 0, forever), 2 * time.Second},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
 	// Monotone in srtt and inflight, always within [DeadMin, DeadMax].
 	r := rand.New(rand.NewPCG(25, 25))
 	for i := 0; i < 10000; i++ {
@@ -112,6 +134,23 @@ func TestCapacityFormula(t *testing.T) {
 	if got := Capacity(0, 0, 50*ms, floor, 64<<10); got != 64<<10 {
 		t.Errorf("window below the floor: %d", got)
 	}
+	// A ceiling of MaxInt64 is returned as the integer, never through
+	// float64 (2⁶³ would wrap to MinInt64), and a huge minRTT does not
+	// overflow the Duration sum.
+	for _, tc := range []struct {
+		name      string
+		got, want int64
+	}{
+		{"infinite rate, unbounded", Capacity(math.Inf(1), 0, 0, 0, math.MaxInt64), math.MaxInt64},
+		{"enormous rate, unbounded", Capacity(1e30, 20*ms, 50*ms, floor, math.MaxInt64), math.MaxInt64},
+		{"large rate, unbounded", Capacity(1e18, 0, 0, floor, math.MaxInt64), 200_000_000_000_000_000},
+		{"huge minRTT", Capacity(0.5, math.MaxInt64, 50*ms, floor, math.MaxInt64), 9_223_372_036},
+		{"huge minRTT, ordinary bounds", Capacity(1e6, math.MaxInt64, 50*ms, floor, ceil), ceil},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s: Capacity = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
 }
 
 // TestRescueWait: max(300 ms, 3 × the fastest srtt) (plan §4).
@@ -176,7 +215,7 @@ func TestSRTTOrder(t *testing.T) {
 	if !slices.Equal(got, []int{5, 2, 0, 3, 1, 4}) {
 		t.Fatalf("SRTTOrder = %v", got)
 	}
-	if n := testing.AllocsPerRun(100, func() { SRTTOrder(srtt, buf) }); n != 0 {
+	if n := testing.AllocsPerRun(100, func() { SRTTOrder(srtt, buf) }); n != 0 && !raceEnabled {
 		t.Fatalf("SRTTOrder allocates %v times", n)
 	}
 	if got := SRTTOrder(nil, buf); len(got) != 0 {
@@ -257,20 +296,21 @@ func TestEpochAndPingIDWrap_L14(t *testing.T) {
 
 // TestPureCallsDoNotAllocate: the per-evaluation calls the actor and the
 // health layer make (Add/Summary/Classify/NextChange/Evaluate/Rank) allocate
-// nothing in steady state.
+// nothing in steady state (asserted in the non-race lane only).
 func TestPureCallsDoNotAllocate(t *testing.T) {
 	a := NewAggregator(DefaultAggParams())
 	at := simEpoch
 	sel := NewSelector(defaultSelectorParams())
-	sums := make([]Summary, 2)
-	cs := make([]Candidate, 2)
+	sums := make([]Summary, 3)
+	cs := make([]Candidate, 3)
 	out := make([]int, 0, 16)
-	failed := []bool{false, false}
+	failed := []bool{false, false, false}
 	n := testing.AllocsPerRun(200, func() {
 		at = at.Add(time.Second)
 		a.Add(at, 30*ms, false)
 		sums[0] = a.Summary()
 		sums[1] = sums[0]
+		sums[2] = Summary{Seen: true, N: 32, Mean: 10 * ms, At: at} // qualifies: dwell clocks run
 		_ = NextChange(sums[0], at, defFresh)
 		v := sel.Evaluate(at, 0, sums, failed)
 		_ = v
@@ -279,7 +319,7 @@ func TestPureCallsDoNotAllocate(t *testing.T) {
 		}
 		out = Rank(cs, out)
 	})
-	if n != 0 {
+	if n != 0 && !raceEnabled {
 		t.Fatalf("steady-state calls allocate %v times per run", n)
 	}
 }

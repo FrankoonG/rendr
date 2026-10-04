@@ -126,7 +126,7 @@ func TestRaceCopiesOrder(t *testing.T) {
 	if n := testing.AllocsPerRun(100, func() {
 		rr := NewRace(order, time.Second, simEpoch)
 		rr.Next(simEpoch, 0, all)
-	}); n != 0 {
+	}); n != 0 && !raceEnabled {
 		t.Fatalf("NewRace+Next allocate %v times", n)
 	}
 }

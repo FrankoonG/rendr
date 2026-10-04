@@ -27,16 +27,24 @@ func estimateNs(k float64, srtt time.Duration, bytes int64, rate float64) float6
 	return d
 }
 
-// clampNs clamps d to [min, max] and converts it; when min > max the upper
-// bound wins (it is the hard limit, e.g. DeadMax inside the G4 budget).
+// clampNs clamps d (nanoseconds, never NaN) to [min, max] and converts it;
+// when min > max the upper bound wins (it is the hard limit, e.g. DeadMax
+// inside the G4 budget). The bounds are returned as integers, never through
+// float64: float64(math.MaxInt64) rounds up to 2⁶³, which converts to a
+// negative Duration, so a "disabled" bound of MaxInt64 would otherwise turn
+// into a huge negative deadline.
 func clampNs(d float64, min, max time.Duration) time.Duration {
-	if d < float64(min) {
-		d = float64(min)
+	if d >= float64(max) { // also +Inf
+		return max
 	}
-	if d > float64(max) {
-		d = float64(max)
+	r := time.Duration(d) // d < float64(max) ≤ 2⁶³: in range
+	if r < min {
+		r = min
 	}
-	return time.Duration(d)
+	if r > max { // inverted bounds
+		r = max
+	}
+	return r
 }
 
 // DeathDeadline is how long the oldest committed PING may stay unanswered
@@ -67,17 +75,22 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 	}
 	c := 0.0
 	if rate > 0 { // also false for NaN
-		// Nanoseconds first, then one division: exact for every realistic
-		// rate, so table values do not drift by one byte.
-		c = 2 * rate * float64(minRTT+pingBusy+capSlack) / float64(time.Second)
+		// Nanoseconds first (summed in float64, so no Duration overflow),
+		// then one division: exact for every realistic rate, so table
+		// values do not drift by one byte.
+		c = 2 * rate * (float64(minRTT) + float64(pingBusy) + float64(capSlack)) / float64(time.Second)
 	}
-	if c < float64(floor) {
-		c = float64(floor)
+	if c >= float64(ceil) { // also +Inf; the integer bound, as in clampNs
+		return ceil
 	}
-	if c > float64(ceil) {
-		c = float64(ceil)
+	r := int64(c) // c < float64(ceil) ≤ 2⁶³: in range
+	if r < floor {
+		r = floor
 	}
-	return int64(c)
+	if r > ceil { // floor above the window
+		r = ceil
+	}
+	return r
 }
 
 // RescueWait is how long the bond window head may stay stuck before it is

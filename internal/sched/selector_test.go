@@ -130,9 +130,10 @@ func TestSelectorChallengerNeedsFresh_L28(t *testing.T) {
 
 // TestSelectorDwellCooldown_L29: 30% better switches only after Dwell of
 // continuous qualification, a second quality switch waits for Cooldown, a
-// lapse or a different challenger restarts the dwell, the first quality
-// switch needs no cooldown and death switches neither need nor start one
-// (D7).
+// lapse or a new incumbent restarts the dwell while a rank change among
+// qualifying challengers does not (every challenger has its own dwell), the
+// first quality switch needs no cooldown and death switches neither need
+// nor start one (D7).
 func TestSelectorDwellCooldown_L29(t *testing.T) {
 	p := defaultSelectorParams()
 	t0 := simEpoch
@@ -202,18 +203,21 @@ func TestSelectorDwellCooldown_L29(t *testing.T) {
 	}
 	sel.Switched(t1.Add(2600*ms+p.Dwell), true)
 
-	// A different best challenger restarts the dwell (three factories).
+	// Every challenger has its own dwell (three factories), so a rank change
+	// restarts nothing: C qualifies against B from t2; at t2+2s A becomes
+	// the best-ranked and starts its own dwell; at t2+Dwell C, the
+	// best-ranked factory whose dwell is complete, wins although A ranks
+	// better.
 	t2 := t1.Add(2600*ms + p.Dwell + p.Cooldown)
-	eval(t2, 1, 100*ms, 100*ms, 70*ms)                   // C qualifies against B
-	eval(t2.Add(2*time.Second), 1, 60*ms, 100*ms, 70*ms) // A is now the best: restart
-	if v := eval(t2.Add(p.Dwell), 1, 60*ms, 100*ms, 70*ms); v.Switch {
-		t.Fatal("dwell carried over to a different challenger")
+	eval(t2, 1, 100*ms, 100*ms, 70*ms) // C qualifies against B
+	if v := eval(t2.Add(2*time.Second), 1, 60*ms, 100*ms, 70*ms); v.Switch || !v.Wake.Equal(t2.Add(p.Dwell)) {
+		t.Fatalf("A overtakes C: %+v, want no switch and a wake at C's dwell end", v)
 	}
-	if v := eval(t2.Add(2*time.Second+p.Dwell), 1, 60*ms, 100*ms, 70*ms); !v.Switch || v.To != 0 {
-		t.Fatalf("new challenger after its own dwell: %+v, want a switch to 0", v)
+	if v := eval(t2.Add(p.Dwell), 1, 60*ms, 100*ms, 70*ms); !v.Switch || v.To != 2 {
+		t.Fatalf("rank change restarted C's dwell: %+v, want a switch to 2 at t2+Dwell", v)
 	}
-	sel.Switched(t2.Add(2*time.Second+p.Dwell), true)
-	q3 := t2.Add(2*time.Second + p.Dwell)
+	sel.Switched(t2.Add(p.Dwell), true)
+	q3 := t2.Add(p.Dwell)
 
 	// D7: a death switch inside the cooldown neither resets nor extends it:
 	// the next quality switch still waits for q3 + Cooldown, not for the
@@ -226,6 +230,37 @@ func TestSelectorDwellCooldown_L29(t *testing.T) {
 	}
 	if v := eval(q3.Add(p.Cooldown), 1, 100*ms, 100*ms, 60*ms); !v.Switch || v.To != 2 {
 		t.Fatalf("after the quality cooldown: %+v, want a switch to 2", v)
+	}
+
+	// Two equally good challengers whose rank swaps at every evaluation (the
+	// noise of two paths with the same RTT) cannot keep each other's dwell
+	// from completing: the switch away from a much worse incumbent comes
+	// exactly Dwell after both began to qualify, to the one ranked best then.
+	// (A dwell that restarted on every change of the best challenger would
+	// never complete here.)
+	selF := NewSelector(p)
+	f0 := simEpoch.Add(3 * time.Hour)
+	for k := 0; ; k++ {
+		now := f0.Add(time.Duration(k) * 500 * ms)
+		b, c := 30*ms, 31*ms
+		if k%2 == 1 {
+			b, c = c, b
+		}
+		v := selF.Evaluate(now, 0, []Summary{freshSum(now, 90*ms), freshSum(now, b), freshSum(now, c)}, nil)
+		if !v.Switch {
+			if !now.Before(f0.Add(p.Dwell)) {
+				t.Fatalf("rank flips: no switch at %v (Dwell %v after the start)", now.Sub(f0), p.Dwell)
+			}
+			continue
+		}
+		want := 1
+		if b > c {
+			want = 2
+		}
+		if !now.Equal(f0.Add(p.Dwell)) || v.To != want {
+			t.Fatalf("rank flips: switch to %d at +%v, want to %d at +%v", v.To, now.Sub(f0), want, p.Dwell)
+		}
+		break
 	}
 
 	// An incumbent change the selector was not told about (no Switched)
@@ -242,6 +277,24 @@ func TestSelectorDwellCooldown_L29(t *testing.T) {
 	}
 	if v := sel3.Evaluate(c0.Add(2*time.Second+p.Dwell), 1, three(c0.Add(2*time.Second+p.Dwell)), nil); !v.Switch || v.To != 2 {
 		t.Fatalf("dwell against the new incumbent: %+v", v)
+	}
+
+	// Switched restarts every dwell even when the active factory index is
+	// unchanged (the active lane was replaced by a new carrier of the same
+	// factory): the dwell then counts from Switched.
+	selS := NewSelector(p)
+	s0 := simEpoch.Add(5 * time.Hour)
+	two := func(now time.Time) []Summary { return []Summary{freshSum(now, 100*ms), freshSum(now, 70*ms)} }
+	selS.Evaluate(s0, 0, two(s0), nil)
+	selS.Switched(s0.Add(2*time.Second), false)
+	if v := selS.Evaluate(s0.Add(2*time.Second), 0, two(s0.Add(2*time.Second)), nil); v.Switch || !v.Wake.Equal(s0.Add(2*time.Second+p.Dwell)) {
+		t.Fatalf("after Switched with the same active: %+v, want the dwell restarted", v)
+	}
+	if v := selS.Evaluate(s0.Add(p.Dwell), 0, two(s0.Add(p.Dwell)), nil); v.Switch {
+		t.Fatal("dwell survived Switched")
+	}
+	if v := selS.Evaluate(s0.Add(2*time.Second+p.Dwell), 0, two(s0.Add(2*time.Second+p.Dwell)), nil); !v.Switch || v.To != 1 {
+		t.Fatalf("dwell from Switched: %+v, want a switch to 1", v)
 	}
 
 	// D7: death switches never start a cooldown: with only death switches

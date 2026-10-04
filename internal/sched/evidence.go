@@ -211,6 +211,13 @@ func (a *Aggregator) Reset() {
 // SigmaK·max(σ, SigmaFloor) (σ = standard deviation of the earlier samples),
 // the earlier samples are discarded and the window restarts from the newest
 // ShiftRun.
+//
+// Precondition (design §7.8, L28): at is this process's own clock reading
+// at PONG arrival (time.Now(), keeping its monotonic reading), never a time
+// taken from the peer or a wall-clock-only value. A sample stamped in the
+// future is then impossible by construction, which is why Add needs no now;
+// a future stamp would otherwise stay Fresh and make every later real
+// sample look older than the newest and be rejected.
 func (a *Aggregator) Add(at time.Time, rtt time.Duration, loaded bool) bool {
 	if a.p.Window <= 0 { // zero value, not built by NewAggregator
 		a.p = a.p.normalized()
