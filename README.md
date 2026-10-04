@@ -125,7 +125,7 @@ for {
 		break
 	}
 	conn, err := pc.Confirm()     // or pc.Reject(code, msg)
-	go serve(conn)                // *rendr.Conn is a net.Conn (plus CloseWrite, Status)
+	go serve(conn)                // *rendr.Conn is a net.Conn (plus CloseWrite, Done, Status)
 }
 
 // Dialer side: one Peer per destination instance, one factory per path.
@@ -148,13 +148,25 @@ Semantics in brief:
   `ErrCapacity`, `ErrVersion`, `ErrProtocol`, `ErrMetadataTooLarge`,
   `ErrIdleTimeout`. Deadlines behave as for any `net.Conn`.
 - `Close` returns at once; written data is still delivered in the background
-  within `Linger`. `CloseWrite` sends a FIN and keeps reading.
+  within `Linger`. `CloseWrite` sends a FIN and keeps reading. `Done` returns
+  a channel that is closed once the session has ended: `Status().State` is
+  then `StateEnded` and `Status().Err` final (`io.EOF` after a clean
+  finish).
 - `Runtime.Close` resets every session that has not ended, including closed
   ones still finishing in the background (they end with `net.ErrClosed`, the
-  peer's with `*AbortError`). For a clean end on both sides, call `Close`
-  once `Read` returned `io.EOF` and wait until `Status().State` is
-  `StateEnded` (`Err` is `io.EOF`) before `Runtime.Close`, as
-  [`examples/mtls`](examples/mtls) does.
+  peer's with `*AbortError`). For a clean end on both sides, read until
+  `io.EOF`, `Close`, wait for `Done` (bounded by your own context), and only
+  then call `Runtime.Close`, as [`examples/mtls`](examples/mtls) does:
+
+  ```go
+  _, err = io.Copy(dst, conn) // until the peer's FIN (Read returned io.EOF)
+  conn.Close()                // this side's FIN, unless CloseWrite sent it
+  select {
+  case <-conn.Done(): // ended; conn.Status().Err is io.EOF after a clean finish
+  case <-ctx.Done():
+  }
+  cli.Close() // the Runtime: resets every session that has not ended
+  ```
 - Selector mode keeps one active carrier, fails over on carrier death and
   switches for quality only on probe evidence, with hysteresis (band, dwell,
   cooldown). Bond mode sends on all carriers in proportion to their measured

@@ -197,6 +197,12 @@ func (rt *Runtime) Status() Status {
 // are counted in Status.Abandoned. Later calls on the Runtime and its objects
 // return net.ErrClosed.
 //
+// Sessions reset by Close end with net.ErrClosed, their peers' with
+// *AbortError (AbortGoingAway). For a clean end, let every session finish
+// first: Read until io.EOF, Conn.Close, wait until Conn.Done is closed
+// (bounded by your own context; Conn.Status().Err is then io.EOF), and only
+// then Close.
+//
 // A concurrent or later Close waits for the first one to finish, except
 // when it is called from Config.OnEvent (it then returns at once: the first
 // Close never waits for the callback that called it).

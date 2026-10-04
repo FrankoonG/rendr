@@ -47,10 +47,13 @@ func (c *Conn) Write(p []byte) (int, error) { return c.s.Write(p) }
 // Close returns at once. Buffered and further incoming data is discarded;
 // blocked calls return net.ErrClosed; the session delivers what was written
 // and finishes in the background within Linger, or resets the peer
-// (AbortClosed if the peer keeps sending, AbortLinger at expiry).
-// Runtime.Close resets a closed session that has not finished yet: for a
-// clean end, wait until Status().State is StateEnded (Err io.EOF) before
-// closing the Runtime.
+// (AbortClosed if the peer keeps sending, AbortLinger at expiry); Done is
+// closed once it has ended. Runtime.Close resets a closed session that has
+// not finished yet (it ends with net.ErrClosed, the peer's with
+// *AbortError). The clean end: Read until io.EOF (the peer's FIN arrived,
+// so Close discards nothing), Close (this side's FIN, unless CloseWrite sent
+// it), wait for Done bounded by your own context (Status().Err is then
+// io.EOF), and only then Runtime.Close.
 func (c *Conn) Close() error { return c.s.Close() }
 
 // CloseWrite sends one FIN after everything written so far (idempotent);
@@ -96,3 +99,21 @@ func (c *Conn) Metadata() []byte { return c.s.Metadata() }
 // together with every routing change, so the reported active carrier always
 // equals the routed one.
 func (c *Conn) Status() SessionStatus { return sessionStatusFrom(c.s.Status()) }
+
+// Done returns a channel that is closed once the session has fully ended:
+// Status().State is StateEnded with its final Err (io.EOF after a clean
+// finish; else the end error, such as ErrNoPath, *AbortError, or
+// net.ErrClosed when this side reset the session), Status().Carriers lists
+// only dead carriers, and every goroutine the session owns has exited (a
+// call stuck in embedder code is abandoned after its bound and counted in
+// the Runtime's Status.Abandoned). It is the same channel on every call,
+// closed exactly once, for dialer and passive Conns alike, and never before
+// that end. Status may report StateEnded slightly earlier: Done also waits
+// for the session's carriers to finish (within about 2 s).
+//
+// Done only observes the end. A session ends by itself once both FINs were
+// delivered and acknowledged, after Close within Linger, on a failure
+// (ErrNoPath, ErrSessionLost, *AbortError, ErrIdleTimeout), or when
+// Runtime.Close resets it. For a clean end, wait for Done before
+// Runtime.Close (see Close).
+func (c *Conn) Done() <-chan struct{} { return c.s.Done() }
