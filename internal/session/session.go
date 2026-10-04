@@ -6,12 +6,6 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 )
 
-// Session is one stream session: its stream state, its lanes and its actor.
-// All exported methods are safe for concurrent use.
-type Session struct {
-	_ struct{} // unexported state is defined by the implementation (design §3, §4, §7)
-}
-
 // ID returns the session ID.
 func (s *Session) ID() [16]byte {
 	panic("unimplemented: M1b")
