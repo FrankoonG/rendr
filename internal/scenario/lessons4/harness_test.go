@@ -1,6 +1,7 @@
 package lessons4
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -34,7 +35,12 @@ type worldOpts struct {
 	// the dialer's copy gets dHooks.
 	ov     testhooks.Overrides
 	dHooks *testhooks.Hooks
-	dcfg   rendr.Config
+	// pTune, if set, changes the passive's copy of ov: a per-side timing
+	// such as a death deadline, never a counter preset.
+	pTune func(*testhooks.Overrides)
+	// dcfg and pcfg are the dialer's and the passive's Config (OnEvent is
+	// the world's event log).
+	dcfg, pcfg rendr.Config
 	// tap wraps every passive carrier conn in a frame tap (world.taps).
 	tap bool
 }
@@ -57,10 +63,13 @@ func newWorld(t testing.TB, o worldOpts, names ...string) *world {
 	w := &world{t: t, dev: &eventLog{}, pev: &eventLog{}, taps: &tapSet{}}
 	dov, pov := o.ov, o.ov
 	dov.Hooks, pov.Hooks = o.dHooks, nil
-	dcfg := o.dcfg
-	dcfg.OnEvent = w.dev.add
+	if o.pTune != nil {
+		o.pTune(&pov)
+	}
+	dcfg, pcfg := o.dcfg, o.pcfg
+	dcfg.OnEvent, pcfg.OnEvent = w.dev.add, w.pev.add
 	w.d = newRuntime(t, dcfg, &dov)
-	w.p = newRuntime(t, rendr.Config{OnEvent: w.pev.add}, &pov)
+	w.p = newRuntime(t, pcfg, &pov)
 	t.Cleanup(w.shutdown)
 	ln, err := w.p.Listen(rendr.ListenConfig{})
 	if err != nil {
@@ -489,6 +498,18 @@ func (f *flow) firstReadAfter(t time.Time) (readMark, bool) {
 		}
 	}
 	return readMark{}, false
+}
+
+// reached returns the first read after which the reader had at least k
+// bytes.
+func (f *flow) reached(k int64) (readMark, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i, _ := slices.BinarySearchFunc(f.reads, k, func(m readMark, k int64) int { return cmp.Compare(m.got, k) })
+	if i == len(f.reads) {
+		return readMark{}, false
+	}
+	return f.reads[i], true
 }
 
 // lastReadBefore returns the last read that returned data before t.

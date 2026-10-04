@@ -1,6 +1,7 @@
 package lessons4
 
 import (
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -13,70 +14,115 @@ import (
 )
 
 // TestBondAsymmetricReorderBounded_L34: a bond over a 5 ms and a 200 ms
-// path (one-way; same rate R) moves 64 MiB (16 MiB under -race). The fast
-// member never runs so far ahead that the receiver's reorder exceeds the
-// window: no carrier dies (no window violation), the passive's buffered
-// bytes stay within 2·Window plus its reader stages; the slow member
-// carries a real share, so the session beats a single fast carrier (> R);
-// every byte arrives intact.
+// path (one-way; the same rate R = 4 MiB/s each) moves 64 MiB (16 MiB under
+// -race). "window": the receiver's window W = 1.5 MiB is below what the two
+// paths could keep busy (≈ R·400 ms on the slow path plus the fast data
+// queued for 200 ms behind its head), so the sender is window-limited —
+// the case the lesson is about: the fast member must never run so far
+// ahead of the head on the slow member that the receiver has to hold more
+// than W; its receive charge reaches W/2 (the window binds). "aggregate":
+// the default 8 MiB window does not bind, and the bond adds the slow path's
+// rate to the fast one's. In both the receiver's charge stays within W
+// plus its two reader stages, no carrier dies (no window violation),
+// nothing is retransmitted (nothing was dropped at the receiver's 2·W cap
+// or rescued), the steady goodput (25%–90% of the transfer) beats a single
+// fast carrier (> 1.2·R), the slow member carries a real share, and every
+// byte arrives intact.
 func TestBondAsymmetricReorderBounded_L34(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const rate = 4 << 20 // bytes/s per path
-		n := int64(64 << 20)
-		if raceEnabled {
-			n = 16 << 20
-		}
-		w := newWorld(t, worldOpts{}, "fast", "slow")
-		lf, ls := w.link("fast"), w.link("slow")
-		lf.SetDelay(5*time.Millisecond, 0)
-		ls.SetDelay(200*time.Millisecond, 0)
-		lf.SetRate(rate)
-		ls.SetRate(rate)
-		dc, pc := w.open(w.peer(nil, lf, ls), rendr.DialOptions{Mode: rendr.ModeBond})
-		waitFor(t, 5*time.Second, "both members", func() bool { return len(dataCarriers(dc.Status())) == 2 })
+	for _, c := range []struct {
+		name   string
+		window int // the passive's Window (0: the default 8 MiB)
+	}{
+		{"window", 3 << 19},
+		{"aggregate", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { bondAsym(t, c.window) })
+		})
+	}
+}
 
-		start := time.Now()
-		f := startFlow(dc, pc, n, 34, flowOpts{closeWrite: true, eof: true})
-		var maxBuf int64
-		for done := false; !done; {
-			select {
-			case <-f.rdone:
-				done = true
-			case <-time.After(10 * time.Millisecond):
-				maxBuf = max(maxBuf, w.p.Status().BufferedBytes)
-			}
-		}
-		elapsed := time.Since(start)
-		f.wait(t, time.Second, "bond transfer")
+func bondAsym(t *testing.T, window int) {
+	const rate = 4 << 20 // bytes/s per path
+	n := int64(64 << 20)
+	if raceEnabled {
+		n = 16 << 20
+	}
+	w := newWorld(t, worldOpts{pcfg: rendr.Config{Window: window}}, "fast", "slow")
+	lf, ls := w.link("fast"), w.link("slow")
+	lf.SetDelay(5*time.Millisecond, 0)
+	ls.SetDelay(200*time.Millisecond, 0)
+	lf.SetRate(rate)
+	ls.SetRate(rate)
+	dc, pc := w.open(w.peer(nil, lf, ls), rendr.DialOptions{Mode: rendr.ModeBond})
+	waitFor(t, 5*time.Second, "both members", func() bool { return len(dataCarriers(dc.Status())) == 2 })
+	win := pc.Status().Window
+	if window != 0 && win != int64(window) {
+		t.Fatalf("the passive advertises a %s window, want %s", mib(win), mib(int64(window)))
+	}
 
-		window := int64(8 << 20) // the default Window
-		if limit := 2*window + 1<<20; maxBuf > limit {
-			t.Fatalf("the passive buffered up to %s, want ≤ 2·Window + 1 MiB (%s)", mib(maxBuf), mib(limit))
+	start := time.Now()
+	f := startFlow(dc, pc, n, 34, flowOpts{closeWrite: true, eof: true})
+	// The passive only receives: its Budget charge is its receive buffers
+	// (in order and out of order) plus its carriers' reader stages.
+	var maxBuf int64
+	for done := false; !done; {
+		select {
+		case <-f.rdone:
+			done = true
+		case <-time.After(10 * time.Millisecond):
+			maxBuf = max(maxBuf, w.p.Status().BufferedBytes)
 		}
-		got := float64(n) / elapsed.Seconds()
-		if got <= 1.2*rate {
-			t.Fatalf("goodput %.2f MiB/s over %v, want more than a single fast path (%.2f MiB/s) by 20%%", got/(1<<20), elapsed, float64(rate)/(1<<20))
+	}
+	elapsed := time.Since(start)
+	f.wait(t, time.Second, "bond transfer")
+
+	// The goodput of the steady part, from 25% to 90% of the transfer (the
+	// slow member's ramp from the capacity floor takes a few of its 400 ms
+	// RTTs).
+	from, ok := f.reached(n / 4)
+	to, ok2 := f.reached(n * 9 / 10)
+	if !ok || !ok2 || !to.at.After(from.at) {
+		t.Fatalf("no steady part in the reads (%v, %v)", from, to)
+	}
+	got := float64(to.got-from.got) / to.at.Sub(from.at).Seconds()
+	ds, ps := dc.Status(), pc.Status()
+	slow, ok := memberOn(ds, "slow")
+	fast, ok2 := memberOn(ds, "fast")
+	t.Logf("window %s: steady goodput %.2f MiB/s (single path %.2f; %.2f MiB/s with the ramp), passive buffered ≤ %s, shares fast %s / slow %s, retransmitted %d",
+		mib(win), got/(1<<20), float64(rate)/(1<<20), float64(n)/elapsed.Seconds()/(1<<20), mib(maxBuf),
+		mib(int64(fast.TxBytes)), mib(int64(slow.TxBytes)), ds.RetransmittedBytes)
+	// A reader stage: one 16 KiB-class stage buffer plus one 64 KiB-class
+	// DATA buffer being filled (design D29, §4.9).
+	stages := 2 * int64(16<<10+64+64<<10+64)
+	if window != 0 {
+		if maxBuf < win/2 {
+			t.Fatalf("the passive buffered at most %s: the %s window never bound (load not reached)", mib(maxBuf), mib(win))
 		}
-		ds, ps := dc.Status(), pc.Status()
-		for _, s := range []rendr.SessionStatus{ds, ps} {
-			if d := deadOf(s); len(d) != 0 || s.Migrations != (rendr.MigrationCounts{}) {
-				t.Fatalf("%v: dead carriers %+v, migrations %+v; want none", s.Role, d, s.Migrations)
-			}
+	}
+	if limit := win + stages; maxBuf > limit {
+		t.Fatalf("the passive buffered up to %s, want ≤ its window plus two reader stages (%s): the fast member ran ahead of the window", mib(maxBuf), mib(limit))
+	}
+	if got <= 1.2*rate {
+		t.Fatalf("steady goodput %.2f MiB/s, want more than a single fast path (%.2f MiB/s) by 20%%", got/(1<<20), float64(rate)/(1<<20))
+	}
+	for _, s := range []rendr.SessionStatus{ds, ps} {
+		if d := deadOf(s); len(d) != 0 || s.Migrations != (rendr.MigrationCounts{}) {
+			t.Fatalf("%v: dead carriers %+v, migrations %+v; want none", s.Role, d, s.Migrations)
 		}
-		slow, ok := memberOn(ds, "slow")
-		fast, ok2 := memberOn(ds, "fast")
-		if !ok || !ok2 || int64(slow.TxBytes) < n/10 || int64(fast.TxBytes) < n/10 {
-			t.Fatalf("member shares: fast %d, slow %d of %d bytes; want ≥ 10%% each", fast.TxBytes, slow.TxBytes, n)
-		}
-		if lf.Stats().Session.MaxDelay != 5*time.Millisecond || ls.Stats().Session.MaxDelay != 200*time.Millisecond ||
-			lf.Stats().Throttled == 0 || ls.Stats().Throttled == 0 {
-			t.Fatal("the asymmetric delays or the rate limits were not applied (stimulus)")
-		}
-		t.Logf("goodput %.2f MiB/s (single path %.2f), passive buffered ≤ %s, shares fast %s / slow %s, retransmitted %d",
-			got/(1<<20), float64(rate)/(1<<20), mib(maxBuf), mib(int64(fast.TxBytes)), mib(int64(slow.TxBytes)), ds.RetransmittedBytes)
-		endClean(t, dc, pc)
-		w.close()
-	})
+	}
+	if ds.RetransmittedBytes != 0 {
+		t.Fatalf("the dialer retransmitted %d bytes: DATA beyond the window was dropped or a head was rescued", ds.RetransmittedBytes)
+	}
+	if !ok || !ok2 || int64(slow.TxBytes) < n/10 || int64(fast.TxBytes) < n/10 {
+		t.Fatalf("member shares: fast %d, slow %d of %d bytes; want ≥ 10%% each", fast.TxBytes, slow.TxBytes, n)
+	}
+	if lf.Stats().Session.MaxDelay != 5*time.Millisecond || ls.Stats().Session.MaxDelay != 200*time.Millisecond ||
+		lf.Stats().Throttled == 0 || ls.Stats().Throttled == 0 {
+		t.Fatal("the asymmetric delays or the rate limits were not applied (stimulus)")
+	}
+	endClean(t, dc, pc)
+	w.close()
 }
 
 // TestBondStalledMemberRecovers_L34 (Z4; design §4.11, §11.4): the
@@ -86,11 +132,14 @@ func TestBondAsymmetricReorderBounded_L34(t *testing.T) {
 // data lane exists) within max(300 ms, 3·srtt), so the receiver's in-order
 // delivery moves on long before any death deadline; a stall shorter than
 // the death deadline kills nothing, and the session then finishes intact.
-// Two stalls: "write" — the member's carrier Write stops in the middle of
-// a frame (the embedder conn blocks after half a batch; its path stays
-// healthy) —, and "path" — the member's path stops delivering in both
-// directions while its conns keep accepting writes (L34's "a stalled
-// member that still accepts writes").
+// A rescue is a duplicate of the head the receiver lacks: the stalled
+// member's death and requeue is none, nor is a resend of bytes the
+// receiver already has in order (the test names either case). Two stalls:
+// "write" — the member's carrier Write stops in the middle of a frame (the
+// embedder conn blocks after half a batch; its path stays healthy) —, and
+// "path" — the member's path stops delivering in both directions while its
+// conns keep accepting writes until the link buffer is full (L34's "a
+// stalled member that still accepts writes").
 func TestBondStalledMemberRecovers_L34(t *testing.T) {
 	for _, mode := range []string{"write", "path"} {
 		t.Run(mode, func(t *testing.T) {
@@ -145,6 +194,7 @@ func bondStall(t *testing.T, path bool) {
 	}()
 	w := newWorld(t, worldOpts{tap: true}, "fast", "slow")
 	lf, ls := w.link("fast"), w.link("slow")
+	defer lf.SetStall(false) // a failed test still ends its bubble
 	lf.SetDelay(5*time.Millisecond, 0)
 	ls.SetDelay(20*time.Millisecond, 0)
 	lf.SetRate(24 << 20)
@@ -194,14 +244,39 @@ func bondStall(t *testing.T, path bool) {
 	stuckAt := f.got.Load()
 	bound := max(300*time.Millisecond, 3*srtt)
 
+	// Wait for the slow member's duplicate of the stuck head — or for the
+	// stalled member's death: its requeue would resend bytes on the slow
+	// member too, but it is no rescue.
 	var rescuedAt time.Time
+	var atD, atP rendr.SessionStatus // both ends at that moment
 	waitFor(t, 3*time.Second, "a rescue by the other member", func() bool {
-		if c, ok := carrierOf(dc.Status(), slow.ID); ok && c.RetxBytes > 0 {
-			rescuedAt = time.Now()
-			return true
+		st := dc.Status()
+		sc, _ := carrierOf(st, slow.ID)
+		fc, _ := carrierOf(st, fast.ID)
+		if sc.RetxBytes == 0 && fc.State != rendr.CarrierDead {
+			return false
 		}
-		return false
+		rescuedAt, atD, atP = time.Now(), st, pc.Status()
+		return true
 	})
+	if path && lf.Stats().Session.Held == 0 {
+		t.Fatal("the path stall held no chunk of the fast member (stimulus)")
+	}
+	fc, _ := carrierOf(atD, fast.ID)
+	sc, _ := carrierOf(atD, slow.ID)
+	// ACK = delivered: once the head has been stuck long enough to be
+	// rescued, the dialer's acknowledged front is the receiver's in-order
+	// front — unless the receiver's ACKs cannot reach the dialer.
+	ackLag := int64(atP.RxBytes) - int64(atD.AckedBytes)
+	diag := fmt.Sprintf("at +%v the dialer had %s acknowledged and the receiver %s in order (ACK lag %s); the fast member was %v (retransmitted %d, in flight %d, death %v %q), the slow member had retransmitted %d (in flight %d)",
+		rescuedAt.Sub(stallAt), mib(int64(atD.AckedBytes)), mib(int64(atP.RxBytes)), mib(ackLag),
+		fc.State, fc.RetxBytes, fc.Inflight, fc.DeathCause, fc.DeathDetail, sc.RetxBytes, sc.Inflight)
+	if fc.State == rendr.CarrierDead {
+		t.Fatalf("no rescue sender: no member duplicated the stuck head before the stalled member died (its requeue is no rescue); %s", diag)
+	}
+	if ackLag >= 64<<10 {
+		t.Fatalf("the rescue resent bytes the receiver already had in order: its ACKs are held on the stalled member, so the dialer cannot see the real head; %s", diag)
+	}
 	time.Sleep(time.Second - time.Since(stallAt)) // a stall shorter than the death deadline (≥ 2 s here)
 	stuck := f.got.Load()
 	releasedAt := time.Now()
@@ -211,13 +286,17 @@ func bondStall(t *testing.T, path bool) {
 		close(ctl.release)
 	}
 	moved, ok := f.firstReadAfter(rescuedAt)
+	movedAt := "none before the release"
+	if ok {
+		movedAt = fmt.Sprintf("+%v (%s)", moved.at.Sub(stallAt), mib(moved.got))
+	}
 	// The head is stuck since the receiver's last in-order delivery before
 	// the rescue; its ACK reaches the dialer within the ACK delay (20 ms)
 	// and one srtt, and the rescue clock (lastAdvance) starts there.
 	last, _ := f.lastReadBefore(rescuedAt)
 	ds, ps := dc.Status(), pc.Status()
-	t.Logf("fast srtt %v, slow srtt %v: receiver at %s when stalled, stuck from +%v, rescue at +%v (bound %v), first delivery after it at +%v (%s), %s at the release; dialer acked %s",
-		srtt, slow.SRTT, mib(stuckAt), last.at.Sub(stallAt), rescuedAt.Sub(stallAt), bound, moved.at.Sub(stallAt), mib(moved.got), mib(stuck), mib(int64(ds.AckedBytes)))
+	t.Logf("fast srtt %v, slow srtt %v: receiver at %s when stalled, stuck from +%v, rescue at +%v (bound %v), first delivery after it %s, %s at the release; dialer acked %s",
+		srtt, slow.SRTT, mib(stuckAt), last.at.Sub(stallAt), rescuedAt.Sub(stallAt), bound, movedAt, mib(stuck), mib(int64(ds.AckedBytes)))
 	if d := rescuedAt.Sub(last.at); d > bound+20*time.Millisecond+srtt {
 		t.Fatalf("the rescue left %v after the head got stuck, want within max(300 ms, 3·srtt) = %v (+ the ACK delay and one srtt for the ACK)", d, bound)
 	}
@@ -235,9 +314,6 @@ func bondStall(t *testing.T, path bool) {
 		if d := deadOf(s); len(d) != 0 || s.Migrations != (rendr.MigrationCounts{}) {
 			t.Fatalf("%v: a stall below the death deadline killed %+v (migrations %+v)", s.Role, d, s.Migrations)
 		}
-	}
-	if path && lf.Stats().Session.Held == 0 {
-		t.Fatal("the path stall held no chunk of the fast member (stimulus)")
 	}
 	endClean(t, dc, pc)
 	w.close()
@@ -334,10 +410,11 @@ func TestBondDoubleDeathSingleTeardown_L34(t *testing.T) {
 // drain rates — 1:8 within 15% over the steady part of the transfer —
 // because each member pulls DATA only up to its PONG-proven capacity
 // (L32, P4; no configured weights). The capacity evidence exists only
-// under backlog: once the transfer turns into a demand-limited trickle,
-// the member carrying it is no longer backlogged, so its PONGs bring no
-// rate sample, its rate decays and its cap falls back to the 128 KiB floor
-// (the cold-start prior).
+// under backlog: once the transfer turns into a demand-limited trickle
+// (≈ 100 KB/s for 10 s), the member carrying it is no longer backlogged, so
+// its PONGs bring no rate sample: its rate estimate decays far below even
+// the trickle's own rate, which samples taken without backlog would track,
+// and its cap falls back to the 128 KiB floor (the cold-start prior).
 func TestBondSplitFollowsDrainRate_L32(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const slowRate, fastRate = 2 << 20, 16 << 20
@@ -399,18 +476,24 @@ func TestBondSplitFollowsDrainRate_L32(t *testing.T) {
 		}
 		f.wait(t, time.Minute, "bulk transfer")
 
-		// A demand-limited trickle: 2 KiB every 20 ms for 5 s. It rides the
-		// lowest-srtt member, the fast one.
-		g := startFlow(dc, pc, 250*2<<10, 33, flowOpts{chunk: 2 << 10, pace: 20 * time.Millisecond})
+		// A demand-limited trickle: 2 KiB every 20 ms for 10 s. It rides the
+		// lowest-srtt member, the fast one. Its rate decays by 0.95 per
+		// 50 ms (design §4.10) from ≈ 16 MiB/s to ≈ 0.6 KB/s in 10 s, while
+		// samples taken without backlog would keep it near the trickle's own
+		// rate.
+		const chunk, gap, writes = 2 << 10, 20 * time.Millisecond, 500
+		trickle := float64(chunk) / gap.Seconds()
+		g := startFlow(dc, pc, writes*chunk, 33, flowOpts{chunk: chunk, pace: gap})
 		g.wait(t, time.Minute, "trickle")
 		st := dc.Status()
 		carrying, ok := memberOn(st, "fast")
 		if !ok || carrying.TxBytes <= fc.TxBytes {
 			t.Fatalf("the fast member carried none of the trickle: %+v", st.Carriers)
 		}
-		t.Logf("after the trickle: fast rate %.0f cap %d; slow (idle) rate %.0f cap %d", carrying.Rate, carrying.Cap, sc.Rate, sc.Cap)
-		if carrying.Cap != floor || carrying.Rate >= fc.Rate/8 {
-			t.Fatalf("after 5 s of demand-limited traffic the fast member's cap is %d (rate %.0f, was %.0f), want the %d floor", carrying.Cap, carrying.Rate, fc.Rate, floor)
+		t.Logf("after the trickle (%.0f B/s): fast rate %.0f cap %d; slow (idle) rate %.0f cap %d", trickle, carrying.Rate, carrying.Cap, sc.Rate, sc.Cap)
+		if carrying.Rate >= trickle/4 || carrying.Cap != floor {
+			t.Fatalf("after 10 s of demand-limited traffic the fast member's rate is %.0f B/s (was %.0f; the trickle's own rate %.0f) and its cap %d: want the rate far below the trickle's (no rate sample without backlog) and the %d floor",
+				carrying.Rate, fc.Rate, trickle, carrying.Cap, floor)
 		}
 		endClean(t, dc, pc)
 		w.close()

@@ -55,9 +55,10 @@ func (cc *closeCounter) closes() []int32 {
 // carrier of a session is cut and the session redials and attaches a new
 // one. Afterwards the goroutines are exactly those of the start (one
 // session with one carrier), every carrier conn of both ends was closed
-// exactly once, every cut was one death migration and one rejoin on both
-// ends, the session still moves data intact, and both Runtimes end with
-// nothing left (no session, buffered byte or abandoned call).
+// exactly once, every cut was one death migration and one no-path episode
+// on both ends and one rejoin of the dialer, the session still moves data
+// intact, and both Runtimes end with nothing left (no session, buffered
+// byte or abandoned call).
 func TestAttachKillChurnNoLeak_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cycles := 10000
@@ -67,14 +68,25 @@ func TestAttachKillChurnNoLeak_L52(t *testing.T) {
 		var dconns closeCounter
 		w := newWorld(t, worldOpts{tap: true}, "a")
 		l := w.link("a")
+		// A 1 ms path: both ends see a cut at once, so the passive's death
+		// step for the old carrier runs before the redialled JOIN can reach
+		// it, and every cut is a no-path episode on both ends (a JOIN that
+		// overtook the death step would legitimately start none).
+		l.SetDelay(time.Millisecond, 0)
 		dc, pc := w.open(w.peer(dconns.wrap, l), rendr.DialOptions{})
 		e2 := startFlow(dc, pc, 1<<20, 520, flowOpts{})
 		e2.wait(t, time.Minute, "warm-up")
 
+		// live: both ends route on the same carrier, and the passive applied
+		// and echoed the dialer's SCHED for it, so the next cut cannot lose
+		// that SCHED in the link (the passive counts its death migrations
+		// from the SCHEDs it applies).
 		live := func() (rendr.CarrierID, bool) {
-			da, ok := activeOf(dc.Status())
-			pa, ok2 := activeOf(pc.Status())
-			return da.ID, ok && ok2 && da.ID == pa.ID
+			ds, ps := dc.Status(), pc.Status()
+			da, ok := activeOf(ds)
+			pa, ok2 := activeOf(ps)
+			synced := ds.SchedEchoed == ds.SchedEpoch && ps.SchedEpoch == ds.SchedEpoch
+			return da.ID, ok && ok2 && da.ID == pa.ID && synced
 		}
 		settle := func(what string, prev rendr.CarrierID) rendr.CarrierID {
 			var id rendr.CarrierID

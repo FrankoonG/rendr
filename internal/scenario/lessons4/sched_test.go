@@ -284,11 +284,13 @@ func TestSchedResentUntilEcho_L45(t *testing.T) {
 
 // TestBothSidesLoseActive_L45: both ends lose the active carrier A at the
 // same moment while each has DATA in flight on it — "kill": the path is
-// cut, both see its end at once; "silent": the path drops everything, and
-// each end's own death detection fires. Neither end ends or resets the
-// session: the dialer races a new carrier on B, the passive follows its
-// SCHED, both replay their lost bytes, both count the same single death,
-// and both streams arrive intact.
+// cut, both see its end at once (transport_error); "silent": the path drops
+// everything without a close, and the end whose PING goes unanswered first
+// declares A dead (ping_timeout or write_stall; rendrtest's blackhole then
+// carries its close to the other end, which may record transport_error).
+// Neither end ends or resets the session: the dialer races a new carrier on
+// B, the passive follows its SCHED, both replay their lost bytes, both
+// count the same single death, and both streams arrive intact.
 func TestBothSidesLoseActive_L45(t *testing.T) {
 	for _, mode := range []string{"kill", "silent"} {
 		t.Run(mode, func(t *testing.T) {
@@ -305,7 +307,8 @@ func TestBothSidesLoseActive_L45(t *testing.T) {
 					l.SetRate(8 << 20)
 				}
 				dc, pc := w.open(w.peer(nil, la, lb), rendr.DialOptions{})
-				if act, ok := activeOf(dc.Status()); !ok || act.Name != "a" {
+				a, ok := activeOf(dc.Status())
+				if !ok || a.Name != "a" {
 					t.Fatalf("the session did not start on a: %+v", dc.Status().Carriers)
 				}
 				f := startFlow(dc, pc, n, 453, flowOpts{closeWrite: true, eof: true})
@@ -321,14 +324,27 @@ func TestBothSidesLoseActive_L45(t *testing.T) {
 				waitFor(t, 5*time.Second, "both ends' death migration", func() bool {
 					return dc.Status().Migrations.Death == 1 && pc.Status().Migrations.Death == 1
 				})
+				detected := false
 				for _, s := range []rendr.SessionStatus{dc.Status(), pc.Status()} {
 					act, ok := activeOf(s)
 					if s.State != rendr.StateOpen || !ok || s.Migrations != (rendr.MigrationCounts{Death: 1}) || s.RetransmittedBytes == 0 {
 						t.Fatalf("%v after losing A: %+v (active %+v)", s.Role, s, act)
 					}
-					if d := deadOf(s); len(d) != 1 {
-						t.Fatalf("%v dead carriers %+v, want only A", s.Role, d)
+					d := deadOf(s)
+					if len(d) != 1 || d[0].ID != a.ID {
+						t.Fatalf("%v dead carriers %+v, want only A (%d)", s.Role, d, a.ID)
 					}
+					switch c := d[0].DeathCause; {
+					case mode == "kill" && c == rendr.CauseTransportError:
+					case mode == "silent" && (c == rendr.CausePingTimeout || c == rendr.CauseWriteStall):
+						detected = true
+					case mode == "silent" && c == rendr.CauseTransportError:
+					default:
+						t.Fatalf("%v: A died of %v %q in mode %s", s.Role, c, d[0].DeathDetail, mode)
+					}
+				}
+				if mode == "silent" && !detected {
+					t.Fatal("neither end detected the silent loss of A itself (ping_timeout or write_stall)")
 				}
 				if act, _ := activeOf(dc.Status()); act.Name != "b" {
 					t.Fatalf("dialer active %+v, want b", act)

@@ -48,8 +48,11 @@ func sessionTap(t *testing.T, w *world) *tapConn {
 // inside a DATA frame, and fails; "kill": the path is cut while the
 // passive's reader holds part of a frame —; the partial frame is never
 // handed over, the session replays from the acknowledged front on a new
-// carrier, and every byte reaches the application exactly once (exact
-// PRNG stream, exact counters, EOF right after it).
+// carrier, and every byte reaches the application exactly once: the reader
+// verifies the exact PRNG stream byte by byte (a lost, duplicated or
+// zero-filled byte fails it) and requires io.EOF right after the last
+// byte. The session's byte counters must agree (a sanity check: they count
+// committed, in-order and read bytes, so they cannot see a duplicate).
 func TestKillMidFrameExactlyOnce_L42(t *testing.T) {
 	for _, mode := range []string{"write", "kill"} {
 		t.Run(mode, func(t *testing.T) {
@@ -141,14 +144,16 @@ func killMidFrame(t *testing.T, kill bool) {
 		}
 	}
 	waitFor(t, 5*time.Second, "the cut carrier's end at the passive", func() bool { return len(deadOf(pc.Status())) == 1 })
-	f.wait(t, time.Minute, "transfer across the cut")
+	// Exactly once: the PRNG verifier saw every byte once, in order, then EOF.
+	f.wait(t, time.Minute, "exactly-once delivery across the cut (PRNG stream, then EOF)")
 	waitFor(t, 5*time.Second, "the last ACK and the passive's death migration", func() bool {
 		return dc.Status().AckedBytes == uint64(n) && pc.Status().Migrations.Death == 1
 	})
 
 	ds, ps := dc.Status(), pc.Status()
 	if ps.RxBytes != uint64(n) || ps.DeliveredBytes != uint64(n) || ds.AckedBytes != uint64(n) || ds.TxBytes != uint64(n) {
-		t.Fatalf("counters: dialer tx %d acked %d, passive rx %d delivered %d; want exactly %d each", ds.TxBytes, ds.AckedBytes, ps.RxBytes, ps.DeliveredBytes, n)
+		t.Fatalf("counters disagree with the verified stream (sanity check): dialer tx %d acked %d, passive rx %d delivered %d; want %d each",
+			ds.TxBytes, ds.AckedBytes, ps.RxBytes, ps.DeliveredBytes, n)
 	}
 	if ds.RetransmittedBytes == 0 || ds.Migrations.Death != 1 || ps.Migrations.Death != 1 {
 		t.Fatalf("no replay after the cut: retransmitted %d, migrations %+v / %+v", ds.RetransmittedBytes, ds.Migrations, ps.Migrations)
@@ -310,7 +315,11 @@ func TestDroppedFrameFseq_L43(t *testing.T) {
 // arrive intact. "lockstep": X and Y are identical sessions moving the
 // same volume side by side and X's next DATA frame is spliced into Y
 // (their carriers are at the same frame index); "offset": X's first DATA
-// frame is spliced into Y once Y is many frames further.
+// frame is spliced into Y once Y is many frames further. (The lockstep
+// splice is the hard case: every carrier direction starts at the same
+// fseq, every M1 session uses handle 1 and the CRC32C covers only the
+// frame, so only a per-carrier binding of the frames can tell X's frame
+// from Y's own.)
 func TestSplicedSessionsKilled_L43(t *testing.T) {
 	for _, mode := range []string{"lockstep", "offset"} {
 		t.Run(mode, func(t *testing.T) {
@@ -357,12 +366,12 @@ func splice(t *testing.T, offset bool) {
 		t.Fatalf("captured %v (%v)", h, err)
 	}
 	ly.InjectRaw(rendrtest.Up, raw)
-	fx.wait(t, time.Minute, "X")
-	fy.wait(t, time.Minute, "Y (fseq "+itoa(h.Fseq)+" of X spliced in)")
-
+	waitFor(t, 5*time.Second, "the splice into Y's carrier", func() bool { return ly.Stats().Session.FramesInjected > 0 })
 	if c, i := lx.Stats().Session.FramesCaptured, ly.Stats().Session.FramesInjected; c != 1 || i != 1 {
 		t.Fatalf("captured %d on X, injected %d into Y; want 1 and 1 (stimulus)", c, i)
 	}
+	fx.wait(t, time.Minute, "X")
+	fy.wait(t, time.Minute, "Y, with X's DATA frame (fseq "+itoa(h.Fseq)+") spliced into its carrier")
 	waitFor(t, 5*time.Second, "Y's death steps and migrations", func() bool {
 		return len(deadOf(yp.Status())) == 1 && len(deadOf(yd.Status())) == 1 &&
 			yd.Status().Migrations.Death == 1 && yp.Status().Migrations.Death == 1

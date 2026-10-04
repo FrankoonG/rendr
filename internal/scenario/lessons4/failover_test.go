@@ -8,6 +8,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -153,12 +154,15 @@ func deathCause(c rendr.Cause) bool {
 // G1-style transfer (passive → dialer) over two 50 Mbit/s paths with 20 ms
 // RTT; at a seeded random offset the active path is blackholed (every byte
 // in its 2 MiB link buffers, in flight and later vanishes; nothing closes).
-// The DROP lands while DATA is in flight on the active carrier. For each of
-// 20 seeds: no write or read error, every byte verified, no pause in
-// delivery longer than the G4 budget of 5 s, the end that detects the
-// silent death records ping_timeout or write_stall, one death migration on
-// both ends, the bytes lost in the path are replayed, and the stimulus is
-// proven by the blackhole's drop counter.
+// The DROP lands while DATA is in flight on the active carrier. The sender
+// (the passive) has a 10 s death deadline, beyond the G4 budget, so its own
+// detection cannot rescue the transfer: the receiver must detect the silent
+// death itself (F12/P12: it PINGs at the busy cadence while DATA arrives),
+// as it must on a real DROP, which loses every FIN and RST. For each of 20
+// seeds: no write or read error, every byte verified, no pause in delivery
+// longer than the G4 budget of 5 s, the dialer records ping_timeout or
+// write_stall, one death migration on both ends, the bytes lost in the path
+// are replayed, and the stimulus is proven by the blackhole's drop counter.
 func TestRandomOffsetBlackholeSeeds_L61(t *testing.T) {
 	for seed := uint64(1); seed <= 20; seed++ {
 		t.Run(fmt.Sprintf("seed%02d", seed), func(t *testing.T) {
@@ -176,7 +180,10 @@ func blackholeSeed(t *testing.T, seed uint64) {
 	rng := rand.New(rand.NewPCG(seed, 61))
 	at := n/10 + rng.Int64N(n*8/10) // the DROP offset: 10%–90% of the transfer
 
-	w := newWorld(t, worldOpts{}, "a", "b")
+	// The sender's (passive's) death deadline is 10 s: only the receiver's
+	// own detection keeps the pause within the 5 s budget.
+	slowSender := func(ov *testhooks.Overrides) { ov.DeadMin, ov.DeadMax = 10*time.Second, 10*time.Second }
+	w := newWorld(t, worldOpts{pTune: slowSender}, "a", "b")
 	la, lb := w.link("a"), w.link("b")
 	for _, l := range []*rendrtest.Link{la, lb} {
 		l.SetDelay(10*time.Millisecond, 0)
@@ -219,27 +226,23 @@ func blackholeSeed(t *testing.T, seed uint64) {
 	}
 	gap, _ := f.gap()
 	t.Logf("DROP at %s of %s: delivery resumed %v later, longest pause %v", mib(at), mib(n), resumed.at.Sub(dropAt), gap)
-	// The side whose PING went unanswered first declares the death
-	// (ping_timeout, or write_stall); its close reaches the other side as
-	// the carrier's end (the link model propagates a close even while
-	// blackholed), so that side may record transport_error.
+	// The receiver (the dialer) declared the death itself. Its close then
+	// reaches the passive as the carrier's end — rendrtest's blackhole
+	// carries a close, a real DROP would not —, so the passive may record
+	// transport_error rather than its own (10 s) detection.
 	st, ps := dc.Status(), pc.Status()
-	detected := false
 	for _, s := range []rendr.SessionStatus{st, ps} {
 		dead := deadOf(s)
 		if len(dead) != 1 || dead[0].ID != act.ID {
 			t.Fatalf("%v dead carriers %+v, want exactly %d", s.Role, dead, act.ID)
 		}
-		switch dead[0].DeathCause {
-		case rendr.CausePingTimeout, rendr.CauseWriteStall:
-			detected = true
-		case rendr.CauseTransportError:
+		switch c := dead[0].DeathCause; {
+		case c == rendr.CausePingTimeout, c == rendr.CauseWriteStall:
+		case c == rendr.CauseTransportError && s.Role == rendr.RolePassive:
 		default:
-			t.Fatalf("%v: %d died of %v", s.Role, act.ID, dead[0].DeathCause)
+			t.Fatalf("%v: %d died of %v %q; the receiver must detect the silent death itself (ping_timeout or write_stall)",
+				s.Role, act.ID, c, dead[0].DeathDetail)
 		}
-	}
-	if !detected {
-		t.Fatalf("neither end detected the silent death: %+v / %+v", deadOf(st), deadOf(ps))
 	}
 	na, ok := activeOf(st)
 	if !ok || na.Name != other.Name() || st.Migrations.Death != 1 {
