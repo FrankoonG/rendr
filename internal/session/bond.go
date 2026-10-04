@@ -14,7 +14,7 @@ import (
 // then per cadence; the new incarnation is a rejoin, not a migration. The
 // head of the send window is rescued by a duplicate on another member when
 // it stays stuck — on the member holding it only while that member is the
-// only data lane.
+// only data lane and DATA sent on several members is unacknowledged.
 
 // chooseMembersLocked fixes the member factories when the session opens
 // on factory winner and kicks every other member slot.
@@ -77,17 +77,29 @@ func (a *actor) bondSlotsLocked(now time.Time) {
 
 // rescueLocked is the bond rescue check (§4.11, W7): while sBase < end it
 // is armed at lastAdvance + RescueWait(fastest srtt, RescueMin) — never at
-// a time already past —; when the head has been stuck that long and was
-// not rescued at this sBase, the stuck segment is duplicated (the receiver
-// deduplicates) by the first data lane with capacity that may send it: any
-// lane but the holder while another data lane exists (L34), else the
-// holder itself (rescueSenderLocked, §0.8 V3): bytes the receiver dropped
-// at its out-of-order cap or shed would otherwise never be resent, and the
-// session would stall for good on a healthy carrier. While the rescue
-// is pending, every step wakes the lanes that may send it, so a member's
-// death, retirement or attach hands it over without waiting for an
-// unrelated wake. It runs on both sides: the passive rescues its own sends
-// over its data lanes (the applied SCHED's members).
+// a time already past —; when the head has been stuck that long, the stuck
+// segment is duplicated (the receiver deduplicates) by the first data lane
+// with capacity that may send it (rescueSenderLocked): any lane but its
+// holder (L34), and the holder itself only while it is the only data lane
+// and interleaved DATA is unacknowledged (st.interleaved, §0.8 V3): bytes
+// the receiver dropped at its out-of-order cap or shed would otherwise
+// never be resent, and the session would stall for good on a healthy
+// carrier.
+//
+// One rescue per sBase value (ctl.rescuedBase), set only if some lane may
+// send it: another data lane, or the holder under the rule above. When the
+// holder sent its own duplicate (its record in st.rescue: not set, holder
+// kept), that duplicate may sit behind the holder's own stalled carrier,
+// so the same head is rescued once more as soon as another data lane
+// exists (an attach, or a SCHED that adds a member). The holder never
+// sends that second one while another data lane exists; only if every
+// other data lane leaves again before taking it can the holder's duplicate
+// and a further one follow (one more per lane that appears).
+//
+// While a rescue is pending, every step wakes the lanes that may send it,
+// so a member's death, retirement or attach hands it over without waiting
+// for an unrelated wake. It runs on both sides: the passive rescues its own
+// sends over its data lanes (the applied SCHED's members).
 func (a *actor) rescueLocked(now time.Time) {
 	s := a.s
 	st := &s.st
@@ -103,12 +115,17 @@ func (a *actor) rescueLocked(now time.Time) {
 		a.want(due)
 		return
 	}
-	if st.sBase != s.ctl.rescuedBase && !st.rescue.set {
+	if !st.rescue.set {
 		if holder, sp, ok := s.rescueHolderLocked(); ok {
-			st.rescue = rescueSlot{set: true, sp: sp, holder: holder}
-			s.ctl.rescuedBase = st.sBase
-			s.routingChangedLocked() // V15
-			s.wakeRescueLocked()
+			other := s.otherDataLaneLocked(holder)
+			first := st.sBase != s.ctl.rescuedBase && (other || st.interleaved)
+			again := st.sBase == s.ctl.rescuedBase && st.rescue.holder == holder && other
+			if first || again {
+				st.rescue = rescueSlot{set: true, sp: sp, holder: holder}
+				s.ctl.rescuedBase = st.sBase
+				s.routingChangedLocked() // V15
+				s.wakeRescueLocked()
+			}
 		}
 	}
 	a.rescueAt = now.Add(wait)

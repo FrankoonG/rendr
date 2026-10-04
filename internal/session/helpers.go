@@ -124,7 +124,9 @@ func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 	}
 	l.finHere = false
 	if st.rescue.holder == l {
-		st.rescue = rescueSlot{} // its spans are requeued: the replay resends the head
+		// Pending, or the record of its own duplicate: its spans are
+		// requeued, and the replay resends the head.
+		st.rescue = rescueSlot{}
 	}
 	if st.ackLane == l {
 		st.ackLane = nil
@@ -240,10 +242,11 @@ func (s *Session) takeFactsLocked() uint32 {
 // and returns it with the span to duplicate, which starts at sBase and lies
 // inside that lane's infl; ok is false when no lane holds sBase (not sent
 // yet, or requeued). The actor calls it when the head has been stuck since
-// lastAdvance for sched.RescueWait and was not rescued at this sBase, then
-// sets st.rescue = {sp, holder} and wakes the lanes that may send the
-// duplicate (wakeRescueLocked, rescueSenderLocked). How an idle actor learns
-// that data became outstanding is described with the fact bits in state.go.
+// lastAdvance for sched.RescueWait and no rescue is pending, then may set
+// st.rescue = {sp, holder} (rescueLocked) and wakes the lanes that may send
+// the duplicate (wakeRescueLocked, rescueSenderLocked). How an idle actor
+// learns that data became outstanding is described with the fact bits in
+// state.go.
 //
 // The span is the stuck segment: from sBase to the end of the holder's
 // span, its chunk or one DATA segment, whichever comes first, so a rescue
@@ -270,30 +273,44 @@ func (s *Session) rescueHolderLocked() (holder *lane, sp span, ok bool) {
 
 // rescueSenderLocked reports whether data lane l may send the pending
 // rescue duplicate (design §4.11, §0.8 V3): every data lane other than the
-// rescue's holder may, and the holder itself only while no other data lane
-// exists. The holder exclusion stands whenever another data lane exists
-// (L34): the head may be stuck because the holder's carrier stalls, and a
-// duplicate queued behind the stalled original would rescue nothing. With
-// the holder as the only data lane no other lane can resend the head: if
-// the receiver lost those bytes — dropped at its 2·W out-of-order receive
-// cap or shed (D13, V3) after the holder's carrier delivered them — nothing
-// else ever would (stream carriers have no retransmission timer) and the
-// session would stall for good on a healthy carrier, so the holder sends
-// the duplicate itself. If the head is stuck for another reason (a slow
-// carrier, an application that does not read), that costs one segment per
-// stuck head, which the receiver discards as a duplicate. Which lanes may
-// send is re-evaluated at every Fill: it changes as members die, retire,
-// attach or leave the send set.
+// rescue's holder may; the holder itself only while no other data lane
+// exists and interleaved DATA is unacknowledged (st.interleaved).
+//
+// The holder exclusion stands whenever another data lane exists (L34): the
+// head may be stuck because the holder's carrier stalls, and a duplicate
+// queued behind the stalled original would rescue nothing. With the holder
+// as the only data lane no other lane can resend the head: if the receiver
+// lost those bytes — dropped at its 2·W out-of-order receive cap or shed
+// (D13, V3) after the holder's carrier delivered them — nothing else ever
+// would (stream carriers have no retransmission timer) and the session
+// would stall for good on a healthy carrier, so the holder sends the
+// duplicate itself. The receiver can only have lost bytes it held out of
+// order, though, and it holds bytes out of order only if DATA went out on
+// more than one data lane since everything sent was last acknowledged: one
+// lane delivers in order, and so does the replay of a lane that died or
+// left the send set. Without that the head is stuck for another reason (a
+// stalled or slow carrier, an application that does not read) and the
+// duplicate could only cost bandwidth, so the holder does not send it.
+// While interleaved DATA is unacknowledged, a duplicate that turns out to
+// be needless costs one segment per stuck head, which the receiver
+// discards. (Allowing it only below the highest offset sent while another
+// data lane existed is not enough: while the receiver's charge stays at
+// its cap, the lone holder's later frames land beyond a dropped one and
+// are dropped too.) Which lanes may send is re-evaluated at every Fill: it
+// changes as members die, retire, attach or leave the send set.
 func (s *Session) rescueSenderLocked(l *lane) bool {
-	if l != s.st.rescue.holder {
-		return true
-	}
+	st := &s.st
+	return l != st.rescue.holder || (st.interleaved && !s.otherDataLaneLocked(l))
+}
+
+// otherDataLaneLocked reports whether a data lane other than l exists.
+func (s *Session) otherDataLaneLocked(l *lane) bool {
 	for _, o := range s.st.order {
 		if o != l && o.data {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // wakeRescueLocked wakes the idle data lanes that may send the pending
@@ -302,8 +319,9 @@ func (s *Session) rescueSenderLocked(l *lane) bool {
 // member's spare capacity, the holder's included, so it may stop at a lane
 // that must not send the duplicate, and the lanes that may send it change
 // as members come and go (the holder becomes a sender when the last other
-// data lane leaves; a lane attaching later takes the duplicate over). A
-// busy lane runs Fill again by itself after its write.
+// data lane leaves while interleaved DATA is unacknowledged; a lane
+// attaching later takes the duplicate over). A busy lane runs Fill again
+// by itself after its write.
 func (s *Session) wakeRescueLocked() {
 	st := &s.st
 	if !st.rescue.set || st.ended {

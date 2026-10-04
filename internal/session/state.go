@@ -115,8 +115,9 @@ type stream struct {
 	peerLimit uint64    // max over received Delivered + Window and the initial window: the largest edge the peer advertised
 	retx      spanList  // requeued spans, resent lowest first before new data, FIN and retirement (L10)
 
-	rescue rescueSlot // (A) sets {span, excluded lane}; (S) Fill consumes and clears
-	fin    finState   // requested, off, lane, acked (§4.3 step 6, §4.7)
+	rescue      rescueSlot // (A) sets {span, holder}; (S) Fill consumes it: clears it, or leaves the holder's record when the holder sent its own duplicate
+	interleaved bool       // (S) bond: DATA went out while another data lane existed and not everything sent since is acknowledged, so the receiver may hold, or have dropped, bytes out of order; the stuck head's holder sends its own rescue duplicate only while it is set (§4.11)
+	fin         finState   // requested, off, lane, acked (§4.3 step 6, §4.7)
 
 	wcopying     bool // a Write copies into [end, resEnd) outside mu: teardown must not release chunks
 	wfreePending bool // endLocked ran during that copy: the copier releases the chunks after it
@@ -208,7 +209,7 @@ type control struct {
 	episodeStart time.Time // (A) death time of the last live lane
 	episodeGen   uint64    // (A) incremented per episode; expiry acts only if unchanged (L18)
 
-	rescuedBase uint64    // (A) sBase at the last rescue (one rescue per sBase value)
+	rescuedBase uint64    // (A) sBase at the last rescue (one rescue per sBase value; once more after the holder's own duplicate, §4.11)
 	adopting    int       // (A) adopts posted by Join/AttachOpen, not yet handled; count toward MaxCarriers (§6.3)
 	closeBy     time.Time // (A) end/shutdown: Kill lanes whose CLOSE is unwritten by then (§4.7)
 
@@ -250,9 +251,12 @@ type segRing struct {
 type segList struct{ s []seg }
 
 // rescueSlot is a pending bond rescue (§4.11): the actor sets it, the first
-// data lane with capacity that may send it (any lane but holder, the holder
-// itself only while it is the only data lane: rescueSenderLocked) sends sp,
-// and Fill clears it.
+// data lane with capacity that may send it (any lane but holder; the holder
+// itself only while it is the only data lane and stream.interleaved is set:
+// rescueSenderLocked) sends sp, and Fill clears it — except when the holder
+// sent it: then Fill leaves the holder's record (set false, holder kept),
+// from which the actor rescues the same head once more when another data
+// lane appears (rescueLocked).
 type rescueSlot struct {
 	set    bool
 	sp     span
