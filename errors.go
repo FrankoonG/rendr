@@ -3,9 +3,8 @@ package rendr
 import "github.com/FrankoonG/rendr/v2/internal/session"
 
 // Errors (plan §6). They are the same values the core produces, so
-// errors.Is and errors.As match. ErrNoPath, ErrSessionLost, ErrCapacity,
-// ErrVersion, ErrProtocol, ErrMetadataTooLarge and ErrIdleTimeout implement
-// net.Error with Timeout() == false. Deadline expiry is
+// errors.Is and errors.As match. Every sentinel below implements net.Error
+// with Timeout() == false, and so does *AbortError. Deadline expiry is
 // os.ErrDeadlineExceeded (Timeout() == true) and never ends a session; use
 // after Close, Write after CloseWrite and calls after Runtime.Close return
 // net.ErrClosed; only the peer's FIN at the contiguous delivery point yields

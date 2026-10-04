@@ -1,6 +1,11 @@
 package rendr
 
-import "encoding/hex"
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+)
 
 // InstanceID identifies one Runtime incarnation: 128 random bits from
 // crypto/rand drawn by NewRuntime, never persisted, never all zero. It is
@@ -19,6 +24,39 @@ type SessionID [16]byte
 
 // String returns 32 lowercase hex digits.
 func (id SessionID) String() string { return hex.EncodeToString(id[:]) }
+
+// newInstanceID draws a Runtime's InstanceID from r (crypto/rand.Reader in
+// production; plan §3.4): never all zero. The error is r's failure.
+func newInstanceID(r io.Reader) (InstanceID, error) {
+	id, err := randomID(r)
+	return InstanceID(id), err
+}
+
+// newSessionID draws a dialer session ID from r (crypto/rand.Reader in
+// production; L47): never all zero, which the OPEN decoder rejects.
+func newSessionID(r io.Reader) (SessionID, error) {
+	id, err := randomID(r)
+	return SessionID(id), err
+}
+
+// errZeroIDs reports a random source that keeps producing the invalid
+// all-zero ID (a broken or exhausted source, never crypto/rand).
+var errZeroIDs = errors.New("rendr: random source produced only all-zero IDs")
+
+// randomID reads 128 random bits from r, redrawing an all-zero value (at
+// most 4 draws; crypto/rand yields zero with probability 2^-128).
+func randomID(r io.Reader) ([16]byte, error) {
+	var id [16]byte
+	for range 4 {
+		if _, err := io.ReadFull(r, id[:]); err != nil {
+			return [16]byte{}, fmt.Errorf("rendr: drawing a random ID: %w", err)
+		}
+		if id != ([16]byte{}) {
+			return id, nil
+		}
+	}
+	return [16]byte{}, errZeroIDs
+}
 
 // CarrierID identifies a carrier incarnation: allocated by the dialer
 // Runtime, never 0, never reused while in use in that Runtime.
