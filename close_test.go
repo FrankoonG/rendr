@@ -754,7 +754,11 @@ func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 	// Status.Abandoned before it returns, exactly once: by the handshake
 	// group's join, not by the carrier's last resort as well (that counted 2
 	// for 1). When the Write finally returns nothing is left and the conn was
-	// closed exactly once.
+	// closed exactly once. The exact Close duration and the attribution of
+	// the count pin the current design: Z3's optional follow-up (counting a
+	// stuck ReadHello refusal before Runtime.Close, as goWatched does) would
+	// also end the goroutine's membership of the handshake group, so Close
+	// would no longer wait for it, and must update both.
 	synctest.Test(t, func(t *testing.T) {
 		const wait = 500 * time.Millisecond
 		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: wait})

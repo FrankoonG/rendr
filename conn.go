@@ -52,8 +52,8 @@ func (c *Conn) Write(p []byte) (int, error) { return c.s.Write(p) }
 // not finished yet (it ends with net.ErrClosed, the peer's with
 // *AbortError). The clean end: Read until io.EOF (the peer's FIN arrived,
 // so Close discards nothing), Close (this side's FIN, unless CloseWrite sent
-// it), wait for Done bounded by your own context (Status().Err is then
-// io.EOF), and only then Runtime.Close.
+// it), wait for Done bounded by your own context (Status().Err is io.EOF
+// after a clean finish), and only then Runtime.Close.
 func (c *Conn) Close() error { return c.s.Close() }
 
 // CloseWrite sends one FIN after everything written so far (idempotent);
@@ -104,12 +104,14 @@ func (c *Conn) Status() SessionStatus { return sessionStatusFrom(c.s.Status()) }
 // Status().State is StateEnded with its final Err (io.EOF after a clean
 // finish; else the end error, such as ErrNoPath, *AbortError, or
 // net.ErrClosed when this side reset the session), Status().Carriers lists
-// only dead carriers, and every goroutine the session owns has exited (a
-// call stuck in embedder code is abandoned after its bound and counted in
-// the Runtime's Status.Abandoned). It is the same channel on every call,
-// closed exactly once, for dialer and passive Conns alike, and never before
-// that end. Status may report StateEnded slightly earlier: Done also waits
-// for the session's carriers to finish (within about 2 s).
+// only dead carriers (no dial attempt is left), and every goroutine the
+// session owns has finished its work (its scheduler exits right after
+// closing Done) or, if stuck in embedder code, was abandoned after its
+// bound and counted in the Runtime's Status.Abandoned. It is the same
+// channel on every call, closed exactly once, for dialer and passive Conns
+// alike, and never before that end. Status may report StateEnded slightly
+// earlier: Done also waits for the session's carriers and dial attempts to
+// finish (within about 2 s).
 //
 // Done only observes the end. A session ends by itself once both FINs were
 // delivered and acknowledged, after Close within Linger, on a failure
