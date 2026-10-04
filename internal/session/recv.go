@@ -1,63 +1,95 @@
 package session
 
 import (
+	"sync/atomic"
+
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 )
 
-// The receive path (design §4.4). Every DATA frame arrives whole and
-// CRC-verified. Payloads of at least 16 KiB come in a reader-owned Buf whose
-// reference moves to the stream (kept by reference: rendr never copies bulk
-// received bytes); smaller ones are copied under the lock into 16 KiB runs
-// that grow at their end (P17). inq holds the in-order segments covering
-// [rRead, rTail); ooq the out-of-order ones beyond rTail (ascending,
-// non-overlapping). Bytes that overlap held bytes are compared once; a
-// mismatch is a violation that kills only the delivering carrier, and the
-// first copy stays authoritative (L13).
+// The receive path (design §4.4, §0.8 V3). Every DATA frame arrives whole
+// and CRC-verified: a payload of at least 16 KiB in a reader-owned Buf whose
+// reference moves to the stream, a smaller one as a slice valid only during
+// the call. inq holds the in-order segments covering [rRead, rTail); ooq the
+// out-of-order ones beyond rTail (ascending, non-overlapping; neighbours may
+// touch). Bytes that overlap held bytes are compared once; a mismatch is a
+// violation that kills only the delivering carrier, and the first copy stays
+// authoritative (L13).
 //
-// Copy limit. One Data call copies fewer than 16 KiB under the lock (§3.2,
-// P17): copyBudget covers both the frame's own small pieces and the run
-// merges below. A payload without a Buf (below 16 KiB, valid only during
-// the call) is copied in any case, so its length is reserved first. A
-// referenced frame that overlaps held bytes is placed in pieces: a piece
-// below 16 KiB is copied into a run, as a small payload would be, rather
-// than pinning the frame's whole buffer for a few bytes — but only while
-// the limit allows; later small pieces of that frame are kept by reference.
-// Such a reference pins at most one buffer per frame that contributed at
-// least 16 KiB of new bytes in that call (for 64 KiB segments, a buffer at
-// most 4× those bytes).
+// Segments. A segment is a run — a 16 KiB-class buffer into which the
+// stream copies small payloads, from the buffer's first byte — or a
+// reference to one received frame's buffer. No two segments share a buffer,
+// so the receive charge below is exact. Every segment may grow at its end
+// into the rest of its buffer: a run up to 16 KiB, a reference up to the
+// buffer's capacity (the reader hands the whole buffer over and touches it
+// no more, and no other segment uses it).
 //
-// Receive charge (design §0.8 V3, D13). st.oooCap is the size-class
-// capacity held by inq and ooq together, counted per segment: a buffer
-// shared by several pieces of one frame counts once per piece, so the count
-// never understates the Budget charge the segments cause. Out-of-order data
-// may fill it only up to recvLimit, 2·W: a piece that would need more is
-// dropped and counted in oooDropped (never a violation: the sender still
-// holds the bytes, and its retransmission fills the hole). In-order data
-// inside the advertised window is always taken; when it pushes the charge
-// above 2·W, out-of-order segments are shed, highest first and counted the
-// same way, until it fits again (shedLocked, at the end of the Data call).
-// So between Data calls the receive charge is at most 2·W whenever
-// out-of-order data is held; a session's Budget footprint adds its
-// carriers' reader stages, one run per lane (D29). The charge of inq alone
-// is not capped (the window bounds its bytes, and they cannot be refused):
-// it exceeds 2·W only through referenced buffers larger than the bytes they
-// hold (class rounding, frames that overlapped held bytes), the runs between
-// such references, or promoted runs the copy limit of one call left
-// unmerged.
+// Copy limit (§3.2, P17). One Data call copies fewer than 16 KiB under the
+// lock, its own new bytes and the merges below together (rcall). A payload
+// without a Buf is below 16 KiB and always copied. A frame with a Buf is
+// kept by reference when its new bytes (those no segment holds yet) reach
+// the limit, or when that costs no more than copying them: the held
+// segments it would replace charge at least its buffer and it would hold at
+// least half of that buffer (heldRange.byRef). Otherwise its new bytes are
+// copied and its buffer released at once. A frame kept by reference is one
+// segment, from its first new byte, that replaces every held segment it
+// covers (they hold the same bytes, which were compared): it holds at least
+// 16 KiB of its frame or at least half its buffer, and pins no other buffer.
 //
-// Promotion merge (V3). A segment that becomes contiguous moves from ooq to
-// inq; if it fits the free room of the in-order tail run and the call's
-// copy limit allows, it is copied into that run and its buffer reference
-// dropped. Small frames that arrived out of order thus end up packed into
-// runs as densely as in-order ones, instead of each keeping a 16 KiB run
-// for its few bytes while freeing the out-of-order allowance for more of
-// the same (measured at up to 164× Budget charge per buffered byte before
-// V3).
+// Merging. Copied bytes first go into the room of the segment that ends
+// where they begin; a new run is taken when there is none. When a placement
+// closes a gap, the segments that now follow it contiguously are merged into
+// it — copied, their buffers released — while they fit its room and the
+// call's copy limit allows: in ooq as out-of-order data arrives, so
+// out-of-order runs stay dense in any arrival order, and on promotion, when
+// segments become contiguous with rTail and move to inq. A segment that does
+// not fit moves as it is, and the next ones can merge into it.
+//
+// Receive charge (D13, V3). st.oooCap is the size-class capacity held by inq
+// and ooq together: exactly the Budget charge of the session's receive
+// buffers. Out-of-order data takes a new buffer only while the charge stays
+// within recvLimit, 2·W; bytes that would need more are dropped and counted
+// in oooDropped (never a violation). In-order data inside the advertised
+// window is always taken; when it pushes the charge above 2·W, out-of-order
+// segments are shed, highest first and counted the same way (shedLocked).
+// So between Data calls the charge is at most 2·W whenever out-of-order data
+// is held; a session's Budget footprint adds its carriers' reader stages,
+// one run per lane (D29). With nothing held out of order the charge is the
+// in-order queue's alone, which nothing can shed: the window bounds its
+// bytes, and dense runs, references holding whole frames (class rounding
+// stays below 2×) and the room a reference offers to the bytes after it keep
+// the charge within about 2× those bytes — except a frame kept by reference
+// for at least 16 KiB of new bytes while other segments held the rest of it
+// (up to 4× for the 64 KiB frames rendr senders produce, more for larger
+// frames).
+//
+// Recovery. Dropped and shed bytes are not lost to the stream: the sender
+// still holds them unacknowledged. They return only when another carrier
+// retransmits them — a bond rescue sent on a lane other than the one whose
+// spans hold them (§4.11), or the requeue and replay after that lane dies
+// or loses data eligibility. While that lane is the only data lane and stays
+// healthy, nothing resends them.
 
 // recvLimit is the cap on the receive charge that out-of-order data may
 // fill: 2·W (V3).
 func (s *Session) recvLimit() int64 {
 	return 2 * s.window()
+}
+
+// recvCopyHook is a test seam: when a test stores {s, fn}, fn runs at the
+// end of every placement by one of s's Data calls, under s.mu, with the
+// payload bytes that call copied (the copy limit). Production never sets it.
+var recvCopyHook atomic.Pointer[recvHook]
+
+// recvHook is the value of recvCopyHook.
+type recvHook struct {
+	s  *Session
+	fn func(copied int)
+}
+
+// rcall is the copy state of one Data call (the copy limit, file comment).
+type rcall struct {
+	left   int // bytes the call may still copy: its own new bytes are reserved first, merges take the rest
+	copied int // payload bytes copied (the call's own and the merged ones)
 }
 
 // dataLocked implements lane.Data under s.mu.
@@ -101,17 +133,134 @@ func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
 		return errConflict
 	}
 
-	// Place the parts of [max(off, rTail), end) no segment holds yet.
-	ref := buf // the reference the first referencing piece takes over
+	// Place the bytes of [max(off, rTail), end) no segment holds yet.
 	tail := st.rTail
-	budget := copyBudget // bytes this call may still copy (file comment)
-	if buf == nil {
-		budget -= len(p) // copied in any case: p is valid only during the call
+	c := rcall{left: copyBudget}
+	h := st.heldIn(max(off, st.rTail), end)
+	n := h.newBytes()
+	if buf != nil && n > 0 && (n > copyBudget || h.byRef(int64(cap(buf.B)))) {
+		s.keepRefLocked(off, p, buf, &h, n, &c)
+	} else {
+		c.left -= int(n) // the frame's own new bytes are copied in any case
+		s.copyPiecesLocked(off, p, &c)
+		buf.Release()
 	}
+	if hk := recvCopyHook.Load(); hk != nil && hk.s == s {
+		hk.fn(c.copied)
+	}
+	if st.rTail == tail {
+		return nil // nothing in order: out-of-order admission kept the cap
+	}
+	if st.discard {
+		if s.consumeAllLocked() > 0 {
+			st.discardedAfterClose = true
+			st.facts |= factDiscardedAfterClose
+			s.ringActor()
+		}
+		s.shedLocked() // a Read copy in flight defers the release of inq
+		return nil
+	}
+	s.shedLocked()
+	if st.rwaiting {
+		streamSignal(st.rwake)
+	}
+	if st.ackOnData {
+		st.ackOnData = false
+		s.bumpNowLocked() // the first in-order DATA after an attach (L11, L19)
+	}
+	return nil
+}
+
+// heldRange describes the held out-of-order bytes inside a frame's range
+// [start, end), start = max(off, rTail): the frame's new bytes all lie in
+// [s0, x) — a segment straddling start moves s0 to its end, one straddling
+// end moves x to its start — and ooq[a:b] are the segments inside [s0, x),
+// holding bytes payload bytes and charge capacity.
+type heldRange struct {
+	s0, x  uint64
+	a, b   int
+	bytes  uint64
+	charge int64
+}
+
+// heldIn returns the heldRange of [start, end).
+func (st *stream) heldIn(start, end uint64) heldRange {
+	h := heldRange{s0: start, x: end}
+	l := st.ooq.s
+	i := st.ooq.after(start)
+	if i < len(l) && l[i].off < start {
+		h.s0 = l[i].end()
+		i++
+	}
+	h.a, h.b = i, i
+	for ; h.b < len(l) && l[h.b].off < end; h.b++ {
+		sg := &l[h.b]
+		if sg.end() > end {
+			h.x = sg.off
+			break
+		}
+		h.bytes += uint64(len(sg.b))
+		h.charge += segCap(sg)
+	}
+	return h
+}
+
+// newBytes returns the bytes of [s0, x) no segment holds.
+func (h *heldRange) newBytes() uint64 {
+	if h.s0 >= h.x {
+		return 0
+	}
+	return h.x - h.s0 - h.bytes
+}
+
+// byRef reports whether keeping a frame whose buffer has capacity c by
+// reference (over [s0, x), replacing the held segments there) is preferable
+// to copying its new bytes although the copy limit would allow it: the
+// replaced segments charge at least as much, and the reference holds at
+// least half its buffer (copying could merge sparse held runs denser).
+func (h *heldRange) byRef(c int64) bool {
+	return h.charge >= c && 2*int64(h.x-h.s0) >= c
+}
+
+// keepRefLocked keeps the frame's [s0, x) by reference as one segment that
+// replaces the held segments ooq[a:b] it covers; n is the frame's new bytes.
+// In order it is always taken. Out of order it is taken only while the
+// receive charge stays within recvLimit; otherwise its new bytes are dropped
+// and counted (the held segments stay) and the buffer is released.
+func (s *Session) keepRefLocked(off uint64, p []byte, buf *carrier.Buf, h *heldRange, n uint64, c *rcall) {
+	st := &s.st
+	sg := seg{off: h.s0, b: p[h.s0-off : h.x-off], buf: buf}
+	charge := int64(cap(buf.B))
+	if h.s0 == st.rTail {
+		st.releaseOOORange(h.a, h.b) // a == 0: ooq starts beyond rTail
+		st.inq.push(sg)
+		st.oooCap += charge
+		st.rxBytes += h.x - h.s0
+		st.rTail = h.x
+		s.promoteLocked(c)
+		return
+	}
+	if st.oooCap-h.charge+charge > s.recvLimit() {
+		st.oooDropped += n
+		buf.Release()
+		return
+	}
+	st.releaseOOORange(h.a, h.b)
+	st.ooq.insert(h.a, sg)
+	st.oooCap += charge
+	s.mergeFollowersLocked(h.a, c)
+}
+
+// copyPiecesLocked copies every part of p (at off) that no segment holds:
+// in order (appendCopyLocked) or out of order (insertCopyLocked), each piece
+// running up to the next held segment.
+func (s *Session) copyPiecesLocked(off uint64, p []byte, c *rcall) {
+	st := &s.st
+	end := off + uint64(len(p))
 	for pos := off; pos < end; {
 		if pos < st.rTail {
-			// Held in order (compared above, or just moved in from ooq
-			// after an in-order piece filled the gap before it).
+			// Held in order (compared, or just promoted from ooq after an
+			// in-order piece filled the gap before it).
 			pos = st.rTail
 			continue
 		}
@@ -127,80 +276,28 @@ func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
 		}
 		piece := p[pos-off : stop-off]
 		if pos == st.rTail {
-			ref = s.appendInOrderLocked(pos, piece, buf, ref, &budget)
+			s.appendCopyLocked(pos, piece, c)
 		} else {
-			ref = s.insertOOOLocked(i, pos, piece, buf, ref, &budget)
+			s.insertCopyLocked(i, pos, piece, c)
 		}
 		pos = stop
 	}
-	if ref != nil {
-		ref.Release() // no piece kept a reference
-	}
-	if st.rTail == tail {
-		return nil // nothing in order: out-of-order admission kept the cap
-	}
-	if st.discard {
-		if s.consumeAllLocked() > 0 {
-			st.discardedAfterClose = true
-			st.facts |= factDiscardedAfterClose
-			s.ringActor()
-		}
-		s.shedLocked()
-		return nil
-	}
-	s.shedLocked()
-	if st.rwaiting {
-		streamSignal(st.rwake)
-	}
-	if st.ackOnData {
-		st.ackOnData = false
-		s.bumpNowLocked() // the first in-order DATA after an attach (L11, L19)
-	}
-	return nil
 }
 
-// takeRef returns the reference a piece of buf keeps: the one moved in by
-// Data for the first piece (ref non-nil), a new one for later pieces.
-func takeRef(buf, ref *carrier.Buf) *carrier.Buf {
-	if ref == nil {
-		buf.Ref()
+// segRoom returns the bytes sg can still grow by at its end: a run up to
+// 16 KiB, a reference up to its buffer's capacity.
+func segRoom(sg *seg) int {
+	if sg.run {
+		return runSize - len(sg.b)
 	}
-	return nil
+	return cap(sg.b) - len(sg.b)
 }
 
-// keepByRef decides whether a piece of a DATA frame is kept by reference
-// (true) or copied into runs, charging a copy to budget, the bytes the
-// current Data call may still copy (see the file comment). Without buf the
-// payload is valid only during the call and below 16 KiB: it is always
-// copied, and dataLocked reserved its bytes before placing any piece.
-func keepByRef(piece []byte, buf *carrier.Buf, budget *int) bool {
-	if buf == nil {
-		return false
-	}
-	if len(piece) >= runSize || len(piece) > *budget {
-		return true
-	}
-	*budget -= len(piece)
-	return false
-}
-
-// tailRun returns the in-order tail segment if it is a run with free room
-// that ends at pos, else nil.
-func (st *stream) tailRun(pos uint64) *seg {
-	if st.inq.n == 0 {
-		return nil
-	}
-	if t := st.inq.back(); t.run && len(t.b) < runSize && t.end() == pos {
-		return t
-	}
-	return nil
-}
-
-// growRun copies the head of q into the free room of run t and returns the
-// number of bytes copied.
-func growRun(t *seg, q []byte) int {
-	m := copy(t.buf.B[len(t.b):runSize], q)
-	t.b = t.buf.B[:len(t.b)+m]
+// growSeg copies the head of q into t's room and returns the bytes copied.
+func growSeg(t *seg, q []byte) int {
+	n := len(t.b)
+	m := copy(t.b[n:n+segRoom(t)], q)
+	t.b = t.b[:n+m]
 	return m
 }
 
@@ -215,51 +312,95 @@ func (s *Session) newRunLocked(off uint64, q []byte) (seg, int) {
 	return seg{off: off, b: rb.B[:m], buf: rb, run: true}, m
 }
 
-// appendInOrderLocked appends piece at pos == rTail to inq — by reference,
-// or copied into the in-order tail run and new runs (keepByRef) — then
-// promotes every out-of-order segment that became contiguous
-// (promoteLocked). It returns the reference still unused (see dataLocked).
-func (s *Session) appendInOrderLocked(pos uint64, piece []byte, buf, ref *carrier.Buf, budget *int) *carrier.Buf {
+// appendCopyLocked copies piece, at pos == rTail, to the end of inq — into
+// the tail segment's room, then new runs — and promotes what became
+// contiguous.
+func (s *Session) appendCopyLocked(pos uint64, piece []byte, c *rcall) {
 	st := &s.st
-	if keepByRef(piece, buf, budget) {
-		ref = takeRef(buf, ref)
-		st.inq.push(seg{off: pos, b: piece, buf: buf})
-		st.oooCap += int64(cap(buf.B))
-	} else {
-		for q := piece; len(q) > 0; {
-			var m int
-			if t := st.tailRun(pos); t != nil {
-				m = growRun(t, q)
-			} else {
-				var sg seg
-				sg, m = s.newRunLocked(pos, q)
-				st.inq.push(sg)
-			}
-			q, pos = q[m:], pos+uint64(m)
+	for q := piece; len(q) > 0; {
+		var m int
+		if st.inq.n > 0 && segRoom(st.inq.back()) > 0 {
+			m = growSeg(st.inq.back(), q) // the tail ends at rTail == pos
+		} else {
+			var sg seg
+			sg, m = s.newRunLocked(pos, q)
+			st.inq.push(sg)
 		}
+		c.copied += m
+		q, pos = q[m:], pos+uint64(m)
 	}
 	st.rTail += uint64(len(piece))
 	st.rxBytes += uint64(len(piece))
-	s.promoteLocked(budget)
-	return ref
+	s.promoteLocked(c)
+}
+
+// insertCopyLocked copies piece, at pos (> rTail), into ooq before segment
+// i: into the room of the segment that ends exactly at pos, then into new
+// runs while the receive charge stays within recvLimit — bytes beyond it are
+// dropped and counted (D13, V3: never a violation; the sender still holds
+// them). If the piece closed the gap to the next segment, the segments that
+// now follow contiguously are merged (mergeFollowersLocked).
+func (s *Session) insertCopyLocked(i int, pos uint64, piece []byte, c *rcall) {
+	st := &s.st
+	for q := piece; len(q) > 0; {
+		if i > 0 {
+			if t := &st.ooq.s[i-1]; t.end() == pos && segRoom(t) > 0 {
+				m := growSeg(t, q)
+				c.copied += m
+				q, pos = q[m:], pos+uint64(m)
+				continue
+			}
+		}
+		if st.oooCap+runCap > s.recvLimit() {
+			st.oooDropped += uint64(len(q))
+			return // a gap remains: nothing to merge
+		}
+		sg, m := s.newRunLocked(pos, q)
+		c.copied += m
+		st.ooq.insert(i, sg)
+		q, pos, i = q[m:], pos+uint64(m), i+1
+	}
+	s.mergeFollowersLocked(i-1, c)
+}
+
+// mergeFollowersLocked merges the out-of-order segments that follow ooq[k]
+// contiguously into it — copied, their buffers released — while they fit its
+// room and the call's copy limit allows.
+func (s *Session) mergeFollowersLocked(k int, c *rcall) {
+	st := &s.st
+	t := &st.ooq.s[k]
+	j := k + 1
+	for ; j < len(st.ooq.s); j++ {
+		sg := &st.ooq.s[j]
+		n := len(sg.b)
+		if sg.off != t.end() || n > segRoom(t) || n > c.left {
+			break
+		}
+		growSeg(t, sg.b)
+		c.left -= n
+		c.copied += n
+		st.oooCap -= segCap(sg)
+		sg.buf.Release()
+	}
+	st.ooq.cut(k+1, j)
 }
 
 // promoteLocked moves every out-of-order segment that became contiguous
-// (it starts at rTail) into inq (V3). A segment that fits the free room of
-// the in-order tail run is merged into it — copied, and its buffer
-// reference dropped — while budget, the bytes the current Data call may
-// still copy, allows; any other segment is appended as it is and becomes
-// the new tail, so the segments after it can merge into it if it is a run
-// with room.
-func (s *Session) promoteLocked(budget *int) {
+// (it starts at rTail) into inq (V3). A segment that fits the room of the
+// in-order tail is merged into it — copied, its buffer released — while the
+// call's copy limit allows; any other one is appended as it is and becomes
+// the tail the next ones can merge into. inq is not empty (an in-order
+// placement precedes every promotion).
+func (s *Session) promoteLocked(c *rcall) {
 	st := &s.st
 	k := 0
 	for ; k < len(st.ooq.s) && st.ooq.s[k].off == st.rTail; k++ {
 		sg := &st.ooq.s[k]
 		n := len(sg.b)
-		if t := st.tailRun(st.rTail); t != nil && n <= runSize-len(t.b) && n <= *budget {
-			growRun(t, sg.b)
-			*budget -= n
+		if t := st.inq.back(); n <= segRoom(t) && n <= c.left {
+			growSeg(t, sg.b)
+			c.left -= n
+			c.copied += n
 			st.oooCap -= segCap(sg)
 			sg.buf.Release()
 		} else {
@@ -268,47 +409,7 @@ func (s *Session) promoteLocked(budget *int) {
 		st.rTail += uint64(n)
 		st.rxBytes += uint64(n)
 	}
-	if k > 0 {
-		st.ooq.removeFront(k)
-	}
-}
-
-// insertOOOLocked inserts piece at pos (> rTail) before out-of-order
-// segment i: by reference (keepByRef), or appended to the run that ends
-// exactly at pos (if it has room) and otherwise copied into new runs. A new
-// buffer is taken only while the receive charge stays within recvLimit;
-// bytes beyond it are dropped and counted (D13, V3: never a violation; the
-// sender still holds them). It returns the reference still unused.
-func (s *Session) insertOOOLocked(i int, pos uint64, piece []byte, buf, ref *carrier.Buf, budget *int) *carrier.Buf {
-	st := &s.st
-	limit := s.recvLimit()
-	if keepByRef(piece, buf, budget) {
-		if c := int64(cap(buf.B)); st.oooCap+c <= limit {
-			ref = takeRef(buf, ref)
-			st.ooq.insert(i, seg{off: pos, b: piece, buf: buf})
-			st.oooCap += c
-		} else {
-			st.oooDropped += uint64(len(piece))
-		}
-		return ref
-	}
-	for q := piece; len(q) > 0; {
-		if i > 0 {
-			if t := &st.ooq.s[i-1]; t.run && len(t.b) < runSize && t.end() == pos {
-				m := growRun(t, q)
-				q, pos = q[m:], pos+uint64(m)
-				continue
-			}
-		}
-		if st.oooCap+runCap > limit {
-			st.oooDropped += uint64(len(q))
-			break
-		}
-		sg, m := s.newRunLocked(pos, q)
-		st.ooq.insert(i, sg)
-		q, pos, i = q[m:], pos+uint64(m), i+1
-	}
-	return ref
+	st.ooq.removeFront(k)
 }
 
 // shedLocked restores the receive cap after in-order data took room (V3):
@@ -361,14 +462,20 @@ func (st *stream) releaseConsumed() {
 	}
 }
 
-// releaseOOO releases every out-of-order segment.
-func (st *stream) releaseOOO() {
-	for i := range st.ooq.s {
+// releaseOOORange releases the out-of-order segments ooq[a:b] and removes
+// them.
+func (st *stream) releaseOOORange(a, b int) {
+	for i := a; i < b; i++ {
 		sg := &st.ooq.s[i]
 		st.oooCap -= segCap(sg)
 		sg.buf.Release()
 	}
-	st.ooq.removeFront(len(st.ooq.s))
+	st.ooq.cut(a, b)
+}
+
+// releaseOOO releases every out-of-order segment.
+func (st *stream) releaseOOO() {
+	st.releaseOOORange(0, len(st.ooq.s))
 }
 
 // releaseRecv releases every received buffer (session end) and makes the
@@ -382,4 +489,14 @@ func (st *stream) releaseRecv() {
 	}
 	st.releaseOOO()
 	st.rTail = st.rRead
+}
+
+// cut removes l.s[i:j] (their buffers are the caller's).
+func (l *segList) cut(i, j int) {
+	if i >= j {
+		return
+	}
+	n := i + copy(l.s[i:], l.s[j:])
+	clear(l.s[n:])
+	l.s = l.s[:n]
 }
