@@ -29,7 +29,8 @@ func (l *lane) Handle() uint32 {
 // dialer's pending SCHED; the ACK on the duty lane (with the ACK-delay
 // rule, b.WakeAt; an ACK that takes lastWin from 64 KiB or more to below it
 // rings the actor, see readvertiseLocked); then, if l.data, DATA — the
-// rescue span unless l is its holder, retransmissions lowest first, new
+// rescue span if l may send it (rescueSenderLocked: never its holder while
+// another data lane exists), retransmissions lowest first, new
 // data up to min(end, peerLimit), cut at chunk boundaries and bounded by
 // b.Room() and the carrier's capacity (b.MarkCapBlocked when data waits on
 // the cap); then the FIN when due. It sets l.idle when it appended nothing.
