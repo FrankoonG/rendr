@@ -2,6 +2,7 @@ package carrier
 
 import (
 	"context"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,12 @@ type factoryState struct {
 	markAt   time.Time // when the mark was (last) set
 	attempts uint64    // probe attempts started
 	first    bool      // WaitFirst: a sample or a failure since the current run started
+
+	// The gauge's volume counters at the latest probe PING commit of any
+	// incarnation (volAt zero: none yet): the start of the interval over
+	// which the next PING measures the level before its flight.
+	volAt        time.Time
+	volTx, volRx uint64
 }
 
 // probePing is the gauge state when one probe PING was committed (§8.2).
@@ -120,6 +127,27 @@ type probePing struct {
 	id     uint32
 	loaded bool   // the gauge was loaded at the commit
 	epoch  uint64 // the gauge epoch at the commit
+	tx, rx uint64 // the gauge's volume counters at the commit
+	// idle is how long no DATA had moved at the commit, calm how long no
+	// carrier had been backlogged (0: one was); forever: never.
+	idle, calm time.Duration
+	// prior is the DATA (both directions) the factory's session carriers
+	// moved from the previous probe PING commit to this one, over priorSpan
+	// (zero: no previous commit).
+	prior     uint64
+	priorSpan time.Duration
+}
+
+// forever is probePing.idle and .calm when the event never happened.
+const forever = time.Duration(math.MaxInt64)
+
+// since returns how long before at the event at t happened: forever for a
+// zero t, 0 for a t after at (a reading taken a moment after at).
+func since(at, t time.Time) time.Duration {
+	if t.IsZero() {
+		return forever
+	}
+	return max(at.Sub(t), 0)
 }
 
 // probeEarly is a matched probe PONG that arrived before its PING's
@@ -127,7 +155,8 @@ type probePing struct {
 // (it records the commit under Conn.mu) before it calls PingCommitted, so
 // on a path faster than that gap the reader reports the PONG first. Its
 // sample waits for the callback, which always follows the commit, so the
-// commit-time gauge state still tags it (§8.2).
+// commit-time gauge state still tags it (§8.2). Such a flight is shorter
+// than the callback's own delay: the volume rule never applies to it.
 type probeEarly struct {
 	ok     bool
 	id     uint32
@@ -452,35 +481,45 @@ func (h *Health) publishLocked() {
 type healthObserver struct{ h *Health }
 
 func (o healthObserver) PingCommitted(c *Conn, id uint32, at time.Time) {
-	o.h.pingCommitted(c, id)
+	o.h.pingCommitted(c, id, at)
 }
 
 func (o healthObserver) Pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	o.h.pong(c, id, rtt, at)
 }
 
-// pingCommitted records the factory gauge's state at the commit of probe
-// PING id (§8.2), or completes the sample of a PONG that overtook this
-// callback. Callbacks of an incarnation that is no longer current change
-// nothing (L21, L23).
-func (h *Health) pingCommitted(c *Conn, id uint32) {
+// pingCommitted records the factory gauge's state at the commit (at) of
+// probe PING id (§8.2) — its load state and, for volumeLoaded, its volume
+// counters, how long no DATA had moved and no carrier had been backlogged,
+// and the DATA moved since the previous probe PING commit — or completes
+// the sample of a PONG that overtook this callback. Callbacks of an
+// incarnation that is no longer current change nothing (L21, L23).
+func (h *Health) pingCommitted(c *Conn, id uint32, at time.Time) {
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
 		return
 	}
-	loaded, epoch := h.gauges[i].Loaded(h.p.LoadThreshold)
+	g := h.gauges[i].read(h.p.LoadThreshold)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	f := &h.fac[i]
 	if f.conn != c {
 		return
 	}
+	rec := probePing{id: id, loaded: g.loaded, epoch: g.epoch, tx: g.tx, rx: g.rx, idle: since(at, g.movedAt), calm: since(at, g.calmAt)}
+	if g.backlogged {
+		rec.calm = 0
+	}
+	if !f.volAt.IsZero() {
+		rec.prior, rec.priorSpan = grown(g.tx, f.volTx)+grown(g.rx, f.volRx), at.Sub(f.volAt)
+	}
+	f.volAt, f.volTx, f.volRx = at, g.tx, g.rx
 	if e := f.early; e.ok && e.id == id {
 		f.early = probeEarly{}
-		h.sampleLocked(i, e.at, e.rtt, e.loaded || loaded || e.epoch != epoch)
+		h.sampleLocked(i, e.at, e.rtt, e.loaded || g.loaded || e.epoch != g.epoch)
 		return
 	}
-	f.pushPing(probePing{id: id, loaded: loaded, epoch: epoch})
+	f.pushPing(rec)
 }
 
 // pong turns a matched probe PONG into a sample (design §7.8, §8.2). at is
@@ -488,9 +527,11 @@ func (h *Health) pingCommitted(c *Conn, id uint32) {
 // future stamp is impossible), rtt counts from the PING's write commit
 // (L23). The sample is loaded when the factory's gauge was loaded at the
 // commit or at the arrival, or its epoch changed in between (a load episode
-// shorter than one probe RTT). A PONG of an incarnation that is no longer
-// current gives nothing (L21, L23). A PONG without its commit record
-// overtook its PingCommitted callback: the sample waits for it (probeEarly).
+// shorter than one probe RTT), or by the volume rule (volumeLoaded: the
+// Peer's traffic rose during the flight faster than the gauge could see
+// it). A PONG of an incarnation that is no longer current gives nothing
+// (L21, L23). A PONG without its commit record overtook its PingCommitted
+// callback: the sample waits for it (probeEarly).
 //
 // A round trip shorter than the clock's resolution measures 0 (Windows'
 // monotonic clock advances in steps of about 0.3–0.5 ms, so a loopback or
@@ -505,7 +546,7 @@ func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	if i < 0 || i >= len(h.gauges) {
 		return
 	}
-	loaded, epoch := h.gauges[i].Loaded(h.p.LoadThreshold)
+	g := h.gauges[i].read(h.p.LoadThreshold)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	f := &h.fac[i]
@@ -514,10 +555,91 @@ func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	}
 	rec, ok := f.takePing(id)
 	if !ok {
-		f.early = probeEarly{ok: true, id: id, rtt: rtt, at: at, loaded: loaded, epoch: epoch}
+		f.early = probeEarly{ok: true, id: id, rtt: rtt, at: at, loaded: g.loaded, epoch: g.epoch}
 		return
 	}
-	h.sampleLocked(i, at, rtt, loaded || rec.loaded || rec.epoch != epoch)
+	loaded := g.loaded || rec.loaded || rec.epoch != g.epoch ||
+		h.volumeLoaded(&rec, grown(g.tx, rec.tx)+grown(g.rx, rec.rx), rtt)
+	h.sampleLocked(i, at, rtt, loaded)
+}
+
+// grown returns how far a volume counter grew from then to now. The two
+// readings come from different goroutines (the probe carrier's writer at
+// the commit, its reader at the arrival) and are taken before Health.mu, so
+// a PONG that raced its PingCommitted callback can carry the earlier
+// reading: that counts as no growth.
+func grown(now, then uint64) uint64 {
+	if now < then {
+		return 0
+	}
+	return now - then
+}
+
+// volumeLoaded is the volume rule of the self-load guard (design §8.2,
+// added for §0.13 A7a): a probe sample is also loaded when the factory's
+// session carriers moved at least LoadThreshold of DATA, both directions
+// together, between its PING's commit and its PONG's arrival (moved),
+// unless that traffic was established before the commit (established).
+//
+// The volume covers what the instantaneous rule cannot see yet. A download
+// that starts at a probe PING's commit queues the PONG behind the passive's
+// first burst (its capacity), yet when the PONG arrives the dialer's gauge
+// still shows nothing: no forward bytes in flight, a reverse bound of 0
+// (rxRate is refreshed only when the session carrier's own PONG arrives,
+// behind the same burst) and no backlog (the passive's first BUSY PING is
+// still on its way). The burst itself reached the dialer before the PONG,
+// so the moved volume is at least the burst. Light interactive traffic
+// stays far below the threshold (G2, G9: 1 KiB each way every 100 ms moves
+// a few KiB in a 20–100 ms flight) and follows the instantaneous rule
+// alone. LoadThreshold = MaxInt64 disables this rule with the rest of the
+// guard.
+func (h *Health) volumeLoaded(rec *probePing, moved uint64, rtt time.Duration) bool {
+	return moved >= uint64(h.p.LoadThreshold) && !h.established(rec, rtt)
+}
+
+// established reports that the traffic before probe PING rec's commit was
+// application-limited traffic the instantaneous rule had already
+// classified (§8.1 item 2), so the volume rule leaves the sample to it. A
+// fixed rate moves more per flight as the RTT grows, so without this
+// exception every sample of an echo of 256 KiB/s on a path whose RTT rose
+// to 300 ms (77 KiB each way per flight, never backlogged) would be loaded
+// and the selector could never leave the path. Bursty traffic needs it too:
+// while an application sends a 64 KiB message every second, every sample
+// whose flight a message overlaps would be loaded — all of them when the
+// message period divides Probe.Interval.
+//
+// The traffic is established when the session carriers moved DATA since
+// the previous probe PING commit (prior, over priorSpan), none of them was
+// backlogged at the commit or within one flight (rtt) before it, and either
+//   - regular: at least LoadThreshold moved and none of them was backlogged
+//     since the previous commit, however bursty the traffic; or
+//   - steady: at the rate it moved, L = prior/priorSpan, one flight carries
+//     at least LoadThreshold (L·rtt) and the carriers had not been silent
+//     at the commit for as long as LoadThreshold takes at that rate
+//     (L·idle), a continuous flow that may have hit its capacity cap now
+//     and then (a capacity that gets no BUSY sample decays).
+//
+// A transfer that restarts after a pause behind a saturating one is not
+// established: its predecessor was backlogged in the interval (not
+// regular), and the restart came either after a silence as long as
+// LoadThreshold takes at that rate (not steady) or within one flight of the
+// predecessor's backlog report clearing. Traffic that rises from a trickle
+// is not established either. Known gaps: a transfer that starts at a probe
+// PING while unbacklogged traffic of at least LoadThreshold per probe
+// interval flows on the same factory still gets an unloaded sample (§8.4);
+// and with a Probe.Interval shorter than the RTT, an echo whose reverse
+// direction falls silent for one RTT after the RTT rose loses a sample or
+// two to the volume rule.
+func (h *Health) established(rec *probePing, rtt time.Duration) bool {
+	if rec.prior == 0 || rec.calm < rtt {
+		return false
+	}
+	thr := uint64(h.p.LoadThreshold)
+	if rec.priorSpan <= 0 || (rec.prior >= thr && rec.calm >= rec.priorSpan) {
+		return true // regular (or no time base to judge it: the instantaneous rule decides)
+	}
+	p, span, t := float64(rec.prior), float64(rec.priorSpan), float64(thr)
+	return p*float64(rtt) >= t*span && p*float64(rec.idle) < t*span // steady
 }
 
 // sampleLocked adds one probe sample of factory i and publishes the

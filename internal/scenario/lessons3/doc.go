@@ -9,8 +9,10 @@
 // and asserts that its stimulus happened, that its load was reached and that
 // the data arrived intact. The package has no production code.
 //
-// Reproductions of open product findings live in findings_test.go behind
-// the rendr_findings build tag: they fail on the current code by design and
-// run only with go test -tags rendr_findings. A finding whose product fix
-// landed moves to the package's normal tests (design §0.13 Revision 8).
+// A reproduction of an open product finding, which fails on the current
+// code by design, goes to findings_test.go behind the rendr_findings build
+// tag and runs only with go test -tags rendr_findings; once its product fix
+// lands it moves to the package's normal tests (design §0.13 Revision 8).
+// None is open: the last one, TestDownloadGuardEdges_L29, moved to
+// l29_test.go with the self-load guard's volume rule (§0.13 A7a).
 package lessons3

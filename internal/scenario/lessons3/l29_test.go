@@ -47,6 +47,10 @@ type guardBulk struct {
 	// atProbePing starts the bulk the moment a's probe carrier committed a
 	// PING; otherwise it starts about halfway between two of them.
 	atProbePing bool
+	// lead (with atProbePing): a first transfer of lead × rate bytes, in the
+	// bulk's direction, starts at one of a's probe PINGs; the bulk starts at
+	// the next one, after the pause the first transfer leaves.
+	lead time.Duration
 }
 
 // guardResult is what a bulk scenario observed.
@@ -56,6 +60,23 @@ type guardResult struct {
 	srtt            time.Duration       // the session carrier's smoothed RTT on a in mid-bulk
 	carried         int64               // bulk bytes delivered while the bulk ran
 	throttled       int64               // bytes a's bottleneck paced
+	onsetLoaded     bool                // atProbePing: a's sample of the PING the bulk started at was loaded
+	pause           time.Duration       // lead: from the first transfer's last byte to the bulk's start
+}
+
+// awaitProbePing waits until a's probe carrier committed a PING.
+func awaitProbePing(t *testing.T, a *rendrtest.Link) {
+	t.Helper()
+	for ok := false; !ok; {
+		before := a.Stats().Probe.FramesCaptured
+		select {
+		case <-a.CaptureNextFrame(rendrtest.Up, rendrtest.FramePing):
+		case <-time.After(3 * time.Second):
+			t.Fatal("a's probe carrier sent no PING for 3 s")
+		}
+		synctest.Wait() // the link counts the capture right after handing it over
+		ok = a.Stats().Probe.FramesCaptured > before
+	}
 }
 
 func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
@@ -86,28 +107,38 @@ func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
 				t.Fatalf("before the bulk: factory %d %+v, want fresh evidence", i, fs)
 			}
 		}
-		if gb.atProbePing {
-			for ok := false; !ok; {
-				before := a.Stats().Probe.FramesCaptured
-				select {
-				case <-a.CaptureNextFrame(rendrtest.Up, rendrtest.FramePing):
-				case <-time.After(3 * time.Second):
-					t.Fatal("a's probe carrier sent no PING for 3 s")
-				}
-				synctest.Wait() // the link counts the capture right after handing it over
-				ok = a.Stats().Probe.FramesCaptured > before
-			}
-		}
 		from, to := dc, pc
 		if gb.download {
 			from, to = pc, dc
 		}
+		var onset rendr.FactoryStatus
+		if gb.atProbePing {
+			if gb.lead > 0 {
+				awaitProbePing(t, a)
+				lead := w.startFlow("lead", from, to, 290, flowOpts{n: int64(gb.rate * gb.lead.Seconds()), keepOpen: true})
+				lead.wait(t, 10*time.Second)
+				leadEnd := time.Now()
+				awaitProbePing(t, a)
+				res.pause = time.Since(leadEnd)
+			} else {
+				awaitProbePing(t, a)
+			}
+			onset = p.Status().Factories[0]
+		}
+		start := time.Now()
 		bulk := w.startFlow("bulk", from, to, 291, flowOpts{})
-		time.Sleep(gb.dur / 2)
+		if gb.atProbePing {
+			// a's next sample is the one of the PING the bulk started at.
+			waitFor(t, time.Second, "a's sample of the PING the bulk started at", func() bool {
+				return p.Status().Factories[0].Samples > onset.Samples
+			})
+			res.onsetLoaded = p.Status().Factories[0].LoadedSamples > onset.LoadedSamples
+		}
+		time.Sleep(time.Until(start.Add(gb.dur / 2)))
 		if cs, ok := carrierByID(dc, first.ID); ok {
 			res.srtt = cs.SRTT
 		}
-		time.Sleep(gb.dur / 2)
+		time.Sleep(time.Until(start.Add(gb.dur)))
 		res.carried = bulk.recvd.Load()
 		bulk.stop()
 		bulk.wait(t, 60*time.Second)
@@ -154,10 +185,8 @@ func checkGuarded(t *testing.T, gb guardBulk, r guardResult) {
 // capacity sits at its 128 KiB floor, so the reverse bound rxRate × srtt
 // alone hovered around the load threshold while the passive was saturated;
 // a peer that reports BUSY now counts at least the capacity floor (design
-// §0.13 A5). The start phase of both cases (halfway between two of a's
-// probe PINGs) is the favourable one: a download that starts right after a
-// probe PING commit still switches (the rendr_findings test
-// TestDownloadGuardEdges_L29, recorded as open in §0.13).
+// §0.13 A5). Both cases start halfway between two of a's probe PINGs; a
+// download that starts right at a probe PING is TestDownloadGuardEdges_L29.
 func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 	t.Run("guarded", func(t *testing.T) {
 		gb := guardBulk{download: true, rate: guardRate(), dur: 60 * time.Second}
@@ -178,6 +207,63 @@ func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 			t.Fatalf("control: %d samples tagged loaded with the guard disabled", r.a.LoadedSamples)
 		}
 	})
+}
+
+// TestDownloadGuardEdges_L29: downloads in the shape of
+// TestBulkDownloadNoQualitySwitch_L29 that start right at one of a's probe
+// PINGs (design §0.13 A7a, §8.2 volume rule). The PING's PONG enters the
+// down bottleneck one one-way delay after the commit, behind the rest of
+// the passive's first burst (its capacity: the 128 KiB floor after an idle
+// phase), and waits for it to drain: about 52 ms at 2 MiB/s, so the sample
+// measures about 72 ms against a base of 20 ms. When the PONG arrives the
+// gauge still holds nothing — no forward bytes in flight (a download), a
+// reverse bound of 0 (rxRate is refreshed only when the dialer's own
+// session carrier receives a PONG, behind the same burst) and no backlog
+// (the passive's first BUSY PING is still on its way) — so the
+// instantaneous rule took the sample as unloaded; with only the few
+// unloaded samples of the idle phase in a's window it lifted a's mean
+// enough for b (20 ms) to qualify, and the switch followed one dwell
+// later. The volume rule tags it loaded: the burst itself crossed a's
+// session carrier during the flight. Both subtests require that sample to
+// be loaded and no switch; on the code before the volume rule both fail
+// with one quality switch on each end (L60: the stimulus is real). The
+// guard-disabled control of TestBulkDownloadNoQualitySwitch_L29 disables
+// the volume rule too (it shares LoadThreshold).
+//
+//   - start-at-probe-ping: the download starts after the idle phase.
+//   - restart-at-probe-ping: a first transfer of 1.75 s at the link rate
+//     starts at one probe PING and the download restarts at the next one,
+//     after a pause of a few hundred milliseconds: the first transfer still
+//     dominates the interval before the commit, but it was backlogged, so
+//     the volume rule does not take the traffic as established
+//     application-limited flow.
+//
+// The window exists only while the first capacity drains slower than about
+// one one-way delay (128 KiB per 10 ms, about 12.8 MB/s at a 20 ms RTT): at
+// G1-sel's 200 Mbit/s the first sample measures 20.0 ms.
+func TestDownloadGuardEdges_L29(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lead time.Duration
+	}{
+		{"start-at-probe-ping", 0},
+		{"restart-at-probe-ping", 1750 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gb := guardBulk{download: true, rate: guardRate(), dur: 30 * time.Second, atProbePing: true, lead: tc.lead}
+			r := runGuardBulk(t, gb)
+			if tc.lead > 0 {
+				t.Logf("pause between the transfers %v", r.pause)
+				if r.pause <= 0 || r.pause >= time.Second {
+					t.Fatalf("stimulus: pause %v between the transfers, want a fraction of the 2 s probe interval", r.pause)
+				}
+			}
+			checkGuarded(t, gb, r)
+			if !r.onsetLoaded {
+				t.Fatalf("a's sample of the PING the download started at was unloaded: %+v", r.a)
+			}
+		})
+	}
 }
 
 // TestBulkUploadNoQualitySwitch_L29: the mirrored case (§8.3 "upload bulk
