@@ -3,6 +3,9 @@ package rendrtest
 import (
 	"net"
 	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,62 +17,135 @@ const (
 	readyPoll    = 5 * time.Millisecond
 )
 
-// leakSample is one observation: goroutines and open fds (-1 where fds are
-// not counted).
-type leakSample struct{ g, fd int }
-
-func sampleLeak() leakSample { return leakSample{runtime.NumGoroutine(), openFDs()} }
-
-// AssertNoLeak records a settled goroutine baseline (and the open-fd count
-// on Linux) and returns a check to defer (L66). The caller must have joined
-// everything it started before the check runs; the check then forces a
-// netpoll round trip and waits (at most 10 s) until three consecutive
-// samples 100 ms apart equal the baseline (unit layer: zero growth), else
-// it fails t with a full goroutine dump. Inside a synctest bubble the
-// bubble's own leak check makes it unnecessary.
+// AssertNoLeak records a settled baseline of the live goroutines — by
+// identity — and, on Linux, of the open file descriptors, and returns a
+// check to defer (L66). The caller must have joined everything it started
+// before the check runs; the check then forces a netpoll round trip and
+// waits (at most 10 s) until three consecutive samples 100 ms apart show no
+// goroutine and no fd that was not in the baseline (unit layer: zero
+// growth). Baseline goroutines and fds may end meanwhile without hiding a
+// new one. On failure t gets the stacks of the new goroutines and the new
+// fds only.
+//
+// It is meant for real-time tests outside synctest bubbles (a bubble checks
+// its own goroutines). It cannot be used with t.Parallel: goroutines of
+// tests running in parallel would count as leaks.
 func AssertNoLeak(t testing.TB) (check func()) {
 	t.Helper()
-	netpollRoundTrip()
-	base := settle()
+	return leakCheck{wait: leakWait, real: true}.assert(t)
+}
+
+// leakCheck is AssertNoLeak's procedure. Its self-tests run it inside
+// synctest bubbles with real false: no sockets (the netpoll round trip) and
+// no fds there (design §3.8).
+type leakCheck struct {
+	wait time.Duration
+	real bool
+}
+
+func (lc leakCheck) assert(t testing.TB) (check func()) {
+	t.Helper()
+	if lc.real {
+		netpollRoundTrip()
+	}
+	base := lc.settle()
 	return func() {
 		t.Helper()
-		netpollRoundTrip()
-		deadline := time.Now().Add(leakWait)
-		var cur leakSample
-		for same := 0; ; {
-			if cur = sampleLeak(); cur == base {
-				if same++; same == leakSamples {
+		if lc.real {
+			netpollRoundTrip()
+		}
+		deadline := time.Now().Add(lc.wait)
+		var gs, fds []string
+		for clean := 0; ; {
+			if gs, fds = leaked(base, lc.sample()); len(gs)+len(fds) == 0 {
+				if clean++; clean == leakSamples {
 					return
 				}
 			} else {
-				same = 0
+				clean = 0
 			}
 			if !time.Now().Before(deadline) {
 				break
 			}
 			time.Sleep(leakInterval)
 		}
-		buf := make([]byte, 1<<20)
-		buf = buf[:runtime.Stack(buf, true)]
-		t.Errorf("rendrtest: leak after %v: %d goroutines (baseline %d), %d fds (baseline %d)\n%s",
-			leakWait, cur.g, base.g, cur.fd, base.fd, buf)
+		t.Errorf("rendrtest: leak after %v: %d goroutine(s) and %d fd(s) not in the baseline %q\n%s",
+			lc.wait, len(gs), len(fds), fds, strings.Join(gs, "\n\n"))
 	}
 }
 
-// settle returns the first value seen in three consecutive samples 100 ms
-// apart (or the last sample after leakWait).
-func settle() leakSample {
-	deadline := time.Now().Add(leakWait)
-	last, same := sampleLeak(), 1
-	for same < leakSamples && time.Now().Before(deadline) {
-		time.Sleep(leakInterval)
-		if cur := sampleLeak(); cur == last {
-			same++
-		} else {
-			last, same = cur, 1
+// leakSample is one observation: the live goroutines by ID with their
+// stacks, the sampling goroutine's ID, and the open fds ("fd -> target"; nil
+// where they are not observed).
+type leakSample struct {
+	gs   map[uint64]string
+	self uint64
+	fds  map[string]bool
+}
+
+func (lc leakCheck) sample() leakSample {
+	buf := make([]byte, 64<<10)
+	for {
+		if n := runtime.Stack(buf, true); n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	s := leakSample{gs: map[uint64]string{}}
+	for i, block := range strings.Split(string(buf), "\n\n") {
+		head, _, _ := strings.Cut(strings.TrimPrefix(block, "goroutine "), " ")
+		if id, err := strconv.ParseUint(head, 10, 64); err == nil {
+			s.gs[id] = block
+			if i == 0 { // runtime.Stack lists the calling goroutine first
+				s.self = id
+			}
 		}
 	}
+	if lc.real {
+		s.fds = openFDs()
+	}
+	return s
+}
+
+// settle samples until three consecutive samples 100 ms apart see the same
+// goroutines and fds (or lc.wait passed) and returns the last one.
+func (lc leakCheck) settle() leakSample {
+	deadline := time.Now().Add(lc.wait)
+	last, same := lc.sample(), 1
+	for same < leakSamples && time.Now().Before(deadline) {
+		time.Sleep(leakInterval)
+		cur := lc.sample()
+		if g, f := leaked(last, cur); len(g)+len(f) == 0 && len(cur.gs) == len(last.gs) && len(cur.fds) == len(last.fds) {
+			same++
+		} else {
+			same = 1
+		}
+		last = cur
+	}
 	return last
+}
+
+// leaked returns the stacks of the goroutines of cur that are not in base
+// (except the sampling goroutine), in ID order, and its fds not in base.
+func leaked(base, cur leakSample) (gs, fds []string) {
+	var ids []uint64
+	for id := range cur.gs {
+		if _, ok := base.gs[id]; !ok && id != cur.self {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		gs = append(gs, cur.gs[id])
+	}
+	for fd := range cur.fds {
+		if !base.fds[fd] {
+			fds = append(fds, fd)
+		}
+	}
+	slices.Sort(fds)
+	return gs, fds
 }
 
 // netpollRoundTrip moves one byte through a loopback TCP pair, so that the

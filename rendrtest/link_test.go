@@ -185,6 +185,144 @@ func TestLinkRateSharedBottleneck(t *testing.T) {
 	})
 }
 
+// TestLinkLostBytesLeaveTheBottleneck: bytes lost to Kill or to the
+// blackhole give the bottleneck back at once: one byte written right after
+// 1 MiB was lost on a 1 MiB/s link arrives after ≈ 1 µs of transmission,
+// not after the second the lost MiB would have occupied.
+func TestLinkLostBytesLeaveTheBottleneck(t *testing.T) {
+	const rate = 1 << 20
+	oneByte := time.Second / rate // rounded down; the check allows 1 µs more
+	t.Run("kill", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newHarness(t, LinkConfig{Name: "kill-rate"})
+			defer h.l.Close()
+			h.l.SetRate(rate)
+			a, _ := h.dial() // its far end never reads
+			write(t, a, make([]byte, 1<<20))
+			time.Sleep(10 * time.Millisecond)
+			if n := h.l.Kill(); n != 1 {
+				t.Fatalf("Kill = %d", n)
+			}
+			if st := h.l.Stats(); st.All.BufferLost != 1<<20 || st.All.Bytes != 0 {
+				t.Fatalf("BufferLost %d, Bytes %d; want 1 MiB, 0", st.All.BufferLost, st.All.Bytes)
+			}
+			b, bSrv := h.dial()
+			start := time.Now()
+			write(t, b, []byte{7})
+			readN(t, bSrv, 1)
+			if d := time.Since(start); d > oneByte+time.Microsecond {
+				t.Fatalf("one byte behind a killed carrier's lost MiB took %v", d)
+			}
+		})
+	})
+	t.Run("blackhole", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := newHarness(t, LinkConfig{Name: "bh-rate"})
+			defer h.l.Close()
+			h.l.SetRate(rate)
+			cli, srv := h.dial()
+			ra := readBackground(srv)
+			write(t, cli, make([]byte, 1<<20))
+			time.Sleep(10 * time.Millisecond)
+			h.l.SetBlackhole(true)
+			synctest.Wait()
+			if st := h.l.Stats(); st.All.Dropped != 1<<20 || len(ra.bytes()) != 0 {
+				t.Fatalf("Dropped %d, delivered %d; want the whole queued MiB dropped at once", st.All.Dropped, len(ra.bytes()))
+			}
+			h.l.SetBlackhole(false)
+			start := time.Now()
+			write(t, cli, []byte{7})
+			time.Sleep(time.Millisecond)
+			if at := ra.times(); len(at) != 1 || at[0].Sub(start) > oneByte+time.Microsecond {
+				t.Fatalf("one byte after a blackholed MiB: %d bytes, arrival %v", len(at), at)
+			}
+		})
+	})
+}
+
+// TestLinkStallDrainsAtRate: a stall stops the bottleneck, and its backlog
+// then drains at the rate — not as one burst when the stall ends.
+func TestLinkStallDrainsAtRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const rate = 64 << 10
+		h := newHarness(t, LinkConfig{Name: "stall-rate"})
+		defer h.l.Close()
+		h.l.SetRate(rate)
+		cli, srv := h.dial()
+		ra := readBackground(srv)
+		h.l.SetStall(true)
+		data := prngBytes(6, 10*rate)
+		write(t, cli, data)
+		time.Sleep(20 * time.Second)
+		if n := len(ra.bytes()); n != 0 {
+			t.Fatalf("%d bytes crossed a stalled link", n)
+		}
+		if held := h.l.Stats().All.Held; held != 10 {
+			t.Fatalf("Held %d, want the 10 queued chunks", held)
+		}
+		released := time.Now()
+		h.l.SetStall(false)
+		time.Sleep(1500 * time.Millisecond)
+		if n := len(ra.bytes()); n != rate {
+			t.Fatalf("%d bytes 1.5 s after the stall at %d B/s: the backlog burst", n, rate)
+		}
+		time.Sleep(9 * time.Second)
+		got, at := ra.bytes(), ra.times()
+		if !bytes.Equal(got, data) || at[len(at)-1].Sub(released) != 10*time.Second {
+			t.Fatalf("%d of %d bytes, the last %v after the stall; want all after 10s", len(got), len(data), at[len(at)-1].Sub(released))
+		}
+	})
+}
+
+// TestLinkSetRateAppliesToQueued: a rate change applies at once to the
+// bytes already queued at the bottleneck.
+func TestLinkSetRateAppliesToQueued(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const rate = 64 << 10
+		h := newHarness(t, LinkConfig{Name: "rate-change"})
+		defer h.l.Close()
+		h.l.SetRate(rate)
+		cli, srv := h.dial()
+		ra := readBackground(srv)
+		data := prngBytes(8, 10*rate)
+		start := time.Now()
+		write(t, cli, data)
+		time.Sleep(1500 * time.Millisecond)
+		if n := len(ra.bytes()); n != rate {
+			t.Fatalf("%d bytes after 1.5 s at %d B/s", n, rate)
+		}
+		h.l.SetRate(0)
+		time.Sleep(time.Millisecond)
+		got, at := ra.bytes(), ra.times()
+		if !bytes.Equal(got, data) || at[len(at)-1].Sub(start) != 1500*time.Millisecond {
+			t.Fatalf("%d of %d bytes, the last after %v; want all at 1.5s once the limit was lifted", len(got), len(data), at[len(at)-1].Sub(start))
+		}
+		if th := h.l.Stats().Throttled; th != rate {
+			t.Fatalf("Throttled %d, want only the chunk paced before the change (%d)", th, rate)
+		}
+	})
+}
+
+// TestLinkCountsReadBytesOnly: Bytes and CarrierInfo.Up count what the far
+// end has read, not what waits in the link for a reader.
+func TestLinkCountsReadBytesOnly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, LinkConfig{Name: "read-only"})
+		defer h.l.Close()
+		cli, srv := h.dial()
+		write(t, cli, make([]byte, 1000))
+		synctest.Wait()
+		if st, ci := h.l.Stats(), h.l.Carriers()[0]; st.All.Bytes != 0 || ci.Up != 0 {
+			t.Fatalf("Bytes %d, Up %d before the far end read anything", st.All.Bytes, ci.Up)
+		}
+		readN(t, srv, 1000)
+		synctest.Wait()
+		if st, ci := h.l.Stats(), h.l.Carriers()[0]; st.All.Bytes != 1000 || ci.Up != 1000 {
+			t.Fatalf("Bytes %d, Up %d after the far end read 1000", st.All.Bytes, ci.Up)
+		}
+	})
+}
+
 // TestLinkKillLosesBufferedBytes: a Write returns once the link holds its
 // bytes (bounded by Buffer); Kill loses exactly the bytes the far end had
 // not read (BufferLost), and both conns then fail as a dead carrier does.

@@ -33,9 +33,10 @@ end of M1b but may still change before v2.0.0. Packet sessions, datagram
 and QUIC carriers (M2), race scheduling and carrier multiplexing (M3), and an
 L4 TCP module (M4) follow.
 
-Supported platforms are Linux and Windows; macOS and arm64 are compiled but
-not tested at run time. The root module depends only on the standard
-library (and `golang.org/x/sys` where needed).
+Supported platforms are Linux and Windows; Windows has no real-network
+regression in 2.0.0 (see [Not in 2.0.0](#not-in-200)). macOS and arm64 are
+compiled but not tested at run time. The root module depends only on the
+standard library (and `golang.org/x/sys` where needed).
 
 ## Security model
 
@@ -46,7 +47,8 @@ transport layer meant to run inside the embedder's own protocol:
   encrypted channel that the embedder controls (mutual TLS, an SSH tunnel,
   an authenticated L7 tunnel, ...).
 - A rendr `InstanceID` identifies a running instance for routing only. It is
-  random and not guessable, but it is **not an identity** and proves nothing.
+  random but travels in clear on the wire: it is not a secret, **not an
+  identity**, and proves nothing.
 - The built-in TCP carrier (`carrier/tcp`) is plaintext. Its listener and
   dialer accept only loopback addresses unless `Options.AllowNonLoopback` is
   set; enable that only on a trusted network or inside an authenticated
@@ -182,8 +184,11 @@ bubbles and is used by rendr's own tests.
 ## Not in 2.0.0
 
 - Carrier pools, warm standby carriers, carrier priorities and changing a
-  running session's carrier set: every session snapshots its Peer's factories
-  at `Dial`.
+  running session's carrier set. Every session snapshots its Peer's factories
+  at `Dial` and only redials those; replacing a factory affects new sessions
+  only. Selector failover therefore dials a new carrier, probe carriers are
+  never adopted by sessions, and the failover time an expensive (L7)
+  carrier dial adds is quantified only before the 2.0.0 release.
 - Nested scheduling groups and peak-transfer modes.
 - L4 UDP, L3 and L2 payload modules (the L4 module of M4 is TCP only).
 - Stream sessions over raw datagram carriers (use QUIC streams or a reliable
@@ -192,6 +197,8 @@ bubbles and is used by rendr's own tests.
   retransmit).
 - Optional quality triggers, re-probe hooks and embedder quality callbacks.
 - A graceful `Runtime.Shutdown(ctx)`: only `Close` (GOAWAY and reset).
+- A real-network regression on Windows: Windows is covered by unit tests,
+  in-process scenario tests and cross-compilation only.
 - Run-time testing on macOS and arm64 (compile-only).
 
 ## License

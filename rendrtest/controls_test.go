@@ -1,6 +1,7 @@
 package rendrtest
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"testing"
@@ -8,9 +9,17 @@ import (
 	"time"
 )
 
-// counterNames names every counter for failure messages.
+// counterNames names every counter after its Counts field.
 var counterNames = [nCtr]string{"Killed", "Bytes", "Dropped", "Held", "Corrupted", "FramesCorrupted",
-	"FramesDropped", "FramesInjected", "BufferLost", "MaxDelay", "scripted", "blocked", "panics", "overReads", "captured"}
+	"FramesDropped", "FramesInjected", "BufferLost", "MaxDelay", "WritesScripted", "WritesBlocked",
+	"WritePanics", "OverReads", "FramesCaptured"}
+
+// exported maps a Counts value onto the internal counter order.
+func exported(c Counts) [nCtr]int64 {
+	return [nCtr]int64{c.Killed, c.Bytes, c.Dropped, c.Held, c.Corrupted, c.FramesCorrupted,
+		c.FramesDropped, c.FramesInjected, c.BufferLost, int64(c.MaxDelay), c.WritesScripted,
+		c.WritesBlocked, c.WritePanics, c.OverReads, c.FramesCaptured}
+}
 
 // snapCounters reads every counter of every class (all, session, probe).
 func snapCounters(l *Link) (s [3][nCtr]int64) {
@@ -44,12 +53,14 @@ func newControlsRig(t *testing.T) *controlsRig {
 	return r
 }
 
-// TestLinkControlsCount_L60: every link control has a stimulus counter, and
-// the counters are split by carrier class (session = first frame OPEN/JOIN,
-// probe = PING) so that a stimulus proof counts only what touched a session.
-// Each row applies one control on a link carrying one session and one probe
+// TestLinkControlsCount_L60: every link control has a stimulus counter in
+// Stats, split by carrier class (session = first frame OPEN/JOIN, probe =
+// PING) so that a stimulus proof counts only what touched a session. Each
+// row applies one control on a link carrying one session and one probe
 // carrier and checks the exact per-class deltas; every counter obeys
-// All = Session + Probe.
+// All = Session + Probe, and Stats reports every counter of every class.
+// The CaptureNextFrame and ScriptWrites rows show a one-shot control
+// hitting whichever carrier comes first, which the Session counter tells.
 func TestLinkControlsCount_L60(t *testing.T) {
 	type deltas map[ctr][2]int64 // counter → (session, probe) delta
 	rows := []struct {
@@ -122,14 +133,20 @@ func TestLinkControlsCount_L60(t *testing.T) {
 			return deltas{cFramesInjected: {1, 1}}
 		}},
 		{"CaptureNextFrame", func(t *testing.T, r *controlsRig) deltas {
-			ch := r.h.l.CaptureNextFrame(Up, FramePing)
-			write(t, r.sCli, frameBytes(FramePing, 2, pingPayload(9)))
-			synctest.Wait()
-			write(t, r.pCli, r.pPing)
-			if len(<-ch) == 0 {
-				t.Fatal("empty capture")
+			// The first carrier to forward a PING wins: the session's, then
+			// (armed again) the probe's.
+			for i, order := range [][]net.Conn{{r.sCli, r.pCli}, {r.pCli, r.sCli}} {
+				ch := r.h.l.CaptureNextFrame(Up, FramePing)
+				first := frameBytes(FramePing, uint32(2+i), pingPayload(uint32(10+i)))
+				write(t, order[0], first)
+				synctest.Wait()
+				write(t, order[1], frameBytes(FramePing, uint32(2+i), pingPayload(99)))
+				synctest.Wait() // both PINGs passed their trackers before the next capture is armed
+				if got := <-ch; !bytes.Equal(got, first) {
+					t.Fatalf("capture %d took %x, want the first PING %x", i, got, first)
+				}
 			}
-			return deltas{cCaptured: {1, 0}}
+			return deltas{cCaptured: {1, 1}}
 		}},
 		{"ScriptWrites", func(t *testing.T, r *controlsRig) deltas {
 			r.h.l.ScriptWrites(Up, WriteResult{ZeroWrite: true})
@@ -185,6 +202,12 @@ func TestLinkControlsCount_L60(t *testing.T) {
 				want := row.act(t, r)
 				synctest.Wait()
 				after := snapCounters(r.h.l)
+				st := r.h.l.Stats()
+				for c, cs := range []Counts{st.All, st.Session, st.Probe} {
+					if exported(cs) != after[c] {
+						t.Errorf("class %d: Stats %v, counters %v", c, exported(cs), after[c])
+					}
+				}
 				for k := range nCtr {
 					var d [3]int64
 					for c := range d {

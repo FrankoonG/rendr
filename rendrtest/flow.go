@@ -27,27 +27,33 @@ type carrier struct {
 	held    atomic.Int64
 }
 
-// chunk is a run of bytes due for delivery at at.
+// chunk is a run of bytes in the link: first queued at the bottleneck of
+// its direction (Link.bq), then on its flow's wire (flow.q) until at.
 type chunk struct {
-	b         []byte
-	at        time.Time
-	throttled bool
+	b       []byte
+	f       *flow
+	arrival time.Time // when the link accepted it
+	at      time.Time // delivery time, set when it leaves the bottleneck
+	held    bool      // counted as held by a stall
 }
 
 // flow is one direction of a carrier: a reader pulls what the writer wrote
-// out of src (while fewer than Buffer bytes are queued), passes it through
-// the frame tracker and queues timed chunks; a deliverer writes them into
-// dst in order, honouring stall, blackhole and CorruptNext.
+// out of src (while fewer than Buffer bytes are in the link), passes it
+// through the frame tracker and queues it at the direction's bottleneck
+// (Link.transmit), which puts it on the flow's wire; a deliverer writes the
+// wire into dst at each chunk's delivery time, honouring stall, blackhole
+// and CorruptNext.
 type flow struct {
 	c        *carrier
 	i        int // 0 up, 1 down
 	src, dst net.Conn
 
 	mu     sync.Mutex
-	q      []chunk
-	queued int       // bytes queued, the chunk being written included
+	q      []*chunk  // on the wire, in order
+	queued int       // bytes in the link: at the bottleneck, on the wire, being written
+	inTx   int       // chunks at the bottleneck
 	lastAt time.Time // delivery times never go backwards (a byte stream)
-	eof    bool      // the writer's side ended: deliver the queue, then end the carrier
+	eof    bool      // the writer's side ended: deliver everything, then end the carrier
 	tr     tracker
 	wake   chan struct{} // cap 1: deliverer
 	room   chan struct{} // cap 1: reader
@@ -66,7 +72,8 @@ type deadOpen struct {
 }
 
 // open creates a carrier (or, while blackholed, a dead open) and starts its
-// goroutines. first (owned) goes ahead of everything the dialer writes.
+// goroutines, and the link's bottlenecks with its first carrier. first
+// (owned) goes ahead of everything the dialer writes.
 func (l *Link) open(first []byte) (net.Conn, error) {
 	l.mu.Lock()
 	if l.closed {
@@ -88,6 +95,12 @@ func (l *Link) open(first []byte) (net.Conn, error) {
 		}
 		go l.deadLoop(d)
 		return newConn(l, cli, 0, &d.kind, d.done), nil
+	}
+	if !l.txOn {
+		l.txOn = true
+		l.wg.Add(2)
+		go l.transmit(0)
+		go l.transmit(1)
 	}
 	cli, a := net.Pipe()
 	b, srv := net.Pipe()
@@ -120,21 +133,27 @@ func (l *Link) open(first []byte) (net.Conn, error) {
 }
 
 // shut closes the carrier once: the dialer's and the passive's conns then
-// read EOF and fail writes. It reports whether this call closed it.
+// read EOF and fail writes, and its chunks leave the bottlenecks (they take
+// no more bottleneck time). It reports whether this call closed it.
 func (c *carrier) shut() bool {
 	first := false
 	c.once.Do(func() {
 		first = true
+		c.closed.Store(true)
 		close(c.done)
 		c.a.Close()
 		c.b.Close()
-		c.closed.Store(true)
 		l := c.l
 		l.mu.Lock()
 		if i := slices.Index(l.carriers, c); i >= 0 {
 			l.carriers = slices.Delete(l.carriers, i, i+1)
 		}
 		l.mu.Unlock()
+		l.smu.Lock()
+		for i := range l.bq {
+			l.bq[i] = slices.DeleteFunc(l.bq[i], func(ch *chunk) bool { return ch.f.c == c })
+		}
+		l.smu.Unlock()
 	})
 	return first
 }
@@ -151,6 +170,12 @@ func (c *carrier) countLost() {
 	c.l.count(c.kind.Load(), cBufferLost, int64(n))
 }
 
+// countHeld counts one chunk held by a stall.
+func (c *carrier) countHeld() {
+	c.l.count(c.kind.Load(), cHeld, 1)
+	c.held.Add(1)
+}
+
 func signal(ch chan struct{}) {
 	select {
 	case ch <- struct{}{}:
@@ -158,7 +183,7 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// readLoop moves the writer's bytes into the queue while it has room.
+// readLoop moves the writer's bytes into the link while it has room.
 func (f *flow) readLoop() {
 	c, l := f.c, f.c.l
 	defer l.wg.Done()
@@ -226,50 +251,178 @@ func (f *flow) push(p []byte) {
 	}
 }
 
-// enqueue queues b (owned) with its delivery time: arrival, then the
-// direction's shared bottleneck at the configured rate, then the one-way
-// delay with jitter, never before the previous chunk. f.mu held.
+// enqueue queues b (owned) at the bottleneck of its direction, behind the
+// bytes of every carrier of the link that arrived earlier; while the link
+// is blackholed b vanishes instead. f.mu held.
 func (f *flow) enqueue(b []byte, kind int32) {
 	l := f.c.l
-	now := time.Now()
 	l.smu.Lock()
 	if l.blackhole {
 		l.smu.Unlock()
 		l.count(kind, cDropped, int64(len(b)))
 		return
 	}
-	d := l.delay
-	if l.jitter > 0 {
-		d += time.Duration(l.rng.Int64N(int64(2*l.jitter)+1)) - l.jitter
-		d = max(d, 0)
-	}
-	at, throttled := now, false
-	if l.rate > 0 {
-		start := now
-		if l.freeAt[f.i].After(start) {
-			start = l.freeAt[f.i]
-		}
-		at = start.Add(time.Duration(float64(len(b)) / l.rate * float64(time.Second)))
-		l.freeAt[f.i] = at
-		throttled = true
-	}
+	l.bq[f.i] = append(l.bq[f.i], &chunk{b: b, f: f, arrival: time.Now()})
 	l.smu.Unlock()
-	l.count(kind, cMaxDelay, int64(d))
-	at = at.Add(d)
-	if at.Before(f.lastAt) {
-		at = f.lastAt
-	}
-	f.lastAt = at
-	f.q = append(f.q, chunk{b: b, at: at, throttled: throttled})
 	f.queued += len(b)
+	f.inTx++
+	signal(l.txWork[f.i])
+}
+
+// transmit is the bottleneck of direction i, shared by every carrier of
+// the link: it moves the queued chunks onto their flows' wires in arrival
+// order, each taking len/rate. Nothing is transmitted while the link is
+// stalled, so a backlog drains at the rate afterwards; a rate change
+// applies at once to every chunk not yet transmitted; blackholed chunks
+// and chunks of ended carriers take no bottleneck time.
+func (l *Link) transmit(i int) {
+	defer l.wg.Done()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	var busy, start time.Time // end of the previous transmission; start of cur's
+	var cur *chunk            // the chunk being transmitted
+	for {
+		l.smu.Lock()
+		if len(l.bq[i]) == 0 {
+			l.smu.Unlock()
+			select {
+			case <-l.txWork[i]:
+			case <-l.stop:
+				return
+			}
+			continue
+		}
+		ch := l.bq[i][0]
+		rate, stalled, bh, ctl := l.rate, l.stalled, l.blackhole, l.ctl
+		if stalled {
+			for _, q := range l.bq[i] {
+				if !q.held {
+					q.held = true
+					q.f.c.countHeld()
+				}
+			}
+		}
+		l.smu.Unlock()
+		now := time.Now()
+		if cur != nil && cur != ch { // lost with its carrier while being transmitted
+			busy, cur = now, nil
+		}
+		switch {
+		case bh || ch.f.c.closed.Load():
+			if cur == ch {
+				busy, cur = now, nil
+			}
+			l.discard(i, ch, bh)
+			continue
+		case stalled:
+			cur = nil // restarts after the stall
+			select {
+			case <-ctl:
+			case <-l.txWork[i]: // count new arrivals as held
+			case <-ch.f.c.done:
+			case <-l.stop:
+				return
+			}
+			busy = maxTime(busy, time.Now())
+			continue
+		}
+		end := now
+		if rate > 0 {
+			if cur != ch {
+				cur, start = ch, maxTime(busy, ch.arrival)
+			}
+			end = start.Add(time.Duration(float64(len(ch.b)) / rate * float64(time.Second)))
+			if d := end.Sub(now); d > 0 {
+				timer.Reset(d)
+				select {
+				case <-timer.C:
+				case <-ctl: // re-evaluated with the new settings
+					timer.Stop()
+					continue
+				case <-ch.f.c.done:
+					timer.Stop()
+					continue
+				case <-l.stop:
+					return
+				}
+			}
+			l.throttled.Add(int64(len(ch.b)))
+		}
+		busy, cur = end, nil
+		l.toWire(i, ch, end)
+	}
+}
+
+// popHead removes ch from the head of the bottleneck of direction i; false
+// if it is no longer there (its carrier ended). l.smu held.
+func (l *Link) popHead(i int, ch *chunk) bool {
+	if len(l.bq[i]) == 0 || l.bq[i][0] != ch {
+		return false
+	}
+	l.bq[i][0] = nil
+	l.bq[i] = l.bq[i][1:]
+	return true
+}
+
+// discard removes the bottleneck's head ch without transmitting it: a
+// blackholed chunk is dropped (counted unless its carrier was killed, which
+// counts it as lost), a chunk of an ended carrier just goes.
+func (l *Link) discard(i int, ch *chunk, blackholed bool) {
+	l.smu.Lock()
+	ok := l.popHead(i, ch)
+	l.smu.Unlock()
+	if !ok {
+		return
+	}
+	f := ch.f
+	f.mu.Lock()
+	if blackholed && !f.c.closed.Load() {
+		l.count(f.c.kind.Load(), cDropped, int64(len(ch.b)))
+		f.queued -= len(ch.b)
+		f.inTx--
+	}
+	f.mu.Unlock()
+	signal(f.room)
 	signal(f.wake)
 }
 
-// pop removes n delivered bytes from the head chunk. f.mu held.
+// toWire moves ch, transmitted at end, from the bottleneck onto its flow's
+// wire: it is due one delay (with jitter) later, never before the flow's
+// previous chunk.
+func (l *Link) toWire(i int, ch *chunk, end time.Time) {
+	l.smu.Lock()
+	if !l.popHead(i, ch) {
+		l.smu.Unlock()
+		return
+	}
+	d := l.delay
+	if l.jitter > 0 {
+		d = max(d+time.Duration(l.rng[i].Int64N(int64(2*l.jitter)+1))-l.jitter, 0)
+	}
+	l.smu.Unlock()
+	f := ch.f
+	l.count(f.c.kind.Load(), cMaxDelay, int64(d))
+	f.mu.Lock()
+	ch.at = maxTime(end.Add(d), f.lastAt)
+	f.lastAt = ch.at
+	f.q = append(f.q, ch)
+	f.inTx--
+	f.mu.Unlock()
+	signal(f.wake)
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+// pop removes n delivered bytes from the head chunk of the wire. f.mu held.
 func (f *flow) pop(n int) {
 	f.queued -= n
 	if n >= len(f.q[0].b) {
-		f.q[0] = chunk{}
+		f.q[0] = nil
 		f.q = f.q[1:]
 	} else {
 		f.q[0].b = f.q[0].b[n:]
@@ -277,9 +430,9 @@ func (f *flow) pop(n int) {
 	signal(f.room)
 }
 
-// deliverLoop writes queued chunks into dst at their delivery time. When
-// the writer's side ended and the queue is empty, or a write fails, it ends
-// the carrier.
+// deliverLoop writes the wire's chunks into dst at their delivery time.
+// When the writer's side ended and the link holds nothing more of this
+// flow, or a write fails, it ends the carrier.
 func (f *flow) deliverLoop() {
 	c, l := f.c, f.c.l
 	defer l.wg.Done()
@@ -287,9 +440,9 @@ func (f *flow) deliverLoop() {
 	for {
 		f.mu.Lock()
 		for len(f.q) == 0 {
-			eof := f.eof
+			end := f.eof && f.inTx == 0
 			f.mu.Unlock()
-			if eof {
+			if end {
 				c.shut()
 				return
 			}
@@ -320,13 +473,9 @@ func (f *flow) deliverLoop() {
 			ch.b[len(ch.b)/2] ^= 0xFF
 			l.count(kind, cCorrupted, 1)
 		}
-		// Count first, so that whoever read the bytes sees them counted;
-		// take back what a failed write did not deliver.
-		f.delivered(kind, int64(len(ch.b)), ch.throttled)
+		// Only bytes the far end has read are counted as delivered.
 		n, err := f.dst.Write(ch.b)
-		if lost := len(ch.b) - n; lost > 0 {
-			f.delivered(kind, -int64(lost), ch.throttled)
-		}
+		f.delivered(kind, int64(n))
 		f.mu.Lock()
 		f.pop(n)
 		f.mu.Unlock()
@@ -337,16 +486,13 @@ func (f *flow) deliverLoop() {
 	}
 }
 
-// delivered counts n bytes forwarded to the far end.
-func (f *flow) delivered(kind int32, n int64, throttled bool) {
+// delivered counts n bytes the far end read.
+func (f *flow) delivered(kind int32, n int64) {
 	f.c.l.count(kind, cBytes, n)
 	if f.i == 0 {
 		f.c.up.Add(n)
 	} else {
 		f.c.down.Add(n)
-	}
-	if throttled {
-		f.c.l.throttled.Add(n)
 	}
 }
 
@@ -375,26 +521,28 @@ func (f *flow) waitUntil(at time.Time) bool {
 	}
 }
 
-// waitStall holds the head chunk while the link is stalled (counted once
-// per chunk); false if the carrier was shut meanwhile.
+// waitStall holds the wire while the link is stalled (every chunk on it
+// counted once as held); false if the carrier was shut meanwhile.
 func (f *flow) waitStall() bool {
-	c, l := f.c, f.c.l
-	held := false
+	l := f.c.l
 	for {
 		l.smu.Lock()
-		st, ch := l.stalled, l.stallCh
+		st, ctl := l.stalled, l.ctl
 		l.smu.Unlock()
 		if !st {
 			return true
 		}
-		if !held {
-			held = true
-			l.count(c.kind.Load(), cHeld, 1)
-			c.held.Add(1)
+		f.mu.Lock()
+		for _, ch := range f.q {
+			if !ch.held {
+				ch.held = true
+				f.c.countHeld()
+			}
 		}
+		f.mu.Unlock()
 		select {
-		case <-ch:
-		case <-c.done:
+		case <-ctl:
+		case <-f.c.done:
 			return false
 		}
 	}

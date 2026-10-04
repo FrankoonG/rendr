@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 
 	"github.com/FrankoonG/rendr/v2"
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -30,23 +31,28 @@ type Options struct {
 	AllowNonLoopback bool
 }
 
-// Listen listens on network ("tcp", "tcp4", "tcp6") and address. Accepted
-// connections have keepalive disabled and NODELAY set and are rendr-owned.
-// Pass the result to rendr.FromListener. A non-loopback address fails with
-// ErrNonLoopback unless allowed; without AllowNonLoopback a host name is
-// resolved first and every address it yields must be loopback.
+// Listen listens on network ("tcp", "tcp4", "tcp6") and address exactly
+// like net.Listen (a host name binds its IPv4 address when it has one).
+// Accepted connections have keepalive disabled and NODELAY set and are
+// rendr-owned. Pass the result to rendr.FromListener.
+//
+// Without AllowNonLoopback the address must be loopback, else Listen fails
+// with ErrNonLoopback: an empty host (all interfaces) and non-loopback IPs
+// are refused before any socket is opened, a host name is accepted only if
+// every address it resolves to is loopback, and the address actually bound
+// is checked once more (a name that resolves differently the second time is
+// refused, not bound).
 func Listen(network, address string, o Options) (net.Listener, error) {
 	if err := checkNetwork(network); err != nil {
 		return nil, err
 	}
+	lc := net.ListenConfig{KeepAlive: -1}
 	if !o.AllowNonLoopback {
-		ap, err := loopback(context.Background(), network, address)
-		if err != nil {
+		if err := loopbackOnly(context.Background(), network, address); err != nil {
 			return nil, err
 		}
-		address = ap.String()
+		lc.Control = func(_, addr string, _ syscall.RawConn) error { return checkAddr(addr) }
 	}
-	lc := net.ListenConfig{KeepAlive: -1}
 	ln, err := lc.Listen(context.Background(), network, address)
 	if err != nil {
 		return nil, err
@@ -55,9 +61,11 @@ func Listen(network, address string, o Options) (net.Listener, error) {
 }
 
 // Carrier returns a StreamCarrier named name that dials network/address
-// with net.Dialer{KeepAlive: -1}, then SetKeepAlive(false) and
-// SetNoDelay(true), honouring ctx. A non-loopback address fails with
-// ErrNonLoopback unless allowed.
+// like net.Dialer{KeepAlive: -1} (a host name's addresses are tried in
+// turn, with the net package's IPv4/IPv6 fallback), then SetKeepAlive(false)
+// and SetNoDelay(true), honouring ctx. Without AllowNonLoopback the address
+// must be loopback as for Listen, and every address actually connected to
+// is checked again (ErrNonLoopback).
 func Carrier(name, network, address string, o Options) rendr.StreamCarrier {
 	return rendr.StreamCarrier{
 		Name: name,
@@ -69,14 +77,13 @@ func dial(ctx context.Context, network, address string, o Options) (net.Conn, er
 	if err := checkNetwork(network); err != nil {
 		return nil, err
 	}
+	d := net.Dialer{KeepAlive: -1}
 	if !o.AllowNonLoopback {
-		ap, err := loopback(ctx, network, address)
-		if err != nil {
+		if err := loopbackOnly(ctx, network, address); err != nil {
 			return nil, err
 		}
-		address = ap.String()
+		d.ControlContext = func(_ context.Context, _, addr string, _ syscall.RawConn) error { return checkAddr(addr) }
 	}
-	d := net.Dialer{KeepAlive: -1}
 	c, err := d.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
@@ -133,17 +140,13 @@ func checkNetwork(network string) error {
 	return net.UnknownNetworkError(network)
 }
 
-// loopback resolves address and requires every address of its host to be
-// loopback; it returns the first one. An empty host (all interfaces) is
-// not loopback.
-func loopback(ctx context.Context, network, address string) (netip.AddrPort, error) {
-	host, port, err := net.SplitHostPort(address)
+// loopbackOnly requires the host of address to be loopback: an IP literal
+// is checked as is, a host name is resolved and every address it yields
+// must be loopback. An empty host (all interfaces) is not loopback.
+func loopbackOnly(ctx context.Context, network, address string) error {
+	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return netip.AddrPort{}, err
-	}
-	p, err := net.DefaultResolver.LookupPort(ctx, network, port)
-	if err != nil {
-		return netip.AddrPort{}, err
+		return err
 	}
 	var ips []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
@@ -151,16 +154,31 @@ func loopback(ctx context.Context, network, address string) (netip.AddrPort, err
 	} else if host != "" {
 		ipNet := map[string]string{"tcp": "ip", "tcp4": "ip4", "tcp6": "ip6"}[network]
 		if ips, err = net.DefaultResolver.LookupNetIP(ctx, ipNet, host); err != nil {
-			return netip.AddrPort{}, err
+			return err
 		}
 	}
+	return checkAddrs(address, ips)
+}
+
+// checkAddrs accepts a non-empty set of loopback addresses only.
+func checkAddrs(address string, ips []netip.Addr) error {
 	if len(ips) == 0 {
-		return netip.AddrPort{}, fmt.Errorf("%w: %q", ErrNonLoopback, address)
+		return fmt.Errorf("%w: %q", ErrNonLoopback, address)
 	}
 	for _, ip := range ips {
 		if !ip.Unmap().IsLoopback() {
-			return netip.AddrPort{}, fmt.Errorf("%w: %q", ErrNonLoopback, address)
+			return fmt.Errorf("%w: %q", ErrNonLoopback, address)
 		}
 	}
-	return netip.AddrPortFrom(ips[0].Unmap(), uint16(p)), nil
+	return nil
+}
+
+// checkAddr is the connect/bind hook: it accepts only a loopback ip:port,
+// the address the net package resolved and is about to use.
+func checkAddr(addr string) error {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil || !ap.Addr().Unmap().IsLoopback() {
+		return fmt.Errorf("%w: %q", ErrNonLoopback, addr)
+	}
+	return nil
 }

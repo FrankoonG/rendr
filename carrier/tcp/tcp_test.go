@@ -164,3 +164,68 @@ func TestLoopbackOnlyByDefault(t *testing.T) {
 		c.Close()
 	}
 }
+
+// TestHostNameLikeNet: a loopback host name behaves exactly as with the net
+// package. Dial tries every address "localhost" resolves to, so it reaches
+// a listener on either loopback address whichever one the resolver lists
+// first (the first address alone used to be dialed), and Listen binds the
+// address net.Listen binds (IPv4 preferred), not the first one resolved.
+func TestHostNameLikeNet(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", "localhost")
+	if err != nil || len(ips) == 0 {
+		t.Fatalf("resolving localhost: %v, %v", ips, err)
+	}
+	created, fallbacks := 0, 0 // listeners; those reached on an address other than the first resolved
+	for _, li := range []struct{ network, host string }{{"tcp4", "127.0.0.1"}, {"tcp6", "::1"}} {
+		ln, err := tcp.Listen(li.network, net.JoinHostPort(li.host, "0"), tcp.Options{})
+		if err != nil {
+			if li.network == "tcp6" { // a host without IPv6 loopback: only the IPv4 case applies
+				t.Logf("no IPv6 loopback listener: %v", err)
+				continue
+			}
+			t.Fatalf("Listen(%s): %v", li.host, err)
+		}
+		created++
+		addr := net.JoinHostPort("localhost", strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+		ref, refErr := net.Dial("tcp", addr)
+		got, gotErr := tcp.Carrier("x", "tcp", addr, tcp.Options{}).Dial(ctx)
+		if (refErr == nil) != (gotErr == nil) {
+			t.Errorf("%s with a listener on %s: net.Dial %v, tcp.Carrier %v", addr, li.host, refErr, gotErr)
+		}
+		if gotErr == nil && ips[0].Unmap().Is4() != (li.network == "tcp4") {
+			fallbacks++
+		}
+		for _, c := range []net.Conn{ref, got} {
+			if c != nil {
+				c.Close()
+			}
+		}
+		ln.Close()
+	}
+	families := map[bool]bool{}
+	for _, ip := range ips {
+		families[ip.Unmap().Is4()] = true
+	}
+	switch {
+	case len(families) == 2 && created == 2 && fallbacks == 0:
+		t.Errorf("localhost resolves to %v, but the listener on the second family was not reached", ips)
+	case fallbacks == 0:
+		t.Logf("fallback not exercised on this host: localhost resolves to %v, %d loopback listeners", ips, created)
+	}
+
+	ln, err := tcp.Listen("tcp", "localhost:0", tcp.Options{})
+	if err != nil {
+		t.Fatalf("Listen(localhost): %v", err)
+	}
+	defer ln.Close()
+	ref, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("net.Listen(localhost): %v", err)
+	}
+	defer ref.Close()
+	if got, want := ln.Addr().(*net.TCPAddr).IP.To4() != nil, ref.Addr().(*net.TCPAddr).IP.To4() != nil; got != want {
+		t.Fatalf("Listen(localhost) bound %v, net.Listen bound %v", ln.Addr(), ref.Addr())
+	}
+}

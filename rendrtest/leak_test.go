@@ -2,6 +2,8 @@ package rendrtest
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -40,45 +42,162 @@ func (f *fakeTB) failures() string {
 	return strings.Join(f.msgs, "\n")
 }
 
-// TestAssertNoLeakDetectsLeak_L66: AssertNoLeak stays quiet when the test
-// joined what it started, and reports exactly one leaked goroutine (after
-// its full 10 s settling window) when one is still running at the check.
-func TestAssertNoLeakDetectsLeak_L66(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		quiet := &fakeTB{TB: t}
-		check := AssertNoLeak(quiet)
-		joined := make(chan struct{})
-		go func() { close(joined) }()
-		<-joined
-		check()
-		if msg := quiet.failures(); msg != "" {
-			t.Fatalf("AssertNoLeak failed without a leak: %.300s", msg)
-		}
+var leakReport = regexp.MustCompile(`leak after (\S+): (\d+) goroutine\(s\) and (\d+) fd\(s\) not in the baseline`)
 
-		leaky := &fakeTB{TB: t}
-		check = AssertNoLeak(leaky)
-		stop := make(chan struct{})
-		go func() { <-stop }()
-		start := time.Now()
-		check()
-		waited := time.Since(start)
-		close(stop)
-		msg := leaky.failures()
-		m := regexp.MustCompile(`leak after 10s: (\d+) goroutines \(baseline (\d+)\), (-?\d+) fds \(baseline (-?\d+)\)`).FindStringSubmatch(msg)
-		if m == nil {
-			t.Fatalf("AssertNoLeak missed the leaked goroutine: %.300s", msg)
+// expectLeak checks a report of exactly goroutines new goroutines whose
+// stacks name the test, without the stacks of baseline goroutines.
+func expectLeak(t *testing.T, msg string, goroutines int) {
+	t.Helper()
+	m := leakReport.FindStringSubmatch(msg)
+	if m == nil {
+		t.Fatalf("AssertNoLeak missed the leak: %.300s", msg)
+	}
+	if n, _ := strconv.Atoi(m[2]); n != goroutines {
+		t.Fatalf("reported %s new goroutines, want %d: %.600s", m[2], goroutines, msg)
+	}
+	if !strings.Contains(msg, t.Name()[:strings.IndexByte(t.Name(), '/')]) || strings.Contains(msg, "testing.tRunner") {
+		t.Fatalf("the report does not carry exactly the leaked goroutine's stack: %.600s", msg)
+	}
+}
+
+// TestAssertNoLeakDetectsLeak_L66: AssertNoLeak compares goroutines by
+// identity. It stays quiet when the test joined what it started — also when
+// a goroutine of the baseline ended meanwhile (a count would fail) — and
+// reports exactly the leaked goroutine after its full 10 s settling window
+// — also when a baseline goroutine ended and the count is unchanged (a
+// count would pass). The procedure runs inside bubbles without its real
+// sockets and fds (design §3.8); TestAssertNoLeakRealSockets_L66 covers
+// those.
+func TestAssertNoLeakDetectsLeak_L66(t *testing.T) {
+	inBubble := leakCheck{wait: leakWait}
+	// older starts a goroutine before the baseline and returns a func that
+	// ends it and waits for it.
+	older := func() (end func()) {
+		stop, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			<-stop
+		}()
+		return func() {
+			close(stop)
+			<-done
 		}
-		got, _ := strconv.Atoi(m[1])
-		base, _ := strconv.Atoi(m[2])
-		fds, _ := strconv.Atoi(m[3])
-		fdBase, _ := strconv.Atoi(m[4])
-		if got != base+1 || fds != fdBase || waited < 10*time.Second {
-			t.Fatalf("reported %d goroutines over baseline %d (fds %d/%d) after %v; want exactly one more after 10s", got, base, fds, fdBase, waited)
-		}
-		if !strings.Contains(msg, "TestAssertNoLeakDetectsLeak_L66") {
-			t.Fatal("the report carries no goroutine dump")
-		}
+	}
+	t.Run("joined", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &fakeTB{TB: t}
+			check := inBubble.assert(f)
+			joined := make(chan struct{})
+			go func() { close(joined) }()
+			<-joined
+			start := time.Now()
+			check()
+			if msg := f.failures(); msg != "" || time.Since(start) >= leakWait {
+				t.Fatalf("failed without a leak after %v: %.300s", time.Since(start), msg)
+			}
+		})
 	})
+	t.Run("baseline-goroutine-ended", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &fakeTB{TB: t}
+			end := older()
+			check := inBubble.assert(f)
+			end()
+			start := time.Now()
+			check()
+			if msg := f.failures(); msg != "" || time.Since(start) >= leakWait {
+				t.Fatalf("failed after a baseline goroutine ended (%v): %.300s", time.Since(start), msg)
+			}
+		})
+	})
+	t.Run("leaked", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &fakeTB{TB: t}
+			check := inBubble.assert(f)
+			stop := make(chan struct{})
+			go func() { <-stop }()
+			start := time.Now()
+			check()
+			waited := time.Since(start)
+			close(stop)
+			expectLeak(t, f.failures(), 1)
+			if waited != leakWait {
+				t.Fatalf("reported after %v, want the full %v", waited, leakWait)
+			}
+		})
+	})
+	t.Run("leak-behind-an-ended-goroutine", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := &fakeTB{TB: t}
+			end := older()
+			check := inBubble.assert(f)
+			end()
+			stop := make(chan struct{})
+			go func() { <-stop }() // as many goroutines as at the baseline
+			check()
+			close(stop)
+			expectLeak(t, f.failures(), 1)
+		})
+	})
+}
+
+// TestAssertNoLeakRealSockets_L66: the exported AssertNoLeak on the real
+// clock with its netpoll round trip and, on Linux, fd identities: a test
+// that closed its loopback connections and joined its goroutines passes;
+// one that leaves a goroutine and a connection behind is reported (the
+// goroutine's stack, and on Linux both sockets) by the same procedure with
+// a 1 s window.
+func TestAssertNoLeakRealSockets_L66(t *testing.T) {
+	pair := func() (net.Conn, net.Conn, net.Listener) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		s, err := ln.Accept()
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		return c, s, ln
+	}
+
+	quiet := &fakeTB{TB: t}
+	check := AssertNoLeak(quiet)
+	c, s, ln := pair()
+	var wg sync.WaitGroup
+	wg.Go(func() { io.Copy(io.Discard, s) })
+	c.Write([]byte("bye"))
+	c.Close()
+	wg.Wait()
+	s.Close()
+	ln.Close()
+	start := time.Now()
+	check()
+	if msg := quiet.failures(); msg != "" || time.Since(start) >= leakWait {
+		t.Fatalf("failed after everything was closed and joined (%v): %.300s", time.Since(start), msg)
+	}
+
+	leaky := &fakeTB{TB: t}
+	check = leakCheck{wait: time.Second, real: true}.assert(leaky)
+	stop := make(chan struct{})
+	go func() { <-stop }()
+	c, s, ln = pair()
+	ln.Close()
+	check()
+	close(stop)
+	c.Close()
+	s.Close()
+	msg := leaky.failures()
+	m := leakReport.FindStringSubmatch(msg)
+	if m == nil || !strings.Contains(msg, "TestAssertNoLeakRealSockets_L66.func") {
+		t.Fatalf("the leaked goroutine was not reported: %.600s", msg)
+	}
+	if fds, _ := strconv.Atoi(m[3]); openFDs() != nil && (fds < 2 || !strings.Contains(msg, "socket:[")) {
+		t.Fatalf("the two leaked sockets were not reported: %.600s", msg)
+	}
 }
 
 // TestReadyBothHelper_L66: ReadyBoth waits for both ends, not the first one

@@ -122,16 +122,23 @@ var (
 
 // Link is an in-memory path: every Dial creates one carrier whose two
 // directions pass through pumps that apply delay/jitter (order preserving),
-// a token-bucket rate, blackhole, stall, frame-aware corruption, drops and
+// a rate limit, blackhole, stall, frame-aware corruption, drops and
 // injection. Controls apply to current and future carriers; the one-shot
 // frame controls apply to every current carrier; the one-shot conn controls
 // (ScriptWrites, PanicWrites, OverRead) are consumed by the next matching
-// call on any conn of that side, current or future.
+// call on any conn of that side, current or future. One-shot controls do
+// not choose a carrier class: on a link that also carries a probe carrier
+// they may hit the probe, so a stimulus proof checks Stats().Session (or the
+// test gives the link a single carrier).
 //
-// The rate limiter is one bottleneck per direction shared by all carriers of
-// the link: bytes of every carrier queue behind each other in arrival order,
-// so a probe carrier's PING waits behind a session carrier's bulk exactly as
-// at a real bottleneck (the self-load guard tests, design §8.5).
+// The rate limit is one bottleneck per direction shared by all carriers of
+// the link, paced when bytes are transmitted: bytes of every carrier queue
+// behind each other in arrival order, so a probe carrier's PING waits
+// behind a session carrier's bulk exactly as at a real bottleneck (the
+// self-load guard tests, design §8.5). Bytes lost to Kill or the blackhole
+// leave the queue without taking bottleneck time, a stall stops the
+// bottleneck (its backlog then drains at the rate) and SetRate applies to
+// every byte still queued. The one-way delay is added after the bottleneck.
 //
 // Create a Link inside the synctest bubble that uses it; Close it before
 // the bubble ends.
@@ -152,20 +159,24 @@ type Link struct {
 	carriers []*carrier    // live carriers
 	history  []*carrier    // every carrier, in creation order
 	dead     []*deadOpen   // dials made while blackholed
+	txOn     bool          // the bottleneck goroutines run (from the first carrier until Close)
+	stop     chan struct{} // closed by Close: the bottlenecks exit
 	wg       sync.WaitGroup
 	armedW   [2]atomic.Bool // a write misbehaviour may apply to side i
 	armedR   [2]atomic.Bool // an over-read is pending on side i
 
-	// smu guards timing and loss settings; it is a leaf lock.
+	// smu guards timing and loss settings and the bottleneck queues; it is a
+	// leaf lock.
 	smu       sync.Mutex
 	delay     time.Duration
 	jitter    time.Duration
-	rate      float64      // bytes/s per direction, 0 = unlimited
-	freeAt    [2]time.Time // the shared bottleneck of each direction is busy until then
+	rate      float64 // bytes/s per direction, 0 = unlimited
 	blackhole bool
 	stalled   bool
-	stallCh   chan struct{} // closed and renewed on every stall change
-	rng       *rand.Rand    // jitter; seeded from the name (deterministic)
+	ctl       chan struct{}    // closed and renewed on every rate, stall or blackhole change
+	bq        [2][]*chunk      // the bottleneck queue of each direction, in arrival order
+	txWork    [2]chan struct{} // cap 1: a chunk was queued at bottleneck i
+	rng       [2]*rand.Rand    // jitter per direction; seeded from the name (deterministic)
 
 	ctr       [3]counters // all, session, probe
 	throttled atomic.Int64
@@ -196,8 +207,13 @@ func NewLink(cfg LinkConfig) *Link {
 		buffer:  max(b, minBuffer),
 		release: make(chan struct{}),
 		blockCh: make(chan struct{}),
-		stallCh: make(chan struct{}),
-		rng:     rand.New(rand.NewPCG(s, s^0x9e3779b97f4a7c15)),
+		stop:    make(chan struct{}),
+		ctl:     make(chan struct{}),
+		txWork:  [2]chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)},
+		rng: [2]*rand.Rand{
+			rand.New(rand.NewPCG(s, s^0x9e3779b97f4a7c15)),
+			rand.New(rand.NewPCG(s^1, s^0x7f4a7c159e3779b9)),
+		},
 	}
 }
 
@@ -264,37 +280,52 @@ func (l *Link) dial(ctx context.Context, first []byte) (net.Conn, error) {
 	return l.open(first)
 }
 
-// SetDelay sets the one-way delay and uniform jitter of both directions.
+// SetDelay sets the one-way delay and uniform jitter of both directions,
+// added to bytes as they leave the bottleneck (bytes already past it keep
+// their delivery time).
 func (l *Link) SetDelay(oneWay, jitter time.Duration) {
 	l.smu.Lock()
 	l.delay, l.jitter = max(oneWay, 0), max(jitter, 0)
 	l.smu.Unlock()
 }
 
-// SetRate caps each direction at bytesPerSec (0 = unlimited).
+// SetRate caps each direction's shared bottleneck at bytesPerSec (0 =
+// unlimited). The change applies at once, also to bytes already queued.
 func (l *Link) SetRate(bytesPerSec float64) {
 	l.smu.Lock()
 	l.rate = max(bytesPerSec, 0)
+	l.bumpCtl()
 	l.smu.Unlock()
 }
 
-// SetBlackhole makes bytes vanish without closing anything; new dials
-// "open" but never answer (counted as Dropped).
+// SetBlackhole makes bytes vanish without closing anything (counted as
+// Dropped): new bytes, bytes still queued at the bottleneck (they take no
+// bottleneck time) and bytes in flight when they would arrive. New dials
+// "open" but never answer.
 func (l *Link) SetBlackhole(on bool) {
 	l.smu.Lock()
 	l.blackhole = on
+	l.bumpCtl()
 	l.smu.Unlock()
 }
 
-// SetStall holds bytes (not lost) until un-stalled (counted as Held).
+// SetStall holds bytes (not lost) until un-stalled (counted as Held, once
+// per chunk): the bottleneck transmits nothing and nothing in flight
+// arrives. After the stall the backlog drains at the rate.
 func (l *Link) SetStall(on bool) {
 	l.smu.Lock()
 	if l.stalled != on {
 		l.stalled = on
-		close(l.stallCh)
-		l.stallCh = make(chan struct{})
+		l.bumpCtl()
 	}
 	l.smu.Unlock()
+}
+
+// bumpCtl wakes everything waiting on a rate, stall or blackhole change.
+// l.smu held.
+func (l *Link) bumpCtl() {
+	close(l.ctl)
+	l.ctl = make(chan struct{})
 }
 
 // SetRefuse makes new dials fail.
@@ -313,8 +344,9 @@ func (l *Link) SetDial(b DialBehavior) {
 
 // Kill closes both ends of every current carrier and returns how many it
 // killed (counted as Killed). Bytes buffered in the link are lost (counted
-// as BufferLost); Kill returns after the carriers' pumps exited, so the
-// counters are final. Dials made while blackholed are closed too.
+// as BufferLost) and give back their share of the bottleneck at once; Kill
+// returns after the carriers' pumps exited, so the counters are final.
+// Dials made while blackholed are closed too.
 func (l *Link) Kill() int {
 	l.mu.Lock()
 	cs := slices.Clone(l.carriers)
@@ -368,10 +400,11 @@ func (l *Link) DropNextFrame(d Dir, t FrameType) {
 }
 
 // InjectAfterNextFrame inserts one frame of type t with the given flags,
-// handle and payload after the next frame of type after in direction d, with
-// the correct fseq and CRC; later frames of that direction are re-stamped so
-// that only the injected frame's semantics can trigger a reaction (stale
-// PONG, conflicting FIN, ACK beyond sent, ...).
+// handle and payload after the next frame of type after in direction d on
+// every current carrier (probe carriers included), with the correct fseq
+// and CRC; later frames of that direction are re-stamped so that only the
+// injected frame's semantics can trigger a reaction (stale PONG,
+// conflicting FIN, ACK beyond sent, ...). Counted as FramesInjected.
 func (l *Link) InjectAfterNextFrame(d Dir, after, t FrameType, flags uint8, handle uint32, payload []byte) {
 	if len(payload) > wire.MaxFramePayload {
 		panic("rendrtest: injected payload beyond MaxFramePayload")
@@ -382,11 +415,13 @@ func (l *Link) InjectAfterNextFrame(d Dir, after, t FrameType, flags uint8, hand
 
 // CaptureNextFrame copies the raw bytes (header through trailer) of the next
 // frame of type t forwarded in direction d on any current carrier into the
-// returned channel (buffered, one frame) and forwards the frame unchanged.
-// Tests use it to learn values they cannot compute, such as an old
-// incarnation's PING nonce for a stale-PONG injection (L21), or to obtain
-// another session's frame for a splice (L43). Without a current carrier the
-// channel never receives.
+// returned channel (buffered, one frame) and forwards the frame unchanged
+// (counted as FramesCaptured). Tests use it to learn values they cannot
+// compute, such as an old incarnation's PING nonce for a stale-PONG
+// injection (L21), or to obtain another session's frame for a splice (L43).
+// The first carrier to forward such a frame wins, a probe carrier included:
+// check Stats().Session.FramesCaptured or use a link with one carrier.
+// Without a current carrier the channel never receives.
 func (l *Link) CaptureNextFrame(d Dir, t FrameType) <-chan []byte {
 	cp := &capture{t: t, ch: make(chan []byte, 1)}
 	l.eachFlow(d, func(f *flow) { f.tr.captures = append(f.tr.captures, cp) })
@@ -394,7 +429,8 @@ func (l *Link) CaptureNextFrame(d Dir, t FrameType) <-chan []byte {
 }
 
 // InjectRaw inserts raw at the next frame boundary in direction d on every
-// current carrier, byte for byte: neither fseq nor CRC is re-stamped, so
+// current carrier (probe carriers included), byte for byte: neither fseq
+// nor CRC is re-stamped, so
 // spliced bytes of another carrier or session hit the receiver's fseq and
 // CRC checks exactly as a misbehaving relay's would (L43). Counted as
 // FramesInjected. A carrier that is between frames gets raw at once.
@@ -424,8 +460,10 @@ func (l *Link) eachFlow(d Dir, fn func(f *flow)) {
 	}
 }
 
-// ScriptWrites makes the next Writes of side d's conn (Up: the dialer's
-// conn, Down: the passive's) return the scripted results (L42).
+// ScriptWrites makes the next Writes of side d's conns (Up: the dialer's,
+// Down: the passive's) return the scripted results (L42), counted as
+// WritesScripted. Each result is consumed by the next Write on any conn of
+// that side, a probe carrier's included.
 func (l *Link) ScriptWrites(d Dir, r ...WriteResult) {
 	l.mu.Lock()
 	s := &l.sides[d.index()]
@@ -434,7 +472,8 @@ func (l *Link) ScriptWrites(d Dir, r ...WriteResult) {
 	l.mu.Unlock()
 }
 
-// BlockWrites blocks Writes of side d's conns per m (BlockOff lifts it).
+// BlockWrites blocks Writes of side d's conns per m (BlockOff lifts it);
+// every Write that blocks is counted once as WritesBlocked.
 func (l *Link) BlockWrites(d Dir, m BlockMode) {
 	l.mu.Lock()
 	if !l.closed {
@@ -445,7 +484,8 @@ func (l *Link) BlockWrites(d Dir, m BlockMode) {
 	l.mu.Unlock()
 }
 
-// PanicWrites makes the next Write of side d's conns panic (L51).
+// PanicWrites makes the next Write on any conn of side d panic (L51),
+// counted as WritePanics.
 func (l *Link) PanicWrites(d Dir) {
 	l.mu.Lock()
 	l.sides[d.index()].panics++
@@ -453,8 +493,8 @@ func (l *Link) PanicWrites(d Dir) {
 	l.mu.Unlock()
 }
 
-// OverRead makes the next Read of side d's conns that returns data report
-// len(p)+1 (L42).
+// OverRead makes the next Read on any conn of side d that returns data
+// report len(p)+1 (L42), counted as OverReads.
 func (l *Link) OverRead(d Dir) {
 	l.mu.Lock()
 	l.sides[d.index()].over++
@@ -546,6 +586,7 @@ func (l *Link) Close() {
 	if !l.closed {
 		l.closed = true
 		l.releaseAll()
+		close(l.stop)
 	}
 	cs := slices.Clone(l.carriers)
 	dead := l.dead
@@ -560,10 +601,12 @@ func (l *Link) Close() {
 	l.wg.Wait()
 }
 
-// Counts are fault and traffic counters of a set of carriers.
+// Counts are fault and traffic counters of a set of carriers. Every
+// control has one, so a stimulus proof can show that a fault touched the
+// carrier class it is about (L60).
 type Counts struct {
 	Killed          int64         // carriers closed by Kill
-	Bytes           int64         // bytes forwarded (both directions)
+	Bytes           int64         // bytes the far ends have read, both directions (a chunk counts once read in full)
 	Dropped         int64         // bytes discarded by the blackhole
 	Held            int64         // chunks held back by a stall
 	Corrupted       int64         // chunks corrupted by CorruptNext
@@ -572,6 +615,11 @@ type Counts struct {
 	FramesInjected  int64         // frames inserted by InjectAfterNextFrame or InjectRaw
 	BufferLost      int64         // bytes accepted by a Write and lost when the carrier was killed
 	MaxDelay        time.Duration // largest delay applied
+	WritesScripted  int64         // Writes that returned a ScriptWrites result
+	WritesBlocked   int64         // Writes blocked by BlockWrites
+	WritePanics     int64         // Writes that panicked (PanicWrites)
+	OverReads       int64         // Reads that reported len(p)+1 (OverRead)
+	FramesCaptured  int64         // frames copied by CaptureNextFrame
 }
 
 // Stats are a link's counters: over all carriers, session carriers only,
@@ -588,7 +636,7 @@ type CarrierInfo struct {
 	Seq      int       // creation order on its link
 	First    FrameType // first frame type after the PREFACE (0 until it crossed)
 	Session  bool      // First is OPEN or JOIN
-	Up, Down int64     // bytes delivered in each direction
+	Up, Down int64     // bytes the far end has read in each direction (as Counts.Bytes)
 	Held     int64     // chunks held by a stall
 	Closed   bool
 }
@@ -623,7 +671,6 @@ const (
 	cFramesInjected
 	cBufferLost
 	cMaxDelay
-	// Counted but not (yet) part of Counts: conn misbehaviours and captures.
 	cScripted
 	cBlocked
 	cPanics
@@ -659,6 +706,11 @@ func (c *counters) snap() Counts {
 		FramesInjected:  c[cFramesInjected].Load(),
 		BufferLost:      c[cBufferLost].Load(),
 		MaxDelay:        time.Duration(c[cMaxDelay].Load()),
+		WritesScripted:  c[cScripted].Load(),
+		WritesBlocked:   c[cBlocked].Load(),
+		WritePanics:     c[cPanics].Load(),
+		OverReads:       c[cOverReads].Load(),
+		FramesCaptured:  c[cCaptured].Load(),
 	}
 }
 
