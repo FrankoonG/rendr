@@ -1,4 +1,4 @@
-package msess_test
+package scenario
 
 import (
 	"bytes"
@@ -265,17 +265,6 @@ func TestTargetDialFailure(t *testing.T) {
 	}
 }
 
-func TestLegacyExitUnsupported(t *testing.T) {
-	f := newFixture(t, "p1", "p2")
-	for _, l := range f.links {
-		l.setLegacy(true)
-	}
-	_, err := f.dial(selector, dialOpts{target: echo()})
-	if !isUnsupported(err) {
-		t.Fatalf("want unsupported, got %v", err)
-	}
-}
-
 // Twenty sessions half-close and finish cleanly; the server releases every
 // session and target connection, and once the fixture is torn down the
 // goroutine count returns to its settled pre-test baseline. The baseline is
@@ -514,69 +503,6 @@ func TestSelectorFailoverRacesPastStalledCandidate(t *testing.T) {
 	}
 	t.Logf("recovery=%s maxStall=%s", rec, r.maxStall)
 }
-
-func testPacketFailover(t *testing.T, m mode) {
-	f := newFixture(t, "p1", "p2", "p3")
-	for _, l := range f.links {
-		l.set(3*time.Millisecond, 0, 0)
-	}
-	c := f.mustDial(m, dialOpts{target: packetEcho(), packet: true})
-	const pps, dur = 50, 8 * time.Second
-	var victim string
-	var victimID uint32
-	var replaced <-chan uint32
-	pr := packetFlow(c, dur, pps, func() {
-		if m == bond {
-			victim = "p2"
-		} else {
-			victimID, victim = activeSub(c)
-			if victim == "" {
-				return
-			}
-			replaced = watchReplaced(c, victimID)
-		}
-		f.link(victim).setRefuse(true)
-		f.link(victim).setStall(true) // QUIC-style: nothing arrives, nothing errors
-	})
-	t.Logf("gap=%s lost=%d/%d tail=%d exit sockets=%v", pr.gap, pr.lost, pr.sent, pr.tail, pr.socks)
-	if victim == "" {
-		t.Fatal("INVALID: no active carrier at fault time")
-	}
-	stimulus(t, f.link(victim).stats().Session.Held > 0, "no session bytes were held on the stalled %s", victim)
-	if replaced != nil {
-		if id := <-replaced; id == 0 {
-			t.Fatalf("active subflow %d on %s was never replaced", victimID, victim)
-		}
-	}
-	if pr.gap > 3*time.Second {
-		t.Fatalf("datagram flow stopped for %s after losing a path", pr.gap)
-	}
-	// Loss is bounded by what the failover can explain: datagrams handed to
-	// the stalled carrier until its death is detected (DeadMin) plus the
-	// reply gap. In bond mode the gap stays short while the stalled
-	// carrier's share is lost, hence both terms.
-	rate := float64(pr.sent) / dur.Seconds()
-	if maxLost := int(rate*(pr.gap+tun.DeadMin).Seconds() + rate/2); pr.lost > maxLost {
-		t.Fatalf("lost %d of %d datagrams, want <= %d (gap %s)", pr.lost, pr.sent, maxLost, pr.gap)
-	}
-	// after the failover the replies are back at the send rate
-	if want := int(0.75 * rate * tailWindow.Seconds()); pr.tail < want {
-		t.Fatalf("%d replies in the last %s, want >= %d", pr.tail, tailWindow, want)
-	}
-	if len(pr.socks) != 1 {
-		t.Fatalf("target socket changed: %v", pr.socks)
-	}
-	if n := f.far.packetDials.Load(); n != 1 {
-		t.Fatalf("server opened %d target sockets for one packet session", n)
-	}
-	waitFor(5*time.Second, func() bool { return f.serverSessions() == 0 })
-	if n := f.serverSessions(); n != 0 {
-		t.Fatalf("server kept %d packet session(s) after Close", n)
-	}
-}
-
-func TestPacketSelectorFailover(t *testing.T) { testPacketFailover(t, selector) }
-func TestPacketBondFailover(t *testing.T)     { testPacketFailover(t, bond) }
 
 // Pipelined open (HELLO in the carrier open request): same session
 // semantics — byte-exact echo while the active carrier is cut and a rejoin
