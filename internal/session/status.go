@@ -102,6 +102,11 @@ func (s *Session) status() Status {
 	if sn != nil {
 		out.State, out.Err = sn.state, sn.err
 		out.SchedEpoch, out.SchedEchoed = sn.epoch, sn.echoed
+		if s.p.Role == RolePassive {
+			// The passive echoes exactly the epoch it applied
+			// (rendr.SessionStatus: "passive: equals SchedEpoch").
+			out.SchedEchoed = sn.epoch
+		}
 		out.MigDeath, out.MigQuality, out.MigExplicit = sn.migDeath, sn.migQuality, sn.migExplicit
 		out.Rejoins, out.NoPathEpisodes, out.InNoPath = sn.rejoins, sn.episodes, sn.inNoPath
 	}

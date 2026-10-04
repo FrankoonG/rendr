@@ -364,6 +364,13 @@ func TestDialConfirmRoundTrip(t *testing.T) {
 		if st := dc.Status(); st.TxBytes != 3<<20+17 || st.DeliveredBytes != 3<<20+17 || st.State != StateOpen {
 			t.Fatalf("dialer byte counters %+v", st)
 		}
+		// SCHED (§7.5, §10.1): the dialer's initial epoch was applied and
+		// echoed; the passive reports the epoch it applied as echoed.
+		synctest.Wait()
+		if ds, ps := dc.Status(), sc.Status(); ds.SchedEpoch == 0 || ds.SchedEchoed != ds.SchedEpoch ||
+			ps.SchedEpoch != ds.SchedEpoch || ps.SchedEchoed != ps.SchedEpoch {
+			t.Fatalf("SCHED epochs: dialer %d echoed %d, passive %d echoed %d", ds.SchedEpoch, ds.SchedEchoed, ps.SchedEpoch, ps.SchedEchoed)
+		}
 		e2eFinish(t, dc, sc)
 		// An ended session is remembered for Runtime.Close only by its Done
 		// channel, and only until it closed: reading Status drops it.

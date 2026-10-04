@@ -491,7 +491,16 @@ func (h *Health) pingCommitted(c *Conn, id uint32) {
 // shorter than one probe RTT). A PONG of an incarnation that is no longer
 // current gives nothing (L21, L23). A PONG without its commit record
 // overtook its PingCommitted callback: the sample waits for it (probeEarly).
+//
+// A round trip shorter than the clock's resolution measures 0 (Windows'
+// monotonic clock advances in steps of about 0.3–0.5 ms, so a loopback or
+// LAN probe usually reads 0; so does a zero-delay link in a synctest
+// bubble). It is still a round trip: it counts as 1 ns, because
+// sched.Aggregator rejects a zero RTT as untimed, which would leave such a
+// path without evidence for good and make every cold-start Dial wait the
+// whole Probe.DialWait.
 func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
+	rtt = max(rtt, time.Nanosecond)
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
 		return
