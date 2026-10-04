@@ -17,15 +17,18 @@ import (
 // 返回前 A 的未 ACK 区间已排到 B，对端在收到 SCHED 之前就从 B 收到数据").
 //
 // Bulk flows from the dialer over two rate-limited members, A and B, more
-// than one member can carry. A is killed, and the passive's SCHED
-// processing is blocked from that moment: its actor is held as it starts
-// to handle A's death (Hooks.DeathObserved), so it applies no SCHED (and
-// moves no ACK duty) until released. The dialer counts the bond death
+// than one member can carry. A is killed right after it committed a DATA
+// batch, which is still in the link (5 ms one way behind a 2 MiB/s
+// bottleneck) and dies with A: the link counts it lost. The passive's
+// SCHED processing is blocked from that moment: its actor is held as it
+// starts to handle A's death (Hooks.DeathObserved), so it applies no SCHED
+// (and moves no ACK duty) until released. The dialer counts the bond death
 // migration in A's death step — at the instant of the kill, and only
 // because that step requeued A's unacknowledged spans to a live member
 // (§7.6) — and B retransmits them. While the passive's applied epoch stays
 // where it was, its application receives the entire stream intact up to
-// io.EOF, including every byte that was in flight on A.
+// io.EOF, including the batch lost with A: those bytes can only have come
+// from the death step's requeue.
 func TestBondDeathRequeuesBeforeSched_L27(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newHoldGate()
@@ -47,10 +50,25 @@ func TestBondDeathRequeuesBeforeSched_L27(t *testing.T) {
 		epoch0 := pc.Status().SchedEpoch
 		g.arm(func(id uint32) bool { return id == uint32(memberA.ID) })
 
+		// Wait (in 1 ms steps) for A's next DATA commit and kill it at once:
+		// the batch has not left the link yet.
+		cs, _ := carrierByID(dc, memberA.ID)
+		tx0, batch := cs.TxBytes, uint64(0)
+		waitFor(t, 2*time.Second, "A committing a DATA batch", func() bool {
+			cs, _ := carrierByID(dc, memberA.ID)
+			batch = cs.TxBytes - tx0
+			return batch > 0
+		})
 		mark := w.dev.mark()
 		killedAt := time.Now()
 		if a.Kill() < 1 {
 			t.Fatal("no carrier of a killed")
+		}
+		// At most one millisecond of the bottleneck (≈ 2 KiB) has passed
+		// since the commit.
+		lost := a.Stats().Session.BufferLost
+		if lost < int64(batch)-4*kib || lost < 16*kib {
+			t.Fatalf("stimulus: %d bytes lost with A after it committed %d DATA bytes; want the batch lost in the link", lost, batch)
 		}
 		ev := w.dev.wait(t, mark, time.Second, "the dialer's bond death migration", isKind(rendr.EventMigration, dc.ID()))
 		if ev.From != memberA.ID || !isDeathCause(ev.Cause) || !ev.Time.Equal(killedAt) {
@@ -77,8 +95,8 @@ func TestBondDeathRequeuesBeforeSched_L27(t *testing.T) {
 		if cs, ok := carrierByID(dc, memberB.ID); !ok || cs.RetxBytes == 0 {
 			t.Fatalf("B %+v (found %v): want A's spans retransmitted on B", cs, ok)
 		}
-		t.Logf("held passive at epoch %d received %d bytes; dialer epoch %d, %d bytes resent on B",
-			epoch0, up.recvd.Load(), dc.Status().SchedEpoch, dc.Status().RetransmittedBytes)
+		t.Logf("A killed after committing %d DATA bytes, %d bytes lost in the link; held passive at epoch %d received %d bytes; dialer epoch %d, %d bytes resent on B",
+			batch, lost, epoch0, up.recvd.Load(), dc.Status().SchedEpoch, dc.Status().RetransmittedBytes)
 
 		g.open()
 		waitState(t, 5*time.Second, "the passive catching up with the dialer's SCHED", func() (bool, string) {

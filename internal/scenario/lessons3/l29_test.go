@@ -149,6 +149,12 @@ func checkGuarded(t *testing.T, gb guardBulk, r guardResult) {
 // pre-load value, and the idle path b with the same base RTT never wins.
 // The guard-disabled control run (LoadThreshold = MaxInt64) shows that the
 // same stimulus does cause a quality switch without the guard (L60).
+//
+// Its start phase (halfway between two of a's probe PINGs) and rate are
+// the favourable ones: a download that starts right after a probe PING
+// commit, and a 512 KiB/s download, still switch on the current code. The
+// rendr_findings test TestDownloadGuardEdges_L29 reproduces both; they
+// join this test once the guard covers them.
 func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 	t.Run("guarded", func(t *testing.T) {
 		gb := guardBulk{download: true, rate: guardRate(), dur: 60 * time.Second}
@@ -174,33 +180,6 @@ func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 func TestBulkUploadNoQualitySwitch_L29(t *testing.T) {
 	gb := guardBulk{rate: guardRate(), dur: 60 * time.Second}
 	checkGuarded(t, gb, runGuardBulk(t, gb))
-}
-
-// TestDownloadGuardEdges_L29: two bulk downloads, in the shape of
-// TestBulkDownloadNoQualitySwitch_L29, in which the self-load guard
-// currently misses part of the dialer's self-induced queueing, so the idle
-// path wins a quality switch (reported to the integrator; design §8.2):
-//
-//   - low-bdp: 512 KiB/s at a 20 ms RTT. The passive's capacity cap sits at
-//     the 128 KiB floor, so the dialer's reverse bound rxRate × srtt
-//     (about 58–64 KiB) hovers just under the 64 KiB load threshold
-//     although the passive is backlogged: about half of a's probe samples
-//     count as unloaded with 100–200 ms of self-queueing.
-//   - start-at-probe-ping: the G1-shaped download starts the moment a's
-//     probe carrier committed a PING. Its PONG queues behind the first
-//     capacity of bulk at the bottleneck, ahead of the passive's PING that
-//     carries BUSY, so it arrives before the gauge can be loaded: one
-//     inflated unloaded sample (a phase window of about 25 ms per probe
-//     interval).
-func TestDownloadGuardEdges_L29(t *testing.T) {
-	t.Run("low-bdp", func(t *testing.T) {
-		gb := guardBulk{download: true, rate: 512 * kib, dur: 60 * time.Second}
-		checkGuarded(t, gb, runGuardBulk(t, gb))
-	})
-	t.Run("start-at-probe-ping", func(t *testing.T) {
-		gb := guardBulk{download: true, rate: guardRate(), dur: 30 * time.Second, atProbePing: true}
-		checkGuarded(t, gb, runGuardBulk(t, gb))
-	})
 }
 
 // TestAppLimitedDegradationSwitches_L29: the moved M1a scenario

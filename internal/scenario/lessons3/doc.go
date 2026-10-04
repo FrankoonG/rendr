@@ -8,4 +8,8 @@
 // rendrtest Links created inside the testing/synctest bubble that uses them,
 // and asserts that its stimulus happened, that its load was reached and that
 // the data arrived intact. The package has no production code.
+//
+// Reproductions of open product findings live in findings_test.go behind
+// the rendr_findings build tag: they fail on the current code by design and
+// run only with go test -tags rendr_findings.
 package lessons3

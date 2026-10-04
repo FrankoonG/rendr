@@ -8,6 +8,7 @@ import (
 
 	rendr "github.com/FrankoonG/rendr/v2"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -186,43 +187,81 @@ func mustCarrier(t testing.TB, dc *rendr.Conn, name string) rendr.CarrierStatus 
 //     factory, which becomes active within one round trip.
 //
 // The dialer counts the quality switch and B's death; the passive ends up
-// routing over the dialer's active carrier.
+// routing over the dialer's active carrier. (Whether the passive counts the
+// same migrations depends on which SCHEDs reach it: see the rendr_findings
+// test TestSuccessorDeathCountedOnBothEnds_L22.)
 func TestSuccessorDiesFallsBackToPredecessor_L22(t *testing.T) {
-	t.Run("predecessor-retiring", func(t *testing.T) { successorDies(t, false, false) })
-	t.Run("predecessor-retired", func(t *testing.T) { successorDies(t, true, false) })
+	t.Run("predecessor-retiring", func(t *testing.T) { successorDies(t, successorCase{}) })
+	t.Run("predecessor-retired", func(t *testing.T) { successorDies(t, successorCase{retired: true}) })
 }
 
-// TestSuccessorDeathCountedOnBothEnds_L22: the scenarios of
-// TestSuccessorDiesFallsBackToPredecessor_L22, checking that both ends
-// count the same selector migrations (design §7.6: the passive counts from
-// the SCHED cause bits, "both ends therefore count the same selector
-// migrations"; §0.2). The dialer counts the quality switch to B and B's
-// death. The passive counts a SCHED only when the carrier it names becomes
-// its sender, which B never does there:
-//
-//   - predecessor-retired: the passive applies the quality SCHED, but B is
-//     already dead on the passive by then, so only the death SCHED (naming
-//     the new carrier of a) counts.
-//   - predecessor-retiring: the death SCHED is published in the same
-//     instant as the quality SCHED and supersedes it before it is sent;
-//     the passive's sender goes from A to A, and nothing counts.
-//
-// It fails on the current code (reported to the integrator).
-func TestSuccessorDeathCountedOnBothEnds_L22(t *testing.T) {
-	t.Run("predecessor-retiring", func(t *testing.T) { successorDies(t, false, true) })
-	t.Run("predecessor-retired", func(t *testing.T) { successorDies(t, true, true) })
+// successorCase is one scenario of the L22 successor-death tests.
+type successorCase struct {
+	// retired: the session is idle at the switch, so Retire is called on A
+	// at once; otherwise the passive application holds A's data
+	// unacknowledged and A stays retiring.
+	retired bool
+	// order fixes whether the quality SCHED of the switch to B reaches the
+	// passive before B's death supersedes it (the findings test); the
+	// required test leaves it to goroutine scheduling.
+	order schedOrder
 }
 
-// successorDies runs one TestSuccessorDiesFallsBackToPredecessor_L22
-// scenario; bothEnds adds the both-ends migration count check.
-func successorDies(t *testing.T, retired, bothEnds bool) {
+// schedOrder is the order in which the passive learns of the two SCHEDs a
+// successor death publishes on the dialer: the quality SCHED of the switch
+// to B, then the SCHED of B's death (in the retiring case, naming A again;
+// in the retired case, naming the race winner one JOIN later).
+type schedOrder uint8
+
+const (
+	// schedFree: goroutine scheduling decides whether A's writer carries
+	// the quality SCHED before B's death step publishes the next epoch.
+	schedFree schedOrder = iota
+	// schedFirst: the dialer's death step for B is held
+	// (Hooks.DeathObserved) until A's link carried the quality SCHED.
+	schedFirst
+	// schedNeverSent: A's writer is held (Hooks.BeforeWrite) on a batch
+	// sealed before the switch until B's death step published the next
+	// epoch, and B dies in the instant of the switch: the quality SCHED
+	// never reaches the passive. Retiring case only.
+	schedNeverSent
+)
+
+// successorDies runs one successor-death scenario and returns the
+// migrations each end counted.
+func successorDies(t *testing.T, sc successorCase) (dialer, passive rendr.MigrationCounts) {
 	synctest.Test(t, func(t *testing.T) {
 		ov := selectorTimings(time.Hour)  // one quality switch only
 		ov.RetireGrace = 30 * time.Second // A's retirement waits for its acknowledgements
+		var join, death, write *holdGate  // the order's hold points (dialer only)
+		switch sc.order {
+		case schedFirst:
+			death = newHoldGate()
+			ov.Hooks = &testhooks.Hooks{DeathObserved: death.hook}
+		case schedNeverSent:
+			if sc.retired {
+				t.Fatal("schedNeverSent needs the retiring predecessor as B's fallback")
+			}
+			join, write = newHoldGate(), newHoldGate()
+			calls := 0
+			join.arm(func(uint32) bool { calls++; return calls == 2 }) // the OPEN's result passes, B's JOIN result is held
+			// A, idle but for PINGs, writes within 200 ms while B's JOIN
+			// result is held.
+			ov.PingIdle = 200 * time.Millisecond
+			ov.Hooks = &testhooks.Hooks{DialResult: join.hook, BeforeWrite: func(id uint32, _, _ int) { write.hook(id) }}
+		}
+		pov := ov
+		pov.Hooks = nil
+		var gates []*holdGate
+		for _, g := range []*holdGate{join, death, write} {
+			if g != nil {
+				gates = append(gates, g)
+			}
+		}
 		w := newWorld(t, worldConfig{
 			links: []linkSpec{{name: "a", delay: 5 * time.Millisecond}, {name: "b", delay: 10 * time.Millisecond}},
-			dov:   &ov,
-		})
+			dov:   &ov, pov: &pov,
+		}, gates...)
 		a, b := w.link("a"), w.link("b")
 		dc, pc := w.open(w.peer(), rendr.ModeSelector)
 		pred := mustActive(t, dc, "dialer")
@@ -231,7 +270,7 @@ func successorDies(t *testing.T, retired, bothEnds bool) {
 		}
 		read := make(chan struct{}) // the passive application reads once closed
 		var held *flow
-		if retired {
+		if sc.retired {
 			close(read)
 			warm := w.startFlow("warm-up", dc, pc, 230, flowOpts{n: 256 * kib, keepOpen: true})
 			warm.wait(t, 5*time.Second)
@@ -249,23 +288,56 @@ func successorDies(t *testing.T, retired, bothEnds bool) {
 			}
 		}
 
+		// The first SCHED A carries from now on shows which SCHED of the
+		// switch the passive gets first (a probe carrier carries none).
+		var firstSched <-chan []byte
+		if sc.order != schedFree {
+			firstSched = a.CaptureNextFrame(rendrtest.Up, rendrtest.FrameSched)
+		}
+		epoch0 := dc.Status().SchedEpoch
 		mark := w.dev.mark()
 		a.SetDelay(40*time.Millisecond, 0) // b becomes the clearly better path
+		if sc.order == schedNeverSent {
+			// The switch waits for B's JOIN result, which is released only
+			// once A's writer is held on its next batch: that batch was
+			// sealed before the switch, so it cannot carry the quality
+			// SCHED. Nothing below lets virtual time pass until A's writer
+			// is released.
+			awaitHeld(t, join, 10*time.Second, "B's JOIN result")
+			write.arm(func(id uint32) bool { return id == uint32(pred.ID) })
+			awaitHeld(t, write, 2*time.Second, "A's next write")
+			join.open()
+		}
 		q := w.dev.wait(t, mark, 10*time.Second, "quality switch", isKind(rendr.EventMigration, dc.ID()))
+		if sc.order == schedFirst {
+			death.arm(func(id uint32) bool { return id == uint32(q.To) })
+		}
 		killed := b.Kill() // the successor dies right after its confirmation
 		if q.Cause != rendr.CauseQuality || q.From != pred.ID || killed < 1 {
 			t.Fatalf("migration %+v (killed %d carriers of b), want a quality switch away from A %d", q, killed, pred.ID)
 		}
+		if sc.order == schedFirst {
+			// B's death step waits until A carried the quality SCHED.
+			awaitHeld(t, death, time.Second, "B's death step")
+			wantSched(t, firstSched, epoch0+1, wire.SchedQuality, q.To)
+			death.open()
+		}
 		d := w.dev.wait(t, mark, 2*time.Second, "death migration", func(e rendr.Event) bool {
 			return e.Kind == rendr.EventMigration && e.Session == dc.ID() && isDeathCause(e.Cause)
 		})
+		if sc.order == schedNeverSent {
+			write.open()
+			// The death SCHED (naming A again) is the first SCHED on A; B's
+			// frames died with b in the instant of the switch.
+			wantSched(t, firstSched, epoch0+2, wire.SchedDeath, pred.ID)
+		}
 		recovered := d.Time.Sub(q.Time)
 		if d.From != q.To {
 			t.Fatalf("death migration %+v, want away from the successor %d", d, q.To)
 		}
 		act := mustActive(t, dc, "dialer")
 		st := dc.Status()
-		if retired {
+		if sc.retired {
 			// Retire was called on A: a new carrier of a won the race.
 			old, _ := carrierByID(dc, pred.ID)
 			if act.ID == pred.ID || act.Name != "a" || act.Gen != 2 || d.To != act.ID || old.State == rendr.CarrierActive {
@@ -292,15 +364,8 @@ func successorDies(t *testing.T, retired, bothEnds bool) {
 			return ok && cs.ID == act.ID && ps.SchedEpoch == ds.SchedEpoch,
 				fmt.Sprintf("passive active %d (%v), epoch %d of %d", cs.ID, ok, ps.SchedEpoch, ds.SchedEpoch)
 		})
-		if bothEnds {
-			// Design §7.6, §0.2: both ends count the same selector
-			// migrations; the passive counts them from the SCHED causes.
-			if got := pc.Status().Migrations; got != want {
-				t.Errorf("passive migrations %+v, dialer %+v: the ends disagree", got, want)
-			}
-		}
 
-		if retired {
+		if sc.retired {
 			// The session runs on over the new carrier, both ways.
 			up := w.startFlow("up", dc, pc, 232, flowOpts{n: 4 * mib})
 			down := w.startFlow("down", pc, dc, 233, flowOpts{n: 4 * mib})
@@ -314,9 +379,46 @@ func successorDies(t *testing.T, retired, bothEnds bool) {
 			t.Fatalf("stimulus: b killed %d session carriers", st.Killed)
 		}
 		wantMigrations(t, "dialer", dc, want)
+		dialer, passive = dc.Status().Migrations, pc.Status().Migrations
 		finishSession(t, dc, pc)
 		w.finish()
 	})
+	return dialer, passive
+}
+
+// awaitHeld waits until g holds a call, failing t after within.
+func awaitHeld(t testing.TB, g *holdGate, within time.Duration, what string) uint32 {
+	t.Helper()
+	select {
+	case id := <-g.held:
+		return id
+	case <-time.After(within):
+		t.Fatalf("%s not held within %v", what, within)
+		return 0
+	}
+}
+
+// wantSched requires that the frame captured on ch is a SCHED of the given
+// epoch and cause naming exactly the carrier id.
+func wantSched(t testing.TB, ch <-chan []byte, epoch uint32, cause wire.SchedCause, id rendr.CarrierID) {
+	t.Helper()
+	var raw []byte
+	select {
+	case raw = <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("no SCHED captured within 1 s (want epoch %d)", epoch)
+	}
+	f, _, err := wire.DecodeFrame(raw)
+	if err != nil || f.Type != wire.TypeSched {
+		t.Fatalf("captured frame %x: type %v, %v", raw, f.Type, err)
+	}
+	s, err := wire.ParseSched(f.Payload)
+	if err != nil {
+		t.Fatalf("captured SCHED payload: %v", err)
+	}
+	if got := wire.SchedCause(f.Flags & wire.SchedCauseMask); s.Epoch != epoch || got != cause || s.N != 1 || s.IDs[0] != uint32(id) {
+		t.Fatalf("captured SCHED epoch %d, cause %d, IDs %v; want epoch %d, cause %d naming %d", s.Epoch, got, s.IDs[:s.N], epoch, cause, id)
+	}
 }
 
 // TestRecoveredPathWinsAfterDwell_L22: A (the better path a) dies and the
