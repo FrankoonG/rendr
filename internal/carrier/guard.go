@@ -170,13 +170,13 @@ func closeNow(nc net.Conn) {
 }
 
 // closeOnce closes an embedder conn exactly once (L52), whoever comes
-// first: the goroutine that owns the conn, after its last call (now), or
-// the last-resort close of that goroutine's abandonment (lastResort, design
-// §0.8 V2). A verdict write — WriteAndClose, an RST(withdrawn) — on a conn
-// that ignores its write deadline but honours Close would otherwise keep
-// the conn open for as long as the peer does not read: the goroutine stuck
-// in it is counted in the abandoned-call pool, and only the Close it never
-// reaches would unblock it.
+// first: the goroutine that owns the conn, after its last call, or the
+// last-resort close of that goroutine's abandonment (design §0.8 V2). A
+// verdict write — WriteAndClose, an RST(withdrawn), a PREFACE_ACK refusal —
+// on a conn that ignores its write deadline but honours Close would
+// otherwise keep the conn open for as long as the peer does not read: the
+// goroutine stuck in it is counted in the abandoned-call pool, and only the
+// Close it never reaches would unblock it.
 type closeOnce struct {
 	nc   net.Conn
 	done atomic.Bool
@@ -191,14 +191,56 @@ func (k *closeOnce) now() {
 	}
 }
 
-// lastResort closes the conn on a guarded goroutine (CloseConn) unless it
-// was closed already: the goroutine that owns it was adopted by the
-// abandoned-call pool while still inside an embedder call that ignored its
-// deadline, and the Close unblocks it. It never blocks.
-func (k *closeOnce) lastResort(env *Env) {
+// async closes the conn on a guarded goroutine (CloseConn) unless it was
+// closed already; it never blocks. As the last resort it runs when the
+// goroutine that owns the conn was adopted by the abandoned-call pool while
+// still inside an embedder call that ignored its deadline: the Close
+// unblocks that call.
+func (k *closeOnce) async(env *Env) {
 	if k.done.CompareAndSwap(false, true) {
 		CloseConn(env, k.nc)
 	}
+}
+
+// writeAndCloseInline is Conn.WriteAndClose for a conn that has no Conn,
+// run on the calling goroutine: it writes frame bounded by deadline (zero:
+// now + drainMax) and closes k's conn in the L05 order — CloseWrite on an
+// OwnedTCP, a drain bounded by min(deadline, drainMax), then Close on a
+// guarded goroutine (k.async). The calling goroutine is watched like the
+// closer of WriteAndClose: when it is still inside the write or the drain
+// AbandonWait after both bounds — a conn that ignores its deadlines and a
+// peer that neither reads nor closes — it is counted in the abandoned-call
+// pool and its conn is closed through k as the last resort (design §0.8
+// V2), which ends the call on a conn that honours Close. Every other close
+// of the conn must go through k too — the caller's runtime.Goexit guard
+// included, since a Goexit in a conn call skips the final close here — so
+// that it is closed exactly once (L51, L52). It is the verdict form for
+// ReadHello's PREFACE_ACK refusals (VERSION, FEATURE, and the gate's
+// CAPACITY or GOING_AWAY): the refusal stays on the handshake goroutine and
+// in its slot (L48), so Runtime.Close's handshake join covers it.
+func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Time) {
+	now := time.Now()
+	if deadline.IsZero() {
+		deadline = now.Add(drainMax)
+	}
+	wait := env.Timing.withDefaults().AbandonWait + drainMax
+	if d := deadline.Sub(now); d > 0 {
+		wait += d
+	}
+	w := armWatch(env.Abandon, wait, func() { k.async(env) })
+	defer w.finish() // also on runtime.Goexit in a conn call: nothing stays counted
+	_ = callSetWriteDeadline(k.nc, deadline)
+	if writeFull(k.nc, frame) == nil {
+		if o, ok := k.nc.(*OwnedTCP); ok {
+			_ = callCloseWrite(o)
+		}
+		until := time.Now().Add(drainMax)
+		if deadline.Before(until) {
+			until = deadline
+		}
+		drain(k.nc, until)
+	}
+	k.async(env)
 }
 
 // watch counts a goroutine that is still inside embedder code AbandonWait
@@ -225,7 +267,7 @@ func startWatch(pool *AbandonPool, d time.Duration) *watch {
 
 // armWatch is startWatch with a last-resort action: when the watch adopts
 // its goroutine, last runs once on the timer's goroutine, after the
-// adoption (design §0.8 V2: closeOnce.lastResort). It must not block.
+// adoption (design §0.8 V2: closeOnce.async). It must not block.
 func armWatch(pool *AbandonPool, d time.Duration, last func()) *watch {
 	w := &watch{pool: pool, last: last}
 	if d <= 0 {

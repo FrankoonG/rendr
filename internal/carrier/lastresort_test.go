@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -13,16 +15,24 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// lrConn is one end of a net.Pipe that ignores write deadlines — and, when
-// deaf, read deadlines too — but honours Close: a Write or Read in progress
-// returns as soon as the conn is closed (design §0.8 V2). It counts Writes
-// and Closes and records when it was first closed.
+// lrConn is one end of a net.Pipe that ignores write deadlines (unless
+// writeDeadlines) — and, when deaf, read deadlines too — but honours Close:
+// a Write or Read in progress returns as soon as the conn is closed (design
+// §0.8 V2). It counts Writes and Closes, records when it was first closed
+// and closes closed then (a gate for the tests).
 type lrConn struct {
 	net.Conn
-	deaf     bool
-	writes   atomic.Int32
-	closes   atomic.Int32
-	closedAt atomic.Int64 // UnixNano of the first Close; 0: never closed
+	deaf           bool
+	writeDeadlines bool // honour write deadlines like a plain net.Pipe end
+	writes         atomic.Int32
+	closes         atomic.Int32
+	closedAt       atomic.Int64 // UnixNano of the first Close; 0: never closed
+	closed         chan struct{}
+	once           sync.Once
+}
+
+func newLRConn(nc net.Conn, deaf bool) *lrConn {
+	return &lrConn{Conn: nc, deaf: deaf, closed: make(chan struct{})}
 }
 
 func (l *lrConn) Write(p []byte) (int, error) {
@@ -34,11 +44,22 @@ func (l *lrConn) Close() error {
 	if l.closes.Add(1) == 1 {
 		l.closedAt.Store(time.Now().UnixNano())
 	}
-	return l.Conn.Close()
+	err := l.Conn.Close()
+	l.once.Do(func() { close(l.closed) })
+	return err
 }
 
-func (l *lrConn) SetDeadline(t time.Time) error    { return l.SetReadDeadline(t) }
-func (l *lrConn) SetWriteDeadline(time.Time) error { return nil }
+func (l *lrConn) SetDeadline(t time.Time) error {
+	_ = l.SetWriteDeadline(t)
+	return l.SetReadDeadline(t)
+}
+
+func (l *lrConn) SetWriteDeadline(t time.Time) error {
+	if !l.writeDeadlines {
+		return nil
+	}
+	return l.Conn.SetWriteDeadline(t)
+}
 
 func (l *lrConn) SetReadDeadline(t time.Time) error {
 	if l.deaf {
@@ -56,6 +77,17 @@ func (l *lrConn) closedAfter(start time.Time) time.Duration {
 	return time.Unix(0, n).Sub(start)
 }
 
+// waitClosed waits for the first Close (inside a bubble the wait is
+// virtual: time advances to the timer that closes the conn).
+func (l *lrConn) waitClosed(t testing.TB) {
+	t.Helper()
+	select {
+	case <-l.closed:
+	case <-time.After(time.Minute):
+		t.Fatal("the conn was never closed")
+	}
+}
+
 // lrSilentPassive is a passive end that reads the dialer's PREFACE and
 // OPEN, answers PREFACE_ACK(OK) for carrier id and then neither reads nor
 // closes: a verdict the dialer writes after it is never taken.
@@ -71,14 +103,18 @@ func lrSilentPassive(nc net.Conn, id uint32) {
 // a conn that ignores its write deadline (or the drain's read deadline)
 // but honours Close, to a peer that neither reads nor closes — the frame
 // or the drain of WriteAndClose, the RST(withdrawn) after an instance
-// refusal or after a withdrawal — ends when the abandonment timer adopts
-// the stuck goroutine: the conn is then closed exactly once, at that
-// moment (the last resort), the goroutine returns and leaves the
-// abandoned-call pool, and the handshake was never held by the verdict.
-// Without the last resort the conn stays open and the goroutine stuck.
+// refusal or after a withdrawal, and the inline verdict meant for
+// ReadHello's PREFACE_ACK refusals — ends when the abandonment timer adopts
+// the stuck goroutine: the conn is then closed exactly once, at that moment
+// (the last resort), the goroutine returns and leaves the abandoned-call
+// pool. Establish returns before its RST (written on a goroutine of its
+// own); the inline verdict holds its caller until the last resort, as a
+// refusal holds its handshake slot. Without the last resort the conn stays
+// open and the goroutine stuck.
 func TestVerdictWriteLastResortClose_L52(t *testing.T) {
 	const abandonWait = time.Second // hTiming
 	errOther := errors.New("not the bound instance")
+	refusal := func() []byte { return hPrefaceAck(wire.PrefaceVersion, 9) }
 	for _, tc := range []struct {
 		name   string
 		deaf   bool
@@ -143,16 +179,41 @@ func TestVerdictWriteLastResortClose_L52(t *testing.T) {
 					t.Fatalf("after %v: %v, want the withdrawal at once", time.Since(start), err)
 				}
 			}},
+		{"inline verdict (a PREFACE_ACK refusal), the peer never reads", false, 1, abandonWait + time.Second + drainMax,
+			func(t *testing.T, env *Env, nc *lrConn, _ net.Conn) {
+				start := time.Now()
+				writeAndCloseInline(env, &closeOnce{nc: nc}, refusal(), start.Add(time.Second))
+				if d := time.Since(start); d != abandonWait+time.Second+drainMax {
+					t.Fatalf("returned after %v, want the last resort", d)
+				}
+			}},
+		{"inline verdict drain, the peer reads the refusal and stays", true, 1, abandonWait + time.Second + drainMax,
+			func(t *testing.T, env *Env, nc *lrConn, peer net.Conn) {
+				got := make(chan []byte, 1)
+				go func() {
+					var ab [wire.PrefaceLen]byte
+					_, _ = io.ReadFull(peer, ab[:])
+					got <- ab[:] // then silent: the drain never sees EOF
+				}()
+				start := time.Now()
+				writeAndCloseInline(env, &closeOnce{nc: nc}, refusal(), start.Add(time.Second))
+				if ack, err := wire.ParsePrefaceAck(<-got); err != nil || ack.Status != wire.PrefaceVersion {
+					t.Fatalf("the peer read %+v %v, want the refusal", ack, err)
+				}
+				if d := time.Since(start); d != abandonWait+time.Second+drainMax {
+					t.Fatalf("returned after %v, want the last resort", d)
+				}
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				env := hEnv()
 				a, b := net.Pipe()
 				defer b.Close() // unblocks a goroutine the last resort missed, so the bubble can end
-				nc := &lrConn{Conn: a, deaf: tc.deaf}
+				nc := newLRConn(a, tc.deaf)
 				start := time.Now()
 				tc.run(t, env, nc, b)
-				time.Sleep(time.Minute)
+				nc.waitClosed(t)
 				synctest.Wait()
 				if nc.writes.Load() != tc.writes {
 					t.Fatalf("stimulus: %d conn Writes, want %d", nc.writes.Load(), tc.writes)
@@ -162,6 +223,66 @@ func TestVerdictWriteLastResortClose_L52(t *testing.T) {
 				}
 				if env.Abandon.Len() != 0 || env.IDs.inUse() != 0 {
 					t.Fatalf("abandoned %d (the stuck goroutine must return once closed), IDs in use %d", env.Abandon.Len(), env.IDs.inUse())
+				}
+			})
+		})
+	}
+}
+
+// TestInlineVerdictGoexitClosesOnce_L51: a runtime.Goexit inside the
+// embedder's Write of an inline verdict skips its final close; the
+// caller's Goexit guard closes through the same closeOnce, so the conn is
+// closed exactly once — also when the last resort already closed it under
+// a Write that ignored its deadline and then ran Goexit — and nothing stays
+// counted in the abandoned-call pool.
+func TestInlineVerdictGoexitClosesOnce_L51(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block bool // the Write blocks until the conn is closed, then runs Goexit
+		at    time.Duration
+	}{{"at once", false, 0}, {"after the last resort", true, time.Second + time.Second + drainMax}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				defer b.Close()
+				closed := make(chan struct{})
+				var once sync.Once
+				var closes atomic.Int32
+				hc := &hookConn{Conn: a,
+					onWrite: func(net.Conn, []byte) (int, error) {
+						if tc.block {
+							<-closed // ignores its deadline, honours Close
+						}
+						runtime.Goexit()
+						return 0, nil
+					},
+					onSetWriteDeadline: func(net.Conn, time.Time) error { return nil },
+					onClose: func(nc net.Conn) error {
+						closes.Add(1)
+						once.Do(func() { close(closed) })
+						return nc.Close()
+					}}
+				k := &closeOnce{nc: hc}
+				start := time.Now()
+				done := make(chan struct{})
+				returned := false
+				go func() {
+					defer close(done)
+					defer k.async(env) // the caller's Goexit guard (ReadHello's)
+					writeAndCloseInline(env, k, hPrefaceAck(wire.PrefaceCapacity, 9), start.Add(time.Second))
+					returned = true
+				}()
+				<-done
+				synctest.Wait()
+				if returned || hc.writes.Load() != 1 {
+					t.Fatalf("stimulus: returned %v, writes %d; want one Write that ran Goexit", returned, hc.writes.Load())
+				}
+				if d := time.Since(start); d != tc.at {
+					t.Fatalf("the Goexit came after %v, want %v", d, tc.at)
+				}
+				if closes.Load() != 1 || env.Abandon.Len() != 0 {
+					t.Fatalf("conn closed %d times, abandoned %d", closes.Load(), env.Abandon.Len())
 				}
 			})
 		})

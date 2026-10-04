@@ -431,49 +431,84 @@ func TestWithdrawOverRawPipe_L49(t *testing.T) {
 }
 
 // TestWithdrawCutsUnreadHello_L49: an OPEN still being written when the
-// dialer withdraws — the passive read only the PREFACE and then stalls — is
-// cut: Establish returns at the withdrawal, and nothing follows the partial
-// first frame on the wire (an RST there would sit inside a broken frame);
-// the conn is closed exactly once and nothing is abandoned.
+// dialer withdraws — the passive read only the PREFACE, or also answered
+// PREFACE_ACK(OK), and then stalls — is cut on a plain pipe end and on one
+// that ignores write deadlines but honours Close (design §0.8 V2):
+// Establish returns at the withdrawal, the conn is closed exactly once,
+// right then, and nothing follows the partial first frame on the wire (an
+// RST there would sit inside a broken frame); nothing is abandoned. Waiting
+// for a hello writer that only the close can end would hold both until
+// AbandonWait.
 func TestWithdrawCutsUnreadHello_L49(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		env := hEnv()
-		a, b := net.Pipe()
-		hc := &hookConn{Conn: a}
-		var rest []byte
-		var restErr error
-		passive := make(chan struct{})
-		stalled := make(chan struct{})
-		go func() {
-			defer close(passive)
-			var pb [wire.PrefaceLen]byte
-			if _, restErr = io.ReadFull(b, pb[:]); restErr != nil {
-				return
-			}
-			<-stalled // the first frame stays unread until the dialer gave up
-			rest, restErr = io.ReadAll(b)
-		}()
-		ctx, cancel := context.WithCancelCause(context.Background())
-		defer cancel(nil)
-		time.AfterFunc(100*time.Millisecond, func() { cancel(ErrWithdrawn) })
-		f := Factory{Name: "pipe", Dial: func(context.Context) (net.Conn, error) { return hc, nil }}
-		start := time.Now()
-		_, err := Establish(ctx, env, f, env.IDs.Next(), wire.TypeOpen, openPayload(0), nil)
-		var ee *EstablishError
-		if !errors.As(err, &ee) || ee.Cause != CauseLocalClose || !errors.Is(err, ErrWithdrawn) || time.Since(start) != 100*time.Millisecond {
-			t.Fatalf("after %v: %v, want the withdrawal at once", time.Since(start), err)
-		}
-		close(stalled)
-		<-passive
-		b.Close()
-		if restErr != nil || len(rest) != 0 {
-			t.Fatalf("after the PREFACE the passive read %d bytes (%v), want nothing after a cut first frame", len(rest), restErr)
-		}
-		synctest.Wait()
-		if hc.writes.Load() != 1 || hc.closes.Load() != 1 || env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
-			t.Fatalf("writes %d, closes %d, IDs in use %d, abandoned %d", hc.writes.Load(), hc.closes.Load(), env.IDs.inUse(), env.Abandon.Len())
-		}
-	})
+	const withdraw = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name           string
+		writeDeadlines bool // false: the conn ignores write deadlines
+		ack            bool // the passive answers PREFACE_ACK(OK) before it stalls
+	}{
+		{"pipe, PREFACE read", true, false},
+		{"pipe, PREFACE_ACK answered", true, true},
+		{"write deadline ignored, PREFACE read", false, false},
+		{"write deadline ignored, PREFACE_ACK answered", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				nc := newLRConn(a, false)
+				nc.writeDeadlines = tc.writeDeadlines
+				id := env.IDs.Next()
+				var rest []byte
+				var restErr error
+				passive := make(chan struct{})
+				stalled := make(chan struct{})
+				var unstall sync.Once
+				release := func() { unstall.Do(func() { close(stalled) }) }
+				defer func() { // a failed assertion still ends the passive, so the bubble can end
+					release()
+					b.Close()
+				}()
+				go func() {
+					defer close(passive)
+					var pb [wire.PrefaceLen]byte
+					if _, restErr = io.ReadFull(b, pb[:]); restErr != nil {
+						return
+					}
+					if tc.ack {
+						if _, restErr = b.Write(hPrefaceAck(wire.PrefaceOK, id)); restErr != nil {
+							return
+						}
+					}
+					<-stalled // the first frame stays unread until the dialer gave up
+					rest, restErr = io.ReadAll(b)
+				}()
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				time.AfterFunc(withdraw, func() { cancel(ErrWithdrawn) })
+				f := Factory{Name: "pipe", Dial: func(context.Context) (net.Conn, error) { return nc, nil }}
+				start := time.Now()
+				_, err := Establish(ctx, env, f, id, wire.TypeOpen, openPayload(0), nil)
+				var ee *EstablishError
+				if !errors.As(err, &ee) || ee.Cause != CauseLocalClose || !errors.Is(err, ErrWithdrawn) || time.Since(start) != withdraw {
+					t.Fatalf("after %v: %v, want the withdrawal at once", time.Since(start), err)
+				}
+				nc.waitClosed(t)
+				release()
+				<-passive
+				b.Close()
+				if restErr != nil || len(rest) != 0 {
+					t.Fatalf("after the PREFACE the passive read %d bytes (%v), want nothing after a cut first frame", len(rest), restErr)
+				}
+				synctest.Wait()
+				if n, at := nc.closes.Load(), nc.closedAfter(start); n != 1 || at != withdraw {
+					t.Fatalf("conn closed %d times, first after %v; want once, at the withdrawal", n, at)
+				}
+				if nc.writes.Load() != 1 || env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
+					t.Fatalf("writes %d, IDs in use %d, abandoned %d", nc.writes.Load(), env.IDs.inUse(), env.Abandon.Len())
+				}
+			})
+		})
+	}
 }
 
 // TestHelloWriteFailureEndsAttempt_L42_L51: a hello Write that fails — an
@@ -529,6 +564,62 @@ func TestHelloWriteFailureEndsAttempt_L42_L51(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestHelloWriteFailsAfterPrefaceAck_L51: the passive read the PREFACE and
+// answered PREFACE_ACK(OK), which Establish read, and then the hello Write
+// fails on the first frame: Establish, waiting for the first frame to be
+// written, ends at once with the Write's failure (stage preface, not a
+// completed PREFACE exchange); nothing follows the PREFACE on the wire, the
+// conn is closed exactly once and nothing is abandoned.
+func TestHelloWriteFailsAfterPrefaceAck_L51(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		a, b := net.Pipe()
+		errBoom := errors.New("boom")
+		id := env.IDs.Next()
+		acked := make(chan struct{})
+		var rest []byte
+		passive := make(chan error, 1)
+		go func() {
+			defer b.Close()
+			var pb [wire.PrefaceLen]byte
+			if _, err := io.ReadFull(b, pb[:]); err != nil {
+				passive <- err
+				return
+			}
+			_, err := b.Write(hPrefaceAck(wire.PrefaceOK, id)) // returns once Establish read it
+			close(acked)
+			if err != nil {
+				passive <- err
+				return
+			}
+			rest, err = io.ReadAll(b)
+			passive <- err
+		}()
+		hc := &hookConn{Conn: a, onWrite: func(nc net.Conn, p []byte) (int, error) {
+			n, err := nc.Write(p[:wire.PrefaceLen])
+			if err != nil {
+				return n, err
+			}
+			<-acked // Establish has the PREFACE_ACK(OK): it now waits for the first frame
+			return n, errBoom
+		}}
+		f := Factory{Name: "w", Dial: func(context.Context) (net.Conn, error) { return hc, nil }}
+		start := time.Now()
+		_, err := Establish(context.Background(), env, f, id, wire.TypeOpen, openPayload(0), nil)
+		var ee *EstablishError
+		if !errors.As(err, &ee) || ee.Stage != "preface" || ee.Cause != CauseTransportError || ee.PrefaceOK || !errors.Is(err, errBoom) || time.Since(start) != 0 {
+			t.Fatalf("after %v: %v (%+v), want the Write's failure at once", time.Since(start), err, ee)
+		}
+		if perr := <-passive; perr != nil || len(rest) != 0 {
+			t.Fatalf("the passive read %d bytes after the PREFACE (%v), want nothing", len(rest), perr)
+		}
+		synctest.Wait()
+		if hc.writes.Load() != 1 || hc.closes.Load() != 1 || env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
+			t.Fatalf("writes %d, closes %d, IDs in use %d, abandoned %d", hc.writes.Load(), hc.closes.Load(), env.IDs.inUse(), env.Abandon.Len())
+		}
+	})
 }
 
 // TestHelloWriterAbandonedBounded_L52: a hello Write stuck in an embedder

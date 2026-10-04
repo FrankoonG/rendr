@@ -554,9 +554,9 @@ func (c *Conn) partDone(p uint8) {
 // the verdict write or the drain of WriteAndClose on a conn that ignores
 // its deadline. Its conn is then closed once as a last resort (design §0.8
 // V2), which unblocks the call on a conn that honours Close; a closer stuck
-// inside the Close itself is never closed a second time (closeOnce).
-// lastResort only starts a guarded goroutine, so it may run under the
-// leaf lock.
+// inside the Close itself is never closed a second time (closeOnce). The
+// last resort (closeOnce.async) only starts a guarded goroutine, so it may
+// run under the leaf lock.
 func (c *Conn) abandonParts() {
 	c.jmu.Lock()
 	defer c.jmu.Unlock()
@@ -570,7 +570,7 @@ func (c *Conn) abandonParts() {
 		}
 	}
 	if stuck&partCloser != 0 {
-		c.ncClose.lastResort(c.env)
+		c.ncClose.async(c.env) // the last resort
 	}
 	c.maybeDoneLocked()
 }
