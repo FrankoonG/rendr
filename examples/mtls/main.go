@@ -19,9 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -137,17 +137,17 @@ func serveTLS(ln net.Listener, cfg *tls.Config, timeout time.Duration, handle fu
 	}
 }
 
-// result is what run observed: the echoed bytes and the final Status of
-// the session at each end.
+// result is what run observed: the echo, and the Status of the session at
+// each end as finish reported it (ended with io.EOF when run succeeds).
 type result struct {
 	echo            []byte
 	dialer, passive rendr.SessionStatus
 }
 
-// run starts both Runtimes, dials, echoes msg and reports the result. Each
-// side ends its session (finish) before its Runtime closes.
-func run(p *pki, msg []byte) (result, error) {
-	var r result
+// run starts both Runtimes, echoes msg through one session and reports the
+// result. Each side ends its session (finish) before its Runtime closes;
+// the passive application hands its outcome back over a channel.
+func run(p *pki, msg []byte) (r result, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	passive, err := rendr.NewRuntime(rendr.Config{})
@@ -164,23 +164,28 @@ func run(p *pki, msg []byte) (result, error) {
 		return r, err
 	}
 	defer serveTLS(raw, p.server, 10*time.Second, ln.Handle)()
-	echoed := make(chan error, 1)
+	type end struct {
+		st  rendr.SessionStatus
+		err error
+	}
+	echoed := make(chan end, 1)
 	go func() { // the passive application
 		st, err := echoOne(ctx, ln)
-		r.passive = st
-		echoed <- err
+		echoed <- end{st, err}
 	}()
 	r.echo, r.dialer, err = dialEcho(ctx, raw.Addr().String(), p.client, msg)
 	if err != nil {
 		cancel() // the passive application stops waiting
 	}
-	err = errors.Join(err, <-echoed) // r.passive is set from here on
-	return r, err
+	e := <-echoed
+	r.passive = e.st
+	return r, errors.Join(err, e.err)
 }
 
 // dialEcho sends msg and a FIN over one selector session, reads the echo
-// and ends the session before its Runtime closes. It returns the echo and
-// the session's final Status.
+// until the passive's FIN and ends the session (finish) before its Runtime
+// closes. It returns the echo and the session's Status from finish (zero if
+// dialEcho failed before).
 func dialEcho(ctx context.Context, addr string, cfg *tls.Config, msg []byte) ([]byte, rendr.SessionStatus, error) {
 	dialer, err := rendr.NewRuntime(rendr.Config{})
 	if err != nil {
@@ -197,21 +202,22 @@ func dialEcho(ctx context.Context, addr string, cfg *tls.Config, msg []byte) ([]
 	}
 	defer conn.Close()
 	if _, err := conn.Write(msg); err != nil {
-		return nil, conn.Status(), err
+		return nil, rendr.SessionStatus{}, err
 	}
-	if err := conn.CloseWrite(); err != nil {
-		return nil, conn.Status(), err
+	if err := conn.CloseWrite(); err != nil { // our FIN ends the passive's echo loop
+		return nil, rendr.SessionStatus{}, err
 	}
 	echo, err := io.ReadAll(conn) // until the passive's FIN
 	if err != nil {
-		return echo, conn.Status(), err
+		return echo, rendr.SessionStatus{}, err
 	}
-	end, err := finish(ctx, conn)
-	return echo, end, err
+	st, err := finish(ctx, conn)
+	return echo, st, err
 }
 
-// echoOne confirms one session, echoes it until the dialer's FIN, sends its
-// own FIN and ends the session. It returns the session's final Status.
+// echoOne confirms one session, echoes it until the dialer's FIN and ends
+// it (finish; its Close sends the passive's FIN after the echo). It returns
+// the session's Status from finish (zero if echoOne failed before).
 func echoOne(ctx context.Context, ln *rendr.Listener) (rendr.SessionStatus, error) {
 	pc, err := ln.Accept(ctx)
 	if err != nil {
@@ -223,52 +229,52 @@ func echoOne(ctx context.Context, ln *rendr.Listener) (rendr.SessionStatus, erro
 	}
 	defer c.Close()
 	if _, err := io.Copy(c, c); err != nil {
-		return c.Status(), err
-	}
-	if err := c.CloseWrite(); err != nil {
-		return c.Status(), err
+		return rendr.SessionStatus{}, err
 	}
 	return finish(ctx, c)
 }
 
-// finish closes c and waits, bounded by ctx, until its session has ended,
-// and returns the final Status. Close returns at once; the session goes on
-// in the background: it delivers what was written and, once both FINs are
-// delivered, exchanges DONE with the peer to confirm the end. Only then may
-// the Runtime close: Runtime.Close resets a session that has not ended — it
-// ends with net.ErrClosed and its peer with *rendr.AbortError instead of
-// io.EOF. Status is the session's observable end (Config.OnEvent's
-// EventSessionEnd reports the same error asynchronously); a clean end
-// reports io.EOF.
+// finish closes c and waits, bounded by ctx, until its session has ended.
+// It returns the session's Status (final once the session ended) and an
+// error unless the end was clean (io.EOF).
+//
+// Call it once Read returned io.EOF: the peer's FIN has arrived, so Close
+// discards nothing; it sends this side's FIN unless CloseWrite already
+// did. The session then finishes in the background: it delivers what was
+// written and, once both FINs are delivered, exchanges DONE with the peer.
+// Only after that may the Runtime close: Runtime.Close resets every session
+// that has not ended — also a closed one that is still finishing — which
+// then ends with net.ErrClosed and its peer with *rendr.AbortError instead
+// of io.EOF. (A Close while the peer may still send discards what arrives
+// and can reset the peer: AbortClosed, or AbortLinger after Config.Linger.)
+//
+// A Conn has no end signal, so finish polls Status; Config.OnEvent's
+// EventSessionEnd reports the same end asynchronously.
 func finish(ctx context.Context, c *rendr.Conn) (rendr.SessionStatus, error) {
 	c.Close()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		st := c.Status()
-		if st.State == rendr.StateEnded {
-			if st.Err != io.EOF {
-				return st, fmt.Errorf("session ended with %w", st.Err)
-			}
-			return st, nil
-		}
+	st := c.Status()
+	for st.State != rendr.StateEnded {
 		select {
 		case <-ctx.Done():
 			return st, fmt.Errorf("session still %v: %w", st.State, ctx.Err())
-		case <-tick.C:
+		case <-time.After(10 * time.Millisecond):
+			st = c.Status()
 		}
 	}
+	if st.Err != io.EOF {
+		return st, fmt.Errorf("session ended with %w", st.Err)
+	}
+	return st, nil
 }
 
 func main() {
 	p, err := newPKI()
-	if err == nil {
-		var r result
-		if r, err = run(p, []byte(greeting)); err == nil {
-			fmt.Printf("echoed %q; session ended: dialer %v, passive %v\n", r.echo, r.dialer.Err, r.passive.Err)
-			return
-		}
+	if err != nil {
+		log.Fatal("mtls: ", err)
 	}
-	fmt.Fprintln(os.Stderr, "mtls:", err)
-	os.Exit(1)
+	r, err := run(p, []byte(greeting))
+	if err != nil {
+		log.Fatal("mtls: ", err)
+	}
+	fmt.Printf("echoed %q; the session ended cleanly at both ends\n", r.echo)
 }
