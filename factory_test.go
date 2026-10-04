@@ -74,6 +74,13 @@ func TestFactoryMisbehaviour_L51(t *testing.T) {
 					e.close()
 					return
 				}
+				// Every factory call is stuck in the embedder and already
+				// counted when Close returns: a call is counted when its
+				// attempt gives up (after the dial grace), so Close's join of
+				// the session already sees it (design §0.10 Y8, §0.11 Z2).
+				if n, calls := e.d.Status().Abandoned, link.Stats().Dials; n != int(calls) {
+					t.Fatalf("abandoned %d when Runtime.Close returned, want every one of the %d stuck factory calls", n, calls)
+				}
 				if r := <-res; r.c != nil || !errors.Is(r.err, net.ErrClosed) {
 					t.Fatalf("in-flight Dial at Close: %v, %v", r.c, r.err)
 				}
