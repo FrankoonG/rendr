@@ -21,22 +21,29 @@ import (
 // capacity floor is at most W; one full DATA segment fits a batch and the
 // window.
 //
-// Part 2 (dynamic): a model of the byte-window protocol (sender bounded by
-// its own W and by peerLimit = max over received Delivered + Window;
-// receiver advertising rRead + AdvertiseWindow under memory pressure with
-// a right edge that never retracts; FIFO lanes reordering against each
-// other; lane deaths that lose in-flight frames and replay the requeued
-// spans; JOIN rxNext trims) is driven by random schedules between the
-// normalized parameters of two independently configured Runtimes — every
-// boundary of Window, MaxBufferedBytes and MaxCarriersPerSession and
-// random configurations — in both directions. Every DATA frame must arrive
-// below the receiver's fatal threshold (the largest edge it advertised),
-// peerLimit never exceeds that edge, the send buffer never exceeds W, and
-// once pressure ends every byte is delivered in order. A deterministic
-// replay burst (the v1 failure: fill the window, push the receiver to 100%
-// memory, kill the carrier, replay everything on another) stays inside the
-// threshold; the same scenario against a receiver that retracts its edge
-// (P10 violated) must be caught, proving the check has teeth (L60).
+// Part 2 (dynamic) checks the design rule, not the session code: a test
+// model of the byte-window protocol of design §4.2–§4.6 and §4.12 (sender
+// bounded by its own W and by peerLimit = max over received Delivered +
+// Window; receiver advertising rRead + the plan §3.7 memory-pressure
+// window with a right edge that never retracts, P10; FIFO lanes reordering
+// against each other; lane deaths that lose in-flight frames and replay
+// the requeued spans; JOIN rxNext trims) is driven by random schedules
+// between the normalized parameters of two independently configured
+// Runtimes — every boundary of Window, MaxBufferedBytes and
+// MaxCarriersPerSession and random configurations — in both directions.
+// Every DATA frame must arrive below the receiver's fatal threshold (the
+// largest edge it advertised), peerLimit never exceeds that edge, the send
+// buffer never exceeds W, and once pressure ends every byte is delivered in
+// order. A deterministic replay burst (the v1 failure: fill the window,
+// push the receiver to 100% memory, kill the carrier, replay everything on
+// another) stays inside the threshold; the same scenario against a
+// receiver that retracts its edge (P10 violated) must be caught, proving
+// the check has teeth (L60). With the edge never retracting, the model
+// keeps the property by construction, so part 2 shows that the rule P10
+// suffices for every admitted configuration; that the session code
+// implements the rule is proved in internal/session by
+// TestRightEdgeNeverRetracts_L15 (with TestNoReaderBoundsAck_L15 and
+// TestHeldHeadBoundsHeap_L15).
 func TestWindowInvariantAllConfigs_L15(t *testing.T) {
 	cfgs := windowBoundaryConfigs()
 	r := rand.New(rand.NewPCG(15, 15))
@@ -143,7 +150,8 @@ func checkWindowStatic(t *testing.T, e effective) {
 
 // wmAdvertise is the plan §3.7 memory-pressure rule (design §4.12) as the
 // model's receiver applies it: used ≤ 75% → W; used ≥ max → 0; between →
-// max(64 KiB, W·(1 − used/max)/0.25).
+// max(64 KiB, W·(1 − used/max)/0.25). It is the model's copy of
+// sched.AdvertiseWindow, the production implementation of the same rule.
 func wmAdvertise(w, used, bmax int64) int64 {
 	switch {
 	case used*4 <= bmax*3:

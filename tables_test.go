@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"encoding/binary"
+	"math"
 	"net"
 	"slices"
 	"sync"
@@ -320,6 +321,41 @@ func TestSessionTableTombstoneRingCap_L47(t *testing.T) {
 	}
 }
 
+// TestSessionTableHugeMaxSessions: an unclamped override MaxSessions near
+// math.MaxInt (a test meaning "unlimited") saturates the 2×MaxSessions
+// tombstone cap instead of overflowing it to a negative value, which would
+// evict each new tombstone at once and then dereference the empty FIFO.
+// As a backstop, an index with a non-positive limit only evicts what it
+// holds.
+func TestSessionTableHugeMaxSessions(t *testing.T) {
+	for _, c := range []struct{ maxSessions, limit int }{
+		{math.MaxInt, math.MaxInt},
+		{math.MaxInt/2 + 1, math.MaxInt},
+		{math.MaxInt / 2, math.MaxInt - 1},
+		{1 << 20, 2 << 20},
+	} {
+		tab := newSessionTable[*tblSess](c.maxSessions)
+		if tab.tombs.limit != c.limit {
+			t.Fatalf("MaxSessions %d: tombstone cap %d, want %d", c.maxSessions, tab.tombs.limit, c.limit)
+		}
+		for i := 0; i < 3; i++ {
+			k, s := tblKey(i), &tblSess{id: i}
+			admitPassive(t, tab, k, s, time.Minute, tblNow)
+			if !tab.ended(k, s, session.Verdict{Opened: true}, tblNow) {
+				t.Fatalf("MaxSessions %d: end %d not applied", c.maxSessions, i)
+			}
+		}
+		if n := tab.counts(tblNow).Tombstones; n != 3 || !tab.lookup(tblKey(0), tblNow).tomb {
+			t.Fatalf("MaxSessions %d: %d tombstones kept, want 3 including the oldest", c.maxSessions, n)
+		}
+	}
+	x := &tombIndex[*tblSess]{limit: -1}
+	e := &tableEntry[*tblSess]{key: tblKey(0), tomb: true, expiry: tblNow.Add(time.Hour), heapIdx: -1}
+	if v := x.push(e, tblNow); len(v) != 1 || v[0] != e || x.len() != 0 || x.head != nil || len(x.h) != 0 {
+		t.Fatalf("push into a non-positive limit: victims %d, len %d", len(v), x.len())
+	}
+}
+
 // TestSessionTableCategories checks the disjoint SessionCounts categories
 // (precedence pending > lingering > orphaned > open), the MaxSessions units
 // shared by both roles, and that updates of another session's entry are
@@ -596,36 +632,58 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 // TestHandshakeSlotsConcurrent_L48 admits and releases from 64 goroutines
 // into 8 slots: every conn ends exactly once — released by its handshake
 // or handed out by exactly one eviction — the evictions counter matches,
-// and the table never exceeds its limit.
+// and the table never exceeds its limit. The stimulus does not depend on
+// parallel scheduling: in a fill phase every worker holds its first slot
+// until all 64 have admitted once, so 64 admissions meet 8 slots and
+// exactly 56 evictions happen before any release, at any GOMAXPROCS; the
+// churn that follows mixes admissions, evictions and releases.
 func TestHandshakeSlotsConcurrent_L48(t *testing.T) {
 	const workers, each, slots = 64, 200, 8
 	h := newHSTable(slots)
 	var evictedBy sync.Map
 	var released, evictedSeen, overLimit atomic.Int64
-	var wg sync.WaitGroup
+	admit := func(c *hsConn) *hsSlot {
+		s, ev := h.admit(c)
+		if ev != nil {
+			if _, dup := evictedBy.LoadOrStore(ev, true); dup {
+				t.Error("a conn was evicted twice")
+			}
+			evictedSeen.Add(1)
+		}
+		if h.len() > slots {
+			overLimit.Add(1)
+		}
+		return s
+	}
+	release := func(s *hsSlot) {
+		if h.release(s) {
+			released.Add(1)
+		}
+	}
+	var wg, filled sync.WaitGroup
+	gate := make(chan struct{})
+	filled.Add(workers)
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < each; i++ {
-				c := &hsConn{id: w*each + i}
-				s, ev := h.admit(c)
-				if ev != nil {
-					if _, dup := evictedBy.LoadOrStore(ev, true); dup {
-						t.Error("a conn was evicted twice")
-					}
-					evictedSeen.Add(1)
-				}
-				if h.len() > slots {
-					overLimit.Add(1)
-				}
-				if h.release(s) {
-					released.Add(1)
-				}
+			first := admit(&hsConn{id: w * each})
+			filled.Done()
+			<-gate // hold the first slot until every worker admitted once
+			release(first)
+			for i := 1; i < each; i++ {
+				release(admit(&hsConn{id: w*each + i}))
 			}
 		}()
 	}
+	filled.Wait()
+	held, fillEvictions := h.len(), h.evicted()
+	close(gate)
 	wg.Wait()
+	// Stimulus: the fill phase reached the limit — 8 held, 56 evicted.
+	if held != slots || fillEvictions != workers-slots {
+		t.Fatalf("after the fill phase: %d slots held, %d evictions; want %d and %d", held, fillEvictions, slots, workers-slots)
+	}
 	if overLimit.Load() != 0 {
 		t.Fatalf("the table exceeded %d slots %d times", slots, overLimit.Load())
 	}
@@ -635,8 +693,8 @@ func TestHandshakeSlotsConcurrent_L48(t *testing.T) {
 	if h.evicted() != uint64(evictedSeen.Load()) || h.len() != 0 {
 		t.Fatalf("evictions counter %d, seen %d, len %d", h.evicted(), evictedSeen.Load(), h.len())
 	}
-	if evictedSeen.Load() == 0 {
-		t.Fatal("no eviction happened: the stimulus did not reach the limit")
+	if evictedSeen.Load() < workers-slots {
+		t.Fatalf("%d evictions, want at least %d", evictedSeen.Load(), workers-slots)
 	}
 }
 

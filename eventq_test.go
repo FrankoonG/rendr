@@ -3,7 +3,9 @@ package rendr
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -174,6 +176,73 @@ func TestEventCallbackPanicCounted_L51_L53(t *testing.T) {
 	})
 }
 
+// TestEventCallbackPanicNilCounted_L51_L53 runs a callback's panic(nil)
+// under GODEBUG=panicnil=1, which an embedder may set through a godebug
+// block in its go.mod, a //go:debug directive or the environment: recover()
+// then returns nil, exactly as it does for a runtime.Goexit. The queue must
+// still classify the fault as a recovered panic — this worker continues, no
+// replacement starts — so every event is delivered exactly once and in
+// order, never two callbacks run at once, every fault is counted, and the
+// worker exits exactly once (a second worker would also close done, and
+// that double close would crash the embedding process).
+func TestEventCallbackPanicNilCounted_L51_L53(t *testing.T) {
+	godebug := "panicnil=1"
+	if old := os.Getenv("GODEBUG"); old != "" {
+		godebug = old + "," + godebug // the last setting wins
+	}
+	t.Setenv("GODEBUG", godebug) // the runtime re-reads GODEBUG on Setenv
+	// Stimulus: the setting is in effect, recover() yields nil for panic(nil).
+	if r := recoveredPanicNil(); r != nil {
+		t.Fatalf("GODEBUG=panicnil=1 is not in effect: recover() returned %T", r)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		var running, overlap atomic.Int32
+		var delivered []uint64 // worker-only until join (a second worker would race on it)
+		q := newEventQueue(func(ev Event) {
+			if running.Add(1) != 1 {
+				overlap.Add(1)
+			}
+			defer running.Add(-1)
+			delivered = append(delivered, ev.Seq)
+			if ev.Carrier%2 == 1 {
+				panic(nil)
+			}
+			// A second worker, if one existed, would take the next event
+			// while this callback sleeps: the overlap check would see it.
+			time.Sleep(time.Millisecond)
+		}, 64, nil)
+		for i := 1; i <= 40; i++ {
+			q.Emit(evqEvent(i))
+		}
+		q.close()
+		if !q.join(time.Second, nil) {
+			t.Fatal("worker did not exit")
+		}
+		synctest.Wait() // a stray second worker would still be running here
+		if overlap.Load() != 0 {
+			t.Fatalf("%d callbacks overlapped: a panic(nil) started a second worker", overlap.Load())
+		}
+		if len(delivered) != 40 {
+			t.Fatalf("delivered %d events, want 40", len(delivered))
+		}
+		for i, s := range delivered {
+			if s != uint64(i+1) {
+				t.Fatalf("delivery %d has Seq %d: order or exactly-once broken", i, s)
+			}
+		}
+		if d, p := q.counters(); d != 0 || p != 20 {
+			t.Fatalf("dropped %d faults %d, want 0 and 20 (one per panic(nil))", d, p)
+		}
+	})
+}
+
+// recoveredPanicNil returns what recover() yields for panic(nil): a
+// *runtime.PanicNilError by default, nil under GODEBUG=panicnil=1.
+func recoveredPanicNil() (r any) {
+	defer func() { r = recover() }()
+	panic(nil)
+}
+
 // TestEventQueueJoinFromCallback: a callback may call Runtime.Close, which
 // closes the queue and joins the worker. From inside the callback the join
 // must return at once (it cannot wait for itself), adopt nothing, and the
@@ -253,13 +322,82 @@ func TestEventQueueStuckCallbackAbandoned_L52(t *testing.T) {
 	})
 }
 
-// TestEventQueueClosedAndNil: events after close are dropped and counted
-// (their Seq still advances), and a nil queue — the Runtime without
-// OnEvent — discards everything with no goroutine.
+// evqOrderPool is an abandoned-call pool whose Adopt and Leave run test
+// code (the adoption-window test below).
+type evqOrderPool struct{ adopt, leave func() }
+
+func (p *evqOrderPool) Adopt() { p.adopt() }
+func (p *evqOrderPool) Leave() { p.leave() }
+
+// TestEventQueueWorkerExitsDuringAdopt_L52 drives the window between join's
+// claim of a stuck worker and the end of its Adopt, which runs with no lock
+// held (evMu is a leaf): Adopt itself releases the stuck callback and lets
+// the worker drain and exit before Adopt returns. The worker must not
+// leave the pool for an adoption that has not completed; join leaves for
+// it instead, so the pool sees exactly one Adopt followed by one Leave and
+// join reports that the worker is gone.
+func TestEventQueueWorkerExitsDuringAdopt_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var delivered int
+		q := newEventQueue(func(ev Event) {
+			if ev.Seq == 1 {
+				close(entered)
+				<-release
+			}
+			delivered++
+		}, 8, nil)
+		var adopted, left int
+		exitedInWindow := false
+		pool := &evqOrderPool{
+			adopt: func() {
+				close(release)
+				<-q.done        // the worker drains and exits inside the window ...
+				synctest.Wait() // ... and finishes; a premature Leave would have run by now
+				exitedInWindow = true
+				adopted++ // the count lands last, like an Adopt that has not returned
+			},
+			leave: func() {
+				if left >= adopted {
+					t.Error("Leave ran before the matching Adopt returned")
+				}
+				left++
+			},
+		}
+		q.Emit(evqEvent(1))
+		<-entered // stimulus: the worker is stuck in its callback
+		q.Emit(evqEvent(2))
+		start := time.Now()
+		if !q.join(time.Second, pool) {
+			t.Fatal("join must report the worker that exited during Adopt")
+		}
+		if waited := time.Since(start); waited != time.Second {
+			t.Fatalf("join waited %v, want the 1s bound before adopting", waited)
+		}
+		synctest.Wait()
+		if !exitedInWindow || adopted != 1 || left != 1 {
+			t.Fatalf("exit in the window %v, adopted %d, left %d: want true, 1, 1", exitedInWindow, adopted, left)
+		}
+		if delivered != 2 {
+			t.Fatalf("delivered %d events, want 2", delivered)
+		}
+		if !q.join(0, pool) || adopted != 1 || left != 1 {
+			t.Fatal("a join after the exit touched the pool")
+		}
+	})
+}
+
+// TestEventQueueClosedAndNil: events after close — before and after the
+// worker exited — are discarded: not delivered, not counted in
+// EventsDropped (which means a full ring), given no Seq and no
+// EventEnqueued; and a nil queue — the Runtime without OnEvent — discards
+// everything with no goroutine.
 func TestEventQueueClosedAndNil(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var got []Event
-		q := newEventQueue(func(ev Event) { got = append(got, ev) }, 4, nil)
+		var hooked []uint64 // appended under evMu by this goroutine's Emits
+		hooks := &testhooks.Hooks{EventEnqueued: func(seq uint64) { hooked = append(hooked, seq) }}
+		q := newEventQueue(func(ev Event) { got = append(got, ev) }, 4, hooks)
 		q.Emit(evqEvent(1))
 		synctest.Wait()
 		q.close()
@@ -269,12 +407,12 @@ func TestEventQueueClosedAndNil(t *testing.T) {
 			t.Fatal("join")
 		}
 		q.Emit(evqEvent(3))
-		if d, _ := q.counters(); d != 2 || len(got) != 1 {
-			t.Fatalf("dropped %d delivered %d, want 2 and 1", d, len(got))
+		if d, _ := q.counters(); d != 0 || len(got) != 1 {
+			t.Fatalf("dropped %d delivered %d, want 0 and 1", d, len(got))
 		}
 		evqCheck(t, got[0], 1, 1)
-		if q.seq != 3 {
-			t.Fatalf("Seq %d after three events, want 3", q.seq)
+		if q.seq != 1 || !slices.Equal(hooked, []uint64{1}) {
+			t.Fatalf("Seq %d and EventEnqueued %v after two post-close events, want 1 and [1]", q.seq, hooked)
 		}
 	})
 	// join without a prior close still drains and joins.

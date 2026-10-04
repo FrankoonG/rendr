@@ -47,8 +47,10 @@ type Config struct {
 	// (Status.EventsDropped; the Seq gap shows the drop); a panic is
 	// recovered and counted (Status.CallbackPanics), and so is a
 	// runtime.Goexit, after which a new worker continues with the next
-	// event. It is never called with a rendr lock held and may call any
-	// rendr method, including Close.
+	// event. Runtime.Close stops the queue: events already queued are still
+	// delivered, later ones are discarded without being counted. OnEvent is
+	// never called with a rendr lock held and may call any rendr method,
+	// including Close.
 	OnEvent func(Event)
 }
 

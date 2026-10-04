@@ -93,7 +93,8 @@ type effective struct {
 	// zero (RetireGrace, Selector.Floor, Probe.DialWait,
 	// Handshake.MaxMetadata), IdleTimeout 0 means off; every other field is
 	// non-zero and inside its range unless an override set it. OnEvent is
-	// passed through.
+	// passed through. It is an output, never an input: normalizing it again
+	// would turn those selected zeros back into defaults.
 	cfg Config
 
 	timing  carrier.Timing       // carrier.Env.Timing
@@ -172,7 +173,12 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 	// adjusted value stays inside the field's own range (DeadMin ≥ 500 ms
 	// gives DeadMin/4 ≥ 125 ms ≥ min PingBusy; NoPathGrace ≥ 3 s gives
 	// NoPathGrace/2 ≥ 1.5 s ≥ min RejoinBackoffMax; 2×Interval ≤ 60 s ≤ max
-	// Fresh), so step 1 never has to run again: normalize is idempotent.
+	// Fresh), so step 1 never has to run again. The normalized Config is a
+	// fixed point when fed back as an input with each selected zero of the
+	// four zero-able fields written as a negative value: nothing changes or
+	// is recorded (TestConfigNormalizeIdempotent). Fed back unchanged, such
+	// a zero would select the default again, so an effective cfg is never
+	// re-normalized.
 	if c.DeadMax < c.DeadMin {
 		a.record("DeadMax", fmtDur(c.DeadMax), fmtDur(c.DeadMin), "constraint 1: DeadMax ≥ DeadMin")
 		c.DeadMax = c.DeadMin

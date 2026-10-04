@@ -3,6 +3,7 @@ package rendr
 import (
 	"container/heap"
 	"hash/maphash"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -129,13 +130,19 @@ type sessionTable[S comparable] struct {
 }
 
 // newSessionTable returns an empty table for maxSessions (≥ 1) sessions; it
-// remembers at most 2×maxSessions tombstones (plan §3.7).
+// remembers at most 2×maxSessions tombstones (plan §3.7). The tombstone cap
+// saturates at math.MaxInt instead of overflowing: an unclamped test
+// override may pass a huge MaxSessions to mean "unlimited".
 func newSessionTable[S comparable](maxSessions int) *sessionTable[S] {
-	t := &sessionTable[S]{seed: maphash.MakeSeed(), maxUnits: int64(max(maxSessions, 1))}
+	n := max(maxSessions, 1)
+	t := &sessionTable[S]{seed: maphash.MakeSeed(), maxUnits: int64(n)}
 	for i := range t.shards {
 		t.shards[i].m = make(map[tableKey]*tableEntry[S])
 	}
-	t.tombs.limit = 2 * int(t.maxUnits)
+	t.tombs.limit = math.MaxInt
+	if n <= math.MaxInt/2 {
+		t.tombs.limit = 2 * n
+	}
 	return t
 }
 
@@ -396,7 +403,7 @@ func (x *tombIndex[S]) push(e *tableEntry[S], now time.Time) []*tableEntry[S] {
 	x.tail = e
 	x.n++
 	heap.Push(&x.h, e)
-	for x.n > x.limit {
+	for x.n > x.limit && x.head != nil {
 		v := x.head
 		x.removeLocked(v)
 		victims = append(victims, v)

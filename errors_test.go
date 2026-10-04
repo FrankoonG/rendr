@@ -73,10 +73,11 @@ func TestErrorsMatch(t *testing.T) {
 var errLastCarrier = errors.New("io: read/write on closed pipe")
 
 // TestAbortAndRejectErrors checks the coded errors: *AbortError matches
-// ErrAborted (and nothing else) and yields Code/Msg/Remote through
-// errors.As, also when wrapped; *RejectError likewise with ErrRejected;
-// both are net.Errors that are not timeouts; the reserved abort codes equal
-// the wire RST codes.
+// ErrAborted (and nothing else), yields Code/Msg/Remote through errors.As,
+// also when wrapped, and is a net.Error that is not a timeout; *RejectError
+// matches ErrRejected (and nothing else) and yields Code/Msg through
+// errors.As, also when wrapped, while the sentinel ErrRejected itself is no
+// *RejectError; the reserved abort codes equal the wire RST codes.
 func TestAbortAndRejectErrors(t *testing.T) {
 	ab := &AbortError{Code: AbortLinger, Msg: "linger expired", Remote: true}
 	var err error = fmt.Errorf("read: %w", ab)

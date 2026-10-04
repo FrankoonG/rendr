@@ -12,13 +12,17 @@ type Status struct {
 	Sessionless        int      // probe carriers held by this (passive) Runtime
 	BufferedBytes      int64    // MaxBufferedBytes accounting (buffer capacity)
 	Abandoned          int      // goroutines still stuck in embedder calls past their bound (L52)
-	EventsDropped      uint64   // events dropped because the queue was full (or emitted after Close)
+	EventsDropped      uint64   // events dropped because the queue was full
 	CallbackPanics     uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
 	ConfigAdjustments  []string // "Field: old → new (reason)"; Config first, then "Listen[i].Field: ..."
 }
 
-// SessionCounts counts sessions of both roles. Pending, Lingering and
-// Orphaned are disjoint from Open.
+// SessionCounts counts sessions of both roles. Open, Pending, Lingering and
+// Orphaned are mutually disjoint: a session counts in the first of
+// Pending, Lingering, Orphaned that applies, else in Open, so their sum is
+// the number of live sessions. A dialer session that is still dialling
+// holds a MaxSessions unit but counts in no category until its Dial
+// succeeds.
 type SessionCounts struct {
 	Open       int // open sessions not in another category
 	Pending    int // passive sessions waiting for Confirm/Reject
