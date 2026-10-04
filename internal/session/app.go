@@ -9,9 +9,12 @@ import (
 
 // Read implements the application read side (L01, L02, L07). It returns
 // io.EOF only when the peer's FIN is at the contiguous delivery point; a
-// carrier error never surfaces. Precedence when nothing is readable: local
-// Close → net.ErrClosed; EOF condition → io.EOF; session end → its error;
-// read deadline → os.ErrDeadlineExceeded. The copy into p happens outside
+// carrier error never surfaces. Precedence: local Close → net.ErrClosed;
+// EOF condition → io.EOF; session end → its error; read deadline passed →
+// os.ErrDeadlineExceeded, also while bytes are buffered (net.Conn: a call
+// after the deadline fails instead of reading; the bytes stay readable once
+// the deadline is moved); then the buffered bytes. The EOF condition and the
+// end only arise when nothing is readable. The copy into p happens outside
 // the session lock; the commit afterwards decides "Read won" (data
 // returned) or "Close won" ((0, net.ErrClosed), data discarded).
 func (s *Session) Read(p []byte) (int, error) {
@@ -32,13 +35,13 @@ func (s *Session) Read(p []byte) (int, error) {
 		switch {
 		case st.closed:
 			err = errClosed
-		case st.rRead < st.rTail:
 		case st.peerFinSet && st.rRead == st.peerFin:
 			err = io.EOF // the only EOF source (L02)
 		case st.ended:
 			err = st.endErr // never EOF for a carrier error (L01)
 		case deadlinePassed(&st.rdl):
-			err = errDeadline
+			err = errDeadline // before buffered bytes, as net.Conn (L06)
+		case st.rRead < st.rTail:
 		default:
 			st.rwaiting = true
 			s.mu.Unlock()
@@ -154,8 +157,8 @@ func (s *Session) write(p []byte, poll **time.Timer) (int, error) {
 		}
 		s.mu.Unlock()
 
-		if writeCopyHook != nil {
-			writeCopyHook()
+		if h := writeCopyHook.Load(); h != nil && h.s == s {
+			h.fn()
 		}
 		// [end, end+k) is reserved: no carrier writer reads it before the
 		// commit, and the chunks stay referenced until then (§4.2).

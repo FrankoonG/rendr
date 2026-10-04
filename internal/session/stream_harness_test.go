@@ -17,10 +17,12 @@ import (
 // initStreamLocked, lanes on fake ports, and the actor's few steps done by
 // hand under s.mu. Fill, Data, Control and WriteBlocked are driven
 // directly with real carrier Batches, Bufs and wire codecs; no carrier
-// goroutine and no actor run.
+// goroutine and no actor run. Every package-level helper of the stream
+// tests starts with "st" (the actor's tests use their own prefix, as the
+// mailbox tests use "mb"), so the two test sets never collide.
 
-// fakePort is a lane's carrier as the stream sees it.
-type fakePort struct {
+// stPort is a lane's carrier as the stream sees it.
+type stPort struct {
 	id   uint32
 	wake chan struct{} // cap 1: Wake's token, consumed by a writer emulation
 
@@ -35,13 +37,13 @@ type fakePort struct {
 	kills     int
 }
 
-func newFakePort(id uint32) *fakePort {
-	return &fakePort{id: id, wake: make(chan struct{}, 1), capacity: 1 << 40}
+func stNewPort(id uint32) *stPort {
+	return &stPort{id: id, wake: make(chan struct{}, 1), capacity: 1 << 40}
 }
 
-func (f *fakePort) ID() uint32 { return f.id }
+func (f *stPort) ID() uint32 { return f.id }
 
-func (f *fakePort) Wake() {
+func (f *stPort) Wake() {
 	f.mu.Lock()
 	f.wakes++
 	f.calls++
@@ -52,68 +54,68 @@ func (f *fakePort) Wake() {
 	}
 }
 
-func (f *fakePort) RequestPing() {}
+func (f *stPort) RequestPing() {}
 
-func (f *fakePort) Inflight() int64 {
+func (f *stPort) Inflight() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	return f.inflight
 }
 
-func (f *fakePort) Capacity() int64 {
+func (f *stPort) Capacity() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	return f.capacity
 }
 
-func (f *fakePort) SRTT() time.Duration {
+func (f *stPort) SRTT() time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.srtt
 }
 
-func (f *fakePort) WriteBlocked() bool {
+func (f *stPort) WriteBlocked() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	return f.blocked
 }
 
-func (f *fakePort) CloseSent() bool {
+func (f *stPort) CloseSent() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.closeSent
 }
 
-func (f *fakePort) Kill(carrier.Cause, string) bool {
+func (f *stPort) Kill(carrier.Cause, string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.kills++
 	return f.kills == 1
 }
 
-func (f *fakePort) set(fn func(f *fakePort)) {
+func (f *stPort) set(fn func(f *stPort)) {
 	f.mu.Lock()
 	fn(f)
 	f.mu.Unlock()
 }
 
-func (f *fakePort) wakeCount() int {
+func (f *stPort) wakeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.wakes
 }
 
-func (f *fakePort) callCount() int {
+func (f *stPort) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
 }
 
-// sopt configures a test session; zero fields take the defaults below.
-type sopt struct {
+// stOpt configures a test session; zero fields take the defaults below.
+type stOpt struct {
 	role     Role
 	mode     Mode
 	window   int64
@@ -127,10 +129,10 @@ type sopt struct {
 	ackDelay time.Duration
 }
 
-// newTestSession returns an open session whose stream was initialized as
+// stSession returns an open session whose stream was initialized as
 // Dial or NewPending would (initStreamLocked) and whose initial window was
 // advertised (openWindowLocked).
-func newTestSession(o sopt) *Session {
+func stSession(o stOpt) *Session {
 	if o.role == 0 {
 		o.role = RoleDialer
 	}
@@ -174,11 +176,11 @@ func newTestSession(o sopt) *Session {
 	return s
 }
 
-// addLane adds a lane as the actor does on an attach: confirmed (the
+// stAddLane adds a lane as the actor does on an attach: confirmed (the
 // passive's first response already placed), data-eligible if data (the
 // selector's active lane), registered with laneAddedLocked.
-func addLane(s *Session, id uint32, data bool) (*lane, *fakePort) {
-	fp := newFakePort(id)
+func stAddLane(s *Session, id uint32, data bool) (*lane, *stPort) {
+	fp := stNewPort(id)
 	l := &lane{s: s, port: fp, id: id, factory: -1, since: time.Now()}
 	s.mu.Lock()
 	l.state = LaneMember
@@ -197,8 +199,8 @@ func addLane(s *Session, id uint32, data bool) (*lane, *fakePort) {
 	return l, fp
 }
 
-// killLane is the actor's death step for l (§7.3, C1).
-func killLane(s *Session, l *lane) uint64 {
+// stKillLane is the actor's death step for l (§7.3, C1).
+func stKillLane(s *Session, l *lane) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l.state = LaneDead
@@ -209,9 +211,9 @@ func killLane(s *Session, l *lane) uint64 {
 	return s.laneGoneLocked(l)
 }
 
-// route makes l the selector's active data lane (or a bond member) as an
+// stRoute makes l the selector's active data lane (or a bond member) as an
 // actor routing change does.
-func route(s *Session, l *lane, data bool) {
+func stRoute(s *Session, l *lane, data bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l.data = data
@@ -226,22 +228,30 @@ func route(s *Session, l *lane, data bool) {
 	s.routingChangedLocked()
 }
 
-// endSession ends the stream as the actor's end procedure does.
-func endSession(s *Session, err error) {
+// stEnd ends the stream as the actor's end procedure does.
+func stEnd(s *Session, err error) {
 	s.mu.Lock()
 	s.endLocked(err)
 	s.mu.Unlock()
 }
 
-// locked runs fn under s.mu.
-func locked[T any](s *Session, fn func(st *stream) T) T {
+// stSetCopyHook makes fn run in s's Write after each round's reservation and
+// before its copy (writeCopyHook) until the test ends. Tests that set it do
+// not run in parallel with each other.
+func stSetCopyHook(t testing.TB, s *Session, fn func()) {
+	writeCopyHook.Store(&copyHook{s: s, fn: fn})
+	t.Cleanup(func() { writeCopyHook.Store(nil) })
+}
+
+// stLocked runs fn under s.mu.
+func stLocked[T any](s *Session, fn func(st *stream) T) T {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return fn(&s.st)
 }
 
-// frame is one recorded frame of a batch.
-type frame struct {
+// stFrame is one recorded frame of a batch.
+type stFrame struct {
 	typ   wire.Type
 	flags uint8
 	off   uint64 // DATA, FIN: the stream offset
@@ -251,7 +261,7 @@ type frame struct {
 	at    time.Time
 }
 
-func (f frame) String() string {
+func (f stFrame) String() string {
 	switch f.typ {
 	case wire.TypeData:
 		return fmt.Sprintf("DATA[%d,+%d retx=%v]", f.off, f.n, f.retx)
@@ -263,12 +273,12 @@ func (f frame) String() string {
 	return f.typ.String()
 }
 
-// frames returns the frames of b.
-func frames(b *carrier.Batch) []frame {
-	out := make([]frame, 0, b.Len())
+// stFrames returns the frames of b.
+func stFrames(b *carrier.Batch) []stFrame {
+	out := make([]stFrame, 0, b.Len())
 	for i := range b.Len() {
 		bf := b.Frame(i)
-		f := frame{typ: bf.Header.Type, flags: bf.Header.Flags, at: b.Now()}
+		f := stFrame{typ: bf.Header.Type, flags: bf.Header.Flags, at: b.Now()}
 		switch f.typ {
 		case wire.TypeData:
 			f.off, f.n, f.retx = bf.Off, len(bf.Body), bf.Retx
@@ -282,27 +292,29 @@ func frames(b *carrier.Batch) []frame {
 	return out
 }
 
-// fill runs one Fill of l into a fresh batch at now and returns its frames
-// (chunk references released, as a writer does after its write).
-func fill(l *lane, now time.Time) ([]frame, *carrier.Batch) {
+// stFill runs one Fill of l into a fresh batch at now and returns its frames
+// and the batch, which still holds its chunk references: the caller
+// releases them (b.ReleaseRefs, as a writer does after its write) or
+// delivers the batch first.
+func stFill(l *lane, now time.Time) ([]stFrame, *carrier.Batch) {
 	b := carrier.NewBatch(0)
 	b.Reset(now)
 	l.Fill(nil, b)
-	fs := frames(b)
+	fs := stFrames(b)
 	return fs, b
 }
 
-// deliver hands every frame of b to the endpoint to, as its carrier's
+// stDeliver hands every frame of b to the endpoint to, as its carrier's
 // reader would: DATA of at least 16 KiB in a reader-owned Buf of the
 // receiving Runtime (reference moved), smaller DATA by a borrowed slice,
 // session control frames to Control. It returns the first violation (the
 // receiving carrier would be killed) and stops there.
-func deliver(b *carrier.Batch, to *lane) error {
+func stDeliver(b *carrier.Batch, to *lane) error {
 	for i := range b.Len() {
 		f := b.Frame(i)
 		var err error
 		if f.Header.Type == wire.TypeData {
-			err = deliverData(to, f.Off, f.Body)
+			err = stDeliverData(to, f.Off, f.Body)
 		} else {
 			err = to.Control(nil, f.Header, f.Payload)
 		}
@@ -313,7 +325,7 @@ func deliver(b *carrier.Batch, to *lane) error {
 	return nil
 }
 
-func deliverData(to *lane, off uint64, body []byte) error {
+func stDeliverData(to *lane, off uint64, body []byte) error {
 	if len(body) < carrier.BigData {
 		return to.Data(nil, off, body, nil)
 	}
@@ -323,11 +335,11 @@ func deliverData(to *lane, off uint64, body []byte) error {
 	return to.Data(nil, off, buf.B[:n], buf)
 }
 
-// deliverRange delivers data at off in 64 KiB frames.
-func deliverRange(to *lane, off uint64, data []byte) error {
+// stDeliverRange delivers data at off in 64 KiB frames.
+func stDeliverRange(to *lane, off uint64, data []byte) error {
 	for len(data) > 0 {
 		n := min(len(data), 64<<10)
-		if err := deliverData(to, off, data[:n]); err != nil {
+		if err := stDeliverData(to, off, data[:n]); err != nil {
 			return err
 		}
 		off, data = off+uint64(n), data[n:]
@@ -335,27 +347,27 @@ func deliverRange(to *lane, off uint64, data []byte) error {
 	return nil
 }
 
-func ctlHeader(t wire.Type, flags uint8, n int) wire.Header {
+func stCtlHeader(t wire.Type, flags uint8, n int) wire.Header {
 	return wire.Header{Type: t, Flags: flags, Len: uint32(n), Handle: wire.SessionHandle}
 }
 
-// sendAck delivers ACK{delivered, window} (flags) to l.
-func sendAck(l *lane, flags uint8, delivered uint64, window uint32) error {
+// stSendAck delivers ACK{delivered, window} (flags) to l.
+func stSendAck(l *lane, flags uint8, delivered uint64, window uint32) error {
 	var p [wire.AckLen]byte
 	wire.PutAck(p[:], &wire.Ack{Delivered: delivered, Window: window})
-	return l.Control(nil, ctlHeader(wire.TypeAck, flags, wire.AckLen), p[:])
+	return l.Control(nil, stCtlHeader(wire.TypeAck, flags, wire.AckLen), p[:])
 }
 
-// sendFin delivers FIN(off) to l.
-func sendFin(l *lane, off uint64) error {
+// stSendFin delivers FIN(off) to l.
+func stSendFin(l *lane, off uint64) error {
 	var p [wire.FinLen]byte
 	wire.PutFin(p[:], off)
-	return l.Control(nil, ctlHeader(wire.TypeFin, 0, wire.FinLen), p[:])
+	return l.Control(nil, stCtlHeader(wire.TypeFin, 0, wire.FinLen), p[:])
 }
 
-// pattern returns n bytes whose value at stream offset off+i depends on
+// stPattern returns n bytes whose value at stream offset off+i depends on
 // both (consistent across overlapping frames, distinct across offsets).
-func pattern(off uint64, n int) []byte {
+func stPattern(off uint64, n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
 		x := off + uint64(i)
@@ -364,18 +376,18 @@ func pattern(off uint64, n int) []byte {
 	return b
 }
 
-// readN reads exactly n bytes from s (test goroutine only).
-func readN(t testing.TB, s *Session, n int) []byte {
+// stReadN reads exactly n bytes from s (test goroutine only).
+func stReadN(t testing.TB, s *Session, n int) []byte {
 	t.Helper()
-	out, err := readFull(s, n)
+	out, err := stReadFull(s, n)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return out
 }
 
-// readFull reads exactly n bytes from s; any goroutine may call it.
-func readFull(s *Session, n int) ([]byte, error) {
+// stReadFull reads exactly n bytes from s; any goroutine may call it.
+func stReadFull(s *Session, n int) ([]byte, error) {
 	out := make([]byte, 0, n)
 	buf := make([]byte, 64<<10)
 	for len(out) < n {
@@ -388,50 +400,50 @@ func readFull(s *Session, n int) ([]byte, error) {
 	return out, nil
 }
 
-type readResult struct {
+type stReadResult struct {
 	b   []byte
 	err error
 }
 
-// readAsync reads exactly n bytes from s on a new goroutine.
-func readAsync(s *Session, n int) <-chan readResult {
-	ch := make(chan readResult, 1)
+// stReadAsync reads exactly n bytes from s on a new goroutine.
+func stReadAsync(s *Session, n int) <-chan stReadResult {
+	ch := make(chan stReadResult, 1)
 	go func() {
-		b, err := readFull(s, n)
-		ch <- readResult{b, err}
+		b, err := stReadFull(s, n)
+		ch <- stReadResult{b, err}
 	}()
 	return ch
 }
 
-// pair is two sessions joined by links: link i connects a's lane i and b's
+// stPair is two sessions joined by links: link i connects a's lane i and b's
 // lane i. a is the dialer, b the passive. trace records every frame moved,
 // per direction.
-type pair struct {
+type stPair struct {
 	a, b    *Session
 	al, bl  []*lane
-	ap, bp  []*fakePort
+	ap, bp  []*stPort
 	cut     []bool // link carriers killed after a violation
 	stall   []bool // a's writer on the link is stuck in a write: a → b moves nothing
 	errs    []error
-	traceAB []frame
-	traceBA []frame
+	traceAB []stFrame
+	traceBA []stFrame
 	mu      sync.Mutex // guards trace and errs in the asynchronous mode
 	batch   *carrier.Batch
 }
 
-// newPair builds the two sessions with links lanes each; the selector's
+// stNewPair builds the two sessions with links lanes each; the selector's
 // active (or every bond member) is data-eligible from the start, and both
 // initial windows are exchanged as OPEN and OPEN_ACK would.
-func newPair(ao, bo sopt, links int) *pair {
+func stNewPair(ao, bo stOpt, links int) *stPair {
 	ao.role, bo.role = RoleDialer, RolePassive
 	if bo.mode == 0 {
 		bo.mode = ao.mode
 	}
-	p := &pair{a: newTestSession(ao), b: newTestSession(bo), batch: carrier.NewBatch(0)}
+	p := &stPair{a: stSession(ao), b: stSession(bo), batch: carrier.NewBatch(0)}
 	for i := range links {
 		data := i == 0 || ao.mode == ModeBond
-		la, fa := addLane(p.a, uint32(i+1), data)
-		lb, fb := addLane(p.b, uint32(i+1), data)
+		la, fa := stAddLane(p.a, uint32(i+1), data)
+		lb, fb := stAddLane(p.b, uint32(i+1), data)
 		p.al, p.ap = append(p.al, la), append(p.ap, fa)
 		p.bl, p.bp = append(p.bl, lb), append(p.bp, fb)
 		p.cut = append(p.cut, false)
@@ -452,7 +464,7 @@ func newPair(ao, bo sopt, links int) *pair {
 
 // step runs one Fill on link i in one direction at now and delivers the
 // frames; it returns the frames moved and the batch's WakeAt time.
-func (p *pair) step(i int, aToB bool, now time.Time) (int, time.Time) {
+func (p *stPair) step(i int, aToB bool, now time.Time) (int, time.Time) {
 	if p.cut[i] || (aToB && p.stall[i]) {
 		return 0, time.Time{}
 	}
@@ -465,13 +477,13 @@ func (p *pair) step(i int, aToB bool, now time.Time) (int, time.Time) {
 	from.Fill(nil, b)
 	n, wake := b.Len(), b.WakeTime()
 	if n > 0 {
-		fs := frames(b)
+		fs := stFrames(b)
 		if aToB {
 			p.traceAB = append(p.traceAB, fs...)
 		} else {
 			p.traceBA = append(p.traceBA, fs...)
 		}
-		if err := deliver(b, to); err != nil {
+		if err := stDeliver(b, to); err != nil {
 			p.cut[i] = true
 			p.errs = append(p.errs, err)
 		}
@@ -484,7 +496,7 @@ func (p *pair) step(i int, aToB bool, now time.Time) (int, time.Time) {
 // anything. With settle, a quiescent round whose Fills asked to be called
 // again (the ACK delay, b.WakeAt) is repeated at that time, as the writer
 // timer would; time itself does not move.
-func (p *pair) pump(settle bool) int {
+func (p *stPair) pump(settle bool) int {
 	total := 0
 	now := time.Now()
 	for {
@@ -510,8 +522,8 @@ func (p *pair) pump(settle bool) int {
 	}
 }
 
-// count returns the frames of type t in tr.
-func count(tr []frame, t wire.Type) int {
+// stCount returns the frames of type t in tr.
+func stCount(tr []stFrame, t wire.Type) int {
 	n := 0
 	for _, f := range tr {
 		if f.typ == t {
@@ -521,11 +533,11 @@ func count(tr []frame, t wire.Type) int {
 	return n
 }
 
-// runWriter emulates lane from's carrier writer inside a synctest bubble
+// stRunWriter emulates lane from's carrier writer inside a synctest bubble
 // (§4.8): Fill on every wake or WakeAt time, self-continuing while Fill
 // appends; each batch goes to sink. It exits when stop closes or sink
 // fails (a violation kills the receiving carrier).
-func runWriter(wg *sync.WaitGroup, from *lane, fp *fakePort, stop <-chan struct{}, sink func(b *carrier.Batch) error) {
+func stRunWriter(wg *sync.WaitGroup, from *lane, fp *stPort, stop <-chan struct{}, sink func(b *carrier.Batch) error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -564,22 +576,84 @@ func runWriter(wg *sync.WaitGroup, from *lane, fp *fakePort, stop <-chan struct{
 
 // runPair starts writer emulations for every link of p in both directions
 // (asynchronous mode); stop ends them.
-func (p *pair) runPair(wg *sync.WaitGroup, stop <-chan struct{}) {
+func (p *stPair) runPair(wg *sync.WaitGroup, stop <-chan struct{}) {
 	for i := range p.al {
 		i := i
-		runWriter(wg, p.al[i], p.ap[i], stop, func(b *carrier.Batch) error {
+		stRunWriter(wg, p.al[i], p.ap[i], stop, func(b *carrier.Batch) error {
 			p.record(true, b)
-			return p.sinkErr(deliver(b, p.bl[i]))
+			return p.sinkErr(stDeliver(b, p.bl[i]))
 		})
-		runWriter(wg, p.bl[i], p.bp[i], stop, func(b *carrier.Batch) error {
+		stRunWriter(wg, p.bl[i], p.bp[i], stop, func(b *carrier.Batch) error {
 			p.record(false, b)
-			return p.sinkErr(deliver(b, p.al[i]))
+			return p.sinkErr(stDeliver(b, p.al[i]))
 		})
 	}
 }
 
-func (p *pair) record(aToB bool, b *carrier.Batch) {
-	fs := frames(b)
+// runLinks is runPair over links with a virtual latency lat: each batch is
+// copied off the writer's batch (as bytes on a wire) and delivered by the
+// link's own goroutine lat later, so virtual time — and with it the peer's
+// answer — advances only once every writer emulation went idle. A producer
+// that forgets to wake an idle writer therefore deadlocks the bubble
+// deterministically (R1). A batch for which drop(i, aToB, b) returns true
+// falls into a black hole on link i (it is recorded in neither trace).
+func (p *stPair) runLinks(wg *sync.WaitGroup, stop <-chan struct{}, lat time.Duration, drop func(i int, aToB bool, b *carrier.Batch) bool) {
+	type wframe struct {
+		h    wire.Header
+		off  uint64
+		body []byte
+	}
+	link := func(i int, from, to *lane, fp *stPort, aToB bool) {
+		q := make(chan []wframe, 1024)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case fs := <-q:
+					time.Sleep(lat)
+					for _, f := range fs {
+						var err error
+						if f.h.Type == wire.TypeData {
+							err = stDeliverData(to, f.off, f.body)
+						} else {
+							err = to.Control(nil, f.h, f.body)
+						}
+						if p.sinkErr(err) != nil {
+							break // the receiving carrier is killed: the rest is lost
+						}
+					}
+				case <-stop:
+					return
+				}
+			}
+		}()
+		stRunWriter(wg, from, fp, stop, func(b *carrier.Batch) error {
+			if drop != nil && drop(i, aToB, b) {
+				return nil
+			}
+			p.record(aToB, b)
+			fs := make([]wframe, b.Len())
+			for i := range fs {
+				f := b.Frame(i)
+				body := f.Payload
+				if f.Header.Type == wire.TypeData {
+					body = f.Body
+				}
+				fs[i] = wframe{f.Header, f.Off, bytes.Clone(body)}
+			}
+			q <- fs
+			return nil
+		})
+	}
+	for i := range p.al {
+		link(i, p.al[i], p.bl[i], p.ap[i], true)
+		link(i, p.bl[i], p.al[i], p.bp[i], false)
+	}
+}
+
+func (p *stPair) record(aToB bool, b *carrier.Batch) {
+	fs := stFrames(b)
 	p.mu.Lock()
 	if aToB {
 		p.traceAB = append(p.traceAB, fs...)
@@ -589,7 +663,7 @@ func (p *pair) record(aToB bool, b *carrier.Batch) {
 	p.mu.Unlock()
 }
 
-func (p *pair) sinkErr(err error) error {
+func (p *stPair) sinkErr(err error) error {
 	if err != nil {
 		p.mu.Lock()
 		p.errs = append(p.errs, err)
@@ -598,7 +672,7 @@ func (p *pair) sinkErr(err error) error {
 	return err
 }
 
-func (p *pair) errors() []error {
+func (p *stPair) errors() []error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]error(nil), p.errs...)
@@ -606,10 +680,10 @@ func (p *pair) errors() []error {
 
 // close ends both streams (the actors' end procedures) and checks that
 // every buffer returned to its Budget.
-func (p *pair) close(t testing.TB) {
+func (p *stPair) close(t testing.TB) {
 	t.Helper()
-	endSession(p.a, errClosed)
-	endSession(p.b, errClosed)
+	stEnd(p.a, errClosed)
+	stEnd(p.b, errClosed)
 	for _, s := range []*Session{p.a, p.b} {
 		if u := s.env.Carrier.Budget.Used(); u != 0 {
 			t.Errorf("Budget.Used = %d after the end, want 0 (a buffer leaked)", u)
@@ -618,31 +692,31 @@ func (p *pair) close(t testing.TB) {
 }
 
 // record header used by the writer tests: [writer u16][seq u32][len u32].
-const recHead = 10
+const stRecHead = 10
 
-func putRecord(w, seq int, body []byte) []byte {
-	b := make([]byte, recHead+len(body))
+func stPutRecord(w, seq int, body []byte) []byte {
+	b := make([]byte, stRecHead+len(body))
 	binary.BigEndian.PutUint16(b[0:2], uint16(w))
 	binary.BigEndian.PutUint32(b[2:6], uint32(seq))
 	binary.BigEndian.PutUint32(b[6:10], uint32(len(body)))
-	copy(b[recHead:], body)
+	copy(b[stRecHead:], body)
 	return b
 }
 
-// recordBody is the deterministic body of record (w, seq).
-func recordBody(w, seq, n int) []byte {
-	return pattern(uint64(w)<<32|uint64(seq)<<12, n)
+// stRecordBody is the deterministic body of record (w, seq).
+func stRecordBody(w, seq, n int) []byte {
+	return stPattern(uint64(w)<<32|uint64(seq)<<12, n)
 }
 
-func checkRecord(t testing.TB, b []byte) (w, seq, n int) {
+func stCheckRecord(t testing.TB, b []byte) (w, seq, n int) {
 	t.Helper()
 	w = int(binary.BigEndian.Uint16(b[0:2]))
 	seq = int(binary.BigEndian.Uint32(b[2:6]))
 	n = int(binary.BigEndian.Uint32(b[6:10]))
-	if len(b) < recHead+n {
-		t.Fatalf("record (%d, %d) truncated: %d of %d bytes", w, seq, len(b)-recHead, n)
+	if len(b) < stRecHead+n {
+		t.Fatalf("record (%d, %d) truncated: %d of %d bytes", w, seq, len(b)-stRecHead, n)
 	}
-	if !bytes.Equal(b[recHead:recHead+n], recordBody(w, seq, n)) {
+	if !bytes.Equal(b[stRecHead:stRecHead+n], stRecordBody(w, seq, n)) {
 		t.Fatalf("record (%d, %d) of %d bytes is corrupted or interleaved", w, seq, n)
 	}
 	return w, seq, n

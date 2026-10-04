@@ -21,7 +21,7 @@ import (
 func TestNoReaderBoundsAck_L15(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const w = 256 << 10
-		p := newPair(sopt{window: w}, sopt{window: w}, 1)
+		p := stNewPair(stOpt{window: w}, stOpt{window: w}, 1)
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
 		p.runPair(&wg, stop)
@@ -33,22 +33,22 @@ func TestNoReaderBoundsAck_L15(t *testing.T) {
 			}
 			wg.Wait()
 		}()
-		msg := pattern(0, 2*w)
-		wres := make(chan ioResult, 1)
+		msg := stPattern(0, 2*w)
+		wres := make(chan stIO, 1)
 		go func() {
 			n, err := p.a.Write(msg)
-			wres <- ioResult{n, err}
+			wres <- stIO{n, err}
 		}()
 		synctest.Wait()
 		if len(wres) != 0 {
 			r := <-wres
 			t.Fatalf("Write of 2·W returned (%d, %v) with no reader", r.n, r.err)
 		}
-		rx := locked(p.b, func(st *stream) [3]uint64 { return [3]uint64{st.rRead, st.rTail, st.rightEdge} })
+		rx := stLocked(p.b, func(st *stream) [3]uint64 { return [3]uint64{st.rRead, st.rTail, st.rightEdge} })
 		if rx[0] != 0 || rx[1] != w || rx[2] != w {
 			t.Fatalf("receiver rRead=%d rTail=%d edge=%d, want 0, W, W", rx[0], rx[1], rx[2])
 		}
-		tx := locked(p.a, func(st *stream) [3]uint64 { return [3]uint64{st.sBase, st.sNext, st.end} })
+		tx := stLocked(p.a, func(st *stream) [3]uint64 { return [3]uint64{st.sBase, st.sNext, st.end} })
 		if tx != [3]uint64{0, w, w} {
 			t.Fatalf("sender sBase/sNext/end = %v, want 0, W, W", tx)
 		}
@@ -75,7 +75,7 @@ func TestNoReaderBoundsAck_L15(t *testing.T) {
 			t.Fatalf("receiver holds %d bytes of buffers for a %d-byte window", u, w)
 		}
 
-		got := readAsync(p.b, len(msg))
+		got := stReadAsync(p.b, len(msg))
 		r := <-wres
 		if r.n != len(msg) || r.err != nil {
 			t.Fatalf("Write once a reader appeared = (%d, %v)", r.n, r.err)
@@ -100,9 +100,9 @@ func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 	if streamRaceEnabled {
 		total = 16 << 20
 	}
-	s := newTestSession(sopt{role: RolePassive, window: w})
+	s := stSession(stOpt{role: RolePassive, window: w})
 	budget := s.env.Carrier.Budget
-	l, _ := addLane(s, 1, false)
+	l, _ := stAddLane(s, 1, false)
 	ids := uint32(1)
 	rng := rand.New(rand.NewPCG(15, 15))
 	fed, kills := 0, 0
@@ -115,20 +115,20 @@ func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 		} else {
 			off, size = 1+uint64(rng.IntN(w+w/16)), 1+rng.IntN(64<<10)
 		}
-		err := deliverData(l, off, pattern(off, size))
+		err := stDeliverData(l, off, stPattern(off, size))
 		switch {
 		case err == nil:
 		case errors.Is(err, errWindow) && off+uint64(size) > w:
 			kills++ // that carrier dies; the peer continues on another
 			ids++
-			l, _ = addLane(s, ids, false)
+			l, _ = stAddLane(s, ids, false)
 		default:
 			t.Fatalf("frame [%d,+%d): %v", off, size, err)
 		}
 		fed += size
 		maxUsed = max(maxUsed, budget.Used())
 	}
-	st := locked(s, func(st *stream) [4]uint64 {
+	st := stLocked(s, func(st *stream) [4]uint64 {
 		return [4]uint64{st.rRead, st.rTail, st.oooDropped, uint64(st.oooCap)}
 	})
 	t.Logf("fed %d MiB, %d carrier kills, peak %d KiB, dropped %d KiB", fed>>20, kills, maxUsed>>10, st[2]>>10)
@@ -142,14 +142,14 @@ func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 		t.Fatalf("stimulus missing: dropped %d, kills %d, cap %d", st[2], kills, st[3])
 	}
 	// The head arrives: the contiguous prefix is readable and intact.
-	if err := l.Data(nil, 0, pattern(0, 1), nil); err != nil {
+	if err := l.Data(nil, 0, stPattern(0, 1), nil); err != nil {
 		t.Fatal(err)
 	}
-	n := locked(s, func(st *stream) int { return int(st.rTail) })
-	if got := readN(t, s, n); !bytes.Equal(got, pattern(0, n)) {
+	n := stLocked(s, func(st *stream) int { return int(st.rTail) })
+	if got := stReadN(t, s, n); !bytes.Equal(got, stPattern(0, n)) {
 		t.Fatal("reordered bytes corrupted")
 	}
-	endSession(s, errClosed)
+	stEnd(s, errClosed)
 	if u := budget.Used(); u != 0 {
 		t.Fatalf("Budget.Used = %d after the end", u)
 	}
@@ -164,15 +164,15 @@ func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 func TestRightEdgeNeverRetracts_L15(t *testing.T) {
 	const w = 8 << 20
 	budget := carrier.NewBudget(64 << 20)
-	s := newTestSession(sopt{role: RolePassive, window: w, budget: budget})
-	l, _ := addLane(s, 1, false)
+	s := stSession(stOpt{role: RolePassive, window: w, budget: budget})
+	l, _ := stAddLane(s, 1, false)
 	var edges []uint64
 	place := func() wire.Ack {
 		t.Helper()
 		s.mu.Lock()
 		s.bumpNowLocked()
 		s.mu.Unlock()
-		fs, b := fill(l, time.Now())
+		fs, b := stFill(l, time.Now())
 		b.ReleaseRefs()
 		for _, f := range fs {
 			if f.typ == wire.TypeAck {
@@ -204,24 +204,24 @@ func TestRightEdgeNeverRetracts_L15(t *testing.T) {
 	if a := place(); a.Window != w {
 		t.Fatalf("unpressured window %d, want W", a.Window)
 	}
-	if err := deliverRange(l, 0, pattern(0, 4<<20)); err != nil {
+	if err := stDeliverRange(l, 0, stPattern(0, 4<<20)); err != nil {
 		t.Fatal(err)
 	}
-	readN(t, s, 1<<20)
+	stReadN(t, s, 1<<20)
 	undo := pressure(0.9) // AdvertiseWindow → max(64 KiB, W·0.4) < W
 	a := place()
 	if a.Delivered != 1<<20 || a.Window != w-1<<20 {
 		t.Fatalf("pressured ACK %+v: the edge must stay at W (window W − 1 MiB), not retract", a)
 	}
 	// Honest bytes up to the old edge are still accepted under pressure.
-	if err := deliverRange(l, 4<<20, pattern(4<<20, w-4<<20)); err != nil {
+	if err := stDeliverRange(l, 4<<20, stPattern(4<<20, w-4<<20)); err != nil {
 		t.Fatalf("bytes up to the advertised edge rejected under pressure: %v", err)
 	}
 	if err := l.Data(nil, w, []byte{1}, nil); !errors.Is(err, errWindow) {
 		t.Fatalf("a byte beyond the largest edge = %v, want the window violation", err)
 	}
 	undo()
-	readN(t, s, w-1<<20)
+	stReadN(t, s, w-1<<20)
 	undo = pressure(1.0) // advertise 0
 	takeBell()
 	if a := place(); a.Window != 0 || a.Delivered != w {
@@ -245,7 +245,7 @@ func TestRightEdgeNeverRetracts_L15(t *testing.T) {
 	if !again || !bumped {
 		t.Fatalf("readvertise after the pressure ended: keep=%v bumped=%v, want true, true (until an ACK is placed)", again, bumped)
 	}
-	fs, b := fill(l, time.Now())
+	fs, b := stFill(l, time.Now())
 	b.ReleaseRefs()
 	if len(fs) != 1 || fs[0].ack.Window != w {
 		t.Fatalf("re-advertised ACK %v, want the full window", fs)
@@ -256,7 +256,7 @@ func TestRightEdgeNeverRetracts_L15(t *testing.T) {
 	if again {
 		t.Fatal("readvertise still active after a full window was placed")
 	}
-	endSession(s, errClosed)
+	stEnd(s, errClosed)
 	if u := budget.Used(); u != 0 {
 		t.Fatalf("Budget.Used = %d after the end", u)
 	}

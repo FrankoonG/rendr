@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -16,10 +17,18 @@ import (
 // write may read the chunk, so acknowledged memory is never reused while
 // a write still reads it (L17, L43).
 
-// writeCopyHook, when set by a test, runs in Write after a round's
-// reservation and before its copy, outside every lock (L03: a Close racing
-// the first Write's copy). It is nil in production.
-var writeCopyHook func()
+// writeCopyHook is a test seam: when a test stores {s, fn}, fn runs in s's
+// Write after each round's reservation and before its copy, outside every
+// lock (a Close, an ACK or the session's end racing the copy: L03, F5, F7).
+// It only affects the named session, so tests of other sessions are
+// unaffected; production pays one atomic load per round (nil).
+var writeCopyHook atomic.Pointer[copyHook]
+
+// copyHook is the value of writeCopyHook.
+type copyHook struct {
+	s  *Session
+	fn func()
+}
 
 // sendRoomLocked is the send-buffer room: W minus the unacknowledged and
 // reserved bytes.

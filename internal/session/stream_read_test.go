@@ -15,15 +15,15 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// bufferedReceiver returns a passive session holding data in order: a
+// stBufferedReceiver returns a passive session holding data in order: a
 // segment kept by reference (≥ 16 KiB) and a small copied run.
-func bufferedReceiver(t testing.TB, o sopt) (*Session, *lane, []byte) {
+func stBufferedReceiver(t testing.TB, o stOpt) (*Session, *lane, []byte) {
 	t.Helper()
 	o.role = RolePassive
-	s := newTestSession(o)
-	l, _ := addLane(s, 1, false)
-	data := pattern(0, 40<<10+1000)
-	if err := deliverData(l, 0, data[:40<<10]); err != nil {
+	s := stSession(o)
+	l, _ := stAddLane(s, 1, false)
+	data := stPattern(0, 40<<10+1000)
+	if err := stDeliverData(l, 0, data[:40<<10]); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Data(nil, 40<<10, data[40<<10:], nil); err != nil {
@@ -47,16 +47,16 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 				close(entered)
 				<-release
 			}}
-			s, _, data := bufferedReceiver(t, sopt{hooks: hooks})
+			s, _, data := stBufferedReceiver(t, stOpt{hooks: hooks})
 			used := s.env.Carrier.Budget.Used()
 			buf := make([]byte, len(data))
-			done := make(chan ioResult, 1)
+			done := make(chan stIO, 1)
 			go func() {
 				n, err := s.Read(buf)
-				done <- ioResult{n, err}
+				done <- stIO{n, err}
 			}()
 			<-entered // the bytes are copied out, the commit is pending
-			var r ioResult
+			var r stIO
 			if closeWins {
 				if err := s.Close(); err != nil {
 					t.Fatal(err)
@@ -87,7 +87,7 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 					t.Fatalf("Read after Close = (%d, %v), want (0, net.ErrClosed)", n, err)
 				}
 			}
-			endSession(s, errClosed)
+			stEnd(s, errClosed)
 			if u := s.env.Carrier.Budget.Used(); u != 0 {
 				t.Fatalf("Budget.Used = %d after the end", u)
 			}
@@ -106,10 +106,10 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 				runtime.Gosched()
 			}
 		}}
-		s, _, data := bufferedReceiver(t, sopt{hooks: hooks})
+		s, _, data := stBufferedReceiver(t, stOpt{hooks: hooks})
 		buf := make([]byte, len(data))
 		var wg sync.WaitGroup
-		var r ioResult
+		var r stIO
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -117,7 +117,7 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 				runtime.Gosched()
 			}
 			n, err := s.Read(buf)
-			r = ioResult{n, err}
+			r = stIO{n, err}
 		}()
 		closed := make(chan struct{})
 		go func() {
@@ -144,7 +144,7 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 		default:
 			t.Fatalf("run %d: Read racing Close = (%d, %v): neither outcome", i, r.n, r.err)
 		}
-		endSession(s, errClosed)
+		stEnd(s, errClosed)
 		if u := s.env.Carrier.Budget.Used(); u != 0 {
 			t.Fatalf("run %d: Budget.Used = %d after the end (leak)", i, u)
 		}
@@ -175,23 +175,23 @@ func TestRstDuringReadCopy_L07(t *testing.T) {
 			<-release
 		}}
 		pool, budget := carrier.NewBufPool(), carrier.NewBudget(1<<30)
-		s, l, data := bufferedReceiver(t, sopt{hooks: hooks, pool: pool, budget: budget})
+		s, l, data := stBufferedReceiver(t, stOpt{hooks: hooks, pool: pool, budget: budget})
 		used := budget.Used()
 		buf := make([]byte, len(data)+100)
-		done := make(chan ioResult, 1)
+		done := make(chan stIO, 1)
 		go func() {
 			n, err := s.Read(buf)
-			done <- ioResult{n, err}
+			done <- stIO{n, err}
 		}()
 		<-entered
 
 		// Stimulus: the peer's RST arrives; the actor ends the session.
 		var p [wire.RstFixedLen + 6]byte
 		n := wire.PutRst(p[:], &wire.Rst{Code: wire.RstLinger, Msg: []byte("linger")})
-		if err := l.Control(nil, ctlHeader(wire.TypeRst, 0, n), p[:n]); err != nil {
+		if err := l.Control(nil, stCtlHeader(wire.TypeRst, 0, n), p[:n]); err != nil {
 			t.Fatalf("RST: %v", err)
 		}
-		rst := locked(s, func(st *stream) *wire.Rst {
+		rst := stLocked(s, func(st *stream) *wire.Rst {
 			if st.facts&factRst == 0 {
 				return nil
 			}
@@ -200,7 +200,7 @@ func TestRstDuringReadCopy_L07(t *testing.T) {
 		if rst == nil || rst.Code != wire.RstLinger || string(rst.Msg) != "linger" {
 			t.Fatalf("RST not recorded for the actor: %+v", rst)
 		}
-		endSession(s, &AbortError{Code: AbortCode(rst.Code), Msg: string(rst.Msg), Remote: true})
+		stEnd(s, &AbortError{Code: AbortCode(rst.Code), Msg: string(rst.Msg), Remote: true})
 		if u := budget.Used(); u != used {
 			t.Fatalf("the end released %d bytes of buffers under the Read's copy", used-u)
 		}
@@ -238,22 +238,22 @@ func TestRstDuringReadCopy_L07(t *testing.T) {
 	// released early and reused by the churn would be reported.
 	for i := range 200 {
 		pool, budget := carrier.NewBufPool(), carrier.NewBudget(1<<30)
-		s, _, data := bufferedReceiver(t, sopt{pool: pool, budget: budget})
+		s, _, data := stBufferedReceiver(t, stOpt{pool: pool, budget: budget})
 		buf := make([]byte, len(data))
 		var wg sync.WaitGroup
-		var r ioResult
+		var r stIO
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			n, err := s.Read(buf)
-			r = ioResult{n, err}
+			r = stIO{n, err}
 		}()
 		go func() {
 			defer wg.Done()
 			for range i % 4 {
 				runtime.Gosched()
 			}
-			endSession(s, &AbortError{Code: AbortIdle, Remote: true})
+			stEnd(s, &AbortError{Code: AbortIdle, Remote: true})
 			for range 4 {
 				b := pool.Get(carrier.BigData, budget)
 				clear(b.B)

@@ -59,14 +59,14 @@ func (s *Session) ackCadenceLocked() {
 }
 
 // ackQualifiesLocked: l may carry the session's ACKs — it is live, has sent
-// (passive) or received (dialer) its first response frame, and has not
-// written CLOSE.
+// (passive) or received (dialer) its first response frame, that frame was
+// not a refusal (nothing follows a refusal), and it has not written CLOSE.
 func (s *Session) ackQualifiesLocked(l *lane) bool {
 	if l.state == LaneDead {
 		return false
 	}
 	if s.p.Role == RolePassive {
-		if !l.firstSent {
+		if !l.firstSent || refusedLocked(l) {
 			return false
 		}
 	} else if l.state == LaneJoining {
@@ -81,9 +81,12 @@ func (s *Session) ackKeepLocked(l *lane) bool {
 }
 
 // chooseAckLaneLocked returns the best qualifying lane other than skip: in
-// srtt order, the first lane neither retiring (Retire called) nor
-// write-blocked; else the first only blocked; else the first retiring; nil
-// if none qualifies.
+// srtt order, the first lane neither write-blocked nor retiring (Retire
+// called); else the first writable retiring lane (it still carries frames
+// until its CLOSE, and Fill places a pending delayed ACK there before the
+// CLOSE); else the first blocked one, preferring one that is not retiring;
+// nil if none qualifies. Writability comes first (§4.6: an ACK never waits
+// behind a blocked carrier while a writable lane qualifies).
 func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 	s.refreshOrderLocked(time.Now(), false)
 	var best *lane
@@ -93,10 +96,10 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 			continue
 		}
 		rank := 0
-		if l.retireCalled {
+		if l.port.WriteBlocked() {
 			rank = 2
 		}
-		if l.port.WriteBlocked() {
+		if l.retireCalled {
 			rank++
 		}
 		if rank < bestRank {
@@ -111,8 +114,8 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 
 // ensureAckLaneLocked keeps the current duty lane while it qualifies, is
 // not retiring and is not write-blocked; otherwise it moves the duty to the
-// best other qualifying lane (keeping a blocked one only if nothing better
-// exists) or clears it.
+// best qualifying lane (chooseAckLaneLocked, which may keep the current
+// one if nothing better exists) or clears it.
 func (s *Session) ensureAckLaneLocked() {
 	st := &s.st
 	cur := st.ackLane
@@ -142,11 +145,15 @@ func (s *Session) raiseEdgeLocked() uint64 {
 }
 
 // fillAckLocked is Fill step 4 on the duty lane l: the ACK-delay rule, then
-// one ACK if l owes one.
+// one ACK if l owes one. On a lane on which Retire was called a pending
+// delayed ACK is due at once: its writer appends CLOSE after a Fill that
+// placed nothing and then exits, dropping the WakeAt, so the ACK would wait
+// for the next 64 KiB or urgent bump (the actor sets retireCalled before it
+// calls Conn.Retire).
 func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 	st := &s.st
 	if !st.ackDelayAt.IsZero() {
-		if !b.Now().Before(st.ackDelayAt) {
+		if l.retireCalled || !b.Now().Before(st.ackDelayAt) {
 			st.ackGen++
 			st.ackBumped = st.rRead
 			st.ackDelayAt = time.Time{}

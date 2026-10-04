@@ -13,7 +13,7 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-type ioResult struct {
+type stIO struct {
 	n   int
 	err error
 }
@@ -25,26 +25,26 @@ type ioResult struct {
 func TestFinAboveGapNoEOF_L02(t *testing.T) {
 	for _, first := range []uint64{0, 1<<62 - 1<<20} {
 		synctest.Test(t, func(t *testing.T) {
-			s := newTestSession(sopt{role: RolePassive, first: first, limit: 1 << 62})
-			la, _ := addLane(s, 1, false)
-			lb, _ := addLane(s, 2, false)
-			data := pattern(first, 100)
+			s := stSession(stOpt{role: RolePassive, first: first, limit: 1 << 62})
+			la, _ := stAddLane(s, 1, false)
+			lb, _ := stAddLane(s, 2, false)
+			data := stPattern(first, 100)
 
 			// Stimulus: [0,50) and FIN(100) on lane A; [50,100) never arrives there.
 			if err := la.Data(nil, first, data[:50], nil); err != nil {
 				t.Fatalf("Data [0,50): %v", err)
 			}
-			if err := sendFin(la, first+100); err != nil {
+			if err := stSendFin(la, first+100); err != nil {
 				t.Fatalf("FIN(100): %v", err)
 			}
 			buf := make([]byte, 200)
 			if n, err := s.Read(buf); n != 50 || err != nil || !bytes.Equal(buf[:n], data[:50]) {
 				t.Fatalf("first Read = (%d, %v), want the 50 contiguous bytes", n, err)
 			}
-			done := make(chan ioResult, 1)
+			done := make(chan stIO, 1)
 			go func() {
 				n, err := s.Read(buf[50:])
-				done <- ioResult{n, err}
+				done <- stIO{n, err}
 			}()
 			synctest.Wait()
 			select {
@@ -54,7 +54,7 @@ func TestFinAboveGapNoEOF_L02(t *testing.T) {
 			}
 
 			// Lane A's carrier dies (EOF): still no EOF and no error.
-			killLane(s, la)
+			stKillLane(s, la)
 			synctest.Wait()
 			select {
 			case r := <-done:
@@ -77,12 +77,12 @@ func TestFinAboveGapNoEOF_L02(t *testing.T) {
 				t.Fatalf("repeated Read at the FIN = (%d, %v), want (0, io.EOF)", n, err)
 			}
 			// The FIN_DELIVERED ACK leaves on the surviving lane.
-			fs, b := fill(lb, time.Now())
+			fs, b := stFill(lb, time.Now())
 			b.ReleaseRefs()
 			if len(fs) != 1 || fs[0].typ != wire.TypeAck || fs[0].flags&wire.FlagAckFinDelivered == 0 || fs[0].ack.Delivered != first+100 {
 				t.Fatalf("survivor frames %v, want one ACK(100) with FIN_DELIVERED", fs)
 			}
-			endSession(s, io.EOF)
+			stEnd(s, io.EOF)
 			if u := s.env.Carrier.Budget.Used(); u != 0 {
 				t.Fatalf("Budget.Used = %d after the end", u)
 			}
@@ -97,22 +97,22 @@ func TestFinAboveGapNoEOF_L02(t *testing.T) {
 func TestCloseUnblocksWithoutCarriers_L03(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const w = 256 << 10
-		s := newTestSession(sopt{window: w})
-		l, _ := addLane(s, 1, true)
-		killLane(s, l) // no carrier left
+		s := stSession(stOpt{window: w})
+		l, _ := stAddLane(s, 1, true)
+		stKillLane(s, l) // no carrier left
 
 		// The send buffer accepts W without any carrier (L17), then blocks.
 		if n, err := s.Write(make([]byte, w)); n != w || err != nil {
 			t.Fatalf("Write of one window without carriers = (%d, %v), want (%d, nil)", n, err, w)
 		}
-		wDone, rDone := make(chan ioResult, 1), make(chan ioResult, 1)
+		wDone, rDone := make(chan stIO, 1), make(chan stIO, 1)
 		go func() {
 			n, err := s.Write(make([]byte, 1000))
-			wDone <- ioResult{n, err}
+			wDone <- stIO{n, err}
 		}()
 		go func() {
 			n, err := s.Read(make([]byte, 10))
-			rDone <- ioResult{n, err}
+			rDone <- stIO{n, err}
 		}()
 		synctest.Wait()
 		if len(wDone) != 0 || len(rDone) != 0 {
@@ -141,15 +141,15 @@ func TestCloseUnblocksWithoutCarriers_L03(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatalf("second Close = %v, want nil (idempotent)", err)
 		}
-		facts := locked(s, func(st *stream) uint32 { return st.facts })
+		facts := stLocked(s, func(st *stream) uint32 { return st.facts })
 		if facts&factClose == 0 || facts&factCloseWrite == 0 {
 			t.Fatalf("facts %#x lack factClose|factCloseWrite: the actor would not linger", facts)
 		}
-		fin := locked(s, func(st *stream) finState { return st.fin })
+		fin := stLocked(s, func(st *stream) finState { return st.fin })
 		if !fin.requested || fin.off != w {
 			t.Fatalf("FIN %+v, want requested at the reserved end %d", fin, w)
 		}
-		endSession(s, errClosed)
+		stEnd(s, errClosed)
 		if u := s.env.Carrier.Budget.Used(); u != 0 {
 			t.Fatalf("Budget.Used = %d after the end", u)
 		}
@@ -161,31 +161,30 @@ func TestCloseUnblocksWithoutCarriers_L03(t *testing.T) {
 // commits below the FIN, and the peer reads every byte before io.EOF.
 func TestCloseRacesFirstWrite_L03(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		p := newPair(sopt{}, sopt{}, 1)
+		p := stNewPair(stOpt{}, stOpt{}, 1)
 		entered, release := make(chan struct{}), make(chan struct{})
 		var once sync.Once
-		writeCopyHook = func() { once.Do(func() { close(entered); <-release }) }
-		defer func() { writeCopyHook = nil }()
+		stSetCopyHook(t, p.a, func() { once.Do(func() { close(entered); <-release }) })
 
-		msg := pattern(0, 1000)
-		wres := make(chan ioResult, 1)
+		msg := stPattern(0, 1000)
+		wres := make(chan stIO, 1)
 		go func() {
 			n, err := p.a.Write(msg)
-			wres <- ioResult{n, err}
+			wres <- stIO{n, err}
 		}()
 		<-entered // the first round is reserved and its copy is in progress
 
 		if err := p.a.Close(); err != nil {
 			t.Fatalf("Close = %v", err)
 		}
-		st := locked(p.a, func(st *stream) [4]uint64 {
-			return [4]uint64{st.fin.off, st.end, st.resEnd, b2u(st.fin.requested)}
+		st := stLocked(p.a, func(st *stream) [4]uint64 {
+			return [4]uint64{st.fin.off, st.end, st.resEnd, stB2U(st.fin.requested)}
 		})
 		if st[3] != 1 || st[0] != 1000 || st[1] != 0 || st[2] != 1000 {
 			t.Fatalf("after Close during the copy: fin.off=%d end=%d resEnd=%d requested=%d, want 1000, 0, 1000, 1", st[0], st[1], st[2], st[3])
 		}
 		// A carrier writer running now finds neither DATA nor a FIN.
-		fs, b := fill(p.al[0], time.Now())
+		fs, b := stFill(p.al[0], time.Now())
 		b.ReleaseRefs()
 		for _, f := range fs {
 			if f.typ == wire.TypeData || f.typ == wire.TypeFin {
@@ -220,7 +219,7 @@ func TestCloseRacesFirstWrite_L03(t *testing.T) {
 		if fins != 1 || dataEnd != 1000 {
 			t.Fatalf("wire carried %d FINs and DATA up to %d, want 1 FIN after DATA up to 1000", fins, dataEnd)
 		}
-		got := readN(t, p.b, len(msg))
+		got := stReadN(t, p.b, len(msg))
 		if !bytes.Equal(got, msg) {
 			t.Fatal("peer read corrupted bytes")
 		}
@@ -231,7 +230,7 @@ func TestCloseRacesFirstWrite_L03(t *testing.T) {
 	})
 }
 
-func b2u(b bool) uint64 {
+func stB2U(b bool) uint64 {
 	if b {
 		return 1
 	}
@@ -243,8 +242,8 @@ func b2u(b bool) uint64 {
 // reverse direction stays usable until the peer's own FIN.
 func TestCloseWriteIdempotent_L04(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		p := newPair(sopt{}, sopt{}, 1)
-		req := pattern(0, 3000)
+		p := stNewPair(stOpt{}, stOpt{}, 1)
+		req := stPattern(0, 3000)
 		if n, err := p.a.Write(req); n != len(req) || err != nil {
 			t.Fatalf("Write = (%d, %v)", n, err)
 		}
@@ -258,7 +257,7 @@ func TestCloseWriteIdempotent_L04(t *testing.T) {
 			t.Fatalf("Write after CloseWrite = (%d, %v), want (0, net.ErrClosed)", n, err)
 		}
 		p.pump(true)
-		if got := readN(t, p.b, len(req)); !bytes.Equal(got, req) {
+		if got := stReadN(t, p.b, len(req)); !bytes.Equal(got, req) {
 			t.Fatal("request corrupted")
 		}
 		if _, err := p.b.Read(make([]byte, 1)); err != io.EOF {
@@ -266,19 +265,19 @@ func TestCloseWriteIdempotent_L04(t *testing.T) {
 		}
 		_ = p.a.CloseWrite() // a third call after the FIN was sent
 		p.pump(true)
-		if n := count(p.traceAB, wire.TypeFin); n != 1 {
+		if n := stCount(p.traceAB, wire.TypeFin); n != 1 {
 			t.Fatalf("%d FINs on the wire, want exactly 1", n)
 		}
 
 		// The reverse direction is unaffected by our half-close.
-		resp := pattern(1<<40, 200<<10)
+		resp := stPattern(1<<40, 200<<10)
 		if n, err := p.b.Write(resp); n != len(resp) || err != nil {
 			t.Fatalf("server Write = (%d, %v)", n, err)
 		}
 		if err := p.b.CloseWrite(); err != nil {
 			t.Fatalf("server CloseWrite = %v", err)
 		}
-		done := readAsync(p.a, len(resp))
+		done := stReadAsync(p.a, len(resp))
 		for len(done) == 0 {
 			p.pump(true)
 			synctest.Wait()
@@ -290,12 +289,12 @@ func TestCloseWriteIdempotent_L04(t *testing.T) {
 			t.Fatalf("client Read after the response = %v, want io.EOF", err)
 		}
 		p.pump(true)
-		if n := count(p.traceBA, wire.TypeFin); n != 1 {
+		if n := stCount(p.traceBA, wire.TypeFin); n != 1 {
 			t.Fatalf("%d server FINs on the wire, want 1", n)
 		}
 		// Both FINs acknowledged, both delivered: DONE went both ways.
 		for _, s := range []*Session{p.a, p.b} {
-			done := locked(s, func(st *stream) bool { return st.doneSent && st.peerDone && st.fin.acked })
+			done := stLocked(s, func(st *stream) bool { return st.doneSent && st.peerDone && st.fin.acked })
 			if !done {
 				t.Fatal("DONE was not exchanged after both half-closes completed")
 			}

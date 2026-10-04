@@ -28,6 +28,14 @@ func (s *Session) fillLocked(l *lane, b *carrier.Batch) {
 	l.idle = b.Len() == start
 }
 
+// refusedLocked reports that l's first response frame, already placed, was
+// a refusal (a non-OK OPEN_ACK or JOIN_ACK). Fill keeps that frame in
+// l.first as the marker (an accepted one is cleared), so nothing ever
+// follows a refusal on the wire and the lane never carries the ACK duty.
+func refusedLocked(l *lane) bool {
+	return l.firstSent && l.first.t != 0
+}
+
 // fillControlLocked appends Fill steps 1–4: the passive's first response
 // frame (nothing at all while a held carrier has none yet), the RST, the
 // dialer's pending SCHED and the ACK on the duty lane. It reports whether
@@ -50,15 +58,17 @@ func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 			return false // held: the first response is the first frame on the wire
 		}
 		l.firstSent = true
-		l.first = firstFrame{}
 		st.facts |= factLaneConfirmed
 		s.ringActor()
 		if !ok {
-			return false // nothing follows a refusal
+			return false // nothing follows a refusal (l.first stays as its marker)
 		}
+		l.first = firstFrame{}
 		if st.ackLane == nil {
 			s.ensureAckLaneLocked()
 		}
+	} else if refusedLocked(l) {
+		return false // nothing follows a refusal, in any later Fill either
 	}
 	if r := s.ctl.rst; r != nil {
 		if !l.rstSent {

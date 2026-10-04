@@ -14,6 +14,15 @@ import (
 // overlap held bytes are compared once; a mismatch is a violation that
 // kills only the delivering carrier, and the first copy stays authoritative
 // (L13).
+//
+// A referenced frame that overlaps held bytes is placed in pieces. A piece
+// below 16 KiB is copied into a run, as a small payload would be, rather
+// than pinning the frame's whole buffer for a few bytes — but only while
+// the bytes copied by this Data call stay below 16 KiB (copyBudget), so no
+// call copies 16 KiB or more under the lock (§3.2, P17); later small pieces
+// of that frame are kept by reference. Such a reference pins at most one
+// buffer per frame that contributed at least 16 KiB of new bytes in that
+// call (for 64 KiB segments, a buffer at most 4× those bytes).
 
 // dataLocked implements lane.Data under s.mu.
 func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
@@ -59,6 +68,7 @@ func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
 	// Place the parts of [max(off, rTail), end) no segment holds yet.
 	ref := buf // the reference the first referencing piece takes over
 	tail := st.rTail
+	budget := copyBudget
 	for pos := off; pos < end; {
 		if pos < st.rTail {
 			// Held in order (compared above, or just moved in from ooq
@@ -78,9 +88,9 @@ func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
 		}
 		piece := p[pos-off : stop-off]
 		if pos == st.rTail {
-			ref = s.appendInOrderLocked(pos, piece, buf, ref)
+			ref = s.appendInOrderLocked(pos, piece, buf, ref, &budget)
 		} else {
-			ref = s.insertOOOLocked(i, pos, piece, buf, ref)
+			ref = s.insertOOOLocked(i, pos, piece, buf, ref, &budget)
 		}
 		pos = stop
 	}
@@ -117,14 +127,25 @@ func takeRef(buf, ref *carrier.Buf) *carrier.Buf {
 	return nil
 }
 
+// keepByRef decides whether a piece of a DATA frame is kept by reference
+// (true) or copied into runs, charging a copy to budget, the bytes the
+// current Data call may still copy (see the file comment). Without buf the
+// payload is valid only during the call and below 16 KiB: always copied.
+func keepByRef(piece []byte, buf *carrier.Buf, budget *int) bool {
+	if buf != nil && (len(piece) >= runSize || len(piece) > *budget) {
+		return true
+	}
+	*budget -= len(piece)
+	return false
+}
+
 // appendInOrderLocked appends piece at pos == rTail to inq — by reference
-// when it is at least runSize bytes of buf, else copied into the tail run
-// or new runs — then moves every out-of-order segment that became
-// contiguous into inq. It returns the reference still unused (see
-// dataLocked).
-func (s *Session) appendInOrderLocked(pos uint64, piece []byte, buf, ref *carrier.Buf) *carrier.Buf {
+// or copied into the tail run or new runs (keepByRef) — then moves every
+// out-of-order segment that became contiguous into inq. It returns the
+// reference still unused (see dataLocked).
+func (s *Session) appendInOrderLocked(pos uint64, piece []byte, buf, ref *carrier.Buf, budget *int) *carrier.Buf {
 	st := &s.st
-	if buf != nil && len(piece) >= runSize {
+	if keepByRef(piece, buf, budget) {
 		ref = takeRef(buf, ref)
 		st.inq.push(seg{off: pos, b: piece, buf: buf})
 	} else {
@@ -161,15 +182,15 @@ func (s *Session) appendInOrderLocked(pos uint64, piece []byte, buf, ref *carrie
 }
 
 // insertOOOLocked inserts piece at pos (> rTail) before out-of-order
-// segment i, within the 2·W capacity cap: a piece of at least runSize bytes
-// of buf by reference, a smaller one appended to the run that ends exactly
-// at pos (if it has room) and otherwise copied into a new run. Bytes beyond
-// the cap are dropped and counted (D13: never a violation; the sender still
-// holds them). It returns the reference still unused.
-func (s *Session) insertOOOLocked(i int, pos uint64, piece []byte, buf, ref *carrier.Buf) *carrier.Buf {
+// segment i, within the 2·W capacity cap: by reference (keepByRef), or
+// appended to the run that ends exactly at pos (if it has room) and
+// otherwise copied into a new run. Bytes beyond the cap are dropped and
+// counted (D13: never a violation; the sender still holds them). It
+// returns the reference still unused.
+func (s *Session) insertOOOLocked(i int, pos uint64, piece []byte, buf, ref *carrier.Buf, budget *int) *carrier.Buf {
 	st := &s.st
 	limit := 2 * s.window()
-	if buf != nil && len(piece) >= runSize {
+	if keepByRef(piece, buf, budget) {
 		if c := int64(cap(buf.B)); st.oooCap+c <= limit {
 			ref = takeRef(buf, ref)
 			st.ooq.insert(i, seg{off: pos, b: piece, buf: buf})

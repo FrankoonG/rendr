@@ -23,7 +23,9 @@ func (l *lane) Handle() uint32 {
 // Fill appends the lane's frames to b in one s.mu section (design §4.3):
 // nothing on a LaneDead lane (§4.0 C1); the pending first response
 // (OPEN_ACK or JOIN_ACK; fact factLaneConfirmed), and nothing at all while a
-// held passive carrier has none yet; RST once (then nothing else); the
+// held passive carrier has none yet, nor ever after a refusal (a non-OK
+// first response, which stays in l.first as the marker); RST once (then
+// nothing else); the
 // dialer's pending SCHED; the ACK on the duty lane (with the ACK-delay
 // rule, b.WakeAt; an ACK that takes lastWin from 64 KiB or more to below it
 // rings the actor, see readvertiseLocked); then, if l.data, DATA — the
@@ -92,9 +94,10 @@ func (l *lane) Control(c *carrier.Conn, h wire.Header, p []byte) error {
 
 // WriteBlocked is called by the carrier's watchdog when the current batch
 // write has been in progress for PingBusy (design §4.6, §4.8): duties held
-// by this lane move to a non-blocked lane, which is woken (the ACK duty,
-// also while ackDelayAt is armed, C30), and fact factWriteBlocked tells the
-// actor to move a SCHED resend. It must not block.
+// by this lane move to a non-blocked lane — one on which Retire was called
+// if no other is writable — which is woken (the ACK duty, also while
+// ackDelayAt is armed, C30), and fact factWriteBlocked tells the actor to
+// move a SCHED resend. It must not block.
 func (l *lane) WriteBlocked(c *carrier.Conn) {
 	s := l.s
 	s.mu.Lock()

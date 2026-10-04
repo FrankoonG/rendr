@@ -29,6 +29,9 @@ const (
 	runSize = carrier.BigData
 	// runCap is the class capacity a run charges (the 16 KiB class).
 	runCap = carrier.BigData + carrier.ClassSlack
+	// copyBudget is the most payload bytes one Data call copies under the
+	// session lock (below 16 KiB, §3.2, P17); see recv.go.
+	copyBudget = runSize - 1
 	// windowFloor is the window below which the actor re-advertises (D18)
 	// and below which a placed ACK rings it (W6).
 	windowFloor = 64 << 10
