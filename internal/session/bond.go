@@ -13,7 +13,8 @@ import (
 // (the death step kicks its slot; not gated by the failed mark, plan §3.2),
 // then per cadence; the new incarnation is a rejoin, not a migration. The
 // head of the send window is rescued by a duplicate on another member when
-// it stays stuck.
+// it stays stuck — on the member holding it only while that member is the
+// only data lane.
 
 // chooseMembersLocked fixes the member factories when the session opens
 // on factory winner and kicks every other member slot.
@@ -77,8 +78,16 @@ func (a *actor) bondSlotsLocked(now time.Time) {
 // rescueLocked is the bond rescue check (§4.11, W7): while sBase < end it
 // is armed at lastAdvance + RescueWait(fastest srtt, RescueMin) — never at
 // a time already past —; when the head has been stuck that long and was
-// not rescued at this sBase, the stuck segment is duplicated by the first
-// other data lane with capacity (the receiver deduplicates).
+// not rescued at this sBase, the stuck segment is duplicated (the receiver
+// deduplicates) by the first data lane with capacity that may send it: any
+// lane but the holder while another data lane exists (L34), else the
+// holder itself (rescueSenderLocked, §0.8 V3): bytes the receiver dropped
+// at its out-of-order cap or shed would otherwise never be resent, and the
+// session would stall for good on a healthy carrier. While the rescue
+// is pending, every step wakes the lanes that may send it, so a member's
+// death, retirement or attach hands it over without waiting for an
+// unrelated wake. It runs on both sides: the passive rescues its own sends
+// over its data lanes (the applied SCHED's members).
 func (a *actor) rescueLocked(now time.Time) {
 	s := a.s
 	st := &s.st
@@ -86,6 +95,7 @@ func (a *actor) rescueLocked(now time.Time) {
 		a.rescueAt = time.Time{}
 		return
 	}
+	s.wakeRescueLocked()
 	wait := sched.RescueWait(a.fastestSRTTLocked(), orDefault(s.p.RescueMin, defRescueMin))
 	due := st.lastAdvance.Add(wait)
 	if now.Before(due) {
@@ -94,30 +104,13 @@ func (a *actor) rescueLocked(now time.Time) {
 		return
 	}
 	if st.sBase != s.ctl.rescuedBase && !st.rescue.set {
-		if holder, sp, ok := s.rescueHolderLocked(); ok && a.otherDataLaneLocked(holder) {
+		if holder, sp, ok := s.rescueHolderLocked(); ok {
 			st.rescue = rescueSlot{set: true, sp: sp, holder: holder}
 			s.ctl.rescuedBase = st.sBase
 			s.routingChangedLocked() // V15
-			// The stream's wake walk counts every member's spare capacity,
-			// the holder's included, so it may stop at the holder, which
-			// must not send the duplicate: wake the other data lanes here.
-			for _, l := range s.lanes {
-				if l.data && l != holder {
-					wakeLaneLocked(l)
-				}
-			}
+			s.wakeRescueLocked()
 		}
 	}
 	a.rescueAt = now.Add(wait)
 	a.want(a.rescueAt)
-}
-
-// otherDataLaneLocked reports whether a data lane other than holder exists.
-func (a *actor) otherDataLaneLocked(holder *lane) bool {
-	for _, l := range a.s.lanes {
-		if l.data && l != holder {
-			return true
-		}
-	}
-	return false
 }

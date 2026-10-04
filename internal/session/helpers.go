@@ -241,9 +241,9 @@ func (s *Session) takeFactsLocked() uint32 {
 // inside that lane's infl; ok is false when no lane holds sBase (not sent
 // yet, or requeued). The actor calls it when the head has been stuck since
 // lastAdvance for sched.RescueWait and was not rescued at this sBase, then
-// sets st.rescue = {sp, holder} and wakes the other data lanes. How an idle
-// actor learns that data became outstanding is described with the fact bits
-// in state.go.
+// sets st.rescue = {sp, holder} and wakes the lanes that may send the
+// duplicate (wakeRescueLocked, rescueSenderLocked). How an idle actor learns
+// that data became outstanding is described with the fact bits in state.go.
 //
 // The span is the stuck segment: from sBase to the end of the holder's
 // span, its chunk or one DATA segment, whichever comes first, so a rescue
@@ -266,6 +266,55 @@ func (s *Session) rescueHolderLocked() (holder *lane, sp span, ok bool) {
 		}
 	}
 	return nil, span{}, false
+}
+
+// rescueSenderLocked reports whether data lane l may send the pending
+// rescue duplicate (design §4.11, §0.8 V3): every data lane other than the
+// rescue's holder may, and the holder itself only while no other data lane
+// exists. The holder exclusion stands whenever another data lane exists
+// (L34): the head may be stuck because the holder's carrier stalls, and a
+// duplicate queued behind the stalled original would rescue nothing. With
+// the holder as the only data lane no other lane can resend the head: if
+// the receiver lost those bytes — dropped at its 2·W out-of-order receive
+// cap or shed (D13, V3) after the holder's carrier delivered them — nothing
+// else ever would (stream carriers have no retransmission timer) and the
+// session would stall for good on a healthy carrier, so the holder sends
+// the duplicate itself. If the head is stuck for another reason (a slow
+// carrier, an application that does not read), that costs one segment per
+// stuck head, which the receiver discards as a duplicate. Which lanes may
+// send is re-evaluated at every Fill: it changes as members die, retire,
+// attach or leave the send set.
+func (s *Session) rescueSenderLocked(l *lane) bool {
+	if l != s.st.rescue.holder {
+		return true
+	}
+	for _, o := range s.st.order {
+		if o != l && o.data {
+			return false
+		}
+	}
+	return true
+}
+
+// wakeRescueLocked wakes the idle data lanes that may send the pending
+// rescue duplicate (rescueSenderLocked). The actor calls it in every step
+// while a rescue is pending: the stream's bond wake walk counts every
+// member's spare capacity, the holder's included, so it may stop at a lane
+// that must not send the duplicate, and the lanes that may send it change
+// as members come and go (the holder becomes a sender when the last other
+// data lane leaves; a lane attaching later takes the duplicate over). A
+// busy lane runs Fill again by itself after its write.
+func (s *Session) wakeRescueLocked() {
+	st := &s.st
+	if !st.rescue.set || st.ended {
+		return
+	}
+	for _, l := range st.order {
+		if l.data && l.idle && s.rescueSenderLocked(l) {
+			l.idle = false
+			l.port.Wake()
+		}
+	}
 }
 
 // readvertiseLocked is the actor's window re-advertisement step at now

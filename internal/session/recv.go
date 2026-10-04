@@ -63,11 +63,14 @@ import (
 // frames).
 //
 // Recovery. Dropped and shed bytes are not lost to the stream: the sender
-// still holds them unacknowledged. They return only when another carrier
-// retransmits them — a bond rescue sent on a lane other than the one whose
-// spans hold them (§4.11), or the requeue and replay after that lane dies
-// or loses data eligibility. While that lane is the only data lane and stays
-// healthy, nothing resends them.
+// still holds them unacknowledged. They return when they are retransmitted:
+// by a bond rescue duplicate (§4.11) — sent on a lane other than the one
+// whose spans hold them while another data lane exists, and by that lane
+// itself once it is the only data lane (nothing else would ever resend
+// them) — or by the requeue and replay after that lane dies or loses data
+// eligibility. Only a bond receiver holds out-of-order data: a selector's
+// one sending lane, and its successor's replay from the acknowledged front,
+// never get ahead of rTail.
 
 // recvLimit is the cap on the receive charge that out-of-order data may
 // fill: 2·W (V3).

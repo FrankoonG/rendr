@@ -250,11 +250,13 @@ type segRing struct {
 type segList struct{ s []seg }
 
 // rescueSlot is a pending bond rescue (§4.11): the actor sets it, the first
-// data lane other than holder that has capacity sends sp, and Fill clears it.
+// data lane with capacity that may send it (any lane but holder, the holder
+// itself only while it is the only data lane: rescueSenderLocked) sends sp,
+// and Fill clears it.
 type rescueSlot struct {
 	set    bool
 	sp     span
-	holder *lane // the lane that must not send the duplicate
+	holder *lane // the lane whose span holds the stuck head: excluded while another data lane exists
 }
 
 // finState is our FIN (§4.3 step 6, §4.7): requested at the first

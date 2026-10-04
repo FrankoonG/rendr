@@ -1,6 +1,8 @@
 package session
 
 import (
+	"sync/atomic"
+
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -93,19 +95,33 @@ func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 	return true
 }
 
-// fillDataLocked is Fill step 5 on a data lane: the rescue duplicate unless
-// l holds the stuck head, then retransmissions lowest first (a replay
-// completes before new data, the FIN and retirement, L10), then new bytes
-// up to min(end, peerLimit). It stops at the batch's DATA budget, a full
-// batch or the carrier's capacity cap; at the cap with bytes still
-// pullable it marks the batch cap-blocked, so the PONG that frees capacity
-// wakes the writer (§4.10).
+// rescueSendHook is a test seam: when a test stores {s, fn}, fn runs under
+// s.mu each time a lane of s places (part of) the rescue duplicate in a
+// batch, with holder reporting that the lane is the rescue's holder (it
+// sends its own duplicate: no other data lane exists). Production never
+// sets it (one atomic load per placed rescue).
+var rescueSendHook atomic.Pointer[rescueHook]
+
+// rescueHook is the value of rescueSendHook.
+type rescueHook struct {
+	s  *Session
+	fn func(l *lane, holder bool)
+}
+
+// fillDataLocked is Fill step 5 on a data lane: the rescue duplicate if l
+// may send it (rescueSenderLocked: any other data lane, the holder of the
+// stuck head only while it is the only data lane), then retransmissions
+// lowest first (a replay completes before new data, the FIN and
+// retirement, L10), then new bytes up to min(end, peerLimit). It stops at
+// the batch's DATA budget, a full batch or the carrier's capacity cap; at
+// the cap with bytes still pullable it marks the batch cap-blocked, so the
+// PONG that frees capacity wakes the writer (§4.10).
 func (s *Session) fillDataLocked(l *lane, b *carrier.Batch) {
 	st := &s.st
 	left := l.port.Capacity() - l.port.Inflight()
 	sent := false
-	if st.rescue.set && st.rescue.holder != l && left > 0 {
-		sp := st.rescue.sp
+	if st.rescue.set && left > 0 && s.rescueSenderLocked(l) {
+		sp, holder := st.rescue.sp, st.rescue.holder == l
 		for sp.n > 0 {
 			k := s.addDataLocked(l, b, sp.off, sp.n, true, &sent)
 			if k == 0 {
@@ -118,6 +134,9 @@ func (s *Session) fillDataLocked(l *lane, b *carrier.Batch) {
 			st.rescue = rescueSlot{}
 		} else {
 			st.rescue.sp = sp
+		}
+		if hk := rescueSendHook.Load(); hk != nil && hk.s == s && sent {
+			hk.fn(l, holder)
 		}
 	}
 	for left > 0 && !st.retx.empty() {
@@ -141,7 +160,7 @@ func (s *Session) fillDataLocked(l *lane, b *carrier.Batch) {
 		st.sNext += k
 		left -= int64(k)
 	}
-	if left <= 0 && (s.pullableLocked() > 0 || (st.rescue.set && st.rescue.holder != l)) {
+	if left <= 0 && (s.pullableLocked() > 0 || (st.rescue.set && s.rescueSenderLocked(l))) {
 		b.MarkCapBlocked()
 	}
 }
