@@ -105,6 +105,7 @@ type Conn struct {
 	env     *Env
 	tm      Timing // env.Timing with defaults for zero fields
 	nc      net.Conn
+	ncClose closeOnce // closes nc exactly once: the closer, or the last resort of its abandonment (V2)
 	owned   *OwnedTCP // nc itself when it is rendr's ownership token (D3, L57); nil otherwise
 	id      uint32
 	peer    [16]byte
@@ -185,6 +186,7 @@ func newConn(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name 
 		env:     env,
 		tm:      env.Timing.withDefaults(),
 		nc:      nc,
+		ncClose: closeOnce{nc: nc},
 		id:      id,
 		peer:    peer,
 		factory: factory,
@@ -369,7 +371,8 @@ func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 // after Timing.AbandonWait) and the embedder conn was closed or its close
 // abandoned. Before it closes, the CarrierID is released and every
 // abandoned goroutine is counted in Env.Abandon, so a joiner woken by Done
-// sees the final state.
+// sees the final state; a closer abandoned before its Close has had its
+// conn's last-resort close started (design §0.8 V2).
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // PeerClosed reports that the peer sent CLOSE on this carrier.
@@ -493,8 +496,9 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 	defer c.partDone(partCloser) // also on runtime.Goexit inside an embedder call
 	// Deferred, so the conn is closed exactly once also when one of the
 	// embedder calls below (CloseWrite, the verdict write, the drain) calls
-	// runtime.Goexit (L51).
-	defer closeNow(c.nc)
+	// runtime.Goexit (L51); skipped when the abandonment's last resort
+	// closed it first under a call that ignored its deadline (V2).
+	defer c.ncClose.now()
 	switch mode {
 	case closeRetired:
 		if c.owned != nil {
@@ -545,6 +549,14 @@ func (c *Conn) partDone(p uint8) {
 // woken by Done already sees them in Status.Abandoned and in the Full
 // fail-fast gate; partDone reads the abandoned bits under the same lock, so
 // a part's Leave always follows its Adopt.
+//
+// A closer adopted here is still inside an embedder call before its Close:
+// the verdict write or the drain of WriteAndClose on a conn that ignores
+// its deadline. Its conn is then closed once as a last resort (design §0.8
+// V2), which unblocks the call on a conn that honours Close; a closer stuck
+// inside the Close itself is never closed a second time (closeOnce). The
+// last resort (closeOnce.async) only starts a guarded goroutine, so it may
+// run under the leaf lock.
 func (c *Conn) abandonParts() {
 	c.jmu.Lock()
 	defer c.jmu.Unlock()
@@ -556,6 +568,9 @@ func (c *Conn) abandonParts() {
 				c.env.Abandon.Adopt()
 			}
 		}
+	}
+	if stuck&partCloser != 0 {
+		c.ncClose.async(c.env) // the last resort
 	}
 	c.maybeDoneLocked()
 }
@@ -637,6 +652,12 @@ func (c *Conn) closeWritten() {
 // conn is closed once the write gave up. It returns at once; the work runs
 // on a guarded goroutine. The death record becomes CauseLocalClose. On a
 // started or already dead Conn it only kills it.
+//
+// On a conn that ignores the write (or the drain's read) deadline, the
+// closer is adopted by the abandoned-call pool AbandonWait after the
+// deadline and the drain bound, and its conn is then closed exactly once
+// as a last resort (design §0.8 V2): a conn that honours Close unblocks,
+// and the closer leaves the pool.
 func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []byte, deadline time.Time) {
 	c.jmu.Lock()
 	started := c.join.started
