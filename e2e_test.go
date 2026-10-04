@@ -365,6 +365,17 @@ func TestDialConfirmRoundTrip(t *testing.T) {
 			t.Fatalf("dialer byte counters %+v", st)
 		}
 		e2eFinish(t, dc, sc)
+		// An ended session is remembered for Runtime.Close only by its Done
+		// channel, and only until it closed: reading Status drops it.
+		for _, rt := range []*Runtime{e.d, e.p} {
+			rt.Status()
+			rt.mu.Lock()
+			n := len(rt.draining)
+			rt.mu.Unlock()
+			if n != 0 {
+				t.Fatalf("Runtime %v still remembers %d ended sessions whose Done closed", rt.InstanceID(), n)
+			}
+		}
 		ds, ps := e.d.Status(), e.p.Status()
 		if ds.Sessions != (SessionCounts{}) || ps.Sessions != (SessionCounts{Tombstones: 1}) || e.d.table.inUse() != 0 || e.p.table.inUse() != 0 {
 			t.Fatalf("after the end: dialer %+v, passive %+v", ds.Sessions, ps.Sessions)

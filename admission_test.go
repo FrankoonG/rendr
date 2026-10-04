@@ -156,9 +156,11 @@ func TestOpenRefusedBeforeState_L44_L48(t *testing.T) {
 
 // TestOpenCapacityAndGoingAway_L48: the OPEN admission order of design
 // §6.2 on the wire. A tombstone is answered before any capacity check (a
-// retried OPEN gets its verdict even at MaxSessions); a closing Runtime or
-// Listener answers GOING_AWAY; MaxSessions (open, pending, lingering,
-// orphaned and still-dialling sessions of both roles) answers
+// retried OPEN gets its verdict even at MaxSessions); a closing Runtime
+// answers GOING_AWAY, a closed Listener of a running Runtime
+// CAPACITY(CodeBacklog) — never GOING_AWAY, which would make the dialer's
+// Peer give up on the whole instance (D21); MaxSessions (open, pending,
+// lingering, orphaned and still-dialling sessions of both roles) answers
 // CAPACITY(CodeMaxSessions); a full AcceptBacklog answers
 // CAPACITY(CodeBacklog) and returns the MaxSessions unit it reserved. A
 // JOIN is not subject to any of these (plan §3.5): on a closed Listener it
@@ -228,7 +230,7 @@ func TestOpenCapacityAndGoingAway_L48(t *testing.T) {
 				t.Fatal(err)
 			}
 			d.send(wire.TypeOpen, 0, wpOpen(wpSID(1), wire.KindStream, 1, nil))
-			d.expectOpenAck(wire.StatusGoingAway, 0)
+			d.expectOpenAck(wire.StatusCapacity, wire.CodeBacklog)
 			d.expectEOF()
 			j.send(wire.TypeJoin, 0, wpJoin(wpSID(2), 1, 0))
 			j.expectJoinAck(wire.StatusUnknownSession)
@@ -340,10 +342,10 @@ func TestTombstoneRejectsReplay_L47(t *testing.T) {
 	})
 
 	// The tombstones of real sessions, each ended by its own verdict path:
-	// Reject, AcceptTimeout, Listener.Close (GOING_AWAY), an opened session
-	// reset by its dialer, and a pending session the dialer withdrew. The
-	// replays arrive through another Listener of the same Runtime (the
-	// table is the Runtime's, L50).
+	// Reject, AcceptTimeout, Listener.Close (CAPACITY backlog: the Runtime
+	// runs on), an opened session reset by its dialer, and a pending session
+	// the dialer withdrew. The replays arrive through another Listener of
+	// the same Runtime (the table is the Runtime's, L50).
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, nil)
 		ln := wpListen(t, rt, ListenConfig{})
@@ -382,8 +384,8 @@ func TestTombstoneRejectsReplay_L47(t *testing.T) {
 		late := open(timed, wpSID(2))
 		finish(late, func() { late.expectOpenAck(wire.StatusCapacity, wire.CodeAcceptTimeout) })
 
-		away := open(closing, wpSID(3))
-		finish(away, func() { away.expectOpenAck(wire.StatusGoingAway, 0) })
+		shut := open(closing, wpSID(3))
+		finish(shut, func() { shut.expectOpenAck(wire.StatusCapacity, wire.CodeBacklog) })
 		synctest.Wait()
 		closing.Close()
 
@@ -425,7 +427,7 @@ func TestTombstoneRejectsReplay_L47(t *testing.T) {
 		}{
 			{1, wire.StatusRejected, 7, "no route"},
 			{2, wire.StatusCapacity, wire.CodeAcceptTimeout, ""},
-			{3, wire.StatusGoingAway, 0, ""},
+			{3, wire.StatusCapacity, wire.CodeBacklog, ""},
 			{4, wire.StatusUnknownSession, 0, ""},
 			{5, wire.StatusUnknownSession, 0, ""},
 		}

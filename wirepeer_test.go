@@ -76,13 +76,15 @@ type wpDialer struct {
 }
 
 // wpConnect creates a pipe, hands the passive end to ln.Handle (which must
-// accept it) and returns the dialer end.
+// accept it) and returns the dialer end. A cleanup closes the dialer end
+// (again), so that a failed test leaves no passive write blocked on it.
 func wpConnect(t testing.TB, ln *Listener, inst [16]byte, id uint32) *wpDialer {
 	t.Helper()
 	a, b := net.Pipe()
 	if err := ln.Handle(a); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
+	t.Cleanup(func() { b.Close() })
 	return &wpDialer{t: t, nc: b, inst: inst, id: id, txFseq: wire.FirstFseq, rxFseq: wire.FirstFseq}
 }
 

@@ -2,8 +2,12 @@ package rendr_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -85,28 +89,47 @@ func (r *relay) acceptLoop() {
 
 // serve pumps both directions; an EOF is passed on as a half-close, so
 // that the relay itself never closes a socket with unread data. Once both
-// directions ended the sockets are closed.
+// directions ended in a FIN, a TCP RST that a rendr end sends afterwards —
+// closing its socket with unread bytes, or before it read the relay's
+// FIN — arrives on a socket nobody reads any more: after rstWait each
+// socket is read once more (past its FIN a read returns at once), and any
+// error other than EOF or a timeout counts. Then the sockets are closed.
 func (r *relay) serve(p *relayPair) {
 	var wg sync.WaitGroup
 	var failed atomic.Bool
+	fail := func(err error) {
+		failed.Store(true)
+		r.lastEr.Store(err)
+	}
 	pump := func(dst, src *net.TCPConn) {
 		defer wg.Done()
 		_, err := io.Copy(dst, src)
 		if err != nil && !p.reset.Load() {
-			failed.Store(true)
-			r.lastEr.Store(err)
+			fail(err)
 			// Pass the failure on: the other end must not wait forever.
 			dst.SetLinger(0)
 			dst.Close()
 			src.Close()
 			return
 		}
-		dst.CloseWrite()
+		if err := dst.CloseWrite(); err != nil && !p.reset.Load() {
+			fail(err)
+		}
 	}
 	wg.Add(2)
 	go pump(p.b, p.a)
 	go pump(p.a, p.b)
 	wg.Wait()
+	if !failed.Load() && !p.reset.Load() {
+		time.Sleep(rstWait)
+		for _, c := range []*net.TCPConn{p.a, p.b} {
+			c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			var b [1]byte
+			if _, err := c.Read(b[:]); err != io.EOF && !p.reset.Load() && !isTimeout(err) {
+				fail(fmt.Errorf("after both FINs: %v", err))
+			}
+		}
+	}
 	if failed.Load() {
 		r.errs.Add(1)
 	}
@@ -115,6 +138,16 @@ func (r *relay) serve(p *relayPair) {
 	r.mu.Lock()
 	delete(r.pairs, p)
 	r.mu.Unlock()
+}
+
+// rstWait is how long the relay keeps a connection open after both FINs
+// to catch a late TCP RST from a rendr end (loopback delivers it at once).
+const rstWait = 25 * time.Millisecond
+
+// isTimeout reports a deadline expiry.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // reset aborts every connection the relay carries: SO_LINGER 0 and Close
@@ -381,20 +414,30 @@ type onlyWriter struct{ io.Writer }
 
 // TestSteadyStateZeroAllocs_L41_L54 (design §12.2, V4): the steady state of
 // a session costs no allocation end to end. Over a warmed carrier/tcp
-// loopback pair driven only through the public API (rendr-owned TCP
-// conns: vectored writes, the poller's deadline timers reset in place), a
-// 64 KiB Write on the dialer and the 64 KiB Read on the passive — the
-// application copies, one carrier batch write, the reader's frame decode,
-// the ACK and PING traffic they cause on both carriers — allocate nothing
-// (testing.AllocsPerRun counts every goroutine). Asserted in the non-race
-// lane; the race lane logs the figure.
+// loopback pair driven only through the public API (rendr-owned TCP conns:
+// vectored writes, the poller's deadline timers reset in place), at least
+// 4000 rounds of a 64 KiB Write on the dialer and the 64 KiB Read on the
+// passive — the application copies, the carrier batch writes, the reader's
+// frame decode, and the ACK, PING and PONG traffic on both carriers — cost
+// at most 40 allocations in total. The window is counted raw
+// (runtime.MemStats.Mallocs, every goroutine), not per run: the integer
+// division of testing.AllocsPerRun reports 0 for anything below one
+// allocation per round, so a PING or an ACK that allocated once per
+// interval would pass unseen. GC is off during the window (no pool is
+// cleared mid-window), one P runs (as in AllocsPerRun: no cross-P pool
+// refills), PingBusy is at its lowest setting (10 ms) and the window lasts
+// at least 50 PING intervals: an allocation per PING or per PONG exceeds
+// the bound, while the few one-off runtime allocations stay well below it.
+// Asserted in the non-race lane; the race lane runs a short window and
+// logs the figure.
 func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
-	d, err := rendr.NewRuntime(rendr.Config{})
+	cfg := rendr.Config{PingBusy: 10 * time.Millisecond}
+	d, err := rendr.NewRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	p, err := rendr.NewRuntime(rendr.Config{})
+	p, err := rendr.NewRuntime(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,25 +471,57 @@ func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 			t.Fatalf("Read = %d, %v", n, err)
 		}
 	}
-	for range 256 { // warm up: pools, rings, the poller's timers, ACK and PING state
+	const warm, maxAllocs = 256, 40
+	for range warm { // pools, rings, the poller's timers, ACK and PING state
 		round()
 	}
-	allocs := testing.AllocsPerRun(500, round)
+	// The window lasts at least 4000 rounds and 50 PING intervals: each
+	// carrier PINGs at least every PingBusy while it sends or receives DATA
+	// and the other answers every PING, so an allocation per PING (or per
+	// PONG) alone adds at least 2 × 49 > maxAllocs. The bound does not grow
+	// with the rounds a fast machine fits into the window.
+	minRounds, minWindow := 100*maxAllocs, 50*cfg.PingBusy
+	if loopbackRace {
+		minRounds, minWindow = warm, 0 // the race lane only logs the figure
+	}
+	f0 := dc.Status().Carriers[0].Frames
+	mallocs, rounds, el := countMallocs(minRounds, minWindow, round)
+	frames := dc.Status().Carriers[0].Frames - f0
 	if string(rbuf) != string(wbuf) {
 		t.Fatal("the last round delivered other bytes")
 	}
 	st := dc.Status()
-	if st.TxBytes != 757*64<<10 || len(st.Carriers) != 1 {
-		t.Fatalf("dialer status %+v", st)
+	if st.TxBytes != uint64(warm+rounds)*64<<10 || len(st.Carriers) != 1 || rounds < minRounds || el < minWindow {
+		t.Fatalf("load: %d rounds in %v, dialer status %+v", rounds, el, st)
 	}
+	t.Logf("%d allocations in %d rounds of 64 KiB (%v; the dialer's carrier wrote %d frames)", mallocs, rounds, el, frames)
 	if loopbackRace {
-		t.Logf("race lane: %v allocations per 64 KiB round trip (not asserted)", allocs)
-	} else if allocs != 0 {
-		t.Fatalf("%v allocations per 64 KiB Write → Read round trip, want 0", allocs)
+		t.Logf("race lane: not asserted")
+	} else if mallocs > maxAllocs {
+		t.Fatalf("%d allocations in %d steady-state round trips over %v, want at most %d", mallocs, rounds, el, maxAllocs)
 	}
 	dc.Close()
 	pc.Close()
 	waitEnded(t, dc, 30*time.Second)
 	waitEnded(t, pc, 30*time.Second)
 	lp.close(t)
+}
+
+// countMallocs runs f at least n times and for at least window, with the
+// garbage collector off and one P (as testing.AllocsPerRun), and returns
+// the raw number of heap allocations of every goroutine during the window,
+// the runs and the window's duration.
+func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs int, el time.Duration) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	start := time.Now()
+	for runs < n || time.Since(start) < window {
+		f()
+		runs++
+	}
+	el = time.Since(start)
+	runtime.ReadMemStats(&m1)
+	return m1.Mallocs - m0.Mallocs, runs, el
 }

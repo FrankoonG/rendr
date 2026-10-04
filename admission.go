@@ -13,45 +13,47 @@ import (
 // metadata over the limit and malformed OPENs are refused BAD_REQUEST before
 // any state exists (L44, L48); an existing entry routes the carrier
 // (tombstone: its verdict, §6.5; live session: AttachOpen, L47); then a
-// closing Runtime or Listener answers GOING_AWAY, MaxSessions and the
-// Listener's backlog answer CAPACITY; otherwise both reservations are taken,
-// the pending session is created unstarted outside every admission lock and
-// inserted with insert-or-get (D28): the winner starts it and queues it for
-// Accept; a loser releases both reservations and routes its carrier to the
-// entry that won.
-func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time) {
+// closing Runtime answers GOING_AWAY, a closed Listener (whose Runtime runs
+// on) CAPACITY(CodeBacklog), MaxSessions and the Listener's backlog answer
+// CAPACITY; otherwise both reservations are taken, the pending session is
+// created unstarted outside every admission lock and inserted with
+// insert-or-get (D28): the winner starts it and queues it for Accept; a
+// loser releases both reservations and routes its carrier to the entry that
+// won. It reports whether it refused the carrier itself (an answer written
+// with WriteAndClose, which the handshake goroutine then awaits).
+func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time) (refused bool) {
 	c := h.Conn
 	if h.MetaTooLarge {
 		answerOpen(c, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeMetadataSize}, deadline)
-		return
+		return true
 	}
 	o, err := wire.ParseOpen(h.Payload, rt.eff.cfg.Handshake.MaxMetadata)
 	if code, bad := openBadRequest(h.Payload, &o, err); bad {
 		answerOpen(c, wire.OpenAck{Status: wire.StatusBadRequest, Code: code}, deadline)
-		return
+		return true
 	}
 	key := passiveKey(InstanceID(h.Preface.Instance), SessionID(o.SID))
 	if r := rt.table.lookup(key, time.Now()); r.found {
-		routeOpen(r, c, deadline)
-		return
+		return routeOpen(r, c, deadline)
 	}
-	if rt.closing.Load() || ln.isClosed() {
-		answerOpen(c, wire.OpenAck{Status: wire.StatusGoingAway}, deadline)
-		return
+	if st, code := ln.refusal(); st != wire.StatusOK {
+		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
+		return true
 	}
 	if !rt.table.reserve() {
 		answerOpen(c, wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeMaxSessions}, deadline)
-		return
+		return true
 	}
 	switch ln.reserve() {
 	case reserveClosed:
 		rt.table.unreserve()
-		answerOpen(c, wire.OpenAck{Status: wire.StatusGoingAway}, deadline)
-		return
+		st, code := ln.refusal()
+		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
+		return true
 	case reserveFull:
 		rt.table.unreserve()
 		answerOpen(c, wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeBacklog}, deadline)
-		return
+		return true
 	}
 	spec := session.PassiveSpec{
 		SID:            o.SID,
@@ -67,8 +69,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time)
 		// carrier goes to the entry that won (D28).
 		ln.unreserve()
 		rt.table.unreserve()
-		routeOpen(r, c, deadline)
-		return
+		return routeOpen(r, c, deadline)
 	}
 	ln.bind(s)
 	s.Start()
@@ -78,6 +79,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time)
 		s.Shutdown()
 	}
 	ln.enqueue(s)
+	return false
 }
 
 // openBadRequest decides whether an OPEN is answered BAD_REQUEST and with
@@ -110,18 +112,22 @@ func openBadRequest(payload []byte, o *wire.Open, err error) (code uint32, bad b
 // GOING_AWAY for a session that never opened, UNKNOWN_SESSION for one that
 // did or was withdrawn); a live session takes it with AttachOpen (pending:
 // parked until the verdict; open: adopted with OPEN_ACK(OK)) or returns the
-// verdict to answer (CAPACITY CodeCarriers, an ended session's verdict).
-func routeOpen(r lookupResult[*session.Session], c *carrier.Conn, deadline time.Time) {
+// verdict to answer (CAPACITY CodeCarriers, an ended session's verdict). It
+// reports whether it answered the carrier itself.
+func routeOpen(r lookupResult[*session.Session], c *carrier.Conn, deadline time.Time) (refused bool) {
 	switch {
 	case r.tomb:
 		answerOpen(c, r.verdict.OpenAck(), deadline)
 	case r.sess == nil: // a passive key never holds a dialer placeholder
 		answerOpen(c, wire.OpenAck{Status: wire.StatusUnknownSession}, deadline)
 	default:
-		if taken, v := r.sess.AttachOpen(c); !taken {
-			answerOpen(c, v.OpenAck(), deadline)
+		taken, v := r.sess.AttachOpen(c)
+		if taken {
+			return false
 		}
+		answerOpen(c, v.OpenAck(), deadline)
 	}
+	return true
 }
 
 // admitJoin routes a JOIN carrier (design §6.3; L48: no OPEN capacity,
@@ -130,22 +136,26 @@ func routeOpen(r lookupResult[*session.Session], c *carrier.Conn, deadline time.
 // another dialer instance cannot find the key, plan §3.4). A live session
 // decides everything else under its own lock (pending: BAD_REQUEST; ended:
 // UNKNOWN_SESSION; mode; carrier limit; rxNext), and the root writes the
-// status of a JOIN it did not take.
-func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time) {
+// status of a JOIN it did not take. It reports whether it answered the
+// carrier itself.
+func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time) (refused bool) {
 	c := h.Conn
 	j, err := wire.ParseJoin(h.Payload)
 	if err != nil {
 		answerJoin(c, wire.StatusBadRequest, deadline)
-		return
+		return true
 	}
 	r := rt.table.lookup(passiveKey(InstanceID(h.Preface.Instance), SessionID(j.SID)), time.Now())
 	if !r.found || r.tomb || r.sess == nil {
 		answerJoin(c, wire.StatusUnknownSession, deadline)
-		return
+		return true
 	}
-	if taken, st := r.sess.Join(c, &j); !taken {
-		answerJoin(c, st, deadline)
+	taken, st := r.sess.Join(c, &j)
+	if taken {
+		return false
 	}
+	answerJoin(c, st, deadline)
+	return true
 }
 
 // lnRegistry is the session.Registry of the passive sessions a Listener

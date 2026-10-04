@@ -19,8 +19,9 @@ import (
 // admitSessionless starts h's carrier as a sessionless carrier and counts
 // it, or refuses it: CLOSE(capacity) at either cap, GOAWAY when the Runtime
 // is closing (its Close may already have taken its snapshot of these
-// carriers). On success the caller watches the carrier (watchSessionless)
-// on the handshake goroutine, now a member of rt.slg.
+// carriers); the handshake goroutine then awaits the refusal
+// (awaitRefusal). On success the caller watches the carrier
+// (watchSessionless) on the handshake goroutine, now a member of rt.slg.
 func (rt *Runtime) admitSessionless(h *carrier.Hello, deadline time.Time) (*carrier.Conn, InstanceID, bool) {
 	c, inst := h.Conn, InstanceID(h.Preface.Instance)
 	rt.mu.Lock()

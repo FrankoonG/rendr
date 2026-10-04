@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -23,8 +24,10 @@ func (listenerSource) isSource() {}
 
 // FromListener is a pull source: one accept goroutine per source hands every
 // accepted conn to the handshake. Ownership of l moves to the Listener, which
-// closes it exactly once on Close. Temporary accept errors (EMFILE) back off
-// 5 ms → 100 ms; one failing source never stops another (L50).
+// closes it exactly once on Close; l must therefore be given to one Listener
+// only, once (Listen rejects a ListenConfig that repeats it). Temporary
+// accept errors (EMFILE) back off 5 ms → 100 ms; one failing source never
+// stops another (L50).
 func FromListener(l net.Listener) Source { return listenerSource{l: l} }
 
 // ListenConfig configures a Listener.
@@ -44,7 +47,9 @@ const (
 var errNilConn = errors.New("rendr: Handle: nil conn")
 
 // listenSources validates a ListenConfig's sources: every one must come
-// from FromListener with a non-nil net.Listener.
+// from FromListener with a non-nil net.Listener, and no net.Listener may
+// appear twice (it would get two accept loops and two Closes, while
+// FromListener promises exactly one).
 func listenSources(srcs []Source) ([]net.Listener, error) {
 	out := make([]net.Listener, 0, len(srcs))
 	for i, s := range srcs {
@@ -52,9 +57,25 @@ func listenSources(srcs []Source) ([]net.Listener, error) {
 		if !ok || ls.l == nil {
 			return nil, fmt.Errorf("rendr: Listen: source %d is not FromListener of a non-nil net.Listener", i)
 		}
+		for j, prev := range out {
+			if sameListener(prev, ls.l) {
+				return nil, fmt.Errorf("rendr: Listen: source %d repeats the net.Listener of source %d", i, j)
+			}
+		}
 		out = append(out, ls.l)
 	}
 	return out, nil
+}
+
+// sameListener reports whether a and b are the same net.Listener value; an
+// implementation whose dynamic type is not comparable is never the same.
+func sameListener(a, b net.Listener) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
 }
 
 // Listener admits carriers and hands new stream sessions to the application
@@ -84,7 +105,8 @@ type Listener struct {
 type pendItem struct {
 	s          *session.Session
 	prev, next *pendItem
-	queued     bool // linked in the queue (not yet returned by Accept)
+	queued     bool        // linked in the queue (not yet returned by Accept)
+	shut       atomic.Bool // the Listener closed while the session held its slot
 }
 
 func newListener(rt *Runtime, cfg ListenConfig, srcs []net.Listener) *Listener {
@@ -233,7 +255,7 @@ func (ln *Listener) Accept(ctx context.Context) (*PendingConn, error) {
 			if it.s.State() != session.StatePending {
 				continue // withdrawn or timed out: its Registry.Ended frees the slot
 			}
-			return &PendingConn{s: it.s, rt: ln.rt}, nil
+			return &PendingConn{s: it.s, rt: ln.rt, it: it}, nil
 		}
 		ln.mu.Unlock()
 		select {
@@ -267,12 +289,22 @@ func (ln *Listener) passSignal() {
 }
 
 // Close stops the sources (closing every FromListener listener exactly
-// once, bounded), answers every pending session OPEN_ACK(GOING_AWAY), and
-// makes Accept and Handle return net.ErrClosed. Confirmed sessions are not
-// affected. Idempotent.
+// once, bounded), answers every session that is still pending — and every
+// OPEN whose handshake on this Listener completes afterwards —
+// OPEN_ACK(CAPACITY, backlog), so the dialer's Dial returns ErrCapacity, and
+// makes Accept and Handle return net.ErrClosed; Confirm and Reject of a
+// PendingConn it refused return net.ErrClosed. Confirmed sessions are not
+// affected (their carriers may arrive through any Listener), and the
+// Runtime keeps admitting through its other Listeners: a Listener's Close
+// is not the instance going away, so it never answers GOING_AWAY, which
+// makes a dialer's Peer stop OPENing to the whole instance (D21); only
+// Runtime.Close does. Idempotent.
 func (ln *Listener) Close() error {
-	for _, s := range ln.shut() {
-		s.RefusePending(wire.StatusGoingAway, 0)
+	if refuse := ln.shut(); len(refuse) > 0 {
+		st, code := ln.refusal() // GOING_AWAY only when Runtime.Close runs concurrently
+		for _, s := range refuse {
+			s.RefusePending(st, code)
+		}
 	}
 	ln.loops.wait(time.Now().Add(ln.rt.eff.timing.AbandonWait), ln.rt.abandon)
 	ln.rt.mu.Lock()
@@ -283,8 +315,9 @@ func (ln *Listener) Close() error {
 
 // shut closes the Listener once: Accept and Handle fail from now on, every
 // source is closed on a guarded goroutine (an embedder Close may block or
-// panic, L50/L51), and the sessions holding a backlog slot are returned for
-// the caller to refuse with GOING_AWAY. Later calls return nothing.
+// panic, L50/L51), and the sessions holding a backlog slot are marked and
+// returned for the caller to refuse (Listener.Close; Runtime.Close shuts
+// them down instead). Later calls return nothing.
 func (ln *Listener) shut() []*session.Session {
 	ln.mu.Lock()
 	if ln.closed {
@@ -293,7 +326,11 @@ func (ln *Listener) shut() []*session.Session {
 	}
 	ln.closed = true
 	close(ln.done)
-	refuse := mapKeys(ln.pending)
+	refuse := make([]*session.Session, 0, len(ln.pending))
+	for s, it := range ln.pending {
+		it.shut.Store(true) // before the refusal: a Confirm that loses to it sees the mark
+		refuse = append(refuse, s)
+	}
 	ln.mu.Unlock()
 	for _, l := range ln.srcs {
 		ln.loops.add()
@@ -304,6 +341,22 @@ func (ln *Listener) shut() []*session.Session {
 		}()
 	}
 	return refuse
+}
+
+// refusal is the answer to an OPEN this Listener cannot take any more
+// (design §6.2, §6.8): GOING_AWAY while the Runtime closes — the whole
+// instance goes away and the dialer's Peer never OPENs to it again (D21) —
+// else CAPACITY(CodeBacklog) once this Listener closed: the Runtime keeps
+// running, so the instance must not be recorded as gone away. StatusOK
+// while the Listener admits.
+func (ln *Listener) refusal() (wire.AckStatus, uint32) {
+	switch {
+	case ln.rt.closing.Load():
+		return wire.StatusGoingAway, 0
+	case ln.isClosed():
+		return wire.StatusCapacity, wire.CodeBacklog
+	}
+	return wire.StatusOK, 0
 }
 
 func (ln *Listener) isClosed() bool {
@@ -354,8 +407,9 @@ func (ln *Listener) bind(s *session.Session) {
 
 // enqueue makes the started session s available to Accept and wakes one.
 // A session that already ended is skipped; on a closed Listener it is
-// refused with GOING_AWAY instead (Close may have run before its slot was
-// bound; RefusePending of a session Close already refused does nothing).
+// refused instead (refusal: CAPACITY, or GOING_AWAY while the Runtime
+// closes), as Close may have run before its slot was bound; RefusePending
+// of a session that was already refused or shut down does nothing.
 func (ln *Listener) enqueue(s *session.Session) {
 	ln.mu.Lock()
 	it := ln.pending[s]
@@ -365,7 +419,7 @@ func (ln *Listener) enqueue(s *session.Session) {
 	}
 	if ln.closed {
 		ln.mu.Unlock()
-		s.RefusePending(wire.StatusGoingAway, 0)
+		s.RefusePending(ln.refusal())
 		return
 	}
 	it.prev = ln.tail
@@ -415,6 +469,7 @@ func (ln *Listener) unlinkLocked(it *pendItem) {
 type PendingConn struct {
 	s  *session.Session
 	rt *Runtime
+	it *pendItem // its backlog slot: marked when the Listener closed
 }
 
 // ID returns the session ID.
@@ -437,7 +492,7 @@ func (p *PendingConn) PeerInstance() InstanceID { return InstanceID(p.s.PeerInst
 // a second decision.
 func (p *PendingConn) Confirm() (*Conn, error) {
 	if err := p.s.Confirm(); err != nil {
-		return nil, err
+		return nil, p.decisionErr(err)
 	}
 	return newConn(p.rt, p.s), nil
 }
@@ -446,5 +501,16 @@ func (p *PendingConn) Confirm() (*Conn, error) {
 // truncated to 255 bytes. The dialer's Dial returns *RejectError{code, msg};
 // a retried OPEN gets the same answer. Errors as for Confirm.
 func (p *PendingConn) Reject(code uint32, msg string) error {
-	return p.s.Reject(code, msg)
+	return p.decisionErr(p.s.Reject(code, msg))
+}
+
+// decisionErr is the error of a Confirm or Reject: the session's own,
+// except that a session its Listener's Close refused — answered CAPACITY,
+// so that the dialer does not take the instance for gone away — reports
+// net.ErrClosed like every call on a closed Listener (design §9).
+func (p *PendingConn) decisionErr(err error) error {
+	if err != nil && p.it != nil && p.it.shut.Load() && errors.Is(err, ErrCapacity) {
+		return net.ErrClosed
+	}
+	return err
 }

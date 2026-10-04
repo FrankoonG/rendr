@@ -36,9 +36,10 @@ type Runtime struct {
 	backlog atomic.Int64 // pending sessions across Listeners (Status.AcceptBacklog[0])
 	closing atomic.Bool  // set under mu by Close; read lock-free on admission paths
 
-	hsg  *group // handshake goroutines (accept loops and Handle start them)
-	slg  *group // sessionless carriers' watchers
-	dial *group // Peer.Dial calls inside session.Dial
+	hsg  *group        // handshake goroutines (accept loops and Handle start them) and their conn closers
+	slg  *group        // sessionless carriers' watchers
+	dial *group        // Peer.Dial calls inside session.Dial
+	cut  chan struct{} // closed by Close at its close bound: refusals still in flight end (awaitRefusal)
 
 	mu        sync.Mutex // a leaf (design §3.2)
 	closed    chan struct{}
@@ -47,7 +48,7 @@ type Runtime struct {
 	listeners map[*Listener]struct{}
 	peers     map[*Peer]struct{}
 	sl        map[*carrier.Conn]struct{} // live sessionless carriers
-	draining  []*session.Session         // ended sessions whose Done may still be open (joined by Close)
+	draining  []<-chan struct{}          // Done of ended sessions that may still run (joined by Close)
 	pruneAt   int
 }
 
@@ -91,6 +92,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		hsg:       newGroup(),
 		slg:       newGroup(),
 		dial:      newGroup(),
+		cut:       make(chan struct{}),
 		closed:    make(chan struct{}),
 		adjust:    adj,
 		listeners: make(map[*Listener]struct{}),
@@ -165,6 +167,7 @@ func (rt *Runtime) Status() Status {
 	now := time.Now()
 	rt.mu.Lock()
 	adj := slices.Clone(rt.adjust)
+	rt.pruneDrainingLocked()
 	rt.mu.Unlock()
 	dropped, panics := rt.ev.counters()
 	return Status{
@@ -183,12 +186,14 @@ func (rt *Runtime) Status() Status {
 }
 
 // Close shuts the Runtime down (idempotent, bounded): new handshakes are
-// answered PREFACE_ACK(GOING_AWAY); every Listener closes (pending sessions
-// answered GOING_AWAY); every session sends RST(AbortGoingAway) and GOAWAY
-// and ends locally with net.ErrClosed; every Peer stops probing; sessionless
-// carriers get GOAWAY; then every goroutine is joined within about 2 s,
-// stragglers stuck in embedder code are counted in Status.Abandoned. Later
-// calls on the Runtime and its objects return net.ErrClosed.
+// answered PREFACE_ACK(GOING_AWAY); every Listener closes; every pending
+// session is answered GOING_AWAY; every open session sends RST(AbortGoingAway)
+// and GOAWAY and ends locally with net.ErrClosed; every Peer stops probing;
+// sessionless carriers get GOAWAY; an admission refusal still being written
+// gets the close bound, min(1 s, DeadMax), and is then cut; then every
+// goroutine is joined within about 2 s, and stragglers stuck in embedder code
+// are counted in Status.Abandoned. Later calls on the Runtime and its objects
+// return net.ErrClosed.
 //
 // A concurrent or later Close waits for the first one to finish, except
 // when it is called from Config.OnEvent (it then returns at once: the first
@@ -210,27 +215,16 @@ func (rt *Runtime) Close() error {
 	rt.mu.Unlock()
 	rt.cancel(net.ErrClosed) // in-flight Dials withdraw (session.Dial returns within 100 ms)
 
-	t0 := time.Now()
-	wait := rt.eff.timing.AbandonWait
-	kill := min(time.Second, rt.eff.cfg.DeadMax)
-	killAt := t0.Add(kill)
-	// The own bound of a session after Shutdown and of a Peer's probe run
-	// after Health.Close (design §4.7, §0.9 X2): lanes whose CLOSE is
-	// unwritten are killed at the Kill bound and their stuck parts
-	// abandoned AbandonWait later; dial attempts still running are
-	// abandoned 2·AbandonWait after their cancellation.
-	bound := t0.Add(max(kill+wait, 2*wait) + closeSlack)
-	joinBy := t0.Add(wait) // handshakes, accept loops, in-flight Dials
-
-	// Step 2: every Listener (sources closed once, pending → GOING_AWAY).
-	var refuse []*session.Session
+	// Steps 2–5 only post work: nothing before the joins waits for a session
+	// or an embedder call, so a large table or backlog cannot eat into the
+	// join bounds, which count from the end of step 5.
+	//
+	// Step 2: every Listener stops (its sources are closed once). Its
+	// pending sessions are answered GOING_AWAY by their Shutdown in step 3.
 	for _, ln := range lns {
-		refuse = append(refuse, ln.shut()...)
+		ln.shut()
 	}
-	for _, s := range refuse {
-		s.RefusePending(wire.StatusGoingAway, 0)
-	}
-	// Step 3: every session.
+	// Step 3: every session; pending ones answer GOING_AWAY.
 	for _, s := range rt.table.live() {
 		s.Shutdown()
 	}
@@ -243,15 +237,29 @@ func (rt *Runtime) Close() error {
 			p.shutdown()
 		}()
 	}
-	// Step 5: sessionless carriers; unfinished handshakes are closed (their
-	// closers join the handshake group: a stuck embedder Close is counted
-	// by the join below, before Close returns).
+	// Step 5: sessionless carriers; unfinished handshakes are closed (the
+	// drain is final: no handshake starts afterwards). Their closers are
+	// members of the handshake group, so a stuck embedder Close is counted
+	// before Close returns (L52).
 	for _, c := range sl {
 		c.GoAway()
 	}
 	for _, nc := range rt.hs.drain() {
-		rt.closeHandshakeConn(nc)
+		rt.hsg.add()
+		rt.closeWatched(nc)
 	}
+
+	t1 := time.Now()
+	wait := rt.eff.timing.AbandonWait
+	kill := min(time.Second, rt.eff.cfg.DeadMax)
+	killAt := t1.Add(kill) // the close bound of a CLOSE frame (§4.7) and of a refusal
+	joinBy := t1.Add(wait) // accept loops, in-flight Dials
+	// The own bound of a session after Shutdown and of a Peer's probe run
+	// after Health.Close (design §4.7, §0.9 X2): lanes whose CLOSE is
+	// unwritten are killed at the Kill bound and their stuck parts
+	// abandoned AbandonWait later; dial attempts still running are
+	// abandoned 2·AbandonWait after their cancellation.
+	bound := t1.Add(max(kill+wait, 2*wait) + closeSlack)
 
 	// Step 7 (W14: before the event queue). After the handshakes, accept
 	// loops and in-flight Dials no session can appear any more; one that
@@ -264,13 +272,12 @@ func (rt *Runtime) Close() error {
 	for _, ln := range lns {
 		ln.loops.wait(joinBy, rt.abandon)
 	}
-	rt.hsg.wait(joinBy, rt.abandon)
 	rt.dial.wait(joinBy, nil)
-	join := rt.table.live()
-	rt.mu.Lock()
-	join = append(join, rt.draining...)
-	rt.mu.Unlock()
-
+	// At the close bound: sessionless carriers whose CLOSE is still
+	// unwritten are killed, and refusals still being written or drained are
+	// cut (their conns closed, awaitRefusal); AbandonWait later every
+	// handshake goroutine still running is stuck in embedder code.
+	rt.hsg.wait(killAt, nil)
 	if !rt.slg.wait(killAt, nil) {
 		for _, c := range sl {
 			if !c.CloseSent() {
@@ -278,7 +285,14 @@ func (rt *Runtime) Close() error {
 			}
 		}
 	}
-	waitSessions(join, bound)
+	close(rt.cut)
+	rt.hsg.wait(killAt.Add(wait), rt.abandon)
+	join := doneOf(rt.table.live())
+	rt.mu.Lock()
+	join = append(join, rt.draining...)
+	rt.mu.Unlock()
+
+	waitDone(join, bound)
 	rt.slg.wait(bound, nil)
 	health.wait(bound, nil)
 
@@ -299,18 +313,27 @@ func (rt *Runtime) onEventWorker() bool {
 	return rt.ev != nil && goid() == rt.ev.worker.Load()
 }
 
-// waitSessions waits until every session's Done closed or deadline. A
-// session that misses its own bound is not abandoned: rendr's own goroutines
-// always end (design §6.8); Close only stops waiting.
-func waitSessions(ss []*session.Session, deadline time.Time) {
-	if len(ss) == 0 {
+// doneOf returns the Done channels of ss.
+func doneOf(ss []*session.Session) []<-chan struct{} {
+	out := make([]<-chan struct{}, len(ss))
+	for i, s := range ss {
+		out[i] = s.Done()
+	}
+	return out
+}
+
+// waitDone waits until every channel in done (sessions' Done) closed or
+// deadline. A session that misses its own bound is not abandoned: rendr's
+// own goroutines always end (design §6.8); Close only stops waiting.
+func waitDone(done []<-chan struct{}, deadline time.Time) {
+	if len(done) == 0 {
 		return
 	}
 	t := time.NewTimer(time.Until(deadline))
 	defer t.Stop()
-	for _, s := range ss {
+	for _, ch := range done {
 		select {
-		case <-s.Done():
+		case <-ch:
 		case <-t.C:
 			return
 		}
@@ -330,28 +353,33 @@ func (rt *Runtime) gate(*wire.Preface) wire.PrefaceStatus {
 	return wire.PrefaceOK
 }
 
-// noteEnded records an ended session until its Done closes, so that Close
-// joins it even when it no longer has a table entry (a passive tombstone
-// keeps no session; a dialer entry is removed; a failed Dial never had
-// one). The Registries call it before they remove the table entry, so a
-// session is always in the table or in this list (or both) for Close's
-// snapshot. Sessions whose Done closed are pruned when the list doubled.
+// noteEnded records an ended session's Done until it closes, so that Close
+// joins the session even when it no longer has a table entry (a passive
+// tombstone keeps no session; a dialer entry is removed; a failed Dial
+// never had one). The Registries call it before they remove the table
+// entry, so a session is always in the table or in this list (or both) for
+// Close's snapshot. Only the Done channel is kept, never the session
+// itself, so an ended session's memory is not held here. Closed channels
+// are pruned when the list doubled and whenever Status is read.
 func (rt *Runtime) noteEnded(s *session.Session) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if isClosed(rt.closed) {
 		return
 	}
-	rt.draining = append(rt.draining, s)
-	if len(rt.draining) < rt.pruneAt {
-		return
+	rt.draining = append(rt.draining, s.Done())
+	if len(rt.draining) >= rt.pruneAt {
+		rt.pruneDrainingLocked()
 	}
+}
+
+// pruneDrainingLocked drops the Done channels that closed and sets the
+// next count-based prune at twice what is kept (at least minPruneAt).
+func (rt *Runtime) pruneDrainingLocked() {
 	kept := rt.draining[:0]
-	for _, x := range rt.draining {
-		select {
-		case <-x.Done():
-		default:
-			kept = append(kept, x)
+	for _, ch := range rt.draining {
+		if !isClosed(ch) {
+			kept = append(kept, ch)
 		}
 	}
 	clear(rt.draining[len(kept):])
@@ -382,9 +410,10 @@ func mapKeys[K comparable, V any](m map[K]V) []K {
 // wait returns when every member exited, or at the deadline; members still
 // running then — stuck in embedder code — are counted once in the
 // abandoned-call pool and leave it when they finally exit. No member may be
-// added after a wait that gave up (every group stops admitting members
-// before it is joined: a closed Listener starts no handshake, a closing
-// Runtime no Dial and no sessionless carrier).
+// added after a wait with a pool gave up (every group stops admitting
+// members before it is joined: a closed Listener starts no handshake, a
+// drained handshake table admits none, a closing Runtime starts no Dial and
+// no sessionless carrier); a member may add another while it still runs.
 type group struct {
 	mu   sync.Mutex
 	n    int           // members running
@@ -461,4 +490,34 @@ func (g *group) running() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.n
+}
+
+// goWatched runs f — an embedder call such as a conn's Close — on a new
+// goroutine that already holds a membership of g (the caller added it),
+// and counts that goroutine in pool when f is still running d later, also
+// when nobody joins g then (D20: a full pool makes new carriers fail fast).
+// The watch that counts it also ends its membership of g, so a later wait
+// neither waits for it nor counts it again; it leaves pool when f returns.
+// A wait that counted it first is settled by the watch's done (g's owed
+// count makes that done leave pool once), so the goroutine is always
+// counted exactly once.
+func (g *group) goWatched(pool *carrier.AbandonPool, d time.Duration, f func()) {
+	var state atomic.Int32 // 0 running, 1 returned in time, 2 counted by the watch
+	t := time.AfterFunc(d, func() {
+		if state.CompareAndSwap(0, 2) {
+			pool.Adopt()
+			g.done(pool)
+		}
+	})
+	go func() {
+		defer func() { // also on runtime.Goexit inside f (L51)
+			if state.CompareAndSwap(0, 1) {
+				t.Stop()
+				g.done(pool)
+				return
+			}
+			pool.Leave()
+		}()
+		f()
+	}()
 }

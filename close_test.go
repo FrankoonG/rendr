@@ -25,7 +25,8 @@ import (
 // is closed at once (not at its deadline), every probe carrier gets
 // GOAWAY then CLOSE, Close returns within its ≈ 2 s bound, nothing is
 // abandoned, every counter is back to zero, later calls return
-// net.ErrClosed, and the bubble ends with no goroutine left.
+// net.ErrClosed, and the bubble ends with no goroutine left. Further
+// cases: live sessions and Dials in flight; admission refusals in flight.
 func TestRuntimeCloseJoinsEverything(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var events atomic.Int32
@@ -176,6 +177,55 @@ func TestRuntimeCloseJoinsEverything(t *testing.T) {
 			t.Fatalf("rendr goroutines left after both Close calls: %v", left)
 		}
 		e.close()
+	})
+
+	// With admission refusals in flight (design §6.8 step 7, L52): a
+	// scripted dialer's OPEN (mode 7) is refused BAD_REQUEST and one of
+	// its JOINs UNKNOWN_SESSION, but the dialer never reads the answers, so
+	// both refusals block in their write on the unbuffered pipes; a third
+	// refusal (BAD_REQUEST) is read at once, and its carrier then waits in
+	// the L05 drain for the dialer's EOF. Close gives the refusals still in
+	// flight the close bound, min(1 s, DeadMax), then cuts them — each
+	// dialer sees its conn closed — and joins their carriers: it returns
+	// exactly at that bound with nothing abandoned, and no rendr goroutine
+	// outlives it.
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{})
+		mute := wpConnect(t, ln, wpInst(0x61), 1)
+		mute.hello(rt)
+		mute.send(wire.TypeOpen, 0, wpOpen(wpSID(1), wire.KindStream, 7, nil))
+		muteJoin := wpConnect(t, ln, wpInst(0x61), 2)
+		muteJoin.hello(rt)
+		muteJoin.send(wire.TypeJoin, 0, wpJoin(wpSID(2), 1, 0))
+		reader := wpConnect(t, ln, wpInst(0x61), 3)
+		reader.hello(rt)
+		reader.send(wire.TypeOpen, 0, wpOpen(wpSID(3), wire.KindStream, 7, nil))
+		reader.expectOpenAck(wire.StatusBadRequest, wire.CodeBadMode)
+		synctest.Wait()
+		if _, by := rendrGoroutines(); by["github.com/FrankoonG/rendr/v2/internal/carrier.(*Conn).closer"] != 3 {
+			t.Fatalf("stimulus: refusals in flight %v, want 3 carrier closers", by)
+		}
+		start := time.Now()
+		rt.Close()
+		if el, kill := time.Since(start), min(time.Second, rt.eff.cfg.DeadMax); el != kill {
+			t.Fatalf("Runtime.Close took %v, want the close bound %v", el, kill)
+		}
+		for i, d := range []*wpDialer{mute, muteJoin, reader} {
+			var b [1]byte
+			if n, err := d.nc.Read(b[:]); n != 0 || !errors.Is(err, io.EOF) {
+				t.Fatalf("dialer %d after Close: (%d, %v), want its conn closed", i+1, n, err)
+			}
+			d.close()
+		}
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 {
+			t.Fatalf("rendr goroutines after Close returned: %v", left)
+		}
+		if st := rt.Status(); st.Abandoned != 0 || rt.hsg.running() != 0 {
+			t.Fatalf("after Close: %+v, %d handshake goroutines", st, rt.hsg.running())
+		}
+		wpNoState(t, rt)
 	})
 }
 
@@ -522,8 +572,10 @@ func (c *malConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
 // only Close, one whose Close blocks — each closed exactly once. A session
 // lane's CLOSE is stuck behind a write that ignores deadlines and Close
 // (C24): the lane is killed at the close bound and its writer, stuck in
-// the embedder's Write, is the only goroutine left. When the embedder calls
-// finally return, the pool empties.
+// the embedder's Write, is the only goroutine left. Further cases: a dial
+// attempt stuck in a deaf conn's Read, and an admission refusal stuck in
+// the embedder's Write. When the embedder calls finally return, the pool
+// empties.
 func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: 500 * time.Millisecond})
@@ -647,7 +699,76 @@ func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 		}
 		wpNoState(t, rt)
 	})
+
+	// An admission refusal whose write ignores deadlines and Close: the
+	// conn passes the handshake, but its OPEN_ACK(BAD_REQUEST) write blocks
+	// in the embedder. Runtime.Close gives the refusal the close bound, cuts
+	// it (the conn is closed: the dialer sees EOF), and AbandonWait later
+	// counts the goroutine stuck in the embedder's Write in Status.Abandoned
+	// before it returns. When the Write finally returns nothing is left and
+	// the conn was closed exactly once.
+	synctest.Test(t, func(t *testing.T) {
+		const wait = 500 * time.Millisecond
+		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: wait})
+		ln := wpListen(t, rt, ListenConfig{})
+		a, b := net.Pipe()
+		sw := &stuckWriteConn{Conn: a, release: make(chan struct{})}
+		t.Cleanup(sw.free)
+		if err := ln.Handle(sw); err != nil {
+			t.Fatal(err)
+		}
+		d := &wpDialer{t: t, nc: b, inst: wpInst(0x65), id: 1, txFseq: wire.FirstFseq, rxFseq: wire.FirstFseq}
+		t.Cleanup(d.close)
+		d.hello(rt)
+		d.send(wire.TypeOpen, 0, wpOpen(wpSID(1), wire.KindStream, 7, nil))
+		synctest.Wait()
+		if n := sw.writes.Load(); n != 2 {
+			t.Fatalf("stimulus: %d writes, want the PREFACE_ACK and the stuck refusal", n)
+		}
+		start := time.Now()
+		rt.Close()
+		kill := min(time.Second, rt.eff.cfg.DeadMax)
+		if el := time.Since(start); el != kill+wait {
+			t.Fatalf("Runtime.Close took %v, want the close bound %v plus AbandonWait %v", el, kill, wait)
+		}
+		if n := rt.Status().Abandoned; n != 1 {
+			t.Fatalf("abandoned %d at Close's return, want the refusal stuck in the embedder's Write", n)
+		}
+		d.expectEOF()
+		sw.free()
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 || rt.Status().Abandoned != 0 || sw.closes.Load() != 1 {
+			t.Fatalf("after the Write returned: %v, abandoned %d, conn closed %d times", left, rt.Status().Abandoned, sw.closes.Load())
+		}
+		wpNoState(t, rt)
+	})
 }
+
+// stuckWriteConn passes the handshake — reads, and its first write (the
+// PREFACE_ACK), go through to a net.Pipe — but blocks every later Write,
+// ignoring deadlines and Close, until freed (L52).
+type stuckWriteConn struct {
+	net.Conn
+	writes   atomic.Int32
+	closes   atomic.Int32
+	release  chan struct{}
+	freeOnce sync.Once
+}
+
+func (c *stuckWriteConn) Write(p []byte) (int, error) {
+	if c.writes.Add(1) > 1 {
+		<-c.release
+		return 0, io.ErrClosedPipe
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *stuckWriteConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+func (c *stuckWriteConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
 
 // TestPassiveRuntimeCloseGoesAway (design §6.8, D21): when the passive
 // Runtime closes, its open session sends RST(GoingAway) and GOAWAY: the
@@ -695,5 +816,186 @@ func TestPassiveRuntimeCloseGoesAway(t *testing.T) {
 		p2.Close()
 		wpNoState(t, d)
 		wpNoState(t, p2)
+	})
+}
+
+// TestCloseDrainIsFinal_L52 (design §6.8 step 5, L52): no handshake starts
+// after Runtime.Close drained the handshake slots. A Handle that counted
+// its handshake before Close closed the Listener but takes its slot only
+// after the drain (the window between Listener.Handle's two halves,
+// widened here) gets no slot: its conn is closed at once, exactly once,
+// on the handshake's own membership of the group Close joins. Close
+// returns as soon as that close returned — no handshake waits for its
+// deadline, none is abandoned or still holds a slot — and no rendr
+// goroutine outlives it.
+func TestCloseDrainIsFinal_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{})
+		a, b := net.Pipe()
+		c := &countConn{Conn: a}
+		if !ln.beginHandshake() { // Handle's first half: the handshake is counted
+			t.Fatal("beginHandshake refused on an open Listener")
+		}
+		start := time.Now()
+		closed := make(chan error, 1)
+		go func() { closed <- rt.Close() }()
+		synctest.Wait() // Close drained the slots and waits for the counted handshake
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned (%v) while a counted handshake was still starting", err)
+		default:
+		}
+		rt.startHandshake(ln, c, time.Now()) // Handle's second half, after the drain
+		var buf [1]byte
+		if n, err := b.Read(buf[:]); n != 0 || !errors.Is(err, io.EOF) || time.Since(start) != 0 {
+			t.Fatalf("the conn of a handshake started after the drain: (%d, %v) after %v, want closed at once", n, err, time.Since(start))
+		}
+		if err := <-closed; err != nil || time.Since(start) != 0 {
+			t.Fatalf("Close = %v after %v, want at once", err, time.Since(start))
+		}
+		synctest.Wait()
+		if st := rt.Status(); st.Handshakes != 0 || st.Abandoned != 0 || c.closes.Load() != 1 {
+			t.Fatalf("after Close: %+v, conn closed %d times", st, c.closes.Load())
+		}
+		if n, left := rendrGoroutines(); n != 0 {
+			t.Fatalf("rendr goroutines after Close: %v", left)
+		}
+		b.Close()
+	})
+}
+
+// TestEvictedCloseCounted_L52 (D20, L52): the Close of an evicted
+// handshake's conn that never returns is counted in Status.Abandoned
+// AbandonWait after the eviction while the Runtime runs — not only by a
+// later Runtime.Close — so a stuck embedder Close is visible to the
+// abandoned-call pool's fail-fast at once. It is counted exactly once:
+// Runtime.Close neither waits for it nor counts it again, and when the
+// embedder's Close returns the pool is empty. The conn is closed once.
+func TestEvictedCloseCounted_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const wait = 500 * time.Millisecond
+		rt := wpTestRuntime(t, Config{Handshake: HandshakeLimits{MaxConcurrent: 1}}, &testhooks.Overrides{AbandonWait: wait})
+		ln := wpListen(t, rt, ListenConfig{})
+		stuck := newMalConn(true, true) // its Read returns at Close; its Close blocks until freed
+		t.Cleanup(stuck.free)
+		if err := ln.Handle(stuck); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		d := wpConnect(t, ln, wpInst(0x62), 2) // the only slot is taken: stuck is evicted
+		synctest.Wait()
+		if st := rt.Status(); st.HandshakeEvictions != 1 || st.Abandoned != 0 || stuck.closes.Load() != 1 {
+			t.Fatalf("after the eviction: %+v, stuck conn closed %d times", st, stuck.closes.Load())
+		}
+		time.Sleep(wait)
+		synctest.Wait()
+		if n := rt.Status().Abandoned; n != 1 {
+			t.Fatalf("abandoned %d AbandonWait after the eviction, want the stuck Close", n)
+		}
+		start := time.Now()
+		rt.Close()
+		if el := time.Since(start); el != 0 {
+			t.Fatalf("Runtime.Close took %v: it waited for a closer that was already counted", el)
+		}
+		if n := rt.Status().Abandoned; n != 1 {
+			t.Fatalf("abandoned %d after Runtime.Close, want the one stuck Close counted once", n)
+		}
+		stuck.free()
+		synctest.Wait()
+		if st := rt.Status(); st.Abandoned != 0 || stuck.closes.Load() != 1 {
+			t.Fatalf("after the Close returned: %+v, conn closed %d times", st, stuck.closes.Load())
+		}
+		d.close()
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 {
+			t.Fatalf("rendr goroutines left: %v", left)
+		}
+	})
+}
+
+// TestCloseDeliversSessionEnds_L53 (design §6.8 W14): Runtime.Close joins
+// the sessions it shut down before it closes the event queue, so the
+// SessionEnd of every session Close ended is delivered — also when a
+// session reaches its end decision only after Close reached its join. The
+// actors of three sessions are held (Hooks.DeathObserved) when their
+// carrier dies; Close then runs on a goroutine of its own (not the event
+// callback) and is still waiting when the actors are released. Every
+// session's events are delivered, its last one a SessionEnd with
+// net.ErrClosed, all in Seq order with nothing dropped.
+func TestCloseDeliversSessionEnds_L53(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const n = 3
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		free := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(free)
+		var held atomic.Int32
+		hooks := &testhooks.Hooks{DeathObserved: func(uint32) {
+			held.Add(1)
+			<-release
+		}}
+		var log eventLog
+		d := wpTestRuntime(t, Config{OnEvent: log.add}, &testhooks.Overrides{Hooks: hooks})
+		p := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, p, ListenConfig{})
+		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: ln.Handle})
+		t.Cleanup(link.Close)
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := map[SessionID]bool{}
+		var ends []*Conn
+		for range n {
+			dc, sc := e2eOpen(t, peer, ln, DialOptions{})
+			ids[dc.ID()] = true
+			ends = append(ends, sc)
+		}
+		link.SetRefuse(true)
+		if k := link.Kill(); k != n {
+			t.Fatalf("killed %d carriers, want %d", k, n)
+		}
+		synctest.Wait()
+		if h := held.Load(); h != n {
+			t.Fatalf("stimulus: %d actors held in their death step, want %d", h, n)
+		}
+		closed := make(chan struct{})
+		go func() {
+			d.Close()
+			close(closed)
+		}()
+		synctest.Wait() // Close posted the shutdowns and waits in its join
+		select {
+		case <-closed:
+			t.Fatal("Runtime.Close returned while every session's actor was held")
+		default:
+		}
+		free()
+		<-closed
+		evs := log.all()
+		last := map[SessionID]Event{}
+		for i, ev := range evs {
+			if ev.Seq != uint64(i+1) || !ids[ev.Session] {
+				t.Fatalf("event %d: %+v (want Seq %d of one of the sessions)", i, ev, i+1)
+			}
+			last[ev.Session] = ev
+		}
+		for id := range ids {
+			ev, ok := last[id]
+			if !ok || ev.Kind != EventSessionEnd || !errors.Is(ev.Err, net.ErrClosed) {
+				t.Fatalf("session %v: last event %+v, want its SessionEnd (net.ErrClosed): %+v", id, ev, evs)
+			}
+		}
+		if st := d.Status(); st.EventsDropped != 0 || st.Abandoned != 0 {
+			t.Fatalf("dialer %+v", st)
+		}
+		for _, sc := range ends {
+			sc.Close()
+		}
+		p.Close()
+		link.Close()
+		wpNoState(t, d)
+		wpNoState(t, p)
 	})
 }

@@ -248,16 +248,17 @@ func TestAcceptCloseRace_L50(t *testing.T) {
 	// Every Accept returns exactly one of a PendingConn or an error; a
 	// session the application took is confirmed (its dialer gets
 	// OPEN_ACK(OK)) unless Close refused it first (Confirm: net.ErrClosed,
-	// dialer GOING_AWAY); a session still queued is refused GOING_AWAY.
-	// Each dialer gets exactly one answer, OK only for a confirmed session,
-	// and no slot or unit survives the Runtime. Both outcomes occur.
+	// dialer CAPACITY backlog); a session still queued is refused the same
+	// way. Each dialer gets exactly one answer, OK only for a confirmed
+	// session, and no slot or unit survives the Runtime. Both outcomes
+	// occur.
 	var oks, refusals int
 	for i := range 100 {
 		synctest.Test(t, func(t *testing.T) {
 			rt := wpTestRuntime(t, Config{}, nil)
 			ln := wpListen(t, rt, ListenConfig{})
 			const sessions = 3
-			answers := make(chan wire.AckStatus, sessions)
+			answers := make(chan wire.OpenAck, sessions)
 			var dialers sync.WaitGroup
 			for k := range sessions {
 				d := wpConnect(t, ln, wpInst(0x50), uint32(k+1))
@@ -269,7 +270,7 @@ func TestAcceptCloseRace_L50(t *testing.T) {
 					if err != nil {
 						t.Errorf("OPEN_ACK: %v", err)
 					}
-					answers <- a.Status
+					answers <- a
 					d.drain()
 				})
 			}
@@ -315,14 +316,14 @@ func TestAcceptCloseRace_L50(t *testing.T) {
 			}()
 			ok := 0
 			for range sessions {
-				switch st := <-answers; st {
-				case wire.StatusOK:
+				switch a := <-answers; {
+				case a.Status == wire.StatusOK:
 					ok++
 					oks++
-				case wire.StatusGoingAway:
+				case a.Status == wire.StatusCapacity && a.Code == wire.CodeBacklog:
 					refusals++
 				default:
-					t.Fatalf("run %d: a pending session was answered %d", i, st)
+					t.Fatalf("run %d: a pending session was answered %+v", i, a)
 				}
 			}
 			if ok != len(confirmed) {
@@ -538,29 +539,45 @@ func liveCarriers(st SessionStatus) []CarrierStatus {
 	return out
 }
 
-// TestListenerClosePendingGoingAway_L50: Listener.Close answers every
-// session that is still pending OPEN_ACK(GOING_AWAY) at once — one the
-// application accepted but did not decide and one still queued — and
-// returns within 100 ms (L50). The dialers' Dials return ErrCapacity, the
-// dialer's Peer records the instance as gone away (D21), Confirm of the
-// accepted PendingConn and Accept return net.ErrClosed, and the passive
-// keeps two GOING_AWAY tombstones and no pending slot.
+// TestListenerClosePendingGoingAway_L50: Listener.Close refuses every
+// session that is still pending at once — one the application accepted but
+// did not decide and one still queued — and returns within 100 ms (L50).
+// Only the Listener closed, not the instance: the refusal is
+// OPEN_ACK(CAPACITY, backlog), never GOING_AWAY, so the dialers' Dials
+// return ErrCapacity and the dialer's Peer does not record the instance as
+// gone away (D21 is Runtime.Close's). Confirm of the accepted PendingConn
+// and Accept return net.ErrClosed, and the passive keeps two CAPACITY
+// tombstones and no pending slot. The next Dial of the same Peer reaches the
+// still running Runtime through its other Listener and carries data. When
+// the Runtime itself closes, a pending session is answered GOING_AWAY: that
+// Dial returns ErrCapacity, the Peer now records the instance (D21), and
+// Confirm returns net.ErrClosed.
 func TestListenerClosePendingGoingAway_L50(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
-		peer := e.peer()
+		d := wpTestRuntime(t, Config{}, nil)
+		p := wpTestRuntime(t, Config{}, nil)
+		ln1, ln2 := wpListen(t, p, ListenConfig{}), wpListen(t, p, ListenConfig{})
+		var route atomic.Pointer[Listener]
+		route.Store(ln1)
+		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: func(c net.Conn) error { return route.Load().Handle(c) }})
+		t.Cleanup(link.Close)
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		if err != nil {
+			t.Fatal(err)
+		}
 		r1 := e2eDialAsync(context.Background(), peer, DialOptions{})
-		pc, err := e.ln.Accept(context.Background())
+		pc, err := ln1.Accept(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
 		r2 := e2eDialAsync(context.Background(), peer, DialOptions{Mode: ModeBond})
 		synctest.Wait()
-		if st := e.p.Status(); st.Sessions.Pending != 2 || st.AcceptBacklog[0] != 2 {
+		if st := p.Status(); st.Sessions.Pending != 2 || st.AcceptBacklog[0] != 2 {
 			t.Fatalf("before Close: %+v", st)
 		}
+		route.Store(ln2) // later carriers reach the Runtime through its other Listener
 		start := time.Now()
-		if err := e.ln.Close(); err != nil || time.Since(start) > 100*time.Millisecond {
+		if err := ln1.Close(); err != nil || time.Since(start) > 100*time.Millisecond {
 			t.Fatalf("Listener.Close = %v after %v", err, time.Since(start))
 		}
 		for i, res := range []<-chan dialResult{r1, r2} {
@@ -568,20 +585,131 @@ func TestListenerClosePendingGoingAway_L50(t *testing.T) {
 				t.Fatalf("Dial %d of a pending session at Listener.Close: %v, %v", i+1, r.c, r.err)
 			}
 		}
-		if !peer.goneAway(e.p.InstanceID()) {
-			t.Fatal("the Peer did not record the instance that answered GOING_AWAY")
+		if peer.goneAway(p.InstanceID()) {
+			t.Fatal("a Listener's Close made the Peer record the running instance as gone away")
 		}
 		if c, err := pc.Confirm(); c != nil || !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Confirm after Listener.Close: %v, %v", c, err)
 		}
-		if pc2, err := e.ln.Accept(context.Background()); pc2 != nil || !errors.Is(err, net.ErrClosed) {
+		if err := pc.Reject(1, "late"); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Reject after Listener.Close: %v", err)
+		}
+		if pc2, err := ln1.Accept(context.Background()); pc2 != nil || !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Accept after Listener.Close: %v, %v", pc2, err)
 		}
 		synctest.Wait()
-		if st := e.p.Status(); st.Sessions != (SessionCounts{Tombstones: 2}) || st.AcceptBacklog[0] != 0 {
+		if st := p.Status(); st.Sessions != (SessionCounts{Tombstones: 2}) || st.AcceptBacklog[0] != 0 {
 			t.Fatalf("after Close: %+v", st)
 		}
-		e.close()
+
+		// The instance runs on: the same Peer's next Dial reaches it.
+		dc, sc := e2eOpen(t, peer, ln2, DialOptions{})
+		if dc.PeerInstance() != p.InstanceID() {
+			t.Fatalf("the Dial after Listener.Close reached %v, want %v", dc.PeerInstance(), p.InstanceID())
+		}
+		e2eExchange(t, dc, sc, 256<<10, 50)
+		e2eFinish(t, dc, sc)
+
+		// Runtime.Close: a pending session is answered GOING_AWAY, and only
+		// now does the Peer record the instance as gone away.
+		r3 := e2eDialAsync(context.Background(), peer, DialOptions{})
+		pc3, err := ln2.Accept(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Close()
+		if r := <-r3; r.c != nil || !errors.Is(r.err, ErrCapacity) {
+			t.Fatalf("Dial of a pending session at Runtime.Close: %v, %v", r.c, r.err)
+		}
+		if !peer.goneAway(p.InstanceID()) {
+			t.Fatal("the Peer did not record the instance whose Runtime closed (D21)")
+		}
+		if c, err := pc3.Confirm(); c != nil || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Confirm after Runtime.Close: %v, %v", c, err)
+		}
+		d.Close()
+		link.Close()
+		wpNoState(t, d)
+		wpNoState(t, p)
+	})
+}
+
+// TestAcceptSkipsEndedSessions_L50: Accept never returns a session that
+// ended while it was queued (design §6.2): a queued session whose dialer
+// withdrew it (RST withdrawn) and one whose AcceptTimeout expired, both
+// before any Accept, are skipped — an Accept with a deadline times out
+// with no PendingConn — and their backlog slots are free at once; a session
+// queued after them is the one Accept returns. Stimulus proof: each was
+// queued and held a backlog slot, and each dialer saw its session end
+// (the CLOSE of the withdrawn one, CAPACITY(accept timeout)).
+func TestAcceptSkipsEndedSessions_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{AcceptTimeout: 200 * time.Millisecond})
+		inst := wpInst(0x64)
+		open := func(id uint32, sid int) *wpDialer {
+			d := wpConnect(t, ln, inst, id)
+			d.hello(rt)
+			d.send(wire.TypeOpen, 0, wpOpen(wpSID(sid), wire.KindStream, 1, nil))
+			return d
+		}
+		acceptNone := func(what string) {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			if pc, err := ln.Accept(ctx); pc != nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Accept after %s: %v, %v; want no session", what, pc, err)
+			}
+		}
+		queued := func(n int) {
+			t.Helper()
+			ln.mu.Lock()
+			k := 0
+			for it := ln.head; it != nil; it = it.next {
+				k++
+			}
+			ln.mu.Unlock()
+			if st := rt.Status(); k != n || st.AcceptBacklog[0] != n || st.Sessions.Pending != n {
+				t.Fatalf("%d queued, status %+v; want %d", k, st, n)
+			}
+		}
+
+		w := open(1, 1)
+		synctest.Wait()
+		queued(1)
+		w.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+		if seen := w.drain(); len(seen) == 0 || seen[len(seen)-1] != wire.TypeClose {
+			t.Fatalf("the withdrawn session's carrier ended with %v, want its CLOSE", seen)
+		}
+		synctest.Wait()
+		queued(0)
+		acceptNone("a withdrawal")
+
+		late := open(2, 2)
+		synctest.Wait()
+		queued(1)
+		late.expectOpenAck(wire.StatusCapacity, wire.CodeAcceptTimeout) // 200 ms after the admission
+		late.drain()
+		synctest.Wait()
+		queued(0)
+		acceptNone("an AcceptTimeout")
+
+		live := open(3, 3)
+		pc, err := ln.Accept(context.Background())
+		if err != nil || pc.ID() != SessionID(wpSID(3)) {
+			t.Fatalf("Accept = %v, %v; want the live session", pc, err)
+		}
+		if err := pc.Reject(5, "seen"); err != nil {
+			t.Fatal(err)
+		}
+		live.expectOpenAck(wire.StatusRejected, 5)
+		live.drain()
+		synctest.Wait()
+		if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 3}) || st.AcceptBacklog[0] != 0 {
+			t.Fatalf("after the verdicts: %+v", st)
+		}
+		rt.Close()
+		wpNoState(t, rt)
 	})
 }
 

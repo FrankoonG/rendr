@@ -255,7 +255,12 @@ func TestRandomOpenAckLoss_L47(t *testing.T) {
 			return pc.Confirm()
 		})
 		stop := make(chan struct{})
+		var stopOnce sync.Once
 		var wg sync.WaitGroup
+		t.Cleanup(func() { // a failing test still ends the dropper before the bubble ends
+			stopOnce.Do(func() { close(stop) })
+			wg.Wait()
+		})
 		wg.Go(func() { // the dropper
 			for {
 				select {
@@ -302,7 +307,7 @@ func TestRandomOpenAckLoss_L47(t *testing.T) {
 			dc.Close()
 			sc.Close()
 		}
-		close(stop)
+		stopOnce.Do(func() { close(stop) })
 		wg.Wait()
 		synctest.Wait()
 		acc.mu.Lock()

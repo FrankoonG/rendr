@@ -237,7 +237,8 @@ func TestAcceptTimeoutIsCapacity_L48(t *testing.T) {
 // no OPEN capacity applies to a JOIN). The active carrier of a session in
 // the middle of a bulk transfer is killed during the flood: the session
 // fails over (one death migration on both ends) and every byte arrives;
-// the flood's OPENs meanwhile get CAPACITY. Load proof: MaxSessions and the
+// the flood's OPENs meanwhile get CAPACITY(MaxSessions), and the 4 parked
+// ones CAPACITY(backlog) at Listener.Close. Load proof: MaxSessions and the
 // backlog are full and the flood was refused.
 func TestJoinPriorityUnderOpenFlood_L48(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -251,9 +252,18 @@ func TestJoinPriorityUnderOpenFlood_L48(t *testing.T) {
 		// until stop, never accepted: 4 fill the backlog and MaxSessions and
 		// wait for the application, every other one is refused.
 		stop := make(chan struct{})
+		var stopOnce sync.Once
 		var flood sync.WaitGroup
 		var fmu sync.Mutex
-		answers := map[wire.AckStatus]int{}
+		answers := map[[2]uint32]int{} // {status, code}
+		// A failing test still ends the flood and its parked OPENs before
+		// the bubble ends (the Runtimes' Close answers or closes them).
+		t.Cleanup(func() {
+			stopOnce.Do(func() { close(stop) })
+			e.d.Close()
+			e.p.Close()
+			flood.Wait()
+		})
 		flood.Go(func() {
 			for i := 0; ; i++ {
 				select {
@@ -280,7 +290,7 @@ func TestJoinPriorityUnderOpenFlood_L48(t *testing.T) {
 						return
 					}
 					fmu.Lock()
-					answers[a.Status]++
+					answers[[2]uint32{uint32(a.Status), a.Code}]++
 					fmu.Unlock()
 				})
 			}
@@ -304,8 +314,8 @@ func TestJoinPriorityUnderOpenFlood_L48(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Fatal("the transfer did not complete after the failover")
 		}
-		close(stop)
-		if err := e.ln.Close(); err != nil { // the 4 parked OPENs get GOING_AWAY; the session is not affected
+		stopOnce.Do(func() { close(stop) })
+		if err := e.ln.Close(); err != nil { // the 4 parked OPENs get CAPACITY(backlog); the session is not affected
 			t.Fatal(err)
 		}
 		flood.Wait()
@@ -315,10 +325,11 @@ func TestJoinPriorityUnderOpenFlood_L48(t *testing.T) {
 			}
 		}
 		fmu.Lock()
-		refused, away, kinds := answers[wire.StatusCapacity], answers[wire.StatusGoingAway], len(answers)
+		capacity := uint32(wire.StatusCapacity)
+		refused, parked, kinds := answers[[2]uint32{capacity, wire.CodeMaxSessions}], answers[[2]uint32{capacity, wire.CodeBacklog}], len(answers)
 		fmu.Unlock()
-		if refused < 20 || away != 4 || kinds != 2 {
-			t.Fatalf("flood answers %v, want CAPACITY (≥ 20) and 4 GOING_AWAY at Listener.Close", answers)
+		if refused < 20 || parked != 4 || kinds != 2 {
+			t.Fatalf("flood answers %v ({status, code}), want CAPACITY(MaxSessions) ≥ 20 and 4 CAPACITY(backlog) at Listener.Close", answers)
 		}
 		t.Logf("flood: %d OPENs refused CAPACITY during the failover", refused)
 		e2eFinish(t, dc, sc)

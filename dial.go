@@ -96,8 +96,15 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, reg *dial
 	env := p.env
 	env.Registry = reg
 	ec := &entryCtx{Context: dctx}
-	s, err = session.Dial(ec, &env, p.spec(sid, o))
-	return s, ec.live.Load(), err
+	spec := p.spec(sid, o)
+	s, err = session.Dial(ec, &env, spec)
+	// session.Dial's documented contract: it creates no session (and makes
+	// no Registry call) when ctx is done at its entry check — its first Err
+	// call — or when spec has no factory (never here: NewPeer requires
+	// one). TestSessionDialEntryContract pins both, so that a change on the
+	// session side fails visibly instead of leaving a Dial membership that
+	// no Registry.Ended ever releases.
+	return s, ec.live.Load() && len(spec.Factories) > 0, err
 }
 
 // spec is the frozen DialSpec of session sid (L20): the Peer's factory

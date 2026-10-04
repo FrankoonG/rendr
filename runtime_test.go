@@ -72,13 +72,14 @@ func TestNewRuntimeIdentityAndStatus(t *testing.T) {
 }
 
 // TestListenRejectsBadSources: a Listen source must be FromListener of a
-// non-nil net.Listener; a rejected Listen takes no ownership (the listener
-// is not closed) and records no adjustment.
+// non-nil net.Listener, and one net.Listener may not appear twice (it would
+// get two accept loops and two Closes, L50/L51); a rejected Listen takes no
+// ownership (the listener is not closed) and records no adjustment.
 func TestListenRejectsBadSources(t *testing.T) {
 	rt := wpTestRuntime(t, Config{}, nil)
 	defer rt.Close()
 	l := newFakeListener()
-	for _, srcs := range [][]Source{{nil}, {FromListener(nil)}, {FromListener(l), nil}} {
+	for _, srcs := range [][]Source{{nil}, {FromListener(nil)}, {FromListener(l), nil}, {FromListener(l), FromListener(newFakeListener()), FromListener(l)}} {
 		if ln, err := rt.Listen(ListenConfig{Sources: srcs, AcceptBacklog: -1}); ln != nil || err == nil {
 			t.Fatalf("Listen(%v) = %v, %v", srcs, ln, err)
 		}
@@ -86,6 +87,23 @@ func TestListenRejectsBadSources(t *testing.T) {
 	if l.closes.Load() != 0 || len(rt.Status().ConfigAdjustments) != 0 {
 		t.Fatalf("a rejected Listen closed its source (%d) or recorded %q", l.closes.Load(), rt.Status().ConfigAdjustments)
 	}
+	// A listener type that cannot be compared is never mistaken for a
+	// repetition (no panic).
+	ln, err := rt.Listen(ListenConfig{Sources: []Source{
+		FromListener(uncomparableListener{fakeListener: newFakeListener()}),
+		FromListener(uncomparableListener{fakeListener: newFakeListener()}),
+	}})
+	if err != nil {
+		t.Fatalf("Listen of two uncomparable listeners: %v", err)
+	}
+	ln.Close()
+}
+
+// uncomparableListener is a net.Listener whose dynamic type has a slice
+// field: comparing two of them with == panics.
+type uncomparableListener struct {
+	*fakeListener
+	pad []int
 }
 
 // TestTesthooksNewRuntime: testhooks.NewRuntime builds a *Runtime with the
