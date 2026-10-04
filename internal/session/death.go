@@ -40,6 +40,7 @@ func (a *actor) reapDead(now time.Time) time.Time {
 		if l.c.PeerGoAway() {
 			a.peerGoAwayLocked(now)
 		}
+		a.endIfDoneLocked(now)
 		a.laneDiedLocked(now, l) // removes l from s.lanes: i now names the next lane
 		a.unlockStep(now)
 	}
@@ -187,10 +188,27 @@ func (a *actor) peerSignalsLocked(now time.Time) {
 	if a.ending {
 		return
 	}
+	if a.endIfDoneLocked(now); a.ending {
+		return
+	}
 	for _, l := range s.lanes {
 		if l.state != LaneDead && !l.retireCalled && l.c.PeerClosed() {
 			a.peerClosedLocked(now, l)
 		}
+	}
+}
+
+// endIfDoneLocked ends a session whose DONE went both ways (D4) before the
+// step treats carrier ends as routing losses. Once both DONEs crossed, the
+// peer ends and retires its carriers (CLOSE, then their close), and its
+// DONE and its CLOSE often reach this actor in one step (always at
+// GOMAXPROCS=1); repairing routing first would start a no-path episode — a
+// NoPathStart event, an Orphaned call, one more episode — and on the dialer
+// a failover race, right before terminationLocked ends the session cleanly
+// in that same step.
+func (a *actor) endIfDoneLocked(now time.Time) {
+	if st := &a.s.st; !a.ending && st.doneSent && st.peerDone {
+		a.terminationLocked(now)
 	}
 }
 
