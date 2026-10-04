@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -306,6 +307,149 @@ func TestCarrierBidirectionalBulk(t *testing.T) {
 		sb.chunk.Release()
 		if env.Budget.Used() != 0 {
 			t.Fatalf("budget %d", env.Budget.Used())
+		}
+	})
+}
+
+// TestRetireFlushesBeforeClose_L05: Retire while the endpoint still has four
+// batches of DATA: the writer keeps flushing round after round and appends
+// CLOSE only in a round where the endpoint appended nothing, so every DATA
+// byte precedes the single CLOSE and CLOSE is the last frame on the wire.
+func TestRetireFlushesBeforeClose_L05(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		c, p := hPair(t, env, nil)
+		p.keep()
+		src := newSource(env, ChunkSize, false)
+		c.Start(src, &hBell{}, StartOptions{})
+		synctest.Wait()
+		src.offer(1 << 20) // four 256 KiB batches
+		c.Retire(wire.CloseRetire)
+		synctest.Wait()
+		if got := hCheckData(t, p, 1<<20); got != 16 {
+			t.Fatalf("%d DATA frames, want 16", got)
+		}
+		fr := p.received()
+		if last := fr[len(fr)-1]; last.Type != wire.TypeClose || p.count(wire.TypeClose) != 1 {
+			t.Fatalf("last frame %v, %d CLOSE frames", last.Type, p.count(wire.TypeClose))
+		}
+		if c.wr.coalesced < 5 {
+			t.Fatalf("%d batches: the DATA did not need several rounds", c.wr.coalesced)
+		}
+		p.close() // EOF after our CLOSE ends the retirement
+		hWait(t, c)
+		if cause := hCause(c); cause != CauseRetired {
+			t.Fatalf("cause %v", cause)
+		}
+		src.chunk.Release()
+	})
+}
+
+// TestEndAfterPeerCloseIsRetirement_L05 (design §7.3): the peer sends
+// nothing after its CLOSE — no PONG either — and closes the conn after its
+// bounded drain, so a write that fails or stalls and a PING left
+// unanswered after the peer's CLOSE end the planned retirement (cause
+// retired: no failed mark, no immediate redial, no death migration), as a
+// read error after a CLOSE already does; the same events without a CLOSE
+// from the peer stay deaths with their own causes.
+func TestEndAfterPeerCloseIsRetirement_L05(t *testing.T) {
+	errBroken := errors.New("broken pipe")
+	for _, tc := range []struct {
+		name      string
+		peerClose bool
+		mode      string // "write error", "write stall" or "no PONG"
+		want      Cause
+		after     time.Duration // when the carrier ends, counted from the stimulus
+	}{
+		{"write error after the peer's CLOSE", true, "write error", CauseRetired, 0},
+		{"write error", false, "write error", CauseTransportError, 0},
+		{"write stall after the peer's CLOSE", true, "write stall", CauseRetired, 2 * time.Second},
+		{"write stall", false, "write stall", CauseWriteStall, 2 * time.Second},
+		{"no PONG after the peer's CLOSE", true, "no PONG", CauseRetired, 3 * time.Second},
+		{"no PONG", false, "no PONG", CausePingTimeout, 3 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				var armed atomic.Bool
+				release := make(chan struct{})
+				var once sync.Once
+				c, p := hPair(t, env, func(nc net.Conn) net.Conn {
+					return &hookConn{
+						Conn: nc,
+						onWrite: func(nc net.Conn, b []byte) (int, error) {
+							switch {
+							case !armed.Load():
+								return nc.Write(b)
+							case tc.mode == "write stall":
+								<-release // until the close
+								return 0, net.ErrClosed
+							}
+							return 0, errBroken
+						},
+						onClose: func(nc net.Conn) error {
+							once.Do(func() { close(release) })
+							return nc.Close()
+						},
+					}
+				})
+				if tc.mode != "no PONG" {
+					p.autoPong(nil)
+				}
+				ep := &hEP{}
+				start := time.Now() // "no PONG": the first PING is committed now
+				c.Start(ep, &hBell{}, StartOptions{})
+				time.Sleep(time.Millisecond) // the first PING is answered (unless "no PONG") before the peer's CLOSE
+				if tc.peerClose {
+					if err := p.send(wire.TypeClose, 0, 0, []byte{byte(wire.CloseRetire)}); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if !c.PeerClosed() {
+						t.Fatal("stimulus missing: the peer's CLOSE was not applied")
+					}
+				}
+				if tc.mode != "no PONG" { // the endpoint has one more frame: an ACK
+					start = time.Now()
+					armed.Store(true)
+					var sent atomic.Bool
+					ep.setFill(func(c *Conn, b *Batch) {
+						if sent.CompareAndSwap(false, true) {
+							b.AddAck(wire.SessionHandle, 0, &wire.Ack{})
+						}
+					})
+					c.Wake()
+				}
+				hWait(t, c)
+				p.close()
+				dead, cause, detail, at := c.Death()
+				if !dead || cause != tc.want || at.Sub(start) != tc.after {
+					t.Fatalf("death %v %v %q after %v, want %v after %v", dead, cause, detail, at.Sub(start), tc.want, tc.after)
+				}
+			})
+		})
+	}
+}
+
+// TestWriteAndCloseZeroDeadlineBounded: a verdict written with a zero
+// deadline to a peer that never reads is bounded by the 1 s drain bound:
+// the write gives up, the conn is closed exactly once, and Done closes then
+// with nothing abandoned.
+func TestWriteAndCloseZeroDeadlineBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		a, b := net.Pipe()
+		defer b.Close()
+		hc := &hookConn{Conn: a}
+		c := hConn(env, hc)
+		start := time.Now()
+		c.WriteAndClose(wire.TypeClose, 0, 0, []byte{byte(wire.CloseCapacity)}, time.Time{})
+		hWait(t, c)
+		if d := time.Since(start); d != time.Second {
+			t.Fatalf("Done after %v, want the 1 s write bound", d)
+		}
+		if hc.writes.Load() != 1 || hc.closes.Load() != 1 || env.Abandon.Len() != 0 {
+			t.Fatalf("writes %d, closes %d, abandoned %d", hc.writes.Load(), hc.closes.Load(), env.Abandon.Len())
 		}
 	})
 }

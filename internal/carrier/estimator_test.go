@@ -668,3 +668,225 @@ func TestReceiverPingCadence_P12(t *testing.T) {
 		p.close()
 	})
 }
+
+// TestOldestPingDecidesDeath_L25 (plan §3.6): while received DATA keeps the
+// cadence at PingBusy, the peer answers the first PINGs and then stops; the
+// carrier dies with ping_timeout exactly D after the first unanswered
+// PING's commit, although newer PINGs keep going out behind it — the
+// oldest committed, unanswered PING decides, not the newest.
+func TestOldestPingDecidesDeath_L25(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		env.Timing.DeadMin, env.Timing.DeadMax = time.Second, time.Second
+		c, p := hPair(t, env, nil)
+		const answered = 10
+		var mu sync.Mutex
+		var firstUnanswered time.Time
+		behind := 0 // PINGs written after the first unanswered one
+		p.setHandler(func(f wire.Frame) {
+			if f.Type != wire.TypePing {
+				return
+			}
+			pg, _ := wire.ParsePing(f.Payload)
+			if pg.ID <= answered {
+				p.later(time.Microsecond, func() { _ = p.pong(pg) })
+				return
+			}
+			mu.Lock()
+			if firstUnanswered.IsZero() {
+				firstUnanswered = time.Now() // net.Pipe: the write returns (commits) as the peer reads it
+			} else {
+				behind++
+			}
+			mu.Unlock()
+		})
+		c.Start(&hEP{}, &hBell{}, StartOptions{})
+		var off uint64
+		for { // DATA every 10 ms keeps the cadence at PingBusy (P12)
+			if dead, _, _, _ := c.Death(); dead {
+				break
+			}
+			_ = p.sendFrames(hFrame{t: wire.TypeData, handle: wire.SessionHandle, payload: dataPayload(off, 1000)})
+			off += 1000
+			time.Sleep(10 * time.Millisecond)
+		}
+		hWait(t, c)
+		p.close()
+		_, cause, _, at := c.Death()
+		mu.Lock()
+		defer mu.Unlock()
+		if firstUnanswered.IsZero() || behind < 5 {
+			t.Fatalf("stimulus missing: first unanswered PING at %v, %d PINGs behind it", firstUnanswered, behind)
+		}
+		if cause != CausePingTimeout || at.Sub(firstUnanswered) != time.Second {
+			t.Fatalf("death %v %v after the first unanswered PING, want ping_timeout after D = 1s (%d newer PINGs outstanding)", cause, at.Sub(firstUnanswered), behind)
+		}
+	})
+}
+
+// TestFullPingRingResumesOnPong_L25: on a path whose RTT (1 s) exceeds 16
+// PING intervals, the record ring fills and further PINGs wait; the PONG
+// that frees a record wakes the writer, so the next PING goes out in the
+// same instant — not at the death-deadline timer the writer slept on.
+func TestFullPingRingResumesOnPong_L25(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		c, p := hPair(t, env, nil)
+		const rtt = time.Second
+		var mu sync.Mutex
+		pingAt := map[uint32]time.Time{}
+		p.setHandler(func(f wire.Frame) {
+			if f.Type != wire.TypePing {
+				return
+			}
+			pg, _ := wire.ParsePing(f.Payload)
+			mu.Lock()
+			pingAt[pg.ID] = time.Now()
+			mu.Unlock()
+			p.later(rtt, func() { _ = p.pong(pg) })
+		})
+		src := newSource(env, 4<<10, false)
+		src.offer(4 << 10) // unproven in flight until a PONG proves it: PINGs every PingBusy
+		start := time.Now()
+		c.Start(src, &hBell{}, StartOptions{})
+		time.Sleep(rtt + 100*time.Millisecond)
+		c.Kill(CauseLocalClose, "test end")
+		hWait(t, c)
+		p.close()
+		src.chunk.Release()
+		mu.Lock()
+		defer mu.Unlock()
+		pb := env.Timing.PingBusy
+		for id := uint32(1); id <= pingRingSize; id++ {
+			if got := pingAt[id].Sub(start); got != time.Duration(id-1)*pb {
+				t.Fatalf("PING %d at %v, want %v: the ring did not fill at the PingBusy cadence", id, got, time.Duration(id-1)*pb)
+			}
+		}
+		if got := pingAt[pingRingSize+1].Sub(start); got != rtt {
+			t.Fatalf("PING %d at %v, want the instant the first PONG freed a record (%v)", pingRingSize+1, got, rtt)
+		}
+	})
+}
+
+// capRaceEP is the endpoint of TestCapWakeRacesFill_L32: it fills exactly
+// the 128 KiB cap; once armed, a Fill finds the cap reached and, before
+// that Fill returns, lets the PONG that proves every byte arrive (the
+// reader applies it while the writer is still inside Fill); afterwards it
+// sends more DATA whenever there is room under the cap.
+type capRaceEP struct {
+	hEP
+	chunk *Buf
+	off   uint64
+	armed atomic.Bool
+	raced atomic.Bool
+	race  func() // delivers the PONG and waits until the reader applied it
+}
+
+func (e *capRaceEP) Fill(c *Conn, b *Batch) {
+	switch {
+	case e.off < 128<<10:
+		for e.off < 128<<10 && b.AddData(wire.SessionHandle, e.off, e.chunk.B[:ChunkSize], e.chunk, false) {
+			e.off += ChunkSize
+		}
+	case e.armed.Load() && !e.raced.Load():
+		if c.Inflight() >= c.Capacity() {
+			b.MarkCapBlocked()
+			e.raced.Store(true)
+			e.race()
+		}
+	case e.raced.Load() && e.off < 192<<10 && c.Inflight() < c.Capacity():
+		if b.AddData(wire.SessionHandle, e.off, e.chunk.B[:ChunkSize], e.chunk, false) {
+			e.off += ChunkSize
+		}
+	}
+}
+
+// TestCapWakeRacesFill_L32 (C5, §3.5): the PONG that proves every in-flight
+// byte is applied while the writer is inside a Fill that already decided
+// "cap-blocked" (after a round that was not cap-blocked, with no cap-hit
+// PING pending): the writer still resumes in that same instant instead of
+// sleeping until its next PING (PingBusy = 1 s here), because the
+// cap-blocked flag is published before Fill evaluates the cap.
+func TestCapWakeRacesFill_L32(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		env.Timing.PingBusy = time.Second
+		c, p := hPair(t, env, nil)
+		ep := &capRaceEP{chunk: env.Bufs.Get(ChunkSize, nil)}
+		var mu sync.Mutex
+		var pings []wire.Ping
+		var resumed time.Time
+		p.setHandler(func(f wire.Frame) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch f.Type {
+			case wire.TypePing:
+				pg, _ := wire.ParsePing(f.Payload)
+				pings = append(pings, pg)
+			case wire.TypeData:
+				if binary.BigEndian.Uint64(f.Payload) >= 128<<10 && resumed.IsZero() {
+					resumed = time.Now()
+				}
+			}
+		})
+		ep.race = func() {
+			mu.Lock()
+			pg := pings[len(pings)-1] // the PING sent after the 128 KiB: its mark covers them
+			mu.Unlock()
+			_ = p.pong(pg)
+			synctest.Wait() // the reader applied the PONG; this writer is still inside Fill
+		}
+		start := time.Now()
+		c.Start(ep, &hBell{}, StartOptions{})
+		time.Sleep(1500 * time.Millisecond) // PING 1 + 128 KiB at 0; PING 2 alone at 1 s
+		ep.armed.Store(true)
+		c.Wake() // new data waits: the next Fill finds the cap reached
+		raceAt := time.Now()
+		time.Sleep(time.Second)
+		inflight := c.Inflight()
+		c.Kill(CauseLocalClose, "test end")
+		hWait(t, c)
+		p.close()
+		ep.chunk.Release()
+		mu.Lock()
+		defer mu.Unlock()
+		if !ep.raced.Load() || len(pings) < 2 || raceAt.Sub(start) != 1500*time.Millisecond || inflight != 64<<10 {
+			t.Fatalf("stimulus missing: raced %v, PINGs %d, in flight %d afterwards", ep.raced.Load(), len(pings), inflight)
+		}
+		if resumed.IsZero() || !resumed.Equal(raceAt) {
+			t.Fatalf("DATA resumed %v after the PONG arrived inside Fill, want at once", resumed.Sub(raceAt))
+		}
+	})
+}
+
+// TestGaugeNotFedAfterKillRacesStart (§8.2): a Kill that lands between
+// Start's death check and Start installing the factory gauge ends the
+// carrier's self-load accounting first; frames the reader still handles
+// before the closer's Close (a PING with BUSY here) add nothing, so a dead
+// carrier never leaves its factory's gauge backlogged.
+func TestGaugeNotFedAfterKillRacesStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		c, p := hPair(t, env, nil)
+		g := NewGauge()
+		// The window replayed step by step: Start passed its death check,
+		// the racing Kill records the death, Start installs the gauge, and
+		// the reader handles a BUSY PING.
+		if !c.setDeath(CauseLocalClose, "raced Start") {
+			t.Fatal("setDeath lost")
+		}
+		c.mu.Lock()
+		c.st.gauge = g
+		c.mu.Unlock()
+		c.onPing(true, &wire.Ping{ID: 1}, time.Now())
+		if !c.Stats().PeerBusy {
+			t.Fatal("stimulus missing: the BUSY PING was not applied")
+		}
+		if g.backlogged.Load() != 0 || g.inflight.Load() != 0 {
+			t.Fatalf("a dead carrier fed the gauge: backlogged %d, inflight %d", g.backlogged.Load(), g.inflight.Load())
+		}
+		c.startCloser(closeKill, nil, time.Time{}) // the rest of the racing Kill
+		hWait(t, c)
+		p.close()
+	})
+}

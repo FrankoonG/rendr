@@ -11,7 +11,8 @@ import "time"
 //     ep.WriteBlocked, so duties move off a carrier whose write is blocked
 //     (L08, D5);
 //   - stage 2 at the stall window: if wstate still holds generation g, the
-//     write stalled: Kill(write_stall) (L24).
+//     write stalled: Kill(write_stall) (L24), or, after the peer's CLOSE,
+//     the end of that retirement (endIfPeerClosed).
 //
 // When the write returns, one store sets generation g+1 with the flag
 // clear. time.AfterFunc's Stop cannot stop a callback that already started,
@@ -59,7 +60,7 @@ func (c *Conn) watchStage2() {
 	if int64(time.Since(c.base)) < c.wd2At.Load() {
 		return
 	}
-	if c.wstate.Load()>>1 == gen {
+	if c.wstate.Load()>>1 == gen && !c.endIfPeerClosed("write stalled") {
 		c.Kill(CauseWriteStall, "batch write exceeded its stall window")
 	}
 }

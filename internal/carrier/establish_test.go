@@ -532,3 +532,85 @@ func TestEstablishDialEarly(t *testing.T) {
 		}
 	})
 }
+
+// TestWithdrawRstReadsPendingAnswer_L05_L49: the RST(withdrawn) Establish
+// writes after an OPEN — when check refuses the instance, and when the
+// session withdraws while the answer is pending — is followed by the L05
+// close order: the dialer reads what the passive had already sent (here an
+// OPEN_ACK in flight just after the dialer gave up) before it closes, so
+// that answer is consumed instead of being met by a close (on TCP a reset
+// that can discard the RST before the passive reads it); the passive reads
+// exactly the RST and then EOF. A withdrawal still returns at once.
+func TestWithdrawRstReadsPendingAnswer_L05_L49(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		withdraw time.Duration // 0: check refuses the instance at the PREFACE_ACK
+	}{{"instance check", 0}, {"withdrawn", 100 * time.Millisecond}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				f := Factory{Name: "w", Dial: func(context.Context) (net.Conn, error) { return a, nil }}
+				var ackErr error
+				var after []byte
+				passive := make(chan struct{})
+				readerDone := make(chan struct{})
+				go func() {
+					defer close(passive)
+					var in [wire.PrefaceLen + wire.FrameOverhead + wire.OpenFixedLen]byte // PREFACE + OPEN
+					if _, err := io.ReadFull(b, in[:]); err != nil {
+						ackErr = err
+						return
+					}
+					go func() { // everything the dialer writes after its OPEN
+						defer close(readerDone)
+						after, _ = io.ReadAll(b)
+					}()
+					if _, err := b.Write(hPrefaceAck(wire.PrefaceOK, 3)); err != nil {
+						ackErr = err
+						return
+					}
+					time.Sleep(tc.withdraw + time.Microsecond) // the answer is in flight when the dialer gives up
+					_, ackErr = b.Write(frameAt(wire.TypeOpenAck, 0, env.Presets.firstFseq(), wire.SessionHandle, okOpenAck()))
+				}()
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				var check func(*wire.PrefaceAck) error
+				errOther := errors.New("not the bound instance")
+				if tc.withdraw == 0 {
+					check = func(*wire.PrefaceAck) error { return errOther }
+				} else {
+					time.AfterFunc(tc.withdraw, func() { cancel(ErrWithdrawn) })
+				}
+				start := time.Now()
+				_, err := Establish(ctx, env, f, 3, wire.TypeOpen, openPayload(0), check)
+				took := time.Since(start)
+				var ee *EstablishError
+				switch {
+				case !errors.As(err, &ee):
+					t.Fatalf("Establish: %v", err)
+				case tc.withdraw == 0 && (ee.Cause != CauseInstanceMismatch || !errors.Is(err, errOther)):
+					t.Fatalf("instance check: %v", err)
+				case tc.withdraw > 0 && (!errors.Is(err, ErrWithdrawn) || took != tc.withdraw):
+					t.Fatalf("withdrawal returned after %v: %v", took, err)
+				}
+				<-passive
+				<-readerDone
+				b.Close()
+				if ackErr != nil {
+					t.Fatalf("the in-flight OPEN_ACK was refused by the close: %v", ackErr)
+				}
+				fr, n, err := wire.DecodeFrame(after)
+				if err != nil || n != len(after) || fr.Type != wire.TypeRst || fr.Fseq != env.Presets.firstFseq()+1 {
+					t.Fatalf("after the OPEN: %d bytes, %+v %v", len(after), fr.Header, err)
+				}
+				if r, _ := wire.ParseRst(fr.Payload); r.Code != wire.RstWithdrawn {
+					t.Fatalf("RST code %d", r.Code)
+				}
+				if env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
+					t.Fatalf("IDs in use %d, abandoned %d", env.IDs.inUse(), env.Abandon.Len())
+				}
+			})
+		})
+	}
+}

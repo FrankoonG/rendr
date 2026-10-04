@@ -73,41 +73,65 @@ func TestCarrierIDWrapSkipsInUse_L14(t *testing.T) {
 }
 
 // TestCarrierPanicsContained_L51: a panic or runtime.Goexit inside any
-// embedder conn method, and a Read returning len+1, is contained: the
-// carrier dies with transport_error (or keeps its earlier cause), the
-// process survives, the carrier joins, its conn is closed exactly once,
-// its reader stage returns to the Budget and nothing is abandoned.
+// embedder conn method — the reader's stage and big-DATA reads, the
+// writer's batch write, and the close paths (the closer's SetDeadline, the
+// verdict write of WriteAndClose) — and a Read returning len+1, is
+// contained: the carrier dies with transport_error (or keeps its earlier
+// cause), the process survives, the carrier joins, its conn is closed
+// exactly once, every buffer (the reader stage, a big-DATA payload being
+// read, the coalescing scratch) returns to the Budget and nothing is
+// abandoned.
 func TestCarrierPanicsContained_L51(t *testing.T) {
 	boom := func() { panic("boom") }
+	kill := func(c *Conn, _ *wirePeer) { c.Kill(CauseLocalClose, "test kill") }
 	cases := []struct {
-		name   string
-		hook   func(h *hookConn)
-		kill   bool // the test kills the carrier (the misbehaviour is in the close path)
-		cause  Cause
-		detail string
+		name      string
+		hook      func(h *hookConn)
+		unstarted bool                       // the carrier is never started (the admission's WriteAndClose path)
+		run       func(c *Conn, p *wirePeer) // the stimulus (nil: the started carrier's first PING only)
+		cause     Cause
+		detail    string
 	}{
 		{"Write panics", func(h *hookConn) {
 			h.onWrite = func(net.Conn, []byte) (int, error) { boom(); return 0, nil }
-		}, false, CauseTransportError, "Write panicked"},
+		}, false, nil, CauseTransportError, "Write panicked"},
 		{"Read panics", func(h *hookConn) {
 			h.onRead = func(net.Conn, []byte) (int, error) { boom(); return 0, nil }
-		}, false, CauseTransportError, "Read panicked"},
+		}, false, nil, CauseTransportError, "Read panicked"},
 		{"Read returns len+1", func(h *hookConn) {
 			h.onRead = func(_ net.Conn, p []byte) (int, error) { return len(p) + 1, nil }
-		}, false, CauseTransportError, "invalid count"},
+		}, false, nil, CauseTransportError, "invalid count"},
 		{"Write calls Goexit", func(h *hookConn) {
 			h.onWrite = func(net.Conn, []byte) (int, error) { runtime.Goexit(); return 0, nil }
-		}, false, CauseTransportError, "Goexit"},
+		}, false, nil, CauseTransportError, "Goexit"},
 		{"Read calls Goexit", func(h *hookConn) {
 			h.onRead = func(net.Conn, []byte) (int, error) { runtime.Goexit(); return 0, nil }
-		}, false, CauseTransportError, "Goexit"},
+		}, false, nil, CauseTransportError, "Goexit"},
+		{"Read calls Goexit inside a big DATA payload", func(h *hookConn) {
+			h.onRead = func(nc net.Conn, p []byte) (int, error) {
+				if len(p) > classSize(0) { // the Read into the payload's own Buf (stage reads are smaller)
+					runtime.Goexit()
+				}
+				return nc.Read(p)
+			}
+		}, false, func(_ *Conn, p *wirePeer) {
+			go p.sendFrames(hFrame{t: wire.TypeData, handle: wire.SessionHandle, payload: dataPayload(0, 100<<10)})
+		}, CauseTransportError, "Goexit"},
 		{"SetWriteDeadline panics", func(h *hookConn) {
 			h.onSetWriteDeadline = func(net.Conn, time.Time) error { boom(); return nil }
-		}, false, CauseTransportError, "SetWriteDeadline panicked"},
+		}, false, nil, CauseTransportError, "SetWriteDeadline panicked"},
 		{"SetDeadline and Close panic", func(h *hookConn) {
 			h.onSetDeadline = func(net.Conn, time.Time) error { boom(); return nil }
 			h.onClose = func(nc net.Conn) error { nc.Close(); boom(); return nil }
-		}, true, CauseLocalClose, "test kill"},
+		}, false, kill, CauseLocalClose, "test kill"},
+		{"SetDeadline calls Goexit while closing", func(h *hookConn) {
+			h.onSetDeadline = func(net.Conn, time.Time) error { runtime.Goexit(); return nil }
+		}, false, kill, CauseLocalClose, "test kill"},
+		{"Write calls Goexit in WriteAndClose", func(h *hookConn) {
+			h.onWrite = func(net.Conn, []byte) (int, error) { runtime.Goexit(); return 0, nil }
+		}, true, func(c *Conn, _ *wirePeer) {
+			c.WriteAndClose(wire.TypeClose, 0, 0, []byte{byte(wire.CloseCapacity)}, time.Now().Add(time.Second))
+		}, CauseLocalClose, "closed after"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,10 +143,12 @@ func TestCarrierPanicsContained_L51(t *testing.T) {
 					tc.hook(hc)
 					return hc
 				})
-				c.Start(&hEP{}, &hBell{}, StartOptions{})
-				synctest.Wait()
-				if tc.kill {
-					c.Kill(CauseLocalClose, "test kill")
+				if !tc.unstarted {
+					c.Start(&hEP{}, &hBell{}, StartOptions{})
+					synctest.Wait()
+				}
+				if tc.run != nil {
+					tc.run(c, p)
 				}
 				hWait(t, c)
 				p.close()
@@ -325,8 +351,10 @@ func TestGuardedDialMisbehaviour_L51(t *testing.T) {
 // carrier killed while its writer is stuck in an embedder Write that
 // ignores deadlines and Close joins AbandonWait later with the writer
 // counted as abandoned, and the send chunk the stuck write may still read
-// stays referenced (never recycled under it) until that Write returns; then
-// the references go and the pool empties.
+// stays referenced (never recycled under it) until that Write returns; so
+// does the coalescing scratch the Write was handed, whose class capacity
+// stays charged to the Budget (it is visible in BufferedBytes) until then.
+// Then the references go, the Budget returns to zero and the pool empties.
 func TestAbandonedWriteKeepsItsBuffers_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := hEnv()
@@ -350,17 +378,123 @@ func TestAbandonedWriteKeepsItsBuffers_L52(t *testing.T) {
 		if refs := src.chunk.refs.Load(); refs != 3 {
 			t.Fatalf("chunk refs %d during the write, want the source's and two DATA frames'", refs)
 		}
+		stage := int64(classSize(0))
+		scratch := int64(classSize(classFor(2 * (16<<10 + wire.DataHeadLen + wire.TrailerLen))))
+		if got := env.Budget.Used(); got != stage+scratch {
+			t.Fatalf("budget %d during the write, want the reader stage %d + the batch scratch %d", got, stage, scratch)
+		}
 		c.Kill(CauseLocalClose, "shutdown")
 		hWait(t, c)
-		if env.Abandon.Len() != 1 || src.chunk.refs.Load() != 3 {
-			t.Fatalf("after Done: abandoned %d, chunk refs %d", env.Abandon.Len(), src.chunk.refs.Load())
+		if env.Abandon.Len() != 1 || src.chunk.refs.Load() != 3 || env.Budget.Used() != scratch {
+			t.Fatalf("after Done: abandoned %d, chunk refs %d, budget %d (want the scratch %d)", env.Abandon.Len(), src.chunk.refs.Load(), env.Budget.Used(), scratch)
 		}
 		close(release)
 		synctest.Wait()
-		if env.Abandon.Len() != 0 || src.chunk.refs.Load() != 1 {
-			t.Fatalf("after the stuck Write returned: abandoned %d, chunk refs %d", env.Abandon.Len(), src.chunk.refs.Load())
+		if env.Abandon.Len() != 0 || src.chunk.refs.Load() != 1 || env.Budget.Used() != 0 {
+			t.Fatalf("after the stuck Write returned: abandoned %d, chunk refs %d, budget %d", env.Abandon.Len(), src.chunk.refs.Load(), env.Budget.Used())
 		}
 		p.close()
 		src.chunk.Release()
 	})
+}
+
+// TestHandshakeGoexitContained_L51: a conn call that runs runtime.Goexit on
+// the handshake's own goroutine — Establish waiting for the PREFACE_ACK,
+// ReadHello reading the PREFACE — still closes the conn exactly once, and
+// Establish still releases its carrier ID; nothing is abandoned.
+func TestHandshakeGoexitContained_L51(t *testing.T) {
+	goexitRead := func(net.Conn, []byte) (int, error) { runtime.Goexit(); return 0, nil }
+	for _, side := range []string{"Establish", "ReadHello"} {
+		t.Run(side, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				hc := &hookConn{Conn: a, onRead: goexitRead}
+				go io.Copy(io.Discard, b) // the other end takes whatever is written; EOF once hc is closed
+				done := make(chan struct{})
+				returned := false
+				go func() {
+					defer close(done)
+					if side == "Establish" {
+						f := Factory{Name: "g", Dial: func(context.Context) (net.Conn, error) { return hc, nil }}
+						_, _ = Establish(context.Background(), env, f, env.IDs.Next(), wire.TypeOpen, openPayload(0), nil)
+					} else {
+						_, _ = ReadHello(env, hc, time.Now().Add(time.Second), 4096, nil)
+					}
+					returned = true
+				}()
+				<-done
+				synctest.Wait() // the guarded close ran
+				b.Close()
+				if returned {
+					t.Fatal("the stimulus did not happen: the handshake returned")
+				}
+				if hc.reads.Load() != 1 || hc.closes.Load() != 1 {
+					t.Fatalf("reads %d (want the Goexit one), conn closed %d times", hc.reads.Load(), hc.closes.Load())
+				}
+				if env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
+					t.Fatalf("IDs in use %d, abandoned %d", env.IDs.inUse(), env.Abandon.Len())
+				}
+			})
+		})
+	}
+}
+
+// TestDoneSettlesAccountsFirst_L52: what a joiner reads after Done is final
+// when Done closes — the reader stuck in an embedder Read is already
+// counted in the abandoned-call pool (Status.Abandoned, the Full fail-fast
+// gate) and the CarrierID is already released. Holding the ID allocator's
+// lock (white-box, real time: a mutex is no durable block for synctest)
+// parks the carrier exactly at its release: by then the stuck reader must
+// be counted and Done must still be open.
+func TestDoneSettlesAccountsFirst_L52(t *testing.T) {
+	env := hEnv()
+	env.Timing.AbandonWait = 20 * time.Millisecond
+	a, b := net.Pipe()
+	go io.Copy(io.Discard, b) // ends when the carrier closes its end
+	release := make(chan struct{})
+	hc := &hookConn{Conn: a, onRead: func(net.Conn, []byte) (int, error) {
+		<-release // ignores deadlines and Close
+		return 0, io.EOF
+	}}
+	id := env.IDs.Next()
+	c := newConn(env, hc, id, hPeerInst, 0, "f0", true) // a dialer carrier: Done releases its ID
+	c.Start(&hEP{}, &hBell{}, StartOptions{})
+	var once sync.Once
+	unstick := func() { once.Do(func() { close(release) }) }
+	env.IDs.mu.Lock()
+	locked := true
+	defer func() { // a failed assertion still unparks the carrier and its reader
+		if locked {
+			env.IDs.mu.Unlock()
+		}
+		unstick()
+	}()
+	c.Kill(CauseLocalClose, "shutdown")
+	for start := time.Now(); env.Abandon.Len() != 1; time.Sleep(time.Millisecond) {
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("the stuck reader was not counted before the ID release (abandoned %d)", env.Abandon.Len())
+		}
+	}
+	select {
+	case <-c.Done():
+		t.Fatal("Done closed before the CarrierID was released")
+	case <-time.After(20 * time.Millisecond):
+	}
+	env.IDs.mu.Unlock()
+	locked = false
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done did not close after the ID allocator was released")
+	}
+	if env.IDs.inUse() != 0 || env.Abandon.Len() != 1 {
+		t.Fatalf("after Done: IDs in use %d, abandoned %d", env.IDs.inUse(), env.Abandon.Len())
+	}
+	unstick()
+	for start := time.Now(); env.Abandon.Len() != 0; time.Sleep(time.Millisecond) {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("the reader did not leave the pool after its Read returned")
+		}
+	}
 }

@@ -103,8 +103,12 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // with valid magic and CRC from another major (wire.ErrMajor) is reported as
 // PrefaceVersion and one with unknown required bits (wire.ErrFeature) as
 // PrefaceFeature (design §5.1). When ctx is cancelled with cause ErrWithdrawn
-// after the first frame was written, Establish writes a best-effort
-// RST(wire.RstWithdrawn) (bounded, guarded) before closing (L49).
+// after the first frame was written, Establish returns at once and writes a
+// best-effort RST(wire.RstWithdrawn) (bounded, guarded) before closing
+// (L49). Both RSTs are followed by the L05 close order on a guarded
+// goroutine (CloseWrite on an OwnedTCP, a drain of what the passive already
+// sent bounded by 1 s, Close), so an answer racing the withdrawal cannot
+// turn the close into a TCP reset that discards the RST.
 //
 // Further contracts of this implementation: Hooks.DialStart(f.Index) runs
 // right before the factory call, on the guarded goroutine (a hook that
@@ -112,7 +116,10 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // Establish owns id — the returned Conn
 // releases it to env.IDs when its Done closes, and a failed attempt
 // releases it before returning; every conn it obtained is closed exactly
-// once unless it is returned inside the Established; an accepted response
+// once unless it is returned inside the Established, also when a conn call
+// runs runtime.Goexit on the caller's goroutine (L51: the id is released
+// then too, and the caller's own deferred cleanup must report the attempt);
+// an accepted response
 // is OPEN_ACK (for OPEN), JOIN_ACK (for JOIN) or PONG (for PING), or CLOSE
 // or GOAWAY for any of them, and every one is fully validated (CRC, fseq,
 // canonical payload) before it is returned; a well-formed non-OK
@@ -141,7 +148,25 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		panic("rendr/carrier: Establish: first frame must be OPEN, JOIN or PING")
 	}
 
+	// returned is set on every return path; a conn call that runs
+	// runtime.Goexit on this goroutine skips them all, and the deferred
+	// cleanup then closes the conn exactly once and releases id (L51).
+	var g *hsGuard
+	returned := false
+	defer func() {
+		if returned {
+			return
+		}
+		if g != nil {
+			g.finish()
+			g.closeWith(nil, false)
+		}
+		if env.IDs != nil {
+			env.IDs.Release(id)
+		}
+	}()
 	fail := func(e *EstablishError) (*Established, error) {
+		returned = true
 		if env.IDs != nil {
 			env.IDs.Release(id)
 		}
@@ -180,7 +205,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		return fail(&EstablishError{Stage: "dial", Cause: CauseTransportError, Err: err})
 	}
 
-	g := &hsGuard{env: env, nc: nc, ctx: ctx, firstWritten: f.DialEarly != nil}
+	g = &hsGuard{env: env, nc: nc, ctx: ctx, firstWritten: f.DialEarly != nil, left: make(chan struct{})}
 	if t == wire.TypeOpen {
 		g.rst = withdrawFrame(first + 1)
 	}
@@ -196,9 +221,9 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 				cause, err = CauseTransportError, fmt.Errorf("%w (%v)", errDialTimeout, err)
 			}
 		} else if rst {
-			g.closeWith(g.rst)
+			g.closeWith(g.rst, false)
 		}
-		g.closeWith(nil)
+		g.closeWith(nil, false)
 		e := &EstablishError{Stage: stage, Cause: cause, PrefaceOK: prefaceOK, Err: err}
 		if prefaceOK {
 			e.Instance = inst
@@ -207,6 +232,11 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	}
 
 	_ = callSetDeadline(nc, deadline)
+	if g.isAborted() {
+		// The abort ran before this deadline was set and may have been
+		// overridden by it; every later abort unblocks the conn after it.
+		return failed("preface", CauseTransportError, false, [16]byte{}, errors.New("attempt ended"), false)
+	}
 	if f.DialEarly == nil {
 		if err := writeFull(nc, hello); err != nil {
 			return failed("preface", CauseTransportError, false, [16]byte{}, err, false)
@@ -253,7 +283,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		if g.finish() && ctx.Err() != nil {
 			e.Cause, e.Err = CauseLocalClose, context.Cause(ctx)
 		}
-		g.closeWith(nil)
+		g.closeWith(nil, false)
 		return fail(e)
 	}
 	if check != nil {
@@ -299,6 +329,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	if t == wire.TypePing {
 		c.st.nextPingID = pingID + 1
 	}
+	returned = true
 	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p}, nil
 }
 
@@ -361,6 +392,7 @@ type hsGuard struct {
 	nc           net.Conn
 	ctx          context.Context // the caller's context (its cause tells a withdrawal)
 	rst          []byte          // RST(withdrawn) for an OPEN; nil otherwise
+	left         chan struct{}   // closed by finish: the handshake no longer touches the conn
 	closed       atomic.Bool
 	mu           sync.Mutex
 	finished     bool
@@ -378,23 +410,35 @@ func (g *hsGuard) abort() {
 	rst := g.rst != nil && g.firstWritten && errors.Is(context.Cause(g.ctx), ErrWithdrawn)
 	g.mu.Unlock()
 	if rst {
-		g.closeWith(g.rst)
+		g.closeWith(g.rst, true)
 		return
 	}
-	g.closeWith(nil)
+	g.closeWith(nil, false)
 }
 
 // finish ends the guarded phase and reports whether abort ran first.
 func (g *hsGuard) finish() (aborted bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.finished = true
+	if !g.finished {
+		g.finished = true
+		close(g.left)
+	}
 	return g.aborted
 }
 
-// closeWith closes the conn once: with frame non-nil it first writes it
-// (bounded by drainMax), all on a guarded goroutine.
-func (g *hsGuard) closeWith(frame []byte) {
+// isAborted reports whether abort ran.
+func (g *hsGuard) isAborted() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.aborted
+}
+
+// closeWith closes the conn once, on a guarded goroutine: with frame nil at
+// once (SetDeadline(now), Close); otherwise after writing frame in the L05
+// order (writeThenClose). concurrent says that the handshake may still be
+// inside a conn call (abort), which must be unblocked before the drain.
+func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 	if !g.closed.CompareAndSwap(false, true) {
 		return
 	}
@@ -402,17 +446,45 @@ func (g *hsGuard) closeWith(frame []byte) {
 		CloseConn(g.env, g.nc)
 		return
 	}
-	writeThenClose(g.env, g.nc, frame)
+	var left <-chan struct{}
+	if concurrent {
+		left = g.left
+	}
+	writeThenClose(g.env, g.nc, frame, left)
 }
 
-// writeThenClose writes frame (bounded by drainMax) and closes nc on a
-// guarded goroutine counted in the abandoned-call pool when it hangs.
-func writeThenClose(env *Env, nc net.Conn, frame []byte) {
-	w := startWatch(env.Abandon, env.Timing.withDefaults().AbandonWait+drainMax)
+// writeThenClose writes frame and closes nc in the L05 order — the frame
+// (bounded by drainMax), CloseWrite on an OwnedTCP, a drain bounded by
+// drainMax, then SetDeadline(now) and Close — on a guarded goroutine
+// counted in the abandoned-call pool when it hangs. The drain reads what
+// the passive already sent (an OPEN_ACK racing a withdrawal), so the close
+// never answers unread bytes with a TCP reset that could discard the frame
+// before the passive read it (Windows drops buffered data on a reset).
+// When left is non-nil the handshake may still be blocked in a Read of nc:
+// the goroutine first unblocks it (SetReadDeadline(now); the handshake
+// returns at once) and waits until it left the conn, at most drainMax, so
+// the drain never competes with it.
+func writeThenClose(env *Env, nc net.Conn, frame []byte, left <-chan struct{}) {
+	w := startWatch(env.Abandon, env.Timing.withDefaults().AbandonWait+3*drainMax)
 	go func() {
 		defer w.finish()
+		defer closeNow(nc) // exactly once, also on runtime.Goexit in a conn call (L51)
+		if left != nil {
+			_ = callSetReadDeadline(nc, time.Now())
+			t := time.NewTimer(drainMax)
+			select {
+			case <-left:
+			case <-t.C:
+			}
+			t.Stop()
+		}
 		_ = callSetWriteDeadline(nc, time.Now().Add(drainMax))
-		_ = writeFull(nc, frame)
-		closeNow(nc)
+		if writeFull(nc, frame) != nil {
+			return
+		}
+		if o, ok := nc.(*OwnedTCP); ok {
+			_ = callCloseWrite(o)
+		}
+		drain(nc, time.Now().Add(drainMax))
 	}()
 }

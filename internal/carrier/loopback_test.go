@@ -104,11 +104,14 @@ func TestVectoredWriteOnOwnedTCP_L41(t *testing.T) {
 }
 
 // allocEP fills every round with one ACK and four 64 KiB DATA frames that
-// reference one chunk, allocating nothing.
+// reference one chunk, and takes received DATA like a session (a big
+// payload's Buf is released, a small one is not retained), allocating
+// nothing.
 type allocEP struct {
 	chunk *Buf
 	ack   wire.Ack
 	off   uint64
+	rx    struct{ big, small int }
 }
 
 func (e *allocEP) Handle() uint32 { return wire.SessionHandle }
@@ -124,55 +127,145 @@ func (e *allocEP) Fill(c *Conn, b *Batch) {
 	}
 }
 
-func (e *allocEP) Data(*Conn, uint64, []byte, *Buf) error   { return nil }
+func (e *allocEP) Data(_ *Conn, _ uint64, _ []byte, buf *Buf) error {
+	if buf != nil {
+		e.rx.big++
+		buf.Release()
+	} else {
+		e.rx.small++
+	}
+	return nil
+}
 func (e *allocEP) Control(*Conn, wire.Header, []byte) error { return nil }
 func (e *allocEP) WriteBlocked(*Conn)                       {}
 
-// TestSteadyStateZeroAllocs_L41_L54 (carrier half, §12.2): one writer
-// round — Fill, carrier control, seal, stall window and watchdog, the
-// per-batch write deadline and one vectored write of 256 KiB of DATA over
-// an OwnedTCP loopback pair — allocates nothing. The count is asserted in
-// the non-race lane only (the race detector instruments allocations).
+// TestSteadyStateZeroAllocs_L41_L54 (carrier half, §12.2), over an OwnedTCP
+// loopback pair. Writer: one round — carrier control with a PING and a
+// PONG, Fill, seal, stall window and watchdog, the per-batch write deadline
+// and one vectored write of an ACK and 256 KiB of DATA — allocates nothing.
+// Reader: one group of frames — a 64 KiB DATA read straight into a pooled
+// Buf and handed over by reference, a 1000-byte DATA, a PING and a PONG
+// matching a committed PING record — allocates nothing. The counts are
+// asserted in the non-race lane only (the race detector instruments
+// allocations and makes sync.Pool drop items).
 func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
-	env := hEnv()
-	cl, sv := tcpPair(t)
-	defer sv.Close()
-	go func() { // the receiver discards everything (no allocation per read)
-		buf := make([]byte, 1<<20)
-		for {
-			if _, err := sv.Read(buf); err != nil {
-				return
+	t.Run("writer", func(t *testing.T) {
+		env := hEnv()
+		cl, sv := tcpPair(t)
+		defer sv.Close()
+		go func() { // the receiver discards everything (no allocation per read)
+			buf := make([]byte, 1<<20)
+			for {
+				if _, err := sv.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+		c := hConn(env, NewOwnedTCP(cl))
+		ep := &allocEP{chunk: env.Bufs.Get(ChunkSize, nil)}
+		defer ep.chunk.Release()
+		c.ep = ep
+		c.writerInit()
+		round := func() {
+			// Every round also carries a PING (requested, the records of
+			// earlier rounds answered) and a PONG for the peer's latest PING.
+			c.mu.Lock()
+			c.st.head, c.st.n = 0, 0
+			c.st.pingReq = true
+			c.st.pong, c.st.pongDue = wire.Ping{ID: 9, Nonce: 99}, true
+			c.mu.Unlock()
+			if !c.writeRound(&c.wr) {
+				_, cause, detail, _ := c.Death()
+				t.Fatalf("writer round ended the carrier: %v %s", cause, detail)
+			}
+			if !c.wr.ping {
+				t.Fatal("a round without its PING")
 			}
 		}
-	}()
-	c := hConn(env, NewOwnedTCP(cl))
-	ep := &allocEP{chunk: env.Bufs.Get(ChunkSize, nil)}
-	defer ep.chunk.Release()
-	c.ep = ep
-	c.writerInit()
-	round := func() {
-		if !c.writeRound(&c.wr) {
-			_, cause, detail, _ := c.Death()
-			t.Fatalf("writer round ended the carrier: %v %s", cause, detail)
+		for range 20 { // warm up: the poller's deadline timer, the iovec pool
+			round()
 		}
-	}
-	for range 20 { // warm up: the first PING, the poller's deadline timer, the iovec pool
-		round()
-	}
-	allocs := testing.AllocsPerRun(100, round)
-	frames := c.Stats().Frames
-	c.Kill(CauseLocalClose, "test end")
-	<-c.Done()
-	if frames < 120*5 || c.wr.vectored < 120 {
-		t.Fatalf("%d frames in %d vectored writes", frames, c.wr.vectored)
-	}
-	if carrierRace {
-		t.Logf("race lane: %v allocations per round (not asserted)", allocs)
-		return
-	}
-	if allocs != 0 {
-		t.Fatalf("%v allocations per writer round", allocs)
-	}
+		allocs := testing.AllocsPerRun(100, round)
+		frames := c.Stats().Frames
+		c.Kill(CauseLocalClose, "test end")
+		<-c.Done()
+		if frames < 121*7 || c.wr.vectored < 121 {
+			t.Fatalf("%d frames in %d vectored writes, want 7 per round", frames, c.wr.vectored)
+		}
+		if carrierRace {
+			t.Logf("race lane: %v allocations per round (not asserted)", allocs)
+			return
+		}
+		if allocs != 0 {
+			t.Fatalf("%v allocations per writer round", allocs)
+		}
+	})
+	t.Run("reader", func(t *testing.T) {
+		env := hEnv()
+		cl, sv := tcpPair(t)
+		defer sv.Close()
+		c := hConn(env, NewOwnedTCP(cl))
+		ep := &allocEP{}
+		c.ep = ep
+		c.rd.stage = env.Bufs.Get(BigData, env.Budget)
+		const groups = 20 + 1 + 100
+		var stream []byte
+		fseq := env.Presets.firstFseq()
+		frame := func(t wire.Type, handle uint32, payload []byte) {
+			stream = wire.AppendFrame(stream, wire.Header{Type: t, Fseq: fseq, Handle: handle}, payload)
+			fseq++
+		}
+		var off uint64
+		for i := range uint32(groups) {
+			frame(wire.TypeData, wire.SessionHandle, dataPayload(off, ChunkSize))
+			off += ChunkSize
+			frame(wire.TypeData, wire.SessionHandle, dataPayload(off, 1000))
+			off += 1000
+			frame(wire.TypePing, 0, pingPayload(wire.Ping{ID: i}))
+			frame(wire.TypePong, 0, pingPayload(wire.Ping{ID: i + 1, Nonce: c.salt ^ uint64(i+1)}))
+		}
+		written := make(chan error, 1)
+		go func() { _, err := sv.Write(stream); written <- err }()
+		var id uint32
+		group := func() {
+			id++ // the PING record this group's PONG answers, committed just now
+			c.mu.Lock()
+			c.st.push(pingRecord{id: id, nonce: c.salt ^ uint64(id), committedAt: time.Now()})
+			c.mu.Unlock()
+			for range 4 {
+				if !c.readFrame(&c.rd) {
+					_, cause, detail, _ := c.Death()
+					t.Fatalf("the reader stopped: %v %s", cause, detail)
+				}
+			}
+		}
+		for range 20 { // warm up: the receive-buffer class pool
+			group()
+		}
+		allocs := testing.AllocsPerRun(100, group)
+		if err := <-written; err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		records, sampled := c.st.n, c.st.rttSeen
+		c.mu.Unlock()
+		if ep.rx.big != groups || ep.rx.small != groups || records != 0 || !sampled || c.Stats().RxBytes != off {
+			t.Fatalf("delivered %d big and %d small payloads (%d bytes), %d PING records left (RTT sampled %v)", ep.rx.big, ep.rx.small, c.Stats().RxBytes, records, sampled)
+		}
+		c.rd.stage.Release()
+		c.Kill(CauseLocalClose, "test end")
+		<-c.Done()
+		if env.Budget.Used() != 0 {
+			t.Fatalf("budget %d after every buffer was released", env.Budget.Used())
+		}
+		if carrierRace {
+			t.Logf("race lane: %v allocations per group (not asserted)", allocs)
+			return
+		}
+		if allocs != 0 {
+			t.Fatalf("%v allocations per group of received frames", allocs)
+		}
+	})
 }
 
 // BenchmarkCarrierStream (perf lane, §12.4): one carrier writes DATA over

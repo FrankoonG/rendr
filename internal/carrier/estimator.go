@@ -328,12 +328,19 @@ func (c *Conn) gaugeUpdateLocked() {
 }
 
 // endGaugeLocked withdraws the whole contribution when the carrier ends.
+// It marks the end even while no gauge is installed yet: a Kill that races
+// Start runs before Start installs the gauge, and the reader may still
+// account frames until the closer's Close, so nothing may be contributed
+// afterwards.
 func (c *Conn) endGaugeLocked() {
 	st := &c.st
-	if st.gauge == nil || st.gEnded {
+	if st.gEnded {
 		return
 	}
 	st.gEnded = true
+	if st.gauge == nil {
+		return
+	}
 	if st.gContrib != 0 {
 		st.gauge.AddInflight(-st.gContrib)
 		st.gContrib = 0

@@ -24,9 +24,12 @@ type Endpoint interface {
 	// (StartOptions.Hold) the first response frame (OPEN_ACK or JOIN_ACK)
 	// before anything else; then session control (RST, SCHED, ACK, FIN) and
 	// then DATA (rescue span, retransmissions, new data) within b.Room() and
-	// the carrier's capacity. It appends nothing when it has nothing to send;
-	// it may call b.WakeAt to be called again at a time (ACK delay) and
-	// b.MarkCapBlocked when data waits on the capacity cap. The writer never
+	// the carrier's capacity: c.Inflight() counts only batches already
+	// written, so Fill stops pulling DATA once c.Inflight() plus the DATA
+	// bytes it appended in this round reach c.Capacity(). It appends
+	// nothing when it has nothing to send; it may call b.WakeAt to be
+	// called again at a time (ACK delay) and b.MarkCapBlocked when data
+	// waits on the capacity cap. The writer never
 	// calls Fill again after its own Kill or after it saw the death record
 	// (it exits); a Fill that was already running when another goroutine
 	// killed the carrier may still complete, so the endpoint's owner must
@@ -364,7 +367,9 @@ func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 
 // Done is closed when the reader and writer exited (or were abandoned
 // after Timing.AbandonWait) and the embedder conn was closed or its close
-// abandoned. The CarrierID is released then.
+// abandoned. Before it closes, the CarrierID is released and every
+// abandoned goroutine is counted in Env.Abandon, so a joiner woken by Done
+// sees the final state.
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // PeerClosed reports that the peer sent CLOSE on this carrier.
@@ -392,7 +397,9 @@ func (c *Conn) SRTT() time.Duration {
 }
 
 // Inflight returns DATA payload bytes written and not yet proven received by
-// a PONG watermark (submitted − pongMark).
+// a PONG watermark (submitted − pongMark). Bytes join it when the write of
+// their batch returned: the batch being filled or written is not included
+// (Fill adds what it appended itself, see Endpoint.Fill).
 func (c *Conn) Inflight() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -484,6 +491,10 @@ func (c *Conn) startCloser(mode closeMode, frame []byte, deadline time.Time) {
 
 func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 	defer c.partDone(partCloser) // also on runtime.Goexit inside an embedder call
+	// Deferred, so the conn is closed exactly once also when one of the
+	// embedder calls below (CloseWrite, the verdict write, the drain) calls
+	// runtime.Goexit (L51).
+	defer closeNow(c.nc)
 	switch mode {
 	case closeRetired:
 		if c.owned != nil {
@@ -498,7 +509,6 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 			drain(c.nc, time.Now().Add(drainMax))
 		}
 	}
-	closeNow(c.nc)
 }
 
 // drain reads and discards until EOF, an error or the time until (L05:
@@ -530,23 +540,30 @@ func (c *Conn) partDone(p uint8) {
 
 // abandonParts counts every part still running AbandonWait after the close
 // as abandoned (L52) and lets Done close; each leaves the pool when its
-// embedder call finally returns.
+// embedder call finally returns. The parts enter the pool before Done
+// closes (Adopt is an atomic add, safe under the leaf lock), so a joiner
+// woken by Done already sees them in Status.Abandoned and in the Full
+// fail-fast gate; partDone reads the abandoned bits under the same lock, so
+// a part's Leave always follows its Adopt.
 func (c *Conn) abandonParts() {
 	c.jmu.Lock()
+	defer c.jmu.Unlock()
 	stuck := c.join.running &^ c.join.abandoned
 	c.join.abandoned |= stuck
-	c.maybeDoneLocked()
-	c.jmu.Unlock()
-	if c.env.Abandon == nil {
-		return
-	}
-	for p := partReader; p <= partCloser; p <<= 1 {
-		if stuck&p != 0 {
-			c.env.Abandon.Adopt()
+	if c.env.Abandon != nil {
+		for p := partReader; p <= partCloser; p <<= 1 {
+			if stuck&p != 0 {
+				c.env.Abandon.Adopt()
+			}
 		}
 	}
+	c.maybeDoneLocked()
 }
 
+// maybeDoneLocked closes Done once the closer started and every part
+// finished or was abandoned. Every account settles before Done closes —
+// the abandoned parts are counted (abandonParts) and the CarrierID is
+// released here — so a joiner woken by Done never sees a stale state.
 func (c *Conn) maybeDoneLocked() {
 	j := &c.join
 	if !j.closing || j.doneClosed || j.running&^j.abandoned != 0 {
@@ -559,10 +576,10 @@ func (c *Conn) maybeDoneLocked() {
 	if j.drain != nil {
 		j.drain.Stop()
 	}
-	close(c.done)
 	if c.dialer && c.env.IDs != nil {
-		c.env.IDs.Release(c.id)
+		c.env.IDs.Release(c.id) // the allocator's lock is a leaf
 	}
+	close(c.done)
 }
 
 // finishRetire ends a planned retirement (both CLOSEs exchanged, EOF or
@@ -573,6 +590,21 @@ func (c *Conn) finishRetire(detail string) {
 	if c.setDeath(CauseRetired, detail) {
 		c.startCloser(closeRetired, nil, time.Time{})
 	}
+}
+
+// endIfPeerClosed ends the planned retirement instead of a death when the
+// peer already sent CLOSE, and reports whether it did. The peer sends
+// nothing after its CLOSE — no PONG either — and closes the conn after its
+// bounded drain, so a failed or stalled write and an unanswered PING after
+// it are the end of that retirement, not evidence against the path (as a
+// read error after a CLOSE, readFailed). The cause then stays retired: no
+// failed mark, no immediate redial, no death migration (design §7.3).
+func (c *Conn) endIfPeerClosed(detail string) bool {
+	if !c.peerClosed.Load() {
+		return false
+	}
+	c.finishRetire("retired: " + detail + " after the peer's CLOSE")
+	return true
 }
 
 // closeWritten runs on the writer right after the batch carrying our CLOSE
@@ -600,9 +632,11 @@ func (c *Conn) closeWritten() {
 // WriteAndClose writes one frame (the next tx fseq) on an unstarted Conn —
 // an admission verdict such as OPEN_ACK(CAPACITY), JOIN_ACK(UNKNOWN_SESSION)
 // or CLOSE(capacity) — bounded by deadline, then closes it in the L05 order
-// (CloseWrite on OwnedTCP only, bounded drain, Close). It returns at once;
-// the work runs on a guarded goroutine. The death record becomes
-// CauseLocalClose. On a started or already dead Conn it only kills it.
+// (CloseWrite on OwnedTCP only, bounded drain, Close). A zero deadline
+// means now + 1 s (the drain bound): the write is never unbounded, so the
+// conn is closed once the write gave up. It returns at once; the work runs
+// on a guarded goroutine. The death record becomes CauseLocalClose. On a
+// started or already dead Conn it only kills it.
 func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []byte, deadline time.Time) {
 	c.jmu.Lock()
 	started := c.join.started
@@ -610,6 +644,9 @@ func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []
 	if started {
 		c.Kill(CauseLocalClose, "WriteAndClose on a started carrier")
 		return
+	}
+	if deadline.IsZero() {
+		deadline = time.Now().Add(drainMax)
 	}
 	frame := wire.AppendFrame(nil, wire.Header{Type: t, Flags: flags, Fseq: c.wr.fseq, Handle: handle}, payload)
 	if !c.setDeath(CauseLocalClose, "closed after a "+t.String()) {

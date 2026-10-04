@@ -18,6 +18,10 @@ type writer struct {
 	timer *time.Timer
 	vec   net.Buffers // OwnedTCP: the reused iovec backing array
 	vv    net.Buffers // the vector handed to WriteBuffers; a field, so taking its address allocates nothing
+	// scratch is the coalescing copy of the batch while its Write runs
+	// (every conn but an OwnedTCP): pooled and charged to the Budget,
+	// released only after the Write returned or unwound (§4.1).
+	scratch *Buf
 
 	// The current round.
 	ping   bool // the batch carries a PING
@@ -87,8 +91,15 @@ func (c *Conn) writeLoop() {
 			c.Kill(CauseTransportError, "conn Write called runtime.Goexit")
 		}
 		w := &c.wr
+		// The embedder call returned or unwound: release the chunk
+		// references and the coalescing scratch (only this goroutine pools
+		// its buffers, §4.1).
 		if w.b != nil {
-			w.b.Reset(time.Time{}) // the embedder call returned: release the chunk references
+			w.b.Reset(time.Time{})
+		}
+		if w.scratch != nil {
+			w.scratch.Release()
+			w.scratch = nil
 		}
 		if w.timer != nil {
 			w.timer.Stop()
@@ -120,6 +131,13 @@ func (c *Conn) writeRound(w *writer) bool {
 	b := w.b
 	b.Reset(now)
 	w.ping, w.close = false, false
+	// The cap-blocked flag is published before Fill and corrected after it
+	// (§3.5: set the waiting flag, then evaluate). A PONG that frees
+	// capacity while Fill decides at the cap therefore always sees it set
+	// and wakes the writer, so a round that ends cap-blocked with nothing to
+	// write never sleeps past the capacity that PONG proved (C5, R13). A
+	// PONG during a round that is not cap-blocked costs one extra round.
+	c.capBlocked.Store(true)
 	epFrames := false
 	var retiring bool
 	var reason wire.CloseReason
@@ -132,6 +150,7 @@ func (c *Conn) writeRound(w *writer) bool {
 		if b.Len() > 0 {
 			w.held, epFrames = false, true
 		} else if !c.isRetiring() {
+			c.capBlocked.Store(b.CapBlocked())
 			return c.sleep(w, now)
 		}
 		retiring, reason = c.appendCarrierControl(w, b, now)
@@ -166,8 +185,10 @@ func (c *Conn) isRetiring() bool {
 }
 
 // checkDeadlines kills the carrier when its oldest committed PING passed
-// the death deadline (L25) and retires a sessionless carrier that saw no
-// PING for SessionlessIdle (§6.4). It reports a death (the writer exits).
+// the death deadline (L25) — after the peer's CLOSE, which no PONG follows,
+// that ends the retirement instead — and retires a sessionless carrier that
+// saw no PING for SessionlessIdle (§6.4). It reports an end (the writer
+// exits).
 func (c *Conn) checkDeadlines(now time.Time) bool {
 	c.mu.Lock()
 	dead, _, waited := c.deathDueLocked(now)
@@ -177,7 +198,9 @@ func (c *Conn) checkDeadlines(now time.Time) bool {
 	}
 	c.mu.Unlock()
 	if dead {
-		c.Kill(CausePingTimeout, "no PONG for "+waited.String())
+		if !c.endIfPeerClosed("no PONG") {
+			c.Kill(CausePingTimeout, "no PONG for "+waited.String())
+		}
 		return true
 	}
 	return false
@@ -289,6 +312,9 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 	c.disarmWatchdog(gen)
 	b.ReleaseRefs() // the write returned: its chunk references go (L17, L43)
 	if err != nil {
+		if c.endIfPeerClosed("write ended (" + err.Error() + ")") {
+			return false
+		}
 		cause := CauseTransportError
 		if isTimeout(err) {
 			cause = CauseWriteStall
@@ -329,8 +355,13 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 // vectored write that references the send chunks (D3); every other conn
 // gets the batch copied into a pooled scratch and exactly one Write call
 // unless it writes short with progress, in which case the remainder follows
-// inside the same stall window (C23, L42). The scratch is released only
-// after the Write returned (abandoned-call rule, §4.1).
+// inside the same stall window (C23, L42). The scratch is charged to the
+// Budget like every other buffer (§4.1, plan §3.7: it shows in
+// BufferedBytes and in the window's memory-pressure feedback) and released
+// only after the Write returned (abandoned-call rule): a writer stuck in an
+// embedder Write keeps it, and its charge, until that Write returns. Its
+// class is the smallest that holds the batch; a full batch (256 KiB of DATA
+// plus framing) takes the 512 KiB class for the duration of the Write.
 func (c *Conn) physWrite(w *writer, b *Batch, total int) error {
 	if c.owned != nil {
 		w.vectored++
@@ -355,8 +386,9 @@ func (c *Conn) physWrite(w *writer, b *Batch, total int) error {
 	if total > MaxClass+ClassSlack { // only with a test BatchBudget beyond 1 MiB
 		return writeFull(c.nc, b.appendTo(make([]byte, 0, total)))
 	}
-	sc := c.env.Bufs.Get(total, nil)
-	err := writeFull(c.nc, b.appendTo(sc.B[:0]))
-	sc.Release()
+	w.scratch = c.env.Bufs.Get(total, c.env.Budget)
+	err := writeFull(c.nc, b.appendTo(w.scratch.B[:0]))
+	w.scratch.Release()
+	w.scratch = nil
 	return err
 }

@@ -13,11 +13,23 @@ import (
 type reader struct {
 	fseq  uint32 // next expected rx fseq (strict +1, wrapping: L14, L43)
 	stage *Buf   // one 16 KiB-class Buf, force-charged to the Budget for the reader's life (D29)
-	r, w  int    // stage.B[r:w] holds bytes read but not yet consumed
+	// big is the Buf a big DATA payload is being read into (nil otherwise):
+	// if an embedder Read calls runtime.Goexit while filling it, the
+	// reader's exit releases it with the stage (abandoned-call rule, §4.1).
+	big  *Buf
+	r, w int // stage.B[r:w] holds bytes read but not yet consumed
 	// pending is an error that a Read returned together with bytes (L01):
 	// the bytes are processed first, the error ends the reader when more
 	// bytes are needed.
 	pending error
+}
+
+// releaseBig releases the big-DATA buffer of a frame that is not handed over.
+func (rd *reader) releaseBig() {
+	if rd.big != nil {
+		rd.big.Release()
+		rd.big = nil
+	}
 }
 
 // errAfterClose: the peer sent a frame after its CLOSE (no frame follows
@@ -35,8 +47,11 @@ func (c *Conn) readLoop() {
 		if !normal { // runtime.Goexit inside an embedder Read (L51)
 			c.Kill(CauseTransportError, "conn Read called runtime.Goexit")
 		}
+		// The embedder call returned or unwound: only this goroutine pools
+		// its buffers (§4.1), so the Budget returns to zero (R7).
+		rd.releaseBig()
 		if rd.stage != nil {
-			rd.stage.Release() // the embedder call returned: only this goroutine pools its buffers (§4.1)
+			rd.stage.Release()
 			rd.stage = nil
 		}
 		c.partDone(partReader)
@@ -277,32 +292,33 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 	crc := wire.CRC(head) // before the stage is reused for the look-ahead
 	rd.r += wire.DataHeadLen
 	buf := c.env.Bufs.Get(n+LookAhead, c.env.Budget)
+	rd.big = buf
 	want := n + wire.TrailerLen
 	got := copy(buf.B[:want], sb[rd.r:rd.w])
 	rd.r += got
 	for got < want {
 		if rd.pending != nil {
-			buf.Release()
+			rd.releaseBig()
 			c.readFailed(rd.pending)
 			return false
 		}
 		rd.r, rd.w = 0, 0 // the stage is empty
 		m, err := callRead(c.nc, buf.B[got:n+LookAhead])
 		if m < 0 || m > n+LookAhead-got {
-			buf.Release()
+			rd.releaseBig()
 			c.readFailed(&countError{"Read", m, n + LookAhead - got})
 			return false
 		}
 		got += m
 		if err != nil {
 			if got < want {
-				buf.Release()
+				rd.releaseBig()
 				c.readFailed(err)
 				return false
 			}
 			rd.pending = err
 		} else if m == 0 {
-			buf.Release()
+			rd.releaseBig()
 			c.readFailed(errZeroRead)
 			return false
 		}
@@ -313,14 +329,15 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 	}
 	crc = wire.CRCUpdate(crc, buf.B[:n])
 	if crc != wire.Trailer(buf.B[n:want]) {
-		buf.Release()
+		rd.releaseBig()
 		c.violation("DATA: crc mismatch")
 		return false
 	}
 	rd.fseq++
 	c.frameArrived()
 	c.dataArrived(n)
-	if err := c.ep.Data(c, off, buf.B[:n], buf); err != nil { // buf's reference moved to the endpoint
+	rd.big = nil // buf's reference moves to the endpoint
+	if err := c.ep.Data(c, off, buf.B[:n], buf); err != nil {
 		c.violation("DATA: %v", err)
 		return false
 	}

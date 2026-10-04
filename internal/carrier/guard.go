@@ -161,10 +161,11 @@ func CloseConn(env *Env, nc net.Conn) {
 }
 
 // closeNow unblocks and closes nc: SetDeadline(now), then Close. Panics in
-// either call are contained (L51).
+// either call are contained, and Close is deferred so that it runs exactly
+// once even when SetDeadline calls runtime.Goexit (L51).
 func closeNow(nc net.Conn) {
+	defer func() { _ = callClose(nc) }()
 	_ = callSetDeadline(nc, time.Now())
-	_ = callClose(nc)
 }
 
 // watch counts a goroutine that is still inside embedder code AbandonWait

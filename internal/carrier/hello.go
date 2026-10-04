@@ -56,8 +56,25 @@ var (
 // on an OwnedTCP, a drain bounded by min(deadline, 1 s), Close) so that the
 // dialer reads the answer instead of a reset; PREFACE_ACK(OK) is written
 // right after the PREFACE is validated (P18); a PING first frame's pad is
-// streamed (never allocated by its length) and must be zero.
+// streamed (never allocated by its length) and must be zero; when a conn
+// call runs runtime.Goexit on the caller's goroutine, nc is still closed
+// exactly once (L51; the caller's own deferred cleanup must release its
+// handshake slot).
 func ReadHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
+	returned := false
+	defer func() {
+		if !returned { // runtime.Goexit inside an embedder conn call (L51)
+			CloseConn(env, nc)
+		}
+	}()
+	h, err := readHello(env, nc, deadline, maxMeta, gate)
+	returned = true
+	return h, err
+}
+
+// readHello is ReadHello without the Goexit guard: every return path closes
+// nc unless a Hello owns it.
+func readHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
 	fail := func(err error) (*Hello, error) {
 		CloseConn(env, nc)
 		return nil, err
