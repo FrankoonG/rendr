@@ -1,0 +1,239 @@
+package session
+
+import (
+	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/sched"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
+)
+
+// The SCHED protocol (design §7.5; L45, D6, D24). The dialer is the sole
+// authority: it publishes SCHED{epoch, data-eligible carrier IDs, cause}
+// whenever that set changes, offers it once on every live lane (Fill
+// places it where lane.schedSent differs from ctl.epoch) and then re-sends
+// it single-flight on one lane at a time until the passive echoes the
+// epoch in an ACK. The passive applies a newer epoch idempotently and
+// echoes it at once; when its sending lane dies or is retired it moves to
+// a local fallback first and follows the next epoch (routing only: only
+// the SCHED cause bits count migrations, P13).
+
+// publishSchedLocked (dialer) publishes the current data-eligible set —
+// the selector's active lane, or every bond member — with cause c as the
+// next epoch. With no data lane nothing is published (N ≥ 1, V15).
+func (a *actor) publishSchedLocked(now time.Time, c wire.SchedCause) {
+	s := a.s
+	ctl := &s.ctl
+	var set wire.Sched
+	for _, l := range s.lanes {
+		if l.data && set.N < wire.MaxSchedIDs {
+			set.IDs[set.N] = l.id
+			set.N++
+		}
+	}
+	if set.N == 0 {
+		return
+	}
+	ctl.epoch++
+	set.Epoch = ctl.epoch
+	ctl.set, ctl.cause = set, c
+	for _, l := range s.lanes {
+		if l.state != LaneDead && !l.c.CloseSent() {
+			wakeLaneLocked(l) // offered once on every live lane
+		}
+	}
+	a.resendAt = now.Add(a.resendEvery())
+	a.dirty = true
+}
+
+// resendEvery is the SCHED resend interval clamp(2 × min srtt, 50 ms, 1 s).
+func (a *actor) resendEvery() time.Duration {
+	var m time.Duration
+	for _, l := range a.s.lanes {
+		if r := l.port.SRTT(); r > 0 && (m == 0 || r < m) {
+			m = r
+		}
+	}
+	return min(max(2*m, minResend), maxResend)
+}
+
+// schedResendLocked (dialer) re-sends an unechoed SCHED on the next live
+// lane in rotation that is not write-blocked (D6): setting its schedSent to
+// epoch − 1 makes its Fill place the SCHED once more.
+func (a *actor) schedResendLocked(now time.Time) {
+	s := a.s
+	ctl := &s.ctl
+	if a.d == nil || ctl.set.N == 0 || !sched.EpochNewer(ctl.epoch, ctl.echoed) {
+		a.resendAt = time.Time{}
+		return
+	}
+	if a.resendAt.IsZero() {
+		a.resendAt = now.Add(a.resendEvery())
+	}
+	if now.Before(a.resendAt) {
+		a.want(a.resendAt)
+		return
+	}
+	if l := a.resendLaneLocked(); l != nil {
+		l.schedSent = ctl.epoch - 1
+		wakeLaneLocked(l)
+	}
+	a.resendAt = now.Add(a.resendEvery())
+	a.want(a.resendAt)
+}
+
+// resendLaneLocked picks the next lane for a SCHED resend: live, CLOSE not
+// written, preferably neither write-blocked nor retired.
+func (a *actor) resendLaneLocked() *lane {
+	lanes := a.s.lanes
+	var fallback *lane
+	for k := range lanes {
+		i := (a.resendIdx + k) % len(lanes)
+		l := lanes[i]
+		if l.state == LaneDead || l.c.CloseSent() {
+			continue
+		}
+		if l.port.WriteBlocked() || l.retireCalled {
+			if fallback == nil {
+				fallback = l
+			}
+			continue
+		}
+		a.resendIdx = i + 1
+		return l
+	}
+	return fallback
+}
+
+// applySchedLocked (passive) applies the newest SCHED stored by the stream
+// if its epoch is newer than the applied one (L45: 3, 1, 2 ends at 3), then
+// echoes it at once with an urgent ACK.
+func (a *actor) applySchedLocked(now time.Time) {
+	s := a.s
+	ctl := &s.ctl
+	if !ctl.schedInSet || !sched.EpochNewer(ctl.schedIn.Epoch, ctl.epoch) {
+		return
+	}
+	ctl.epoch = ctl.schedIn.Epoch
+	ctl.set = ctl.schedIn
+	ctl.cause = ctl.schedInCause
+	a.dirty = true
+	a.passiveRouteLocked(now)
+	s.bumpAckLocked(true)
+}
+
+// schedLists reports whether set names carrier id.
+func schedLists(set *wire.Sched, id uint32) bool {
+	for _, x := range set.IDs[:set.N] {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// passiveRouteLocked recomputes the passive's send set (§7.5): selector →
+// the lane the applied SCHED names, if usable; else the current sender
+// while it is alive; else the local fallback (D24) — the newest usable
+// lane. A lane leaving the set has its spans requeued, so reverse traffic
+// leaves it within one RTT (L45).
+//
+// Counting (§7.6, P13, C26): when the named lane becomes the sender and
+// differs from the previously named one, the SCHED's cause counts (death,
+// quality, explicit; initial never) — also when the named lane attached
+// later. A local fallback is routing only, so both ends count alike.
+func (a *actor) passiveRouteLocked(now time.Time) {
+	s := a.s
+	ctl := &s.ctl
+	if a.ending || (ctl.state != StateOpen && ctl.state != StateClosing) {
+		return
+	}
+	if s.p.Mode == ModeBond {
+		a.passiveBondRouteLocked()
+		return
+	}
+	var named *lane
+	if ctl.set.N > 0 {
+		if l := a.laneByIDLocked(ctl.set.IDs[0]); l != nil && s.usableLocked(l) {
+			named = l
+		}
+	}
+	cur := ctl.active
+	next := cur
+	switch {
+	case named != nil:
+		next = named
+	case cur != nil && s.aliveLocked(cur) && !cur.c.CloseSent():
+		// keep (the epoch-0 sender may still be placing its OPEN_ACK)
+	default:
+		next = a.newestUsableLocked(nil)
+	}
+	if next != cur {
+		if cur != nil && cur.state != LaneDead {
+			cur.data = false
+			if cur.state == LaneActive {
+				cur.state = LaneMember
+			}
+			s.requeueLocked(cur)
+		}
+		ctl.active = next
+		if next != nil {
+			next.data = true
+			if next.state != LaneJoining {
+				next.state = LaneActive
+			}
+		}
+		s.routingChangedLocked()
+		a.dirty = true
+	}
+	if named != nil && named.id != a.named {
+		from := a.named
+		a.named = named.id
+		a.countLocked(now, ctl.cause, from, named.id, schedEventCause(ctl.cause))
+	}
+}
+
+// passiveBondRouteLocked: the data lanes are the usable lanes the applied
+// SCHED lists; before the first SCHED, the epoch-0 senders chosen at
+// Confirm; with none, the newest usable lane (D24).
+func (a *actor) passiveBondRouteLocked() {
+	s := a.s
+	ctl := &s.ctl
+	changed, have := false, false
+	for _, l := range s.lanes {
+		want := l.data && s.aliveLocked(l)
+		if ctl.set.N > 0 {
+			want = s.usableLocked(l) && schedLists(&ctl.set, l.id)
+		}
+		if want != l.data {
+			l.data = want
+			if !want {
+				s.requeueLocked(l)
+			}
+			changed = true
+		}
+		have = have || want
+	}
+	if !have {
+		if fb := a.newestUsableLocked(nil); fb != nil {
+			fb.data = true
+			changed = true
+		}
+	}
+	if changed {
+		s.routingChangedLocked()
+		a.dirty = true
+	}
+}
+
+// schedEventCause is the Event cause of a passive migration counted from a
+// SCHED.
+func schedEventCause(c wire.SchedCause) carrier.Cause {
+	switch c {
+	case wire.SchedQuality:
+		return carrier.CauseQuality
+	case wire.SchedExplicit:
+		return carrier.CauseRetired
+	}
+	return carrier.CauseNone
+}

@@ -22,9 +22,10 @@ type mailbox struct {
 	// cmds holds the commands not yet drained, in arrival order. Bounded by
 	// construction: at most one dial result per slot, one adopt per admitted
 	// carrier and four application/admission commands.
-	cmds   []command
-	closed bool          // set by the actor at exit (close); post fails afterwards
-	bell   chan struct{} // cap 1: the doorbell (also rung for facts); made by init
+	cmds    []command
+	closed  bool          // set by the actor at exit (close); post fails afterwards
+	started bool          // a passive session's Start ran (start)
+	bell    chan struct{} // cap 1: the doorbell (also rung for facts); made by init
 }
 
 // The mailbox is the session's carrier.Doorbell (carrier.Conn.Start,
@@ -36,6 +37,18 @@ var _ carrier.Doorbell = (*mailbox)(nil)
 // nothing (the stream's fake-lane unit tests run without it).
 func (m *mailbox) init() {
 	m.bell = make(chan struct{}, 1)
+}
+
+// start reports whether this is the first call: Start launches the actor
+// once (a second call would start a second actor).
+func (m *mailbox) start() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.started {
+		return false
+	}
+	m.started = true
+	return true
 }
 
 // post queues c for the actor and rings the doorbell. It returns false,

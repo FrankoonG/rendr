@@ -1,6 +1,9 @@
 package session
 
 import (
+	"bytes"
+	"time"
+
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -24,8 +27,37 @@ type PassiveSpec struct {
 // open), Reject, AcceptTimeout (CAPACITY, CodeAcceptTimeout),
 // RefusePending, Shutdown, or an RST from the dialer (withdrawn:
 // ErrSessionLost for a later Confirm).
+//
+// Further contracts of this implementation: Params.Role is set to
+// RolePassive and a zero Params.Mode to ModeSelector; AcceptTimeout counts
+// from this call (the admission). The session calls Env.Registry: Opened
+// at Confirm, Lingering on Close, Orphaned around no-path episodes of an
+// open session, and Ended at its end with the verdict its tombstone
+// repeats.
 func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
-	panic("unimplemented: M1b")
+	p := spec.Params
+	p.Role = RolePassive
+	if p.Mode == 0 {
+		p.Mode = ModeSelector
+	}
+	s := &Session{env: env, p: p, id: spec.SID, meta: bytes.Clone(spec.Metadata), peer: spec.DialerInstance}
+	s.done = make(chan struct{})
+	s.mb.init()
+	now := time.Now()
+	s.mu.Lock()
+	s.initStreamLocked()
+	s.peerWindowLocked(spec.PeerWindow)
+	s.ctl.state = StatePending
+	s.ctl.epoch = p.FirstEpoch - 1 // the first SCHED (FirstEpoch) is newer (V15)
+	s.ctl.rescuedBase = ^uint64(0)
+	l := &lane{s: s, c: first, port: first, id: first.ID(), factory: -1, gen: 1, since: now}
+	l.state = LaneJoining
+	l.schedSent = s.ctl.epoch
+	s.lanes = append(s.lanes, l)
+	s.laneAddedLocked(l)
+	s.initialSnapLocked()
+	s.mu.Unlock()
+	return s
 }
 
 // Start launches the actor of a session made by NewPending and starts its
@@ -36,7 +68,45 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 // Reject, RefusePending, Shutdown) wait in the mailbox and are handled in
 // order once the actor runs.
 func (s *Session) Start() {
-	panic("unimplemented: M1b")
+	if !s.mb.start() {
+		return // a second Start: the actor already runs
+	}
+	a := newActor(s)
+	s.mu.Lock()
+	first := s.lanes[0] // the actor is not running yet: NewPending's lane
+	s.mu.Unlock()
+	a.gen = first.gen
+	a.acceptBy = first.since.Add(orDefault(s.p.AcceptTimeout, defAcceptTimeout))
+	first.c.Start(first, &s.mb, carrier.StartOptions{Hold: true})
+	go a.run()
+}
+
+// carriersLocked counts the lanes that are not dead plus the adopts posted
+// but not yet handled: the carrier limit of Join and AttachOpen (D27, C31).
+func (s *Session) carriersLocked() int {
+	n := s.ctl.adopting
+	for _, l := range s.lanes {
+		if l.state != LaneDead {
+			n++
+		}
+	}
+	return n
+}
+
+// maxCarriers is Params.MaxCarriers with its default.
+func (s *Session) maxCarriers() int {
+	if s.p.MaxCarriers > 0 {
+		return s.p.MaxCarriers
+	}
+	return defMaxCarriers
+}
+
+// finalVerdict is the verdict of an ended session (its last snapshot).
+func (s *Session) finalVerdict() Verdict {
+	if sn := s.snap.Load(); sn != nil {
+		return sn.verdict
+	}
+	return Verdict{Status: wire.StatusUnknownSession}
 }
 
 // AttachOpen handles a duplicate OPEN for this session (L47): a pending
@@ -47,7 +117,21 @@ func (s *Session) Start() {
 // taken is false and v is the verdict the caller writes as OPEN_ACK before
 // closing c.
 func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
-	panic("unimplemented: M1b")
+	s.mu.Lock()
+	switch {
+	case s.ctl.state == StateEnded:
+		s.mu.Unlock()
+		return false, s.finalVerdict()
+	case s.carriersLocked() >= s.maxCarriers():
+		s.mu.Unlock()
+		return false, Verdict{Status: wire.StatusCapacity, Code: wire.CodeCarriers}
+	}
+	s.ctl.adopting++
+	s.mu.Unlock()
+	if !s.mb.post(&adopt{conn: c, kind: adoptOpen}) {
+		return false, s.finalVerdict() // the actor exited meanwhile
+	}
+	return true, Verdict{}
 }
 
 // Confirm opens a pending session: OPEN_ACK(OK, window) becomes the first
@@ -56,21 +140,36 @@ func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
 // answered, net.ErrClosed if the Listener or Runtime closed, and an error
 // for a second call.
 func (s *Session) Confirm() error {
-	panic("unimplemented: M1b")
+	c := &confirm{reply: make(chan error, 1)}
+	if !s.mb.post(c) {
+		return verdictErr(s.finalVerdict())
+	}
+	return <-c.reply
 }
 
 // Reject ends a pending session with OPEN_ACK(REJECTED, code, msg[:255]) on
 // every OPEN carrier; the tombstone repeats this verdict to duplicate OPENs.
 // Errors as for Confirm.
 func (s *Session) Reject(code uint32, msg string) error {
-	panic("unimplemented: M1b")
+	r := &reject{code: code, msg: msg, reply: make(chan error, 1)}
+	if !s.mb.post(r) {
+		return verdictErr(s.finalVerdict())
+	}
+	return <-r.reply
 }
 
 // RefusePending ends a pending session with OPEN_ACK(status, code) — used
 // for GOING_AWAY when its Listener closes. It returns false if the session is
 // not pending.
+//
+// It waits for the actor's answer, so it must not be called with a lock
+// held that the session's own goroutines may need.
 func (s *Session) RefusePending(status wire.AckStatus, code uint32) bool {
-	panic("unimplemented: M1b")
+	r := &refuse{status: status, code: code, reply: make(chan bool, 1)}
+	if !s.mb.post(r) {
+		return false
+	}
+	return <-r.reply
 }
 
 // Join handles a JOIN for a live table entry (the admission only checked
@@ -86,5 +185,26 @@ func (s *Session) RefusePending(status wire.AckStatus, code uint32) bool {
 // first frame. When taken is false the caller writes JOIN_ACK(status) and
 // closes c.
 func (s *Session) Join(c *carrier.Conn, j *wire.Join) (taken bool, status wire.AckStatus) {
-	panic("unimplemented: M1b")
+	s.mu.Lock()
+	switch {
+	case s.ctl.state == StatePending:
+		status = wire.StatusBadRequest
+	case s.ctl.state == StateEnded:
+		status = wire.StatusUnknownSession
+	case Mode(j.Mode) != s.p.Mode:
+		status = wire.StatusBadRequest
+	case s.carriersLocked() >= s.maxCarriers():
+		status = wire.StatusCapacity
+	case s.applyRxNextLocked(j.RxNext) != nil:
+		status = wire.StatusBadRequest
+	default:
+		s.ctl.adopting++
+		s.mu.Unlock()
+		if !s.mb.post(&adopt{conn: c, kind: adoptJoin, join: *j}) {
+			return false, wire.StatusUnknownSession // the actor exited meanwhile
+		}
+		return true, wire.StatusOK
+	}
+	s.mu.Unlock()
+	return false, status
 }
