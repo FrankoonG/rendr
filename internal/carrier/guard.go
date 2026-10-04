@@ -40,11 +40,16 @@ var errDialTimeout error = &timeoutError{"rendr: carrier dial timed out"}
 // ctx ends or DialTimeout elapses, whichever is first, even if f ignores ctx.
 // A panic or runtime.Goexit in f becomes ErrFactoryPanic; (nil, nil) becomes
 // ErrNilConn; (conn, err) closes conn once and returns err; a conn that
-// arrives after the call returned is closed exactly once. A goroutine still
-// inside f after AbandonWait past the return is counted in env.Abandon until
-// f returns. It fails fast with ErrAbandonFull when env.Abandon is full.
-// GuardedDial itself does not run Hooks.DialStart: Establish runs it inside
-// f, right before the factory call, so callers of Establish never call it.
+// arrives after the call returned is closed exactly once. When GuardedDial
+// returns without f's result, nobody waits for that goroutine any more: it
+// is counted in env.Abandon at once and leaves it when f returns (L52;
+// design §0.10 Y8), so a joiner that has seen the attempt end — Session.Done,
+// Runtime.Close — already sees the stuck call in Status.Abandoned. It is
+// counted once only: the attempt itself returned, so no wind-down that
+// abandons attempts still running (design §0.9 X2) counts it again. It
+// fails fast with ErrAbandonFull when env.Abandon is full. GuardedDial
+// itself does not run Hooks.DialStart: Establish runs it inside f, right
+// before the factory call, so callers of Establish never call it.
 func GuardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Conn, error)) (net.Conn, error) {
 	return guardedDial(ctx, env, f)
 }
@@ -58,14 +63,14 @@ func GuardedDialEarly(ctx context.Context, env *Env, f func(context.Context, []b
 
 // dialCall is one guarded factory call. The factory goroutine delivers its
 // normalized result through res unless the caller gave up first, in which
-// case the goroutine closes a late conn itself (exactly once) and reports
-// to the abandonment watch.
+// case the caller counted the goroutine in the abandoned-call pool and the
+// goroutine, once f returned, leaves the pool and closes a late conn itself
+// (exactly once).
 type dialCall struct {
 	env    *Env
 	res    chan dialResult // cap 1
 	mu     sync.Mutex
-	gaveUp bool   // the caller returned without the result
-	w      *watch // armed when the caller gave up
+	gaveUp bool // the caller returned without the result; the goroutine is counted in env.Abandon
 }
 
 type dialResult struct {
@@ -101,8 +106,13 @@ func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Con
 		return r.c, r.err
 	default:
 	}
+	// Nobody waits for the call any more: it is abandoned now (L52). The
+	// Adopt happens under the lock the goroutine reads gaveUp under, so its
+	// Leave always follows it.
 	d.gaveUp = true
-	d.w = startWatch(env.Abandon, tm.AbandonWait)
+	if env.Abandon != nil {
+		env.Abandon.Adopt()
+	}
 	return nil, err
 }
 
@@ -138,10 +148,12 @@ func (d *dialCall) run(ctx context.Context, f func(context.Context) (net.Conn, e
 			return
 		}
 		d.mu.Unlock()
-		if c != nil {
-			CloseConn(d.env, c) // a late conn: closed exactly once
+		if d.env.Abandon != nil {
+			d.env.Abandon.Leave() // f returned: the call is no longer stuck in the embedder
 		}
-		d.w.finish()
+		if c != nil {
+			CloseConn(d.env, c) // a late conn: closed exactly once (its own close is watched)
+		}
 	}()
 	c, err = f(ctx)
 	normal = true

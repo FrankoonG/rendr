@@ -46,15 +46,18 @@ type carrierState struct {
 	txBytes, retxBytes, frames uint64
 
 	// PING records: a FIFO ring, oldest at head.
-	ring          [pingRingSize]pingRecord
-	head, n       int
-	nextPingID    uint32
-	pingSent      bool      // a PING was encoded on this incarnation
-	pingReq       bool      // RequestPing or a cap-hit PING
-	lastCommit    time.Time // commit of the latest PING (cadence)
-	intervalStart time.Time // start of the current backlog interval: the latest PING commit, or Start
-	lastBusy      bool      // the BUSY flag of the latest PING sent (Stats.Backlogged)
-	peerBusy      bool      // the BUSY flag of the latest PING received (Stats.PeerBusy)
+	ring       [pingRingSize]pingRecord
+	head, n    int
+	nextPingID uint32
+	pingSent   bool      // a PING was encoded on this incarnation
+	pingReq    bool      // RequestPing or a cap-hit PING
+	lastCommit time.Time // commit of the latest PING (cadence)
+	// intervalStart is the start of the current backlog interval: the
+	// commit of the latest PING that judged one (an interval of at least
+	// minRateSample, X4), or Start.
+	intervalStart time.Time
+	lastBusy      bool // the latest judged backlog state, carried by every PING sent since (Stats.Backlogged)
+	peerBusy      bool // the BUSY flag of the latest PING received (Stats.PeerBusy)
 
 	// Carrier-level control.
 	pong       wire.Ping // latest PING received: answered by the next PONG (latest wins, L08)
@@ -106,15 +109,20 @@ func decay(dt time.Duration) float64 {
 
 // encodePingLocked appends this carrier's next PING to b (design §4.10):
 // id from the counter (serial arithmetic, L14), nonce = salt ^ id (D14),
-// BUSY when the writer was backlogged for ≥ 25% of the interval since the
-// previous PING commit (D15); an interval shorter than 5 ms (a cap-hit PING
-// right behind the previous one) carries the previous state on. Its record
-// is uncommitted until the write returns.
+// and BUSY when the writer was backlogged for ≥ 25% of the current backlog
+// interval (D15). An interval shorter than 5 ms cannot be judged: such a
+// PING carries the latest judged state on, and its commit does not restart
+// the interval, whose busy time keeps accumulating until a PING judges it
+// (X4). In a cap-limited flow every PING is a cap-hit PING one RTT after
+// the previous commit; restarting the interval at each of them would never
+// judge one below a 5 ms RTT, so BUSY, the rate samples it gates and the
+// capacity they raise would stay off for good. Its record is uncommitted
+// until the write returns.
 func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time) {
 	st := &c.st
 	id := st.nextPingID
-	busy := st.lastBusy // an interval too short to judge (a cap-hit PING right after a commit) keeps the state
-	if now.Sub(st.intervalStart) >= minRateSample {
+	busy, judged := st.lastBusy, now.Sub(st.intervalStart) >= minRateSample
+	if judged {
 		busy = w.backlogged(now, st.intervalStart)
 	}
 	p := wire.Ping{ID: id, TS: uint64(now.Sub(c.base)), Nonce: c.salt ^ uint64(id)}
@@ -126,16 +134,17 @@ func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time) {
 	st.pingSent, st.pingReq = true, false
 	st.lastBusy = busy
 	c.rxData.Store(false)
-	w.ping, w.pingID = true, id
+	w.ping, w.pingID, w.pingJudged = true, id, judged
 	w.dataSincePing = false
 	c.gaugeUpdateLocked()
 }
 
 // commitLocked accounts a batch whose write returned at at: DATA becomes
 // submitted, and the batch's PING is committed (RTT counts from here, L23;
-// a new backlog interval starts). A batch that ended cap-blocked after
-// writing DATA asks for a cap-hit PING, so the cap is released one RTT
-// later rather than at the next PING timer (msess, R13).
+// a new backlog interval starts when the PING judged the previous one,
+// X4). A batch that ended cap-blocked after writing DATA asks for a cap-hit
+// PING, so the cap is released one RTT later rather than at the next PING
+// timer (msess, R13).
 func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 	st := &c.st
 	data := uint64(b.dataBytes())
@@ -147,7 +156,10 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 		if i := st.find(w.pingID); i >= 0 {
 			st.record(i).committedAt = at
 		}
-		st.lastCommit, st.intervalStart = at, at
+		st.lastCommit = at
+		if w.pingJudged {
+			st.intervalStart = at
+		}
 	}
 	if data > 0 && b.CapBlocked() {
 		st.pingReq = true
@@ -312,8 +324,9 @@ func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
 // busyCadenceLocked: PING every PingBusy while this side has unproven DATA
 // in flight, waits at the capacity cap, sent BUSY in its last PING, received
 // DATA since its previous PING (a pure receiver must detect a silent drop
-// within the G4 budget, F12/P12), or its backlog state flipped since the
-// last PING (the peer learns it within an RTT).
+// within the G4 budget, F12/P12), or the current backlog interval disagrees
+// with the latest judged state (the peer learns a flip within PingBusy and
+// an RTT).
 func (c *Conn) busyCadenceLocked(now time.Time, w *writer) bool {
 	st := &c.st
 	return st.inflight() > 0 || !w.capSince.IsZero() || st.lastBusy || c.rxData.Load() ||

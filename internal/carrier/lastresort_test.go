@@ -99,18 +99,19 @@ func lrSilentPassive(nc net.Conn, id uint32) {
 	_, _ = nc.Write(hPrefaceAck(wire.PrefaceOK, id))
 }
 
-// TestVerdictWriteLastResortClose_L52 (design §0.8 V2): a verdict write on
-// a conn that ignores its write deadline (or the drain's read deadline)
-// but honours Close, to a peer that neither reads nor closes — the frame
-// or the drain of WriteAndClose, the RST(withdrawn) after an instance
-// refusal or after a withdrawal, and the inline verdict meant for
-// ReadHello's PREFACE_ACK refusals — ends when the abandonment timer adopts
-// the stuck goroutine: the conn is then closed exactly once, at that moment
-// (the last resort), the goroutine returns and leaves the abandoned-call
-// pool. Establish returns before its RST (written on a goroutine of its
-// own); the inline verdict holds its caller until the last resort, as a
-// refusal holds its handshake slot. Without the last resort the conn stays
-// open and the goroutine stuck.
+// TestVerdictWriteLastResortClose_L52 (design §0.8 V2, §0.9 X5): a verdict
+// write on a conn that ignores its write deadline (or the drain's read
+// deadline) but honours Close, to a peer that neither reads nor closes —
+// the frame or the drain of WriteAndClose, the RST(withdrawn) after an
+// instance refusal or after a withdrawal, the inline verdict, and
+// ReadHello's PREFACE_ACK refusals that use it (a dialer of another major,
+// a gate's CAPACITY) — ends when the abandonment timer adopts the stuck
+// goroutine: the conn is then closed exactly once, at that moment (the last
+// resort), the goroutine returns and leaves the abandoned-call pool.
+// Establish returns before its RST (written on a goroutine of its own); the
+// inline verdict holds its caller until the last resort, as a refusal holds
+// its handshake slot, and ReadHello then returns its typed refusal. Without
+// the last resort the conn stays open and the goroutine stuck.
 func TestVerdictWriteLastResortClose_L52(t *testing.T) {
 	const abandonWait = time.Second // hTiming
 	errOther := errors.New("not the bound instance")
@@ -204,6 +205,40 @@ func TestVerdictWriteLastResortClose_L52(t *testing.T) {
 					t.Fatalf("returned after %v, want the last resort", d)
 				}
 			}},
+		{"ReadHello refusal (VERSION), the dialer never reads", false, 1, abandonWait + time.Second + drainMax,
+			func(t *testing.T, env *Env, nc *lrConn, peer net.Conn) {
+				pb := hPreface(9)
+				pb[4] = 3 // a dialer of another major
+				recrc(pb)
+				go func() { _, _ = peer.Write(pb) }() // then it never reads
+				start := time.Now()
+				h, err := ReadHello(env, nc, start.Add(time.Second), 4096, nil)
+				if h != nil || !errors.Is(err, errHelloRefused) || time.Since(start) != abandonWait+time.Second+drainMax {
+					t.Fatalf("ReadHello = %v, %v after %v; want the refusal, returned by the last resort", h, err, time.Since(start))
+				}
+			}},
+		{"ReadHello refusal (gate CAPACITY) drain, the dialer reads it and stays", true, 1, abandonWait + time.Second + drainMax,
+			func(t *testing.T, env *Env, nc *lrConn, peer net.Conn) {
+				got := make(chan []byte, 1)
+				go func() {
+					if _, err := peer.Write(hPreface(9)); err != nil {
+						got <- nil
+						return
+					}
+					var ab [wire.PrefaceLen]byte
+					_, _ = io.ReadFull(peer, ab[:])
+					got <- ab[:] // then silent: the drain never sees EOF
+				}()
+				start := time.Now()
+				gate := func(*wire.Preface) wire.PrefaceStatus { return wire.PrefaceCapacity }
+				h, err := ReadHello(env, nc, start.Add(time.Second), 4096, gate)
+				if ack, perr := wire.ParsePrefaceAck(<-got); perr != nil || ack.Status != wire.PrefaceCapacity || ack.CarrierID != 9 {
+					t.Fatalf("the dialer read %+v %v, want the CAPACITY refusal", ack, perr)
+				}
+				if h != nil || !errors.Is(err, errHelloRefused) || time.Since(start) != abandonWait+time.Second+drainMax {
+					t.Fatalf("ReadHello = %v, %v after %v; want the refusal, returned by the last resort", h, err, time.Since(start))
+				}
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -277,6 +312,69 @@ func TestInlineVerdictGoexitClosesOnce_L51(t *testing.T) {
 				synctest.Wait()
 				if returned || hc.writes.Load() != 1 {
 					t.Fatalf("stimulus: returned %v, writes %d; want one Write that ran Goexit", returned, hc.writes.Load())
+				}
+				if d := time.Since(start); d != tc.at {
+					t.Fatalf("the Goexit came after %v, want %v", d, tc.at)
+				}
+				if closes.Load() != 1 || env.Abandon.Len() != 0 {
+					t.Fatalf("conn closed %d times, abandoned %d", closes.Load(), env.Abandon.Len())
+				}
+			})
+		})
+	}
+}
+
+// TestReadHelloRefusalGoexitClosesOnce_L51 (design §0.9 X5): ReadHello's
+// PREFACE_ACK refusal and its runtime.Goexit guard close the conn through
+// one closeOnce. When the embedder's Write of the refusal (to a dialer of
+// another major) runs Goexit — at once, or after the last resort already
+// closed the conn under a Write that ignored its deadline — ReadHello never
+// returns, yet the conn is closed exactly once and nothing stays counted in
+// the abandoned-call pool.
+func TestReadHelloRefusalGoexitClosesOnce_L51(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block bool // the Write blocks until the conn is closed, then runs Goexit
+		at    time.Duration
+	}{{"at once", false, 0}, {"after the last resort", true, time.Second + time.Second + drainMax}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				defer b.Close()
+				closed := make(chan struct{})
+				var once sync.Once
+				var closes atomic.Int32
+				hc := &hookConn{Conn: a,
+					onWrite: func(net.Conn, []byte) (int, error) {
+						if tc.block {
+							<-closed // ignores its deadline, honours Close
+						}
+						runtime.Goexit()
+						return 0, nil
+					},
+					onSetWriteDeadline: func(net.Conn, time.Time) error { return nil },
+					onClose: func(nc net.Conn) error {
+						closes.Add(1)
+						once.Do(func() { close(closed) })
+						return nc.Close()
+					}}
+				pb := hPreface(9)
+				pb[4] = 3 // a dialer of another major: refused with VERSION
+				recrc(pb)
+				go func() { _, _ = b.Write(pb) }()
+				start := time.Now()
+				done := make(chan struct{})
+				returned := false
+				go func() {
+					defer close(done)
+					_, _ = ReadHello(env, hc, start.Add(time.Second), 4096, nil)
+					returned = true
+				}()
+				<-done
+				synctest.Wait()
+				if returned || hc.writes.Load() != 1 || hc.reads.Load() == 0 {
+					t.Fatalf("stimulus: returned %v, writes %d, reads %d; want the PREFACE read and one refusal Write that ran Goexit", returned, hc.writes.Load(), hc.reads.Load())
 				}
 				if d := time.Since(start); d != tc.at {
 					t.Fatalf("the Goexit came after %v, want %v", d, tc.at)

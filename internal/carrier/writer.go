@@ -24,14 +24,16 @@ type writer struct {
 	scratch *Buf
 
 	// The current round.
-	ping   bool // the batch carries a PING
-	pingID uint32
-	close  bool // the batch carries our CLOSE, its last frame
+	ping       bool // the batch carries a PING
+	pingID     uint32
+	pingJudged bool // the PING judged a backlog interval (≥ 5 ms): its commit starts the next one (X4)
+	close      bool // the batch carries our CLOSE, its last frame
 
-	// Backlog accounting (D15): busy time since the latest PING commit =
-	// durations of writes that carried DATA plus time spent cap-blocked
-	// (from MarkCapBlocked until the next Fill that pulled DATA or found
-	// nothing waiting).
+	// Backlog accounting (D15): busy time in the current backlog interval
+	// (since the commit of the latest PING that judged one, X4) = durations
+	// of writes that carried DATA plus time spent cap-blocked (from
+	// MarkCapBlocked until the next Fill that pulled DATA or found nothing
+	// waiting).
 	busyAcc       time.Duration
 	capSince      time.Time // start of the open cap-blocked period; zero: none
 	dataSincePing bool      // DATA was written after the latest PING was encoded
@@ -130,7 +132,7 @@ func (c *Conn) writeRound(w *writer) bool {
 	}
 	b := w.b
 	b.Reset(now)
-	w.ping, w.close = false, false
+	w.ping, w.pingJudged, w.close = false, false, false
 	// The cap-blocked flag is published before Fill and corrected after it
 	// (§3.5: set the waiting flag, then evaluate). A PONG that frees
 	// capacity while Fill decides at the cap therefore always sees it set
@@ -336,9 +338,13 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 	c.commitLocked(w, b, end)
 	c.mu.Unlock()
 	if w.ping {
-		w.busyAcc = 0 // the next backlog interval starts at this commit
-		if !w.capSince.IsZero() {
-			w.capSince = end
+		if w.pingJudged {
+			// The next backlog interval starts at this commit. A PING that
+			// could not judge one (< 5 ms) leaves it running (X4).
+			w.busyAcc = 0
+			if !w.capSince.IsZero() {
+				w.capSince = end
+			}
 		}
 		if o := c.opts.Observer; o != nil {
 			o.PingCommitted(c, w.pingID, end)

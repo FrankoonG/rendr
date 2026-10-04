@@ -451,7 +451,7 @@ type Stats struct {
 	Rate              float64   // bytes/s proven by PONG watermarks (decaying max, backlog-gated)
 	RxRate            float64   // DATA payload bytes/s received (decaying max)
 	Inflight, Cap     int64     // submitted − pongMark; capacity cap
-	Backlogged        bool      // this side's writer was send-backlogged in the last PING interval
+	Backlogged        bool      // this side's writer was send-backlogged in the latest backlog interval a PING judged (≥ 5 ms)
 	PeerBusy          bool      // the peer's latest PING carried BUSY
 	TxBytes, RxBytes  uint64    // DATA payload bytes sent / received on this carrier
 	RetxBytes, Frames uint64    // retransmitted DATA payload bytes; frames written

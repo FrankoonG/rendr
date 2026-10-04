@@ -46,37 +46,45 @@ var (
 // checking the header before reading or allocating anything sized by it.
 // A PING first frame (probe carrier) is also recorded as the Conn's pending
 // PONG, so a sessionless carrier answers it as its first frame once
-// started. Every failure closes nc (via CloseConn) and returns an error; no
-// session state exists at that point.
+// started. Every failure closes nc exactly once, on a guarded goroutine
+// (CloseConn), and returns an error; no session state exists at that
+// point.
 //
 // Further contracts of this implementation: a PREFACE whose kind is not
 // stream (a datagram carrier needs a packet conn, M2) is closed silently
 // like a malformed one; a non-OK PREFACE_ACK (VERSION, FEATURE or the
 // gate's answer) is written and followed by the L05 close order (CloseWrite
-// on an OwnedTCP, a drain bounded by min(deadline, 1 s), Close) so that the
-// dialer reads the answer instead of a reset; PREFACE_ACK(OK) is written
-// right after the PREFACE is validated (P18); a PING first frame's pad is
-// streamed (never allocated by its length) and must be zero; when a conn
-// call runs runtime.Goexit on the caller's goroutine, nc is still closed
-// exactly once (L51; the caller's own deferred cleanup must release its
-// handshake slot).
+// on an OwnedTCP, a drain bounded by min(deadline, 1 s), Close) on the
+// calling handshake goroutine, in its slot, so that the dialer reads the
+// answer instead of a reset; on a conn that ignores its deadlines, towards
+// a dialer that neither reads nor closes, that goroutine is adopted by the
+// abandoned-call pool AbandonWait after both bounds and the conn is closed
+// then as the last resort (design §0.8 V2), which returns the refusal on a
+// conn that honours Close; PREFACE_ACK(OK) is written right after the
+// PREFACE is validated (P18); a PING first frame's pad is streamed (never
+// allocated by its length) and must be zero; when a conn call runs
+// runtime.Goexit on the caller's goroutine, nc is still closed exactly
+// once (L51; the caller's own deferred cleanup must release its handshake
+// slot).
 func ReadHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
+	k := &closeOnce{nc: nc} // every close of nc goes through k: exactly once (L52)
 	returned := false
 	defer func() {
 		if !returned { // runtime.Goexit inside an embedder conn call (L51)
-			CloseConn(env, nc)
+			k.async(env)
 		}
 	}()
-	h, err := readHello(env, nc, deadline, maxMeta, gate)
+	h, err := readHello(env, k, deadline, maxMeta, gate)
 	returned = true
 	return h, err
 }
 
 // readHello is ReadHello without the Goexit guard: every return path closes
-// nc unless a Hello owns it.
-func readHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
+// k's conn unless a Hello owns it.
+func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
+	nc := k.nc
 	fail := func(err error) (*Hello, error) {
-		CloseConn(env, nc)
+		k.async(env)
 		return nil, err
 	}
 	if err := callSetDeadline(nc, deadline); err != nil {
@@ -94,10 +102,10 @@ func readHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate
 	case perr == nil:
 	case errors.Is(perr, wire.ErrMajor):
 		// Another major: the carrier ID's place is the only echo we can give.
-		refuse(env, nc, deadline, wire.PrefaceVersion, binary.BigEndian.Uint32(pb[32:36]))
+		refuse(env, k, deadline, wire.PrefaceVersion, binary.BigEndian.Uint32(pb[32:36]))
 		return nil, fmt.Errorf("%w: %w", errHelloRefused, perr)
 	case errors.Is(perr, wire.ErrFeature):
-		refuse(env, nc, deadline, wire.PrefaceFeature, p.CarrierID)
+		refuse(env, k, deadline, wire.PrefaceFeature, p.CarrierID)
 		return nil, fmt.Errorf("%w: %w", errHelloRefused, perr)
 	default:
 		return fail(fmt.Errorf("rendr: handshake: PREFACE: %w", perr))
@@ -110,7 +118,7 @@ func readHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate
 		status = gate(&p)
 	}
 	if status != wire.PrefaceOK {
-		refuse(env, nc, deadline, status, p.CarrierID)
+		refuse(env, k, deadline, status, p.CarrierID)
 		return nil, fmt.Errorf("%w: PREFACE_ACK %s", errHelloRefused, prefaceStatusName(status))
 	}
 	var ab [wire.PrefaceLen]byte
@@ -222,20 +230,12 @@ func readHelloPing(nc net.Conn, hdr []byte, n int) (wire.Ping, error) {
 	return ping, nil
 }
 
-// refuse writes a non-OK PREFACE_ACK and closes nc in the L05 order
-// (inline, bounded by the handshake deadline and drainMax).
-func refuse(env *Env, nc net.Conn, deadline time.Time, status wire.PrefaceStatus, carrierID uint32) {
+// refuse writes a non-OK PREFACE_ACK and closes k's conn in the L05 order
+// on the handshake goroutine, in its slot (writeAndCloseInline: the write
+// bounded by the handshake deadline, the drain by min(deadline, 1 s), the
+// last resort on a conn that ignores its deadlines, design §0.8 V2).
+func refuse(env *Env, k *closeOnce, deadline time.Time, status wire.PrefaceStatus, carrierID uint32) {
 	var ab [wire.PrefaceLen]byte
 	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: status, Instance: env.Local, CarrierID: carrierID})
-	if writeFull(nc, ab[:]) == nil {
-		if o, ok := nc.(*OwnedTCP); ok {
-			_ = callCloseWrite(o)
-		}
-		until := time.Now().Add(drainMax)
-		if !deadline.IsZero() && deadline.Before(until) {
-			until = deadline
-		}
-		drain(nc, until)
-	}
-	CloseConn(env, nc)
+	writeAndCloseInline(env, k, ab[:], deadline)
 }
