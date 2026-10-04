@@ -8,34 +8,37 @@ import (
 
 // ID returns the session ID.
 func (s *Session) ID() [16]byte {
-	panic("unimplemented: M1b")
+	return s.id
 }
 
 // PeerInstance returns the bound peer InstanceID (dialer: from the PREFACE_ACK
 // of the carrier that carried the first OPEN_ACK(OK); passive: the dialer's).
 func (s *Session) PeerInstance() [16]byte {
-	panic("unimplemented: M1b")
+	return s.peer
 }
 
 // Metadata returns the session's OPEN metadata (owned by the session; do not
 // modify).
 func (s *Session) Metadata() []byte {
-	panic("unimplemented: M1b")
+	return s.meta
 }
 
 // Mode returns the mode fixed at OPEN.
 func (s *Session) Mode() Mode {
-	panic("unimplemented: M1b")
+	return s.p.Mode
 }
 
 // Role returns the side.
 func (s *Session) Role() Role {
-	panic("unimplemented: M1b")
+	return s.p.Role
 }
 
 // State returns the current lifecycle state.
 func (s *Session) State() State {
-	panic("unimplemented: M1b")
+	if sn := s.snap.Load(); sn != nil {
+		return sn.state
+	}
+	return StatePending
 }
 
 // Status returns a snapshot: the control part as last published by the
@@ -44,13 +47,13 @@ func (s *Session) State() State {
 // L27), plus the data counters and per-carrier estimator figures read at
 // call time.
 func (s *Session) Status() Status {
-	panic("unimplemented: M1b")
+	return s.status()
 }
 
 // Done is closed after the session ended and every goroutine it owns (actor,
 // dial attempts, carriers) exited or was abandoned after its bound.
 func (s *Session) Done() <-chan struct{} {
-	panic("unimplemented: M1b")
+	return s.done
 }
 
 // Shutdown is Runtime.Close for this session: a pending session answers
@@ -61,7 +64,7 @@ func (s *Session) Done() <-chan struct{} {
 // then counted as abandoned; design §4.7). It returns at once; Done reports
 // completion.
 func (s *Session) Shutdown() {
-	panic("unimplemented: M1b")
+	s.mb.post(&shutdown{}) // refused only once the actor exited: nothing left to shut down
 }
 
 // Status is the session snapshot (field-for-field rendr.SessionStatus).

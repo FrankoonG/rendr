@@ -127,8 +127,8 @@ type stream struct {
 	rightEdge  uint64  // the largest right edge ever advertised; never retracts (P10); the receiver's fatal threshold
 	inq        segRing // in-order segments covering [rRead, rTail)
 	ooq        segList // out-of-order segments beyond rTail: ascending, non-overlapping
-	oooCap     int64   // size-class capacity held by ooq (at most 2·W; DATA beyond it is dropped, D13)
-	oooDropped uint64  // out-of-order DATA payload bytes dropped at the oooCap limit (counted, never a violation: §4.4 step 6, D13)
+	oooCap     int64   // size-class capacity held by inq and ooq together: exactly the Budget charge of the receive buffers (one segment per buffer); out-of-order data may fill it to 2·W (D13, V3)
+	oooDropped uint64  // out-of-order DATA payload bytes dropped at the 2·W receive cap or shed by later in-order data (counted, never a violation: §4.4 step 6, D13, V3)
 
 	peerFin          uint64 // the peer's FIN offset (valid when peerFinSet)
 	peerFinSet       bool   // a FIN arrived
@@ -230,12 +230,13 @@ type chunkRing struct {
 	head, n int
 }
 
-// seg is one received segment; b aliases buf.B.
+// seg is one received segment; b is a tail slice of buf.B, so every
+// segment may grow at its end into the rest of its buffer (V3).
 type seg struct {
 	off uint64
 	b   []byte
 	buf *carrier.Buf
-	run bool // a 16 KiB copy run that may grow at its end (payloads < 16 KiB, P17)
+	run bool // a 16 KiB copy run starting at its buffer's first byte (payloads < 16 KiB, P17)
 }
 
 // segRing is the in-order receive queue: inq covers [rRead, rTail).

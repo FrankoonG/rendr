@@ -157,12 +157,13 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 
 // onPongLocked applies a PONG received at now (design §4.10). A PONG that
 // matches no record of this incarnation by id and nonce is ignored; one
-// that matches a PING whose write has not returned yet only marks it
-// (liveness, no sample). A match yields the RTT from the PING's commit
-// (L23), drops that record and every older one, updates srtt, minRTT, the
-// PONG watermark, the rate (only for a backlogged interval: D15, P4) and the
-// receive rate. wake reports that the watermark advanced while the writer's
-// last round was cap-blocked (C5), or that the PONG freed a full record ring.
+// that matches a PING whose write has not returned yet marks it and
+// advances the PONG watermark (liveness and delivery, no sample). A match
+// yields the RTT from the PING's commit (L23), drops that record and every
+// older one, updates srtt, minRTT, the PONG watermark, the rate (only for a
+// backlogged interval: D15, P4) and the receive rate. wake reports that the
+// watermark advanced while the writer's last round was cap-blocked (C5), or
+// that the PONG freed records of a full ring.
 func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time.Duration, wake bool) {
 	st := &c.st
 	i := st.find(p.ID)
@@ -175,15 +176,26 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 	}
 	if r.committedAt.IsZero() {
 		// The PONG raced its PING's own write (the bytes left before the
-		// Write call returned): it proves liveness but is no evidence (L23).
-		// The record stays for a genuine match; the older records were
-		// answered before it on this FIFO stream, so they go, and early
-		// records never accumulate in the ring.
+		// Write call returned): it is no evidence (L23) — no RTT and no
+		// rate sample — but it proves liveness, and that the peer read
+		// every DATA byte submitted before the PING. So the watermark
+		// advances and a cap-blocked writer is woken (C5): a carrier whose
+		// every PONG races its commit (a synchronous conn at GOMAXPROCS=1)
+		// must not stay capped at its capacity for good. The record stays
+		// for a genuine match; the older records were answered before it on
+		// this FIFO stream, so they go (waking a writer that waits on a
+		// full ring), and early records never accumulate in the ring.
 		r.early = true
+		full := st.n == pingRingSize
+		advanced := r.mark > st.pongMark
+		if advanced {
+			st.pongMark = r.mark
+			c.gaugeUpdateLocked()
+		}
 		if i > 0 {
 			st.dropThrough(i - 1)
 		}
-		return false, 0, false
+		return false, 0, (advanced && c.capBlocked.Load()) || (full && i > 0)
 	}
 	rec := *r
 	full := st.n == pingRingSize

@@ -93,7 +93,10 @@ func TestNoReaderBoundsAck_L15(t *testing.T) {
 // 64 MiB (16 MiB under -race) in frames of 1 B–64 KiB at random offsets,
 // overlapping and repeating; frames beyond the window are violations that
 // kill their carrier. The receive memory stays below 2·W plus one run (the
-// out-of-order cap, D13); the excess is dropped and counted.
+// out-of-order cap, D13); the excess is dropped and counted. Isolated tiny
+// frames, a run each, open the stream so that the cap binds: in the random
+// mix the large frames replace the runs they cover (V3) and keep the
+// charge below it.
 func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 	const w = 1 << 20
 	total := 64 << 20
@@ -107,6 +110,14 @@ func TestHeldHeadBoundsHeap_L15(t *testing.T) {
 	rng := rand.New(rand.NewPCG(15, 15))
 	fed, kills := 0, 0
 	var maxUsed int64
+	for k := 0; stLocked(s, func(st *stream) uint64 { return st.oooDropped }) == 0; k++ {
+		off, size := 1+64*uint64(k), 1+k%32
+		if err := stDeliverData(l, off, stPattern(off, size)); err != nil {
+			t.Fatalf("isolated frame [%d,+%d): %v", off, size, err)
+		}
+		fed += size
+		maxUsed = max(maxUsed, budget.Used())
+	}
 	for fed < total {
 		var off uint64
 		var size int

@@ -24,8 +24,8 @@ const (
 	// re-checks it (D16: there is no budget waiter list).
 	budgetPoll = 20 * time.Millisecond
 	// runSize is the payload capacity of a receive run: DATA payloads below
-	// it are copied into runs under the session lock (P17); pieces of at
-	// least this size are kept by reference.
+	// it are copied into runs under the session lock (P17); frames with at
+	// least this many new bytes are kept by reference.
 	runSize = carrier.BigData
 	// runCap is the class capacity a run charges (the 16 KiB class).
 	runCap = carrier.BigData + carrier.ClassSlack
