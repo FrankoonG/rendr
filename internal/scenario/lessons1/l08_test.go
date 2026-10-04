@@ -48,7 +48,7 @@ func TestBlockedCarrierDoesNotBlockControl_L08(t *testing.T) {
 		go func() { errs <- readN(pc, warm, 1) }()
 		go func() { errs <- readN(dc, warm, 2) }()
 		for range 4 {
-			if err := <-errs; err != nil {
+			if err := recv(t, errs, time.Minute, "the warm-up"); err != nil {
 				t.Fatalf("warm-up: %v", err)
 			}
 		}
@@ -96,7 +96,7 @@ func TestBlockedCarrierDoesNotBlockControl_L08(t *testing.T) {
 			t.Fatalf("the ACK appeared on %q %v after a blocked, want ≤ 300 ms", ack.tap.link, el)
 		}
 		for range 2 {
-			if err := <-errs; err != nil {
+			if err := recv(t, errs, time.Minute, "passive → dialer after the block"); err != nil {
 				t.Fatalf("passive → dialer after the block: %v", err)
 			}
 		}
@@ -133,13 +133,11 @@ func TestBlockedCarrierDoesNotBlockControl_L08(t *testing.T) {
 			errs <- err
 		}()
 		for range 2 {
-			if err := <-errs; err != nil {
+			if err := recv(t, errs, time.Minute, "dialer → passive after the block"); err != nil {
 				t.Fatalf("dialer → passive after the block: %v", err)
 			}
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		closedAt := time.Now()
 		for _, c := range []*rendr.Conn{dc, pc} {
 			if err := c.Close(); err != nil {
@@ -195,7 +193,7 @@ func TestBidirectionalBulkNoDeadlock_L08(t *testing.T) {
 			if err != nil {
 				t.Fatalf("exchange: %v", err)
 			}
-		case <-time.After(10 * time.Minute):
+		case <-time.After(2 * time.Minute): // the transfer takes about a second of virtual time
 			t.Fatalf("no progress: deadlock after %v", time.Since(start))
 		}
 		el := time.Since(start)

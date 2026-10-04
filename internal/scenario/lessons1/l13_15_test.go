@@ -2,6 +2,7 @@ package lessons1
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -57,10 +58,10 @@ func ackBeyondSent(t *testing.T, dir rendrtest.Dir) {
 	errs := make(chan error, 2)
 	go func() { errs <- sendAndClose(snd, n, 1) }()
 	go func() { errs <- readStream(rcv, n, 1, &g) }()
-	<-g.at(n / 3)
+	reached(t, &g, n/3, time.Minute)
 	la.CorruptNextFrame(dir, rendrtest.FrameAck, rendrtest.ForgeAckBeyondSent)
 	for range 2 {
-		if err := <-errs; err != nil {
+		if err := recv(t, errs, time.Minute, "the stream"); err != nil {
 			t.Fatalf("stream: %v", err)
 		}
 	}
@@ -91,11 +92,20 @@ func ackBeyondSent(t *testing.T, dir rendrtest.Dir) {
 	if err := closeWrite(rcv); err != nil {
 		t.Fatal(err)
 	}
-	if k, err := snd.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-		t.Fatalf("sender Read: (%d, %v)", k, err)
-	}
+	readEOF(t, snd, "sender")
 	finish(t, dc, pc)
 	f.close()
+}
+
+// readEOF requires that c's next Read returns (0, io.EOF) within 30 s.
+func readEOF(t testing.TB, c *rendr.Conn, who string) {
+	t.Helper()
+	runWithin(t, 30*time.Second, who+" Read at the peer's FIN", func() error {
+		if k, err := c.Read(make([]byte, 1)); k != 0 || err != io.EOF {
+			return fmt.Errorf("(%d, %v), want (0, io.EOF)", k, err)
+		}
+		return nil
+	})
 }
 
 // TestOffsetExhaustion_L14: with both Runtimes' stream offsets preset to
@@ -115,13 +125,13 @@ func TestOffsetExhaustion_L14(t *testing.T) {
 		f := newFixture(t, opts{ov: ov}, "a")
 		f.link("a").SetDelay(time.Millisecond, 0)
 		dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
-		if _, err := writeStream(dc, n, 1, 64<<10); err != nil {
-			t.Fatalf("writes below the limit: %v", err)
-		}
-		v := rendrtest.NewVerifier(1, n)
-		if _, err := io.CopyN(v, pc, n); err != nil {
-			t.Fatalf("passive read below the limit: %v", err)
-		}
+		runWithin(t, time.Minute, "the stream below the limit", func() error {
+			if _, err := writeStream(dc, n, 1, 64<<10); err != nil {
+				return fmt.Errorf("writes: %w", err)
+			}
+			_, err := io.CopyN(rendrtest.NewVerifier(1, n), pc, n)
+			return err
+		})
 		eventually(t, time.Second, "acknowledged", func() bool { return dc.Status().AckedBytes == n })
 		synctest.Wait()
 
@@ -165,14 +175,18 @@ func TestOffsetExhaustion_L14(t *testing.T) {
 // killed. The entire window is replayed on B (5 ms) at once, without a
 // single byte beyond the receiver's advertised right edge (no window
 // violation, no carrier killed for one), and the stream arrives intact.
+// The sender's own window (send buffer) is twice the receiver's, as after
+// the lesson's "enlarged window": only the receiver's advertised edge may
+// bound what is in flight, so a sender that overruns it is caught.
 func TestReplayAfterBlackholeWithinWindow_L15(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
-			window = 1 << 20
+			window = 1 << 20 // the receiver's (passive's) window
 			n      = 8 << 20
 		)
-		ov := testhooks.Overrides{Window: window, SelectorDwell: time.Hour, SelectorCooldown: time.Hour}
-		f := newFixture(t, opts{ov: ov}, "a", "b")
+		ov := testhooks.Overrides{SelectorDwell: time.Hour, SelectorCooldown: time.Hour}
+		o := opts{ov: ov, dcfg: rendr.Config{Window: 2 * window}, pcfg: rendr.Config{Window: window}}
+		f := newFixture(t, o, "a", "b")
 		la, lb := f.link("a"), f.link("b")
 		la.SetDelay(200*time.Millisecond, 0)
 		lb.SetDelay(5*time.Millisecond, 0)
@@ -183,11 +197,14 @@ func TestReplayAfterBlackholeWithinWindow_L15(t *testing.T) {
 		if c, ok := carrierIn(dc.Status(), rendr.CarrierActive); !ok || c.Name != "a" {
 			t.Fatalf("active carrier %+v, want one on a", c)
 		}
+		if w := pc.Status().Window; w != window {
+			t.Fatalf("the passive advertises %d, want its Config.Window %d", w, window)
+		}
 		var g gauge
 		errs := make(chan error, 2)
 		go func() { errs <- sendAndClose(dc, n, 1) }()
 		go func() { errs <- readStream(pc, n, 1, &g) }()
-		<-g.at(3 << 20)
+		reached(t, &g, 3<<20, 2*time.Minute)
 		eventually(t, 30*time.Second, "b's probe evidence", func() bool {
 			return peer.Status().Factories[1].Evidence == rendr.EvidenceFresh
 		})
@@ -226,15 +243,20 @@ func TestReplayAfterBlackholeWithinWindow_L15(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			sent, edge := windowState(f, a)
 			c, _ := carrierIn(dc.Status(), rendr.CarrierActive)
-			t.Fatalf("no burst reached the right edge on the 400 ms carrier: %d of %d bytes sent, %d of the %d-byte window outstanding; "+
-				"carrier cap %d, rate %.0f B/s, srtt %v: the flow stays capacity-limited below the window",
-				sent, edge, sent-dc.Status().AckedBytes, window, c.Cap, c.Rate, c.SRTT)
+			if c.ID != rendr.CarrierID(a.cid.Load()) {
+				t.Fatalf("A ended before a burst filled the window: dialer's dead carriers %+v, passive's %+v",
+					deadCarriers(dc.Status()), deadCarriers(pc.Status()))
+			}
+			t.Fatalf("no burst reached the right edge on the 400 ms carrier within 5 s: %d of %d bytes sent, "+
+				"%d of the %d-byte window outstanding; carrier %q cap %d, rate %.0f B/s, srtt %v: "+
+				"the carrier's in-flight cap, not the window, limits the flow",
+				sent, edge, int64(sent)-int64(dc.Status().AckedBytes), window, c.Name, c.Cap, c.Rate, c.SRTT)
 		}
 		time.Sleep(450 * time.Millisecond) // more than one RTT: everything in flight vanished
 		sent, _ := windowState(f, a)
 		acked := dc.Status().AckedBytes
-		if gap := sent - acked; gap != window {
-			t.Fatalf("sent %d, acknowledged %d: %d unacknowledged, want the whole window %d", sent, acked, gap, window)
+		if gap := int64(sent) - int64(acked); gap != window {
+			t.Fatalf("sent %d, acknowledged %d: %d unacknowledged, want the receiver's whole window %d", sent, acked, gap, window)
 		}
 		if late := f.wire.count(func(fr frame) bool { return fr.tap == a && !fr.out && fr.at.After(holedAt) }); late != 0 {
 			t.Fatalf("the dialer read %d frames on A through the blackhole", late)
@@ -244,7 +266,7 @@ func TestReplayAfterBlackholeWithinWindow_L15(t *testing.T) {
 			t.Fatal("killing A hit no carrier")
 		}
 		for range 2 {
-			if err := <-errs; err != nil {
+			if err := recv(t, errs, 2*time.Minute, "the stream"); err != nil {
 				t.Fatalf("stream: %v", err)
 			}
 		}
@@ -306,9 +328,7 @@ func TestReplayAfterBlackholeWithinWindow_L15(t *testing.T) {
 		if err := pc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		finish(t, dc, pc)
 		f.close()
 	})

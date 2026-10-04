@@ -18,19 +18,21 @@ import (
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
-// TestCloseWriteRacesWrite_L03: 1000 sessions in which one writer streams
-// PRNG bytes while four closers call Close or CloseWrite concurrently. On
-// the wire there is exactly one FIN; it sits at exactly the bytes the
-// writer was told were accepted, every DATA frame lies below it, the
-// passive reads exactly those bytes and then io.EOF, every closer gets the
-// same result (nil), and the writer stops with net.ErrClosed.
+// TestCloseWriteRacesWrite_L03: 1000 sessions (also under -race, as the
+// lesson requires) in which one writer streams PRNG bytes while four
+// closers call Close or CloseWrite concurrently. On the wire there is
+// exactly one FIN; it sits at exactly the bytes the writer was told were
+// accepted, every DATA frame lies below it, the passive reads exactly those
+// bytes and then io.EOF, every closer gets the same result (nil), and the
+// writer stops with net.ErrClosed.
 func TestCloseWriteRacesWrite_L03(t *testing.T) {
-	iters := 1000
-	if lessonsRace {
-		iters = 200
-	}
+	const iters = 1000
 	synctest.Test(t, func(t *testing.T) {
 		f := newFixture(t, opts{}, "a")
+		// A delay, so that every carrier round trip costs virtual time: a
+		// regression that kills and redials in a loop then runs into the
+		// per-session bounds instead of spinning at one virtual instant.
+		f.link("a").SetDelay(100*time.Microsecond, 0)
 		peer := f.peer("a")
 		rng := rand.New(rand.NewPCG(3, 1000))
 		var finsSeen, withData int
@@ -111,8 +113,26 @@ func closeWriteRace(t *testing.T, f *fixture, peer *rendr.Peer, i int, rng *rand
 		cw.Wait()
 		close(closed)
 	})
-	got, rerr := readPrefix(pc, seed)
-	wg.Wait()
+	type prefix struct {
+		n   int64
+		err error
+	}
+	read := make(chan prefix, 1)
+	go func() {
+		n, err := readPrefix(pc, seed)
+		read <- prefix{n, err}
+	}()
+	churn := func() string {
+		return fmt.Sprintf("%d session carriers on the link so far, dialer %+v", len(sessionCarriers(f.link("a"))), dc.Status())
+	}
+	rp := recv(t, read, 10*time.Second, fmt.Sprintf("session %d: the passive's stream", i), churn)
+	got, rerr := rp.n, rp.err
+	joined := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(joined)
+	}()
+	recv(t, joined, 10*time.Second, fmt.Sprintf("session %d: the writer and the closers", i), churn)
 	synctest.Wait() // the dialer's writer has logged everything it wrote
 
 	if !errors.Is(werr, net.ErrClosed) {
@@ -223,13 +243,14 @@ func TestLingerBoundedBehindBlockedCarrier_L03_L52(t *testing.T) {
 			f := newFixture(t, opts{ov: ov}, "a")
 			l := f.link("a")
 			dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
-			if _, err := writeStream(dc, n, 1, 32<<10); err != nil {
-				t.Fatal(err)
-			}
 			v := rendrtest.NewVerifier(1, 2*n)
-			if _, err := io.CopyN(v, pc, n); err != nil {
-				t.Fatalf("first half: %v", err)
-			}
+			runWithin(t, time.Minute, "first half", func() error {
+				if _, err := writeStream(dc, n, 1, 32<<10); err != nil {
+					return err
+				}
+				_, err := io.CopyN(v, pc, n)
+				return err
+			})
 			synctest.Wait()
 			read := make(chan error, 1)
 			go func() {
@@ -242,9 +263,12 @@ func TestLingerBoundedBehindBlockedCarrier_L03_L52(t *testing.T) {
 			io.CopyN(io.Discard, src, n)
 			buf := make([]byte, n)
 			src.Read(buf)
-			if k, err := dc.Write(buf); k != n || err != nil {
-				t.Fatalf("Write behind the block: (%d, %v)", k, err)
-			}
+			runWithin(t, time.Second, "the Write behind the block", func() error {
+				if k, err := dc.Write(buf); k != n || err != nil {
+					return fmt.Errorf("(%d, %v), want (%d, nil)", k, err, n)
+				}
+				return nil
+			})
 			synctest.Wait()
 			if got := l.Stats().Session.WritesBlocked; got != 1 {
 				t.Fatalf("blocked session writes: %d, want 1", got)
@@ -275,7 +299,7 @@ func TestLingerBoundedBehindBlockedCarrier_L03_L52(t *testing.T) {
 			}
 
 			// The passive never saw EOF: it fails with ErrNoPath at its retention.
-			if err := <-read; !errors.Is(err, rendr.ErrNoPath) {
+			if err := recv(t, read, time.Minute, "the passive's read"); !errors.Is(err, rendr.ErrNoPath) {
 				t.Fatalf("passive read ended with %v, want ErrNoPath", err)
 			}
 			if pst := pc.Status(); pst.DeliveredBytes != n || !errors.Is(pst.Err, rendr.ErrNoPath) {
@@ -298,18 +322,14 @@ func TestLingerBoundedBehindBlockedCarrier_L03_L52(t *testing.T) {
 			dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
 			synctest.Wait()
 			l.BlockWrites(rendrtest.Down, rendrtest.BlockHard)
-			if _, err := writeStream(dc, n, 1, 32<<10); err != nil {
-				t.Fatal(err)
-			}
+			runWithin(t, time.Second, "writes", func() error { _, err := writeStream(dc, n, 1, 32<<10); return err })
 			closedAt := time.Now()
 			if err := dc.Close(); err != nil || time.Since(closedAt) != 0 {
 				t.Fatalf("Close: %v after %v, want nil at once", err, time.Since(closedAt))
 			}
 			// The data and the FIN reach the passive application; nothing
 			// it writes (ACK, PONG, CLOSE) can leave.
-			if err := readStream(pc, n, 1, nil); err != nil {
-				t.Fatalf("passive stream: %v", err)
-			}
+			runWithin(t, time.Second, "the passive stream", func() error { return readStream(pc, n, 1, nil) })
 
 			st := waitEnded(t, dc, linger+time.Second)
 			if el := endedAt(t, f.dev, dc).Sub(closedAt); el != linger || !errors.Is(st.Err, net.ErrClosed) {

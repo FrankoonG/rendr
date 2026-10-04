@@ -37,9 +37,7 @@ func TestFinViaSecondCarrier_L02(t *testing.T) {
 			err := readStream(pc, n, 1, nil)
 			read <- result{err, time.Now()}
 		}()
-		if _, err := writeStream(dc, n, 1, 64<<10); err != nil {
-			t.Fatal(err)
-		}
+		runWithin(t, time.Minute, "writes", func() error { _, err := writeStream(dc, n, 1, 64<<10); return err })
 		eventually(t, 10*time.Second, "everything acknowledged", func() bool { return dc.Status().AckedBytes == n })
 		l.DropNextFrame(rendrtest.Up, rendrtest.FrameFin)
 		if err := dc.CloseWrite(); err != nil {
@@ -53,7 +51,7 @@ func TestFinViaSecondCarrier_L02(t *testing.T) {
 			t.Fatalf("passive Read returned %v when carrier 1 died, before any FIN arrived", r.err)
 		default:
 		}
-		r := <-read
+		r := recv(t, read, time.Minute, "the passive stream")
 		if r.err != nil {
 			t.Fatalf("passive stream: %v", r.err)
 		}
@@ -98,9 +96,7 @@ func TestFinViaSecondCarrier_L02(t *testing.T) {
 		if err := pc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read after the passive's FIN: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		finish(t, dc, pc)
 		f.close()
 	})
@@ -125,13 +121,13 @@ func TestKillWithoutFinBlocksRead_L02(t *testing.T) {
 		f := newFixture(t, opts{ov: ov}, "a")
 		l := f.link("a")
 		dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
-		if _, err := writeStream(dc, n, 1, 32<<10); err != nil {
-			t.Fatal(err)
-		}
-		v := rendrtest.NewVerifier(1, n)
-		if _, err := io.CopyN(v, pc, n); err != nil {
-			t.Fatalf("passive read: %v", err)
-		}
+		runWithin(t, time.Minute, "data", func() error {
+			if _, err := writeStream(dc, n, 1, 32<<10); err != nil {
+				return err
+			}
+			_, err := io.CopyN(rendrtest.NewVerifier(1, n), pc, n)
+			return err
+		})
 
 		type result struct {
 			n   int
@@ -185,8 +181,8 @@ func TestKillWithoutFinBlocksRead_L02(t *testing.T) {
 				t.Fatalf("%s Read failed %v after the kill, want %v", role, got, at)
 			}
 		}
-		check(<-dr, "dialer", grace)
-		check(<-pr, "passive", retain)
+		check(recv(t, dr, retain, "the dialer's blocked Read"), "dialer", grace)
+		check(recv(t, pr, retain, "the passive's blocked Read"), "passive", retain)
 		for _, c := range []*rendr.Conn{dc, pc} {
 			if st := c.Status(); st.State != rendr.StateEnded || !errors.Is(st.Err, rendr.ErrNoPath) || st.DeliveredBytes+st.TxBytes != n {
 				t.Fatalf("%v after the grace: %+v", st.Role, st)

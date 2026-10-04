@@ -1,6 +1,7 @@
 package lessons1
 
 import (
+	"fmt"
 	"io"
 	"testing"
 	"testing/synctest"
@@ -47,7 +48,7 @@ func TestBufferLossKillsSHA_L10_L61(t *testing.T) {
 
 		var lost [3]int64
 		for i := range 3 {
-			<-g.at(n * int64(i+1) / 4)
+			reached(t, &g, n*int64(i+1)/4, 2*time.Minute)
 			before := l.Stats().Session.BufferLost
 			if k := l.Kill(); k != 1 {
 				t.Fatalf("kill %d hit %d carriers, want the session's", i+1, k)
@@ -55,7 +56,7 @@ func TestBufferLossKillsSHA_L10_L61(t *testing.T) {
 			lost[i] = l.Stats().Session.BufferLost - before
 		}
 		for range 2 {
-			if err := <-werr; err != nil {
+			if err := recv(t, werr, 2*time.Minute, "the writers"); err != nil {
 				t.Fatalf("writer: %v", err)
 			}
 		}
@@ -65,7 +66,7 @@ func TestBufferLossKillsSHA_L10_L61(t *testing.T) {
 			n    int64
 			seed uint64
 		}{{"dialer → passive", fwd, n, 1}, {"passive → dialer", rev, back, 2}} {
-			s := <-x.ch
+			s := recv(t, x.ch, 2*time.Minute, x.name)
 			if s.err != io.EOF || s.n != x.n || s.d != digest(x.n, x.seed) {
 				t.Fatalf("%s: %d bytes, end %v, SHA-256 match %v (want %d bytes, io.EOF, match)", x.name, s.n, s.err, s.d == digest(x.n, x.seed), x.n)
 			}
@@ -137,20 +138,26 @@ func TestDeathAfterWriteReturnedReplays_L10_L17(t *testing.T) {
 		src.Read(part1)
 		src.Read(part2)
 		at := time.Now()
-		if k, err := dc.Write(part1); k != n1 || err != nil || time.Since(at) != 0 {
-			t.Fatalf("Write(part1): (%d, %v) after %v, want (%d, nil) at once", k, err, time.Since(at), n1)
-		}
+		runWithin(t, time.Second, "Write(part1)", func() error {
+			if k, err := dc.Write(part1); k != n1 || err != nil || time.Since(at) != 0 {
+				return fmt.Errorf("(%d, %v) after %v, want (%d, nil) at once", k, err, time.Since(at), n1)
+			}
+			return nil
+		})
 		synctest.Wait()
 		if a.faults.Load() != 1 {
 			t.Fatalf("A's first DATA write was not intercepted (%d)", a.faults.Load())
 		}
-		if k, err := dc.Write(part2); k != n2 || err != nil || time.Since(at) != 0 {
-			t.Fatalf("Write(part2): (%d, %v), want (%d, nil) at once", k, err, n2)
-		}
+		runWithin(t, time.Second, "Write(part2)", func() error {
+			if k, err := dc.Write(part2); k != n2 || err != nil || time.Since(at) != 0 {
+				return fmt.Errorf("(%d, %v) after %v, want (%d, nil) at once", k, err, time.Since(at), n2)
+			}
+			return nil
+		})
 		if err := dc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-read; err != nil {
+		if err := recv(t, read, time.Minute, "the passive stream"); err != nil {
 			t.Fatalf("passive stream: %v", err)
 		}
 		synctest.Wait()
@@ -195,9 +202,7 @@ func TestDeathAfterWriteReturnedReplays_L10_L17(t *testing.T) {
 		if err := pc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		finish(t, dc, pc)
 		f.close()
 	})

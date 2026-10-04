@@ -137,11 +137,16 @@ func dialAsync(peer *rendr.Peer, o rendr.DialOptions) <-chan dialRes {
 	return ch
 }
 
+// openWithin bounds each step of opening a session (virtual time).
+const openWithin = 30 * time.Second
+
 // open dials one session on peer and confirms it on the fixture's Listener.
 func (f *fixture) open(peer *rendr.Peer, o rendr.DialOptions) (dc, pc *rendr.Conn) {
 	f.t.Helper()
 	res := dialAsync(peer, o)
-	pend, err := f.ln.Accept(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), openWithin)
+	defer cancel()
+	pend, err := f.ln.Accept(ctx)
 	if err != nil {
 		f.t.Fatalf("Accept: %v", err)
 	}
@@ -149,11 +154,61 @@ func (f *fixture) open(peer *rendr.Peer, o rendr.DialOptions) (dc, pc *rendr.Con
 	if err != nil {
 		f.t.Fatalf("Confirm: %v", err)
 	}
-	r := <-res
+	r := recv(f.t, res, openWithin, "Dial")
 	if r.err != nil {
 		f.t.Fatalf("Dial: %v", r.err)
 	}
 	return r.c, pc
+}
+
+// recv receives one value from ch and fails t, naming what (and the
+// details, evaluated at the failure), when none arrives within d. Inside a
+// bubble d is virtual time: rendr's PING timers keep the clock moving, so a
+// stuck scenario never deadlocks the bubble — without a bound it would only
+// end at the package -timeout, with every later test lost. (A loop that
+// never lets virtual time pass, such as carriers killed and redialled over
+// a zero-delay Link, escapes every such bound: tests that could run into
+// one give their Links a delay.)
+func recv[T any](t testing.TB, ch <-chan T, d time.Duration, what string, details ...func() string) T {
+	t.Helper()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case v := <-ch:
+		return v
+	case <-timer.C:
+		for _, f := range details {
+			what += "; " + f()
+		}
+		t.Fatalf("%s: not within %v", what, d)
+		var zero T
+		return zero
+	}
+}
+
+// runWithin runs fn on its own goroutine and fails t when fn returns an
+// error or does not return within d (see recv). After a failure the
+// fixture's cleanup closes the Runtimes, which unblocks fn.
+func runWithin(t testing.TB, d time.Duration, what string, fn func() error) {
+	t.Helper()
+	ch := make(chan error, 1)
+	go func() { ch <- fn() }()
+	if err := recv(t, ch, d, what); err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+}
+
+// reached waits until gauge g counted k bytes and fails t when it does not
+// within d (see recv).
+func reached(t testing.TB, g *gauge, k int64, d time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-g.at(k):
+	case <-timer.C:
+		t.Fatalf("%d bytes received: not within %v (have %d)", k, d, g.get())
+	}
 }
 
 // close releases every blocked write, closes both Runtimes (the dialer

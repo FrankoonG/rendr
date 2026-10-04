@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -19,7 +20,11 @@ import (
 // active carrier in the middle of a bidirectional transfer, on the dialer's
 // and on the passive's end, is a carrier death (transport_error) and
 // nothing else: the application sees no error, both streams arrive intact
-// and end in io.EOF, and each end counts exactly one death migration.
+// and end in io.EOF, and each end counts exactly one death migration. The
+// bytes returned with EOF complete a DATA frame that the carrier applies
+// before it dies (n before err): the faulted end has received it in order
+// by the time the replacement carrier's JOIN is written (replay would hide
+// dropped bytes from the stream check alone).
 func TestCarrierErrorsAreDeath_L01(t *testing.T) {
 	faults := []struct {
 		name string
@@ -51,6 +56,19 @@ func carrierErrorIsDeath(t *testing.T, sd side, fault readFault, n int64) {
 	f.link("a").SetDelay(time.Millisecond, 0)
 	f.link("a").SetRate(64 << 20) // the transfer spans virtual time: the fault lands mid-stream
 	dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
+	faulted := dc
+	if sd == passiveSide {
+		faulted = pc
+	}
+	// The faulted end's in-order receive count when the replacement's JOIN
+	// is written: between the death and that JOIN nothing can reach it.
+	var rxAtJoin atomic.Int64
+	rxAtJoin.Store(-1)
+	f.wire.setHook(func(fr frame) {
+		if fr.out && fr.typ == wire.TypeJoin {
+			rxAtJoin.CompareAndSwap(-1, int64(faulted.Status().RxBytes))
+		}
+	})
 
 	var gp gauge
 	errs := make(chan error, 4)
@@ -59,7 +77,7 @@ func carrierErrorIsDeath(t *testing.T, sd side, fault readFault, n int64) {
 	go func() { errs <- readStream(pc, n, 1, &gp) }()
 	go func() { errs <- readStream(dc, n, 2, nil) }()
 
-	<-gp.at(n / 3)
+	reached(t, &gp, n/3, time.Minute)
 	taps := f.wire.sessionTaps(sd, "a")
 	if len(taps) != 1 {
 		t.Fatalf("%d %v session taps before the fault, want 1", len(taps), sd)
@@ -67,7 +85,7 @@ func carrierErrorIsDeath(t *testing.T, sd side, fault readFault, n int64) {
 	victim := taps[0]
 	victim.armRead(fault)
 	for range 4 {
-		if err := <-errs; err != nil {
+		if err := recv(t, errs, time.Minute, "both streams"); err != nil {
 			t.Fatalf("application saw an error: %v", err)
 		}
 	}
@@ -77,10 +95,6 @@ func carrierErrorIsDeath(t *testing.T, sd side, fault readFault, n int64) {
 	// killed it with transport_error on the faulted end.
 	if got := victim.faults.Load(); got != 1 {
 		t.Fatalf("faults injected on the active carrier: %d, want 1", got)
-	}
-	faulted := dc
-	if sd == passiveSide {
-		faulted = pc
 	}
 	var cause rendr.Cause
 	for _, c := range deadCarriers(faulted.Status()) {
@@ -93,6 +107,22 @@ func carrierErrorIsDeath(t *testing.T, sd side, fault readFault, n int64) {
 	}
 	if sc := sessionCarriers(f.link("a")); len(sc) != 2 {
 		t.Fatalf("%d session carriers on the link, want the original and one replacement", len(sc))
+	}
+	if fault == faultDataEOF {
+		// n before err: the DATA that came with EOF was applied.
+		var end uint64
+		for _, fr := range victim.eofFrames() {
+			if fr.typ == wire.TypeData {
+				end = max(end, fr.dataEnd())
+			}
+		}
+		if end == 0 {
+			t.Fatal("the Read that returned EOF completed no DATA frame")
+		}
+		if rx := rxAtJoin.Load(); rx < int64(end) {
+			t.Fatalf("the %v had received %d bytes in order when the replacement's JOIN was written, "+
+				"but the Read that returned EOF completed DATA up to %d: the bytes returned with the error were dropped", sd, rx, end)
+		}
 	}
 	// Load and integrity: n bytes each way, verified above; Death +1 on both ends.
 	for _, c := range []*rendr.Conn{dc, pc} {
@@ -129,15 +159,45 @@ func finish(t testing.TB, a, b *rendr.Conn) {
 	}
 }
 
-// TestLocalCloseNoFailover_L01: a local close of a carrier (its CLOSE at
-// the end of a session, its GOAWAY at Runtime.Close) racing a read failure
-// of the same carrier never triggers a failover on the side that closed:
-// the read failure is injected (the Link is killed: both ends read EOF and
-// buffered bytes are lost) just before the closing write is forwarded,
-// right after it, or during the drain that follows it. The closing side
-// counts no migration, rejoin or no-path episode, dials no new carrier,
-// emits at most one CarrierDown per carrier, and ends with its local
-// result; the other side still ends cleanly or as the protocol prescribes.
+// swap moves n bytes of PRNG(seed) from a to b and n bytes of
+// PRNG(seed+1) from b to a at the same time, without closing anything.
+func swap(a, b *rendr.Conn, n int64, seed uint64) error {
+	errs := make(chan error, 4)
+	go func() { _, err := writeStream(a, n, seed, 16<<10); errs <- err }()
+	go func() { _, err := writeStream(b, n, seed+1, 16<<10); errs <- err }()
+	go func() { errs <- readN(b, n, seed) }()
+	go func() { errs <- readN(a, n, seed+1) }()
+	for range 4 {
+		if err := <-errs; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TestLocalCloseNoFailover_L01: a local close of a carrier racing a read
+// failure of that same carrier never triggers a failover on the side that
+// closed. Two kinds of local close are raced:
+//
+//   - at the session's end (conn-close: the CLOSE that follows the DONE
+//     exchange; runtime-close: the GOAWAY at Runtime.Close); the read
+//     failure is a Link kill (both ends read EOF, buffered bytes are lost);
+//   - while the session stays open (selector-retire: the planned CLOSE of
+//     the carrier a quality switch left behind); the read failure severs
+//     just that carrier (its probe sibling on the same Link is untouched).
+//
+// The failure strikes just before the closing write is forwarded
+// (before-write), right after it (after-write: inside the Write that
+// forwarded it at the session's end; once that Write returned for the
+// retirement), or during the drain that follows (during-drain). The closing
+// side counts no migration (beyond the switch), rejoin or no-path episode,
+// dials no new carrier and emits at most one CarrierDown per carrier. At the
+// session's end it ends with its local result; the other side still ends
+// cleanly or as the protocol prescribes. While the session stays open, a
+// failure after the CLOSE was written ends the retirement (retired: no
+// failed mark, no redial), one before it is the death of a carrier that
+// carried nothing (transport_error: the failed mark of design §7.3 but no
+// failover), and the session keeps moving data on its new carrier.
 func TestLocalCloseNoFailover_L01(t *testing.T) {
 	iters := 24
 	if lessonsRace {
@@ -159,6 +219,17 @@ func TestLocalCloseNoFailover_L01(t *testing.T) {
 				})
 			})
 		}
+	}
+	retires := 4
+	if lessonsRace {
+		retires = 2
+	}
+	for _, at := range []string{"before-write", "after-write", "during-drain"} {
+		t.Run("selector-retire/"+at, func(t *testing.T) {
+			for i := range retires {
+				synctest.Test(t, func(t *testing.T) { retireNoFailover(t, at, i) })
+			}
+		})
 	}
 }
 
@@ -219,20 +290,9 @@ func localCloseNoFailover(t *testing.T, kind, at string, i int) int {
 	// Data both ways; for Runtime.Close without FINs, so that the session
 	// is still open (no DONE) when the Runtime closes it.
 	if kind == "conn-close" {
-		if err := exchange(dc, pc, 64<<10, uint64(i), 16<<10); err != nil {
-			t.Fatalf("iteration %d: exchange: %v", i, err)
-		}
+		runWithin(t, time.Minute, "exchange", func() error { return exchange(dc, pc, 64<<10, uint64(i), 16<<10) })
 	} else {
-		errs := make(chan error, 4)
-		go func() { _, err := writeStream(dc, 64<<10, uint64(i), 16<<10); errs <- err }()
-		go func() { _, err := writeStream(pc, 64<<10, uint64(i)+1, 16<<10); errs <- err }()
-		go func() { errs <- readN(pc, 64<<10, uint64(i)) }()
-		go func() { errs <- readN(dc, 64<<10, uint64(i)+1) }()
-		for range 4 {
-			if err := <-errs; err != nil {
-				t.Fatalf("iteration %d: data: %v", i, err)
-			}
-		}
+		runWithin(t, time.Minute, "data both ways", func() error { return swap(dc, pc, 64<<10, uint64(i)) })
 	}
 
 	dialsBefore := l.Stats().Dials
@@ -244,17 +304,12 @@ func localCloseNoFailover(t *testing.T, kind, at string, i int) int {
 		rtClosed = make(chan struct{})
 		go func() { f.d.Close(); close(rtClosed) }()
 	}
-	var k int
-	select {
-	case k = <-killed:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("iteration %d: the dialer never wrote its %v", i, closing)
-	}
+	k := recv(t, killed, 30*time.Second, "the dialer's "+closing.String())
 	if at != "during-drain" && k != 1 {
 		t.Fatalf("iteration %d: the read failure hit %d carriers, want the closing one", i, k)
 	}
 	if rtClosed != nil {
-		<-rtClosed
+		recv(t, rtClosed, 30*time.Second, "Runtime.Close")
 	}
 
 	// The closing side (the dialer) never failed over.
@@ -272,12 +327,7 @@ func localCloseNoFailover(t *testing.T, kind, at string, i int) int {
 	if n := len(f.dev.of(dc.ID(), rendr.EventMigration)) + len(f.dev.of(dc.ID(), rendr.EventNoPathStart)); n != 0 {
 		t.Fatalf("iteration %d: dialer emitted %d migration/no-path events", i, n)
 	}
-	downs := map[rendr.CarrierID]int{}
-	for _, ev := range f.dev.of(dc.ID(), rendr.EventCarrierDown) {
-		if downs[ev.Carrier]++; downs[ev.Carrier] > 1 {
-			t.Fatalf("iteration %d: carrier %d reported down twice", i, ev.Carrier)
-		}
-	}
+	onePerCarrier(t, f.dev, dc)
 	if d := l.Stats().Dials; d != dialsBefore || len(sessionCarriers(l)) != 1 {
 		t.Fatalf("iteration %d: the dialer redialled after its local close: %d dials (was %d), %d session carriers",
 			i, d, dialsBefore, len(sessionCarriers(l)))
@@ -300,10 +350,153 @@ func localCloseNoFailover(t *testing.T, kind, at string, i int) int {
 	return k
 }
 
+// onePerCarrier requires at most one CarrierDown event per carrier of c's
+// session in log l, and returns the events by carrier.
+func onePerCarrier(t testing.TB, l *evLog, c *rendr.Conn) map[rendr.CarrierID]rendr.Event {
+	t.Helper()
+	downs := map[rendr.CarrierID]rendr.Event{}
+	for _, ev := range l.of(c.ID(), rendr.EventCarrierDown) {
+		if _, dup := downs[ev.Carrier]; dup {
+			t.Fatalf("carrier %d reported down twice", ev.Carrier)
+		}
+		downs[ev.Carrier] = ev
+	}
+	return downs
+}
+
 // finishAsync runs the clean end of a session whose data already
 // crossed: both ends Close (their FINs went out with exchange's
 // CloseWrite) and the DONE exchange runs in the background.
 func finishAsync(a, b *rendr.Conn) {
 	a.Close()
 	b.Close()
+}
+
+// retireNoFailover runs one selector-retire iteration: a selector session
+// opens on a (the faster path), a degrades, the quality switch moves the
+// session to b, and the planned CLOSE of a's carrier is raced by a read
+// failure of that carrier.
+func retireNoFailover(t *testing.T, at string, i int) {
+	ov := testhooks.Overrides{
+		ProbeInterval: 50 * time.Millisecond, ProbeFresh: time.Second,
+		SelectorDwell: 200 * time.Millisecond, SelectorCooldown: time.Hour,
+		RetireGrace: time.Second,
+	}
+	f := newFixture(t, opts{ov: ov}, "a", "b")
+	la, lb := f.link("a"), f.link("b")
+	la.SetDelay(time.Millisecond, 0)
+	lb.SetDelay(time.Duration(4+i%3)*time.Millisecond, 0)
+	peer := f.peer("a", "b")
+	dc, pc := f.open(peer, rendr.DialOptions{})
+	if c, ok := carrierIn(dc.Status(), rendr.CarrierActive); !ok || c.Name != "a" {
+		t.Fatalf("iteration %d: active carrier %+v, want one on a (the faster path)", i, c)
+	}
+	const n = 64 << 10
+	seed := uint64(10 * (i + 1))
+	runWithin(t, time.Minute, "data before the switch", func() error { return swap(dc, pc, n, seed) })
+	eventually(t, 10*time.Second, "data acknowledged", func() bool {
+		return dc.Status().AckedBytes == n && pc.Status().AckedBytes == n
+	})
+
+	// The strike: sever a's session carrier on the dialer around the
+	// planned CLOSE the switch makes it write.
+	victim := f.wire.sessionTaps(dialerSide, "a")[0]
+	struck := make(chan struct{}, 1)
+	var fired atomic.Bool
+	strike := func() {
+		victim.sever()
+		struck <- struct{}{}
+	}
+	switch at {
+	case "before-write":
+		victim.setPlan(func(_ *tap, fs []frame) planVerdict {
+			for _, fr := range fs {
+				if fr.typ == wire.TypeClose && fired.CompareAndSwap(false, true) {
+					strike() // the Write that carries the CLOSE then fails
+				}
+			}
+			return planVerdict{}
+		})
+	default:
+		// after-write: as soon as the carrier's Write of the CLOSE returned;
+		// during-drain: while it waits for the peer's CLOSE (a 40 ms round
+		// trip once a has degraded).
+		delay := time.Nanosecond
+		if at == "during-drain" {
+			delay = time.Duration(1+i%4) * 7 * time.Millisecond
+		}
+		f.wire.setHook(func(fr frame) {
+			if fr.tap == victim && fr.out && fr.typ == wire.TypeClose && fired.CompareAndSwap(false, true) {
+				go func() {
+					time.Sleep(delay)
+					strike()
+				}()
+			}
+		})
+	}
+	dialsA := la.Stats().Dials
+	la.SetDelay(20*time.Millisecond, 0) // a degrades: b qualifies, and wins after the dwell
+	recv(t, struck, 30*time.Second, "the strike at a's planned CLOSE")
+	synctest.Wait() // the death step ran
+
+	// The retired carrier ended once, with the cause its timing implies; the
+	// failed mark follows the cause.
+	cid := rendr.CarrierID(victim.cid.Load())
+	var cause rendr.Cause
+	for _, c := range deadCarriers(dc.Status()) {
+		if c.ID == cid {
+			cause = c.DeathCause
+		}
+	}
+	want := rendr.CauseRetired
+	if at == "before-write" {
+		want = rendr.CauseTransportError
+	}
+	if cause != want {
+		t.Fatalf("iteration %d: a's session carrier ended with %v, want %v: %+v", i, cause, want, dc.Status().Carriers)
+	}
+	if fs := peer.Status().Factories[0]; fs.Failed != (want == rendr.CauseTransportError) {
+		t.Fatalf("iteration %d: factory a failed mark %v (%q) after a %v end", i, fs.Failed, fs.FailReason, cause)
+	}
+	if c, ok := carrierIn(dc.Status(), rendr.CarrierActive); !ok || c.Name != "b" {
+		t.Fatalf("iteration %d: active carrier %+v after the switch, want one on b", i, c)
+	}
+
+	// The session stays open and keeps moving data, on b.
+	runWithin(t, time.Minute, "data after the strike", func() error { return swap(dc, pc, n, seed+2) })
+	synctest.Wait()
+	quality := rendr.MigrationCounts{Quality: 1}
+	for _, c := range []*rendr.Conn{dc, pc} {
+		if st := c.Status(); st.Migrations != quality || st.Rejoins != 0 || st.NoPathEpisodes != 0 || st.InNoPath || st.State != rendr.StateOpen {
+			t.Fatalf("iteration %d: %v failed over after a's retirement: %+v", i, st.Role, st)
+		}
+	}
+	if m, np := len(f.dev.of(dc.ID(), rendr.EventMigration)), len(f.dev.of(dc.ID(), rendr.EventNoPathStart)); m != 1 || np != 0 {
+		t.Fatalf("iteration %d: dialer emitted %d migration and %d no-path events, want the switch only", i, m, np)
+	}
+	if ev, ok := onePerCarrier(t, f.dev, dc)[cid]; !ok || ev.Cause != want {
+		t.Fatalf("iteration %d: CarrierDown of a's carrier: %+v (reported %v), want one with %v", i, ev, ok, want)
+	}
+	// No redial: neither a session nor a probe carrier was dialled on a.
+	if d := la.Stats().Dials; d != dialsA || len(sessionCarriers(la)) != 1 || len(sessionCarriers(lb)) != 1 {
+		t.Fatalf("iteration %d: %d dials on a (was %d), session carriers a %d, b %d",
+			i, d, dialsA, len(sessionCarriers(la)), len(sessionCarriers(lb)))
+	}
+	endBoth(t, dc, pc)
+	f.close()
+}
+
+// endBoth ends an open session cleanly: both half-close, both read
+// io.EOF, both Close and end with io.EOF.
+func endBoth(t testing.TB, a, b *rendr.Conn) {
+	t.Helper()
+	for _, c := range []*rendr.Conn{a, b} {
+		if err := c.CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite: %v", err)
+		}
+	}
+	for _, c := range []*rendr.Conn{a, b} {
+		readEOF(t, c, c.Status().Role.String())
+	}
+	finish(t, a, b)
 }

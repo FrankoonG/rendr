@@ -104,7 +104,8 @@ func newWireLog() *wireLog { return &wireLog{changed: make(chan struct{})} }
 
 // setHook installs fn, called synchronously (on the conn's reader or
 // writer goroutine, no lock held) for every frame logged afterwards; nil
-// removes it. fn must not block.
+// removes it. fn must not wait for the test; it may delay the goroutine it
+// runs on by a fixed virtual time as a stimulus (a Read that returns late).
 func (w *wireLog) setHook(fn func(f frame)) {
 	if fn == nil {
 		w.hook.Store(nil)
@@ -230,7 +231,11 @@ const (
 	faultTimeout                            // (0, a timeout *net.OpError)
 	faultZeroNil                            // (0, nil)
 	faultPanic                              // panic inside Read
-	faultDataEOF                            // (n > 0 real bytes, io.EOF)
+	// faultDataEOF returns real bytes together with io.EOF from the first
+	// Read whose bytes complete a DATA frame (earlier Reads pass), so the
+	// carrier must apply a known frame before it dies (L01: n before err);
+	// the frames that Read completed are kept (eofFrames).
+	faultDataEOF
 )
 
 var errInjected = errors.New("lessons1: injected carrier write failure")
@@ -253,6 +258,21 @@ type tap struct {
 	rmu   sync.Mutex
 	inp   parser
 	fault atomic.Uint32 // a pending readFault (0 = none)
+	eof   []frame       // faultDataEOF: the frames its Read completed (rmu)
+}
+
+// sever closes the tap's underlying conn: this side's blocked and later
+// Reads and Writes on the carrier fail, and the far end reads EOF after the
+// bytes already in the Link — a read failure of this one carrier, unlike
+// Link.Kill, which ends every carrier of the Link, probe carriers included.
+func (tp *tap) sever() { tp.Conn.Close() }
+
+// eofFrames returns the frames completed by the Read that faultDataEOF
+// failed (nil before it fired).
+func (tp *tap) eofFrames() []frame {
+	tp.rmu.Lock()
+	defer tp.rmu.Unlock()
+	return tp.eof
 }
 
 // setPlan installs a write plan (nil removes it).
@@ -301,7 +321,10 @@ func (tp *tap) Write(p []byte) (int, error) {
 // Read forwards to the conn (or injects the armed fault) and logs the
 // frames the bytes complete.
 func (tp *tap) Read(p []byte) (int, error) {
-	if f := readFault(tp.fault.Swap(0)); f != 0 {
+	switch f := readFault(tp.fault.Load()); {
+	case f == faultDataEOF:
+		return tp.readDataEOF(p)
+	case f != 0 && tp.fault.CompareAndSwap(uint32(f), 0):
 		tp.faults.Add(1)
 		switch f {
 		case faultEOF:
@@ -316,22 +339,37 @@ func (tp *tap) Read(p []byte) (int, error) {
 			return 0, nil
 		case faultPanic:
 			panic("lessons1: injected panic in a carrier Read")
-		case faultDataEOF:
-			n, err := tp.Conn.Read(p)
-			if k := min(max(n, 0), len(p)); k > 0 {
-				tp.parseIn(p[:k])
-			}
-			if err == nil {
-				err = io.EOF
-			}
-			return n, err
 		}
 	}
 	n, err := tp.Conn.Read(p)
 	if k := min(max(n, 0), len(p)); k > 0 {
-		tp.parseIn(p[:k])
+		tp.parseIn(p[:k], nil)
 	}
 	return n, err
+}
+
+// readDataEOF serves a Read while faultDataEOF is armed: the conn's real
+// bytes, and io.EOF with them once they complete a DATA frame.
+func (tp *tap) readDataEOF(p []byte) (int, error) {
+	n, err := tp.Conn.Read(p)
+	k := min(max(n, 0), len(p))
+	if k == 0 {
+		return n, err
+	}
+	var fs []frame
+	tp.parseIn(p[:k], &fs)
+	data := false
+	for _, f := range fs {
+		data = data || f.typ == wire.TypeData
+	}
+	if err != nil || !data || !tp.fault.CompareAndSwap(uint32(faultDataEOF), 0) {
+		return n, err
+	}
+	tp.faults.Add(1)
+	tp.rmu.Lock()
+	tp.eof = fs
+	tp.rmu.Unlock()
+	return n, io.EOF
 }
 
 // parseOut logs the frames completed by bytes this side wrote (wmu held).
@@ -346,8 +384,9 @@ func (tp *tap) parseOut(b []byte, ft fate) {
 	})
 }
 
-// parseIn logs the frames completed by bytes this side read.
-func (tp *tap) parseIn(b []byte) {
+// parseIn logs the frames completed by bytes this side read, also appending
+// them to keep when it is non-nil.
+func (tp *tap) parseIn(b []byte, keep *[]frame) {
 	tp.rmu.Lock()
 	defer tp.rmu.Unlock()
 	tp.inp.feed(b, tp.preface, func(h wire.Header, body []byte) {
@@ -355,6 +394,9 @@ func (tp *tap) parseIn(b []byte) {
 		f.at, f.tap = time.Now(), tp
 		if tp.side == passiveSide {
 			tp.classify(h.Type)
+		}
+		if keep != nil {
+			*keep = append(*keep, f)
 		}
 		tp.log.add(f)
 	})

@@ -36,9 +36,7 @@ func TestFinReplayedOnNewCarrier_L04(t *testing.T) {
 		})
 		read := make(chan error, 1)
 		go func() { read <- readStream(pc, n, 1, nil) }()
-		if _, err := writeStream(dc, n, 1, 64<<10); err != nil {
-			t.Fatal(err)
-		}
+		runWithin(t, time.Minute, "writes", func() error { _, err := writeStream(dc, n, 1, 64<<10); return err })
 		for range 2 { // idempotent
 			if err := dc.CloseWrite(); err != nil {
 				t.Fatalf("CloseWrite: %v", err)
@@ -47,7 +45,7 @@ func TestFinReplayedOnNewCarrier_L04(t *testing.T) {
 		if _, err := dc.Write([]byte{1}); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Write after CloseWrite: %v, want net.ErrClosed", err)
 		}
-		if err := <-read; err != nil {
+		if err := recv(t, read, time.Minute, "the passive stream"); err != nil {
 			t.Fatalf("passive stream: %v", err)
 		}
 		synctest.Wait()
@@ -97,9 +95,7 @@ func TestFinReplayedOnNewCarrier_L04(t *testing.T) {
 		if err := pc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		finish(t, dc, pc)
 		f.close()
 	})
@@ -125,9 +121,7 @@ func TestHalfCloseReverse4MiB_L04(t *testing.T) {
 		server := make(chan error, 1)
 		go func() { server <- rendrtest.HalfCloseCheck(req, 1, reply)(pc) }()
 
-		if _, err := writeStream(dc, req, 1, 16<<10); err != nil {
-			t.Fatal(err)
-		}
+		runWithin(t, time.Minute, "the request", func() error { _, err := writeStream(dc, req, 1, 16<<10); return err })
 		for range 2 {
 			if err := dc.CloseWrite(); err != nil {
 				t.Fatalf("CloseWrite: %v", err)
@@ -140,17 +134,17 @@ func TestHalfCloseReverse4MiB_L04(t *testing.T) {
 		client := make(chan error, 1)
 		go func() { client <- readStream(dc, reply, 2, &g) }()
 
-		<-g.at(reply / 2)
+		reached(t, &g, reply/2, time.Minute)
 		if k := l.Kill(); k != 1 {
 			t.Fatalf("Kill hit %d carriers, want 1", k)
 		}
 		if _, err := dc.Write([]byte{1}); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Write after CloseWrite, during the migration: %v", err)
 		}
-		if err := <-client; err != nil {
+		if err := recv(t, client, time.Minute, "the client's reply"); err != nil {
 			t.Fatalf("client reply: %v", err)
 		}
-		if err := <-server; err != nil {
+		if err := recv(t, server, time.Minute, "the server"); err != nil {
 			t.Fatalf("server: %v", err)
 		}
 		synctest.Wait()
@@ -229,9 +223,7 @@ func TestFinNotBeforeStuckData_L04(t *testing.T) {
 			read <- result{err, time.Now()}
 		}()
 		la.BlockWrites(rendrtest.Up, rendrtest.BlockHard)
-		if _, err := writeStream(dc, n, 1, 64<<10); err != nil {
-			t.Fatal(err)
-		}
+		runWithin(t, time.Minute, "writes", func() error { _, err := writeStream(dc, n, 1, 64<<10); return err })
 		if err := dc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
@@ -250,10 +242,21 @@ func TestFinNotBeforeStuckData_L04(t *testing.T) {
 		if rx := pc.Status().RxBytes; rx >= n {
 			t.Fatalf("the passive had all %d bytes when the FIN arrived: nothing was stuck on A", rx)
 		}
+		// The Read blocked since before the FIN arrived; make it judge the
+		// EOF condition again now that the FIN sits above the hole: setting
+		// a deadline wakes every blocked Read (L06) and a future one fails
+		// none.
+		if err := pc.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
 		select {
 		case r := <-read:
 			t.Fatalf("passive Read ended (%v) with a hole below the FIN", r.err)
 		default:
+		}
+		if err := pc.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
 		}
 		if s := la.Stats(); s.Session.WritesBlocked < 1 {
 			t.Fatalf("A's session writes blocked: %d", s.Session.WritesBlocked)
@@ -261,7 +264,7 @@ func TestFinNotBeforeStuckData_L04(t *testing.T) {
 
 		// The stuck bytes arrive (rescued on B, or replayed after A's
 		// write-stall death); io.EOF only after all of them.
-		r := <-read
+		r := recv(t, read, time.Minute, "the passive stream")
 		if r.err != nil {
 			t.Fatalf("passive stream: %v", r.err)
 		}
@@ -277,9 +280,7 @@ func TestFinNotBeforeStuckData_L04(t *testing.T) {
 		if err := pc.CloseWrite(); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
+		readEOF(t, dc, "dialer")
 		finish(t, dc, pc)
 		f.close()
 	})

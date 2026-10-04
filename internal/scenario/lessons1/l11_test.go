@@ -1,9 +1,11 @@
 package lessons1
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -65,11 +67,14 @@ func TestRetransmitWithoutAppTraffic_L11(t *testing.T) {
 		src := make([]byte, n)
 		rendrtest.PRNG(1).Read(src)
 		wrote := time.Now()
-		if k, err := dc.Write(src); k != n || err != nil {
-			t.Fatalf("Write: (%d, %v)", k, err)
-		}
+		runWithin(t, time.Second, "the only Write", func() error {
+			if k, err := dc.Write(src); k != n || err != nil {
+				return fmt.Errorf("(%d, %v), want (%d, nil)", k, err, n)
+			}
+			return nil
+		})
 		// No application traffic from here until the bytes arrived.
-		at := <-got
+		at := recv(t, got, time.Minute, "the passive's bytes")
 		if el := at.Sub(wrote); el > time.Second {
 			t.Fatalf("delivered %v after the only Write, want ≤ 1 s", el)
 		}
@@ -93,19 +98,7 @@ func TestRetransmitWithoutAppTraffic_L11(t *testing.T) {
 		if pst := pc.Status(); pst.RxBytes != n || pst.DeliveredBytes != n {
 			t.Fatalf("passive received %d / delivered %d, want exactly %d", pst.RxBytes, pst.DeliveredBytes, n)
 		}
-		if err := dc.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if k, err := pc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("passive Read: (%d, %v)", k, err)
-		}
-		if err := pc.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
-		finish(t, dc, pc)
+		endBoth(t, dc, pc)
 		f.close()
 	})
 }
@@ -128,12 +121,13 @@ func TestSoleCarrierTailRecovered_L11(t *testing.T) {
 		v := rendrtest.NewVerifier(1, head+tail)
 		buf := make([]byte, head+tail)
 		rendrtest.PRNG(1).Read(buf)
-		if _, err := dc.Write(buf[:head]); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := io.CopyN(v, pc, head); err != nil {
-			t.Fatal(err)
-		}
+		runWithin(t, time.Minute, "the head", func() error {
+			if _, err := dc.Write(buf[:head]); err != nil {
+				return err
+			}
+			_, err := io.CopyN(v, pc, head)
+			return err
+		})
 		eventually(t, time.Second, "head acknowledged", func() bool { return dc.Status().AckedBytes == head })
 		synctest.Wait()
 
@@ -146,10 +140,8 @@ func TestSoleCarrierTailRecovered_L11(t *testing.T) {
 			got <- time.Now()
 		}()
 		wrote := time.Now()
-		if _, err := dc.Write(buf[head:]); err != nil {
-			t.Fatal(err)
-		}
-		at := <-got
+		runWithin(t, time.Second, "the tail's Write", func() error { _, err := dc.Write(buf[head:]); return err })
+		at := recv(t, got, time.Minute, "the tail")
 		if el := at.Sub(wrote); el > time.Second {
 			t.Fatalf("tail delivered %v after its Write, want ≤ 1 s", el)
 		}
@@ -196,130 +188,138 @@ func TestSoleCarrierTailRecovered_L11(t *testing.T) {
 				t.Fatalf("%v migrations %+v, want exactly 1 death", st.Role, st.Migrations)
 			}
 		}
-		if err := dc.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if k, err := pc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("passive Read: (%d, %v)", k, err)
-		}
-		if err := pc.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
-		finish(t, dc, pc)
+		endBoth(t, dc, pc)
 		f.close()
 	})
 }
 
 // TestAckLossRecovers_L11: a writer blocked on a small window while the
-// reverse path loses everything for 100 ms — every ACK (and PONG) the
-// passive writes vanishes. When the reverse path works again its first
-// frame shows the dialer the fseq gap, the carrier is replaced, and the
-// passive's acknowledgement on the new carrier unblocks the writer within
-// two ACK intervals; the stream arrives intact.
+// reverse path loses everything for a while — every ACK (and PONG) the
+// passive writes vanishes, so its send buffer stays full. Once the reverse
+// path works again, its first frame (at the latest the PONG to the
+// dialer's next busy PING, sent every PingBusy while bytes are unproven,
+// P12) shows the dialer the fseq gap, the carrier is replaced, and the
+// passive's acknowledgement on the new carrier (the JOIN_ACK's rxNext, and
+// the ACK the new duty lane places at once, design §4.6) unblocks the
+// writer. Bounds: within two ACK intervals (2·AckDelay) of the
+// replacement's JOIN, and within PingBusy + 2·AckDelay of the moment the
+// reverse path recovered, whatever the phase of the PING cadence — the
+// loss durations span one PingBusy period. The stream arrives intact.
 func TestAckLossRecovers_L11(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const (
-			window  = 256 << 10
-			n       = 4 << 20
-			loss    = 100 * time.Millisecond
-			ackIntv = 20 * time.Millisecond // AckDelay (plan §4: ACK every 64 KiB or 20 ms)
-		)
-		f := newFixture(t, opts{ov: testhooks.Overrides{Window: window}}, "a")
-		f.link("a").SetDelay(time.Millisecond, 0)
-		dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
-
-		// The writer records when each Write returned.
-		var mu sync.Mutex
-		var writes []time.Time
-		werr := make(chan error, 1)
-		go func() {
-			src := rendrtest.PRNG(1)
-			buf := make([]byte, 16<<10)
-			for done := 0; done < n; done += len(buf) {
-				src.Read(buf)
-				if _, err := dc.Write(buf); err != nil {
-					werr <- err
-					return
-				}
-				mu.Lock()
-				writes = append(writes, time.Now())
-				mu.Unlock()
-			}
-			werr <- dc.CloseWrite()
-		}()
-		var g gauge
-		rerr := make(chan error, 1)
-		go func() { rerr <- readStream(pc, n, 1, &g) }()
-
-		<-g.at(n / 4)
-		// Every write of the passive on carrier 1 vanishes for `loss`.
-		p1 := f.wire.sessionTaps(passiveSide, "a")[0]
-		lossFrom := time.Now()
-		lossTo := lossFrom.Add(loss)
-		var swallowed int
-		p1.setPlan(func(_ *tap, fs []frame) planVerdict {
-			if time.Now().Before(lossTo) {
-				swallowed++
-				return planVerdict{swallow: true}
-			}
-			return planVerdict{}
+	for _, loss := range []time.Duration{100, 115, 130, 145} {
+		t.Run(fmt.Sprintf("loss-%dms", loss), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { ackLossRecovers(t, loss*time.Millisecond) })
 		})
-		if err := <-werr; err != nil {
-			t.Fatalf("writer: %v", err)
-		}
-		if err := <-rerr; err != nil {
-			t.Fatalf("passive stream: %v", err)
-		}
-		synctest.Wait()
+	}
+}
 
-		// Stimulus: ACKs were lost, the dialer killed carrier 1 at the gap.
-		if swallowed == 0 {
-			t.Fatal("no passive write was lost")
-		}
-		dt := f.wire.sessionTaps(dialerSide, "a")
-		if len(dt) != 2 {
-			t.Fatalf("%d session carriers, want the original and its replacement", len(dt))
-		}
-		if d := deadCarriers(dc.Status()); len(d) != 1 || d[0].DeathCause != rendr.CauseProtocolViolation {
-			t.Fatalf("dialer's dead carriers %+v, want carrier 1 killed for the fseq gap", d)
-		}
-		// The writer stalled during the loss and resumed within two ACK
-		// intervals of the first ACK on the new carrier.
-		acks := dt[1].recv(wire.TypeAck)
-		if len(acks) == 0 {
-			t.Fatal("no ACK on carrier 2")
-		}
-		recovered := acks[0].at
-		mu.Lock()
-		ws := append([]time.Time(nil), writes...)
-		mu.Unlock()
-		var before, after time.Time // the last Write that returned before the recovery, the first one at or after it
-		for _, w := range ws {
-			if w.Before(recovered) {
-				before = w
-			} else if after.IsZero() {
-				after = w
+func ackLossRecovers(t *testing.T, loss time.Duration) {
+	const (
+		window   = 256 << 10
+		n        = 4 << 20
+		ackDelay = 20 * time.Millisecond // AckDelay (plan §4: ACK every 64 KiB or 20 ms)
+		pingBusy = 50 * time.Millisecond // PingBusy (default)
+	)
+	f := newFixture(t, opts{ov: testhooks.Overrides{Window: window}}, "a")
+	f.link("a").SetDelay(time.Millisecond, 0)
+	dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
+
+	// The writer records when each Write returned.
+	var mu sync.Mutex
+	var writes []time.Time
+	werr := make(chan error, 1)
+	go func() {
+		src := rendrtest.PRNG(1)
+		buf := make([]byte, 16<<10)
+		for done := 0; done < n; done += len(buf) {
+			src.Read(buf)
+			if _, err := dc.Write(buf); err != nil {
+				werr <- err
+				return
 			}
+			mu.Lock()
+			writes = append(writes, time.Now())
+			mu.Unlock()
 		}
-		if before.After(lossFrom.Add(loss / 2)) {
-			t.Fatalf("the writer kept writing during the loss (last write before recovery at %v, loss %v..%v)", before, lossFrom, lossTo)
+		werr <- dc.CloseWrite()
+	}()
+	var g gauge
+	rerr := make(chan error, 1)
+	go func() { rerr <- readStream(pc, n, 1, &g) }()
+
+	reached(t, &g, n/4, time.Minute)
+	// Every write of the passive on carrier 1 vanishes for loss.
+	p1 := f.wire.sessionTaps(passiveSide, "a")[0]
+	lossFrom := time.Now()
+	lossTo := lossFrom.Add(loss)
+	var swallowed atomic.Int64
+	p1.setPlan(func(_ *tap, fs []frame) planVerdict {
+		if time.Now().Before(lossTo) {
+			swallowed.Add(1)
+			return planVerdict{swallow: true}
 		}
-		if after.IsZero() || after.Sub(recovered) > 2*ackIntv {
-			t.Fatalf("the writer resumed %v after the first ACK on carrier 2, want ≤ %v", after.Sub(recovered), 2*ackIntv)
-		}
-		if st := dc.Status(); st.Migrations != (rendr.MigrationCounts{Death: 1}) || st.TxBytes != n {
-			t.Fatalf("dialer: %+v", st)
-		}
-		if err := pc.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if k, err := dc.Read(make([]byte, 1)); k != 0 || err != io.EOF {
-			t.Fatalf("dialer Read: (%d, %v)", k, err)
-		}
-		finish(t, dc, pc)
-		f.close()
+		return planVerdict{}
 	})
+	if err := recv(t, werr, time.Minute, "the writer"); err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	if err := recv(t, rerr, time.Minute, "the passive stream"); err != nil {
+		t.Fatalf("passive stream: %v", err)
+	}
+	synctest.Wait()
+
+	// Stimulus: ACKs were lost, the dialer killed carrier 1 at the gap.
+	if swallowed.Load() == 0 {
+		t.Fatal("no passive write was lost")
+	}
+	dt := f.wire.sessionTaps(dialerSide, "a")
+	if len(dt) != 2 {
+		t.Fatalf("%d session carriers, want the original and its replacement", len(dt))
+	}
+	if d := deadCarriers(dc.Status()); len(d) != 1 || d[0].DeathCause != rendr.CauseProtocolViolation {
+		t.Fatalf("dialer's dead carriers %+v, want carrier 1 killed for the fseq gap", d)
+	}
+	joins, acks := dt[1].sent(wire.TypeJoin), dt[1].recv(wire.TypeAck)
+	if len(joins) != 1 || len(acks) == 0 {
+		t.Fatalf("carrier 2: JOINs %+v, %d ACKs read", joins, len(acks))
+	}
+	mu.Lock()
+	ws := append([]time.Time(nil), writes...)
+	mu.Unlock()
+	var stalled, resumed time.Time // the last Write that returned before lossTo, the first one at or after it
+	for _, w := range ws {
+		if w.Before(lossTo) {
+			stalled = w
+		} else if resumed.IsZero() {
+			resumed = w
+		}
+	}
+	// The writer stalled during the loss (its buffer filled) ...
+	if stalled.After(lossFrom.Add(loss / 2)) {
+		t.Fatalf("the writer kept writing during the loss (last write before its end at %v, loss %v..%v)", stalled, lossFrom, lossTo)
+	}
+	// ... and resumed promptly once the reverse path worked again.
+	if resumed.IsZero() {
+		t.Fatal("the writer never resumed")
+	}
+	timeline := fmt.Sprintf("after the recovery: JOIN +%v, first ACK on carrier 2 +%v, writer resumed +%v",
+		joins[0].at.Sub(lossTo), acks[0].at.Sub(lossTo), resumed.Sub(lossTo))
+	if el := resumed.Sub(lossTo); el > pingBusy+2*ackDelay {
+		t.Fatalf("the writer resumed %v after the reverse path recovered, want ≤ PingBusy + 2·AckDelay = %v (%s)", el, pingBusy+2*ackDelay, timeline)
+	}
+	if el := resumed.Sub(joins[0].at); el > 2*ackDelay {
+		t.Fatalf("the writer resumed %v after the replacement's JOIN, want ≤ 2·AckDelay = %v (%s)", el, 2*ackDelay, timeline)
+	}
+	if el := resumed.Sub(acks[0].at); el > 2*ackDelay {
+		t.Fatalf("the writer resumed %v after the first ACK on carrier 2, want ≤ %v (%s)", el, 2*ackDelay, timeline)
+	}
+	if st := dc.Status(); st.Migrations != (rendr.MigrationCounts{Death: 1}) || st.TxBytes != n {
+		t.Fatalf("dialer: %+v", st)
+	}
+	if err := pc.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	readEOF(t, dc, "dialer")
+	finish(t, dc, pc)
+	f.close()
 }
