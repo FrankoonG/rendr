@@ -6,9 +6,9 @@ import (
 )
 
 // A lane is its carrier's endpoint (design §4.0); the methods below are
-// WP4's. The carrier calls them from its writer (Fill, and WriteBlocked via
-// the watchdog) and its reader (Data, Control), never while holding its own
-// lock; each takes s.mu.
+// stream code. The carrier calls them from its writer (Fill, and
+// WriteBlocked via the watchdog) and its reader (Data, Control), never while
+// holding its own lock; each takes s.mu.
 var _ carrier.Endpoint = (*lane)(nil)
 
 // Handle returns the session handle the lane uses on its carrier
@@ -22,11 +22,12 @@ func (l *lane) Handle() uint32 {
 // (OPEN_ACK or JOIN_ACK; fact factLaneConfirmed), and nothing at all while a
 // held passive carrier has none yet; RST once (then nothing else); the
 // dialer's pending SCHED; the ACK on the duty lane (with the ACK-delay
-// rule, b.WakeAt); then, if l.data, DATA — the rescue span unless l is its
-// holder, retransmissions lowest first, new data up to min(end, peerLimit),
-// cut at chunk boundaries and bounded by b.Room() and the carrier's
-// capacity (b.MarkCapBlocked when data waits on the cap); then the FIN when
-// due. It sets l.idle when it appended nothing.
+// rule, b.WakeAt; an ACK that takes lastWin from 64 KiB or more to below it
+// rings the actor, see readvertiseLocked); then, if l.data, DATA — the
+// rescue span unless l is its holder, retransmissions lowest first, new
+// data up to min(end, peerLimit), cut at chunk boundaries and bounded by
+// b.Room() and the carrier's capacity (b.MarkCapBlocked when data waits on
+// the cap); then the FIN when due. It sets l.idle when it appended nothing.
 func (l *lane) Fill(c *carrier.Conn, b *carrier.Batch) {
 	panic("unimplemented: M1b")
 }

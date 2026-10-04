@@ -9,17 +9,18 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// This file is the session's internal layout: the contract between the
-// stream (work package WP4) and the actor (WP7) of design §4.0. It declares
-// every shared type with exactly the fields of §4.0 and nothing executable.
-// Methods live with their only writer: WP4 owns the spans, rings, segments
+// This file is the session's internal layout (design §4.0): the contract
+// between the stream (the data path: application Read and Write, the lanes'
+// carrier.Endpoint methods, ACK, FIN) and the actor (the session's control
+// goroutine). It declares every shared type and nothing executable. Methods
+// live with their only writer: the stream owns the spans, rings, segments
 // and deadlines, the lane's carrier.Endpoint methods (lane_ep.go) and the
-// helpers the actor calls (helpers.go); WP7 owns the mailbox (mailbox.go)
-// and the status snapshot (status.go).
+// helpers the actor calls (helpers.go); the actor owns the mailbox
+// (mailbox.go) and the status snapshot (status.go).
 //
-// Field ownership: (S) is written only by stream code (WP4), (A) only by
-// actor code (WP7); both are read under Session.mu. Immutable fields are set
-// before the session becomes visible to any other goroutine.
+// Field ownership: (S) is written only by stream code, (A) only by actor
+// code; both are read under Session.mu. Immutable fields are set before the
+// session becomes visible to any other goroutine.
 
 // Session is one stream session: its stream state, its lanes and its actor.
 // All exported methods are safe for concurrent use.
@@ -54,7 +55,7 @@ type Session struct {
 }
 
 // port is the set of *carrier.Conn methods the stream uses on a lane's
-// carrier; a fake implements it in WP4 unit tests (design §4.0).
+// carrier; a fake implements it in the stream's unit tests (design §4.0).
 type port interface {
 	ID() uint32
 	Wake()
@@ -71,12 +72,12 @@ type port interface {
 var _ port = (*carrier.Conn)(nil)
 
 // lane is one carrier incarnation of a session (design §4.0, §7.1). It
-// implements carrier.Endpoint; its methods live in WP4's lane_ep.go. The
-// first group is immutable; the other fields are guarded by Session.mu.
+// implements carrier.Endpoint; its methods live in lane_ep.go. The first
+// group is immutable; the other fields are guarded by Session.mu.
 type lane struct {
 	s       *Session      // immutable
 	c       *carrier.Conn // immutable: the carrier incarnation
-	port    port          // immutable: the stream's view of c (a fake in WP4 unit tests)
+	port    port          // immutable: the stream's view of c (a fake in stream unit tests)
 	id      uint32        // immutable: the CarrierID
 	factory int           // immutable: the dialer factory index (-1 on the passive side)
 	gen     uint32        // immutable: dialer: incarnation number of the factory slot; passive: attach order
@@ -99,8 +100,8 @@ type lane struct {
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a
-// whole, written only by WP4 code (the actor changes it through the helpers
-// in helpers.go) except where a field says otherwise. Offsets are u64
+// whole, written only by stream code (the actor changes it through the
+// helpers in helpers.go) except where a field says otherwise. Offsets are u64
 // stream offsets from Params.FirstOffset; C is carrier.ChunkSize and W is
 // Params.Window.
 type stream struct {
@@ -121,12 +122,13 @@ type stream struct {
 	wfreePending bool // endLocked ran during that copy: the copier releases the chunks after it
 
 	// Receive side (§4.4, §4.5, §4.12).
-	rRead     uint64  // delivered to the application (consumed by Read)
-	rTail     uint64  // end of the contiguous received bytes
-	rightEdge uint64  // the largest right edge ever advertised; never retracts (P10); the receiver's fatal threshold
-	inq       segRing // in-order segments covering [rRead, rTail)
-	ooq       segList // out-of-order segments beyond rTail: ascending, non-overlapping
-	oooCap    int64   // size-class capacity held by ooq (at most 2·W; excess DATA is dropped and counted, D13)
+	rRead      uint64  // delivered to the application (consumed by Read)
+	rTail      uint64  // end of the contiguous received bytes
+	rightEdge  uint64  // the largest right edge ever advertised; never retracts (P10); the receiver's fatal threshold
+	inq        segRing // in-order segments covering [rRead, rTail)
+	ooq        segList // out-of-order segments beyond rTail: ascending, non-overlapping
+	oooCap     int64   // size-class capacity held by ooq (at most 2·W; DATA beyond it is dropped, D13)
+	oooDropped uint64  // out-of-order DATA payload bytes dropped at the oooCap limit (counted, never a violation: §4.4 step 6, D13)
 
 	peerFin          uint64 // the peer's FIN offset (valid when peerFinSet)
 	peerFinSet       bool   // a FIN arrived
@@ -143,7 +145,7 @@ type stream struct {
 	ackFlags   uint8     // header flags the next ACK carries (FIN_DELIVERED, DONE)
 	ackDelayAt time.Time // armed ACK delay (zero: none); fired by the duty lane's writer timer, never by the actor
 	ackLane    *lane     // the ACK duty lane (D5); nil when no lane qualifies
-	lastWin    int64     // window carried by the last ACK placed (D18 re-advertisement below 64 KiB)
+	lastWin    int64     // the window last advertised: W at init, then OPEN/OPEN_ACK (openWindowLocked) and every ACK placed; below 64 KiB the actor re-advertises (D18, readvertiseLocked)
 	ackOnData  bool      // the next in-order DATA bumps an urgent ACK (a lane attached, L19)
 
 	// Application waiters (§3.5) and deadlines (§3.6).
@@ -166,7 +168,7 @@ type stream struct {
 	peerDone     bool      // the peer's DONE arrived (fact)
 	doneSentAt   time.Time // when doneSent was set (the actor's DONE wait)
 
-	lastAdvance time.Time // last sBase advance (rescue clock, read by the actor)
+	lastAdvance time.Time // rescue clock, read by the actor: the last sBase advance, or the Write commit that made data outstanding (sBase == end before it)
 	echoIn      uint32    // dialer: highest EpochEcho received (fact factEcho); the actor copies it into ctl.echoed
 
 	rstIn     *wire.Rst // the RST received (fact factRst)
@@ -185,7 +187,7 @@ type stream struct {
 }
 
 // control is the session's control state (design §4.0, §7): (A) as a whole,
-// written only by WP7 code except the received-SCHED fields, which the
+// written only by actor code except the received-SCHED fields, which the
 // stream stores for the actor to apply.
 type control struct {
 	state  State // (A) lifecycle
@@ -284,6 +286,25 @@ type firstFrame struct {
 // st.facts under mu before it calls ringActor. The actor takes them with
 // takeFactsLocked and re-reads the state they point at, so a fact is never
 // lost or applied twice.
+//
+// Two conditions have no fact bit: they only arm actor deadlines, and the
+// actor re-reads them in every step. The data path still rings the actor
+// (under mu) when one arises, so an idle actor arms the deadline at once:
+//
+//   - Window pressure (D18): Fill places an ACK that takes lastWin from
+//     64 KiB or more to below it. The actor keeps its
+//     Params.WindowReadvertise deadline armed for as long as
+//     readvertiseLocked returns true, which it does until an ACK carrying
+//     at least 64 KiB has been placed; an ACK that leaves lastWin below
+//     64 KiB therefore needs no ring.
+//   - Bond data outstanding (§4.11): a Write commit makes data outstanding
+//     (sBase == end before it). That commit restarts the rescue clock
+//     lastAdvance (in either mode) and, in bond mode, rings the actor. In
+//     bond mode the actor keeps a rescue check armed while sBase < end: at
+//     lastAdvance + sched.RescueWait, or RescueWait after the current step
+//     once that time has passed without a rescue (none possible, or already
+//     done at this sBase), so a stuck head is rescued without waiting for
+//     an unrelated wake.
 const (
 	factClose               uint32 = 1 << iota // the application called Close (closed, closedAt)
 	factCloseWrite                             // the application called CloseWrite (fin.requested)

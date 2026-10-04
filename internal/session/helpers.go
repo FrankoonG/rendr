@@ -2,25 +2,28 @@ package session
 
 import "time"
 
-// Stream helpers the actor (WP7) calls (design §4.0). Every helper is
-// called with s.mu held, never blocks, and changes stream (S) state only as
-// documented here; the bodies are WP4's.
+// Stream helpers the actor calls (design §4.0). Every helper is called with
+// s.mu held, never blocks, and changes stream (S) state only as documented
+// here.
 
 // initStreamLocked initializes the stream once, before the session is
 // visible to any other goroutine (Dial, NewPending): every offset — cbase,
 // sBase, sNext, end, resEnd, rRead, rTail, rightEdge and peerLimit — is
-// Params.FirstOffset; the chunk ring gets capacity W/C + 2; rwake and wwake
-// are made (cap 1); the deadline timers and the srtt order slice are
-// prepared. Nothing is charged to the Budget.
+// Params.FirstOffset; lastWin is W (nothing advertised yet, so nothing to
+// re-advertise); the chunk ring gets capacity W/C + 2; rwake and wwake are
+// made (cap 1); the deadline timers and the srtt order slice are prepared.
+// Nothing is charged to the Budget.
 func (s *Session) initStreamLocked() {
 	panic("unimplemented: M1b")
 }
 
 // openWindowLocked raises rightEdge to rRead + sched.AdvertiseWindow(W,
-// Budget.Used, Budget.Max), never retracting it (P10), and returns
-// rightEdge − rRead: the window the dialer puts in OPEN (at Dial) and the
-// passive in every OPEN_ACK(OK) (Confirm, duplicate OPENs on an open
-// session).
+// Budget.Used, Budget.Max), never retracting it (P10), records rightEdge −
+// rRead in lastWin and returns it: the window the dialer puts in OPEN (at
+// Dial) and the passive in every OPEN_ACK(OK) (Confirm, duplicate OPENs on
+// an open session). It is called by the actor or before the actor's first
+// step, so a window below 64 KiB reaches the actor through readvertiseLocked
+// in that same or its first step, without a ring.
 func (s *Session) openWindowLocked() uint32 {
 	panic("unimplemented: M1b")
 }
@@ -115,21 +118,37 @@ func (s *Session) takeFactsLocked() uint32 {
 
 // rescueHolderLocked finds the lane whose infl covers sBase (design §4.11)
 // and returns it with the span to duplicate, which starts at sBase and lies
-// inside that lane's infl; ok is false when no lane holds sBase. The actor
-// then sets st.rescue = {sp, holder} and wakes the other data lanes.
+// inside that lane's infl; ok is false when no lane holds sBase (not sent
+// yet, or requeued). The actor calls it when the head has been stuck since
+// lastAdvance for sched.RescueWait and was not rescued at this sBase, then
+// sets st.rescue = {sp, holder} and wakes the other data lanes. How an idle
+// actor learns that data became outstanding is described with the fact bits
+// in state.go.
 func (s *Session) rescueHolderLocked() (holder *lane, sp span, ok bool) {
 	panic("unimplemented: M1b")
 }
 
 // readvertiseLocked is the actor's window re-advertisement step at now
-// (design D18, §4.6, §4.12): while the window last advertised (lastWin) is
-// below 64 KiB it bumps an urgent ACK when the right edge can advance at
-// the current Budget usage. It reports whether the window it can advertise
-// now is still below 64 KiB, i.e. whether the actor keeps its
-// Params.WindowReadvertise deadline armed. The actor arms that deadline
-// whenever a step finds lastWin below 64 KiB; the stream rings it
-// (ringActor) when an ACK it places takes lastWin below 64 KiB, so an
-// otherwise idle actor learns of the pressure.
+// (design D18, §4.6, §4.12). While lastWin, the window last advertised, is
+// below 64 KiB, it bumps an urgent ACK when the right edge can advance at
+// the current Budget usage (rRead + sched.AdvertiseWindow(W, Budget.Used,
+// Budget.Max) > rightEdge); it changes nothing else.
+//
+// It returns lastWin < 64 KiB as it stands after that bump (false once the
+// stream ended). A bump only queues an ACK, and lastWin changes only when
+// Fill places one, so the actor, which calls readvertiseLocked in every
+// step, keeps its Params.WindowReadvertise deadline armed until an ACK
+// carrying at least 64 KiB has actually been placed. If the Budget fills up
+// again before the queued ACK is placed, that ACK carries a small window,
+// lastWin stays below 64 KiB and the next deadline retries. (Reporting
+// instead whether the window advertisable now is below 64 KiB would let the
+// actor disarm before the ACK is placed and leave the peer stalled at
+// window 0 with nothing left to wake either side.)
+//
+// Fill rings the actor (ringActor) when an ACK it places takes lastWin from
+// 64 KiB or more to below it, so an idle actor arms the deadline; an ACK
+// that leaves lastWin below 64 KiB needs no ring because the deadline is
+// still armed.
 func (s *Session) readvertiseLocked(now time.Time) bool {
 	panic("unimplemented: M1b")
 }

@@ -33,7 +33,7 @@ var _ carrier.Doorbell = (*mailbox)(nil)
 
 // init makes the doorbell. It is called once, before the session is
 // visible to any other goroutine (Dial, NewPending). Until then ring does
-// nothing (WP4's fake-lane tests run without it).
+// nothing (the stream's fake-lane unit tests run without it).
 func (m *mailbox) init() {
 	m.bell = make(chan struct{}, 1)
 }
