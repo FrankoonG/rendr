@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
@@ -24,8 +25,8 @@ import (
 // Part 2 (dynamic) checks the design rule, not the session code: a test
 // model of the byte-window protocol of design §4.2–§4.6 and §4.12 (sender
 // bounded by its own W and by peerLimit = max over received Delivered +
-// Window; receiver advertising rRead + the plan §3.7 memory-pressure
-// window with a right edge that never retracts, P10; FIFO lanes reordering
+// Window; receiver advertising rRead + sched.AdvertiseWindow (plan §3.7)
+// with a right edge that never retracts, P10; FIFO lanes reordering
 // against each other; lane deaths that lose in-flight frames and replay
 // the requeued spans; JOIN rxNext trims) is driven by random schedules
 // between the normalized parameters of two independently configured
@@ -139,19 +140,24 @@ func checkWindowStatic(t *testing.T, e effective) {
 	}
 	b := e.cfg.MaxBufferedBytes
 	for _, used := range []int64{0, b / 2, b * 3 / 4, b*3/4 + 1, b * 9 / 10, b - 1, b} {
-		if a := wmAdvertise(w, used, b); a < 0 || a > w {
+		a := sched.AdvertiseWindow(w, used, b)
+		if a < 0 || a > w {
 			t.Errorf("advertisement %d for window %d at %d/%d outside [0, window]", a, w, used, b)
 		}
+		if p := wmAdvertise(w, used, b); a != p {
+			t.Errorf("sched.AdvertiseWindow(%d, %d, %d) = %d, the plan rule gives %d", w, used, b, a, p)
+		}
 	}
-	if wmAdvertise(w, b, b) != 0 {
+	if sched.AdvertiseWindow(w, b, b) != 0 {
 		t.Errorf("a full budget must advertise 0")
 	}
 }
 
-// wmAdvertise is the plan §3.7 memory-pressure rule (design §4.12) as the
-// model's receiver applies it: used ≤ 75% → W; used ≥ max → 0; between →
-// max(64 KiB, W·(1 − used/max)/0.25). It is the model's copy of
-// sched.AdvertiseWindow, the production implementation of the same rule.
+// wmAdvertise is the plan §3.7 memory-pressure rule (design §4.12) written
+// independently of its production implementation: used ≤ 75% → W; used ≥
+// max → 0; between → max(64 KiB, W·(1 − used/max)/0.25). The model's
+// receiver applies sched.AdvertiseWindow; checkWindowStatic asserts that
+// it agrees with this copy at the pressure boundaries of every config.
 func wmAdvertise(w, used, bmax int64) int64 {
 	switch {
 	case used*4 <= bmax*3:
@@ -252,7 +258,7 @@ func newWindowModel(t *testing.T, cfg wmEnds, seed uint64, retract bool) *window
 // advertise is the receiver placing a window: rightEdge = max(rightEdge,
 // rRead + AdvertiseWindow) (P10), returned as the u32 wire field.
 func (m *windowModel) advertise() uint32 {
-	edge := m.rRead + uint64(wmAdvertise(m.cfg.wr, m.used, m.cfg.bmax))
+	edge := m.rRead + uint64(sched.AdvertiseWindow(m.cfg.wr, m.used, m.cfg.bmax))
 	if m.retract {
 		m.rightEdge = edge
 	} else {
