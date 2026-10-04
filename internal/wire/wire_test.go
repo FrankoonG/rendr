@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"testing"
 )
 
@@ -586,6 +587,106 @@ func TestPayloadErrors_L44(t *testing.T) {
 	}
 }
 
+// TestDataEndAndCheckPad_L42_L44: the DATA end rule and the PING pad rule
+// exist once, in package wire (design §0.7 W2; L42: one helper validates),
+// for the reader that holds a big DATA payload in its own buffer or streams
+// a large pad. DataEnd rejects an empty or oversize data length (ErrLength,
+// checked first) and an end beyond 2^64 − 1 (ErrValue); CheckPad accepts
+// only zero bytes, wherever a non-zero one sits (in the 8-byte word loop or
+// the tail). ParseDataOffset and ParsePing give the same verdicts on
+// contiguous payloads, a pad checked chunk by chunk gives the verdict of
+// the whole pad, and neither helper allocates (non-race lane).
+func TestDataEndAndCheckPad_L42_L44(t *testing.T) {
+	const maxData = MaxFramePayload - DataPrefixLen
+	payload := make([]byte, MaxFramePayload+1) // DATA payloads: offset prefix, then zero data
+	for _, c := range []struct {
+		name string
+		off  uint64
+		n    int
+		end  uint64
+		err  error
+	}{
+		{"one byte at 0", 0, 1, 1, nil},
+		{"max data at 0", 0, maxData, maxData, nil},
+		{"offset 2^62", 1 << 62, 64 << 10, 1<<62 + 64<<10, nil},
+		{"empty", 5, 0, 0, ErrLength},
+		{"negative", 5, -1, 0, ErrLength},
+		{"one beyond max", 0, maxData + 1, 0, ErrLength},
+		{"length checked before the end", math.MaxUint64, 0, 0, ErrLength},
+		{"end at 2^64-1", math.MaxUint64 - 1, 1, math.MaxUint64, nil},
+		{"end at 2^64", math.MaxUint64, 1, 0, ErrValue},
+		{"max data ending at 2^64-1", math.MaxUint64 - maxData, maxData, math.MaxUint64, nil},
+		{"max data ending at 2^64", math.MaxUint64 - maxData + 1, maxData, 0, ErrValue},
+	} {
+		end, err := DataEnd(c.off, c.n)
+		if end != c.end || !sameErr(err, c.err) {
+			t.Errorf("DataEnd %s (off %d, n %d) = %d, %v; want %d, %v", c.name, c.off, c.n, end, err, c.end, c.err)
+		}
+		if c.n < 0 {
+			continue
+		}
+		p := payload[:DataPrefixLen+c.n]
+		PutDataOffset(p, c.off)
+		wantOff := c.off
+		if c.err != nil {
+			wantOff = 0
+		}
+		if off, err := ParseDataOffset(p); off != wantOff || !sameErr(err, c.err) {
+			t.Errorf("ParseDataOffset %s = %d, %v; want %d, %v", c.name, off, err, wantOff, c.err)
+		}
+	}
+	if off, err := ParseDataOffset(payload[:DataPrefixLen-1]); off != 0 || !errors.Is(err, ErrLength) {
+		t.Errorf("ParseDataOffset of a partial offset = %d, %v; want ErrLength", off, err)
+	}
+
+	pad := make([]byte, MaxPingPad)
+	ping := make([]byte, PingFixedLen+MaxPingPad)
+	for _, n := range []int{0, 1, 7, 8, 9, 16, 17, 1000, MaxPingPad} {
+		at := []int{-1} // -1: all zero; else the index of the one non-zero byte
+		for i := range n {
+			if n <= 17 || i == 0 || i == 7 || i == 8 || i == n/2 || i == n-8 || i == n-1 {
+				at = append(at, i)
+			}
+		}
+		for _, i := range at {
+			b := pad[:n]
+			clear(b)
+			var want error
+			if i >= 0 {
+				b[i], want = 1<<(i%8), ErrReserved
+			}
+			if err := CheckPad(b); !sameErr(err, want) {
+				t.Errorf("CheckPad of %d bytes, non-zero at %d: %v, want %v", n, i, err, want)
+			}
+			copy(ping[PingFixedLen:], b)
+			if pg, err := ParsePing(ping[:PingFixedLen+n]); !sameErr(err, want) || (err == nil && pg.Pad != n) {
+				t.Errorf("ParsePing with a %d-byte pad, non-zero at %d: pad %d, %v; want %v", n, i, pg.Pad, err, want)
+			}
+			for _, chunk := range []int{1, 5, 8, 4096} {
+				var got error
+				for rest := b; len(rest) > 0 && got == nil; rest = rest[min(chunk, len(rest)):] {
+					got = CheckPad(rest[:min(chunk, len(rest))])
+				}
+				if !sameErr(got, want) {
+					t.Errorf("CheckPad in %d-byte chunks of %d bytes, non-zero at %d: %v, want %v", chunk, n, i, got, want)
+				}
+			}
+		}
+	}
+
+	zero, dirty := make([]byte, MaxPingPad), make([]byte, MaxPingPad)
+	dirty[len(dirty)-1] = 0x80
+	if a := testing.AllocsPerRun(100, func() {
+		sinkU64, sinkErr = DataEnd(1<<40, maxData)
+		_, sinkErr = DataEnd(math.MaxUint64, 1)
+		_, sinkErr = DataEnd(0, 0)
+		sinkErr = CheckPad(zero)
+		sinkErr = CheckPad(dirty)
+	}); a != 0 && !raceEnabled {
+		t.Errorf("DataEnd and CheckPad: %v allocs", a)
+	}
+}
+
 // TestParseHeaderRules_L44 sweeps every type byte, flag bit, handle class and
 // length bound of design §5.2 checks (1)–(5), including their order.
 func TestParseHeaderRules_L44(t *testing.T) {
@@ -647,14 +748,13 @@ func TestParseHeaderRules_L44(t *testing.T) {
 				t.Errorf("type %v flag %#x: %v, want ErrFlags", ty, f, err)
 			}
 		}
-		// Handles: carrier-level frames need 0, session frames non-zero;
-		// extension handles are opaque. This is the stateless rule of the
-		// declared ParseHeader contract; that a session frame's handle is
-		// its carrier's session handle (SessionHandle in M1) is a
-		// per-carrier rule checked by the carrier's reader and handshake.
+		// Handles (design §0.7 W1): carrier-level frames need 0, session
+		// frames exactly SessionHandle (M1: one session per carrier), so 0,
+		// 2 and 0xffffffff are ErrHandle on a session frame; extension
+		// handles are opaque.
 		for _, hd := range []uint32{0, 1, 2, 0xffffffff} {
 			_, err := ParseHeader(hdr(byte(i), 0, uint32(lo), hd))
-			wantOK := ty.Extension() || ty.CarrierLevel() == (hd == 0)
+			wantOK := ty.Extension() || (ty.CarrierLevel() && hd == 0) || (!ty.CarrierLevel() && hd == SessionHandle)
 			if wantOK != (err == nil) || (!wantOK && !errors.Is(err, ErrHandle)) {
 				t.Errorf("type %v handle %d: %v (want accepted: %v)", ty, hd, err, wantOK)
 			}
@@ -691,12 +791,19 @@ func TestParseHeaderRules_L44(t *testing.T) {
 	if _, err := ParseHeader(hdr(byte(TypePing), 0, 3, 1)); !errors.Is(err, ErrHandle) {
 		t.Errorf("PING with handle 1 and a bad length: %v, want ErrHandle", err)
 	}
+	if _, err := ParseHeader(hdr(byte(TypeAck), 0, 3, 2)); !errors.Is(err, ErrHandle) {
+		t.Errorf("ACK with handle 2 and a bad length: %v, want ErrHandle", err)
+	}
 	if _, err := ParseHeader(make([]byte, HeaderLen-1)); !errors.Is(err, ErrShort) {
 		t.Errorf("12-byte header: %v, want ErrShort", err)
 	}
 	// Bytes after the header are ignored.
-	if h, err := ParseHeader(append(hdr(byte(TypeAck), 3, AckLen, 9), 1, 2, 3)); err != nil || h.Flags != 3 || h.Handle != 9 || h.Len != AckLen || h.Fseq != 0xfffffff0 {
+	if h, err := ParseHeader(append(hdr(byte(TypeAck), 3, AckLen, SessionHandle), 1, 2, 3)); err != nil || h.Flags != 3 || h.Handle != SessionHandle || h.Len != AckLen || h.Fseq != 0xfffffff0 {
 		t.Errorf("header with trailing bytes: %+v %v", h, err)
+	}
+	// An extension header decodes its handle as given.
+	if h, err := ParseHeader(hdr(0x9a, 0x5a, 7, 0x01020304)); err != nil || h.Type != 0x9a || h.Flags != 0x5a || h.Handle != 0x01020304 || h.Len != 7 {
+		t.Errorf("extension header: %+v %v", h, err)
 	}
 }
 

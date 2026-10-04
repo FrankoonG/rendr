@@ -231,21 +231,36 @@ func PutDataOffset(dst []byte, off uint64) {
 	dst[4], dst[5], dst[6], dst[7] = byte(off>>24), byte(off>>16), byte(off>>8), byte(off)
 }
 
-// ParseDataOffset returns the offset of a DATA payload p. p must hold at
-// least DataPrefixLen+1 bytes (empty DATA is malformed: ErrLength) and
-// offset+len(data) must not overflow uint64 (ErrValue). A reader that does
-// not hold the payload contiguously (a big DATA payload read into its own
-// buffer) applies the same end rule to the offset and the payload length
-// from the header: off ≤ 2^64 − 1 − n for n = Len − DataPrefixLen bytes.
+// ParseDataOffset returns the offset of a DATA payload p (the offset prefix
+// followed by the data bytes) under the rules of DataEnd: fewer than
+// DataPrefixLen+1 bytes (empty DATA is malformed) or more data than a frame
+// can carry is ErrLength, an end beyond 2^64 − 1 is ErrValue.
 func ParseDataOffset(p []byte) (uint64, error) {
-	if len(p) <= DataPrefixLen {
+	if len(p) < DataPrefixLen {
 		return 0, ErrLength
 	}
-	off := binary.BigEndian.Uint64(p[0:8])
-	if off > math.MaxUint64-uint64(len(p)-DataPrefixLen) {
-		return 0, ErrValue
+	off := binary.BigEndian.Uint64(p[0:DataPrefixLen])
+	if _, err := DataEnd(off, len(p)-DataPrefixLen); err != nil {
+		return 0, err
 	}
 	return off, nil
+}
+
+// DataEnd returns the stream offset just past n data bytes at offset off:
+// end = off + n. n must be 1..MaxFramePayload − DataPrefixLen, the data one
+// DATA frame can carry (ErrLength, checked first), and end must fit in a
+// uint64 (ErrValue). ParseDataOffset applies it to a contiguous payload; a
+// reader that reads a big DATA payload into its own buffer applies it to
+// the staged offset prefix and n = Len − DataPrefixLen from the header, so
+// the rule exists only in this package.
+func DataEnd(off uint64, n int) (end uint64, err error) {
+	if n < 1 || n > MaxFramePayload-DataPrefixLen {
+		return 0, ErrLength
+	}
+	if off > math.MaxUint64-uint64(n) {
+		return 0, ErrValue
+	}
+	return off + uint64(n), nil
 }
 
 // Ack is the ACK payload: delivered u64 | window u32 | epochEcho u32.
@@ -411,10 +426,8 @@ func PutPing(dst []byte, p *Ping) int {
 	return n
 }
 
-// ParsePing decodes a PING or PONG payload: ≥ PingFixedLen bytes, pad ≤
-// MaxPingPad (ErrLength), every pad byte zero (ErrReserved). A reader that
-// streams a pad larger than its buffer applies the same zero rule to every
-// chunk of it; the pad length comes from the header (Len − PingFixedLen).
+// ParsePing decodes a PING or PONG payload: ≥ PingFixedLen bytes (ErrShort),
+// pad ≤ MaxPingPad (ErrLength), every pad byte zero (CheckPad: ErrReserved).
 func ParsePing(p []byte) (Ping, error) {
 	if len(p) < PingFixedLen {
 		return Ping{}, ErrShort
@@ -423,8 +436,8 @@ func ParsePing(p []byte) (Ping, error) {
 	if pad > MaxPingPad {
 		return Ping{}, ErrLength
 	}
-	if !allZero(p[PingFixedLen:]) {
-		return Ping{}, ErrReserved
+	if err := CheckPad(p[PingFixedLen:]); err != nil {
+		return Ping{}, err
 	}
 	return Ping{
 		ID:    binary.BigEndian.Uint32(p[0:4]),
@@ -432,6 +445,26 @@ func ParsePing(p []byte) (Ping, error) {
 		Nonce: binary.BigEndian.Uint64(p[12:20]),
 		Pad:   pad,
 	}, nil
+}
+
+// CheckPad checks PING/PONG padding: nil if every byte of b is zero (an
+// empty b included), ErrReserved otherwise. ParsePing applies it to a whole
+// pad; a reader that streams a pad larger than its buffer applies it to
+// every chunk instead (the pad length, Len − PingFixedLen, is already
+// bounded by ParseHeader), so the rule exists only in this package.
+func CheckPad(b []byte) error {
+	for len(b) >= 8 {
+		if binary.LittleEndian.Uint64(b) != 0 {
+			return ErrReserved
+		}
+		b = b[8:]
+	}
+	for _, c := range b {
+		if c != 0 {
+			return ErrReserved
+		}
+	}
+	return nil
 }
 
 // PutReason writes a one-byte CLOSE or GOAWAY reason and returns ReasonLen.
@@ -473,20 +506,4 @@ func exactTail(have, want int) error {
 		return ErrTrailing
 	}
 	return nil
-}
-
-// allZero reports whether every byte of b is zero (PING pad).
-func allZero(b []byte) bool {
-	for len(b) >= 8 {
-		if binary.LittleEndian.Uint64(b) != 0 {
-			return false
-		}
-		b = b[8:]
-	}
-	for _, c := range b {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
 }

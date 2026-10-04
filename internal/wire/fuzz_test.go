@@ -79,7 +79,7 @@ func refPrefaceErr(b []byte, role Role) error {
 // headerRule is the §5.2/§5.3 row of one core type.
 type headerRule struct {
 	flags   byte
-	carrier bool // handle must be 0
+	carrier bool // handle must be 0; otherwise it must be 1 (the M1 session handle, design §0.7 W1)
 	lo, hi  int  // payload length bounds
 }
 
@@ -113,12 +113,13 @@ func refHeaderErr(b []byte) error {
 		return nil
 	}
 	r, ok := refRules[b[0]]
+	handle := binary.BigEndian.Uint32(b[9:13])
 	switch {
 	case !ok:
 		return ErrType
 	case b[1]&^r.flags != 0:
 		return ErrFlags
-	case r.carrier != (binary.BigEndian.Uint32(b[9:13]) == 0):
+	case r.carrier && handle != 0, !r.carrier && handle != 1:
 		return ErrHandle
 	case n < r.lo || n > r.hi:
 		return ErrLength
@@ -181,6 +182,7 @@ func fuzzSeeds() [][]byte {
 		{0x20, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 1},                         // M2 type
 		{0x11, 0x04, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 1},                     // ACK undefined flag
 		{0x30, 0, 0, 0, 20, 0, 0, 0, 1, 0, 0, 0, 1},                        // PING handle 1
+		{0x11, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 2},                        // ACK handle 2 (not the session handle)
 		{0x12, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 1},                         // FIN short
 		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // short header
 	} {

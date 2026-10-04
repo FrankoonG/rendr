@@ -75,7 +75,13 @@ type Hooks struct {
 	// BeforeWrite runs in a carrier writer before every physical write with
 	// the batch's frame and byte counts (L41, L55).
 	BeforeWrite func(carrier uint32, frames, bytes int)
-	// EventEnqueued runs after an event was assigned its sequence number (L53).
+	// EventEnqueued runs after an event was assigned its sequence number
+	// (L53), under the event-queue lock: calls are in Seq order, and it runs
+	// also for an event dropped because the queue is full (the drop keeps
+	// its Seq). It never runs after the queue was closed (such an event gets
+	// no Seq), nor in a Runtime without OnEvent (no event gets a Seq).
+	// Unlike the other hooks it must not block, and it must not call into
+	// rendr: every event producer waits for that lock meanwhile.
 	EventEnqueued func(seq uint64)
 }
 

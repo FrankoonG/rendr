@@ -7,7 +7,9 @@
 //   - Parse* and Decode* functions never panic, never write to their input,
 //     never allocate, and check every length against the bytes actually
 //     present before using it. Variable parts of a decoded value (metadata,
-//     messages) alias the input; callers copy what they keep.
+//     messages) alias the input; callers copy what they keep. DataEnd and
+//     CheckPad (the DATA end and PING pad rules for a reader that does not
+//     hold a payload contiguously) obey the same contract.
 //   - Fixed-size payloads must be exactly their size; variable tails must be
 //     described exactly by their explicit length field; trailing bytes,
 //     undefined flag bits and non-zero reserved fields are rejected.

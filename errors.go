@@ -4,11 +4,11 @@ import "github.com/FrankoonG/rendr/v2/internal/session"
 
 // Errors (plan §6). They are the same values the core produces, so
 // errors.Is and errors.As match. Every sentinel below implements net.Error
-// with Timeout() == false, and so does *AbortError. Deadline expiry is
-// os.ErrDeadlineExceeded (Timeout() == true) and never ends a session; use
-// after Close, Write after CloseWrite and calls after Runtime.Close return
-// net.ErrClosed; only the peer's FIN at the contiguous delivery point yields
-// io.EOF.
+// with Timeout() == false, and so do *AbortError and *RejectError. Deadline
+// expiry is os.ErrDeadlineExceeded (Timeout() == true) and never ends a
+// session; use after Close, Write after CloseWrite and calls after
+// Runtime.Close return net.ErrClosed; only the peer's FIN at the contiguous
+// delivery point yields io.EOF.
 var (
 	// ErrNoPath: no carrier for NoPathGrace (passive: PassiveRetain) since the
 	// last one was declared dead; or Dial: no OPEN completed within NoPathGrace.
@@ -60,5 +60,6 @@ const (
 type AbortError = session.AbortError
 
 // RejectError is the Dial error when the peer application called
-// PendingConn.Reject(Code, Msg). errors.Is(err, ErrRejected) is true.
+// PendingConn.Reject(Code, Msg). errors.Is(err, ErrRejected) is true; like
+// every Dial error it is a net.Error with Timeout() == false.
 type RejectError = session.RejectError

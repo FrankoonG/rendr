@@ -95,3 +95,10 @@ func (e *RejectError) Error() string {
 
 // Is reports target == ErrRejected.
 func (e *RejectError) Is(target error) bool { return target == ErrRejected }
+
+// Timeout implements net.Error (always false): like every other Dial error
+// (plan §6, design §0.7 W3), a rejection is final, not a timeout.
+func (e *RejectError) Timeout() bool { return false }
+
+// Temporary implements net.Error (always false).
+func (e *RejectError) Temporary() bool { return false }

@@ -75,9 +75,11 @@ var errLastCarrier = errors.New("io: read/write on closed pipe")
 // TestAbortAndRejectErrors checks the coded errors: *AbortError matches
 // ErrAborted (and nothing else), yields Code/Msg/Remote through errors.As,
 // also when wrapped, and is a net.Error that is not a timeout; *RejectError
-// matches ErrRejected (and nothing else) and yields Code/Msg through
-// errors.As, also when wrapped, while the sentinel ErrRejected itself is no
-// *RejectError; the reserved abort codes equal the wire RST codes.
+// matches ErrRejected (and nothing else), yields Code/Msg through
+// errors.As, also when wrapped, and is a net.Error that is not a timeout
+// like every other Dial error (design §0.7 W3), while the sentinel
+// ErrRejected itself is no *RejectError; the reserved abort codes equal the
+// wire RST codes.
 func TestAbortAndRejectErrors(t *testing.T) {
 	ab := &AbortError{Code: AbortLinger, Msg: "linger expired", Remote: true}
 	var err error = fmt.Errorf("read: %w", ab)
@@ -105,6 +107,10 @@ func TestAbortAndRejectErrors(t *testing.T) {
 	var gr *RejectError
 	if !errors.As(err, &gr) || gr.Code != 403 || gr.Msg != "forbidden" {
 		t.Fatalf("errors.As RejectError: %+v", gr)
+	}
+	ne = nil
+	if !errors.As(err, &ne) || ne != net.Error(rj) || ne.Timeout() {
+		t.Fatalf("a wrapped RejectError must be a net.Error with Timeout() == false (got %v)", ne)
 	}
 	if errors.As(ErrRejected, &gr) {
 		t.Fatal("the sentinel itself is not a *RejectError")

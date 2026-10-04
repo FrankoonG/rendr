@@ -61,6 +61,7 @@ const (
 	FirstFseq uint32 = 1
 	// SessionHandle is the handle every session frame uses in M1 (one
 	// session per carrier, chosen by the dialer, echoed by the passive).
+	// ParseHeader rejects a session frame with any other handle (ErrHandle).
 	SessionHandle uint32 = 1
 	// KnownRequired is the set of required PREFACE feature bits this build
 	// implements (none). Any other required bit is answered FEATURE.
@@ -130,8 +131,10 @@ func (t Type) Extension() bool { return t >= 0x80 }
 
 // CarrierLevel reports whether t is a carrier-level core type (PING, PONG,
 // CLOSE, GOAWAY), whose handle must be 0. Every other core type is a
-// session frame whose handle must be non-zero. The handle of an extension
-// type is opaque and never checked.
+// session frame whose handle must be SessionHandle: an M1 carrier carries
+// exactly one session (M3's mux relaxes this to any non-zero handle,
+// dispatched by handle). ParseHeader enforces both rules (ErrHandle). The
+// handle of an extension type is opaque and never checked.
 func (t Type) CarrierLevel() bool {
 	return t == TypePing || t == TypePong || t == TypeClose || t == TypeGoAway
 }

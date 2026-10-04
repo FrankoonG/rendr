@@ -29,7 +29,8 @@ var (
 	ErrType = errors.New("rendr/wire: unknown core frame type")
 	// ErrFlags: an undefined flag bit is set.
 	ErrFlags = errors.New("rendr/wire: undefined flag bits")
-	// ErrHandle: handle 0 on a session frame or non-zero on a carrier-level frame.
+	// ErrHandle: a session frame whose handle is not SessionHandle, or a
+	// carrier-level frame whose handle is not 0.
 	ErrHandle = errors.New("rendr/wire: bad handle")
 	// ErrLength: a length outside the type's bounds or beyond MaxFramePayload.
 	ErrLength = errors.New("rendr/wire: bad length")

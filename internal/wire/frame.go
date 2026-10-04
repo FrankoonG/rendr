@@ -15,7 +15,7 @@ type Header struct {
 	Flags  uint8
 	Len    uint32 // payload length, ≤ MaxFramePayload
 	Fseq   uint32 // per carrier, per direction; strict +1 (serial arithmetic) on stream carriers
-	Handle uint32 // 0 for carrier-level frames, the session handle otherwise
+	Handle uint32 // 0 for carrier-level frames, SessionHandle for session frames; opaque for extensions
 }
 
 // PutHeader writes h into b[:HeaderLen]. It panics if len(b) < HeaderLen or
@@ -33,21 +33,21 @@ func PutHeader(b []byte, h *Header) {
 }
 
 // ParseHeader decodes b[:HeaderLen] and checks everything that can be
-// checked before the payload is read or any buffer is sized: Len ≤
-// MaxFramePayload (ErrLength), the type is a known M1 core type or an
+// checked before the payload is read or any buffer is sized, in this order:
+// Len ≤ MaxFramePayload (ErrLength), the type is a known M1 core type or an
 // extension (ErrType), only AllowedFlags(type) are set (ErrFlags), the
-// handle rule of Type.CarrierLevel (ErrHandle), and Len within
-// PayloadBounds(type) (ErrLength). For an extension type only Len ≤
-// MaxFramePayload applies: its flags and handle are opaque. The fseq is not
-// checked (it is stateful; see SeqLess). Fewer than HeaderLen bytes are
-// ErrShort; bytes after the header are ignored.
+// handle (ErrHandle), and Len within PayloadBounds(type) (ErrLength). For an
+// extension type only Len ≤ MaxFramePayload applies: its flags and handle
+// are opaque. The fseq is not checked (it is stateful; see SeqLess). Fewer
+// than HeaderLen bytes are ErrShort; bytes after the header are ignored.
 //
-// The handle rule is stateless: 0 for a carrier-level type, non-zero for a
-// session type. That a session frame carries its own carrier's session
-// handle (SessionHandle in M1) and that the carrier accepts session frames
-// at all (probe and sessionless carriers do not) are per-carrier rules
-// (design §5.2 check 4) that the code reading the carrier applies after
-// ParseHeader.
+// The handle rule is the whole M1 rule (Type.CarrierLevel): 0 for a
+// carrier-level type, SessionHandle for a session type. The carrier reader
+// and both handshakes rely on this ErrHandle and do not check the handle
+// again. Whether a carrier accepts session frames at all (probe and
+// sessionless carriers do not) is not a header property; the code reading
+// the carrier decides it. M3 (mux) relaxes the session rule to any non-zero
+// handle, dispatched by handle.
 func ParseHeader(b []byte) (Header, error) {
 	if len(b) < HeaderLen {
 		return Header{}, ErrShort
@@ -71,7 +71,11 @@ func ParseHeader(b []byte) (Header, error) {
 	if h.Flags&^AllowedFlags(h.Type) != 0 {
 		return Header{}, ErrFlags
 	}
-	if h.Type.CarrierLevel() != (h.Handle == 0) {
+	want := SessionHandle
+	if h.Type.CarrierLevel() {
+		want = 0
+	}
+	if h.Handle != want {
 		return Header{}, ErrHandle
 	}
 	if lo, hi, _ := PayloadBounds(h.Type); int(h.Len) < lo || int(h.Len) > hi {

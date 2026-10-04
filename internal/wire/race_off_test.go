@@ -1,0 +1,7 @@
+//go:build !race
+
+package wire
+
+// raceEnabled: allocation gates (testing.AllocsPerRun) are asserted only in
+// the non-race lane (design §11.1); the functional checks run in both.
+const raceEnabled = false
