@@ -99,13 +99,14 @@ type Health struct {
 
 // factoryState is one factory's evidence, mark and counters (under
 // Health.mu). It outlives runs: a restart keeps the counters and the marks;
-// a new probe incarnation resets the aggregator (L23).
+// a new probe incarnation resets the aggregator and its PING records (L23).
 type factoryState struct {
 	agg   sched.Aggregator
 	conn  *Conn // the current probe incarnation (nil: none); the observer ignores every other Conn
 	pings [pingRingSize]probePing
 	pHead int
 	pN    int
+	early probeEarly // a PONG that overtook its PingCommitted callback; reset per incarnation
 
 	failed   bool
 	reason   string
@@ -119,6 +120,21 @@ type probePing struct {
 	id     uint32
 	loaded bool   // the gauge was loaded at the commit
 	epoch  uint64 // the gauge epoch at the commit
+}
+
+// probeEarly is a matched probe PONG that arrived before its PING's
+// PingCommitted callback. The carrier writer makes a PING's PONG matchable
+// (it records the commit under Conn.mu) before it calls PingCommitted, so
+// on a path faster than that gap the reader reports the PONG first. Its
+// sample waits for the callback, which always follows the commit, so the
+// commit-time gauge state still tags it (§8.2).
+type probeEarly struct {
+	ok     bool
+	id     uint32
+	rtt    time.Duration
+	at     time.Time
+	loaded bool   // the gauge was loaded at the arrival
+	epoch  uint64 // the gauge epoch at the arrival
 }
 
 // pushPing records a committed PING (FIFO; the oldest goes when full, as
@@ -338,13 +354,15 @@ func (h *Health) Succeeded(i int) {
 // Close stops probing, retires the probe carriers and joins the health
 // goroutine and the probe attempts (bounded). Idempotent.
 //
-// Bounds (design §3.1, §6.8 step 4): probe carriers retire with CLOSE;
-// those whose CLOSE is still unwritten after min(1 s, DeadMax) are killed,
-// and every carrier's Done is itself bounded (a goroutine stuck in an
-// embedder call is abandoned after AbandonWait); attempts are cancelled and
-// one still inside embedder code AbandonWait later is counted in
-// Env.Abandon. Every account is settled when Close returns. Concurrent
-// calls all return after the joins.
+// Bounds (design §3.1, §6.8 steps 4 and 7): probe carriers retire with
+// CLOSE; those whose CLOSE is still unwritten after min(1 s, DeadMax) are
+// killed, and every carrier's Done is itself bounded (a goroutine stuck in
+// an embedder call is abandoned after AbandonWait); attempts are cancelled
+// (GuardedDial and Establish count their own stuck helper goroutines) and
+// one whose goroutine is itself still inside an embedder call
+// 2·AbandonWait after the cancellation is counted in Env.Abandon. Every
+// account is settled when Close returns. Concurrent calls all return after
+// the joins.
 func (h *Health) Close() {
 	h.mu.Lock()
 	if !h.closed {
@@ -442,7 +460,9 @@ func (o healthObserver) Pong(c *Conn, id uint32, rtt time.Duration, at time.Time
 }
 
 // pingCommitted records the factory gauge's state at the commit of probe
-// PING id (§8.2).
+// PING id (§8.2), or completes the sample of a PONG that overtook this
+// callback. Callbacks of an incarnation that is no longer current change
+// nothing (L21, L23).
 func (h *Health) pingCommitted(c *Conn, id uint32) {
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
@@ -450,10 +470,17 @@ func (h *Health) pingCommitted(c *Conn, id uint32) {
 	}
 	loaded, epoch := h.gauges[i].Loaded(h.p.LoadThreshold)
 	h.mu.Lock()
-	if f := &h.fac[i]; f.conn == c {
-		f.pushPing(probePing{id: id, loaded: loaded, epoch: epoch})
+	defer h.mu.Unlock()
+	f := &h.fac[i]
+	if f.conn != c {
+		return
 	}
-	h.mu.Unlock()
+	if e := f.early; e.ok && e.id == id {
+		f.early = probeEarly{}
+		h.sampleLocked(i, e.at, e.rtt, e.loaded || loaded || e.epoch != epoch)
+		return
+	}
+	f.pushPing(probePing{id: id, loaded: loaded, epoch: epoch})
 }
 
 // pong turns a matched probe PONG into a sample (design §7.8, §8.2). at is
@@ -462,8 +489,8 @@ func (h *Health) pingCommitted(c *Conn, id uint32) {
 // (L23). The sample is loaded when the factory's gauge was loaded at the
 // commit or at the arrival, or its epoch changed in between (a load episode
 // shorter than one probe RTT). A PONG of an incarnation that is no longer
-// current gives nothing (L21, L23). A PONG whose PING was committed after
-// the failed mark clears it.
+// current gives nothing (L21, L23). A PONG without its commit record
+// overtook its PingCommitted callback: the sample waits for it (probeEarly).
 func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
@@ -476,11 +503,19 @@ func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	if f.conn != c {
 		return
 	}
-	if rec, ok := f.takePing(id); ok {
-		// Without a record (the PONG overtook its PingCommitted callback)
-		// the arrival state decides alone.
-		loaded = loaded || rec.loaded || rec.epoch != epoch
+	rec, ok := f.takePing(id)
+	if !ok {
+		f.early = probeEarly{ok: true, id: id, rtt: rtt, at: at, loaded: loaded, epoch: epoch}
+		return
 	}
+	h.sampleLocked(i, at, rtt, loaded || rec.loaded || rec.epoch != epoch)
+}
+
+// sampleLocked adds one probe sample of factory i and publishes the
+// change. A sample whose PING was committed (at − rtt) after the failed mark
+// clears it: a round trip that happened after the failure (plan §3.9).
+func (h *Health) sampleLocked(i int, at time.Time, rtt time.Duration, loaded bool) {
+	f := &h.fac[i]
 	changed := false
 	if f.failed && !at.Add(-rtt).Before(f.markAt) {
 		h.clearLocked(i)

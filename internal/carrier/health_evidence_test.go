@@ -16,12 +16,15 @@ import (
 // processing delays it — gives no sample; the probe carrier's own first
 // PING, sent right after Start, does: its RTT counts from the PING's write
 // commit and its timestamp is the PONG's arrival (the reader's own clock).
-// Probe PINGs then follow every Interval. A reconnect is a new
+// Probe PINGs then follow every HealthParams.Interval (the Runtime Env's
+// own ProbeInterval is not the probe cadence). A reconnect is a new
 // incarnation: its evidence is Unknown again although the old samples were
 // Fresh, and its first sample again comes from its first PING.
 func TestProbeEstablishmentPongIsNotASample_L23(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, nil)
+		r := newPrRig(t, 2, func(env *Env, p *HealthParams) {
+			env.Timing.ProbeInterval = 7 * time.Second // NewHealth must apply Interval (2 s) to its probes
+		})
 		r.pas.setDelay(300 * time.Millisecond)
 		r.h.Use()
 		// Hello at 0, at the passive at 10 ms, establishment PONG written
@@ -81,6 +84,49 @@ func TestProbeEstablishmentPongIsNotASample_L23(t *testing.T) {
 	})
 }
 
+// TestProbeIncarnationOwnsItsPingRecords_L23_L28 (design §8.2, L23): PING
+// ids restart in every probe incarnation, so commit records left by an
+// incarnation that died with PINGs outstanding must never tag a sample of
+// the next one. Path 0 is blackholed right after its first probe carrier
+// was established: that carrier's first PING (id 2), committed while the
+// factory's gauge is loaded, is never answered and the carrier dies of
+// ping_timeout. The replacement's first PING has id 2 again and is
+// committed while the gauge is unloaded: its sample is unloaded.
+func TestProbeIncarnationOwnsItsPingRecords_L23_L28(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newPrRig(t, 2, nil)
+		g := r.h.Gauges()[0]
+		g.AddInflight(1 << 20)
+		g.SetBacklog(true) // loaded: the first probe PING (committed at 20 ms) is recorded loaded
+		r.h.Use()
+		r.until(25 * time.Millisecond) // established at 20 ms; its PING 2 is in flight
+		old := r.probe(0)
+		r.links[0].SetBlackhole(true)
+		r.until(time.Second)
+		g.SetBacklog(false)
+		g.AddInflight(-(1 << 20))
+		r.until(2900 * time.Millisecond) // PING 3 (committed unloaded at 2.02 s) vanished too
+		r.links[0].SetBlackhole(false)
+		// PING 2 is DeadMin (3 s) old at 3.02 s: ping_timeout; the carrier
+		// never produced a sample, so its replacement starts at once.
+		r.until(3030 * time.Millisecond)
+		if dead, cause, _, _ := old.Death(); !dead || cause != CausePingTimeout {
+			t.Fatalf("first probe carrier: dead %v, cause %v", dead, cause)
+		}
+		if st := r.links[0].Stats().Probe; st.Dropped == 0 {
+			t.Fatalf("stimulus: the blackhole dropped nothing: %+v", st)
+		}
+		r.until(3070 * time.Millisecond) // re-established at 3.04 s; PING 2 committed at 3.04 s, answered at 3.06 s
+		s := r.h.Snapshot()
+		if nc := r.probe(0); nc == nil || nc == old {
+			t.Fatalf("no new incarnation: %v", nc)
+		}
+		if s.Info[0].Samples != 1 || s.Info[0].LoadedSamples != 0 || s.Sum[0].N != 1 || !s.Sum[0].At.Equal(r.start.Add(3060*time.Millisecond)) {
+			t.Fatalf("first sample of the new incarnation: info %+v, summary %+v (want one unloaded sample at 3.06 s)", s.Info[0], s.Sum[0])
+		}
+	})
+}
+
 // TestHealthRanksFreshUnknownFailed_L28 (plan §3.9, design §7.8): the
 // snapshot ranks Fresh factories by aggregated RTT, then factories without
 // evidence (a dial still hanging) by configuration order, then failed ones
@@ -90,7 +136,7 @@ func TestProbeEstablishmentPongIsNotASample_L23(t *testing.T) {
 // committed after it, never by one committed before it.
 func TestHealthRanksFreshUnknownFailed_L28(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 4, nil)
+		r := newPrRig(t, 4, nil)
 		// 0: Fresh, 20 ms RTT. 1: dials hang (Unknown, not failed until
 		// DialTimeout). 2: dials refused (failed). 3: Fresh, 10 ms RTT.
 		r.links[1].SetDial(rendrtest.DialHang)
@@ -102,7 +148,7 @@ func TestHealthRanksFreshUnknownFailed_L28(t *testing.T) {
 		r.h.Use()
 		r.until(time.Second)
 		s := r.h.Snapshot()
-		if got, want := phRank(s, time.Now()), []int{3, 0, 1, 2}; !slices.Equal(got, want) {
+		if got, want := prRank(s, time.Now()), []int{3, 0, 1, 2}; !slices.Equal(got, want) {
 			t.Fatalf("rank %v, want %v (evidence %v %v %v %v, failed %v)", got, want,
 				s.Evidence(0, time.Now()), s.Evidence(1, time.Now()), s.Evidence(2, time.Now()), s.Evidence(3, time.Now()), s.Failed)
 		}
@@ -124,7 +170,7 @@ func TestHealthRanksFreshUnknownFailed_L28(t *testing.T) {
 		if s.Version != v+1 || bell.n.Load() != rings+1 || !s.Failed[3] || s.Info[3].FailReason != "ping_timeout" {
 			t.Fatalf("MarkFailed not published at once: version %d→%d, rings %d→%d, failed %v, info %+v", v, s.Version, rings, bell.n.Load(), s.Failed[3], s.Info[3])
 		}
-		if got, want := phRank(s, time.Now()), []int{0, 1, 2, 3}; !slices.Equal(got, want) {
+		if got, want := prRank(s, time.Now()), []int{0, 1, 2, 3}; !slices.Equal(got, want) {
 			t.Fatalf("rank after MarkFailed %v, want %v", got, want)
 		}
 		// Factory 3's next PING is committed at 2.01 s (after the mark) and
@@ -138,7 +184,7 @@ func TestHealthRanksFreshUnknownFailed_L28(t *testing.T) {
 		if s.Failed[3] || s.Info[3].FailReason != "" {
 			t.Fatalf("mark not cleared by the PONG of a PING committed after it: %+v", s.Info[3])
 		}
-		if got, want := phRank(s, time.Now()), []int{3, 0, 1, 2}; !slices.Equal(got, want) {
+		if got, want := prRank(s, time.Now()), []int{3, 0, 1, 2}; !slices.Equal(got, want) {
 			t.Fatalf("rank after the PONG %v, want %v", got, want)
 		}
 		// A mark set between a PING's commit (4.01 s) and its PONG (4.02 s)
@@ -169,7 +215,7 @@ func TestHealthRanksFreshUnknownFailed_L28(t *testing.T) {
 // the evidence, which proves the stimulus (L60).
 func TestHealthLoadedSamplesExcluded_L28_L29(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, nil)
+		r := newPrRig(t, 2, nil)
 		g := r.h.Gauges()[0]
 		const thr = 64 << 10
 		r.h.Use()
@@ -266,7 +312,7 @@ func TestHealthLoadedSamplesExcluded_L28_L29(t *testing.T) {
 // Stale. sched.NextChange gives every boundary.
 func TestHealthEvidenceAgesWithoutRepublication_L28_L29(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, func(env *Env, p *HealthParams) {
+		r := newPrRig(t, 2, func(env *Env, p *HealthParams) {
 			env.Timing.DeadMin, env.Timing.DeadMax = time.Hour, time.Hour // silence is not death here
 		})
 		g := r.h.Gauges()[0]
@@ -325,13 +371,17 @@ func TestHealthEvidenceAgesWithoutRepublication_L28_L29(t *testing.T) {
 
 // TestHealthIgnoresStaleIncarnation_L21_L23: the observer accepts PING
 // commits and PONGs only from the factory's current probe incarnation; a
-// late callback of a replaced carrier changes nothing (no sample, no
-// publication, no mark cleared). A PONG that overtook its own commit
-// callback is still a sample, tagged by the gauge state at its arrival.
+// late callback of a replaced carrier changes nothing — no sample, no
+// publication, no mark cleared, and no commit record that a PING of the
+// current incarnation with the same id (ids restart per incarnation) could
+// match. A PONG that overtook its own PingCommitted callback (the writer
+// makes a PING matchable before it reports the commit) waits for it: the
+// sample is then tagged loaded when the gauge was loaded at the arrival,
+// at the commit callback, or its epoch changed in between (§8.2).
 func TestHealthIgnoresStaleIncarnation_L21_L23(t *testing.T) {
 	env := hEnv()
 	fs := []Factory{{Name: "a"}, {Name: "b"}}
-	h := NewHealth(env, fs, phParams())
+	h := NewHealth(env, fs, prParams())
 	defer h.Close()
 	pipe := func() *Conn {
 		a, b := net.Pipe()
@@ -344,21 +394,67 @@ func TestHealthIgnoresStaleIncarnation_L21_L23(t *testing.T) {
 	h.mu.Unlock()
 	h.MarkFailed(0, "ping_timeout")
 	v := h.Snapshot().Version
-	now := time.Now()
-	later := now.Add(time.Second)
-	h.obs.PingCommitted(oldC, 7, later)
-	h.obs.Pong(oldC, 7, 5*time.Millisecond, later.Add(5*time.Millisecond))
+	g := h.Gauges()[0]
+	const big = 1 << 20
+	at := time.Now().Add(time.Second)
+	ms := time.Millisecond
+
+	// The replaced incarnation commits PING 7 while the gauge is loaded and
+	// gets its PONG: nothing changes.
+	g.AddInflight(big)
+	g.SetBacklog(true)
+	h.obs.PingCommitted(oldC, 7, at)
+	h.obs.Pong(oldC, 7, 5*ms, at.Add(5*ms))
 	if s := h.Snapshot(); s.Version != v || s.Info[0].Samples != 0 || !s.Failed[0] {
 		t.Fatalf("a stale incarnation changed the evidence: version %d→%d, info %+v, failed %v", v, s.Version, s.Info[0], s.Failed[0])
 	}
-	// The current incarnation: a PONG without its commit record (it
-	// overtook PingCommitted) while the gauge is loaded is a loaded sample.
-	g := h.Gauges()[0]
-	g.AddInflight(1 << 20)
-	g.SetBacklog(true)
-	h.obs.Pong(cur, 8, 5*time.Millisecond, later.Add(5*time.Millisecond))
+	// The current incarnation's own PING 7, committed and answered while
+	// the gauge is unloaded (same epoch): an unloaded sample, which also
+	// clears the mark (its PING was committed after it).
+	g.SetBacklog(false)
+	h.obs.PingCommitted(cur, 7, at)
+	h.obs.Pong(cur, 7, 5*ms, at.Add(5*ms))
 	s := h.Snapshot()
-	if s.Version != v+1 || s.Info[0].Samples != 1 || s.Info[0].LoadedSamples != 1 || s.Failed[0] {
-		t.Fatalf("current incarnation: version %d→%d, info %+v, failed %v", v, s.Version, s.Info[0], s.Failed[0])
+	if s.Version != v+1 || s.Info[0].Samples != 1 || s.Info[0].LoadedSamples != 0 || s.Failed[0] {
+		t.Fatalf("current PING 7 (a stale commit record must not tag it): version %d→%d, info %+v, failed %v", v, s.Version, s.Info[0], s.Failed[0])
+	}
+
+	// PONGs that overtook their commit callback. The gauge starts each step
+	// unloaded: its in-flight estimate is above the threshold (until the
+	// third step) and no carrier is backlogged.
+	nop := func() {}
+	steps := []struct {
+		name                   string
+		arrival, commit, after func() // gauge changes before the PONG, before its PingCommitted, after the step
+		loaded                 bool
+	}{
+		{"loaded at the commit only", nop, func() { g.SetBacklog(true) }, func() { g.SetBacklog(false) }, true},
+		{"loaded at the arrival only", func() { g.SetBacklog(true) }, func() { g.SetBacklog(false) }, nop, true},
+		{"epoch changed in between", func() { g.AddInflight(-big) }, func() { g.SetBacklog(true); g.SetBacklog(false) }, nop, true},
+		{"never loaded", nop, nop, nop, false},
+	}
+	samples, loaded := uint64(1), uint64(0)
+	for k, st := range steps {
+		id := uint32(8 + k)
+		pongAt := at.Add(time.Duration(k+1) * time.Second)
+		st.arrival()
+		ver := h.Snapshot().Version
+		h.obs.Pong(cur, id, 5*ms, pongAt)
+		if s := h.Snapshot(); s.Version != ver || s.Info[0].Samples != samples {
+			t.Fatalf("%s: a PONG ahead of its commit callback became a sample before it: %+v", st.name, s.Info[0])
+		}
+		st.commit()
+		h.obs.PingCommitted(cur, id, pongAt.Add(-5*ms))
+		st.after()
+		samples++
+		stamp := func(s *Snapshot) time.Time { return s.Sum[0].At }
+		if st.loaded {
+			loaded++
+			stamp = func(s *Snapshot) time.Time { return s.Sum[0].LoadedAt }
+		}
+		s := h.Snapshot()
+		if s.Version != ver+1 || s.Info[0].Samples != samples || s.Info[0].LoadedSamples != loaded || !stamp(s).Equal(pongAt) {
+			t.Fatalf("%s: version %d→%d, info %+v, summary %+v (want %d samples, %d loaded, stamped at the arrival)", st.name, ver, s.Version, s.Info[0], s.Sum[0], samples, loaded)
+		}
 	}
 }

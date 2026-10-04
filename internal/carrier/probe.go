@@ -38,18 +38,23 @@ type healthRun struct {
 	done    chan struct{} // closed when the goroutine exited (after its wind-down)
 	first   chan struct{} // closed when every factory has first evidence, or when the run ends
 
-	stopped     bool          // (mu) stop is closed
-	firstDue    bool          // (mu) every factory has first evidence: the next publication closes first
-	firstClosed bool          // (mu) first is closed
-	ended       bool          // (mu) the wind-down began: late attempt results are discarded
-	slots       []probeSlot   // (mu) one per factory
-	live        []*Conn       // (mu) every Conn the run started or discarded and has not seen Done
-	acts        []probeAction // the run goroutine's queue of work done outside mu
+	stopped     bool            // (mu) stop is closed
+	firstDue    bool            // (mu) every factory has first evidence: the next publication closes first
+	firstClosed bool            // (mu) first is closed
+	ended       bool            // (mu) the wind-down began: late attempt results are discarded
+	slots       []probeSlot     // (mu) one per factory
+	live        []*Conn         // (mu) every Conn the run started or discarded and has not seen Done
+	atts        []*probeAttempt // (mu) every attempt the run started whose goroutine was not seen to exit
+	acts        []probeAction   // the run goroutine's queue of work done outside mu
 }
 
 // probeSlot is one factory's probe state within a run.
 type probeSlot struct {
-	cad     sched.Cadence // redial cadence, cap BackoffMax (plan §3.6)
+	// cad is the redial cadence, cap BackoffMax (plan §3.6). Its failure
+	// count n (Fails) is not reset when a probe dial completes the PREFACE
+	// exchange but only when the probe carrier it established held its
+	// path for Probe.BackoffMax (endedLocked).
+	cad     sched.Cadence
 	conn    *Conn         // the started probe carrier; nil: none
 	retired bool          // Retire was called on conn (the peer sent GOAWAY)
 	att     *probeAttempt // the attempt in flight; nil: none
@@ -215,6 +220,7 @@ func (r *healthRun) stepLocked(now time.Time) (wake time.Time, end *runEnd) {
 			} else {
 				a := &probeAttempt{id: s.cad.Start(now), start: now, done: make(chan struct{})}
 				s.att = a
+				r.atts = append(r.atts, a)
 				h.fac[i].attempts++
 				r.acts = append(r.acts, probeAction{op: opAttempt, slot: i, att: a})
 				changed = true
@@ -237,11 +243,20 @@ func earliest(a, b time.Time) time.Time {
 
 // endedLocked handles the end of slot i's probe carrier. A death (any
 // cause but retired) marks the factory failed with its cause; a planned
-// end (the peer's CLOSE, or our retirement after its GOAWAY) does not. In
-// both cases the next attempt starts at max(now, start of the attempt that
-// established the carrier + Backoff(0)): a carrier that lived longer than
-// one backoff step is replaced at once, and one that ends right after its
-// establishment cannot make the slot redial in a loop.
+// end (the peer's CLOSE, or our retirement after its GOAWAY) does not.
+//
+// The replacement (plan §3.6 applied to probe slots, design §7.7): a probe
+// carrier that held its path — it lived at least Probe.BackoffMax from the
+// start of the attempt that established it — is replaced at once and the
+// slot's failure count n restarts at 0. A shorter-lived one counts as one
+// more failure of the slot: the replacement starts at max(now, that start
+// + Backoff(n)) and n grows. So a path that accepts probe carriers and
+// then drops them is redialled like one that refuses them (the spacing
+// grows to Probe.BackoffMax) instead of at dial speed, while the first
+// replacement of a carrier that lived longer than Backoff(n) still starts
+// at once. Plan §3.6 resets n at every completed PREFACE exchange; for
+// probe slots that would loop on such a path, so a probe establishment
+// leaves n alone (resultLocked).
 func (r *healthRun) endedLocked(i int, s *probeSlot, cause Cause, now time.Time) {
 	h := r.h
 	f := &h.fac[i]
@@ -252,11 +267,17 @@ func (r *healthRun) endedLocked(i int, s *probeSlot, cause Cause, now time.Time)
 	if cause.Death() {
 		h.markLocked(i, cause.String(), now)
 	}
-	next := s.cad.LastStart.Add(sched.Backoff(0, h.p.BackoffMax, h.p.Rand()))
+	if !now.Before(s.cad.LastStart.Add(h.p.BackoffMax)) {
+		s.cad.Fails = 0
+		s.cad.Kick()
+		return
+	}
+	next := s.cad.LastStart.Add(sched.Backoff(s.cad.Fails, h.p.BackoffMax, h.p.Rand()))
 	if next.Before(now) {
 		next = now
 	}
 	s.cad.NextAt, s.cad.Immediate = next, false
+	s.cad.Fails++
 }
 
 // resultLocked applies a finished attempt of slot i (design §7.8): a PONG
@@ -264,7 +285,10 @@ func (r *healthRun) endedLocked(i int, s *probeSlot, cause Cause, now time.Time)
 // is no sample, D26); a CLOSE answer (capacity: the passive's sessionless
 // pool is full, plan §3.5), a GOAWAY answer, a refused PREFACE or any
 // error is a probe failure: failed mark with its reason and a growing
-// backoff, so a refusing passive is not redialled in a tight loop.
+// backoff, so a refusing passive is not redialled in a tight loop. A
+// success clears a failed mark set before its attempt started, but keeps
+// the slot's failure count until the carrier held its path for
+// Probe.BackoffMax (endedLocked).
 func (r *healthRun) resultLocked(i int, s *probeSlot, a *probeAttempt, now time.Time) {
 	h := r.h
 	f := &h.fac[i]
@@ -283,11 +307,13 @@ func (r *healthRun) resultLocked(i int, s *probeSlot, a *probeAttempt, now time.
 		r.acts = append(r.acts, probeAction{op: opKill, conn: c, detail: "probe refused: " + reason})
 		return
 	}
+	fails := s.cad.Fails
 	s.cad.Finish(now, a.id, sched.OutcomeAttached, h.p.BackoffMax, u)
+	s.cad.Fails = fails
 	s.conn, s.retired = c, false
 	f.conn = c
-	f.agg.Reset() // a new incarnation starts Unknown (L23)
-	f.pHead, f.pN = 0, 0
+	f.agg.Reset()                               // a new incarnation starts Unknown (L23)
+	f.pHead, f.pN, f.early = 0, 0, probeEarly{} // its PING ids restart: no record of another incarnation may match
 	if f.failed && !a.start.Before(f.markAt) {
 		h.clearLocked(i) // a successful probe dial after the mark (plan §3.9)
 	}
@@ -324,7 +350,9 @@ func probeRefusalReason(est *Established) string {
 	return "going_away"
 }
 
-// pruneLocked forgets conns whose Done closed (they need no join).
+// pruneLocked forgets conns whose Done closed and attempts whose goroutine
+// exited (they need no join), so both lists stay bounded by the slots
+// however often a probe reconnects (invariant 4).
 func (r *healthRun) pruneLocked() {
 	live := r.live[:0]
 	for _, c := range r.live {
@@ -336,6 +364,16 @@ func (r *healthRun) pruneLocked() {
 	}
 	clear(r.live[len(live):])
 	r.live = live
+	atts := r.atts[:0]
+	for _, a := range r.atts {
+		select {
+		case <-a.done:
+		default:
+			atts = append(atts, a)
+		}
+	}
+	clear(r.atts[len(atts):])
+	r.atts = atts
 }
 
 // perform runs the queued actions outside Health.mu.
@@ -405,13 +443,18 @@ func (r *healthRun) attempt(i int, a *probeAttempt) {
 type runEnd struct {
 	conns []*Conn         // every carrier the run started or discarded and has not seen Done
 	kill  []*Conn         // unstarted carriers of finished attempts the run never applied
-	atts  []*probeAttempt // attempts still in flight
+	atts  []*probeAttempt // attempts still in flight: joined within 2·AbandonWait, else abandoned
+	tails []*probeAttempt // attempts that posted their result and are exiting: joined without a bound
 }
 
 // endLocked ends the run (Health.mu held): it detaches the run (later
 // attempt results are discarded, the observer ignores its carriers),
 // releases WaitFirst, publishes Probing = false unless another run is
-// current, and returns what the wind-down must stop and join.
+// current, and returns what the wind-down must stop and join: every carrier
+// and every attempt goroutine the run started that was not seen to end.
+// An attempt that already posted its result runs only rendr code after
+// that (a ring, a CAS, close(done)), so it is joined without a bound; one
+// still in flight can no longer post and is joined within 2·AbandonWait.
 func (r *healthRun) endLocked() *runEnd {
 	h := r.h
 	r.ended = true
@@ -420,19 +463,22 @@ func (r *healthRun) endLocked() *runEnd {
 	}
 	e := &runEnd{conns: r.live}
 	r.live = nil
+	for _, a := range r.atts {
+		if a.finished {
+			e.tails = append(e.tails, a)
+		} else {
+			e.atts = append(e.atts, a)
+		}
+	}
+	r.atts = nil
 	for i := range r.slots {
 		s := &r.slots[i]
 		if f := &h.fac[i]; s.conn != nil && f.conn == s.conn {
 			f.conn = nil
 		}
-		if a := s.att; a != nil {
-			switch {
-			case !a.finished:
-				e.atts = append(e.atts, a)
-			case a.est != nil:
-				e.kill = append(e.kill, a.est.Conn)
-				e.conns = append(e.conns, a.est.Conn)
-			}
+		if a := s.att; a != nil && a.finished && a.est != nil {
+			e.kill = append(e.kill, a.est.Conn) // posted but never applied: never started
+			e.conns = append(e.conns, a.est.Conn)
 		}
 		*s = probeSlot{}
 	}
@@ -442,18 +488,24 @@ func (r *healthRun) endLocked() *runEnd {
 }
 
 // windDown stops and joins everything the run started (design §3.1, §6.8
-// step 4): attempts are cancelled; started probe carriers retire with
-// CLOSE and are killed when their CLOSE is still unwritten after
+// steps 4 and 7): attempts are cancelled; started probe carriers retire
+// with CLOSE and are killed when their CLOSE is still unwritten after
 // min(1 s, DeadMax); unstarted ones are killed; every carrier's Done is
 // awaited (each is bounded by the carrier itself: a part stuck in embedder
-// code is abandoned after AbandonWait). An attempt still running
-// AbandonWait after its cancellation is counted in Env.Abandon until it
-// returns. Then the run leaves Health.runs and its done closes.
+// code is abandoned after AbandonWait). A cancelled attempt returns
+// within AbandonWait unless its own goroutine is stuck in an embedder call:
+// GuardedDial and Establish leave a stuck helper goroutine of theirs (the
+// factory call, a hello writer) behind and count it in Env.Abandon
+// themselves. So the wind-down counts an attempt only when it is still
+// running 2·AbandonWait after its cancellation, until it returns, and no
+// stuck call is ever counted twice. Every other attempt goroutine has
+// exited when the wind-down ends. Then the run leaves Health.runs and its
+// done closes.
 func (r *healthRun) windDown(e *runEnd) {
 	h := r.h
 	tm := h.env.Timing.withDefaults()
 	r.cancel(errProbeStopped)
-	abandon := time.NewTimer(tm.AbandonWait)
+	abandon := time.NewTimer(2 * tm.AbandonWait)
 	defer abandon.Stop()
 	kill := time.NewTimer(min(time.Second, tm.DeadMax))
 	defer kill.Stop()
@@ -490,9 +542,17 @@ func (r *healthRun) windDown(e *runEnd) {
 				gaveUp = true
 			}
 		}
-		if a.state.CompareAndSwap(attRunning, attAbandoned) && h.env.Abandon != nil {
+		// Adopt before the CAS: the attempt's Leave (its own CAS failed)
+		// then always follows this Adopt, so the pool never reads negative.
+		if h.env.Abandon != nil {
 			h.env.Abandon.Adopt()
+			if !a.state.CompareAndSwap(attRunning, attAbandoned) {
+				h.env.Abandon.Leave() // it finished meanwhile
+			}
 		}
+	}
+	for _, a := range e.tails {
+		<-a.done
 	}
 	h.mu.Lock()
 	if k := slices.Index(h.runs, r); k >= 0 {

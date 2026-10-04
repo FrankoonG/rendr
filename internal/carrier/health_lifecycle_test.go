@@ -2,6 +2,7 @@ package carrier
 
 import (
 	"context"
+	"net"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,9 +15,9 @@ import (
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
-// phGoroutines counts the goroutines other than the caller whose stack
+// prGoroutines counts the goroutines other than the caller whose stack
 // contains frame (after synctest.Wait, exiting goroutines are gone).
-func phGoroutines(frame string) int {
+func prGoroutines(frame string) int {
 	buf := make([]byte, 1<<20)
 	for {
 		n := runtime.Stack(buf, true)
@@ -43,20 +44,20 @@ func phGoroutines(frame string) int {
 func TestHealthWaitFirstColdStartOnly(t *testing.T) {
 	cases := []struct {
 		name     string
-		setup    func(r *phRig)
+		setup    func(r *prRig)
 		want     time.Duration
 		complete bool // every factory has evidence (a sample or a mark) when WaitFirst returns
 	}{
 		// Establishment takes one 20 ms RTT and the first PING another.
 		{"BothSampled", nil, 40 * time.Millisecond, true},
-		{"FailureCounts", func(r *phRig) { r.links[1].SetRefuse(true) }, 40 * time.Millisecond, true},
-		{"HangingDialBoundedByDialWait", func(r *phRig) { r.links[1].SetDial(rendrtest.DialHang) }, 800 * time.Millisecond, false},
-		{"SlowPathBoundedByDialWait", func(r *phRig) { r.links[1].SetDelay(500*time.Millisecond, 0) }, 800 * time.Millisecond, false},
+		{"FailureCounts", func(r *prRig) { r.links[1].SetRefuse(true) }, 40 * time.Millisecond, true},
+		{"HangingDialBoundedByDialWait", func(r *prRig) { r.links[1].SetDial(rendrtest.DialHang) }, 800 * time.Millisecond, false},
+		{"SlowPathBoundedByDialWait", func(r *prRig) { r.links[1].SetDelay(500*time.Millisecond, 0) }, 800 * time.Millisecond, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				r := newPhRig(t, 2, nil)
+				r := newPrRig(t, 2, nil)
 				if tc.setup != nil {
 					tc.setup(r)
 				}
@@ -87,7 +88,7 @@ func TestHealthWaitFirstColdStartOnly(t *testing.T) {
 	}
 	t.Run("ContextEnds", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 2, nil)
+			r := newPrRig(t, 2, nil)
 			r.links[1].SetDial(rendrtest.DialHang)
 			r.h.Use()
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -100,7 +101,7 @@ func TestHealthWaitFirstColdStartOnly(t *testing.T) {
 	})
 	t.Run("CloseReleases", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 2, nil)
+			r := newPrRig(t, 2, nil)
 			r.links[1].SetDial(rendrtest.DialHang)
 			r.h.Use()
 			go func() {
@@ -123,11 +124,20 @@ func TestHealthWaitFirstColdStartOnly(t *testing.T) {
 // after the last Use while no session holds the Peer — its probe carriers
 // retire with CLOSE on both ends and its goroutine exits, and nothing is
 // dialled while idle; the next Use restarts it as a cold start (WaitFirst
-// waits for first samples again); a Hold keeps probing past IdleStop, which
-// then counts from the release.
+// waits for first samples again); every later Use moves the idle stop; a
+// Hold starts probing when it is stopped and keeps it running past
+// IdleStop, which then counts from the release.
 func TestHealthIdleStopAndRestart_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, nil)
+		r := newPrRig(t, 2, nil)
+		dials := func() int64 { return r.links[0].Stats().Dials + r.links[1].Stats().Dials }
+		probing := func(at time.Duration, want bool) {
+			t.Helper()
+			r.until(at)
+			if got := r.h.Snapshot().Probing; got != want {
+				t.Fatalf("at %v: probing %v, want %v", at, got, want)
+			}
+		}
 		r.h.Use()
 		r.until(5*time.Minute - time.Second)
 		p0, p1 := r.probe(0), r.probe(1)
@@ -145,11 +155,11 @@ func TestHealthIdleStopAndRestart_L52(t *testing.T) {
 				t.Fatalf("path %d: probe ended %v, passive %v", i, hCause(c), hCause(pas[0]))
 			}
 		}
-		if n := phGoroutines("(*healthRun)"); n != 0 {
+		if n := prGoroutines("(*healthRun)"); n != 0 {
 			t.Fatalf("%d health goroutines after the idle stop", n)
 		}
 		r.until(6 * time.Minute)
-		if d := r.links[0].Stats().Dials + r.links[1].Stats().Dials; d != 2 {
+		if d := dials(); d != 2 {
 			t.Fatalf("%d dials, want 2: nothing is dialled while idle", d)
 		}
 
@@ -164,27 +174,36 @@ func TestHealthIdleStopAndRestart_L52(t *testing.T) {
 			t.Fatalf("after the restart: probing %v, info %+v, summary %+v", s.Probing, s.Info[0], s.Sum[0])
 		}
 
-		// A Hold keeps probing; IdleStop counts from its release.
-		release := r.h.Hold()
-		r.until(16 * time.Minute)
-		if !r.h.Snapshot().Probing {
-			t.Fatal("probing stopped while held")
+		// Later Uses move the idle stop: probing runs until IdleStop after
+		// the last one (12 min), without a new run or dial.
+		probing(9*time.Minute, true)
+		r.h.Use()
+		probing(12*time.Minute, true)
+		r.h.Use()
+		probing(17*time.Minute-time.Second, true)
+		if d := dials(); d != 4 {
+			t.Fatalf("%d dials, want 4: a Use during a run starts nothing", d)
 		}
+		probing(17*time.Minute+100*time.Millisecond, false)
+
+		// A Hold starts probing when it is stopped and keeps it running
+		// past IdleStop; IdleStop then counts from the release.
+		r.until(18 * time.Minute)
+		release := r.h.Hold()
+		r.until(18*time.Minute + 100*time.Millisecond)
+		if s = r.h.Snapshot(); !s.Probing || s.Info[0].Attempts != 3 || s.Info[0].ProbeCarrier == 0 || s.Info[1].ProbeCarrier == 0 {
+			t.Fatalf("Hold did not start probing: probing %v, info %+v %+v", s.Probing, s.Info[0], s.Info[1])
+		}
+		probing(30*time.Minute, true)
 		release()
 		release() // idempotent
-		r.until(21*time.Minute - time.Second)
-		if !r.h.Snapshot().Probing {
-			t.Fatal("probing stopped before IdleStop after the release")
-		}
-		r.until(21*time.Minute + 100*time.Millisecond)
-		if r.h.Snapshot().Probing {
-			t.Fatal("probing still runs IdleStop after the release")
-		}
+		probing(35*time.Minute-time.Second, true)
+		probing(35*time.Minute+100*time.Millisecond, false)
 		r.h.mu.Lock()
 		holds, runs := r.h.holds, len(r.h.runs)
 		r.h.mu.Unlock()
-		if holds != 0 || runs != 0 {
-			t.Fatalf("holds %d, runs %d after the second stop", holds, runs)
+		if holds != 0 || runs != 0 || dials() != 6 {
+			t.Fatalf("holds %d, runs %d, dials %d after the last stop", holds, runs, dials())
 		}
 	})
 }
@@ -195,11 +214,12 @@ func TestHealthIdleStopAndRestart_L52(t *testing.T) {
 // within the bounds when they do not: a factory that ignores its context
 // and a probe carrier whose writes ignore deadlines and Close are
 // abandoned (counted in Env.Abandon until they return), the latter after
-// the kill bound for an unwritten CLOSE.
+// the kill bound for an unwritten CLOSE. A probe dial whose result arrives
+// while the run winds down never leaves its carrier behind.
 func TestPeerCloseJoinsProbes(t *testing.T) {
 	t.Run("Cooperative_L52", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 3, nil)
+			r := newPrRig(t, 3, nil)
 			r.h.Use()
 			r.until(5 * time.Second)
 			probes := []*Conn{r.probe(0), r.probe(1), r.probe(2)}
@@ -220,7 +240,7 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 				}
 			}
 			synctest.Wait()
-			if n := phGoroutines("internal/carrier.(*"); n != 0 {
+			if n := prGoroutines("internal/carrier.(*"); n != 0 {
 				t.Fatalf("%d carrier or health goroutines outlive Close", n)
 			}
 			for i := range probes {
@@ -252,7 +272,7 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 	})
 	t.Run("StuckPaths_L20_L52", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 3, nil)
+			r := newPrRig(t, 3, nil)
 			// Path 1's factory hangs and ignores its context; path 2's probe
 			// carrier gets every write hard-blocked after its establishment.
 			r.links[1].SetDial(rendrtest.DialHangForever)
@@ -279,7 +299,7 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 				t.Fatalf("abandoned %d, want 2 (path 1's factory call, path 2's writer)", n)
 			}
 			synctest.Wait()
-			if n := phGoroutines("(*healthRun)"); n != 0 {
+			if n := prGoroutines("(*healthRun)"); n != 0 {
 				t.Fatalf("%d health goroutines outlive Close", n)
 			}
 			r.links[1].Release()
@@ -292,7 +312,7 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 	})
 	t.Run("SilentPeer_L52", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 2, nil)
+			r := newPrRig(t, 2, nil)
 			r.h.Use()
 			r.until(5 * time.Second)
 			silent := r.probe(1)
@@ -312,37 +332,50 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 	})
 	t.Run("StuckAttempt_L52", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 2, nil)
+			r := newPrRig(t, 2, nil)
 			// Path 1's attempt blocks in its hello write, which ignores
-			// deadlines and Close: after the cancellation the attempt's
-			// goroutine stays inside embedder code.
+			// deadlines and Close: after the cancellation that Write stays
+			// inside embedder code.
 			r.links[1].BlockWrites(rendrtest.Up, rendrtest.BlockHard)
 			r.h.Use()
 			r.until(time.Second)
-			if st := r.links[1].Stats().All; st.WritesBlocked != 1 || r.h.Snapshot().Info[1].ProbeCarrier != 0 {
+			r.h.mu.Lock()
+			a := r.h.run.slots[1].att
+			r.h.mu.Unlock()
+			if st := r.links[1].Stats().All; st.WritesBlocked != 1 || a == nil || r.h.Snapshot().Info[1].ProbeCarrier != 0 {
 				t.Fatalf("stimulus: %+v", st)
 			}
 			t0 := time.Now()
 			r.h.Close()
-			if d := time.Since(t0); d != time.Second {
-				t.Fatalf("Close took %v, want AbandonWait (1s) for the stuck attempt", d)
-			}
+			d := time.Since(t0)
+			// Exactly the one goroutine inside the Write is counted, never
+			// twice. Either Establish writes the hello on a helper goroutine
+			// (design §0.8 V1): it abandons that writer AbandonWait after the
+			// cancellation and returns, and Close joins the attempt. Or the
+			// attempt's own goroutine is the writer: the wind-down abandons
+			// the attempt at its bound, 2·AbandonWait.
 			if n := r.env.Abandon.Len(); n != 1 {
-				t.Fatalf("abandoned %d, want the stuck attempt", n)
+				t.Fatalf("abandoned %d, want the one stuck Write", n)
+			}
+			switch st := a.state.Load(); {
+			case st == attDone && d == time.Second:
+			case st == attAbandoned && d == 2*time.Second:
+			default:
+				t.Fatalf("Close took %v with the attempt in state %d: want 1s with the attempt joined, or 2s with it abandoned", d, st)
 			}
 			r.links[1].Release()
 			synctest.Wait()
 			if n := r.env.Abandon.Len(); n != 0 {
 				t.Fatalf("abandoned %d after the write returned", n)
 			}
-			if n := phGoroutines("(*healthRun)"); n != 0 {
+			if n := prGoroutines("(*healthRun)"); n != 0 {
 				t.Fatalf("%d health goroutines left after the stuck attempt returned", n)
 			}
 		})
 	})
 	t.Run("ConcurrentClose_L52", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPhRig(t, 2, nil)
+			r := newPrRig(t, 2, nil)
 			r.h.Use()
 			r.until(time.Second)
 			r.links[1].BlockWrites(rendrtest.Up, rendrtest.BlockHard)
@@ -366,6 +399,122 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 			r.links[1].Release()
 		})
 	})
+	// Late attempt results: path 1's first attempt completes its handshake
+	// at 20 ms and is held inside Establish (prGate) until the test lets it
+	// return its carrier.
+	gated := func(t *testing.T) (*prRig, *prGate, *probeAttempt) {
+		t.Helper()
+		gate := newPrGate()
+		r := newPrRigDial(t, 2, nil, func(i int, l *rendrtest.Link) func(context.Context) (net.Conn, error) {
+			if i == 1 {
+				return gate.dial(l)
+			}
+			return l.Dial
+		})
+		r.h.Use()
+		r.until(time.Second)
+		r.h.mu.Lock()
+		a := r.h.run.slots[1].att
+		r.h.mu.Unlock()
+		if !gate.held() || a == nil || r.probe(1) != nil || r.probe(0) == nil || len(r.pas.on(1)) != 1 {
+			t.Fatalf("stimulus: held %v, attempt %v, probes %v %v", gate.held(), a, r.probe(0), r.probe(1))
+		}
+		return r, gate, a
+	}
+	// settled checks that nothing the run started outlives Close: the
+	// attempt's goroutine, the late carrier (its CarrierID is released when
+	// its Done closes) and its passive end (EOF once the dialer closed it).
+	settled := func(t *testing.T, r *prRig, a *probeAttempt) {
+		t.Helper()
+		select {
+		case <-a.done:
+		default:
+			t.Fatal("the attempt's goroutine outlives Close")
+		}
+		if n, ab := r.env.IDs.inUse(), r.env.Abandon.Len(); n != 0 || ab != 0 {
+			t.Fatalf("after Close: %d CarrierIDs in use, %d abandoned", n, ab)
+		}
+		r.until(r.since() + 100*time.Millisecond)
+		if c := hCause(r.pas.on(1)[0]); c != CauseTransportError {
+			t.Fatalf("the late carrier's passive end ended %v, want transport_error (the dialer closed it)", c)
+		}
+		if s := r.h.Snapshot(); s.Probing || s.Info[1].ProbeCarrier != 0 {
+			t.Fatalf("after Close: probing %v, info %+v", s.Probing, s.Info[1])
+		}
+		if n := prGoroutines("internal/carrier.(*"); n != 0 {
+			t.Fatalf("%d carrier or health goroutines outlive Close", n)
+		}
+	}
+	t.Run("LateResultDiscarded_L52", func(t *testing.T) {
+		// The result arrives after the wind-down began: the attempt itself
+		// discards the carrier (kill and join) before it ends, and Close
+		// waits for that instead of abandoning the attempt.
+		synctest.Test(t, func(t *testing.T) {
+			r, gate, a := gated(t)
+			ret := make(chan time.Duration)
+			go func() {
+				r.h.Close()
+				ret <- r.since()
+			}()
+			r.until(1100 * time.Millisecond)
+			select {
+			case at := <-ret:
+				t.Fatalf("Close returned at %v while the attempt was still held", at)
+			default:
+			}
+			gate.open()
+			if at := <-ret; at != 1100*time.Millisecond {
+				t.Fatalf("Close returned at %v, want 1.1s (when the held attempt ended)", at)
+			}
+			r.h.mu.Lock()
+			finished, est := a.finished, a.est
+			r.h.mu.Unlock()
+			if finished || est != nil {
+				t.Fatalf("a result that arrived during the wind-down was posted: finished %v, est %v", finished, est)
+			}
+			settled(t, r, a)
+		})
+	})
+	t.Run("PostedResultNotApplied_L52", func(t *testing.T) {
+		// The result is posted, but the run ends in the very step that
+		// would apply it: the wind-down kills the never-started carrier
+		// and joins it and the attempt.
+		synctest.Test(t, func(t *testing.T) {
+			r, gate, a := gated(t)
+			// Close's flag without its stop signal: the run goroutine
+			// sleeps until the attempt posts its result and rings it, so
+			// the step that ends the run finds that result unapplied.
+			r.h.mu.Lock()
+			r.h.closed = true
+			close(r.h.closedCh)
+			r.h.mu.Unlock()
+			gate.open()
+			t0 := time.Now()
+			r.h.Close()
+			if d := time.Since(t0); d != 20*time.Millisecond {
+				t.Fatalf("Close took %v, want path 0's CLOSE exchange (20ms)", d)
+			}
+			r.h.mu.Lock()
+			est := a.est
+			r.h.mu.Unlock()
+			if est == nil {
+				t.Fatal("stimulus: the held attempt did not post its result")
+			}
+			c := est.Conn
+			select {
+			case <-c.Done():
+			default:
+				t.Fatal("the unapplied carrier was not joined")
+			}
+			if _, cause, detail, _ := c.Death(); cause != CauseLocalClose || detail != "probing stopped" {
+				t.Fatalf("the unapplied carrier ended %v (%s), want local_close (probing stopped)", cause, detail)
+			}
+			if st := c.Stats(); st.Frames != 0 {
+				t.Fatalf("the unapplied carrier was started: %d frames written", st.Frames)
+			}
+			settled(t, r, a)
+		})
+	})
 }
 
 // TestProbePeerCloseReconnects_L22_L23 (V6, V16, design §6.8): a probe
@@ -377,7 +526,7 @@ func TestPeerCloseJoinsProbes(t *testing.T) {
 // and replaced the same way.
 func TestProbePeerCloseReconnects_L22_L23(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, nil)
+		r := newPrRig(t, 2, nil)
 		r.h.Use()
 		r.until(3 * time.Second)
 		old := r.probe(0)
@@ -435,9 +584,9 @@ func TestProbePeerCloseReconnects_L22_L23(t *testing.T) {
 func TestHealthInertSingleFactory(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := hEnv()
-		l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "only", Accept: newPhPassive().accept(0)})
+		l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "only", Accept: newPrPassive().accept(0)})
 		defer l.Close()
-		h := NewHealth(env, []Factory{{Name: "only", Dial: l.Dial}}, phParams())
+		h := NewHealth(env, []Factory{{Name: "only", Dial: l.Dial}}, prParams())
 		if h.Gauges() != nil {
 			t.Fatal("an inert Health has gauges")
 		}
@@ -478,7 +627,7 @@ func TestHealthInertSingleFactory(t *testing.T) {
 		h.Close()
 		h.Close()
 
-		none := NewHealth(env, nil, phParams())
+		none := NewHealth(env, nil, prParams())
 		none.Use()
 		none.WaitFirst(context.Background())
 		if len(none.Snapshot().Sum) != 0 || none.Gauges() != nil {

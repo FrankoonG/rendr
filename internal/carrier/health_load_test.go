@@ -16,7 +16,7 @@ import (
 // count again. Factory 1's samples are never loaded.
 func TestHealthSessionBacklogLoadsProbes_L28(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := newPhRig(t, 2, nil)
+		r := newPrRig(t, 2, nil)
 		r.h.Use()
 		r.until(time.Second)
 		base := r.h.Snapshot().Info[0]
