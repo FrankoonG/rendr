@@ -575,11 +575,14 @@ type hsConn struct {
 
 // TestHandshakeSlotsEvictOldest_L48 checks the handshake LRU of plan §3.5:
 // a full table evicts the oldest unfinished handshake (never refusing the
-// new one) and counts it; a released slot leaves the LRU at once; release
-// tells a handshake whether it was evicted; drain hands back every
-// unfinished one oldest first.
+// new one), counts it and adds the evicted conn's closer to the given
+// group under the table lock; a released slot leaves the LRU at once;
+// release tells a handshake whether it was evicted; drain hands back every
+// unfinished one oldest first, and after it the table admits nothing
+// (Runtime.Close: no handshake starts after its drain).
 func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 	h := newHSTable(3)
+	g := newGroup()
 	c := make([]*hsConn, 8)
 	s := make([]*hsSlot, 8)
 	for i := range c {
@@ -587,14 +590,17 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		var ev net.Conn
-		if s[i], ev = h.admit(c[i]); ev != nil {
+		if s[i], ev = h.admit(c[i], g); ev != nil {
 			t.Fatalf("admit %d evicted %v below the limit", i, ev)
 		}
+	}
+	if g.running() != 0 {
+		t.Fatalf("admits below the limit added %d group members", g.running())
 	}
 	admitEvicts := func(i, want int) {
 		t.Helper()
 		var ev net.Conn
-		s[i], ev = h.admit(c[i])
+		s[i], ev = h.admit(c[i], g)
 		if ev != c[want] {
 			t.Fatalf("admit %d evicted %v, want conn %d", i, ev, want)
 		}
@@ -607,15 +613,15 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 	if h.release(s[2]) {
 		t.Fatal("released twice")
 	}
-	if _, ev := h.admit(c[5]); ev != nil {
+	if _, ev := h.admit(c[5], g); ev != nil {
 		t.Fatalf("admit into a released slot evicted %v", ev)
 	}
 	admitEvicts(6, 3)
 	if h.release(s[0]) || h.release(s[1]) || h.release(s[3]) {
 		t.Fatal("an evicted handshake was told it still holds its slot")
 	}
-	if h.len() != 3 || h.evicted() != 3 {
-		t.Fatalf("len %d evictions %d, want 3 and 3", h.len(), h.evicted())
+	if h.len() != 3 || h.evicted() != 3 || g.running() != 3 {
+		t.Fatalf("len %d evictions %d closers %d, want 3, 3 and 3", h.len(), h.evicted(), g.running())
 	}
 	got := h.drain()
 	if want := []net.Conn{c[4], c[5], c[6]}; !slices.Equal(got, want) {
@@ -624,8 +630,8 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 	if h.len() != 0 || h.release(s[4]) {
 		t.Fatal("drain left a slot held")
 	}
-	if _, ev := h.admit(c[7]); ev != nil || h.len() != 1 {
-		t.Fatal("the table is unusable after drain")
+	if sl, ev := h.admit(c[7], g); sl != nil || ev != nil || h.len() != 0 || g.running() != 3 {
+		t.Fatalf("admit after drain: slot %v, evicted %v, len %d, closers %d; want nothing", sl, ev, h.len(), g.running())
 	}
 }
 
@@ -643,7 +649,7 @@ func TestHandshakeSlotsConcurrent_L48(t *testing.T) {
 	var evictedBy sync.Map
 	var released, evictedSeen, overLimit atomic.Int64
 	admit := func(c *hsConn) *hsSlot {
-		s, ev := h.admit(c)
+		s, ev := h.admit(c, nil)
 		if ev != nil {
 			if _, dup := evictedBy.LoadOrStore(ev, true); dup {
 				t.Error("a conn was evicted twice")

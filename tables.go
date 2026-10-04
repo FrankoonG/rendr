@@ -498,12 +498,15 @@ type hsSlot struct {
 // unfinished handshakes per Runtime; when full, admitting a new one evicts
 // the oldest (the caller closes its conn: SetDeadline(now) + Close on a
 // guarded goroutine, never in the accept loop) and counts the eviction. A
-// new handshake is never refused.
+// new handshake is never refused while the Runtime runs; once drain ran
+// (Runtime.Close) the table admits nothing more, so no handshake can start
+// after the drain that was meant to close every one of them.
 type hsTable struct {
 	mu         sync.Mutex
 	limit      int     // Handshake.MaxConcurrent
 	head, tail *hsSlot // head = oldest
 	n          int
+	drained    bool // drain ran: admit refuses
 	evictions  atomic.Uint64
 }
 
@@ -512,16 +515,26 @@ func newHSTable(limit int) *hsTable { return &hsTable{limit: limit} }
 
 // admit occupies a slot for nc. When all slots were taken, the oldest
 // unfinished handshake is evicted and its conn returned for the caller to
-// close; evicted is nil otherwise.
-func (h *hsTable) admit(nc net.Conn) (s *hsSlot, evicted net.Conn) {
-	s = &hsSlot{nc: nc, held: true}
+// close; evicted is nil otherwise. When g is non-nil, an eviction adds one
+// member to g under the table lock — the goroutine that will close the
+// evicted conn — so that the member exists before a later drain returns
+// (Runtime.Close joins g after its drain). After drain, admit occupies
+// nothing and returns a nil slot: the caller closes nc itself.
+func (h *hsTable) admit(nc net.Conn, g *group) (s *hsSlot, evicted net.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.drained {
+		return nil, nil
+	}
+	s = &hsSlot{nc: nc, held: true}
 	if h.n >= h.limit && h.head != nil {
 		old := h.head
 		h.unlinkLocked(old)
 		evicted = old.nc
 		h.evictions.Add(1)
+		if g != nil {
+			g.add() // a leaf lock under hsMu: group.mu never waits for hsMu
+		}
 	}
 	s.prev = h.tail
 	if h.tail != nil {
@@ -565,10 +578,11 @@ func (h *hsTable) unlinkLocked(s *hsSlot) {
 
 // drain releases every occupied slot and returns their conns, oldest first
 // (Runtime.Close: close every unfinished handshake). Their handshakes see
-// release return false.
+// release return false. The drain is final: admit refuses from now on.
 func (h *hsTable) drain() []net.Conn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.drained = true
 	out := make([]net.Conn, 0, h.n)
 	for h.head != nil {
 		s := h.head

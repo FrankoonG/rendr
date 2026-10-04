@@ -25,9 +25,10 @@ var (
 	// ErrRejected: Dial was rejected by the peer application; errors.As
 	// yields *RejectError.
 	ErrRejected = session.ErrRejected
-	// ErrCapacity: Dial refused for capacity: CAPACITY or GOING_AWAY from the
-	// peer, the peer's AcceptTimeout, local MaxSessions, or the local
-	// abandoned-call pool is full.
+	// ErrCapacity: Dial refused for capacity: CAPACITY from the peer (its
+	// MaxSessions, a full backlog or a closed Listener, its AcceptTimeout),
+	// GOING_AWAY from the peer (its Runtime is closing), local MaxSessions,
+	// or the local abandoned-call pool is full.
 	ErrCapacity = session.ErrCapacity
 	// ErrVersion: the peer answered PREFACE_ACK VERSION or FEATURE.
 	ErrVersion = session.ErrVersion
