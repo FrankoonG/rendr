@@ -94,16 +94,31 @@ func (t Timing) withDefaults() Timing {
 
 // Presets are counter start values (L14); zero means the production default.
 type Presets struct {
-	FirstFseq   uint32 // first fseq in each direction (0 = wire.FirstFseq)
+	FirstFseq   uint32 // first fseq in each direction (0: derived from the direction's PREFACE or PREFACE_ACK, §0.13 A6)
 	FirstPingID uint32 // first PING id (0 = 1)
 }
 
-// firstFseq returns the fseq of the first frame in each direction.
+// firstFseq returns the fseq a Conn starts with before its handshake sets
+// the derived one (fseqFrom): FirstFseq when preset, else wire.FirstFseq.
+// Only a Conn that skips the handshake (package tests) keeps it.
 func (p Presets) firstFseq() uint32 {
 	if p.FirstFseq == 0 {
 		return wire.FirstFseq
 	}
 	return p.FirstFseq
+}
+
+// fseqFrom returns the fseq of the first frame in the direction that hello
+// — a PREFACE or PREFACE_ACK, as written on the wire — opened: FirstFseq
+// when preset (L14 wrap tests, scripted peers), else hello's CRC field
+// (wire.PrefaceFseq), so every carrier direction numbers its frames from
+// its own start and a frame spliced from another carrier fails the fseq
+// check (design §0.13 A6; L43).
+func (p Presets) fseqFrom(hello []byte) uint32 {
+	if p.FirstFseq != 0 {
+		return p.FirstFseq
+	}
+	return wire.PrefaceFseq(hello)
 }
 
 // firstPingID returns the id of a carrier's first PING.

@@ -64,8 +64,9 @@ type SessionStatus struct {
 // MigrationCounts counts migrations by cause (plan §3.6). Selector: a change
 // of the active carrier instance at publication; bond: a member that dies
 // with unacknowledged data of this side that is moved to other members. Both
-// ends count the same selector migrations (the passive counts from the
-// cause carried by SCHED).
+// ends count the same selector migrations: the dialer decides them, and the
+// passive takes the dialer's cumulative counts from every scheduling update
+// it applies, so they agree once the passive has followed the latest one.
 type MigrationCounts struct {
 	Death, Quality, Explicit uint64
 }

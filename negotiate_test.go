@@ -79,13 +79,14 @@ func prefaceAck(p wire.Preface, st wire.PrefaceStatus, inst [16]byte, edit func(
 	return b
 }
 
-// frameAfterAck appends one passive frame (first fseq) to a PREFACE_ACK.
+// frameAfterAck appends one passive frame to a PREFACE_ACK, with the first
+// fseq of the passive's direction: the PREFACE_ACK's CRC field (§0.13 A6).
 func frameAfterAck(ack []byte, ty wire.Type, flags uint8, payload []byte) []byte {
 	var handle uint32
 	if !ty.CarrierLevel() {
 		handle = wire.SessionHandle
 	}
-	return wire.AppendFrame(ack, wire.Header{Type: ty, Flags: flags, Fseq: wire.FirstFseq, Handle: handle}, payload)
+	return wire.AppendFrame(ack, wire.Header{Type: ty, Flags: flags, Fseq: wire.PrefaceFseq(ack), Handle: handle}, payload)
 }
 
 // TestHandshakeNegotiationTyped_L44 (as amended by P19): a dialer meeting

@@ -173,9 +173,11 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 // advances the PONG watermark (liveness and delivery, no sample). A match
 // yields the RTT from the PING's commit (L23), drops that record and every
 // older one, updates srtt, minRTT, the PONG watermark, the rate (only for a
-// backlogged interval: D15, P4) and the receive rate. wake reports that the
-// watermark advanced while the writer's last round was cap-blocked (C5), or
-// that the PONG freed records of a full ring.
+// backlogged interval: D15, P4; a PONG that proves nothing new restarts the
+// interval only while the interval itself has proven nothing yet, §0.13 A1)
+// and the receive rate. wake reports that the watermark advanced while the
+// writer's last round was cap-blocked (C5), or that the PONG freed records
+// of a full ring.
 func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time.Duration, wake bool) {
 	st := &c.st
 	i := st.find(p.ID)
@@ -224,10 +226,23 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		st.pongMark = rec.mark
 	}
 	switch {
-	case !advanced:
-		// Nothing new was proven: idle is not slowness. The next interval
-		// starts here.
+	case !advanced && st.pongMark == st.rateMark:
+		// Nothing new was proven since the interval began: idle is not
+		// slowness. The next interval starts here.
 		st.rateMark, st.rateAt, st.rateCommitAt = st.pongMark, now, rec.committedAt
+	case !advanced:
+		// Nothing new was proven by this PONG, but the interval holds bytes
+		// an earlier PONG proved too soon after its start to be sampled
+		// (< minRateSample). Restarting here would throw that proof away:
+		// on a path whose RTT is at least PingBusy, a busy PING that went
+		// out just before a burst returns just before the PONG proving the
+		// burst, and when the two arrive less than minRateSample apart
+		// (RTT mod PingBusy < 5 ms) the round trips lost their samples — the
+		// rate stayed at or near 0 and the capacity at CapFloor, 128 KiB per
+		// RTT whatever the window (design §0.13 A1). The interval runs on to
+		// the next PONG that proves more. Its start still precedes every
+		// byte it counts on the wire (each PING precedes the DATA submitted
+		// after its mark), so the sample stays within the drain rate.
 	case now.Sub(st.rateAt) >= minRateSample:
 		dt := now.Sub(st.rateAt)
 		st.rate *= decay(dt)
@@ -336,12 +351,22 @@ func (c *Conn) busyCadenceLocked(now time.Time, w *writer) bool {
 // gaugeUpdateLocked refreshes this carrier's self-load contribution:
 // forward bytes not proven by a PONG watermark plus the reverse bound
 // rxRate·srtt, and the backlog state (local BUSY or the peer's) (§8.2).
+// While the peer reports BUSY the reverse bound is at least CapFloor: a
+// send-backlogged peer sits at its capacity cap, never below the floor, or
+// has writes in progress that cover a quarter of its time (§0.13 A5). On a
+// path whose bandwidth-delay product is below the floor, rxRate·srtt alone
+// hovered around LoadThreshold while the peer was saturated, and a probe
+// sample carrying the download's own queueing counted as unloaded.
 func (c *Conn) gaugeUpdateLocked() {
 	st := &c.st
 	if st.gauge == nil || st.gEnded {
 		return
 	}
-	contrib := st.inflight() + int64(st.rxRate*st.srtt.Seconds())
+	rev := int64(st.rxRate * st.srtt.Seconds())
+	if st.peerBusy {
+		rev = max(rev, c.tm.CapFloor)
+	}
+	contrib := st.inflight() + rev
 	if d := contrib - st.gContrib; d != 0 {
 		st.gauge.AddInflight(d)
 		st.gContrib = contrib

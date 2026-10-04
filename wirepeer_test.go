@@ -104,9 +104,13 @@ func wpRecrc(b []byte) []byte {
 
 // sendPreface writes p (40 bytes or a malformed variant) and reads the
 // answer: a 40-byte PREFACE_ACK, or ok == false when the passive closed the
-// carrier without one (n bytes received before EOF).
+// carrier without one (n bytes received before EOF). Each direction then
+// numbers its frames from its own preface's CRC field (design §0.13 A6).
 func (d *wpDialer) sendPreface(p []byte) (ack wire.PrefaceAck, ok bool, n int) {
 	d.t.Helper()
+	if len(p) >= wire.PrefaceLen {
+		d.txFseq = wire.PrefaceFseq(p)
+	}
 	if _, err := d.nc.Write(p); err != nil {
 		return ack, false, 0 // closed before it read the whole preface
 	}
@@ -119,6 +123,7 @@ func (d *wpDialer) sendPreface(p []byte) (ack wire.PrefaceAck, ok bool, n int) {
 	if err != nil {
 		d.t.Fatalf("PREFACE_ACK does not parse: %v", err)
 	}
+	d.rxFseq = wire.PrefaceFseq(b[:])
 	return ack, true, n
 }
 

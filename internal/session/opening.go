@@ -294,17 +294,35 @@ func (a *actor) raceLocked(now time.Time) {
 }
 
 // dialActLocked runs the dialer's policy for a step: the opening phase, or
-// the selector's failover race and quality policy, or bond membership.
+// the selector's failover race and quality policy, or bond membership —
+// except while the session waits only for the peer's DONE (doneWaitLocked).
 func (a *actor) dialActLocked(now time.Time) {
 	d := a.d
 	switch {
 	case !d.opened:
 		a.openingLocked(now)
+	case a.doneWaitLocked():
 	case a.s.p.Mode == ModeBond:
 		a.bondSlotsLocked(now)
 	default:
 		a.selectorLocked(now)
 	}
+}
+
+// doneWaitLocked reports that no new attempt may start (design §0.13 A2,
+// amending X3): our DONE was sent, the peer's is outstanding, and a lane is
+// still alive or an ended lane's reader is still pending
+// (awaitReaderLocked). Everything of ours was acknowledged, so a carrier
+// can only bring the peer's DONE, which any live lane brings as well — and
+// our own DONE goes out again on a survivor with every re-ACK. A peer that
+// ended cleanly retires its carriers right after its DONE, so the CLOSE on
+// one lane can precede the DONE on another: redialling the retired member
+// would only race the clean end. Once no lane is alive and no reader is
+// pending, the no-path episode starts and the slots redial as before (a
+// JOIN answered UNKNOWN_SESSION after our DONE is a clean end, D4).
+func (a *actor) doneWaitLocked() bool {
+	st := &a.s.st
+	return st.doneSent && !st.peerDone && (a.hasAliveLocked() || a.readersPendingLocked())
 }
 
 // openingLocked runs Dial's opening phase (§6.6) until the first

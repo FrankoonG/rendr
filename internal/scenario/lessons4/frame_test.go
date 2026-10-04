@@ -316,10 +316,10 @@ func TestDroppedFrameFseq_L43(t *testing.T) {
 // same volume side by side and X's next DATA frame is spliced into Y
 // (their carriers are at the same frame index); "offset": X's first DATA
 // frame is spliced into Y once Y is many frames further. (The lockstep
-// splice is the hard case: every carrier direction starts at the same
-// fseq, every M1 session uses handle 1 and the CRC32C covers only the
-// frame, so only a per-carrier binding of the frames can tell X's frame
-// from Y's own.)
+// splice is the hard case: every M1 session uses handle 1 and the CRC32C
+// covers only the frame, so only a per-carrier binding of the frames can
+// tell X's frame from Y's own — each carrier direction numbers its frames
+// from its own preface's CRC field, design §0.13 A6.)
 func TestSplicedSessionsKilled_L43(t *testing.T) {
 	for _, mode := range []string{"lockstep", "offset"} {
 		t.Run(mode, func(t *testing.T) {

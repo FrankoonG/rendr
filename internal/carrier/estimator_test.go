@@ -890,3 +890,61 @@ func TestGaugeNotFedAfterKillRacesStart(t *testing.T) {
 		p.close()
 	})
 }
+
+// TestGaugeBusyPeerHoldsCapFloor_L29 (design §0.13 A5, §8.2): while the
+// peer reports BUSY, a carrier counts at least CapFloor as its reverse
+// bound, so a saturated download whose rxRate × srtt stays below the load
+// threshold — a path whose bandwidth-delay product is below the floor —
+// still loads the gauge; without the peer's BUSY the same reverse traffic
+// does not (the backlog gate of the guard is unchanged).
+func TestGaugeBusyPeerHoldsCapFloor_L29(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		c, p := hPair(t, env, nil)
+		p.keep()
+		g := NewGauge()
+		c.Start(&hEP{}, &hBell{}, StartOptions{Gauge: g})
+		p.autoPong(func(uint32) time.Duration { return 20 * time.Millisecond })
+		// A trickle of reverse DATA: rxRate × srtt stays far below the
+		// threshold.
+		for i := range 20 {
+			_ = p.sendFrames(hFrame{t: wire.TypeData, handle: wire.SessionHandle, payload: dataPayload(uint64(i)*(1<<10), 1<<10)})
+			time.Sleep(10 * time.Millisecond)
+		}
+		synctest.Wait()
+		const threshold = 64 << 10
+		st := c.Stats()
+		rev := int64(st.RxRate * st.SRTT.Seconds())
+		if st.RxRate == 0 || st.SRTT == 0 || rev >= threshold || st.PeerBusy {
+			t.Fatalf("stimulus: rxRate %.0f B/s × srtt %v = %d bytes, peer BUSY %v; want a small reverse bound and no BUSY", st.RxRate, st.SRTT, rev, st.PeerBusy)
+		}
+		if loaded, _ := g.Loaded(threshold); loaded || g.inflight.Load() != rev {
+			t.Fatalf("without the peer's BUSY: gauge loaded %v with %d bytes, want unloaded with %d", loaded, g.inflight.Load(), rev)
+		}
+		// The peer reports BUSY: the reverse bound becomes the floor.
+		if err := p.ping(900, true); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if st := c.Stats(); !st.PeerBusy {
+			t.Fatal("the peer's BUSY PING was not recorded")
+		}
+		if loaded, _ := g.Loaded(threshold); !loaded || g.inflight.Load() != env.Timing.CapFloor {
+			t.Fatalf("with the peer's BUSY: gauge loaded %v with %d bytes, want loaded with the floor %d", loaded, g.inflight.Load(), env.Timing.CapFloor)
+		}
+		// BUSY clears: back to the measured bound, unloaded.
+		if err := p.ping(901, false); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if loaded, _ := g.Loaded(threshold); loaded || g.inflight.Load() >= threshold {
+			t.Fatalf("after BUSY cleared: gauge loaded %v with %d bytes", loaded, g.inflight.Load())
+		}
+		c.Kill(CauseLocalClose, "test end")
+		hWait(t, c)
+		if g.inflight.Load() != 0 || g.backlogged.Load() != 0 {
+			t.Fatalf("gauge after the end: inflight %d backlogged %d", g.inflight.Load(), g.backlogged.Load())
+		}
+		p.close()
+	})
+}

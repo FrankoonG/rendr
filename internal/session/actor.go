@@ -131,9 +131,14 @@ type actor struct {
 	// no member was left; the next lane that carries data counts the death
 	// migration (dialer: the next attach; passive: the next data lane).
 	deathOwed bool
-	// named (passive selector): the lane the last applied SCHED (or the
-	// epoch-0 choice) made the sender; migrations count against it (§7.6).
+	// named (passive selector): the carrier the last applied SCHED (or the
+	// epoch-0 choice) named; the From of the Migration events the next
+	// SCHED's counts produce (§7.6, §0.13 A3).
 	named uint32
+	// readerWait is the Done channel of an ended lane whose death step waits
+	// for its reader (awaitReaderLocked, §0.13 A2): the loop also wakes when
+	// it closes. reapDead recomputes it every step.
+	readerWait <-chan struct{}
 
 	d *dialer // dialer only
 }
@@ -172,6 +177,7 @@ func (a *actor) run() {
 		case <-s.mb.bell:
 		case <-a.timer.C:
 		case <-joined:
+		case <-a.readerWait:
 		}
 	}
 }

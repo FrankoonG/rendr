@@ -39,6 +39,17 @@ func PutPrefaceAck(b []byte, a *PrefaceAck) {
 	putPreface(b, a.Minor, uint8(a.Status), RolePassive, a.Req, a.Opt, &a.Instance, a.CarrierID)
 }
 
+// PrefaceFseq returns the fseq of the first frame in the carrier direction
+// that b — the PrefaceLen bytes of a PREFACE or a PREFACE_ACK — opens: its
+// CRC32C field (bytes 36–39). The dialer's direction starts at its
+// PREFACE's, the passive's at its PREFACE_ACK's, and both differ between
+// carriers (instance, carrier ID), so a frame spliced in from another
+// carrier at the same frame index fails the fseq check like any other
+// (design §0.13 A6; L43). It panics if len(b) < PrefaceLen.
+func PrefaceFseq(b []byte) uint32 {
+	return binary.BigEndian.Uint32(b[36:PrefaceLen])
+}
+
 // putPreface writes the 40-byte layout shared by PREFACE and PREFACE_ACK;
 // byte 6 is the kind (PREFACE) or the status (PREFACE_ACK).
 func putPreface(b []byte, minor, b6 uint8, role Role, req, opt uint32, inst *[16]byte, id uint32) {

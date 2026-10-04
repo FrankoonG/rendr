@@ -106,8 +106,10 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // carriers; payload encoded by wire.PutOpen/PutJoin; handle SessionHandle)
 // or TypePing (probe carriers; payload must be nil: Establish encodes the
 // PING with the Conn's first PING id and nonce = salt ^ id; handle 0). Its
-// fseq is the Runtime's first fseq (Env.Presets.FirstFseq, 0 = wire.FirstFseq)
-// and the Conn's tx fseq and PING id counters continue after it. A PING's
+// fseq is the first fseq of the dialer's direction — Env.Presets.FirstFseq
+// when preset, else the PREFACE's CRC field (wire.PrefaceFseq, §0.13 A6) —
+// and the Conn's tx fseq and PING id counters continue after it; the
+// passive's direction starts at its PREFACE_ACK's in the same way. A PING's
 // response must be a PONG echoing its id and nonce (else a protocol
 // violation); that establishment PONG is not an RTT sample (design D26).
 //
@@ -155,7 +157,6 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // PREFACE_ACK of this major also reports the passive's Instance (the
 // instance a GOING_AWAY names, design §6.6), with PrefaceOK false.
 func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
-	first := env.Presets.firstFseq()
 	pingID := env.Presets.firstPingID()
 	var sb [8]byte
 	_, _ = rand.Read(sb[:])
@@ -163,6 +164,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 
 	hello := make([]byte, wire.PrefaceLen, wire.PrefaceLen+wire.FrameOverhead+max(len(payload), wire.PingFixedLen))
 	wire.PutPreface(hello, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Instance: env.Local, CarrierID: id})
+	first := env.Presets.fseqFrom(hello)
 	switch t {
 	case wire.TypeOpen, wire.TypeJoin:
 		hello = wire.AppendFrame(hello, wire.Header{Type: t, Fseq: first, Handle: wire.SessionHandle}, payload)
@@ -342,8 +344,9 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	if herr != nil {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("response header: %w", herr), false)
 	}
-	if h.Fseq != first {
-		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("response fseq %d, want %d", h.Fseq, first), false)
+	rfirst := env.Presets.fseqFrom(ab[:])
+	if h.Fseq != rfirst {
+		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("response fseq %d, want %d", h.Fseq, rfirst), false)
 	}
 	if !responseAllowed(t, h) {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("%v as the response to %v", h.Type, t), false)
@@ -366,7 +369,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 
 	c := newConn(env, nc, id, ack.Instance, f.Index, f.Name, true)
 	c.salt = salt
-	c.wr.fseq, c.rd.fseq = first+1, first+1
+	c.wr.fseq, c.rd.fseq = first+1, rfirst+1
 	if t == wire.TypePing {
 		c.st.nextPingID = pingID + 1
 	}

@@ -38,6 +38,41 @@ func (s *Session) bumpNowLocked() {
 		l.idle = false
 		l.port.Wake()
 	}
+	if l := st.gapLane; l != nil && l.idle {
+		l.idle = false
+		l.port.Wake()
+	}
+}
+
+// gapAckLocked runs after every Data call on lane l that started at offset
+// off while the in-order end was tail (design §0.13 A4; L34). A bond
+// receiver holding out-of-order data lacks bytes that some lane carries; if
+// that lane is the ACK duty lane and its path stalled while its conn still
+// accepts writes, the duty never moves (its writes do not block) and every
+// ACK sits in the stalled path: the sender's acknowledged front goes stale
+// and its rescue duplicates bytes this side already has. So while
+// out-of-order data is held, a lane other than the duty lane that delivers
+// DATA beyond the in-order end becomes the gap lane and carries every ACK
+// as well (Fill), over the path that evidently delivers; it is woken when
+// it owes one. The gap lane is dropped once nothing is held out of order
+// (or with its lane, laneGoneLocked). A selector receiver never holds
+// out-of-order data, and in a healthy bond out-of-order data mostly arrives
+// on the lowest-srtt lane, which usually holds the duty: the extra ACKs are
+// rare.
+func (s *Session) gapAckLocked(l *lane, off, tail uint64) {
+	st := &s.st
+	if len(st.ooq.s) == 0 || st.ended {
+		st.gapLane = nil
+		return
+	}
+	if off <= tail || l == st.ackLane {
+		return
+	}
+	st.gapLane = l
+	if l.ackSent != st.ackGen && l.idle {
+		l.idle = false
+		l.port.Wake()
+	}
 }
 
 // ackCadenceLocked applies the delivery cadence after rRead advanced.
@@ -50,8 +85,13 @@ func (s *Session) ackCadenceLocked() {
 	if st.rRead > st.ackBumped && st.ackDelayAt.IsZero() {
 		st.ackDelayAt = time.Now().Add(s.ackDelay())
 		s.ensureAckLaneLocked()
-		// Once: its Fill arms the writer timer (b.WakeAt) for ackDelayAt.
+		// Once: its Fill arms the writer timer (b.WakeAt) for ackDelayAt —
+		// the gap lane's too (§0.13 A4).
 		if l := st.ackLane; l != nil && l.idle {
+			l.idle = false
+			l.port.Wake()
+		}
+		if l := st.gapLane; l != nil && l.idle {
 			l.idle = false
 			l.port.Wake()
 		}

@@ -31,6 +31,10 @@ func hTiming() Timing {
 	}
 }
 
+// hEnv returns the package tests' Env. Its preset first fseq lets scripted
+// peers number their frames from wire.FirstFseq; production derives each
+// direction's first fseq from its PREFACE or PREFACE_ACK (§0.13 A6), which
+// TestPrefaceDerivedFseq_L43 covers with Presets left zero.
 func hEnv() *Env {
 	local := [16]byte{0xaa, 15: 0xaa}
 	return &Env{
@@ -40,6 +44,7 @@ func hEnv() *Env {
 		Abandon: NewAbandonPool(256),
 		Bufs:    NewBufPool(),
 		Budget:  NewBudget(1 << 30),
+		Presets: Presets{FirstFseq: wire.FirstFseq},
 	}
 }
 

@@ -26,9 +26,20 @@ import (
 // delivering it never hides it.
 func (a *actor) reapDead(now time.Time) time.Time {
 	s := a.s
+	a.readerWait = nil
 	for i := 0; i < len(s.lanes); {
 		l := s.lanes[i]
 		if dead, _, _, _ := l.c.Death(); !dead {
+			i++
+			continue
+		}
+		s.mu.Lock()
+		wait := a.awaitReaderLocked(l)
+		s.mu.Unlock()
+		if wait {
+			if a.readerWait == nil {
+				a.readerWait = l.c.Done() // the loop wakes when it closes
+			}
 			i++
 			continue
 		}
@@ -45,6 +56,45 @@ func (a *actor) reapDead(now time.Time) time.Time {
 		a.unlockStep(now)
 	}
 	return now
+}
+
+// awaitReaderLocked reports that the death step of the ended lane l waits
+// for its reader (design §0.13 A2, amending X3). Once our DONE was sent
+// and while the peer's is still outstanding, the peer may already have
+// ended cleanly: it ends as soon as it holds both DONEs and then retires
+// its carriers, so its DONE and the end of the carrier that carries it can
+// reach this side together, and the death can be noticed first — by this
+// carrier's writer, or through another lane — while the DONE still sits in
+// this carrier's reader. Its reader dispatches every frame it read before
+// it exits, so the death step waits until the carrier is done; a clean end
+// found that way is no routing loss (X3: no failed mark, redial, no-path
+// episode or migration). The wait is bounded by the carrier's own join
+// (AbandonWait for a call stuck in embedder code). When the carrier is done
+// and the peer's DONE did not come, the death step runs as before, with the
+// death time the carrier recorded.
+func (a *actor) awaitReaderLocked(l *lane) bool {
+	st := &a.s.st
+	if a.ending || !st.doneSent || st.peerDone {
+		return false
+	}
+	select {
+	case <-l.c.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+// readersPendingLocked reports an ended lane whose death step waits for its
+// reader (awaitReaderLocked): the session may still end cleanly, so no
+// no-path episode starts before that lane's death step decides.
+func (a *actor) readersPendingLocked() bool {
+	for _, l := range a.s.lanes {
+		if laneEnded(l) && a.awaitReaderLocked(l) {
+			return true
+		}
+	}
+	return false
 }
 
 // laneDiedLocked is the death step of lane l (§7.3).
@@ -76,7 +126,7 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 			a.bondDeathCountLocked(now, l.id, cause, requeued)
 		}
 	}
-	if !a.hasAliveLocked() {
+	if !a.hasAliveLocked() && !a.readersPendingLocked() {
 		// The other lanes may have ended too and wait for their own death
 		// step: the episode starts at the death of the last live carrier.
 		a.episodeStartLocked(now, a.lastDeathLocked(at))
@@ -191,6 +241,12 @@ func (a *actor) peerSignalsLocked(now time.Time) {
 	if a.endIfDoneLocked(now); a.ending {
 		return
 	}
+	if a.readersPendingLocked() {
+		// A peer CLOSE may be the peer's retirement after a DONE still
+		// sitting in another lane's reader (awaitReaderLocked): its routing
+		// repair waits for that reader as well.
+		return
+	}
 	for _, l := range s.lanes {
 		if l.state != LaneDead && !l.retireCalled && l.c.PeerClosed() {
 			a.peerClosedLocked(now, l)
@@ -254,7 +310,7 @@ func (a *actor) peerClosedLocked(now time.Time, l *lane) {
 	} else if wasActive {
 		a.lostActiveLocked(now, l.id, carrier.CauseRetired)
 	}
-	if !a.hasAliveLocked() {
+	if !a.hasAliveLocked() && !a.readersPendingLocked() {
 		a.episodeStartLocked(now, now)
 	}
 }

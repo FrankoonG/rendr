@@ -150,14 +150,21 @@ func checkGuarded(t *testing.T, gb guardBulk, r guardResult) {
 // The guard-disabled control run (LoadThreshold = MaxInt64) shows that the
 // same stimulus does cause a quality switch without the guard (L60).
 //
-// Its start phase (halfway between two of a's probe PINGs) and rate are
-// the favourable ones: a download that starts right after a probe PING
-// commit, and a 512 KiB/s download, still switch on the current code. The
-// rendr_findings test TestDownloadGuardEdges_L29 reproduces both; they
-// join this test once the guard covers them.
+// The low-bdp case is a 512 KiB/s download at a 20 ms RTT: the passive's
+// capacity sits at its 128 KiB floor, so the reverse bound rxRate × srtt
+// alone hovered around the load threshold while the passive was saturated;
+// a peer that reports BUSY now counts at least the capacity floor (design
+// §0.13 A5). The start phase of both cases (halfway between two of a's
+// probe PINGs) is the favourable one: a download that starts right after a
+// probe PING commit still switches (the rendr_findings test
+// TestDownloadGuardEdges_L29, recorded as open in §0.13).
 func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 	t.Run("guarded", func(t *testing.T) {
 		gb := guardBulk{download: true, rate: guardRate(), dur: 60 * time.Second}
+		checkGuarded(t, gb, runGuardBulk(t, gb))
+	})
+	t.Run("low-bdp", func(t *testing.T) {
+		gb := guardBulk{download: true, rate: 512 * kib, dur: 60 * time.Second}
 		checkGuarded(t, gb, runGuardBulk(t, gb))
 	})
 	t.Run("guard-disabled-control", func(t *testing.T) {

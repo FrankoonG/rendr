@@ -50,7 +50,11 @@ func (l *lane) Fill(c *carrier.Conn, b *carrier.Batch) {
 func (l *lane) Data(c *carrier.Conn, off uint64, p []byte, buf *carrier.Buf) error {
 	s := l.s
 	s.mu.Lock()
+	tail := s.st.rTail
 	err := s.dataLocked(off, p, buf)
+	if err == nil {
+		s.gapAckLocked(l, off, tail)
+	}
 	s.mu.Unlock()
 	return err
 }

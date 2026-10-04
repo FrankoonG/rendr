@@ -11,5 +11,6 @@
 //
 // Reproductions of open product findings live in findings_test.go behind
 // the rendr_findings build tag: they fail on the current code by design and
-// run only with go test -tags rendr_findings.
+// run only with go test -tags rendr_findings. A finding whose product fix
+// landed moves to the package's normal tests (design §0.13 Revision 8).
 package lessons3

@@ -345,12 +345,18 @@ func ParseRst(p []byte) (Rst, error) {
 	return r, nil
 }
 
-// Sched is the SCHED payload: epoch u32 | n u8 | carrierID[n] u32. The
-// SchedCause travels in the header flags.
+// Sched is the SCHED payload: epoch u32 | death u64 | quality u64 |
+// explicit u64 | n u8 | carrierID[n] u32. The SchedCause travels in the
+// header flags. Death, Quality and Explicit are the dialer's cumulative
+// selector migration counts when it encoded the frame, so the passive
+// counts exactly what the dialer counted even when a SCHED is superseded
+// before it reaches the passive (design §0.13 A3); a bond session sends
+// zero (each side counts its own bond migrations).
 type Sched struct {
-	Epoch uint32
-	N     int                 // 1..MaxSchedIDs
-	IDs   [MaxSchedIDs]uint32 // IDs[:N] non-zero and distinct
+	Epoch                    uint32
+	Death, Quality, Explicit uint64              // cumulative selector migrations (zero in bond)
+	N                        int                 // 1..MaxSchedIDs
+	IDs                      [MaxSchedIDs]uint32 // IDs[:N] non-zero and distinct
 }
 
 // PutSched writes s into dst and returns SchedFixedLen + 4·s.N. It panics if
@@ -363,29 +369,38 @@ func PutSched(dst []byte, s *Sched) int {
 	n := SchedFixedLen + 4*s.N
 	_ = dst[n-1]
 	binary.BigEndian.PutUint32(dst[0:4], s.Epoch)
-	dst[4] = uint8(s.N)
+	binary.BigEndian.PutUint64(dst[4:12], s.Death)
+	binary.BigEndian.PutUint64(dst[12:20], s.Quality)
+	binary.BigEndian.PutUint64(dst[20:28], s.Explicit)
+	dst[28] = uint8(s.N)
 	for i, id := range s.IDs[:s.N] {
 		binary.BigEndian.PutUint32(dst[SchedFixedLen+4*i:], id)
 	}
 	return n
 }
 
-// ParseSched decodes a SCHED payload: exact length 5 + 4n, 1 ≤ n ≤
-// MaxSchedIDs, IDs non-zero and distinct (ErrValue). Check order: fixed part
-// (ErrShort), n (ErrValue), exact length (ErrShort/ErrTrailing), IDs
-// (ErrValue). IDs beyond N are zero.
+// ParseSched decodes a SCHED payload: exact length 29 + 4n, 1 ≤ n ≤
+// MaxSchedIDs, IDs non-zero and distinct (ErrValue); the counts are any
+// u64. Check order: fixed part (ErrShort), n (ErrValue), exact length
+// (ErrShort/ErrTrailing), IDs (ErrValue). IDs beyond N are zero.
 func ParseSched(p []byte) (Sched, error) {
 	if len(p) < SchedFixedLen {
 		return Sched{}, ErrShort
 	}
-	n := int(p[4])
+	n := int(p[28])
 	if n < 1 || n > MaxSchedIDs {
 		return Sched{}, ErrValue
 	}
 	if err := exactTail(len(p)-SchedFixedLen, 4*n); err != nil {
 		return Sched{}, err
 	}
-	s := Sched{Epoch: binary.BigEndian.Uint32(p[0:4]), N: n}
+	s := Sched{
+		Epoch:    binary.BigEndian.Uint32(p[0:4]),
+		Death:    binary.BigEndian.Uint64(p[4:12]),
+		Quality:  binary.BigEndian.Uint64(p[12:20]),
+		Explicit: binary.BigEndian.Uint64(p[20:28]),
+		N:        n,
+	}
 	for i := range n {
 		id := binary.BigEndian.Uint32(p[SchedFixedLen+4*i:])
 		if id == 0 {

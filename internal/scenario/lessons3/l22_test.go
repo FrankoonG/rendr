@@ -187,9 +187,9 @@ func mustCarrier(t testing.TB, dc *rendr.Conn, name string) rendr.CarrierStatus 
 //     factory, which becomes active within one round trip.
 //
 // The dialer counts the quality switch and B's death; the passive ends up
-// routing over the dialer's active carrier. (Whether the passive counts the
-// same migrations depends on which SCHEDs reach it: see the rendr_findings
-// test TestSuccessorDeathCountedOnBothEnds_L22.)
+// routing over the dialer's active carrier. (That the passive counts the
+// same migrations whichever SCHEDs reach it is
+// TestSuccessorDeathCountedOnBothEnds_L22.)
 func TestSuccessorDiesFallsBackToPredecessor_L22(t *testing.T) {
 	t.Run("predecessor-retiring", func(t *testing.T) { successorDies(t, successorCase{}) })
 	t.Run("predecessor-retired", func(t *testing.T) { successorDies(t, successorCase{retired: true}) })
@@ -508,4 +508,46 @@ func TestRecoveredPathWinsAfterDwell_L22(t *testing.T) {
 		finishSession(t, dc, pc)
 		w.finish()
 	})
+}
+
+// TestSuccessorDeathCountedOnBothEnds_L22: the scenarios of
+// TestSuccessorDiesFallsBackToPredecessor_L22, checking that both ends
+// count the same selector migrations (design §7.6). The dialer counts
+// {Death: 1, Quality: 1}: the quality switch to B and B's death. Which
+// SCHEDs reach the passive depends on goroutine scheduling — A's writer
+// carries the quality SCHED only if it fills a batch before B's death step
+// publishes the next epoch, which then supersedes it — so each case fixes
+// the order with hooks:
+//
+//   - retiring-quality-sched-first: B's death step is held until A carried
+//     the quality SCHED; the passive applies it (B is already dead there),
+//     then the death SCHED naming A;
+//   - retiring-quality-sched-never-sent: A's writer is held across the
+//     switch and B's death, so the first SCHED A carries is the death SCHED
+//     naming A: the quality SCHED never reaches the passive;
+//   - retired-quality-sched-first: the quality SCHED reaches the passive
+//     (B dead there); the death SCHED names the race winner, a new carrier
+//     of a. Without hooks this order is the only one.
+//
+// Counting from the cause of each applied SCHED gave the passive {0, 0, 0},
+// {0, 0, 0} and {Death: 1}; no passive-side rule can learn of a quality
+// switch whose SCHED was never sent. The SCHED therefore carries the
+// dialer's cumulative selector migration counts (design §0.13 A3), and the
+// passive takes them from every SCHED it applies.
+func TestSuccessorDeathCountedOnBothEnds_L22(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sc   successorCase
+	}{
+		{"retiring-quality-sched-first", successorCase{order: schedFirst}},
+		{"retiring-quality-sched-never-sent", successorCase{order: schedNeverSent}},
+		{"retired-quality-sched-first", successorCase{retired: true, order: schedFirst}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dialer, passive := successorDies(t, tc.sc)
+			if !t.Failed() && passive != dialer {
+				t.Errorf("passive migrations %+v, dialer %+v: the ends disagree", passive, dialer)
+			}
+		})
+	}
 }

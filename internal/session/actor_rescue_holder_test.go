@@ -360,7 +360,11 @@ func rhHolderAlone(t *testing.T, passiveSends bool) {
 // 50 ms late, to p2 while p1 still has up to a window in flight; p1 keeps
 // delivering after the switch, and every DATA placement leaves the
 // receiver with nothing out of order and nothing dropped. Both directions:
-// the passive follows the dialer's SCHED.
+// the passive follows the dialer's SCHED. p1's 4 MiB/s bottleneck keeps a
+// queue on it whatever the phase of its capacity cycle, so p1 always has
+// frames on the way when the switch comes (without it, a capacity-limited
+// p1 writes its bursts into an unlimited pipe and, in half of each round
+// trip, has nothing left on the way; design §0.13 A1).
 func TestActorRescueSelectorStaysInOrder(t *testing.T) {
 	for _, passiveSends := range []bool{false, true} {
 		name := "dialer-sends"
@@ -385,6 +389,7 @@ func rhSelectorInOrder(t *testing.T, passiveSends bool) {
 	h.set(30*time.Millisecond, 0)
 	l1, l2 := w.link("p1"), w.link("p2")
 	l1.SetDelay(rhSlow, 0)
+	l1.SetRate(4 << 20)
 	a, b := w.open(ModeSelector, h, l1, l2)
 	first := acActive(a)
 	if first == 0 || a.Status().Carriers[0].Name != "p1" {

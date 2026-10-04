@@ -15,8 +15,9 @@ import (
 // it single-flight on one lane at a time until the passive echoes the
 // epoch in an ACK. The passive applies a newer epoch idempotently and
 // echoes it at once; when its sending lane dies or is retired it moves to
-// a local fallback first and follows the next epoch (routing only: only
-// the SCHED cause bits count migrations, P13).
+// a local fallback first and follows the next epoch (routing only: a
+// selector passive counts migrations only from the cumulative counts each
+// SCHED carries, P13, §0.13 A3).
 
 // publishSchedLocked (dialer) publishes the current data-eligible set —
 // the selector's active lane, or every bond member — with cause c as the
@@ -119,7 +120,37 @@ func (a *actor) applySchedLocked(now time.Time) {
 	ctl.cause = ctl.schedInCause
 	a.dirty = true
 	a.passiveRouteLocked(now)
+	if s.p.Mode != ModeBond {
+		a.followCountsLocked(now)
+	}
 	s.bumpAckLocked(true)
+}
+
+// followCountsLocked (passive selector) takes the dialer's cumulative
+// selector migration counts from the SCHED just applied (§7.6, P13, §0.13
+// A3). The passive cannot classify a dialer switch by itself, and counting
+// from the cause of each applied SCHED missed every SCHED superseded
+// before it reached the passive — lost with the carrier that died right
+// after it attached (L20), or never sent because the next publication came
+// first (L22) — so the ends disagreed. Every migration taken this way is
+// one Migration event, from the carrier the previous applied SCHED (or the
+// epoch-0 choice) named to the one this SCHED names.
+func (a *actor) followCountsLocked(now time.Time) {
+	ctl := &a.s.ctl
+	from, to := a.named, ctl.set.IDs[0]
+	a.followLocked(now, &ctl.migDeath, ctl.set.Death, from, to, wire.SchedDeath)
+	a.followLocked(now, &ctl.migQuality, ctl.set.Quality, from, to, wire.SchedQuality)
+	a.followLocked(now, &ctl.migExplicit, ctl.set.Explicit, from, to, wire.SchedExplicit)
+	a.named = to
+}
+
+// followLocked raises the passive counter *have to the dialer's count want,
+// one Migration event per migration.
+func (a *actor) followLocked(now time.Time, have *uint64, want uint64, from, to uint32, c wire.SchedCause) {
+	for ; *have < want; *have++ {
+		a.dirty = true
+		a.event(now, EventMigration, 0, from, to, schedEventCause(c), nil)
+	}
 }
 
 // schedLists reports whether set names carrier id.
@@ -138,10 +169,8 @@ func schedLists(set *wire.Sched, id uint32) bool {
 // lane. A lane leaving the set has its spans requeued, so reverse traffic
 // leaves it within one RTT (L45).
 //
-// Counting (§7.6, P13, C26): when the named lane becomes the sender and
-// differs from the previously named one, the SCHED's cause counts (death,
-// quality, explicit; initial never) — also when the named lane attached
-// later. A local fallback is routing only, so both ends count alike.
+// Routing only: a local fallback counts nothing, and the counts come with
+// the SCHED (followCountsLocked), so both ends count alike (§7.6, P13).
 func (a *actor) passiveRouteLocked(now time.Time) {
 	s := a.s
 	ctl := &s.ctl
@@ -186,11 +215,6 @@ func (a *actor) passiveRouteLocked(now time.Time) {
 		}
 		s.routingChangedLocked()
 		a.dirty = true
-	}
-	if named != nil && named.id != a.named {
-		from := a.named
-		a.named = named.id
-		a.countLocked(now, ctl.cause, from, named.id, schedEventCause(ctl.cause))
 	}
 }
 

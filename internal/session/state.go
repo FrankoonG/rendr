@@ -146,6 +146,7 @@ type stream struct {
 	ackFlags   uint8     // header flags the next ACK carries (FIN_DELIVERED, DONE)
 	ackDelayAt time.Time // armed ACK delay (zero: none); fired by the duty lane's writer timer, never by the actor
 	ackLane    *lane     // the ACK duty lane (D5); nil when no lane qualifies
+	gapLane    *lane     // bond receiver: a lane other than ackLane that delivered DATA beyond the in-order end; it carries every ACK too until out-of-order data is no longer held (§0.13 A4)
 	lastWin    int64     // the window last advertised: W at init, then OPEN/OPEN_ACK (openWindowLocked) and every ACK placed; below 64 KiB the actor re-advertises (D18, readvertiseLocked)
 	ackOnData  bool      // the next in-order DATA bumps an urgent ACK (a lane attached, L19)
 

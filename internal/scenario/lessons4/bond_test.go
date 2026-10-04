@@ -139,7 +139,10 @@ func bondAsym(t *testing.T, window int) {
 // embedder conn blocks after half a batch; its path stays healthy) —, and
 // "path" — the member's path stops delivering in both directions while its
 // conns keep accepting writes until the link buffer is full (L34's "a
-// stalled member that still accepts writes").
+// stalled member that still accepts writes"). There the receiver's ACK duty
+// stays on the stalled member, whose small writes never block; its ACKs
+// reach the dialer over the other member, which delivers DATA beyond the
+// gap (design §0.13 A4).
 func TestBondStalledMemberRecovers_L34(t *testing.T) {
 	for _, mode := range []string{"write", "path"} {
 		t.Run(mode, func(t *testing.T) {
@@ -291,14 +294,24 @@ func bondStall(t *testing.T, path bool) {
 		movedAt = fmt.Sprintf("+%v (%s)", moved.at.Sub(stallAt), mib(moved.got))
 	}
 	// The head is stuck since the receiver's last in-order delivery before
-	// the rescue; its ACK reaches the dialer within the ACK delay (20 ms)
-	// and one srtt, and the rescue clock (lastAdvance) starts there.
+	// the rescue, and the rescue clock (lastAdvance) starts when the ACK of
+	// that delivery reaches the dialer. With a stalled write the ACK duty
+	// moves off the blocked lane and the ACK arrives within the ACK delay
+	// (20 ms) and one srtt. With a stalled path the duty lane's writes never
+	// block: the ACK rides the other member, which carries it as soon as it
+	// delivers DATA beyond the gap — within one of its round trips — and
+	// then crosses that member's path (design §0.13 A4): 2·srtt of the
+	// rescuing member.
+	ackBy := 20*time.Millisecond + srtt
+	if path {
+		ackBy = 2 * slow.SRTT
+	}
 	last, _ := f.lastReadBefore(rescuedAt)
 	ds, ps := dc.Status(), pc.Status()
 	t.Logf("fast srtt %v, slow srtt %v: receiver at %s when stalled, stuck from +%v, rescue at +%v (bound %v), first delivery after it %s, %s at the release; dialer acked %s",
 		srtt, slow.SRTT, mib(stuckAt), last.at.Sub(stallAt), rescuedAt.Sub(stallAt), bound, movedAt, mib(stuck), mib(int64(ds.AckedBytes)))
-	if d := rescuedAt.Sub(last.at); d > bound+20*time.Millisecond+srtt {
-		t.Fatalf("the rescue left %v after the head got stuck, want within max(300 ms, 3·srtt) = %v (+ the ACK delay and one srtt for the ACK)", d, bound)
+	if d := rescuedAt.Sub(last.at); d > bound+ackBy {
+		t.Fatalf("the rescue left %v after the head got stuck, want within max(300 ms, 3·srtt) = %v plus %v for its ACK", d, bound, ackBy)
 	}
 	if fs, _ := carrierOf(ds, fast.ID); fs.RetxBytes != 0 {
 		t.Fatalf("the stalled holder sent its own duplicate while another data lane existed: %+v", fs)

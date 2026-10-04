@@ -502,6 +502,7 @@ func TestPayloadErrors_L44(t *testing.T) {
 	zeroSID := func(b []byte) []byte { clear(b[:16]); return b }
 	sched := func(n byte, ids ...uint32) []byte {
 		b := binary.BigEndian.AppendUint32(nil, 1)
+		b = append(b, make([]byte, 24)...) // the migration counts
 		b = append(b, n)
 		for _, id := range ids {
 			b = binary.BigEndian.AppendUint32(b, id)
@@ -561,6 +562,7 @@ func TestPayloadErrors_L44(t *testing.T) {
 		{"rst msg trailing", ErrTrailing, e(ParseRst([]byte{0, 0, 0, 1, 0, 'x'}))},
 		{"rst unknown code", nil, e(ParseRst([]byte{0, 0, 0xff, 0xff, 0}))},
 		{"sched short", ErrShort, e(ParseSched(make([]byte, 4)))},
+		{"sched counts short", ErrShort, e(ParseSched(make([]byte, SchedFixedLen-1)))},
 		{"sched n 0", ErrValue, e(ParseSched(sched(0)))},
 		{"sched n 17", ErrValue, e(ParseSched(sched(17, make([]uint32, 17)...)))},
 		{"sched ids short", ErrShort, e(ParseSched(sched(2, 1)))},
@@ -1039,9 +1041,9 @@ func TestWireLayout_L44(t *testing.T) {
 	// RST: code u32 · mlen u8 · msg
 	n = PutRst(buf, &Rst{Code: RstIdle, Msg: []byte("idle")})
 	check("RST", buf[:n], cat(be32(5), []byte{4}, []byte("idle")))
-	// SCHED: epoch u32 · n u8 · carrierID[n] u32
-	n = PutSched(buf, &Sched{Epoch: 0x01020304, N: 2, IDs: [MaxSchedIDs]uint32{7, 0x09080706}})
-	check("SCHED", buf[:n], cat(be32(0x01020304), []byte{2}, be32(7), be32(0x09080706)))
+	// SCHED: epoch u32 · death u64 · quality u64 · explicit u64 · n u8 · carrierID[n] u32
+	n = PutSched(buf, &Sched{Epoch: 0x01020304, Death: 5, Quality: 1 << 40, Explicit: 0x0a0b0c0d0e0f1011, N: 2, IDs: [MaxSchedIDs]uint32{7, 0x09080706}})
+	check("SCHED", buf[:n], cat(be32(0x01020304), be64(5), be64(1<<40), be64(0x0a0b0c0d0e0f1011), []byte{2}, be32(7), be32(0x09080706)))
 	// PING / PONG: id u32 · ts u64 · nonce u64 · pad (zero bytes); the
 	// destination's garbage is overwritten with zeros.
 	for i := range 40 {
@@ -1052,6 +1054,31 @@ func TestWireLayout_L44(t *testing.T) {
 	// CLOSE / GOAWAY: reason u8
 	n = PutReason(buf, uint8(CloseCapacity))
 	check("CLOSE", buf[:n], []byte{2})
+}
+
+// TestPrefaceFseq_L43 (design §0.13 A6): the first fseq of a carrier
+// direction is the CRC32C field of the PREFACE or PREFACE_ACK that opened
+// it, so carriers that differ in instance or carrier ID start elsewhere.
+func TestPrefaceFseq_L43(t *testing.T) {
+	seen := map[uint32]bool{}
+	for i, inst := range [][16]byte{gDialer, gPassive} {
+		for id := uint32(1); id <= 3; id++ {
+			b := make([]byte, PrefaceLen)
+			if i == 0 {
+				PutPreface(b, &Preface{Kind: KindStream, Instance: inst, CarrierID: id})
+			} else {
+				PutPrefaceAck(b, &PrefaceAck{Status: PrefaceOK, Instance: inst, CarrierID: id})
+			}
+			got := PrefaceFseq(b)
+			if want := CRC(b[:36]); got != want || got != binary.BigEndian.Uint32(b[36:40]) {
+				t.Fatalf("PrefaceFseq %#x, want the CRC field %#x", got, want)
+			}
+			seen[got] = true
+		}
+	}
+	if len(seen) != 6 {
+		t.Fatalf("%d distinct first fseqs for 6 prefaces", len(seen))
+	}
 }
 
 func TestSeqLessWraps(t *testing.T) {

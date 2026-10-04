@@ -131,6 +131,9 @@ func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 	if st.ackLane == l {
 		st.ackLane = nil
 	}
+	if st.gapLane == l {
+		st.gapLane = nil
+	}
 	requeued = s.requeueLocked(l)
 	if !st.ended {
 		s.bumpNowLocked() // re-ACK on a lane's death (L11), also moving the duty

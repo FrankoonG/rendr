@@ -40,8 +40,9 @@ const (
 	FinLen = 8
 	// RstFixedLen is the RST payload without its message.
 	RstFixedLen = 5
-	// SchedFixedLen is the SCHED payload without carrier IDs.
-	SchedFixedLen = 5
+	// SchedFixedLen is the SCHED payload without carrier IDs: epoch u32,
+	// the three migration counts u64 and n u8.
+	SchedFixedLen = 29
 	// PingFixedLen is the PING/PONG payload without padding.
 	PingFixedLen = 20
 	// ReasonLen is the exact CLOSE and GOAWAY payload size.
@@ -57,7 +58,10 @@ const (
 	// fits in 64 KiB.
 	MaxPingPad = 64<<10 - PingFixedLen
 
-	// FirstFseq is the fseq of the first frame in each direction of a carrier.
+	// FirstFseq is the conventional first fseq of test vectors and scripted
+	// peers. A carrier direction starts at PrefaceFseq of the PREFACE or
+	// PREFACE_ACK that opened it (design §0.13 A6) unless a test preset
+	// fixes it.
 	FirstFseq uint32 = 1
 	// SessionHandle is the handle every session frame uses in M1 (one
 	// session per carrier, chosen by the dialer, echoed by the passive).

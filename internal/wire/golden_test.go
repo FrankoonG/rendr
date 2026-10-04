@@ -151,7 +151,7 @@ func goldenVectors() []vector {
 		one := Sched{Epoch: 7, N: 1}
 		one.IDs[0] = gCarrier
 		add(frameVec("sched_n1_"+cname, TypeSched, uint8(cause), 6, SessionHandle, one))
-		all := Sched{Epoch: 0xffffffff, N: MaxSchedIDs}
+		all := Sched{Epoch: 0xffffffff, Death: 0x0102030405060708, Quality: 3, Explicit: 0xffffffffffffffff, N: MaxSchedIDs}
 		for i := range all.IDs {
 			all.IDs[i] = uint32(i + 1)
 		}

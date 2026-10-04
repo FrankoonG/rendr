@@ -93,7 +93,7 @@ var refRules = map[byte]headerRule{
 	0x11: {0x03, false, 16, 16},
 	0x12: {0, false, 8, 8},
 	0x13: {0, false, 5, 5 + 255},
-	0x14: {0x03, false, 9, 5 + 4*16},
+	0x14: {0x03, false, 29 + 4, 29 + 4*16}, // epoch, three u64 migration counts, n (§0.13 A3)
 	0x30: {0x01, true, 20, 64 << 10},
 	0x31: {0, true, 20, 64 << 10},
 	0x32: {0, true, 1, 1},

@@ -42,8 +42,10 @@ var (
 // order, design §5.1): ErrMajor answers VERSION and ErrFeature FEATURE, then
 // closes; every other error closes nc silently. Then ask gate; write
 // PREFACE_ACK; on OK read exactly one frame, which must be OPEN, JOIN or PING
-// with the Runtime's first fseq (Env.Presets.FirstFseq, 0 = wire.FirstFseq),
-// checking the header before reading or allocating anything sized by it.
+// with the first fseq of the dialer's direction (Env.Presets.FirstFseq when
+// preset, else the PREFACE's CRC field; our direction starts at our
+// PREFACE_ACK's, §0.13 A6), checking the header before reading or
+// allocating anything sized by it.
 // A PING first frame (probe carrier) is also recorded as the Conn's pending
 // PONG, so a sessionless carrier answers it as its first frame once
 // started. Every failure closes nc exactly once, on a guarded goroutine
@@ -129,7 +131,7 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 		return fail(fmt.Errorf("rendr: handshake: writing PREFACE_ACK: %w", err))
 	}
 
-	first := env.Presets.firstFseq()
+	first := env.Presets.fseqFrom(pb[:]) // the dialer's direction starts at its PREFACE's (§0.13 A6)
 	var hb [wire.HeaderLen]byte
 	if err := readFull(nc, hb[:]); err != nil {
 		return fail(fmt.Errorf("rendr: handshake: reading the first frame: %w", err))
@@ -176,6 +178,7 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 	}
 	c := newConn(env, nc, p.CarrierID, p.Instance, -1, "", false)
 	c.rd.fseq = first + 1
+	c.wr.fseq = env.Presets.fseqFrom(ab[:]) // ours starts at our PREFACE_ACK's
 	if h.Type == wire.TypePing {
 		c.st.pong, c.st.pongDue = hello.Ping, true
 	}
