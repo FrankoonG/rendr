@@ -1,4 +1,4 @@
-package msess_test
+package scenario
 
 // API-independent traffic helpers: they only use net.Conn / io interfaces.
 
@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -144,82 +142,6 @@ func offeredLoad(t *testing.T, r echoResult, rateKiB int, dur time.Duration) {
 	if r.sent < want {
 		t.Fatalf("offered load %d bytes, want >= %d (%d KiB/s for %s)", r.sent, want, rateKiB, dur)
 	}
-}
-
-// packetFlow sends pps datagrams for dur through c, probing IDENTP every
-// second.
-type packetResult struct {
-	gap        time.Duration   // longest reply gap (incl. trailing silence)
-	sent, lost int             // data datagrams sent / never answered
-	socks      map[string]bool // far-end sockets seen
-	tail       int             // data replies in the last tailWindow of the flow
-}
-
-const tailWindow = 2 * time.Second
-
-func packetFlow(c net.Conn, dur time.Duration, pps int, midway func()) packetResult {
-	var mu sync.Mutex
-	socks := map[string]bool{}
-	got := 0
-	last := time.Now()
-	var maxGap time.Duration
-	var replies []time.Time
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, 2048)
-		for {
-			n, err := c.Read(buf)
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			if strings.HasPrefix(string(buf[:n]), "IDENTP ") {
-				socks[strings.TrimPrefix(string(buf[:n]), "IDENTP ")] = true
-			} else {
-				if g := time.Since(last); g > maxGap {
-					maxGap = g
-				}
-				last = time.Now()
-				replies = append(replies, last)
-				got++
-			}
-			mu.Unlock()
-		}
-	}()
-	sent := 0
-	start := time.Now()
-	half := false
-	lastProbe := time.Time{}
-	for time.Since(start) < dur {
-		if time.Since(lastProbe) >= time.Second {
-			c.Write([]byte("IDENTP"))
-			lastProbe = time.Now()
-		}
-		c.Write([]byte(fmt.Sprintf("d%07d", sent)))
-		sent++
-		if !half && time.Since(start) > dur/2 && midway != nil {
-			half = true
-			midway()
-		}
-		time.Sleep(time.Second / time.Duration(pps))
-	}
-	end := time.Now()
-	time.Sleep(500 * time.Millisecond)
-	c.Close()
-	<-done
-	mu.Lock()
-	defer mu.Unlock()
-	if t := end.Sub(last); t > maxGap {
-		maxGap = t
-	}
-	tail := 0
-	for _, at := range replies {
-		if at.After(end.Add(-tailWindow)) && !at.After(end) {
-			tail++
-		}
-	}
-	return packetResult{gap: maxGap, sent: sent, lost: sent - got, socks: socks, tail: tail}
 }
 
 type prngReader struct{ x uint64 }
