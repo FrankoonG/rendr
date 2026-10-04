@@ -7,6 +7,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
@@ -37,12 +38,13 @@ func openTwoPaths(t *testing.T, e *env, m rendr.Mode) (a, b *path, dc, pc *rendr
 // only copies into the send buffer. Path a's dialer-side writes are
 // Hard-blocked (they ignore deadlines and Close, like a wedged embedder
 // conn) right before the application writes 32 KiB: Write returns (32768,
-// nil) at once. The bytes reach the passive through b — selector: a dies
-// with write_stall and the failover replays them on b; bond: b rescues the
-// stuck head (L34) — intact. Releasing a afterwards completes the stuck
-// carrier write late: it has no effect (a's blocked carrier never delivers
-// any DATA, no byte is delivered twice) and that carrier was closed exactly
-// once on each end.
+// nil) at once — in the bubble, after no time at all (the lesson's bound
+// is 1 s). The bytes reach the passive through b — selector: a dies with
+// write_stall and the failover replays them on b; bond: b rescues the
+// stuck head (L34) — intact. Releasing a afterwards lets the stuck carrier
+// write complete late: it has no effect — no DATA frame below the first
+// 32 KiB is dispatched again on any carrier, the stream arrives exactly
+// once, and the blocked carrier was closed exactly once on each end.
 func TestAppWriteDecoupledFromCarrierWrite_L17(t *testing.T) {
 	for _, m := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(m.String(), func(t *testing.T) {
@@ -58,8 +60,8 @@ func TestAppWriteDecoupledFromCarrierWrite_L17(t *testing.T) {
 				src.Read(p1)
 				start := time.Now()
 				n, err := dc.Write(p1)
-				if el := time.Since(start); n != first || err != nil || el > time.Second {
-					t.Fatalf("Write over a Hard-blocked carrier = (%d, %v) after %v, want (%d, nil) within 1 s", n, err, el, first)
+				if el := time.Since(start); n != first || err != nil || el != 0 {
+					t.Fatalf("Write over a Hard-blocked carrier = (%d, %v) after %v, want (%d, nil) at once", n, err, el, first)
 				}
 
 				// The bytes arrive through b, intact.
@@ -90,7 +92,10 @@ func TestAppWriteDecoupledFromCarrierWrite_L17(t *testing.T) {
 					}
 				}
 
-				// Release a: the stuck carrier write completes late.
+				// Release a: the stuck carrier write completes late. Everything below
+				// offset 32 KiB is acknowledged by then; nothing may resend it.
+				waitFor(t, time.Second, time.Millisecond, "32 KiB acknowledged", func() bool { return dc.Status().AckedBytes == first })
+				below := dataFramesBelow(first, a, b)
 				a.link.BlockWrites(rendrtest.Up, rendrtest.BlockOff)
 				synctest.Wait()
 				p2 := make([]byte, second)
@@ -105,14 +110,14 @@ func TestAppWriteDecoupledFromCarrierWrite_L17(t *testing.T) {
 					t.Fatalf("passive stream after the release: %v", err)
 				}
 				endClean(t, dc, pc)
+				if n := dataFramesBelow(first, a, b); n != below {
+					t.Fatalf("%d DATA frames below offset %d dispatched after the release (%d before it)", n-below, first, below)
+				}
 				// a's first session carrier is the blocked one (a later one is a
 				// bond member redialled after its death).
 				ds, ps := a.sessionConns(true), a.sessionConns(false)
 				if len(ds) == 0 || len(ps) == 0 {
 					t.Fatal("no session carrier on a")
-				}
-				if n := len(ps[0].in.list(wire.TypeData)); n != 0 {
-					t.Fatalf("the late write delivered %d DATA frames on a's blocked carrier", n)
 				}
 				if dn, pn := ds[0].closes.Load(), ps[0].closes.Load(); dn != 1 || pn != 1 {
 					t.Fatalf("a's blocked carrier closed %d times (dialer end) and %d times (passive end), want exactly once each", dn, pn)
@@ -124,22 +129,47 @@ func TestAppWriteDecoupledFromCarrierWrite_L17(t *testing.T) {
 }
 
 // TestWriteBeforeSlowReturn_L17 (L17): a carrier write hands its bytes to
-// the peer and then returns only 1 s later (below the stall window). The
-// application's Write under a 500 ms deadline succeeds at once; the peer
-// reads and acknowledges the bytes while the carrier write is still
-// blocked; when it returns, nothing was written twice (one DATA frame per
-// byte, no retransmission), no carrier died, and the session goes on.
-// Selector and bond.
+// the peer and then returns only hold = WriteStall/2 later (below the stall
+// window, so the carrier stays alive). The application's Write under a
+// 500 ms deadline succeeds at once. The peer application reads the bytes
+// at once (the acknowledgement arrives while the carrier write is still
+// blocked), or — so that a resend would be possible at all — only later:
+// in bond mode after the watchdog reported the write blocked (PingBusy) but
+// before a rescue could be due (RescueMin), in selector mode only after the
+// slow write returned. In every case nothing is written twice (one DATA
+// frame per byte on the wire, no retransmission), no carrier dies, nothing
+// migrates, and the session goes on intact.
 func TestWriteBeforeSlowReturn_L17(t *testing.T) {
-	for _, m := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
-		t.Run(m.String(), func(t *testing.T) {
+	const (
+		pingBusy   = 50 * time.Millisecond  // PingBusy: the watchdog reports a write blocked
+		writeStall = 2 * time.Second        // WriteStall: the watchdog kills the carrier
+		hold       = writeStall / 2         // the slow write returns this long after the hand-over
+		rescueMin  = 300 * time.Millisecond // RescueMin: the bond rescue floor (RescueWait at these RTTs)
+		ackDelay   = 20 * time.Millisecond  // AckDelay
+		maxOneWay  = 5 * time.Millisecond   // path b (openTwoPaths)
+	)
+	for _, tc := range []struct {
+		name string
+		mode rendr.Mode
+		read time.Duration // when the peer application reads, after the hand-over (≥ hold: once the write returned)
+	}{
+		{"selector, peer reads at once", rendr.ModeSelector, 0},
+		{"bond, peer reads at once", rendr.ModeBond, 0},
+		{"selector, peer reads after the write returned", rendr.ModeSelector, hold},
+		{"bond, peer reads while the write is reported blocked", rendr.ModeBond, 2 * pingBusy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.read > 0 && tc.read < hold && (tc.read <= pingBusy || tc.read+ackDelay+2*maxOneWay >= rescueMin) {
+				t.Fatal("test parameters: the read must follow the blocked report and acknowledge before a rescue is due")
+			}
 			synctest.Test(t, func(t *testing.T) {
-				e := newEnv(t, rendr.Config{}, rendr.Config{}, nil)
-				a, b, dc, pc := openTwoPaths(t, e, m)
+				cfg := rendr.Config{PingBusy: pingBusy, WriteStall: writeStall}
+				e := newEnv(t, cfg, cfg, &testhooks.Overrides{RescueMin: rescueMin, AckDelay: ackDelay})
+				a, b, dc, pc := openTwoPaths(t, e, tc.mode)
 				const seed, first, second = 171, 32768, 128 << 10
 				src := rendrtest.PRNG(seed)
 				v := rendrtest.NewVerifier(seed, first+second)
-				sw := newSlowWrite(time.Second)
+				sw := newSlowWrite(hold)
 				a.slow.Store(sw)
 				b.slow.Store(sw)
 
@@ -159,26 +189,40 @@ func TestWriteBeforeSlowReturn_L17(t *testing.T) {
 				}
 				handed := time.Now()
 
-				// The peer has the bytes and acknowledges them while the carrier
-				// write is still blocked.
+				// The peer reads at tc.read; until then nothing is acknowledged.
+				if tc.read >= hold {
+					select {
+					case <-sw.returned:
+					case <-time.After(2 * hold):
+						t.Fatal("the slow carrier write never returned")
+					}
+					synctest.Wait()
+				} else {
+					time.Sleep(time.Until(handed.Add(tc.read)))
+				}
+				if st := dc.Status(); st.AckedBytes != 0 {
+					t.Fatalf("stimulus: %d bytes acknowledged %v after the hand-over, before the peer read", st.AckedBytes, time.Since(handed))
+				}
 				pc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				got := make([]byte, first)
 				if _, err := io.ReadFull(pc, got); err != nil {
-					t.Fatalf("passive read during the slow write: %v", err)
+					t.Fatalf("passive read: %v", err)
 				}
 				if _, err := v.Write(got); err != nil {
 					t.Fatalf("passive stream: %v", err)
 				}
 				waitFor(t, 500*time.Millisecond, time.Millisecond, "acknowledged", func() bool { return dc.Status().AckedBytes == first })
-				select {
-				case <-sw.returned:
-					t.Fatalf("the carrier write returned before the acknowledgement (after %v)", time.Since(handed))
-				default:
-				}
-				select {
-				case <-sw.returned:
-				case <-time.After(2 * time.Second):
-					t.Fatal("the slow carrier write never returned")
+				if tc.read < hold {
+					select {
+					case <-sw.returned:
+						t.Fatalf("the carrier write returned before the acknowledgement (after %v)", time.Since(handed))
+					default:
+					}
+					select {
+					case <-sw.returned:
+					case <-time.After(2 * hold):
+						t.Fatal("the slow carrier write never returned")
+					}
 				}
 				synctest.Wait()
 

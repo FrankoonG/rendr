@@ -20,8 +20,10 @@ import (
 // and again right after the replacement attached, either once the passive
 // followed the replacement's SCHED or before that SCHED could reach it. It
 // survives both: the upload completes intact, the dialer received nothing
-// but control frames, and both ends count two death migrations (design
-// §7.6: "both ends count the same selector migrations").
+// but control frames, it rejoined twice and counted two death migrations
+// (and so did the passive once it followed). Whether the passive also
+// counts two when the second death beats the replacement's SCHED is L20's
+// rule ("两端都计数迁移"), asserted by TestRedialAfterFailures_L20.
 func TestUploadOnlySurvivesDeaths_L19(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -74,15 +76,11 @@ func TestUploadOnlySurvivesDeaths_L19(t *testing.T) {
 				if ds.State != rendr.StateOpen || ps.State != rendr.StateOpen || ds.Rejoins != 2 || a.link.Stats().Session.Killed != 2 {
 					t.Fatalf("after two deaths: dialer %+v, passive %+v, killed %d", ds, ps, a.link.Stats().Session.Killed)
 				}
-				if ds.Migrations.Death != 2 || ps.Migrations.Death != 2 {
-					why := ""
-					if !tc.followed {
-						why = "; the passive counts one migration per SCHED it applies, and the SCHED naming the" +
-							" replacement was lost with it and superseded before the passive applied it"
-					}
-					t.Errorf("death migrations: dialer %d, passive %d; want 2 on both ends (design §7.6: both ends"+
-						" count the same selector migrations)%s", ds.Migrations.Death, ps.Migrations.Death, why)
+				if ds.Migrations.Death != 2 || (tc.followed && ps.Migrations.Death != 2) {
+					t.Fatalf("death migrations: dialer %d, passive %d; want 2 on the dialer (and on the passive, which"+
+						" applied both SCHEDs)", ds.Migrations.Death, ps.Migrations.Death)
 				}
+				t.Logf("death migrations: dialer %d, passive %d", ds.Migrations.Death, ps.Migrations.Death)
 				endClean(t, dc, pc)
 				e.close()
 			})
@@ -131,14 +129,15 @@ func TestIdleSurvivesRepeatedDeaths_L19(t *testing.T) {
 // TestUnknownSessionIsSessionLost_L19 (L19): the bound instance forgets the
 // session while the dialer is cut off — the passive's IdleTimeout ends it,
 // its tombstone remains — and the dialer, still inside its 60 s grace,
-// redials. The JOIN is answered UNKNOWN_SESSION and the session ends with
+// redials (jitter fixed at its mean, so the redial times are reproducible).
+// The JOIN is answered UNKNOWN_SESSION and the session ends with
 // ErrSessionLost within one RTT of that redial's start, without waiting for
 // the grace.
 func TestUnknownSessionIsSessionLost_L19(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
 		var starts []time.Time
-		dov := &testhooks.Overrides{Hooks: &testhooks.Hooks{DialStart: func(int) {
+		dov := &testhooks.Overrides{Rand: func() float64 { return 0.5 }, Hooks: &testhooks.Hooks{DialStart: func(int) {
 			mu.Lock()
 			starts = append(starts, time.Now())
 			mu.Unlock()
@@ -211,12 +210,15 @@ func TestUnknownSessionIsSessionLost_L19(t *testing.T) {
 // its place behind the same path. When the session has no live carrier
 // left, its redial reaches the new instance and the session ends with
 // ErrSessionLost at once (one RTT after the death), not at the grace. When
-// it still has a live carrier to the original instance (bond), only the
-// mismatched carrier is closed and the session carries on intact.
+// it still has a live carrier to the original instance (bond), each of the
+// member slot's redials that reaches the new instance is closed (exactly
+// once) and the session carries on intact. The new instance never admits a
+// session. Redial jitter is fixed at its mean.
 func TestPeerRestartFastFail_L19(t *testing.T) {
+	ov := &testhooks.Overrides{Rand: func() float64 { return 0.5 }}
 	t.Run("no live carrier", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			e := newEnv(t, rendr.Config{}, rendr.Config{}, nil)
+			e := newEnv(t, rendr.Config{}, rendr.Config{}, ov)
 			const oneWay = 5 * time.Millisecond
 			a := e.path("a", oneWay)
 			dc, pc := e.open(e.peer(a), rendr.DialOptions{})
@@ -232,30 +234,38 @@ func TestPeerRestartFastFail_L19(t *testing.T) {
 			if !isTerminal(r.err, rendr.ErrSessionLost) || r.at.Sub(t0) > 2*oneWay+time.Millisecond {
 				t.Fatalf("Read = %v after %v, want ErrSessionLost within one RTT (grace 15 s)", r.err, r.at.Sub(t0))
 			}
-			if reached.Load() < 1 {
-				t.Fatal("stimulus: no redial reached the new instance")
+			if reached.Load() < 1 || len(a.sessionConns(true)) != 2 {
+				t.Fatalf("stimulus: %d carriers reached the new instance, %d session carriers on a", reached.Load(), len(a.sessionConns(true)))
 			}
 			if st := dc.Status(); st.State != rendr.StateEnded || st.NoPathEpisodes != 1 {
 				t.Fatalf("dialer status %+v", st)
 			}
-			p2.Close()
 			synctest.Wait()
-			noState(t, "restarted passive", p2)
 			if st := p2.Status(); st.Sessions != (rendr.SessionCounts{}) {
 				t.Fatalf("the new instance admitted a session: %+v", st.Sessions)
 			}
+			p2.Close()
+			synctest.Wait()
+			noState(t, "restarted passive", p2)
 			e.close()
+			if dn, pn := a.sessionConns(true)[1].closes.Load(), a.sessionConns(false)[1].closes.Load(); dn != 1 || pn != 1 {
+				t.Fatalf("the redial into the new instance closed %d times (dialer end) and %d times (its end), want once each", dn, pn)
+			}
 		})
 	})
 	t.Run("old instance still reachable", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			e := newEnv(t, rendr.Config{}, rendr.Config{}, nil)
+			e := newEnv(t, rendr.Config{}, rendr.Config{}, ov)
 			a := e.path("a", time.Millisecond)
 			b := e.path("b", time.Millisecond)
 			dc, pc := e.open(e.peer(a, b), rendr.DialOptions{Mode: rendr.ModeBond})
 			waitFor(t, 5*time.Second, time.Millisecond, "two members", func() bool { return len(liveOf(dc.Status(), "")) == 2 })
 
-			p2, reached := restarted(t, e, b)
+			old := len(b.sessionConns(true)) // b's member to the original instance
+			if old != 1 {
+				t.Fatalf("%d session carriers on b before the restart, want its member", old)
+			}
+			p2, _ := restarted(t, e, b)
 			if n := b.link.Kill(); n < 1 {
 				t.Fatalf("Kill killed %d carriers", n)
 			}
@@ -267,8 +277,9 @@ func TestPeerRestartFastFail_L19(t *testing.T) {
 			up := startXfer(dc, pc, vol, 195)
 			down := startXfer(pc, dc, vol, 196)
 			time.Sleep(3 * time.Second) // b's member slot redials several times into the new instance
-			if n := reached.Load(); n < 2 {
-				t.Fatalf("stimulus: %d carriers reached the new instance", n)
+			mismatched := b.sessionConns(true)[old:]
+			if len(mismatched) < 2 {
+				t.Fatalf("stimulus: %d session redials of b reached the new instance", len(mismatched))
 			}
 			st := dc.Status()
 			if st.State != rendr.StateOpen || len(liveOf(st, "a")) != 1 || len(liveOf(st, "b")) != 0 || up.got.Load() >= vol {
@@ -277,10 +288,24 @@ func TestPeerRestartFastFail_L19(t *testing.T) {
 			up.wait(t, 30*time.Second)
 			down.wait(t, 30*time.Second)
 			endClean(t, dc, pc)
+			synctest.Wait()
+			if st := p2.Status(); st.Sessions != (rendr.SessionCounts{}) {
+				t.Fatalf("the new instance admitted a session: %+v", st.Sessions)
+			}
 			p2.Close()
 			synctest.Wait()
 			noState(t, "restarted passive", p2)
 			e.close()
+			ds, ps := b.sessionConns(true)[old:], b.sessionConns(false)[old:]
+			if len(ds) != len(ps) {
+				t.Fatalf("b's redials: %d dialer ends, %d ends at the new instance", len(ds), len(ps))
+			}
+			for i := range ds {
+				if dn, pn := ds[i].closes.Load(), ps[i].closes.Load(); dn != 1 || pn != 1 {
+					t.Fatalf("b's redial %d into the new instance closed %d times (dialer end) and %d times (its end), want once each", i+1, dn, pn)
+				}
+			}
+			t.Logf("%d of b's redials reached the new instance", len(ds))
 		})
 	})
 }

@@ -30,7 +30,7 @@ func TestNoPathGraceExpiry_L18(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const grace, win = 200 * time.Millisecond, 256 << 10
 		cfg := rendr.Config{Window: win}
-		e := newEnv(t, cfg, cfg, &testhooks.Overrides{NoPathGrace: grace})
+		e := newEnv(t, cfg, cfg, &testhooks.Overrides{NoPathGrace: grace, Rand: func() float64 { return 0.5 }})
 		a := e.path("a", time.Millisecond)
 		dc, pc := e.open(e.peer(a), rendr.DialOptions{})
 
@@ -175,16 +175,27 @@ func TestNoPathRecoveryBeforeGrace_L18(t *testing.T) {
 }
 
 // TestNoPathEpisodesFreshBudget_L18 (L18): every no-path episode gets the
-// full grace, counted from the death of the last carrier. With the default
-// NoPathGrace (15 s) and t the death time of the first outage: outage at
+// full grace, counted from the death of the last carrier. With NoPathGrace
+// 15 s (the default) and t the death time of the first outage: outage at
 // t = 0, recovery at t = 10 s, a second outage at t = 11 s; at t = 24 s the
 // session is still open (a budget shared with the first episode would have
-// run out at 15 s or 16 s), and at t = 26 s — 15 s after the second death —
-// it ends with ErrNoPath. The first redial of each episode starts at the
-// death and waits in the factory; data crosses the recovery intact.
+// run out at 15 s or 16 s), and at t = 26 s — the grace after the second
+// death — it ends with ErrNoPath. The first redial of each episode starts
+// at its death and waits in the factory (DialTimeout raised to a minute so
+// that it outlasts both episodes); data crosses the recovery intact.
 func TestNoPathEpisodesFreshBudget_L18(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		e := newEnv(t, rendr.Config{}, rendr.Config{}, &testhooks.Overrides{DialTimeout: time.Minute})
+		const (
+			grace   = 15 * time.Second // NoPathGrace (the default, set explicitly)
+			healAt  = 10 * time.Second // the first outage ends
+			again   = 11 * time.Second // the second outage starts
+			checkAt = again + grace - 2*time.Second
+		)
+		if checkAt <= grace+again-healAt {
+			t.Fatal("test parameters: the check must come after any budget shared with the first episode ran out")
+		}
+		cfg := rendr.Config{NoPathGrace: grace}
+		e := newEnv(t, cfg, cfg, &testhooks.Overrides{DialTimeout: time.Minute})
 		a := e.path("a", time.Millisecond)
 		var gate atomic.Pointer[chan struct{}]
 		a.gate = func(ctx context.Context, _ int64, _ []byte) error {
@@ -217,9 +228,9 @@ func TestNoPathEpisodesFreshBudget_L18(t *testing.T) {
 		defer up()
 
 		t0 := down() // t = 0
-		time.Sleep(10 * time.Second)
+		time.Sleep(time.Until(t0.Add(healAt)))
 		if st := dc.Status(); st.State != rendr.StateOpen || !st.InNoPath || st.NoPathEpisodes != 1 {
-			t.Fatalf("t = 10 s, first outage: %+v", st)
+			t.Fatalf("t = %v, first outage: %+v", healAt, st)
 		}
 		if cs := a.callsSince(t0, 0); len(cs) != 1 || !cs[0].at.Equal(t0) {
 			t.Fatalf("redials in the first episode: %+v, want one, started at the death", cs)
@@ -228,23 +239,26 @@ func TestNoPathEpisodesFreshBudget_L18(t *testing.T) {
 		waitFor(t, 100*time.Millisecond, time.Millisecond, "recovery", func() bool { return !dc.Status().InNoPath })
 		exchange(t, dc, pc, 256<<10, 3)
 
-		time.Sleep(time.Until(t0.Add(11 * time.Second)))
+		time.Sleep(time.Until(t0.Add(again)))
 		t1 := down() // t = 11 s
 		rres := goOp(func() (int, error) { return dc.Read(make([]byte, 1)) })
-		time.Sleep(time.Until(t0.Add(24 * time.Second)))
+		time.Sleep(time.Until(t0.Add(checkAt)))
 		if st := dc.Status(); st.State != rendr.StateOpen || !st.InNoPath || st.NoPathEpisodes != 2 || !running(rres) {
-			t.Fatalf("t = 24 s, second outage: %+v", st)
+			t.Fatalf("t = %v, second outage: %+v", checkAt, st)
+		}
+		if cs := a.callsSince(t1, 0); len(cs) != 1 || !cs[0].at.Equal(t1) {
+			t.Fatalf("redials in the second episode: %+v, want one, started at the death (t = %v)", cs, again)
 		}
 		r := await(t, rres, 3*time.Second, "Read at the second episode's expiry")
-		if !isTerminal(r.err, rendr.ErrNoPath) || !r.at.Equal(t1.Add(15*time.Second)) {
-			t.Fatalf("Read returned %v at t = %v, want ErrNoPath at t = 26 s", r.err, r.at.Sub(t0))
+		if !isTerminal(r.err, rendr.ErrNoPath) || !r.at.Equal(t1.Add(grace)) {
+			t.Fatalf("Read returned %v at t = %v, want ErrNoPath at t = %v", r.err, r.at.Sub(t0), again+grace)
 		}
 		ns, ne := e.dev.of(rendr.EventNoPathStart), e.dev.of(rendr.EventNoPathEnd)
-		if len(ns) != 2 || !ns[0].Time.Equal(t0) || !ns[1].Time.Equal(t1) || len(ne) != 1 || ne[0].Time.Sub(t0) > 10*time.Second+10*time.Millisecond {
+		if len(ns) != 2 || !ns[0].Time.Equal(t0) || !ns[1].Time.Equal(t1) || len(ne) != 1 || ne[0].Time.Sub(t0) > healAt+10*time.Millisecond {
 			t.Fatalf("episodes: starts %+v, ends %+v", ns, ne)
 		}
 		if st := dc.Status(); st.State != rendr.StateEnded || !isTerminal(st.Err, rendr.ErrNoPath) || st.NoPathEpisodes != 2 {
-			t.Fatalf("t = 26 s: %+v", st)
+			t.Fatalf("t = %v: %+v", again+grace, st)
 		}
 		if k := a.link.Stats().Session.Killed; k != 2 {
 			t.Fatalf("stimulus: %d session carriers killed", k)
@@ -258,16 +272,17 @@ func TestNoPathEpisodesFreshBudget_L18(t *testing.T) {
 // grace counted from the last frame: the outage swallows the dialer's next
 // idle PING right before it ends, so the death is judged DeadMin after
 // that PING — about PingIdle + DeadMin after the last frame received and
-// after the path came back. With the default grace and with the minimum
-// grace (3 s) the session survives: the first reconnect starts at the
-// death judgment (the grace counts from there) and attaches one RTT later;
-// data then crosses intact.
+// after the path came back. With the default grace (15 s) and with the
+// minimum grace (3 s) the session survives: the first reconnect starts at
+// the death judgment (the grace counts from there) and attaches one RTT
+// later; data then crosses intact. PingIdle and DeadMin are set explicitly
+// to their defaults; every bound derives from them.
 func TestIdleOutageWorstPhaseSurvives_L18(t *testing.T) {
 	for _, g := range []struct {
 		name  string
-		grace time.Duration // 0: the Runtime's default, 15 s
+		grace time.Duration
 	}{
-		{"default grace", 0},
+		{"default grace", 15 * time.Second},
 		{"minimum grace", 3 * time.Second},
 	} {
 		t.Run(g.name, func(t *testing.T) {
@@ -279,17 +294,18 @@ func TestIdleOutageWorstPhaseSurvives_L18(t *testing.T) {
 					starts = append(starts, time.Now())
 					mu.Unlock()
 				}}}
-				e := newEnvSplit(t, rendr.Config{}, rendr.Config{}, dov, nil)
 				const oneWay, pingIdle, deadMin = time.Millisecond, 10 * time.Second, 3 * time.Second
+				cfg := rendr.Config{PingIdle: pingIdle, DeadMin: deadMin}
+				e := newEnvSplit(t, cfg, cfg, dov, nil)
 				a := e.path("a", oneWay)
 				dc, pc := e.open(e.peer(a), rendr.DialOptions{NoPathGrace: g.grace})
 				dconn := a.sessionConns(true)[0]
 
 				// Idle: each end PINGs every PingIdle from its carrier's start.
-				time.Sleep(25 * time.Second)
+				time.Sleep(2*pingIdle + pingIdle/2)
 				pings := dconn.out.list(wire.TypePing)
 				if len(pings) < 3 {
-					t.Fatalf("%d dialer PINGs in 25 idle seconds", len(pings))
+					t.Fatalf("%d dialer PINGs in %v idle", len(pings), 2*pingIdle+pingIdle/2)
 				}
 				last, prev := pings[len(pings)-1].at, pings[len(pings)-2].at
 				if last.Sub(prev) != pingIdle {
@@ -420,23 +436,28 @@ func TestConcurrentDeathsNeverEOF_L18(t *testing.T) {
 // TestDialAllFactoriesFail_L18 (L18): Dial over four factories that all
 // fail — one refuses, one hangs until its context ends, one reaches a
 // blackholed path, one reaches a non-rendr endpoint — returns ErrNoPath
-// (errors.Is, wrapping the last carrier error, not a timeout) once
-// NoPathGrace has passed since the opening race started (after the cold
-// start's probe wait), and not earlier. Every factory got at least one
-// OPEN attempt (stimulus); neither Runtime keeps any state of the session.
+// (errors.Is, wrapping the last carrier error, not a timeout) exactly
+// NoPathGrace after the opening race started, and not earlier. The race
+// starts once the cold start's probe wait ends: the hanging and the
+// blackholed factory give neither a probe sample nor a failure, so Dial
+// waits the whole Probe.DialWait first (design §6.6, §7.8). Every factory
+// got at least one OPEN attempt, each failing its own way (stimulus);
+// neither Runtime keeps any state of the session.
 func TestDialAllFactoriesFail_L18(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const grace, dialWait = 3 * time.Second, 800 * time.Millisecond
-		e := newEnv(t, rendr.Config{JoinStagger: 100 * time.Millisecond}, rendr.Config{}, nil)
+		const grace, dialWait = 3 * time.Second, 800 * time.Millisecond // NoPathGrace; Probe.DialWait (the default, set explicitly)
+		dcfg := rendr.Config{JoinStagger: 100 * time.Millisecond, Probe: rendr.ProbePolicy{DialWait: dialWait}}
+		e := newEnv(t, dcfg, rendr.Config{}, &testhooks.Overrides{Rand: func() float64 { return 0.5 }})
 		refused := e.path("refused", time.Millisecond)
 		refused.link.SetRefuse(true)
 		hangs := e.path("hangs", time.Millisecond)
 		hangs.link.SetDial(rendrtest.DialHang)
 		hole := e.path("blackholed", time.Millisecond)
 		hole.link.SetBlackhole(true)
-		junk := e.path("not-rendr", time.Millisecond)
-		junk.setFar(nonRendr)
-		ps := []*path{refused, hangs, hole, junk}
+		notRendr := e.path("not-rendr", time.Millisecond)
+		junk := new(junkEnd)
+		notRendr.setFar(junk.accept)
+		ps := []*path{refused, hangs, hole, notRendr}
 		for _, p := range ps {
 			p.early = true
 		}
@@ -444,17 +465,34 @@ func TestDialAllFactoriesFail_L18(t *testing.T) {
 
 		start := time.Now()
 		c, err := peer.Dial(context.Background(), rendr.DialOptions{NoPathGrace: grace})
-		el := time.Since(start)
+		failed := time.Now()
 		if c != nil || !isTerminal(err, rendr.ErrNoPath) || !strings.Contains(err.Error(), "last carrier error") {
 			t.Fatalf("Dial = %v, %v; want ErrNoPath wrapping the last carrier error", c, err)
 		}
-		if el < grace || el > grace+dialWait+10*time.Millisecond {
-			t.Fatalf("Dial failed after %v, want within [%v, %v]", el, grace, grace+dialWait)
-		}
+		var race time.Time // the first OPEN attempt: the opening race's start
 		for _, p := range ps {
-			if n := len(p.callsSince(start, wire.TypeOpen)); n < 1 {
+			cs := p.callsSince(start, wire.TypeOpen)
+			if len(cs) < 1 {
 				t.Fatalf("stimulus: no OPEN attempt on %s (calls %d)", p.name, p.calls.Load())
 			}
+			if race.IsZero() || cs[0].at.Before(race) {
+				race = cs[0].at
+			}
+		}
+		if d := race.Sub(start); d != dialWait {
+			t.Fatalf("the opening race started %v after Dial, want after the cold start's probe wait (%v)", d, dialWait)
+		}
+		if d := failed.Sub(race); d != grace {
+			t.Fatalf("Dial failed %v after the opening race started (%v after the call), want exactly NoPathGrace (%v)", d, failed.Sub(start), grace)
+		}
+		if st := refused.link.Stats(); st.DialFailures < 1 {
+			t.Fatalf("stimulus: refused path: %+v", st)
+		}
+		if st := hole.link.Stats(); st.Session.Dropped == 0 {
+			t.Fatalf("stimulus: no OPEN bytes swallowed by the blackhole: %+v", st)
+		}
+		if n := junk.open.Load(); n < 1 {
+			t.Fatalf("stimulus: %d OPENs answered by the non-rendr endpoint", n)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()

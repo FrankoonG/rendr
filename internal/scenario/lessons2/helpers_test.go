@@ -527,6 +527,20 @@ func (t *tap) lastBefore(t0 time.Time) (frameRec, bool) {
 	return frameRec{}, false
 }
 
+// dataFramesBelow counts the DATA frames the dialer wrote on the session
+// carriers of ps whose stream offset is below end.
+func dataFramesBelow(end uint64, ps ...*path) int {
+	n := 0
+	for _, p := range ps {
+		for _, f := range p.sent(wire.TypeData) {
+			if f.off < end {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // dataBytes sums the stream bytes of DATA frames (payload minus the offset).
 func dataBytes(fs []frameRec) int64 {
 	var n int64
@@ -867,14 +881,31 @@ func isTerminal(err, want error) bool {
 // errRefused is a factory failure (a refused connection).
 var errRefused = errors.New("lessons2: connection refused")
 
-// nonRendr is a far end that is not a rendr instance: it reads what the
-// dialer sends and answers with an HTTP error, then closes (L20).
-func nonRendr(c net.Conn) error {
+// junkEnd is a far end that is not a rendr instance (L20: a misconfigured
+// forwarding): it reads the first bytes a dialer sends, answers with an
+// HTTP error and closes. It counts the carriers that reached it by the
+// type of their first frame (the byte after the 40-byte PREFACE), so a
+// test can prove which attempts it refused.
+type junkEnd struct{ open, join, ping atomic.Int64 }
+
+// accept is the far end's Accept.
+func (j *junkEnd) accept(c net.Conn) error {
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 64)
-	if _, err := c.Read(buf); err != nil {
+	n, err := c.Read(buf)
+	if err != nil {
 		return nil
+	}
+	if n > wire.PrefaceLen {
+		switch wire.Type(buf[wire.PrefaceLen]) {
+		case wire.TypeOpen:
+			j.open.Add(1)
+		case wire.TypeJoin:
+			j.join.Add(1)
+		case wire.TypePing:
+			j.ping.Add(1)
+		}
 	}
 	c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 	return nil
