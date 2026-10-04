@@ -148,7 +148,36 @@ func (t Type) Known() bool {
 
 // String returns the frame type name ("OPEN", "ACK", ...) or "0xNN".
 func (t Type) String() string {
-	panic("unimplemented: M1b")
+	switch t {
+	case TypeOpen:
+		return "OPEN"
+	case TypeOpenAck:
+		return "OPEN_ACK"
+	case TypeJoin:
+		return "JOIN"
+	case TypeJoinAck:
+		return "JOIN_ACK"
+	case TypeData:
+		return "DATA"
+	case TypeAck:
+		return "ACK"
+	case TypeFin:
+		return "FIN"
+	case TypeRst:
+		return "RST"
+	case TypeSched:
+		return "SCHED"
+	case TypePing:
+		return "PING"
+	case TypePong:
+		return "PONG"
+	case TypeClose:
+		return "CLOSE"
+	case TypeGoAway:
+		return "GOAWAY"
+	}
+	const hex = "0123456789abcdef"
+	return string([]byte{'0', 'x', hex[t>>4], hex[t&0x0f]})
 }
 
 // Header flag bits. Undefined bits must be 0 (ErrFlags). Bits are per type.
