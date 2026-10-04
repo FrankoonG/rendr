@@ -895,8 +895,10 @@ func TestStreamDiscardShedsDuringReadCopy(t *testing.T) {
 // resolved as the actor's rescue resolves it: the lane holding the stuck
 // head is found and the other lane sends the duplicate. The receiver reads
 // the whole stream byte-exact, every byte is acknowledged and every buffer
-// returns. (Recovery needs a lane other than the holder; while the holder is
-// the only data lane, nothing resends its dropped bytes.)
+// returns. (Here a lane other than the holder recovers each stall; when the
+// holder is the only data lane and interleaved DATA is unacknowledged, the
+// holder resends its own head: TestStreamRescueHolderAlone_L34,
+// TestActorRescueHolderAlone_L34.)
 func TestStreamOOODropsRecoveredByRescue(t *testing.T) {
 	const (
 		w     = 256 << 10

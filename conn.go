@@ -48,6 +48,9 @@ func (c *Conn) Write(p []byte) (int, error) { return c.s.Write(p) }
 // blocked calls return net.ErrClosed; the session delivers what was written
 // and finishes in the background within Linger, or resets the peer
 // (AbortClosed if the peer keeps sending, AbortLinger at expiry).
+// Runtime.Close resets a closed session that has not finished yet: for a
+// clean end, wait until Status().State is StateEnded (Err io.EOF) before
+// closing the Runtime.
 func (c *Conn) Close() error { return c.s.Close() }
 
 // CloseWrite sends one FIN after everything written so far (idempotent);

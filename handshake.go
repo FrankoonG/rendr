@@ -18,9 +18,14 @@ import (
 //	    released → OPEN: admitOpen; JOIN: admitJoin; PING: sessionless →
 //	    a carrier the admission refused is awaited until it is done
 //
-// The slot covers only the network reads: it is released right after the
-// first frame, never held while waiting for the application or for a
-// refusal to be written.
+// The slot covers the network reads and ReadHello's own PREFACE_ACK
+// refusals (VERSION, FEATURE, the gate's CAPACITY or GOING_AWAY), which are
+// written and closed inline, bounded by the handshake deadline (the drain
+// by at most 1 s of it); on a conn that ignores its deadlines the conn is
+// closed as the last resort 1 s + AbandonWait after that deadline (design
+// §0.8 V2, §0.9 X5). It is released right after the first frame, never
+// held while waiting for the application or for an admission refusal to be
+// written.
 
 // startHandshake runs the handshake of nc, accepted at at, on its own
 // goroutine; the caller already counted it in rt.hsg. It never blocks on

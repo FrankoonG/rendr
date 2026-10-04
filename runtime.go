@@ -187,8 +187,10 @@ func (rt *Runtime) Status() Status {
 
 // Close shuts the Runtime down (idempotent, bounded): new handshakes are
 // answered PREFACE_ACK(GOING_AWAY); every Listener closes; every pending
-// session is answered GOING_AWAY; every open session sends RST(AbortGoingAway)
-// and GOAWAY and ends locally with net.ErrClosed; every Peer stops probing;
+// session is answered GOING_AWAY; every open session that has not ended —
+// one whose application called Close and that is still finishing in the
+// background included — sends RST(AbortGoingAway) and GOAWAY and ends
+// locally with net.ErrClosed; every Peer stops probing;
 // sessionless carriers get GOAWAY; an admission refusal still being written
 // gets the close bound, min(1 s, DeadMax), and is then cut; then every
 // goroutine is joined within about 2 s, and stragglers stuck in embedder code

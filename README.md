@@ -149,6 +149,12 @@ Semantics in brief:
   `ErrIdleTimeout`. Deadlines behave as for any `net.Conn`.
 - `Close` returns at once; written data is still delivered in the background
   within `Linger`. `CloseWrite` sends a FIN and keeps reading.
+- `Runtime.Close` resets every session that has not ended, including closed
+  ones still finishing in the background (they end with `net.ErrClosed`, the
+  peer's with `*AbortError`). For a clean end on both sides, call `Close`
+  once `Read` returned `io.EOF` and wait until `Status().State` is
+  `StateEnded` (`Err` is `io.EOF`) before `Runtime.Close`, as
+  [`examples/mtls`](examples/mtls) does.
 - Selector mode keeps one active carrier, fails over on carrier death and
   switches for quality only on probe evidence, with hysteresis (band, dwell,
   cooldown). Bond mode sends on all carriers in proportion to their measured

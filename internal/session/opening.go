@@ -475,9 +475,11 @@ func (a *actor) killEst(est *carrier.Established, cause carrier.Cause, detail st
 // AbandonWait unless its own goroutine is stuck in an embedder call:
 // GuardedDial and Establish leave a stuck helper goroutine of theirs (the
 // factory call, the hello writer) behind and count it in the abandoned
-// pool themselves, AbandonWait after the cancellation. Abandoning the
-// attempt at that same instant would count one stuck call twice, so the
-// actor waits twice as long (as the health layer's wind-down does).
+// pool themselves — GuardedDial dialGrace (≤ AbandonWait) after the
+// cancellation, before the attempt returns; Establish's hello writer
+// AbandonWait after it. Abandoning the attempt at that last instant would
+// count one stuck call twice, so the actor waits twice as long (as the
+// health layer's wind-down does).
 func (a *actor) cancelAttemptsLocked(now time.Time) {
 	d := a.d
 	d.raceOn = false
