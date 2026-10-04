@@ -1,5 +1,7 @@
 package wire
 
+import "encoding/binary"
+
 // Preface is a dialer PREFACE (40 bytes, not a frame):
 //
 //	"RND2" | major u8 | minor u8 | kind u8 | role u8 (=1) | req u32 | opt u32 |
@@ -28,13 +30,29 @@ type PrefaceAck struct {
 // CRC) into b[:PrefaceLen]. It panics if len(b) < PrefaceLen (programming
 // error).
 func PutPreface(b []byte, p *Preface) {
-	panic("unimplemented: M1b")
+	putPreface(b, p.Minor, uint8(p.Kind), RoleDialer, p.Req, p.Opt, &p.Instance, p.CarrierID)
 }
 
 // PutPrefaceAck writes exactly PrefaceLen bytes of a (major Major, role
 // passive, CRC) into b[:PrefaceLen]. It panics if len(b) < PrefaceLen.
 func PutPrefaceAck(b []byte, a *PrefaceAck) {
-	panic("unimplemented: M1b")
+	putPreface(b, a.Minor, uint8(a.Status), RolePassive, a.Req, a.Opt, &a.Instance, a.CarrierID)
+}
+
+// putPreface writes the 40-byte layout shared by PREFACE and PREFACE_ACK;
+// byte 6 is the kind (PREFACE) or the status (PREFACE_ACK).
+func putPreface(b []byte, minor, b6 uint8, role Role, req, opt uint32, inst *[16]byte, id uint32) {
+	_ = b[PrefaceLen-1]
+	copy(b[0:4], Magic[:])
+	b[4] = Major
+	b[5] = minor
+	b[6] = b6
+	b[7] = uint8(role)
+	binary.BigEndian.PutUint32(b[8:12], req)
+	binary.BigEndian.PutUint32(b[12:16], opt)
+	copy(b[16:32], inst[:])
+	binary.BigEndian.PutUint32(b[32:36], id)
+	binary.BigEndian.PutUint32(b[36:40], CRC(b[:36]))
 }
 
 // ParsePreface decodes a PREFACE. len(b) must be exactly PrefaceLen. Checks,
@@ -49,8 +67,32 @@ func PutPrefaceAck(b []byte, a *PrefaceAck) {
 // the CRC32C of bytes 0–35 in bytes 36–39; only the other fields may change
 // meaning. The major is therefore checked before any of them, so a PREFACE
 // of another major is answered PREFACE_ACK(VERSION), never closed silently.
+//
+// Only ErrFeature comes with the decoded value (every other field is valid,
+// so the FEATURE answer can echo the carrier ID); every other error returns
+// the zero Preface.
 func ParsePreface(b []byte) (Preface, error) {
-	panic("unimplemented: M1b")
+	if err := checkPreface(b, RoleDialer); err != nil {
+		return Preface{}, err
+	}
+	p := Preface{
+		Minor:     b[5],
+		Kind:      CarrierKind(b[6]),
+		Req:       binary.BigEndian.Uint32(b[8:12]),
+		Opt:       binary.BigEndian.Uint32(b[12:16]),
+		CarrierID: binary.BigEndian.Uint32(b[32:36]),
+	}
+	copy(p.Instance[:], b[16:32])
+	if p.Kind != KindStream && p.Kind != KindDatagram {
+		return Preface{}, ErrMalformed
+	}
+	if p.Instance == ([16]byte{}) || p.CarrierID == 0 {
+		return Preface{}, ErrMalformed
+	}
+	if p.Req&^KnownRequired != 0 {
+		return p, ErrFeature
+	}
+	return p, nil
 }
 
 // ParsePrefaceAck decodes a PREFACE_ACK in the same canonical order for the
@@ -59,7 +101,52 @@ func ParsePreface(b []byte) (Preface, error) {
 // returned with a nil error. ErrMajor (valid magic and CRC, another major)
 // and ErrFeature (unknown required bits) are deterministic capability gaps
 // as well: the dialer maps all four to ErrVersion (design §5.1). Every other
-// error is a carrier error.
+// error is a carrier error. As for ParsePreface, only ErrFeature comes with
+// the decoded value.
 func ParsePrefaceAck(b []byte) (PrefaceAck, error) {
-	panic("unimplemented: M1b")
+	if err := checkPreface(b, RolePassive); err != nil {
+		return PrefaceAck{}, err
+	}
+	a := PrefaceAck{
+		Minor:     b[5],
+		Status:    PrefaceStatus(b[6]),
+		Req:       binary.BigEndian.Uint32(b[8:12]),
+		Opt:       binary.BigEndian.Uint32(b[12:16]),
+		CarrierID: binary.BigEndian.Uint32(b[32:36]),
+	}
+	copy(a.Instance[:], b[16:32])
+	if a.Status > PrefaceCapacity {
+		return PrefaceAck{}, ErrMalformed
+	}
+	if a.Instance == ([16]byte{}) || a.CarrierID == 0 {
+		return PrefaceAck{}, ErrMalformed
+	}
+	if a.Req&^KnownRequired != 0 {
+		return a, ErrFeature
+	}
+	return a, nil
+}
+
+// checkPreface runs the steps of the canonical order (design §5.1) that do
+// not depend on the direction's byte 6: length, magic, CRC, major and role.
+func checkPreface(b []byte, role Role) error {
+	switch {
+	case len(b) < PrefaceLen:
+		return ErrShort
+	case len(b) > PrefaceLen:
+		return ErrTrailing
+	}
+	if b[0] != Magic[0] || b[1] != Magic[1] || b[2] != Magic[2] || b[3] != Magic[3] {
+		return ErrMagic
+	}
+	if CRC(b[:36]) != binary.BigEndian.Uint32(b[36:40]) {
+		return ErrCRC
+	}
+	if b[4] != Major {
+		return ErrMajor
+	}
+	if Role(b[7]) != role {
+		return ErrMalformed
+	}
+	return nil
 }
