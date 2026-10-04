@@ -168,8 +168,10 @@ func (s *Session) Reject(code uint32, msg string) error {
 }
 
 // RefusePending ends a pending session with OPEN_ACK(status, code) — used
-// for GOING_AWAY when its Listener closes. It returns false if the session is
-// not pending.
+// when its Listener closes: CAPACITY(CodeBacklog) while the Runtime runs
+// (a closed Listener is not the instance going away, D21), GOING_AWAY when
+// Runtime.Close runs concurrently. It returns false if the session is not
+// pending.
 //
 // It waits for the actor's answer (sent before the verdict's Registry
 // calls, as for Confirm), so it must not be called with a lock held that

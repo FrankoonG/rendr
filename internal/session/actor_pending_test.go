@@ -132,10 +132,11 @@ func TestActorPendingWithdrawn(t *testing.T) {
 	})
 }
 
-// TestActorPendingRefuseGoingAway: RefusePending(GOING_AWAY) (Listener
-// close) answers the pending session's OPEN with GOING_AWAY (the dialer:
-// ErrCapacity, and its Peer notes the instance); Confirm then returns
-// net.ErrClosed and a second RefusePending false.
+// TestActorPendingRefuseGoingAway: RefusePending(GOING_AWAY) (a Listener
+// closing while its Runtime closes) answers the pending session's OPEN
+// with GOING_AWAY (the dialer: ErrCapacity, and its Peer notes the
+// instance); Confirm then returns net.ErrClosed and a second RefusePending
+// false.
 func TestActorPendingRefuseGoingAway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := acNewWorld(t, nil)

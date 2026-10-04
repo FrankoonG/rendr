@@ -14,7 +14,8 @@ import (
 // OPENs), and the confirmation of a lane once its first response frame was
 // placed. A pending session survives the death of its carriers; it ends
 // only by a verdict executed here — Confirm, Reject, AcceptTimeout
-// (CAPACITY), RefusePending/Shutdown (GOING_AWAY) — or by the dialer's
+// (CAPACITY), RefusePending (its Listener closed: CAPACITY, or GOING_AWAY
+// while the Runtime closes), Shutdown (GOING_AWAY) — or by the dialer's
 // RST(AbortWithdrawn).
 
 // errDecided is Confirm's or Reject's error when a verdict already ran.
@@ -178,8 +179,8 @@ func (a *actor) onRejectLocked(now time.Time, c *reject) {
 	a.refusePendingLocked(now, wire.OpenAck{Status: wire.StatusRejected, Code: c.code, Msg: []byte(msg)}, false)
 }
 
-// onRefuseLocked is RefusePending (Listener.Close: GOING_AWAY). Its reply,
-// too, precedes Registry.Ended.
+// onRefuseLocked is RefusePending (Listener.Close: CAPACITY, or GOING_AWAY
+// while the Runtime closes). Its reply, too, precedes Registry.Ended.
 func (a *actor) onRefuseLocked(now time.Time, c *refuse) {
 	a.pendingFactsLocked(now)
 	ok := !a.ending && !a.decided && a.s.ctl.state == StatePending
