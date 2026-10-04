@@ -186,41 +186,33 @@ func TestStreamPassiveFirstFrame(t *testing.T) {
 	stEnd(s, errClosed)
 }
 
-// TestStreamCopyBudget (§3.2, P17): one Data call copies less than 16 KiB
-// under the session lock. A 64 KiB frame that three held 1-byte segments
-// split into a 16 KiB piece and three pieces of 16 KiB − 1 copies one of
-// them into a run and keeps the others by reference; the stream reads back
+// TestStreamCopyBudget (§3.2, P17, V3): one Data call copies less than
+// 16 KiB under the session lock. A 64 KiB frame whose new bytes three held
+// 1-byte segments split into a 16 KiB piece and three pieces of 16 KiB − 1
+// has more new bytes than one call may copy: it is kept whole by reference,
+// one segment that replaces the three held runs (nothing copied), rather
+// than in pieces that would each pin its buffer. The stream reads back
 // intact and every buffer returns to the Budget.
 func TestStreamCopyBudget(t *testing.T) {
 	s := stSession(stOpt{role: RolePassive})
+	copies := stWatchCopies(t, s) // every call copies fewer than 16 KiB
 	l, _ := stAddLane(s, 1, false)
 	for _, off := range []uint64{16 << 10, 32 << 10, 48 << 10} {
 		if err := l.Data(nil, off, stPattern(off, 1), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	runBytes := func() int {
-		return stLocked(s, func(st *stream) int {
-			n := 0
-			for i := range st.inq.n {
-				if sg := st.inq.at(i); sg.run {
-					n += len(sg.b)
-				}
-			}
-			for i := range st.ooq.s {
-				if st.ooq.s[i].run {
-					n += len(st.ooq.s[i].b)
-				}
-			}
-			return n
-		})
-	}
-	before := runBytes()
 	if err := stDeliverData(l, 0, stPattern(0, 64<<10)); err != nil {
 		t.Fatal(err)
 	}
-	if copied := runBytes() - before; copied >= runSize || copied == 0 {
-		t.Fatalf("one Data call copied %d bytes into runs, want some and below %d", copied, runSize)
+	if _, last := copies(); last != 0 {
+		t.Fatalf("the 64 KiB frame's Data call copied %d bytes, want none (kept by reference)", last)
+	}
+	if in, out := stSegs(s); len(in) != 1 || in[0] != 64<<10 || len(out) != 0 {
+		t.Fatalf("segments in order %v, out of order %v; want the whole frame as one and none held", in, out)
+	}
+	if u := s.env.Carrier.Budget.Used(); u != stClass(64<<10) {
+		t.Fatalf("Budget charge %d, want the frame's buffer alone (%d): the held runs were not released", u, stClass(64<<10))
 	}
 	if got := stReadN(t, s, 64<<10); !bytes.Equal(got, stPattern(0, 64<<10)) {
 		t.Fatal("the split frame reads back corrupted")
