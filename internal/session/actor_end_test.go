@@ -230,10 +230,12 @@ func TestActorAttemptGoexitReported(t *testing.T) {
 
 // TestActorAbandonsStuckAttempt: the session ends while a redial is stuck
 // in a Hard-blocked handshake Write that ignores its deadline, its
-// cancellation and Close: the attempt is cancelled at once and abandoned
-// AbandonWait later, so Done closes then with that goroutine counted in the
-// abandoned pool; when the write finally returns, the attempt leaves the
-// pool and its conn is closed.
+// cancellation and Close: the attempt is cancelled at once; Establish
+// closes the conn and abandons its hello writer AbandonWait later (design
+// §0.8 V1), so the attempt returns and Done closes then, with exactly that
+// stuck call counted in the abandoned pool (the actor's own abandonment
+// waits 2·AbandonWait and never counts it a second time); when the write
+// finally returns, it leaves the pool and the conn is closed.
 func TestActorAbandonsStuckAttempt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := acNewWorld(t, nil)
@@ -255,7 +257,7 @@ func TestActorAbandonsStuckAttempt(t *testing.T) {
 			t.Fatalf("Done %v after Shutdown, want the attempt abandoned after AbandonWait %v", d, wait)
 		}
 		if n := w.a.cenv.Abandon.Len(); n != 1 {
-			t.Fatalf("abandoned pool %d, want the stuck attempt", n)
+			t.Fatalf("abandoned pool %d, want the stuck hello Write once", n)
 		}
 		l2.Release()
 		acWaitFor(t, 5*time.Second, "the attempt left the pool", func() bool { return w.a.cenv.Abandon.Len() == 0 })

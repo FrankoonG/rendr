@@ -471,11 +471,17 @@ func (a *actor) killEst(est *carrier.Established, cause carrier.Cause, detail st
 // cancelAttemptsLocked withdraws every attempt in flight (C25): their
 // contexts end with carrier.ErrWithdrawn (Establish sends RST(withdrawn)
 // where an OPEN was written) and the end phase abandons the ones still
-// running AbandonWait later.
+// running 2·AbandonWait later. A cancelled attempt returns within
+// AbandonWait unless its own goroutine is stuck in an embedder call:
+// GuardedDial and Establish leave a stuck helper goroutine of theirs (the
+// factory call, the hello writer) behind and count it in the abandoned
+// pool themselves, AbandonWait after the cancellation. Abandoning the
+// attempt at that same instant would count one stuck call twice, so the
+// actor waits twice as long (as the health layer's wind-down does).
 func (a *actor) cancelAttemptsLocked(now time.Time) {
 	d := a.d
 	d.raceOn = false
-	d.abandonBy = now.Add(a.abandonWait())
+	d.abandonBy = now.Add(2 * a.abandonWait())
 	for i := range d.slots {
 		if at := d.slots[i].att; at != nil {
 			at.cancel(carrier.ErrWithdrawn)

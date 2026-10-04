@@ -121,8 +121,9 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 
 // endingLocked bounds the end phase: lanes whose CLOSE is still unwritten
 // at closeBy are killed (their writers return, or are abandoned after
-// AbandonWait), and dial attempts still running AbandonWait after their
-// cancellation are abandoned, so Done closes within about 2 s (C24). It
+// AbandonWait), and dial attempts still running 2·AbandonWait after their
+// cancellation are abandoned (cancelAttemptsLocked), so Done closes within
+// about 2 s (C24). It
 // also records the adopts still posted but unhandled (quiet): Join and
 // AttachOpen refuse once the session ended, so that count only falls.
 func (a *actor) endingLocked(now time.Time) {

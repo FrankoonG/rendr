@@ -413,11 +413,11 @@ func acNewWorld(t testing.TB, hooks *testhooks.Hooks) *acWorld {
 
 // acLinkDelay is the one-way delay every actor-test link starts with. On a
 // link without delay a PONG can arrive before its PING's write commit
-// (with GOMAXPROCS=1 every PONG does); the carrier estimator then gives no
-// sample and does not advance its PONG watermark, so a carrier that sends
-// DATA stays capped at its capacity floor for good (a carrier-layer defect
-// reported to WP3). A virtual one-way delay makes every PONG arrive after
-// the commit: the commit happens at the write's virtual instant, the PONG
+// (with GOMAXPROCS=1 every PONG does); the carrier estimator then takes no
+// RTT or rate sample from it (it still advances the PONG watermark, so the
+// capacity cap releases). A virtual one-way delay makes every PONG arrive
+// after the commit, so the carriers of these tests always have RTT
+// evidence: the commit happens at the write's virtual instant, the PONG
 // two delays later.
 const acLinkDelay = time.Millisecond
 
