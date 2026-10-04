@@ -139,16 +139,19 @@ func (e *allocEP) Data(_ *Conn, _ uint64, _ []byte, buf *Buf) error {
 func (e *allocEP) Control(*Conn, wire.Header, []byte) error { return nil }
 func (e *allocEP) WriteBlocked(*Conn)                       {}
 
-// TestSteadyStateZeroAllocs_L41_L54 (carrier half, §12.2), over an OwnedTCP
-// loopback pair. Writer: one round — carrier control with a PING and a
-// PONG, Fill, seal, stall window and watchdog, the per-batch write deadline
-// and one vectored write of an ACK and 256 KiB of DATA — allocates nothing.
-// Reader: one group of frames — a 64 KiB DATA read straight into a pooled
-// Buf and handed over by reference, a 1000-byte DATA, a PING and a PONG
-// matching a committed PING record — allocates nothing. The counts are
-// asserted in the non-race lane only (the race detector instruments
-// allocations and makes sync.Pool drop items).
-func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
+// TestCarrierRoundZeroAllocs_L41_L54 is the carrier half of design §12.2's
+// allocation gate, over an OwnedTCP loopback pair. Writer: one round —
+// carrier control with a PING and a PONG, Fill, seal, stall window and
+// watchdog, the per-batch write deadline and one vectored write of an ACK
+// and 256 KiB of DATA — allocates nothing. Reader: one group of frames — a
+// 64 KiB DATA read straight into a pooled Buf and handed over by reference,
+// a 1000-byte DATA, a PING and a PONG matching a committed PING record —
+// allocates nothing. The counts are asserted in the non-race lane only (the
+// race detector instruments allocations and makes sync.Pool drop items).
+// The §11.4 name TestSteadyStateZeroAllocs_L41_L54 is left to the
+// end-to-end gate (session Write → Read over lanes on real carriers), so
+// the name-based coverage gate (W17) cannot pass on a half.
+func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 	t.Run("writer", func(t *testing.T) {
 		env := hEnv()
 		cl, sv := tcpPair(t)

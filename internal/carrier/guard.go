@@ -36,14 +36,15 @@ func (e *timeoutError) Temporary() bool { return true }
 // Timing.DialTimeout.
 var errDialTimeout error = &timeoutError{"rendr: carrier dial timed out"}
 
-// GuardedDial calls f on a fresh goroutine (counted by Hooks.DialStart via the
-// caller) and returns when f returns or when ctx ends or DialTimeout elapses,
-// whichever is first, even if f ignores ctx. A panic or runtime.Goexit in f
-// becomes ErrFactoryPanic; (nil, nil) becomes ErrNilConn; (conn, err) closes
-// conn once and returns err; a conn that arrives after the call returned is
-// closed exactly once. A goroutine still inside f after AbandonWait past the
-// return is counted in env.Abandon until f returns. It fails fast with
-// ErrAbandonFull when env.Abandon is full.
+// GuardedDial calls f on a fresh goroutine and returns when f returns or when
+// ctx ends or DialTimeout elapses, whichever is first, even if f ignores ctx.
+// A panic or runtime.Goexit in f becomes ErrFactoryPanic; (nil, nil) becomes
+// ErrNilConn; (conn, err) closes conn once and returns err; a conn that
+// arrives after the call returned is closed exactly once. A goroutine still
+// inside f after AbandonWait past the return is counted in env.Abandon until
+// f returns. It fails fast with ErrAbandonFull when env.Abandon is full.
+// GuardedDial itself does not run Hooks.DialStart: Establish runs it inside
+// f, right before the factory call, so callers of Establish never call it.
 func GuardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Conn, error)) (net.Conn, error) {
 	return guardedDial(ctx, env, f)
 }

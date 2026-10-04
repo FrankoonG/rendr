@@ -37,7 +37,7 @@ type EstablishError struct {
 	Cause     Cause              // CauseTransportError, CauseProtocolViolation, CauseInstanceMismatch or CauseLocalClose (ctx)
 	Status    wire.PrefaceStatus // the PREFACE_ACK status when a well-formed non-OK one was read
 	PrefaceOK bool               // the PREFACE exchange completed (cadence outcome Refused, not Failed)
-	Instance  [16]byte           // the passive InstanceID when PrefaceOK
+	Instance  [16]byte           // the passive InstanceID when PrefaceOK; also set (PrefaceOK false) from a well-formed non-OK PREFACE_ACK of this major, e.g. the instance a GOING_AWAY names (§6.6)
 	Err       error
 }
 
