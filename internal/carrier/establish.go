@@ -107,7 +107,9 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // RST(wire.RstWithdrawn) (bounded, guarded) before closing (L49).
 //
 // Further contracts of this implementation: Hooks.DialStart(f.Index) runs
-// right before the factory call; Establish owns id — the returned Conn
+// right before the factory call, on the guarded goroutine (a hook that
+// blocks acts like a hanging factory; a fast-failed attempt calls neither);
+// Establish owns id — the returned Conn
 // releases it to env.IDs when its Done closes, and a failed attempt
 // releases it before returning; every conn it obtained is closed exactly
 // once unless it is returned inside the Established; an accepted response
@@ -153,15 +155,23 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	actx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	if h := env.Hooks; h != nil && h.DialStart != nil {
-		h.DialStart(f.Index)
+	dialStart := func() {
+		if h := env.Hooks; h != nil && h.DialStart != nil {
+			h.DialStart(f.Index)
+		}
 	}
 	var nc net.Conn
 	var err error
 	if f.DialEarly != nil {
-		nc, err = GuardedDialEarly(actx, env, f.DialEarly, hello)
+		nc, err = GuardedDialEarly(actx, env, func(ctx context.Context, first []byte) (net.Conn, error) {
+			dialStart()
+			return f.DialEarly(ctx, first)
+		}, hello)
 	} else {
-		nc, err = GuardedDial(actx, env, f.Dial)
+		nc, err = GuardedDial(actx, env, func(ctx context.Context) (net.Conn, error) {
+			dialStart()
+			return f.Dial(ctx)
+		})
 	}
 	if err != nil {
 		if ctx.Err() != nil {

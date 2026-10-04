@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -179,7 +180,8 @@ func TestAbandonPoolBounds_L52(t *testing.T) {
 			t.Fatalf("abandoned %d (full %v), want the two stuck readers", n, env.Abandon.Full())
 		}
 
-		var calls atomic.Int32
+		var calls, starts atomic.Int32
+		env.Hooks = &testhooks.Hooks{DialStart: func(int) { starts.Add(1) }}
 		factory := func(context.Context) (net.Conn, error) {
 			calls.Add(1)
 			a, b := net.Pipe()
@@ -191,8 +193,8 @@ func TestAbandonPoolBounds_L52(t *testing.T) {
 		}
 		_, err := Establish(context.Background(), env, Factory{Name: "f", Dial: factory}, env.IDs.Next(), wire.TypePing, nil, nil)
 		var ee *EstablishError
-		if !errors.As(err, &ee) || ee.Stage != "dial" || !errors.Is(err, ErrAbandonFull) || calls.Load() != 0 {
-			t.Fatalf("Establish with a full pool: %v (factory calls %d)", err, calls.Load())
+		if !errors.As(err, &ee) || ee.Stage != "dial" || !errors.Is(err, ErrAbandonFull) || calls.Load() != 0 || starts.Load() != 0 {
+			t.Fatalf("Establish with a full pool: %v (factory calls %d, DialStart %d)", err, calls.Load(), starts.Load())
 		}
 
 		close(release)
@@ -317,4 +319,48 @@ func TestGuardedDialMisbehaviour_L51(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestAbandonedWriteKeepsItsBuffers_L52 (§4.1 abandoned-call rule): a
+// carrier killed while its writer is stuck in an embedder Write that
+// ignores deadlines and Close joins AbandonWait later with the writer
+// counted as abandoned, and the send chunk the stuck write may still read
+// stays referenced (never recycled under it) until that Write returns; then
+// the references go and the pool empties.
+func TestAbandonedWriteKeepsItsBuffers_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		release := make(chan struct{})
+		var calls atomic.Int32
+		c, p := hPair(t, env, func(nc net.Conn) net.Conn {
+			return &hookConn{Conn: nc, onWrite: func(nc net.Conn, b []byte) (int, error) {
+				if calls.Add(1) == 2 {
+					<-release // ignores deadlines and Close
+					return 0, net.ErrClosed
+				}
+				return nc.Write(b)
+			}}
+		})
+		src := newSource(env, 16<<10, false)
+		c.Start(src, &hBell{}, StartOptions{})
+		synctest.Wait() // the first PING written
+		src.offer(32 << 10)
+		c.Wake()
+		synctest.Wait() // the second write (two DATA frames on the chunk) is stuck
+		if refs := src.chunk.refs.Load(); refs != 3 {
+			t.Fatalf("chunk refs %d during the write, want the source's and two DATA frames'", refs)
+		}
+		c.Kill(CauseLocalClose, "shutdown")
+		hWait(t, c)
+		if env.Abandon.Len() != 1 || src.chunk.refs.Load() != 3 {
+			t.Fatalf("after Done: abandoned %d, chunk refs %d", env.Abandon.Len(), src.chunk.refs.Load())
+		}
+		close(release)
+		synctest.Wait()
+		if env.Abandon.Len() != 0 || src.chunk.refs.Load() != 1 {
+			t.Fatalf("after the stuck Write returned: abandoned %d, chunk refs %d", env.Abandon.Len(), src.chunk.refs.Load())
+		}
+		p.close()
+		src.chunk.Release()
+	})
 }

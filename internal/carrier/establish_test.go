@@ -10,6 +10,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -485,10 +486,13 @@ func TestEstablishProbePing(t *testing.T) {
 
 // TestEstablishDialEarly: with DialEarly the factory receives PREFACE ‖
 // first frame exactly and sends them itself; Establish writes nothing more
-// before it reads the answer.
+// before it reads the answer; Hooks.DialStart reports the factory index
+// once, right before the call.
 func TestEstablishDialEarly(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := hEnv()
+		var starts []int
+		env.Hooks = &testhooks.Hooks{DialStart: func(i int) { starts = append(starts, i) }}
 		var early []byte
 		f, ends := pipeFactory(0, "early")
 		f.DialEarly = func(ctx context.Context, first []byte) (net.Conn, error) {
@@ -505,9 +509,13 @@ func TestEstablishDialEarly(t *testing.T) {
 				return append(hPrefaceAck(wire.PrefaceOK, 12), frameAt(wire.TypeOpenAck, 0, 1, wire.SessionHandle, okOpenAck())...)
 			})
 		}()
+		f.Index = 4
 		est, err := Establish(context.Background(), env, f, 12, wire.TypeOpen, openPayload(3), nil)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(starts) != 1 || starts[0] != 4 {
+			t.Fatalf("DialStart calls %v", starts)
 		}
 		if p, err := wire.ParsePreface(early[:wire.PrefaceLen]); err != nil || p.CarrierID != 12 {
 			t.Fatalf("early PREFACE %+v %v", p, err)

@@ -202,6 +202,12 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			c.finishRetire("retired: CLOSE exchange complete")
 			return false
 		}
+		if c.ep == nil {
+			// A probe or sessionless carrier has no session to drain: it
+			// answers the peer's CLOSE with its own at once (its owner may
+			// still call Retire; it is idempotent).
+			c.Retire(wire.CloseRetire)
+		}
 	case wire.TypeGoAway:
 		if _, err := wire.ParseGoAway(p); err != nil {
 			c.violation("GOAWAY: %v", err)

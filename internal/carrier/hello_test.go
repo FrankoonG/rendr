@@ -372,3 +372,29 @@ func TestSessionlessCarrierLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// TestCarrierWithoutSessionAnswersClose: a carrier without a session (a
+// sessionless or probe carrier) answers the peer's CLOSE with its own at
+// once and retires; nothing else follows its CLOSE.
+func TestCarrierWithoutSessionAnswersClose(t *testing.T) {
+	for _, o := range []StartOptions{{Sessionless: true}, {Probe: true, Observer: &hObserver{}}} {
+		synctest.Test(t, func(t *testing.T) {
+			env := hEnv()
+			c, p := hPair(t, env, nil)
+			p.autoPong(nil)
+			c.Start(nil, &hBell{}, o)
+			synctest.Wait()
+			if err := p.send(wire.TypeClose, 0, 0, []byte{byte(wire.CloseRetire)}); err != nil {
+				t.Fatal(err)
+			}
+			hWait(t, c)
+			p.close()
+			if dead, cause, _, _ := c.Death(); !dead || cause != CauseRetired || !c.CloseSent() || !c.PeerClosed() {
+				t.Fatalf("death %v %v, CLOSE sent %v", dead, cause, c.CloseSent())
+			}
+			if fr := p.received(); fr[len(fr)-1].Type != wire.TypeClose || p.count(wire.TypeClose) != 1 {
+				t.Fatalf("frames %v", fr)
+			}
+		})
+	}
+}
