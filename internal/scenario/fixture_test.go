@@ -10,8 +10,9 @@ package scenario
 // Overrides value made from tun (counter presets and timings are identical
 // on both ends, L14). The dialer has a Peer over every link and a second
 // Peer whose factories use DialEarly (pipelined dials). The passive has one
-// push-only Listener and every link's Accept is its Handle, so each carrier
-// goes through the passive handshake and admission. A per-side limit
+// push-only Listener and every link's Accept hands the passive end of each
+// carrier to its Handle, so each carrier goes through the passive handshake
+// and admission. A per-side limit
 // (fixtureConfig.maxSessions) goes only into the passive's Config, never
 // into the shared Overrides (design §10.5): MaxSessions counts both roles.
 //
@@ -23,7 +24,10 @@ package scenario
 // prove its stimulus happened. A Peer with two or more links keeps a probe
 // carrier on every link, so stimulus proofs count session carriers only
 // (linkStats.Session, carrierLog); a carrier is classified by its first
-// frame after the PREFACE (OPEN or JOIN: session, PING: probe).
+// frame after the PREFACE (OPEN or JOIN: session, PING: probe). The link
+// adapter counts what rendr reads from the link's conns, so that its
+// counters include every byte rendr has read when a test reads them (the
+// read barrier, see link.settled).
 //
 // Far end: an accept loop on the passive Listener routes every new session
 // on its OPEN metadata (the target): echo, gen:N (N bytes of PRNG(7), then
@@ -35,7 +39,8 @@ package scenario
 //
 // The bodies run on real time, and in sequence they take about two minutes.
 // Every fixture therefore runs its test in parallel with the others, at most
-// parallelFixtures at once, except the tests in serialTests.
+// fixtureLimit() at once (one fixture per two Ps), except the tests in
+// serialTests, which run alone.
 
 import (
 	"context"
@@ -111,13 +116,43 @@ func quietLog(format string, args ...any) {
 
 // ---------------------------------------------------------------- parallelism
 
-// parallelFixtures bounds how many parallel tests hold a fixture at once,
-// independent of GOMAXPROCS and -parallel: half the CPUs, at least 2 and at
-// most 8, so that real-time timing noise stays low on small workers and the
-// host stays lightly loaded.
-var parallelFixtures = min(8, max(2, runtime.NumCPU()/2))
+// fixtureLimit bounds how many parallel tests hold a fixture at once: one
+// per two Ps (or CPUs, if fewer), at least 1 and at most 8, so that the
+// real-time timing noise of the bodies stays low and the host lightly
+// loaded. It is read at every acquisition, because -cpu changes GOMAXPROCS
+// between iterations (with -cpu 1 the fixtures run one at a time);
+// -parallel cannot do this, it is fixed when the test binary starts
+// (default: the initial GOMAXPROCS).
+func fixtureLimit() int {
+	return min(8, max(1, min(runtime.GOMAXPROCS(0), runtime.NumCPU())/2))
+}
 
-var fixtureSlots = make(chan struct{}, parallelFixtures)
+// The fixture slots: slotBusy parallel tests hold a fixture; slotFree is
+// broadcast when one lets go.
+var (
+	slotMu   sync.Mutex
+	slotFree = sync.NewCond(&slotMu)
+	slotBusy int
+)
+
+// acquireFixtureSlot blocks until fewer than fixtureLimit() parallel tests
+// hold a fixture, then takes a slot.
+func acquireFixtureSlot() {
+	slotMu.Lock()
+	defer slotMu.Unlock()
+	for slotBusy >= fixtureLimit() {
+		slotFree.Wait()
+	}
+	slotBusy++
+}
+
+// releaseFixtureSlot gives a slot back.
+func releaseFixtureSlot() {
+	slotMu.Lock()
+	slotBusy--
+	slotMu.Unlock()
+	slotFree.Broadcast()
+}
 
 // serialTests run alone (the parallel tests are paused in t.Parallel
 // meanwhile, before their fixtures exist):
@@ -125,13 +160,16 @@ var fixtureSlots = make(chan struct{}, parallelFixtures)
 //     with a baseline settled before its fixture exists, so no other test
 //     may run beside it;
 //   - TestSelectorFailoverRacesPastStalledCandidate requires the initial
-//     carrier on p1 (1 ms one way) rather than p2 (2 ms): Dial ranks by the
-//     first probe sample of each path (plan §3.9), and beside other
-//     fixtures under -race the scheduling noise of one real-time sample
-//     exceeded that 2 ms RTT margin (once in three shuffled iterations).
+//     carrier on p1 (1 ms one way) rather than p2 (2 ms), and
+//     TestSelectorMigratesOnDegradation on p1 (2 ms) rather than p2 (5 ms):
+//     Dial ranks by the first probe sample of each path (plan §3.9), and
+//     beside other fixtures under -race the scheduling noise of one
+//     real-time sample exceeded such a few-ms RTT margin (the first once in
+//     three shuffled iterations; the second at -cpu 1).
 var serialTests = map[string]bool{
 	"TestHalfCloseAndCleanFinish":                   true,
 	"TestSelectorFailoverRacesPastStalledCandidate": true,
+	"TestSelectorMigratesOnDegradation":             true,
 }
 
 // ---------------------------------------------------------------- fixture
@@ -190,8 +228,8 @@ func newFixtureCfg(t *testing.T, cfg fixtureConfig) *fixture {
 	t.Helper()
 	if !serialTests[t.Name()] {
 		t.Parallel()
-		fixtureSlots <- struct{}{}
-		t.Cleanup(func() { <-fixtureSlots }) // after f.close (cleanups run last-in first-out)
+		acquireFixtureSlot()
+		t.Cleanup(releaseFixtureSlot) // after f.close (cleanups run last-in first-out)
 	}
 	f := &fixture{t: t, far: newFarEnd()}
 	t.Cleanup(f.close)
@@ -206,10 +244,12 @@ func newFixtureCfg(t *testing.T, cfg fixtureConfig) *fixture {
 	plain := make([]rendr.Carrier, len(cfg.links))
 	early := make([]rendr.Carrier, len(cfg.links))
 	for i, n := range cfg.links {
-		l := &link{name: n, l: rendrtest.NewLink(rendrtest.LinkConfig{Name: n, Accept: ln.Handle})}
+		l := &link{t: t, name: n}
+		l.l = rendrtest.NewLink(rendrtest.LinkConfig{Name: n,
+			Accept: func(c net.Conn) error { return ln.Handle(l.counted(c)) }})
 		f.links = append(f.links, l)
-		plain[i] = rendr.StreamCarrier{Name: n, Dial: l.l.Dial}
-		early[i] = rendr.StreamCarrier{Name: n, Dial: l.l.Dial, DialEarly: l.l.DialEarly}
+		plain[i] = rendr.StreamCarrier{Name: n, Dial: l.dial}
+		early[i] = rendr.StreamCarrier{Name: n, Dial: l.dial, DialEarly: l.dialEarly}
 	}
 	// A Peer probes only once it is used, so the Peer a test does not dial
 	// through adds no carriers.
@@ -331,7 +371,10 @@ const (
 // sessionDone is closed once the session has fully ended: the Conn's Done
 // channel when it has one, else a Status poll until StateEnded. The poll
 // ends at the latest with the fixture (Runtime.Close ends every session) and
-// gives up after sessionDoneMax (the channel then never closes).
+// gives up after sessionDoneMax (the channel then never closes). The poll is
+// a stand-in until Conn.Done (design AA2) is on the branch; it is weaker
+// (StateEnded can precede Done by the carriers' wind-down), so it goes, with
+// sessionDonePoll and sessionDoneMax, once Done is there.
 func sessionDone(c net.Conn) <-chan struct{} {
 	if d, ok := c.(interface{ Done() <-chan struct{} }); ok {
 		return d.Done()
@@ -394,10 +437,17 @@ func faultCountsOf(c rendrtest.Counts) faultCounts {
 // keeps a probe carrier on every link, so a link-wide counter can move
 // without the fault ever touching a session: stimulus proofs must use
 // Session.
+//
+// Throttled has no session-only variant (rendrtest counts the bottleneck
+// link-wide, as M1a did): it proves that the rate limiter ran on the link,
+// not that it delayed session bytes. Every byte that crosses a link with a
+// rate set passes its bottleneck, so a test proves that session data was
+// rate limited by a Session.Bytes increase while the rate was set
+// (TestBondAggregatesThroughput checks both).
 type linkStats struct {
 	faultCounts
 	Session   faultCounts
-	Throttled int64 // bytes passed through the rate limiter
+	Throttled int64 // bytes passed through the rate limiter (link-wide)
 }
 
 // carrierInfo is a snapshot of one carrier for per-carrier assertions.
@@ -408,10 +458,52 @@ type carrierInfo struct {
 	held     int64 // chunks held by a stall
 }
 
-// link is a thin adapter over a rendrtest.Link (design §11.3, V12).
+// link is a thin adapter over a rendrtest.Link (design §11.3, V12). The
+// only addition is a read barrier for its counters: every conn of the link
+// that rendr gets (from the factories dial and dialEarly on the dialer, and
+// through the link's Accept, which hands it to the passive Listener's
+// Handle) is a farConn that counts the bytes rendr read from it in read.
 type link struct {
+	t    *testing.T
 	name string
 	l    *rendrtest.Link
+	read atomic.Int64 // bytes rendr has read from the link's conns, both directions
+}
+
+// farConn is a link conn as rendr sees it: rendrtest's own conn (only the
+// net.Conn methods, like every embedder conn) whose Reads are counted.
+type farConn struct {
+	net.Conn
+	read *atomic.Int64
+}
+
+func (c *farConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.read.Add(int64(n))
+	}
+	return n, err
+}
+
+// counted wraps a conn of the link in a farConn.
+func (l *link) counted(c net.Conn) net.Conn { return &farConn{Conn: c, read: &l.read} }
+
+// dial is the link's StreamCarrier.Dial.
+func (l *link) dial(ctx context.Context) (net.Conn, error) {
+	c, err := l.l.Dial(ctx)
+	if c == nil {
+		return nil, err
+	}
+	return l.counted(c), err
+}
+
+// dialEarly is the link's StreamCarrier.DialEarly (pipelined dials).
+func (l *link) dialEarly(ctx context.Context, first []byte) (net.Conn, error) {
+	c, err := l.l.DialEarly(ctx, first)
+	if c == nil {
+		return nil, err
+	}
+	return l.counted(c), err
 }
 
 // set configures one-way delay, jitter and a bandwidth cap (Mbit/s, 0 = none).
@@ -437,14 +529,51 @@ func (l *link) kill() { l.l.Kill() }
 // current carrier.
 func (l *link) corruptNext() { l.l.CorruptNext(rendrtest.Up) }
 
+// The read barrier. rendrtest counts a chunk's bytes (Counts.Bytes, then the
+// carrier's Up or Down) once its pump's Write into the far end has returned,
+// and that pump goroutine is only made runnable by the far end's Read: until
+// it runs, the counts trail what rendr has already read and acted on, by up
+// to one 64 KiB chunk per direction and carrier — more than the framing
+// margin of a check such as Session.Bytes >= 2·echoed. Both sides count the
+// same bytes (a pump's Write returns exactly what the far end's Reads took),
+// so settled waits until the carriers' Up + Down reach the read count it
+// started with: every byte rendr had read is then in every counter (Bytes
+// is counted before Up/Down). The wait lasts until the runnable pumps get
+// the processor; settleMax is a safety net that fails the test.
+const settleMax = 5 * time.Second
+
+// settled returns the link's carriers once their byte counts include
+// everything rendr had read from the link when it was called.
+func (l *link) settled() []rendrtest.CarrierInfo {
+	want := l.read.Load()
+	deadline := time.Now().Add(settleMax)
+	for {
+		cs := l.l.Carriers()
+		var got int64
+		for _, c := range cs {
+			got += c.Up + c.Down
+		}
+		if got >= want {
+			return cs
+		}
+		if !time.Now().Before(deadline) {
+			l.t.Errorf("fixture: link %s counted %d of the %d bytes rendr read from it after %s", l.name, got, want, settleMax)
+			return cs
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (l *link) stats() linkStats {
+	l.settled()
 	s := l.l.Stats()
 	return linkStats{faultCounts: faultCountsOf(s.All), Session: faultCountsOf(s.Session), Throttled: s.Throttled}
 }
 
-// carrierLog lists every carrier the link created, in creation order.
+// carrierLog lists every carrier the link created, in creation order, once
+// their byte counts include everything rendr has read (as stats).
 func (l *link) carrierLog() []carrierInfo {
-	cs := l.l.Carriers()
+	cs := l.settled()
 	out := make([]carrierInfo, len(cs))
 	for i, c := range cs {
 		out[i] = carrierInfo{seq: c.Seq, kind: int32(c.First), up: c.Up, down: c.Down, held: c.Held}
