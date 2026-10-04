@@ -169,6 +169,38 @@ func closeNow(nc net.Conn) {
 	_ = callSetDeadline(nc, time.Now())
 }
 
+// closeOnce closes an embedder conn exactly once (L52), whoever comes
+// first: the goroutine that owns the conn, after its last call (now), or
+// the last-resort close of that goroutine's abandonment (lastResort, design
+// §0.8 V2). A verdict write — WriteAndClose, an RST(withdrawn) — on a conn
+// that ignores its write deadline but honours Close would otherwise keep
+// the conn open for as long as the peer does not read: the goroutine stuck
+// in it is counted in the abandoned-call pool, and only the Close it never
+// reaches would unblock it.
+type closeOnce struct {
+	nc   net.Conn
+	done atomic.Bool
+}
+
+// now closes the conn on the calling goroutine (closeNow) unless it was
+// closed already. A close that hangs in the embedder keeps the flag, so
+// the last resort never closes a second time.
+func (k *closeOnce) now() {
+	if k.done.CompareAndSwap(false, true) {
+		closeNow(k.nc)
+	}
+}
+
+// lastResort closes the conn on a guarded goroutine (CloseConn) unless it
+// was closed already: the goroutine that owns it was adopted by the
+// abandoned-call pool while still inside an embedder call that ignored its
+// deadline, and the Close unblocks it. It never blocks.
+func (k *closeOnce) lastResort(env *Env) {
+	if k.done.CompareAndSwap(false, true) {
+		CloseConn(env, k.nc)
+	}
+}
+
 // watch counts a goroutine that is still inside embedder code AbandonWait
 // after it was armed in the abandoned-call pool (L52): exactly one of
 // expire (counted: Adopt) and finish (in time) wins; a counted goroutine
@@ -177,6 +209,7 @@ type watch struct {
 	state atomic.Int32 // watchRunning, watchDone or watchAbandoned
 	timer *time.Timer
 	pool  *AbandonPool // nil: not counted
+	last  func()       // run once when the goroutine is adopted; nil: none
 }
 
 const (
@@ -187,7 +220,14 @@ const (
 
 // startWatch arms a watch that counts its goroutine in pool after d.
 func startWatch(pool *AbandonPool, d time.Duration) *watch {
-	w := &watch{pool: pool}
+	return armWatch(pool, d, nil)
+}
+
+// armWatch is startWatch with a last-resort action: when the watch adopts
+// its goroutine, last runs once on the timer's goroutine, after the
+// adoption (design §0.8 V2: closeOnce.lastResort). It must not block.
+func armWatch(pool *AbandonPool, d time.Duration, last func()) *watch {
+	w := &watch{pool: pool, last: last}
 	if d <= 0 {
 		d = time.Second
 	}
@@ -196,8 +236,14 @@ func startWatch(pool *AbandonPool, d time.Duration) *watch {
 }
 
 func (w *watch) expire() {
-	if w.state.CompareAndSwap(watchRunning, watchAbandoned) && w.pool != nil {
+	if !w.state.CompareAndSwap(watchRunning, watchAbandoned) {
+		return
+	}
+	if w.pool != nil {
 		w.pool.Adopt()
+	}
+	if w.last != nil {
+		w.last()
 	}
 }
 
