@@ -234,8 +234,12 @@ func TestAbandonPoolBounds_L52(t *testing.T) {
 		}
 		nc.Close()
 
-		// A factory that ignores its context.
+		// A factory that ignores its context: given up dialGrace after the
+		// cancellation, and counted by then.
 		late := make(chan struct{})
+		var lateOnce sync.Once
+		free := func() { lateOnce.Do(func() { close(late) }) }
+		defer free() // a failed assertion still lets the call return
 		var lateConn *hookConn
 		ctx, cancel := context.WithCancel(context.Background())
 		time.AfterFunc(100*time.Millisecond, cancel)
@@ -247,15 +251,15 @@ func TestAbandonPoolBounds_L52(t *testing.T) {
 			lateConn = &hookConn{Conn: a}
 			return lateConn, nil
 		})
-		if !errors.Is(err, context.Canceled) || time.Since(start) != 100*time.Millisecond {
-			t.Fatalf("ignoring factory: %v after %v", err, time.Since(start))
+		if !errors.Is(err, context.Canceled) || time.Since(start) != 100*time.Millisecond+dialGrace || env.Abandon.Len() != 1 {
+			t.Fatalf("ignoring factory: %v after %v, abandoned %d", err, time.Since(start), env.Abandon.Len())
 		}
 		time.Sleep(env.Timing.AbandonWait)
 		synctest.Wait()
 		if n := env.Abandon.Len(); n != 1 {
 			t.Fatalf("abandoned %d, want the stuck factory call", n)
 		}
-		close(late)
+		free()
 		synctest.Wait()
 		if env.Abandon.Len() != 0 || lateConn == nil || lateConn.closes.Load() != 1 {
 			t.Fatalf("after the late return: abandoned %d, late conn closes %v", env.Abandon.Len(), lateConn)
@@ -284,11 +288,11 @@ func TestGuardedDialMisbehaviour_L51(t *testing.T) {
 		{"ignores ctx until DialTimeout", func(_ context.Context, mk func() net.Conn) (net.Conn, error) {
 			time.Sleep(time.Hour)
 			return mk(), nil
-		}, 0, nil, 10 * time.Second, 1, true},
+		}, 0, nil, 10*time.Second + dialGrace, 1, true},
 		{"late success after cancel", func(_ context.Context, mk func() net.Conn) (net.Conn, error) {
 			time.Sleep(3 * time.Second)
 			return mk(), nil
-		}, 500 * time.Millisecond, context.Canceled, 500 * time.Millisecond, 1, false},
+		}, 500 * time.Millisecond, context.Canceled, 500*time.Millisecond + dialGrace, 1, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

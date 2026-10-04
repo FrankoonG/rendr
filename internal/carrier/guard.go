@@ -36,15 +36,36 @@ func (e *timeoutError) Temporary() bool { return true }
 // Timing.DialTimeout.
 var errDialTimeout error = &timeoutError{"rendr: carrier dial timed out"}
 
-// GuardedDial calls f on a fresh goroutine and returns when f returns or when
-// ctx ends or DialTimeout elapses, whichever is first, even if f ignores ctx.
-// A panic or runtime.Goexit in f becomes ErrFactoryPanic; (nil, nil) becomes
+// dialGrace is how long GuardedDial still waits for a factory call after it
+// gave up on it (ctx ended or DialTimeout passed), capped by AbandonWait: the
+// reaction bound of a factory that honours its context. Only a call still
+// running after it is stuck in embedder code and counted as abandoned (L52):
+// counting a call that is merely returning would make Status.Abandoned at
+// Runtime.Close's return depend on scheduling (design §3.1, §6.8 step 7). A
+// cancelled attempt still ends long before the wind-downs that abandon
+// attempts still running 2·AbandonWait after their cancellation (design
+// §0.9 X2).
+const dialGrace = 50 * time.Millisecond
+
+// GuardedDial calls f on a fresh goroutine and returns f's result when f
+// returns before ctx ends and before DialTimeout elapses. Otherwise it gives
+// up, even if f ignores ctx, and returns ctx's cause or a timeout error: at
+// once when f then returns within dialGrace (at most AbandonWait) — a
+// factory that honours its context does — or after that grace. A panic or
+// runtime.Goexit in f becomes ErrFactoryPanic; (nil, nil) becomes
 // ErrNilConn; (conn, err) closes conn once and returns err; a conn that
-// arrives after the call returned is closed exactly once. A goroutine still
-// inside f after AbandonWait past the return is counted in env.Abandon until
-// f returns. It fails fast with ErrAbandonFull when env.Abandon is full.
-// GuardedDial itself does not run Hooks.DialStart: Establish runs it inside
-// f, right before the factory call, so callers of Establish never call it.
+// arrives after GuardedDial gave up is closed exactly once. A call still
+// running after the grace is stuck in embedder code: it is counted in
+// env.Abandon before GuardedDial returns and leaves it when f returns (L52;
+// design §0.10 Y8), so a joiner that has seen the attempt end —
+// Session.Done, Health.Close, Runtime.Close — already sees it in
+// Status.Abandoned, while a call that honours ctx is never counted. It is
+// counted once only: the attempt itself ends within AbandonWait of its
+// cancellation, so no wind-down that abandons attempts still running
+// 2·AbandonWait after it (design §0.9 X2) counts it again. It fails fast
+// with ErrAbandonFull when env.Abandon is full. GuardedDial itself does not
+// run Hooks.DialStart: Establish runs it inside f, right before the factory
+// call, so callers of Establish never call it.
 func GuardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Conn, error)) (net.Conn, error) {
 	return guardedDial(ctx, env, f)
 }
@@ -57,15 +78,15 @@ func GuardedDialEarly(ctx context.Context, env *Env, f func(context.Context, []b
 }
 
 // dialCall is one guarded factory call. The factory goroutine delivers its
-// normalized result through res unless the caller gave up first, in which
-// case the goroutine closes a late conn itself (exactly once) and reports
-// to the abandonment watch.
+// normalized result through res unless the caller gave up on it first, in
+// which case the caller counted the goroutine in the abandoned-call pool and
+// the goroutine, once f returned, leaves the pool and closes a late conn
+// itself (exactly once).
 type dialCall struct {
 	env    *Env
 	res    chan dialResult // cap 1
 	mu     sync.Mutex
-	gaveUp bool   // the caller returned without the result
-	w      *watch // armed when the caller gave up
+	gaveUp bool // the caller returned without the result; the goroutine is counted in env.Abandon
 }
 
 type dialResult struct {
@@ -94,15 +115,36 @@ func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Con
 	case <-t.C:
 		err = errDialTimeout
 	}
+	// Given up: the result is err whatever f returns now. A factory that
+	// honours ctx returns at once, so the call is still joined for a short
+	// grace and is never counted as abandoned (L52).
+	late := func(r dialResult) (net.Conn, error) {
+		if r.c != nil {
+			CloseConn(env, r.c) // too late for the caller: closed exactly once
+		}
+		return nil, err
+	}
+	grace := time.NewTimer(min(dialGrace, tm.AbandonWait))
+	defer grace.Stop()
+	select {
+	case r := <-d.res:
+		return late(r)
+	case <-grace.C:
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	select {
-	case r := <-d.res: // the factory returned while the caller was giving up
-		return r.c, r.err
+	case r := <-d.res: // it returned while the grace ran out
+		return late(r)
 	default:
 	}
+	// Still inside f: stuck in embedder code, and nobody waits for it any
+	// more (L52). The Adopt happens under the lock the goroutine reads
+	// gaveUp under, so its Leave always follows it.
 	d.gaveUp = true
-	d.w = startWatch(env.Abandon, tm.AbandonWait)
+	if env.Abandon != nil {
+		env.Abandon.Adopt()
+	}
 	return nil, err
 }
 
@@ -138,10 +180,12 @@ func (d *dialCall) run(ctx context.Context, f func(context.Context) (net.Conn, e
 			return
 		}
 		d.mu.Unlock()
-		if c != nil {
-			CloseConn(d.env, c) // a late conn: closed exactly once
+		if d.env.Abandon != nil {
+			d.env.Abandon.Leave() // f returned: the call is no longer stuck in the embedder
 		}
-		d.w.finish()
+		if c != nil {
+			CloseConn(d.env, c) // a late conn: closed exactly once (its own close is watched)
+		}
 	}()
 	c, err = f(ctx)
 	normal = true
@@ -206,18 +250,22 @@ func (k *closeOnce) async(env *Env) {
 // run on the calling goroutine: it writes frame bounded by deadline (zero:
 // now + drainMax) and closes k's conn in the L05 order — CloseWrite on an
 // OwnedTCP, a drain bounded by min(deadline, drainMax), then Close on a
-// guarded goroutine (k.async). The calling goroutine is watched like the
-// closer of WriteAndClose: when it is still inside the write or the drain
-// AbandonWait after both bounds — a conn that ignores its deadlines and a
-// peer that neither reads nor closes — it is counted in the abandoned-call
-// pool and its conn is closed through k as the last resort (design §0.8
-// V2), which ends the call on a conn that honours Close. Every other close
-// of the conn must go through k too — the caller's runtime.Goexit guard
-// included, since a Goexit in a conn call skips the final close here — so
-// that it is closed exactly once (L51, L52). It is the verdict form for
-// ReadHello's PREFACE_ACK refusals (VERSION, FEATURE, and the gate's
-// CAPACITY or GOING_AWAY): the refusal stays on the handshake goroutine and
-// in its slot (L48), so Runtime.Close's handshake join covers it.
+// guarded goroutine (k.async). When the calling goroutine is still inside
+// the write or the drain AbandonWait after both bounds — a conn that ignores
+// its deadlines and a peer that neither reads nor closes — its conn is
+// closed through k as the last resort (design §0.8 V2), which ends the call
+// on a conn that honours Close. That goroutine is not counted in the
+// abandoned-call pool here: it belongs to the caller's owner, which joins
+// it and counts it once if it stays stuck (ReadHello's caller is a
+// handshake goroutine of root's handshake group, counted by Runtime.Close's
+// bounded join); a count here as well would count one stuck goroutine twice
+// (L52, design §0.9 X5). Every other close of the conn must go through k
+// too — the caller's runtime.Goexit guard included, since a Goexit in a
+// conn call skips the final close here — so that it is closed exactly once
+// (L51, L52). It is the verdict form for ReadHello's PREFACE_ACK refusals
+// (VERSION, FEATURE, and the gate's CAPACITY or GOING_AWAY): the refusal
+// stays on the handshake goroutine and in its slot (L48), so Runtime.Close's
+// handshake join covers it.
 func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Time) {
 	now := time.Now()
 	if deadline.IsZero() {
@@ -227,8 +275,8 @@ func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Tim
 	if d := deadline.Sub(now); d > 0 {
 		wait += d
 	}
-	w := armWatch(env.Abandon, wait, func() { k.async(env) })
-	defer w.finish() // also on runtime.Goexit in a conn call: nothing stays counted
+	w := armWatch(nil, wait, func() { k.async(env) }) // the last resort only: the caller's owner counts this goroutine
+	defer w.finish()                                  // also on runtime.Goexit in a conn call
 	_ = callSetWriteDeadline(k.nc, deadline)
 	if writeFull(k.nc, frame) == nil {
 		if o, ok := k.nc.(*OwnedTCP); ok {
@@ -267,7 +315,9 @@ func startWatch(pool *AbandonPool, d time.Duration) *watch {
 
 // armWatch is startWatch with a last-resort action: when the watch adopts
 // its goroutine, last runs once on the timer's goroutine, after the
-// adoption (design §0.8 V2: closeOnce.async). It must not block.
+// adoption (design §0.8 V2: closeOnce.async). It must not block. With a nil
+// pool nothing is counted (the goroutine's owner counts it) and last still
+// runs when d passes before finish.
 func armWatch(pool *AbandonPool, d time.Duration, last func()) *watch {
 	w := &watch{pool: pool, last: last}
 	if d <= 0 {

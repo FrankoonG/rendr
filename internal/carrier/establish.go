@@ -76,8 +76,10 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // Establish runs one dial attempt for carrier id on factory f, bounded as a
 // whole by Timing.DialTimeout and by ctx: the guarded factory call (DialEarly
 // with PREFACE ‖ first frame when f.DialEarly is set, else Dial followed by
-// one Write of PREFACE ‖ first frame); then PREFACE_ACK and exactly one
-// response frame under the same deadline; then deadlines are cleared.
+// one Write of PREFACE ‖ first frame; a factory that ignores ctx is given up
+// on dialGrace later and counted in env.Abandon, see GuardedDial); then
+// PREFACE_ACK and exactly one response frame under the same deadline; then
+// deadlines are cleared.
 //
 // The Write of PREFACE ‖ first frame runs on a guarded helper goroutine, the
 // hello writer, while Establish reads PREFACE_ACK (design §0.8 V1): on a
