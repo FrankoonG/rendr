@@ -111,6 +111,30 @@ func TestDecoderSeedsExactlyOne_L44_L43(t *testing.T) {
 	if got := acceptors(both); len(got) != 0 {
 		t.Errorf("two concatenated frames accepted as one encoding by %v", got)
 	}
+
+	// A PREFACE or PREFACE_ACK fed to the frame decoder fails check (1)
+	// before its type byte 'R' is looked at: bytes 2–4 ('D', '2', major)
+	// read as Len ≥ 0x443200 > MaxFramePayload whatever the major, so the
+	// canonical header order of §5.2 makes it ErrLength, not ErrType.
+	pre, pack := validPrefaces()
+	prefaces := 0
+	for _, p := range [][]byte{pre, pack} {
+		for major := range 256 {
+			b := bytes.Clone(p)
+			b[4] = byte(major)
+			reseal(b)
+			if _, err := ParseHeader(b); !errors.Is(err, ErrLength) {
+				t.Errorf("preface % x as a header: %v, want ErrLength", b[:HeaderLen], err)
+			}
+			if f, n, err := DecodeFrame(b); !errors.Is(err, ErrLength) || n != 0 || f.Payload != nil {
+				t.Errorf("preface % x as a frame: n=%d %v, want ErrLength", b[:HeaderLen], n, err)
+			}
+			prefaces++
+		}
+	}
+	if prefaces != 512 {
+		t.Fatalf("%d prefaces fed to the frame decoder, want 512", prefaces)
+	}
 }
 
 func validPrefaces() (pre, ack []byte) {
@@ -624,7 +648,10 @@ func TestParseHeaderRules_L44(t *testing.T) {
 			}
 		}
 		// Handles: carrier-level frames need 0, session frames non-zero;
-		// extension handles are opaque.
+		// extension handles are opaque. This is the stateless rule of the
+		// declared ParseHeader contract; that a session frame's handle is
+		// its carrier's session handle (SessionHandle in M1) is a
+		// per-carrier rule checked by the carrier's reader and handshake.
 		for _, hd := range []uint32{0, 1, 2, 0xffffffff} {
 			_, err := ParseHeader(hdr(byte(i), 0, uint32(lo), hd))
 			wantOK := ty.Extension() || ty.CarrierLevel() == (hd == 0)

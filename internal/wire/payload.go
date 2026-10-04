@@ -233,7 +233,10 @@ func PutDataOffset(dst []byte, off uint64) {
 
 // ParseDataOffset returns the offset of a DATA payload p. p must hold at
 // least DataPrefixLen+1 bytes (empty DATA is malformed: ErrLength) and
-// offset+len(data) must not overflow uint64 (ErrValue).
+// offset+len(data) must not overflow uint64 (ErrValue). A reader that does
+// not hold the payload contiguously (a big DATA payload read into its own
+// buffer) applies the same end rule to the offset and the payload length
+// from the header: off ≤ 2^64 − 1 − n for n = Len − DataPrefixLen bytes.
 func ParseDataOffset(p []byte) (uint64, error) {
 	if len(p) <= DataPrefixLen {
 		return 0, ErrLength
@@ -409,7 +412,9 @@ func PutPing(dst []byte, p *Ping) int {
 }
 
 // ParsePing decodes a PING or PONG payload: ≥ PingFixedLen bytes, pad ≤
-// MaxPingPad (ErrLength), every pad byte zero (ErrReserved).
+// MaxPingPad (ErrLength), every pad byte zero (ErrReserved). A reader that
+// streams a pad larger than its buffer applies the same zero rule to every
+// chunk of it; the pad length comes from the header (Len − PingFixedLen).
 func ParsePing(p []byte) (Ping, error) {
 	if len(p) < PingFixedLen {
 		return Ping{}, ErrShort

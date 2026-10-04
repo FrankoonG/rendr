@@ -41,6 +41,13 @@ func PutHeader(b []byte, h *Header) {
 // MaxFramePayload applies: its flags and handle are opaque. The fseq is not
 // checked (it is stateful; see SeqLess). Fewer than HeaderLen bytes are
 // ErrShort; bytes after the header are ignored.
+//
+// The handle rule is stateless: 0 for a carrier-level type, non-zero for a
+// session type. That a session frame carries its own carrier's session
+// handle (SessionHandle in M1) and that the carrier accepts session frames
+// at all (probe and sessionless carriers do not) are per-carrier rules
+// (design §5.2 check 4) that the code reading the carrier applies after
+// ParseHeader.
 func ParseHeader(b []byte) (Header, error) {
 	if len(b) < HeaderLen {
 		return Header{}, ErrShort

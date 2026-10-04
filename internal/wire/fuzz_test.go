@@ -7,6 +7,7 @@ import (
 	"flag"
 	"hash/crc32"
 	"math/rand/v2"
+	"sync/atomic"
 	"testing"
 )
 
@@ -18,9 +19,10 @@ import (
 // on every input: no panic, the input is unchanged, the result equals an
 // independent reference of the specification, an accepted input re-encodes
 // to exactly the same bytes (decode(encode(x)) == x), and an accepted
-// whole encoding is accepted by exactly one decoder. Allocation-freedom is
-// checked on every seed (AllocsPerRun stops the world, so it is skipped for
-// generated inputs while fuzzing).
+// whole encoding is accepted by exactly one decoder. Allocation-freedom
+// (AllocsPerRun == 0) is checked on every seed and, while the fuzzing engine
+// runs, on a sample of the generated inputs (AllocsPerRun stops the world,
+// which would slow fuzzing down if it ran on every input).
 
 // fuzzing reports whether the fuzzing engine runs (rather than the seeds
 // being replayed as ordinary subtests).
@@ -28,6 +30,21 @@ func fuzzing() bool {
 	f := flag.Lookup("test.fuzz")
 	return f != nil && f.Value.String() != ""
 }
+
+const (
+	// allocSampleEvery: while fuzzing, one checkAllocs call in this many is
+	// measured (each fuzz worker process counts its own calls).
+	allocSampleEvery = 4096
+	// fuzzAllocRuns is the AllocsPerRun count of a sampled check.
+	// AllocsPerRun reports mallocs / runs rounded down: a deterministic
+	// decoder that allocates does so on every call and reports ≥ 1, while a
+	// few stray allocations of the fuzzing engine during the measurement (a
+	// timer goroutine) round down to 0.
+	fuzzAllocRuns = 64
+)
+
+// allocChecks counts the checkAllocs calls made while fuzzing.
+var allocChecks atomic.Uint64
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -116,12 +133,18 @@ func sameErr(got, want error) bool {
 	return errors.Is(got, want)
 }
 
+// checkAllocs asserts that f allocates nothing: on every replayed seed, and
+// on every allocSampleEvery-th call while fuzzing.
 func checkAllocs(t *testing.T, name string, f func()) {
 	t.Helper()
+	runs := 2
 	if fuzzing() {
-		return
+		if allocChecks.Add(1)%allocSampleEvery != 0 {
+			return
+		}
+		runs = fuzzAllocRuns
 	}
-	if a := testing.AllocsPerRun(2, f); a != 0 {
+	if a := testing.AllocsPerRun(runs, f); a != 0 {
 		t.Fatalf("%s allocated %v times", name, a)
 	}
 }
@@ -386,7 +409,22 @@ func FuzzStream_L42_L43(f *testing.F) {
 		if !bytes.Equal(stream, orig) {
 			t.Fatal("the decoder modified its input")
 		}
+		checkAllocs(t, "stream decode", func() { decodeAll(stream) })
 	})
+}
+
+// decodeAll decodes frames from the front of b until the first error and
+// keeps nothing (the allocation check of the stream target).
+func decodeAll(b []byte) {
+	for at := 0; ; {
+		f, n, err := DecodeFrame(b[at:])
+		if err != nil {
+			sinkErr = err
+			return
+		}
+		sinkFrame = f
+		at += n
+	}
 }
 
 // decodeOneShot decodes frames from the front of b until the first error;

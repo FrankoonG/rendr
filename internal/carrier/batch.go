@@ -167,10 +167,12 @@ func (b *Batch) Room() int {
 }
 
 // Full reports that no further frame of any kind fits (frame count or
-// control arena exhausted): the frame limit is reached, or the control
-// arena and the DATA budget are both used up.
+// control arena exhausted). Every Add* refuses while Full is true, DATA
+// included. Full false does not promise that a particular frame fits:
+// AddData also needs len(body) ≤ Room(), and a control frame needs room
+// for its payload in the arena, so callers check every Add* result.
 func (b *Batch) Full() bool {
-	return b.n >= MaxBatchFrames || (b.ctl >= ControlArena && b.data >= b.budget)
+	return b.n >= MaxBatchFrames || b.ctl >= ControlArena
 }
 
 // AddOpenAck appends an OPEN_ACK frame; false if the batch is full.
@@ -263,7 +265,7 @@ func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx
 	if handle == 0 {
 		panic("rendr/carrier: session frame with handle 0")
 	}
-	if b.n >= MaxBatchFrames || len(body) > b.budget-b.data {
+	if b.Full() || len(body) > b.Room() {
 		return false
 	}
 	if chunk != nil {

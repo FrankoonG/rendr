@@ -1,28 +1,9 @@
 package carrier
 
 import (
-	"runtime"
 	"sync"
 	"testing"
 )
-
-// poolDrops reports whether sync.Pool drops items, which it does on purpose
-// under the race detector. Allocation counts of pool-backed paths are then
-// not asserted: allocation gates belong to the non-race lane (design §11.1);
-// the code paths still run and their accounting is still checked.
-func poolDrops() bool {
-	var p sync.Pool
-	p.New = func() any { return new([64]byte) }
-	x := p.Get()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	for range 1000 {
-		p.Put(x)
-		x = p.Get()
-	}
-	runtime.ReadMemStats(&after)
-	return after.Mallocs-before.Mallocs > 100
-}
 
 func mustPanic(t *testing.T, name string, f func()) {
 	t.Helper()
@@ -36,13 +17,30 @@ func mustPanic(t *testing.T, name string, f func()) {
 }
 
 // TestBufClasses: Get returns the smallest of the seven classes 2^k + 64
-// (k = 14..20) that holds n bytes, for every class edge.
+// (k = 14..20) that holds n bytes, for every class edge and for the
+// big-DATA sizes n + LookAhead with n = 2^k+30 … 2^k+64, k = 14..16, around
+// each class top (the pool side of design C15; the reader's own bound is
+// exercised by the carrier reader's tests).
 func TestBufClasses(t *testing.T) {
 	p := NewBufPool()
 	sizes := []int{0, 1, BigData, ChunkSize, MaxClass, MaxClass + ClassSlack}
 	for k := minClassShift; k <= maxClassShift; k++ {
 		for d := -2; d <= 2; d++ {
 			sizes = append(sizes, 1<<k+ClassSlack+d, 1<<k+d)
+		}
+	}
+	for k := 14; k <= 16; k++ {
+		for n := 1<<k + 30; n <= 1<<k+64; n++ {
+			sizes = append(sizes, n+LookAhead)
+		}
+		// The read window n + LookAhead (trailer included) stays inside
+		// class k exactly while n ≤ 2^k + 39; a bound four bytes larger
+		// would have crossed the class top for n = 2^k+36 … 2^k+39.
+		if c := classFor(1<<k + 39 + LookAhead); c != k-minClassShift {
+			t.Errorf("n = 2^%d+39: class %d, want %d", k, c, k-minClassShift)
+		}
+		if c := classFor(1<<k + 40 + LookAhead); c != k-minClassShift+1 {
+			t.Errorf("n = 2^%d+40: class %d, want %d", k, c, k-minClassShift+1)
 		}
 	}
 	for _, n := range sizes {
@@ -68,48 +66,6 @@ func TestBufClasses(t *testing.T) {
 	mustPanic(t, "Get(-1)", func() { p.Get(-1, nil) })
 	mustPanic(t, "Get(max+1)", func() { p.Get(MaxClass+ClassSlack+1, nil) })
 	mustPanic(t, "TryGet(max+1)", func() { p.TryGet(MaxClass+ClassSlack+1, NewBudget(1<<30)) })
-}
-
-// TestBufClassBoundaryLookAhead_L42 (C15) sweeps every big-DATA payload size
-// n = 2^k+30 … 2^k+64 for k = 14, 15, 16 at the Buf level: the reader reads
-// payload, trailer and the next frame's header and offset into
-// Get(n+LookAhead).B[:n+LookAhead], which always fits, while the pre-C15
-// bound n+4+LookAhead overflowed the class at the top of each class.
-func TestBufClassBoundaryLookAhead_L42(t *testing.T) {
-	p := NewBufPool()
-	bud := NewBudget(1 << 30)
-	next := []byte{0x10, 0, 0, 9, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 7} // header + offset of the next frame
-	for k := 14; k <= 16; k++ {
-		overflowed := 0
-		for n := 1<<k + 30; n <= 1<<k+64; n++ {
-			b := p.Get(n+LookAhead, bud)
-			if len(b.B) < n+LookAhead {
-				t.Fatalf("n=%d: Get(n+LookAhead) holds %d bytes", n, len(b.B))
-			}
-			if n+4+LookAhead > len(b.B) {
-				overflowed++
-			}
-			// One read in steady state: payload ‖ trailer ‖ look-ahead.
-			win := b.B[:n+LookAhead]
-			for i := range n {
-				win[i] = byte(i * 7)
-			}
-			copy(win[n:], []byte{0xde, 0xad, 0xbe, 0xef})
-			copy(win[n+4:], next)
-			if win[n] != 0xde || win[n+3] != 0xef || string(win[n+4:]) != string(next) || win[n-1] != byte((n-1)*7) {
-				t.Fatalf("n=%d: window contents corrupted", n)
-			}
-			b.Release()
-		}
-		// Stimulus proof: the sweep reached the sizes where the old bound
-		// would have sliced beyond the class (n+25 in (2^k+60, 2^k+64]).
-		if overflowed != 4 {
-			t.Fatalf("k=%d: %d sizes where n+4+LookAhead exceeds the class, want 4", k, overflowed)
-		}
-	}
-	if bud.Used() != 0 {
-		t.Fatalf("budget %d after every buffer was released", bud.Used())
-	}
 }
 
 // TestBudgetAccounting: TryAcquire never exceeds max, Acquire is a forced
@@ -279,7 +235,10 @@ func TestBufDoubleRelease(t *testing.T) {
 }
 
 // TestBufPoolZeroAllocs_L41: in steady state Get, TryGet, Ref and Release
-// allocate nothing (warm per-class pools).
+// allocate nothing (warm per-class pools). The race detector makes
+// sync.Pool drop items on purpose, so the count is asserted only in the
+// non-race lane (design §11.1); the race lane still runs the cycles and
+// checks their accounting.
 func TestBufPoolZeroAllocs_L41(t *testing.T) {
 	p := NewBufPool()
 	bud := NewBudget(1 << 30)
@@ -296,8 +255,8 @@ func TestBufPoolZeroAllocs_L41(t *testing.T) {
 	if bud.Used() != 0 {
 		t.Fatalf("budget %d after the cycles", bud.Used())
 	}
-	if poolDrops() {
-		t.Logf("sync.Pool drops items (race detector): %v allocs per cycle not asserted", allocs)
+	if bufRaceEnabled {
+		t.Logf("race detector on: %v allocs per cycle not asserted (non-race lane only)", allocs)
 		return
 	}
 	if allocs != 0 {

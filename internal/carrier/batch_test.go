@@ -178,8 +178,9 @@ func TestBatchDataBudget(t *testing.T) {
 }
 
 // TestBatchFrameAndArenaLimits: at most MaxBatchFrames frames and
-// ControlArena control-payload bytes per batch; Full reports when no frame
-// of any kind fits.
+// ControlArena control-payload bytes per batch; Full reports that no frame
+// of any kind fits (frame count or control arena exhausted) and every Add*
+// then refuses, DATA included; a full DATA budget alone is not Full.
 func TestBatchFrameAndArenaLimits(t *testing.T) {
 	b := NewBatch(1 << 20)
 	b.Reset(time.Time{})
@@ -197,7 +198,9 @@ func TestBatchFrameAndArenaLimits(t *testing.T) {
 	}
 
 	// Control arena: 31 RSTs with 255-byte messages and one with 127 bytes
-	// fill the 8 KiB exactly; then no control frame fits, DATA still does.
+	// fill the 8 KiB exactly. A frame that does not fit the arena's rest is
+	// refused while the batch is not yet Full; once the arena is exhausted
+	// the batch is Full and refuses every frame, DATA included.
 	b.Reset(time.Time{})
 	msg := bytes.Repeat([]byte{'m'}, wire.MaxMsg)
 	for i := range 31 {
@@ -205,21 +208,32 @@ func TestBatchFrameAndArenaLimits(t *testing.T) {
 			t.Fatalf("RST %d refused", i)
 		}
 	}
-	if !b.AddRst(h1, &wire.Rst{Code: 1, Msg: msg[:ControlArena-31*(wire.RstFixedLen+wire.MaxMsg)-wire.RstFixedLen]}) {
+	last := ControlArena - 31*(wire.RstFixedLen+wire.MaxMsg) - wire.RstFixedLen
+	if b.Full() || b.AddRst(h1, &wire.Rst{Code: 1, Msg: msg[:last+1]}) || b.Len() != 31 {
+		t.Fatalf("an RST one byte beyond the arena: full %v len %d", b.Full(), b.Len())
+	}
+	if !b.AddRst(h1, &wire.Rst{Code: 1, Msg: msg[:last]}) {
 		t.Fatal("the RST that fills the arena exactly was refused")
 	}
-	if b.ctl != ControlArena {
-		t.Fatalf("control arena %d, want %d", b.ctl, ControlArena)
+	if b.ctl != ControlArena || !b.Full() {
+		t.Fatalf("control arena %d of %d, full %v", b.ctl, ControlArena, b.Full())
 	}
-	if b.AddFin(h1, 1) || b.addGoAway(wire.GoAwayShutdown) || b.addPong(&wire.Ping{}) {
-		t.Fatal("a control frame beyond ControlArena was added")
+	if b.AddFin(h1, 1) || b.addGoAway(wire.GoAwayShutdown) || b.addPong(&wire.Ping{}) || b.AddData(h1, 0, []byte{1}, nil, false) {
+		t.Fatal("a frame was added to a batch whose control arena is exhausted")
 	}
-	if b.Full() {
-		t.Fatal("Full with DATA room left")
+	if b.Len() != 32 || b.Room() != 1<<20 {
+		t.Fatalf("refused frames changed the batch: len %d room %d", b.Len(), b.Room())
 	}
+
+	// DATA budget: a used-up budget refuses DATA but is not Full (control
+	// frames still fit); the largest DATA body fits a 1 MiB budget.
+	b.Reset(time.Time{})
 	big := make([]byte, wire.MaxFramePayload-wire.DataPrefixLen) // the largest DATA body
-	if !b.AddData(h1, 0, big, nil, false) || b.Full() || !b.AddData(h1, 1, big[:wire.DataPrefixLen], nil, false) || !b.Full() {
-		t.Fatalf("after the DATA budget was used: room %d full %v", b.Room(), b.Full())
+	if !b.AddData(h1, 0, big, nil, false) || b.Full() || !b.AddData(h1, 1, big[:wire.DataPrefixLen], nil, false) {
+		t.Fatalf("filling the DATA budget: room %d full %v", b.Room(), b.Full())
+	}
+	if b.Room() != 0 || b.Full() || b.AddData(h1, 2, []byte{1}, nil, false) || !b.AddFin(h1, 3) {
+		t.Fatalf("after the DATA budget was used: room %d full %v len %d", b.Room(), b.Full(), b.Len())
 	}
 	if b.wireLen() != b.used+b.bodies || b.used > arenaSize {
 		t.Fatalf("arena %d of %d", b.used, arenaSize)
