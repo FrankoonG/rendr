@@ -12,8 +12,8 @@ type Status struct {
 	Sessionless        int      // probe carriers held by this (passive) Runtime
 	BufferedBytes      int64    // MaxBufferedBytes accounting (buffer capacity)
 	Abandoned          int      // goroutines still stuck in embedder calls past their bound (L52)
-	EventsDropped      uint64   // events dropped because the queue was full
-	CallbackPanics     uint64   // OnEvent panics recovered
+	EventsDropped      uint64   // events dropped because the queue was full (or emitted after Close)
+	CallbackPanics     uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
 	ConfigAdjustments  []string // "Field: old → new (reason)"; Config first, then "Listen[i].Field: ..."
 }
 

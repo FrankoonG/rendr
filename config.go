@@ -44,9 +44,11 @@ type Config struct {
 
 	// OnEvent, if set, is called with every event on a single worker
 	// goroutine fed by a bounded queue (256); a full queue drops and counts
-	// (Status.EventsDropped); a panic is recovered and counted
-	// (Status.CallbackPanics). It is never called with a rendr lock held and
-	// may call any rendr method, including Close.
+	// (Status.EventsDropped; the Seq gap shows the drop); a panic is
+	// recovered and counted (Status.CallbackPanics), and so is a
+	// runtime.Goexit, after which a new worker continues with the next
+	// event. It is never called with a rendr lock held and may call any
+	// rendr method, including Close.
 	OnEvent func(Event)
 }
 
