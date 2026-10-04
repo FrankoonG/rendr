@@ -42,10 +42,10 @@ func (a *actor) pendingErr() error {
 	return verdictErr(a.verdict)
 }
 
-// reply sends Confirm's or Reject's answer after the lock is released
-// (capacity 1: never blocks).
+// reply sends Confirm's or Reject's answer after the lock is released,
+// before the step's Registry calls (capacity 1: never blocks).
 func (a *actor) reply(ch chan error, err error) {
-	a.later = append(a.later, func() { ch <- err })
+	a.answer(func() { ch <- err })
 }
 
 // pendingLocked runs the pending phase's deadlines: the dialer's RST
@@ -60,6 +60,28 @@ func (a *actor) pendingLocked(now time.Time) {
 		return
 	}
 	a.want(a.acceptBy)
+}
+
+// pendingFactsLocked applies the facts of the pending phase that a carrier
+// or the stream already recorded — the dialer's RST(AbortWithdrawn), its
+// GOAWAY — before a verdict command of the same step runs: a Confirm or
+// Reject queued behind a withdrawal must answer ErrSessionLost, never open
+// a withdrawn session (§6.2).
+func (a *actor) pendingFactsLocked(now time.Time) {
+	s := a.s
+	if a.ending || s.ctl.state != StatePending {
+		return
+	}
+	if s.st.rstIn != nil {
+		a.withdrawnLocked(now)
+		return
+	}
+	for _, l := range s.lanes {
+		if l.c.PeerGoAway() {
+			a.peerGoAwayLocked(now)
+			return
+		}
+	}
 }
 
 // withdrawnLocked ends a pending session withdrawn by its dialer
@@ -90,26 +112,33 @@ func (a *actor) refusePendingLocked(now time.Time, ack wire.OpenAck, goAway bool
 // onConfirmLocked is PendingConn.Confirm: OPEN_ACK(OK, window) becomes the
 // first frame of every OPEN carrier and their writers are released; the
 // epoch-0 sender is the oldest live OPEN carrier (selector) or all of them
-// (bond). With no carrier alive the no-path episode starts now.
+// (bond). It routes at once — its DATA may follow the OPEN_ACK in the same
+// batch — so it is reported routed (active, or a bond member) in this same
+// critical section (L27); its CarrierUp follows once the OPEN_ACK is
+// placed. With no carrier alive the no-path episode starts now. The reply
+// precedes Registry.Opened (a slow Registry never delays Confirm).
 func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 	s := a.s
 	ctl := &s.ctl
+	a.pendingFactsLocked(now)
 	if a.ending || a.decided || ctl.state != StatePending {
 		a.reply(c.reply, a.pendingErr())
 		return
 	}
 	a.decided, a.opened = true, true
+	a.openedAt = now
 	ctl.state = StateOpen
 	win := s.openWindowLocked()
 	var sender *lane
 	for _, l := range s.lanes {
-		if l.state == LaneDead || l.firstSent || l.first.t != 0 {
-			continue
+		if l.state == LaneDead || l.retireCalled || l.firstSent || l.first.t != 0 {
+			continue // a retired carrier closes without an answer
 		}
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: win}}
 		if s.aliveLocked(l) {
 			if s.p.Mode == ModeBond {
 				l.data = true
+				l.state = LaneMember
 			} else if sender == nil {
 				sender = l
 			}
@@ -118,12 +147,13 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 	}
 	if sender != nil {
 		sender.data = true
+		sender.state = LaneActive
 		ctl.active = sender
 		a.named = sender.id
 	}
 	s.routingChangedLocked()
 	a.dirty = true
-	a.reply(c.reply, nil) // before Opened: a slow Registry never delays Confirm
+	a.reply(c.reply, nil)
 	a.registry(func(r Registry) { r.Opened(s) })
 	if !a.hasAliveLocked() {
 		a.episodeStartLocked(now, now)
@@ -131,8 +161,11 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 }
 
 // onRejectLocked is PendingConn.Reject: OPEN_ACK(REJECTED, code,
-// msg[:255]) on every OPEN carrier; the tombstone repeats it.
+// msg[:255]) on every OPEN carrier; the tombstone repeats it. The reply
+// precedes Registry.Ended (as Confirm's precedes Opened), so a caller
+// never waits for Registry.Ended.
 func (a *actor) onRejectLocked(now time.Time, c *reject) {
+	a.pendingFactsLocked(now)
 	if a.ending || a.decided || a.s.ctl.state != StatePending {
 		a.reply(c.reply, a.pendingErr())
 		return
@@ -141,18 +174,20 @@ func (a *actor) onRejectLocked(now time.Time, c *reject) {
 	if len(msg) > wire.MaxMsg {
 		msg = msg[:wire.MaxMsg]
 	}
-	a.refusePendingLocked(now, wire.OpenAck{Status: wire.StatusRejected, Code: c.code, Msg: []byte(msg)}, false)
 	a.reply(c.reply, nil)
+	a.refusePendingLocked(now, wire.OpenAck{Status: wire.StatusRejected, Code: c.code, Msg: []byte(msg)}, false)
 }
 
-// onRefuseLocked is RefusePending (Listener.Close: GOING_AWAY).
+// onRefuseLocked is RefusePending (Listener.Close: GOING_AWAY). Its reply,
+// too, precedes Registry.Ended.
 func (a *actor) onRefuseLocked(now time.Time, c *refuse) {
+	a.pendingFactsLocked(now)
 	ok := !a.ending && !a.decided && a.s.ctl.state == StatePending
+	ch := c.reply
+	a.answer(func() { ch <- ok })
 	if ok {
 		a.refusePendingLocked(now, wire.OpenAck{Status: c.status, Code: c.code}, false)
 	}
-	ch := c.reply
-	a.later = append(a.later, func() { ch <- ok })
 }
 
 // onAdoptLocked attaches a carrier admitted by Join or AttachOpen
@@ -173,6 +208,7 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	}
 	a.gen++
 	l := a.newLaneLocked(now, ad.conn, -1, a.gen, LaneJoining)
+	a.unconfirmed = append(a.unconfirmed, l)
 	switch {
 	case ad.kind == adoptJoin:
 		l.first = firstFrame{t: wire.TypeJoinAck, joinAck: wire.JoinAck{Status: wire.StatusOK, RxNext: s.st.rRead}}
@@ -187,7 +223,9 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 
 // refuseAdopt answers an adopted carrier of an ended session and closes it:
 // JOIN_ACK(UNKNOWN_SESSION), or the session's verdict to a duplicate OPEN.
+// The carrier joins the exit join (§6.8).
 func (a *actor) refuseAdopt(ad *adopt) {
+	defer a.dropConn(ad.conn)
 	if ad.kind == adoptJoin {
 		var p [wire.JoinAckLen]byte
 		n := wire.PutJoinAck(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession})
@@ -202,21 +240,28 @@ func (a *actor) refuseAdopt(ad *adopt) {
 
 // lanesConfirmedLocked handles factLaneConfirmed on the passive: a lane
 // whose first response (an OK) was placed joins the routing (L22: a carrier
-// is confirmed before it carries data) and is announced.
+// is confirmed before it carries data) and is announced (CarrierUp); the
+// epoch-0 sender already routes since Confirm and is only announced. A
+// refused or dead lane is dropped from the list unannounced.
 func (a *actor) lanesConfirmedLocked(now time.Time) {
-	s := a.s
 	route := false
-	for _, l := range s.lanes {
-		if l.state != LaneJoining || !l.firstSent || refusedLocked(l) {
-			continue
+	k := 0
+	for _, l := range a.unconfirmed {
+		switch {
+		case l.state == LaneDead || refusedLocked(l):
+		case !l.firstSent:
+			a.unconfirmed[k] = l
+			k++
+		default:
+			if l.state == LaneJoining {
+				l.state = LaneMember
+			}
+			a.dirty, route = true, true
+			a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)
 		}
-		l.state = LaneMember
-		if l == s.ctl.active {
-			l.state = LaneActive
-		}
-		a.dirty, route = true, true
-		a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)
 	}
+	clear(a.unconfirmed[k:])
+	a.unconfirmed = a.unconfirmed[:k]
 	if route {
 		a.passiveRouteLocked(now)
 	}

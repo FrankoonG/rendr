@@ -125,13 +125,19 @@ func (r *acRegistry) endedVerdict(s *Session) (Verdict, bool) {
 	return v, ok
 }
 
-// acEvents records events.
+// acEvents records events. hold, when set, runs on the emitting actor's
+// goroutine for every event before it is recorded (a test may block there
+// to hold that actor between two steps).
 type acEvents struct {
-	mu  sync.Mutex
-	evs []Event
+	mu   sync.Mutex
+	evs  []Event
+	hold atomic.Pointer[func(Event)]
 }
 
 func (e *acEvents) Emit(ev Event) {
+	if h := e.hold.Load(); h != nil {
+		(*h)(ev)
+	}
 	e.mu.Lock()
 	e.evs = append(e.evs, ev)
 	e.mu.Unlock()
@@ -180,14 +186,45 @@ type acPassive struct {
 	t       testing.TB
 	maxMeta int
 	gate    carrier.Gate
-	mu      sync.Mutex
-	tab     map[[16]byte]*acEntry
-	pending chan *Session // admitted sessions in admission order (the listener queue)
-	wg      sync.WaitGroup
+	// answer, when set, may replace the admission of a new OPEN by a
+	// scripted OPEN_ACK (typed Dial answers); ok false admits normally.
+	answer func(o *wire.Open) (oa wire.OpenAck, ok bool)
+	// joinAnswer, when set, may answer a JOIN with a scripted JOIN_ACK
+	// (the carrier is closed after it); ok false routes the JOIN normally.
+	joinAnswer func(j *wire.Join) (ja wire.JoinAck, ok bool)
+	mu         sync.Mutex
+	tab        map[[16]byte]*acEntry
+	pending    chan *Session // admitted sessions in admission order (the listener queue)
+	wg         sync.WaitGroup
 	// Admission outcomes (stimulus proofs): JOIN answers by status, and
 	// duplicate OPENs refused by AttachOpen by status and code.
 	joins      map[wire.AckStatus]int
 	openRefuse map[[2]uint32]int
+	// closing holds the carriers the shim answered and closed itself (the
+	// root's handshake goroutines own those); teardown joins them.
+	closing []*carrier.Conn
+}
+
+// closed records a carrier the shim answered and closed.
+func (p *acPassive) closed(c *carrier.Conn) {
+	p.mu.Lock()
+	p.closing = append(p.closing, c)
+	p.mu.Unlock()
+}
+
+// joinClosing waits for every carrier the shim closed (bounded: each one's
+// close is itself bounded by its write deadline, drain and AbandonWait).
+func (p *acPassive) joinClosing(t testing.TB) {
+	p.mu.Lock()
+	cs := append([]*carrier.Conn(nil), p.closing...)
+	p.mu.Unlock()
+	for _, c := range cs {
+		select {
+		case <-c.Done():
+		case <-time.After(10 * time.Second):
+			t.Errorf("a carrier the admission shim closed is not done")
+		}
+	}
 }
 
 // counts returns copies of the admission counters.
@@ -252,6 +289,7 @@ func (p *acPassive) accept(nc net.Conn) error {
 			p.admitJoin(h)
 		default:
 			h.Conn.Kill(carrier.CauseLocalClose, "no sessionless carriers in actor tests")
+			p.closed(h.Conn)
 		}
 	}()
 	return nil
@@ -260,8 +298,14 @@ func (p *acPassive) accept(nc net.Conn) error {
 func (p *acPassive) admitOpen(h *carrier.Hello) {
 	o, err := wire.ParseOpen(h.Payload, p.maxMeta)
 	if err != nil {
-		acAnswerOpen(h.Conn, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeBadValue})
+		p.answerOpen(h.Conn, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeBadValue})
 		return
+	}
+	if p.answer != nil {
+		if oa, ok := p.answer(&o); ok {
+			p.answerOpen(h.Conn, oa)
+			return
+		}
 	}
 	p.mu.Lock()
 	e := p.tab[o.SID]
@@ -279,29 +323,37 @@ func (p *acPassive) admitOpen(h *carrier.Hello) {
 	s, tomb, v := e.s, e.tomb, e.v
 	p.mu.Unlock()
 	if tomb {
-		acAnswerOpen(h.Conn, v.OpenAck())
+		p.answerOpen(h.Conn, v.OpenAck())
 		return
 	}
 	if taken, v := s.AttachOpen(h.Conn); !taken {
 		p.mu.Lock()
 		p.openRefuse[[2]uint32{uint32(v.Status), v.Code}]++
 		p.mu.Unlock()
-		acAnswerOpen(h.Conn, v.OpenAck())
+		p.answerOpen(h.Conn, v.OpenAck())
 	}
 }
 
 func (p *acPassive) admitJoin(h *carrier.Hello) {
 	j, err := wire.ParseJoin(h.Payload)
 	if err != nil {
-		acAnswerJoin(h.Conn, wire.StatusBadRequest)
+		p.answerJoin(h.Conn, wire.StatusBadRequest)
 		return
+	}
+	if p.joinAnswer != nil {
+		if ja, ok := p.joinAnswer(&j); ok {
+			var b [wire.JoinAckLen]byte
+			h.Conn.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:wire.PutJoinAck(b[:], &ja)], time.Time{})
+			p.closed(h.Conn)
+			return
+		}
 	}
 	s := p.session(j.SID)
 	if s == nil {
 		p.mu.Lock()
 		p.joins[wire.StatusUnknownSession]++
 		p.mu.Unlock()
-		acAnswerJoin(h.Conn, wire.StatusUnknownSession)
+		p.answerJoin(h.Conn, wire.StatusUnknownSession)
 		return
 	}
 	taken, st := s.Join(h.Conn, &j)
@@ -309,18 +361,22 @@ func (p *acPassive) admitJoin(h *carrier.Hello) {
 	p.joins[st]++
 	p.mu.Unlock()
 	if !taken {
-		acAnswerJoin(h.Conn, st)
+		p.answerJoin(h.Conn, st)
 	}
 }
 
-func acAnswerOpen(c *carrier.Conn, oa wire.OpenAck) {
+// answerOpen writes oa on the unstarted carrier c and closes it.
+func (p *acPassive) answerOpen(c *carrier.Conn, oa wire.OpenAck) {
 	b := make([]byte, wire.OpenAckFixedLen+len(oa.Msg))
 	c.WriteAndClose(wire.TypeOpenAck, 0, wire.SessionHandle, b[:wire.PutOpenAck(b, &oa)], time.Time{})
+	p.closed(c)
 }
 
-func acAnswerJoin(c *carrier.Conn, st wire.AckStatus) {
+// answerJoin writes JOIN_ACK(st) on the unstarted carrier c and closes it.
+func (p *acPassive) answerJoin(c *carrier.Conn, st wire.AckStatus) {
 	var b [wire.JoinAckLen]byte
 	c.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:wire.PutJoinAck(b[:], &wire.JoinAck{Status: st})], time.Time{})
+	p.closed(c)
 }
 
 // acWorld is one test's two Runtimes, links and sessions; teardown shuts
@@ -355,9 +411,26 @@ func acNewWorld(t testing.TB, hooks *testhooks.Hooks) *acWorld {
 	return w
 }
 
+// acLinkDelay is the one-way delay every actor-test link starts with. On a
+// link without delay a PONG can arrive before its PING's write commit
+// (with GOMAXPROCS=1 every PONG does); the carrier estimator then gives no
+// sample and does not advance its PONG watermark, so a carrier that sends
+// DATA stays capped at its capacity floor for good (a carrier-layer defect
+// reported to WP3). A virtual one-way delay makes every PONG arrive after
+// the commit: the commit happens at the write's virtual instant, the PONG
+// two delays later.
+const acLinkDelay = time.Millisecond
+
 // link makes a link to the passive.
 func (w *acWorld) link(name string) *rendrtest.Link {
-	l := rendrtest.NewLink(rendrtest.LinkConfig{Name: name, Accept: w.b.accept})
+	l := w.linkTo(name, w.b)
+	return l
+}
+
+// linkTo makes a link to passive p (another instance of the peer).
+func (w *acWorld) linkTo(name string, p *acPassive) *rendrtest.Link {
+	l := rendrtest.NewLink(rendrtest.LinkConfig{Name: name, Accept: p.accept})
+	l.SetDelay(acLinkDelay, 0)
 	w.links = append(w.links, l)
 	return l
 }
@@ -431,7 +504,11 @@ func (w *acWorld) open(mode Mode, h healthSource, links ...*rendrtest.Link) (dia
 	return r.s, passive
 }
 
-// teardown shuts every session down and joins everything.
+// teardown shuts every session down and joins everything: each session's
+// Done (it covers its lanes, its attempts and every carrier it closed
+// itself), the links, the shim's handshakes and the carriers the shim
+// closed. Every buffer is charged only while a started carrier's reader or
+// writer holds it, so both Budgets are back at zero once that is all done.
 func (w *acWorld) teardown() {
 	defer close(w.quit)
 	for _, s := range w.sess {
@@ -449,7 +526,7 @@ func (w *acWorld) teardown() {
 		l.Close()
 	}
 	w.b.wg.Wait()
-	time.Sleep(5 * time.Second) // closers and drains of unowned conns finish (virtual time)
+	w.b.joinClosing(w.t)
 	synctest.Wait()
 	if u := w.a.cenv.Budget.Used(); u != 0 {
 		w.t.Errorf("dialer Budget: %d bytes still charged", u)

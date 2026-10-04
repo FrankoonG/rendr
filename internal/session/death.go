@@ -19,6 +19,11 @@ import (
 // section. Hooks.DeathObserved runs before each, outside the lock (a test
 // may hold the actor there, L21, L27). It returns now, refreshed after a
 // hook held the actor (migration timestamps are publication times, L09).
+//
+// A GOAWAY the peer sent on the dying carrier is reconciled first, in the
+// same critical section: GOAWAY ends the session whether or not its lane
+// is still alive (§4.7, §6.8), so a carrier that died right after
+// delivering it never hides it.
 func (a *actor) reapDead(now time.Time) time.Time {
 	s := a.s
 	for i := 0; i < len(s.lanes); {
@@ -32,6 +37,9 @@ func (a *actor) reapDead(now time.Time) time.Time {
 			now = time.Now()
 		}
 		s.mu.Lock()
+		if l.c.PeerGoAway() {
+			a.peerGoAwayLocked(now)
+		}
 		a.laneDiedLocked(now, l) // removes l from s.lanes: i now names the next lane
 		a.unlockStep(now)
 	}
@@ -68,7 +76,9 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 		}
 	}
 	if !a.hasAliveLocked() {
-		a.episodeStartLocked(now, at)
+		// The other lanes may have ended too and wait for their own death
+		// step: the episode starts at the death of the last live carrier.
+		a.episodeStartLocked(now, a.lastDeathLocked(at))
 	}
 }
 
@@ -159,20 +169,23 @@ func (a *actor) owedDeathLocked(now time.Time, to uint32) {
 	}
 }
 
-// peerSignalsLocked reconciles peer GOAWAY and CLOSE on live lanes. A
+// peerSignalsLocked reconciles peer GOAWAY and CLOSE on the lanes. A
 // GOAWAY comes from the bound instance (every lane of a session reaches
-// it): the session ends (§6.8). A peer CLOSE retires the lane; losing the
-// selector's active lane that way is a routing loss (§7.3).
+// it): the session ends (§6.8); it is also reconciled during the end phase,
+// because the peer's RST(GoingAway) may overtake its GOAWAY and end the
+// session first, and the dialer must still note the instance (D21). A peer
+// CLOSE retires the lane; losing the selector's active lane that way is a
+// routing loss (§7.3).
 func (a *actor) peerSignalsLocked(now time.Time) {
-	if a.ending {
-		return
-	}
 	s := a.s
 	for _, l := range s.lanes {
-		if l.state != LaneDead && l.c.PeerGoAway() {
+		if l.c.PeerGoAway() {
 			a.peerGoAwayLocked(now)
-			return
+			break
 		}
+	}
+	if a.ending {
+		return
 	}
 	for _, l := range s.lanes {
 		if l.state != LaneDead && !l.retireCalled && l.c.PeerClosed() {
@@ -181,21 +194,27 @@ func (a *actor) peerSignalsLocked(now time.Time) {
 	}
 }
 
-// peerGoAwayLocked ends the session after a GOAWAY from the bound instance:
-// with *AbortError{AbortGoingAway, Remote: true} whether or not the RST
-// arrived (plan §3.4); the dialer's Peer never OPENs to it again (D21). A
-// pending session is withdrawn (its dialer is going away).
+// peerGoAwayLocked reconciles a GOAWAY from the bound instance: the
+// dialer's Peer notes the instance once and never OPENs to it again (D21);
+// an open session ends with *AbortError{AbortGoingAway, Remote: true}
+// whether or not the RST arrived (plan §3.4); a pending session is
+// withdrawn (its dialer is going away). A session that already ended only
+// notes the instance.
 func (a *actor) peerGoAwayLocked(now time.Time) {
 	s := a.s
-	if d := a.d; d != nil && d.spec.NoteGoAway != nil {
-		inst, note := s.peer, d.spec.NoteGoAway
-		a.later = append(a.later, func() { note(inst) })
+	if !a.goAwaySeen {
+		a.goAwaySeen = true
+		if a.d != nil {
+			a.noteGoAway(s.peer)
+		}
 	}
-	if s.ctl.state == StatePending {
+	switch {
+	case a.ending:
+	case s.ctl.state == StatePending:
 		a.withdrawnLocked(now)
-		return
+	default:
+		a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
 	}
-	a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
 }
 
 // peerClosedLocked handles the peer's CLOSE on lane l: answer it (Retire;

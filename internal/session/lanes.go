@@ -40,10 +40,7 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 			break
 		}
 	}
-	if len(a.gone) >= 16 {
-		a.joinWait() // drop the carriers already joined: churn never grows the list
-	}
-	a.gone = append(a.gone, l.c)
+	a.dropConn(l.c)
 	if len(a.dead) == maxDeadLanes {
 		copy(a.dead, a.dead[1:])
 		a.dead = a.dead[:maxDeadLanes-1]
@@ -59,8 +56,15 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 // Conn.Retire not called, no peer CLOSE or GOAWAY, our CLOSE not written;
 // on the passive, its first response frame was placed and was not a
 // refusal (a lane joins the data set only once confirmed, L22).
+//
+// "Live" includes the carrier's death record, not only the lane state: a
+// lane whose carrier already ended but whose death step has not run yet
+// (two carriers die together; the actor reaps them one per critical
+// section) is never made eligible (§7.1), so every death leads to one
+// routing decision against the survivors only and both ends count the
+// same migrations (§7.6).
 func (s *Session) usableLocked(l *lane) bool {
-	if l.state == LaneDead || l.retireCalled {
+	if l.state == LaneDead || l.retireCalled || laneEnded(l) {
 		return false
 	}
 	if s.p.Role == RolePassive && (!l.firstSent || refusedLocked(l)) {
@@ -70,13 +74,32 @@ func (s *Session) usableLocked(l *lane) bool {
 }
 
 // aliveLocked: l counts as a carrier of the session for no-path purposes:
-// not dead and not retired (a passive lane still placing its first
-// response counts: it is attaching).
+// not dead (by lane state or by its carrier's death record) and not
+// retired (a passive lane still placing its first response counts: it is
+// attaching).
 func (s *Session) aliveLocked(l *lane) bool {
-	if l.state == LaneDead || l.retireCalled || (s.p.Role == RolePassive && refusedLocked(l)) {
+	if l.state == LaneDead || l.retireCalled || laneEnded(l) || (s.p.Role == RolePassive && refusedLocked(l)) {
 		return false
 	}
 	return !l.c.PeerClosed() && !l.c.PeerGoAway()
+}
+
+// laneEnded reports that l's carrier recorded its death (lock-free).
+func laneEnded(l *lane) bool {
+	dead, _, _, _ := l.c.Death()
+	return dead
+}
+
+// lastDeathLocked returns the latest of at and the death times of the
+// lanes whose carrier ended but which are not reaped yet: the death time
+// of the last live carrier when several end together (§7.7).
+func (a *actor) lastDeathLocked(at time.Time) time.Time {
+	for _, l := range a.s.lanes {
+		if dead, _, _, t := l.c.Death(); dead && t.After(at) {
+			at = t
+		}
+	}
+	return at
 }
 
 // hasAliveLocked reports whether any lane is alive.

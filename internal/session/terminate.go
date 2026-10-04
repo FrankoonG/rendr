@@ -15,11 +15,18 @@ import (
 // window re-advertisement deadline (D18, W6).
 
 // terminationLocked applies the end rules of an open or closing session in
-// precedence order and arms their deadlines.
+// precedence order and arms their deadlines. The IdleTimeout clock counts
+// from the last application Write or Read commit, but never from before
+// the session opened: a pending phase (passive) or an opening phase
+// (dialer) longer than IdleTimeout is not idleness of the open session.
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
 	linger := orDefault(s.p.Linger, defLinger)
+	idleBase := st.lastData
+	if a.openedAt.After(idleBase) {
+		idleBase = a.openedAt
+	}
 	switch {
 	case st.rstIn != nil:
 		// RST received: no RST is sent back (§4.7).
@@ -41,7 +48,7 @@ func (a *actor) terminationLocked(now time.Time) {
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstClosed}, false)
 	case st.closed && !st.doneSent && !now.Before(st.closedAt.Add(linger)):
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstLinger}, false)
-	case s.p.IdleTimeout > 0 && !now.Before(st.lastData.Add(s.p.IdleTimeout)):
+	case s.p.IdleTimeout > 0 && !now.Before(idleBase.Add(s.p.IdleTimeout)):
 		a.terminateLocked(now, ErrIdleTimeout, &wire.Rst{Code: wire.RstIdle}, false)
 	default:
 		if st.doneSent {
@@ -50,7 +57,7 @@ func (a *actor) terminationLocked(now time.Time) {
 			a.want(st.closedAt.Add(linger))
 		}
 		if s.p.IdleTimeout > 0 {
-			a.want(st.lastData.Add(s.p.IdleTimeout))
+			a.want(idleBase.Add(s.p.IdleTimeout))
 		}
 	}
 }
@@ -94,6 +101,7 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 	ctl.inNoPath = false
 	ctl.closeBy = now.Add(min(closeBound, a.deadMax()))
 	a.want(ctl.closeBy)
+	a.adoptsLeft = ctl.adopting // the exit waits for them (quiet); endingLocked keeps it current
 	a.dirty = true
 	if a.orphanOn {
 		a.orphanOn = false
@@ -114,9 +122,12 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 // endingLocked bounds the end phase: lanes whose CLOSE is still unwritten
 // at closeBy are killed (their writers return, or are abandoned after
 // AbandonWait), and dial attempts still running AbandonWait after their
-// cancellation are abandoned, so Done closes within about 2 s (C24).
+// cancellation are abandoned, so Done closes within about 2 s (C24). It
+// also records the adopts still posted but unhandled (quiet): Join and
+// AttachOpen refuse once the session ended, so that count only falls.
 func (a *actor) endingLocked(now time.Time) {
 	s := a.s
+	a.adoptsLeft = s.ctl.adopting
 	if by := s.ctl.closeBy; now.Before(by) {
 		a.want(by)
 	} else {

@@ -43,7 +43,10 @@ func (a *actor) qualityLocked(now time.Time) {
 		return
 	}
 	d.selVer, d.selAct = snap.Version, act
-	v := d.sel.Evaluate(now, act, snap.Sum, snap.Failed)
+	for i := range d.selFailed {
+		d.selFailed[i] = a.failedLocked(snap, i) // a factory that just died is no challenger either
+	}
+	v := d.sel.Evaluate(now, act, snap.Sum, d.selFailed)
 	d.selWake = v.Wake
 	a.want(v.Wake)
 	if v.Switch {

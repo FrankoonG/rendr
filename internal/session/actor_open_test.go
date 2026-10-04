@@ -35,8 +35,7 @@ func TestOpeningRaceRejectsOtherInstance_L47(t *testing.T) {
 				p2 := acNewPassive(t, 3, nil)
 				l1 := w.link("p1")
 				l1.SetDelay(time.Millisecond, 0)
-				l2 := rendrtest.NewLink(rendrtest.LinkConfig{Name: "p2", Accept: p2.accept})
-				w.links = append(w.links, l2)
+				l2 := w.linkTo("p2", p2)
 				defer p2.wg.Wait()
 				l2.SetDelay(time.Millisecond, 0)
 				if tc.bound {
@@ -224,4 +223,74 @@ func TestOpeningRaceCarrierLimitNotTerminal_L48(t *testing.T) {
 			t.Fatalf("transfer: %v %v", we, re)
 		}
 	})
+}
+
+// TestActorDialTypedAnswers: every refusal that ends the opening phase maps
+// to its typed Dial error at once (design §6.6, §9; within 200 ms, one
+// factory call): PREFACE_ACK VERSION or FEATURE → ErrVersion; PREFACE_ACK
+// GOING_AWAY or CAPACITY, OPEN_ACK GOING_AWAY, and OPEN_ACK CAPACITY with
+// any code but CodeCarriers → ErrCapacity (GOING_AWAY also notes the
+// instance, D21); OPEN_ACK BAD_REQUEST → ErrProtocol, with CodeMetadataSize
+// → ErrMetadataTooLarge; OPEN_ACK UNKNOWN_SESSION → ErrSessionLost (P8).
+func TestActorDialTypedAnswers(t *testing.T) {
+	cases := []struct {
+		name   string
+		gate   wire.PrefaceStatus // OK: answered by OPEN_ACK
+		answer wire.OpenAck
+		want   error
+		noted  bool
+	}{
+		{"preface-version", wire.PrefaceVersion, wire.OpenAck{}, ErrVersion, false},
+		{"preface-feature", wire.PrefaceFeature, wire.OpenAck{}, ErrVersion, false},
+		{"preface-going-away", wire.PrefaceGoingAway, wire.OpenAck{}, ErrCapacity, true},
+		{"preface-capacity", wire.PrefaceCapacity, wire.OpenAck{}, ErrCapacity, false},
+		{"open-bad-request", wire.PrefaceOK, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeBadMode}, ErrProtocol, false},
+		{"open-metadata-size", wire.PrefaceOK, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeMetadataSize}, ErrMetadataTooLarge, false},
+		{"open-unknown-session", wire.PrefaceOK, wire.OpenAck{Status: wire.StatusUnknownSession}, ErrSessionLost, false},
+		{"open-going-away", wire.PrefaceOK, wire.OpenAck{Status: wire.StatusGoingAway}, ErrCapacity, true},
+		{"open-capacity", wire.PrefaceOK, wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeMaxSessions}, ErrCapacity, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := acNewWorld(t, nil)
+				defer w.teardown()
+				if tc.gate != wire.PrefaceOK {
+					st := tc.gate
+					w.b.gate = func(*wire.Preface) wire.PrefaceStatus { return st }
+				} else {
+					oa := tc.answer
+					w.b.answer = func(*wire.Open) (wire.OpenAck, bool) { return oa, true }
+				}
+				noted := make(chan [16]byte, 4)
+				l1 := w.link("p1")
+				spec := w.spec(ModeSelector, l1)
+				spec.NoteGoAway = func(inst [16]byte) { noted <- inst }
+				start := time.Now()
+				s, err := w.dial(context.Background(), spec, nil)
+				if s != nil || !errors.Is(err, tc.want) {
+					t.Fatalf("Dial: %v, %v; want %v", s, err, tc.want)
+				}
+				if d := time.Since(start); d > 200*time.Millisecond {
+					t.Fatalf("Dial failed after %v, want at once", d)
+				}
+				if n := l1.Stats().Dials; n != 1 {
+					t.Fatalf("%d factory calls, want 1 (a terminal answer is not retried)", n)
+				}
+				switch {
+				case tc.noted && len(noted) != 1:
+					t.Fatalf("NoteGoAway called %d times, want once", len(noted))
+				case tc.noted:
+					if inst := <-noted; inst != w.b.cenv.Local {
+						t.Fatalf("NoteGoAway(%x), want the passive instance", inst)
+					}
+				case len(noted) != 0:
+					t.Fatal("an instance was noted as gone away")
+				}
+				if len(w.b.pending) != 0 {
+					t.Fatal("a session was admitted")
+				}
+			})
+		})
+	}
 }

@@ -2,6 +2,7 @@ package session
 
 import (
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -49,6 +50,21 @@ const (
 	defMaxCarriers   = 6
 	minResend        = 50 * time.Millisecond
 	maxResend        = time.Second
+	// maxGone is how many removed carriers the actor keeps before it
+	// prunes the joined ones: churn never grows the list.
+	maxGone = 16
+)
+
+// Unexported test seams (nil in production: one atomic load per actor
+// critical section or wait). afterUnlockHook runs on the actor goroutine
+// right after every critical section of a step, when the published
+// snapshot and the routing it describes are visible to every other
+// goroutine (the L27 consistency check). beforeWaitHook runs right before
+// the actor blocks for its next step (the end-phase wakeup regression
+// test). Neither is called with a lock held.
+var (
+	afterUnlockHook atomic.Pointer[func(s *Session)]
+	beforeWaitHook  atomic.Pointer[func(s *Session)]
 )
 
 // actor is the state of one session's actor goroutine. Only that
@@ -60,20 +76,42 @@ type actor struct {
 	wakeAt time.Time // earliest deadline collected by want during a step
 	cmds   []command // drain buffer
 	events []Event   // emitted after the step released the lock
-	later  []func()  // Registry, health and reply calls made after the lock is released
-	dirty  bool      // control state changed: publish before unlocking
+	// answers are the replies of the step's commands, Dial's result and the
+	// Peer's gone-away note (in the order queued, so a note precedes the
+	// Dial result it explains): run right after the lock is released and
+	// before every call in later, so a caller waiting for a reply never
+	// waits for a Registry call (it may hold a lock a Registry method
+	// takes). Each is a non-blocking send or a leaf-lock call.
+	answers []func()
+	later   []func() // Registry and health calls made after the lock is released (after the answers)
+	dirty   bool     // control state changed: publish before unlocking
 
-	gen  uint32          // passive: lanes attached so far (lane.gen = attach order)
-	gone []*carrier.Conn // carriers of removed lanes whose Done has not closed yet (joined at exit)
-	dead []laneSnap      // the last maxDeadLanes dead lanes, oldest first (Status)
+	gen uint32 // passive: lanes attached so far (lane.gen = attach order)
+	// gone holds every carrier the actor stopped using whose Done has not
+	// closed yet: the carriers of removed lanes and the unstarted ones it
+	// killed or answered and closed itself (refused or late dial results,
+	// adopts of an ended session). The actor exits only once all of them
+	// are joined, so none of their goroutines outlives Session.Done (§6.8).
+	gone []*carrier.Conn
+	dead []laneSnap // the last maxDeadLanes dead lanes, oldest first (Status)
+	// unconfirmed (passive): lanes whose first response frame has not been
+	// announced yet (EventCarrierUp once Fill placed an OK, §10.3).
+	unconfirmed []*lane
 
-	ending   bool    // the end procedure ran (ctl.state == StateEnded)
-	endErr   error   // the end error
-	verdict  Verdict // what a tombstone answers (passive) once ending
-	opened   bool    // the session reached StateOpen (events, verdict)
-	decided  bool    // passive: a verdict ran while pending (Confirm, Reject, refusal, timeout, withdrawal)
-	lingerOn bool    // Registry.Lingering(on) was reported
-	orphanOn bool    // Registry.Orphaned(on) was reported
+	ending     bool      // the end procedure ran (ctl.state == StateEnded)
+	endErr     error     // the end error
+	verdict    Verdict   // what a tombstone answers (passive) once ending
+	opened     bool      // the session reached StateOpen (events, verdict)
+	openedAt   time.Time // when it did: the IdleTimeout clock starts no earlier (§4.7)
+	decided    bool      // passive: a verdict ran while pending (Confirm, Reject, refusal, timeout, withdrawal)
+	lingerOn   bool      // Registry.Lingering(on) was reported
+	orphanOn   bool      // Registry.Orphaned(on) was reported
+	goAwaySeen bool      // a GOAWAY of the bound instance was reconciled (noted once, D21)
+	// adoptsLeft is ctl.adopting as the end phase last read it under the
+	// lock: adopts posted by Join or AttachOpen before the end decision and
+	// not yet handled. The actor exits only after handling them, so their
+	// carriers are answered and joined, never left to the final drain.
+	adoptsLeft int
 
 	acceptBy  time.Time // passive pending: the AcceptTimeout deadline
 	episodeBy time.Time // the current no-path episode's expiry
@@ -90,7 +128,8 @@ type actor struct {
 	lossFrom  uint32
 	lossEv    carrier.Cause
 	// deathOwed (bond, both sides): a member died with requeued spans and
-	// no member was left; the next attach counts the death migration.
+	// no member was left; the next lane that carries data counts the death
+	// migration (dialer: the next attach; passive: the next data lane).
 	deathOwed bool
 	// named (passive selector): the lane the last applied SCHED (or the
 	// epoch-0 choice) made the sender; migrations count against it (§7.6).
@@ -113,14 +152,21 @@ func (a *actor) run() {
 		now := time.Now()
 		a.wakeAt = time.Time{}
 		a.step(now)
-		if a.finished() {
-			a.exit()
-			return
-		}
-		a.arm(time.Now()) // a hook may have held the step
 		var joined <-chan struct{}
 		if a.ending {
+			// One decision per round: the exit and the channel waited on
+			// come from the same joinWait. A carrier whose Done closes after
+			// it is the one waited on below, so its closing always wakes the
+			// actor; no lost wakeup can leave the session undone (L52).
 			joined = a.joinWait()
+			if joined == nil && a.quiet() {
+				a.exit()
+				return
+			}
+		}
+		a.arm(time.Now()) // a hook may have held the step
+		if h := beforeWaitHook.Load(); h != nil {
+			(*h)(s)
 		}
 		select {
 		case <-s.mb.bell:
@@ -160,6 +206,9 @@ func (a *actor) unlockStep(now time.Time) {
 		a.dirty = false
 	}
 	a.s.mu.Unlock()
+	if h := afterUnlockHook.Load(); h != nil {
+		(*h)(a.s)
+	}
 }
 
 // handleLocked dispatches one command.
@@ -257,9 +306,15 @@ func (a *actor) arm(now time.Time) {
 	a.timer.Reset(max(a.wakeAt.Sub(now), minArm))
 }
 
-// flush runs the calls deferred until the session lock was released, then
-// emits the step's events in order (design §3.2: never under a lock).
+// flush runs the calls deferred until the session lock was released —
+// the answers first, then the Registry and health calls — and emits the
+// step's events in order (design §3.2: never under a lock).
 func (a *actor) flush() {
+	for i, f := range a.answers {
+		f()
+		a.answers[i] = nil
+	}
+	a.answers = a.answers[:0]
 	for i, f := range a.later {
 		f()
 		a.later[i] = nil
@@ -284,6 +339,13 @@ func (a *actor) event(now time.Time, k EventKind, carrierID, from, to uint32, ca
 	a.events = append(a.events, Event{Kind: k, Session: a.s.id, Carrier: carrierID, From: from, To: to, Cause: cause, Err: err, Time: now})
 }
 
+// answer defers a reply (a capacity-1 send that never blocks) or the
+// gone-away note until the lock is released; answers precede every
+// deferred Registry call.
+func (a *actor) answer(f func()) {
+	a.answers = append(a.answers, f)
+}
+
 // registry defers a Registry call until the lock is released.
 func (a *actor) registry(f func(r Registry)) {
 	if r := a.s.env.Registry; r != nil {
@@ -299,13 +361,26 @@ func (a *actor) rand() float64 {
 	return rand.Float64()
 }
 
-// finished reports that the actor may exit: the session ended, every lane
-// was removed and every carrier joined, and no dial attempt is in flight.
-func (a *actor) finished() bool {
-	if !a.ending || len(a.s.lanes) > 0 || (a.d != nil && a.d.running > 0) {
-		return false
+// quiet reports, in the end phase, that nothing but carrier joins remains:
+// every lane was removed, no dial attempt is in flight and every adopt
+// posted before the end decision was handled. Each of these can only
+// decrease once the session ended, and each decrease rings the doorbell
+// (a lane's death, a dial result, an adopt's post) or fires the timer (an
+// attempt abandoned at abandonBy).
+func (a *actor) quiet() bool {
+	return len(a.s.lanes) == 0 && (a.d == nil || a.d.running == 0) && a.adoptsLeft == 0
+}
+
+// dropConn hands a carrier the actor closed itself (Kill or WriteAndClose
+// on a conn it never attached) to the exit join (§6.8).
+func (a *actor) dropConn(c *carrier.Conn) {
+	if c == nil {
+		return
 	}
-	return a.joinWait() == nil
+	if len(a.gone) >= maxGone {
+		a.joinWait() // drop the carriers already joined
+	}
+	a.gone = append(a.gone, c)
 }
 
 // joinWait prunes the carriers whose Done closed and returns the Done
@@ -331,7 +406,10 @@ func (a *actor) joinWait() <-chan struct{} {
 
 // exit closes the mailbox, cleans up commands posted since the last
 // drain (each one exactly once, F9), releases the health subscription and
-// hold, and closes Done.
+// hold, and closes Done. Only commands that own no carrier the session
+// still waits for can be left by then: replies, and results of attempts
+// abandoned in embedder code (their late conns are closed here; their
+// goroutines are counted in the abandoned pool, L52).
 func (a *actor) exit() {
 	s := a.s
 	for _, c := range s.mb.close() {
@@ -359,7 +437,7 @@ func (a *actor) discard(c command) {
 		if a.d != nil && !a.d.opened {
 			kind = wire.TypeOpen
 		}
-		discardEst(c.est, kind)
+		a.discardEst(c.est, kind)
 	case *adopt:
 		a.refuseAdopt(c)
 	case *confirm:

@@ -149,7 +149,7 @@ func (a *actor) passiveRouteLocked(now time.Time) {
 		return
 	}
 	if s.p.Mode == ModeBond {
-		a.passiveBondRouteLocked()
+		a.passiveBondRouteLocked(now)
 		return
 	}
 	var named *lane
@@ -178,10 +178,11 @@ func (a *actor) passiveRouteLocked(now time.Time) {
 		}
 		ctl.active = next
 		if next != nil {
+			// Routed and reported in the same critical section (L27): a
+			// lane whose first response was placed but not yet announced
+			// is active as soon as it routes.
 			next.data = true
-			if next.state != LaneJoining {
-				next.state = LaneActive
-			}
+			next.state = LaneActive
 		}
 		s.routingChangedLocked()
 		a.dirty = true
@@ -195,35 +196,66 @@ func (a *actor) passiveRouteLocked(now time.Time) {
 
 // passiveBondRouteLocked: the data lanes are the usable lanes the applied
 // SCHED lists; before the first SCHED, the epoch-0 senders chosen at
-// Confirm; with none, the newest usable lane (D24).
-func (a *actor) passiveBondRouteLocked() {
+// Confirm while they live; with none, one local fallback (D24): the
+// current fallback while it stays usable — recomputing the routing never
+// moves it, so its in-flight spans are not requeued and resent for
+// nothing — else the newest usable lane.
+//
+// A lane that starts carrying data while a bond death is owed (the last
+// data member died with this side's unacknowledged DATA requeued) counts
+// that death migration (§7.6: each side counts at its next data lane).
+func (a *actor) passiveBondRouteLocked(now time.Time) {
 	s := a.s
-	ctl := &s.ctl
-	changed, have := false, false
+	listed := false
 	for _, l := range s.lanes {
-		want := l.data && s.aliveLocked(l)
-		if ctl.set.N > 0 {
-			want = s.usableLocked(l) && schedLists(&ctl.set, l.id)
+		if a.bondListedLocked(l) {
+			listed = true
+			break
 		}
-		if want != l.data {
-			l.data = want
-			if !want {
-				s.requeueLocked(l)
-			}
-			changed = true
-		}
-		have = have || want
 	}
-	if !have {
-		if fb := a.newestUsableLocked(nil); fb != nil {
-			fb.data = true
-			changed = true
+	var fb *lane
+	if !listed {
+		for _, l := range s.lanes {
+			if l.data && s.usableLocked(l) {
+				fb = l // keep the newest current fallback
+			}
 		}
+		if fb == nil {
+			fb = a.newestUsableLocked(nil)
+		}
+	}
+	changed := false
+	for _, l := range s.lanes {
+		want := l == fb || (listed && a.bondListedLocked(l))
+		if want == l.data {
+			continue
+		}
+		l.data = want
+		changed = true
+		if !want {
+			s.requeueLocked(l)
+			continue
+		}
+		if l.state == LaneJoining {
+			l.state = LaneMember // routed and reported together (L27)
+		}
+		a.owedDeathLocked(now, l.id)
 	}
 	if changed {
 		s.routingChangedLocked()
 		a.dirty = true
 	}
+}
+
+// bondListedLocked (passive bond): l belongs to the send set — listed by
+// the applied SCHED and usable, or, before the first SCHED, an epoch-0
+// sender that is still alive.
+func (a *actor) bondListedLocked(l *lane) bool {
+	s := a.s
+	if s.ctl.set.N > 0 {
+		return s.usableLocked(l) && schedLists(&s.ctl.set, l.id)
+	}
+	return l.data && s.aliveLocked(l)
 }
 
 // schedEventCause is the Event cause of a passive migration counted from a

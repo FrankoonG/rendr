@@ -276,47 +276,91 @@ func TestActorNoPathRecovery(t *testing.T) {
 // one that joined (p2): the passive's ACKs stay on its first carrier (p1),
 // so the dialer's view of the head stays exact — with the ACKs held behind
 // the stall as well, only the death of the member could recover.
+//
+// During the stall both rescue rules hold: the holder of the stuck head
+// never sends the duplicate (its carrier retransmits nothing; the other
+// member does), and each value of the head is rescued at most once (the
+// retransmitted bytes stay within one segment per distinct head value).
+// In the slow-rescuer variant the rescuing member's path has a 400 ms
+// one-way delay, so the duplicate is acknowledged only after several
+// rescue checks at the same head: none of them may rescue it again.
 func TestActorBondRescue(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		w := acNewWorld(t, nil)
-		defer w.teardown()
-		l1, l2 := w.slowLink("p1"), w.slowLink("p2")
-		l1.SetRate(8 << 20)
-		l2.SetRate(8 << 20)
-		a, b := w.open(ModeBond, nil, l1, l2)
-		acWaitFor(t, time.Second, "both members", func() bool { return a.dataMembers() == 2 })
-		const n = 24 << 20
-		done := make(chan [2]error, 1)
-		go func() {
-			we, re := acTransfer(a, b, n, 51, true)
-			done <- [2]error{we, re}
-		}()
-		acWaitFor(t, 5*time.Second, "2 MiB delivered", func() bool { return b.Status().DeliveredBytes >= 2<<20 })
-		if l2.Stats().Session.Bytes == 0 {
-			t.Fatal("the joined member carried nothing before the stall")
+	for _, slow := range []bool{false, true} {
+		name := "fast-rescuer"
+		if slow {
+			name = "slow-rescuer"
 		}
-		l2.SetStall(true)
-		time.Sleep(100 * time.Millisecond)
-		d0, r0 := b.Status().DeliveredBytes, a.Status().RetransmittedBytes
-		time.Sleep(800 * time.Millisecond) // the death deadline (DeadMin 1 s) kills the member later
-		st := a.Status()
-		if st.MigDeath != 0 {
-			t.Fatalf("the stalled member died before the rescue window ended: %+v", st)
-		}
-		// Without the rescue the in-order point stays at the held head.
-		if d1 := b.Status().DeliveredBytes; d1 <= d0 || st.RetransmittedBytes <= r0 {
-			t.Fatalf("during the stall: delivered %d → %d, retransmitted %d → %d; want progress by rescue", d0, d1, r0, st.RetransmittedBytes)
-		}
-		if l2.Stats().Session.Held == 0 {
-			t.Fatal("no chunk was held by the stall (stimulus)")
-		}
-		acWaitFor(t, 5*time.Second, "the stalled member died", func() bool { return a.Status().MigDeath == 1 })
-		l2.SetStall(false)
-		r := <-done
-		if r[0] != nil || r[1] != nil {
-			t.Fatalf("transfer: write %v, read %v", r[0], r[1])
-		}
-	})
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := acNewWorld(t, nil)
+				defer w.teardown()
+				window := 800 * time.Millisecond // before the stalled member's PING deadline (DeadMin 1 s)
+				if slow {
+					w.a.cenv.Timing.DeadMin, w.a.cenv.Timing.DeadMax = 3*time.Second, 4*time.Second
+					window = 2500 * time.Millisecond
+				}
+				l1, l2 := w.slowLink("p1"), w.slowLink("p2")
+				l1.SetRate(8 << 20)
+				l2.SetRate(8 << 20)
+				a, b := w.open(ModeBond, nil, l1, l2)
+				acWaitFor(t, time.Second, "both members", func() bool { return a.dataMembers() == 2 })
+				if slow {
+					l1.SetDelay(400*time.Millisecond, 0)
+				}
+				const n = 24 << 20
+				done := make(chan [2]error, 1)
+				go func() {
+					we, re := acTransfer(a, b, n, 51, true)
+					done <- [2]error{we, re}
+				}()
+				acWaitFor(t, 5*time.Second, "2 MiB delivered", func() bool { return b.Status().DeliveredBytes >= 2<<20 })
+				if l2.Stats().Session.Bytes == 0 {
+					t.Fatal("the joined member carried nothing before the stall")
+				}
+				l2.SetStall(true)
+				time.Sleep(100 * time.Millisecond)
+				retx := func(name string) uint64 {
+					for _, c := range a.Status().Carriers {
+						if c.Name == name && c.State != LaneDead {
+							return c.Stats.RetxBytes
+						}
+					}
+					t.Fatalf("no live carrier %s", name)
+					return 0
+				}
+				d0, r0 := b.Status().DeliveredBytes, a.Status().RetransmittedBytes
+				h0, o0 := retx("p2"), retx("p1")
+				heads := map[uint64]bool{}
+				for end := time.Now().Add(window); time.Now().Before(end); {
+					heads[a.Status().AckedBytes] = true
+					time.Sleep(10 * time.Millisecond)
+				}
+				st := a.Status()
+				if st.MigDeath != 0 {
+					t.Fatalf("the stalled member died before the rescue window ended: %+v", st)
+				}
+				// Without the rescue the in-order point stays at the held head.
+				if d1 := b.Status().DeliveredBytes; d1 <= d0 || st.RetransmittedBytes <= r0 {
+					t.Fatalf("during the stall: delivered %d → %d, retransmitted %d → %d; want progress by rescue", d0, d1, r0, st.RetransmittedBytes)
+				}
+				if h1, o1 := retx("p2"), retx("p1"); h1 != h0 || o1 <= o0 {
+					t.Fatalf("retransmitted during the stall: holder p2 %d → %d, other member p1 %d → %d; the duplicate must leave on p1 only", h0, h1, o0, o1)
+				}
+				if got, bound := st.RetransmittedBytes-r0, uint64(len(heads))*uint64(w.a.cenv.Timing.Segment); got > bound {
+					t.Fatalf("%d bytes retransmitted during the stall over %d head values: more than one segment per head", got, len(heads))
+				}
+				if l2.Stats().Session.Held == 0 {
+					t.Fatal("no chunk was held by the stall (stimulus)")
+				}
+				acWaitFor(t, 10*time.Second, "the stalled member died", func() bool { return a.Status().MigDeath == 1 })
+				l2.SetStall(false)
+				r := <-done
+				if r[0] != nil || r[1] != nil {
+					t.Fatalf("transfer: write %v, read %v", r[0], r[1])
+				}
+			})
+		})
+	}
 }
 
 // TestActorPeerCloseIsExplicit: the passive (here: an injected frame)
@@ -355,6 +399,51 @@ func TestActorPeerCloseIsExplicit(t *testing.T) {
 			t.Fatalf("migration events %+v, want one from %d with cause retired", ev, first)
 		}
 		if we, re := acTransfer(a, b, 1<<20, 61, false); we != nil || re != nil {
+			t.Fatalf("transfer: %v %v", we, re)
+		}
+	})
+}
+
+// TestActorBondEpisodeKicksMembers (§7.7): when the last bond member dies,
+// the no-path episode makes every member slot redial at once — also a slot
+// still in its backoff from earlier failures. Here p2's slot backs off for
+// seconds (its path refused four redials) when p1 dies: p2 is redialled at
+// the episode start, attaches, and the episode ends within one handshake.
+func TestActorBondEpisodeKicksMembers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		w.a.p.Grace, w.a.p.Retain, w.a.p.BackoffMax = 30*time.Second, 40*time.Second, 4*time.Second
+		l1, l2 := w.link("p1"), w.link("p2")
+		a, b := w.open(ModeBond, nil, l1, l2)
+		acWaitFor(t, time.Second, "both members", func() bool { return a.dataMembers() == 2 })
+		l2.SetRefuse(true)
+		l2.Kill()
+		time.Sleep(4 * time.Second) // redials at +0, 0.5, 1.5 and 3.5 s fail: the next waits until +7.5 s
+		failures := l2.Stats().DialFailures
+		if failures < 4 {
+			t.Fatalf("%d refused redials of p2, want its slot deep in backoff (stimulus)", failures)
+		}
+		l2.SetRefuse(false)
+		l1.SetRefuse(true)
+		killed := time.Now()
+		dials := l2.Stats().Dials
+		l1.Kill()
+		acWaitFor(t, time.Second, "p2 back as a member", func() bool {
+			st := a.Status()
+			return !st.InNoPath && a.dataMembers() == 1
+		})
+		if d := time.Since(killed); d > 50*time.Millisecond {
+			t.Fatalf("episode ended %v after the last member died, want p2 redialled at once", d)
+		}
+		if got := l2.Stats().Dials - dials; got != 1 {
+			t.Fatalf("%d dials of p2 after the episode started, want 1", got)
+		}
+		if st := a.Status(); st.NoPathEpisodes != 1 {
+			t.Fatalf("no-path episodes %d, want 1", st.NoPathEpisodes)
+		}
+		l1.SetRefuse(false)
+		if we, re := acTransfer(a, b, 1<<20, 98, false); we != nil || re != nil {
 			t.Fatalf("transfer: %v %v", we, re)
 		}
 	})

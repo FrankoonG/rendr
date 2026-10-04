@@ -2,11 +2,14 @@ package session
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -194,4 +197,48 @@ func TestCloseCancelsBlockedRedial_L21(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestActorJoinAckBeyondSentKills (§6.7): a JOIN_ACK(OK) whose rxNext lies
+// beyond what the dialer ever sent is a protocol violation of that carrier:
+// it is killed, never attached, and trims nothing (the unacknowledged data
+// stays queued); the attempt counts as failed and the slot's next redial
+// attaches normally, so the session recovers with every byte intact.
+func TestActorJoinAckBeyondSentKills(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		l1 := w.link("p1")
+		a, b := w.open(ModeSelector, nil, l1)
+		const n = 64 << 10
+		if err := acWritePRNG(a, n, 99); err != nil { // the passive does not read yet: nothing is acknowledged
+			t.Fatalf("Write: %v", err)
+		}
+		acWaitFor(t, time.Second, "the data sent", func() bool { return b.Status().RxBytes == n })
+		var scripted atomic.Int32
+		w.b.joinAnswer = func(*wire.Join) (wire.JoinAck, bool) {
+			if scripted.Add(1) > 1 {
+				return wire.JoinAck{}, false
+			}
+			return wire.JoinAck{Status: wire.StatusOK, RxNext: 1 << 40}, true
+		}
+		l1.Kill()
+		acWaitFor(t, 3*time.Second, "the next redial attached", func() bool { return acActive(a) != 0 })
+		switch scripted.Load() {
+		case 0:
+			t.Fatal("no JOIN was answered with the bogus rxNext (stimulus)")
+		case 1:
+			t.Fatal("the carrier answered with an rxNext beyond what was sent became the active lane")
+		}
+		st := a.Status()
+		if st.AckedBytes != 0 || st.Rejoins != 1 || st.MigDeath != 1 {
+			t.Fatalf("after the recovery: acked %d (want 0: nothing was trimmed), rejoins %d, death migrations %d", st.AckedBytes, st.Rejoins, st.MigDeath)
+		}
+		for _, c := range st.Carriers {
+			if c.State == LaneDead && c.DeathCause == carrier.CauseProtocolViolation {
+				t.Fatalf("the violating carrier became a lane: %+v", c)
+			}
+		}
+		acReadVerify(t, b, n, 99) // the replay through the attached redial
+	})
 }

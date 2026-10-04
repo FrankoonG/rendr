@@ -56,7 +56,12 @@ var (
 	errNotBound      = errors.New("rendr: carrier reached another peer instance")
 	errLateInstance  = errors.New("rendr: OPEN_ACK(OK) from an instance other than the bound one")
 	errDialWithdrawn = errors.New("rendr: dial withdrawn")
+	errAttemptExited = errors.New("rendr: dial attempt ended by runtime.Goexit in an embedder call")
 )
+
+// markPending is the failedVer of a local failed mark whose health-layer
+// call has not run yet.
+const markPending = ^uint64(0)
 
 // rstWithdrawn is the RST(AbortWithdrawn) payload answering a late or
 // foreign OPEN_ACK(OK) (C9, C25).
@@ -90,9 +95,17 @@ type dialer struct {
 	selAct   int // the active factory the last evaluation saw
 	switchTo int // factory of a planned switch whose JOIN runs (-1: none)
 
-	failed []bool // local failed marks not yet shown by a health snapshot (ranking only)
-	cands  []sched.Candidate
-	rank   []int
+	// failed holds the local failed marks: the only marks of an inert
+	// health layer, and otherwise a mirror of a MarkFailed call until the
+	// health layer's snapshots carry it. failedVer is the snapshot version
+	// current right after that call (markPending before it ran): any
+	// snapshot at least that new shows the mark or its later clearing by a
+	// probe PONG, so the local mark yields to it (§7.8).
+	failed    []bool
+	failedVer []uint64
+	selFailed []bool // the merged marks handed to the selector
+	cands     []sched.Candidate
+	rank      []int
 
 	unsub   func()
 	release func()
@@ -125,6 +138,8 @@ func newDialer(spec DialSpec, h healthSource) *dialer {
 		d.slots[i].f = f
 	}
 	d.failed = make([]bool, len(spec.Factories))
+	d.failedVer = make([]uint64, len(spec.Factories))
+	d.selFailed = make([]bool, len(spec.Factories))
 	d.sel = sched.NewSelector(spec.Params.Selector)
 	return d
 }
@@ -169,13 +184,26 @@ func openPayload(s *Session, window uint32) []byte {
 
 // markFailed sets factory i's failed mark: a health-layer call after the
 // lock is released, mirrored by a local mark so that a race ranked in the
-// same step already ranks the factory last (§7.3); the local mark yields
-// to the health layer's once its snapshot shows it (rankLocked).
+// same step already ranks the factory last (§7.3). The local mark yields
+// to the health layer once a snapshot published after that call is seen
+// (failedLocked), whatever its mark says by then: the health layer clears
+// a mark at the next successful probe PONG (§7.8), which a snapshot the
+// actor never read could not tell it.
 func (a *actor) markFailed(i int, reason string) {
 	d := a.d
 	d.failed[i] = true
 	if h := d.h; h != nil {
-		a.later = append(a.later, func() { h.MarkFailed(i, reason) })
+		d.failedVer[i] = markPending
+		a.later = append(a.later, func() {
+			h.MarkFailed(i, reason)
+			v := uint64(0)
+			if sn := h.Snapshot(); sn != nil {
+				v = sn.Version
+			}
+			if d.failed[i] && d.failedVer[i] == markPending { // runs on the actor goroutine
+				d.failedVer[i] = v
+			}
+		})
 	}
 }
 
@@ -189,18 +217,35 @@ func (a *actor) succeeded(i int) {
 	}
 }
 
+// failedLocked reports factory i's failed mark at snapshot snap (nil:
+// none): the health layer's mark once snap is at least as new as the
+// version recorded after the local mark's MarkFailed call (the local mark
+// is dropped then), else the local mark too.
+func (a *actor) failedLocked(snap *carrier.Snapshot, i int) bool {
+	d := a.d
+	if snap == nil {
+		return d.failed[i]
+	}
+	if d.failed[i] && d.failedVer[i] != markPending && snap.Version >= d.failedVer[i] {
+		d.failed[i] = false // the health layer's snapshots carry the mark (or its clearing) now
+	}
+	return d.failed[i] || (i < len(snap.Failed) && snap.Failed[i])
+}
+
 // noteGoAway records an instance that answered GOING_AWAY or sent GOAWAY
-// (the Peer never OPENs to it again, D21).
+// (the Peer never OPENs to it again, D21). The note is an answer: it
+// reaches the Peer before Dial's result, so a Dial retried at once cannot
+// OPEN to that instance again.
 func (a *actor) noteGoAway(inst [16]byte) {
 	if f := a.d.spec.NoteGoAway; f != nil && inst != ([16]byte{}) {
-		a.later = append(a.later, func() { f(inst) })
+		a.answer(func() { f(inst) })
 	}
 }
 
 // rankLocked ranks the factories at now (§7.8): the health snapshot
 // classified at now (configuration order when the health layer is inert)
 // with the failed marks — the snapshot's, and the local ones it does not
-// show yet.
+// show yet (failedLocked).
 func (a *actor) rankLocked(now time.Time) []int {
 	d := a.d
 	var snap *carrier.Snapshot
@@ -209,12 +254,9 @@ func (a *actor) rankLocked(now time.Time) []int {
 	}
 	d.cands = d.cands[:0]
 	for i := range d.slots {
-		c := sched.Candidate{Index: i, Failed: d.failed[i]}
+		c := sched.Candidate{Index: i, Failed: a.failedLocked(snap, i)}
 		if snap != nil && i < len(snap.Sum) {
 			c.Ev = snap.Evidence(i, now)
-			if i < len(snap.Failed) && snap.Failed[i] {
-				c.Failed, d.failed[i] = true, false // the health layer holds the mark now
-			}
 		}
 		d.cands = append(d.cands, c)
 	}
@@ -291,7 +333,7 @@ func (a *actor) failOpeningLocked(now time.Time, err error) {
 	d := a.d
 	if d.state.CompareAndSwap(dialWaiting, dialFailed) {
 		ch := d.result
-		a.later = append(a.later, func() { ch <- err })
+		a.answer(func() { ch <- err })
 	}
 	a.terminateLocked(now, err, nil, false)
 }
@@ -327,23 +369,43 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 // then exactly one post of the result. A result the actor can no longer
 // take (it exited) is closed here; an attempt the actor abandoned at its
 // end leaves the abandoned-call pool when it finally returns.
+//
+// An embedder conn call inside Establish may run runtime.Goexit on this
+// goroutine (L51); Establish then releases the CarrierID and closes the
+// conn itself, and this goroutine's deferred cleanup reports the attempt
+// as failed, so the slot's cadence, the attempt count and the abandoned
+// pool stay exact and the slot redials.
 func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, payload []byte) {
 	s := a.s
+	posted := false
+	defer func() {
+		if !posted {
+			a.postResult(at, nil, errAttemptExited)
+		}
+		if !at.state.CompareAndSwap(attemptRunning, attemptFinished) {
+			if p := s.env.Carrier.Abandon; p != nil {
+				p.Leave()
+			}
+		}
+	}()
 	check := a.openCheck
 	if at.kind == wire.TypeJoin {
 		check = a.joinCheck
 	}
 	est, err := carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
+	posted = true
+	a.postResult(at, est, err)
+}
+
+// postResult runs Hooks.DialResult and posts the attempt's one result; a
+// result the actor can no longer take (it exited) is closed here.
+func (a *actor) postResult(at *attempt, est *carrier.Established, err error) {
+	s := a.s
 	if h := s.env.Hooks; h != nil && h.DialResult != nil {
 		h.DialResult(at.cid)
 	}
 	if !s.mb.post(&dialResult{slot: at.slot, attempt: at.id, est: est, err: err}) {
 		discardEst(est, at.kind)
-	}
-	if !at.state.CompareAndSwap(attemptRunning, attemptFinished) {
-		if p := s.env.Carrier.Abandon; p != nil {
-			p.Leave()
-		}
 	}
 }
 
@@ -377,11 +439,33 @@ func discardEst(est *carrier.Established, kind wire.Type) {
 	}
 	if kind == wire.TypeOpen && est.Resp.Type == wire.TypeOpenAck {
 		if oa, err := wire.ParseOpenAck(est.Payload); err == nil && oa.Status == wire.StatusOK {
-			est.Conn.WriteAndClose(wire.TypeRst, 0, wire.SessionHandle, rstWithdrawn, time.Time{})
+			withdrawConn(est.Conn)
 			return
 		}
 	}
 	est.Conn.Kill(carrier.CauseLocalClose, "dial result not attached")
+}
+
+// withdrawConn answers an OPEN_ACK(OK) nobody keeps with RST(AbortWithdrawn)
+// on the unstarted carrier and closes it (V8).
+func withdrawConn(c *carrier.Conn) {
+	c.WriteAndClose(wire.TypeRst, 0, wire.SessionHandle, rstWithdrawn, time.Time{})
+}
+
+// discardEst is discardEst for a result the running actor drops: the
+// carrier joins the exit join (§6.8).
+func (a *actor) discardEst(est *carrier.Established, kind wire.Type) {
+	if est != nil {
+		discardEst(est, kind)
+		a.dropConn(est.Conn)
+	}
+}
+
+// killEst kills the carrier of a result the actor does not attach (a
+// refusal, a mismatch, a violation) and hands it to the exit join.
+func (a *actor) killEst(est *carrier.Established, cause carrier.Cause, detail string) {
+	est.Conn.Kill(cause, detail)
+	a.dropConn(est.Conn)
 }
 
 // cancelAttemptsLocked withdraws every attempt in flight (C25): their
@@ -428,7 +512,7 @@ func (a *actor) abandonAttemptsLocked() {
 func (a *actor) onDialResultLocked(now time.Time, r *dialResult) {
 	d := a.d
 	if d == nil || r.slot < 0 || r.slot >= len(d.slots) {
-		discardEst(r.est, wire.TypeJoin)
+		a.discardEst(r.est, wire.TypeJoin)
 		return
 	}
 	// A result nobody attaches is withdrawn with an RST only while the
@@ -440,7 +524,7 @@ func (a *actor) onDialResultLocked(now time.Time, r *dialResult) {
 	sl := &d.slots[r.slot]
 	at := sl.att
 	if at == nil || at.id != r.attempt {
-		discardEst(r.est, kind) // abandoned: no longer waited for (L21)
+		a.discardEst(r.est, kind) // abandoned: no longer waited for (L21)
 		return
 	}
 	sl.att = nil
@@ -448,7 +532,7 @@ func (a *actor) onDialResultLocked(now time.Time, r *dialResult) {
 	at.cancel(context.Canceled)
 	a.dirty = true
 	if a.ending {
-		discardEst(r.est, kind)
+		a.discardEst(r.est, kind)
 		return
 	}
 	if r.err != nil {
@@ -549,7 +633,7 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 			a.joinRefusedLocked(now, i, at, est, ja.Status)
 		}
 	case wire.TypeGoAway:
-		est.Conn.Kill(carrier.CauseGoAway, "GOAWAY answered the first frame")
+		a.killEst(est, carrier.CauseGoAway, "GOAWAY answered the first frame")
 		a.noteGoAway(est.Ack.Instance)
 		a.finish(now, i, at, sched.OutcomeRefused)
 		a.switchFailedLocked(now, i)
@@ -560,7 +644,7 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 			a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
 		}
 	default: // CLOSE: the carrier was refused
-		est.Conn.Kill(carrier.CauseRetired, "CLOSE answered the first frame")
+		a.killEst(est, carrier.CauseRetired, "CLOSE answered the first frame")
 		a.finish(now, i, at, sched.OutcomeRefused)
 		a.switchFailedLocked(now, i)
 	}
@@ -573,6 +657,7 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	s := a.s
 	d := a.d
 	if dead, _, _, _ := est.Conn.Death(); dead {
+		a.dropConn(est.Conn)
 		a.finish(now, i, at, sched.OutcomeRefused)
 		return
 	}
@@ -580,19 +665,21 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	if !d.opened {
 		if !d.state.CompareAndSwap(dialWaiting, dialSucceeded) {
 			// Dial's ctx ended first: withdraw (C25).
-			est.Conn.WriteAndClose(wire.TypeRst, 0, wire.SessionHandle, rstWithdrawn, time.Time{})
+			withdrawConn(est.Conn)
+			a.dropConn(est.Conn)
 			a.finish(now, i, at, sched.OutcomeRefused)
 			a.terminateLocked(now, errDialWithdrawn, nil, false)
 			return
 		}
 		d.opened, a.opened = true, true
+		a.openedAt = now
 		d.raceOn = false
 		s.peer = inst
 		s.bound.Store(true)
 		s.peerWindowLocked(window)
 		s.ctl.state = StateOpen
 		ch := d.result
-		a.later = append(a.later, func() { ch <- nil })
+		a.answer(func() { ch <- nil })
 		if s.p.Mode == ModeBond {
 			a.chooseMembersLocked(now, i)
 		}
@@ -602,7 +689,8 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	if inst != s.peer {
 		// A restarted peer opened a session of its own: withdraw it; it is
 		// never a member (one byte stream is never split, plan §3.4).
-		est.Conn.WriteAndClose(wire.TypeRst, 0, wire.SessionHandle, rstWithdrawn, time.Time{})
+		withdrawConn(est.Conn)
+		a.dropConn(est.Conn)
 		d.setLast(errLateInstance)
 		a.finish(now, i, at, sched.OutcomeRefused)
 		return
@@ -616,7 +704,7 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 // continues. After the session opened, a refusal only ends the attempt.
 func (a *actor) openRefusedLocked(now time.Time, i int, at *attempt, est *carrier.Established, oa *wire.OpenAck) {
 	d := a.d
-	est.Conn.Kill(carrier.CauseLocalClose, "OPEN refused")
+	a.killEst(est, carrier.CauseLocalClose, "OPEN refused")
 	a.finish(now, i, at, sched.OutcomeRefused)
 	a.succeeded(i)
 	if d.opened {
@@ -654,13 +742,13 @@ func (a *actor) openRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, rxNext uint64) {
 	s := a.s
 	if dead, _, _, _ := est.Conn.Death(); dead || est.Ack.Instance != s.peer {
-		est.Conn.Kill(carrier.CauseInstanceMismatch, "JOIN answered by another instance")
+		a.killEst(est, carrier.CauseInstanceMismatch, "JOIN answered by another instance")
 		a.finish(now, i, at, sched.OutcomeRefused)
 		a.switchFailedLocked(now, i)
 		return
 	}
 	if err := s.applyRxNextLocked(rxNext); err != nil {
-		est.Conn.Kill(carrier.CauseProtocolViolation, "JOIN_ACK rxNext beyond sent")
+		a.killEst(est, carrier.CauseProtocolViolation, "JOIN_ACK rxNext beyond sent")
 		a.finish(now, i, at, sched.OutcomeFailed)
 		a.switchFailedLocked(now, i)
 		return
@@ -674,7 +762,7 @@ func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 // GOAWAY; CAPACITY backs off.
 func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrier.Established, st wire.AckStatus) {
 	s := a.s
-	est.Conn.Kill(carrier.CauseLocalClose, "JOIN refused")
+	a.killEst(est, carrier.CauseLocalClose, "JOIN refused")
 	a.finish(now, i, at, sched.OutcomeRefused)
 	a.succeeded(i)
 	a.switchFailedLocked(now, i)

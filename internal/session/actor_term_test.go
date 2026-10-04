@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
-	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // Termination component tests (design §4.7; D4): a clean end by DONE both
@@ -219,7 +218,9 @@ func TestActorOffsetExhaustion(t *testing.T) {
 // TestActorShutdownGoesAway: Runtime.Close on the passive (Shutdown) sends
 // GOAWAY and RST(AbortGoingAway) and ends it with net.ErrClosed; the dialer
 // ends with *AbortError{AbortGoingAway, Remote: true} and its Peer notes
-// the instance as gone away (D21).
+// the instance as gone away exactly once (D21) — also when the RST, placed
+// by the passive's writer in a round already past its carrier control,
+// overtakes the GOAWAY and ends the dialer first.
 func TestActorShutdownGoesAway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := acNewWorld(t, nil)
@@ -254,7 +255,10 @@ func TestActorShutdownGoesAway(t *testing.T) {
 				t.Fatalf("NoteGoAway(%x), want the passive instance", inst)
 			}
 		default:
-			// The RST may win the race against the GOAWAY: then no note.
+			t.Fatal("the dialer did not note the instance that went away")
+		}
+		if len(noted) != 0 {
+			t.Fatal("the instance was noted more than once")
 		}
 	})
 }
@@ -305,8 +309,7 @@ func TestActorPeerRestartFastFail(t *testing.T) {
 		p2 := acNewPassive(t, 3, nil) // the restarted peer
 		defer p2.wg.Wait()
 		l1 := w.link("p1")
-		l2 := rendrtest.NewLink(rendrtest.LinkConfig{Name: "p2", Accept: p2.accept})
-		w.links = append(w.links, l2)
+		l2 := w.linkTo("p2", p2)
 		w.a.p.Grace = 30 * time.Second
 		a, _ := w.open(ModeSelector, nil, l1, l2)
 		l1.SetRefuse(true)

@@ -46,11 +46,17 @@ type DialSpec struct {
 // RoleDialer and a zero Params.Mode to ModeSelector. With a health layer
 // the session subscribes to its snapshots and holds it (Health.Hold) until
 // the session ends; Peer.Dial still calls Use and WaitFirst before Dial.
-// The session calls Env.Registry for every Dial, also one that failed
-// (Lingering on Close, Ended at its end with Verdict{Opened: true} once it
-// opened), and Ended only after its carriers and attempts were joined or
-// withdrawn; Opened and Orphaned are passive-only. Events are emitted only
-// for a session whose Dial succeeded.
+//
+// Registry: Dial returns at once, without creating a session and without
+// any Registry call, when ctx is already done or spec has no factory; the
+// caller releases what it reserved for the Dial itself. Every session it
+// creates calls Ended exactly once, also when Dial fails, with
+// Verdict{Opened: true} once it opened — at the end decision, on the
+// actor goroutine after the session lock was released, in the same step
+// that retires the lanes and withdraws the attempts, not after they were
+// joined (Session.Done reports that) — and Lingering(on) after Close,
+// Lingering(off) at the end; Opened and Orphaned are passive-only. Events
+// are emitted only for a session whose Dial succeeded.
 func Dial(ctx context.Context, env *Env, spec DialSpec) (*Session, error) {
 	var h healthSource
 	if spec.Health != nil { // a nil *Health in the interface would not be nil

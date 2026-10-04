@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -131,9 +132,11 @@ func TestActorPendingWithdrawn(t *testing.T) {
 	})
 }
 
-// TestActorPendingShutdown: Shutdown of a pending session answers
-// GOING_AWAY (the dialer: ErrCapacity); Confirm returns net.ErrClosed.
-func TestActorPendingShutdown(t *testing.T) {
+// TestActorPendingRefuseGoingAway: RefusePending(GOING_AWAY) (Listener
+// close) answers the pending session's OPEN with GOING_AWAY (the dialer:
+// ErrCapacity, and its Peer notes the instance); Confirm then returns
+// net.ErrClosed and a second RefusePending false.
+func TestActorPendingRefuseGoingAway(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := acNewWorld(t, nil)
 		defer w.teardown()
@@ -187,4 +190,186 @@ func TestActorDialNoPathAtGrace(t *testing.T) {
 			t.Fatalf("%d factory calls, want the cadence's retries", n)
 		}
 	})
+}
+
+// TestActorPendingShutdown: Shutdown (Runtime.Close) of a pending session
+// answers its OPEN with GOING_AWAY ahead of the carrier's GOAWAY and CLOSE:
+// Dial fails with ErrCapacity and notes the instance as gone away; the
+// tombstone repeats GOING_AWAY and a later Confirm returns net.ErrClosed.
+func TestActorPendingShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		noted := make(chan [16]byte, 1)
+		spec := w.spec(ModeSelector, w.link("p1"))
+		spec.NoteGoAway = func(inst [16]byte) { noted <- inst }
+		errc := make(chan error, 1)
+		go func() {
+			_, err := w.dial(context.Background(), spec, nil)
+			errc <- err
+		}()
+		b := <-w.b.pending
+		w.sess = append(w.sess, b)
+		b.Shutdown()
+		if err := <-errc; !errors.Is(err, ErrCapacity) {
+			t.Fatalf("Dial: %v, want ErrCapacity (GOING_AWAY)", err)
+		}
+		if inst := <-noted; inst != w.b.cenv.Local {
+			t.Fatalf("NoteGoAway(%x), want the passive instance", inst)
+		}
+		<-b.Done()
+		if v, _ := w.b.reg.endedVerdict(b); v.Opened || v.Status != wire.StatusGoingAway {
+			t.Fatalf("verdict %+v, want GOING_AWAY", v)
+		}
+		if err := b.Confirm(); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Confirm after Shutdown: %v, want net.ErrClosed", err)
+		}
+		if st := b.Status(); st.State != StateEnded || !errors.Is(st.Err, net.ErrClosed) {
+			t.Fatalf("passive %v %v, want ended with net.ErrClosed", st.State, st.Err)
+		}
+	})
+}
+
+// TestActorConfirmAfterWithdrawal: the dialer's RST(AbortWithdrawn) is
+// already stored when the passive's actor drains a Confirm in the same step
+// (the actor was held in its event sink meanwhile): Confirm must answer
+// ErrSessionLost — never open a withdrawn session and report it Opened
+// (§6.2) — and the tombstone answers UNKNOWN_SESSION.
+func TestActorConfirmAfterWithdrawal(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		w.a.p.JoinStagger = 10 * time.Millisecond
+		l1, l2 := w.link("p1"), w.link("p2")
+		spec := w.spec(ModeSelector, l1, l2)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errc := make(chan error, 1)
+		go func() {
+			_, err := w.dial(ctx, spec, nil)
+			errc <- err
+		}()
+		b := <-w.b.pending
+		w.sess = append(w.sess, b)
+		acWaitFor(t, time.Second, "both OPENs parked", func() bool {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			return len(b.lanes) == 2
+		})
+		// Hold the passive's actor in its event sink on the CarrierDown of
+		// the parked OPEN killed below.
+		held, release := make(chan struct{}, 1), make(chan struct{})
+		hold := func(ev Event) {
+			if ev.Kind == EventCarrierDown && ev.Session == b.ID() {
+				select {
+				case held <- struct{}{}:
+					<-release
+				default:
+				}
+			}
+		}
+		w.b.ev.hold.Store(&hold)
+		defer w.b.ev.hold.Store(nil)
+		l1.Kill()
+		<-held
+		cancel() // Dial returns; the dialer withdraws its OPEN still parked on p2
+		if err := <-errc; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Dial: %v, want context.Canceled", err)
+		}
+		acWaitFor(t, time.Second, "the withdrawal RST stored", func() bool {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			return b.st.rstIn != nil
+		})
+		confirmed := make(chan error, 1)
+		go func() { confirmed <- b.Confirm() }()
+		acWaitFor(t, time.Second, "the Confirm queued", func() bool {
+			b.mb.mu.Lock()
+			defer b.mb.mu.Unlock()
+			return len(b.mb.cmds) > 0
+		})
+		close(release)
+		if err := <-confirmed; !errors.Is(err, ErrSessionLost) {
+			t.Fatalf("Confirm after the withdrawal RST: %v, want ErrSessionLost", err)
+		}
+		<-b.Done()
+		if v, _ := w.b.reg.endedVerdict(b); v.Opened || v.Status != wire.StatusUnknownSession {
+			t.Fatalf("verdict %+v, want withdrawn (UNKNOWN_SESSION)", v)
+		}
+		w.b.reg.mu.Lock()
+		opened := len(w.b.reg.opened)
+		w.b.reg.mu.Unlock()
+		if opened != 0 {
+			t.Fatal("a withdrawn session reported Opened")
+		}
+	})
+}
+
+// TestActorVerdictRepliesBeforeEnded: Reject and RefusePending get their
+// answer before the actor reports the verdict to Registry.Ended, as
+// Confirm does before Opened. A Registry.Ended that waits for something
+// the caller does only after its Reject or RefusePending returned (for
+// example a lock the caller still holds) would otherwise never complete.
+func TestActorVerdictRepliesBeforeEnded(t *testing.T) {
+	for _, refuse := range []bool{false, true} {
+		name := "reject"
+		if refuse {
+			name = "refuse"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := acNewWorld(t, nil)
+				defer w.teardown()
+				gate := make(chan struct{})
+				var closeOnce sync.Once
+				defer closeOnce.Do(func() { close(gate) }) // before the teardown, also when the test fails
+				prev := w.b.reg.onEnded
+				w.b.reg.onEnded = func(s *Session, v Verdict) {
+					<-gate
+					prev(s, v)
+				}
+				spec := w.spec(ModeSelector, w.link("p1"))
+				errc := make(chan error, 1)
+				go func() {
+					_, err := w.dial(context.Background(), spec, nil)
+					errc <- err
+				}()
+				b := <-w.b.pending
+				w.sess = append(w.sess, b)
+				replied := make(chan error, 1)
+				go func() {
+					if refuse {
+						if !b.RefusePending(wire.StatusGoingAway, 0) {
+							replied <- errors.New("RefusePending returned false on a pending session")
+							return
+						}
+						replied <- nil
+						return
+					}
+					replied <- b.Reject(9, "no")
+				}()
+				select {
+				case err := <-replied:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("the verdict's reply waited for Registry.Ended")
+				}
+				closeOnce.Do(func() { close(gate) })
+				err := <-errc
+				var re *RejectError
+				switch {
+				case refuse && !errors.Is(err, ErrCapacity):
+					t.Fatalf("Dial: %v, want ErrCapacity (GOING_AWAY)", err)
+				case !refuse && (!errors.As(err, &re) || re.Code != 9):
+					t.Fatalf("Dial: %v, want *RejectError{9}", err)
+				}
+				<-b.Done()
+				if _, ok := w.b.reg.endedVerdict(b); !ok {
+					t.Fatal("Registry.Ended was never called")
+				}
+			})
+		})
+	}
 }

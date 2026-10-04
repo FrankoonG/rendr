@@ -76,6 +76,7 @@ func (s *Session) Start() {
 	first := s.lanes[0] // the actor is not running yet: NewPending's lane
 	s.mu.Unlock()
 	a.gen = first.gen
+	a.unconfirmed = append(a.unconfirmed, first)
 	a.acceptBy = first.since.Add(orDefault(s.p.AcceptTimeout, defAcceptTimeout))
 	first.c.Start(first, &s.mb, carrier.StartOptions{Hold: true})
 	go a.run()
@@ -136,9 +137,17 @@ func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
 
 // Confirm opens a pending session: OPEN_ACK(OK, window) becomes the first
 // frame of every OPEN carrier and their writers are released. It returns
-// ErrSessionLost if the dialer withdrew, ErrCapacity if AcceptTimeout already
-// answered, net.ErrClosed if the Listener or Runtime closed, and an error
-// for a second call.
+// ErrSessionLost if the dialer withdrew (also when its RST or GOAWAY
+// arrived before the actor executed this Confirm), ErrCapacity if
+// AcceptTimeout already answered, net.ErrClosed if the Listener or Runtime
+// closed, and an error for a second call.
+//
+// Confirm, Reject and RefusePending wait for the actor's answer, which it
+// sends after releasing the session lock and before any Env.Registry call
+// of that step (Opened, Ended, Lingering, Orphaned): a caller may hold a
+// lock the Registry methods take — the actor waits for it only after
+// answering — but none that the session lock may wait for (design §3.2:
+// the admission locks are never held together with a session lock).
 func (s *Session) Confirm() error {
 	c := &confirm{reply: make(chan error, 1)}
 	if !s.mb.post(c) {
@@ -162,8 +171,9 @@ func (s *Session) Reject(code uint32, msg string) error {
 // for GOING_AWAY when its Listener closes. It returns false if the session is
 // not pending.
 //
-// It waits for the actor's answer, so it must not be called with a lock
-// held that the session's own goroutines may need.
+// It waits for the actor's answer (sent before the verdict's Registry
+// calls, as for Confirm), so it must not be called with a lock held that
+// the session's own goroutines may need.
 func (s *Session) RefusePending(status wire.AckStatus, code uint32) bool {
 	r := &refuse{status: status, code: code, reply: make(chan bool, 1)}
 	if !s.mb.post(r) {
