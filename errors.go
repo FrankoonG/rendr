@@ -18,9 +18,10 @@ var (
 	// new instance while none was alive), or the dialer withdrew a pending
 	// session (Confirm/Reject).
 	ErrSessionLost = session.ErrSessionLost
-	// ErrAborted: the peer reset the session (its linger expired, it closed
-	// while we were still sending, its Runtime closed, its IdleTimeout
-	// fired); errors.As yields *AbortError.
+	// ErrAborted: the session was reset, by the peer (its linger expired, it
+	// closed while we were still sending, its Runtime closed, its
+	// IdleTimeout fired, ...) or, for AbortExhausted, by this side;
+	// errors.As yields *AbortError.
 	ErrAborted = session.ErrAborted
 	// ErrRejected: Dial was rejected by the peer application; errors.As
 	// yields *RejectError.
@@ -64,7 +65,7 @@ const (
 //
 //	Code   AbortCode // why the session was reset (see the reserved codes)
 //	Msg    string    // the reset's message, at most 255 bytes
-//	Remote bool      // true: the peer reset the session or its Runtime is closing; false: this side reset it (AbortExhausted)
+//	Remote bool      // true: the peer reset it or is going away; false: this side reset it (AbortExhausted)
 type AbortError = session.AbortError
 
 // RejectError is the Dial error when the peer application called

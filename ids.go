@@ -73,11 +73,11 @@ const (
 	ModeSelector Mode = 1
 	// ModeBond: every member carrier carries data (capacity pull, rescue);
 	// a dead member is redialled immediately. The dialer keeps one member
-	// per factory of the Peer, up to its MaxCarriersPerSession. A passive
-	// whose MaxCarriersPerSession is below that member count refuses the
-	// surplus members, which are then redialled at the RejoinBackoffMax
-	// interval for the session's whole life, so a Peer used for bond
-	// sessions should not have more factories than the passive's
+	// per factory of the Peer, up to the dialer's MaxCarriersPerSession. A
+	// passive whose MaxCarriersPerSession is below that member count refuses
+	// the surplus members, which are then redialled for the session's whole
+	// life at intervals that grow to RejoinBackoffMax, so a Peer used for
+	// bond sessions should not have more factories than the passive's
 	// MaxCarriersPerSession.
 	ModeBond Mode = 2
 )
@@ -189,7 +189,7 @@ type Cause uint8
 
 // Causes.
 const (
-	CauseNone              Cause = 0 // no cause; in EventMigration: a passive selector's death migration (the passive does not learn the death cause)
+	CauseNone              Cause = 0 // no cause; in EventMigration: a selector passive's death migration (see Event)
 	CausePingTimeout       Cause = 1 // the oldest committed PING stayed unanswered beyond the death deadline
 	CauseWriteStall        Cause = 2 // one batch write exceeded the stall window
 	CauseTransportError    Cause = 3 // EOF, RST, read/write error, (0, nil), invalid counts, panic in the conn
@@ -197,7 +197,7 @@ const (
 	CauseInstanceMismatch  Cause = 5 // the carrier reached another rendr instance than the session's
 	CauseGoAway            Cause = 6 // the peer sent GOAWAY
 	CauseLocalClose        Cause = 7 // closed by this side
-	CauseRetired           Cause = 8 // ended by a CLOSE (planned, or the peer's); not a death; in EventMigration: an explicit migration
+	CauseRetired           Cause = 8 // ended by a CLOSE (planned or the peer's); not a death; explicit in EventMigration
 	CauseQuality           Cause = 9 // only in EventMigration: a selector quality switch
 )
 

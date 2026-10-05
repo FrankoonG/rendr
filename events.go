@@ -17,16 +17,19 @@ import "time"
 // names, and Cause is CauseQuality, CauseRetired, or CauseNone for a death,
 // whose cause the passive does not learn. In a bond session each side
 // reports every member that died with unacknowledged data of that side:
-// From is the dead member and Cause its death cause; To is 0, or, when no
-// other member was carrying data, the member that took the data over.
+// From is the dead member and Cause its death cause. To is 0 when another
+// member carries data once the death is handled (on the passive this can
+// be a fallback it picks in that same step); otherwise To is the next
+// member that starts carrying data (on the dialer, the next member to
+// attach).
 type Event struct {
 	Seq     uint64    // Runtime-wide, assigned at enqueue; gaps are dropped events
 	Time    time.Time // when the change was published
 	Kind    EventKind
 	Session SessionID
 	Carrier CarrierID // EventCarrierUp/Down: the carrier
-	From    CarrierID // EventMigration: the carrier the data left (see above)
-	To      CarrierID // EventMigration: the carrier the data moved to, or 0 (see above)
-	Cause   Cause     // EventCarrierDown: the carrier's end cause; EventMigration: the migration cause (see above)
+	From    CarrierID // EventMigration: the carrier the data left (see Event)
+	To      CarrierID // EventMigration: the carrier the data moved to, or 0 (see Event)
+	Cause   Cause     // EventCarrierDown: the carrier's end cause; EventMigration: why the data moved (see Event)
 	Err     error     // EventSessionEnd: the end error
 }

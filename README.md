@@ -97,7 +97,7 @@ a passive limit of at least Peers × carrier factories. A bond session dials
 one member per factory, up to `MaxCarriersPerSession`: give a Peer used for
 bond sessions no more factories than the passive's `MaxCarriersPerSession`,
 or the passive refuses the surplus members and the dialer redials them
-every `RejoinBackoffMax` for the session's whole life.
+about every `RejoinBackoffMax` for the session's whole life.
 
 ## Deployment patterns
 
@@ -151,7 +151,7 @@ Semantics in brief:
 - With no usable carrier for `NoPathGrace` (15 s by default, counted from the
   death of the last carrier) every call fails with `rendr.ErrNoPath`. Other
   typed errors: `ErrSessionLost` (the peer instance restarted or forgot the
-  session), `*AbortError` (the peer reset the session), `*RejectError`,
+  session), `*AbortError` (the session was reset), `*RejectError`,
   `ErrCapacity`, `ErrVersion`, `ErrProtocol`, `ErrMetadataTooLarge`,
   `ErrIdleTimeout`. Deadlines behave as for any `net.Conn`.
 - `Close` returns at once; written data is still delivered in the background
@@ -190,16 +190,20 @@ buffers. Send buffers stay within it: `Write` waits while it is used up.
 Receive buffers are bounded by the advertised windows instead: once the
 budget is more than 75 % used, newly advertised windows shrink (to 0 when
 it is full), but a window once advertised is never taken back. Receive
-memory is therefore bounded by `MaxSessions × 2 × Window` (10,000 × 2 ×
-8 MiB ≈ 156 GiB with the defaults), not by the budget: size `MaxSessions`
-and `Window` to the memory you have. Carrier reader stages add about
-16 KiB per live carrier outside the budget; `Status.BufferedBytes` reports
-both.
+memory is therefore bounded by about `MaxSessions × 2 × Window` (10,000 ×
+2 × 8 MiB ≈ 156 GiB with the defaults), not by the budget: size
+`MaxSessions` and `Window` to the memory you have. Every carrier other
+than a bare `carrier/tcp` connection (TLS or a tunnel, for example) also
+copies each batch it writes into a buffer of up to 512 KiB, held while the
+conn's `Write` runs. That buffer is charged to the budget unconditionally:
+it counts toward the 75 % threshold and can take the budget past its
+limit. Carrier reader stages add about 16 KiB per live carrier outside the
+budget; `Status.BufferedBytes` reports both.
 
 An idle session costs about 70 KiB per side with one carrier (selector) and
-about 185 KiB per side as a three-member bond, mostly the carriers' reader
-stages and write batches. Each side runs one goroutine per session plus two
-per carrier.
+about 185 KiB per side as a three-member bond, mostly goroutine stacks and
+the carriers' reader stages and write batches. Each side runs one goroutine
+per session plus two per carrier.
 
 ### Selector self-load guard: limitation
 

@@ -15,7 +15,7 @@ import "time"
 // before their milestone.
 type Config struct {
 	NoPathGrace      time.Duration // 15 s; 3 s–300 s; counted from the death of the last carrier
-	RejoinBackoffMax time.Duration // 4 s; 1 s–8 s and ≤ NoPathGrace/2; cap of the redial interval, which grows from 0.5 s while attempts keep failing or being refused
+	RejoinBackoffMax time.Duration // 4 s; 1 s–8 s and ≤ NoPathGrace/2; redial backoff cap, also for repeated refusals
 	JoinStagger      time.Duration // 1 s; 0.1 s–10 s; failover race stagger
 	RetireGrace      time.Duration // 2 s; 0–30 s; old carrier's retirement bound after a planned switch
 
@@ -51,9 +51,14 @@ type Config struct {
 	// advertised instead: once the budget is more than 75 % used, the
 	// windows advertised from then on shrink (to 0 when it is full), but
 	// windows already advertised are honoured, so receive memory is bounded
-	// by MaxSessions × 2 × Window, not by this budget. The reader stage of
-	// every live carrier (about 16 KiB) is accounted apart and never shrinks
-	// a window; Status.BufferedBytes reports both.
+	// by about MaxSessions × 2 × Window, not by this budget. Every carrier
+	// other than a bare carrier/tcp connection also copies each batch it
+	// writes into a buffer of up to 512 KiB, held while the conn's Write
+	// runs; that buffer is charged to this budget unconditionally, so it
+	// counts toward the 75 % threshold and can take the use past
+	// MaxBufferedBytes. The reader stage of every live carrier (about
+	// 16 KiB) is accounted apart and never shrinks a window;
+	// Status.BufferedBytes reports both.
 	MaxBufferedBytes int64
 
 	Handshake   HandshakeLimits
