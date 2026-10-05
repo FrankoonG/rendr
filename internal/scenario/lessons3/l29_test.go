@@ -293,20 +293,27 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gb := guardBulk{download: true, rate: guardRate(), dur: 30 * time.Second, atProbePing: true, lead: tc.lead, keepalive: tc.keepalive}
-			r := runGuardBulk(t, gb)
-			if tc.lead > 0 {
-				t.Logf("pause between the transfers %v", r.pause)
-				if r.pause <= 0 || r.pause >= time.Second {
-					t.Fatalf("stimulus: pause %v between the transfers, want a fraction of the 2 s probe interval", r.pause)
+			// The first transfer starts after an idle phase at the capacity
+			// floor; how long its ramp takes depends on the phase of the
+			// PINGs that prove the rate, a scheduling detail of the bubble,
+			// and varies by about one RTT (20 ms) — about as much as the
+			// short pause's whole window. A run whose pause misses the
+			// window is repeated, at most edgeAttempts times; the
+			// assertions below apply to the run whose stimulus holds.
+			var r guardResult
+			for attempt := 1; ; attempt++ {
+				r = runGuardBulk(t, gb)
+				if tc.lead > 0 {
+					t.Logf("pause between the transfers %v", r.pause)
 				}
-			}
-			// The short pause must stay where only the volume moved since the
-			// backlog ended reveals the restart: after the first transfer's
-			// backlog report cleared (it had not at 8 ms at 2 MiB/s, nor at
-			// 2 ms at 1 MiB/s) and shorter than LoadThreshold takes at the
-			// link rate.
-			if short := time.Duration(float64(64*kib) / gb.rate * float64(time.Second)); tc.name == "restart-short-pause" && (r.pause < 12*time.Millisecond || r.pause >= short) {
-				t.Fatalf("stimulus: pause %v, want at least 12 ms and less than %v", r.pause, short)
+				miss := edgeStimulus(tc.name, gb, r.pause)
+				if miss == "" {
+					break
+				}
+				if attempt == edgeAttempts {
+					t.Fatalf("stimulus: %s (attempt %d of %d)", miss, attempt, edgeAttempts)
+				}
+				t.Logf("stimulus missed in attempt %d: %s; the run is repeated", attempt, miss)
 			}
 			checkGuarded(t, gb, r)
 			if !r.onsetLoaded {
@@ -314,6 +321,30 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 			}
 		})
 	}
+}
+
+// edgeAttempts bounds the runs of one TestDownloadGuardEdges_L29 case whose
+// stimulus misses its window (a miss happened in about 1 of 10 runs of
+// restart-short-pause).
+const edgeAttempts = 4
+
+// edgeStimulus reports why a run of case name with pause between the
+// transfers misses the case's stimulus ("" when it holds).
+func edgeStimulus(name string, gb guardBulk, pause time.Duration) string {
+	if gb.lead <= 0 {
+		return ""
+	}
+	if pause <= 0 || pause >= time.Second {
+		return fmt.Sprintf("pause %v between the transfers, want a fraction of the 2 s probe interval", pause)
+	}
+	// The short pause must stay where only the volume moved since the
+	// backlog ended reveals the restart: after the first transfer's backlog
+	// report cleared (it had not at 8 ms at 2 MiB/s, nor at 2 ms at
+	// 1 MiB/s) and shorter than LoadThreshold takes at the link rate.
+	if short := time.Duration(float64(64*kib) / gb.rate * float64(time.Second)); name == "restart-short-pause" && (pause < 12*time.Millisecond || pause >= short) {
+		return fmt.Sprintf("pause %v, want at least 12 ms and less than %v", pause, short)
+	}
+	return ""
 }
 
 // TestBulkUploadNoQualitySwitch_L29: the mirrored case (§8.3 "upload bulk
