@@ -1,6 +1,7 @@
 package session
 
 import (
+	"io"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -268,12 +269,30 @@ func (a *actor) endIfDoneLocked(now time.Time) {
 	}
 }
 
+// doneOr is the error of an end that proves the peer gone or going away —
+// the no-path episode's expiry, a GOING_AWAY answer, a GOAWAY, a JOIN that
+// reached a restarted peer or was answered UNKNOWN_SESSION: io.EOF once our
+// DONE was sent, else err (D4, extended by design §0.14 B4). Our DONE
+// follows the peer's FIN_DELIVERED for our FIN and our own for its FIN:
+// the peer delivered everything we sent, and its FIN reached our
+// application. Only the peer's DONE is missing — lost with a dying
+// carrier — so such an end is the clean end that DONE would have given,
+// whichever comes first: it, Linger after our DONE (terminationLocked), or
+// the proof that the peer is gone. An end before our DONE was sent keeps
+// err.
+func (a *actor) doneOr(err error) error {
+	if a.s.st.doneSent {
+		return io.EOF
+	}
+	return err
+}
+
 // peerGoAwayLocked reconciles a GOAWAY from the bound instance: the
 // dialer's Peer notes the instance once and never OPENs to it again (D21);
 // an open session ends with *AbortError{AbortGoingAway, Remote: true}
-// whether or not the RST arrived (plan §3.4); a pending session is
-// withdrawn (its dialer is going away). A session that already ended only
-// notes the instance.
+// whether or not the RST arrived (plan §3.4) — or cleanly (io.EOF) once our
+// DONE was sent (doneOr) —; a pending session is withdrawn (its dialer is
+// going away). A session that already ended only notes the instance.
 func (a *actor) peerGoAwayLocked(now time.Time) {
 	s := a.s
 	if !a.goAwaySeen {
@@ -287,7 +306,7 @@ func (a *actor) peerGoAwayLocked(now time.Time) {
 	case s.ctl.state == StatePending:
 		a.withdrawnLocked(now)
 	default:
-		a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
+		a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}), nil, false)
 	}
 }
 
