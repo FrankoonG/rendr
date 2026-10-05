@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -33,6 +34,13 @@ func verdictErr(v Verdict) error {
 		return net.ErrClosed
 	}
 	return ErrSessionLost // withdrawn by the dialer
+}
+
+// rejectedErr is the end error of a pending session that this side's
+// application rejected: it matches ErrRejected and names the application's
+// code. (A later Confirm or Reject still gets errDecided from verdictErr.)
+func rejectedErr(v Verdict) error {
+	return fmt.Errorf("rendr: session rejected by this side (code %d): %w", v.Code, ErrRejected)
 }
 
 // pendingErr is the error of a Confirm or Reject arriving after a verdict.
@@ -107,7 +115,11 @@ func (a *actor) refusePendingLocked(now time.Time, ack wire.OpenAck, goAway bool
 			l.first = firstFrame{t: wire.TypeOpenAck, openAck: ack}
 		}
 	}
-	a.terminateLocked(now, verdictErr(a.verdict), nil, goAway)
+	end := verdictErr(a.verdict)
+	if ack.Status == wire.StatusRejected {
+		end = rejectedErr(a.verdict)
+	}
+	a.terminateLocked(now, end, nil, goAway)
 }
 
 // onConfirmLocked is PendingConn.Confirm: OPEN_ACK(OK, window) becomes the
