@@ -154,13 +154,37 @@ func (d *dialer) lastErr() error {
 
 func (d *dialer) setLast(err error) { d.last.Store(&err) }
 
-// wrapLast wraps the last carrier error into a Dial error (§9).
+// wrapLast wraps the last carrier error into a Dial error (§9): err (a
+// sentinel such as ErrNoPath, or ctx.Err()) and last both stay reachable by
+// errors.Is and errors.As — errors.As still finds the
+// *carrier.EstablishError —, except that the result never matches io.EOF
+// or io.ErrUnexpectedEOF (design §0.14 B13, invariant 1): a carrier whose
+// far end closed during the handshake failed as a carrier, and a Dial
+// error must not read as the end of a stream.
 func wrapLast(err, last error) error {
 	if last == nil {
 		return err
 	}
-	return fmt.Errorf("%w (last carrier error: %w)", err, last)
+	return fmt.Errorf("%w (last carrier error: %w)", err, &lastCarrierError{last})
 }
+
+// lastCarrierError is the last carrier error inside a Dial error
+// (wrapLast). It has the wrapped error's text and forwards errors.As and
+// errors.Is to it, but answers errors.Is false for io.EOF and
+// io.ErrUnexpectedEOF; it has no Unwrap method, so errors.Is cannot reach
+// them past it.
+type lastCarrierError struct{ err error }
+
+func (e *lastCarrierError) Error() string { return e.err.Error() }
+
+// Is matches target in the wrapped error's tree unless target is io.EOF or
+// io.ErrUnexpectedEOF.
+func (e *lastCarrierError) Is(target error) bool {
+	return target != io.EOF && target != io.ErrUnexpectedEOF && errors.Is(e.err, target)
+}
+
+// As finds the first error in the wrapped error's tree that matches target.
+func (e *lastCarrierError) As(target any) bool { return errors.As(e.err, target) }
 
 // gauge returns factory i's self-load gauge (nil without a health layer).
 func (d *dialer) gauge(i int) *carrier.Gauge {
@@ -577,7 +601,9 @@ func (a *actor) finish(now time.Time, i int, at *attempt, o sched.Outcome) {
 // §6.7): version and capacity answers are terminal for Dial; a refused
 // instance and any answer after the PREFACE exchange count as Refused
 // (backoff reset, failed mark cleared); everything else is Failed (failed
-// mark, backoff).
+// mark, backoff). An open session ends when the bound instance answers
+// GOING_AWAY (*AbortError) or a JOIN reached a restarted peer
+// (ErrSessionLost) — cleanly (io.EOF) once our DONE was sent (doneOr).
 func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error) {
 	s := a.s
 	d := a.d
@@ -597,7 +623,7 @@ func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error
 		a.noteGoAway(e.Instance)
 		terminal = fmt.Errorf("%w: %w", ErrCapacity, err)
 		if d.opened && e.Instance == s.peer {
-			end = &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}
+			end = a.doneOr(&AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true})
 		}
 	case e.Status == wire.PrefaceCapacity:
 		terminal = fmt.Errorf("%w: %w", ErrCapacity, err)
@@ -607,7 +633,7 @@ func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error
 		if at.kind == wire.TypeJoin && !a.hasAliveLocked() {
 			// Peer restart (plan §3.4): a redialled carrier reached another
 			// instance while the session has no live carrier.
-			end = fmt.Errorf("%w: %w", ErrSessionLost, err)
+			end = a.doneOr(fmt.Errorf("%w: %w", ErrSessionLost, err))
 		}
 	}
 	a.finish(now, i, at, outcome)
@@ -639,7 +665,9 @@ func (a *actor) switchFailedLocked(now time.Time, i int) {
 }
 
 // attemptAnsweredLocked handles an attempt whose handshake completed with
-// a response frame.
+// a response frame. A GOAWAY answer from the bound instance ends an open
+// session like a GOAWAY on a lane (peerGoAwayLocked): *AbortError, or
+// io.EOF once our DONE was sent (doneOr).
 func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *carrier.Established) {
 	s := a.s
 	d := a.d
@@ -667,7 +695,7 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 		case !d.opened:
 			a.failOpeningLocked(now, fmt.Errorf("%w: GOAWAY", ErrCapacity))
 		case est.Ack.Instance == s.peer:
-			a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
+			a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}), nil, false)
 		}
 	default: // CLOSE: the carrier was refused
 		a.killEst(est, carrier.CauseRetired, "CLOSE answered the first frame")
@@ -783,27 +811,24 @@ func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 }
 
 // joinRefusedLocked handles a non-OK JOIN_ACK from the bound instance
-// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19; a clean
-// end after our DONE, D4), BAD_REQUEST with ErrProtocol, GOING_AWAY like a
-// GOAWAY; CAPACITY backs off.
+// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19),
+// BAD_REQUEST with ErrProtocol, GOING_AWAY like a GOAWAY; CAPACITY backs
+// off. UNKNOWN_SESSION and GOING_AWAY end cleanly (io.EOF) once our DONE
+// was sent (D4, doneOr); BAD_REQUEST proves no peer gone and keeps its
+// error.
 func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrier.Established, st wire.AckStatus) {
-	s := a.s
 	a.killEst(est, carrier.CauseLocalClose, "JOIN refused")
 	a.finish(now, i, at, sched.OutcomeRefused)
 	a.succeeded(i)
 	a.switchFailedLocked(now, i)
 	switch st {
 	case wire.StatusUnknownSession:
-		if s.st.doneSent {
-			a.terminateLocked(now, io.EOF, nil, false)
-		} else {
-			a.terminateLocked(now, fmt.Errorf("%w: JOIN_ACK UNKNOWN_SESSION", ErrSessionLost), nil, false)
-		}
+		a.terminateLocked(now, a.doneOr(fmt.Errorf("%w: JOIN_ACK UNKNOWN_SESSION", ErrSessionLost)), nil, false)
 	case wire.StatusBadRequest:
 		a.terminateLocked(now, fmt.Errorf("%w: JOIN_ACK BAD_REQUEST", ErrProtocol), nil, false)
 	case wire.StatusGoingAway:
 		a.noteGoAway(est.Ack.Instance)
-		a.terminateLocked(now, &AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}, nil, false)
+		a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortGoingAway, Msg: "peer going away", Remote: true}), nil, false)
 	}
 }
 

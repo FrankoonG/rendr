@@ -12,7 +12,9 @@ import (
 // PassiveRetain from the OPEN on the passive. Any carrier attaching ends
 // it, and the next episode starts with a fresh budget. Expiry is decided
 // after the step handled its commands (an attach already queued wins) and
-// only while no carrier is alive; the session then ends with ErrNoPath.
+// only while no carrier is alive; the session then ends with ErrNoPath, or
+// cleanly (io.EOF) once our DONE was sent (design §0.14 B4: the grace can
+// be shorter than Linger, and the peer's DONE was lost with the carrier).
 
 // episodeStartLocked starts an episode at time at (a death time; now if
 // zero or later). The dialer redials at once: the selector's race was
@@ -67,8 +69,11 @@ func (a *actor) episodeEndLocked(now time.Time) {
 	}
 }
 
-// episodeExpiryLocked ends the session with ErrNoPath when the episode's
-// grace passed and still no carrier is alive.
+// episodeExpiryLocked ends the session when the episode's grace passed and
+// still no carrier is alive: with ErrNoPath, or with io.EOF once our DONE
+// was sent (doneOr). With the defaults the dialer's NoPathGrace (15 s) and
+// a PassiveRetain below Linger (a dialer NoPathGrace of 10 s or less) both
+// expire before the Linger rule after our DONE could end the session.
 func (a *actor) episodeExpiryLocked(now time.Time) {
 	if !a.s.ctl.inNoPath {
 		return
@@ -81,5 +86,5 @@ func (a *actor) episodeExpiryLocked(now time.Time) {
 		a.want(a.episodeBy)
 		return
 	}
-	a.terminateLocked(now, ErrNoPath, nil, false)
+	a.terminateLocked(now, a.doneOr(ErrNoPath), nil, false)
 }
