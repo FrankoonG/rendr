@@ -13,9 +13,9 @@ import (
 )
 
 // SCHED migration counts on the passive (design §0.14 B1; L45, invariants
-// 4 and 6): the store bounds what a SCHED may claim, and following the
-// counts of an applied SCHED is O(1). Every package-level identifier of
-// this file starts with "g1".
+// 4 and 6): the store bounds what a SCHED may claim by its own epoch, and
+// following the counts of an applied SCHED is O(1). Every package-level
+// identifier of this file starts with "g1".
 
 // g1Counts is a SCHED's epoch and cumulative selector migration counts.
 type g1Counts struct {
@@ -51,14 +51,15 @@ func g1Stored(s *Session) (k g1Counts, set, rang bool) {
 }
 
 // TestSchedCountsBound_L45 (§0.14 B1): the passive stores a newer SCHED
-// only when no count is below the reference's — the newest SCHED stored or
-// applied; before any, the initial applied epoch (FirstEpoch − 1) with
-// counts 0 — and the counts rose together by at most the serial epoch
-// advance. Anything else is a violation of the delivering carrier
-// (Control's error kills only it) and leaves the stored SCHED as it was; a
-// SCHED that is not newer is ignored whatever its counts. Legitimate
-// SCHEDs pass: a jump of 2 when one SCHED was lost, a bond passive whose
-// own counters count its bond deaths, epochs across the 2³² wrap.
+// only when its counts sum to at most the SCHEDs a dialer can have
+// published up to its epoch — epoch − (FirstEpoch − 1), unwrapped past 2³²
+// by the migrations the passive followed. Anything else is a violation of
+// the delivering carrier (Control's error kills only it) and leaves the
+// stored SCHED and the counters as they were. The bound never involves an
+// earlier SCHED: a forged one within it cannot make the dialer's later
+// SCHEDs fail, and a count below an earlier SCHED's is no violation. A
+// SCHED that is not newer than the newest stored or applied one — before
+// any, FirstEpoch − 1 — is ignored whatever its counts.
 func TestSchedCountsBound_L45(t *testing.T) {
 	type step struct {
 		k    g1Counts
@@ -66,41 +67,50 @@ func TestSchedCountsBound_L45(t *testing.T) {
 		kept g1Counts // the stored SCHED afterwards (the zero value: none)
 	}
 	none := g1Counts{}
+	const w32 = 1 << 32
 	cases := []struct {
-		name  string
-		mode  Mode
-		first uint32 // FirstEpoch: the initial applied epoch is first − 1
-		local uint64 // the passive's own death counter before the first SCHED (bond)
-		steps []step
+		name     string
+		mode     Mode
+		first    uint32   // FirstEpoch
+		applied  uint32   // the applied epoch (0: first − 1, as NewPending sets it)
+		followed g1Counts // the passive's counters before the first SCHED (epoch unused)
+		steps    []step
 	}{
-		{name: "decrease", first: 1, steps: []step{
-			{g1Counts{3, 1, 1, 1}, nil, g1Counts{3, 1, 1, 1}},               // advance 3, rise 3
-			{g1Counts{4, 0, 2, 1}, errSchedCountDown, g1Counts{3, 1, 1, 1}}, // death 1 → 0, the sum unchanged
-			{g1Counts{9, 2, 0, 3}, errSchedCountDown, g1Counts{3, 1, 1, 1}}, // quality 1 → 0, room to spare
-			{g1Counts{4, 1, 1, 0}, errSchedCountDown, g1Counts{3, 1, 1, 1}}, // explicit 1 → 0
-			{g1Counts{4, 2, 1, 1}, nil, g1Counts{4, 2, 1, 1}},               // the next legitimate SCHED
-			{g1Counts{6, 2, 1, 1}, nil, g1Counts{6, 2, 1, 1}},               // a publication that counts nothing
-			{g1Counts{7, 1, 9, 9}, errSchedCountDown, g1Counts{6, 2, 1, 1}}, // a decrease beside big rises
-		}},
-		{name: "overshoot", first: 1, steps: []step{
-			{g1Counts{1, 2, 0, 0}, errSchedCountJump, none},                 // against the initial reference (epoch 0, counts 0)
-			{g1Counts{1, 0, 1, 1}, errSchedCountJump, none},                 // two causes, one epoch
-			{g1Counts{1, 1, 0, 0}, nil, g1Counts{1, 1, 0, 0}},               // the dialer's first failover
-			{g1Counts{2, 3, 0, 0}, errSchedCountJump, g1Counts{1, 1, 0, 0}}, // one cause beyond the advance
-			{g1Counts{2, 2, 1, 0}, errSchedCountJump, g1Counts{1, 1, 0, 0}}, // each cause within the advance, the sum beyond it
-			{g1Counts{2, 1, 1, 1}, errSchedCountJump, g1Counts{1, 1, 0, 0}}, // quality and explicit together
-			{g1Counts{3, 2, 1, 0}, nil, g1Counts{3, 2, 1, 0}},               // advance 2, rise 2
+		{name: "beyond the epoch", first: 1, steps: []step{
+			{g1Counts{1, 2, 0, 0}, errSchedCounts, none},                 // one publication counts at most one migration
+			{g1Counts{1, 0, 1, 1}, errSchedCounts, none},                 // two causes, one publication
+			{g1Counts{1, 1, 0, 0}, nil, g1Counts{1, 1, 0, 0}},            // within the bound
+			{g1Counts{2, 3, 0, 0}, errSchedCounts, g1Counts{1, 1, 0, 0}}, // one cause beyond two publications
+			{g1Counts{2, 2, 1, 0}, errSchedCounts, g1Counts{1, 1, 0, 0}}, // each cause within, the sum beyond
+			{g1Counts{2, 1, 1, 1}, errSchedCounts, g1Counts{1, 1, 0, 0}}, // quality and explicit together
+			{g1Counts{3, 2, 1, 0}, nil, g1Counts{3, 2, 1, 0}},
 		}},
 		{name: "forged", first: 1, steps: []step{
-			{g1Counts{2, 1 << 62, 0, 0}, errSchedCountJump, none},          // B1's reproduction
-			{g1Counts{2, math.MaxUint64, 0, 0}, errSchedCountJump, none},   // the largest count
-			{g1Counts{2, 1 << 63, 1 << 63, 0}, errSchedCountJump, none},    // rises whose 64-bit sum wraps to 0
-			{g1Counts{2, 0, math.MaxUint64, 1}, errSchedCountJump, none},   // whose sum wraps to 0 with the third cause
-			{g1Counts{0x7FFFFFFF, 1 << 31, 0, 0}, errSchedCountJump, none}, // the largest advance, one count beyond it
+			{g1Counts{2, 1 << 62, 0, 0}, errSchedCounts, none},          // B1's reproduction
+			{g1Counts{2, math.MaxUint64, 0, 0}, errSchedCounts, none},   // the largest count
+			{g1Counts{2, 1 << 63, 1 << 63, 0}, errSchedCounts, none},    // counts whose 64-bit sum wraps to 0
+			{g1Counts{2, 0, math.MaxUint64, 1}, errSchedCounts, none},   // wraps to 0 with the third cause
+			{g1Counts{0x7FFFFFFF, 1 << 31, 0, 0}, errSchedCounts, none}, // the farthest newer epoch, one count beyond
 			{g1Counts{0x7FFFFFFF, 1<<31 - 1, 0, 0}, nil, g1Counts{0x7FFFFFFF, 1<<31 - 1, 0, 0}},
 		}},
+		{name: "forged reference", first: 1, steps: []step{
+			// A forged SCHED within the bound (two epochs ahead, two
+			// explicit migrations) is stored like the dialer's own. The
+			// dialer's later SCHEDs — three deaths by epoch 4, no explicit
+			// migration — must still pass: the review's reference rule
+			// rejected every one of them, a carrier death each, forever.
+			{g1Counts{3, 0, 0, 2}, nil, g1Counts{3, 0, 0, 2}},
+			{g1Counts{4, 3, 0, 0}, nil, g1Counts{4, 3, 0, 0}},
+			{g1Counts{5, 4, 0, 0}, nil, g1Counts{5, 4, 0, 0}},
+		}},
+		{name: "lower counts", first: 1, steps: []step{
+			{g1Counts{3, 1, 1, 1}, nil, g1Counts{3, 1, 1, 1}},
+			{g1Counts{4, 0, 2, 1}, nil, g1Counts{4, 0, 2, 1}}, // death 1 → 0: which of the two is forged is unknowable
+			{g1Counts{9, 2, 0, 3}, nil, g1Counts{9, 2, 0, 3}},
+			{g1Counts{10, 0, 0, 0}, nil, g1Counts{10, 0, 0, 0}},
+		}},
 		{name: "lost", first: 1, steps: []step{
-			{g1Counts{1, 0, 0, 0}, nil, g1Counts{1, 0, 0, 0}}, // the initial SCHED
+			{g1Counts{1, 0, 0, 0}, nil, g1Counts{1, 0, 0, 0}}, // the opening SCHED
 			{g1Counts{3, 2, 0, 0}, nil, g1Counts{3, 2, 0, 0}}, // epoch 2 (death 1) was lost: a valid jump of 2
 			{g1Counts{6, 2, 2, 1}, nil, g1Counts{6, 2, 2, 1}}, // two lost again, three migrations of two causes
 		}},
@@ -112,23 +122,59 @@ func TestSchedCountsBound_L45(t *testing.T) {
 			{g1Counts{0x80000005, 1 << 62, 0, 0}, nil, g1Counts{5, 2, 0, 0}}, // 2³¹ away: not newer in serial arithmetic
 			{g1Counts{6, 3, 0, 0}, nil, g1Counts{6, 3, 0, 0}},
 		}},
+		{name: "stale before the first", first: 1, steps: []step{
+			// Nothing stored yet: the reference is the initial applied
+			// epoch FirstEpoch − 1 = 0.
+			{g1Counts{0, 5, 0, 0}, nil, none},          // the initial epoch itself, a count beyond any bound
+			{g1Counts{0x80000000, 0, 0, 0}, nil, none}, // 2³¹ away
+			{g1Counts{0x80000001, 0, 0, 0}, nil, none}, // older across the wrap
+			{g1Counts{0xFFFFFFF0, 1, 0, 0}, nil, none}, // just below the initial epoch
+			{g1Counts{1, 0, 0, 0}, nil, g1Counts{1, 0, 0, 0}},
+		}},
+		{name: "applied reference", first: 1, applied: 7, followed: g1Counts{0, 3, 1, 1}, steps: []step{
+			{g1Counts{7, 0, 0, 0}, nil, none},                 // the applied epoch: ignored
+			{g1Counts{6, 9, 9, 9}, nil, none},                 // older than the applied epoch
+			{g1Counts{8, 4, 2, 3}, errSchedCounts, none},      // 9 migrations by epoch 8
+			{g1Counts{8, 4, 2, 2}, nil, g1Counts{8, 4, 2, 2}}, // 8 by epoch 8
+		}},
 		{name: "wraparound", first: 0xFFFFFFFE, steps: []step{
-			{g1Counts{0, 4, 0, 0}, errSchedCountJump, none},                 // advance 3 over 0xFFFFFFFD
-			{g1Counts{0, 3, 0, 0}, nil, g1Counts{0, 3, 0, 0}},               // the first two SCHEDs lost
-			{g1Counts{0xFFFFFFFF, 1, 0, 0}, nil, g1Counts{0, 3, 0, 0}},      // older across the wrap: ignored
-			{g1Counts{2, 6, 0, 0}, errSchedCountJump, g1Counts{0, 3, 0, 0}}, // advance 2, rise 3
+			{g1Counts{0, 4, 0, 0}, errSchedCounts, none},                 // three publications: 0xFFFFFFFE, 0xFFFFFFFF, 0
+			{g1Counts{0, 3, 0, 0}, nil, g1Counts{0, 3, 0, 0}},            // the first two SCHEDs lost
+			{g1Counts{0xFFFFFFFF, 1, 0, 0}, nil, g1Counts{0, 3, 0, 0}},   // older across the wrap: ignored
+			{g1Counts{2, 6, 0, 0}, errSchedCounts, g1Counts{0, 3, 0, 0}}, // five publications by epoch 2
 			{g1Counts{2, 4, 1, 0}, nil, g1Counts{2, 4, 1, 0}},
-			{g1Counts{3, 3, 2, 0}, errSchedCountDown, g1Counts{2, 4, 1, 0}},
+			{g1Counts{3, 3, 2, 0}, nil, g1Counts{3, 3, 2, 0}},
 		}},
-		{name: "wraparound-stored", first: 0xFFFFFFFE, steps: []step{
+		{name: "wraparound stored", first: 0xFFFFFFFE, steps: []step{
 			{g1Counts{0xFFFFFFFE, 0, 0, 0}, nil, g1Counts{0xFFFFFFFE, 0, 0, 0}},
-			{g1Counts{1, 3, 0, 0}, nil, g1Counts{1, 3, 0, 0}}, // 0xFFFFFFFE → 1: advance 3
-			{g1Counts{2, 5, 0, 0}, errSchedCountJump, g1Counts{1, 3, 0, 0}},
+			{g1Counts{1, 3, 0, 0}, nil, g1Counts{1, 3, 0, 0}}, // four publications by epoch 1
+			{g1Counts{2, 6, 0, 0}, errSchedCounts, g1Counts{1, 3, 0, 0}},
 		}},
-		{name: "bond", mode: ModeBond, first: 1, local: 3, steps: []step{
-			{g1Counts{1, 0, 0, 0}, nil, g1Counts{1, 0, 0, 0}}, // bond sends zero; the passive's own bond deaths do not matter
+		{name: "beyond 2^32 publications", first: 1, applied: 5, followed: g1Counts{0, w32 + 3, 1, 0}, steps: []step{
+			// The dialer published 2³² + 5 SCHEDs by epoch 5 (the epoch
+			// wrapped once) and the passive followed its 2³² + 4
+			// migrations. The epoch alone allows 6 by epoch 6; the
+			// followed migrations unwrap it to 2³² + 6.
+			{g1Counts{6, w32 + 4, 1, 0}, nil, g1Counts{6, w32 + 4, 1, 0}},
+			{g1Counts{7, w32 + 5, 1, 1}, nil, g1Counts{7, w32 + 5, 1, 1}},
+			{g1Counts{8, w32 + 8, 1, 0}, errSchedCounts, g1Counts{7, w32 + 5, 1, 1}}, // 2³² + 9 by epoch 8
+			{g1Counts{8, w32 + 7, 1, 0}, nil, g1Counts{8, w32 + 7, 1, 0}},
+			{g1Counts{9, 5, 0, 0}, nil, g1Counts{9, 5, 0, 0}}, // lower counts
+		}},
+		{name: "followed near 2^64", first: 1, applied: 5, followed: g1Counts{0, math.MaxUint64 - 2, 0, 0}, steps: []step{
+			// Only forged SCHEDs within the bound inflate the counters this
+			// far; the bound would exceed 2⁶⁴ and binds nothing.
+			{g1Counts{6, math.MaxUint64, 0, 0}, nil, g1Counts{6, math.MaxUint64, 0, 0}},
+		}},
+		{name: "followed beyond 2^64", first: 1, applied: 5, followed: g1Counts{0, math.MaxUint64, 5, 0}, steps: []step{
+			{g1Counts{6, math.MaxUint64, 9, 0}, nil, g1Counts{6, math.MaxUint64, 9, 0}},
+		}},
+		{name: "bond", mode: ModeBond, first: 1, followed: g1Counts{0, 3, 0, 0}, steps: []step{
+			// Bond sends zero; the passive's own bond deaths (3) are no
+			// followed counts and do not widen the bound.
+			{g1Counts{1, 0, 0, 0}, nil, g1Counts{1, 0, 0, 0}},
 			{g1Counts{2, 0, 0, 0}, nil, g1Counts{2, 0, 0, 0}},
-			{g1Counts{3, 2, 0, 0}, errSchedCountJump, g1Counts{2, 0, 0, 0}},
+			{g1Counts{3, 4, 0, 0}, errSchedCounts, g1Counts{2, 0, 0, 0}},
 		}},
 	}
 	for _, tc := range cases {
@@ -137,8 +183,12 @@ func TestSchedCountsBound_L45(t *testing.T) {
 			defer stEnd(s, errClosed)
 			l, _ := stAddLane(s, 7, false)
 			s.mu.Lock()
+			s.p.FirstEpoch = tc.first
 			s.ctl.epoch = tc.first - 1 // as NewPending does
-			s.ctl.migDeath = tc.local
+			if tc.applied != 0 {
+				s.ctl.epoch = tc.applied
+			}
+			s.ctl.migDeath, s.ctl.migQuality, s.ctl.migExplicit = tc.followed.d, tc.followed.q, tc.followed.x
 			s.mu.Unlock()
 			g1Stored(s) // drop the facts of the setup
 			prev := none
@@ -162,10 +212,31 @@ func TestSchedCountsBound_L45(t *testing.T) {
 			}
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			if s.ctl.migDeath != tc.local || s.ctl.migQuality+s.ctl.migExplicit != 0 {
-				t.Fatalf("the store changed the counters: %d/%d/%d", s.ctl.migDeath, s.ctl.migQuality, s.ctl.migExplicit)
+			if have := (g1Counts{0, s.ctl.migDeath, s.ctl.migQuality, s.ctl.migExplicit}); have != tc.followed {
+				t.Fatalf("the store changed the counters: %v, want %v", have, tc.followed)
 			}
 		})
+	}
+}
+
+// g1FollowWithin applies set to the passive a's counters under s.mu on
+// another goroutine (followCountsLocked) and reports whether that returned
+// within d. A follow that is not O(1) never returns for counts near 2⁶⁴;
+// its goroutine then keeps s.mu, so the caller must not end s.
+func g1FollowWithin(s *Session, a *actor, set wire.Sched, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.ctl.set = set
+		a.followCountsLocked(time.Now())
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
 	}
 }
 
@@ -174,11 +245,15 @@ func TestSchedCountsBound_L45(t *testing.T) {
 // (never down), and the migrations taken are queued as Migration events
 // from the carrier the previous SCHED named to the one this SCHED names:
 // one per migration, at most maxFollowEvents (4) per applied SCHED, at
-// least one for every cause that rose; the counters are the record. Before
-// the bound the passive queued one event per claimed migration, so a jump
-// of 2^20 in each cause queued three million events in one actor step.
+// least one for every cause that rose; the counters are the record. The
+// last step claims counts near 2⁶⁴ in every cause (the follow itself is
+// unbounded; the store is bypassed here): it returns at once, while a
+// follow raising the counters one migration at a time — as before the
+// bound, a jump of 2^20 then queued 2^20 events in one step — would never
+// return.
 func TestSchedFollowO1_L45(t *testing.T) {
 	const big = 1 << 20
+	const top = math.MaxUint64
 	none, quality, explicit := carrier.CauseNone, carrier.CauseQuality, carrier.CauseRetired
 	four := []carrier.Cause{none, none, none, none}
 	steps := []struct {
@@ -200,18 +275,30 @@ func TestSchedFollowO1_L45(t *testing.T) {
 		{"2^20 deaths and explicit", g1Counts{21 + 5*big, 13 + 2*big, 4 + big, 3 + 2*big}, 19,
 			g1Counts{0, 13 + 2*big, 4 + big, 3 + 2*big}, []carrier.Cause{none, none, none, explicit}},
 		{"lower counts", g1Counts{22 + 5*big, 0, 0, 0}, 20, g1Counts{0, 13 + 2*big, 4 + big, 3 + 2*big}, nil},
+		{"counts near 2^64", g1Counts{23 + 5*big, top - 2, top - 1, top}, 21,
+			g1Counts{0, top - 2, top - 1, top}, []carrier.Cause{none, none, quality, explicit}},
 	}
 	s := stSession(stOpt{role: RolePassive})
-	defer stEnd(s, errClosed)
+	hung := false
+	defer func() {
+		if !hung {
+			stEnd(s, errClosed)
+		}
+	}()
 	s.env.Events = &acEvents{} // the actor queues events only with a sink
 	a := newActor(s)
 	a.named = 10 // the epoch-0 choice
 	from := a.named
 	for _, st := range steps {
+		set := wire.Sched{Epoch: st.sched.epoch, Death: st.sched.d, Quality: st.sched.q, Explicit: st.sched.x, N: 1, IDs: [wire.MaxSchedIDs]uint32{st.to}}
 		s.mu.Lock()
-		s.ctl.set = wire.Sched{Epoch: st.sched.epoch, Death: st.sched.d, Quality: st.sched.q, Explicit: st.sched.x, N: 1, IDs: [wire.MaxSchedIDs]uint32{st.to}}
 		a.events = a.events[:0]
-		a.followCountsLocked(time.Now())
+		s.mu.Unlock()
+		if !g1FollowWithin(s, a, set, 10*time.Second) {
+			hung = true
+			t.Fatalf("%s: following SCHED %v did not return within 10 s: not O(1)", st.name, st.sched)
+		}
+		s.mu.Lock()
 		evs := append([]Event(nil), a.events...)
 		have, named := g1Counts{0, s.ctl.migDeath, s.ctl.migQuality, s.ctl.migExplicit}, a.named
 		s.mu.Unlock()
@@ -234,9 +321,9 @@ func TestSchedFollowO1_L45(t *testing.T) {
 // (real carriers, its actor running) receives SCHEDs as its carrier's
 // reader delivers them. A valid jump of 2 — the SCHED of the first of two
 // migrations was lost — counts 2 with two Migration events; a valid jump
-// of 2^20 is taken in one actor step with exactly 4 events; a SCHED whose
-// death count is 2^62 is refused as a violation, nothing changes, and the
-// session keeps delivering both ways.
+// of 2^20 counts 2^20 with exactly 4 events; a SCHED whose death count is
+// 2^62 is refused as a violation, nothing changes, and the session keeps
+// delivering both ways.
 func TestSchedJumpApplied_L45(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const big = 1 << 20
@@ -272,12 +359,9 @@ func TestSchedJumpApplied_L45(t *testing.T) {
 		check("a valid jump of 2", 2, 2)
 		apply(g1Counts{3 + big, 2 + big, 0, 0})
 		check("a valid jump of 2^20", 2+big, 2+maxFollowEvents)
-		if evs := migs(); !evs[2].Time.Equal(evs[2+maxFollowEvents-1].Time) {
-			t.Fatalf("the events of one SCHED span %v .. %v, want one actor step", evs[2].Time, evs[2+maxFollowEvents-1].Time)
-		}
 		forged := g1Counts{4 + big, 1 << 62, 0, 0}
-		if err := g1Sched(pl, wire.SchedDeath, forged, pl.id); !errors.Is(err, errSchedCountJump) {
-			t.Fatalf("SCHED %v = %v, want %v", forged, err, errSchedCountJump)
+		if err := g1Sched(pl, wire.SchedDeath, forged, pl.id); !errors.Is(err, errSchedCounts) {
+			t.Fatalf("SCHED %v = %v, want %v", forged, err, errSchedCounts)
 		}
 		synctest.Wait() // the passive's actor would have run
 		if e := b.Status().SchedEpoch; e != 3+big {

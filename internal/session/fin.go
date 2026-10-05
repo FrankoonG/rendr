@@ -101,28 +101,31 @@ func (s *Session) rstLocked(p []byte) error {
 	return nil
 }
 
-// SCHED count violations (design §0.14 B1).
-var (
-	errSchedCountDown error = violation("SCHED migration count decreased")
-	errSchedCountJump error = violation("SCHED migration counts rose beyond the epoch advance")
-)
+// errSchedCounts: a SCHED claims more migrations than SCHEDs were published
+// up to its epoch (design §0.14 B1).
+var errSchedCounts error = violation("SCHED migration counts exceed its epoch")
 
 // schedLocked stores the newest SCHED received (passive only; the actor
 // applies it, L45). A SCHED not newer than the reference — the newest SCHED
 // stored or applied; before any, the passive's initial applied epoch
-// (FirstEpoch − 1) with counts 0 — is ignored. A newer one must carry
-// counts a dialer can have sent (§0.14 B1): no count below the reference's,
-// and the counts together at most the serial epoch advance above them. The
-// dialer counts every selector migration together with its own publication
-// in one critical section (lostActiveLocked, the race winner's attach,
-// qualitySwitchLocked; a publication may count nothing), Fill writes the
-// current counts with the current epoch and runs outside those sections (so
-// every copy of an epoch carries the same counts), and bond sends zero: any
-// two SCHEDs of one session keep this bound, also when resent, reordered or
-// lost. A SCHED that breaks it is a violation of the carrier that delivered
-// it — the session survives (invariant 6) and the passive's counters stay
-// as they are. The applied epoch and SCHED are actor state, read here under
-// s.mu.
+// FirstEpoch − 1 — is ignored. A newer one whose counts sum to more than
+// the SCHEDs the dialer can have published up to its epoch
+// (schedCountsFit) is a violation of the carrier that delivered it: the
+// session survives (invariant 6), nothing is stored, and the passive's
+// counters stay as they are (§0.14 B1).
+//
+// The bound holds for every SCHED a dialer sends, also resent, reordered
+// or after a loss: a selector dialer counts each migration together with
+// its own publication in one critical section (lostActiveLocked, the race
+// winner's attach, qualitySwitchLocked; the opening publication counts
+// nothing), Fill sends the counts belonging to the epoch it sends, and bond
+// sends zero. It depends only on the SCHED itself, FirstEpoch and the
+// migrations this passive followed, which never decrease, so no SCHED
+// received earlier — a forged one within the bound included — can make a
+// later legitimate one fail it. For that reason a count below an earlier
+// SCHED's is no violation either: the passive cannot tell which of two
+// disagreeing SCHEDs is forged, and following never lowers a counter. The
+// applied epoch and the counters are actor state, read here under s.mu.
 func (s *Session) schedLocked(flags uint8, p []byte) error {
 	if s.p.Role == RoleDialer {
 		return errSchedOnDialer
@@ -132,15 +135,19 @@ func (s *Session) schedLocked(flags uint8, p []byte) error {
 		return err
 	}
 	c := &s.ctl
-	refEpoch, ref := c.epoch, &c.set
+	ref := c.epoch
 	if c.schedInSet && !sched.EpochNewer(c.epoch, c.schedIn.Epoch) {
-		refEpoch, ref = c.schedIn.Epoch, &c.schedIn
+		ref = c.schedIn.Epoch
 	}
-	if !sched.EpochNewer(sc.Epoch, refEpoch) {
-		return nil // stale, or a resend of the reference
+	if !sched.EpochNewer(sc.Epoch, ref) {
+		return nil // stale, or a copy of the reference
 	}
-	if err := schedCountsCheck(ref, &sc, sc.Epoch-refEpoch); err != nil {
-		return err
+	var followed [3]uint64 // a bond passive follows no counts (bond sends zero)
+	if s.p.Mode != ModeBond {
+		followed = [3]uint64{c.migDeath, c.migQuality, c.migExplicit}
+	}
+	if !schedCountsFit(&sc, s.p.FirstEpoch, followed) {
+		return errSchedCounts
 	}
 	c.schedIn = sc
 	c.schedInCause = wire.SchedCause(flags & wire.SchedCauseMask)
@@ -150,23 +157,36 @@ func (s *Session) schedLocked(flags uint8, p []byte) error {
 	return nil
 }
 
-// schedCountsCheck tests the counts of next against those of ref, a SCHED
-// adv epochs older (1 ≤ adv < 2³¹): none may decrease, and the summed rise
-// may not exceed adv. The running sum never exceeds adv, so forged counts
-// near 2⁶⁴ cannot wrap it.
-func schedCountsCheck(ref, next *wire.Sched, adv uint32) error {
-	room := uint64(adv)
-	for _, c := range [...][2]uint64{{ref.Death, next.Death}, {ref.Quality, next.Quality}, {ref.Explicit, next.Explicit}} {
-		if c[1] < c[0] {
-			return errSchedCountDown
+// schedCountsFit reports whether the counts of sc, a SCHED newer than the
+// applied one, sum to at most the number of SCHEDs the dialer can have
+// published up to sc.Epoch (each publication counts at most one
+// migration). That number is congruent to sc.Epoch − (first − 1) modulo
+// 2³². It exceeds f, the sum of the migrations the passive followed (they
+// were counted with publications up to the applied epoch, and sc is
+// newer), by at most 2³²: fewer than 2³¹ epochs lie between the two, and
+// only the opening publication counts nothing. So it is the smallest such
+// number above f, also once the epochs wrapped. Forged SCHEDs within the
+// bound may raise f, which only loosens it; a bound beyond 2⁶⁴ binds
+// nothing.
+func schedCountsFit(sc *wire.Sched, first uint32, followed [3]uint64) bool {
+	var f uint64
+	for _, n := range followed {
+		if f+n < f {
+			return true
 		}
-		rise := c[1] - c[0]
-		if rise > room {
-			return errSchedCountJump
-		}
-		room -= rise
+		f += n
 	}
-	return nil
+	room := f + 1 + uint64(sc.Epoch-(first-1)-uint32(f+1))
+	if room <= f {
+		return true
+	}
+	for _, n := range [...]uint64{sc.Death, sc.Quality, sc.Explicit} {
+		if n > room {
+			return false
+		}
+		room -= n // the running sum never wraps
+	}
+	return true
 }
 
 // closeWriteLocked requests our FIN at the reserved end (idempotent) and

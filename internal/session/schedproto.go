@@ -17,9 +17,10 @@ import (
 // echoes it at once; when its sending lane dies or is retired it moves to
 // a local fallback first and follows the next epoch (routing only: a
 // selector passive counts migrations only from the cumulative counts each
-// SCHED carries, P13, §0.13 A3). The passive's store rejects a SCHED whose
-// counts no dialer can have sent (schedLocked, §0.14 B1), and following
-// the counts takes O(1) per applied SCHED.
+// SCHED carries, P13, §0.13 A3). The passive's store rejects a SCHED that
+// claims more migrations than SCHEDs were published by its epoch
+// (schedLocked, §0.14 B1), and following the counts takes O(1) per applied
+// SCHED.
 
 // publishSchedLocked (dialer) publishes the current data-eligible set —
 // the selector's active lane, or every bond member — with cause c as the
@@ -147,7 +148,8 @@ const maxFollowEvents = 4
 // applied SCHED, and at least one for every cause whose count rose. The
 // counters are the record. The SCHED store bounds what a SCHED may claim
 // (schedLocked); a legitimate SCHED folds several migrations only when
-// SCHEDs before it were superseded or lost.
+// SCHEDs before it were superseded or lost. A forged SCHED within that
+// bound can raise the counters; nothing lowers them.
 func (a *actor) followCountsLocked(now time.Time) {
 	ctl := &a.s.ctl
 	from, to := a.named, ctl.set.IDs[0]

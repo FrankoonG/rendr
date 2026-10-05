@@ -30,17 +30,17 @@ const g1HeapBound = 16 << 20
 // cumulative death count is forged (2^20, or B1's 2^62) — injected into the
 // dialer → passive stream of the session's only carrier with the correct
 // fseq and CRC, as a misbehaving relay could — claims more migrations than
-// its epoch advanced, which no dialer can send. The passive kills exactly
-// that carrier as a protocol_violation naming SCHED; its migration
-// counters and applied epoch stay as they were, no Migration event and no
-// dropped event appear, and handling it allocates almost nothing (before
-// the bound the passive's actor followed the count one migration and one
-// event at a time under the session lock: 2^20 grew the heap by about
-// 400 MiB, 2^62 never returned and blocked Read, Write and Status). The
-// dialer's redial is held until those checks ran, so no legitimate
-// migration interferes; then it fails over to a new carrier, both ends
-// count that one death, and the session keeps delivering (SHA-256 both
-// ways, before and after).
+// SCHEDs were published by its epoch, which no dialer can send. The
+// passive kills exactly that carrier as a protocol_violation naming SCHED;
+// its migration counters and applied epoch stay as they were, no Migration
+// event and no dropped event appear, and handling it allocates almost
+// nothing (before the bound the passive's actor followed the count one
+// migration and one event at a time under the session lock: 2^20 grew the
+// heap by about 400 MiB, 2^62 never returned and blocked Read, Write and
+// Status). The dialer's redial is held until those checks ran, so no
+// legitimate migration interferes; then it fails over to a new carrier,
+// both ends count that one death, and the session keeps delivering
+// (SHA-256 both ways, before and after).
 func TestForgedSchedCountsKillCarrier_L45(t *testing.T) {
 	for _, k := range []uint{20, 62} {
 		t.Run(fmt.Sprintf("death=2^%d", k), func(t *testing.T) {
@@ -132,6 +132,127 @@ func g1ForgedSched(t *testing.T, death uint64) {
 	g1Exchange(t, dc, pc, 1<<20, 4502)
 	endClean(t, dc, pc)
 	w.close()
+}
+
+// TestForgedSchedWithinBoundNoChurn_L45: a forged SCHED that stays within
+// the bound — two epochs ahead of the dialer, two explicit migrations,
+// naming the active carrier, injected with the correct fseq and CRC —
+// cannot be told from the dialer's own. The passive applies it and counts
+// the two explicit migrations (as without the bound: nothing lowers a
+// counter), and that SCHED must not decide how the dialer's later SCHEDs
+// are judged. Through four failovers (the link killed under a paced flow)
+// no carrier dies of a protocol violation and each failover costs one
+// dial; the passive follows the dialer's deaths once its epochs passed the
+// forged one; the flow and a 1 MiB exchange afterwards arrive intact.
+// Measuring the bound from the newest SCHED received instead rejected
+// every later SCHED of the dialer: each carrier that delivered one died,
+// the dialer redialled at once, and the session churned through thousands
+// of carriers while the passive stayed at the forged epoch.
+func TestForgedSchedWithinBoundNoChurn_L45(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const failovers = 4
+		w := newWorld(t, worldOpts{}, "a")
+		l := w.link("a")
+		l.SetDelay(2*time.Millisecond, 0)
+		dc, pc := w.open(w.peer(nil, l), rendr.DialOptions{})
+		g1Exchange(t, dc, pc, 64<<10, 4511)
+
+		ps0 := pc.Status()
+		act, ok := activeOf(ps0)
+		if !ok || ps0.Migrations != (rendr.MigrationCounts{}) {
+			t.Fatalf("before the forged SCHED: passive %+v", ps0)
+		}
+		forged := ps0.SchedEpoch + 2
+		var ids [wire.MaxSchedIDs]uint32
+		ids[0] = uint32(act.ID)
+		var p [wire.SchedFixedLen + 4]byte
+		n := wire.PutSched(p[:], &wire.Sched{Epoch: forged, Explicit: 2, N: 1, IDs: ids})
+		l.InjectAfterNextFrame(rendrtest.Up, rendrtest.FramePing, rendrtest.FrameSched, uint8(wire.SchedExplicit), wire.SessionHandle, p[:n])
+		waitFor(t, 30*time.Second, "the forged SCHED applied", func() bool { return pc.Status().SchedEpoch == forged })
+		if ps := pc.Status(); ps.Migrations != (rendr.MigrationCounts{Explicit: 2}) || len(deadOf(ps)) != 0 {
+			t.Fatalf("after the forged SCHED: passive %+v, want two explicit migrations and no dead carrier", ps)
+		}
+
+		f := startFlow(dc, pc, 512<<10, 4513, flowOpts{chunk: 8 << 10, pace: 10 * time.Millisecond})
+		// wait polls cond for up to 10 s of virtual time; a timeout reports
+		// both ends and the churn (protocol violations, dials).
+		wait := func(what string, cond func() bool) {
+			t.Helper()
+			for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+				if !time.Now().Before(deadline) {
+					ds, ps := dc.Status(), pc.Status()
+					t.Fatalf("timed out waiting for %s: dialer %+v at epoch %d, passive %+v at epoch %d; "+
+						"%d passive carriers dead of protocol_violation, %d dials; flow %d of %d bytes",
+						what, ds.Migrations, ds.SchedEpoch, ps.Migrations, ps.SchedEpoch, g1Violations(w), l.Stats().Dials, f.got.Load(), f.n)
+				}
+			}
+		}
+		for i := 1; i <= failovers; i++ {
+			// The flow moves 16 KiB over the current carrier first (load).
+			from := f.got.Load()
+			wait(fmt.Sprintf("16 KiB of the flow before failover %d", i), func() bool { return f.got.Load() >= from+16<<10 })
+			prev, _ := activeOf(dc.Status())
+			l.Kill()
+			wait(fmt.Sprintf("failover %d", i), func() bool {
+				ds := dc.Status()
+				a, ok := activeOf(ds)
+				return ok && a.ID != prev.ID && ds.Migrations.Death >= uint64(i)
+			})
+		}
+		// The passive follows the dialer once the dialer's epochs passed the
+		// forged one (from the third failover on).
+		wait("the passive following the dialer", func() bool {
+			ds, ps := dc.Status(), pc.Status()
+			da, dok := activeOf(ds)
+			pa, pok := activeOf(ps)
+			return dok && pok && da.ID == pa.ID && ps.SchedEpoch == ds.SchedEpoch &&
+				ds.Migrations == (rendr.MigrationCounts{Death: failovers}) &&
+				ps.Migrations == (rendr.MigrationCounts{Death: failovers, Explicit: 2})
+		})
+		if got := f.got.Load(); got >= f.n {
+			t.Fatalf("the paced flow ended (%d bytes) before the last failover was followed; want it across the failovers (load)", got)
+		}
+		f.wait(t, time.Minute, "the paced flow across the failovers")
+
+		st := l.Stats()
+		if st.Session.FramesInjected != 1 || st.Session.Killed != failovers {
+			t.Errorf("SCHED frames injected %d, carriers killed %d; want 1 and %d (stimulus)", st.Session.FramesInjected, st.Session.Killed, failovers)
+		}
+		if v := g1Violations(w); v != 0 || st.Dials != 1+failovers || st.DialFailures != 0 {
+			t.Errorf("%d passive carriers dead of protocol_violation, %d dials (%d failed); want 0 and %d (one per failover)",
+				v, st.Dials, st.DialFailures, 1+failovers)
+		}
+		var deaths, explicit int
+		for _, ev := range w.pev.of(rendr.EventMigration) {
+			switch ev.Cause {
+			case rendr.CauseNone:
+				deaths++
+			case rendr.CauseRetired:
+				explicit++
+			}
+		}
+		if deaths != failovers || explicit != 2 {
+			t.Errorf("passive Migration events: %d deaths, %d explicit; want %d and 2", deaths, explicit, failovers)
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+		g1Exchange(t, dc, pc, 1<<20, 4515)
+		endClean(t, dc, pc)
+		w.close()
+	})
+}
+
+// g1Violations counts the passive's CarrierDown events for a protocol
+// violation.
+func g1Violations(w *world) int {
+	n := 0
+	for _, ev := range w.pev.of(rendr.EventCarrierDown) {
+		if ev.Cause == rendr.CauseProtocolViolation {
+			n++
+		}
+	}
+	return n
 }
 
 // g1Until polls cond every 50 ms of virtual time (fewer Status calls than
