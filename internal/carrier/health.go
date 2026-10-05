@@ -104,7 +104,7 @@ type Health struct {
 type factoryState struct {
 	agg   sched.Aggregator
 	conn  *Conn // the current probe incarnation (nil: none); the observer ignores every other Conn
-	pings [pingRingSize]probePing
+	pings [pingCadenceMax]probePing
 	pHead int
 	pN    int
 	early probeEarly // a PONG that overtook its PingCommitted callback; reset per incarnation
@@ -169,7 +169,8 @@ type probeEarly struct {
 }
 
 // pushPing records a committed PING (FIFO; the oldest goes when full, as
-// the carrier never keeps more than pingRingSize PINGs outstanding).
+// a probe carrier sends only cadence PINGs and never keeps more than
+// pingCadenceMax of them outstanding).
 func (f *factoryState) pushPing(p probePing) {
 	if f.pN == len(f.pings) {
 		f.pHead = (f.pHead + 1) % len(f.pings)

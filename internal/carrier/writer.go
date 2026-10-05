@@ -27,6 +27,7 @@ type writer struct {
 	ping       bool // the batch carries a PING
 	pingID     uint32
 	pingJudged bool // the PING judged a backlog interval (≥ 5 ms): its commit starts the next one (X4)
+	pingAtEnd  bool // the PING ends the batch and proves all of its DATA (endPing)
 	close      bool // the batch carries our CLOSE, its last frame
 
 	// Backlog accounting (D15): busy time in the current backlog interval
@@ -37,6 +38,19 @@ type writer struct {
 	busyAcc       time.Duration
 	capSince      time.Time // start of the open cap-blocked period; zero: none
 	dataSincePing bool      // DATA was written after the latest PING was encoded
+
+	// The byte clock (design §0.13 A7b, endPing). A burst is the rounds the
+	// writer runs without sleeping; burst counts its batches that carried
+	// DATA and clock the DATA it wrote since the latest PING. step is the
+	// clock's step, computed with each round's carrier control (0: the clock
+	// is off). While it runs, a cadence or requested PING follows the
+	// round's DATA (pingEnd); one that found the batch full goes first in
+	// the next round (pingFirst).
+	burst     int
+	clock     int64
+	step      int64
+	pingEnd   bool
+	pingFirst bool
 
 	// Physical writes by shape (tests and diagnostics).
 	vectored, coalesced uint64
@@ -132,7 +146,7 @@ func (c *Conn) writeRound(w *writer) bool {
 	}
 	b := w.b
 	b.Reset(now)
-	w.ping, w.pingJudged, w.close = false, false, false
+	w.ping, w.pingJudged, w.pingAtEnd, w.pingEnd, w.close = false, false, false, false, false
 	// The cap-blocked flag is published before Fill and corrected after it
 	// (§3.5: set the waiting flag, then evaluate). A PONG that frees
 	// capacity while Fill decides at the cap therefore always sees it set
@@ -166,6 +180,7 @@ func (c *Conn) writeRound(w *writer) bool {
 	}
 	c.capBlocked.Store(b.CapBlocked())
 	w.noteRound(b, now)
+	c.endPing(w, b, now)
 	if b.CapBlocked() && w.dataSincePing && !w.ping {
 		c.mu.Lock()
 		c.st.pingReq = true // a cap-hit PING: in-flight is released only by PONGs
@@ -210,7 +225,10 @@ func (c *Conn) checkDeadlines(now time.Time) bool {
 
 // appendCarrierControl appends carrier-level frames under Conn.mu: the
 // pending PONG (latest wins), a due PING (none once retiring) and GOAWAY.
-// It returns the retirement state read in the same section.
+// It takes the byte clock's step for the round first: while the clock runs,
+// a due cadence or requested PING is left to endPing, which places it after
+// the round's DATA (design §0.13 A7b). It returns the retirement state read
+// in the same section.
 func (c *Conn) appendCarrierControl(w *writer, b *Batch, now time.Time) (retiring bool, reason wire.CloseReason) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -218,9 +236,14 @@ func (c *Conn) appendCarrierControl(w *writer, b *Batch, now time.Time) (retirin
 	if st.pongDue && b.addPong(&st.pong) {
 		st.pongDue = false
 	}
+	w.step = c.clockStepLocked()
 	if !st.retiring {
 		if due, _ := c.pingDueLocked(now, w); due {
-			c.encodePingLocked(w, b, now)
+			if w.step > 0 && st.pingSent && !w.pingFirst {
+				w.pingEnd = true // endPing appends it after Fill
+			} else {
+				c.encodePingLocked(w, b, now, false)
+			}
 		}
 	}
 	if st.goAway && !st.goAwaySent && b.addGoAway(wire.GoAwayShutdown) {
@@ -234,6 +257,7 @@ func (c *Conn) appendCarrierControl(w *writer, b *Batch, now time.Time) (retirin
 // endpoint's WakeAt and the sessionless idle limit. It returns true (the
 // caller runs the next round, which re-checks everything).
 func (c *Conn) sleep(w *writer, now time.Time) bool {
+	w.burst, w.clock = 0, 0 // the burst ends: the byte clock starts again with the next one
 	c.mu.Lock()
 	at := c.nextWakeLocked(now, w)
 	c.mu.Unlock()
@@ -332,7 +356,11 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 	}
 	if n := b.dataBytes(); n > 0 {
 		w.busyAcc += end.Sub(start)
-		w.dataSincePing = true
+		w.burst++
+		if !w.pingAtEnd { // a PING that ends the batch proves its DATA: none of it follows the PING
+			w.dataSincePing = true
+			w.clock += int64(n)
+		}
 		if g := c.opts.Gauge; g != nil {
 			g.AddTx(n, end) // the self-load volume (§8.2), counted with st.txBytes
 		}

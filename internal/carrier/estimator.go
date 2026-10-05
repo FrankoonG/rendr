@@ -13,18 +13,33 @@ const (
 	// pingRingSize bounds the PING records of one carrier. While it is
 	// full no new PING is encoded: the oldest record alone decides death,
 	// and the next PONG frees records (FIFO).
-	pingRingSize = 16
-	// minRateSample is the shortest interval a rate sample may span.
+	pingRingSize = 32
+	// pingCadenceMax bounds the records the PING cadence may fill: a PING
+	// due only by its timer waits while this many are outstanding (on a
+	// path whose round trip spans more cadence intervals; the oldest record
+	// decides death either way). The first PING, requested (cap-hit) PINGs
+	// and byte-clocked PINGs may use the rest of the ring, so the PINGs that
+	// release capacity never wait behind cadence PINGs that prove nothing
+	// new (design §0.13 A7b). It also sizes the health layer's probe
+	// records: a probe carrier sends only its first and cadence PINGs.
+	pingCadenceMax = 16
+	// minRateSample is the shortest interval a rate sample may span (and a
+	// backlog interval a PING may judge); rateSpan lengthens the rate's.
 	minRateSample = 5 * time.Millisecond
 	// rateDecayStep: the decaying-max rate filters lose 5% per 50 ms.
 	rateDecayStep = 50 * time.Millisecond
+	// clockStepMin and clockStepDiv set the byte clock's step (design §0.13
+	// A7b): max(clockStepMin, capacity/clockStepDiv) of DATA between two
+	// PINGs of a burst (endPing).
+	clockStepMin = 64 << 10
+	clockStepDiv = 8
 )
 
 // pingRecord is one PING of this incarnation (design §4.10, D14).
 type pingRecord struct {
 	id          uint32
 	nonce       uint64    // salt ^ id: binds a PONG to this incarnation (L21, L23)
-	mark        uint64    // submitted before the batch carrying the PING (PINGs precede DATA)
+	mark        uint64    // DATA submitted before the PING on the wire: before its batch, or through it (a PING that ends its batch, endPing)
 	committedAt time.Time // when the write carrying the PING returned; zero until then
 	busy        bool      // the BUSY flag the PING carried (this side backlogged before it)
 	early       bool      // a matching PONG raced the PING's own write: liveness proven, no sample (L23)
@@ -117,8 +132,12 @@ func decay(dt time.Duration) float64 {
 // the previous commit; restarting the interval at each of them would never
 // judge one below a 5 ms RTT, so BUSY, the rate samples it gates and the
 // capacity they raise would stay off for good. Its record is uncommitted
-// until the write returns.
-func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time) {
+// until the write returns. A PING appended before Fill (atEnd false: the
+// first PING, and every PING while the byte clock is off) precedes every
+// DATA byte of its batch, and its mark is what was submitted before the
+// batch; one appended after Fill (atEnd, endPing) follows every DATA byte
+// of its batch, and its mark includes them.
+func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time, atEnd bool) {
 	st := &c.st
 	id := st.nextPingID
 	busy, judged := st.lastBusy, now.Sub(st.intervalStart) >= minRateSample
@@ -129,14 +148,114 @@ func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time) {
 	if !b.addPing(busy, &p) {
 		return
 	}
+	mark := st.submitted
+	if atEnd {
+		mark += uint64(b.dataBytes())
+	}
 	st.nextPingID++
-	st.push(pingRecord{id: id, nonce: p.Nonce, mark: st.submitted, busy: busy})
+	st.push(pingRecord{id: id, nonce: p.Nonce, mark: mark, busy: busy})
 	st.pingSent, st.pingReq = true, false
 	st.lastBusy = busy
 	c.rxData.Store(false)
-	w.ping, w.pingID, w.pingJudged = true, id, judged
-	w.dataSincePing = false
+	w.ping, w.pingID, w.pingJudged, w.pingAtEnd = true, id, judged, atEnd
+	w.dataSincePing, w.clock, w.pingFirst = false, 0, false
 	c.gaugeUpdateLocked()
+}
+
+// endPing appends, after the DATA Fill placed in b, the PING that ends the
+// batch (design §0.13 A7b): the cadence or requested PING that
+// appendCarrierControl left to it while the byte clock runs (pingEnd), or
+// else a byte-clocked PING.
+//
+// The byte clock: a cap-limited writer whose conn takes its whole capacity
+// C at once (a socket buffer, a deep router queue) proved such a burst only
+// with its cap-hit PING, queued behind all of it, and got the capacity
+// back one round trip after the burst drained, every burst: a path of rate
+// R and round-trip time RTT ran at R·C/(C + R·RTT) (12.7 of 16 MiB/s at
+// 100 ms with an 8 MiB window; about 57 % in M1c's window-100ms case). The
+// byte clock puts a PING into the burst after every step = max(64 KiB, C/8)
+// of DATA written since the latest PING, so the PONGs come back while the
+// burst drains, each releasing a step of capacity; the bytes in flight stay
+// near C, and the path stays busy once C exceeds R·RTT by more than a step.
+// Where the window binds instead (Window/RTT below R), the in-flight count
+// lags the path by up to a step of delivered but unproven bytes, so the
+// flow reaches about (Window − step)/RTT.
+//
+// The clock runs only while the path's bandwidth-delay product, rate ×
+// minRTT, reaches one step (clockStepLocked): only then does the cycle cost
+// the path a ninth or more (R·RTT ≥ C/8 gives R·C/(C + R·RTT) ≤ 8/9 R).
+// Below it a burst of C spans many round trips and drains with little loss,
+// and PINGs inside it would only keep the capacity's whole headroom,
+// 2·rate·(minRTT + PingBusy + 50 ms) — over twenty round trips at a 10 ms
+// RTT — standing in the path's queue, inflating every RTT measured through
+// it (a bond orders its members by srtt, L34). Once the capacity is clamped
+// at the window the gate reads rate·minRTT ≥ Window/8, which a fast short
+// path can reach too (128 MiB/s at 10 ms with an 8 MiB window): the clock
+// then removes the cycle there as well, at the cost of keeping up to the
+// window's headroom (Window − rate·minRTT) queued in the path. Before the
+// first rate sample the clock is off; bursts at the 128 KiB floor are single
+// batches anyway.
+//
+// Every PING placed here ends its batch: it follows the DATA it proves, so
+// it reaches the peer together with the last of those bytes, and its PONG's
+// arrival matches its mark. A PING at the front of a batch arrives only with
+// the bytes behind it in the same unit of the path — a TSO or GRO segment,
+// a store-and-forward link quantum — later than the position it proves: a
+// rate interval started at its PONG loses a unit of drain time, which the
+// short samples of a clocked flow (a clock step, a refill of a batch or
+// two) cannot absorb: they read a 16 MiB/s link as 24 MiB/s (clock PINGs in
+// front), a 4 MiB/s one as 6 MiB/s (cadence PINGs in front of refills) and,
+// behind a blocked write whose PONGs freed capacity, as 7.8 MiB/s (the
+// cap-hit PING requested at its end, in front of the next round's DATA).
+// So while the clock runs, cadence and requested PINGs end their batch as
+// well (one that does not fit in a full batch goes first in the next round,
+// pingFirst); the first PING precedes its batch, the clock being off then.
+//
+// A byte-clocked PING goes only into a batch whose DATA budget Fill
+// exhausted (more DATA was waiting) and that is not the first of its burst:
+// the batch that ends a burst, because the capacity, the window or the
+// application stopped Fill, is proven by the cap-hit or the next cadence
+// PING as before, so a writer that stops with DATA unproven keeps the
+// PingBusy cadence, whose PINGs draw the PONG that reveals a lost reverse
+// path (L11, P12). A burst whose only full batches are partly
+// retransmissions (segments that do not fill the budget exactly) or many
+// small frames gets no clock PING: it is proven as before the byte clock.
+// At most one PING per batch; none once retiring; its record may use the
+// ring past the cadence's share. The step was computed with the round's
+// carrier control (w.step), so the decision takes no lock and reads no
+// clock; the lock is taken only to encode the PING.
+func (c *Conn) endPing(w *writer, b *Batch, now time.Time) {
+	due := w.pingEnd
+	w.pingEnd = false
+	if !due {
+		n := int64(b.dataBytes())
+		if w.ping || n == 0 || w.burst == 0 || w.step == 0 || w.clock+n < w.step || b.Room() > 0 {
+			return
+		}
+	}
+	if !b.pingFits() {
+		if due {
+			w.pingFirst = true // still due: the next round's carrier control places it first
+		}
+		return
+	}
+	c.mu.Lock()
+	if !c.st.retiring && c.st.n < pingRingSize {
+		c.encodePingLocked(w, b, now, true)
+	}
+	c.mu.Unlock()
+}
+
+// clockStepLocked returns the byte clock's step, max(64 KiB, capacity/8),
+// or 0 while the clock is off: the path's bandwidth-delay product
+// (rate·minRTT) is below one step.
+func (c *Conn) clockStepLocked() int64 {
+	st := &c.st
+	step := max(clockStepMin, c.capacityLocked()/clockStepDiv)
+	if st.rate*st.minRTT.Seconds() < float64(step) {
+		return 0
+	}
+	return step
 }
 
 // commitLocked accounts a batch whose write returned at at: DATA becomes
@@ -144,7 +263,10 @@ func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time) {
 // a new backlog interval starts when the PING judged the previous one,
 // X4). A batch that ended cap-blocked after writing DATA asks for a cap-hit
 // PING, so the cap is released one RTT later rather than at the next PING
-// timer (msess, R13).
+// timer (msess, R13), unless a PING ended the batch (endPing) and so proves
+// all of its DATA already. A PONG that raced this write proved the bytes
+// before its PING; those of the batch itself count from here, now that
+// they are submitted (onPongLocked).
 func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 	st := &c.st
 	data := uint64(b.dataBytes())
@@ -154,14 +276,18 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 	st.frames += uint64(b.Len())
 	if w.ping {
 		if i := st.find(w.pingID); i >= 0 {
-			st.record(i).committedAt = at
+			r := st.record(i)
+			r.committedAt = at
+			if r.early && r.mark > st.pongMark {
+				st.pongMark = r.mark
+			}
 		}
 		st.lastCommit = at
 		if w.pingJudged {
 			st.intervalStart = at
 		}
 	}
-	if data > 0 && b.CapBlocked() {
+	if data > 0 && b.CapBlocked() && !w.pingAtEnd {
 		st.pingReq = true
 	}
 	c.gaugeUpdateLocked()
@@ -174,10 +300,11 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 // yields the RTT from the PING's commit (L23), drops that record and every
 // older one, updates srtt, minRTT, the PONG watermark, the rate (only for a
 // backlogged interval: D15, P4; a PONG that proves nothing new restarts the
-// interval only while the interval itself has proven nothing yet, §0.13 A1)
-// and the receive rate. wake reports that the watermark advanced while the
-// writer's last round was cap-blocked (C5), or that the PONG freed records
-// of a full ring.
+// interval only while the interval itself has proven nothing yet, §0.13 A1;
+// a sample spans at least rateSpan) and the receive rate. wake reports that
+// the watermark advanced while the writer's last round was cap-blocked
+// (C5), or that the PONG freed the records a waiting PING needs
+// (ringFreed).
 func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time.Duration, wake bool) {
 	st := &c.st
 	i := st.find(p.ID)
@@ -195,24 +322,29 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		// every DATA byte submitted before the PING. So the watermark
 		// advances and a cap-blocked writer is woken (C5): a carrier whose
 		// every PONG races its commit (a synchronous conn at GOMAXPROCS=1)
-		// must not stay capped at its capacity for good. The record stays
+		// must not stay capped at its capacity for good. The watermark never
+		// passes what was submitted: the mark of a PING that ends its batch
+		// (endPing) counts that batch's DATA, which is submitted only at the
+		// commit, so the rest of the mark is applied there (commitLocked)
+		// and the bytes in flight never read negative. The record stays
 		// for a genuine match; the older records were answered before it on
 		// this FIFO stream, so they go (waking a writer that waits on a
 		// full ring), and early records never accumulate in the ring.
 		r.early = true
-		full := st.n == pingRingSize
-		advanced := r.mark > st.pongMark
+		n0 := st.n
+		m := min(r.mark, st.submitted)
+		advanced := m > st.pongMark
 		if advanced {
-			st.pongMark = r.mark
+			st.pongMark = m
 			c.gaugeUpdateLocked()
 		}
 		if i > 0 {
 			st.dropThrough(i - 1)
 		}
-		return false, 0, (advanced && c.capBlocked.Load()) || (full && i > 0)
+		return false, 0, (advanced && c.capBlocked.Load()) || ringFreed(n0, st.n)
 	}
 	rec := *r
-	full := st.n == pingRingSize
+	n0 := st.n
 	st.dropThrough(i)
 	rtt = now.Sub(rec.committedAt)
 	if !st.rttSeen {
@@ -233,7 +365,7 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 	case !advanced:
 		// Nothing new was proven by this PONG, but the interval holds bytes
 		// an earlier PONG proved too soon after its start to be sampled
-		// (< minRateSample). Restarting here would throw that proof away:
+		// (< rateSpan). Restarting here would throw that proof away:
 		// on a path whose RTT is at least PingBusy, a busy PING that went
 		// out just before a burst returns just before the PONG proving the
 		// burst, and when the two arrive less than minRateSample apart
@@ -243,7 +375,7 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		// the next PONG that proves more. Its start still precedes every
 		// byte it counts on the wire (each PING precedes the DATA submitted
 		// after its mark), so the sample stays within the drain rate.
-	case now.Sub(st.rateAt) >= minRateSample:
+	case now.Sub(st.rateAt) >= st.rateSpan():
 		dt := now.Sub(st.rateAt)
 		st.rate *= decay(dt)
 		if rec.busy {
@@ -255,7 +387,14 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 			if dc := rec.committedAt.Sub(st.rateCommitAt); dc > span {
 				span = dc
 			}
-			if s := float64(st.pongMark-st.rateMark) / span.Seconds(); s > st.rate {
+			s := float64(st.pongMark-st.rateMark) / span.Seconds()
+			if span < st.srtt/2 && c.capacityLocked() > c.tm.CapFloor {
+				// A sample shorter than half an RTT can be a cluster of
+				// PONGs released together: once the capacity left its
+				// floor, it may at most double the estimate (rateSpan).
+				s = min(s, 2*st.rate)
+			}
+			if s > st.rate {
 				st.rate = s
 			}
 		}
@@ -270,9 +409,52 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		st.rxMark, st.rxAt = rx, now
 	}
 	c.gaugeUpdateLocked()
-	// A full record ring deferred the next PING (a cap-hit one included):
-	// the freed records let the writer send it.
-	return true, rtt, (advanced && c.capBlocked.Load()) || full
+	// A full ring, or the cadence's full share of it, deferred the next
+	// PING: the freed records let the writer send it.
+	return true, rtt, (advanced && c.capBlocked.Load()) || ringFreed(n0, st.n)
+}
+
+// ringFreed reports whether dropping records took the ring from n0 to n
+// records out of the full ring or below the cadence's share: a PING may
+// have been waiting for the room.
+func ringFreed(n0, n int) bool {
+	return (n0 == pingRingSize && n < n0) || (n0 >= pingCadenceMax && n < pingCadenceMax)
+}
+
+// rateSpan returns the shortest interval a rate sample may span: 5 ms
+// (minRateSample), and half the smoothed RTT while the peer reports BUSY.
+//
+// With byte-clocked PINGs (design §0.13 A7b) a PONG proves new bytes every
+// clock step instead of once per burst, so samples over a few
+// milliseconds of PONG arrivals become common, and such arrivals carry
+// timing noise. A backlogged peer queues our PONGs behind its own DATA, and
+// they leave that queue together (ACK compression): over 5 ms such
+// clusters read a 16 MiB/s link at a 100 ms RTT as 72 MiB/s, and an 8
+// MiB/s one at 400 ms as 55 MiB/s (design §0.13 A1 bounds a sample with
+// bulk both ways at 4×; the estimate before the byte clock peaked at 3.6×).
+// Half the smoothed RTT, which holds the queueing delay of both
+// directions, averages a cluster with the gap behind it (2× and 1.7×
+// there). Such a sample measures what the path carried for this side
+// while both directions were loaded — its achieved rate, not the drain rate
+// of a saturated path — so with bulk both ways the estimate follows the
+// achieved rate (far below the link rate where a window limits the flow;
+// the capacity is then clamped at the window anyway). Without the peer's
+// BUSY its writer has no standing queue, and the 5 ms floor keeps the
+// drain-rate samples inside one burst that raise a capacity from the floor
+// within one round trip (L32, L33; an echo whose path degrades, L29).
+//
+// The peer's BUSY flag tells of its writer, not of the queue its last
+// burst left behind: our PONGs queued there leave together after its BUSY
+// cleared (a 16 MiB/s link then read as 118 MiB/s), and a peer whose
+// backlog comes and goes is not BUSY all the time. So a sample over less
+// than half the smoothed RTT may at most double the estimate (onPongLocked)
+// unless the capacity still sits at its floor: before the first evidence
+// any sample may set it, and a real rise takes a few PONGs, not one.
+func (st *carrierState) rateSpan() time.Duration {
+	if st.peerBusy {
+		return max(minRateSample, st.srtt/2)
+	}
+	return minRateSample
 }
 
 // onPing records a PING received at now: the next PONG answers it (latest
@@ -315,8 +497,10 @@ func (c *Conn) deathDueLocked(now time.Time) (due bool, at time.Time, waited tim
 // once (L23); a requested one as soon as possible; then probe carriers PING
 // every ProbeInterval and other carriers every PingBusy while busy (P12)
 // and PingIdle otherwise. Sessionless carriers never PING; a full record
-// ring defers the PING until a PONG frees a record. Application silence
-// never triggers anything (L30).
+// ring defers the PING until a PONG frees a record, and the cadence's full
+// share of it (pingCadenceMax) defers a cadence PING. Byte-clocked PINGs
+// are not scheduled here: they end batches that carry DATA (endPing).
+// Application silence never triggers anything (L30).
 func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
 	st := &c.st
 	if c.opts.Sessionless || st.n == pingRingSize {
@@ -324,6 +508,9 @@ func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
 	}
 	if !st.pingSent || st.pingReq {
 		return true, now
+	}
+	if st.n >= pingCadenceMax {
+		return false, time.Time{}
 	}
 	iv := c.tm.PingIdle
 	switch {
