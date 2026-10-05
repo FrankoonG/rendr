@@ -83,6 +83,15 @@ type Hooks struct {
 	// Unlike the other hooks it must not block, and it must not call into
 	// rendr: every event producer waits for that lock meanwhile.
 	EventEnqueued func(seq uint64)
+	// DialBegin runs in Peer.Dial after its entry checks passed and its
+	// MaxSessions placeholder was placed, right before the Dial joins the
+	// Runtime's group of in-flight Dials (L52: a Dial racing Runtime.Close).
+	DialBegin func()
+	// LeavePending runs on a passive session's actor goroutine when the
+	// session with this ID leaves its Listener's backlog (Registry.Opened or
+	// Registry.Ended), before its slot is freed and it is unlinked from the
+	// Accept queue (L50).
+	LeavePending func(session [16]byte)
 }
 
 // ErrNotInstalled is returned by NewRuntime when package rendr is not linked

@@ -45,6 +45,9 @@ func (p *Peer) Dial(ctx context.Context, o DialOptions) (*Conn, error) {
 	if !rt.table.placeDialer(sid) {
 		return nil, fmt.Errorf("rendr: Dial: local MaxSessions %d reached: %w", rt.eff.cfg.MaxSessions, ErrCapacity)
 	}
+	if h := rt.eff.hooks; h != nil && h.DialBegin != nil {
+		h.DialBegin()
+	}
 	if !rt.beginDial() {
 		rt.table.ended(dialerKey(sid), nil, session.Verdict{}, time.Now())
 		return nil, net.ErrClosed
