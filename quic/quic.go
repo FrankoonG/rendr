@@ -3,6 +3,7 @@ package quic
 import (
 	"crypto/tls"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2"
@@ -63,6 +64,23 @@ type Options struct {
 	// (default 2.25 MiB, at most 2048 datagrams); overflow is dropped and
 	// counted (L46).
 	DatagramQueueBytes int
+	// Counters, when non-nil, receives the datagram drops of every carrier
+	// and listener built with these Options (one value may be shared): the
+	// transport's own losses, for loss attribution.
+	Counters *Counters
+}
+
+// Counters count the datagrams the quic module's adapters dropped (M2
+// design §A6.3, Revision 1, R1-9). A drop here is a transport loss, like a
+// kernel socket's: rendr counted the datagram as sent.
+type Counters struct {
+	// IngressDrops: received DATAGRAMs a full ingress queue dropped (L46).
+	IngressDrops atomic.Uint64
+	// EgressDrops: DATAGRAMs the egress queue dropped — the oldest when it
+	// was full (256 datagrams or 512 KiB), or one older than 250 ms when its
+	// turn came: QUIC's congestion control sends slower than rendr writes,
+	// and a datagram carrier's WriteTo never blocks on it.
+	EgressDrops atomic.Uint64
 }
 
 // StreamCarrier returns a stream carrier factory named name that dials
@@ -75,8 +93,12 @@ func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error)
 // DatagramCarrier returns a datagram carrier factory named name that dials
 // address over QUIC: one connection per carrier, DATAGRAM frames only, MTU
 // DatagramBudget. Dial refuses a connection whose peer does not support
-// DATAGRAM or whose current limit is below DatagramBudget. It fails for a
-// missing or invalid TLS configuration.
+// DATAGRAM or whose current limit is below DatagramBudget. The conn's
+// WriteTo never blocks on QUIC's congestion control: it queues the datagram
+// in a bounded egress queue that one sender goroutine per connection
+// drains into quic-go (drops counted in Options.Counters); an error of an
+// earlier datagram (too large, connection closed) is returned by the next
+// WriteTo. It fails for a missing or invalid TLS configuration.
 func DatagramCarrier(name, address string, o Options) (rendr.DatagramCarrier, error) {
 	panic("unimplemented: M2")
 }
@@ -124,4 +146,5 @@ type ListenerStats struct {
 	Streams          uint64 // stream carriers handed to rendr
 	Datagrams        uint64 // datagram carriers handed to rendr
 	DatagramDrops    uint64 // DATAGRAMs the ingress queues dropped (L46)
+	EgressDrops      uint64 // DATAGRAMs the egress queues of handed carriers dropped (R1-9)
 }

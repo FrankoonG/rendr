@@ -27,13 +27,16 @@ type OwnedUDP struct {
 	peer  netip.AddrPort
 	flow  uint64
 	limit int // MaxDatagram: the largest UDP payload, flow header included
+	recv  int // the receive limit in rendr bytes: limit − 9 until SetLimit lowers it (R1-6)
 }
 
 // NewOwnedUDP returns the token for u, a socket carrier/udp opened toward
 // peer for one carrier, with that carrier's flow ID (≠ 0, crypto/rand) and
-// MaxDatagram (546–65,507). Ownership of u moves to the token.
+// MaxDatagram (546–65,507; carrier/udp has already clamped it to the MTU of
+// the interface the route to peer uses, M2 design Revision 1, R1-16).
+// Ownership of u moves to the token.
 func NewOwnedUDP(u *net.UDPConn, peer netip.AddrPort, flow uint64, maxDatagram int) *OwnedUDP {
-	return &OwnedUDP{u: u, peer: peer, flow: flow, limit: maxDatagram}
+	return &OwnedUDP{u: u, peer: peer, flow: flow, limit: maxDatagram, recv: maxDatagram - wire.FlowHeaderLen}
 }
 
 // Flow returns the carrier's flow ID.
@@ -60,8 +63,13 @@ func (o *OwnedUDP) SetReadDeadline(t time.Time) error { return o.u.SetReadDeadli
 // SetWriteDeadline sets the socket's write deadline.
 func (o *OwnedUDP) SetWriteDeadline(t time.Time) error { return o.u.SetWriteDeadline(t) }
 
-// ReadSize implements PacketIO: MaxDatagram + 1.
-func (o *OwnedUDP) ReadSize() int { return o.limit + 1 }
+// ReadSize implements PacketIO: the receive limit + the flow header + 1
+// (MaxDatagram + 1 until SetLimit).
+func (o *OwnedUDP) ReadSize() int { return o.recv + wire.FlowHeaderLen + 1 }
+
+// SetLimit implements PacketIO: the receive limit in rendr bytes, at most
+// Limit() (called before Start only).
+func (o *OwnedUDP) SetLimit(n int) { o.recv = min(n, o.Limit()) }
 
 // ReadDatagram implements PacketIO.
 func (o *OwnedUDP) ReadDatagram(buf []byte) ([]byte, PeerKey, ReadEvent, error) {
@@ -120,7 +128,9 @@ func (s *OwnedUDPSocket) ReadAddrPort(p []byte) (n int, src netip.AddrPort, ev R
 }
 
 // WriteAddrPort sends p as one datagram to dst. EMSGSIZE and WSAEMSGSIZE are
-// a *wire.DatagramTooLargeError with Max 0; ICMP-class errors ErrNoise.
+// a *wire.DatagramTooLargeError with Max 0 (with the interface-MTU clamp of
+// R1-16 only a route change produces them; the MTU probe then decides);
+// ICMP-class errors ErrNoise.
 func (s *OwnedUDPSocket) WriteAddrPort(p []byte, dst netip.AddrPort) error {
 	panic("unimplemented: M2")
 }

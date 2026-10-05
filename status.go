@@ -90,11 +90,13 @@ type SessionStatus struct {
 }
 
 // PacketCounters count the datagrams of one packet session on this side.
-// The send-side drops and Sent add up to what WriteTo accepted; a datagram
-// that was sent and not received was lost with a carrier, dropped by the
-// network, or counted in the peer's receive-side drops.
+// Sent and the send-side drops add up to what WriteTo accepted (a datagram
+// still queued is in none of them; nothing is queued after the end): a
+// datagram a carrier refused as too large counts in DropTooLarge, not in
+// Sent. A datagram that was sent and not received was lost with a carrier,
+// dropped by the network, or counted in the peer's receive-side drops.
 type PacketCounters struct {
-	Sent          uint64 // handed to a carrier
+	Sent          uint64 // handed to a carrier and not refused by it
 	Received      uint64 // accepted from carriers (distinct)
 	Duplicates    uint64 // received again inside the dedup window
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
@@ -102,7 +104,7 @@ type PacketCounters struct {
 	DropTooLarge  uint64 // send side: no live carrier could carry it, or a carrier refused it as too large
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)
-	DropLate      uint64 // receive side: older than the dedup window
+	DropLate      uint64 // receive side: older than the dedup window, or arrived after ReadFrom already returned io.EOF
 	PeerReceived  uint64 // the peer's Received, as last reported by its accounting frames
 }
 

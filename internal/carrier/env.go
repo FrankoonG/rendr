@@ -25,7 +25,8 @@ type Env struct {
 	// DBufs is the datagram buffer pool (classes 2 KiB … 64 KiB, M2-D28):
 	// datagram reader buffers and writer scratches (charged to Stages),
 	// udpflow inbox buffers (charged to Budget). The stream pool Bufs keeps
-	// its M1 classes. Nil until M2 wave 1 builds it in NewRuntime.
+	// its M1 classes. NewRuntime sets it (NewDatagramBufPool, WP3c);
+	// component tests that need it set their own; nil in M1 tests.
 	DBufs *BufPool
 	// Dgram are the Runtime-wide datagram counters behind
 	// rendr.Status.Datagram; nil in component tests.
@@ -62,7 +63,7 @@ type Timing struct {
 	Segment            int           // largest DATA payload a sender puts in one frame (64 KiB)
 
 	// M2: datagram carriers (M2-D16, M2-D23, M2-D24). Zero selects the
-	// default once M2 wave 1 extends withDefaults.
+	// default (withDefaults).
 	PacketPing    time.Duration // PING cadence of a packet-active datagram carrier (1 s)
 	PacketActive  time.Duration // a DGRAM written or read within this keeps a carrier packet-active (PingIdle, 10 s)
 	RelRTOInit    time.Duration // REL and H1 timeout before the first RTT sample (300 ms)
@@ -88,6 +89,15 @@ const (
 	defAbandonWait     = time.Second
 	defWindow          = 8 << 20
 	defCapFloor        = 128 << 10
+
+	// M2 (datagram carriers; M2 design §A7.4). PacketActive defaults to
+	// PingIdle.
+	defPacketPing    = time.Second
+	defRelRTOInit    = 300 * time.Millisecond
+	defRelRTOMin     = 200 * time.Millisecond
+	defRelRTOMax     = 2 * time.Second
+	defMTUProbeEvery = 10
+	defMTUProbeFails = 3
 )
 
 // withDefaults returns t with every zero (or negative) field replaced by
@@ -123,6 +133,20 @@ func (t Timing) withDefaults() Timing {
 	if t.Segment <= 0 {
 		t.Segment = ChunkSize
 	}
+	def(&t.PacketPing, defPacketPing)
+	def(&t.PacketActive, t.PingIdle)
+	def(&t.RelRTOInit, defRelRTOInit)
+	def(&t.RelRTOMin, defRelRTOMin)
+	def(&t.RelRTOMax, defRelRTOMax)
+	if t.RelRTOMax < t.RelRTOMin {
+		t.RelRTOMax = t.RelRTOMin
+	}
+	if t.MTUProbeEvery <= 0 {
+		t.MTUProbeEvery = defMTUProbeEvery
+	}
+	if t.MTUProbeFails <= 0 {
+		t.MTUProbeFails = defMTUProbeFails
+	}
 	return t
 }
 
@@ -154,6 +178,17 @@ func (p Presets) fseqFrom(hello []byte) uint32 {
 		return p.FirstFseq
 	}
 	return wire.PrefaceFseq(hello)
+}
+
+// firstCseq returns the first REL cseq of each direction of a datagram
+// carrier: FirstCseq when preset (both Runtimes of a test preset the same
+// value, as FirstFseq), else wire.FirstCseq. The handshakes derive the REL
+// start values of M2 design Revision 1, R1-3, from it.
+func (p Presets) firstCseq() uint32 {
+	if p.FirstCseq == 0 {
+		return wire.FirstCseq
+	}
+	return p.FirstCseq
 }
 
 // firstPingID returns the id of a carrier's first PING.

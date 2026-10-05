@@ -21,9 +21,11 @@ type Factory struct {
 	Dial      func(ctx context.Context) (net.Conn, error)               // stream factories: required
 	DialEarly func(ctx context.Context, first []byte) (net.Conn, error) // stream factories: optional
 
-	// Kind is the factory's carrier kind; zero means wire.KindStream (every
-	// M1 factory). A datagram factory sets DialPacket and MTU instead of
-	// Dial; Establish dispatches on Kind (M2 design §A5.10).
+	// Kind is the factory's carrier kind. NewPeer sets it for every factory
+	// (M2 design Revision 1, R1-32); zero — component tests, M1 factories —
+	// means wire.KindStream, also in the DialInfo Establish attaches. A
+	// datagram factory sets DialPacket and MTU instead of Dial; Establish
+	// dispatches on Kind (M2 design §A5.10).
 	Kind wire.CarrierKind
 	// DialPacket opens one datagram carrier: a net.PacketConn and the peer
 	// address rendr writes to (rendr.DatagramCarrier.Dial). Required for a
@@ -40,7 +42,7 @@ type Factory struct {
 // Established is a dialer carrier whose handshake completed: PREFACE_ACK(OK)
 // and the passive's first frame were read and verified.
 type Established struct {
-	Conn    *Conn           // unstarted; owns the net.Conn and any bytes read past the response frame
+	Conn    *Conn           // unstarted; owns the net.Conn and any bytes read past the response frame (a datagram carrier: its PacketIO and the response datagram's tail, R1-1)
 	Ack     wire.PrefaceAck // Status == PrefaceOK
 	Resp    wire.Header     // the passive's first frame: OPEN_ACK, JOIN_ACK, PONG, CLOSE or GOAWAY
 	Payload []byte          // a copy of the response payload (≤ 300 bytes)

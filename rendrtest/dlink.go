@@ -144,8 +144,10 @@ func (l *DatagramLink) ScriptWrites(d Dir, rs ...WriteResult) { panic("unimpleme
 func (l *DatagramLink) ReadFaults(d Dir, errs ...error) { panic("unimplemented: M2") }
 
 // TruncateNext makes the next ReadFrom of side d report a truncated
-// datagram: Linux style (n == len(p)) or Windows style (an error matching
-// WSAEMSGSIZE).
+// datagram: Linux style (n == len(p), nil) or Windows style (n == len(p)
+// with a *net.OpError wrapping syscall.Errno(10040), WSAEMSGSIZE, on every
+// OS: rendr classifies embedder errors by one platform-independent table,
+// M2 design Revision 1, R1-28).
 func (l *DatagramLink) TruncateNext(d Dir, windows bool) { panic("unimplemented: M2") }
 
 // ForeignNext delivers the next datagram of direction d from another
@@ -224,13 +226,17 @@ func (h *DatagramHub) Spoof(b []byte) { panic("unimplemented: M2") }
 func (h *DatagramHub) Replay(i, k int) { panic("unimplemented: M2") }
 
 // FloodMix is the share of each datagram class of a flood (percent).
+// Preface is a valid OPEN first datagram, Join a valid JOIN first datagram
+// (random session and flow IDs; R1-21: JOIN and probe flows have their own
+// per-source quota).
 type FloodMix struct {
-	Random, BadCRC, Preface int
+	Random, BadCRC, Preface, Join int
 }
 
 // Flood sends rate datagrams per second to the passive socket from
 // rotating foreign addresses: random bytes, valid flow headers with a bad
-// frame CRC, and valid first datagrams with random IDs (L58). stop ends it.
+// frame CRC, and valid first datagrams (OPEN or JOIN) with random IDs
+// (L58). stop ends it.
 func (h *DatagramHub) Flood(rate float64, mix FloodMix) (stop func()) {
 	panic("unimplemented: M2")
 }

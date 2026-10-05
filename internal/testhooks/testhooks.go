@@ -58,7 +58,9 @@ type Overrides struct {
 	PacketQueue, PacketMaxPayload          int           // Packet.Queue (1 MiB), Packet.MaxPayload (65,507)
 	PackEvery, DedupBits                   int           // PACK after this many datagrams (256); receive dedup window bits (16,384)
 	MTUProbeEvery, MTUProbeFails           int           // every n-th PacketPing PING is an MTU probe (10); consecutive failed probes that kill (3)
-	FlowMaxFlows, FlowPerSource, FlowInbox int           // udpflow bounds: flows per source, admitting flows per source IP (32), inbox datagrams (512)
+	FlowMaxFlows, FlowPerSource, FlowInbox int           // udpflow bounds: flows per source, admitting OPEN flows per source IP (32), inbox datagrams (512)
+	FlowPerSourceJoin                      int           // admitting JOIN and probe flows per source IP (32; M2 design Revision 1, R1-21)
+	FlowTombstoneTTL                       time.Duration // how long a removed flow ID stays refused (max(Handshake.Timeout, DialTimeout) + 2 s; R1-11)
 	// Counter presets (L14), equal in both Runtimes of a test.
 	FirstSeq  uint64 // first packet seq of every session direction (0)
 	FirstCseq uint32 // first REL cseq of every datagram carrier direction (1)

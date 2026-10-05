@@ -12,11 +12,17 @@
 // header and CRC verify): before that nothing is allocated (plan:324).
 // Admission is bounded per source IP address (admitting flows: from H1
 // until a positive verdict was written, so held carriers of pending
-// sessions count too) and in total; both overflows drop silently (no
-// amplification). A closed Listener answers a new flow's H1 with a
-// stateless PREFACE_ACK(CAPACITY). Removal deletes a flow from the table
-// only if the table still maps its ID to that *Flow (pointer compare). The
-// package never imports package session or the root package.
+// sessions count too) — separately for flows whose H1 carries an OPEN and
+// for those whose H1 carries a JOIN or a probe PING, so that an OPEN flood
+// from an address never blocks the JOINs and probes of that address's
+// sessions (L48; M2 design Revision 1, R1-21) — and in total; every
+// overflow drops silently (no amplification). A closed Listener answers a
+// new flow's H1 with a stateless PREFACE_ACK(CAPACITY). Removal deletes a
+// flow from the table only if the table still maps its ID to that *Flow
+// (pointer compare) and leaves a tombstone of the ID for
+// Limits.TombstoneTTL: a late copy of the flow's H1 is dropped instead of
+// creating a new flow (R1-11). The package never imports package session
+// or the root package.
 package udpflow
 
 import (
@@ -28,9 +34,11 @@ import (
 
 // Default bounds (M2-D59; testhooks may change them).
 const (
-	DefaultPerSource = 32  // admitting flows per source IP address
-	DefaultInbox     = 512 // datagrams queued per flow
-	MaxFlowsCap      = 65536
+	DefaultPerSource     = 32   // admitting OPEN flows per source IP address
+	DefaultPerSourceJoin = 32   // admitting JOIN and probe flows per source IP address (R1-21)
+	DefaultInbox         = 512  // datagrams queued per flow
+	DefaultTombstones    = 4096 // removed flow IDs remembered per source (oldest forgotten first; R1-11)
+	MaxFlowsCap          = 65536
 )
 
 // Limits bound one Source.
@@ -38,11 +46,21 @@ type Limits struct {
 	// MaxFlows bounds live flows: min(MaxFlowsCap, MaxSessions ×
 	// MaxCarriersPerSession + Sessionless.Total + Handshake.MaxConcurrent).
 	MaxFlows int
-	// PerSource bounds admitting flows per source IP address.
+	// PerSource bounds admitting flows per source IP address whose H1
+	// carries an OPEN.
 	PerSource int
+	// PerSourceJoin bounds admitting flows per source IP address whose H1
+	// carries a JOIN or a probe PING (R1-21): an OPEN flood never uses it.
+	PerSourceJoin int
 	// Inbox bounds the datagrams queued per flow (buffers charged to
 	// Env.Budget with TryAcquire: a refusal drops the datagram).
 	Inbox int
+	// TombstoneTTL is how long a removed flow's ID stays refused:
+	// max(Handshake.Timeout, DialTimeout) + 2 s, the longest a correct
+	// dialer's copies of its H1 can still arrive (R1-11); Tombstones bounds
+	// the IDs remembered (DefaultTombstones).
+	TombstoneTTL time.Duration
+	Tombstones   int
 }
 
 // Admit receives every new flow on the demux goroutine, its H1 already in
@@ -99,12 +117,12 @@ func (s *Source) Stats() Stats {
 // Stats are one Source's counters.
 type Stats struct {
 	Flows      int    // live flows, admitting ones included
-	Admitting  int    // flows before a positive verdict was written for them
-	Dropped    uint64 // datagrams dropped before reaching a flow (malformed, unknown flow, no valid H1, quota, cap)
+	Admitting  int    // flows before a positive verdict was written for them (both per-source quotas)
+	Dropped    uint64 // datagrams dropped before reaching a flow (malformed, unknown or tombstoned flow, no valid H1, quota, cap)
 	Truncated  uint64 // of Dropped: truncated or oversize datagrams
 	InboxDrops uint64 // datagrams a full or Budget-refused inbox dropped
 	ReadErrors uint64 // transient read errors (backed off)
-	QuotaDrops uint64 // of Dropped: valid H1 refused by the per-source quota or MaxFlows
+	QuotaDrops uint64 // of Dropped: valid H1 refused by a per-source quota or MaxFlows
 }
 
 // Flow is one raw-UDP carrier's view of the shared socket. *Flow implements
@@ -128,6 +146,12 @@ func (f *Flow) Admitted() {
 
 // ReadSize implements carrier.PacketIO: 0 (inbox buffers are handed out).
 func (f *Flow) ReadSize() int { return 0 }
+
+// SetLimit implements carrier.PacketIO: inbox datagrams with more rendr
+// bytes than n are returned as carrier.ReadTruncated (R1-6).
+func (f *Flow) SetLimit(n int) {
+	panic("unimplemented: M2")
+}
 
 // ReadDatagram implements carrier.PacketIO: the next inbox datagram.
 func (f *Flow) ReadDatagram(buf []byte) ([]byte, carrier.PeerKey, carrier.ReadEvent, error) {
@@ -155,7 +179,9 @@ func (f *Flow) WriteDatagramTo(b []byte, dst carrier.PeerKey) error {
 	panic("unimplemented: M2")
 }
 
-// SetPeer implements carrier.PacketIO: the latest candidate only.
+// SetPeer implements carrier.PacketIO: the latest candidate only. The
+// carrier's reader calls it when a rebind commits (Flow.mu guards the
+// peer).
 func (f *Flow) SetPeer(dst carrier.PeerKey) error {
 	panic("unimplemented: M2")
 }

@@ -202,6 +202,17 @@ func CloseConn(env *Env, nc net.Conn) {
 	(&closeOnce{nc: nc}).async(env)
 }
 
+// deadlineCloser is what a closeOnce closes (M2 design Revision 1, R1-7):
+// the embedder net.Conn of a stream carrier or the PacketIO of a datagram
+// carrier, both of which satisfy it. The closer, its deadline part and the
+// last resort of an abandonment therefore act on the real transport of
+// either kind; a datagram Conn is never built with a nil conn
+// (newDatagramConn).
+type deadlineCloser interface {
+	SetDeadline(t time.Time) error
+	Close() error
+}
+
 // closeOnce closes an embedder conn exactly once (L51, L52): it calls
 // SetDeadline(now) and Close at most once each, whoever comes first — the
 // goroutine that owns the conn, after its last call, or the last-resort
@@ -223,9 +234,20 @@ func CloseConn(env *Env, nc net.Conn) {
 // silent path, only the peer ends, with the closer and the reader counted
 // in the abandoned-call pool all that time.
 type closeOnce struct {
-	nc      net.Conn
-	setting atomic.Bool // SetDeadline(now) was started
-	closing atomic.Bool // Close was started; a Close that hangs in the embedder keeps it, so nothing closes a second time
+	nc      deadlineCloser // a net.Conn (stream carriers) or a PacketIO (datagram carriers)
+	setting atomic.Bool    // SetDeadline(now) was started
+	closing atomic.Bool    // Close was started; a Close that hangs in the embedder keeps it, so nothing closes a second time
+}
+
+// conn returns the stream conn k closes, for the stream-only paths that
+// also read or write it (readHello, writeAndCloseInline). A datagram
+// transport never takes those paths: conn panics for one.
+func (k *closeOnce) conn() net.Conn {
+	nc, ok := k.nc.(net.Conn)
+	if !ok {
+		panic("rendr/carrier: stream close path on a datagram transport")
+	}
+	return nc
 }
 
 // startDeadline reports whether the caller is to call SetDeadline(now):
@@ -327,16 +349,17 @@ func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Tim
 	}
 	w := armWatch(nil, wait, func() { k.last(env) }) // the last resort only: the caller's owner counts this goroutine
 	defer w.finish()                                 // also on runtime.Goexit in a conn call
-	_ = callSetWriteDeadline(k.nc, deadline)
-	if writeFull(k.nc, frame) == nil {
-		if o, ok := k.nc.(*OwnedTCP); ok {
+	nc := k.conn()
+	_ = callSetWriteDeadline(nc, deadline)
+	if writeFull(nc, frame) == nil {
+		if o, ok := nc.(*OwnedTCP); ok {
 			_ = callCloseWrite(o)
 		}
 		until := time.Now().Add(drainMax)
 		if deadline.Before(until) {
 			until = deadline
 		}
-		drain(k.nc, until)
+		drain(nc, until)
 	}
 	k.async(env)
 }
@@ -459,7 +482,7 @@ func callWriteBuffers(o *OwnedTCP, v *net.Buffers) (n int64, err error) {
 	return o.WriteBuffers(v)
 }
 
-func callSetDeadline(nc net.Conn, t time.Time) (err error) {
+func callSetDeadline(nc deadlineCloser, t time.Time) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &panicError{"SetDeadline", r}
@@ -486,7 +509,7 @@ func callSetWriteDeadline(nc net.Conn, t time.Time) (err error) {
 	return nc.SetWriteDeadline(t)
 }
 
-func callClose(nc net.Conn) (err error) {
+func callClose(nc deadlineCloser) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &panicError{"Close", r}

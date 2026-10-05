@@ -111,6 +111,90 @@ func (p *plane) WriteBlocked(c *carrier.Conn) {
 	panic("unimplemented: M2")
 }
 
+// endpoint returns the carrier endpoint of lane l (M2-D2): (*plane)(l) for
+// a packet session, l itself for a stream session. Every Conn.Start of a
+// session lane passes it.
+func (s *Session) endpoint(l *lane) carrier.Endpoint {
+	if s.pk != nil {
+		return (*plane)(l)
+	}
+	return l
+}
+
+// The WP6a functions WP6b's actor code calls (M2 design §A5.1, §A11.5 and
+// Revision 1, R1-20, R1-22). Each is called with s.mu held.
+
+// initPacketLocked initialises the packet plane after initStreamLocked's
+// generic part: rings with max = Queue and maxN = Queue/64, the dedup
+// storage (DedupBits/64 words), nextSeq = FirstSeq; maxPayload from
+// PassiveSpec.MaxPayload on the passive (R1-32) or 0 on the dialer until
+// its OPEN_ACK fixed it.
+func (s *Session) initPacketLocked() {
+	panic("unimplemented: M2")
+}
+
+// pktWakeLocked wakes the data lanes the wake policy selects for queued
+// datagrams (§A5.2 with R1-19's minimum share in bond mode).
+func (s *Session) pktWakeLocked(now time.Time) {
+	panic("unimplemented: M2")
+}
+
+// pktRecomputeLocked recomputes pk.dgMax and pk.mixed from the live data
+// lanes (every routing change; §A5.2) and drops txBig when the last stream
+// data lane left.
+func (s *Session) pktRecomputeLocked() {
+	panic("unimplemented: M2")
+}
+
+// pktCloseLocked is Session.Close for a packet session (§A5.6): requests
+// the FIN, discards the receive queue, wakes both waiters and the lanes.
+func (s *Session) pktCloseLocked(now time.Time) {
+	panic("unimplemented: M2")
+}
+
+// pktEndLocked releases the packet rings at the session's end (a datagram
+// a ReadFrom detached stays with it), counts still-queued tx datagrams as
+// DropQueue and wakes every waiter (§A5.1 endLocked).
+func (s *Session) pktEndLocked() {
+	panic("unimplemented: M2")
+}
+
+// pktPeerFinCheckLocked delivers the peer's FIN once nothing more can come
+// (§A5.6, L40): the receive queue is empty and every seq below the final
+// one was accepted, or finWaitAt passed.
+func (s *Session) pktPeerFinCheckLocked(now time.Time) {
+	panic("unimplemented: M2")
+}
+
+// pktPackCadenceLocked accounts one accepted datagram for the PACK
+// cadence (§A5.5): urgent at PackEvery, else armed PacketPing after the
+// first unreported datagram.
+func (s *Session) pktPackCadenceLocked() {
+	panic("unimplemented: M2")
+}
+
+// pktDgramRecentLocked reports whether lane l placed a DGRAM within the
+// last PacketPing (bond death counting, M2-D44; laneGoneLocked).
+func (s *Session) pktDgramRecentLocked(l *lane, now time.Time) bool {
+	panic("unimplemented: M2")
+}
+
+// pktAgeLocked drops the queued tx datagrams older than MaxAge (DropNoPath
+// or DropAge per M2-D35) and returns when the next queued one ages out
+// (zero: none queued). The actor calls it while no data lane exists and
+// arms a deadline at the returned time (§A5.2, R1-22).
+func (s *Session) pktAgeLocked(now time.Time) time.Time {
+	panic("unimplemented: M2")
+}
+
+// fillPackLocked is the packet branch of fillControlLocked's duty-lane
+// step (§A5.5): places the PACK when due, REL-wrapped when reliable; a
+// reliable PACK that finds no REL room hands the duty to a live lane with
+// REL room (R1-17).
+func (s *Session) fillPackLocked(l *lane, b *carrier.Batch) {
+	panic("unimplemented: M2")
+}
+
 // Kind returns the session kind (wire.KindStream or wire.KindDatagram).
 func (s *Session) Kind() wire.CarrierKind {
 	if s.pk != nil {

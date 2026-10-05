@@ -351,4 +351,5 @@ const (
 	factExhausted                              // a Write reached Params.OffsetLimit (exhausted)
 	factLaneConfirmed                          // Fill placed a lane's first response frame (firstSent)
 	factWriteBlocked                           // a lane's carrier reported WriteBlocked (duties move off it)
+	factPktFin                                 // packet session: the peer's FIN arrived; the actor arms pk.finWaitAt (M2 design §A5.6)
 )

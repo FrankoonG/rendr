@@ -17,6 +17,9 @@ type PassiveSpec struct {
 	Metadata       []byte   // copied
 	// MaxPayload is a packet session's accepted MaxPayload (pmtu_acc,
 	// M2-D49), carried by Confirm's OPEN_ACK; 0 for stream sessions.
+	// NewPending fixes the session's MaxPayload from it, so
+	// PendingPacket.MaxPayload reads the accepted value before Confirm (M2
+	// design Revision 1, R1-32).
 	MaxPayload int
 }
 

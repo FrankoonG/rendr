@@ -19,14 +19,28 @@ import (
 // The reader half (ReadSize, ReadDatagram, Release, SetReadDeadline) is
 // called only by the carrier's reader goroutine and, before Start, by the
 // handshake; the writer half (Headroom, WriteDatagram, WriteDatagramTo,
-// SetPeer, SetWriteDeadline) only by the writer goroutine and, before Start
-// or for a refusal, by the handshake and the closer; SetDeadline, Close and
-// Limit by any goroutine. The I/O contract is M2 design §A6.4.
+// SetWriteDeadline) only by the writer goroutine and, before Start or for a
+// refusal, by the handshake and the closer; SetPeer by the writer or the
+// reader (a rebind commits in the reader, M2-D27; implementations guard the
+// peer with their own lock); SetLimit only before Start (Conn.SetBudget);
+// SetDeadline, Close and Limit by any goroutine. The I/O contract is M2
+// design §A6.4.
 type PacketIO interface {
-	// ReadSize is the buffer length ReadDatagram needs: the receive limit
-	// + 1 (truncation detection, plan:634) + Headroom. Flows return 0: they
-	// hand out their inbox buffers instead (see Release).
+	// ReadSize is the buffer length ReadDatagram needs: the current
+	// receive limit (Limit() until SetLimit lowered it) + 1 (truncation
+	// detection, plan:634) + Headroom. Callers pass a buffer of at least
+	// ReadSize() bytes; the transport reads into its first ReadSize() bytes,
+	// so the caller and the transport judge truncation against the same
+	// length (M2 design Revision 1, R1-6). Flows return 0: they hand out
+	// their inbox buffers instead (see Release) and apply the receive limit
+	// themselves.
 	ReadSize() int
+	// SetLimit lowers the receive limit to n rendr bytes
+	// (wire.MinFrameBudget ≤ n ≤ Limit()): a longer datagram is then
+	// ReadTruncated, and ReadSize follows. Conn.SetBudget calls it once with
+	// the negotiated cmtu before Start (R1-6); Limit keeps reporting the
+	// transport's capacity.
+	SetLimit(n int)
 	// ReadDatagram reads the next datagram into buf (flows ignore buf and
 	// return an inbox buffer) and returns its rendr bytes — the flow header
 	// already removed — aliasing that buffer, valid until the next call or
@@ -54,8 +68,8 @@ type PacketIO interface {
 	// WriteDatagramTo sends b to dst instead of the current peer (a rebind
 	// challenge, M2-D27); ErrNoRebind on transports that cannot rebind.
 	WriteDatagramTo(b []byte, dst PeerKey) error
-	// SetPeer makes dst the current peer (a committed rebind); ErrNoRebind
-	// on transports that cannot rebind.
+	// SetPeer makes dst the current peer (a committed rebind, called by the
+	// reader or the writer); ErrNoRebind on transports that cannot rebind.
 	SetPeer(dst PeerKey) error
 	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
@@ -64,8 +78,11 @@ type PacketIO interface {
 	// (a flow leaves its source's table; the shared socket stays open).
 	Close() error
 	// Limit is the largest rendr datagram (after the flow header) the
-	// transport can receive: a flow's socket MaxDatagram − 9; an *OwnedUDP's
-	// MaxDatagram − 9; wire.MaxDatagram for embedder conns (unknown).
+	// transport can receive — its capacity, used for the cmtu offer and
+	// cmtu_acc: a flow's socket MaxDatagram − 9; an *OwnedUDP's MaxDatagram
+	// − 9 (carrier/udp clamps MaxDatagram to the route's interface MTU at
+	// Dial, R1-16); the limit given to NewPacketIO for embedder conns
+	// (wire.MaxDatagram when unknown).
 	Limit() int
 }
 
@@ -116,9 +133,16 @@ type DgramStats struct {
 // once into a PeerKey (pointer identity first, then *net.UDPAddr → AddrPort,
 // else a guarded String()); datagrams from other sources are ReadForeign;
 // WriteDatagram always passes the original peer value to WriteTo. limit is
-// the receive limit (the negotiated cmtu; wire.MaxDatagram while unknown).
-// Errors: a nil pc or peer, a peer whose String panics. Ownership of pc
-// moves to the result only on success (L57).
+// the transport's Limit and its initial receive limit: the factory MTU on
+// a dialer, wire.MaxDatagram for Listener.HandlePacket (unknown); the
+// negotiated cmtu lowers the receive limit later (SetLimit, R1-6), so a
+// started carrier reads with cmtu + 1 bytes. Transport errors are
+// classified by one table on every OS (M2 design §A6.4, Revision 1, R1-28):
+// the Windows errnos (WSAEMSGSIZE 10040, WSAENETRESET 10052,
+// WSAECONNABORTED 10053, WSAECONNRESET 10054) and the POSIX ones match
+// everywhere, so an embedder conn — or the in-memory fake — behaves the same
+// on every host. NewPacketIO fails for a nil pc or peer and for a peer whose
+// String panics. Ownership of pc moves to the result only on success (L57).
 func NewPacketIO(env *Env, pc net.PacketConn, peer net.Addr, limit int) (PacketIO, error) {
 	panic("unimplemented: M2")
 }

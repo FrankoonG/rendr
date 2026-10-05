@@ -104,5 +104,9 @@ func CarrierDialInfo(ctx context.Context) (DialInfo, bool) {
 	if !ok {
 		return DialInfo{}, false
 	}
-	return DialInfo{Carrier: CarrierID(d.Carrier), Kind: Kind(d.Kind), Probe: d.Probe, Session: SessionID(d.Session)}, true
+	k := Kind(d.Kind)
+	if k == 0 {
+		k = KindStream // a factory without an explicit kind is a stream factory
+	}
+	return DialInfo{Carrier: CarrierID(d.Carrier), Kind: k, Probe: d.Probe, Session: SessionID(d.Session)}, true
 }

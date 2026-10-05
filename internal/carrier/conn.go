@@ -121,7 +121,7 @@ type Conn struct {
 	env     *Env
 	tm      Timing // env.Timing with defaults for zero fields
 	nc      net.Conn
-	ncClose closeOnce // closes nc exactly once: the closer, or the last resort of its abandonment (V2)
+	ncClose closeOnce // closes nc (a datagram carrier: its dg.io, R1-7) exactly once: the closer, or the last resort of its abandonment (V2)
 	owned   *OwnedTCP // nc itself when it is rendr's ownership token (D3, L57); nil otherwise
 	id      uint32
 	peer    [16]byte
@@ -276,8 +276,11 @@ func (c *Conn) DgramMax() int {
 // SetBudget fixes the negotiated cmtu of an unstarted datagram carrier
 // (M2-D50): on the passive the admission's min(the dialer's offer, the
 // transport's Limit), on the dialer the value the OPEN_ACK or JOIN_ACK
-// returned (≤ its offer). It sets the send budget and the receive limit.
-// A no-op on stream carriers; it panics after Start.
+// returned (≤ its offer). It sets the send budget and the receive limit,
+// and lowers the transport's receive limit to it (PacketIO.SetLimit, M2
+// design Revision 1, R1-6), so the started reader's buffer is cmtu +
+// Headroom + 1 and a longer datagram is ReadTruncated. A no-op on stream
+// carriers; it panics after Start.
 func (c *Conn) SetBudget(cmtu int) {
 	panic("unimplemented: M2")
 }
@@ -621,11 +624,11 @@ func (c *Conn) closeConn() {
 	if set {
 		go func() {
 			defer c.partDone(partDeadline) // also on runtime.Goexit inside the embedder's SetDeadline
-			_ = callSetDeadline(c.nc, time.Now())
+			_ = callSetDeadline(k.nc, time.Now())
 		}()
 	}
 	if k.startClose() {
-		_ = callClose(c.nc)
+		_ = callClose(k.nc) // the net.Conn, or a datagram carrier's PacketIO (R1-7)
 	}
 }
 
@@ -785,6 +788,11 @@ func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []
 	}
 	if deadline.IsZero() {
 		deadline = time.Now().Add(drainMax)
+	}
+	if c.dg != nil {
+		// A datagram verdict is a REL retransmitted until RACKed (M2-D21).
+		c.dgWriteAndClose(t, flags, handle, payload, deadline)
+		return
 	}
 	frame := wire.AppendFrame(nil, wire.Header{Type: t, Flags: flags, Fseq: c.wr.fseq, Handle: handle}, payload)
 	if !c.setDeath(CauseLocalClose, "closed after a "+t.String()) {

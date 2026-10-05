@@ -135,10 +135,10 @@ func (p *PendingPacket) Metadata() []byte { return p.s.Metadata() }
 // PeerInstance returns the dialer's InstanceID.
 func (p *PendingPacket) PeerInstance() InstanceID { return InstanceID(p.s.PeerInstance()) }
 
-// MaxPayload returns the MaxPayload Confirm fixes for the session.
-func (p *PendingPacket) MaxPayload() int {
-	panic("unimplemented: M2")
-}
+// MaxPayload returns the session's MaxPayload: the value Confirm's
+// OPEN_ACK carries, fixed when the OPEN was admitted (M2 design Revision 1,
+// R1-32).
+func (p *PendingPacket) MaxPayload() int { return p.s.MaxPayload() }
 
 // Confirm accepts the session (OPEN_ACK OK) and returns its PacketConn.
 func (p *PendingPacket) Confirm() (*PacketConn, error) {

@@ -48,7 +48,12 @@ type Options struct {
 	// DatagramCarrier.MTU is MaxDatagram − 9. A listening socket should
 	// allow at least every dialer's value: the carriers then agree on the
 	// dialer's (a larger dialer value is lowered to the listener's at the
-	// handshake).
+	// handshake). A value above what the local interface carries is lowered
+	// to it — by Dial to the MTU of the interface the route to the peer
+	// uses, by Listen on a specific address to that address's interface
+	// MTU, minus the IP and UDP headers — so the socket never refuses its
+	// own datagrams as too large (M2 design Revision 1, R1-16); a wildcard
+	// Listen cannot know its route and keeps the value.
 	MaxDatagram int
 	// ReadBuffer and WriteBuffer size the socket buffers, best effort: 0
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with

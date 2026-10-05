@@ -6,6 +6,21 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
+// newDatagramConn returns an unstarted datagram carrier over io (M2-D3; M2
+// design Revision 1, R1-7): newConn without an embedder net.Conn whose
+// closer, deadline part and last-resort close act on io through ncClose,
+// so no close of a datagram Conn ever goes through a nil conn. The
+// handshakes (dgestablish.go, dghello.go) build every datagram Conn with
+// it and then fill dg: budget and receive limit, windows, the REL start
+// values of R1-3, the handshake bytes and, on the dialer, the response
+// datagram's tail (R1-1).
+func newDatagramConn(env *Env, io PacketIO, id uint32, peer [16]byte, factory int, name string, dialer bool) *Conn {
+	c := newConn(env, nil, id, peer, factory, name, dialer)
+	c.ncClose.nc = io
+	c.dg = &dgState{io: io}
+	return c
+}
+
 // dgState is the datagram half of a Conn (M2-D3): set by the datagram
 // handshakes, nil on stream carriers. The Conn's lifecycle, death record,
 // joins, closer, watchdog, PING records and estimator are shared with
@@ -20,9 +35,18 @@ import (
 // the work packages that fill them (M2 design §A11): dgHandshake in
 // dghello.go, relState in rel.go, dgProbe and dgChallenge in dgprobe.go.
 type dgState struct {
-	io        PacketIO     // (I) the transport
-	recvLimit int          // (I) the negotiated cmtu: the reader accepts datagrams up to it (buffer recvLimit + Headroom + 1)
+	io        PacketIO     // (I) the transport; ncClose closes it exactly once (R1-7)
+	recvLimit int          // (I) the negotiated cmtu: the reader accepts datagrams up to it (io.SetLimit; buffer io.ReadSize() = recvLimit + Headroom + 1, R1-6)
 	budget    atomic.Int32 // (A) the send frame budget: the negotiated cmtu, only ever lowered (M2-D25)
+
+	// tail (dialer, I until Start, then R) holds the rendr bytes that
+	// followed the response frame in the response datagram — frames the
+	// passive packed behind its first response (a first PING, DGRAMs that
+	// Confirm released): Establish copies them here and the reader walks
+	// them as the rest of that datagram (header, CRC, fseq window,
+	// dispatch) before its first ReadDatagram, so nothing the passive sent
+	// with its response is lost (M2 design Revision 1, R1-1). Nil after.
+	tail []byte
 
 	rwin          wire.FseqWindow // (R) receive anti-replay window (M2-D13)
 	peerClosed    bool            // (R) the peer's CLOSE was dispatched (M2-D30)
@@ -46,4 +70,14 @@ type dgCounters struct {
 	refused     atomic.Uint64 // DGRAMs lost in datagrams the transport refused as too large
 	retransmits atomic.Uint64 // REL and H1 retransmissions
 	rebinds     atomic.Uint64 // committed rebinds
+}
+
+// PeerCloseReason returns the reason of the peer's CLOSE once the reader
+// dispatched it, and true; false before (M2 design Revision 1, R1-3). A
+// datagram probe carrier learns a CLOSE(capacity) only after Establish
+// returned on the probe's PONG, so the health layer reads it here to record
+// the probe failure with reason "capacity" (plan:175). Stream carriers
+// learn a capacity refusal as Establish's response and report false.
+func (c *Conn) PeerCloseReason() (wire.CloseReason, bool) {
+	panic("unimplemented: M2")
 }

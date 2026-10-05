@@ -24,7 +24,9 @@
 // refuses a datagram as too large (plan:635). A packet session over it
 // carries application datagrams of up to 1127 bytes (plan:331). One pump
 // goroutine per connection drains received DATAGRAMs into a bounded queue
-// (L46).
+// (L46); one sender goroutine drains a bounded egress queue into quic-go,
+// so rendr's carrier writer never blocks on QUIC's congestion control and
+// a congested path drops datagrams instead of stalling the carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
 // conns for rendr's core.
