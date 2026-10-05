@@ -426,11 +426,11 @@ func (l *Link) InjectAfterNextFrame(d Dir, after, t FrameType, flags uint8, hand
 // compute, such as an old carrier incarnation's PING nonce for a stale-PONG
 // injection, or to obtain another session's frame for a splice. The first
 // carrier to forward such a frame wins, a probe carrier included: check
-// Stats().Session.FramesCaptured or use a link with one carrier. The count
-// follows the frame's delivery: the channel receives the frame before
-// FramesCaptured counts it (and before the frame is forwarded), so a test
-// that received the frame must wait until the count shows it before
-// asserting on it. Without a current carrier the channel never receives.
+// Stats().Session.FramesCaptured or use a link with one carrier. The
+// channel receives the frame before FramesCaptured counts it (and before
+// the frame is forwarded), so a test that received the frame must wait
+// until the count shows it before asserting on it. Without a current
+// carrier the channel never receives.
 func (l *Link) CaptureNextFrame(d Dir, t FrameType) <-chan []byte {
 	cp := &capture{t: t, ch: make(chan []byte, 1)}
 	l.eachFlow(d, func(f *flow) { f.tr.captures = append(f.tr.captures, cp) })

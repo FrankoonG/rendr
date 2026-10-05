@@ -4,10 +4,14 @@
 // end a carrier that rendr still considers alive) and TCP_NODELAY on, and
 // that refuse non-loopback addresses unless AllowNonLoopback is set (the
 // carrier is neither encrypted nor authenticated: it is meant for tests and
-// trusted networks). rendr recognises the connections this package creates
-// and writes to them with zero-copy vectored writes (writev on Unix,
-// WSASend on Windows); every other connection, one that wraps a connection
-// of this package included, gets one copied Write per batch.
+// trusted networks).
+//
+// rendr recognises the connections this package creates: it writes to them
+// with zero-copy vectored writes (writev on Unix, WSASend on Windows) and
+// half-closes them (CloseWrite) before it closes them in an orderly
+// teardown. Every other connection, one that wraps a connection of this
+// package included, is used only through net.Conn and gets one copied
+// Write per batch.
 package tcp
 
 import (
@@ -36,8 +40,9 @@ type Options struct {
 
 // Listen listens on network ("tcp", "tcp4", "tcp6") and address exactly
 // like net.Listen (a host name binds its IPv4 address when it has one).
-// Accepted connections have keepalive disabled and NODELAY set and are
-// rendr-owned. Pass the result to rendr.FromListener.
+// Accepted connections have keepalive disabled and NODELAY set, and rendr
+// writes to them with vectored writes (see the package documentation).
+// Pass the result to rendr.FromListener.
 //
 // Without AllowNonLoopback the address must be loopback, else Listen fails
 // with ErrNonLoopback: an empty host (all interfaces) and non-loopback IPs

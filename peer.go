@@ -22,7 +22,8 @@ type Carrier interface{ isCarrier() }
 // returns as untrusted: calls are bounded by DialTimeout even when
 // ctx is ignored, panics and Goexit are contained, (nil, nil) is an error,
 // a conn returned late is closed exactly once, byte counts are validated,
-// and conns are only ever used through the net.Conn interface.
+// and conns are only ever used through the net.Conn interface, except the
+// connections package carrier/tcp creates (see that package).
 type StreamCarrier struct {
 	// Name identifies the factory in Status, PeerStatus and ranking ties;
 	// unique and non-empty within a Peer.
