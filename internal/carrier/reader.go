@@ -12,7 +12,7 @@ import (
 // reader is the reader goroutine's own state (design §4.9).
 type reader struct {
 	fseq  uint32 // next expected rx fseq (strict +1, wrapping: L14, L43)
-	stage *Buf   // one 16 KiB-class Buf, force-charged to the Budget for the reader's life (D29)
+	stage *Buf   // one 16 KiB-class Buf, charged to the stage account for the reader's life (Env.stageBudget, B2)
 	// big is the Buf a big DATA payload is being read into (nil otherwise):
 	// if an embedder Read calls runtime.Goexit while filling it, the
 	// reader's exit releases it with the stage (abandoned-call rule, §4.1).
@@ -48,7 +48,7 @@ func (c *Conn) readLoop() {
 			c.Kill(CauseTransportError, "conn Read called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
-		// its buffers (§4.1), so the Budget returns to zero (R7).
+		// its buffers (§4.1), so both accounts return to zero (R7).
 		rd.releaseBig()
 		if rd.stage != nil {
 			rd.stage.Release()
@@ -57,7 +57,7 @@ func (c *Conn) readLoop() {
 		c.partDone(partReader)
 	}()
 	if rd.stage == nil {
-		rd.stage = c.env.Bufs.Get(BigData, c.env.Budget)
+		rd.stage = c.env.Bufs.Get(BigData, c.env.stageBudget())
 	}
 	for c.readFrame(rd) {
 	}

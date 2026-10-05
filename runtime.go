@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"crypto/rand"
+	"math"
 	"net"
 	"slices"
 	"sync"
@@ -17,7 +18,7 @@ import (
 
 // Runtime is one rendr instance: it owns its InstanceID, admission tables
 // (handshake slots, session table and tombstones, sessionless carriers),
-// the memory budget, the buffer pool, the abandoned-call pool, the event
+// the memory accounts, the buffer pool, the abandoned-call pool, the event
 // queue, its Listeners and Peers. All methods are safe for concurrent use.
 type Runtime struct {
 	id      InstanceID
@@ -25,7 +26,8 @@ type Runtime struct {
 	ov      *testhooks.Overrides // a copy, for normalizeListen; nil in production
 	cenv    carrier.Env          // immutable after construction
 	abandon *carrier.AbandonPool // goroutines stuck in embedder code (L52)
-	budget  *carrier.Budget      // MaxBufferedBytes accounting
+	budget  *carrier.Budget      // MaxBufferedBytes: the data buffers
+	stages  *carrier.Budget      // the reader stages, outside MaxBufferedBytes (design §0.14 B2)
 	ev      *eventQueue          // nil without Config.OnEvent
 	table   *sessionTable[*session.Session]
 	hs      *hsTable
@@ -86,6 +88,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		ov:        ovc,
 		abandon:   carrier.NewAbandonPool(eff.abandonLimit),
 		budget:    carrier.NewBudget(eff.cfg.MaxBufferedBytes),
+		stages:    carrier.NewBudget(math.MaxInt64), // forced charges only: never refuses
 		table:     newSessionTable[*session.Session](eff.cfg.MaxSessions),
 		hs:        newHSTable(eff.cfg.Handshake.MaxConcurrent),
 		slt:       newSLTable(eff.cfg.Sessionless.PerInstance, eff.cfg.Sessionless.Total),
@@ -108,6 +111,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		Abandon: rt.abandon,
 		Bufs:    carrier.NewBufPool(),
 		Budget:  rt.budget,
+		Stages:  rt.stages,
 		Hooks:   eff.hooks,
 	}
 	rt.gateFn = rt.gate
@@ -177,7 +181,7 @@ func (rt *Runtime) Status() Status {
 		HandshakeEvictions: rt.hs.evicted(),
 		AcceptBacklog:      [2]int{int(rt.backlog.Load()), 0},
 		Sessionless:        rt.slt.len(),
-		BufferedBytes:      rt.budget.Used(),
+		BufferedBytes:      rt.budget.Used() + rt.stages.Used(),
 		Abandoned:          rt.abandon.Len(),
 		EventsDropped:      dropped,
 		CallbackPanics:     panics,
@@ -193,9 +197,11 @@ func (rt *Runtime) Status() Status {
 // locally with net.ErrClosed; every Peer stops probing;
 // sessionless carriers get GOAWAY; an admission refusal still being written
 // gets the close bound, min(1 s, DeadMax), and is then cut; then every
-// goroutine is joined within about 2 s, and stragglers stuck in embedder code
-// are counted in Status.Abandoned. Later calls on the Runtime and its objects
-// return net.ErrClosed.
+// goroutine is joined within about 2 s, plus AbandonWait (1 s, the bound on
+// waiting for a goroutine stuck in embedder code) for a stuck
+// Config.OnEvent callback, and stragglers stuck in embedder code are counted
+// in Status.Abandoned. Later calls on the Runtime and its objects return
+// net.ErrClosed.
 //
 // Sessions reset by Close end with net.ErrClosed, their peers' with
 // *AbortError (AbortGoingAway). For a clean end, let every session finish
