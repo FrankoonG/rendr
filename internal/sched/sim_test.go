@@ -46,6 +46,7 @@ type simConfig struct {
 	interval time.Duration
 	dur      time.Duration // the run covers events at offsets in [0, dur]
 	active   int           // initially active factory
+	classes  []uint8       // kind class per factory (Selector.SetClasses); nil: all 0
 	paths    []simPath
 	// observe, if set, sees every evaluation: the instant, the active
 	// factory evaluated, the summaries and the verdict (before a switch is
@@ -79,6 +80,7 @@ func runSim(cfg simConfig) simResult {
 	}
 	sums := make([]Summary, n)
 	sel := NewSelector(cfg.sel)
+	sel.SetClasses(cfg.classes)
 	sent := make([]int, n)
 	arrive := make([]time.Duration, n)
 	rtt := make([]time.Duration, n)
