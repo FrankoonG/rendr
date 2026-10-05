@@ -25,7 +25,9 @@ var (
 	// was withdrawn by its dialer.
 	ErrSessionLost error = &sessionError{"rendr: session lost"}
 	// ErrAborted: the session was reset, by the peer or, for
-	// AbortExhausted, by this side; *AbortError matches it.
+	// AbortExhausted, by this side; *AbortError matches it. A peer reset
+	// that arrives once our DONE was sent (both FINs delivered, ours
+	// acknowledged) ends the session with io.EOF instead.
 	ErrAborted error = &sessionError{"rendr: session aborted"}
 	// ErrRejected: Dial was rejected by the peer application; *RejectError matches it.
 	ErrRejected error = &sessionError{"rendr: rejected"}
