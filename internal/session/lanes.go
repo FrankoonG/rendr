@@ -28,8 +28,16 @@ func (a *actor) newLaneLocked(now time.Time, c *carrier.Conn, factory int, gen u
 }
 
 // removeLaneLocked drops a dead lane from s.lanes (keeping the attach order
-// of the others), keeps its carrier for the exit join and records it among
-// the last dead lanes of Status.
+// of the others) and from the passive's unconfirmed list, hands its carrier
+// to the exit join and records it among the last dead lanes of Status.
+//
+// The record keeps the carrier while it is in gone: the step that prunes
+// it after its join (pruneGoneLocked) replaces it by its final Stats
+// (settleDeadLocked), so the dead-lane history keeps a carrier no longer
+// than the join list does (design §0.14 B7). The unconfirmed list would
+// otherwise keep a passive lane that died before its first response frame
+// was placed until the next confirmation — for a pending session, until
+// its verdict, however many parked carriers die meanwhile.
 func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at time.Time) {
 	s := a.s
 	for i, o := range s.lanes {
@@ -37,6 +45,14 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 			copy(s.lanes[i:], s.lanes[i+1:])
 			s.lanes[len(s.lanes)-1] = nil
 			s.lanes = s.lanes[:len(s.lanes)-1]
+			break
+		}
+	}
+	for i, o := range a.unconfirmed {
+		if o == l {
+			copy(a.unconfirmed[i:], a.unconfirmed[i+1:])
+			a.unconfirmed[len(a.unconfirmed)-1] = nil
+			a.unconfirmed = a.unconfirmed[:len(a.unconfirmed)-1]
 			break
 		}
 	}
@@ -50,6 +66,20 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 		deathCause: cause, deathDetail: detail, deathAt: at,
 	})
 	a.dirty = true
+}
+
+// settleDeadLocked replaces the joined carrier c by its final Stats in the
+// dead-lane record that still holds it (none once the record was evicted).
+// Joined means c's Done closed: its goroutines finished or were abandoned,
+// so these are the Stats Status would read from c from then on.
+func (a *actor) settleDeadLocked(c *carrier.Conn) {
+	for i := range a.dead {
+		if d := &a.dead[i]; d.conn == c {
+			d.stats, d.conn = c.Stats(), nil
+			a.dirty = true
+			return
+		}
+	}
 }
 
 // usableLocked: l may carry DATA or serve as a fallback (§7.3, C7): live,
