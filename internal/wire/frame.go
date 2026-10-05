@@ -86,7 +86,7 @@ func ParseHeader(b []byte) (Header, error) {
 
 // PayloadBounds returns the inclusive payload length bounds of t: OPEN
 // 32..32+65535, OPEN_ACK 10..265, JOIN 25, JOIN_ACK 9, DATA 9..MaxFramePayload,
-// ACK 16, FIN 8, RST 5..260, SCHED 9..69, PING/PONG 20..20+MaxPingPad, CLOSE 1,
+// ACK 16, FIN 8, RST 5..260, SCHED 33..93, PING/PONG 20..20+MaxPingPad, CLOSE 1,
 // GOAWAY 1, extensions 0..MaxFramePayload. ok is false for unknown core types.
 func PayloadBounds(t Type) (min, max int, ok bool) {
 	if t.Extension() {

@@ -72,7 +72,13 @@ const (
 	// probe evidence; racing failover on death.
 	ModeSelector Mode = 1
 	// ModeBond: every member carrier carries data (capacity pull, rescue);
-	// a dead member is redialled immediately.
+	// a dead member is redialled immediately. The dialer keeps one member
+	// per factory of the Peer, up to its MaxCarriersPerSession. A passive
+	// whose MaxCarriersPerSession is below that member count refuses the
+	// surplus members, which are then redialled at the RejoinBackoffMax
+	// interval for the session's whole life, so a Peer used for bond
+	// sessions should not have more factories than the passive's
+	// MaxCarriersPerSession.
 	ModeBond Mode = 2
 )
 
@@ -177,13 +183,13 @@ func (s CarrierState) String() string {
 	return "carrier(" + itoa(uint64(s)) + ")"
 }
 
-// Cause is a carrier death cause (plan §3.6) and, in EventMigration, the
-// migration cause.
+// Cause is why a carrier ended (CarrierStatus.DeathCause, EventCarrierDown)
+// and, in EventMigration, why a session's data moved (see Event).
 type Cause uint8
 
 // Causes.
 const (
-	CauseNone              Cause = 0
+	CauseNone              Cause = 0 // no cause; in EventMigration: a passive selector's death migration (the passive does not learn the death cause)
 	CausePingTimeout       Cause = 1 // the oldest committed PING stayed unanswered beyond the death deadline
 	CauseWriteStall        Cause = 2 // one batch write exceeded the stall window
 	CauseTransportError    Cause = 3 // EOF, RST, read/write error, (0, nil), invalid counts, panic in the conn
@@ -191,7 +197,7 @@ const (
 	CauseInstanceMismatch  Cause = 5 // the carrier reached another rendr instance than the session's
 	CauseGoAway            Cause = 6 // the peer sent GOAWAY
 	CauseLocalClose        Cause = 7 // closed by this side
-	CauseRetired           Cause = 8 // planned CLOSE; not a death (an explicit migration cause in events)
+	CauseRetired           Cause = 8 // ended by a CLOSE (planned, or the peer's); not a death; in EventMigration: an explicit migration
 	CauseQuality           Cause = 9 // only in EventMigration: a selector quality switch
 )
 
@@ -227,7 +233,7 @@ type EventKind uint8
 const (
 	EventCarrierUp   EventKind = 1 // a carrier was confirmed (OPEN_ACK/JOIN_ACK exchanged)
 	EventCarrierDown EventKind = 2 // a carrier ended (Cause)
-	EventMigration   EventKind = 3 // From → To with Cause: a death cause, CauseQuality, or CauseRetired/CauseGoAway (explicit)
+	EventMigration   EventKind = 3 // a migration counted in SessionStatus.Migrations: From → To with Cause (see Event)
 	EventNoPathStart EventKind = 4 // the session lost its last carrier
 	EventNoPathEnd   EventKind = 5 // a carrier attached during a no-path episode
 	EventSessionEnd  EventKind = 6 // the session ended (Err)

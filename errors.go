@@ -42,25 +42,36 @@ var (
 	ErrIdleTimeout = session.ErrIdleTimeout
 )
 
-// AbortCode is an RST code. Values below 256 are reserved for rendr.
+// AbortCode is an RST code: why a session was reset. Its underlying type is
+// uint32. Values below 256 are reserved for rendr, which uses 1
+// (AbortClosed), 2 (AbortLinger), 3 (AbortGoingAway), 4 (AbortExhausted),
+// 5 (AbortIdle) and 6 (AbortWithdrawn).
 type AbortCode = session.AbortCode
 
 // Reserved abort codes.
 const (
-	AbortClosed    = session.AbortClosed    // the peer closed while we were still sending to it
-	AbortLinger    = session.AbortLinger    // the peer's linger expired before its data and FIN were delivered
-	AbortGoingAway = session.AbortGoingAway // the peer Runtime is closing (also GOAWAY from the bound instance)
-	AbortExhausted = session.AbortExhausted // a stream offset reached 2^62
-	AbortIdle      = session.AbortIdle      // the peer's IdleTimeout expired
-	AbortWithdrawn = session.AbortWithdrawn // the dialer abandoned Dial after its OPEN may have been admitted
+	AbortClosed    = session.AbortClosed    // 1: the peer closed while we were still sending to it
+	AbortLinger    = session.AbortLinger    // 2: the peer's linger expired before its data and FIN were delivered
+	AbortGoingAway = session.AbortGoingAway // 3: the peer Runtime is closing (also GOAWAY from the bound instance)
+	AbortExhausted = session.AbortExhausted // 4: a stream offset reached 2^62
+	AbortIdle      = session.AbortIdle      // 5: the peer's IdleTimeout expired
+	AbortWithdrawn = session.AbortWithdrawn // 6: the dialer abandoned Dial after its OPEN may have been admitted
 )
 
-// AbortError is the error of a reset session: Code, the peer's message, and
-// whether the reset came from the peer (Remote) or was decided locally.
-// errors.Is(err, ErrAborted) is true for every *AbortError.
+// AbortError is the error of a reset session. errors.Is(err, ErrAborted) is
+// true for every *AbortError, and it is a net.Error with Timeout() == false.
+// It is a struct with these fields:
+//
+//	Code   AbortCode // why the session was reset (see the reserved codes)
+//	Msg    string    // the reset's message, at most 255 bytes
+//	Remote bool      // true: the peer reset the session or its Runtime is closing; false: this side reset it (AbortExhausted)
 type AbortError = session.AbortError
 
 // RejectError is the Dial error when the peer application called
-// PendingConn.Reject(Code, Msg). errors.Is(err, ErrRejected) is true; like
-// every Dial error it is a net.Error with Timeout() == false.
+// PendingConn.Reject. errors.Is(err, ErrRejected) is true; like every Dial
+// error it is a net.Error with Timeout() == false. It is a struct with these
+// fields:
+//
+//	Code uint32 // the code passed to Reject
+//	Msg  string // the message passed to Reject, truncated to 255 bytes
 type RejectError = session.RejectError

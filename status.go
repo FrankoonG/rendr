@@ -10,7 +10,7 @@ type Status struct {
 	HandshakeEvictions uint64   // unfinished handshakes evicted because the slots were full
 	AcceptBacklog      [2]int   // pending sessions across Listeners: [0] stream, [1] packet (0 until M2)
 	Sessionless        int      // probe carriers held by this (passive) Runtime
-	BufferedBytes      int64    // MaxBufferedBytes accounting (buffer capacity)
+	BufferedBytes      int64    // session data buffers (the MaxBufferedBytes budget) plus carrier reader stages (about 16 KiB per live carrier); 0 after Runtime.Close, except buffers held by abandoned calls
 	Abandoned          int      // goroutines still stuck in embedder calls past their bound (L52)
 	EventsDropped      uint64   // events dropped because the queue was full
 	CallbackPanics     uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
@@ -45,7 +45,7 @@ type SessionStatus struct {
 	SchedEchoed uint32 // dialer: highest epoch echoed by the passive; passive: equals SchedEpoch
 
 	Migrations     MigrationCounts // never counts the initial attach
-	Rejoins        uint64          // carriers re-attached on a factory after a death (not migrations)
+	Rejoins        uint64          // dialer only (0 on the passive): carriers attached on a factory that already had one in this session, such as a redial after a death; not migrations
 	NoPathEpisodes uint64
 	InNoPath       bool
 
