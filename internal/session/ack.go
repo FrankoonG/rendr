@@ -13,7 +13,11 @@ import (
 // increments ackGen and the duty lane (ackLane) places one ACK carrying the
 // values current at placement (latest wins) once its ackSent differs. The
 // duty lane is a qualifying lane whose writer is not blocked, so an ACK
-// never waits behind a stuck carrier for more than PingBusy (L08; D5).
+// never waits behind a stuck carrier for more than PingBusy (L08; D5). On
+// the passive, selector or bond, it is also a lane the applied SCHED
+// lists: the duty follows the dialer's routing at once (ackDroppedLocked),
+// so ACKs do not keep riding a carrier the dialer abandoned after a death
+// only it detected.
 //
 // Receiver cadence: a bump once AckEvery bytes were delivered since the
 // last bump, else an ACK delay armed at the first unacknowledged delivery
@@ -117,16 +121,46 @@ func (s *Session) ackQualifiesLocked(l *lane) bool {
 
 // ackKeepLocked: the current duty lane keeps the duty.
 func (s *Session) ackKeepLocked(l *lane) bool {
-	return s.ackQualifiesLocked(l) && !l.retireCalled && !l.port.WriteBlocked()
+	return s.ackQualifiesLocked(l) && !s.ackLeavingLocked(l) && !l.port.WriteBlocked()
+}
+
+// ackLeavingLocked: l still qualifies for the ACK duty but is on its way
+// out — Retire was called on it, or (passive) the dialer dropped it
+// (ackDroppedLocked) — so it carries the duty only when no lane that stays
+// can (chooseAckLaneLocked).
+func (s *Session) ackLeavingLocked(l *lane) bool {
+	return l.retireCalled || s.ackDroppedLocked(l)
+}
+
+// ackDroppedLocked (passive, either mode): a SCHED was applied and it does
+// not list l (the selector's SCHED names its active carrier, the bond's
+// lists its members). The dialer, the sole routing authority, no longer
+// sends on that carrier: it switched away for quality, retired it, or saw
+// it die — possibly a death this side has not detected (one-way loss: the
+// dialer's PINGs go unanswered while this side's own death deadline, up to
+// DeadMax, has not expired, and the dialer's close may never reach it).
+// ACKs placed there would wait for that detection, and the dialer's send
+// window with them. A bond is no exception: the gap lane (§0.13 A4)
+// carries ACKs only while data is held out of order, and once the dialer
+// sends on the remaining members alone and its requeued bytes arrived,
+// nothing is. So the duty moves to a lane the SCHED lists when it is
+// applied (the application bumps an urgent ACK, which re-chooses the duty)
+// and comes back only when no listed lane qualifies (design §0.13 A7 (c)).
+// The dialer keeps every qualifying lane eligible: it knows its own
+// routing.
+func (s *Session) ackDroppedLocked(l *lane) bool {
+	return s.p.Role == RolePassive && s.ctl.set.N > 0 && !schedLists(&s.ctl.set, l.id)
 }
 
 // chooseAckLaneLocked returns the best qualifying lane other than skip: in
-// srtt order, the first lane neither write-blocked nor retiring (Retire
-// called); else the first writable retiring lane (it still carries frames
-// until its CLOSE, and Fill places a pending delayed ACK there before the
-// CLOSE); else the first blocked one, preferring one that is not retiring;
-// nil if none qualifies. Writability comes first (§4.6: an ACK never waits
-// behind a blocked carrier while a writable lane qualifies).
+// srtt order, the first lane neither write-blocked nor leaving (Retire
+// called, or dropped by the applied SCHED on the passive:
+// ackLeavingLocked); else the first writable leaving lane (it still
+// carries frames until its CLOSE, and Fill places a pending delayed ACK
+// there before the CLOSE); else the first blocked one, preferring one that
+// is not leaving; nil if none qualifies. Writability comes first (§4.6: an
+// ACK never waits behind a blocked carrier while a writable lane
+// qualifies).
 func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 	s.refreshOrderLocked(time.Now(), false)
 	var best *lane
@@ -139,7 +173,7 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 		if l.port.WriteBlocked() {
 			rank = 2
 		}
-		if l.retireCalled {
+		if s.ackLeavingLocked(l) {
 			rank++
 		}
 		if rank < bestRank {
@@ -153,9 +187,10 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 }
 
 // ensureAckLaneLocked keeps the current duty lane while it qualifies, is
-// not retiring and is not write-blocked; otherwise it moves the duty to the
-// best qualifying lane (chooseAckLaneLocked, which may keep the current
-// one if nothing better exists) or clears it.
+// not leaving (retiring, or dropped by the applied SCHED) and is not
+// write-blocked; otherwise it moves the duty to the best qualifying lane
+// (chooseAckLaneLocked, which may keep the current one if nothing better
+// exists) or clears it.
 func (s *Session) ensureAckLaneLocked() {
 	st := &s.st
 	cur := st.ackLane

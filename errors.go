@@ -22,7 +22,10 @@ var (
 	// ErrAborted: the session was reset, by the peer (its linger expired, it
 	// closed while we were still sending, its Runtime closed, its
 	// IdleTimeout fired, ...) or, for AbortExhausted, by this side;
-	// errors.As yields *AbortError.
+	// errors.As yields *AbortError. A peer reset that arrives once this side
+	// has sent its final confirmation (both FINs were delivered and this
+	// side's FIN was acknowledged, so the peer only gave up waiting for that
+	// confirmation) ends the session with io.EOF instead.
 	ErrAborted = session.ErrAborted
 	// ErrRejected: Dial was rejected by the peer application; errors.As
 	// yields *RejectError.

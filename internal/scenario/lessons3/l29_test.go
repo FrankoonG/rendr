@@ -66,6 +66,7 @@ type guardResult struct {
 	throttled       int64                 // bytes a's bottleneck paced
 	onsetLoaded     bool                  // atProbePing: a's sample of the PING the bulk started at was loaded
 	pause           time.Duration         // lead: from the first transfer's last byte to the bulk's start
+	leadDur         time.Duration         // lead: from the probe PING the first transfer started at to its last byte
 	keepalive       rendr.MigrationCounts // the keepalive session's dialer end
 }
 
@@ -131,9 +132,11 @@ func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
 		if gb.atProbePing {
 			if gb.lead > 0 {
 				awaitProbePing(t, a)
+				leadStart := time.Now()
 				lead := w.startFlow("lead", from, to, 290, flowOpts{n: int64(gb.rate * gb.lead.Seconds()), keepOpen: true})
 				lead.wait(t, 10*time.Second)
 				leadEnd := time.Now()
+				res.leadDur = leadEnd.Sub(leadStart)
 				awaitProbePing(t, a)
 				res.pause = time.Since(leadEnd)
 			} else {
@@ -297,14 +300,17 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 			// floor; how long its ramp takes depends on the phase of the
 			// PINGs that prove the rate, a scheduling detail of the bubble,
 			// and varies by about one RTT (20 ms) — about as much as the
-			// short pause's whole window. A run whose pause misses the
-			// window is repeated, at most edgeAttempts times; the
-			// assertions below apply to the run whose stimulus holds.
+			// short pause's whole window — or, with GOMAXPROCS=1, by about
+			// 190 ms in every run. A run whose pause misses the window is
+			// repeated, at most edgeAttempts times, with the short pause's
+			// first transfer corrected by its measured overshoot
+			// (edgeRetryLead); the assertions below apply to the run whose
+			// stimulus holds.
 			var r guardResult
 			for attempt := 1; ; attempt++ {
 				r = runGuardBulk(t, gb)
 				if tc.lead > 0 {
-					t.Logf("pause between the transfers %v", r.pause)
+					t.Logf("first transfer of %v took %v; pause between the transfers %v", gb.lead, r.leadDur, r.pause)
 				}
 				miss := edgeStimulus(tc.name, gb, r.pause)
 				if miss == "" {
@@ -313,7 +319,10 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 				if attempt == edgeAttempts {
 					t.Fatalf("stimulus: %s (attempt %d of %d)", miss, attempt, edgeAttempts)
 				}
-				t.Logf("stimulus missed in attempt %d: %s; the run is repeated", attempt, miss)
+				if tc.name == "restart-short-pause" {
+					gb.lead = edgeRetryLead(gb, r.leadDur)
+				}
+				t.Logf("stimulus missed in attempt %d: %s; the run is repeated with a first transfer of %v", attempt, miss, gb.lead)
 			}
 			checkGuarded(t, gb, r)
 			if !r.onsetLoaded {
@@ -325,8 +334,33 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 
 // edgeAttempts bounds the runs of one TestDownloadGuardEdges_L29 case whose
 // stimulus misses its window (a miss happened in about 1 of 10 runs of
-// restart-short-pause).
+// restart-short-pause; with GOMAXPROCS=1 its first run always misses, and
+// the corrected second one hits).
 const edgeAttempts = 4
+
+// guardProbeInterval is the Probe.Interval of the guard scenarios (the
+// default): a's probe PINGs commit that far apart.
+const guardProbeInterval = 2 * time.Second
+
+// edgeShortPause returns restart-short-pause's window for the pause: after
+// the first transfer's backlog report cleared and shorter than
+// LoadThreshold (64 KiB) takes at the link rate.
+func edgeShortPause(gb guardBulk) (lo, hi time.Duration) {
+	return 12 * time.Millisecond, time.Duration(float64(64*kib) / gb.rate * float64(time.Second))
+}
+
+// edgeRetryLead returns restart-short-pause's first transfer for the run
+// after one whose first transfer took took and missed the window. The
+// transfer starts at one of a's probe PINGs and the bulk at the next one,
+// so it should end the middle of the window before that PING:
+// guardProbeInterval − (lo+hi)/2 after its start. The ramp's extra time
+// over the transfer's nominal length repeats from run to run (the bubble
+// is deterministic for a given GOMAXPROCS), so the length is corrected by
+// the measured overshoot.
+func edgeRetryLead(gb guardBulk, took time.Duration) time.Duration {
+	lo, hi := edgeShortPause(gb)
+	return gb.lead + guardProbeInterval - (lo+hi)/2 - took
+}
 
 // edgeStimulus reports why a run of case name with pause between the
 // transfers misses the case's stimulus ("" when it holds).
@@ -341,8 +375,8 @@ func edgeStimulus(name string, gb guardBulk, pause time.Duration) string {
 	// backlog ended reveals the restart: after the first transfer's backlog
 	// report cleared (it had not at 8 ms at 2 MiB/s, nor at 2 ms at
 	// 1 MiB/s) and shorter than LoadThreshold takes at the link rate.
-	if short := time.Duration(float64(64*kib) / gb.rate * float64(time.Second)); name == "restart-short-pause" && (pause < 12*time.Millisecond || pause >= short) {
-		return fmt.Sprintf("pause %v, want at least 12 ms and less than %v", pause, short)
+	if lo, hi := edgeShortPause(gb); name == "restart-short-pause" && (pause < lo || pause >= hi) {
+		return fmt.Sprintf("pause %v, want at least %v and less than %v", pause, lo, hi)
 	}
 	return ""
 }

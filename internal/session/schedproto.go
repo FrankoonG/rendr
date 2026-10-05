@@ -111,7 +111,11 @@ func (a *actor) resendLaneLocked() *lane {
 
 // applySchedLocked (passive) applies the newest SCHED stored by the stream
 // if its epoch is newer than the applied one (L45: 3, 1, 2 ends at 3), then
-// echoes it at once with an urgent ACK.
+// echoes it at once with an urgent ACK. The bump re-chooses the ACK duty
+// against the new set (ackDroppedLocked): a duty lane the SCHED no longer
+// lists hands the duty to a listed lane in this step, so the echo and the
+// ACKs after it leave on a carrier the dialer still uses (L45: reverse
+// traffic leaves a dropped carrier at once, ACKs included).
 func (a *actor) applySchedLocked(now time.Time) {
 	s := a.s
 	ctl := &s.ctl

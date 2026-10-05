@@ -503,7 +503,8 @@ func (p *PendingConn) Confirm() (*Conn, error) {
 
 // Reject refuses the session with OPEN_ACK(REJECTED, code, msg); msg is
 // truncated to 255 bytes. The dialer's Dial returns *RejectError{code, msg};
-// a retried OPEN gets the same answer. Errors as for Confirm.
+// a retried OPEN gets the same answer. On this side the session ends with an
+// error matching ErrRejected (its EventSessionEnd). Errors as for Confirm.
 func (p *PendingConn) Reject(code uint32, msg string) error {
 	return p.decisionErr(p.s.Reject(code, msg))
 }

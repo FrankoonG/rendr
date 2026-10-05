@@ -725,9 +725,10 @@ func TestOldestPingDecidesDeath_L25(t *testing.T) {
 }
 
 // TestFullPingRingResumesOnPong_L25: on a path whose RTT (1 s) exceeds 16
-// PING intervals, the record ring fills and further PINGs wait; the PONG
-// that frees a record wakes the writer, so the next PING goes out in the
-// same instant — not at the death-deadline timer the writer slept on.
+// PING intervals, the cadence fills its share of the record ring
+// (pingCadenceMax) and further cadence PINGs wait; the PONG that frees a
+// record wakes the writer, so the next PING goes out in the same instant —
+// not at the death-deadline timer the writer slept on.
 func TestFullPingRingResumesOnPong_L25(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := hEnv()
@@ -757,13 +758,13 @@ func TestFullPingRingResumesOnPong_L25(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		pb := env.Timing.PingBusy
-		for id := uint32(1); id <= pingRingSize; id++ {
+		for id := uint32(1); id <= pingCadenceMax; id++ {
 			if got := pingAt[id].Sub(start); got != time.Duration(id-1)*pb {
 				t.Fatalf("PING %d at %v, want %v: the ring did not fill at the PingBusy cadence", id, got, time.Duration(id-1)*pb)
 			}
 		}
-		if got := pingAt[pingRingSize+1].Sub(start); got != rtt {
-			t.Fatalf("PING %d at %v, want the instant the first PONG freed a record (%v)", pingRingSize+1, got, rtt)
+		if got := pingAt[pingCadenceMax+1].Sub(start); got != rtt {
+			t.Fatalf("PING %d at %v, want the instant the first PONG freed a record (%v)", pingCadenceMax+1, got, rtt)
 		}
 	})
 }

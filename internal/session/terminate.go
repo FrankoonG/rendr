@@ -27,8 +27,17 @@ import (
 // actor; the deadline armed below fires at the old time, and that step
 // re-arms it from the new one. Once our DONE was sent the idle rule no
 // longer applies: the exchange is complete, and Linger (or the episode
-// expiry, a GOAWAY or a peer restart, each ending with io.EOF) bounds the
-// wait for the peer's DONE.
+// expiry, a GOAWAY, a peer restart or a peer RST, each ending with io.EOF)
+// bounds the wait for the peer's DONE.
+//
+// A peer RST ends the session with *AbortError{Code, Msg, Remote: true} —
+// or with io.EOF once our DONE was sent (doneOr), whatever its code: our
+// FIN was acknowledged as delivered and the peer's FIN reached our
+// application, so the exchange is complete, and an RST that follows (a
+// peer whose Linger or IdleTimeout expired because our FIN_DELIVERED and
+// DONE were lost, or its Runtime closing) only says that the peer gave up
+// waiting for our DONE. Invariant 1 holds: the peer's FIN was delivered at
+// the contiguous point, where Read returns io.EOF anyway.
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
@@ -41,7 +50,7 @@ func (a *actor) terminationLocked(now time.Time) {
 	case st.rstIn != nil:
 		// RST received: no RST is sent back (§4.7).
 		r := st.rstIn
-		a.terminateLocked(now, &AbortError{Code: AbortCode(r.Code), Msg: string(r.Msg), Remote: true}, nil, false)
+		a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(r.Code), Msg: string(r.Msg), Remote: true}), nil, false)
 	case st.exhausted:
 		// L14: exactly one RST(Exhausted); the Write already returned the error.
 		a.terminateLocked(now, errExhausted(), &wire.Rst{Code: wire.RstExhausted}, false)

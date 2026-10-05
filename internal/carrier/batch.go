@@ -363,11 +363,17 @@ func (b *Batch) addPong(p *wire.Ping) bool {
 	return b.addPingFrame(wire.TypePong, 0, p)
 }
 
+// pingFits reports whether a PING or PONG still fits: a frame slot and its
+// fixed payload in the control arena (padding is a body, outside the arena).
+func (b *Batch) pingFits() bool {
+	return b.n < MaxBatchFrames && b.ctl+wire.PingFixedLen <= ControlArena
+}
+
 func (b *Batch) addPingFrame(t wire.Type, flags uint8, p *wire.Ping) bool {
 	if p.Pad < 0 || p.Pad > wire.MaxPingPad {
 		panic("rendr/carrier: PING pad outside 0..wire.MaxPingPad")
 	}
-	if b.n >= MaxBatchFrames || b.ctl+wire.PingFixedLen > ControlArena {
+	if !b.pingFits() {
 		return false
 	}
 	f, dst := b.reserve(t, flags, 0, wire.PingFixedLen, p.Pad)

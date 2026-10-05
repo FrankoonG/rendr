@@ -156,9 +156,11 @@ Semantics in brief:
 - With no usable carrier for `NoPathGrace` (15 s by default, counted from the
   death of the last carrier) every call fails with `rendr.ErrNoPath`. Other
   typed errors: `ErrSessionLost` (the peer instance restarted or forgot the
-  session), `*AbortError` (the session was reset), `*RejectError`,
-  `ErrCapacity`, `ErrVersion`, `ErrProtocol`, `ErrMetadataTooLarge`,
-  `ErrIdleTimeout`. Deadlines behave as for any `net.Conn`.
+  session), `*AbortError` (the session was reset; a reset that arrives once
+  both FINs were delivered and this side has sent its final confirmation
+  ends the session with `io.EOF` instead), `*RejectError`, `ErrCapacity`,
+  `ErrVersion`, `ErrProtocol`, `ErrMetadataTooLarge`, `ErrIdleTimeout`.
+  Deadlines behave as for any `net.Conn`.
 - `Close` returns at once; written data is still delivered in the background
   within `Linger`. `CloseWrite` sends a FIN and keeps reading. `Done` returns
   a channel that is closed once the session has ended: `Status().State` is
