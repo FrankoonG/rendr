@@ -133,9 +133,11 @@ type probePing struct {
 	idle, calm time.Duration
 	// prior is the DATA (both directions) the factory's session carriers
 	// moved from the previous probe PING commit to this one, over priorSpan
-	// (zero: no previous commit).
-	prior     uint64
-	priorSpan time.Duration
+	// (zero: no previous commit); settled is the part of it they moved
+	// after the latest end of a backlog (all of it when no backlog ended in
+	// that interval, 0 while one is backlogged).
+	prior, settled uint64
+	priorSpan      time.Duration
 }
 
 // forever is probePing.idle and .calm when the event never happened.
@@ -491,9 +493,10 @@ func (o healthObserver) Pong(c *Conn, id uint32, rtt time.Duration, at time.Time
 // pingCommitted records the factory gauge's state at the commit (at) of
 // probe PING id (§8.2) — its load state and, for volumeLoaded, its volume
 // counters, how long no DATA had moved and no carrier had been backlogged,
-// and the DATA moved since the previous probe PING commit — or completes
-// the sample of a PONG that overtook this callback. Callbacks of an
-// incarnation that is no longer current change nothing (L21, L23).
+// and the DATA moved since the previous probe PING commit and since the
+// latest end of a backlog — or completes the sample of a PONG that
+// overtook this callback. Callbacks of an incarnation that is no longer
+// current change nothing (L21, L23).
 func (h *Health) pingCommitted(c *Conn, id uint32, at time.Time) {
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
@@ -512,6 +515,12 @@ func (h *Health) pingCommitted(c *Conn, id uint32, at time.Time) {
 	}
 	if !f.volAt.IsZero() {
 		rec.prior, rec.priorSpan = grown(g.tx, f.volTx)+grown(g.rx, f.volRx), at.Sub(f.volAt)
+		rec.settled = rec.prior
+		if g.backlogged {
+			rec.settled = 0
+		} else if g.calmAt.After(f.volAt) {
+			rec.settled = min(rec.prior, grown(g.tx, g.calmTx)+grown(g.rx, g.calmRx))
+		}
 	}
 	f.volAt, f.volTx, f.volRx = at, g.tx, g.rx
 	if e := f.early; e.ok && e.id == id {
@@ -606,40 +615,53 @@ func (h *Health) volumeLoaded(rec *probePing, moved uint64, rtt time.Duration) b
 // and the selector could never leave the path. Bursty traffic needs it too:
 // while an application sends a 64 KiB message every second, every sample
 // whose flight a message overlaps would be loaded — all of them when the
-// message period divides Probe.Interval.
+// message period divides Probe.Interval (probe PINGs are not jittered).
 //
-// The traffic is established when the session carriers moved DATA since
-// the previous probe PING commit (prior, over priorSpan), none of them was
-// backlogged at the commit or within one flight (rtt) before it, and either
-//   - regular: at least LoadThreshold moved and none of them was backlogged
-//     since the previous commit, however bursty the traffic; or
-//   - steady: at the rate it moved, L = prior/priorSpan, one flight carries
-//     at least LoadThreshold (L·rtt) and the carriers had not been silent
-//     at the commit for as long as LoadThreshold takes at that rate
-//     (L·idle), a continuous flow that may have hit its capacity cap now
-//     and then (a capacity that gets no BUSY sample decays).
+// It judges the interval since the previous probe PING commit, in which the
+// session carriers moved prior bytes over priorSpan. Their rate L =
+// prior/priorSpan is steady when one flight carries at least LoadThreshold
+// at it (L·rtt) and the carriers had not been silent at the commit for as
+// long as LoadThreshold takes at it (L·idle). The traffic is established
+//   - if no carrier was backlogged in the interval: when at least
+//     LoadThreshold moved, however bursty (regular), or the rate is steady;
+//   - if one was (or is): only when the rate is steady and at least
+//     LoadThreshold moved after the latest backlog ended (settled). An
+//     application-limited flow that reaches its capacity cap now and then
+//     is established again once it moved that much after each episode
+//     (after an RTT rise its in-flight can outgrow its capacity, which
+//     decays without BUSY samples, so it cycles through backlog episodes).
 //
-// A transfer that restarts after a pause behind a saturating one is not
-// established: its predecessor was backlogged in the interval (not
-// regular), and the restart came either after a silence as long as
-// LoadThreshold takes at that rate (not steady) or within one flight of the
-// predecessor's backlog report clearing. Traffic that rises from a trickle
-// is not established either. Known gaps: a transfer that starts at a probe
-// PING while unbacklogged traffic of at least LoadThreshold per probe
-// interval flows on the same factory still gets an unloaded sample (§8.4);
-// and with a Probe.Interval shorter than the RTT, an echo whose reverse
-// direction falls silent for one RTT after the RTT rose loses a sample or
-// two to the volume rule.
+// A transfer that restarts behind a saturating one is therefore not
+// established, however short or long the pause, as long as less than
+// LoadThreshold moved between the end of its predecessor's backlog and the
+// commit: the pause alone, or small concurrent traffic such as keepalives.
+// Neither is traffic that rises from a trickle.
+//
+// Known gaps (§8.4). (1) At least LoadThreshold of unbacklogged traffic,
+// both directions together, on the same factory — another session's
+// included — since the later of the previous probe PING commit and the
+// latest end of a backlog (32 KiB/s on average at the default 2 s
+// Probe.Interval) can establish the traffic, so a transfer that starts at a
+// probe PING commit while such traffic flows gets an unloaded onset sample.
+// (2) With a Probe.Interval shorter than the RTT, an echo whose reverse
+// direction falls silent for one RTT after the RTT rose can lose a sample
+// or two. (3) An application-limited flow that cycles through backlog
+// episodes loses the samples committed in an episode or before it moved
+// LoadThreshold after one, and, when its writes are about LoadThreshold or
+// larger, those committed in a pause between two writes longer than
+// LoadThreshold takes at its rate: its quality switch can come a probe
+// interval or two later than the instantaneous rule alone would allow.
 func (h *Health) established(rec *probePing, rtt time.Duration) bool {
-	if rec.prior == 0 || rec.calm < rtt {
-		return false
+	if rec.prior == 0 || rec.priorSpan <= 0 {
+		return false // nothing moved, or no time base to judge it
 	}
 	thr := uint64(h.p.LoadThreshold)
-	if rec.priorSpan <= 0 || (rec.prior >= thr && rec.calm >= rec.priorSpan) {
-		return true // regular (or no time base to judge it: the instantaneous rule decides)
-	}
 	p, span, t := float64(rec.prior), float64(rec.priorSpan), float64(thr)
-	return p*float64(rtt) >= t*span && p*float64(rec.idle) < t*span // steady
+	steady := p*float64(rtt) >= t*span && p*float64(rec.idle) < t*span
+	if rec.calm >= rec.priorSpan {
+		return rec.prior >= thr || steady // no backlog in the interval
+	}
+	return rec.settled >= thr && steady
 }
 
 // sampleLocked adds one probe sample of factory i and publishes the

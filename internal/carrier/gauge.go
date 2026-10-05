@@ -14,10 +14,11 @@ import (
 //
 // It holds two kinds of state. The instantaneous load (inflight,
 // backlogged, epoch) is each carrier's current contribution and returns to
-// zero when the carriers end. The history (tx, rx, movedAt, calmAt) only
-// moves forward: the DATA the carriers moved, when they last moved some and
-// when the last backlog ended, which the health layer compares across a
-// probe PING's flight (the volume rule, Health.volumeLoaded).
+// zero when the carriers end. The history (tx, rx, movedAt, calmAt and the
+// counters at calmAt) only moves forward: the DATA the carriers moved, when
+// they last moved some, and when the last backlog ended and how much had
+// moved by then, which the health layer compares across a probe PING's
+// flight (the volume rule, Health.volumeLoaded).
 type Gauge struct {
 	inflight   atomic.Int64  // Σ contributions: forward unproven bytes + reverse bound rxRate·srtt
 	backlogged atomic.Int64  // carriers currently backlogged on either side
@@ -26,6 +27,8 @@ type Gauge struct {
 	rx         atomic.Uint64 // DATA payload bytes received (counted per verified DATA frame)
 	movedAt    atomic.Int64  // when DATA last moved: nanoseconds after base; 0 = never
 	calmAt     atomic.Int64  // when backlogged last fell to 0: nanoseconds after base; 0 = never
+	calmTx     atomic.Uint64 // tx when backlogged last fell to 0
+	calmRx     atomic.Uint64 // rx when backlogged last fell to 0
 	base       time.Time
 }
 
@@ -44,10 +47,15 @@ func (g *Gauge) AddInflight(delta int64) {
 
 // SetBacklog reports a contributing carrier entering (true) or leaving
 // (false) the backlogged state on either side (local writer backlog or the
-// peer's PING BUSY flag). Each carrier reports transitions only.
+// peer's PING BUSY flag). Each carrier reports transitions only. The end of
+// the last backlog is stamped with the volume counters at that moment, the
+// counters first (read reads calmAt first, so a reading that sees the new
+// calmAt sees these counters or later ones, never the previous end's).
 func (g *Gauge) SetBacklog(on bool) {
 	if !on {
 		if g.backlogged.Add(-1) == 0 {
+			g.calmTx.Store(g.tx.Load())
+			g.calmRx.Store(g.rx.Load())
 			g.calmAt.Store(g.stamp(time.Now()))
 		}
 		return
@@ -91,12 +99,13 @@ func (g *Gauge) stamp(at time.Time) int64 {
 // history (the health layer reads one at a probe PING's commit and one at
 // its PONG's arrival).
 type gaugeState struct {
-	loaded     bool   // aggregate in-flight ≥ threshold while a carrier is backlogged
-	backlogged bool   // a carrier is backlogged
-	epoch      uint64 // 0 → 1 transitions of the backlogged count
-	tx, rx     uint64 // DATA payload bytes written and received so far
-	movedAt    time.Time
-	calmAt     time.Time // the latest end of a backlog (zero: none)
+	loaded         bool   // aggregate in-flight ≥ threshold while a carrier is backlogged
+	backlogged     bool   // a carrier is backlogged
+	epoch          uint64 // 0 → 1 transitions of the backlogged count
+	tx, rx         uint64 // DATA payload bytes written and received so far
+	movedAt        time.Time
+	calmAt         time.Time // the latest end of a backlog (zero: none)
+	calmTx, calmRx uint64    // tx and rx at calmAt (zero when there was none)
 }
 
 // read returns the gauge's current state. The fields are read one by one,
@@ -115,6 +124,7 @@ func (g *Gauge) read(threshold int64) gaugeState {
 	}
 	if d := g.calmAt.Load(); d != 0 {
 		s.calmAt = g.base.Add(time.Duration(d))
+		s.calmTx, s.calmRx = g.calmTx.Load(), g.calmRx.Load()
 	}
 	return s
 }

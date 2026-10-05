@@ -23,8 +23,8 @@ import (
 // when the write returned) and receives (once per frame, small and big
 // frames alike) in the gauge, exactly as its own TxBytes and RxBytes, and
 // stamps the latest movement; a second carrier that moves as much without a
-// Gauge adds nothing. The gauge stamps the end of a backlog when its count
-// falls to zero.
+// Gauge adds nothing. The gauge stamps the end of a backlog, with the
+// volume counters at that moment, when its count falls to zero.
 func TestGaugeVolumeCountsSessionData_L29(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := hEnv()
@@ -70,20 +70,24 @@ func TestGaugeVolumeCountsSessionData_L29(t *testing.T) {
 			t.Fatalf("carrier without a gauge moved tx %d rx %d, want %d and %d", ost.TxBytes, ost.RxBytes, sent, off)
 		}
 
-		// The end of a backlog is stamped when the count falls to zero.
+		// The end of a backlog is stamped, with the counters at that moment,
+		// when the count falls to zero.
 		g2 := NewGauge()
 		time.Sleep(time.Second)
 		g2.SetBacklog(true)
 		g2.SetBacklog(true)
+		g2.AddTx(5, time.Now())
 		g2.SetBacklog(false)
-		if s := g2.read(64 << 10); !s.backlogged || !s.calmAt.IsZero() {
+		if s := g2.read(64 << 10); !s.backlogged || !s.calmAt.IsZero() || s.calmTx != 0 {
 			t.Fatalf("one of two carriers left the backlog: %+v", s)
 		}
 		time.Sleep(time.Second)
+		g2.AddRx(7, time.Now())
 		ended := time.Now()
 		g2.SetBacklog(false)
-		if s := g2.read(64 << 10); s.backlogged || !s.calmAt.Equal(ended) {
-			t.Fatalf("the last carrier left the backlog at %v: %+v", ended, s)
+		g2.AddTx(11, time.Now()) // after the end: not in its counters
+		if s := g2.read(64 << 10); s.backlogged || !s.calmAt.Equal(ended) || s.calmTx != 5 || s.calmRx != 7 || s.tx != 16 {
+			t.Fatalf("the last carrier left the backlog at %v with 5 written and 7 received: %+v", ended, s)
 		}
 	})
 }
@@ -226,7 +230,8 @@ func (r *vrRig) nextSample(before FactoryInfo, epoch uint64) (loaded, instantane
 // loaded exactly when the volume rule says so, while the instantaneous
 // rule has no backlog to see in that flight. The burst is the 128 KiB a
 // download (rx) or an upload (tx) puts on the wire first (the capacity
-// floor): the A7a shape at the carrier layer.
+// floor): the A7a shape at the carrier layer. The steady flow below is 16
+// KiB every 4 ms (4 MiB/s) from 2.1 s, about 80 KiB per 20 ms flight.
 //
 //   - onset-rx, onset-tx: no DATA before; the burst is the whole flight's
 //     volume — loaded, in either direction.
@@ -241,12 +246,29 @@ func (r *vrRig) nextSample(before FactoryInfo, epoch uint64) (loaded, instantane
 //   - backlogged-predecessor: the same messages, but the peer reported
 //     BUSY for a while in the interval before the commit (a saturating
 //     transfer before a pause) — not established, loaded.
-//   - steady-flow: 16 KiB every 4 ms (4 MiB/s, 80 KiB per 20 ms flight)
-//     running through the commit and the flight, with a BUSY episode early
-//     in the interval — established, unloaded, although the flight moved
-//     more than the threshold.
+//   - steady-flow: the steady flow running through the commit and the
+//     flight, with a BUSY episode early in the interval — established,
+//     unloaded, although the flight moved more than the threshold.
 //   - silent-before-commit: the same flow, stopped 100 ms before the commit
 //     (longer than the threshold takes at its rate) — loaded.
+//   - backlog-ends-before-commit: the steady flow until 5 ms before the
+//     commit, the peer reporting BUSY until 8 ms before it (at most one
+//     16 KiB write moved since), then the burst — a restart behind a
+//     saturating transfer after a pause far shorter than the threshold
+//     takes at the flow's rate: not established, loaded. A rule that only
+//     asks whether the rate is steady takes it for established.
+//   - backlog-ended-within-a-flight: the probe path's RTT rose to 300 ms
+//     (factory 0's link: 150 ms one way); the steady flow, BUSY until 100
+//     ms before the commit (about 400 KiB moved since), no burst — an
+//     application-limited flow between two of the backlog episodes it
+//     cycles through on the degraded path: established, unloaded, although
+//     its backlog ended within one flight before the commit.
+//   - trickle-after-backlog: 300 ms RTT; the steady flow with BUSY from
+//     3.05 s until it stops at 3.5 s, then 512 bytes every 10 ms until 5 ms
+//     before the commit (about 26 KiB; the carriers are never silent for
+//     long), then the burst — not established, loaded. A rule that
+//     estimates the volume moved since the backlog ended from the
+//     interval's rate takes it for established.
 func TestHealthVolumeRule_L29(t *testing.T) {
 	type pattern struct {
 		name     string
@@ -257,6 +279,14 @@ func TestHealthVolumeRule_L29(t *testing.T) {
 		loaded   bool
 	}
 	burstRx := func(n int) func(r *vrRig) { return func(r *vrRig) { r.rx(n, 16<<10) } }
+	// burstAfter is burstRx once the traffic of before, which stops a few
+	// milliseconds before the commit, ended (one sender at a time).
+	burstAfter := func(n int) func(r *vrRig) {
+		return func(r *vrRig) {
+			r.bg.Wait()
+			r.rx(n, 16<<10)
+		}
+	}
 	messages := func(withBusy bool) func(r *vrRig) {
 		return func(r *vrRig) {
 			for k := range 7 { // 0.75, 1.25, …, 3.75 s: never inside a probe flight
@@ -277,19 +307,33 @@ func TestHealthVolumeRule_L29(t *testing.T) {
 			r.rx(1<<10, 1<<10)
 		}
 	}
-	steady := func(stop time.Duration) func(r *vrRig) {
+	// flow: the steady flow from 2.1 s until stop, the peer reporting BUSY
+	// from on until off; slow raises factory 0's probe RTT to 300 ms at 3 s
+	// (after the 2.02 s probe PING was answered; on ≥ 3 s then), and after
+	// is the traffic that follows a flow stopped before the commit.
+	flow := func(stop, on, off time.Duration, slow bool, after func(r *vrRig)) func(r *vrRig) {
 		return func(r *vrRig) {
 			r.until(2100 * time.Millisecond)
 			r.stream(16<<10, 4*time.Millisecond, r.start.Add(stop))
-			r.until(2500 * time.Millisecond)
+			if slow {
+				r.until(3 * time.Second)
+				r.links[0].SetDelay(150*time.Millisecond, 0)
+			}
+			r.until(on)
 			r.busy(true)
-			r.until(2800 * time.Millisecond)
+			r.until(off)
 			r.busy(false)
 			if stop < 4*time.Second {
 				r.until(stop + 10*time.Millisecond)
 				r.bg.Wait() // the flow ended before the commit
+				if after != nil {
+					after(r)
+				}
 			}
 		}
+	}
+	steady := func(stop time.Duration) func(r *vrRig) {
+		return flow(stop, 2500*time.Millisecond, 2800*time.Millisecond, false, nil)
 	}
 	for _, pt := range []pattern{
 		{name: "onset-rx", burst: burstRx(128 << 10), moved: 128 << 10, loaded: true},
@@ -301,6 +345,13 @@ func TestHealthVolumeRule_L29(t *testing.T) {
 		{name: "backlogged-predecessor", before: messages(true), burst: burstRx(128 << 10), moved: 128 << 10, loaded: true},
 		{name: "steady-flow", before: steady(4100 * time.Millisecond), burst: burstRx(0), moved: 64 << 10},
 		{name: "silent-before-commit", before: steady(3920 * time.Millisecond), burst: burstRx(128 << 10), moved: 128 << 10, loaded: true},
+		{name: "backlog-ends-before-commit", before: flow(4015*time.Millisecond, 3600*time.Millisecond, 4012*time.Millisecond, false, nil),
+			burst: burstAfter(128 << 10), moved: 128 << 10, loaded: true},
+		{name: "backlog-ended-within-a-flight", before: flow(4400*time.Millisecond, 3500*time.Millisecond, 3920*time.Millisecond, true, nil),
+			burst: burstRx(0), moved: 1 << 20},
+		{name: "trickle-after-backlog", before: flow(3500*time.Millisecond, 3050*time.Millisecond, 3500*time.Millisecond, true, func(r *vrRig) {
+			r.stream(512, 10*time.Millisecond, r.start.Add(4015*time.Millisecond))
+		}), burst: burstAfter(128 << 10), moved: 128 << 10, loaded: true},
 	} {
 		t.Run(pt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
