@@ -580,9 +580,10 @@ func (c *malConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
 // the embedder's Write, is the only goroutine left. Further cases: a dial
 // attempt stuck in a deaf conn's Read, an admission refusal stuck in the
 // embedder's Write, a PREFACE_ACK refusal stuck in the embedder's Write,
-// and a handshake conn whose deadline setters wait for its Read (closed at
-// once: its Close does not wait for its SetDeadline). When the embedder
-// calls finally return, the pool empties.
+// a handshake conn whose deadline setters wait for its Read (closed at
+// once: its Close does not wait for its SetDeadline), and a handshake conn
+// whose SetDeadline at its close never returns (joined and counted by
+// Close). When the embedder calls finally return, the pool empties.
 func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: 500 * time.Millisecond})
@@ -857,7 +858,81 @@ func TestMaliciousConnsCloseBounded_L52(t *testing.T) {
 		}
 		wpNoState(t, rt)
 	})
+
+	// A handshake conn whose SetDeadline(now) at its close never returns
+	// until released (it ignores Close), while its Close works (design
+	// §0.14 B3, L52). Runtime.Close's drain runs SetDeadline and Close on
+	// separate watched members of the handshake group: the Close ends the
+	// handshake's Read at once, and Close's join waits for the stuck
+	// SetDeadline member until its watch counts it, AbandonWait after it
+	// started, so Close returns then with it in Status.Abandoned. The failed
+	// handshake's own close (ReadHello's) calls SetDeadline(now) too, on a
+	// guarded goroutine its own watch counts at the same moment: exactly two
+	// goroutines are counted once both watches ran. When the calls return
+	// the pool empties and no rendr goroutine is left; the embedder's Close
+	// ran once. A SetDeadline outside the handshake group would let Close
+	// return at once, before any count.
+	synctest.Test(t, func(t *testing.T) {
+		const wait = 500 * time.Millisecond
+		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{AbandonWait: wait})
+		ln := wpListen(t, rt, ListenConfig{})
+		a, b := net.Pipe()
+		t.Cleanup(func() { b.Close() }) // a failed test still ends its bubble
+		sd := &g4StuckDeadlineConn{Conn: a, release: make(chan struct{})}
+		t.Cleanup(sd.free)
+		if err := ln.Handle(sd); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n, st := sd.sets.Load(), rt.Status(); n != 1 || st.Handshakes != 1 {
+			t.Fatalf("stimulus: %d SetDeadline calls, %d handshake slots; want the handshake deadline set, the handshake reading in its slot", n, st.Handshakes)
+		}
+		start := time.Now()
+		rt.Close()
+		el := time.Since(start)
+		if n := rt.Status().Abandoned; el != wait || n < 1 {
+			t.Fatalf("Runtime.Close took %v and returned with %d abandoned; want it to join the drain's stuck SetDeadline until it was counted, AbandonWait (%v)", el, n, wait)
+		}
+		synctest.Wait()
+		if n, k, st := sd.closes.Load(), sd.sets.Load(), rt.Status(); n != 1 || k != 3 || st.Abandoned != 2 || st.Handshakes != 0 {
+			t.Fatalf("conn closed %d times, %d SetDeadline calls, abandoned %d, %d handshake slots; want closed once, the drain's and ReadHello's SetDeadline(now) stuck and counted", n, k, st.Abandoned, st.Handshakes)
+		}
+		sd.free()
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 || rt.Status().Abandoned != 0 || sd.closes.Load() != 1 {
+			t.Fatalf("after the SetDeadline calls returned: rendr goroutines %v, abandoned %d, conn closed %d times", left, rt.Status().Abandoned, sd.closes.Load())
+		}
+		wpNoState(t, rt)
+	})
 }
+
+// g4StuckDeadlineConn passes its first SetDeadline — the handshake
+// deadline ReadHello sets — to the wrapped conn; every later one, a close's
+// SetDeadline(now), blocks until freed and ignores Close. Its Close closes
+// the wrapped conn (L52, design §0.14 B3).
+type g4StuckDeadlineConn struct {
+	net.Conn
+	release  chan struct{}
+	freeOnce sync.Once
+	sets     atomic.Int32
+	closes   atomic.Int32
+}
+
+func (c *g4StuckDeadlineConn) SetDeadline(t time.Time) error {
+	if c.sets.Add(1) == 1 {
+		return c.Conn.SetDeadline(t)
+	}
+	<-c.release
+	return nil
+}
+
+func (c *g4StuckDeadlineConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+// free returns every blocked SetDeadline (idempotent).
+func (c *g4StuckDeadlineConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
 
 // stuckWriteConn passes the handshake — reads, and its first write (the
 // PREFACE_ACK), go through to a net.Pipe — but blocks every later Write,
@@ -1313,5 +1388,70 @@ func TestG4LockedConnCarrierEndsClosed_L52(t *testing.T) {
 			link.Close()
 			wpNoState(t, rt)
 		})
+	})
+}
+
+// TestG4LockedConnWithdrawnDial_L49_L52 (design §0.14 B3, L49, L52):
+// Runtime.Close while a Dial's OPEN is pending on the passive, whose
+// application never accepts, over a conn whose deadline setters wait for a
+// Read in progress and whose Close ends that Read. Close withdraws the
+// Dial; the attempt's withdrawal unblocks the handshake's response Read
+// with SetDeadline(now) on a goroutine of its own, which waits behind that
+// Read, and closes the conn when the handshake has not left it 1 s (the
+// carrier's drain bound) later, without the best-effort RST: the passive
+// reads EOF. The conn is closed exactly once, while the Read is in
+// progress; Runtime.Close returns 1 s after it began with nothing
+// abandoned; no rendr goroutine is left after both Runtimes closed. Before
+// the fix the withdrawal's own goroutine was held in that SetDeadline
+// until its last resort (AbandonWait + 3 s), so the session gave up on the
+// attempt at 2·AbandonWait and Close returned after 2 s with the attempt
+// counted in Status.Abandoned (a transient count for every such Dial).
+func TestG4LockedConnWithdrawnDial_L49_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const drainBound = time.Second // the carrier's drain bound (production AbandonWait is 1 s too)
+		e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, nil), p: wpTestRuntime(t, Config{}, nil)}
+		e.ln = wpListen(t, e.p, ListenConfig{}) // nothing accepts: the OPEN stays pending
+		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "ws", Accept: e.ln.Handle})
+		e.links = append(e.links, link)
+		t.Cleanup(link.Close)
+		dialed := make(chan *g4LockedConn, 16) // every carrier the dialer's factory made
+		p, err := e.d.NewPeer(PeerConfig{Carriers: []Carrier{StreamCarrier{Name: "ws", Dial: func(ctx context.Context) (net.Conn, error) {
+			nc, err := link.Dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			lc := newG4LockedConn(nc)
+			dialed <- lc
+			return lc, nil
+		}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := e2eDialAsync(context.Background(), p, DialOptions{})
+		synctest.Wait() // the OPEN is pending; the attempt waits in its response Read
+		if n, st := len(dialed), e.p.Status(); n != 1 || st.Sessions.Pending != 1 {
+			t.Fatalf("stimulus: %d carriers dialed, %d pending sessions; want one OPEN, pending", n, st.Sessions.Pending)
+		}
+		dlc := <-dialed
+		if n := dlc.inCall.Load(); n != 1 {
+			t.Fatalf("stimulus: %d calls in progress, want the attempt's response Read", n)
+		}
+		start := time.Now()
+		e.d.Close()
+		el := time.Since(start)
+		if r := <-res; r.c != nil || !errors.Is(r.err, net.ErrClosed) {
+			t.Fatalf("Dial at Close: %v, %v", r.c, r.err)
+		}
+		if n := e.d.Status().Abandoned; el != drainBound || n != 0 {
+			t.Fatalf("Runtime.Close took %v and returned with %d abandoned; want %v and nothing abandoned", el, n, drainBound)
+		}
+		if n := dlc.closes.Load(); n != 1 || !dlc.callAtClose.Load() {
+			t.Fatalf("the attempt's conn closed %d times (Read in progress then: %v); want once, while the Read waited", n, dlc.callAtClose.Load())
+		}
+		e.close() // both Runtimes hold nothing and abandoned nothing
+		synctest.Wait()
+		if n, left := rendrGoroutines(); n != 0 || dlc.closes.Load() != 1 {
+			t.Fatalf("rendr goroutines after both Close calls: %v; the attempt's conn closed %d times", left, dlc.closes.Load())
+		}
 	})
 }

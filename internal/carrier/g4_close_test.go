@@ -456,3 +456,171 @@ func TestG4LastResortClosesLockedConn_L52(t *testing.T) {
 		})
 	}
 }
+
+// TestG4WithdrawnAttemptLockedConn_L49_L52 (design §0.14 B3, L49, L52): an
+// OPEN attempt withdrawn — its context cancelled with cause ErrWithdrawn —
+// while its PREFACE_ACK Read waits on a conn whose deadline setters wait
+// for that Read, towards a passive that stays silent. The withdrawal's
+// goroutine starts SetDeadline(now) on a goroutine of its own, which waits
+// behind the Read, and waits at most drainMax for the handshake to leave
+// the conn before the best-effort RST. The handshake cannot leave, so the
+// RST is dropped and the conn is closed: exactly once, drainMax after the
+// withdrawal, while the Read is in progress, and Establish returns then
+// with the withdrawal. Nothing is counted in the abandoned-call pool at any
+// time, also with an AbandonWait shorter than drainMax: the SetDeadline
+// that waits for that close is not stuck in embedder code, and returns
+// with the Read. Before the fix the SetDeadline ran on the withdrawal's own
+// goroutine and held it until its last resort (AbandonWait + 3·drainMax);
+// a SetDeadline counted AbandonWait after it started would be counted
+// before the close that ends it.
+func TestG4WithdrawnAttemptLockedConn_L49_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const wait = 500 * time.Millisecond // shorter than drainMax
+		env := hEnv()
+		env.Timing.AbandonWait = wait
+		a, b := net.Pipe()
+		t.Cleanup(func() { b.Close() }) // a failed test still ends its bubble
+		lc := newG4LockedConn(a)
+		go g4SilentPassive(b)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(nil)
+		f := Factory{Name: "g4", Dial: func(context.Context) (net.Conn, error) { return lc, nil }}
+		type result struct {
+			est *Established
+			err error
+			at  time.Time
+		}
+		res := make(chan result, 1)
+		go func() {
+			est, err := Establish(ctx, env, f, env.IDs.Next(), wire.TypeOpen, openPayload(0), nil)
+			res <- result{est, err, time.Now()}
+		}()
+		synctest.Wait() // the passive read the hello; Establish waits in its PREFACE_ACK Read
+		if n := lc.inCall.Load(); n != 1 {
+			t.Fatalf("stimulus: %d calls in progress, want the PREFACE_ACK Read", n)
+		}
+		start := time.Now()
+		cancel(ErrWithdrawn)
+		time.Sleep((wait + drainMax) / 2) // past AbandonWait, before drainMax
+		synctest.Wait()
+		if n, k := lc.closes.Load(), env.Abandon.Len(); n != 0 || k != 0 {
+			t.Fatalf("%v after the withdrawal: conn closed %d times, abandoned %d; want the handshake still awaited and nothing counted", time.Since(start), n, k)
+		}
+		var r result
+		select {
+		case r = <-res:
+		case <-time.After(time.Minute):
+			t.Fatal("Establish did not return")
+		}
+		synctest.Wait()
+		var ee *EstablishError
+		if r.est != nil || !errors.As(r.err, &ee) || ee.Cause != CauseLocalClose || !errors.Is(r.err, ErrWithdrawn) {
+			t.Fatalf("Establish = %v, %v; want the withdrawal", r.est, r.err)
+		}
+		if d := r.at.Sub(start); d != drainMax {
+			t.Fatalf("Establish returned %v after the withdrawal, want %v (the handshake awaited, then the close)", d, drainMax)
+		}
+		if n, after := lc.closes.Load(), lc.closedAfter(start); n != 1 || after != drainMax || !lc.callAtClose.Load() {
+			t.Fatalf("conn closed %d times, first %v after the withdrawal (Read in progress then: %v); want once, after %v, while the Read waited", n, after, lc.callAtClose.Load(), drainMax)
+		}
+		if env.Abandon.Len() != 0 || env.IDs.inUse() != 0 {
+			t.Fatalf("abandoned %d, IDs in use %d", env.Abandon.Len(), env.IDs.inUse())
+		}
+		time.Sleep(wait + 3*drainMax) // past every watch the withdrawal armed
+		synctest.Wait()
+		if n, k := lc.closes.Load(), env.Abandon.Len(); n != 1 || k != 0 {
+			t.Fatalf("later: conn closed %d times, abandoned %d", n, k)
+		}
+	})
+}
+
+// TestG4WithdrawRstFollowsUnblockingDeadline_L49 (design §0.14 B3, L49):
+// the withdrawal's SetDeadline(now), which unblocks the handshake, runs on
+// a goroutine of its own, so the RST(withdrawn) after it must wait until it
+// returned: a SetDeadline that applies its write half only after the RST's
+// write deadline was set would expire the RST's Write. The conn's
+// SetDeadline sets the read deadline (the handshake's response Read
+// returns, the handshake leaves the conn), then waits until released before
+// it sets the write deadline; the passive reads nothing more after the
+// hello until after the release.
+// The RST's write is set up only after the SetDeadline returned, so the
+// passive reads exactly one RST(withdrawn) after the OPEN, and the conn is
+// closed exactly once, after the drain; Establish returns at the
+// withdrawal and nothing is abandoned.
+func TestG4WithdrawRstFollowsUnblockingDeadline_L49(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := hEnv()
+		a, b := net.Pipe()
+		t.Cleanup(func() { b.Close() }) // a failed test still ends its bubble
+		gate := make(chan struct{})
+		var gateOnce sync.Once
+		release := func() { gateOnce.Do(func() { close(gate) }) }
+		t.Cleanup(release)
+		var sets atomic.Int32
+		hc := &hookConn{Conn: a, onSetDeadline: func(nc net.Conn, d time.Time) error {
+			if sets.Add(1) == 1 {
+				return nc.SetDeadline(d) // the attempt's deadline
+			}
+			err := nc.SetReadDeadline(d)
+			<-gate // the write half comes late
+			if werr := nc.SetWriteDeadline(d); err == nil {
+				err = werr
+			}
+			return err
+		}}
+		id := env.IDs.Next()
+		readNow := make(chan struct{})
+		var after []byte
+		passive := make(chan error, 1)
+		go func() {
+			var in [wire.PrefaceLen + wire.FrameOverhead + wire.OpenFixedLen]byte
+			if _, err := io.ReadFull(b, in[:]); err != nil {
+				passive <- err
+				return
+			}
+			if _, err := b.Write(hPrefaceAck(wire.PrefaceOK, id)); err != nil {
+				passive <- err
+				return
+			}
+			<-readNow
+			var err error
+			after, err = io.ReadAll(b)
+			passive <- err
+		}()
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(nil)
+		f := Factory{Name: "g4", Dial: func(context.Context) (net.Conn, error) { return hc, nil }}
+		res := make(chan error, 1)
+		go func() {
+			_, err := Establish(ctx, env, f, id, wire.TypeOpen, openPayload(0), nil)
+			res <- err
+		}()
+		synctest.Wait() // PREFACE_ACK(OK) read; Establish waits in its response Read
+		start := time.Now()
+		cancel(ErrWithdrawn)
+		if err := <-res; !errors.Is(err, ErrWithdrawn) || time.Since(start) != 0 {
+			t.Fatalf("Establish = %v after %v, want the withdrawal at once", err, time.Since(start))
+		}
+		synctest.Wait()
+		if n := sets.Load(); n != 2 {
+			t.Fatalf("stimulus: %d SetDeadline calls, want the attempt's and the withdrawal's, its write half held", n)
+		}
+		release()
+		synctest.Wait()
+		close(readNow)
+		if err := <-passive; err != nil {
+			t.Fatalf("passive: %v", err)
+		}
+		fr, n, err := wire.DecodeFrame(after)
+		if err != nil || n != len(after) || fr.Type != wire.TypeRst {
+			t.Fatalf("after the OPEN the passive read %d bytes (%+v, %v), want one RST", len(after), fr.Header, err)
+		}
+		if r, err := wire.ParseRst(fr.Payload); err != nil || r.Code != wire.RstWithdrawn {
+			t.Fatalf("RST %+v %v", r, err)
+		}
+		synctest.Wait()
+		if hc.closes.Load() != 1 || env.Abandon.Len() != 0 || env.IDs.inUse() != 0 {
+			t.Fatalf("conn closed %d times, abandoned %d, IDs in use %d", hc.closes.Load(), env.Abandon.Len(), env.IDs.inUse())
+		}
+	})
+}

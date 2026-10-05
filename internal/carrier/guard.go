@@ -245,10 +245,32 @@ func (k *closeOnce) startClose() bool { return k.closing.CompareAndSwap(false, t
 // the embedder's call AbandonWait after it started is counted in
 // env.Abandon until the call returns (L52).
 func (k *closeOnce) async(env *Env) {
-	if k.startDeadline() {
-		goGuarded(env, func() { _ = callSetDeadline(k.nc, time.Now()) })
-	}
+	k.goDeadline(env, env.Timing.AbandonWait)
 	k.last(env)
+}
+
+// goDeadline starts SetDeadline(now) on a goroutine of its own unless a
+// SetDeadline or Close was started already (startDeadline), and returns a
+// channel that is closed when that call returned — at once when it was not
+// started here. The goroutine is counted in env.Abandon when it is still
+// inside the embedder's call d after it started, until the call returns
+// (L52). d is AbandonWait plus the time the caller may still take before it
+// calls Close: on a conn whose deadline setters wait for a call in
+// progress, the SetDeadline returns only when that call ended, which on a
+// silent path only the Close does.
+func (k *closeOnce) goDeadline(env *Env, d time.Duration) <-chan struct{} {
+	set := make(chan struct{})
+	if !k.startDeadline() {
+		close(set)
+		return set
+	}
+	w := startWatch(env.Abandon, d)
+	go func() {
+		defer w.finish() // also on runtime.Goexit inside the embedder's SetDeadline
+		defer close(set)
+		_ = callSetDeadline(k.nc, time.Now())
+	}()
+	return set
 }
 
 // last calls Close on a guarded goroutine unless Close was started already;
