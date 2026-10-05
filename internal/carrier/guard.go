@@ -192,80 +192,108 @@ func (d *dialCall) run(ctx context.Context, f func(context.Context) (net.Conn, e
 }
 
 // CloseConn closes an embedder conn that is not (or no longer) owned by a
-// Conn: SetDeadline(now) then Close on a guarded goroutine; it returns at
-// once. Each conn must be passed to CloseConn at most once.
+// Conn and returns at once: SetDeadline(now) and Close each run on a
+// guarded goroutine, and the Close does not wait for the SetDeadline
+// (closeOnce.async). Each conn must be passed to CloseConn at most once.
 func CloseConn(env *Env, nc net.Conn) {
 	if nc == nil {
 		return
 	}
+	(&closeOnce{nc: nc}).async(env)
+}
+
+// closeOnce closes an embedder conn exactly once (L51, L52): it calls
+// SetDeadline(now) and Close at most once each, whoever comes first — the
+// goroutine that owns the conn, after its last call, or the last-resort
+// close of that goroutine's abandonment (design §0.8 V2). A verdict write —
+// WriteAndClose, an RST(withdrawn), a PREFACE_ACK refusal — on a conn that
+// ignores its write deadline but honours Close would otherwise keep the
+// conn open for as long as the peer does not read: the goroutine stuck in
+// it is counted in the abandoned-call pool, and only the Close it never
+// reaches would unblock it.
+//
+// Close never waits for SetDeadline to return (design §0.14 B3).
+// SetDeadline(now) is started first, on a goroutine of its own, so that a
+// conn that honours deadlines unblocks its pending calls (L52), and Close
+// follows at once. A conn whose deadline setters wait for a pending call —
+// a websocket adapter that honours gorilla's one-reader rule serializes
+// SetReadDeadline with Read — and whose Close ends that call is so closed
+// at once, and its SetDeadline returns when the call has ended. A Close
+// called only after SetDeadline returned would wait for a Read that, on a
+// silent path, only the peer ends, with the closer and the reader counted
+// in the abandoned-call pool all that time.
+type closeOnce struct {
+	nc      net.Conn
+	setting atomic.Bool // SetDeadline(now) was started
+	closing atomic.Bool // Close was started; a Close that hangs in the embedder keeps it, so nothing closes a second time
+}
+
+// startDeadline reports whether the caller is to call SetDeadline(now):
+// neither SetDeadline nor Close was started yet (after Close a deadline
+// unblocks nothing).
+func (k *closeOnce) startDeadline() bool {
+	return !k.closing.Load() && k.setting.CompareAndSwap(false, true)
+}
+
+// startClose reports whether the caller is to call Close: nobody started
+// it yet.
+func (k *closeOnce) startClose() bool { return k.closing.CompareAndSwap(false, true) }
+
+// async closes the conn and never blocks: SetDeadline(now) on a guarded
+// goroutine, started first, and Close on another, which does not wait for
+// it. A step that was started already is skipped. A goroutine still inside
+// the embedder's call AbandonWait after it started is counted in
+// env.Abandon until the call returns (L52).
+func (k *closeOnce) async(env *Env) {
+	if k.startDeadline() {
+		goGuarded(env, func() { _ = callSetDeadline(k.nc, time.Now()) })
+	}
+	k.last(env)
+}
+
+// last calls Close on a guarded goroutine unless Close was started already;
+// it never blocks. As the last resort it runs when the goroutine that owns
+// the conn was adopted by the abandoned-call pool while still inside an
+// embedder call that ignored its deadline (a verdict write, a drain): the
+// Close unblocks that call. It is never preceded by a SetDeadline of its
+// own, which could wait for that very call (design §0.14 B3).
+func (k *closeOnce) last(env *Env) {
+	if k.startClose() {
+		goGuarded(env, func() { _ = callClose(k.nc) })
+	}
+}
+
+// goGuarded runs the embedder call f on a goroutine of its own, counted in
+// env.Abandon when it is still running AbandonWait after it started, until
+// it returns (L52).
+func goGuarded(env *Env, f func()) {
 	w := startWatch(env.Abandon, env.Timing.AbandonWait)
 	go func() {
-		defer w.finish() // also on runtime.Goexit inside the embedder's Close
-		closeNow(nc)
+		defer w.finish() // also on runtime.Goexit inside the embedder's call
+		f()
 	}()
-}
-
-// closeNow unblocks and closes nc: SetDeadline(now), then Close. Panics in
-// either call are contained, and Close is deferred so that it runs exactly
-// once even when SetDeadline calls runtime.Goexit (L51).
-func closeNow(nc net.Conn) {
-	defer func() { _ = callClose(nc) }()
-	_ = callSetDeadline(nc, time.Now())
-}
-
-// closeOnce closes an embedder conn exactly once (L52), whoever comes
-// first: the goroutine that owns the conn, after its last call, or the
-// last-resort close of that goroutine's abandonment (design §0.8 V2). A
-// verdict write — WriteAndClose, an RST(withdrawn), a PREFACE_ACK refusal —
-// on a conn that ignores its write deadline but honours Close would
-// otherwise keep the conn open for as long as the peer does not read: the
-// goroutine stuck in it is counted in the abandoned-call pool, and only the
-// Close it never reaches would unblock it.
-type closeOnce struct {
-	nc   net.Conn
-	done atomic.Bool
-}
-
-// now closes the conn on the calling goroutine (closeNow) unless it was
-// closed already. A close that hangs in the embedder keeps the flag, so
-// the last resort never closes a second time.
-func (k *closeOnce) now() {
-	if k.done.CompareAndSwap(false, true) {
-		closeNow(k.nc)
-	}
-}
-
-// async closes the conn on a guarded goroutine (CloseConn) unless it was
-// closed already; it never blocks. As the last resort it runs when the
-// goroutine that owns the conn was adopted by the abandoned-call pool while
-// still inside an embedder call that ignored its deadline: the Close
-// unblocks that call.
-func (k *closeOnce) async(env *Env) {
-	if k.done.CompareAndSwap(false, true) {
-		CloseConn(env, k.nc)
-	}
 }
 
 // writeAndCloseInline is Conn.WriteAndClose for a conn that has no Conn,
 // run on the calling goroutine: it writes frame bounded by deadline (zero:
 // now + drainMax) and closes k's conn in the L05 order — CloseWrite on an
-// OwnedTCP, a drain bounded by min(deadline, drainMax), then Close on a
-// guarded goroutine (k.async). When the calling goroutine is still inside
-// the write or the drain AbandonWait after both bounds — a conn that ignores
-// its deadlines and a peer that neither reads nor closes — its conn is
-// closed through k as the last resort (design §0.8 V2), which ends the call
-// on a conn that honours Close. That goroutine is not counted in the
-// abandoned-call pool here: it belongs to the caller's owner, which joins
-// it and counts it once if it stays stuck (ReadHello's caller is a
-// handshake goroutine of root's handshake group, counted by Runtime.Close's
-// bounded join); a count here as well would count one stuck goroutine twice
-// (L52, design §0.9 X5). Every other close of the conn must go through k
-// too — the caller's runtime.Goexit guard included, since a Goexit in a
-// conn call skips the final close here — so that it is closed exactly once
-// (L51, L52). It is the verdict form for ReadHello's PREFACE_ACK refusals
-// (VERSION, FEATURE, and the gate's CAPACITY or GOING_AWAY): the refusal
-// stays on the handshake goroutine and in its slot (L48), so Runtime.Close's
-// handshake join covers it.
+// OwnedTCP, a drain bounded by min(deadline, drainMax), then SetDeadline(now)
+// and Close on guarded goroutines (k.async). When the calling goroutine is
+// still inside the write or the drain AbandonWait after both bounds — a conn
+// that ignores its deadlines and a peer that neither reads nor closes — its
+// conn is closed through k as the last resort (k.last, design §0.8 V2),
+// which ends the call on a conn that honours Close. That goroutine is not
+// counted in the abandoned-call pool here: it belongs to the caller's
+// owner, which joins it and counts it once if it stays stuck (ReadHello's
+// caller is a handshake goroutine of root's handshake group, counted by
+// Runtime.Close's bounded join); a count here as well would count one
+// stuck goroutine twice (L52, design §0.9 X5). Every other close of the
+// conn must go through k too — the caller's runtime.Goexit guard included,
+// since a Goexit in a conn call skips the final close here — so that it is
+// closed exactly once (L51, L52). It is the verdict form for ReadHello's
+// PREFACE_ACK refusals (VERSION, FEATURE, and the gate's CAPACITY or
+// GOING_AWAY): the refusal stays on the handshake goroutine and in its slot
+// (L48), so Runtime.Close's handshake join covers it.
 func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Time) {
 	now := time.Now()
 	if deadline.IsZero() {
@@ -275,8 +303,8 @@ func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Tim
 	if d := deadline.Sub(now); d > 0 {
 		wait += d
 	}
-	w := armWatch(nil, wait, func() { k.async(env) }) // the last resort only: the caller's owner counts this goroutine
-	defer w.finish()                                  // also on runtime.Goexit in a conn call
+	w := armWatch(nil, wait, func() { k.last(env) }) // the last resort only: the caller's owner counts this goroutine
+	defer w.finish()                                 // also on runtime.Goexit in a conn call
 	_ = callSetWriteDeadline(k.nc, deadline)
 	if writeFull(k.nc, frame) == nil {
 		if o, ok := k.nc.(*OwnedTCP); ok {
@@ -315,7 +343,7 @@ func startWatch(pool *AbandonPool, d time.Duration) *watch {
 
 // armWatch is startWatch with a last-resort action: when the watch adopts
 // its goroutine, last runs once on the timer's goroutine, after the
-// adoption (design §0.8 V2: closeOnce.async). It must not block. With a nil
+// adoption (design §0.8 V2: closeOnce.last). It must not block. With a nil
 // pool nothing is counted (the goroutine's owner counts it) and last still
 // runs when d passes before finish.
 func armWatch(pool *AbandonPool, d time.Duration, last func()) *watch {

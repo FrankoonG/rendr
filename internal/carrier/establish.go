@@ -619,7 +619,7 @@ func (g *hsGuard) join() {
 }
 
 // closeWith begins the close of the conn, once: with frame nil at once
-// (SetDeadline(now), Close; CloseConn); otherwise after writing frame in
+// (SetDeadline(now) and Close; CloseConn); otherwise after writing frame in
 // the L05 order (writeThenClose), but only when PREFACE ‖ first frame were
 // written completely — nothing may follow a partial first frame. concurrent
 // says that the handshake may still be inside a conn call (abort): the
@@ -642,11 +642,12 @@ func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 
 // writeThenClose writes frame and closes nc in the L05 order — the frame
 // (bounded by drainMax), CloseWrite on an OwnedTCP, a drain bounded by
-// drainMax, then SetDeadline(now) and Close — on a guarded goroutine
-// counted in the abandoned-call pool when it hangs. The drain reads what
-// the passive already sent (an OPEN_ACK racing a withdrawal), so the close
-// never answers unread bytes with a TCP reset that could discard the frame
-// before the passive read it (Windows drops buffered data on a reset).
+// drainMax, then SetDeadline(now) and Close on guarded goroutines of their
+// own (closeOnce.async) — on a guarded goroutine counted in the
+// abandoned-call pool when it hangs. The drain reads what the passive
+// already sent (an OPEN_ACK racing a withdrawal), so the close never
+// answers unread bytes with a TCP reset that could discard the frame before
+// the passive read it (Windows drops buffered data on a reset).
 // When left is non-nil the handshake goroutine may still be inside a conn
 // call: the goroutine first unblocks it (SetDeadline(now): the handshake's
 // read and a hello Write in progress return at once on a conn that honours
@@ -658,13 +659,13 @@ func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 // When the goroutine is adopted by the abandoned-call pool — a conn that
 // ignores the write or the drain's read deadline and a peer that does not
 // read or close — its conn is closed exactly once as a last resort (design
-// §0.8 V2), which unblocks it on a conn that honours Close.
+// §0.8 V2, closeOnce.last), which unblocks it on a conn that honours Close.
 func writeThenClose(env *Env, nc net.Conn, frame []byte, left <-chan struct{}, ok func() bool) {
 	k := &closeOnce{nc: nc}
-	w := armWatch(env.Abandon, env.Timing.withDefaults().AbandonWait+3*drainMax, func() { k.async(env) })
+	w := armWatch(env.Abandon, env.Timing.withDefaults().AbandonWait+3*drainMax, func() { k.last(env) })
 	go func() {
 		defer w.finish()
-		defer k.now() // exactly once, also on runtime.Goexit in a conn call (L51)
+		defer k.async(env) // exactly once, also on runtime.Goexit in a conn call (L51)
 		if left != nil {
 			_ = callSetDeadline(nc, time.Now())
 			t := time.NewTimer(drainMax)
