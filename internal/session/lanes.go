@@ -31,13 +31,13 @@ func (a *actor) newLaneLocked(now time.Time, c *carrier.Conn, factory int, gen u
 // of the others) and from the passive's unconfirmed list, hands its carrier
 // to the exit join and records it among the last dead lanes of Status.
 //
-// The record keeps the carrier only until it is joined: pruneGoneLocked
-// then replaces it by its final Stats (settleDeadLocked), so no list of the
-// actor keeps a joined carrier reachable (design §0.14 B7). The
-// unconfirmed list would otherwise keep a passive lane that died before its
-// first response frame was placed until the next confirmation — for a
-// pending session, until its verdict, however many parked carriers die
-// meanwhile.
+// The record keeps the carrier while it is in gone: the step that prunes
+// it after its join (pruneGoneLocked) replaces it by its final Stats
+// (settleDeadLocked), so the dead-lane history keeps a carrier no longer
+// than the join list does (design §0.14 B7). The unconfirmed list would
+// otherwise keep a passive lane that died before its first response frame
+// was placed until the next confirmation — for a pending session, until
+// its verdict, however many parked carriers die meanwhile.
 func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at time.Time) {
 	s := a.s
 	for i, o := range s.lanes {

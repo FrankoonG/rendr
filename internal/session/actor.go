@@ -89,9 +89,13 @@ type actor struct {
 	// killed or answered and closed itself (refused or late dial results,
 	// adopts of an ended session). The actor exits only once all of them
 	// are joined, so none of their goroutines outlives Session.Done (§6.8).
-	// Every step prunes the joined ones (pruneGoneLocked), and the loop
-	// wakes when the oldest one still running is joined, so a joined
-	// carrier is never kept reachable (§0.14 B7).
+	// Every step prunes the joined ones (pruneGoneLocked) and the loop
+	// waits for the oldest one still running (joinWait), so a joined
+	// carrier leaves gone, and its dead-lane record lets it go, no later
+	// than the step after the join of the oldest carrier then in gone: at
+	// once when that is the carrier itself, else within that older
+	// carrier's own join bound (AbandonWait for a call stuck in embedder
+	// code). A join does not ring the doorbell (§0.14 B7).
 	gone []*carrier.Conn
 	// dead is the last maxDeadLanes dead lanes, oldest first (Status). A
 	// record keeps its carrier while that carrier is in gone, then its final
@@ -396,9 +400,11 @@ func (a *actor) dropConn(c *carrier.Conn) {
 
 // pruneGoneLocked drops the joined carriers from gone and settles the
 // dead-lane record of each (§0.14 B7). Every step calls it, so neither list
-// grows with churn and neither keeps a joined carrier reachable. A record
-// keeps its carrier exactly while the carrier is in gone, so once gone is
-// empty no record holds a carrier and the exit publishes none.
+// grows with churn, and a joined carrier stays in them only until the next
+// step: at the latest the one the join of the oldest carrier in gone wakes
+// (joinWait), which may come after the carrier's own join. A record keeps
+// its carrier exactly while the carrier is in gone, so once gone is empty
+// no record holds a carrier and the exit publishes none.
 func (a *actor) pruneGoneLocked() {
 	k := 0
 	for _, c := range a.gone {

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
 	"runtime"
@@ -13,16 +14,20 @@ import (
 	"weak"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // Dead-lane retention (design §0.14 B7). The Status history of the last
-// dead lanes keeps a carrier only until the carrier is joined and then its
-// final Stats; the actor prunes joined carriers in every step and wakes
-// when one is joined; a passive lane that dies unconfirmed leaves the
+// dead lanes keeps a carrier only until the step that prunes it from the
+// join list after its join, and then its final Stats; the actor prunes
+// joined carriers in every step and wakes when the oldest carrier still in
+// the join list is joined; a passive lane that dies unconfirmed leaves the
 // unconfirmed list at once. So no list of a session keeps a dead
 // *carrier.Conn — its writer Batch, timers and embedder conn — reachable
-// after its Done, while Status keeps reporting the dead carriers as before.
-// Package-level helpers of these tests start with "g6".
+// once it was joined and its session took the step that join wakes, while
+// Status keeps reporting the dead carriers as before and the exit still
+// waits for every one of them (L52). Package-level helpers of these tests
+// start with "g6".
 
 // g6Watch follows one carrier through its death and join: the test holds
 // it strongly until release, then only weakly.
@@ -33,6 +38,11 @@ type g6Watch struct {
 	wc    weak.Pointer[carrier.Conn]
 	wb    weak.Pointer[carrier.Batch]
 	final carrier.Stats // its Stats once joined (release)
+	// Its death record (release): set once by the carrier, the record the
+	// session's death step copies into Status.
+	cause  carrier.Cause
+	detail string
+	at     time.Time
 }
 
 // g6Watch1 watches the carrier with CarrierID id among s's lanes.
@@ -60,9 +70,9 @@ func g6WatchActive(t testing.TB, a, b *Session) (wa, wb *g6Watch) {
 }
 
 // release waits (virtual time) for the carrier's join, takes its final
-// Stats and a weak pointer to its writer Batch, and drops the strong
-// reference. Done orders the writer's exit (and its Batch) before these
-// reads.
+// Stats, its death record and a weak pointer to its writer Batch, and
+// drops the strong reference. Done orders the writer's exit (and its
+// Batch) before these reads.
 func (w *g6Watch) release(t testing.TB, within time.Duration) {
 	t.Helper()
 	select {
@@ -71,6 +81,11 @@ func (w *g6Watch) release(t testing.TB, within time.Duration) {
 		t.Fatalf("carrier %d not joined within %v", w.id, within)
 	}
 	w.final = w.conn.Stats()
+	var dead bool
+	dead, w.cause, w.detail, w.at = w.conn.Death()
+	if !dead {
+		t.Fatalf("carrier %d joined without a death record", w.id)
+	}
 	w.wb = weak.Make(g6BatchOf(t, w.conn))
 	w.conn = nil
 }
@@ -128,9 +143,11 @@ func g6First(ids []uint32) []uint32 {
 	return ids[:min(len(ids), 8)]
 }
 
-// g6CheckDead checks that st lists exactly the watched carriers ws as its
-// dead ones, after every live one and oldest first, each with cause, a
-// death time and detail, and its final Stats.
+// g6CheckDead checks that st lists exactly the watched (released) carriers
+// ws as its dead ones, after every live one and oldest first, each with
+// the death record its carrier holds (cause, detail and time) and its
+// final Stats; unless cause is CauseNone, each also died of cause, with a
+// death time and a detail.
 func g6CheckDead(t testing.TB, side string, st Status, cause carrier.Cause, ws ...*g6Watch) {
 	t.Helper()
 	var dead []CarrierStatus
@@ -149,8 +166,11 @@ func g6CheckDead(t testing.TB, side string, st Status, cause carrier.Cause, ws .
 		switch {
 		case d.ID != w.id:
 			t.Fatalf("%s: dead carrier #%d is %d, want %d (oldest first): %+v", side, i, d.ID, w.id, st.Carriers)
-		case d.DeathCause != cause || d.DeathAt.IsZero() || d.DeathDetail == "":
+		case cause != carrier.CauseNone && (d.DeathCause != cause || d.DeathAt.IsZero() || d.DeathDetail == ""):
 			t.Fatalf("%s: dead carrier %d: cause %v at %v (%q), want %v", side, d.ID, d.DeathCause, d.DeathAt, d.DeathDetail, cause)
+		case d.DeathCause != w.cause || d.DeathDetail != w.detail || !d.DeathAt.Equal(w.at) || d.DeathAt.IsZero():
+			t.Fatalf("%s: dead carrier %d: cause %v at %v (%q), want its own death record %v at %v (%q)",
+				side, d.ID, d.DeathCause, d.DeathAt, d.DeathDetail, w.cause, w.at, w.detail)
 		case d.Stats != w.final:
 			t.Fatalf("%s: dead carrier %d reports %+v, want its final Stats %+v", side, d.ID, d.Stats, w.final)
 		}
@@ -169,6 +189,30 @@ type g6StuckClose struct {
 func (c *g6StuckClose) Close() error {
 	<-c.release
 	return c.Conn.Close()
+}
+
+// g6OpenStuckFirst opens a selector pair over l1 whose first carrier's
+// embedder conn on the dialer blocks in Close (g6StuckClose) until unblock
+// is called. unblock is idempotent; the caller defers it after
+// w.teardown, so the stuck Close returns before the bubble ends also when
+// the test fails.
+func g6OpenStuckFirst(w *acWorld, l1 *rendrtest.Link) (a, b *Session, unblock func()) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock = func() { once.Do(func() { close(release) }) }
+	var wrapped atomic.Bool
+	f := carrier.Factory{Name: l1.Name(), Dial: func(ctx context.Context) (net.Conn, error) {
+		c, err := l1.Dial(ctx)
+		if err == nil && wrapped.CompareAndSwap(false, true) {
+			return &g6StuckClose{Conn: c, release: release}, nil
+		}
+		return c, err
+	}}
+	w.sid++
+	p := w.a.p
+	p.Mode = ModeSelector
+	a, b = w.openSpec(DialSpec{SID: [16]byte{0xD6, w.sid}, Params: p, Factories: []carrier.Factory{f}}, nil)
+	return a, b, unblock
 }
 
 // g6PipePath is a factory over net.Pipe straight into the passive shim. It
@@ -241,11 +285,13 @@ func g6CutRound(t testing.TB, paths []*g6PipePath, dialers, passives []*Session)
 	})
 }
 
-// TestG6DeadCarrierReleasedAtJoin_L52_L53: once a dead carrier is joined,
-// no list of its session keeps it — nor its writer Batch — reachable, and
-// Status still lists it among the dead ones with its final Stats (design
-// §0.14 B7; was: the dead-lane history pinned the last 8 carriers and the
-// join list up to 16).
+// TestG6DeadCarrierReleasedAtJoin_L52_L53: once a dead carrier is joined
+// and its session took the step that join wakes, no list of the session
+// keeps it — nor its writer Batch — reachable, and Status still lists it
+// among the dead ones with its final Stats (design §0.14 B7; was: the
+// dead-lane history pinned the last 8 carriers and the join list up to
+// 16). No carrier leaves the join list before it is joined: the exit
+// still waits for each (L52).
 func TestG6DeadCarrierReleasedAtJoin_L52_L53(t *testing.T) {
 	// late-join: the dialer's carrier dies with a transfer behind it, and
 	// its embedder Close blocks, so it is joined only at AbandonWait, after
@@ -256,19 +302,8 @@ func TestG6DeadCarrierReleasedAtJoin_L52_L53(t *testing.T) {
 			w := acNewWorld(t, nil)
 			defer w.teardown()
 			l1 := w.link("p1")
-			release := make(chan struct{})
-			var wrapped atomic.Bool
-			f := carrier.Factory{Name: "p1", Dial: func(ctx context.Context) (net.Conn, error) {
-				c, err := l1.Dial(ctx)
-				if err == nil && wrapped.CompareAndSwap(false, true) {
-					return &g6StuckClose{Conn: c, release: release}, nil
-				}
-				return c, err
-			}}
-			w.sid++
-			p := w.a.p
-			p.Mode = ModeSelector
-			a, b := w.openSpec(DialSpec{SID: [16]byte{0xD6, w.sid}, Params: p, Factories: []carrier.Factory{f}}, nil)
+			a, b, unblock := g6OpenStuckFirst(w, l1)
+			defer unblock() // before the teardown
 			if we, re := acTransfer(a, b, 256<<10, 61, false); we != nil || re != nil {
 				t.Fatalf("transfer a→b: %v %v", we, re)
 			}
@@ -296,7 +331,7 @@ func TestG6DeadCarrierReleasedAtJoin_L52_L53(t *testing.T) {
 			if d, aw := time.Since(cut), w.a.cenv.Timing.AbandonWait; d < aw {
 				t.Fatalf("the dialer's dead carrier was joined %v after the cut, want its abandoned Close at AbandonWait %v (stimulus)", d, aw)
 			}
-			close(release) // the abandoned Close returns and its closer exits
+			unblock() // the abandoned Close returns and its closer exits
 			wb.release(t, 5*time.Second)
 			g6Settle()
 			if wa.final.TxBytes == 0 || wa.final.RxBytes == 0 || wb.final.TxBytes == 0 || wb.final.RxBytes == 0 {
@@ -305,6 +340,86 @@ func TestG6DeadCarrierReleasedAtJoin_L52_L53(t *testing.T) {
 			g6CheckDead(t, "dialer", a.Status(), carrier.CauseTransportError, wa)
 			g6CheckDead(t, "passive", b.Status(), carrier.CauseTransportError, wb)
 			g6Unreachable(t, "late-join", wa, wb)
+			if n := w.a.cenv.Abandon.Len(); n != 0 {
+				t.Fatalf("abandoned pool %d after the Close returned, want 0", n)
+			}
+		})
+	})
+
+	// dead-before-end: every step prunes the join list, yet a carrier that
+	// died while its session was open stays in it until it is joined, so
+	// the session's exit still waits for it (L52). The dialer's dead
+	// carrier is stuck in its embedder Close when the session is shut
+	// down: Session.Done closes at that carrier's join, AbandonWait after
+	// its death, and not before. Once both sessions ended, their final
+	// Status lists every carrier with its final Stats, and none of them
+	// stays reachable while the application still holds the sessions.
+	t.Run("dead-before-end", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := acNewWorld(t, nil)
+			defer w.teardown()
+			l1 := w.link("p1")
+			a, b, unblock := g6OpenStuckFirst(w, l1)
+			defer unblock() // before the teardown
+			wa1, wb1 := g6WatchActive(t, a, b)
+			cut := time.Now()
+			if n := l1.Kill(); n != 1 {
+				t.Fatalf("Kill closed %d carriers, want 1 (stimulus)", n)
+			}
+			acWaitFor(t, 5*time.Second, "the pair runs on a new carrier", func() bool {
+				id := acActive(a)
+				return id != 0 && id != wa1.id && acActive(b) == id
+			})
+			wa2, wb2 := g6WatchActive(t, a, b)
+			joinedAt := make(chan time.Time, 1)
+			go func() {
+				<-wa1.done
+				joinedAt <- time.Now()
+			}()
+			select {
+			case <-wa1.done:
+				t.Fatal("the dialer's dead carrier was joined while its Close blocked (stimulus)")
+			default:
+			}
+			if d := g6DeadIDs(a.Status()); len(d) != 1 || d[0] != wa1.id {
+				t.Fatalf("dialer Status lists dead carriers %v before Shutdown, want [%d] (stimulus)", d, wa1.id)
+			}
+			a.Shutdown()
+			acDone(t, a, 5*time.Second)
+			select {
+			case <-wa1.done:
+			default:
+				t.Fatalf("Session.Done closed %v after the cut while its dead carrier %d was not joined (L52)", time.Since(cut), wa1.id)
+			}
+			synctest.Wait() // the join's watcher ran
+			var at time.Time
+			select {
+			case at = <-joinedAt:
+			default:
+				t.Fatal("the join's watcher did not run")
+			}
+			if d, aw := at.Sub(cut), w.a.cenv.Timing.AbandonWait; d < aw {
+				t.Fatalf("the dialer's dead carrier was joined %v after the cut, want its abandoned Close at AbandonWait %v (stimulus)", d, aw)
+			}
+			if d := time.Since(at); d > 10*time.Millisecond {
+				t.Fatalf("Session.Done %v after its dead carrier's join, want at once", d)
+			}
+			acDone(t, b, 5*time.Second) // the passive ends on the dialer's going-away abort
+			var ae *AbortError
+			if err := b.Status().Err; !errors.As(err, &ae) || ae.Code != AbortGoingAway || !ae.Remote {
+				t.Fatalf("passive ended with %v, want the dialer's going-away abort (stimulus)", err)
+			}
+			for _, wt := range []*g6Watch{wa1, wa2, wb1, wb2} {
+				wt.release(t, 5*time.Second)
+			}
+			unblock() // the abandoned Close returns and its closer exits
+			g6Settle()
+			if wa1.cause != carrier.CauseTransportError || wb1.cause != carrier.CauseTransportError {
+				t.Fatalf("the cut carriers died of %v and %v, want transport_error (stimulus)", wa1.cause, wb1.cause)
+			}
+			g6CheckDead(t, "dialer", a.Status(), carrier.CauseNone, wa1, wa2)
+			g6CheckDead(t, "passive", b.Status(), carrier.CauseNone, wb1, wb2)
+			g6Unreachable(t, "dead-before-end", wa1, wa2, wb1, wb2)
 			if n := w.a.cenv.Abandon.Len(); n != 0 {
 				t.Fatalf("abandoned pool %d after the Close returned, want 0", n)
 			}

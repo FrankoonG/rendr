@@ -11,8 +11,9 @@ import (
 // mu in the same critical section as every routing change, so the reported
 // active carrier always equals the routed one (L27, L53). Session.Status
 // adds the data counters (read under mu) and each lane's carrier.Stats: read
-// from its Conn at call time, or a joined dead carrier's final Stats. A
-// published snapshot is never modified.
+// from its Conn at call time, or, once a dead lane's carrier was joined and
+// pruned (laneSnap.conn), its final Stats. A published snapshot is never
+// modified.
 type statusSnap struct {
 	state State
 	err   error // the end error once state == StateEnded
@@ -38,12 +39,13 @@ type laneSnap struct {
 	gen   uint32 // dialer: incarnation number of the factory slot; passive: attach order
 	state LaneState
 	// conn is the carrier whose Stats Status reads at call time: a live
-	// lane's, and a dead lane's until its carrier is joined (its reader may
-	// still account frames it read before the death). nil for a dial
-	// attempt in flight and for a dead lane whose carrier was joined: stats
-	// then holds the carrier's final Stats, so the dead-lane history never
-	// keeps a joined carrier — its Batch, timers and embedder conn —
-	// reachable (design §0.14 B7).
+	// lane's, and a dead lane's until the actor prunes its carrier from the
+	// join list after its join (its reader may still account frames it read
+	// before the death). nil for a dial attempt in flight and for a dead
+	// lane whose carrier was pruned: stats then holds the carrier's final
+	// Stats, read after its join, so the dead-lane history keeps a carrier
+	// — its Batch, timers and embedder conn — no longer than the join list
+	// does (design §0.14 B7).
 	conn  *carrier.Conn
 	stats carrier.Stats // the final Stats of a joined dead carrier (conn == nil)
 
