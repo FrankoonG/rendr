@@ -592,16 +592,28 @@ func (a *actor) onDialResultLocked(now time.Time, r *dialResult) {
 	a.attemptAnsweredLocked(now, r.slot, at, r.est)
 }
 
-// finish records an attempt's cadence outcome.
+// finish records an attempt's cadence outcome. A refusal while the session
+// has no live carrier — the opening phase or a no-path episode, both bounded
+// by the grace — keeps the first backoff step whatever the slot's count:
+// the passive may be refusing only until it drops a carrier the dialer has
+// already lost (design D27), and the failover race dials a slot without a
+// Kick, so the slot's recovery window does not cover it. Refusals beside a
+// live carrier back off to the cap (§0.14 B6).
 func (a *actor) finish(now time.Time, i int, at *attempt, o sched.Outcome) {
-	a.d.slots[i].cad.Finish(now, at.id, o, orDefault(a.s.p.BackoffMax, defBackoffMax), a.rand())
+	limit := orDefault(a.s.p.BackoffMax, defBackoffMax)
+	if o == sched.OutcomeRefused && !a.hasAliveLocked() {
+		limit = sched.BackoffBase
+	}
+	a.d.slots[i].cad.Finish(now, at.id, o, limit, a.rand())
 }
 
 // attemptFailedLocked handles an attempt whose Establish failed (§6.6,
 // §6.7): version and capacity answers are terminal for Dial; a refused
 // instance and any answer after the PREFACE exchange count as Refused
-// (backoff reset, failed mark cleared); everything else is Failed (failed
-// mark, backoff). An open session ends when the bound instance answers
+// (failed mark cleared; the backoff resets at the slot's first refusal and
+// inside its recovery window, and keeps its first step while no carrier
+// lives: sched.Cadence, finish); everything else is Failed (failed mark,
+// backoff). An open session ends when the bound instance answers
 // GOING_AWAY (*AbortError) or a JOIN reached a restarted peer
 // (ErrSessionLost) — cleanly (io.EOF) once our DONE was sent (doneOr).
 func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error) {
