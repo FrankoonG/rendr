@@ -14,9 +14,10 @@ import (
 // values current at placement (latest wins) once its ackSent differs. The
 // duty lane is a qualifying lane whose writer is not blocked, so an ACK
 // never waits behind a stuck carrier for more than PingBusy (L08; D5). On
-// the passive it is also a lane the applied SCHED lists: the duty follows
-// the dialer's routing at once (ackDroppedLocked), so ACKs do not keep
-// riding a carrier the dialer abandoned after a death only it detected.
+// the passive, selector or bond, it is also a lane the applied SCHED
+// lists: the duty follows the dialer's routing at once (ackDroppedLocked),
+// so ACKs do not keep riding a carrier the dialer abandoned after a death
+// only it detected.
 //
 // Receiver cadence: a bump once AckEvery bytes were delivered since the
 // last bump, else an ACK delay armed at the first unacknowledged delivery
@@ -131,17 +132,22 @@ func (s *Session) ackLeavingLocked(l *lane) bool {
 	return l.retireCalled || s.ackDroppedLocked(l)
 }
 
-// ackDroppedLocked (passive): a SCHED was applied and it does not list l.
-// The dialer, the sole routing authority, no longer sends on that carrier:
-// it switched away for quality, retired it, or saw it die — possibly a
-// death this side has not detected (one-way loss: the dialer's PINGs go
-// unanswered while this side's own death deadline, up to DeadMax, has not
-// expired, and the dialer's close may never reach it). ACKs placed there
-// would wait for that detection, and the dialer's send window with them,
-// so the duty moves to a lane the SCHED lists when it is applied (the
-// application bumps an urgent ACK, which re-chooses the duty) and comes
-// back only when no listed lane qualifies (design §0.13 A7 (c)). The dialer
-// keeps every qualifying lane eligible: it knows its own routing.
+// ackDroppedLocked (passive, either mode): a SCHED was applied and it does
+// not list l (the selector's SCHED names its active carrier, the bond's
+// lists its members). The dialer, the sole routing authority, no longer
+// sends on that carrier: it switched away for quality, retired it, or saw
+// it die — possibly a death this side has not detected (one-way loss: the
+// dialer's PINGs go unanswered while this side's own death deadline, up to
+// DeadMax, has not expired, and the dialer's close may never reach it).
+// ACKs placed there would wait for that detection, and the dialer's send
+// window with them. A bond is no exception: the gap lane (§0.13 A4)
+// carries ACKs only while data is held out of order, and once the dialer
+// sends on the remaining members alone and its requeued bytes arrived,
+// nothing is. So the duty moves to a lane the SCHED lists when it is
+// applied (the application bumps an urgent ACK, which re-chooses the duty)
+// and comes back only when no listed lane qualifies (design §0.13 A7 (c)).
+// The dialer keeps every qualifying lane eligible: it knows its own
+// routing.
 func (s *Session) ackDroppedLocked(l *lane) bool {
 	return s.p.Role == RolePassive && s.ctl.set.N > 0 && !schedLists(&s.ctl.set, l.id)
 }

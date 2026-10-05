@@ -308,7 +308,11 @@ func (a *actor) endIfPeerEndedLocked(now time.Time) {
 // or never sent because our FIN_DELIVERED was lost — so such an end is the
 // clean end that DONE would have given, whichever comes first: it, Linger
 // after our DONE (terminationLocked), or the proof that the peer is gone or
-// gave up. An end before our DONE was sent keeps err.
+// gave up. An end before our DONE was sent keeps err — also one in the
+// gap after DONE's conditions held and before the duty lane placed it (a
+// writer round; longer while that lane's writer is blocked, until the duty
+// moves after PingBusy): the gate is the DONE actually sent, one gate for
+// every end listed here.
 func (a *actor) doneOr(err error) error {
 	if a.s.st.doneSent {
 		return io.EOF
