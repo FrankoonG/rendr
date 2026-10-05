@@ -179,10 +179,15 @@ func (c *Conn) frameArrived() time.Time {
 	return now
 }
 
-// dataArrived accounts n DATA payload bytes; the first DATA after a PING
-// wakes the writer, whose PING cadence becomes PingBusy (P12).
-func (c *Conn) dataArrived(n int) {
+// dataArrived accounts n DATA payload bytes that arrived at now (also in
+// the self-load volume of a dialer session carrier's Gauge, §8.2); the
+// first DATA after a PING wakes the writer, whose PING cadence becomes
+// PingBusy (P12).
+func (c *Conn) dataArrived(n int, now time.Time) {
 	c.rxBytes.Add(uint64(n))
+	if g := c.opts.Gauge; g != nil {
+		g.AddRx(n, now)
+	}
 	if !c.rxData.Load() && c.rxData.CompareAndSwap(false, true) {
 		c.Wake()
 	}
@@ -237,7 +242,7 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			return false
 		}
 		data := p[wire.DataPrefixLen:]
-		c.dataArrived(len(data))
+		c.dataArrived(len(data), now)
 		if err := c.ep.Data(c, off, data, nil); err != nil {
 			c.violation("DATA: %v", err)
 			return false
@@ -334,8 +339,7 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 		return false
 	}
 	rd.fseq++
-	c.frameArrived()
-	c.dataArrived(n)
+	c.dataArrived(n, c.frameArrived())
 	rd.big = nil // buf's reference moves to the endpoint
 	if err := c.ep.Data(c, off, buf.B[:n], buf); err != nil {
 		c.violation("DATA: %v", err)

@@ -330,9 +330,12 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 	if c.death.Load() != nil {
 		return false // killed (or the retirement completed) while the write was in progress
 	}
-	if b.dataBytes() > 0 {
+	if n := b.dataBytes(); n > 0 {
 		w.busyAcc += end.Sub(start)
 		w.dataSincePing = true
+		if g := c.opts.Gauge; g != nil {
+			g.AddTx(n, end) // the self-load volume (§8.2), counted with st.txBytes
+		}
 	}
 	c.mu.Lock()
 	c.commitLocked(w, b, end)

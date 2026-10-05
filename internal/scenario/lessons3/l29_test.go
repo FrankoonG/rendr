@@ -47,15 +47,41 @@ type guardBulk struct {
 	// atProbePing starts the bulk the moment a's probe carrier committed a
 	// PING; otherwise it starts about halfway between two of them.
 	atProbePing bool
+	// lead (with atProbePing): a first transfer of lead × rate bytes, in the
+	// bulk's direction, starts at one of a's probe PINGs; the bulk starts at
+	// the next one, after the pause the first transfer leaves.
+	lead time.Duration
+	// keepalive: a second selector session of the same Peer, also on a,
+	// echoes 256 bytes every 20 ms throughout (about 25 KB/s each way: less
+	// than the load threshold per probe interval).
+	keepalive bool
 }
 
 // guardResult is what a bulk scenario observed.
 type guardResult struct {
 	dialer, passive rendr.MigrationCounts
-	a               rendr.FactoryStatus // the active path's evidence at the end
-	srtt            time.Duration       // the session carrier's smoothed RTT on a in mid-bulk
-	carried         int64               // bulk bytes delivered while the bulk ran
-	throttled       int64               // bytes a's bottleneck paced
+	a               rendr.FactoryStatus   // the active path's evidence at the end
+	srtt            time.Duration         // the session carrier's smoothed RTT on a in mid-bulk
+	carried         int64                 // bulk bytes delivered while the bulk ran
+	throttled       int64                 // bytes a's bottleneck paced
+	onsetLoaded     bool                  // atProbePing: a's sample of the PING the bulk started at was loaded
+	pause           time.Duration         // lead: from the first transfer's last byte to the bulk's start
+	keepalive       rendr.MigrationCounts // the keepalive session's dialer end
+}
+
+// awaitProbePing waits until a's probe carrier committed a PING.
+func awaitProbePing(t *testing.T, a *rendrtest.Link) {
+	t.Helper()
+	for ok := false; !ok; {
+		before := a.Stats().Probe.FramesCaptured
+		select {
+		case <-a.CaptureNextFrame(rendrtest.Up, rendrtest.FramePing):
+		case <-time.After(3 * time.Second):
+			t.Fatal("a's probe carrier sent no PING for 3 s")
+		}
+		synctest.Wait() // the link counts the capture right after handing it over
+		ok = a.Stats().Probe.FramesCaptured > before
+	}
 }
 
 func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
@@ -77,6 +103,17 @@ func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
 		if first.Name != "a" {
 			t.Fatalf("initial active %+v, want a carrier of a", first)
 		}
+		var ka *flow
+		var kc, kp *rendr.Conn
+		echoed := make(chan error, 1)
+		if gb.keepalive {
+			kc, kp = w.open(p, rendr.ModeSelector)
+			if cs := mustActive(t, kc, "keepalive dialer"); cs.Name != "a" {
+				t.Fatalf("keepalive session active %+v, want a carrier of a", cs)
+			}
+			w.goBG(func() { echoed <- echo(kp) })
+			ka = w.startFlow("keepalive", kc, kc, 289, flowOpts{chunk: 256, gap: 20 * time.Millisecond})
+		}
 		// Idle: both paths collect unloaded probe samples. Probing started
 		// at the Dial, so a's probe PINGs fall about every 2 s after it; 7 s
 		// after the Dial is about halfway between two of them.
@@ -86,34 +123,53 @@ func runGuardBulk(t *testing.T, gb guardBulk) guardResult {
 				t.Fatalf("before the bulk: factory %d %+v, want fresh evidence", i, fs)
 			}
 		}
-		if gb.atProbePing {
-			for ok := false; !ok; {
-				before := a.Stats().Probe.FramesCaptured
-				select {
-				case <-a.CaptureNextFrame(rendrtest.Up, rendrtest.FramePing):
-				case <-time.After(3 * time.Second):
-					t.Fatal("a's probe carrier sent no PING for 3 s")
-				}
-				synctest.Wait() // the link counts the capture right after handing it over
-				ok = a.Stats().Probe.FramesCaptured > before
-			}
-		}
 		from, to := dc, pc
 		if gb.download {
 			from, to = pc, dc
 		}
+		var onset rendr.FactoryStatus
+		if gb.atProbePing {
+			if gb.lead > 0 {
+				awaitProbePing(t, a)
+				lead := w.startFlow("lead", from, to, 290, flowOpts{n: int64(gb.rate * gb.lead.Seconds()), keepOpen: true})
+				lead.wait(t, 10*time.Second)
+				leadEnd := time.Now()
+				awaitProbePing(t, a)
+				res.pause = time.Since(leadEnd)
+			} else {
+				awaitProbePing(t, a)
+			}
+			onset = p.Status().Factories[0]
+		}
+		start := time.Now()
 		bulk := w.startFlow("bulk", from, to, 291, flowOpts{})
-		time.Sleep(gb.dur / 2)
+		if gb.atProbePing {
+			// a's next sample is the one of the PING the bulk started at.
+			waitFor(t, time.Second, "a's sample of the PING the bulk started at", func() bool {
+				return p.Status().Factories[0].Samples > onset.Samples
+			})
+			res.onsetLoaded = p.Status().Factories[0].LoadedSamples > onset.LoadedSamples
+		}
+		time.Sleep(time.Until(start.Add(gb.dur / 2)))
 		if cs, ok := carrierByID(dc, first.ID); ok {
 			res.srtt = cs.SRTT
 		}
-		time.Sleep(gb.dur / 2)
+		time.Sleep(time.Until(start.Add(gb.dur)))
 		res.carried = bulk.recvd.Load()
 		bulk.stop()
 		bulk.wait(t, 60*time.Second)
 		res.dialer, res.passive = dc.Status().Migrations, pc.Status().Migrations
 		res.a = p.Status().Factories[0]
 		res.throttled = a.Stats().Throttled
+		if ka != nil {
+			ka.stop()
+			ka.wait(t, 30*time.Second)
+			if err := <-echoed; err != nil {
+				t.Fatal(err)
+			}
+			res.keepalive = kc.Status().Migrations
+			finishSession(t, kc, kp)
+		}
 		finishSession(t, dc, pc)
 		w.finish()
 	})
@@ -134,8 +190,8 @@ func checkGuarded(t *testing.T, gb guardBulk, r guardResult) {
 	if want := int64(0.9 * gb.rate * gb.dur.Seconds()); r.carried < want {
 		t.Fatalf("load: %d bytes in %v, want ≥ %d (90%% of the link rate)", r.carried, gb.dur, want)
 	}
-	if r.dialer.Quality != 0 || r.passive.Quality != 0 || r.dialer.Death+r.dialer.Explicit != 0 {
-		t.Fatalf("migrations dialer %+v, passive %+v: the bulk caused a switch", r.dialer, r.passive)
+	if r.dialer.Quality != 0 || r.passive.Quality != 0 || r.dialer.Death+r.dialer.Explicit != 0 || r.keepalive != (rendr.MigrationCounts{}) {
+		t.Fatalf("migrations dialer %+v, passive %+v, keepalive session %+v: the bulk caused a switch", r.dialer, r.passive, r.keepalive)
 	}
 	if r.a.LoadedSamples == 0 {
 		t.Fatalf("a's probe evidence %+v: no sample was tagged loaded", r.a)
@@ -154,10 +210,8 @@ func checkGuarded(t *testing.T, gb guardBulk, r guardResult) {
 // capacity sits at its 128 KiB floor, so the reverse bound rxRate × srtt
 // alone hovered around the load threshold while the passive was saturated;
 // a peer that reports BUSY now counts at least the capacity floor (design
-// §0.13 A5). The start phase of both cases (halfway between two of a's
-// probe PINGs) is the favourable one: a download that starts right after a
-// probe PING commit still switches (the rendr_findings test
-// TestDownloadGuardEdges_L29, recorded as open in §0.13).
+// §0.13 A5). Both cases start halfway between two of a's probe PINGs; a
+// download that starts right at a probe PING is TestDownloadGuardEdges_L29.
 func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 	t.Run("guarded", func(t *testing.T) {
 		gb := guardBulk{download: true, rate: guardRate(), dur: 60 * time.Second}
@@ -178,6 +232,88 @@ func TestBulkDownloadNoQualitySwitch_L29(t *testing.T) {
 			t.Fatalf("control: %d samples tagged loaded with the guard disabled", r.a.LoadedSamples)
 		}
 	})
+}
+
+// TestDownloadGuardEdges_L29: downloads in the shape of
+// TestBulkDownloadNoQualitySwitch_L29 that start right at one of a's probe
+// PINGs (design §0.13 A7a, §8.2 volume rule). The PING's PONG enters the
+// down bottleneck one one-way delay after the commit, behind the rest of
+// the passive's first burst (its capacity: the 128 KiB floor after an idle
+// phase), and waits for it to drain: about 52 ms at 2 MiB/s, so the sample
+// measures about 72 ms against a base of 20 ms. When the PONG arrives the
+// gauge still holds nothing — no forward bytes in flight (a download), a
+// reverse bound of 0 (rxRate is refreshed only when the dialer's own
+// session carrier receives a PONG, behind the same burst) and no backlog
+// (the passive's first BUSY PING is still on its way) — so the
+// instantaneous rule took the sample as unloaded; with only the few
+// unloaded samples of the idle phase in a's window it lifted a's mean
+// enough for b (20 ms) to qualify, and the switch followed one dwell
+// later. The volume rule tags it loaded: the burst itself crossed a's
+// session carrier during the flight. Every subtest requires that sample to
+// be loaded and no switch; on the code before the volume rule each fails
+// with one quality switch on each end (L60: the stimulus is real). The
+// guard-disabled control of TestBulkDownloadNoQualitySwitch_L29 disables
+// the volume rule too (it shares LoadThreshold).
+//
+//   - start-at-probe-ping: the download starts after the idle phase.
+//   - restart-at-probe-ping: a first transfer of 1.75 s at the link rate
+//     starts at one probe PING and the download restarts at the next one,
+//     after a pause of about 0.24 s: the first transfer dominates the
+//     interval before the commit, but nothing moved after its backlog
+//     ended, so the volume rule does not take the traffic for established
+//     application-limited flow (the restart's capacity, grown during the
+//     first transfer, queues about 512 KiB ahead of the PONG).
+//   - restart-short-pause: the same with a first transfer of 1.97 s, which
+//     leaves a pause of about 17 ms: shorter than LoadThreshold takes at the
+//     link rate (31 ms at 2 MiB/s, 62 ms at 1 MiB/s), so the silence before
+//     the commit does not reveal the restart, and long enough for the first
+//     transfer's backlog report to have cleared, so the instantaneous rule
+//     does not either. A volume rule that only asked whether the interval's
+//     rate fills a flight without a silence misses it.
+//   - restart-with-keepalives: a first transfer of 1.5 s, while a second
+//     session of the same Peer echoes 256 bytes every 20 ms on a throughout:
+//     the carriers are never silent for long, but less than LoadThreshold
+//     moved after the first transfer's backlog ended, so the traffic is not
+//     established. A rule that estimated that volume from the interval's
+//     rate took it for established and switched.
+//
+// The window exists only while the first capacity drains slower than about
+// one one-way delay (128 KiB per 10 ms, about 12.8 MB/s at a 20 ms RTT): at
+// G1-sel's 200 Mbit/s the first sample measures 20.0 ms.
+func TestDownloadGuardEdges_L29(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lead      time.Duration
+		keepalive bool
+	}{
+		{"start-at-probe-ping", 0, false},
+		{"restart-at-probe-ping", 1750 * time.Millisecond, false},
+		{"restart-short-pause", 1970 * time.Millisecond, false},
+		{"restart-with-keepalives", 1500 * time.Millisecond, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gb := guardBulk{download: true, rate: guardRate(), dur: 30 * time.Second, atProbePing: true, lead: tc.lead, keepalive: tc.keepalive}
+			r := runGuardBulk(t, gb)
+			if tc.lead > 0 {
+				t.Logf("pause between the transfers %v", r.pause)
+				if r.pause <= 0 || r.pause >= time.Second {
+					t.Fatalf("stimulus: pause %v between the transfers, want a fraction of the 2 s probe interval", r.pause)
+				}
+			}
+			// The short pause must stay where only the volume moved since the
+			// backlog ended reveals the restart: after the first transfer's
+			// backlog report cleared (it had not at 8 ms at 2 MiB/s, nor at
+			// 2 ms at 1 MiB/s) and shorter than LoadThreshold takes at the
+			// link rate.
+			if short := time.Duration(float64(64*kib) / gb.rate * float64(time.Second)); tc.name == "restart-short-pause" && (r.pause < 12*time.Millisecond || r.pause >= short) {
+				t.Fatalf("stimulus: pause %v, want at least 12 ms and less than %v", r.pause, short)
+			}
+			checkGuarded(t, gb, r)
+			if !r.onsetLoaded {
+				t.Fatalf("a's sample of the PING the download started at was unloaded: %+v", r.a)
+			}
+		})
+	}
 }
 
 // TestBulkUploadNoQualitySwitch_L29: the mirrored case (§8.3 "upload bulk
@@ -241,6 +377,80 @@ func TestAppLimitedDegradationSwitches_L29(t *testing.T) {
 		p1 := p.Status().Factories[0]
 		if p1.LoadedSamples != 0 {
 			t.Fatalf("p1 %+v: the application-limited echo was taken for self-load", p1)
+		}
+		wantMigrations(t, "dialer", dc, rendr.MigrationCounts{Quality: 1})
+		waitFor(t, time.Second, "the passive counting the quality switch", func() bool {
+			return pc.Status().Migrations == rendr.MigrationCounts{Quality: 1}
+		})
+		finishSession(t, dc, pc)
+		w.finish()
+	})
+}
+
+// TestAppLimitedAboveCapFloorSwitches_L29: the application-limited case of
+// §8.1 item 2 with a flow whose in-flight outgrows its capacity once the
+// path degrades (the volume rule's backlog clause, design §0.13 A7a). The
+// dialer echoes 1 MiB/s in 64 KiB writes through the passive over a (5 ms
+// one way; b: 15 ms), both 50 Mbit/s, default timings; after 20 s a
+// degrades to 150 ms one way. About 300 KiB is then unproven in flight
+// each way, more than the capacity a carrier derives from its 10 ms
+// minimum RTT, so the writers wait at their caps now and then: the
+// carriers cycle through backlog episodes and the samples committed in one
+// are loaded. The first sample after the degradation, committed about
+// 0.2 s after an episode ended, carries about 0.7 MiB in its flight but is
+// unloaded — the flow moved far more than LoadThreshold since that episode
+// ended — and with a's earlier samples at about 28 ms (they wait behind the
+// echo's 64 KiB writes at the 50 Mbit/s bottleneck) it lets b (30 ms)
+// qualify: the selector switches within Dwell + 2·Probe.Interval + the
+// degraded RTT of the degradation (plan §3.9's bound), as without the
+// volume rule. A backlog clause that loaded every sample committed within
+// one flight of the end of an episode switched in 8 of 20 runs within 20 s,
+// none within 9 s.
+func TestAppLimitedAboveCapFloorSwitches_L29(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const linkRate = 50e6 / 8
+		w := newWorld(t, worldConfig{
+			links: []linkSpec{{name: "a", delay: 5 * time.Millisecond, rate: linkRate}, {name: "b", delay: 15 * time.Millisecond, rate: linkRate}},
+		})
+		p := w.peer()
+		dc, pc := w.open(p, rendr.ModeSelector)
+		if cs := mustActive(t, dc, "dialer"); cs.Name != "a" {
+			t.Fatalf("initial active %+v, want a", cs)
+		}
+		echoed := make(chan error, 1)
+		w.goBG(func() { echoed <- echo(pc) })
+		const rate, chunk = mib, 64 * kib
+		start := time.Now()
+		f := w.startFlow("echo", dc, dc, 294, flowOpts{chunk: chunk, gap: time.Duration(float64(time.Second) * chunk / rate)})
+		time.Sleep(20 * time.Second)
+		before := p.Status().Factories[0]
+		if before.Evidence != rendr.EvidenceFresh || before.LoadedSamples != 0 {
+			t.Fatalf("before the degradation: a %+v, want fresh unloaded evidence", before)
+		}
+		mark := w.dev.mark()
+		degraded := time.Now()
+		w.link("a").SetDelay(150*time.Millisecond, 0)
+		bound := 3*time.Second + 2*2*time.Second + 300*time.Millisecond // Dwell + 2·Probe.Interval + RTT
+		ev := w.dev.wait(t, mark, bound, "the quality switch off the degraded a", isKind(rendr.EventMigration, dc.ID()))
+		if cs := mustActive(t, dc, "dialer"); ev.Cause != rendr.CauseQuality || cs.Name != "b" || ev.To != cs.ID {
+			t.Fatalf("migration %+v, active %+v; want a quality switch to b", ev, cs)
+		}
+		t.Logf("switched to b %v after the degradation", ev.Time.Sub(degraded))
+		time.Sleep(time.Second)
+		after := p.Status().Factories[0]
+		f.stop()
+		f.wait(t, 30*time.Second)
+		if err := <-echoed; err != nil {
+			t.Fatal(err)
+		}
+		if want := int64(0.9 * rate * time.Since(start).Seconds()); f.recvd.Load() < want {
+			t.Fatalf("load: %d bytes echoed in %v, want ≥ %d", f.recvd.Load(), time.Since(start), want)
+		}
+		if s := w.link("a").Stats().Session; s.MaxDelay < 150*time.Millisecond {
+			t.Fatalf("stimulus: no session carrier on a was delayed 150 ms: %+v", s)
+		}
+		if after.LoadedSamples == 0 {
+			t.Fatalf("stimulus: a %+v: no backlog episode loaded a sample after the degradation", after)
 		}
 		wantMigrations(t, "dialer", dc, rendr.MigrationCounts{Quality: 1})
 		waitFor(t, time.Second, "the passive counting the quality switch", func() bool {

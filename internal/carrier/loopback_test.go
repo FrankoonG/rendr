@@ -146,8 +146,11 @@ func (e *allocEP) WriteBlocked(*Conn)                       {}
 // and 256 KiB of DATA — allocates nothing. Reader: one group of frames — a
 // 64 KiB DATA read straight into a pooled Buf and handed over by reference,
 // a 1000-byte DATA, a PING and a PONG matching a committed PING record —
-// allocates nothing. The counts are asserted in the non-race lane only (the
-// race detector instruments allocations and makes sync.Pool drop items).
+// allocates nothing. Both carriers feed a self-load gauge as a dialer
+// session carrier of a multi-factory Peer does (§8.2: in-flight, backlog and
+// the volume counters of every batch and DATA frame). The counts are
+// asserted in the non-race lane only (the race detector instruments
+// allocations and makes sync.Pool drop items).
 // The §11.4 name TestSteadyStateZeroAllocs_L41_L54 is left to the
 // end-to-end gate (session Write → Read over lanes on real carriers), so
 // the name-based coverage gate (W17) cannot pass on a half.
@@ -168,6 +171,8 @@ func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 		ep := &allocEP{chunk: env.Bufs.Get(ChunkSize, nil)}
 		defer ep.chunk.Release()
 		c.ep = ep
+		g := NewGauge()
+		c.opts.Gauge, c.st.gauge = g, g
 		c.writerInit()
 		round := func() {
 			// Every round also carries a PING (requested, the records of
@@ -189,11 +194,14 @@ func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 			round()
 		}
 		allocs := testing.AllocsPerRun(100, round)
-		frames := c.Stats().Frames
+		st := c.Stats()
 		c.Kill(CauseLocalClose, "test end")
 		<-c.Done()
-		if frames < 121*7 || c.wr.vectored < 121 {
-			t.Fatalf("%d frames in %d vectored writes, want 7 per round", frames, c.wr.vectored)
+		if st.Frames < 121*7 || c.wr.vectored < 121 {
+			t.Fatalf("%d frames in %d vectored writes, want 7 per round", st.Frames, c.wr.vectored)
+		}
+		if tx := g.read(0).tx; tx != st.TxBytes || tx < 121*256<<10 {
+			t.Fatalf("gauge counted %d DATA bytes written, carrier %d", tx, st.TxBytes)
 		}
 		if carrierRace {
 			t.Logf("race lane: %v allocations per round (not asserted)", allocs)
@@ -210,6 +218,8 @@ func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 		c := hConn(env, NewOwnedTCP(cl))
 		ep := &allocEP{}
 		c.ep = ep
+		g := NewGauge()
+		c.opts.Gauge, c.st.gauge = g, g
 		c.rd.stage = env.Bufs.Get(BigData, env.Budget)
 		const groups = 20 + 1 + 100
 		var stream []byte
@@ -254,6 +264,9 @@ func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 		c.mu.Unlock()
 		if ep.rx.big != groups || ep.rx.small != groups || records != 0 || !sampled || c.Stats().RxBytes != off {
 			t.Fatalf("delivered %d big and %d small payloads (%d bytes), %d PING records left (RTT sampled %v)", ep.rx.big, ep.rx.small, c.Stats().RxBytes, records, sampled)
+		}
+		if rx := g.read(0).rx; rx != off {
+			t.Fatalf("gauge counted %d DATA bytes received, want %d", rx, off)
 		}
 		c.rd.stage.Release()
 		c.Kill(CauseLocalClose, "test end")
