@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -67,21 +68,35 @@ func g9Opens(l *rendrtest.Link) int {
 	return n
 }
 
+// g9States maps the carriers listed in st, dead ones included, to their
+// states.
+func g9States(st SessionStatus) map[CarrierID]CarrierState {
+	m := make(map[CarrierID]CarrierState, len(st.Carriers))
+	for _, c := range st.Carriers {
+		m[c.ID] = c.State
+	}
+	return m
+}
+
 // TestRepeatedOpenBeforeCapacity_L47_L48: a repeated OPEN of a session
-// that exists is routed to that session before any capacity check (design
-// §6.2, plan §3.5, §5; L47: an OPEN is idempotent; L48), so it is never
-// answered CAPACITY while the passive's backlog is full or its MaxSessions
-// are reached — conditions that a new session's OPEN is refused for at the
-// same moment (the stimulus). A repeated OPEN of a pending session is
+// that exists is routed to that session before the admission's MaxSessions
+// and backlog checks (design §6.2, plan §3.5, §5; L47: an OPEN is
+// idempotent; L48), so it is never answered CAPACITY for a full backlog or
+// for reached MaxSessions — conditions that a new session's OPEN is refused
+// for at the same moment (the stimulus). (The session's own verdict still
+// applies: at its MaxCarriersPerSession it answers CAPACITY(CodeCarriers),
+// which these cases do not reach.) A repeated OPEN of a pending session is
 // parked: it gets no answer until the application's verdict, then
 // OPEN_ACK(OK) together with the first carrier; one session is accepted.
 // A repeated OPEN of an open session is adopted at once with OPEN_ACK(OK).
-// Either way the session then holds both carriers, and the repeated OPEN
-// took no backlog slot and no MaxSessions unit. The last case is a real
-// Dial over two factories whose second candidate OPENs one JoinStagger
-// after the first while the session is still pending and holds the
-// passive's only backlog slot and only MaxSessions unit: the Dial succeeds
-// with both carriers as bond members on each end, and data crosses.
+// Either way the session then holds both carriers attached — the first
+// OPEN carrier active, the repeated one a live non-active member (selector)
+// — and the repeated OPEN took no backlog slot and no MaxSessions unit.
+// The last case is a real Dial over two factories whose second candidate
+// OPENs one JoinStagger after the first while the session is still pending
+// and holds the passive's only backlog slot and only MaxSessions unit: the
+// Dial succeeds with both OPEN carriers as bond members on each end, and
+// data crosses.
 func TestRepeatedOpenBeforeCapacity_L47_L48(t *testing.T) {
 	cases := []struct {
 		name string
@@ -195,8 +210,9 @@ func TestRepeatedOpenBeforeCapacity_L47_L48(t *testing.T) {
 					pending, live = 0, 1
 				}
 				synctest.Wait()
-				if n := len(liveCarriers(sc.Status())); n != 2 {
-					t.Fatalf("the session holds %d live carriers, want both OPEN carriers: %+v", n, sc.Status().Carriers)
+				want := map[CarrierID]CarrierState{CarrierID(first.id): CarrierActive, CarrierID(second.id): CarrierMember}
+				if st := sc.Status(); !maps.Equal(g9States(st), want) {
+					t.Fatalf("the session holds %+v, want both OPEN carriers attached: %v", st.Carriers, want)
 				}
 				if other != nil {
 					pending = 1 // the other session is still waiting for its verdict
@@ -263,10 +279,16 @@ func TestRepeatedOpenBeforeCapacity_L47_L48(t *testing.T) {
 			}
 			dc := r.c
 			time.Sleep(100 * time.Millisecond) // the second member's OPEN_ACK(OK) arrives
-			for _, c := range []*Conn{dc, sc} {
-				st := c.Status()
-				if live := liveCarriers(st); len(live) != 2 {
-					t.Fatalf("%v holds %d live carriers, want both OPEN carriers: %+v", st.Role, len(live), st.Carriers)
+			// Both ends list the same two carriers, one per factory, both bond
+			// members: neither is left joining.
+			dst, pst := dc.Status(), sc.Status()
+			if cs := dst.Carriers; len(cs) != 2 || cs[0].ID == cs[1].ID || cs[0].Name == cs[1].Name {
+				t.Fatalf("dialer carriers %+v, want one per factory", cs)
+			}
+			want := map[CarrierID]CarrierState{dst.Carriers[0].ID: CarrierMember, dst.Carriers[1].ID: CarrierMember}
+			for _, st := range []SessionStatus{dst, pst} {
+				if !maps.Equal(g9States(st), want) {
+					t.Fatalf("%v holds %+v, want both OPEN carriers as bond members: %v", st.Role, st.Carriers, want)
 				}
 			}
 			e2eExchange(t, dc, sc, 1<<20, 10)

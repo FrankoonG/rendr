@@ -67,7 +67,11 @@ func g9DialAcrossClose(t *testing.T, cancelled bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	res := e2eDialAsync(ctx, peer, DialOptions{})
-	<-paused
+	select {
+	case <-paused:
+	case r := <-res:
+		t.Fatalf("stimulus: the Dial returned (%v, %v) without reaching Hooks.DialBegin", r.c, r.err)
+	}
 	if n := rt.table.inUse(); n != 1 {
 		t.Fatalf("stimulus: %d MaxSessions units while the Dial is held, want its placeholder's", n)
 	}
@@ -111,12 +115,13 @@ func g9DialAcrossClose(t *testing.T, cancelled bool) {
 type g9HelloConn struct {
 	net.Conn
 	atGate   chan struct{} // closed when ReadHello's SetDeadline(zero) arrived
-	gate     chan struct{} // closed by the test: that call proceeds
+	gate     chan struct{} // closed by openGate: that call proceeds
 	release  chan struct{} // closed by free: the hanging call returns
 	helloed  atomic.Bool   // ReadHello's SetDeadline(zero) returned
 	hang     atomic.Bool   // the one hanging call was taken
 	hanging  atomic.Int32  // calls hanging now
 	closes   atomic.Int32  // Close calls (the embedder's Close; L51: once)
+	gateOnce sync.Once
 	freeOnce sync.Once
 }
 
@@ -146,9 +151,17 @@ func (c *g9HelloConn) Close() error {
 	return c.Conn.Close()
 }
 
-// free returns the hanging call (idempotent; also a cleanup, so that a
-// failed test still ends its bubble).
-func (c *g9HelloConn) free() { c.freeOnce.Do(func() { close(c.release) }) }
+// openGate lets ReadHello's held SetDeadline(zero) proceed (idempotent).
+func (c *g9HelloConn) openGate() { c.gateOnce.Do(func() { close(c.gate) }) }
+
+// free opens the gate and returns the hanging call (idempotent). It is also
+// a cleanup, so that a test that failed anywhere — before it opened the
+// gate included — still ends its bubble: the held ReadHello proceeds, and
+// the call that would hang after it returns at once.
+func (c *g9HelloConn) free() {
+	c.openGate()
+	c.freeOnce.Do(func() { close(c.release) })
+}
 
 // TestHelloOutlivingSlotJoinedByClose_L52 (design §6.1, §6.8 step 7; L52):
 // a handshake whose slot is taken while ReadHello is still in its last
@@ -183,7 +196,11 @@ func TestHelloOutlivingSlotJoinedByClose_L52(t *testing.T) {
 				t.Cleanup(d.close)
 				d.hello(rt)
 				d.send(wire.TypeOpen, 0, wpOpen(wpSID(1), wire.KindStream, 1, nil))
-				<-hc.atGate
+				select {
+				case <-hc.atGate:
+				case <-time.After(time.Minute):
+					t.Fatal("stimulus: ReadHello never cleared its deadline after it read the OPEN")
+				}
 				synctest.Wait()
 
 				closed := make(chan struct{})
@@ -208,7 +225,7 @@ func TestHelloOutlivingSlotJoinedByClose_L52(t *testing.T) {
 					t.Fatal("Runtime.Close returned while a handshake was inside ReadHello")
 				default:
 				}
-				close(hc.gate) // ReadHello returns its Hello; the handshake finds its slot gone
+				hc.openGate() // ReadHello returns its Hello; the handshake finds its slot gone
 				synctest.Wait()
 				if n := hc.hanging.Load(); n != 1 {
 					t.Fatalf("stimulus: %d calls hang in SetDeadline, want the discarded carrier's closer", n)
@@ -278,7 +295,11 @@ func TestAcceptSkipsWithdrawnQueued_L50(t *testing.T) {
 		w.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
 		drained := make(chan []wire.Type, 1)
 		go func() { drained <- w.drain() }()
-		<-entered
+		select {
+		case <-entered:
+		case <-time.After(time.Minute):
+			t.Fatal("stimulus: the withdrawn session's Registry.Ended never reached Hooks.LeavePending")
+		}
 		synctest.Wait()
 
 		// Stimulus: the withdrawn session ended but is still queued at the
