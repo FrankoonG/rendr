@@ -18,6 +18,13 @@ import (
 // lrLinkPair is ltLinkPair with a link buffer of buf bytes per direction.
 func lrLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint) (dialer, passive *Conn) {
 	t.Helper()
+	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil)
+}
+
+// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap (nil:
+// none).
+func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap func(net.Conn) net.Conn) (dialer, passive *Conn) {
+	t.Helper()
 	pass := make(chan *Conn, 1)
 	link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "wan", Buffer: buf, Accept: func(nc net.Conn) error {
 		h, err := ReadHello(envP, nc, time.Now().Add(10*time.Second), 4096, nil)
@@ -39,7 +46,17 @@ func lrLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration
 		}
 		link.Close()
 	})
-	est, err := Establish(context.Background(), envD, Factory{Name: "wan", Dial: link.Dial}, envD.IDs.Next(), wire.TypeOpen, openPayload(0), nil)
+	dial := link.Dial
+	if wrap != nil {
+		dial = func(ctx context.Context) (net.Conn, error) {
+			nc, err := link.Dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return wrap(nc), nil
+		}
+	}
+	est, err := Establish(context.Background(), envD, Factory{Name: "wan", Dial: dial}, envD.IDs.Next(), wire.TypeOpen, openPayload(0), nil)
 	if err != nil {
 		t.Fatalf("Establish: %v", err)
 	}
@@ -83,9 +100,10 @@ func (d *lrDuplex) Fill(c *Conn, b *Batch) {
 // link, one way or both ways at once, the estimate must reach the link rate
 // without exceeding it by more than the sampling slack, and the capacity
 // the matching cap. Every byte arrives intact and in order. (Throughput on
-// a rate-limited path stays below the link rate by the capacity cycle —
-// a cap-blocked writer's proof is its cap-hit PING, queued behind the whole
-// burst — which design §0.13 A1 records; the floor this fixes is far below.)
+// a rate-limited path is judged by TestByteClockFillsLongPath_L15_L32: the
+// capacity cycle design §0.13 A1 records — a cap-blocked writer's proof was
+// its cap-hit PING, queued behind the whole burst — is what byte-clocked
+// PINGs remove; the floor this fixes is far below either.)
 func TestCapLimitedFlowLongRTT_L15_L32(t *testing.T) {
 	for _, tc := range []struct {
 		rtt    time.Duration
