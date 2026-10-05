@@ -367,6 +367,9 @@ func splice(t *testing.T, offset bool) {
 	}
 	ly.InjectRaw(rendrtest.Up, raw)
 	waitFor(t, 5*time.Second, "the splice into Y's carrier", func() bool { return ly.Stats().Session.FramesInjected > 0 })
+	// The link counts a capture right after handing it over (design §0.14
+	// B9): the lockstep splice can reach this point first.
+	waitFor(t, 5*time.Second, "X's link counting the capture as a session frame", func() bool { return lx.Stats().Session.FramesCaptured == 1 })
 	if c, i := lx.Stats().Session.FramesCaptured, ly.Stats().Session.FramesInjected; c != 1 || i != 1 {
 		t.Fatalf("captured %d on X, injected %d into Y; want 1 and 1 (stimulus)", c, i)
 	}

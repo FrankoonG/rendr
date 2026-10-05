@@ -228,7 +228,15 @@ func TestInvalidWriteCounts_L42(t *testing.T) {
 // once the write completed, whichever runs first: a callback that fires
 // while the write is blocked, one that runs after the write completed, and
 // a late one of an earlier write running after a newer write was armed.
-// Then the real writer with writes returning exactly at PingBusy.
+// Then the real writer with writes returning exactly at PingBusy. Then
+// stage 2 (design §0.14 B15): a write that returns exactly at the end of
+// its stall window races stage 2's callback, already started (Stop cannot
+// stop it); the carrier stays alive in both orders in which the callback
+// checks after the write returned: at once, where the generation check
+// sees the write completed, and only after the next write was armed, where
+// the due-time check sees that the newer write's window is not due yet.
+// The control order, the check while the write is still in progress, is a
+// stall and kills at exactly the window (L24).
 func TestWatchdogRacesWriteCompletion_L08(t *testing.T) {
 	t.Run("forced orders", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -335,6 +343,83 @@ func TestWatchdogRacesWriteCompletion_L08(t *testing.T) {
 			p.close()
 			src.chunk.Release()
 		})
+	})
+	t.Run("writes return at the stall window", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			order int    // 0: the check after the return; 1: after the next write was armed; 2: before the return
+			fault string // orders 0 and 1: what a kill means (the check that should have spared the carrier)
+		}{
+			{"check after the return", 0, "stage 2 acted on a completed generation"},
+			{"check after the next write was armed", 1, "stage 2 acted on the newer write before its stall window was due (a late callback of the earlier write)"},
+			{"control check before the return", 2, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					env := hEnv()
+					a, b := net.Pipe()
+					defer a.Close()
+					defer b.Close()
+					c := hConn(env, a)
+					ep := &hEP{}
+					c.ep = ep
+					c.writerInit()
+					// Stage 2's timer starts its callback at the end of the
+					// stall window as the writer's does, but the callback's
+					// check waits until the test lets it run, so the test
+					// orders it against the write's return at that instant.
+					started, check := make(chan struct{}), make(chan struct{})
+					c.wd2.Stop()
+					c.wd2 = time.AfterFunc(time.Hour, func() {
+						started <- struct{}{}
+						<-check
+						c.watchStage2()
+					})
+					c.wd2.Stop()
+					stall := c.tm.WriteStall
+					gen := c.wstate.Load() >> 1
+					start := time.Now()
+					c.armWatchdog(gen, start, stall) // write g starts
+					<-started
+					if d := time.Since(start); d != stall || !c.WriteBlocked() || ep.blocked.Load() != 1 {
+						t.Fatalf("stage 2 started after %v (blocked %v, %d reports); want it at the stall window %v with the write reported blocked once (stimulus)",
+							d, c.WriteBlocked(), ep.blocked.Load(), stall)
+					}
+					switch tc.order {
+					case 0:
+						c.disarmWatchdog(gen) // write g returns
+						close(check)
+					case 1:
+						c.disarmWatchdog(gen)                   // write g returns
+						c.armWatchdog(gen+1, time.Now(), stall) // write g+1 starts
+						close(check)
+						synctest.Wait()
+						time.Sleep(time.Millisecond)
+						c.disarmWatchdog(gen + 1) // write g+1 returns inside its window
+					case 2:
+						close(check)
+						synctest.Wait()
+						c.disarmWatchdog(gen) // the write returns after the kill
+					}
+					synctest.Wait()
+					time.Sleep(2 * stall) // nothing else is due
+					synctest.Wait()
+					dead, cause, _, at := c.Death()
+					if tc.order == 2 {
+						if !dead || cause != CauseWriteStall || at.Sub(start) != stall {
+							t.Fatalf("stage 2 checked while the write was in progress: death %v %v after %v, want write_stall at %v", dead, cause, at.Sub(start), stall)
+						}
+					} else if dead {
+						t.Fatalf("a write that returned exactly at the end of its stall window killed the carrier (%v): %s", cause, tc.fault)
+					}
+					if c.WriteBlocked() || ep.blocked.Load() != 1 {
+						t.Fatalf("after the write returned: flag %v, %d reports; want the flag clear and 1 report", c.WriteBlocked(), ep.blocked.Load())
+					}
+					c.Kill(CauseLocalClose, "test end")
+					hWait(t, c)
+				})
+			})
+		}
 	})
 }
 

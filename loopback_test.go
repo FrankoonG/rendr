@@ -24,7 +24,12 @@ import (
 // for byte; it can reset all the connections it carries (SO_LINGER 0, so
 // each rendr end sees a TCP RST), and it reports every connection that
 // ended in an error other than its own reset — a TCP RST sent by a rendr
-// end (ECONNRESET on Linux, WSAECONNRESET on Windows) included.
+// end (ECONNRESET on Linux, WSAECONNRESET on Windows) included. Every test
+// of the group is a leak oracle (L52, L66; design §0.14 B11): it takes
+// rendrtest.AssertNoLeak's baseline first and runs its check once both
+// Runtimes, their listeners and the relay are closed, so a goroutine (or,
+// on Linux, an fd) that a carrier, a session or a Runtime left behind
+// fails the test.
 
 // relay is a TCP forwarder between a dialer and a passive listener.
 type relay struct {
@@ -263,12 +268,17 @@ func (lp *loopPair) open(t testing.TB) (dc, pc *rendr.Conn) {
 	return r.c, pc
 }
 
-// close closes both Runtimes and requires that nothing is left: no session,
-// no buffered byte (R7), nothing abandoned.
+// close closes both Runtimes (each closes its Listeners and their
+// net.Listeners) and the relay, joining its goroutines, and requires that
+// nothing is left: no session, no buffered byte (R7), nothing abandoned.
+// The test's leak check runs after it (design §0.14 B11).
 func (lp *loopPair) close(t testing.TB) {
 	t.Helper()
 	lp.d.Close()
 	lp.p.Close()
+	if lp.relay != nil {
+		lp.relay.close()
+	}
 	for _, rt := range []*rendr.Runtime{lp.d, lp.p} {
 		st := rt.Status()
 		sc := st.Sessions
@@ -276,6 +286,22 @@ func (lp *loopPair) close(t testing.TB) {
 			t.Fatalf("Runtime %v after Close: %+v", rt.InstanceID(), st)
 		}
 	}
+}
+
+// g10Migrated polls (real time, at most within) until the dialer conn c
+// counted at least deaths death migrations and r forwarded at least conns
+// connections, and reports whether it did. A dialer selector counts the
+// death migration of its lost active carrier when the race winner, the
+// redialed carrier, is published (design §7.6), after the death itself.
+func g10Migrated(c *rendr.Conn, r *relay, deaths uint64, conns int64, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for c.Status().Migrations.Death < deaths || r.conns.Load() < conns {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // waitEnded polls (real time) until c's session ended.
@@ -301,8 +327,16 @@ func waitEnded(t testing.TB, c *rendr.Conn, within time.Duration) rendr.SessionS
 // with the passive's data and FIN already written. The dialer's Read
 // returns every byte intact and io.EOF exactly at the end, never an error
 // or an early EOF; each reset is one death migration and one redial
-// (stimulus proof: four resets, four deaths, five carriers).
+// (stimulus proof: four resets, four deaths, five carriers). The selector
+// counts a reset's death migration when the redialed carrier attaches,
+// which can trail the reads: the dialer may have buffered the rest of the
+// data and the FIN before the reset (the default Window is 8 MiB). So each
+// reset waits until the previous one's migration was counted (it must hit
+// the attached carrier that replaced the last one), and the stimulus is
+// read once the fourth was; the session needs that fifth carrier anyway
+// to end. Both waits are bounded.
 func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{})
 	dc, pc := lp.open(t)
 	const total = 16 << 20
@@ -318,11 +352,17 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	v := rendrtest.NewVerifier(2, total)
 	buf := make([]byte, 64<<10)
 	var got int64
+	var done uint64 // resets made
 	for {
 		if len(marks) > 0 && got >= marks[0] {
+			if !g10Migrated(dc, lp.relay, done, int64(done)+1, 10*time.Second) {
+				t.Fatalf("reset %d at %d bytes: the death migration of the previous reset is not counted after 10s (%d relayed connections): %+v",
+					done+1, got, lp.relay.conns.Load(), dc.Status())
+			}
 			if n := lp.relay.reset(); n < 1 {
 				t.Fatalf("reset no connection at %d bytes", got)
 			}
+			done++
 			marks = marks[1:]
 		}
 		n, err := dc.Read(buf)
@@ -343,6 +383,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	if err := <-sent; err != nil {
 		t.Fatalf("passive send: %v", err)
 	}
+	g10Migrated(dc, lp.relay, 4, 5, 10*time.Second) // the fifth carrier attached: the fourth death counted
 	st := dc.Status()
 	if lp.relay.resets.Load() < 4 || st.Migrations.Death < 4 || st.NoPathEpisodes < 4 || lp.relay.conns.Load() < 5 {
 		t.Fatalf("stimulus: %d resets, %d relayed connections, dialer %+v", lp.relay.resets.Load(), lp.relay.conns.Load(), st)
@@ -353,6 +394,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	waitEnded(t, dc, 30*time.Second)
 	waitEnded(t, pc, 30*time.Second)
 	lp.close(t)
+	check()
 }
 
 // TestLoopbackCloseWithUnreadNoReset_L05: closing never resets a TCP
@@ -364,6 +406,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 // the relay sees every connection end in a FIN on both sides — no TCP RST
 // (ECONNRESET) at all.
 func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{})
 	const rounds, size = 200, 1 << 20
 	msg := make([]byte, size)
@@ -407,6 +450,7 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d", n, c, lp.relay.lastEr.Load(), rounds)
 	}
 	lp.close(t)
+	check()
 }
 
 // onlyWriter hides io.ReaderFrom so that io.Copy uses plain Writes.
@@ -431,6 +475,7 @@ type onlyWriter struct{ io.Writer }
 // Asserted in the non-race lane; the race lane runs a short window and
 // logs the figure.
 func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	cfg := rendr.Config{PingBusy: 10 * time.Millisecond}
 	d, err := rendr.NewRuntime(cfg)
 	if err != nil {
@@ -505,6 +550,7 @@ func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	waitEnded(t, dc, 30*time.Second)
 	waitEnded(t, pc, 30*time.Second)
 	lp.close(t)
+	check()
 }
 
 // countMallocs runs f at least n times and for at least window, with the
