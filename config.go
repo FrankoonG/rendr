@@ -11,8 +11,8 @@ import "time"
 // a negative value selects zero. Configuration is frozen when the Runtime
 // is built; each session also snapshots it at Dial or OPEN.
 //
-// Milestone M2 adds PacketPing and Packet (packet sessions); they are not
-// declared before then.
+// PacketPing and Packet configure packet sessions and datagram carriers
+// (milestone M2).
 type Config struct {
 	NoPathGrace      time.Duration // 15 s; 3 s–300 s; counted from the death of the last carrier
 	RejoinBackoffMax time.Duration // 4 s; 1 s–8 s and ≤ NoPathGrace/2; redial backoff cap, also for repeated refusals
@@ -66,6 +66,12 @@ type Config struct {
 	Handshake   HandshakeLimits
 	Sessionless SessionlessLimits
 
+	// PacketPing (1 s; 0.2 s–10 s and ≤ DeadMin/2) is the PING cadence of
+	// a datagram carrier that moved a datagram within PingIdle, and the
+	// delay of a packet session's accounting frame (plan:188, plan:301).
+	PacketPing time.Duration
+	Packet     PacketPolicy
+
 	// OnEvent, if set, is called with every event on a single worker
 	// goroutine fed by a bounded queue (256); a full queue drops and counts
 	// (Status.EventsDropped; the Seq gap shows the drop); a panic is
@@ -76,6 +82,22 @@ type Config struct {
 	// never called with a rendr lock held and may call any rendr method,
 	// including Close.
 	OnEvent func(Event)
+}
+
+// PacketPolicy configures packet sessions (plan:285–287). A session fixes
+// its values at Dial or OPEN.
+type PacketPolicy struct {
+	// Queue (1 MiB; 64 KiB–64 MiB, and at least MaxPayload + 64) bounds the
+	// datagram bytes queued per direction, and Queue/64 datagrams; a full
+	// queue drops its oldest datagram (WriteTo never blocks).
+	Queue int
+	// MaxAge (100 ms; 10 ms–2 s): a datagram not handed to a carrier within
+	// this is dropped.
+	MaxAge time.Duration
+	// MaxPayload (65,507; 512–65,507) is the largest datagram this side
+	// offers (dialer) or accepts (passive); a session's limit is fixed at
+	// OPEN from it and its carriers' budgets (PacketConn.MaxPayload).
+	MaxPayload int
 }
 
 // SelectorPolicy are the selector's quality-switch parameters. Death

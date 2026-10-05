@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // ID returns the session ID.
@@ -84,6 +85,27 @@ type Status struct {
 	RetransmittedBytes                           uint64
 	Window, PeerWindow                           int64 // advertised receive window; peer right edge − acked
 	Carriers                                     []CarrierStatus
+
+	// M2. Kind is the session kind (wire.KindStream or wire.KindDatagram);
+	// MaxPayload and Packet are set for packet sessions only.
+	Kind       wire.CarrierKind
+	MaxPayload int
+	Packet     *PacketCounters
+}
+
+// PacketCounters count the datagrams of one packet session on this side
+// (field-for-field rendr.PacketCounters; M2-D61).
+type PacketCounters struct {
+	Sent          uint64 // placed on a carrier (seq assigned)
+	Received      uint64 // accepted from carriers (new seqs)
+	Duplicates    uint64 // received again inside the dedup window
+	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
+	DropAge       uint64 // send side: older than Packet.MaxAge before placement while a data lane existed
+	DropTooLarge  uint64 // send side: no live data lane could carry it, or a carrier refused it as too large
+	DropNoPath    uint64 // send side: aged out or discarded while the session had no data lane
+	DropRecvQueue uint64 // receive side: evicted by a full receive queue (the application did not read)
+	DropLate      uint64 // receive side: older than the dedup window
+	PeerReceived  uint64 // the peer's Received, from its PACKs (merged by max)
 }
 
 // CarrierStatus is one lane in a Status (live lanes in attach order, then the

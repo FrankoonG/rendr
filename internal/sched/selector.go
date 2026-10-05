@@ -30,6 +30,22 @@ type Selector struct {
 	seen     [maxFactories]time.Time // factory i's newest unloaded sample at the latest evaluation
 	lastQual time.Time               // last quality switch (valid when hasQual)
 	hasQual  bool                    // D7: no quality switch yet → the first needs no cooldown
+
+	// class is the kind class per factory (M2-D48; zero for every factory
+	// of a stream session). A challenger of a lower class than the active
+	// factory qualifies without Band and Floor (still EvFresh, unloaded,
+	// with dwell and cooldown): a packet session that fell back to a stream
+	// carrier returns to a datagram carrier. A challenger of a higher class
+	// never qualifies. M2 wave 1 applies it in Evaluate.
+	class [maxFactories]uint8
+}
+
+// SetClasses records the kind class of every factory (index i of c is
+// factory i; at most 16). A selector whose classes are all 0 — every stream
+// session, and every session before this call — behaves as in M1.
+func (s *Selector) SetClasses(c []uint8) {
+	s.class = [maxFactories]uint8{}
+	copy(s.class[:], c)
 }
 
 // NewSelector returns a selector with no candidate and no previous quality

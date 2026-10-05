@@ -1,6 +1,9 @@
 package rendr
 
-import "github.com/FrankoonG/rendr/v2/internal/session"
+import (
+	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
+)
 
 // Session and Dial errors. They are the same values the core produces, so
 // errors.Is and errors.As match. Every sentinel below implements net.Error
@@ -45,7 +48,28 @@ var (
 	ErrMetadataTooLarge = session.ErrMetadataTooLarge
 	// ErrIdleTimeout: Config.IdleTimeout expired; the peer gets AbortIdle.
 	ErrIdleTimeout = session.ErrIdleTimeout
+
+	// ErrPacketTooLarge: PacketConn.WriteTo of more than MaxPayload bytes;
+	// nothing is queued and nothing else changes.
+	ErrPacketTooLarge = session.ErrPacketTooLarge
+	// ErrPacketDestinationMismatch: PacketConn.WriteTo to an address other
+	// than nil or the session's RemoteAddr; no method of that address is
+	// called.
+	ErrPacketDestinationMismatch = session.ErrPacketDestinationMismatch
+
+	// ErrDatagramTooLarge is carrier-facing: the conn of a DatagramCarrier
+	// (or of HandlePacket) returns an error matching it from WriteTo for a
+	// datagram it cannot send because of its size (see
+	// DatagramTooLargeError). The carrier then lowers its budget instead of
+	// dying. It never reaches an application.
+	ErrDatagramTooLarge = wire.ErrDatagramTooLarge
 )
+
+// DatagramTooLargeError refuses one datagram because of its size; Max is the
+// largest datagram the conn can send now (0: unknown). errors.Is(err,
+// ErrDatagramTooLarge) holds for it. A carrier whose budget falls below the
+// control floor (300 bytes) is replaced.
+type DatagramTooLargeError = wire.DatagramTooLargeError
 
 // AbortCode is an RST code: why a session was reset. Its underlying type is
 // uint32. Values below 256 are reserved for rendr, which uses 1

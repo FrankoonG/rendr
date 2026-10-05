@@ -21,6 +21,15 @@ type Env struct {
 	Budget  *Budget          // MaxBufferedBytes: the data buffers (send chunks, receive buffers, write scratches)
 	Stages  *Budget          // the reader stages, outside MaxBufferedBytes (stageBudget; nil: Budget)
 	Hooks   *testhooks.Hooks // nil in production
+
+	// DBufs is the datagram buffer pool (classes 2 KiB … 64 KiB, M2-D28):
+	// datagram reader buffers and writer scratches (charged to Stages),
+	// udpflow inbox buffers (charged to Budget). The stream pool Bufs keeps
+	// its M1 classes. Nil until M2 wave 1 builds it in NewRuntime.
+	DBufs *BufPool
+	// Dgram are the Runtime-wide datagram counters behind
+	// rendr.Status.Datagram; nil in component tests.
+	Dgram *DgramStats
 }
 
 // stageBudget returns the account a carrier's reader stage is charged to
@@ -51,6 +60,16 @@ type Timing struct {
 	CapFloor           int64         // capacity floor (128 KiB)
 	BatchBudget        int           // DATA payload bytes per batch (256 KiB)
 	Segment            int           // largest DATA payload a sender puts in one frame (64 KiB)
+
+	// M2: datagram carriers (M2-D16, M2-D23, M2-D24). Zero selects the
+	// default once M2 wave 1 extends withDefaults.
+	PacketPing    time.Duration // PING cadence of a packet-active datagram carrier (1 s)
+	PacketActive  time.Duration // a DGRAM written or read within this keeps a carrier packet-active (PingIdle, 10 s)
+	RelRTOInit    time.Duration // REL and H1 timeout before the first RTT sample (300 ms)
+	RelRTOMin     time.Duration // REL timeout clamp, lower (200 ms)
+	RelRTOMax     time.Duration // REL timeout clamp, upper (2 s)
+	MTUProbeEvery int           // every n-th PacketPing-cadence PING is an MTU probe (10)
+	MTUProbeFails int           // consecutive unanswered probes that kill the carrier (3)
 }
 
 // Defaults for zero Timing fields (plan §4). package rendr always fills
@@ -111,6 +130,7 @@ func (t Timing) withDefaults() Timing {
 type Presets struct {
 	FirstFseq   uint32 // first fseq in each direction (0: derived from the direction's PREFACE or PREFACE_ACK, §0.13 A6)
 	FirstPingID uint32 // first PING id (0 = 1)
+	FirstCseq   uint32 // first REL cseq in each direction of a datagram carrier (0 = wire.FirstCseq; L14)
 }
 
 // firstFseq returns the fseq a Conn starts with before its handshake sets

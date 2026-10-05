@@ -21,6 +21,21 @@ type Status struct {
 	EventsDropped     uint64   // events dropped because the queue was full
 	CallbackPanics    uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
 	ConfigAdjustments []string // "Field: old → new (reason)"; Config first, then "Listen[i].Field: ..."
+
+	Datagram DatagramStatus // FromPacketConn sources and datagram carriers (M2)
+}
+
+// DatagramStatus summarises the raw-UDP sources (FromPacketConn) and the
+// datagram carriers of a Runtime.
+type DatagramStatus struct {
+	Sources    int    // live FromPacketConn sources
+	Flows      int    // live raw-UDP flows, admitting ones included (bounded, see FromPacketConn)
+	Admitting  int    // flows before a positive verdict was written for them (≤ 32 per source IP address)
+	Dropped    uint64 // datagrams and frames dropped: malformed, unknown flow, foreign source, duplicate or out-of-window frames, quota, truncated
+	Truncated  uint64 // of Dropped: truncated or oversize datagrams
+	InboxDrops uint64 // datagrams a full flow inbox dropped
+	ReadErrors uint64 // transient read errors (ICMP class), backed off and ignored
+	Rebinds    uint64 // raw-UDP flows whose reply address moved after a nonce check
 }
 
 // SessionCounts counts sessions of both roles. Open, Pending, Lingering and
@@ -65,6 +80,30 @@ type SessionStatus struct {
 	PeerWindow int64 // peer's right edge minus AckedBytes
 
 	Carriers []CarrierStatus // live carriers in attach order, then the last 8 dead ones
+
+	// Packet sessions (Kind KindPacket): MaxPayload is fixed at OPEN;
+	// TxBytes, RxBytes and DeliveredBytes count datagram payload bytes
+	// accepted by WriteTo, accepted from carriers and returned by ReadFrom;
+	// AckedBytes, RetransmittedBytes, Window and PeerWindow are 0.
+	MaxPayload int
+	Packet     *PacketCounters // nil for stream sessions
+}
+
+// PacketCounters count the datagrams of one packet session on this side.
+// The send-side drops and Sent add up to what WriteTo accepted; a datagram
+// that was sent and not received was lost with a carrier, dropped by the
+// network, or counted in the peer's receive-side drops.
+type PacketCounters struct {
+	Sent          uint64 // handed to a carrier
+	Received      uint64 // accepted from carriers (distinct)
+	Duplicates    uint64 // received again inside the dedup window
+	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
+	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge while one existed
+	DropTooLarge  uint64 // send side: no live carrier could carry it, or a carrier refused it as too large
+	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
+	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)
+	DropLate      uint64 // receive side: older than the dedup window
+	PeerReceived  uint64 // the peer's Received, as last reported by its accounting frames
 }
 
 // MigrationCounts counts migrations by cause. Selector: a change
@@ -99,4 +138,10 @@ type CarrierStatus struct {
 
 	DeathCause  Cause
 	DeathDetail string
+
+	// Datagram carriers (zero on stream carriers).
+	MTU         int    // current frame budget: bytes of rendr frames per datagram
+	Dropped     uint64 // datagrams and frames this carrier dropped (truncated, malformed, duplicate, out of window, foreign)
+	Retransmits uint64 // reliable control retransmissions (first datagram included)
+	Rebinds     uint64 // reply-address moves (passive raw-UDP flows)
 }

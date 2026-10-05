@@ -54,6 +54,22 @@ type Endpoint interface {
 	WriteBlocked(c *Conn)
 }
 
+// PacketEndpoint is the Endpoint of a packet session's lane (M2-D2). The
+// carrier asserts it once at Start: a stream session's Endpoint does not
+// implement it, and a DGRAM frame delivered to it is a violation of the
+// delivering carrier. Packet session control (PACK, FIN, RST, SCHED)
+// arrives through Control.
+type PacketEndpoint interface {
+	Endpoint
+	// Datagram delivers one CRC-verified DGRAM frame carrying session seq
+	// seq. When buf is non-nil, p aliases buf.B and ownership of buf's
+	// reference moves to the endpoint (kept or released, also on error);
+	// when buf is nil, p is valid only during the call. A non-nil error
+	// kills the carrier with CauseProtocolViolation; the session is
+	// unaffected.
+	Datagram(c *Conn, seq uint64, p []byte, buf *Buf) error
+}
+
 // Doorbell is a non-blocking, coalescing notification (the session actor's
 // mailbox signal or the health layer's). Ring may be called from any
 // goroutine, with or without locks held.
@@ -143,6 +159,11 @@ type Conn struct {
 	rd reader // reader goroutine (and ReadHello before Start)
 	wr writer // writer goroutine (and the handshake writers before Start)
 
+	// dg is the datagram half of a datagram carrier (M2-D3), set by the
+	// datagram handshakes before the Conn is returned; nil on stream
+	// carriers.
+	dg *dgState
+
 	// Two-stage write watchdog (design §4.8, C6): reused AfterFunc timers
 	// whose callbacks act only for the write generation they were armed for.
 	wd1, wd2       *time.Timer
@@ -212,6 +233,54 @@ func newConn(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name 
 
 // ID returns the CarrierID (dialer-assigned, echoed in PREFACE_ACK).
 func (c *Conn) ID() uint32 { return c.id }
+
+// Kind returns the carrier kind: wire.KindDatagram for a datagram carrier,
+// else wire.KindStream. Immutable.
+func (c *Conn) Kind() wire.CarrierKind {
+	if c.dg != nil {
+		return wire.KindDatagram
+	}
+	return wire.KindStream
+}
+
+// MTU returns a datagram carrier's current send frame budget — bytes of
+// frames per datagram, the flow header excluded: the negotiated cmtu,
+// lowered (never raised) by wire.DatagramTooLargeError (M2-D25). 0 on
+// stream carriers. Lock-free.
+func (c *Conn) MTU() int {
+	if c.dg == nil {
+		return 0
+	}
+	return int(c.dg.budget.Load())
+}
+
+// RecvLimit returns a datagram carrier's negotiated cmtu (its reader accepts
+// datagrams of up to that many rendr bytes); 0 on stream carriers.
+func (c *Conn) RecvLimit() int {
+	if c.dg == nil {
+		return 0
+	}
+	return c.dg.recvLimit
+}
+
+// DgramMax returns the largest application datagram this carrier takes now:
+// MTU() − wire.DgramOverhead on a datagram carrier, wire.MaxPacketPayload on
+// a stream carrier (a DGRAM is an ordinary frame there).
+func (c *Conn) DgramMax() int {
+	if c.dg == nil {
+		return wire.MaxPacketPayload
+	}
+	return c.MTU() - wire.DgramOverhead
+}
+
+// SetBudget fixes the negotiated cmtu of an unstarted datagram carrier
+// (M2-D50): on the passive the admission's min(the dialer's offer, the
+// transport's Limit), on the dialer the value the OPEN_ACK or JOIN_ACK
+// returned (≤ its offer). It sets the send budget and the receive limit.
+// A no-op on stream carriers; it panics after Start.
+func (c *Conn) SetBudget(cmtu int) {
+	panic("unimplemented: M2")
+}
 
 // PeerInstance returns the remote Runtime's InstanceID from the handshake.
 func (c *Conn) PeerInstance() [16]byte { return c.peer }
@@ -459,6 +528,16 @@ type Stats struct {
 	TxBytes, RxBytes  uint64    // DATA payload bytes sent / received on this carrier
 	RetxBytes, Frames uint64    // retransmitted DATA payload bytes; frames written
 	LastRx            time.Time // last frame received
+
+	// M2. TxBytes and RxBytes also count DGRAM payload bytes on every
+	// carrier; the fields below are zero on stream carriers.
+	MTU                    int    // current send frame budget (Conn.MTU)
+	Datagrams, DatagramsRx uint64 // datagrams written / read and handed over
+	Dropped                uint64 // datagrams and frames dropped (M2-D14), Truncated included
+	Truncated              uint64 // truncated or oversize datagrams read
+	Refused                uint64 // DGRAMs lost in datagrams the transport refused as too large (the session adds them to PacketCounters.DropTooLarge)
+	Retransmits            uint64 // REL and H1 retransmissions (L12)
+	Rebinds                uint64 // committed rebinds of a passive raw-UDP flow (L59)
 }
 
 // Closing and joining.

@@ -14,3 +14,8 @@
 
 # Local build outputs.
 /bin/
+
+# Uncommitted Go workspaces for local development of the nested quic module
+# (plan §8).
+go.work
+go.work.sum

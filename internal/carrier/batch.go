@@ -120,6 +120,8 @@ type BatchFrame struct {
 	Chunk   *Buf        // DATA: the referenced send chunk
 	Retx    bool        // DATA: retransmitted bytes
 	Payload []byte      // control frames: the encoded payload (aliases the batch arena; valid until Reset)
+	Seq     uint64      // DGRAM: the session seq (Body holds the datagram)
+	Rel     bool        // a reliable control frame wrapped in REL on a datagram batch; Header is the inner header
 }
 
 // Frame returns frame i (0 ≤ i < Len()) in insertion order. A padded PING

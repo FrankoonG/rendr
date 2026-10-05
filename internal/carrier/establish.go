@@ -18,8 +18,23 @@ import (
 type Factory struct {
 	Index     int                                                       // configuration order
 	Name      string                                                    // unique within the Peer
-	Dial      func(ctx context.Context) (net.Conn, error)               // required
-	DialEarly func(ctx context.Context, first []byte) (net.Conn, error) // optional
+	Dial      func(ctx context.Context) (net.Conn, error)               // stream factories: required
+	DialEarly func(ctx context.Context, first []byte) (net.Conn, error) // stream factories: optional
+
+	// Kind is the factory's carrier kind; zero means wire.KindStream (every
+	// M1 factory). A datagram factory sets DialPacket and MTU instead of
+	// Dial; Establish dispatches on Kind (M2 design §A5.10).
+	Kind wire.CarrierKind
+	// DialPacket opens one datagram carrier: a net.PacketConn and the peer
+	// address rendr writes to (rendr.DatagramCarrier.Dial). Required for a
+	// datagram factory.
+	DialPacket func(ctx context.Context) (net.PacketConn, net.Addr, error)
+	// MTU is a datagram factory's frame budget: the largest datagram of
+	// rendr bytes it writes (rendr.DatagramCarrier.MTU,
+	// wire.MinFrameBudget–wire.MaxDatagram); a raw-UDP flow header is the
+	// transport's own Headroom and not counted. A carrier's cmtu offer is
+	// min(MTU, its transport's Limit) (M2-D50).
+	MTU int
 }
 
 // Established is a dialer carrier whose handshake completed: PREFACE_ACK(OK)

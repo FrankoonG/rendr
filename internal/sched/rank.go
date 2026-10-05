@@ -5,6 +5,12 @@ type Candidate struct {
 	Index  int      // configuration order; unique, used as the final tie-break
 	Ev     Evidence // evidence at the ranking instant
 	Failed bool     // ranking demotion mark (plan §3.9); never blocks a dial
+	// Class is the kind class of the factory for the ranked session (M2-D47):
+	// 0 the session's preferred carrier kind (a packet session's datagram
+	// factories), 1 the fallback kind (its stream factories). Stream
+	// sessions use class 0 only. M2 wave 1 orders by it after the failed
+	// mark and before the evidence; until then Less ignores it.
+	Class uint8
 }
 
 // rankClass is the comparator class of c: 0 measured (EvFresh, or EvHeld

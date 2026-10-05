@@ -18,6 +18,12 @@ type DialSpec struct {
 	Metadata   []byte                   // copied by Dial
 	GoneAway   func(inst [16]byte) bool // instances that sent GOAWAY to this Peer: never OPEN to them
 	NoteGoAway func(inst [16]byte)      // record an instance that answered GOING_AWAY or sent GOAWAY
+	// Eligible is the set of factories this session may dial (M2-D46): bit
+	// i for Factories[i]; 0 means all (every M1 session). Stream sessions
+	// get the stream factories only; packet sessions all of them, ranked
+	// by kind class (M2-D47). Health keeps every factory under its Peer
+	// index.
+	Eligible uint16
 }
 
 // Dial creates a dialer session and runs its opening phase (design §6.6):

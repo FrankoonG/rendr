@@ -67,6 +67,10 @@ type Session struct {
 	snap  atomic.Pointer[statusSnap] // (A) published under mu with every control change
 	mb    mailbox                    // (A) the actor's mailbox; ringActor rings its doorbell
 	done  chan struct{}              // (A) closed at actor exit
+
+	// pk is the packet data plane (M2-D1): non-nil exactly for packet
+	// sessions, set before the session becomes visible, never changed.
+	pk *packet
 }
 
 // port is the set of *carrier.Conn methods the stream uses on a lane's
@@ -112,6 +116,11 @@ type lane struct {
 	rstSent      bool       // (S)
 	finHere      bool       // (S) our unacknowledged FIN went out here
 	idle         bool       // (S) the writer found nothing in its last Fill
+
+	// Packet lanes only (M2).
+	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
+	echoRel      uint32    // (S) passive: the epoch echo last placed in a reliable PACK on this lane (M2-D39)
+	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a

@@ -13,8 +13,11 @@ type PassiveSpec struct {
 	SID            [16]byte
 	Params         Params   // passive: Grace = clamp(OPEN.retain_ms, 1 s, 400 s)
 	DialerInstance [16]byte // from the OPEN carrier's PREFACE; the bound instance
-	PeerWindow     uint32   // OPEN.window: the dialer's initial receive window
+	PeerWindow     uint32   // OPEN.window: the dialer's initial receive window (stream sessions; a packet session's OPEN.window is the carrier budget offer, M2-D11)
 	Metadata       []byte   // copied
+	// MaxPayload is a packet session's accepted MaxPayload (pmtu_acc,
+	// M2-D49), carried by Confirm's OPEN_ACK; 0 for stream sessions.
+	MaxPayload int
 }
 
 // NewPending creates an unstarted passive session in StatePending with
