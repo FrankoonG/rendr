@@ -17,7 +17,9 @@ import (
 // echoes it at once; when its sending lane dies or is retired it moves to
 // a local fallback first and follows the next epoch (routing only: a
 // selector passive counts migrations only from the cumulative counts each
-// SCHED carries, P13, §0.13 A3).
+// SCHED carries, P13, §0.13 A3). The passive's store rejects a SCHED whose
+// counts no dialer can have sent (schedLocked, §0.14 B1), and following
+// the counts takes O(1) per applied SCHED.
 
 // publishSchedLocked (dialer) publishes the current data-eligible set —
 // the selector's active lane, or every bond member — with cause c as the
@@ -126,31 +128,56 @@ func (a *actor) applySchedLocked(now time.Time) {
 	s.bumpAckLocked(true)
 }
 
+// maxFollowEvents bounds the Migration events one applied SCHED produces
+// on the passive (design §0.14 B1).
+const maxFollowEvents = 4
+
 // followCountsLocked (passive selector) takes the dialer's cumulative
 // selector migration counts from the SCHED just applied (§7.6, P13, §0.13
 // A3). The passive cannot classify a dialer switch by itself, and counting
 // from the cause of each applied SCHED missed every SCHED superseded
 // before it reached the passive — lost with the carrier that died right
 // after it attached (L20), or never sent because the next publication came
-// first (L22) — so the ends disagreed. Every migration taken this way is
-// one Migration event, from the carrier the previous applied SCHED (or the
-// epoch-0 choice) named to the one this SCHED names.
+// first (L22) — so the ends disagreed.
+//
+// Following is O(1) (§0.14 B1): each counter jumps to the dialer's count,
+// and the migrations taken are queued as Migration events, from the
+// carrier the previous applied SCHED (or the epoch-0 choice) named to the
+// one this SCHED names: one per migration, at most maxFollowEvents per
+// applied SCHED, and at least one for every cause whose count rose. The
+// counters are the record. The SCHED store bounds what a SCHED may claim
+// (schedLocked); a legitimate SCHED folds several migrations only when
+// SCHEDs before it were superseded or lost.
 func (a *actor) followCountsLocked(now time.Time) {
 	ctl := &a.s.ctl
 	from, to := a.named, ctl.set.IDs[0]
-	a.followLocked(now, &ctl.migDeath, ctl.set.Death, from, to, wire.SchedDeath)
-	a.followLocked(now, &ctl.migQuality, ctl.set.Quality, from, to, wire.SchedQuality)
-	a.followLocked(now, &ctl.migExplicit, ctl.set.Explicit, from, to, wire.SchedExplicit)
+	spare := maxFollowEvents // events left beyond one per cause that rose
+	for _, r := range [...]bool{ctl.set.Death > ctl.migDeath, ctl.set.Quality > ctl.migQuality, ctl.set.Explicit > ctl.migExplicit} {
+		if r {
+			spare--
+		}
+	}
+	spare = a.followLocked(now, &ctl.migDeath, ctl.set.Death, from, to, wire.SchedDeath, spare)
+	spare = a.followLocked(now, &ctl.migQuality, ctl.set.Quality, from, to, wire.SchedQuality, spare)
+	a.followLocked(now, &ctl.migExplicit, ctl.set.Explicit, from, to, wire.SchedExplicit, spare)
 	a.named = to
 }
 
-// followLocked raises the passive counter *have to the dialer's count want,
-// one Migration event per migration.
-func (a *actor) followLocked(now time.Time, have *uint64, want uint64, from, to uint32, c wire.SchedCause) {
-	for ; *have < want; *have++ {
-		a.dirty = true
+// followLocked raises the passive counter *have to the dialer's count want
+// in one step (never lowers it) and queues one Migration event for the
+// first migration taken plus one for each further one while spare lasts;
+// it returns the spare left.
+func (a *actor) followLocked(now time.Time, have *uint64, want uint64, from, to uint32, c wire.SchedCause, spare int) int {
+	if want <= *have {
+		return spare
+	}
+	extra := min(want-*have-1, uint64(spare))
+	*have = want
+	a.dirty = true
+	for range 1 + extra {
 		a.event(now, EventMigration, 0, from, to, schedEventCause(c), nil)
 	}
+	return spare - int(extra)
 }
 
 // schedLists reports whether set names carrier id.

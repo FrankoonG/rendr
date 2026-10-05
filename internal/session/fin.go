@@ -101,8 +101,28 @@ func (s *Session) rstLocked(p []byte) error {
 	return nil
 }
 
+// SCHED count violations (design §0.14 B1).
+var (
+	errSchedCountDown error = violation("SCHED migration count decreased")
+	errSchedCountJump error = violation("SCHED migration counts rose beyond the epoch advance")
+)
+
 // schedLocked stores the newest SCHED received (passive only; the actor
-// validates the epoch order and applies it, L45).
+// applies it, L45). A SCHED not newer than the reference — the newest SCHED
+// stored or applied; before any, the passive's initial applied epoch
+// (FirstEpoch − 1) with counts 0 — is ignored. A newer one must carry
+// counts a dialer can have sent (§0.14 B1): no count below the reference's,
+// and the counts together at most the serial epoch advance above them. The
+// dialer counts every selector migration together with its own publication
+// in one critical section (lostActiveLocked, the race winner's attach,
+// qualitySwitchLocked; a publication may count nothing), Fill writes the
+// current counts with the current epoch and runs outside those sections (so
+// every copy of an epoch carries the same counts), and bond sends zero: any
+// two SCHEDs of one session keep this bound, also when resent, reordered or
+// lost. A SCHED that breaks it is a violation of the carrier that delivered
+// it — the session survives (invariant 6) and the passive's counters stay
+// as they are. The applied epoch and SCHED are actor state, read here under
+// s.mu.
 func (s *Session) schedLocked(flags uint8, p []byte) error {
 	if s.p.Role == RoleDialer {
 		return errSchedOnDialer
@@ -112,12 +132,39 @@ func (s *Session) schedLocked(flags uint8, p []byte) error {
 		return err
 	}
 	c := &s.ctl
-	if !c.schedInSet || sched.EpochNewer(sc.Epoch, c.schedIn.Epoch) {
-		c.schedIn = sc
-		c.schedInCause = wire.SchedCause(flags & wire.SchedCauseMask)
-		c.schedInSet = true
-		s.st.facts |= factSched
-		s.ringActor()
+	refEpoch, ref := c.epoch, &c.set
+	if c.schedInSet && !sched.EpochNewer(c.epoch, c.schedIn.Epoch) {
+		refEpoch, ref = c.schedIn.Epoch, &c.schedIn
+	}
+	if !sched.EpochNewer(sc.Epoch, refEpoch) {
+		return nil // stale, or a resend of the reference
+	}
+	if err := schedCountsCheck(ref, &sc, sc.Epoch-refEpoch); err != nil {
+		return err
+	}
+	c.schedIn = sc
+	c.schedInCause = wire.SchedCause(flags & wire.SchedCauseMask)
+	c.schedInSet = true
+	s.st.facts |= factSched
+	s.ringActor()
+	return nil
+}
+
+// schedCountsCheck tests the counts of next against those of ref, a SCHED
+// adv epochs older (1 ≤ adv < 2³¹): none may decrease, and the summed rise
+// may not exceed adv. The running sum never exceeds adv, so forged counts
+// near 2⁶⁴ cannot wrap it.
+func schedCountsCheck(ref, next *wire.Sched, adv uint32) error {
+	room := uint64(adv)
+	for _, c := range [...][2]uint64{{ref.Death, next.Death}, {ref.Quality, next.Quality}, {ref.Explicit, next.Explicit}} {
+		if c[1] < c[0] {
+			return errSchedCountDown
+		}
+		rise := c[1] - c[0]
+		if rise > room {
+			return errSchedCountJump
+		}
+		room -= rise
 	}
 	return nil
 }
