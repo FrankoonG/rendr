@@ -19,7 +19,7 @@ func (id InstanceID) String() string { return hex.EncodeToString(id[:]) }
 func (id InstanceID) IsZero() bool { return id == InstanceID{} }
 
 // SessionID identifies a session: chosen by the dialer from crypto/rand and
-// reused by every OPEN and JOIN of that session (L47).
+// reused by every OPEN and JOIN of that session.
 type SessionID [16]byte
 
 // String returns 32 lowercase hex digits.
@@ -66,7 +66,7 @@ type CarrierID uint32
 type Mode uint8
 
 // Modes. The zero Mode in DialOptions selects ModeSelector. Race (3)
-// arrives in M3.
+// follows in milestone M3.
 const (
 	// ModeSelector: one active carrier at a time; quality switching by the
 	// probe evidence; racing failover on death.
@@ -93,8 +93,8 @@ func (m Mode) String() string {
 	return "mode(" + itoa(uint64(m)) + ")"
 }
 
-// Kind is the session or carrier kind. M2 adds packet sessions and
-// datagram carriers (value 2).
+// Kind is the session or carrier kind. Packet sessions and datagram
+// carriers (value 2) follow in milestone M2.
 type Kind uint8
 
 // Kinds.
@@ -114,7 +114,7 @@ type Role uint8
 // Roles.
 const (
 	RoleDialer  Role = 1 // dials carriers and decides scheduling for both directions
-	RolePassive Role = 2 // accepts carriers and follows SCHED
+	RolePassive Role = 2 // accepts carriers and follows the dialer's scheduling updates (SCHED)
 )
 
 // String returns "dialer", "passive" or "role(N)".
@@ -159,7 +159,7 @@ type CarrierState uint8
 
 // Carrier states.
 const (
-	CarrierJoining  CarrierState = 1 // OPEN_ACK/JOIN_ACK not exchanged yet: carries no DATA (L22)
+	CarrierJoining  CarrierState = 1 // OPEN_ACK/JOIN_ACK not exchanged yet: carries no DATA
 	CarrierActive   CarrierState = 2 // selector: the data carrier
 	CarrierMember   CarrierState = 3 // bond: a data member; selector: a live non-active carrier
 	CarrierRetiring CarrierState = 4 // planned retirement: no new DATA; CLOSE when acknowledged or after RetireGrace
@@ -201,7 +201,9 @@ const (
 	CauseQuality           Cause = 9 // only in EventMigration: a selector quality switch
 )
 
-// String returns the plan §3.6 name ("ping_timeout", "write_stall", ...).
+// String returns "ping_timeout", "write_stall", "transport_error",
+// "protocol_violation", "instance_mismatch", "goaway", "local_close",
+// "retired", "quality", or "none" for CauseNone and unknown values.
 func (c Cause) String() string {
 	switch c {
 	case CausePingTimeout:
@@ -258,8 +260,8 @@ func (k EventKind) String() string {
 	return "event(" + itoa(uint64(k)) + ")"
 }
 
-// Evidence is a factory's probe evidence class in PeerStatus (plan §3.9,
-// design §8).
+// Evidence is a factory's probe evidence class in PeerStatus (see
+// ProbePolicy and SelectorPolicy).
 type Evidence uint8
 
 // Evidence classes.

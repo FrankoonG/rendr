@@ -13,11 +13,11 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/session"
 )
 
-// Dial opens a session (design §6.6): with two or more factories it first
-// waits for the first probe samples — only while probing is cold-starting
-// and never longer than Probe.DialWait — then races OPEN over the ranked
-// factories with JoinStagger and returns on the first OPEN_ACK(OK).
-// Errors (plan §6): *RejectError (ErrRejected), ErrCapacity, ErrVersion,
+// Dial opens a session: with two or more factories it first waits for the
+// first probe samples — only while probing is cold-starting and never
+// longer than Probe.DialWait — then races OPEN over the ranked factories
+// with JoinStagger and returns on the first OPEN_ACK(OK).
+// Errors: *RejectError (ErrRejected), ErrCapacity, ErrVersion,
 // ErrProtocol, ErrMetadataTooLarge, ErrSessionLost, ErrNoPath (no OPEN within
 // NoPathGrace, wrapping the last carrier error), ctx.Err() wrapping the last
 // carrier error (returned within 100 ms of cancellation; the session then

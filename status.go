@@ -8,7 +8,7 @@ type Status struct {
 	Sessions           SessionCounts
 	Handshakes         int    // occupied handshake slots
 	HandshakeEvictions uint64 // unfinished handshakes evicted because the slots were full
-	AcceptBacklog      [2]int // pending sessions across Listeners: [0] stream, [1] packet (0 until M2)
+	AcceptBacklog      [2]int // pending sessions across Listeners: [0] stream, [1] packet (0: no packet sessions yet)
 	Sessionless        int    // probe carriers held by this (passive) Runtime
 
 	// BufferedBytes is the use of the MaxBufferedBytes budget (send,
@@ -17,7 +17,7 @@ type Status struct {
 	// buffers still held by calls stuck in embedder code (Abandoned).
 	BufferedBytes int64
 
-	Abandoned         int      // goroutines still stuck in embedder calls past their bound (L52)
+	Abandoned         int      // goroutines still stuck in embedder calls past their bound (see Runtime.Close)
 	EventsDropped     uint64   // events dropped because the queue was full
 	CallbackPanics    uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
 	ConfigAdjustments []string // "Field: old → new (reason)"; Config first, then "Listen[i].Field: ..."
@@ -34,7 +34,7 @@ type SessionCounts struct {
 	Pending    int // passive sessions waiting for Confirm/Reject
 	Lingering  int // sessions whose application called Close and that have not ended
 	Orphaned   int // passive sessions inside a no-path episode
-	Tombstones int // ended passive sessions remembered for TombstoneTTL
+	Tombstones int // ended passive sessions remembered for PassiveRetain + Linger, so that a late OPEN cannot start them again
 }
 
 // SessionStatus is a session snapshot.
@@ -67,7 +67,7 @@ type SessionStatus struct {
 	Carriers []CarrierStatus // live carriers in attach order, then the last 8 dead ones
 }
 
-// MigrationCounts counts migrations by cause (plan §3.6). Selector: a change
+// MigrationCounts counts migrations by cause. Selector: a change
 // of the active carrier instance at publication; bond: a member that dies
 // with unacknowledged data of this side that is moved to other members. Both
 // ends count the same selector migrations: the dialer decides them, and the

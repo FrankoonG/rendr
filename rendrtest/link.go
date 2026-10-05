@@ -54,11 +54,12 @@ const (
 	CorruptTrailer CorruptMode = 3 // flip a CRC bit
 	// ForgeAckBeyondSent rewrites an ACK's delivered offset far beyond
 	// anything sent, keeping fseq and recomputing the CRC: the receiver must
-	// kill exactly this carrier for "ACK beyond sent" (L13).
+	// kill exactly this carrier for "ACK beyond sent".
 	ForgeAckBeyondSent CorruptMode = 4
 )
 
-// DialBehavior makes the link's factory misbehave (L51).
+// DialBehavior makes the link's factory misbehave (fail, hang, return
+// (nil, nil), panic, ...), to test that rendr contains an untrusted factory.
 type DialBehavior uint8
 
 // Dial behaviours.
@@ -83,7 +84,9 @@ const (
 	BlockHard BlockMode = 2 // writes block and ignore deadlines and Close until Release (an abandoned call)
 )
 
-// WriteResult scripts the result of one conn Write (L42).
+// WriteResult scripts the result of one conn Write, including results a
+// correct conn never returns (a count above len(p), (0, nil)), to test how
+// rendr handles them.
 type WriteResult struct {
 	N         int   // bytes reported written (relative to len(p) when Relative)
 	Relative  bool  // N is added to len(p) (e.g. −3 for "len−3", +1 for "len+1")
@@ -94,7 +97,9 @@ type WriteResult struct {
 
 // LinkConfig configures a Link.
 type LinkConfig struct {
-	// Name is the link's name (the factory name in the fixture).
+	// Name is the link's name; tests usually give the StreamCarrier that
+	// dials through the link the same name. It also seeds the link's jitter,
+	// so equal names give equal jitter sequences.
 	Name string
 	// Accept receives the passive end of every new carrier, typically
 	// (*rendr.Listener).Handle. It must return; when it fails (or is nil) the
@@ -102,8 +107,8 @@ type LinkConfig struct {
 	Accept func(net.Conn) error
 	// Buffer is how many bytes per direction a Write may hand to the link
 	// before it blocks (default 2 MiB, at least 1 KiB). Bytes accepted but not
-	// yet delivered are lost when the carrier is killed: the buffer-loss model
-	// of L10/L61.
+	// yet delivered are lost when the carrier is killed, as on a broken
+	// connection.
 	Buffer int
 }
 
@@ -134,8 +139,8 @@ var (
 // The rate limit is one bottleneck per direction shared by all carriers of
 // the link, paced when bytes are transmitted: bytes of every carrier queue
 // behind each other in arrival order, so a probe carrier's PING waits
-// behind a session carrier's bulk exactly as at a real bottleneck (the
-// self-load guard tests, design §8.5). Bytes lost to Kill or the blackhole
+// behind a session carrier's bulk exactly as at a real bottleneck (what
+// tests of rendr's self-load guard need). Bytes lost to Kill or the blackhole
 // leave the queue without taking bottleneck time, a stall stops the
 // bottleneck (its backlog then drains at the rate) and SetRate applies to
 // every byte still queued. The one-way delay is added after the bottleneck.
@@ -371,7 +376,8 @@ func (l *Link) Kill() int {
 }
 
 // CorruptNext flips one byte in the next chunk forwarded in direction d of
-// every current carrier (M1a behaviour).
+// every current carrier, wherever that byte falls: unlike CorruptNextFrame
+// it ignores frame boundaries.
 func (l *Link) CorruptNext(d Dir) {
 	l.mu.Lock()
 	for _, c := range l.carriers {
@@ -394,7 +400,7 @@ func (l *Link) CorruptNextFrame(d Dir, t FrameType, m CorruptMode) {
 }
 
 // DropNextFrame removes the next frame of type t in direction d on every
-// current carrier: the receiver sees an fseq gap (L43).
+// current carrier: the receiver sees an fseq gap.
 func (l *Link) DropNextFrame(d Dir, t FrameType) {
 	l.eachFlow(d, func(f *flow) { f.tr.drops = append(f.tr.drops, t) })
 }
@@ -417,11 +423,14 @@ func (l *Link) InjectAfterNextFrame(d Dir, after, t FrameType, flags uint8, hand
 // frame of type t forwarded in direction d on any current carrier into the
 // returned channel (buffered, one frame) and forwards the frame unchanged
 // (counted as FramesCaptured). Tests use it to learn values they cannot
-// compute, such as an old incarnation's PING nonce for a stale-PONG
-// injection (L21), or to obtain another session's frame for a splice (L43).
-// The first carrier to forward such a frame wins, a probe carrier included:
-// check Stats().Session.FramesCaptured or use a link with one carrier.
-// Without a current carrier the channel never receives.
+// compute, such as an old carrier incarnation's PING nonce for a stale-PONG
+// injection, or to obtain another session's frame for a splice. The first
+// carrier to forward such a frame wins, a probe carrier included: check
+// Stats().Session.FramesCaptured or use a link with one carrier. The
+// channel receives the frame before FramesCaptured counts it (and before
+// the frame is forwarded), so a test that received the frame must wait
+// until the count shows it before asserting on it. Without a current
+// carrier the channel never receives.
 func (l *Link) CaptureNextFrame(d Dir, t FrameType) <-chan []byte {
 	cp := &capture{t: t, ch: make(chan []byte, 1)}
 	l.eachFlow(d, func(f *flow) { f.tr.captures = append(f.tr.captures, cp) })
@@ -430,10 +439,10 @@ func (l *Link) CaptureNextFrame(d Dir, t FrameType) <-chan []byte {
 
 // InjectRaw inserts raw at the next frame boundary in direction d on every
 // current carrier (probe carriers included), byte for byte: neither fseq
-// nor CRC is re-stamped, so
-// spliced bytes of another carrier or session hit the receiver's fseq and
-// CRC checks exactly as a misbehaving relay's would (L43). Counted as
-// FramesInjected. A carrier that is between frames gets raw at once.
+// nor CRC is re-stamped, so spliced bytes of another carrier or session hit
+// the receiver's fseq and CRC checks exactly as a misbehaving relay's
+// would. Counted as FramesInjected. A carrier that is between frames gets
+// raw at once.
 func (l *Link) InjectRaw(d Dir, raw []byte) {
 	raw = slices.Clone(raw)
 	l.eachFlow(d, func(f *flow) {
@@ -461,7 +470,7 @@ func (l *Link) eachFlow(d Dir, fn func(f *flow)) {
 }
 
 // ScriptWrites makes the next Writes of side d's conns (Up: the dialer's,
-// Down: the passive's) return the scripted results (L42), counted as
+// Down: the passive's) return the scripted results, counted as
 // WritesScripted. Each result is consumed by the next Write on any conn of
 // that side, a probe carrier's included.
 func (l *Link) ScriptWrites(d Dir, r ...WriteResult) {
@@ -484,8 +493,8 @@ func (l *Link) BlockWrites(d Dir, m BlockMode) {
 	l.mu.Unlock()
 }
 
-// PanicWrites makes the next Write on any conn of side d panic (L51),
-// counted as WritePanics.
+// PanicWrites makes the next Write on any conn of side d panic, counted as
+// WritePanics.
 func (l *Link) PanicWrites(d Dir) {
 	l.mu.Lock()
 	l.sides[d.index()].panics++
@@ -494,7 +503,7 @@ func (l *Link) PanicWrites(d Dir) {
 }
 
 // OverRead makes the next Read on any conn of side d that returns data
-// report len(p)+1 (L42), counted as OverReads.
+// report the invalid count len(p)+1, counted as OverReads.
 func (l *Link) OverRead(d Dir) {
 	l.mu.Lock()
 	l.sides[d.index()].over++
@@ -603,7 +612,7 @@ func (l *Link) Close() {
 
 // Counts are fault and traffic counters of a set of carriers. Every
 // control has one, so a stimulus proof can show that a fault touched the
-// carrier class it is about (L60).
+// carrier class it is about.
 type Counts struct {
 	Killed          int64         // carriers closed by Kill
 	Bytes           int64         // bytes the far ends have read, both directions (a chunk counts once read in full)
@@ -619,7 +628,7 @@ type Counts struct {
 	WritesBlocked   int64         // Writes blocked by BlockWrites
 	WritePanics     int64         // Writes that panicked (PanicWrites)
 	OverReads       int64         // Reads that reported len(p)+1 (OverRead)
-	FramesCaptured  int64         // frames copied by CaptureNextFrame
+	FramesCaptured  int64         // frames copied by CaptureNextFrame (counted after the copy reached its channel)
 }
 
 // Stats are a link's counters: over all carriers, session carriers only,

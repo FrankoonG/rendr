@@ -67,7 +67,8 @@ func (c *Conn) LocalAddr() net.Addr { return c.local }
 // RemoteAddr returns Addr{peer instance, session}.
 func (c *Conn) RemoteAddr() net.Addr { return c.remote }
 
-// SetDeadline sets both deadlines (net.Conn semantics; L06).
+// SetDeadline sets the read and the write deadline, as SetReadDeadline and
+// SetWriteDeadline do (net.Conn semantics).
 func (c *Conn) SetDeadline(t time.Time) error {
 	rerr := c.s.SetReadDeadline(t)
 	if werr := c.s.SetWriteDeadline(t); rerr == nil {

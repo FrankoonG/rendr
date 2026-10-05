@@ -19,13 +19,12 @@ const (
 
 // AssertNoLeak records a settled baseline of the live goroutines — by
 // identity — and, on Linux, of the open file descriptors, and returns a
-// check to defer (L66). The caller must have joined everything it started
-// before the check runs; the check then forces a netpoll round trip and
-// waits (at most 10 s) until three consecutive samples 100 ms apart show no
-// goroutine and no fd that was not in the baseline (unit layer: zero
-// growth). Baseline goroutines and fds may end meanwhile without hiding a
-// new one. On failure t gets the stacks of the new goroutines and the new
-// fds only.
+// check to defer. The caller must have joined everything it started before
+// the check runs; the check then forces a netpoll round trip and waits (at
+// most 10 s) until three consecutive samples 100 ms apart show no goroutine
+// and no fd that was not in the baseline: no growth is tolerated. Baseline
+// goroutines and fds may end meanwhile without hiding a new one. On failure
+// t gets the stacks of the new goroutines and the new fds only.
 //
 // It is meant for real-time tests outside synctest bubbles (a bubble checks
 // its own goroutines). It cannot be used with t.Parallel: goroutines of
@@ -172,8 +171,9 @@ func netpollRoundTrip() {
 	}
 }
 
-// ReadyBoth waits until both a() and b() hold (L66: readiness waits for both
-// ends), failing t after within.
+// ReadyBoth waits, polling every 5 ms, until a() and b() hold in the same
+// poll — readiness of both ends of a connection, not just one — and fails t
+// if that takes longer than within.
 func ReadyBoth(t testing.TB, a, b func() bool, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
