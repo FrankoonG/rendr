@@ -1,6 +1,6 @@
 // Command mtls shows how an embedder wraps rendr carriers in mutually
-// authenticated TLS 1.3 over carrier/tcp with the standard library (plan
-// §1.4): rendr neither encrypts nor authenticates, so the passive side
+// authenticated TLS 1.3 over carrier/tcp with the standard library:
+// rendr neither encrypts nor authenticates, so the passive side
 // verifies the client certificate before a carrier reaches rendr and the
 // dialer's factory completes its handshake before rendr sees the conn. A
 // rendr InstanceID is not an identity; trust comes from the certificates.
