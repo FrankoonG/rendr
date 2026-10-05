@@ -38,7 +38,9 @@ type Config struct {
 	// application Read or Write moved bytes and none of this side's data was
 	// acknowledged as delivered. Data that still reaches the peer
 	// application keeps the session alive; a peer application that stops
-	// reading lets it time out.
+	// reading lets it time out. It does not end a finished exchange (both
+	// FINs delivered and this side's FIN acknowledged): Linger bounds the
+	// wait for the peer's final confirmation, and that end is io.EOF.
 	IdleTimeout time.Duration
 
 	Window                int // 8 MiB; 256 KiB–64 MiB; per session per direction

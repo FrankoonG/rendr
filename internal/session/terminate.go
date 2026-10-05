@@ -25,7 +25,10 @@ import (
 // behind a slow reader whose bytes keep arriving is not idle, a peer that
 // stops reading is. The data path moves the clock without ringing the
 // actor; the deadline armed below fires at the old time, and that step
-// re-arms it from the new one.
+// re-arms it from the new one. Once our DONE was sent the idle rule no
+// longer applies: the exchange is complete, and Linger (or the episode
+// expiry, a GOAWAY or a peer restart, each ending with io.EOF) bounds the
+// wait for the peer's DONE.
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
@@ -55,7 +58,9 @@ func (a *actor) terminationLocked(now time.Time) {
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstClosed}, false)
 	case st.closed && !st.doneSent && !now.Before(st.closedAt.Add(linger)):
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstLinger}, false)
-	case s.p.IdleTimeout > 0 && !now.Before(idleBase.Add(s.p.IdleTimeout)):
+	case s.p.IdleTimeout > 0 && !st.doneSent && !now.Before(idleBase.Add(s.p.IdleTimeout)):
+		// After our DONE the exchange is complete and Linger bounds the
+		// wait for the peer's DONE (design §0.14 B4): not idleness.
 		a.terminateLocked(now, ErrIdleTimeout, &wire.Rst{Code: wire.RstIdle}, false)
 	default:
 		if st.doneSent {
@@ -63,7 +68,7 @@ func (a *actor) terminationLocked(now time.Time) {
 		} else if st.closed {
 			a.want(st.closedAt.Add(linger))
 		}
-		if s.p.IdleTimeout > 0 {
+		if s.p.IdleTimeout > 0 && !st.doneSent {
 			a.want(idleBase.Add(s.p.IdleTimeout))
 		}
 	}
