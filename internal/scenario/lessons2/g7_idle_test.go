@@ -24,9 +24,9 @@ const (
 
 // TestIdleTimeoutCountsDelivery_L19 (design §0.14 B5; L19: a session is
 // judged by the delivery of application data, never by control traffic
-// alone). IdleTimeout ends a session end whose application committed no
-// Write or Read and none of whose sent bytes were acknowledged as delivered
-// for that long.
+// alone). IdleTimeout ends a session whose application committed no Write
+// or Read and none of whose sent bytes were acknowledged as delivered for
+// that long.
 //
 // slow-reader: IdleTimeout 10 s on both ends. The dialer writes 12 MiB in
 // one Write; the passive's application takes 4 KiB every 500 ms. The Write

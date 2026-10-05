@@ -231,10 +231,14 @@ func (s *Session) Close() error {
 }
 
 // acquireLocked takes the call semaphore *sem (rsem or wsem) for one Read or
-// Write (§0.14 B12). It is called with s.mu held and returns with it held;
-// ok is false when the application's Close came first: the call then
-// returns net.ErrClosed without the semaphore. The semaphore is created on
-// first use, so a Session built without a constructor works too.
+// Write (§0.14 B12). It is called with s.mu held and returns with it held.
+// ok is false only for a call that has to wait and meets the application's
+// Close first (closed already, or before the semaphore frees): it then
+// returns net.ErrClosed without the semaphore. A call that gets the
+// semaphore, at once (even after Close) or after waiting, meets a Close
+// through Read's or Write's own precedence (local Close first). The
+// semaphore is created on first use, so a Session built without a
+// constructor works too.
 //
 // Uncontended, it costs one non-blocking send. Contended, it releases s.mu
 // and waits on channels only, so the wait is durable in a synctest bubble,
