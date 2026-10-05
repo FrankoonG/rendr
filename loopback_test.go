@@ -288,6 +288,22 @@ func (lp *loopPair) close(t testing.TB) {
 	}
 }
 
+// g10Migrated polls (real time, at most within) until the dialer conn c
+// counted at least deaths death migrations and r forwarded at least conns
+// connections, and reports whether it did. A dialer selector counts the
+// death migration of its lost active carrier when the race winner, the
+// redialed carrier, is published (design §7.6), after the death itself.
+func g10Migrated(c *rendr.Conn, r *relay, deaths uint64, conns int64, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for c.Status().Migrations.Death < deaths || r.conns.Load() < conns {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
 // waitEnded polls (real time) until c's session ended.
 func waitEnded(t testing.TB, c *rendr.Conn, within time.Duration) rendr.SessionStatus {
 	t.Helper()
@@ -311,7 +327,14 @@ func waitEnded(t testing.TB, c *rendr.Conn, within time.Duration) rendr.SessionS
 // with the passive's data and FIN already written. The dialer's Read
 // returns every byte intact and io.EOF exactly at the end, never an error
 // or an early EOF; each reset is one death migration and one redial
-// (stimulus proof: four resets, four deaths, five carriers).
+// (stimulus proof: four resets, four deaths, five carriers). The selector
+// counts a reset's death migration when the redialed carrier attaches,
+// which can trail the reads: the dialer may have buffered the rest of the
+// data and the FIN before the reset (the default Window is 8 MiB). So each
+// reset waits until the previous one's migration was counted (it must hit
+// the attached carrier that replaced the last one), and the stimulus is
+// read once the fourth was; the session needs that fifth carrier anyway
+// to end. Both waits are bounded.
 func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{})
@@ -329,11 +352,17 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	v := rendrtest.NewVerifier(2, total)
 	buf := make([]byte, 64<<10)
 	var got int64
+	var done uint64 // resets made
 	for {
 		if len(marks) > 0 && got >= marks[0] {
+			if !g10Migrated(dc, lp.relay, done, int64(done)+1, 10*time.Second) {
+				t.Fatalf("reset %d at %d bytes: the death migration of the previous reset is not counted after 10s (%d relayed connections): %+v",
+					done+1, got, lp.relay.conns.Load(), dc.Status())
+			}
 			if n := lp.relay.reset(); n < 1 {
 				t.Fatalf("reset no connection at %d bytes", got)
 			}
+			done++
 			marks = marks[1:]
 		}
 		n, err := dc.Read(buf)
@@ -354,6 +383,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	if err := <-sent; err != nil {
 		t.Fatalf("passive send: %v", err)
 	}
+	g10Migrated(dc, lp.relay, 4, 5, 10*time.Second) // the fifth carrier attached: the fourth death counted
 	st := dc.Status()
 	if lp.relay.resets.Load() < 4 || st.Migrations.Death < 4 || st.NoPathEpisodes < 4 || lp.relay.conns.Load() < 5 {
 		t.Fatalf("stimulus: %d resets, %d relayed connections, dialer %+v", lp.relay.resets.Load(), lp.relay.conns.Load(), st)

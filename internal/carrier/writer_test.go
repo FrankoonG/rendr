@@ -232,10 +232,11 @@ func TestInvalidWriteCounts_L42(t *testing.T) {
 // stage 2 (design §0.14 B15): a write that returns exactly at the end of
 // its stall window races stage 2's callback, already started (Stop cannot
 // stop it); the carrier stays alive in both orders in which the callback
-// checks after the write returned — at once, or only after the next write
-// was armed — because the check sees a newer generation (or a later due
-// time). The control order, the check while the write is still in
-// progress, is a stall and kills at exactly the window (L24).
+// checks after the write returned: at once, where the generation check
+// sees the write completed, and only after the next write was armed, where
+// the due-time check sees that the newer write's window is not due yet.
+// The control order, the check while the write is still in progress, is a
+// stall and kills at exactly the window (L24).
 func TestWatchdogRacesWriteCompletion_L08(t *testing.T) {
 	t.Run("forced orders", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -346,8 +347,13 @@ func TestWatchdogRacesWriteCompletion_L08(t *testing.T) {
 	t.Run("writes return at the stall window", func(t *testing.T) {
 		for _, tc := range []struct {
 			name  string
-			order int // 0: the check after the return; 1: after the next write was armed; 2: before the return
-		}{{"check after the return", 0}, {"check after the next write was armed", 1}, {"control check before the return", 2}} {
+			order int    // 0: the check after the return; 1: after the next write was armed; 2: before the return
+			fault string // orders 0 and 1: what a kill means (the check that should have spared the carrier)
+		}{
+			{"check after the return", 0, "stage 2 acted on a completed generation"},
+			{"check after the next write was armed", 1, "stage 2 acted on the newer write before its stall window was due (a late callback of the earlier write)"},
+			{"control check before the return", 2, ""},
+		} {
 			t.Run(tc.name, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					env := hEnv()
@@ -404,7 +410,7 @@ func TestWatchdogRacesWriteCompletion_L08(t *testing.T) {
 							t.Fatalf("stage 2 checked while the write was in progress: death %v %v after %v, want write_stall at %v", dead, cause, at.Sub(start), stall)
 						}
 					} else if dead {
-						t.Fatalf("a write that returned exactly at the end of its stall window killed the carrier (%v): stage 2 acted on a completed generation", cause)
+						t.Fatalf("a write that returned exactly at the end of its stall window killed the carrier (%v): %s", cause, tc.fault)
 					}
 					if c.WriteBlocked() || ep.blocked.Load() != 1 {
 						t.Fatalf("after the write returned: flag %v, %d reports; want the flag clear and 1 report", c.WriteBlocked(), ep.blocked.Load())
