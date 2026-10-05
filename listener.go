@@ -436,6 +436,9 @@ func (ln *Listener) enqueue(s *session.Session) {
 
 // leavePending frees the backlog slot of s (Registry.Opened or Ended).
 func (ln *Listener) leavePending(s *session.Session) {
+	if h := ln.rt.eff.hooks; h != nil && h.LeavePending != nil {
+		h.LeavePending(s.ID())
+	}
 	ln.mu.Lock()
 	it := ln.pending[s]
 	if it != nil {

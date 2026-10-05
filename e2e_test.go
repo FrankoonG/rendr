@@ -337,13 +337,27 @@ func TestDialConfirmRoundTrip(t *testing.T) {
 
 		// Deadlines (net.Conn semantics, L06): a past read deadline fails Read
 		// at once with a timeout and leaves the session usable; SetDeadline
-		// covers both directions; zero clears.
+		// covers both directions — after SetDeadline(past) a Write fails at
+		// once with a timeout and accepts nothing (TxBytes stays 0), and a
+		// Read times out after exactly its 100 ms deadline; zero clears.
 		if err := sc.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
 			t.Fatal(err)
 		}
 		var ne net.Error
 		if n, err := sc.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !ne.Timeout() {
 			t.Fatalf("Read past its deadline: (%d, %v)", n, err)
+		}
+		for _, c := range []*Conn{dc, sc} {
+			if err := c.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			ne = nil
+			if n, err := c.Write([]byte("late")); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !ne.Timeout() {
+				t.Fatalf("%v Write after SetDeadline(past): (%d, %v), want (0, a timeout)", c.Status().Role, n, err)
+			}
+			if st := c.Status(); st.TxBytes != 0 || st.State != StateOpen {
+				t.Fatalf("%v after a Write past its deadline: %d bytes accepted, state %v", st.Role, st.TxBytes, st.State)
+			}
 		}
 		if err := dc.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			t.Fatal(err)
