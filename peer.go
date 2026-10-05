@@ -29,9 +29,10 @@ type StreamCarrier struct {
 	// Dial opens one carrier. Required.
 	Dial func(ctx context.Context) (net.Conn, error)
 	// DialEarly, if set, is used instead of Dial: first holds the PREFACE and
-	// the first frame (OPEN or JOIN) and must be sent before anything else
-	// inside the embedder's own open request, saving one round trip. The
-	// returned conn must not deliver first again.
+	// the first frame — an OPEN or JOIN for a session carrier, a PING for a
+	// probe carrier (Peers with two or more factories) — and must be sent
+	// before anything else inside the embedder's own open request, saving
+	// one round trip. The returned conn must not deliver first again.
 	DialEarly func(ctx context.Context, first []byte) (net.Conn, error)
 }
 
@@ -203,7 +204,7 @@ type FactoryStatus struct {
 	Name          string
 	Evidence      Evidence      // at the time of the call
 	RTT           time.Duration // aggregated probe RTT (fresh or held), else 0
-	Samples       uint64        // unloaded probe samples accepted
+	Samples       uint64        // probe samples accepted, loaded ones included
 	LoadedSamples uint64        // samples excluded by the self-load guard
 	Failed        bool          // ranking demotion mark; never blocks a dial
 	FailReason    string        // last failure: "transport_error", "capacity", "ping_timeout", ...
