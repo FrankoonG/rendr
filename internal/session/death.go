@@ -225,9 +225,10 @@ func (a *actor) owedDeathLocked(now time.Time, to uint32) {
 // GOAWAY comes from the bound instance (every lane of a session reaches
 // it): the session ends (§6.8); it is also reconciled during the end phase,
 // because the peer's RST(GoingAway) may overtake its GOAWAY and end the
-// session first, and the dialer must still note the instance (D21). A peer
-// CLOSE retires the lane; losing the selector's active lane that way is a
-// routing loss (§7.3).
+// session first (with the same error: endIfDoneLocked, terminationLocked),
+// and the dialer must still note the instance (D21). A peer CLOSE retires
+// the lane; losing the selector's active lane that way is a routing loss
+// (§7.3).
 func (a *actor) peerSignalsLocked(now time.Time) {
 	s := a.s
 	for _, l := range s.lanes {
@@ -255,16 +256,36 @@ func (a *actor) peerSignalsLocked(now time.Time) {
 	}
 }
 
-// endIfDoneLocked ends a session whose DONE went both ways (D4) before the
-// step treats carrier ends as routing losses. Once both DONEs crossed, the
-// peer ends and retires its carriers (CLOSE, then their close), and its
-// DONE and its CLOSE often reach this actor in one step (always at
-// GOMAXPROCS=1); repairing routing first would start a no-path episode — a
-// NoPathStart event, an Orphaned call, one more episode — and on the dialer
-// a failover race, right before terminationLocked ends the session cleanly
-// in that same step.
+// endIfDoneLocked ends a session whose DONE was sent once the peer's end is
+// known, before the step treats carrier ends as routing losses (reapDead)
+// and before terminationLocked's rules (peerSignalsLocked runs it in the
+// critical section of actLocked, ahead of it):
+//
+//   - The DONE went both ways (D4): terminationLocked ends the session
+//     cleanly. Once both DONEs crossed, the peer ends and retires its
+//     carriers (CLOSE, then their close), and its DONE and its CLOSE often
+//     reach this actor in one step (always at GOMAXPROCS=1); repairing
+//     routing first would start a no-path episode — a NoPathStart event, an
+//     Orphaned call, one more episode — and on the dialer a failover race,
+//     right before terminationLocked ends the session cleanly in that same
+//     step.
+//   - The peer's RST(GoingAway) arrived: its Runtime is closing, which also
+//     sends GOAWAY, and either may arrive first — a writer round that had
+//     placed its carrier controls before the GOAWAY was requested carries
+//     the RST alone, the GOAWAY follows in the next round. Plan §3.4 gives
+//     both the same end, and after our DONE a GOAWAY ends cleanly
+//     (peerGoAwayLocked, doneOr; design §0.14 B4), so the RST ends the
+//     session with io.EOF here instead of terminationLocked's reset rule
+//     (*AbortError). No RST is sent back (§4.7). A GOAWAY that follows still
+//     notes the instance (D21): peerSignalsLocked reconciles it in the end
+//     phase. Before our DONE the reset rule keeps the *AbortError.
 func (a *actor) endIfDoneLocked(now time.Time) {
-	if st := &a.s.st; !a.ending && st.doneSent && st.peerDone {
+	st := &a.s.st
+	switch {
+	case a.ending || !st.doneSent:
+	case st.rstIn != nil && st.rstIn.Code == wire.RstGoingAway:
+		a.terminateLocked(now, io.EOF, nil, false)
+	case st.peerDone:
 		a.terminationLocked(now)
 	}
 }
@@ -272,7 +293,8 @@ func (a *actor) endIfDoneLocked(now time.Time) {
 // doneOr is the error of an end that proves the peer gone or going away —
 // the no-path episode's expiry, a GOING_AWAY answer, a GOAWAY, a JOIN that
 // reached a restarted peer or was answered UNKNOWN_SESSION: io.EOF once our
-// DONE was sent, else err (D4, extended by design §0.14 B4). Our DONE
+// DONE was sent, else err (D4, extended by design §0.14 B4; the peer's
+// RST(GoingAway) after our DONE likewise, endIfDoneLocked). Our DONE
 // follows the peer's FIN_DELIVERED for our FIN and our own for its FIN:
 // the peer delivered everything we sent, and its FIN reached our
 // application. Only the peer's DONE is missing — lost with a dying
@@ -291,8 +313,9 @@ func (a *actor) doneOr(err error) error {
 // dialer's Peer notes the instance once and never OPENs to it again (D21);
 // an open session ends with *AbortError{AbortGoingAway, Remote: true}
 // whether or not the RST arrived (plan §3.4) — or cleanly (io.EOF) once our
-// DONE was sent (doneOr) —; a pending session is withdrawn (its dialer is
-// going away). A session that already ended only notes the instance.
+// DONE was sent (doneOr), as when the RST arrives first (endIfDoneLocked)
+// —; a pending session is withdrawn (its dialer is going away). A session
+// that already ended only notes the instance.
 func (a *actor) peerGoAwayLocked(now time.Time) {
 	s := a.s
 	if !a.goAwaySeen {

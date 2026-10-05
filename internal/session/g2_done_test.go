@@ -20,10 +20,11 @@ import (
 // DONE is then lost with a dying carrier, every end that proves the peer
 // gone is the clean end that DONE would have given: the no-path episode's
 // expiry (both roles), a GOING_AWAY answer (PREFACE_ACK, JOIN_ACK), a
-// GOAWAY (on a lane, or answering a JOIN) and a JOIN that reached a
-// restarted peer all end with io.EOF. The same ends before our DONE was
-// sent keep their errors (the before-done controls). Package-level helpers
-// of this file start with "g2".
+// GOAWAY (on a lane, or answering a JOIN) — or the RST(AbortGoingAway) that
+// the peer's Runtime.Close sends with it, whichever arrives first — and a
+// JOIN that reached a restarted peer all end with io.EOF. The same ends
+// before our DONE was sent keep their errors (the before-done controls).
+// Package-level helpers of this file start with "g2".
 
 // g2N is the size of each direction's transfer.
 const g2N = 64 << 10
@@ -302,16 +303,20 @@ func TestG2PeerRestartAfterDone_L05(t *testing.T) {
 }
 
 // TestG2GoingAwayAfterDone_L05: the bound instance goes away after the
-// exchange finished. Four forms reach the waiting dialer: its redial is
+// exchange finished. Five forms reach the waiting dialer: its redial is
 // answered PREFACE_ACK(GOING_AWAY) or JOIN_ACK(GOING_AWAY) or GOAWAY as the
-// response to its JOIN, or — while the passive still waits for our lost
-// FIN_DELIVERED and DONE — the passive's Runtime closes and sends GOAWAY
-// (and RST(AbortGoingAway)) on the live lane. Each ends the session at once
-// and notes the instance as gone away exactly once (D21): cleanly (io.EOF)
-// after our DONE, with *AbortError{AbortGoingAway, Remote: true} before it
-// (before-done).
+// response to its JOIN; or — while the passive still waits for our lost
+// FIN_DELIVERED and DONE — the passive's Runtime closes and sends GOAWAY and
+// RST(AbortGoingAway) on the live lane, the GOAWAY first (goaway) or the RST
+// first (rst-first: a writer round already past its carrier controls when
+// the Shutdown runs places the RST alone, and the GOAWAY follows in the next
+// round; an RST(AbortGoingAway) injected ahead of the Shutdown stands in for
+// that round). Each ends the session at once and notes the instance as gone
+// away exactly once (D21; in rst-first through the GOAWAY that follows the
+// end): cleanly (io.EOF) after our DONE, with *AbortError{AbortGoingAway,
+// Remote: true} before it (before-done).
 func TestG2GoingAwayAfterDone_L05(t *testing.T) {
-	for _, form := range []string{"preface-ack", "join-ack", "goaway-response", "goaway"} {
+	for _, form := range []string{"preface-ack", "join-ack", "goaway-response", "goaway", "rst-first"} {
 		for _, done := range []bool{true, false} {
 			name := form + "/done"
 			if !done {
@@ -370,18 +375,23 @@ func g2GoingAway(t *testing.T, form string, done bool) {
 	first := a.lanes[0].c
 	a.mu.Unlock()
 	var strike time.Time // the end must follow it within 2 s
+	lane := form == "goaway" || form == "rst-first"
 	switch {
-	case form == "goaway":
+	case lane:
 		acHalfCloseSettled(t, a, b, g2N, 71)
-		if done {
+		if done || form == "rst-first" {
 			// Nothing the dialer writes from now on arrives (no fseq gap
 			// ever shows): its FIN_DELIVERED and DONE are placed and
-			// swallowed, so the passive keeps waiting for them.
+			// swallowed, so the passive keeps waiting for them; in
+			// rst-first its CLOSE after the RST is swallowed too, so the
+			// passive's lane is still up for the Shutdown that follows.
 			swallow := make([]rendrtest.WriteResult, 64)
 			for i := range swallow {
 				swallow[i] = rendrtest.WriteResult{Relative: true}
 			}
 			l1.ScriptWrites(rendrtest.Up, swallow...)
+		}
+		if done {
 			acReadToEOF(t, a, g2N, 71)
 			acWaitFor(t, time.Second, "the dialer placed its DONE", func() bool {
 				sent, _ := g2Done(a)
@@ -392,6 +402,9 @@ func g2GoingAway(t *testing.T, form string, done bool) {
 			}
 		}
 		strike = time.Now()
+		if form == "rst-first" {
+			g2ResetFirst(t, l1, a, first)
+		}
 		b.Shutdown() // the passive Runtime closes: GOAWAY, RST(AbortGoingAway), CLOSE
 	case done:
 		armed.Store(true)
@@ -402,7 +415,7 @@ func g2GoingAway(t *testing.T, form string, done bool) {
 		l1.Kill()
 	}
 	acDone(t, a, 10*time.Second)
-	if form != "goaway" {
+	if !lane {
 		strike = g2NoPathAt(t, w.a, a) // the redial follows the carrier's death
 	}
 	st := a.Status()
@@ -412,6 +425,8 @@ func g2GoingAway(t *testing.T, form string, done bool) {
 		t.Fatalf("end %v, want io.EOF: our DONE was sent", st.Err)
 	case !done && (!errors.As(st.Err, &ae) || ae.Code != AbortGoingAway || !ae.Remote):
 		t.Fatalf("end %v, want *AbortError{AbortGoingAway, Remote}", st.Err)
+	case !done && form == "rst-first" && ae.Msg != g2RstMsg:
+		t.Fatalf("end %v, want the injected RST's end (message %q)", st.Err, g2RstMsg)
 	}
 	if sent, peer := g2Done(a); sent != done || peer {
 		t.Fatalf("our DONE sent %v, the peer's received %v (stimulus)", sent, peer)
@@ -427,7 +442,7 @@ func g2GoingAway(t *testing.T, form string, done bool) {
 			t.Fatalf("NoteGoAway(%x), want the bound instance", inst)
 		}
 	}
-	if form == "goaway" {
+	if lane {
 		if !first.PeerGoAway() {
 			t.Fatal("no GOAWAY reached the live lane (stimulus)")
 		}
@@ -458,5 +473,33 @@ func g2AnswerGoAway(p *acPassive, n *atomic.Int32) func(net.Conn) error {
 			p.closed(h.Conn)
 		}()
 		return nil
+	}
+}
+
+// g2RstMsg is the message of the injected RST(AbortGoingAway): an
+// *AbortError carrying it proves that the RST ended the session, not the
+// GOAWAY (whose end says "peer going away").
+const g2RstMsg = "going away (injected first)"
+
+// g2ResetFirst gives the dialer a, whose one lane is first, the passive's
+// RST(AbortGoingAway) ahead of the passive's GOAWAY: it is injected after
+// the passive's next PING on l, before the test calls the passive's
+// Shutdown. That is the order a passive writer round produces when the
+// Shutdown runs after the round placed its carrier controls and before it
+// filled the lane: the round carries the RST alone, the next one the GOAWAY
+// and CLOSE. It returns once the RST ended a, with no GOAWAY seen first.
+func g2ResetFirst(t *testing.T, l *rendrtest.Link, a *Session, first *carrier.Conn) {
+	t.Helper()
+	var p [wire.RstFixedLen + len(g2RstMsg)]byte
+	wire.PutRst(p[:], &wire.Rst{Code: wire.RstGoingAway, Msg: []byte(g2RstMsg)})
+	l.InjectAfterNextFrame(rendrtest.Down, rendrtest.FramePing, rendrtest.FrameRst, 0, wire.SessionHandle, p[:])
+	acWaitFor(t, 3*time.Second, "the injected RST ended the dialer", func() bool {
+		return a.Status().State == StateEnded
+	})
+	if first.PeerGoAway() {
+		t.Fatal("a GOAWAY reached the dialer before the RST ended it (stimulus)")
+	}
+	if n := l.Stats().Session.FramesInjected; n != 1 {
+		t.Fatalf("%d frames injected, want the RST (stimulus)", n)
 	}
 }

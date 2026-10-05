@@ -27,10 +27,12 @@ import (
 // defaults the dialer's NoPathGrace of 15 s, and a PassiveRetain of 29 s
 // for a dialer NoPathGrace of 10 s, both expire before the 30 s Linger),
 // ErrSessionLost when its redial reached a restarted peer, *AbortError on
-// GOING_AWAY or GOAWAY — so an application that checks Status().Err after
-// Done saw a failure. Each of these ends is now the clean end (io.EOF) the
-// lost DONE would have given; an end before our DONE was sent keeps its
-// error (TestG2NoPathBeforeDone_L05). Helpers of this file start with "g2".
+// GOING_AWAY, GOAWAY or the RST(AbortGoingAway) the peer's Runtime.Close
+// sends with its GOAWAY (either may arrive first) — so an application that
+// checks Status().Err after Done saw a failure. Each of these ends is now
+// the clean end (io.EOF) the lost DONE would have given; an end before our
+// DONE was sent keeps its error (TestG2NoPathBeforeDone_L05). Helpers of
+// this file start with "g2".
 
 const (
 	g2N      = 256 << 10        // bytes each way
@@ -335,6 +337,12 @@ func TestG2DoneLostPeerRestarted_L05(t *testing.T) {
 //     sends GOAWAY and RST(AbortGoingAway) on the live carrier. The dialer
 //     ends with io.EOF; the passive with net.ErrClosed, as Runtime.Close
 //     resets every session that has not ended.
+//   - rst-first: as goaway, but the RST(AbortGoingAway) arrives first, as
+//     when the closing passive's writer round had placed its carrier
+//     controls before the Shutdown and carries the RST alone, the GOAWAY
+//     following in the next round. An RST injected after the passive's next
+//     PING stands in for that round; the Runtime.Close that follows sends
+//     the GOAWAY. The dialer still ends with io.EOF, at the RST.
 func TestG2DoneLostGoingAway_L05(t *testing.T) {
 	t.Run("preface-ack", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -384,6 +392,50 @@ func TestG2DoneLostGoingAway_L05(t *testing.T) {
 			}
 			if n := f.wire.count(func(fr frame) bool { return !fr.out && fr.typ == wire.TypeGoAway && fr.tap.side == dialerSide }); n != 1 {
 				t.Fatalf("the dialer read %d GOAWAY frames, want 1 (stimulus)", n)
+			}
+			if n := f.wire.count(func(fr frame) bool { return fr.done() && !fr.out }); n != 0 {
+				t.Fatalf("%d DONE frames were read, want none (stimulus)", n)
+			}
+			f.close()
+		})
+	})
+	t.Run("rst-first", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := g2NewFixture(t, opts{})
+			dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
+			v := g2Exchange(t, f, dc, pc, dialerSide)
+			g2Tap(t, f, dialerSide).setPlan(func(*tap, []frame) planVerdict { return planVerdict{swallow: true} })
+			g2FinishFirst(t, dc, v)
+			if _, ok := f.wire.wait(10*time.Second, func(fr frame) bool {
+				return fr.done() && fr.out && fr.fate == fateSwallowed && fr.tap.side == dialerSide
+			}); !ok {
+				t.Fatal("the dialer placed no DONE")
+			}
+			var rst [wire.RstFixedLen + len("going away")]byte
+			wire.PutRst(rst[:], &wire.Rst{Code: wire.RstGoingAway, Msg: []byte("going away")})
+			f.l.InjectAfterNextFrame(rendrtest.Down, rendrtest.FramePing, rendrtest.FrameRst, 0, wire.SessionHandle, rst[:])
+			read := func(keep func(fr frame) bool) int {
+				return f.wire.count(func(fr frame) bool { return !fr.out && fr.tap.side == dialerSide && keep(fr) })
+			}
+			isRst := func(fr frame) bool { return fr.typ == wire.TypeRst && fr.rst == wire.RstGoingAway }
+			isGoAway := func(fr frame) bool { return fr.typ == wire.TypeGoAway }
+			st := waitEnded(t, dc, time.Minute)
+			if st.Err != io.EOF {
+				t.Fatalf("dialer ended with %v, want io.EOF: its DONE was sent, its FIN acknowledged and the peer's FIN delivered", st.Err)
+			}
+			if r, g := read(isRst), read(isGoAway); r != 1 || g != 0 {
+				t.Fatalf("the dialer read %d RST(AbortGoingAway) and %d GOAWAY frames by its end, want the RST alone (stimulus)", r, g)
+			}
+			if n := f.l.Stats().Session.FramesInjected; n != 1 {
+				t.Fatalf("%d frames injected, want the RST (stimulus)", n)
+			}
+			f.p.Close() // the GOAWAY follows
+			if pst := g2Ended(t, pc, 10*time.Second); !errors.Is(pst.Err, net.ErrClosed) {
+				t.Fatalf("passive ended with %v, want net.ErrClosed (its Runtime closed)", pst.Err)
+			}
+			g2Ended(t, dc, 10*time.Second)
+			if g := read(isGoAway); g != 1 {
+				t.Fatalf("the dialer read %d GOAWAY frames after its end, want 1 (stimulus)", g)
 			}
 			if n := f.wire.count(func(fr frame) bool { return fr.done() && !fr.out }); n != 0 {
 				t.Fatalf("%d DONE frames were read, want none (stimulus)", n)
