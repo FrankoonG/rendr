@@ -13,7 +13,26 @@ import (
 
 	"github.com/FrankoonG/rendr/v2/carrier/tcp"
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
+
+// Every test that opens sockets is a leak oracle (L52, L66; design §0.14
+// B11): it takes a goroutine (and, on Linux, fd) baseline first and checks
+// it once every conn and listener it opened is closed (g10NoLeak).
+
+// g10NoLeak takes rendrtest.AssertNoLeak's baseline and returns its check,
+// to be deferred first so that it runs after every other deferred close.
+// The check is skipped once the test failed: a failed test may leave its
+// goroutines behind, and its failure is the report.
+func g10NoLeak(t *testing.T) func() {
+	t.Helper()
+	check := rendrtest.AssertNoLeak(t)
+	return func() {
+		if !t.Failed() {
+			check()
+		}
+	}
+}
 
 // syscaller is a conn exposing its socket (both *carrier.OwnedTCP and
 // *net.TCPConn).
@@ -42,6 +61,7 @@ func sockopt(t *testing.T, c syscaller, level, opt int) int {
 // A conn from Go's default dialer, which enables keepalive, reads 1 through
 // the same probe: the zeros are real readings, not a broken probe.
 func TestTCPKeepAliveOff_L26(t *testing.T) {
+	defer g10NoLeak(t)()
 	ln, err := tcp.Listen("tcp", "127.0.0.1:0", tcp.Options{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -108,6 +128,7 @@ func TestTCPKeepAliveOff_L26(t *testing.T) {
 // any socket is opened; loopback literals pass the check; AllowNonLoopback
 // lifts it; other networks are not TCP.
 func TestLoopbackOnlyByDefault(t *testing.T) {
+	defer g10NoLeak(t)()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	refused := []struct{ network, address string }{
@@ -171,6 +192,7 @@ func TestLoopbackOnlyByDefault(t *testing.T) {
 // first (the first address alone used to be dialed), and Listen binds the
 // address net.Listen binds (IPv4 preferred), not the first one resolved.
 func TestHostNameLikeNet(t *testing.T) {
+	defer g10NoLeak(t)()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", "localhost")

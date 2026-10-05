@@ -24,7 +24,12 @@ import (
 // for byte; it can reset all the connections it carries (SO_LINGER 0, so
 // each rendr end sees a TCP RST), and it reports every connection that
 // ended in an error other than its own reset — a TCP RST sent by a rendr
-// end (ECONNRESET on Linux, WSAECONNRESET on Windows) included.
+// end (ECONNRESET on Linux, WSAECONNRESET on Windows) included. Every test
+// of the group is a leak oracle (L52, L66; design §0.14 B11): it takes
+// rendrtest.AssertNoLeak's baseline first and runs its check once both
+// Runtimes, their listeners and the relay are closed, so a goroutine (or,
+// on Linux, an fd) that a carrier, a session or a Runtime left behind
+// fails the test.
 
 // relay is a TCP forwarder between a dialer and a passive listener.
 type relay struct {
@@ -263,12 +268,17 @@ func (lp *loopPair) open(t testing.TB) (dc, pc *rendr.Conn) {
 	return r.c, pc
 }
 
-// close closes both Runtimes and requires that nothing is left: no session,
-// no buffered byte (R7), nothing abandoned.
+// close closes both Runtimes (each closes its Listeners and their
+// net.Listeners) and the relay, joining its goroutines, and requires that
+// nothing is left: no session, no buffered byte (R7), nothing abandoned.
+// The test's leak check runs after it (design §0.14 B11).
 func (lp *loopPair) close(t testing.TB) {
 	t.Helper()
 	lp.d.Close()
 	lp.p.Close()
+	if lp.relay != nil {
+		lp.relay.close()
+	}
 	for _, rt := range []*rendr.Runtime{lp.d, lp.p} {
 		st := rt.Status()
 		sc := st.Sessions
@@ -303,6 +313,7 @@ func waitEnded(t testing.TB, c *rendr.Conn, within time.Duration) rendr.SessionS
 // or an early EOF; each reset is one death migration and one redial
 // (stimulus proof: four resets, four deaths, five carriers).
 func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{})
 	dc, pc := lp.open(t)
 	const total = 16 << 20
@@ -353,6 +364,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 	waitEnded(t, dc, 30*time.Second)
 	waitEnded(t, pc, 30*time.Second)
 	lp.close(t)
+	check()
 }
 
 // TestLoopbackCloseWithUnreadNoReset_L05: closing never resets a TCP
@@ -364,6 +376,7 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 // the relay sees every connection end in a FIN on both sides — no TCP RST
 // (ECONNRESET) at all.
 func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{})
 	const rounds, size = 200, 1 << 20
 	msg := make([]byte, size)
@@ -407,6 +420,7 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d", n, c, lp.relay.lastEr.Load(), rounds)
 	}
 	lp.close(t)
+	check()
 }
 
 // onlyWriter hides io.ReaderFrom so that io.Copy uses plain Writes.
@@ -431,6 +445,7 @@ type onlyWriter struct{ io.Writer }
 // Asserted in the non-race lane; the race lane runs a short window and
 // logs the figure.
 func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
 	cfg := rendr.Config{PingBusy: 10 * time.Millisecond}
 	d, err := rendr.NewRuntime(cfg)
 	if err != nil {
@@ -505,6 +520,7 @@ func TestSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	waitEnded(t, dc, 30*time.Second)
 	waitEnded(t, pc, 30*time.Second)
 	lp.close(t)
+	check()
 }
 
 // countMallocs runs f at least n times and for at least window, with the

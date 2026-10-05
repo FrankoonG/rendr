@@ -8,10 +8,28 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // Real-loopback tests (outside synctest bubbles, real time): the OwnedTCP
 // write path and the carrier half of the steady-state allocation gate.
+// Each is a leak oracle (L52, L66; design §0.14 B11): it takes a goroutine
+// (and, on Linux, fd) baseline first and checks it once its carriers, the
+// peer and both sockets are closed (g10NoLeak).
+
+// g10NoLeak takes rendrtest.AssertNoLeak's baseline and returns its check,
+// to be deferred first so that it runs after every other deferred close.
+// The check is skipped once the test failed: a failed test may leave its
+// goroutines behind, and its failure is the report.
+func g10NoLeak(t *testing.T) func() {
+	t.Helper()
+	check := rendrtest.AssertNoLeak(t)
+	return func() {
+		if !t.Failed() {
+			check()
+		}
+	}
+}
 
 // tcpPair returns a connected pair of loopback TCP conns (127.0.0.1).
 func tcpPair(t testing.TB) (client, server *net.TCPConn) {
@@ -63,6 +81,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // parses an intact stream; a planned retirement ends with CloseWrite (an
 // orderly FIN after our CLOSE, not a reset).
 func TestVectoredWriteOnOwnedTCP_L41(t *testing.T) {
+	defer g10NoLeak(t)()
 	env := hEnv()
 	cl, sv := tcpPair(t)
 	own := NewOwnedTCP(cl)
@@ -156,6 +175,7 @@ func (e *allocEP) WriteBlocked(*Conn)                       {}
 // the name-based coverage gate (W17) cannot pass on a half.
 func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 	t.Run("writer", func(t *testing.T) {
+		defer g10NoLeak(t)()
 		env := hEnv()
 		cl, sv := tcpPair(t)
 		defer sv.Close()
@@ -212,6 +232,7 @@ func TestCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 		}
 	})
 	t.Run("reader", func(t *testing.T) {
+		defer g10NoLeak(t)()
 		env := hEnv()
 		cl, sv := tcpPair(t)
 		defer sv.Close()
