@@ -86,7 +86,8 @@ func (s *Session) maybeDoneLocked() {
 }
 
 // rstLocked stores the first RST received (the actor ends the session with
-// *AbortError{Remote: true}; no RST is sent back).
+// *AbortError{Remote: true}, or with io.EOF once our DONE was sent; no RST
+// is sent back).
 func (s *Session) rstLocked(p []byte) error {
 	r, err := wire.ParseRst(p)
 	if err != nil {

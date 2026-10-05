@@ -99,10 +99,11 @@ func (l *lane) Control(c *carrier.Conn, h wire.Header, p []byte) error {
 
 // WriteBlocked is called by the carrier's watchdog when the current batch
 // write has been in progress for PingBusy (design §4.6, §4.8): duties held
-// by this lane move to a non-blocked lane — one on which Retire was called
-// if no other is writable — which is woken (the ACK duty, also while
-// ackDelayAt is armed, C30), and fact factWriteBlocked tells the actor to
-// move a SCHED resend. It must not block.
+// by this lane move to a non-blocked lane — a leaving one (Retire called,
+// or dropped by the applied SCHED: ackLeavingLocked) if no other is
+// writable — which is woken (the ACK duty, also while ackDelayAt is armed,
+// C30), and fact factWriteBlocked tells the actor to move a SCHED resend.
+// It must not block.
 func (l *lane) WriteBlocked(c *carrier.Conn) {
 	s := l.s
 	s.mu.Lock()
