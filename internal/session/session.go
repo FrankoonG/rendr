@@ -45,7 +45,8 @@ func (s *Session) State() State {
 // actor (published under the session lock together with every routing
 // change, so the reported active carrier always equals the routed one,
 // L27), plus the data counters and per-carrier estimator figures read at
-// call time.
+// call time; a dead carrier's figures are final once it was joined (the
+// step that prunes it records its last Stats, §0.14 B7).
 func (s *Session) Status() Status {
 	return s.status()
 }

@@ -58,8 +58,9 @@ type attemptStep struct {
 // attempt is immediate; after the n-th consecutive failure the next starts
 // at max(previous start + min(0.5 s·2ⁿ, cap) × U[0.8, 1.2), previous end),
 // measured between attempt starts, so an attempt hung until DialTimeout is
-// followed at once by the next one; Refused resets n and counts as failure
-// 0; there is never more than one attempt at a time per slot (L22).
+// followed at once by the next one; the slot's first Refused since it
+// attached resets n and counts as failure 0 (§0.14 B6: later ones count as
+// failures); there is never more than one attempt at a time per slot (L22).
 func TestRedialCadenceStartTimes_L20_L22(t *testing.T) {
 	const dialTimeout = 10 * time.Second
 	fast := attemptStep{20 * ms, OutcomeFailed}
@@ -68,7 +69,7 @@ func TestRedialCadenceStartTimes_L20_L22(t *testing.T) {
 		fast, fast, fast, fast, fast, // 0.5, 1, 2, 4, 4 s (cap)
 		hung,       // backoff 4 s < 10 s: next starts when it ends
 		fast, fast, // keeps the capped interval
-		{30 * ms, OutcomeRefused}, // PREFACE completed: n reset, counts as failure 0
+		{30 * ms, OutcomeRefused}, // the first refusal: n reset, counts as failure 0
 		fast, fast,                // 1 s, 2 s again
 		hung, hung, // back-to-back hung attempts
 		fast,

@@ -228,9 +228,10 @@ func echoOne(ctx context.Context, ln *rendr.Listener) (rendr.SessionStatus, erro
 // then Done is closed. Only after that may the Runtime close: Runtime.Close
 // resets every session that has not ended — also a closed one that is still
 // finishing — which then ends with net.ErrClosed and its peer with
-// *rendr.AbortError instead of io.EOF. (A Close while the peer may still
-// send discards what arrives and can reset the peer: AbortClosed, or
-// AbortLinger after Config.Linger.)
+// *rendr.AbortError instead of io.EOF (unless both FINs had already been
+// delivered and only the final confirmation was outstanding). (A Close
+// while the peer may still send discards what arrives and can reset the
+// peer: AbortClosed, or AbortLinger after Config.Linger.)
 func finish(ctx context.Context, c *rendr.Conn) (rendr.SessionStatus, error) {
 	c.Close()
 	select {

@@ -135,8 +135,10 @@ func TestDeadlineSemantics_L06(t *testing.T) {
 	})
 
 	t.Run("past deadline wakes five readers", func(t *testing.T) {
-		// Real time: Reads serialize on rmu, and goroutines queued on a
-		// mutex are not durably blocked, so a bubble could never settle.
+		// Real time. Since §0.14 B12 Reads serialize on the rsem channel
+		// semaphore, so queued Reads block durably and a bubble would work
+		// as well; TestQueuedCallsDeadline_L06/reads covers this case in
+		// one.
 		s := stSession(stOpt{role: RolePassive})
 		done := make(chan stIO, 5)
 		for range 5 {

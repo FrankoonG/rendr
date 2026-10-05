@@ -48,9 +48,9 @@ var (
 // allocating anything sized by it.
 // A PING first frame (probe carrier) is also recorded as the Conn's pending
 // PONG, so a sessionless carrier answers it as its first frame once
-// started. Every failure closes nc exactly once, on a guarded goroutine
-// (CloseConn), and returns an error; no session state exists at that
-// point.
+// started. Every failure closes nc exactly once, on guarded goroutines
+// (closeOnce.async: SetDeadline(now) and Close, which does not wait for
+// it), and returns an error; no session state exists at that point.
 //
 // Further contracts of this implementation: a PREFACE whose kind is not
 // stream (a datagram carrier needs a packet conn, M2) is closed silently

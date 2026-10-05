@@ -97,7 +97,12 @@ a passive limit of at least Peers × carrier factories. A bond session dials
 one member per factory, up to `MaxCarriersPerSession`: give a Peer used for
 bond sessions no more factories than the passive's `MaxCarriersPerSession`,
 or the passive refuses the surplus members and the dialer redials them
-about every `RejoinBackoffMax` for the session's whole life.
+about every `RejoinBackoffMax` for the session's whole life. Better, leave
+the passive one carrier more than a session holds (a bond: its factories;
+a selector: 2). Otherwise, when the dialer loses a carrier that the passive
+still holds, the replacement is refused until the passive's own liveness
+check drops the old one, up to `PingIdle` + `DeadMax` (14 s) later, which
+leaves little of the default 15 s `NoPathGrace`.
 
 ## Deployment patterns
 
@@ -160,10 +165,12 @@ Semantics in brief:
   then `StateEnded` and `Status().Err` final (`io.EOF` after a clean
   finish).
 - `Runtime.Close` resets every session that has not ended, including closed
-  ones still finishing in the background (they end with `net.ErrClosed`, the
-  peer's with `*AbortError`). For a clean end on both sides, read until
-  `io.EOF`, `Close`, wait for `Done` (bounded by your own context), and only
-  then call `Runtime.Close`, as [`examples/mtls`](examples/mtls) does:
+  ones still finishing in the background (they end with `net.ErrClosed`;
+  their peers end with `*AbortError`, or with `io.EOF` if both FINs had
+  already been delivered and only the final confirmation was outstanding).
+  For a clean end on both sides, read until `io.EOF`, `Close`, wait for
+  `Done` (bounded by your own context), and only then call `Runtime.Close`,
+  as [`examples/mtls`](examples/mtls) does:
 
   ```go
   _, err = io.Copy(dst, conn) // until the peer's FIN (Read returned io.EOF)
@@ -201,9 +208,13 @@ limit. Carrier reader stages add about 16 KiB per live carrier outside the
 budget; `Status.BufferedBytes` reports both.
 
 An idle session costs about 70 KiB per side with one carrier (selector) and
-about 185 KiB per side as a three-member bond, mostly goroutine stacks and
-the carriers' reader stages and write batches. Each side runs one goroutine
-per session plus two per carrier.
+about 170–185 KiB per side as a three-member bond, mostly goroutine stacks
+and the carriers' reader stages and write batches. Each side runs one
+goroutine per session plus two per carrier. While idle, a session's
+carriers wake about every `PingIdle` to send and answer liveness PINGs and
+its scheduler sleeps, except that every dialer session of a Peer with two or
+more factories wakes once per probe sample of the Peer: 90 times a minute
+with three factories at the default 2 s `Probe.Interval`.
 
 ### Selector self-load guard: limitation
 

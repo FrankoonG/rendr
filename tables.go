@@ -496,11 +496,12 @@ type hsSlot struct {
 
 // hsTable is the handshake slot LRU (plan §3.5, L48): at most limit
 // unfinished handshakes per Runtime; when full, admitting a new one evicts
-// the oldest (the caller closes its conn: SetDeadline(now) + Close on a
-// guarded goroutine, never in the accept loop) and counts the eviction. A
-// new handshake is never refused while the Runtime runs; once drain ran
-// (Runtime.Close) the table admits nothing more, so no handshake can start
-// after the drain that was meant to close every one of them.
+// the oldest (the caller closes its conn with closeWatched: SetDeadline(now)
+// and Close on two watched goroutines, never in the accept loop) and counts
+// the eviction. A new handshake is never refused while the Runtime runs;
+// once drain ran (Runtime.Close) the table admits nothing more, so no
+// handshake can start after the drain that was meant to close every one of
+// them.
 type hsTable struct {
 	mu         sync.Mutex
 	limit      int     // Handshake.MaxConcurrent
@@ -516,10 +517,11 @@ func newHSTable(limit int) *hsTable { return &hsTable{limit: limit} }
 // admit occupies a slot for nc. When all slots were taken, the oldest
 // unfinished handshake is evicted and its conn returned for the caller to
 // close; evicted is nil otherwise. When g is non-nil, an eviction adds one
-// member to g under the table lock — the goroutine that will close the
-// evicted conn — so that the member exists before a later drain returns
-// (Runtime.Close joins g after its drain). After drain, admit occupies
-// nothing and returns a nil slot: the caller closes nc itself.
+// member to g under the table lock — the first of the two goroutines that
+// will close the evicted conn; closeWatched adds the second outside the
+// lock while the first is held — so that the member exists before a later
+// drain returns (Runtime.Close joins g after its drain). After drain, admit
+// occupies nothing and returns a nil slot: the caller closes nc itself.
 func (h *hsTable) admit(nc net.Conn, g *group) (s *hsSlot, evicted net.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

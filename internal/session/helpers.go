@@ -69,8 +69,9 @@ func (s *Session) peerWindowLocked(w uint32) {
 // §4.6): rx > sNext returns an error (the passive answers BAD_REQUEST; the
 // dialer kills that carrier with protocol_violation) and changes nothing;
 // rx > sBase advances sBase to rx (trims spans, frees chunks, counts the
-// acknowledged bytes, sets lastAdvance, wakes the application writer and
-// the data lanes). It never touches peerLimit.
+// acknowledged bytes, sets lastAdvance, restarts the IdleTimeout clock
+// (lastData, §0.14 B5), wakes the application writer and the data lanes).
+// It never touches peerLimit.
 func (s *Session) applyRxNextLocked(rx uint64) error {
 	st := &s.st
 	if rx > st.sNext {

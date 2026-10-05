@@ -243,7 +243,9 @@ func (a *actor) refuseAdopt(ad *adopt) {
 // whose first response (an OK) was placed joins the routing (L22: a carrier
 // is confirmed before it carries data) and is announced (CarrierUp); the
 // epoch-0 sender already routes since Confirm and is only announced. A
-// refused or dead lane is dropped from the list unannounced.
+// refused lane is dropped from the list unannounced; a dead lane already
+// left it when it died (removeLaneLocked), so the dead case below is only a
+// guard.
 func (a *actor) lanesConfirmedLocked(now time.Time) {
 	route := false
 	k := 0

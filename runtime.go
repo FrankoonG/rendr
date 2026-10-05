@@ -204,10 +204,11 @@ func (rt *Runtime) Status() Status {
 // net.ErrClosed.
 //
 // Sessions reset by Close end with net.ErrClosed, their peers' with
-// *AbortError (AbortGoingAway). For a clean end, let every session finish
-// first: Read until io.EOF, Conn.Close, wait until Conn.Done is closed
-// (bounded by your own context; Conn.Status().Err is io.EOF after a clean
-// finish), and only then Close.
+// *AbortError (AbortGoingAway), or with io.EOF where both FINs had already
+// been delivered and only the final confirmation was outstanding. For a
+// clean end, let every session finish first: Read until io.EOF,
+// Conn.Close, wait until Conn.Done is closed (bounded by your own context;
+// Conn.Status().Err is io.EOF after a clean finish), and only then Close.
 //
 // A concurrent or later Close waits for the first one to finish, except
 // when it is called from Config.OnEvent (it then returns at once: the first

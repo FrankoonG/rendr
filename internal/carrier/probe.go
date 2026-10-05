@@ -254,8 +254,9 @@ func earliest(a, b time.Time) time.Time {
 // then drops them is redialled like one that refuses them (the spacing
 // grows to Probe.BackoffMax) instead of at dial speed, while the first
 // replacement of a carrier that lived longer than Backoff(n) still starts
-// at once. Plan §3.6 resets n at every completed PREFACE exchange; for
-// probe slots that would loop on such a path, so a probe establishment
+// at once. Plan §3.6 resets n at a completed PREFACE exchange (since §0.14
+// B6 only at a session slot's first refusal or inside its recovery window);
+// for probe slots that would loop on such a path, so a probe establishment
 // leaves n alone (resultLocked).
 func (r *healthRun) endedLocked(i int, s *probeSlot, cause Cause, now time.Time) {
 	h := r.h

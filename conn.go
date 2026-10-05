@@ -50,10 +50,11 @@ func (c *Conn) Write(p []byte) (int, error) { return c.s.Write(p) }
 // (AbortClosed if the peer keeps sending, AbortLinger at expiry); Done is
 // closed once it has ended. Runtime.Close resets a closed session that has
 // not finished yet (it ends with net.ErrClosed, the peer's with
-// *AbortError). The clean end: Read until io.EOF (the peer's FIN arrived,
-// so Close discards nothing), Close (this side's FIN, unless CloseWrite sent
-// it), wait for Done bounded by your own context (Status().Err is io.EOF
-// after a clean finish), and only then Runtime.Close.
+// *AbortError, or with io.EOF if both FINs had already been delivered). The
+// clean end: Read until io.EOF (the peer's FIN arrived, so Close discards
+// nothing), Close (this side's FIN, unless CloseWrite sent it), wait for
+// Done bounded by your own context (Status().Err is io.EOF after a clean
+// finish), and only then Runtime.Close.
 func (c *Conn) Close() error { return c.s.Close() }
 
 // CloseWrite sends one FIN after everything written so far (idempotent);

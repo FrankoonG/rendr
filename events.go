@@ -11,8 +11,9 @@ import "time"
 // switch, else the death cause of the lost carrier, or CauseRetired when it
 // ended by a CLOSE instead. The passive of a selector session takes its
 // counts from the dialer's scheduling updates and emits their events when
-// it applies the update that carries them, at most 4 per update (the counts
-// are the record): From is the carrier the previously applied update named
+// it applies the update that carries them: one per migration, at most 4 per
+// update and at least one for each cause that rose (the counts are the
+// record). From is the carrier the previously applied update named
 // (initially the passive's first sending carrier), To the one this update
 // names, and Cause is CauseQuality, CauseRetired, or CauseNone for a death,
 // whose cause the passive does not learn. In a bond session each side

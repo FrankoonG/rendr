@@ -24,7 +24,8 @@ var (
 	// UNKNOWN_SESSION, the peer restarted (plan §3.4), or a pending session
 	// was withdrawn by its dialer.
 	ErrSessionLost error = &sessionError{"rendr: session lost"}
-	// ErrAborted: the peer reset the session; *AbortError matches it.
+	// ErrAborted: the session was reset, by the peer or, for
+	// AbortExhausted, by this side; *AbortError matches it.
 	ErrAborted error = &sessionError{"rendr: session aborted"}
 	// ErrRejected: Dial was rejected by the peer application; *RejectError matches it.
 	ErrRejected error = &sessionError{"rendr: rejected"}

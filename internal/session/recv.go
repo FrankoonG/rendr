@@ -52,15 +52,16 @@ import (
 // window is always taken; when it pushes the charge above 2·W, out-of-order
 // segments are shed, highest first and counted the same way (shedLocked).
 // So between Data calls the charge is at most 2·W whenever out-of-order data
-// is held; a session's Budget footprint adds its carriers' reader stages,
-// one run per lane (D29). With nothing held out of order the charge is the
-// in-order queue's alone, which nothing can shed: the window bounds its
-// bytes, and dense runs, references holding whole frames (class rounding
-// stays below 2×) and the room a reference offers to the bytes after it keep
-// the charge within about 2× those bytes — except a frame kept by reference
-// for at least 16 KiB of new bytes while other segments held the rest of it
-// (up to 4× for the 64 KiB frames rendr senders produce, more for larger
-// frames).
+// is held; a session's Budget footprint adds one run per lane (D29), while
+// its carriers' reader stages are charged to the separate stage account
+// outside MaxBufferedBytes (§0.14 B2). With nothing held out of order the
+// charge is the in-order queue's alone, which nothing can shed: the window
+// bounds its bytes, and dense runs, references holding whole frames (class
+// rounding stays below 2×) and the room a reference offers to the bytes
+// after it keep the charge within about 2× those bytes — except a frame kept
+// by reference for at least 16 KiB of new bytes while other segments held
+// the rest of it (up to 4× for the 64 KiB frames rendr senders produce, more
+// for larger frames).
 //
 // Recovery. Dropped and shed bytes are not lost to the stream: the sender
 // still holds them unacknowledged. They return when they are retransmitted:

@@ -77,7 +77,9 @@ type MigrationCounts struct {
 	Death, Quality, Explicit uint64
 }
 
-// CarrierStatus is one carrier of a session.
+// CarrierStatus is one carrier of a session. A dead carrier's figures are
+// final once its goroutines have finished (or were abandoned) and it was
+// released.
 type CarrierStatus struct {
 	ID       CarrierID
 	Name     string // factory name ("" on the passive side)

@@ -146,7 +146,9 @@ func TestUnknownSessionIsSessionLost_L19(t *testing.T) {
 		const oneWay = 5 * time.Millisecond
 		a := e.path("a", oneWay)
 		dc, pc := e.open(e.peer(a), rendr.DialOptions{NoPathGrace: time.Minute})
-		exchange(t, dc, pc, 256<<10, 193) // the passive's idle clock starts at its last read
+		// The passive's idle clock starts at its last read or at the last
+		// acknowledged delivery of its data, whichever is later.
+		exchange(t, dc, pc, 256<<10, 193)
 
 		a.link.SetRefuse(true)
 		cut := time.Now()
