@@ -25,11 +25,18 @@ import (
 // Session is one stream session: its stream state, its lanes and its actor.
 // All exported methods are safe for concurrent use.
 //
-// Lock order (design §3.2): wmu / rmu → mu → carrier.Conn's own lock. wmu and
-// rmu serialize application Writes and Reads and are held across the
-// application copy; mu guards st, ctl, lanes and every lane's mutable fields
-// and is never held across I/O, an embedder call, a callback, a blocking
-// channel operation or a payload copy of 16 KiB or more.
+// Lock order (design §3.2, revised by §0.14 B12): wsem / rsem → mu →
+// carrier.Conn's own lock. wsem and rsem serialize application Writes and
+// Reads: each is held for a whole call, across the application copy and the
+// waits for room or data. They are 1-slot channel semaphores, not mutexes, so
+// a call queued behind another blocks durably in a testing/synctest bubble
+// (a goroutine waiting in sync.Mutex.Lock is not durably blocked, and a
+// bubble with two concurrent Writes or Reads could never advance its
+// clock). A call blocks on a semaphore only without mu; under mu it merely
+// tries it (a non-blocking send), so the order cannot invert (acquireLocked,
+// app.go). mu guards st, ctl, lanes and every lane's mutable fields and is
+// never held across I/O, an embedder call, a callback, a blocking channel
+// operation or a payload copy of 16 KiB or more.
 type Session struct {
 	env  *Env     // immutable
 	p    Params   // immutable
@@ -44,7 +51,15 @@ type Session struct {
 	// peer only after observing bound (design §6.6).
 	bound atomic.Bool
 
-	mu, wmu, rmu sync.Mutex
+	mu sync.Mutex
+
+	// wsem and rsem are the Write and Read call semaphores (cap 1, created
+	// on first use under mu; a token in the buffer means a call holds it).
+	// closing is created under mu by the first call that has to wait for
+	// one, while the session is not closed, and closed (then cleared) by the
+	// first Close: a waiting call observes Close directly instead of
+	// through the holder (acquireLocked).
+	wsem, rsem, closing chan struct{}
 
 	st    stream                     // (S)
 	ctl   control                    // (A)
@@ -176,7 +191,7 @@ type stream struct {
 	rstIn     *wire.Rst // the RST received (fact factRst)
 	exhausted bool      // a Write would have passed Params.OffsetLimit (fact factExhausted)
 	facts     uint32    // fact bits (fact*) not yet taken by the actor (takeFactsLocked)
-	lastData  time.Time // last application Write or Read commit (the IdleTimeout clock)
+	lastData  time.Time // the IdleTimeout clock: the last application Write or Read commit or acknowledged delivery of our data (an sBase advance, B5)
 
 	// Counters (Status).
 	txBytes   uint64 // bytes committed by application Writes

@@ -16,11 +16,16 @@ import (
 // the deadline is moved); then the buffered bytes. The EOF condition and the
 // end only arise when nothing is readable. The copy into p happens outside
 // the session lock; the commit afterwards decides "Read won" (data
-// returned) or "Close won" ((0, net.ErrClosed), data discarded).
+// returned) or "Close won" ((0, net.ErrClosed), data discarded). Concurrent
+// Reads are serialized (rsem, acquireLocked).
 func (s *Session) Read(p []byte) (int, error) {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
 	s.mu.Lock()
+	sem, ok := s.acquireLocked(&s.rsem)
+	if !ok {
+		s.mu.Unlock()
+		return 0, errClosed
+	}
+	defer releaseCall(sem)
 	st := &s.st
 	if len(p) == 0 {
 		closed := st.closed
@@ -119,9 +124,16 @@ func (s *Session) Read(p []byte) (int, error) {
 // session end → its error; write deadline → os.ErrDeadlineExceeded. A
 // partial acceptance returns (k, err); after a deadline the k bytes are
 // delivered (L06), after a session failure they are not guaranteed.
+// Concurrent Writes are serialized (wsem, acquireLocked): one Write's bytes
+// are contiguous in the stream, never interleaved with another's.
 func (s *Session) Write(p []byte) (int, error) {
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
+	s.mu.Lock()
+	sem, ok := s.acquireLocked(&s.wsem)
+	if !ok {
+		s.mu.Unlock()
+		return 0, errClosed
+	}
+	defer releaseCall(sem)
 	var poll *time.Timer
 	n, err := s.write(p, &poll)
 	if poll != nil {
@@ -131,9 +143,9 @@ func (s *Session) Write(p []byte) (int, error) {
 }
 
 // write runs Write's rounds; poll is the lazily created budget-poll timer.
+// It is called with s.mu held and returns with it released.
 func (s *Session) write(p []byte, poll **time.Timer) (int, error) {
 	n := 0
-	s.mu.Lock()
 	if len(p) == 0 {
 		st := &s.st
 		var err error
@@ -207,10 +219,68 @@ func (s *Session) CloseWrite() error {
 func (s *Session) Close() error {
 	s.mu.Lock()
 	s.closeLocked(time.Now())
+	if c := s.closing; c != nil {
+		// Calls waiting for rsem or wsem return net.ErrClosed now. closing
+		// is never recreated: acquireLocked checks st.closed first.
+		s.closing = nil
+		close(c)
+	}
 	s.mu.Unlock()
 	s.ringActor()
 	return nil
 }
+
+// acquireLocked takes the call semaphore *sem (rsem or wsem) for one Read or
+// Write (§0.14 B12). It is called with s.mu held and returns with it held;
+// ok is false when the application's Close came first: the call then
+// returns net.ErrClosed without the semaphore. The semaphore is created on
+// first use, so a Session built without a constructor works too.
+//
+// Uncontended, it costs one non-blocking send. Contended, it releases s.mu
+// and waits on channels only, so the wait is durable in a synctest bubble,
+// until the holder releases the semaphore or Close closes s.closing: Close
+// is observed directly. Every other condition reaches a waiting call
+// through the holder, as with the former mutexes: a deadline (per
+// direction), CloseWrite (Writes) and the session's end wake the holder,
+// whose only blocking points are rwake or wwake and the budget poll (or a
+// bounded copy), so it returns at once, and the next call meets the same
+// condition as soon as it holds the semaphore (the precedence of Read and
+// Write is unchanged). A deadline that passes while calls queue thus fails
+// all of them at that instant. Go's net package (internal/poll's fdMutex)
+// treats its lock waiters the same way; observing deadlines directly would
+// cost a broadcast per Set*Deadline call.
+func (s *Session) acquireLocked(sem *chan struct{}) (chan struct{}, bool) {
+	ch := *sem
+	if ch == nil {
+		ch = make(chan struct{}, 1)
+		*sem = ch
+	}
+	select {
+	case ch <- struct{}{}:
+		return ch, true
+	default:
+	}
+	if s.st.closed {
+		return nil, false
+	}
+	if s.closing == nil {
+		s.closing = make(chan struct{})
+	}
+	closing := s.closing
+	s.mu.Unlock()
+	select {
+	case ch <- struct{}{}:
+		s.mu.Lock()
+		return ch, true
+	case <-closing:
+		s.mu.Lock()
+		return nil, false
+	}
+}
+
+// releaseCall returns a call semaphore taken by acquireLocked; the token is in
+// the buffer, so it never blocks.
+func releaseCall(sem chan struct{}) { <-sem }
 
 // SetReadDeadline implements net.Conn deadline semantics for reads (L06): a
 // per-direction generation timer; every call wakes blocked readers to

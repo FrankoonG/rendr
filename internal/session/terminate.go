@@ -15,10 +15,17 @@ import (
 // window re-advertisement deadline (D18, W6).
 
 // terminationLocked applies the end rules of an open or closing session in
-// precedence order and arms their deadlines. The IdleTimeout clock counts
-// from the last application Write or Read commit, but never from before
-// the session opened: a pending phase (passive) or an opening phase
-// (dialer) longer than IdleTimeout is not idleness of the open session.
+// precedence order and arms their deadlines. The IdleTimeout clock
+// (st.lastData) counts from the last application Write or Read commit or the
+// last acknowledged delivery of our data (an sBase advance, §0.14 B5), but
+// never from before the session opened: a pending phase (passive) or an
+// opening phase (dialer) longer than IdleTimeout is not idleness of the open
+// session. Idle therefore means that the application committed no Write or
+// Read and nothing of ours was delivered for IdleTimeout: a Write blocked
+// behind a slow reader whose bytes keep arriving is not idle, a peer that
+// stops reading is. The data path moves the clock without ringing the
+// actor; the deadline armed below fires at the old time, and that step
+// re-arms it from the new one.
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
