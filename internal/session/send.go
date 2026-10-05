@@ -9,7 +9,7 @@ import (
 
 // The send buffer (design §4.2): bytes enter refcounted 64 KiB chunks
 // through reserve (under mu) → copy (outside every lock) → commit (under
-// mu). [end, resEnd) is reserved by the one Write that is copying (wmu
+// mu). [end, resEnd) is reserved by the one Write that is copying (wsem
 // serializes Writes) and is invisible to carrier writers until the commit;
 // a FIN fixed at resEnd can therefore never overtake that copy (D9, F1).
 // The session holds one reference per chunk and drops it once the chunk is
@@ -152,8 +152,17 @@ func (s *Session) commitRoundLocked(k int64) error {
 // it trims every lane's in-flight spans and the retransmission queue, drops
 // the session's reference on every chunk now fully acknowledged (and, once
 // nothing is outstanding or reserved, on the partial tail chunk too: an idle
-// session holds no send memory), restarts the rescue clock and wakes a
-// writer waiting for room (D17 hysteresis).
+// session holds no send memory), restarts the rescue clock and the idle
+// clock, and wakes a writer waiting for room (D17 hysteresis).
+//
+// The idle clock (lastData, §0.14 B5): the acknowledged delivery of our data
+// is activity, like an application commit. A Write blocked behind a slow
+// reader commits nothing until min(256 KiB, W/4) of room frees, but its
+// bytes keep being delivered, so IdleTimeout must not end it; a peer that
+// stops reading acknowledges nothing and still lets it expire. Only an
+// advance counts: an ACK that delivers nothing new (a duplicate, a window
+// update) and carrier traffic (PING, PONG) do not. now is the caller's
+// clock reading for this advance, so this adds no clock read.
 func (s *Session) advanceSendLocked(to uint64, now time.Time) {
 	st := &s.st
 	st.sBase = to
@@ -179,6 +188,7 @@ func (s *Session) advanceSendLocked(to uint64, now time.Time) {
 		st.cbase = to / chunkSize * chunkSize
 	}
 	st.lastAdvance = now
+	st.lastData = now
 	if st.wwaiting && s.sendRoomLocked() >= s.writerWakeRoom() {
 		streamSignal(st.wwake)
 	}
