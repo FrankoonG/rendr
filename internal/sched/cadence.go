@@ -43,7 +43,10 @@ const (
 	OutcomeFailed Outcome = iota + 1
 	// OutcomeRefused: the PREFACE exchange completed but the carrier was not
 	// attached (CAPACITY, a timeout waiting for OPEN_ACK, instance mismatch).
-	// It resets the failure count (plan §3.6) and then counts as failure 0.
+	// The first refusal since the slot last attached resets the failure
+	// count (plan §3.6) and then counts as failure 0; every later one counts
+	// as a failure, also after failed attempts in between, so a peer that
+	// keeps refusing is redialled at the growing cadence up to the cap.
 	OutcomeRefused
 	// OutcomeAttached: the carrier was attached (OPEN_ACK/JOIN_ACK OK).
 	OutcomeAttached
@@ -53,16 +56,24 @@ const (
 // attempt at a time; the first attempt after a death or at the start of a
 // no-path episode is immediate (Kick); after the n-th consecutive failure the
 // next attempt starts at max(LastStart + Backoff(n), end of the failed
-// attempt). Attempt ids make late results of superseded attempts
-// detectable. It is a value type owned by the session actor (or the health
-// layer for probe slots).
+// attempt). A refusal resets n only when it is the first since the slot
+// last attached; later refusals count as failures (OutcomeRefused). Attempt
+// ids make late results of superseded attempts detectable. It is a value
+// type owned by the session actor (or the health layer for probe slots,
+// which never report OutcomeRefused).
 type Cadence struct {
-	Fails     int       // consecutive failures (n)
+	Fails     int       // consecutive failures (n), refusals after the first included
 	Running   bool      // an attempt is in flight
 	Immediate bool      // the next attempt may start now regardless of backoff
 	Attempt   uint64    // id of the latest attempt
 	LastStart time.Time // start of the latest attempt
 	NextAt    time.Time // earliest start of the next attempt (when !Immediate)
+
+	// refused: an attempt was refused since the slot last attached (or
+	// since it was created). Only Attached clears it; a failure or a Kick
+	// does not, so a refusing peer reached between failed dials, or right
+	// after a no-path episode started, still backs off.
+	refused bool
 }
 
 // Ready reports whether an attempt may start at now; if not and no attempt
@@ -87,9 +98,12 @@ func (c *Cadence) Start(now time.Time) uint64 {
 }
 
 // Finish records the end of attempt id at now. It returns false (and changes
-// nothing) for a stale id. Attached resets Fails; Refused resets Fails and
-// then counts failure 0; Failed computes NextAt with Backoff(Fails, max, u)
-// and increments Fails.
+// nothing) for a stale id. Attached resets Fails and the refusal memory; the
+// first Refused since the last Attached resets Fails and then counts failure
+// 0; Failed, and every later Refused, compute NextAt with Backoff(Fails,
+// max, u) and increment Fails, so persistent refusals grow the interval to
+// the cap like failures do (design §0.14 B6; plan §3.6 amended: a completed
+// PREFACE exchange resets n at the first refusal only).
 //
 // A Kick that arrived while the attempt ran survives it: the next attempt is
 // then immediate. An unknown outcome counts as a failure.
@@ -101,9 +115,13 @@ func (c *Cadence) Finish(now time.Time, id uint64, o Outcome, max time.Duration,
 	switch o {
 	case OutcomeAttached:
 		c.Fails = 0
+		c.refused = false
 		c.NextAt = time.Time{}
 	case OutcomeRefused:
-		c.Fails = 0
+		if !c.refused {
+			c.refused = true
+			c.Fails = 0 // the first refusal: the PREFACE exchange completed (plan §3.6)
+		}
 		c.backoff(now, max, u)
 	default:
 		c.backoff(now, max, u)
@@ -124,5 +142,7 @@ func (c *Cadence) backoff(now time.Time, max time.Duration, u float64) {
 }
 
 // Kick makes the next attempt immediate (a carrier of this slot died, or a
-// no-path episode started). It is not gated by health failed marks.
+// no-path episode started). It is not gated by health failed marks. It
+// keeps Fails and the refusal memory: only the attempt's own outcome
+// decides the backoff after it.
 func (c *Cadence) Kick() { c.Immediate = true }
