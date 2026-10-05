@@ -132,8 +132,13 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // completely by then, a best-effort RST(wire.RstWithdrawn) (bounded,
 // guarded) follows it before the close (L49); a hello Write still in
 // progress is cut instead, by its deadline or, on a conn that ignores write
-// deadlines, by the close, and nothing follows a partial first frame. Both
-// RSTs are followed by the L05 close order on a guarded goroutine
+// deadlines, by the close, and nothing follows a partial first frame. A
+// conn call that has not ended 1 s after the withdrawal — on a conn that
+// ignores its read deadline, or whose deadline setters wait for that call
+// (a websocket adapter that honours gorilla's one-reader rule; design §0.14
+// B3) — is ended by the close instead, without the RST: Establish returns
+// then, and the passive reads EOF after the first frame. Both RSTs are
+// followed by the L05 close order on a guarded goroutine
 // (CloseWrite on an OwnedTCP, a drain of what the passive already sent
 // bounded by 1 s, Close), so an answer racing the withdrawal cannot turn the
 // close into a TCP reset that discards the RST; on a conn that ignores the
@@ -619,7 +624,7 @@ func (g *hsGuard) join() {
 }
 
 // closeWith begins the close of the conn, once: with frame nil at once
-// (SetDeadline(now), Close; CloseConn); otherwise after writing frame in
+// (SetDeadline(now) and Close; CloseConn); otherwise after writing frame in
 // the L05 order (writeThenClose), but only when PREFACE ‖ first frame were
 // written completely — nothing may follow a partial first frame. concurrent
 // says that the handshake may still be inside a conn call (abort): the
@@ -642,40 +647,59 @@ func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 
 // writeThenClose writes frame and closes nc in the L05 order — the frame
 // (bounded by drainMax), CloseWrite on an OwnedTCP, a drain bounded by
-// drainMax, then SetDeadline(now) and Close — on a guarded goroutine
-// counted in the abandoned-call pool when it hangs. The drain reads what
-// the passive already sent (an OPEN_ACK racing a withdrawal), so the close
-// never answers unread bytes with a TCP reset that could discard the frame
-// before the passive read it (Windows drops buffered data on a reset).
+// drainMax, then SetDeadline(now) and Close on guarded goroutines of their
+// own (closeOnce.async) — on a guarded goroutine counted in the
+// abandoned-call pool when it hangs. The drain reads what the passive
+// already sent (an OPEN_ACK racing a withdrawal), so the close never
+// answers unread bytes with a TCP reset that could discard the frame before
+// the passive read it (Windows drops buffered data on a reset).
 // When left is non-nil the handshake goroutine may still be inside a conn
-// call: the goroutine first unblocks it (SetDeadline(now): the handshake's
-// read and a hello Write in progress return at once on a conn that honours
-// deadlines) and waits until it left the conn, at most drainMax, so that
-// the drain never competes with it; ok, if non-nil, then decides whether
-// the frame may be written at all (the first frame was written
-// completely, so the hello writer's Write has returned), else the conn is
-// closed at once, which also ends a hello Write that ignores its deadline.
+// call: the goroutine first unblocks it with SetDeadline(now) — the
+// handshake's read and a hello Write in progress return at once on a conn
+// that honours deadlines — and waits until it left the conn, at most
+// drainMax, so that the drain never competes with it; ok, if non-nil, then
+// decides whether the frame may be written at all (the first frame was
+// written completely, so the hello writer's Write has returned), else the
+// conn is closed at once, which also ends a hello Write that ignores its
+// deadline. A handshake still inside its call after drainMax — a read that
+// ignores its deadline, or a conn whose deadline setters wait for the call
+// in progress (a websocket adapter that honours gorilla's one-reader rule;
+// design §0.14 B3) — gets no frame (it is best effort, L49): the conn is
+// closed at once, which ends the call on a conn that honours Close. The
+// SetDeadline therefore runs on a goroutine of its own (closeOnce's
+// deadline step, goDeadline; the final close then calls Close only), which
+// such a conn holds until that close; the frame's write deadline is set
+// only after it returned, and it is counted in the abandoned-call pool only
+// when it is still inside the embedder's call AbandonWait after that close
+// (L52).
 // When the goroutine is adopted by the abandoned-call pool — a conn that
 // ignores the write or the drain's read deadline and a peer that does not
 // read or close — its conn is closed exactly once as a last resort (design
-// §0.8 V2), which unblocks it on a conn that honours Close.
+// §0.8 V2, closeOnce.last), which unblocks it on a conn that honours Close.
 func writeThenClose(env *Env, nc net.Conn, frame []byte, left <-chan struct{}, ok func() bool) {
 	k := &closeOnce{nc: nc}
-	w := armWatch(env.Abandon, env.Timing.withDefaults().AbandonWait+3*drainMax, func() { k.async(env) })
+	wait := env.Timing.withDefaults().AbandonWait
+	w := armWatch(env.Abandon, wait+3*drainMax, func() { k.last(env) })
 	go func() {
 		defer w.finish()
-		defer k.now() // exactly once, also on runtime.Goexit in a conn call (L51)
+		defer k.async(env) // exactly once, also on runtime.Goexit in a conn call (L51)
 		if left != nil {
-			_ = callSetDeadline(nc, time.Now())
+			set := k.goDeadline(env, wait+drainMax) // the close below comes drainMax after it at the latest
 			t := time.NewTimer(drainMax)
+			defer t.Stop()
 			select {
 			case <-left:
 			case <-t.C:
+				return // still inside a conn call: no frame; the close ends the call
 			}
-			t.Stop()
-		}
-		if ok != nil && !ok() {
-			return
+			if ok != nil && !ok() {
+				return
+			}
+			select {
+			case <-set: // the frame's write deadline follows SetDeadline(now)
+			case <-t.C:
+				return
+			}
 		}
 		_ = callSetWriteDeadline(nc, time.Now().Add(drainMax))
 		if writeFull(nc, frame) != nil {

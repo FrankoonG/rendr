@@ -49,29 +49,44 @@ func (rt *Runtime) startHandshake(ln *Listener, nc net.Conn, at time.Time) {
 }
 
 // closeWatched closes the conn of an unfinished handshake (eviction,
-// Runtime.Close's drain, a handshake refused by that drain) on a goroutine
-// that already holds a membership of rt.hsg: the handshake goroutine's own
-// read then fails at once, and Runtime.Close's bounded join covers the
-// closer like the handshake itself. A Close the embedder never returns from
-// is counted in Status.Abandoned AbandonWait after it started, by the
-// closer's own watch outside Runtime.Close and at the latest by Close's
-// join before it returns (L52), exactly as a handshake stuck in a Read.
+// Runtime.Close's drain, a handshake refused by that drain, a refusal cut
+// by Runtime.Close): SetDeadline(now) and Close each run on a goroutine
+// that holds a membership of rt.hsg — the caller added the first, this
+// adds the second while that one is held — so the handshake goroutine's
+// own call fails at once, and Runtime.Close's bounded join covers both
+// closers like the handshake itself. SetDeadline is started first (L52),
+// and the Close does not wait for it (design §0.14 B3): a conn whose
+// deadline setters wait for a Read in progress — a websocket adapter that
+// honours gorilla's one-reader rule — is closed at once, which ends that
+// Read and then the SetDeadline. Every call of an unfinished handshake
+// runs under a deadline set before it (the handshake deadline, set first
+// by ReadHello, or a refusal's write and drain bounds), so a Close that
+// happens to run before its SetDeadline leaves no call unbounded. A
+// SetDeadline or Close the embedder never returns from is counted in
+// Status.Abandoned AbandonWait after it started, by its own watch outside
+// Runtime.Close and at the latest by Close's join before it returns (L52),
+// exactly as a handshake stuck in a Read.
 func (rt *Runtime) closeWatched(nc net.Conn) {
-	rt.hsg.goWatched(rt.abandon, rt.eff.timing.AbandonWait, func() { closeNow(nc) })
+	wait := rt.eff.timing.AbandonWait
+	rt.hsg.add() // the Close's membership, added while the caller's is held
+	rt.hsg.goWatched(rt.abandon, wait, func() { setDeadlineNow(nc) })
+	rt.hsg.goWatched(rt.abandon, wait, func() { closeConn(nc) })
 }
 
-// closeNow unblocks and closes an embedder conn: SetDeadline(now), then
-// Close. A panic in either call is contained, and Close runs even when
-// SetDeadline calls runtime.Goexit (L51).
-func closeNow(nc net.Conn) {
-	defer func() {
-		defer func() { _ = recover() }()
-		_ = nc.Close()
-	}()
-	func() {
-		defer func() { _ = recover() }()
-		_ = nc.SetDeadline(time.Now())
-	}()
+// setDeadlineNow calls nc.SetDeadline(time.Now()); a panic is contained
+// (L51; a runtime.Goexit ends only its own closer goroutine, which
+// goWatched settles).
+func setDeadlineNow(nc net.Conn) {
+	defer func() { _ = recover() }()
+	_ = nc.SetDeadline(time.Now())
+}
+
+// closeConn calls nc.Close(); a panic is contained (L51). nc is an onceConn
+// or rendr's own OwnedTCP, so the embedder's Close runs once however many
+// closers a handshake's conn meets.
+func closeConn(nc net.Conn) {
+	defer func() { _ = recover() }()
+	_ = nc.Close()
 }
 
 // handshake is one handshake goroutine. Every path closes nc exactly once:
@@ -135,10 +150,11 @@ func (rt *Runtime) handshake(ln *Listener, slot *hsSlot, nc net.Conn, at time.Ti
 // ignores them by itself). When the Runtime closes first, the refusal gets
 // the close bound — min(1 s, DeadMax) after Close's last shutdown step,
 // like a CLOSE frame — and is then cut: nc (the same conn the carrier owns)
-// is closed on a watched member of rt.hsg, so the write and the drain fail
-// at once, and Close joins the end of the carrier (design §6.8, L52). Every
-// close of nc goes through its once wrapper (or is a second close of
-// rendr's own OwnedTCP), so the embedder's Close still runs once (L51).
+// is closed on watched members of rt.hsg (closeWatched), so the write and
+// the drain fail at once, and Close joins the end of the carrier (design
+// §6.8, L52). Every close of nc goes through its once wrapper (or is a
+// second close of rendr's own OwnedTCP), so the embedder's Close still
+// runs once (L51).
 func (rt *Runtime) awaitRefusal(c *carrier.Conn, nc net.Conn) {
 	select {
 	case <-c.Done():
