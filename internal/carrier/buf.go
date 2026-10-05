@@ -49,9 +49,16 @@ func classFor(n int) int {
 	return bits.Len(uint(n-ClassSlack-1)) - minClassShift
 }
 
-// Budget is the Runtime-wide MaxBufferedBytes account (plan §3.7). Usage is
-// one atomic counter; there is no lock and no waiter list (app writers that
-// find the budget exhausted re-check on a timer, design §4.2).
+// Budget is a byte account; a Buf releases its charge to the Budget it was
+// charged to. A Runtime has two (design §0.14 B2). Env.Budget is the
+// MaxBufferedBytes account of the data buffers (plan §3.7): send chunks
+// (TryAcquire, which may refuse), receive buffers inside an advertised
+// window and write scratches (Acquire, forced); its usage drives the window
+// advertisement. Env.Stages is the fixed account of the reader stages
+// (16 KiB + ClassSlack per started carrier): only forced charges use it, so
+// its max is never consulted. Status.BufferedBytes is the sum of both.
+// Usage is one atomic counter; there is no lock and no waiter list (app
+// writers that find the budget exhausted re-check on a timer, design §4.2).
 type Budget struct {
 	used atomic.Int64
 	max  int64

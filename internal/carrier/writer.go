@@ -365,7 +365,7 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 // gets the batch copied into a pooled scratch and exactly one Write call
 // unless it writes short with progress, in which case the remainder follows
 // inside the same stall window (C23, L42). The scratch is charged to the
-// Budget like every other buffer (§4.1, plan §3.7: it shows in
+// Budget like every other data buffer (§4.1, plan §3.7: it shows in
 // BufferedBytes and in the window's memory-pressure feedback) and released
 // only after the Write returned (abandoned-call rule): a writer stuck in an
 // embedder Write keeps it, and its charge, until that Write returns. Its

@@ -17,9 +17,24 @@ type Env struct {
 	Presets Presets          // counter presets (L14); zero values in production
 	IDs     *IDAllocator     // dialer-side CarrierIDs
 	Abandon *AbandonPool     // goroutines stuck in embedder calls past their bound (L52)
-	Bufs    *BufPool         // receive buffers and send chunks
-	Budget  *Budget          // MaxBufferedBytes accounting
+	Bufs    *BufPool         // receive buffers, send chunks, write scratches and reader stages
+	Budget  *Budget          // MaxBufferedBytes: the data buffers (send chunks, receive buffers, write scratches)
+	Stages  *Budget          // the reader stages, outside MaxBufferedBytes (stageBudget; nil: Budget)
 	Hooks   *testhooks.Hooks // nil in production
+}
+
+// stageBudget returns the account a carrier's reader stage is charged to
+// for the reader's whole life (design §0.14 B2, revising D29): Stages, a
+// fixed account of one 16 KiB-class buffer per started carrier that
+// neither Budget.TryAcquire (send chunks) nor the window advertisement
+// (Budget.Used) sees, so idle carriers cannot exhaust MaxBufferedBytes and
+// freeze the sessions' data. Status.BufferedBytes reports both accounts.
+// An Env without a stage account charges its stages to Budget.
+func (e *Env) stageBudget() *Budget {
+	if e.Stages != nil {
+		return e.Stages
+	}
+	return e.Budget
 }
 
 // Timing is the effective per-carrier timing and sizing of a Runtime.
