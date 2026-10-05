@@ -50,9 +50,6 @@ const (
 	defMaxCarriers   = 6
 	minResend        = 50 * time.Millisecond
 	maxResend        = time.Second
-	// maxGone is how many removed carriers the actor keeps before it
-	// prunes the joined ones: churn never grows the list.
-	maxGone = 16
 )
 
 // Unexported test seams (nil in production: one atomic load per actor
@@ -92,8 +89,14 @@ type actor struct {
 	// killed or answered and closed itself (refused or late dial results,
 	// adopts of an ended session). The actor exits only once all of them
 	// are joined, so none of their goroutines outlives Session.Done (§6.8).
+	// Every step prunes the joined ones (pruneGoneLocked), and the loop
+	// wakes when the oldest one still running is joined, so a joined
+	// carrier is never kept reachable (§0.14 B7).
 	gone []*carrier.Conn
-	dead []laneSnap // the last maxDeadLanes dead lanes, oldest first (Status)
+	// dead is the last maxDeadLanes dead lanes, oldest first (Status). A
+	// record keeps its carrier while that carrier is in gone, then its final
+	// Stats (settleDeadLocked).
+	dead []laneSnap
 	// unconfirmed (passive): lanes whose first response frame has not been
 	// announced yet (EventCarrierUp once Fill placed an OK, §10.3).
 	unconfirmed []*lane
@@ -157,17 +160,20 @@ func (a *actor) run() {
 		now := time.Now()
 		a.wakeAt = time.Time{}
 		a.step(now)
-		var joined <-chan struct{}
-		if a.ending {
-			// One decision per round: the exit and the channel waited on
-			// come from the same joinWait. A carrier whose Done closes after
-			// it is the one waited on below, so its closing always wakes the
-			// actor; no lost wakeup can leave the session undone (L52).
-			joined = a.joinWait()
-			if joined == nil && a.quiet() {
-				a.exit()
-				return
-			}
+		// One decision per round: the exit and the channel waited on come
+		// from the same look at gone, which the step just pruned. The loop
+		// waits for the oldest carrier still in gone in every phase: its
+		// join wakes the actor, whose next step prunes it, and every
+		// carrier joined meanwhile, and settles their dead-lane records
+		// without waiting for an unrelated wakeup (§0.14 B7). In the end
+		// phase the exit waits for an empty gone: a carrier whose Done
+		// closes after this look is the one waited on below or is pruned
+		// in the step that one wakes, so no lost wakeup can leave the
+		// session undone (L52).
+		joined := a.joinWait()
+		if a.ending && joined == nil && a.quiet() {
+			a.exit()
+			return
 		}
 		a.arm(time.Now()) // a hook may have held the step
 		if h := beforeWaitHook.Load(); h != nil {
@@ -184,7 +190,8 @@ func (a *actor) run() {
 
 // step is one actor round: commands in arrival order, then the facts
 // re-read from the objects the actor holds, then deadlines (no-path expiry
-// after the commands: an attach already queued wins, L18).
+// after the commands: an attach already queued wins, L18), then the joined
+// carriers leave gone (their final Stats published with the step).
 func (a *actor) step(now time.Time) {
 	s := a.s
 	a.cmds = s.mb.drain(a.cmds[:0])
@@ -199,6 +206,7 @@ func (a *actor) step(now time.Time) {
 	s.mu.Lock()
 	a.peerSignalsLocked(now)
 	a.actLocked(now)
+	a.pruneGoneLocked()
 	a.unlockStep(now)
 	a.flush()
 }
@@ -377,26 +385,26 @@ func (a *actor) quiet() bool {
 	return len(a.s.lanes) == 0 && (a.d == nil || a.d.running == 0) && a.adoptsLeft == 0
 }
 
-// dropConn hands a carrier the actor closed itself (Kill or WriteAndClose
-// on a conn it never attached) to the exit join (§6.8).
+// dropConn hands a carrier the actor stopped using — a removed lane's, or
+// one it closed itself (Kill or WriteAndClose on a conn it never attached)
+// — to the exit join (§6.8).
 func (a *actor) dropConn(c *carrier.Conn) {
-	if c == nil {
-		return
+	if c != nil {
+		a.gone = append(a.gone, c)
 	}
-	if len(a.gone) >= maxGone {
-		a.joinWait() // drop the carriers already joined
-	}
-	a.gone = append(a.gone, c)
 }
 
-// joinWait prunes the carriers whose Done closed and returns the Done
-// channel of the first one still open (nil when all are joined): the loop
-// waits on it during the end phase, one at a time.
-func (a *actor) joinWait() <-chan struct{} {
+// pruneGoneLocked drops the joined carriers from gone and settles the
+// dead-lane record of each (§0.14 B7). Every step calls it, so neither list
+// grows with churn and neither keeps a joined carrier reachable. A record
+// keeps its carrier exactly while the carrier is in gone, so once gone is
+// empty no record holds a carrier and the exit publishes none.
+func (a *actor) pruneGoneLocked() {
 	k := 0
 	for _, c := range a.gone {
 		select {
 		case <-c.Done():
+			a.settleDeadLocked(c)
 		default:
 			a.gone[k] = c
 			k++
@@ -404,7 +412,13 @@ func (a *actor) joinWait() <-chan struct{} {
 	}
 	clear(a.gone[k:])
 	a.gone = a.gone[:k]
-	if k == 0 {
+}
+
+// joinWait returns the Done channel of the oldest carrier the last step
+// left in gone (nil when every carrier was joined): the loop waits on it,
+// one at a time.
+func (a *actor) joinWait() <-chan struct{} {
+	if len(a.gone) == 0 {
 		return nil
 	}
 	return a.gone[0].Done()

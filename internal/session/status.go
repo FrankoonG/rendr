@@ -10,8 +10,9 @@ import (
 // immutable value the actor builds and publishes through Session.snap under
 // mu in the same critical section as every routing change, so the reported
 // active carrier always equals the routed one (L27, L53). Session.Status
-// adds the data counters (read under mu) and each lane's live carrier.Stats
-// (read from its Conn at call time). A published snapshot is never modified.
+// adds the data counters (read under mu) and each lane's carrier.Stats: read
+// from its Conn at call time, or a joined dead carrier's final Stats. A
+// published snapshot is never modified.
 type statusSnap struct {
 	state State
 	err   error // the end error once state == StateEnded
@@ -36,7 +37,15 @@ type laneSnap struct {
 	name  string // factory name; "" on the passive side
 	gen   uint32 // dialer: incarnation number of the factory slot; passive: attach order
 	state LaneState
-	conn  *carrier.Conn // live Stats are read from it at Status time; nil for a dial attempt in flight
+	// conn is the carrier whose Stats Status reads at call time: a live
+	// lane's, and a dead lane's until its carrier is joined (its reader may
+	// still account frames it read before the death). nil for a dial
+	// attempt in flight and for a dead lane whose carrier was joined: stats
+	// then holds the carrier's final Stats, so the dead-lane history never
+	// keeps a joined carrier — its Batch, timers and embedder conn —
+	// reachable (design §0.14 B7).
+	conn  *carrier.Conn
+	stats carrier.Stats // the final Stats of a joined dead carrier (conn == nil)
 
 	deathCause  carrier.Cause
 	deathDetail string
@@ -126,7 +135,7 @@ func (s *Session) status() Status {
 	out.Carriers = make([]CarrierStatus, len(sn.lanes))
 	for i, ls := range sn.lanes {
 		cs := CarrierStatus{
-			ID: ls.id, Name: ls.name, Gen: ls.gen, State: ls.state,
+			ID: ls.id, Name: ls.name, Gen: ls.gen, State: ls.state, Stats: ls.stats,
 			DeathCause: ls.deathCause, DeathDetail: ls.deathDetail, DeathAt: ls.deathAt,
 		}
 		if ls.conn != nil {
