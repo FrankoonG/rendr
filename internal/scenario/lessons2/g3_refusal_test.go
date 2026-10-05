@@ -15,9 +15,11 @@ import (
 // TestPersistentRefusalBacksOff_L20 (L20; design §0.14 B6): a bond Peer with
 // two factories dials a passive whose MaxCarriersPerSession is 1. The
 // session opens on a, and the member slot of b is refused with JOIN_ACK
-// CAPACITY for as long as a lives. Its JOIN dials must follow the redial
-// cadence of plan §3.6 as amended — the first refusal resets n, every later
-// one counts as a failure — so the k-th interval (k from 0) lies within
+// CAPACITY for as long as a lives. b never dialled before the bond kicked
+// its slot when the session opened, so that kick opens no recovery window
+// (sched.Cadence). Its JOIN dials must follow the redial cadence of plan
+// §3.6 as amended — the first refusal resets n, every later one counts as a
+// failure — so the k-th interval (k from 0) lies within
 // [min(0.5 s·2ᵏ, cap) × 0.8, min(0.5 s·2ᵏ, cap) × 1.2] and the count in 60
 // virtual seconds stays within what those bounds allow (with the cap of 4 s:
 // 15 to 21; the old cadence redialled every ≈ 0.5 s, about 120 times). In
