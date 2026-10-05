@@ -91,9 +91,10 @@ func Stall(release <-chan struct{}) Behaviour {
 	}
 }
 
-// HalfCloseCheck (L04) reads exactly want bytes of PRNG(seed) followed by
-// io.EOF, then writes reply bytes of PRNG(seed+1) and CloseWrite, then
-// closes. Any deviation is its error.
+// HalfCloseCheck checks half-close: it reads exactly want bytes of
+// PRNG(seed) followed by io.EOF, then writes reply bytes of PRNG(seed+1) on
+// the still-open direction and CloseWrite, then closes. Any deviation is
+// its error.
 func HalfCloseCheck(want int64, seed uint64, reply int64) Behaviour {
 	return func(c net.Conn) error {
 		defer c.Close()

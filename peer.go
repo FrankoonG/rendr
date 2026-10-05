@@ -11,14 +11,15 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/session"
 )
 
-// Carrier is a carrier factory. The set is closed: M1 has StreamCarrier;
-// M2 adds DatagramCarrier.
+// Carrier is a carrier factory. The set is closed: StreamCarrier is its
+// only implementation; DatagramCarrier follows with packet sessions
+// (milestone M2).
 type Carrier interface{ isCarrier() }
 
 // StreamCarrier is a factory of ordered, reliable byte-stream carriers to
 // the Peer's rendr instance (an L7 tunnel, a TLS connection, a raw TCP
 // connection from carrier/tcp, ...). rendr treats it and every conn it
-// returns as untrusted (L51): calls are bounded by DialTimeout even when
+// returns as untrusted: calls are bounded by DialTimeout even when
 // ctx is ignored, panics and Goexit are contained, (nil, nil) is an error,
 // a conn returned late is closed exactly once, byte counts are validated,
 // and conns are only ever used through the net.Conn interface.
@@ -40,7 +41,7 @@ func (StreamCarrier) isCarrier() {}
 
 // PeerConfig lists a Peer's carrier factories in preference order (the
 // order breaks ranking ties). Every session snapshots it at Dial; a later
-// change of the Peer does not affect existing sessions (L20).
+// change of the Peer does not affect existing sessions.
 type PeerConfig struct {
 	Carriers []Carrier
 }
@@ -57,9 +58,10 @@ type DialOptions struct {
 	NoPathGrace time.Duration
 }
 
-// Peer is one destination rendr instance (the same-instance contract,
-// plan §1.4) reachable through a set of carrier factories. It does not pin
-// the InstanceID: every new session learns the instance it reaches.
+// Peer is one destination rendr instance reachable through a set of
+// carrier factories; every factory must reach that same instance (the
+// embedding contract in the package documentation). It does not pin the
+// InstanceID: every new session learns the instance it reaches.
 type Peer struct {
 	rt        *Runtime
 	factories []carrier.Factory // the snapshot every session dials with (L20); never modified
@@ -199,7 +201,8 @@ type PeerStatus struct {
 	Factories []FactoryStatus // in configuration order
 }
 
-// FactoryStatus is one factory's probe state (plan §3.9, design §8).
+// FactoryStatus is one factory's probe state (see ProbePolicy, Evidence
+// and SelectorPolicy).
 type FactoryStatus struct {
 	Name          string
 	Evidence      Evidence      // at the time of the call

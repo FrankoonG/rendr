@@ -9,8 +9,9 @@ import (
 // prng is the xorshift64 byte stream of the M1a fixture.
 type prng struct{ x uint64 }
 
-// PRNG returns the deterministic xorshift stream of the M1a fixture for
-// seed; it never fails and never ends.
+// PRNG returns the deterministic pseudo-random byte stream of seed
+// (xorshift64), the stream Gen writes and a Verifier expects: the same seed
+// always yields the same bytes. It never fails and never ends.
 func PRNG(seed uint64) io.Reader { return &prng{x: seed*2654435761 + 1} }
 
 func (p *prng) Read(b []byte) (int, error) {
@@ -42,7 +43,7 @@ func Digest(r io.Reader, n int64) ([32]byte, error) {
 }
 
 // Verifier checks a received stream against PRNG(seed) of exactly want
-// bytes (L64): it accepts io.EOF only after exactly want matching bytes;
+// bytes: it accepts io.EOF only after exactly want matching bytes;
 // every other outcome — a mismatch, a short or long stream, io.ErrClosedPipe,
 // net.ErrClosed or any other error — is a failure that carries the error's
 // text. It never tolerates an error type to stay green.

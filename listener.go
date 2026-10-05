@@ -14,8 +14,9 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// Source is where a Listener gets carriers from. The set is closed: M1 has
-// FromListener; M2 adds FromPacketConn.
+// Source is where a Listener gets carriers from. The set is closed:
+// FromListener returns the only kind of Source; FromPacketConn follows with
+// packet sessions (milestone M2).
 type Source interface{ isSource() }
 
 type listenerSource struct{ l net.Listener }
@@ -27,7 +28,7 @@ func (listenerSource) isSource() {}
 // closes it exactly once on Close; l must therefore be given to one Listener
 // only, once (Listen rejects a ListenConfig that repeats it). Temporary
 // accept errors (EMFILE) back off 5 ms → 100 ms; one failing source never
-// stops another (L50).
+// stops another.
 func FromListener(l net.Listener) Source { return listenerSource{l: l} }
 
 // ListenConfig configures a Listener.
@@ -81,7 +82,7 @@ func sameListener(a, b net.Listener) (same bool) {
 // Listener admits carriers and hands new stream sessions to the application
 // for Confirm or Reject. Carriers of sessions that already exist (JOIN,
 // duplicate OPEN) are routed by the Runtime, so a carrier may arrive on any
-// source or Listener of the Runtime (L50).
+// source or Listener of the Runtime.
 type Listener struct {
 	rt    *Runtime
 	cfg   ListenConfig // normalized
@@ -297,7 +298,7 @@ func (ln *Listener) passSignal() {
 // affected (their carriers may arrive through any Listener), and the
 // Runtime keeps admitting through its other Listeners: a Listener's Close
 // is not the instance going away, so it never answers GOING_AWAY, which
-// makes a dialer's Peer stop OPENing to the whole instance (D21); only
+// makes a dialer's Peer stop OPENing to the whole instance; only
 // Runtime.Close does. Idempotent.
 func (ln *Listener) Close() error {
 	if refuse := ln.shut(); len(refuse) > 0 {

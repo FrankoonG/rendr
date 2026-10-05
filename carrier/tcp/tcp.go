@@ -1,10 +1,13 @@
-// Package tcp is rendr's built-in plaintext TCP carrier (plan §8, ≤ 300
-// lines): a listener and a factory whose connections have TCP keepalive
-// disabled on both ends (rendr's PING is the only liveness authority, L26)
-// and TCP_NODELAY on, and that refuse non-loopback addresses unless
-// AllowNonLoopback is set (plan §1.4: plaintext, for tests and trusted
-// networks). Its connections carry rendr's ownership token, so the carrier
-// writer uses zero-copy vectored writes on them.
+// Package tcp is rendr's built-in plaintext TCP carrier: a listener and a
+// factory whose connections have TCP keepalive disabled on both ends
+// (rendr's PING is the only liveness authority, so no keepalive timer can
+// end a carrier that rendr still considers alive) and TCP_NODELAY on, and
+// that refuse non-loopback addresses unless AllowNonLoopback is set (the
+// carrier is neither encrypted nor authenticated: it is meant for tests and
+// trusted networks). rendr recognises the connections this package creates
+// and writes to them with zero-copy vectored writes (writev on Unix,
+// WSASend on Windows); every other connection, one that wraps a connection
+// of this package included, gets one copied Write per batch.
 package tcp
 
 import (

@@ -2,17 +2,17 @@ package rendr
 
 import "time"
 
-// Config configures a Runtime. The zero value of every field selects its
-// default; out-of-range values are clamped to the plan §4 range and every
-// change (clamp or cross-parameter constraint) is recorded in
-// Status.ConfigAdjustments as "Field: old → new (reason)". For the four
-// fields whose range includes zero (RetireGrace, Selector.Floor,
-// Probe.DialWait, Handshake.MaxMetadata) a negative value selects zero.
-// Configuration is frozen when the Runtime is built; each session also
-// snapshots it at Dial or OPEN (L20).
+// Config configures a Runtime. Field comments give each default, then its
+// range. The zero value of every field selects its default; out-of-range
+// values are clamped to the range and every change (clamp or
+// cross-parameter constraint) is recorded in Status.ConfigAdjustments as
+// "Field: old → new (reason)". For the four fields whose range includes
+// zero (RetireGrace, Selector.Floor, Probe.DialWait, Handshake.MaxMetadata)
+// a negative value selects zero. Configuration is frozen when the Runtime
+// is built; each session also snapshots it at Dial or OPEN.
 //
-// M2 adds PacketPing and Packet (packet sessions); they are not declared
-// before their milestone.
+// Milestone M2 adds PacketPing and Packet (packet sessions); they are not
+// declared before then.
 type Config struct {
 	NoPathGrace      time.Duration // 15 s; 3 s–300 s; counted from the death of the last carrier
 	RejoinBackoffMax time.Duration // 4 s; 1 s–8 s and ≤ NoPathGrace/2; redial backoff cap, also for repeated refusals
@@ -120,8 +120,13 @@ type SelectorPolicy struct {
 	Cooldown time.Duration // 15 s; 1 s–600 s: minimum time between two quality switches
 }
 
-// ProbePolicy configures the Peer health layer (plan §3.9). A Peer with one
-// carrier factory never probes.
+// ProbePolicy configures the Peer health layer. While a Peer with two or
+// more carrier factories is in use (it has a live session, or a Dial or a
+// session end in the last 5 minutes), it keeps one sessionless probe
+// carrier per factory and sends a PING on each every Interval. The
+// round-trip samples rank the factories for Dial and failover and drive
+// selector quality switches (see SelectorPolicy and FactoryStatus). A Peer
+// with one carrier factory never probes.
 type ProbePolicy struct {
 	Interval   time.Duration // 2 s; 0.5 s–30 s: probe PING cadence
 	Fresh      time.Duration // 10 s; 2×Interval–120 s: sample freshness
@@ -129,14 +134,17 @@ type ProbePolicy struct {
 	DialWait   time.Duration // 800 ms; 0–5 s: how long Dial waits for first samples
 }
 
-// HandshakeLimits bound pre-admission resources (plan §3.5, L48).
+// HandshakeLimits bound what a Runtime spends on a carrier it accepted
+// before admitting it (the PREFACE, the first frame and the written
+// verdict), and the OPEN metadata it sends or accepts.
 type HandshakeLimits struct {
 	Timeout       time.Duration // 10 s; 1 s–60 s: PREFACE + first frame + verdict write
 	MaxConcurrent int           // 256; 1–65536: handshake slots per Runtime (the oldest is evicted when full)
 	MaxMetadata   int           // 4096; 0–65535: OPEN metadata bytes
 }
 
-// SessionlessLimits bound probe carriers held by a passive Runtime (plan §3.5).
+// SessionlessLimits bound the sessionless probe carriers that dialers'
+// Peers keep on a passive Runtime (see ProbePolicy).
 type SessionlessLimits struct {
 	PerInstance int           // 16; 1–1024: per dialer InstanceID
 	Total       int           // 1024; 1–65536: per Runtime

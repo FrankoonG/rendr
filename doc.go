@@ -33,7 +33,9 @@
 //
 // Embedding contract: every carrier of a Peer must reach the same rendr
 // instance; relays may only forward rendr bytes opaquely or fail explicitly;
-// carrier keepalive and idle timers must exceed PassiveRetain. fseq, CRC32C
-// and InstanceID checks kill a misbehaving carrier but do not replace the
-// contract.
+// carrier keepalive and idle timers must exceed PassiveRetain, the time the
+// passive side keeps a session without carriers: the dialer's NoPathGrace +
+// PingIdle + DeadMax + 5 s (34 s with the defaults). Frame sequence numbers
+// (fseq), CRC32C and InstanceID checks kill a misbehaving carrier but do
+// not replace the contract.
 package rendr

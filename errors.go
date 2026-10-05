@@ -2,7 +2,7 @@ package rendr
 
 import "github.com/FrankoonG/rendr/v2/internal/session"
 
-// Errors (plan §6). They are the same values the core produces, so
+// Session and Dial errors. They are the same values the core produces, so
 // errors.Is and errors.As match. Every sentinel below implements net.Error
 // with Timeout() == false, and so do *AbortError and *RejectError. Deadline
 // expiry is os.ErrDeadlineExceeded (Timeout() == true) and never ends a
@@ -10,8 +10,9 @@ import "github.com/FrankoonG/rendr/v2/internal/session"
 // Runtime.Close return net.ErrClosed; only the peer's FIN at the contiguous
 // delivery point yields io.EOF.
 var (
-	// ErrNoPath: no carrier for NoPathGrace (passive: PassiveRetain) since the
-	// last one was declared dead; or Dial: no OPEN completed within NoPathGrace.
+	// ErrNoPath: no carrier for NoPathGrace (passive: PassiveRetain, see the
+	// package documentation) since the last one was declared dead; or Dial:
+	// no OPEN completed within NoPathGrace.
 	ErrNoPath = session.ErrNoPath
 	// ErrSessionLost: deterministic loss — the bound peer instance answered
 	// UNKNOWN_SESSION, or the peer restarted (a redialled carrier reached a

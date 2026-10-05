@@ -4,8 +4,9 @@
 //
 // A Link is a path: every Dial creates a carrier from two net.Pipe pairs
 // joined by pumps. Each direction holds up to LinkConfig.Buffer bytes that
-// a Write returned for but the far end has not read; Kill loses them (the
-// buffer-loss model of L10/L61). Delay, jitter, a rate limit (one shared
+// a Write returned for but the far end has not read; Kill loses them, as a
+// broken connection loses what sat in its socket buffers, so a returned
+// Write never proves delivery. Delay, jitter, a rate limit (one shared
 // bottleneck per direction), blackhole and stall act on that buffer. A frame
 // tracker per direction follows the PREFACE and the frame boundaries, so
 // that faults can target single frames (corrupt, drop, inject, capture,
@@ -20,5 +21,5 @@
 // Stimulus proofs: every fault control has a counter, split into all
 // carriers, session carriers and probe carriers (a carrier is classified by
 // its first frame after the PREFACE: OPEN or JOIN = session, PING = probe),
-// so a test can prove that a fault actually touched a session (L60, L63).
+// so a test can prove that a fault actually touched a session.
 package rendrtest
