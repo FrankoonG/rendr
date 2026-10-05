@@ -26,6 +26,13 @@ const (
 // goroutines and fds may end meanwhile without hiding a new one. On failure
 // t gets the stacks of the new goroutines and the new fds only.
 //
+// Every sample (of the baseline and of the check) first runs the garbage
+// collector, because the runtime closes some descriptors only from a
+// finalizer: on Linux, io.Copy between two TCP connections splices through
+// a pipe pair that Go keeps in a pool, and the pair is closed only after
+// two collections have dropped it from the pool. Without the collections
+// such a pipe pair would be taken for a leak.
+//
 // It is meant for real-time tests outside synctest bubbles (a bubble checks
 // its own goroutines). It cannot be used with t.Parallel: goroutines of
 // tests running in parallel would count as leaks.
@@ -83,6 +90,9 @@ type leakSample struct {
 }
 
 func (lc leakCheck) sample() leakSample {
+	if lc.real {
+		runtime.GC() // pooled splice pipes are closed by a finalizer (AssertNoLeak)
+	}
 	buf := make([]byte, 64<<10)
 	for {
 		if n := runtime.Stack(buf, true); n < len(buf) {
