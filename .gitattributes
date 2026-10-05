@@ -1,0 +1,3 @@
+# Every checkout uses LF line endings, whatever the local core.autocrlf
+# setting, so gofmt and content hashes see the same bytes everywhere.
+* text=auto eol=lf
