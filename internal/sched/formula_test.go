@@ -295,16 +295,25 @@ func TestEpochAndPingIDWrap_L14(t *testing.T) {
 }
 
 // TestPureCallsDoNotAllocate: the per-evaluation calls the actor and the
-// health layer make (Add/Summary/Classify/NextChange/Evaluate/Rank) allocate
-// nothing in steady state (asserted in the non-race lane only).
+// health layer make (Add/Summary/Classify/NextChange/Evaluate/Rank, also
+// with kind classes: M2-D47, M2-D48) and the REL timer arithmetic of a
+// datagram carrier's writer and reader (RTTVar, RTO, RTOBackoff: M2-D16)
+// allocate nothing in steady state (asserted in the non-race lane only).
 func TestPureCallsDoNotAllocate(t *testing.T) {
 	a := NewAggregator(DefaultAggParams())
 	at := simEpoch
 	sel := NewSelector(defaultSelectorParams())
+	// A packet session on a stream carrier (factories 0 and 1): datagram
+	// factory 2 qualifies by class, its dwell clock runs.
+	classes := []uint8{1, 1, 0}
+	pkt := NewSelector(defaultSelectorParams())
+	pkt.SetClasses(classes)
 	sums := make([]Summary, 3)
 	cs := make([]Candidate, 3)
 	out := make([]int, 0, 16)
 	failed := []bool{false, false, false}
+	var srtt, rttvar, rto time.Duration
+	k := 0
 	n := testing.AllocsPerRun(200, func() {
 		at = at.Add(time.Second)
 		a.Add(at, 30*ms, false)
@@ -314,12 +323,27 @@ func TestPureCallsDoNotAllocate(t *testing.T) {
 		_ = NextChange(sums[0], at, defFresh)
 		v := sel.Evaluate(at, 0, sums, failed)
 		_ = v
+		v = pkt.Evaluate(at, 0, sums, failed)
+		_ = v
 		for i := range cs {
-			cs[i] = Candidate{Index: i, Ev: Classify(sums[i], at, defFresh)}
+			cs[i] = Candidate{Index: i, Ev: Classify(sums[i], at, defFresh), Class: classes[i]}
 		}
 		out = Rank(cs, out)
+		// One PONG and one REL timer arming.
+		rtt := 30*ms + time.Duration(k%7)*ms
+		rttvar = RTTVar(rttvar, srtt, rtt, k == 0)
+		if k == 0 {
+			srtt = rtt
+		} else {
+			srtt = (7*srtt + rtt) / 8
+		}
+		rto = RTOBackoff(RTO(srtt, rttvar, k > 0), k%5)
+		k++
 	})
 	if n != 0 && !raceEnabled {
 		t.Fatalf("steady-state calls allocate %v times per run", n)
+	}
+	if k < 200 || rto < RTOMin || rto > RTOMax || out[0] != 2 {
+		t.Fatalf("runs %d, last RTO %v, ranking %v", k, rto, out)
 	}
 }
