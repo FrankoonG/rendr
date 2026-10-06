@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -59,9 +60,16 @@ func pattern(n int, seed uint32) []byte {
 type vector struct {
 	name string
 	b    []byte
-	kind string // "preface", "preface_ack" or "frame"
+	// kind: "preface", "preface_ack" or "frame"; M2 adds "datagram" (the
+	// rendr bytes of one datagram with more than one element), "udp" (a
+	// raw-UDP flow header and the rendr bytes behind it), "flow_header" (a
+	// bare flow header) and "reject" (an encoding every decoder rejects:
+	// the decoder named by as fails with err).
+	kind string
 	hdr  Header // frames: the expected header (Len included)
-	val  any    // Preface, PrefaceAck, or the decoded payload value
+	val  any    // Preface, PrefaceAck, the decoded payload value, []dgElem, udpVal or flowVal
+	as   string // reject: "frame" (a valid header and CRC, the payload parser fails) or "flow_header"
+	err  error  // reject: the error of that decoder
 }
 
 func prefaceVec(name string, p Preface) vector {
@@ -180,6 +188,94 @@ func goldenVectors() []vector {
 	add(frameVec("ext_81_flagsff_handle1", Type(0x81), 0xff, 11, 1, extVal(pattern(300, 0x81))))
 	add(frameVec("ext_fe_flagsff_handle0_empty", Type(0xfe), 0xff, 11, 0, extVal(nil)))
 	add(frameVec("ext_ff_flags00_handle1", Type(0xff), 0x00, 11, 1, extVal("x")))
+
+	return append(vs, goldenVectorsM2()...)
+}
+
+// goldenVectorsM2 builds the vectors M2 adds (M2 design §A3.10), after
+// every M1 vector, which stays byte-identical: the packet-session frames,
+// RACK, every REL-wrapped control frame, the packet OPEN fields, the MTU
+// probe, the raw-UDP flow header and the datagram handshakes (§A5.10).
+func goldenVectorsM2() []vector {
+	var vs []vector
+	add := func(v vector) { vs = append(vs, v) }
+
+	add(frameVec("dgram_empty", TypeDgram, 0, 12, SessionHandle, dgramVal{Seq: 1}))
+	add(frameVec("dgram_1000", TypeDgram, 0, 12, SessionHandle, dgramVal{Seq: 1 << 32, Body: pattern(1000, 0x20)}))
+	add(frameVec("dgram_seq_max", TypeDgram, 0, 12, SessionHandle, dgramVal{Seq: 1<<62 - 1, Body: []byte{0x5a}}))
+	add(frameVec("pack_zero", TypePack, 0, 13, SessionHandle, Pack{}))
+	add(frameVec("pack_example", TypePack, 0, 13, SessionHandle, Pack{HighestSeq: 1 << 20, Received: 1<<20 - 7, EpochEcho: 3}))
+	add(frameVec("pack_fin_delivered_done", TypePack, FlagPackFinDelivered|FlagPackDone, 13, SessionHandle, Pack{HighestSeq: 1000, Received: 1000}))
+	add(frameVec("rack_zero", TypeRack, 0, 14, 0, Rack{}))
+	add(frameVec("rack_sack", TypeRack, 0, 14, 0, Rack{CumAck: 5, Sack: 0x55}))
+	add(frameVec("rack_wrap", TypeRack, 0, 14, 0, Rack{CumAck: 0xfffffffe, Sack: 0x01})) // holds cseq 0 (L14)
+
+	// REL-wrapped control frames. The OPEN and JOIN RELs are the frames of
+	// the H1 datagrams below (their first fseq is their PREFACE's CRC
+	// field): alone they are "REL before PREFACE" seeds (plan:363).
+	pre, preJoin := dgPrefaceVec(gCarrier), dgPrefaceVec(gCarrierJoin)
+	relOpen := relVec("rel_open_packet", PrefaceFseq(pre.b), RelHead{Cseq: FirstCseq, Type: TypeOpen, Handle: SessionHandle}, gPacketOpen())
+	add(relOpen)
+	meta := gPacketOpen()
+	meta.Metadata = pattern(gMaxMeta, 0x34)
+	add(relVec("rel_open_packet_meta", PrefaceFseq(pre.b), RelHead{Cseq: FirstCseq, Type: TypeOpen, Handle: SessionHandle}, meta))
+	okAck := OpenAck{Status: StatusOK, Window: PacketWindow(gMaxPayload, gBudget)}
+	add(relVec("rel_open_ack_ok_packet", 15, RelHead{Cseq: FirstCseq, Type: TypeOpenAck, Handle: SessionHandle}, okAck))
+	add(relVec("rel_open_ack_capacity", 15, RelHead{Cseq: FirstCseq, Type: TypeOpenAck, Handle: SessionHandle}, OpenAck{Status: StatusCapacity, Code: CodeMaxSessions}))
+	relJoin := relVec("rel_join_packet", PrefaceFseq(preJoin.b), RelHead{Cseq: FirstCseq, Type: TypeJoin, Handle: SessionHandle}, Join{SID: gSID, Mode: 1, RxNext: gBudget})
+	add(relJoin)
+	add(relVec("rel_join_ack_ok_packet", 15, RelHead{Cseq: FirstCseq, Type: TypeJoinAck, Handle: SessionHandle}, JoinAck{Status: StatusOK, RxNext: gBudget}))
+	one := Sched{Epoch: 7, Quality: 1, N: 1}
+	one.IDs[0] = gCarrierJoin
+	add(relVec("rel_sched_n1", 16, RelHead{Cseq: 2, Type: TypeSched, Flags: uint8(SchedQuality), Handle: SessionHandle}, one))
+	all := Sched{Epoch: 0xffffffff, Death: 0x0102030405060708, Quality: 3, Explicit: 0xffffffffffffffff, N: MaxSchedIDs}
+	for i := range all.IDs {
+		all.IDs[i] = uint32(i + 1)
+	}
+	add(relVec("rel_sched_n16", 16, RelHead{Cseq: 3, Type: TypeSched, Flags: uint8(SchedDeath), Handle: SessionHandle}, all))
+	add(relVec("rel_fin", 16, RelHead{Cseq: 4, Type: TypeFin, Handle: SessionHandle}, finVal(1001))) // a packet session's final seq
+	add(relVec("rel_rst_255", 16, RelHead{Cseq: 5, Type: TypeRst, Handle: SessionHandle}, Rst{Code: RstLinger, Msg: pattern(MaxMsg, 0x13)}))
+	add(relVec("rel_close", 16, RelHead{Cseq: 0xffffffff, Type: TypeClose}, CloseRetire))
+	add(relVec("rel_goaway", 16, RelHead{Cseq: 0, Type: TypeGoAway}, GoAwayShutdown)) // the cseq after 0xffffffff (L14)
+	add(relVec("rel_pack_flagged", 16, RelHead{Cseq: 6, Type: TypePack, Flags: FlagPackFinDelivered | FlagPackDone, Handle: SessionHandle}, Pack{HighestSeq: 1000, Received: 999, EpochEcho: 4}))
+
+	// A packet OPEN on a stream carrier (window 0) and the two packet field
+	// errors (§A3.5).
+	streamOpen := gPacketOpen()
+	streamOpen.Mode, streamOpen.Window, streamOpen.PMTU = 2, 0, MaxPacketPayload
+	add(frameVec("open_packet_stream_carrier", TypeOpen, 0, FirstFseq, SessionHandle, streamOpen))
+	low := gPacketOpen()
+	low.PMTU = MinPacketPayload - 1
+	add(rejectFrameVec("open_packet_pmtu_low", TypeOpen, FirstFseq, SessionHandle, low, ErrValue))
+	bad := gPacketOpen()
+	bad.Window = MinFrameBudget - 1
+	add(rejectFrameVec("open_packet_window_bad", TypeOpen, FirstFseq, SessionHandle, bad, ErrValue))
+
+	add(frameVec("ping_mtu_probe_1152", TypePing, 0, 17, 0, Ping{ID: 10, TS: gTS, Nonce: gNonce ^ 10, Pad: gBudget - FrameOverhead - PingFixedLen}))
+	add(flowHeaderVec("flow_header", gFlow))
+	add(vector{name: "flow_header_zero", b: []byte{FlowVersion, 0, 0, 0, 0, 0, 0, 0, 0}, kind: "reject", as: "flow_header", err: ErrFlowHeader})
+
+	// The datagram handshakes: H1 (dialer), H2 (passive), H3 (the
+	// passive's first REL, its response), H4 (the dialer's RACK of it), the
+	// probe pair, a resent H1 and a PREFACE-level refusal.
+	h1 := datagramVec("h1_open", pre, relOpen)
+	add(h1)
+	add(datagramVec("h1_join", preJoin, relJoin))
+	preProbe := dgPrefaceVec(gCarrierProbe)
+	add(datagramVec("h1_probe", preProbe, frameVec("", TypePing, 0, PrefaceFseq(preProbe.b), 0, gProbePing())))
+	ack := dgAckVec(PrefaceOK, gCarrier)
+	add(datagramVec("h2_ok", ack, frameVec("", TypeRack, 0, PrefaceFseq(ack.b), 0, Rack{CumAck: FirstCseq})))
+	ackProbe := dgAckVec(PrefaceOK, gCarrierProbe)
+	add(datagramVec("h2_probe", ackProbe, frameVec("", TypePong, 0, PrefaceFseq(ackProbe.b), 0, gProbePing())))
+	add(relVec("h3_open_ack", PrefaceFseq(ack.b)+1, RelHead{Cseq: FirstCseq, Type: TypeOpenAck, Handle: SessionHandle}, okAck))
+	add(frameVec("h4_rack", TypeRack, 0, PrefaceFseq(pre.b)+1, 0, Rack{CumAck: FirstCseq}))
+	resend := h1
+	resend.name, resend.b = "h1_resend", bytes.Clone(h1.b)
+	add(resend)
+	refusal := dgAckVec(PrefaceVersion, gCarrier)
+	refusal.name = "refusal_version"
+	add(refusal)
+	add(udpVec("udp_h1_open", gFlow, h1))
 	return vs
 }
 
@@ -216,6 +312,29 @@ func decodeTyped(t Type, p []byte) (any, error) {
 		return ParseClose(p)
 	case TypeGoAway:
 		return ParseGoAway(p)
+	case TypeDgram:
+		seq, data, err := ParseDgram(p)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			data = nil
+		}
+		return dgramVal{Seq: seq, Body: data}, nil
+	case TypePack:
+		return ParsePack(p)
+	case TypeRack:
+		return ParseRack(p)
+	case TypeRel:
+		h, inner, err := ParseRel(p)
+		if err != nil {
+			return nil, err
+		}
+		v, err := decodeTyped(h.Type, inner)
+		if err != nil {
+			return nil, err
+		}
+		return relVal{Head: h, Inner: v}, nil
 	}
 	if t.Extension() {
 		if len(p) == 0 {
@@ -226,12 +345,22 @@ func decodeTyped(t Type, p []byte) (any, error) {
 	return nil, ErrType
 }
 
-// encodeTyped encodes a decoded payload value with its type's encoder.
+// encodeTyped encodes a decoded payload value with its type's encoder (a
+// REL's head and inner payload with theirs).
 func encodeTyped(t Type, v any) []byte {
+	if r, ok := v.(relVal); ok {
+		inner := encodeTyped(r.Head.Type, r.Inner)
+		b := make([]byte, RelHeadLen+len(inner))
+		PutRelHead(b, &r.Head)
+		copy(b[RelHeadLen:], inner)
+		return b
+	}
 	size := OpenFixedLen + MaxMetadata // the largest non-DATA core payload
 	switch v := v.(type) {
 	case dataVal:
 		size = DataPrefixLen + len(v.Body)
+	case dgramVal:
+		size = DgramPrefixLen + len(v.Body)
 	case extVal:
 		size = len(v)
 	}
@@ -263,6 +392,13 @@ func encodeTyped(t Type, v any) []byte {
 		n = PutReason(b, uint8(v))
 	case GoAwayReason:
 		n = PutReason(b, uint8(v))
+	case dgramVal:
+		PutDgramSeq(b, v.Seq)
+		n = DgramPrefixLen + copy(b[DgramPrefixLen:], v.Body)
+	case Pack:
+		n = PutPack(b, &v)
+	case Rack:
+		n = PutRack(b, &v)
 	case extVal:
 		n = copy(b, v)
 	default:
@@ -302,6 +438,49 @@ func checkVector(v vector) error {
 		if got, err = decodeTyped(f.Type, f.Payload); err != nil {
 			return err
 		}
+	case "datagram":
+		elems, err := decodeDatagram(v.b)
+		if err != nil {
+			return err
+		}
+		got = elems
+	case "flow_header":
+		flow, rest, err := ParseFlowHeader(v.b)
+		if err != nil {
+			return err
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("%d bytes after the flow header", len(rest))
+		}
+		got = flowVal(flow)
+	case "udp":
+		flow, rest, err := ParseFlowHeader(v.b)
+		if err != nil {
+			return err
+		}
+		elems, err := decodeDatagram(rest)
+		if err != nil {
+			return err
+		}
+		got = udpVal{Flow: flow, Elems: elems}
+	case "reject":
+		var err error
+		switch v.as {
+		case "frame":
+			f, n, ferr := DecodeFrame(v.b)
+			if ferr != nil || n != len(v.b) {
+				return fmt.Errorf("not a whole frame: n=%d %v", n, ferr)
+			}
+			_, err = decodeTyped(f.Type, f.Payload)
+		case "flow_header":
+			_, _, err = ParseFlowHeader(v.b)
+		}
+		if !errors.Is(err, v.err) {
+			return fmt.Errorf("%s decoder: %v, want %v", v.as, err, v.err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown vector kind %q", v.kind)
 	}
 	if !reflect.DeepEqual(got, v.val) {
 		return fmt.Errorf("decoded %+v, want %+v", got, v.val)
@@ -395,10 +574,33 @@ func TestGolden_L44(t *testing.T) {
 		"join_ack_ok", "join_ack_going_away", "data_1", "data_64k", "ack_fin_delivered_done", "fin",
 		"rst_code6_msg255", "sched_n16_explicit", "ping_busy_pad1000", "pong_pad0", "close_capacity", "goaway_shutdown",
 		"ext_81_flagsff_handle1", "ext_fe_flagsff_handle0_empty",
+		// M2 (design §A3.10).
+		"dgram_empty", "dgram_1000", "dgram_seq_max", "pack_zero", "pack_example", "pack_fin_delivered_done",
+		"rack_zero", "rack_sack", "rack_wrap", "rel_open_packet", "rel_open_packet_meta", "rel_open_ack_ok_packet",
+		"rel_open_ack_capacity", "rel_join_packet", "rel_join_ack_ok_packet", "rel_sched_n1", "rel_sched_n16",
+		"rel_fin", "rel_rst_255", "rel_close", "rel_goaway", "rel_pack_flagged", "open_packet_stream_carrier",
+		"open_packet_pmtu_low", "open_packet_window_bad", "ping_mtu_probe_1152", "flow_header", "flow_header_zero",
+		"h1_open", "h1_join", "h1_probe", "h2_ok", "h2_probe", "h3_open_ack", "h4_rack", "h1_resend",
+		"refusal_version", "udp_h1_open",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
 		}
+	}
+	// M1's vectors keep their positions and bytes; the resent H1 is
+	// byte-identical to the first (PA-21).
+	if names[0] != "preface" || names[len(names)-1] != "udp_h1_open" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
+	}
+	m1 := 0
+	for _, v := range vs {
+		if v.name == "dgram_empty" {
+			break
+		}
+		m1++
+	}
+	if m1 != 73-4 { // the M1 file: 73 lines, four of them comments
+		t.Errorf("%d vectors precede the M2 ones, want the 69 of M1", m1)
 	}
 }
 

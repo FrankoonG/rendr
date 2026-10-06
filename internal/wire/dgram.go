@@ -1,14 +1,22 @@
 package wire
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+)
 
-// This file declares the M2 additions of wire format v2 (plan §5; M2 design
+// This file holds the M2 additions of wire format v2 (plan §5; M2 design
 // §A3): the packet-session frames DGRAM and PACK, the reliable control
 // sublayer frames REL and RACK, the raw-UDP flow header and the datagram
-// classification helpers. M2 wave 1 implements the codecs and extends Known,
-// CarrierLevel, AllowedFlags, PayloadBounds and String to the four types in
-// the same commit that moves the M1 tests pinning them as ErrType; until
-// then ParseHeader keeps rejecting them.
+// classification helpers. Known, CarrierLevel, AllowedFlags, PayloadBounds
+// and String cover the four types, so ParseHeader checks them like every
+// other core type (§A3.1). No M1 encoding changes (M2-D11).
+//
+// A datagram's bytes (§A3.4) are an optional raw-UDP flow header (only on
+// raw-UDP flow carriers), then rendr bytes: an optional PREFACE or
+// PREFACE_ACK (only in the handshake datagrams) followed by whole frames
+// that fill the datagram exactly. The package has no datagram walker: the
+// carrier reader walks a datagram with DecodeFrame and the payload parsers.
 
 // M2 frame types (M2-D6).
 const (
@@ -150,16 +158,24 @@ func itoa(v int) string {
 	return string(b[i:])
 }
 
-// PutDgramSeq writes the DGRAM prefix (seq) into dst[:DgramPrefixLen].
+// PutDgramSeq writes the DGRAM prefix (seq) into dst[:DgramPrefixLen]. The
+// datagram bytes follow it in the frame (the batch references them; they
+// are never copied into its arena). It panics if dst is too small.
 func PutDgramSeq(dst []byte, seq uint64) {
-	panic("unimplemented: M2")
+	_ = dst[DgramPrefixLen-1]
+	binary.BigEndian.PutUint64(dst[:DgramPrefixLen], seq)
 }
 
 // ParseDgram decodes a DGRAM payload: seq and the datagram bytes (aliasing
 // p; an empty datagram is legal). Fewer than DgramPrefixLen bytes is
-// ErrShort.
+// ErrShort. Every seq decodes: its limits (OffsetLimit, the peer's final
+// seq) and the session's MaxPayload are the receiving session's checks
+// (M2 design §A3.2). data's capacity ends at its length.
 func ParseDgram(p []byte) (seq uint64, data []byte, err error) {
-	panic("unimplemented: M2")
+	if len(p) < DgramPrefixLen {
+		return 0, nil, ErrShort
+	}
+	return binary.BigEndian.Uint64(p[:DgramPrefixLen]), p[DgramPrefixLen:len(p):len(p)], nil
 }
 
 // Pack is the PACK payload: highestSeq u64 · received u64 · epochEcho u32.
@@ -170,14 +186,39 @@ type Pack struct {
 	EpochEcho  uint32 // passive: the SCHED epoch it applied; dialer: 0
 }
 
-// PutPack writes p into dst and returns PackLen.
+// PutPack writes p into dst and returns PackLen. It writes the canonical
+// HighestSeq 0 itself when Received is 0, whatever p holds, so a sender
+// cannot emit a PACK its peer rejects (as PutOpenAck writes its canonical
+// zero fields). It panics if dst is too small.
 func PutPack(dst []byte, p *Pack) int {
-	panic("unimplemented: M2")
+	_ = dst[PackLen-1]
+	hi := p.HighestSeq
+	if p.Received == 0 {
+		hi = 0
+	}
+	binary.BigEndian.PutUint64(dst[0:8], hi)
+	binary.BigEndian.PutUint64(dst[8:16], p.Received)
+	binary.BigEndian.PutUint32(dst[16:20], p.EpochEcho)
+	return PackLen
 }
 
 // ParsePack decodes a PACK payload (exactly PackLen bytes, canonical).
+// Received ≤ HighestSeq + 1 is not a codec rule (seqs start at the
+// session's first seq): the receiving session checks a PACK against what
+// it sent (M2 design §A3.2).
 func ParsePack(p []byte) (Pack, error) {
-	panic("unimplemented: M2")
+	if err := exactTail(len(p), PackLen); err != nil {
+		return Pack{}, err
+	}
+	pk := Pack{
+		HighestSeq: binary.BigEndian.Uint64(p[0:8]),
+		Received:   binary.BigEndian.Uint64(p[8:16]),
+		EpochEcho:  binary.BigEndian.Uint32(p[16:20]),
+	}
+	if pk.Received == 0 && pk.HighestSeq != 0 {
+		return Pack{}, ErrReserved
+	}
+	return pk, nil
 }
 
 // RelHead is the fixed part of a REL payload: the cseq and the compact
@@ -189,60 +230,139 @@ type RelHead struct {
 	Handle uint32 // 0 for CLOSE and GOAWAY, SessionHandle otherwise
 }
 
-// PutRelHead writes h into dst[:RelHeadLen].
+// PutRelHead writes h into dst[:RelHeadLen]; the inner payload follows it.
+// The fields are written as given (no validation, so tests can build
+// invalid frames; the writer wraps only Wrappable types). It panics if dst
+// is too small.
 func PutRelHead(dst []byte, h *RelHead) {
-	panic("unimplemented: M2")
+	_ = dst[RelHeadLen-1]
+	binary.BigEndian.PutUint32(dst[0:4], h.Cseq)
+	dst[4] = byte(h.Type)
+	dst[5] = h.Flags
+	binary.BigEndian.PutUint32(dst[6:10], h.Handle)
 }
 
 // ParseRel decodes a REL payload: the head and the inner payload (aliasing
 // p). Check order: length ≥ RelHeadLen (ErrShort); Wrappable(type)
 // (ErrType: REL in REL is impossible); flags (ErrFlags); handle
 // (ErrHandle); inner length within PayloadBounds(type) (ErrLength). The
-// inner payload is decoded by its own parser at dispatch.
+// inner payload is decoded by its own parser at dispatch. Every cseq
+// decodes (the receiver's window decides). inner's capacity ends at its
+// length; an error returns the zero RelHead and a nil inner.
 func ParseRel(p []byte) (h RelHead, inner []byte, err error) {
-	panic("unimplemented: M2")
+	if len(p) < RelHeadLen {
+		return RelHead{}, nil, ErrShort
+	}
+	h = RelHead{
+		Cseq:   binary.BigEndian.Uint32(p[0:4]),
+		Type:   Type(p[4]),
+		Flags:  p[5],
+		Handle: binary.BigEndian.Uint32(p[6:10]),
+	}
+	if !Wrappable(h.Type) {
+		return RelHead{}, nil, ErrType
+	}
+	if h.Flags&^AllowedFlags(h.Type) != 0 {
+		return RelHead{}, nil, ErrFlags
+	}
+	want := SessionHandle
+	if h.Type.CarrierLevel() {
+		want = 0
+	}
+	if h.Handle != want {
+		return RelHead{}, nil, ErrHandle
+	}
+	n := len(p) - RelHeadLen
+	if lo, hi, _ := PayloadBounds(h.Type); n < lo || n > hi {
+		return RelHead{}, nil, ErrLength
+	}
+	return h, p[RelHeadLen:len(p):len(p)], nil
 }
 
 // Rack is the RACK payload: cumAck u32 · sack u32. CumAck is the highest
 // cseq the receiver dispatched in order; sack bit i (bit 0 the least
-// significant) reports cseq CumAck + 2 + i held out of order.
+// significant) reports cseq CumAck + 2 + i held out of order. Only bits
+// 0 … RelWindow − 2 exist (a receiver holds at most RelWindow − 1 frames);
+// the others are reserved zero.
 type Rack struct {
 	CumAck uint32
 	Sack   uint32
 }
 
-// PutRack writes r into dst and returns RackLen.
+// rackSackMask covers the defined sack bits: cseq CumAck + 2 … CumAck +
+// RelWindow (bits 0 … RelWindow − 2).
+const rackSackMask uint32 = 1<<(RelWindow-1) - 1
+
+// PutRack writes r into dst and returns RackLen. The fields are written as
+// given (reserved sack bits included, as Open.Flags). It panics if dst is
+// too small.
 func PutRack(dst []byte, r *Rack) int {
-	panic("unimplemented: M2")
+	_ = dst[RackLen-1]
+	binary.BigEndian.PutUint32(dst[0:4], r.CumAck)
+	binary.BigEndian.PutUint32(dst[4:8], r.Sack)
+	return RackLen
 }
 
-// ParseRack decodes a RACK payload (exactly RackLen bytes).
+// ParseRack decodes a RACK payload: exactly RackLen bytes; sack bits
+// outside rackSackMask must be 0 (ErrReserved). Every cumAck decodes
+// (serial arithmetic, L14): whether it or a sack bit names a cseq not yet
+// sent is the sender's check (M2 design §A3.3).
 func ParseRack(p []byte) (Rack, error) {
-	panic("unimplemented: M2")
+	if err := exactTail(len(p), RackLen); err != nil {
+		return Rack{}, err
+	}
+	r := Rack{CumAck: binary.BigEndian.Uint32(p[0:4]), Sack: binary.BigEndian.Uint32(p[4:8])}
+	if r.Sack&^rackSackMask != 0 {
+		return Rack{}, ErrReserved
+	}
+	return r, nil
 }
 
 // Wrappable reports whether a REL may carry type t: OPEN, OPEN_ACK, JOIN,
 // JOIN_ACK, FIN, RST, SCHED, CLOSE, GOAWAY (plan:356) and PACK (M2-D39).
+// REL, RACK, DGRAM, DATA, ACK, PING, PONG, extensions and unknown types are
+// not: REL inside REL is impossible by construction.
 func Wrappable(t Type) bool {
-	panic("unimplemented: M2")
+	switch t {
+	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeFin, TypeRst, TypeSched,
+		TypeClose, TypeGoAway, TypePack:
+		return true
+	}
+	return false
 }
 
 // PutFlowHeader writes the raw-UDP flow header (FlowVersion, flow) into
-// dst[:FlowHeaderLen]. It panics if flow is 0.
+// dst[:FlowHeaderLen]. It panics if flow is 0 or dst is too small.
 func PutFlowHeader(dst []byte, flow uint64) {
-	panic("unimplemented: M2")
+	if flow == 0 {
+		panic("rendr/wire: PutFlowHeader: flow ID 0")
+	}
+	_ = dst[FlowHeaderLen-1]
+	dst[0] = FlowVersion
+	binary.BigEndian.PutUint64(dst[1:FlowHeaderLen], flow)
 }
 
 // ParseFlowHeader splits a raw-UDP datagram into its flow ID and its rendr
 // bytes (aliasing d). ErrFlowHeader for fewer than FlowHeaderLen bytes, a
-// version other than FlowVersion, or flow 0.
+// version other than FlowVersion, or flow 0. The flow ID is a
+// demultiplexing key, not authentication (plan:361): it has no integrity
+// check of its own. rest may be empty; its capacity ends at its length.
 func ParseFlowHeader(d []byte) (flow uint64, rest []byte, err error) {
-	panic("unimplemented: M2")
+	if len(d) < FlowHeaderLen || d[0] != FlowVersion {
+		return 0, nil, ErrFlowHeader
+	}
+	flow = binary.BigEndian.Uint64(d[1:FlowHeaderLen])
+	if flow == 0 {
+		return 0, nil, ErrFlowHeader
+	}
+	return flow, d[FlowHeaderLen:len(d):len(d)], nil
 }
 
 // IsPreface reports whether the rendr bytes b of a datagram start with a
 // PREFACE or PREFACE_ACK candidate: at least PrefaceLen bytes and the
-// "RND2" magic. The full checks are ParsePreface and ParsePrefaceAck.
+// "RND2" magic. The full checks are ParsePreface and ParsePrefaceAck. A
+// frame never starts with the magic: its first byte is its type, and 0x52
+// ('R') is never assigned (TypeReservedR).
 func IsPreface(b []byte) bool {
 	return len(b) >= PrefaceLen && b[0] == Magic[0] && b[1] == Magic[1] && b[2] == Magic[2] && b[3] == Magic[3]
 }
