@@ -89,8 +89,11 @@ func (c *linkConn) waitBlock() error {
 	counted := false
 	for {
 		l.mu.Lock()
-		m, ch := l.sides[c.side].block, l.blockCh
+		m, ch, closed := l.sides[c.side].block, l.blockCh, l.closed
 		l.mu.Unlock()
+		if closed { // Close lifted the block before it shut the carriers
+			return io.ErrClosedPipe
+		}
 		if m == BlockOff {
 			return nil
 		}
