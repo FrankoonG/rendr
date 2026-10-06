@@ -11,19 +11,22 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// dgBatch returns a fresh round of a datagram batch with frame budget
+// The helpers of this file carry the prefix bdg (batch datagram) so that no
+// other file of package carrier collides with them.
+
+// bdgBatch returns a fresh round of a datagram batch with frame budget
 // budget and REL room room.
-func dgBatch(budget, room int) *Batch {
+func bdgBatch(budget, room int) *Batch {
 	b := NewBatch(0)
 	b.Reset(time.Unix(1700000000, 0))
 	b.SetDatagram(budget, room)
 	return b
 }
 
-// stampRels stamps consecutive cseqs from first on every new REL of the
+// bdgStampRels stamps consecutive cseqs from first on every new REL of the
 // round, as the writer's relSeal does, and returns their REL payloads
 // (copies, as the send slots hold them).
-func stampRels(b *Batch, first uint32) [][]byte {
+func bdgStampRels(b *Batch, first uint32) [][]byte {
 	var out [][]byte
 	for k := range b.relCount() {
 		out = append(out, bytes.Clone(b.relPayload(k, first+uint32(k))))
@@ -31,35 +34,35 @@ func stampRels(b *Batch, first uint32) [][]byte {
 	return out
 }
 
-// frameSize returns the bytes frame i occupies on the wire.
-func frameSize(b *Batch, i int) int {
+// bdgFrameSize returns the bytes frame i occupies on the wire.
+func bdgFrameSize(b *Batch, i int) int {
 	return wire.FrameOverhead + int(b.frames[i].hdr.Len)
 }
 
-// datagram is one packed datagram of a sealed batch.
-type datagram struct {
+// bdgPacked is one packed datagram of a sealed batch.
+type bdgPacked struct {
 	i, end, n int
 	bytes     []byte
 }
 
-// packDatagrams packs a sealed batch into datagrams for budget, as the
+// bdgPack packs a sealed batch into datagrams for budget, as the
 // datagram writer does (nextDatagram, appendDatagram into a reused scratch
 // after headroom bytes), and returns them with the rendr bytes copied.
-func packDatagrams(b *Batch, budget, headroom int) []datagram {
-	var out []datagram
+func bdgPack(b *Batch, budget, headroom int) []bdgPacked {
+	var out []bdgPacked
 	scratch := make([]byte, 0, headroom+wire.MaxDatagram)
 	for i := 0; i < b.Len(); {
 		end, n := b.nextDatagram(i, budget)
 		d := b.appendDatagram(scratch[:headroom], i, end)
-		out = append(out, datagram{i: i, end: end, n: n, bytes: bytes.Clone(d[headroom:])})
+		out = append(out, bdgPacked{i: i, end: end, n: n, bytes: bytes.Clone(d[headroom:])})
 		i = end
 	}
 	return out
 }
 
-// decodeAll decodes every frame of rendr bytes p, which must hold complete
+// bdgDecode decodes every frame of rendr bytes p, which must hold complete
 // frames only (a datagram, or the coalesced stream form).
-func decodeAll(t *testing.T, p []byte) []wire.Frame {
+func bdgDecode(t *testing.T, p []byte) []wire.Frame {
 	t.Helper()
 	var out []wire.Frame
 	for len(p) > 0 {
@@ -85,7 +88,9 @@ func decodeAll(t *testing.T, p []byte) []wire.Frame {
 // whole and in insertion order, at most one DGRAM per datagram as its last
 // frame, a padded PING or PONG alone, control frames riding in front of the
 // next DGRAM when they fit, an oversize frame alone. A stream batch keeps
-// every M1 behaviour and carries DGRAM and PACK as ordinary frames.
+// every M1 behaviour and carries DGRAM and PACK as ordinary frames. A batch
+// reused round after round, as the writer keeps it, starts every round
+// afresh: its own chunk references (§A4.5), REL refusal and DGRAM bytes.
 func TestBatchDgram_L41(t *testing.T) {
 	t.Run("mode", func(t *testing.T) {
 		b := NewBatch(0)
@@ -137,7 +142,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			{wire.TypePack, wire.FlagPackFinDelivered | wire.FlagPackDone, h1, 47}, // a flagged PACK is always reliable
 			{wire.TypeClose, 0, 0, 28},                                             // REL{CLOSE}
 		}
-		b := dgBatch(1232, wire.RelWindow)
+		b := bdgBatch(1232, wire.RelWindow)
 		adds := []bool{
 			b.AddOpenAck(h1, &wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeCarriers, Msg: msg}),
 			b.AddJoinAck(h1, &wire.JoinAck{Status: wire.StatusOK, RxNext: 1152}),
@@ -196,7 +201,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			if !f.Rel || f.Header.Type != w.t || f.Header.Flags != w.flags || f.Header.Handle != w.handle || len(f.Payload) != int(f.Header.Len) {
 				t.Errorf("frame %d inner %+v rel %v, want %v flags %#x handle %d", i, f.Header, f.Rel, w.t, w.flags, w.handle)
 			}
-			if got := frameSize(b, i); got != w.size {
+			if got := bdgFrameSize(b, i); got != w.size {
 				t.Errorf("frame %d (%v) is %d bytes on the wire, want %d", i, w.t, got, w.size)
 			}
 		}
@@ -221,7 +226,7 @@ func TestBatchDgram_L41(t *testing.T) {
 
 		// The cseqs, in insertion order, and the REL payload layout:
 		// cseq u32 · itype u8 · iflags u8 · ihandle u32 · ipayload.
-		pays := stampRels(b, 0xfffffffe) // wraps (L14)
+		pays := bdgStampRels(b, 0xfffffffe) // wraps (L14)
 		for k, p := range pays {
 			f := b.Frame(int(b.relIdx[k]))
 			cs := binary.BigEndian.Uint32(p[0:4])
@@ -260,8 +265,8 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Errorf("stream PACK header %+v", f.Header)
 		}
 		s.seal(1) // nothing to stamp on a stream batch
-		mustPanic(t, "ACK on a datagram batch", func() { dgBatch(1152, 8).AddAck(h1, 0, &wire.Ack{}) })
-		mustPanic(t, "DATA on a datagram batch", func() { dgBatch(1152, 8).AddData(h1, 0, []byte{1}, nil, false) })
+		mustPanic(t, "ACK on a datagram batch", func() { bdgBatch(1152, 8).AddAck(h1, 0, &wire.Ack{}) })
+		mustPanic(t, "DATA on a datagram batch", func() { bdgBatch(1152, 8).AddData(h1, 0, []byte{1}, nil, false) })
 		mustPanic(t, "RACK on a stream batch", func() { s.addRack(&wire.Rack{}) })
 		mustPanic(t, "REL retransmission on a stream batch", func() { s.addRelRetx(make([]byte, wire.RelHeadLen)) })
 		mustPanic(t, "undefined PACK flags", func() { s.AddPack(h1, 0x04, &pack, false) })
@@ -270,7 +275,7 @@ func TestBatchDgram_L41(t *testing.T) {
 	t.Run("rel room", func(t *testing.T) {
 		// A carrier with all eight RELs outstanding: no reliable frame, and
 		// the refusal is recorded for the writer's blocked flag (W5).
-		b := dgBatch(1152, 0)
+		b := bdgBatch(1152, 0)
 		if b.AddFin(h1, 1) || b.addClose(wire.CloseRetire) || b.AddPack(h1, wire.FlagPackDone, &wire.Pack{}, false) || b.Len() != 0 || !b.relRefused() {
 			t.Fatalf("REL room 0: len %d, refused %v", b.Len(), b.relRefused())
 		}
@@ -278,7 +283,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Fatal("REL room 0 refused an unreliable PACK")
 		}
 		// Room 3: exactly three reliable frames, whatever their type.
-		b = dgBatch(1152, 3)
+		b = bdgBatch(1152, 3)
 		got := 0
 		for i := range 6 {
 			if b.AddFin(h1, uint64(i)) {
@@ -293,7 +298,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		}
 		// A full batch refuses a reliable frame without reporting the REL
 		// window: the frame waits for the next round, not for a RACK.
-		b = dgBatch(1152, wire.RelWindow)
+		b = bdgBatch(1152, wire.RelWindow)
 		for range MaxBatchFrames {
 			b.addPing(false, &wire.Ping{})
 		}
@@ -305,7 +310,7 @@ func TestBatchDgram_L41(t *testing.T) {
 	t.Run("seal and retransmission", func(t *testing.T) {
 		// Round 1: two new RELs, stamped and sealed; the wire frames are
 		// REL frames whose payloads are exactly the stamped REL payloads.
-		b := dgBatch(1152, wire.RelWindow)
+		b := bdgBatch(1152, wire.RelWindow)
 		sched := wire.Sched{Epoch: 2, N: 1, IDs: [wire.MaxSchedIDs]uint32{9}}
 		if !b.AddFin(h1, 77) || !b.AddSched(h1, wire.SchedQuality, &sched) {
 			t.Fatal("building round 1")
@@ -319,7 +324,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Fatalf("seal returned %d", next)
 		}
 		raw1 := b.appendTo(nil)
-		first := decodeAll(t, raw1)
+		first := bdgDecode(t, raw1)
 		for i, f := range first {
 			if f.Type != wire.TypeRel || f.Fseq != 100+uint32(i) || f.Handle != 0 || !bytes.Equal(f.Payload, pays[i]) {
 				t.Fatalf("round 1 frame %d: %+v", i, f.Header)
@@ -348,10 +353,10 @@ func TestBatchDgram_L41(t *testing.T) {
 		if f := b.Frame(0); !f.Rel || f.Header.Type != wire.TypeFin || f.Header.Handle != h1 {
 			t.Fatalf("retransmission view %+v", f.Header)
 		}
-		stampRels(b, 43)
+		bdgStampRels(b, 43)
 		b.seal(500)
 		raw2 := b.appendTo(nil)
-		second := decodeAll(t, raw2)
+		second := bdgDecode(t, raw2)
 		if second[0].Type != wire.TypeRel || second[0].Fseq != 500 || !bytes.Equal(second[0].Payload, first[0].Payload) {
 			t.Fatalf("retransmission: %+v, payload equal %v", second[0].Header, bytes.Equal(second[0].Payload, first[0].Payload))
 		}
@@ -369,9 +374,9 @@ func TestBatchDgram_L41(t *testing.T) {
 		if binary.BigEndian.Uint32(pays[0]) != 41 {
 			t.Fatal("the REL payload changed")
 		}
-		mustPanic(t, "REL payload too short", func() { dgBatch(1152, 8).addRelRetx(make([]byte, wire.RelHeadLen-1)) })
-		mustPanic(t, "REL payload too long", func() { dgBatch(1152, 8).addRelRetx(make([]byte, wire.RelMaxPayload+1)) })
-		full := dgBatch(1152, 8)
+		mustPanic(t, "REL payload too short", func() { bdgBatch(1152, 8).addRelRetx(make([]byte, wire.RelHeadLen-1)) })
+		mustPanic(t, "REL payload too long", func() { bdgBatch(1152, 8).addRelRetx(make([]byte, wire.RelMaxPayload+1)) })
+		full := bdgBatch(1152, 8)
 		for range MaxBatchFrames {
 			full.addPing(false, &wire.Ping{})
 		}
@@ -385,7 +390,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		ca, cb := filledChunk(p, bud, 7), filledChunk(p, bud, 8)
 		defer ca.Release()
 		defer cb.Release()
-		b := dgBatch(1152, wire.RelWindow)
+		b := bdgBatch(1152, wire.RelWindow)
 		room := 1152 - wire.DgramOverhead
 		// One reference per (batch, chunk): three datagrams of chunk A,
 		// one of B, A again, an empty datagram and one without a chunk.
@@ -488,7 +493,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Fatalf("1 MiB stream batch: DGRAM room %d", big.DgramRoom())
 		}
 		s.Reset(time.Time{})
-		mustPanic(t, "DGRAM with handle 0", func() { dgBatch(1152, 8).AddDgram(0, 1, nil, nil) })
+		mustPanic(t, "DGRAM with handle 0", func() { bdgBatch(1152, 8).AddDgram(0, 1, nil, nil) })
 		mustPanic(t, "DGRAM beyond MaxPacketPayload", func() {
 			NewBatch(1<<20).AddDgram(h1, 1, make([]byte, wire.MaxPacketPayload+1), nil)
 		})
@@ -499,7 +504,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		p, bud := NewBufPool(), NewBudget(1<<30)
 		c := filledChunk(p, bud, 9)
 		defer c.Release()
-		b := dgBatch(budget, wire.RelWindow)
+		b := bdgBatch(budget, wire.RelWindow)
 		sched := wire.Sched{Epoch: 4, N: 1, IDs: [wire.MaxSchedIDs]uint32{5}}
 		room := b.DgramRoom()
 		ok := b.addRack(&wire.Rack{CumAck: 9}) && // 0: RACK 25
@@ -524,7 +529,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		if !ok || b.Len() != 19 {
 			t.Fatalf("building the batch: ok %v len %d", ok, b.Len())
 		}
-		stampRels(b, 1)
+		bdgStampRels(b, 1)
 		b.seal(1000)
 		want := []struct{ i, end, n int }{
 			{0, 7, 25 + 37 + 37 + 35 + 60 + 37 + 525}, // control frames ride in front of the DGRAM
@@ -540,7 +545,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			{17, 19, 25 + 28}, // the batch's tail: no DGRAM
 		}
 		const headroom = wire.FlowHeaderLen // a raw-UDP flow carrier builds after its flow header
-		got := packDatagrams(b, budget, headroom)
+		got := bdgPack(b, budget, headroom)
 		if len(got) != len(want) {
 			t.Fatalf("%d datagrams, want %d", len(got), len(want))
 		}
@@ -549,7 +554,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			if d.i != want[k].i || d.end != want[k].end || d.n != want[k].n || len(d.bytes) != d.n {
 				t.Errorf("datagram %d: frames [%d, %d) %d bytes (%d written), want [%d, %d) %d", k, d.i, d.end, d.n, len(d.bytes), want[k].i, want[k].end, want[k].n)
 			}
-			fs := decodeAll(t, d.bytes)
+			fs := bdgDecode(t, d.bytes)
 			if len(fs) != d.end-d.i {
 				t.Fatalf("datagram %d decodes into %d frames, want %d", k, len(fs), d.end-d.i)
 			}
@@ -574,7 +579,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Fatalf("appendDatagram: %d bytes, headroom kept %v, scratch reused %v", len(out), bytes.Equal(out[:headroom], flow), &out[0] == &scratch[0])
 		}
 		c.B[0] ^= 0xff
-		if fs := decodeAll(t, out[headroom:]); fs[6].Type != wire.TypeDgram {
+		if fs := bdgDecode(t, out[headroom:]); fs[6].Type != wire.TypeDgram {
 			t.Fatal("datagram 0 does not end with its DGRAM")
 		} else if seq, body, err := wire.ParseDgram(fs[6].Payload); err != nil || seq != 100 || len(body) != 500 || body[0] != 9 {
 			t.Fatalf("DGRAM 100 after the chunk changed: seq %d, %d bytes, err %v", seq, len(body), err)
@@ -617,7 +622,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		var seen struct{ ride, alone, oversize, budgetSplit, dgramSplit, retx, refused int }
 		for trial := range 400 {
 			budget := wire.ControlFloor + rng.IntN(2000)
-			b := dgBatch(budget, rng.IntN(wire.RelWindow+1))
+			b := bdgBatch(budget, rng.IntN(wire.RelWindow+1))
 			for b.Len() < MaxBatchFrames && rng.IntN(70) != 0 {
 				switch rng.IntN(12) {
 				case 0:
@@ -657,7 +662,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			if b.Len() == 0 {
 				continue
 			}
-			if rels := stampRels(b, rng.Uint32()); len(rels) > 0 {
+			if rels := bdgStampRels(b, rng.Uint32()); len(rels) > 0 {
 				stored = rels
 			}
 			b.seal(rng.Uint32())
@@ -665,7 +670,7 @@ func TestBatchDgram_L41(t *testing.T) {
 			if rng.IntN(4) == 0 {
 				pack = wire.ControlFloor + rng.IntN(budget-wire.ControlFloor+1) // a shrink after Fill
 			}
-			ds := packDatagrams(b, pack, rng.IntN(2)*wire.FlowHeaderLen)
+			ds := bdgPack(b, pack, rng.IntN(2)*wire.FlowHeaderLen)
 			var joined []byte
 			next := 0
 			for k, d := range ds {
@@ -675,7 +680,7 @@ func TestBatchDgram_L41(t *testing.T) {
 				next = d.end
 				sum := 0
 				for j := d.i; j < d.end; j++ {
-					sum += frameSize(b, j)
+					sum += bdgFrameSize(b, j)
 					if b.frames[j].hdr.Type == wire.TypeDgram && j != d.end-1 {
 						t.Fatalf("trial %d datagram %d: a DGRAM at %d is not its last frame (end %d)", trial, k, j, d.end)
 					}
@@ -688,11 +693,11 @@ func TestBatchDgram_L41(t *testing.T) {
 				}
 				if k > 0 {
 					prev, first := &b.frames[d.i-1], &b.frames[d.i]
-					fits := ds[k-1].n+frameSize(b, d.i) <= pack
+					fits := ds[k-1].n+bdgFrameSize(b, d.i) <= pack
 					switch {
 					case prev.hdr.Type != wire.TypeDgram && !prev.alone() && !first.alone():
 						if fits {
-							t.Fatalf("trial %d datagram %d: frame %d (%d bytes) fits the previous datagram of %d bytes (budget %d)", trial, k, d.i, frameSize(b, d.i), ds[k-1].n, pack)
+							t.Fatalf("trial %d datagram %d: frame %d (%d bytes) fits the previous datagram of %d bytes (budget %d)", trial, k, d.i, bdgFrameSize(b, d.i), ds[k-1].n, pack)
 						}
 						seen.budgetSplit++
 					case prev.hdr.Type == wire.TypeDgram && fits && !first.alone():
@@ -708,7 +713,7 @@ func TestBatchDgram_L41(t *testing.T) {
 				if d.end-d.i == 1 && d.n > pack {
 					seen.oversize++
 				}
-				if fs := decodeAll(t, d.bytes); len(fs) != d.end-d.i {
+				if fs := bdgDecode(t, d.bytes); len(fs) != d.end-d.i {
 					t.Fatalf("trial %d datagram %d: %d frames decoded, want %d", trial, k, len(fs), d.end-d.i)
 				}
 				joined = append(joined, d.bytes...)
@@ -756,7 +761,7 @@ func TestBatchDgram_L41(t *testing.T) {
 		if len(bufs) != 5 || &bufs[1][0] != &c.B[0] || &bufs[3][0] != &c.B[BigData] {
 			t.Fatalf("%d iovecs; the DGRAM bodies are not referenced", len(bufs))
 		}
-		fs := decodeAll(t, stream)
+		fs := bdgDecode(t, stream)
 		types := []wire.Type{wire.TypePing, wire.TypePack, wire.TypeDgram, wire.TypeDgram, wire.TypeDgram, wire.TypeFin}
 		for i, f := range fs {
 			if f.Type != types[i] || f.Fseq != 5+uint32(i) {
@@ -779,6 +784,123 @@ func TestBatchDgram_L41(t *testing.T) {
 			t.Fatalf("chunk refs %d after ReleaseRefs", c.refs.Load())
 		}
 	})
+
+	t.Run("rounds", func(t *testing.T) {
+		// The writer keeps one Batch for its Conn's whole life and Resets
+		// it every round: nothing of a round leaks into the next. The
+		// queue's chunks outlive rounds and consecutive rounds place
+		// datagrams of the same chunk (a round of up to 64 DGRAMs straddles
+		// 64 KiB chunks), so every round takes its own reference per chunk
+		// — also when it starts with the chunk the previous round ended
+		// with — and releases it at its ReleaseRefs, or at the next Reset
+		// when no ReleaseRefs came (session tests drive Fill that way; M2
+		// design §A4.5). Without that reference a chunk the queue pops
+		// during the write returns to the pool under the batch, and seal
+		// stamps a valid CRC over recycled bytes (L17, L43); the last round
+		// shows the reference keeping a popped chunk, its bytes and its
+		// charge. The REL refusal (the writer's blocked flag, §A5.9), the
+		// new RELs and the DGRAM bytes (TxBytes) belong to their round
+		// only, and a stream round between datagram rounds wraps nothing
+		// and counts its DGRAM bytes as DATA (M2-D26).
+		p, bud := NewBufPool(), NewBudget(1<<30)
+		ca, cb := filledChunk(p, bud, 13), filledChunk(p, bud, 14)
+		defer cb.Release() // the last round pops chunk A
+		charged := bud.Used()
+		b := NewBatch(0)
+		const rounds = 5
+		for round := range rounds {
+			b.Reset(time.Unix(int64(round), 0))
+			if ca.refs.Load() != 1 || cb.refs.Load() != 1 || bud.Used() != charged {
+				t.Fatalf("round %d: after Reset: chunk references A %d, B %d, charged %d; want 1, 1, %d",
+					round, ca.refs.Load(), cb.refs.Load(), bud.Used(), charged)
+			}
+			stream, last := round == 2, round == rounds-1
+			room := wire.RelWindow
+			if round == 0 {
+				room = 0 // all eight RELs outstanding: the FIN is refused
+			}
+			if !stream {
+				b.SetDatagram(1152, room)
+			}
+			if b.AddFin(h1, uint64(round)) != (round != 0) {
+				t.Fatalf("round %d: AddFin with REL room %d returned %v", round, room, round == 0)
+			}
+			// x, x, y: every round starts with the chunk the previous one
+			// ended with (A, A, B in even rounds; B, B, A in odd ones).
+			x, y := ca, cb
+			if round%2 == 1 {
+				x, y = cb, ca
+			}
+			n, off := 100*(round+1), 1000*round
+			adds := []struct {
+				seq  uint64
+				body []byte
+				ref  *Buf
+			}{
+				{uint64(3 * round), x.B[off : off+n], x},
+				{uint64(3*round + 1), x.B[off+n : off+2*n], x},
+				{uint64(3*round + 2), y.B[off : off+n], y},
+			}
+			var want [][]byte
+			for _, a := range adds {
+				if !b.AddDgram(h1, a.seq, a.body, a.ref) {
+					t.Fatalf("round %d: DGRAM %d refused", round, a.seq)
+				}
+				want = append(want, bytes.Clone(a.body))
+			}
+			if x.refs.Load() != 2 || y.refs.Load() != 2 {
+				t.Fatalf("round %d: chunk references %d (the chunk the previous round ended with) and %d while the batch holds DGRAMs of both; want 2 each (the test's and the batch's one)",
+					round, x.refs.Load(), y.refs.Load())
+			}
+			rels, data := 1, 0
+			if round == 0 || stream {
+				rels = 0
+			}
+			if stream {
+				data = 3 * n
+			}
+			if b.Datagram() == stream || b.relRefused() != (round == 0) || b.relCount() != rels ||
+				b.dgramBytes() != 3*n || b.dataBytes() != data || b.Room() != defaultBatchBudget-data {
+				t.Fatalf("round %d: datagram %v, relRefused %v, relCount %d, dgramBytes %d, data %d, room %d; want %v, %v, %d, %d, %d, %d",
+					round, b.Datagram(), b.relRefused(), b.relCount(), b.dgramBytes(), b.dataBytes(), b.Room(),
+					!stream, round == 0, rels, 3*n, data, defaultBatchBudget-data)
+			}
+			if last {
+				// The queue pops the round's first chunk while the write is
+				// in flight: the batch's own reference alone keeps it — its
+				// bytes and its charge — until ReleaseRefs.
+				x.Release()
+				if x.refs.Load() != 1 || bud.Used() != charged {
+					t.Fatalf("round %d: a chunk popped by the queue: refs %d, charged %d; want 1, %d (the batch's reference keeps it)",
+						round, x.refs.Load(), bud.Used(), charged)
+				}
+			}
+			bdgStampRels(b, uint32(round))
+			b.seal(uint32(100 * round))
+			fs := bdgDecode(t, b.appendTo(nil))
+			if len(fs) != len(adds)+min(round, 1) || (round > 0 && (fs[0].Type == wire.TypeRel) == stream) {
+				t.Fatalf("round %d: %d frames on the wire, the first a %v", round, len(fs), fs[0].Type)
+			}
+			for k, f := range fs[len(fs)-len(adds):] {
+				seq, body, err := wire.ParseDgram(f.Payload)
+				if err != nil || f.Type != wire.TypeDgram || seq != adds[k].seq || !bytes.Equal(body, want[k]) {
+					t.Fatalf("round %d: DGRAM %d on the wire: %v, seq %d, %d bytes, %v", round, k, f.Type, seq, len(body), err)
+				}
+			}
+			if round == 1 {
+				continue // no ReleaseRefs: the next Reset releases the references
+			}
+			b.ReleaseRefs()
+			refsX, wantCharged := int32(1), charged
+			if last {
+				refsX, wantCharged = 0, charged-int64(classSize(2))
+			}
+			if x.refs.Load() != refsX || y.refs.Load() != 1 || bud.Used() != wantCharged {
+				t.Fatalf("round %d: after ReleaseRefs: chunk references %d and %d, charged %d; want %d, 1, %d",
+					round, x.refs.Load(), y.refs.Load(), bud.Used(), refsX, wantCharged)
+			}
+		}
+	})
 }
 
 // TestBatchDgramZeroAllocs_L41 (M2 design §A8.5, L41): a whole datagram
@@ -787,9 +909,10 @@ func TestBatchDgram_L41(t *testing.T) {
 // DGRAMs of one chunk and a bare PACK, REL{CLOSE}, relPayload for each new
 // REL, seal, packing every datagram into the reused scratch after the
 // raw-UDP flow header, ReleaseRefs — allocates nothing, and the control
-// frames ride in front of the first DGRAM. The chunk stays referenced by
-// the test, so no pool traffic is involved and the count is exact under
-// -race too.
+// frames ride in front of the first DGRAM. Every round takes its own one
+// reference on the chunk and releases it at its ReleaseRefs (§A4.5). The
+// chunk stays referenced by the test, so no pool traffic is involved and
+// the count is exact under -race too.
 func TestBatchDgramZeroAllocs_L41(t *testing.T) {
 	p, bud := NewBufPool(), NewBudget(1<<30)
 	c := filledChunk(p, bud, 12)
@@ -806,7 +929,7 @@ func TestBatchDgramZeroAllocs_L41(t *testing.T) {
 	rack := wire.Rack{CumAck: 1}
 	now := time.Unix(9, 0)
 	fseq, cseq := uint32(1), uint32(2)
-	var datagrams, first int
+	var datagrams, first, unheld int
 	round := func() {
 		b.Reset(now)
 		b.SetDatagram(budget, wire.RelWindow-1)
@@ -835,18 +958,22 @@ func TestBatchDgramZeroAllocs_L41(t *testing.T) {
 			sinkBytes = b.appendDatagram(scratch[:wire.FlowHeaderLen], i, end)
 			i = end
 		}
+		if c.refs.Load() != 2 { // the test's and this round's own one
+			unheld++
+		}
 		b.ReleaseRefs()
 	}
 	round()
-	if b.Len() != 49 || b.relCount() != 4 || first != 8 || datagrams != 41 || c.refs.Load() != 1 {
-		t.Fatalf("round: %d frames, %d new RELs, first datagram [0, %d), %d datagrams, chunk refs %d; want 49, 4, [0, 8), 41, 1",
-			b.Len(), b.relCount(), first, datagrams, c.refs.Load())
+	if b.Len() != 49 || b.relCount() != 4 || first != 8 || datagrams != 41 || unheld != 0 || c.refs.Load() != 1 {
+		t.Fatalf("round: %d frames, %d new RELs, first datagram [0, %d), %d datagrams, %d rounds without the batch's chunk reference, chunk refs %d; want 49, 4, [0, 8), 41, 0, 1",
+			b.Len(), b.relCount(), first, datagrams, unheld, c.refs.Load())
 	}
 	if a := testing.AllocsPerRun(100, round); a != 0 {
 		t.Fatalf("%v allocations per datagram batch round", a)
 	}
 	// 102 rounds: ours, AllocsPerRun's warm-up and its 100 measured runs.
-	if fseq != 1+102*49 || cseq != 2+102*4 || datagrams != 102*41 || c.refs.Load() != 1 {
-		t.Fatalf("after 102 rounds: fseq %d, cseq %d, %d datagrams, chunk refs %d", fseq, cseq, datagrams, c.refs.Load())
+	if fseq != 1+102*49 || cseq != 2+102*4 || datagrams != 102*41 || unheld != 0 || c.refs.Load() != 1 {
+		t.Fatalf("after 102 rounds: fseq %d, cseq %d, %d datagrams, %d rounds without the batch's chunk reference, chunk refs %d",
+			fseq, cseq, datagrams, unheld, c.refs.Load())
 	}
 }

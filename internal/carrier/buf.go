@@ -89,12 +89,18 @@ func classFor(n int) int { return streamLayout.class(n) }
 
 // Budget is a byte account; a Buf releases its charge to the Budget it was
 // charged to. A Runtime has two (design §0.14 B2). Env.Budget is the
-// MaxBufferedBytes account of the data buffers (plan §3.7): send chunks
-// (TryAcquire, which may refuse), receive buffers inside an advertised
-// window and write scratches (Acquire, forced); its usage drives the window
-// advertisement. Env.Stages is the fixed account of the reader stages
-// (16 KiB + ClassSlack per started carrier): only forced charges use it, so
-// its max is never consulted. Status.BufferedBytes is the sum of both.
+// MaxBufferedBytes account of the data buffers (plan §3.7): send chunks,
+// packet-queue storage, received datagrams of 16 KiB or more and udpflow
+// inbox buffers (TryAcquire or TryGet, which may refuse), receive buffers
+// inside an advertised window and stream write scratches (Acquire, forced);
+// its usage drives the window advertisement. Env.Stages is the fixed
+// account of the buffers carriers and sources hold for a handshake or for
+// their whole life: a stream carrier's reader stage (16 KiB + ClassSlack
+// per started carrier), a datagram carrier's handshake and reader buffers
+// and its writer scratch (datagram-pool classes, M2-D28, M2-D60), a udpflow
+// source's spare and its flows' control-reserve buffers (M2 design §A6.2).
+// Only forced charges use it, so its max is never consulted.
+// Status.BufferedBytes is the sum of both.
 // Usage is one atomic counter; there is no lock and no waiter list (app
 // writers that find the budget exhausted re-check on a timer, design §4.2).
 type Budget struct {

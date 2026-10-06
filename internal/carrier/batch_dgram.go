@@ -136,9 +136,10 @@ func (b *Batch) holdRef(ref *Buf) bool {
 // wire.FlagPackDone). reliable asks for REL wrapping in datagram mode (a
 // PACK with flags is always wrapped there; M2-D39); false when the batch is
 // full or no REL room is left for a wrapped one. A stream batch carries
-// every PACK as an ordinary frame.
+// every PACK as an ordinary frame. It panics on flags outside
+// wire.AllowedFlags(wire.TypePack) (a programming error).
 func (b *Batch) AddPack(handle uint32, flags uint8, p *wire.Pack, reliable bool) bool {
-	if flags&^(wire.FlagPackFinDelivered|wire.FlagPackDone) != 0 {
+	if flags&^wire.AllowedFlags(wire.TypePack) != 0 {
 		panic("rendr/carrier: undefined PACK flags")
 	}
 	var q []byte
