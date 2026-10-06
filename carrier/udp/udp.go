@@ -78,10 +78,11 @@ type Options struct {
 	// dialer's (a larger dialer value is lowered to the listener's at the
 	// handshake). A value above what the local interface carries is lowered
 	// to it — by Dial to the MTU of the interface the route to the peer
-	// uses, by Listen on a specific address to that address's interface
-	// MTU, minus the IP and UDP headers — so the socket never refuses its
-	// own datagrams as too large (M2 design Revision 1, R1-16); a wildcard
-	// Listen cannot know its route and keeps the value.
+	// uses (the loopback interface's for a loopback peer), by Listen on a
+	// specific address to that address's interface MTU, minus the IP and
+	// UDP headers — so the socket never refuses its own datagrams as too
+	// large (M2 design Revision 1, R1-16); a wildcard Listen cannot know its
+	// route and keeps the value.
 	MaxDatagram int
 	// ReadBuffer and WriteBuffer size the socket buffers, best effort: 0
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with
@@ -104,8 +105,9 @@ func Listen(network, address string, o Options) (net.PacketConn, error) {
 // peer's family for a loopback peer (else the unspecified address) and an
 // ephemeral port, draws a new flow ID and returns the socket — closed on
 // every failure before Dial returns (L57) — and the peer as a
-// *net.UDPAddr. MTU is MaxDatagram − 9 (0, which NewPeer rejects, for an
-// invalid MaxDatagram).
+// *net.UDPAddr. An IPv6 link-local peer names its interface in the zone,
+// by name or by index. MTU is MaxDatagram − 9 (0, which NewPeer rejects,
+// for an invalid MaxDatagram).
 func Carrier(name, network, address string, o Options) rendr.DatagramCarrier {
 	mtu := 0
 	if m, err := o.maxDatagram(); err == nil {

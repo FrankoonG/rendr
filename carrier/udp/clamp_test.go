@@ -3,6 +3,7 @@ package udp
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"testing"
@@ -17,10 +18,15 @@ import (
 // interface owns, or an interface without a known MTU (the Windows loopback
 // reports −1), leaves it; an address two interfaces own takes the smaller
 // MTU; a clamp below 546 bytes fails. Dial looks the route up for a
-// non-loopback peer only (a loopback peer consults neither the route nor
-// the interface table), fails without a route and leaves the value to the
-// MTU probe when the interface table is unknown. The "real" subtest checks
-// Listen and Dial on an address of an up interface of this host.
+// non-loopback peer; for a loopback peer it clamps to the loopback
+// interface that owns the address its socket binds, with no route lookup
+// (Linux's loopback MTU of 65,536 carries every IPv4 UDP payload but at most
+// 65,488-byte IPv6 ones). It fails without a route, leaves the value to the
+// MTU probe when the interface table is unknown, and fails when its context
+// is done. Only the interfaces that can lower the value are read: those
+// whose MTU is below MaxDatagram plus the headers. The "real" subtest
+// checks that bound and the context on this host's interface table, and
+// Listen and Dial on an address of an up interface.
 func TestUDPInterfaceMTUClamp(t *testing.T) {
 	// Addresses of the fake table, derived from the net package's constants
 	// (the values are irrelevant: only ownership counts).
@@ -75,18 +81,40 @@ func TestUDPInterfaceMTUClamp(t *testing.T) {
 		t.Error("the route of a loopback peer was looked up")
 		return netip.Addr{}, noRoute
 	}
-	neverTable := func() ([]ifaceMTU, error) {
-		t.Error("the interface table was read for a loopback peer")
-		return nil, nil
-	}
-	for _, peer := range []netip.AddrPort{
-		netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 9),
-		netip.AddrPortFrom(netip.IPv6Loopback(), 9),
-	} {
-		if got, err := routeClamp(ctx, peer, wire.MaxDatagram, never, neverTable); err != nil || got != wire.MaxDatagram {
-			t.Errorf("loopback peer %v: %d, %v; want no clamp", peer, got, err)
+	// tableOf serves rows and records the bound each read asked for (the
+	// fake ignores it: clampMaxDatagram's answer does not depend on it).
+	var asked []int
+	tableOf := func(rows ...ifaceMTU) func(context.Context, int) ([]ifaceMTU, error) {
+		return func(_ context.Context, below int) ([]ifaceMTU, error) {
+			asked = append(asked, below)
+			return rows, nil
 		}
 	}
+	lo4, lo6 := netip.AddrFrom4([4]byte{127, 0, 0, 1}), netip.IPv6Loopback()
+	for _, r := range []struct {
+		name        string
+		peer        netip.Addr
+		mtu         int
+		want, below int
+	}{
+		{"IPv4 loopback, MTU 65536", lo4, 65536, wire.MaxDatagram, wire.MaxDatagram + 28},
+		{"IPv6 loopback, MTU 65536", lo6, 65536, 65536 - 48, wire.MaxDatagram + 48},
+		{"IPv4 loopback, MTU 1500", lo4, 1500, 1500 - 28, wire.MaxDatagram + 28},
+		{"IPv6 loopback, unknown MTU", lo6, -1, wire.MaxDatagram, wire.MaxDatagram + 48},
+		{"another IPv4 loopback address", lo4.Next(), 1500, 1500 - 28, wire.MaxDatagram + 28},
+	} {
+		asked = nil
+		peer := netip.AddrPortFrom(r.peer, 9)
+		got, err := routeClamp(ctx, peer, wire.MaxDatagram, never, tableOf(ifaceMTU{mtu: r.mtu, addrs: []netip.Addr{lo4, lo6}}))
+		if err != nil || got != r.want || len(asked) != 1 || asked[0] != r.below {
+			t.Errorf("%s: %d, %v, table read with bounds %v; want %d, one read below %d", r.name, got, err, asked, r.want, r.below)
+		}
+	}
+	if _, err := routeClamp(ctx, netip.AddrPortFrom(lo6, 9), wire.MaxDatagram, never,
+		tableOf(ifaceMTU{mtu: 573, addrs: []netip.Addr{lo4, lo6}})); !errors.Is(err, errClampFloor) {
+		t.Errorf("a loopback interface below the floor: %v, want errClampFloor", err)
+	}
+
 	peer := netip.AddrPortFrom(x4, 9)
 	via := func(src netip.Addr, err error) func(context.Context, netip.AddrPort) (netip.Addr, error) {
 		return func(_ context.Context, p netip.AddrPort) (netip.Addr, error) {
@@ -96,38 +124,76 @@ func TestUDPInterfaceMTUClamp(t *testing.T) {
 			return src, err
 		}
 	}
-	tbl := func() ([]ifaceMTU, error) { return table, nil }
-	if got, err := routeClamp(ctx, peer, wire.MaxDatagram, via(c4, nil), tbl); err != nil || got != 576-28 {
-		t.Errorf("routed via the 576-byte interface: %d, %v", got, err)
+	asked = nil
+	if got, err := routeClamp(ctx, peer, wire.MaxDatagram, via(c4, nil), tableOf(table...)); err != nil || got != 576-28 ||
+		len(asked) != 1 || asked[0] != wire.MaxDatagram+28 {
+		t.Errorf("routed via the 576-byte interface: %d, %v, bounds %v", got, err, asked)
 	}
-	if _, err := routeClamp(ctx, peer, wire.MaxDatagram, via(d4, nil), tbl); !errors.Is(err, errClampFloor) {
+	asked = nil
+	if got, err := routeClamp(ctx, netip.AddrPortFrom(b6, 9), DefaultMaxDatagram, func(context.Context, netip.AddrPort) (netip.Addr, error) {
+		return a6, nil
+	}, tableOf(table...)); err != nil || got != DefaultMaxDatagram || len(asked) != 1 || asked[0] != DefaultMaxDatagram+48 {
+		t.Errorf("routed from an IPv6 address: %d, %v, bounds %v; want %d below %d", got, err, asked, DefaultMaxDatagram, DefaultMaxDatagram+48)
+	}
+	if _, err := routeClamp(ctx, peer, wire.MaxDatagram, via(d4, nil), tableOf(table...)); !errors.Is(err, errClampFloor) {
 		t.Errorf("routed via the 573-byte interface: %v, want errClampFloor", err)
 	}
-	if _, err := routeClamp(ctx, peer, wire.MaxDatagram, via(netip.Addr{}, noRoute), tbl); !errors.Is(err, noRoute) {
+	if _, err := routeClamp(ctx, peer, wire.MaxDatagram, via(netip.Addr{}, noRoute), tableOf(table...)); !errors.Is(err, noRoute) {
 		t.Errorf("no route: %v, want the lookup's error", err)
 	}
-	unknown := func() ([]ifaceMTU, error) { return nil, errors.New("wp5: no interface table") }
+	unknown := func(context.Context, int) ([]ifaceMTU, error) { return nil, errors.New("wp5: no interface table") }
 	if got, err := routeClamp(ctx, peer, wire.MaxDatagram, via(c4, nil), unknown); err != nil || got != wire.MaxDatagram {
 		t.Errorf("unknown interface table: %d, %v; want no clamp", got, err)
+	}
+	done, cancel := context.WithCancel(ctx)
+	cancel()
+	ctxTable := func(c context.Context, _ int) ([]ifaceMTU, error) { return nil, c.Err() }
+	for _, p := range []netip.AddrPort{peer, netip.AddrPortFrom(lo4, 9)} {
+		route := via(c4, nil)
+		if p.Addr().IsLoopback() {
+			route = never
+		}
+		if _, err := routeClamp(done, p, wire.MaxDatagram, route, ctxTable); !errors.Is(err, context.Canceled) {
+			t.Errorf("a cancelled dial to %v: %v, want context.Canceled", p, err)
+		}
 	}
 
 	t.Run("real", func(t *testing.T) {
 		defer wp5NoLeak(t)()
-		tab, err := interfaceTable()
+		ctx := wp5Ctx(t)
+		all, err := interfaceTable(ctx, math.MaxInt)
 		if err != nil {
 			t.Fatalf("interfaceTable: %v", err)
 		}
-		for _, row := range tab {
+		for _, row := range all {
+			if row.mtu <= 0 {
+				t.Errorf("interface table row with MTU %d: an unknown MTU is never listed", row.mtu)
+			}
 			for _, a := range row.addrs {
 				if !a.IsValid() || a.Is4In6() || a.Zone() != "" {
 					t.Errorf("interface table address %v is not an unmapped address without zone", a)
 				}
 			}
 		}
+		if _, err := interfaceTable(done, math.MaxInt); !errors.Is(err, context.Canceled) {
+			t.Errorf("interfaceTable with a cancelled context: %v, want context.Canceled", err)
+		}
 		ip, mtu, ok := wp5UpInterface(t)
 		if !ok {
 			t.Logf("no up non-loopback interface with an IPv4 address: the real clamp is not exercised here")
 			return
+		}
+		if !wp5Owns(all, ip, mtu) {
+			t.Errorf("the full interface table has no MTU %d row owning the interface's address", mtu)
+		}
+		below, err := interfaceTable(ctx, mtu)
+		if err != nil {
+			t.Fatalf("interfaceTable below %d: %v", mtu, err)
+		}
+		for _, row := range below {
+			if row.mtu >= mtu {
+				t.Errorf("interfaceTable below %d listed a row with MTU %d", mtu, row.mtu)
+			}
 		}
 		want := min(wire.MaxDatagram, mtu-28)
 		o := Options{AllowNonLoopback: true, MaxDatagram: wire.MaxDatagram}
@@ -139,12 +205,12 @@ func TestUDPInterfaceMTUClamp(t *testing.T) {
 		if got := s.(interface{ MaxDatagram() int }).MaxDatagram(); got != want {
 			t.Errorf("Listen on an interface with MTU %d: MaxDatagram %d, want %d", mtu, got, want)
 		}
-		src, err := routeSource(wp5Ctx(t), netip.AddrPortFrom(ip, 9))
+		src, err := routeSource(ctx, netip.AddrPortFrom(ip, 9))
 		if err != nil {
 			t.Fatalf("routeSource: %v", err)
 		}
 		if src != ip {
-			if want, err = clampMaxDatagram(wire.MaxDatagram, src, tab); err != nil {
+			if want, err = clampMaxDatagram(wire.MaxDatagram, src, all); err != nil {
 				t.Fatal(err)
 			}
 			t.Logf("the route to this host's own address leaves from another address; expecting its clamp, %d", want)
@@ -155,6 +221,18 @@ func TestUDPInterfaceMTUClamp(t *testing.T) {
 			t.Errorf("Dial over an interface with MTU %d: Limit %d, want %d", mtu, d.Limit(), want-wire.FlowHeaderLen)
 		}
 	})
+}
+
+// wp5Owns reports whether a row of table with the given MTU owns ip.
+func wp5Owns(table []ifaceMTU, ip netip.Addr, mtu int) bool {
+	for _, row := range table {
+		for _, a := range row.addrs {
+			if a == ip && row.mtu == mtu {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // wp5UpInterface returns the first IPv4 global unicast address of an up,

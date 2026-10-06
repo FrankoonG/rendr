@@ -51,15 +51,16 @@ type wp5Family struct {
 var wp5Families = []wp5Family{{"udp4", "127.0.0.1", false}, {"udp6", "::1", true}}
 
 // wp5Listen listens on the loopback address of fam with o; ok is false (and
-// the reason logged) when the host has no IPv6 loopback.
+// the reason logged) only when the host has no IPv6 loopback at all, which a
+// plain socket decides: a failure of rendr's own Listen where a plain socket
+// binds is a test failure, never a skipped family.
 func wp5Listen(t *testing.T, fam wp5Family, o Options) (s *carrier.OwnedUDPSocket, ok bool) {
 	t.Helper()
+	if fam.v6 && !wp5HaveIPv6Loopback(t) {
+		return nil, false
+	}
 	pc, err := Listen(fam.network, net.JoinHostPort(fam.host, "0"), o)
 	if err != nil {
-		if fam.v6 {
-			t.Logf("no IPv6 loopback listener: %v", err)
-			return nil, false
-		}
 		t.Fatalf("Listen(%s): %v", fam.network, err)
 	}
 	s, isOwned := pc.(*carrier.OwnedUDPSocket)
@@ -68,6 +69,19 @@ func wp5Listen(t *testing.T, fam wp5Family, o Options) (s *carrier.OwnedUDPSocke
 		t.Fatalf("Listen returned %T, not rendr-owned", pc)
 	}
 	return s, true
+}
+
+// wp5HaveIPv6Loopback reports whether a plain UDP socket binds the IPv6
+// loopback address (the reason is logged when not).
+func wp5HaveIPv6Loopback(t *testing.T) bool {
+	t.Helper()
+	u, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Logf("no IPv6 loopback on this host: %v", err)
+		return false
+	}
+	u.Close()
+	return true
 }
 
 // wp5Dial dials address with o and returns the rendr-owned token.
@@ -117,10 +131,20 @@ func wp5Flow(d []byte) (uint64, bool) {
 }
 
 // wp5Exchange sends one datagram of size bytes (the flow header included)
-// from the dialer token to the listening token and the listener's reply
-// back, and checks both arrive whole, from the right source, with the
-// dialer's flow header.
+// from the dialer token to the listening token, which the dialer reached at
+// the listener's own address, and the listener's reply back (wp5ExchangeVia).
 func wp5Exchange(t *testing.T, o *carrier.OwnedUDP, s *carrier.OwnedUDPSocket, size int) {
+	t.Helper()
+	wp5ExchangeVia(t, o, wp5AP(s), s, size)
+}
+
+// wp5ExchangeVia sends one datagram of size bytes from the dialer token to
+// the listening token, which the dialer reaches at peer, and the listener's
+// reply back, and checks both arrive whole, from the right source — the
+// listener sees the dialer's address (its port, for a dialer bound to the
+// unspecified address), the dialer sees peer — with the dialer's flow
+// header.
+func wp5ExchangeVia(t *testing.T, o *carrier.OwnedUDP, peer netip.AddrPort, s *carrier.OwnedUDPSocket, size int) {
 	t.Helper()
 	b := make([]byte, size)
 	for i := range b {
@@ -132,8 +156,10 @@ func wp5Exchange(t *testing.T, o *carrier.OwnedUDP, s *carrier.OwnedUDPSocket, s
 	p := make([]byte, s.MaxDatagram()+1)
 	s.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, src, ev, err := s.ReadAddrPort(p)
-	if err != nil || ev != carrier.ReadOK || n != size || src != wp5AP(o) || !bytes.Equal(p[9:n], b[9:]) {
-		t.Fatalf("listener read %d bytes from %v (event %d, %v); want %d from %v", n, src, ev, err, size, wp5AP(o))
+	from := wp5AP(o)
+	fromOK := src == from || (from.Addr().IsUnspecified() && src.Port() == from.Port())
+	if err != nil || ev != carrier.ReadOK || n != size || !fromOK || !bytes.Equal(p[9:n], b[9:]) {
+		t.Fatalf("listener read %d bytes from %v (event %d, %v); want %d from %v", n, src, ev, err, size, from)
 	}
 	if f, ok := wp5Flow(p[:n]); !ok || f != o.Flow() || f == 0 {
 		t.Fatalf("datagram header % x, want version 2 and flow %#x", p[:9], o.Flow())
@@ -145,8 +171,8 @@ func wp5Exchange(t *testing.T, o *carrier.OwnedUDP, s *carrier.OwnedUDPSocket, s
 	buf := make([]byte, o.ReadSize())
 	o.SetReadDeadline(time.Now().Add(10 * time.Second))
 	data, key, ev, err := o.ReadDatagram(buf)
-	if err != nil || ev != carrier.ReadOK || key.AP != wp5AP(s) || !bytes.Equal(data, p[9:n]) {
-		t.Fatalf("dialer read %d bytes from %v (event %d, %v); want the reply from %v", len(data), key.AP, ev, err, wp5AP(s))
+	if err != nil || ev != carrier.ReadOK || key.AP != peer || !bytes.Equal(data, p[9:n]) {
+		t.Fatalf("dialer read %d bytes from %v (event %d, %v); want the reply from %v", len(data), key.AP, ev, err, peer)
 	}
 }
 

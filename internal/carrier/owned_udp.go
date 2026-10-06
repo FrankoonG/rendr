@@ -24,8 +24,11 @@ import (
 // no allocation per datagram (M2-D4, M2-D66).
 //
 // Its net.PacketConn methods exist for the factory signature, tests and
-// diagnostics: ReadFrom strips and WriteTo adds the flow header. Close
-// closes the socket exactly once.
+// diagnostics: ReadFrom strips and WriteTo adds the flow header, and a
+// transient error is a Temporary() error that wraps ErrNoise and the
+// socket's own error (an embedder that wraps the token reaches the core
+// through NewPacketIO, which classifies it as noise). Close closes the
+// socket exactly once.
 type OwnedUDP struct {
 	u     *net.UDPConn
 	peer  netip.AddrPort
@@ -63,18 +66,21 @@ func (o *OwnedUDP) Flow() uint64 { return o.flow }
 // ReadFrom reads one datagram of the flow and returns its rendr bytes.
 // Datagrams that ReadDatagram would not hand over — empty, truncated, from
 // another source, without this flow's header — are skipped; a transient
-// (noise) error is returned as ErrNoise, any other error as is. p shorter
-// than the rendr bytes receives their prefix. The address is always the
-// peer's. For tests and diagnostics: it allocates a read buffer per call.
+// (noise) error is returned as a noise error (Temporary(), wrapping
+// ErrNoise and the socket's error), any other error as is. p shorter than
+// the rendr bytes receives their prefix. The address is always the peer's.
+// For tests and diagnostics: it allocates a read buffer per call.
 func (o *OwnedUDP) ReadFrom(p []byte) (int, net.Addr, error) {
 	buf := make([]byte, o.ReadSize())
 	for {
-		data, _, ev, err := o.ReadDatagram(buf)
+		b := buf[:o.ReadSize()]
+		n, _, flags, src, rerr := o.u.ReadMsgUDPAddrPort(b, nil)
+		data, _, ev, err := o.readResult(b, n, flags, src, rerr)
 		switch {
 		case err != nil:
 			return 0, nil, err
 		case ev == ReadNoise:
-			return 0, nil, ErrNoise
+			return 0, nil, &noiseError{rerr}
 		case ev != ReadOK:
 			continue
 		}
@@ -82,9 +88,12 @@ func (o *OwnedUDP) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-// WriteTo sends p, prefixed with the flow header, to addr (a *net.UDPAddr).
-// Errors follow WriteDatagram's classification; on success it returns
-// len(p). For tests and diagnostics: it allocates the datagram per call.
+// WriteTo sends p, prefixed with the flow header, to addr (a *net.UDPAddr;
+// the net package unmaps an IPv4-mapped address for an IPv4 socket and maps
+// an IPv4 one for an IPv6 socket). Errors follow WriteDatagram's
+// classification, a transient one returned as a noise error (Temporary(),
+// wrapping ErrNoise and the socket's error); on success it returns len(p).
+// For tests and diagnostics: it allocates the datagram per call.
 func (o *OwnedUDP) WriteTo(p []byte, addr net.Addr) (int, error) {
 	ua, ok := addr.(*net.UDPAddr)
 	if !ok || ua == nil {
@@ -93,12 +102,37 @@ func (o *OwnedUDP) WriteTo(p []byte, addr net.Addr) (int, error) {
 	b := make([]byte, wire.FlowHeaderLen+len(p))
 	copy(b, o.hdr[:])
 	copy(b[wire.FlowHeaderLen:], p)
-	n, err := o.u.WriteToUDPAddrPort(b, unmapAddrPort(ua.AddrPort()))
-	if err := udpWriteResult(n, len(b), err, false); err != nil {
-		return 0, err
+	n, err := o.u.WriteToUDPAddrPort(b, ua.AddrPort())
+	if werr := viewWriteResult(n, len(b), err); werr != nil {
+		return 0, werr
 	}
 	return len(p), nil
 }
+
+// viewWriteResult is udpWriteResult for the net.PacketConn view of a dialer
+// socket: a transient error becomes a noise error instead of the bare
+// ErrNoise the PacketIO methods return.
+func viewWriteResult(n, want int, err error) error {
+	werr := udpWriteResult(n, want, err, false)
+	if werr == ErrNoise {
+		return &noiseError{err}
+	}
+	return werr
+}
+
+// noiseError is a transient socket error as the net.PacketConn view of an
+// OwnedUDP returns it: Temporary(), never a timeout, matching ErrNoise and
+// the socket's own error (errors.Is, errors.As). An embedder that wraps the
+// token and returns it from a DatagramCarrier factory reaches the core
+// through NewPacketIO, whose one table classifies Temporary() errors as
+// noise on every OS (M2 design §A6.4, Revision 1, R1-28): the datagram is
+// lost, never the carrier.
+type noiseError struct{ err error }
+
+func (e *noiseError) Error() string   { return ErrNoise.Error() + ": " + e.err.Error() }
+func (e *noiseError) Unwrap() []error { return []error{ErrNoise, e.err} }
+func (e *noiseError) Temporary() bool { return true }
+func (e *noiseError) Timeout() bool   { return false }
 
 // Close closes the socket.
 func (o *OwnedUDP) Close() error { return o.u.Close() }
@@ -187,9 +221,10 @@ func (o *OwnedUDP) Headroom() int { return wire.FlowHeaderLen }
 // b[:Headroom()] and sends b to the peer with one WriteToUDPAddrPort.
 // EMSGSIZE and WSAEMSGSIZE are a *wire.DatagramTooLargeError with Max 0
 // (after carrier/udp's interface-MTU clamp only a route change produces
-// them; the MTU probe then decides, R1-16); noise errors ErrNoise; a count
-// other than len(b) an error (L42: the carrier dies, never retried on it);
-// every other error, ECONNABORTED included, is returned (death).
+// them; the MTU probe then decides, R1-16); noise errors — a local packet
+// filter's refusal (EPERM on Unix) included — ErrNoise; a count other than
+// len(b) an error (L42: the carrier dies, never retried on it); every other
+// error, ECONNABORTED included, is returned (death).
 func (o *OwnedUDP) WriteDatagram(b []byte) error {
 	*(*[wire.FlowHeaderLen]byte)(b) = o.hdr
 	n, err := o.u.WriteToUDPAddrPort(b, o.peer)
@@ -275,7 +310,7 @@ func (s *OwnedUDPSocket) readResult(b []byte, n, flags int, src netip.AddrPort, 
 // WriteAddrPort sends p as one datagram to dst. EMSGSIZE and WSAEMSGSIZE are
 // a *wire.DatagramTooLargeError with Max 0 (with the interface-MTU clamp of
 // R1-16 only a route change produces them; the MTU probe then decides);
-// ICMP-class errors ErrNoise.
+// ICMP-class errors, a local packet filter's refusal and an abort ErrNoise.
 func (s *OwnedUDPSocket) WriteAddrPort(p []byte, dst netip.AddrPort) error {
 	n, err := s.u.WriteToUDPAddrPort(p, dst)
 	return udpWriteResult(n, len(p), err, true)
@@ -314,10 +349,11 @@ var _ net.PacketConn = (*OwnedUDPSocket)(nil)
 type udpClass uint8
 
 const (
-	udpOther   udpClass = iota // returned to the caller: a permanent error (death), a closed socket, or the caller's deadline
-	udpNoise                   // ICMP class, ENOBUFS, Temporary(): the datagram or read is lost, the carrier lives
-	udpMsgSize                 // EMSGSIZE, WSAEMSGSIZE: a write refused as too large; on Windows also a truncated read
-	udpAbort                   // ECONNABORTED, WSAECONNABORTED: death on a dialer socket, noise on a listening one
+	udpOther    udpClass = iota // returned to the caller: a permanent error (death), a closed socket, or the caller's deadline
+	udpNoise                    // ICMP class, ENOBUFS, Temporary(): the datagram or read is lost, the carrier lives
+	udpMsgSize                  // EMSGSIZE, WSAEMSGSIZE: a write refused as too large; on Windows also a truncated read
+	udpAbort                    // ECONNABORTED, WSAECONNABORTED: death on a dialer socket, noise on a listening one
+	udpFiltered                 // EPERM (Unix): a local packet filter dropped a datagram on send — noise on a write, death on a read
 )
 
 // udpErrClass classifies err. The caller's deadline comes first (an
@@ -339,15 +375,18 @@ func udpErrClass(err error) udpClass {
 }
 
 // udpWriteResult maps one write of a datagram of want bytes to the PacketIO
-// contract: too large → errUDPTooLarge, noise → ErrNoise, an abort → ErrNoise
-// on a listening socket (the shared socket stays bound and in use), a count
-// other than want → errUDPWriteCount (L42), anything else as is.
+// contract: too large → errUDPTooLarge; noise and a local filter's refusal →
+// ErrNoise (the datagram is lost: loss is never death, M2-D14; a refusal
+// that persists starves the carrier of PONGs, which ends it by ping_timeout
+// as any persistent loss does); an abort → ErrNoise on a listening socket
+// (the shared socket stays bound and in use); a count other than want →
+// errUDPWriteCount (L42); anything else as is.
 func udpWriteResult(n, want int, err error, listening bool) error {
 	if err != nil {
 		switch udpErrClass(err) {
 		case udpMsgSize:
 			return errUDPTooLarge
-		case udpNoise:
+		case udpNoise, udpFiltered:
 			return ErrNoise
 		case udpAbort:
 			if listening {

@@ -294,7 +294,8 @@ func wp5Envelope(t *testing.T, o *OwnedUDP, raw, foreign *net.UDPConn, peer neti
 
 	// The net.PacketConn view: ReadFrom skips what ReadDatagram drops and
 	// returns the rendr bytes from the peer's address; WriteTo adds the
-	// header.
+	// header and takes the peer as the net package spells an IPv4 address
+	// in a *net.UDPAddr (16 bytes, IPv4-mapped).
 	wp5Send(t, foreign, append(wp5Header(wp5Flow), 9), dst)
 	wp5Send(t, raw, append(other, 8), dst)
 	wp5Send(t, raw, append(wp5Header(wp5Flow), "hello"...), dst)
@@ -304,8 +305,9 @@ func wp5Envelope(t *testing.T, o *OwnedUDP, raw, foreign *net.UDPConn, peer neti
 	if err != nil || string(p[:n]) != "hello" || addr.(*net.UDPAddr).AddrPort() != peer {
 		t.Fatalf("ReadFrom = %q from %v, %v; want \"hello\" from %v", p[:n], addr, err, peer)
 	}
-	if n, err := o.WriteTo([]byte("world"), net.UDPAddrFromAddrPort(peer)); n != 5 || err != nil {
-		t.Fatalf("WriteTo = %d, %v", n, err)
+	to := &net.UDPAddr{IP: net.IP(peer.Addr().AsSlice()).To16(), Port: int(peer.Port())}
+	if n, err := o.WriteTo([]byte("world"), to); n != 5 || err != nil {
+		t.Fatalf("WriteTo(%v) = %d, %v", to, n, err)
 	}
 	n, _, err = raw.ReadFromUDPAddrPort(got)
 	if err != nil || !bytes.Equal(got[:n], append(wp5Header(wp5Flow), "world"...)) {

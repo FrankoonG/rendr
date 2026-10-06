@@ -61,7 +61,8 @@ func (o Options) buffers() (read, write int, err error) {
 // is checked again (a name that resolves differently the second time is
 // refused, not bound). The bound socket gets don't-fragment and its
 // buffers, and a specific address clamps MaxDatagram to its interface's MTU
-// (R1-16). Every failure after the socket was opened closes it.
+// (R1-16; a loopback address included). Every failure after the socket was
+// opened closes it (L57).
 func listen(ctx context.Context, network, address string, o Options) (net.PacketConn, error) {
 	if err := checkNetwork(network); err != nil {
 		return nil, err
@@ -87,16 +88,14 @@ func listen(ctx context.Context, network, address string, o Options) (net.Packet
 	}
 	u := pc.(*net.UDPConn)
 	local := u.LocalAddr().(*net.UDPAddr).AddrPort()
-	if err := configure(u, isIPv6(local.Addr()), rbuf, wbuf); err != nil {
+	if err := sysConfigure(u, isIPv6(local.Addr()), rbuf, wbuf); err != nil {
 		u.Close()
 		return nil, err
 	}
 	if !local.Addr().IsUnspecified() {
-		if table, err := interfaceTable(); err == nil {
-			if maxDatagram, err = clampMaxDatagram(maxDatagram, local.Addr(), table); err != nil {
-				u.Close()
-				return nil, err
-			}
+		if maxDatagram, err = clampTo(ctx, maxDatagram, local.Addr(), sysInterfaceTable); err != nil {
+			u.Close()
+			return nil, err
 		}
 	}
 	return carrier.NewOwnedUDPSocket(u, maxDatagram), nil

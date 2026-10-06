@@ -24,6 +24,16 @@ func wp5OpErr(op string, err error) error {
 	return &net.OpError{Op: op, Net: "udp", Err: os.NewSyscallError("wp5"+op, err)}
 }
 
+// wp5Errnos are one OS's rows of the error table of rendr's own UDP sockets
+// (owned_udp_*_test.go): nil and empty where the OS has none.
+type wp5Errnos struct {
+	noise     []error // noise on a read and on a write
+	sendNoise []error // noise on a write, death on a read (a local packet filter's refusal)
+	abort     error   // death on a dialer socket, noise on a listening one
+	msgSize   error   // a truncated read, a too-large write
+	others    []error // death everywhere
+}
+
 // Outcomes of one injected error.
 const (
 	wp5Death     = iota // read or write: the injected error itself is returned (death, or the caller's deadline)
@@ -41,13 +51,19 @@ const (
 // Temporary() too, so it must be judged first — a closed socket and every
 // other error are returned. Writes: EMSGSIZE is a
 // *wire.DatagramTooLargeError with Max 0, noise ErrNoise, ECONNABORTED death
-// on a dialer and noise on a listener, an invalid count death (L42). The
-// "real" subtest proves the rows a loopback socket can produce: an
-// oversize datagram is refused by the kernel as too large through both
-// tokens, which keep working; an expired deadline reaches the caller as a
-// timeout; a closed socket fails with net.ErrClosed.
+// on a dialer and noise on a listener, an invalid count death (L42); a
+// local packet filter's refusal (EPERM on Unix) loses the datagram, not the
+// carrier (M2-D14), but a read never fails so and an EPERM there is death.
+// The net.PacketConn view of a dialer token returns a noise error that is
+// Temporary() and matches ErrNoise and the errno, which an embedder's
+// wrapper hands to NewPacketIO's one table. The "real" subtest proves the
+// rows a loopback socket can produce: an oversize datagram is refused by
+// the kernel as too large through both tokens, which keep working; an
+// expired deadline reaches the caller as a timeout; a closed socket fails
+// with net.ErrClosed. The "icmp" subtest proves the ICMP-derived noise
+// rows on a real socket where the OS reports them (wp5ReportICMP).
 func TestOwnedUDPErrorClasses(t *testing.T) {
-	noise, abort, msgSize, others := wp5ErrnoCases()
+	errnos := wp5ErrnoCases()
 	type row struct {
 		name                   string
 		err                    error
@@ -56,18 +72,25 @@ func TestOwnedUDPErrorClasses(t *testing.T) {
 	}
 	deadline := &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 	var rows []row
-	for _, e := range noise {
+	for _, e := range errnos.noise {
 		rows = append(rows, row{"noise " + e.Error(), wp5OpErr("read", e), wp5Noise, wp5Noise, wp5Noise, wp5Noise})
 	}
+	for _, e := range errnos.sendNoise {
+		rows = append(rows, row{"send noise " + e.Error(), wp5OpErr("read", e), wp5Death, wp5Death, wp5Noise, wp5Noise})
+	}
+	if errnos.abort != nil {
+		rows = append(rows, row{"abort", wp5OpErr("read", errnos.abort), wp5Death, wp5Noise, wp5Death, wp5Noise})
+	}
+	if errnos.msgSize != nil {
+		rows = append(rows, row{"msgsize", wp5OpErr("read", errnos.msgSize), wp5Truncated, wp5Truncated, wp5TooLarge, wp5TooLarge})
+	}
 	rows = append(rows,
-		row{"abort", wp5OpErr("read", abort), wp5Death, wp5Noise, wp5Death, wp5Noise},
-		row{"msgsize", wp5OpErr("read", msgSize), wp5Truncated, wp5Truncated, wp5TooLarge, wp5TooLarge},
 		row{"deadline", deadline, wp5Death, wp5Death, wp5Death, wp5Death},
 		row{"closed", &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed}, wp5Death, wp5Death, wp5Death, wp5Death},
 		row{"temporary", &net.OpError{Op: "read", Net: "udp", Err: wp5TempErr{true}}, wp5Noise, wp5Noise, wp5Noise, wp5Noise},
 		row{"not temporary", &net.OpError{Op: "read", Net: "udp", Err: wp5TempErr{false}}, wp5Death, wp5Death, wp5Death, wp5Death},
 	)
-	for _, e := range others {
+	for _, e := range errnos.others {
 		rows = append(rows, row{"other " + e.Error(), wp5OpErr("read", e), wp5Death, wp5Death, wp5Death, wp5Death})
 	}
 	var tmp interface{ Temporary() bool }
@@ -116,6 +139,15 @@ func TestOwnedUDPErrorClasses(t *testing.T) {
 		checkRead("listener", r, r.sockRead, nil, ev, err)
 		checkWrite("dialer", r, r.dialerWrite, udpWriteResult(-1, 100, r.err, false))
 		checkWrite("listener", r, r.sockWrite, udpWriteResult(-1, 100, r.err, true))
+
+		// The dialer token's net.PacketConn view: a noise error instead of
+		// the bare ErrNoise, everything else as WriteDatagram reports it.
+		verr := viewWriteResult(-1, 100, r.err)
+		if r.dialerWrite == wp5Noise {
+			wp5CheckNoiseError(t, "view write, "+r.name, verr, r.err)
+		} else {
+			checkWrite("view", r, r.dialerWrite, verr)
+		}
 	}
 
 	// Counts (L42): a read count outside the buffer and a write count other
@@ -135,9 +167,15 @@ func TestOwnedUDPErrorClasses(t *testing.T) {
 				t.Errorf("write count %d of 100 (listening %v): %v", n, listening, err)
 			}
 		}
+		if err := viewWriteResult(n, 100, nil); !errors.Is(err, errUDPWriteCount) {
+			t.Errorf("view write count %d of 100: %v", n, err)
+		}
 	}
 	if err := udpWriteResult(100, 100, nil, false); err != nil {
 		t.Errorf("an exact write: %v", err)
+	}
+	if err := viewWriteResult(100, 100, nil); err != nil {
+		t.Errorf("an exact view write: %v", err)
 	}
 
 	t.Run("real", func(t *testing.T) {
@@ -189,6 +227,9 @@ func TestOwnedUDPErrorClasses(t *testing.T) {
 		if err := s.WriteAddrPort([]byte("late"), wp5AP(raw)); !errors.Is(err, os.ErrDeadlineExceeded) {
 			t.Errorf("listener write past its deadline: %v; want the timeout", err)
 		}
+		if _, _, err := o.ReadFrom(make([]byte, 100)); !errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, ErrNoise) {
+			t.Errorf("dialer ReadFrom past its deadline: %v; want the timeout", err)
+		}
 		o.Close()
 		s.Close()
 		if _, _, _, err := o.ReadDatagram(make([]byte, o.ReadSize())); !errors.Is(err, net.ErrClosed) {
@@ -201,6 +242,102 @@ func TestOwnedUDPErrorClasses(t *testing.T) {
 			t.Errorf("dialer write after Close: %v; want net.ErrClosed", err)
 		}
 	})
+
+	t.Run("icmp", func(t *testing.T) {
+		defer g10NoLeak(t)()
+		gone, _ := wp5Listen(t, "udp4")
+		dead := wp5AP(gone)
+		gone.Close() // nothing listens at dead any more: a datagram to it draws an ICMP port unreachable
+		du, _ := wp5Listen(t, "udp4")
+		o := NewOwnedUDP(du, dead, wp5Flow, wp5MaxDatagram)
+		defer o.Close()
+		errno := wp5ReportICMP(t, du)
+		if errno == nil {
+			t.Logf("no ICMP-derived errors are read on this OS (owned_udp_*_test.go): the injected rows cover it")
+			return
+		}
+		su, _ := wp5Listen(t, "udp4")
+		s := NewOwnedUDPSocket(su, wp5MaxDatagram)
+		defer s.Close()
+		wp5ReportICMP(t, su)
+		deadline := time.Now().Add(10 * time.Second)
+		o.SetDeadline(deadline)
+		s.SetDeadline(deadline)
+		d := wp5Datagram(wp5Flow, 50)
+
+		// PacketIO: ReadNoise with a nil error, nothing handed over.
+		if err := o.WriteDatagram(d); err != nil {
+			t.Fatalf("dialer write to a closed port: %v", err)
+		}
+		if data, _, ev, err := o.ReadDatagram(make([]byte, o.ReadSize())); ev != ReadNoise || err != nil || data != nil {
+			t.Fatalf("dialer read after an ICMP error: event %d, %v, %d bytes; want ReadNoise", ev, err, len(data))
+		}
+		if err := s.WriteAddrPort(d, dead); err != nil {
+			t.Fatalf("listener write to a closed port: %v", err)
+		}
+		if _, _, ev, err := s.ReadAddrPort(make([]byte, s.MaxDatagram()+1)); ev != ReadNoise || err != nil {
+			t.Fatalf("listener read after an ICMP error: event %d, %v; want ReadNoise", ev, err)
+		}
+
+		// The net.PacketConn view: a Temporary() noise error with the errno.
+		if err := o.WriteDatagram(d); err != nil {
+			t.Fatalf("dialer write to a closed port: %v", err)
+		}
+		_, addr, err := o.ReadFrom(make([]byte, 100))
+		if addr != nil {
+			t.Errorf("ReadFrom after an ICMP error returned the address %v", addr)
+		}
+		wp5CheckNoiseError(t, "ReadFrom after an ICMP error", err, errno)
+	})
+}
+
+// wp5CheckNoiseError checks a noise error of the OwnedUDP net.PacketConn
+// view: Temporary(), not a timeout, matching ErrNoise and cause (the
+// socket's error, or its errno).
+func wp5CheckNoiseError(t *testing.T, what string, err, cause error) {
+	t.Helper()
+	tmp, isTemp := err.(interface{ Temporary() bool })
+	to, isTimeout := err.(interface{ Timeout() bool })
+	if !errors.Is(err, ErrNoise) || !errors.Is(err, cause) || !isTemp || !tmp.Temporary() ||
+		!isTimeout || to.Timeout() || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("%s: %v (%T); want a Temporary() error, not a timeout, matching ErrNoise and %v", what, err, err, cause)
+	}
+}
+
+// TestOwnedUDPConstructorPanics: the constructors refuse what carrier/udp
+// never passes (programming errors): flow ID 0 (§A3.4: never a flow) and a
+// MaxDatagram outside 546–65,507 — below the flow header and the smallest
+// frame budget, or above a UDP payload. The bounds themselves are accepted.
+func TestOwnedUDPConstructorPanics(t *testing.T) {
+	peer := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 9)
+	lo, hi := wire.MinFrameBudget+wire.FlowHeaderLen, wire.MaxDatagram
+	for _, r := range []struct {
+		name  string
+		build func()
+		panic bool
+	}{
+		{"dialer, flow 0", func() { NewOwnedUDP(nil, peer, 0, wp5MaxDatagram) }, true},
+		{"dialer, MaxDatagram below the floor", func() { NewOwnedUDP(nil, peer, wp5Flow, lo-1) }, true},
+		{"dialer, MaxDatagram above a UDP payload", func() { NewOwnedUDP(nil, peer, wp5Flow, hi+1) }, true},
+		{"dialer, the floor", func() { NewOwnedUDP(nil, peer, wp5Flow, lo) }, false},
+		{"dialer, the largest", func() { NewOwnedUDP(nil, peer, ^uint64(0), hi) }, false},
+		{"listener, MaxDatagram below the floor", func() { NewOwnedUDPSocket(nil, lo-1) }, true},
+		{"listener, MaxDatagram above a UDP payload", func() { NewOwnedUDPSocket(nil, hi+1) }, true},
+		{"listener, the floor", func() { NewOwnedUDPSocket(nil, lo) }, false},
+		{"listener, the largest", func() { NewOwnedUDPSocket(nil, hi) }, false},
+	} {
+		panicked := func() (p bool) {
+			defer func() { p = recover() != nil }()
+			r.build()
+			return false
+		}()
+		if panicked != r.panic {
+			t.Errorf("%s: panicked %v, want %v", r.name, panicked, r.panic)
+		}
+	}
+	if lo != 546 {
+		t.Errorf("the smallest MaxDatagram is %d, want 546 (carrier/udp's documented range)", lo)
+	}
 }
 
 // TestOwnedUDPZeroAllocs_L41_L54: a datagram round trip through both tokens
