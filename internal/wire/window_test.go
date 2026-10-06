@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"runtime"
@@ -135,8 +136,10 @@ func nextSeq(top, width uint64, op [3]byte) uint64 {
 // of loss (+2 … +16), 20 % a recent one (0 … 31 behind: mostly
 // duplicates), 12 % a reordered one (32 … w − 1 behind), 10 % a late one
 // (w … 4w behind), 2 % a forward jump (w … w + 2^27) and 1 % an arbitrary
-// value (arbitrary true: the caller draws it).
-func randDelta(rng *rand.Rand, w int64) (d int64, arbitrary bool) {
+// value (arbitrary true: the caller draws it). Without jumps those 3 % are
+// the next in order: a jump clears the whole map, so only a phase without
+// them laps the ring and reaches the bits a lap leaves behind.
+func randDelta(rng *rand.Rand, w int64, jumps bool) (d int64, arbitrary bool) {
 	switch r := rng.IntN(100); {
 	case r < 45:
 		return 1, false
@@ -148,10 +151,63 @@ func randDelta(rng *rand.Rand, w int64) (d int64, arbitrary bool) {
 		return -(32 + rng.Int64N(w-32)), false
 	case r < 97:
 		return -(w + rng.Int64N(3*w)), false
+	case !jumps:
+		return 1, false
 	case r < 99:
 		return w + rng.Int64N(1<<27), false
 	}
 	return 0, true
+}
+
+// lapGaps drives a window of the given width (a power of two ≥ 1024;
+// accept offers one number, the window's newest is start − 1 or none) with
+// forward gaps that cross 64-bit word boundaries in every alignment: a
+// skipped last bit of a word, a gap ending at a word's last bit, one
+// spanning a whole word, several words, half the ring and width − 1 (the
+// longest move that clears bit by bit). Before each gap a full lap in order
+// sets every bit of the ring, so a bit the move fails to clear — say bit 63
+// of a word — is still set from the lap before: the skipped number arriving
+// late would be dropped as a duplicate, silent loss (L39, L43). Every
+// skipped number must be new once (offered newest first: each a reordered
+// arrival), then a duplicate. It returns the first wrong verdict, or "".
+func lapGaps(width, start uint64, accept func(uint64) WindowVerdict) string {
+	v := start // the next number in order
+	for _, g := range [...]struct{ align, n uint64 }{
+		{62, 2}, {40, 30}, {31, 32}, {63, 66}, {0, 200}, {17, width/2 + 3}, {5, width - 1},
+	} {
+		// A full lap in order up to top ≡ align (mod 64).
+		top := v + width
+		top += (g.align + 64 - top%64) % 64
+		for ; v <= top; v++ {
+			if got := accept(v); got != WindowNew {
+				return fmt.Sprintf("lap to %#x: Accept(%#x) = %d, want new", top, v, got)
+			}
+		}
+		f := top + g.n
+		if got := accept(f); got != WindowNew {
+			return fmt.Sprintf("gap of %d after %#x: Accept(%#x) = %d, want new", g.n, top, f, got)
+		}
+		for _, want := range [...]WindowVerdict{WindowNew, WindowDuplicate} {
+			for x := f - 1; x > top; x-- {
+				if got := accept(x); got != want {
+					return fmt.Sprintf("gap of %d after %#x: skipped Accept(%#x) = %d, want %d", g.n, top, x, got, want)
+				}
+			}
+		}
+		// The edges after the move: the newest, the newest before it and the
+		// oldest inside the window (from the lap) are duplicates, one width
+		// behind is late.
+		for _, e := range [...]struct {
+			x    uint64
+			want WindowVerdict
+		}{{f, WindowDuplicate}, {top, WindowDuplicate}, {f - width + 1, WindowDuplicate}, {f - width, WindowLate}} {
+			if got := accept(e.x); got != e.want {
+				return fmt.Sprintf("gap of %d after %#x: edge Accept(%#x) = %d, want %d", g.n, top, e.x, got, e.want)
+			}
+		}
+		v = f + 1
+	}
+	return ""
 }
 
 // TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:333) —
@@ -159,9 +215,11 @@ func randDelta(rng *rand.Rand, w int64) (d int64, arbitrary bool) {
 // inside the 1024-frame window is accepted once (not strict +1), a repeated
 // one is a duplicate, one 1024 or more behind the newest is late; jumps of
 // 1024 or more clear the window; u32 serial arithmetic across 2^32 (L14:
-// a preset near the limit wraps and keeps accepting); verdicts equal the map
-// model under random reordering, duplication, loss and jumps; no
-// allocation.
+// a preset near the limit wraps and keeps accepting); after a full lap,
+// every fseq a forward move skips is new once, whatever 64-bit word
+// boundaries the move crosses (lapGaps); verdicts equal the map model under
+// random reordering, duplication, loss and jumps, and in a phase without
+// jumps that laps the ring many times; no allocation.
 func TestFseqWindow_L43_L14(t *testing.T) {
 	var w FseqWindow
 	expect := func(f uint32, want WindowVerdict) {
@@ -221,32 +279,53 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 	}
 	expect(0, WindowDuplicate)
 
+	// Laps and forward gaps across word boundaries (the laps pass 2^32):
+	// a move clears every bit it passes. Init and the laps allocate nothing.
+	const lapStart = 0xffffe800
+	var lapErr string
+	if grew := allocatedDuring(func() {
+		w.Init(lapStart)
+		lapErr = lapGaps(FseqWindowBits, lapStart, func(f uint64) WindowVerdict { return w.Accept(uint32(f)) })
+	}); grew && !raceEnabled {
+		t.Errorf("FseqWindow allocated in Init and the laps")
+	}
+	if lapErr != "" {
+		t.Fatal(lapErr)
+	}
+
 	// Against the map model: random reordering, duplication, loss and
-	// jumps, from several starts (also across the wrap).
+	// jumps, from several starts (also across the wrap); then without jumps,
+	// so the window laps its ring more than 20 times.
 	rng := rand.New(rand.NewPCG(43, 14))
 	for _, first := range []uint32{1, 0xfffffc00, 0x7fffffff, 0xfffffffe} {
-		w.Init(first)
-		m := newFseqModel(first)
-		counts := [3]int{}
-		for range 20000 {
-			d, arbitrary := randDelta(rng, FseqWindowBits)
-			f := m.top + uint32(d)
-			if arbitrary {
-				f = rng.Uint32()
+		for _, jumps := range []bool{true, false} {
+			w.Init(first)
+			m := newFseqModel(first)
+			counts := [3]int{}
+			for range 20000 {
+				d, arbitrary := randDelta(rng, FseqWindowBits, jumps)
+				f := m.top + uint32(d)
+				if arbitrary {
+					f = rng.Uint32()
+				}
+				got, want := w.Accept(f), m.accept(f)
+				if got != want {
+					t.Fatalf("first %#x, jumps %v: Accept(%#x) = %d, model %d", first, jumps, f, got, want)
+				}
+				counts[got]++
 			}
-			got, want := w.Accept(f), m.accept(f)
-			if got != want {
-				t.Fatalf("first %#x: Accept(%#x) = %d, model %d", first, f, got, want)
+			// Stimulus proof: every verdict occurred many times; without
+			// jumps the newest moved on by more than 20 laps.
+			for v, n := range counts {
+				if n < 1000 {
+					t.Fatalf("first %#x, jumps %v: verdict %d occurred %d times", first, jumps, v, n)
+				}
 			}
-			counts[got]++
+			if laps := (m.top - (first - 1)) / FseqWindowBits; !jumps && laps < 20 {
+				t.Fatalf("first %#x: %d laps without jumps, want 20 or more", first, laps)
+			}
+			t.Logf("first %#x, jumps %v: new %d, duplicate %d, late %d", first, jumps, counts[WindowNew], counts[WindowDuplicate], counts[WindowLate])
 		}
-		// Stimulus proof: every verdict occurred many times.
-		for v, n := range counts {
-			if n < 1000 {
-				t.Fatalf("first %#x: verdict %d occurred %d times", first, v, n)
-			}
-		}
-		t.Logf("first %#x: new %d, duplicate %d, late %d", first, counts[WindowNew], counts[WindowDuplicate], counts[WindowLate])
 	}
 
 	f := uint32(5)
@@ -284,25 +363,42 @@ func allocatedDuring(run func()) bool {
 
 // TestSeqWindow_L39: a packet session's dedup window (M2-D36) — with seq 0
 // missing forever the window follows the newest seq, its state stays the
-// fixed storage and Accept never allocates; a duplicate inside the window
-// is reported, a seq the width or more behind the newest is late; the first
-// accepted seq may be any (a reordered start loses nothing); seqs near 2^62
-// and every storage size behave as the map model; Init clears its storage
-// and rejects sizes that are not a power of two ≥ 16 words.
+// fixed storage and neither Init, the first fill nor any later Accept
+// allocates; a duplicate inside the window is reported, a seq the width or
+// more behind the newest is late; the first accepted seq may be any (a
+// reordered start loses nothing); after a full lap every seq a forward move
+// skips is new once, whatever word boundaries it crosses (lapGaps, every
+// storage size); seqs near 2^62 and every storage size behave as the map
+// model, also in a phase without jumps that laps the small rings; Init
+// clears its storage and rejects sizes that are not a power of two ≥ 16
+// words.
 func TestSeqWindow_L39(t *testing.T) {
 	storage := make([]uint64, DefaultSeqWindowBits/64)
 	var w SeqWindow
-	w.Init(storage)
 	expect := func(s uint64, want WindowVerdict) {
 		t.Helper()
 		if got := w.Accept(s); got != want {
 			t.Fatalf("Accept(%d) = %d, want %d", s, got, want)
 		}
 	}
-	// seq 0 is missing forever: nothing is pinned.
+	// seq 0 is missing forever: nothing is pinned. Init and the fill from a
+	// fresh window allocate nothing — raw counts, so state kept outside the
+	// storage (a map, even one that forgets old seqs) cannot hide in its
+	// growth.
 	const n = 100000
-	for s := uint64(1); s <= n; s++ {
-		expect(s, WindowNew)
+	notNew := uint64(0) // the first seq of the fill that was not new
+	if grew := allocatedDuring(func() {
+		w.Init(storage)
+		for s := uint64(1); s <= n; s++ {
+			if w.Accept(s) != WindowNew && notNew == 0 {
+				notNew = s
+			}
+		}
+	}); grew && !raceEnabled {
+		t.Errorf("SeqWindow allocated in Init and its first %d seqs", n)
+	}
+	if notNew != 0 {
+		t.Fatalf("Accept(%d) of the first fill is not new", notNew)
 	}
 	expect(0, WindowLate)
 	expect(n, WindowDuplicate)
@@ -352,41 +448,56 @@ func TestSeqWindow_L39(t *testing.T) {
 	}
 	expect(10, WindowNew)
 
+	// Laps and forward gaps across word boundaries, every storage size: a
+	// move clears every bit it passes.
+	for _, words := range []int{16, 32, 256, 1024} {
+		w.Init(make([]uint64, words))
+		if msg := lapGaps(uint64(words)*64, 1<<40+3, w.Accept); msg != "" {
+			t.Fatalf("%d words: %s", words, msg)
+		}
+	}
+
 	// Against the map model: every storage size, from a small start and
 	// near 2^62 (the session ends there, L14), so the ring index wraps many
-	// times; the session's seqs never wrap u64 (fuzzing covers arbitrary
-	// values).
+	// times; with jumps, then without (the 1024- and 2048-bit rings lap
+	// more than 10 times); the session's seqs never wrap u64 (fuzzing
+	// covers arbitrary values).
 	rng := rand.New(rand.NewPCG(39, 62))
 	for _, words := range []int{16, 32, 256, 1024} {
 		width := uint64(words) * 64
 		for _, start := range []uint64{4*width + 1, 1<<62 - 1<<34} {
-			w.Init(make([]uint64, words))
-			m := newSeqModel(width)
-			if w.Accept(start) != WindowNew || m.accept(start) != WindowNew {
-				t.Fatalf("the first seq is not new")
-			}
-			counts := [3]int{}
-			top := start
-			for range 20000 {
-				d, arbitrary := randDelta(rng, int64(width))
-				if arbitrary {
-					d = 1
+			for _, jumps := range []bool{true, false} {
+				w.Init(make([]uint64, words))
+				m := newSeqModel(width)
+				if w.Accept(start) != WindowNew || m.accept(start) != WindowNew {
+					t.Fatalf("the first seq is not new")
 				}
-				s := top + uint64(d)
-				got, want := w.Accept(s), m.accept(s)
-				if got != want {
-					t.Fatalf("width %d start %#x: Accept(%#x) = %d, model %d", width, start, s, got, want)
+				counts := [3]int{}
+				top := start
+				for range 20000 {
+					d, arbitrary := randDelta(rng, int64(width), jumps)
+					if arbitrary {
+						d = 1
+					}
+					s := top + uint64(d)
+					got, want := w.Accept(s), m.accept(s)
+					if got != want {
+						t.Fatalf("width %d start %#x jumps %v: Accept(%#x) = %d, model %d", width, start, jumps, s, got, want)
+					}
+					counts[got]++
+					top = m.top
 				}
-				counts[got]++
-				top = m.top
-			}
-			for v, c := range counts {
-				if c < 1000 {
-					t.Fatalf("width %d start %#x: verdict %d occurred %d times", width, start, v, c)
+				for v, c := range counts {
+					if c < 1000 {
+						t.Fatalf("width %d start %#x jumps %v: verdict %d occurred %d times", width, start, jumps, v, c)
+					}
 				}
-			}
-			if m.top < start || m.top >= 1<<62 && start < 1<<61 {
-				t.Fatalf("width %d: the newest %#x left the session's range from %#x", width, m.top, start)
+				if m.top < start || m.top >= 1<<62 && start < 1<<61 {
+					t.Fatalf("width %d: the newest %#x left the session's range from %#x", width, m.top, start)
+				}
+				if laps := (m.top - start) / width; !jumps && width <= 2048 && laps < 10 {
+					t.Fatalf("width %d start %#x: %d laps without jumps, want 10 or more", width, start, laps)
+				}
 			}
 		}
 	}
