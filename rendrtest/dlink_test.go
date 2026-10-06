@@ -17,15 +17,14 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// dCounterNames names every datagram counter (the last three have no
-// exported field).
+// dCounterNames names every datagram counter.
 var dCounterNames = [nDctr]string{"Sent", "Delivered", "Lost", "Duplicated", "Reordered", "Oversize",
-	"Injected", "Corrupted", "Truncated", "Foreign", "ScriptedWrites", "ReadFaults", "held", "killed", "captured"}
+	"Injected", "Corrupted", "Truncated", "Foreign", "ScriptedWrites", "ReadFaults", "Held", "Killed", "Captured"}
 
 // dExported maps DatagramCounts onto the counter order.
-func dExported(c DatagramCounts) [dcHeld]uint64 {
-	return [dcHeld]uint64{c.Sent, c.Delivered, c.Lost, c.Duplicated, c.Reordered, c.Oversize,
-		c.Injected, c.Corrupted, c.Truncated, c.Foreign, c.ScriptedWrites, c.ReadFaults}
+func dExported(c DatagramCounts) [nDctr]uint64 {
+	return [nDctr]uint64{c.Sent, c.Delivered, c.Lost, c.Duplicated, c.Reordered, c.Oversize,
+		c.Injected, c.Corrupted, c.Truncated, c.Foreign, c.ScriptedWrites, c.ReadFaults, c.Held, c.Killed, c.Captured}
 }
 
 // dSnap reads every counter of every class (all, session, probe).
@@ -67,9 +66,8 @@ func (g *dControlsRig) pData() []byte { return dFrame(FramePing, 2, pingPayload(
 // stimulus proof counts only what touched a session (L60, L63). Each row
 // applies one control on a link carrying one session and one probe carrier
 // and checks the control's effect and the exact per-class deltas of every
-// counter — the ones without an exported field (held, killed, captured)
-// included; All = Session + Probe; Stats reports every exported counter of
-// every class. (Needs internal/wire's REL codec: integration 1.)
+// counter; All = Session + Probe; Stats reports every counter of every
+// class. (Needs internal/wire's REL codec: integration 1.)
 func TestDatagramLinkControlsCount_L60(t *testing.T) {
 	type deltas map[dctr][2]uint64 // counter → (session, probe) delta
 	one := [2]uint64{1, 1}
@@ -287,8 +285,8 @@ func TestDatagramLinkControlsCount_L60(t *testing.T) {
 				after := dSnap(g.r.l.n)
 				st := g.r.l.Stats()
 				for c, cs := range []DatagramCounts{st.All, st.Session, st.Probe} {
-					if dExported(cs) != [dcHeld]uint64(after[c][:dcHeld]) {
-						t.Errorf("class %d: Stats %v, counters %v", c, dExported(cs), after[c][:dcHeld])
+					if dExported(cs) != after[c] {
+						t.Errorf("class %d: Stats %v, counters %v", c, dExported(cs), after[c])
 					}
 				}
 				for k := range nDctr {
@@ -780,7 +778,7 @@ func TestDatagramLinkStall(t *testing.T) {
 			t.Fatalf("after the release: %d at %v, %d at %v; want 1 at 100ms, 2 at 110ms",
 				as[0].b[0], as[0].at.Sub(start), as[1].b[0], as[1].at.Sub(start))
 		}
-		if held := r.l.n.ctr[0][dcHeld].Load(); held != 2 {
+		if held := r.l.Stats().All.Held; held != 2 {
 			t.Fatalf("held %d, want 2: datagram 1 (on its way, due inside the stall) and datagram 2 (written while held)", held)
 		}
 
@@ -866,8 +864,8 @@ func TestDatagramLinkKill(t *testing.T) {
 		if got, _ := dRecv(t, c.srv); got[0] != 3 {
 			t.Fatal("the new carrier does not work")
 		}
-		if st := r.l.Stats(); st.All.Lost != 2 || st.Carriers != 3 || st.All.Sent != 3 {
-			t.Fatalf("Lost %d, Carriers %d, Sent %d; want 2, 3, 3", st.All.Lost, st.Carriers, st.All.Sent)
+		if st := r.l.Stats(); st.All.Lost != 2 || st.All.Killed != 2 || st.Carriers != 3 || st.All.Sent != 3 {
+			t.Fatalf("Lost %d, Killed %d, Carriers %d, Sent %d; want 2, 2, 3, 3", st.All.Lost, st.All.Killed, st.Carriers, st.All.Sent)
 		}
 	})
 }
@@ -1093,8 +1091,8 @@ func TestDatagramLinkCaptureNext_L12(t *testing.T) {
 		if !bytes.Equal(ap, bp) {
 			t.Fatal("the resent REL payload differs")
 		}
-		if st := r.l.Stats().Session; st.Lost != 1 || r.l.n.ctr[1][dcCaptured].Load() != 3 {
-			t.Fatalf("session Lost %d, captured %d; want 1, 3", st.Lost, r.l.n.ctr[1][dcCaptured].Load())
+		if st := r.l.Stats().Session; st.Lost != 1 || st.Captured != 3 {
+			t.Fatalf("session Lost %d, Captured %d; want 1, 3", st.Lost, st.Captured)
 		}
 	})
 }

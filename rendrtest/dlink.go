@@ -79,9 +79,9 @@ type DatagramLinkConfig struct {
 // (ScriptWrites, ReadFaults, TruncateNext) take the side whose conns make
 // the call (Up: the dialer's conns, Down: the passive's).
 //
-// Counters without a field of their own: Stall shows in arrival times,
-// Kill in Lost (the datagrams it lost) and in the conns' errors, CaptureNext
-// in its channel.
+// Stall counts what it held (Held), Kill the carriers it failed (Killed;
+// the datagrams it lost count in Lost), CaptureNext the datagrams it copied
+// (Captured).
 //
 // Queue (DatagramLinkConfig) bounds each direction over all carriers, from
 // WriteTo to the reader, transit included: datagrams per second × one-way
@@ -513,6 +513,11 @@ type DatagramCounts struct {
 	Sent, Delivered, Lost, Duplicated, Reordered uint64
 	Oversize, Injected, Corrupted, Truncated     uint64
 	Foreign, ScriptedWrites, ReadFaults          uint64
+	// Held counts the datagrams a stall held: written while it lasted, or on
+	// their way with an arrival time inside it. Killed counts the carriers
+	// Kill failed, Captured the datagrams CaptureNext copied. A DatagramHub
+	// has none of these controls.
+	Held, Killed, Captured uint64
 }
 
 // DatagramStats are a datagram link's or hub's counters.

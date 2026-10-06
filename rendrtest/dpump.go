@@ -252,8 +252,7 @@ func sameAddr(a net.Addr, b *net.UDPAddr) bool {
 	return ok && x == y
 }
 
-// dctr indexes the datagram counters. The first twelve are DatagramCounts'
-// fields; the rest have no exported field.
+// dctr indexes the datagram counters, in DatagramCounts' field order.
 type dctr int
 
 const (
@@ -291,6 +290,9 @@ func (c *dcounters) snap() DatagramCounts {
 		Foreign:        c[dcForeign].Load(),
 		ScriptedWrites: c[dcScripted].Load(),
 		ReadFaults:     c[dcReadFaults].Load(),
+		Held:           c[dcHeld].Load(),
+		Killed:         c[dcKilled].Load(),
+		Captured:       c[dcCaptured].Load(),
 	}
 }
 
