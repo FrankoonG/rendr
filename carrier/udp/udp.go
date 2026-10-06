@@ -16,9 +16,37 @@
 // them without allocating per datagram, with exact truncation detection.
 // Every other net.PacketConn, one that wraps a socket of this package
 // included, is used only through its methods.
+//
+// # Threat model
+//
+// The flow ID keeps blind off-path injection out: a sender must guess 64
+// random bits to reach a carrier at all. It is the only barrier, and it is
+// no secret from anyone who sees the traffic: the frame CRC is public and
+// any frame number ahead of the receive window is accepted, so a holder of a
+// flow ID can kill its carrier with one forged datagram that breaks the
+// protocol, or retire it with a forged CLOSE. Replies move to a new client
+// address only after that address answered a random nonce (NAT rebinding,
+// L59), so a replayed or blindly spoofed datagram never redirects them —
+// but an on-path attacker that receives at the address it forges can answer,
+// as with QUIC path validation. A captured first datagram replayed after
+// the listener forgot the removed flow's ID (it remembers the ID for the
+// longer of the handshake and dial timeouts plus two seconds) opens a
+// pending session again. Damaged datagrams are dropped and counted, never a
+// death: that keeps corrupting paths from churning carriers but is no
+// protection against forgery. The defence is the embedder's authentication:
+// use this carrier on loopback (the default), on a trusted network, or
+// inside an authenticated channel (plan:361).
+//
+// # Sizes
+//
+// A listening socket's MaxDatagram should be at least every dialer's, else
+// the handshake lowers a larger dialer budget to the listener's; either way
+// nothing is truncated in steady state. A longer datagram that still
+// arrives is dropped and counted, never delivered in part (L58).
 package udp
 
 import (
+	"context"
 	"errors"
 	"net"
 
@@ -67,7 +95,7 @@ type Options struct {
 // loopback, checked before and after binding (ErrNonLoopback); an empty
 // host (wildcard) requires AllowNonLoopback.
 func Listen(network, address string, o Options) (net.PacketConn, error) {
-	panic("unimplemented: M2")
+	return listen(context.Background(), network, address, o)
 }
 
 // Carrier returns a DatagramCarrier named name whose every Dial resolves
@@ -79,5 +107,13 @@ func Listen(network, address string, o Options) (net.PacketConn, error) {
 // *net.UDPAddr. MTU is MaxDatagram − 9 (0, which NewPeer rejects, for an
 // invalid MaxDatagram).
 func Carrier(name, network, address string, o Options) rendr.DatagramCarrier {
-	panic("unimplemented: M2")
+	mtu := 0
+	if m, err := o.maxDatagram(); err == nil {
+		mtu = m - flowHeaderLen
+	}
+	return rendr.DatagramCarrier{
+		Name: name,
+		MTU:  mtu,
+		Dial: func(ctx context.Context) (net.PacketConn, net.Addr, error) { return dial(ctx, network, address, o) },
+	}
 }
