@@ -140,6 +140,13 @@ func (c *Conn) readFrame(rd *reader) bool {
 		c.violation("%v: %v", h.Type, errAfterClose)
 		return false
 	}
+	if h.Type == wire.TypeRel || h.Type == wire.TypeRack {
+		// Datagram-carrier control (M2 §A3.6): a violation on every stream
+		// carrier, before the session check (probe and sessionless carriers
+		// have no endpoint) and the size check (never skipped as large).
+		c.violation("%v on a stream carrier", h.Type)
+		return false
+	}
 	if !h.Type.Extension() && !h.Type.CarrierLevel() {
 		switch {
 		case c.ep == nil:
@@ -353,6 +360,13 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 // running CRC: an extension is discarded; of a PING or PONG only the fixed
 // part is kept and every pad byte must be zero (wire.CheckPad).
 func (c *Conn) readStreamed(rd *reader, h wire.Header) bool {
+	if !h.Type.Extension() && h.Type != wire.TypePing && h.Type != wire.TypePong {
+		// A core frame larger than the stage that is not big DATA (M2: a
+		// DGRAM of 16 KiB or more until the packet path reads it by
+		// reference) is never skipped as if it were an extension.
+		c.violation("%v of %d bytes on a stream carrier", h.Type, h.Len)
+		return false
+	}
 	sb := rd.stage.B
 	crc := wire.CRC(sb[rd.r : rd.r+wire.HeaderLen])
 	rd.r += wire.HeaderLen
