@@ -31,18 +31,26 @@ type Selector struct {
 	lastQual time.Time               // last quality switch (valid when hasQual)
 	hasQual  bool                    // D7: no quality switch yet → the first needs no cooldown
 
-	// class is the kind class per factory (M2-D48; zero for every factory
-	// of a stream session). A challenger of a lower class than the active
-	// factory qualifies without Band and Floor (still EvFresh, unloaded,
-	// with dwell and cooldown): a packet session that fell back to a stream
-	// carrier returns to a datagram carrier. A challenger of a higher class
-	// never qualifies (Evaluate).
+	// class is the kind class per factory (M2-D48; SetClasses, all zero
+	// before). A challenger of a lower class than the active factory
+	// qualifies without Band and Floor (still EvFresh, unloaded, with dwell
+	// and cooldown): a packet session that fell back to a stream carrier
+	// returns to a datagram carrier. A challenger of a higher class never
+	// qualifies (Evaluate).
 	class [maxFactories]uint8
 }
 
 // SetClasses records the kind class of every factory (index i of c is
-// factory i; at most 16). A selector whose classes are all 0 — every stream
-// session, and every session before this call — behaves as in M1.
+// factory i; at most 16; missing entries are 0). Factories of one class
+// compete by M1's rules, so a selector whose classes are all equal — every
+// session before this call — behaves as in M1.
+//
+// The session hands Evaluate every factory of the Peer — health keeps each
+// under its Peer index (M2-D46) — and any of them that is not failed may
+// become the quality target. A factory the session may not dial, such as a
+// datagram factory of a stream session on a mixed Peer, must therefore get
+// a class above every factory the session may dial (a higher class never
+// qualifies) or be marked failed for Evaluate.
 func (s *Selector) SetClasses(c []uint8) {
 	s.class = [maxFactories]uint8{}
 	copy(s.class[:], c)

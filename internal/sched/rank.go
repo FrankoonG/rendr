@@ -9,7 +9,9 @@ type Candidate struct {
 	// 0 the session's preferred carrier kind (a packet session's datagram
 	// factories), 1 the fallback kind (its stream factories). Stream
 	// sessions use class 0 only. Less orders by it after the failed mark
-	// and before the evidence.
+	// and before the evidence, so a higher class does not rank a factory
+	// after the failed ones: a factory the session may not dial (M2-D46)
+	// is left out of the ranked set instead.
 	Class uint8
 }
 

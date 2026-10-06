@@ -16,9 +16,11 @@ import (
 // never qualify (L28: such evidence never wins). A stream challenger never
 // qualifies against a datagram incumbent, whatever either's evidence.
 // Challengers of the active factory's own class keep Band and Floor; among
-// qualified challengers the lower class wins. Every refused challenger has
-// a control in which the same challenger switches, so each stimulus is
-// real.
+// qualified challengers the lower class wins. A factory the session may not
+// dial (M2-D46) never becomes the target, even 100 times faster, when it
+// has a class above the session's factories or is marked failed (the two
+// ways SetClasses names). Every refused challenger has a control in which
+// the same challenger switches, so each stimulus is real.
 func TestSelectorClassUp_L28(t *testing.T) {
 	p := defaultSelectorParams()
 	const dg, st = 0, 1
@@ -182,6 +184,52 @@ func TestSelectorClassUp_L28(t *testing.T) {
 			sel, active = newSel(dg, dg), 0
 			if sw, _ := drive(&sel, &active, start, start.Add(time.Minute), time.Second, sums); len(sw) != 1 || sw[0].to != 1 {
 				t.Errorf("%s, control (equal classes): switches %+v, want one to 1", inc.name, sw)
+			}
+		}
+	})
+
+	t.Run("ineligible factory never", func(t *testing.T) {
+		// A stream session on a mixed Peer: stream factory 0 is active,
+		// datagram factory 1 (1 ms, 100 times faster) is in the health
+		// snapshot but the session may not dial it. Given class 255 above
+		// the session's class 0, or marked failed, it never becomes the
+		// target, whatever the incumbent's evidence; at class 0 and not
+		// failed (the control) M1's rule switches to it at Dwell.
+		const ineligible = 255
+		for _, inc := range []struct {
+			name string
+			sum  func(now time.Time) Summary
+		}{
+			{"fresh 100 ms", func(now time.Time) Summary { return freshSum(now, 100*ms) }},
+			{"held 100 ms", func(now time.Time) Summary { return heldSum(now, 100*ms) }},
+			{"stale", func(now time.Time) Summary { return staleSum(now, 100*ms) }},
+			{"unknown", func(time.Time) Summary { return Summary{} }},
+		} {
+			for _, way := range []struct {
+				name    string
+				classes []uint8
+				failed  bool
+			}{
+				{"class 255", []uint8{0, ineligible}, false},
+				{"marked failed", nil, true},
+			} {
+				sel, active := newSel(way.classes...), 0
+				sw, evals := drive(&sel, &active, start, start.Add(5*time.Minute), time.Second, func(now time.Time) ([]Summary, []bool) {
+					return []Summary{inc.sum(now), freshSum(now, ms)}, []bool{false, way.failed}
+				})
+				if len(sw) != 0 {
+					t.Errorf("%s incumbent, %s: switches %+v, want none", inc.name, way.name, sw)
+				}
+				if evals < 300 {
+					t.Errorf("%s incumbent, %s: only %d evaluations", inc.name, way.name, evals)
+				}
+			}
+			sel, active := newSel(), 0
+			sw, _ := drive(&sel, &active, start, start.Add(5*time.Minute), time.Second, func(now time.Time) ([]Summary, []bool) {
+				return []Summary{inc.sum(now), freshSum(now, ms)}, []bool{false, false}
+			})
+			if len(sw) != 1 || sw[0].to != 1 || !sw[0].at.Equal(start.Add(p.Dwell)) {
+				t.Errorf("%s incumbent, control (class 0, not failed): switches %+v, want one to 1 at Dwell", inc.name, sw)
 			}
 		}
 	})

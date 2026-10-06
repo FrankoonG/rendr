@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/big"
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 )
@@ -20,7 +21,10 @@ const (
 // with rttvar 50 ms gives 600 ms; every consecutive retransmission of the
 // same frame doubles the timeout up to 2 s, so a frame lost for good is
 // sent at 0, 0.3, 0.9, 2.1, 4.1, 6.1, 8.1 s (the H1 schedule of the M2
-// design §A5.10) and never more often than every 2 s after that.
+// design §A5.10) and never more often than every 2 s after that. The same
+// rule holds with the bounds as arguments (rtoWithin, rtoBackoffWithin):
+// the REL timer takes them from carrier.Timing, whose RelRTOInit,
+// RelRTOMin and RelRTOMax test hooks may shrink (M2-D16).
 func TestRTO_L12(t *testing.T) {
 	if RTOInitial != 300*ms || RTOMin != 200*ms || RTOMax != 2*time.Second {
 		t.Fatalf("constants: initial %v, min %v, max %v", RTOInitial, RTOMin, RTOMax)
@@ -145,6 +149,105 @@ func TestRTO_L12(t *testing.T) {
 				t.Errorf("%s: copies at %v, want %v", tc.name, got, tc.want)
 				break
 			}
+		}
+	}
+
+	// Timing bounds: the defaults shrunk tenfold (RelRTOInit 30 ms,
+	// RelRTOMin 20 ms, RelRTOMax 200 ms), as a test hook sets them.
+	const tInit, tLo, tHi = 30 * ms, 20 * ms, 200 * ms
+	for _, tc := range []struct {
+		name               string
+		srtt, rttvar, want time.Duration
+		sampled            bool
+	}{
+		{"before a sample", 40 * ms, 5 * ms, tInit, false},
+		{"before a sample, any estimator", maxDur, maxDur, tInit, false},
+		{"L12 tenfold: RTT 40 ms, rttvar 5 ms", 40 * ms, 5 * ms, 60 * ms, true},
+		{"below the floor", 2 * ms, 500 * time.Microsecond, tLo, true},
+		{"exactly the floor", 12 * ms, 2 * ms, tLo, true},
+		{"1 ns above the floor", tLo + 1, 0, tLo + 1, true},
+		{"1 ns below the cap", tHi - 1, 0, tHi - 1, true},
+		{"exactly the cap", 160 * ms, 10 * ms, tHi, true},
+		{"above the cap", 190 * ms, 10 * ms, tHi, true},
+		{"srtt alone at the cap", tHi, 0, tHi, true},
+		{"4·rttvar would overflow", 0, maxDur/4 + 1, tHi, true},
+		{"both maximal", maxDur, maxDur, tHi, true},
+		{"negative counts as 0", minDur, minDur, tLo, true},
+	} {
+		if got := rtoWithin(tc.srtt, tc.rttvar, tc.sampled, tInit, tLo, tHi); got != tc.want {
+			t.Errorf("Timing bounds, %s: rtoWithin(%v, %v, sampled %v) = %v, want %v", tc.name, tc.srtt, tc.rttvar, tc.sampled, got, tc.want)
+		}
+	}
+	for _, initial := range []time.Duration{ms, 5 * time.Second} { // the configured value, inside the clamp or not
+		if got := rtoWithin(400*ms, 50*ms, false, initial, tLo, tHi); got != initial {
+			t.Errorf("Timing bounds: rtoWithin(unsampled, initial %v) = %v", initial, got)
+		}
+	}
+	for _, tc := range []struct {
+		rto  time.Duration
+		n    int
+		want time.Duration
+	}{
+		{tInit, 0, 30 * ms}, {tInit, 1, 60 * ms}, {tInit, 2, 120 * ms}, {tInit, 3, tHi}, {tInit, 1000, tHi},
+		{100 * ms, 1, tHi}, {100*ms + 1, 1, tHi}, {100*ms - 1, 1, tHi - 2},
+		{300 * ms, 0, tHi}, {maxDur, 0, tHi}, {1, 63, tHi}, {1, math.MaxInt, tHi},
+		{tInit, -1, tInit}, {0, 3, 0}, {-ms, 3, -ms},
+	} {
+		if got := rtoBackoffWithin(tc.rto, tc.n, tHi); got != tc.want {
+			t.Errorf("Timing bounds: rtoBackoffWithin(%v, %d, %v) = %v, want %v", tc.rto, tc.n, tHi, got, tc.want)
+		}
+	}
+	// A cap near the int64 limit: the doubling saturates exactly there.
+	for _, tc := range []struct {
+		rto  time.Duration
+		n    int
+		want time.Duration
+	}{
+		{1, 62, 1 << 62}, {1, 63, maxDur}, {2, 61, 1 << 62}, {2, 62, maxDur}, {maxDur, 0, maxDur}, {maxDur, 1, maxDur},
+	} {
+		if got := rtoBackoffWithin(tc.rto, tc.n, maxDur); got != tc.want {
+			t.Errorf("rtoBackoffWithin(%d, %d, max) = %d, want %d", tc.rto, tc.n, got, tc.want)
+		}
+	}
+	var at time.Duration // a frame lost for good under the shrunk bounds
+	var tenfold []time.Duration
+	rto := rtoWithin(40*ms, 5*ms, false, tInit, tLo, tHi)
+	for k := 0; k < 6; k++ {
+		tenfold = append(tenfold, at)
+		at += rtoBackoffWithin(rto, k, tHi)
+	}
+	if want := []time.Duration{0, 30 * ms, 90 * ms, 210 * ms, 410 * ms, 610 * ms}; !slices.Equal(tenfold, want) {
+		t.Errorf("Timing bounds, before any sample: copies at %v, want %v", tenfold, want)
+	}
+	// Against min(max(srtt + 4·rttvar, lo), hi) and min(rto·2ⁿ, hi) in exact
+	// arithmetic for random bounds 0 < lo ≤ hi of any magnitude.
+	for i := 0; i < 20000; i++ {
+		lo, hi := max(randDur(r), 1), max(randDur(r), 1)
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		srtt, rttvar := randDur(r), randDur(r)
+		sum := new(big.Int).Mul(big.NewInt(int64(rttvar)), big.NewInt(4))
+		sum.Add(sum, big.NewInt(int64(srtt)))
+		var want time.Duration
+		switch {
+		case sum.Cmp(big.NewInt(int64(hi))) >= 0:
+			want = hi
+		case sum.Cmp(big.NewInt(int64(lo))) <= 0:
+			want = lo
+		default:
+			want = time.Duration(sum.Int64())
+		}
+		if got := rtoWithin(srtt, rttvar, true, tInit, lo, hi); got != want {
+			t.Fatalf("rtoWithin(%d, %d, [%d, %d]) = %d, want %d", srtt, rttvar, lo, hi, got, want)
+		}
+		b, n := max(randDur(r), 1), r.IntN(70)
+		bw := new(big.Int).Lsh(big.NewInt(int64(b)), uint(n))
+		if bw.Cmp(big.NewInt(int64(hi))) > 0 {
+			bw.SetInt64(int64(hi))
+		}
+		if got := rtoBackoffWithin(b, n, hi); int64(got) != bw.Int64() {
+			t.Fatalf("rtoBackoffWithin(%d, %d, %d) = %d, want %d", b, n, hi, got, bw.Int64())
 		}
 	}
 }
