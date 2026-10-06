@@ -152,9 +152,10 @@ type DgramStats struct {
 // an error matching ErrNoise or reporting Temporary() is noise on reads
 // and writes; the caller's own deadline is recognised by
 // errors.Is(err, os.ErrDeadlineExceeded), never by Timeout(), which a dead
-// conn may report too. NewPacketIO fails for a nil pc or peer and for a
-// peer whose String panics. Ownership of pc moves to the result only on
-// success (L57).
+// conn may report too. That table is ClassifyPacketErr; an abort
+// (PacketErrAbort) ends the carrier. NewPacketIO fails for a nil pc or
+// peer and for a peer whose String panics. Ownership of pc moves to the
+// result only on success (L57).
 func NewPacketIO(env *Env, pc net.PacketConn, peer net.Addr, limit int) (PacketIO, error) {
 	panic("unimplemented: M2")
 }

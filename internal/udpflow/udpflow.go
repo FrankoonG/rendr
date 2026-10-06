@@ -86,6 +86,9 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 // other sources of the Listener go on, L50), admits flows through admit and
 // routes datagrams to their inboxes. Transient errors (ICMP class,
 // ECONNABORTED on a listening socket, Temporary) back off 5 → 100 ms (L58).
+// An *carrier.OwnedUDPSocket classifies its own errors; a foreign conn's
+// read and write errors are classified by carrier.ClassifyPacketErr, an
+// abort (PacketErrAbort) being noise on the shared socket (integration 1).
 func (s *Source) Run(admit Admit) {
 	panic("unimplemented: M2")
 }
