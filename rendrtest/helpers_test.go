@@ -165,7 +165,9 @@ func fseqOf(frame []byte) uint32 { return binary.BigEndian.Uint32(frame[5:9]) }
 
 // goldenFrames returns every frame vector of internal/wire's golden file
 // with its header kept except the fseq, renumbered from first: a stream of
-// every frame type and size the wire format defines.
+// every frame type and size the wire format defines. Vectors that are not
+// exactly one frame (datagrams behind a PREFACE, flow headers) are skipped;
+// internal/wire's golden test checks them.
 func goldenFrames(t *testing.T, first uint32) [][]byte {
 	t.Helper()
 	f, err := os.Open("../internal/wire/testdata/golden.txt")
@@ -185,9 +187,9 @@ func goldenFrames(t *testing.T, first uint32) [][]byte {
 		if err != nil {
 			t.Fatalf("golden %s: %v", name, err)
 		}
-		fr, _, err := wire.DecodeFrame(b)
-		if err != nil {
-			t.Fatalf("golden %s: %v", name, err)
+		fr, n, err := wire.DecodeFrame(b)
+		if err != nil || n != len(b) {
+			continue
 		}
 		fr.Fseq = first + uint32(len(out))
 		out = append(out, wire.AppendFrame(nil, fr.Header, fr.Payload))
