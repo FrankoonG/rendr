@@ -48,7 +48,11 @@ type PacketIO interface {
 	// truncated, foreign source, bad flow header) or a transient error
 	// (ReadNoise: back off 5–100 ms, keep reading); ReadCandidate is a valid
 	// datagram from a new source on a transport that can rebind. A non-nil
-	// err ends the carrier (transport_error), e.g. after Close.
+	// err ends the carrier (transport_error), e.g. after Close, except the
+	// expiry of a read deadline its caller set (handshake, closer), which
+	// the caller recognises by errors.Is(err, os.ErrDeadlineExceeded) as
+	// the net.PacketConn contract defines it — never by Timeout(), which a
+	// dead conn may report too (quic-go's idle timeout; integration 1).
 	ReadDatagram(buf []byte) (data []byte, src PeerKey, ev ReadEvent, err error)
 	// Release returns the buffer of the last ReadDatagram to its owner
 	// (flows); a no-op otherwise.
