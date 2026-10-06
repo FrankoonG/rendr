@@ -86,15 +86,18 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time)
 // which reason code (design §5.3, §6.2): a parse error is CodeBadKind or
 // CodeBadMode when the kind or mode byte is outside the format's range,
 // else CodeBadValue (reserved flags or PMTU, zero SID, inconsistent
-// lengths); a well-formed OPEN of another kind than stream (M2) is
-// CodeBadKind, mode race (M3) CodeBadMode.
+// lengths, a packet OPEN's pmtu or window out of range, M2 §A3.5); a
+// well-formed OPEN of another kind than stream (M2) is CodeBadKind, mode
+// race (M3) CodeBadMode.
 func openBadRequest(payload []byte, o *wire.Open, err error) (code uint32, bad bool) {
 	if err != nil {
 		if errors.Is(err, wire.ErrValue) && len(payload) >= wire.OpenFixedLen {
 			if k := wire.CarrierKind(payload[16]); k != wire.KindStream && k != wire.KindDatagram {
 				return wire.CodeBadKind, true
 			}
-			return wire.CodeBadMode, true
+			if m := payload[17]; m < 1 || m > 3 {
+				return wire.CodeBadMode, true
+			}
 		}
 		return wire.CodeBadValue, true
 	}

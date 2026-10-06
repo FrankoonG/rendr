@@ -105,20 +105,30 @@ func TestPassivePrefaceAnswers_L44_L48(t *testing.T) {
 // answered OPEN_ACK(BAD_REQUEST) with its reason code before any session
 // state exists (design §5.3, §6.2; L48): metadata over Handshake.MaxMetadata
 // is refused unread (CodeMetadataSize → ErrMetadataTooLarge at the dialer);
-// an unknown kind or the datagram kind (M2) is CodeBadKind; mode 0 or race
-// (M3) is CodeBadMode; reserved flags or PMTU, a zero session ID and an
-// inconsistent metadata length are CodeBadValue. The answer is the
-// carrier's first frame (first fseq, session handle) followed by EOF, and
-// no MaxSessions unit, backlog slot or handshake slot remains.
+// an unknown kind or a well-formed packet OPEN (the datagram kind, until
+// packet sessions are admitted) is CodeBadKind; mode 0 or race (M3) is
+// CodeBadMode; reserved flags or PMTU, a zero session ID, an inconsistent
+// metadata length and a packet OPEN's pmtu or window out of range (M2
+// §A3.5) are CodeBadValue. The answer is the carrier's first frame (first
+// fseq, session handle) followed by EOF, and no MaxSessions unit, backlog
+// slot or handshake slot remains.
 func TestOpenRefusedBeforeState_L44_L48(t *testing.T) {
 	sid := wpSID(1)
+	packetOpen := func(window uint32, pmtu uint16) []byte {
+		b := wpOpen(sid, wire.KindDatagram, 1, nil)
+		binary.BigEndian.PutUint32(b[24:28], window)
+		binary.BigEndian.PutUint16(b[28:30], pmtu)
+		return b
+	}
 	cases := []struct {
 		name    string
 		payload []byte
 		code    uint32
 	}{
 		{"metadata over the limit", wpOpen(sid, wire.KindStream, 1, make([]byte, 5000)), wire.CodeMetadataSize},
-		{"datagram kind", wpOpen(sid, wire.KindDatagram, 1, nil), wire.CodeBadKind},
+		{"datagram kind", packetOpen(0, 1127), wire.CodeBadKind},
+		{"packet pmtu 0", packetOpen(0, 0), wire.CodeBadValue},
+		{"packet window 536", packetOpen(536, 1127), wire.CodeBadValue},
 		{"unknown kind", func() []byte { b := wpOpen(sid, wire.KindStream, 1, nil); b[16] = 7; return b }(), wire.CodeBadKind},
 		{"race mode", wpOpen(sid, wire.KindStream, 3, nil), wire.CodeBadMode},
 		{"mode 0", wpOpen(sid, wire.KindStream, 0, nil), wire.CodeBadMode},
