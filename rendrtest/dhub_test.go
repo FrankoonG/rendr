@@ -349,6 +349,75 @@ func TestDatagramHubFlood_L58(t *testing.T) {
 	})
 }
 
+// TestDatagramHubDialFrom_L58: DialFrom(n) dials clients of host n: they
+// share host n's IP address, which no client of another host has, and work
+// as Dial's — host 0's — do (flow header, replies, Rebind on the same
+// address); a Flood's first share comes from host 0's address only, never
+// from another host's (R1-21: a session dialled from another host is
+// outside the flooded quota). DialFrom panics for a host outside 0–255.
+func TestDatagramHubDialFrom_L58(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewDatagramHub(DatagramHubConfig{Name: "hosts"})
+		defer h.Close()
+		sock := h.PacketConn()
+		a, _ := hDial(t, h)
+		b, peerB, err := h.DialFrom(1)(context.Background())
+		if err != nil || peerB != sock.LocalAddr() {
+			t.Fatalf("DialFrom(1) = (%v, %v, %v)", b, peerB, err)
+		}
+		c, _, err := h.DialFrom(0)(context.Background())
+		if err != nil {
+			t.Fatalf("DialFrom(0): %v", err)
+		}
+		au, bu, cu := a.LocalAddr().(*net.UDPAddr), b.LocalAddr().(*net.UDPAddr), c.LocalAddr().(*net.UDPAddr)
+		if au.IP.Equal(bu.IP) || !au.IP.Equal(cu.IP) || au.Port == cu.Port {
+			t.Fatalf("host 0: %v and %v, host 1: %v", au, cu, bu)
+		}
+		dSend(t, b, []byte("from b"), peerB)
+		d, from := dRecv(t, sock)
+		flow, rest := hFlow(t, d)
+		if string(rest) != "from b" || from != b.LocalAddr() {
+			t.Fatalf("socket read %q from %v", rest, from)
+		}
+		dSend(t, sock, hWire(flow, []byte("to b")), from)
+		if got, _ := dRecv(t, b); string(got) != "to b" {
+			t.Fatalf("b read %q", got)
+		}
+		h.Rebind(1) // b, in Dial order
+		dSend(t, b, []byte("moved"), peerB)
+		if _, moved := dRecv(t, sock); !moved.(*net.UDPAddr).IP.Equal(bu.IP) || moved.(*net.UDPAddr).Port == bu.Port {
+			t.Fatalf("b moved from %v to %v, want a new port of host 1", bu, moved)
+		}
+		got := dCollect(sock, 1<<30)
+		h.Flood(1000, FloodMix{Random: 1, Preface: 1, Join: 1})
+		time.Sleep(100 * time.Millisecond)
+		synctest.Wait()
+		h.Close()
+		host0 := 0
+		for _, x := range got() {
+			switch u := x.from.(*net.UDPAddr); {
+			case u.IP.Equal(bu.IP):
+				t.Fatalf("a flood datagram came from host 1: %v", u)
+			case u.IP.Equal(au.IP):
+				host0++
+			}
+		}
+		if host0 == 0 {
+			t.Fatal("no flood datagram came from host 0")
+		}
+		for _, n := range []int{-1, 256} {
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatalf("DialFrom(%d) did not panic", n)
+					}
+				}()
+				h.DialFrom(n)
+			}()
+		}
+	})
+}
+
 // TestDatagramHubLossDelayQueue: SetDelay and SetLoss act per direction on
 // every client; each client and direction holds at most Queue datagrams
 // that were written and not yet read (more are lost); the passive socket

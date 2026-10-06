@@ -34,8 +34,9 @@ type DatagramHubConfig struct {
 // bubbles.
 //
 // Addresses: the passive socket has one address; every client has a port
-// of one shared client IP address (one dialing host), and the address
-// under which the passive sees it can move (Rebind). A client conn drops
+// of its dialing host's IP address — Dial's clients share host 0's,
+// DialFrom(n)'s host n's — and the address under which the passive sees it
+// can move (Rebind). A client conn drops
 // what arrives with another flow ID, and a datagram the passive sends to
 // an address no client has (any longer) is lost. MTU applies to the
 // datagram on the wire, flow header included: a client conn refuses a
@@ -95,6 +96,7 @@ const (
 type hclient struct {
 	h     *DatagramHub
 	ep    *endpoint
+	host  int // its dialing host (its IP address)
 	flow  uint64
 	hdr   [wire.FlowHeaderLen]byte
 	ext   *net.UDPAddr // where the passive sees it (moved by Rebind)
@@ -134,9 +136,28 @@ func NewDatagramHub(cfg DatagramHubConfig) *DatagramHub {
 // rendr.FromPacketConn).
 func (h *DatagramHub) PacketConn() net.PacketConn { return h.sock }
 
-// Dial is a rendr.DatagramCarrier.Dial: a new client endpoint, returned
-// with the passive socket's address. Its flow ID is fresh and never 0.
+// Dial is a rendr.DatagramCarrier.Dial: a new client endpoint of dialing
+// host 0, returned with the passive socket's address. Its flow ID is fresh
+// and never 0.
 func (h *DatagramHub) Dial(ctx context.Context) (net.PacketConn, net.Addr, error) {
+	return h.dial(ctx, 0)
+}
+
+// DialFrom returns a Dial whose clients belong to dialing host n (0–255):
+// the clients of one host share its IP address. Host 0 is Dial's and the
+// address a Flood's first share comes from, so a session dialled from
+// another host takes no room in the per-source OPEN quota that share fills
+// (R1-21: a new DialPacket while the victim's own address is flooded). It
+// panics for another n.
+func (h *DatagramHub) DialFrom(n int) func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+	if n < 0 || n > 255 {
+		panic("rendrtest: DialFrom: no such host")
+	}
+	return func(ctx context.Context) (net.PacketConn, net.Addr, error) { return h.dial(ctx, n) }
+}
+
+// dial creates a client of host.
+func (h *DatagramHub) dial(ctx context.Context, host int) (net.PacketConn, net.Addr, error) {
 	n := h.n
 	n.dials.Add(1)
 	if err := ctx.Err(); err != nil {
@@ -149,7 +170,7 @@ func (h *DatagramHub) Dial(ctx context.Context) (net.PacketConn, net.Addr, error
 		n.dialFails.Add(1)
 		return nil, nil, net.ErrClosed
 	}
-	c := &hclient{h: h, kind: kindUnknown, flow: h.newFlow()}
+	c := &hclient{h: h, host: host, kind: kindUnknown, flow: h.newFlow()}
 	wire.PutFlowHeader(c.hdr[:], c.flow)
 	h.move(c)
 	c.ep = n.newEndpoint(c.ext, Down.index(), 0, &c.kind, c)
@@ -167,15 +188,21 @@ func (h *DatagramHub) newFlow() uint64 {
 	}
 }
 
-// move gives c a fresh address on the clients' IP address and maps it;
-// the old one stays mapped to c, so that a reply to it is counted as c's
-// loss. n.mu held.
+// move gives c a fresh address on its host's IP address and maps it; the
+// old one stays mapped to c, so that a reply to it is counted as c's loss.
+// n.mu held.
 func (h *DatagramHub) move(c *hclient) {
-	a := fakeAddr(hubClientPool, h.ports%(floodPortBase-2000))
+	a := hostAddr(c.host, 2000+h.ports%(floodPortBase-2000))
 	h.ports++
 	ap, _ := apOf(a)
 	h.addrs[ap] = c
 	c.ext = a
+}
+
+// hostAddr is the given port of dialing host n's IP address.
+func hostAddr(n, port int) *net.UDPAddr {
+	ip := netip.AddrFrom4([4]byte{127, hubClientPool, 0, byte(n)})
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 }
 
 func (c *hclient) first(_ *endpoint, p []byte) {
@@ -328,12 +355,13 @@ type FloodMix struct {
 // never comes from the clients' IP address — it takes the next foreign one
 // instead — because a per-source quota cannot tell a flood's JOINs from a
 // client's own (R1-21 floods the victim's address with OPENs, and its JOIN
-// must still pass). Every client shares that address: once the flood's
-// OPENs fill its per-source OPEN quota at a FromPacketConn listener (an
-// Accept that takes no session keeps it full), the OPEN of a new session
-// dialled through the hub is dropped like the flood's surplus OPENs until
-// the quota has room, while JOINs and probes, which have their own quota,
-// pass.
+// must still pass). Every client of host 0 shares that address: once the
+// flood's OPENs fill its per-source OPEN quota at a FromPacketConn listener
+// (an Accept that takes no session keeps it full), the OPEN of a new
+// session dialled from host 0 is dropped like the flood's surplus OPENs
+// until the quota has room, while JOINs and probes, which have their own
+// quota, pass; a session dialled from another host (DialFrom) is outside
+// that quota.
 //
 // The datagrams arrive at once and count as Spoofed; while the passive
 // socket holds Queue foreign datagrams, new ones are dropped uncounted
@@ -403,7 +431,7 @@ func (h *DatagramHub) floodLoop(f *hflood, rate float64, mix FloodMix, rng *rand
 }
 
 // floodAddr hands out the next flood source address: groups 0–3 in turn,
-// group 0 on the clients' IP address — a valid JOIN takes the next of
+// group 0 on host 0's IP address — a valid JOIN takes the next of
 // groups 1–3 instead (see Flood). n.mu held.
 func (h *DatagramHub) floodAddr(join bool) *net.UDPAddr {
 	g := h.fsent % 4
@@ -415,10 +443,7 @@ func (h *DatagramHub) floodAddr(join bool) *net.UDPAddr {
 	k := h.floodSrc[g]
 	h.floodSrc[g]++
 	if g == 0 {
-		c := fakeAddr(hubClientPool, 0)
-		ap, _ := apOf(c)
-		port := floodPortBase + k%(65536-floodPortBase)
-		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(ap.Addr(), uint16(port)))
+		return hostAddr(0, floodPortBase+k%(65536-floodPortBase))
 	}
 	ip := netip.AddrFrom4([4]byte{127, hubFloodPool, 0, byte(g)})
 	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(2000+k%60000)))
