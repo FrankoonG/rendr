@@ -63,7 +63,10 @@ type Timing struct {
 	Segment            int           // largest DATA payload a sender puts in one frame (64 KiB)
 
 	// M2: datagram carriers (M2-D16, M2-D23, M2-D24). Zero selects the
-	// default (withDefaults).
+	// default (withDefaults). The REL and H1 timeout is
+	// sched.RTOWithin(srtt, rttvar, sampled, RelRTOInit, RelRTOMin,
+	// RelRTOMax), its n-th retransmission's sched.RTOBackoffWithin(rto, n,
+	// RelRTOMax).
 	PacketPing    time.Duration // PING cadence of a packet-active datagram carrier (1 s)
 	PacketActive  time.Duration // a DGRAM written or read within this keeps a carrier packet-active (PingIdle, 10 s)
 	RelRTOInit    time.Duration // REL and H1 timeout before the first RTT sample (300 ms)

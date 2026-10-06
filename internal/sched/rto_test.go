@@ -22,7 +22,7 @@ const (
 // same frame doubles the timeout up to 2 s, so a frame lost for good is
 // sent at 0, 0.3, 0.9, 2.1, 4.1, 6.1, 8.1 s (the H1 schedule of the M2
 // design §A5.10) and never more often than every 2 s after that. The same
-// rule holds with the bounds as arguments (rtoWithin, rtoBackoffWithin):
+// rule holds with the bounds as arguments (RTOWithin, RTOBackoffWithin):
 // the REL timer takes them from carrier.Timing, whose RelRTOInit,
 // RelRTOMin and RelRTOMax test hooks may shrink (M2-D16).
 func TestRTO_L12(t *testing.T) {
@@ -174,13 +174,13 @@ func TestRTO_L12(t *testing.T) {
 		{"both maximal", maxDur, maxDur, tHi, true},
 		{"negative counts as 0", minDur, minDur, tLo, true},
 	} {
-		if got := rtoWithin(tc.srtt, tc.rttvar, tc.sampled, tInit, tLo, tHi); got != tc.want {
-			t.Errorf("Timing bounds, %s: rtoWithin(%v, %v, sampled %v) = %v, want %v", tc.name, tc.srtt, tc.rttvar, tc.sampled, got, tc.want)
+		if got := RTOWithin(tc.srtt, tc.rttvar, tc.sampled, tInit, tLo, tHi); got != tc.want {
+			t.Errorf("Timing bounds, %s: RTOWithin(%v, %v, sampled %v) = %v, want %v", tc.name, tc.srtt, tc.rttvar, tc.sampled, got, tc.want)
 		}
 	}
 	for _, initial := range []time.Duration{ms, 5 * time.Second} { // the configured value, inside the clamp or not
-		if got := rtoWithin(400*ms, 50*ms, false, initial, tLo, tHi); got != initial {
-			t.Errorf("Timing bounds: rtoWithin(unsampled, initial %v) = %v", initial, got)
+		if got := RTOWithin(400*ms, 50*ms, false, initial, tLo, tHi); got != initial {
+			t.Errorf("Timing bounds: RTOWithin(unsampled, initial %v) = %v", initial, got)
 		}
 	}
 	for _, tc := range []struct {
@@ -193,8 +193,8 @@ func TestRTO_L12(t *testing.T) {
 		{300 * ms, 0, tHi}, {maxDur, 0, tHi}, {1, 63, tHi}, {1, math.MaxInt, tHi},
 		{tInit, -1, tInit}, {0, 3, 0}, {-ms, 3, -ms},
 	} {
-		if got := rtoBackoffWithin(tc.rto, tc.n, tHi); got != tc.want {
-			t.Errorf("Timing bounds: rtoBackoffWithin(%v, %d, %v) = %v, want %v", tc.rto, tc.n, tHi, got, tc.want)
+		if got := RTOBackoffWithin(tc.rto, tc.n, tHi); got != tc.want {
+			t.Errorf("Timing bounds: RTOBackoffWithin(%v, %d, %v) = %v, want %v", tc.rto, tc.n, tHi, got, tc.want)
 		}
 	}
 	// A cap near the int64 limit: the doubling saturates exactly there.
@@ -205,16 +205,16 @@ func TestRTO_L12(t *testing.T) {
 	}{
 		{1, 62, 1 << 62}, {1, 63, maxDur}, {2, 61, 1 << 62}, {2, 62, maxDur}, {maxDur, 0, maxDur}, {maxDur, 1, maxDur},
 	} {
-		if got := rtoBackoffWithin(tc.rto, tc.n, maxDur); got != tc.want {
-			t.Errorf("rtoBackoffWithin(%d, %d, max) = %d, want %d", tc.rto, tc.n, got, tc.want)
+		if got := RTOBackoffWithin(tc.rto, tc.n, maxDur); got != tc.want {
+			t.Errorf("RTOBackoffWithin(%d, %d, max) = %d, want %d", tc.rto, tc.n, got, tc.want)
 		}
 	}
 	var at time.Duration // a frame lost for good under the shrunk bounds
 	var tenfold []time.Duration
-	rto := rtoWithin(40*ms, 5*ms, false, tInit, tLo, tHi)
+	rto := RTOWithin(40*ms, 5*ms, false, tInit, tLo, tHi)
 	for k := 0; k < 6; k++ {
 		tenfold = append(tenfold, at)
-		at += rtoBackoffWithin(rto, k, tHi)
+		at += RTOBackoffWithin(rto, k, tHi)
 	}
 	if want := []time.Duration{0, 30 * ms, 90 * ms, 210 * ms, 410 * ms, 610 * ms}; !slices.Equal(tenfold, want) {
 		t.Errorf("Timing bounds, before any sample: copies at %v, want %v", tenfold, want)
@@ -238,16 +238,16 @@ func TestRTO_L12(t *testing.T) {
 		default:
 			want = time.Duration(sum.Int64())
 		}
-		if got := rtoWithin(srtt, rttvar, true, tInit, lo, hi); got != want {
-			t.Fatalf("rtoWithin(%d, %d, [%d, %d]) = %d, want %d", srtt, rttvar, lo, hi, got, want)
+		if got := RTOWithin(srtt, rttvar, true, tInit, lo, hi); got != want {
+			t.Fatalf("RTOWithin(%d, %d, [%d, %d]) = %d, want %d", srtt, rttvar, lo, hi, got, want)
 		}
 		b, n := max(randDur(r), 1), r.IntN(70)
 		bw := new(big.Int).Lsh(big.NewInt(int64(b)), uint(n))
 		if bw.Cmp(big.NewInt(int64(hi))) > 0 {
 			bw.SetInt64(int64(hi))
 		}
-		if got := rtoBackoffWithin(b, n, hi); int64(got) != bw.Int64() {
-			t.Fatalf("rtoBackoffWithin(%d, %d, %d) = %d, want %d", b, n, hi, got, bw.Int64())
+		if got := RTOBackoffWithin(b, n, hi); int64(got) != bw.Int64() {
+			t.Fatalf("RTOBackoffWithin(%d, %d, %d) = %d, want %d", b, n, hi, got, bw.Int64())
 		}
 	}
 }

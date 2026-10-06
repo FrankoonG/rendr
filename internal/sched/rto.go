@@ -20,7 +20,7 @@ const (
 // A negative srtt or rttvar, which no estimator produces, counts as 0, and
 // the sum cannot overflow: the result always lies in [RTOMin, RTOMax].
 func RTO(srtt, rttvar time.Duration, sampled bool) time.Duration {
-	return rtoWithin(srtt, rttvar, sampled, RTOInitial, RTOMin, RTOMax)
+	return RTOWithin(srtt, rttvar, sampled, RTOInitial, RTOMin, RTOMax)
 }
 
 // RTOBackoff returns min(rto·2ⁿ, RTOMax): the timeout of the n-th
@@ -30,18 +30,19 @@ func RTO(srtt, rttvar time.Duration, sampled bool) time.Duration {
 // counts as 0; a non-positive rto, which RTO never returns, has nothing to
 // double and is returned unchanged.
 func RTOBackoff(rto time.Duration, n int) time.Duration {
-	return rtoBackoffWithin(rto, n, RTOMax)
+	return RTOBackoffWithin(rto, n, RTOMax)
 }
 
-// rtoWithin is RTO with the timeout before the first sample (initial) and
+// RTOWithin is RTO with the timeout before the first sample (initial) and
 // the clamp [lo, hi] as arguments; RTO passes RTOInitial, RTOMin and
-// RTOMax. The REL timer of a datagram carrier applies the same rule with
+// RTOMax. The REL and handshake timers of a datagram carrier call it with
 // carrier.Timing's RelRTOInit, RelRTOMin and RelRTOMax, which default to
-// those values and which test hooks may shrink (M2-D16). initial is
-// returned as it is; otherwise the result is min(max(srtt + 4·rttvar, lo),
-// hi) of the exact sum, which lies in [lo, hi] whenever lo ≤ hi (Timing
-// guarantees RelRTOMin ≤ RelRTOMax).
-func rtoWithin(srtt, rttvar time.Duration, sampled bool, initial, lo, hi time.Duration) time.Duration {
+// those values and which test hooks may shrink (M2-D16), so the carrier
+// and these tests share one formula. initial is returned as it is;
+// otherwise the result is min(max(srtt + 4·rttvar, lo), hi) of the exact
+// sum, which lies in [lo, hi] whenever lo ≤ hi (Timing guarantees
+// RelRTOMin ≤ RelRTOMax).
+func RTOWithin(srtt, rttvar time.Duration, sampled bool, initial, lo, hi time.Duration) time.Duration {
 	if !sampled {
 		return initial
 	}
@@ -56,11 +57,11 @@ func rtoWithin(srtt, rttvar time.Duration, sampled bool, initial, lo, hi time.Du
 	return min(max(srtt+4*rttvar, lo), hi)
 }
 
-// rtoBackoffWithin is RTOBackoff with the cap hi as an argument:
+// RTOBackoffWithin is RTOBackoff with the cap hi as an argument:
 // min(rto·2ⁿ, hi), exact for every n (RTOBackoff passes RTOMax; the REL
-// timer RelRTOMax). A negative n counts as 0; a non-positive rto is
-// returned unchanged.
-func rtoBackoffWithin(rto time.Duration, n int, hi time.Duration) time.Duration {
+// and handshake timers carrier.Timing's RelRTOMax). A negative n counts as
+// 0; a non-positive rto is returned unchanged.
+func RTOBackoffWithin(rto time.Duration, n int, hi time.Duration) time.Duration {
 	if rto <= 0 {
 		return rto
 	}
