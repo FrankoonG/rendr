@@ -752,7 +752,10 @@ func TestDatagramLinkBlackhole(t *testing.T) {
 // not arrived when it began arrives, WriteTo keeps returning, at most Queue
 // datagrams wait (the rest are lost) — and the release delivers the
 // datagrams whose arrival time passed at once and transmits the waiting
-// ones from then on, at the rate; the other direction is not held.
+// ones from then on, at the rate; the other direction is not held. Every
+// datagram the stall held is counted: written while held, or on its way
+// with an arrival time inside the stall. A second Stall(on) does not move
+// the stall's start.
 func TestDatagramLinkStall(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newDRig(t, DatagramLinkConfig{Name: "stall", Queue: 4})
@@ -777,6 +780,9 @@ func TestDatagramLinkStall(t *testing.T) {
 			t.Fatalf("after the release: %d at %v, %d at %v; want 1 at 100ms, 2 at 110ms",
 				as[0].b[0], as[0].at.Sub(start), as[1].b[0], as[1].at.Sub(start))
 		}
+		if held := r.l.n.ctr[0][dcHeld].Load(); held != 2 {
+			t.Fatalf("held %d, want 2: datagram 1 (on its way, due inside the stall) and datagram 2 (written while held)", held)
+		}
 
 		r.l.SetDelay(Up, 0, 0)
 		r.l.SetRate(Up, 1000)
@@ -796,6 +802,19 @@ func TestDatagramLinkStall(t *testing.T) {
 		dNothing(t, c.srv, time.Second)
 		if st := r.l.Stats().All; st.Lost != 2 || st.Delivered != 7 {
 			t.Fatalf("Lost %d, Delivered %d; want 2 (beyond Queue), 7", st.Lost, st.Delivered)
+		}
+
+		r.l.SetRate(Up, 0)
+		r.l.SetDelay(Up, 10*time.Millisecond, 0)
+		c.up(t, []byte{20}) // due in 10 ms
+		time.Sleep(5 * time.Millisecond)
+		r.l.Stall(Up, true)
+		time.Sleep(15 * time.Millisecond)
+		r.l.Stall(Up, true) // again, after the datagram's arrival time: still held
+		dNothing(t, c.srv, 50*time.Millisecond)
+		r.l.Stall(Up, false)
+		if got, _ := dRecv(t, c.srv); got[0] != 20 {
+			t.Fatalf("after the release: %d, want 20", got[0])
 		}
 	})
 }
@@ -890,6 +909,92 @@ func TestDatagramLinkQueueBound(t *testing.T) {
 			t.Fatalf("Lost %d, Duplicated %d; want 4, 5 (copies only where they fit)", st.Lost, st.Duplicated)
 		}
 	})
+}
+
+// TestDatagramLinkClosedReceiverLoses: a datagram whose receiving conn is
+// closed — on its way when the conn closes, or written afterwards, which is
+// UDP to a closed port — is lost and counted and gives back, or never
+// takes, its room in the queue the link's carriers share: another
+// carrier's datagram still fits a queue of one.
+func TestDatagramLinkClosedReceiverLoses(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newDRig(t, DatagramLinkConfig{Name: "closed-receiver", Queue: 1})
+		defer r.l.Close()
+		a, b := r.dial(), r.dial()
+		r.l.SetDelay(Up, 10*time.Millisecond, 0)
+		a.up(t, []byte{1}) // on its way when its receiver closes
+		if err := a.srv.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		for range 3 {
+			a.up(t, []byte{2}) // WriteTo succeeds, as UDP to a closed port
+		}
+		b.up(t, []byte{3})
+		if got, _ := dRecv(t, b.srv); got[0] != 3 {
+			t.Fatalf("got %d, want 3", got[0])
+		}
+		if st := r.l.Stats().All; st.Sent != 5 || st.Lost != 4 || st.Delivered != 1 {
+			t.Fatalf("Sent %d, Lost %d, Delivered %d; want 5, 4, 1", st.Sent, st.Lost, st.Delivered)
+		}
+	})
+}
+
+// TestDatagramLinkAcceptFailure: when Accept fails, or is nil, the link
+// closes the passive end: its reads fail with net.ErrClosed, and what the
+// dialer sends to it is lost (counted) without holding room in the queue;
+// with a failing Accept, a later accepted carrier's datagram still fits a
+// queue of one.
+func TestDatagramLinkAcceptFailure(t *testing.T) {
+	for _, nilAccept := range []bool{false, true} {
+		name := map[bool]string{false: "error", true: "nil"}[nilAccept]
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				acc := make(chan dAccept, 2)
+				verdicts := make(chan error, 2) // Accept's results, in call order
+				verdicts <- errors.New("refused")
+				verdicts <- nil
+				cfg := DatagramLinkConfig{Name: "accept-" + name, Queue: 1}
+				if !nilAccept {
+					cfg.Accept = func(pc net.PacketConn, peer net.Addr) error {
+						acc <- dAccept{pc, peer}
+						return <-verdicts
+					}
+				}
+				l := NewDatagramLink(cfg)
+				defer l.Close()
+				cli, peer, err := l.Dial(context.Background())
+				if err != nil {
+					t.Fatalf("Dial: %v", err)
+				}
+				synctest.Wait() // the Accept call returned
+				if !nilAccept {
+					refused := (<-acc).pc
+					refused.SetReadDeadline(time.Now().Add(time.Second)) // an error once closed
+					if _, _, err := refused.ReadFrom(make([]byte, 8)); !errors.Is(err, net.ErrClosed) {
+						t.Fatalf("the refused passive end reads: %v, want net.ErrClosed", err)
+					}
+				}
+				for range 3 {
+					dSend(t, cli, []byte{1}, peer)
+				}
+				if st := l.Stats().All; st.Sent != 3 || st.Lost != 3 {
+					t.Fatalf("Sent %d, Lost %d; want 3, 3", st.Sent, st.Lost)
+				}
+				if nilAccept {
+					return
+				}
+				cli2, peer2, err := l.Dial(context.Background())
+				if err != nil {
+					t.Fatalf("second Dial: %v", err)
+				}
+				srv2 := (<-acc).pc
+				dSend(t, cli2, []byte{2}, peer2)
+				if got, _ := dRecv(t, srv2); got[0] != 2 {
+					t.Fatalf("got %d, want 2", got[0])
+				}
+			})
+		})
+	}
 }
 
 // TestDatagramLinkDropNext_L12: DropNext drops the next n datagrams of its
@@ -1029,7 +1134,8 @@ func TestDatagramLinkCorruptNext_L43(t *testing.T) {
 // TestDatagramLinkInjectRaw: InjectRaw delivers a datagram on the newest
 // carrier at once, from its other end's address, untouched by the path —
 // through a delay, a blackhole and a stall — and counted; without a
-// carrier it does nothing.
+// carrier, or toward a receiving end that is closed, it does nothing (no
+// count, no room taken in the queue).
 func TestDatagramLinkInjectRaw(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newDRig(t, DatagramLinkConfig{Name: "inject"})
@@ -1054,6 +1160,18 @@ func TestDatagramLinkInjectRaw(t *testing.T) {
 		dNothing(t, a.srv, time.Second)
 		if st := r.l.Stats().All; st.Injected != 2 || st.Delivered != 2 || st.Sent != 0 {
 			t.Fatalf("Injected %d, Delivered %d, Sent %d", st.Injected, st.Delivered, st.Sent)
+		}
+		b.srv.Close()
+		r.l.InjectRaw(Up, []byte("to a closed end"))
+		r.l.InjectRaw(Down, []byte("down again")) // the other end still receives
+		if got, _ := dRecv(t, b.cli); string(got) != "down again" {
+			t.Fatalf("got %q", got)
+		}
+		r.l.n.mu.Lock()
+		queued := r.l.queued
+		r.l.n.mu.Unlock()
+		if st := r.l.Stats().All; st.Injected != 3 || st.Lost != 0 || queued != [2]int{} {
+			t.Fatalf("Injected %d, Lost %d, queued %v; want 3, 0, none", st.Injected, st.Lost, queued)
 		}
 	})
 }
@@ -1333,6 +1451,28 @@ func TestDatagramLinkDialBehaviours_L51(t *testing.T) {
 			}
 			return true
 		}},
+		{"hang-release", 0, func(t *testing.T, r *dRig) bool {
+			r.l.SetDialBehavior(DialHang)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := r.l.Dial(ctx)
+				done <- err
+			}()
+			time.Sleep(time.Hour)
+			select {
+			case err := <-done:
+				t.Fatalf("hanging dial returned %v before Release", err)
+			default:
+			}
+			r.l.Release()
+			start := time.Now()
+			if err := <-done; !errors.Is(err, errReleased) || time.Since(start) != 0 {
+				t.Fatalf("released dial: %v after %v, want errReleased at once", err, time.Since(start))
+			}
+			return true
+		}},
 		{"hang-forever", 0, func(t *testing.T, r *dRig) bool {
 			r.l.SetDialBehavior(DialHangForever)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -1489,6 +1629,29 @@ func TestDatagramLinkCloseJoins(t *testing.T) {
 		}
 		if st := r.l.Stats().All; st.Lost != 2 || st.Sent != 2 {
 			t.Fatalf("Lost %d, Sent %d; want 2, 2", st.Lost, st.Sent)
+		}
+	})
+}
+
+// TestDatagramLinkCloseJoinsAccept: Close returns only after every Accept
+// call the link started has returned, however long it takes.
+func TestDatagramLinkCloseJoinsAccept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		returned := make(chan struct{})
+		l := NewDatagramLink(DatagramLinkConfig{Name: "close-accept", Accept: func(net.PacketConn, net.Addr) error {
+			time.Sleep(time.Second)
+			close(returned)
+			return nil
+		}})
+		if _, _, err := l.Dial(context.Background()); err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		start := time.Now()
+		l.Close()
+		closed := time.Since(start)
+		<-returned // a Close that did not join must still let the bubble end clean
+		if closed != time.Second {
+			t.Fatalf("Close returned after %v, want 1s: it must join the Accept call it started", closed)
 		}
 	})
 }

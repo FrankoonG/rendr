@@ -293,6 +293,7 @@ func mustHeader(t *testing.T, f []byte) wire.Header {
 func TestDatagramHubFlood_L58(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := NewDatagramHub(DatagramHubConfig{Name: "flood", Queue: 4096})
+		defer h.Close() // a failed assertion must not leave a flood running in the bubble
 		sock := h.PacketConn()
 		a, _ := hDial(t, h)
 		client := a.LocalAddr().(*net.UDPAddr)
@@ -308,6 +309,9 @@ func TestDatagramHubFlood_L58(t *testing.T) {
 		h.Flood(5000, FloodMix{}) // left running: Close stops it
 		h.Flood(0, FloodMix{})()  // no rate: nothing
 		time.Sleep(10 * time.Millisecond)
+		// The flood's timer fires at this instant too: let its batch in and the
+		// collector read it, or Close would drop datagrams already Spoofed.
+		synctest.Wait()
 		h.Close()
 		as := got()
 		if n := h.Stats().Spoofed; len(as) != int(n) || n <= 1000 {
@@ -347,7 +351,10 @@ func TestDatagramHubFlood_L58(t *testing.T) {
 
 // TestDatagramHubLossDelayQueue: SetDelay and SetLoss act per direction on
 // every client; each client and direction holds at most Queue datagrams
-// that were written and not yet read (more are lost).
+// that were written and not yet read (more are lost); the passive socket
+// holds at most Queue foreign datagrams nobody has read — more are dropped,
+// uncounted for a Spoof, as the client's loss for a Replay — and reading
+// frees room.
 func TestDatagramHubLossDelayQueue(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := NewDatagramHub(DatagramHubConfig{Name: "path", Queue: 4})
@@ -387,6 +394,27 @@ func TestDatagramHubLossDelayQueue(t *testing.T) {
 		dNothing(t, sock, time.Second)
 		if st := h.Stats().All; st.Lost != 2+2 || st.Delivered != 2+5 {
 			t.Fatalf("Lost %d, Delivered %d; want 4, 7", st.Lost, st.Delivered)
+		}
+
+		for i := range 6 {
+			h.Spoof([]byte{byte(i)})
+		}
+		h.Replay(0, 0)
+		if st := h.Stats(); st.Spoofed != 4 || st.All.Injected != 1 || st.All.Lost != 4+1 {
+			t.Fatalf("socket full: Spoofed %d, Injected %d, Lost %d; want 4, 1, 5", st.Spoofed, st.All.Injected, st.All.Lost)
+		}
+		for i := range 4 {
+			if got, _ := dRecv(t, sock); got[0] != byte(i) {
+				t.Fatalf("foreign datagram %d is %d", i, got[0])
+			}
+		}
+		dNothing(t, sock, time.Second)
+		h.Replay(0, 0)
+		if got, _ := dRecv(t, sock); !bytes.Equal(got, hWire(flow, []byte("up"))) {
+			t.Fatalf("replay after reading: %x", got)
+		}
+		if st := h.Stats(); st.Spoofed != 5 || st.All.Injected != 2 || st.All.Lost != 5 {
+			t.Fatalf("after reading: Spoofed %d, Injected %d, Lost %d; want 5, 2, 5", st.Spoofed, st.All.Injected, st.All.Lost)
 		}
 	})
 }

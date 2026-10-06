@@ -15,9 +15,13 @@ import (
 
 // DatagramHubConfig configures a DatagramHub.
 type DatagramHubConfig struct {
-	Name  string
-	MTU   int // largest datagram (default 65,507)
-	Queue int // datagrams queued per client and direction (default 1024)
+	Name string
+	MTU  int // largest datagram (default 65,507)
+	// Queue bounds the datagrams of each client and direction (default
+	// 1024) from WriteTo until a reader takes them, transit included, and
+	// the foreign datagrams (Spoof, Replay, Flood) the passive socket holds
+	// unread; more are dropped.
+	Queue int
 }
 
 // DatagramHub is an in-memory shared datagram socket (M2 design §A8.1):
@@ -44,6 +48,10 @@ type DatagramHubConfig struct {
 // foreign address (Spoof, Replay, Flood), and a Replay also counts as
 // Injected in the class of the client it repeats. Spoof and Flood
 // datagrams belong to no class.
+//
+// Memory: for Replay the hub keeps the first 16 datagrams each client sent,
+// and every address a client had, for as long as it lives: up to 16 × MTU
+// bytes per client (under 20 KiB at carrier/udp's 1232-byte datagrams).
 //
 // Create a DatagramHub inside the synctest bubble that uses it; Close it
 // before the bubble ends.
@@ -320,11 +328,17 @@ type FloodMix struct {
 // never comes from the clients' IP address — it takes the next foreign one
 // instead — because a per-source quota cannot tell a flood's JOINs from a
 // client's own (R1-21 floods the victim's address with OPENs, and its JOIN
-// must still pass). The datagrams
-// arrive at once and count as Spoofed; while the passive socket holds
-// Queue foreign datagrams, new ones are dropped uncounted (and a flood
-// sends at most Queue datagrams per millisecond). stop waits until the
-// flood's goroutine exited (Close stops every flood).
+// must still pass). Every client shares that address: once the flood's
+// OPENs fill its per-source OPEN quota at a FromPacketConn listener (an
+// Accept that takes no session keeps it full), the OPEN of a new session
+// dialled through the hub is dropped like the flood's surplus OPENs until
+// the quota has room, while JOINs and probes, which have their own quota,
+// pass.
+//
+// The datagrams arrive at once and count as Spoofed; while the passive
+// socket holds Queue foreign datagrams, new ones are dropped uncounted
+// (and a flood sends at most Queue datagrams per millisecond). stop waits
+// until the flood's goroutine exited (Close stops every flood).
 func (h *DatagramHub) Flood(rate float64, mix FloodMix) (stop func()) {
 	n := h.n
 	n.mu.Lock()

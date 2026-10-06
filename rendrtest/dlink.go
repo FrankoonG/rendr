@@ -46,7 +46,14 @@ type DatagramLinkConfig struct {
 	// larger WriteTo is refused (MTURefuse) until SetMTU chooses otherwise.
 	MTU int
 	// Queue is how many datagrams per direction may wait in the link
-	// (default 1024); more are tail-dropped and counted as lost.
+	// (default 1024); more are tail-dropped and counted as lost. The bound
+	// is shared by every carrier of the link and holds a datagram from its
+	// WriteTo until a reader takes it: held by a stall, waiting at the rate
+	// bottleneck, on its way (delay) or arrived and unread. A direction
+	// thus carries at most Queue datagrams per one-way delay (the default:
+	// about 10,000 per second at 100 ms), and the datagrams waiting at a
+	// conn that nobody reads take room from every carrier until that conn
+	// is closed: give high-rate or long-delay scenarios a larger Queue.
 	Queue int
 }
 
@@ -75,6 +82,10 @@ type DatagramLinkConfig struct {
 // Counters without a field of their own: Stall shows in arrival times,
 // Kill in Lost (the datagrams it lost) and in the conns' errors, CaptureNext
 // in its channel.
+//
+// Queue (DatagramLinkConfig) bounds each direction over all carriers, from
+// WriteTo to the reader, transit included: datagrams per second × one-way
+// delay must stay well below it, or the link tail-drops on its own.
 //
 // Accounting, per class: Sent + Duplicated + Injected = Delivered +
 // Truncated + Lost + the datagrams still in the link. Sent counts the

@@ -117,9 +117,10 @@ func TestPacketVerifier_L36_L39(t *testing.T) {
 }
 
 // TestPacketGen_L40: PacketGen sends Count test datagrams on an absolute
-// schedule at Rate (or back to back), never closes pc, records every result
-// and the longest WriteTo, keeps going after a refused datagram and stops
-// once the conn is closed.
+// schedule at Rate (a slow WriteTo does not shift the later datagrams) or
+// back to back, never closes pc, records every result and the longest
+// WriteTo, keeps going after a refused datagram and stops once the conn is
+// closed.
 func TestPacketGen_L40(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newDRig(t, DatagramLinkConfig{Name: "gen"})
@@ -143,6 +144,16 @@ func TestPacketGen_L40(t *testing.T) {
 		start = time.Now()
 		if res := PacketGen(PacketGenConfig{Seed: 3, Size: 30, Count: 50}, c.cli, c.srvAddr); res.Sent != 50 || time.Since(start) != 0 {
 			t.Fatalf("back to back: %+v after %v", res, time.Since(start))
+		}
+		slow := &slowPC{d: 5 * time.Millisecond} // each WriteTo takes half the 10-ms period
+		start = time.Now()
+		if res := PacketGen(PacketGenConfig{Size: 30, Count: 5, Rate: 100}, slow, fakeAddr(5, 1)); res.Sent != 5 || res.MaxWrite != 5*time.Millisecond {
+			t.Fatalf("slow conn: %+v", res)
+		}
+		for k, at := range slow.calls {
+			if d := at.Sub(start); d != time.Duration(k)*10*time.Millisecond {
+				t.Fatalf("slow conn: datagram %d written after %v, want %v (the schedule is absolute)", k, d, time.Duration(k)*10*time.Millisecond)
+			}
 		}
 		r.l.SetMTU(100, MTURefuse)
 		if res := PacketGen(PacketGenConfig{Size: 200, Count: 3}, c.cli, c.srvAddr); res.Sent != 0 || res.Errors != 3 || !errors.Is(res.FirstErr, wire.ErrDatagramTooLarge) {
@@ -209,6 +220,19 @@ func (s *scriptPC) LocalAddr() net.Addr              { return fakeAddr(5, 2) }
 func (s *scriptPC) SetDeadline(time.Time) error      { return nil }
 func (s *scriptPC) SetReadDeadline(time.Time) error  { return nil }
 func (s *scriptPC) SetWriteDeadline(time.Time) error { return nil }
+
+// slowPC is a scriptPC whose WriteTo takes d and records when it was called.
+type slowPC struct {
+	scriptPC
+	d     time.Duration
+	calls []time.Time
+}
+
+func (s *slowPC) WriteTo(p []byte, _ net.Addr) (int, error) {
+	s.calls = append(s.calls, time.Now())
+	time.Sleep(s.d)
+	return len(p), nil
+}
 
 // TestPacketBehaviours_L64: PacketEcho returns every datagram to its
 // source — after the peer's FIN closed its writes it keeps reading to the
