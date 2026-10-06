@@ -41,10 +41,6 @@ const (
 	compactReady      = 1024    // ready FIFO head that triggers a compaction
 )
 
-// errWSAEMSGSIZE is Windows' WSAEMSGSIZE, which rendr classifies by number
-// on every OS (M2 design Revision 1, R1-28).
-const errWSAEMSGSIZE = syscall.Errno(10040)
-
 // errMissingAddress is what net.UDPConn.WriteTo returns for a nil
 // *net.UDPAddr.
 var errMissingAddress = errors.New("missing address")
