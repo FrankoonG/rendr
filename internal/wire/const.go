@@ -63,9 +63,10 @@ const (
 	// PREFACE_ACK that opened it (design §0.13 A6) unless a test preset
 	// fixes it.
 	FirstFseq uint32 = 1
-	// SessionHandle is the handle every session frame uses in M1 (one
-	// session per carrier, chosen by the dialer, echoed by the passive).
-	// ParseHeader rejects a session frame with any other handle (ErrHandle).
+	// SessionHandle is the handle every session frame uses in M1 and M2
+	// (one session per carrier, chosen by the dialer, echoed by the
+	// passive). ParseHeader rejects a session frame, and ParseRel a wrapped
+	// one, with any other handle (ErrHandle).
 	SessionHandle uint32 = 1
 	// KnownRequired is the set of required PREFACE feature bits this build
 	// implements (none). Any other required bit is answered FEATURE.
@@ -75,10 +76,12 @@ const (
 // Magic starts every PREFACE and PREFACE_ACK.
 var Magic = [4]byte{'R', 'N', 'D', '2'}
 
-// CarrierKind is byte 6 of a PREFACE.
+// CarrierKind is byte 6 of a PREFACE (the carrier kind) and the OPEN kind
+// byte (the session kind: a packet session is KindDatagram).
 type CarrierKind uint8
 
-// Carrier kinds. M1 accepts only KindStream.
+// Carrier and session kinds: stream (M1) and datagram (M2: datagram
+// carriers and packet sessions).
 const (
 	KindStream   CarrierKind = 1
 	KindDatagram CarrierKind = 2
@@ -112,8 +115,10 @@ const (
 // CRC check (plan §5).
 type Type uint8
 
-// Frame types used by M1 stream sessions. 0x20 DGRAM, 0x21 PACK, 0x34 REL
-// and 0x35 RACK are reserved for M2; decoding them in M1 yields ErrType.
+// Frame types of stream sessions (M1). The M2 types — 0x20 DGRAM and 0x21
+// PACK of packet sessions, 0x34 REL and 0x35 RACK of the reliable control
+// sublayer of datagram carriers — and the never assigned 0x52 are declared
+// in dgram.go.
 const (
 	TypeOpen    Type = 0x01
 	TypeOpenAck Type = 0x02
@@ -134,26 +139,35 @@ const (
 func (t Type) Extension() bool { return t >= 0x80 }
 
 // CarrierLevel reports whether t is a carrier-level core type (PING, PONG,
-// CLOSE, GOAWAY), whose handle must be 0. Every other core type is a
-// session frame whose handle must be SessionHandle: an M1 carrier carries
-// exactly one session (M3's mux relaxes this to any non-zero handle,
-// dispatched by handle). ParseHeader enforces both rules (ErrHandle). The
-// handle of an extension type is opaque and never checked.
+// CLOSE, GOAWAY, REL, RACK), whose handle must be 0. Every other core type
+// is a session frame whose handle must be SessionHandle: an M1–M2 carrier
+// carries exactly one session (M3's mux relaxes this to any non-zero
+// handle, dispatched by handle). ParseHeader and ParseRel enforce both
+// rules (ErrHandle). The handle of an extension type is opaque and never
+// checked.
 func (t Type) CarrierLevel() bool {
-	return t == TypePing || t == TypePong || t == TypeClose || t == TypeGoAway
-}
-
-// Known reports whether t is one of the 13 core types M1 implements.
-func (t Type) Known() bool {
 	switch t {
-	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeData, TypeAck, TypeFin,
-		TypeRst, TypeSched, TypePing, TypePong, TypeClose, TypeGoAway:
+	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack:
 		return true
 	}
 	return false
 }
 
-// String returns the frame type name ("OPEN", "ACK", ...) or "0xNN".
+// Known reports whether t is one of the 17 core types of wire format v2:
+// the 13 of stream sessions (M1) and DGRAM, PACK, REL and RACK (M2).
+// 0x52 is never Known (TypeReservedR).
+func (t Type) Known() bool {
+	switch t {
+	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeData, TypeAck, TypeFin,
+		TypeRst, TypeSched, TypePing, TypePong, TypeClose, TypeGoAway,
+		TypeDgram, TypePack, TypeRel, TypeRack:
+		return true
+	}
+	return false
+}
+
+// String returns the frame type name ("OPEN", "ACK", "DGRAM", ...) or
+// "0xNN".
 func (t Type) String() string {
 	switch t {
 	case TypeOpen:
@@ -182,6 +196,14 @@ func (t Type) String() string {
 		return "CLOSE"
 	case TypeGoAway:
 		return "GOAWAY"
+	case TypeDgram:
+		return "DGRAM"
+	case TypePack:
+		return "PACK"
+	case TypeRel:
+		return "REL"
+	case TypeRack:
+		return "RACK"
 	}
 	const hex = "0123456789abcdef"
 	return string([]byte{'0', 'x', hex[t>>4], hex[t&0x0f]})
@@ -218,6 +240,8 @@ const (
 
 // AllowedFlags returns the flag bits defined for core type t (0 for core
 // types without flags). Extension flags are opaque: every bit is allowed.
+// A REL carries its inner frame's flags in its own head (iflags), checked
+// against the inner type by ParseRel; the REL header's flags are 0.
 func AllowedFlags(t Type) uint8 {
 	if t.Extension() {
 		return 0xFF
@@ -225,6 +249,8 @@ func AllowedFlags(t Type) uint8 {
 	switch t {
 	case TypeAck:
 		return FlagAckFinDelivered | FlagAckDone
+	case TypePack:
+		return FlagPackFinDelivered | FlagPackDone
 	case TypePing:
 		return FlagPingBusy
 	case TypeSched:
@@ -250,7 +276,7 @@ const (
 // (design decision D10). REJECTED carries the application's own code.
 const (
 	CodeBadMode       uint32 = 1 // BAD_REQUEST: unknown mode, or JOIN mode differs from the session
-	CodeBadKind       uint32 = 2 // BAD_REQUEST: kind is not stream (M1)
+	CodeBadKind       uint32 = 2 // BAD_REQUEST: an unknown session kind, or a session kind this carrier cannot open (M2 design §A3.5)
 	CodeMetadataSize  uint32 = 3 // BAD_REQUEST: mlen exceeds the passive's MaxMetadata → ErrMetadataTooLarge
 	CodeBadValue      uint32 = 4 // BAD_REQUEST: reserved flags, pmtu or another field out of range
 	CodeMaxSessions   uint32 = 1 // CAPACITY: the passive Runtime is at MaxSessions

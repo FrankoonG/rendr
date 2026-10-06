@@ -14,7 +14,7 @@ type Header struct {
 	Type   Type
 	Flags  uint8
 	Len    uint32 // payload length, ≤ MaxFramePayload
-	Fseq   uint32 // per carrier, per direction; strict +1 (serial arithmetic) on stream carriers
+	Fseq   uint32 // per carrier, per direction; strict +1 (serial arithmetic) on stream carriers, a FseqWindow on datagram carriers
 	Handle uint32 // 0 for carrier-level frames, SessionHandle for session frames; opaque for extensions
 }
 
@@ -34,20 +34,23 @@ func PutHeader(b []byte, h *Header) {
 
 // ParseHeader decodes b[:HeaderLen] and checks everything that can be
 // checked before the payload is read or any buffer is sized, in this order:
-// Len ≤ MaxFramePayload (ErrLength), the type is a known M1 core type or an
+// Len ≤ MaxFramePayload (ErrLength), the type is a known core type or an
 // extension (ErrType), only AllowedFlags(type) are set (ErrFlags), the
 // handle (ErrHandle), and Len within PayloadBounds(type) (ErrLength). For an
 // extension type only Len ≤ MaxFramePayload applies: its flags and handle
-// are opaque. The fseq is not checked (it is stateful; see SeqLess). Fewer
-// than HeaderLen bytes are ErrShort; bytes after the header are ignored.
+// are opaque. The fseq is not checked (it is stateful: strict +1 on stream
+// carriers, see SeqLess; a FseqWindow on datagram carriers). Fewer than
+// HeaderLen bytes are ErrShort; bytes after the header are ignored.
 //
-// The handle rule is the whole M1 rule (Type.CarrierLevel): 0 for a
-// carrier-level type, SessionHandle for a session type. The carrier reader
-// and both handshakes rely on this ErrHandle and do not check the handle
-// again. Whether a carrier accepts session frames at all (probe and
-// sessionless carriers do not) is not a header property; the code reading
-// the carrier decides it. M3 (mux) relaxes the session rule to any non-zero
-// handle, dispatched by handle.
+// The handle rule is the whole M1–M2 rule (Type.CarrierLevel): 0 for a
+// carrier-level type (REL and RACK included), SessionHandle for a session
+// type (DGRAM and PACK included). The carrier reader and both handshakes
+// rely on this ErrHandle and do not check the handle again. Whether a
+// carrier accepts a frame at all (session frames on probe and sessionless
+// carriers, DATA on a packet session, REL on a stream carrier, a bare
+// control frame on a datagram carrier: M2 design §A3.6) is not a header
+// property; the code reading the carrier decides it. M3 (mux) relaxes the
+// session rule to any non-zero handle, dispatched by handle.
 func ParseHeader(b []byte) (Header, error) {
 	if len(b) < HeaderLen {
 		return Header{}, ErrShort
@@ -87,7 +90,10 @@ func ParseHeader(b []byte) (Header, error) {
 // PayloadBounds returns the inclusive payload length bounds of t: OPEN
 // 32..32+65535, OPEN_ACK 10..265, JOIN 25, JOIN_ACK 9, DATA 9..MaxFramePayload,
 // ACK 16, FIN 8, RST 5..260, SCHED 33..93, PING/PONG 20..20+MaxPingPad, CLOSE 1,
-// GOAWAY 1, extensions 0..MaxFramePayload. ok is false for unknown core types.
+// GOAWAY 1, DGRAM 8..MaxFramePayload (an empty datagram is legal), PACK 20,
+// REL 10..MaxFramePayload (ParseRel bounds the inner payload by its own
+// type), RACK 8, extensions 0..MaxFramePayload. ok is false for unknown core
+// types.
 func PayloadBounds(t Type) (min, max int, ok bool) {
 	if t.Extension() {
 		return 0, MaxFramePayload, true
@@ -115,6 +121,14 @@ func PayloadBounds(t Type) (min, max int, ok bool) {
 		return PingFixedLen, PingFixedLen + MaxPingPad, true
 	case TypeClose, TypeGoAway:
 		return ReasonLen, ReasonLen, true
+	case TypeDgram:
+		return DgramPrefixLen, MaxFramePayload, true
+	case TypePack:
+		return PackLen, PackLen, true
+	case TypeRel:
+		return RelHeadLen, MaxFramePayload, true
+	case TypeRack:
+		return RackLen, RackLen, true
 	}
 	return 0, 0, false
 }

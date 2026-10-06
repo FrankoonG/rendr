@@ -3,7 +3,10 @@ package wire
 import "errors"
 
 // Decoding errors. Every one of them is a protocol violation when it occurs
-// on an established carrier (the carrier is killed; the session survives).
+// on an established stream carrier (the carrier is killed; the session
+// survives). On a datagram carrier a framing or CRC error only drops the
+// rest of its datagram; a CRC-valid frame whose payload fails to decode
+// still kills the carrier (M2 design §A3.8, PA-1).
 var (
 	// ErrShort: the input is shorter than the structure requires.
 	ErrShort = errors.New("rendr/wire: short input")
@@ -25,7 +28,8 @@ var (
 	ErrMalformed = errors.New("rendr/wire: malformed")
 	// ErrCRC: CRC32C mismatch.
 	ErrCRC = errors.New("rendr/wire: crc mismatch")
-	// ErrType: an unknown core frame type (0x01–0x7F), including M2 types.
+	// ErrType: an unknown core frame type (0x00–0x7F; 0x52 is never
+	// assigned), or a type a REL may not carry (Wrappable).
 	ErrType = errors.New("rendr/wire: unknown core frame type")
 	// ErrFlags: an undefined flag bit is set.
 	ErrFlags = errors.New("rendr/wire: undefined flag bits")
