@@ -56,6 +56,9 @@ type dgramConn struct {
 	pumped  chan struct{}
 	sent    chan struct{}
 	once    sync.Once
+	// exitHook, set by a test before it closes the conn, runs as the pump
+	// and the sender exit (the join test of Close).
+	exitHook func()
 }
 
 func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.ApplicationErrorCode), o *Options, ls *Counters) *dgramConn {
@@ -67,7 +70,7 @@ func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.Applic
 		}
 	}
 	d.max.Store(int64(limit))
-	d.in.ring, d.in.max, d.in.wake, d.out.wake = make([][]byte, 16), o.DatagramQueueBytes, make(chan struct{}, 1), make(chan struct{}, 1)
+	d.in.ring, d.in.max, d.in.wake, d.out.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1), make(chan struct{}, 1)
 	if first != nil {
 		d.in.push(first) // the datagram that classified the connection comes first
 	}
@@ -94,8 +97,16 @@ func (d *dgramConn) drops(egress bool, n uint64) {
 	}
 }
 
+// exit closes c, the pump's or the sender's exit signal.
+func (d *dgramConn) exit(c chan struct{}) {
+	if d.exitHook != nil {
+		d.exitHook()
+	}
+	close(c)
+}
+
 func (d *dgramConn) pump() {
-	defer close(d.pumped)
+	defer d.exit(d.pumped)
 	for {
 		b, err := d.qc.ReceiveDatagram(d.qc.Context())
 		if err != nil {
@@ -112,11 +123,13 @@ func (d *dgramConn) pump() {
 // an error is kept for the next WriteTo: once for a too-large datagram
 // (the budget shrinks), for good when the connection failed.
 func (d *dgramConn) send() {
-	defer close(d.sent)
+	defer d.exit(d.sent)
 	q, done := &d.out, d.qc.Context().Done()
 	var cur []byte
 	for {
 		q.mu.Lock()
+		q.give(cur) // the previous datagram's buffer: SendDatagram copied it, or it was dropped
+		cur = nil
 		for q.n == 0 && !q.closed {
 			q.mu.Unlock()
 			select {
@@ -132,7 +145,7 @@ func (d *dgramConn) send() {
 			return
 		}
 		s := &q.slots[q.head]
-		cur, s.b = s.b, cur[:0] // the slot keeps the sender's spare buffer
+		cur, s.b = s.b, nil
 		at := s.at
 		q.head, q.n, q.bytes = (q.head+1)%egressMax, q.n-1, q.bytes-len(cur)
 		q.mu.Unlock()
@@ -190,11 +203,13 @@ func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	}
 	var dropped uint64
 	for ; q.n > 0 && (q.n == egressMax || q.bytes+len(p) > egressBytes); dropped++ {
-		q.bytes -= len(q.slots[q.head].b)
-		q.head, q.n = (q.head+1)%egressMax, q.n-1
+		s := &q.slots[q.head]
+		q.bytes -= len(s.b)
+		q.give(s.b)
+		s.b, q.head, q.n = nil, (q.head+1)%egressMax, q.n-1
 	}
 	s := &q.slots[(q.head+q.n)%egressMax]
-	s.b, s.at = append(s.b[:0], p...), now
+	s.b, s.at = append(q.take(), p...), now
 	q.n, q.bytes = q.n+1, q.bytes+len(p)
 	q.mu.Unlock()
 	signal(q.wake)
@@ -231,7 +246,7 @@ func (d *dgramConn) SetReadDeadline(t time.Time) error {
 	d.in.mu.Lock()
 	d.in.deadline = t
 	d.in.mu.Unlock()
-	signal(d.in.wake) // a blocked ReadFrom re-checks
+	signal(d.in.wake) // a blocked ReadFrom re-checks and passes the wake on when it returns
 	return nil
 }
 
@@ -249,8 +264,10 @@ func signal(c chan struct{}) {
 	}
 }
 
-// egress is a connection's bounded send queue (R1-9); slots keep their
-// buffers, so a steady state copies without allocating.
+// egress is a connection's bounded send queue (R1-9). A slot holds a
+// buffer only while its datagram is queued; up to egressSpare released
+// buffers are kept for reuse, so a steady state copies without allocating
+// and an idle queue keeps little memory.
 type egress struct {
 	mu    sync.Mutex
 	slots [egressMax]struct {
@@ -258,10 +275,31 @@ type egress struct {
 		at time.Time
 	}
 	head, n, bytes int
+	spare          [egressSpare][]byte
+	nspare         int
 	wdl            time.Time
 	err            error // for the next WriteTo; kept when fatal
 	fatal, closed  bool
 	wake           chan struct{}
+}
+
+// take returns a released buffer, emptied, or nil (append allocates).
+func (q *egress) take() []byte {
+	if q.nspare == 0 {
+		return nil
+	}
+	q.nspare--
+	b := q.spare[q.nspare]
+	q.spare[q.nspare] = nil
+	return b[:0]
+}
+
+// give keeps a released buffer for reuse unless egressSpare are kept.
+func (q *egress) give(b []byte) {
+	if b != nil && q.nspare < egressSpare {
+		q.spare[q.nspare] = b
+		q.nspare++
+	}
 }
 
 func (q *egress) setErr(err error, fatal bool) {
@@ -277,12 +315,12 @@ func (q *egress) setErr(err error, fatal bool) {
 // the queued datagrams (L01).
 type ingress struct {
 	mu             sync.Mutex
-	ring           [][]byte // grows to ingressMax
+	ring           [][]byte // grows to ingressMax; released when drained
 	head, n, bytes int
 	max            int
 	deadline       time.Time
 	err            error
-	wake           chan struct{}
+	wake           chan struct{} // one waiter re-checks; one that returns passes it on
 }
 
 // push queues b unless the queue is full (false: a drop) or failed.
@@ -321,8 +359,10 @@ func (q *ingress) fail(err error, discard bool) {
 }
 
 // pop returns the oldest datagram, else the terminal error, waiting until
-// one exists or the read deadline passed. Every reader shares the one
-// deadline, so a waiter that returns passes the wake on.
+// one exists or the read deadline passed. A passed deadline fails the call
+// even with datagrams queued (as a socket's); the terminal error comes
+// after the queued datagrams and before the deadline. Every reader shares
+// the one deadline, so a waiter that returns passes the wake on.
 func (q *ingress) pop() ([]byte, error) {
 	var t *time.Timer
 	defer func() {
@@ -332,21 +372,26 @@ func (q *ingress) pop() ([]byte, error) {
 	}()
 	for {
 		q.mu.Lock()
-		if q.n > 0 {
+		dl := q.deadline
+		expired := !dl.IsZero() && !time.Now().Before(dl) // no clock read without a deadline
+		if q.n > 0 && !expired {
 			b := q.ring[q.head]
 			q.ring[q.head] = nil
 			q.head, q.n, q.bytes = (q.head+1)%len(q.ring), q.n-1, q.bytes-len(b)
-			if q.n > 0 {
+			switch {
+			case q.n > 0:
 				signal(q.wake)
+			case len(q.ring) > 4*ingressInit:
+				q.ring, q.head = make([][]byte, ingressInit), 0 // a drained burst releases its ring
 			}
 			q.mu.Unlock()
 			return b, nil
 		}
-		err, dl := q.err, q.deadline
-		q.mu.Unlock()
-		if err == nil && !dl.IsZero() && !time.Now().Before(dl) {
+		err := q.err
+		if q.n > 0 || (err == nil && expired) { // q.n > 0: the deadline passed
 			err = os.ErrDeadlineExceeded
 		}
+		q.mu.Unlock()
 		if err != nil {
 			signal(q.wake)
 			return nil, err

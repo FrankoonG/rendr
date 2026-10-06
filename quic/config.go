@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"time"
 
@@ -25,9 +26,11 @@ const (
 
 const (
 	ingressMax  = 2048 // datagrams in one ingress queue (L46)
+	ingressInit = 16   // its first ring; a drained ring above 4·ingressInit is released
 	egressMax   = 256  // datagrams in one egress queue (R1-9)
 	egressBytes = 512 << 10
 	egressAge   = 250 * time.Millisecond
+	egressSpare = 8 // released egress buffers kept for reuse
 )
 
 var (
@@ -68,10 +71,12 @@ func quicConfig(base *qgo.Config, idle time.Duration, server, datagrams bool) *q
 		c.MaxIdleTimeout = MinIdleTimeout
 	}
 	c.InitialPacketSize = cmp.Or(c.InitialPacketSize, 1200) // the floor keeps DatagramBudget valid after an MTU reset
-	c.InitialStreamReceiveWindow = cmp.Or(c.InitialStreamReceiveWindow, 1<<20)
-	c.MaxStreamReceiveWindow = cmp.Or(c.MaxStreamReceiveWindow, 16<<20) // rendr's Window is the flow-control authority
-	c.InitialConnectionReceiveWindow = cmp.Or(c.InitialConnectionReceiveWindow, 3<<19)
+	// Receive windows (rendr's Window is the flow-control authority): the
+	// defaults fill what is unset; an initial window never exceeds its max.
+	c.MaxStreamReceiveWindow = cmp.Or(c.MaxStreamReceiveWindow, 16<<20)
+	c.InitialStreamReceiveWindow = min(cmp.Or(c.InitialStreamReceiveWindow, 1<<20), c.MaxStreamReceiveWindow)
 	c.MaxConnectionReceiveWindow = cmp.Or(c.MaxConnectionReceiveWindow, 24<<20)
+	c.InitialConnectionReceiveWindow = min(cmp.Or(c.InitialConnectionReceiveWindow, 3<<19), c.MaxConnectionReceiveWindow)
 	c.MaxIncomingUniStreams = -1
 	c.EnableDatagrams = server || datagrams
 	c.MaxIncomingStreams = -1 // the passive never opens a stream
@@ -88,6 +93,24 @@ func quicConfig(base *qgo.Config, idle time.Duration, server, datagrams bool) *q
 		}
 	}
 	return c
+}
+
+// clientTLS is tlsConfig for a carrier dialing address: an unset
+// ServerName becomes the address's host unless that is an IP literal, so
+// the certificate is verified against the name dialed (quic-go would
+// verify a resolved address against the IP, and crypto/tls sends no SNI
+// for an IP).
+func clientTLS(base *tls.Config, address string) (*tls.Config, error) {
+	c, err := tlsConfig(base, false)
+	if err != nil || c.ServerName != "" {
+		return c, err
+	}
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		if _, err := netip.ParseAddr(host); err != nil {
+			c.ServerName = host
+		}
+	}
+	return c, nil
 }
 
 // tlsConfig clones base with NextProtos [ALPN] (empty is completed, any
@@ -109,9 +132,11 @@ func tlsConfig(base *tls.Config, server bool) (*tls.Config, error) {
 	return c, nil
 }
 
-// closedError wraps a dead connection's error whose Timeout is true
-// (quic-go's idle and handshake timeouts), so that no caller takes it for
-// the expiry of a deadline it set (L01); errors.As still finds it.
+// closedError wraps a dead connection's error that claims Timeout or
+// Temporary — quic-go's idle and handshake timeouts, its stateless reset
+// (Temporary) — so that no caller takes it for the expiry of a deadline it
+// set or for transient noise: every QUIC error ends the carrier (L01;
+// M2 design §A6.4). errors.As still finds the QUIC error.
 type closedError struct{ error }
 
 func (e closedError) Unwrap() error { return e.error }
@@ -119,10 +144,10 @@ func (closedError) Timeout() bool   { return false }
 func (closedError) Temporary() bool { return false }
 
 // connErr returns err for an adapter's caller: a deadline expiry as is,
-// another timeout-like error as a closedError.
+// another timeout-like or temporary error as a closedError.
 func connErr(err error) error {
 	var ne net.Error
-	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !ne.Timeout() {
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) || !errors.As(err, &ne) || !(ne.Timeout() || ne.Temporary()) {
 		return err
 	}
 	return closedError{err}

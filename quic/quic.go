@@ -38,7 +38,10 @@ const (
 type Options struct {
 	// TLS is required: a client configuration for the carriers, a server
 	// configuration with a certificate for Listen. It is cloned; NextProtos
-	// must be empty or exactly [ALPN] (else the constructor fails).
+	// must be empty or exactly [ALPN] (else the constructor fails). A
+	// carrier verifies the server's certificate against ServerName when it
+	// is set, else against the host of its address: a host name (also sent
+	// as SNI) or an IP literal.
 	TLS *tls.Config
 	// Config optionally tunes quic-go. Always overridden: KeepAlivePeriod 0,
 	// Allow0RTT false, InitialPacketSize 1200 when unset, EnableDatagrams
@@ -50,16 +53,19 @@ type Options struct {
 	// given. Below rendr's PassiveRetain it breaks the embedding contract
 	// (L26): for tests that need QUIC's own timer to fire (L01).
 	IdleTimeout time.Duration
-	// LocalAddr optionally fixes a dialer carrier's local "ip:port".
+	// LocalAddr optionally fixes a dialer carrier's local "ip:port". Every
+	// carrier binds a socket of its own to it, so a non-zero port allows
+	// only one live carrier of the factory at a time: use port 0 unless
+	// that is intended.
 	LocalAddr string
 	// StatelessResetKey lets a restarted listener reset its old connections
 	// at once; useful only if it is the same across restarts.
 	StatelessResetKey *qgo.StatelessResetKey
 	// Listener limits (defaults 10 s, 256, 4096): how long an accepted
-	// connection may take to open its stream or send its first DATAGRAM,
-	// how many connections may be in handshake or in that wait (the oldest
-	// is evicted beyond), and how many may be alive in total (refused
-	// beyond).
+	// connection may take to open its stream or send its first DATAGRAM;
+	// how many connections may be in handshake (new ones are refused
+	// beyond) and, separately, in that wait (the oldest is evicted beyond);
+	// and how many may be alive in total (refused beyond).
 	HandshakeTimeout time.Duration
 	MaxPending       int
 	MaxConns         int
@@ -88,9 +94,12 @@ type Counters struct {
 
 // StreamCarrier returns a stream carrier factory named name that dials
 // address over QUIC: one connection with one client bidirectional stream
-// per carrier. It fails for a missing or invalid TLS configuration.
+// per carrier. The conn's Close returns at once; its QUIC connection and
+// its UDP socket are released after a linger of at most 500 ms (or at the
+// peer's close) that lets the peer read the last bytes. It fails for a
+// missing or invalid TLS configuration.
 func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error) {
-	tc, err := tlsConfig(o.TLS, false)
+	tc, err := clientTLS(o.TLS, address)
 	if err != nil {
 		return rendr.StreamCarrier{}, err
 	}
@@ -110,7 +119,7 @@ func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error)
 // earlier datagram (too large, connection closed) is returned by the next
 // WriteTo. It fails for a missing or invalid TLS configuration.
 func DatagramCarrier(name, address string, o Options) (rendr.DatagramCarrier, error) {
-	tc, err := tlsConfig(o.TLS, false)
+	tc, err := clientTLS(o.TLS, address)
 	if err != nil {
 		return rendr.DatagramCarrier{}, err
 	}
@@ -196,7 +205,9 @@ func (l *Listener) Stats() ListenerStats {
 
 // ListenerStats are a Listener's counters.
 type ListenerStats struct {
-	Refused          uint64 // connections refused by the admission bounds
+	// Refused counts the connection attempts the admission bounds refused,
+	// per Initial packet: a retransmitted or split ClientHello counts again.
+	Refused          uint64
 	Evicted          uint64 // pending connections evicted (oldest first)
 	ClassifyTimeouts uint64 // connections that neither opened a stream nor sent a DATAGRAM in time
 	BadKind          uint64 // connections that did both, or negotiated another ALPN

@@ -134,7 +134,8 @@ func TestQUICLazyStreamBounded_L48(t *testing.T) {
 func TestQUICBothKindsRejected(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	srvTLS, _ := testTLS(t)
-	l, err := Listen("udp4", "127.0.0.1:0", Options{TLS: srvTLS})
+	ft := &frameTracer{}
+	l, err := Listen("udp4", "127.0.0.1:0", Options{TLS: srvTLS, Config: &qgo.Config{Tracer: ft.trace}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +154,12 @@ func TestQUICBothKindsRejected(t *testing.T) {
 	if err := qc.SendDatagram([]byte("PREFACE")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond) // both frames reach the passive before Serve accepts the connection
+	// Classification takes the first event, then the other only if it is
+	// already there: the passive handles both frames before Serve accepts
+	// the connection.
+	eventually(t, "the passive handled the stream and the DATAGRAM", func() bool {
+		return ft.rcvStreams.Load() > 0 && ft.rcvDatagrams.Load() > 0
+	})
 	f := newFakeRendr()
 	served := make(chan error, 1)
 	go func() { served <- l.serve(f) }()
@@ -172,9 +178,52 @@ func TestQUICBothKindsRejected(t *testing.T) {
 
 // TestQUICListenerCloseKeepsCarriers: closing the Listener stops
 // accepting but leaves the carriers handed to rendr running on the shared
-// socket; Done closes once the last of them closed.
+// socket; Done closes once the last of them closed. A connection still
+// classifying is closed at once (codeListenerClosed), not left to its
+// HandshakeTimeout.
 func TestQUICListenerCloseKeepsCarriers(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
+	t.Run("handed carriers keep running", testListenerCloseHanded)
+	t.Run("classifying connections closed", func(t *testing.T) {
+		srvTLS, _ := testTLS(t)
+		l, err := Listen("udp4", "127.0.0.1:0", Options{TLS: srvTLS, HandshakeTimeout: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		served := make(chan error, 1)
+		go func() { served <- l.serve(newFakeRendr()) }()
+		qc, err := rawTransport(t).Dial(dialCtx(t), l.Addr(), rawClientTLS(t), quicConfig(nil, 0, false, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer qc.CloseWithError(0, "")
+		eventually(t, "the silent connection is classifying", func() bool {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			return len(l.waiting) == 1
+		})
+		start := time.Now()
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if code, remote := closeCode(t, qc); code != codeListenerClosed || !remote {
+			t.Errorf("closed with %d (remote %v), want codeListenerClosed", code, remote)
+		}
+		select {
+		case <-l.Done():
+		case <-time.After(testEventuallyTime):
+			t.Fatal("Done not closed")
+		}
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("the classifying connection and Done ended %v after Listener.Close", d)
+		}
+		if err := <-served; !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Serve after Close: %v", err)
+		}
+	})
+}
+
+func testListenerCloseHanded(t *testing.T) {
 	so, _ := testTLS(t)
 	l, err := Listen("udp4", "127.0.0.1:0", Options{TLS: so})
 	if err != nil {

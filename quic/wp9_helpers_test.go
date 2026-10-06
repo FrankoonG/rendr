@@ -12,10 +12,13 @@ import (
 	"math/big"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	qgo "github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 // The WP9 tests run on real loopback sockets, outside synctest bubbles
@@ -23,10 +26,10 @@ import (
 // rendrtest.AssertNoLeak first so that it checks after every cleanup.
 
 var (
-	pkiOnce        sync.Once
-	pkiSrv, pkiCli *tls.Config
-	pkiErr         error
-	errNotHanded   = errors.New("fake rendr: closed")
+	pkiOnce                 sync.Once
+	pkiSrv, pkiCli, pkiName *tls.Config
+	pkiErr                  error
+	errNotHanded            = errors.New("fake rendr: closed")
 )
 
 const (
@@ -72,15 +75,69 @@ func testTLS(t testing.TB) (srv, cli *tls.Config) {
 			pkiErr = err
 			return
 		}
+		named, err := issue(&x509.Certificate{SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "localhost"},
+			NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), DNSNames: []string{"localhost"},
+			KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}, ca.Leaf, ca.PrivateKey)
+		if err != nil {
+			pkiErr = err
+			return
+		}
 		pool := x509.NewCertPool()
 		pool.AddCert(ca.Leaf)
 		pkiSrv = &tls.Config{Certificates: []tls.Certificate{leaf}}
+		pkiName = &tls.Config{Certificates: []tls.Certificate{named}}
 		pkiCli = &tls.Config{RootCAs: pool}
 	})
 	if pkiErr != nil {
 		t.Fatal(pkiErr)
 	}
 	return pkiSrv.Clone(), pkiCli.Clone()
+}
+
+// nameOnlyTLS returns a server configuration whose certificate (signed by
+// the test CA) names only the DNS name localhost, no IP address.
+func nameOnlyTLS(t testing.TB) *tls.Config {
+	t.Helper()
+	testTLS(t)
+	return pkiName.Clone()
+}
+
+// frameTracer is a quic-go connection tracer (quic.Config.Tracer) that
+// counts the STREAM and DATAGRAM frames its connections received and the
+// DATAGRAM frames they sent: deterministic gates for real-socket tests.
+// quic-go records a received packet after it handled the packet's frames.
+type frameTracer struct {
+	rcvStreams, rcvDatagrams, sentDatagrams atomic.Int64
+}
+
+func (f *frameTracer) trace(context.Context, bool, qgo.ConnectionID) qlogwriter.Trace { return f }
+func (f *frameTracer) AddProducer() qlogwriter.Recorder                               { return f }
+func (f *frameTracer) SupportsSchemas(string) bool                                    { return true }
+func (f *frameTracer) Close() error                                                   { return nil }
+
+func (f *frameTracer) RecordEvent(e qlogwriter.Event) {
+	var frames []qlog.Frame
+	sent := false
+	switch p := e.(type) {
+	case qlog.PacketReceived:
+		frames = p.Frames
+	case qlog.PacketSent:
+		frames, sent = p.Frames, true
+	}
+	for _, fr := range frames {
+		switch fr.Frame.(type) {
+		case *qlog.StreamFrame:
+			if !sent {
+				f.rcvStreams.Add(1)
+			}
+		case *qlog.DatagramFrame:
+			if sent {
+				f.sentDatagrams.Add(1)
+			} else {
+				f.rcvDatagrams.Add(1)
+			}
+		}
+	}
 }
 
 // fakeRendr stands in for a *rendr.Listener: it collects what Serve hands

@@ -3,6 +3,7 @@ package quic
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -128,14 +129,14 @@ func seqDatagram(i, size int) []byte {
 	return b
 }
 
-// sendGated writes count datagrams in groups of 16 and waits after each
-// group until the passive's pump took them all over (queued or dropped):
-// quic-go's silent 128-entry queue never overflows, so every loss is the
-// ingress queue's own, counted.
-func sendGated(t *testing.T, cli, srv *dgramConn, ctr *Counters, count, size int) {
+// sendGated writes the count datagrams gen(0), gen(1), … in groups of 16
+// and waits after each group until the passive's pump took them all over
+// (queued or dropped): quic-go's silent 128-entry queue never overflows,
+// so every loss is the ingress queue's own, counted.
+func sendGated(t *testing.T, cli, srv *dgramConn, ctr *Counters, count int, gen func(int) []byte) {
 	t.Helper()
 	for i := 0; i < count; i++ {
-		if _, err := cli.WriteTo(seqDatagram(i, size), nil); err != nil {
+		if _, err := cli.WriteTo(gen(i), nil); err != nil {
 			t.Fatal(err)
 		}
 		if i%16 == 15 || i == count-1 {
@@ -148,31 +149,48 @@ func sendGated(t *testing.T, cli, srv *dgramConn, ctr *Counters, count, size int
 
 // TestQUICDatagramPump_L46: with the consumer paused, the pump keeps
 // draining quic-go's 128-entry queue into the ingress queue — 512
-// datagrams arrive in order — and the byte bound drops exactly the
-// overflow, counted (Options.Counters and ListenerStats.DatagramDrops).
+// datagrams arrive in order — and each bound drops exactly the overflow,
+// counted (Options.Counters and ListenerStats.DatagramDrops): the byte
+// bound, and the 2048-datagram count bound, which alone bounds tiny and
+// empty datagrams. A drained queue releases the ring a burst grew.
 func TestQUICDatagramPump_L46(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
+	seq1000 := func(i int) []byte { return seqDatagram(i, 1000) }
+	tiny := func(i int) []byte { // 4 bytes, and empty beyond the count bound
+		if i < ingressMax {
+			return seqDatagram(i, 4)
+		}
+		return []byte{}
+	}
 	for _, tc := range []struct {
-		name  string
-		bytes int
-		want  int
+		name         string
+		bytes, count int
+		gen          func(int) []byte
+		want         int
 	}{
-		{"512 in order", 0, 512},
-		{"byte bound", 64 << 10, (64 << 10) / 1000},
+		{"512 in order", 0, 512, seq1000, 512},
+		{"byte bound", 64 << 10, 512, seq1000, (64 << 10) / 1000},
+		{"count bound", 0, ingressMax + 64, tiny, ingressMax},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctr := &Counters{}
 			cli, srv, l := dgramPair(t, Options{DatagramQueueBytes: tc.bytes, Counters: ctr}, Options{})
-			sendGated(t, cli, srv, ctr, 512, 1000)
+			sendGated(t, cli, srv, ctr, tc.count, tc.gen)
 			buf := make([]byte, DatagramBudget+1)
 			for i := 0; i < tc.want; i++ {
 				n, _, err := srv.ReadFrom(buf)
-				if err != nil || !bytes.Equal(buf[:n], seqDatagram(i, 1000)) {
+				if err != nil || !bytes.Equal(buf[:n], tc.gen(i)) {
 					t.Fatalf("datagram %d: %d bytes, seq %d, %v", i, n, binary.BigEndian.Uint32(buf), err)
 				}
 			}
-			if q, drops := queued(srv), ctr.IngressDrops.Load(); q != 0 || drops != uint64(512-tc.want) || l.Stats().DatagramDrops != drops {
-				t.Errorf("left %d, drops %d (listener %d), want 0 and %d", q, drops, l.Stats().DatagramDrops, 512-tc.want)
+			if q, drops := queued(srv), ctr.IngressDrops.Load(); q != 0 || drops != uint64(tc.count-tc.want) || l.Stats().DatagramDrops != drops {
+				t.Errorf("left %d, drops %d (listener %d), want 0 and %d", q, drops, l.Stats().DatagramDrops, tc.count-tc.want)
+			}
+			srv.in.mu.Lock()
+			ring := len(srv.in.ring)
+			srv.in.mu.Unlock()
+			if ring != ingressInit {
+				t.Errorf("the drained queue keeps a ring of %d entries, want %d", ring, ingressInit)
 			}
 		})
 	}
@@ -293,12 +311,27 @@ func relayPair(t *testing.T, perSec float64, ctr *Counters) (cli, srv *dgramConn
 	return cli, srv, relay
 }
 
+// egressHeld returns the number of slot buffers and of spare buffers d's
+// egress queue holds, and its length.
+func egressHeld(d *dgramConn) (slots, spares, n int) {
+	d.out.mu.Lock()
+	defer d.out.mu.Unlock()
+	for i := range d.out.slots {
+		if d.out.slots[i].b != nil {
+			slots++
+		}
+	}
+	return slots, d.out.nspare, d.out.n
+}
+
 // TestQUICDatagramEgressNeverBlocks (R1-9): over a path that carries
 // about 20 packets per second, 1 kpps offered for 10 s — QUIC's congestion
 // control sends far less and SendDatagram blocks — yet WriteTo never
 // waits: the egress queue drops (counted) instead, the connection stays
 // alive, and an error met by a queued datagram is returned by the next
-// WriteTo. A datagram that waited longer than 250 ms is dropped, not sent.
+// WriteTo. A full queue drops its oldest datagram, so the newest wait to
+// be sent; a datagram that waited longer than 250 ms is dropped, not sent;
+// a drained queue keeps at most egressSpare buffers.
 func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	t.Run("never blocks", func(t *testing.T) {
@@ -346,6 +379,41 @@ func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 			t.Errorf("WriteTo after the peer's close: %v", werr)
 		}
 	})
+	t.Run("full queue drops the oldest", func(t *testing.T) {
+		ctr := &Counters{}
+		cli, _, relay := relayPair(t, 0, ctr)
+		relay.limited.Store(true) // a black hole: no ACK returns, the sender blocks in SendDatagram
+		for i := range 100 {
+			if _, err := cli.WriteTo(seqDatagram(i, 1000), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		eventually(t, "the sender is blocked", func() bool { _, _, n := egressHeld(cli); return n > 0 })
+		for i := 100; i < 400; i++ {
+			if _, err := cli.WriteTo(seqDatagram(i, 1000), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The queue holds the newest datagrams, oldest first: a run ending
+		// at seq 399 (the blocked sender may still take one from its head).
+		cli.out.mu.Lock()
+		n, seqs := cli.out.n, make([]int, 0, egressMax)
+		for k := range n {
+			seqs = append(seqs, int(binary.BigEndian.Uint32(cli.out.slots[(cli.out.head+k)%egressMax].b)))
+		}
+		cli.out.mu.Unlock()
+		for k, seq := range seqs {
+			if seq != 400-n+k {
+				t.Fatalf("the queue of %d holds seq %d..%d (seq %d at %d); want the newest, seq %d..399", n, seqs[0], seqs[n-1], seq, k, 400-n)
+			}
+		}
+		if n < egressMax/2 || ctr.EgressDrops.Load() == 0 {
+			t.Errorf("a queue of %d, egress drops %d: the queue never filled", n, ctr.EgressDrops.Load())
+		}
+		if slots, _, n := egressHeld(cli); slots != n {
+			t.Errorf("%d slots hold a buffer for %d queued datagrams", slots, n)
+		}
+	})
 	t.Run("stale datagrams dropped", func(t *testing.T) {
 		ctr := &Counters{}
 		cli, srv, relay := relayPair(t, 0, ctr)
@@ -380,6 +448,9 @@ func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 		time.Sleep(300 * time.Millisecond) // every queued datagram is older than 250 ms now
 		relay.limited.Store(false)
 		eventually(t, "the sender drained the queue", func() bool { cli.out.mu.Lock(); defer cli.out.mu.Unlock(); return cli.out.n == 0 })
+		if slots, spares, _ := egressHeld(cli); slots != 0 || spares > egressSpare {
+			t.Errorf("the drained queue keeps %d slot buffers and %d spares; want 0 and at most %d", slots, spares, egressSpare)
+		}
 		for i := 1000; i < 1010; i++ {
 			_, _ = cli.WriteTo(seqDatagram(i, 1000), nil)
 		}
@@ -396,8 +467,9 @@ func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 // TestQUICErrorsAreDeath_L01 (adapter half): every QUIC error reaches the
 // core as the conn's error, detailed by the connection's close cause —
 // the peer's application close, QUIC's own idle timeout (an explicit
-// short IdleTimeout) and a dial whose handshake times out. Timeouts of a
-// dead connection are never deadline errors (closedError).
+// short IdleTimeout), a stateless reset from a restarted passive, and a
+// dial whose handshake times out. The error of a dead connection is
+// neither a deadline error nor noise to the core (closedError, §A6.4).
 func TestQUICErrorsAreDeath_L01(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	t.Run("application close", func(t *testing.T) {
@@ -428,6 +500,72 @@ func TestQUICErrorsAreDeath_L01(t *testing.T) {
 		sc, _, _ := streamPair(t, Options{}, Options{IdleTimeout: 300 * time.Millisecond})
 		if _, err := sc.Read(make([]byte, 8)); !errors.As(err, new(*qgo.IdleTimeoutError)) || !errors.As(err, &ne) || ne.Timeout() {
 			t.Errorf("stream Read at QUIC's idle timeout: %v", err)
+		}
+	})
+	t.Run("stateless reset", func(t *testing.T) {
+		// A restarted passive with the same StatelessResetKey resets the old
+		// connections at once. quic-go's StatelessResetError claims
+		// Temporary, which the core's datagram reader takes for noise.
+		var key qgo.StatelessResetKey
+		if _, err := rand.Read(key[:]); err != nil {
+			t.Fatal(err)
+		}
+		l, f := serveFake(t, Options{StatelessResetKey: &key})
+		addr := l.Addr().String()
+		dc, err := DatagramCarrier("q", addr, clientOptions(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc, err := StreamCarrier("q", addr, clientOptions(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pc, _, err := dc.Dial(dialCtx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cd := pc.(*dgramConn)
+		t.Cleanup(func() { _ = cd.Close() })
+		cs, err := sc.Dial(dialCtx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cs.Close() })
+		if _, err := cd.WriteTo([]byte("classify"), nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cs.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		sd, ss := f.packet(t), f.stream(t)
+		t.Cleanup(func() { _ = sd.Close(); _ = ss.Close() })
+
+		// The passive's process ends without CONNECTION_CLOSE; its successor
+		// binds the same port with the same key.
+		_ = l.tr.Close()
+		_ = l.udp.Close()
+		srvTLS, _ := testTLS(t)
+		l2, err := Listen("udp4", addr, Options{TLS: srvTLS, StatelessResetKey: &key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l2.Close(); <-l2.Done() })
+		var werr error
+		eventually(t, "WriteTo returns the reset", func() bool {
+			_, werr = cd.WriteTo(make([]byte, 200), nil) // each datagram draws a reset
+			return werr != nil
+		})
+		_ = cd.SetReadDeadline(time.Now().Add(testEventuallyTime))
+		_, _, rerr := cd.ReadFrom(make([]byte, 64))
+		_ = cs.SetDeadline(time.Now().Add(testEventuallyTime))
+		_, _ = cs.Write(make([]byte, 200)) // a packet the successor answers with a reset
+		_, serr := cs.Read(make([]byte, 8))
+		for name, err := range map[string]error{"WriteTo": werr, "ReadFrom": rerr, "stream Read": serr} {
+			var ne net.Error
+			if !errors.As(err, new(*qgo.StatelessResetError)) || !errors.Is(err, net.ErrClosed) ||
+				errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+				t.Errorf("%s after a stateless reset: %v; want a carrier death (neither noise nor a deadline)", name, err)
+			}
 		}
 	})
 	t.Run("handshake timeout on dial", func(t *testing.T) {

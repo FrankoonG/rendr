@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -69,6 +71,23 @@ func TestQUICConfigEnforced_L26(t *testing.T) {
 	}
 	if got := quicConfig(&qgo.Config{InitialPacketSize: 1350}, 0, false, false).InitialPacketSize; got != 1350 {
 		t.Errorf("an explicit InitialPacketSize became %d", got)
+	}
+	for _, tc := range []struct {
+		name           string
+		cfg            *qgo.Config
+		is, ms, ic, mc uint64
+	}{ // receive windows: an initial window never exceeds its max; explicit values are kept
+		{"max below the default initial", &qgo.Config{MaxStreamReceiveWindow: 512 << 10, MaxConnectionReceiveWindow: 768 << 10},
+			512 << 10, 512 << 10, 768 << 10, 768 << 10},
+		{"explicit initial", &qgo.Config{InitialStreamReceiveWindow: 4 << 20, InitialConnectionReceiveWindow: 6 << 20},
+			4 << 20, 16 << 20, 6 << 20, 24 << 20},
+	} {
+		c := quicConfig(tc.cfg, 0, false, false)
+		if c.InitialStreamReceiveWindow != tc.is || c.MaxStreamReceiveWindow != tc.ms ||
+			c.InitialConnectionReceiveWindow != tc.ic || c.MaxConnectionReceiveWindow != tc.mc {
+			t.Errorf("%s: windows %d/%d, %d/%d; want %d/%d, %d/%d", tc.name, c.InitialStreamReceiveWindow, c.MaxStreamReceiveWindow,
+				c.InitialConnectionReceiveWindow, c.MaxConnectionReceiveWindow, tc.is, tc.ms, tc.ic, tc.mc)
+		}
 	}
 	perClient := quicConfig(&qgo.Config{GetConfigForClient: func(*qgo.ClientInfo) (*qgo.Config, error) {
 		return &qgo.Config{KeepAlivePeriod: 5 * time.Second, Allow0RTT: true, MaxIdleTimeout: 10 * time.Second}, nil
@@ -155,5 +174,47 @@ func TestQUICALPN_L44(t *testing.T) {
 	}
 	if s := l.Stats(); s.Datagrams+s.Streams+s.BadKind != 0 || len(f.packets)+len(f.streams) != 0 {
 		t.Errorf("a failed handshake reached the listener: %+v", s)
+	}
+}
+
+// TestQUICDialByHostName: a carrier dialed by host name verifies the
+// server's certificate against that name (sent as SNI) unless
+// tls.Config.ServerName is set, which is kept; an IP literal is verified
+// against the IP.
+func TestQUICDialByHostName(t *testing.T) {
+	t.Cleanup(rendrtest.AssertNoLeak(t))
+	l, _ := serveFake(t, Options{TLS: nameOnlyTLS(t)}) // the certificate names only localhost
+	port := strconv.Itoa(l.Addr().(*net.UDPAddr).Port)
+	for _, tc := range []struct {
+		name, host, serverName string
+		ok                     bool
+	}{
+		{"by name", "localhost", "", true},
+		{"explicit ServerName kept", "localhost", "other.invalid", false},
+		{"IP literal with ServerName", "127.0.0.1", "localhost", true},
+		{"IP literal", "127.0.0.1", "", false},
+	} {
+		o := clientOptions(t)
+		o.TLS.ServerName = tc.serverName
+		addr := net.JoinHostPort(tc.host, port)
+		sc, err := StreamCarrier("q", addr, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc, err := DatagramCarrier("q", addr, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, serr := sc.Dial(dialCtx(t))
+		if c != nil {
+			_ = c.Close()
+		}
+		pc, _, derr := dc.Dial(dialCtx(t))
+		if pc != nil {
+			_ = pc.Close()
+		}
+		if (serr == nil) != tc.ok || (derr == nil) != tc.ok {
+			t.Errorf("%s (%s, ServerName %q): stream %v, datagram %v; want success %v", tc.name, addr, tc.serverName, serr, derr, tc.ok)
+		}
 	}
 }

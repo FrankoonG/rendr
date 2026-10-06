@@ -22,28 +22,35 @@ import (
 func TestQUICGoPinnedBehaviour(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	t.Run("receive queue drops silently at 128", func(t *testing.T) { // why the pump exists (L46)
-		cli, srv := rawPair(t, nil, nil)
+		ft := &frameTracer{}
+		cli, srv := rawPair(t, nil, quicConfig(&qgo.Config{Tracer: ft.trace}, 0, true, true))
 		for i := range 200 {
 			if err := cli.SendDatagram(seqDatagram(i, 100)); err != nil {
 				t.Fatal(err)
 			}
 		}
-		time.Sleep(300 * time.Millisecond)
+		// Once 128 were handled the queue is full; after the peer's close
+		// nothing more arrives, and what was queued stays readable.
+		eventually(t, "128 DATAGRAMs handled", func() bool { return ft.rcvDatagrams.Load() >= 128 })
+		_ = cli.CloseWithError(0, "")
+		select {
+		case <-srv.Context().Done():
+		case <-time.After(testEventuallyTime):
+			t.Fatal("the peer's CONNECTION_CLOSE did not arrive")
+		}
 		got := 0
 		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			b, err := srv.ReceiveDatagram(ctx)
-			cancel()
+			b, err := srv.ReceiveDatagram(context.Background())
 			if err != nil {
 				break
 			}
 			if got == 0 {
-				t.Logf("first queued seq %d", binary.BigEndian.Uint32(b))
+				t.Logf("first queued seq %d of %d handled", binary.BigEndian.Uint32(b), ft.rcvDatagrams.Load())
 			}
 			got++
 		}
 		if got != 128 {
-			t.Errorf("an unread receiver kept %d of 200 datagrams, want quic-go's 128", got)
+			t.Errorf("an unread receiver kept %d datagrams, want quic-go's 128", got)
 		}
 	})
 	t.Run("fresh slices", func(t *testing.T) { // the pump moves ownership without copying (L46)
@@ -77,7 +84,8 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 		}
 		defer ln.Close()
 		relay := newRateRelay(t, str.Conn.LocalAddr(), 0)
-		cli, err := rawTransport(t).Dial(dialCtx(t), relay.pc.LocalAddr(), rawClientTLS(t), quicConfig(nil, 0, false, true))
+		ft := &frameTracer{}
+		cli, err := rawTransport(t).Dial(dialCtx(t), relay.pc.LocalAddr(), rawClientTLS(t), quicConfig(&qgo.Config{Tracer: ft.trace}, 0, false, true))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -99,9 +107,14 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 			}
 			ended <- nil
 		}()
-		time.Sleep(time.Second)
-		if n := done.Load(); n >= 150 {
-			t.Errorf("%d of 300 SendDatagram calls returned on a path that acknowledges nothing", n)
+		// Once the congestion window is spent, frames leave only in probe
+		// packets: quic-go holds 32 and the next call waits.
+		eventually(t, "quic-go holds 32 DATAGRAM frames", func() bool { return done.Load()-ft.sentDatagrams.Load() >= 32 })
+		for last := int64(-1); done.Load() != last; time.Sleep(100 * time.Millisecond) {
+			last = done.Load() // until the caller made no progress for 100 ms
+		}
+		if n, sent := done.Load(), ft.sentDatagrams.Load(); n == 300 || n-sent != 32 {
+			t.Errorf("%d of 300 SendDatagram calls returned, %d DATAGRAMs sent: want a caller blocked with 32 queued", n, sent)
 		}
 		_ = cli.CloseWithError(0, "")
 		select {
@@ -123,7 +136,11 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = cli.CloseWithError(7, "bye")
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-srv.Context().Done():
+		case <-time.After(testEventuallyTime):
+			t.Fatal("the peer's CONNECTION_CLOSE did not arrive")
+		}
 		n := 0
 		var rerr error
 		if ss, err := srv.AcceptStream(dialCtx(t)); err != nil {
@@ -154,7 +171,7 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 		read, write := make(chan error, 1), make(chan error, 1)
 		go func() { _, err := ss.Read(make([]byte, 1)); read <- err }()        // the dialer sends nothing more
 		go func() { _, err := ss.Write(make([]byte, 64<<20)); write <- err }() // the dialer reads nothing
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)                                     // the calls block (one that has not yet fails at once)
 		_ = ss.SetDeadline(time.Now())
 		for _, c := range []chan error{read, write} {
 			select {
@@ -168,15 +185,22 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 			}
 		}
 	})
-	t.Run("close errors are timeouts", func(t *testing.T) { // why connErr wraps them
-		for _, err := range []error{&qgo.IdleTimeoutError{}, &qgo.HandshakeTimeoutError{}} {
+	t.Run("close errors look transient", func(t *testing.T) { // why connErr wraps them
+		for _, tc := range []struct {
+			err                error
+			timeout, temporary bool
+		}{
+			{&qgo.IdleTimeoutError{}, true, false},
+			{&qgo.HandshakeTimeoutError{}, true, false},
+			{&qgo.StatelessResetError{}, false, true},
+		} {
 			var ne net.Error
-			if !errors.As(err, &ne) || !ne.Timeout() || !errors.Is(err, net.ErrClosed) {
-				t.Errorf("%T: Timeout %v", err, ne != nil && ne.Timeout())
+			if !errors.As(tc.err, &ne) || ne.Timeout() != tc.timeout || ne.Temporary() != tc.temporary || !errors.Is(tc.err, net.ErrClosed) {
+				t.Errorf("%T: Timeout %v, Temporary %v", tc.err, ne != nil && ne.Timeout(), ne != nil && ne.Temporary())
 			}
-			if errors.As(connErr(err), &ne); ne.Timeout() || !errors.As(connErr(err), new(*qgo.IdleTimeoutError)) &&
-				!errors.As(connErr(err), new(*qgo.HandshakeTimeoutError)) {
-				t.Errorf("connErr(%T) is a deadline error or lost the QUIC error", err)
+			err := connErr(tc.err)
+			if errors.As(err, &ne); ne.Timeout() || ne.Temporary() || !errors.Is(err, tc.err) || !errors.Is(err, net.ErrClosed) {
+				t.Errorf("connErr(%T) is a deadline error or noise, or lost the QUIC error", tc.err)
 			}
 		}
 		if err := connErr(os.ErrDeadlineExceeded); err != os.ErrDeadlineExceeded {

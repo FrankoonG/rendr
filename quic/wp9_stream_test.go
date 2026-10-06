@@ -41,7 +41,7 @@ func TestQUICStreamConnClose_L05_L52(t *testing.T) {
 		read, write := make(chan error, 1), make(chan error, 1)
 		go func() { _, err := cli.Read(make([]byte, 8)); read <- err }()
 		go func() { _, err := cli.Write(make([]byte, 64<<20)); write <- err }() // beyond the peer's window: blocks
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)                                      // the calls block; one that has not yet fails at once with net.ErrClosed
 		start, closed := time.Now(), make(chan error, 1)
 		go func() { closed <- cli.Close() }()
 		select {
