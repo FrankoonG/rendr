@@ -189,8 +189,10 @@ func (s *Session) pktAgeLocked(now time.Time) time.Time {
 
 // fillPackLocked is the packet branch of fillControlLocked's duty-lane
 // step (§A5.5): places the PACK when due, REL-wrapped when reliable; a
-// reliable PACK that finds no REL room hands the duty to a live lane with
-// REL room (R1-17).
+// reliable PACK that a datagram batch refused for lack of REL room
+// (b.Datagram() && b.RelRoom() == 0: a stream batch reports no REL room
+// whatever it holds, and its refusal never moves the duty) hands the duty
+// to a live lane with REL room (R1-17, as amended at integration 1).
 func (s *Session) fillPackLocked(l *lane, b *carrier.Batch) {
 	panic("unimplemented: M2")
 }

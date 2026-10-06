@@ -112,8 +112,9 @@ type PeerKey struct {
 var (
 	// ErrNoRebind: the transport cannot change its peer.
 	ErrNoRebind = errors.New("rendr/carrier: the transport cannot rebind")
-	// ErrNoise: a transient datagram error (ICMP class, ENOBUFS); the
-	// datagram is lost, the carrier lives.
+	// ErrNoise: a transient datagram error (ICMP class, ENOBUFS, a local
+	// packet filter's refusal of a send); the datagram is lost, the carrier
+	// lives.
 	ErrNoise = errors.New("rendr/carrier: transient datagram error")
 )
 
@@ -141,8 +142,15 @@ type DgramStats struct {
 // the Windows errnos (WSAEMSGSIZE 10040, WSAENETRESET 10052,
 // WSAECONNABORTED 10053, WSAECONNRESET 10054) and the POSIX ones match
 // everywhere, so an embedder conn — or the in-memory fake — behaves the same
-// on every host. NewPacketIO fails for a nil pc or peer and for a peer whose
-// String panics. Ownership of pc moves to the result only on success (L57).
+// on every host. As on rendr's own sockets (integration 1), EPERM on a
+// write is noise (a local packet filter dropped the datagram; a refusal
+// that persists ends the carrier by ping_timeout) and death on a read, and
+// an error matching ErrNoise or reporting Temporary() is noise on reads
+// and writes; the caller's own deadline is recognised by
+// errors.Is(err, os.ErrDeadlineExceeded), never by Timeout(), which a dead
+// conn may report too. NewPacketIO fails for a nil pc or peer and for a
+// peer whose String panics. Ownership of pc moves to the result only on
+// success (L57).
 func NewPacketIO(env *Env, pc net.PacketConn, peer net.Addr, limit int) (PacketIO, error) {
 	panic("unimplemented: M2")
 }

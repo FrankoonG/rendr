@@ -22,7 +22,10 @@ type DialSpec struct {
 	// i for Factories[i]; 0 means all (every M1 session). Stream sessions
 	// get the stream factories only; packet sessions all of them, ranked
 	// by kind class (M2-D47). Health keeps every factory under its Peer
-	// index.
+	// index, so a factory outside Eligible is kept out of every scheduling
+	// input (integration 1): never ranked (no race, bond or redial slot)
+	// and marked failed for the selector's Evaluate, so that it never
+	// becomes a quality target.
 	Eligible uint16
 }
 

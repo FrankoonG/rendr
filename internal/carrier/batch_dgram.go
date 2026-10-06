@@ -322,8 +322,10 @@ func (b *Batch) appendDatagram(dst []byte, i, end int) []byte {
 	return append(dst, b.arena[seg:stop]...)
 }
 
-// Writer-side helpers beyond the contract names (WP3c; used by the datagram
-// writer as it needs them).
+// Writer-side helpers added to the WP3c ↔ WP3a contract at integration 1
+// (M2 design §A11.5): datagramDgram gives each datagram's TxBytes and
+// Refused, dgramBytes the round's DGRAM bytes in both modes, and relRefused
+// is the only source of the REL sender's blocked flag (§A5.9).
 
 // datagramDgram reports whether the datagram whose last frame is end − 1
 // carries a DGRAM — always its last frame (M2-D12) — and that DGRAM's
