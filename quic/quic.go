@@ -1,8 +1,11 @@
 package quic
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -87,7 +90,14 @@ type Counters struct {
 // address over QUIC: one connection with one client bidirectional stream
 // per carrier. It fails for a missing or invalid TLS configuration.
 func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error) {
-	panic("unimplemented: M2")
+	tc, err := tlsConfig(o.TLS, false)
+	if err != nil {
+		return rendr.StreamCarrier{}, err
+	}
+	o = o.norm()
+	return rendr.StreamCarrier{Name: name, Dial: func(ctx context.Context) (net.Conn, error) {
+		return dialStream(ctx, address, tc, &o)
+	}}, nil
 }
 
 // DatagramCarrier returns a datagram carrier factory named name that dials
@@ -100,13 +110,20 @@ func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error)
 // earlier datagram (too large, connection closed) is returned by the next
 // WriteTo. It fails for a missing or invalid TLS configuration.
 func DatagramCarrier(name, address string, o Options) (rendr.DatagramCarrier, error) {
-	panic("unimplemented: M2")
+	tc, err := tlsConfig(o.TLS, false)
+	if err != nil {
+		return rendr.DatagramCarrier{}, err
+	}
+	o = o.norm()
+	return rendr.DatagramCarrier{Name: name, MTU: DatagramBudget, Dial: func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+		return dialDatagram(ctx, address, tc, &o)
+	}}, nil
 }
 
 // Listen opens a QUIC listener on network ("udp", "udp4", "udp6") and
 // address. Serve hands its carriers to a rendr.Listener.
 func Listen(network, address string, o Options) (*Listener, error) {
-	panic("unimplemented: M2")
+	return listen(network, address, o)
 }
 
 // Listener accepts QUIC connections and classifies each by its first event:
@@ -116,32 +133,73 @@ func Listen(network, address string, o Options) (*Listener, error) {
 // any handshake state exists (ConnContext, L48).
 type Listener struct {
 	opts Options
+	udp  *net.UDPConn
+	tr   *qgo.Transport
+	ql   *qgo.Listener
+	ctr  Counters // drops of the handed datagram carriers
+	done chan struct{}
+	fin  sync.Once
+
+	mu      sync.Mutex
+	closing bool
+	shaking int       // ConnContext … Accept: QUIC handshakes in flight
+	conns   int       // ConnContext … the connection's end
+	waiting []*waiter // accepted, not yet classified, oldest first
+	refs    int       // 1 until Close, plus every accepted connection not yet released
+	stats   ListenerStats
 }
 
 // Serve hands every carrier to rl until Close; it returns net.ErrClosed
 // after Close. Closing rl and l are independent: carriers already handed to
 // rl keep running when l closes.
-func (l *Listener) Serve(rl *rendr.Listener) error { panic("unimplemented: M2") }
+func (l *Listener) Serve(rl *rendr.Listener) error {
+	if rl == nil {
+		return errors.New("rendr/quic: Serve needs a rendr.Listener")
+	}
+	return l.serve(rl)
+}
 
 // Addr returns the listening address.
-func (l *Listener) Addr() net.Addr { panic("unimplemented: M2") }
+func (l *Listener) Addr() net.Addr { return l.udp.LocalAddr() }
 
 // Close stops accepting; carriers already handed to rendr keep running.
-func (l *Listener) Close() error { panic("unimplemented: M2") }
+func (l *Listener) Close() error {
+	l.mu.Lock()
+	if l.closing {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closing = true
+	ws := l.waiting
+	l.waiting = nil
+	l.mu.Unlock()
+	for _, w := range ws {
+		w.cancel(errListenerClosed)
+	}
+	err := l.ql.Close() // refuses the handshakes in flight; accepted connections stay
+	l.unref()
+	return err
+}
 
 // Done is closed when the listener's transport and UDP socket are closed
 // (after Close, once no carrier uses them).
-func (l *Listener) Done() <-chan struct{} { panic("unimplemented: M2") }
+func (l *Listener) Done() <-chan struct{} { return l.done }
 
 // Stats returns the listener's counters.
-func (l *Listener) Stats() ListenerStats { panic("unimplemented: M2") }
+func (l *Listener) Stats() ListenerStats {
+	l.mu.Lock()
+	s := l.stats
+	l.mu.Unlock()
+	s.DatagramDrops, s.EgressDrops = l.ctr.IngressDrops.Load(), l.ctr.EgressDrops.Load()
+	return s
+}
 
 // ListenerStats are a Listener's counters.
 type ListenerStats struct {
 	Refused          uint64 // connections refused by the admission bounds
 	Evicted          uint64 // pending connections evicted (oldest first)
 	ClassifyTimeouts uint64 // connections that neither opened a stream nor sent a DATAGRAM in time
-	BadKind          uint64 // connections that did both
+	BadKind          uint64 // connections that did both, or negotiated another ALPN
 	BudgetRefused    uint64 // datagram connections whose DATAGRAM limit was below DatagramBudget
 	Streams          uint64 // stream carriers handed to rendr
 	Datagrams        uint64 // datagram carriers handed to rendr

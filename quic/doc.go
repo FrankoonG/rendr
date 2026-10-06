@@ -4,9 +4,11 @@
 // DATAGRAM frames, RFC 9221), and a listener that hands both kinds to a
 // rendr.Listener (M2-D67; plan:635).
 //
-// Every carrier is its own QUIC connection on its own UDP socket, so closing
-// a carrier releases its socket and two carriers never share a fate: the
-// fate group plan:635 describes is empty in M2 (PA-12).
+// Every carrier is its own QUIC connection, so two carriers never share a
+// fate: the fate group plan:635 describes is empty in M2 (PA-12). A dialer
+// carrier has its own UDP socket, released when the carrier closes; the
+// carriers a Listener accepted share its socket, which closes after the
+// last of them (Listener.Done).
 //
 // Security: QUIC always encrypts, but encryption is not authentication. A
 // tls.Config is required and only what it verifies is authenticated; the
