@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // Stream helpers the actor calls (design §4.0). Every helper is called with
@@ -13,22 +14,20 @@ import (
 // here.
 
 // initStreamLocked initializes the stream once, before the session is
-// visible to any other goroutine (Dial, NewPending): every offset — cbase,
-// sBase, sNext, end, resEnd, rRead, rTail, rightEdge and peerLimit — is
-// Params.FirstOffset; lastWin is W (nothing advertised yet, so nothing to
-// re-advertise); the chunk ring gets capacity W/C + 2; rwake and wwake are
-// made (cap 1); the deadline timers and the srtt order slice are prepared.
-// Nothing is charged to the Budget.
+// visible to any other goroutine (Dial, NewPending). Its generic part serves
+// both session kinds (M2 design §A5.1): rwake and wwake are made (cap 1),
+// the first acceptable echo, the idle and rescue clocks and the srtt order
+// slice. A packet session (Params.Kind == wire.KindDatagram) then gets its
+// packet plane (initPacketLocked: rings, dedup window, first seq, and on
+// the passive the accepted MaxPayload) and keeps every byte-stream field
+// zero. The stream remainder: every offset — cbase, sBase, sNext, end,
+// resEnd, rRead, rTail, rightEdge and peerLimit — is Params.FirstOffset;
+// lastWin is W (nothing advertised yet, so nothing to re-advertise); the
+// chunk ring gets capacity W/C + 2. Nothing is charged to the Budget.
 func (s *Session) initStreamLocked() {
 	st := &s.st
-	off := s.p.FirstOffset
-	st.cbase, st.sBase, st.sNext, st.end, st.resEnd = off, off, off, off, off
-	st.rRead, st.rTail, st.rightEdge, st.peerLimit = off, off, off, off
-	w := s.window()
-	st.chunks = chunkRing{b: make([]*carrier.Buf, w/chunkSize+2)}
 	st.rwake = make(chan struct{}, 1)
 	st.wwake = make(chan struct{}, 1)
-	st.lastWin = w
 	// The first echo a dialer accepts is FirstEpoch (serial arithmetic).
 	st.echoIn = s.p.FirstEpoch - 1
 	now := time.Now()
@@ -36,6 +35,16 @@ func (s *Session) initStreamLocked() {
 	st.order = make([]*lane, 0, 4)
 	// Deadline timers are created by the first Set*Deadline with a future
 	// time (§3.6); a zero deadline needs none.
+	if s.p.Kind == wire.KindDatagram {
+		s.initPacketLocked()
+		return
+	}
+	off := s.p.FirstOffset
+	st.cbase, st.sBase, st.sNext, st.end, st.resEnd = off, off, off, off, off
+	st.rRead, st.rTail, st.rightEdge, st.peerLimit = off, off, off, off
+	w := s.window()
+	st.chunks = chunkRing{b: make([]*carrier.Buf, w/chunkSize+2)}
+	st.lastWin = w
 }
 
 // openWindowLocked raises rightEdge to rRead + sched.AdvertiseWindow(W,
@@ -44,17 +53,52 @@ func (s *Session) initStreamLocked() {
 // Dial) and the passive in every OPEN_ACK(OK) (Confirm, duplicate OPENs on
 // an open session). It is called by the actor or before the actor's first
 // step, so a window below 64 KiB reaches the actor through readvertiseLocked
-// in that same or its first step, without a ring.
+// in that same or its first step, without a ring. A packet session
+// advertises no window: its OPEN carries 0, which Establish replaces by
+// each datagram attempt's cmtu offer (M2-D11), and its OPEN_ACK windows are
+// per carrier (laneWindowLocked).
 func (s *Session) openWindowLocked() uint32 {
+	if s.pk != nil {
+		return 0
+	}
 	w := min(s.raiseEdgeLocked(), math.MaxUint32)
 	s.st.lastWin = int64(w)
 	return uint32(w)
 }
 
+// laneWindowLocked is the window of the OPEN_ACK(OK) that lane l's carrier
+// answers an OPEN with (M2 design §A5.1 "openWindowLocked(l)"): a stream
+// session's openWindowLocked; for a packet session PacketWindow(MaxPayload,
+// the cmtu_acc of l's own carrier) — 0 on a stream carrier — so that every
+// OPEN carrier, in Confirm and in a duplicate OPEN's adoption alike, gets
+// its own budget (M2-D11, §A3.5; Revision 1, R1-5).
+func (s *Session) laneWindowLocked(l *lane) uint32 {
+	if s.pk == nil {
+		return s.openWindowLocked()
+	}
+	return wire.PacketWindow(uint16(s.pk.maxPayload), uint16(laneRecvLimit(l)))
+}
+
+// laneRecvLimit returns the negotiated cmtu of l's carrier
+// (carrier.Conn.RecvLimit: 0 on a stream carrier). A port without it (the
+// stream tests' fakes) reports 0.
+func laneRecvLimit(l *lane) int {
+	if r, ok := l.port.(interface{ RecvLimit() int }); ok {
+		return r.RecvLimit()
+	}
+	return 0
+}
+
 // peerWindowLocked applies the peer's initial window w: peerLimit =
 // max(peerLimit, sBase + w). The passive calls it at NewPending
-// (OPEN.window), the dialer at binding (the first OPEN_ACK(OK)).
+// (OPEN.window), the dialer at binding (the first OPEN_ACK(OK)). A packet
+// session has no flow-control window: its passive consumed OPEN.window (the
+// cmtu offer) at admission, and its dialer validates the OPEN_ACK's packet
+// values per carrier instead (pktOpenAckLocked); a no-op there.
 func (s *Session) peerWindowLocked(w uint32) {
+	if s.pk != nil {
+		return
+	}
 	st := &s.st
 	if lim := st.sBase + uint64(w); lim > st.peerLimit {
 		st.peerLimit = lim
@@ -71,8 +115,13 @@ func (s *Session) peerWindowLocked(w uint32) {
 // rx > sBase advances sBase to rx (trims spans, frees chunks, counts the
 // acknowledged bytes, sets lastAdvance, restarts the IdleTimeout clock
 // (lastData, §0.14 B5), wakes the application writer and the data lanes).
-// It never touches peerLimit.
+// It never touches peerLimit. A packet session's JOIN and JOIN_ACK carry
+// the carrier's cmtu in that field instead (M2-D11), judged by Join and by
+// the dialer's JOIN_ACK check: here it changes nothing.
 func (s *Session) applyRxNextLocked(rx uint64) error {
+	if s.pk != nil {
+		return nil
+	}
 	st := &s.st
 	if rx > st.sNext {
 		return errRxNextBeyondSent
@@ -91,8 +140,12 @@ func (s *Session) applyRxNextLocked(rx uint64) error {
 // sBase) into retx and clears l.infl, returning the number of bytes
 // requeued. The actor calls it when l loses data eligibility (planned
 // switch, passive SCHED move, retirement, peer CLOSE); laneGoneLocked does
-// the same on a lane's end. Acknowledged bytes are never requeued (L10).
+// the same on a lane's end. Acknowledged bytes are never requeued (L10). A
+// packet session retransmits nothing (plan D9): 0.
 func (s *Session) requeueLocked(l *lane) (bytes uint64) {
+	if s.pk != nil {
+		return 0
+	}
 	st := &s.st
 	l.infl.trimBelow(st.sBase)
 	for _, sp := range l.infl.s {
@@ -114,6 +167,15 @@ func (s *Session) requeueLocked(l *lane) (bytes uint64) {
 // re-sent at the same offset after the replay), removes l from st.order and
 // from every duty (the ACK duty moves to another lane with a re-ACK bump,
 // §4.6), and wakes the surviving data lanes.
+//
+// A packet session (M2 design §A5.1) takes the same generic steps — order,
+// the FIN placed again (same final seq) on another lane, the duty lanes and
+// the death bump, which re-places the PACK flags and the epoch echo on a
+// survivor — then recomputes its routing summary and wakes the data lanes
+// for the queued datagrams and the FIN (pktRecomputeLocked,
+// pktWakeLocked). Nothing is requeued: it returns 1 when l placed a DGRAM
+// within the last PacketPing, so that the bond death counts (M2-D44), else
+// 0.
 func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 	if l.state != LaneDead || l.data {
 		panic("rendr/session: laneGoneLocked on a lane that is not dead and data-ineligible")
@@ -124,16 +186,28 @@ func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 		st.fin.lane = nil
 	}
 	l.finHere = false
-	if st.rescue.holder == l {
-		// Pending, or the record of its own duplicate: its spans are
-		// requeued, and the replay resends the head.
-		st.rescue = rescueSlot{}
-	}
 	if st.ackLane == l {
 		st.ackLane = nil
 	}
 	if st.gapLane == l {
 		st.gapLane = nil
+	}
+	if s.pk != nil {
+		now := time.Now()
+		if !st.ended {
+			s.bumpNowLocked() // the PACK flags and the echo go out on a survivor (M2-D39)
+			s.pktRecomputeLocked()
+			s.pktWakeLocked(now)
+		}
+		if s.pktDgramRecentLocked(l, now) {
+			return 1
+		}
+		return 0
+	}
+	if st.rescue.holder == l {
+		// Pending, or the record of its own duplicate: its spans are
+		// requeued, and the replay resends the head.
+		st.rescue = rescueSlot{}
 	}
 	requeued = s.requeueLocked(l)
 	if !st.ended {
@@ -170,10 +244,19 @@ func (s *Session) laneAddedLocked(l *lane) {
 // policy of design §4.11 (selector: the active lane; bond: srtt-ordered
 // lanes until the spare capacity covers the pending bytes). The actor also
 // calls it after setting st.rescue, so the rescue span counts as pending.
+// A packet session recomputes its routing summary (dgMax, mixed) and wakes
+// the lanes its own wake policy selects (pktRecomputeLocked, pktWakeLocked;
+// M2 design §A5.2).
 func (s *Session) routingChangedLocked() {
-	if !s.st.ended {
-		s.wakeDataLocked(time.Now())
+	if s.st.ended {
+		return
 	}
+	if s.pk != nil {
+		s.pktRecomputeLocked()
+		s.pktWakeLocked(time.Now())
+		return
+	}
+	s.wakeDataLocked(time.Now())
 }
 
 // bumpAckLocked schedules an ACK (design §4.6). A bump increments ackGen,
@@ -195,7 +278,9 @@ func (s *Session) bumpAckLocked(urgent bool) {
 // then wfreePending, and the copier releases them) and the receive buffers
 // (unless rcopying: then rfreePending, and the reader releases them), and
 // stops the deadline timers. A second call changes nothing (no buffer is
-// released twice).
+// released twice). A packet session releases its rings instead
+// (pktEndLocked: a datagram a ReadFrom detached stays with it, queued tx
+// datagrams count DropQueue, every waiter is woken).
 func (s *Session) endLocked(err error) {
 	st := &s.st
 	if st.ended {
@@ -206,6 +291,11 @@ func (s *Session) endLocked(err error) {
 	}
 	st.ended = true
 	st.endErr = err
+	if s.pk != nil {
+		s.pktEndLocked()
+		st.stopDeadlinesLocked()
+		return
+	}
 	if st.rwaiting {
 		streamSignal(st.rwake)
 	}
@@ -229,8 +319,12 @@ func (s *Session) endLocked(err error) {
 }
 
 // pendingBytesLocked returns the bytes waiting to be sent: committed but
-// never sent (end − sNext) plus queued for retransmission (retx).
+// never sent (end − sNext) plus queued for retransmission (retx); for a
+// packet session, the bytes of its queued datagrams.
 func (s *Session) pendingBytesLocked() uint64 {
+	if s.pk != nil {
+		return s.pktPendingBytesLocked()
+	}
 	return s.st.end - s.st.sNext + s.st.retx.bytes()
 }
 
@@ -257,7 +351,7 @@ func (s *Session) takeFactsLocked() uint32 {
 // duplicates at most one frame (as msess did).
 func (s *Session) rescueHolderLocked() (holder *lane, sp span, ok bool) {
 	st := &s.st
-	if st.sBase >= st.sNext || st.ended {
+	if s.pk != nil || st.sBase >= st.sNext || st.ended {
 		return nil, span{}, false
 	}
 	x := st.sBase
@@ -328,7 +422,7 @@ func (s *Session) otherDataLaneLocked(l *lane) bool {
 // by itself after its write.
 func (s *Session) wakeRescueLocked() {
 	st := &s.st
-	if !st.rescue.set || st.ended {
+	if s.pk != nil || !st.rescue.set || st.ended {
 		return
 	}
 	for _, l := range st.order {
@@ -362,10 +456,10 @@ func (s *Session) wakeRescueLocked() {
 // still armed.
 //
 // "64 KiB" is min(64 KiB, W): a smaller configured window (tests) can never
-// advertise more than itself.
+// advertise more than itself. A packet session advertises no window: false.
 func (s *Session) readvertiseLocked(now time.Time) bool {
 	st := &s.st
-	if st.ended {
+	if s.pk != nil || st.ended {
 		return false
 	}
 	floor := s.readvertiseFloor()
@@ -381,4 +475,118 @@ func (s *Session) readvertiseLocked(now time.Time) bool {
 		s.bumpNowLocked()
 	}
 	return true
+}
+
+// The packet handshake values (M2 design §A3.5, §A5.4; M2-D11, M2-D49,
+// M2-D50; Revision 1, R1-5): OPEN, OPEN_ACK, JOIN and JOIN_ACK carry a
+// packet session's MaxPayload and each carrier's frame budget (cmtu) in
+// their existing fields. The passive's OPEN values are the admission's
+// (package rendr); the passive's JOIN values and every dialer check are
+// here.
+
+// budgetConn is the part of a carrier the packet handshake values read and
+// set before the carrier starts: *carrier.Conn (Kind; RecvLimit, which is
+// the dialer's cmtu offer until SetBudget fixes the negotiated value).
+type budgetConn interface {
+	Kind() wire.CarrierKind
+	RecvLimit() int
+	SetBudget(cmtu int)
+}
+
+var _ budgetConn = (*carrier.Conn)(nil)
+
+// Violations of a carrier's packet handshake values (§A3.5): the carrier is
+// killed with protocol_violation; the session survives (invariant 6).
+var (
+	errPktCmtu        error = violation("packet handshake: cmtu outside the carrier's offer (0 on a stream carrier)")
+	errPktPmtu        error = violation("packet OPEN_ACK: MaxPayload outside 512 … the offer")
+	errPktPmtuChanged error = violation("packet OPEN_ACK: MaxPayload differs from the one the first OPEN_ACK fixed")
+)
+
+// pktCmtuOK reports whether cmtu is a valid answered budget on a carrier of
+// kind k whose offer was offer: 0 on a stream carrier; MinFrameBudget …
+// offer on a datagram carrier (§A3.5, the dialer's checks).
+func pktCmtuOK(k wire.CarrierKind, offer int, cmtu uint64) bool {
+	if k != wire.KindDatagram {
+		return cmtu == 0
+	}
+	return cmtu >= wire.MinFrameBudget && cmtu <= uint64(offer)
+}
+
+// pktOffer is the dialer's MaxPayload offer (Params.Packet.MaxPayload,
+// computed by package rendr from the factory snapshot, M2-D49).
+func (s *Session) pktOffer() int {
+	if v := s.p.Packet.MaxPayload; v > 0 {
+		return v
+	}
+	return wire.MaxPacketPayload
+}
+
+// pktOpenAckLocked applies the packet values of an OPEN_ACK(OK) that
+// carrier c received (dialer, §A3.5, R1-5): window = pmtu_acc << 16 |
+// cmtu_acc. cmtu_acc must be 0 on a stream carrier and MinFrameBudget … c's
+// offer on a datagram carrier; pmtu_acc 512 … the session's offer. The
+// first OPEN_ACK (first: it binds the session) fixes the session's
+// MaxPayload; every later one must repeat it. A violation changes nothing
+// and is that carrier's (the attempt fails as a carrier error); otherwise
+// c's budget is set (a no-op on a stream carrier) before it starts.
+func (s *Session) pktOpenAckLocked(c budgetConn, window uint32, first bool) error {
+	pmtu, cmtu := wire.SplitPacketWindow(window)
+	if !pktCmtuOK(c.Kind(), c.RecvLimit(), uint64(cmtu)) {
+		return errPktCmtu
+	}
+	if int(pmtu) < wire.MinPacketPayload || int(pmtu) > s.pktOffer() {
+		return errPktPmtu
+	}
+	if !first && int(pmtu) != s.pk.maxPayload {
+		return errPktPmtuChanged
+	}
+	if first {
+		s.pk.maxPayload = int(pmtu) // immutable from here (M2-D49, PA-4)
+	}
+	c.SetBudget(int(cmtu))
+	return nil
+}
+
+// pktJoinAckLocked applies a packet session's JOIN_ACK(OK) on carrier c
+// (dialer, §A3.5): rxNext is cmtu_acc, checked as OPEN_ACK's; c's budget is
+// set before it starts.
+func (s *Session) pktJoinAckLocked(c budgetConn, rxNext uint64) error {
+	if !pktCmtuOK(c.Kind(), c.RecvLimit(), rxNext) {
+		return errPktCmtu
+	}
+	c.SetBudget(int(rxNext))
+	return nil
+}
+
+// pktJoinBudget is the passive's JOIN rule for a carrier of kind k (§A3.5,
+// §A5.4): a stream session's JOIN on a datagram carrier is refused; a
+// packet session's JOIN carries the cmtu offer in rxNext — 0 on a stream
+// carrier, 537 … 65,507 on a datagram carrier — and cmtu_acc = min(offer,
+// limit), limit being the transport's receive capacity. ok false answers
+// BAD_REQUEST. A stream session's JOIN on a stream carrier is M1's
+// (applyRxNextLocked): cmtu 0.
+func pktJoinBudget(packet bool, k wire.CarrierKind, rxNext uint64, limit int) (cmtu int, ok bool) {
+	switch {
+	case !packet:
+		return 0, k != wire.KindDatagram
+	case k != wire.KindDatagram:
+		return 0, rxNext == 0
+	case rxNext < wire.MinFrameBudget || rxNext > wire.MaxDatagram:
+		return 0, false
+	}
+	cmtu = int(min(rxNext, uint64(limit)))
+	return cmtu, cmtu >= wire.MinFrameBudget
+}
+
+// transportLimit returns the largest datagram carrier c's transport can
+// receive (its PacketIO's Limit: the passive's cmtu_acc bound, M2-D50).
+// carrier.Conn does not export it at the skeleton; until it does (contract
+// request: Conn.TransportLimit), an unknown limit accepts any offer, as
+// HandlePacket's does (M2-D60), and the transport's SetLimit clamps.
+func transportLimit(c *carrier.Conn) int {
+	if t, ok := any(c).(interface{ TransportLimit() int }); ok {
+		return t.TransportLimit()
+	}
+	return wire.MaxDatagram
 }

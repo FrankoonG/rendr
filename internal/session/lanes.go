@@ -20,7 +20,8 @@ func (a *actor) newLaneLocked(now time.Time, c *carrier.Conn, factory int, gen u
 	s := a.s
 	l := &lane{s: s, c: c, port: c, id: c.ID(), factory: factory, gen: gen, since: now}
 	l.state = st
-	l.schedSent = s.ctl.epoch // a lane carries only SCHEDs published after it attached
+	l.schedSent = s.ctl.epoch   // a lane carries only SCHEDs published after it attached
+	l.echoRel = s.ctl.epoch - 1 // passive: the first epoch echo placed on l is reliable (M2-D39)
 	s.lanes = append(s.lanes, l)
 	s.laneAddedLocked(l)
 	a.dirty = true
@@ -58,6 +59,9 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 	}
 	a.dropConn(l.c)
 	if len(a.dead) == maxDeadLanes {
+		if ev := &a.dead[0]; ev.conn == nil {
+			a.refusedGone += ev.stats.Refused // settled: its final count (else counted at its settling)
+		}
 		copy(a.dead, a.dead[1:])
 		a.dead = a.dead[:maxDeadLanes-1]
 	}
@@ -71,14 +75,29 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 // settleDeadLocked replaces the joined carrier c by its final Stats in the
 // dead-lane record that still holds it (none once the record was evicted).
 // Joined means c's Done closed: its goroutines finished or were abandoned,
-// so these are the Stats Status would read from c from then on.
+// so these are the Stats Status would read from c from then on. A packet
+// session adds the Refused count of a carrier without a record to
+// refusedGone (R1-31).
 func (a *actor) settleDeadLocked(c *carrier.Conn) {
+	a.settleStatsLocked(c, c.Stats())
+}
+
+// settleStatsLocked is settleDeadLocked with c's final Stats st: they
+// replace c in its dead-lane record, or, once the record was evicted
+// (removeLaneLocked counted none of its Refused then), a packet session
+// adds st.Refused to refusedGone. Every refused DGRAM of a dead carrier is
+// thus counted once: in its record while it lasts, in refusedGone after.
+func (a *actor) settleStatsLocked(c *carrier.Conn, st carrier.Stats) {
 	for i := range a.dead {
 		if d := &a.dead[i]; d.conn == c {
-			d.stats, d.conn = c.Stats(), nil
+			d.stats, d.conn = st, nil
 			a.dirty = true
 			return
 		}
+	}
+	if a.s.pk != nil && st.Refused > 0 {
+		a.refusedGone += st.Refused
+		a.dirty = true
 	}
 }
 

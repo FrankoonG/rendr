@@ -141,6 +141,15 @@ func newDialer(spec DialSpec, h healthSource) *dialer {
 	d.failedVer = make([]uint64, len(spec.Factories))
 	d.selFailed = make([]bool, len(spec.Factories))
 	d.sel = sched.NewSelector(spec.Params.Selector)
+	if spec.Params.Kind == wire.KindDatagram {
+		// Class-up (M2-D48): the selector compares kind classes with the
+		// index-to-class mapping rankLocked uses.
+		cl := make([]uint8, len(spec.Factories))
+		for i := range spec.Factories {
+			cl[i] = kindClass(spec.Params.Kind, &spec.Factories[i])
+		}
+		d.sel.SetClasses(cl)
+	}
 	return d
 }
 
@@ -194,7 +203,22 @@ func (d *dialer) gauge(i int) *carrier.Gauge {
 	return nil
 }
 
-// openPayload encodes the OPEN every attempt of this session sends.
+// laneGauge returns the self-load gauge a carrier of kind k of factory i
+// starts with: a datagram carrier gets none (nothing is submitted on it,
+// M2-D26; a packet selector on datagram carriers has no self-load gauge,
+// R1-33); a stream carrier keeps M1's — also a packet session's, where
+// DGRAM bytes are DATA.
+func (a *actor) laneGauge(k wire.CarrierKind, i int) *carrier.Gauge {
+	if k == wire.KindDatagram {
+		return nil
+	}
+	return a.d.gauge(i)
+}
+
+// openPayload encodes the OPEN every attempt of this session sends. A
+// packet session's OPEN has kind 2, its MaxPayload offer in pmtu and a
+// window of 0, which Establish replaces by each datagram attempt's cmtu
+// offer (M2-D11, §A3.5; a stream carrier keeps 0).
 func openPayload(s *Session, window uint32) []byte {
 	retain := s.p.Retain
 	if retain <= 0 {
@@ -202,6 +226,9 @@ func openPayload(s *Session, window uint32) []byte {
 	}
 	ms := min(retain.Milliseconds(), 1<<32-1)
 	o := wire.Open{SID: s.id, Kind: wire.KindStream, Mode: uint8(s.p.Mode), RetainMs: uint32(ms), Window: window, Metadata: s.meta}
+	if s.pk != nil {
+		o.Kind, o.Window, o.PMTU = wire.KindDatagram, 0, uint16(s.pktOffer())
+	}
 	p := make([]byte, wire.OpenFixedLen+len(s.meta))
 	return p[:wire.PutOpen(p, &o)]
 }
@@ -269,7 +296,10 @@ func (a *actor) noteGoAway(inst [16]byte) {
 // rankLocked ranks the factories at now (§7.8): the health snapshot
 // classified at now (configuration order when the health layer is inert)
 // with the failed marks — the snapshot's, and the local ones it does not
-// show yet (failedLocked).
+// show yet (failedLocked). Only the factories the session may dial are
+// ranked (DialSpec.Eligible, M2-D46; integration 1 D6): the others never
+// get a race, bond or redial slot. A packet session's datagram factories
+// rank before its stream factories (Candidate.Class, M2-D47).
 func (a *actor) rankLocked(now time.Time) []int {
 	d := a.d
 	var snap *carrier.Snapshot
@@ -278,7 +308,10 @@ func (a *actor) rankLocked(now time.Time) []int {
 	}
 	d.cands = d.cands[:0]
 	for i := range d.slots {
-		c := sched.Candidate{Index: i, Failed: a.failedLocked(snap, i)}
+		if !d.spec.eligible(i) {
+			continue
+		}
+		c := sched.Candidate{Index: i, Failed: a.failedLocked(snap, i), Class: kindClass(a.s.p.Kind, &d.slots[i].f)}
 		if snap != nil && i < len(snap.Sum) {
 			c.Ev = snap.Evidence(i, now)
 		}
@@ -291,10 +324,36 @@ func (a *actor) rankLocked(now time.Time) []int {
 // startRaceLocked starts a staggered race over the current ranking (the
 // opening phase, or a selector that lost its active lane without a
 // fallback). The dead factory ranks last (failed) but stays a candidate.
+//
+// The opening race of a packet session skips the datagram factories whose
+// frame budget cannot carry the OPEN (M2-D52); they still JOIN.
 func (a *actor) startRaceLocked(now time.Time) {
 	d := a.d
-	d.race = sched.NewRace(a.rankLocked(now), orDefault(a.s.p.JoinStagger, defJoinStagger), now)
+	order := a.rankLocked(now)
+	if !d.opened && a.s.pk != nil {
+		k := 0
+		for _, i := range order {
+			if openFits(&d.slots[i].f, len(a.s.meta)) {
+				order[k] = i
+				k++
+			}
+		}
+		order = order[:k]
+	}
+	d.race = sched.NewRace(order, orDefault(a.s.p.JoinStagger, defJoinStagger), now)
 	d.raceOn = true
+}
+
+// openOverhead is what an OPEN costs in a datagram besides its metadata:
+// PREFACE, frame header and trailer, REL header and the OPEN's fixed part
+// (M2-D52: a datagram factory can carry an OPEN iff 99 + metadata ≤ MTU).
+const openOverhead = wire.PrefaceLen + wire.FrameOverhead + wire.RelHeadLen + wire.OpenFixedLen
+
+// openFits reports whether factory f can carry a packet session's OPEN with
+// meta bytes of metadata: every stream factory; a datagram factory whose
+// frame budget holds it (M2-D52).
+func openFits(f *carrier.Factory, meta int) bool {
+	return f.Kind != wire.KindDatagram || openOverhead+meta <= f.MTU
 }
 
 // raceLocked starts the race's attempts: the first ready candidate at
@@ -395,8 +454,12 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 	sl := &d.slots[i]
 	payload := d.open
 	if kind == wire.TypeJoin {
+		rx := s.st.rRead
+		if s.pk != nil {
+			rx = 0 // the cmtu offer: Establish writes a datagram attempt's (M2-D11)
+		}
 		var j [wire.JoinLen]byte
-		n := wire.PutJoin(j[:], &wire.Join{SID: s.id, Mode: uint8(s.p.Mode), RxNext: s.st.rRead})
+		n := wire.PutJoin(j[:], &wire.Join{SID: s.id, Mode: uint8(s.p.Mode), RxNext: rx})
 		payload = j[:n]
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -718,7 +781,9 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 
 // openOKLocked handles OPEN_ACK(OK): the first one binds the session to
 // its instance and opens it; a later one is kept only from the bound
-// instance (C9), as a bond member or a retired selector race loser.
+// instance (C9), as a bond member or a retired selector race loser. A
+// packet session checks each carrier's packet values first (§A3.5, R1-5):
+// the first OPEN_ACK fixes MaxPayload, every carrier gets its own budget.
 func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, window uint32) {
 	s := a.s
 	d := a.d
@@ -728,6 +793,12 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		return
 	}
 	inst := est.Ack.Instance
+	if s.pk != nil && (!d.opened || inst == s.peer) {
+		if err := s.pktOpenAckLocked(est.Conn, window, !d.opened); err != nil {
+			a.pktBadAnswerLocked(now, i, at, est, err)
+			return
+		}
+	}
 	if !d.opened {
 		if !d.state.CompareAndSwap(dialWaiting, dialSucceeded) {
 			// Dial's ctx ended first: withdraw (C25).
@@ -813,13 +884,30 @@ func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		a.switchFailedLocked(now, i)
 		return
 	}
-	if err := s.applyRxNextLocked(rxNext); err != nil {
+	if s.pk != nil {
+		if err := s.pktJoinAckLocked(est.Conn, rxNext); err != nil {
+			a.pktBadAnswerLocked(now, i, at, est, err)
+			a.switchFailedLocked(now, i)
+			return
+		}
+	} else if err := s.applyRxNextLocked(rxNext); err != nil {
 		a.killEst(est, carrier.CauseProtocolViolation, "JOIN_ACK rxNext beyond sent")
 		a.finish(now, i, at, sched.OutcomeFailed)
 		a.switchFailedLocked(now, i)
 		return
 	}
 	a.attachLocked(now, i, at, est)
+}
+
+// pktBadAnswerLocked fails an attempt whose OPEN_ACK(OK) or JOIN_ACK(OK)
+// carried invalid packet values (§A3.5): a protocol violation of that
+// carrier, which is killed; the attempt counts as failed (failed mark,
+// backoff) and the race or redial continues.
+func (a *actor) pktBadAnswerLocked(now time.Time, i int, at *attempt, est *carrier.Established, err error) {
+	a.killEst(est, carrier.CauseProtocolViolation, err.Error())
+	a.d.setLast(err)
+	a.finish(now, i, at, sched.OutcomeFailed)
+	a.markFailed(i, carrier.CauseProtocolViolation.String())
 }
 
 // joinRefusedLocked handles a non-OK JOIN_ACK from the bound instance
@@ -885,7 +973,7 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	}
 	s.routingChangedLocked()
 	a.episodeEndLocked(now)
-	est.Conn.Start(l, &s.mb, carrier.StartOptions{Gauge: d.gauge(i)})
+	est.Conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Gauge: a.laneGauge(est.Conn.Kind(), i)})
 	a.succeeded(i)
 	a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)
 }

@@ -99,11 +99,12 @@ func (a *actor) bondSlotsLocked(now time.Time) {
 // While a rescue is pending, every step wakes the lanes that may send it,
 // so a member's death, retirement or attach hands it over without waiting
 // for an unrelated wake. It runs on both sides: the passive rescues its own
-// sends over its data lanes (the applied SCHED's members).
+// sends over its data lanes (the applied SCHED's members). A packet session
+// retransmits nothing (plan D9): no rescue.
 func (a *actor) rescueLocked(now time.Time) {
 	s := a.s
 	st := &s.st
-	if s.p.Mode != ModeBond || st.ended || st.sBase >= st.end {
+	if s.pk != nil || s.p.Mode != ModeBond || st.ended || st.sBase >= st.end {
 		a.rescueAt = time.Time{}
 		return
 	}
