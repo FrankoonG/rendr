@@ -27,9 +27,13 @@ package udpflow
 
 import (
 	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // Default bounds (M2-D59; testhooks may change them).
@@ -39,6 +43,30 @@ const (
 	DefaultInbox         = 512  // datagrams queued per flow
 	DefaultTombstones    = 4096 // removed flow IDs remembered per source (oldest forgotten first; R1-11)
 	MaxFlowsCap          = 65536
+)
+
+// Internal bounds of the demultiplexer.
+const (
+	// defaultTombstoneTTL is the TombstoneTTL of a zero Limits:
+	// max(Handshake.Timeout, DialTimeout) + 2 s with the default 10-s
+	// timeouts (R1-11). package rendr always sets it.
+	defaultTombstoneTTL = 12 * time.Second
+	// reserveBufs is the control reserve of one flow: datagrams without a
+	// DGRAM frame it may hold in Stages-charged buffers while the Budget
+	// refuses inbox buffers (M2-D59; L16).
+	reserveBufs = 4
+	// minRing is the inbox ring a new flow starts with; it doubles up to
+	// Limits.Inbox and never shrinks (no allocation per datagram in steady
+	// state, no 512-entry ring per idle flow).
+	minRing = 8
+	// backoffMin and backoffMax bound the noise backoff of the demux loop
+	// (L58: 5 ms doubling to 100 ms).
+	backoffMin = 5 * time.Millisecond
+	backoffMax = 100 * time.Millisecond
+	// emptyRun is the number of consecutive empty reads after which the
+	// demux backs off like noise: an embedder conn that returns (0, addr,
+	// nil) forever must not spin a core (PA-18, R1-27).
+	emptyRun = 64
 )
 
 // Limits bound one Source.
@@ -69,16 +97,121 @@ type Limits struct {
 type Admit func(f *Flow)
 
 // Source is the demultiplexer of one shared socket.
+//
+// Locks: Source.mu guards the flow table, the per-IP admitting counts, the
+// tombstones and the lifecycle; Flow.mu guards one flow's inbox, peer and
+// deadlines. The order is Source.mu → Flow.mu; neither is held across a
+// socket call or a callback (M2 design §A4.2).
 type Source struct {
 	env *carrier.Env
 	pc  net.PacketConn // a *carrier.OwnedUDPSocket gets the AddrPort fast path; any other conn is used through its methods only (L57)
 	lim Limits
+
+	own       *carrier.OwnedUDPSocket // pc when it is exactly rendr's own listening socket, else nil
+	maxDgram  int                     // the largest datagram read: own.MaxDatagram(), else wire.MaxDatagram
+	dbufs     *carrier.BufPool        // Env.DBufs (a private pool when the Env has none)
+	stages    *carrier.Budget         // the account of the spare and the control reserve (Env.Stages, else Env.Budget)
+	firstCseq uint32                  // the REL cseq of a valid H1 (Presets.FirstCseq or wire.FirstCseq)
+	firstFseq uint32                  // Presets.FirstFseq (0: an H1's first frame carries its PREFACE's fseq)
+
+	halted atomic.Bool   // the socket close started: Run returns, flow writes fail
+	killed atomic.Bool   // Abort, a permanent read error or the end of Run: every flow's reads fail
+	quit   chan struct{} // closed with halted: ends a backoff sleep
+
+	mu         sync.Mutex
+	flows      map[uint64]*Flow
+	perIP      map[netip.Addr][2]int32 // admitting flows per source IP address and class
+	admitting  int
+	tombs      map[uint64]time.Time // removed flow IDs → refused until (R1-11)
+	tq         []tomb               // the same IDs, oldest first (from tqHead)
+	tqHead     int
+	stopped    bool // no admission: Stop, Abort or a permanent error
+	closing    bool // the socket close started (exactly once)
+	sockDone   bool // the socket's Close returned or was abandoned
+	run        runState
+	runWatch   *watch
+	doneClosed bool
+	done       chan struct{}
+
+	dropped, truncated, inboxDrops, readErrors, quotaDrops atomic.Uint64
+
+	ans [wire.FlowHeaderLen + wire.PrefaceLen]byte // the stateless PREFACE_ACK answer (Run goroutine only)
 }
+
+// runState is the life of a Source's Run goroutine.
+type runState uint8
+
+const (
+	runIdle      runState = iota // Run not called yet
+	runRunning                   // Run is reading
+	runExited                    // Run returned
+	runAbandoned                 // Run was stuck in the conn's ReadFrom AbandonWait after the close (L50)
+)
+
+// tomb is one removed flow ID and the end of its refusal.
+type tomb struct {
+	id    uint64
+	until time.Time
+}
+
+// Admission classes of a new flow (R1-21).
+const (
+	classOpen = 0 // the H1 carries an OPEN
+	classJoin = 1 // the H1 carries a JOIN or a probe PING
+)
 
 // NewSource wraps pc; ownership of pc moves to the Source (closed by Stop
 // once the last flow ended, or by Abort).
 func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
-	return &Source{env: env, pc: pc, lim: lim}
+	s := &Source{env: env, pc: pc, lim: lim.normalized(), maxDgram: wire.MaxDatagram,
+		dbufs: env.DBufs, stages: env.Stages, firstCseq: env.Presets.FirstCseq, firstFseq: env.Presets.FirstFseq,
+		quit: make(chan struct{}), flows: make(map[uint64]*Flow), perIP: make(map[netip.Addr][2]int32),
+		tombs: make(map[uint64]time.Time), done: make(chan struct{})}
+	if own, ok := pc.(*carrier.OwnedUDPSocket); ok {
+		s.own, s.maxDgram = own, own.MaxDatagram()
+	}
+	if s.dbufs == nil {
+		s.dbufs = carrier.NewDatagramBufPool()
+	}
+	if s.stages == nil {
+		s.stages = env.Budget
+	}
+	if s.firstCseq == 0 {
+		s.firstCseq = wire.FirstCseq
+	}
+	return s
+}
+
+// normalized returns l with every unset bound at its default and MaxFlows
+// capped at MaxFlowsCap.
+func (l Limits) normalized() Limits {
+	if l.MaxFlows <= 0 || l.MaxFlows > MaxFlowsCap {
+		l.MaxFlows = MaxFlowsCap
+	}
+	if l.PerSource <= 0 {
+		l.PerSource = DefaultPerSource
+	}
+	if l.PerSourceJoin <= 0 {
+		l.PerSourceJoin = DefaultPerSourceJoin
+	}
+	if l.Inbox <= 0 {
+		l.Inbox = DefaultInbox
+	}
+	if l.TombstoneTTL <= 0 {
+		l.TombstoneTTL = defaultTombstoneTTL
+	}
+	if l.Tombstones <= 0 {
+		l.Tombstones = DefaultTombstones
+	}
+	return l
+}
+
+// quota returns the per-IP admitting bound of class c.
+func (l *Limits) quota(c uint8) int32 {
+	if c == classOpen {
+		return int32(l.PerSource)
+	}
+	return int32(l.PerSourceJoin)
 }
 
 // Run is the demux loop (M2 design §A6.2): it reads pc until Abort, Stop
@@ -90,31 +223,58 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 // read and write errors are classified by carrier.ClassifyPacketErr, an
 // abort (PacketErrAbort) being noise on the shared socket (integration 1).
 func (s *Source) Run(admit Admit) {
-	panic("unimplemented: M2")
+	s.mu.Lock()
+	if s.run != runIdle {
+		s.mu.Unlock()
+		return // one loop per source
+	}
+	s.run = runRunning
+	s.mu.Unlock()
+	r := &reader{s: s, admit: admit}
+	defer r.exit() // also on runtime.Goexit inside the conn's ReadFrom
+	if s.own != nil {
+		r.loopOwned()
+	} else {
+		r.loopForeign()
+	}
 }
 
 // Stop ends admission (a new flow's H1 gets a stateless
 // PREFACE_ACK(CAPACITY)); the socket closes once the last flow ended
 // (Listener.Close: accepted sessions keep their carriers, plan:471).
 func (s *Source) Stop() {
-	panic("unimplemented: M2")
+	s.mu.Lock()
+	s.stopped = true
+	if len(s.flows) == 0 {
+		s.closeSocketLocked()
+	}
+	s.mu.Unlock()
 }
 
 // Abort closes the socket at once; every flow's reads fail (Runtime.Close's
 // last step).
 func (s *Source) Abort() {
-	panic("unimplemented: M2")
+	s.mu.Lock()
+	s.killLocked()
+	s.closeSocketLocked()
+	s.mu.Unlock()
 }
 
 // Done is closed when Run returned, the socket is closed and every flow
 // ended.
-func (s *Source) Done() <-chan struct{} {
-	panic("unimplemented: M2")
-}
+func (s *Source) Done() <-chan struct{} { return s.done }
 
 // Stats returns the source's counters (rendr.Status.Datagram).
 func (s *Source) Stats() Stats {
-	panic("unimplemented: M2")
+	s.mu.Lock()
+	st := Stats{Flows: len(s.flows), Admitting: s.admitting}
+	s.mu.Unlock()
+	st.Dropped = s.dropped.Load()
+	st.Truncated = s.truncated.Load()
+	st.InboxDrops = s.inboxDrops.Load()
+	st.ReadErrors = s.readErrors.Load()
+	st.QuotaDrops = s.quotaDrops.Load()
+	return st
 }
 
 // Stats are one Source's counters.
@@ -128,94 +288,199 @@ type Stats struct {
 	QuotaDrops uint64 // of Dropped: valid H1 refused by a per-source quota or MaxFlows
 }
 
-// Flow is one raw-UDP carrier's view of the shared socket. *Flow implements
-// carrier.PacketIO and can rebind: a datagram of the flow from another
-// source is returned as carrier.ReadCandidate (M2-D27), and SetPeer moves
-// the reply address once the carrier verified the candidate.
-type Flow struct {
-	id  uint64
-	src *Source
+// killLocked ends the source for its flows: no admission, and every flow's
+// reads fail from now on (Abort, a permanent read error, the end of Run).
+func (s *Source) killLocked() {
+	s.stopped = true
+	if s.killed.Swap(true) {
+		return
+	}
+	for _, f := range s.flows {
+		f.wake()
+	}
 }
 
-// ID returns the flow ID.
-func (f *Flow) ID() uint64 { return f.id }
-
-// Admitted tells the source that a positive verdict was written for the
-// flow (OPEN_ACK or JOIN_ACK OK, or a probe carrier started): it leaves the
-// per-source admitting count.
-func (f *Flow) Admitted() {
-	panic("unimplemented: M2")
+// closeSocketLocked starts the socket's close exactly once — whichever of
+// Stop's last flow, Abort or the end of Run comes first (A12 #17: the
+// shared socket is closed once, never under live flows by Listener.Close).
+// The close runs on its own goroutine: a foreign conn's Close may hang
+// (abandoned after AbandonWait, L50), and Run, whose read the close should
+// end, is abandoned the same way if its ReadFrom ignores the close.
+func (s *Source) closeSocketLocked() {
+	if s.closing {
+		return
+	}
+	s.closing = true
+	s.halted.Store(true)
+	close(s.quit)
+	if s.run == runRunning {
+		s.runWatch = startWatch(s.env.Abandon, s.abandonWait(), s.runStuck)
+	}
+	go s.closeSocket()
 }
 
-// ReadSize implements carrier.PacketIO: 0 (inbox buffers are handed out).
-func (f *Flow) ReadSize() int { return 0 }
-
-// SetLimit implements carrier.PacketIO: inbox datagrams with more rendr
-// bytes than n are returned as carrier.ReadTruncated (R1-6).
-func (f *Flow) SetLimit(n int) {
-	panic("unimplemented: M2")
+// closeSocket closes pc (guarded: a panic is contained, a hang abandoned).
+func (s *Source) closeSocket() {
+	w := startWatch(s.env.Abandon, s.abandonWait(), s.sockClosed)
+	defer func() {
+		_ = recover() // a panicking Close still counts as closed
+		if w.finish() {
+			s.sockClosed()
+		}
+	}()
+	_ = s.pc.Close()
 }
 
-// ReadDatagram implements carrier.PacketIO: the next inbox datagram.
-func (f *Flow) ReadDatagram(buf []byte) ([]byte, carrier.PeerKey, carrier.ReadEvent, error) {
-	panic("unimplemented: M2")
+// sockClosed records that the socket's Close returned or was abandoned.
+func (s *Source) sockClosed() {
+	s.mu.Lock()
+	s.sockDone = true
+	s.checkDoneLocked()
+	s.mu.Unlock()
 }
 
-// Release implements carrier.PacketIO: returns the last inbox buffer.
-func (f *Flow) Release() {
-	panic("unimplemented: M2")
+// runStuck is the run watch's expiry: Run's ReadFrom ignored the close for
+// AbandonWait; it is counted as abandoned and no longer holds up Done.
+func (s *Source) runStuck() {
+	s.mu.Lock()
+	if s.run == runRunning {
+		s.run = runAbandoned
+		s.checkDoneLocked()
+	}
+	s.mu.Unlock()
 }
 
-// Headroom implements carrier.PacketIO: the flow header.
-func (f *Flow) Headroom() int {
-	panic("unimplemented: M2")
+// checkDoneLocked closes done once Run returned (or was abandoned), the
+// socket is closed and every flow ended.
+func (s *Source) checkDoneLocked() {
+	if s.doneClosed || !s.sockDone || len(s.flows) != 0 {
+		return
+	}
+	if s.run != runExited && s.run != runAbandoned {
+		return
+	}
+	s.doneClosed = true
+	close(s.done)
 }
 
-// WriteDatagram implements carrier.PacketIO: to the flow's current peer.
-func (f *Flow) WriteDatagram(b []byte) error {
-	panic("unimplemented: M2")
+// abandonWait is the bound on joining a goroutine stuck in the conn.
+func (s *Source) abandonWait() time.Duration {
+	if d := s.env.Timing.AbandonWait; d > 0 {
+		return d
+	}
+	return time.Second
 }
 
-// WriteDatagramTo implements carrier.PacketIO: a rebind challenge to the
-// latest candidate only.
-func (f *Flow) WriteDatagramTo(b []byte, dst carrier.PeerKey) error {
-	panic("unimplemented: M2")
+// remove deletes f from the table — only if the table still maps f's ID
+// to f (pointer compare, L58: a late removal of a dead flow never removes
+// a newer flow with the same ID) — and leaves a tombstone of the ID for
+// TombstoneTTL (R1-11). f leaves its IP's admitting count either way. The
+// socket closes when it was the last flow of a stopped source.
+func (s *Source) remove(f *Flow) {
+	now := time.Now()
+	s.mu.Lock()
+	if s.flows[f.id] == f {
+		delete(s.flows, f.id)
+		s.addTombLocked(f.id, now)
+	}
+	if f.admitting {
+		f.admitting = false
+		s.unadmitLocked(f)
+	}
+	if s.stopped && len(s.flows) == 0 {
+		s.closeSocketLocked()
+	}
+	s.checkDoneLocked()
+	s.mu.Unlock()
 }
 
-// SetPeer implements carrier.PacketIO: the latest candidate only. The
-// carrier's reader calls it when a rebind commits (Flow.mu guards the
-// peer).
-func (f *Flow) SetPeer(dst carrier.PeerKey) error {
-	panic("unimplemented: M2")
+// unadmitLocked takes f out of its IP's admitting count.
+func (s *Source) unadmitLocked(f *Flow) {
+	s.admitting--
+	c := s.perIP[f.ip]
+	c[f.cls]--
+	if c == [2]int32{} {
+		delete(s.perIP, f.ip)
+	} else {
+		s.perIP[f.ip] = c
+	}
 }
 
-// SetDeadline implements carrier.PacketIO.
-func (f *Flow) SetDeadline(t time.Time) error {
-	panic("unimplemented: M2")
+// addTombLocked refuses id until now + TombstoneTTL, forgetting the
+// oldest tombstone when Tombstones are remembered (R1-11).
+func (s *Source) addTombLocked(id uint64, now time.Time) {
+	for s.tqHead < len(s.tq) && !now.Before(s.tq[s.tqHead].until) {
+		s.forgetTombLocked()
+	}
+	if len(s.tq)-s.tqHead >= s.lim.Tombstones {
+		s.forgetTombLocked()
+	}
+	if s.tqHead > 0 && s.tqHead >= len(s.tq)/2 {
+		n := copy(s.tq, s.tq[s.tqHead:])
+		clear(s.tq[n:])
+		s.tq, s.tqHead = s.tq[:n], 0
+	}
+	until := now.Add(s.lim.TombstoneTTL)
+	s.tq = append(s.tq, tomb{id: id, until: until})
+	s.tombs[id] = until
 }
 
-// SetReadDeadline implements carrier.PacketIO (wakes a waiting read).
-func (f *Flow) SetReadDeadline(t time.Time) error {
-	panic("unimplemented: M2")
+// forgetTombLocked drops the oldest tombstone (its map entry only if no
+// newer tombstone of the same ID replaced it).
+func (s *Source) forgetTombLocked() {
+	t := s.tq[s.tqHead]
+	s.tq[s.tqHead] = tomb{}
+	s.tqHead++
+	if u, ok := s.tombs[t.id]; ok && u.Equal(t.until) {
+		delete(s.tombs, t.id)
+	}
 }
 
-// SetWriteDeadline implements carrier.PacketIO (recorded; a shared socket
-// has no per-flow write deadline, the writer's watchdog bounds a stuck
-// write).
-func (f *Flow) SetWriteDeadline(t time.Time) error {
-	panic("unimplemented: M2")
+// tombLocked reports whether id is tombstoned at now.
+func (s *Source) tombLocked(id uint64, now time.Time) bool {
+	u, ok := s.tombs[id]
+	if !ok {
+		return false
+	}
+	if now.Before(u) {
+		return true
+	}
+	delete(s.tombs, id)
+	return false
 }
 
-// Close implements carrier.PacketIO: removes the flow (pointer compare),
-// releases its inbox and wakes its reader; the socket stays open.
-func (f *Flow) Close() error {
-	panic("unimplemented: M2")
+// watch bounds the wait for a goroutine inside an embedder call (L50,
+// L52): if finish is not called within d, the goroutine is counted in the
+// abandoned-call pool and onAbandon runs (on the timer's goroutine); a
+// later finish leaves the pool.
+type watch struct {
+	state atomic.Uint32 // 0 running, 1 finished in time, 2 abandoned
+	timer *time.Timer
+	pool  *carrier.AbandonPool
 }
 
-// Limit implements carrier.PacketIO: the socket's MaxDatagram − 9
-// (wire.MaxDatagram − 9 for a foreign conn).
-func (f *Flow) Limit() int {
-	panic("unimplemented: M2")
+func startWatch(pool *carrier.AbandonPool, d time.Duration, onAbandon func()) *watch {
+	w := &watch{pool: pool}
+	w.timer = time.AfterFunc(d, func() {
+		if !w.state.CompareAndSwap(0, 2) {
+			return
+		}
+		if w.pool != nil {
+			w.pool.Adopt()
+		}
+		onAbandon()
+	})
+	return w
 }
 
-var _ carrier.PacketIO = (*Flow)(nil)
+// finish reports whether the call returned before its abandonment.
+func (w *watch) finish() bool {
+	if w.state.CompareAndSwap(0, 1) {
+		w.timer.Stop()
+		return true
+	}
+	if w.pool != nil {
+		w.pool.Leave()
+	}
+	return false
+}
