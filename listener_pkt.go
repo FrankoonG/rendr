@@ -7,6 +7,7 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/session"
 	"github.com/FrankoonG/rendr/v2/internal/udpflow"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // The packet half of a Listener (M2 design §A5.14): FromPacketConn sources
@@ -17,17 +18,21 @@ import (
 // can close) hands every new flow to newFlow, which starts the flow's
 // handshake in a handshake slot. Listener.Close stops the source's
 // admission (a new flow's H1 is answered CAPACITY by the source; its socket
-// closes after its last flow ended); Runtime.Close aborts it after its
-// close bound and joins its Done (M2-D58). The Runtime keeps every source
-// whose Done has not closed (Status.Datagram).
+// closes after its last flow ended); Runtime.Close aborts it once the
+// sessions ended or had the close bound, and joins its Done (M2-D58). The
+// Runtime keeps every source whose Done has not closed (Status.Datagram);
+// Listen and Status drop the finished ones.
 
 // newSourcesLocked wraps the FromPacketConn sockets of one Listen call in
 // sources with the Runtime's flow bounds (M2-D59) and records them; the
-// caller holds rt.mu and starts them with the Listener.
+// caller holds rt.mu and starts them with the Listener. Finished sources
+// are dropped first, so that repeated Listen and Listener.Close keep the
+// record bounded by the live sources even when Status is never read.
 func (rt *Runtime) newSourcesLocked(pcs []net.PacketConn) []*udpflow.Source {
 	if len(pcs) == 0 {
 		return nil
 	}
+	rt.pruneSourcesLocked()
 	out := make([]*udpflow.Source, len(pcs))
 	for i, pc := range pcs {
 		out[i] = udpflow.NewSource(&rt.cenv, pc, rt.eff.flow)
@@ -61,15 +66,18 @@ func (ln *Listener) newFlow(f *udpflow.Flow) {
 // closed, dropping the others. The caller holds rt.mu (a leaf: the
 // sources' own locks are taken afterwards, by datagramStatus).
 func (rt *Runtime) liveSourcesLocked() []*udpflow.Source {
-	var out []*udpflow.Source
+	rt.pruneSourcesLocked()
+	return mapKeys(rt.sources)
+}
+
+// pruneSourcesLocked drops the sources whose Done has closed. The caller
+// holds rt.mu.
+func (rt *Runtime) pruneSourcesLocked() {
 	for src := range rt.sources {
 		if isClosed(src.Done()) {
 			delete(rt.sources, src)
-			continue
 		}
-		out = append(out, src)
 	}
-	return out
 }
 
 // datagramStatus returns Status.Datagram (M2 design §A5.14): the live
@@ -159,6 +167,23 @@ func (rt *Runtime) flowsOpened(s *session.Session) {
 	for _, fl := range flows {
 		fl.Admitted()
 	}
+}
+
+// sessionKind returns the kind of the passive session s (routeOpen's
+// kind check, M2 design §A3.5): datagram for a packet session, which the
+// admission records in pflows before it becomes visible and until its
+// entry is a tombstone, or which reports it itself (Session.Kind).
+func (rt *Runtime) sessionKind(s *session.Session) wire.CarrierKind {
+	if s.Kind() == wire.KindDatagram {
+		return wire.KindDatagram
+	}
+	rt.fmu.Lock()
+	_, packet := rt.pflows[s]
+	rt.fmu.Unlock()
+	if packet {
+		return wire.KindDatagram
+	}
+	return wire.KindStream
 }
 
 // flowOf returns the raw-UDP flow behind a datagram transport, or nil.

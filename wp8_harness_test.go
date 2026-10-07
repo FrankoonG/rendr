@@ -344,3 +344,42 @@ func (d *wdDialer) wdProbePing(rt *Runtime) {
 	}
 	d.t.Fatal("no PONG for the PING")
 }
+
+// wdNoFlowRecords requires that rt holds no passive packet session's flow
+// record (rt.pflows): each one leaves with its session (Registry.Ended)
+// or a lost insert, so none keeps an ended session reachable (invariant 4).
+func wdNoFlowRecords(t testing.TB, rt *Runtime) {
+	t.Helper()
+	rt.fmu.Lock()
+	n := len(rt.pflows)
+	rt.fmu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d flow records left after their sessions ended", n)
+	}
+}
+
+// wdFindOpenAck reads the passive's datagrams until one carries a reliable
+// OPEN_ACK (GOAWAY, CLOSE and RACKs around it skipped) and returns it;
+// false when none came within 3 s of the previous datagram.
+func (d *wdDialer) wdFindOpenAck() (wire.OpenAck, bool) {
+	d.t.Helper()
+	for range 32 {
+		b := d.read(3 * time.Second)
+		if b == nil {
+			break
+		}
+		if wire.IsPreface(b) {
+			continue
+		}
+		for _, f := range d.frames(b) {
+			if f.Type != wire.TypeRel {
+				continue
+			}
+			if h, inner, err := wire.ParseRel(f.Payload); err == nil && h.Type == wire.TypeOpenAck {
+				a, err := wire.ParseOpenAck(inner)
+				return a, err == nil
+			}
+		}
+	}
+	return wire.OpenAck{}, false
+}

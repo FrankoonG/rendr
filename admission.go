@@ -16,8 +16,9 @@ import (
 // carrier (M2 design §A3.5); a packet OPEN on a datagram carrier fixes the
 // carrier's frame budget, cmtu_acc = min(the dialer's offer, the
 // transport's limit), before anything else uses the carrier (M2-D50, R1-5);
-// an existing entry routes the carrier (tombstone: its verdict, §6.5; live
-// session: AttachOpen, L47); then a closing Runtime answers GOING_AWAY, a
+// an existing entry routes the carrier (tombstone: its verdict, §6.5; a
+// live session of the other kind: BAD_REQUEST CodeBadKind; live session:
+// AttachOpen, L47); then a closing Runtime answers GOING_AWAY, a
 // closed Listener (whose Runtime runs on) CAPACITY(CodeBacklog), MaxSessions
 // and the Listener's backlog of the OPEN's session kind answer CAPACITY;
 // otherwise both reservations are taken, the pending session is created
@@ -49,7 +50,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 	}
 	key := passiveKey(InstanceID(h.Preface.Instance), SessionID(o.SID))
 	if r := rt.table.lookup(key, time.Now()); r.found {
-		return rt.routeOpen(r, c, fl, deadline)
+		return rt.routeOpen(r, c, fl, o.Kind, deadline)
 	}
 	if st, code := ln.refusal(); st != wire.StatusOK {
 		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
@@ -93,7 +94,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 		rt.untrackFlows(s)
 		ln.unreserve(k)
 		rt.table.unreserve()
-		return rt.routeOpen(r, c, fl, deadline)
+		return rt.routeOpen(r, c, fl, o.Kind, deadline)
 	}
 	ln.bind(s, k)
 	s.Start()
@@ -161,18 +162,23 @@ func packetAccept(o *wire.Open, limit, ownMax int) (cmtu, maxPayload int) {
 // routeOpen routes an OPEN carrier to an existing entry (design §6.2,
 // §6.5): a tombstone repeats its verdict (L47: REJECTED, CAPACITY or
 // GOING_AWAY for a session that never opened, UNKNOWN_SESSION for one that
-// did or was withdrawn); a live session takes it with AttachOpen (pending:
+// did or was withdrawn); an OPEN of kind other than the live session's is
+// BAD_REQUEST CodeBadKind (M2 design §A3.5: a datagram carrier on a stream
+// session, or a stream-kind OPEN on a packet session, is a protocol
+// violation of that carrier, never the session's); a live session takes it with AttachOpen (pending:
 // parked until the verdict; open: adopted with OPEN_ACK(OK)) or returns the
 // verdict to answer (CAPACITY CodeCarriers, BAD_REQUEST for a carrier ID it
 // already attached, an ended session's verdict). A datagram carrier's
 // budget was set by admitOpen before (R1-5). It reports whether it answered
 // the carrier itself.
-func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, fl *udpflow.Flow, deadline time.Time) (refused bool) {
+func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, fl *udpflow.Flow, kind wire.CarrierKind, deadline time.Time) (refused bool) {
 	switch {
 	case r.tomb:
 		answerOpen(c, r.verdict.OpenAck(), deadline)
 	case r.sess == nil: // a passive key never holds a dialer placeholder
 		answerOpen(c, wire.OpenAck{Status: wire.StatusUnknownSession}, deadline)
+	case rt.sessionKind(r.sess) != kind:
+		answerOpen(c, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeBadKind}, deadline)
 	default:
 		taken, v := r.sess.AttachOpen(c)
 		if taken {
@@ -191,16 +197,19 @@ func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, 
 // decides everything else under its own lock (pending: BAD_REQUEST; ended:
 // UNKNOWN_SESSION; mode; the carrier's kind and a packet session's cmtu
 // offer, M2 design §A3.5; carrier limit; rxNext), and the root writes the
-// status of a JOIN it did not take. An accepted JOIN's raw-UDP flow leaves
-// its source's admitting quota (M2-D59). It reports whether it answered
-// the carrier itself.
-func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time, fl *udpflow.Flow) (refused bool) {
+// status of a JOIN it did not take. A datagram carrier's cmtu offer is
+// first bounded by its transport's limit (joinOffer), so the session fixes
+// cmtu_acc = min(rxNext, limit) as for an OPEN (M2 design §A5.4, M2-D50).
+// An accepted JOIN's raw-UDP flow leaves its source's admitting quota
+// (M2-D59). It reports whether it answered the carrier itself.
+func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time, limit int, fl *udpflow.Flow) (refused bool) {
 	c := h.Conn
 	j, err := wire.ParseJoin(h.Payload)
 	if err != nil {
 		answerJoin(c, wire.StatusBadRequest, deadline)
 		return true
 	}
+	j.RxNext = joinOffer(j.RxNext, c.Kind(), limit)
 	r := rt.table.lookup(passiveKey(InstanceID(h.Preface.Instance), SessionID(j.SID)), time.Now())
 	if !r.found || r.tomb || r.sess == nil {
 		answerJoin(c, wire.StatusUnknownSession, deadline)
@@ -215,6 +224,19 @@ func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time, fl *udpflow.F
 	}
 	answerJoin(c, st, deadline)
 	return true
+}
+
+// joinOffer bounds a JOIN's cmtu offer by the transport limit of the
+// datagram carrier it came on (M2 design §A5.4: the passive's cmtu_acc =
+// min(rxNext, io.Limit())). A stream carrier's rxNext (a stream session's
+// delivered offset, or a packet session's 0) and an offer outside
+// [MinFrameBudget, MaxDatagram], which the session refuses as it is, are
+// returned unchanged.
+func joinOffer(rxNext uint64, k wire.CarrierKind, limit int) uint64 {
+	if k != wire.KindDatagram || limit <= 0 || rxNext < wire.MinFrameBudget || rxNext > wire.MaxDatagram {
+		return rxNext
+	}
+	return min(rxNext, uint64(limit))
 }
 
 // lnRegistry is the session.Registry of the passive sessions a Listener

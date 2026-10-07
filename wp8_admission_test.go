@@ -81,6 +81,107 @@ func TestPassiveBudgetNegotiated_L37(t *testing.T) {
 			t.Errorf("%s: packetAccept = %d, %d; want %d, %d", tc.name, cm, mp, tc.cmtu, tc.maxPayload)
 		}
 	}
+	// The JOIN half (§A5.4: cmtu_acc = min(rxNext, io.Limit())): admitJoin
+	// bounds a datagram carrier's offer by its transport's limit before the
+	// session fixes the budget; a stream carrier's rxNext (an offset) and
+	// an offer out of range (refused by the session) pass unchanged. The
+	// end-to-end row (a JOIN offering 1400 on a 1152 transport is answered
+	// JOIN_ACK cmtu_acc 1152) passes at integration 2.
+	for _, tc := range []struct {
+		name   string
+		rxNext uint64
+		kind   wire.CarrierKind
+		limit  int
+		want   uint64
+	}{
+		{"QUIC-like transport, larger offer", 1400, wire.KindDatagram, 1152, 1152},
+		{"QUIC-like transport, smaller offer", 1000, wire.KindDatagram, 1152, 1000},
+		{"unknown limit", 1400, wire.KindDatagram, wire.MaxDatagram, 1400},
+		{"stream carrier: rxNext is an offset", 1 << 40, wire.KindStream, 0, 1 << 40},
+		{"stream carrier of a packet session", 0, wire.KindStream, 0, 0},
+		{"offer below the floor stays refused", wire.MinFrameBudget - 1, wire.KindDatagram, 1152, wire.MinFrameBudget - 1},
+		{"offer above MaxDatagram stays refused", wire.MaxDatagram + 1, wire.KindDatagram, 1152, wire.MaxDatagram + 1},
+	} {
+		if got := joinOffer(tc.rxNext, tc.kind, tc.limit); got != tc.want {
+			t.Errorf("%s: joinOffer(%d, %v, %d) = %d, want %d", tc.name, tc.rxNext, tc.kind, tc.limit, got, tc.want)
+		}
+	}
+}
+
+// TestOpenKindMismatchRefused: an OPEN routed to an existing session of
+// the other kind (the same dialer instance and SID) is refused BAD_REQUEST
+// CodeBadKind on its own carrier and never attached (M2 design §A3.5;
+// invariant 6: the carrier that violates the protocol is refused, the
+// session survives). A packet OPEN — over a datagram flow or over a stream
+// carrier — meets a pending stream session, and a stream OPEN meets a
+// pending packet session; each existing session keeps its backlog slot and
+// its first carrier, which then receives its verdict. Attaching a datagram
+// carrier to a stream session would make the stream session's writer put
+// an ACK into a datagram batch, a panic on a carrier goroutine.
+func TestOpenKindMismatchRefused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		hub := rendrtest.NewDatagramHub(rendrtest.DatagramHubConfig{Name: "kind"})
+		defer hub.Close()
+		ln := wpListen(t, rt, ListenConfig{Sources: []Source{FromPacketConn(hub.PacketConn())}})
+		inst := wpInst(0xb6)
+
+		// A pending stream session; a packet OPEN of its key on a datagram
+		// flow and on a stream carrier.
+		ss := wpConnect(t, ln, inst, 1)
+		ss.hello(rt)
+		ss.send(wire.TypeOpen, 0, wpOpen(wpSID(20), wire.KindStream, 1, nil))
+		synctest.Wait()
+		g := wdHubDial(t, hub, inst, 2)
+		g.sendH1(wire.TypeOpen, wdPacketOpen(wpSID(20), 1, 1223, 1198))
+		g.expectH2(rt)
+		if a := g.expectOpenAck(wire.StatusBadRequest, wire.CodeBadKind); a.Window != 0 {
+			t.Fatalf("refusal of a packet OPEN on a stream session: %+v", a)
+		}
+		sp := wpConnect(t, ln, inst, 3)
+		sp.hello(rt)
+		sp.send(wire.TypeOpen, 0, wdPacketOpen(wpSID(20), 1, 0, 1127))
+		sp.expectOpenAck(wire.StatusBadRequest, wire.CodeBadKind)
+
+		// A pending packet session; a stream OPEN of its key.
+		pg := wdHubDial(t, hub, inst, 4)
+		pg.sendH1(wire.TypeOpen, wdPacketOpen(wpSID(21), 1, 1223, 1198))
+		pg.expectH2(rt)
+		synctest.Wait()
+		ps := wpConnect(t, ln, inst, 5)
+		ps.hello(rt)
+		ps.send(wire.TypeOpen, 0, wpOpen(wpSID(21), wire.KindStream, 1, nil))
+		ps.expectOpenAck(wire.StatusBadRequest, wire.CodeBadKind)
+
+		synctest.Wait()
+		if st := rt.Status(); st.AcceptBacklog != [2]int{1, 1} || st.Sessions.Pending != 2 {
+			t.Fatalf("the existing sessions after the refusals: %+v", st)
+		}
+		pc, err := ln.Accept(context.Background())
+		if err != nil || pc.ID() != SessionID(wpSID(20)) {
+			t.Fatalf("Accept = %v, %v; want the stream session", pc, err)
+		}
+		if err := pc.Reject(5, "s"); err != nil {
+			t.Fatal(err)
+		}
+		ss.expectOpenAck(wire.StatusRejected, 5)
+		pp, err := ln.AcceptPacket(context.Background())
+		if err != nil || pp.ID() != SessionID(wpSID(21)) {
+			t.Fatalf("AcceptPacket = %v, %v; want the packet session", pp, err)
+		}
+		if err := pp.Reject(6, "p"); err != nil {
+			t.Fatal(err)
+		}
+		pg.expectOpenAck(wire.StatusRejected, 6)
+		for _, d := range []*wpDialer{ss, sp, ps} {
+			d.close()
+		}
+		g.close()
+		pg.close()
+		rt.Close()
+		wpNoState(t, rt)
+		wdNoFlowRecords(t, rt)
+	})
 }
 
 // TestDuplicateOpenBudget: the opening race sends a packet session's OPEN
@@ -189,6 +290,7 @@ func TestPacketOpenOnStreamCarrier(t *testing.T) {
 		if st := rt.Status(); st.AcceptBacklog != [2]int{} || st.Sessions.Pending != 0 {
 			t.Fatalf("after Reject: %+v", st)
 		}
+		wdNoFlowRecords(t, rt) // the ended session's flow record went with it
 		rt.Close()
 		wpNoState(t, rt)
 	})
@@ -242,6 +344,7 @@ func TestPacketOpenPools_L48(t *testing.T) {
 		}
 		rt.Close()
 		wpNoState(t, rt)
+		wdNoFlowRecords(t, rt)
 	})
 }
 

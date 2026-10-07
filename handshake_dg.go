@@ -81,7 +81,7 @@ func (rt *Runtime) handshakeDatagram(ln *Listener, slot *hsSlot, io carrier.Pack
 	case wire.TypeOpen:
 		refused = rt.admitOpen(ln, h, deadline, io.Limit(), fl)
 	case wire.TypeJoin:
-		refused = rt.admitJoin(h, deadline, fl)
+		refused = rt.admitJoin(h, deadline, io.Limit(), fl)
 	case wire.TypePing:
 		c, inst, ok := rt.admitSessionless(h, deadline)
 		if !ok {

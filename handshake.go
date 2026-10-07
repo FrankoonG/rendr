@@ -125,7 +125,7 @@ func (rt *Runtime) handshake(ln *Listener, slot *hsSlot, nc net.Conn, at time.Ti
 	case wire.TypeOpen:
 		refused = rt.admitOpen(ln, h, deadline, 0, nil)
 	case wire.TypeJoin:
-		refused = rt.admitJoin(h, deadline, nil)
+		refused = rt.admitJoin(h, deadline, 0, nil)
 	case wire.TypePing:
 		c, inst, ok := rt.admitSessionless(h, deadline)
 		if !ok {

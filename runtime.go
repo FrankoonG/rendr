@@ -317,11 +317,21 @@ func (rt *Runtime) Close() error {
 		}
 	}
 	close(rt.cut)
-	// FromPacketConn sources close their sockets now (M2-D58, M2 design
-	// §A4.6): their sessions' GOAWAYs had the close bound; every flow's
-	// reads fail, and each source's Done is joined below.
-	for _, src := range srcs {
-		src.Abort()
+	// FromPacketConn sources close their sockets only after the sessions
+	// (M2-D58, M2 design §A4.6): the open packet sessions' RST(GoingAway)
+	// and their carriers' GOAWAYs are REL-wrapped and travel over these
+	// sockets, so every session — the ones that ended meanwhile included —
+	// gets until its end or the close bound. Then every flow's reads fail,
+	// and each source's Done is joined below.
+	if len(srcs) > 0 {
+		early := doneOf(rt.table.live())
+		rt.mu.Lock()
+		early = append(early, rt.draining...)
+		rt.mu.Unlock()
+		waitDone(early, killAt)
+		for _, src := range srcs {
+			src.Abort()
+		}
 	}
 	rt.hsg.wait(killAt.Add(wait), rt.abandon)
 	join := doneOf(rt.table.live())
