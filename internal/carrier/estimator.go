@@ -49,6 +49,7 @@ type pingRecord struct {
 type carrierState struct {
 	// Estimator.
 	srtt, minRTT               time.Duration
+	rttvar                     time.Duration // RFC 6298 RTT variation (sched.RTTVar): only the REL timeout uses it (M2-D16)
 	rttSeen                    bool
 	rate                       float64 // bytes/s: decaying max of backlogged PONG-watermark samples
 	submitted, pongMark        uint64  // DATA payload bytes written / proven by PONG watermarks
@@ -138,13 +139,24 @@ func decay(dt time.Duration) float64 {
 // batch; one appended after Fill (atEnd, endPing) follows every DATA byte
 // of its batch, and its mark includes them.
 func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time, atEnd bool) {
+	c.encodePingPadLocked(w, b, now, atEnd, 0)
+}
+
+// encodePingPadLocked is encodePingLocked with pad zero bytes of padding
+// (an MTU probe of a datagram carrier, M2-D24). On a datagram carrier
+// PING ids skip 0 when the counter wraps: id 0 is the rebind challenge
+// (M2-D27, L14); stream carriers keep M1's plain wrap.
+func (c *Conn) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd bool, pad int) {
 	st := &c.st
 	id := st.nextPingID
+	if id == 0 && c.dg != nil {
+		id = 1
+	}
 	busy, judged := st.lastBusy, now.Sub(st.intervalStart) >= minRateSample
 	if judged {
 		busy = w.backlogged(now, st.intervalStart)
 	}
-	p := wire.Ping{ID: id, TS: uint64(now.Sub(c.base)), Nonce: c.salt ^ uint64(id)}
+	p := wire.Ping{ID: id, TS: uint64(now.Sub(c.base)), Nonce: c.salt ^ uint64(id), Pad: pad}
 	if !b.addPing(busy, &p) {
 		return
 	}
@@ -152,7 +164,7 @@ func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time, atEnd bool) 
 	if atEnd {
 		mark += uint64(b.dataBytes())
 	}
-	st.nextPingID++
+	st.nextPingID = id + 1
 	st.push(pingRecord{id: id, nonce: p.Nonce, mark: mark, busy: busy})
 	st.pingSent, st.pingReq = true, false
 	st.lastBusy = busy
@@ -347,6 +359,7 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 	n0 := st.n
 	st.dropThrough(i)
 	rtt = now.Sub(rec.committedAt)
+	st.rttvar = sched.RTTVar(st.rttvar, st.srtt, rtt, !st.rttSeen) // before srtt (RFC 6298 §2.3)
 	if !st.rttSeen {
 		st.srtt, st.minRTT, st.rttSeen = rtt, rtt, true
 	} else {
