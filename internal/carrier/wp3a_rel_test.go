@@ -320,6 +320,8 @@ func TestRelInOrderDispatch_L12_L45(t *testing.T) {
 			var lost atomic.Int32
 			a.io.setFilter(dropFirst(withRel(first), 1, &lost))
 			release := make(chan struct{})
+			var once sync.Once
+			defer once.Do(func() { close(release) }) // a failed assertion never leaves the reader blocked
 			var blocking atomic.Bool
 			b.ep.setHook(func(h wire.Header, p []byte) {
 				if off, _ := wire.ParseFin(p); h.Type == wire.TypeFin && off == 1 {
@@ -348,7 +350,7 @@ func TestRelInOrderDispatch_L12_L45(t *testing.T) {
 			if !sawFirst {
 				t.Fatal("no RACK covered the dispatched first FIN")
 			}
-			close(release)
+			once.Do(func() { close(release) })
 			synctest.Wait()
 			if r := a.c.RelRoom(); r != wire.RelWindow {
 				t.Fatalf("RelRoom %d after the release, want %d", r, wire.RelWindow)

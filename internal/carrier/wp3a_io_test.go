@@ -394,6 +394,9 @@ func TestRelArmedOnAttempt_L12(t *testing.T) {
 				want.Store(1)
 				a.ep.setFill(finFill(&want, &next))
 				t0 := time.Now()
+				// The peer stays silent at first, so no other write of a (a PONG)
+				// can arm the timer: only the attempt of the REL's datagram does.
+				b.io.setFilter(func([]byte) bool { return time.Since(t0) >= 200*time.Millisecond })
 				a.start(StartOptions{})
 				b.start(StartOptions{})
 				time.Sleep(time.Second)
