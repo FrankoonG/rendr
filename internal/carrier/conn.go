@@ -148,6 +148,7 @@ type Conn struct {
 
 	// Set by Start under mu before the goroutines run; read by them.
 	ep   Endpoint
+	pep  PacketEndpoint // ep when it is a packet session's (asserted once at Start, M2-D2); nil otherwise
 	opts StartOptions
 
 	mu sync.Mutex
@@ -282,7 +283,18 @@ func (c *Conn) DgramMax() int {
 // Headroom + 1 and a longer datagram is ReadTruncated. A no-op on stream
 // carriers; it panics after Start.
 func (c *Conn) SetBudget(cmtu int) {
-	panic("unimplemented: M2")
+	if c.dg == nil {
+		return
+	}
+	c.jmu.Lock()
+	started := c.join.started
+	c.jmu.Unlock()
+	if started {
+		panic("rendr/carrier: SetBudget after Start")
+	}
+	c.dg.recvLimit = cmtu
+	c.dg.budget.Store(int32(cmtu))
+	c.dg.io.SetLimit(cmtu)
 }
 
 // PeerInstance returns the remote Runtime's InstanceID from the handshake.
@@ -324,12 +336,21 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 	now := time.Now()
 	c.mu.Lock()
 	c.ep, c.opts = ep, o
+	c.pep, _ = ep.(PacketEndpoint)
 	st := &c.st
 	st.gauge = o.Gauge
+	if c.dg != nil {
+		st.gauge = nil // no self-load gauge on datagram carriers (M2-D26)
+	}
 	st.rateAt, st.rateCommitAt, st.rxAt, st.intervalStart, st.lastPingRx = now, now, now, now, now
 	c.mu.Unlock()
 	c.wr.held = o.Hold
-	go c.readLoop()
+	if c.dg != nil {
+		c.dg.held.Store(o.Hold)
+		go c.dgReadLoop()
+	} else {
+		go c.readLoop()
+	}
 	go c.writeLoop()
 }
 
@@ -516,6 +537,16 @@ func (c *Conn) Stats() Stats {
 	}
 	if n := c.lastRx.Load(); n != 0 {
 		s.LastRx = c.base.Add(time.Duration(n))
+	}
+	if dg := c.dg; dg != nil {
+		s.MTU = int(dg.budget.Load())
+		s.Datagrams = dg.ctr.datagrams.Load()
+		s.DatagramsRx = dg.ctr.datagramsRx.Load()
+		s.Dropped = dg.ctr.dropped.Load()
+		s.Truncated = dg.ctr.truncated.Load()
+		s.Refused = dg.ctr.refused.Load()
+		s.Retransmits = dg.ctr.retransmits.Load()
+		s.Rebinds = dg.ctr.rebinds.Load()
 	}
 	return s
 }

@@ -157,6 +157,11 @@ func (c *Conn) readFrame(rd *reader) bool {
 			return false
 		case h.Type == wire.TypeData && int(h.Len)-wire.DataPrefixLen >= BigData:
 			return c.readBigData(rd, h)
+		case h.Type == wire.TypeDgram && c.pep != nil && int(h.Len)-wire.DgramPrefixLen >= BigData:
+			// A packet session's DGRAM of 16 KiB or more is read by reference
+			// like big DATA (M2 §A5.3; integration 1, D1: this replaces the
+			// readStreamed guard for packet sessions only).
+			return c.readBigData(rd, h)
 		}
 	}
 	total := wire.HeaderLen + int(h.Len) + wire.TrailerLen
@@ -254,6 +259,23 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			c.violation("DATA: %v", err)
 			return false
 		}
+	case wire.TypeDgram:
+		// A packet session's datagram on a stream carrier: its bytes count
+		// as DATA there (busy cadence, byte clock, M2-D26).
+		if c.pep == nil {
+			c.violation("DGRAM on a stream session")
+			return false
+		}
+		seq, data, err := wire.ParseDgram(p)
+		if err != nil {
+			c.violation("DGRAM: %v", err)
+			return false
+		}
+		c.dataArrived(len(data), now)
+		if err := c.pep.Datagram(c, seq, data, nil); err != nil {
+			c.violation("DGRAM: %v", err)
+			return false
+		}
 	default:
 		if h.Type.Extension() {
 			return true // CRC-checked and skipped on every carrier (§5.2)
@@ -271,6 +293,9 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 func (c *Conn) pong(p *wire.Ping, now time.Time) {
 	c.mu.Lock()
 	matched, rtt, wake := c.onPongLocked(p, now)
+	if c.dg != nil {
+		c.dgPongProbeLocked(p)
+	}
 	c.mu.Unlock()
 	if wake {
 		c.Wake()
@@ -284,7 +309,9 @@ func (c *Conn) pong(p *wire.Ping, now time.Time) {
 
 // readBigData reads a DATA frame whose payload is at least BigData bytes
 // straight into its own pooled Buf and hands it to the endpoint by
-// reference (design §4.9). The read bound is n + LookAhead (the trailer
+// reference (design §4.9); a packet session's DGRAM of that size the same
+// way (DATA and DGRAM share the 8-byte prefix; only the endpoint call
+// differs, M2 §A5.3). The read bound is n + LookAhead (the trailer
 // included, C15), which Get(n + LookAhead) always covers; at most 21 bytes
 // of the next frame read along are moved back to the stage. A partial frame
 // is never handed over (L42).
@@ -297,9 +324,12 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 	sb := rd.stage.B
 	head := sb[rd.r : rd.r+wire.DataHeadLen]
 	off := binary.BigEndian.Uint64(head[wire.HeaderLen:])
-	if _, err := wire.DataEnd(off, n); err != nil {
-		c.violation("DATA: %v", err)
-		return false
+	dgram := h.Type == wire.TypeDgram
+	if !dgram {
+		if _, err := wire.DataEnd(off, n); err != nil {
+			c.violation("DATA: %v", err)
+			return false
+		}
 	}
 	crc := wire.CRC(head) // before the stage is reused for the look-ahead
 	rd.r += wire.DataHeadLen
@@ -342,14 +372,20 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 	crc = wire.CRCUpdate(crc, buf.B[:n])
 	if crc != wire.Trailer(buf.B[n:want]) {
 		rd.releaseBig()
-		c.violation("DATA: crc mismatch")
+		c.violation("%v: crc mismatch", h.Type)
 		return false
 	}
 	rd.fseq++
 	c.dataArrived(n, c.frameArrived())
 	rd.big = nil // buf's reference moves to the endpoint
-	if err := c.ep.Data(c, off, buf.B[:n], buf); err != nil {
-		c.violation("DATA: %v", err)
+	var err error
+	if dgram {
+		err = c.pep.Datagram(c, off, buf.B[:n], buf)
+	} else {
+		err = c.ep.Data(c, off, buf.B[:n], buf)
+	}
+	if err != nil {
+		c.violation("%v: %v", h.Type, err)
 		return false
 	}
 	return true
