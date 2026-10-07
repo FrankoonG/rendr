@@ -610,3 +610,30 @@ func TestDgramOnStreamCarrier(t *testing.T) {
 		}
 	})
 }
+
+// TestDatagramTailWalked: the rendr bytes that followed the response frame
+// in the response datagram (dg.tail, kept by Establish) are walked by the
+// reader before its first read, exactly as the rest of that datagram — a
+// PING in it is answered at once, a DGRAM in it delivered — and nothing
+// is lost (R1-1; Establish's half is WP3b's TestEstablishResponseTail).
+func TestDatagramTailWalked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, true)
+		s.c.dg.tail = p.datagram(pingFrame(wire.TypePing, wire.Ping{ID: 9, Nonce: 90}), dgramFrame(3, 50))
+		s.start(StartOptions{})
+		synctest.Wait()
+		var pong bool
+		for _, d := range p.read() {
+			for _, pg := range pingsOf(d, true) {
+				pong = pong || pg.ID == 9
+			}
+		}
+		got := s.ep.datagrams()
+		if !pong || len(got) != 1 || got[0].seq != 3 || got[0].n != 50 {
+			t.Fatalf("PONG for the tail's PING %v, datagrams %+v", pong, got)
+		}
+		if s.c.dg.tail != nil || s.c.Stats().Dropped != 0 {
+			t.Fatalf("tail kept or frames dropped (%d)", s.c.Stats().Dropped)
+		}
+	})
+}
