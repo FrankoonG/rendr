@@ -105,11 +105,12 @@ func TestPassivePrefaceAnswers_L44_L48(t *testing.T) {
 // answered OPEN_ACK(BAD_REQUEST) with its reason code before any session
 // state exists (design §5.3, §6.2; L48): metadata over Handshake.MaxMetadata
 // is refused unread (CodeMetadataSize → ErrMetadataTooLarge at the dialer);
-// an unknown kind or a well-formed packet OPEN (the datagram kind, until
-// packet sessions are admitted) is CodeBadKind; mode 0 or race (M3) is
-// CodeBadMode; reserved flags or PMTU, a zero session ID, an inconsistent
-// metadata length and a packet OPEN's pmtu or window out of range (M2
-// §A3.5) are CodeBadValue. The answer is the carrier's first frame (first
+// an unknown kind is CodeBadKind; mode 0 or race (M3) is CodeBadMode;
+// reserved flags or PMTU, a zero session ID, an inconsistent metadata
+// length, a packet OPEN's pmtu or window out of range and a packet OPEN
+// that offers a datagram budget (window ≠ 0) on a stream carrier (M2
+// §A3.5) are CodeBadValue. (A well-formed packet OPEN on a stream carrier
+// is admitted as a packet session since M2: TestPacketOpenOnStreamCarrier.) The answer is the carrier's first frame (first
 // fseq, session handle) followed by EOF, and no MaxSessions unit, backlog
 // slot or handshake slot remains.
 func TestOpenRefusedBeforeState_L44_L48(t *testing.T) {
@@ -126,7 +127,7 @@ func TestOpenRefusedBeforeState_L44_L48(t *testing.T) {
 		code    uint32
 	}{
 		{"metadata over the limit", wpOpen(sid, wire.KindStream, 1, make([]byte, 5000)), wire.CodeMetadataSize},
-		{"datagram kind", packetOpen(0, 1127), wire.CodeBadKind},
+		{"packet window on a stream carrier", packetOpen(1400, 1127), wire.CodeBadValue},
 		{"packet pmtu 0", packetOpen(0, 0), wire.CodeBadValue},
 		{"packet window 536", packetOpen(536, 1127), wire.CodeBadValue},
 		{"unknown kind", func() []byte { b := wpOpen(sid, wire.KindStream, 1, nil); b[16] = 7; return b }(), wire.CodeBadKind},
@@ -211,7 +212,7 @@ func TestOpenCapacityAndGoingAway_L48(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			rt := wpTestRuntime(t, Config{}, nil)
 			ln := wpListen(t, rt, ListenConfig{AcceptBacklog: 1})
-			if ln.reserve() != reserveOK { // the one slot: an admission in progress
+			if ln.reserve(kindIdxStream) != reserveOK { // the one slot: an admission in progress
 				t.Fatal("reserve")
 			}
 			d := wpConnect(t, ln, inst, 1)
@@ -223,7 +224,7 @@ func TestOpenCapacityAndGoingAway_L48(t *testing.T) {
 			if n := rt.table.inUse(); n != 0 {
 				t.Fatalf("a refused OPEN kept %d MaxSessions units", n)
 			}
-			ln.unreserve()
+			ln.unreserve(kindIdxStream)
 			wpNoState(t, rt)
 			rt.Close()
 		})
@@ -476,7 +477,7 @@ func TestJoinRoutingAnswers_L48(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{MaxSessions: 1}, nil)
 		ln := wpListen(t, rt, ListenConfig{AcceptBacklog: 1})
-		if !rt.table.placeDialer(SessionID(wpSID(99))) || ln.reserve() != reserveOK {
+		if !rt.table.placeDialer(SessionID(wpSID(99))) || ln.reserve(kindIdxStream) != reserveOK {
 			t.Fatal("filling MaxSessions and the backlog")
 		}
 		inst := wpInst(0xe3)
@@ -498,10 +499,10 @@ func TestJoinRoutingAnswers_L48(t *testing.T) {
 			d.expectEOF()
 		}
 		synctest.Wait()
-		if rt.table.inUse() != 1 || rt.backlog.Load() != 0 {
-			t.Fatalf("JOINs changed the admission state: units %d backlog %d", rt.table.inUse(), rt.backlog.Load())
+		if rt.table.inUse() != 1 || rt.backlog[kindIdxStream].Load() != 0 {
+			t.Fatalf("JOINs changed the admission state: units %d backlog %d", rt.table.inUse(), rt.backlog[kindIdxStream].Load())
 		}
-		ln.unreserve()
+		ln.unreserve(kindIdxStream)
 		rt.table.ended(dialerKey(SessionID(wpSID(99))), nil, session.Verdict{}, time.Now())
 		wpNoState(t, rt)
 		rt.Close()

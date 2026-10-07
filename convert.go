@@ -7,6 +7,7 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // The internal packages mirror the public enums numerically (design §2.4,
@@ -63,12 +64,12 @@ func eventFrom(ev session.Event) Event {
 	}
 }
 
-// sessionStatusFrom converts a session snapshot. M1 sessions are all
-// stream sessions.
+// sessionStatusFrom converts a session snapshot (M2-D61): a packet
+// session reports KindPacket, its MaxPayload and its PacketCounters.
 func sessionStatusFrom(st session.Status) SessionStatus {
 	out := SessionStatus{
 		ID:           SessionID(st.ID),
-		Kind:         KindStream,
+		Kind:         kindFrom(st.Kind),
 		Mode:         Mode(st.Mode),
 		Role:         Role(st.Role),
 		PeerInstance: InstanceID(st.PeerInstance),
@@ -91,6 +92,21 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 		RetransmittedBytes: st.RetransmittedBytes,
 		Window:             st.Window,
 		PeerWindow:         st.PeerWindow,
+		MaxPayload:         st.MaxPayload,
+	}
+	if pc := st.Packet; pc != nil {
+		out.Packet = &PacketCounters{
+			Sent:          pc.Sent,
+			Received:      pc.Received,
+			Duplicates:    pc.Duplicates,
+			DropQueue:     pc.DropQueue,
+			DropAge:       pc.DropAge,
+			DropTooLarge:  pc.DropTooLarge,
+			DropNoPath:    pc.DropNoPath,
+			DropRecvQueue: pc.DropRecvQueue,
+			DropLate:      pc.DropLate,
+			PeerReceived:  pc.PeerReceived,
+		}
 	}
 	if len(st.Carriers) > 0 {
 		out.Carriers = make([]CarrierStatus, len(st.Carriers))
@@ -101,13 +117,19 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 	return out
 }
 
-// carrierStatusFrom converts one lane of a session snapshot. M1 carriers
-// are all stream carriers.
+// carrierStatusFrom converts one lane of a session snapshot. A datagram
+// carrier is the one with a frame budget (Stats.MTU, never 0 on a datagram
+// carrier: it starts at MinFrameBudget or above and is never lowered below
+// the control floor); its datagram counters are copied (M2-D61).
 func carrierStatusFrom(cs *session.CarrierStatus) CarrierStatus {
+	k := KindStream
+	if cs.Stats.MTU != 0 {
+		k = KindDatagram
+	}
 	return CarrierStatus{
 		ID:          CarrierID(cs.ID),
 		Name:        cs.Name,
-		Kind:        KindStream,
+		Kind:        k,
 		Gen:         cs.Gen,
 		State:       CarrierState(cs.State),
 		SRTT:        cs.Stats.SRTT,
@@ -121,7 +143,20 @@ func carrierStatusFrom(cs *session.CarrierStatus) CarrierStatus {
 		Frames:      cs.Stats.Frames,
 		DeathCause:  Cause(cs.DeathCause),
 		DeathDetail: cs.DeathDetail,
+		MTU:         cs.Stats.MTU,
+		Dropped:     cs.Stats.Dropped,
+		Retransmits: cs.Stats.Retransmits,
+		Rebinds:     cs.Stats.Rebinds,
 	}
+}
+
+// kindFrom converts a session kind; zero (every M1 session) is a stream
+// session.
+func kindFrom(k wire.CarrierKind) Kind {
+	if k == wire.KindDatagram {
+		return KindPacket
+	}
+	return KindStream
 }
 
 // peerStatusFrom converts a health snapshot classified at now (Peer.Status,

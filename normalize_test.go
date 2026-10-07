@@ -55,9 +55,11 @@ func normFields() []normField {
 		d("PingIdle", func(c *Config) *time.Duration { return &c.PingIdle }, 10*time.Second, time.Second, 60*time.Second, false,
 			func(c *Config) { c.Sessionless.Idle = time.Hour }),
 		d("DeadMin", func(c *Config) *time.Duration { return &c.DeadMin }, 3*time.Second, 500*time.Millisecond, 10*time.Second, false,
-			func(c *Config) { c.DeadMax = 30 * time.Second }),
+			func(c *Config) { c.DeadMax, c.PacketPing = 30*time.Second, 200*time.Millisecond }),
 		d("DeadMax", func(c *Config) *time.Duration { return &c.DeadMax }, 4*time.Second, 500*time.Millisecond, 30*time.Second, false,
-			func(c *Config) { c.DeadMin, c.WriteStall = 500*time.Millisecond, 500*time.Millisecond }),
+			func(c *Config) {
+				c.DeadMin, c.WriteStall, c.PacketPing = 500*time.Millisecond, 500*time.Millisecond, 200*time.Millisecond
+			}),
 		d("WriteStall", func(c *Config) *time.Duration { return &c.WriteStall }, 2*time.Second, 500*time.Millisecond, 30*time.Second, false,
 			func(c *Config) { c.DeadMax = 30 * time.Second }),
 		d("Probe.Interval", func(c *Config) *time.Duration { return &c.Probe.Interval }, 2*time.Second, 500*time.Millisecond, 30*time.Second, false,
@@ -80,6 +82,13 @@ func normFields() []normField {
 		i("Handshake.MaxMetadata", func(c *Config) *int { return &c.Handshake.MaxMetadata }, 4096, 0, 65535, true),
 		i("Sessionless.PerInstance", func(c *Config) *int { return &c.Sessionless.PerInstance }, 16, 1, 1024, false),
 		i("Sessionless.Total", func(c *Config) *int { return &c.Sessionless.Total }, 1024, 1, 65536, false),
+		d("Packet.MaxAge", func(c *Config) *time.Duration { return &c.Packet.MaxAge }, 100*time.Millisecond, 10*time.Millisecond, 2*time.Second, false, nil),
+		{
+			name: "Packet.Queue", def: 1 << 20, lo: 64 << 10, hi: 64 << 20,
+			geti: func(c *Config) *int { return &c.Packet.Queue },
+			base: func(c *Config) { c.Packet.MaxPayload = 512 }, // constraint 8 quiet at lo
+		},
+		i("Packet.MaxPayload", func(c *Config) *int { return &c.Packet.MaxPayload }, 65507, 512, 65507, false),
 	}
 }
 
@@ -277,18 +286,44 @@ func TestConfigNormalizeConstraints(t *testing.T) {
 			func(c Config) bool { return c.WriteStall == 4*time.Second },
 			[]string{"WriteStall: 4.000000001s → 4s (constraint 1: WriteStall ≤ DeadMax)"}},
 		{"WriteStall follows a raised DeadMax", func(c *Config) {
-			c.DeadMin, c.DeadMax, c.WriteStall = time.Second, 500*time.Millisecond, 20*time.Second
+			c.DeadMin, c.DeadMax, c.WriteStall, c.PacketPing = time.Second, 500*time.Millisecond, 20*time.Second, 500*time.Millisecond
 		},
 			func(c Config) bool { return c.DeadMax == time.Second && c.WriteStall == time.Second },
 			[]string{"DeadMax: 500ms → 1s (constraint 1: DeadMax ≥ DeadMin)", "WriteStall: 20s → 1s (constraint 1: WriteStall ≤ DeadMax)"}},
-		{"PingBusy ≤ DeadMin/4 at limit", func(c *Config) { c.DeadMin, c.PingBusy = time.Second, 250*time.Millisecond },
+		{"PingBusy ≤ DeadMin/4 at limit", func(c *Config) {
+			c.DeadMin, c.PingBusy, c.PacketPing = time.Second, 250*time.Millisecond, 500*time.Millisecond
+		},
 			func(c Config) bool { return c.PingBusy == 250*time.Millisecond }, nil},
-		{"PingBusy ≤ DeadMin/4 beyond", func(c *Config) { c.DeadMin, c.PingBusy = time.Second, 250*time.Millisecond+1 },
+		{"PingBusy ≤ DeadMin/4 beyond", func(c *Config) {
+			c.DeadMin, c.PingBusy, c.PacketPing = time.Second, 250*time.Millisecond+1, 500*time.Millisecond
+		},
 			func(c Config) bool { return c.PingBusy == 250*time.Millisecond },
 			[]string{"PingBusy: 250.000001ms → 250ms (constraint 2: PingBusy ≤ DeadMin/4)"}},
-		{"PingBusy at the smallest DeadMin", func(c *Config) { c.DeadMin, c.PingBusy = 500*time.Millisecond, 500*time.Millisecond },
+		{"PingBusy at the smallest DeadMin", func(c *Config) {
+			c.DeadMin, c.PingBusy, c.PacketPing = 500*time.Millisecond, 500*time.Millisecond, 250*time.Millisecond
+		},
 			func(c Config) bool { return c.PingBusy == 125*time.Millisecond },
 			[]string{"PingBusy: 500ms → 125ms (constraint 2: PingBusy ≤ DeadMin/4)"}},
+		{"PacketPing ≤ DeadMin/2 at limit", func(c *Config) { c.DeadMin, c.PacketPing = time.Second, 500*time.Millisecond },
+			func(c Config) bool { return c.PacketPing == 500*time.Millisecond }, nil},
+		{"PacketPing ≤ DeadMin/2 beyond", func(c *Config) { c.DeadMin, c.PacketPing = time.Second, 500*time.Millisecond+1 },
+			func(c Config) bool { return c.PacketPing == 500*time.Millisecond },
+			[]string{"PacketPing: 500.000001ms → 500ms (constraint 2: PacketPing ≤ DeadMin/2)"}},
+		{"PacketPing default at the smallest DeadMin", func(c *Config) { c.DeadMin = 500 * time.Millisecond },
+			func(c Config) bool { return c.PacketPing == 250*time.Millisecond },
+			[]string{"PacketPing: 1s → 250ms (constraint 2: PacketPing ≤ DeadMin/2)"}},
+		{"Packet.Queue ≥ MaxPayload + 64 at limit", func(c *Config) { c.Packet.Queue, c.Packet.MaxPayload = 65571, 65507 },
+			func(c Config) bool { return c.Packet.Queue == 65571 }, nil},
+		{"Packet.Queue ≥ MaxPayload + 64 beyond", func(c *Config) { c.Packet.Queue, c.Packet.MaxPayload = 65570, 65507 },
+			func(c Config) bool { return c.Packet.Queue == 65571 },
+			[]string{"Packet.Queue: 65570 → 65571 (constraint 8: Packet.Queue ≥ Packet.MaxPayload + 64)"}},
+		{"Packet.Queue follows a clamped MaxPayload", func(c *Config) { c.Packet.Queue, c.Packet.MaxPayload = 1, 1<<20 },
+			func(c Config) bool { return c.Packet.Queue == 65571 && c.Packet.MaxPayload == 65507 },
+			[]string{
+				"Packet.Queue: 1 → 65536 (range 65536..67108864)",
+				"Packet.MaxPayload: 1048576 → 65507 (range 512..65507)",
+				"Packet.Queue: 65536 → 65571 (constraint 8: Packet.Queue ≥ Packet.MaxPayload + 64)",
+			}},
 		{"RejoinBackoffMax ≤ NoPathGrace/2 at limit", func(c *Config) { c.NoPathGrace, c.RejoinBackoffMax = 6*time.Second, 3*time.Second },
 			func(c Config) bool { return c.RejoinBackoffMax == 3*time.Second }, nil},
 		{"RejoinBackoffMax ≤ NoPathGrace/2 beyond", func(c *Config) { c.NoPathGrace, c.RejoinBackoffMax = 6*time.Second, 3*time.Second+1 },
@@ -326,21 +361,25 @@ func TestConfigNormalizeConstraints(t *testing.T) {
 			"Sessionless.Idle: 10s → 1m30s (constraint 5: Sessionless.Idle ≥ 3×max(PingIdle, Probe.Interval))",
 			"Probe.Fresh: 30s → 1m0s (constraint 7: Probe.Fresh ≥ 2×Probe.Interval)",
 		}},
-		{"all six", func(c *Config) {
+		{"all eight", func(c *Config) {
 			c.DeadMin, c.DeadMax, c.WriteStall, c.PingBusy = time.Second, 500*time.Millisecond, 6*time.Second, 2*time.Second
 			c.NoPathGrace, c.RejoinBackoffMax = 3*time.Second, 2*time.Second
 			c.Probe.Interval, c.Probe.Fresh, c.Sessionless.Idle = 10*time.Second, 5*time.Second, 5*time.Second
+			c.Packet.Queue, c.Packet.MaxPayload = 64<<10, 65507
 		}, func(c Config) bool {
 			return c.DeadMax == time.Second && c.WriteStall == time.Second && c.PingBusy == 250*time.Millisecond &&
-				c.RejoinBackoffMax == 1500*time.Millisecond && c.Sessionless.Idle == 30*time.Second && c.Probe.Fresh == 20*time.Second
+				c.PacketPing == 500*time.Millisecond && c.RejoinBackoffMax == 1500*time.Millisecond &&
+				c.Sessionless.Idle == 30*time.Second && c.Probe.Fresh == 20*time.Second && c.Packet.Queue == 65571
 		}, []string{
 			"PingBusy: 2s → 500ms (range 10ms..500ms)",
 			"DeadMax: 500ms → 1s (constraint 1: DeadMax ≥ DeadMin)",
 			"WriteStall: 6s → 1s (constraint 1: WriteStall ≤ DeadMax)",
 			"PingBusy: 500ms → 250ms (constraint 2: PingBusy ≤ DeadMin/4)",
+			"PacketPing: 1s → 500ms (constraint 2: PacketPing ≤ DeadMin/2)",
 			"RejoinBackoffMax: 2s → 1.5s (constraint 3: RejoinBackoffMax ≤ NoPathGrace/2)",
 			"Sessionless.Idle: 5s → 30s (constraint 5: Sessionless.Idle ≥ 3×max(PingIdle, Probe.Interval))",
 			"Probe.Fresh: 5s → 20s (constraint 7: Probe.Fresh ≥ 2×Probe.Interval)",
+			"Packet.Queue: 65536 → 65571 (constraint 8: Packet.Queue ≥ Packet.MaxPayload + 64)",
 		}},
 	}
 	for _, tc := range cases {
@@ -406,6 +445,10 @@ func checkNormalized(t *testing.T, c Config) {
 	ini("Handshake.MaxMetadata", int64(c.Handshake.MaxMetadata), 0, 65535)
 	ini("Sessionless.PerInstance", int64(c.Sessionless.PerInstance), 1, 1024)
 	ini("Sessionless.Total", int64(c.Sessionless.Total), 1, 65536)
+	in("PacketPing", c.PacketPing, 200*time.Millisecond, min(10*time.Second, c.DeadMin/2))
+	ini("Packet.MaxPayload", int64(c.Packet.MaxPayload), 512, 65507)
+	ini("Packet.Queue", int64(c.Packet.Queue), max(64<<10, int64(c.Packet.MaxPayload)+64), 64<<20)
+	in("Packet.MaxAge", c.Packet.MaxAge, 10*time.Millisecond, 2*time.Second)
 	if lim := 3 * max(c.PingIdle, c.Probe.Interval); c.Sessionless.Idle < lim {
 		t.Errorf("Sessionless.Idle = %v < 3×max(PingIdle, Probe.Interval) = %v", c.Sessionless.Idle, lim)
 	}
@@ -502,6 +545,12 @@ func randomConfig(r *rand.Rand) Config {
 			Total:       int(num(1, 65536)),
 			Idle:        dur(time.Second, time.Hour),
 		},
+		PacketPing: dur(200*time.Millisecond, 10*time.Second),
+		Packet: PacketPolicy{
+			Queue:      int(num(64<<10, 64<<20)),
+			MaxAge:     dur(10*time.Millisecond, 2*time.Second),
+			MaxPayload: int(num(512, 65507)),
+		},
 	}
 }
 
@@ -570,6 +619,8 @@ func TestConfigNormalizeDefaults(t *testing.T) {
 		Window: 8 << 20, MaxCarriersPerSession: 6, MaxSessions: 10000, MaxBufferedBytes: 1 << 30,
 		Handshake:   HandshakeLimits{Timeout: 10 * time.Second, MaxConcurrent: 256, MaxMetadata: 4096},
 		Sessionless: SessionlessLimits{PerInstance: 16, Total: 1024, Idle: 30 * time.Second},
+		PacketPing:  time.Second,
+		Packet:      PacketPolicy{Queue: 1 << 20, MaxAge: 100 * time.Millisecond, MaxPayload: 65507},
 	}
 	if !reflect.DeepEqual(e.cfg, want) {
 		t.Fatalf("defaults\n got %+v\nwant %+v", e.cfg, want)
@@ -579,6 +630,8 @@ func TestConfigNormalizeDefaults(t *testing.T) {
 		WriteStall: 2 * time.Second, DialTimeout: 10 * time.Second, HandshakeTimeout: 10 * time.Second,
 		ProbeInterval: 2 * time.Second, SessionlessIdle: 30 * time.Second, AbandonWait: time.Second,
 		Window: 8 << 20, CapFloor: 128 << 10, BatchBudget: 256 << 10, Segment: 64 << 10,
+		PacketPing: time.Second, PacketActive: 10 * time.Second, RelRTOInit: 300 * time.Millisecond,
+		RelRTOMin: 200 * time.Millisecond, RelRTOMax: 2 * time.Second, MTUProbeEvery: 10, MTUProbeFails: 3,
 	}
 	if e.timing != wantTiming {
 		t.Fatalf("timing\n got %+v\nwant %+v", e.timing, wantTiming)
@@ -657,6 +710,10 @@ func TestConfigNormalizeOverrides(t *testing.T) {
 		WriteStall: time.Hour, DialTimeout: 100 * time.Millisecond, HandshakeTimeout: 50 * time.Millisecond,
 		ProbeInterval: 200 * time.Millisecond, SessionlessIdle: time.Millisecond, AbandonWait: 3 * time.Millisecond,
 		Window: 4 << 10, CapFloor: 1 << 10, BatchBudget: 2 << 10, Segment: 1 << 10,
+		// M2 values the overrides above do not set: their defaults, and
+		// PacketActive = the overridden PingIdle.
+		PacketPing: time.Second, PacketActive: 500 * time.Millisecond, RelRTOInit: 300 * time.Millisecond,
+		RelRTOMin: 200 * time.Millisecond, RelRTOMax: 2 * time.Second, MTUProbeEvery: 10, MTUProbeFails: 3,
 	}
 	if e.timing != wantTiming {
 		t.Fatalf("timing\n got %+v\nwant %+v", e.timing, wantTiming)

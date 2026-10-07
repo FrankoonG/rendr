@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"hash/maphash"
 	"math"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -486,10 +485,20 @@ func (h *tombHeap[S]) Pop() any {
 	return e
 }
 
+// hsIO is the transport of an unfinished handshake (design §6.1): an
+// accepted net.Conn, or the carrier.PacketIO of a datagram carrier (a
+// HandlePacket conn or a raw-UDP flow; M2 design §A5.14). Eviction and
+// Runtime.Close's drain close it with SetDeadline(now) and Close.
+type hsIO interface {
+	SetDeadline(t time.Time) error
+	Close() error
+}
+
 // hsSlot is one occupied handshake slot (design §6.1): an accepted conn
-// whose PREFACE and first frame are not yet parsed.
+// whose PREFACE and first frame (a datagram carrier: whose first datagram)
+// are not yet parsed.
 type hsSlot struct {
-	nc         net.Conn
+	nc         hsIO
 	prev, next *hsSlot
 	held       bool // in the LRU; false once released or evicted
 }
@@ -522,7 +531,7 @@ func newHSTable(limit int) *hsTable { return &hsTable{limit: limit} }
 // lock while the first is held — so that the member exists before a later
 // drain returns (Runtime.Close joins g after its drain). After drain, admit
 // occupies nothing and returns a nil slot: the caller closes nc itself.
-func (h *hsTable) admit(nc net.Conn, g *group) (s *hsSlot, evicted net.Conn) {
+func (h *hsTable) admit(nc hsIO, g *group) (s *hsSlot, evicted hsIO) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.drained {
@@ -581,11 +590,11 @@ func (h *hsTable) unlinkLocked(s *hsSlot) {
 // drain releases every occupied slot and returns their conns, oldest first
 // (Runtime.Close: close every unfinished handshake). Their handshakes see
 // release return false. The drain is final: admit refuses from now on.
-func (h *hsTable) drain() []net.Conn {
+func (h *hsTable) drain() []hsIO {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.drained = true
-	out := make([]net.Conn, 0, h.n)
+	out := make([]hsIO, 0, h.n)
 	for h.head != nil {
 		s := h.head
 		h.unlinkLocked(s)

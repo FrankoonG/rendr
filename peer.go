@@ -9,11 +9,13 @@ import (
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// Carrier is a carrier factory. The set is closed: StreamCarrier is its
-// only implementation; DatagramCarrier follows with packet sessions
-// (milestone M2).
+// Carrier is a carrier factory. The set is closed: StreamCarrier and
+// DatagramCarrier (each as a value or a non-nil pointer). Stream sessions
+// (Dial) use a Peer's stream factories only; packet sessions (DialPacket)
+// use both kinds, datagram factories first.
 type Carrier interface{ isCarrier() }
 
 // StreamCarrier is a factory of ordered, reliable byte-stream carriers to
@@ -66,6 +68,7 @@ type DialOptions struct {
 type Peer struct {
 	rt        *Runtime
 	factories []carrier.Factory // the snapshot every session dials with (L20); never modified
+	streams   uint16            // DialSpec.Eligible bits of the stream factories (M2-D46)
 	names     []string          // factory names in configuration order (PeerStatus)
 	health    *carrier.Health   // nil for a single factory (no probing, design §7.8)
 	env       session.Env       // the Env template of this Peer's sessions; each Dial adds its own Registry (dialReg)
@@ -92,29 +95,19 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 	}
 	seen := make(map[string]struct{}, n)
 	for i, c := range cfg.Carriers {
-		var sc StreamCarrier
-		switch v := c.(type) {
-		case StreamCarrier:
-			sc = v
-		case *StreamCarrier:
-			if v == nil {
-				return nil, fmt.Errorf("rendr: NewPeer: carrier %d is a nil *StreamCarrier", i)
-			}
-			sc = *v
-		default:
-			return nil, fmt.Errorf("rendr: NewPeer: carrier %d is %T, want StreamCarrier", i, c)
+		f, err := factoryOf(i, c)
+		if err != nil {
+			return nil, err
 		}
-		switch _, dup := seen[sc.Name]; {
-		case sc.Name == "":
-			return nil, fmt.Errorf("rendr: NewPeer: carrier %d has no Name", i)
-		case dup:
-			return nil, fmt.Errorf("rendr: NewPeer: carrier name %q is used twice", sc.Name)
-		case sc.Dial == nil:
-			return nil, fmt.Errorf("rendr: NewPeer: carrier %q has no Dial", sc.Name)
+		if _, dup := seen[f.Name]; dup {
+			return nil, fmt.Errorf("rendr: NewPeer: carrier name %q is used twice", f.Name)
 		}
-		seen[sc.Name] = struct{}{}
-		p.factories[i] = carrier.Factory{Index: i, Name: sc.Name, Dial: sc.Dial, DialEarly: sc.DialEarly}
-		p.names[i] = sc.Name
+		seen[f.Name] = struct{}{}
+		p.factories[i] = f
+		p.names[i] = f.Name
+		if f.Kind == wire.KindStream {
+			p.streams |= 1 << i
+		}
 	}
 	p.env = session.Env{
 		Carrier: &rt.cenv,
@@ -126,6 +119,44 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 		p.health = carrier.NewHealth(&rt.cenv, p.factories, rt.eff.health)
 	}
 	return p, nil
+}
+
+// factoryOf validates the i-th carrier factory of a PeerConfig and converts
+// it (M2 design §A2.1, §A5.14): a StreamCarrier needs a Name and a Dial; a
+// DatagramCarrier a Name, a Dial and an MTU of 537–65,507 bytes (M2-D51).
+// Every factory gets its Kind (R1-32).
+func factoryOf(i int, c Carrier) (carrier.Factory, error) {
+	switch v := c.(type) {
+	case *StreamCarrier:
+		if v == nil {
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %d is a nil *StreamCarrier", i)
+		}
+		return factoryOf(i, *v)
+	case *DatagramCarrier:
+		if v == nil {
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %d is a nil *DatagramCarrier", i)
+		}
+		return factoryOf(i, *v)
+	case StreamCarrier:
+		switch {
+		case v.Name == "":
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %d has no Name", i)
+		case v.Dial == nil:
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %q has no Dial", v.Name)
+		}
+		return carrier.Factory{Index: i, Name: v.Name, Kind: wire.KindStream, Dial: v.Dial, DialEarly: v.DialEarly}, nil
+	case DatagramCarrier:
+		switch {
+		case v.Name == "":
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %d has no Name", i)
+		case v.Dial == nil:
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %q has no Dial", v.Name)
+		case v.MTU < wire.MinFrameBudget || v.MTU > wire.MaxDatagram:
+			return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %q has MTU %d, want %d to %d", v.Name, v.MTU, wire.MinFrameBudget, wire.MaxDatagram)
+		}
+		return carrier.Factory{Index: i, Name: v.Name, Kind: wire.KindDatagram, DialPacket: v.Dial, MTU: v.MTU}, nil
+	}
+	return carrier.Factory{}, fmt.Errorf("rendr: NewPeer: carrier %d is %T, want StreamCarrier or DatagramCarrier", i, c)
 }
 
 // Status returns the per-factory probe evidence.

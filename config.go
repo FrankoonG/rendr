@@ -135,6 +135,13 @@ type PacketPolicy struct {
 // cycles through backlog episodes loses the samples taken in and right
 // after an episode, and in pauses between writes of 64 KiB or more, so its
 // quality switch can come a probe interval or two later.
+//
+// Packet sessions: the guard sees only traffic on stream carriers. A packet
+// session's datagram carriers have no self-load gauge (they keep no bytes
+// in flight), so a packet session that saturates its own path loads the
+// probe samples of that path unnoticed: the selector may leave the path on
+// a quality switch and return to it after Cooldown, once the samples
+// recover.
 type SelectorPolicy struct {
 	Band     float64       // 0.25; 0.05–0.90: a challenger's RTT must be ≤ active × (1 − Band) ...
 	Floor    time.Duration // 5 ms; 0–1 s: ... and at least Floor lower

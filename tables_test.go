@@ -589,7 +589,7 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 		c[i] = &hsConn{id: i}
 	}
 	for i := 0; i < 3; i++ {
-		var ev net.Conn
+		var ev hsIO
 		if s[i], ev = h.admit(c[i], g); ev != nil {
 			t.Fatalf("admit %d evicted %v below the limit", i, ev)
 		}
@@ -599,7 +599,7 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 	}
 	admitEvicts := func(i, want int) {
 		t.Helper()
-		var ev net.Conn
+		var ev hsIO
 		s[i], ev = h.admit(c[i], g)
 		if ev != c[want] {
 			t.Fatalf("admit %d evicted %v, want conn %d", i, ev, want)
@@ -624,7 +624,7 @@ func TestHandshakeSlotsEvictOldest_L48(t *testing.T) {
 		t.Fatalf("len %d evictions %d closers %d, want 3, 3 and 3", h.len(), h.evicted(), g.running())
 	}
 	got := h.drain()
-	if want := []net.Conn{c[4], c[5], c[6]}; !slices.Equal(got, want) {
+	if want := []hsIO{c[4], c[5], c[6]}; !slices.Equal(got, want) {
 		t.Fatalf("drain %v, want conns 4, 5, 6", got)
 	}
 	if h.len() != 0 || h.release(s[4]) {
