@@ -24,7 +24,7 @@ import (
 
 // fakeAddr returns a PeerKey for test address n.
 func fakeAddr(n byte) PeerKey {
-	return PeerKey{AP: netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, 0, n}), 4000+uint16(n))}
+	return PeerKey{AP: netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, n}), 4000+uint16(n))}
 }
 
 // dgItem is one datagram (or a scripted read result) in a fakeIO inbox.
