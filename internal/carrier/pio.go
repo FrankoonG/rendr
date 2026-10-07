@@ -157,7 +157,11 @@ type DgramStats struct {
 // peer and for a peer whose String panics. Ownership of pc moves to the
 // result only on success (L57).
 func NewPacketIO(env *Env, pc net.PacketConn, peer net.Addr, limit int) (PacketIO, error) {
-	panic("unimplemented: M2")
+	p, err := newPacketIO(env, pc, peer, limit)
+	if err != nil {
+		return nil, err // never a typed nil
+	}
+	return p, nil
 }
 
 // GuardedDialPacket calls a datagram factory under the GuardedDial rules
@@ -166,5 +170,49 @@ func NewPacketIO(env *Env, pc net.PacketConn, peer net.Addr, limit int) (PacketI
 // result closed exactly once). (nil, _, nil) and (pc, nil, nil) are
 // ErrNilConn, with pc closed once.
 func GuardedDialPacket(ctx context.Context, env *Env, f func(context.Context) (net.PacketConn, net.Addr, error)) (net.PacketConn, net.Addr, error) {
-	panic("unimplemented: M2")
+	norm := func(r packetDial, err error) (packetDial, error) {
+		switch {
+		case err != nil:
+			closePacketConn(env, r.pc) // a conn returned with an error
+			return packetDial{}, err
+		case r.pc == nil:
+			return packetDial{}, ErrNilConn
+		case nilAddr(r.peer):
+			closePacketConn(env, r.pc) // no peer to write to: closed once
+			return packetDial{}, ErrNilConn
+		}
+		return r, nil
+	}
+	call := func(ctx context.Context) (packetDial, error) {
+		pc, peer, err := f(ctx)
+		return packetDial{pc, peer}, err
+	}
+	r, err := guardedCall(ctx, env, call, norm, func(r packetDial) { closePacketConn(env, r.pc) })
+	return r.pc, r.peer, err
+}
+
+// packetDial is the result of a datagram factory call.
+type packetDial struct {
+	pc   net.PacketConn
+	peer net.Addr
+}
+
+// closePacketConn closes an embedder packet conn that no Conn owns and
+// returns at once (closeOnce.async: SetDeadline(now) and Close on guarded
+// goroutines). nil does nothing. Each conn is passed at most once.
+func closePacketConn(env *Env, pc net.PacketConn) {
+	if pc == nil {
+		return
+	}
+	(&closeOnce{nc: pc}).async(env)
+}
+
+// nilAddr reports a nil peer address: the nil interface or a typed nil
+// *net.UDPAddr (every other typed nil fails NewPacketIO's guarded String).
+func nilAddr(a net.Addr) bool {
+	if a == nil {
+		return true
+	}
+	ua, ok := a.(*net.UDPAddr)
+	return ok && ua == nil
 }
