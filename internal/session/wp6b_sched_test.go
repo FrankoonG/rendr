@@ -181,18 +181,30 @@ func TestPacketPlannedSwitchRetire(t *testing.T) {
 		if !retiring || called || removed == 0 {
 			t.Fatalf("old lane at the switch: retiring %v, retired %v, epoch %d; want retiring, not retired, the switch's epoch", retiring, called, removed)
 		}
+		var srttEcho time.Duration
 		tEcho := wpPoll(t, time.Second, "the passive echoed the switch", func() bool {
-			return wpLocked(a, func() bool { return !sched.EpochNewer(removed, a.ctl.echoed) })
+			return wpLocked(a, func() bool {
+				srttEcho = old.port.SRTT()
+				return !sched.EpochNewer(removed, a.ctl.echoed)
+			})
 		})
 		tRet := wpPoll(t, time.Second, "the old lane retired", func() bool {
 			return wpLocked(a, func() bool { return old.retireCalled })
 		})
 		srtt := wpLocked(a, func() time.Duration { return old.port.SRTT() })
-		t.Logf("switch → echo %v, echo → retire %v (srtt %v)", tEcho.Sub(tSwitch), tRet.Sub(tEcho), srtt)
+		t.Logf("switch → echo %v, echo → retire %v (srtt %v at the echo, %v at the retirement)", tEcho.Sub(tSwitch), tRet.Sub(tEcho), srttEcho, srtt)
 		if tEcho.Sub(tSwitch) < 90*time.Millisecond {
 			t.Fatalf("stimulus: the echo came %v after the switch, want it delayed by p2's 100 ms", tEcho.Sub(tSwitch))
 		}
-		if tRet.Before(tEcho) || tRet.Sub(tEcho) > 2*srtt+5*time.Millisecond {
+		if srttEcho <= 0 {
+			t.Fatal("stimulus: the old carrier had no srtt at the echo")
+		}
+		// The polls see the echo up to 1 ms late: the retirement comes at
+		// least 2·srtt − 1 ms after the observed echo, at most 2·srtt + 5 ms.
+		if lo := 2*min(srttEcho, srtt) - time.Millisecond; tRet.Sub(tEcho) < lo {
+			t.Fatalf("retired %v after the echo, want 2·srtt (≥ %v) for the datagrams still in flight on the old lane", tRet.Sub(tEcho), lo)
+		}
+		if tRet.Sub(tEcho) > 2*max(srttEcho, srtt)+5*time.Millisecond {
 			t.Fatalf("retired %v after the echo, want within 2·srtt (%v) after it", tRet.Sub(tEcho), 2*srtt)
 		}
 		if tRet.Sub(tSwitch) >= w.a.p.RetireGrace {
@@ -219,6 +231,61 @@ func TestPacketPlannedSwitchRetire(t *testing.T) {
 			t.Fatalf("dialer drops across a planned switch: %+v", *as.Packet)
 		}
 	})
+}
+
+// TestPacketRetireDeadline (M2-D42): pktRetiringLocked's deadline for a
+// lane a planned switch removed: RetireGrace (retireAt) until the passive
+// echoed the removing epoch; from the echo, echo + 2·srtt — not earlier,
+// so the datagrams the passive still had in flight on the lane arrive — or
+// retireAt if that comes first.
+func TestPacketRetireDeadline(t *testing.T) {
+	const srtt = 20 * time.Millisecond
+	t0 := time.Unix(1000, 0)
+	for _, tc := range []struct {
+		name  string
+		grace time.Duration // retireAt − t0
+		want  time.Duration // the armed deadline − t0 after the echo at t0 + 10 ms
+	}{
+		{"2·srtt after the echo", 400 * time.Millisecond, 10*time.Millisecond + 2*srtt},
+		{"RetireGrace first", 15 * time.Millisecond, 15 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := dpSession(dpOpt{})
+			l, fp := dpAddLane(s, 1, false, true)
+			fp.set(func(f *dpPort) { f.srtt = srtt })
+			a := &actor{s: s}
+			step := func(now time.Time) (at time.Time) {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				defer func() {
+					// The fake lane has no carrier: a retirement panics in
+					// Retire after marking the lane.
+					if r := recover(); r != nil || l.retireCalled {
+						t.Fatalf("retired at t0+%v, before its deadline", now.Sub(t0))
+					}
+				}()
+				a.wakeAt = time.Time{}
+				a.pktRetiringLocked(now, l)
+				return a.wakeAt
+			}
+			s.mu.Lock()
+			l.state, l.retireEpoch, l.retireAt = LaneRetiring, 7, t0.Add(tc.grace)
+			s.ctl.echoed = 6
+			s.mu.Unlock()
+			if got := step(t0); !got.Equal(l.retireAt) {
+				t.Fatalf("before the echo: armed at t0+%v, want RetireGrace t0+%v", got.Sub(t0), tc.grace)
+			}
+			s.mu.Lock()
+			s.ctl.echoed = 7
+			s.mu.Unlock()
+			if got := step(t0.Add(10 * time.Millisecond)); !got.Equal(t0.Add(tc.want)) {
+				t.Fatalf("at the echo: armed at t0+%v, want t0+%v", got.Sub(t0), tc.want)
+			}
+			if got := step(t0.Add(tc.want - 1)); !got.Equal(t0.Add(tc.want)) {
+				t.Fatalf("just before the deadline: armed at t0+%v, want t0+%v", got.Sub(t0), tc.want)
+			}
+		})
+	}
 }
 
 // TestPacketRankClass (M2-D46, M2-D47): a packet session ranks its datagram

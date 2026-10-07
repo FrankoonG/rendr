@@ -227,11 +227,7 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	a.unconfirmed = append(a.unconfirmed, l)
 	switch {
 	case ad.kind == adoptJoin:
-		rx := s.st.rRead
-		if s.pk != nil {
-			rx = uint64(laneRecvLimit(l)) // cmtu_acc, fixed by Join's SetBudget (M2-D11)
-		}
-		l.first = firstFrame{t: wire.TypeJoinAck, joinAck: wire.JoinAck{Status: wire.StatusOK, RxNext: rx}}
+		l.first = firstFrame{t: wire.TypeJoinAck, joinAck: wire.JoinAck{Status: wire.StatusOK, RxNext: s.joinAckRxLocked(l)}}
 	case ctl.state != StatePending:
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: s.laneWindowLocked(l)}}
 	}
@@ -239,6 +235,17 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	if ctl.state != StatePending {
 		a.episodeEndLocked(now)
 	}
+}
+
+// joinAckRxLocked is JOIN_ACK(OK).rxNext for the adopted JOIN lane l:
+// rRead on a stream session (§6.3); on a packet session cmtu_acc, the
+// budget Join fixed on l's carrier (SetBudget, so its RecvLimit; 0 on a
+// stream carrier), never an offset (M2-D11, M2-D50).
+func (s *Session) joinAckRxLocked(l *lane) uint64 {
+	if s.pk != nil {
+		return uint64(laneRecvLimit(l))
+	}
+	return s.st.rRead
 }
 
 // refuseAdopt answers an adopted carrier of an ended session and closes it:

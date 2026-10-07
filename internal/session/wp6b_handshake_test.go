@@ -3,7 +3,11 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -111,12 +115,16 @@ func TestPacketOpenAckFields_L37(t *testing.T) {
 				answered++
 				return wire.OpenAck{Status: wire.StatusOK, Window: wire.PacketWindow(1250, 1200)}, true // cmtu on a stream carrier
 			}
-			s, err := w.dial(context.Background(), wpSpec(w, ModeSelector, 1400, l), nil)
+			h := &wpMarkHealth{acHealth: acNewHealth(1, w.a.p.Selector.Fresh)}
+			s, err := w.dial(context.Background(), wpSpec(w, ModeSelector, 1400, l), h)
 			if s != nil || !errors.Is(err, ErrNoPath) || !errors.Is(err, errPktCmtu) {
 				t.Fatalf("Dial = %v, %v; want ErrNoPath wrapping the carrier's cmtu violation", s, err)
 			}
 			if answered == 0 {
 				t.Fatal("stimulus: no OPEN reached the scripted answer")
+			}
+			if !h.marked(0, carrier.CauseProtocolViolation.String()) {
+				t.Fatalf("the factory was not marked failed as a protocol violation (marks %v)", h.list())
 			}
 			if errors.Is(err, io.EOF) {
 				t.Fatal("a Dial error must never read as io.EOF")
@@ -225,6 +233,94 @@ func TestPacketJoinFields(t *testing.T) {
 			}
 		})
 	})
+	t.Run("adopt: JOIN_ACK(OK) carries the carrier's cmtu_acc", func(t *testing.T) {
+		// The adopted JOIN lane's JOIN_ACK answers the budget Join fixed on
+		// its carrier (its RecvLimit after SetBudget), never rRead.
+		s := dpSession(dpOpt{role: RolePassive})
+		l, fp := dpAddLane(s, 1, false, true)
+		s.mu.Lock()
+		s.st.rRead = 777 // a stray offset must not leak into a packet JOIN_ACK
+		s.mu.Unlock()
+		for _, lim := range []int{1200, wire.MinFrameBudget, 0} {
+			l.port = wpLimitPort{fp, lim}
+			if got := wpLocked(s, func() uint64 { return s.joinAckRxLocked(l) }); got != uint64(lim) {
+				t.Fatalf("packet JOIN_ACK rxNext %d, want the carrier's cmtu_acc %d", got, lim)
+			}
+		}
+		ss := &Session{}
+		ss.st.rRead = 777
+		if got := ss.joinAckRxLocked(l); got != 777 {
+			t.Fatalf("stream JOIN_ACK rxNext %d, want rRead 777", got)
+		}
+	})
+	t.Run("end to end: a JOIN_ACK outside the rules is its carrier's violation", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := wpNewWorld(t, nil)
+			defer w.teardown()
+			h := &wpMarkHealth{acHealth: acNewHealth(2, w.a.p.Selector.Fresh)}
+			l1, l2 := wpLink(w, "p1", 1400), wpLink(w, "p2", 1400)
+			a, b := wpOpen(w, wpSpec(w, ModeBond, 1400, l1, l2), h)
+			acWaitFor(t, time.Second, "both members attached", func() bool { return a.dataMembers() == 2 && b.dataMembers() == 2 })
+			var scripted atomic.Int32
+			w.b.joinAnswer = func(*wire.Join) (wire.JoinAck, bool) {
+				if scripted.Add(1) > 1 {
+					return wire.JoinAck{}, false
+				}
+				return wire.JoinAck{Status: wire.StatusOK, RxNext: 1200}, true // a cmtu on a stream carrier
+			}
+			if l2.Kill() == 0 {
+				t.Fatal("the kill hit no carrier")
+			}
+			acWaitFor(t, 3*time.Second, "the member rejoined", func() bool { return a.dataMembers() == 2 && b.dataMembers() == 2 })
+			switch scripted.Load() {
+			case 0:
+				t.Fatal("stimulus: no JOIN was answered with the scripted cmtu")
+			case 1:
+				t.Fatal("the carrier whose JOIN_ACK carried a cmtu on a stream carrier became a member")
+			}
+			if !h.marked(1, carrier.CauseProtocolViolation.String()) {
+				t.Fatalf("factory 1 not marked failed as a protocol violation (marks %v)", h.list())
+			}
+			for _, c := range a.Status().Carriers {
+				if c.DeathCause == carrier.CauseProtocolViolation {
+					t.Fatalf("the violating carrier became a lane: %+v", c)
+				}
+			}
+			if st := a.Status(); st.State != StateOpen || a.MaxPayload() != 1400 {
+				t.Fatalf("the session after the violation: %v, MaxPayload %d", st.State, a.MaxPayload())
+			}
+			dpWrite(t, a, 2, 1400)
+			buf := make([]byte, 2000)
+			if n, err := b.ReadFrom(buf); n != 1400 || err != nil || dpID(buf) != 2 {
+				t.Fatalf("ReadFrom = %d, %v", n, err)
+			}
+		})
+	})
+}
+
+// wpMarkHealth is acHealth recording every MarkFailed call as
+// "factory:reason".
+type wpMarkHealth struct {
+	*acHealth
+	mu    sync.Mutex
+	marks []string
+}
+
+func (h *wpMarkHealth) MarkFailed(i int, reason string) {
+	h.mu.Lock()
+	h.marks = append(h.marks, fmt.Sprintf("%d:%s", i, reason))
+	h.mu.Unlock()
+	h.acHealth.MarkFailed(i, reason)
+}
+
+func (h *wpMarkHealth) list() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.marks)
+}
+
+func (h *wpMarkHealth) marked(i int, reason string) bool {
+	return slices.Contains(h.list(), fmt.Sprintf("%d:%s", i, reason))
 }
 
 // TestPacketPassiveMaxPayload_L37 (M2-D49, R1-32): the passive's accepted

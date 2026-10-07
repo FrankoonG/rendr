@@ -42,6 +42,61 @@ func TestPacketStatusSnapshot(t *testing.T) {
 		}
 	})
 
+	t.Run("dead carriers' refused DGRAMs count once (R1-31)", func(t *testing.T) {
+		// More dead carriers than the dead-lane history keeps (8), with a
+		// Refused count each: settled before their record is evicted, or
+		// evicted before they settle. Either way every carrier's count is
+		// in its record or in refusedGone exactly once, and Status moves
+		// all of them from Sent to DropTooLarge.
+		const n = maxDeadLanes + 3
+		refused := func(i int) uint64 { return uint64(i + 1) }
+		var total uint64
+		for i := range n {
+			total += refused(i)
+		}
+		for _, settleFirst := range []bool{true, false} {
+			s := dpSession(dpOpt{})
+			a := &actor{s: s}
+			conns := make([]*carrier.Conn, n)
+			s.mu.Lock()
+			for i := range conns {
+				conns[i] = &carrier.Conn{} // an identity only: no method that needs a carrier runs on it
+				l := &lane{s: s, c: conns[i], port: dpNewPort(uint32(i+1), true), id: uint32(i + 1), state: LaneDead}
+				a.removeLaneLocked(l, carrier.CauseLocalClose, "", time.Now())
+				if settleFirst {
+					a.settleStatsLocked(conns[i], carrier.Stats{Refused: refused(i)})
+				}
+			}
+			if !settleFirst {
+				if a.refusedGone != 0 {
+					s.mu.Unlock()
+					t.Fatalf("evicted unsettled records counted %d", a.refusedGone)
+				}
+				for i, c := range conns {
+					a.settleStatsLocked(c, carrier.Stats{Refused: refused(i)})
+				}
+			}
+			var inRecords uint64
+			for _, d := range a.dead {
+				inRecords += d.stats.Refused
+			}
+			gone := a.refusedGone
+			a.publishLocked(time.Now())
+			s.pk.ctr = PacketCounters{Sent: 100, DropTooLarge: 1}
+			s.mu.Unlock()
+			if want := refused(0) + refused(1) + refused(2); gone != want || gone+inRecords != total {
+				t.Fatalf("settle first %v: refusedGone %d, in the records %d; want %d and %d in all", settleFirst, gone, inRecords, want, total)
+			}
+			if got := s.snap.Load().refusedGone; got != gone {
+				t.Fatalf("settle first %v: published refusedGone %d, want %d", settleFirst, got, gone)
+			}
+			st := s.status()
+			if st.Packet.Sent != 100-total || st.Packet.DropTooLarge != 1+total {
+				t.Fatalf("settle first %v: Sent %d DropTooLarge %d; want %d, %d", settleFirst, st.Packet.Sent, st.Packet.DropTooLarge, 100-total, 1+total)
+			}
+		}
+	})
+
 	t.Run("end to end", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := wpNewWorld(t, nil)

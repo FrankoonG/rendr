@@ -20,13 +20,8 @@ func (a *actor) newLaneLocked(now time.Time, c *carrier.Conn, factory int, gen u
 	s := a.s
 	l := &lane{s: s, c: c, port: c, id: c.ID(), factory: factory, gen: gen, since: now}
 	l.state = st
-	l.schedSent = s.ctl.epoch // a lane carries only SCHEDs published after it attached
-	if s.pk != nil && a.d != nil && c.Kind() == wire.KindDatagram && s.ctl.set.N > 0 {
-		// A packet session's datagram lane carries the current epoch once
-		// (REL) instead, so that "schedSent == epoch" means "carried there"
-		// for the SCHED resend's skip (M2-D53, resendLaneLocked).
-		l.schedSent = s.ctl.epoch - 1
-	}
+	l.schedSent = s.ctl.epoch   // a lane carries only SCHEDs published after it attached
+	l.echoRel = s.ctl.epoch - 1 // passive: the first epoch echo placed on l is reliable (M2-D39)
 	s.lanes = append(s.lanes, l)
 	s.laneAddedLocked(l)
 	a.dirty = true
@@ -84,18 +79,25 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 // session adds the Refused count of a carrier without a record to
 // refusedGone (R1-31).
 func (a *actor) settleDeadLocked(c *carrier.Conn) {
+	a.settleStatsLocked(c, c.Stats())
+}
+
+// settleStatsLocked is settleDeadLocked with c's final Stats st: they
+// replace c in its dead-lane record, or, once the record was evicted
+// (removeLaneLocked counted none of its Refused then), a packet session
+// adds st.Refused to refusedGone. Every refused DGRAM of a dead carrier is
+// thus counted once: in its record while it lasts, in refusedGone after.
+func (a *actor) settleStatsLocked(c *carrier.Conn, st carrier.Stats) {
 	for i := range a.dead {
 		if d := &a.dead[i]; d.conn == c {
-			d.stats, d.conn = c.Stats(), nil
+			d.stats, d.conn = st, nil
 			a.dirty = true
 			return
 		}
 	}
-	if a.s.pk != nil {
-		if n := c.Stats().Refused; n > 0 {
-			a.refusedGone += n
-			a.dirty = true
-		}
+	if a.s.pk != nil && st.Refused > 0 {
+		a.refusedGone += st.Refused
+		a.dirty = true
 	}
 }
 

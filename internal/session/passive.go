@@ -64,6 +64,7 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 	l := &lane{s: s, c: first, port: first, id: first.ID(), factory: -1, gen: 1, since: now}
 	l.state = LaneJoining
 	l.schedSent = s.ctl.epoch
+	l.echoRel = s.ctl.epoch - 1 // the first epoch echo placed on l is reliable (M2-D39)
 	s.lanes = append(s.lanes, l)
 	s.laneAddedLocked(l)
 	s.initialSnapLocked()
