@@ -182,9 +182,10 @@ func (c *Conn) dgPingLocked(w *writer, b *Batch, now time.Time) (kill bool) {
 // SetWriteDeadline cover the round. Per datagram: written; refused as too
 // large — the budget shrinks (M2-D25), its DGRAM counts Refused and its
 // PING record goes; lost to noise — Dropped; any other error ends the
-// carrier (an invalid count included: never retried, L42). The commit
-// follows under Conn.mu: the PING commit (L23), the REL timer per R1-2,
-// the CLOSE and the retirement checks (R1-4).
+// carrier (an invalid count included: never retried, L42). The PING is
+// committed when the write that carried it returns (L23); the rest of the
+// commit follows under Conn.mu: the REL timer per R1-2, the CLOSE and the
+// retirement checks (R1-4).
 func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, cand PeerKey, nonce uint64) bool {
 	dg := c.dg
 	io := dg.io
@@ -218,6 +219,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		fatal = c.dgControlWritten(io.WriteDatagramTo(d, cand))
 	}
 	budget := int(dg.budget.Load())
+	pinged, pingT := w.ping, time.Time{}
 	for i := 0; fatal == nil && i < b.Len(); {
 		end, _ := b.nextDatagram(i, budget)
 		d := b.appendDatagram(w.dscratch.B[:hr], i, end)
@@ -226,6 +228,17 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		}
 		err := io.WriteDatagram(d)
 		n, hasDgram := b.datagramDgram(end)
+		if w.ping && w.pingAt >= i && w.pingAt < end && (err == nil || errors.Is(err, ErrNoise)) {
+			// The PING is committed at the return of the write that carried
+			// it (L23), not at the end of the round: the rest of the round's
+			// writes neither stretch its RTT sample nor let its PONG arrive
+			// before the commit.
+			pingT = time.Now()
+			c.mu.Lock()
+			c.commitPingLocked(w, pingT)
+			c.mu.Unlock()
+			w.ping = false
+		}
 		switch {
 		case err == nil:
 			dg.ctr.datagrams.Add(1)
@@ -244,6 +257,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 				c.mu.Lock()
 				c.dgUnsentPingLocked(w) // it never left; a probe counts unanswered
 				c.mu.Unlock()
+				pinged = false
 			}
 			if c.dgShrink(err) {
 				fatal = errBudgetFloor
@@ -279,9 +293,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		c.closeSent.Store(true) // attempted: REL{CLOSE} is retransmitted until RACKed
 	}
 	c.mu.Lock()
-	c.commitLocked(w, b, end)
+	c.commitLocked(w, b, end) // w.ping is false here: the PING was committed with its datagram
 	c.st.txBytes += txb
-	c.relAttemptedLocked(w.retx, end)
+	c.relAttemptedLocked(w.retx, w.retxCseq, end)
 	if rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {
 		dg.peerCloseRacked = true
 	}
@@ -293,9 +307,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 			hook.RelRetransmit(c.id, w.retxCseq)
 		}
 	}
-	if w.ping {
+	if pinged {
 		if o := c.opts.Observer; o != nil {
-			o.PingCommitted(c, w.pingID, end)
+			o.PingCommitted(c, w.pingID, pingT)
 		}
 	}
 	if finish {

@@ -115,9 +115,16 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 	return ok
 }
 
-// dgBackoff sleeps the reader's back-off (5 ms doubling to 100 ms) unless
-// the carrier dies meanwhile; it reports whether the reader continues.
+// dgBackoff sleeps the reader's back-off (5 ms doubling to 100 ms); it
+// reports whether the reader continues. A dead carrier's reader exits
+// here: a transport that keeps answering after Close (empties, noise)
+// never makes it spin.
 func (c *Conn) dgBackoff(rd *dgReader) bool {
+	select {
+	case <-c.dying:
+		return false
+	default:
+	}
 	rd.backoff = min(max(2*rd.backoff, noiseMin), noiseMax)
 	if rd.timer == nil {
 		rd.timer = time.NewTimer(rd.backoff)
@@ -126,10 +133,11 @@ func (c *Conn) dgBackoff(rd *dgReader) bool {
 	}
 	select {
 	case <-rd.timer.C:
+		return true
 	case <-c.dying:
 		rd.timer.Stop()
+		return false
 	}
-	return true // a dead carrier's closer ends the next read
 }
 
 // dgFrames handles the rendr bytes of one datagram received at now from

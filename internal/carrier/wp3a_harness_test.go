@@ -63,6 +63,7 @@ type fakeIO struct {
 	delay   time.Duration
 	link    chan dgItem // delayed delivery, FIFO (delay > 0)
 	endless ReadEvent   // non-zero: every read returns it at once
+	zombie  bool        // endless mode goes on after Close (a transport that ignores it)
 	spinAt  time.Time   // endless mode: reads at one instant of (virtual) time
 	spins   int
 	rec     bool
@@ -137,7 +138,13 @@ func (f *fakeIO) ReadDatagram(buf []byte) ([]byte, PeerKey, ReadEvent, error) {
 	f.nreads.Add(1)
 	f.mu.Lock()
 	hang := f.hang
+	short := len(buf) < f.recv+f.hr+1
 	f.mu.Unlock()
+	if short {
+		// The reader must pass ReadSize() bytes: recvLimit + Headroom + 1, so
+		// a datagram one byte over the limit is seen as truncated (R1-6).
+		return nil, PeerKey{}, 0, errShortBuf
+	}
 	if hang != nil {
 		<-hang
 		return nil, PeerKey{}, 0, net.ErrClosed
@@ -150,7 +157,7 @@ func (f *fakeIO) ReadDatagram(buf []byte) ([]byte, PeerKey, ReadEvent, error) {
 	}()
 	for {
 		f.mu.Lock()
-		if f.endless != 0 && !f.closed {
+		if f.endless != 0 && (!f.closed || f.zombie) {
 			ev := f.endless
 			now := time.Now()
 			if now.Equal(f.spinAt) {
@@ -575,10 +582,18 @@ type dgSide struct {
 // dgPair returns two unstarted datagram carriers over a lossless in-memory
 // link with frame budget cmtu: a (dialer) and b (passive). Cleanup kills
 // both and waits for Done.
-func dgPair(t testing.TB, cmtu int) (a, b *dgSide) {
+func dgPair(t testing.TB, cmtu int) (a, b *dgSide) { return dgPairWith(t, cmtu, nil) }
+
+// dgPairWith is dgPair with mod applied to both sides' Env before the
+// carriers are built (Presets: the first fseq and cseq, L14 wrap rows).
+func dgPairWith(t testing.TB, cmtu int, mod func(*Env)) (a, b *dgSide) {
 	ia, ib := newFakeIOPair(cmtu)
 	a = &dgSide{env: dgEnv(), io: ia, ep: &dEP{}, bell: &hBell{}}
 	b = &dgSide{env: dgEnv(), io: ib, ep: &dEP{}, bell: &hBell{}}
+	if mod != nil {
+		mod(a.env)
+		mod(b.env)
+	}
 	a.c = dgConn(a.env, ia, cmtu, true)
 	b.c = dgConn(b.env, ib, cmtu, false)
 	t.Cleanup(func() {
@@ -646,8 +661,16 @@ func (p *rawPeer) read() [][]byte {
 // a link and a raw peer on the other end (the peer's datagrams come from
 // the carrier's current peer address).
 func rawPair(t testing.TB, cmtu int, dialer bool) (*dgSide, *rawPeer) {
+	return rawPairWith(t, cmtu, dialer, nil)
+}
+
+// rawPairWith is rawPair with mod applied to the carrier's Env first.
+func rawPairWith(t testing.TB, cmtu int, dialer bool, mod func(*Env)) (*dgSide, *rawPeer) {
 	ia, ib := newFakeIOPair(cmtu)
 	s := &dgSide{env: dgEnv(), io: ia, ep: &dEP{}, bell: &hBell{}}
+	if mod != nil {
+		mod(s.env)
+	}
 	s.c = dgConn(s.env, ia, cmtu, dialer)
 	p := &rawPeer{io: ib, fseq: s.env.Presets.firstFseq()}
 	t.Cleanup(func() {
@@ -725,6 +748,17 @@ const spinLimit = 10000
 
 // errSpin: the reader read spinLimit times without time advancing.
 var errSpin = errors.New("test: the reader spins")
+
+// errShortBuf: the reader passed a buffer shorter than ReadSize().
+var errShortBuf = errors.New("test: read buffer shorter than ReadSize")
+
+// wrapPresets numbers both directions so that the fseqs and the REL cseqs
+// wrap within the first frames (L14): the first two RELs are 0xFFFFFFFF
+// and 0.
+func wrapPresets(env *Env) {
+	env.Presets.FirstFseq = 0xFFFFFFF0
+	env.Presets.FirstCseq = 0xFFFFFFFF
+}
 
 // errNotNoise is a transport error that is neither noise nor a size
 // refusal: the carrier dies.

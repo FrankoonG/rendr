@@ -287,22 +287,30 @@ func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
 	st.retxBytes += uint64(b.retxBytes())
 	st.frames += uint64(b.Len())
 	if w.ping {
-		if i := st.find(w.pingID); i >= 0 {
-			r := st.record(i)
-			r.committedAt = at
-			if r.early && r.mark > st.pongMark {
-				st.pongMark = r.mark
-			}
-		}
-		st.lastCommit = at
-		if w.pingJudged {
-			st.intervalStart = at
-		}
+		c.commitPingLocked(w, at)
 	}
 	if data > 0 && b.CapBlocked() && !w.pingAtEnd {
 		st.pingReq = true
 	}
 	c.gaugeUpdateLocked()
+}
+
+// commitPingLocked commits the writer's PING at at, the return of the
+// write that carried it (L23): RTT counts from here; an early mark applies
+// its PONG watermark; a judged PING starts the next backlog interval.
+func (c *Conn) commitPingLocked(w *writer, at time.Time) {
+	st := &c.st
+	if i := st.find(w.pingID); i >= 0 {
+		r := st.record(i)
+		r.committedAt = at
+		if r.early && r.mark > st.pongMark {
+			st.pongMark = r.mark
+		}
+	}
+	st.lastCommit = at
+	if w.pingJudged {
+		st.intervalStart = at
+	}
 }
 
 // onPongLocked applies a PONG received at now (design §4.10). A PONG that

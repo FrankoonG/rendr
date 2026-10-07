@@ -75,10 +75,24 @@ func (l *retxLog) get() ([]time.Time, []uint32) {
 // TestRelWindow_L12: at most wire.RelWindow RELs are outstanding; a ninth
 // reliable frame is refused by the batch and stays due in the session
 // (RelRoom 0); the RACK that frees room wakes the blocked writer, which
-// then places it.
+// then places it. The wrap row numbers both directions so that the cseqs
+// and fseqs wrap inside the window (L14).
 func TestRelWindow_L12(t *testing.T) {
+	for _, pre := range presetRows {
+		t.Run(pre.name, func(t *testing.T) { testRelWindow(t, pre.mod) })
+	}
+}
+
+// presetRows are the REL tests' numbering rows: the default first cseq and
+// fseq, and both wrapping within the first frames (L14).
+var presetRows = []struct {
+	name string
+	mod  func(*Env)
+}{{"first", nil}, {"wrap", wrapPresets}}
+
+func testRelWindow(t *testing.T, mod func(*Env)) {
 	synctest.Test(t, func(t *testing.T) {
-		a, b := dgPair(t, 1200)
+		a, b := dgPairWith(t, 1200, mod)
 		var want atomic.Int32
 		var next atomic.Uint64
 		want.Store(9)
@@ -443,8 +457,15 @@ func TestRelBeyondWindowKills_L43(t *testing.T) {
 
 // TestRackValidation_L13: a RACK naming a cseq never sent — by its cumAck
 // or by a sack bit — or with reserved sack bits kills the carrier; a stale
-// cumAck is ignored; a cumAck at una frees its slot (§A3.3).
+// cumAck is ignored; a cumAck at una frees its slot (§A3.3). Every row also
+// runs with the cseqs wrapping between the outstanding RELs (L14).
 func TestRackValidation_L13(t *testing.T) {
+	for _, pre := range presetRows {
+		t.Run(pre.name, func(t *testing.T) { testRackValidation(t, pre.mod) })
+	}
+}
+
+func testRackValidation(t *testing.T, mod func(*Env)) {
 	for _, tc := range []struct {
 		name string
 		cum  int32 // relative to the first cseq; two RELs are outstanding
@@ -460,7 +481,7 @@ func TestRackValidation_L13(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				s, p := rawPair(t, 1200, true)
+				s, p := rawPairWith(t, 1200, true, mod)
 				var want atomic.Int32
 				var next atomic.Uint64
 				want.Store(2)
@@ -482,6 +503,185 @@ func TestRackValidation_L13(t *testing.T) {
 				}
 				if r := s.c.RelRoom(); r != tc.room {
 					t.Fatalf("RelRoom %d, want %d", r, tc.room)
+				}
+			})
+		})
+	}
+}
+
+// TestRelBlockedWake_L12: a reliable frame refused for lack of REL room is
+// placed as soon as a RACK with progress frees room — the RACK wakes the
+// blocked writer (§A5.9; integration 1, D9) — not at the next PING. The
+// carrier is past its youth with PingIdle 1 min, so no PING round can hide a
+// missing wake.
+func TestRelBlockedWake_L12(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := dgPair(t, 1200)
+		withTiming(func(tm *Timing) { tm.PingIdle = time.Minute }, a, b)
+		var want atomic.Int32
+		var next atomic.Uint64
+		a.ep.setFill(finFill(&want, &next))
+		a.start(StartOptions{})
+		b.start(StartOptions{})
+		time.Sleep(6 * time.Second)                        // past the youth: PINGs at PingIdle only
+		b.io.setFilter(func([]byte) bool { return false }) // no RACK reaches a
+		want.Store(9)
+		a.c.Wake()
+		synctest.Wait()
+		a.c.mu.Lock()
+		blocked := a.c.dg.rel.blocked
+		a.c.mu.Unlock()
+		if want.Load() != 1 || a.c.RelRoom() != 0 || !blocked {
+			t.Fatalf("FINs due %d, RelRoom %d, blocked %v; want the ninth refused and blocked", want.Load(), a.c.RelRoom(), blocked)
+		}
+		b.io.setFilter(nil) // the path recovers: the retransmission of una draws a RACK
+		t1 := time.Now()
+		for len(finOffsets(b.ep)) < 9 && time.Since(t1) < 5*time.Second {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := finOffsets(b.ep); len(got) != 9 {
+			t.Fatalf("passive FINs %v 5 s after the path recovered, want 0…8", got)
+		}
+		a.c.mu.Lock()
+		rto := a.c.relRTOLocked()
+		a.c.mu.Unlock()
+		if d := time.Since(t1); d > rto+50*time.Millisecond {
+			t.Fatalf("the ninth FIN arrived %v after the path recovered, want ≤ one RTO (%v) and an RTT", d, rto)
+		}
+	})
+}
+
+// TestRelRTOFromSamples_L12: the REL timeout follows the carrier's own RTT
+// samples, srtt + 4·rttvar (M2-D16): a peer answering PINGs after 60 and
+// 180 ms in turn gives a non-zero rttvar, and a lost REL is retransmitted
+// exactly that timeout after its attempt.
+func TestRelRTOFromSamples_L12(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, true)
+		var log retxLog
+		s.env.Hooks = log.hooks()
+		var want atomic.Int32
+		var next atomic.Uint64
+		s.ep.setFill(finFill(&want, &next))
+		s.io.setRec(true)
+		s.start(StartOptions{})
+		delays := []time.Duration{60 * time.Millisecond, 180 * time.Millisecond}
+		for n := 0; n < 8; {
+			<-p.io.wake // a datagram reached the peer (exact virtual time)
+			var ps []wire.Ping
+			for _, d := range p.read() {
+				ps = append(ps, pingsOf(d, false)...)
+			}
+			if len(ps) == 0 {
+				continue
+			}
+			time.Sleep(delays[n%2])
+			for _, pg := range ps {
+				p.send(pingFrame(wire.TypePong, pg))
+			}
+			n++
+		}
+		synctest.Wait()
+		s.c.mu.Lock()
+		srtt, rttvar, rto := s.c.st.srtt, s.c.st.rttvar, s.c.relRTOLocked()
+		s.c.mu.Unlock()
+		if rttvar < 20*time.Millisecond || rto != srtt+4*rttvar || rto <= s.c.tm.RelRTOMin {
+			t.Fatalf("srtt %v rttvar %v RTO %v, want rttvar from the jittered samples and RTO = srtt + 4·rttvar", srtt, rttvar, rto)
+		}
+		p.read()
+		want.Store(1) // the peer stays silent from here on: the REL is lost
+		s.c.Wake()
+		synctest.Wait()
+		var attempt time.Time
+		for _, w := range s.io.recorded() {
+			if anyRel(w.b) {
+				attempt = w.at
+				break
+			}
+		}
+		time.Sleep(rto + 10*time.Millisecond)
+		at, _ := log.get()
+		if attempt.IsZero() || len(at) != 1 || at[0].Sub(attempt) != rto {
+			t.Fatalf("REL attempted at %v, retransmissions at %v, want one %v later", attempt, at, rto)
+		}
+	})
+}
+
+// TestRelBackoffResetOnProgress_L12: a RACK with progress resets the
+// backoff and arms the new una's first timeout one RTO after that RACK
+// (§A5.9): REL x is lost once, x+1 always; after the RACK of x the
+// retransmissions of x+1 follow one, two and four RTOs apart. The second
+// row makes the RACK land between the retransmission of x and the writer's
+// commit: the retransmission of x no longer backs the new una off.
+func TestRelBackoffResetOnProgress_L12(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		oneWay time.Duration
+		race   bool
+	}{
+		{"RACK after the commit", 5 * time.Millisecond, false},
+		{"RACK before the commit", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				a, b := dgPair(t, 1200)
+				if tc.oneWay > 0 {
+					a.io.setDelay(tc.oneWay)
+					b.io.setDelay(tc.oneWay)
+				}
+				var want atomic.Int32
+				var next atomic.Uint64
+				a.ep.setFill(finFill(&want, &next))
+				a.io.setRec(true)
+				a.start(StartOptions{})
+				b.start(StartOptions{})
+				time.Sleep(100 * time.Millisecond) // the first PING's sample
+				x := a.env.Presets.firstCseq()
+				var lost atomic.Int32
+				a.io.setFilter(func(d []byte) bool {
+					return !withRel(x+1)(d) && dropFirst(withRel(x), 1, &lost)(d)
+				})
+				if tc.race {
+					var copies atomic.Int32
+					a.io.setPost(func(d []byte) {
+						if !withRel(x)(d) || copies.Add(1) != 1 {
+							return // only the retransmission of x is held (the first copy was lost before delivery)
+						}
+						for range 100 { // hold the write until the RACK of x was processed
+							a.c.mu.Lock()
+							moved := a.c.dg.rel.una != x
+							a.c.mu.Unlock()
+							if moved {
+								return
+							}
+							time.Sleep(time.Millisecond)
+						}
+					})
+				}
+				a.c.mu.Lock()
+				rto := a.c.relRTOLocked()
+				a.c.mu.Unlock()
+				want.Store(2)
+				a.c.Wake()
+				time.Sleep(10 * rto)
+				var xs, ys []time.Time
+				for _, w := range a.io.recorded() {
+					if withRel(x)(w.b) {
+						xs = append(xs, w.at)
+					}
+					if withRel(x + 1)(w.b) {
+						ys = append(ys, w.at)
+					}
+				}
+				if lost.Load() != 1 || len(xs) != 2 || len(ys) < 4 {
+					t.Fatalf("lost %d, copies of x %v, of x+1 %v", lost.Load(), xs, ys)
+				}
+				rack := xs[1].Add(2 * tc.oneWay) // the RACK of x arrives one RTT after its retransmission
+				wantAt := []time.Duration{rto, 3 * rto, 7 * rto}
+				for i, w := range wantAt {
+					if d := ys[i+1].Sub(rack); d != w {
+						t.Fatalf("retransmission %d of x+1 %v after the RACK of x, want %v (RTO %v; all %v)", i+1, d, w, rto, ys)
+					}
 				}
 			})
 		})

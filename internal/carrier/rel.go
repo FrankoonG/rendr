@@ -124,17 +124,20 @@ func (c *Conn) relRetxDueLocked(now time.Time) bool {
 }
 
 // relAttemptedLocked runs after the round's datagrams were attempted —
-// written, refused or lost to noise — at at (R1-2): a retransmission
-// re-arms the timer with the next backed-off timeout whatever its outcome,
-// and a new REL arms it when it is not armed; nothing is armed while no REL
-// is outstanding.
-func (c *Conn) relAttemptedLocked(retx bool, at time.Time) {
+// written, refused or lost to noise — at at (R1-2): a retransmission of
+// retxCseq re-arms the timer with the next backed-off timeout whatever its
+// outcome while that cseq is still una, and a new REL arms it when it is
+// not armed; nothing is armed while no REL is outstanding. A RACK with
+// progress that landed between the retransmission's placement and this
+// commit already reset the backoff and armed the new una's first timeout
+// (relOnRack): the retransmission no longer backs it off.
+func (c *Conn) relAttemptedLocked(retx bool, retxCseq uint32, at time.Time) {
 	r := &c.dg.rel
 	if !r.outstanding() {
 		r.due, r.backoff = time.Time{}, 0
 		return
 	}
-	if retx {
+	if retx && r.una == retxCseq {
 		r.backoff++
 		r.due = at.Add(sched.RTOBackoffWithin(c.relRTOLocked(), r.backoff, c.tm.RelRTOMax))
 		return
@@ -170,9 +173,10 @@ func (r *relState) rackLocked() wire.Rack {
 // a set sack bit naming a cseq not yet sent is a violation; a cumAck at or
 // beyond una frees the slots through it; a lower one is stale and
 // ignored; sack bits are otherwise ignored (R1-18). Progress resets the
-// backoff, re-arms or clears the timer and wakes a writer that found no
-// REL room; the RACK that covers our CLOSE may complete a retirement
-// (R1-4). It reports whether the reader continues.
+// backoff, re-arms or clears the timer — waking the writer when the new
+// una's timeout is earlier than the one it sleeps on — and wakes a writer
+// that found no REL room; the RACK that covers our CLOSE may complete a
+// retirement (R1-4). It reports whether the reader continues.
 func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 	rk, err := wire.ParseRack(p)
 	if err != nil {
@@ -199,7 +203,11 @@ func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 		r.una = rk.CumAck + 1
 		r.backoff = 0
 		if r.outstanding() {
+			// The new una's first timeout: a writer asleep until the old,
+			// backed-off one is woken to re-arm its timer.
+			old := r.due
 			r.due = now.Add(c.relRTOLocked())
+			wake = old.IsZero() || r.due.Before(old)
 		} else {
 			r.due = time.Time{}
 		}

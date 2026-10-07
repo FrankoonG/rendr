@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -56,44 +57,54 @@ func isPingDatagram(d []byte) bool {
 }
 
 // TestPingRetryOnLoss_L24_L25: an unanswered PING is retried one RTO after
-// its commit (one unpadded PING per RTO, PA-10), so an idle datagram carrier
-// whose cadence is PingIdle (longer than the death deadline) survives the
-// loss of one PING; the death rule itself is unchanged.
+// its commit, and a lost retry one RTO after that — one unpadded PING per
+// RTO, never a burst (PA-10, R1-13) — so an idle datagram carrier whose
+// cadence is PingIdle (longer than the death deadline) survives the loss of
+// a PING; the death rule itself is unchanged.
 func TestPingRetryOnLoss_L24_L25(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		a, b := dgPair(t, 1200)
-		a.io.setDelay(5 * time.Millisecond)
-		b.io.setDelay(5 * time.Millisecond)
-		a.io.setRec(true)
-		a.start(StartOptions{})
-		b.start(StartOptions{})
-		time.Sleep(10 * time.Second) // past youth: the cadence is PingIdle (10 s) > D (3 s)
-		var lost atomic.Int32
-		a.io.setFilter(dropFirst(isPingDatagram, 1, &lost))
-		time.Sleep(20 * time.Second)
-		if dead, cause, detail, _ := a.c.Death(); dead {
-			t.Fatalf("carrier died: %v %q", cause, detail)
-		}
-		if lost.Load() != 1 {
-			t.Fatalf("lost %d PINGs, want 1", lost.Load())
-		}
-		ps := pingWrites(a.io.recorded())
-		var dropAt time.Time
-		for i, p := range ps {
-			if p.at.Sub(ps[0].at) >= 10*time.Second && dropAt.IsZero() {
-				dropAt = p.at
-				if i+1 >= len(ps) {
-					t.Fatal("no PING after the lost one")
+	for _, lose := range []int{1, 2} {
+		t.Run(fmt.Sprintf("%d lost", lose), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				a, b := dgPair(t, 1200)
+				a.io.setDelay(5 * time.Millisecond)
+				b.io.setDelay(5 * time.Millisecond)
+				a.io.setRec(true)
+				a.start(StartOptions{})
+				b.start(StartOptions{})
+				time.Sleep(10 * time.Second) // past youth: the cadence is PingIdle (10 s) > D (3 s)
+				var lost atomic.Int32
+				a.io.setFilter(dropFirst(isPingDatagram, lose, &lost))
+				time.Sleep(20 * time.Second)
+				if dead, cause, detail, _ := a.c.Death(); dead {
+					t.Fatalf("carrier died: %v %q", cause, detail)
+				}
+				if int(lost.Load()) != lose {
+					t.Fatalf("lost %d PINGs, want %d", lost.Load(), lose)
 				}
 				a.c.mu.Lock()
 				rto := a.c.relRTOLocked()
 				a.c.mu.Unlock()
-				if d := ps[i+1].at.Sub(dropAt); d != rto || ps[i+1].p.Pad != 0 {
-					t.Fatalf("retry %v after the lost PING (pad %d), want one RTO (%v)", d, ps[i+1].p.Pad, rto)
+				ps := pingWrites(a.io.recorded())
+				i := 0
+				for i < len(ps) && ps[i].at.Sub(ps[0].at) < 10*time.Second {
+					i++
 				}
-			}
-		}
-	})
+				if i+lose+1 >= len(ps) {
+					t.Fatalf("%d PINGs, want the lost ones, their retries and the next cadence PING", len(ps))
+				}
+				for k := 1; k <= lose; k++ {
+					if d := ps[i+k].at.Sub(ps[i+k-1].at); d != rto || ps[i+k].p.Pad != 0 {
+						t.Fatalf("retry %d %v after the PING before it (pad %d), want one RTO (%v)", k, d, ps[i+k].p.Pad, rto)
+					}
+				}
+				// The answered retry ends the retries: the next PING is the
+				// cadence's, not a burst behind it.
+				if d := ps[i+lose+1].at.Sub(ps[i+lose].at); d < rto {
+					t.Fatalf("a PING %v after the answered retry, want none within an RTO (%v)", d, rto)
+				}
+			})
+		})
+	}
 }
 
 // TestIdleDatagramCarrierSurvivesLoss_L25: an idle datagram carrier — a

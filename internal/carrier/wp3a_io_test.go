@@ -152,6 +152,53 @@ func TestDatagramReadCount_L42(t *testing.T) {
 			}
 		})
 	})
+	t.Run("a handed-over datagram resets the guard", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, p := rawPair(t, 1200, true)
+			s.start(StartOptions{})
+			synctest.Wait()
+			p.read()
+			for k := range uint32(3) {
+				for range spinIdle - 1 {
+					s.io.injectEvent(ReadForeign, nil)
+				}
+				p.send(pingFrame(wire.TypePing, wire.Ping{ID: 100 + k, Nonce: 1}))
+			}
+			synctest.Wait() // no virtual time passes: a back-off would leave reads pending
+			s.io.mu.Lock()
+			left := s.io.n
+			s.io.mu.Unlock()
+			last := false // the PONG slot is latest-wins: the last PING is answered
+			for _, d := range p.read() {
+				for _, pg := range pingsOf(d, true) {
+					last = last || pg.ID == 102
+				}
+			}
+			if dropped := s.c.Stats().Dropped; left != 0 || !last || dropped != 3*(spinIdle-1) {
+				t.Fatalf("%d reads pending, PONG of the last PING %v, dropped %d; want none pending (no back-off)", left, last, dropped)
+			}
+		})
+	})
+	t.Run("a transport answering after Close", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, _ := rawPair(t, 1200, true)
+			s.io.mu.Lock()
+			s.io.endless, s.io.zombie = ReadEmpty, true
+			s.io.mu.Unlock()
+			s.start(StartOptions{})
+			time.Sleep(time.Second)
+			n1 := s.io.nreads.Load()
+			s.c.Kill(CauseLocalClose, "test")
+			hWait(t, s.c)
+			time.Sleep(time.Second)
+			if n := s.io.nreads.Load() - n1; n > spinIdle {
+				t.Fatalf("%d reads after the death, want the reader gone at its next back-off", n)
+			}
+			if s.env.Abandon.Len() != 0 {
+				t.Fatal("the reader was abandoned")
+			}
+		})
+	})
 }
 
 // TestDatagramTooLargeShrinks_L37_L01: a size refusal loses that datagram
@@ -299,8 +346,9 @@ func TestDatagramSemanticViolationKills_L43(t *testing.T) {
 
 // TestDatagramAfterPeerClose: once the peer's CLOSE was dispatched, frames
 // with a later fseq are dropped and counted unless they are a RACK or a REL
-// duplicate (re-RACKed), earlier fseqs (reordered) are still processed
-// (M2-D30), and the retirement completes after the CLOSE exchange (R1-4).
+// duplicate (re-RACKed); a new REL behind the CLOSE is dropped and counted,
+// never dispatched; earlier fseqs (reordered) are still processed (M2-D30),
+// and the retirement completes after the CLOSE exchange (R1-4).
 func TestDatagramAfterPeerClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p := rawPair(t, 1200, false)
@@ -325,6 +373,19 @@ func TestDatagramAfterPeerClose(t *testing.T) {
 		synctest.Wait()
 		if got := s.c.Stats().Dropped - dropped; got != 2 {
 			t.Fatalf("%d frames dropped after the CLOSE, want 2", got)
+		}
+		dropped = s.c.Stats().Dropped
+		rst := make([]byte, wire.RstFixedLen)
+		wire.PutRst(rst, &wire.Rst{Code: 1})
+		p.send(relFrame(first+1, wire.TypeRst, 0, wire.SessionHandle, rst))
+		synctest.Wait()
+		if got := s.c.Stats().Dropped - dropped; got != 1 {
+			t.Fatalf("a new REL after the CLOSE: %d dropped, want 1", got)
+		}
+		for _, h := range s.ep.controls() {
+			if h.Type == wire.TypeRst {
+				t.Fatal("a new REL{RST} after the peer's CLOSE was dispatched")
+			}
 		}
 		late := p.fseq
 		p.fseq = reserved
