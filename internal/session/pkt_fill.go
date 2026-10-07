@@ -155,30 +155,35 @@ func (s *Session) pktHasDataLaneLocked() bool {
 }
 
 // pktOtherCarrierLocked reports whether a live data lane other than l can
-// carry an n-byte datagram now — a stream data lane with spare capacity for
-// it, or a datagram data lane whose DgramMax is at least n, either not
-// write-blocked — and wakes it (M2-D45). It recomputes the routing summary
-// first, so two lanes never defer to each other. A capable member that
+// carry an n-byte datagram now — a datagram data lane whose DgramMax is at
+// least n, else a stream data lane with spare capacity for it, either not
+// write-blocked — and wakes it (M2-D45). Datagram lanes come first, as in
+// the wake walk (§A5.2): a datagram that fits a datagram member never
+// moves to a stream member because a smaller datagram member pulled it
+// (integration 2; TestPacketCapacityAgreement_L37). It recomputes the
+// routing summary first, so two lanes never defer to each other. A capable member that
 // cannot write now does not hold the queue behind the head until MaxAge:
 // the head is dropped as too large instead (a budget shrink is rare; the
 // datagrams behind it are not held up).
 func (s *Session) pktOtherCarrierLocked(l *lane, n int) bool {
 	s.pktRouteLocked()
-	for _, o := range s.st.order {
-		if o == l || !o.data || o.state == LaneDead {
-			continue
+	for pass := range 2 {
+		for _, o := range s.st.order {
+			if o == l || !o.data || o.state == LaneDead {
+				continue
+			}
+			if _, dg := pktDgramLane(o); dg != (pass == 0) {
+				continue
+			}
+			if !s.pktCanPlaceLocked(o, n) {
+				continue
+			}
+			if o.idle {
+				o.idle = false
+				o.port.Wake()
+			}
+			return true
 		}
-		if pp, dg := pktDgramLane(o); dg && pp.DgramMax() < n {
-			continue
-		}
-		if !s.pktCanPlaceLocked(o, n) {
-			continue
-		}
-		if o.idle {
-			o.idle = false
-			o.port.Wake()
-		}
-		return true
 	}
 	return false
 }
@@ -310,14 +315,19 @@ func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, 
 }
 
 // pktCanPlaceLocked reports whether lane l can place an n-byte datagram
-// now: it is not write-blocked and, on a stream lane, its spare capacity
-// (Capacity − Inflight) holds n bytes (n < 0: no capacity needed).
+// now: it is not write-blocked and, on a datagram lane, n fits its
+// DgramMax — a smaller member never takes the head only to defer it
+// (integration 2) — or, on a stream lane, its spare capacity (Capacity −
+// Inflight) holds n bytes (n < 0: no size or capacity needed).
 func (s *Session) pktCanPlaceLocked(l *lane, n int) bool {
 	if l.port.WriteBlocked() {
 		return false
 	}
-	if _, dg := pktDgramLane(l); dg || n < 0 {
+	if n < 0 {
 		return true
+	}
+	if pp, dg := pktDgramLane(l); dg {
+		return pp.DgramMax() >= n
 	}
 	return l.port.Capacity()-l.port.Inflight() >= int64(n)
 }

@@ -176,8 +176,8 @@ func TestPacketTooLarge_L37(t *testing.T) {
 		p2.set(func(f *dpPort) { f.srtt = 2 * time.Millisecond })
 		dpIdle(l1)
 		dpIdle(l2)
-		dpWrite(t, b, 1, 1000)
 		w := p2.wakeCount()
+		dpWrite(t, b, 1, 1000) // the walk wakes the member that can carry it (integration 2)
 		if fs := dpFrames(dpFill(l1, time.Now())); dpCount(fs, wire.TypeDgram) != 0 {
 			t.Fatalf("the shrunk lane placed %v", fs)
 		}
@@ -190,6 +190,33 @@ func TestPacketTooLarge_L37(t *testing.T) {
 		}
 		if c := dpCtr(b); c.DropTooLarge != 0 || c.Sent != 1 {
 			t.Fatalf("counters %+v, want the datagram sent once", c)
+		}
+
+		// Mixed bond (integration 2): a small datagram member that meets a
+		// head it cannot carry defers it to a datagram member that can, never
+		// to the stream member listed before it.
+		m := dpSession(dpOpt{mode: ModeBond})
+		ls, ps := dpAddLane(m, 1, true, true)
+		lt, pt := dpAddLane(m, 2, true, false)
+		lb, pb := dpAddLane(m, 3, true, true)
+		ps.set(func(f *dpPort) { f.srtt = time.Millisecond; f.budget = 600 })
+		pt.set(func(f *dpPort) { f.srtt = 2 * time.Millisecond })
+		pb.set(func(f *dpPort) { f.srtt = 3 * time.Millisecond })
+		for _, l := range []*lane{ls, lt, lb} {
+			dpIdle(l)
+		}
+		dpWrite(t, m, 1, 500)
+		dpWrite(t, m, 2, 1000)
+		m.mu.Lock()
+		lt.idle, lb.idle = true, true // as if both writers had gone idle since
+		m.mu.Unlock()
+		wt, wb := pt.wakeCount(), pb.wakeCount()
+		if fs := dpFrames(dpFill(ls, time.Now())); dpCount(fs, wire.TypeDgram) != 1 {
+			t.Fatalf("the small member placed %v, want the 500-byte datagram", fs)
+		}
+		if pb.wakeCount() == wb || pt.wakeCount() != wt {
+			t.Fatalf("the deferred head woke the stream member (%d → %d) or not the big member (%d → %d)",
+				wt, pt.wakeCount(), wb, pb.wakeCount())
 		}
 	})
 }
