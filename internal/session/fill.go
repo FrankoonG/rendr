@@ -97,7 +97,11 @@ func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 		}
 	}
 	if l == st.ackLane || (l == st.gapLane && s.ackQualifiesLocked(l)) {
-		s.fillAckLocked(l, b)
+		if s.pk != nil {
+			s.fillPackLocked(l, b) // a packet session places PACK (M2 design §A5.5)
+		} else {
+			s.fillAckLocked(l, b)
+		}
 	}
 	return true
 }
