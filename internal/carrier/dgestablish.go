@@ -82,7 +82,8 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // doubling to RelRTOMax until a PREFACE_ACK, a RACK covering it or the
 // response, at most Handshake.Timeout after the first copy; the
 // PREFACE_ACK checked in M1's canonical order (a malformed one is a lost
-// datagram); then, until the response, frames through the receive window:
+// datagram; before it, only a rebind challenge is answered, R1-14); then,
+// until the response, frames through the receive window:
 // a RACK, PING (id 0: the rebind challenge, answered at once through this
 // socket, R1-14), a PONG of another id, PACK, DGRAM and a REL with another
 // cseq are dropped and counted (M2-D20); the response REL{FirstCseq,
@@ -366,6 +367,11 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 			rdl = next
 		}
 		_ = io.SetReadDeadline(rdl)
+		if d.isAborted() {
+			// The abort's SetDeadline(now) may have run before this later
+			// read deadline replaced it: the loop's top ends the attempt.
+			continue
+		}
 		data, _, ev, err := io.ReadDatagram(b)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) && !d.isAborted() && time.Now().Before(d.deadline) {
@@ -403,13 +409,22 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 			}
 			data = data[wire.PrefaceLen:] // a duplicate H2's frames are window duplicates
 		} else if ackBytes == nil {
+			// Before the PREFACE_ACK only a rebind challenge is answered: the
+			// H2 may have gone to the mapping the rebind left (R1-14).
+			werr := d.challenges(data)
 			io.Release()
-			dgEnvDropped(env) // before the PREFACE_ACK nothing is processed
+			if werr != nil {
+				return d.failed("preface", CauseTransportError, false, [16]byte{}, werr, false)
+			}
 			continue
 		}
 		r, verr := d.frames(data, &rwin)
 		if verr != nil {
 			io.Release()
+			var we *dgWriteError
+			if errors.As(verr, &we) {
+				return d.failed("response", CauseTransportError, true, ack.Instance, we.err, false)
+			}
 			return d.failed("response", CauseProtocolViolation, true, ack.Instance, verr, false)
 		}
 		if r.acked {
@@ -591,13 +606,8 @@ func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error
 				return r, fmt.Errorf("PING: %w", perr)
 			}
 			if pg.ID == 0 {
-				// A rebind challenge: its PONG at once, through this socket
-				// and NAT mapping (R1-14).
-				pg.Pad = 0
-				var pp [wire.PingFixedLen]byte
-				wire.PutPing(pp[:], &pg)
-				if err := d.write(d.frame(wire.Header{Type: wire.TypePong}, pp[:])); err != nil {
-					return r, err
+				if err := d.answerChallenge(pg); err != nil {
+					return r, &dgWriteError{err}
 				}
 				continue
 			}
@@ -612,6 +622,57 @@ func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error
 		}
 	}
 	return r, nil
+}
+
+// dgWriteError is a transport error of a write inside frames: the attempt
+// ends as a transport error, not a protocol violation.
+type dgWriteError struct{ err error }
+
+func (e *dgWriteError) Error() string { return e.err.Error() }
+func (e *dgWriteError) Unwrap() error { return e.err }
+
+// answerChallenge answers a rebind challenge (a PING with id 0) at once with
+// its PONG — the same nonce, no pad — through this socket and NAT mapping
+// (R1-14 (4)). It returns a write error that ends the attempt.
+func (d *dgDial) answerChallenge(pg wire.Ping) error {
+	pg.Pad = 0
+	var pp [wire.PingFixedLen]byte
+	wire.PutPing(pp[:], &pg)
+	return d.write(d.frame(wire.Header{Type: wire.TypePong}, pp[:]))
+}
+
+// challenges handles rendr bytes data that arrive before the PREFACE_ACK
+// (and do not start with a PREFACE): every CRC-valid bare PING with id 0 is
+// a rebind challenge whose PONG leaves at once — the passive commits a
+// rebind only on its nonce coming back from the candidate source, and the
+// transport already restricts sources to the peer —; everything else is
+// dropped and counted, without state. No receive window exists yet: a
+// replayed challenge is answered again, one PONG per PING. A write error
+// is returned (the attempt ends).
+func (d *dgDial) challenges(data []byte) error {
+	answered := false
+	for len(data) > 0 {
+		f, n, err := wire.DecodeFrame(data)
+		if err != nil {
+			break // the rest of this datagram (PA-1)
+		}
+		data = data[n:]
+		if f.Type != wire.TypePing {
+			continue
+		}
+		pg, perr := wire.ParsePing(f.Payload)
+		if perr != nil || pg.ID != 0 {
+			continue
+		}
+		if err := d.answerChallenge(pg); err != nil {
+			return err
+		}
+		answered = true
+	}
+	if !answered {
+		dgEnvDropped(d.env) // before the PREFACE_ACK nothing else is processed
+	}
+	return nil
 }
 
 // checkRack validates a RACK against what H1 sent: nothing beyond

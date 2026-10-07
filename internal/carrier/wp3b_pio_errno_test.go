@@ -32,7 +32,7 @@ func (wbTemporary) Temporary() bool { return true }
 // size refusal (L42, L58).
 func TestPacketIOErrorClasses_L58(t *testing.T) {
 	env := dgEnv()
-	peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 	op := func(err error) error { return &net.OpError{Op: "read", Net: "udp", Err: err} }
 	t.Run("read", func(t *testing.T) {
 		for _, tc := range []struct {

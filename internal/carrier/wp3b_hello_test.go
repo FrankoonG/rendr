@@ -120,6 +120,12 @@ func TestRelBeforePrefaceNoState_L44_L48(t *testing.T) {
 		if r.h.First.Type != wire.TypeOpen || !bytes.Equal(r.h.Payload, open) || r.h.Preface.CarrierID != 9 {
 			t.Errorf("Hello %+v", r.h)
 		}
+		// Until the admission's SetBudget: budget and receive limit
+		// MinFrameBudget, and the transport reads no more than that (an H1
+		// this small fits), so a verdict closer's buffer is a small class.
+		if c := r.h.Conn; c.MTU() != wire.MinFrameBudget || c.RecvLimit() != wire.MinFrameBudget || b.ReadSize() != wire.MinFrameBudget+1 {
+			t.Errorf("Hello budget %d, receive limit %d, ReadSize %d; want %d, %d, %d", c.MTU(), c.RecvLimit(), b.ReadSize(), wire.MinFrameBudget, wire.MinFrameBudget, wire.MinFrameBudget+1)
+		}
 		synctest.Wait()
 		var answers [][]byte
 		for {
@@ -286,15 +292,17 @@ func TestDatagramVerdictReliable(t *testing.T) {
 		name     string
 		lose     int           // verdict copies lost on the way
 		rackAt   time.Duration // the raw dialer RACKs then (0: never)
+		below    bool          // that RACK covers only F − 1: not the verdict
 		dupAt    time.Duration // the raw dialer repeats its H1 then (0: never)
 		deadline time.Duration
 		want     []time.Duration // verdict copies
 		closedAt time.Duration
 	}{
-		{"resent until RACKed", 2, 1000 * time.Millisecond, 0, 10 * time.Second, []time.Duration{0, 300 * time.Millisecond, 900 * time.Millisecond}, time.Second},
-		{"never RACKed", 0, 0, 0, 10 * time.Second, []time.Duration{0, 300 * time.Millisecond, 900 * time.Millisecond}, 2 * time.Second},
-		{"deadline first", 0, 0, 0, 500 * time.Millisecond, []time.Duration{0, 300 * time.Millisecond}, 500 * time.Millisecond},
-		{"duplicate H1", 0, 200 * time.Millisecond, 100 * time.Millisecond, 10 * time.Second, []time.Duration{0, 100 * time.Millisecond}, 200 * time.Millisecond},
+		{"resent until RACKed", 2, 1000 * time.Millisecond, false, 0, 10 * time.Second, []time.Duration{0, 300 * time.Millisecond, 900 * time.Millisecond}, time.Second},
+		{"never RACKed", 0, 0, false, 0, 10 * time.Second, []time.Duration{0, 300 * time.Millisecond, 900 * time.Millisecond}, 2 * time.Second},
+		{"RACK below the verdict", 0, 1000 * time.Millisecond, true, 0, 10 * time.Second, []time.Duration{0, 300 * time.Millisecond, 900 * time.Millisecond}, 2 * time.Second},
+		{"deadline first", 0, 0, false, 0, 500 * time.Millisecond, []time.Duration{0, 300 * time.Millisecond}, 500 * time.Millisecond},
+		{"duplicate H1", 0, 200 * time.Millisecond, false, 100 * time.Millisecond, 10 * time.Second, []time.Duration{0, 100 * time.Millisecond}, 200 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
@@ -321,7 +329,11 @@ func TestDatagramVerdictReliable(t *testing.T) {
 				if tc.rackAt > 0 {
 					time.Sleep(time.Until(start.Add(tc.rackAt)))
 					var rk [wire.RackLen]byte
-					wire.PutRack(rk[:], &wire.Rack{CumAck: F})
+					cum := F
+					if tc.below {
+						cum = F - 1
+					}
+					wire.PutRack(rk[:], &wire.Rack{CumAck: cum})
 					_ = a.WriteDatagram(wbFrame(wire.TypeRack, 0, fs, 0, rk[:]))
 				}
 				hWait(t, h.Conn)
@@ -416,16 +428,17 @@ func (d *wbDeafIO) SetDeadline(t time.Time) error { return d.SetReadDeadline(t) 
 // with the frame budget MinFrameBudget on both ends; a passive whose
 // sessionless pool is full answers REL{F, CLOSE(capacity)} after H2p, which
 // the started probe carrier dispatches (R1-3): it retires, and the health
-// layer marks the factory failed with reason "capacity" (plan:175).
+// layer marks the factory failed with reason "capacity" (plan:175); a
+// probe retired by a CLOSE of another reason marks nothing.
 func TestDatagramProbeCarrier(t *testing.T) {
 	wbBubble(t, func(t *testing.T) {
 		denv, penv := wbEnvs()
 		var h1ps [2]<-chan []byte
 		var pmu sync.Mutex
 		var passives []*Conn // factory 0's passive probe carriers
-		var links [2]*rendrtest.DatagramLink
+		var links [3]*rendrtest.DatagramLink
 		var fs []Factory
-		for i := range 2 {
+		for i := range 3 {
 			l := rendrtest.NewDatagramLink(rendrtest.DatagramLinkConfig{Name: fmt.Sprintf("p%d", i), Accept: func(pc net.PacketConn, peer net.Addr) error {
 				io, err := NewPacketIO(penv, pc, peer, wire.MaxDatagram)
 				if err != nil {
@@ -440,9 +453,13 @@ func TestDatagramProbeCarrier(t *testing.T) {
 						h.Conn.Kill(CauseProtocolViolation, "probe carriers only")
 						return
 					}
-					if i == 1 {
+					if i > 0 {
+						reason := wire.CloseCapacity
+						if i == 2 {
+							reason = wire.CloseRetire
+						}
 						var b [wire.ReasonLen]byte
-						wire.PutReason(b[:], uint8(wire.CloseCapacity))
+						wire.PutReason(b[:], uint8(reason))
 						h.Conn.WriteAndClose(wire.TypeClose, 0, 0, b[:], time.Now().Add(2*time.Second))
 						return
 					}
@@ -454,7 +471,9 @@ func TestDatagramProbeCarrier(t *testing.T) {
 				return nil
 			}})
 			links[i] = l
-			h1ps[i] = l.CaptureNext(rendrtest.Up, rendrtest.FramePing)
+			if i < 2 {
+				h1ps[i] = l.CaptureNext(rendrtest.Up, rendrtest.FramePing)
+			}
 			fs = append(fs, Factory{Index: i, Name: l.Name(), Kind: wire.KindDatagram, DialPacket: l.Dial, MTU: 1200})
 		}
 		hl := NewHealth(denv, fs, prParams())
@@ -477,6 +496,9 @@ func TestDatagramProbeCarrier(t *testing.T) {
 		}
 		if !s.Failed[1] || s.Info[1].FailReason != "capacity" {
 			t.Errorf("factory 1: failed %v reason %q, want capacity", s.Failed[1], s.Info[1].FailReason)
+		}
+		if s.Failed[2] {
+			t.Errorf("factory 2: failed (reason %q) after a CLOSE(retire), want no mark", s.Info[2].FailReason)
 		}
 		hl.mu.Lock()
 		pc := hl.fac[0].conn

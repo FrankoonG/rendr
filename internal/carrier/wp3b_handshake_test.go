@@ -150,6 +150,40 @@ func TestDatagramHandshakeSchedule_PA13(t *testing.T) {
 			})
 		})
 	}
+	t.Run("a RACK stops the copies", func(t *testing.T) {
+		// H2's RACK covers H1's REL: no copy follows while H3 is delayed by
+		// 2.5 s; H3 then establishes (§A5.10 phase 2).
+		wbBubble(t, func(t *testing.T) {
+			r, raws := wbRawRig(t, 1200)
+			type res struct {
+				est *Established
+				err error
+			}
+			ch := make(chan res, 1)
+			go func() {
+				est, err := r.establish(context.Background(), wire.TypeOpen, wbOpen(1100))
+				ch <- res{est, err}
+			}()
+			w := <-raws
+			h1 := w.waitN(t, 1)[0].b
+			F := r.penv.Presets.firstCseq()
+			h2, fs := wbH2(r.penv, h1, F)
+			w.send(h2)
+			time.Sleep(2500 * time.Millisecond)
+			synctest.Wait()
+			if got := w.received(); len(got) != 1 {
+				t.Errorf("%d datagrams by 2.5 s, want H1 alone: a RACK covering it ends its copies", len(got))
+			}
+			w.send(wbFrame(wire.TypeRel, 0, fs, 0, relPayloadOf(F, wire.TypeOpenAck, 0, wire.SessionHandle, wbOpenAckOK(1100, 1200))))
+			x := <-ch
+			if x.err != nil {
+				t.Fatalf("Establish: %v", x.err)
+			}
+			if n := x.est.Conn.Stats().Retransmits; n != 0 {
+				t.Errorf("Retransmits %d, want 0", n)
+			}
+		})
+	})
 }
 
 // TestEstablishEarlyFrames_L12: before the response the dialer drops and
@@ -246,6 +280,62 @@ func TestEstablishEarlyFrames_L12(t *testing.T) {
 			if dead, cause, detail, _ := x.est.Conn.Death(); dead {
 				t.Errorf("established carrier dead: %v %s", cause, detail)
 			}
+			// H4: the RACK of the REL response, written once the response
+			// arrived (best effort).
+			synctest.Wait()
+			var h4 []wire.Rack
+			for _, g := range w.received() {
+				if !wire.IsPreface(g.b) {
+					h4 = append(h4, racksOf(g.b)...)
+				}
+			}
+			if len(h4) != 1 || h4[0] != (wire.Rack{CumAck: F}) {
+				t.Errorf("RACKs after the response %+v, want H4 = RACK{%d}", h4, F)
+			}
+		})
+	})
+	t.Run("challenge before the PREFACE_ACK", func(t *testing.T) {
+		// The H2 went to the mapping a rebind left: the passive's challenge
+		// to the new mapping arrives first and is answered at once; another
+		// PING is dropped; the repeated H2 and H3 then establish (R1-14).
+		wbBubble(t, func(t *testing.T) {
+			r, raws := wbRawRig(t, 1200)
+			type res struct {
+				est *Established
+				err error
+			}
+			ch := make(chan res, 1)
+			go func() {
+				est, err := r.establish(context.Background(), wire.TypeOpen, wbOpen(1100))
+				ch <- res{est, err}
+			}()
+			w := <-raws
+			h1 := w.waitN(t, 1)[0].b
+			F := r.penv.Presets.firstCseq()
+			h2, fs := wbH2(r.penv, h1, F)
+			w.send(append(wbFrame(wire.TypePing, 0, fs, 0, ping(5)), wbFrame(wire.TypePing, 0, fs+1, 0, wbPingPayload(wire.Ping{ID: 0, Nonce: 0xc4a11e}))...))
+			w.send(wbFrame(wire.TypePing, 0, fs+2, 0, ping(6)))
+			synctest.Wait()
+			var pongs []wire.Ping
+			for _, g := range w.received()[1:] {
+				pongs = append(pongs, pingsOf(g.b, true)...)
+			}
+			if len(pongs) != 1 || pongs[0].ID != 0 || pongs[0].Nonce != 0xc4a11e || pongs[0].Pad != 0 {
+				t.Errorf("answers before the PREFACE_ACK %+v, want one PONG id 0 with the nonce", pongs)
+			}
+			if n := r.denv.Dgram.Dropped.Load(); n != 1 {
+				t.Errorf("Dropped %d before the PREFACE_ACK, want 1 (the datagram without a challenge)", n)
+			}
+			select {
+			case x := <-ch:
+				t.Fatalf("attempt ended before H2: %v", x.err)
+			default:
+			}
+			w.send(append(h2, wbFrame(wire.TypeRel, 0, fs+3, 0, relPayloadOf(F, wire.TypeOpenAck, 0, wire.SessionHandle, wbOpenAckOK(1100, 1200)))...))
+			x := <-ch
+			if x.err != nil || x.est.Resp.Type != wire.TypeOpenAck {
+				t.Fatalf("Establish: %v, want OPEN_ACK", x.err)
+			}
 		})
 	})
 	for _, tc := range []struct {
@@ -259,6 +349,11 @@ func TestEstablishEarlyFrames_L12(t *testing.T) {
 			return wbFrame(wire.TypeData, 0, fs, wire.SessionHandle, make([]byte, wire.DataPrefixLen+1))
 		}},
 		{"RACK beyond sent", func(fs, F uint32) []byte { return wbFrame(wire.TypeRack, 0, fs, 0, rack(F+1)) }},
+		{"RACK sacking a cseq never sent", func(fs, F uint32) []byte {
+			p := make([]byte, wire.RackLen)
+			wire.PutRack(p, &wire.Rack{CumAck: F - 1, Sack: 1}) // bit 0: cseq F + 1
+			return wbFrame(wire.TypeRack, 0, fs, 0, p)
+		}},
 		{"JOIN_ACK answers an OPEN", func(fs, F uint32) []byte {
 			p := make([]byte, wire.JoinAckLen)
 			wire.PutJoinAck(p, &wire.JoinAck{Status: wire.StatusOK, RxNext: 1200})

@@ -66,7 +66,7 @@ func TestPacketIOPeerKey_L38_L57(t *testing.T) {
 	}
 	t.Run("UDP peer", func(t *testing.T) {
 		pc := newWBPC()
-		peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+		peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 		io, err := NewPacketIO(env, pc, peer, 1500)
 		if err != nil {
 			t.Fatal(err)
@@ -78,8 +78,8 @@ func TestPacketIOPeerKey_L38_L57(t *testing.T) {
 			want ReadEvent
 		}{
 			{"same pointer", peer, ReadOK},
-			{"same address, mapped", &net.UDPAddr{IP: net.ParseIP("::ffff:10.0.0.2"), Port: 4000}, ReadOK},
-			{"other port", &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 4001}, ReadForeign},
+			{"same address, mapped", &net.UDPAddr{IP: net.ParseIP("::ffff:127.0.0.1"), Port: 4000}, ReadOK},
+			{"other port", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4001}, ReadForeign},
 			{"typed nil", (*net.UDPAddr)(nil), ReadForeign},
 			{"nil", nil, ReadForeign},
 			{"another type with the same text", other, ReadForeign},
@@ -113,7 +113,7 @@ func TestPacketIOPeerKey_L38_L57(t *testing.T) {
 			{"same text", twin, ReadOK},
 			{"other text", &wbCountAddr{s: "peer-b"}, ReadForeign},
 			{"panicking String", wbPanicAddr{}, ReadForeign},
-			{"UDP source", &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 4000}, ReadForeign},
+			{"UDP source", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4000}, ReadForeign},
 		} {
 			if ev := read(t, io, pc, tc.src); ev != tc.want {
 				t.Errorf("%s: %v, want %v", tc.name, ev, tc.want)
@@ -172,7 +172,7 @@ func TestPacketIOPeerKey_L38_L57(t *testing.T) {
 			return
 		}
 		pc := newWBPC()
-		peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+		peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 		io, _ := NewPacketIO(env, pc, peer, 1500)
 		for range 200 {
 			pc.push(wbRead{b: []byte("rendr bytes"), src: peer})
@@ -199,13 +199,22 @@ func TestPacketIOLimitFollowsBudget(t *testing.T) {
 	wbBubble(t, func(t *testing.T) {
 		env := dgEnv()
 		pc := newWBPC()
-		peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+		peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 		io, err := NewPacketIO(env, pc, peer, wire.MaxDatagram)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if io.ReadSize() != wire.MaxDatagram+1 {
 			t.Fatalf("ReadSize %d before the budget, want %d", io.ReadSize(), wire.MaxDatagram+1)
+		}
+		// SetLimit stays within [MinFrameBudget, Limit].
+		if io2, _ := NewPacketIO(env, newWBPC(), peer, 1500); io2 != nil {
+			io2.SetLimit(100)
+			lo := io2.ReadSize()
+			io2.SetLimit(wire.MaxDatagram)
+			if hi := io2.ReadSize(); lo != wire.MinFrameBudget+1 || hi != 1501 {
+				t.Errorf("SetLimit clamps: ReadSize %d and %d, want %d and 1501", lo, hi, wire.MinFrameBudget+1)
+			}
 		}
 		c := newDatagramConn(env, io, 7, hPeerInst, -1, "", false)
 		c.SetBudget(1152)
@@ -259,7 +268,7 @@ func TestPacketIOLimitFollowsBudget(t *testing.T) {
 // every conn it returned exactly once, and leaves the abandoned-call pool
 // empty once a stuck call returned (L51, L52, L57).
 func TestDatagramFactoryMisbehaviour_L51(t *testing.T) {
-	peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 	errBoom := errors.New("boom")
 	for _, tc := range []struct {
 		name    string
@@ -479,7 +488,7 @@ func (wbGoexitAddr) String() string  { runtime.Goexit(); return "" }
 // Establish, and its deferred cleanup still closes the factory's conn
 // exactly once and releases the CarrierID (L51).
 func TestDatagramEstablishGoexit_L51(t *testing.T) {
-	peer := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2).To4(), Port: 4000}
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 4000}
 	for _, tc := range []struct {
 		name string
 		addr net.Addr

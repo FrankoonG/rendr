@@ -321,10 +321,10 @@ func wbRelsIn(d []byte) []wire.RelHead {
 }
 
 // wbPC is a scripted net.PacketConn (the embedder adapter's tests): reads
-// return the queued results in order and block — honouring the read
-// deadline unless ignoreDL — while none is queued; writes are recorded and
-// answered by wfn (nil: written whole). Close ends every call once and
-// counts.
+// first return spin empty datagrams from spinSrc, then the queued results in
+// order, and block — honouring the read deadline unless ignoreDL — while
+// none is queued; writes are recorded and answered by wfn (nil: written
+// whole). Close ends every call once and counts.
 type wbPC struct {
 	mu       sync.Mutex
 	reads    []wbRead
@@ -338,6 +338,9 @@ type wbPC struct {
 	closed   bool
 	closes   atomic.Int32
 	deadSets atomic.Int32
+	spin     int // reads that return (0, spinSrc, nil) before the queued ones
+	spinSrc  net.Addr
+	nreads   atomic.Int32 // ReadFrom calls
 }
 
 type wbRead struct {
@@ -367,6 +370,7 @@ func (c *wbPC) push(r wbRead) {
 }
 
 func (c *wbPC) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.nreads.Add(1)
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -379,6 +383,12 @@ func (c *wbPC) ReadFrom(p []byte) (int, net.Addr, error) {
 		if c.closed {
 			c.mu.Unlock()
 			return 0, nil, net.ErrClosed
+		}
+		if c.spin > 0 {
+			c.spin--
+			src := c.spinSrc
+			c.mu.Unlock()
+			return 0, src, nil
 		}
 		if len(c.reads) > 0 {
 			r := c.reads[0]
@@ -458,6 +468,59 @@ func (c *wbPC) written() []wbWrite {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]wbWrite(nil), c.writes...)
+}
+
+// wbHookPC is a wbPC with interleaving hooks: afterRead runs once, after a
+// ReadFrom that returned a datagram and before the caller sees it;
+// onSetRead runs before the trigger-th SetReadDeadline takes effect; every
+// SetDeadline signals setNow once it took effect.
+type wbHookPC struct {
+	*wbPC
+	hmu       sync.Mutex
+	afterRead func()
+	setReads  int
+	trigger   int
+	onSetRead func()
+	setNow    chan struct{}
+}
+
+func newWBHookPC() *wbHookPC { return &wbHookPC{wbPC: newWBPC(), setNow: make(chan struct{}, 1)} }
+
+func (h *wbHookPC) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, src, err := h.wbPC.ReadFrom(p)
+	if n > 0 {
+		h.hmu.Lock()
+		f := h.afterRead
+		h.afterRead = nil
+		h.hmu.Unlock()
+		if f != nil {
+			f()
+		}
+	}
+	return n, src, err
+}
+
+func (h *wbHookPC) SetReadDeadline(t time.Time) error {
+	h.hmu.Lock()
+	h.setReads++
+	var f func()
+	if h.setReads == h.trigger {
+		f = h.onSetRead
+	}
+	h.hmu.Unlock()
+	if f != nil {
+		f()
+	}
+	return h.wbPC.SetReadDeadline(t)
+}
+
+func (h *wbHookPC) SetDeadline(t time.Time) error {
+	err := h.wbPC.SetDeadline(t)
+	select {
+	case h.setNow <- struct{}{}:
+	default:
+	}
+	return err
 }
 
 // wbCountPC counts the Close calls of a factory's conn.

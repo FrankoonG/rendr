@@ -226,7 +226,8 @@ func (c *Conn) dgHandshakeWritten(err error) error {
 // or JOIN, the outer frame's fseq) or the PING's; the Conn's REL start
 // values are R1-3's (send FirstCseq; receive FirstCseq, or FirstCseq − 1
 // after a probe's PING), its frame budget and receive limit
-// wire.MinFrameBudget until the admission's SetBudget (a probe keeps it);
+// wire.MinFrameBudget until the admission's SetBudget (a probe keeps it),
+// and io's receive limit max(len(H1), wire.MinFrameBudget) until then;
 // its first PONG was H2p's, so a sessionless carrier has none due; the
 // handshake's read buffer is io.ReadSize() bytes of the datagram pool,
 // charged to the stage account and released before it returns; when a
@@ -402,6 +403,10 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		dg.rel.initRecv(fcs) // H1's REL was dispatched as the Hello
 		dg.recvLimit = wire.MinFrameBudget
 		dg.budget.Store(wire.MinFrameBudget) // until the admission's SetBudget
+		// The transport reads no more than a duplicate H1 until then: a
+		// verdict closer's buffer (dgVerdict) stays a small class even on a
+		// 64 KiB transport, and still recognises the duplicate.
+		io.SetLimit(max(len(d), wire.MinFrameBudget))
 	}
 	c.wr.fseq = afirst + 1
 	c.rd.fseq = h.first.Fseq + 1
