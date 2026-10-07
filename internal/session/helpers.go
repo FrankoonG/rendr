@@ -580,13 +580,12 @@ func pktJoinBudget(packet bool, k wire.CarrierKind, rxNext uint64, limit int) (c
 }
 
 // transportLimit returns the largest datagram carrier c's transport can
-// receive (its PacketIO's Limit: the passive's cmtu_acc bound, M2-D50).
-// carrier.Conn does not export it at the skeleton; until it does (contract
-// request: Conn.TransportLimit), an unknown limit accepts any offer, as
-// HandlePacket's does (M2-D60), and the transport's SetLimit clamps.
+// receive (Conn.TransportLimit: the passive's cmtu_acc bound, M2-D50). An
+// unknown limit (0) accepts any offer, as HandlePacket's does (M2-D60), and
+// the transport's SetLimit clamps.
 func transportLimit(c *carrier.Conn) int {
-	if t, ok := any(c).(interface{ TransportLimit() int }); ok {
-		return t.TransportLimit()
+	if n := c.TransportLimit(); n > 0 {
+		return n
 	}
 	return wire.MaxDatagram
 }

@@ -400,8 +400,9 @@ func TestPacketStatusFields(t *testing.T) {
 	pk := session.PacketCounters{Sent: 1, Received: 2, Duplicates: 3, DropQueue: 4, DropAge: 5, DropTooLarge: 6, DropNoPath: 7,
 		DropRecvQueue: 8, DropLate: 9, PeerReceived: 10}
 	st := session.Status{Kind: wire.KindDatagram, MaxPayload: 1127, Packet: &pk, Carriers: []session.CarrierStatus{
-		{ID: 1, Stats: carrier.Stats{MTU: 1152, Dropped: 11, Retransmits: 12, Rebinds: 13, TxBytes: 14}},
-		{ID: 2, Stats: carrier.Stats{TxBytes: 15}},
+		{ID: 1, Stats: carrier.Stats{Kind: wire.KindDatagram, MTU: 1152, Dropped: 11, Retransmits: 12, Rebinds: 13, TxBytes: 14}},
+		{ID: 2, Stats: carrier.Stats{Kind: wire.KindStream, TxBytes: 15}},
+		{ID: 3, Stats: carrier.Stats{Kind: wire.KindDatagram}}, // the kind is the carrier's, not inferred from MTU
 	}}
 	out := sessionStatusFrom(st)
 	want := PacketCounters{Sent: 1, Received: 2, Duplicates: 3, DropQueue: 4, DropAge: 5, DropTooLarge: 6, DropNoPath: 7,
@@ -410,6 +411,9 @@ func TestPacketStatusFields(t *testing.T) {
 		t.Fatalf("packet session status %+v", out)
 	}
 	c0, c1 := out.Carriers[0], out.Carriers[1]
+	if c2 := out.Carriers[2]; c2.Kind != KindDatagram {
+		t.Fatalf("datagram carrier without MTU %+v", c2)
+	}
 	if c0.Kind != KindDatagram || c0.MTU != 1152 || c0.Dropped != 11 || c0.Retransmits != 12 || c0.Rebinds != 13 || c0.TxBytes != 14 {
 		t.Fatalf("datagram carrier %+v", c0)
 	}

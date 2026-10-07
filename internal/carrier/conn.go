@@ -264,6 +264,17 @@ func (c *Conn) RecvLimit() int {
 	return c.dg.recvLimit
 }
 
+// TransportLimit returns the largest datagram a datagram carrier's transport
+// receives (its PacketIO's Limit, the passive's cmtu_acc bound, M2-D50; 0
+// when the transport does not know it, as HandlePacket's); 0 on stream
+// carriers.
+func (c *Conn) TransportLimit() int {
+	if c.dg == nil {
+		return 0
+	}
+	return c.dg.io.Limit()
+}
+
 // DgramMax returns the largest application datagram this carrier takes now:
 // MTU() − wire.DgramOverhead on a datagram carrier, wire.MaxPacketPayload on
 // a stream carrier (a DGRAM is an ordinary frame there).
@@ -522,6 +533,7 @@ func (c *Conn) Stats() Stats {
 	defer c.mu.Unlock()
 	st := &c.st
 	s := Stats{
+		Kind:       c.Kind(),
 		SRTT:       st.srtt,
 		MinRTT:     st.minRTT,
 		Rate:       st.rate,
@@ -553,6 +565,7 @@ func (c *Conn) Stats() Stats {
 
 // Stats is a point-in-time view of one carrier.
 type Stats struct {
+	Kind              wire.CarrierKind // the carrier's kind (Conn.Kind)
 	SRTT, MinRTT      time.Duration
 	Rate              float64   // bytes/s proven by PONG watermarks (decaying max, backlog-gated)
 	RxRate            float64   // DATA payload bytes/s received (decaying max)

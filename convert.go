@@ -117,19 +117,14 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 	return out
 }
 
-// carrierStatusFrom converts one lane of a session snapshot. A datagram
-// carrier is the one with a frame budget (Stats.MTU, never 0 on a datagram
-// carrier: it starts at MinFrameBudget or above and is never lowered below
-// the control floor); its datagram counters are copied (M2-D61).
+// carrierStatusFrom converts one lane of a session snapshot: its kind is
+// the carrier's (Stats.Kind); a datagram carrier's counters are copied
+// (M2-D61).
 func carrierStatusFrom(cs *session.CarrierStatus) CarrierStatus {
-	k := KindStream
-	if cs.Stats.MTU != 0 {
-		k = KindDatagram
-	}
 	return CarrierStatus{
 		ID:          CarrierID(cs.ID),
 		Name:        cs.Name,
-		Kind:        k,
+		Kind:        kindFrom(cs.Stats.Kind),
 		Gen:         cs.Gen,
 		State:       CarrierState(cs.State),
 		SRTT:        cs.Stats.SRTT,
