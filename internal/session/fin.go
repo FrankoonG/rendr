@@ -109,7 +109,9 @@ var errSchedCounts error = violation("SCHED migration counts exceed its epoch")
 // schedLocked stores the newest SCHED received (passive only; the actor
 // applies it, L45). A SCHED not newer than the reference — the newest SCHED
 // stored or applied; before any, the passive's initial applied epoch
-// FirstEpoch − 1 — is ignored. A newer one whose counts sum to more than
+// FirstEpoch − 1 — is ignored, except that a packet session answers one
+// that is not newer than its applied epoch with an urgent PACK (the
+// re-echo, M2-D39). A newer one whose counts sum to more than
 // the SCHEDs the dialer can have published up to its epoch
 // (schedCountsFit) is a violation of the carrier that delivered it: the
 // session survives (invariant 6), nothing is stored, and the passive's
@@ -141,6 +143,14 @@ func (s *Session) schedLocked(flags uint8, p []byte) error {
 		ref = c.schedIn.Epoch
 	}
 	if !sched.EpochNewer(sc.Epoch, ref) {
+		if s.pk != nil && !sched.EpochNewer(sc.Epoch, c.epoch) {
+			// A packet session re-echoes a SCHED it already applied: the
+			// dialer resends only while the echo is missing, so the echo PACK
+			// was lost or still sits behind a dying carrier; an urgent PACK
+			// carries it again (reliable on its lane when not yet carried
+			// there, M2-D39; L45).
+			s.bumpNowLocked()
+		}
 		return nil // stale, or a copy of the reference
 	}
 	var followed [3]uint64 // a bond passive follows no counts (bond sends zero)
@@ -191,10 +201,11 @@ func schedCountsFit(sc *wire.Sched, first uint32, followed [3]uint64) bool {
 }
 
 // closeWriteLocked requests our FIN at the reserved end (idempotent) and
-// wakes a blocked Write (it returns net.ErrClosed) and the data lanes.
+// wakes a blocked Write (it returns net.ErrClosed) and the data lanes. A
+// packet session has no half-close (M2-D63): a no-op there.
 func (s *Session) closeWriteLocked(now time.Time) {
 	st := &s.st
-	if st.fin.requested {
+	if s.pk != nil || st.fin.requested {
 		return
 	}
 	st.fin.requested = true
@@ -208,9 +219,15 @@ func (s *Session) closeWriteLocked(now time.Time) {
 
 // closeLocked is Close under s.mu: CloseWrite semantics, discard mode
 // (buffered and future in-order bytes are consumed on arrival; the peer
-// keeps being acknowledged), both waiters woken, fact factClose.
+// keeps being acknowledged), both waiters woken, fact factClose. A packet
+// session's Close is pktCloseLocked (M2 design §A5.6): the FIN requested,
+// the receive queue discarded, the waiters and the lanes woken.
 func (s *Session) closeLocked(now time.Time) {
 	st := &s.st
+	if s.pk != nil {
+		s.pktCloseLocked(now)
+		return
+	}
 	if st.closed {
 		return
 	}

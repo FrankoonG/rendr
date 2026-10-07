@@ -101,6 +101,11 @@ type actor struct {
 	// record keeps its carrier while that carrier is in gone, then its final
 	// Stats (settleDeadLocked).
 	dead []laneSnap
+	// refusedGone (packet sessions) is the Refused count of the dead
+	// carriers that left the dead-lane history: Status folds every
+	// carrier's refused DGRAMs into DropTooLarge (R1-31), and the history
+	// keeps only the last maxDeadLanes.
+	refusedGone uint64
 	// unconfirmed (passive): lanes whose first response frame has not been
 	// announced yet (EventCarrierUp once Fill placed an OK, §10.3).
 	unconfirmed []*lane
@@ -264,6 +269,8 @@ func (a *actor) factsLocked(now time.Time) {
 	if f&factSched != 0 && s.p.Role == RolePassive {
 		a.applySchedLocked(now)
 	}
+	// factPktFin needs no action here: packetLocked re-reads the peer's FIN
+	// and arms its straggler bound in this step.
 	if f&factLaneConfirmed != 0 && s.p.Role == RolePassive {
 		a.lanesConfirmedLocked(now)
 	}
@@ -305,7 +312,34 @@ func (a *actor) actLocked(now time.Time) {
 	a.schedResendLocked(now)
 	a.rescueLocked(now)
 	a.readvLocked(now)
+	a.packetLocked(now)
 	a.episodeExpiryLocked(now)
+}
+
+// packetLocked runs a packet session's actor deadlines (M2 design §A5.1,
+// §A5.2, §A5.6): the EOF straggler bound after the peer's FIN — at
+// pk.finWaitAt the peer's FIN is delivered once the receive queue is empty
+// (factPktFin rings the actor, which re-reads the state here) — and, while
+// no data lane exists, the no-path ageing step, which drops the queued
+// datagrams older than MaxAge (DropNoPath) and is armed at the next one's
+// expiry. A ReadFrom that empties the queue later delivers the FIN itself.
+func (a *actor) packetLocked(now time.Time) {
+	s := a.s
+	pk := s.pk
+	if pk == nil || s.st.ended {
+		return
+	}
+	st := &s.st
+	if st.peerFinSet && !st.peerFinDelivered && !pk.finWaitAt.IsZero() {
+		if now.Before(pk.finWaitAt) {
+			a.want(pk.finWaitAt)
+		} else {
+			s.pktPeerFinCheckLocked(now)
+		}
+	}
+	if !s.pktHasDataLaneLocked() {
+		a.want(s.pktAgeLocked(now))
+	}
 }
 
 // want records a deadline: the timer is armed for the earliest one.

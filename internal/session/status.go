@@ -29,6 +29,10 @@ type statusSnap struct {
 	// AttachOpen and Confirm after the actor exited).
 	verdict Verdict
 
+	// refusedGone (packet sessions): the DGRAMs refused by dead carriers no
+	// longer in lanes (R1-31; the actor's refusedGone).
+	refusedGone uint64
+
 	lanes []laneSnap // live lanes in attach order (and in-flight dial attempts as joining), then the last 8 dead ones
 }
 
@@ -69,6 +73,7 @@ func (a *actor) publishLocked(now time.Time) {
 		rejoins:     ctl.rejoins,
 		episodes:    ctl.episodes,
 		inNoPath:    ctl.inNoPath,
+		refusedGone: a.refusedGone,
 	}
 	if a.ending {
 		sn.err, sn.verdict = a.endErr, a.verdict
@@ -106,10 +111,16 @@ func (s *Session) initialSnapLocked() {
 }
 
 // status renders the snapshot with the data counters and live carrier
-// statistics.
+// statistics. A packet session adds its kind, MaxPayload and packet
+// counters (M2 design §A7.2): the carriers' refused DGRAMs — placed, then
+// refused by the transport as too large — count in DropTooLarge and not in
+// Sent, so the send-side identity holds over public fields (R1-31). Its
+// byte counters count datagram payload bytes; AckedBytes, Window and
+// PeerWindow are 0.
 func (s *Session) status() Status {
 	sn := s.snap.Load()
-	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, PeerInstance: s.peer}
+	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, PeerInstance: s.peer, Kind: s.Kind()}
+	var ctr PacketCounters
 	if sn != nil {
 		out.State, out.Err = sn.state, sn.err
 		out.SchedEpoch, out.SchedEchoed = sn.epoch, sn.echoed
@@ -130,8 +141,15 @@ func (s *Session) status() Status {
 	out.RetransmittedBytes = st.retxBytes
 	out.Window = st.lastWin
 	out.PeerWindow = int64(st.peerLimit - st.sBase)
+	if s.pk != nil {
+		ctr = s.pk.ctr
+		out.MaxPayload = s.pk.maxPayload
+	}
 	s.mu.Unlock()
 	if sn == nil {
+		if s.pk != nil {
+			out.Packet = &ctr
+		}
 		return out
 	}
 	out.Carriers = make([]CarrierStatus, len(sn.lanes))
@@ -145,5 +163,24 @@ func (s *Session) status() Status {
 		}
 		out.Carriers[i] = cs
 	}
+	if s.pk != nil {
+		refused := sn.refusedGone
+		for i := range out.Carriers {
+			refused += out.Carriers[i].Stats.Refused
+		}
+		out.Packet = pktReport(ctr, refused)
+	}
 	return out
+}
+
+// pktReport is the reported PacketCounters (R1-31): Sent = placed −
+// refused, DropTooLarge = own + refused, where refused is the DGRAMs the
+// session's carriers placed and their transports refused as too large.
+// Sent never goes below 0 (a carrier's count may be read after the
+// session's).
+func pktReport(c PacketCounters, refused uint64) *PacketCounters {
+	refused = min(refused, c.Sent)
+	c.Sent -= refused
+	c.DropTooLarge += refused
+	return &c
 }

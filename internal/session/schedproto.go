@@ -87,15 +87,25 @@ func (a *actor) schedResendLocked(now time.Time) {
 }
 
 // resendLaneLocked picks the next lane for a SCHED resend: live, CLOSE not
-// written, preferably neither write-blocked nor retired.
+// written, preferably neither write-blocked nor retired. A packet
+// session's datagram lane that already carried the current epoch is
+// skipped (M2-D53): its REL sublayer delivers the SCHED there while the
+// carrier lives. Stream lanes, and datagram lanes that have not carried it,
+// remain candidates; with none, nothing is resent.
 func (a *actor) resendLaneLocked() *lane {
-	lanes := a.s.lanes
+	s := a.s
+	lanes := s.lanes
 	var fallback *lane
 	for k := range lanes {
 		i := (a.resendIdx + k) % len(lanes)
 		l := lanes[i]
-		if l.state == LaneDead || l.c.CloseSent() {
+		if l.state == LaneDead || l.port.CloseSent() {
 			continue
+		}
+		if s.pk != nil && l.schedSent == s.ctl.epoch {
+			if _, dg := pktDgramLane(l); dg {
+				continue
+			}
 		}
 		if l.port.WriteBlocked() || l.retireCalled {
 			if fallback == nil {

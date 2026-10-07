@@ -44,7 +44,10 @@ func (a *actor) qualityLocked(now time.Time) {
 	}
 	d.selVer, d.selAct = snap.Version, act
 	for i := range d.selFailed {
-		d.selFailed[i] = a.failedLocked(snap, i) // a factory that just died is no challenger either
+		// A factory that just died is no challenger either, nor one the
+		// session may not dial (integration 1 D6: marked failed for
+		// Evaluate, so it never becomes a quality target).
+		d.selFailed[i] = a.failedLocked(snap, i) || !d.spec.eligible(i)
 	}
 	v := d.sel.Evaluate(now, act, snap.Sum, d.selFailed)
 	d.selWake = v.Wake
@@ -82,7 +85,11 @@ func (a *actor) startSwitchLocked(now time.Time, to int) {
 // (§7.2 step 3): nl becomes active; the old active retires (no new DATA,
 // its unacknowledged spans replayed in order on nl, CLOSE once they are
 // acknowledged or after RetireGrace); SCHED{quality}; one quality
-// migration timestamped now (L09); the cooldown starts.
+// migration timestamped now (L09); the cooldown starts. A packet session
+// requeues nothing — new datagrams take nl at once — and the old lane
+// retires once the passive echoed the SCHED that removed it, plus 2·srtt
+// for the datagrams the passive had in flight on it, or at RetireGrace
+// (M2-D42, retiringLocked).
 func (a *actor) qualitySwitchLocked(now time.Time, nl *lane) {
 	s := a.s
 	d := a.d
@@ -98,6 +105,9 @@ func (a *actor) qualitySwitchLocked(now time.Time, nl *lane) {
 		s.requeueLocked(old)
 	}
 	a.publishSchedLocked(now, wire.SchedQuality)
+	if s.pk != nil && old != nil && old != nl {
+		old.retireEpoch, old.retireEchoAt = s.ctl.epoch, time.Time{}
+	}
 	a.countLocked(now, wire.SchedQuality, from, nl.id, carrier.CauseQuality)
 	d.sel.Switched(now, true)
 	d.switchTo = -1

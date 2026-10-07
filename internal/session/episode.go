@@ -52,12 +52,17 @@ func (a *actor) episodeStartLocked(now, at time.Time) {
 	}
 }
 
-// episodeEndLocked ends the current episode (a carrier attached).
+// episodeEndLocked ends the current episode (a carrier attached). A packet
+// session records the end time: a datagram queued before it that ages out
+// later counts DropNoPath, not DropAge (M2-D35).
 func (a *actor) episodeEndLocked(now time.Time) {
 	s := a.s
 	ctl := &s.ctl
 	if !ctl.inNoPath {
 		return
+	}
+	if s.pk != nil {
+		s.pk.noPathEnd = now
 	}
 	ctl.inNoPath = false
 	a.episodeBy = time.Time{}

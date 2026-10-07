@@ -147,6 +147,9 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 		if l.state == LaneDead || l.retireCalled || l.firstSent || l.first.t != 0 {
 			continue // a retired carrier closes without an answer
 		}
+		if s.pk != nil {
+			win = s.laneWindowLocked(l) // each OPEN carrier's own cmtu_acc (R1-5)
+		}
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: win}}
 		if s.aliveLocked(l) {
 			if s.p.Mode == ModeBond {
@@ -224,11 +227,15 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	a.unconfirmed = append(a.unconfirmed, l)
 	switch {
 	case ad.kind == adoptJoin:
-		l.first = firstFrame{t: wire.TypeJoinAck, joinAck: wire.JoinAck{Status: wire.StatusOK, RxNext: s.st.rRead}}
+		rx := s.st.rRead
+		if s.pk != nil {
+			rx = uint64(laneRecvLimit(l)) // cmtu_acc, fixed by Join's SetBudget (M2-D11)
+		}
+		l.first = firstFrame{t: wire.TypeJoinAck, joinAck: wire.JoinAck{Status: wire.StatusOK, RxNext: rx}}
 	case ctl.state != StatePending:
-		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: s.openWindowLocked()}}
+		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: s.laneWindowLocked(l)}}
 	}
-	ad.conn.Start(l, &s.mb, carrier.StartOptions{Hold: true})
+	ad.conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Hold: true})
 	if ctl.state != StatePending {
 		a.episodeEndLocked(now)
 	}

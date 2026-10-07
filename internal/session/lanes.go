@@ -21,6 +21,12 @@ func (a *actor) newLaneLocked(now time.Time, c *carrier.Conn, factory int, gen u
 	l := &lane{s: s, c: c, port: c, id: c.ID(), factory: factory, gen: gen, since: now}
 	l.state = st
 	l.schedSent = s.ctl.epoch // a lane carries only SCHEDs published after it attached
+	if s.pk != nil && a.d != nil && c.Kind() == wire.KindDatagram && s.ctl.set.N > 0 {
+		// A packet session's datagram lane carries the current epoch once
+		// (REL) instead, so that "schedSent == epoch" means "carried there"
+		// for the SCHED resend's skip (M2-D53, resendLaneLocked).
+		l.schedSent = s.ctl.epoch - 1
+	}
 	s.lanes = append(s.lanes, l)
 	s.laneAddedLocked(l)
 	a.dirty = true
@@ -58,6 +64,9 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 	}
 	a.dropConn(l.c)
 	if len(a.dead) == maxDeadLanes {
+		if ev := &a.dead[0]; ev.conn == nil {
+			a.refusedGone += ev.stats.Refused // settled: its final count (else counted at its settling)
+		}
 		copy(a.dead, a.dead[1:])
 		a.dead = a.dead[:maxDeadLanes-1]
 	}
@@ -71,13 +80,21 @@ func (a *actor) removeLaneLocked(l *lane, cause carrier.Cause, detail string, at
 // settleDeadLocked replaces the joined carrier c by its final Stats in the
 // dead-lane record that still holds it (none once the record was evicted).
 // Joined means c's Done closed: its goroutines finished or were abandoned,
-// so these are the Stats Status would read from c from then on.
+// so these are the Stats Status would read from c from then on. A packet
+// session adds the Refused count of a carrier without a record to
+// refusedGone (R1-31).
 func (a *actor) settleDeadLocked(c *carrier.Conn) {
 	for i := range a.dead {
 		if d := &a.dead[i]; d.conn == c {
 			d.stats, d.conn = c.Stats(), nil
 			a.dirty = true
 			return
+		}
+	}
+	if a.s.pk != nil {
+		if n := c.Stats().Refused; n > 0 {
+			a.refusedGone += n
+			a.dirty = true
 		}
 	}
 }

@@ -121,6 +121,7 @@ type lane struct {
 	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
 	echoRel      uint32    // (S) passive: the epoch echo last placed in a reliable PACK on this lane (M2-D39)
 	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
+	retireEpoch  uint32    // (A) planned switch: the SCHED epoch that removed the lane (M2-D42)
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a
