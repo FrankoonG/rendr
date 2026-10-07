@@ -23,9 +23,11 @@ import (
 // shared socket DatagramHub (passive: FromPacketConn) and carrier/udp on
 // loopback (FromPacketConn of a real socket) — in selector and in bond
 // mode. The dialer sends 10,000 datagrams per second (1,000 under -race)
-// and the passive 1,000 per second back, while one path is killed every
-// 10 s (DatagramLink.Kill: both ends fail; the shared-socket transports:
-// the dialer's conn is closed under rendr, an embedder-closed conn).
+// and the passive 1,000 per second back, while every 10 s a path that
+// carries the session is killed — selector: the active carrier's, bond:
+// the members' in turn (DatagramLink.Kill: both ends fail; the
+// shared-socket transports: the dialer's session conn is closed under
+// rendr, an embedder-closed conn).
 //
 // Stimulus: every kill ended a carrier (CarrierDown events of the dialer)
 // and the session survived each. Load: the rate was reached (the received
@@ -51,14 +53,15 @@ type smokeRun struct {
 // smokeNet is one transport's two paths between the Runtimes.
 type smokeNet struct {
 	carriers []rendr.Carrier
-	kill     func(i int) bool // fails path i's current carrier; false: none
+	kill     func(i int) bool // fails path i's current session carrier; false: none
 	listen   rendr.ListenConfig
 	attach   func(ln *rendr.Listener) // HandlePacket wiring, if any
 	close    func()
 }
 
-// lastConn wraps a datagram factory so that the conn it returned last can
-// be closed under rendr (an embedder-closed conn: transport_error at once).
+// lastConn wraps a datagram factory so that the session conn it returned
+// last can be closed under rendr (an embedder-closed conn: transport_error
+// at once); probe carriers' conns are not recorded.
 type lastConn struct {
 	mu sync.Mutex
 	pc net.PacketConn
@@ -67,7 +70,7 @@ type lastConn struct {
 func (l *lastConn) wrap(dial func(context.Context) (net.PacketConn, net.Addr, error)) func(context.Context) (net.PacketConn, net.Addr, error) {
 	return func(ctx context.Context) (net.PacketConn, net.Addr, error) {
 		pc, a, err := dial(ctx)
-		if err == nil {
+		if di, ok := rendr.CarrierDialInfo(ctx); err == nil && ok && !di.Probe {
 			l.mu.Lock()
 			l.pc = pc
 			l.mu.Unlock()
@@ -279,7 +282,20 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 	var kills []time.Duration
 	for k := 1; time.Duration(k)*r.every < r.duration; k++ {
 		time.Sleep(time.Until(start.Add(time.Duration(k) * r.every)))
-		if n.kill((k - 1) % 2) {
+		victim := (k - 1) % 2
+		if r.mode == rendr.ModeSelector {
+			victim = -1
+			for _, cs := range dc.Status().Carriers {
+				if cs.State == rendr.CarrierActive {
+					for i, c := range n.carriers {
+						if c.(rendr.DatagramCarrier).Name == cs.Name {
+							victim = i
+						}
+					}
+				}
+			}
+		}
+		if victim >= 0 && n.kill(victim) {
 			kills = append(kills, time.Since(start))
 		}
 	}
