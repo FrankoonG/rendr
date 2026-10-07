@@ -13,6 +13,7 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/session"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/udpflow"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -35,8 +36,8 @@ type Runtime struct {
 	gateFn  carrier.Gate    // rt.gate, bound once
 	ctx     context.Context // cancelled by Close: in-flight Dials withdraw
 	cancel  context.CancelCauseFunc
-	backlog atomic.Int64 // pending sessions across Listeners (Status.AcceptBacklog[0])
-	closing atomic.Bool  // set under mu by Close; read lock-free on admission paths
+	backlog [numKinds]atomic.Int64 // pending sessions across Listeners per kind (Status.AcceptBacklog)
+	closing atomic.Bool            // set under mu by Close; read lock-free on admission paths
 
 	hsg  *group        // handshake goroutines (accept loops and Handle start them) and their conn closers
 	slg  *group        // sessionless carriers' watchers
@@ -49,9 +50,13 @@ type Runtime struct {
 	nlisten   int      // Listen calls so far (the i of "Listen[i].")
 	listeners map[*Listener]struct{}
 	peers     map[*Peer]struct{}
-	sl        map[*carrier.Conn]struct{} // live sessionless carriers
-	draining  []<-chan struct{}          // Done of ended sessions that may still run (joined by Close)
+	sl        map[*carrier.Conn]struct{}   // live sessionless carriers
+	sources   map[*udpflow.Source]struct{} // FromPacketConn sources whose Done is not closed (Status.Datagram.Sources)
+	draining  []<-chan struct{}            // Done of ended sessions that may still run (joined by Close)
 	pruneAt   int
+
+	fmu    sync.Mutex                    // a leaf: guards pflows
+	pflows map[*session.Session]*flowSet // passive packet sessions: the raw-UDP flows of their OPEN carriers (listener_pkt.go)
 }
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
@@ -101,6 +106,8 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		listeners: make(map[*Listener]struct{}),
 		peers:     make(map[*Peer]struct{}),
 		sl:        make(map[*carrier.Conn]struct{}),
+		sources:   make(map[*udpflow.Source]struct{}),
+		pflows:    make(map[*session.Session]*flowSet),
 		pruneAt:   minPruneAt,
 	}
 	rt.cenv = carrier.Env{
@@ -113,6 +120,8 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		Budget:  rt.budget,
 		Stages:  rt.stages,
 		Hooks:   eff.hooks,
+		DBufs:   carrier.NewDatagramBufPool(),
+		Dgram:   &carrier.DgramStats{},
 	}
 	rt.gateFn = rt.gate
 	rt.ctx, rt.cancel = context.WithCancelCause(context.Background())
@@ -123,9 +132,10 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 // InstanceID returns this Runtime's InstanceID.
 func (rt *Runtime) InstanceID() InstanceID { return rt.id }
 
-// NewPeer validates and deep-copies cfg: 1–16 carriers, every Name non-empty
-// and unique, every Dial non-nil. A Peer with two or more carriers runs the
-// health layer (probe carriers) while it is in use.
+// NewPeer validates and deep-copies cfg: 1–16 carriers of both kinds, every
+// Name non-empty and unique, every Dial non-nil, every DatagramCarrier's MTU
+// within 537–65,507. A Peer with two or more carriers runs the health layer
+// (probe carriers, of both kinds) while it is in use.
 func (rt *Runtime) NewPeer(cfg PeerConfig) (*Peer, error) {
 	p, err := newPeer(rt, cfg)
 	if err != nil {
@@ -143,11 +153,12 @@ func (rt *Runtime) NewPeer(cfg PeerConfig) (*Peer, error) {
 }
 
 // Listen creates a Listener over cfg.Sources (one accept goroutine per
-// pull source). cfg is normalized like Config; adjustments are appended to
+// FromListener source, one demultiplexing goroutine per FromPacketConn
+// source). cfg is normalized like Config; adjustments are appended to
 // Status.ConfigAdjustments with the prefix "Listen[i].". When Listen fails
 // the sources stay owned by the caller.
 func (rt *Runtime) Listen(cfg ListenConfig) (*Listener, error) {
-	srcs, err := listenSources(cfg.Sources)
+	srcs, psrcs, err := listenSources(cfg.Sources)
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +171,7 @@ func (rt *Runtime) Listen(cfg ListenConfig) (*Listener, error) {
 	rt.nlisten++
 	rt.adjust = append(rt.adjust, adj...)
 	ln := newListener(rt, ncfg, srcs)
+	ln.psrcs = rt.newSourcesLocked(psrcs)
 	rt.listeners[ln] = struct{}{}
 	ln.start()
 	return ln, nil
@@ -172,6 +184,7 @@ func (rt *Runtime) Status() Status {
 	rt.mu.Lock()
 	adj := slices.Clone(rt.adjust)
 	rt.pruneDrainingLocked()
+	srcs := rt.liveSourcesLocked()
 	rt.mu.Unlock()
 	dropped, panics := rt.ev.counters()
 	return Status{
@@ -179,13 +192,14 @@ func (rt *Runtime) Status() Status {
 		Sessions:           rt.table.counts(now),
 		Handshakes:         rt.hs.len(),
 		HandshakeEvictions: rt.hs.evicted(),
-		AcceptBacklog:      [2]int{int(rt.backlog.Load()), 0},
+		AcceptBacklog:      [2]int{int(rt.backlog[kindIdxStream].Load()), int(rt.backlog[kindIdxPacket].Load())},
 		Sessionless:        rt.slt.len(),
 		BufferedBytes:      rt.budget.Used() + rt.stages.Used(),
 		Abandoned:          rt.abandon.Len(),
 		EventsDropped:      dropped,
 		CallbackPanics:     panics,
 		ConfigAdjustments:  adj,
+		Datagram:           rt.datagramStatus(srcs),
 	}
 }
 
@@ -196,7 +210,8 @@ func (rt *Runtime) Status() Status {
 // background included — sends RST(AbortGoingAway) and GOAWAY and ends
 // locally with net.ErrClosed; every Peer stops probing;
 // sessionless carriers get GOAWAY; an admission refusal still being written
-// gets the close bound, min(1 s, DeadMax), and is then cut; then every
+// gets the close bound, min(1 s, DeadMax), and is then cut, and every
+// FromPacketConn socket is closed (its flows end); then every
 // goroutine is joined within about 2 s, plus AbandonWait (1 s, the bound on
 // waiting for a goroutine stuck in embedder code) for a stuck
 // Config.OnEvent callback, and stragglers stuck in embedder code are counted
@@ -227,6 +242,7 @@ func (rt *Runtime) Close() error {
 	lns := mapKeys(rt.listeners)
 	peers := mapKeys(rt.peers)
 	sl := mapKeys(rt.sl)
+	srcs := mapKeys(rt.sources)
 	rt.mu.Unlock()
 	rt.cancel(net.ErrClosed) // in-flight Dials withdraw (session.Dial returns within 100 ms)
 
@@ -301,12 +317,31 @@ func (rt *Runtime) Close() error {
 		}
 	}
 	close(rt.cut)
+	// FromPacketConn sources close their sockets only after the sessions
+	// (M2-D58, M2 design §A4.6): the open packet sessions' RST(GoingAway)
+	// and their carriers' GOAWAYs are REL-wrapped and travel over these
+	// sockets, so every session — the ones that ended meanwhile included —
+	// gets until its end or the close bound. Then every flow's reads fail,
+	// and each source's Done is joined below.
+	if len(srcs) > 0 {
+		early := doneOf(rt.table.live())
+		rt.mu.Lock()
+		early = append(early, rt.draining...)
+		rt.mu.Unlock()
+		waitDone(early, killAt)
+		for _, src := range srcs {
+			src.Abort()
+		}
+	}
 	rt.hsg.wait(killAt.Add(wait), rt.abandon)
 	join := doneOf(rt.table.live())
 	rt.mu.Lock()
 	join = append(join, rt.draining...)
 	rt.mu.Unlock()
 
+	for _, src := range srcs {
+		join = append(join, src.Done())
+	}
 	waitDone(join, bound)
 	rt.slg.wait(bound, nil)
 	health.wait(bound, nil)

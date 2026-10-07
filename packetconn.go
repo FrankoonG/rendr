@@ -2,6 +2,8 @@ package rendr
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"time"
 
@@ -24,6 +26,21 @@ type PacketConn struct {
 
 var _ net.PacketConn = (*PacketConn)(nil)
 
+// newPacketConn wraps the packet session s of rt; the peer instance is
+// bound before the session is handed to the application, so both
+// addresses are fixed here. The remote address is boxed once, so ReadFrom
+// returns it without allocating.
+func newPacketConn(rt *Runtime, s *session.Session) *PacketConn {
+	sid := SessionID(s.ID())
+	c := &PacketConn{
+		s:      s,
+		local:  Addr{Instance: rt.id, Session: sid},
+		remote: Addr{Instance: InstanceID(s.PeerInstance()), Session: sid},
+	}
+	c.raddr = c.remote
+	return c
+}
+
 // ReadFrom returns the next datagram and the session's remote address. A
 // datagram longer than p returns (len(p), addr, io.ErrShortBuffer) and its
 // rest is discarded (unlike net.UDPConn, which truncates silently). io.EOF
@@ -32,7 +49,11 @@ var _ net.PacketConn = (*PacketConn)(nil)
 // close); then calls return net.ErrClosed after Close, the session's end
 // error after a failure, or os.ErrDeadlineExceeded after the read deadline.
 func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	panic("unimplemented: M2")
+	n, err := c.s.ReadFrom(p)
+	if err != nil && !errors.Is(err, io.ErrShortBuffer) {
+		return n, nil, err
+	}
+	return n, c.raddr, err
 }
 
 // WriteTo queues p as one datagram and returns (len(p), nil) at once: it
@@ -43,7 +64,26 @@ func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // peer closed: net.ErrClosed; after a failure the end error; past the write
 // deadline (0, os.ErrDeadlineExceeded) with nothing queued.
 func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	panic("unimplemented: M2")
+	if !c.isRemote(addr) {
+		return 0, ErrPacketDestinationMismatch
+	}
+	return c.s.WriteTo(p)
+}
+
+// isRemote reports whether addr names this session's peer: nil, the remote
+// Addr, or a non-nil *Addr holding it. Nothing of addr but its dynamic type
+// is used — no method of a foreign address is ever called (L38), and a
+// typed nil *Addr is a mismatch.
+func (c *PacketConn) isRemote(addr net.Addr) bool {
+	switch a := addr.(type) {
+	case nil:
+		return true
+	case Addr:
+		return a == c.remote
+	case *Addr:
+		return a != nil && *a == c.remote
+	}
+	return false
 }
 
 // Close returns at once: later calls return net.ErrClosed and received
@@ -106,14 +146,22 @@ func (c *PacketConn) Done() <-chan struct{} { return c.s.Done() }
 // OPEN can carry is refused at once with ErrMetadataTooLarge (a datagram
 // factory carries at most its MTU − 99 bytes of metadata).
 func (p *Peer) DialPacket(ctx context.Context, o DialOptions) (*PacketConn, error) {
-	panic("unimplemented: M2")
+	s, err := p.dial(ctx, o, true)
+	if err != nil {
+		return nil, err
+	}
+	return newPacketConn(p.rt, s), nil
 }
 
 // AcceptPacket returns the next pending packet session; Accept returns only
 // stream sessions. Same ctx, backlog and Close rules as Accept: the packet
 // backlog is separate (ListenConfig.AcceptBacklog per session kind).
 func (ln *Listener) AcceptPacket(ctx context.Context) (*PendingPacket, error) {
-	panic("unimplemented: M2")
+	it, err := ln.next(ctx, kindIdxPacket)
+	if err != nil {
+		return nil, err
+	}
+	return &PendingPacket{s: it.s, ln: ln, it: it}, nil
 }
 
 // PendingPacket is a packet session waiting for Confirm or Reject; the
@@ -121,6 +169,7 @@ func (ln *Listener) AcceptPacket(ctx context.Context) (*PendingPacket, error) {
 type PendingPacket struct {
 	s  *session.Session
 	ln *Listener
+	it *pendItem // its backlog slot: marked when the Listener closed
 }
 
 // ID returns the session ID.
@@ -142,11 +191,14 @@ func (p *PendingPacket) MaxPayload() int { return p.s.MaxPayload() }
 
 // Confirm accepts the session (OPEN_ACK OK) and returns its PacketConn.
 func (p *PendingPacket) Confirm() (*PacketConn, error) {
-	panic("unimplemented: M2")
+	if err := p.s.Confirm(); err != nil {
+		return nil, decisionErr(p.it, err)
+	}
+	return newPacketConn(p.ln.rt, p.s), nil
 }
 
 // Reject refuses the session (OPEN_ACK REJECTED); the dialer's DialPacket
 // returns *RejectError{code, msg}.
 func (p *PendingPacket) Reject(code uint32, msg string) error {
-	panic("unimplemented: M2")
+	return decisionErr(p.it, p.s.Reject(code, msg))
 }

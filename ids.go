@@ -107,10 +107,13 @@ const (
 	KindPacket        = KindDatagram
 )
 
-// String returns "stream" or "kind(N)".
+// String returns "stream", "datagram" or "kind(N)".
 func (k Kind) String() string {
-	if k == KindStream {
+	switch k {
+	case KindStream:
 		return "stream"
+	case KindDatagram:
+		return "datagram"
 	}
 	return "kind(" + itoa(uint64(k)) + ")"
 }

@@ -8,7 +8,7 @@ type Status struct {
 	Sessions           SessionCounts
 	Handshakes         int    // occupied handshake slots
 	HandshakeEvictions uint64 // unfinished handshakes evicted because the slots were full
-	AcceptBacklog      [2]int // pending sessions across Listeners: [0] stream, [1] packet (0: no packet sessions yet)
+	AcceptBacklog      [2]int // pending sessions across Listeners: [0] stream (Accept), [1] packet (AcceptPacket)
 	Sessionless        int    // probe carriers held by this (passive) Runtime
 
 	// BufferedBytes is the use of the MaxBufferedBytes budget (send,

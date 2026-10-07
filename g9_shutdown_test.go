@@ -306,7 +306,7 @@ func TestAcceptSkipsWithdrawnQueued_L50(t *testing.T) {
 		// head, holding its slot, while its Ended is held.
 		ln.mu.Lock()
 		var queued []*session.Session
-		for it := ln.head; it != nil; it = it.next {
+		for it := ln.q[kindIdxStream].head; it != nil; it = it.next {
 			queued = append(queued, it.s)
 		}
 		ln.mu.Unlock()

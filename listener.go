@@ -11,12 +11,13 @@ import (
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/udpflow"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // Source is where a Listener gets carriers from. The set is closed:
-// FromListener returns the only kind of Source; FromPacketConn follows with
-// packet sessions (milestone M2).
+// FromListener (stream carriers) and FromPacketConn (raw-UDP datagram
+// carriers).
 type Source interface{ isSource() }
 
 type listenerSource struct{ l net.Listener }
@@ -33,8 +34,8 @@ func FromListener(l net.Listener) Source { return listenerSource{l: l} }
 
 // ListenConfig configures a Listener.
 type ListenConfig struct {
-	Sources       []Source      // may be empty: a push-only listener fed by Handle
-	AcceptBacklog int           // 128; 1–65536: pending stream sessions of this Listener
+	Sources       []Source      // may be empty: a push-only listener fed by Handle and HandlePacket
+	AcceptBacklog int           // 128; 1–65536: pending sessions of this Listener, per session kind (stream: Accept; packet: AcceptPacket)
 	AcceptTimeout time.Duration // 10 s; 0.1 s–60 s: then OPEN_ACK(CAPACITY, accept timeout)
 }
 
@@ -48,63 +49,111 @@ const (
 var errNilConn = errors.New("rendr: Handle: nil conn")
 
 // listenSources validates a ListenConfig's sources: every one must come
-// from FromListener with a non-nil net.Listener, and no net.Listener may
-// appear twice (it would get two accept loops and two Closes, while
-// FromListener promises exactly one).
-func listenSources(srcs []Source) ([]net.Listener, error) {
-	out := make([]net.Listener, 0, len(srcs))
+// from FromListener with a non-nil net.Listener or from FromPacketConn with
+// a non-nil net.PacketConn, and no listener or socket may appear twice (it
+// would get two accept or demux loops and two Closes, while both promise
+// exactly one).
+func listenSources(srcs []Source) ([]net.Listener, []net.PacketConn, error) {
+	var (
+		out        = make([]net.Listener, 0, len(srcs))
+		pout       []net.PacketConn
+		lidx, pidx []int // the srcs index of each element of out and pout
+	)
 	for i, s := range srcs {
-		ls, ok := s.(listenerSource)
-		if !ok || ls.l == nil {
-			return nil, fmt.Errorf("rendr: Listen: source %d is not FromListener of a non-nil net.Listener", i)
-		}
-		for j, prev := range out {
-			if sameListener(prev, ls.l) {
-				return nil, fmt.Errorf("rendr: Listen: source %d repeats the net.Listener of source %d", i, j)
+		switch v := s.(type) {
+		case listenerSource:
+			if v.l == nil {
+				break
 			}
+			for j, prev := range out {
+				if sameValue(prev, v.l) {
+					return nil, nil, fmt.Errorf("rendr: Listen: source %d repeats the net.Listener of source %d", i, lidx[j])
+				}
+			}
+			out, lidx = append(out, v.l), append(lidx, i)
+			continue
+		case packetSource:
+			if v.pc == nil {
+				break
+			}
+			for j, prev := range pout {
+				if sameValue(prev, v.pc) {
+					return nil, nil, fmt.Errorf("rendr: Listen: source %d repeats the net.PacketConn of source %d", i, pidx[j])
+				}
+			}
+			pout, pidx = append(pout, v.pc), append(pidx, i)
+			continue
 		}
-		out = append(out, ls.l)
+		return nil, nil, fmt.Errorf("rendr: Listen: source %d is neither FromListener of a non-nil net.Listener nor FromPacketConn of a non-nil net.PacketConn", i)
 	}
-	return out, nil
+	return out, pout, nil
 }
 
-// sameListener reports whether a and b are the same net.Listener value; an
+// sameValue reports whether a and b are the same interface value; an
 // implementation whose dynamic type is not comparable is never the same.
-func sameListener(a, b net.Listener) (same bool) {
+func sameValue[T any](a, b T) (same bool) {
 	defer func() {
 		if recover() != nil {
 			same = false
 		}
 	}()
-	return a == b
+	return any(a) == any(b)
 }
 
-// Listener admits carriers and hands new stream sessions to the application
-// for Confirm or Reject. Carriers of sessions that already exist (JOIN,
-// duplicate OPEN) are routed by the Runtime, so a carrier may arrive on any
-// source or Listener of the Runtime.
+// Listener admits carriers and hands new sessions to the application for
+// Confirm or Reject: stream sessions through Accept, packet sessions
+// through AcceptPacket, each kind with its own backlog. Carriers of
+// sessions that already exist (JOIN, duplicate OPEN) are routed by the
+// Runtime, so a carrier may arrive on any source or Listener of the
+// Runtime.
 type Listener struct {
 	rt    *Runtime
 	cfg   ListenConfig // normalized
 	env   session.Env  // the Env of the sessions this Listener admits (Registry: lnRegistry)
 	srcs  []net.Listener
-	loops *group // accept loops and source closes
+	psrcs []*udpflow.Source // FromPacketConn sources (listener_pkt.go)
+	loops *group            // accept loops and source closes
 
 	// mu guards the admission state; a leaf (design §3.2). The ownership of
-	// a pending session is either in the queue or with the application
-	// (L50): Accept unlinks it, Close refuses every session still pending.
-	mu         sync.Mutex
-	closed     bool
-	reserved   int                            // backlog slots reserved by admissions in progress
-	pending    map[*session.Session]*pendItem // sessions holding a backlog slot (queued or accepted, undecided)
-	head, tail *pendItem                      // queued sessions in admission order (head = oldest)
-	qsig       chan struct{}                  // cap 1: wakes one Accept
-	done       chan struct{}                  // closed by Close
+	// a pending session is either in its kind's queue or with the
+	// application (L50): Accept and AcceptPacket unlink it, Close refuses
+	// every session still pending.
+	mu      sync.Mutex
+	closed  bool
+	q       [numKinds]pendQueue            // per session kind: [kindIdxStream] Accept, [kindIdxPacket] AcceptPacket
+	pending map[*session.Session]*pendItem // sessions holding a backlog slot (queued or accepted, undecided)
+	done    chan struct{}                  // closed by Close
+}
+
+// Session kinds as indices of the per-kind admission state
+// (Listener.q, Status.AcceptBacklog; M2 design §A5.14).
+const (
+	kindIdxStream = 0
+	kindIdxPacket = 1
+	numKinds      = 2
+)
+
+// kindIdx is the index of a session or OPEN kind.
+func kindIdx(k wire.CarrierKind) int {
+	if k == wire.KindDatagram {
+		return kindIdxPacket
+	}
+	return kindIdxStream
+}
+
+// pendQueue is the backlog of one session kind of a Listener (guarded by
+// Listener.mu, except sig).
+type pendQueue struct {
+	reserved   int           // backlog slots reserved by admissions in progress
+	n          int           // sessions of this kind holding a backlog slot
+	head, tail *pendItem     // queued sessions in admission order (head = oldest)
+	sig        chan struct{} // cap 1: wakes one Accept (or AcceptPacket)
 }
 
 // pendItem is one session holding a backlog slot of its Listener.
 type pendItem struct {
 	s          *session.Session
+	k          int // kind index
 	prev, next *pendItem
 	queued     bool        // linked in the queue (not yet returned by Accept)
 	shut       atomic.Bool // the Listener closed while the session held its slot
@@ -117,8 +166,10 @@ func newListener(rt *Runtime, cfg ListenConfig, srcs []net.Listener) *Listener {
 		srcs:    srcs,
 		loops:   newGroup(),
 		pending: make(map[*session.Session]*pendItem),
-		qsig:    make(chan struct{}, 1),
 		done:    make(chan struct{}),
+	}
+	for k := range ln.q {
+		ln.q[k].sig = make(chan struct{}, 1)
 	}
 	ln.env = session.Env{
 		Carrier:  &rt.cenv,
@@ -130,12 +181,14 @@ func newListener(rt *Runtime, cfg ListenConfig, srcs []net.Listener) *Listener {
 	return ln
 }
 
-// start launches one accept loop per source.
+// start launches one accept loop per stream source and one demux loop per
+// packet source.
 func (ln *Listener) start() {
 	for _, l := range ln.srcs {
 		ln.loops.add()
 		go ln.acceptLoop(l)
 	}
+	ln.startPacketSources()
 }
 
 // Handle pushes one embedder-accepted carrier into the handshake and
@@ -234,11 +287,23 @@ func (ln *Listener) pause(d time.Duration) bool {
 // Accept returns the next pending stream session, in admission order,
 // skipping sessions that were withdrawn or timed out. It returns exactly one
 // of (*PendingConn, nil) or (nil, err): ctx.Err() when ctx ends (the queue is
-// untouched), net.ErrClosed after Close.
+// untouched), net.ErrClosed after Close. Packet sessions wait for
+// AcceptPacket.
 func (ln *Listener) Accept(ctx context.Context) (*PendingConn, error) {
+	it, err := ln.next(ctx, kindIdxStream)
+	if err != nil {
+		return nil, err
+	}
+	return &PendingConn{s: it.s, rt: ln.rt, it: it}, nil
+}
+
+// next returns the oldest pending session of kind k that is still pending
+// (Accept, AcceptPacket).
+func (ln *Listener) next(ctx context.Context, k int) (*pendItem, error) {
+	q := &ln.q[k]
 	for {
 		if err := ctx.Err(); err != nil {
-			ln.passSignal()
+			ln.passSignal(k)
 			return nil, err
 		}
 		ln.mu.Lock()
@@ -246,23 +311,23 @@ func (ln *Listener) Accept(ctx context.Context) (*PendingConn, error) {
 			ln.mu.Unlock()
 			return nil, net.ErrClosed
 		}
-		if it := ln.head; it != nil {
+		if it := q.head; it != nil {
 			ln.unlinkLocked(it)
-			more := ln.head != nil
+			more := q.head != nil
 			ln.mu.Unlock()
 			if more {
-				ln.signal() // another Accept may take the next one
+				ln.signal(k) // another Accept may take the next one
 			}
 			if it.s.State() != session.StatePending {
 				continue // withdrawn or timed out: its Registry.Ended frees the slot
 			}
-			return &PendingConn{s: it.s, rt: ln.rt, it: it}, nil
+			return it, nil
 		}
 		ln.mu.Unlock()
 		select {
-		case <-ln.qsig:
+		case <-q.sig:
 		case <-ctx.Done():
-			ln.passSignal()
+			ln.passSignal(k)
 			return nil, ctx.Err()
 		case <-ln.done:
 			return nil, net.ErrClosed
@@ -270,31 +335,35 @@ func (ln *Listener) Accept(ctx context.Context) (*PendingConn, error) {
 	}
 }
 
-// signal wakes one Accept (cap-1 token; a stale token only causes a re-check).
-func (ln *Listener) signal() {
+// signal wakes one Accept of kind k (cap-1 token; a stale token only
+// causes a re-check).
+func (ln *Listener) signal(k int) {
 	select {
-	case ln.qsig <- struct{}{}:
+	case ln.q[k].sig <- struct{}{}:
 	default:
 	}
 }
 
-// passSignal hands a wakeup on to another Accept when sessions are queued:
-// an Accept that leaves without taking one may have consumed the token.
-func (ln *Listener) passSignal() {
+// passSignal hands a wakeup on to another Accept of kind k when sessions
+// are queued: an Accept that leaves without taking one may have consumed
+// the token.
+func (ln *Listener) passSignal(k int) {
 	ln.mu.Lock()
-	more := ln.head != nil
+	more := ln.q[k].head != nil
 	ln.mu.Unlock()
 	if more {
-		ln.signal()
+		ln.signal(k)
 	}
 }
 
 // Close stops the sources (closing every FromListener listener exactly
-// once, bounded), answers every session that is still pending — and every
-// OPEN whose handshake on this Listener completes afterwards —
-// OPEN_ACK(CAPACITY, backlog), so the dialer's Dial returns ErrCapacity, and
-// makes Accept and Handle return net.ErrClosed; Confirm and Reject of a
-// PendingConn it refused return net.ErrClosed. Confirmed sessions are not
+// once, bounded; a FromPacketConn socket stops admitting and closes once
+// its last flow ended, M2-D58), answers every session that is still
+// pending — and every OPEN whose handshake on this Listener completes
+// afterwards — OPEN_ACK(CAPACITY, backlog), so the dialer's Dial returns
+// ErrCapacity, and makes Accept, AcceptPacket, Handle and HandlePacket
+// return net.ErrClosed; Confirm and Reject of a PendingConn or
+// PendingPacket it refused return net.ErrClosed. Confirmed sessions are not
 // affected (their carriers may arrive through any Listener), and the
 // Runtime keeps admitting through its other Listeners: a Listener's Close
 // is not the instance going away, so it never answers GOING_AWAY, which
@@ -314,9 +383,11 @@ func (ln *Listener) Close() error {
 	return nil
 }
 
-// shut closes the Listener once: Accept and Handle fail from now on, every
-// source is closed on a guarded goroutine (an embedder Close may block or
-// panic, L50/L51), and the sessions holding a backlog slot are marked and
+// shut closes the Listener once: Accept, AcceptPacket, Handle and
+// HandlePacket fail from now on, every FromListener source is closed on a
+// guarded goroutine (an embedder Close may block or panic, L50/L51), every
+// FromPacketConn source stops admitting (its socket closes after its last
+// flow, M2-D58), and the sessions holding a backlog slot are marked and
 // returned for the caller to refuse (Listener.Close; Runtime.Close shuts
 // them down instead). Later calls return nothing.
 func (ln *Listener) shut() []*session.Session {
@@ -340,6 +411,9 @@ func (ln *Listener) shut() []*session.Session {
 			defer func() { _ = recover() }()
 			_ = l.Close()
 		}()
+	}
+	for _, src := range ln.psrcs {
+		src.Stop()
 	}
 	return refuse
 }
@@ -375,40 +449,43 @@ const (
 	reserveFull
 )
 
-// reserve takes a backlog slot for an OPEN being admitted (design §6.2).
-func (ln *Listener) reserve() reserveResult {
+// reserve takes a backlog slot of kind k for an OPEN being admitted (design
+// §6.2); each session kind has its own AcceptBacklog (plan §4).
+func (ln *Listener) reserve(k int) reserveResult {
 	ln.mu.Lock()
 	defer ln.mu.Unlock()
+	q := &ln.q[k]
 	switch {
 	case ln.closed:
 		return reserveClosed
-	case len(ln.pending)+ln.reserved >= ln.cfg.AcceptBacklog:
+	case q.n+q.reserved >= ln.cfg.AcceptBacklog:
 		return reserveFull
 	}
-	ln.reserved++
+	q.reserved++
 	return reserveOK
 }
 
-// unreserve returns a slot whose admission created no session.
-func (ln *Listener) unreserve() {
+// unreserve returns a slot of kind k whose admission created no session.
+func (ln *Listener) unreserve(k int) {
 	ln.mu.Lock()
-	ln.reserved--
+	ln.q[k].reserved--
 	ln.mu.Unlock()
 }
 
-// bind turns a reservation into the slot of session s; it runs before
-// s.Start, so the session's Registry calls always find it.
-func (ln *Listener) bind(s *session.Session) {
+// bind turns a reservation of kind k into the slot of session s; it runs
+// before s.Start, so the session's Registry calls always find it.
+func (ln *Listener) bind(s *session.Session, k int) {
 	ln.mu.Lock()
-	ln.reserved--
-	ln.pending[s] = &pendItem{s: s}
+	ln.q[k].reserved--
+	ln.q[k].n++
+	ln.pending[s] = &pendItem{s: s, k: k}
 	ln.mu.Unlock()
-	ln.rt.backlog.Add(1)
+	ln.rt.backlog[k].Add(1)
 }
 
-// enqueue makes the started session s available to Accept and wakes one.
-// A session that already ended is skipped; on a closed Listener it is
-// refused instead (refusal: CAPACITY, or GOING_AWAY while the Runtime
+// enqueue makes the started session s available to its kind's Accept and
+// wakes one. A session that already ended is skipped; on a closed Listener
+// it is refused instead (refusal: CAPACITY, or GOING_AWAY while the Runtime
 // closes), as Close may have run before its slot was bound; RefusePending
 // of a session that was already refused or shut down does nothing.
 func (ln *Listener) enqueue(s *session.Session) {
@@ -423,16 +500,17 @@ func (ln *Listener) enqueue(s *session.Session) {
 		s.RefusePending(ln.refusal())
 		return
 	}
-	it.prev = ln.tail
-	if ln.tail != nil {
-		ln.tail.next = it
+	q := &ln.q[it.k]
+	it.prev = q.tail
+	if q.tail != nil {
+		q.tail.next = it
 	} else {
-		ln.head = it
+		q.head = it
 	}
-	ln.tail = it
+	q.tail = it
 	it.queued = true
 	ln.mu.Unlock()
-	ln.signal()
+	ln.signal(it.k)
 }
 
 // leavePending frees the backlog slot of s (Registry.Opened or Ended).
@@ -444,26 +522,28 @@ func (ln *Listener) leavePending(s *session.Session) {
 	it := ln.pending[s]
 	if it != nil {
 		delete(ln.pending, s)
+		ln.q[it.k].n--
 		if it.queued {
 			ln.unlinkLocked(it)
 		}
 	}
 	ln.mu.Unlock()
 	if it != nil {
-		ln.rt.backlog.Add(-1)
+		ln.rt.backlog[it.k].Add(-1)
 	}
 }
 
 func (ln *Listener) unlinkLocked(it *pendItem) {
+	q := &ln.q[it.k]
 	if it.prev != nil {
 		it.prev.next = it.next
 	} else {
-		ln.head = it.next
+		q.head = it.next
 	}
 	if it.next != nil {
 		it.next.prev = it.prev
 	} else {
-		ln.tail = it.prev
+		q.tail = it.prev
 	}
 	it.prev, it.next, it.queued = nil, nil, false
 }
@@ -496,7 +576,7 @@ func (p *PendingConn) PeerInstance() InstanceID { return InstanceID(p.s.PeerInst
 // a second decision.
 func (p *PendingConn) Confirm() (*Conn, error) {
 	if err := p.s.Confirm(); err != nil {
-		return nil, p.decisionErr(err)
+		return nil, decisionErr(p.it, err)
 	}
 	return newConn(p.rt, p.s), nil
 }
@@ -506,15 +586,16 @@ func (p *PendingConn) Confirm() (*Conn, error) {
 // a retried OPEN gets the same answer. On this side the session ends with an
 // error matching ErrRejected (its EventSessionEnd). Errors as for Confirm.
 func (p *PendingConn) Reject(code uint32, msg string) error {
-	return p.decisionErr(p.s.Reject(code, msg))
+	return decisionErr(p.it, p.s.Reject(code, msg))
 }
 
-// decisionErr is the error of a Confirm or Reject: the session's own,
-// except that a session its Listener's Close refused — answered CAPACITY,
-// so that the dialer does not take the instance for gone away — reports
-// net.ErrClosed like every call on a closed Listener (design §9).
-func (p *PendingConn) decisionErr(err error) error {
-	if err != nil && p.it != nil && p.it.shut.Load() && errors.Is(err, ErrCapacity) {
+// decisionErr is the error of a Confirm or Reject of the session holding
+// backlog slot it: the session's own, except that a session its Listener's
+// Close refused — answered CAPACITY, so that the dialer does not take the
+// instance for gone away — reports net.ErrClosed like every call on a
+// closed Listener (design §9).
+func decisionErr(it *pendItem, err error) error {
+	if err != nil && it != nil && it.shut.Load() && errors.Is(err, ErrCapacity) {
 		return net.ErrClosed
 	}
 	return err

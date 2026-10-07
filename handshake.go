@@ -66,7 +66,7 @@ func (rt *Runtime) startHandshake(ln *Listener, nc net.Conn, at time.Time) {
 // Status.Abandoned AbandonWait after it started, by its own watch outside
 // Runtime.Close and at the latest by Close's join before it returns (L52),
 // exactly as a handshake stuck in a Read.
-func (rt *Runtime) closeWatched(nc net.Conn) {
+func (rt *Runtime) closeWatched(nc hsIO) {
 	wait := rt.eff.timing.AbandonWait
 	rt.hsg.add() // the Close's membership, added while the caller's is held
 	rt.hsg.goWatched(rt.abandon, wait, func() { setDeadlineNow(nc) })
@@ -76,15 +76,16 @@ func (rt *Runtime) closeWatched(nc net.Conn) {
 // setDeadlineNow calls nc.SetDeadline(time.Now()); a panic is contained
 // (L51; a runtime.Goexit ends only its own closer goroutine, which
 // goWatched settles).
-func setDeadlineNow(nc net.Conn) {
+func setDeadlineNow(nc hsIO) {
 	defer func() { _ = recover() }()
 	_ = nc.SetDeadline(time.Now())
 }
 
-// closeConn calls nc.Close(); a panic is contained (L51). nc is an onceConn
-// or rendr's own OwnedTCP, so the embedder's Close runs once however many
-// closers a handshake's conn meets.
-func closeConn(nc net.Conn) {
+// closeConn calls nc.Close(); a panic is contained (L51). nc is an onceConn,
+// rendr's own OwnedTCP or a carrier.PacketIO (whose Close is idempotent), so
+// the embedder's Close runs once however many closers a handshake's conn
+// meets.
+func closeConn(nc hsIO) {
 	defer func() { _ = recover() }()
 	_ = nc.Close()
 }
@@ -122,9 +123,9 @@ func (rt *Runtime) handshake(ln *Listener, slot *hsSlot, nc net.Conn, at time.Ti
 	refused := true
 	switch h.First.Type {
 	case wire.TypeOpen:
-		refused = rt.admitOpen(ln, h, deadline)
+		refused = rt.admitOpen(ln, h, deadline, 0, nil)
 	case wire.TypeJoin:
-		refused = rt.admitJoin(h, deadline)
+		refused = rt.admitJoin(h, deadline, 0, nil)
 	case wire.TypePing:
 		c, inst, ok := rt.admitSessionless(h, deadline)
 		if !ok {
@@ -155,7 +156,7 @@ func (rt *Runtime) handshake(ln *Listener, slot *hsSlot, nc net.Conn, at time.Ti
 // §6.8, L52). Every close of nc goes through its once wrapper (or is a
 // second close of rendr's own OwnedTCP), so the embedder's Close still
 // runs once (L51).
-func (rt *Runtime) awaitRefusal(c *carrier.Conn, nc net.Conn) {
+func (rt *Runtime) awaitRefusal(c *carrier.Conn, nc hsIO) {
 	select {
 	case <-c.Done():
 		return

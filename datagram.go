@@ -2,9 +2,13 @@ package rendr
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // DatagramCarrier is a factory of datagram carriers to the Peer's rendr
@@ -84,8 +88,31 @@ func FromPacketConn(pc net.PacketConn) Source { return packetSource{pc: pc} }
 // whose String panics, the Listener closed — pc stays the caller's and is
 // not closed (unlike Handle, which closes its conn after Close; L57).
 func (ln *Listener) HandlePacket(pc net.PacketConn, peer net.Addr) error {
-	panic("unimplemented: M2")
+	switch {
+	case pc == nil:
+		return errNilPacketConn
+	case peer == nil:
+		return errNilPeer
+	}
+	// The receive limit is unknown (any offer is accepted, M2-D60); the
+	// negotiated budget lowers it before the carrier starts (R1-6). A peer
+	// whose String panics fails here, and pc stays the caller's (L57).
+	io, err := carrier.NewPacketIO(&ln.rt.cenv, pc, peer, wire.MaxDatagram)
+	if err != nil {
+		return fmt.Errorf("rendr: HandlePacket: %w", err)
+	}
+	if !ln.beginHandshake() {
+		return net.ErrClosed // unlike Handle, pc stays the caller's (M2-D57)
+	}
+	ln.rt.startHandshakeDatagram(ln, io, time.Now())
+	return nil
 }
+
+// Errors of HandlePacket (pc stays the caller's).
+var (
+	errNilPacketConn = errors.New("rendr: HandlePacket: nil net.PacketConn")
+	errNilPeer       = errors.New("rendr: HandlePacket: nil peer address")
+)
 
 // DialInfo describes the carrier a factory call is for.
 type DialInfo struct {
