@@ -28,8 +28,9 @@ type fakeConn struct {
 	wErrs    []fakeWrite // results of the next writes
 	reads    int         // ReadFrom calls
 	empty    bool        // every read returns (0, addr, nil) (R1-27)
+	emptyCap int         // with empty: reads past this count block until Close (0: no cap)
 	panicked bool        // the next read panics
-	deaf     bool        // ReadFrom ignores Close until release is closed (L50)
+	deaf     bool        // a waiting ReadFrom ignores Close until release is closed, WriteTo ignores it (L50)
 	release  chan struct{}
 	discard  bool // writes are not recorded (allocation gates)
 }
@@ -47,6 +48,13 @@ type fakeWrite struct {
 
 func newFakeConn() *fakeConn {
 	return &fakeConn{wakeCh: make(chan struct{}, 1), closedCh: make(chan struct{}), release: make(chan struct{})}
+}
+
+// queued returns the number of datagrams and errors not read yet.
+func (c *fakeConn) queued() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.in)
 }
 
 // send queues one datagram from addr.
@@ -84,9 +92,15 @@ func (c *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			c.panicked = false
 			c.mu.Unlock()
 			panic("fake ReadFrom panic")
-		case c.empty:
+		case c.empty && (c.emptyCap == 0 || c.reads <= c.emptyCap):
 			c.mu.Unlock()
 			return 0, udpAddr(9, 9), nil
+		case c.empty:
+			// A reader past the cap spins: block until Close, so that fake
+			// time can advance and the test can count the reads.
+			c.mu.Unlock()
+			<-c.closedCh
+			return 0, nil, net.ErrClosed
 		case len(c.in) > 0:
 			d := c.in[0]
 			c.in = c.in[1:]
@@ -100,6 +114,15 @@ func (c *fakeConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		c.mu.Unlock()
 		if deaf {
 			<-c.release
+			// The late return delivers a datagram queued meanwhile, if any
+			// (a read that completes after the close started).
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if len(c.in) > 0 {
+				d := c.in[0]
+				c.in = c.in[1:]
+				return copy(p, d.b), d.from, nil
+			}
 			return 0, nil, net.ErrClosed
 		}
 		select {
@@ -120,7 +143,7 @@ func (c *fakeConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 		return w.n, w.err
 	}
-	if c.closed {
+	if c.closed && !c.deaf {
 		return 0, net.ErrClosed
 	}
 	if c.discard {

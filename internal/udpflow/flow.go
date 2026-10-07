@@ -393,7 +393,11 @@ func (f *Flow) SetWriteDeadline(t time.Time) error {
 // Close implements carrier.PacketIO: removes the flow (pointer compare),
 // releases its inbox and wakes its reader; the socket stays open. The
 // buffer of the datagram the reader holds is returned by its next
-// ReadDatagram or Release, never under it. Close is idempotent.
+// ReadDatagram or Release, never under it: Close may run on another
+// goroutine while the reader still uses that datagram (PacketIO's reader
+// half belongs to the reader), so the reader must call Release (or
+// ReadDatagram, which then fails) when it exits, or the buffer stays
+// charged to Env.Budget. Close is idempotent.
 func (f *Flow) Close() error {
 	f.mu.Lock()
 	if f.closed {

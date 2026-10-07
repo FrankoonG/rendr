@@ -57,16 +57,27 @@ const (
 	reserveBufs = 4
 	// minRing is the inbox ring a new flow starts with; it doubles up to
 	// Limits.Inbox and never shrinks (no allocation per datagram in steady
-	// state, no 512-entry ring per idle flow).
+	// state, no 512-entry ring per idle flow). The ring is not charged to a
+	// Budget: one entry is about 80 bytes, so a flow that once burst to the
+	// full inbox keeps about 40 KiB (Inbox 512) until it closes, at most
+	// MaxFlows times that per source — bounded by Limits, not counted (the
+	// queued datagrams' buffers are charged to Env.Budget).
 	minRing = 8
 	// backoffMin and backoffMax bound the noise backoff of the demux loop
 	// (L58: 5 ms doubling to 100 ms).
 	backoffMin = 5 * time.Millisecond
 	backoffMax = 100 * time.Millisecond
-	// emptyRun is the number of consecutive empty reads after which the
-	// demux backs off like noise: an embedder conn that returns (0, addr,
-	// nil) forever must not spin a core (PA-18, R1-27).
-	emptyRun = 64
+	// emptyRun and emptyPause are a foreign conn's spin guard: after
+	// emptyRun consecutive empty reads the demux pauses emptyPause (fixed,
+	// not doubling), so a conn that returns (0, addr, nil) forever cannot
+	// spin a core (PA-18, R1-27) and a flood of real empty datagrams cannot
+	// slow the shared socket below about emptyRun reads per millisecond
+	// (L58). rendr's own socket drops empties without a pause: the kernel
+	// returns one only for a real datagram. M2-D86's doubling backoff is the
+	// carrier reader's rule; applied to the shared socket's reader it would
+	// let a cheap empty flood starve every flow.
+	emptyRun   = 64
+	emptyPause = time.Millisecond
 )
 
 // Limits bound one Source.

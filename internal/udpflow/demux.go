@@ -78,7 +78,7 @@ func (r *reader) loopOwned() {
 			r.noise()
 			continue
 		case ev == carrier.ReadEmpty:
-			r.empty()
+			s.drop() // a real empty datagram: the kernel cannot spin on empties, no backoff (L58)
 			continue
 		}
 		r.backoff, r.empties = 0, 0
@@ -117,7 +117,7 @@ func (r *reader) loopForeign() {
 			s.countTruncated()
 			continue
 		case n == 0:
-			r.empty()
+			r.emptyForeign()
 			continue
 		}
 		r.backoff, r.empties = 0, 0
@@ -142,27 +142,31 @@ func (r *reader) noise() {
 	if d := s.env.Dgram; d != nil {
 		d.ReadErrors.Add(1)
 	}
-	r.sleep()
-}
-
-// empty drops an empty datagram; a run of emptyRun empty reads backs off
-// like noise (PA-18, R1-27).
-func (r *reader) empty() {
-	r.s.drop()
-	r.empties++
-	if r.empties >= emptyRun {
-		r.sleep()
-	}
-}
-
-// sleep waits for the current backoff (or until the socket closes) and
-// doubles it.
-func (r *reader) sleep() {
 	d := r.backoff
 	if d <= 0 {
 		d = backoffMin
 	}
 	r.backoff = min(2*d, backoffMax)
+	r.pause(d)
+}
+
+// emptyForeign drops an empty read of a foreign conn; every emptyRun
+// consecutive empty reads pause emptyPause. A conn that returns (0, addr,
+// nil) forever thus reads at most emptyRun times per emptyPause instead of
+// spinning a core (PA-18, R1-27), while a real flood of empty datagrams
+// keeps tens of thousands of reads per second — a doubling backoff would
+// starve every flow on the socket (L58).
+func (r *reader) emptyForeign() {
+	r.s.drop()
+	r.empties++
+	if r.empties >= emptyRun {
+		r.empties = 0
+		r.pause(emptyPause)
+	}
+}
+
+// pause waits d (or until the socket closes) on the reused timer.
+func (r *reader) pause(d time.Duration) {
 	if r.timer == nil {
 		r.timer = time.NewTimer(d)
 	} else {

@@ -111,12 +111,15 @@ func TestFlowOwnedSocketZeroAllocs_L41_L54(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A GC moves every sync.Pool to its victim cache: it runs before the
+	// warm-up, never between the warm-up and the measurement, or the
+	// window would count the pools' chains being rebuilt.
+	runtime.GC()
 	for range 200 {
 		round()
 	}
 	const rounds = 4000
 	var m0, m1 runtime.MemStats
-	runtime.GC()
 	runtime.ReadMemStats(&m0)
 	for range rounds {
 		round()

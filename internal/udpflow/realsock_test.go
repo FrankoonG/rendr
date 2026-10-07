@@ -179,3 +179,40 @@ func TestFlowOwnedSocket_L58(t *testing.T) {
 		t.Fatal("the shared socket is still open")
 	}
 }
+
+// TestFlowOwnedSocketEmpties_L58: on rendr's own socket an empty datagram
+// is a real datagram the kernel received — it is dropped and counted, and
+// a run of them never pauses the demux: a live flow's datagram behind
+// hundreds of empties arrives at once (L58).
+func TestFlowOwnedSocketEmpties_L58(t *testing.T) {
+	rs := newRealSource(t, 1232)
+	if err := rs.u.SetReadBuffer(4 << 20); err != nil {
+		t.Fatal(err)
+	}
+	const id = 0x4321
+	rs.send(h1(id, wire.TypeOpen, 5))
+	f := rs.flow()
+	f.Admitted()
+	readOne(t, f, realWait)
+	const batches, empties = 3, 4 * emptyRun
+	for i := range batches {
+		before := rs.s.Stats().Dropped
+		for range empties {
+			rs.send(nil)
+		}
+		rs.send(dg(id, pingFrame(uint32(i+2))))
+		// One socket on loopback delivers in order: the PING follows the
+		// batch. A pause per empty run would hold it for seconds.
+		if b, _, ev := readOne(t, f, time.Second); ev != carrier.ReadOK || u32(b[5:9]) != uint32(i+2) {
+			t.Fatalf("batch %d: event %d", i, ev)
+		}
+		// Loopback may drop a few under load; the run must have crossed
+		// the spin guard's length several times to mean anything.
+		if d := rs.s.Stats().Dropped - before; d < 2*emptyRun {
+			t.Fatalf("batch %d: %d of %d empty datagrams counted", i, d, empties)
+		}
+	}
+	if st := rs.s.Stats(); st.ReadErrors != 0 || st.Flows != 1 {
+		t.Fatalf("Stats %+v", st)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -101,6 +102,14 @@ func TestFlowBadDatagramsDropped_L58(t *testing.T) {
 		if !bytes.Equal(b, valid[wire.FlowHeaderLen:]) || ev != carrier.ReadOK || src.AP != apOf(2, 1000) {
 			t.Fatalf("H1 read back: %d bytes, event %d, source %v", len(b), ev, src)
 		}
+		// A known flow's datagram with the flow header alone is dropped at
+		// the source: nothing reaches the inbox.
+		h.c.send(dg(0x53), udpAddr(2, 1000))
+		synctest.Wait()
+		if st := h.s.Stats(); st.Dropped != want+1 || st.InboxDrops != 0 {
+			t.Fatalf("header only on a known flow: Stats %+v, want Dropped %d", st, want+1)
+		}
+		expectNoRead(t, f, time.Millisecond)
 	})
 }
 
@@ -110,7 +119,14 @@ func TestFlowFloodBounded_L58(t *testing.T) {
 		h := newHarness(t, env, Limits{MaxFlows: 64})
 		defer h.shutdown()
 		const liveID = 0xfeed
+		var bMu sync.Mutex
+		var bAdmitted time.Time
 		h.admitFn = func(f *Flow) {
+			if f.ID() == 0xb0b {
+				bMu.Lock()
+				bAdmitted = time.Now()
+				bMu.Unlock()
+			}
 			if f.ID() == liveID {
 				f.Admitted() // its session was accepted
 				return
@@ -179,8 +195,11 @@ func TestFlowFloodBounded_L58(t *testing.T) {
 		if bFlow == nil {
 			t.Fatal("IP B's H1 was not admitted during the flood")
 		}
-		if d := time.Since(bSent); d > time.Second {
-			t.Fatalf("IP B admitted after %v, want ≤ 1 s", d)
+		bMu.Lock()
+		bAt := bAdmitted
+		bMu.Unlock()
+		if d := bAt.Sub(bSent); d < 0 || d > time.Second {
+			t.Fatalf("IP B admitted %v after its H1, want ≤ 1 s", d)
 		}
 		if received < 90 { // 100 sent: ≥ 90 % of the baseline
 			t.Fatalf("the live flow received %d of 100 datagrams during the flood", received)
@@ -228,12 +247,26 @@ func TestFlowsReleased_L58(t *testing.T) {
 			synctest.Wait()
 			readOne(t, f, time.Second) // the H1; two pings stay queued
 			readOne(t, f, time.Second)
-			if _, _, _, err := f.ReadDatagram(nil); err != nil { // held while Close runs
+			held, _, _, err := f.ReadDatagram(nil) // held while Close runs
+			if err != nil {
 				t.Fatal(err)
 			}
 			f.Close()
-			if _, _, _, err := f.ReadDatagram(nil); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("read after Close: %v", err)
+			// Close never releases the datagram the reader holds (it may still
+			// be in use): it stays charged and intact until the reader's
+			// Release or next ReadDatagram.
+			if want := pingFrame(3); !bytes.Equal(held, want) || env.Budget.Used() == 0 {
+				t.Fatalf("cycle %d: Close released the datagram the reader holds (Budget %d)", i, env.Budget.Used())
+			}
+			if i%2 == 0 {
+				if _, _, _, err := f.ReadDatagram(nil); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("read after Close: %v", err)
+				}
+			} else {
+				f.Release()
+			}
+			if used := env.Budget.Used(); used != 0 {
+				t.Fatalf("cycle %d: Budget holds %d bytes after the reader let go", i, used)
 			}
 		}
 		st := h.s.Stats()
@@ -787,25 +820,77 @@ func TestSourceForeignReadPanic_L57(t *testing.T) {
 	})
 }
 
+// TestSourceEmptyReadsBackOff_L42: a foreign conn that returns (0, addr,
+// nil) forever cannot spin a core — at most emptyRun reads per emptyPause —
+// and the source neither dies nor slows further (R1-27's guard, fixed so
+// that an empty flood cannot starve the socket, L58).
 func TestSourceEmptyReadsBackOff_L42(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
 		h := newHarness(t, env, Limits{})
+		const perSecond = emptyRun * int(time.Second/emptyPause)
 		h.c.mu.Lock()
 		h.c.empty = true
+		h.c.emptyCap = 4 * perSecond // a spinning reader stops here instead of hanging the bubble
 		h.c.mu.Unlock()
 		h.c.kick()
 		time.Sleep(time.Second)
+		synctest.Wait()
 		h.c.mu.Lock()
 		reads := h.c.reads
 		h.c.mu.Unlock()
-		if reads > emptyRun+20 {
-			t.Fatalf("%d empty reads in 1 s, want ≤ %d (no spin)", reads, emptyRun+20)
+		if reads < perSecond-emptyRun || reads > perSecond+2*emptyRun {
+			t.Fatalf("%d empty reads in 1 s, want about %d (%d per %v: neither a spin nor a doubling backoff)", reads, perSecond, emptyRun, emptyPause)
 		}
-		if st := h.s.Stats(); st.Dropped < emptyRun {
-			t.Fatalf("Stats %+v: empty datagrams not counted", st)
+		if st := h.s.Stats(); st.Dropped < uint64(perSecond-emptyRun) || st.ReadErrors != 0 {
+			t.Fatalf("Stats %+v: empty datagrams not counted as drops", st)
 		}
 		h.shutdown()
+	})
+}
+
+// TestFlowEmptyFlood_L58: a live flow keeps ≥ 90 % of its datagrams while
+// 2,000 empty datagrams per second arrive on the shared socket, and the
+// source keeps up with the flood (nothing piles up in the socket).
+func TestFlowEmptyFlood_L58(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := testEnv(1 << 30)
+		h := newHarness(t, env, Limits{})
+		defer h.shutdown()
+		from := udpAddr(2, 1000)
+		h.c.send(h1(1, wire.TypeOpen, 1), from)
+		synctest.Wait()
+		f := h.last()
+		f.Admitted()
+		readOne(t, f, time.Second)
+		const rounds, empties = 20, 200 // one datagram per 100 ms against 2 kpps of empties
+		received := 0
+		for i := range rounds {
+			for range empties {
+				h.c.send(nil, udpAddr(10, 9000))
+			}
+			h.c.send(dg(1, pingFrame(uint32(i+2))), from)
+			time.Sleep(100 * time.Millisecond)
+			for {
+				if err := f.SetReadDeadline(time.Now().Add(time.Microsecond)); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, _, err := f.ReadDatagram(nil); err != nil {
+					break
+				}
+				f.Release()
+				received++
+			}
+		}
+		if received < rounds*9/10 {
+			t.Fatalf("%d of %d datagrams delivered under the empty flood, %d still queued in the socket", received, rounds, h.c.queued())
+		}
+		if q := h.c.queued(); q > empties {
+			t.Fatalf("%d datagrams queued in the socket: the source fell behind the flood", q)
+		}
+		if st := h.s.Stats(); st.Dropped != rounds*empties {
+			t.Fatalf("Stats %+v, want %d empty datagrams dropped", st, rounds*empties)
+		}
 	})
 }
 
@@ -880,12 +965,37 @@ func TestSourceReadIgnoresClose_L50(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
 		h := newHarness(t, env, Limits{})
+		h.c.send(h1(1, wire.TypeOpen, 1), udpAddr(2, 1000))
+		synctest.Wait()
+		f := h.last()
+		readOne(t, f, time.Second)
+		if err := f.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		// From now on the conn's waiting ReadFrom ignores Close.
 		h.c.mu.Lock()
 		h.c.deaf = true
 		h.c.mu.Unlock()
+		h.c.kick()
+		errc := make(chan error, 1)
+		go func() {
+			_, _, _, err := f.ReadDatagram(nil)
+			errc <- err
+		}()
 		synctest.Wait()
 		start := time.Now()
 		h.s.Abort()
+		// Abort itself fails the flow's reads: the demux goroutine is stuck
+		// in the conn and cannot do it.
+		select {
+		case err := <-errc:
+			if !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("read across Abort: %v, want net.ErrClosed", err)
+			}
+		case <-time.After(time.Millisecond):
+			t.Fatal("a waiting flow read outlived Abort while the conn ignored Close")
+		}
+		f.Close()
 		<-h.s.Done()
 		if d := time.Since(start); d != env.Timing.AbandonWait {
 			t.Fatalf("Done after %v, want AbandonWait %v", d, env.Timing.AbandonWait)
@@ -893,10 +1003,17 @@ func TestSourceReadIgnoresClose_L50(t *testing.T) {
 		if n := env.Abandon.Len(); n != 1 {
 			t.Fatalf("%d abandoned calls, want the stuck ReadFrom", n)
 		}
+		// The stuck read finally returns a valid H1: the socket's close has
+		// started, so it is dropped without a CAPACITY answer.
+		h.c.send(h1(2, wire.TypeOpen, 2), udpAddr(2, 1001))
+		dropped := h.s.Stats().Dropped
 		close(h.c.release)
 		synctest.Wait()
 		if n := env.Abandon.Len(); n != 0 {
 			t.Fatalf("%d abandoned calls after the ReadFrom returned", n)
+		}
+		if st := h.s.Stats(); st.Dropped != dropped+1 || st.Flows != 0 || len(h.c.written()) != 0 {
+			t.Fatalf("a late H1 after the close: Stats %+v, %d written, want one drop and no answer", st, len(h.c.written()))
 		}
 		if used := env.Budget.Used() + env.Stages.Used(); used != 0 {
 			t.Fatalf("%d bytes buffered after the late return", used)
