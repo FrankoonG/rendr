@@ -2,6 +2,7 @@ package carrier
 
 import (
 	"sync/atomic"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -52,6 +53,16 @@ type dgState struct {
 	peerClosed    bool            // (R) the peer's CLOSE was dispatched (M2-D30)
 	peerCloseFseq uint32          // (R) its fseq: later non-RACK frames are dropped
 
+	// The datagram retirement (M2-D31, R1-4): it completes when our CLOSE
+	// was RACKed, the peer's CLOSE was dispatched and a datagram carrying a
+	// RACK that covers the peer's CLOSE was written.
+	peerCloseSeen   bool          // (M) the peer's CLOSE was dispatched
+	peerCloseCseq   uint32        // (M) its cseq
+	peerCloseRacked bool          // (M) a written datagram carried a RACK covering it
+	peerCloseReason atomic.Uint32 // (A) its reason (R1-3; 0: none yet)
+
+	held atomic.Bool // (A) a held passive carrier has not placed its first response yet (M2-D22, R1-14)
+
 	lastDgram atomic.Int64 // (A) ns after Conn.base of the last DGRAM written or read: packet activity (M2-D23)
 
 	hs    dgHandshake // (I/M) stored PREFACE / PREFACE_ACK / H2 bytes, H2 repeat flag (M2-D19)
@@ -79,5 +90,56 @@ type dgCounters struct {
 // the probe failure with reason "capacity" (plan:175). Stream carriers
 // learn a capacity refusal as Establish's response and report false.
 func (c *Conn) PeerCloseReason() (wire.CloseReason, bool) {
-	panic("unimplemented: M2")
+	if c.dg == nil {
+		return 0, false
+	}
+	r := c.dg.peerCloseReason.Load()
+	return wire.CloseReason(r), r != 0
 }
+
+// dgDropped counts n dropped datagrams or frames (M2-D14) on the carrier
+// and in the Runtime-wide counters.
+func (c *Conn) dgDropped(n uint64) {
+	c.dg.ctr.dropped.Add(n)
+	if s := c.env.Dgram; s != nil {
+		s.Dropped.Add(n)
+	}
+}
+
+// dgTruncated counts one truncated or oversize datagram (a drop too).
+func (c *Conn) dgTruncated() {
+	c.dg.ctr.truncated.Add(1)
+	if s := c.env.Dgram; s != nil {
+		s.Truncated.Add(1)
+	}
+	c.dgDropped(1)
+}
+
+// dgReadError counts one transient read error (ReadNoise).
+func (c *Conn) dgReadError() {
+	if s := c.env.Dgram; s != nil {
+		s.ReadErrors.Add(1)
+	}
+}
+
+// dgSince returns the nanoseconds after Conn.base at now, at least 1 (0
+// marks "never" in the activity clocks).
+func (c *Conn) dgSince(now time.Time) int64 {
+	return max(int64(now.Sub(c.base)), 1)
+}
+
+// packetActive reports whether the carrier is packet-active at now (M2-D23):
+// a DGRAM was written or read within PacketActive, or the carrier is
+// younger than packetYouth.
+func (c *Conn) packetActive(now time.Time) bool {
+	age := now.Sub(c.base)
+	if age < packetYouth {
+		return true
+	}
+	last := c.dg.lastDgram.Load()
+	return last != 0 && age-time.Duration(last) < c.tm.PacketActive
+}
+
+// packetYouth keeps a new datagram carrier on the PacketPing cadence for its
+// first seconds (M2-D23: "or the carrier younger than 5 s").
+const packetYouth = 5 * time.Second
