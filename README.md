@@ -244,6 +244,13 @@ the first sample of a transfer that starts at a probe can be taken as
 unloaded. And after an RTT rise, an application-limited flow can switch a
 probe interval or two later.
 
+Packet sessions have no self-load gauge on datagram carriers: those
+carriers keep no bytes in flight, so the guard sees only a packet session's
+traffic on stream carriers. A packet session that saturates its own
+datagram path loads that path's probe samples unnoticed; the selector may
+then leave the path on a quality switch and return to it after `Cooldown`,
+once the samples recover.
+
 ## Testing
 
 Package [`rendrtest`](rendrtest) provides in-memory carriers with fault

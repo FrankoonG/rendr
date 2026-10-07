@@ -55,7 +55,10 @@ type PacketIO interface {
 	// dead conn may report too (quic-go's idle timeout; integration 1).
 	ReadDatagram(buf []byte) (data []byte, src PeerKey, ev ReadEvent, err error)
 	// Release returns the buffer of the last ReadDatagram to its owner
-	// (flows); a no-op otherwise.
+	// (flows); a no-op otherwise. The reader calls it before it exits,
+	// also after Close: Close never releases a buffer the reader still
+	// holds (integration 2; a final ReadDatagram, which fails after Close,
+	// returns it too).
 	Release()
 	// Headroom is the number of bytes WriteDatagram fills in front of the
 	// rendr bytes itself (wire.FlowHeaderLen for raw-UDP flow carriers, else
@@ -70,7 +73,9 @@ type PacketIO interface {
 	// it).
 	WriteDatagram(b []byte) error
 	// WriteDatagramTo sends b to dst instead of the current peer (a rebind
-	// challenge, M2-D27); ErrNoRebind on transports that cannot rebind.
+	// challenge, M2-D27); ErrNoRebind on transports that cannot rebind. b
+	// has WriteDatagram's layout: the transport fills b[:Headroom()], the
+	// datagram's rendr bytes start after it.
 	WriteDatagramTo(b []byte, dst PeerKey) error
 	// SetPeer makes dst the current peer (a committed rebind, called by the
 	// reader or the writer); ErrNoRebind on transports that cannot rebind.
@@ -79,7 +84,10 @@ type PacketIO interface {
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 	// Close unblocks every call and releases the transport exactly once
-	// (a flow leaves its source's table; the shared socket stays open).
+	// (a flow leaves its source's table; the shared socket stays open). A
+	// flow's buffer still held by the reader is returned by the reader's
+	// Release (Close may run on any goroutine while the reader half
+	// belongs to the reader).
 	Close() error
 	// Limit is the largest rendr datagram (after the flow header) the
 	// transport can receive — its capacity, used for the cmtu offer and

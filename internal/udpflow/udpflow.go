@@ -272,7 +272,8 @@ func (s *Source) Abort() {
 }
 
 // Done is closed when Run returned, the socket is closed and every flow
-// ended.
+// ended. It never closes for a source whose Run was never called: package
+// rendr starts Run for every Source it creates.
 func (s *Source) Done() <-chan struct{} { return s.done }
 
 // Stats returns the source's counters (rendr.Status.Datagram).

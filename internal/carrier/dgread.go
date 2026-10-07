@@ -49,7 +49,9 @@ func (c *Conn) dgReadLoop() {
 			c.Kill(CauseTransportError, "conn ReadFrom called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
-		// its buffer (§4.1).
+		// its buffer (§4.1), and it returns a flow buffer it may still hold
+		// (PacketIO.Release; Close never does, integration 2).
+		dg.io.Release()
 		if rd.buf != nil {
 			rd.buf.Release()
 			rd.buf = nil
