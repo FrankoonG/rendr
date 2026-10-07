@@ -423,9 +423,10 @@ func (d *wbDeafIO) SetReadDeadline(t time.Time) error {
 func (d *wbDeafIO) SetDeadline(t time.Time) error { return d.SetReadDeadline(t) }
 
 // TestDatagramProbeCarrier (carrier level; the passive's sessionless count
-// and "never adopted" are integration 2's): a datagram factory's probe
-// carrier sends H1p = PREFACE ‖ PING and is established by H2p's PONG,
-// with the frame budget MinFrameBudget on both ends; a passive whose
+// and "never adopted" are the root's TestDatagramProbesE2E): a datagram
+// factory's probe carrier sends H1p = PREFACE ‖ PING and is established
+// by H2p's PONG, with the frame budget MinFrameBudget on both ends; a
+// passive whose
 // sessionless pool is full answers REL{F, CLOSE(capacity)} after H2p, which
 // the started probe carrier dispatches (R1-3): it retires, and the health
 // layer marks the factory failed with reason "capacity" (plan:175); a

@@ -23,7 +23,7 @@ import (
 // (HandlePacket's 65,507) takes any offer. The accepted MaxPayload follows
 // M2-D49's passive rule (packetAccept; the L37 worked example included).
 // The end-to-end half (PendingPacket.MaxPayload, the dialer's SetBudget)
-// passes at integration 2.
+// is TestPassiveBudgetJoinE2E_L37 and TestDialPacketMaxPayloadE2E_L37.
 func TestPassiveBudgetNegotiated_L37(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -86,7 +86,7 @@ func TestPassiveBudgetNegotiated_L37(t *testing.T) {
 	// session fixes the budget; a stream carrier's rxNext (an offset) and
 	// an offer out of range (refused by the session) pass unchanged. The
 	// end-to-end row (a JOIN offering 1400 on a 1152 transport is answered
-	// JOIN_ACK cmtu_acc 1152) passes at integration 2.
+	// JOIN_ACK cmtu_acc 1152) is TestPassiveBudgetJoinE2E_L37.
 	for _, tc := range []struct {
 		name   string
 		rxNext uint64
@@ -304,7 +304,7 @@ func TestPacketOpenOnStreamCarrier(t *testing.T) {
 // stream session and AcceptPacket only the packet session. (The flood half
 // — a packet-OPEN flood from the victim's own source IP over FromPacketConn
 // while Accept stalls, the victim's failover JOIN completing within 1 s —
-// needs working packet sessions and passes at integration 2.)
+// is TestPacketOpenPoolsFlood_L48.)
 func TestPacketOpenPools_L48(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, nil)

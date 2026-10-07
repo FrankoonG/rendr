@@ -160,8 +160,8 @@ func TestStreamDialNeedsStreamFactory(t *testing.T) {
 // members cannot, else that minimum; a stream-only Peer offers
 // Packet.MaxPayload; no offer exceeds Packet.MaxPayload. The DialSpec of a
 // DialPacket carries the offer and the packet configuration. (The end-to-
-// end table — the session's MaxPayload once OPEN_ACK fixed it — passes at
-// integration 2.)
+// end table — the session's MaxPayload once OPEN_ACK fixed it — is
+// TestDialPacketMaxPayloadE2E_L37.)
 func TestDialPacketMaxPayload_L37(t *testing.T) {
 	ds := func(mtus ...int) []carrier.Factory {
 		fs := make([]carrier.Factory, len(mtus))
@@ -359,8 +359,8 @@ func TestCarrierDialInfo(t *testing.T) {
 // foreign net.Addr whose String panics — returns (0,
 // ErrPacketDestinationMismatch) without calling any method of it and
 // without reaching the session. (The end-to-end half — the address stable
-// across migrations, the token reaching the factory — passes at
-// integration 2.)
+// across migrations, the token reaching the factory — is
+// TestPacketLogicalAddrE2E_L38.)
 func TestPacketLogicalAddr_L38(t *testing.T) {
 	remote := Addr{Instance: InstanceID(wpInst(1)), Session: SessionID(wpSID(1))}
 	c := &PacketConn{remote: remote} // no session: a mismatch never reaches it

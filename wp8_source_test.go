@@ -48,8 +48,8 @@ func TestListenerCloseKeepsFlows_L50(t *testing.T) {
 		}
 		// A second OPEN carrier of the same pending session counts as well
 		// (holdFlow), until Confirm's positive verdict releases both
-		// (flowsOpened, which Registry.Opened calls; opening the session
-		// itself needs the packet session actor: integration 2).
+		// (flowsOpened, which Registry.Opened calls; through a real Confirm:
+		// TestPacketAdmittingReleasedE2E_L48).
 		dup := wdHubDial(t, hub, inst, 4)
 		dup.sendH1(wire.TypeOpen, wdPacketOpen(wpSID(1), 1, 1223, 1198))
 		dup.expectH2(rt)
@@ -116,9 +116,8 @@ func TestListenerCloseKeepsFlows_L50(t *testing.T) {
 // RST(GoingAway)/GOAWAY, "then every source Aborts"). A pending packet
 // session over the source is answered OPEN_ACK(GOING_AWAY) on its flow
 // (after the carrier's GOAWAY) before the socket closes, exactly once, and
-// nothing remains. (The open
-// session's RST(GoingAway) reaching the dialer as *AbortError passes at
-// integration 2.)
+// nothing remains. (The open session's RST(GoingAway) reaching the dialer
+// as *AbortError is TestRuntimeCloseOpenPacketSession.)
 func TestRuntimeCloseSourcesLast(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt := wpTestRuntime(t, Config{}, nil)

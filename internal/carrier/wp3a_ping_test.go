@@ -564,8 +564,8 @@ func TestChallengePongSlot(t *testing.T) {
 // its first response — a PONG for a PING, a RACK for a REL — and never
 // writes a PING or a session frame while held; at the verdict its first
 // response leaves with the first PING behind it in the same round (M2-D22,
-// R1-8). (The H2 repeat of a duplicate H1 needs WP3b's stored handshake
-// bytes: it is checked at integration 2.)
+// R1-8). (The H2 repeat of a duplicate H1 is the root's
+// TestHeldCarrierRepeatsH2E2E.)
 func TestHeldDatagramCarrier(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p := rawPair(t, 1200, false)
