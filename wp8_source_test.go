@@ -108,3 +108,39 @@ func TestListenerCloseKeepsFlows_L50(t *testing.T) {
 		}
 	})
 }
+
+// TestPacketSourceValidation: Listen takes FromPacketConn sources beside
+// FromListener ones; a nil net.PacketConn, or one given twice (it would get
+// two demux loops and two Closes, M2-D58), fails Listen, and a failed
+// Listen leaves every socket with the caller, unclosed.
+func TestPacketSourceValidation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		hub := rendrtest.NewDatagramHub(rendrtest.DatagramHubConfig{Name: "v"})
+		defer hub.Close()
+		sock := &countPC{PacketConn: hub.PacketConn()}
+		for _, srcs := range [][]Source{
+			{FromPacketConn(nil)},
+			{FromPacketConn(sock), FromPacketConn(sock)},
+			{FromPacketConn(sock), FromListener(nil)},
+		} {
+			if ln, err := rt.Listen(ListenConfig{Sources: srcs}); ln != nil || err == nil {
+				t.Fatalf("Listen(%v) = %v, %v", srcs, ln, err)
+			}
+		}
+		if n := sock.closes.Load(); n != 0 || rt.Status().Datagram.Sources != 0 {
+			t.Fatalf("a failed Listen closed the socket %d times (%d sources)", n, rt.Status().Datagram.Sources)
+		}
+		ln := wpListen(t, rt, ListenConfig{Sources: []Source{FromPacketConn(sock)}})
+		if ds := rt.Status().Datagram; ds.Sources != 1 {
+			t.Fatalf("sources %d, want 1", ds.Sources)
+		}
+		ln.Close()
+		synctest.Wait()
+		if n, ds := sock.closes.Load(), rt.Status().Datagram; n != 1 || ds.Sources != 0 {
+			t.Fatalf("Listener.Close without flows: socket closed %d times, %d sources; want 1 and 0", n, ds.Sources)
+		}
+		rt.Close()
+		wpNoState(t, rt)
+	})
+}
