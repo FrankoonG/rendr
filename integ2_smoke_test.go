@@ -33,7 +33,7 @@ import (
 // and the session survived each. Load: the rate was reached (the received
 // count). Integrity: every datagram is verified (seq, size, CRC and body);
 // none is corrupt, resized or duplicated; every loss falls within a short
-// window after a kill; the PacketCounters of both ends add up (§A7.2:
+// window after a kill or is a counted queue drop; the PacketCounters of both ends add up (§A7.2:
 // accepted = Sent + the send-side drops, nothing queued after the end;
 // Received = returned by ReadFrom + DropRecvQueue). After Runtime.Close
 // nothing is left: no session, handshake, flow, source or buffered byte,
@@ -349,19 +349,26 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 			t.Errorf("load: %s received %d unique datagrams, want ≥ %d", x.name, res.Unique, min)
 		}
 		lost := x.sentSeqs - res.Unique
-		for _, m := range res.Missing {
-			at := time.Duration(float64(m.From) / float64(x.rate) * float64(time.Second))
-			if !nearKill(at, kills, r.lossWin) {
-				t.Errorf("%s: seqs %d–%d (sent at %v) lost away from every kill %v", x.name, m.From, m.To, at, kills)
-				break
-			}
-		}
-		// §A7.2: the send side adds up over public fields; the receive side
-		// read up to its end (nothing discarded after Close).
 		tp, rp := x.tx.Packet, x.rx.Packet
 		if tp == nil || rp == nil {
 			t.Fatalf("%s: no PacketCounters", x.name)
 		}
+		// Losses away from every kill must be counted drops of the
+		// session's own queues (none in virtual time; in real time under
+		// -race a host stall can age one out: DropAge), never silent.
+		var away uint64
+		for _, m := range res.Missing {
+			at := time.Duration(float64(m.From) / float64(x.rate) * float64(time.Second))
+			if !nearKill(at, kills, r.lossWin) {
+				away += m.To - m.From + 1
+			}
+		}
+		if counted := tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge + rp.DropRecvQueue; away > counted {
+			t.Errorf("%s: %d datagrams lost away from every kill %v, only %d counted as queue drops (missing %v)",
+				x.name, away, kills, counted, res.Missing)
+		}
+		// §A7.2: the send side adds up over public fields; the receive side
+		// read up to its end (nothing discarded after Close).
 		if sum := tp.Sent + tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge; sum != x.sentSeqs {
 			t.Errorf("%s: accepted %d ≠ Sent %d + DropQueue %d + DropAge %d + DropNoPath %d + DropTooLarge %d = %d",
 				x.name, x.sentSeqs, tp.Sent, tp.DropQueue, tp.DropAge, tp.DropNoPath, tp.DropTooLarge, sum)

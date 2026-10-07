@@ -25,7 +25,7 @@ import (
 // carrier) run at the same time; each loses its carrier once (the dialer's
 // conn is closed under rendr: an embedder-closed conn, transport_error)
 // and goes on. Integrity: every datagram verified (seq, size, CRC, body;
-// no duplicate; losses only right after the kill) and every stream byte
+// no duplicate; losses only right after the kill or counted as drops) and every stream byte
 // exact; the PacketCounters add up (§A7.2). Clean end: both sessions end by
 // Close, both Runtimes close with no session, handshake or buffered byte
 // left, the quic Listener's Done closes, and no goroutine is left.
@@ -44,7 +44,8 @@ func TestQUICSmoke_CA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ql, err := Listen("udp4", "127.0.0.1:0", Options{TLS: srv})
+	var qctr Counters // the adapters' own datagram drops (transport losses)
+	ql, err := Listen("udp4", "127.0.0.1:0", Options{TLS: srv, Counters: &qctr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +53,7 @@ func TestQUICSmoke_CA(t *testing.T) {
 	go func() { served <- ql.Serve(rl) }()
 	addr := ql.Addr().String()
 
-	dc, err := DatagramCarrier("qd", addr, Options{TLS: cli})
+	dc, err := DatagramCarrier("qd", addr, Options{TLS: cli, Counters: &qctr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,11 +268,19 @@ func TestQUICSmoke_CA(t *testing.T) {
 		if res.Unique < x.acc*9/10 {
 			t.Errorf("%s: %d of %d datagrams received", x.name, res.Unique, x.acc)
 		}
+		// Losses away from the kill must be counted: the session's queue
+		// drops or the QUIC adapters' own (a host stall under -race).
+		var away uint64
 		for _, m := range res.Missing {
 			at := time.Duration(m.From) * time.Second / rate
 			if at < killAt-100*time.Millisecond || at > killAt+3*time.Second {
-				t.Errorf("%s: seqs %d–%d (sent at %v) lost away from the kill at %v", x.name, m.From, m.To, at, killAt)
+				away += m.To - m.From + 1
 			}
+		}
+		counted := x.tx.DropQueue + x.tx.DropAge + x.tx.DropNoPath + x.tx.DropTooLarge + x.rx.DropRecvQueue +
+			qctr.IngressDrops.Load() + qctr.EgressDrops.Load()
+		if away > counted {
+			t.Errorf("%s: %d datagrams lost away from the kill at %v, %d counted (missing %v)", x.name, away, killAt, counted, res.Missing)
 		}
 		if sum := x.tx.Sent + x.tx.DropQueue + x.tx.DropAge + x.tx.DropNoPath + x.tx.DropTooLarge; sum != x.acc {
 			t.Errorf("%s: accepted %d ≠ the send-side sum %d (%+v)", x.name, x.acc, sum, *x.tx)
