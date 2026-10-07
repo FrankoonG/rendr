@@ -155,9 +155,13 @@ func (s *Session) pktHasDataLaneLocked() bool {
 }
 
 // pktOtherCarrierLocked reports whether a live data lane other than l can
-// carry an n-byte datagram — a stream data lane, or a datagram data lane
-// whose DgramMax is at least n — and wakes it (M2-D45). It recomputes the
-// routing summary first, so two lanes never defer to each other.
+// carry an n-byte datagram now — a stream data lane with spare capacity for
+// it, or a datagram data lane whose DgramMax is at least n, either not
+// write-blocked — and wakes it (M2-D45). It recomputes the routing summary
+// first, so two lanes never defer to each other. A capable member that
+// cannot write now does not hold the queue behind the head until MaxAge:
+// the head is dropped as too large instead (a budget shrink is rare; the
+// datagrams behind it are not held up).
 func (s *Session) pktOtherCarrierLocked(l *lane, n int) bool {
 	s.pktRouteLocked()
 	for _, o := range s.st.order {
@@ -165,6 +169,9 @@ func (s *Session) pktOtherCarrierLocked(l *lane, n int) bool {
 			continue
 		}
 		if pp, dg := pktDgramLane(o); dg && pp.DgramMax() < n {
+			continue
+		}
+		if !s.pktCanPlaceLocked(o, n) {
 			continue
 		}
 		if o.idle {
@@ -248,7 +255,7 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 	s.refreshOrderLocked(now, false)
 	if pk.tx.n == 0 && pk.txBig.n == 0 {
 		if st.fin.requested && !st.fin.acked && st.fin.lane == nil {
-			s.pktWalkLocked(1, false, nil, 0)
+			s.pktWalkLocked(1, false, nil, 0, -1)
 		}
 		return
 	}
@@ -261,17 +268,21 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			counted, covered = sl, carrier.MaxBatchFrames
 		}
 		if covered < pk.tx.n {
-			s.pktWalkLocked(pk.tx.n, false, counted, covered)
+			s.pktWalkLocked(pk.tx.n, false, counted, covered, int(pk.tx.front().n))
 		}
 	}
 	if pk.txBig.n > 0 {
-		s.pktWalkLocked(pk.txBig.n, true, nil, 0)
+		s.pktWalkLocked(pk.txBig.n, true, nil, 0, int(pk.txBig.front().n))
 	}
 }
 
 // pktWalkLocked is the bond walk of pktWakeDataLocked for need queued
-// datagrams: skip is a lane already counted (covered includes it).
-func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered int) {
+// datagrams whose head has head bytes (−1: the FIN, no capacity needed):
+// skip is a lane already counted (covered includes it). A stream lane
+// without spare capacity for the head is skipped like a write-blocked one:
+// it could place nothing, so it covers nothing (a stalled member absorbs
+// at most its capacity, L32; as M1's wakeDataLocked counts spare capacity).
+func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, head int) {
 	for pass := range 2 {
 		if streamOnly && pass == 0 {
 			continue
@@ -283,7 +294,7 @@ func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered i
 			if _, dg := pktDgramLane(l); dg != (pass == 0) {
 				continue
 			}
-			if l.port.WriteBlocked() {
+			if !s.pktCanPlaceLocked(l, head) {
 				continue
 			}
 			if l.idle {
@@ -298,22 +309,39 @@ func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered i
 	}
 }
 
+// pktCanPlaceLocked reports whether lane l can place an n-byte datagram
+// now: it is not write-blocked and, on a stream lane, its spare capacity
+// (Capacity − Inflight) holds n bytes (n < 0: no capacity needed).
+func (s *Session) pktCanPlaceLocked(l *lane, n int) bool {
+	if l.port.WriteBlocked() {
+		return false
+	}
+	if _, dg := pktDgramLane(l); dg || n < 0 {
+		return true
+	}
+	return l.port.Capacity()-l.port.Inflight() >= int64(n)
+}
+
 // pktStaleLocked returns the bond lane the minimum share serves now
-// (R1-19), or nil: the remembered one while it is a live data lane that is
-// not write-blocked, else the result of a scan (at most once per
-// PacketPing/8) for the live data lane, not write-blocked, that placed no
-// DGRAM within PacketPing/4 — never-placed lanes first, then the oldest
-// lastDgramAt.
+// (R1-19), or nil: the remembered one while it is a live data lane that can
+// place tx's head now (pktCanPlaceLocked), else the result of a scan for
+// the live data lane that can place it and placed no DGRAM within
+// PacketPing/4 — never-placed lanes first, then the oldest lastDgramAt.
+// The scan runs at most once per PacketPing/max(8, 4·lanes): one stale
+// lane is served per scan, so with k members each is served at least every
+// max((k−1)·period, PacketPing/4 + period) < PacketPing/2 for every bond up
+// to MaxCarriersPerSession (and beyond). Called with tx non-empty.
 func (s *Session) pktStaleLocked(now time.Time) *lane {
 	pk := s.pk
+	head := int(pk.tx.front().n)
 	if sl := pk.stale; sl != nil {
-		if sl.data && sl.state != LaneDead && !sl.port.WriteBlocked() {
+		if sl.data && sl.state != LaneDead && s.pktCanPlaceLocked(sl, head) {
 			return sl
 		}
-		pk.stale = nil
+		pk.stale = nil // it cannot place now: a capacity-blocked member never holds the share
 	}
 	pp := s.pktPing()
-	if !pk.staleScanAt.IsZero() && now.Sub(pk.staleScanAt) < pp/8 {
+	if !pk.staleScanAt.IsZero() && now.Sub(pk.staleScanAt) < pp/time.Duration(max(8, 4*len(s.st.order))) {
 		return nil
 	}
 	pk.staleScanAt = now
@@ -328,7 +356,7 @@ func (s *Session) pktStaleLocked(now time.Time) *lane {
 		if best != nil && !l.lastDgramAt.Before(best.lastDgramAt) {
 			continue
 		}
-		if l.port.WriteBlocked() {
+		if !s.pktCanPlaceLocked(l, head) {
 			continue
 		}
 		best = l

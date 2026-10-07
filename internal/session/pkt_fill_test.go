@@ -266,6 +266,62 @@ func TestPacketWakePolicy_L08(t *testing.T) {
 			if p1.wakeCount() != w1 || p2.wakeCount() != w2+1 {
 				t.Fatal("a write-blocked lane was woken, or the other one was not")
 			}
+			// The walk itself skips it: with every member served, the
+			// minimum share stays out and the walk alone chooses.
+			dpIdle(l2)
+			now := time.Now()
+			s.mu.Lock()
+			l1.lastDgramAt, l2.lastDgramAt = now, now
+			s.refreshOrderLocked(now, true)
+			s.mu.Unlock()
+			w1, w2 = p1.wakeCount(), p2.wakeCount()
+			dpWrite(t, s, 2, 10)
+			if p1.wakeCount() != w1 || p2.wakeCount() != w2+1 {
+				t.Fatalf("walk: blocked lane woken %d times, other %d; want 0 and 1", p1.wakeCount()-w1, p2.wakeCount()-w2)
+			}
+			dpEnd(s, io.EOF)
+		})
+	})
+
+	// A stream member without spare capacity covers nothing and never
+	// holds the minimum share (L32: a stalled member absorbs at most its
+	// capacity): at a low rate the healthy member carries every datagram.
+	for _, mixed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "capblocked/mixed", false: "capblocked/stream"}[mixed], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { dpCapBlockedRun(t, mixed) })
+		})
+	}
+	// A member the minimum share chose while it had capacity, out of
+	// capacity before it placed anything, is forgotten: the next WriteTo
+	// wakes the healthy member.
+	t.Run("capblocked/remembered", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s := dpSession(dpOpt{mode: ModeBond})
+			la, pa := dpAddLane(s, 1, true, false)
+			lb, pb := dpAddLane(s, 2, true, true)
+			pa.set(func(f *dpPort) { f.srtt = time.Millisecond; f.capacity = 4000 })
+			pb.set(func(f *dpPort) { f.srtt = 2 * time.Millisecond })
+			dpIdle(la)
+			dpIdle(lb)
+			now := time.Now()
+			s.mu.Lock()
+			lb.lastDgramAt = now // served; la never placed: the share's choice
+			s.refreshOrderLocked(now, true)
+			s.mu.Unlock()
+			wa, wb := pa.wakeCount(), pb.wakeCount()
+			dpWrite(t, s, 1, 100)
+			if pa.wakeCount() != wa+1 || pb.wakeCount() != wb {
+				t.Fatalf("first WriteTo woke the stale member %d and the other %d times; want 1 and 0 (stimulus)", pa.wakeCount()-wa, pb.wakeCount()-wb)
+			}
+			pa.set(func(f *dpPort) { f.inflight = f.capacity })
+			if fs := dpFrames(dpFill(la, time.Now())); dpCount(fs, wire.TypeDgram) != 0 {
+				t.Fatalf("a member without capacity placed %v", fs)
+			}
+			wa = pa.wakeCount()
+			dpWrite(t, s, 2, 100)
+			if pa.wakeCount() != wa || pb.wakeCount() != wb+1 {
+				t.Fatalf("second WriteTo woke the member without capacity %d and the healthy one %d times; want 0 and 1", pa.wakeCount()-wa, pb.wakeCount()-wb)
+			}
 			dpEnd(s, io.EOF)
 		})
 	})
@@ -313,11 +369,55 @@ func TestPacketWakePolicy_L08(t *testing.T) {
 		{4, time.Millisecond, 60 * time.Second},
 		{2, 100 * time.Microsecond, 6 * time.Second},
 		{4, 100 * time.Microsecond, 6 * time.Second},
+		{8, time.Millisecond, 10 * time.Second},
+		{16, time.Millisecond, 10 * time.Second}, // MaxCarriersPerSession's maximum
 	} {
 		t.Run(fmt.Sprintf("share/%d@%v", tc.members, tc.every), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) { dpShareRun(t, tc.members, tc.every, tc.run) })
 		})
 	}
+}
+
+// dpCapBlockedRun: a bond whose fastest member is a stream lane with no
+// spare capacity (Capacity == Inflight) and a healthy member (a datagram
+// lane when mixed, else a stream lane); 100-byte datagrams every 10 ms for
+// 3 virtual seconds with MaxAge 100 ms. The member without capacity is
+// never woken (neither the walk nor the minimum share picks it).
+func dpCapBlockedRun(t *testing.T, mixed bool) {
+	s := dpSession(dpOpt{mode: ModeBond, maxAge: 100 * time.Millisecond, packetPing: time.Second})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	lb, pb := dpAddLane(s, 1, true, false)
+	pb.set(func(f *dpPort) { f.srtt = time.Millisecond; f.capacity, f.inflight = 4000, 4000 })
+	lh, ph := dpAddLane(s, 2, true, mixed)
+	ph.set(func(f *dpPort) { f.srtt = 2 * time.Millisecond })
+	blocked := &dpShareLane{l: lb, p: pb, start: time.Now(), first: -1}
+	healthy := &dpShareLane{l: lh, p: ph, start: time.Now(), first: -1}
+	for _, w := range []*dpShareLane{blocked, healthy} {
+		dpIdle(w.l)
+		wg.Go(func() { w.run(stop) })
+	}
+	wb := pb.wakeCount()
+	const n = 300
+	for range n {
+		synctest.Wait()
+		if _, err := s.WriteTo(make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	synctest.Wait()
+	close(stop)
+	wg.Wait()
+	c := dpCtr(s)
+	t.Logf("counters %+v; healthy %d DGRAMs, blocked %d", c, healthy.dgrams, blocked.dgrams)
+	if blocked.dgrams != 0 || pb.wakeCount() != wb {
+		t.Fatalf("the member without capacity placed %d DGRAMs and was woken %d times; want neither", blocked.dgrams, pb.wakeCount()-wb)
+	}
+	if c.Sent < n*9/10 || healthy.dgrams != int(c.Sent) {
+		t.Fatalf("Sent %d (healthy member %d) of %d; want ≥ 90 %% by the healthy member", c.Sent, healthy.dgrams, n)
+	}
+	dpEnd(s, io.EOF)
 }
 
 // dpShareLane is an emulated carrier writer: woken by its port, it runs

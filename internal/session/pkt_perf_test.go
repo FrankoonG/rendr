@@ -222,7 +222,7 @@ func TestPacketDispatchCostFlat_L54(t *testing.T) {
 		dpEnd(d.r, io.EOF)
 	}
 	t.Logf("ns per dispatch %v (2/6/16 lanes)", ns)
-	if ns[2] > 1.5*ns[0]+2000 {
+	if ns[2] > 1.5*ns[0]+200 { // 200 ns: the noise floor of 50 ms samples, not a slack for O(lanes) work
 		t.Fatalf("dispatch with 16 lanes costs %.0f ns vs %.0f ns with 2: grows with the carrier count", ns[2], ns[0])
 	}
 }

@@ -121,13 +121,22 @@ func (s *Session) movePackDutyLocked(l *lane) {
 // (rxSince already counts it): at PackEvery datagrams since the last PACK
 // an urgent bump; else the first unreported datagram arms the PACK delay
 // (PacketPing) and wakes the duty lane once, whose Fill arms its writer
-// timer (b.WakeAt). That first datagram is also the only one that reads
-// the clock (the idle clock moves with it).
+// timer (b.WakeAt). Only that first datagram and every PackEvery-th one
+// read the clock, and the idle clock moves with them (M2-D41): while the
+// PACK cannot be placed, a busy receiver still moves it every PackEvery
+// datagrams. (The residual lag — at most PacketPing, or PackEvery
+// datagrams while no duty lane can place the PACK — is why IdleTimeout
+// should be at least 2·PacketPing.)
 func (s *Session) packCadenceLocked() {
 	st, pk := &s.st, s.pk
 	switch every := s.pktPackEvery(); {
-	case pk.rxSince == every:
-		s.bumpNowLocked()
+	case pk.rxSince%every == 0:
+		if pk.rxSince == every {
+			s.bumpNowLocked()
+		}
+		if now := time.Now(); now.After(st.lastData) {
+			st.lastData = now
+		}
 	case pk.rxSince < every && st.ackDelayAt.IsZero():
 		now := time.Now()
 		st.ackDelayAt = now.Add(s.pktPing())

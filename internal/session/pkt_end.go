@@ -132,11 +132,13 @@ func (s *Session) pktDeliverFinLocked() {
 
 // pktReleaseLocked is pktEndLocked: every ring released (a datagram a
 // ReadFrom detached holds its own reference), the still-queued tx
-// datagrams counted DropQueue, both waiters woken.
+// datagrams counted DropQueue and the still-queued rx datagrams, which the
+// application never read, DropRecvQueue (after the end nothing is queued:
+// Received = returned + DropRecvQueue, §A7.2), both waiters woken.
 func (s *Session) pktReleaseLocked() {
 	st, pk := &s.st, s.pk
 	pk.ctr.DropQueue += uint64(pk.tx.releaseAll() + pk.txBig.releaseAll())
-	pk.rx.releaseAll()
+	pk.ctr.DropRecvQueue += uint64(pk.rx.releaseAll())
 	pk.stale = nil
 	if st.rwaiting {
 		streamSignal(st.rwake)
