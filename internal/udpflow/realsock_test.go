@@ -38,6 +38,11 @@ type realSource struct {
 
 func newRealSource(t *testing.T, maxDatagram int) *realSource {
 	t.Helper()
+	return newRealSourceEnv(t, maxDatagram, testEnv(1<<30), Limits{})
+}
+
+func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits) *realSource {
+	t.Helper()
 	u, err := net.ListenUDP("udp4", loopback4())
 	if err != nil {
 		t.Fatal(err)
@@ -47,9 +52,9 @@ func newRealSource(t *testing.T, maxDatagram int) *realSource {
 		u.Close()
 		t.Fatal(err)
 	}
-	rs := &realSource{t: t, env: testEnv(1 << 30), u: u, cl: cl, admitted: make(chan *Flow, 16),
+	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 16),
 		dst: u.LocalAddr().(*net.UDPAddr).AddrPort()}
-	rs.s = NewSource(rs.env, carrier.NewOwnedUDPSocket(u, maxDatagram), Limits{})
+	rs.s = NewSource(rs.env, carrier.NewOwnedUDPSocket(u, maxDatagram), lim)
 	go rs.s.Run(func(f *Flow) {
 		rs.mu.Lock()
 		rs.all = append(rs.all, f)
@@ -215,4 +220,120 @@ func TestFlowOwnedSocketEmpties_L58(t *testing.T) {
 	if st := rs.s.Stats(); st.ReadErrors != 0 || st.Flows != 1 {
 		t.Fatalf("Stats %+v", st)
 	}
+}
+
+// waitFor polls cond every millisecond for at most realWait.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(realWait)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within %v", what, realWait)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestFlowOwnedSocketCharge (R-C3-2; plan:774): the read buffer of rendr's
+// own socket is charged to nothing while the source waits — an idle source
+// whose reader runs (it read and dropped junk) holds 0 bytes in the Budget
+// and in Stages — and a datagram read into it is charged to the Budget from
+// the moment it is queued for a flow until the flow's reader releases it.
+// When the Budget refuses that charge, a datagram without a DGRAM still
+// reaches its flow through the control reserve (Stages, L16) and a DGRAM is
+// dropped as an inbox drop; nothing stays charged. When the flow's inbox is
+// full, the read buffer the Budget took (TryCharge) is returned uncharged
+// for the next read: after the overflow and the drain, the idle source
+// again holds 0 bytes.
+func TestFlowOwnedSocketCharge(t *testing.T) {
+	t.Run("budget", func(t *testing.T) {
+		rs := newRealSource(t, 1232)
+		used := func() int64 { return rs.env.Budget.Used() + rs.env.Stages.Used() }
+		rs.send([]byte("junk"))
+		waitFor(t, "the junk datagram's drop", func() bool { return rs.s.Stats().Dropped == 1 })
+		if u := used(); u != 0 {
+			t.Fatalf("an idle source whose reader runs: %d bytes charged, want 0", u)
+		}
+		const id = 0x77
+		rs.send(h1(id, wire.TypeOpen, 1))
+		f := rs.flow()
+		if rs.env.Budget.Used() == 0 {
+			t.Fatal("the H1 queued in its flow's inbox is charged to no Budget")
+		}
+		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) == 0 {
+			t.Fatalf("H1: event %d", ev)
+		}
+		f.Admitted()
+		for i := range 3 {
+			rs.send(dg(id, dgramFrame(uint32(2+i), 900)))
+			waitFor(t, "the DGRAM's charge", func() bool { return rs.env.Budget.Used() > 0 })
+			if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) < 900 {
+				t.Fatalf("DGRAM %d: event %d, %d bytes", i, ev, len(b))
+			}
+			if u := used(); u != 0 {
+				t.Fatalf("after reading DGRAM %d: %d bytes charged, want 0", i, u)
+			}
+		}
+		if st := rs.s.Stats(); st.InboxDrops != 0 || st.Flows != 1 {
+			t.Fatalf("Stats %+v", st)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		rs := newRealSourceEnv(t, 1232, testEnv(0), Limits{}) // the Budget refuses every buffer
+		const id = 0x78
+		rs.send(h1(id, wire.TypeOpen, 1))
+		f := rs.flow()
+		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) == 0 {
+			t.Fatalf("H1 under memory pressure: event %d", ev)
+		}
+		rs.send(dg(id, dgramFrame(2, 100))) // dropped: carries a DGRAM
+		rs.send(dg(id, pingFrame(3)))
+		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || wire.Type(b[0]) != wire.TypePing {
+			t.Fatalf("got %s (event %d), want the PING through the control reserve", wire.Type(b[0]), ev)
+		}
+		if st := rs.s.Stats(); st.InboxDrops != 1 {
+			t.Fatalf("Stats %+v, want 1 inbox drop (the DGRAM)", st)
+		}
+		if b, s := rs.env.Budget.Used(), rs.env.Stages.Used(); b != 0 || s != 0 {
+			t.Fatalf("charged: Budget %d, Stages %d, want 0 and 0", b, s)
+		}
+	})
+	t.Run("overflow", func(t *testing.T) {
+		rs := newRealSourceEnv(t, 1232, testEnv(1<<30), Limits{Inbox: 2})
+		used := func() int64 { return rs.env.Budget.Used() + rs.env.Stages.Used() }
+		const id = 0x79
+		rs.send(h1(id, wire.TypeOpen, 1))
+		f := rs.flow()
+		if _, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK {
+			t.Fatalf("H1: event %d", ev)
+		}
+		f.Admitted()
+		const sent, inbox = 6, 2
+		for i := range sent { // nobody reads: the inbox overflows
+			rs.send(dg(id, dgramFrame(uint32(2+i), 900)))
+		}
+		waitFor(t, "the overflow's inbox drops", func() bool { return rs.s.Stats().InboxDrops == sent-inbox })
+		if rs.env.Budget.Used() == 0 {
+			t.Fatal("stimulus: the queued DGRAMs are charged to no Budget")
+		}
+		for i := range inbox {
+			if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) < 900 {
+				t.Fatalf("queued DGRAM %d: event %d, %d bytes", i, ev, len(b))
+			}
+		}
+		if u := used(); u != 0 {
+			t.Fatalf("after the overflow and the drain: %d bytes charged (Budget %d, Stages %d), want 0",
+				u, rs.env.Budget.Used(), rs.env.Stages.Used())
+		}
+		rs.send(dg(id, dgramFrame(uint32(2+sent), 900))) // the read buffer works on
+		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) < 900 {
+			t.Fatalf("a DGRAM after the overflow: event %d, %d bytes", ev, len(b))
+		}
+		if u := used(); u != 0 {
+			t.Fatalf("after the last DGRAM: %d bytes charged, want 0", u)
+		}
+		if st := rs.s.Stats(); st.InboxDrops != sent-inbox || st.Flows != 1 {
+			t.Fatalf("Stats %+v", st)
+		}
+	})
 }

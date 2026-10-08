@@ -45,6 +45,10 @@ type dgChallenge struct {
 
 	pong    wire.Ping // the PING with id 0 to answer (challenge-PONG slot)
 	pongDue bool
+
+	// check is the nonce of the address check H2 carried on a passive
+	// OPEN flow (SourceChecker; 0: none, or answered already).
+	check uint64
 }
 
 // Rebind challenge limits (M2-D27, M2 design §A7.4).
@@ -208,15 +212,42 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time) {
 		c.mu.Unlock()
 		return // the oldest of the latest chalCommitsMax commits is within the minute
 	}
-	var nb [8]byte
-	nonce := uint64(0)
-	for nonce == 0 {
-		_, _ = rand.Read(nb[:]) // crypto/rand never fails
-		nonce = binary.LittleEndian.Uint64(nb[:])
-	}
-	ch.active, ch.cand, ch.nonce, ch.at, ch.sentAt, ch.sends, ch.last = true, src, nonce, now, time.Time{}, 0, now
+	ch.active, ch.cand, ch.nonce, ch.at, ch.sentAt, ch.sends, ch.last = true, src, newNonce(), now, time.Time{}, 0, now
 	c.mu.Unlock()
 	c.Wake()
+}
+
+// newNonce returns a challenge nonce (≠ 0) from crypto/rand.
+func newNonce() uint64 {
+	var nb [8]byte
+	for {
+		_, _ = rand.Read(nb[:]) // crypto/rand never fails
+		if n := binary.LittleEndian.Uint64(nb[:]); n != 0 {
+			return n
+		}
+	}
+}
+
+// sourceChecked reports whether p, a PONG with id 0 from the current peer,
+// answers the address check of this passive OPEN flow (SourceChecker): the
+// nonce H2 carried. The first answer proves the source to the transport
+// (SourceProven, outside Conn.mu); the check is then spent, and any later
+// PONG with id 0 goes to the rebind challenge (onChallengePong).
+func (c *Conn) sourceChecked(p *wire.Ping) bool {
+	c.mu.Lock()
+	ch := &c.dg.chal
+	ok := ch.check != 0 && p.Nonce == ch.check
+	if ok {
+		ch.check = 0
+	}
+	c.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if sc, is := c.dg.io.(SourceChecker); is {
+		sc.SourceProven()
+	}
+	return true
 }
 
 // onChallengePong checks a PONG with id 0 from src at now (M2-D27): it

@@ -27,7 +27,7 @@ type dgHandshake struct {
 	repeatH2 bool
 
 	pre []byte // (I) passive: the 40 PREFACE bytes of the accepted H1
-	h2b []byte // (I) passive: the stored H2 rendr bytes, repeated verbatim
+	h2b []byte // (I) passive: the stored H2 rendr bytes, repeated verbatim (an unanswered address check at a fresh fseq)
 	ack []byte // (I) dialer: the 40 PREFACE_ACK bytes the handshake read
 }
 
@@ -38,8 +38,11 @@ func (h *dgHandshake) dupH1(rendr []byte) bool {
 	return h.pre != nil && len(rendr) >= wire.PrefaceLen && bytes.Equal(rendr[:wire.PrefaceLen], h.pre)
 }
 
-// h2 returns the stored H2 rendr bytes (PREFACE_ACK ‖ RACK{FirstCseq}, or
-// ‖ PONG for a probe) that the writer repeats verbatim; nil on a dialer.
+// h2 returns the stored H2 rendr bytes (PREFACE_ACK ‖ RACK{FirstCseq}, ‖
+// the address check PING{id 0} of an OPEN on a SourceChecker transport, or
+// ‖ PONG for a probe) that the writer repeats verbatim — except that while
+// the address check is unanswered its PING goes at a fresh fseq
+// (dgWriteBatch); nil on a dialer.
 func (h *dgHandshake) h2() []byte {
 	return h.h2b
 }
@@ -217,7 +220,9 @@ func (c *Conn) dgHandshakeWritten(err error) error {
 // H2 = PREFACE_ACK(OK) ‖ RACK{FirstCseq} (a probe: PREFACE_ACK(OK) ‖ PONG),
 // keeps it for duplicates and returns the unstarted Conn with the Hello
 // fields of ReadHello (MetaTooLarge for an OPEN whose metadata exceeds
-// maxMeta). Every failure closes io exactly once.
+// maxMeta). On a SourceChecker transport the H2 of an OPEN also carries
+// the address check, PING{id 0, nonce} (see SourceChecker). Every failure
+// closes io exactly once.
 //
 // Further contracts of this implementation: the OPEN or JOIN payload is
 // handed over as received (a copy; its fields are judged by the admission,
@@ -372,14 +377,22 @@ func readHelloDatagram(env *Env, k *closeOnce, io PacketIO, b []byte, deadline t
 
 // acceptH1 answers the complete valid H1 d with H2 and builds the unstarted
 // passive Conn (R1-3's start values, the window past the H1 frame, the
-// stored PREFACE and H2).
+// stored PREFACE and H2). The H2 of an OPEN on a SourceChecker transport
+// also carries the address check: PREFACE_ACK(OK) ‖ RACK{FirstCseq} ‖
+// PING{id 0, a fresh nonce} at the next fseq; an H2 repeat while the check
+// is unanswered carries it again at a fresh fseq (dgWriteBatch).
 func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 	probe := h.first.Type == wire.TypePing
+	var check uint64
+	if _, ok := io.(SourceChecker); ok && h.first.Type == wire.TypeOpen && !h.meta {
+		check = newNonce()
+	}
 	var ab [wire.PrefaceLen]byte
 	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Instance: env.Local, CarrierID: h.pf.CarrierID})
 	afirst := env.Presets.fseqFrom(ab[:])
-	h2 := append(make([]byte, 0, wire.PrefaceLen+wire.FrameOverhead+wire.PingFixedLen), ab[:]...)
+	h2 := append(make([]byte, 0, wire.PrefaceLen+2*wire.FrameOverhead+wire.RackLen+wire.PingFixedLen), ab[:]...)
 	fcs := env.Presets.firstCseq()
+	next := afirst + 1 // the fseq of our next frame
 	if probe {
 		var pp [wire.PingFixedLen]byte
 		wire.PutPing(pp[:], &h.ping) // the PONG echoes the PING (pad 0)
@@ -388,11 +401,18 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		var rk [wire.RackLen]byte
 		wire.PutRack(rk[:], &wire.Rack{CumAck: fcs})
 		h2 = wire.AppendFrame(h2, wire.Header{Type: wire.TypeRack, Fseq: afirst}, rk[:])
+		if check != 0 {
+			var pp [wire.PingFixedLen]byte
+			wire.PutPing(pp[:], &wire.Ping{Nonce: check}) // id 0: answered at once by Establish (R1-14 (4))
+			h2 = wire.AppendFrame(h2, wire.Header{Type: wire.TypePing, Fseq: next}, pp[:])
+			next++
+		}
 	}
 	c := newDatagramConn(env, io, h.pf.CarrierID, h.pf.Instance, -1, "", false)
 	dg := c.dg
 	dg.hs.pre = bytes.Clone(d[:wire.PrefaceLen])
 	dg.hs.h2b = h2
+	dg.chal.check = check
 	dg.rwin.Init(h.first.Fseq)
 	dg.rwin.Accept(h.first.Fseq)
 	dg.rel.initSend(fcs) // our first REL is H3 (or a verdict)
@@ -408,7 +428,7 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		// 64 KiB transport, and still recognises the duplicate.
 		io.SetLimit(max(len(d), wire.MinFrameBudget))
 	}
-	c.wr.fseq = afirst + 1
+	c.wr.fseq = next
 	c.rd.fseq = h.first.Fseq + 1
 
 	hr := io.Headroom()

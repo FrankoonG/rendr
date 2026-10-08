@@ -100,6 +100,32 @@ type PacketIO interface {
 	Limit() int
 }
 
+// SourceChecker is implemented by a passive PacketIO that counts against
+// an admission quota of its source address until a verdict was written for
+// it (a udpflow.Flow and its source IP's admitting quota, M2-D59): the
+// datagram handshake then checks the source of an OPEN — H2 carries an
+// address check, a PING with id 0 and a fresh nonce, which the dialer's
+// Establish answers at once with a PONG of that nonce through its socket
+// (R1-14 (4)) — and the carrier's reader calls SourceProven when that
+// answer arrives from the transport's current peer. A proven source
+// receives the passive's datagrams, so its flow leaves the quota while its
+// session waits for the application: pending sessions are bounded by the
+// Listener's AcceptBacklog instead, and the dialers of a NAT site that
+// share one address never starve each other (gold/G6-mixed-nat, E19). A
+// source that never reads the answers (a blind or spoofed flood) stays
+// counted; a sighted source that answers is bounded like a stream
+// listener's clients (AcceptBacklog, MaxSessions, MaxFlows), not by its
+// address's quota. The check travels only inside H2 — once per H1 or
+// duplicate H1, never on a timer (no amplification); a repeat while it is
+// unanswered carries it at a fresh fseq, so the dialer's keepalive copies
+// of H1 (every RelRTOMax until Handshake.Timeout) give a lost answer more
+// chances — and a flow whose answers are all lost stays counted until its
+// verdict or removal. Only the carrier's reader calls SourceProven, at
+// most once.
+type SourceChecker interface {
+	SourceProven()
+}
+
 // ReadEvent classifies a datagram ReadDatagram did not hand over as an
 // ordinary datagram of the current peer (M2-D15).
 type ReadEvent uint8

@@ -275,7 +275,8 @@ func typesOf(ds []tapDgram) [][]wire.Type {
 	return out
 }
 
-// refusedBadRequest reports whether ds holds an H2 (a PREFACE_ACK) and an
+// refusedBadRequest reports whether ds holds an H2 (a PREFACE_ACK, with
+// the OPEN's address check) and an
 // OPEN_ACK with status BAD_REQUEST, and nothing but repeats of those.
 func refusedBadRequest(ds []tapDgram) bool {
 	h2, refused := false, false
@@ -286,6 +287,7 @@ func refusedBadRequest(ds []tapDgram) bool {
 		for _, f := range d.frames {
 			switch {
 			case f.typ == wire.TypeRack:
+			case f.typ == wire.TypePing && f.id == 0 && d.preface: // H2's address check of an OPEN (R-C3-1)
 			case f.typ == wire.TypeRel && f.inner == wire.TypeOpenAck:
 				a, err := wire.ParseOpenAck(f.body)
 				if err != nil || a.Status != wire.StatusBadRequest {

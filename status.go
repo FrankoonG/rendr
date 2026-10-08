@@ -12,9 +12,17 @@ type Status struct {
 	Sessionless        int    // probe carriers held by this (passive) Runtime
 
 	// BufferedBytes is the use of the MaxBufferedBytes budget (send,
-	// receive and write buffers) plus the carrier reader stages (about
-	// 16 KiB per live carrier). It is 0 after Runtime.Close, except for
-	// buffers still held by calls stuck in embedder code (Abandoned).
+	// receive and write buffers, and the datagrams queued for raw-UDP
+	// flows) plus the carrier reader stages (about 16 KiB per live stream
+	// carrier, the datagram classes of a datagram carrier, and a raw-UDP
+	// flow's control reserve while it holds datagrams). The read buffer a
+	// FromPacketConn source keeps for its socket (one datagram buffer per
+	// source, at most 64 KiB) holds no data while it waits and is not
+	// counted; a datagram read into it counts once it is queued for a
+	// flow. So it is 0 with no session and no carrier, also while
+	// Listeners with FromPacketConn sources are open (plan:774), and
+	// after Runtime.Close, except for buffers still held by calls stuck in
+	// embedder code (Abandoned).
 	BufferedBytes int64
 
 	Abandoned         int      // goroutines still stuck in embedder calls past their bound (see Runtime.Close)
@@ -30,7 +38,7 @@ type Status struct {
 type DatagramStatus struct {
 	Sources    int    // live FromPacketConn sources
 	Flows      int    // live raw-UDP flows, admitting ones included (bounded, see FromPacketConn)
-	Admitting  int    // flows before a positive verdict was written for them (≤ 32 per source IP address)
+	Admitting  int    // flows counted against their source IP address's quotas (≤ 32 OPEN and ≤ 32 JOIN or probe flows per address): from the first datagram until a positive verdict was written for them, their dialer answered an OPEN's address check, or their removal; a source that answers the check is bounded by AcceptBacklog, MaxSessions and Flows instead (see FromPacketConn)
 	Dropped    uint64 // datagrams and frames dropped: malformed, unknown flow, foreign source, duplicate or out-of-window frames, quota, truncated
 	Truncated  uint64 // of Dropped: truncated or oversize datagrams
 	InboxDrops uint64 // datagrams a full flow inbox dropped

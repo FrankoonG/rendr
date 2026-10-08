@@ -230,11 +230,14 @@ func TestPacketSelectorNoGaugeE2E(t *testing.T) {
 	})
 }
 
-// TestPacketAdmittingReleasedE2E_L48 (M2-D59; the WP8 review's surviving
-// mutants): a packet session's raw-UDP flow counts against its source's
-// admitting quota until Confirm writes its OPEN_ACK(OK) — through
-// Registry.Opened, not a direct call — and a bond member's JOIN flow
-// leaves the quota at once; with every carrier attached Admitting is 0.
+// TestPacketAdmittingReleasedE2E_L48 (M2-D59 as amended by R-C3-1; the
+// WP8 review's surviving mutants): a packet session's raw-UDP OPEN flow
+// leaves its source's admitting quota once rendr's dialer answered the
+// address check of its H2 — while the session is still pending, so a
+// pending session holds a backlog slot, not the quota (an unanswered
+// check keeps it counted until Confirm: TestListenerCloseKeepsFlows_L50,
+// TestPacketSourceCheck_E19) — and a bond member's JOIN flow leaves the
+// quota at once; with every carrier attached Admitting is 0.
 func TestPacketAdmittingReleasedE2E_L48(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := peNewHub(t, Config{}, ListenConfig{}, nil)
@@ -244,8 +247,9 @@ func TestPacketAdmittingReleasedE2E_L48(t *testing.T) {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if a := h.p.Status().Datagram.Admitting; a < 1 {
-			t.Fatalf("a pending session's OPEN flow: Admitting %d, want ≥ 1", a)
+		if st := h.p.Status(); st.Datagram.Admitting != 0 || st.Datagram.Flows < 1 || st.AcceptBacklog[1] != 1 {
+			t.Fatalf("a pending session whose dialer answered the address check: Admitting %d (want 0), flows %d, packet backlog %d (want 1)",
+				st.Datagram.Admitting, st.Datagram.Flows, st.AcceptBacklog[1])
 		}
 		pc, err := pp.Confirm()
 		if err != nil {
