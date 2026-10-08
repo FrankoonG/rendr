@@ -70,7 +70,8 @@ func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.Applic
 		}
 	}
 	d.max.Store(int64(limit))
-	d.in.ring, d.in.max, d.in.wake, d.out.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1), make(chan struct{}, 1)
+	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1)
+	d.out.wake = make(chan struct{}, 1)
 	if first != nil {
 		d.in.push(first) // the datagram that classified the connection comes first
 	}
@@ -144,10 +145,8 @@ func (d *dgramConn) send() {
 			q.mu.Unlock()
 			return
 		}
-		s := &q.slots[q.head]
-		cur, s.b = s.b, nil
-		at := s.at
-		q.head, q.n, q.bytes = (q.head+1)%egressMax, q.n-1, q.bytes-len(cur)
+		at := q.slot(0).at
+		cur = q.pop()
 		q.mu.Unlock()
 		if time.Since(at) > egressAge {
 			d.drops(true, 1)
@@ -181,7 +180,8 @@ func (d *dgramConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // WriteTo queues a copy of p and returns at once (R1-9), dropping the
-// oldest queued datagram when the queue is full. A datagram above the
+// queued datagrams older than egressAge and, when the queue is still full,
+// the oldest. A datagram above the
 // connection's DATAGRAM limit is refused with a rendr.DatagramTooLargeError;
 // an earlier datagram's error is returned instead of queueing p.
 func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -202,15 +202,10 @@ func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		return 0, &rendr.DatagramTooLargeError{Max: int(d.max.Load())}
 	}
 	var dropped uint64
-	for ; q.n > 0 && (q.n == egressMax || q.bytes+len(p) > egressBytes); dropped++ {
-		s := &q.slots[q.head]
-		q.bytes -= len(s.b)
-		q.give(s.b)
-		s.b, q.head, q.n = nil, (q.head+1)%egressMax, q.n-1
+	for ; q.n > 0 && (q.n == egressMax || q.bytes+len(p) > egressBytes || now.Sub(q.slot(0).at) > egressAge); dropped++ {
+		q.give(q.pop())
 	}
-	s := &q.slots[(q.head+q.n)%egressMax]
-	s.b, s.at = append(q.take(), p...), now
-	q.n, q.bytes = q.n+1, q.bytes+len(p)
+	q.push(append(q.take(), p...), now)
 	q.mu.Unlock()
 	signal(q.wake)
 	if dropped > 0 {
@@ -264,16 +259,14 @@ func signal(c chan struct{}) {
 	}
 }
 
-// egress is a connection's bounded send queue (R1-9). A slot holds a
-// buffer only while its datagram is queued; up to egressSpare released
-// buffers are kept for reuse, so a steady state copies without allocating
-// and an idle queue keeps little memory.
+// egress is a connection's bounded send queue (R1-9): a ring that grows to
+// egressMax slots and is released when drained, like the ingress ring. A
+// slot holds a buffer only while its datagram is queued; up to egressSpare
+// released buffers are kept for reuse, so a steady state copies without
+// allocating and an idle queue keeps little memory.
 type egress struct {
-	mu    sync.Mutex
-	slots [egressMax]struct {
-		b  []byte
-		at time.Time
-	}
+	mu             sync.Mutex
+	ring           []egressSlot
 	head, n, bytes int
 	spare          [egressSpare][]byte
 	nspare         int
@@ -281,6 +274,40 @@ type egress struct {
 	err            error // for the next WriteTo; kept when fatal
 	fatal, closed  bool
 	wake           chan struct{}
+}
+
+type egressSlot struct {
+	b  []byte
+	at time.Time // when WriteTo queued it
+}
+
+// slot returns the k-th queued slot, oldest first (k < q.n).
+func (q *egress) slot(k int) *egressSlot { return &q.ring[(q.head+k)%len(q.ring)] }
+
+// push queues b, growing the ring (q.n < egressMax).
+func (q *egress) push(b []byte, at time.Time) {
+	if q.n == len(q.ring) {
+		r := make([]egressSlot, max(2*q.n, egressInit))
+		for i := range q.n {
+			r[i] = *q.slot(i)
+		}
+		q.ring, q.head = r, 0
+	}
+	*q.slot(q.n) = egressSlot{b, at}
+	q.n, q.bytes = q.n+1, q.bytes+len(b)
+}
+
+// pop removes and returns the oldest datagram (q.n > 0); a drained ring
+// above 4·egressInit slots is released.
+func (q *egress) pop() []byte {
+	s := q.slot(0)
+	b := s.b
+	*s = egressSlot{}
+	q.head, q.n, q.bytes = (q.head+1)%len(q.ring), q.n-1, q.bytes-len(b)
+	if q.n == 0 && len(q.ring) > 4*egressInit {
+		q.ring, q.head = nil, 0
+	}
+	return b
 }
 
 // take returns a released buffer, emptied, or nil (append allocates).

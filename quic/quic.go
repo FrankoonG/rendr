@@ -85,10 +85,11 @@ type Options struct {
 type Counters struct {
 	// IngressDrops: received DATAGRAMs a full ingress queue dropped (L46).
 	IngressDrops atomic.Uint64
-	// EgressDrops: DATAGRAMs the egress queue dropped — the oldest when it
-	// was full (256 datagrams or 512 KiB), or one older than 250 ms when its
-	// turn came: QUIC's congestion control sends slower than rendr writes,
-	// and a datagram carrier's WriteTo never blocks on it.
+	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
+	// 250 ms (when its turn came, or when a newer one was queued), or the
+	// oldest when the queue was full (4096 datagrams or 4 MiB): QUIC's
+	// congestion control sends slower than rendr writes, and a datagram
+	// carrier's WriteTo never blocks on it.
 	EgressDrops atomic.Uint64
 }
 

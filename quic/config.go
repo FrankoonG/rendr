@@ -27,10 +27,17 @@ const (
 const (
 	ingressMax  = 2048 // datagrams in one ingress queue (L46)
 	ingressInit = 16   // its first ring; a drained ring above 4·ingressInit is released
-	egressMax   = 256  // datagrams in one egress queue (R1-9)
-	egressBytes = 512 << 10
+	// The egress queue (R1-9) holds egressAge of a 10-kpps flow of
+	// 1000-byte datagrams (R-F2: quic-go's window-limited phases after a
+	// congestion cut); WriteTo drops a head older than egressAge, so a
+	// stalled sender holds at most egressAge of the writer's rate. Memory
+	// per carrier while backlogged: at most 4 MiB of datagrams and a
+	// 4096-slot ring (192 KiB), both released when the queue drains.
+	egressMax   = 4096 // datagrams in one egress queue
+	egressBytes = 4 << 20
 	egressAge   = 250 * time.Millisecond
-	egressSpare = 8 // released egress buffers kept for reuse
+	egressInit  = 16 // its first ring; a drained ring above 4·egressInit is released
+	egressSpare = 8  // released egress buffers kept for reuse
 )
 
 var (
