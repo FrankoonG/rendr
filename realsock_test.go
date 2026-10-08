@@ -56,19 +56,25 @@ func TestUDPEndToEnd(t *testing.T) {
 // kill every 10 s (selector: the active carrier; bond: the members in
 // turn). It is a long real-time load, so -short skips it; the pool lanes
 // run it without -short.
+//
+// Under the race detector it runs 30 s per mode (two kills, 10 s apart:
+// in bond mode each member once) with the same criteria: the unit suite's
+// -race lane has a 5-minute wall-clock budget (plan §9.0) and a required
+// test must not skip there, while the 60-s timeline at full rate stays in
+// the non-race lanes.
 func TestPacketSmokeUDP60_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("60-s real-time smoke")
 	}
-	rate := 10000
+	rate, duration := 10000, 60*time.Second
 	if loopbackRace {
-		rate = 2000
+		rate, duration = 2000, 30*time.Second
 	}
 	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
-			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: 60 * time.Second, every: 10 * time.Second,
+			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
 				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
