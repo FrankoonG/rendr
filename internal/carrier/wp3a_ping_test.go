@@ -538,6 +538,63 @@ func TestRebindNonce_L59(t *testing.T) {
 	})
 }
 
+// TestRebindRefusedCommit_L59: an answered challenge whose commit the
+// transport refuses (SetPeer: the flow's candidate was replaced by a newer
+// source) is one counted drop and moves nothing; it does not use one of the
+// 10 commits per minute, so a later genuine move still commits within the
+// minute.
+func TestRebindRefusedCommit_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, false)
+		s.io.rebind = true
+		s.start(StartOptions{})
+		synctest.Wait()
+		p.read()
+		setRefuse := func(v bool) {
+			s.io.mu.Lock()
+			s.io.refuse = v
+			s.io.mu.Unlock()
+		}
+		id := uint32(10)
+		answered := 0
+		move := func(a byte) { // the peer moves to address a and answers the challenge from it
+			p.io.moveTo(fakeAddr(a))
+			id++
+			p.send(pingFrame(wire.TypePing, wire.Ping{ID: id, Nonce: 1}))
+			synctest.Wait()
+			answered += rebindAnswer(p)
+			synctest.Wait()
+		}
+		wait := func(d time.Duration) { // the peer keeps answering PINGs: the carrier lives
+			for end := time.Now().Add(d); time.Now().Before(end); {
+				time.Sleep(100 * time.Millisecond)
+				answered += rebindAnswer(p)
+			}
+		}
+		setRefuse(true)
+		d0 := s.c.Stats().Dropped
+		for i := range byte(10) {
+			move(40 + i)
+			p.io.moveTo(fakeAddr(2)) // refused: the peer keeps the carrier alive from the committed address
+			wait(1100 * time.Millisecond)
+		}
+		st := s.c.Stats()
+		if answered != 10 || st.Rebinds != 0 || s.io.cur != fakeAddr(2) || st.Dropped-d0 != 10 {
+			t.Fatalf("10 refused commits: %d challenges answered, rebinds %d, peer %v, %d dropped; want 10, 0, the old peer, 10",
+				answered, st.Rebinds, s.io.cur, st.Dropped-d0)
+		}
+		setRefuse(false)
+		move(60) // within the minute of the refusals
+		if st := s.c.Stats(); st.Rebinds != 1 || s.io.cur != fakeAddr(60) {
+			t.Fatalf("after 10 refused commits a genuine move: rebinds %d, peer %v; want 1 and the new address (the refusals used the commit limit)",
+				st.Rebinds, s.io.cur)
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead {
+			t.Fatalf("the carrier died: %v %s", cause, detail)
+		}
+	})
+}
+
 // TestChallengePongSlot: a PING with id 0 is answered through its own slot
 // (PONG id 0, same nonce), never displacing the regular latest-wins PONG.
 func TestChallengePongSlot(t *testing.T) {

@@ -19,10 +19,11 @@ import (
 //     address moves — the same carrier on both ends, Rebinds 1 (carrier and
 //     Runtime), no death, no migration, no dial. Up, nothing is lost; down,
 //     only what the passive wrote to the old address before the commit.
-//  2. The client's first 16 datagrams are replayed from foreign addresses:
-//     window duplicates (or a repeated H1, answered with the stored H2 to
-//     the current address); nothing is written to a replay's address and the
-//     reply address stays.
+//  2. The client's first 16 datagrams are replayed from foreign addresses,
+//     100 ms apart: window duplicates, each frame dropped and counted (or a
+//     repeated H1, answered with the stored H2 to the current address);
+//     no challenge is started, nothing is written to a replay's address and
+//     the reply address stays.
 //  3. A forged datagram — the flow's ID, a fresh fseq and a valid CRC, from
 //     a foreign address — makes the passive challenge that address. A
 //     forged answer — the challenge's nonce in a PONG with id 0 — from a
@@ -33,8 +34,9 @@ import (
 //     expires unanswered, the reply address stays and both flows go on
 //     without a loss.
 //  4. The carrier dies (its conn closed under rendr); the session continues
-//     on a new flow (losses only at the kill). The dead flow's H1 replayed while its ID is tombstoned
-//     is dropped without state (R1-11); replayed after the tombstone TTL it
+//     on a new flow (losses only at the kill). The dead flow's H1, replayed
+//     while its ID is tombstoned, is dropped without state (R1-11); replayed
+//     after the tombstone TTL it
 //     makes a flow whose OPEN is refused BAD_REQUEST (the carrier ID is one
 //     of the session's dead lanes) — no lane either way.
 func TestPacketNatRebind_L59(t *testing.T) {
@@ -79,23 +81,42 @@ func TestPacketNatRebind_L59(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		requireSameCarrier(t, w, dc, pc, dcar.ID, pcar.ID, 1)
 
-		// 2. Replays of the client's first datagrams, from foreign addresses.
+		// 2. Replays of the client's first datagrams, from foreign addresses,
+		// 100 ms apart: each replay is the flow's latest rebind candidate
+		// for longer than a challenge takes to be written, so a challenge a
+		// replay wrongly started would reach the tap (a burst would let the
+		// last replay's address refuse the earlier ones' challenges).
 		replayAt := time.Now()
 		dropped0, spoofed0 := carrierDropped(pc, pcar.ID), w.hub.Stats().Spoofed
 		for k := range 16 {
 			w.hub.Replay(0, k)
+			time.Sleep(100 * time.Millisecond)
 		}
 		time.Sleep(time.Second)
 		if s := w.hub.Stats(); s.Spoofed-spoofed0 != 16 {
 			t.Fatalf("stimulus: %d datagrams replayed, want 16", s.Spoofed-spoofed0)
 		}
-		if d := carrierDropped(pc, pcar.ID) - dropped0; d < 15 {
-			t.Fatalf("the passive carrier dropped %d replayed frames, want every frame of the 15 non-H1 replays", d)
+		reads, writes = w.tap.snapshot()
+		replayed, replayedFrames := 0, uint64(0)
+		for _, d := range reads {
+			if !d.at.Before(replayAt) && d.addr != newAddr {
+				replayed++
+				if !d.preface {
+					replayedFrames += uint64(len(d.frames))
+				}
+			}
 		}
-		_, writes = w.tap.snapshot()
+		if replayed != 16 {
+			t.Fatalf("stimulus: the passive read %d datagrams from foreign addresses, want the 16 replays", replayed)
+		}
+		// Each frame of the 15 non-H1 replays is a window duplicate, and
+		// nothing else is dropped: no challenge was started and refused.
+		if d := carrierDropped(pc, pcar.ID) - dropped0; d != replayedFrames {
+			t.Fatalf("the passive carrier dropped %d frames and datagrams, want exactly the %d frames of the 15 non-H1 replays", d, replayedFrames)
+		}
 		for _, d := range writesWith(writes, replayAt, func(tapDgram) bool { return true }) {
-			if d.addr != newAddr {
-				t.Fatalf("after the replays the passive wrote %v to %v (not the client's address %v)", d.types(), d.addr, newAddr)
+			if d.addr != newAddr || isChallenge(d) {
+				t.Fatalf("after the replays the passive wrote %v to %v (want only traffic to the client's address %v)", d.types(), d.addr, newAddr)
 			}
 		}
 		requireSameCarrier(t, w, dc, pc, dcar.ID, pcar.ID, 1)

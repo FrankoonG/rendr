@@ -40,6 +40,12 @@ const (
 //     after the flood and Close nothing is left.
 //
 // Every victim datagram is verified; losses only at the kill.
+//
+// The valid first datagrams are OPENs and JOINs 2:1 (FloodMix Preface 4,
+// Join 2), not B1.11's equal shares: this row is R1-21's OPEN flood from
+// the victim's own address, so it weights the OPENs that keep that
+// address's OPEN quota full, while the JOINs still fill the three foreign
+// JOIN quotas. B1.11 (the gold flood) keeps its equal shares.
 func TestPacketFlood_L58(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const owd = 5 * time.Millisecond

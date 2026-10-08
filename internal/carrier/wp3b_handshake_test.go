@@ -150,7 +150,7 @@ func TestDatagramHandshakeSchedule_PA13(t *testing.T) {
 			})
 		})
 	}
-	t.Run("a RACK stops the copies", func(t *testing.T) {
+	t.Run("a RACK ends retransmission; keepalive copies follow", func(t *testing.T) {
 		// H2's RACK covers H1's REL: its retransmission ends; while H3 is
 		// delayed by 4.5 s only keepalive copies follow, verbatim, every
 		// RelRTOMax after the RACK (integration 2, K5), and none counts as a

@@ -18,9 +18,9 @@ import (
 // active cadence (PacketActive, 10 s). Over the minute, every datagram
 // either end writes holds only PINGs and the PONGs that answer the peer's
 // PINGs — no PACK, REL, RACK or DGRAM — each end's PINGs are PingIdle
-// apart, and the carrier writers and session actors wake only for those
-// datagrams (no timer while idle: an armed REL or PACK timer would wake
-// them). The session then carries 50 datagrams each way intact.
+// apart, the carrier writers wake only for those datagrams and the session
+// actors do not wake (no timer while idle: an armed REL or PACK timer or an
+// actor deadline would wake them). The session then carries 50 datagrams each way intact.
 func TestIdlePacketSessionWrites(t *testing.T) {
 	runtime.SetBlockProfileRate(1) // before the goroutines whose waits are counted exist
 	defer runtime.SetBlockProfileRate(0)
@@ -87,10 +87,18 @@ func TestIdlePacketSessionWrites(t *testing.T) {
 				t.Fatalf("side %d: %d PONGs for the peer's %d PINGs", side, pongs[side], peer)
 			}
 		}
-		// Every wakeup of a writer or an actor is accounted for by a datagram
-		// written or read: a timer armed while idle would add one per expiry.
-		if limit := int64(2 * total); wr > limit || ac > limit {
-			t.Fatalf("wakeups in the idle minute: writers %d, actors %d; want ≤ %d (two per datagram on the wire)", wr, ac, limit)
+		// Every wakeup of a writer is accounted for by a datagram written or
+		// read: a timer armed while idle would add one per expiry.
+		if limit := int64(2 * total); wr > limit {
+			t.Fatalf("writer wakeups in the idle minute: %d; want ≤ %d (two per datagram on the wire)", wr, limit)
+		}
+		// The carriers answer and track idle PINGs and PONGs themselves; the
+		// session actors have nothing to do and no deadline to keep, so they
+		// do not wake at all (0 measured; the slack of 2 is for a scheduling
+		// straggler of the burst before the minute, not for a timer, which
+		// would wake each actor at least once per expiry).
+		if ac > 2 {
+			t.Fatalf("actor wakeups in the idle minute: %d; want ≤ 2 (an idle session's actors keep no timer)", ac)
 		}
 
 		burst(t, dc, pc, 3, 50, "after the idle minute: up")
