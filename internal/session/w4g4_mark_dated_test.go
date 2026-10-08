@@ -11,27 +11,20 @@ import (
 type g4Mark struct {
 	i      int
 	reason string
-	dated  bool      // MarkFailedAt (else MarkFailed)
 	at     time.Time // the failure time MarkFailedAt was given
 	called time.Time // when the call ran
 }
 
-// g4DatedHealth is acHealth that also offers the dated mark of
-// carrier.Health (datedMarker) and records every report.
+// g4DatedHealth is acHealth that records every dated mark report.
 type g4DatedHealth struct {
 	*acHealth
 	mu    sync.Mutex
 	marks []g4Mark
 }
 
-func (h *g4DatedHealth) MarkFailed(i int, reason string) {
-	h.record(g4Mark{i: i, reason: reason, called: time.Now()})
-	h.acHealth.MarkFailed(i, reason)
-}
-
 func (h *g4DatedHealth) MarkFailedAt(i int, reason string, at time.Time) {
-	h.record(g4Mark{i: i, reason: reason, dated: true, at: at, called: time.Now()})
-	h.acHealth.MarkFailed(i, reason)
+	h.record(g4Mark{i: i, reason: reason, at: at, called: time.Now()})
+	h.acHealth.MarkFailedAt(i, reason, at)
 }
 
 func (h *g4DatedHealth) record(m g4Mark) {
@@ -114,13 +107,13 @@ func TestActorDeathMarkDatedByDeath_MARKAT(t *testing.T) {
 			t.Fatalf("stimulus: p2's carrier %+v, want dead by a death cause at %v", dead, died)
 		}
 		m := h.of(1)[0]
-		if !m.dated || !m.at.Equal(died) || m.reason != dead.DeathCause.String() {
+		if !m.at.Equal(died) || m.reason != dead.DeathCause.String() {
 			t.Fatalf("p2's death reported as %+v, want dated %v (%s)", m, died, dead.DeathCause)
 		}
 		if m.called.Sub(died) < 50*time.Millisecond {
 			t.Fatalf("stimulus: the report ran %v after the death, want the 50 ms hold", m.called.Sub(died))
 		}
-		if pm := h.of(0); len(pm) == 0 || !pm[0].dated {
+		if pm := h.of(0); len(pm) == 0 || pm[0].at.IsZero() {
 			t.Fatalf("p1's death reported as %+v, want dated", pm)
 		}
 
