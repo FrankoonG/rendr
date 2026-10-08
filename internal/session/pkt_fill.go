@@ -23,6 +23,7 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 		return // C1: never place anything on a lane the actor declared dead
 	}
 	start := b.Len()
+	l.capMarked = false
 	if s.fillControlLocked(l, b) && l.data {
 		s.fillDgramLocked(l, b)
 		st, pk := &s.st, s.pk
@@ -103,6 +104,7 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 			}
 			if int64(n) > left {
 				b.MarkCapBlocked() // the PONG that frees capacity wakes the writer
+				l.capMarked = true
 				return placed
 			}
 			if pk.nextSeq >= limit {
@@ -359,8 +361,34 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			s.pktWakeDgramLocked()
 		}
 	}
-	if pk.txBig.n > 0 {
-		s.pktWalkLocked(pk.txBig.n, true, nil, 0, int(pk.txBig.front().n))
+	if pk.txBig.n > 0 && !s.pktWalkLocked(pk.txBig.n, true, nil, 0, int(pk.txBig.front().n)) {
+		s.pktWakeCappedLocked()
+	}
+}
+
+// pktWakeCappedLocked follows a txBig walk that found no stream member
+// able to place the head now: it wakes the first live stream data lane
+// that is idle, not write-blocked and not already marked cap-blocked by its
+// latest Fill (lane.capMarked). Its Fill places nothing beyond its capacity
+// and marks the batch cap-blocked, so the PONG that frees capacity wakes
+// its writer (M1's wake policy, and tx's fallback through
+// pktOtherCarrierLocked, wake such a lane too). Without it, a member whose
+// previous Fill had emptied txBig was woken by nothing when its capacity
+// freed, and the queued datagrams waited for a later WriteTo or aged out
+// (TestPacketCappedStreamLaneWoken_L32). A marked lane is not woken again:
+// one wake per capacity episode.
+func (s *Session) pktWakeCappedLocked() {
+	for _, l := range s.st.order {
+		if !l.data || l.state == LaneDead || l.capMarked || l.port.WriteBlocked() {
+			continue
+		}
+		if _, dg := pktDgramLane(l); !dg {
+			if l.idle {
+				l.idle = false
+				l.port.Wake()
+			}
+			return
+		}
 	}
 }
 

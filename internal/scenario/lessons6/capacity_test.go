@@ -64,7 +64,8 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 		}
 		for _, l := range up.losses() {
 			if time.Since(l.wrote) > time.Second {
-				t.Fatalf("before the stall seq %d, written %v ago, is missing", l.seq, time.Since(l.wrote))
+				t.Fatalf("before the stall seq %d (%d bytes), written %v ago, is missing; dialer %+v; passive %+v",
+					l.seq, size(l.seq), time.Since(l.wrote), *dc.Status().Packet, *pc.Status().Packet)
 			}
 		}
 
