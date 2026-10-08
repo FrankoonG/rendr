@@ -144,7 +144,11 @@ func (c *PacketConn) Done() <-chan struct{} { return c.s.Done() }
 // stream members carrying what the datagram members cannot), bounded by
 // both sides' Packet.MaxPayload. Metadata that no factory able to carry an
 // OPEN can carry is refused at once with ErrMetadataTooLarge (a datagram
-// factory carries at most its MTU − 99 bytes of metadata).
+// factory carries at most its MTU − 99 bytes of metadata). A carrier/udp
+// carrier clamped at its Dial to a smaller route MTU carries less than its
+// factory MTU: an OPEN that does not fit it fails that attempt, and when
+// every datagram factory returned such a carrier, a Dial that would end
+// with ErrNoPath (after NoPathGrace) ends with ErrMetadataTooLarge.
 func (p *Peer) DialPacket(ctx context.Context, o DialOptions) (*PacketConn, error) {
 	s, err := p.dial(ctx, o, true)
 	if err != nil {
