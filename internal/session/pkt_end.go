@@ -169,6 +169,26 @@ func (s *Session) pktAgeOutLocked(now time.Time) time.Time {
 	return next
 }
 
+// pktAgeBigLocked is the actor's ageing of a held txBig (pk.bigHeld,
+// C4-F2): no stream data lane pulls it until the awaited SCHED routes a
+// member, so its heads older than MaxAge are dropped here (DropAge: a data
+// lane exists, M2-D35) and the time the next one ages out is returned
+// (zero: none queued). Emptied here, txBig no longer holds the FIN back:
+// the wake policy runs.
+func (s *Session) pktAgeBigLocked(now time.Time) time.Time {
+	pk := s.pk
+	q := &pk.txBig
+	if q.n == 0 {
+		return time.Time{}
+	}
+	s.pktAgeQueueLocked(q, now.Sub(pk.base).Nanoseconds(), false)
+	if q.n == 0 {
+		s.pktWakeLocked(now)
+		return time.Time{}
+	}
+	return pk.base.Add(time.Duration(q.front().at) + s.pktMaxAge() + 1)
+}
+
 // pktPendingBytesLocked returns the bytes of the datagrams queued for
 // sending (pendingBytesLocked of a packet session, §A5.1).
 func (s *Session) pktPendingBytesLocked() uint64 {
