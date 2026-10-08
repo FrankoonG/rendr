@@ -88,7 +88,7 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 				continue
 			}
 			if dg && n > b.DgramRoom() {
-				if s.pktOtherCarrierLocked(l, n) {
+				if s.pktOtherCarrierLocked(l, n, false) {
 					return placed // that lane takes the head; nothing overtakes it here
 				}
 				q.evict()
@@ -154,38 +154,64 @@ func (s *Session) pktHasDataLaneLocked() bool {
 	return false
 }
 
-// pktOtherCarrierLocked reports whether a live data lane other than l can
-// carry an n-byte datagram now — a datagram data lane whose DgramMax is at
-// least n, else a stream data lane with spare capacity for it, either not
-// write-blocked — and wakes it (M2-D45). Datagram lanes come first, as in
-// the wake walk (§A5.2): a datagram that fits a datagram member never
-// moves to a stream member because a smaller datagram member pulled it
-// (integration 2; TestPacketCapacityAgreement_L37). It recomputes the
-// routing summary first, so two lanes never defer to each other. A capable member that
-// cannot write now does not hold the queue behind the head until MaxAge:
-// the head is dropped as too large instead (a budget shrink is rare; the
-// datagrams behind it are not held up).
-func (s *Session) pktOtherCarrierLocked(l *lane, n int) bool {
+// pktOtherCarrierLocked reports whether a live data lane other than l
+// (nil: any) can carry an n-byte datagram and wakes it (M2-D45). Datagram
+// lanes come first, as in the wake walk (§A5.2): a datagram that fits a
+// datagram member never moves to a stream member because a smaller
+// datagram member pulled it (integration 2;
+// TestPacketCapacityAgreement_L37). It recomputes the routing summary
+// first, so two lanes never defer to each other.
+//
+// With ever false (Fill) only a lane that can place the head now counts
+// (pktCanPlaceLocked: a datagram data lane whose DgramMax is at least n,
+// else a stream data lane with spare capacity for it, either not
+// write-blocked). A capable member that cannot write now does not hold the
+// queue behind the head until MaxAge: the head is dropped as too large
+// instead (a budget shrink is rare; the datagrams behind it are not held
+// up).
+//
+// With ever true (the wake policy's fallback decision) a lane that could
+// carry the head at all counts too — a datagram data lane whose DgramMax
+// is at least n, or a stream data lane, write-blocked or at its capacity:
+// the first that can place it now is woken, else the first that can carry
+// it. Waking a lane that cannot place now is harmless (a write-blocked
+// writer fills again when its write returns) and keeps a stream lane at
+// its capacity live: its Fill marks the batch cap-blocked, so the PONG
+// that frees capacity wakes it (TestPacketFallbackWriteBlocked_L08).
+func (s *Session) pktOtherCarrierLocked(l *lane, n int, ever bool) bool {
 	s.pktRouteLocked()
+	var capable *lane // the first lane that can carry the head, not now
 	for pass := range 2 {
 		for _, o := range s.st.order {
 			if o == l || !o.data || o.state == LaneDead {
 				continue
 			}
-			if _, dg := pktDgramLane(o); dg != (pass == 0) {
+			pp, dg := pktDgramLane(o)
+			if dg != (pass == 0) || (dg && pp.DgramMax() < n) {
 				continue
 			}
-			if !s.pktCanPlaceLocked(o, n) {
-				continue
+			if s.pktCanPlaceLocked(o, n) {
+				pktWakeIdle(o)
+				return true
 			}
-			if o.idle {
-				o.idle = false
-				o.port.Wake()
+			if capable == nil {
+				capable = o
 			}
-			return true
 		}
 	}
-	return false
+	if !ever || capable == nil {
+		return false
+	}
+	pktWakeIdle(capable)
+	return true
+}
+
+// pktWakeIdle wakes l when it is idle (a coalescing Wake).
+func pktWakeIdle(l *lane) {
+	if l.idle {
+		l.idle = false
+		l.port.Wake()
+	}
 }
 
 // pktBigPushedLocked follows WriteTo's push into txBig: the first datagram
@@ -299,13 +325,18 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			// member whose writer would drain it first.
 			counted, covered = sl, carrier.MaxBatchFrames
 		}
-		if covered < pk.tx.n && !s.pktWalkLocked(pk.tx.n, false, counted, covered, int(pk.tx.front().n)) {
-			// No live data lane can place the head now: it is larger than
-			// every datagram member's DgramMax and no stream member has room
-			// for it (a budget shrink, or a mixed bond whose stream members
-			// are gone). Wake a datagram member anyway: its Fill drops the
-			// head as DropTooLarge (M2-D45) and places what follows, instead
-			// of the head holding every datagram behind it until MaxAge.
+		if head := int(pk.tx.front().n); covered < pk.tx.n && !s.pktWalkLocked(pk.tx.n, false, counted, covered, head) &&
+			!s.pktOtherCarrierLocked(nil, head, true) {
+			// No live data lane can ever carry the head: it is larger than
+			// every datagram member's DgramMax and no stream member is left
+			// (a budget shrink, or a mixed bond whose stream members are
+			// gone). Wake a datagram member anyway: its Fill drops the head
+			// as DropTooLarge (M2-D45) and places what follows, instead of
+			// the head holding every datagram behind it until MaxAge. A
+			// member that can carry it but cannot place it now (write-
+			// blocked, at its capacity) was woken instead, and no smaller
+			// member is woken only to drop the head: it waits for that
+			// member (TestPacketFallbackWriteBlocked_L08).
 			s.pktWakeDgramLocked()
 		}
 	}
