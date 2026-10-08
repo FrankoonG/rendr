@@ -316,8 +316,8 @@ func relayPair(t *testing.T, perSec float64, ctr *Counters) (cli, srv *dgramConn
 func egressHeld(d *dgramConn) (slots, spares, n int) {
 	d.out.mu.Lock()
 	defer d.out.mu.Unlock()
-	for i := range d.out.slots {
-		if d.out.slots[i].b != nil {
+	for i := range d.out.ring {
+		if d.out.ring[i].b != nil {
 			slots++
 		}
 	}
@@ -389,22 +389,23 @@ func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 			}
 		}
 		eventually(t, "the sender is blocked", func() bool { _, _, n := egressHeld(cli); return n > 0 })
-		for i := 100; i < 400; i++ {
+		const total = egressMax + 300 // past the count bound (4096 buffers of 1024 B fit the byte bound; TestQUICDatagramEgressByteBound has that)
+		for i := 100; i < total; i++ {
 			if _, err := cli.WriteTo(seqDatagram(i, 1000), nil); err != nil {
 				t.Fatal(err)
 			}
 		}
 		// The queue holds the newest datagrams, oldest first: a run ending
-		// at seq 399 (the blocked sender may still take one from its head).
+		// at seq total-1 (the blocked sender may still take one from its head).
 		cli.out.mu.Lock()
 		n, seqs := cli.out.n, make([]int, 0, egressMax)
 		for k := range n {
-			seqs = append(seqs, int(binary.BigEndian.Uint32(cli.out.slots[(cli.out.head+k)%egressMax].b)))
+			seqs = append(seqs, int(binary.BigEndian.Uint32(cli.out.slot(k).b)))
 		}
 		cli.out.mu.Unlock()
 		for k, seq := range seqs {
-			if seq != 400-n+k {
-				t.Fatalf("the queue of %d holds seq %d..%d (seq %d at %d); want the newest, seq %d..399", n, seqs[0], seqs[n-1], seq, k, 400-n)
+			if seq != total-n+k {
+				t.Fatalf("the queue of %d holds seq %d..%d (seq %d at %d); want the newest, seq %d..%d", n, seqs[0], seqs[n-1], seq, k, total-n, total-1)
 			}
 		}
 		if n < egressMax/2 || ctr.EgressDrops.Load() == 0 {
