@@ -118,7 +118,8 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 // Peer's health layer itself for the session's lifetime. created reports
 // whether session.Dial created a session — then that session calls reg's
 // Ended exactly once, also when Dial failed (it withdraws in the
-// background). reg.fit, when not nil, records the carriers' frame budgets.
+// background). A packet session's datagram factories are wrapped for the
+// Dial (wrapDatagram).
 func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bool, reg *dialReg) (s *session.Session, created bool, err error) {
 	rt := p.rt
 	dctx, cancel := context.WithCancelCause(ctx)
@@ -133,8 +134,8 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	env.Registry = reg
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
-	if reg.fit != nil {
-		spec.Factories = reg.fit.wrap(spec.Factories)
+	if packet {
+		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, spec.Params.Mode == session.ModeBond))
 	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
@@ -200,21 +201,28 @@ func openCapable(fs []carrier.Factory, meta int) bool {
 // factory, the frame budget of the latest carrier each datagram factory
 // returned (W4 L3-1): a carrier/udp socket clamped at Dial to its interface
 // MTU carries less than its factory MTU — the budget openCapable checked —,
-// and an OPEN that does not fit it fails its attempt (ErrH1TooLarge). When
-// every datagram factory returned such a carrier too small for the OPEN, a
-// Dial that ends with ErrNoPath ends with ErrMetadataTooLarge instead. A
-// factory that never returned a carrier proves nothing: the Dial then keeps
-// ErrNoPath.
+// and an OPEN that does not fit it fails its attempt. When every datagram
+// factory returned such a carrier too small for the OPEN, a Dial that ends
+// with ErrNoPath ends with ErrMetadataTooLarge instead. A factory that
+// never returned a carrier proves nothing: the Dial then keeps ErrNoPath.
 type openFit struct {
 	budget []atomic.Int32 // per factory: 0 unknown, else min(MTU, transport limit)
 }
 
 func newOpenFit(n int) *openFit { return &openFit{budget: make([]atomic.Int32, n)} }
 
-// wrap returns a copy of fs whose datagram factories record the budget of
-// every rendr-owned UDP carrier they return (an embedder conn's budget is
-// its factory MTU, which openCapable already checked).
-func (f *openFit) wrap(fs []carrier.Factory) []carrier.Factory {
+// wrapDatagram returns, for one packet Dial, a copy of fs whose datagram
+// factories' DialPacket first marks the attempt's MaxPayload offer as the
+// datagram budgets' when fromBudgets (carrier.MarkBudgetOffer: the OPEN's
+// pmtu then follows a lower carrier budget, W4 L3-1), and records in fit,
+// when not nil, the budget of every rendr-owned UDP carrier it returns (an
+// embedder conn's budget is its factory MTU, which openCapable already
+// checked). It returns fs itself when there is nothing to do; the Peer's
+// snapshot is never changed.
+func wrapDatagram(fs []carrier.Factory, fit *openFit, fromBudgets bool) []carrier.Factory {
+	if fit == nil && !fromBudgets {
+		return fs
+	}
 	out := make([]carrier.Factory, len(fs))
 	copy(out, fs)
 	for i := range out {
@@ -222,10 +230,16 @@ func (f *openFit) wrap(fs []carrier.Factory) []carrier.Factory {
 		if out[i].Kind != wire.KindDatagram || dial == nil {
 			continue
 		}
-		b := &f.budget[i]
+		var b *atomic.Int32
+		if fit != nil {
+			b = &fit.budget[i]
+		}
 		out[i].DialPacket = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			if fromBudgets {
+				carrier.MarkBudgetOffer(ctx)
+			}
 			pc, a, err := dial(ctx)
-			if o, ok := pc.(*carrier.OwnedUDP); ok && o != nil && err == nil {
+			if o, ok := pc.(*carrier.OwnedUDP); ok && o != nil && err == nil && b != nil {
 				b.Store(int32(min(o.Limit(), mtu)))
 			}
 			return pc, a, err
@@ -250,22 +264,35 @@ func (f *openFit) tooSmall(meta int) bool {
 
 // packetOffer is a packet session's MaxPayload offer (M2-D49, M2 design
 // §A5.4): the smallest datagram payload budget (MTU − 25) over the Peer's
-// datagram factories when a selector session has one, or a bond session
-// has no stream factory to carry larger datagrams; else Packet.MaxPayload;
-// never more than Packet.MaxPayload (maxPayload).
+// datagram factories when the offer comes from them (offerFromBudgets);
+// else Packet.MaxPayload; never more than Packet.MaxPayload (maxPayload).
 func packetOffer(fs []carrier.Factory, bond bool, maxPayload int) int {
-	dg, hasDgram, hasStream := maxPayload, false, false
+	if !offerFromBudgets(fs, bond) {
+		return maxPayload
+	}
+	dg := maxPayload
 	for i := range fs {
 		if fs[i].Kind == wire.KindDatagram {
-			dg, hasDgram = min(dg, fs[i].MTU-wire.DgramOverhead), true
+			dg = min(dg, fs[i].MTU-wire.DgramOverhead)
+		}
+	}
+	return dg
+}
+
+// offerFromBudgets reports whether a packet session's MaxPayload offer
+// comes from the datagram factories' budgets (M2-D49): a selector session
+// on a Peer with a datagram factory, or a bond session without a stream
+// factory to carry larger datagrams.
+func offerFromBudgets(fs []carrier.Factory, bond bool) bool {
+	hasDgram, hasStream := false, false
+	for i := range fs {
+		if fs[i].Kind == wire.KindDatagram {
+			hasDgram = true
 		} else {
 			hasStream = true
 		}
 	}
-	if hasDgram && (!bond || !hasStream) {
-		return dg
-	}
-	return maxPayload
+	return hasDgram && (!bond || !hasStream)
 }
 
 // beginDial counts one more Dial inside session.Dial unless the Runtime is

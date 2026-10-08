@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/carrier/tcp"
 )
 
 // The factory MTU against the interface clamp (W4 L3-1; R1-16, M2-D49,
@@ -244,4 +247,138 @@ func TestUDPClampedAtDialOffer(t *testing.T) {
 	if el := time.Since(start); !errors.Is(err, rendr.ErrMetadataTooLarge) || errors.Is(err, rendr.ErrNoPath) || el > grace+2*time.Second {
 		t.Fatalf("DialPacket with 2000 bytes of metadata: %v after %v, want ErrMetadataTooLarge within NoPathGrace + 2 s", err, el)
 	}
+}
+
+// liveCarriers waits until c has n live carriers (a bounded wait on the
+// session's own state, not a timing assumption) and returns their MTUs.
+func liveCarriers(t *testing.T, side string, c *rendr.PacketConn, n int) []int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var mtus []int
+		for _, cs := range c.Status().Carriers {
+			if cs.DeathCause == rendr.CauseNone {
+				mtus = append(mtus, cs.MTU)
+			}
+		}
+		if len(mtus) == n {
+			return mtus
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d live carriers after 10 s, want %d: %+v", side, len(mtus), n, c.Status().Carriers)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestUDPClampedBondStreamOffer (wave-4 review G3): a bond session on a
+// Peer that has a stream factory offers its configured Packet.MaxPayload
+// (2,000 bytes) for the stream carriers to carry (M2-D49), also when its
+// OPEN goes out on a udp carrier clamped at Dial (factory MTU 3,991, socket
+// budget 1,463): only a session whose offer came from the datagram budgets
+// lowers the OPEN's pmtu to the carrier's budget. The stream factory's
+// Dial is held until the session opened, so the OPEN goes on the udp
+// carrier (stimulus: the passive's first carrier is the clamped udp one).
+// Both ends then fix MaxPayload 2,000; once the TCP carrier joined,
+// datagrams of 2,000 bytes go over it and arrive intact both ways, none
+// refused as too large (load and integrity).
+func TestUDPClampedBondStreamOffer(t *testing.T) {
+	defer wp5NoLeak(t)()
+	wp5Swap(t, &sysInterfaceTable, offerTable)
+	const maxPayload = 2000
+	d, err := rendr.NewRuntime(rendr.Config{Packet: rendr.PacketPolicy{MaxPayload: maxPayload}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	pr, err := rendr.NewRuntime(rendr.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	ls, err := Listen("udp4", "127.0.0.1:0", Options{MaxDatagram: 4000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl, err := tcp.Listen("tcp4", "127.0.0.1:0", tcp.Options{})
+	if err != nil {
+		ls.Close()
+		t.Fatal(err)
+	}
+	ln, err := pr.Listen(rendr.ListenConfig{Sources: []rendr.Source{rendr.FromPacketConn(ls), rendr.FromListener(tl)}}) // owns ls and tl
+	if err != nil {
+		ls.Close()
+		tl.Close()
+		t.Fatal(err)
+	}
+	u := Carrier("u", "udp4", ls.LocalAddr().String(), Options{MaxDatagram: 4000})
+	u.MTU = 4000 - flowHeaderLen // the factory budget Carrier reports when it cannot clamp in advance
+	opened := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(opened) }) }
+	defer release()
+	tc := tcp.Carrier("t", "tcp4", tl.Addr().String(), tcp.Options{})
+	tcpDial := tc.Dial
+	tc.Dial = func(ctx context.Context) (net.Conn, error) {
+		select { // held until the session opened on the udp carrier
+		case <-opened:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return tcpDial(ctx)
+	}
+	p, err := d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{u, tc}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type dialed struct {
+		c   *rendr.PacketConn
+		err error
+	}
+	ch := make(chan dialed, 1)
+	go func() {
+		c, err := p.DialPacket(wp5Ctx(t), rendr.DialOptions{Mode: rendr.ModeBond})
+		ch <- dialed{c, err}
+	}()
+	pp, err := ln.AcceptPacket(wp5Ctx(t))
+	if err != nil {
+		t.Fatalf("AcceptPacket: %v", err)
+	}
+	pc, err := pp.Confirm()
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	r := <-ch
+	if r.err != nil {
+		pc.Close()
+		t.Fatalf("DialPacket: %v", r.err)
+	}
+	dc := r.c
+	defer closePair(t, dc, pc)
+	for _, s := range []struct {
+		side string
+		c    *rendr.PacketConn
+	}{{"dialer", dc}, {"passive", pc}} {
+		var members []rendr.CarrierStatus
+		for _, cs := range s.c.Status().Carriers {
+			if cs.DeathCause == rendr.CauseNone && cs.State == rendr.CarrierMember {
+				members = append(members, cs)
+			}
+		}
+		if len(members) != 1 || members[0].Kind != rendr.KindDatagram || members[0].MTU != offerMTU-28-flowHeaderLen {
+			t.Fatalf("%s: member carriers %+v, want only the clamped udp carrier of MTU %d (stimulus)", s.side, members, offerMTU-28-flowHeaderLen)
+		}
+	}
+	release() // the TCP carrier may join now
+	for _, s := range []struct {
+		side string
+		c    *rendr.PacketConn
+	}{{"dialer", dc}, {"passive", pc}} {
+		if mp := s.c.MaxPayload(); mp != maxPayload {
+			t.Fatalf("%s: MaxPayload %d, want the configured %d (a bond session with a stream factory)", s.side, mp, maxPayload)
+		}
+		liveCarriers(t, s.side, s.c, 2)
+	}
+	exchangeMax(t, "dialer → passive", dc, pc, 8)
+	exchangeMax(t, "passive → dialer", pc, dc, 8)
 }

@@ -3,6 +3,7 @@ package carrier
 import (
 	"bytes"
 	"context"
+	"net"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -118,26 +119,82 @@ func TestEstablishH3BeforeH2_M2D20(t *testing.T) {
 	}
 }
 
-// TestOpenPmtu (W4 L3-1): a packet OPEN's MaxPayload offer that fits its
-// factory's budget (pmtu ≤ MTU − 25) is lowered to a carrier's lower cmtu
-// offer − 25; an offer above the factory budget (a bond session with a
-// stream factory meant larger datagrams for the stream carriers), one that
-// already fits the offer, an unknown factory MTU and a result below
-// MinPacketPayload keep it.
+// TestOpenPmtu (W4 L3-1): a marked packet OPEN's MaxPayload offer above
+// a carrier's cmtu offer − 25 is lowered to it; one that already fits the
+// offer, and a result below MinPacketPayload, keep it.
 func TestOpenPmtu(t *testing.T) {
-	for _, c := range []struct{ pmtu, mtu, offer, want int }{
-		{3966, 3991, 1463, 1438},
-		{2000, 3991, 1463, 1438},
-		{1438, 3991, 1463, -1},
-		{1000, 3991, 1463, -1},
-		{4000, 3991, 1463, -1},
-		{3966, 3991, 3991, -1},
-		{3966, 0, 1463, -1},
-		{1000, 3991, 536, -1},
-		{1000, 3991, 537, 512},
+	for _, c := range []struct{ pmtu, offer, want int }{
+		{3966, 1463, 1438},
+		{2000, 1463, 1438},
+		{1439, 1463, 1438},
+		{1438, 1463, -1},
+		{1000, 1463, -1},
+		{3966, 3991, -1},
+		{1000, 536, -1},
+		{1000, 537, 512},
 	} {
-		if got := openPmtu(c.pmtu, c.mtu, c.offer); got != c.want {
-			t.Errorf("openPmtu(%d, %d, %d) = %d, want %d", c.pmtu, c.mtu, c.offer, got, c.want)
+		if got := openPmtu(c.pmtu, c.offer); got != c.want {
+			t.Errorf("openPmtu(%d, %d) = %d, want %d", c.pmtu, c.offer, got, c.want)
 		}
+	}
+}
+
+// TestOpenPmtuMark (W4 L3-1, wave-4 review G3): the OPEN's pmtu follows a
+// lower carrier budget only when the factory marked the session's offer as
+// the datagram budgets' (MarkBudgetOffer, package rendr's packetOffer
+// rule). Unmarked — a bond session with a stream factory, whose offer is
+// Packet.MaxPayload for its stream carriers — the OPEN keeps the session's
+// pmtu. Stimulus: a packet OPEN of pmtu 1300 on a carrier of budget 1200,
+// marked and unmarked; integrity: the H1 that reaches the passive carries
+// the cmtu offer 1200, pmtu 1175 (marked) or 1300 (unmarked) and the rest
+// of the OPEN unchanged. A context without the mark's slot is left alone.
+func TestOpenPmtuMark(t *testing.T) {
+	MarkBudgetOffer(context.Background()) // no slot: nothing to mark, no panic
+	for _, tc := range []struct {
+		name string
+		mark bool
+		want uint16
+	}{{"unmarked", false, 1300}, {"marked", true, 1200 - wire.DgramOverhead}} {
+		t.Run(tc.name, func(t *testing.T) {
+			wbBubble(t, func(t *testing.T) {
+				r, raws := wbRawRig(t, 1200)
+				if tc.mark {
+					dial := r.f.DialPacket
+					r.f.DialPacket = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+						MarkBudgetOffer(ctx)
+						return dial(ctx)
+					}
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() {
+					_, err := r.establish(ctx, wire.TypeOpen, wbOpen(1300))
+					done <- err
+				}()
+				w := <-raws
+				h1 := w.waitN(t, 1)[0].b
+				cancel()
+				if err := <-done; err == nil {
+					t.Fatal("Establish without an answer succeeded")
+				}
+				f, _, err := wire.DecodeFrame(h1[wire.PrefaceLen:])
+				if err != nil || f.Type != wire.TypeRel {
+					t.Fatalf("H1 frame %v, %v: want a REL", f.Type, err)
+				}
+				_, inner, err := wire.ParseRel(f.Payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				o, err := wire.ParseOpen(inner, wire.MaxMetadata)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, _ := wire.ParseOpen(wbOpen(tc.want), wire.MaxMetadata)
+				want.Window = 1200
+				if o.SID != want.SID || o.Kind != want.Kind || o.Mode != want.Mode || o.RetainMs != want.RetainMs || o.Window != want.Window || o.PMTU != want.PMTU || len(o.Metadata) != 0 {
+					t.Errorf("OPEN in H1 %+v, want %+v", o, want)
+				}
+			})
+		})
 	}
 }

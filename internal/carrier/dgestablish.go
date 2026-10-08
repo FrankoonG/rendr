@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
@@ -23,12 +24,27 @@ import (
 // Errors of the datagram handshake.
 var (
 	errNoDialPacket = errors.New("rendr/carrier: datagram factory without DialPacket")
-	// ErrH1TooLarge: the first datagram — an OPEN with its metadata — does
-	// not fit the carrier's cmtu offer (the factory MTU, lowered by the
-	// transport's own limit). Package rendr maps a packet Dial that ended
-	// on it to ErrMetadataTooLarge (W4 L3-1).
-	ErrH1TooLarge = errors.New("rendr/carrier: the first datagram exceeds the carrier's frame budget")
+	errH1TooLarge   = errors.New("rendr/carrier: the first datagram exceeds the carrier's frame budget")
 )
+
+// budgetOfferKey is the context key of a datagram attempt's budget-offer
+// mark (MarkBudgetOffer).
+type budgetOfferKey struct{}
+
+// MarkBudgetOffer is called by a datagram factory's DialPacket with the
+// context Establish passed it: it records that the session's MaxPayload
+// offer came from the datagram factories' frame budgets (package rendr's
+// packetOffer: a selector session, or a bond session without a stream
+// factory, M2-D49), so that the attempt's OPEN lowers its pmtu to a lower
+// carrier budget (openPmtu, W4 L3-1). Without the mark the OPEN keeps the
+// session's pmtu: a bond session with a stream factory offers datagrams
+// larger than a datagram carrier carries, for its stream carriers. Any
+// other context is left alone.
+func MarkBudgetOffer(ctx context.Context) {
+	if b, ok := ctx.Value(budgetOfferKey{}).(*atomic.Bool); ok {
+		b.Store(true)
+	}
+}
 
 // dgDial is one datagram dial attempt (establishDatagram).
 type dgDial struct {
@@ -46,10 +62,11 @@ type dgDial struct {
 	io       PacketIO
 	k        *closeOnce // closes io once on every failure path
 	deadline time.Time
-	tx       uint32 // the next tx fseq
-	retx     uint64 // H1 copies after the first
-	wrote    bool   // a copy of H1 was written: a withdrawal sends the RST
-	early    []byte // a response datagram that overtook the PREFACE_ACK (keepEarly)
+	tx       uint32      // the next tx fseq
+	retx     uint64      // H1 copies after the first
+	wrote    bool        // a copy of H1 was written: a withdrawal sends the RST
+	early    []byte      // a response datagram that overtook the PREFACE_ACK (keepEarly)
+	budget   atomic.Bool // the factory marked the session's offer as the datagram budgets' (MarkBudgetOffer)
 
 	// The guard of the attempt (hsGuard's rules for a datagram transport):
 	// abort unblocks the handshake's read when the attempt's context ends;
@@ -82,7 +99,8 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // *OwnedUDP token by its exact type, else NewPacketIO with the factory MTU,
 // whose failure closes the conn once); the cmtu offer min(f.MTU, Limit)
 // (a probe: wire.MinFrameBudget), written into OPEN.window or JOIN.rxNext
-// of a copy of payload, a packet OPEN's pmtu lowered to fit it (openPmtu);
+// of a copy of payload, a packet OPEN's pmtu lowered to fit it when the
+// factory marked the offer as the datagram budgets' (openPmtu);
 // H1 = PREFACE ‖ REL{FirstCseq, OPEN | JOIN} (a
 // probe: PREFACE ‖ PING) written once and resent verbatim at RelRTOInit
 // doubling to RelRTOMax until a PREFACE_ACK, a RACK covering it or the
@@ -288,7 +306,7 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 	}
 	actx, cancel := context.WithDeadline(d.ctx, d.deadline)
 	defer cancel()
-	dctx := withDialInfo(actx, dialInfoFor(f, d.id, d.t, payload))
+	dctx := context.WithValue(withDialInfo(actx, dialInfoFor(f, d.id, d.t, payload)), budgetOfferKey{}, &d.budget)
 	pc, peer, err := GuardedDialPacket(dctx, env, func(ctx context.Context) (net.PacketConn, net.Addr, error) {
 		if h := env.Hooks; h != nil && h.DialStart != nil {
 			h.DialStart(f.Index)
@@ -332,7 +350,7 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 	if n := len(h1) - io.Headroom(); n > offer {
 		d.closeIO()
 		return d.fail(&EstablishError{Stage: "dial", Cause: CauseTransportError,
-			Err: fmt.Errorf("%w: %d bytes, budget %d", ErrH1TooLarge, n, offer)})
+			Err: fmt.Errorf("%w: %d bytes, budget %d", errH1TooLarge, n, offer)})
 	}
 	d.tx = first + 1
 
@@ -504,8 +522,10 @@ func (d *dgDial) buildH1(payload []byte, offer int) ([]byte, uint32) {
 	switch {
 	case d.t == wire.TypeOpen && len(inner) >= wire.OpenFixedLen:
 		binary.BigEndian.PutUint32(inner[24:28], uint32(offer))
-		if p := openPmtu(int(binary.BigEndian.Uint16(inner[28:30])), d.f.MTU, offer); p >= 0 {
-			binary.BigEndian.PutUint16(inner[28:30], uint16(p))
+		if d.budget.Load() {
+			if p := openPmtu(int(binary.BigEndian.Uint16(inner[28:30])), offer); p >= 0 {
+				binary.BigEndian.PutUint16(inner[28:30], uint16(p))
+			}
 		}
 	case d.t == wire.TypeJoin && len(inner) >= 25:
 		binary.BigEndian.PutUint64(inner[17:25], uint64(offer))
@@ -514,17 +534,18 @@ func (d *dgDial) buildH1(payload []byte, offer int) ([]byte, uint32) {
 }
 
 // openPmtu returns the MaxPayload offer a packet OPEN carries on a carrier
-// whose cmtu offer is offer, or −1 to keep pmtu (W4 L3-1; M2-D49, M2-D50):
-// a pmtu that fits the factory's frame budget (pmtu ≤ factoryMTU − 25) means
-// datagram carriers carry every datagram — the passive reads it so
-// (packetAccept) — so when the transport's budget is lower than the
-// factory's (carrier/udp clamps each socket to its interface MTU) it is
-// lowered to offer − 25, never below MinPacketPayload. The passive then
+// whose cmtu offer is offer, or −1 to keep pmtu (W4 L3-1; M2-D49, M2-D50).
+// buildH1 applies it only when the factory marked the session's offer as
+// the datagram factories' budgets (MarkBudgetOffer): datagram carriers are
+// to carry every datagram, as the passive reads a pmtu ≤ window − 25
+// (packetAccept). When the transport's budget is lower than the factory's
+// (carrier/udp clamps each socket to its interface MTU) the offer is
+// lowered to offer − 25, never below MinPacketPayload; the passive then
 // accepts at most cmtu_acc − 25 and the session's MaxPayload fits the
 // carrier that opened it.
-func openPmtu(pmtu, factoryMTU, offer int) int {
+func openPmtu(pmtu, offer int) int {
 	lowered := offer - wire.DgramOverhead
-	if factoryMTU <= 0 || pmtu > factoryMTU-wire.DgramOverhead || pmtu <= lowered || lowered < wire.MinPacketPayload {
+	if pmtu <= lowered || lowered < wire.MinPacketPayload {
 		return -1
 	}
 	return lowered

@@ -42,7 +42,7 @@ func TestOpenFitTooSmall(t *testing.T) {
 		{Index: 3, Name: "stream", Kind: wire.KindStream, Dial: stream},
 	}
 	f := newOpenFit(len(fs))
-	w := f.wrap(fs)
+	w := wrapDatagram(fs, f, false)
 	if &w[0] == &fs[0] || w[3].Dial == nil || w[3].DialPacket != nil {
 		t.Fatal("wrap changed the Peer's snapshot or a stream factory")
 	}
@@ -80,5 +80,43 @@ func TestOpenFitTooSmall(t *testing.T) {
 	var none *openFit
 	if none.tooSmall(1 << 16) {
 		t.Error("a nil openFit (a Peer with a stream factory) maps an error")
+	}
+}
+
+// TestOfferFromBudgets (W4 L3-1, wave-4 review G3): the MaxPayload offer
+// comes from the datagram budgets — and the OPEN's pmtu may follow a lower
+// carrier budget — for a selector session with a datagram factory and for
+// a bond session without a stream factory; a bond session with a stream
+// factory offers Packet.MaxPayload for its stream carriers, and its
+// datagram factories are not wrapped (nothing is marked). packetOffer
+// follows the same rule.
+func TestOfferFromBudgets(t *testing.T) {
+	dg := carrier.Factory{Kind: wire.KindDatagram, MTU: 3991, DialPacket: func(context.Context) (net.PacketConn, net.Addr, error) { return nil, nil, net.ErrClosed }}
+	st := carrier.Factory{Kind: wire.KindStream, Dial: func(context.Context) (net.Conn, error) { return nil, net.ErrClosed }}
+	for _, c := range []struct {
+		name       string
+		fs         []carrier.Factory
+		bond       bool
+		maxPayload int
+		want       bool
+		offer      int
+	}{
+		{"selector, datagram only", []carrier.Factory{dg}, false, 2000, true, 2000},
+		{"selector, datagram and stream", []carrier.Factory{dg, st}, false, 2000, true, 2000},
+		{"bond, datagram only", []carrier.Factory{dg}, true, 2000, true, 2000},
+		{"bond, datagram and stream", []carrier.Factory{dg, st}, true, 2000, false, 2000},
+		{"bond, datagram and stream, large MaxPayload", []carrier.Factory{dg, st}, true, 60000, false, 60000},
+		{"selector, stream only", []carrier.Factory{st}, false, 2000, false, 2000},
+		{"selector, datagram budget below MaxPayload", []carrier.Factory{dg}, false, 60000, true, 3966},
+	} {
+		if got := offerFromBudgets(c.fs, c.bond); got != c.want {
+			t.Errorf("%s: offerFromBudgets = %v, want %v", c.name, got, c.want)
+		}
+		if got := packetOffer(c.fs, c.bond, c.maxPayload); got != c.offer {
+			t.Errorf("%s: packetOffer = %d, want %d", c.name, got, c.offer)
+		}
+		if w := wrapDatagram(c.fs, nil, offerFromBudgets(c.fs, c.bond)); c.want != (&w[0] != &c.fs[0]) {
+			t.Errorf("%s: wrapped %v, want %v", c.name, &w[0] != &c.fs[0], c.want)
+		}
 	}
 }
