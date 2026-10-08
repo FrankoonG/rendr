@@ -200,6 +200,9 @@ type joinState struct {
 	doneClosed bool
 	timer      *time.Timer // abandons stuck parts
 	drain      *time.Timer // retirement drain bound (stopped at Done)
+	// readerExit, when set, is closed as the reader part finishes: the
+	// closer of a drain-bound retirement waits on it (closeRetiredDrain).
+	readerExit chan struct{}
 }
 
 // newConn returns an unstarted carrier over nc. The handshake code sets the
@@ -593,9 +596,10 @@ type Stats struct {
 type closeMode uint8
 
 const (
-	closeKill     closeMode = iota // abrupt: SetDeadline(now) and Close (closeConn)
-	closeRetired                   // planned: CloseWrite (OwnedTCP only), then SetDeadline(now) and Close
-	closeWriteOne                  // WriteAndClose: write one frame, CloseWrite (OwnedTCP), bounded drain, then SetDeadline(now) and Close
+	closeKill         closeMode = iota // abrupt: SetDeadline(now) and Close (closeConn)
+	closeRetired                       // planned: CloseWrite (OwnedTCP only), then SetDeadline(now) and Close
+	closeWriteOne                      // WriteAndClose: write one frame, CloseWrite (OwnedTCP), bounded drain, then SetDeadline(now) and Close
+	closeRetiredDrain                  // planned, an OwnedTCP carrier past the drain bound: CloseWrite, the reader ends (awaitReader, ≤ drainMax), then SetDeadline(now) and Close
 )
 
 // drainMax bounds the drain of a planned close and of WriteAndClose.
@@ -607,10 +611,13 @@ const drainMax = time.Second
 // after the close (plus the bounded write and drain of WriteAndClose).
 func (c *Conn) startCloser(mode closeMode, frame []byte, deadline time.Time) {
 	wait := c.tm.AbandonWait
-	if mode == closeWriteOne {
+	switch mode {
+	case closeWriteOne:
 		if d := time.Until(deadline); d > 0 {
 			wait += d
 		}
+		wait += drainMax
+	case closeRetiredDrain:
 		wait += drainMax
 	}
 	c.jmu.Lock()
@@ -633,6 +640,9 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 		if c.owned != nil {
 			_ = callCloseWrite(c.owned)
 		}
+	case closeRetiredDrain:
+		_ = callCloseWrite(c.owned)
+		c.awaitReader(drainMax)
 	case closeWriteOne:
 		_ = callSetWriteDeadline(c.nc, deadline)
 		if writeFull(c.nc, frame) == nil {
@@ -641,6 +651,38 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 			}
 			drain(c.nc, time.Now().Add(drainMax))
 		}
+	}
+}
+
+// awaitReader waits, at most d, until the reader part finished. The reader
+// owns Read (no second reader drains the conn): after a drain-bound
+// retirement it keeps reading — the peer's late frames are dispatched as
+// before the bound — and ends at the peer's CLOSE (no frame follows it),
+// at EOF or at a read error, so the conn is closed with nothing unread and
+// no late frame of the peer meets a closed socket and draws a TCP RST
+// (L05; W4-K11, TestLoopbackDrainBoundNoReset_L05). A peer that sends
+// nothing more is cut off by closeConn after d. A later Kill does not cut
+// the wait short (the death is already recorded, so it starts no closer):
+// Done and the join may come up to d later, inside the closer's
+// abandonment wait (AbandonWait + drainMax). No owner kills a carrier
+// whose CLOSE was written (the end phase and Runtime.Close kill only those
+// whose CLOSE is unwritten), and only such a carrier reaches this wait.
+func (c *Conn) awaitReader(d time.Duration) {
+	c.jmu.Lock()
+	if c.join.running&partReader == 0 {
+		c.jmu.Unlock()
+		return
+	}
+	if c.join.readerExit == nil {
+		c.join.readerExit = make(chan struct{})
+	}
+	exit := c.join.readerExit
+	c.jmu.Unlock()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-exit:
+	case <-t.C:
 	}
 }
 
@@ -694,6 +736,10 @@ func drain(nc net.Conn, until time.Time) {
 func (c *Conn) partDone(p uint8) {
 	c.jmu.Lock()
 	c.join.running &^= p
+	if p == partReader && c.join.readerExit != nil {
+		close(c.join.readerExit)
+		c.join.readerExit = nil
+	}
 	left := c.join.abandoned&p != 0
 	c.join.abandoned &^= p
 	c.maybeDoneLocked()
@@ -764,10 +810,23 @@ func (c *Conn) maybeDoneLocked() {
 // finishRetire ends a planned retirement (both CLOSEs exchanged, EOF or
 // read error after a CLOSE, or the drain bound): the death record becomes
 // CauseRetired unless a death came first, and the conn is closed in the
-// L05 order.
-func (c *Conn) finishRetire(detail string) {
+// L05 order. At the drain bound (drained) a carrier over rendr's own TCP
+// (OwnedTCP) half-closes and still consumes what the peer sends until its
+// CLOSE or EOF, bounded by drainMax, before the socket is closed
+// (closeRetiredDrain): a frame of a stalled peer that arrived after the
+// bound would otherwise meet a closed socket and draw a TCP RST (W4-K11).
+// Every other conn — an embedder's net.Conn, which rendr cannot
+// half-close, or a datagram carrier's PacketIO (R1-7) — is closed at the
+// bound.
+func (c *Conn) finishRetire(detail string) { c.retire(detail, false) }
+
+func (c *Conn) retire(detail string, drained bool) {
 	if c.setDeath(CauseRetired, detail) {
-		c.startCloser(closeRetired, nil, time.Time{})
+		mode := closeRetired
+		if drained && c.owned != nil && c.dg == nil {
+			mode = closeRetiredDrain
+		}
+		c.startCloser(mode, nil, time.Time{})
 	}
 }
 
@@ -803,7 +862,7 @@ func (c *Conn) closeWritten() {
 	}
 	c.jmu.Lock()
 	if !c.join.doneClosed {
-		c.join.drain = time.AfterFunc(bound, func() { c.finishRetire("retired: drain bound after CLOSE") })
+		c.join.drain = time.AfterFunc(bound, func() { c.retire("retired: drain bound after CLOSE", true) })
 	}
 	c.jmu.Unlock()
 }
