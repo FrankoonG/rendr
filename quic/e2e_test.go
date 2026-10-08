@@ -96,8 +96,16 @@ func (r *qeRelay) upstream(client netip.AddrPort) *net.UDPConn {
 		buf := make([]byte, 65536)
 		for {
 			n, err := u.Read(buf)
-			if err != nil {
+			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			if err != nil {
+				// A connected UDP socket reports an ICMP port unreachable
+				// as ECONNREFUSED on its next read (Linux): a datagram the
+				// relay sent while the server's socket was closed (restart)
+				// must not end the server → client direction, or the new
+				// listener's stateless reset never reaches the client.
+				continue
 			}
 			if r.blackhole.Load() {
 				r.dropped.Add(1)
