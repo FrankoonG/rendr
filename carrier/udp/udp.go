@@ -73,16 +73,17 @@ type Options struct {
 	// MaxDatagram is the largest UDP payload rendr sends or accepts on the
 	// socket, the 9-byte flow header included: 0 selects
 	// DefaultMaxDatagram; else 546–65,507. The factory's
-	// DatagramCarrier.MTU is MaxDatagram − 9. A listening socket should
-	// allow at least every dialer's value: the carriers then agree on the
-	// dialer's (a larger dialer value is lowered to the listener's at the
-	// handshake). A value above what the local interface carries is lowered
-	// to it — by Dial to the MTU of the interface the route to the peer
-	// uses (the loopback interface's for a loopback peer), by Listen on a
-	// specific address to that address's interface MTU, minus the IP and
-	// UDP headers — so the socket never refuses its own datagrams as too
-	// large (M2 design Revision 1, R1-16); a wildcard Listen cannot know its
-	// route and keeps the value.
+	// DatagramCarrier.MTU is MaxDatagram − 9, clamped in advance as Dial
+	// clamps it when the address is an IP literal (see Carrier). A
+	// listening socket should allow at least every dialer's value: the
+	// carriers then agree on the dialer's (a larger dialer value is
+	// lowered to the listener's at the handshake). A value above what the
+	// local interface carries is lowered to it — by Dial to the MTU of the
+	// interface the route to the peer uses (the loopback interface's for a
+	// loopback peer), by Listen on a specific address to that address's
+	// interface MTU, minus the IP and UDP headers — so the socket never
+	// refuses its own datagrams as too large (M2 design Revision 1, R1-16);
+	// a wildcard Listen cannot know its route and keeps the value.
 	MaxDatagram int
 	// ReadBuffer and WriteBuffer size the socket buffers, best effort: 0
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with
@@ -106,12 +107,22 @@ func Listen(network, address string, o Options) (net.PacketConn, error) {
 // ephemeral port, draws a new flow ID and returns the socket — closed on
 // every failure before Dial returns (L57) — and the peer as a
 // *net.UDPAddr. An IPv6 link-local peer names its interface in the zone,
-// by name or by index. MTU is MaxDatagram − 9 (0, which NewPeer rejects,
-// for an invalid MaxDatagram).
+// by name or by index.
+//
+// MTU is MaxDatagram − 9 (0, which NewPeer rejects, for an invalid
+// MaxDatagram), lowered to what the carriers will carry (W4 L3-1): for an
+// IP literal that Dial accepts, Carrier applies Dial's interface clamp
+// once, best effort (a route lookup, which sends nothing, and the
+// interface table), so that DialPacket's metadata check, the MaxPayload
+// offer and the opening race see the clamped budget. For a host name, or
+// when the clamp at Dial is lower than the one Carrier saw (a route that
+// changed), each carrier's own budget offer is the clamped one, and an
+// OPEN whose MaxPayload offer came from the datagram factories' budgets
+// follows it (rendr.DatagramCarrier.MTU).
 func Carrier(name, network, address string, o Options) rendr.DatagramCarrier {
 	mtu := 0
 	if m, err := o.maxDatagram(); err == nil {
-		mtu = m - flowHeaderLen
+		mtu = literalClamp(network, address, o.AllowNonLoopback, m) - flowHeaderLen
 	}
 	return rendr.DatagramCarrier{
 		Name: name,

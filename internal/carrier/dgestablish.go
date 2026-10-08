@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
@@ -25,6 +26,25 @@ var (
 	errNoDialPacket = errors.New("rendr/carrier: datagram factory without DialPacket")
 	errH1TooLarge   = errors.New("rendr/carrier: the first datagram exceeds the carrier's frame budget")
 )
+
+// budgetOfferKey is the context key of a datagram attempt's budget-offer
+// mark (MarkBudgetOffer).
+type budgetOfferKey struct{}
+
+// MarkBudgetOffer is called by a datagram factory's DialPacket with the
+// context Establish passed it: it records that the session's MaxPayload
+// offer came from the datagram factories' frame budgets (package rendr's
+// packetOffer: a selector session, or a bond session without a stream
+// factory, M2-D49), so that the attempt's OPEN lowers its pmtu to a lower
+// carrier budget (openPmtu, W4 L3-1). Without the mark the OPEN keeps the
+// session's pmtu: a bond session with a stream factory offers datagrams
+// larger than a datagram carrier carries, for its stream carriers. Any
+// other context is left alone.
+func MarkBudgetOffer(ctx context.Context) {
+	if b, ok := ctx.Value(budgetOfferKey{}).(*atomic.Bool); ok {
+		b.Store(true)
+	}
+}
 
 // dgDial is one datagram dial attempt (establishDatagram).
 type dgDial struct {
@@ -42,9 +62,11 @@ type dgDial struct {
 	io       PacketIO
 	k        *closeOnce // closes io once on every failure path
 	deadline time.Time
-	tx       uint32 // the next tx fseq
-	retx     uint64 // H1 copies after the first
-	wrote    bool   // a copy of H1 was written: a withdrawal sends the RST
+	tx       uint32      // the next tx fseq
+	retx     uint64      // H1 copies after the first
+	wrote    bool        // a copy of H1 was written: a withdrawal sends the RST
+	early    []byte      // a response datagram that overtook the PREFACE_ACK (keepEarly)
+	budget   atomic.Bool // the factory marked the session's offer as the datagram budgets' (MarkBudgetOffer)
 
 	// The guard of the attempt (hsGuard's rules for a datagram transport):
 	// abort unblocks the handshake's read when the attempt's context ends;
@@ -77,7 +99,9 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // *OwnedUDP token by its exact type, else NewPacketIO with the factory MTU,
 // whose failure closes the conn once); the cmtu offer min(f.MTU, Limit)
 // (a probe: wire.MinFrameBudget), written into OPEN.window or JOIN.rxNext
-// of a copy of payload; H1 = PREFACE ‖ REL{FirstCseq, OPEN | JOIN} (a
+// of a copy of payload, a packet OPEN's pmtu lowered to fit it when the
+// factory marked the offer as the datagram budgets' (openPmtu);
+// H1 = PREFACE ‖ REL{FirstCseq, OPEN | JOIN} (a
 // probe: PREFACE ‖ PING) written once and resent verbatim at RelRTOInit
 // doubling to RelRTOMax until a PREFACE_ACK, a RACK covering it or the
 // response, at most Handshake.Timeout after the first copy (after a RACK
@@ -85,7 +109,8 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // keepalive that reveals a NAT rebind to a held passive flow, not counted
 // as a retransmission; integration 2, K5); the
 // PREFACE_ACK checked in M1's canonical order (a malformed one is a lost
-// datagram; before it, only a rebind challenge is answered, R1-14); then,
+// datagram; before it, only a rebind challenge is answered, R1-14, and one
+// datagram led by the response is kept for after it, keepEarly); then,
 // until the response, frames through the receive window:
 // a RACK, PING (id 0: the rebind challenge, or the address check an OPEN's
 // H2 carries on a raw-UDP flow — answered at once through this socket,
@@ -281,7 +306,7 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 	}
 	actx, cancel := context.WithDeadline(d.ctx, d.deadline)
 	defer cancel()
-	dctx := withDialInfo(actx, dialInfoFor(f, d.id, d.t, payload))
+	dctx := context.WithValue(withDialInfo(actx, dialInfoFor(f, d.id, d.t, payload)), budgetOfferKey{}, &d.budget)
 	pc, peer, err := GuardedDialPacket(dctx, env, func(ctx context.Context) (net.PacketConn, net.Addr, error) {
 		if h := env.Hooks; h != nil && h.DialStart != nil {
 			h.DialStart(f.Index)
@@ -418,6 +443,10 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 			}
 			data = data[wire.PrefaceLen:] // a duplicate H2's frames are window duplicates
 		} else if ackBytes == nil {
+			if d.keepEarly(data) {
+				io.Release() // its frames run once the PREFACE_ACK(OK) is read
+				continue
+			}
 			// Before the PREFACE_ACK only a rebind challenge is answered: the
 			// H2 may have gone to the mapping the rebind left (R1-14).
 			werr := d.challenges(data)
@@ -428,6 +457,14 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 			continue
 		}
 		r, verr := d.frames(data, &rwin)
+		if early := d.early; verr == nil && !r.ok && early != nil {
+			// The response overtook the PREFACE_ACK (keepEarly): its frames
+			// follow H2's now, as if it had arrived after it.
+			d.early = nil
+			acked := r.acked
+			r, verr = d.frames(early, &rwin)
+			r.acked = r.acked || acked
+		}
 		if verr != nil {
 			io.Release()
 			var we *dgWriteError
@@ -483,12 +520,35 @@ func (d *dgDial) buildH1(payload []byte, offer int) ([]byte, uint32) {
 	copy(inner, payload)
 	// The cmtu offer travels in OPEN.window or JOIN.rxNext (M2-D11, §A3.5).
 	switch {
-	case d.t == wire.TypeOpen && len(inner) >= 28:
+	case d.t == wire.TypeOpen && len(inner) >= wire.OpenFixedLen:
 		binary.BigEndian.PutUint32(inner[24:28], uint32(offer))
+		if d.budget.Load() {
+			if p := openPmtu(int(binary.BigEndian.Uint16(inner[28:30])), offer); p >= 0 {
+				binary.BigEndian.PutUint16(inner[28:30], uint16(p))
+			}
+		}
 	case d.t == wire.TypeJoin && len(inner) >= 25:
 		binary.BigEndian.PutUint64(inner[17:25], uint64(offer))
 	}
 	return wire.AppendFrame(h1, wire.Header{Type: wire.TypeRel, Fseq: first}, rp), first
+}
+
+// openPmtu returns the MaxPayload offer a packet OPEN carries on a carrier
+// whose cmtu offer is offer, or −1 to keep pmtu (W4 L3-1; M2-D49, M2-D50).
+// buildH1 applies it only when the factory marked the session's offer as
+// the datagram factories' budgets (MarkBudgetOffer): datagram carriers are
+// to carry every datagram, as the passive reads a pmtu ≤ window − 25
+// (packetAccept). When the transport's budget is lower than the factory's
+// (carrier/udp clamps each socket to its interface MTU) the offer is
+// lowered to offer − 25, never below MinPacketPayload; the passive then
+// accepts at most cmtu_acc − 25 and the session's MaxPayload fits the
+// carrier that opened it.
+func openPmtu(pmtu, offer int) int {
+	lowered := offer - wire.DgramOverhead
+	if pmtu <= lowered || lowered < wire.MinPacketPayload {
+		return -1
+	}
+	return lowered
 }
 
 // prefaceAck handles the first PREFACE_ACK (M1's canonical order, design
@@ -689,6 +749,31 @@ func (d *dgDial) challenges(data []byte) error {
 		dgEnvDropped(d.env) // before the PREFACE_ACK nothing else is processed
 	}
 	return nil
+}
+
+// keepEarly keeps one copy of rendr bytes data that arrive before the
+// PREFACE_ACK when its first frame is the response — a CRC-valid
+// REL{FirstCseq} of a type that may answer H1 (W4 REL-4; M2-D20 as
+// amended): reordering can deliver H3 ahead of H2, and the passive has no
+// RTT sample yet to resend it before RelRTOInit. The copy's frames run
+// through the receive window once a PREFACE_ACK(OK) was read (an attempt
+// that ends otherwise discards it); a probe has no REL response, and only
+// the first such datagram is kept. It reports whether data was kept.
+func (d *dgDial) keepEarly(data []byte) bool {
+	if d.t == wire.TypePing || d.early != nil {
+		return false
+	}
+	f, _, err := wire.DecodeFrame(data)
+	if err != nil || f.Type != wire.TypeRel {
+		return false
+	}
+	h, inner, err := wire.ParseRel(f.Payload)
+	if err != nil || h.Cseq != d.fcs ||
+		!responseAllowed(d.t, wire.Header{Type: h.Type, Flags: h.Flags, Len: uint32(len(inner)), Fseq: f.Fseq, Handle: h.Handle}) {
+		return false
+	}
+	d.early = bytes.Clone(data)
+	return true
 }
 
 // checkRack validates a RACK against what H1 sent: nothing beyond
