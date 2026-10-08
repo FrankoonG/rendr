@@ -651,9 +651,6 @@ func (e *allocDgEP) Datagram(_ *Conn, _ uint64, _ []byte, buf *Buf) error {
 // and the reader (window, dispatch, REL receive, RACK) over an in-memory
 // pair, with REL/RACK active and idle (L41, L54; non-race lane).
 func TestDatagramCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
-	if carrierRace {
-		t.Skip("allocation gates run in the non-race lane (sync.Pool drops items under -race)")
-	}
 	for _, rel := range []bool{false, true} {
 		name := "idle REL"
 		if rel {
@@ -706,7 +703,13 @@ func TestDatagramCarrierRoundZeroAllocs_L41_L54(t *testing.T) {
 				for range 20 {
 					round()
 				}
-				if allocs := testing.AllocsPerRun(200, round); allocs != 0 {
+				allocs := testing.AllocsPerRun(200, round)
+				if carrierRace {
+					// The race lane runs the rounds but asserts no allocation count:
+					// the detector slows the data path and sync.Pool drops items on
+					// purpose (as the other carrier allocation gates do).
+					t.Logf("race lane: %.1f allocations per round (not asserted)", allocs)
+				} else if allocs != 0 {
 					t.Fatalf("%.1f allocations per round, want 0", allocs)
 				}
 				if rel && a.c.RelRoom() != wire.RelWindow {
