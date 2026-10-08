@@ -119,7 +119,7 @@ func TestActorLocalFailedMarkYields(t *testing.T) {
 		}
 		w.a.ev.hold.Store(&hold)
 		l1.Kill()
-		<-held // the death step ran and MarkFailed was called (before the step's events)
+		<-held // the death step ran and MarkFailedAt was called (before the step's events)
 		h.mu.Lock()
 		marked, marks := h.failed[0], h.marks
 		h.mu.Unlock()

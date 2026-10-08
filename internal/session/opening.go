@@ -28,24 +28,17 @@ import (
 type healthSource interface {
 	Snapshot() *carrier.Snapshot
 	Subscribe(b carrier.Doorbell) (cancel func())
-	MarkFailed(i int, reason string)
+	// MarkFailedAt dates a failed mark by the failure rather than by the
+	// call (W4-MARKAT): markFailed calls it after the actor's step, so a
+	// probe round trip of the factory between the failure and that call
+	// still clears or prevents the mark.
+	MarkFailedAt(i int, reason string, at time.Time)
 	Succeeded(i int)
 	Gauges() []*carrier.Gauge
 	Hold() (release func())
 }
 
 var _ healthSource = (*carrier.Health)(nil)
-
-// datedMarker is a healthSource that dates a failed mark by the failure
-// rather than by the call (carrier.Health; W4-MARKAT). markFailed calls it
-// after the actor's step, so a probe round trip of the factory between the
-// failure and that call still clears or prevents the mark. A healthSource
-// without it (the actor tests' fakes) gets MarkFailed.
-type datedMarker interface {
-	MarkFailedAt(i int, reason string, at time.Time)
-}
-
-var _ datedMarker = (*carrier.Health)(nil)
 
 // Dial outcome states (one CAS decides between success and withdrawal).
 const (
@@ -246,7 +239,7 @@ func openPayload(s *Session, window uint32) []byte {
 
 // markFailed sets factory i's failed mark for a failure at at (a carrier's
 // death time, or the step's now): a health-layer call after the lock is
-// released, dated by at (datedMarker), mirrored by a local mark so that a
+// released, dated by at (MarkFailedAt), mirrored by a local mark so that a
 // race ranked in the same step already ranks the factory last (§7.3). The
 // local mark yields to the health layer once a snapshot published after
 // that call is seen (failedLocked), whatever its mark says by then: the
@@ -259,11 +252,7 @@ func (a *actor) markFailed(i int, reason string, at time.Time) {
 	if h := d.h; h != nil {
 		d.failedVer[i] = markPending
 		a.later = append(a.later, func() {
-			if m, ok := h.(datedMarker); ok {
-				m.MarkFailedAt(i, reason, at)
-			} else {
-				h.MarkFailed(i, reason)
-			}
+			h.MarkFailedAt(i, reason, at)
 			v := uint64(0)
 			if sn := h.Snapshot(); sn != nil {
 				v = sn.Version

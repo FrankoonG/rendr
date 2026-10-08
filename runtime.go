@@ -56,7 +56,7 @@ type Runtime struct {
 	draining  []<-chan struct{}            // Done of ended sessions that may still run (joined by Close)
 	pruneAt   int
 
-	fmu    sync.Mutex                    // a leaf: guards pflows
+	fmu    sync.Mutex                    // guards pflows; taken before a udpflow.Flow's lock (holdFlow), never while one is held
 	pflows map[*session.Session]*flowSet // passive packet sessions: the raw-UDP flows of their OPEN carriers (listener_pkt.go)
 }
 

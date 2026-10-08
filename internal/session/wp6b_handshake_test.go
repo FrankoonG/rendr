@@ -298,7 +298,7 @@ func TestPacketJoinFields(t *testing.T) {
 	})
 }
 
-// wpMarkHealth is acHealth recording every MarkFailed call as
+// wpMarkHealth is acHealth recording every MarkFailedAt call as
 // "factory:reason".
 type wpMarkHealth struct {
 	*acHealth
@@ -306,11 +306,11 @@ type wpMarkHealth struct {
 	marks []string
 }
 
-func (h *wpMarkHealth) MarkFailed(i int, reason string) {
+func (h *wpMarkHealth) MarkFailedAt(i int, reason string, at time.Time) {
 	h.mu.Lock()
 	h.marks = append(h.marks, fmt.Sprintf("%d:%s", i, reason))
 	h.mu.Unlock()
-	h.acHealth.MarkFailed(i, reason)
+	h.acHealth.MarkFailedAt(i, reason, at)
 }
 
 func (h *wpMarkHealth) list() []string {

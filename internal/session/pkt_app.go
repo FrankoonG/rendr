@@ -70,6 +70,9 @@ func (s *Session) writeTo(p []byte) (int, error) {
 		pk.ctr.DropQueue++ // the chunk pool refused even after one eviction
 	} else {
 		copy(slot, p) // slot is nil for ext
+		if pk.dgMin > 0 && n > pk.dgMin {
+			q.back().wide = true // W4-REL-5: the smaller member leaves it to a larger one
+		}
 		if q == &pk.txBig {
 			s.pktBigPushedLocked()
 		}

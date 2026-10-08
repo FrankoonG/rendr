@@ -324,8 +324,16 @@ func (r *healthRun) resultLocked(i int, s *probeSlot, a *probeAttempt, now time.
 	f.conn = c
 	f.agg.Reset()                               // a new incarnation starts Unknown (L23)
 	f.pHead, f.pN, f.early = 0, 0, probeEarly{} // its PING ids restart: no record of another incarnation may match
-	if f.failed && !a.start.Before(f.markAt) && c.Kind() != wire.KindDatagram {
-		h.clearLocked(i) // a successful probe dial after the mark (plan §3.9)
+	if c.Kind() != wire.KindDatagram {
+		// A successful stream probe dial proves the factory from its start:
+		// it clears a mark set before that, and (proofAt) a late
+		// MarkFailedAt for a death before that start (W4-MARKAT).
+		if a.start.After(f.proofAt) {
+			f.proofAt = a.start
+		}
+		if f.failed && !a.start.Before(f.markAt) {
+			h.clearLocked(i) // a successful probe dial after the mark (plan §3.9)
+		}
 	}
 	// A datagram probe's establishment PONG is H2p, written by the
 	// passive's handshake before its admission decided; the sessionless

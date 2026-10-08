@@ -112,7 +112,7 @@ type factoryState struct {
 	failed   bool
 	reason   string
 	markAt   time.Time // the failure the mark records (MarkFailedAt's at; a probe failure's time)
-	proofAt  time.Time // the latest PING commit of any sample (zero: none), for MarkFailedAt
+	proofAt  time.Time // the latest PING commit of any sample or start of a successful stream probe dial (zero: none), for MarkFailedAt
 	attempts uint64    // probe attempts started
 	first    bool      // WaitFirst: a sample or a failure since the current run started
 
@@ -371,7 +371,8 @@ func (h *Health) MarkFailed(i int, reason string) {
 // The failure is dated by at, not by the call: the session reports a
 // death after its actor step, and a probe sample processed in between
 // must still count (W4-MARKAT). So a factory whose latest sample's PING
-// was committed at or after at is not marked at all, and a mark already
+// was committed at or after at, or whose latest successful stream probe
+// dial started at or after at, is not marked at all, and a mark already
 // set for a later failure keeps that later time.
 func (h *Health) MarkFailedAt(i int, reason string, at time.Time) {
 	now := time.Now()

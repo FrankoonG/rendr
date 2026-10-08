@@ -43,6 +43,7 @@ type packet struct {
 	noPathEnd time.Time    // end of the latest no-path episode: DropNoPath vs DropAge (M2-D35)
 	finPlaced bool         // our FIN was placed once: st.fin.off holds the final seq
 	dgMax     int          // the largest DgramMax over live datagram data lanes (0: none; routing, M2-D43, M2-D45)
+	dgMin     int          // the smallest DgramMax over live datagram data lanes (0: none): pdesc.wide (W4-REL-5)
 	mixed     bool         // bond with live datagram data lanes and a stream member (a data lane, or one awaiting its SCHED): WriteTo puts datagrams above dgMax in txBig
 	bigHeld   bool         // mixed by stream members awaiting their SCHED only: txBig waits for one, aged by the actor (C4-F2)
 	rcopy     *carrier.Buf // a datagram ReadFrom detached and copies outside the lock (L07: released at its commit)
@@ -81,6 +82,7 @@ type pdesc struct {
 	chunk uint32       // absolute chunk number (an ext datagram carries the newest chunk's number at its push, so the numbers never decrease along the queue)
 	off   uint32       // offset in the chunk
 	n     uint32       // length (0 is a legal empty datagram)
+	wide  bool         // tx: above the smallest live datagram data lane's DgramMax at its push (pk.dgMin): a mixed-budget head, not one a budget shrink left behind (W4-REL-5)
 	at    int64        // enqueue time, ns since the session's base
 	ext   *carrier.Buf // a big datagram in its own Buf (B is exactly the datagram)
 }
