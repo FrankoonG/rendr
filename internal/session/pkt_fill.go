@@ -227,9 +227,9 @@ func (s *Session) pktRouteLocked() {
 // write-blocked and placed no DGRAM within PacketPing/4 — one that never
 // placed one first, then the stalest — is found by a scan that runs at
 // most once per PacketPing/8 and is remembered until it places a DGRAM;
-// when it is idle it is woken and counts as the walk's first member (with
-// at most a batch queued it is then the only lane woken, so it takes
-// them). Then, for each queue that holds datagrams, the walk visits the
+// it is woken when idle and counts as the walk's first member on every
+// WriteTo until then, woken or still pending (with at most a batch queued
+// it is then the only lane woken, so it takes them). Then, for each queue that holds datagrams, the walk visits the
 // data lanes in srtt order, datagram lanes first then stream lanes (txBig:
 // stream lanes only), skipping write-blocked ones, waking the idle ones
 // until one batch (64 frames) per visited writer covers the queue
@@ -267,9 +267,14 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 	var counted *lane
 	covered := 0
 	if pk.tx.n > 0 {
-		if sl := s.pktStaleLocked(now); sl != nil && sl.idle {
-			sl.idle = false
-			sl.port.Wake()
+		if sl := s.pktStaleLocked(now); sl != nil {
+			if sl.idle {
+				sl.idle = false
+				sl.port.Wake()
+			}
+			// Woken earlier and not run yet, it still covers a batch: the
+			// burst behind it waits for its Fill instead of waking a faster
+			// member whose writer would drain it first.
 			counted, covered = sl, carrier.MaxBatchFrames
 		}
 		if covered < pk.tx.n && !s.pktWalkLocked(pk.tx.n, false, counted, covered, int(pk.tx.front().n)) {

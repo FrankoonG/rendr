@@ -353,14 +353,6 @@ func sleepUntil(at time.Time) {
 	}
 }
 
-// laterOf returns the later of a and b.
-func laterOf(a, b time.Time) time.Time {
-	if a.After(b) {
-		return a
-	}
-	return b
-}
-
 // Status helpers.
 
 // activeOf returns the carrier the session reports active.

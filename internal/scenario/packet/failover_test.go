@@ -256,10 +256,16 @@ func packetFailover(t *testing.T, mode rendr.Mode) {
 		// A request is lost on the way up when the passive never got it:
 		// the dialer placed it on p2 between the stall and its verdict. A
 		// reply is lost on the way down: the passive placed it on p2
-		// before it left p2, at its own verdict or at the dialer's SCHED
-		// that removed p2 (one way after the dialer's verdict; 50 ms
-		// cover it).
-		leave := laterOf(died[1], died[0].Add(50*time.Millisecond))
+		// before it left p2, at the earlier of its own verdict and the
+		// dialer's SCHED that removed p2 (plan:152; the SCHED arrives one
+		// way after the dialer's verdict, 50 ms cover its handling). At
+		// msess's scales both ends die within a few ms of each other, so
+		// the SCHED rule is rarely the binding one here (TestG3Miniature's
+		// bond covers it).
+		leave := died[1]
+		if sched := died[0].Add(oneWay + 50*time.Millisecond); sched.Before(leave) {
+			leave = sched
+		}
 		up, down := 0, 0
 		for _, l := range ls {
 			at, echoed := e.echoedAt(uint64(l.seq))

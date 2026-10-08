@@ -20,7 +20,8 @@ import (
 // the DROP stays below 5 % for DeliveryRatio, B6): (1) configuration order
 // [p2, p1]; p1 made active by +20 ms on p2's B → A delay during
 // DialPacket, restored, and still active after 20 s (≥ Cooldown), else the
-// stimulus failed; (2) p1 dropped for 20 s (the failover to p2 judged by
+// stimulus failed; (2) p1 dropped for 20 s from just after a PONG
+// (afterPong, the worst phase; the failover to p2 judged by
 // B1.3's PktRecovery and causes) and restored at T_rm; (3) at T_rm +
 // 4.06 s the dialer's active carrier: on p2 (expected) its conn is closed
 // under rendr (the hard kill, carrier.close: M2-D74, PA-23; T_k the time
@@ -85,7 +86,8 @@ func g5Selector(t *testing.T) {
 	}
 	m0 := dc.Status().Migrations
 
-	// (2) DROP p1 for 20 s.
+	// (2) DROP p1 for 20 s, just after a PONG (the worst phase).
+	afterPong(t, p1)
 	lost0 := p1.Stats().Session.Lost
 	act, _ := activeOf(dc.Status())
 	drop := time.Now()

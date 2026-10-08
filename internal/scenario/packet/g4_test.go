@@ -6,6 +6,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestG4PktMiniature: gold/G4-pkt-sel and gold/G4-pkt-bond (M2 design
@@ -16,7 +17,9 @@ import (
 // one; bond: B's member with the largest Tx growth over the last second
 // (F13, which must be at least 25 % of B's offered bytes) — drops
 // everything in both directions without an error, an RST or an ICMP
-// (plan:747) until the end; the clean end comes 60 s later. The run is
+// (plan:747) until the end, starting just after a PONG of the dialer's
+// PING on it (afterPong: the worst phase, so the outage is the designed
+// PacketPing + D); the clean end comes 60 s later. The run is
 // 90 s, not 60: the designed outage of the selector (≈ PacketPing + D +
 // 2·RTT ≈ 4.05 s per direction, PA-13) must stay below 5 % of the run for
 // DeliveryRatio, the rule by which the gold sizes its runs (B6).
@@ -59,6 +62,7 @@ func g4(t *testing.T, mode rendr.Mode) {
 	sleepUntil(up.start.Add(warm - time.Second))
 	victim := pickDataCarrier(t, dc, pc, mode)
 	vl := w.link(victim.Name)
+	afterPong(t, vl)
 	lost0 := vl.Stats().Session.Lost
 	drop := time.Now()
 	for _, d := range bothDirs {
@@ -92,6 +96,28 @@ func g4(t *testing.T, mode rendr.Mode) {
 	}
 	w.noViolation()
 	w.close()
+}
+
+// afterPong waits for the dialer's next PING on l and then one round trip
+// and 10 ms more, so that a DROP right after it lands just after that
+// PING's PONG arrived: the worst phase of the death rule (PA-13). The next
+// PING is then committed about a PacketPing later and the death comes D
+// after it, so the outage is PacketPing + D, not D (synctest fixes the
+// phase: a drop at an arbitrary instant lands at the same phase in every
+// run). The dialer's session carrier on l is the only one that PINGs at
+// the PacketPing cadence; a probe carrier's PING would land the drop at an
+// arbitrary phase, which the logged recovery would show.
+func afterPong(t *testing.T, l *rendrtest.DatagramLink) {
+	t.Helper()
+	ch := l.CaptureNext(rendrtest.Up, rendrtest.FramePing)
+	t0 := time.Now()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("stimulus: no PING of the dialer on %s within 3 s", l.Name())
+	}
+	t.Logf("%s: the dialer's PING at +%v; the drop follows one round trip and 10 ms later", l.Name(), time.Since(t0))
+	time.Sleep(2*goldOneWay + 10*time.Millisecond)
 }
 
 // pickDataCarrier picks the carrier that carries data (F13) over the

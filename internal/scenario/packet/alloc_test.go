@@ -179,8 +179,9 @@ func pump(tb testing.TB, w, r *rendr.PacketConn, seed uint64, n, window int) (go
 // AllocsPerRun's integer division unseen); GC is off during it and one P
 // runs; PacketPing is 10 ms (a testhooks override) and the window lasts
 // at least 50 of them, so an allocation per PING, per PONG or per MTU probe
-// alone exceeds the bound. Asserted in the non-race lane; the race lane
-// runs a short window and logs the figure.
+// alone exceeds the bound; the control frames written by both ends prove
+// that the PING cadence ran in the window. Asserted in the non-race lane;
+// the race lane runs a short window and logs the figure.
 func TestPacketSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	check := rendrtest.AssertNoLeak(t)
 	ov := testhooks.Overrides{PacketPing: 10 * time.Millisecond}
@@ -224,23 +225,36 @@ func TestPacketSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	if raceEnabled {
 		minRounds, minWindow = warm, 0 // the race lane only logs the figure
 	}
-	c0 := dc.Status().Carriers[0]
+	c0, q0 := dc.Status().Carriers[0], pc.Status().Carriers[0]
 	mallocs, rounds, el := countMallocs(minRounds, minWindow, round)
-	c1 := dc.Status().Carriers[0]
+	c1, q1 := dc.Status().Carriers[0], pc.Status().Carriers[0]
 	if string(rbuf[:len(wbuf)]) != string(wbuf) {
 		t.Fatal("the last round delivered other bytes")
 	}
 	ds, ps := dc.Status(), pc.Status()
 	if rounds < minRounds || el < minWindow || len(ds.Carriers) != 1 || c1.ID != c0.ID || c1.State != rendr.CarrierActive ||
+		len(ps.Carriers) != 1 || q1.ID != q0.ID || q1.State != rendr.CarrierActive ||
 		drops(ds.Packet)+drops(ps.Packet) != 0 || ds.Packet.Received < uint64(rounds) || ps.Packet.Received < uint64(rounds) {
 		t.Fatalf("load: %d rounds in %v; dialer %+v %+v; passive %+v", rounds, el, ds, *ds.Packet, *ps.Packet)
 	}
-	t.Logf("%d allocations in %d round trips of 1000 bytes (%v; the dialer's carrier wrote %d frames, %d retransmissions)",
-		mallocs, rounds, el, c1.Frames-c0.Frames, c1.Retransmits-c0.Retransmits)
-	// Stimulus: besides one DGRAM per round the dialer's carrier wrote its
-	// control traffic — at least a PING per PacketPing of the window.
-	if ctl := c1.Frames - c0.Frames - uint64(rounds); !raceEnabled && ctl < uint64(minWindow/ov.PacketPing)-1 {
-		t.Fatalf("stimulus: %d control frames in a %v window, want ≥ one PING per %v", ctl, el, ov.PacketPing)
+	// Stimulus: the PING cadence ran in the window. Besides one DGRAM per
+	// round, each carrier wrote its PACKs, its PINGs (MTU probes included)
+	// and its PONGs to the peer's PINGs. PACKs alone are at most one per
+	// PackEvery datagrams plus one per PacketPing (the delay timer) and one
+	// of each at the edges, so with T = window/PacketPing both ends without
+	// the PING cadence write at most 2·rounds/PackEvery + 2·T + 4 control
+	// frames, and with it about 2·T more (a PING and a PONG per end per
+	// PacketPing). The bound sits halfway: an allocation per PING, PONG or
+	// MTU probe cannot pass for want of PINGs in the window.
+	const packEvery = 256 // the default PackEvery (§A5.5)
+	ticks := uint64(el / ov.PacketPing)
+	ctlD := c1.Frames - c0.Frames - uint64(rounds)
+	ctlP := q1.Frames - q0.Frames - uint64(rounds)
+	want := 2*uint64(rounds)/packEvery + 3*ticks + 4
+	t.Logf("%d allocations in %d round trips of 1000 bytes (%v); control frames: dialer %d, passive %d (stimulus bound %d); dialer retransmissions %d",
+		mallocs, rounds, el, ctlD, ctlP, want, c1.Retransmits-c0.Retransmits)
+	if !raceEnabled && ctlD+ctlP < want {
+		t.Fatalf("stimulus: %d control frames (dialer %d, passive %d) in a %v window, want ≥ %d: the PING cadence did not run", ctlD+ctlP, ctlD, ctlP, el, want)
 	}
 	if raceEnabled {
 		t.Logf("race lane: not asserted")
