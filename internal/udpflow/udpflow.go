@@ -65,7 +65,8 @@ const (
 	// Limits.Inbox and never shrinks (no allocation per datagram in steady
 	// state, no 512-entry ring per idle flow). The ring is not charged to a
 	// Budget: one entry is about 80 bytes, so a flow that once burst to the
-	// full inbox keeps about 40 KiB (Inbox 512) until it closes, at most
+	// full inbox keeps about 40 KiB (Inbox 512) until it closes (Close
+	// drops it, so a stale *Flow pins none), at most
 	// MaxFlows times that per source — bounded by Limits, not counted (the
 	// queued datagrams' buffers are charged to Env.Budget).
 	minRing = 8

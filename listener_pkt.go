@@ -2,6 +2,7 @@ package rendr
 
 import (
 	"net"
+	"slices"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -137,6 +138,12 @@ func (rt *Runtime) untrackFlows(s *session.Session) {
 // (AttachOpen): a pending session's flow waits for Confirm; an opened
 // session's OPEN_ACK(OK) follows at once, so the flow leaves its quota
 // now, as when s has no record (it ended: the carrier closes anyway).
+// A pending session outlives its carriers, so the flows of OPEN carriers
+// that died meanwhile (removed: they left the quota already) are dropped
+// first: the record holds only flows not yet closed — those of the
+// carriers s holds (at most MaxCarriersPerSession) or that are still
+// closing, plus this one — however often a dialer parks and retires OPEN
+// carriers within AcceptTimeout (invariant 4, W4-L2-1).
 func (rt *Runtime) holdFlow(s *session.Session, fl *udpflow.Flow) {
 	if fl == nil {
 		return
@@ -144,6 +151,7 @@ func (rt *Runtime) holdFlow(s *session.Session, fl *udpflow.Flow) {
 	rt.fmu.Lock()
 	fs := rt.pflows[s]
 	if fs != nil && !fs.opened {
+		fs.flows = slices.DeleteFunc(fs.flows, (*udpflow.Flow).Removed)
 		fs.flows = append(fs.flows, fl)
 		rt.fmu.Unlock()
 		return
