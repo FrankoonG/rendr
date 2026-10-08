@@ -111,6 +111,15 @@ func (f *Flow) SourceProven() { f.unadmit() }
 
 var _ carrier.SourceChecker = (*Flow)(nil)
 
+// Removed reports whether the flow was closed (Close: it left its
+// source's table and holds no inbox), so that a record of flows can drop
+// it (package rendr's pending flow record, W4-L2-1).
+func (f *Flow) Removed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
 // unadmit takes the flow out of its source IP's admitting count (once).
 func (f *Flow) unadmit() {
 	s := f.src
@@ -406,13 +415,13 @@ func (f *Flow) SetWriteDeadline(t time.Time) error {
 }
 
 // Close implements carrier.PacketIO: removes the flow (pointer compare),
-// releases its inbox and wakes its reader; the socket stays open. The
-// buffer of the datagram the reader holds is returned by its next
-// ReadDatagram or Release, never under it: Close may run on another
-// goroutine while the reader still uses that datagram (PacketIO's reader
-// half belongs to the reader), so the reader must call Release (or
-// ReadDatagram, which then fails) when it exits, or the buffer stays
-// charged to Env.Budget. Close is idempotent.
+// releases its inbox (the queued buffers and the ring) and wakes its
+// reader; the socket stays open. The buffer of the datagram the reader
+// holds is returned by its next ReadDatagram or Release, never under it:
+// Close may run on another goroutine while the reader still uses that
+// datagram (PacketIO's reader half belongs to the reader), so the reader
+// must call Release (or ReadDatagram, which then fails) when it exits, or
+// the buffer stays charged to Env.Budget. Close is idempotent.
 func (f *Flow) Close() error {
 	f.mu.Lock()
 	if f.closed {
@@ -425,6 +434,7 @@ func (f *Flow) Close() error {
 		f.head = (f.head + 1) % len(f.ring)
 		f.n--
 	}
+	f.ring, f.head = nil, 0 // a stale *Flow pins no inbox (every ring access checks closed first)
 	if f.rdlTimer != nil {
 		f.rdlTimer.Stop()
 	}
