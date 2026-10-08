@@ -47,7 +47,19 @@ type DatagramCarrier struct {
 	// rejects other values). A packet session carries application datagrams
 	// of up to MTU − 25 bytes on it. The quic module sets 1152; carrier/udp
 	// sets its MaxDatagram − 9 (its sockets add the 9-byte flow header
-	// themselves).
+	// themselves), clamped in advance to the interface MTU for an IP
+	// literal.
+	//
+	// MTU should be what every carrier of the factory carries: DialPacket's
+	// metadata check (an OPEN takes MTU − 99 bytes of metadata at most), the
+	// MaxPayload offer and the opening race read it before any carrier
+	// exists. A carrier whose transport carries less (a carrier/udp socket
+	// clamped at Dial to its interface MTU) offers its own lower budget, and
+	// a MaxPayload offer that fits MTU − 25 is lowered to that budget − 25 in
+	// its OPEN, so the session's MaxPayload still fits the carrier that
+	// opened it; metadata that fits MTU but not such a carrier's budget ends
+	// DialPacket with ErrMetadataTooLarge once NoPathGrace passed, instead
+	// of at once.
 	MTU int
 }
 

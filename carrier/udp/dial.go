@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 )
@@ -63,6 +64,48 @@ func dial(ctx context.Context, network, address string, o Options) (net.PacketCo
 	}
 	return carrier.NewOwnedUDP(u, peer, newFlowID(), maxDatagram), net.UDPAddrFromAddrPort(peer), nil
 }
+
+// literalClamp is Carrier's advance clamp of maxDatagram (W4 L3-1): for an
+// IP literal with a numeric port that dial accepts, routeClamp as dial
+// applies it, bounded by literalClampWait; for anything else — a host
+// name, which only dial resolves, an address dial refuses, a failed route
+// lookup or a clamp below the floor, all of which dial reports itself —
+// maxDatagram unchanged.
+func literalClamp(network, address string, allowNonLoopback bool, maxDatagram int) int {
+	if checkNetwork(network) != nil {
+		return maxDatagram
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return maxDatagram
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return maxDatagram
+	}
+	pn, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return maxDatagram
+	}
+	if !allowNonLoopback && checkAddrs(address, []netip.Addr{ip}) != nil {
+		return maxDatagram
+	}
+	ip, ok := pickAddr(network, []netip.Addr{ip})
+	if !ok || ip.IsUnspecified() {
+		return maxDatagram
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), literalClampWait)
+	defer cancel()
+	m, err := routeClamp(ctx, netip.AddrPortFrom(peerZone(ip), uint16(pn)), maxDatagram, sysRouteSource, sysInterfaceTable)
+	if err != nil {
+		return maxDatagram
+	}
+	return m
+}
+
+// literalClampWait bounds Carrier's advance clamp (a route lookup and the
+// interface table: milliseconds).
+const literalClampWait = time.Second
 
 // bindAddr returns the address a dialer socket for peer binds and its
 // network: the loopback address of the peer's family for a loopback peer,

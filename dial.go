@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -77,6 +78,9 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 		return nil, net.ErrClosed
 	}
 	reg := &dialReg{rt: rt, sid: sid}
+	if packet && p.streams == 0 {
+		reg.fit = newOpenFit(len(p.factories))
+	}
 	s, created, err := p.open(ctx, sid, o, packet, reg)
 	if err != nil {
 		// The placeholder's MaxSessions unit is free at once; the session's
@@ -87,6 +91,11 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 		}
 		if rt.closing.Load() && ctx.Err() == nil {
 			return nil, net.ErrClosed // the Runtime closed during the Dial
+		}
+		if reg.fit.tooSmall(len(o.Metadata)) && errors.Is(err, ErrNoPath) {
+			// W4 L3-1: every factory's carriers carried less than its MTU
+			// promised, too little for this OPEN.
+			return nil, fmt.Errorf("rendr: DialPacket: %d bytes of metadata, more than the carriers' OPEN can carry: %w (%v)", len(o.Metadata), ErrMetadataTooLarge, err)
 		}
 		return nil, err
 	}
@@ -109,7 +118,7 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 // Peer's health layer itself for the session's lifetime. created reports
 // whether session.Dial created a session — then that session calls reg's
 // Ended exactly once, also when Dial failed (it withdraws in the
-// background).
+// background). reg.fit, when not nil, records the carriers' frame budgets.
 func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bool, reg *dialReg) (s *session.Session, created bool, err error) {
 	rt := p.rt
 	dctx, cancel := context.WithCancelCause(ctx)
@@ -124,6 +133,9 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	env.Registry = reg
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
+	if reg.fit != nil {
+		spec.Factories = reg.fit.wrap(spec.Factories)
+	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
 	// no Registry call) when ctx is done at its entry check — its first Err
@@ -182,6 +194,58 @@ func openCapable(fs []carrier.Factory, meta int) bool {
 		}
 	}
 	return false
+}
+
+// openFit records, for one packet Dial on a Peer without a stream
+// factory, the frame budget of the latest carrier each datagram factory
+// returned (W4 L3-1): a carrier/udp socket clamped at Dial to its interface
+// MTU carries less than its factory MTU — the budget openCapable checked —,
+// and an OPEN that does not fit it fails its attempt (ErrH1TooLarge). When
+// every datagram factory returned such a carrier too small for the OPEN, a
+// Dial that ends with ErrNoPath ends with ErrMetadataTooLarge instead. A
+// factory that never returned a carrier proves nothing: the Dial then keeps
+// ErrNoPath.
+type openFit struct {
+	budget []atomic.Int32 // per factory: 0 unknown, else min(MTU, transport limit)
+}
+
+func newOpenFit(n int) *openFit { return &openFit{budget: make([]atomic.Int32, n)} }
+
+// wrap returns a copy of fs whose datagram factories record the budget of
+// every rendr-owned UDP carrier they return (an embedder conn's budget is
+// its factory MTU, which openCapable already checked).
+func (f *openFit) wrap(fs []carrier.Factory) []carrier.Factory {
+	out := make([]carrier.Factory, len(fs))
+	copy(out, fs)
+	for i := range out {
+		dial, mtu := out[i].DialPacket, out[i].MTU
+		if out[i].Kind != wire.KindDatagram || dial == nil {
+			continue
+		}
+		b := &f.budget[i]
+		out[i].DialPacket = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			pc, a, err := dial(ctx)
+			if o, ok := pc.(*carrier.OwnedUDP); ok && o != nil && err == nil {
+				b.Store(int32(min(o.Limit(), mtu)))
+			}
+			return pc, a, err
+		}
+	}
+	return out
+}
+
+// tooSmall reports whether every factory recorded a carrier budget too
+// small for an OPEN with meta bytes of metadata (false for a nil f).
+func (f *openFit) tooSmall(meta int) bool {
+	if f == nil {
+		return false
+	}
+	for i := range f.budget {
+		if b := int(f.budget[i].Load()); b == 0 || openOverhead+meta <= b {
+			return false
+		}
+	}
+	return len(f.budget) > 0
 }
 
 // packetOffer is a packet session's MaxPayload offer (M2-D49, M2 design
@@ -244,6 +308,7 @@ func (c *entryCtx) Err() error {
 type dialReg struct {
 	rt  *Runtime
 	sid SessionID
+	fit *openFit // a packet Dial without stream factories: the carriers' budgets (W4 L3-1)
 
 	mu    sync.Mutex
 	ended bool // Ended ran
