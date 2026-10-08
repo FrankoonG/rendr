@@ -80,7 +80,10 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // of a copy of payload; H1 = PREFACE ‖ REL{FirstCseq, OPEN | JOIN} (a
 // probe: PREFACE ‖ PING) written once and resent verbatim at RelRTOInit
 // doubling to RelRTOMax until a PREFACE_ACK, a RACK covering it or the
-// response, at most Handshake.Timeout after the first copy; the
+// response, at most Handshake.Timeout after the first copy (after a RACK
+// covering it and before the response, a copy every RelRTOMax is a
+// keepalive that reveals a NAT rebind to a held passive flow, not counted
+// as a retransmission; integration 2, K5); the
 // PREFACE_ACK checked in M1's canonical order (a malformed one is a lost
 // datagram; before it, only a rebind challenge is answered, R1-14); then,
 // until the response, frames through the receive window:
@@ -338,6 +341,7 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 	k := 0
 	next := now.Add(sched.RTOBackoffWithin(tm.RelRTOInit, 0, tm.RelRTOMax))
 	resendUntil := now.Add(tm.HandshakeTimeout)
+	acked := false // a RACK covered H1's REL: copies are keepalives
 
 	var (
 		ack      wire.PrefaceAck
@@ -356,8 +360,12 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 				if err := d.write(h1); err != nil { // the same bytes: a verbatim copy (PA-21)
 					return d.failed(stageOf(ackBytes), CauseTransportError, ackBytes != nil, ack.Instance, err, false)
 				}
-				d.retx++
-				next = now.Add(sched.RTOBackoffWithin(tm.RelRTOInit, k, tm.RelRTOMax))
+				if acked {
+					next = now.Add(tm.RelRTOMax) // a keepalive (K5): not a retransmission
+				} else {
+					d.retx++
+					next = now.Add(sched.RTOBackoffWithin(tm.RelRTOInit, k, tm.RelRTOMax))
+				}
 			} else {
 				next = time.Time{} // copies stop Handshake.Timeout after the first
 			}
@@ -427,8 +435,14 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 			}
 			return d.failed("response", CauseProtocolViolation, true, ack.Instance, verr, false)
 		}
-		if r.acked {
-			next = time.Time{} // a RACK covering H1's REL: no more copies
+		if r.acked && !acked {
+			// A RACK covering H1's REL ends its retransmission. While the
+			// response is outstanding (a held passive carrier waits for
+			// Confirm), a verbatim copy still leaves every RelRTOMax: a
+			// keepalive that lets the held passive flow see a NAT rebind
+			// and challenge the new address (R1-14; integration 2, K5).
+			acked = true
+			next = time.Now().Add(tm.RelRTOMax)
 		}
 		if !r.ok {
 			io.Release()
