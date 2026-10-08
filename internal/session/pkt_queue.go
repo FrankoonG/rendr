@@ -56,6 +56,11 @@ func (q *pring) front() *pdesc {
 	return &q.desc[q.head]
 }
 
+// back returns the tail descriptor (q.n > 0).
+func (q *pring) back() *pdesc {
+	return &q.desc[(q.head+q.n-1)&(len(q.desc)-1)]
+}
+
 // chunkAt returns the chunk with absolute number c (held by the ring).
 func (q *pring) chunkAt(c uint32) *carrier.Buf {
 	i := q.chead + int(c-q.cbase)

@@ -89,7 +89,12 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 				continue
 			}
 			if dg && n > b.DgramRoom() {
-				if s.pktOtherCarrierLocked(l, n, false) {
+				// A wide head (queued above the smallest member's DgramMax:
+				// a mixed-budget bond) waits for a member that can carry it
+				// at all; any other head is one a budget shrink left behind
+				// and waits only for a member that can place it now
+				// (W4-REL-5, L37).
+				if s.pktOtherCarrierLocked(l, n, d.wide) {
 					return placed // that lane takes the head; nothing overtakes it here
 				}
 				q.evict()
@@ -169,15 +174,14 @@ func (s *Session) pktHasDataLaneLocked() bool {
 // write-blocked). A capable member that cannot write now does not hold the
 // queue behind the head until MaxAge: the head is dropped as too large
 // instead, and the datagrams behind it are not held up
-// (TestPacketShrinkDropsAtOnce_L37). Fill cannot tell a lane whose own
-// budget shrank from a smaller member of a mixed-budget bond, so this is
-// also the rule for the latter (M2-D45 trade-off): while the only members
-// that can carry the head are write-blocked or at their capacity, a Fill
-// of a smaller member — its PACK duty, a control frame, a wake for another
-// queue — drops every head it cannot carry as DropTooLarge. The wake
-// policy never wakes it for them (ever true below), so without such a
-// Fill they wait and age out as DropAge
-// (TestPacketFallbackWriteBlocked_L08, extra-fill).
+// (TestPacketShrinkDropsAtOnce_L37). That is the rule for a head a budget
+// shrink left behind. A head of a mixed-budget bond — queued above the
+// smallest live datagram member's DgramMax (pdesc.wide) — is filled with
+// ever true instead: a smaller member's Fill for another reason (its PACK
+// duty, a control frame) leaves it for the larger member even while that
+// one is write-blocked or at its capacity, rather than dropping it as
+// DropTooLarge (W4-REL-5; TestPacketFallbackWriteBlocked_L08, extra-fill).
+// It is still dropped when no live member can carry it at all.
 //
 // With ever true (the wake policy's fallback decision) a lane that could
 // carry the head at all counts too — a datagram data lane whose DgramMax
@@ -232,8 +236,9 @@ func (s *Session) pktBigPushedLocked() {
 	}
 }
 
-// pktRouteLocked is pktRecomputeLocked (§A5.2): pk.dgMax = the largest
-// DgramMax over live datagram data lanes (0: none); pk.mixed = bond with
+// pktRouteLocked is pktRecomputeLocked (§A5.2): pk.dgMax and pk.dgMin =
+// the largest and smallest DgramMax over live datagram data lanes (0:
+// none); pk.mixed = bond with
 // live datagram data lanes and a stream member — a live stream data lane,
 // or (passive) a confirmed stream member awaiting the SCHED that routes it
 // (C4-F2: Status lists it as a member, and the dialer lists it in its next
@@ -244,7 +249,7 @@ func (s *Session) pktBigPushedLocked() {
 // lane is forgotten once it is no data lane.
 func (s *Session) pktRouteLocked() {
 	pk := s.pk
-	dgMax, stream, held, dgram := 0, false, false, false
+	dgMax, dgMin, stream, held, dgram := 0, 0, false, false, false
 	for _, l := range s.st.order {
 		if l.state == LaneDead {
 			continue
@@ -257,13 +262,17 @@ func (s *Session) pktRouteLocked() {
 			continue
 		}
 		if dg {
+			m := pp.DgramMax()
+			if !dgram || m < dgMin {
+				dgMin = m
+			}
 			dgram = true
-			dgMax = max(dgMax, pp.DgramMax())
+			dgMax = max(dgMax, m)
 		} else {
 			stream = true
 		}
 	}
-	pk.dgMax = dgMax
+	pk.dgMax, pk.dgMin = dgMax, dgMin
 	pk.mixed = s.p.Mode == ModeBond && (stream || held) && dgram
 	pk.bigHeld = pk.mixed && !stream
 	if !stream && !held && pk.txBig.n > 0 {
