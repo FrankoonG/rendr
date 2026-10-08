@@ -537,7 +537,10 @@ func (s *stuckPC) Close() error {
 // still holding its Budget-charged read buffer. Once that ReadFrom
 // returns, the demux goroutine leaves the abandoned pool and releases the
 // buffer (L52). The source's Done is not that exit: the test waits for the
-// pool and the Budget, not for Datagram.Sources, which was 0 already.
+// pool and the Budget, not for Datagram.Sources, which was 0 already. A
+// BufferedBytes above 0 after Close is the exception Status documents for
+// buffers held by abandoned calls (M1's abandoned-call rule); it is
+// required here so the drain after the release is observed, not assumed.
 func TestPacketSourceIgnoresClose_L50(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var s *stuckPC

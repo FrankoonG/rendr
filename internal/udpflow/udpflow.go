@@ -271,9 +271,12 @@ func (s *Source) Abort() {
 	s.mu.Unlock()
 }
 
-// Done is closed when Run returned, the socket is closed and every flow
-// ended. It never closes for a source whose Run was never called: package
-// rendr starts Run for every Source it creates.
+// Done is closed when Run returned (or was abandoned: its ReadFrom
+// ignored the close for AbandonWait, L50), the socket is closed and every
+// flow ended. An abandoned Run's read buffers stay charged (Budget and
+// Stages) until that ReadFrom returns (M1's abandoned-call rule). It never
+// closes for a source whose Run was never called: package rendr starts Run
+// for every Source it creates.
 func (s *Source) Done() <-chan struct{} { return s.done }
 
 // Stats returns the source's counters (rendr.Status.Datagram).
@@ -352,7 +355,8 @@ func (s *Source) sockClosed() {
 }
 
 // runStuck is the run watch's expiry: Run's ReadFrom ignored the close for
-// AbandonWait; it is counted as abandoned and no longer holds up Done.
+// AbandonWait; it is counted as abandoned and no longer holds up Done. Its
+// read buffers are released by reader.exit once the ReadFrom returns.
 func (s *Source) runStuck() {
 	s.mu.Lock()
 	if s.run == runRunning {

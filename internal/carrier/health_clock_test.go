@@ -89,7 +89,28 @@ func TestProbeSubTickRTTIsASample_L28(t *testing.T) {
 			// The probe carrier's cadence PINGs at 0, 2 and 4 s (the
 			// establishment PONG is no sample, D26): every PONG measures 0,
 			// and none races its commit, so each is a sample.
-			r.until(4500 * time.Millisecond)
+			settle := func() {
+				// The test's own synctest.Wait takes sem like a pump's: two
+				// concurrent Waits panic. It repeats while a socket model
+				// still holds bytes (its pump waited for sem behind us), so
+				// the snapshot sees every write that was due by now.
+				for {
+					sem <- struct{}{}
+					synctest.Wait()
+					<-sem
+					smu.Lock()
+					busy := false
+					for _, sc := range socks {
+						busy = busy || sc.pending()
+					}
+					smu.Unlock()
+					if !busy {
+						return
+					}
+				}
+			}
+			time.Sleep(time.Until(r.start.Add(4500 * time.Millisecond)))
+			settle()
 			s := r.h.Snapshot()
 			for i := range s.Sum {
 				if s.Info[i].Attempts != 1 || s.Info[i].Samples != 3 || s.Failed[i] {
@@ -120,8 +141,10 @@ func TestProbeSubTickRTTIsASample_L28(t *testing.T) {
 // buffer once every other goroutine of the bubble is durably blocked
 // (synctest.Wait), so bytes leave only after the writing goroutine
 // finished what follows its Write — no virtual time passes. sem
-// serializes the pumps' synctest.Wait calls (concurrent ones panic); a
-// channel, so a pump waiting for it is durably blocked.
+// serializes the synctest.Wait calls of every pump and of the test
+// goroutine (concurrent ones panic): no goroutine of the bubble may call
+// synctest.Wait without holding it. It is a channel, so a goroutine
+// waiting for it is durably blocked.
 type prSockConn struct {
 	net.Conn
 	sem    chan struct{}
@@ -155,6 +178,14 @@ func (c *prSockConn) Write(p []byte) (int, error) {
 	default:
 	}
 	return len(p), nil
+}
+
+// pending reports whether the model holds bytes its pump has not
+// forwarded yet.
+func (c *prSockConn) pending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.buf) != 0 && c.err == nil
 }
 
 func (c *prSockConn) Close() error {
