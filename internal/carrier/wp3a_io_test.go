@@ -88,8 +88,9 @@ func TestDatagramWriteCount_L42(t *testing.T) {
 // TestDatagramReadCount_L42: a read error — an invalid count the adapter
 // reports, a closed conn — ends the carrier; a truncated or empty datagram
 // is dropped and counted, never a death (PA-18); and a transport that hands
-// over nothing forever never makes the reader spin: after 64 such reads it
-// backs off to 100 ms (R1-27, M2-D86).
+// over nothing forever never makes the reader spin: every 64 such reads
+// pause 1 ms — fixed, not doubling, so a real burst is still read fast
+// (R1-27 and M2-D86 as amended by WP12).
 func TestDatagramReadCount_L42(t *testing.T) {
 	t.Run("invalid count", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -137,18 +138,16 @@ func TestDatagramReadCount_L42(t *testing.T) {
 			s.io.endless = ReadEmpty
 			s.io.mu.Unlock()
 			s.start(StartOptions{})
-			time.Sleep(time.Second)
+			time.Sleep(500 * time.Millisecond)
 			n1 := s.io.nreads.Load()
-			time.Sleep(10 * time.Second)
+			time.Sleep(time.Second)
 			n2 := s.io.nreads.Load()
-			if dead, cause, detail, _ := s.c.Death(); dead && cause != CausePingTimeout {
+			if dead, cause, detail, _ := s.c.Death(); dead {
 				t.Fatalf("carrier died: %v %q", cause, detail)
 			}
-			if r := float64(n2-n1) / 10; r > 20 {
-				t.Fatalf("%.1f reads per second after the first 64, want ≤ 20", r)
-			}
-			if n1 < 64 {
-				t.Fatalf("%d reads in the first second, want the 64 before the back-off", n1)
+			const perSecond = spinIdle * int64(time.Second/spinPause)
+			if r := n2 - n1; r < perSecond-spinIdle || r > perSecond+2*spinIdle {
+				t.Fatalf("%d reads in 1 s, want about %d (%d per %v: neither a spin nor a doubling back-off)", r, perSecond, spinIdle, spinPause)
 			}
 		})
 	})
