@@ -303,12 +303,14 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 			// short pause's whole window — or, with GOMAXPROCS=1, by about
 			// 190 ms in every run. A run whose pause misses the window is
 			// repeated, at most edgeAttempts times, with the short pause's
-			// first transfer corrected by its measured overshoot
-			// (edgeRetryLead); the assertions below apply to the run whose
-			// stimulus holds.
+			// first transfer corrected by the smallest overshoot measured so
+			// far (edgeRetryLead); the assertions below apply to the run
+			// whose stimulus holds.
 			var r guardResult
+			over := time.Duration(math.MaxInt64) // the smallest ramp overshoot seen
 			for attempt := 1; ; attempt++ {
 				r = runGuardBulk(t, gb)
+				over = min(over, r.leadDur-gb.lead)
 				if tc.lead > 0 {
 					t.Logf("first transfer of %v took %v; pause between the transfers %v", gb.lead, r.leadDur, r.pause)
 				}
@@ -320,7 +322,7 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 					t.Fatalf("stimulus: %s (attempt %d of %d)", miss, attempt, edgeAttempts)
 				}
 				if tc.name == "restart-short-pause" {
-					gb.lead = edgeRetryLead(gb, r.leadDur)
+					gb.lead = edgeRetryLead(gb, over)
 				}
 				t.Logf("stimulus missed in attempt %d: %s; the run is repeated with a first transfer of %v", attempt, miss, gb.lead)
 			}
@@ -335,8 +337,11 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 // edgeAttempts bounds the runs of one TestDownloadGuardEdges_L29 case whose
 // stimulus misses its window (a miss happened in about 1 of 10 runs of
 // restart-short-pause; with GOMAXPROCS=1 its first run always misses, and
-// the corrected second one hits).
-const edgeAttempts = 4
+// the corrected second one hits). Under -race on Linux the overshoot takes
+// one of about three values per run (13, 33 or 171 ms), independent of the
+// first transfer's length; a length set for the smallest hits with the
+// first two and misses with the third, so up to six runs are allowed.
+const edgeAttempts = 6
 
 // guardProbeInterval is the Probe.Interval of the guard scenarios (the
 // default): a's probe PINGs commit that far apart.
@@ -350,16 +355,19 @@ func edgeShortPause(gb guardBulk) (lo, hi time.Duration) {
 }
 
 // edgeRetryLead returns restart-short-pause's first transfer for the run
-// after one whose first transfer took took and missed the window. The
+// after one that missed the window, given over, the smallest overshoot of
+// a first transfer's duration over its nominal length measured so far. The
 // transfer starts at one of a's probe PINGs and the bulk at the next one,
 // so it should end the middle of the window before that PING:
 // guardProbeInterval − (lo+hi)/2 after its start. The ramp's extra time
-// over the transfer's nominal length repeats from run to run (the bubble
-// is deterministic for a given GOMAXPROCS), so the length is corrected by
-// the measured overshoot.
-func edgeRetryLead(gb guardBulk, took time.Duration) time.Duration {
+// mostly repeats from run to run (the bubble is deterministic for a given
+// GOMAXPROCS) but under -race takes one of a few values; correcting by the
+// latest one alternated between a length too long for the small values and
+// one too short for the large one (L29 on the Linux race lane), so the
+// length is corrected by the smallest.
+func edgeRetryLead(gb guardBulk, over time.Duration) time.Duration {
 	lo, hi := edgeShortPause(gb)
-	return gb.lead + guardProbeInterval - (lo+hi)/2 - took
+	return guardProbeInterval - (lo+hi)/2 - over
 }
 
 // edgeStimulus reports why a run of case name with pause between the
