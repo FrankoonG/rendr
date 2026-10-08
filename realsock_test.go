@@ -19,20 +19,32 @@ import (
 // counted as queue drops; the §A7.2 identities on both ends), and nothing
 // left after Runtime.Close.
 
+// realLossWindows are the loss windows of a real-time smoke over
+// carrier/udp: a lost datagram must have been sent in [T_k − pre,
+// T_k + post] of a kill at T_k (M2 design B1.4, F8: ± 200 ms; the 50-ms
+// pre-window of runSmoke's default is tighter). Under -race in real time
+// the receiving reader can lag 100 ms and more, so datagrams that still
+// sat unread in the killed socket were in flight on the dead carrier, and
+// the passive's switch to the new carrier lags as much: both windows
+// widen.
+func realLossWindows() (pre, post time.Duration) {
+	if loopbackRace {
+		return 250 * time.Millisecond, 500 * time.Millisecond
+	}
+	return 0, 200 * time.Millisecond
+}
+
 // TestUDPEndToEnd: selector and bond, 10 s at 2,000 datagrams per second
 // (1,000 back), one carrier closed under rendr at 5 s (an embedder-closed
 // socket: transport_error at once); the session moves to a new carrier and
 // keeps every datagram that was not in flight on the dead one.
 func TestUDPEndToEnd(t *testing.T) {
-	pre := time.Duration(0)
-	if loopbackRace {
-		pre = 250 * time.Millisecond // see TestPacketSmokeUDP60_CA
-	}
+	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
 			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: 10 * time.Second, every: 5 * time.Second,
-				rate: 2000, back: 1000, lossWin: 5 * time.Second, preWin: pre}, rendr.Config{})
+				rate: 2000, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
 }
@@ -48,18 +60,16 @@ func TestPacketSmokeUDP60_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("60-s real-time smoke")
 	}
-	rate, pre := 10000, time.Duration(0)
+	rate := 10000
 	if loopbackRace {
-		// Under -race in real time the receiving reader can lag 100 ms
-		// and more: datagrams that still sat unread in the killed socket
-		// were in flight on the dead carrier.
-		rate, pre = 2000, 250*time.Millisecond
+		rate = 2000
 	}
+	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
 			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: 60 * time.Second, every: 10 * time.Second,
-				rate: rate, back: 1000, lossWin: 5 * time.Second, preWin: pre}, rendr.Config{})
+				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
 }

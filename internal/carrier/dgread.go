@@ -9,14 +9,22 @@ import (
 // The reader of a datagram carrier (M2-D13, M2-D14, M2-D30; M2 design
 // §A5.7 and Revision 1, R1-1, R1-4, R1-27).
 
-// Reader back-off (M2-D15, M2-D86): a transient read error, and every read
-// after spinIdle consecutive reads that handed nothing over (on a transport
-// other than rendr's own UDP socket), waits noiseMin, doubling to noiseMax,
-// until a datagram is handed over.
+// Reader back-off (M2-D15): a transient read error waits noiseMin, doubling
+// to noiseMax, until a datagram is handed over. The spin guard (M2-D86,
+// R1-27 as amended by WP12): every spinIdle consecutive reads that handed
+// nothing over (empty, truncated, foreign, bad envelope) pause spinPause —
+// fixed, not doubling, as udpflow's emptyRun/emptyPause (L58). A conn that
+// answers (0, nil) forever is read at most spinIdle times per spinPause
+// instead of spinning a core, while a burst of real empty or foreign
+// datagrams is still read at tens of thousands per second: a doubling
+// back-off read the rest of a 400-datagram burst at 100 ms each and
+// starved the carrier into a ping_timeout (WP12
+// TestUDPZeroLengthIsNotDeath_L42).
 const (
-	noiseMin = 5 * time.Millisecond
-	noiseMax = 100 * time.Millisecond
-	spinIdle = 64
+	noiseMin  = 5 * time.Millisecond
+	noiseMax  = 100 * time.Millisecond
+	spinIdle  = 64
+	spinPause = time.Millisecond
 )
 
 // dbufs returns the pool of datagram reader buffers and writer scratches:
@@ -33,7 +41,6 @@ type dgReader struct {
 	buf     *Buf // the read buffer, io.ReadSize() bytes (nil: the transport hands out its own)
 	backoff time.Duration
 	idle    int         // consecutive reads that handed nothing over
-	guard   bool        // the spin guard applies (not on rendr's own socket)
 	timer   *time.Timer // the back-off timer, created at the first back-off
 }
 
@@ -44,13 +51,7 @@ type dgReader struct {
 // it (PA-1); a read error, a violation or the end of a retirement does.
 func (c *Conn) dgReadLoop() {
 	dg := c.dg
-	// rendr's own socket cannot spin: each of its reads consumes a datagram
-	// that someone sent, so a burst of empty, foreign or malformed ones is
-	// read at once instead of 100 ms each behind the back-off, which would
-	// starve the carrier into a ping_timeout (as udpflow reads its own
-	// socket, L58; WP12 TestUDPZeroLengthIsNotDeath_L42).
-	_, own := dg.io.(*OwnedUDP)
-	rd := &dgReader{guard: !own}
+	rd := &dgReader{}
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder ReadFrom (L51)
@@ -113,8 +114,9 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 		}
 		dg.io.Release()
 		rd.idle++
-		if rd.guard && rd.idle >= spinIdle {
-			return c.dgBackoff(rd) // the spin guard (R1-27)
+		if rd.idle >= spinIdle {
+			rd.idle = 0
+			return c.dgPause(rd, spinPause) // the spin guard (R1-27)
 		}
 		return true
 	}
@@ -130,16 +132,22 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 // here: a transport that keeps answering after Close (empties, noise)
 // never makes it spin.
 func (c *Conn) dgBackoff(rd *dgReader) bool {
+	rd.backoff = min(max(2*rd.backoff, noiseMin), noiseMax)
+	return c.dgPause(rd, rd.backoff)
+}
+
+// dgPause sleeps d on the reader's timer; it reports whether the reader
+// continues (false: the carrier is dying).
+func (c *Conn) dgPause(rd *dgReader, d time.Duration) bool {
 	select {
 	case <-c.dying:
 		return false
 	default:
 	}
-	rd.backoff = min(max(2*rd.backoff, noiseMin), noiseMax)
 	if rd.timer == nil {
-		rd.timer = time.NewTimer(rd.backoff)
+		rd.timer = time.NewTimer(d)
 	} else {
-		rd.timer.Reset(rd.backoff)
+		rd.timer.Reset(d)
 	}
 	select {
 	case <-rd.timer.C:

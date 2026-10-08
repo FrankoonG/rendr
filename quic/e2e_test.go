@@ -878,8 +878,9 @@ func retireOnce(t *testing.T, e *qeEnv, kind rendr.Kind, passiveFirst bool, i in
 	case <-time.After(5 * time.Second):
 		t.Fatal("the dialer's QUIC connection was not released within 5 s of the session's end")
 	}
-	if took := at.Sub(<-ended); took > 750*time.Millisecond {
-		t.Errorf("the dialer's connection was released %v after its session ended, beyond the 500-ms linger", took)
+	// The linger's clamp is 500 ms; 100 ms more covers scheduling.
+	if took := at.Sub(<-ended); took > 600*time.Millisecond {
+		t.Errorf("the dialer's connection was released %v after its session ended, beyond the 500-ms linger (+100 ms)", took)
 	} else {
 		t.Logf("session %d: the dialer's connection was released %v after its session ended (%v)", i, took, context.Cause(dqc.Context()))
 	}

@@ -47,7 +47,7 @@ type smokeRun struct {
 	every    time.Duration // a kill every this long
 	rate     int           // dialer → passive datagrams per second
 	back     int           // passive → dialer datagrams per second
-	lossWin  time.Duration // losses must start within this after a kill
+	lossWin  time.Duration // a lost datagram was sent within this after a kill
 	preWin   time.Duration // ... or within this before it (0: 50 ms)
 }
 
@@ -296,8 +296,9 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 				}
 			}
 		}
+		at := time.Since(start) // the pre-command time (B0 F8)
 		if victim >= 0 && n.kill(victim) {
-			kills = append(kills, time.Since(start))
+			kills = append(kills, at)
 		}
 	}
 	time.Sleep(time.Until(start.Add(r.duration)))
@@ -356,12 +357,19 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 		}
 		// Losses away from every kill must be counted drops of the
 		// session's own queues (none in virtual time; in real time under
-		// -race a host stall can age one out: DropAge), never silent.
+		// -race a host stall can age one out: DropAge), never silent. Each
+		// lost datagram is judged by its own send time (seq / rate), so a
+		// range that starts at a kill does not excuse its tail.
 		var away uint64
+		var late time.Duration // the latest send time of a loss after its kill
 		for _, m := range res.Missing {
-			at := time.Duration(float64(m.From) / float64(x.rate) * float64(time.Second))
-			if !nearKill(at, kills, r.preWin, r.lossWin) {
-				away += m.To - m.From + 1
+			for seq := m.From; seq <= m.To; seq++ {
+				at := time.Duration(float64(seq) / float64(x.rate) * float64(time.Second))
+				if !nearKill(at, kills, r.preWin, r.lossWin) {
+					away++
+				} else if d := sinceKill(at, kills, r.lossWin); d > late {
+					late = d
+				}
 			}
 		}
 		if counted := tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge + rp.DropRecvQueue; away > counted {
@@ -380,8 +388,8 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 		if rp.Received > tp.Sent || rp.Duplicates != 0 {
 			t.Errorf("%s: Received %d of Sent %d, Duplicates %d", x.name, rp.Received, tp.Sent, rp.Duplicates)
 		}
-		t.Logf("%s: accepted %d, unique %d, lost %d (%.3f%%), missing ranges %d, max gap %v; tx %+v; rx %+v",
-			x.name, x.sentSeqs, res.Unique, lost, 100*float64(lost)/float64(max(x.sentSeqs, 1)), len(res.Missing), res.MaxGap, *tp, *rp)
+		t.Logf("%s: accepted %d, unique %d, lost %d (%.3f%%), missing ranges %d, latest loss %v after its kill, max gap %v; tx %+v; rx %+v",
+			x.name, x.sentSeqs, res.Unique, lost, 100*float64(lost)/float64(max(x.sentSeqs, 1)), len(res.Missing), late, res.MaxGap, *tp, *rp)
 	}
 	t.Logf("kills at %v; dialer CarrierDown events %d; migrations dialer %+v passive %+v", kills, downs.Load(), ds.Migrations, ps.Migrations)
 
@@ -423,6 +431,16 @@ func nearKill(at time.Duration, kills []time.Duration, pre, win time.Duration) b
 	return false
 }
 
+// sinceKill returns at − k for a kill k with k ≤ at ≤ k + win (0: none).
+func sinceKill(at time.Duration, kills []time.Duration, win time.Duration) time.Duration {
+	for _, k := range kills {
+		if k <= at && at <= k+win {
+			return at - k
+		}
+	}
+	return 0
+}
+
 func waitDone(t *testing.T, done <-chan struct{}, what string) {
 	t.Helper()
 	select {
@@ -449,7 +467,7 @@ func TestPacketSmoke_CA(t *testing.T) {
 					n := tr.net()
 					defer n.close()
 					runSmoke(t, n, smokeRun{mode: mode, duration: 60 * time.Second, every: 10 * time.Second,
-						rate: rate, back: 1000, lossWin: 5 * time.Second}, rendr.Config{})
+						rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				})
 			})
 		}
@@ -467,12 +485,13 @@ func TestPacketSmokeUDP_CA(t *testing.T) {
 	if loopbackRace {
 		rate = 2000
 	}
+	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			g0 := runtime.NumGoroutine()
 			n := smokeUDPNet(t)
 			runSmoke(t, n, smokeRun{mode: mode, duration: 10 * time.Second, every: 2 * time.Second,
-				rate: rate, back: 1000, lossWin: 5 * time.Second}, rendr.Config{})
+				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 			deadline := time.Now().Add(5 * time.Second)
 			for runtime.NumGoroutine() > g0 && time.Now().Before(deadline) {
 				time.Sleep(10 * time.Millisecond)
