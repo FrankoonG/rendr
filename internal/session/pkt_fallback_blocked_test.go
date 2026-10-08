@@ -24,26 +24,35 @@ import (
 // fills again: every datagram still younger than MaxAge goes out on A, in
 // order and intact; one older than MaxAge counts as DropAge (a data lane
 // that can carry it exists), never DropTooLarge.
+//
+// extra-fill records the M2-D45 trade-off (pktOtherCarrierLocked): Fill
+// cannot tell B, the smaller member of a mixed-budget bond, from a lane
+// whose own budget shrank (TestPacketShrinkDropsAtOnce_L37), so when B
+// fills for another reason while A is blocked — here one Fill after the
+// 10th write, as B's PACK duty or a control frame would run it — it drops
+// the 10 queued heads as DropTooLarge; the 10 written after it wait for A.
 func TestPacketFallbackWriteBlocked_L08(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		blocked time.Duration // from the first write to A's write returning
-		kept    int           // datagrams younger than MaxAge (100 ms) then
+		name      string
+		blocked   time.Duration // from the first write to A's write returning
+		extraFill int           // B fills once after this many writes (0: never)
+		kept      int           // datagrams younger than MaxAge (100 ms) then
 	}{
-		{"60ms", 60 * time.Millisecond, 20},
+		{"60ms", 60 * time.Millisecond, 0, 20},
 		// Written at 0, 3, …, 57 ms; at 150 ms those written before 50 ms
 		// (17) are older than MaxAge; the last 3 (51, 54, 57 ms) are not.
-		{"150ms", 150 * time.Millisecond, 3},
+		{"150ms", 150 * time.Millisecond, 0, 3},
+		{"extra-fill", 60 * time.Millisecond, 10, 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				testFallbackWriteBlocked(t, tc.blocked, tc.kept)
+				testFallbackWriteBlocked(t, tc.blocked, tc.extraFill, tc.kept)
 			})
 		})
 	}
 }
 
-func testFallbackWriteBlocked(t *testing.T, blocked time.Duration, kept int) {
+func testFallbackWriteBlocked(t *testing.T, blocked time.Duration, extraFill, kept int) {
 	const (
 		total = 20
 		n     = 1200
@@ -87,6 +96,17 @@ func testFallbackWriteBlocked(t *testing.T, blocked time.Duration, kept int) {
 	for i := 1; i <= total; i++ {
 		dpWrite(t, s, uint64(i), n)
 		runB()
+		if i == extraFill {
+			// B fills for a reason of its own (PACK duty, a control frame):
+			// it cannot carry a head and drops each as too large.
+			b := dpFill(lb, time.Now())
+			fs := dpFrames(b)
+			b.ReleaseRefs()
+			bDgrams += dpCount(fs, wire.TypeDgram)
+			if c := dpCtr(s); c.DropTooLarge != uint64(extraFill) {
+				t.Fatalf("stimulus: B's extra Fill dropped %d heads, want the %d queued (counters %+v)", c.DropTooLarge, extraFill, c)
+			}
+		}
 		if i < total {
 			time.Sleep(gap)
 		}
@@ -121,8 +141,8 @@ func testFallbackWriteBlocked(t *testing.T, blocked time.Duration, kept int) {
 		t.Fatalf("B placed %d DGRAMs larger than its DgramMax", bDgrams)
 	}
 	ctr := dpCtr(s)
-	if ctr.DropTooLarge != 0 {
-		t.Fatalf("DropTooLarge %d, want 0: A can carry every head (counters %+v)", ctr.DropTooLarge, ctr)
+	if ctr.DropTooLarge != uint64(extraFill) {
+		t.Fatalf("DropTooLarge %d, want %d: A can carry every head and only B's extra Fill drops them (counters %+v)", ctr.DropTooLarge, extraFill, ctr)
 	}
 	if got := pb.wakeCount() - wb0; got != 0 {
 		t.Fatalf("B, which cannot carry a %d-byte datagram, was woken %d times", n, got)
@@ -135,8 +155,8 @@ func testFallbackWriteBlocked(t *testing.T, blocked time.Duration, kept int) {
 			t.Fatalf("A placed ids %v, want %d..%d in order", ids, total-kept+1, total)
 		}
 	}
-	if ctr.Sent != uint64(kept) || ctr.DropAge != uint64(total-kept) || ctr.DropNoPath != 0 || ctr.DropQueue != 0 {
-		t.Fatalf("counters %+v, want Sent %d DropAge %d", ctr, kept, total-kept)
+	if age := total - extraFill - kept; ctr.Sent != uint64(kept) || ctr.DropAge != uint64(age) || ctr.DropNoPath != 0 || ctr.DropQueue != 0 {
+		t.Fatalf("counters %+v, want Sent %d DropAge %d", ctr, kept, age)
 	}
 	dpEnd(s, io.EOF)
 }

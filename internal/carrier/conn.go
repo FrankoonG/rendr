@@ -661,7 +661,12 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 // at EOF or at a read error, so the conn is closed with nothing unread and
 // no late frame of the peer meets a closed socket and draws a TCP RST
 // (L05; W4-K11, TestLoopbackDrainBoundNoReset_L05). A peer that sends
-// nothing more is cut off by closeConn after d.
+// nothing more is cut off by closeConn after d. A later Kill does not cut
+// the wait short (the death is already recorded, so it starts no closer):
+// Done and the join may come up to d later, inside the closer's
+// abandonment wait (AbandonWait + drainMax). No owner kills a carrier
+// whose CLOSE was written (the end phase and Runtime.Close kill only those
+// whose CLOSE is unwritten), and only such a carrier reaches this wait.
 func (c *Conn) awaitReader(d time.Duration) {
 	c.jmu.Lock()
 	if c.join.running&partReader == 0 {

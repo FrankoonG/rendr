@@ -43,9 +43,10 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 // fillDgramLocked places queued datagrams on data lane l: a stream lane
 // pulls txBig first, then tx; a datagram lane tx only. The seq is assigned
 // here (M2-D34). A head older than MaxAge is dropped (M2-D35); a head
-// above a datagram batch's DgramRoom (only after a budget shrink, D7) is
-// left to another live data lane that can carry it, else dropped
-// (DropTooLarge, M2-D45); on a stream lane DGRAM bytes are DATA and wait
+// above a datagram batch's DgramRoom (after a budget shrink, D7, or on the
+// smaller member of a mixed-budget bond) is left to another live data lane
+// that can place it now, else dropped (DropTooLarge, M2-D45;
+// pktOtherCarrierLocked); on a stream lane DGRAM bytes are DATA and wait
 // for the carrier's capacity (M2-D26). It stops at a full batch.
 func (s *Session) fillDgramLocked(l *lane, b *carrier.Batch) {
 	if s.placeDgramsLocked(l, b) {
@@ -167,8 +168,16 @@ func (s *Session) pktHasDataLaneLocked() bool {
 // else a stream data lane with spare capacity for it, either not
 // write-blocked). A capable member that cannot write now does not hold the
 // queue behind the head until MaxAge: the head is dropped as too large
-// instead (a budget shrink is rare; the datagrams behind it are not held
-// up).
+// instead, and the datagrams behind it are not held up
+// (TestPacketShrinkDropsAtOnce_L37). Fill cannot tell a lane whose own
+// budget shrank from a smaller member of a mixed-budget bond, so this is
+// also the rule for the latter (M2-D45 trade-off): while the only members
+// that can carry the head are write-blocked or at their capacity, a Fill
+// of a smaller member — its PACK duty, a control frame, a wake for another
+// queue — drops every head it cannot carry as DropTooLarge. The wake
+// policy never wakes it for them (ever true below), so without such a
+// Fill they wait and age out as DropAge
+// (TestPacketFallbackWriteBlocked_L08, extra-fill).
 //
 // With ever true (the wake policy's fallback decision) a lane that could
 // carry the head at all counts too — a datagram data lane whose DgramMax
@@ -336,7 +345,8 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			// member that can carry it but cannot place it now (write-
 			// blocked, at its capacity) was woken instead, and no smaller
 			// member is woken only to drop the head: it waits for that
-			// member (TestPacketFallbackWriteBlocked_L08).
+			// member unless a smaller member fills for another reason
+			// (pktOtherCarrierLocked; TestPacketFallbackWriteBlocked_L08).
 			s.pktWakeDgramLocked()
 		}
 	}
