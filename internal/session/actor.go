@@ -322,7 +322,9 @@ func (a *actor) actLocked(now time.Time) {
 // (factPktFin rings the actor, which re-reads the state here) — and, while
 // no data lane exists, the no-path ageing step, which drops the queued
 // datagrams older than MaxAge (DropNoPath) and is armed at the next one's
-// expiry. A ReadFrom that empties the queue later delivers the FIN itself.
+// expiry; while txBig waits for a member's SCHED (pk.bigHeld, C4-F2), the
+// same step for txBig (DropAge). A ReadFrom that empties the queue later
+// delivers the FIN itself.
 func (a *actor) packetLocked(now time.Time) {
 	s := a.s
 	pk := s.pk
@@ -339,6 +341,8 @@ func (a *actor) packetLocked(now time.Time) {
 	}
 	if !s.pktHasDataLaneLocked() {
 		a.want(s.pktAgeLocked(now))
+	} else if pk.bigHeld {
+		a.want(s.pktAgeBigLocked(now))
 	}
 }
 

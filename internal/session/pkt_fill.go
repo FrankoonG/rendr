@@ -188,19 +188,40 @@ func (s *Session) pktOtherCarrierLocked(l *lane, n int) bool {
 	return false
 }
 
+// pktBigPushedLocked follows WriteTo's push into txBig: the first datagram
+// of a held txBig (pk.bigHeld) rings the actor, which arms its MaxAge
+// (pktAgeBigLocked): no lane pulls it until the awaited SCHED.
+func (s *Session) pktBigPushedLocked() {
+	if s.pk.bigHeld && s.pk.txBig.n == 1 {
+		s.ringActor()
+	}
+}
+
 // pktRouteLocked is pktRecomputeLocked (§A5.2): pk.dgMax = the largest
 // DgramMax over live datagram data lanes (0: none); pk.mixed = bond with
-// live data lanes of both kinds. When no live stream data lane is left,
-// txBig is dropped (DropTooLarge: no live carrier can carry it). The
-// remembered stale lane is forgotten once it is no data lane.
+// live datagram data lanes and a stream member — a live stream data lane,
+// or (passive) a confirmed stream member awaiting the SCHED that routes it
+// (C4-F2: Status lists it as a member, and the dialer lists it in its next
+// SCHED, plan:147); pk.bigHeld = mixed by awaiting members only: txBig
+// waits for their SCHED, its heads aged out by the actor at MaxAge
+// (pktAgeBigLocked). When no stream member is left, txBig is dropped
+// (DropTooLarge: no live carrier can carry it, L37). The remembered stale
+// lane is forgotten once it is no data lane.
 func (s *Session) pktRouteLocked() {
 	pk := s.pk
-	dgMax, stream, dgram := 0, false, false
+	dgMax, stream, held, dgram := 0, false, false, false
 	for _, l := range s.st.order {
-		if !l.data || l.state == LaneDead {
+		if l.state == LaneDead {
 			continue
 		}
-		if pp, dg := pktDgramLane(l); dg {
+		pp, dg := pktDgramLane(l)
+		if l.data {
+			l.awaitSched = false // routed: no longer awaiting its SCHED
+		} else {
+			held = held || (!dg && l.awaitSched && l.state == LaneMember && !l.port.CloseSent())
+			continue
+		}
+		if dg {
 			dgram = true
 			dgMax = max(dgMax, pp.DgramMax())
 		} else {
@@ -208,8 +229,9 @@ func (s *Session) pktRouteLocked() {
 		}
 	}
 	pk.dgMax = dgMax
-	pk.mixed = s.p.Mode == ModeBond && stream && dgram
-	if !stream && pk.txBig.n > 0 {
+	pk.mixed = s.p.Mode == ModeBond && (stream || held) && dgram
+	pk.bigHeld = pk.mixed && !stream
+	if !stream && !held && pk.txBig.n > 0 {
 		pk.ctr.DropTooLarge += uint64(pk.txBig.releaseAll())
 	}
 	if sl := pk.stale; sl != nil && (!sl.data || sl.state == LaneDead) {

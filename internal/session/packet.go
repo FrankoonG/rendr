@@ -43,7 +43,8 @@ type packet struct {
 	noPathEnd time.Time    // end of the latest no-path episode: DropNoPath vs DropAge (M2-D35)
 	finPlaced bool         // our FIN was placed once: st.fin.off holds the final seq
 	dgMax     int          // the largest DgramMax over live datagram data lanes (0: none; routing, M2-D43, M2-D45)
-	mixed     bool         // bond with live data lanes of both kinds: WriteTo puts datagrams above dgMax in txBig
+	mixed     bool         // bond with live datagram data lanes and a stream member (a data lane, or one awaiting its SCHED): WriteTo puts datagrams above dgMax in txBig
+	bigHeld   bool         // mixed by stream members awaiting their SCHED only: txBig waits for one, aged by the actor (C4-F2)
 	rcopy     *carrier.Buf // a datagram ReadFrom detached and copies outside the lock (L07: released at its commit)
 
 	base        time.Time // immutable: the origin of pdesc.at (monotonic)
@@ -294,10 +295,26 @@ func (s *Session) pktWakeLocked(now time.Time) {
 	s.pktWakeDataLocked(now)
 }
 
-// pktRecomputeLocked recomputes pk.dgMax and pk.mixed from the live data
-// lanes (every routing change; §A5.2) and drops txBig when the last stream
-// data lane left.
+// pktRecomputeLocked recomputes pk.dgMax, pk.mixed and pk.bigHeld from
+// the live lanes (every routing change, and when a passive bond member is
+// confirmed; §A5.2) and drops txBig when no stream member is left.
 func (s *Session) pktRecomputeLocked() {
+	s.pktRouteLocked()
+}
+
+// pktMemberConfirmedLocked is called by lanesConfirmedLocked when a lane
+// that joined an open passive session was confirmed (its JOIN_ACK placed;
+// Status lists it as a member from this step). A packet bond member carries data only from the
+// dialer's SCHED that lists it (plan:147); until then it awaits it
+// (awaitSched) and the datagrams only a stream lane can carry wait for it
+// in txBig within MaxAge (C4-F2, pktRouteLocked) instead of being dropped
+// as too large. The routing summary changes in the same step as the
+// Status (L27).
+func (s *Session) pktMemberConfirmedLocked(l *lane) {
+	if s.pk == nil || s.p.Mode != ModeBond || s.st.ended {
+		return
+	}
+	l.awaitSched = true
 	s.pktRouteLocked()
 }
 

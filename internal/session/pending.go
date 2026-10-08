@@ -284,6 +284,7 @@ func (a *actor) lanesConfirmedLocked(now time.Time) {
 		default:
 			if l.state == LaneJoining {
 				l.state = LaneMember
+				a.s.pktMemberConfirmedLocked(l)
 			}
 			a.dirty, route = true, true
 			a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)

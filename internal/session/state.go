@@ -122,6 +122,7 @@ type lane struct {
 	echoRel      uint32    // (S) passive: the epoch echo last placed in a reliable PACK on this lane (M2-D39); (A) initializes it to ctl.epoch−1, never the applied epoch
 	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
 	retireEpoch  uint32    // (A) planned switch: the SCHED epoch that removed the lane (M2-D42)
+	awaitSched   bool      // (A) passive packet bond: a JOIN member confirmed and not yet routed by a SCHED (set at confirmation; cleared by the routing summary once it routes): txBig waits for it (C4-F2)
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a
