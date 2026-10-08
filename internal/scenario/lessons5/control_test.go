@@ -2,6 +2,7 @@ package lessons5
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -245,13 +246,19 @@ func (l *retxLog) snapshot() []relRetx {
 
 // TestControlPermanentLoss_L12: a carrier that loses every REL — here the
 // active carrier of a closing packet session, whose FIN can never arrive
-// over it while its PINGs and PONGs pass, so it lives on. REL resends only
-// the oldest unacknowledged frame (single flight), once per backed-off
-// RTO: the gaps double from the first RTO up to RelRTOMax (2 s). When the
-// carrier dies its resends stop; the session places the FIN again on the
-// replacement carrier, which delivers it, and the session ends cleanly with
-// every datagram delivered. Never do two carriers resend: no other carrier
-// retransmits while the first lives, and the first never after its death.
+// over it while its PINGs and PONGs pass, so it lives on. REL resends one
+// frame per backed-off RTO (single flight): the gaps double from the first
+// RTO up to RelRTOMax (2 s), and every resend is the FIN (the only REL
+// outstanding on it; the oldest-first rule is TestRelSingleFlight_L12's,
+// seen here on the replacement). The carrier is killed 100 ms before its next
+// resend is due, and the FIN's first copy on the replacement carrier is lost
+// too (the whole datagram, with any REL it shares, such as the new epoch's
+// SCHED), so the session outlives that due time: the dead carrier never
+// resends, the replacement becomes the one resender — one REL at a time,
+// oldest first, the FIN's REL payload byte-identical in a new frame — and
+// the session ends cleanly with every datagram delivered. Never do two
+// carriers resend: no other carrier retransmits while the first lives, and
+// the first never after its death.
 func TestControlPermanentLoss_L12(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stop := make(chan struct{})
@@ -281,18 +288,29 @@ func TestControlPermanentLoss_L12(t *testing.T) {
 		fin := stamp(la.CaptureNext(rendrtest.Up, rendrtest.FrameFin), stop)
 		la.DropNext(rendrtest.Up, rendrtest.FrameRel, 1<<30)
 		dc.Close()
-		time.Sleep(6500 * time.Millisecond)
+		var first capture
+		select {
+		case first = <-fin:
+		case <-time.After(time.Second):
+			t.Fatal("stimulus: no FIN was written on a")
+		}
+		finHead, _, err := wire.ParseRel(mustRel(t, first.b, wire.TypeFin))
+		if err != nil {
+			t.Fatalf("the FIN's REL head: %v", err)
+		}
+		// Resends are due at 0.2, 0.6, 1.4, 3.0 and 5.0 s after the FIN; a
+		// dies at 4.9 s, while the one due at 5.0 s is still pending.
+		time.Sleep(time.Until(first.at.Add(4900 * time.Millisecond)))
 		select {
 		case <-r.done:
 			t.Fatalf("the passive's reader ended before a's death: %v", r.err)
 		default:
 		}
-		if _, ok := carrierOf(dc.Status(), act.ID); !ok {
-			t.Fatalf("a's carrier is gone from the status: %+v", dc.Status().Carriers)
-		}
-		if c, _ := carrierOf(dc.Status(), act.ID); c.State == rendr.CarrierDead {
+		if c, ok := carrierOf(dc.Status(), act.ID); !ok || c.State == rendr.CarrierDead {
 			t.Fatalf("the carrier on a died of REL loss alone (%v %q): its PINGs pass", c.DeathCause, c.DeathDetail)
 		}
+		// The FIN placed again on b loses its first copy: b must resend it.
+		tlB := armTailLoss(lb, rendrtest.Up, rendrtest.FrameFin, stop)
 		la.Refuse(true)
 		la.Kill()
 		killAt := time.Now()
@@ -300,38 +318,34 @@ func TestControlPermanentLoss_L12(t *testing.T) {
 		pc.Close()
 		waitDone(t, 5*time.Second, dc, pc)
 		eofAfter := r.endAt.Sub(killAt)
-		time.Sleep(5 * time.Second) // a resend that would follow the death has its chance
 
-		var first capture
-		select {
-		case first = <-fin:
-		default:
-			t.Fatal("stimulus: no FIN was written on a")
-		}
 		all := log.snapshot()[before:]
-		var onA []relRetx
+		var onA, others []relRetx
 		for _, x := range all {
 			switch {
 			case x.carrier == act.ID:
 				onA = append(onA, x)
 			case !x.at.After(killAt):
 				t.Fatalf("carrier %d resent cseq %d at %v while a's carrier was alive: two resenders", x.carrier, x.cseq, x.at.Sub(first.at))
+			default:
+				others = append(others, x)
 			}
 		}
 		if lost := la.Stats().Session.Lost - lostBefore; lost < uint64(len(onA))+1 {
 			t.Fatalf("stimulus: a lost %d session datagrams, want the FIN and its %d resends", lost, len(onA))
 		}
 		// The schedule: the first RTO (RelRTOMin 200 ms: the carrier has RTT
-		// samples), then doubling gaps capped at 2 s: 0.2, 0.6, 1.4, 3.0,
-		// 5.0 s after the FIN — five resends before the death at 6.5 s.
-		if len(onA) < 4 || len(onA) > 6 {
-			t.Fatalf("%d resends on a in 6.5 s, at %v after the FIN; want 5 (0.2, 0.6, 1.4, 3.0, 5.0 s)", len(onA), gaps(first.at, onA))
+		// samples), then doubling gaps capped at 2 s: 0.2, 0.6, 1.4, 3.0 s
+		// after the FIN — four resends before the death at 4.9 s.
+		if len(onA) != 4 {
+			t.Fatalf("%d resends on a, at %v after the FIN; want 4 (0.2, 0.6, 1.4, 3.0 s) before its death at %v",
+				len(onA), gaps(first.at, onA), killAt.Sub(first.at))
 		}
 		prev := first.at
 		var gap time.Duration
 		for i, x := range onA {
-			if x.cseq != onA[0].cseq {
-				t.Fatalf("resend %d is cseq %d, the first was %d: only the oldest unacknowledged REL is resent", i, x.cseq, onA[0].cseq)
+			if x.cseq != finHead.Cseq {
+				t.Fatalf("resend %d is cseq %d, the FIN is %d: only the outstanding REL is resent", i, x.cseq, finHead.Cseq)
 			}
 			if x.at.After(killAt) {
 				t.Fatalf("resend %d on a at %v, after its death at %v", i, x.at.Sub(first.at), killAt.Sub(first.at))
@@ -346,26 +360,72 @@ func TestControlPermanentLoss_L12(t *testing.T) {
 			}
 			prev, gap = x.at, g
 		}
+		// The clause "stopped at its death" can fail only if the session
+		// was still open when a's next resend came due.
+		due := prev.Add(min(2*gap, 2*time.Second))
+		if !due.After(killAt) || !r.endAt.After(due) {
+			t.Fatalf("staging: a's next resend was due at +%v, a died at +%v, io.EOF at +%v; want death < due < io.EOF",
+				due.Sub(first.at), killAt.Sub(first.at), r.endAt.Sub(first.at))
+		}
+		// The one resender after the death: b's carrier. The datagram that
+		// carried the FIN on b was lost whole (it may hold an earlier REL,
+		// the new epoch's SCHED): b resends one REL at a time, oldest
+		// first, and the FIN last — its REL payload byte-identical in a new
+		// frame.
+		fb, _ := tlB.verify(t, wire.TypeFin)
+		finB, _, err := wire.ParseRel(mustRel(t, fb.b, wire.TypeFin))
+		if err != nil {
+			t.Fatalf("the FIN's REL head on b: %v", err)
+		}
+		if len(others) == 0 {
+			t.Fatal("no carrier resent the FIN after a's death")
+		}
+		bID := others[0].carrier
+		for i, x := range others {
+			if x.carrier != bID {
+				t.Fatalf("carriers %d and %d both resent after a's death: two resenders", bID, x.carrier)
+			}
+			if i > 0 && (!x.at.After(others[i-1].at) || x.cseq < others[i-1].cseq) {
+				t.Fatalf("resends on b %+v: want one at a time, oldest first", others)
+			}
+		}
+		if last := others[len(others)-1]; last.cseq != finB.Cseq {
+			t.Fatalf("the last resend on b is cseq %d, the FIN is %d", last.cseq, finB.Cseq)
+		}
+		if c, ok := carrierOf(dc.Status(), bID); !ok || c.Name != "b" {
+			t.Fatalf("the resender after a's death, carrier %d, is not on b: %+v", bID, dc.Status().Carriers)
+		}
 		if res.Unique != 300 || len(res.Missing) != 0 {
 			t.Fatalf("before io.EOF: %+v, want all 300 datagrams", res)
 		}
-		if eofAfter > 2*time.Second {
+		if eofAfter > time.Second {
 			t.Fatalf("io.EOF %v after a's death: the FIN was not placed on the replacement carrier at once", eofAfter)
 		}
-		var onB bool
-		for _, c := range dc.Status().Carriers {
-			if c.Name == "b" {
-				onB = true
-			}
-		}
-		if !onB {
-			t.Fatalf("no carrier on b: %+v", dc.Status().Carriers)
-		}
-		t.Logf("FIN at %v; %d resends on a: %v; a killed at +%v; io.EOF %v later", first.at.Format("05.000"), len(onA),
-			gaps(first.at, onA), killAt.Sub(first.at), eofAfter)
+		t.Logf("FIN at %v; %d resends on a: %v; a killed at +%v (next due +%v); %d resends on b: %v; io.EOF %v after the death",
+			first.at.Format("05.000"), len(onA), gaps(first.at, onA), killAt.Sub(first.at), due.Sub(first.at),
+			len(others), cseqs(first.at, others), eofAfter)
 		w.noViolation()
 		w.close()
 	})
+}
+
+// mustRel returns the REL payload wrapping t in datagram d.
+func mustRel(t *testing.T, d []byte, it wire.Type) []byte {
+	t.Helper()
+	p, _, ok := relOf(d, it)
+	if !ok {
+		t.Fatalf("captured datagram holds no REL{%v}: %x", it, d)
+	}
+	return p
+}
+
+// cseqs formats the cseqs and times of resends relative to t0.
+func cseqs(t0 time.Time, xs []relRetx) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = fmt.Sprintf("%d@%v", x.cseq, x.at.Sub(t0))
+	}
+	return out
 }
 
 // gaps formats the times of resends relative to t0.

@@ -144,6 +144,11 @@ func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) {
 			if x.res.Unique < n*90/100 || x.got != x.res.Unique {
 				t.Fatalf("%s: %d unique datagrams returned, Received %d (of %d sent): %+v", x.what, x.res.Unique, x.got, n, x.res)
 			}
+			// The last datagram is written long after the last death: a loss
+			// at the tail (which Missing does not list) is never near one.
+			if x.res.Highest != n-1 {
+				t.Fatalf("%s: the highest seq returned is %d, want %d: the tail was lost away from every death", x.what, x.res.Highest, n-1)
+			}
 			// Losses only at deaths: datagram k is written at start + k·15 ms;
 			// a missing one was written while a dead carrier was being
 			// replaced (its handshake may cost one RelRTOInit when the

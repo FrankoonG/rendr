@@ -53,7 +53,6 @@ type world struct {
 	dev, pev *eventLog
 	taps     *tapSet
 	tap      bool
-	lastPeer *rendr.Peer
 }
 
 // newWorld builds the Runtimes, the Listener and one DatagramLink per name.
@@ -95,7 +94,7 @@ func newRuntime(t testing.TB, cfg rendr.Config, ov *testhooks.Overrides) *rendr.
 func (w *world) addLink(name string) *rendrtest.DatagramLink {
 	accept := func(pc net.PacketConn, peer net.Addr) error {
 		if w.tap {
-			pc = w.taps.wrap(pc, false, name, 0, false)
+			pc = w.taps.wrap(pc, false, 0, false)
 		}
 		return w.ln.HandlePacket(pc, peer)
 	}
@@ -133,7 +132,7 @@ func (w *world) dgCarrier(l *rendrtest.DatagramLink, mtu int) rendr.DatagramCarr
 			return pc, addr, err
 		}
 		di, _ := rendr.CarrierDialInfo(ctx)
-		return w.taps.wrap(pc, true, name, di.Carrier, di.Probe), addr, nil
+		return w.taps.wrap(pc, true, di.Carrier, di.Probe), addr, nil
 	}}
 }
 
@@ -145,7 +144,6 @@ func (w *world) peer(cs ...rendr.Carrier) *rendr.Peer {
 	if err != nil {
 		w.t.Fatalf("NewPeer: %v", err)
 	}
-	w.lastPeer = p
 	return p
 }
 
@@ -453,7 +451,7 @@ type pktReader struct {
 	n     atomic.Int64 // datagrams returned
 	err   error        // what ended it (io.EOF: the clean end)
 	endAt time.Time
-	bad   error // the first verification failure
+	bad   atomic.Pointer[error] // the first verification failure
 }
 
 // readPackets reads c on its own goroutine until ReadFrom fails, verifying
@@ -469,8 +467,8 @@ func readPackets(c *rendr.PacketConn, seed uint64) *pktReader {
 				r.err, r.endAt = err, time.Now()
 				return
 			}
-			if verr := r.v.Add(buf[:n], time.Now()); verr != nil && r.bad == nil {
-				r.bad = verr
+			if verr := r.v.Add(buf[:n], time.Now()); verr != nil {
+				r.bad.CompareAndSwap(nil, &verr)
 			}
 			r.n.Add(1)
 		}
@@ -513,8 +511,12 @@ func (r *pktReader) waitClosed(t testing.TB, within time.Duration, what string) 
 func (r *pktReader) check(t testing.TB, what string) rendrtest.PacketResult {
 	t.Helper()
 	res := r.v.Result()
-	if r.bad != nil || res.Corrupt+res.BadSize != 0 {
-		t.Fatalf("%s: a damaged datagram (%v): %+v", what, r.bad, res)
+	if bad := r.bad.Load(); bad != nil || res.Corrupt+res.BadSize != 0 {
+		var err error
+		if bad != nil {
+			err = *bad
+		}
+		t.Fatalf("%s: a damaged datagram (%v): %+v", what, err, res)
 	}
 	if res.Duplicates != 0 {
 		t.Fatalf("%s: %d datagrams returned twice (L39: at most once): %+v", what, res.Duplicates, res)
@@ -527,11 +529,11 @@ func (r *pktReader) check(t testing.TB, what string) rendrtest.PacketResult {
 // streamFlow is n bytes of PRNG(seed) written on one Conn and hashed on
 // another.
 type streamFlow struct {
-	n                  int64
-	wdone, rdone       chan struct{}
-	werr, rerr         error
-	sent, got          [32]byte
-	start, rend, wdEnd time.Time
+	n            int64
+	wdone, rdone chan struct{}
+	werr, rerr   error
+	sent, got    [32]byte
+	start, rend  time.Time
 }
 
 // startStream writes n bytes of PRNG(seed) on wc and reads them on rc, each
@@ -555,7 +557,6 @@ func startStream(wc, rc net.Conn, n int64, seed uint64) *streamFlow {
 			}
 		}
 		h.Sum(f.sent[:0])
-		f.wdEnd = time.Now()
 	}()
 	go func() {
 		defer close(f.rdone)
@@ -670,7 +671,6 @@ func walkFrames(d []byte, f func(wire.Frame) bool) {
 type tapPC struct {
 	net.PacketConn
 	dialer bool
-	link   string
 	id     rendr.CarrierID // dialer: the DialInfo's carrier
 
 	mu    sync.Mutex
@@ -854,8 +854,8 @@ type tapSet struct {
 
 // wrap wraps pc; a dialer's conn is classified by its DialInfo, a
 // passive's by the first datagram it reads.
-func (s *tapSet) wrap(pc net.PacketConn, dialer bool, link string, id rendr.CarrierID, probe bool) *tapPC {
-	c := &tapPC{PacketConn: pc, dialer: dialer, link: link, id: id, typed: dialer, probe: probe, established: !dialer}
+func (s *tapSet) wrap(pc net.PacketConn, dialer bool, id rendr.CarrierID, probe bool) *tapPC {
+	c := &tapPC{PacketConn: pc, dialer: dialer, id: id, typed: dialer, probe: probe, established: !dialer}
 	s.mu.Lock()
 	s.taps = append(s.taps, c)
 	s.mu.Unlock()
