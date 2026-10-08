@@ -120,7 +120,7 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 		return // a pending session survives the death of its carriers (§6.2, F6)
 	}
 	if a.d != nil {
-		a.dialerLaneDiedLocked(now, l, cause, wasActive, wasData, requeued)
+		a.dialerLaneDiedLocked(now, l, cause, at, wasActive, wasData, requeued)
 	} else {
 		a.passiveRouteLocked(now) // local fallback (D24): routing only
 		if s.p.Mode == ModeBond && wasData {
@@ -134,13 +134,18 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 	}
 }
 
-// dialerLaneDiedLocked is the dialer part of a death step: the failed mark
-// and the immediate redial of the factory for a death cause (not gated by
-// the mark, plan §3.2), then the bond shrink or the selector fallback.
-func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause, wasActive, wasData bool, requeued uint64) {
+// dialerLaneDiedLocked is the dialer part of a death step: the failed mark,
+// dated by the carrier's death time diedAt (zero: now) rather than by this
+// step, and the immediate redial of the factory for a death cause (not
+// gated by the mark, plan §3.2), then the bond shrink or the selector
+// fallback.
+func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause, diedAt time.Time, wasActive, wasData bool, requeued uint64) {
 	d := a.d
 	if cause.Death() && l.factory >= 0 && l.factory < len(d.slots) {
-		a.markFailed(l.factory, cause.String())
+		if diedAt.IsZero() || diedAt.After(now) {
+			diedAt = now
+		}
+		a.markFailed(l.factory, cause.String(), diedAt)
 		d.slots[l.factory].cad.Kick()
 	}
 	if a.s.p.Mode == ModeBond {
