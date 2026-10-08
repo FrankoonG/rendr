@@ -27,7 +27,7 @@ type dgHandshake struct {
 	repeatH2 bool
 
 	pre []byte // (I) passive: the 40 PREFACE bytes of the accepted H1
-	h2b []byte // (I) passive: the stored H2 rendr bytes, repeated verbatim
+	h2b []byte // (I) passive: the stored H2 rendr bytes, repeated verbatim (an unanswered address check at a fresh fseq)
 	ack []byte // (I) dialer: the 40 PREFACE_ACK bytes the handshake read
 }
 
@@ -40,7 +40,9 @@ func (h *dgHandshake) dupH1(rendr []byte) bool {
 
 // h2 returns the stored H2 rendr bytes (PREFACE_ACK ‖ RACK{FirstCseq}, ‖
 // the address check PING{id 0} of an OPEN on a SourceChecker transport, or
-// ‖ PONG for a probe) that the writer repeats verbatim; nil on a dialer.
+// ‖ PONG for a probe) that the writer repeats verbatim — except that while
+// the address check is unanswered its PING goes at a fresh fseq
+// (dgWriteBatch); nil on a dialer.
 func (h *dgHandshake) h2() []byte {
 	return h.h2b
 }
@@ -377,7 +379,8 @@ func readHelloDatagram(env *Env, k *closeOnce, io PacketIO, b []byte, deadline t
 // passive Conn (R1-3's start values, the window past the H1 frame, the
 // stored PREFACE and H2). The H2 of an OPEN on a SourceChecker transport
 // also carries the address check: PREFACE_ACK(OK) ‖ RACK{FirstCseq} ‖
-// PING{id 0, a fresh nonce} at the next fseq, repeated with H2.
+// PING{id 0, a fresh nonce} at the next fseq; an H2 repeat while the check
+// is unanswered carries it again at a fresh fseq (dgWriteBatch).
 func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 	probe := h.first.Type == wire.TypePing
 	var check uint64

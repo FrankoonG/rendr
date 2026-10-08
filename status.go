@@ -38,7 +38,7 @@ type Status struct {
 type DatagramStatus struct {
 	Sources    int    // live FromPacketConn sources
 	Flows      int    // live raw-UDP flows, admitting ones included (bounded, see FromPacketConn)
-	Admitting  int    // flows counted against their source IP address's quotas (≤ 32 OPEN and ≤ 32 JOIN or probe flows per address): from the first datagram until a positive verdict was written for them, their dialer answered an OPEN's address check, or their removal (see FromPacketConn)
+	Admitting  int    // flows counted against their source IP address's quotas (≤ 32 OPEN and ≤ 32 JOIN or probe flows per address): from the first datagram until a positive verdict was written for them, their dialer answered an OPEN's address check, or their removal; a source that answers the check is bounded by AcceptBacklog, MaxSessions and Flows instead (see FromPacketConn)
 	Dropped    uint64 // datagrams and frames dropped: malformed, unknown flow, foreign source, duplicate or out-of-window frames, quota, truncated
 	Truncated  uint64 // of Dropped: truncated or oversize datagrams
 	InboxDrops uint64 // datagrams a full flow inbox dropped

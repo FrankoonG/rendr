@@ -14,8 +14,10 @@
 // until a positive verdict was written or, for an OPEN, until its source
 // answered the address check of H2 (Flow.SourceProven) — so held carriers
 // of pending sessions count until their dialer proved that it receives
-// the passive's datagrams; a blind flood's never leave the quota, a NAT
-// site's dialers leave it within a round trip, R-C3-1) — separately for
+// the passive's datagrams; a blind or spoofed flood's never leave the
+// quota, a NAT site's dialers leave it within a round trip, R-C3-1; a
+// sighted source that answers is then bounded by the Listener's
+// AcceptBacklog and MaxFlows, not by this quota) — separately for
 // flows whose H1 carries an OPEN and
 // for those whose H1 carries a JOIN or a probe PING, so that an OPEN flood
 // from an address never blocks the JOINs and probes of that address's

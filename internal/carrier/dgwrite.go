@@ -191,6 +191,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	io := dg.io
 	c.mu.Lock()
 	srtt := c.st.srtt
+	check := dg.chal.check
 	c.mu.Unlock()
 	stall := sched.StallWindow(srtt, b.wireLen(), 0, c.tm.WriteStall, c.tm.DeadMax)
 	gen := c.wstate.Load() >> 1
@@ -203,6 +204,17 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	rackWritten := false
 	if h2 {
 		d := append(w.dscratch.B[:hr], dg.hs.h2()...)
+		if check != 0 {
+			// The address check is still unanswered (its PONG may have been
+			// lost): the repeat carries it at a fresh fseq instead of the
+			// first one, so the dialer's window takes it and Establish
+			// answers it again. Same size, still one datagram per duplicate
+			// H1: no amplification (SourceChecker).
+			var pp [wire.PingFixedLen]byte
+			wire.PutPing(pp[:], &wire.Ping{Nonce: check})
+			d = wire.AppendFrame(d[:len(d)-wire.FrameOverhead-wire.PingFixedLen], wire.Header{Type: wire.TypePing, Fseq: w.fseq}, pp[:])
+			w.fseq++
+		}
 		if hook != nil && hook.BeforeWrite != nil {
 			hook.BeforeWrite(c.id, 1, len(d))
 		}

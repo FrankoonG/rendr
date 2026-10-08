@@ -74,9 +74,14 @@ func (packetSource) isSource() {}
 // passive's datagrams: a pending session whose dialer answered it waits
 // for Accept in the Listener's AcceptBacklog, not in its address's quota,
 // so the dialers behind one NAT address never starve each other, while a
-// source that never reads the answers (a blind flood) keeps at most 32
-// OPEN flows, pending sessions included. A datagram beyond a quota is
-// dropped silently.
+// source that never reads the answers (a blind or spoofed flood) keeps at
+// most 32 OPEN flows, pending sessions included. The per-address quota
+// therefore protects the backlog only against blind floods: a source that
+// answers the check is bounded like a stream Listener's clients — by
+// AcceptBacklog per session kind, MaxSessions and the flow bound above —
+// so one such address can hold the whole packet backlog, and further
+// OPENs, from any address, are then answered CAPACITY. A datagram beyond a
+// quota is dropped silently.
 //
 // Ownership of pc moves to the Listener: Listener.Close stops admitting new
 // flows (a new carrier is refused with CAPACITY) and closes pc once its

@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -365,5 +367,262 @@ func TestPacketSourceCheck_E19(t *testing.T) {
 		a.close()
 		b.close()
 		c.close()
+	})
+}
+
+// TestPacketSightedSourceBacklog_E19 (R-C3-1; M2-D59 as amended, L58): the
+// trade-off of the address check. A source that answers it — a sighted
+// host, here rendr's own dialers on one source IP address whose
+// application is never accepted — is bounded like a stream listener's
+// clients, not by its address's quota: its pending sessions fill the
+// Listener's whole packet AcceptBacklog (40 here, above the OPEN quota of
+// 32) while its flows leave the quota. Once the backlog is full every
+// further packet OPEN — from that address and from another — is answered
+// CAPACITY at once (not dropped silently: the dialer ends with
+// ErrCapacity long before its attempt deadline), the backlog never grows
+// past its bound, and Flows and Admitting stay bounded. The pending
+// sessions end with ErrCapacity at AcceptTimeout, after which a session
+// from the other address opens and echoes intact; nothing is left.
+func TestPacketSightedSourceBacklog_E19(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const backlog, extra = 40, 4
+		h := peNewHub(t, Config{}, ListenConfig{AcceptBacklog: backlog}, nil)
+		acceptTimeout := h.ln.cfg.AcceptTimeout
+		p1 := h.peer(h.carrier("u1", 1, nil))
+		p2 := h.peer(h.carrier("u2", 2, nil))
+
+		var (
+			mu         sync.Mutex
+			failures   []string
+			capacities int // dials ended with ErrCapacity
+		)
+		fail := func(format string, a ...any) {
+			mu.Lock()
+			failures = append(failures, fmt.Sprintf(format, a...))
+			mu.Unlock()
+		}
+		// dial runs one DialPacket that must end with ErrCapacity within
+		// [lo, hi] of its start.
+		var dials sync.WaitGroup
+		dial := func(p *Peer, name string, i int, lo, hi time.Duration) {
+			dials.Add(1)
+			go func() {
+				defer dials.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				start := time.Now()
+				c, err := p.DialPacket(ctx, DialOptions{Metadata: churnMeta('i', i)})
+				took := time.Since(start)
+				switch {
+				case c != nil:
+					c.Close()
+					fail("%s session %d: DialPacket returned a session", name, i)
+				case !errors.Is(err, ErrCapacity):
+					fail("%s session %d: %v after %v, want ErrCapacity", name, i, err, took)
+				case took < lo || took > hi:
+					fail("%s session %d: ErrCapacity after %v, want within [%v, %v]", name, i, took, lo, hi)
+				default:
+					mu.Lock()
+					capacities++
+					mu.Unlock()
+				}
+			}()
+		}
+
+		for i := range backlog { // the sighted source fills the backlog
+			dial(p1, "pending", i, acceptTimeout-100*time.Millisecond, acceptTimeout+2*time.Second)
+			time.Sleep(20 * time.Millisecond)
+		}
+		peWait(t, 2*time.Second, "the full packet backlog", func() bool { return h.p.Status().AcceptBacklog[1] == backlog })
+		synctest.Wait()
+		st := h.p.Status()
+		t.Logf("backlog full: packet backlog %d, datagram %+v", st.AcceptBacklog[1], st.Datagram)
+		// Stimulus and load: more pending sessions from the one address
+		// than its OPEN quota holds, every one proven and out of it.
+		if st.AcceptBacklog[1] != backlog || st.Datagram.Flows != backlog || st.Datagram.Admitting != 0 {
+			t.Fatalf("stimulus: packet backlog %d (want %d), flows %d (want %d), admitting %d (want 0)",
+				st.AcceptBacklog[1], backlog, st.Datagram.Flows, backlog, st.Datagram.Admitting)
+		}
+		dropped := st.Datagram.Dropped
+
+		over := time.Now()
+		for i := range extra { // the backlog is full: CAPACITY at once, both addresses
+			dial(p1, "same-address", backlog+i, 0, time.Second)
+			dial(p2, "other-address", backlog+extra+i, 0, time.Second)
+		}
+		maxPending, maxFlows, maxAdmitting := 0, 0, 0
+		for time.Since(over) < 2*time.Second {
+			st := h.p.Status()
+			maxPending = max(maxPending, st.AcceptBacklog[1])
+			maxFlows = max(maxFlows, st.Datagram.Flows)
+			maxAdmitting = max(maxAdmitting, st.Datagram.Admitting)
+			time.Sleep(10 * time.Millisecond)
+		}
+		st = h.p.Status()
+		mu.Lock()
+		answered := capacities
+		mu.Unlock()
+		t.Logf("over the backlog: %d answered CAPACITY, max pending %d, max flows %d, max admitting %d, datagram %+v",
+			answered, maxPending, maxFlows, maxAdmitting, st.Datagram)
+		if answered != 2*extra {
+			t.Errorf("%d of the %d OPENs over the full backlog ended with ErrCapacity within 2 s", answered, 2*extra)
+		}
+		if maxPending > backlog || maxFlows > backlog+2*extra || maxAdmitting > 2*extra {
+			t.Errorf("over the backlog: pending %d (≤ %d), flows %d (≤ %d), admitting %d (≤ %d)",
+				maxPending, backlog, maxFlows, backlog+2*extra, maxAdmitting, 2*extra)
+		}
+		if st.Datagram.Dropped != dropped {
+			t.Errorf("over the backlog: Dropped %d → %d, want no silent drop", dropped, st.Datagram.Dropped)
+		}
+
+		dials.Wait() // the pending sessions end at AcceptTimeout
+		for _, f := range failures {
+			t.Error(f)
+		}
+		peWait(t, 5*time.Second, "an empty packet backlog", func() bool { return h.p.Status().AcceptBacklog[1] == 0 })
+
+		// Afterwards a session from the other address opens.
+		got := make(chan error, 1)
+		go func() {
+			pp, err := h.ln.AcceptPacket(context.Background())
+			if err != nil {
+				got <- err
+				return
+			}
+			pc, err := pp.Confirm()
+			if err != nil {
+				got <- err
+				return
+			}
+			defer pc.Close()
+			buf := make([]byte, 2048)
+			pc.SetReadDeadline(time.Now().Add(10 * time.Second))
+			n, _, err := pc.ReadFrom(buf)
+			if err == nil {
+				_, err = pc.WriteTo(buf[:n], nil)
+			}
+			got <- err
+			pc.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_, _, _ = pc.ReadFrom(buf) // until the dialer's close
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		c, err := p2.DialPacket(ctx, DialOptions{Metadata: churnMeta('a', 99)})
+		cancel()
+		if err != nil {
+			t.Fatalf("a session after the backlog drained: %v", err)
+		}
+		want := bytes.Repeat(churnMeta('a', 99), 40)
+		if _, err := c.WriteTo(want, nil); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 2048)
+		c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		n, _, err := c.ReadFrom(buf)
+		if err != nil || !bytes.Equal(buf[:n], want) {
+			t.Fatalf("echo %q (%v), want %d bytes of its own", buf[:n], err, len(want))
+		}
+		if err := <-got; err != nil {
+			t.Fatalf("the passive application: %v", err)
+		}
+		c.Close()
+		p1.Close()
+		p2.Close()
+		time.Sleep(15 * time.Second) // verdict repeats, flow removals and tombstones end
+		h.close()
+	})
+}
+
+// lossyCheckPC loses the dialer's first answers to an address check: a
+// datagram that is one PONG with id 0, while lose > 0.
+type lossyCheckPC struct {
+	net.PacketConn
+	lose atomic.Int32 // answers still to lose
+	lost atomic.Int32 // answers lost
+}
+
+func (l *lossyCheckPC) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if f, n, err := wire.DecodeFrame(b); err == nil && n == len(b) && f.Type == wire.TypePong {
+		if p, err := wire.ParsePing(f.Payload); err == nil && p.ID == 0 && l.lose.Add(-1) >= 0 {
+			l.lost.Add(1)
+			return len(b), nil // lost on the path
+		}
+	}
+	return l.PacketConn.WriteTo(b, addr)
+}
+
+// TestPacketSourceCheckLostAnswer_E19 (R-C3-1; M2-D59 as amended): the
+// dialer's answer to the address check is lost. The flow stays counted
+// against its address's quota, and the dialer — which got H2, so it does
+// not retransmit H1 — still sends its keepalive copies of H1 every
+// RelRTOMax while it waits for the verdict (K5). The passive answers each
+// copy with the stored H2 whose check PING moved to a fresh fseq, so the
+// dialer's receive window takes it and answers again: the flow leaves the
+// quota while its session is still pending, within one keepalive interval
+// (2 s) plus a round trip, with exactly one answer lost. The session then
+// opens and echoes intact.
+func TestPacketSourceCheckLostAnswer_E19(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		lossy := &lossyCheckPC{}
+		lossy.lose.Store(1)
+		dial := h.hub.DialFrom(1)
+		p := h.peer(DatagramCarrier{Name: "lossy", MTU: 1223, Dial: func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			pc, a, err := dial(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			lossy.PacketConn = pc
+			return lossy, a, nil
+		}})
+		type result struct {
+			c   *PacketConn
+			err error
+		}
+		res := make(chan result, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			c, err := p.DialPacket(ctx, DialOptions{Metadata: churnMeta('a', 1)})
+			res <- result{c, err}
+		}()
+		peWait(t, 2*time.Second, "the pending session", func() bool { return h.p.Status().AcceptBacklog[1] == 1 })
+		synctest.Wait()
+		start := time.Now()
+		// Stimulus: the answer was lost and the flow still counts.
+		if st := h.p.Status(); lossy.lost.Load() != 1 || st.Datagram.Admitting != 1 {
+			t.Fatalf("stimulus: %d answers lost (want 1), admitting %d (want 1)", lossy.lost.Load(), st.Datagram.Admitting)
+		}
+		peWait(t, 3*time.Second, "the flow leaving the quota", func() bool { return h.p.Status().Datagram.Admitting == 0 })
+		if st := h.p.Status(); st.AcceptBacklog[1] != 1 || st.Datagram.Flows != 1 || lossy.lost.Load() != 1 {
+			t.Fatalf("after the repeated check: packet backlog %d (want 1: pending), flows %d, lost %d",
+				st.AcceptBacklog[1], st.Datagram.Flows, lossy.lost.Load())
+		}
+		t.Logf("the flow left the quota %v after the lost answer", time.Since(start))
+
+		pp, err := h.ln.AcceptPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		pc, err := pp.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-res
+		if r.err != nil {
+			t.Fatalf("DialPacket: %v", r.err)
+		}
+		want := bytes.Repeat(churnMeta('a', 1), 40)
+		if _, err := r.c.WriteTo(want, nil); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 2048)
+		pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil || !bytes.Equal(buf[:n], want) {
+			t.Fatalf("the passive read %q (%v), want %d bytes of the dialer's", buf[:n], err, len(want))
+		}
+		peEnd(t, r.c, pc)
+		p.Close()
+		h.close()
 	})
 }

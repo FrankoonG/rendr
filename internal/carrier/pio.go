@@ -112,8 +112,16 @@ type PacketIO interface {
 // session waits for the application: pending sessions are bounded by the
 // Listener's AcceptBacklog instead, and the dialers of a NAT site that
 // share one address never starve each other (gold/G6-mixed-nat, E19). A
-// source that never reads the answers (a blind flood) stays counted. Only
-// the carrier's reader calls SourceProven, at most once.
+// source that never reads the answers (a blind or spoofed flood) stays
+// counted; a sighted source that answers is bounded like a stream
+// listener's clients (AcceptBacklog, MaxSessions, MaxFlows), not by its
+// address's quota. The check travels only inside H2 — once per H1 or
+// duplicate H1, never on a timer (no amplification); a repeat while it is
+// unanswered carries it at a fresh fseq, so the dialer's keepalive copies
+// of H1 (every RelRTOMax until Handshake.Timeout) give a lost answer more
+// chances — and a flow whose answers are all lost stays counted until its
+// verdict or removal. Only the carrier's reader calls SourceProven, at
+// most once.
 type SourceChecker interface {
 	SourceProven()
 }
