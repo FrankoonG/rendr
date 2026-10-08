@@ -73,6 +73,15 @@ type Options struct {
 	// (default 2.25 MiB, at most 2048 datagrams); overflow is dropped and
 	// counted (L46).
 	DatagramQueueBytes int
+	// DatagramEgressBytes bounds the memory of the per-connection DATAGRAM
+	// egress queue, its buffers' capacities (default 4 MiB, at least
+	// DatagramBudget; at most 4096 datagrams): the queue that lets WriteTo
+	// return at once while QUIC's congestion control sends slower than
+	// rendr writes (R1-9). A datagram older than 250 ms is dropped, so a
+	// backlogged carrier holds at most 250 ms of its writer's rate; the
+	// default holds that much of 10,000 datagrams of 1000 bytes a second.
+	// Overflow drops the oldest; every drop is counted.
+	DatagramEgressBytes int
 	// Counters, when non-nil, receives the datagram drops of every carrier
 	// and listener built with these Options (one value may be shared): the
 	// transport's own losses, for loss attribution.
@@ -86,10 +95,12 @@ type Counters struct {
 	// IngressDrops: received DATAGRAMs a full ingress queue dropped (L46).
 	IngressDrops atomic.Uint64
 	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
-	// 250 ms (when its turn came, or when a newer one was queued), or the
-	// oldest when the queue was full (4096 datagrams or 4 MiB): QUIC's
-	// congestion control sends slower than rendr writes, and a datagram
-	// carrier's WriteTo never blocks on it.
+	// 250 ms (when its turn came, or when a newer one was queued), the
+	// oldest when the queue was full (4096 datagrams or
+	// Options.DatagramEgressBytes), or those still queued when the carrier
+	// closed or its connection failed: QUIC's congestion control sends
+	// slower than rendr writes, and a datagram carrier's WriteTo never
+	// blocks on it.
 	EgressDrops atomic.Uint64
 }
 

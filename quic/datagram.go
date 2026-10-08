@@ -71,7 +71,7 @@ func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.Applic
 	}
 	d.max.Store(int64(limit))
 	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1)
-	d.out.wake = make(chan struct{}, 1)
+	d.out.max, d.out.wake = o.DatagramEgressBytes, make(chan struct{}, 1)
 	if first != nil {
 		d.in.push(first) // the datagram that classified the connection comes first
 	}
@@ -122,9 +122,11 @@ func (d *dgramConn) pump() {
 
 // send drains the egress queue, dropping a datagram older than egressAge;
 // an error is kept for the next WriteTo: once for a too-large datagram
-// (the budget shrinks), for good when the connection failed.
+// (the budget shrinks), for good when the connection failed. At its exit
+// the datagrams still queued are discarded and counted.
 func (d *dgramConn) send() {
 	defer d.exit(d.sent)
+	defer d.discard()
 	q, done := &d.out, d.qc.Context().Done()
 	var cur []byte
 	for {
@@ -180,10 +182,11 @@ func (d *dgramConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // WriteTo queues a copy of p and returns at once (R1-9), dropping the
-// queued datagrams older than egressAge and, when the queue is still full,
-// the oldest. A datagram above the
-// connection's DATAGRAM limit is refused with a rendr.DatagramTooLargeError;
-// an earlier datagram's error is returned instead of queueing p.
+// queued datagrams older than egressAge and, while the queue is still full
+// (egressMax datagrams or Options.DatagramEgressBytes of buffers), the
+// oldest. A datagram above the connection's DATAGRAM limit is refused with
+// a rendr.DatagramTooLargeError; an earlier datagram's error is returned
+// instead of queueing p.
 func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	q, now := &d.out, time.Now()
 	q.mu.Lock()
@@ -201,11 +204,12 @@ func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		q.mu.Unlock()
 		return 0, &rendr.DatagramTooLargeError{Max: int(d.max.Load())}
 	}
+	b := append(q.take(), p...)
 	var dropped uint64
-	for ; q.n > 0 && (q.n == egressMax || q.bytes+len(p) > egressBytes || now.Sub(q.slot(0).at) > egressAge); dropped++ {
+	for ; q.n > 0 && (q.n == egressMax || q.bytes+cap(b) > q.max || now.Sub(q.slot(0).at) > egressAge); dropped++ {
 		q.give(q.pop())
 	}
-	q.push(append(q.take(), p...), now)
+	q.push(b, now)
 	q.mu.Unlock()
 	signal(q.wake)
 	if dropped > 0 {
@@ -215,7 +219,8 @@ func (d *dgramConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 // Close fails both queues, closes the connection once and joins the pump
-// and the sender (a SendDatagram blocked in quic-go returns at the close).
+// and the sender (a SendDatagram blocked in quic-go returns at the close);
+// the datagrams still queued are discarded and counted in EgressDrops.
 func (d *dgramConn) Close() error {
 	d.once.Do(func() {
 		d.in.fail(net.ErrClosed, true)
@@ -226,8 +231,26 @@ func (d *dgramConn) Close() error {
 		d.release(codeClosed)
 		<-d.pumped
 		<-d.sent
+		d.discard()
 	})
 	return nil
+}
+
+// discard drops the queued datagrams, which will never be sent (the
+// sender exited), and counts them in EgressDrops: rendr counted them as
+// sent. WriteTo queues nothing more: the sender exits only after Close or
+// a fatal error, which every later WriteTo returns.
+func (d *dgramConn) discard() {
+	q := &d.out
+	q.mu.Lock()
+	n := uint64(q.n)
+	for q.n > 0 {
+		q.give(q.pop())
+	}
+	q.mu.Unlock()
+	if n > 0 {
+		d.drops(true, n)
+	}
 }
 
 func (d *dgramConn) LocalAddr() net.Addr { return d.local }
@@ -263,11 +286,13 @@ func signal(c chan struct{}) {
 // egressMax slots and is released when drained, like the ingress ring. A
 // slot holds a buffer only while its datagram is queued; up to egressSpare
 // released buffers are kept for reuse, so a steady state copies without
-// allocating and an idle queue keeps little memory.
+// allocating and an idle queue keeps little memory. bytes counts the
+// queued buffers' capacities (the memory held), bounded by max.
 type egress struct {
 	mu             sync.Mutex
-	ring           []egressSlot
+	ring           []egressSlot // nil or a power of two of slots
 	head, n, bytes int
+	max            int // Options.DatagramEgressBytes
 	spare          [egressSpare][]byte
 	nspare         int
 	wdl            time.Time
@@ -281,8 +306,9 @@ type egressSlot struct {
 	at time.Time // when WriteTo queued it
 }
 
-// slot returns the k-th queued slot, oldest first (k < q.n).
-func (q *egress) slot(k int) *egressSlot { return &q.ring[(q.head+k)%len(q.ring)] }
+// slot returns the k-th queued slot, oldest first (k < q.n); the ring's
+// length is a power of two (egressInit, doubled).
+func (q *egress) slot(k int) *egressSlot { return &q.ring[(q.head+k)&(len(q.ring)-1)] }
 
 // push queues b, growing the ring (q.n < egressMax).
 func (q *egress) push(b []byte, at time.Time) {
@@ -294,7 +320,7 @@ func (q *egress) push(b []byte, at time.Time) {
 		q.ring, q.head = r, 0
 	}
 	*q.slot(q.n) = egressSlot{b, at}
-	q.n, q.bytes = q.n+1, q.bytes+len(b)
+	q.n, q.bytes = q.n+1, q.bytes+cap(b)
 }
 
 // pop removes and returns the oldest datagram (q.n > 0); a drained ring
@@ -303,7 +329,7 @@ func (q *egress) pop() []byte {
 	s := q.slot(0)
 	b := s.b
 	*s = egressSlot{}
-	q.head, q.n, q.bytes = (q.head+1)%len(q.ring), q.n-1, q.bytes-len(b)
+	q.head, q.n, q.bytes = (q.head+1)&(len(q.ring)-1), q.n-1, q.bytes-cap(b)
 	if q.n == 0 && len(q.ring) > 4*egressInit {
 		q.ring, q.head = nil, 0
 	}

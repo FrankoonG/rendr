@@ -389,7 +389,7 @@ func TestQUICDatagramEgressNeverBlocks(t *testing.T) {
 			}
 		}
 		eventually(t, "the sender is blocked", func() bool { _, _, n := egressHeld(cli); return n > 0 })
-		const total = egressMax + 300 // past both the count and the byte bound
+		const total = egressMax + 300 // past the count bound (4096 buffers of 1024 B fit the byte bound; TestQUICDatagramEgressByteBound has that)
 		for i := 100; i < total; i++ {
 			if _, err := cli.WriteTo(seqDatagram(i, 1000), nil); err != nil {
 				t.Fatal(err)

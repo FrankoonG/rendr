@@ -31,12 +31,13 @@ const (
 	// 1000-byte datagrams (R-F2: quic-go's window-limited phases after a
 	// congestion cut); WriteTo drops a head older than egressAge, so a
 	// stalled sender holds at most egressAge of the writer's rate. Memory
-	// per carrier while backlogged: at most 4 MiB of datagrams and a
-	// 4096-slot ring (192 KiB), both released when the queue drains.
-	egressMax   = 4096 // datagrams in one egress queue
+	// per carrier while backlogged: at most Options.DatagramEgressBytes of
+	// buffers (default egressBytes) and a ring of up to 4096 slots
+	// (192 KiB), both released when the queue drains.
+	egressMax   = 4096 // datagrams in one egress queue (a power of two)
 	egressBytes = 4 << 20
 	egressAge   = 250 * time.Millisecond
-	egressInit  = 16 // its first ring; a drained ring above 4·egressInit is released
+	egressInit  = 16 // its first ring (a power of two); a drained ring above 4·egressInit is released
 	egressSpare = 8  // released egress buffers kept for reuse
 )
 
@@ -55,6 +56,7 @@ func (o Options) norm() Options {
 	o.MaxPending = cmp.Or(max(o.MaxPending, 0), 256)
 	o.MaxConns = cmp.Or(max(o.MaxConns, 0), 4096)
 	o.DatagramQueueBytes = max(cmp.Or(max(o.DatagramQueueBytes, 0), 2048*DatagramBudget), DatagramBudget)
+	o.DatagramEgressBytes = max(cmp.Or(max(o.DatagramEgressBytes, 0), egressBytes), DatagramBudget)
 	return o
 }
 
