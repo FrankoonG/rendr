@@ -192,15 +192,36 @@ func (c *Conn) onChallengePing(p *wire.Ping) {
 
 // rebindCandidate starts a challenge to src at now (M2-D27, §A5.13): a
 // datagram from a new source of which a frame was newly accepted, or a copy
-// of the stored H1 on a held passive flow (R1-14). One challenge is in
-// flight at a time, challenges are at least max(RTO, 1 s) apart and at most
-// chalCommitsMax rebinds commit per minute. The datagram's frames were
-// processed normally; replies keep going to the current peer until a
-// commit.
-func (c *Conn) rebindCandidate(src PeerKey, now time.Time) {
+// of the stored H1 while the passive's first REL is unacknowledged (R1-14,
+// wave 4). One challenge is in flight at a time, challenges are at least
+// max(RTO, 1 s) apart and at most chalCommitsMax rebinds commit per minute.
+// A source other than the candidate of the challenge in flight retargets
+// it (a second NAT move, W4-REL-1): a fresh nonce for the newer source,
+// which the transport now tracks as its candidate, while the challenge
+// keeps its creation time (expiry) and its send schedule — its next send,
+// at once when none went yet and otherwise at the backed-off resend time,
+// goes to the newer source — so a retarget never adds a send and never
+// extends a challenge. retarget is false for a datagram that carried a
+// challenge answer which committed nothing (a PONG with id 0 from another
+// source or with a stale nonce): an answer is no claim of a new source, so
+// a forged answer cannot redirect the challenge in flight. The datagram's
+// frames were processed normally; replies keep going to the current peer
+// until a commit.
+func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 	c.mu.Lock()
 	ch := &c.dg.chal
 	if ch.active && now.Sub(ch.at) < chalExpiry {
+		if src == ch.cand || !retarget {
+			c.mu.Unlock()
+			return
+		}
+		at := ch.at
+		c.mu.Unlock()
+		nonce := newNonce() // outside Conn.mu
+		c.mu.Lock()
+		if ch.active && ch.at.Equal(at) {
+			ch.cand, ch.nonce = src, nonce
+		}
 		c.mu.Unlock()
 		return
 	}
