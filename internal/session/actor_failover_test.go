@@ -311,7 +311,12 @@ func TestActorBondRescue(t *testing.T) {
 				window := 800 * time.Millisecond // before the stalled member's PING deadline (DeadMin 1 s)
 				delay := time.Millisecond        // p1's one-way delay (slowLink)
 				if slow {
+					// Both ends: the passive's own silence verdict on the
+					// stalled member (DeadMin 1 s) closes its end, and a close
+					// may cross the stalled link (rendrtest), ending the
+					// dialer's member by transport_error inside the window.
 					w.a.cenv.Timing.DeadMin, w.a.cenv.Timing.DeadMax = 3*time.Second, 4*time.Second
+					w.b.cenv.Timing.DeadMin, w.b.cenv.Timing.DeadMax = 3*time.Second, 4*time.Second
 					window = 2500 * time.Millisecond
 					delay = 400 * time.Millisecond
 				}
@@ -329,7 +334,10 @@ func TestActorBondRescue(t *testing.T) {
 				if slow {
 					l1.SetDelay(400*time.Millisecond, 0)
 				}
-				const n = 24 << 20
+				// The transfer outlasts the 3-s search for a burst below: with
+				// 24 MiB it ended about 1.5 s in, and a search that had not
+				// found a burst by then could not (Linux race lane).
+				const n = 64 << 20
 				done := make(chan [2]error, 1)
 				go func() {
 					we, re := acTransfer(a, b, n, 51, true)

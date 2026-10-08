@@ -23,6 +23,14 @@ import (
 // carries two sessions): with the packet session on a datagram carrier, on
 // a stream carrier of the very link the stream session uses, and on a
 // stream carrier of its own slow link.
+//
+// The shared link runs at 16 MiB/s: the stream session's in-flight bytes
+// queue at the shared FIFO bottleneck ahead of the packet session's frames
+// and PONGs, and at 4 MiB/s that queue could exceed MaxAge (100 ms), so
+// the packet session's stream carrier stayed cap-blocked and datagrams
+// aged out (DropAge 12 under -race at GOMAXPROCS=1, 2 of 15 runs); "nothing
+// backs up" holds by construction only while that queue stays well below
+// MaxAge.
 func TestPacketConsumerStalled_L40(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -39,7 +47,7 @@ func TestPacketConsumerStalled_L40(t *testing.T) {
 				dl.SetDelay(rendrtest.Down, 5*time.Millisecond, 0)
 				ls := w.addStreamLink("s")
 				ls.SetDelay(5*time.Millisecond, 0)
-				ls.SetRate(4 << 20)
+				ls.SetRate(16 << 20)
 				var pktCarrier rendr.Carrier = w.dgCarrier(dl, 1400)
 				if tc.stream {
 					pktCarrier = rendr.StreamCarrier{Name: "s", Dial: ls.Dial}
@@ -66,9 +74,9 @@ func TestPacketConsumerStalled_L40(t *testing.T) {
 				if during >= n {
 					t.Fatalf("load: the packet writer had finished before the stream did (%d of %d)", during, n)
 				}
-				// 1 MiB at 4 MiB/s is 250 ms; the packet session's share of
-				// the link (1 MB/s on the shared link) leaves at least 3 MB/s.
-				if took > 700*time.Millisecond {
+				// 1 MiB at 16 MiB/s is 62.5 ms; the packet session's share of
+				// the link (1 MB/s on the shared link) leaves at least 15 MB/s.
+				if took > 175*time.Millisecond {
 					t.Fatalf("the stream session needed %v for 1 MiB beside the stalled packet session", took)
 				}
 				if wr.maxCall >= time.Millisecond {
