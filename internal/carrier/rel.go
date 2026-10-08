@@ -33,6 +33,17 @@ type relState struct {
 	due       time.Time               // when una is retransmitted; zero: not armed (R1-2)
 	blocked   bool                    // a reliable Add* found no REL room: a RACK with progress wakes the writer
 
+	// The implied loss of a burst's tail (W4-REL-2): round counts the
+	// writer rounds whose datagrams were attempted, sealed[c mod RelWindow]
+	// is the round that first sent cseq c, and retx records the latest
+	// retransmission of una — its cseq and the round that first sent it —
+	// until a RACK with progress consumes it.
+	round    uint32
+	sealed   [wire.RelWindow]uint32
+	retx     bool
+	retxCseq uint32
+	retxRnd  uint32
+
 	// Receiver.
 	cum      uint32                  // highest cseq dispatched in order
 	heldMask uint8                   // bit c mod RelWindow: cseq c (cum + 2 … cum + 8) is held
@@ -59,6 +70,7 @@ type relHeld struct {
 func (r *relState) initSend(next uint32) {
 	r.next, r.una = next, next
 	r.backoff, r.due, r.blocked = 0, time.Time{}, false
+	r.retx = false
 }
 
 // initRecv sets the receiver's cumulative point: the cseq of the last REL
@@ -113,6 +125,7 @@ func (c *Conn) relSealLocked(b *Batch) {
 		p := b.relPayload(k, cs)
 		s := &r.slot[cs%wire.RelWindow]
 		s.n = uint16(copy(s.b[:], p))
+		r.sealed[cs%wire.RelWindow] = r.round
 		r.next++
 	}
 }
@@ -130,16 +143,20 @@ func (c *Conn) relRetxDueLocked(now time.Time) bool {
 // not armed; nothing is armed while no REL is outstanding. A RACK with
 // progress that landed between the retransmission's placement and this
 // commit already reset the backoff and armed the new una's first timeout
-// (relOnRack): the retransmission no longer backs it off.
+// (relOnRack): the retransmission no longer backs it off. A retransmission
+// of una is recorded with the round that first sent it, for the implied
+// loss of relOnRack.
 func (c *Conn) relAttemptedLocked(retx bool, retxCseq uint32, at time.Time) {
 	r := &c.dg.rel
+	r.round++
 	if !r.outstanding() {
-		r.due, r.backoff = time.Time{}, 0
+		r.due, r.backoff, r.retx = time.Time{}, 0, false
 		return
 	}
 	if retx && r.una == retxCseq {
 		r.backoff++
 		r.due = at.Add(sched.RTOBackoffWithin(c.relRTOLocked(), r.backoff, c.tm.RelRTOMax))
+		r.retx, r.retxCseq, r.retxRnd = true, retxCseq, r.sealed[retxCseq%wire.RelWindow]
 		return
 	}
 	if r.due.IsZero() {
@@ -176,7 +193,15 @@ func (r *relState) rackLocked() wire.Rack {
 // backoff, re-arms or clears the timer — waking the writer when the new
 // una's timeout is earlier than the one it sleeps on — and wakes a writer
 // that found no REL room; the RACK that covers our CLOSE may complete a
-// retirement (R1-4). It reports whether the reader continues.
+// retirement (R1-4). The tail of a lost burst (W4-REL-2): when the
+// progress covers the latest retransmission of una and the new una was
+// first sent in the same writer round as that retransmitted REL — they
+// left together, so the first arrived only through its retransmission
+// and the new una, sent before it, is lost — the new una is due at once
+// instead of an RTO later: one implied-loss resend per RACK and no SACK
+// logic (R1-18), so k RELs lost together are resent one RTT apart rather
+// than RTT + RTO apart. A new una first sent in a later round keeps its
+// RTO. It reports whether the reader continues.
 func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 	rk, err := wire.ParseRack(p)
 	if err != nil {
@@ -202,11 +227,18 @@ func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 	if !wire.SeqLess(rk.CumAck, r.una) { // cumAck ≥ una: progress
 		r.una = rk.CumAck + 1
 		r.backoff = 0
+		implied := r.retx && !wire.SeqLess(rk.CumAck, r.retxCseq)
+		if implied {
+			r.retx = false // consumed: one implied-loss resend per RACK
+		}
 		if r.outstanding() {
 			// The new una's first timeout: a writer asleep until the old,
 			// backed-off one is woken to re-arm its timer.
 			old := r.due
 			r.due = now.Add(c.relRTOLocked())
+			if implied && r.sealed[r.una%wire.RelWindow] == r.retxRnd {
+				r.due = now // lost with the retransmitted REL's first copy
+			}
 			wake = old.IsZero() || r.due.Before(old)
 		} else {
 			r.due = time.Time{}

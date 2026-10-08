@@ -160,30 +160,37 @@ func (c *Conn) dgPause(rd *dgReader, d time.Duration) bool {
 
 // dgFrames handles the rendr bytes of one datagram received at now from
 // src (§A5.7, §A3.8): a datagram starting with a PREFACE is a duplicate H1
-// on the passive (the stored H2 is repeated; on a held passive flow a copy
-// from a new source also starts a challenge, R1-14) and dropped otherwise;
+// on the passive (the stored H2 is repeated; while the passive's first REL
+// is unacknowledged — held, or released with H3 on its way — a copy from a
+// new source also starts a challenge, R1-14 as amended by wave 4) and
+// dropped otherwise;
 // a frame that fails to decode drops the rest of the datagram (PA-1); a
 // window duplicate or late frame is dropped; after the peer's CLOSE every
 // later frame but a RACK or a REL is dropped (M2-D30). A ReadCandidate
 // datagram of which a frame was newly accepted starts a rebind challenge
-// (M2-D27). It reports whether the reader continues.
+// (M2-D27), or retargets the one in flight unless it carried a challenge
+// answer that committed nothing. It reports whether the reader continues.
 func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) bool {
 	dg := c.dg
 	if wire.IsPreface(data) {
 		if !c.dialer && dg.hs.dupH1(data) {
 			c.mu.Lock()
 			dg.hs.repeatH2 = true
+			// Until our first REL (H3 or a verdict) is acknowledged, the
+			// dialer sends nothing but H1 copies: held, and after the hold
+			// was released while H3 is still on its way (W4-REL-3).
+			early := dg.rel.una == c.env.Presets.firstCseq()
 			c.mu.Unlock()
 			c.Wake()
-			if ev == ReadCandidate && dg.held.Load() {
-				c.rebindCandidate(src, now) // a rebound handshake (R1-14)
+			if ev == ReadCandidate && (early || dg.held.Load()) {
+				c.rebindCandidate(src, now, true) // a rebound handshake (R1-14)
 			}
 		} else {
 			c.dgDropped(1)
 		}
 		return true
 	}
-	advanced, committed := false, false
+	advanced, committed, answered := false, false, false
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
 		if err != nil {
@@ -203,17 +210,27 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 			c.dgDropped(1) // nothing new follows the peer's CLOSE (M2-D30)
 			continue
 		}
-		ok, comm := c.dgDispatch(&f, src, ev == ReadCandidate, now)
+		ok, ans := c.dgDispatch(&f, src, ev == ReadCandidate, now)
 		if !ok {
 			return false
 		}
-		committed = committed || comm
+		committed = committed || ans == chalCommitted
+		answered = answered || ans == chalRefused
 	}
 	if ev == ReadCandidate && advanced && !committed {
-		c.rebindCandidate(src, now)
+		c.rebindCandidate(src, now, !answered)
 	}
 	return true
 }
+
+// chalAnswer is what one frame did to the rebind challenge (dgDispatch).
+type chalAnswer uint8
+
+const (
+	chalNone      chalAnswer = iota // no challenge answer
+	chalCommitted                   // a PONG with id 0 that committed the rebind
+	chalRefused                     // a PONG with id 0 that committed nothing (dropped and counted)
+)
 
 // dgDispatch handles one accepted frame (the legality of §A3.6): PING and
 // PONG bare (id 0: the rebind challenge and its answer, M2-D27; a PONG
@@ -221,58 +238,61 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 // flow's address check instead, SourceChecker); REL and
 // RACK by the REL sublayer; DGRAM to the packet endpoint; a bare PACK to the
 // endpoint; extensions skipped; every other bare frame — DATA, ACK and a
-// reliable type outside REL — is a violation. committed reports a rebind
-// commit.
-func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) (ok, committed bool) {
+// reliable type outside REL — is a violation. ans reports what the frame
+// did to the rebind challenge.
+func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) (ok bool, ans chalAnswer) {
 	switch f.Type {
 	case wire.TypePing:
 		p, err := wire.ParsePing(f.Payload)
 		if err != nil {
 			c.violation("PING: %v", err)
-			return false, false
+			return false, chalNone
 		}
 		if p.ID == 0 {
 			c.onChallengePing(&p)
-			return true, false
+			return true, chalNone
 		}
 		c.onPing(f.Flags&wire.FlagPingBusy != 0, &p, now)
-		return true, false
+		return true, chalNone
 	case wire.TypePong:
 		p, err := wire.ParsePing(f.Payload)
 		if err != nil {
 			c.violation("PONG: %v", err)
-			return false, false
+			return false, chalNone
 		}
 		if p.ID == 0 {
 			if !cand && c.sourceChecked(&p) {
-				return true, false
+				return true, chalNone
 			}
-			return true, c.onChallengePong(&p, src, now)
+			if c.onChallengePong(&p, src, now) {
+				return true, chalCommitted
+			}
+			return true, chalRefused
 		}
 		c.pong(&p, now)
-		return true, false
+		return true, chalNone
 	case wire.TypeRel:
-		return c.relOnRel(f, now), false
+		return c.relOnRel(f, now), chalNone
 	case wire.TypeRack:
-		return c.relOnRack(f.Payload, now), false
+		return c.relOnRack(f.Payload, now), chalNone
 	case wire.TypeDgram:
-		return c.dgOnDgram(f.Payload, now), false
+		return c.dgOnDgram(f.Payload, now), chalNone
 	case wire.TypePack:
 		if c.ep == nil {
 			c.violation("PACK on a carrier without a session")
-			return false, false
+			return false, chalNone
 		}
 		if err := c.ep.Control(c, f.Header, f.Payload); err != nil {
 			c.violation("PACK: %v", err)
-			return false, false
+			return false, chalNone
 		}
-		return true, false
+		return true, chalNone
 	}
 	if f.Type.Extension() {
-		return true, false // CRC-checked and skipped (§5.2); never inside REL
+		return true, chalNone // CRC-checked and skipped (§5.2); never inside REL
 	}
 	c.violation("bare %v on a datagram carrier", f.Type)
-	return false, false
+	return false, chalNone
 }
 
 // dgOnDgram hands one DGRAM to the packet endpoint (§A5.3): below BigData
