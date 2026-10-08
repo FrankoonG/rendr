@@ -635,7 +635,22 @@ func TestRelBackoffResetOnProgress_L12(t *testing.T) {
 				a.io.setRec(true)
 				a.start(StartOptions{})
 				b.start(StartOptions{})
-				time.Sleep(100 * time.Millisecond) // the first PING's sample
+				// Gate on the first PING's sample: the RTO read below must be
+				// the one the retransmissions use, and before the first sample
+				// it is RelRTOInit, not the sampled one. A fixed wait let the
+				// sample land after the read in a few runs per thousand.
+				for waited := 0; ; waited++ {
+					a.c.mu.Lock()
+					seen := a.c.st.rttSeen
+					a.c.mu.Unlock()
+					if seen {
+						break
+					}
+					if waited == 2000 {
+						t.Fatal("stimulus: no RTT sample within 2 s")
+					}
+					time.Sleep(time.Millisecond)
+				}
 				x := a.env.Presets.firstCseq()
 				var lost atomic.Int32
 				a.io.setFilter(func(d []byte) bool {
