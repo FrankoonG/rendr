@@ -56,16 +56,22 @@ var (
 	// than nil or the session's RemoteAddr; no method of that address is
 	// called.
 	ErrPacketDestinationMismatch = session.ErrPacketDestinationMismatch
+)
 
-	// ErrDatagramTooLarge is carrier-facing: the conn of a DatagramCarrier
-	// (or of HandlePacket) returns an error matching it from WriteTo for a
+// Carrier-facing errors. They are not session or Dial errors and make no
+// net.Error claim: the embedder's carrier conns return them to rendr,
+// which handles them and never passes them to an application.
+var (
+	// ErrDatagramTooLarge: the conn of a DatagramCarrier (or of
+	// HandlePacket) returns an error matching it from WriteTo for a
 	// datagram it cannot send because of its size (see
 	// DatagramTooLargeError). The carrier then lowers its budget instead of
-	// dying. It never reaches an application.
+	// dying. It is a plain error, not a net.Error.
 	ErrDatagramTooLarge = wire.ErrDatagramTooLarge
 )
 
-// DatagramTooLargeError refuses one datagram because of its size; Max is the
+// DatagramTooLargeError is carrier-facing like ErrDatagramTooLarge (no
+// net.Error claim): it refuses one datagram because of its size; Max is the
 // largest datagram the conn can send now (0: unknown). errors.Is(err,
 // ErrDatagramTooLarge) holds for it. A carrier whose budget falls below the
 // control floor (300 bytes) is replaced.
