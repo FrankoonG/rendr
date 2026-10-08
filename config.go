@@ -41,6 +41,11 @@ type Config struct {
 	// reading lets it time out. It does not end a finished exchange (both
 	// FINs delivered and this side's FIN acknowledged): Linger bounds the
 	// wait for the peer's final confirmation, and that end is io.EOF.
+	// For a packet session the clock moves on every successful WriteTo, on
+	// every datagram accepted from a carrier and on every datagram ReadFrom
+	// returns (M2-D41); the move on accepted datagrams may lag by up to
+	// PacketPing, which is why IdleTimeout should be at least 2·PacketPing
+	// (the clamps ensure it: PacketPing ≤ DeadMin/2 ≤ 5 s).
 	IdleTimeout time.Duration
 
 	Window                int // 8 MiB; 256 KiB–64 MiB; per session per direction

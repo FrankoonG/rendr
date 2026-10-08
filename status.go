@@ -25,10 +25,15 @@ type Status struct {
 	// embedder code (Abandoned).
 	BufferedBytes int64
 
-	Abandoned         int      // goroutines still stuck in embedder calls past their bound (see Runtime.Close)
-	EventsDropped     uint64   // events dropped because the queue was full
-	CallbackPanics    uint64   // OnEvent calls that panicked (recovered) or called runtime.Goexit
-	ConfigAdjustments []string // "Field: old → new (reason)"; Config first, then "Listen[i].Field: ..."
+	Abandoned      int    // goroutines still stuck in embedder calls past their bound (see Runtime.Close)
+	EventsDropped  uint64 // events dropped because the queue was full
+	CallbackPanics uint64 // OnEvent calls that panicked (recovered) or called runtime.Goexit
+
+	// ConfigAdjustments lists the clamped fields as "Field: old → new
+	// (reason)": every record of the Config first, then the records of
+	// the Listen calls ("Listen[i].Field: ..."), of which only the latest
+	// 64 are kept, oldest first, so Listen churn cannot grow the list.
+	ConfigAdjustments []string
 
 	Datagram DatagramStatus // FromPacketConn sources and datagram carriers (M2)
 }

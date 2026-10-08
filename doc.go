@@ -25,11 +25,29 @@
 //     Runtime.Close resets every session that has not ended.
 //   - Deadlines follow net.Conn and never end the session.
 //
+// Packet sessions (Peer.DialPacket, Listener.AcceptPacket) carry datagrams
+// instead of a byte stream: a *PacketConn is a net.PacketConn whose
+// WriteTo sends one datagram of at most MaxPayload bytes (fixed at OPEN;
+// larger ones fail with ErrPacketTooLarge) and whose ReadFrom returns one.
+// Datagrams are delivered at most once, possibly reordered, never
+// retransmitted; they are lost only in flight on a carrier that dies or
+// when a bounded queue drops them (counted). Their carriers are datagram
+// carriers — the built-in raw UDP carrier (package carrier/udp, with a
+// listening socket served through FromPacketConn), the QUIC carriers of
+// the nested module github.com/FrankoonG/rendr/v2/quic, or an embedder's
+// net.PacketConn (DatagramCarrier, Listener.HandlePacket) — and stream
+// carriers too. ReadFrom returns io.EOF only after the peer closed its end
+// and the datagrams this side holds were read; a carrier change is as
+// invisible as for a stream session.
+//
 // Security model: rendr provides no confidentiality and no authentication.
 // A rendr listener must only be reachable through an authenticated,
 // encrypted channel that the embedder controls (see examples/mtls). An
-// InstanceID is not an identity. The built-in raw TCP carrier is plaintext
-// and loopback-only unless explicitly allowed.
+// InstanceID is not an identity. The built-in raw TCP and raw UDP carriers
+// (carrier/tcp, carrier/udp) are plaintext and loopback-only unless
+// explicitly allowed (AllowNonLoopback); the UDP flow ID is no
+// authentication. The QUIC carriers encrypt, but authenticate only what
+// their tls.Config verifies.
 //
 // Embedding contract: every carrier of a Peer must reach the same rendr
 // instance; relays may only forward rendr bytes opaquely or fail explicitly;

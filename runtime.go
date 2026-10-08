@@ -47,6 +47,7 @@ type Runtime struct {
 	mu        sync.Mutex // a leaf (design §3.2)
 	closed    chan struct{}
 	adjust    []string // Status.ConfigAdjustments: Config first, then "Listen[i]."
+	nconfig   int      // the Config's records at the front of adjust (never trimmed)
 	nlisten   int      // Listen calls so far (the i of "Listen[i].")
 	listeners map[*Listener]struct{}
 	peers     map[*Peer]struct{}
@@ -61,9 +62,10 @@ type Runtime struct {
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
 const (
-	closeSlack   = 250 * time.Millisecond // beyond the sessions' and probe runs' own bound
-	minPruneAt   = 64                     // draining list prune threshold floor
-	maxFactories = wire.MaxSchedIDs       // carriers per Peer (MaxCarriersPerSession ≤ 16)
+	closeSlack      = 250 * time.Millisecond // beyond the sessions' and probe runs' own bound
+	minPruneAt      = 64                     // draining list prune threshold floor
+	maxFactories    = wire.MaxSchedIDs       // carriers per Peer (MaxCarriersPerSession ≤ 16)
+	maxListenAdjust = 64                     // Listen records kept in ConfigAdjustments, the latest (W4-L2-2)
 )
 
 // NewRuntime normalizes cfg (see Config) and draws the InstanceID from
@@ -103,6 +105,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		cut:       make(chan struct{}),
 		closed:    make(chan struct{}),
 		adjust:    adj,
+		nconfig:   len(adj),
 		listeners: make(map[*Listener]struct{}),
 		peers:     make(map[*Peer]struct{}),
 		sl:        make(map[*carrier.Conn]struct{}),
@@ -155,8 +158,9 @@ func (rt *Runtime) NewPeer(cfg PeerConfig) (*Peer, error) {
 // Listen creates a Listener over cfg.Sources (one accept goroutine per
 // FromListener source, one demultiplexing goroutine per FromPacketConn
 // source). cfg is normalized like Config; adjustments are appended to
-// Status.ConfigAdjustments with the prefix "Listen[i].". When Listen fails
-// the sources stay owned by the caller.
+// Status.ConfigAdjustments with the prefix "Listen[i]." (only the latest
+// 64 Listen records are kept, see Status). When Listen fails the sources
+// stay owned by the caller.
 func (rt *Runtime) Listen(cfg ListenConfig) (*Listener, error) {
 	srcs, psrcs, err := listenSources(cfg.Sources)
 	if err != nil {
@@ -170,6 +174,9 @@ func (rt *Runtime) Listen(cfg ListenConfig) (*Listener, error) {
 	ncfg, adj := normalizeListen(rt.nlisten, cfg, rt.ov)
 	rt.nlisten++
 	rt.adjust = append(rt.adjust, adj...)
+	if over := len(rt.adjust) - rt.nconfig - maxListenAdjust; over > 0 {
+		rt.adjust = slices.Delete(rt.adjust, rt.nconfig, rt.nconfig+over) // the oldest Listen records
+	}
 	ln := newListener(rt, ncfg, srcs)
 	ln.psrcs = rt.newSourcesLocked(psrcs)
 	rt.listeners[ln] = struct{}{}

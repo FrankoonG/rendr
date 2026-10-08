@@ -121,7 +121,9 @@ func (l *Listener) accept(h handoff, qc *qgo.Conn) {
 // classify waits at most HandshakeTimeout for the connection's first
 // client stream or DATAGRAM and hands the carrier to rendr. Both kinds,
 // neither, another ALPN, a DATAGRAM limit below DatagramBudget, eviction
-// and the Listener's close end the connection instead.
+// and the Listener's close end the connection instead. Both kinds also
+// when the stream comes after the hand-over of a datagram carrier: see
+// watchLateStream.
 func (l *Listener) classify(h handoff, w *waiter, ctx context.Context) {
 	qc := w.qc
 	ctx, stop := context.WithTimeoutCause(ctx, l.opts.HandshakeTimeout, errClassifyTimeout)
@@ -187,7 +189,22 @@ func (l *Listener) classify(h handoff, w *waiter, ctx context.Context) {
 			return
 		}
 		l.bump(&l.stats.Datagrams)
+		go l.watchLateStream(qc, rel)
 	}
+}
+
+// watchLateStream ends a handed datagram carrier whose peer opens its one
+// allowed client stream after classification (W4-L2-3): nothing reads that
+// stream, so quic-go would buffer up to InitialStreamReceiveWindow outside
+// every rendr budget. The connection is closed with codeBadKind (BadKind
+// counted); the carrier dies and rendr's session survives it (invariant 6).
+// The goroutine ends with the connection.
+func (l *Listener) watchLateStream(qc *qgo.Conn, rel func(qgo.ApplicationErrorCode)) {
+	if _, err := qc.AcceptStream(qc.Context()); err != nil {
+		return // the connection ended
+	}
+	l.bump(&l.stats.BadKind)
+	rel(codeBadKind)
 }
 
 func (l *Listener) bump(p *uint64) {

@@ -12,8 +12,11 @@ acknowledgement = delivered to the receiving application, bounded
 retransmission and reordering, and the scheduling of a session over its
 carriers (one active carrier with failover and quality switching, or all
 carriers bonded for throughput). Carriers are rendr-to-rendr connections
-that the embedder supplies as `net.Conn` factories — typically L7 tunnels —
-or the built-in plaintext TCP carrier.
+that the embedder supplies as `net.Conn` or `net.PacketConn` factories —
+typically L7 tunnels — or the built-in plaintext TCP and UDP carriers, or
+the QUIC carriers of the nested module `github.com/FrankoonG/rendr/v2/quic`.
+Besides byte-stream sessions (`net.Conn`), rendr carries packet sessions
+(`net.PacketConn`): datagrams delivered at most once, never retransmitted.
 
 ```
 dialer (decides scheduling for both directions)          passive (follows)
@@ -26,11 +29,12 @@ app ── net.Conn ── session ══ carrier × N ══ session ── net
 
 **rendr 2.0 is a ground-up rewrite in progress** on the `v2` branch
 (module `github.com/FrankoonG/rendr/v2`); it is not compatible with earlier
-releases, their API or their wire format. The current checkpoint is M1b,
-the 2.0 core: stream sessions, selector and bond scheduling, the wire
-format, admission and the API below. The API is meant to be frozen at the
-end of M1b but may still change before v2.0.0. Packet sessions, datagram
-and QUIC carriers (M2), race scheduling and carrier multiplexing (M3), and an
+releases, their API or their wire format. The current checkpoint is M2:
+the 2.0 core of M1 (stream sessions, selector and bond scheduling, the wire
+format, admission) plus packet sessions, datagram carriers (the raw UDP
+carrier `carrier/udp` and embedder `net.PacketConn` carriers) and the QUIC
+stream and datagram carriers of the nested `quic` module. The API may still
+change before v2.0.0. Race scheduling and carrier multiplexing (M3) and an
 L4 TCP module (M4) follow.
 
 Supported platforms are Linux and Windows; Windows has no real-network
@@ -49,10 +53,15 @@ transport layer meant to run inside the embedder's own protocol:
 - A rendr `InstanceID` identifies a running instance for routing only. It is
   random but travels in clear on the wire: it is not a secret, **not an
   identity**, and proves nothing.
-- The built-in TCP carrier (`carrier/tcp`) is plaintext. Its listener and
-  dialer accept only loopback addresses unless `Options.AllowNonLoopback` is
-  set; enable that only on a trusted network or inside an authenticated
-  encrypted channel.
+- The built-in TCP and UDP carriers (`carrier/tcp`, `carrier/udp`) are
+  plaintext. Their listeners and dialers accept only loopback addresses
+  unless `Options.AllowNonLoopback` is set; enable that only on a trusted
+  network or inside an authenticated encrypted channel. The UDP carrier's
+  random flow ID keeps blind off-path injection out but is no
+  authentication: anyone who sees the traffic can kill or retire a carrier.
+- The QUIC carriers (module `github.com/FrankoonG/rendr/v2/quic`) always
+  encrypt, but encryption is not authentication: they authenticate only
+  what the embedder's `tls.Config` verifies.
 - [`examples/mtls`](examples/mtls) shows mutually authenticated TLS carriers
   built with the standard library's `crypto/tls`: the passive side verifies
   the client certificate before a carrier ever reaches rendr.
@@ -148,6 +157,33 @@ peer, err := cli.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{
 }})
 conn, err := peer.Dial(ctx, rendr.DialOptions{Mode: rendr.ModeSelector, Metadata: []byte("app-defined")})
 ```
+
+Packet sessions use the same Runtime, Peer and Listener. A listening UDP
+socket is a `rendr.FromPacketConn` source, and a datagram factory joins the
+Peer's carriers:
+
+```go
+sock, err := udp.Listen("udp", addr, udp.Options{}) // package carrier/udp
+ln, err := srv.Listen(rendr.ListenConfig{Sources: []rendr.Source{rendr.FromPacketConn(sock)}})
+pp, err := ln.AcceptPacket(ctx)  // Accept returns stream sessions only
+pc, err := pp.Confirm()          // *rendr.PacketConn is a net.PacketConn
+
+peer, err := cli.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{
+	udp.Carrier("udp", "udp", addr, udp.Options{}),
+}})
+pc, err := peer.DialPacket(ctx, rendr.DialOptions{Mode: rendr.ModeSelector})
+n, err := pc.WriteTo(datagram, nil) // one datagram of at most pc.MaxPayload() bytes
+```
+
+`WriteTo` never waits: each datagram is queued and sent at most once,
+possibly reordered, and lost only in flight on a carrier that dies or when a
+bounded queue drops it (counted in the session's packet counters).
+`ReadFrom` returns one datagram per call and `io.EOF` only after the peer
+closed its end and the datagrams already received were read. A larger
+datagram fails with `ErrPacketTooLarge`. A carrier change is as invisible as
+for a stream session. With `Config.IdleTimeout`, every successful `WriteTo`,
+every received datagram and every datagram `ReadFrom` returns keeps a packet
+session alive.
 
 Semantics in brief:
 
