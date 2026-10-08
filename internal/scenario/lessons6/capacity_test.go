@@ -11,11 +11,17 @@ import (
 
 // TestPacketStreamLaneCapacity_L32: a mixed packet bond with a datagram
 // member u (frame budget 1000: datagrams up to 975 bytes) and a stream
-// member s (a 2 MB/s stream link whose conn could buffer 8 MiB). Bursts of
-// 100 datagrams every 20 ms: four of five are 900 bytes, which u carries;
-// every fifth is 1,200 bytes, which only a stream member can carry (the
-// bond's txBig, M2-D43), so s carries datagrams by construction (1.2 MB/s,
-// below its link's rate). Then s's link stalls: nothing it accepted
+// member s (an 8 MiB/s stream link whose conn could buffer 8 MiB). Bursts
+// of 100 datagrams every 20 ms: four of five are 900 bytes, which u
+// carries; every fifth is 1,200 bytes, which only a stream member can carry
+// (the bond's txBig, M2-D43), so s carries datagrams by construction
+// (1.2 MB/s). A stream member's Fill also pulls tx after txBig (§A5.2), so
+// when the writers run in parallel s takes small datagrams too, up to the
+// whole 4.8 MB/s offered: its link's rate stays above that, so s is never
+// saturated before the stall (on a 2 MB/s link it was at GOMAXPROCS ≥ 2,
+// its capacity full, and big datagrams aged out before the stall). The
+// stall starts while s has room for a big datagram, so it holds some. Then
+// s's link stalls: nothing it accepted
 // arrives, and its Write keeps returning while its buffer has room. On a
 // stream lane DGRAM bytes are DATA (M2-D26): they are submitted against the
 // carrier's in-flight capacity, so the stalled member takes at most its
@@ -46,7 +52,7 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 		}
 		ls := w.addStreamLink("s", 8<<20)
 		ls.SetDelay(5*time.Millisecond, 0)
-		ls.SetRate(2 << 20)
+		ls.SetRate(8 << 20)
 		dc, pc := w.open(w.peer(dgCarrier(lu, 1000), stCarrier(ls)), rendr.DialOptions{Mode: rendr.ModeBond})
 		waitFor(t, 10*time.Second, "both members on both ends", func() bool {
 			return len(liveOf(dc.Status())) == 2 && len(liveOf(pc.Status())) == 2
@@ -69,8 +75,13 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 			}
 		}
 
-		// The stream member's link stalls; follow its capacity and in-flight
-		// bytes until it dies.
+		// The stream member's link stalls while s has room for a big
+		// datagram (its writer then takes datagrams the stall holds); follow
+		// its capacity and in-flight bytes until it dies.
+		waitFor(t, time.Second, "room on the stream member", func() bool {
+			c, ok := carrierOf(dc.Status(), sc.ID)
+			return ok && c.Cap-c.Inflight >= big
+		})
 		held0 := ls.Stats().Session.Held
 		stalled := time.Now()
 		ls.SetStall(true)
