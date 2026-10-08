@@ -1,6 +1,7 @@
 package lessons6
 
 import (
+	"fmt"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -155,8 +156,24 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 				until = rejoin
 			}
 			if l.wrote.Before(stalled.Add(-time.Second)) || l.wrote.After(until) {
-				t.Fatalf("seq %d (%d bytes) written at +%v of the stall was lost: outside [stall − 1 s, +%v]",
-					l.seq, size(l.seq), l.wrote.Sub(stalled), until.Sub(stalled))
+				// Diagnosis: every loss outside its window, the counters and
+				// the carriers at the end.
+				var out []string
+				for _, m := range ls_ {
+					u := death
+					if size(m.seq) == big {
+						u = rejoin
+					}
+					if (m.wrote.Before(stalled.Add(-time.Second)) || m.wrote.After(u)) && len(out) < 40 {
+						out = append(out, fmt.Sprintf("%d/%dB@+%v", m.seq, size(m.seq), m.wrote.Sub(stalled)))
+					}
+				}
+				var cs []string
+				for _, c := range dc.Status().Carriers {
+					cs = append(cs, fmt.Sprintf("%s#%d %v %v %q cap %d infl %d tx %d", c.Name, c.ID, c.State, c.DeathCause, c.DeathDetail, c.Cap, c.Inflight, c.TxBytes))
+				}
+				t.Fatalf("seq %d (%d bytes) written at +%v of the stall was lost: outside [stall − 1 s, +%v]; outside (first 40): %v; death +%v; dialer %+v; passive %+v; dialer carriers %v",
+					l.seq, size(l.seq), l.wrote.Sub(stalled), until.Sub(stalled), out, death.Sub(stalled), *ds, *ps, cs)
 			}
 		}
 		if up.firstArrivalWrittenFrom(rejoin).IsZero() {
