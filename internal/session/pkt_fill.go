@@ -272,8 +272,14 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			sl.port.Wake()
 			counted, covered = sl, carrier.MaxBatchFrames
 		}
-		if covered < pk.tx.n {
-			s.pktWalkLocked(pk.tx.n, false, counted, covered, int(pk.tx.front().n))
+		if covered < pk.tx.n && !s.pktWalkLocked(pk.tx.n, false, counted, covered, int(pk.tx.front().n)) {
+			// No live data lane can place the head now: it is larger than
+			// every datagram member's DgramMax and no stream member has room
+			// for it (a budget shrink, or a mixed bond whose stream members
+			// are gone). Wake a datagram member anyway: its Fill drops the
+			// head as DropTooLarge (M2-D45) and places what follows, instead
+			// of the head holding every datagram behind it until MaxAge.
+			s.pktWakeDgramLocked()
 		}
 	}
 	if pk.txBig.n > 0 {
@@ -287,7 +293,10 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 // without spare capacity for the head is skipped like a write-blocked one:
 // it could place nothing, so it covers nothing (a stalled member absorbs
 // at most its capacity, L32; as M1's wakeDataLocked counts spare capacity).
-func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, head int) {
+// It reports whether a lane could place the head; skip counts as one (the
+// minimum share's lane, chosen because it can).
+func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, head int) bool {
+	found := skip != nil
 	for pass := range 2 {
 		if streamOnly && pass == 0 {
 			continue
@@ -306,10 +315,29 @@ func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, 
 				l.idle = false
 				l.port.Wake()
 			}
+			found = true
 			covered += carrier.MaxBatchFrames
 			if covered >= need {
-				return
+				return true
 			}
+		}
+	}
+	return found
+}
+
+// pktWakeDgramLocked wakes the first live datagram data lane that is not
+// write-blocked (srtt order).
+func (s *Session) pktWakeDgramLocked() {
+	for _, l := range s.st.order {
+		if !l.data || l.state == LaneDead || l.port.WriteBlocked() {
+			continue
+		}
+		if _, dg := pktDgramLane(l); dg {
+			if l.idle {
+				l.idle = false
+				l.port.Wake()
+			}
+			return
 		}
 	}
 }
