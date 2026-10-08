@@ -278,12 +278,26 @@ func TestActorNoPathRecovery(t *testing.T) {
 // the stall as well, only the death of the member could recover.
 //
 // During the stall both rescue rules hold: the holder of the stuck head
-// never sends the duplicate (its carrier retransmits nothing; the other
-// member does), and each value of the head is rescued at most once (the
-// retransmitted bytes stay within one segment per distinct head value).
+// never sends the duplicate while the other member exists (rescueSendHook;
+// the other member does), and each value of the head is rescued at most
+// once (the retransmitted bytes stay within one segment per distinct head
+// value). p2 itself may rescue a head p1 holds (any lane but the holder
+// may): with p1's 400 ms delay a head on p1 can stay stuck for RescueWait,
+// so p2's retransmitted bytes are not a measure of the holder rule.
 // In the slow-rescuer variant the rescuing member's path has a 400 ms
 // one-way delay, so the duplicate is acknowledged only after several
 // rescue checks at the same head: none of them may rescue it again.
+//
+// The stall starts while p2 carries a burst (K8): the bond counts the
+// member's death only when it requeues this side's unacknowledged DATA
+// (m1b §7.6), and each rescue moves at most one segment off the stalled
+// member, one per RescueMin plus a round trip on p1. A stall that caught
+// fewer segments in transit than the rescues acknowledged before the death
+// (at most DeadMax after the stall) left nothing to requeue, so the death
+// rightly counted no migration — the wait for it below failed in about one
+// of 20–60 runs under -race, where scheduling moves the stall's phase in
+// p2's bursts. The test now waits for a burst holding more segments than
+// that bound, so the death always finds DATA to requeue.
 func TestActorBondRescue(t *testing.T) {
 	for _, slow := range []bool{false, true} {
 		name := "fast-rescuer"
@@ -295,10 +309,18 @@ func TestActorBondRescue(t *testing.T) {
 				w := acNewWorld(t, nil)
 				defer w.teardown()
 				window := 800 * time.Millisecond // before the stalled member's PING deadline (DeadMin 1 s)
+				delay := time.Millisecond        // p1's one-way delay (slowLink)
 				if slow {
 					w.a.cenv.Timing.DeadMin, w.a.cenv.Timing.DeadMax = 3*time.Second, 4*time.Second
 					window = 2500 * time.Millisecond
+					delay = 400 * time.Millisecond
 				}
+				seg := int64(w.a.cenv.Timing.Segment)
+				// Rescues acknowledged before the stalled member's death:
+				// at most one per RescueMin plus p1's round trip until
+				// DeadMax (and a PING interval) after the stall, plus one
+				// already under way when it starts.
+				maxRescued := int64((w.a.cenv.Timing.DeadMax+100*time.Millisecond)/(w.a.p.RescueMin+2*delay)) + 2
 				l1, l2 := w.slowLink("p1"), w.slowLink("p2")
 				l1.SetRate(8 << 20)
 				l2.SetRate(8 << 20)
@@ -317,8 +339,46 @@ func TestActorBondRescue(t *testing.T) {
 				if l2.Stats().Session.Bytes == 0 {
 					t.Fatal("the joined member carried nothing before the stall")
 				}
+				// transit is the DATA payload the dialer wrote on p2 that the
+				// passive has not received yet.
+				transit := func() int64 {
+					var tx, rx uint64
+					var id uint32
+					for _, c := range a.Status().Carriers {
+						if c.Name == "p2" && c.State != LaneDead {
+							tx, id = c.Stats.TxBytes, c.ID
+						}
+					}
+					for _, c := range b.Status().Carriers {
+						if c.ID == id {
+							rx = c.Stats.RxBytes
+						}
+					}
+					return int64(tx) - int64(rx)
+				}
+				// No goroutine of the bubble runs between the check and the
+				// stall (acWaitFor returns after synctest.Wait). In the fast
+				// variant p2 must also have room left under its capacity
+				// cap: the holder rule below is only tested if the stalled
+				// holder could place the duplicate itself (a holder at its
+				// cap places nothing). The slow variant's p2 gets room while
+				// the stall lasts, and a burst with room is rare there.
+				acWaitFor(t, 3*time.Second, "a burst in transit on p2", func() bool {
+					if transit() <= maxRescued*seg {
+						return false
+					}
+					for _, c := range a.Status().Carriers {
+						if c.Name == "p2" && c.State != LaneDead {
+							return slow || c.Stats.Cap-c.Stats.Inflight >= seg
+						}
+					}
+					return false
+				})
 				l2.SetStall(true)
 				time.Sleep(100 * time.Millisecond)
+				if got := transit(); got <= maxRescued*seg {
+					t.Fatalf("%d bytes held on p2 by the stall, want more than %d segments (stimulus)", got, maxRescued)
+				}
 				retx := func(name string) uint64 {
 					for _, c := range a.Status().Carriers {
 						if c.Name == name && c.State != LaneDead {
@@ -329,7 +389,8 @@ func TestActorBondRescue(t *testing.T) {
 					return 0
 				}
 				d0, r0 := b.Status().DeliveredBytes, a.Status().RetransmittedBytes
-				h0, o0 := retx("p2"), retx("p1")
+				placed := rhWatchRescues(t, a)
+				o0 := retx("p1")
 				heads := map[uint64]bool{}
 				for end := time.Now().Add(window); time.Now().Before(end); {
 					heads[a.Status().AckedBytes] = true
@@ -343,8 +404,11 @@ func TestActorBondRescue(t *testing.T) {
 				if d1 := b.Status().DeliveredBytes; d1 <= d0 || st.RetransmittedBytes <= r0 {
 					t.Fatalf("during the stall: delivered %d → %d, retransmitted %d → %d; want progress by rescue", d0, d1, r0, st.RetransmittedBytes)
 				}
-				if h1, o1 := retx("p2"), retx("p1"); h1 != h0 || o1 <= o0 {
-					t.Fatalf("retransmitted during the stall: holder p2 %d → %d, other member p1 %d → %d; the duplicate must leave on p1 only", h0, h1, o0, o1)
+				if holder, other, both := placed.counts(); both != 0 || holder != 0 || other == 0 {
+					t.Fatalf("rescues placed during the stall: %d by the holder alone, %d by another member, %d by the holder beside another member; want only by another member", holder, other, both)
+				}
+				if o1 := retx("p1"); o1 <= o0 {
+					t.Fatalf("p1 retransmitted %d → %d during the stall: the duplicate of p2's held head must leave on p1", o0, o1)
 				}
 				if got, bound := st.RetransmittedBytes-r0, uint64(len(heads))*uint64(w.a.cenv.Timing.Segment); got > bound {
 					t.Fatalf("%d bytes retransmitted during the stall over %d head values: more than one segment per head", got, len(heads))
