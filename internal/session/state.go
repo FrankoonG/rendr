@@ -119,6 +119,7 @@ type lane struct {
 
 	// Packet lanes only (M2).
 	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
+	capMarked    bool      // (S) its latest Fill left a queued datagram for want of capacity and marked the batch cap-blocked: the PONG that frees capacity wakes it (pktWakeCappedLocked)
 	echoRel      uint32    // (S) passive: the epoch echo last placed in a reliable PACK on this lane (M2-D39); (A) initializes it to ctl.epoch−1, never the applied epoch
 	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
 	retireEpoch  uint32    // (A) planned switch: the SCHED epoch that removed the lane (M2-D42)
