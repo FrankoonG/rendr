@@ -513,7 +513,31 @@ func TestPacketLogicalAddrE2E_L38(t *testing.T) {
 		}
 		buf := make([]byte, 64)
 		for round := range 4 {
-			e.links[round%2].Kill()
+			// Kill the link that carries the session's active carrier: the
+			// ranking may redial either factory after a death (failed
+			// factories rank by configuration order, and the mark of the
+			// one killed before may still stand), so alternating the links
+			// could hit one that carries nothing (W4-K12).
+			var active string
+			peWait(t, 5*time.Second, "an active carrier", func() bool {
+				for _, cs := range peLive(dc) {
+					if cs.State == CarrierActive {
+						active = cs.Name
+						return true
+					}
+				}
+				return false
+			})
+			killed := false
+			for _, l := range e.links {
+				if l.Name() == active {
+					l.Kill()
+					killed = true
+				}
+			}
+			if !killed {
+				t.Fatalf("round %d: the active carrier %q is on no link", round, active)
+			}
 			time.Sleep(2 * time.Second)
 			if _, err := dc.WriteTo([]byte{byte(round)}, pc.LocalAddr()); err != nil {
 				t.Fatalf("round %d: WriteTo to the logical address: %v", round, err)

@@ -111,7 +111,8 @@ type factoryState struct {
 
 	failed   bool
 	reason   string
-	markAt   time.Time // when the mark was (last) set
+	markAt   time.Time // the failure the mark records (MarkFailedAt's at; a probe failure's time)
+	proofAt  time.Time // the latest PING commit of any sample (zero: none), for MarkFailedAt
 	attempts uint64    // probe attempts started
 	first    bool      // WaitFirst: a sample or a failure since the current run started
 
@@ -354,20 +355,42 @@ func (h *Health) Subscribe(b Doorbell) (cancel func()) {
 	}
 }
 
-// MarkFailed sets factory i's failed mark (a session carrier of i died).
-// The mark only demotes i in the ranking; it never blocks a dial (plan §3.9).
-// The mark is in the snapshot when MarkFailed returns. It is cleared by
-// Succeeded, by a probe dial of i that started after the mark, or by a
-// probe PONG whose PING was committed after the mark (a round trip that
-// happened after the failure; plan §3.9 "标记之后的下一个成功 PING/PONG").
+// MarkFailed is MarkFailedAt for a failure that happens now.
 func (h *Health) MarkFailed(i int, reason string) {
+	h.MarkFailedAt(i, reason, time.Time{})
+}
+
+// MarkFailedAt sets factory i's failed mark for a failure at at (a session
+// carrier of i died then; zero or a future at means now). The mark only
+// demotes i in the ranking; it never blocks a dial (plan §3.9). The mark
+// is in the snapshot when MarkFailedAt returns. It is cleared by
+// Succeeded, by a probe dial of i that started after the mark, or by a
+// probe PONG whose PING was committed at or after at (a round trip that
+// happened after the failure; plan §3.9 "标记之后的下一个成功 PING/PONG").
+//
+// The failure is dated by at, not by the call: the session reports a
+// death after its actor step, and a probe sample processed in between
+// must still count (W4-MARKAT). So a factory whose latest sample's PING
+// was committed at or after at is not marked at all, and a mark already
+// set for a later failure keeps that later time.
+func (h *Health) MarkFailedAt(i int, reason string, at time.Time) {
 	now := time.Now()
+	if at.IsZero() || at.After(now) {
+		at = now
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if i < 0 || i >= len(h.fac) {
 		return
 	}
-	h.markLocked(i, reason, now)
+	f := &h.fac[i]
+	if !f.failed && !f.proofAt.IsZero() && !f.proofAt.Before(at) {
+		return // a round trip after the failure already proved the factory
+	}
+	if f.failed && f.markAt.After(at) {
+		at = f.markAt
+	}
+	h.markLocked(i, reason, at)
 	h.publishLocked()
 }
 
@@ -413,11 +436,11 @@ func (h *Health) Close() {
 	}
 }
 
-// markLocked sets factory i's failed mark at now; a failure is first
-// evidence for WaitFirst.
-func (h *Health) markLocked(i int, reason string, now time.Time) {
+// markLocked sets factory i's failed mark for a failure at at; a failure
+// is first evidence for WaitFirst.
+func (h *Health) markLocked(i int, reason string, at time.Time) {
 	f := &h.fac[i]
-	f.failed, f.reason, f.markAt = true, reason, now
+	f.failed, f.reason, f.markAt = true, reason, at
 	h.noteFirstLocked(i)
 }
 
@@ -526,7 +549,7 @@ func (h *Health) pingCommitted(c *Conn, id uint32, at time.Time) {
 	f.volAt, f.volTx, f.volRx = at, g.tx, g.rx
 	if e := f.early; e.ok && e.id == id {
 		f.early = probeEarly{}
-		h.sampleLocked(i, e.at, e.rtt, e.loaded || g.loaded || e.epoch != g.epoch)
+		h.sampleLocked(i, e.at, at, e.rtt, e.loaded || g.loaded || e.epoch != g.epoch)
 		return
 	}
 	f.pushPing(rec)
@@ -551,6 +574,7 @@ func (h *Health) pingCommitted(c *Conn, id uint32, at time.Time) {
 // path without evidence for good and make every cold-start Dial wait the
 // whole Probe.DialWait.
 func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
+	commit := at.Add(-rtt) // before the 1 ns floor: a PING committed at the mark's instant clears it
 	rtt = max(rtt, time.Nanosecond)
 	i := c.Factory()
 	if i < 0 || i >= len(h.gauges) {
@@ -570,7 +594,7 @@ func (h *Health) pong(c *Conn, id uint32, rtt time.Duration, at time.Time) {
 	}
 	loaded := g.loaded || rec.loaded || rec.epoch != g.epoch ||
 		h.volumeLoaded(&rec, grown(g.tx, rec.tx)+grown(g.rx, rec.rx), rtt)
-	h.sampleLocked(i, at, rtt, loaded)
+	h.sampleLocked(i, at, commit, rtt, loaded)
 }
 
 // grown returns how far a volume counter grew from then to now. The two
@@ -665,13 +689,18 @@ func (h *Health) established(rec *probePing, rtt time.Duration) bool {
 	return rec.settled >= thr && steady
 }
 
-// sampleLocked adds one probe sample of factory i and publishes the
-// change. A sample whose PING was committed (at − rtt) after the failed mark
-// clears it: a round trip that happened after the failure (plan §3.9).
-func (h *Health) sampleLocked(i int, at time.Time, rtt time.Duration, loaded bool) {
+// sampleLocked adds one probe sample of factory i (PONG at at, PING
+// committed at commit) and publishes the change. A sample whose PING was
+// committed at or after the failure its mark records clears the mark: a
+// round trip that happened after the failure (plan §3.9). The commit is
+// kept (proofAt) for a MarkFailedAt that reports an earlier failure late.
+func (h *Health) sampleLocked(i int, at, commit time.Time, rtt time.Duration, loaded bool) {
 	f := &h.fac[i]
+	if commit.After(f.proofAt) {
+		f.proofAt = commit
+	}
 	changed := false
-	if f.failed && !at.Add(-rtt).Before(f.markAt) {
+	if f.failed && !commit.Before(f.markAt) {
 		h.clearLocked(i)
 		changed = true
 	}

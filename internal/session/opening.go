@@ -36,6 +36,17 @@ type healthSource interface {
 
 var _ healthSource = (*carrier.Health)(nil)
 
+// datedMarker is a healthSource that dates a failed mark by the failure
+// rather than by the call (carrier.Health; W4-MARKAT). markFailed calls it
+// after the actor's step, so a probe round trip of the factory between the
+// failure and that call still clears or prevents the mark. A healthSource
+// without it (the actor tests' fakes) gets MarkFailed.
+type datedMarker interface {
+	MarkFailedAt(i int, reason string, at time.Time)
+}
+
+var _ datedMarker = (*carrier.Health)(nil)
+
 // Dial outcome states (one CAS decides between success and withdrawal).
 const (
 	dialWaiting int32 = iota
@@ -233,20 +244,26 @@ func openPayload(s *Session, window uint32) []byte {
 	return p[:wire.PutOpen(p, &o)]
 }
 
-// markFailed sets factory i's failed mark: a health-layer call after the
-// lock is released, mirrored by a local mark so that a race ranked in the
-// same step already ranks the factory last (§7.3). The local mark yields
-// to the health layer once a snapshot published after that call is seen
-// (failedLocked), whatever its mark says by then: the health layer clears
-// a mark at the next successful probe PONG (§7.8), which a snapshot the
-// actor never read could not tell it.
-func (a *actor) markFailed(i int, reason string) {
+// markFailed sets factory i's failed mark for a failure at at (a carrier's
+// death time, or the step's now): a health-layer call after the lock is
+// released, dated by at (datedMarker), mirrored by a local mark so that a
+// race ranked in the same step already ranks the factory last (§7.3). The
+// local mark yields to the health layer once a snapshot published after
+// that call is seen (failedLocked), whatever its mark says by then: the
+// health layer clears a mark at the next successful probe PONG (§7.8), or
+// does not set it when a probe round trip already followed the failure,
+// which a snapshot the actor never read could not tell it.
+func (a *actor) markFailed(i int, reason string, at time.Time) {
 	d := a.d
 	d.failed[i] = true
 	if h := d.h; h != nil {
 		d.failedVer[i] = markPending
 		a.later = append(a.later, func() {
-			h.MarkFailed(i, reason)
+			if m, ok := h.(datedMarker); ok {
+				m.MarkFailedAt(i, reason, at)
+			} else {
+				h.MarkFailed(i, reason)
+			}
 			v := uint64(0)
 			if sn := h.Snapshot(); sn != nil {
 				v = sn.Version
@@ -717,7 +734,7 @@ func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error
 		if e != nil {
 			reason = e.Cause.String()
 		}
-		a.markFailed(i, reason)
+		a.markFailed(i, reason, now)
 	} else if e != nil && e.PrefaceOK {
 		a.succeeded(i)
 	}
@@ -907,7 +924,7 @@ func (a *actor) pktBadAnswerLocked(now time.Time, i int, at *attempt, est *carri
 	a.killEst(est, carrier.CauseProtocolViolation, err.Error())
 	a.d.setLast(err)
 	a.finish(now, i, at, sched.OutcomeFailed)
-	a.markFailed(i, carrier.CauseProtocolViolation.String())
+	a.markFailed(i, carrier.CauseProtocolViolation.String(), now)
 }
 
 // joinRefusedLocked handles a non-OK JOIN_ACK from the bound instance
