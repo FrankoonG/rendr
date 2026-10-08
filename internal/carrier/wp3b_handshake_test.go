@@ -150,9 +150,11 @@ func TestDatagramHandshakeSchedule_PA13(t *testing.T) {
 			})
 		})
 	}
-	t.Run("a RACK stops the copies", func(t *testing.T) {
-		// H2's RACK covers H1's REL: no copy follows while H3 is delayed by
-		// 2.5 s; H3 then establishes (§A5.10 phase 2).
+	t.Run("a RACK ends retransmission; keepalive copies follow", func(t *testing.T) {
+		// H2's RACK covers H1's REL: its retransmission ends; while H3 is
+		// delayed by 4.5 s only keepalive copies follow, verbatim, every
+		// RelRTOMax after the RACK (integration 2, K5), and none counts as a
+		// retransmission; H3 then establishes (§A5.10 phase 2).
 		wbBubble(t, func(t *testing.T) {
 			r, raws := wbRawRig(t, 1200)
 			type res struct {
@@ -168,11 +170,18 @@ func TestDatagramHandshakeSchedule_PA13(t *testing.T) {
 			h1 := w.waitN(t, 1)[0].b
 			F := r.penv.Presets.firstCseq()
 			h2, fs := wbH2(r.penv, h1, F)
+			rackAt := time.Now()
 			w.send(h2)
-			time.Sleep(2500 * time.Millisecond)
+			time.Sleep(4500 * time.Millisecond)
 			synctest.Wait()
-			if got := w.received(); len(got) != 1 {
-				t.Errorf("%d datagrams by 2.5 s, want H1 alone: a RACK covering it ends its copies", len(got))
+			got := w.received()
+			if len(got) != 3 {
+				t.Fatalf("%d datagrams by 4.5 s, want H1 and two keepalives: a RACK covering it ends its retransmission", len(got))
+			}
+			for i, g := range got[1:] {
+				if at := g.at.Sub(rackAt); at != time.Duration(i+1)*2*time.Second || !bytes.Equal(g.b, got[0].b) {
+					t.Errorf("keepalive %d at %v after the RACK (verbatim %v), want %v, verbatim", i, at, bytes.Equal(g.b, got[0].b), time.Duration(i+1)*2*time.Second)
+				}
 			}
 			w.send(wbFrame(wire.TypeRel, 0, fs, 0, relPayloadOf(F, wire.TypeOpenAck, 0, wire.SessionHandle, wbOpenAckOK(1100, 1200))))
 			x := <-ch

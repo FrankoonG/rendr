@@ -18,8 +18,11 @@ var (
 	// stopped (Abort, a permanent read error): the carrier ends.
 	errSourceClosed = fmt.Errorf("rendr/udpflow: the shared socket is closed: %w", net.ErrClosed)
 	// errNotCandidate: WriteDatagramTo or SetPeer named another address
-	// than the flow's latest rebind candidate (M2-D27).
-	errNotCandidate = errors.New("rendr/udpflow: not the flow's latest rebind candidate")
+	// than the flow's latest rebind candidate (M2-D27). It wraps
+	// carrier.ErrNoRebind: a datagram from a newer source replaced the
+	// candidate while a challenge to the older one was in flight, so the
+	// challenge is lost — never the carrier.
+	errNotCandidate = fmt.Errorf("%w: not the flow's latest rebind candidate", carrier.ErrNoRebind)
 	// errWriteCount: a foreign conn's WriteTo reported another count than
 	// the datagram's length (L42, PA-19).
 	errWriteCount = errors.New("rendr/udpflow: datagram write returned an invalid count")

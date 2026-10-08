@@ -223,15 +223,14 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time) {
 // commits the rebind when it answers the challenge in flight — the same
 // nonce, from the candidate, before the expiry — by making the candidate
 // the transport's peer (the reader may call SetPeer, R1-14). Any other
-// PONG with id 0 is ignored and counted. It reports whether it committed.
+// PONG with id 0, and an answer whose commit the transport refuses, is
+// ignored and counted. It reports whether it committed.
 func (c *Conn) onChallengePong(p *wire.Ping, src PeerKey, now time.Time) bool {
 	c.mu.Lock()
 	ch := &c.dg.chal
 	ok := ch.active && now.Sub(ch.at) < chalExpiry && p.Nonce == ch.nonce && src == ch.cand
 	if ok {
 		ch.active = false
-		ch.commits[ch.nc%chalCommitsMax] = now
-		ch.nc++
 	}
 	c.mu.Unlock()
 	if !ok {
@@ -239,8 +238,16 @@ func (c *Conn) onChallengePong(p *wire.Ping, src PeerKey, now time.Time) bool {
 		return false
 	}
 	if err := c.dg.io.SetPeer(src); err != nil {
-		return false // a transport that cannot rebind never reports candidates
+		// A newer source replaced the transport's rebind candidate (a
+		// transport that cannot rebind never reports one): the answer is
+		// stale, a counted drop, and no commit against the rate limit.
+		c.dgDropped(1)
+		return false
 	}
+	c.mu.Lock()
+	ch.commits[ch.nc%chalCommitsMax] = now
+	ch.nc++
+	c.mu.Unlock()
 	c.dg.ctr.rebinds.Add(1)
 	if s := c.env.Dgram; s != nil {
 		s.Rebinds.Add(1)

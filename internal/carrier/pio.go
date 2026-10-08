@@ -73,7 +73,9 @@ type PacketIO interface {
 	// it).
 	WriteDatagram(b []byte) error
 	// WriteDatagramTo sends b to dst instead of the current peer (a rebind
-	// challenge, M2-D27); ErrNoRebind on transports that cannot rebind. b
+	// challenge, M2-D27); ErrNoRebind (or an error wrapping it) on
+	// transports that cannot rebind and for a dst that is no longer the
+	// transport's latest candidate: the challenge is lost, not the carrier. b
 	// has WriteDatagram's layout: the transport fills b[:Headroom()], the
 	// datagram's rendr bytes start after it.
 	WriteDatagramTo(b []byte, dst PeerKey) error

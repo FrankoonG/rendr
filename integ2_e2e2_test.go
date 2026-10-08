@@ -647,11 +647,11 @@ func TestHeldCarrierRepeatsH2E2E(t *testing.T) {
 // candidate source), challenges it from the held writer, the dialer's
 // Establish answers, the rebind commits and the verdict reaches the new
 // address — DialPacket succeeds at Confirm and the carrier counts one
-// rebind. After H2 the dialer sends nothing until the verdict (its H1 is
-// acknowledged), so nothing reveals the move: the verdict goes to the old
-// address, the attempt ends at Handshake.Timeout and the Dial's next
-// carrier opens the session (no rebind; integration 2, known limitation
-// K5). Either way datagrams then flow both ways.
+// rebind. After H2 (its H1 is acknowledged) the dialer's Establish still
+// sends a verbatim H1 copy every RelRTOMax until the verdict (a keepalive,
+// integration 2, K5), so the held flow learns the move the same way before
+// Confirm: one rebind, DialPacket at Confirm. Either way datagrams then
+// flow both ways.
 func TestRebindWhileHeld_L59(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -686,7 +686,8 @@ func rebindWhileHeld(t *testing.T, h2Lost bool) {
 		case <-time.After(15 * time.Second):
 			t.Fatal("DialPacket did not complete after the rebind")
 		}
-		t.Logf("DialPacket returned %v after its start (%v)", time.Since(start), r.err)
+		retAt := time.Now()
+		t.Logf("DialPacket returned %v after its start (%v)", retAt.Sub(start), r.err)
 		if r.err != nil {
 			t.Fatalf("DialPacket: %v", r.err)
 		}
@@ -699,12 +700,9 @@ func rebindWhileHeld(t *testing.T, h2Lost bool) {
 		if v := peRecv(t, dc, 16, 20, time.Second); v.Result().Unique != 20 {
 			t.Fatalf("down: %+v", v.Result())
 		}
-		want := uint64(0)
-		if h2Lost {
-			want = 1
-			if d := time.Since(start); d > 4*time.Second {
-				t.Fatalf("DialPacket took %v: the rebind was not found before the verdict", d)
-			}
+		want := uint64(1)
+		if d := retAt.Sub(start); d > 4100*time.Millisecond {
+			t.Fatalf("DialPacket took %v: the rebind was not found before the verdict", d)
 		}
 		var rebinds uint64
 		for _, cs := range pc.Status().Carriers {

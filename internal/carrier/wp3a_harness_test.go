@@ -3,6 +3,7 @@ package carrier
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -52,6 +53,7 @@ type fakeIO struct {
 	addr   PeerKey // this end's address as the other end sees it
 	cur    PeerKey // the current peer
 	rebind bool    // a passive raw-UDP flow: other sources are ReadCandidate, SetPeer works
+	refuse bool    // SetPeer refuses (ErrNoRebind), as a flow whose candidate a newer source replaced
 	hr     int
 	limit  int
 	recv   int
@@ -322,6 +324,10 @@ func (f *fakeIO) SetPeer(dst PeerKey) error {
 		return ErrNoRebind
 	}
 	f.mu.Lock()
+	if f.refuse {
+		f.mu.Unlock()
+		return fmt.Errorf("%w: not the latest candidate", ErrNoRebind)
+	}
 	f.cur = dst
 	f.sets = append(f.sets, dst)
 	f.mu.Unlock()
