@@ -326,6 +326,41 @@ func TestPacketWakePolicy_L08(t *testing.T) {
 		})
 	})
 
+	// The minimum share's member was woken and has not run yet when more
+	// datagrams arrive (one burst): it still covers the queue up to a
+	// batch, so no other member is woken and its Fill takes the whole
+	// burst (R1-19). Counting it only on the WriteTo that woke it let the
+	// fastest member's writer, run first at GOMAXPROCS=1, drain the burst
+	// every time: a rejoined member then placed nothing for seconds.
+	t.Run("share/pending", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s := dpSession(dpOpt{mode: ModeBond})
+			lf, pf := dpAddLane(s, 1, true, true)
+			ls, ps := dpAddLane(s, 2, true, true)
+			pf.set(func(f *dpPort) { f.srtt = time.Millisecond })
+			ps.set(func(f *dpPort) { f.srtt = 2 * time.Millisecond })
+			dpIdle(lf)
+			dpIdle(ls)
+			now := time.Now()
+			s.mu.Lock()
+			lf.lastDgramAt = now // served; ls never placed: the share's choice
+			s.refreshOrderLocked(now, true)
+			s.mu.Unlock()
+			wf, ws := pf.wakeCount(), ps.wakeCount()
+			const burst = 20
+			for i := 1; i <= burst; i++ {
+				dpWrite(t, s, uint64(i), 100)
+				if pf.wakeCount() != wf || ps.wakeCount() != ws+1 {
+					t.Fatalf("after WriteTo %d: fastest member woken %d times, stale member %d; want 0 and 1", i, pf.wakeCount()-wf, ps.wakeCount()-ws)
+				}
+			}
+			if fs := dpFrames(dpFill(ls, time.Now())); dpCount(fs, wire.TypeDgram) != burst {
+				t.Fatalf("the stale member placed %d DGRAMs, want the whole burst of %d", dpCount(fs, wire.TypeDgram), burst)
+			}
+			dpEnd(s, io.EOF)
+		})
+	})
+
 	t.Run("txBig", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			s := dpSession(dpOpt{mode: ModeBond, maxPayload: 4000})
