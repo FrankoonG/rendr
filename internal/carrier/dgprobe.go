@@ -35,10 +35,11 @@ type dgChallenge struct {
 	active bool      // a challenge is in flight
 	cand   PeerKey   // the candidate source
 	nonce  uint64    // its nonce (≠ 0)
-	at     time.Time // when it was created: it expires chalExpiry later
+	at     time.Time // its creation, or its first send to a retargeted candidate: it expires chalExpiry later
+	moved  bool      // retargeted, and nothing sent to the new candidate yet (at is not running)
 	sentAt time.Time // its latest send (zero: not sent yet)
-	sends  int       // its sends so far
-	last   time.Time // creation time of the latest challenge (spacing)
+	sends  int       // its sends so far (a retarget keeps at most one: its backoff restarts)
+	last   time.Time // creation time of the latest challenge (spacing, chalLifeMax)
 
 	commits [chalCommitsMax]time.Time // the latest commit times (a ring)
 	nc      int                       // commits recorded
@@ -54,6 +55,7 @@ type dgChallenge struct {
 // Rebind challenge limits (M2-D27, M2 design §A7.4).
 const (
 	chalExpiry     = 2 * time.Second // an unanswered challenge expires
+	chalLifeMax    = 2 * chalExpiry  // a retargeted challenge expires at the latest
 	chalSpacingMin = time.Second     // challenges are at least max(RTO, 1 s) apart
 	chalCommitsMax = 10              // commits per chalCommitWin
 	chalCommitWin  = time.Minute
@@ -193,36 +195,46 @@ func (c *Conn) onChallengePing(p *wire.Ping) {
 // rebindCandidate starts a challenge to src at now (M2-D27, §A5.13): a
 // datagram from a new source of which a frame was newly accepted, or a copy
 // of the stored H1 while the passive's first REL is unacknowledged (R1-14,
-// wave 4). One challenge is in flight at a time, challenges are at least
-// max(RTO, 1 s) apart and at most chalCommitsMax rebinds commit per minute.
+// wave 4). One challenge is in flight at a time, challenges are created at
+// least max(RTO, 1 s) apart and at most chalCommitsMax rebinds commit per
+// minute.
+//
 // A source other than the candidate of the challenge in flight retargets
-// it (a second NAT move, W4-REL-1): a fresh nonce for the newer source,
-// which the transport now tracks as its candidate, while the challenge
-// keeps its creation time (expiry) and its send schedule — its next send,
-// at once when none went yet and otherwise at the backed-off resend time,
-// goes to the newer source — so a retarget never adds a send and never
-// extends a challenge. retarget is false for a datagram that carried a
-// challenge answer which committed nothing (a PONG with id 0 from another
-// source or with a stale nonce): an answer is no claim of a new source, so
-// a forged answer cannot redirect the challenge in flight. The datagram's
-// frames were processed normally; replies keep going to the current peer
-// until a commit.
+// it (a second NAT move, W4-REL-1): the newer source, which the transport
+// now tracks as its candidate, gets a fresh nonce; the backoff restarts —
+// the next send goes at once when none went yet, and otherwise one RTO
+// after the latest send, so a retarget never sends challenges less than
+// an RTO apart — and the expiry restarts with the first send to the newer
+// source, so the retargeted challenge has its full chalExpiry for the
+// answer even when that send waits for the RTO of a long path; a
+// challenge lives at most chalLifeMax since its creation, however often it
+// is retargeted. Any window-valid datagram from a new source retargets,
+// the same claim that creates a challenge; the one exception is a datagram that carried a challenge
+// answer (a PONG with id 0) which committed nothing — from another source
+// or with a stale nonce (retarget false): an answer is no claim of a new
+// source, so a replayed or misdirected answer leaves the challenge with
+// its candidate. This is no defence against a forger who can inject
+// window-valid frames; such a forger could start challenges before. The
+// datagram's frames were processed normally; replies keep going to the
+// current peer until a commit.
 func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 	c.mu.Lock()
 	ch := &c.dg.chal
-	if ch.active && now.Sub(ch.at) < chalExpiry {
+	if ch.active && !c.chalExpiredLocked(now) {
 		if src == ch.cand || !retarget {
 			c.mu.Unlock()
 			return
 		}
-		at := ch.at
+		created := ch.last // spacing: one challenge per creation time
 		c.mu.Unlock()
 		nonce := newNonce() // outside Conn.mu
 		c.mu.Lock()
-		if ch.active && ch.at.Equal(at) {
-			ch.cand, ch.nonce = src, nonce
+		if ch.active && ch.last.Equal(created) && ch.cand != src {
+			ch.cand, ch.nonce, ch.moved = src, nonce, true
+			ch.sends = min(ch.sends, 1)
 		}
 		c.mu.Unlock()
+		c.Wake()
 		return
 	}
 	if !ch.last.IsZero() && now.Sub(ch.last) < max(c.relRTOLocked(), chalSpacingMin) {
@@ -233,7 +245,7 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 		c.mu.Unlock()
 		return // the oldest of the latest chalCommitsMax commits is within the minute
 	}
-	ch.active, ch.cand, ch.nonce, ch.at, ch.sentAt, ch.sends, ch.last = true, src, newNonce(), now, time.Time{}, 0, now
+	ch.active, ch.cand, ch.nonce, ch.at, ch.moved, ch.sentAt, ch.sends, ch.last = true, src, newNonce(), now, false, time.Time{}, 0, now
 	c.mu.Unlock()
 	c.Wake()
 }
@@ -280,7 +292,7 @@ func (c *Conn) sourceChecked(p *wire.Ping) bool {
 func (c *Conn) onChallengePong(p *wire.Ping, src PeerKey, now time.Time) bool {
 	c.mu.Lock()
 	ch := &c.dg.chal
-	ok := ch.active && now.Sub(ch.at) < chalExpiry && p.Nonce == ch.nonce && src == ch.cand
+	ok := ch.active && !c.chalExpiredLocked(now) && p.Nonce == ch.nonce && src == ch.cand
 	if ok {
 		ch.active = false
 	}
@@ -309,23 +321,35 @@ func (c *Conn) onChallengePong(p *wire.Ping, src PeerKey, now time.Time) bool {
 
 // chalSendLocked reports whether the challenge is to be sent now — first
 // at once, then resent at the REL RTO, backed off, until it expires — and
-// marks it sent (the writer writes it alone, to the candidate). An
-// expired challenge is dropped.
+// marks it sent (the writer writes it alone, to the candidate); the first
+// send to a retargeted candidate starts its expiry. An expired challenge
+// is dropped.
 func (c *Conn) chalSendLocked(now time.Time) (send bool, cand PeerKey, nonce uint64) {
 	ch := &c.dg.chal
 	if !ch.active {
 		return false, PeerKey{}, 0
 	}
-	if now.Sub(ch.at) >= chalExpiry {
+	if c.chalExpiredLocked(now) {
 		ch.active = false
 		return false, PeerKey{}, 0
 	}
 	if !ch.sentAt.IsZero() && now.Before(c.chalResendAtLocked()) {
 		return false, PeerKey{}, 0
 	}
+	if ch.moved {
+		ch.at, ch.moved = now, false
+	}
 	ch.sends++
 	ch.sentAt = now
 	return true, ch.cand, ch.nonce
+}
+
+// chalExpiredLocked reports whether the challenge in flight expired at
+// now: chalExpiry after its creation or its first send to a retargeted
+// candidate, and chalLifeMax after its creation at the latest.
+func (c *Conn) chalExpiredLocked(now time.Time) bool {
+	ch := &c.dg.chal
+	return now.Sub(ch.last) >= chalLifeMax || (!ch.moved && now.Sub(ch.at) >= chalExpiry)
 }
 
 // chalResendAtLocked is when the challenge in flight is resent.
@@ -344,7 +368,10 @@ func (c *Conn) chalWakeLocked(now time.Time) time.Time {
 	if ch.sentAt.IsZero() {
 		return now
 	}
-	at := ch.at.Add(chalExpiry)
+	at := ch.last.Add(chalLifeMax)
+	if e := ch.at.Add(chalExpiry); !ch.moved && e.Before(at) {
+		at = e
+	}
 	if t := c.chalResendAtLocked(); t.Before(at) {
 		at = t
 	}

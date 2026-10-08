@@ -309,3 +309,188 @@ func TestRebindForgedAnswerKeepsTarget_L59(t *testing.T) {
 		}
 	})
 }
+
+// pipeDelay delays every later datagram of this direction by d, each on its
+// own timer (a long path, not a serializing link: setDelay waits d per
+// datagram in turn, so a burst arrives spread out by d each). Equal delays
+// keep the order. Deliveries stop once the receiving end closes.
+func pipeDelay(f *fakeIO, d time.Duration) {
+	link := make(chan dgItem, 4096)
+	f.mu.Lock()
+	f.delay, f.link = d, link
+	f.mu.Unlock()
+	gone := f.other.done
+	go func() {
+		for {
+			select {
+			case <-gone:
+				return
+			case it := <-link:
+				time.AfterFunc(d, func() {
+					select {
+					case <-gone:
+					default:
+						f.other.push(it)
+					}
+				})
+			}
+		}
+	}()
+}
+
+// TestRebindDoubleMoveLongPath_L59 is TestRebindDoubleMove_L59 on a long
+// path (500 ms each way, RTO + RTT above the 2-s challenge expiry): the
+// challenge to the first candidate has gone, so the retargeted challenge's
+// first send to the second waits for one RTO; its expiry starts with that
+// send, so the retargeted challenge itself commits — no fresh challenge
+// after an expiry — within 2·RTO + RTT of the second move, exactly once,
+// and the carrier lives.
+func TestRebindDoubleMoveLongPath_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const oneWay = 500 * time.Millisecond
+		s, p := rawPair(t, 1200, false)
+		s.io.rebind = true
+		s.io.setRec(true)
+		pipeDelay(s.io, oneWay)
+		pipeDelay(p.io, oneWay)
+		t.Cleanup(func() { p.io.Close() })
+		s.start(StartOptions{})
+		for range 300 { // 6 s of answered PINGs: the RTT settles near 1 s
+			time.Sleep(20 * time.Millisecond)
+			rebindAnswer(p)
+		}
+		s.c.mu.Lock()
+		rto, rtt, seen := s.c.relRTOLocked(), s.c.st.srtt, s.c.st.rttSeen
+		s.c.mu.Unlock()
+		if !seen || rtt < 2*oneWay || rto+rtt <= chalExpiry {
+			t.Fatalf("srtt %v, RTO %v: want an RTT sample of the long path and RTO + RTT above %v (stimulus)", rtt, rto, chalExpiry)
+		}
+
+		t0 := time.Now()
+		p.io.moveTo(fakeAddr(9))
+		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 100, Nonce: 1}))
+		time.Sleep(10 * time.Millisecond)
+		p.io.moveTo(fakeAddr(10))
+		t1 := time.Now()
+		id := uint32(101)
+		for s.c.Stats().Rebinds == 0 && time.Since(t1) < 8*time.Second {
+			p.send(pingFrame(wire.TypePing, wire.Ping{ID: id, Nonce: 1}))
+			id++
+			time.Sleep(20 * time.Millisecond)
+			rebindAnswer(p)
+		}
+		took := time.Since(t1)
+		s.c.mu.Lock()
+		created := s.c.dg.chal.last
+		s.c.mu.Unlock()
+		ws := s.io.recorded()
+		if n9, n10 := chalTo(ws, fakeAddr(9)), chalTo(ws, fakeAddr(10)); n9 == 0 || n10 == 0 {
+			t.Fatalf("challenges to the first candidate %d, to the second %d; want both (stimulus)", n9, n10)
+		}
+		if st := s.c.Stats(); st.Rebinds != 1 || s.io.cur != fakeAddr(10) || took > 2*rto+rtt {
+			t.Fatalf("rebinds %d, peer %v, %v after the second move; want 1, the second address, within 2·RTO + RTT = %v",
+				st.Rebinds, s.io.cur, took, 2*rto+rtt)
+		}
+		if d := created.Sub(t0); d < oneWay || d > oneWay+10*time.Millisecond {
+			t.Fatalf("the committing challenge was created %v after the first move, want the first move's (%v): a fresh challenge after an expiry", d, oneWay)
+		}
+		t.Logf("second move committed %v after it (RTO %v, RTT %v)", took, rto, rtt)
+		// Integrity: the carrier lives and its replies reach the new address.
+		for range 200 {
+			p.send(pingFrame(wire.TypePing, wire.Ping{ID: id, Nonce: 1}))
+			id++
+			time.Sleep(20 * time.Millisecond)
+			rebindAnswer(p)
+		}
+		p.send(pingFrame(wire.TypePing, wire.Ping{ID: id, Nonce: 7}))
+		time.Sleep(2*oneWay + 50*time.Millisecond)
+		var pong bool
+		for _, d := range p.read() {
+			for _, pg := range pingsOf(d, true) {
+				pong = pong || pg.ID == id
+			}
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead || !pong {
+			t.Fatalf("after the commit: dead %v (%v %q), PONG at the new address %v", dead, cause, detail, pong)
+		}
+		if r := s.c.Stats().Rebinds; r != 1 {
+			t.Fatalf("rebinds %d after the commit, want 1", r)
+		}
+	})
+}
+
+// TestRebindRetargetChurnBounded_L59: a forger injects a window-valid PING
+// from a new source every 20 ms for 10 s (500 datagrams over 8 addresses)
+// while the real peer stays and answers its PINGs. Every forged datagram
+// retargets the challenge in flight (M2-D27), yet the challenge sends stay
+// bounded: two challenge writes less than an RTO apart have a challenge
+// creation between them, every challenge expires within chalLifeMax of its
+// creation, creations are at least max(RTO, 1 s) apart, nothing commits and
+// the carrier lives.
+func TestRebindRetargetChurnBounded_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, false)
+		s.io.rebind = true
+		s.io.setRec(true)
+		s.start(StartOptions{})
+		synctest.Wait()
+		rebindAnswer(p)
+		var creations []time.Time
+		forged := 0
+		t0 := time.Now()
+		for time.Since(t0) < 10*time.Second {
+			s.io.inject(fakeAddr(byte(20+forged%8)), p.datagram(pingFrame(wire.TypePing, wire.Ping{ID: uint32(1000 + forged), Nonce: 1})))
+			forged++
+			time.Sleep(20 * time.Millisecond)
+			synctest.Wait()
+			rebindAnswer(p) // the real peer: challenges to forged sources never reach it
+			s.c.mu.Lock()
+			ch := s.c.dg.chal
+			s.c.mu.Unlock()
+			if ch.active && time.Since(ch.last) > chalLifeMax {
+				t.Fatalf("a challenge active %v after its creation, want at most %v", time.Since(ch.last), chalLifeMax)
+			}
+			if n := len(creations); !ch.last.IsZero() && (n == 0 || !creations[n-1].Equal(ch.last)) {
+				creations = append(creations, ch.last)
+			}
+		}
+		s.c.mu.Lock()
+		rto := s.c.relRTOLocked()
+		s.c.mu.Unlock()
+		for k := 1; k < len(creations); k++ {
+			if d := creations[k].Sub(creations[k-1]); d < max(rto, chalSpacingMin) {
+				t.Fatalf("challenges created %v apart, want at least %v", d, max(rto, chalSpacingMin))
+			}
+		}
+		var at []time.Time
+		for _, w := range s.io.recorded() {
+			for _, pg := range pingsOf(w.b, false) {
+				if pg.ID == 0 {
+					at = append(at, w.at)
+				}
+			}
+		}
+		if len(at) < 2 || len(creations) < 2 {
+			t.Fatalf("%d challenge writes, %d creations for %d forged datagrams (stimulus)", len(at), len(creations), forged)
+		}
+		for k := 1; k < len(at); k++ {
+			if at[k].Sub(at[k-1]) >= rto {
+				continue
+			}
+			between := false
+			for _, c := range creations {
+				between = between || (c.After(at[k-1]) && !c.After(at[k]))
+			}
+			if !between {
+				t.Fatalf("challenge writes %v apart without a creation between them, want at least the RTO %v", at[k].Sub(at[k-1]), rto)
+			}
+		}
+		if st := s.c.Stats(); st.Rebinds != 0 || s.io.cur != fakeAddr(2) {
+			t.Fatalf("rebinds %d, peer %v after forged churn; want 0 and the real peer", st.Rebinds, s.io.cur)
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead {
+			t.Fatalf("the carrier died: %v %q", cause, detail)
+		}
+		t.Logf("%d forged datagrams: %d challenge writes, %d challenges (RTO %v)", forged, len(at), len(creations), rto)
+	})
+}
