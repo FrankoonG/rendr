@@ -48,6 +48,7 @@ type smokeRun struct {
 	rate     int           // dialer → passive datagrams per second
 	back     int           // passive → dialer datagrams per second
 	lossWin  time.Duration // losses must start within this after a kill
+	preWin   time.Duration // ... or within this before it (0: 50 ms)
 }
 
 // smokeNet is one transport's two paths between the Runtimes.
@@ -359,7 +360,7 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 		var away uint64
 		for _, m := range res.Missing {
 			at := time.Duration(float64(m.From) / float64(x.rate) * float64(time.Second))
-			if !nearKill(at, kills, r.lossWin) {
+			if !nearKill(at, kills, r.preWin, r.lossWin) {
 				away += m.To - m.From + 1
 			}
 		}
@@ -407,11 +408,15 @@ func liveCarriers(c *rendr.PacketConn) []rendr.CarrierStatus {
 	return out
 }
 
-// nearKill reports whether at lies in [k − 50 ms, k + win] of a kill k
-// (a datagram queued just before the kill may be lost with its carrier).
-func nearKill(at time.Duration, kills []time.Duration, win time.Duration) bool {
+// nearKill reports whether at lies in [k − pre, k + win] of a kill k
+// (pre 0: 50 ms; a datagram sent just before the kill may be lost with
+// its carrier).
+func nearKill(at time.Duration, kills []time.Duration, pre, win time.Duration) bool {
+	if pre == 0 {
+		pre = 50 * time.Millisecond
+	}
 	for _, k := range kills {
-		if at >= k-50*time.Millisecond && at <= k+win {
+		if at >= k-pre && at <= k+win {
 			return true
 		}
 	}

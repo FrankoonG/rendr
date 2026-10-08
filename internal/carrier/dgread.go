@@ -10,8 +10,9 @@ import (
 // §A5.7 and Revision 1, R1-1, R1-4, R1-27).
 
 // Reader back-off (M2-D15, M2-D86): a transient read error, and every read
-// after spinIdle consecutive reads that handed nothing over, waits
-// noiseMin, doubling to noiseMax, until a datagram is handed over.
+// after spinIdle consecutive reads that handed nothing over (on a transport
+// other than rendr's own UDP socket), waits noiseMin, doubling to noiseMax,
+// until a datagram is handed over.
 const (
 	noiseMin = 5 * time.Millisecond
 	noiseMax = 100 * time.Millisecond
@@ -32,6 +33,7 @@ type dgReader struct {
 	buf     *Buf // the read buffer, io.ReadSize() bytes (nil: the transport hands out its own)
 	backoff time.Duration
 	idle    int         // consecutive reads that handed nothing over
+	guard   bool        // the spin guard applies (not on rendr's own socket)
 	timer   *time.Timer // the back-off timer, created at the first back-off
 }
 
@@ -42,7 +44,13 @@ type dgReader struct {
 // it (PA-1); a read error, a violation or the end of a retirement does.
 func (c *Conn) dgReadLoop() {
 	dg := c.dg
-	rd := &dgReader{}
+	// rendr's own socket cannot spin: each of its reads consumes a datagram
+	// that someone sent, so a burst of empty, foreign or malformed ones is
+	// read at once instead of 100 ms each behind the back-off, which would
+	// starve the carrier into a ping_timeout (as udpflow reads its own
+	// socket, L58; WP12 TestUDPZeroLengthIsNotDeath_L42).
+	_, own := dg.io.(*OwnedUDP)
+	rd := &dgReader{guard: !own}
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder ReadFrom (L51)
@@ -105,7 +113,7 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 		}
 		dg.io.Release()
 		rd.idle++
-		if rd.idle >= spinIdle {
+		if rd.guard && rd.idle >= spinIdle {
 			return c.dgBackoff(rd) // the spin guard (R1-27)
 		}
 		return true
