@@ -94,13 +94,14 @@ func classFor(n int) int { return streamLayout.class(n) }
 // inbox buffers (TryAcquire or TryGet, which may refuse), receive buffers
 // inside an advertised window and stream write scratches (Acquire, forced);
 // its usage drives the window advertisement. Env.Stages is the fixed
-// account of the buffers carriers and sources hold for a handshake or for
+// account of the buffers carriers and flows hold for a handshake or for
 // their whole life: a stream carrier's reader stage (16 KiB + ClassSlack
 // per started carrier), a datagram carrier's handshake and reader buffers
-// and its writer scratch (datagram-pool classes, M2-D28, M2-D60), a udpflow
-// source's spare and its flows' control-reserve buffers (M2 design §A6.2).
-// Only forced charges use it, so its max is never consulted.
-// Status.BufferedBytes is the sum of both.
+// and its writer scratch (datagram-pool classes, M2-D28, M2-D60), and a
+// udpflow flow's control-reserve buffers (M2 design §A6.2). Only forced
+// charges use it, so its max is never consulted. Status.BufferedBytes is
+// the sum of both. A udpflow source's own read buffer (one per source) is
+// in neither while it waits for the socket: it holds no data (R-C3-2).
 // Usage is one atomic counter; there is no lock and no waiter list (app
 // writers that find the budget exhausted re-check on a timer, design §4.2).
 type Budget struct {
@@ -167,6 +168,30 @@ type Buf struct {
 	class  uint8
 	pool   *BufPool
 	budget *Budget // charged with the class capacity; nil: uncharged
+}
+
+// TryCharge charges b, taken uncharged (Get with a nil budget), to budget
+// with TryAcquire and reports whether b is now charged to it; a nil budget
+// charges nothing and succeeds. Only b's sole holder calls it, before b is
+// shared: a udpflow source's read buffer is charged when the datagram read
+// into it moves to a flow's inbox (R-C3-2).
+func (b *Buf) TryCharge(budget *Budget) bool {
+	if budget == nil {
+		return true
+	}
+	if b.budget != nil || !budget.TryAcquire(int64(len(b.full))) {
+		return false
+	}
+	b.budget = budget
+	return true
+}
+
+// Uncharge returns b's charge: TryCharge undone by b's sole holder.
+func (b *Buf) Uncharge() {
+	if bud := b.budget; bud != nil {
+		b.budget = nil
+		bud.Release(int64(len(b.full)))
+	}
 }
 
 // Ref adds a reference. It must only be called by a holder of a reference.

@@ -84,7 +84,11 @@ func TestPacketNatRebindHeld_L59(t *testing.T) {
 		if !newAddr.IsValid() || !copyAt.Before(rebindAt.Add(2*time.Second+2*owd)) {
 			t.Fatalf("no H1 copy from the new address within RelRTOMax of the rebind (first at %v)", copyAt.Sub(rebindAt))
 		}
+		// The challenge is a PING with id 0 in a datagram of its own; the
+		// PING with id 0 in H2 (and its repeats) is the OPEN's address
+		// check, whose PONG came from the old address before the rebind.
 		var chal, pong, verdict tapDgram
+		var chalNonce uint64
 		for _, d := range writes {
 			if d.at.Before(rebindAt) {
 				continue
@@ -94,8 +98,8 @@ func TestPacketNatRebindHeld_L59(t *testing.T) {
 			}
 			for _, f := range d.frames {
 				switch {
-				case f.typ == wire.TypePing && f.id == 0 && chal.at.IsZero():
-					chal = d
+				case f.typ == wire.TypePing && f.id == 0 && !d.preface && chal.at.IsZero():
+					chal, chalNonce = d, f.nonce
 				case f.typ == wire.TypeRel && f.inner == wire.TypeOpenAck && verdict.at.IsZero():
 					verdict = d
 				}
@@ -103,7 +107,7 @@ func TestPacketNatRebindHeld_L59(t *testing.T) {
 		}
 		for _, d := range reads {
 			for _, f := range d.frames {
-				if f.typ == wire.TypePong && f.id == 0 && pong.at.IsZero() {
+				if f.typ == wire.TypePong && f.id == 0 && f.nonce == chalNonce && pong.at.IsZero() {
 					pong = d
 				}
 			}

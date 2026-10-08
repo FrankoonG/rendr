@@ -114,6 +114,10 @@ type wdDialer struct {
 	h1   []byte // the last H1 written (resent verbatim)
 	tx   uint32 // fseq of this dialer's next frame after H1
 	rx   uint32 // fseq expected next from the passive (set by the PREFACE_ACK)
+
+	flow  bool      // a FromPacketConn flow (wdHubDial): the H2 of an OPEN carries the address check
+	first wire.Type // the first frame of the last H1 written
+	check uint64    // the address check's nonce from H2 (0: none)
 }
 
 // dial opens a carrier of w as dialer inst with carrier ID id.
@@ -141,6 +145,7 @@ func wdH1(inst [16]byte, id uint32, t wire.Type, payload []byte) []byte {
 func (d *wdDialer) sendH1(t wire.Type, payload []byte) {
 	d.t.Helper()
 	d.h1 = wdH1(d.inst, d.id, t, payload)
+	d.first, d.tx = t, wire.PrefaceFseq(d.h1[:wire.PrefaceLen])+1
 	if _, err := d.pc.WriteTo(d.h1, d.peer); err != nil {
 		d.t.Fatalf("writing H1: %v", err)
 	}
@@ -180,7 +185,9 @@ func (d *wdDialer) frames(b []byte) []wire.Frame {
 }
 
 // expectH2 requires H2 = PREFACE_ACK(OK, our carrier ID, from rt) ‖
-// RACK{FirstCseq} (M2-D19).
+// RACK{FirstCseq} (M2-D19) ‖, for an OPEN on a FromPacketConn flow and
+// only there, the address check PING{id 0, nonce ≠ 0, pad 0} at the next
+// fseq (carrier.SourceChecker), whose nonce it records (answerCheck).
 func (d *wdDialer) expectH2(rt *Runtime) {
 	d.t.Helper()
 	b := d.read(time.Second)
@@ -193,11 +200,38 @@ func (d *wdDialer) expectH2(rt *Runtime) {
 	}
 	d.rx = wire.PrefaceFseq(b[:wire.PrefaceLen])
 	fs := d.frames(b[wire.PrefaceLen:])
-	if len(fs) != 1 || fs[0].Type != wire.TypeRack || fs[0].Fseq != d.rx {
-		d.t.Fatalf("H2 frames %+v, want one RACK at fseq %d", fs, d.rx)
+	want := 1
+	if d.flow && d.first == wire.TypeOpen {
+		want = 2
+	}
+	if len(fs) != want || fs[0].Type != wire.TypeRack || fs[0].Fseq != d.rx {
+		d.t.Fatalf("H2 frames %+v, want a RACK at fseq %d and %d frames", fs, d.rx, want)
 	}
 	if r, err := wire.ParseRack(fs[0].Payload); err != nil || r.CumAck != wire.FirstCseq {
 		d.t.Fatalf("H2 RACK %+v (%v), want cumAck %d", r, err, wire.FirstCseq)
+	}
+	d.rx++
+	if want == 2 {
+		p, err := wire.ParsePing(fs[1].Payload)
+		if fs[1].Type != wire.TypePing || fs[1].Fseq != d.rx || err != nil || p.ID != 0 || p.Nonce == 0 || p.Pad != 0 {
+			d.t.Fatalf("H2's address check %+v (%+v, %v), want PING{id 0, nonce ≠ 0} at fseq %d", fs[1], p, err, d.rx)
+		}
+		d.check = p.Nonce
+		d.rx++
+	}
+}
+
+// answerCheck answers H2's address check with PONG{id 0, nonce}, as
+// Establish does (R1-14 (4)), with nonce xor (0: the check's own nonce).
+func (d *wdDialer) answerCheck(xor uint64) {
+	d.t.Helper()
+	if d.check == 0 {
+		d.t.Fatal("answerCheck: H2 carried no address check")
+	}
+	b := wire.AppendFrame(nil, wire.Header{Type: wire.TypePong, Fseq: d.tx}, wpPing(wire.Ping{Nonce: d.check ^ xor}))
+	d.tx++
+	if _, err := d.pc.WriteTo(b, d.peer); err != nil {
+		d.t.Fatalf("writing the check's PONG: %v", err)
 	}
 }
 
@@ -318,7 +352,7 @@ func wdHubDial(t testing.TB, hub *rendrtest.DatagramHub, inst [16]byte, id uint3
 	if err != nil {
 		t.Fatalf("DatagramHub.Dial: %v", err)
 	}
-	return &wdDialer{t: t, pc: pc, peer: peer, inst: inst, id: id}
+	return &wdDialer{t: t, pc: pc, peer: peer, inst: inst, id: id, flow: true}
 }
 
 // wdProbePing sends one more PING on a started probe carrier and requires

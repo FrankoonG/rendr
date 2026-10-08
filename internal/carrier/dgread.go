@@ -203,7 +203,7 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 			c.dgDropped(1) // nothing new follows the peer's CLOSE (M2-D30)
 			continue
 		}
-		ok, comm := c.dgDispatch(&f, src, now)
+		ok, comm := c.dgDispatch(&f, src, ev == ReadCandidate, now)
 		if !ok {
 			return false
 		}
@@ -216,12 +216,14 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 }
 
 // dgDispatch handles one accepted frame (the legality of §A3.6): PING and
-// PONG bare (id 0: the rebind challenge and its answer, M2-D27); REL and
+// PONG bare (id 0: the rebind challenge and its answer, M2-D27; a PONG
+// with id 0 from the current peer — cand false — may answer a passive OPEN
+// flow's address check instead, SourceChecker); REL and
 // RACK by the REL sublayer; DGRAM to the packet endpoint; a bare PACK to the
 // endpoint; extensions skipped; every other bare frame — DATA, ACK and a
 // reliable type outside REL — is a violation. committed reports a rebind
 // commit.
-func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, now time.Time) (ok, committed bool) {
+func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) (ok, committed bool) {
 	switch f.Type {
 	case wire.TypePing:
 		p, err := wire.ParsePing(f.Payload)
@@ -242,6 +244,9 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, now time.Time) (ok, commit
 			return false, false
 		}
 		if p.ID == 0 {
+			if !cand && c.sourceChecked(&p) {
+				return true, false
+			}
 			return true, c.onChallengePong(&p, src, now)
 		}
 		c.pong(&p, now)

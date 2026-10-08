@@ -87,8 +87,9 @@ func dialInfoFor(f Factory, id uint32, t wire.Type, payload []byte) DialInfo {
 // PREFACE_ACK checked in M1's canonical order (a malformed one is a lost
 // datagram; before it, only a rebind challenge is answered, R1-14); then,
 // until the response, frames through the receive window:
-// a RACK, PING (id 0: the rebind challenge, answered at once through this
-// socket, R1-14), a PONG of another id, PACK, DGRAM and a REL with another
+// a RACK, PING (id 0: the rebind challenge, or the address check an OPEN's
+// H2 carries on a raw-UDP flow — answered at once through this socket,
+// R1-14, SourceChecker), a PONG of another id, PACK, DGRAM and a REL with another
 // cseq are dropped and counted (M2-D20); the response REL{FirstCseq,
 // OPEN_ACK | JOIN_ACK | CLOSE | GOAWAY} (or the probe's PONG) returns the
 // unstarted Conn — R1-3's REL start values, the window, the PREFACE_ACK,
@@ -645,9 +646,10 @@ type dgWriteError struct{ err error }
 func (e *dgWriteError) Error() string { return e.err.Error() }
 func (e *dgWriteError) Unwrap() error { return e.err }
 
-// answerChallenge answers a rebind challenge (a PING with id 0) at once with
-// its PONG — the same nonce, no pad — through this socket and NAT mapping
-// (R1-14 (4)). It returns a write error that ends the attempt.
+// answerChallenge answers a rebind challenge or an address check (a PING
+// with id 0) at once with its PONG — the same nonce, no pad — through this
+// socket and NAT mapping (R1-14 (4), SourceChecker). It returns a write
+// error that ends the attempt.
 func (d *dgDial) answerChallenge(pg wire.Ping) error {
 	pg.Pad = 0
 	var pp [wire.PingFixedLen]byte

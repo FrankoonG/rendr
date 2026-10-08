@@ -16,14 +16,17 @@ type reader struct {
 	s     *Source
 	admit Admit
 
-	// rb is the next read's buffer while the Budget grants one (rendr's own
-	// socket: class MaxDatagram + 1, TryGet against Env.Budget): a datagram
-	// read into it is handed to its flow's inbox without a copy, and a
-	// dropped one leaves it for the next read (nothing allocated for junk).
+	// rb is the read buffer of rendr's own socket (class MaxDatagram + 1),
+	// uncharged while it waits for the socket: an idle source holds no
+	// buffered bytes (R-C3-2). A datagram read into it is handed to its
+	// flow's inbox without a copy once the Budget takes its charge
+	// (Buf.TryCharge; refused: the datagram is copied out as from the
+	// spare — into a Budget-charged buffer of its size, else the flow's
+	// control reserve, else dropped), and a dropped one leaves it for the
+	// next read (nothing allocated for junk).
 	rb *carrier.Buf
-	// spare is the Stages-charged read buffer used while the Budget refuses
-	// (rendr's own socket) and for every read of a foreign conn (its
-	// ReadFrom reads into it; a routed datagram is copied out).
+	// spare is a foreign conn's read buffer (its ReadFrom reads into it; a
+	// routed datagram is copied out), uncharged as rb.
 	spare *carrier.Buf
 
 	backoff time.Duration // the next noise backoff (0: backoffMin)
@@ -43,6 +46,10 @@ func (r *reader) exit() {
 	r.spare.Release()
 	r.rb, r.spare = nil, nil
 	s.mu.Lock()
+	if s.abCharge > 0 { // the abandoned read returned (runStuck's charge)
+		s.stages.Release(s.abCharge)
+		s.abCharge = 0
+	}
 	s.killLocked()
 	s.closeSocketLocked()
 	if s.runWatch != nil {
@@ -53,20 +60,16 @@ func (r *reader) exit() {
 	s.mu.Unlock()
 }
 
-// loopOwned reads rendr's own listening socket: ReadAddrPort into a
-// Budget-charged buffer (else the spare), no allocation per datagram, its
-// own error and truncation classes (WP5).
+// loopOwned reads rendr's own listening socket: ReadAddrPort into rb, no
+// allocation per datagram, its own error and truncation classes (WP5).
 func (r *reader) loopOwned() {
 	s := r.s
-	r.spare = s.dbufs.Get(s.maxDgram+1, s.stages)
 	for !s.halted.Load() {
 		if r.rb == nil {
-			r.rb = s.dbufs.TryGet(s.maxDgram+1, s.env.Budget)
+			r.rb = s.dbufs.Get(s.maxDgram+1, nil) // charged at hand-over
+			s.rbuf.Store(int64(len(r.rb.B)))
 		}
-		b, direct := r.spare.B, false
-		if r.rb != nil {
-			b, direct = r.rb.B, true
-		}
+		b := r.rb.B
 		n, src, ev, err := s.own.ReadAddrPort(b)
 		switch {
 		case err != nil:
@@ -82,7 +85,7 @@ func (r *reader) loopOwned() {
 			continue
 		}
 		r.backoff, r.empties = 0, 0
-		s.route(r, b[:n], src, nil, direct)
+		s.route(r, b[:n], src, nil, true)
 	}
 }
 
@@ -92,7 +95,8 @@ func (r *reader) loopOwned() {
 // shared listening socket (integration 1, D16).
 func (r *reader) loopForeign() {
 	s := r.s
-	r.spare = s.dbufs.Get(wire.MaxDatagram+1, s.stages)
+	r.spare = s.dbufs.Get(wire.MaxDatagram+1, nil) // uncharged: routed datagrams are copied out
+	s.rbuf.Store(int64(len(r.spare.B)))
 	for !s.halted.Load() {
 		b := r.spare.B[:wire.MaxDatagram+1]
 		n, addr, err := callReadFrom(s.pc, b)
@@ -199,17 +203,20 @@ func (s *Source) route(r *reader, d []byte, src netip.AddrPort, addr *net.UDPAdd
 }
 
 // deliver queues the rendr bytes rb of a known flow f: the read buffer
-// itself (direct), else a copy in a Budget-charged buffer, else — the
-// Budget refuses — a copy in one of f's control-reserve buffers, only for
-// a datagram without a DGRAM frame (M2-D59; L16).
+// itself (direct) once the Budget took its charge, else a copy in a
+// Budget-charged buffer, else — the Budget refuses — a copy in one of f's
+// control-reserve buffers, only for a datagram without a DGRAM frame
+// (M2-D59; L16).
 func (s *Source) deliver(r *reader, f *Flow, rb []byte, src netip.AddrPort, addr *net.UDPAddr, direct bool) {
 	var res pushResult
 	switch {
-	case direct:
+	case direct && r.rb.TryCharge(s.env.Budget):
 		if res = f.push(r.rb, rb, src, addr, false); res == pushOK {
 			r.rb = nil // moved to the inbox
+		} else {
+			r.rb.Uncharge() // it stays the read buffer
 		}
-	default:
+	default: // a foreign conn's spare, or the Budget refused rb's class
 		if buf := s.dbufs.TryGet(len(rb), s.env.Budget); buf != nil {
 			data := buf.B[:copy(buf.B, rb)]
 			if res = f.push(buf, data, src, addr, false); res != pushOK {
@@ -283,7 +290,7 @@ func (s *Source) admitH1(r *reader, id uint64, rb []byte, src netip.AddrPort, ad
 
 	// The H1 into the new inbox: a fresh flow's inbox is empty and its
 	// reserve free, and an H1 carries no DGRAM, so it always fits.
-	if direct {
+	if direct && r.rb.TryCharge(s.env.Budget) {
 		f.push(r.rb, rb, src, addr, false)
 		r.rb = nil
 	} else if buf := s.dbufs.TryGet(len(rb), s.env.Budget); buf != nil {

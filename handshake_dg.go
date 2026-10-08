@@ -43,8 +43,11 @@ func (rt *Runtime) startHandshakeDatagram(ln *Listener, io carrier.PacketIO, at 
 // handshakeDatagram is one datagram handshake goroutine (handshake's
 // counterpart). A flow's admitting quota is released when a positive
 // verdict was written for it: an accepted JOIN, a started sessionless
-// carrier, or the Confirm of its OPEN's session (admitOpen, holdFlow);
-// otherwise the flow leaves it when it is removed (M2-D59). Every exit
+// carrier, or the Confirm of its OPEN's session (admitOpen, holdFlow); an
+// OPEN flow's also when its dialer answered the address check of H2 (the
+// carrier's reader, carrier.SourceChecker), so a pending session holds its
+// backlog slot and not its address's quota; otherwise the flow leaves it
+// when it is removed (M2-D59). Every exit
 // returns the inbox buffer the reader may still hold (Release), so a flow
 // leaves nothing charged to the Budget.
 func (rt *Runtime) handshakeDatagram(ln *Listener, slot *hsSlot, io carrier.PacketIO, at time.Time) {

@@ -100,7 +100,19 @@ func (f *Flow) ID() uint64 { return f.id }
 // Admitted tells the source that a positive verdict was written for the
 // flow (OPEN_ACK or JOIN_ACK OK, or a probe carrier started): it leaves the
 // per-source admitting count.
-func (f *Flow) Admitted() {
+func (f *Flow) Admitted() { f.unadmit() }
+
+// SourceProven tells the source that the flow's peer answered the address
+// check of its OPEN's H2 (carrier.SourceChecker): it receives the passive's
+// datagrams, so the flow leaves the per-source admitting count while its
+// session waits for the application (bounded by the Listener's
+// AcceptBacklog instead).
+func (f *Flow) SourceProven() { f.unadmit() }
+
+var _ carrier.SourceChecker = (*Flow)(nil)
+
+// unadmit takes the flow out of its source IP's admitting count (once).
+func (f *Flow) unadmit() {
 	s := f.src
 	s.mu.Lock()
 	if f.admitting {

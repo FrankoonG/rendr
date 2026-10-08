@@ -27,7 +27,9 @@ import (
 // loser releases both reservations and routes its carrier to the entry that
 // won. limit is the transport limit of a datagram carrier (0 on a stream
 // carrier) and fl its raw-UDP flow, if any, which leaves its source's
-// admitting quota once a positive verdict is written for it (M2-D59). It
+// admitting quota once a positive verdict is written for it (M2-D59) — or
+// earlier, once its dialer answered the address check of H2 (the carrier's
+// reader, carrier.SourceChecker). It
 // reports whether it refused the carrier itself (an answer written with
 // WriteAndClose, which the handshake goroutine then awaits).
 func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time, limit int, fl *udpflow.Flow) (refused bool) {

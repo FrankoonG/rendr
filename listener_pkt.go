@@ -101,8 +101,10 @@ func (rt *Runtime) datagramStatus(srcs []*udpflow.Source) DatagramStatus {
 }
 
 // flowSet is the record of one passive packet session's raw-UDP flows that
-// still count against their sources' admitting quotas (M2-D59): the flows
-// of its OPEN carriers, until Confirm writes their OPEN_ACK(OK) (opened).
+// may still count against their sources' admitting quotas (M2-D59): the
+// flows of its OPEN carriers, until Confirm writes their OPEN_ACK(OK)
+// (opened). A flow whose dialer answered the address check left its quota
+// already (Flow.SourceProven); Admitted is then a no-op.
 type flowSet struct {
 	flows  []*udpflow.Flow
 	opened bool

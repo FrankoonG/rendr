@@ -11,8 +11,12 @@
 // datagram H1 (a PREFACE of kind datagram and exactly one first frame whose
 // header and CRC verify): before that nothing is allocated (plan:324).
 // Admission is bounded per source IP address (admitting flows: from H1
-// until a positive verdict was written, so held carriers of pending
-// sessions count too) — separately for flows whose H1 carries an OPEN and
+// until a positive verdict was written or, for an OPEN, until its source
+// answered the address check of H2 (Flow.SourceProven) — so held carriers
+// of pending sessions count until their dialer proved that it receives
+// the passive's datagrams; a blind flood's never leave the quota, a NAT
+// site's dialers leave it within a round trip, R-C3-1) — separately for
+// flows whose H1 carries an OPEN and
 // for those whose H1 carries a JOIN or a probe PING, so that an OPEN flood
 // from an address never blocks the JOINs and probes of that address's
 // sessions (L48; M2 design Revision 1, R1-21) — and in total; every
@@ -121,7 +125,7 @@ type Source struct {
 	own       *carrier.OwnedUDPSocket // pc when it is exactly rendr's own listening socket, else nil
 	maxDgram  int                     // the largest datagram read: own.MaxDatagram(), else wire.MaxDatagram
 	dbufs     *carrier.BufPool        // Env.DBufs (a private pool when the Env has none)
-	stages    *carrier.Budget         // the account of the spare and the control reserve (Env.Stages, else Env.Budget)
+	stages    *carrier.Budget         // the account of the flows' control reserve (Env.Stages, else Env.Budget)
 	firstCseq uint32                  // the REL cseq of a valid H1 (Presets.FirstCseq or wire.FirstCseq)
 	firstFseq uint32                  // Presets.FirstFseq (0: an H1's first frame carries its PREFACE's fseq)
 
@@ -145,6 +149,15 @@ type Source struct {
 	done       chan struct{}
 
 	dropped, truncated, inboxDrops, readErrors, quotaDrops atomic.Uint64
+
+	// rbuf is the class size of the Run goroutine's read buffer (set by
+	// the loop); abCharge (mu) is the Stages charge an abandoned Run's
+	// read buffer takes from its abandonment until its ReadFrom returns:
+	// the buffer is uncharged while the source waits for datagrams
+	// (R-C3-2), but a call stuck in embedder code keeps its buffer
+	// visible in Status.BufferedBytes (M1's abandoned-call rule, L52).
+	rbuf     atomic.Int64
+	abCharge int64
 
 	ans [wire.FlowHeaderLen + wire.PrefaceLen]byte // the stateless PREFACE_ACK answer (Run goroutine only)
 }
@@ -273,8 +286,9 @@ func (s *Source) Abort() {
 
 // Done is closed when Run returned (or was abandoned: its ReadFrom
 // ignored the close for AbandonWait, L50), the socket is closed and every
-// flow ended. An abandoned Run's read buffers stay charged (Budget and
-// Stages) until that ReadFrom returns (M1's abandoned-call rule). It never
+// flow ended. An abandoned Run's read buffer is charged to Stages from its
+// abandonment until that ReadFrom returns (M1's abandoned-call rule). It
+// never
 // closes for a source whose Run was never called: package rendr starts Run
 // for every Source it creates.
 func (s *Source) Done() <-chan struct{} { return s.done }
@@ -295,7 +309,7 @@ func (s *Source) Stats() Stats {
 // Stats are one Source's counters.
 type Stats struct {
 	Flows      int    // live flows, admitting ones included
-	Admitting  int    // flows before a positive verdict was written for them (both per-source quotas)
+	Admitting  int    // flows counted against their IP's quotas (both): before a positive verdict or a proven source
 	Dropped    uint64 // datagrams dropped before reaching a flow (malformed, unknown or tombstoned flow, no valid H1, quota, cap)
 	Truncated  uint64 // of Dropped: truncated or oversize datagrams
 	InboxDrops uint64 // datagrams a full or Budget-refused inbox dropped
@@ -361,6 +375,10 @@ func (s *Source) runStuck() {
 	s.mu.Lock()
 	if s.run == runRunning {
 		s.run = runAbandoned
+		if n := s.rbuf.Load(); n > 0 {
+			s.stages.Acquire(n)
+			s.abCharge = n
+		}
 		s.checkDoneLocked()
 	}
 	s.mu.Unlock()

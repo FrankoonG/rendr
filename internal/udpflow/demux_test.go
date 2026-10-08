@@ -634,6 +634,38 @@ func TestFlowJoinQuota_L48(t *testing.T) {
 	})
 }
 
+// TestFlowSourceProven_E19 (R-C3-1; M2-D59 as amended): a flow whose
+// source answered its OPEN's address check (SourceProven) leaves its IP's
+// OPEN quota, so a further OPEN from that address is admitted while the
+// proven flow lives on; the release happens once — a repeated
+// SourceProven, or the positive verdict's Admitted after it, frees no
+// second slot — and the quota's bound still holds for unproven flows.
+func TestFlowSourceProven_E19(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := testEnv(1 << 30)
+		h := newHarness(t, env, Limits{PerSource: 2})
+		defer h.shutdown()
+		host := byte(6)
+		for i := range 3 {
+			h.c.send(h1(uint64(1+i), wire.TypeOpen, 1), udpAddr(host, uint16(1000+i)))
+		}
+		synctest.Wait()
+		if st := h.s.Stats(); st.Flows != 2 || st.Admitting != 2 || st.QuotaDrops != 1 {
+			t.Fatalf("quota 2: Stats %+v, want 2 flows, 2 admitting, 1 quota drop", st)
+		}
+		p := h.admittedFlows()[0]
+		p.SourceProven()
+		p.SourceProven()
+		p.Admitted()
+		h.c.send(h1(10, wire.TypeOpen, 1), udpAddr(host, 2000))
+		h.c.send(h1(11, wire.TypeOpen, 1), udpAddr(host, 2001))
+		synctest.Wait()
+		if st := h.s.Stats(); st.Flows != 3 || st.Admitting != 2 || st.QuotaDrops != 2 {
+			t.Fatalf("after one proven flow: Stats %+v, want 3 flows, 2 admitting, 2 quota drops", st)
+		}
+	})
+}
+
 // TestPacketIOLimitFollowsBudget is the Flow row of M2 design Revision 1,
 // R1-6: SetLimit lowers the receive limit applied to inbox datagrams, and
 // Limit keeps reporting the transport's capacity.
