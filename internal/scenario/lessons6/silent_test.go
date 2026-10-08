@@ -81,6 +81,20 @@ func silentDrop(t *testing.T, mode rendr.Mode) {
 	}
 	lost0 := vl.Stats().Session.Lost
 	migr0 := dc.Status().Migrations
+	// The other link's losses and the victim's Tx on each end at the drop:
+	// every datagram lost must be one its sender placed on the victim.
+	var ol *rendrtest.DatagramLink
+	for _, l := range w.links {
+		if l != vl {
+			ol = l
+		}
+	}
+	olost0 := ol.Stats().Session.Lost
+	var vtx0 [2]uint64
+	for i, c := range []*rendr.PacketConn{dc, pc} {
+		cs, _ := carrierOf(c.Status(), victim.ID)
+		vtx0[i] = cs.TxBytes
+	}
 
 	// DROP: both directions, silently, to the end of the observation.
 	drop := time.Now()
@@ -137,11 +151,33 @@ func silentDrop(t *testing.T, mode rendr.Mode) {
 	// the one-way delay: those already on their way) and the later of the
 	// resume and its sender's verdict on the victim (a bond's survivor
 	// resumes at once; the victim's share is lost until its death).
-	for _, d := range []struct {
+	if l := ol.Stats().Session.Lost; l != olost0 {
+		t.Fatalf("the healthy link %s lost %d datagrams after the drop", ol.Name(), l-olost0)
+	}
+	for i, d := range []struct {
 		name   string
 		f      *flow
 		sender time.Time
 	}{{"dialer → passive", up, died[0]}, {"passive → dialer", down, died[1]}} {
+		// The sender dropped nothing itself and only the victim's link
+		// loses datagrams: every loss was placed on the victim before its
+		// sender's verdict (the victim's share, bond), and the bytes lost
+		// of datagrams written after the drop fit in what the sender wrote
+		// to the victim after the drop.
+		send := [2]*rendr.PacketConn{dc, pc}[i]
+		if c := send.Status().Packet; c.DropQueue+c.DropAge+c.DropNoPath+c.DropTooLarge != 0 {
+			t.Fatalf("%s: the sender dropped datagrams itself: %+v", d.name, *c)
+		}
+		lostBytes := uint64(0)
+		for _, l := range d.f.losses() {
+			if l.wrote.After(drop) { // at the drop's instant it may have been written before the snapshot
+				lostBytes += uint64(d.f.cfg.size(l.seq))
+			}
+		}
+		if vc, _ := carrierOf(send.Status(), victim.ID); lostBytes > vc.TxBytes-vtx0[i] {
+			t.Fatalf("%s: %d bytes of datagrams written after the drop lost, but the sender wrote only %d bytes to the victim",
+				d.name, lostBytes, vc.TxBytes-vtx0[i])
+		}
 		resume := d.f.firstArrivalWrittenFrom(drop)
 		if resume.IsZero() || resume.Sub(drop) > 5*time.Second {
 			t.Fatalf("%s: the first datagram written after the drop arrived at +%v, want within 5 s", d.name, resume.Sub(drop))

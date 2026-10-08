@@ -293,9 +293,10 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 // without spare capacity for the head is skipped like a write-blocked one:
 // it could place nothing, so it covers nothing (a stalled member absorbs
 // at most its capacity, L32; as M1's wakeDataLocked counts spare capacity).
-// It reports whether a lane could place the head.
+// It reports whether a lane could place the head; skip counts as one (the
+// minimum share's lane, chosen because it can).
 func (s *Session) pktWalkLocked(need int, streamOnly bool, skip *lane, covered, head int) bool {
-	found := false
+	found := skip != nil
 	for pass := range 2 {
 		if streamOnly && pass == 0 {
 			continue

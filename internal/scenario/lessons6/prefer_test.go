@@ -96,6 +96,9 @@ func TestPacketPrefersDatagram_L28(t *testing.T) {
 		if m := dc.Status().Migrations; m.Death != 1 || m.Quality != 1 {
 			t.Fatalf("migrations after the return: %+v, want one death and one quality migration", m)
 		}
+		// Events reach the log through the Runtime's event worker, after
+		// the state Status shows: let it drain before reading the log.
+		synctest.Wait()
 		quality := 0
 		for _, ev := range w.dev.of(rendr.EventMigration) {
 			if ev.Cause == rendr.CauseQuality {

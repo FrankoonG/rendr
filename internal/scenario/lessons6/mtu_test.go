@@ -57,8 +57,17 @@ func mtuWorld(t *testing.T, mode rendr.Mode, names ...string) (w *world, dc, pc 
 			t.Fatalf("%v MaxPayload %d, want 1375", c.Status().Role, mp)
 		}
 	}
-	up = startFlow(dc, pc, flowCfg{seed: 31, pace: 2 * time.Millisecond, size: mtuSize})
-	down = startFlow(pc, dc, flowCfg{seed: 32, pace: 10 * time.Millisecond, size: mtuSize})
+	ucfg := flowCfg{seed: 31, pace: 2 * time.Millisecond, size: mtuSize}
+	dcfg := flowCfg{seed: 32, pace: 10 * time.Millisecond, size: mtuSize}
+	if mode == rendr.ModeBond {
+		// The same rates in bursts: the shrunk member's batches then meet
+		// datagrams it can no longer carry behind the ones it can, which
+		// it must leave to the other member (M2-D45), not drop.
+		ucfg.burst, ucfg.pace = 16, 32*time.Millisecond
+		dcfg.burst, dcfg.pace = 8, 80*time.Millisecond
+	}
+	up = startFlow(dc, pc, ucfg)
+	down = startFlow(pc, dc, dcfg)
 	time.Sleep(5 * time.Second)
 	return w, dc, pc, up, down
 }
@@ -318,7 +327,9 @@ func mtuShrinkBelowFloor(t *testing.T) {
 // ping_timeout, detail "mtu probe", when the fourth probe finds its three
 // predecessors unanswered: about 40 s after the carrier attached, never
 // before the third probe could have failed (30 s) and within
-// 4 × 10 × PacketPing + 2 s = 42 s (B1.9 part 4). Each redial attaches at
+// 4 × 10 × PacketPing + 2 s = 42 s (B1.9 part 4). The passive, which
+// probes too (M2-D50), ends each carrier by its own MTU-probe verdict (or
+// the dialer's CLOSE after the dialer's). Each redial attaches at
 // once (no ErrNoPath, the session's MaxPayload unchanged) and lives another
 // ≈ 40 s. 500-byte datagrams (which fit) keep flowing both ways: every one
 // written outside [death − 1 s, death + 1 s] arrives, intact. A WriteTo of
@@ -395,9 +406,24 @@ func TestPacketMTUBlackhole_L37(t *testing.T) {
 			if !next.IsZero() && next.Sub(ev.Time) > time.Second {
 				t.Fatalf("the redial after carrier %d's death attached %v later", ev.Carrier, next.Sub(ev.Time))
 			}
+			// The passive probes too (M2-D50): it ends the carrier by its
+			// own MTU-probe verdict or by the dialer's CLOSE that follows
+			// the dialer's, never otherwise.
+			pcs, ok := carrierOf(pc.Status(), ev.Carrier)
+			pev, pok := w.pev.downOf(ev.Carrier)
+			switch {
+			case !ok || !pok || pcs.State != rendr.CarrierDead || pev.Cause != pcs.DeathCause:
+				t.Fatalf("passive: carrier %d is %+v (found %v), CarrierDown %+v (found %v)", ev.Carrier, pcs, ok, pev, pok)
+			case pcs.DeathCause == rendr.CausePingTimeout && pcs.DeathDetail == "mtu probe":
+			case pcs.DeathCause == rendr.CauseRetired && !pev.Time.Before(ev.Time):
+			default:
+				t.Fatalf("passive: carrier %d ended %v (%q) at +%v, want its own MTU-probe verdict or the dialer's CLOSE after +%v",
+					ev.Carrier, pcs.DeathCause, pcs.DeathDetail, pev.Time.Sub(start), ev.Time.Sub(start))
+			}
 			deaths = append(deaths, ev.Time)
-			t.Logf("carrier %d: attached +%v, died +%v (lived %v): %v %q; next attached +%v",
-				ev.Carrier, ups[ev.Carrier].Sub(start), ev.Time.Sub(start), life, ev.Cause, c.DeathDetail, next.Sub(start))
+			t.Logf("carrier %d: attached +%v, died +%v (lived %v): %v %q; next attached +%v; passive: %v %q at +%v",
+				ev.Carrier, ups[ev.Carrier].Sub(start), ev.Time.Sub(start), life, ev.Cause, c.DeathDetail, next.Sub(start),
+				pcs.DeathCause, pcs.DeathDetail, pev.Time.Sub(start))
 		}
 		if len(deaths) != 2 {
 			t.Fatalf("%d MTU-probe deaths in 90 s, want 2 (at ≈ 40 s and ≈ 80 s)", len(deaths))
