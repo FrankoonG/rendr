@@ -3,11 +3,14 @@ package carrier
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestProbeSubTickRTTIsASample_L28 (wave-2 integration): a probe round trip
@@ -53,25 +56,148 @@ func TestProbeSubTickRTTIsASample_L28(t *testing.T) {
 	})
 	t.Run("ZeroDelayLinks", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			r := newPrRig(t, 2, nil)
+			// Each probe carrier writes through a prSockConn: like a socket,
+			// its Write returns once the bytes are buffered, and they leave
+			// only after the writer finished the write's commit. A Link's
+			// own conn is a net.Pipe whose Write returns only once the far
+			// end read the bytes; at GOMAXPROCS=1 its pump goroutines then
+			// run the whole zero-delay round trip before the writer resumes,
+			// so every PONG raced its PING's write commit and was no sample
+			// (V6) — a property of the synchronous test conn, not of the
+			// sub-tick round trip this test is about.
+			sem := make(chan struct{}, 1)
+			var socks []*prSockConn
+			var smu sync.Mutex
+			r := newPrRigDial(t, 2, nil, func(i int, l *rendrtest.Link) func(context.Context) (net.Conn, error) {
+				return func(ctx context.Context) (net.Conn, error) {
+					nc, err := l.Dial(ctx)
+					if err != nil {
+						return nil, err
+					}
+					sc := newPrSockConn(nc, sem)
+					smu.Lock()
+					socks = append(socks, sc)
+					smu.Unlock()
+					return sc, nil
+				}
+			})
 			for _, l := range r.links {
 				l.SetDelay(0, 0) // every round trip takes no virtual time: RTT 0
 			}
 			r.h.Use()
 			r.h.WaitFirst(context.Background())
-			// The establishment and two more probe PINGs (Interval 2 s): every
-			// PONG measures 0. One that raced its PING's own write commit is
-			// no sample (V6), but not all of them can.
+			// The probe carrier's cadence PINGs at 0, 2 and 4 s (the
+			// establishment PONG is no sample, D26): every PONG measures 0,
+			// and none races its commit, so each is a sample.
 			r.until(4500 * time.Millisecond)
 			s := r.h.Snapshot()
 			for i := range s.Sum {
-				if s.Info[i].Samples == 0 || s.Failed[i] {
-					t.Fatalf("factory %d: no sample from zero-delay round trips: info %+v, failed %v", i, s.Info[i], s.Failed[i])
+				if s.Info[i].Attempts != 1 || s.Info[i].Samples != 3 || s.Failed[i] {
+					t.Fatalf("factory %d: zero-delay round trips gave %d samples (want 3, one per cadence PING): info %+v, failed %v", i, s.Info[i].Samples, s.Info[i], s.Failed[i])
 				}
 				if ev := s.Evidence(i, time.Now()); ev.State != sched.EvFresh || ev.RTT != time.Nanosecond {
 					t.Fatalf("factory %d: evidence %+v, want Fresh 1ns", i, ev)
 				}
 			}
+			smu.Lock()
+			defer smu.Unlock()
+			if len(socks) != 2 {
+				t.Fatalf("%d probe conns dialled, want 2", len(socks))
+			}
+			for k, sc := range socks {
+				// The PREFACE with its establishment PING, then three cadence
+				// PINGs, each its own write, all crossed the socket model.
+				if n := sc.writes.Load(); n < 4 {
+					t.Fatalf("probe conn %d: %d writes forwarded, want at least 4", k, n)
+				}
+			}
 		})
 	})
+}
+
+// prSockConn models a socket's send buffer over a synchronous test conn:
+// Write appends to the buffer and returns at once; a pump forwards the
+// buffer once every other goroutine of the bubble is durably blocked
+// (synctest.Wait), so bytes leave only after the writing goroutine
+// finished what follows its Write — no virtual time passes. sem
+// serializes the pumps' synctest.Wait calls (concurrent ones panic); a
+// channel, so a pump waiting for it is durably blocked.
+type prSockConn struct {
+	net.Conn
+	sem    chan struct{}
+	kick   chan struct{} // cap 1
+	done   chan struct{} // closed by Close
+	once   sync.Once
+	writes atomic.Int64 // buffers forwarded
+
+	mu  sync.Mutex
+	buf []byte
+	err error // the forwarding write's error, or net.ErrClosed
+}
+
+func newPrSockConn(nc net.Conn, sem chan struct{}) *prSockConn {
+	c := &prSockConn{Conn: nc, sem: sem, kick: make(chan struct{}, 1), done: make(chan struct{})}
+	go c.pump()
+	return c
+}
+
+func (c *prSockConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.err != nil {
+		err := c.err
+		c.mu.Unlock()
+		return 0, err
+	}
+	c.buf = append(c.buf, p...)
+	c.mu.Unlock()
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (c *prSockConn) Close() error {
+	c.once.Do(func() {
+		c.mu.Lock()
+		if c.err == nil {
+			c.err = net.ErrClosed
+		}
+		c.mu.Unlock()
+		close(c.done)
+	})
+	return c.Conn.Close()
+}
+
+func (c *prSockConn) pump() {
+	for {
+		select {
+		case <-c.kick:
+		case <-c.done:
+			return
+		}
+		select {
+		case c.sem <- struct{}{}:
+		case <-c.done:
+			return
+		}
+		synctest.Wait()
+		<-c.sem
+		c.mu.Lock()
+		b := c.buf
+		c.buf = nil
+		c.mu.Unlock()
+		if len(b) == 0 {
+			continue
+		}
+		if _, err := c.Conn.Write(b); err != nil {
+			c.mu.Lock()
+			if c.err == nil {
+				c.err = err
+			}
+			c.mu.Unlock()
+			return
+		}
+		c.writes.Add(1)
+	}
 }

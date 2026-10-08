@@ -532,8 +532,12 @@ func (s *stuckPC) Close() error {
 // session over a FromPacketConn socket whose ReadFrom ignores Close: the
 // session ends (the dialer sees AbortGoingAway), the socket is closed
 // exactly once, and Runtime.Close returns within its bound although the
-// demux goroutine stays blocked in the embedder's ReadFrom; once that
-// returns, the source is gone.
+// demux goroutine stays blocked in the embedder's ReadFrom: the source is
+// gone (its Done closed) and the stuck read is counted in Status.Abandoned,
+// still holding its Budget-charged read buffer. Once that ReadFrom
+// returns, the demux goroutine leaves the abandoned pool and releases the
+// buffer (L52). The source's Done is not that exit: the test waits for the
+// pool and the Budget, not for Datagram.Sources, which was 0 already.
 func TestPacketSourceIgnoresClose_L50(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var s *stuckPC
@@ -551,6 +555,10 @@ func TestPacketSourceIgnoresClose_L50(t *testing.T) {
 		if n := s.closes.Load(); n != 1 {
 			t.Fatalf("the socket was closed %d times, want 1", n)
 		}
+		if st := h.p.Status(); st.Datagram.Sources != 0 || st.Abandoned != 1 || st.BufferedBytes == 0 {
+			t.Fatalf("after Runtime.Close: sources %d, abandoned %d, buffered %d; want the source gone and its stuck read abandoned with its buffer",
+				st.Datagram.Sources, st.Abandoned, st.BufferedBytes)
+		}
 		select {
 		case <-dc.Done():
 		case <-time.After(5 * time.Second):
@@ -561,7 +569,10 @@ func TestPacketSourceIgnoresClose_L50(t *testing.T) {
 			t.Fatalf("the dialer's end: %v, want AbortGoingAway", err)
 		}
 		close(s.release)
-		peWait(t, 5*time.Second, "the source ended", func() bool { return h.p.Status().Datagram.Sources == 0 })
+		peWait(t, 5*time.Second, "the abandoned read returned", func() bool {
+			st := h.p.Status()
+			return st.Abandoned == 0 && st.BufferedBytes == 0
+		})
 		t.Logf("Runtime.Close returned after %v", took)
 		h.close()
 	})
