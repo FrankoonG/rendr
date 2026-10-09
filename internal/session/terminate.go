@@ -113,9 +113,21 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 		l.data = false
 		l.state = LaneRetiring
 		l.retireCalled = true
-		if goAway {
+		switch {
+		case firstOwedOnViewLocked(l):
+			// A view of a MUX trunk whose first response is set but not
+			// placed: retired now, its writer would take a Fill that ran
+			// before the verdict, or one the batch had no room for, for "no
+			// verdict" and answer CAPACITY CodeBacklog in its place (R1-9;
+			// m3 BACKLOG). It is woken instead: a refusal is its first and
+			// last frame and ends the handle (M3-D7); after an OK the view is
+			// held, and ends with the dialer's DETACH (a dialer that drops
+			// the OK) or, at the latest, at closeBy (endingLocked: Kill, its
+			// DETACH(ended), R1-9).
+			wakeLaneLocked(l)
+		case goAway:
 			l.c.GoAway()
-		} else {
+		default:
 			l.c.Retire(wire.CloseRetire)
 		}
 	}
