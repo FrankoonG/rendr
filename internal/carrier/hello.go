@@ -143,6 +143,9 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 	if h.Fseq != first {
 		return fail(fmt.Errorf("%w: fseq %d, want %d", errHelloFirst, h.Fseq, first))
 	}
+	if !dedicatedOK(h.Type, h.Handle) {
+		return fail(fmt.Errorf("%w: %v with handle %d (a carrier's first frame is view 1's)", errHelloFirst, h.Type, h.Handle))
+	}
 	hello := &Hello{Preface: p, First: h}
 	switch h.Type {
 	case wire.TypeOpen:

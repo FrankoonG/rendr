@@ -261,7 +261,7 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 	if dc == nil {
 		t.FailNow()
 	}
-	if r.mode == rendr.ModeBond {
+	if r.mode != rendr.ModeSelector { // bond and race: both members
 		deadline := time.Now().Add(5 * time.Second)
 		for len(liveCarriers(dc)) < 2 && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
@@ -385,8 +385,24 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 		if got := x.s.read.Load() + rp.DropRecvQueue; rp.Received != got {
 			t.Errorf("%s: Received %d ≠ read %d + DropRecvQueue %d", x.name, rp.Received, x.s.read.Load(), rp.DropRecvQueue)
 		}
-		if rp.Received > tp.Sent || rp.Duplicates != 0 {
+		if rp.Received > tp.Sent || (rp.Duplicates != 0) != (r.mode == rendr.ModeRace) {
 			t.Errorf("%s: Received %d of Sent %d, Duplicates %d", x.name, rp.Received, tp.Sent, rp.Duplicates)
+		}
+		if r.mode == rendr.ModeRace {
+			// Race (M3-D32, M3-D35): every member carries every datagram,
+			// so a member's death loses (almost) nothing; the receiver
+			// counts the other members' copies as Duplicates (G3-race's
+			// ≥ 0.9 × Received), the sender its extra placements as
+			// Race.Copies.
+			if lost*100 > x.sentSeqs {
+				t.Errorf("%s: race lost %d of %d datagrams, want ≤ 1 %%", x.name, lost, x.sentSeqs)
+			}
+			if x.tx.Race.Copies == 0 || rp.Duplicates*10 < rp.Received*9 {
+				t.Errorf("%s: race copies %d, receiver Duplicates %d of Received %d, want copies and Duplicates ≥ 0.9 × Received",
+					x.name, x.tx.Race.Copies, rp.Duplicates, rp.Received)
+			}
+			t.Logf("%s: race copies %d, receiver duplicates %d (%.3f of Received)", x.name, x.tx.Race.Copies, rp.Duplicates,
+				float64(rp.Duplicates)/float64(max(rp.Received, 1)))
 		}
 		t.Logf("%s: accepted %d, unique %d, lost %d (%.3f%%), missing ranges %d, latest loss %v after its kill, max gap %v; tx %+v; rx %+v",
 			x.name, x.sentSeqs, res.Unique, lost, 100*float64(lost)/float64(max(x.sentSeqs, 1)), len(res.Missing), late, res.MaxGap, *tp, *rp)

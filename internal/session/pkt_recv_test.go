@@ -212,6 +212,42 @@ func TestPacketEOFFinal_L40(t *testing.T) {
 	})
 }
 
+// TestPacketCopyAfterEOFIsDuplicate_L35: a copy of a received datagram
+// that arrives after the peer's FIN was delivered (a slow race member's
+// tail, M3-D35) counts Duplicates, not DropLate; a never-received seq
+// after io.EOF stays DropLate (R1-12). Nothing is returned after io.EOF.
+func TestPacketCopyAfterEOFIsDuplicate_L35(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := dpSession(dpOpt{role: RolePassive})
+		l, _ := dpAddLane(s, 1, true, true)
+		for _, seq := range []uint64{0, 2} {
+			_ = dpDatagram(l, seq, dpPayload(seq, 32))
+		}
+		if err := dpSendFin(l, 3); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(60 * time.Millisecond) // past the 50-ms straggler bound
+		s.mu.Lock()
+		s.pktPeerFinCheckLocked(time.Now())
+		s.mu.Unlock()
+		if got := dpReadEOF(t, s); len(got) != 2 {
+			t.Fatalf("read %d datagrams before io.EOF, want 2", len(got))
+		}
+		for _, seq := range []uint64{2, 0, 1} { // two copies, one straggler
+			if err := dpDatagram(l, seq, dpPayload(seq, 32)); err != nil {
+				t.Fatalf("seq %d after io.EOF: %v, want a silent drop", seq, err)
+			}
+		}
+		if c := dpCtr(s); c.Duplicates != 2 || c.DropLate != 1 || c.Received != 2 {
+			t.Fatalf("counters %+v; want Duplicates 2, DropLate 1, Received 2", c)
+		}
+		if n, err := s.ReadFrom(make([]byte, 64)); n != 0 || err != io.EOF {
+			t.Fatalf("ReadFrom after io.EOF = %d, %v", n, err)
+		}
+		dpEnd(s, io.EOF)
+	})
+}
+
 // TestPacketFinConflict_L13: the peer's FIN is checked against what was
 // received (violations of the delivering carrier): another final seq than
 // an earlier FIN's, a final seq at or below an accepted datagram or below

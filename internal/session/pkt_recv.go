@@ -15,10 +15,12 @@ import (
 // violation of the delivering carrier (§A3.2); the session survives.
 //
 // Accounting: a new seq counts Received (and PACK's received), a seq seen
-// within the dedup window Duplicates, one older than the window or after
-// the peer's FIN was delivered DropLate (nothing is returned after io.EOF,
-// R1-12), an eviction by the full receive queue DropRecvQueue; after this
-// side's Close an accepted datagram is discarded uncounted (M2-D37).
+// within the dedup window Duplicates — also after the peer's FIN was
+// delivered (a slow race member's copies, M3-D35) — one older than the
+// window, or a new one after the peer's FIN was delivered, DropLate
+// (nothing is returned after io.EOF, R1-12), an eviction by the full
+// receive queue DropRecvQueue; after this side's Close an accepted
+// datagram is discarded uncounted (M2-D37).
 //
 // The idle clock (M2-D41) moves on an accepted datagram without a clock
 // read per datagram: the first unreported datagram reads the clock for
@@ -38,7 +40,11 @@ func (s *Session) datagramLocked(seq uint64, d []byte, buf *carrier.Buf) error {
 	case st.peerFinSet && seq >= st.peerFin:
 		err = errDgramBeyondFin
 	case st.peerFinDelivered:
-		pk.ctr.DropLate++ // a straggler after io.EOF was decided (R1-12)
+		if pk.dedup.Accept(seq) == wire.WindowDuplicate {
+			pk.ctr.Duplicates++ // a copy of a received datagram (M3-D35)
+		} else {
+			pk.ctr.DropLate++ // a straggler after io.EOF was decided (R1-12)
+		}
 	default:
 		switch pk.dedup.Accept(seq) {
 		case wire.WindowDuplicate:

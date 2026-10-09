@@ -149,10 +149,6 @@ type Hooks struct {
 	// AfterViewFill runs in a MUX trunk's writer after a DRR Fill call of
 	// handle returned and before the writer's ready-set decision (R1-1).
 	AfterViewFill func(carrier, handle uint32)
-	// PacketFillOrder runs at the start of every Fill of a packet session's
-	// lane on carrier, before the lane reads its capacity: a test drives the
-	// lanes' Fill calls in a fixed interleaving (R1-28).
-	PacketFillOrder func(carrier uint32)
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,
