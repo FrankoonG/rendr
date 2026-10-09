@@ -22,7 +22,9 @@ import (
 // PASS: over 8 s after a 2-s warm-up each direction carries ≥ 0.85 of the
 // link; both flows end intact. Observed before the fix (m3 8a9b989, at
 // every GOMAXPROCS): deep A → B 0.209 and B → A 0.939, shallow A → B 0.750
-// and B → A 0.996; after it 0.98/0.96 and 0.92/0.96.
+// and B → A 0.996; after it deep 0.96/0.93 and shallow 0.92/0.96 (with
+// WP DRR merged; deep reports SRTT about 490 ms against a 41-ms MinRTT,
+// the allowance's standing queues: sched.CapacityDuplex).
 //
 // Cause (internal/carrier/estimator.go, sched.Capacity): the capacity was
 // 2·rate·(minRTT + PingBusy + 50 ms), about 160 ms of the rate here, while
@@ -39,7 +41,8 @@ import (
 // measures the reverse queue one way — the arrival of the peer's PINGs
 // against their TS, over the smallest such delay — and, while the peer is
 // BUSY, adds it to the capacity at the delivered rate (sched.CapacityDuplex,
-// bounded by srtt − minRTT).
+// bounded by srtt − minRTT; the floor follows a drifting or stepping peer
+// clock, TestDuplexPeerClockSkew_L15).
 func TestMuxBulkBothWaysKeepsTheLink(t *testing.T) {
 	for _, c := range []struct {
 		name   string

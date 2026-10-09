@@ -87,10 +87,20 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 // rev is measured one way (the carrier's noteOWD). The allowance counts
 // once: it covers a delay the writer does not cause. Its rate is the
 // delivered average, bounded by the estimate, because the estimate is a
-// decaying maximum that bulk both ways overestimates (ACK compression; up
-// to 3× in TestByteClockDuplexRateBounded_L32): each side's allowance is
-// the other side's queue, so an overestimated multiplier would feed the
-// two queues into each other.
+// decaying maximum that bulk both ways overestimates (ACK compression:
+// TestByteClockDuplexRateBounded_L32 bounds it at 3× the link and logs
+// peaks near 2×, TestDuplexKeepsBothDirections_L15 up to 2.6×): each
+// side's allowance is the other side's queue, so an overestimated
+// multiplier would feed the two queues into each other.
+//
+// Its price is latency. With bulk both ways over a bottleneck deeper than
+// the cap, a side's bytes in flight, rate·(minRTT + q_fwd + q_rev), equal
+// the cap 2·rate·(minRTT + pingBusy + 50 ms) + rate·q_rev, so each
+// direction's standing queue settles near minRTT + 2·pingBusy + 100 ms and
+// the round trip near 3·minRTT + 4·pingBusy + 200 ms (460 ms on a 20-ms
+// path with the default PingBusy, against about 240 ms for bulk one way),
+// less where the bottleneck's buffer or the window is smaller;
+// TestDuplexKeepsBothDirections_L15 holds it within 1.5× of that.
 func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float64, rev time.Duration, floor, ceil int64) int64 {
 	if minRTT <= 0 {
 		minRTT = capUnknownRTT

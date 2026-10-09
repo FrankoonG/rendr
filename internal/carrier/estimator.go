@@ -33,10 +33,14 @@ const (
 	// PINGs of a burst (endPing).
 	clockStepMin = 64 << 10
 	clockStepDiv = 8
-	// owdGain and owdCreep smooth the reverse queue and let its floor
-	// follow the peer's clock (noteOWD).
+	// owdGain smooths the reverse queue; owdCreep and owdLift let its
+	// floor follow the peer's clock (noteOWD).
 	owdGain  = 8
 	owdCreep = 16
+	owdLift  = 4
+	// owdLimit bounds a one-way delay (73 years) so that differences of
+	// two never overflow.
+	owdLimit = time.Duration(1) << 61
 )
 
 // pingRecord is one PING of this incarnation (design §4.10, D14).
@@ -54,6 +58,7 @@ type carrierState struct {
 	// Estimator.
 	srtt, minRTT               time.Duration
 	rttvar                     time.Duration // RFC 6298 RTT variation (sched.RTTVar): only the REL timeout uses it (M2-D16)
+	lastRTT                    time.Duration // the latest RTT sample (noteOWD's bound)
 	rttSeen                    bool
 	rate                       float64 // bytes/s: decaying max of backlogged PONG-watermark samples
 	submitted, pongMark        uint64  // DATA payload bytes written / proven by PONG watermarks
@@ -175,6 +180,9 @@ func (t *trunk) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd bo
 		busy = w.backlogged(now, st.intervalStart)
 	}
 	p := wire.Ping{ID: id, TS: uint64(now.Sub(t.base)), Nonce: t.salt ^ uint64(id), Pad: pad}
+	if hk := t.env.Hooks; hk != nil && hk.PingTS != nil {
+		p.TS = hk.PingTS(t.id, p.TS)
+	}
 	if !b.addPing(busy, &p) {
 		return
 	}
@@ -385,6 +393,7 @@ func (t *trunk) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt tim
 	n0 := st.n
 	st.dropThrough(i)
 	rtt = now.Sub(rec.committedAt)
+	st.lastRTT = rtt
 	st.rttvar = sched.RTTVar(st.rttvar, st.srtt, rtt, !st.rttSeen) // before srtt (RFC 6298 §2.3)
 	if !st.rttSeen {
 		st.srtt, st.minRTT, st.rttSeen = rtt, rtt, true
@@ -499,31 +508,73 @@ func (st *carrierState) rateSpan() time.Duration {
 
 // noteOWD takes the one-way delay d of a PING the peer sent — our clock at
 // arrival minus the PING's TS, the peer's monotonic clock at encode, so d
-// carries the unknown offset of the two clocks — and busy, the BUSY flag it
-// carried. The floor owdBase is the smallest d seen: the path's propagation
-// plus the offset. The excess d − owdBase is what the PING waited in the
-// peer's socket and the path's queue towards us; our PONGs wait there too,
-// behind the same DATA. revQ follows a rising excess at once (a PONG is
-// late as soon as the queue grows) and a falling one with gain 1/8, as
-// srtt. A PING without BUSY moves the floor up by a sixteenth of its
-// excess: a peer without a backlog has no standing queue, so the floor
-// follows a peer clock that runs slow against ours (whose drift would
-// otherwise grow the excess for the life of the carrier) and returns at
-// once to a smaller d. While the peer stays BUSY the floor holds and
-// drifts at the clocks' relative rate (0.1 ms per second at 100 ppm);
-// revDelayLocked bounds what the capacity takes from it.
-func (st *carrierState) noteOWD(d time.Duration, busy bool) {
+// carries the unknown offset of the two clocks — busy, the BUSY flag it
+// carried, rt, an upper estimate of our current round trip (onPing: the
+// largest of srtt, the latest RTT sample and the wait of the oldest
+// unanswered PING), and deadMax, the carrier's DeadMax. The floor owdBase
+// estimates the path's propagation plus the offset. The excess
+// d − owdBase is what the PING waited in the peer's socket and the path's
+// queue towards us; our PONGs wait there too, behind the same DATA. revQ
+// follows a rising excess at once (a PONG is late as soon as the queue
+// grows) and a falling one with gain 1/8, as srtt.
+//
+// The floor moves three ways:
+//   - down at once to a smaller d;
+//   - up by a sixteenth of the excess on a PING without BUSY: a peer
+//     without a backlog has no standing queue, so the floor follows a peer
+//     clock that runs slow against ours;
+//   - up, BUSY or not, by a quarter of the part of the excess beyond
+//     rt − minRTT, the queueing our own round trip shows in both
+//     directions together (once an RTT was measured). No reverse queue
+//     exceeds it (our PONGs come back through that queue), so an excess
+//     beyond it is an error of the floor: a peer clock that ran slow, or
+//     stepped back, while the peer stayed BUSY. The floor then stays
+//     within our forward queue of the truth and closes that gap as our
+//     forward queue dips (the queues of bulk both ways swing), so a clock
+//     error does not accumulate (TestDuplexPeerClockSkew_L15). An excess
+//     beyond the bound by more than DeadMax — no PING waits that long on a
+//     live carrier — moves the floor at once to d − (rt − minRTT): a step
+//     of the peer's clock, or a TS far ahead of or behind the truth
+//     (TestReverseQueueFloorBound).
+//
+// rt must not lag a growing queue. srtt alone does (gain 1/8, and while
+// both directions ramp up PONGs are few): the rule then took the ramp's
+// queue for a clock error and kept the floor 50–370 ms too high for the
+// rest of the transfer, so the reverse queue read that much short
+// (TestDuplexKeepsBothDirections_L15's floor check; with a sixteenth's
+// lift TestCapLimitedFlowLongRTT_L15_L32's duplex rows failed). The latest
+// RTT sample and the wait of the oldest unanswered PING follow the queue
+// as it grows.
+func (st *carrierState) noteOWD(d time.Duration, busy bool, rt, deadMax time.Duration) {
 	switch {
 	case !st.owdSeen || d < st.owdBase:
 		st.owdBase, st.owdSeen = d, true
 	case !busy:
 		st.owdBase += (d - st.owdBase) / owdCreep
 	}
+	if st.rttSeen {
+		if over := d - st.owdBase - max(0, rt-st.minRTT); over > deadMax {
+			st.owdBase += over
+		} else if over > 0 {
+			st.owdBase += over / owdLift
+		}
+	}
 	if q := d - st.owdBase; q > st.revQ {
 		st.revQ = q
 	} else {
 		st.revQ += (q - st.revQ) / owdGain
 	}
+}
+
+// owdOf returns the one-way delay of a PING with timestamp ts (the peer's
+// monotonic ns at encode) that arrived elapsed after this carrier's start,
+// clamped to ±owdLimit so that the floor arithmetic never overflows, and
+// false for a TS that no monotonic clock reaches (beyond MaxInt64 ns).
+func owdOf(elapsed time.Duration, ts uint64) (time.Duration, bool) {
+	if ts > math.MaxInt64 {
+		return 0, false
+	}
+	return min(owdLimit, max(-owdLimit, elapsed-time.Duration(ts))), true
 }
 
 // noteDelivered closes a delivered-rate window at a matched PONG once it
@@ -550,8 +601,9 @@ func (st *carrierState) noteDelivered(now time.Time) {
 // without a backlog queues no DATA in front of our PONGs. It never exceeds
 // srtt − minRTT, the queueing that the round trips of our own PINGs measured
 // in both directions together: the reverse queue is part of it, so a wrong
-// TS (a peer clock that drifts, a peer that lies) adds at most what the
-// round trip already shows.
+// TS (a peer clock that drifts or steps, a peer that lies) adds at most
+// what the round trip already shows, and noteOWD's floor rule ends such an
+// error as the round trip's queueing falls.
 func (st *carrierState) revDelayLocked() time.Duration {
 	if !st.peerBusy || !st.rttSeen {
 		return 0
@@ -568,13 +620,26 @@ func (t *trunk) onPing(busy bool, p *wire.Ping, now time.Time) {
 	st := &t.st
 	st.pong, st.pongDue = *p, true
 	st.lastPingRx = now
-	st.noteOWD(time.Duration(int64(now.Sub(t.base))-int64(p.TS)), busy)
+	if d, ok := owdOf(now.Sub(t.base), p.TS); ok {
+		st.noteOWD(d, busy, max(st.srtt, st.lastRTT, st.oldestWait(now)), t.tm.DeadMax)
+	}
 	if st.peerBusy != busy {
 		st.peerBusy = busy
 		t.gaugeUpdateLocked()
 	}
 	t.mu.Unlock()
 	t.wakeWriter()
+}
+
+// oldestWait is how long the oldest committed, unanswered PING has waited
+// for its PONG (0 if none): a lower bound of its round trip.
+func (st *carrierState) oldestWait(now time.Time) time.Duration {
+	for i := range st.n {
+		if r := st.record(i); !r.committedAt.IsZero() && !r.early {
+			return now.Sub(r.committedAt)
+		}
+	}
+	return 0
 }
 
 // deathDueLocked reports whether the oldest committed, unanswered PING has

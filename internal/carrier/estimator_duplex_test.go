@@ -2,34 +2,166 @@ package carrier
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
+// duplexCase is one carrier-level run of bulk both ways (duplexRun): the
+// dialer and the passive each send as fast as their capacity lets them,
+// over a Link shaped to rate per direction with a buffer of buf per
+// direction, Window 8 MiB on both ends.
+type duplexCase struct {
+	rtt  time.Duration
+	rate float64
+	buf  int
+	// warm and span: the judged window [warm, warm+span) after Start.
+	warm, span time.Duration
+	// pingTS, if set, rewrites the TS of every PING the passive sends;
+	// since is the virtual time since the run began, before the handshake
+	// (a peer clock that drifts or steps against the dialer's).
+	pingTS func(ts uint64, since time.Duration) uint64
+}
+
+// duplexResult is what duplexRun measured over the judged window.
+type duplexResult struct {
+	shares  [2]float64       // dialer → passive, passive → dialer: share of the link
+	peak    [2]float64       // the largest rate estimate of each side
+	srttMax [2]time.Duration // the largest srtt each side reported
+	minRTT  [2]time.Duration // each side's minRTT at the window's end
+	// lift: the largest distance from Start to the window's end between
+	// each side's one-way floor (owdBase) and the true one: the Link's
+	// one-way delay plus the offset of the two carriers' clocks.
+	lift [2]time.Duration
+}
+
+// duplexRun runs c and returns its window's measurements once both flows
+// completed intact and in order and neither carrier died (it fails the
+// test otherwise). Each flow carries rate × (warm + span + 1 s), so neither
+// ends inside the window. Samples are taken every 10 ms.
+func duplexRun(t *testing.T, c duplexCase) duplexResult {
+	total := uint64(c.rate * (c.warm + c.span + time.Second).Seconds())
+	envD, envP := phEnvs()
+	envD.Timing.Window, envP.Timing.Window = 8<<20, 8<<20
+	if c.pingTS != nil {
+		began := time.Now() // set before any carrier goroutine reads it
+		envP.Hooks = &testhooks.Hooks{PingTS: func(_ uint32, ts uint64) uint64 { return c.pingTS(ts, time.Since(began)) }}
+	}
+	sink := newLtSink(total)
+	back := newSource(envP, ChunkSize, true)
+	defer back.chunk.Release()
+	back.offer(total)
+	dc, pc := lrLinkPair(t, envD, envP, c.rate, c.rtt/2, c.buf, &lrDuplex{ltSink: sink, src: back})
+	src := newSource(envD, ChunkSize, true)
+	defer src.chunk.Release()
+	src.offer(total)
+	start := time.Now()
+	dc.Start(src, &hBell{}, StartOptions{})
+
+	var r duplexResult
+	lift := func(x, peer *Conn) time.Duration {
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		return x.st.owdBase - (c.rtt/2 + peer.trunk.base.Sub(x.trunk.base))
+	}
+	var fwd0 uint64
+	var back0 int64
+	for at := start.Add(10 * time.Millisecond); at.Before(start.Add(c.warm + c.span)); at = at.Add(10 * time.Millisecond) {
+		time.Sleep(time.Until(at))
+		r.lift[0], r.lift[1] = max(r.lift[0], lift(dc, pc)), max(r.lift[1], lift(pc, dc))
+		if at.Before(start.Add(c.warm)) {
+			continue
+		}
+		if at.Equal(start.Add(c.warm)) {
+			fwd0, _, _ = sink.result()
+			back0 = src.rxBytes.Load()
+		}
+		for i, x := range []*Conn{dc, pc} {
+			s := x.Stats()
+			r.peak[i], r.srttMax[i] = max(r.peak[i], s.Rate), max(r.srttMax[i], s.SRTT)
+		}
+	}
+	time.Sleep(time.Until(start.Add(c.warm + c.span)))
+	fwd1, _, _ := sink.result()
+	back1 := src.rxBytes.Load()
+	r.shares = [2]float64{float64(fwd1-fwd0) / (c.rate * c.span.Seconds()), float64(back1-back0) / (c.rate * c.span.Seconds())}
+	ds, ps := dc.Stats(), pc.Stats()
+	r.minRTT = [2]time.Duration{ds.MinRTT, ps.MinRTT}
+	t.Logf("dialer → passive %.3f, passive → dialer %.3f of the link; rate peaks %.1f and %.1f MiB/s; srtt max %v and %v (minRTT %v and %v); cap %d and %d KiB; floor lift %v and %v",
+		r.shares[0], r.shares[1], r.peak[0]/(1<<20), r.peak[1]/(1<<20), r.srttMax[0].Round(time.Millisecond), r.srttMax[1].Round(time.Millisecond),
+		ds.MinRTT.Round(time.Millisecond), ps.MinRTT.Round(time.Millisecond), ds.Cap>>10, ps.Cap>>10, r.lift[0].Round(time.Millisecond), r.lift[1].Round(time.Millisecond))
+
+	for limit := time.After(time.Minute); ; {
+		next, bad, doneAt := sink.result()
+		if bad != "" {
+			t.Fatalf("the dialer's flow: %s", bad)
+		}
+		if !doneAt.IsZero() && uint64(src.rxBytes.Load()) >= total {
+			break
+		}
+		select {
+		case <-limit:
+			t.Fatalf("stalled: %d and %d of %d bytes", next, src.rxBytes.Load(), total)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if got := uint64(src.rxBytes.Load()); got != total {
+		t.Fatalf("the passive's flow: %d of %d bytes", got, total)
+	}
+	for _, x := range []*Conn{dc, pc} {
+		if dead, cause, detail, _ := x.Death(); dead {
+			t.Fatalf("carrier %d died: %v %s", x.ID(), cause, detail)
+		}
+	}
+	return r
+}
+
+// requireShares fails the test unless each direction of r carried at least
+// 0.85 of the link.
+func requireShares(t *testing.T, r duplexResult) {
+	t.Helper()
+	for i, who := range []string{"dialer → passive", "passive → dialer"} {
+		if r.shares[i] < 0.85 {
+			t.Errorf("%s carried %.3f of the link with bulk both ways, want ≥ 0.85", who, r.shares[i])
+		}
+	}
+}
+
 // TestDuplexKeepsBothDirections_L15 (M3 estimator amendment; L15, plan §4
-// capacity): bulk both ways over one carrier, each side sending as fast as
-// its capacity lets it, over a Link shaped to the same rate per direction.
-// Each side's PONGs travel behind the other side's DATA, so its proofs
-// come a reverse queue later than its own round trip: with a capacity
-// sized from minRTT alone (2·rate·(minRTT + PingBusy + 50 ms)) the side
-// whose PONGs wait longer is cap-limited below the link, its rate samples
-// (span ≥ srtt/2 while the peer is BUSY) measure what it achieved, and the
-// estimate settles near CapFloor/srtt. Before the fix (m3 8a9b989) the
-// passive's flow carried 0.15 of a 4 MiB/s link at a 20 ms RTT with a
-// 2-MiB link buffer and 0.17 of a 16 MiB/s link at 100 ms (the second is
-// the path TestByteClockDuplexRateBounded_L32 logs, not judges); the 2 MiB/s
-// row with a 128-KiB buffer passed there (0.88) and fails only with the
-// mux suite's load (TestMuxBulkBothWaysKeepsTheLink): it guards the short
-// queue. The capacity now adds the reverse queue measured one way
+// capacity): bulk both ways over one carrier (duplexRun). Each side's
+// PONGs travel behind the other side's DATA, so its proofs come a reverse
+// queue later than its own round trip: with a capacity sized from minRTT
+// alone (2·rate·(minRTT + PingBusy + 50 ms)) the side whose PONGs wait
+// longer is cap-limited below the link, its rate samples (span ≥ srtt/2
+// while the peer is BUSY) measure what it achieved, and the estimate
+// settles near CapFloor/srtt. Before the fix (m3 8a9b989) the passive's
+// flow carried 0.15 of a 4 MiB/s link at a 20 ms RTT with a 2-MiB link
+// buffer and 0.17 of a 16 MiB/s link at 100 ms (the second is the path
+// TestByteClockDuplexRateBounded_L32 logs, not judges). The 2 MiB/s row
+// with a 128-KiB buffer is a guard, not a failing-first row: it passed
+// there too (0.88; the same Link fails only with the mux suite's load,
+// TestMuxBulkBothWaysKeepsTheLink) and keeps the short queue covered. The
+// capacity now adds the reverse queue measured one way
 // (sched.CapacityDuplex, noteOWD).
 //
 // PASS: over the 6 s after a 2-s warm-up, while both flows run, each
-// direction carries ≥ 0.85 of the link; both flows then complete intact
-// and in order, and neither carrier dies.
+// direction carries ≥ 0.85 of the link; and the price of the allowance is
+// bounded (the amendment's standing-queue bound): neither side's srtt
+// exceeds 1.5 × (3·minRTT + 4·PingBusy + 200 ms), the round trip of two
+// standing queues of minRTT + 2·PingBusy + 100 ms each, with the rate
+// estimate's overestimate as the margin (on the 100 ms row Window/rate
+// bounds it first). With no clock error neither side's one-way floor
+// rises more than one 64-KiB chunk's serialization plus 50 ms above the
+// true one (noteOWD may lift it only for an excess its own round trip
+// does not show; a bound from srtt alone, which lags the queues' ramp,
+// lifted it by 50–180 ms on the two deep Links and read the reverse queue
+// that much short). Both flows then complete intact and in order, and
+// neither carrier dies.
 func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 	for _, tc := range []struct {
 		rtt  time.Duration
@@ -42,64 +174,67 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB", tc.rtt, tc.rate/(1<<20), tc.buf>>10), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				const warm, span = 2 * time.Second, 6 * time.Second
-				total := uint64(tc.rate * (warm + span + time.Second).Seconds()) // neither flow ends inside the window
-				envD, envP := phEnvs()
-				envD.Timing.Window, envP.Timing.Window = 8<<20, 8<<20
-				sink := newLtSink(total)
-				back := newSource(envP, ChunkSize, true)
-				defer back.chunk.Release()
-				back.offer(total)
-				dc, pc := lrLinkPair(t, envD, envP, tc.rate, tc.rtt/2, tc.buf, &lrDuplex{ltSink: sink, src: back})
-				src := newSource(envD, ChunkSize, true)
-				defer src.chunk.Release()
-				src.offer(total)
-				start := time.Now()
-				dc.Start(src, &hBell{}, StartOptions{})
+				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: 6 * time.Second})
+				requireShares(t, r)
+				pb := hTiming().PingBusy
+				for i, who := range []string{"dialer", "passive"} {
+					if bound := 3 * (3*r.minRTT[i] + 4*pb + 200*time.Millisecond) / 2; r.srttMax[i] > bound {
+						t.Errorf("%s: srtt reached %v with bulk both ways, want ≤ %v (1.5 × (3·minRTT + 4·PingBusy + 200 ms))", who, r.srttMax[i], bound)
+					}
+					if bound := time.Duration(float64(ChunkSize)/tc.rate*float64(time.Second)) + 50*time.Millisecond; r.lift[i] > bound {
+						t.Errorf("%s: the one-way floor rose %v above the true one without a clock error, want ≤ %v", who, r.lift[i], bound)
+					}
+				}
+			})
+		})
+	}
+}
 
-				time.Sleep(warm)
-				fwd0, _, _ := sink.result()
-				back0 := src.rxBytes.Load()
-				var peak [2]float64
-				for at := start.Add(warm); at.Before(start.Add(warm + span)); at = at.Add(10 * time.Millisecond) {
-					time.Sleep(time.Until(at))
-					peak[0], peak[1] = max(peak[0], dc.Stats().Rate), max(peak[1], pc.Stats().Rate)
-				}
-				time.Sleep(time.Until(start.Add(warm + span)))
-				fwd1, _, _ := sink.result()
-				back1 := src.rxBytes.Load()
-				shares := [2]float64{float64(fwd1-fwd0) / (tc.rate * span.Seconds()), float64(back1-back0) / (tc.rate * span.Seconds())}
-				ds, ps := dc.Stats(), pc.Stats()
-				t.Logf("dialer → passive %.3f, passive → dialer %.3f of the link; rate peaks %.1f and %.1f MiB/s; dialer srtt %v cap %d KiB; passive srtt %v cap %d KiB",
-					shares[0], shares[1], peak[0]/(1<<20), peak[1]/(1<<20), ds.SRTT, ds.Cap>>10, ps.SRTT, ps.Cap>>10)
-
-				for limit := time.After(time.Minute); ; {
-					next, bad, doneAt := sink.result()
-					if bad != "" {
-						t.Fatalf("the dialer's flow: %s", bad)
+// TestDuplexPeerClockSkew_L15 (M3 estimator review; noteOWD's floor): bulk
+// both ways (duplexRun, 20 ms RTT, 2-MiB link buffer) for 150 virtual
+// seconds while the passive's PING TS — its monotonic clock — runs slow
+// against the dialer's or steps back. Each such PING's apparent one-way
+// delay grows by the clock error, and while the passive stays BUSY nothing
+// re-anchored the dialer's floor, which only fell to a smaller delay or
+// crept up on non-BUSY PINGs: the error read as a reverse queue, the
+// dialer's allowance sat at its srtt − minRTT clamp (which holds its own
+// forward queue as well), the dialer's queue grew and the passive's flow
+// fell back towards DEFECT 2. The floor now also rises by a quarter of any
+// excess beyond the queueing the dialer's own round trip shows, at once
+// beyond it by more than DeadMax. Without that rule (7917493's floor) the
+// passive → dialer share over the last 50 s is 0.71 (drift 0.5 %,
+// 2 MiB/s), 0.61 (drift 1 %, 4 MiB/s), about 0.4 with the flow stalled at
+// the end (a 1-s step, 2 MiB/s) and 0.76 (a 6-s step, 4 MiB/s), the same
+// at GOMAXPROCS 1 and 4; with it 0.90, 0.90–0.91, 0.93 and 0.94. A 0.5 % drift is
+// 10 times NTP's largest slew (500 ppm); over the run it accumulates
+// 0.75 s, what 100 ppm accumulates in about two hours. A peer clock that
+// runs fast is harmless (the floor follows a smaller delay at once).
+//
+// PASS: over the last 50 s each direction carries ≥ 0.85 of the link; both
+// flows complete intact and in order; neither carrier dies.
+func TestDuplexPeerClockSkew_L15(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		rate  float64
+		drift float64       // the passive's clock runs slow by this fraction
+		step  time.Duration // and steps back by this much 10 s into the run
+	}{
+		{"drift0.5%/2MiBps", 2 << 20, 0.005, 0},
+		{"drift1%/4MiBps", 4 << 20, 0.01, 0},
+		{"step1s/2MiBps", 2 << 20, 0, time.Second},
+		{"step6s/4MiBps", 4 << 20, 0, 6 * time.Second}, // beyond DeadMax: the floor moves at once
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				skew := func(ts uint64, since time.Duration) uint64 {
+					v := float64(ts) * (1 - tc.drift)
+					if since >= 10*time.Second {
+						v -= float64(tc.step)
 					}
-					if !doneAt.IsZero() && uint64(src.rxBytes.Load()) >= total {
-						break
-					}
-					select {
-					case <-limit:
-						t.Fatalf("stalled: %d and %d of %d bytes", next, src.rxBytes.Load(), total)
-					case <-time.After(10 * time.Millisecond):
-					}
+					return uint64(max(0, v))
 				}
-				if got := uint64(src.rxBytes.Load()); got != total {
-					t.Fatalf("the passive's flow: %d of %d bytes", got, total)
-				}
-				for _, c := range []*Conn{dc, pc} {
-					if dead, cause, detail, _ := c.Death(); dead {
-						t.Fatalf("carrier %d died: %v %s", c.ID(), cause, detail)
-					}
-				}
-				for i, who := range []string{"dialer → passive", "passive → dialer"} {
-					if shares[i] < 0.85 {
-						t.Errorf("%s carried %.3f of the link with bulk both ways, want ≥ 0.85", who, shares[i])
-					}
-				}
+				requireShares(t, duplexRun(t, duplexCase{rtt: 20 * time.Millisecond, rate: tc.rate, buf: 2 << 20,
+					warm: 100 * time.Second, span: 50 * time.Second, pingTS: skew}))
 			})
 		})
 	}
@@ -116,8 +251,9 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 //     an RTT was measured; it adds min(delivered, rate)·revQ and never more
 //     than srtt − minRTT of it.
 //   - A PING without BUSY moves the floor up by 1/16 of its excess (a peer
-//     clock that runs slow); a BUSY PING never does; a smaller delay resets
-//     the floor at once.
+//     clock that runs slow); a BUSY PING whose excess is within srtt −
+//     minRTT does not (beyond it: TestReverseQueueFloorBound); a smaller
+//     delay resets the floor at once.
 func TestReverseQueueAllowance(t *testing.T) {
 	const rate = 4 << 20
 	t0 := time.Unix(1000, 0)
@@ -181,7 +317,7 @@ func TestReverseQueueAllowance(t *testing.T) {
 	}
 
 	// Without BUSY: no allowance, and the floor creeps up by 1/16 of the
-	// excess; with BUSY it holds.
+	// excess; with BUSY (an excess within srtt − minRTT) it holds.
 	ping(4*time.Second, 170*time.Millisecond, false)
 	if got := capNow(); got != plain {
 		t.Fatalf("peer not BUSY: capacity %d, want the plain %d", got, plain)
@@ -210,6 +346,121 @@ func TestReverseQueueAllowance(t *testing.T) {
 	st.revQ = 10 * time.Hour
 	if got := capNow(); got > tr.tm.Window {
 		t.Fatalf("capacity %d beyond the window %d", got, tr.tm.Window)
+	}
+}
+
+// TestReverseQueueFloorBound (M3 estimator review; noteOWD, owdOf): the
+// floor of the one-way delay checked against the round trip, and PING TS
+// values that no clock produces, driven through onPing.
+//
+//   - No reverse queue exceeds rt − minRTT, the queueing our own round
+//     trip shows in both directions together, where rt is the largest of
+//     srtt, the latest RTT sample and the wait of the oldest unanswered
+//     PING (so it does not lag a growing queue). An excess beyond it
+//     raises the floor by a quarter of the part beyond, BUSY or not; an
+//     excess within it leaves a BUSY PING's floor alone; an excess beyond
+//     it by more than DeadMax moves the floor at once, so that the excess
+//     is rt − minRTT. Before the first RTT the rule does not apply.
+//   - A smaller delay brings the floor down at once after such a move.
+//   - A TS at or above 2^63 ns is no monotonic clock's: the PING is still
+//     answered (it is the PONG's echo) and leaves the floor and revQ alone.
+//   - A TS far ahead (MaxInt64 ns) is clamped, so the floor arithmetic
+//     never overflows: the next ordinary PING re-anchors the floor within
+//     rt − minRTT of its delay, and as the round trip falls the floor
+//     follows it, so a single wrong TS does not hold the allowance at its
+//     clamp for the carrier's life.
+func TestReverseQueueFloorBound(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	tr := &trunk{tm: hTiming(), base: t0}
+	st := &tr.st
+	const off = 5 * time.Second // the peer's clock against ours
+	// ping delivers PING id sent at our time at (the peer's clock reads
+	// off + at) that took oneWay to arrive.
+	ping := func(id uint32, at, oneWay time.Duration, busy bool) {
+		tr.onPing(busy, &wire.Ping{ID: id, TS: uint64(off + at)}, t0.Add(at+oneWay))
+	}
+	floor := 10*time.Millisecond - off
+	ping(1, time.Second, 10*time.Millisecond, true)
+	if st.owdBase != floor {
+		t.Fatalf("first PING: floor %v, want %v", st.owdBase, floor)
+	}
+	// No RTT yet: a 2-s excess is taken as it is.
+	ping(2, 2*time.Second, 2*time.Second, true)
+	if st.owdBase != floor || st.revQ != 1990*time.Millisecond {
+		t.Fatalf("before the first RTT: floor %v revQ %v, want %v and 1.99s", st.owdBase, st.revQ, floor)
+	}
+
+	st.rttSeen, st.srtt, st.minRTT, st.revQ = true, 200*time.Millisecond, 20*time.Millisecond, 0
+	const bound = 180 * time.Millisecond // srtt − minRTT
+	ping(3, 3*time.Second, 160*time.Millisecond, true)
+	if st.owdBase != floor || st.revQ != 150*time.Millisecond {
+		t.Fatalf("an excess within srtt − minRTT: floor %v revQ %v, want %v and 150ms", st.owdBase, st.revQ, floor)
+	}
+	// An excess of 280 ms: 100 ms beyond the bound, a quarter of it.
+	ping(4, 4*time.Second, 290*time.Millisecond, true)
+	floor += 100 * time.Millisecond / owdLift
+	if st.owdBase != floor || st.revQ != 280*time.Millisecond-100*time.Millisecond/owdLift {
+		t.Fatalf("an excess 100 ms beyond srtt − minRTT: floor %v revQ %v, want %v and %v", st.owdBase, st.revQ, floor, 280*time.Millisecond-100*time.Millisecond/owdLift)
+	}
+	// The latest RTT sample widens the bound (400 ms: 380 ms of queueing),
+	// and so does the wait of the oldest unanswered PING (500 ms): a queue
+	// that grows faster than srtt follows is no clock error.
+	excess := func(e time.Duration) time.Duration { return floor + off + e } // the one-way delay giving excess e
+	st.lastRTT = 400 * time.Millisecond
+	ping(40, 4100*time.Millisecond, excess(300*time.Millisecond), true)
+	if st.owdBase != floor {
+		t.Fatalf("an excess within the latest RTT sample's bound: floor %v, want %v", st.owdBase, floor)
+	}
+	st.lastRTT = 0
+	at, ow := 4200*time.Millisecond, excess(400*time.Millisecond)
+	st.ring[st.head], st.n = pingRecord{id: 41, committedAt: t0.Add(at + ow - 500*time.Millisecond)}, 1
+	ping(41, at, ow, true)
+	if st.owdBase != floor {
+		t.Fatalf("an excess within the oldest unanswered PING's wait: floor %v, want %v", st.owdBase, floor)
+	}
+	st.n = 0
+	// An excess of 10 s, beyond the bound (srtt again) by more than
+	// DeadMax: at once.
+	ping(5, 5*time.Second, 10*time.Second+10*time.Millisecond, true)
+	if want := 10*time.Second + 10*time.Millisecond - off - bound; st.owdBase != want {
+		t.Fatalf("an excess beyond srtt − minRTT + DeadMax: floor %v, want %v", st.owdBase, want)
+	}
+	// Ordinary PINGs again: the floor falls to the smaller delay at once.
+	ping(6, 6*time.Second, 30*time.Millisecond, true)
+	if want := 30*time.Millisecond - off; st.owdBase != want {
+		t.Fatalf("after the outlier: floor %v, want %v", st.owdBase, want)
+	}
+
+	// TS values no monotonic clock reaches: answered, otherwise ignored.
+	base, q := st.owdBase, st.revQ
+	for i, ts := range []uint64{1 << 63, math.MaxUint64} {
+		id := uint32(7 + i)
+		tr.onPing(true, &wire.Ping{ID: id, TS: ts}, t0.Add(7*time.Second))
+		if st.owdBase != base || st.revQ != q {
+			t.Fatalf("TS %#x: floor %v revQ %v, want them unchanged (%v, %v)", ts, st.owdBase, st.revQ, base, q)
+		}
+		if !st.pongDue || st.pong.ID != id {
+			t.Fatalf("TS %#x: the PING is not answered", ts)
+		}
+	}
+	// A TS far ahead: clamped (no overflow), then re-anchored at once.
+	tr.onPing(true, &wire.Ping{ID: 9, TS: math.MaxInt64}, t0.Add(8*time.Second))
+	if st.owdBase != -owdLimit {
+		t.Fatalf("TS MaxInt64: floor %v, want the clamp %v", st.owdBase, -owdLimit)
+	}
+	ping(10, 9*time.Second, 30*time.Millisecond, true)
+	if want := 30*time.Millisecond - off - bound; st.owdBase != want {
+		t.Fatalf("an ordinary PING after it: floor %v, want %v", st.owdBase, want)
+	}
+	// While the round trip stays loaded the floor is off by at most the
+	// bound; once the round trip falls (srtt 50 ms: bound 30 ms) BUSY PINGs
+	// close the gap.
+	st.srtt = 50 * time.Millisecond
+	for i := range 128 {
+		ping(uint32(11+i), 10*time.Second+time.Duration(i)*10*time.Millisecond, 30*time.Millisecond, true)
+	}
+	if ex := 30*time.Millisecond - off - st.owdBase; ex > 31*time.Millisecond {
+		t.Fatalf("after 128 PINGs with srtt − minRTT = 30 ms: excess %v, want ≤ 31ms", ex)
 	}
 }
 
