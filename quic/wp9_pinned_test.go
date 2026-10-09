@@ -110,10 +110,18 @@ func TestQUICGoPinnedBehaviour(t *testing.T) {
 		// Once the congestion window is spent, frames leave only in probe
 		// packets: quic-go holds 32 and the next call waits.
 		eventually(t, "quic-go holds 32 DATAGRAM frames", func() bool { return done.Load()-ft.sentDatagrams.Load() >= 32 })
-		for last := int64(-1); done.Load() != last; time.Sleep(100 * time.Millisecond) {
-			last = done.Load() // until the caller made no progress for 100 ms
-		}
-		if n, sent := done.Load(), ft.sentDatagrams.Load(); n == 300 || n-sent != 32 {
+		// A settled state: neither the caller nor the sender moved for
+		// 100 ms, with 32 frames queued. A probe packet can send one queued
+		// frame between two samples (the caller then returns once more), so
+		// a single sample may read 31 under load (a premise flake of the
+		// Linux race lane); the queue bound shows as a settled 32.
+		var n, sent int64
+		eventually(t, "a caller blocked with 32 DATAGRAM frames queued", func() bool {
+			n, sent = done.Load(), ft.sentDatagrams.Load()
+			time.Sleep(100 * time.Millisecond)
+			return done.Load() == n && ft.sentDatagrams.Load() == sent && n-sent == 32
+		})
+		if n == 300 {
 			t.Errorf("%d of 300 SendDatagram calls returned, %d DATAGRAMs sent: want a caller blocked with 32 queued", n, sent)
 		}
 		_ = cli.CloseWithError(0, "")
