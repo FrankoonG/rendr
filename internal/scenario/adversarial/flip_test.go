@@ -61,8 +61,11 @@ var regions = []region{
 // row's Death migrations. Datagram carriers — a DGRAM and a REL of the
 // dialer: the datagram is dropped and counted (the receiving carrier's
 // Dropped), no carrier dies, the REL is retransmitted, and the verifier
-// sees no damaged datagram. DETACH frames exist only on MUX trunks (the
-// MUX half of the set).
+// sees no damaged datagram. DETACH frames exist only on MUX trunks: on a
+// stream trunk the DETACH an idle fifth session's view places at its
+// clean end kills the trunk at the passive (its four busy sessions
+// migrate); on a datagram trunk the REL that carries the first session's
+// DETACH is dropped, counted and retransmitted.
 func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	stream := []struct {
 		name string
@@ -86,14 +89,30 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 		}
 	}
 	for _, r := range regions {
+		t.Run("stream/DETACH/"+r.name, func(t *testing.T) {
+			eachSetupOf(t, muxSetups(), func(t *testing.T, s setup) {
+				runStream(t, s, streamAttack{dir: rendrtest.Up, typ: rendrtest.FrameDetach, detach: true,
+					arm: func(tm *rendrtest.Tamper, _ *pair) {
+						tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDetach), r.bit)
+					},
+					ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
+					want: r.want, muxWant: r.mux})
+			})
+		})
+	}
+	for _, r := range regions {
 		t.Run("stream/DGRAM/"+r.name, func(t *testing.T) {
 			eachSetup(t, func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
 		})
 	}
-	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel} {
+	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel, wire.TypeDetach} {
+		ss := setups()
+		if typ == wire.TypeDetach {
+			ss = muxSetups()
+		}
 		for _, r := range regions {
 			t.Run("datagram/"+typ.String()+"/"+r.name, func(t *testing.T) {
-				eachSetup(t, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
+				eachSetupOf(t, ss, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
 			})
 		}
 	}
@@ -139,9 +158,10 @@ func flipStreamDgram(t *testing.T, s setup, r region) {
 // datagrams per second dialer → passive each; one bit of a frame of type
 // typ is flipped in one datagram the dialer writes — the next DGRAM on the
 // first session's attacked carrier after a second, or the next REL of any
-// session carrier from the first session's end on (its FIN). The
-// receiving carrier drops the datagram's rest and counts it; nothing dies;
-// a REL is retransmitted.
+// session carrier from the first session's end on (its FIN), or (a MUX
+// trunk) the next REL that carries a DETACH: the first session's, the last
+// frame its ending view places. The receiving carrier drops the
+// datagram's rest and counts it; nothing dies; a REL is retransmitted.
 func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	w := newWorld(t, s, worldOpts{})
 	xs := w.openPacketN(w.datagramPeer())
@@ -157,8 +177,8 @@ func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	for _, f := range ups {
 		f.halt(t)
 	}
-	if typ == wire.TypeRel {
-		w.flip.arm(typ, r.bit, 0) // the next REL: the first session's FIN
+	if typ == wire.TypeRel || typ == wire.TypeDetach {
+		w.flip.arm(typ, r.bit, 0) // the next REL: the first session's FIN; or its DETACH
 	}
 	x.endPacket(t, up)
 	id, n := w.flip.targeted()
@@ -170,12 +190,18 @@ func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	if d := w.deaths(); len(d[0])+len(d[1]) != 0 {
 		t.Fatalf("carriers died: dialer %+v, passive %+v", d[0], d[1])
 	}
-	pc, ok := carrierOf(x.p.Status(), id)
+	// A DETACH follows the first session's end: its trunk's counters are
+	// read through a session that still has it.
+	y := x
+	if typ == wire.TypeDetach {
+		y = xs[1]
+	}
+	pc, ok := carrierOf(y.p.Status(), id)
 	if !ok || pc.Dropped == 0 {
 		t.Fatalf("the passive's carrier %d did not count the damaged datagram: %+v", id, pc)
 	}
-	if typ == wire.TypeRel {
-		if dc, ok := carrierOf(x.d.Status(), id); !ok || dc.Retransmits == 0 {
+	if typ == wire.TypeRel || typ == wire.TypeDetach {
+		if dc, ok := carrierOf(y.d.Status(), id); !ok || dc.Retransmits == 0 {
 			t.Fatalf("the damaged REL was not retransmitted: %+v", dc)
 		}
 	}

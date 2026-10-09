@@ -29,13 +29,17 @@ func rowBytes() int64 {
 
 // streamAttack is one row's operation on a stream carrier.
 type streamAttack struct {
-	n    int64         // bytes per session (0: rowBytes)
-	dir  rendrtest.Dir // the attacked direction: Up (the passive detects), Down (the dialer)
-	typ  rendrtest.FrameType
-	sch  bool                                // the frame is a SCHED: armed through schedTrigger
-	arm  func(tm *rendrtest.Tamper, x *pair) // arms the operation on the picked carrier's tamper
-	ops  func(tm *rendrtest.Tamper) int      // the stimulus counter of one tamper
-	want []string                            // the receiving end's detail names one of these
+	n   int64         // bytes per session (0: rowBytes)
+	dir rendrtest.Dir // the attacked direction: Up (the passive detects), Down (the dialer)
+	typ rendrtest.FrameType
+	sch bool // the frame is a SCHED: armed through schedTrigger
+	// detach: the frame is a DETACH (MUX trunks only): the Peer holds one
+	// more session, idle, whose clean end makes its views place a DETACH
+	// each; its end is the stimulus.
+	detach bool
+	arm    func(tm *rendrtest.Tamper, x *pair) // arms the operation on the picked carrier's tamper
+	ops    func(tm *rendrtest.Tamper) int      // the stimulus counter of one tamper
+	want   []string                            // the receiving end's detail names one of these
 	// muxWant replaces want on a MUX trunk (nil: want), where a handle
 	// can name another live view.
 	muxWant []string
@@ -77,7 +81,12 @@ func runStream(t *testing.T, s setup, a streamAttack) {
 		n = rowBytes()
 	}
 	w := newWorld(t, s, worldOpts{})
-	xs := w.openN(w.streamPeer())
+	peer := w.streamPeer()
+	xs := w.openN(peer)
+	var idle *pair
+	if a.detach {
+		idle = w.open(peer)
+	}
 	fs := make([]*sflow, len(xs))
 	for i, x := range xs {
 		fs[i] = startFlow(x.d, x.p, n, 4300+uint64(i))
@@ -94,6 +103,12 @@ func runStream(t *testing.T, s setup, a streamAttack) {
 		deaths, own = 2, 1
 	case a.typ == rendrtest.FrameAck:
 		a.arm(w.tamperOf(ackLane(t, w, x)), x)
+	case a.detach:
+		// The idle session's view on the attacked trunk is the one whose
+		// DETACH meets the armed operation; the trunk dies after the
+		// session's last frames, so it still ends cleanly.
+		a.arm(w.tamperOf(target(t, s, x.d.Status())), x)
+		idle.endClean(t)
 	default:
 		a.arm(w.tamperOf(target(t, s, x.d.Status())), x)
 	}
