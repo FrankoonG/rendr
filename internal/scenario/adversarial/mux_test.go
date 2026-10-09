@@ -46,14 +46,15 @@ var confusions = []string{"open-used", "data-unopened", "detach-unknown", "after
 // handle's OPEN or JOIN would be dropped and counted there (§A3.3) and
 // its attempt would retry with another handle.
 func TestAdvMuxHandleConfusion_L43_L14(t *testing.T) {
+	setupsOf := raceRows() // one of the three MUX setups per row in the race lane, rotating
 	for _, kind := range confusions {
 		t.Run("stream/"+kind, func(t *testing.T) {
-			eachSetupOf(t, muxSetups(), func(t *testing.T, s setup) { confuseStream(t, s, kind) })
+			eachSetupOf(t, setupsOf(muxSetups()), func(t *testing.T, s setup) { confuseStream(t, s, kind) })
 		})
 	}
 	for _, kind := range confusions {
 		t.Run("datagram/"+kind, func(t *testing.T) {
-			eachSetupOf(t, muxSetups(), func(t *testing.T, s setup) { confuseDatagram(t, s, kind) })
+			eachSetupOf(t, setupsOf(muxSetups()), func(t *testing.T, s setup) { confuseDatagram(t, s, kind) })
 		})
 	}
 }
