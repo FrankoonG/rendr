@@ -27,6 +27,10 @@ import (
 // carrier and the verdict reaches it there (m3 BACKLOG, FINDING C of the
 // G6 mixed-NAT case: rejected sessions on live MUX trunks were answered
 // CAPACITY code 2 while the passive's backlog held 13 to 28 of 128).
+// The session never answers CodeBacklog in place of a verdict; the one
+// remaining exception is the carrier's fallback refusal of a view killed
+// with its verdict still unplaced (abandonLocked at the close bound), an
+// open item of the carrier's view-end code.
 // Helpers of these tests start with "bk".
 
 // bkGate holds the passive's MUX writer in its AfterViewFill hook at the
@@ -179,6 +183,59 @@ func TestPassiveBacklogCodeOnlyWhenFull_L48(t *testing.T) {
 			pc.Close()
 		})
 	})
+	t.Run("rejects under a bulk transfer", func(t *testing.T) {
+		// The G6 load shape without a gate: a session on the same trunk
+		// moves 16 MiB each way at 16 MiB/s while 24 sessions are dialed
+		// and rejected one after another on that trunk. Every Dial gets the
+		// application's RejectError, and the bulk arrives intact. (A guard
+		// of the load shape: it fails when the pending view is not woken
+		// for its verdict; the narrow writer races of the gated rows above
+		// it does not reach reliably.)
+		synctest.Test(t, func(t *testing.T) {
+			e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, nil), p: wpTestRuntime(t, Config{}, nil)}
+			e.ln = wpListen(t, e.p, ListenConfig{})
+			// A short link queue: the control frames wait behind at most
+			// 64 KiB of bulk, so the rejects keep pace with the transfer.
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: e.ln.Handle, Buffer: 64 << 10})
+			t.Cleanup(l.Close)
+			p := e.mxPeer(e2eCarrier(l))
+			dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
+			l.SetDelay(2*time.Millisecond, 0)
+			l.SetRate(16 << 20)
+			bulk := make(chan error, 1)
+			go func() { bulk <- e2eExchangeErr(dc, pc, 16<<20, 13) }()
+			for i := range 24 {
+				res := e2eDialAsync(context.Background(), p, DialOptions{})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				pend, err := e.ln.Accept(ctx)
+				cancel()
+				if err != nil {
+					t.Fatalf("Accept %d: %v", i, err)
+				}
+				if err := pend.Reject(4242, "rejected under load"); err != nil {
+					t.Fatalf("Reject %d: %v", i, err)
+				}
+				r := <-res
+				if r.err == nil {
+					r.c.Close()
+				}
+				var re *RejectError
+				if !errors.As(r.err, &re) || re.Code != 4242 {
+					t.Fatalf("Dial %d: %v; want *RejectError{Code: 4242} (CodeBacklog is %d)", i, r.err, wire.CodeBacklog)
+				}
+			}
+			select {
+			case err := <-bulk:
+				t.Fatalf("the bulk exchange ended (%v) before the last reject: no load", err)
+			default:
+			}
+			if err := <-bulk; err != nil {
+				t.Fatalf("bulk exchange: %v", err)
+			}
+			dc.Close()
+			pc.Close()
+		})
+	})
 	t.Run("confirmed, then Runtime.Close", func(t *testing.T) {
 		// The application confirms while the writer is held after the
 		// view's empty Fill, and the passive Runtime closes before the OK
@@ -299,6 +356,42 @@ func TestPassiveBacklogCodeOnlyWhenFull_L48(t *testing.T) {
 			e2eExchange(t, s2, q2, 32<<10, 5)
 			for _, c := range []*Conn{s1, q1, s2, q2} {
 				c.Close()
+			}
+		})
+	})
+	t.Run("withdrawn: dedicated carriers retire unanswered", func(t *testing.T) {
+		// The same withdrawal on two dedicated carriers (no MUX): the
+		// carrier whose OPEN still awaits a response retires without one
+		// (§6.2) — its CLOSE is its only frame. Only a MUX view is owed the
+		// tombstone's UNKNOWN_SESSION; a dedicated carrier ends with its
+		// CLOSE, which already tells the dialer the attempt is over.
+		synctest.Test(t, func(t *testing.T) {
+			rt := wpTestRuntime(t, Config{}, nil)
+			ln := wpListen(t, rt, ListenConfig{})
+			inst := wpInst(0xb7)
+			open := wpOpen(wpSID(4101), wire.KindStream, 1, nil)
+			first := wpConnect(t, ln, inst, 1)
+			first.hello(rt)
+			first.send(wire.TypeOpen, 0, open)
+			synctest.Wait() // pending (Accept is never called)
+			dup := wpConnect(t, ln, inst, 2)
+			dup.hello(rt)
+			dup.send(wire.TypeOpen, 0, open)
+			synctest.Wait() // the duplicate parked on the pending session
+			if st := rt.Status(); st.Sessions.Pending != 1 {
+				t.Fatalf("pending sessions %d, want 1", st.Sessions.Pending)
+			}
+			dup.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+			var wg sync.WaitGroup
+			wg.Go(func() { dup.drain() })
+			seen := first.drain()
+			wg.Wait()
+			if len(seen) != 1 || seen[0] != wire.TypeClose {
+				t.Fatalf("the first carrier of a withdrawn session placed %v; want its CLOSE only (§6.2)", seen)
+			}
+			synctest.Wait()
+			if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 1}) || st.AcceptBacklog[0] != 0 {
+				t.Fatalf("after the withdrawal: %+v", st)
 			}
 		})
 	})
