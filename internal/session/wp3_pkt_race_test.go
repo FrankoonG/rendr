@@ -157,7 +157,12 @@ func TestRacePacketFinCoversSkipped(t *testing.T) {
 		}
 	}
 	b0.ReleaseRefs()
-	b1 := dpFrames(dpFill(ls[1], time.Now()))
+	var b1 []dpFrame
+	for _, f := range dpFrames(dpFill(ls[1], time.Now())) {
+		if f.typ != wire.TypePack { // every race member carries a PACK copy (PA-33 as amended)
+			b1 = append(b1, f)
+		}
+	}
 	if len(b1) != 2 || b1[0].typ != wire.TypeDgram || b1[0].seq != 0 || b1[1].typ != wire.TypeFin || b1[1].fin != 1 {
 		t.Fatalf("the big member placed %v, want DGRAM(0) then FIN(1)", b1)
 	}

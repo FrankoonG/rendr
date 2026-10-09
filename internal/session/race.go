@@ -14,8 +14,9 @@ import (
 // compares an overlap while the first copy is still held. Packet: each data
 // lane places from its own cursor lane.rpos over the one tx ring; a
 // datagram's seq is fixed at its first placement and shared by its copies
-// (pkt_race.go). The ACK (stream) and PACK (packet) duty sits on the
-// fastest live lane. Session counters count unique delivery
+// (pkt_race.go). The ACK (stream) and PACK (packet) duty is the fastest
+// live lane's, and every other live data lane carries a copy of each ACK
+// or PACK (raceAckDutyLocked). Session counters count unique delivery
 // (stream.copyBytes, packet.copies and stream.dupBytes hold the extra);
 // carrier counters count physical copies (L35).
 
@@ -48,7 +49,9 @@ func (s *Session) raceAttachLocked(l *lane) {
 // (stream) or PACK (packet) duty (M3-D33, PA-33): the live lane that is not
 // write-blocked with the lowest SRTT, ties by rank, then attach order; nil
 // when no lane qualifies. The duty code re-chooses it at every ACK or PACK
-// placement decision and at lane attach and death. s.mu held.
+// placement decision and at lane attach and death. It is woken first; every
+// other live data lane carries a copy of each ACK (raceAckDutyLocked).
+// s.mu held.
 //
 // "Live" is ackQualifiesLocked (confirmed, not refused, CLOSE unwritten)
 // and not leaving (Retire called, or dropped by the passive's applied
@@ -69,6 +72,42 @@ func (s *Session) raceAckLaneLocked() *lane {
 		}
 	}
 	return best
+}
+
+// raceAckDutyLocked reports whether race lane l places every ACK (stream)
+// or PACK (packet) besides the duty lane st.ackLane (M3-D33 as amended,
+// PA-33): every data lane that could keep the duty (ackKeepLocked: live,
+// not leaving, not write-blocked) carries a copy, at most MaxCarriers
+// lanes. A member blackholed without an error is neither write-blocked nor
+// dead until its death verdict and its SRTT is frozen, so a duty on the
+// fastest lane alone would keep every ACK in the hole and the sender's
+// window would run out long before that verdict (gold G4-race); with a
+// copy on every member the ACK path survives as long as one member
+// delivers, without a timer or a detection delay. The copies cost nothing
+// the receiver must undo: each lane's ACKs are monotone on that lane (each
+// placement carries the values current then), and the sender merges every
+// field by max (the cumulative ACK and the right edge, P10; FIN_DELIVERED
+// and DONE are idempotent; PACK counts and seqs by max, PA-5) and samples
+// no RTT from an ACK. s.mu held.
+func (s *Session) raceAckDutyLocked(l *lane) bool {
+	return s.p.Mode == ModeRace && l.data && s.ackKeepLocked(l)
+}
+
+// raceWakeAckLocked wakes every idle lane that carries a race session's
+// ACKs (raceAckDutyLocked), so each places the ACK or PACK just bumped or
+// arms its writer timer for a pending delay (b.WakeAt); the duty lane
+// st.ackLane, the fastest, is woken first by the callers. It does nothing
+// for a session that is not a race session. s.mu held.
+func (s *Session) raceWakeAckLocked() {
+	if s.p.Mode != ModeRace {
+		return
+	}
+	for _, l := range s.lanes {
+		if l.idle && s.raceAckDutyLocked(l) {
+			l.idle = false
+			l.port.Wake()
+		}
+	}
 }
 
 // raceFillDataLocked is Fill step 5 on a race data lane (M3-D30): DATA from

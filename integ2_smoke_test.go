@@ -467,11 +467,15 @@ func waitDone(t *testing.T, done <-chan struct{}, what string) {
 }
 
 // TestPacketSmoke_CA is the in-memory half: DatagramLink and DatagramHub,
-// selector and bond, 60 virtual seconds each.
+// selector and bond, 60 virtual seconds each (30 under -race).
 func TestPacketSmoke_CA(t *testing.T) {
-	rate := 10000
+	rate, duration := 10000, 60*time.Second
 	if loopbackRace {
-		rate = 1000
+		// R1-23's first lever (R2-37), as TestPacketRaceSmoke_CR: the race
+		// lane runs 30 virtual seconds (two kills) at 1,000 datagrams per
+		// second, with the same criteria (the root package's Linux race
+		// time reached the 270-s lever line at I2).
+		rate, duration = 1000, 30*time.Second
 	}
 	for _, tr := range []struct {
 		name string
@@ -482,7 +486,7 @@ func TestPacketSmoke_CA(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					n := tr.net()
 					defer n.close()
-					runSmoke(t, n, smokeRun{mode: mode, duration: 60 * time.Second, every: 10 * time.Second,
+					runSmoke(t, n, smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
 						rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				})
 			})
