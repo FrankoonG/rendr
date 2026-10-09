@@ -105,7 +105,11 @@ func (s *Session) raceFillDgramsLocked(l *lane, b *carrier.Batch) (placed bool) 
 		d := &q.desc[i]
 		n := int(d.n)
 		if nowNs-d.at > maxAge {
-			continue // stale for every lane: the head drops it
+			// Defensive: raceHeadLocked above already popped every aged
+			// head, and the descriptors behind one are younger (queued in
+			// time order), so no stale descriptor is reached here today.
+			// MaxAge's rule is the head's (TestRacePacketSkipStale_L40).
+			continue
 		}
 		if n > b.DgramRoom() {
 			if dg {
@@ -159,7 +163,10 @@ func (s *Session) raceDgramDueLocked(l *lane) bool {
 // M3-D32): each member places our FIN once, after its cursor reached the
 // queue's end and no queued datagram that may still be placed lacks its
 // seq — a datagram this lane skipped as too large may still get the next
-// seq on another lane, and the FIN's final seq must cover it.
+// seq on another lane, and the FIN's final seq must cover it. An aged
+// one never will (every lane skips it, the head drops it); the age clause
+// decides where no head step ran first — a control pass (R1-1 rule 5) and
+// the wake policy (raceDgramDueLocked).
 func (s *Session) racePktFinDueLocked(l *lane, nowNs int64) bool {
 	st, pk := &s.st, s.pk
 	q := &pk.tx

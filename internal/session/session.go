@@ -102,7 +102,7 @@ type Status struct {
 // rendr.RaceCounters; M3-D35).
 type RaceCounters struct {
 	CopyBytes uint64 // stream: payload bytes placed below another lane's cursor
-	Copies    uint64 // packet: extra placements of datagrams another lane already placed
+	Copies    uint64 // packet: extra placements of datagrams another lane already placed, less the carriers' refusals (raceRefused)
 }
 
 // PacketCounters count the datagrams of one packet session on this side

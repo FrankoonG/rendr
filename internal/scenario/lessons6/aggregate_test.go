@@ -80,9 +80,17 @@ func TestPacketBondAggregates_L32(t *testing.T) {
 		if bad != nil {
 			t.Fatalf("integrity: %v", bad)
 		}
-		ds, ps := dc.Status().Packet, pc.Status().Packet
-		if ps.Duplicates+ps.DropLate != 0 || uint64(up.arrivedCount()) != ps.Received {
-			t.Fatalf("counters: dialer %+v, passive %+v, arrived %d", *ds, *ps, up.arrivedCount())
+		// A datagram still on the link when settle returned can be counted
+		// in Received an instant before the reader records it: compare the
+		// two from one consistent reading (bounded).
+		ds := dc.Status().Packet
+		ps, arrived := pc.Status().Packet, 0
+		waitFor(t, 5*time.Second, "the reader to record every received datagram", func() bool {
+			ps, arrived = pc.Status().Packet, up.arrivedCount()
+			return uint64(arrived) == ps.Received
+		})
+		if ps.Duplicates+ps.DropLate != 0 {
+			t.Fatalf("counters: dialer %+v, passive %+v, arrived %d", *ds, *ps, arrived)
 		}
 		got := float64(delivered) / secs
 		t.Logf("offered %.0f B/s, delivered %.0f B/s (%.2f of the members' %d B/s); s %d bytes, u %d bytes; dialer %+v",

@@ -33,8 +33,9 @@ func rcTaken(t *testing.T, b *carrier.Batch, payload int) {
 
 // TestFillTakenCapacity (M3-D11): a lane never places beyond its carrier's
 // Capacity − Inflight − Taken: a stream lane (selector and race; segments
-// of 16 KiB, so the soft cap is exact) and a packet session's stream lane,
-// each after another view placed payload in the same batch.
+// of 16 KiB, so the soft cap is exact) and a packet session's stream lane
+// (selector's and race's), each after another view placed payload in the same
+// batch.
 func TestFillTakenCapacity(t *testing.T) {
 	for _, mode := range []Mode{ModeSelector, ModeRace} {
 		s := rcSenderMode(stOpt{window: 4 << 20, segment: 16 << 10}, mode)
@@ -88,6 +89,31 @@ func TestFillTakenCapacity(t *testing.T) {
 	}
 	b.ReleaseRefs()
 	dpEnd(ps, errClosed)
+
+	// A packet race session's stream lane (its own cursor, M3-D32): the
+	// same share, and at it the lane marks the batch cap-blocked and
+	// itself (capMarked), so the PONG that frees capacity wakes it (§4.10).
+	rs, rls, rps := rcPktSender(dpOpt{}, false)
+	rps[0].set(func(f *dpPort) { f.capacity = 10000 })
+	for i := range 20 {
+		dpWrite(t, rs, uint64(i), 1000)
+	}
+	b.Reset(time.Now())
+	rcTaken(t, b, 6000)
+	before = b.Len()
+	(*plane)(rls[0]).Fill(nil, b)
+	n = 0
+	for i := before; i < b.Len(); i++ {
+		if b.Frame(i).Header.Type == wire.TypeDgram {
+			n++
+		}
+	}
+	marked := dpLocked(rs, func(*stream, *packet) bool { return rls[0].capMarked })
+	if n != 4 || !b.CapBlocked() || !marked {
+		t.Fatalf("race packet stream lane placed %d datagrams (want 4), cap-blocked %v, capMarked %v", n, b.CapBlocked(), marked)
+	}
+	b.ReleaseRefs()
+	dpEnd(rs, errClosed)
 }
 
 // TestFillQuotaZeroKeepsIdle (R1-1 rule 5): a lane with DATA (or datagrams)

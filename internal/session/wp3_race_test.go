@@ -359,7 +359,8 @@ func TestRaceUniqueAccounting_L35(t *testing.T) {
 }
 
 // TestRaceBondAccountingProperty_L35: over random member counts, write
-// patterns and capacity limits, the receiver's unique delivered bytes are
+// patterns, capacity limits and payload quotas (copies cut at other
+// boundaries than the first copy's), the receiver's unique delivered bytes are
 // exactly the first deliveries — the sum over members of the bytes each
 // delivered first — for race and bond alike; the payload beyond the unique
 // bytes is the receiver's DupBytes, which equals the race sender's
@@ -394,6 +395,11 @@ func TestRaceBondAccountingProperty_L35(t *testing.T) {
 				for _, i := range rng.Perm(links) {
 					b := p.batch
 					b.Reset(time.Now())
+					if rng.IntN(2) == 0 {
+						// A payload quota (as a MUX writer's) cuts this
+						// member's segments elsewhere than the others'.
+						b.SetQuota(1 + rng.IntN(40<<10))
+					}
 					p.al[i].Fill(nil, b)
 					for k := range b.Len() {
 						f := b.Frame(k)
@@ -610,4 +616,182 @@ func TestRaceFinPerMember(t *testing.T) {
 		t.Fatalf("member 1 placed the FIN again: %v", fs)
 	}
 	p.close(t)
+
+	// A member places the FIN only once its own cursor reached it: the
+	// slow member (16 KiB of capacity) places none while its DATA is short
+	// of the end, though the fast member's cursor (sNext) is past it.
+	p = rcPair(2, stOpt{segment: 16 << 10}, stOpt{})
+	rcWrite(t, p.a, data)
+	if err := p.a.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	fs, b = stFill(p.al[0], time.Now())
+	b.ReleaseRefs()
+	if stCount(fs, wire.TypeFin) != 1 {
+		t.Fatalf("premise: the fast member placed %v", fs)
+	}
+	p.ap[1].set(func(f *stPort) { f.capacity = 16 << 10 })
+	fs, b = stFill(p.al[1], time.Now())
+	b.ReleaseRefs()
+	if _, n := rcDataSpan(fs); n != 16<<10 || stCount(fs, wire.TypeFin) != 0 {
+		t.Fatalf("the slow member at 16 KiB of 40 KiB placed %d DATA bytes and %d FINs, want 16 KiB and none", n, stCount(fs, wire.TypeFin))
+	}
+	p.ap[1].set(func(f *stPort) { f.capacity = 1 << 30 })
+	fs, b = stFill(p.al[1], time.Now())
+	b.ReleaseRefs()
+	if _, n := rcDataSpan(fs); n != 24<<10 || stCount(fs, wire.TypeFin) != 1 {
+		t.Fatalf("the slow member's rest: %d DATA bytes and %d FINs, want 24 KiB and one", n, stCount(fs, wire.TypeFin))
+	}
+	p.close(t)
+}
+
+// TestRaceDupPartialOverlap_L35: copies cut differently from the first
+// copy count exactly their already-held bytes in DupBytes (M3-D35) — the
+// part the application read (dropped uncompared), the unread in-order
+// part and the part over an out-of-order segment still held — and only
+// their new bytes as unique, so the payload delivered is the unique bytes
+// plus DupBytes; the stream reads every byte once.
+func TestRaceDupPartialOverlap_L35(t *testing.T) {
+	s, l1, l2 := rcRecv(ModeRace)
+	d := stPattern(0, 96<<10)
+	payload := 0
+	deliver := func(l *lane, from, to int) {
+		t.Helper()
+		if err := stDeliverData(l, uint64(from), d[from:to]); err != nil {
+			t.Fatalf("[%d, %d): %v", from, to, err)
+		}
+		payload += to - from
+	}
+	// RxBytes counts in-order bytes: held out-of-order bytes join it
+	// when the gap before them fills.
+	check := func(what string, dup, rx, held uint64) {
+		t.Helper()
+		st := s.Status()
+		if st.DupBytes != dup || st.RxBytes != rx || uint64(payload) != st.RxBytes+held+st.DupBytes {
+			t.Fatalf("%s: DupBytes %d RxBytes %d (payload %d); want %d and %d", what, st.DupBytes, st.RxBytes, payload, dup, rx)
+		}
+	}
+	deliver(l1, 0, 48<<10)
+	deliver(l1, 64<<10, 80<<10) // held out of order
+	if got := stReadN(t, s, 16<<10); !bytes.Equal(got, d[:16<<10]) {
+		t.Fatal("integrity")
+	}
+	check("first copies", 0, 48<<10, 16<<10)
+	// [8 KiB, 72 KiB): 8 KiB read, 32 KiB unread in order, 16 KiB new and
+	// 8 KiB over the held segment.
+	deliver(l2, 8<<10, 72<<10)
+	check("a copy over read, unread, missing and held bytes", 48<<10, 80<<10, 0)
+	// [76 KiB, 96 KiB): 4 KiB in order (the held segment merged), 16 KiB new.
+	deliver(l2, 76<<10, 96<<10)
+	check("a copy past the in-order end", 52<<10, 96<<10, 0)
+	if got := stReadN(t, s, 80<<10); !bytes.Equal(got, d[16<<10:]) {
+		t.Fatal("integrity: the stream did not read every byte once")
+	}
+	if st := s.Status(); st.DeliveredBytes != 96<<10 {
+		t.Fatalf("DeliveredBytes %d, want 96 KiB", st.DeliveredBytes)
+	}
+	stEnd(s, errClosed)
+}
+
+// TestRaceAckDutyQualifies (M3-D33): the race ACK duty skips a lane that
+// is write-blocked or leaving (Retire called) even when it is the fastest,
+// falls back to M1's choice (a lane keeps the duty) when every lane is
+// leaving, and between equal SRTTs takes the lower factory index over the
+// attach order.
+func TestRaceAckDutyQualifies(t *testing.T) {
+	s, slow, fast := rcRecv(ModeRace)
+	ps, pf := slow.port.(*stPort), fast.port.(*stPort)
+	ps.set(func(f *stPort) { f.srtt = 80 * time.Millisecond })
+	pf.set(func(f *stPort) { f.srtt = 5 * time.Millisecond })
+	duty := func() *lane {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.ackBumpForTest()
+		return s.st.ackLane
+	}
+	name := func(l *lane) string {
+		switch l {
+		case slow:
+			return "the 80-ms lane"
+		case fast:
+			return "the 5-ms lane"
+		}
+		return "no lane"
+	}
+	want := func(what string, l *lane) {
+		t.Helper()
+		if got := duty(); got != l {
+			t.Fatalf("%s: the duty is on %s, want %s", what, name(got), name(l))
+		}
+	}
+	retire := func(l *lane, on bool) {
+		s.mu.Lock()
+		l.retireCalled = on
+		s.mu.Unlock()
+	}
+	want("known SRTTs", fast)
+	pf.set(func(f *stPort) { f.blocked = true })
+	want("the fast lane write-blocked", slow)
+	pf.set(func(f *stPort) { f.blocked = false })
+	want("unblocked", fast)
+	retire(fast, true)
+	want("the fast lane retiring", slow)
+	retire(slow, true)
+	if duty() == nil {
+		t.Fatal("every lane retiring: M1's fallback must keep a lane on the duty")
+	}
+	retire(fast, false)
+	retire(slow, false)
+	ps.set(func(f *stPort) { f.srtt = 5 * time.Millisecond })
+	s.mu.Lock()
+	slow.factory, fast.factory = 1, 0
+	s.mu.Unlock()
+	want("equal SRTTs, factory 0 attached second", fast)
+	stEnd(s, errClosed)
+}
+
+// TestRaceRequeueBelowLiveCursor (M3-D30): spans a dead member's requeue
+// put back below a live member's cursor are bytes that member already sent;
+// its next Fill sends new bytes from its cursor, neither stalling at the
+// requeued span nor flagging new bytes as retransmissions. The rows: the
+// dead member was behind the live one's cursor, or exactly at it. (Until
+// WP4's death rule M2's requeue runs on any member's death; afterwards
+// nothing is requeued while a data lane lives, and the rows still hold.)
+func TestRaceRequeueBelowLiveCursor(t *testing.T) {
+	for _, bSent := range []int{64 << 10, 128 << 10} {
+		s := rcSender(stOpt{window: 4 << 20, segment: 16 << 10})
+		a, _ := stAddLane(s, 1, true)
+		b, bp := stAddLane(s, 2, true)
+		rcRaceLanes(s)
+		rcWrite(t, s, stPattern(0, 128<<10))
+		fa, ba := stFill(a, time.Now())
+		ba.ReleaseRefs()
+		if _, n := rcDataSpan(fa); n != 128<<10 {
+			t.Fatalf("premise: a sent %d bytes", n)
+		}
+		bp.set(func(f *stPort) { f.capacity = int64(bSent) })
+		fb, bb := stFill(b, time.Now())
+		bb.ReleaseRefs()
+		if _, n := rcDataSpan(fb); n != bSent {
+			t.Fatalf("premise: b sent %d bytes, want %d", n, bSent)
+		}
+		stKillLane(s, b)
+		rcWrite(t, s, stPattern(128<<10, 64<<10))
+		fs, bf := stFill(a, time.Now())
+		bf.ReleaseRefs()
+		retx := 0
+		for _, f := range fs {
+			if f.typ == wire.TypeData && f.retx {
+				retx += f.n
+			}
+		}
+		if first, n := rcDataSpan(fs); first != 128<<10 || n != 64<<10 || retx != 0 {
+			t.Fatalf("b sent %d: a's next Fill sent %d bytes from %d (%d flagged retransmission), want 64 KiB of new bytes from 128 KiB",
+				bSent, n, first, retx)
+		}
+		if st := s.Status(); st.RetransmittedBytes != 0 {
+			t.Fatalf("b sent %d: RetransmittedBytes %d, want 0", bSent, st.RetransmittedBytes)
+		}
+		stEnd(s, errClosed)
+	}
 }

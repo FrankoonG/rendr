@@ -2,6 +2,7 @@ package session
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -162,6 +163,32 @@ func TestRacePacketFinCoversSkipped(t *testing.T) {
 	}
 	if fs := dpFrames(dpFill(ls[0], time.Now())); len(fs) != 1 || fs[0].typ != wire.TypeFin || fs[0].fin != 1 {
 		t.Fatalf("the small member placed %v, want FIN(1)", fs)
+	}
+	dpEnd(a, errClosed)
+
+	// An aged datagram the small member skipped never gets a seq: a
+	// control pass (quota 0, no head step before it) places the FIN once
+	// it is older than MaxAge, not before.
+	a, ls, _ = rcPktSender(dpOpt{maxAge: 100 * time.Millisecond}, true, true)
+	ls[0].port.(*dpPort).set(func(f *dpPort) { f.budget = 600 })
+	dpWrite(t, a, 1, 1000)
+	dpClose(a)
+	now := time.Now()
+	dpFill(ls[0], now).ReleaseRefs() // its cursor passes the big datagram
+	ctl := func(at time.Time) []dpFrame {
+		b := carrier.NewBatch(0)
+		b.Reset(at)
+		b.SetDatagram(600, wire.RelWindow)
+		b.SetQuota(0)
+		(*plane)(ls[0]).Fill(nil, b)
+		defer b.ReleaseRefs()
+		return dpFrames(b)
+	}
+	if fs := ctl(now.Add(50 * time.Millisecond)); len(fs) != 0 {
+		t.Fatalf("a control pass before MaxAge placed %v, want nothing (the big datagram may still take a seq)", fs)
+	}
+	if fs := ctl(now.Add(time.Second)); len(fs) != 1 || fs[0].typ != wire.TypeFin || fs[0].fin != 0 {
+		t.Fatalf("a control pass after MaxAge placed %v, want FIN(0)", fs)
 	}
 	dpEnd(a, errClosed)
 }
@@ -365,4 +392,163 @@ func TestRaceFillZeroAllocs_L41_L54(t *testing.T) {
 		}
 	}
 	dpEnd(ps, errClosed)
+}
+
+// TestRaceWakeEveryMember (M3-D30, R1-29): every race member places every
+// datagram, so one WriteTo wakes every idle member that is not
+// write-blocked, not only the selector's or the first data lane; a member
+// whose cursor is at the queue's end is passed by a wake until its FIN is
+// due.
+func TestRaceWakeEveryMember(t *testing.T) {
+	a, ls, ps := rcPktSender(dpOpt{}, true, true, true)
+	ps[1].set(func(f *dpPort) { f.blocked = true })
+	a.mu.Lock()
+	for _, l := range ls {
+		l.idle = true
+	}
+	a.mu.Unlock()
+	wakes := func() (w [3]int) {
+		for i, p := range ps {
+			w[i] = p.wakeCount()
+		}
+		return w
+	}
+	w0 := wakes()
+	dpWrite(t, a, 1, 200)
+	if w := wakes(); w[0]-w0[0] != 1 || w[1] != w0[1] || w[2]-w0[2] != 1 {
+		t.Fatalf("one WriteTo woke the members %v times, want once each but the write-blocked member 1", [3]int{w[0] - w0[0], w[1] - w0[1], w[2] - w0[2]})
+	}
+	// Member 0 places the datagram and goes idle: a wake with nothing due
+	// for it passes it; the FIN is due once the session closes.
+	dpIdle(ls[0])
+	w0 = wakes()
+	a.mu.Lock()
+	a.pktWakeDataLocked(time.Now())
+	a.mu.Unlock()
+	if w := wakes(); w[0] != w0[0] {
+		t.Fatal("a wake woke member 0 with its cursor at the end and no FIN due")
+	}
+	dpClose(a)
+	if w := wakes(); w[0]-w0[0] != 1 {
+		t.Fatalf("Close woke member 0 %d times, want once (its FIN is due)", w[0]-w0[0])
+	}
+	dpEnd(a, errClosed)
+}
+
+// TestRacePacketPlacedNotDropped (M3-D32, §A6.4): the slow member holds the
+// tx head, so datagrams the fast member placed leave the queue by eviction
+// (a full Packet.Queue), by ageing at WriteTo and at the session's end; on
+// none of these paths does a placed datagram count as a drop, while every
+// never-placed one does, and the send-side identity accepted = Sent +
+// drops + queued unplaced holds throughout.
+func TestRacePacketPlacedNotDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const size = 1000
+		a, ls, _ := rcPktSender(dpOpt{queue: 16 << 10, maxAge: 100 * time.Millisecond}, true, true)
+		accepted := 0
+		write := func() {
+			t.Helper()
+			dpWrite(t, a, uint64(accepted), size)
+			accepted++
+		}
+		identity := func(what string) PacketCounters {
+			t.Helper()
+			unplaced := dpLocked(a, func(_ *stream, pk *packet) (n int) {
+				q := &pk.tx
+				for p := q.pos; p < q.pos+uint64(q.n); p++ {
+					if q.seq == nil || q.seq[q.raceIdx(p)] == 0 {
+						n++
+					}
+				}
+				return n
+			})
+			c := dpCtr(a)
+			if got := c.Sent + c.DropQueue + c.DropAge + c.DropTooLarge + c.DropNoPath + uint64(unplaced); got != uint64(accepted) {
+				t.Fatalf("%s: Sent + drops + %d unplaced queued = %d, want %d accepted (%+v)", what, unplaced, got, accepted, c)
+			}
+			return c
+		}
+		// Eviction: each datagram placed by member 0 before the next
+		// WriteTo; the queue (about 16 datagrams) overflows many times.
+		for range 64 {
+			write()
+			dpFill(ls[0], time.Now()).ReleaseRefs()
+		}
+		if _, n := rcTx(a); n == 0 || n >= 64 {
+			t.Fatalf("premise: %d datagrams queued, want the queue full and evicting", n)
+		}
+		if c := identity("placed, evicted"); c.DropQueue != 0 || c.Sent != 64 {
+			t.Fatalf("evicted placed datagrams: %+v, want Sent 64 and DropQueue 0", c)
+		}
+		// Never placed: evicted by the next ones, counted.
+		for range 24 {
+			write()
+		}
+		if c := identity("unplaced, evicted"); c.DropQueue == 0 {
+			t.Fatalf("never-placed datagrams were evicted uncounted: %+v", c)
+		}
+		before := dpCtr(a).DropQueue
+		// Ageing at WriteTo: everything queued placed, then two unplaced
+		// ones; after MaxAge the next WriteTo ages them all out.
+		dpFill(ls[0], time.Now()).ReleaseRefs()
+		write()
+		write()
+		time.Sleep(200 * time.Millisecond)
+		write()
+		if c := identity("aged at WriteTo"); c.DropAge != 2 || c.DropQueue != before {
+			t.Fatalf("ageing at WriteTo: %+v, want DropAge 2 (the unplaced) and DropQueue %d", c, before)
+		}
+		// The end: one placed, three unplaced still queued.
+		dpFill(ls[0], time.Now()).ReleaseRefs()
+		write()
+		write()
+		write()
+		dpEnd(a, errClosed)
+		if c := identity("the end"); c.DropQueue != before+3 {
+			t.Fatalf("the end: DropQueue %d, want %d + the 3 never placed", c.DropQueue, before)
+		}
+	})
+}
+
+// TestRacePacketRefusedCopies_L35 (M3-D35, R1-31): a race member's
+// transport refusing its placements as too large (an MTU shrink, L37) is
+// charged to the copies first — the other member's placement went out —
+// so the datagrams stay Sent; only refusals beyond every copy (both
+// members refused) move from Sent to DropTooLarge; Sent + DropTooLarge is
+// unchanged.
+func TestRacePacketRefusedCopies_L35(t *testing.T) {
+	a, ls, _ := rcPktSender(dpOpt{}, true, true)
+	for i := range 4 {
+		dpWrite(t, a, uint64(i), 300)
+	}
+	for _, l := range ls {
+		dpFill(l, time.Now()).ReleaseRefs()
+	}
+	if st := a.Status(); st.Packet.Sent != 4 || st.Race.Copies != 4 {
+		t.Fatalf("premise: Sent %d Copies %d", st.Packet.Sent, st.Race.Copies)
+	}
+	for _, tc := range []struct {
+		refused, sent, tooLarge, copies uint64
+	}{
+		{0, 4, 0, 4},
+		{3, 4, 0, 1}, // one member refused three copies
+		{4, 4, 0, 0}, // one member refused every placement
+		{6, 2, 2, 0}, // both refused two datagrams
+	} {
+		var sn statusSnap // the actor's published refusals of dead carriers (R1-31)
+		if cur := a.snap.Load(); cur != nil {
+			sn = *cur
+		}
+		sn.refusedGone = tc.refused
+		a.snap.Store(&sn)
+		st := a.Status()
+		if st.Packet.Sent != tc.sent || st.Packet.DropTooLarge != tc.tooLarge || st.Race.Copies != tc.copies {
+			t.Fatalf("refused %d: Sent %d DropTooLarge %d Copies %d, want %d, %d, %d",
+				tc.refused, st.Packet.Sent, st.Packet.DropTooLarge, st.Race.Copies, tc.sent, tc.tooLarge, tc.copies)
+		}
+		if st.Packet.Sent+st.Packet.DropTooLarge != 4 {
+			t.Fatalf("refused %d: Sent + DropTooLarge = %d, want 4", tc.refused, st.Packet.Sent+st.Packet.DropTooLarge)
+		}
+	}
+	dpEnd(a, errClosed)
 }
