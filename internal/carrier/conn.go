@@ -187,6 +187,10 @@ type joinState struct {
 	readerExit chan struct{}
 	// onDone is rung once when Done closes (OnDone, R1-7).
 	onDone Doorbell
+	// trunkDone runs once, on a goroutine of its own, when the trunk's
+	// Done (TrunkDone) closes (OnTrunkDone, the passive owner's
+	// bookkeeping, M3-D22).
+	trunkDone func()
 }
 
 // newConn returns an unstarted carrier over nc: view 1 of a new trunk
@@ -954,6 +958,13 @@ func (c *Conn) maybeDoneLocked() bool {
 	if b := j.onDone; b != nil {
 		j.onDone = nil
 		b.Ring()
+	}
+	// The owner's hook runs on a goroutine of its own, which lives only
+	// from the trunk's Done to the hook's end: it may take the owner's
+	// locks, and starting it does not block under this leaf lock.
+	if f := j.trunkDone; f != nil {
+		j.trunkDone = nil
+		go f()
 	}
 	return true
 }

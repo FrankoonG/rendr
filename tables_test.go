@@ -419,6 +419,55 @@ func TestSessionTableCategories(t *testing.T) {
 	}
 }
 
+// TestSessionTableCountsOneSnapshot (SessionCounts: the categories' sum is
+// the number of live sessions): a session that moves between categories
+// while Status reads the counts is counted exactly once. The move is made
+// deterministic by running it inside counts, between the read of Open and
+// the other categories: orphaned → open (the passive's rejoin after a
+// no-path episode) and open → orphaned. Observed before the change, on the
+// pool's race lane (TestRelaySpliceRealTCP_L43/mux/switch): four rejoining
+// sessions counted as three. A move in progress or finished during the
+// read sends counts round again; a stream of moves never blocks it.
+func TestSessionTableCountsOneSnapshot(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		tab := newSessionTable[*tblSess](4)
+		k, s := tblKey(1), &tblSess{id: 1}
+		admitPassive(t, tab, k, s, time.Minute, tblNow)
+		tab.opened(k, s)
+		tab.setOrphaned(k, s, !on)
+		moved := 0
+		tab.countsRead = func() {
+			if moved == 0 {
+				tab.setOrphaned(k, s, on)
+			}
+			moved++
+		}
+		c := tab.counts(tblNow)
+		if moved == 0 {
+			t.Fatal("the move did not run inside counts (stimulus)")
+		}
+		if sum := c.Open + c.Pending + c.Lingering + c.Orphaned; sum != 1 {
+			t.Fatalf("orphaned %v → %v during the read: counts %+v sum to %d, want the one live session", !on, on, c, sum)
+		}
+		want := SessionCounts{Open: 1}
+		if on {
+			want = SessionCounts{Orphaned: 1}
+		}
+		if c != want {
+			t.Fatalf("counts %+v after the move, want %+v", c, want)
+		}
+		// Moves that never stop: counts still returns (bounded retries).
+		state := on
+		tab.countsRead = func() { state = !state; tab.setOrphaned(k, s, state); moved++ }
+		before := moved
+		tab.counts(tblNow)
+		if n := moved - before; n != countsTries {
+			t.Fatalf("counts read %d times under continuous moves, want its bound %d", n, countsTries)
+		}
+		tab.countsRead = nil
+	}
+}
+
 // TestSessionTableDialerPlaceholder checks the dialer's opening-phase
 // races: the session's own end may come before or after Peer.Dial attaches
 // it, and Dial's failure path may race the session's end; in every order

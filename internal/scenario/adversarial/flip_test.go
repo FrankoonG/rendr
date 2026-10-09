@@ -67,6 +67,11 @@ var regions = []region{
 // migrate); on a datagram trunk the REL that carries the first session's
 // DETACH is dropped, counted and retransmitted.
 func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
+	row := 0 // the row's index, which picks its setups in the race lane (flipSetups)
+	setupsOf := func(ss []setup) []setup {
+		row++
+		return flipSetups(ss, row)
+	}
 	stream := []struct {
 		name string
 		dir  rendrtest.Dir
@@ -79,7 +84,7 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	for _, f := range stream {
 		for _, r := range regions {
 			t.Run("stream/"+f.name+"/"+r.name, func(t *testing.T) {
-				eachSetup(t, func(t *testing.T, s setup) {
+				eachSetupOf(t, setupsOf(setups()), func(t *testing.T, s setup) {
 					runStream(t, s, streamAttack{dir: f.dir, typ: f.typ, sch: f.typ == rendrtest.FrameSched,
 						arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.FlipBit(f.dir, rendrtest.NextOfType(f.typ), r.bit) },
 						ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
@@ -90,7 +95,7 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	}
 	for _, r := range regions {
 		t.Run("stream/DETACH/"+r.name, func(t *testing.T) {
-			eachSetupOf(t, muxSetups(), func(t *testing.T, s setup) {
+			eachSetupOf(t, setupsOf(muxSetups()), func(t *testing.T, s setup) {
 				runStream(t, s, streamAttack{dir: rendrtest.Up, typ: rendrtest.FrameDetach, detach: true,
 					arm: func(tm *rendrtest.Tamper, _ *pair) {
 						tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDetach), r.bit)
@@ -102,7 +107,7 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	}
 	for _, r := range regions {
 		t.Run("stream/DGRAM/"+r.name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
+			eachSetupOf(t, setupsOf(setups()), func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
 		})
 	}
 	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel, wire.TypeDetach} {
@@ -112,10 +117,29 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 		}
 		for _, r := range regions {
 			t.Run("datagram/"+typ.String()+"/"+r.name, func(t *testing.T) {
-				eachSetupOf(t, ss, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
+				eachSetupOf(t, setupsOf(ss), func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
 			})
 		}
 	}
+}
+
+// flipSetups returns the setups row i of the bit-flip matrix runs against:
+// all of ss, and in the race lane a third of them (R1-23 lever 1, I3: the
+// matrix took 92 s of the Linux race-unit pass), rotating with the row so
+// that every setup meets every frame kind and, across the kinds, every
+// region. Each row keeps its criteria; the non-race lane and the pool's
+// sweep lane run the whole matrix.
+func flipSetups(ss []setup, i int) []setup {
+	if !raceEnabled {
+		return ss
+	}
+	var out []setup
+	for j, s := range ss {
+		if (i+j)%3 == 0 {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // packetRate is the rows' packet rate (datagrams per second, 1000 bytes).

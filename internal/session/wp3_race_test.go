@@ -369,6 +369,9 @@ func TestRaceUniqueAccounting_L35(t *testing.T) {
 // CopyBytes when every copy arrives, and is 0 in bond; no member and no
 // counter ever exceeds the application's written bytes.
 func TestRaceBondAccountingProperty_L35(t *testing.T) {
+	// midFront counts, per mode, the acknowledgements between two members'
+	// Fills that moved the sender's acknowledged front (stimulus).
+	midFront := map[Mode]int{}
 	for seed := range uint64(40) {
 		rng := rand.New(rand.NewPCG(seed, 7))
 		mode := ModeRace
@@ -392,9 +395,30 @@ func TestRaceBondAccountingProperty_L35(t *testing.T) {
 			n := 1 + rng.IntN(96<<10)
 			rcWrite(t, p.a, stPattern(written, n))
 			written += uint64(n)
+			// ack is the receiver's acknowledgement: it reads what it can
+			// and acknowledges on every link (a race ACK leaves on every
+			// member, PA-33 as amended), in random order; the sender frees
+			// capacity as the ACKs arrive.
+			ack := func() (moved int) {
+				if k := stLocked(p.b, func(st *stream) uint64 { return st.rTail - st.rRead }); k > 0 {
+					stReadN(t, p.b, int(k))
+				}
+				for _, i := range rng.Perm(links) {
+					moved += p.stepAck(i)
+					p.ap[i].set(func(f *stPort) { f.inflight = 0 })
+				}
+				return moved
+			}
 			for round := 0; round < 64; round++ {
 				moved := 0
-				for _, i := range rng.Perm(links) {
+				// The acknowledgement comes once inside the round, after a
+				// member chosen at random — between two members' Fills, as
+				// a duty lane's ACK can: it frees capacity and moves the
+				// acknowledged front (bond's sBase, race's cursor clamp)
+				// between them — and once after the round, so that race
+				// still copies when no ACK comes between the Fills.
+				ackAfter := rng.IntN(links)
+				for j, i := range rng.Perm(links) {
 					b := p.batch
 					b.Reset(time.Now())
 					if rng.IntN(2) == 0 {
@@ -420,20 +444,15 @@ func TestRaceBondAccountingProperty_L35(t *testing.T) {
 					}
 					moved += b.Len()
 					b.ReleaseRefs()
+					if j == ackAfter {
+						acked := p.a.Status().AckedBytes
+						moved += ack()
+						if j < links-1 && p.a.Status().AckedBytes > acked {
+							midFront[mode]++
+						}
+					}
 				}
-				// The receiver reads what it can and acknowledges on every
-				// link after the round (a race ACK leaves on every member,
-				// PA-33 as amended: acknowledged between two members' Fills,
-				// the front would pass the next member's cursor before it
-				// copied anything); the sender frees capacity as the ACKs
-				// arrive.
-				if k := stLocked(p.b, func(st *stream) uint64 { return st.rTail - st.rRead }); k > 0 {
-					stReadN(t, p.b, int(k))
-				}
-				for _, i := range rng.Perm(links) {
-					moved += p.stepAck(i)
-					p.ap[i].set(func(f *stPort) { f.inflight = 0 })
-				}
+				moved += ack()
 				if moved == 0 {
 					break
 				}
@@ -465,6 +484,9 @@ func TestRaceBondAccountingProperty_L35(t *testing.T) {
 			t.Fatalf("seed %d race: the sender's CopyBytes %d ≠ the receiver's DupBytes %d (every copy arrived)", seed, sa.Race.CopyBytes, sb.DupBytes)
 		}
 		p.close(t)
+	}
+	if midFront[ModeRace] == 0 || midFront[ModeBond] == 0 {
+		t.Fatalf("acknowledgements between two members' Fills that moved the front: %v, want some in both modes (stimulus)", midFront)
 	}
 }
 

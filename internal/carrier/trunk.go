@@ -125,7 +125,6 @@ type trunk struct {
 	refusals  []refusal        // passive: queued refusal answers for handles that never became views (R1-4)
 	refHead   int              // ring position of the oldest queued answer
 	refN      int              // queued answers (counted with the views against MuxMaxViews)
-	cursor    int              // the writer's rotating DRR start (M3-D10)
 	listener  any              // passive: the root's record of the Listener that accepted the trunk (opaque here; admission uses its queues, §A5.6)
 	viewDone  func(*Conn)      // dialer: the pool's view-count hook, called once per view at its Done (onViewDone)
 

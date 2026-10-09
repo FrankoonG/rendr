@@ -276,9 +276,10 @@ type trunkRec struct {
 
 // addTrunk registers the passive MUX trunk of view 1 c, accepted by ln, in
 // the trunk set — before its session starts it, so the first OPEN or JOIN
-// for a new handle on it finds its record — and starts its watcher, a
-// member of rt.trk joined by Runtime.Close (L52). A trunk is registered
-// once.
+// for a new handle on it finds its record — and registers its end
+// (trunkDone) at the trunk's Done, a member of rt.trk joined by
+// Runtime.Close (L52). No goroutine waits for the Done: a passive trunk
+// costs its reader and writer only (F44). A trunk is registered once.
 func (rt *Runtime) addTrunk(c *carrier.Conn, ln *Listener) {
 	rec := &trunkRec{rt: rt, c: c, ln: ln, inst: InstanceID(c.PeerInstance())}
 	rt.mu.Lock()
@@ -291,14 +292,14 @@ func (rt *Runtime) addTrunk(c *carrier.Conn, ln *Listener) {
 	rt.mu.Unlock()
 	c.SetOwnerTag(rec)
 	c.OnViewEnd(func(*carrier.Conn) { rec.viewEnded() })
-	go rt.watchTrunk(rec)
+	c.OnTrunkDone(func() { rt.trunkDone(rec) })
 }
 
-// watchTrunk removes a passive trunk from the set at its Done and frees
-// what its zero-view bound held.
-func (rt *Runtime) watchTrunk(rec *trunkRec) {
+// trunkDone runs at a passive trunk's Done (carrier OnTrunkDone, on a
+// goroutine of its own): it removes the trunk from the set and frees what
+// its zero-view bound held.
+func (rt *Runtime) trunkDone(rec *trunkRec) {
 	defer rt.trk.done(nil)
-	<-rec.c.TrunkDone()
 	rec.mu.Lock()
 	rec.done = true
 	rec.gen++

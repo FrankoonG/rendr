@@ -446,7 +446,9 @@ func advRows(t *testing.T, size int64, mux bool) {
 			}
 		}
 		advUntil(t, "no handshake left on the passive", func() bool { return n.p.Status().Handshakes == 0 })
-		if st, sc := n.p.Status(), n.p.Status().Sessions; sc.Open+sc.Orphaned+sc.Lingering != k || sc.Pending != 0 || st.AcceptBacklog != [2]int{} {
+		// One snapshot: the sessions rejoin meanwhile (orphaned → open),
+		// and Status counts each of them exactly once (SessionCounts).
+		if st := n.p.Status(); st.Sessions.Open+st.Sessions.Orphaned+st.Sessions.Lingering != k || st.Sessions.Pending != 0 || st.AcceptBacklog != [2]int{} {
 			t.Fatalf("the passive kept state from the fresh connection: %+v", st)
 		}
 		advWaitAll(t, fs, "the transfer across the switch")

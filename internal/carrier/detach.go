@@ -80,11 +80,14 @@ func (t *trunk) abandonLocked(v *Conn, r wire.DetachReason, p *postList) {
 		if v.vx.needResp.Load() && !v.vx.peerDet.Load() {
 			// The dialer awaits a response for this handle: answer it
 			// before the handle ends (a refusal, no DETACH, M3-D7). The
-			// code is CodeBacklog, not CodeMuxFull: the trunk is not
-			// full, and CodeMuxFull would mark it unusable at the dialer.
+			// code is CodeCarriers, which the dialer retries: the view
+			// ends because its carrier or its session's carrier part
+			// ends, not because the backlog is full (CodeBacklog, which
+			// a dialer may take as terminal), and CodeMuxFull would mark
+			// a trunk unusable that is not full (m3 BACKLOG, I3).
 			typ := respTypeOf(v.vx.first)
 			v.vx.last = &lastFrame{t: typ}
-			v.vx.last.p = refusalPayload(typ, wire.StatusCapacity, wire.CodeBacklog)
+			v.vx.last.p = refusalPayload(typ, wire.StatusCapacity, wire.CodeCarriers)
 			v.vx.detQ = true
 			t.ms.lasts = append(t.ms.lasts, v)
 			t.markWorkLocked()

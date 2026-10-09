@@ -27,10 +27,10 @@ import (
 // carrier and the verdict reaches it there (m3 BACKLOG, FINDING C of the
 // G6 mixed-NAT case: rejected sessions on live MUX trunks were answered
 // CAPACITY code 2 while the passive's backlog held 13 to 28 of 128).
-// The session never answers CodeBacklog in place of a verdict; the one
-// remaining exception is the carrier's fallback refusal of a view killed
-// with its verdict still unplaced (abandonLocked at the close bound), an
-// open item of the carrier's view-end code.
+// The session never answers CodeBacklog in place of a verdict, and neither
+// does the carrier: its fallback refusal of a view killed with its verdict
+// still unplaced (abandonLocked at the close bound) carries CodeCarriers,
+// which the dialer retries (TestPendingVerdictUnplacedAtCloseBy_L48).
 // Helpers of these tests start with "bk".
 
 // bkGate holds the passive's MUX writer in its AfterViewFill hook at the
