@@ -29,9 +29,13 @@ import (
 // once. A published trunk leaves the pool when its view count reaches
 // zero: it is sealed and retired with CLOSE (§A5.9); its other ends (a
 // dead trunk) leave the same way, as each view's Done closes. The pool
-// tracks every fresh trunk until the trunk's Done (Wait joins them) without
-// a goroutine of its own beside a published trunk: a pooled trunk costs its
-// reader and writer, as any carrier (F44).
+// counts every fresh trunk until the trunk's Done (Wait joins them) without
+// a goroutine of its own beside a published trunk — a pooled trunk costs
+// its reader and writer, as any carrier (F44) — and keeps no reference to
+// a trunk past its Done: the pool's goroutine of a fresh trunk lives until
+// the trunk is settled (published) or, for a trunk that is discarded or
+// retired unpublished, until its Done; the view hook that retires a
+// published trunk at its last view waits for the trunk's Done.
 //
 // Locks: mu is per Pool and never taken under a session lock, Conn.mu or
 // trunk.mx; it may take the trunk's leaf locks trunk.mx (allocating a
@@ -42,22 +46,25 @@ type Pool struct {
 	fs  []Factory // the Peer's factory snapshot; immutable
 
 	dialTimeout time.Duration // bound of a coalesced wait (M3-D18)
+	joinStall   time.Duration // least wait of a JOIN claimant's waiters for its verdict (dialWait)
 
 	mu      sync.Mutex
 	trunks  [][]*Conn           // per factory: view 1 of each published trunk, oldest first
 	dialing []*dialWait         // per factory: the dial in flight that later attempts wait for (nil: none)
 	full    map[*trunk]bool     // published trunks that answered CAPACITY CodeMuxFull, until a view leaves (§A5.8)
 	extra   map[*Conn]*dialWait // fresh trunks of dials outside dialing (dialWait: a verdict grace ran out), until settled
-	tracked []*Conn             // view 1 of every fresh trunk whose Done may still be open (Wait; swept by sweepLocked)
-	sweepAt int                 // len(tracked) at which the next track sweeps the done ones out
-	watch   int                 // watchFresh goroutines running (one per fresh trunk until it is settled)
-	idle    chan struct{}       // Wait's: closed (and reset) when Close runs or a watcher ends
+	live    int                 // fresh trunks whose Done is still open (Wait)
+	watch   int                 // watchFresh goroutines running
+	idle    chan struct{}       // Wait's: closed (and reset) when Close runs, a trunk is done or a watcher ends
 	closed  bool
 	stats   PoolStats
 
-	// afterPick, tests only (nil in production), runs under mu between the
-	// pick and openView: the E3 window (TestPoolPickThenDeath).
+	// Tests only (nil in production). afterPick runs under mu between the
+	// pick and openView: the E3 window (TestPoolPickThenDeath). watchEnd
+	// runs in watchFresh once its trunk is settled (and, unpublished, done),
+	// before the watcher's end is counted (TestPoolWaitJoinsWatchers).
 	afterPick func(c *Conn)
+	watchEnd  func(c *Conn)
 }
 
 // dialWait is one factory's dial in flight: its waiters block on done; err
@@ -75,29 +82,39 @@ type dialWait struct {
 
 	// The claimant's path proof (WP10): proven closes when its PREFACE_ACK
 	// passed the check — the path works and only its session's verdict on
-	// handle 1 is outstanding. For an OPEN claimant (open) that verdict
-	// may wait for the passive application's Accept and Confirm, which a
-	// slow application must not let hold the other sessions' dials of the
-	// factory (Mux is the default, M3-D2): a waiter then waits for it at
-	// most grace (twice the claimant's dial and PREFACE time, at least
-	// minVerdictGrace) and, if the claimant is still inside Establish
-	// (inEst), dials on its own without a failure. An OPEN waiter's own
-	// dial leaves the claimant the factory's dial in flight (its verdict
-	// waits for the application too, which may accept the sessions in any
-	// order). A JOIN waiter's own dial takes the claimant's place as the
-	// factory's dial in flight, once per claimant: every waiter whose
-	// grace runs out after that waits for it (WP DIALSTORM). A JOIN's
-	// verdict never waits for an application — its session was confirmed
-	// when its OPEN was answered — so a slow one is a loaded passive or
-	// path: the waiters of a JOIN claimant wait for it like for the dial
-	// itself, bounded by their DialTimeout (B0.2 item 1: one dial per
-	// factory per trunk death).
+	// handle 1 is outstanding. A waiter then waits for that verdict at most
+	// grace, counted from the proof or from its own wait if later, and
+	// decides again if the claimant is still inside Establish (inEst):
+	//
+	//   - An OPEN claimant's (open) verdict may wait for the passive
+	//     application's Accept and Confirm, which a slow application must
+	//     not let hold the other sessions' dials of the factory (Mux is the
+	//     default, M3-D2): grace is twice the claimant's dial and PREFACE
+	//     time, at least minVerdictGrace. A JOIN waiter then dials in the
+	//     claimant's place as the factory's dial in flight (its verdict
+	//     waits for no application); every other waiter waits for that dial
+	//     (kick wakes them). An OPEN waiter defers to the JOIN waiters
+	//     (joins > 0), so that a trunk death costs the factory one JOIN dial
+	//     beside an OPEN claimant; with no JOIN waiting it dials beside the
+	//     claimant, which stays the factory's dial in flight (its own
+	//     verdict waits for the application too, which may accept the
+	//     sessions in any order: TestPoolVerdictGrace, E19).
+	//   - A JOIN's verdict never waits for an application — its session was
+	//     confirmed when its OPEN was answered — so a slow one is a loaded
+	//     passive or a path that broke after the PREFACE: grace is at least
+	//     joinStall (the death deadline's floor, DeadMin), far above a
+	//     load-induced delay, and then one waiter, of either kind, dials in
+	//     the claimant's place (WP DIALSTORM; B0.2 item 1: one dial per
+	//     factory per trunk death).
 	proven    chan struct{}
 	provenSet bool
 	open      bool
 	start     time.Time
 	grace     time.Duration
 	inEst     bool
+	joins     int           // JOIN attempts waiting for this dial (an OPEN waiter defers to them)
+	kick      chan struct{} // closed (and replaced) when a waiter took this dial's place or its last JOIN waiter left
+	kept      bool          // the fresh trunk was published (settle)
 }
 
 // minVerdictGrace is the least a coalesced waiter waits for the claimant's
@@ -107,7 +124,33 @@ const minVerdictGrace = 100 * time.Millisecond
 // newDialWait returns the dial of factory f an attempt with first frame
 // kind claims.
 func newDialWait(f int, kind wire.Type) *dialWait {
-	return &dialWait{done: make(chan struct{}), f: f, proven: make(chan struct{}), open: kind == wire.TypeOpen, start: time.Now(), inEst: true}
+	return &dialWait{done: make(chan struct{}), f: f, proven: make(chan struct{}), kick: make(chan struct{}),
+		open: kind == wire.TypeOpen, start: time.Now(), inEst: true}
+}
+
+// kickLocked wakes the waiters of w to decide again (a waiter took w's
+// place, or w's last JOIN waiter left).
+func (w *dialWait) kickLocked() {
+	close(w.kick)
+	w.kick = make(chan struct{})
+}
+
+// leaveLocked ends a JOIN attempt's wait for w. When the last JOIN waiter
+// leaves an OPEN claimant still in place, the OPEN waiters that deferred to
+// the JOINs decide again.
+func (p *Pool) leaveLocked(w *dialWait) {
+	w.joins--
+	if w.joins == 0 && w.open && w.inEst && p.dialing[w.f] == w {
+		w.kickLocked()
+	}
+}
+
+// ownDialLocked reports whether an attempt of kind whose verdict grace on
+// the factory's dial in flight w ran out (graceOut == w) dials now: in w's
+// place when w's claimant is a JOIN or the attempt is one, beside it when
+// it is an OPEN with no JOIN waiting (dialWait).
+func (p *Pool) ownDialLocked(w *dialWait, kind wire.Type, graceOut *dialWait) bool {
+	return w == graceOut && w.inEst && (!w.open || kind == wire.TypeJoin || w.joins == 0)
 }
 
 // timedOut reports whether a dial failed by a timeout: its DialTimeout
@@ -130,36 +173,14 @@ func (p *Pool) provenCheck(w *dialWait, check func(*wire.PrefaceAck) error) func
 		if !w.provenSet {
 			w.provenSet = true
 			w.grace = max(2*time.Since(w.start), minVerdictGrace)
-			close(w.proven)
+			if !w.open {
+				w.grace = max(w.grace, p.joinStall)
+			}
+			close(w.proven) // grace is read by the waiters after this close
 		}
 		p.mu.Unlock()
 		return nil
 	}
-}
-
-// waitVerdict waits, for a waiter of OPEN claimant w whose path was
-// proven, at most w's verdict grace for w to end. With the grace run out
-// it returns with p.mu held (locked) and reports whether the waiter dials
-// on its own (dialWait): the claimant is still inside Establish and still
-// the factory's dial in flight (no JOIN waiter took its place; the others
-// wait for that one). A claimant that returned with a fresh trunk awaits
-// only its session's Start, which is prompt: the waiter keeps waiting.
-// When w or ctx ended first it returns neither.
-func (p *Pool) waitVerdict(ctx context.Context, w *dialWait) (own, locked bool) {
-	p.mu.Lock()
-	g := w.grace
-	p.mu.Unlock()
-	t := time.NewTimer(g)
-	defer t.Stop()
-	select {
-	case <-w.done:
-		return false, false
-	case <-ctx.Done():
-		return false, false
-	case <-t.C:
-	}
-	p.mu.Lock()
-	return w.inEst && p.dialing[w.f] == w, true
 }
 
 // PoolStats are a Pool's counters (rendr.Status.Mux, dialer side).
@@ -177,6 +198,7 @@ func NewPool(env *Env, fs []Factory) *Pool {
 		env:         env,
 		fs:          append([]Factory(nil), fs...),
 		dialTimeout: env.Timing.withDefaults().DialTimeout,
+		joinStall:   env.Timing.withDefaults().DeadMin,
 		trunks:      make([][]*Conn, len(fs)),
 		dialing:     make([]*dialWait, len(fs)),
 	}
@@ -203,12 +225,13 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // is a carrier refusal without penalty: the attempt continues with a dial
 // (or a wait, or another trunk) instead of returning the refusal. A
 // coalesced wait that outlasts Timing.DialTimeout fails like an attempt
-// that hit its DialTimeout (a path failure, L20). A waiter waits for a
-// JOIN claimant's verdict as for its dial; once an OPEN claimant's path
-// was proven it waits for its verdict at most the verdict grace and then
-// dials on its own, an OPEN beside the claimant, a JOIN in the claimant's
-// place as the factory's dial in flight, which the waiters whose grace
-// runs out later wait for (dialWait; B0.2 item 1). A claimant's dial that
+// that hit its DialTimeout (a path failure, L20). Once the claimant's path
+// was proven a waiter waits for its verdict at most the verdict grace —
+// for a JOIN claimant at least joinStall — and then one waiter dials in
+// the claimant's place as the factory's dial in flight, which the others
+// wait for: a JOIN, or after a JOIN claimant's stall any waiter; an OPEN
+// waiter of an OPEN claimant defers to the JOIN waiters, and with none
+// dials beside the claimant (dialWait; B0.2 item 1). A claimant's dial that
 // timed out counts for a waiter only when it began no earlier than the
 // waiter's attempt: the timeout of an older dial says how the path was
 // when that dial was sent (into an outage that may have ended since), not
@@ -226,14 +249,22 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 	dk := sessionDataType(kind, payload)
 	begin := time.Now() // a claimant's dial timeout counts for this attempt only if the dial began no earlier
 	var (
-		skip       []*trunk    // trunks this attempt does not try again (openView failed, refused, died)
-		provenSeen *dialWait   // the dial in flight whose verdict grace this attempt already waited out
-		timer      *time.Timer // the coalesced wait's DialTimeout (from the first wait)
-		counted    bool        // Coalesced counted for this attempt
+		skip     []*trunk    // trunks this attempt does not try again (openView failed, refused, died)
+		graceOut *dialWait   // the dial in flight whose verdict grace ran out for this attempt
+		graceW   *dialWait   // the dial in flight graceEnd belongs to
+		graceEnd time.Time   // when graceW's verdict grace runs out for this attempt (zero: not proven yet)
+		joined   *dialWait   // the dial this JOIN attempt is counted a waiter of (dialWait.joins)
+		timer    *time.Timer // the coalesced wait's DialTimeout (from the first wait)
+		counted  bool        // Coalesced counted for this attempt
 	)
 	defer func() {
 		if timer != nil {
 			timer.Stop()
+		}
+		if joined != nil {
+			p.mu.Lock()
+			p.leaveLocked(joined)
+			p.mu.Unlock()
 		}
 	}()
 	for {
@@ -260,21 +291,33 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			p.releaseCID(cid)
 			return est, err
 		}
-		if w := p.dialing[f]; w != nil {
+		w := p.dialing[f]
+		if w != nil && !p.ownDialLocked(w, kind, graceOut) {
 			if !counted {
 				p.stats.Coalesced++
 				counted = true
 			}
-			proven := w.proven
-			if !w.open || w == provenSeen {
-				proven = nil // a JOIN's verdict is waited for like its dial; or its verdict grace already ran out once
+			if kind == wire.TypeJoin && joined != w {
+				if joined != nil {
+					p.leaveLocked(joined)
+				}
+				joined = w
+				w.joins++
 			}
+			var proven <-chan struct{}
+			if w != graceOut {
+				proven = w.proven // its verdict grace has not run out for this attempt
+			}
+			if graceW != w {
+				graceW, graceEnd = w, time.Time{}
+			}
+			kick := w.kick
 			p.mu.Unlock()
 			if timer == nil {
 				timer = time.NewTimer(p.dialTimeout)
 			}
-			select {
-			case <-w.done:
+			switch awaitDial(ctx, w, proven, &graceEnd, kick, timer) {
+			case waitEnded:
 				if w.release || w.err == nil {
 					continue // published (it is usable now) or released: retry at once
 				}
@@ -288,35 +331,82 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 				}
 				p.releaseCID(cid)
 				return nil, w.err
-			case <-ctx.Done():
+			case waitGrace:
+				graceOut = w
+				continue // decide again (ownDialLocked)
+			case waitKick:
+				continue // a waiter took w's place, or the JOIN waiters left: decide again
+			case waitCtx:
 				p.releaseCID(cid)
 				return nil, &EstablishError{Stage: "dial", Cause: CauseLocalClose, Err: context.Cause(ctx)}
-			case <-timer.C:
+			default: // waitTimer
 				p.releaseCID(cid)
 				return nil, &EstablishError{Stage: "dial", Cause: CauseTransportError, Err: fmt.Errorf("%w (waiting for the factory's dial in flight)", errDialTimeout)}
-			case <-proven:
-				provenSeen = w
-				own, locked := p.waitVerdict(ctx, w)
-				if !own {
-					if locked {
-						p.mu.Unlock()
-					}
-					continue // w ended, or a JOIN waiter took its place: wait for that dial
-				}
-				// The claimant's verdict is slow: dial on our own (p.mu held).
-				// A JOIN's dial takes w's place as the factory's dial in
-				// flight; w stays with its claimant (claimed puts its fresh
-				// trunk in extra).
 			}
 		}
-		w := newDialWait(f, kind)
-		if p.dialing[f] == nil || kind == wire.TypeJoin {
-			p.dialing[f] = w // an OPEN that dials beside a slow OPEN claimant leaves it in place
+		nw := newDialWait(f, kind)
+		if w == nil || !w.open || kind == wire.TypeJoin {
+			// The factory's dial in flight: the first, or in the place of a
+			// claimant whose verdict grace ran out (w keeps its claimant;
+			// claimed puts its fresh trunk in extra), whose waiters wait for
+			// this dial now. An OPEN beside a slow OPEN claimant leaves it in
+			// place.
+			p.dialing[f] = nw
+			if w != nil {
+				w.kickLocked()
+			}
+		}
+		if joined != nil {
+			p.leaveLocked(joined)
+			joined = nil
 		}
 		p.mu.Unlock()
-		est, err := Establish(ctx, p.env, fac, cid, kind, payload, p.provenCheck(w, check))
-		p.claimed(ctx, w, est, err, sess)
+		est, err := Establish(ctx, p.env, fac, cid, kind, payload, p.provenCheck(nw, check))
+		p.claimed(ctx, nw, est, err, sess)
 		return est, err
+	}
+}
+
+// waitOutcome is how a coalesced wait for a dial in flight ended.
+type waitOutcome int
+
+const (
+	waitEnded waitOutcome = iota // the dial ended: published, released or failed (dialWait.done)
+	waitGrace                    // its verdict grace ran out (dialWait)
+	waitKick                     // a waiter took its place, or its JOIN waiters left
+	waitCtx                      // the attempt's context ended
+	waitTimer                    // the coalesced wait's DialTimeout ran out
+)
+
+// awaitDial waits for dial in flight w. proven is w's path proof (nil when
+// w's verdict grace already ran out for the attempt): once it closes the
+// wait is bounded by w's grace too, which runs out at *graceEnd, set on the
+// attempt's first wait after the proof (a wait again after a kick keeps
+// it). kick is w's kick channel and timer the attempt's DialTimeout of the
+// coalesced wait.
+func awaitDial(ctx context.Context, w *dialWait, proven <-chan struct{}, graceEnd *time.Time, kick <-chan struct{}, timer *time.Timer) waitOutcome {
+	var grace <-chan time.Time
+	for {
+		select {
+		case <-w.done:
+			return waitEnded
+		case <-kick:
+			return waitKick
+		case <-proven:
+			proven = nil
+			if graceEnd.IsZero() {
+				*graceEnd = time.Now().Add(w.grace) // written before proven closed
+			}
+			g := time.NewTimer(time.Until(*graceEnd))
+			defer g.Stop()
+			grace = g.C
+		case <-grace:
+			return waitGrace
+		case <-ctx.Done():
+			return waitCtx
+		case <-timer.C:
+			return waitTimer
+		}
 	}
 }
 
@@ -468,15 +558,16 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 			c.onViewDone(func(v *Conn) { p.viewGone(f, c, v) })
 			w.fresh = c
 			if p.dialing[f] != w {
-				// An OPEN waiter's own dial, or a claimant a JOIN waiter took
-				// the place of (a verdict grace ran out): not the factory's
-				// dial in flight, but published alike.
+				// An OPEN waiter's own dial beside the claimant, or a
+				// claimant another waiter took the place of (a verdict grace
+				// ran out): not the factory's dial in flight, but published
+				// alike.
 				if p.extra == nil {
 					p.extra = make(map[*Conn]*dialWait)
 				}
 				p.extra[c] = w
 			}
-			p.trackLocked(c)
+			p.live++
 			p.watch++
 			p.mu.Unlock()
 			go p.watchFresh(w, c)
@@ -514,9 +605,10 @@ func claimantReleases(ctx context.Context, err error) bool {
 // watchFresh is the pool's goroutine of fresh trunk c while it is in
 // flight (L52: owned by the pool, joined by Wait). It settles a trunk that
 // dies before its session starts it (M3-D19: discarded, its waiters retry
-// at once) and ends once the trunk is settled — published or discarded —
-// so a published trunk runs no pool goroutine (F44: two goroutines per
-// carrier); Wait joins the trunk itself through tracked.
+// at once). It ends once the trunk is published, so a published trunk runs
+// no pool goroutine (F44: two goroutines per carrier) — its last view's
+// hook (viewGone) counts its Done — and otherwise (a trunk discarded, or
+// retired at its publication with no view left) once the trunk is done.
 func (p *Pool) watchFresh(w *dialWait, c *Conn) {
 	select {
 	case <-w.done:
@@ -524,40 +616,21 @@ func (p *Pool) watchFresh(w *dialWait, c *Conn) {
 		p.settle(w, c)
 	}
 	p.mu.Lock()
+	kept := w.kept
+	p.mu.Unlock()
+	if !kept {
+		<-c.tdone
+	}
+	if p.watchEnd != nil {
+		p.watchEnd(c)
+	}
+	p.mu.Lock()
+	if !kept {
+		p.live--
+	}
 	p.watch--
 	p.idleLocked()
 	p.mu.Unlock()
-}
-
-// trackLocked records fresh trunk c (view 1) for Wait until its Done. The
-// list is swept of done trunks whenever it doubled since the last sweep, so
-// it holds at most about twice the trunks whose Done is open (amortised
-// O(1) per trunk).
-func (p *Pool) trackLocked(c *Conn) {
-	if len(p.tracked) >= p.sweepAt {
-		p.sweepLocked()
-		p.sweepAt = max(2*len(p.tracked), 16)
-	}
-	p.tracked = append(p.tracked, c)
-}
-
-// sweepLocked drops the tracked trunks whose Done closed and returns the
-// Done of one that is still open (nil when none is).
-func (p *Pool) sweepLocked() <-chan struct{} {
-	var open <-chan struct{}
-	ts := p.tracked[:0]
-	for _, c := range p.tracked {
-		select {
-		case <-c.tdone:
-			continue
-		default:
-		}
-		ts = append(ts, c)
-		open = c.tdone
-	}
-	clear(p.tracked[len(ts):])
-	p.tracked = ts
-	return open
 }
 
 // poolStarted is called by Conn.Start on view 1 of a dialer trunk once the
@@ -601,6 +674,7 @@ func (p *Pool) settle(w *dialWait, c *Conn) {
 	if c.death.Load() == nil && c.ms.started.Load() {
 		if c.viewCount() > 0 {
 			p.trunks[w.f] = append(p.trunks[w.f], c)
+			w.kept = true // its last view's hook counts its Done (viewGone)
 		} else {
 			// Every view ended before the publication (view 1 killed or
 			// retired right after its Start): close at zero (M3-D20).
@@ -646,6 +720,15 @@ func (p *Pool) viewGone(f int, c, v *Conn) {
 	c.seal() // under mu: no openView after this point
 	p.mu.Unlock()
 	c.retireTrunk(wire.CloseRetire)
+	// The pool counts the trunk until its Done (Wait, L52): this hook's
+	// goroutine waits for it — the retirement's CLOSE exchange, bounded
+	// like any carrier's close, or a dead trunk's teardown — and so the
+	// pool keeps no reference to a trunk past its Done.
+	<-c.tdone
+	p.mu.Lock()
+	p.live--
+	p.idleLocked()
+	p.mu.Unlock()
 }
 
 // releaseCID returns the CarrierID reserved for a dial the attempt did not
@@ -674,8 +757,7 @@ func (p *Pool) Close() {
 func (p *Pool) Wait(ctx context.Context) error {
 	for {
 		p.mu.Lock()
-		open := p.sweepLocked()
-		if p.closed && open == nil && p.watch == 0 {
+		if p.closed && p.live == 0 && p.watch == 0 {
 			p.mu.Unlock()
 			return nil
 		}
@@ -685,15 +767,15 @@ func (p *Pool) Wait(ctx context.Context) error {
 		ch := p.idle
 		p.mu.Unlock()
 		select {
-		case <-ch: // Close ran, or a watcher ended (and may have tracked nothing new)
-		case <-open: // nil when every tracked trunk is done
+		case <-ch: // Close ran, a trunk is done or a watcher ended
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		}
 	}
 }
 
-// idleLocked wakes Wait to look again (Close ran, or a watcher ended).
+// idleLocked wakes Wait to look again (Close ran, a trunk is done or a
+// watcher ended).
 func (p *Pool) idleLocked() {
 	if p.idle != nil {
 		close(p.idle)

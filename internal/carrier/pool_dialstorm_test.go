@@ -3,6 +3,7 @@ package carrier
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"testing"
@@ -138,20 +139,18 @@ func TestPoolJoinClaimantKeepsWaiters(t *testing.T) {
 }
 
 // TestPoolVerdictGraceJoinTakesOver (M3-D18 as amended by WP10 and WP
-// DIALSTORM): an OPEN claimant whose verdict is slow (its passive
-// application has not accepted the session after 1 s) releases its
-// waiters after the verdict grace — two OPENs and, 10 ms later, four
-// JOINs of other sessions. Each OPEN dials its own carrier beside the
-// claimant (its verdict waits for the application too,
-// TestPoolVerdictGrace); of the JOINs exactly one dials, in the
-// claimant's place as the factory's dial in flight, and the other three
-// wait for it and then open their views on the published trunks (the
-// waiters' own, the oldest of the fullest first, M3-D17). (An OPEN whose grace
-// runs out after a JOIN took that place waits for the JOIN's dial too:
-// the scenario row's OPEN load.) Four factory calls in all, nobody fails, and once the first
-// session is answered its trunk is published beside the others. Observed
-// before the change: every waiter dialled its own carrier when the grace
-// ran out (7 factory calls).
+// DIALSTORM; B0.2 item 1): an OPEN claimant whose verdict is slow (its
+// passive application has not accepted the session after 1 s) keeps its
+// waiters for the verdict grace — two OPENs and, 10 ms later, four JOINs
+// of other sessions. The OPENs' grace runs out first: they defer to the
+// JOIN waiters and dial nothing. When the JOINs' grace runs out exactly
+// one JOIN dials, in the claimant's place as the factory's dial in flight
+// (its verdict waits for no application), and the other five wait for it
+// and open their views on its trunk. Two factory calls in all — the
+// claimant and one JOIN — nobody fails, and once the first session is
+// answered its trunk is published beside the JOIN's. Observed before WP
+// DIALSTORM: 7 factory calls; after its first round: 4 (each OPEN waiter
+// dialled beside the claimant).
 func TestPoolVerdictGraceJoinTakesOver(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const late = time.Second
@@ -178,31 +177,26 @@ func TestPoolVerdictGraceJoinTakesOver(t *testing.T) {
 			}
 			pt.goAttempt(context.Background(), kinds[i], i, waiters.ch)
 		}
-		own := waiters.get(t, 3) // the two OPENs' own carriers and one JOIN's
-		joins := 0
-		for _, r := range own {
-			if r.err != nil || !r.est.Fresh || !isOK(r.est) {
-				t.Fatalf("waiter %d (%v) after the grace: %v (fresh %v), want its own fresh carrier", r.sid, kinds[r.sid], r.err, r.est != nil && r.est.Fresh)
-			}
-			if d := r.at.Sub(start); d < minVerdictGrace || d > late/2 {
-				t.Fatalf("waiter %d returned %v after the waiters' start, want after the verdict grace (%v) and well before the claimant", r.sid, d, minVerdictGrace)
-			}
-			if kinds[r.sid] == wire.TypeJoin {
-				joins++
-			}
+		time.Sleep(minVerdictGrace - 5*time.Millisecond) // the OPENs' grace ran out, the JOINs' not yet
+		synctest.Wait()
+		if d, n := pt.srv.dials.Load(), pendingResults(waiters.ch); d != 1 || n != 0 {
+			t.Fatalf("%d factory calls and %d waiter results once the OPENs' grace ran out, want 1 and 0 (the OPENs defer to the JOINs)", d, n)
+		}
+		own := waiters.get(t, 1)[0]
+		if own.err != nil || !own.est.Fresh || !isOK(own.est) || kinds[own.sid] != wire.TypeJoin {
+			t.Fatalf("waiter %d (%v) after the grace: %v (fresh %v), want one JOIN's own fresh carrier", own.sid, kinds[own.sid], own.err, own.est != nil && own.est.Fresh)
+		}
+		if d := own.at.Sub(start); d < 10*time.Millisecond+minVerdictGrace || d > late/2 {
+			t.Fatalf("the JOIN's own carrier came %v after the waiters' start, want after its verdict grace and well before the claimant", d)
 		}
 		synctest.Wait()
-		if d, n := pt.srv.dials.Load(), pendingResults(waiters.ch); d != 4 || n != 0 || joins != 1 {
-			t.Fatalf("%d factory calls (%d by JOINs) and %d further results after the grace, want 4 (one JOIN, both OPENs) and 0", d, joins, n)
+		if d, n := pt.srv.dials.Load(), pendingResults(waiters.ch); d != 2 || n != 0 {
+			t.Fatalf("%d factory calls and %d further results after the grace, want 2 (the claimant and one JOIN) and 0", d, n)
 		}
-		ownTrunks := map[*trunk]bool{}
-		for _, r := range own {
-			pt.attach(r.est)
-			ownTrunks[r.est.Conn.trunk] = true
-		}
-		for _, r := range waiters.get(t, 3) {
-			if r.err != nil || !isOK(r.est) || r.est.Fresh || !ownTrunks[r.est.Conn.trunk] || kinds[r.sid] != wire.TypeJoin {
-				t.Fatalf("waiter %d (%v): %v (fresh %v), want a view on a published trunk of the waiters", r.sid, kinds[r.sid], r.err, r.est != nil && r.est.Fresh)
+		pt.attach(own.est)
+		for _, r := range waiters.get(t, 5) {
+			if r.err != nil || !isOK(r.est) || r.est.Fresh || r.est.Conn.trunk != own.est.Conn.trunk {
+				t.Fatalf("waiter %d (%v): %v (fresh %v), want a view on the JOIN's trunk", r.sid, kinds[r.sid], r.err, r.est != nil && r.est.Fresh)
 			}
 			pt.attach(r.est)
 		}
@@ -211,11 +205,223 @@ func TestPoolVerdictGraceJoinTakesOver(t *testing.T) {
 			t.Fatalf("claimant: %v", claim.err)
 		}
 		pt.attach(claim.est)
-		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 4 || st.Carriers != 4 || st.Views != 7 || st.FastPaths != 3 {
-			t.Fatalf("%d factory calls, stats %+v; want 4 calls and four trunks with 7 views", d, st)
+		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 2 || st.Carriers != 2 || st.Views != 7 || st.FastPaths != 5 {
+			t.Fatalf("%d factory calls, stats %+v; want 2 calls and two trunks with 7 views", d, st)
 		}
-		if got := len(pt.p.listed(0)); got != 4 {
-			t.Fatalf("%d published trunks, want all four", got)
+	})
+}
+
+// TestPoolVerdictGraceOpensBeside (WP10, kept by WP DIALSTORM;
+// TestPoolVerdictGrace, E19): with no JOIN waiting, each OPEN waiter of a
+// slow OPEN claimant dials beside it once its grace runs out — the
+// passive application may accept the sessions in any order — and the
+// claimant stays the factory's dial in flight. A JOIN that comes once those
+// trunks are published opens a view on one of them without a call.
+func TestPoolVerdictGraceOpensBeside(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const late = time.Second
+		pt := newPoolT(t, nil, nil)
+		pt.srv.lateVerdicts(func(n int) time.Duration {
+			if n == 1 {
+				return late
+			}
+			return 0
+		})
+		claimed := newDueResults(t, 1)
+		pt.goAttempt(context.Background(), wire.TypeOpen, 1, claimed.ch)
+		synctest.Wait()
+		waiters := newDueResults(t, 2)
+		start := time.Now()
+		pt.goAttempt(context.Background(), wire.TypeOpen, 2, waiters.ch)
+		pt.goAttempt(context.Background(), wire.TypeOpen, 3, waiters.ch)
+		for _, r := range waiters.get(t, 2) {
+			if r.err != nil || !r.est.Fresh || !isOK(r.est) {
+				t.Fatalf("OPEN waiter %d after the grace: %v (fresh %v), want its own fresh carrier", r.sid, r.err, r.est != nil && r.est.Fresh)
+			}
+			if d := r.at.Sub(start); d < minVerdictGrace || d > late/2 {
+				t.Fatalf("OPEN waiter %d returned %v after its start, want after the verdict grace and well before the claimant", r.sid, d)
+			}
+			pt.attach(r.est)
+		}
+		if !pt.p.inFlight(0) {
+			t.Fatal("the slow claimant is no longer the factory's dial in flight")
+		}
+		est, err := pt.attempt(context.Background(), 0, wire.TypeJoin, 9, [16]byte{})
+		if err != nil || est.Fresh || !isOK(est) {
+			t.Fatalf("a JOIN beside the published trunks: %v (fresh %v), want a fast path", err, est != nil && est.Fresh)
+		}
+		pt.attach(est)
+		claim := claimed.get(t, 1)[0]
+		if claim.err != nil || !claim.est.Fresh || !isOK(claim.est) {
+			t.Fatalf("claimant: %v", claim.err)
+		}
+		pt.attach(claim.est)
+		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 3 || st.Carriers != 3 || st.Views != 4 || st.FastPaths != 1 {
+			t.Fatalf("%d factory calls, stats %+v; want 3 calls and three trunks with 4 views", d, st)
+		}
+	})
+}
+
+// TestPoolDeferredOpenDialsWhenJoinsLeave (WP DIALSTORM): an OPEN waiter
+// whose grace ran out defers to the JOIN waiters of the slow OPEN claimant;
+// when the last of them leaves without dialling (its context ended), the
+// OPEN dials beside the claimant at once instead of waiting for the
+// claimant's verdict.
+func TestPoolDeferredOpenDialsWhenJoinsLeave(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const late = time.Second
+		pt := newPoolT(t, nil, nil)
+		pt.srv.lateVerdicts(func(n int) time.Duration {
+			if n == 1 {
+				return late
+			}
+			return 0
+		})
+		claimed := newDueResults(t, 1)
+		pt.goAttempt(context.Background(), wire.TypeOpen, 1, claimed.ch)
+		synctest.Wait()
+		opens, joins := newDueResults(t, 1), newDueResults(t, 1)
+		start := time.Now()
+		pt.goAttempt(context.Background(), wire.TypeOpen, 2, opens.ch)
+		time.Sleep(50 * time.Millisecond)
+		jctx, jcancel := context.WithCancel(context.Background())
+		defer jcancel()
+		pt.goAttempt(jctx, wire.TypeJoin, 3, joins.ch)
+		time.Sleep(minVerdictGrace - 30*time.Millisecond) // the OPEN's grace ran out 20 ms ago, the JOIN's not yet
+		synctest.Wait()
+		if d, n := pt.srv.dials.Load(), pendingResults(opens.ch)+pendingResults(joins.ch); d != 1 || n != 0 {
+			t.Fatalf("%d factory calls and %d results while the OPEN defers to the JOIN, want 1 and 0", d, n)
+		}
+		left := time.Now()
+		jcancel()
+		if r := joins.get(t, 1)[0]; r.err == nil {
+			t.Fatal("the cancelled JOIN got a carrier")
+		}
+		r := opens.get(t, 1)[0]
+		if r.err != nil || !r.est.Fresh || !isOK(r.est) {
+			t.Fatalf("OPEN waiter: %v (fresh %v), want its own fresh carrier", r.err, r.est != nil && r.est.Fresh)
+		}
+		if d := r.at.Sub(left); d > 50*time.Millisecond {
+			t.Fatalf("the OPEN returned %v after the JOIN left (%v after its start), want at once", d, r.at.Sub(start))
+		}
+		pt.attach(r.est)
+		claim := claimed.get(t, 1)[0]
+		if claim.err != nil || !claim.est.Fresh {
+			t.Fatalf("claimant: %v", claim.err)
+		}
+		pt.attach(claim.est)
+		if d := pt.srv.dials.Load(); d != 2 {
+			t.Fatalf("%d factory calls, want 2", d)
+		}
+	})
+}
+
+// TestPoolGraceKeptAcrossKick (WP DIALSTORM): a waiter's verdict grace
+// counts from its first wait after the claimant's proof; a kick that wakes
+// it earlier (here the only JOIN waiter leaving, 50 ms into the grace)
+// does not start the grace again: the OPEN waiter dials beside the slow
+// OPEN claimant when its first grace runs out.
+func TestPoolGraceKeptAcrossKick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const late = time.Second
+		pt := newPoolT(t, nil, nil)
+		pt.srv.lateVerdicts(func(n int) time.Duration {
+			if n == 1 {
+				return late
+			}
+			return 0
+		})
+		claimed := newDueResults(t, 1)
+		pt.goAttempt(context.Background(), wire.TypeOpen, 1, claimed.ch)
+		synctest.Wait()
+		opens, joins := newDueResults(t, 1), newDueResults(t, 1)
+		jctx, jcancel := context.WithCancel(context.Background())
+		defer jcancel()
+		start := time.Now()
+		pt.goAttempt(context.Background(), wire.TypeOpen, 2, opens.ch)
+		pt.goAttempt(jctx, wire.TypeJoin, 3, joins.ch)
+		time.Sleep(minVerdictGrace / 2)
+		jcancel()
+		if r := joins.get(t, 1)[0]; r.err == nil {
+			t.Fatal("the cancelled JOIN got a carrier")
+		}
+		r := opens.get(t, 1)[0]
+		if r.err != nil || !r.est.Fresh || !isOK(r.est) {
+			t.Fatalf("OPEN waiter: %v (fresh %v), want its own fresh carrier", r.err, r.est != nil && r.est.Fresh)
+		}
+		if d := r.at.Sub(start); d < minVerdictGrace || d >= minVerdictGrace+minVerdictGrace/4 {
+			t.Fatalf("the OPEN dialled %v after its start, want when its first grace (%v) ran out", d, minVerdictGrace)
+		}
+		pt.attach(r.est)
+		claim := claimed.get(t, 1)[0]
+		if claim.err != nil || !claim.est.Fresh {
+			t.Fatalf("claimant: %v", claim.err)
+		}
+		pt.attach(claim.est)
+	})
+}
+
+// TestPoolJoinClaimantStall (WP DIALSTORM): the waiters of a JOIN
+// claimant wait for its verdict as for its dial, but not past joinStall
+// (the death deadline's floor, DeadMin: 3 s here) when its conn stalls
+// after the PREFACE_ACK (here the response to its JOIN comes 8 s late: a
+// path that broke after the PREFACE, or a passive stuck under load). Then
+// exactly one waiter — two JOINs and two OPENs wait — dials in the
+// claimant's place, and the other three open their views on that trunk
+// instead of waiting for their DialTimeout (10 s). Two factory calls.
+func TestPoolJoinClaimantStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const late = 8 * time.Second
+		pt := newPoolT(t, nil, nil)
+		stall := pt.env.Timing.DeadMin
+		pt.srv.lateVerdicts(func(n int) time.Duration {
+			if n == 1 {
+				return late
+			}
+			return 0
+		})
+		claimed := newDueResults(t, 1)
+		pt.goAttempt(context.Background(), wire.TypeJoin, 1, claimed.ch)
+		synctest.Wait()
+		waiters := newDueResults(t, 4)
+		start := time.Now()
+		for i := byte(2); i <= 5; i++ {
+			kind := wire.TypeJoin
+			if i%2 == 1 {
+				kind = wire.TypeOpen
+			}
+			pt.goAttempt(context.Background(), kind, i, waiters.ch)
+		}
+		time.Sleep(stall - 10*time.Millisecond)
+		synctest.Wait()
+		if d, n := pt.srv.dials.Load(), pendingResults(waiters.ch); d != 1 || n != 0 {
+			t.Fatalf("%d factory calls and %d results before the stall bound, want 1 and 0", d, n)
+		}
+		own := waiters.get(t, 1)[0]
+		if own.err != nil || !own.est.Fresh || !isOK(own.est) {
+			t.Fatalf("waiter %d after the stall bound: %v (fresh %v), want its own fresh carrier", own.sid, own.err, own.est != nil && own.est.Fresh)
+		}
+		if d := own.at.Sub(start); d < stall || d > stall+time.Second {
+			t.Fatalf("the waiter's own carrier came %v after its start, want right after the stall bound (%v)", d, stall)
+		}
+		synctest.Wait()
+		if d, n := pt.srv.dials.Load(), pendingResults(waiters.ch); d != 2 || n != 0 {
+			t.Fatalf("%d factory calls and %d further results, want 2 and 0", d, n)
+		}
+		pt.attach(own.est)
+		for _, r := range waiters.get(t, 3) {
+			if r.err != nil || !isOK(r.est) || r.est.Fresh || r.est.Conn.trunk != own.est.Conn.trunk {
+				t.Fatalf("waiter %d: %v (fresh %v), want a view on the replacing trunk", r.sid, r.err, r.est != nil && r.est.Fresh)
+			}
+			pt.attach(r.est)
+		}
+		// The stalled claimant's carrier, silent toward the passive past its
+		// death deadline, was ended there: the claimant fails on its own.
+		if claim := claimed.get(t, 1)[0]; claim.err == nil {
+			t.Fatal("the stalled claimant got a carrier")
+		}
+		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 2 || st.Carriers != 1 || st.Views != 4 {
+			t.Fatalf("%d factory calls, stats %+v; want 2 calls and one trunk with 4 views", d, st)
 		}
 	})
 }
@@ -291,31 +497,174 @@ func TestPoolTrunkGoroutines(t *testing.T) {
 	})
 }
 
-// TestPoolTrackedBounded (invariant 4; L52): the pool's record of its
-// trunks for Wait stays bounded by the trunks still running, not by every
-// trunk it ever dialled: 64 sessions in a row each dial a trunk and end
-// (the trunk closes at its last view), and at most 16 entries remain.
-func TestPoolTrackedBounded(t *testing.T) {
+// stuckClose is a dialer conn whose Close waits for release (an embedder's
+// slow Close).
+type stuckClose struct {
+	net.Conn
+	release chan struct{}
+}
+
+func (c *stuckClose) Close() error {
+	<-c.release
+	return c.Conn.Close()
+}
+
+// TestPoolWaitJoinsWatchers (L52, F46: Runtime.Close joins every
+// goroutine): Wait returns nil only once every trunk the pool dialled is
+// done and the pool's watcher of every fresh trunk has ended. (a) A fresh
+// trunk discarded unstarted after Close (its session's discard): Wait
+// blocks while its watcher runs, and returns once the trunk is done and the
+// watcher ended. (b) The same with the trunk's Close stuck in the
+// embedder's conn (its Done open): Wait blocks until the Close returns.
+// (c) A published trunk whose watcher has not ended yet when the trunk is
+// done (its last view's hook counted the Done first): Wait blocks until
+// the watcher ended. Each time no pool goroutine is left.
+func TestPoolWaitJoinsWatchers(t *testing.T) {
+	short := func(p *Pool) error {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		return p.Wait(ctx)
+	}
+	t.Run("discarded", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			hold := make(chan struct{})
+			pt.p.watchEnd = func(*Conn) { <-hold }
+			est, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil || !est.Fresh {
+				t.Fatalf("claimant: %v", err)
+			}
+			pt.p.Close()
+			est.Conn.Kill(CauseLocalClose, "dial result not attached") // the session's discard
+			select {
+			case <-est.Conn.trunk.tdone:
+			case <-time.After(time.Minute):
+				t.Fatal("the discarded trunk is not done")
+			}
+			if err := short(pt.p); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Wait while the watcher runs: %v, want it blocked", err)
+			}
+			close(hold)
+			if err := short(pt.p); err != nil {
+				t.Fatalf("Wait once the watcher ended: %v", err)
+			}
+			if k := poolGoroutines(); k != 0 {
+				t.Fatalf("%d pool goroutines after Wait, want none", k)
+			}
+		})
+	})
+	t.Run("discarded-close-stuck", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			release := make(chan struct{})
+			pt.srv.mu.Lock()
+			pt.srv.wrap = func(_ int, nc net.Conn) net.Conn { return &stuckClose{Conn: nc, release: release} }
+			pt.srv.mu.Unlock()
+			est, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil || !est.Fresh {
+				t.Fatalf("claimant: %v", err)
+			}
+			pt.p.Close()
+			est.Conn.Kill(CauseLocalClose, "dial result not attached") // the session's discard
+			ctx, cancel := context.WithTimeout(context.Background(), pt.env.Timing.AbandonWait/2)
+			defer cancel()
+			if err := pt.p.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Wait while the discarded trunk's Close is stuck: %v, want it blocked", err)
+			}
+			close(release)
+			if err := short(pt.p); err != nil {
+				t.Fatalf("Wait once the Close returned: %v", err)
+			}
+			select {
+			case <-est.Conn.trunk.tdone:
+			default:
+				t.Fatal("Wait returned before the discarded trunk was done")
+			}
+			if k := poolGoroutines(); k != 0 {
+				t.Fatalf("%d pool goroutines after Wait, want none", k)
+			}
+		})
+	})
+	t.Run("published", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			hold := make(chan struct{})
+			pt.p.watchEnd = func(*Conn) { <-hold }
+			est, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil || !est.Fresh {
+				t.Fatalf("claimant: %v", err)
+			}
+			pt.attach(est) // published: the watcher reached watchEnd
+			pt.p.Close()
+			est.Conn.Kill(CauseLocalClose, "session ended") // the last view: the trunk retires
+			select {
+			case <-est.Conn.trunk.tdone:
+			case <-time.After(time.Minute):
+				t.Fatal("the trunk did not close at its last view")
+			}
+			synctest.Wait()
+			pt.p.mu.Lock()
+			live, watch := pt.p.live, pt.p.watch
+			pt.p.mu.Unlock()
+			if live != 0 || watch != 1 {
+				t.Fatalf("stimulus: %d live trunks and %d watchers, want 0 and 1 (the trunk done before its watcher ended)", live, watch)
+			}
+			if err := short(pt.p); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Wait while the watcher runs: %v, want it blocked", err)
+			}
+			close(hold)
+			if err := short(pt.p); err != nil {
+				t.Fatalf("Wait once the watcher ended: %v", err)
+			}
+			if k := poolGoroutines(); k != 0 {
+				t.Fatalf("%d pool goroutines after Wait, want none", k)
+			}
+		})
+	})
+}
+
+// TestPoolKeepsNoDoneTrunk (invariant 4; L52): the pool keeps no record of
+// a trunk past its Done, also after a spike. 16 sessions each hold a trunk
+// of their own (one view per trunk) and all end at once; once the trunks
+// are done the pool counts no live trunk, lists none, runs no goroutine,
+// and Wait returns after Close. (Before WP DIALSTORM's review the pool kept
+// a list for Wait that was swept only when it doubled: up to twice the peak
+// of done trunks stayed referenced through a quiet period.)
+func TestPoolKeepsNoDoneTrunk(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		pt := newPoolT(t, nil, nil)
-		for i := range 64 {
+		const n = 16
+		pt := newPoolT(t, func(e *Env) { e.Timing.MuxMaxViews = 1 }, nil)
+		var ests []*Established
+		for i := range n {
 			est, err := pt.attempt(context.Background(), 0, wire.TypeOpen, byte(i+1), [16]byte{})
 			if err != nil || !est.Fresh {
 				t.Fatalf("session %d: %v", i+1, err)
 			}
 			pt.attach(est)
+			ests = append(ests, est)
+		}
+		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != n || st.Carriers != n {
+			t.Fatalf("stimulus: %d factory calls, stats %+v; want %d trunks", d, st, n)
+		}
+		for _, est := range ests {
 			est.Conn.Kill(CauseLocalClose, "session ended")
+		}
+		for i, est := range ests {
 			select {
 			case <-est.Conn.trunk.tdone:
 			case <-time.After(time.Minute):
 				t.Fatalf("session %d: the trunk did not close at its last view", i+1)
 			}
 		}
+		synctest.Wait()
 		pt.p.mu.Lock()
-		n := len(pt.p.tracked)
+		live, watch, listed, extra, dialing := pt.p.live, pt.p.watch, len(pt.p.trunks[0]), len(pt.p.extra), pt.p.dialing[0]
 		pt.p.mu.Unlock()
-		if n > 16 {
-			t.Fatalf("%d trunks tracked after 64 closed ones, want ≤ 16", n)
+		if live != 0 || watch != 0 || listed != 0 || extra != 0 || dialing != nil {
+			t.Fatalf("after %d done trunks: live %d, watchers %d, listed %d, extra %d, dial in flight %v; want none", n, live, watch, listed, extra, dialing != nil)
+		}
+		if k := poolGoroutines(); k != 0 {
+			t.Fatalf("%d pool goroutines in the quiet period, want none", k)
 		}
 		pt.p.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
