@@ -27,6 +27,11 @@ type opts struct {
 	dcfg, pcfg rendr.Config        // OnEvent is replaced by the fixture's event log
 	lc         rendr.ListenConfig
 	buffer     int // Link buffer per direction (0: rendrtest's 2 MiB)
+	// dedicated: the dialer's factories are CheapSubflow ones, so every
+	// session dials carriers of its own (M2's path; rendr mux is the
+	// default, M3-D2) — for the lessons whose premise is a session's own
+	// carrier (its CLOSE, its forced close at the session's close bound).
+	dedicated bool
 }
 
 // fixture is two Runtimes, the passive's Listener and the Links between them.
@@ -39,12 +44,13 @@ type fixture struct {
 	dev, pev *evLog
 	wire     *wireLog
 	once     sync.Once
+	cheap    bool // opts.dedicated
 }
 
 // newFixture builds a fixture with one Link per name.
 func newFixture(t testing.TB, o opts, names ...string) *fixture {
 	t.Helper()
-	f := &fixture{t: t, byName: map[string]*rendrtest.Link{}, dev: &evLog{}, pev: &evLog{}, wire: newWireLog()}
+	f := &fixture{t: t, byName: map[string]*rendrtest.Link{}, dev: &evLog{}, pev: &evLog{}, wire: newWireLog(), cheap: o.dedicated}
 	dcfg, pcfg := o.dcfg, o.pcfg
 	dcfg.OnEvent, pcfg.OnEvent = f.dev.add, f.pev.add
 	f.d = newRuntime(t, dcfg, &o.ov)
@@ -97,7 +103,7 @@ func (f *fixture) carrier(name string) rendr.StreamCarrier {
 			return nil, err
 		}
 		return f.wire.newTap(name, dialerSide, c), nil
-	}}
+	}, Props: rendr.Props{CheapSubflow: f.cheap}}
 }
 
 // peer returns a dialer Peer over the named links (every link when none),

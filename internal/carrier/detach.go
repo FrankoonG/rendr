@@ -124,7 +124,13 @@ func (c *Conn) retireView(r wire.DetachReason) {
 	t.mx.Lock()
 	switch {
 	case c.vx.detQ || c.vx.detSent.Load() || c.vx.refused || !c.vx.inTable:
-	case c.state == viewLive && c.vx.attached:
+	case c.state == viewLive && c.vx.attached,
+		(c.state == viewPending || c.state == viewJoining) && c.vx.attached && c.vx.needResp.Load():
+		// A live view keeps its Fill until a call places nothing; so does
+		// a passive view whose session attached it but whose verdict is not
+		// placed yet: the verdict its session set (REJECTED, AcceptTimeout,
+		// GOING_AWAY, a JOIN's answer) is its first and last frame, before
+		// its DETACH or, for a refusal, instead of it (M3-D7; WP10).
 		if !c.vx.retireQ.Load() {
 			c.vx.reason = r
 			c.vx.retireQ.Store(true)
@@ -278,6 +284,9 @@ func (t *trunk) placeControlLocked(b *Batch, rd *roundData, nowNs int64, p *post
 		if lf.timer != nil {
 			lf.timer.Stop()
 		}
+		if !skip {
+			v.vx.lastSent = true
+		}
 		if !skip && v.vx.needResp.Load() && (lf.t == wire.TypeOpenAck || lf.t == wire.TypeJoinAck) {
 			v.vx.needResp.Store(false)
 			if len(lf.p) > 0 && wire.AckStatus(lf.p[0]) != wire.StatusOK {
@@ -382,6 +391,23 @@ func (t *trunk) placeDetachLocked(v *Conn, b *Batch, rd *roundData, nowNs int64,
 		t.completeLocked(v, "retired: DETACH exchange complete", p)
 		return true
 	}
+	if rd.goAway {
+		// The trunk goes away (our GOAWAY: Runtime.Close, M3-D26): the
+		// peer's sessions end on it, so no DETACH exchange is waited for —
+		// the view ends with its DETACH placed, its late crossing frames
+		// tolerated, and the trunk's CLOSE follows at its last view
+		// without waiting for a DETACH bound (WP10).
+		if !v.vx.peerDet.Load() {
+			t.tolerateLocked(v.handle, true)
+		}
+		if t.dg != nil {
+			t.ms.awaitAck.Add(-1)
+		}
+		v.state = viewGone
+		t.removeLocked(v)
+		t.endViewLocked(v, CauseRetired, "retired: DETACH placed while going away", p)
+		return true
+	}
 	v.vx.detBound = nowNs + int64(t.detachBound(rd))
 	t.ms.retiring = append(t.ms.retiring, v)
 	if t.ms.detWake == 0 || v.vx.detBound < t.ms.detWake {
@@ -408,6 +434,14 @@ func (t *trunk) detachBound(rd *roundData) time.Duration {
 // view), or queues it for the next round when the batch has no room.
 func (t *trunk) retireDrainedLocked(v *Conn, b *Batch, rd *roundData, nowNs int64, p *postList) {
 	if !v.vx.retireQ.Load() || v.vx.detQ || v.vx.detSent.Load() || !v.vx.inTable {
+		return
+	}
+	if v.vx.needResp.Load() {
+		// A passive view whose session set no verdict to place: the dialer
+		// awaits a response for the handle, so it gets a refusal, never a
+		// DETACH (R1-9; abandonLocked).
+		v.vx.retireQ.Store(false)
+		t.abandonLocked(v, v.vx.reason, p)
 		return
 	}
 	v.vx.retireQ.Store(false)

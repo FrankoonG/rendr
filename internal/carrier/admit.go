@@ -138,6 +138,11 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 		v.state = viewHeld
 		v.held.Store(true)
 		v.vx.fillOK.Store(false) // R1-1's ready set skips it until the go frame
+		if v.vx.retireQ.Load() {
+			// Its session ended while the OK was due: held, it places its
+			// DETACH(ended) only (R1-9).
+			t.abandonLocked(v, wire.DetachEnded, p)
+		}
 	}
 }
 

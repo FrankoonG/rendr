@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
-	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // The packet race (M3 design §A6.4; M3-D32, L39, L40). Every race data lane
@@ -134,7 +133,7 @@ func (s *Session) raceFillDgramsLocked(l *lane, b *carrier.Batch) (placed bool) 
 			seq = pk.nextSeq + 1
 		}
 		body, buf := q.data(d)
-		if !b.AddDgram(wire.SessionHandle, seq-1, body, buf) {
+		if !b.AddDgram(l.Handle(), seq-1, body, buf) {
 			break // the batch is full: the writer self-continues
 		}
 		if first {

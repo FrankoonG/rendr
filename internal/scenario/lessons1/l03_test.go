@@ -240,7 +240,10 @@ func TestLingerBoundedBehindBlockedCarrier_L03_L52(t *testing.T) {
 	}
 	t.Run("closer-blocked", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			f := newFixture(t, opts{ov: ov}, "a")
+			// The session's own carrier is closed by force at its close
+			// bound: dedicated (M3-D2; a view's Kill ends the view only,
+			// R1-2, and a trunk's stuck writer is the trunk's bounds').
+			f := newFixture(t, opts{ov: ov, dedicated: true}, "a")
 			l := f.link("a")
 			dc, pc := f.open(f.peer("a"), rendr.DialOptions{})
 			v := rendrtest.NewVerifier(1, 2*n)

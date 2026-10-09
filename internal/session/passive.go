@@ -115,21 +115,55 @@ func (s *Session) maxCarriers() int {
 	return defMaxCarriers
 }
 
-// knownCarrierLocked reports whether id is the CarrierID of a carrier the
-// session attached: a lane's, or one of the last eight dead lanes' of the
-// published snapshot (the CarrierStatus history, R1-11).
-func (s *Session) knownCarrierLocked(id uint32) bool {
+// knownCarrierLocked reports whether c is a carrier the session attached:
+// a lane's, or one of the last eight dead lanes' of the published snapshot
+// (the CarrierStatus history, R1-11). A dedicated carrier is identified by
+// its CarrierID (M2); a view of a MUX trunk by (CarrierID, handle) (R1-6
+// rule 1, M3-D64), so a new view on a trunk the session used before is
+// never known — handles are never reused (M3-D4) — while a replayed first
+// frame of a known one still is.
+func (s *Session) knownCarrierLocked(c *carrier.Conn) bool {
+	id, h, mux := c.ID(), c.Handle(), c.Mux()
+	same := func(lid, lh uint32) bool { return lid == id && (!mux || lh == h) }
 	for _, l := range s.lanes {
-		if l.id == id {
+		if same(l.id, l.Handle()) {
 			return true
 		}
 	}
 	if sn := s.snap.Load(); sn != nil {
 		for i := range sn.lanes {
-			if ls := &sn.lanes[i]; ls.state == LaneDead && ls.id == id {
+			ls := &sn.lanes[i]
+			if ls.state != LaneDead {
+				continue
+			}
+			lh := ls.stats.Handle
+			if ls.conn != nil {
+				lh = ls.conn.Handle()
+			}
+			if same(ls.id, lh) {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// dupViewLocked reports that the session already holds a view on c's MUX
+// trunk that is still current — neither ended nor detached by the peer
+// (M3-D23, R1-6 rule 3): a second view of one session on one trunk is
+// refused (BAD_REQUEST, CodeDuplicateView on an OPEN). A view with the
+// peer's DETACH is on its way out, and the dialer's DETACH precedes its new
+// JOIN on the trunk. Always false for a dedicated carrier.
+func (s *Session) dupViewLocked(c *carrier.Conn) bool {
+	if !c.Mux() {
+		return false
+	}
+	id := c.ID()
+	for _, l := range s.lanes {
+		if l.id != id || l.state == LaneDead || l.c == c || laneEnded(l) || l.c.PeerClosed() {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -160,9 +194,12 @@ func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
 	case s.ctl.state == StateEnded:
 		s.mu.Unlock()
 		return false, s.finalVerdict()
-	case s.knownCarrierLocked(c.ID()):
+	case s.knownCarrierLocked(c):
 		s.mu.Unlock()
 		return false, Verdict{Status: wire.StatusBadRequest, Code: wire.CodeBadValue}
+	case s.dupViewLocked(c):
+		s.mu.Unlock()
+		return false, Verdict{Status: wire.StatusBadRequest, Code: wire.CodeDuplicateView}
 	case s.carriersLocked() >= s.maxCarriers():
 		s.mu.Unlock()
 		return false, Verdict{Status: wire.StatusCapacity, Code: wire.CodeCarriers}
@@ -254,7 +291,7 @@ func (s *Session) Join(c *carrier.Conn, j *wire.Join) (taken bool, status wire.A
 		status = wire.StatusBadRequest
 	case s.ctl.state == StateEnded:
 		status = wire.StatusUnknownSession
-	case Mode(j.Mode) != s.p.Mode, !kindOK, s.knownCarrierLocked(c.ID()):
+	case Mode(j.Mode) != s.p.Mode, !kindOK, s.knownCarrierLocked(c), s.dupViewLocked(c):
 		status = wire.StatusBadRequest
 	case s.carriersLocked() >= s.maxCarriers():
 		status = wire.StatusCapacity
@@ -263,8 +300,11 @@ func (s *Session) Join(c *carrier.Conn, j *wire.Join) (taken bool, status wire.A
 	default:
 		s.ctl.adopting++
 		s.mu.Unlock()
-		if s.pk != nil {
-			c.SetBudget(cmtu) // the carrier is unstarted until the actor adopts it
+		if s.pk != nil && c.Handle() == wire.SessionHandle {
+			// The carrier is unstarted until the actor adopts it. A view of
+			// a started MUX trunk keeps the trunk's budget (M3-D24; no
+			// SetBudget after Start): its JOIN offered that budget.
+			c.SetBudget(cmtu)
 		}
 		if !s.mb.post(&adopt{conn: c, kind: adoptJoin, join: *j}) {
 			return false, wire.StatusUnknownSession // the actor exited meanwhile

@@ -31,7 +31,7 @@ func (s *Session) fillLocked(l *lane, b *carrier.Batch) {
 			if !ctl {
 				s.fillDataLocked(l, b)
 			}
-			if st := &s.st; s.finDueLocked() && b.AddFin(wire.SessionHandle, st.fin.off) {
+			if st := &s.st; s.finDueLocked() && b.AddFin(l.Handle(), st.fin.off) {
 				st.fin.lane = l
 				l.finHere = true
 			}
@@ -59,7 +59,7 @@ func refusedLocked(l *lane) bool {
 // a refusal, after an RST or after the end).
 func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 	st := &s.st
-	h := wire.SessionHandle
+	h := l.Handle()
 	if s.p.Role == RolePassive && !l.firstSent {
 		placed, ok := false, false
 		switch l.first.t {
@@ -229,7 +229,7 @@ func (s *Session) addDataLocked(l *lane, b *carrier.Batch, off, n uint64, retx b
 		n = room
 	}
 	chunk, pos := st.chunkFor(off)
-	if !b.AddData(wire.SessionHandle, off, chunk.B[pos:pos+int(n)], chunk, retx) {
+	if !b.AddData(l.Handle(), off, chunk.B[pos:pos+int(n)], chunk, retx) {
 		return 0
 	}
 	*sent = true

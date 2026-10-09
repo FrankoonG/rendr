@@ -444,6 +444,9 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 		go c.readLoop()
 	}
 	go c.writeLoop()
+	if c.dialer && c.mux {
+		c.poolStarted() // a fresh MUX trunk runs: its pool publishes it (M3-D19)
+	}
 }
 
 // Wake makes the writer run Fill again soon (cap-1 channel; non-blocking,

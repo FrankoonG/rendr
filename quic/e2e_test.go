@@ -201,6 +201,10 @@ type qeEnv struct {
 	addr     string // the quic Listener's address
 	tap      *qeTap
 	relay    *qeRelay
+	// cheap makes the dialer's factories CheapSubflow ones: every session
+	// on carriers of its own (M2's path; rendr mux is the default, M3-D2),
+	// for the tests whose premise is a session's own carrier.
+	cheap bool
 
 	mu     sync.Mutex
 	ls     []*Listener      // every quic Listener served, the current last
@@ -300,6 +304,7 @@ func (e *qeEnv) factory(kind rendr.Kind, o Options) rendr.Carrier {
 		if err != nil {
 			e.t.Fatal(err)
 		}
+		c.Props.CheapSubflow = e.cheap
 		dial := c.Dial
 		c.Dial = func(ctx context.Context) (net.Conn, error) {
 			nc, err := dial(ctx)
@@ -314,6 +319,7 @@ func (e *qeEnv) factory(kind rendr.Kind, o Options) rendr.Carrier {
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	c.Props.CheapSubflow = e.cheap
 	dial := c.Dial
 	c.Dial = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
 		pc, a, err := dial(ctx)
@@ -821,6 +827,7 @@ func TestQUICRetireBothSidesRetired(t *testing.T) {
 			}
 			t.Run(name, func(t *testing.T) {
 				e := newQEEnv(t, 20*time.Millisecond)
+				e.cheap = true // the session's own carrier's CLOSE exchange (M3-D2)
 				rounds := 4
 				if kind == rendr.KindDatagram {
 					rounds = 1

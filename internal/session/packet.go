@@ -104,14 +104,16 @@ type plane lane
 var _ carrier.PacketEndpoint = (*plane)(nil)
 
 // Handle implements carrier.Endpoint.
-func (p *plane) Handle() uint32 { return wire.SessionHandle }
+func (p *plane) Handle() uint32 { return (*lane)(p).Handle() }
 
 // Fill implements carrier.Endpoint: the packet Fill (M2 design §A5.2).
 func (p *plane) Fill(c *carrier.Conn, b *carrier.Batch) {
 	l := (*lane)(p)
 	s := l.s
 	s.mu.Lock()
-	s.fillPacketLocked(l, b)
+	if s.muxFillLocked(l, b) {
+		s.fillPacketLocked(l, b)
+	}
 	s.mu.Unlock()
 }
 

@@ -265,6 +265,12 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 			// answers the peer's CLOSE with its own at once (its owner may
 			// still call Retire; it is idempotent).
 			c.Retire(wire.CloseRetire)
+		} else if c.mux {
+			// A MUX trunk answers the peer's CLOSE with its own once a
+			// round places no endpoint frame (M2's rule, trunk-wide): its
+			// views' sessions see PeerClosed and place their last frames
+			// first; a trunk without views closes at once (WP10).
+			c.retireTrunk(wire.CloseRetire)
 		}
 	case wire.TypeGoAway:
 		if _, err := wire.ParseGoAway(p); err != nil {

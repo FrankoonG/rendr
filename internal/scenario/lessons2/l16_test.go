@@ -70,6 +70,8 @@ func windowFullSwitch(t *testing.T, planned bool, closeName string, closeFn func
 	e := newEnv(t, cfg, cfg, nil)
 	a := e.path("a", oneWay)
 	b := e.path("b", oneWay)
+	// The predecessor's own CLOSE at the switch: dedicated (M3-D2).
+	a.cheap, b.cheap = true, true
 	dc, pc := e.open(e.peer(a, b), rendr.DialOptions{})
 	act, ok := activeOf(dc.Status())
 	if !ok {

@@ -434,6 +434,20 @@ func (ln *Listener) refusal() (wire.AckStatus, uint32) {
 	return wire.StatusOK, 0
 }
 
+// viewRefusal is refusal for an OPEN; view reports an OPEN for a new handle
+// on a live MUX trunk this Listener accepted (M3-D63, R1-10): there a
+// closed Listener answers CAPACITY CodeListenerClosed — a carrier refusal
+// that makes the dialer's pool stop OPENing on that trunk and dial instead
+// (the dial then reaches the closed listening socket), without touching
+// its Peer's gone-away set; JOINs on the trunk are still admitted.
+func (ln *Listener) viewRefusal(view bool) (wire.AckStatus, uint32) {
+	st, code := ln.refusal()
+	if view && st == wire.StatusCapacity {
+		code = wire.CodeListenerClosed
+	}
+	return st, code
+}
+
 func (ln *Listener) isClosed() bool {
 	ln.mu.Lock()
 	defer ln.mu.Unlock()

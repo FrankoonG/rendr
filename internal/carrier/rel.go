@@ -381,6 +381,9 @@ func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.T
 			// A probe or sessionless carrier has no session to drain: it
 			// answers the peer's CLOSE with its own at once (M1).
 			c.Retire(wire.CloseRetire)
+		} else if c.mux {
+			// A MUX trunk answers the peer's CLOSE trunk-wide (reader.go).
+			c.retireTrunk(wire.CloseRetire)
 		}
 		return true
 	case wire.TypeGoAway:

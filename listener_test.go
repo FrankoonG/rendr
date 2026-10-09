@@ -561,7 +561,9 @@ func TestListenerClosePendingGoingAway_L50(t *testing.T) {
 		route.Store(ln1)
 		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: func(c net.Conn) error { return route.Load().Handle(c) }})
 		t.Cleanup(link.Close)
-		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		// Two sessions pending at once on carriers of their own: dedicated
+		// (M3-D2; the mux case is TestMuxOpenAfterListenerClose_L50).
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{dedicated(e2eCarrier(link))}})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"math"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -14,10 +15,77 @@ import (
 // carrier, or a fake in the stream's unit tests), never the c argument.
 var _ carrier.Endpoint = (*lane)(nil)
 
-// Handle returns the session handle the lane uses on its carrier
-// (wire.SessionHandle in M1).
+// Handle returns the session handle the lane uses on its carrier: the
+// view's (M3-D4) — wire.SessionHandle on a dedicated carrier, the handle
+// the dialer allocated on a MUX trunk. Every session frame the lane places
+// carries it. It is read through the lane's port (the carrier itself in
+// production); a port without a handle (the stream's fakes) or a bare
+// Conn's 0 means wire.SessionHandle. It runs for every frame placed: the
+// production port is checked by its concrete type first (one word
+// compare; the handle is an immutable field of the view), and only a fake
+// pays for the interface assertion.
 func (l *lane) Handle() uint32 {
+	if c, ok := l.port.(*carrier.Conn); ok {
+		if h := c.Handle(); h != 0 {
+			return h
+		}
+		return wire.SessionHandle
+	}
+	if hp, ok := l.port.(interface{ Handle() uint32 }); ok {
+		if h := hp.Handle(); h != 0 {
+			return h
+		}
+	}
 	return wire.SessionHandle
+}
+
+// muxFillLocked applies the two Fill rules of a view on a started MUX
+// trunk (M3-D8, PA-27) before the lane's own Fill, and reports whether
+// that Fill may run: a passive view held after its OK response places
+// nothing until the dialer's first frame for it arrived (the carrier's
+// writer does not call it then; this is the lane's own guard); a dialer
+// lane that owes its go frame places it first — an ACK for a stream
+// session, a PACK for a packet session (REL-wrapped on a datagram trunk,
+// plain on a stream trunk, R1-12) — and nothing else in a call that could
+// not place it. A dedicated carrier and handle 1 of a trunk owe nothing.
+func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) bool {
+	if l.c != nil && l.c.HeldAfterResponse() {
+		return false
+	}
+	if !l.goOwed {
+		return true
+	}
+	if l.state == LaneDead || s.st.ended {
+		return false
+	}
+	if !s.placeGoLocked(l, b) {
+		return false // the batch is full or has no REL room: the go frame stays first
+	}
+	l.goOwed = false
+	return true
+}
+
+// placeGoLocked places lane l's go frame (M3-D8): for a stream session an
+// ACK of what this side delivered so far with its current right edge (the
+// window already advertised, never a new one: the peer's limit is a max
+// merge, P10); for a packet session a PACK of the datagrams received so
+// far. It carries no flags and changes no ACK duty state: the passive
+// reads it as an ordinary ACK or PACK that ends its response hold.
+func (s *Session) placeGoLocked(l *lane, b *carrier.Batch) bool {
+	st := &s.st
+	if pk := s.pk; pk != nil {
+		pa := wire.Pack{Received: pk.rxCount}
+		if pk.rxCount > 0 {
+			pa.HighestSeq = pk.rxHigh
+		}
+		return b.AddPack(l.Handle(), 0, &pa, true)
+	}
+	win := uint64(0)
+	if st.rightEdge > st.rRead {
+		win = st.rightEdge - st.rRead
+	}
+	a := wire.Ack{Delivered: st.rRead, Window: uint32(min(win, math.MaxUint32))}
+	return b.AddAck(l.Handle(), 0, &a)
 }
 
 // Fill appends the lane's frames to b in one s.mu section (design §4.3):
@@ -37,7 +105,9 @@ func (l *lane) Handle() uint32 {
 func (l *lane) Fill(c *carrier.Conn, b *carrier.Batch) {
 	s := l.s
 	s.mu.Lock()
-	s.fillLocked(l, b)
+	if s.muxFillLocked(l, b) {
+		s.fillLocked(l, b)
+	}
 	s.mu.Unlock()
 }
 

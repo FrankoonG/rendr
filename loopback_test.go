@@ -249,7 +249,7 @@ type loopPair struct {
 	relay *relay
 }
 
-func newLoopPair(t testing.TB, cfg rendr.Config) *loopPair {
+func newLoopPair(t testing.TB, cfg rendr.Config, opts ...func(*rendr.StreamCarrier)) *loopPair {
 	t.Helper()
 	d, err := rendr.NewRuntime(cfg)
 	if err != nil {
@@ -271,7 +271,11 @@ func newLoopPair(t testing.TB, cfg rendr.Config) *loopPair {
 		t.Fatal(err)
 	}
 	r := newRelay(t, l.Addr().String())
-	peer, err := d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{tcp.Carrier("relay", "tcp", r.addr(), tcp.Options{})}})
+	sc := tcp.Carrier("relay", "tcp", r.addr(), tcp.Options{})
+	for _, o := range opts {
+		o(&sc)
+	}
+	peer, err := d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{sc}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +510,9 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 // intact, and the relay sees every connection end in a FIN on both sides.
 func TestLoopbackDrainBoundNoReset_L05(t *testing.T) {
 	check := rendrtest.AssertNoLeak(t)
-	lp := newLoopPair(t, rendr.Config{})
+	// The session's own carrier retires by its CLOSE drain bound:
+	// dedicated (M3-D2; a MUX trunk's CLOSE is the pool's at its last view).
+	lp := newLoopPair(t, rendr.Config{}, func(c *rendr.StreamCarrier) { c.Props.CheapSubflow = true })
 	lp.relay.stallable.Store(true)
 	const rounds, size, stall = 3, 64 << 10, 300 * time.Millisecond
 	msg := make([]byte, size)

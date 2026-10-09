@@ -112,6 +112,7 @@ type viewExt struct {
 	detQ     bool              // in detq or lasts (no further Fill)
 	last     *lastFrame        // a WriteAndClose frame to place
 	refused  bool              // gone through a refusal response: no DETACH (M3-D7)
+	lastSent bool              // a WriteAndClose frame was placed for the view (its first session frame after the response on a dialer view: it ends the passive's hold)
 	onDone   Doorbell          // rung once when Done closes (OnDone)
 	doneShut bool              // Done is closed (set with the close, under mx): OnDone rings at once
 	ringFwd  bool              // ring the bell once at the end (killed views ring at Kill)
@@ -517,6 +518,16 @@ func (t *trunk) classifyLocked(typ wire.Type, h uint32) (muxAct, *Conn, string) 
 			return actIllegal, nil, "an OPEN_ACK or JOIN_ACK for a retiring view"
 		}
 		if v.vx.dialer && v != t.view1 && (!v.vx.attached || v.needGo.Load()) {
+			if v.vx.lastSent {
+				// Our last frame for the view (the RST(AbortWithdrawn) of
+				// an abandoned OPEN, R1-5) ended the passive's hold: what it
+				// placed for the handle meanwhile is legal; a view no
+				// session attached takes none of it (WP10).
+				if !v.vx.attached {
+					return actIgnore, nil, ""
+				}
+				return actDispatch, v, ""
+			}
 			return actIllegal, nil, "a frame before the go frame (the passive broke its hold)"
 		}
 		return actDispatch, v, "" // a retiring lane (M1); dropped after the view's Done
@@ -758,6 +769,29 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				t.runPost(&t.ms.post)
 			}
 			switch {
+			case appended == 0 && b.nearFull(), appended > 0 && used == 0:
+				// The view stays ready for the next round, which the writer
+				// runs by itself (M2's self-continuation, per view; WP10):
+				// a call that placed control frames only, or nothing because
+				// the batch had no room left for what the view owes (a
+				// control frame that did not fit), did not decide that the
+				// view is idle — its endpoint marks itself idle only after a
+				// call that placed nothing, and its producers wake only idle
+				// lanes, so dropping it here lost its next data until an
+				// unrelated wakeup. It goes back onto the ring at once (not
+				// called again in this round): its next call is in the next
+				// round, whose control pass places what a producer added
+				// meanwhile before any payload (L16).
+				sc[k] = nil
+				if v.ready.CompareAndSwap(false, true) {
+					t.mx.Lock()
+					if v.vx.inTable && v.vx.fillOK.Load() {
+						t.pushReadyLocked(v)
+					} else {
+						v.ready.Store(false)
+					}
+					t.mx.Unlock()
+				}
 			case used == 0:
 				sc[k] = nil // a Wake during or after the call pushed it again
 			case !v.ready.CompareAndSwap(false, true):
@@ -996,7 +1030,10 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 // (M3-D4): the view in state opening, its first frame copied and queued in
 // the opens FIFO behind every earlier handle (awaitResponse releases it),
 // the view count raised. At the end of the handle space the trunk seals.
-func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr) (*Conn, error) {
+// fromBudgets is the attempt's budget-offer intent (WithBudgetOffer): a
+// packet OPEN on a datagram trunk then lowers its pmtu to the trunk's
+// budget, as buildH1 does for handle 1 (W4 L3-1).
+func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr, fromBudgets bool) (*Conn, error) {
 	if kind != wire.TypeOpen && kind != wire.TypeJoin {
 		return nil, fmt.Errorf("rendr/carrier: openView of %v", kind)
 	}
@@ -1025,6 +1062,9 @@ func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr) (*Conn
 	v := t.newViewLocked(h, viewOpening)
 	v.vx.dialer, v.vx.first, v.vx.sess = true, kind, sess
 	v.vx.firstP = append([]byte(nil), payload...)
+	if t.dg != nil {
+		patchViewOffer(kind, v.vx.firstP, int(t.dg.budget.Load()), fromBudgets) // the trunk's current budget (§A3.3)
+	}
 	v.vx.resp = make(chan struct{})
 	t.opens[(t.ms.opHead+t.ms.opN)%len(t.opens)] = v
 	t.ms.opN++
@@ -1074,7 +1114,16 @@ func (c *Conn) awaitResponseMux(ctx context.Context, check func(*wire.PrefaceAck
 		return &Established{Conn: c, Ack: ack, Resp: hdr, Payload: p}, nil
 	}
 	if err := ctx.Err(); err != nil {
-		c.Kill(CauseLocalClose, "attempt ended before the response")
+		if c.vx.first == wire.TypeOpen && errors.Is(context.Cause(ctx), ErrWithdrawn) {
+			// A withdrawn OPEN (its session never opened): RST(AbortWithdrawn)
+			// for the handle, then DETACH(ended), so the passive's pending
+			// session withdraws at once (R1-5 rule 1, L49) — as Establish's
+			// withdrawal RST on a dedicated carrier. A first frame never
+			// placed leaves a handle gap and places nothing.
+			c.WriteAndClose(wire.TypeRst, 0, c.handle, rstWithdrawnPayload, time.Time{})
+		} else {
+			c.Kill(CauseLocalClose, "attempt ended before the response")
+		}
 		return nil, &EstablishError{Stage: "response", Cause: CauseLocalClose, PrefaceOK: true, Instance: t.peer, Err: context.Cause(ctx)}
 	}
 	c.Kill(CauseTransportError, "the carrier ended before the response")

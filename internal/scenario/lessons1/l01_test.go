@@ -382,7 +382,8 @@ func retireNoFailover(t *testing.T, at string, i int) {
 		SelectorDwell: 200 * time.Millisecond, SelectorCooldown: time.Hour,
 		RetireGrace: time.Second,
 	}
-	f := newFixture(t, opts{ov: ov}, "a", "b")
+	// The planned CLOSE of the session's own carrier: dedicated (M3-D2).
+	f := newFixture(t, opts{ov: ov, dedicated: true}, "a", "b")
 	la, lb := f.link("a"), f.link("b")
 	la.SetDelay(time.Millisecond, 0)
 	lb.SetDelay(time.Duration(4+i%3)*time.Millisecond, 0)

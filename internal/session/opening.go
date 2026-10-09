@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/sched"
@@ -468,7 +469,11 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 		n := wire.PutJoin(j[:], &wire.Join{SID: s.id, Mode: uint8(s.p.Mode), RxNext: rx})
 		payload = j[:n]
 	}
-	ctx, cancel := context.WithCancelCause(context.Background())
+	base := context.Background()
+	if f := d.spec.AttemptContext; f != nil {
+		base = f(base)
+	}
+	ctx, cancel := context.WithCancelCause(base)
 	at := &attempt{slot: i, id: sl.cad.Start(now), cid: s.env.Carrier.IDs.Next(), kind: kind, cancel: cancel}
 	sl.att = at
 	d.running++
@@ -503,7 +508,20 @@ func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, 
 	if at.kind == wire.TypeJoin {
 		check = a.joinCheck
 	}
-	est, err := carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
+	var est *carrier.Established
+	var err error
+	if p := a.d.spec.Pool; p != nil {
+		// Through the Peer's pool (M3-D16): a live trunk's new view, a
+		// coalesced wait or a dial of its own. A JOIN uses only trunks of
+		// the bound instance (M3-D17; s.peer is final once a JOIN starts).
+		var inst [16]byte
+		if at.kind == wire.TypeJoin {
+			inst = s.peer
+		}
+		est, err = p.Attempt(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey())
+	} else {
+		est, err = carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
+	}
 	posted = true
 	a.postResult(at, est, err)
 }
@@ -558,9 +576,12 @@ func discardEst(est *carrier.Established, kind wire.Type) {
 }
 
 // withdrawConn answers an OPEN_ACK(OK) nobody keeps with RST(AbortWithdrawn)
-// on the unstarted carrier and closes it (V8).
+// on the unstarted carrier and closes it (V8). On a view of a started MUX
+// trunk (a fast-path result) the RST is the view's last frame and DETACH
+// follows; the trunk and its other views are untouched (R1-2, R1-5 rule
+// 1). A fresh trunk's view 1 keeps M2's path: its waiters retry (M3-D19).
 func withdrawConn(c *carrier.Conn) {
-	c.WriteAndClose(wire.TypeRst, 0, wire.SessionHandle, rstWithdrawn, time.Time{})
+	c.WriteAndClose(wire.TypeRst, 0, c.Handle(), rstWithdrawn, time.Time{})
 }
 
 // discardEst is discardEst for a result the running actor drops: the
@@ -573,10 +594,45 @@ func (a *actor) discardEst(est *carrier.Established, kind wire.Type) {
 }
 
 // killEst kills the carrier of a result the actor does not attach (a
-// refusal, a mismatch, a violation) and hands it to the exit join.
+// refusal, a mismatch, a violation) and hands it to the exit join. On a
+// view of a started MUX trunk a refusal or a mismatch ends the view only
+// (Kill: DETACH(ended), R1-2); a protocol violation kills the trunk and so
+// every view on it (KillTrunk, M3-D15). On a dedicated or unstarted
+// carrier the two are M2's Kill.
 func (a *actor) killEst(est *carrier.Established, cause carrier.Cause, detail string) {
-	est.Conn.Kill(cause, detail)
+	if cause == carrier.CauseProtocolViolation {
+		est.Conn.KillTrunk(cause, detail)
+	} else {
+		est.Conn.Kill(cause, detail)
+	}
 	a.dropConn(est.Conn)
+}
+
+// viewDetached reports a result whose view of a MUX trunk the peer
+// detached before the attach (R1-9, attached-pending × the peer's DETACH).
+// A dedicated carrier keeps M2's reading: a peer CLOSE that arrives before
+// the attach is handled by the attached lane as any peer CLOSE.
+func viewDetached(c *carrier.Conn) bool { return c.Mux() && c.PeerClosed() }
+
+// poolKey identifies the session to the Peer's pool (M3-D17, R1-6: at most
+// one unreaped view of a session per trunk): the session's address, which
+// stays unique while any of its views lives (each view's endpoint
+// references the session).
+func (s *Session) poolKey() uintptr { return uintptr(unsafe.Pointer(s)) }
+
+// viewBudget is the budget side of a lane's carrier for the packet checks
+// of a response (pktOpenAckLocked, pktJoinAckLocked): the carrier itself,
+// except that a view opened on a started MUX trunk (handle above 1) keeps
+// the trunk's negotiated budget — SetBudget is never called after Start
+// (M2-D50, M3-D24) — so its answer is only validated against it.
+type viewBudget struct{ *carrier.Conn }
+
+// SetBudget fixes an unstarted carrier's budget; a no-op on a view of a
+// started trunk.
+func (v viewBudget) SetBudget(cmtu int) {
+	if v.Handle() == wire.SessionHandle {
+		v.Conn.SetBudget(cmtu)
+	}
 }
 
 // cancelAttemptsLocked withdraws every attempt in flight (C25): their
@@ -793,14 +849,17 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, window uint32) {
 	s := a.s
 	d := a.d
-	if dead, _, _, _ := est.Conn.Death(); dead {
+	if dead, _, _, _ := est.Conn.Death(); dead || viewDetached(est.Conn) {
+		// Ended before the attach — also a view whose peer detached it
+		// while it was attached-pending (R1-9): a carrier refusal, no
+		// cadence failure, no lane.
 		a.dropConn(est.Conn)
 		a.finish(now, i, at, sched.OutcomeRefused)
 		return
 	}
 	inst := est.Ack.Instance
 	if s.pk != nil && (!d.opened || inst == s.peer) {
-		if err := s.pktOpenAckLocked(est.Conn, window, !d.opened); err != nil {
+		if err := s.pktOpenAckLocked(viewBudget{est.Conn}, window, !d.opened); err != nil {
 			a.pktBadAnswerLocked(now, i, at, est, err)
 			return
 		}
@@ -884,6 +943,15 @@ func (a *actor) openRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 // (beyond what was sent kills that carrier); then the lane attaches.
 func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, rxNext uint64) {
 	s := a.s
+	if viewDetached(est.Conn) {
+		// The peer detached the view while it was attached-pending (R1-9):
+		// a carrier refusal, no cadence failure, no lane; our DETACH(ended)
+		// answered it already.
+		a.dropConn(est.Conn)
+		a.finish(now, i, at, sched.OutcomeRefused)
+		a.switchFailedLocked(now, i)
+		return
+	}
 	if dead, _, _, _ := est.Conn.Death(); dead || est.Ack.Instance != s.peer {
 		a.killEst(est, carrier.CauseInstanceMismatch, "JOIN answered by another instance")
 		a.finish(now, i, at, sched.OutcomeRefused)
@@ -891,7 +959,7 @@ func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		return
 	}
 	if s.pk != nil {
-		if err := s.pktJoinAckLocked(est.Conn, rxNext); err != nil {
+		if err := s.pktJoinAckLocked(viewBudget{est.Conn}, rxNext); err != nil {
 			a.pktBadAnswerLocked(now, i, at, est, err)
 			a.switchFailedLocked(now, i)
 			return
@@ -957,6 +1025,9 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	}
 	sl.gen++
 	l := a.newLaneLocked(now, est.Conn, i, sl.gen, LaneMember)
+	// A view opened on a started MUX trunk owes its go frame (M3-D8): the
+	// passive holds the view after its OK response until it arrives.
+	l.goOwed = est.Conn.Handle() != wire.SessionHandle
 	a.finish(now, i, at, sched.OutcomeAttached)
 	switch {
 	case s.p.Mode.members() && sl.member:
