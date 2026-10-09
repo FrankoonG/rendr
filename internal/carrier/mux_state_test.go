@@ -28,6 +28,12 @@ func TestHandleStateMachine(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) { passiveRows(t) })
 	})
 	seeds := 1000
+	if carrierRace {
+		// R1-23 lever 1 (I3): the walk took 25.6 s of the Linux race lane's
+		// carrier package; the race lane walks a quarter of the seeds with
+		// the same checks, the non-race lanes all of them.
+		seeds = 250
+	}
 	if testing.Short() {
 		seeds = 100
 	}
