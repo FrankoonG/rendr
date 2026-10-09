@@ -18,22 +18,30 @@ func (s *Session) fillLocked(l *lane, b *carrier.Batch) {
 		return
 	}
 	start := b.Len()
+	ctl := b.ControlOnly() // a MUX writer's control pass (quota 0, R1-1 rule 5)
 	if s.fillControlLocked(l, b) && l.data {
-		// 5. DATA, then 6. the FIN (race: from the lane's own cursor, and
-		// the FIN once per member, M3-D30).
+		// 5. DATA (not in a control pass), then 6. the FIN (race: from the
+		// lane's own cursor, and the FIN once per member, M3-D30).
 		if s.p.Mode == ModeRace {
-			s.raceFillDataLocked(l, b)
+			if !ctl {
+				s.raceFillDataLocked(l, b)
+			}
 			s.raceFinLocked(l, b)
 		} else {
-			s.fillDataLocked(l, b)
+			if !ctl {
+				s.fillDataLocked(l, b)
+			}
 			if st := &s.st; s.finDueLocked() && b.AddFin(wire.SessionHandle, st.fin.off) {
 				st.fin.lane = l
 				l.finHere = true
 			}
 		}
 	}
-	// 7.
-	l.idle = b.Len() == start
+	// 7. Only a call that may place payload decides idleness: a control
+	// pass places control frames only, so DATA may still wait (R1-1).
+	if !ctl {
+		l.idle = b.Len() == start
+	}
 }
 
 // refusedLocked reports that l's first response frame, already placed, was

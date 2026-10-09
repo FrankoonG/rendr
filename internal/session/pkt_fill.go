@@ -23,9 +23,14 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 		return // C1: never place anything on a lane the actor declared dead
 	}
 	start := b.Len()
-	l.capMarked = false
+	ctl := b.ControlOnly() // a MUX writer's control pass (quota 0, R1-1 rule 5)
+	if !ctl {
+		l.capMarked = false
+	}
 	if s.fillControlLocked(l, b) && l.data {
-		s.fillDgramLocked(l, b)
+		if !ctl {
+			s.fillDgramLocked(l, b)
+		}
 		st, pk := &s.st, s.pk
 		var due bool
 		if s.p.Mode == ModeRace {
@@ -44,7 +49,10 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 			}
 		}
 	}
-	l.idle = b.Len() == start
+	// A control pass decides neither idleness nor the cap mark (R1-1).
+	if !ctl {
+		l.idle = b.Len() == start
+	}
 }
 
 // fillDgramLocked places queued datagrams on data lane l: a stream lane
