@@ -795,3 +795,93 @@ func TestRaceRequeueBelowLiveCursor(t *testing.T) {
 		stEnd(s, errClosed)
 	}
 }
+
+// TestRaceStreamWakeEveryMember (M3-D30; the stream variant of
+// TestRaceWakeEveryMember, wired by WP4's wakeDataLocked dispatch): every
+// race member places every byte, so one Write wakes every idle member that
+// is not write-blocked, not only the first data lane; pullableLocked counts
+// the bytes of the least advanced live member (racePullableLocked), so a
+// member that placed everything is passed by a wake while a slower one
+// still owes its copy; once the peer acknowledged everything nothing is
+// pullable, and a member is woken again only for its FIN.
+func TestRaceStreamWakeEveryMember(t *testing.T) {
+	s := rcSender(stOpt{window: 4 << 20})
+	var ls []*lane
+	var ps []*stPort
+	for id := uint32(1); id <= 3; id++ {
+		l, p := stAddLane(s, id, true)
+		ls, ps = append(ls, l), append(ps, p)
+	}
+	rcRaceLanes(s)
+	ps[1].set(func(f *stPort) { f.blocked = true })
+	s.mu.Lock()
+	for _, l := range ls {
+		l.idle = true
+	}
+	s.mu.Unlock()
+	wakes := func() (w [3]int) {
+		for i, p := range ps {
+			w[i] = p.wakeCount()
+		}
+		return w
+	}
+	pullable := func() uint64 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.pullableLocked()
+	}
+	w0 := wakes()
+	rcWrite(t, s, stPattern(0, 64<<10))
+	if w := wakes(); w[0]-w0[0] != 1 || w[1] != w0[1] || w[2]-w0[2] != 1 {
+		t.Fatalf("one Write woke the members %v times, want once each but the write-blocked member 1",
+			[3]int{w[0] - w0[0], w[1] - w0[1], w[2] - w0[2]})
+	}
+	if n := pullable(); n != 64<<10 {
+		t.Fatalf("pullable %d before any Fill, want 64 KiB", n)
+	}
+	// Member 0 places everything and goes idle; members 1 and 2 still owe
+	// their copies: pullable stays 64 KiB, and a wake passes member 0 but
+	// wakes the idle member 2 again.
+	f0, b0 := stFill(ls[0], time.Now())
+	b0.ReleaseRefs()
+	if _, n := rcDataSpan(f0); n != 64<<10 {
+		t.Fatalf("member 0 placed %d bytes, want 64 KiB", n)
+	}
+	if n := pullable(); n != 64<<10 {
+		t.Fatalf("pullable %d after the fastest member's Fill, want 64 KiB (the slowest member's)", n)
+	}
+	s.mu.Lock()
+	for _, l := range ls {
+		l.idle = true
+	}
+	s.mu.Unlock()
+	w0 = wakes()
+	s.mu.Lock()
+	s.wakeDataLocked(time.Now())
+	s.mu.Unlock()
+	if w := wakes(); w[0] != w0[0] || w[1] != w0[1] || w[2]-w0[2] != 1 {
+		t.Fatalf("a wake woke the members %v times, want member 2 only",
+			[3]int{w[0] - w0[0], w[1] - w0[1], w[2] - w0[2]})
+	}
+	// The peer acknowledges everything on member 0: nothing is pullable,
+	// and no member is woken for bytes.
+	if err := stSendAck(ls[0], 0, 64<<10, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	if n := pullable(); n != 0 {
+		t.Fatalf("pullable %d after the full ACK, want 0", n)
+	}
+	s.mu.Lock()
+	for _, l := range ls {
+		l.idle = true
+	}
+	s.mu.Unlock()
+	w0 = wakes()
+	s.mu.Lock()
+	s.wakeDataLocked(time.Now())
+	s.mu.Unlock()
+	if w := wakes(); w != w0 {
+		t.Fatalf("a wake with nothing to place woke the members %v times", [3]int{w[0] - w0[0], w[1] - w0[1], w[2] - w0[2]})
+	}
+	stEnd(s, errClosed)
+}
