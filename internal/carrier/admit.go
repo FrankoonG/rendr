@@ -123,12 +123,15 @@ func (t *trunk) killFlood(detail string) {
 // responsePlacedLocked runs when a passive view's Fill placed its first
 // response (M3-D7, M3-D8): an OK response holds the view until the
 // dialer's first frame for it (its go frame) — nothing else is placed for
-// it meanwhile; a refusal ends the handle without a DETACH.
+// it meanwhile; a refusal ends the handle without a DETACH. A response the
+// view's Kill queued during this Fill is withdrawn: the handle gets one
+// response (withdrawResponseLocked).
 func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, p *postList) {
 	if !v.vx.needResp.Load() {
 		return
 	}
 	v.vx.needResp.Store(false)
+	killed := t.withdrawResponseLocked(v)
 	if st != wire.StatusOK {
 		t.refusedLocked(v, p)
 		t.endViewLocked(v, CauseLocalClose, "closed after a refusal", p)
@@ -138,7 +141,7 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 		v.state = viewHeld
 		v.held.Store(true)
 		v.vx.fillOK.Store(false) // R1-1's ready set skips it until the go frame
-		if v.vx.retireQ.Load() {
+		if v.vx.retireQ.Load() || killed {
 			// Its session ended while the OK was due: held, it places its
 			// DETACH(ended) only (R1-9).
 			t.abandonLocked(v, wire.DetachEnded, p)
