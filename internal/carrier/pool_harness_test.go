@@ -17,9 +17,9 @@ import (
 // end runs the production passive handshake (ReadHello) and starts the
 // passive trunk, answering handle 1 and every admitted view — and a pool
 // over factories of such servers. Results are attached the way the
-// session attaches them: Start, then the pool's publication hook that
-// Conn.Start runs on view 1 of a fresh trunk (poolStarted; see the WP9
-// contract note). Everything runs inside testing/synctest bubbles.
+// session attaches them: Start, which on view 1 of a fresh trunk runs the
+// pool's publication (poolStarted). Everything runs inside
+// testing/synctest bubbles.
 
 // poolServer is the passive end of one or more factories.
 type poolServer struct {
@@ -255,17 +255,16 @@ func (pt *poolT) goAttempt(ctx context.Context, kind wire.Type, sid byte, ch cha
 }
 
 // attach starts an attempt's carrier as a session does: Start with an
-// endpoint, then — on view 1 of a fresh trunk — the publication hook
-// Conn.Start runs (poolStarted; see the WP9
-// contract note), whose asynchronous publication the bubble
-// settles. Must run inside a synctest bubble.
+// endpoint. On view 1 of a fresh trunk Conn.Start itself runs the pool's
+// publication (poolStarted), asynchronously; the bubble settles it, so
+// every pool test checks publication through Start end to end. Must run
+// inside a synctest bubble.
 func (pt *poolT) attach(est *Established) *mView {
 	mv := &mView{c: est.Conn, ep: &dEP{}, src: newVSource(pt.env), bell: &hBell{}, done: &hBell{}}
 	mv.ep.fill = mv.src.fill
 	est.Conn.OnDone(mv.done)
 	est.Conn.Start(mv.ep, mv.bell, StartOptions{})
 	if est.Fresh {
-		est.Conn.poolStarted() // redundant (a no-op) once Conn.Start calls it: WP9 contract note
 		synctest.Wait()
 	}
 	return mv
