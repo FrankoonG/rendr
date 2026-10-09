@@ -2,6 +2,7 @@ package adversarial
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -630,6 +631,75 @@ func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 			}
 		})
 	}
+	t.Run("stream", func(t *testing.T) {
+		eachSetup(t, replayAcrossStreamSessions)
+	})
+}
+
+// replayAcrossStreamSessions is TestAdvDatagramReplayAcrossSessions_L43/
+// stream, its own expectation (R1-35): the packet sessions A and B, a Peer
+// each, on stream carriers — dedicated, or a stream MUX trunk per link
+// each — send 500 datagrams per second dialer → passive; then A's frames
+// are forwarded into B's attacked carrier from B's next frame boundary on
+// (Tamper.Splice: a stream relay that replays one session's datagrams into
+// another's carrier). B's passive kills that carrier (protocol_violation
+// "fseq": A's frames continue A's sequence) before any of A's datagrams
+// reaches B: B's verifiers see none of them. B's sessions migrate — Death
+// 1 for the attacked one, and for each of its neighbours on the shared
+// trunk (a packet member that placed a DGRAM within the last PacketPing
+// counts, M2-D44) — and lose at most what was in flight on the dead
+// carrier; A's sessions are untouched and lose nothing.
+func replayAcrossStreamSessions(t *testing.T, s setup) {
+	w := newWorld(t, s, worldOpts{})
+	as, bs := w.openPacketN(w.streamPeer()), w.openPacketN(w.streamPeer())
+	fa := startPacketFlows(t, as, 4372, packetRate)
+	fb := startPacketFlows(t, bs, 4352, packetRate)
+	time.Sleep(time.Second)
+	ta, tb := w.tamperOf(target(t, s, as[0].d.Status())), w.tamperOf(target(t, s, bs[0].d.Status()))
+	tb.Splice(rendrtest.Up, ta, 0)
+	waitFor(t, 5*time.Second, "A's frames forwarded into B's carrier (stimulus)", func() bool { return tb.Stats().SplicedBytes > 0 })
+	hit := w.hit(t, spliced)
+	if hit.tm != tb {
+		t.Fatalf("the splice started on carrier %d, not B's", hit.id)
+	}
+	violated(t, "B's carrier", endDead(t, "B's passive", bs[0].p.Status, hit.id), "fseq")
+	if !hasDgram(tb.Log(rendrtest.Up)) {
+		t.Fatal("stimulus: none of A's DGRAMs was forwarded into B's carrier")
+	}
+	time.Sleep(time.Second)
+	fs := append(slices.Clone(fa), fb...)
+	haltAll(t, fs) // every verifier: no foreign, damaged or duplicated datagram
+	time.Sleep(time.Second)
+	for i, f := range fa {
+		if k := f.lost(); k != 0 {
+			t.Fatalf("load: A's session %d lost %d datagrams", i, k)
+		}
+	}
+	for _, f := range fb {
+		// Only what was in flight on the dead carrier: at most its link
+		// queue and one round trip (50), as flipStreamDgram.
+		if f.lost() > 50 {
+			t.Fatalf("load: %s lost %d of %d datagrams", f.name, f.lost(), f.accepted.Load())
+		}
+	}
+	deathsAre(t, s, bs[0].d.Status, bs[0].p.Status, 1)
+	neighboursPacket(t, s, bs, 0, 1)
+	for i, x := range as {
+		untouchedPacket(t, fmt.Sprintf("A's session %d", i), x)
+	}
+	endPackets(t, slices.Concat(as, bs), fs)
+	w.close()
+}
+
+// hasDgram reports whether a frame tap log holds a DGRAM forwarded from
+// another tamper (Spliced).
+func hasDgram(log []rendrtest.FrameRec) bool {
+	for _, r := range log {
+		if r.Spliced && r.Type == rendrtest.FrameDgram {
+			return true
+		}
+	}
+	return false
 }
 
 // replayAcrossSessions is one form of TestAdvDatagramReplayAcrossSessions_L43.

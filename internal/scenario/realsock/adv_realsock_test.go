@@ -3,9 +3,11 @@ package realsock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,10 +103,12 @@ func (n *advNet) serve(l net.Listener, h func(net.Conn)) {
 	}
 }
 
-// peer returns a dialer Peer with one dedicated factory through the relay.
-func (n *advNet) peer() *rendr.Peer {
+// peer returns a dialer Peer with one factory through the relay: a
+// dedicated one (Props.CheapSubflow), or with mux one whose carriers the
+// Peer's sessions share (rendr mux).
+func (n *advNet) peer(mux bool) *rendr.Peer {
 	n.t.Helper()
-	p, err := n.d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{rendr.StreamCarrier{Name: "relay", Props: rendr.Props{CheapSubflow: true},
+	p, err := n.d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{rendr.StreamCarrier{Name: "relay", Props: rendr.Props{CheapSubflow: !mux},
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			var d net.Dialer
 			c, err := d.DialContext(ctx, "tcp", n.rl.Addr().String())
@@ -325,73 +329,96 @@ func advEnd(t testing.TB, dc, pc *rendr.Conn) {
 	}
 }
 
-// TestRelaySpliceRealTCP_L43: a Tamper relays a dedicated carrier between
-// real loopback TCP sockets (the MUX half adds a 4-session MUX trunk), and
-// damages it three ways while 16 MiB move dialer → passive (4 MiB under
-// -race): "flip" — one bit of a DATA payload: the passive kills the
-// carrier (crc mismatch); "splice" — session X's frames spliced into
-// session Y's carrier: Y's passive kills it (fseq), X is untouched;
-// "switch" — the relay reconnects its upstream mid-stream: the fresh
-// connection is closed by the passive's handshake (not "RND2"), the
-// carrier dies on both ends. Each time the session redials through the
-// relay and its stream arrives intact; nothing leaks.
+// TestRelaySpliceRealTCP_L43: a Tamper relays a carrier between real
+// loopback TCP sockets — a dedicated carrier of one session, and ("mux/")
+// a MUX trunk four sessions share — and damages it three ways while 16 MiB
+// move dialer → passive (4 MiB under -race; on the trunk a quarter per
+// session): "flip" — one bit of a DATA payload: the passive kills the
+// carrier (crc mismatch) for every session on it; "splice" — the frames of
+// session X's carrier (a trunk of four sessions X) spliced into session
+// Y's (a trunk of four sessions Y, another Peer's): Y's passive kills it
+// (fseq) for every Y, every X is untouched; "switch" — the relay
+// reconnects its upstream mid-stream: the fresh connection is closed by
+// the passive's handshake (not "RND2"), the carrier dies on both ends of
+// every session on it. Each time the sessions redial through the relay and
+// every stream arrives intact; nothing leaks.
 func TestRelaySpliceRealTCP_L43(t *testing.T) {
 	size := int64(16 << 20)
 	if advRace {
 		size = 4 << 20
 	}
+	advRows(t, size, false)
+	t.Run("mux", func(t *testing.T) { advRows(t, size, true) })
+}
+
+// advRows runs the three rows on a dedicated carrier (one session) or on
+// a MUX trunk (four sessions moving size/4 each).
+func advRows(t *testing.T, size int64, mux bool) {
+	k := 1
+	if mux {
+		k, size = 4, size/4
+	}
 	t.Run("flip", func(t *testing.T) {
 		t.Cleanup(rendrtest.AssertNoLeak(t))
 		n := newAdvNet(t)
 		defer n.close()
-		dc, pc := n.open(n.peer())
-		f := advStart(dc, pc, size, 1)
-		advUntil(t, "a quarter of the transfer", func() bool { return f.got.Load() >= size/4 })
-		id, tm := n.tamperOf(dc)
+		ds, ps := n.openK(n.peer(mux), k)
+		fs := advStartAll(ds, ps, size, 1)
+		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
+		id, tm := n.shared(ds)
 		tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameData), 13*8+20)
 		advUntil(t, "the flip (stimulus)", func() bool { return tm.Stats().Flipped == 1 })
-		if c := advDead(t, pc.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "crc mismatch") {
-			t.Fatalf("the flipped carrier died of %v %q, want protocol_violation crc mismatch", c.DeathCause, c.DeathDetail)
+		for i, pc := range ps {
+			if c := advDead(t, pc.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "crc mismatch") {
+				t.Fatalf("session %d: the flipped carrier died of %v %q, want protocol_violation crc mismatch", i, c.DeathCause, c.DeathDetail)
+			}
 		}
-		f.wait(t, "the transfer across the flip")
-		advEnd(t, dc, pc)
+		advWaitAll(t, fs, "the transfer across the flip")
+		advEndAll(t, ds, ps)
 	})
 	t.Run("splice", func(t *testing.T) {
 		t.Cleanup(rendrtest.AssertNoLeak(t))
 		n := newAdvNet(t)
 		defer n.close()
-		peer := n.peer()
-		xd, xp := n.open(peer)
-		yd, yp := n.open(peer)
-		fx, fy := advStart(xd, xp, size, 2), advStart(yd, yp, size, 3)
-		advUntil(t, "a quarter of both", func() bool { return fx.got.Load() >= size/4 && fy.got.Load() >= size/4 })
-		_, tx := n.tamperOf(xd)
-		id, ty := n.tamperOf(yd)
+		// Dedicated: X and Y on carriers of their own of one Peer; MUX: a
+		// Peer each, so each has a trunk of its own.
+		px, py := n.peer(mux), n.peer(mux)
+		if !mux {
+			py = px
+		}
+		xd, xp := n.openK(px, k)
+		yd, yp := n.openK(py, k)
+		fx, fy := advStartAll(xd, xp, size, 2), advStartAll(yd, yp, size, 20)
+		advUntil(t, "a quarter of both", func() bool { return fx[0].got.Load() >= size/4 && fy[0].got.Load() >= size/4 })
+		_, tx := n.shared(xd)
+		id, ty := n.shared(yd)
 		ty.Splice(rendrtest.Up, tx, 0)
 		advUntil(t, "X's frames in Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 })
-		if c := advDead(t, yp.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "fseq") {
-			t.Fatalf("Y's spliced carrier died of %v %q, want protocol_violation fseq", c.DeathCause, c.DeathDetail)
+		for i, pc := range yp {
+			if c := advDead(t, pc.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "fseq") {
+				t.Fatalf("Y %d: the spliced carrier died of %v %q, want protocol_violation fseq", i, c.DeathCause, c.DeathDetail)
+			}
 		}
-		fx.wait(t, "X")
-		fy.wait(t, "Y")
-		for _, st := range []rendr.SessionStatus{xd.Status(), xp.Status()} {
+		advWaitAll(t, fx, "X")
+		advWaitAll(t, fy, "Y")
+		for _, st := range advStatuses(xd, xp) {
 			for _, c := range st.Carriers {
 				if c.State == rendr.CarrierDead {
 					t.Fatalf("X (%v) lost carrier %+v to Y's splice", st.Role, c)
 				}
 			}
 		}
-		advEnd(t, xd, xp)
-		advEnd(t, yd, yp)
+		advEndAll(t, xd, xp)
+		advEndAll(t, yd, yp)
 	})
 	t.Run("switch", func(t *testing.T) {
 		t.Cleanup(rendrtest.AssertNoLeak(t))
 		n := newAdvNet(t)
 		defer n.close()
-		dc, pc := n.open(n.peer())
-		f := advStart(dc, pc, size, 4)
-		advUntil(t, "a quarter of the transfer", func() bool { return f.got.Load() >= size/4 })
-		id, tm := n.tamperOf(dc)
+		ds, ps := n.openK(n.peer(mux), k)
+		fs := advStartAll(ds, ps, size, 4)
+		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
+		id, tm := n.shared(ds)
 		var fresh *advReadRec
 		tm.SwitchUpstream(func() (net.Conn, error) {
 			c, err := net.Dial("tcp", n.pl.Addr().String())
@@ -411,16 +438,75 @@ func TestRelaySpliceRealTCP_L43(t *testing.T) {
 		if k, err := fresh.result(); k != 0 || errors.Is(err, net.ErrClosed) {
 			t.Fatalf("the fresh connection: %d bytes back, then %v; want none, then the passive's close", k, err)
 		}
-		for _, get := range []func() rendr.SessionStatus{dc.Status, pc.Status} {
-			if c := advDead(t, get, id); c.DeathCause != rendr.CauseTransportError {
-				t.Fatalf("the switched carrier died of %v %q, want transport_error", c.DeathCause, c.DeathDetail)
+		for _, st := range [][]*rendr.Conn{ds, ps} {
+			for _, c := range st {
+				if d := advDead(t, c.Status, id); d.DeathCause != rendr.CauseTransportError {
+					t.Fatalf("the switched carrier died of %v %q, want transport_error", d.DeathCause, d.DeathDetail)
+				}
 			}
 		}
 		advUntil(t, "no handshake left on the passive", func() bool { return n.p.Status().Handshakes == 0 })
-		if st, sc := n.p.Status(), n.p.Status().Sessions; sc.Open+sc.Orphaned+sc.Lingering != 1 || sc.Pending != 0 || st.AcceptBacklog != [2]int{} {
+		if st, sc := n.p.Status(), n.p.Status().Sessions; sc.Open+sc.Orphaned+sc.Lingering != k || sc.Pending != 0 || st.AcceptBacklog != [2]int{} {
 			t.Fatalf("the passive kept state from the fresh connection: %+v", st)
 		}
-		f.wait(t, "the transfer across the switch")
-		advEnd(t, dc, pc)
+		advWaitAll(t, fs, "the transfer across the switch")
+		advEndAll(t, ds, ps)
 	})
+}
+
+// openK opens k sessions over p.
+func (n *advNet) openK(p *rendr.Peer, k int) (ds, ps []*rendr.Conn) {
+	n.t.Helper()
+	for range k {
+		dc, pc := n.open(p)
+		ds, ps = append(ds, dc), append(ps, pc)
+	}
+	return ds, ps
+}
+
+// shared returns the active carrier and its tamper of the sessions ds,
+// which must all have it (one dedicated session; a MUX trunk's four).
+func (n *advNet) shared(ds []*rendr.Conn) (rendr.CarrierID, *rendrtest.Tamper) {
+	n.t.Helper()
+	id, tm := n.tamperOf(ds[0])
+	for i, dc := range ds[1:] {
+		if j, _ := n.tamperOf(dc); j != id {
+			n.t.Fatalf("premise: session %d is active on carrier %d, session 0 on %d (one trunk)", i+1, j, id)
+		}
+	}
+	return id, tm
+}
+
+// advStartAll starts a flow on every session (seeds seed, seed+1, ...).
+func advStartAll(ds, ps []*rendr.Conn, size int64, seed uint64) []*advFlow {
+	fs := make([]*advFlow, len(ds))
+	for i := range ds {
+		fs[i] = advStart(ds[i], ps[i], size, seed+uint64(i))
+	}
+	return fs
+}
+
+// advWaitAll waits for every flow.
+func advWaitAll(t testing.TB, fs []*advFlow, what string) {
+	t.Helper()
+	for i, f := range fs {
+		f.wait(t, fmt.Sprintf("%s, session %d", what, i))
+	}
+}
+
+// advEndAll ends every session cleanly.
+func advEndAll(t testing.TB, ds, ps []*rendr.Conn) {
+	t.Helper()
+	for i := range ds {
+		advEnd(t, ds[i], ps[i])
+	}
+}
+
+// advStatuses returns the status of every end of the sessions.
+func advStatuses(ds, ps []*rendr.Conn) []rendr.SessionStatus {
+	var out []rendr.SessionStatus
+	for _, c := range slices.Concat(ds, ps) {
+		out = append(out, c.Status())
+	}
+	return out
 }
