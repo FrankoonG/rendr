@@ -128,6 +128,8 @@ type trunk struct {
 	cursor    int              // the writer's rotating DRR start (M3-D10)
 	listener  any              // passive: the root's record of the Listener that accepted the trunk (opaque here; admission uses its queues, §A5.6)
 	viewDone  func(*Conn)      // dialer: the pool's view-count hook, called once per view at its Done (onViewDone)
+
+	ms muxState // the rest of the mux state (mux.go)
 }
 
 // viewState is a view's handle lifecycle state (M3 design §A5.4). Its
@@ -212,6 +214,9 @@ func newTrunk(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name
 // last-hit cache, else the view table under mx) is WP8's. The reader calls
 // route for every session frame.
 func (t *trunk) route(h uint32) *Conn {
+	if t.mux {
+		return t.routeMux(h) // mux.go
+	}
 	if v := t.view1; v.handle == h {
 		return v
 	}
@@ -225,6 +230,10 @@ func (t *trunk) route(h uint32) *Conn {
 // over the ready views with quota 0, then deficit round robin with a
 // payload quota per call over one shared capacity) is WP8's.
 func (t *trunk) fillRound(b *Batch) {
+	if t.mux {
+		t.muxRound(b) // mux.go
+		return
+	}
 	if v := t.view1; v.ep != nil {
 		v.ep.Fill(v, b)
 	}
@@ -246,6 +255,10 @@ func (t *trunk) wakeWriter() {
 // peer's CLOSE and GOAWAY concern all of them (§A4.3; M3-D14's fan-out on
 // a MUX trunk is WP8's). A one-view trunk rings view 1's doorbell.
 func (t *trunk) ringViews() {
+	if t.mux {
+		t.ringAll() // mux.go
+		return
+	}
 	t.view1.ring()
 }
 
@@ -257,7 +270,7 @@ func (t *trunk) ringViews() {
 // handed to Env.Admit. It never blocks; a full refusal ring kills the
 // trunk ("mux flood").
 func (t *trunk) admit(h uint32, hdr wire.Header, p []byte) {
-	panic("unimplemented: M3")
+	t.admitMux(h, hdr, p) // admit.go
 }
 
 // openView allocates the next handle on a started dialer MUX trunk and
@@ -267,13 +280,15 @@ func (t *trunk) admit(h uint32, hdr wire.Header, p []byte) {
 // session for the one-view-per-trunk rule. It fails with ErrDead on a dead
 // or sealed trunk; at the end of the handle space it seals the trunk.
 func (t *trunk) openView(kind wire.Type, payload []byte, sess uintptr) (*Conn, error) {
-	panic("unimplemented: M3")
+	return t.openViewMux(kind, payload, sess) // mux.go
 }
 
 // viewCount returns the views that are not gone (the pool's close rule,
 // M3-D20).
 func (t *trunk) viewCount() int {
-	panic("unimplemented: M3")
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	return t.nviews
 }
 
 // seal makes the trunk take no new view (handle exhaustion, or the pool's
@@ -287,7 +302,9 @@ func (t *trunk) seal() {
 // onViewDone registers the hook the trunk calls once for each view whose
 // Done closed (the pool's view-count transition, §A5.9).
 func (t *trunk) onViewDone(f func(*Conn)) {
-	panic("unimplemented: M3")
+	t.mx.Lock()
+	t.viewDone = f
+	t.mx.Unlock()
 }
 
 // usableFor reports whether a new view of a session sess of kind kind may
@@ -297,7 +314,7 @@ func (t *trunk) onViewDone(f func(*Conn)) {
 // (inst not zero) the trunk's peer instance is inst; sess holds no view on
 // the trunk that is not yet reaped (R1-6). The caller holds Pool.mu.
 func (t *trunk) usableFor(kind wire.Type, inst [16]byte, sess uintptr) bool {
-	panic("unimplemented: M3")
+	return t.usableForMux(kind, inst, sess) // mux.go
 }
 
 // awaitResponse waits, bounded by ctx, for the OPEN_ACK or JOIN_ACK of a
@@ -306,7 +323,7 @@ func (t *trunk) usableFor(kind wire.Type, inst [16]byte, sess uintptr) bool {
 // Established. A check failure ends the view (Kill on the view), never the
 // trunk; a refusal response ends the handle (M3-D7).
 func (c *Conn) awaitResponse(ctx context.Context, check func(*wire.PrefaceAck) error) (*Established, error) {
-	panic("unimplemented: M3")
+	return c.awaitResponseMux(ctx, check) // mux.go
 }
 
 // shimEndpoint is the endpoint of a view whose session has not attached it
@@ -322,24 +339,24 @@ var _ PacketEndpoint = (*shimEndpoint)(nil)
 func (e *shimEndpoint) Handle() uint32 { return e.v.Handle() }
 
 // Fill places nothing: a view without its session has no session frames.
-func (e *shimEndpoint) Fill(c *Conn, b *Batch) { panic("unimplemented: M3") }
+func (e *shimEndpoint) Fill(c *Conn, b *Batch) { e.fill(c, b) }
 
 // Data reports DATA for a view without its session (a violation unless the
 // view's state allows it, §A3.3).
 func (e *shimEndpoint) Data(c *Conn, off uint64, p []byte, buf *Buf) error {
-	panic("unimplemented: M3")
+	return e.data(c, off, p, buf)
 }
 
 // Control completes the waiting attempt with the view's response (dialer)
 // or reports a frame the state table does not allow.
 func (e *shimEndpoint) Control(c *Conn, h wire.Header, p []byte) error {
-	panic("unimplemented: M3")
+	return e.control(c, h, p)
 }
 
 // WriteBlocked has no duties to move.
-func (e *shimEndpoint) WriteBlocked(c *Conn) { panic("unimplemented: M3") }
+func (e *shimEndpoint) WriteBlocked(c *Conn) {}
 
 // Datagram reports a DGRAM for a view without its session.
 func (e *shimEndpoint) Datagram(c *Conn, seq uint64, p []byte, buf *Buf) error {
-	panic("unimplemented: M3")
+	return e.dgram(c, seq, p, buf)
 }

@@ -49,8 +49,12 @@ func (c *Conn) watchStage1() {
 	if int64(time.Since(c.base)) < c.wd1At.Load() {
 		return // a late callback of an earlier write; the newer write's own stage is still pending
 	}
-	if c.wstate.CompareAndSwap(gen<<1, gen<<1|1) && c.ep != nil {
-		c.ep.WriteBlocked(c)
+	if c.wstate.CompareAndSwap(gen<<1, gen<<1|1) {
+		if c.mux {
+			c.writeBlockedAll() // every view's endpoint (M3-D14; mux.go)
+		} else if c.ep != nil {
+			c.ep.WriteBlocked(c)
+		}
 	}
 }
 
@@ -61,6 +65,6 @@ func (c *Conn) watchStage2() {
 		return
 	}
 	if c.wstate.Load()>>1 == gen && !c.endIfPeerClosed("write stalled") {
-		c.Kill(CauseWriteStall, "batch write exceeded its stall window")
+		c.killCarrier(CauseWriteStall, "batch write exceeded its stall window")
 	}
 }
