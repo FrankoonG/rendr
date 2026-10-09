@@ -391,7 +391,7 @@ func (a *actor) dialActLocked(now time.Time) {
 	case !d.opened:
 		a.openingLocked(now)
 	case a.doneWaitLocked():
-	case a.s.p.Mode == ModeBond:
+	case a.s.p.Mode.members(): // bond and race (M3-D29)
 		a.bondSlotsLocked(now)
 	default:
 		a.selectorLocked(now)
@@ -823,7 +823,7 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		s.ctl.state = StateOpen
 		ch := d.result
 		a.answer(func() { ch <- nil })
-		if s.p.Mode == ModeBond {
+		if s.p.Mode.members() {
 			a.chooseMembersLocked(now, i)
 		}
 		a.attachLocked(now, i, at, est)
@@ -955,7 +955,7 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	l := a.newLaneLocked(now, est.Conn, i, sl.gen, LaneMember)
 	a.finish(now, i, at, sched.OutcomeAttached)
 	switch {
-	case s.p.Mode == ModeBond:
+	case s.p.Mode.members():
 		l.data = true
 		a.publishSchedLocked(now, wire.SchedInitial) // the grown member set (the first SCHED too)
 		a.owedDeathLocked(now, l.id)

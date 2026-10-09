@@ -87,7 +87,8 @@ func (a *actor) schedResendLocked(now time.Time) {
 }
 
 // resendLaneLocked picks the next lane for a SCHED resend: live, CLOSE not
-// written, preferably neither write-blocked nor retired. A packet
+// written, preferably neither write-blocked nor retired nor a sibling of a
+// write-blocked lane in a HoLCoupled fate group (M3-D39). A packet
 // session's datagram lane that already carried the current epoch is
 // skipped (M2-D53): its REL sublayer delivers the SCHED there while the
 // carrier lives. Stream lanes, and datagram lanes that have not carried it,
@@ -95,7 +96,7 @@ func (a *actor) schedResendLocked(now time.Time) {
 func (a *actor) resendLaneLocked() *lane {
 	s := a.s
 	lanes := s.lanes
-	var fallback *lane
+	var fallback, sibling *lane
 	for k := range lanes {
 		i := (a.resendIdx + k) % len(lanes)
 		l := lanes[i]
@@ -113,8 +114,17 @@ func (a *actor) resendLaneLocked() *lane {
 			}
 			continue
 		}
+		if s.holSiblingBlockedLocked(l) {
+			if sibling == nil {
+				sibling = l // writable, but it may stall with its blocked sibling
+			}
+			continue
+		}
 		a.resendIdx = i + 1
 		return l
+	}
+	if sibling != nil {
+		return sibling
 	}
 	return fallback
 }
@@ -137,7 +147,7 @@ func (a *actor) applySchedLocked(now time.Time) {
 	ctl.cause = ctl.schedInCause
 	a.dirty = true
 	a.passiveRouteLocked(now)
-	if s.p.Mode != ModeBond {
+	if !s.p.Mode.members() {
 		a.followCountsLocked(now)
 	}
 	s.bumpAckLocked(true)
@@ -220,7 +230,7 @@ func (a *actor) passiveRouteLocked(now time.Time) {
 	if a.ending || (ctl.state != StateOpen && ctl.state != StateClosing) {
 		return
 	}
-	if s.p.Mode == ModeBond {
+	if s.p.Mode.members() {
 		a.passiveBondRouteLocked(now)
 		return
 	}

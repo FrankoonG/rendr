@@ -119,7 +119,7 @@ func (l *lane) WriteBlocked(c *carrier.Conn) {
 			}
 		}
 	}
-	if s.p.Mode == ModeBond && !st.ended {
+	if s.p.Mode.members() && !st.ended {
 		s.wakeDataLocked(time.Now()) // pending bytes go to the other members
 	}
 	st.facts |= factWriteBlocked

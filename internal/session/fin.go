@@ -154,7 +154,7 @@ func (s *Session) schedLocked(flags uint8, p []byte) error {
 		return nil // stale, or a copy of the reference
 	}
 	var followed [3]uint64 // a bond passive follows no counts (bond sends zero)
-	if s.p.Mode != ModeBond {
+	if !s.p.Mode.members() {
 		followed = [3]uint64{c.migDeath, c.migQuality, c.migExplicit}
 	}
 	if !schedCountsFit(&sc, s.p.FirstEpoch, followed) {
