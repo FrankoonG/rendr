@@ -121,7 +121,7 @@ func (c *Conn) writeLoop() {
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder call (L51)
-			c.Kill(CauseTransportError, "conn Write called runtime.Goexit")
+			c.killCarrier(CauseTransportError, "conn Write called runtime.Goexit")
 		}
 		w := &c.wr
 		// The embedder call returned or unwound: release the chunk
@@ -236,7 +236,7 @@ func (c *Conn) checkDeadlines(now time.Time) bool {
 	c.mu.Unlock()
 	if dead {
 		if !c.endIfPeerClosed("no PONG") {
-			c.Kill(CausePingTimeout, "no PONG for "+waited.String())
+			c.killCarrier(CausePingTimeout, "no PONG for "+waited.String())
 		}
 		return true
 	}
@@ -344,7 +344,7 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 		if _, ok := err.(*panicError); ok {
 			c.disarmWatchdog(gen)
 			b.ReleaseRefs()
-			c.Kill(CauseTransportError, err.Error())
+			c.killCarrier(CauseTransportError, err.Error())
 			return false
 		}
 		// A conn without write deadlines still has the watchdog's stage 2.
@@ -365,7 +365,7 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 		if isTimeout(err) {
 			cause = CauseWriteStall
 		}
-		c.Kill(cause, "write: "+err.Error()) // a no-op if stage 2 already killed it as write_stall
+		c.killCarrier(cause, "write: "+err.Error()) // a no-op if stage 2 already killed it as write_stall
 		return false
 	}
 	if w.close {

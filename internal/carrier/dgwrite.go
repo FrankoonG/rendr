@@ -51,7 +51,7 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 	retiring, reason := st.retiring, st.reason
 	c.mu.Unlock()
 	if kill {
-		c.Kill(CausePingTimeout, "mtu probe")
+		c.killCarrier(CausePingTimeout, "mtu probe")
 		return false
 	}
 
@@ -71,7 +71,7 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 				c.mu.Unlock()
 				if kill {
 					b.ReleaseRefs()
-					c.Kill(CausePingTimeout, "mtu probe")
+					c.killCarrier(CausePingTimeout, "mtu probe")
 					return false
 				}
 			}
@@ -285,7 +285,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	b.ReleaseRefs() // the writes returned: the chunk references go
 	if fatal != nil {
 		if fatal == errBudgetFloor {
-			c.Kill(CauseTransportError, fatal.Error())
+			c.killCarrier(CauseTransportError, fatal.Error())
 			return false
 		}
 		if c.endIfPeerClosed("write ended (" + fatal.Error() + ")") {
@@ -295,7 +295,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if errors.Is(fatal, os.ErrDeadlineExceeded) {
 			cause = CauseWriteStall
 		}
-		c.Kill(cause, "write: "+fatal.Error())
+		c.killCarrier(cause, "write: "+fatal.Error())
 		return false
 	}
 	if w.close {

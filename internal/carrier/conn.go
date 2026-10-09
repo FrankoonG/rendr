@@ -150,6 +150,8 @@ type Conn struct {
 	// changes after Start.
 	ep  Endpoint
 	pep PacketEndpoint // ep when it is a packet session's (asserted once at Start, M2-D2); nil otherwise
+
+	vx viewExt // the rest of the view's mux state (mux.go)
 }
 
 // deathRecord is the first cause that ended the carrier.
@@ -326,7 +328,10 @@ func (c *Conn) NeedGo() bool { return c.needGo.Load() }
 // and the Runtime close bound. It returns what Kill returns. On a
 // dedicated carrier it is Kill.
 func (c *Conn) KillTrunk(cause Cause, detail string) bool {
-	return c.Kill(cause, detail)
+	if c.trunk == nil {
+		return false
+	}
+	return c.killCarrier(cause, detail)
 }
 
 // OnDone rings b once when Done closes, at once if it already closed
@@ -339,6 +344,17 @@ func (c *Conn) KillTrunk(cause Cause, detail string) bool {
 // nothing.
 func (c *Conn) OnDone(b Doorbell) {
 	if b == nil || c.trunk == nil { // a zero Conn's Done never closes
+		return
+	}
+	if c.vx.own { // a view with its own Done (mux.go)
+		c.mx.Lock()
+		if c.vx.doneShut { // Done closed (set with the close under mx)
+			c.mx.Unlock()
+			b.Ring()
+			return
+		}
+		c.vx.onDone = b
+		c.mx.Unlock()
 		return
 	}
 	c.jmu.Lock()
@@ -356,7 +372,7 @@ func (c *Conn) OnDone(b Doorbell) {
 // false when the ring was full: the trunk was then killed
 // (protocol_violation "mux flood").
 func (c *Conn) Refuse(h uint32, a Answer) bool {
-	panic("unimplemented: M3")
+	return c.trunk.refuse(h, a) // admit.go
 }
 
 // Factory returns the dialer factory index (-1 on the passive side).
@@ -384,6 +400,10 @@ func (c *Conn) Name() string {
 // closes once the conn is closed). Start on a carrier that was already
 // killed starts nothing and rings bell, so the owner reconciles it.
 func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
+	if c.vx.own && c != c.view1 {
+		c.startView(ep, bell, o) // a view created on a started MUX trunk (mux.go)
+		return
+	}
 	c.jmu.Lock()
 	if c.join.started || c.join.closing || c.death.Load() != nil {
 		c.jmu.Unlock()
@@ -394,6 +414,9 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 	}
 	c.join.started = true
 	c.join.running |= partReader | partWriter
+	if c.mux {
+		c.startMux() // view 1 of a MUX trunk gets its own Done (mux.go)
+	}
 	c.jmu.Unlock()
 
 	if bell != nil {
@@ -433,6 +456,10 @@ func (c *Conn) Wake() {
 	if c.trunk == nil {
 		return
 	}
+	if c.vx.own {
+		c.wakeView() // readies the view on a MUX trunk (R1-1, mux.go)
+		return
+	}
 	c.wakeWriter()
 }
 
@@ -452,6 +479,14 @@ func (c *Conn) RequestPing() {
 // Timing.AbandonWait). It never blocks and takes no session lock, so it may
 // be called from anywhere, including under the session lock.
 func (c *Conn) Kill(cause Cause, detail string) bool {
+	if c.vx.own {
+		return c.killView(cause, detail) // view-scoped (R1-2, detach.go)
+	}
+	return c.killCarrier(cause, detail)
+}
+
+// killCarrier is M2's Kill of the physical carrier (KillTrunk).
+func (c *Conn) killCarrier(cause Cause, detail string) bool {
 	if !c.setDeath(cause, detail) {
 		return false
 	}
@@ -499,6 +534,10 @@ func (c *Conn) ring() {
 // A held carrier whose endpoint never placed a first frame writes its
 // CLOSE (after a GOAWAY, if requested) as its first frame.
 func (c *Conn) Retire(reason wire.CloseReason) {
+	if c.vx.own {
+		c.retireView(detachReasonOf(reason)) // DETACH (M3-D6, detach.go)
+		return
+	}
 	c.mu.Lock()
 	if c.st.retiring {
 		c.mu.Unlock()
@@ -512,6 +551,10 @@ func (c *Conn) Retire(reason wire.CloseReason) {
 // GoAway queues GOAWAY(shutdown) ahead of any further frame and then
 // retires the carrier (Runtime.Close).
 func (c *Conn) GoAway() {
+	if c.vx.own {
+		c.goAwayView() // GOAWAY once on the trunk, the view retires (detach.go)
+		return
+	}
 	c.mu.Lock()
 	c.st.goAway = true
 	if !c.st.retiring {
@@ -547,13 +590,17 @@ func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // PeerClosed reports that the peer sent CLOSE on this carrier.
-func (c *Conn) PeerClosed() bool { return c.trunk != nil && c.peerClosed.Load() }
+func (c *Conn) PeerClosed() bool {
+	return c.trunk != nil && (c.peerClosed.Load() || c.vx.peerDet.Load())
+}
 
 // PeerGoAway reports that the peer sent GOAWAY on this carrier.
 func (c *Conn) PeerGoAway() bool { return c.trunk != nil && c.peerGoAway.Load() }
 
 // CloseSent reports that this side has written CLOSE (no new frames follow).
-func (c *Conn) CloseSent() bool { return c.trunk != nil && c.closeSent.Load() }
+func (c *Conn) CloseSent() bool {
+	return c.trunk != nil && (c.closeSent.Load() || c.vx.detSent.Load())
+}
 
 // WriteBlocked reports that the current batch write has been in progress for
 // at least PingBusy (lock-free). The flag lives in one atomic word with the
@@ -625,6 +672,11 @@ func (c *Conn) Stats() Stats {
 		RxBytes:    c.rxBytes.Load(),
 		RetxBytes:  st.retxBytes,
 		Frames:     st.frames,
+	}
+	if c.vx.own {
+		// A view of a MUX trunk reports its own traffic (M3-D11: the
+		// estimator stays the trunk's).
+		s.TxBytes, s.RxBytes, s.RetxBytes, s.Frames = c.tx.Load(), c.rx.Load(), c.retx.Load(), c.frames.Load()
 	}
 	if n := c.lastRx.Load(); n != 0 {
 		s.LastRx = c.base.Add(time.Duration(n))
@@ -820,8 +872,11 @@ func (c *Conn) partDone(p uint8) {
 	}
 	left := c.join.abandoned&p != 0
 	c.join.abandoned &^= p
-	c.maybeDoneLocked()
+	closed := c.maybeDoneLocked()
 	c.jmu.Unlock()
+	if closed && c.mux {
+		c.finishAll() // every view's Done closes once its calls drained (mux.go)
+	}
 	if left && c.env.Abandon != nil {
 		c.env.Abandon.Leave()
 	}
@@ -847,7 +902,14 @@ func (c *Conn) partDone(p uint8) {
 // it was called already.
 func (c *Conn) abandonParts() {
 	c.jmu.Lock()
-	defer c.jmu.Unlock()
+	closed := c.abandonPartsLocked()
+	c.jmu.Unlock()
+	if closed && c.mux {
+		c.finishAll() // mux.go
+	}
+}
+
+func (c *Conn) abandonPartsLocked() bool {
 	stuck := c.join.running &^ c.join.abandoned
 	c.join.abandoned |= stuck
 	if c.env.Abandon != nil {
@@ -860,17 +922,17 @@ func (c *Conn) abandonParts() {
 	if stuck&partCloser != 0 {
 		c.ncClose.last(c.env) // the last resort
 	}
-	c.maybeDoneLocked()
+	return c.maybeDoneLocked()
 }
 
 // maybeDoneLocked closes Done once the closer started and every part
 // finished or was abandoned. Every account settles before Done closes —
 // the abandoned parts are counted (abandonParts) and the CarrierID is
 // released here — so a joiner woken by Done never sees a stale state.
-func (c *Conn) maybeDoneLocked() {
+func (c *Conn) maybeDoneLocked() bool {
 	j := &c.join
 	if !j.closing || j.doneClosed || j.running&^j.abandoned != 0 {
-		return
+		return false
 	}
 	j.doneClosed = true
 	if j.timer != nil {
@@ -890,6 +952,7 @@ func (c *Conn) maybeDoneLocked() {
 		j.onDone = nil
 		b.Ring()
 	}
+	return true
 }
 
 // finishRetire ends a planned retirement (both CLOSEs exchanged, EOF or
@@ -967,11 +1030,15 @@ func (c *Conn) closeWritten() {
 // as a last resort (design §0.8 V2): a conn that honours Close unblocks,
 // and the closer leaves the pool.
 func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []byte, deadline time.Time) {
+	if c.vx.own {
+		c.writeAndCloseView(t, flags, payload, deadline) // view-scoped (R1-2, detach.go)
+		return
+	}
 	c.jmu.Lock()
 	started := c.join.started
 	c.jmu.Unlock()
 	if started {
-		c.Kill(CauseLocalClose, "WriteAndClose on a started carrier")
+		c.killCarrier(CauseLocalClose, "WriteAndClose on a started carrier")
 		return
 	}
 	if deadline.IsZero() {

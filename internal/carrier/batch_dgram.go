@@ -100,6 +100,12 @@ func (b *Batch) AddDgram(handle uint32, seq uint64, body []byte, ref *Buf) bool 
 	if b.Full() || len(body) > b.DgramRoom() {
 		return false
 	}
+	if b.quota && (b.ctlOnly || b.payload()+len(body) > b.qEnd) {
+		return false // the call's payload quota (M3-D10): as a full batch
+	}
+	if b.heldOut(handle) {
+		return false // the response hold (M3-D8)
+	}
 	took := b.holdRef(ref)
 	f, p := b.reserve(wire.TypeDgram, 0, handle, wire.DgramPrefixLen, len(body))
 	wire.PutDgramSeq(p, seq)

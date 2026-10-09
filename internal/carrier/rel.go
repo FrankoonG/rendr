@@ -223,7 +223,8 @@ func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 			return false
 		}
 	}
-	var wake, finish bool
+	var wake, finish, progress bool
+	var una uint32
 	if !wire.SeqLess(rk.CumAck, r.una) { // cumAck ≥ una: progress
 		r.una = rk.CumAck + 1
 		r.backoff = 0
@@ -247,10 +248,14 @@ func (c *Conn) relOnRack(p []byte, now time.Time) bool {
 			r.blocked, wake = false, true
 		}
 		finish = c.dgRetireDoneLocked()
+		progress, una = true, r.una
 	}
 	c.mu.Unlock()
+	if progress && c.mux {
+		c.relAcked(una) // retiring views whose REL{DETACH} it covers (detach.go)
+	}
 	if wake {
-		c.Wake()
+		c.wakeWriter()
 	}
 	if finish {
 		c.finishRetire("retired: CLOSE exchange complete")
@@ -279,7 +284,7 @@ func (c *Conn) relOnRel(f *wire.Frame, now time.Time) bool {
 	if d <= 0 || (d <= wire.RelWindow && d >= 2 && r.heldMask&(1<<(h.Cseq%wire.RelWindow)) != 0) {
 		r.rackDue = true // a duplicate: answered again, never dispatched
 		c.mu.Unlock()
-		c.Wake()
+		c.wakeWriter()
 		return true
 	}
 	c.mu.Unlock()
@@ -293,8 +298,10 @@ func (c *Conn) relOnRel(f *wire.Frame, now time.Time) bool {
 	}
 	switch h.Type {
 	case wire.TypeOpen, wire.TypeOpenAck, wire.TypeJoin, wire.TypeJoinAck:
-		c.violation("REL{%v} after the handshake", h.Type)
-		return false
+		if !c.mux { // on a MUX trunk a new handle's OPEN or JOIN and its response (§A3.3)
+			c.violation("REL{%v} after the handshake", h.Type)
+			return false
+		}
 	}
 	if d >= 2 {
 		s := &r.held[h.Cseq%wire.RelWindow]
@@ -304,7 +311,7 @@ func (c *Conn) relOnRel(f *wire.Frame, now time.Time) bool {
 		r.heldMask |= 1 << (h.Cseq % wire.RelWindow)
 		r.rackDue = true
 		c.mu.Unlock()
-		c.Wake()
+		c.wakeWriter()
 		return true
 	}
 	// d == 1: the next in order.
@@ -345,7 +352,7 @@ func (c *Conn) relAdvance(cseq uint32) {
 	r.heldMask &^= 1 << (cseq % wire.RelWindow)
 	r.rackDue = true
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // relDispatch dispatches one in-order inner frame (§A5.7): CLOSE and
@@ -369,7 +376,7 @@ func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.T
 		dg.peerCloseCseq, dg.peerCloseSeen = h.Cseq, true
 		c.mu.Unlock()
 		c.peerClosed.Store(true)
-		c.ring()
+		c.ringViews()
 		if c.ep == nil {
 			// A probe or sessionless carrier has no session to drain: it
 			// answers the peer's CLOSE with its own at once (M1).
@@ -382,7 +389,18 @@ func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.T
 			return false
 		}
 		c.peerGoAway.Store(true)
-		c.ring()
+		c.ringViews()
+		return true
+	case wire.TypeDetach:
+		// A MUX trunk's end of one handle (M3-D6; detach.go).
+		why, viol := c.onDetach(inner)
+		if viol {
+			c.violation("REL{DETACH}: %s", why)
+			return false
+		}
+		if why != "" {
+			c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted
+		}
 		return true
 	}
 	if c.ep == nil {
@@ -390,9 +408,51 @@ func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.T
 		return false
 	}
 	hdr := wire.Header{Type: h.Type, Flags: h.Flags, Len: uint32(len(inner)), Fseq: fseq, Handle: h.Handle}
+	if c.mux {
+		return c.relDispatchMux(hdr, inner)
+	}
+	if h.Handle != wire.SessionHandle {
+		// A dedicated carrier's only session handle is 1 (§A3.2: a trunk
+		// rule since the codec accepts any handle ≥ 1).
+		c.violation("REL{%v} for handle %d on a dedicated carrier", h.Type, h.Handle)
+		return false
+	}
 	if err := c.ep.Control(c, hdr, inner); err != nil {
 		c.violation("%v: %v", h.Type, err)
 		return false
+	}
+	return true
+}
+
+// relDispatchMux dispatches a REL's inner session frame on a MUX trunk by
+// its handle and the view's state (§A3.3): a new handle's OPEN or JOIN is
+// admitted, a dialer view's response applied, a frame for a view handed to
+// its endpoint; any other is dropped and counted (PA-1).
+func (c *Conn) relDispatchMux(hdr wire.Header, inner []byte) bool {
+	act, v, _ := c.classify(hdr.Type, hdr.Handle)
+	switch act {
+	case actAdmit:
+		c.admit(hdr.Handle, hdr, inner)
+		return c.death.Load() == nil
+	case actResponse:
+		if err := c.onResponse(v, hdr, inner); err != nil {
+			c.violation("%v: %v", hdr.Type, err)
+			return false
+		}
+		return true
+	case actDispatch:
+		if !v.enter() {
+			return true // the view's Done closed after our DETACH: not delivered
+		}
+		err := v.ep.Control(v, hdr, inner)
+		v.exit()
+		if err != nil {
+			c.violation("%v: %v", hdr.Type, err)
+			return false
+		}
+		return true
+	case actIllegal:
+		c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted (PA-1)
 	}
 	return true
 }

@@ -55,7 +55,7 @@ func (c *Conn) dgReadLoop() {
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder ReadFrom (L51)
-			c.Kill(CauseTransportError, "conn ReadFrom called runtime.Goexit")
+			c.killCarrier(CauseTransportError, "conn ReadFrom called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
 		// its buffer (§4.1), and it returns a flow buffer it may still hold
@@ -278,7 +278,19 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 	case wire.TypeDgram:
 		return c.dgOnDgram(f.Handle, f.Payload, now), chalNone
 	case wire.TypePack:
-		v := c.route(f.Handle) // a one-view trunk: a compare with view 1's handle
+		var v *Conn
+		if c.mux {
+			act, mv, _ := c.classify(f.Type, f.Handle)
+			if act != actDispatch {
+				if act == actIllegal {
+					c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted (PA-1)
+				}
+				return true, chalNone
+			}
+			v = mv
+		} else {
+			v = c.route(f.Handle) // a one-view trunk: a compare with view 1's handle
+		}
 		if v == nil {
 			c.violation("PACK for handle %d: no such view", f.Handle)
 			return false, chalNone
@@ -287,7 +299,12 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 			c.violation("PACK on a carrier without a session")
 			return false, chalNone
 		}
-		if err := v.ep.Control(v, f.Header, f.Payload); err != nil {
+		if !v.enter() {
+			return true, chalNone // the view's Done closed after our DETACH: not delivered
+		}
+		err := v.ep.Control(v, f.Header, f.Payload)
+		v.exit()
+		if err != nil {
 			c.violation("PACK: %v", err)
 			return false, chalNone
 		}
@@ -313,7 +330,19 @@ func (c *Conn) dgOnDgram(h uint32, p []byte, now time.Time) bool {
 		c.violation("DGRAM: %v", err)
 		return false
 	}
-	v := c.route(h)
+	var v *Conn
+	if c.mux {
+		act, mv, _ := c.classify(wire.TypeDgram, h)
+		if act != actDispatch {
+			if act == actIllegal {
+				c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted (PA-1)
+			}
+			return true
+		}
+		v = mv
+	} else {
+		v = c.route(h)
+	}
 	if v == nil {
 		c.violation("DGRAM for handle %d: no such view", h)
 		return false
@@ -332,6 +361,11 @@ func (c *Conn) dgOnDgram(h uint32, p []byte, now time.Time) bool {
 		c.wakeWriter()
 	}
 	c.rxBytes.Add(uint64(len(data)))
+	if !v.enter() {
+		return true // the view's Done closed after our DETACH: not delivered (M3-D13)
+	}
+	defer v.exit()
+	v.countRx(len(data))
 	var buf *Buf
 	if len(data) >= BigData {
 		buf = c.env.Bufs.TryGet(len(data), c.env.Budget)

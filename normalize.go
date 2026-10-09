@@ -294,6 +294,14 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		MTUProbeEvery:    k.mtuProbeEvery,
 		MTUProbeFails:    k.mtuProbeFails,
 	}
+	if ov != nil {
+		// M3 mux constants (M3-D50): internal, overridden by tests only; a
+		// zero field keeps carrier.Timing's default.
+		e.timing.MuxMaxViews = ov.MuxMaxViews
+		e.timing.MuxMaxViewsDatagram = ov.MuxMaxViewsDatagram
+		e.timing.MuxQuantum = ov.MuxQuantum
+		e.timing.MuxRefusalRing = ov.MuxRefusalRing
+	}
 	e.health = carrier.HealthParams{
 		Interval:      c.Probe.Interval,
 		Fresh:         c.Probe.Fresh,
@@ -440,7 +448,7 @@ func applyOverrides(c *Config, e *effective, k *internalConstants, ov *testhooks
 		e.rand = ov.Rand
 	}
 	e.hooks = ov.Hooks
-	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID, FirstCseq: ov.FirstCseq}
+	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID, FirstCseq: ov.FirstCseq, FirstHandle: ov.FirstHandle}
 
 	override(&k.ackEvery, ov.AckEvery)
 	override(&k.ackDelay, ov.AckDelay)

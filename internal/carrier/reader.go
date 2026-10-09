@@ -45,7 +45,7 @@ func (c *Conn) readLoop() {
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder Read (L51)
-			c.Kill(CauseTransportError, "conn Read called runtime.Goexit")
+			c.killCarrier(CauseTransportError, "conn Read called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
 		// its buffers (§4.1), so both accounts return to zero (R7).
@@ -111,13 +111,13 @@ func (c *Conn) readFailed(err error) {
 		c.finishRetire("retired: read ended after CLOSE")
 		return
 	}
-	c.Kill(CauseTransportError, "read: "+err.Error())
+	c.killCarrier(CauseTransportError, "read: "+err.Error())
 }
 
 // violation kills the carrier with protocol_violation (L43, invariant 6:
 // only this carrier dies).
 func (c *Conn) violation(format string, a ...any) {
-	c.Kill(CauseProtocolViolation, fmt.Sprintf(format, a...))
+	c.killCarrier(CauseProtocolViolation, fmt.Sprintf(format, a...))
 }
 
 // readFrame reads, verifies and dispatches one frame. It reports whether the
@@ -152,7 +152,22 @@ func (c *Conn) readFrame(rd *reader) bool {
 	// frames.
 	var v *Conn
 	if !h.Type.Extension() && !h.Type.CarrierLevel() {
-		v = c.route(h.Handle)
+		if c.mux {
+			// A MUX trunk: the frame's handle and the view's state decide
+			// (§A3.3, §A5.4; mux.go).
+			act, mv, why := c.classify(h.Type, h.Handle)
+			switch act {
+			case actIllegal:
+				c.violation("%v for handle %d: %s", h.Type, h.Handle, why)
+				return false
+			case actDispatch:
+				v = mv
+			default:
+				return c.readMux(rd, h, act, mv)
+			}
+		} else {
+			v = c.route(h.Handle)
+		}
 		switch {
 		case v == nil:
 			c.violation("%v for handle %d: no such view", h.Type, h.Handle)
@@ -258,6 +273,13 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 		}
 		c.peerGoAway.Store(true)
 		c.ringViews()
+	case wire.TypeDetach:
+		// A MUX trunk's end of one handle (M3-D6; detach.go); a
+		// violation on a dedicated carrier.
+		if why, _ := c.onDetach(p); why != "" {
+			c.violation("%s", why)
+			return false
+		}
 	case wire.TypeData:
 		off, err := wire.ParseDataOffset(p)
 		if err != nil {
@@ -266,7 +288,13 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 		}
 		data := p[wire.DataPrefixLen:]
 		c.dataArrived(len(data), now)
-		if err := v.ep.Data(v, off, data, nil); err != nil {
+		if !v.enter() {
+			return true // the view's Done closed after our DETACH: dropped (M3-D13)
+		}
+		v.countRx(len(data))
+		err = v.ep.Data(v, off, data, nil)
+		v.exit()
+		if err != nil {
 			c.violation("DATA: %v", err)
 			return false
 		}
@@ -283,7 +311,13 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 			return false
 		}
 		c.dataArrived(len(data), now)
-		if err := v.pep.Datagram(v, seq, data, nil); err != nil {
+		if !v.enter() {
+			return true
+		}
+		v.countRx(len(data))
+		err = v.pep.Datagram(v, seq, data, nil)
+		v.exit()
+		if err != nil {
 			c.violation("DGRAM: %v", err)
 			return false
 		}
@@ -291,12 +325,103 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 		if h.Type.Extension() {
 			return true // CRC-checked and skipped on every carrier (§5.2)
 		}
-		if err := v.ep.Control(v, h, p); err != nil {
+		if !v.enter() {
+			return true
+		}
+		err := v.ep.Control(v, h, p)
+		v.exit()
+		if err != nil {
 			c.violation("%v: %v", h.Type, err)
 			return false
 		}
 	}
 	return true
+}
+
+// readMux reads, verifies and handles a session frame of a MUX trunk that
+// is not dispatched to a view's endpoint (§A3.3): an admitted OPEN or JOIN
+// for a new handle (admit), a dialer view's response (onResponse), or a
+// legal frame that is not delivered. A frame beyond the stage (an OPEN
+// with large metadata, a big DATA of a view whose Done closed) is read
+// into a Buf of its own.
+func (c *Conn) readMux(rd *reader, h wire.Header, act muxAct, v *Conn) bool {
+	total := wire.HeaderLen + int(h.Len) + wire.TrailerLen
+	var body []byte
+	var buf *Buf
+	if total <= len(rd.stage.B) {
+		if err := c.fill(rd, total); err != nil {
+			c.readFailed(err)
+			return false
+		}
+		f := rd.stage.B[rd.r : rd.r+total]
+		body = f[:wire.HeaderLen+int(h.Len)]
+		if wire.CRC(body) != wire.Trailer(f[len(body):]) {
+			c.violation("%v: crc mismatch", h.Type)
+			return false
+		}
+		rd.r += total
+	} else {
+		buf = c.env.Bufs.Get(total, c.env.Budget)
+		rd.big = buf
+		got := copy(buf.B[:total], rd.stage.B[rd.r:rd.w])
+		rd.r += got
+		for got < total {
+			if rd.pending != nil {
+				rd.releaseBig()
+				c.readFailed(rd.pending)
+				return false
+			}
+			rd.r, rd.w = 0, 0
+			m, err := callRead(c.nc, buf.B[got:total])
+			if m < 0 || m > total-got {
+				rd.releaseBig()
+				c.readFailed(&countError{"Read", m, total - got})
+				return false
+			}
+			got += m
+			if err != nil {
+				if got < total {
+					rd.releaseBig()
+					c.readFailed(err)
+					return false
+				}
+				rd.pending = err
+			} else if m == 0 {
+				rd.releaseBig()
+				c.readFailed(errZeroRead)
+				return false
+			}
+		}
+		body = buf.B[:wire.HeaderLen+int(h.Len)]
+		if wire.CRC(body) != wire.Trailer(buf.B[len(body):total]) {
+			rd.releaseBig()
+			c.violation("%v: crc mismatch", h.Type)
+			return false
+		}
+	}
+	rd.fseq++
+	now := c.frameArrived()
+	p := body[wire.HeaderLen:]
+	ok := true
+	switch act {
+	case actAdmit:
+		c.admit(h.Handle, h, p)
+		ok = c.death.Load() == nil
+	case actResponse:
+		if err := c.onResponse(v, h, p); err != nil {
+			c.violation("%v: %v", h.Type, err)
+			ok = false
+		}
+	}
+	if h.Type == wire.TypeData || h.Type == wire.TypeDgram {
+		if n := int(h.Len) - wire.DataPrefixLen; n > 0 {
+			c.dataArrived(n, now)
+		}
+	}
+	if buf != nil {
+		rd.releaseBig()
+	}
+	return ok
 }
 
 // pong applies a PONG outside Conn.mu's callers: the estimator update under
@@ -390,12 +515,18 @@ func (c *Conn) readBigData(rd *reader, h wire.Header, v *Conn) bool {
 	rd.fseq++
 	c.dataArrived(n, c.frameArrived())
 	rd.big = nil // buf's reference moves to the endpoint
+	if !v.enter() {
+		buf.Release() // the view's Done closed after our DETACH: dropped (M3-D13)
+		return true
+	}
+	v.countRx(n)
 	var err error
 	if dgram {
 		err = v.pep.Datagram(v, off, buf.B[:n], buf)
 	} else {
 		err = v.ep.Data(v, off, buf.B[:n], buf)
 	}
+	v.exit()
 	if err != nil {
 		c.violation("%v: %v", h.Type, err)
 		return false

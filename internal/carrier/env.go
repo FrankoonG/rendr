@@ -165,6 +165,17 @@ func (t Timing) withDefaults() Timing {
 	if t.MTUProbeFails <= 0 {
 		t.MTUProbeFails = defMTUProbeFails
 	}
+	if t.MuxMaxViews <= 0 {
+		t.MuxMaxViews = defMuxMaxViews
+	}
+	if t.MuxMaxViewsDatagram <= 0 {
+		t.MuxMaxViewsDatagram = defMuxMaxViewsDatagram
+	}
+	if t.MuxQuantum <= 0 {
+		t.MuxQuantum = defMuxQuantum
+	}
+	// MuxRefusalRing stays 0 unless set: the refusal ring then holds the
+	// trunk kind's MuxMaxViews answers (R1-4; refuse).
 	return t
 }
 
