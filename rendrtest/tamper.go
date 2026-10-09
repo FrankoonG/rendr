@@ -158,6 +158,11 @@ type FrameRec struct {
 }
 
 // TamperStats counts the operations that fired, one counter per operation.
+// An operation counts when it acts on its frame, whether or not the write
+// that forwards the result then succeeds: Flipped, Dropped, Duplicated and
+// Rewritten when their frame passes, Replayed when the copy's re-send is
+// attempted (a replay that kills the carrier often meets a receiver that
+// closed during the write; the frame tap logs only what went out).
 type TamperStats struct {
 	Flipped, Dropped, Duplicated, Replayed int
 	Spliced, Switched, Rewritten           int
@@ -628,15 +633,15 @@ func (t *Tamper) frame(d Dir, idx int, fb []byte) bool {
 		}
 	}
 	for _, r := range due {
+		t.mu.Lock()
+		t.stats.Replayed++ // the re-send is attempted (its write may fail)
+		t.mu.Unlock()
 		for _, s := range sinks {
 			s.push(r.b, r.rec)
 		}
 		if !t.emit(d, r.b, []FrameRec{r.rec}, false) {
 			return false
 		}
-		t.mu.Lock()
-		t.stats.Replayed++
-		t.mu.Unlock()
 	}
 	return true
 }

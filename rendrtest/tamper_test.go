@@ -315,6 +315,35 @@ func TestTamperReplayFrame(t *testing.T) {
 	})
 }
 
+// TestTamperReplayCountsAttempts: Replayed counts a replay when its re-send
+// is attempted, as Flipped, Dropped and Duplicated count when they act on
+// their frame — also when that write fails because the receiver went away
+// (a replayed frame that kills its carrier usually meets a receiver that
+// closes while the tamper still writes): the stimulus fired. The failed
+// copy is not in the frame tap, which logs what went out.
+func TestTamperReplayCountsAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, c := net.Pipe()
+		s, p := net.Pipe()
+		tm := NewTamper(c, s)
+		defer func() {
+			tm.Close()
+			d.Close()
+			p.Close()
+		}()
+		fs := dataFrames(1, 3, 'x')
+		tm.ReplayFrame(Up, 0, 1) // frame 0 again after frame 1
+		go d.Write(cat(prefaceBytes(7), slices.Concat(fs...)))
+		readN(t, p, wire.PrefaceLen+len(fs[0])+len(fs[1])) // everything before the replay
+		p.Close()                                          // the receiver goes away: the replay's write fails
+		synctest.Wait()
+		if st := tm.Stats(); st.Replayed != 1 {
+			t.Fatalf("Replayed = %d after a replay whose write failed, want 1", st.Replayed)
+		}
+		checkLog(t, tm.Log(Up), fs[:2], []int{0, 1})
+	})
+}
+
 // TestTamperRewriteHandle: RewriteHandle puts another handle into the
 // addressed frame, with a valid CRC when asked (a broken peer: the frame
 // decodes with the new handle) or the stale one (a damaged path: ErrCRC).
