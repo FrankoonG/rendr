@@ -60,6 +60,32 @@ func inspect(b []byte) dgInfo {
 	return d
 }
 
+// fseqOf returns the fseq of the first frame of datagram b (after any
+// PREFACE; 0 when b has none).
+func fseqOf(b []byte) uint32 {
+	if wire.IsPreface(b) {
+		b = b[wire.PrefaceLen:]
+	}
+	h, err := wire.ParseHeader(b)
+	if err != nil {
+		return 0
+	}
+	return h.Fseq
+}
+
+// replayFrom re-sends datagram i of rec — the recording of the dialer conn
+// of src's latest carrier (dflipConn.written) — into dst's latest carrier,
+// Up: by DatagramLink.ReplayInto while src keeps it (its first 16 and
+// latest 128 datagrams), else by DatagramLink.InjectRaw of the recorded
+// copy, the same arrival. Either counts as Injected on dst.
+func replayFrom(src, dst *rendrtest.DatagramLink, rec [][]byte, i int) {
+	if i < 16 || i >= len(rec)-100 {
+		src.ReplayInto(dst, i)
+		return
+	}
+	dst.InjectRaw(rendrtest.Up, rec[i])
+}
+
 // linkOf returns the factory name of the dialer's carrier id.
 func linkOf(t testing.TB, st rendr.SessionStatus, id rendr.CarrierID) string {
 	t.Helper()
@@ -169,7 +195,13 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 		w.flip.random(rendrtest.Up, 0)
 		w.flip.random(rendrtest.Down, 0)
 		fu, fd := w.flip.randomFlips(rendrtest.Up), w.flip.randomFlips(rendrtest.Down)
-		if fu < 20 || fd < 5 {
+		t.Logf("random flips: %d dialer → passive, %d back", fu, fd)
+		// The flips of a direction follow its own seeded draws, one per
+		// datagram: a session's 4,000 and 800 datagrams flip about 60 and 4
+		// to 5 (the few datagrams at the window's edges move the count by
+		// one); the floors leave that margin. The exact accounting below is
+		// the row's assertion.
+		if fu < 20 || fd < 3 {
 			t.Fatalf("stimulus: %d flips dialer → passive and %d back", fu, fd)
 		}
 		time.Sleep(time.Second)
@@ -198,7 +230,9 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 // other datagrams in its fseq window — exactly those, so the in-window
 // copy never reaches the session's seq window (DropLate and, outside race,
 // Duplicates unchanged) —, the application sees each datagram once, and
-// nothing dies.
+// nothing dies. (A MUX trunk's first datagrams carry the other sessions'
+// OPENs and SCHEDs: its first DGRAM may come after the 16 the link keeps
+// for ReplayInto; replayFrom re-sends it from the conn's own record.)
 func TestAdvDatagramReplay_L43_L39(t *testing.T) {
 	eachSetup(t, func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{record: true})
@@ -210,7 +244,7 @@ func TestAdvDatagramReplay_L43_L39(t *testing.T) {
 		y := ownerOf(t, xs, c.id)
 		sent := c.written()
 		picks := []int{0, -1, -1, -1} // H1, the first REL, the first DGRAM, a recent DGRAM
-		for i := 1; i < min(16, len(sent)); i++ {
+		for i := 1; i < min(64, len(sent)); i++ {
 			d := inspect(sent[i])
 			if picks[1] < 0 && !d.preface && len(d.rels) > 0 {
 				picks[1] = i
@@ -233,10 +267,11 @@ func TestAdvDatagramReplay_L43_L39(t *testing.T) {
 		}
 		d0, p0 := carrierDropped(y, c.id), w.p.Status()
 		dup0, late0 := seqCounts(xs)
+		inj0 := l.Stats().Session.Injected
 		for _, i := range picks {
-			l.ReplayInto(l, i)
+			replayFrom(l, l, sent, i)
 		}
-		if n := l.Stats().Replayed; n != uint64(len(picks)) {
+		if n := l.Stats().Session.Injected - inj0; n != uint64(len(picks)) {
 			t.Fatalf("stimulus: %d datagrams replayed, want %d", n, len(picks))
 		}
 		time.Sleep(time.Second)
@@ -353,15 +388,16 @@ func replayAcrossCarriers(t *testing.T, s setup, ov testhooks.Overrides) {
 	xs := w.openPacketN(w.datagramPeer())
 	ups := startPacketFlows(t, xs, 4360, packetRate)
 	time.Sleep(2 * time.Second)
-	src, dst, picks := acrossCarriers(t, w, xs, false)
+	src, dst, rec, picks := acrossCarriers(t, w, xs, false)
 	v := w.latestOn(dst.Name())
 	y := ownerOf(t, xs, v.id)
 	d0, lost0 := carrierDropped(y, v.id), lostOf(ups)
 	dup0, _ := seqCounts(xs)
+	inj0 := dst.Stats().Session.Injected
 	for _, i := range picks {
-		src.ReplayInto(dst, i)
+		replayFrom(src, dst, rec, i)
 	}
-	if n := dst.Stats().Replayed; n != uint64(len(picks)) {
+	if n := dst.Stats().Session.Injected - inj0; n != uint64(len(picks)) {
 		t.Fatalf("stimulus: %d datagrams replayed, want %d", n, len(picks))
 	}
 	time.Sleep(time.Second)
@@ -445,11 +481,12 @@ func replayRelAcrossCarriers(t *testing.T, s setup, ov testhooks.Overrides) {
 	xs := w.openPacketN(w.datagramPeer())
 	ups := startPacketFlows(t, xs, 4361, 100)
 	time.Sleep(time.Second)
-	src, dst, picks := acrossCarriers(t, w, xs, true)
+	src, dst, rec, picks := acrossCarriers(t, w, xs, true)
 	v := w.latestOn(dst.Name())
 	y := ownerOf(t, xs, v.id)
-	src.ReplayInto(dst, picks[0])
-	if n := dst.Stats().Replayed; n != 1 {
+	inj0 := dst.Stats().Session.Injected
+	replayFrom(src, dst, rec, picks[0])
+	if n := dst.Stats().Session.Injected - inj0; n != 1 {
 		t.Fatalf("stimulus: %d datagrams replayed, want 1", n)
 	}
 	if s.members() {
@@ -471,15 +508,15 @@ func replayRelAcrossCarriers(t *testing.T, s setup, ov testhooks.Overrides) {
 }
 
 // acrossCarriers prepares a replay from one carrier of the first session
-// of xs into another and returns the source link, the destination link
-// and the indices (in the datagrams of the source link's latest carrier,
-// which ReplayInto takes) to replay. Bond and race: the member on "a" into
+// of xs into another and returns the source link, the destination link,
+// the recording of the source link's latest carrier and the indices in it
+// to replay (replayFrom). Bond and race: the member on "a" into
 // the member on "b" — rel: after six kills of b, a's latest datagram with
 // a SCHED REL; else a's five latest DGRAMs. Selector: the active carrier's
 // link is killed and refused, the sessions fail over to the other link,
 // and the dead carrier's first REL (rel) or its five first DGRAMs are
 // replayed into the successor.
-func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *rendrtest.DatagramLink, picks []int) {
+func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *rendrtest.DatagramLink, rec [][]byte, picks []int) {
 	t.Helper()
 	x := xs[0]
 	if w.s.members() {
@@ -499,19 +536,30 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 			}
 		}
 		sent := w.latestOn("a").written()
-		for i := len(sent) - 1; i >= len(sent)-100 && i >= 0 && len(picks) < 5; i-- {
+		// MUX trunks with preset starts: each trunk direction numbers the
+		// frames of four sessions from fseqPreset, at its own pace, so a's
+		// latest fseqs may lie ahead of b's window, where a replay moves the
+		// window (one less than a window ahead) or is a forward jump: the
+		// "dgram" picks are a's latest DGRAMs at or behind b's newest fseq,
+		// the dedicated pair's premise. (Derived starts put them anywhere.)
+		top, behind := uint32(0), false
+		if !rel && w.s.mux && w.o.ov.FirstFseq != 0 {
+			bs := w.latestOn("b").written()
+			top, behind = fseqOf(bs[len(bs)-1]), true
+		}
+		for i := len(sent) - 1; i >= 0 && (behind || i >= len(sent)-100) && len(picks) < 5; i-- {
 			d := inspect(sent[i])
 			switch {
 			case rel && len(d.rels) > 0 && d.rels[0].Type == wire.TypeSched:
-				return src, dst, []int{i}
-			case !rel && d.dgram:
+				return src, dst, sent, []int{i}
+			case !rel && d.dgram && (!behind || int32(fseqOf(sent[i])-top) <= 0):
 				picks = append(picks, i)
 			}
 		}
 		if rel || len(picks) == 0 {
 			t.Fatalf("no datagram of a to replay (rel %v)", rel)
 		}
-		return src, dst, picks
+		return src, dst, sent, picks
 	}
 	name := linkOf(t, x.d.Status(), target(t, w.s, x.d.Status()))
 	src = w.dlink(name)
@@ -540,7 +588,7 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 		d := inspect(sent[i])
 		switch {
 		case rel && !d.preface && len(d.rels) > 0:
-			return src, dst, []int{i}
+			return src, dst, sent, []int{i}
 		case !rel && d.dgram:
 			picks = append(picks, i)
 		}
@@ -548,7 +596,7 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 	if rel || len(picks) == 0 {
 		t.Fatalf("no datagram of the dead carrier to replay (rel %v)", rel)
 	}
-	return src, dst, picks
+	return src, dst, sent, picks
 }
 
 // TestAdvDatagramReplayAcrossSessions_L43: session A's datagrams replayed

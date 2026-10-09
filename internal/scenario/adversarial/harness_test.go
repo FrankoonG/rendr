@@ -72,9 +72,20 @@ func dedicatedSetups() []setup {
 	}
 }
 
-// setups are the setups every row runs against. The MUX half of the set
-// (the 4-session MUX trunk forms) appends its setups here.
-func setups() []setup { return dedicatedSetups() }
+// muxSetups are the 4-session MUX trunk setups: zero Props let the Runtime
+// share every carrier (the rendr mux is the default), so the four sessions
+// of a Peer ride one trunk per link and the attacked carrier is theirs.
+func muxSetups() []setup {
+	return []setup{
+		{name: "mux-selector", mode: rendr.ModeSelector, mux: true, sessions: 4, props: rendr.Props{}},
+		{name: "mux-bond", mode: rendr.ModeBond, mux: true, sessions: 4, props: rendr.Props{}},
+		{name: "mux-race", mode: rendr.ModeRace, mux: true, sessions: 4, props: rendr.Props{}},
+	}
+}
+
+// setups are the setups every row runs against: the dedicated carriers,
+// then the 4-session MUX trunks.
+func setups() []setup { return slices.Concat(dedicatedSetups(), muxSetups()) }
 
 // eachSetup runs body once per setup, each in a bubble of its own.
 func eachSetup(t *testing.T, body func(t *testing.T, s setup)) {
@@ -575,6 +586,129 @@ func neighbours(t testing.TB, s setup, xs []*pair, own, shared uint64) {
 		}
 		untouched(t, fmt.Sprintf("neighbour session %d", i+1), x)
 	}
+}
+
+// kill names the carrier an attack killed: its ID, the cause and which end
+// detected it (dialer: a Down attack; else the passive). A zero id names
+// no one carrier (a stimulus that cut whole links).
+type kill struct {
+	id     rendr.CarrierID
+	cause  rendr.Cause
+	dialer bool
+	// some: on a MUX trunk only some sessions of xs had the carrier (a
+	// selector's failover spreads them over the trunks of both links);
+	// the others count own.
+	some bool
+}
+
+// migrated requires what an attack that killed carrier k of xs[0] did to
+// the stream sessions xs: d Death migrations of the attacked session (the
+// row's deaths, k among them) and own of each neighbour on dedicated
+// carriers (neighbours).
+//
+// On a MUX trunk every session of xs had k (k.some: at least one): the
+// detecting end of each lists k dead with k's cause — the one trunk death
+// reached every view — and each counts its own migrations, d (own for a
+// session k.some left off the trunk). Selector sessions count exactly that
+// (a lost active carrier always counts). A bond or race member's death
+// counts only when it took unacknowledged spans with it (§7.6, M3-D34;
+// A6.6): with four sessions on one trunk whether a session's view held any
+// at the death instant is the other views' timing on the trunk, and a race
+// view's spans below the ACK edge its other member's copies moved are
+// trimmed (requeueLocked) — so each dialer counts at most that and its
+// passive none (it sent nothing of its own). Bond's data on the dead trunk
+// was its only copy: at least one session counts a death.
+func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
+	t.Helper()
+	if !s.mux {
+		xs[0].deathsAre(t, s, d)
+		neighbours(t, s, xs, own, d)
+		return
+	}
+	want := make([]uint64, len(xs))
+	on := 0
+	for i, x := range xs {
+		want[i] = d
+		if k.id == 0 {
+			continue
+		}
+		end := x.p
+		if k.dialer {
+			end = x.d
+		}
+		if _, ok := carrierOf(end.Status(), k.id); !ok {
+			if !k.some {
+				t.Fatalf("session %d never had the shared carrier %d", i, k.id)
+			}
+			want[i] = own
+			continue
+		}
+		on++
+		c := endDead(t, fmt.Sprintf("session %d's detecting end", i), end.Status, k.id)
+		if c.DeathCause != k.cause {
+			t.Fatalf("session %d: trunk %d died of %v %q at the detecting end, want %v", i, k.id, c.DeathCause, c.DeathDetail, k.cause)
+		}
+	}
+	if k.id != 0 && on == 0 {
+		t.Fatalf("no session had carrier %d", k.id)
+	}
+	if !s.members() && !k.some {
+		for i, x := range xs {
+			x.deathsAre(t, s, want[i])
+		}
+		return
+	}
+	if !s.members() {
+		// A selector's failover race may leave a session with a view on
+		// the new trunk that is not its active carrier: losing it is no
+		// Death migration. A session on k counts own or d — d when k was
+		// its active carrier, as it was for the session whose SCHED the
+		// attack hit — and the passive follows the dialer's counts.
+		top := false
+		for i, x := range xs {
+			waitFor(t, 10*time.Second, fmt.Sprintf("session %d's Death migrations settled", i), func() bool {
+				dm, pm := x.d.Status().Migrations.Death, x.p.Status().Migrations.Death
+				return dm >= own && dm == pm
+			})
+			if dm := x.d.Status().Migrations.Death; dm > want[i] {
+				t.Fatalf("session %d: %d Death migrations, want %d to %d", i, dm, own, want[i])
+			} else if dm == d {
+				top = true
+			}
+		}
+		if !top {
+			t.Fatalf("no session counted the death of its active carrier %d", k.id)
+		}
+		return
+	}
+	var sum uint64
+	for i, x := range xs {
+		dm, pm := x.d.Status().Migrations, x.p.Status().Migrations
+		if dm.Death > want[i] || pm.Death != 0 {
+			t.Fatalf("session %d: Death migrations: dialer %+v, passive %+v; want at most %d and 0", i, dm, pm, want[i])
+		}
+		sum += dm.Death
+	}
+	if s.mode == rendr.ModeBond && sum == 0 {
+		t.Fatal("no bond session counted the death of the trunk that carried their unacknowledged data")
+	}
+}
+
+// carrying returns the first session of xs whose end (the dialer's, else
+// the passive's) has or had carrier id.
+func carrying(t testing.TB, xs []*pair, id rendr.CarrierID, dialer bool) *pair {
+	t.Helper()
+	for _, x := range xs {
+		end := x.p
+		if dialer {
+			end = x.d
+		}
+		if _, ok := carrierOf(end.Status(), id); ok {
+			return x
+		}
+	}
+	t.Fatalf("no session has carrier %d", id)
+	return nil
 }
 
 // neighboursPacket is neighbours for packet sessions.
@@ -1122,12 +1256,17 @@ type dflip struct {
 	fired rendr.CarrierID // the conn the targeted flip hit
 	nfire int
 
-	rate  [2]float64 // random flips per datagram, per direction (Up, Down)
-	rng   *rand.Rand
+	rate [2]float64 // random flips per datagram, per direction (Up, Down)
+	// rng draws per direction: a direction's flips are a function of the
+	// number of datagrams it wrote, not of how the goroutines of the two
+	// directions interleave.
+	rng   [2]*rand.Rand
 	flips [2]int // random flips done per direction
 }
 
-func newDflip() *dflip { return &dflip{rng: rand.New(rand.NewPCG(43, 41))} }
+func newDflip() *dflip {
+	return &dflip{rng: [2]*rand.Rand{rand.New(rand.NewPCG(43, 41)), rand.New(rand.NewPCG(41, 43))}}
+}
 
 // arm arms the targeted flip: bit of the first frame of type typ (counted
 // as in rendrtest.Tamper.FlipBit: 0 is the header's first bit, a negative
@@ -1188,9 +1327,9 @@ func (f *dflip) apply(c *dflipConn, p []byte) []byte {
 			return q
 		}
 	}
-	if r := f.rate[dirIndex(c.dir)]; r > 0 && f.rng.Float64() < r {
+	if i := dirIndex(c.dir); f.rate[i] > 0 && f.rng[i].Float64() < f.rate[i] {
 		q := slices.Clone(p)
-		b := f.rng.IntN(8 * len(q))
+		b := f.rng[i].IntN(8 * len(q))
 		q[b/8] ^= 0x80 >> (b % 8)
 		f.flips[dirIndex(c.dir)]++
 		return q

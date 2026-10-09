@@ -6,6 +6,7 @@ import (
 	"net"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
@@ -25,7 +26,18 @@ import (
 // every one; it returns once X's and Y's first sessions delivered a
 // quarter. The rows splice a carrier of xs[0] into one of ys[0].
 func twoSessions(t *testing.T, w *world, n int64) (xs, ys []*pair, fxs, fys []*sflow) {
-	xs, ys = w.openN(w.streamPeer()), w.openN(w.streamPeer())
+	return twoSessionsN(t, w, n, w.s.sessions, w.s.sessions)
+}
+
+// twoSessionsN is twoSessions with nx sessions in X and ny in Y.
+func twoSessionsN(t *testing.T, w *world, n int64, nx, ny int) (xs, ys []*pair, fxs, fys []*sflow) {
+	px, py := w.streamPeer(), w.streamPeer()
+	for range nx {
+		xs = append(xs, w.open(px))
+	}
+	for range ny {
+		ys = append(ys, w.open(py))
+	}
 	for i, x := range xs {
 		fxs = append(fxs, startFlow(x.d, x.p, n, 4310+uint64(2*i)))
 	}
@@ -39,8 +51,9 @@ func twoSessions(t *testing.T, w *world, n int64) (xs, ys []*pair, fxs, fys []*s
 
 // spliceEnd waits for every transfer of X and Y, requires X's sessions
 // untouched (X only lent its frames) and Y's first session's one Death
-// migration (and its neighbours'), and ends every session cleanly.
-func spliceEnd(t *testing.T, w *world, xs, ys []*pair, fxs, fys []*sflow) {
+// migration (and its neighbours', migrated) after Y's carrier k died, and
+// ends every session cleanly.
+func spliceEnd(t *testing.T, w *world, xs, ys []*pair, fxs, fys []*sflow, k kill) {
 	t.Helper()
 	for i, f := range fxs {
 		f.wait(t, 2*time.Minute, fmt.Sprintf("X's session %d", i))
@@ -51,8 +64,7 @@ func spliceEnd(t *testing.T, w *world, xs, ys []*pair, fxs, fys []*sflow) {
 	for i, x := range xs {
 		untouched(t, fmt.Sprintf("X's session %d", i), x)
 	}
-	ys[0].deathsAre(t, w.s, 1)
-	neighbours(t, w.s, ys, 0, 1)
+	migrated(t, w.s, ys, k, 1, 0)
 	for _, x := range slices.Concat(xs, ys) {
 		x.endClean(t)
 	}
@@ -91,45 +103,96 @@ func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
 			name = "midframe"
 		}
 		t.Run(name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) {
-				n := rowBytes()
-				w := newWorld(t, s, worldOpts{})
-				xs, ys, fxs, fys := twoSessions(t, w, n)
-				x, y := xs[0], ys[0]
-				tx, ty := w.tamperOf(target(t, s, x.d.Status())), w.tamperOf(target(t, s, y.d.Status()))
-				want := []string{"fseq"}
-				if mid {
-					ty.Hold(rendrtest.Up)
-					waitFor(t, 5*time.Second, "Y's Up held at a frame boundary", func() bool { return ty.Stats().Held == 1 })
-					log := ty.Log(rendrtest.Up)
-					last := log[len(log)-1]
-					ty.Splice(rendrtest.Up, tx, last.Off+17+int64(last.Len)+15)
-					ty.Release(rendrtest.Up)
-					want = nil // the cut frame fails whichever check meets X's bytes first
-				} else {
-					ty.Splice(rendrtest.Up, tx, 0)
-				}
-				waitFor(t, 5*time.Second, "X's frames forwarded into Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 })
-				hit := w.hit(t, spliced)
-				if hit.tm != ty {
-					t.Fatalf("the splice started on carrier %d, not Y's", hit.id)
-				}
-				violated(t, "Y's spliced carrier", endDead(t, "Y's passive", y.p.Status, hit.id), want...)
-				var own, foreign int
-				for _, r := range ty.Log(rendrtest.Up) {
-					if r.Spliced {
-						foreign++
-					} else {
-						own++
-					}
-				}
-				if foreign == 0 || own == 0 {
-					t.Fatalf("stimulus: Y's carrier forwarded %d own and %d of X's frames", own, foreign)
-				}
-				spliceEnd(t, w, xs, ys, fxs, fys)
-			})
+			eachSetup(t, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
 		})
 	}
+}
+
+// TestAdvMuxSpliceCrossTrunk_L43: the dialer → passive bytes of MUX trunk
+// T1 — four sessions, handles 1 to 4 — are spliced into trunk T2 — three
+// sessions of another Peer, handles 1 to 3 — on the same link, at T2's
+// next frame boundary and 15 bytes into one of its frames (selector, bond
+// and race sessions). T2's passive kills T2 at the first spliced frame —
+// fseq at a boundary (T1's frames continue T1's sequence), whichever
+// check meets the cut frame in the middle — before any view of T2 sees
+// T1's payload: T1's frames carry handles T2's views have (1 to 3) and one
+// T2 never opened (4), and T2's three verifiers read their own streams
+// only. T1's sessions are untouched, T2's migrate (migrated), and every
+// stream arrives intact.
+func TestAdvMuxSpliceCrossTrunk_L43(t *testing.T) {
+	for _, mid := range []bool{false, true} {
+		name := "boundary"
+		if mid {
+			name = "midframe"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, s := range muxSetups() {
+				t.Run(s.name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) { spliceRow(t, s, mid, 4, 3) })
+				})
+			}
+		})
+	}
+}
+
+// spliceRow splices the dialer → passive frames of X's carrier (nx
+// sessions) into Y's (ny sessions): TestAdvSpliceTwoSessions_L41_L43 and
+// TestAdvMuxSpliceCrossTrunk_L43.
+func spliceRow(t *testing.T, s setup, mid bool, nx, ny int) {
+	n := rowBytes()
+	w := newWorld(t, s, worldOpts{})
+	xs, ys, fxs, fys := twoSessionsN(t, w, n, nx, ny)
+	x, y := xs[0], ys[0]
+	tx, ty := w.tamperOf(target(t, s, x.d.Status())), w.tamperOf(target(t, s, y.d.Status()))
+	if s.mux {
+		// The two trunks carry the views the row names: X's handles 1 to
+		// nx, Y's 1 to ny.
+		for _, c := range []struct {
+			name string
+			tm   *rendrtest.Tamper
+			k    int
+		}{{"X", tx, nx}, {"Y", ty, ny}} {
+			hs := map[uint32]bool{}
+			for _, r := range c.tm.Log(rendrtest.Up) {
+				if r.Handle != 0 {
+					hs[r.Handle] = true
+				}
+			}
+			if len(hs) != c.k || !hs[1] || !hs[uint32(c.k)] {
+				t.Fatalf("%s's trunk carried the handles %v, want 1 to %d", c.name, hs, c.k)
+			}
+		}
+	}
+	want := []string{"fseq"}
+	if mid {
+		ty.Hold(rendrtest.Up)
+		waitFor(t, 5*time.Second, "Y's Up held at a frame boundary", func() bool { return ty.Stats().Held == 1 })
+		log := ty.Log(rendrtest.Up)
+		last := log[len(log)-1]
+		ty.Splice(rendrtest.Up, tx, last.Off+17+int64(last.Len)+15)
+		ty.Release(rendrtest.Up)
+		want = nil // the cut frame fails whichever check meets X's bytes first
+	} else {
+		ty.Splice(rendrtest.Up, tx, 0)
+	}
+	waitFor(t, 5*time.Second, "X's frames forwarded into Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 })
+	hit := w.hit(t, spliced)
+	if hit.tm != ty {
+		t.Fatalf("the splice started on carrier %d, not Y's", hit.id)
+	}
+	violated(t, "Y's spliced carrier", endDead(t, "Y's passive", y.p.Status, hit.id), want...)
+	var own, foreign int
+	for _, r := range ty.Log(rendrtest.Up) {
+		if r.Spliced {
+			foreign++
+		} else {
+			own++
+		}
+	}
+	if foreign == 0 || own == 0 {
+		t.Fatalf("stimulus: Y's carrier forwarded %d own and %d of X's frames", own, foreign)
+	}
+	spliceEnd(t, w, xs, ys, fxs, fys, kill{id: hit.id, cause: rendr.CauseProtocolViolation})
 }
 
 // TestAdvRelaySplice_L43_L69: a relay in the path of a carrier mixes up its
@@ -189,7 +252,12 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 				t.Fatalf("the fresh connection %+v: want the dialer's bytes up, nothing down, no session frame first", c)
 			}
 			waitFor(t, 10*time.Second, "no handshake left on the passive", func() bool { return w.p.Status().Handshakes == 0 })
-			if st := w.p.Status(); st.AcceptBacklog != [2]int{} || st.Sessions != before.Sessions {
+			// The sessions that lost the spliced carrier may be orphaned
+			// until their redial attaches (every session of a MUX trunk):
+			// the passive's sessions return to what they were, and nothing
+			// waits in its backlog.
+			waitFor(t, 10*time.Second, "the passive's sessions as before the switch", func() bool { return w.p.Status().Sessions == before.Sessions })
+			if st := w.p.Status(); st.AcceptBacklog != [2]int{} {
 				t.Fatalf("the passive kept state from the fresh connection: sessions %+v (before %+v), backlog %v",
 					st.Sessions, before.Sessions, st.AcceptBacklog)
 			}
@@ -197,8 +265,7 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 				f.wait(t, 2*time.Minute, fmt.Sprintf("session %d's transfer across the relay's switch", i))
 			}
 			w.noViolation()
-			x.deathsAre(t, s, 1)
-			neighbours(t, s, xs, 0, 1)
+			migrated(t, s, xs, kill{id: id, cause: rendr.CauseTransportError}, 1, 0)
 			for _, y := range xs {
 				y.endClean(t)
 			}
@@ -219,7 +286,7 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 				t.Fatalf("the splice started on carrier %d, not Y's", hit.id)
 			}
 			violated(t, "Y's spliced carrier", endDead(t, "Y's dialer", y.d.Status, hit.id), "fseq")
-			spliceEnd(t, w, xs, ys, fxs, fys)
+			spliceEnd(t, w, xs, ys, fxs, fys, kill{id: hit.id, cause: rendr.CauseProtocolViolation, dialer: true})
 		})
 	})
 }

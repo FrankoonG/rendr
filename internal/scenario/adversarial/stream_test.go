@@ -36,26 +36,22 @@ type streamAttack struct {
 	arm  func(tm *rendrtest.Tamper, x *pair) // arms the operation on the picked carrier's tamper
 	ops  func(tm *rendrtest.Tamper) int      // the stimulus counter of one tamper
 	want []string                            // the receiving end's detail names one of these
+	// muxWant replaces want on a MUX trunk (nil: want), where a handle
+	// can name another live view.
+	muxWant []string
+}
+
+// wants returns the details the receiving end may name in setup s.
+func (a streamAttack) wants(s setup) []string {
+	if s.mux && a.muxWant != nil {
+		return a.muxWant
+	}
+	return a.want
 }
 
 // stat adapts a TamperStats counter to a stimulus counter.
 func stat(f func(st rendrtest.TamperStats) int) func(tm *rendrtest.Tamper) int {
 	return func(tm *rendrtest.Tamper) int { return f(tm.Stats()) }
-}
-
-// replays counts the replayed frames tm forwarded Up: frames whose index
-// is below one forwarded before them. (Tamper.Stats counts a replay only
-// once its write returned: a replayed frame that kills the carrier while
-// the link still takes its bytes is in the Log, not in Replayed.)
-func replays(tm *rendrtest.Tamper) int {
-	k, top := 0, -1
-	for _, r := range tm.Log(rendrtest.Up) {
-		if r.Index < top {
-			k++
-		}
-		top = max(top, r.Index)
-	}
-	return k
 }
 
 // fired sums the stimulus counter over every session tamper.
@@ -104,20 +100,27 @@ func runStream(t *testing.T, s setup, a streamAttack) {
 	waitFor(t, 10*time.Second, "the operation (stimulus)", func() bool { return w.fired(a.ops) > 0 })
 	w.disarm()
 	hit := w.hit(t, a.ops)
-	end := x.p
+	// The receiving end of a session on the attacked carrier: x's, or on a
+	// MUX trunk the first session's that has it (after a selector's
+	// failover the sessions may be spread over two trunks).
+	y := x
+	if s.mux {
+		y = carrying(t, xs, hit.id, a.dir == rendrtest.Down)
+	}
+	end := y.p
 	if a.dir == rendrtest.Down {
-		end = x.d
+		end = y.d
 	}
 	c := endDead(t, "the receiving end", end.Status, hit.id)
-	violated(t, "the attacked carrier", c, a.want...)
+	violated(t, "the attacked carrier", c, a.wants(s)...)
 	for i, f := range fs {
 		f.wait(t, 2*time.Minute, fmt.Sprintf("session %d's transfer across the attack", i))
 	}
 	if k := w.fired(a.ops); k != 1 {
 		t.Fatalf("the operation fired %d times, want once", k)
 	}
-	x.deathsAre(t, s, deaths)
-	neighbours(t, s, xs, own, deaths)
+	migrated(t, s, xs, kill{id: hit.id, cause: rendr.CauseProtocolViolation, dialer: a.dir == rendrtest.Down,
+		some: a.sch && s.mode == rendr.ModeSelector}, deaths, own)
 	for _, x := range xs {
 		x.endClean(t)
 	}
@@ -184,7 +187,9 @@ func ackLane(t testing.TB, w *world, x *pair) rendr.CarrierID {
 // once. Selector: every carrier dialled for x from now on is armed and
 // the active carrier's link is killed: the failover carrier's first SCHED
 // names it. Either way the attacked carrier is the second death of the
-// row.
+// row. On a MUX trunk the failover trunk is dialled by whichever session's
+// attempt comes first (the others take views on it, M3-D18), so every new
+// carrier is armed: the first SCHED on it is some session's.
 func schedTrigger(t testing.TB, w *world, x *pair, arm func(tm *rendrtest.Tamper)) {
 	t.Helper()
 	if w.s.members() {
@@ -200,7 +205,11 @@ func schedTrigger(t testing.TB, w *world, x *pair, arm func(tm *rendrtest.Tamper
 			act = c.Name
 		}
 	}
-	w.armNew(x.d.ID(), arm)
+	sess := x.d.ID()
+	if w.s.mux {
+		sess = rendr.SessionID{}
+	}
+	w.armNew(sess, arm)
 	if act == "" || w.link(act).Kill() == 0 {
 		t.Fatalf("stimulus: no active carrier to kill (%q)", act)
 	}
@@ -277,7 +286,7 @@ func TestAdvReplayedFrame_L43(t *testing.T) {
 				avg := (last.Off + int64(17+last.Len) - first.Off) / int64(len(log))
 				tm.ReplayFrame(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameData), int(later/max(avg, 1))+1)
 			},
-			ops:  replays,
+			ops:  stat(func(st rendrtest.TamperStats) int { return st.Replayed }),
 			want: []string{"fseq"}})
 	})
 }
@@ -351,7 +360,13 @@ func TestAdvWriterBufferMutation_L43(t *testing.T) {
 		if lost == 0 {
 			t.Fatal("stimulus: the cut lost no byte in flight")
 		}
-		if ds := x.d.Status(); s.mode != rendr.ModeRace && ds.RetransmittedBytes == 0 {
+		// (On a MUX trunk the bytes the cut lost were whichever sessions'
+		// were in flight.)
+		var retx uint64
+		for _, y := range xs {
+			retx += y.d.Status().RetransmittedBytes
+		}
+		if s.mode != rendr.ModeRace && retx == 0 {
 			t.Fatal("stimulus: nothing was retransmitted after the cut")
 		}
 		if zeroed.Load() < n/2 {
@@ -359,9 +374,15 @@ func TestAdvWriterBufferMutation_L43(t *testing.T) {
 		}
 		w.noViolation()
 		// The cut hit every carrier on the links, so every session counts
-		// the same deaths, dedicated or on a MUX trunk.
-		for _, y := range xs {
-			y.deathsAre(t, s, deaths)
+		// the same deaths, dedicated or on a MUX trunk (where a bond or race
+		// session counts a member's death only with spans in flight on it:
+		// migrated).
+		if s.mux {
+			migrated(t, s, xs, kill{}, deaths, deaths)
+		} else {
+			for _, y := range xs {
+				y.deathsAre(t, s, deaths)
+			}
 		}
 		for _, y := range xs {
 			y.endClean(t)
