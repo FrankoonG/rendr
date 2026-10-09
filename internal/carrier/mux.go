@@ -55,10 +55,10 @@ type muxState struct {
 	awaitAck atomic.Int32 // datagram trunks: retiring views whose DETACH waits for its RACK (relAcked)
 	full     bool         // dialer: a CAPACITY CodeMuxFull answer arrived; cleared when a view's Done closes (the pool's usable rule)
 
-	detq     []*Conn  // views whose DETACH is due (abandoned, killed, after their last frame, the peer's DETACH answered)
-	lasts    []*Conn  // views with a WriteAndClose frame to place
-	retiring []*Conn  // views whose DETACH was placed and whose exchange is not complete
-	tol      []uint32 // ring: handles whose late RST, DETACH or response is dropped (refused, or retired at the DETACH bound)
+	detq     []*Conn    // views whose DETACH is due (abandoned, killed, after their last frame, the peer's DETACH answered)
+	lasts    []*Conn    // views with a WriteAndClose frame to place
+	retiring []*Conn    // views whose DETACH was placed and whose exchange is not complete
+	tol      []tolEntry // ring: handles whose late crossing frames are dropped (refused, or retired at the DETACH bound)
 	tolHead  int
 	opHead   int // the opens FIFO: t.opens[opHead : opHead+opN] (mod cap)
 	opN      int
@@ -67,11 +67,23 @@ type muxState struct {
 	scratch  []*Conn  // the round's ready views (cap = the ring's)
 	nextWake int64    // ns after base: the earliest per-view WakeAt; 0 = none
 	detWake  int64    // ns after base: the earliest DETACH bound of a retiring view; 0 = none
-	capN     int      // views with capMarked
+	capList  []*Conn  // views with capMarked (each once): a PONG re-readies these only (L54)
 	capPM    uint64   // the PONG watermark when the latest view was marked cap-blocked
-	relN     int      // views with relMarked
+	relList  []*Conn  // views with relMarked (each once)
+	wakeList []*Conn  // views with a pending WakeAt (each once)
+	touched  uint64   // views a round visited (ready scratch and wake lists): the cost gate's count (L54)
 	post     postList // the writer's
 	rpost    postList // the reader's
+}
+
+// tolEntry is one entry of the tolerance ring: a handle no view holds any
+// more whose crossing frames are legal. all: every session frame and the
+// DETACH (a view retired at the DETACH bound, whose peer may still be
+// sending); otherwise only RST, a response and the DETACH (a refused
+// handle).
+type tolEntry struct {
+	h   uint32
+	all bool
 }
 
 // viewExt is a view's mux state beyond the fields the skeleton declared
@@ -101,6 +113,7 @@ type viewExt struct {
 	last     *lastFrame        // a WriteAndClose frame to place
 	refused  bool              // gone through a refusal response: no DETACH (M3-D7)
 	onDone   Doorbell          // rung once when Done closes (OnDone)
+	doneShut bool              // Done is closed (set with the close, under mx): OnDone rings at once
 	ringFwd  bool              // ring the bell once at the end (killed views ring at Kill)
 
 	// Writer.
@@ -186,6 +199,9 @@ func (t *trunk) buildTableLocked() {
 	t.views = make(map[uint32]*Conn, 4)
 	t.readyRing = make([]*Conn, n)
 	t.ms.scratch = make([]*Conn, n)
+	t.ms.capList = make([]*Conn, 0, n)
+	t.ms.relList = make([]*Conn, 0, n)
+	t.ms.wakeList = make([]*Conn, 0, n)
 	if v := t.view1; v.vx.inTable {
 		t.views[v.handle] = v
 		if v.vx.fillOK.Load() && v.ready.CompareAndSwap(false, true) {
@@ -338,10 +354,16 @@ func (t *trunk) finishLocked(v *Conn, p *postList) {
 }
 
 // viewDoneClosed closes v's Done (once, after its last call), lowers the
-// view count and runs the OnDone doorbell and the pool's view hook.
+// view count and runs the OnDone doorbell and the pool's view hook. The
+// close and doneShut change together under mx, so an OnDone either sees
+// Done closed and rings at once or registers its bell before the close
+// (R1-7: no lost ring). The pool's hook runs on a goroutine of its own:
+// view Kill, Retire and WriteAndClose may close Done inline and may be
+// called under Session.mu or Pool.mu, while the hook takes Pool.mu.
 func (t *trunk) viewDoneClosed(v *Conn) {
-	close(v.done)
 	t.mx.Lock()
+	close(v.done)
+	v.vx.doneShut = true
 	t.nviews--
 	t.ms.full = false
 	b := v.vx.onDone
@@ -352,7 +374,7 @@ func (t *trunk) viewDoneClosed(v *Conn) {
 		b.Ring()
 	}
 	if f != nil {
-		f(v)
+		go f(v)
 	}
 }
 
@@ -422,7 +444,7 @@ func (t *trunk) classify(typ wire.Type, h uint32) (act muxAct, v *Conn, why stri
 func (t *trunk) classifyLocked(typ wire.Type, h uint32) (muxAct, *Conn, string) {
 	v := t.lookupLocked(h)
 	if v == nil {
-		if (typ == wire.TypeRst || typ == wire.TypeOpenAck || typ == wire.TypeJoinAck) && t.toleratedLocked(h, false) {
+		if typ != wire.TypeOpen && typ != wire.TypeJoin && t.toleratedLocked(h, typ, false) {
 			return actIgnore, nil, ""
 		}
 		if !t.dialer && (typ == wire.TypeOpen || typ == wire.TypeJoin) && h > max(t.maxHandle, wire.SessionHandle) {
@@ -588,7 +610,7 @@ func (t *trunk) muxRound(b *Batch) {
 		t.mx.Unlock()
 		t.runPost(&ms.post)
 	}
-	if ms.capN > 0 {
+	if len(ms.capList) > 0 {
 		// Views still wait on the shared capacity although they were not
 		// called this round: the trunk stays cap-blocked, so the PONG that
 		// frees capacity wakes the writer (C5) and re-readies them.
@@ -678,6 +700,7 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 	sc := t.ms.scratch[:n]
 	start := t.cursor % n
 	t.cursor++
+	t.ms.touched += uint64(n)
 	quantum := t.tm.MuxQuantum
 	// Control pass: every ready view places its control frames (ACK, FIN,
 	// RST, SCHED, PACK, responses) before any view's payload (L16).
@@ -762,15 +785,18 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 	ms := &t.ms
 	if b.capBlocked && !v.capMarked {
 		v.capMarked = true
-		ms.capN++
+		ms.capList = append(ms.capList, v)
 		ms.capPM = rd.pongMark
 	}
 	if b.relBlocked && !v.vx.relMarked {
 		v.vx.relMarked = true
-		ms.relN++
+		ms.relList = append(ms.relList, v)
 	}
 	if w := b.wake; !w.IsZero() {
 		if at := t.nsAt(w); at > nowNs && (v.wakeAt == 0 || at < v.wakeAt) {
+			if v.wakeAt == 0 {
+				ms.wakeList = append(ms.wakeList, v)
+			}
 			v.wakeAt = at
 			if ms.nextWake == 0 || at < ms.nextWake {
 				ms.nextWake = at
@@ -802,42 +828,50 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 
 // reReadyLocked readies the views whose wake came (§A4.3): the views a
 // PONG freed capacity for (cap-marked, once the PONG watermark moved), the
-// views a RACK freed REL room for, and the views whose WakeAt is due.
+// views a RACK freed REL room for, and the views whose WakeAt is due. It
+// visits the marked views only, never the idle ones (L54).
 func (t *trunk) reReadyLocked(rd *roundData, nowNs int64) {
 	ms := &t.ms
-	capFree := ms.capN > 0 && rd.pongMark != ms.capPM
-	relFree := ms.relN > 0 && rd.relRoom > 0
-	due := ms.nextWake != 0 && nowNs >= ms.nextWake
-	if !capFree && !relFree && !due {
-		return
-	}
-	if due {
-		ms.nextWake = 0
-	}
-	for _, v := range t.views {
-		if capFree && v.capMarked {
+	if len(ms.capList) > 0 && rd.pongMark != ms.capPM {
+		for i, v := range ms.capList {
+			ms.touched++
 			v.capMarked = false
 			t.readyLocked(v)
+			ms.capList[i] = nil
 		}
-		if relFree && v.vx.relMarked {
+		ms.capList = ms.capList[:0]
+	}
+	if len(ms.relList) > 0 && rd.relRoom > 0 {
+		for i, v := range ms.relList {
+			ms.touched++
 			v.vx.relMarked = false
 			t.readyLocked(v)
+			ms.relList[i] = nil
 		}
-		if due && v.wakeAt != 0 {
-			if v.wakeAt <= nowNs {
-				v.wakeAt = 0
-				t.readyLocked(v)
-			} else if ms.nextWake == 0 || v.wakeAt < ms.nextWake {
+		ms.relList = ms.relList[:0]
+	}
+	if ms.nextWake == 0 || nowNs < ms.nextWake {
+		return
+	}
+	ms.nextWake = 0
+	k := 0
+	for i, v := range ms.wakeList {
+		ms.touched++
+		ms.wakeList[i] = nil
+		switch {
+		case v.wakeAt == 0:
+		case v.wakeAt <= nowNs:
+			v.wakeAt = 0
+			t.readyLocked(v)
+		default:
+			ms.wakeList[k] = v
+			k++
+			if ms.nextWake == 0 || v.wakeAt < ms.nextWake {
 				ms.nextWake = v.wakeAt
 			}
 		}
 	}
-	if capFree {
-		ms.capN = 0
-	}
-	if relFree {
-		ms.relN = 0
-	}
+	ms.wakeList = ms.wakeList[:k]
 }
 
 // Fan-outs (M3-D14, §A4.3).
@@ -881,17 +915,22 @@ func (t *trunk) writeBlockedAll() {
 	}
 }
 
-// finishAll ends every view of a trunk whose Done closed: each view's
-// Done closes once its calls drained (M3-D13).
+// finishAll ends every view of a trunk whose Done closed: every view not
+// yet gone becomes dead (§A5.4), and each view's Done closes once its
+// calls drained (M3-D13).
 func (t *trunk) finishAll() {
-	if !t.ms.multi.Load() {
-		if v := t.view1; v.vx.own {
+	vs := t.viewsSnapshot()
+	t.mx.Lock()
+	for _, v := range vs {
+		if v.vx.own && v.state != viewGone {
+			v.state = viewDead
+		}
+	}
+	t.mx.Unlock()
+	for _, v := range vs {
+		if v.vx.own {
 			t.finish(v)
 		}
-		return
-	}
-	for _, v := range t.viewsSnapshot() {
-		t.finish(v)
 	}
 	// Views that left the table but whose Done is still open (a killed
 	// view waiting for its calls) close at their last call.

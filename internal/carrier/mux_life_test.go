@@ -135,6 +135,29 @@ func TestViewDoneAfterLastCall_L52(t *testing.T) {
 			s.tap.release()
 		})
 	})
+	t.Run("OnDone in the close window", func(t *testing.T) {
+		// The end is decided under trunk.mx (finishLocked: no call in
+		// progress) and Done closes later, at runPost once mx is released.
+		// An OnDone registered in between must ring once, after the close
+		// (R1-7): a ring while Done is still open would be lost.
+		synctest.Test(t, func(t *testing.T) {
+			s, p := muxRawDialer(t, nil)
+			v, _ := liveRawView(t, s, p, 2, &blockEP{}, &hBell{})
+			var pl postList
+			s.c.mx.Lock()
+			s.c.finishLocked(v, &pl)
+			s.c.mx.Unlock()
+			b := &hBell{}
+			v.OnDone(b)
+			if n := b.n.Load(); n != 0 && !isDone(v.Done()) {
+				t.Fatalf("OnDone rang %d time(s) while Done was still open", n)
+			}
+			s.c.runPost(&pl)
+			if !isDone(v.Done()) || b.n.Load() != 1 {
+				t.Fatalf("after the close: Done %v, OnDone rang %d times, want once", isDone(v.Done()), b.n.Load())
+			}
+		})
+	})
 }
 
 // TestViewEndRecord (R1-3, M3-D62): every publisher of a view's end record
@@ -388,6 +411,52 @@ func TestMuxViolationNeighboursMigrate_L43(t *testing.T) {
 			if dead, _, _, _ := d.view(h).c.Death(); !dead {
 				t.Fatalf("dialer view %d survived its trunk", h)
 			}
+		}
+	})
+}
+
+// TestMuxViewHookOffCaller (§A4.2, M3-D20; WP8 ↔ WP9): the pool's view
+// hook runs once per view at its Done, and never on the goroutine of a view
+// Kill, Retire or WriteAndClose: those may close Done inline and may be
+// called under Pool.mu (or Session.mu), which the hook takes. Here the
+// caller holds the hook's lock while it kills a view: an inline hook would
+// deadlock (synctest reports it).
+func TestMuxViewHookOffCaller(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := muxRawDialer(t, nil)
+		lock := make(chan struct{}, 1) // the pool's mutex
+		var seen []uint32
+		s.c.onViewDone(func(v *Conn) {
+			lock <- struct{}{}
+			seen = append(seen, v.Handle())
+			<-lock
+		})
+		v2, err := s.c.openView(wire.TypeOpen, mOpenPayload(2, false), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lock <- struct{}{}
+		v2.Kill(CauseLocalClose, "the attempt ended under the pool's lock")
+		if !isDone(v2.Done()) {
+			t.Fatal("an opening view's Kill did not close its Done")
+		}
+		<-lock
+		synctest.Wait()
+		openLive(t, s, p, 3)
+		v3 := s.view(3).c
+		lock <- struct{}{}
+		v3.Retire(wire.CloseRetire)
+		<-lock
+		synctest.Wait()
+		_ = p.send(wire.TypeDetach, 0, 0, detachPayload(3, wire.DetachRetired))
+		synctest.Wait()
+		waitDone(t, v3.Done(), "view 3")
+		synctest.Wait()
+		lock <- struct{}{}
+		got := append([]uint32(nil), seen...)
+		<-lock
+		if len(got) != 2 || got[0] != 2 || got[1] != 3 {
+			t.Fatalf("view hook calls %v, want [2 3] (once per view)", got)
 		}
 	})
 }

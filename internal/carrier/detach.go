@@ -79,10 +79,12 @@ func (t *trunk) abandonLocked(v *Conn, r wire.DetachReason, p *postList) {
 	case viewPending, viewJoining:
 		if v.vx.needResp.Load() && !v.vx.peerDet.Load() {
 			// The dialer awaits a response for this handle: answer it
-			// before the handle ends (a refusal, no DETACH, M3-D7).
+			// before the handle ends (a refusal, no DETACH, M3-D7). The
+			// code is CodeBacklog, not CodeMuxFull: the trunk is not
+			// full, and CodeMuxFull would mark it unusable at the dialer.
 			typ := respTypeOf(v.vx.first)
 			v.vx.last = &lastFrame{t: typ}
-			v.vx.last.p = refusalPayload(typ, wire.StatusCapacity, wire.CodeMuxFull)
+			v.vx.last.p = refusalPayload(typ, wire.StatusCapacity, wire.CodeBacklog)
 			v.vx.detQ = true
 			t.ms.lasts = append(t.ms.lasts, v)
 			t.markWorkLocked()
@@ -154,8 +156,10 @@ func (c *Conn) goAwayView() {
 // refusal (M3-D7). The view's end record becomes CauseLocalClose once the
 // frame is placed, or at deadline (zero: now + 1 s), when the frame is
 // dropped and only the DETACH follows. A frame for a view whose first
-// frame was never placed is dropped with it (a handle gap). The handle
-// argument is ignored: a view places frames for its own handle.
+// frame was never placed is dropped with it (a handle gap); so is the
+// frame of a held passive view (OK placed, no go frame yet), which may
+// place nothing but its DETACH(ended) (M3-D8, R1-9). The handle argument
+// is ignored: a view places frames for its own handle.
 func (c *Conn) writeAndCloseView(typ wire.Type, flags uint8, payload []byte, deadline time.Time) {
 	t := c.trunk
 	if deadline.IsZero() {
@@ -172,6 +176,14 @@ func (c *Conn) writeAndCloseView(typ wire.Type, flags uint8, payload []byte, dea
 		t.mx.Unlock()
 		t.runPost(&p)
 		c.endView(CauseLocalClose, "closed before its first frame was placed")
+		return
+	}
+	if c.state == viewHeld || c.held.Load() {
+		t.abandonLocked(c, wire.DetachEnded, &p)
+		t.mx.Unlock()
+		t.runPost(&p)
+		c.endView(CauseLocalClose, "closed while held: its frame dropped, DETACH only (R1-9)")
+		t.wakeWriter()
 		return
 	}
 	c.vx.fillOK.Store(false)
@@ -320,10 +332,7 @@ func (t *trunk) placeControlLocked(b *Batch, rd *roundData, nowNs int64, p *post
 		case v.vx.peerDet.Load() && (t.dg == nil || wire.SeqLess(v.vx.detCseq, rd.una)):
 			t.completeLocked(v, "retired: DETACH exchange complete", p)
 		case nowNs >= v.vx.detBound:
-			if !v.vx.peerDet.Load() {
-				t.tolerateLocked(v.handle) // its late DETACH is dropped
-			}
-			t.completeLocked(v, "retired: DETACH bound", p)
+			t.expireLocked(v, p)
 		default:
 			if ms.detWake == 0 || v.vx.detBound < ms.detWake {
 				ms.detWake = v.vx.detBound
@@ -433,6 +442,19 @@ func (t *trunk) completeLocked(v *Conn, detail string, p *postList) {
 	t.endViewLocked(v, CauseRetired, detail, p)
 }
 
+// expireLocked retires v at its DETACH bound (§A5.5): the peer's DETACH
+// has not arrived (or, on a datagram trunk, our REL{DETACH} is not yet
+// acknowledged). Without the peer's DETACH its handle is tolerated for every
+// session frame and the DETACH: the peer may still be sending what it placed
+// before ours reached it (§A3.3: legal), so a late frame is dropped, never a
+// violation; the peer's DETACH clears the entry.
+func (t *trunk) expireLocked(v *Conn, p *postList) {
+	if !v.vx.peerDet.Load() {
+		t.tolerateLocked(v.handle, true)
+	}
+	t.completeLocked(v, "retired: DETACH bound", p)
+}
+
 // refusedLocked ends a view through a refusal response: gone without a
 // DETACH, its handle tolerated (a crossing RST or DETACH of the dialer is
 // dropped).
@@ -443,33 +465,43 @@ func (t *trunk) refusedLocked(v *Conn, p *postList) {
 	v.held.Store(false)
 	v.state = viewGone
 	t.removeLocked(v)
-	t.tolerateLocked(v.handle)
+	t.tolerateLocked(v.handle, false)
 }
 
 // The tolerance ring: handles whose crossing frames are legal although no
 // view holds them any more — a refused handle (the dialer's RST and DETACH
 // may cross the refusal) and a view retired at the DETACH bound (the
-// peer's DETACH may still come).
+// peer's frames and DETACH may still come). The ring holds MuxMaxViews
+// entries (the kind's): the oldest entry is overwritten.
 
-func (t *trunk) tolerateLocked(h uint32) {
+func (t *trunk) tolerateLocked(h uint32, all bool) {
 	n := t.maxViews()
 	if t.ms.tol == nil {
-		t.ms.tol = make([]uint32, n)
+		t.ms.tol = make([]tolEntry, n)
 	}
-	t.ms.tol[t.ms.tolHead] = h
+	t.ms.tol[t.ms.tolHead] = tolEntry{h: h, all: all}
 	t.ms.tolHead = (t.ms.tolHead + 1) % n
 }
 
-// toleratedLocked reports whether h is in the ring; with drop (the
-// handle's last frame, its DETACH) it leaves the ring.
-func (t *trunk) toleratedLocked(h uint32, drop bool) bool {
-	for i, x := range t.ms.tol {
-		if x == h && h != 0 {
-			if drop {
-				t.ms.tol[i] = 0
-			}
-			return true
+// toleratedLocked reports whether a frame of type typ for h is a tolerated
+// crossing frame: h is in the ring, and the entry covers every session
+// frame or typ is an RST, a response or the DETACH. With drop (the
+// handle's last frame, its DETACH) the entry leaves the ring.
+func (t *trunk) toleratedLocked(h uint32, typ wire.Type, drop bool) bool {
+	if h == 0 {
+		return false
+	}
+	for i, e := range t.ms.tol {
+		if e.h != h {
+			continue
 		}
+		if !e.all && typ != wire.TypeRst && typ != wire.TypeOpenAck && typ != wire.TypeJoinAck && typ != wire.TypeDetach {
+			return false
+		}
+		if drop {
+			t.ms.tol[i] = tolEntry{}
+		}
+		return true
 	}
 	return false
 }
@@ -507,7 +539,7 @@ func (t *trunk) onDetach(p []byte) (illegal string, violation bool) {
 func (t *trunk) onDetachLocked(d wire.Detach, una uint32, p *postList) string {
 	v := t.lookupLocked(d.Handle)
 	if v == nil {
-		if t.toleratedLocked(d.Handle, true) {
+		if t.toleratedLocked(d.Handle, wire.TypeDetach, true) {
 			return ""
 		}
 		return "DETACH for an unknown handle"

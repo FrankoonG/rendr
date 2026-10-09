@@ -107,7 +107,7 @@ func (t *trunk) refuse(h uint32, a Answer) bool {
 	}
 	t.refusals[(t.refHead+t.refN)%len(t.refusals)] = refusal{handle: h, a: a}
 	t.refN++
-	t.tolerateLocked(h)
+	t.tolerateLocked(h, false)
 	t.markWorkLocked()
 	t.mx.Unlock()
 	t.runPost(&p)

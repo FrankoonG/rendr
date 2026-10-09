@@ -38,16 +38,21 @@ const (
 type muxModel struct {
 	dialer, mux, dg bool
 	maxHandle       uint32
-	// per handle: "live", "pending", "awaiting", "attached", "retiring-ours", "retiring-peer", "gone"
+	// per handle: "live", "pending", "awaiting", "attached", "retiring-ours",
+	// "retiring-awaiting" (abandoned before its response, our DETACH
+	// placed), "retiring-answered" (its response crossed our DETACH),
+	// "retiring-peer", "gone"
 	st       map[uint32]string
-	tolerate map[uint32]bool
-	joins    int // JOINs the harness refused at admission (its Admit saw them)
+	tolerate map[uint32]bool // refused handles: a crossing RST, response or DETACH is dropped
+	tolAll   map[uint32]bool // retired at the DETACH bound: every session frame and the DETACH are dropped
+	joins    int             // JOINs the harness refused at admission (its Admit saw them)
 }
 
 func newMuxModel(dialer, mux, dg bool) *muxModel {
-	m := &muxModel{dialer: dialer, mux: mux, dg: dg, maxHandle: 1, st: map[uint32]string{1: "live"}, tolerate: map[uint32]bool{}}
+	m := &muxModel{dialer: dialer, mux: mux, dg: dg, maxHandle: 1, st: map[uint32]string{1: "live"}, tolerate: map[uint32]bool{}, tolAll: map[uint32]bool{}}
 	if dialer && mux {
-		m.st[2], m.st[3], m.st[4], m.st[5] = "awaiting", "attached", "live", "retiring-ours"
+		m.st[2], m.st[3], m.st[4], m.st[5], m.st[6] = "awaiting", "attached", "live", "retiring-ours", "retiring-awaiting"
+		m.tolAll[7] = true
 	}
 	return m
 }
@@ -72,12 +77,13 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 	if t == wire.TypeDetach {
 		s, ok := m.st[h]
 		switch {
-		case !ok && m.tolerate[h]:
+		case !ok && (m.tolerate[h] || m.tolAll[h]):
 			delete(m.tolerate, h)
+			delete(m.tolAll, h)
 			return fzIgnore
 		case !ok, s == "gone", s == "awaiting", s == "retiring-peer":
 			return m.illegal()
-		case s == "retiring-ours":
+		case s == "retiring-ours", s == "retiring-awaiting", s == "retiring-answered":
 			m.st[h] = "gone" // the exchange completes
 			delete(m.st, h)
 			return fzIgnore
@@ -87,6 +93,9 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 	}
 	s, ok := m.st[h]
 	if !ok {
+		if t != wire.TypeOpen && t != wire.TypeJoin && m.tolAll[h] {
+			return fzIgnore // a frame the peer placed before our DETACH reached it
+		}
 		if (t == wire.TypeRst || t == wire.TypeOpenAck || t == wire.TypeJoinAck) && m.tolerate[h] {
 			return fzIgnore
 		}
@@ -112,7 +121,13 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 			return fzResponse
 		}
 		return m.illegal()
-	case "attached", "retiring-peer":
+	case "retiring-awaiting":
+		if t == wire.TypeOpenAck { // the response crossed our DETACH (E6)
+			m.st[h] = "retiring-answered"
+			return fzResponse
+		}
+		return m.illegal() // no session frame before its response and the go frame
+	case "attached", "retiring-peer", "retiring-answered":
 		return m.illegal()
 	case "pending":
 		if isFirstType(t) {
@@ -204,6 +219,13 @@ func fuzzTrunk(dialer, mux, dg bool, ep *recEP, admits *[]uint32) (*Conn, *fuzzC
 		mk := func(h uint32, st viewState) *Conn {
 			v := c.newViewLocked(h, st)
 			v.vx.dialer, v.vx.first, v.vx.resp = true, wire.TypeOpen, make(chan struct{})
+			if st == viewRetiring {
+				v.vx.detSent.Store(true)
+				v.vx.detCseq = c.env.Presets.firstCseq() - 1 // already acknowledged on a datagram trunk
+				if dg {
+					c.ms.awaitAck.Add(1)
+				}
+			}
 			return v
 		}
 		mk(2, viewAwaiting)
@@ -213,10 +235,12 @@ func fuzzTrunk(dialer, mux, dg bool, ep *recEP, admits *[]uint32) (*Conn, *fuzzC
 		v4.ep, v4.pep, v4.vx.attached, v4.vx.respGot = ep, ep, true, true
 		v5 := mk(5, viewRetiring)
 		v5.ep, v5.pep, v5.vx.attached, v5.vx.respGot = ep, ep, true, true
-		v5.vx.detSent.Store(true)
-		v5.vx.detCseq = c.env.Presets.firstCseq() - 1 // already acknowledged on a datagram trunk
-		c.next = 6
+		mk(6, viewRetiring) // abandoned while awaiting its response: our DETACH placed
+		var pl postList
+		c.expireLocked(mk(7, viewRetiring), &pl) // retired at the DETACH bound without the peer's DETACH
+		c.next = 8
 		c.mx.Unlock()
+		c.runPost(&pl)
 	}
 	return c, fc, io
 }
@@ -255,6 +279,10 @@ func FuzzMuxDispatch_L43_L14(f *testing.F) {
 	f.Add([]byte{0x1, 4, 0, 2, 0})                                     // dialer dedicated stream: an OPEN_ACK after establishment
 	f.Add([]byte{0x4, 4, 0, 6, 0, 0, 1})                               // passive dedicated datagram
 	f.Add([]byte{0x2, 0, 3, 0, 2, 1, 4, 5, 4, 6, 4, 6, 4, 0, 7, 0, 6}) // passive: a handle not above, a tolerated DETACH
+	f.Add([]byte{0x2, 1, 1, 5, 1, 7, 1})                               // passive: JOIN 2 refused, RST 2 (crossing), DATA 2 (a violation)
+	f.Add([]byte{0x3, 2, 5, 6, 5, 4, 5})                               // dialer: OPEN_ACK 6 crossing our DETACH, DETACH 6, FIN 6 (a violation)
+	f.Add([]byte{0x3, 7, 6, 4, 6, 5, 6, 3, 6, 6, 6, 7, 6})             // dialer: retired at the bound: DATA, FIN, RST, JOIN_ACK 7, DETACH 7, DATA 7 (a violation)
+	f.Add([]byte{0x7, 2, 5, 4, 5, 6, 5, 7, 6, 5, 6, 6, 6, 6, 6, 4, 6}) // dialer datagram: the same rows, drops counted
 	f.Fuzz(func(t *testing.T, in []byte) {
 		if len(in) < 1 {
 			return

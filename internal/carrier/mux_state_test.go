@@ -100,6 +100,18 @@ func dialerRows(t *testing.T) {
 	if got := forHandle(p.received2(), 5); len(got) != 2 || got[1].h.Type != wire.TypeDetach {
 		t.Fatalf("abandoned awaiting view placed %v, want OPEN, DETACH", types(got))
 	}
+	// retiring (abandoned awaiting) + the OK response that crossed our
+	// DETACH → still retiring, the trunk lives; + the peer's DETACH → gone
+	// (E6, R1-5).
+	_ = p.send(wire.TypeOpenAck, 0, 5, okAck(wire.TypeOpenAck))
+	synctest.Wait()
+	if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+		t.Fatalf("an OK response crossing our DETACH killed the trunk (%v: %s)", cause, detail)
+	}
+	wantState(t, v5, viewRetiring, "abandoned + crossing OK response")
+	_ = p.send(wire.TypeDetach, 0, 0, detachPayload(5, wire.DetachEnded))
+	synctest.Wait()
+	wantState(t, v5, viewGone, "abandoned + crossing OK response + peer DETACH")
 	// attached-pending + the peer's DETACH → retiring, our DETACH, PeerClosed.
 	v6, wait6 := s.openRaw(t, wire.TypeOpen, 6)
 	synctest.Wait()
@@ -129,12 +141,41 @@ func dialerRows(t *testing.T) {
 	}
 	s.attach(v7)
 	synctest.Wait()
+	// awaiting → abandoned while the writer is blocked (our DETACH still
+	// queued) + a refusal that crossed it → gone; the queued DETACH is
+	// never placed (the refusal ended the handle, M3-D7).
+	v8, wait8 := s.openRaw(t, wire.TypeOpen, 8)
+	synctest.Wait()
+	wantState(t, v8, viewAwaiting, "OPEN 8 placed")
+	s.tap.hold()
+	s.v1.src.offer(4 << 10)
+	s.c.Wake()
+	synctest.Wait() // the writer is blocked in its Write
+	v8.Kill(CauseLocalClose, "withdrawn")
+	if _, err := wait8(); err == nil {
+		t.Fatal("a withdrawn attempt returned no error")
+	}
+	b8 := make([]byte, wire.OpenAckFixedLen)
+	n8 := wire.PutOpenAck(b8, &wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeBacklog})
+	_ = p.send(wire.TypeOpenAck, 0, 8, b8[:n8])
+	synctest.Wait()
+	wantState(t, v8, viewGone, "abandoned (DETACH queued) + crossing refusal")
+	s.tap.release()
+	synctest.Wait()
+	if got := forHandle(p.received2(), 8); len(got) != 1 || got[0].h.Type != wire.TypeOpen {
+		t.Fatalf("abandoned view refused before its DETACH left placed %v, want OPEN only", types(got))
+	}
+	if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+		t.Fatalf("trunk died: %v %s", cause, detail)
+	}
 	s.c.KillTrunk(CauseTransportError, "the path died")
 	synctest.Wait()
 	if dead, cause, _, _ := v7.Death(); !dead || cause != CauseTransportError {
 		t.Fatalf("trunk death: view 7 dead %v cause %v", dead, cause)
 	}
 	waitDone(t, v7.Done(), "view 7")
+	wantState(t, v7, viewDead, "live + trunk death")
+	wantState(t, v3, viewGone, "gone stays gone at the trunk's death")
 }
 
 func passiveRows(t *testing.T) {
@@ -145,7 +186,7 @@ func passiveRows(t *testing.T) {
 			v.Refuse(v.Handle(), Answer{Type: wire.TypeOpenAck, Status: wire.StatusCapacity, Code: wire.CodeBacklog})
 		case 5:
 			s.startAdmitted(v, h, wire.StatusRejected)
-		case 2, 6:
+		case 2, 6, 8:
 			mv := &mView{c: v, ep: &dEP{}, src: newVSource(s.env), bell: &hBell{}, done: &hBell{}}
 			mv.ep.fill = mv.src.fill // no verdict yet
 			s.add(mv)
@@ -205,12 +246,42 @@ func passiveRows(t *testing.T) {
 	if got := forHandle(p.received2(), 6); len(got) != 1 || got[0].h.Type != wire.TypeDetach {
 		t.Fatalf("pending view after the dialer's DETACH placed %v, want DETACH only", types(got))
 	}
+	// held + WriteAndClose (its session's verdict) → its frame dropped,
+	// DETACH(ended) only: a held view places nothing before the go frame
+	// but its DETACH (M3-D8, R1-9).
+	_ = p.send(wire.TypeOpen, 0, 7, mOpenPayload(7, false))
+	synctest.Wait()
+	wantState(t, s.view(7).c, viewHeld, "OPEN 7 answered OK")
+	s.view(7).c.WriteAndClose(wire.TypeRst, 0, 7, rstPayload(wire.RstWithdrawn), time.Time{})
+	synctest.Wait()
+	if got := forHandle(p.received2(), 7); len(got) != 2 || got[0].h.Type != wire.TypeOpenAck || got[1].h.Type != wire.TypeDetach {
+		t.Fatalf("held view's WriteAndClose placed %v, want OPEN_ACK, DETACH", types(got))
+	}
+	if dead, cause, _, _ := s.view(7).c.Death(); !dead || cause != CauseLocalClose {
+		t.Fatalf("held view after WriteAndClose: dead %v cause %v, want local_close", dead, cause)
+	}
 	if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
 		t.Fatalf("trunk died: %v %s", cause, detail)
+	}
+	// pending (no verdict yet) + Kill → the safety-net refusal: CAPACITY
+	// with a code that does not mark the dialer's trunk full (not
+	// CodeMuxFull), and no DETACH (M3-D7).
+	_ = p.send(wire.TypeOpen, 0, 8, mOpenPayload(8, false))
+	synctest.Wait()
+	wantState(t, s.view(8).c, viewPending, "OPEN 8 admitted")
+	s.view(8).c.Kill(CauseLocalClose, "the session ended before its verdict")
+	synctest.Wait()
+	got8 := forHandle(p.received2(), 8)
+	if len(got8) != 1 || got8[0].h.Type != wire.TypeOpenAck {
+		t.Fatalf("killed pending view placed %v, want its OPEN_ACK only", types(got8))
+	}
+	if a, err := wire.ParseOpenAck(got8[0].p); err != nil || a.Status != wire.StatusCapacity || a.Code == wire.CodeMuxFull {
+		t.Fatalf("killed pending view answered %+v (%v), want CAPACITY without CodeMuxFull", a, err)
 	}
 	// live + trunk death → dead.
 	s.c.KillTrunk(CauseTransportError, "the path died")
 	waitDone(t, s.view(2).c.Done(), "view 2")
+	wantState(t, s.view(2).c, viewDead, "live + trunk death")
 }
 
 // checkEP is a dEP that records an endpoint call that starts after its

@@ -348,7 +348,7 @@ func (c *Conn) OnDone(b Doorbell) {
 	}
 	if c.vx.own { // a view with its own Done (mux.go)
 		c.mx.Lock()
-		if c.calls.Load()&doneBit != 0 {
+		if c.vx.doneShut { // Done closed (set with the close under mx)
 			c.mx.Unlock()
 			b.Ring()
 			return

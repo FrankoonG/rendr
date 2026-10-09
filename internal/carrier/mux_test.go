@@ -110,6 +110,27 @@ func TestMuxLegality_L43_L14(t *testing.T) {
 	fin := finInner(0)
 	dgMode := false // the session kind follows the trunk's: packet sessions on datagram trunks
 	open := func(h uint32) []byte { return mOpenPayload(byte(h), dgMode) }
+	var crossV *Conn // the abandoned view of the crossing-response rows
+	refusal := func() []byte {
+		b := make([]byte, wire.OpenAckFixedLen)
+		n := wire.PutOpenAck(b, &wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeBacklog})
+		return b[:n]
+	}
+	abandon := func(t *testing.T, s *muxSide) {
+		v, wait := s.openRaw(t, wire.TypeOpen, 2)
+		synctest.Wait()
+		v.Kill(CauseLocalClose, "the attempt was withdrawn")
+		if _, err := wait(); err == nil {
+			t.Fatal("a withdrawn attempt returned no error")
+		}
+		synctest.Wait() // our DETACH is placed
+		crossV = v
+	}
+	ourDetach := func(t *testing.T, log []tapRec) {
+		if got := types(forEff(log, 2)); len(got) != 2 || got[0] != wire.TypeOpen || got[1] != wire.TypeDetach {
+			t.Fatalf("the abandoned view placed %v, want OPEN, DETACH", got)
+		}
+	}
 	rows := []legalRow{
 		{name: "passive OPEN above every handle is admitted", run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
 			send(wire.TypeOpen, 5, open(5))
@@ -178,6 +199,19 @@ func TestMuxLegality_L43_L14(t *testing.T) {
 			send(wire.TypeRst, 2, rst[:])
 			send(wire.TypeDetach, 2, nil)
 		}},
+		{name: "passive refused handle: a session frame that cannot cross the refusal", want: "illegal", run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
+			s.admit = func(s *muxSide, v *Conn, h wire.Header, p []byte) {
+				v.Refuse(v.Handle(), Answer{Type: wire.TypeOpenAck, Status: wire.StatusCapacity, Code: wire.CodeBacklog})
+			}
+			send(wire.TypeOpen, 2, open(2))
+			send(wire.TypeFin, 2, fin) // a dialer awaiting its response places no FIN
+		}},
+		{name: "passive refused by its session's response: a session frame that cannot cross it", want: "illegal", run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
+			s.admit = func(s *muxSide, v *Conn, h wire.Header, p []byte) { s.startAdmitted(v, h, wire.StatusRejected) }
+			send(wire.TypeOpen, 2, open(2))
+			synctest.Wait() // the refusal is placed
+			send(wire.TypeFin, 2, fin)
+		}},
 		{name: "dialer OPEN from the passive", dialer: true, want: "illegal", run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
 			send(wire.TypeOpen, 2, open(2))
 		}},
@@ -206,6 +240,26 @@ func TestMuxLegality_L43_L14(t *testing.T) {
 			s.openRaw(t, wire.TypeOpen, 2)
 			synctest.Wait()
 			send(wire.TypeDetach, 2, nil)
+		}},
+		{name: "dialer OK response crossing our DETACH, then the peer's DETACH", dialer: true, run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
+			abandon(t, s)
+			send(wire.TypeOpenAck, 2, okAck(wire.TypeOpenAck)) // E6: the passive's Confirm crossed our withdrawal
+			synctest.Wait()
+			send(wire.TypeDetach, 2, nil)
+		}, check: func(t *testing.T, s *muxSide, log []tapRec) {
+			ourDetach(t, log)
+			if st := viewStateOf(crossV); st != viewGone && (s.c.dg == nil || st != viewRetiring) {
+				t.Fatalf("abandoned view after the crossing response and the peer's DETACH: state %d", st)
+			}
+		}},
+		{name: "dialer refusal crossing our DETACH ends the handle", dialer: true, run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
+			abandon(t, s)
+			send(wire.TypeOpenAck, 2, refusal())
+		}, check: func(t *testing.T, s *muxSide, log []tapRec) {
+			ourDetach(t, log)
+			if st := viewStateOf(crossV); st != viewGone {
+				t.Fatalf("abandoned view after a crossing refusal: state %d, want gone", st)
+			}
 		}},
 		{name: "dialer refusal ends the handle without DETACH", dialer: true, want: "illegal", run: func(t *testing.T, s *muxSide, send func(wire.Type, uint32, []byte)) {
 			v, wait := s.openRaw(t, wire.TypeOpen, 2)
@@ -702,33 +756,91 @@ func TestMuxDetachBothOrders_L12(t *testing.T) {
 // TestMuxDetachBound (§A5.5): a peer that never answers our DETACH: the
 // view retires at the DETACH bound (end record retired, Done closed) and
 // the trunk lives; the peer's late DETACH is then dropped, not a
-// violation.
+// violation. On a path whose RTT exceeds the bound, the session frames the
+// peer placed before our DETACH reached it (DATA, ACK, FIN) arrive after
+// the view retired: they are legal (§A3.3) and dropped, the trunk lives;
+// the peer's DETACH then ends the tolerance, so a frame after it is a
+// violation again.
 func TestMuxDetachBound(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s, p := muxRawDialer(t, nil)
-		v, wait := s.openRaw(t, wire.TypeOpen, 2)
-		synctest.Wait()
-		_ = p.send(wire.TypeOpenAck, 0, 2, okAck(wire.TypeOpenAck))
-		if _, err := wait(); err != nil {
-			t.Fatal(err)
-		}
-		s.attach(v)
-		synctest.Wait()
-		start := time.Now()
-		v.Retire(wire.CloseRetire)
-		waitDone(t, v.Done(), "view 2")
-		if el := time.Since(start); el > drainMax+10*time.Millisecond {
-			t.Fatalf("retired after %v, want within the bound (≤ %v)", el, drainMax)
-		}
-		dead, cause, detail, _ := v.Death()
-		if !dead || cause != CauseRetired || !strings.Contains(detail, "bound") {
-			t.Fatalf("dead %v cause %v (%s), want retired at the DETACH bound", dead, cause, detail)
-		}
-		_ = p.send(wire.TypeDetach, 0, 0, detachPayload(2, wire.DetachRetired))
-		synctest.Wait()
-		if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
-			t.Fatalf("trunk died (%v: %s)", cause, detail)
-		}
+	t.Run("silent peer", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, p := muxRawDialer(t, nil)
+			v, wait := s.openRaw(t, wire.TypeOpen, 2)
+			synctest.Wait()
+			_ = p.send(wire.TypeOpenAck, 0, 2, okAck(wire.TypeOpenAck))
+			if _, err := wait(); err != nil {
+				t.Fatal(err)
+			}
+			s.attach(v)
+			synctest.Wait()
+			start := time.Now()
+			v.Retire(wire.CloseRetire)
+			waitDone(t, v.Done(), "view 2")
+			if el := time.Since(start); el > drainMax+10*time.Millisecond {
+				t.Fatalf("retired after %v, want within the bound (≤ %v)", el, drainMax)
+			}
+			dead, cause, detail, _ := v.Death()
+			if !dead || cause != CauseRetired || !strings.Contains(detail, "bound") {
+				t.Fatalf("dead %v cause %v (%s), want retired at the DETACH bound", dead, cause, detail)
+			}
+			_ = p.send(wire.TypeDetach, 0, 0, detachPayload(2, wire.DetachRetired))
+			synctest.Wait()
+			if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+				t.Fatalf("trunk died (%v: %s)", cause, detail)
+			}
+		})
+	})
+	t.Run("late frames on a long path", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const rtt = 1500 * time.Millisecond // 2·srtt + 100 ms > 1 s: the stream bound is 1 s
+			s, p := muxRawDialer(t, nil)
+			p.autoPong(func(uint32) time.Duration { return rtt })
+			v, wait := s.openRaw(t, wire.TypeOpen, 2)
+			synctest.Wait()
+			_ = p.send(wire.TypeOpenAck, 0, 2, okAck(wire.TypeOpenAck))
+			if _, err := wait(); err != nil {
+				t.Fatal(err)
+			}
+			mv := s.attach(v)
+			synctest.Wait()
+			for i := 0; s.c.SRTT() < rtt-100*time.Millisecond; i++ {
+				if i > 600 {
+					t.Fatalf("srtt %v, want about %v", s.c.SRTT(), rtt)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			start := time.Now()
+			v.Retire(wire.CloseRetire)
+			waitDone(t, v.Done(), "view 2")
+			if el := time.Since(start); el > drainMax+10*time.Millisecond {
+				t.Fatalf("retired after %v, want at the bound (%v)", el, drainMax)
+			}
+			if _, cause, detail, _ := v.Death(); cause != CauseRetired || !strings.Contains(detail, "bound") {
+				t.Fatalf("view 2 ended %v (%s), want retired at the DETACH bound", cause, detail)
+			}
+			n := len(mv.ep.received())
+			time.Sleep(rtt - drainMax - 300*time.Millisecond) // the peer's frames placed before our DETACH arrived
+			_ = p.send(wire.TypeData, 0, 2, dataPayload(0, 300))
+			_ = p.send(wire.TypeAck, 0, 2, ackPayload())
+			_ = p.send(wire.TypeFin, 0, 2, finInner(300))
+			synctest.Wait()
+			if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+				t.Fatalf("the peer's in-flight frames after the bound killed the trunk (%v: %s)", cause, detail)
+			}
+			if got := len(mv.ep.received()); got != n {
+				t.Fatalf("a retired view got %d frames after its Done", got-n)
+			}
+			_ = p.send(wire.TypeDetach, 0, 0, detachPayload(2, wire.DetachRetired))
+			synctest.Wait()
+			if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+				t.Fatalf("the peer's late DETACH killed the trunk (%v: %s)", cause, detail)
+			}
+			_ = p.send(wire.TypeData, 0, 2, dataPayload(300, 10))
+			synctest.Wait()
+			if dead, cause, _, _ := s.c.KillTrunkDeath(); !dead || cause != CauseProtocolViolation {
+				t.Fatalf("a frame after the peer's DETACH: trunk dead %v cause %v, want protocol_violation", dead, cause)
+			}
+		})
 	})
 }
 

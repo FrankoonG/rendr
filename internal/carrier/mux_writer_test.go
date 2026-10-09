@@ -350,39 +350,162 @@ func TestMuxCapWake(t *testing.T) {
 // TestMuxWakeDuringFillNotLost (R1-1): a producer that writes and wakes a
 // view between its DRR call's return and the writer's ready-set decision
 // (the AfterViewFill hook) is served in the next round, 1000 times — no
-// write waits for an ACK, a PONG or a timer.
+// write waits for an ACK, a PONG or a timer. The second row wakes the view
+// from inside its own Fill, which places nothing (a producer racing the
+// call): the ready flag is cleared before the call, so the Wake re-readies
+// it and the bytes leave in the next round, 1000 times.
 func TestMuxWakeDuringFillNotLost(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var arm atomic.Bool
-		var v2 atomic.Pointer[mView]
-		s, p := muxRawDialer(t, func(env *Env) {
-			env.Hooks = &testhooks.Hooks{AfterViewFill: func(_, h uint32) {
-				if mv := v2.Load(); h == 2 && mv != nil && arm.CompareAndSwap(true, false) {
-					mv.src.offer(100)
-					mv.c.Wake()
+	t.Run("after the call", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var arm atomic.Bool
+			var v2 atomic.Pointer[mView]
+			s, p := muxRawDialer(t, func(env *Env) {
+				env.Hooks = &testhooks.Hooks{AfterViewFill: func(_, h uint32) {
+					if mv := v2.Load(); h == 2 && mv != nil && arm.CompareAndSwap(true, false) {
+						mv.src.offer(100)
+						mv.c.Wake()
+					}
+				}}
+			})
+			openLive(t, s, p, 2, 3)
+			mv := s.view(2)
+			v2.Store(mv)
+			start := time.Now()
+			for i := 0; i < 1000; i++ {
+				arm.Store(true)
+				mv.c.Wake() // a DRR call with nothing to place; the hook writes then
+				synctest.Wait()
+				if arm.Load() {
+					t.Fatalf("iteration %d: view 2 got no DRR call", i)
 				}
-			}}
+				if n := mv.src.pending(); n != 0 {
+					t.Fatalf("iteration %d: %d bytes left waiting (a lost wakeup)", i, n)
+				}
+			}
+			if el := time.Since(start); el != 0 {
+				t.Fatalf("the writes waited %v of virtual time", el)
+			}
+			if got := mv.src.placed.Load(); got != 100*1000 {
+				t.Fatalf("placed %d bytes, want %d", got, 100*1000)
+			}
 		})
-		openLive(t, s, p, 2, 3)
-		mv := s.view(2)
-		v2.Store(mv)
-		start := time.Now()
-		for i := 0; i < 1000; i++ {
-			arm.Store(true)
-			mv.c.Wake() // a DRR call with nothing to place; the hook writes then
+	})
+	t.Run("during the call", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, p := muxRawDialer(t, nil)
+			v, wait := s.openRaw(t, wire.TypeOpen, 2)
 			synctest.Wait()
-			if arm.Load() {
-				t.Fatalf("iteration %d: view 2 got no DRR call", i)
+			_ = p.send(wire.TypeOpenAck, 0, 2, okAck(wire.TypeOpenAck))
+			if _, err := wait(); err != nil {
+				t.Fatal(err)
 			}
-			if n := mv.src.pending(); n != 0 {
-				t.Fatalf("iteration %d: %d bytes left waiting (a lost wakeup)", i, n)
+			src := newVSource(s.env)
+			var arm atomic.Bool
+			ep := &dEP{}
+			ep.fill = func(c *Conn, b *Batch) {
+				if !b.ControlOnly() && arm.CompareAndSwap(true, false) {
+					src.offer(100) // the producer writes and wakes during the call,
+					c.Wake()       // after the call's own look found nothing
+					return
+				}
+				src.fill(c, b)
+			}
+			v.Start(ep, &hBell{}, StartOptions{})
+			synctest.Wait()
+			openLive(t, s, p, 3)
+			start := time.Now()
+			for i := 0; i < 1000; i++ {
+				arm.Store(true)
+				v.Wake()
+				synctest.Wait()
+				if arm.Load() {
+					t.Fatalf("iteration %d: view 2 got no DRR call", i)
+				}
+				if n := src.pending(); n != 0 {
+					t.Fatalf("iteration %d: %d bytes left waiting (a lost wakeup)", i, n)
+				}
+			}
+			if el := time.Since(start); el != 0 {
+				t.Fatalf("the writes waited %v of virtual time", el)
+			}
+			if got := src.placed.Load(); got != 100*1000 {
+				t.Fatalf("placed %d bytes, want %d", got, 100*1000)
+			}
+		})
+	})
+}
+
+// TestMuxViewWakeAt (§A4.3 row "Batch.WakeAt(t) from a view → that view at
+// t"): a view's Fill asks for a call 5 ms later (a delayed ACK) and places
+// nothing; with no other wake, the writer calls it again exactly at the due
+// time, where it places its ACK; no call of it comes in between, and the
+// other view is not called.
+func TestMuxViewWakeAt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const delay = 5 * time.Millisecond
+		s, p := muxRawDialer(t, nil)
+		v, wait := s.openRaw(t, wire.TypeOpen, 2)
+		synctest.Wait()
+		_ = p.send(wire.TypeOpenAck, 0, 2, okAck(wire.TypeOpenAck))
+		if _, err := wait(); err != nil {
+			t.Fatal(err)
+		}
+		var phase atomic.Int32 // 0 idle, 1 armed, 2 waiting for the due call, 3 ACK placed
+		var dueNs, ackNs atomic.Int64
+		var early atomic.Int32
+		ep := &dEP{}
+		ep.fill = func(c *Conn, b *Batch) {
+			if c.NeedGo() {
+				b.AddAck(c.Handle(), 0, &wire.Ack{Window: 1 << 20}) // the go frame
+				return
+			}
+			switch phase.Load() {
+			case 1:
+				due := b.Now().Add(delay)
+				dueNs.Store(due.UnixNano())
+				b.WakeAt(due) // once, as the session's delayed ACK does
+				phase.Store(2)
+			case 2:
+				if now := b.Now().UnixNano(); now < dueNs.Load() {
+					if now > dueNs.Load()-int64(delay) {
+						early.Add(1) // a later round's call before the due time
+					}
+					return
+				}
+				if b.AddAck(c.Handle(), 0, &wire.Ack{Window: 1 << 20}) {
+					ackNs.Store(b.Now().UnixNano())
+					phase.Store(3)
+				}
 			}
 		}
-		if el := time.Since(start); el != 0 {
-			t.Fatalf("the writes waited %v of virtual time", el)
+		v.Start(ep, &hBell{}, StartOptions{})
+		synctest.Wait()
+		openLive(t, s, p, 3)
+		v3 := s.view(3)
+		f3 := v3.src.fills.Load()
+		acks := p.count(wire.TypeAck)
+		phase.Store(1)
+		v.Wake()
+		synctest.Wait()
+		if phase.Load() != 2 {
+			t.Fatalf("phase %d after the wake, want 2 (WakeAt requested)", phase.Load())
 		}
-		if got := mv.src.placed.Load(); got != 100*1000 {
-			t.Fatalf("placed %d bytes, want %d", got, 100*1000)
+		time.Sleep(2 * delay)
+		synctest.Wait()
+		if phase.Load() != 3 {
+			t.Fatal("the view was not called at its WakeAt: its delayed ACK waits for an unrelated wake")
+		}
+		if got := ackNs.Load(); got != dueNs.Load() {
+			t.Fatalf("the ACK was placed %v after the due time, want exactly at it", time.Duration(got-dueNs.Load()))
+		}
+		if n := early.Load(); n != 0 {
+			t.Fatalf("%d calls of the view between its request and its due time", n)
+		}
+		if n := v3.src.fills.Load(); n != f3 {
+			t.Fatalf("view 3 was called %d times by view 2's WakeAt", n-f3)
+		}
+		if p.count(wire.TypeAck) != acks+1 {
+			t.Fatalf("%d ACKs reached the peer, want 1", p.count(wire.TypeAck)-acks)
 		}
 	})
 }
@@ -501,32 +624,63 @@ func TestMuxWriterZeroAllocs(t *testing.T) {
 	}
 }
 
-// TestMuxWriterCostFlat_L54 (§A5.3, L54): idle views cost nothing: a round
-// over 2 ready views costs the same with 2, 64 and 256 attached views
-// (within 1.5×).
+// TestMuxWriterCostFlat_L54 (§A5.3, L54): idle views cost nothing. A round
+// over the same 2 ready views — one of them asking for a WakeAt and marking
+// itself cap-blocked every round, with every round's PONG watermark moved,
+// so the writer's wake and capacity passes run every round — visits the
+// same number of views and makes the same endpoint calls with 2, 64 and
+// 256 attached views. The count is deterministic; the wall-clock cost per
+// round is logged only (no timing assertion in the unit lane, A11.5).
 func TestMuxWriterCostFlat_L54(t *testing.T) {
-	cost := func(n int) time.Duration {
+	type cost struct {
+		touched, fills uint64
+		wall           time.Duration
+	}
+	const rounds = 2000
+	run := func(n int) cost {
 		env := hEnv()
-		ep := &ackDataEP{chunk: env.Bufs.Get(ChunkSize, nil)}
+		ep := &wakeCapEP{ackDataEP: ackDataEP{chunk: env.Bufs.Get(ChunkSize, nil)}}
 		c, views := bareMuxTrunk(env, &nopConn{}, n, ep)
 		b := NewBatch(256 << 10)
-		best := time.Duration(1 << 62)
-		for rep := 0; rep < 5; rep++ {
-			start := time.Now()
-			for i := 0; i < 2000; i++ {
-				b.Reset(start)
-				views[0].Wake() // the same two views are ready in every configuration
-				views[1].Wake()
-				c.fillRound(b)
-			}
-			best = min(best, time.Since(start)/2000)
+		base := time.Now()
+		t0, start := c.ms.touched, time.Now()
+		for i := 0; i < rounds; i++ {
+			b.Reset(base.Add(time.Duration(i+1) * 10 * time.Microsecond))
+			c.mu.Lock()
+			c.st.pongMark++ // a PONG arrived: the capacity pass runs
+			c.mu.Unlock()
+			views[0].Wake() // the same two views are ready in every configuration
+			views[1].Wake()
+			c.fillRound(b)
 		}
-		return best
+		return cost{touched: c.ms.touched - t0, fills: ep.fills, wall: time.Since(start) / rounds}
 	}
-	c2, c64, c256 := cost(2), cost(64), cost(256)
-	t.Logf("round cost: 2 views %v, 64 views %v, 256 views %v", c2, c64, c256)
-	if float64(c256) > 1.5*float64(c2) || float64(c64) > 1.5*float64(c2) {
-		t.Fatalf("round cost grows with idle views: 2 → %v, 64 → %v, 256 → %v (want within 1.5×)", c2, c64, c256)
+	c2, c64, c256 := run(2), run(64), run(256)
+	t.Logf("round cost: 2 views %v, 64 views %v, 256 views %v (views visited %d, %d, %d)", c2.wall, c64.wall, c256.wall, c2.touched, c64.touched, c256.touched)
+	if c2.fills < 4*rounds || c2.touched < 4*rounds-2 { // 2 ready views, then the wake and the capacity pass, every round but the first
+		t.Fatalf("2 views: %d endpoint calls and %d views visited in %d rounds; the wake and capacity passes did not run", c2.fills, c2.touched, rounds)
+	}
+	for _, c := range []cost{c64, c256} {
+		if c.touched != c2.touched || c.fills != c2.fills {
+			t.Fatalf("a round's work grows with idle views: views visited %d / %d / %d, endpoint calls %d / %d / %d (2 / 64 / 256 views)",
+				c2.touched, c64.touched, c256.touched, c2.fills, c64.fills, c256.fills)
+		}
+	}
+}
+
+// wakeCapEP is ackDataEP whose view 2, in its payload call, asks for a
+// call 5 µs later and marks the batch cap-blocked; it counts Fill calls.
+type wakeCapEP struct {
+	ackDataEP
+	fills uint64
+}
+
+func (e *wakeCapEP) Fill(c *Conn, b *Batch) {
+	e.fills++
+	e.ackDataEP.Fill(c, b)
+	if c.Handle() == 2 && !b.ControlOnly() {
+		b.WakeAt(b.Now().Add(5 * time.Microsecond))
+		b.MarkCapBlocked()
 	}
 }
 
