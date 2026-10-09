@@ -385,6 +385,40 @@ func TestTamperRewriteHandle(t *testing.T) {
 	})
 }
 
+// TestTamperRewriteDetachHandle: on a DETACH, whose header handle is 0 (a
+// carrier-level frame), RewriteHandle rewrites the handle the DETACH ends,
+// in its payload: with a valid CRC the frame decodes as a DETACH of the new
+// handle (a broken peer detaching a handle the trunk never had), the
+// header handle stays 0; the tap logs the header as forwarded.
+func TestTamperRewriteDetachHandle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newTamperRig()
+		defer r.close()
+		p := make([]byte, wire.DetachLen)
+		wire.PutDetach(p, &wire.Detach{Handle: 3, Reason: wire.DetachEnded})
+		fs := dataFrames(1, 3, 'x')
+		fs[1] = frameBytes(FrameDetach, 2, p)
+		r.tm.RewriteHandle(Up, NextOfType(FrameDetach), 9, true)
+		got := upRun(t, r, fs)[wire.PrefaceLen+len(fs[0]):]
+		f, _, err := wire.DecodeFrame(got[:len(fs[1])])
+		if err != nil || f.Type != wire.TypeDetach || f.Handle != 0 {
+			t.Fatalf("the rewritten DETACH decodes as %v handle %d, err %v; want a DETACH with header handle 0", f.Type, f.Handle, err)
+		}
+		if d, err := wire.ParseDetach(f.Payload); err != nil || d.Handle != 9 || d.Reason != wire.DetachEnded {
+			t.Fatalf("the rewritten DETACH ends %+v (err %v), want handle 9, reason ended", d, err)
+		}
+		if !bytes.Equal(got[len(fs[1]):], fs[2]) {
+			t.Fatal("the frame after the DETACH changed")
+		}
+		if s := r.tm.Stats(); s.Rewritten != 1 {
+			t.Fatalf("Rewritten = %d, want 1", s.Rewritten)
+		}
+		if lg := r.tm.Log(Up); lg[1].Type != FrameDetach || lg[1].Handle != 0 {
+			t.Fatalf("Log[1] = %+v, want the DETACH with header handle 0", lg[1])
+		}
+	})
+}
+
 // TestTamperHold: Hold stops a direction at the next frame boundary —
 // nothing more arrives, the other direction keeps flowing — and Release
 // resumes it with every byte; one count per stop.
