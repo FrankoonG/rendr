@@ -1,7 +1,11 @@
 package mux
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -514,4 +518,249 @@ func waitUntilOK(within time.Duration, cond func() bool) bool {
 		time.Sleep(time.Millisecond)
 	}
 	return true
+}
+
+// TestMuxIdleFailoverCoalesces_L10_L27 (M3 design §A5.8; M3-D16,
+// M3-D18; B0.2 item 1 — at most one dial per factory per kill; L10, L27;
+// rendr-regress gold/G6-mixed-nat, defect B): two factories p1 and p2 over
+// Links of 10 ms RTT, one Peer with the health layer's probes at their
+// default interval. 24 sessions — 12 selector (active on p1's shared
+// carrier, which ranks first) and 12 bond (a member on p1's and one on p2's
+// shared carrier) — open, exchange 64 KiB each way and go idle until every
+// session actor of both Runtimes is parked (ActorLinger). A concurrent
+// OPEN load of 20 short selector sessions per second (each exchanges
+// 4 KiB each way and closes) runs on the same Peer from 1 s before the
+// stimulus to the end of the recovery.
+//
+// Stimulus: p1's shared carrier is reset (Link.Kill; the path stays up, as
+// a NAT rebinding kills a trunk), so every long session loses its view
+// there at once: the bond sessions redial p1, the selector sessions fail
+// over. Variants: "prompt" (the passive answers handle 1 at once) and
+// "slow-verdict" (host-like load: the response to each long session's
+// first frame on a new carrier reaches the dialer 300 ms after its
+// PREFACE_ACK — three times the pool's least verdict grace — while the
+// PREFACE exchange itself stays prompt).
+// PASS: recovery — every selector session active and every bond session
+// with two live members, none of them the dead carrier — within 10 s;
+// exactly one session factory call in all (p1 and p2) from the kill to
+// the recovery (the other sessions wait for that dial and open their
+// views on its carrier, or use p2's live one); Status.Mux.Carriers on the
+// dialer at most 2 (one carrier per factory) right after the recovery and
+// once the load stopped; every long session's exchange after the recovery
+// verified both ways; a clean end and nothing left after Runtime.Close.
+// Observed before the fix in internal/carrier/pool.go (slow-verdict):
+// each coalesced waiter whose verdict grace ran out while the claimant's
+// JOIN awaited its verdict dialled its own carrier — one factory call per
+// bond session — and the extra carriers stayed with their one session.
+func TestMuxIdleFailoverCoalesces_L10_L27(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		slow time.Duration
+	}{{"prompt", 0}, {"slow-verdict", 300 * time.Millisecond}} {
+		t.Run(v.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { idleFailover(t, v.slow) })
+		})
+	}
+}
+
+// prefaceAckLen is the size of a PREFACE_ACK (wire.PrefaceLen): the
+// bytes a session carrier's dialer reads before its first frame's
+// response.
+const prefaceAckLen = 40
+
+// slowVerdict is a dialer's session carrier conn whose bytes after the
+// PREFACE_ACK — the response to its first frame and everything after it —
+// reach the reader delay after the reader first asks for them (the
+// passive's verdict on handle 1 delayed by host load).
+type slowVerdict struct {
+	net.Conn
+	delay time.Duration
+	read  int // bytes returned so far (Establish reads on one goroutine)
+	slept bool
+}
+
+func (c *slowVerdict) Read(p []byte) (int, error) {
+	if c.read < prefaceAckLen && len(p) > prefaceAckLen-c.read {
+		p = p[:prefaceAckLen-c.read] // never hand out response bytes with the PREFACE_ACK
+	}
+	if c.read >= prefaceAckLen && !c.slept {
+		c.slept = true
+		time.Sleep(c.delay)
+	}
+	n, err := c.Conn.Read(p)
+	c.read += n
+	return n, err
+}
+
+// slowPeer is world.peer over stream links whose session carriers of the
+// sessions slow reports true for are wrapped in slowVerdict.
+func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, names ...string) *rendr.Peer {
+	w.t.Helper()
+	var cs []rendr.Carrier
+	for _, n := range names {
+		s, l := w.spec(n), w.link(n)
+		cs = append(cs, rendr.StreamCarrier{Name: n, Props: s.props, Dial: func(ctx context.Context) (net.Conn, error) {
+			w.count(ctx, n)
+			c, err := l.Dial(ctx)
+			if di, ok := rendr.CarrierDialInfo(ctx); err == nil && ok && !di.Probe && delay > 0 && slow(di.Session) {
+				return &slowVerdict{Conn: c, delay: delay}, nil
+			}
+			return c, err
+		}})
+	}
+	p, err := w.d.NewPeer(rendr.PeerConfig{Carriers: cs})
+	if err != nil {
+		w.t.Fatalf("NewPeer: %v", err)
+	}
+	w.peers = append(w.peers, p)
+	return p
+}
+
+// openLoad opens one short selector session over p every interval (keys
+// prefix0 …) until stop closes; each exchanges 4 KiB each way, verified,
+// and closes. The function it returns waits, once stop closed, for the
+// loop and every session it started, and returns how many completed.
+func (w *world) openLoad(p *rendr.Peer, prefix string, interval time.Duration, stop chan struct{}) func() int {
+	var wg sync.WaitGroup
+	var done atomic.Int64
+	loop := make(chan struct{})
+	go func() {
+		defer close(loop)
+		tk := time.NewTicker(interval)
+		defer tk.Stop()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+			}
+			wg.Go(func() {
+				s, err := w.tryOpen(p, prefix+strconv.Itoa(i), rendr.ModeSelector)
+				if err != nil {
+					w.t.Error(err)
+					return
+				}
+				if err := echo(s, 4<<10, uint64(1000+2*i)); err != nil {
+					w.t.Error(err)
+				}
+				closeAll(w.t, []pair{s})
+				done.Add(1)
+			})
+		}
+	}()
+	return func() int {
+		<-loop
+		wg.Wait()
+		return int(done.Load())
+	}
+}
+
+func idleFailover(t *testing.T, slow time.Duration) {
+	const oneWay = 5 * time.Millisecond
+	w := newWorld(t, worldOpts{}, linkSpec{name: "p1", oneWay: oneWay}, linkSpec{name: "p2", oneWay: oneWay})
+	var (
+		armed atomic.Bool
+		lmu   sync.Mutex
+		long  = map[rendr.SessionID]bool{}
+	)
+	peer := w.slowPeer(slow, func(id rendr.SessionID) bool {
+		lmu.Lock()
+		defer lmu.Unlock()
+		return armed.Load() && long[id]
+	}, "p1", "p2")
+	ps := w.openMany(peer, "L", 24, func(i int) rendr.Mode {
+		if i%2 == 0 {
+			return rendr.ModeSelector
+		}
+		return rendr.ModeBond
+	})
+	var sel, bond []pair
+	lmu.Lock()
+	for _, s := range ps {
+		long[s.d.ID()] = true
+		if s.mode == rendr.ModeSelector {
+			sel = append(sel, s)
+		} else {
+			bond = append(bond, s)
+		}
+	}
+	lmu.Unlock()
+	waitFor(t, 10*time.Second, "two members per bond session", func() bool {
+		for _, s := range bond {
+			if len(liveOf(s.d.Status())) != 2 {
+				return false
+			}
+		}
+		return true
+	})
+	exchangeAll(t, ps, 64<<10, 1)
+	target, name := sharedTarget(t, sel, len(ps))
+	if name != "p1" {
+		t.Fatalf("premise: the selector sessions are active on %s, want p1", name)
+	}
+	if m := w.d.Status().Mux; m.Carriers != 2 {
+		t.Fatalf("premise: dialer Status.Mux %+v, want one carrier per factory", m)
+	}
+	waitFor(t, 10*time.Second, "every session actor of both Runtimes parked", func() bool {
+		return testhooks.ParkedSessions.Load()-w.parked0 == int64(2*len(ps))
+	})
+
+	stop := make(chan struct{})
+	w.addStop(stop)
+	loadStart := time.Now()
+	loadDone := w.openLoad(peer, "O", 50*time.Millisecond, stop)
+	// The kill falls halfway between two OPENs of the load (they start
+	// every 50 ms from loadStart), so the first redial is a long
+	// session's JOIN, as in the regress runs where 22 long sessions each
+	// dialled their own carrier.
+	sleepUntil(loadStart.Add(time.Second + 25*time.Millisecond))
+
+	armed.Store(true)
+	killed := time.Now()
+	if n := w.link("p1").Kill(); n == 0 {
+		t.Fatal("stimulus: the kill of p1 ended no carrier")
+	}
+	recovered := func() bool {
+		for _, s := range ps {
+			st := s.d.Status()
+			live := liveOf(st)
+			if s.mode == rendr.ModeBond && len(live) != 2 {
+				return false
+			}
+			if _, ok := active(st); s.mode == rendr.ModeSelector && !ok {
+				return false
+			}
+			for _, c := range live {
+				if c.ID == target.ID {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	waitFor(t, 10*time.Second, "every long session recovered", recovered)
+	at := time.Now().Add(time.Nanosecond)
+	m := w.d.Status().Mux
+	c1, c2 := w.dialsIn("p1", killed, at), w.dialsIn("p2", killed, at)
+	t.Logf("recovered %v after the kill: %d session factory calls (p1 %d, p2 %d); dialer Status.Mux %+v", at.Sub(killed), c1+c2, c1, c2, m)
+	if c1+c2 != 1 {
+		t.Errorf("%d session factory calls from the kill to the recovery, want exactly 1 (B0.2 item 1)", c1+c2)
+	}
+	if m.Carriers > 2 {
+		t.Errorf("dialer Status.Mux.Carriers %d right after the recovery, want ≤ 2", m.Carriers)
+	}
+	close(stop)
+	if n := loadDone(); n < 20 {
+		t.Errorf("load: %d short sessions completed, want ≥ 20", n)
+	}
+	if m := w.d.Status().Mux; m.Carriers > 2 {
+		t.Errorf("dialer Status.Mux.Carriers %d once the load stopped, want ≤ 2", m.Carriers)
+	}
+	exchangeAll(t, ps, 64<<10, 100)
+	if t.Failed() {
+		t.FailNow()
+	}
+	closeAll(t, ps)
+	w.noViolation()
+	w.close()
 }
