@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -322,6 +323,8 @@ func TestAttemptThroughPool(t *testing.T) {
 func TestViewGoneJoin_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) }) // a failure must not leave the passive's writer held
 		var held, placed chan struct{}
 		held, placed = make(chan struct{}, 1), make(chan struct{}, 1)
 		var holdH uint32
@@ -354,13 +357,23 @@ func TestViewGoneJoin_L52(t *testing.T) {
 		trunk := mxCarrier(t, d1, "a").ID
 
 		// The DONE exchange of d2 completes; both ends retire their views.
+		// The passive's direction ends first (its FIN delivered and
+		// confirmed), then the dialer's: the passive's DONE needs nothing
+		// more than the dialer's FIN and goes out first, so the dialer ends —
+		// its DONE and DETACH placed together — when that DONE arrives, and
+		// the passive's DETACH, which follows the dialer's DONE, is alone in
+		// the batch the hook holds. (Without this order the held batch could
+		// carry the passive's DONE beside its DETACH: the dialer then waited
+		// for that DONE and never placed its DETACH — a premise flake of the
+		// race lane.)
+		p2.CloseWrite()
+		io.Copy(io.Discard, d2)            // the dialer delivered the passive's FIN
+		time.Sleep(200 * time.Millisecond) // and confirmed it to the passive
+		d2.CloseWrite()
 		go func() {
-			p2.CloseWrite()
 			io.Copy(io.Discard, p2)
 			p2.Close()
 		}()
-		d2.CloseWrite()
-		io.Copy(io.Discard, d2)
 		d2.Close()
 		<-held // the passive placed its DETACH: its writer holds it
 		select {
@@ -398,7 +411,7 @@ func TestViewGoneJoin_L52(t *testing.T) {
 		if m := e.d.Status().Mux; m.Carriers != 1 || m.Views != 1 {
 			t.Fatalf("dialer Mux %+v after the view's end, want the trunk with one view", m)
 		}
-		close(release)
+		releaseOnce.Do(func() { close(release) })
 		e2eExchange(t, d1, p1, 256<<10, 7)
 		if st := d1.Status(); st.Migrations != (MigrationCounts{}) {
 			t.Fatalf("the other session migrated: %+v", st.Migrations)
