@@ -6,17 +6,20 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// The session actor (design §3.4, L09): one goroutine per session that
-// exclusively owns every control decision — lane membership, roles and
+// The session actor (design §3.4, L09): one goroutine at a time per
+// session that exclusively owns every control decision — lane membership, roles and
 // routing (lane.data, ctl.active), the selector quality policy and the
 // failover race, bond membership and rescue, SCHED publication and
 // application, the redial cadence of every factory slot, no-path episodes,
 // termination, migration counting and the status snapshot. It is woken by
 // its mailbox (commands that carry ownership, and a coalescing doorbell for
 // facts that live in objects) and by one timer for the earliest deadline.
+// The goroutine runs on demand (M3 §A8, park.go): after the linger without
+// a step that did work it parks and returns, and a kick starts the next.
 //
 // Every step drains the mailbox, then reconciles the facts it re-reads from
 // the objects it holds (carrier death records, peer CLOSE/GOAWAY, stream
@@ -57,15 +60,16 @@ const (
 // right after every critical section of a step, when the published
 // snapshot and the routing it describes are visible to every other
 // goroutine (the L27 consistency check). beforeWaitHook runs right before
-// the actor blocks for its next step (the end-phase wakeup regression
-// test). Neither is called with a lock held.
+// the actor blocks or parks for its next step (the end-phase wakeup
+// regression test). Neither is called with a lock held.
 var (
 	afterUnlockHook atomic.Pointer[func(s *Session)]
 	beforeWaitHook  atomic.Pointer[func(s *Session)]
 )
 
-// actor is the state of one session's actor goroutine. Only that
-// goroutine touches it (the dialer's shared fields say otherwise).
+// actor is the state of one session's actor. Only the goroutine running
+// it touches it (the dialer's shared fields say otherwise): the state word
+// hands it from one goroutine to the next (park.go).
 type actor struct {
 	s *Session
 
@@ -74,10 +78,19 @@ type actor struct {
 	// (M3-D42, L09).
 	state atomic.Uint32
 
+	// timer is the reusable timer of the earliest deadline (and, while
+	// running, of the linger): its callback rings the doorbell (park.go).
 	timer  *time.Timer
 	wakeAt time.Time // earliest deadline collected by want during a step
-	cmds   []command // drain buffer
-	events []Event   // emitted after the step released the lock
+	// worked: the current step did work (R1-22) — it handled a command or
+	// a stream fact, changed control state (published), or queued an
+	// event, answer or Registry call. A quality or ranking re-evaluation
+	// that changed nothing is not work. lastWork is when the last such
+	// step began: the actor parks linger() after it.
+	worked   bool
+	lastWork time.Time
+	cmds     []command // drain buffer
+	events   []Event   // emitted after the step released the lock
 	// answers are the replies of the step's commands, Dial's result and the
 	// Peer's gone-away note (in the order queued, so a note precedes the
 	// Dial result it explains): run right after the lock is released and
@@ -160,20 +173,33 @@ type actor struct {
 	d *dialer // dialer only
 }
 
-// newActor returns the actor of s; run starts it.
+// newActor returns the actor of s, parked; Start publishes it in
+// mailbox.actor and kicks it.
 func newActor(s *Session) *actor {
 	return &actor{s: s}
 }
 
-// run is the actor goroutine (design §3.4).
+// run is one goroutine of the actor (design §3.4; M3 §A8): it runs
+// steps until the session ends (exit) or the actor parks. Only the
+// goroutine that moved the state word to running runs it.
 func (a *actor) run() {
 	s := a.s
-	a.timer = time.NewTimer(time.Hour)
-	a.timer.Stop()
+	a.begin()
 	for {
+		// A kick from here on asks for one more step (again). The token a
+		// ring left before is consumed: this step sees what it rang for.
+		a.state.Store(actorRunning)
+		select {
+		case <-s.mb.bell:
+		default:
+		}
 		now := time.Now()
 		a.wakeAt = time.Time{}
+		a.worked = false
 		a.step(now)
+		if a.worked {
+			a.lastWork = now
+		}
 		// One decision per round: the exit and the channel waited on come
 		// from the same look at gone, which the step just pruned. The loop
 		// waits for the oldest carrier still in gone in every phase: its
@@ -183,19 +209,31 @@ func (a *actor) run() {
 		// phase the exit waits for an empty gone: a carrier whose Done
 		// closes after this look is the one waited on below or is pruned
 		// in the step that one wakes, so no lost wakeup can leave the
-		// session undone (L52).
+		// session undone (L52). A parked actor learns the same joins
+		// through Conn.OnDone (park).
 		joined := a.joinWait()
 		if a.ending && joined == nil && a.quiet() {
+			a.state.Store(actorExited)
 			a.exit()
 			return
 		}
-		a.arm(time.Now()) // a hook may have held the step
+		if a.state.CompareAndSwap(actorAgain, actorRunning) {
+			continue // a kick arrived during the step
+		}
+		now = time.Now() // a hook may have held the step
+		lingerAt := a.lastWork.Add(a.linger())
+		a.arm(now, lingerAt)
 		if h := beforeWaitHook.Load(); h != nil {
 			(*h)(s)
 		}
+		if now = time.Now(); !now.Before(lingerAt) {
+			if a.park(now) {
+				return
+			}
+			continue // a kick raced the park
+		}
 		select {
-		case <-s.mb.bell:
-		case <-a.timer.C:
+		case <-s.mb.bell: // also the timer: deadlines and the linger
 		case <-joined:
 		case <-a.readerWait:
 		}
@@ -209,6 +247,9 @@ func (a *actor) run() {
 func (a *actor) step(now time.Time) {
 	s := a.s
 	a.cmds = s.mb.drain(a.cmds[:0])
+	if len(a.cmds) > 0 {
+		a.worked = true
+	}
 	s.mu.Lock()
 	for i, c := range a.cmds {
 		a.handleLocked(now, c)
@@ -232,6 +273,7 @@ func (a *actor) unlockStep(now time.Time) {
 	if a.dirty {
 		a.publishLocked(now)
 		a.dirty = false
+		a.worked = true
 	}
 	a.s.mu.Unlock()
 	if h := afterUnlockHook.Load(); h != nil {
@@ -264,6 +306,9 @@ func (a *actor) handleLocked(now time.Time, c command) {
 func (a *actor) factsLocked(now time.Time) {
 	s := a.s
 	f := s.takeFactsLocked()
+	if f != 0 {
+		a.worked = true // a lane or data-plane fact (R1-22)
+	}
 	if f == 0 || a.ending {
 		return
 	}
@@ -358,19 +403,23 @@ func (a *actor) want(t time.Time) {
 	}
 }
 
-// arm sets the timer for the earliest deadline of the step.
-func (a *actor) arm(now time.Time) {
-	if a.wakeAt.IsZero() {
-		a.timer.Stop()
-		return
+// arm sets the timer of a running actor for the earlier of the step's
+// earliest deadline and lingerAt, when it parks.
+func (a *actor) arm(now, lingerAt time.Time) {
+	at := lingerAt
+	if !a.wakeAt.IsZero() && a.wakeAt.Before(at) {
+		at = a.wakeAt
 	}
-	a.timer.Reset(max(a.wakeAt.Sub(now), minArm))
+	a.timer.Reset(max(at.Sub(now), minArm))
 }
 
 // flush runs the calls deferred until the session lock was released —
 // the answers first, then the Registry and health calls — and emits the
 // step's events in order (design §3.2: never under a lock).
 func (a *actor) flush() {
+	if len(a.answers)+len(a.later)+len(a.events) > 0 {
+		a.worked = true
+	}
 	for i, f := range a.answers {
 		f()
 		a.answers[i] = nil
@@ -475,7 +524,8 @@ func (a *actor) joinWait() <-chan struct{} {
 
 // exit closes the mailbox, cleans up commands posted since the last
 // drain (each one exactly once, F9), releases the health subscription and
-// hold, and closes Done. Only commands that own no carrier the session
+// hold, and closes Done. The state word is already exited, so no kick
+// starts another goroutine. Only commands that own no carrier the session
 // still waits for can be left by then: replies, and results of attempts
 // abandoned in embedder code (their late conns are closed here; their
 // goroutines are counted in the abandoned pool, L52).
@@ -493,6 +543,10 @@ func (a *actor) exit() {
 		}
 	}
 	a.timer.Stop()
+	if g := s.p.Actors; g != nil {
+		g.Add(-1)
+	}
+	testhooks.LiveSessions.Add(-1)
 	close(s.done)
 }
 

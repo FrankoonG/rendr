@@ -127,6 +127,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		DBufs:   carrier.NewDatagramBufPool(),
 		Dgram:   &carrier.DgramStats{},
 	}
+	rt.eff.params.Actors = &rt.actors // every session's Params counts its running actor (M3-D44)
 	rt.gateFn = rt.gate
 	rt.ctx, rt.cancel = context.WithCancelCause(context.Background())
 	rt.ev = newEventQueue(eff.cfg.OnEvent, eff.eventQueue, eff.hooks)
