@@ -122,11 +122,11 @@ func (a *actor) groupFailoverLocked(now time.Time) {
 	for i := range d.slots {
 		sl := &d.slots[i]
 		g := d.spec.group(i)
-		if g == 0 || !sl.member || sl.att != nil || sl.cad.Fails == 0 || a.factoryUsableLocked(i) {
+		if g == 0 || !sl.member || sl.att != nil || a.factoryUsableLocked(i) {
 			continue
 		}
 		if ok, _ := sl.cad.Ready(now); ok || !a.failedLocked(snap, i) {
-			continue // its own factory may dial now, or it did not fail
+			continue // its own factory may dial now (the death's kick), or it was refused, not failed
 		}
 		if rank == nil {
 			rank = a.rankLocked(now)

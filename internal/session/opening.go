@@ -939,10 +939,14 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 }
 
 // attachLocked attaches an established carrier of factory i as a new lane
-// and gives it its role: a bond member (data-eligible at attach, with a
-// growth SCHED); the selector's active lane when there is none (the race
-// winner, counted with the routing loss's cause); the planned switch's
-// target; otherwise a race loser, retired with CLOSE and no penalty (D23).
+// and gives it its role: a bond or race member (data-eligible at attach,
+// with a growth SCHED); the selector's active lane when there is none (the
+// race winner, counted with the routing loss's cause); the planned
+// switch's target; otherwise a race loser, retired with CLOSE and no
+// penalty (D23). In bond and race a factory that is no member slot — an
+// opening-race attempt that completed after the session opened on another
+// factory — is such a loser too: it never becomes a second member of its
+// fate group, nor a member beyond MaxCarriers (M3-D37, PA-31).
 func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Established) {
 	s := a.s
 	d := a.d
@@ -955,10 +959,12 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	l := a.newLaneLocked(now, est.Conn, i, sl.gen, LaneMember)
 	a.finish(now, i, at, sched.OutcomeAttached)
 	switch {
-	case s.p.Mode.members():
+	case s.p.Mode.members() && sl.member:
 		l.data = true
 		a.publishSchedLocked(now, wire.SchedInitial) // the grown member set (the first SCHED too)
 		a.owedDeathLocked(now, l.id)
+	case s.p.Mode.members():
+		a.retireLaneLocked(l)
 	case ctl.active == nil:
 		a.activateLocked(l)
 		cause := wire.SchedInitial

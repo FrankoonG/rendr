@@ -1,7 +1,9 @@
 package session
 
 import (
+	"fmt"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -160,64 +162,198 @@ func TestBondOnePerFateGroup_L32(t *testing.T) {
 // group's next factory by rank, which is dialled at once and becomes the
 // member; the first factory is not dialled again, and the group never
 // holds two members (M3-D37). The transfer started before the death
-// completes intact on the members that remain.
+// completes intact on the members that remain. In "other-group-between" a
+// non-member factory of another group (p3) ranks between the dead member
+// p1 and its group sibling p4: the membership skips it, so p3 is never
+// dialled and its group keeps its one member p2.
 func TestMemberFailoverWithinGroup(t *testing.T) {
+	cases := []struct {
+		name          string
+		groups        []uint8
+		before, after []int // member slots at the open and after the move
+		sibling       int   // the factory the membership moves to
+	}{
+		{"sibling-next", []uint8{1, 1, 0}, []int{0, 2}, []int{1, 2}, 1},
+		{"other-group-between", []uint8{1, 2, 2, 1}, []int{0, 1}, []int{1, 3}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := acNewWorld(t, nil)
+				defer w.teardown()
+				ls := make([]*rendrtest.Link, len(tc.groups))
+				for i := range ls {
+					ls[i] = w.slowLink(fmt.Sprintf("p%d", i+1))
+				}
+				a, b := wpOpen(w, mgSpec(w, ModeBond, tc.groups, ls...), nil)
+				acWaitFor(t, time.Second, "two members", func() bool { return a.dataMembers() == 2 && b.dataMembers() == 2 })
+				if m := mgMembers(a); !mgSame(m, tc.before) {
+					t.Fatalf("members %v, want %v", m, tc.before)
+				}
+				const n = 8 << 20
+				done := make(chan [2]error, 1)
+				go func() {
+					we, re := acTransfer(a, b, n, 42, true)
+					done <- [2]error{we, re}
+				}()
+				acWaitFor(t, 5*time.Second, "a quarter delivered", func() bool { return b.Status().DeliveredBytes >= n/4 })
+				if d := b.Status().DeliveredBytes; d >= n/2 {
+					t.Fatalf("%d of %d bytes delivered before the kill: no load across it", d, n)
+				}
+				before := mgDials(ls...)
+				ls[0].SetRefuse(true)
+				if ls[0].Kill() == 0 {
+					t.Fatal("the kill hit no carrier")
+				}
+				killed := time.Now()
+				acWaitFor(t, 2*time.Second, "the sibling took p1's place", func() bool {
+					return mgSame(mgDataFactories(a), tc.after)
+				})
+				if d := time.Since(killed); d > 100*time.Millisecond {
+					t.Fatalf("p%d attached %v after p1's death, want the move right after p1's failed redial", tc.sibling+1, d)
+				}
+				after := mgDials(ls...)
+				for i := range after {
+					want := int64(0)
+					if i == 0 || i == tc.sibling {
+						want = 1
+					}
+					if got := after[i] - before[i]; got != want {
+						t.Fatalf("calls since the kill %v (before %v); want one redial of p1, then one of p%d, no other",
+							after, before, tc.sibling+1)
+					}
+				}
+				if m := mgMembers(a); !mgSame(m, tc.after) {
+					t.Fatalf("members %v, want %v (one per group)", m, tc.after)
+				}
+				ls[0].SetRefuse(false)
+				r := <-done
+				if r[0] != nil || r[1] != nil {
+					t.Fatalf("transfer: write %v, read %v", r[0], r[1])
+				}
+				if ls[tc.sibling].Stats().Session.Bytes == 0 {
+					t.Fatal("the new member carried no session bytes")
+				}
+				time.Sleep(10 * time.Second)
+				synctest.Wait()
+				if got := mgDials(ls...); !slices.Equal(got, after) {
+					t.Fatalf("calls %v later, want %v: no factory dialled after the move", got, after)
+				}
+				if m := mgMembers(a); !mgSame(m, tc.after) {
+					t.Fatalf("members %v later, want %v", m, tc.after)
+				}
+			})
+		})
+	}
+}
+
+// TestMemberRefusedKeepsMembership: a member's redial that the peer
+// refuses after the PREFACE exchange (JOIN_ACK CAPACITY) proves the path
+// works: the failed mark is cleared and the membership stays with that
+// factory (M3-D37: only a failed attempt moves it), so its group sibling
+// is never dialled; the member redials at its own cadence and rejoins once
+// the peer admits it.
+func TestMemberRefusedKeepsMembership(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := acNewWorld(t, nil)
 		defer w.teardown()
-		l1, l2, l3 := w.slowLink("p1"), w.slowLink("p2"), w.slowLink("p3")
-		a, b := wpOpen(w, mgSpec(w, ModeBond, []uint8{1, 1, 0}, l1, l2, l3), nil)
+		var refuse atomic.Bool
+		var refused atomic.Int32
+		w.b.joinAnswer = func(*wire.Join) (wire.JoinAck, bool) {
+			if !refuse.Load() {
+				return wire.JoinAck{}, false
+			}
+			refused.Add(1)
+			return wire.JoinAck{Status: wire.StatusCapacity}, true
+		}
+		ls := []*rendrtest.Link{w.slowLink("p1"), w.slowLink("p2"), w.slowLink("p3")}
+		a, b := wpOpen(w, mgSpec(w, ModeBond, []uint8{1, 1, 0}, ls...), nil)
 		acWaitFor(t, time.Second, "two members", func() bool { return a.dataMembers() == 2 && b.dataMembers() == 2 })
 		if m := mgMembers(a); !mgSame(m, []int{0, 2}) {
 			t.Fatalf("members %v, want p1 and p3", m)
 		}
-		const n = 8 << 20
-		done := make(chan [2]error, 1)
-		go func() {
-			we, re := acTransfer(a, b, n, 42, true)
-			done <- [2]error{we, re}
-		}()
-		acWaitFor(t, 5*time.Second, "a quarter delivered", func() bool { return b.Status().DeliveredBytes >= n/4 })
-		if d := b.Status().DeliveredBytes; d >= n/2 {
-			t.Fatalf("%d of %d bytes delivered before the kill: no load across it", d, n)
-		}
-		before := mgDials(l1, l2, l3)
-		l1.SetRefuse(true)
-		if l1.Kill() == 0 {
+		before := mgDials(ls...)
+		refuse.Store(true)
+		if ls[0].Kill() == 0 {
 			t.Fatal("the kill hit no carrier")
 		}
-		killed := time.Now()
-		acWaitFor(t, 2*time.Second, "p2 took p1's place", func() bool {
-			return mgSame(mgDataFactories(a), []int{1, 2})
-		})
-		if d := time.Since(killed); d > 100*time.Millisecond {
-			t.Fatalf("p2 attached %v after p1's death, want the move right after p1's failed redial", d)
-		}
-		after := mgDials(l1, l2, l3)
-		if after[0]-before[0] != 1 || after[1]-before[1] != 1 || after[2] != before[2] {
-			t.Fatalf("calls since the kill p1 %d, p2 %d, p3 %d; want one redial of p1, then one of p2",
-				after[0]-before[0], after[1]-before[1], after[2]-before[2])
-		}
-		if m := mgMembers(a); !mgSame(m, []int{1, 2}) {
-			t.Fatalf("members %v, want p2 and p3 (one per group)", m)
-		}
-		l1.SetRefuse(false)
-		r := <-done
-		if r[0] != nil || r[1] != nil {
-			t.Fatalf("transfer: write %v, read %v", r[0], r[1])
-		}
-		if l2.Stats().Session.Bytes == 0 {
-			t.Fatal("the new member carried no session bytes")
-		}
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 		synctest.Wait()
-		if got := l1.Stats().Dials - before[0]; got != 1 {
-			t.Fatalf("p1 dialled %d times after the move, want no call beyond its first redial", got)
+		after := mgDials(ls...)
+		if r, d := int64(refused.Load()), after[0]-before[0]; r < 2 || d < r || d > r+1 {
+			t.Fatalf("%d refused JOINs over %d redials of p1, want at least two, every answered one refused (stimulus)", r, d)
 		}
-		if m := mgMembers(a); !mgSame(m, []int{1, 2}) {
-			t.Fatalf("members %v later, want p2 and p3", m)
+		if after[1] != before[1] || after[2] != before[2] {
+			t.Fatalf("calls since the kill %v (before %v): only p1 may be redialled", after, before)
+		}
+		if m := mgMembers(a); !mgSame(m, []int{0, 2}) {
+			t.Fatalf("members %v after refused redials, want p1 and p3 still", m)
+		}
+		refuse.Store(false)
+		acWaitFor(t, 10*time.Second, "p1 rejoined", func() bool { return mgSame(mgDataFactories(a), []int{0, 2}) })
+		if got := ls[1].Stats().Dials; got != before[1] {
+			t.Fatalf("p2 dialled %d times, want never", got-before[1])
+		}
+		if we, re := acTransfer(a, b, 1<<20, 47, false); we != nil || re != nil {
+			t.Fatalf("transfer: write %v, read %v", we, re)
 		}
 	})
+}
+
+// TestLateOpenerNeverSecondMember (M3-D37, PA-31; L32, L35): an
+// opening-race attempt that completes after the session opened on another
+// factory attaches as a member only on a member slot. Every link has a
+// 50 ms one-way delay and JoinStagger is 10 ms, so p2 — the winner p1's
+// group sibling — completes its OPEN after p1 won: it is retired with
+// CLOSE and no penalty (D23), never a data lane; the SCHED lists the two
+// members p1 and p3, both ends send on those only, and p2 carries nothing
+// more. Bond and race alike.
+func TestLateOpenerNeverSecondMember(t *testing.T) {
+	for _, mode := range []Mode{ModeBond, ModeRace} {
+		name := "bond"
+		if mode == ModeRace {
+			name = "race"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := acNewWorld(t, nil)
+				defer w.teardown()
+				w.a.p.JoinStagger = 10 * time.Millisecond
+				ls := []*rendrtest.Link{w.link("p1"), w.link("p2"), w.link("p3")}
+				for _, l := range ls {
+					l.SetDelay(50*time.Millisecond, 0)
+				}
+				a, b := wpOpen(w, mgSpec(w, mode, []uint8{1, 1, 0}, ls...), nil)
+				time.Sleep(5 * time.Second)
+				synctest.Wait()
+				if d := mgDials(ls...); !slices.Equal(d, []int64{1, 1, 1}) {
+					t.Fatalf("factory calls %v, want one each (the opening race reached p2)", d)
+				}
+				if cs := ls[1].Carriers(); len(cs) != 1 || !cs[0].Session || !cs[0].Closed || cs[0].Down == 0 {
+					t.Fatalf("p2's carriers %+v: want its OPEN carrier answered, then closed (stimulus)", cs)
+				}
+				if m := mgMembers(a); !mgSame(m, []int{0, 2}) {
+					t.Fatalf("member slots %v, want p1 and p3", m)
+				}
+				if f := mgDataFactories(a); !mgSame(f, []int{0, 2}) {
+					t.Fatalf("data lanes on factories %v, want p1 and p3 only", f)
+				}
+				if n := mgSchedN(a); n != 2 {
+					t.Fatalf("the SCHED lists %d members, want 2", n)
+				}
+				if n := b.dataMembers(); n != 2 {
+					t.Fatalf("the passive sends on %d lanes, want 2", n)
+				}
+				p2 := ls[1].Stats().Session.Bytes
+				if we, re := acTransfer(a, b, 1<<20, 48, false); we != nil || re != nil {
+					t.Fatalf("transfer: write %v, read %v", we, re)
+				}
+				if got := ls[1].Stats().Session.Bytes; got != p2 {
+					t.Fatalf("p2 carried %d session bytes during the transfer, want 0", got-p2)
+				}
+			})
+		})
+	}
 }
 
 // TestSelectorFailoverPrefersOtherGroup: the selector's death failover race

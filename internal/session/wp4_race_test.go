@@ -22,6 +22,22 @@ func mgSchedN(s *Session) int {
 	return int(s.ctl.set.N)
 }
 
+// mgPassiveRoles returns how many live lanes of passive s are data members
+// in state member, and whether s has a selector's active lane.
+func mgPassiveRoles(s *Session) (members int, active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.lanes {
+		if l.state == LaneActive {
+			active = true
+		}
+		if l.data && l.state == LaneMember {
+			members++
+		}
+	}
+	return members, active || s.ctl.active != nil
+}
+
 // TestModeRaceIsBondMembership: a race session over three independent
 // factories keeps all three as members (M3-D29): the SCHED lists every
 // member and the passive sends on exactly the listed carriers; every
@@ -63,6 +79,7 @@ func TestModeRaceIsBondMembership(t *testing.T) {
 		if d := time.Since(killed); d > 100*time.Millisecond {
 			t.Fatalf("member back %v after its death, want the immediate redial", d)
 		}
+		atRejoin, p2AtRejoin := b.Status().DeliveredBytes, ls[1].Stats().Session.Bytes
 		if got := ls[1].Stats().Dials - dials; got != 1 {
 			t.Fatalf("%d redials of the dead member's factory, want 1", got)
 		}
@@ -78,6 +95,12 @@ func TestModeRaceIsBondMembership(t *testing.T) {
 			if got := ls[l].Stats().Session.Bytes - up[l]; got < n*9/10 {
 				t.Fatalf("member %d (p%d) moved %d session bytes, want a copy of nearly every byte (≥ %d)", i, l+1, got, n*9/10)
 			}
+		}
+		if got, rest := ls[1].Stats().Session.Bytes-p2AtRejoin, int64(n)-int64(atRejoin); got < rest*9/10 {
+			t.Fatalf("the rejoined member moved %d session bytes after its rejoin, want a copy of nearly all %d bytes left then", got, rest)
+		}
+		if lanes, active := mgPassiveRoles(b); lanes != 3 || active {
+			t.Fatalf("the passive has %d member lanes and an active lane %v; want three members and no active lane (bond's roles)", lanes, active)
 		}
 		as, bs := a.Status(), b.Status()
 		if as.MigQuality+as.MigExplicit != 0 || bs.MigDeath+bs.MigQuality+bs.MigExplicit != 0 {
@@ -167,6 +190,23 @@ func TestRaceDeathCount(t *testing.T) {
 			acWaitFor(t, time.Second, "the member rejoined", func() bool { return a.Status().Rejoins == 1 && a.dataMembers() == 2 })
 			if as := a.Status(); as.MigDeath != 1 || as.RetransmittedBytes != 0 {
 				t.Fatalf("after the busy member's death: death migrations %d (want 1), retransmitted %d (want 0)", as.MigDeath, as.RetransmittedBytes)
+			}
+			// Each side counts its own deaths: the SCHEDs carry no counts
+			// (as bond's), so the passive applies the dialer's newest one
+			// with zero counts although the dialer counted a death.
+			acWaitFor(t, time.Second, "the passive applied the newest SCHED", func() bool {
+				a.mu.Lock()
+				e := a.ctl.epoch
+				a.mu.Unlock()
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				return b.ctl.epoch == e
+			})
+			b.mu.Lock()
+			set := b.ctl.set
+			b.mu.Unlock()
+			if set.Death+set.Quality+set.Explicit != 0 {
+				t.Fatalf("the race SCHED carried counts %d/%d/%d, want none", set.Death, set.Quality, set.Explicit)
 			}
 			r := <-done
 			if r[0] != nil || r[1] != nil {
@@ -317,4 +357,153 @@ func TestHoLCoupledDutyMove_L08(t *testing.T) {
 			stEnd(s, errClosed)
 		})
 	}
+}
+
+// TestRaceEpisodeKicksMembers (M3-D29, §7.7): race keeps bond's episode
+// rule. When the last live member dies, the no-path episode makes every
+// member slot redial at once, also one still in its backoff: p2's path
+// refused four redials, so its slot waits seconds when p1 dies; p2 is
+// redialled at the episode start and the episode ends within one
+// handshake.
+func TestRaceEpisodeKicksMembers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		w.a.p.Grace, w.a.p.Retain, w.a.p.BackoffMax = 30*time.Second, 40*time.Second, 4*time.Second
+		l1, l2 := w.link("p1"), w.link("p2")
+		a, b := w.open(ModeRace, nil, l1, l2)
+		acWaitFor(t, time.Second, "both members", func() bool { return a.dataMembers() == 2 })
+		l2.SetRefuse(true)
+		l2.Kill()
+		time.Sleep(4 * time.Second) // redials at +0, 0.5, 1.5 and 3.5 s fail: the next waits until +7.5 s
+		if failures := l2.Stats().DialFailures; failures < 4 {
+			t.Fatalf("%d refused redials of p2, want its slot deep in backoff (stimulus)", failures)
+		}
+		l2.SetRefuse(false)
+		l1.SetRefuse(true)
+		killed := time.Now()
+		dials := l2.Stats().Dials
+		l1.Kill()
+		acWaitFor(t, time.Second, "p2 back as a member", func() bool {
+			return !a.Status().InNoPath && a.dataMembers() == 1
+		})
+		if d := time.Since(killed); d > 50*time.Millisecond {
+			t.Fatalf("episode ended %v after the last member died, want p2 redialled at once", d)
+		}
+		if got := l2.Stats().Dials - dials; got != 1 {
+			t.Fatalf("%d dials of p2 after the episode started, want 1", got)
+		}
+		if st := a.Status(); st.NoPathEpisodes != 1 {
+			t.Fatalf("no-path episodes %d, want 1", st.NoPathEpisodes)
+		}
+		l1.SetRefuse(false)
+		if we, re := acTransfer(a, b, 1<<20, 49, false); we != nil || re != nil {
+			t.Fatalf("transfer: %v %v", we, re)
+		}
+	})
+}
+
+// TestRacePeerCloseRepublishes (M3-D29): the passive (here: an injected
+// frame) retires a race member with CLOSE while the session lives; as in
+// bond, the dialer answers it and publishes the shrunk member set at once
+// (an explicit SCHED: both ends then send on the other member only), the
+// slot redials per its cadence (refused here until released) and the
+// member rejoins; no death is counted.
+func TestRacePeerCloseRepublishes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		l1, l2 := w.link("p1"), w.link("p2")
+		a, b := w.open(ModeRace, nil, l1, l2)
+		acWaitFor(t, time.Second, "two members, the SCHED echoed", func() bool {
+			return a.dataMembers() == 2 && b.dataMembers() == 2 && mgSchedN(a) == 2 && a.Status().SchedEchoed >= 1
+		})
+		l1.SetRefuse(true)
+		l1.InjectAfterNextFrame(rendrtest.Down, rendrtest.FramePong, rendrtest.FrameClose, 0, 0, []byte{1})
+		acWaitFor(t, 3*time.Second, "the shrunk member set", func() bool {
+			return mgSchedN(a) == 1 && b.dataMembers() == 1 && a.dataMembers() == 1
+		})
+		if l1.Stats().Session.FramesInjected != 1 {
+			t.Fatal("no CLOSE was injected (stimulus)")
+		}
+		if f := mgDataFactories(a); !mgSame(f, []int{1}) {
+			t.Fatalf("data lanes on factories %v, want p2 only", f)
+		}
+		l1.SetRefuse(false)
+		acWaitFor(t, 10*time.Second, "p1 rejoined", func() bool {
+			return mgSchedN(a) == 2 && a.dataMembers() == 2 && b.dataMembers() == 2
+		})
+		if we, re := acTransfer(a, b, 1<<20, 50, false); we != nil || re != nil {
+			t.Fatalf("transfer: %v %v", we, re)
+		}
+		if as, bs := a.Status(), b.Status(); as.MigDeath+bs.MigDeath != 0 {
+			t.Fatalf("death migrations %d/%d, want none (a CLOSE is no death)", as.MigDeath, bs.MigDeath)
+		}
+	})
+}
+
+// TestRaceDroppedLaneRestartsAtSBase (M3-D30, §A6.2): a race lane that
+// loses data eligibility and stays alive (a passive SCHED drop, a
+// retirement) has its cursor put back to sBase, so when it is routed
+// again without an attach (the passive's fallback, a later SCHED) it
+// starts there as a new data lane does: with another data lane alive it
+// resends the bytes from sBase as copies; as the only data lane its
+// requeued spans go out again as retransmissions, never skipped.
+func TestRaceDroppedLaneRestartsAtSBase(t *testing.T) {
+	reroute := func(s *Session, l *lane, data bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		l.data = data
+		if !data {
+			s.requeueLocked(l)
+		}
+	}
+	t.Run("other-lane-lives", func(t *testing.T) {
+		s := rcSender(stOpt{window: 4 << 20, segment: 16 << 10})
+		a, _ := stAddLane(s, 1, true)
+		stAddLane(s, 2, true)
+		rcRaceLanes(s)
+		rcWrite(t, s, stPattern(0, 128<<10))
+		fa, ba := stFill(a, time.Now())
+		ba.ReleaseRefs()
+		if _, n := rcDataSpan(fa); n != 128<<10 {
+			t.Fatalf("premise: a sent %d bytes", n)
+		}
+		reroute(s, a, false)
+		reroute(s, a, true)
+		fs, bf := stFill(a, time.Now())
+		bf.ReleaseRefs()
+		if first, n := rcDataSpan(fs); first != 0 || n != 128<<10 {
+			t.Fatalf("the re-routed lane sent %d bytes from %d, want all 128 KiB again from sBase 0", n, first)
+		}
+		stEnd(s, errClosed)
+	})
+	t.Run("only-lane", func(t *testing.T) {
+		s := rcSender(stOpt{window: 4 << 20, segment: 16 << 10})
+		a, _ := stAddLane(s, 1, true)
+		rcRaceLanes(s)
+		rcWrite(t, s, stPattern(0, 128<<10))
+		fa, ba := stFill(a, time.Now())
+		ba.ReleaseRefs()
+		if _, n := rcDataSpan(fa); n != 128<<10 {
+			t.Fatalf("premise: a sent %d bytes", n)
+		}
+		reroute(s, a, false)
+		if q := stLocked(s, func(st *stream) uint64 { return st.retx.bytes() }); q != 128<<10 {
+			t.Fatalf("premise: %d bytes requeued, want 128 KiB", q)
+		}
+		reroute(s, a, true)
+		fs, bf := stFill(a, time.Now())
+		bf.ReleaseRefs()
+		retx := 0
+		for _, f := range fs {
+			if f.typ == wire.TypeData && f.retx {
+				retx += f.n
+			}
+		}
+		if first, n := rcDataSpan(fs); first != 0 || n != 128<<10 || retx != 128<<10 {
+			t.Fatalf("the re-routed lane sent %d bytes from %d (%d retransmitted), want the 128 KiB requeued resent from 0", n, first, retx)
+		}
+		stEnd(s, errClosed)
+	})
 }

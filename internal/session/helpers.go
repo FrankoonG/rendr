@@ -148,14 +148,21 @@ func (s *Session) applyRxNextLocked(rx uint64) error {
 // copies the others send or sent; they are dropped and their bytes are
 // still returned (the race death count, M3-D34). When l was the last data
 // lane they are requeued as M1 requeues them, and the next lane resends
-// them as retransmissions from sBase.
+// them as retransmissions from sBase. Either way l's cursor goes back to
+// sBase: a lane that stays alive and is routed again later (the passive's
+// fallback, a later SCHED) starts there as a new data lane does (M3-D30,
+// raceAttachLocked), and never skips bytes it no longer holds in flight.
 func (s *Session) requeueLocked(l *lane) (bytes uint64) {
 	if s.pk != nil {
 		return 0
 	}
 	st := &s.st
 	l.infl.trimBelow(st.sBase)
-	keep := s.p.Mode == ModeRace && s.raceOtherDataLaneLocked(l)
+	keep := false
+	if s.p.Mode == ModeRace {
+		l.rnext = st.sBase
+		keep = s.raceOtherDataLaneLocked(l)
+	}
 	for _, sp := range l.infl.s {
 		if !keep {
 			st.retx.add(sp.off, sp.n)
@@ -416,12 +423,13 @@ func (s *Session) rescueSenderLocked(l *lane) bool {
 }
 
 // raceOtherDataLaneLocked reports whether a data lane other than l lives:
-// data-eligible, not dead by its lane state and, for a lane with a carrier,
-// not ended by its carrier's death record (a lane whose carrier died in the
-// same instant and whose death step has not run yet carries nothing more).
+// data-eligible and not dead by its lane state. A lane whose carrier ended
+// in the same instant but whose death step has not run yet still counts:
+// its own step then finds no other data lane and requeues its spans (the
+// bytes only l held are resent from sBase all the same, counted as copies).
 func (s *Session) raceOtherDataLaneLocked(l *lane) bool {
 	for _, o := range s.st.order {
-		if o != l && o.data && o.state != LaneDead && (o.c == nil || !laneEnded(o)) {
+		if o != l && o.data && o.state != LaneDead {
 			return true
 		}
 	}

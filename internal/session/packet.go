@@ -183,7 +183,7 @@ func (p *plane) WriteBlocked(c *carrier.Conn) {
 			}
 		}
 	}
-	if s.p.Mode.members() && !st.ended {
+	if s.p.Mode == ModeBond && !st.ended {
 		s.pktWakeLocked(time.Now()) // queued datagrams go to the other members
 	}
 	st.facts |= factWriteBlocked
