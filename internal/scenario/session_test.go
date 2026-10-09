@@ -452,12 +452,15 @@ func TestGraceBoundsBothEnds(t *testing.T) {
 
 // The active path dies while the next-best candidate is stalled (a join into
 // it would hang for the handshake timeout): failover must race on to the
-// next candidate instead of waiting.
+// next candidate instead of waiting. The paths' delays are far apart so
+// that the probe ranking (p1, p2, p3) holds under a loaded race lane: with
+// 1, 2 and 8 ms the measured order flipped to p2 first in a Linux
+// race-unit pass (M3 I1).
 func TestSelectorFailoverRacesPastStalledCandidate(t *testing.T) {
 	f := newFixture(t, "p1", "p2", "p3")
 	f.link("p1").set(1*time.Millisecond, 0, 0)
-	f.link("p2").set(2*time.Millisecond, 0, 0)
-	f.link("p3").set(8*time.Millisecond, 0, 0)
+	f.link("p2").set(10*time.Millisecond, 0, 0)
+	f.link("p3").set(25*time.Millisecond, 0, 0)
 	c := f.mustDial(selector, dialOpts{target: echo()})
 	if p := activePath(c); p != "p1" {
 		t.Fatalf("initial active %q", p)

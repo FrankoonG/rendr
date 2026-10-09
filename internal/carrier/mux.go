@@ -605,22 +605,31 @@ func (t *trunk) muxRound(b *Batch) {
 		t.oneViewFill(b, &rd)
 	} else if n > 0 {
 		t.drrRound(b, n, &rd, nowNs)
-		t.mx.Lock()
+	}
+	// The cap list and the wake times are mx state: an openView that
+	// builds the table, or a reader that marks a view, writes them
+	// concurrently, so they are read under mx (a data race in I1's race
+	// lane: TestPoolSealAtZero/open_races_the_close).
+	t.mx.Lock()
+	if n > 0 {
 		t.returnScratchLocked(n)
-		t.mx.Unlock()
+	}
+	capped, nextWake, detWake := len(ms.capList) > 0, ms.nextWake, ms.detWake
+	t.mx.Unlock()
+	if n > 0 {
 		t.runPost(&ms.post)
 	}
-	if len(ms.capList) > 0 {
+	if capped {
 		// Views still wait on the shared capacity although they were not
 		// called this round: the trunk stays cap-blocked, so the PONG that
 		// frees capacity wakes the writer (C5) and re-readies them.
 		b.capBlocked = true
 	}
-	if ms.nextWake != 0 {
-		b.WakeAt(t.base.Add(time.Duration(ms.nextWake)))
+	if nextWake != 0 {
+		b.WakeAt(t.base.Add(time.Duration(nextWake)))
 	}
-	if ms.detWake != 0 {
-		b.WakeAt(t.base.Add(time.Duration(ms.detWake)))
+	if detWake != 0 {
+		b.WakeAt(t.base.Add(time.Duration(detWake)))
 	}
 }
 
