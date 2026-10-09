@@ -27,7 +27,13 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 	if s.fillControlLocked(l, b) && l.data {
 		s.fillDgramLocked(l, b)
 		st, pk := &s.st, s.pk
-		if st.fin.requested && !st.fin.acked && st.fin.lane == nil && pk.tx.n == 0 && pk.txBig.n == 0 {
+		var due bool
+		if s.p.Mode == ModeRace {
+			due = s.racePktFinDueLocked(l, b.Now().Sub(pk.base).Nanoseconds()) // once per member (M3-D30)
+		} else {
+			due = st.fin.requested && !st.fin.acked && st.fin.lane == nil && pk.tx.n == 0 && pk.txBig.n == 0
+		}
+		if due {
 			if !pk.finPlaced {
 				st.fin.off = pk.nextSeq // the final seq is fixed at its first placement (M2-D34)
 				pk.finPlaced = true
@@ -48,9 +54,19 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 // smaller member of a mixed-budget bond) is left to another live data lane
 // that can place it now, else dropped (DropTooLarge, M2-D45;
 // pktOtherCarrierLocked); on a stream lane DGRAM bytes are DATA and wait
-// for the carrier's capacity (M2-D26). It stops at a full batch.
+// for the carrier's capacity (M2-D26; its share Capacity − Inflight −
+// Taken on a MUX trunk, M3-D11). In a mixed bond a stream lane pulls tx's
+// small datagrams only while one MaxPayload datagram still fits its
+// capacity afterwards (M3-D52, KL-13). It stops at a full batch. A race
+// lane places from its own cursor (raceFillDgramsLocked, M3-D32).
 func (s *Session) fillDgramLocked(l *lane, b *carrier.Batch) {
-	if s.placeDgramsLocked(l, b) {
+	var placed bool
+	if s.p.Mode == ModeRace {
+		placed = s.raceFillDgramsLocked(l, b)
+	} else {
+		placed = s.placeDgramsLocked(l, b)
+	}
+	if placed {
 		l.lastDgramAt = b.Now()
 		if s.pk.stale == l {
 			s.pk.stale = nil // the minimum share is served (R1-19)
@@ -68,7 +84,17 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 	noPathEnd := pk.noPathEnd.Sub(pk.base).Nanoseconds()
 	left := int64(math.MaxInt64)
 	if !dg {
-		left = l.port.Capacity() - l.port.Inflight()
+		left = l.port.Capacity() - l.port.Inflight() - int64(b.Taken())
+	}
+	// KL-13 (M3-D52, PA-43): in a mixed bond only a stream member can carry
+	// a datagram above every datagram member's budget, so a stream lane
+	// keeps room for the next one — MaxPayload plus the DGRAM framing —
+	// when it pulls the small datagrams the datagram members are woken
+	// for first. Without it, near saturation the stream member filled its
+	// capacity with small datagrams and the big ones aged out behind them.
+	headroom := int64(math.MinInt64)
+	if !dg && pk.mixed {
+		headroom = int64(pk.maxPayload + wire.DgramOverhead)
 	}
 	limit := s.offsetLimit()
 	queues := [2]*pring{&pk.txBig, &pk.tx}
@@ -102,7 +128,7 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 				pk.ctr.DropTooLarge++
 				continue
 			}
-			if int64(n) > left {
+			if int64(n) > left || (q == &pk.tx && left-int64(n) < headroom) {
 				b.MarkCapBlocked() // the PONG that frees capacity wakes the writer
 				l.capMarked = true
 				return placed
@@ -143,7 +169,9 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 	}
 	for q.n > 0 && nowNs-q.front().at > maxAge {
 		at := q.front().at
-		q.evict()
+		if q.evict() == 0 {
+			continue // a race datagram another lane placed: it was sent
+		}
 		if noData || at < noPathEnd {
 			pk.ctr.DropNoPath++
 		} else {
@@ -283,6 +311,10 @@ func (s *Session) pktRouteLocked() {
 	if sl := pk.stale; sl != nil && (!sl.data || sl.state == LaneDead) {
 		pk.stale = nil
 	}
+	if s.p.Mode == ModeRace && pk.tx.n > 0 {
+		// A lane that left the data set no longer holds the head (M3-D32).
+		s.raceHeadLocked(time.Since(pk.base).Nanoseconds())
+	}
 }
 
 // pktWakeDataLocked is pktWakeLocked (M2 design §A5.2, R1-19; L08): it
@@ -306,6 +338,10 @@ func (s *Session) pktRouteLocked() {
 func (s *Session) pktWakeDataLocked(now time.Time) {
 	st, pk := &s.st, s.pk
 	if st.ended {
+		return
+	}
+	if s.p.Mode == ModeRace {
+		s.raceWakeDataLocked() // every member places every datagram
 		return
 	}
 	if s.p.Mode != ModeBond {

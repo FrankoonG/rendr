@@ -116,7 +116,11 @@ func (s *Session) initialSnapLocked() {
 // refused by the transport as too large — count in DropTooLarge and not in
 // Sent, so the send-side identity holds over public fields (R1-31). Its
 // byte counters count datagram payload bytes; AckedBytes, Window and
-// PeerWindow are 0.
+// PeerWindow are 0. The session counters count unique bytes and datagrams
+// in every mode; a race session's extra copies are in Race (sender) and
+// DupBytes or PacketCounters.Duplicates (receiver), and its carriers' rows
+// count every physical copy (M3-D35, L35). No figure is derived from a
+// race's members (no aggregate rate or latency: Unknown, PA-36).
 func (s *Session) status() Status {
 	sn := s.snap.Load()
 	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, PeerInstance: s.peer, Kind: s.Kind()}
@@ -139,6 +143,15 @@ func (s *Session) status() Status {
 	out.RxBytes = st.rxBytes
 	out.DeliveredBytes = st.delivered
 	out.RetransmittedBytes = st.retxBytes
+	out.DupBytes = st.dupBytes
+	if s.p.Mode == ModeRace {
+		// The sender's extra copies (M3-D35): never counted as
+		// retransmissions or in the unique counters above.
+		out.Race.CopyBytes = st.copyBytes
+		if s.pk != nil {
+			out.Race.Copies = s.pk.copies
+		}
+	}
 	out.Window = st.lastWin
 	out.PeerWindow = int64(st.peerLimit - st.sBase)
 	if s.pk != nil {

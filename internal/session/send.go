@@ -195,8 +195,13 @@ func (s *Session) advanceSendLocked(to uint64, now time.Time) {
 }
 
 // pullableLocked returns the DATA bytes a data lane could send now:
-// queued retransmissions plus new bytes inside the peer's window.
+// queued retransmissions plus new bytes inside the peer's window. A race
+// session's lanes send from their own cursors: the bytes the least
+// advanced data lane could still send (racePullableLocked).
 func (s *Session) pullableLocked() uint64 {
+	if s.p.Mode == ModeRace {
+		return s.racePullableLocked()
+	}
 	st := &s.st
 	n := st.retx.bytes()
 	if lim := min(st.end, st.peerLimit); lim > st.sNext {

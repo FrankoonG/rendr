@@ -1,0 +1,613 @@
+package session
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"math/rand/v2"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/wire"
+)
+
+// WP3 (M3 design §A6.2–§A6.7, §A11.1): the stream race data plane — the
+// per-lane cursors over the one send ring, the receiver's duplicate rules,
+// the ACK duty on the fastest lane and the unique accounting. Sessions and
+// lanes are the stream harness's (fake ports, Fill and delivery by hand);
+// membership is set up as bond's (every lane a data member, M3-D29), which
+// WP4 wires into the actor. Helpers start with "rc".
+
+// rcRaceLanes makes every lane of s a race data member (state member, no
+// selector active lane), as bond membership does, with its cursors started
+// as at its attach. Tests call it right after adding the lanes.
+func rcRaceLanes(s *Session) {
+	for _, l := range s.lanes {
+		rcRaceLane(s, l)
+	}
+}
+
+// rcRaceLane makes l a race data member and starts its cursors.
+func rcRaceLane(s *Session, l *lane) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctl.active == l {
+		s.ctl.active = nil
+	}
+	l.data = true
+	l.state = LaneMember
+	s.raceAttachLocked(l)
+}
+
+// rcSender is a race dialer whose peer advertised a 1 GiB window.
+func rcSender(o stOpt) *Session {
+	o.mode = ModeRace
+	s := stSession(o)
+	s.mu.Lock()
+	s.peerWindowLocked(1 << 30)
+	s.mu.Unlock()
+	return s
+}
+
+// rcPair is a race dialer and a race passive joined by links lanes, every
+// lane a data member on both sides.
+func rcPair(links int, ao, bo stOpt) *stPair {
+	ao.mode, bo.mode = ModeRace, ModeRace
+	p := stNewPair(ao, bo, links)
+	rcRaceLanes(p.a)
+	rcRaceLanes(p.b)
+	return p
+}
+
+// rcWrite writes data on s (the test goroutine; the window must hold it).
+func rcWrite(t *testing.T, s *Session, data []byte) {
+	t.Helper()
+	if n, err := s.Write(data); n != len(data) || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+}
+
+// rcDataSpan returns the first offset and the bytes of the DATA frames in
+// fs (first = ^0 when none).
+func rcDataSpan(fs []stFrame) (first uint64, n int) {
+	first = ^uint64(0)
+	for _, f := range fs {
+		if f.typ == wire.TypeData {
+			first = min(first, f.off)
+			n += f.n
+		}
+	}
+	return first, n
+}
+
+// rcStream returns (sBase, sNext, copyBytes, retxBytes) of s.
+func rcStream(s *Session) [4]uint64 {
+	return stLocked(s, func(st *stream) [4]uint64 { return [4]uint64{st.sBase, st.sNext, st.copyBytes, st.retxBytes} })
+}
+
+// TestRaceStreamCursor_L10: every data lane sends from its own cursor; an
+// ACK moves the acknowledged front and a lane behind it resumes there; sNext
+// is the furthest cursor; a lane attached later starts at sBase (L10's
+// replay from the ACK point), not at sNext.
+func TestRaceStreamCursor_L10(t *testing.T) {
+	s := rcSender(stOpt{window: 4 << 20})
+	a, _ := stAddLane(s, 1, true)
+	b, _ := stAddLane(s, 2, true)
+	rcRaceLanes(s)
+	rcWrite(t, s, stPattern(0, 256<<10))
+
+	fa, ba := stFill(a, time.Now())
+	ba.ReleaseRefs()
+	if first, n := rcDataSpan(fa); first != 0 || n != 256<<10 {
+		t.Fatalf("lane a sent %d bytes from %d, want 256 KiB from 0", n, first)
+	}
+	if v := rcStream(s); v[1] != 256<<10 || v[2] != 0 {
+		t.Fatalf("after a: sNext %d copies %d, want 256 KiB and 0", v[1], v[2])
+	}
+	// b still sends from its own cursor (0): copies of what a placed.
+	fb, bb := stFill(b, time.Now())
+	bb.ReleaseRefs()
+	if first, n := rcDataSpan(fb); first != 0 || n != 256<<10 {
+		t.Fatalf("lane b sent %d bytes from %d, want its own copy of 256 KiB from 0", n, first)
+	}
+	if v := rcStream(s); v[1] != 256<<10 || v[2] != 256<<10 {
+		t.Fatalf("after b: sNext %d copies %d, want 256 KiB both", v[1], v[2])
+	}
+
+	// More data; a sends it, then the peer acknowledges 300 KiB on a: b's
+	// cursor (256 KiB) jumps to the ACK edge.
+	rcWrite(t, s, stPattern(256<<10, 256<<10))
+	fa, ba = stFill(a, time.Now())
+	ba.ReleaseRefs()
+	if first, n := rcDataSpan(fa); first != 256<<10 || n != 256<<10 {
+		t.Fatalf("lane a resumed at %d with %d bytes, want 256 KiB at 256 KiB", first, n)
+	}
+	if err := stSendAck(a, 0, 300<<10, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	fb, bb = stFill(b, time.Now())
+	bb.ReleaseRefs()
+	if first, n := rcDataSpan(fb); first != 300<<10 || n != 212<<10 {
+		t.Fatalf("lane b sent %d bytes from %d after the ACK, want 212 KiB from 300 KiB", n, first)
+	}
+	if v := rcStream(s); v[0] != 300<<10 || v[1] != 512<<10 {
+		t.Fatalf("sBase %d sNext %d, want 300 KiB and 512 KiB (the furthest cursor)", v[0], v[1])
+	}
+
+	// A lane attached now starts at the ACK point and carries everything
+	// unacknowledged.
+	c, _ := stAddLane(s, 3, true)
+	rcRaceLane(s, c)
+	if got := stLocked(s, func(*stream) uint64 { return c.rnext }); got != 300<<10 {
+		t.Fatalf("new lane's cursor %d, want sBase 300 KiB", got)
+	}
+	fc, bc := stFill(c, time.Now())
+	bc.ReleaseRefs()
+	if first, n := rcDataSpan(fc); first != 300<<10 || n != 212<<10 {
+		t.Fatalf("new lane sent %d bytes from %d, want 212 KiB from sBase", n, first)
+	}
+	stEnd(s, errClosed)
+}
+
+// TestRaceSlowLaneSkipsDelivered_L08: a slow member (small capacity) never
+// drags the fast one and never resends what the peer already delivered: once
+// the fast member's ACK moved sBase past the slow member's cursor, the slow
+// member's next DATA starts at sBase (M3-D30's clamp).
+func TestRaceSlowLaneSkipsDelivered_L08(t *testing.T) {
+	p := rcPair(2, stOpt{window: 4 << 20}, stOpt{window: 4 << 20})
+	p.ap[1].set(func(f *stPort) { f.capacity = 16 << 10 })
+	data := stPattern(0, 512<<10)
+	rcWrite(t, p.a, data)
+
+	// The slow lane (1) places one segment within its 16 KiB capacity (a
+	// segment is never cut for the cap); the fast lane (0) everything.
+	if n, _ := p.step(1, true, time.Now()); n == 0 {
+		t.Fatal("the slow lane placed nothing")
+	}
+	slowAt := stLocked(p.a, func(*stream) uint64 { return p.al[1].rnext })
+	if slowAt == 0 || slowAt >= 128<<10 {
+		t.Fatalf("slow cursor %d, want one segment", slowAt)
+	}
+	for range 4 {
+		p.step(0, true, time.Now())
+	}
+	// The receiver reads everything and acknowledges on the fast lane.
+	got := stReadN(t, p.b, len(data))
+	if !bytes.Equal(got, data) {
+		t.Fatal("integrity: the bytes read differ")
+	}
+	p.step(0, false, time.Now())
+	if v := rcStream(p.a); v[0] != 512<<10 {
+		t.Fatalf("sBase %d after the ACK, want 512 KiB", v[0])
+	}
+	// The slow lane's capacity frees; it has nothing left to send.
+	p.ap[1].set(func(f *stPort) { f.capacity = 1 << 30 })
+	fs, b := stFill(p.al[1], time.Now())
+	b.ReleaseRefs()
+	if first, n := rcDataSpan(fs); n != 0 {
+		t.Fatalf("the slow lane resent %d delivered bytes from %d", n, first)
+	}
+	// New bytes: it starts at sBase, not at its old cursor.
+	rcWrite(t, p.a, stPattern(512<<10, 64<<10))
+	fs, b = stFill(p.al[1], time.Now())
+	b.ReleaseRefs()
+	if first, n := rcDataSpan(fs); first != 512<<10 || n != 64<<10 {
+		t.Fatalf("the slow lane sent %d bytes from %d, want 64 KiB from 512 KiB", n, first)
+	}
+	p.close(t)
+}
+
+// rcRecv is a race (or bond) receiver with two confirmed lanes.
+func rcRecv(mode Mode) (*Session, *lane, *lane) {
+	s := stSession(stOpt{role: RolePassive, mode: mode, window: 1 << 20})
+	l1, _ := stAddLane(s, 1, true)
+	l2, _ := stAddLane(s, 2, true)
+	if mode == ModeRace {
+		rcRaceLanes(s)
+	}
+	return s, l1, l2
+}
+
+// TestRaceDupNoImmediateAck: a race receiver gets every byte once per
+// member; the second copy is counted (DupBytes) and dropped without an
+// immediate ACK — the delivery cadence covers the first copy (M3-D31). A
+// bond receiver still answers a whole duplicate at once (its sender may
+// have missed an ACK).
+func TestRaceDupNoImmediateAck(t *testing.T) {
+	for _, mode := range []Mode{ModeRace, ModeBond} {
+		s, l1, l2 := rcRecv(mode)
+		d := stPattern(0, 32<<10)
+		if err := stDeliverData(l1, 0, d); err != nil {
+			t.Fatal(err)
+		}
+		gen := stLocked(s, func(st *stream) uint64 { return st.ackGen })
+		if err := stDeliverData(l2, 0, d); err != nil {
+			t.Fatal(err)
+		}
+		gen2, dup := stLocked(s, func(st *stream) uint64 { return st.ackGen }), stLocked(s, func(st *stream) uint64 { return st.dupBytes })
+		if dup != 32<<10 {
+			t.Fatalf("%v: DupBytes %d, want 32 KiB", mode, dup)
+		}
+		if mode == ModeRace && gen2 != gen {
+			t.Fatalf("race: the duplicate bumped an ACK (ackGen %d → %d)", gen, gen2)
+		}
+		if mode == ModeBond && gen2 == gen {
+			t.Fatal("bond: a whole duplicate must still bump an immediate ACK")
+		}
+		if got := s.Status().DupBytes; got != 32<<10 {
+			t.Fatalf("%v: Status.DupBytes %d", mode, got)
+		}
+		stEnd(s, errClosed)
+	}
+}
+
+// TestRaceConflictKillsSecond_L13: a copy that differs in one byte from
+// bytes this side still holds — unread in order, or held out of order — is
+// a violation of the delivering carrier (race copy mismatch); the stream
+// keeps the first copy and reads it intact.
+func TestRaceConflictKillsSecond_L13(t *testing.T) {
+	s, l1, l2 := rcRecv(ModeRace)
+	d := stPattern(0, 48<<10)
+	if err := stDeliverData(l1, 0, d[:16<<10]); err != nil {
+		t.Fatal(err)
+	}
+	if err := stDeliverData(l1, 32<<10, d[32<<10:]); err != nil { // held out of order
+		t.Fatal(err)
+	}
+	for _, at := range []int{100, 40 << 10} { // in order (unread), out of order
+		bad := bytes.Clone(d)
+		bad[at] ^= 0x10
+		err := stDeliverData(l2, 0, bad)
+		if !errors.Is(err, errRaceMismatch) {
+			t.Fatalf("flip at %d: Data = %v, want the race copy mismatch", at, err)
+		}
+	}
+	// The missing middle arrives intact; the stream reads the first copy.
+	if err := stDeliverData(l1, 16<<10, d[16<<10:32<<10]); err != nil {
+		t.Fatal(err)
+	}
+	if got := stReadN(t, s, len(d)); !bytes.Equal(got, d) {
+		t.Fatal("integrity: the stream did not keep the first copy")
+	}
+	stEnd(s, errClosed)
+}
+
+// TestRaceCopyAfterDeliveryDropped_L13: a copy of bytes the application
+// already read is dropped uncompared and counted (no history is kept,
+// PA-35): even a flipped one is no violation, and nothing changes.
+func TestRaceCopyAfterDeliveryDropped_L13(t *testing.T) {
+	s, l1, l2 := rcRecv(ModeRace)
+	d := stPattern(0, 32<<10)
+	if err := stDeliverData(l1, 0, d); err != nil {
+		t.Fatal(err)
+	}
+	if got := stReadN(t, s, len(d)); !bytes.Equal(got, d) {
+		t.Fatal("integrity")
+	}
+	bad := bytes.Clone(d)
+	bad[7] ^= 1
+	if err := stDeliverData(l2, 0, bad); err != nil {
+		t.Fatalf("a copy of read bytes: %v, want dropped", err)
+	}
+	st := s.Status()
+	if st.DupBytes != 32<<10 || st.DeliveredBytes != 32<<10 || st.RxBytes != 32<<10 {
+		t.Fatalf("Dup %d Delivered %d Rx %d, want 32 KiB each", st.DupBytes, st.DeliveredBytes, st.RxBytes)
+	}
+	stEnd(s, errClosed)
+}
+
+// rcPumpCount pumps p link by link until nothing moves and returns the
+// DATA bytes each of a's lanes placed.
+func rcPumpCount(p *stPair) []int {
+	out := make([]int, len(p.al))
+	for {
+		moved := 0
+		for i := range p.al {
+			for _, aToB := range []bool{true, false} {
+				before := len(p.traceAB)
+				n, _ := p.step(i, aToB, time.Now())
+				moved += n
+				if aToB {
+					_, k := rcDataSpan(p.traceAB[before:])
+					out[i] += k
+				}
+			}
+		}
+		if moved == 0 {
+			return out
+		}
+	}
+}
+
+// TestRaceUniqueAccounting_L35: 32 KiB over two members, both copies
+// delivered: the session counters count unique bytes (TxBytes, AckedBytes,
+// RxBytes, DeliveredBytes = 32 KiB), the extra is the sender's
+// Race.CopyBytes and the receiver's DupBytes (32 KiB each), every carrier
+// carried its own 32 KiB, RetransmittedBytes stays 0, and the same
+// delivered value acknowledged on both lanes changes nothing.
+func TestRaceUniqueAccounting_L35(t *testing.T) {
+	p := rcPair(2, stOpt{}, stOpt{})
+	data := stPattern(0, 32<<10)
+	rcWrite(t, p.a, data)
+	per := rcPumpCount(p)
+	if got := stReadN(t, p.b, len(data)); !bytes.Equal(got, data) {
+		t.Fatal("integrity")
+	}
+	p.pump(true)
+	if per[0] != 32<<10 || per[1] != 32<<10 {
+		t.Fatalf("carrier DATA bytes %v, want 32 KiB on each (physical copies)", per)
+	}
+	sa, sb := p.a.Status(), p.b.Status()
+	if sa.TxBytes != 32<<10 || sa.AckedBytes != 32<<10 || sa.RetransmittedBytes != 0 || sa.Race.CopyBytes != 32<<10 {
+		t.Fatalf("sender: Tx %d Acked %d Retx %d CopyBytes %d", sa.TxBytes, sa.AckedBytes, sa.RetransmittedBytes, sa.Race.CopyBytes)
+	}
+	if sb.RxBytes != 32<<10 || sb.DeliveredBytes != 32<<10 || sb.DupBytes != 32<<10 {
+		t.Fatalf("receiver: Rx %d Delivered %d Dup %d", sb.RxBytes, sb.DeliveredBytes, sb.DupBytes)
+	}
+	// Each lane carries the ACK of the same delivered value: nothing moves.
+	for _, l := range p.al {
+		if err := stSendAck(l, 0, 32<<10, 1<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sa2 := p.a.Status(); sa2.AckedBytes != sa.AckedBytes || sa2.TxBytes != sa.TxBytes || sa2.Race != sa.Race {
+		t.Fatalf("a repeated ACK changed the counters: %+v → %+v", sa, sa2)
+	}
+	p.close(t)
+}
+
+// TestRaceBondAccountingProperty_L35: over random member counts, write
+// patterns and capacity limits, the receiver's unique delivered bytes are
+// exactly the first deliveries — the sum over members of the bytes each
+// delivered first — for race and bond alike; the payload beyond the unique
+// bytes is the receiver's DupBytes, which equals the race sender's
+// CopyBytes when every copy arrives, and is 0 in bond; no member and no
+// counter ever exceeds the application's written bytes.
+func TestRaceBondAccountingProperty_L35(t *testing.T) {
+	for seed := range uint64(40) {
+		rng := rand.New(rand.NewPCG(seed, 7))
+		mode := ModeRace
+		if seed%2 == 1 {
+			mode = ModeBond
+		}
+		links := 2 + rng.IntN(3)
+		p := stNewPair(stOpt{mode: mode, window: 1 << 20}, stOpt{mode: mode, window: 1 << 20}, links)
+		if mode == ModeRace {
+			rcRaceLanes(p.a)
+			rcRaceLanes(p.b)
+		}
+		for i := range p.ap {
+			c := int64(8<<10 + rng.IntN(256<<10))
+			p.ap[i].set(func(f *stPort) { f.capacity = c })
+		}
+		first := make([]uint64, links)   // bytes each member delivered first
+		payload := make([]uint64, links) // DATA payload each member delivered
+		var written uint64
+		for range 6 {
+			n := 1 + rng.IntN(96<<10)
+			rcWrite(t, p.a, stPattern(written, n))
+			written += uint64(n)
+			for round := 0; round < 64; round++ {
+				moved := 0
+				for _, i := range rng.Perm(links) {
+					b := p.batch
+					b.Reset(time.Now())
+					p.al[i].Fill(nil, b)
+					for k := range b.Len() {
+						f := b.Frame(k)
+						if f.Header.Type != wire.TypeData {
+							if err := p.bl[i].Control(nil, f.Header, f.Payload); err != nil {
+								t.Fatal(err)
+							}
+							continue
+						}
+						before := stLocked(p.b, func(st *stream) uint64 { return st.rxBytes })
+						if err := stDeliverData(p.bl[i], f.Off, f.Body); err != nil {
+							t.Fatalf("seed %d: %v", seed, err)
+						}
+						first[i] += stLocked(p.b, func(st *stream) uint64 { return st.rxBytes }) - before
+						payload[i] += uint64(len(f.Body))
+					}
+					moved += b.Len()
+					b.ReleaseRefs()
+					// The receiver reads what it can and acknowledges on this
+					// link; the sender frees capacity as the ACK arrives.
+					if k := stLocked(p.b, func(st *stream) uint64 { return st.rTail - st.rRead }); k > 0 {
+						stReadN(t, p.b, int(k))
+					}
+					moved += p.stepAck(i)
+					p.ap[i].set(func(f *stPort) { f.inflight = 0 })
+				}
+				if moved == 0 {
+					break
+				}
+			}
+			sb := p.b.Status()
+			if sb.DeliveredBytes > written || sb.RxBytes > written || p.a.Status().AckedBytes > written {
+				t.Fatalf("seed %d: a counter exceeds the %d written bytes: %+v", seed, written, sb)
+			}
+		}
+		sa, sb := p.a.Status(), p.b.Status()
+		var sumFirst, sumPayload uint64
+		for i := range first {
+			sumFirst += first[i]
+			sumPayload += payload[i]
+			if payload[i] > written {
+				t.Fatalf("seed %d %v: member %d carried %d of %d bytes", seed, mode, i, payload[i], written)
+			}
+		}
+		if sb.DeliveredBytes != written || sumFirst != written || sa.AckedBytes != written {
+			t.Fatalf("seed %d %v: written %d delivered %d Σfirst %d acked %d", seed, mode, written, sb.DeliveredBytes, sumFirst, sa.AckedBytes)
+		}
+		if sumPayload != written+sb.DupBytes {
+			t.Fatalf("seed %d %v: Σpayload %d ≠ written %d + DupBytes %d", seed, mode, sumPayload, written, sb.DupBytes)
+		}
+		if mode == ModeBond && (sb.DupBytes != 0 || sa.Race.CopyBytes != 0) {
+			t.Fatalf("seed %d bond: DupBytes %d CopyBytes %d, want 0", seed, sb.DupBytes, sa.Race.CopyBytes)
+		}
+		if mode == ModeRace && (sa.Race.CopyBytes != sb.DupBytes || sb.DupBytes == 0) {
+			t.Fatalf("seed %d race: the sender's CopyBytes %d ≠ the receiver's DupBytes %d (every copy arrived)", seed, sa.Race.CopyBytes, sb.DupBytes)
+		}
+		p.close(t)
+	}
+}
+
+// stepAck runs link i's b → a Fill and delivers it, late enough that a
+// delayed ACK is due; it returns the frames moved.
+func (p *stPair) stepAck(i int) int {
+	n, _ := p.step(i, false, time.Now().Add(time.Hour))
+	return n
+}
+
+// TestRaceAggregateUnknown_L35: the session status publishes no figure
+// derived from a race's members — no aggregate rate, RTT, latency or
+// goodput (L35: race's are Unknown, PA-36); each carrier reports its own.
+func TestRaceAggregateUnknown_L35(t *testing.T) {
+	ty := reflect.TypeFor[Status]()
+	for i := range ty.NumField() {
+		name := strings.ToLower(ty.Field(i).Name)
+		for _, bad := range []string{"rtt", "rate", "latency", "goodput", "throughput", "bandwidth", "delay"} {
+			if strings.Contains(name, bad) {
+				t.Errorf("Status.%s looks like an aggregate %s", ty.Field(i).Name, bad)
+			}
+		}
+	}
+	for _, f := range []string{"CopyBytes", "Copies"} {
+		if _, ok := reflect.TypeFor[RaceCounters]().FieldByName(f); !ok {
+			t.Errorf("RaceCounters.%s missing", f)
+		}
+	}
+	if n := reflect.TypeFor[RaceCounters]().NumField(); n != 2 {
+		t.Errorf("RaceCounters has %d fields, want CopyBytes and Copies only", n)
+	}
+}
+
+// TestRaceRetransmittedExcludesCopies: race copies are never
+// retransmissions (RetransmittedBytes stays 0 while both members carry
+// every byte); bytes the death of the last data lane requeued are, and the
+// next lane's cursor sends them once, as retransmissions, not as copies.
+func TestRaceRetransmittedExcludesCopies(t *testing.T) {
+	p := rcPair(2, stOpt{}, stOpt{})
+	data := stPattern(0, 200<<10)
+	rcWrite(t, p.a, data)
+	p.pump(false)
+	if got := stReadN(t, p.b, len(data)); !bytes.Equal(got, data) {
+		t.Fatal("integrity")
+	}
+	p.pump(true)
+	if st := p.a.Status(); st.RetransmittedBytes != 0 || st.Race.CopyBytes != 200<<10 {
+		t.Fatalf("copies: Retransmitted %d CopyBytes %d, want 0 and 200 KiB", st.RetransmittedBytes, st.Race.CopyBytes)
+	}
+	p.close(t)
+
+	// One member sends 64 KiB and dies unacknowledged as the last data
+	// lane (M1's requeue from the ACK edge); a new member carries them.
+	s := rcSender(stOpt{})
+	a, _ := stAddLane(s, 1, true)
+	rcRaceLanes(s)
+	rcWrite(t, s, stPattern(0, 64<<10))
+	_, b := stFill(a, time.Now())
+	b.ReleaseRefs()
+	stKillLane(s, a)
+	c, _ := stAddLane(s, 2, true)
+	rcRaceLane(s, c)
+	fs, b := stFill(c, time.Now())
+	b.ReleaseRefs()
+	retx := 0
+	for _, f := range fs {
+		if f.typ == wire.TypeData && f.retx {
+			retx += f.n
+		}
+	}
+	if st := s.Status(); retx != 64<<10 || st.RetransmittedBytes != 64<<10 || st.Race.CopyBytes != 0 {
+		t.Fatalf("after the last lane's death: retx frames %d, Retransmitted %d, CopyBytes %d; want 64 KiB, 64 KiB, 0",
+			retx, st.RetransmittedBytes, st.Race.CopyBytes)
+	}
+	stEnd(s, errClosed)
+}
+
+// TestRaceAckOnFastest: a race receiver's ACK duty sits on the live lane
+// with the lowest SRTT (M3-D33), re-chosen at every ACK decision: with a
+// 5-ms and an 80-ms member the duty first lands on the 80-ms lane (SRTTs
+// unknown at attach) and moves to the 5-ms lane once the SRTTs are known;
+// after warm-up at least 95 % of the ACK frames leave on it. When it dies,
+// the next ACK leaves on the other lane in the next step.
+func TestRaceAckOnFastest(t *testing.T) {
+	p := rcPair(2, stOpt{ackEvery: 16 << 10}, stOpt{ackEvery: 16 << 10})
+	p.pump(true) // SRTTs unknown: the duty is on lane 0 (attach order)
+	if l := stLocked(p.b, func(st *stream) *lane { return st.ackLane }); l != p.bl[0] {
+		t.Fatalf("initial duty on %v", l)
+	}
+	p.bp[0].set(func(f *stPort) { f.srtt = 80 * time.Millisecond })
+	p.bp[1].set(func(f *stPort) { f.srtt = 5 * time.Millisecond })
+	acks := [2]int{}
+	off := 0
+	for round := range 40 {
+		rcWrite(t, p.a, stPattern(uint64(off), 32<<10))
+		off += 32 << 10
+		for i := range 2 {
+			p.step(i, true, time.Now())
+		}
+		stReadN(t, p.b, 32<<10)
+		for i := range 2 {
+			before := len(p.traceBA)
+			p.step(i, false, time.Now())
+			if round >= 4 {
+				acks[i] += stCount(p.traceBA[before:], wire.TypeAck)
+			}
+		}
+	}
+	if total := acks[0] + acks[1]; total == 0 || acks[1]*100 < 95*total {
+		t.Fatalf("ACK frames: %d on the 80-ms lane, %d on the 5-ms lane; want ≥ 95 %% on the 5-ms lane", acks[0], acks[1])
+	}
+	// The fast lane dies: the next ACK leaves on the slow one.
+	p.cut[1] = true
+	stKillLane(p.b, p.bl[1])
+	fs, b := stFill(p.bl[0], time.Now())
+	b.ReleaseRefs()
+	if stCount(fs, wire.TypeAck) == 0 {
+		t.Fatalf("after the fast lane's death the slow lane's next Fill placed %v, want an ACK", fs)
+	}
+	p.close(t)
+}
+
+// TestRaceFinPerMember: each data member places our FIN once its own cursor
+// reached it (M3-D30), so when the member that carried it first dies before
+// it arrives, the other member's FIN completes the stream — before any
+// death step ran.
+func TestRaceFinPerMember(t *testing.T) {
+	p := rcPair(2, stOpt{}, stOpt{})
+	data := stPattern(0, 40<<10)
+	rcWrite(t, p.a, data)
+	if err := p.a.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		fs, b := stFill(p.al[i], time.Now())
+		if n := stCount(fs, wire.TypeFin); n != 1 {
+			t.Fatalf("member %d placed %d FINs, want 1: %v", i, n, fs)
+		}
+		if i == 1 { // member 0's batch is lost with it; member 1's arrives
+			if err := stDeliver(b, p.bl[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b.ReleaseRefs()
+	}
+	got := stReadN(t, p.b, len(data))
+	if !bytes.Equal(got, data) {
+		t.Fatal("integrity")
+	}
+	if n, err := p.b.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after the FIN = %d, %v; want io.EOF", n, err)
+	}
+	// A member never places the FIN twice.
+	fs, b := stFill(p.al[1], time.Now())
+	b.ReleaseRefs()
+	if stCount(fs, wire.TypeFin) != 0 {
+		t.Fatalf("member 1 placed the FIN again: %v", fs)
+	}
+	p.close(t)
+}
