@@ -5,6 +5,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -15,9 +16,12 @@ const FrameDetach FrameType = 0x36
 
 const (
 	tamperLogMax  = 1 << 20  // frames each direction's Log keeps
-	tamperTeeMax  = 16 << 20 // bytes a splice may hold queued before it drops frames
 	tamperReadBuf = 64 << 10 // largest chunk a pump reads at once
 )
+
+// tamperTeeMax is the bytes a splice may hold queued before it drops (and
+// counts) frames; a variable so that its test needs no 16 MiB stream.
+var tamperTeeMax = 16 << 20
 
 // Tamper is a frame-aware man-in-the-middle between a client-side and a
 // server-side net.Conn (the integrity backstop's adversary, M3 design
@@ -38,10 +42,15 @@ const (
 // unlogged. A stream that ends inside a frame is forwarded as it was
 // written.
 //
-// When either conn fails (read or write) the tamper ends, as a relay that
-// lost one side: it closes both conns. It works over a Link inside a
-// synctest bubble and over real sockets. Close joins its goroutines and
-// closes both conns.
+// The tamper ends as a relay with half-close semantics. A direction whose
+// source ends (EOF or a read error) forwards everything it read, then
+// half-closes its destination (CloseWrite where the conn has it, else
+// Close); a direction whose destination write fails stops alone, so the
+// other direction still delivers its tail. Once both directions are done,
+// at Close, or when a SwitchUpstream dial fails, the tamper ends and
+// closes both conns. A direction with an active Splice is done only when
+// its splice writer stops too. It works over a Link inside a synctest
+// bubble and over real sockets. Close joins its goroutines.
 type Tamper struct {
 	mu     sync.Mutex
 	cond   sync.Cond // Hold waits; broadcast by Release and at the end
@@ -65,7 +74,11 @@ type tdir struct {
 	off     int64 // bytes forwarded
 	log     []FrameRec
 	splice  *tsplice // armed or active Splice of this direction
+	own     *tsink   // the active Splice's queue
 	sinks   []*tsink // other tampers' splices fed by this direction's frames
+	live    int      // the pump and an active splice writer, while they serve the direction
+	eof     bool     // the pump's source ended and all it read went out
+	ended   bool     // live reached 0
 }
 
 type opKind uint8
@@ -106,11 +119,12 @@ type tsplice struct {
 
 // tsink queues the frames another tamper tees into an active splice.
 type tsink struct {
-	mu     sync.Mutex
-	q      []tsinkItem
-	bytes  int
-	closed bool
-	wake   chan struct{} // cap 1
+	mu      sync.Mutex
+	q       []tsinkItem
+	bytes   int
+	closed  bool
+	wake    chan struct{} // cap 1
+	dropped atomic.Int64  // frames dropped beyond tamperTeeMax
 }
 
 type tsinkItem struct {
@@ -133,13 +147,13 @@ type tparse struct {
 // were forwarded; a frame of another tamper forwarded by a Splice is
 // logged with Spliced set and that tamper's index.
 type FrameRec struct {
-	Type    FrameType
-	Handle  uint32
-	Flags   uint8
 	Len     int // payload length
-	Fseq    uint32
 	Index   int
 	Off     int64
+	Handle  uint32
+	Fseq    uint32
+	Type    FrameType
+	Flags   uint8
 	Spliced bool
 }
 
@@ -149,6 +163,12 @@ type TamperStats struct {
 	Spliced, Switched, Rewritten           int
 	Held                                   int   // Hold calls that stopped a direction
 	SplicedBytes                           int64 // bytes forwarded from another tamper by Splice
+	// FlipMissed counts FlipBit operations whose bit lay outside their
+	// frame: nothing was flipped and Flipped did not count them.
+	FlipMissed int
+	// SpliceDropped counts the frames an active Splice dropped because more
+	// than 16 MiB of them waited for a stopped (held or blocked) direction.
+	SpliceDropped int64
 }
 
 // NextOfType returns a frame index for the operations that selects the
@@ -163,6 +183,7 @@ func NextOfType(typ FrameType) int { return -1 - int(typ) }
 func NewTamper(client, server net.Conn) *Tamper {
 	t := &Tamper{client: client, server: server, done: make(chan struct{})}
 	t.cond.L = &t.mu
+	t.dirs[0].live, t.dirs[1].live = 1, 1
 	t.wg.Add(2)
 	go t.pump(Up)
 	go t.pump(Down)
@@ -172,7 +193,8 @@ func NewTamper(client, server net.Conn) *Tamper {
 // FlipBit flips bit bit of frame frameN of direction d: bit 0 is the most
 // significant bit of the frame's first header byte, bits count on in
 // network order through payload and CRC trailer, and a negative bit counts
-// from the end (−1 is the CRC's last bit). A bit beyond the frame wraps.
+// from the end (−1 is the CRC's last bit). A bit outside the frame flips
+// nothing and counts as FlipMissed instead of Flipped.
 func (t *Tamper) FlipBit(d Dir, frameN, bit int) {
 	t.arm(d, tamperOp{kind: opFlip, bit: bit}, frameN)
 }
@@ -226,8 +248,11 @@ func (t *Tamper) Splice(d Dir, from *Tamper, at int64) {
 // upstream mid-stream: it dials a fresh server-side conn, closes the old
 // one and forwards the client's remaining bytes into the new one (a write
 // cut by the switch continues there), while Down forwards what the new
-// upstream sends, parsed from a fresh PREFACE on. A failed dial ends the
-// tamper like a lost upstream.
+// upstream sends, parsed from a fresh PREFACE on (bytes of a frame the old
+// upstream had not finished are dropped; frame indices count on). A failed
+// dial ends the tamper like a lost upstream. When Up already ended with
+// the dialer's EOF, the new upstream is half-closed at once; a Down that
+// already ended stays ended.
 func (t *Tamper) SwitchUpstream(dial func() (net.Conn, error)) {
 	c, err := dial()
 	t.mu.Lock()
@@ -243,8 +268,13 @@ func (t *Tamper) SwitchUpstream(dial func() (net.Conn, error)) {
 	t.server = c
 	t.gen++
 	t.stats.Switched++
+	up := &t.dirs[Up.index()]
+	upEOF := up.ended && up.eof
 	t.mu.Unlock()
 	old.Close()
+	if upEOF {
+		halfClose(c)
+	}
 }
 
 // RewriteHandle rewrites the handle of frame frameN of direction d to h,
@@ -271,7 +301,9 @@ func (t *Tamper) Release(d Dir) {
 }
 
 // Log returns a copy of the frames forwarded in direction d so far, in
-// order (the frame tap). It keeps the first 2^20 frames of a direction.
+// order (the frame tap). It keeps the first 2^20 frames of a direction
+// (40 bytes each: at most 40 MiB) and copies them on every call, so read
+// it once after the stimulus rather than polling it.
 func (t *Tamper) Log(d Dir) []FrameRec {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -282,7 +314,13 @@ func (t *Tamper) Log(d Dir) []FrameRec {
 func (t *Tamper) Stats() TamperStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.stats
+	st := t.stats
+	for _, dd := range t.dirs {
+		if dd.own != nil {
+			st.SpliceDropped += dd.own.dropped.Load()
+		}
+	}
+	return st
 }
 
 // Close stops both pumps, closes both conns and joins the goroutines.
@@ -308,6 +346,44 @@ func (t *Tamper) arm(d Dir, op tamperOp, frameN int) {
 	dd := &t.dirs[d.index()]
 	dd.ops = append(dd.ops, op)
 	t.mu.Unlock()
+}
+
+// leave records that one server of direction d (its pump, or the writer
+// of its active splice) stopped; eof: the pump's source ended and all it
+// read went out. When the last one leaves, a source end half-closes d's
+// destination; when both directions are done the tamper ends.
+func (t *Tamper) leave(d Dir, eof bool) {
+	t.mu.Lock()
+	dd := &t.dirs[d.index()]
+	dd.live--
+	dd.eof = dd.eof || eof
+	var dst net.Conn
+	end := false
+	if dd.live == 0 && !t.closed {
+		dd.ended = true
+		if dd.eof {
+			dst = t.client
+			if d == Up {
+				dst = t.server
+			}
+		}
+		end = t.dirs[0].ended && t.dirs[1].ended
+	}
+	t.mu.Unlock()
+	if dst != nil {
+		halfClose(dst)
+	}
+	if end {
+		t.shutdown()
+	}
+}
+
+// halfClose half-closes c where it has CloseWrite, else closes it (net.Pipe
+// and Link conns have no half-close).
+func halfClose(c net.Conn) {
+	if closeWrite(c) != nil {
+		c.Close()
+	}
 }
 
 // shutdown ends the tamper: both pumps stop at their next step, every
@@ -337,10 +413,10 @@ func (t *Tamper) source(d Dir) (net.Conn, uint64) {
 	return t.server, t.gen
 }
 
-// pump forwards one direction until a conn fails or the tamper ends.
+// pump forwards one direction until its source ends, its destination
+// fails or the tamper ends.
 func (t *Tamper) pump(d Dir) {
 	defer t.wg.Done()
-	defer t.shutdown()
 	src, gen := t.source(d)
 	var p tparse
 	buf := make([]byte, tamperReadBuf)
@@ -349,6 +425,7 @@ func (t *Tamper) pump(d Dir) {
 		if n > 0 {
 			p.acc = append(p.acc, buf[:n]...)
 			if !t.forward(d, &p) {
+				t.leave(d, false)
 				return
 			}
 		}
@@ -367,9 +444,7 @@ func (t *Tamper) pump(d Dir) {
 				continue
 			}
 		}
-		if len(p.acc) > 0 {
-			t.emit(d, p.acc, nil, false)
-		}
+		t.leave(d, len(p.acc) == 0 || t.emit(d, p.acc, nil, false))
 		return
 	}
 }
@@ -513,8 +588,14 @@ func (t *Tamper) frame(d Dir, idx int, fb []byte) bool {
 				if &out[0] == &fb[0] {
 					out = slices.Clone(fb)
 				}
-				bits := 8 * len(out)
-				b := ((op.bit % bits) + bits) % bits
+				bits, b := 8*len(out), op.bit
+				if b < 0 {
+					b += bits
+				}
+				if b < 0 || b >= bits {
+					t.stats.FlipMissed++
+					continue
+				}
 				out[b/8] ^= 0x80 >> (b % 8)
 				t.stats.Flipped++
 			}
@@ -650,10 +731,13 @@ func (t *Tamper) emit(d Dir, b []byte, recs []FrameRec, spliced bool) bool {
 // activateLocked starts the armed splice of direction i: its sink and the
 // writer goroutine's place in the wait group. t.mu held, t not closed.
 func (t *Tamper) activateLocked(i int) *tsink {
-	t.dirs[i].splice.active = true
+	dd := &t.dirs[i]
+	dd.splice.active = true
+	dd.own = &tsink{wake: make(chan struct{}, 1)}
+	dd.live++
 	t.stats.Spliced++
 	t.wg.Add(1)
-	return &tsink{wake: make(chan struct{}, 1)}
+	return dd.own
 }
 
 // startSplice registers sink s with from and starts its writer (s nil:
@@ -669,9 +753,11 @@ func (t *Tamper) startSplice(d Dir, from *Tamper, s *tsink) {
 	go t.spliceWriter(d, s)
 }
 
-// spliceWriter forwards the frames teed into s until the tamper ends.
+// spliceWriter forwards the frames teed into s until a write fails or the
+// tamper ends.
 func (t *Tamper) spliceWriter(d Dir, s *tsink) {
 	defer t.wg.Done()
+	defer t.leave(d, false)
 	defer s.close()
 	for {
 		select {
@@ -681,17 +767,21 @@ func (t *Tamper) spliceWriter(d Dir, s *tsink) {
 		}
 		for _, it := range s.take() {
 			if !t.emit(d, it.b, []FrameRec{it.rec}, true) {
-				t.shutdown()
 				return
 			}
 		}
 	}
 }
 
-// push queues a copy of frame b (dropped beyond the bound or once closed).
+// push queues a copy of frame b (dropped and counted beyond the bound;
+// ignored once closed).
 func (s *tsink) push(b []byte, rec FrameRec) {
 	s.mu.Lock()
-	if !s.closed && s.bytes+len(b) <= tamperTeeMax {
+	switch {
+	case s.closed:
+	case s.bytes+len(b) > tamperTeeMax:
+		s.dropped.Add(1)
+	default:
 		s.q = append(s.q, tsinkItem{b: slices.Clone(b), rec: rec})
 		s.bytes += len(b)
 		signal(s.wake)

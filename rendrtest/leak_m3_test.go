@@ -14,8 +14,10 @@ import (
 // no timer, so only the session registry shows it. The leak check fails on
 // a live session (reporting the parked ones) with no goroutine in sight,
 // passes once a live session ends within its settle bound, and passes
-// with none. The gauges are bumped as the session actor does at Start and
-// at park; the end-to-end row with a real parked session follows WP5.
+// with none. A session already live at the baseline is reported at once
+// as an earlier test's leak. The gauges are bumped as the session actor
+// does at Start and at park; the end-to-end row with a real parked session
+// follows WP5.
 func TestAssertNoLeakSeesParkedSession(t *testing.T) {
 	lc := leakCheck{wait: 2 * time.Second}
 	t.Run("parked", func(t *testing.T) {
@@ -46,6 +48,23 @@ func TestAssertNoLeakSeesParkedSession(t *testing.T) {
 			check()
 			if msg := f.failures(); msg != "" {
 				t.Fatalf("failed although the session ended within the bound: %q", msg)
+			}
+		})
+	})
+	t.Run("earlier-test", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			testhooks.LiveSessions.Add(1) // leaked before this test's baseline
+			defer testhooks.LiveSessions.Add(-1)
+			f := &fakeTB{TB: t}
+			check := lc.assert(f)
+			start := time.Now()
+			check()
+			msg := f.failures()
+			if !strings.Contains(msg, "1 session(s) of an earlier test") || strings.Contains(msg, "leak after") {
+				t.Fatalf("an earlier test's session was not reported as such: %q", msg)
+			}
+			if el := time.Since(start); el >= lc.wait {
+				t.Fatalf("the check took %v: it waited for the earlier test's session", el)
 			}
 		})
 	})

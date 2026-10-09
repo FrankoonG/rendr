@@ -197,19 +197,23 @@ func upRun(t *testing.T, r *tamperRig, fs [][]byte) []byte {
 
 // TestTamperFlipBit: FlipBit flips exactly the addressed bit of the
 // addressed frame — bit 40 is the fseq's first bit, −1 the CRC's last bit,
-// a NextOfType selector the next frame of that type — in the given
-// direction only; the receiver sees an fseq or CRC violation; one count
-// per flip.
+// a NextOfType selector the next frame of that type and only that one —
+// in the given direction only; the receiver sees an fseq or CRC
+// violation; one count per flip. A bit outside its frame flips nothing
+// and counts as missed.
 func TestTamperFlipBit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newTamperRig()
 		defer r.close()
 		fs := dataFrames(1, 8, 'u')
 		fs[6] = frameBytes(FrameAck, 7, ackPayload(9))
+		fs[7] = frameBytes(FrameAck, 8, ackPayload(10)) // a second ACK: not flipped
 		r.tm.FlipBit(Up, 3, 40)
 		r.tm.FlipBit(Up, 5, -1)
 		r.tm.FlipBit(Up, NextOfType(FrameAck), 8)
-		r.tm.FlipBit(Down, 3, 40) // the other direction stays untouched
+		r.tm.FlipBit(Up, 0, 8*len(fs[0]))    // one bit beyond the frame
+		r.tm.FlipBit(Up, 1, -8*len(fs[1])-1) // one bit before it
+		r.tm.FlipBit(Down, 3, 40)            // the other direction stays untouched
 		want := slices.Clone(fs)
 		want[3] = slices.Clone(fs[3])
 		want[3][5] ^= 0x80
@@ -226,30 +230,35 @@ func TestTamperFlipBit(t *testing.T) {
 		if f, _, err := wire.DecodeFrame(want[3]); err == nil && f.Fseq == 4 {
 			t.Fatal("the fseq flip left the fseq intact")
 		}
-		if s := r.tm.Stats(); s.Flipped != 3 {
-			t.Fatalf("Flipped = %d, want 3", s.Flipped)
+		if s := r.tm.Stats(); s.Flipped != 3 || s.FlipMissed != 2 {
+			t.Fatalf("Flipped = %d, FlipMissed = %d; want 3 and 2", s.Flipped, s.FlipMissed)
 		}
 		checkLog(t, r.tm.Log(Up), want, seq(8))
 	})
 }
 
 // TestTamperDropFrame: DropFrame forwards every frame but the addressed
-// one (the receiver sees an fseq gap); the tap and the counter show it.
+// one (the receiver sees an fseq gap) — by index, or the first frame of a
+// type after a NextOfType selector and no other; the tap and the counter
+// show it.
 func TestTamperDropFrame(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newTamperRig()
 		defer r.close()
 		fs := dataFrames(1, 6, 'd')
+		fs[1] = frameBytes(FrameAck, 2, ackPayload(3))
+		fs[4] = frameBytes(FrameAck, 5, ackPayload(6)) // a second ACK: forwarded
 		r.tm.DropFrame(Up, 2)
-		r.tm.DropFrame(Up, NextOfType(FrameAck)) // no ACK comes: never fires
-		want := slices.Concat(fs[:2], fs[3:])
+		r.tm.DropFrame(Up, NextOfType(FrameAck))
+		r.tm.DropFrame(Up, NextOfType(FrameDetach)) // no DETACH comes: never fires
+		want := [][]byte{fs[0], fs[3], fs[4], fs[5]}
 		if got := upRun(t, r, fs); !bytes.Equal(got, cat(prefaceBytes(7), slices.Concat(want...))) {
-			t.Fatal("Up after DropFrame differs from the frames without frame 2")
+			t.Fatal("Up after DropFrame differs from the frames without frames 1 and 2")
 		}
-		if s := r.tm.Stats(); s.Dropped != 1 {
-			t.Fatalf("Dropped = %d, want 1", s.Dropped)
+		if s := r.tm.Stats(); s.Dropped != 2 {
+			t.Fatalf("Dropped = %d, want 2", s.Dropped)
 		}
-		checkLog(t, r.tm.Log(Up), want, []int{0, 1, 3, 4, 5})
+		checkLog(t, r.tm.Log(Up), want, []int{0, 3, 4, 5})
 	})
 }
 
@@ -274,13 +283,15 @@ func TestTamperDuplicateFrame(t *testing.T) {
 
 // TestTamperReplayFrame: ReplayFrame re-sends the addressed frame, byte
 // for byte, after a later frame (absolute index, or a count after a
-// NextOfType selector); a replay must follow its frame.
+// NextOfType selector, which selects one frame only); a replay must follow
+// its frame.
 func TestTamperReplayFrame(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newTamperRig()
 		defer r.close()
 		fs := dataFrames(1, 9, 'r')
 		fs[2] = frameBytes(FrameAck, 3, ackPayload(5))
+		fs[3] = frameBytes(FrameAck, 4, ackPayload(6)) // a second ACK: not replayed
 		r.tm.ReplayFrame(Up, 1, 4)
 		r.tm.ReplayFrame(Up, NextOfType(FrameAck), 5) // frame 2, after frame 7
 		want := slices.Concat(fs[:5], [][]byte{fs[1]}, fs[5:8], [][]byte{fs[2]}, fs[8:])
@@ -608,4 +619,281 @@ func TestTamperRealSockets(t *testing.T) {
 	if s := tm.Stats(); s.Flipped != 1 || len(tm.Log(Up)) != 40 {
 		t.Fatalf("Flipped = %d, Log %d frames; want 1 and 40", s.Flipped, len(tm.Log(Up)))
 	}
+}
+
+// TestTamperCloseTail: the tamper ends as a relay with half-close
+// semantics. A side that writes its last frames and closes while the other
+// side keeps writing gets its tail delivered whole before EOF, although the
+// other direction's writes into the closed side fail meanwhile. The
+// failure is made deterministic: the tail is read by the pump and blocked
+// in its write before the closing side's peer starts writing.
+func TestTamperCloseTail(t *testing.T) {
+	for _, closer := range []Dir{Down, Up} {
+		t.Run(map[Dir]string{Down: "passive-closes", Up: "dialer-closes"}[closer], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				d, c := net.Pipe()
+				s, p := net.Pipe()
+				tm := NewTamper(c, s)
+				defer tm.Close()
+				defer d.Close()
+				defer p.Close()
+				// The closing side cs writes its tail and closes; the other
+				// side keeps writing and reads the tail only afterwards.
+				cs, other := p, d
+				tail := cat(prefaceAckBytes(7), slices.Concat(dataFrames(1, 4, 't')...))
+				otherIn := cat(prefaceBytes(7), slices.Concat(dataFrames(1, 50, 'k')...))
+				if closer == Up {
+					cs, other = d, p
+					tail = cat(prefaceBytes(7), slices.Concat(dataFrames(1, 4, 't')...))
+					otherIn = cat(prefaceAckBytes(7), slices.Concat(dataFrames(1, 50, 'k')...))
+				}
+				go cs.Write(tail) // the pump reads it whole and blocks writing to other
+				synctest.Wait()
+				cs.Close()
+				wrote := make(chan struct{})
+				go func() { // other keeps writing into the closed side
+					defer close(wrote)
+					other.Write(otherIn)
+				}()
+				synctest.Wait()
+				got, err := io.ReadAll(other)
+				if !bytes.Equal(got, tail) {
+					t.Fatalf("the other side got %d of the closing side's %d bytes (%v), want all before EOF", len(got), len(tail), err)
+				}
+				<-wrote
+				tm.Close()
+				if n := len(tm.Log(closer)); n != 4 {
+					t.Fatalf("Log(%v) has %d frames, want the 4 of the tail", closer, n)
+				}
+			})
+		})
+	}
+}
+
+// TestTamperSwitchUpstreamCut: a switch while the Up pump is blocked
+// inside a write continues that write on the new upstream (the old one
+// got a prefix, the new one exactly the rest), and Down parses the new
+// upstream from a fresh PREFACE_ACK on: the old upstream's unfinished
+// frame is dropped, the new PREFACE_ACK is no frame, and the new frames
+// are logged with their own headers while indices and offsets count on.
+func TestTamperSwitchUpstreamCut(t *testing.T) {
+	t.Run("mid-write", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d, c := net.Pipe()
+			s, p := net.Pipe()
+			tm := NewTamper(c, s)
+			down := readBackground(d)
+			fs := dataFrames(1, 5, 'm')
+			in := cat(prefaceBytes(7), slices.Concat(fs...))
+			go d.Write(in)
+			head := readN(t, p, wire.PrefaceLen+10) // the frames' write is cut after 10 bytes
+			synctest.Wait()
+			s2, p2 := net.Pipe()
+			up2 := readBackground(p2)
+			tm.SwitchUpstream(func() (net.Conn, error) { return s2, nil })
+			synctest.Wait()
+			if _, err := p.Read(make([]byte, 1)); err == nil {
+				t.Fatal("the old upstream was not closed")
+			}
+			if got := up2.bytes(); !bytes.Equal(cat(head, got), in) {
+				t.Fatalf("old %d + new %d bytes, want the old prefix and exactly the rest of the %d written", len(head), len(got), len(in))
+			}
+			if s := tm.Stats(); s.Switched != 1 || len(tm.Log(Up)) != 5 {
+				t.Fatalf("Switched = %d, Log(Up) %d frames; want 1 and 5", s.Switched, len(tm.Log(Up)))
+			}
+			tm.Close()
+			d.Close()
+			p.Close()
+			p2.Close()
+			up2.result()
+			down.result()
+		})
+	})
+	t.Run("down-reparse", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			r := newTamperRig()
+			defer r.close()
+			oldF := dataFrames(1, 2, 'o')
+			oldDown := cat(prefaceAckBytes(7), slices.Concat(oldF...))
+			write(t, r.passive, cat(oldDown, dataFrames(3, 1, 'o')[0][:9])) // and an unfinished frame
+			synctest.Wait()
+			s2, p2 := net.Pipe()
+			up2 := readBackground(p2)
+			defer up2.result()
+			defer p2.Close()
+			r.tm.SwitchUpstream(func() (net.Conn, error) { return s2, nil })
+			newF := dataFrames(40, 3, 'n')
+			newDown := cat(prefaceAckBytes(9), slices.Concat(newF...))
+			write(t, p2, newDown)
+			synctest.Wait()
+			if got := r.down.bytes(); !bytes.Equal(got, cat(oldDown, newDown)) {
+				t.Fatalf("Down: %d bytes, want the old frames and the new upstream's %d bytes", len(got), len(newDown))
+			}
+			lg := r.tm.Log(Down)
+			if len(lg) != 5 {
+				t.Fatalf("Log(Down) has %d frames, want 2 old and 3 new: %+v", len(lg), lg)
+			}
+			off := int64(len(oldDown) + wire.PrefaceLen)
+			for i, f := range newF {
+				want := FrameRec{Type: FrameData, Len: len(f) - wire.FrameOverhead, Fseq: 40 + uint32(i),
+					Handle: wire.SessionHandle, Index: 2 + i, Off: off}
+				if lg[2+i] != want {
+					t.Fatalf("Log(Down)[%d] = %+v, want %+v", 2+i, lg[2+i], want)
+				}
+				off += int64(len(f))
+			}
+		})
+	})
+}
+
+// TestTamperSpliceLate: a Splice whose offset already passed starts at
+// once (the counter shows it before any further byte), the tamper's own
+// later bytes are discarded, the direction outlives its own sender's EOF,
+// and the copies are the frames as the source tamper forwarded them, its
+// own operations applied.
+func TestTamperSpliceLate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		x, y := newTamperRig(), newTamperRig()
+		defer x.close()
+		defer y.close()
+		yf := dataFrames(1, 3, 'y')
+		yhead := cat(prefaceBytes(7), slices.Concat(yf...))
+		write(t, y.dialer, yhead)
+		synctest.Wait()
+		y.tm.Splice(Up, x.tm, wire.PrefaceLen)
+		if s := y.tm.Stats(); s.Spliced != 1 {
+			t.Fatalf("Spliced = %d right after a Splice at a passed offset, want 1", s.Spliced)
+		}
+		write(t, y.dialer, slices.Concat(dataFrames(4, 2, 'y')...)) // discarded
+		y.dialer.Close()                                            // y's own sender ends: the splice keeps the direction open
+		synctest.Wait()
+		xf := dataFrames(1, 3, 'x')
+		x.tm.FlipBit(Up, 1, -1)
+		write(t, x.dialer, cat(prefaceBytes(8), slices.Concat(xf...)))
+		synctest.Wait()
+		xgot := x.up.bytes()
+		if len(xgot) != wire.PrefaceLen+len(slices.Concat(xf...)) || bytes.Equal(xgot[wire.PrefaceLen:], slices.Concat(xf...)) {
+			t.Fatal("the source tamper did not forward its frames with the flip")
+		}
+		if got := y.up.bytes(); !bytes.Equal(got, cat(yhead, xgot[wire.PrefaceLen:])) {
+			t.Fatalf("y forwarded %d bytes, want its own %d, then the source's frames as forwarded (flip included)", len(got), len(yhead))
+		}
+	})
+}
+
+// TestTamperSpliceDropped: frames teed into a splice whose direction is
+// held queue up to the bound; the ones beyond it are dropped and counted,
+// and every frame is either forwarded after Release or counted.
+func TestTamperSpliceDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		old := tamperTeeMax
+		tamperTeeMax = 600
+		defer func() { tamperTeeMax = old }()
+		x, y := newTamperRig(), newTamperRig()
+		defer x.close()
+		defer y.close()
+		y.tm.Splice(Up, x.tm, 0)
+		y.tm.Hold(Up)
+		xf := dataFrames(1, 40, 'q') // about 3 KB: more than twice the bound
+		write(t, x.dialer, cat(prefaceBytes(8), slices.Concat(xf...)))
+		synctest.Wait()
+		y.tm.Release(Up)
+		synctest.Wait()
+		s := y.tm.Stats()
+		lg := y.tm.Log(Up)
+		if s.SpliceDropped < 1 || int(s.SpliceDropped)+len(lg) != len(xf) {
+			t.Fatalf("SpliceDropped = %d, %d frames forwarded; want at least 1 dropped and %d in all", s.SpliceDropped, len(lg), len(xf))
+		}
+	})
+}
+
+// TestTamperHoldMidStream: a Hold issued while a run of frames is being
+// written lets that write finish and stops at the frame boundary after
+// it, although the sender's next bytes began inside a frame; Release
+// delivers the rest.
+func TestTamperHoldMidStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, c := net.Pipe()
+		s, p := net.Pipe()
+		tm := NewTamper(c, s)
+		down := readBackground(d)
+		fs := dataFrames(1, 6, 'b')
+		in := cat(prefaceBytes(7), slices.Concat(fs...))
+		run := wire.PrefaceLen + len(slices.Concat(fs[:3]...))
+		go d.Write(in[:run+5]) // the first piece ends inside frame 3
+		head := readN(t, p, wire.PrefaceLen+4)
+		synctest.Wait() // the pump is inside the write of frames 0-2
+		tm.Hold(Up)
+		wrote := make(chan struct{})
+		go func() {
+			defer close(wrote)
+			d.Write(in[run+5:])
+		}()
+		up := readBackground(p)
+		synctest.Wait()
+		got := cat(head, up.bytes())
+		lg := tm.Log(Up)
+		if len(got) != run || len(lg) != 3 || lg[2].Off+int64(wire.FrameOverhead+lg[2].Len) != int64(len(got)) {
+			t.Fatalf("held after %d bytes and %d frames, want %d bytes: the end of frame 2", len(got), len(lg), run)
+		}
+		if st := tm.Stats(); st.Held != 1 {
+			t.Fatalf("Held = %d, want 1", st.Held)
+		}
+		tm.Release(Up)
+		<-wrote
+		synctest.Wait()
+		if got := cat(head, up.bytes()); !bytes.Equal(got, in) {
+			t.Fatal("Up after Release lacks bytes")
+		}
+		tm.Close()
+		d.Close()
+		p.Close()
+		up.result()
+		down.result()
+	})
+}
+
+// TestTamperHalfClose: over conns with CloseWrite the tamper relays a
+// half-close: the dialer's EOF reaches the passive after its bytes, Down
+// keeps flowing, an upstream switched in after that EOF is half-closed at
+// once, and the new upstream's EOF ends the tamper with Down complete.
+func TestTamperHalfClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, c := halfPipe()
+		s, p := halfPipe()
+		tm := NewTamper(c, s)
+		defer tm.Close()
+		up, down := readBackground(p), readBackground(d)
+		upIn := cat(prefaceBytes(7), slices.Concat(dataFrames(1, 3, 'h')...))
+		if _, err := d.Write(upIn); err != nil {
+			t.Fatal(err)
+		}
+		d.CloseWrite()
+		if got, err := up.result(); !bytes.Equal(got, upIn) || err != io.EOF {
+			t.Fatalf("the passive got %d of %d bytes and %v, want all and EOF", len(got), len(upIn), err)
+		}
+		downIn := cat(prefaceAckBytes(7), slices.Concat(dataFrames(1, 2, 'g')...))
+		if _, err := p.Write(downIn); err != nil {
+			t.Fatalf("Down stopped with Up's EOF: %v", err)
+		}
+		synctest.Wait()
+		s2, p2 := halfPipe()
+		up2 := readBackground(p2)
+		tm.SwitchUpstream(func() (net.Conn, error) { return s2, nil })
+		if got, err := up2.result(); len(got) != 0 || err != io.EOF {
+			t.Fatalf("the new upstream got %d bytes and %v, want the dialer's EOF at once", len(got), err)
+		}
+		down2 := cat(prefaceAckBytes(9), slices.Concat(dataFrames(1, 2, 'G')...))
+		if _, err := p2.Write(down2); err != nil {
+			t.Fatal(err)
+		}
+		p2.CloseWrite()
+		if got, err := down.result(); !bytes.Equal(got, cat(downIn, down2)) || err != io.EOF {
+			t.Fatalf("the dialer got %d bytes and %v, want both upstreams' %d and EOF", len(got), err, len(downIn)+len(down2))
+		}
+		tm.Close()
+		p.Close()
+		p2.Close()
+		d.Close()
+	})
 }
