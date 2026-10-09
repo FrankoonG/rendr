@@ -79,9 +79,9 @@ func checkShares(t *testing.T, shares []map[uint32]int, from, n int, hs ...uint3
 
 // TestMuxDRRFairness (M3-D10): backlogged views of one trunk get byte
 // shares within [0.8, 1.25] over any 16 writer rounds: two views; three
-// views on a batch of two quanta (the rotating start serves the third);
-// and a view whose deficit grew while it trickled (the deficit cap keeps
-// it from taking whole batches once both are backlogged).
+// views on a batch of two quanta (each round leads with the least recently
+// served view, so the third is served next); and a view whose deficit
+// grows while it trickles (the deficit cap bounds its quota).
 func TestMuxDRRFairness(t *testing.T) {
 	t.Run("two views", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -105,7 +105,7 @@ func TestMuxDRRFairness(t *testing.T) {
 			}
 		})
 	})
-	t.Run("three views, rotating start", func(t *testing.T) {
+	t.Run("three views, rotation", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			s, p := muxRawDialer(t, func(env *Env) { env.Timing.BatchBudget = 2 * defMuxQuantum })
 			openLive(t, s, p, 2, 3, 4)
@@ -119,40 +119,36 @@ func TestMuxDRRFairness(t *testing.T) {
 		})
 	})
 	t.Run("deficit cap", func(t *testing.T) {
-		// A view cut short by the batch's end round after round carries a
-		// deficit; it never grows beyond two quanta, so no later call of
+		// A view whose producer writes 1 KiB and wakes it during each of
+		// its calls ends every turn with most of its quantum unused, and the
+		// wake takes it out of the round (the ring carries it to the next),
+		// so it carries a deficit from round to round on a batch with room
+		// to spare; the deficit never grows beyond two quanta, so no call of
 		// the view gets a quota above 2·Quantum (M3-D10).
 		const q = defMuxQuantum
 		env := hEnv()
 		chunk := env.Bufs.Get(ChunkSize, nil)
-		a := &drrEP{chunk: chunk, avail: 1 << 10}
+		a := &drrEP{chunk: chunk, avail: 1 << 10, wake: true}
 		b := &drrEP{chunk: chunk, avail: 1 << 40}
 		c, views := bareMuxTrunk(env, &nopConn{}, 3, nil)
 		views[0].ep = &drrEP{chunk: chunk}
 		views[1].ep, views[2].ep = a, b
-		for i := 0; i < 24; i++ { // the batch ends right after a's 1 KiB
-			bt := NewBatch(q + 1<<10)
+		built := 0
+		for i := 0; i < 24; i++ {
+			bt := NewBatch(8 * q)
 			bt.Reset(time.Now())
 			a.avail = 1 << 10
 			views[1].Wake()
 			views[2].Wake()
 			c.fillRound(bt)
 			bt.Reset(time.Time{})
+			built = max(built, views[1].deficit)
 		}
-		if views[1].deficit <= q/2 {
-			t.Fatalf("view 2 carries a deficit of %d, want one built up (> Quantum/2)", views[1].deficit)
+		if built <= q/2 {
+			t.Fatalf("view 2 carried a deficit of at most %d, want one built up (> Quantum/2)", built)
 		}
-		a.avail, a.maxRoom = 1<<40, 0
-		for i := 0; i < 4; i++ {
-			bt := NewBatch(8 * q)
-			bt.Reset(time.Now())
-			views[1].Wake()
-			views[2].Wake()
-			c.fillRound(bt)
-			bt.Reset(time.Time{})
-		}
-		if a.maxRoom > 2*q || views[1].deficit > 2*q {
-			t.Fatalf("a call got a quota of %d bytes (deficit %d), want at most 2·Quantum = %d", a.maxRoom, views[1].deficit, 2*q)
+		if a.maxRoom > 2*q || built > 2*q {
+			t.Fatalf("a call got a quota of %d bytes (deficit up to %d), want at most 2·Quantum = %d", a.maxRoom, built, 2*q)
 		}
 	})
 }
@@ -164,11 +160,15 @@ type drrEP struct {
 	chunk   *Buf
 	avail   int
 	maxRoom int
+	wake    bool // a producer wakes the view during each payload call
 }
 
 func (e *drrEP) Fill(c *Conn, b *Batch) {
 	if b.ControlOnly() {
 		return
+	}
+	if e.wake {
+		c.Wake()
 	}
 	e.maxRoom = max(e.maxRoom, b.Room())
 	for e.avail > 0 {

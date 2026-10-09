@@ -11,12 +11,8 @@ import (
 
 // TestMuxRaceOnSharedTrunks (M3 design §A11.2, §A5.11 "race and bond on
 // shared trunks"; M3-D10, M3-D30, M3-D31, M3-D35): two factories p1 and p2
-// over Links of 20 ms RTT shaped to 8 MiB/s each — also under -race: at a
-// quarter of that rate the four views' shares on p1 spread to [0.75, 1.28]
-// under the race detector's interleavings, the writer's uneven rotation in
-// cap-limited rounds that TestMuxCapLimitedSharesFair isolates, so the
-// shares below would measure that defect instead of race on shared
-// trunks; one Peer opens 2 selector sessions (active on p1, the first
+// over Links of 20 ms RTT shaped to 8 MiB/s each (2 MiB/s under -race,
+// R1-11); one Peer opens 2 selector sessions (active on p1, the first
 // factory) and 2 race sessions (a member on each factory), and each sends
 // open-ended bulk B → A for 6 s. So p1's shared carrier holds 4 views (the
 // two selector sessions and a race member of each race session) and p2's
@@ -35,7 +31,10 @@ import (
 // §A5.11), and each carrier carries ≥ 0.85 of its link; a clean end and
 // nothing left after Runtime.Close.
 func TestMuxRaceOnSharedTrunks(t *testing.T) {
-	const rate = 8 << 20
+	rate := float64(8 << 20)
+	if raceEnabled {
+		rate = 2 << 20 // R1-11
+	}
 	synctest.Test(t, func(t *testing.T) {
 		const oneWay, run = 10 * time.Millisecond, 6 * time.Second
 		w := newWorld(t, worldOpts{}, linkSpec{name: "p1", oneWay: oneWay, rate: rate}, linkSpec{name: "p2", oneWay: oneWay, rate: rate})
