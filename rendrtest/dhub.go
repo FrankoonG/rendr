@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -75,6 +76,8 @@ type DatagramHub struct {
 	fjoin    int                         // flood JOINs moved off the clients' IP address
 	floods   []*hflood
 	nflood   uint64
+
+	replayed atomic.Uint64 // datagrams ReplayFlow delivered
 }
 
 // Hub address plan (loopback addresses that nothing real answers): the
@@ -315,8 +318,36 @@ func (h *DatagramHub) Replay(i, k int) {
 
 // ReplayFlow re-delivers the datagrams client from sent as client to's,
 // rewriting their flow header to to's flow: datagram replay across flows
-// (M3 design §A9.2). It panics for an unknown client.
-func (h *DatagramHub) ReplayFlow(from, to int) { panic("unimplemented: M3") }
+// (M3 design §A9.2). The datagrams are the first 16 from sent (the ones
+// kept for Replay), in order; they arrive at the passive socket at once
+// from to's current address, each counted as Injected in to's class and
+// in Stats().Replayed (or Lost when to's queue is full or the socket is
+// closed). from may equal to. It panics for an unknown client.
+func (h *DatagramHub) ReplayFlow(from, to int) {
+	n := h.n
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if from < 0 || from >= len(h.clients) || to < 0 || to >= len(h.clients) {
+		panic("rendrtest: ReplayFlow: no such client")
+	}
+	src, dst := h.clients[from], h.clients[to]
+	now, up := time.Now(), Up.index()
+	for _, b := range slices.Clone(src.rec) {
+		n.count(dst.kind, dcInjected, 1)
+		q := &dst.q[up]
+		if h.sock.closed || h.sock.killed || *q >= n.queue {
+			n.count(dst.kind, dcLost, 1)
+			continue
+		}
+		dg := n.newDgram(len(b))
+		copy(dg.b, b)
+		wire.PutFlowHeader(dg.b, dst.flow)
+		dg.src, dg.cls, dg.q, dg.dir = dst.ext, dst.kind, q, up
+		*q++
+		h.sock.inject(now, dg)
+		h.replayed.Add(1)
+	}
+}
 
 // foreignIn puts b into the passive socket from src at now, bypassing the
 // path; false when the socket is closed or its foreign queue is full.
@@ -531,7 +562,11 @@ func fillNonZero(rng *rand.Rand, b []byte) {
 }
 
 // Stats returns the hub's counters.
-func (h *DatagramHub) Stats() DatagramStats { return h.n.stats() }
+func (h *DatagramHub) Stats() DatagramStats {
+	s := h.n.stats()
+	s.Replayed = h.replayed.Load()
+	return s
+}
 
 // Close closes every endpoint and joins every goroutine the hub started.
 // The conns fail with net.ErrClosed from then on (their first Close still

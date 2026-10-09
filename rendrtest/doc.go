@@ -20,15 +20,23 @@
 // REL (DropNext, CaptureNext), and conn and factory misbehaviour test
 // rendr's distrust of embedder conns. A DatagramHub is a shared passive
 // socket for FromPacketConn whose clients add and strip the raw-UDP flow
-// header, with Rebind, Spoof, Replay and Flood. PacketGen, PacketEcho,
-// PacketSink and PacketVerifier send and check test datagrams.
+// header, with Rebind, Spoof, Replay and Flood. Datagram replay and splice
+// across carriers and flows: DatagramLink.ReplayInto and SpliceFrom,
+// DatagramHub.ReplayFlow. PacketGen, PacketEcho, PacketSink and
+// PacketVerifier send and check test datagrams.
+//
+// A Tamper is a frame-aware man-in-the-middle between any two stream
+// conns (a Link's passive end and the listener, or real sockets): it flips
+// bits, drops, duplicates and replays frames, splices another tamper's
+// stream, switches its upstream as a relay would, rewrites handles, holds
+// a direction, and logs every forwarded frame.
 //
 // Everything works inside testing/synctest bubbles: links and hubs are
 // built from net.Pipe, mutex-guarded queues, channels and timers created
 // by the caller, and their Close joins every goroutine they started. The
-// package imports only the standard library and rendr's wire codec (it
-// never imports package rendr), so rendr's own package-internal tests can
-// use it.
+// package imports only the standard library, rendr's wire codec and its
+// test-hook gauges (it never imports package rendr), so rendr's own
+// package-internal tests can use it.
 //
 // Stimulus proofs: every fault control has a counter, split into all
 // carriers, session carriers and probe carriers, so a test can prove that a

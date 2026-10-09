@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
 const (
@@ -25,6 +27,15 @@ const (
 // and no fd that was not in the baseline: no growth is tolerated. Baseline
 // goroutines and fds may end meanwhile without hiding a new one. On failure
 // t gets the stacks of the new goroutines and the new fds only.
+//
+// The check also requires that no rendr session is live in the process
+// (M3 design Revision 1, R1-24): a session parked without a goroutine, a
+// carrier or an armed timer leaves nothing else to see. The failure
+// report gives the live and the parked sessions. Call the check after
+// every Runtime of the test was closed. Sessions already live at the
+// baseline belong to an earlier test: the check reports them at once as
+// that test's leak (still a failure) and then requires only that no more
+// are live than at the baseline.
 //
 // Every sample (of the baseline and of the check) first runs the garbage
 // collector, because the runtime closes some descriptors only from a
@@ -55,15 +66,22 @@ func (lc leakCheck) assert(t testing.TB) (check func()) {
 		netpollRoundTrip()
 	}
 	base := lc.settle()
+	live0 := testhooks.LiveSessions.Load()
 	return func() {
 		t.Helper()
+		if live0 != 0 {
+			t.Errorf("rendrtest: %d session(s) of an earlier test were still live at the baseline (%d parked now): that test leaked them",
+				live0, testhooks.ParkedSessions.Load())
+		}
 		if lc.real {
 			netpollRoundTrip()
 		}
 		deadline := time.Now().Add(lc.wait)
 		var gs, fds []string
+		var live int64
 		for clean := 0; ; {
-			if gs, fds = leaked(base, lc.sample()); len(gs)+len(fds) == 0 {
+			gs, fds = leaked(base, lc.sample())
+			if live = testhooks.LiveSessions.Load(); len(gs)+len(fds) == 0 && live <= live0 {
 				if clean++; clean == leakSamples {
 					return
 				}
@@ -75,8 +93,8 @@ func (lc leakCheck) assert(t testing.TB) (check func()) {
 			}
 			time.Sleep(leakInterval)
 		}
-		t.Errorf("rendrtest: leak after %v: %d goroutine(s) and %d fd(s) not in the baseline %q\n%s",
-			lc.wait, len(gs), len(fds), fds, strings.Join(gs, "\n\n"))
+		t.Errorf("rendrtest: leak after %v: %d goroutine(s) and %d fd(s) not in the baseline %q; %d live session(s) (%d parked)\n%s",
+			lc.wait, len(gs), len(fds), fds, live, testhooks.ParkedSessions.Load(), strings.Join(gs, "\n\n"))
 	}
 }
 
