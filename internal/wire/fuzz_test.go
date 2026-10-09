@@ -921,8 +921,13 @@ func FuzzFseqWindow_L43(f *testing.F) {
 		last := first
 		for i := 0; i+3 <= len(ops) && i < 3*maxWindowOps; i += 3 {
 			f := nextFseq(m.top, [3]byte(ops[i:i+3]))
-			if got, want := w.Accept(f), m.accept(f); got != want {
+			got, want := w.Accept(f), m.accept(f)
+			if got != want {
 				t.Fatalf("first %#x, op %d: Accept(%#x) = %d, the model says %d", first, i/3, f, got, want)
+			}
+			if got == WindowAhead && ops[i]&4 != 0 { // the caller proved the jump
+				w.Jump(f)
+				m.jump(f)
 			}
 			last = f
 		}

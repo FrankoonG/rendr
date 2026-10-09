@@ -9,10 +9,12 @@ import (
 )
 
 // fseqModel is a map model of FseqWindow's specification (M2 design
-// §A3.7): after Init(first) the FseqWindowBits fseqs before first count as
-// seen; an fseq newer than the newest (serial arithmetic) is new and
-// becomes the newest; one FseqWindowBits or more behind the newest is late;
-// a seen one is a duplicate; any other is new once.
+// §A3.7, as amended by m3 FSEQJUMP): after Init(first) the FseqWindowBits
+// fseqs before first count as seen; an fseq less than FseqWindowBits newer
+// than the newest (serial arithmetic) is new and becomes the newest; one
+// FseqWindowBits or more newer is ahead and changes nothing until jump
+// takes it (then it alone is seen); one FseqWindowBits or more behind the
+// newest is late; a seen one is a duplicate; any other is new once.
 type fseqModel struct {
 	top  uint32
 	seen map[uint32]bool
@@ -28,15 +30,13 @@ func newFseqModel(first uint32) *fseqModel {
 
 func (m *fseqModel) accept(f uint32) WindowVerdict {
 	if f != m.top && int32(f-m.top) > 0 {
-		// Forget what leaves the window: the d numbers from top − 1023 on,
-		// or everything after a jump of the width or more (so a number seen
-		// one lap of 2^32 ago is never taken for seen).
-		if d := f - m.top; d >= FseqWindowBits {
-			clear(m.seen)
-		} else {
-			for v := m.top - (FseqWindowBits - 1); v != f-(FseqWindowBits-1); v++ {
-				delete(m.seen, v)
-			}
+		if f-m.top >= FseqWindowBits {
+			return WindowAhead
+		}
+		// Forget what leaves the window: the d numbers from top − 1023 on
+		// (so a number seen one lap of 2^32 ago is never taken for seen).
+		for v := m.top - (FseqWindowBits - 1); v != f-(FseqWindowBits-1); v++ {
+			delete(m.seen, v)
 		}
 		m.top = f
 		m.seen[f] = true
@@ -50,6 +50,14 @@ func (m *fseqModel) accept(f uint32) WindowVerdict {
 	}
 	m.seen[f] = true
 	return WindowNew
+}
+
+// jump takes the forward jump to f: everything is forgotten, f is the
+// newest and seen.
+func (m *fseqModel) jump(f uint32) {
+	clear(m.seen)
+	m.top = f
+	m.seen[f] = true
 }
 
 // seqModel is a map model of SeqWindow's specification (§A3.7): the first
@@ -213,8 +221,10 @@ func lapGaps(width, start uint64, accept func(uint64) WindowVerdict) string {
 // TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:333) —
 // Init makes everything before the first fseq "seen"; a reordered fseq
 // inside the 1024-frame window is accepted once (not strict +1), a repeated
-// one is a duplicate, one 1024 or more behind the newest is late; jumps of
-// 1024 or more clear the window; u32 serial arithmetic across 2^32 (L14:
+// one is a duplicate, one 1024 or more behind the newest is late; one 1024
+// or more ahead is reported and moves nothing (m3 FSEQJUMP: a frame of
+// another carrier direction never black-holes this one), and Jump takes it
+// and clears the window; u32 serial arithmetic across 2^32 (L14:
 // a preset near the limit wraps and keeps accepting); after a full lap,
 // every fseq a forward move skips is new once, whatever 64-bit word
 // boundaries the move crosses (lapGaps); verdicts equal the map model under
@@ -255,8 +265,18 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 	expect(top-1, WindowLate)
 	top += 1023
 	for _, jump := range []uint32{1024, 1025, 4096, 1 << 20, 1<<31 - 1} {
-		top += jump
+		// Ahead: nothing moves — the window still holds its newest and its
+		// far edge, and the next in order is new.
+		expect(top+jump, WindowAhead)
+		expect(top+jump, WindowAhead)
+		expect(top, WindowDuplicate)
+		expect(top-1024, WindowLate)
+		top++
 		expect(top, WindowNew)
+		// Jump takes it: only the newest is seen.
+		top += jump - 1
+		w.Jump(top)
+		expect(top, WindowDuplicate)
 		expect(top-1, WindowNew)    // inside the new window, never seen
 		expect(top-1023, WindowNew) // the far edge, cleared by the jump
 		expect(top-1023, WindowDuplicate)
@@ -265,6 +285,8 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 	// 2^31 ahead is not newer in serial arithmetic: late, never a jump.
 	expect(top+1<<31, WindowLate)
 	expect(top, WindowDuplicate)
+	// A move inside one window is taken bit by bit: 1023 ahead is new.
+	expect(top+1023, WindowNew)
 
 	// L14: an fseq preset at the u32 limit keeps working across the wrap.
 	w.Init(0xfffffffe)
@@ -301,7 +323,8 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 		for _, jumps := range []bool{true, false} {
 			w.Init(first)
 			m := newFseqModel(first)
-			counts := [3]int{}
+			counts := [4]int{}
+			taken := 0
 			for range 20000 {
 				d, arbitrary := randDelta(rng, FseqWindowBits, jumps)
 				f := m.top + uint32(d)
@@ -313,18 +336,27 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 					t.Fatalf("first %#x, jumps %v: Accept(%#x) = %d, model %d", first, jumps, f, got, want)
 				}
 				counts[got]++
+				if got == WindowAhead && rng.IntN(2) == 0 { // the caller proved half of them
+					w.Jump(f)
+					m.jump(f)
+					taken++
+				}
 			}
-			// Stimulus proof: every verdict occurred many times; without
-			// jumps the newest moved on by more than 20 laps.
-			for v, n := range counts {
+			// Stimulus proof: every verdict but ahead occurred many times;
+			// with jumps, ahead verdicts and taken jumps did too, without
+			// them none, and the newest moved on by more than 20 laps.
+			for v, n := range counts[:WindowAhead] {
 				if n < 1000 {
 					t.Fatalf("first %#x, jumps %v: verdict %d occurred %d times", first, jumps, v, n)
 				}
 			}
+			if jumps && (counts[WindowAhead] < 200 || taken < 100) || !jumps && counts[WindowAhead] != 0 {
+				t.Fatalf("first %#x, jumps %v: %d ahead, %d jumps taken", first, jumps, counts[WindowAhead], taken)
+			}
 			if laps := (m.top - (first - 1)) / FseqWindowBits; !jumps && laps < 20 {
 				t.Fatalf("first %#x: %d laps without jumps, want 20 or more", first, laps)
 			}
-			t.Logf("first %#x, jumps %v: new %d, duplicate %d, late %d", first, jumps, counts[WindowNew], counts[WindowDuplicate], counts[WindowLate])
+			t.Logf("first %#x, jumps %v: new %d, duplicate %d, late %d, ahead %d (%d taken)", first, jumps, counts[WindowNew], counts[WindowDuplicate], counts[WindowLate], counts[WindowAhead], taken)
 		}
 	}
 

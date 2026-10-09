@@ -19,14 +19,24 @@ const (
 	// WindowLate: the number is older than the window can tell (at least
 	// the width behind the newest).
 	WindowLate
+	// WindowAhead (FseqWindow only): the number is at least the width ahead
+	// of the newest — a forward jump the window does not take on the
+	// number's word; it did not move (Jump takes it).
+	WindowAhead
 )
 
 // FseqWindow is the anti-replay window of one datagram-carrier direction
 // (plan:333): FseqWindowBits frames in u32 serial arithmetic (L14).
 // Duplicates and late frames are dropped and counted by the caller, never
-// violations; there is no forward-jump bound (a sender jumps by every frame
-// lost in an outage). A frame reordered inside the window is accepted once
-// (the window is not strict +1, M2-D13).
+// violations. A frame reordered inside the window is accepted once (the
+// window is not strict +1, M2-D13). A forward jump of FseqWindowBits or
+// more is reported (WindowAhead) instead of taken: a sender jumps that far
+// only after losing a window of frames in an outage, while a datagram of
+// another carrier direction or session, whose fseqs start elsewhere (§0.13
+// A6), lands there about half the time — taking it would move the window
+// up to 2^31 ahead and make every genuine frame late. The caller drops such
+// a frame and moves the window (Jump) only when the frame's datagram proves
+// it comes from this direction's sender (m3 FSEQJUMP).
 type FseqWindow struct {
 	top  uint32                      // the newest fseq accepted
 	bits [FseqWindowBits / 64]uint64 // bit (f mod FseqWindowBits) marks fseq f within the window
@@ -43,21 +53,22 @@ func (w *FseqWindow) Init(first uint32) {
 	}
 }
 
-// Accept marks f and returns WindowNew, or reports it as a duplicate or as
-// late. The caller applies it only after the frame's CRC verified. An f
-// newer than the newest accepted (f − newest in 1 … 2^31 − 1, serial
-// arithmetic) moves the window forward — clearing the bits it passes, all
-// of them after a jump of FseqWindowBits or more — and is new; any other f
-// is late when it is FseqWindowBits or more behind the newest, a duplicate
-// when marked, else new (a reordered frame inside the window).
+// Accept marks f and returns WindowNew, or reports it as a duplicate, as
+// late or as ahead. The caller applies it only after the frame's CRC
+// verified. An f less than FseqWindowBits newer than the newest accepted
+// (f − newest in 1 … FseqWindowBits − 1, serial arithmetic) moves the
+// window forward — clearing the bits it passes — and is new; one at least
+// FseqWindowBits newer (f − newest in FseqWindowBits … 2^31 − 1) is ahead
+// and changes nothing; any other f is late when it is FseqWindowBits or
+// more behind the newest, a duplicate when marked, else new (a reordered
+// frame inside the window).
 func (w *FseqWindow) Accept(f uint32) WindowVerdict {
 	d := f - w.top
 	if int32(d) > 0 {
 		if d >= FseqWindowBits {
-			w.bits = [FseqWindowBits / 64]uint64{}
-		} else {
-			clearRing(w.bits[:], uint64(w.top)+1, uint64(d))
+			return WindowAhead
 		}
+		clearRing(w.bits[:], uint64(w.top)+1, uint64(d))
 		w.top = f
 		setRing(w.bits[:], uint64(f))
 		return WindowNew
@@ -66,6 +77,16 @@ func (w *FseqWindow) Accept(f uint32) WindowVerdict {
 		return WindowLate
 	}
 	return markRing(w.bits[:], uint64(f))
+}
+
+// Jump takes the forward jump Accept reported for f: f becomes the newest
+// accepted and the only one marked (the FseqWindowBits − 1 fseqs before it
+// are unseen, so frames of the jumped stream reordered behind f are still
+// accepted once).
+func (w *FseqWindow) Jump(f uint32) {
+	w.bits = [FseqWindowBits / 64]uint64{}
+	w.top = f
+	setRing(w.bits[:], uint64(f))
 }
 
 // minSeqWindowWords is the smallest SeqWindow storage: 1024 bits.
@@ -94,10 +115,11 @@ func (w *SeqWindow) Init(storage []uint64) {
 // Accept marks seq and returns WindowNew, or reports a duplicate, or a seq
 // older than the window (WindowLate: counted as DropLate). The first
 // accepted seq sets the newest; a seq after the newest moves the window
-// forward as FseqWindow's does (seqs do not wrap: the session ends before
-// 2^62, L14); a seq at least the width behind the newest is late, a marked
-// one a duplicate, any other new — also one older than the first accepted,
-// so a reordered start loses nothing.
+// forward by any distance, clearing the bits it passes (seqs do not wrap:
+// the session ends before 2^62, L14; only DGRAMs that passed a carrier's
+// FseqWindow reach it); a seq at least the width behind the newest is
+// late, a marked one a duplicate, any other new — also one older than the
+// first accepted, so a reordered start loses nothing.
 func (w *SeqWindow) Accept(seq uint64) WindowVerdict {
 	width := uint64(len(w.bits)) * 64
 	switch {
