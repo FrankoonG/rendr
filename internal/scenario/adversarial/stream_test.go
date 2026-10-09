@@ -38,12 +38,6 @@ type streamAttack struct {
 	want []string                            // the receiving end's detail names one of these
 }
 
-// opsAll counts every operation that fired on tm.
-func opsAll(tm *rendrtest.Tamper) int {
-	st := tm.Stats()
-	return st.Flipped + st.Dropped + st.Duplicated + st.Replayed + st.Spliced + st.Switched + st.Rewritten
-}
-
 // stat adapts a TamperStats counter to a stimulus counter.
 func stat(f func(st rendrtest.TamperStats) int) func(tm *rendrtest.Tamper) int {
 	return func(tm *rendrtest.Tamper) int { return f(tm.Stats()) }

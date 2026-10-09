@@ -88,8 +88,8 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 	eachSetup(t, func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{})
 		x := w.openPacket(w.datagramPeer())
-		up := startPacketFlow("A → B", x.d, x.p, 4330, 1000, 0)
-		down := startPacketFlow("B → A", x.p, x.d, 4331, 200, 0)
+		up := startPacketFlow(t, "A → B", x.d, x.p, 4330, 1000, 0)
+		down := startPacketFlow(t, "B → A", x.p, x.d, 4331, 200, 0)
 		time.Sleep(time.Second)
 		w.flip.random(rendrtest.Up, 0.01)
 		w.flip.random(rendrtest.Down, 0.01)
@@ -134,7 +134,7 @@ func TestAdvDatagramReplay_L43_L39(t *testing.T) {
 	eachSetup(t, func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{record: true})
 		x := w.openPacket(w.datagramPeer())
-		up := startPacketFlow("A → B", x.d, x.p, 4340, packetRate, 0)
+		up := startPacketFlow(t, "A → B", x.d, x.p, 4340, packetRate, 0)
 		time.Sleep(3 * time.Second)
 		id := target(t, s, x.d.Status())
 		l := w.dlink(linkOf(t, x.d.Status(), id))
@@ -215,7 +215,7 @@ func TestAdvDatagramReplayAcrossCarriers_L43(t *testing.T) {
 		eachSetup(t, func(t *testing.T, s setup) {
 			w := newWorld(t, s, worldOpts{ov: testhooks.Overrides{FirstFseq: fseqPreset}, record: true})
 			x := w.openPacket(w.datagramPeer())
-			up := startPacketFlow("A → B", x.d, x.p, 4360, packetRate, 0)
+			up := startPacketFlow(t, "A → B", x.d, x.p, 4360, packetRate, 0)
 			time.Sleep(2 * time.Second)
 			src, dst, picks := acrossCarriers(t, w, x, false)
 			p0 := x.p.Status()
@@ -250,7 +250,7 @@ func TestAdvDatagramReplayAcrossCarriers_L43(t *testing.T) {
 		eachSetup(t, func(t *testing.T, s setup) {
 			w := newWorld(t, s, worldOpts{ov: testhooks.Overrides{FirstFseq: fseqPreset}, record: true})
 			x := w.openPacket(w.datagramPeer())
-			up := startPacketFlow("A → B", x.d, x.p, 4361, 100, 0)
+			up := startPacketFlow(t, "A → B", x.d, x.p, 4361, 100, 0)
 			time.Sleep(time.Second)
 			src, dst, picks := acrossCarriers(t, w, x, true)
 			var victim rendr.CarrierID
@@ -367,10 +367,10 @@ func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 	eachSetup(t, func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{ov: testhooks.Overrides{FirstFseq: fseqPreset}, record: true, links: 4})
 		b := w.openPacket(w.datagramPeer("c", "d"))
-		fb := startPacketFlow("B", b.d, b.p, 4351, packetRate, 0)
+		fb := startPacketFlow(t, "B", b.d, b.p, 4351, packetRate, 0)
 		time.Sleep(time.Second)
 		a := w.openPacket(w.datagramPeer("a", "b"))
-		fa := startPacketFlow("A", a.d, a.p, 4350, packetRate, 0)
+		fa := startPacketFlow(t, "A", a.d, a.p, 4350, packetRate, 0)
 		time.Sleep(2 * time.Second)
 		ida, idb := target(t, s, a.d.Status()), target(t, s, b.d.Status())
 		src, dst := w.dlink(linkOf(t, a.d.Status(), ida)), w.dlink(linkOf(t, b.d.Status(), idb))

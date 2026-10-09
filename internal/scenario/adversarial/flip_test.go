@@ -90,7 +90,7 @@ const packetRate = 500
 func flipStreamDgram(t *testing.T, s setup, r region) {
 	w := newWorld(t, s, worldOpts{})
 	x := w.openPacket(w.streamPeer())
-	up := startPacketFlow("A → B", x.d, x.p, 4301, packetRate, 0)
+	up := startPacketFlow(t, "A → B", x.d, x.p, 4301, packetRate, 0)
 	time.Sleep(time.Second)
 	w.tamperOf(target(t, s, x.d.Status())).FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDgram), r.bit)
 	flipped := stat(func(st rendrtest.TamperStats) int { return st.Flipped })
@@ -119,7 +119,7 @@ func flipStreamDgram(t *testing.T, s setup, r region) {
 func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	w := newWorld(t, s, worldOpts{})
 	x := w.openPacket(w.datagramPeer())
-	up := startPacketFlow("A → B", x.d, x.p, 4302, packetRate, 0)
+	up := startPacketFlow(t, "A → B", x.d, x.p, 4302, packetRate, 0)
 	time.Sleep(time.Second)
 	if typ == wire.TypeDgram {
 		w.flip.arm(typ, r.bit, target(t, s, x.d.Status()))

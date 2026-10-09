@@ -208,6 +208,17 @@ func fzOps(s, other, script []byte) []byte {
 	return s
 }
 
+// frameSpans returns the offset and size of every frame of stream b.
+func frameSpans(b []byte) [][2]int {
+	var out [][2]int
+	for off := 0; off+wire.HeaderLen <= len(b); {
+		n := wire.FrameOverhead + (int(b[off+2])<<16 | int(b[off+3])<<8 | int(b[off+4]))
+		out = append(out, [2]int{off, n})
+		off += n
+	}
+	return out
+}
+
 // fzOp encodes one operation for the seeds.
 func fzOp(kind byte, pos, arg int) []byte {
 	return []byte{kind, byte(pos >> 16), byte(pos >> 8), byte(pos), byte(arg >> 16), byte(arg >> 8), byte(arg)}
@@ -229,6 +240,24 @@ func FuzzCarrierStream_L43(f *testing.F) {
 		f.Add(append(slices.Clone(sel), fzOp(2, n/4, 100)...))          // 101 bytes duplicated
 		f.Add(append(slices.Clone(sel), fzOp(1, n/5, 4095)...))         // 4 KiB dropped
 		f.Add(append(slices.Clone(sel), fzOp(4, wire.HeaderLen, 0)...)) // cut inside the first header
+		// Frame-aligned damage, which only the fseq check sees: the
+		// smallest DATA frame past the first third (one of at most 4 KiB,
+		// which the drop and duplicate operations cover whole) dropped or
+		// duplicated, and the other recording spliced in at frame
+		// boundaries.
+		fr, other := frameSpans(r.b), frameSpans(rs[1-i].b)
+		k := -1
+		for j := len(fr) / 3; j < len(fr); j++ {
+			if wire.Type(r.b[fr[j][0]]) == wire.TypeData && (k < 0 || fr[j][1] < fr[k][1]) {
+				k = j
+			}
+		}
+		if k < 0 || fr[k][1] > 4096 {
+			f.Fatalf("%s: no DATA frame of at most 4 KiB past its first third", r.name)
+		}
+		f.Add(append(slices.Clone(sel), fzOp(1, fr[k][0], fr[k][1]-1)...))
+		f.Add(append(slices.Clone(sel), fzOp(2, fr[k][0], fr[k][1]-1)...))
+		f.Add(append(slices.Clone(sel), fzOp(5, fr[len(fr)/2][0], other[len(other)/2][0])...))
 	}
 	f.Fuzz(func(t *testing.T, in []byte) {
 		if len(in) < 2 {

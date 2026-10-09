@@ -344,27 +344,6 @@ func (w *world) tamperOf(id rendr.CarrierID) *rendrtest.Tamper {
 	return nil
 }
 
-// tamperStats sums the counters of every session tamper.
-func (w *world) tamperStats() rendrtest.TamperStats {
-	w.mu.Lock()
-	rs := slices.Clone(w.tampers)
-	w.mu.Unlock()
-	var s rendrtest.TamperStats
-	for _, r := range rs {
-		x := r.tm.Stats()
-		s.Flipped += x.Flipped
-		s.Dropped += x.Dropped
-		s.Duplicated += x.Duplicated
-		s.Replayed += x.Replayed
-		s.Spliced += x.Spliced
-		s.Switched += x.Switched
-		s.Rewritten += x.Rewritten
-		s.FlipMissed += x.FlipMissed
-		s.SplicedBytes += x.SplicedBytes
-	}
-	return s
-}
-
 // dconnOf returns the dialer's conn of datagram session carrier id.
 func (w *world) dconnOf(id rendr.CarrierID) *dflipConn {
 	w.t.Helper()
@@ -800,6 +779,7 @@ type pflow struct {
 	start      time.Time
 
 	stop         chan struct{}
+	once         sync.Once
 	wdone, rdone chan struct{}
 	accepted     atomic.Int64 // WriteTo calls that returned (size, nil)
 	read         atomic.Int64 // datagrams ReadFrom returned
@@ -809,16 +789,24 @@ type pflow struct {
 	bad error // the first integrity failure
 }
 
-// startPacketFlow writes on wc and reads on rc (size 0: 1000 bytes).
-func startPacketFlow(name string, wc, rc *rendr.PacketConn, seed uint64, rate, size int) *pflow {
+// startPacketFlow writes on wc and reads on rc (size 0: 1000 bytes). A
+// cleanup stops the writer, whose timer would otherwise outlive a failed
+// test's bubble.
+func startPacketFlow(t testing.TB, name string, wc, rc *rendr.PacketConn, seed uint64, rate, size int) *pflow {
 	if size == 0 {
 		size = 1000
 	}
 	f := &pflow{name: name, w: wc, r: rc, v: rendrtest.NewPacketVerifier(seed), rate: rate, size: size, seed: seed,
 		start: time.Now(), stop: make(chan struct{}), wdone: make(chan struct{}), rdone: make(chan struct{})}
+	t.Cleanup(f.stopOnce)
 	go f.writer()
 	go f.reader()
 	return f
+}
+
+// stopOnce tells the writer to stop (idempotent).
+func (f *pflow) stopOnce() {
+	f.once.Do(func() { close(f.stop) })
 }
 
 func (f *pflow) writer() {
@@ -870,11 +858,7 @@ func (f *pflow) reader() {
 // halt stops the writer and waits for it; a WriteTo error fails the test.
 func (f *pflow) halt(t testing.TB) {
 	t.Helper()
-	select {
-	case <-f.stop:
-	default:
-		close(f.stop)
-	}
+	f.stopOnce()
 	select {
 	case <-f.wdone:
 	case <-time.After(time.Minute):
