@@ -315,6 +315,35 @@ func TestTamperReplayFrame(t *testing.T) {
 	})
 }
 
+// TestTamperReplayCountsAttempts: Replayed counts a replay when its re-send
+// is attempted, as Flipped, Dropped and Duplicated count when they act on
+// their frame — also when that write fails because the receiver went away
+// (a replayed frame that kills its carrier usually meets a receiver that
+// closes while the tamper still writes): the stimulus fired. The failed
+// copy is not in the frame tap, which logs what went out.
+func TestTamperReplayCountsAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, c := net.Pipe()
+		s, p := net.Pipe()
+		tm := NewTamper(c, s)
+		defer func() {
+			tm.Close()
+			d.Close()
+			p.Close()
+		}()
+		fs := dataFrames(1, 3, 'x')
+		tm.ReplayFrame(Up, 0, 1) // frame 0 again after frame 1
+		go d.Write(cat(prefaceBytes(7), slices.Concat(fs...)))
+		readN(t, p, wire.PrefaceLen+len(fs[0])+len(fs[1])) // everything before the replay
+		p.Close()                                          // the receiver goes away: the replay's write fails
+		synctest.Wait()
+		if st := tm.Stats(); st.Replayed != 1 {
+			t.Fatalf("Replayed = %d after a replay whose write failed, want 1", st.Replayed)
+		}
+		checkLog(t, tm.Log(Up), fs[:2], []int{0, 1})
+	})
+}
+
 // TestTamperRewriteHandle: RewriteHandle puts another handle into the
 // addressed frame, with a valid CRC when asked (a broken peer: the frame
 // decodes with the new handle) or the stale one (a damaged path: ErrCRC).
@@ -352,6 +381,40 @@ func TestTamperRewriteHandle(t *testing.T) {
 		}
 		if lg := r.tm.Log(Up); lg[1].Handle != 7 || lg[3].Handle != 9 {
 			t.Fatalf("Log handles %d and %d, want 7 and 9", lg[1].Handle, lg[3].Handle)
+		}
+	})
+}
+
+// TestTamperRewriteDetachHandle: on a DETACH, whose header handle is 0 (a
+// carrier-level frame), RewriteHandle rewrites the handle the DETACH ends,
+// in its payload: with a valid CRC the frame decodes as a DETACH of the new
+// handle (a broken peer detaching a handle the trunk never had), the
+// header handle stays 0; the tap logs the header as forwarded.
+func TestTamperRewriteDetachHandle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newTamperRig()
+		defer r.close()
+		p := make([]byte, wire.DetachLen)
+		wire.PutDetach(p, &wire.Detach{Handle: 3, Reason: wire.DetachEnded})
+		fs := dataFrames(1, 3, 'x')
+		fs[1] = frameBytes(FrameDetach, 2, p)
+		r.tm.RewriteHandle(Up, NextOfType(FrameDetach), 9, true)
+		got := upRun(t, r, fs)[wire.PrefaceLen+len(fs[0]):]
+		f, _, err := wire.DecodeFrame(got[:len(fs[1])])
+		if err != nil || f.Type != wire.TypeDetach || f.Handle != 0 {
+			t.Fatalf("the rewritten DETACH decodes as %v handle %d, err %v; want a DETACH with header handle 0", f.Type, f.Handle, err)
+		}
+		if d, err := wire.ParseDetach(f.Payload); err != nil || d.Handle != 9 || d.Reason != wire.DetachEnded {
+			t.Fatalf("the rewritten DETACH ends %+v (err %v), want handle 9, reason ended", d, err)
+		}
+		if !bytes.Equal(got[len(fs[1]):], fs[2]) {
+			t.Fatal("the frame after the DETACH changed")
+		}
+		if s := r.tm.Stats(); s.Rewritten != 1 {
+			t.Fatalf("Rewritten = %d, want 1", s.Rewritten)
+		}
+		if lg := r.tm.Log(Up); lg[1].Type != FrameDetach || lg[1].Handle != 0 {
+			t.Fatalf("Log[1] = %+v, want the DETACH with header handle 0", lg[1])
 		}
 	})
 }

@@ -8,8 +8,10 @@
 // application data, and never harms another session beyond a migration.
 //
 // Every row runs against each carrier setup of the suite's setup table:
-// dedicated carriers of selector, bond and race sessions, and (with the
-// MUX half of the set) four sessions sharing one MUX trunk. The scenarios
+// dedicated carriers of selector, bond and race sessions, and four
+// selector, bond or race sessions sharing one MUX trunk per link (the MUX
+// rows add TestAdvMuxSpliceCrossTrunk_L43 and
+// TestAdvMuxHandleConfusion_L43_L14). The scenarios
 // run two Runtimes built with testhooks.NewRuntime, joined by rendrtest
 // links inside testing/synctest bubbles, and drive them only through the
 // public API. Each proves that its stimulus fired (the tamper's or the

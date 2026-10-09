@@ -1,7 +1,6 @@
 package adversarial
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -17,23 +16,39 @@ type region struct {
 	name string
 	bit  int
 	want []string // the detail names one of these (none: any check)
+	// mux replaces want on a MUX trunk (nil: want). There the flipped
+	// handle may name another live view, which the frame's CRC refuses
+	// (the trunk's handle rules first meet a zero handle or one never
+	// opened).
+	mux []string
 }
+
+// wants returns the details a receiving end may name in setup s.
+func (r region) wants(s setup) []string {
+	if s.mux && r.mux != nil {
+		return r.mux
+	}
+	return r.want
+}
+
+// muxHandle are the details of a handle flip on a MUX trunk.
+var muxHandle = []string{"handle", "crc mismatch"}
 
 // regions are the seven regions of §A9.3's bit-flip row, the handle
 // twice (to zero and to another view). The type, flags
 // and length flips break whichever check meets them first (header bounds,
 // the CRC over a shifted frame); the others name their check.
 var regions = []region{
-	{"type", 7, nil},   // the type's last bit: DATA ↔ ACK, SCHED → 0x15, DGRAM → PACK, REL → RACK
-	{"flags", 15, nil}, // the flags' last bit
-	{"len", 39, nil},   // the length's last bit: the frame grows or shrinks by one byte
-	{"fseq", 71, []string{"fseq"}},
-	{"handle", 103, []string{"handle"}}, // handle 1 → 0 on a session frame: the codec's zero-handle rule
+	{"type", 7, nil, nil},   // the type's last bit: DATA ↔ ACK, SCHED → 0x15, DGRAM → PACK, REL → RACK
+	{"flags", 15, nil, nil}, // the flags' last bit
+	{"len", 39, nil, nil},   // the length's last bit: the frame grows or shrinks by one byte
+	{"fseq", 71, []string{"fseq"}, nil},
+	{"handle", 103, []string{"handle"}, muxHandle}, // handle 1 → 0 on a session frame: the codec's zero-handle rule
 	// handle 1 → 3: a session frame for a view a dedicated carrier does
 	// not have (the trunk's routing, checked before the CRC)
-	{"handle3", 102, []string{"no such view"}},
-	{"payload", 8*wire.HeaderLen + 3, []string{"crc mismatch"}},
-	{"crc", -1, []string{"crc mismatch"}},
+	{"handle3", 102, []string{"no such view"}, muxHandle},
+	{"payload", 8*wire.HeaderLen + 3, []string{"crc mismatch"}, nil},
+	{"crc", -1, []string{"crc mismatch"}, nil},
 }
 
 // TestAdvBitFlipRegions_L41_L43: one bit flipped in each region (type,
@@ -46,8 +61,11 @@ var regions = []region{
 // row's Death migrations. Datagram carriers — a DGRAM and a REL of the
 // dialer: the datagram is dropped and counted (the receiving carrier's
 // Dropped), no carrier dies, the REL is retransmitted, and the verifier
-// sees no damaged datagram. DETACH frames exist only on MUX trunks (the
-// MUX half of the set).
+// sees no damaged datagram. DETACH frames exist only on MUX trunks: on a
+// stream trunk the DETACH an idle fifth session's view places at its
+// clean end kills the trunk at the passive (its four busy sessions
+// migrate); on a datagram trunk the REL that carries the first session's
+// DETACH is dropped, counted and retransmitted.
 func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	stream := []struct {
 		name string
@@ -65,20 +83,36 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 					runStream(t, s, streamAttack{dir: f.dir, typ: f.typ, sch: f.typ == rendrtest.FrameSched,
 						arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.FlipBit(f.dir, rendrtest.NextOfType(f.typ), r.bit) },
 						ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
-						want: r.want})
+						want: r.want, muxWant: r.mux})
 				})
 			})
 		}
+	}
+	for _, r := range regions {
+		t.Run("stream/DETACH/"+r.name, func(t *testing.T) {
+			eachSetupOf(t, muxSetups(), func(t *testing.T, s setup) {
+				runStream(t, s, streamAttack{dir: rendrtest.Up, typ: rendrtest.FrameDetach, detach: true,
+					arm: func(tm *rendrtest.Tamper, _ *pair) {
+						tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDetach), r.bit)
+					},
+					ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
+					want: r.want, muxWant: r.mux})
+			})
+		})
 	}
 	for _, r := range regions {
 		t.Run("stream/DGRAM/"+r.name, func(t *testing.T) {
 			eachSetup(t, func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
 		})
 	}
-	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel} {
+	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel, wire.TypeDetach} {
+		ss := setups()
+		if typ == wire.TypeDetach {
+			ss = muxSetups()
+		}
 		for _, r := range regions {
 			t.Run("datagram/"+typ.String()+"/"+r.name, func(t *testing.T) {
-				eachSetup(t, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
+				eachSetupOf(t, ss, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
 			})
 		}
 	}
@@ -102,7 +136,7 @@ func flipStreamDgram(t *testing.T, s setup, r region) {
 	flipped := stat(func(st rendrtest.TamperStats) int { return st.Flipped })
 	waitFor(t, 5*time.Second, "the flip (stimulus)", func() bool { return w.fired(flipped) > 0 })
 	hit := w.hit(t, flipped)
-	violated(t, "the attacked carrier", endDead(t, "the passive", x.p.Status, hit.id), r.want...)
+	violated(t, "the attacked carrier", endDead(t, "the passive", x.p.Status, hit.id), r.wants(s)...)
 	time.Sleep(time.Second)
 	for _, up := range ups {
 		up.halt(t)
@@ -124,9 +158,10 @@ func flipStreamDgram(t *testing.T, s setup, r region) {
 // datagrams per second dialer → passive each; one bit of a frame of type
 // typ is flipped in one datagram the dialer writes — the next DGRAM on the
 // first session's attacked carrier after a second, or the next REL of any
-// session carrier from the first session's end on (its FIN). The
-// receiving carrier drops the datagram's rest and counts it; nothing dies;
-// a REL is retransmitted.
+// session carrier from the first session's end on (its FIN), or (a MUX
+// trunk) the next REL that carries a DETACH: the first session's, the last
+// frame its ending view places. The receiving carrier drops the
+// datagram's rest and counts it; nothing dies; a REL is retransmitted.
 func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	w := newWorld(t, s, worldOpts{})
 	xs := w.openPacketN(w.datagramPeer())
@@ -142,8 +177,8 @@ func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	for _, f := range ups {
 		f.halt(t)
 	}
-	if typ == wire.TypeRel {
-		w.flip.arm(typ, r.bit, 0) // the next REL: the first session's FIN
+	if typ == wire.TypeRel || typ == wire.TypeDetach {
+		w.flip.arm(typ, r.bit, 0) // the next REL: the first session's FIN; or its DETACH
 	}
 	x.endPacket(t, up)
 	id, n := w.flip.targeted()
@@ -155,24 +190,40 @@ func flipDatagram(t *testing.T, s setup, typ wire.Type, r region) {
 	if d := w.deaths(); len(d[0])+len(d[1]) != 0 {
 		t.Fatalf("carriers died: dialer %+v, passive %+v", d[0], d[1])
 	}
-	pc, ok := carrierOf(x.p.Status(), id)
+	// A DETACH follows the first session's end: its trunk's counters are
+	// read through a session that still has it.
+	y := x
+	if typ == wire.TypeDetach {
+		y = xs[1]
+	}
+	pc, ok := carrierOf(y.p.Status(), id)
 	if !ok || pc.Dropped == 0 {
 		t.Fatalf("the passive's carrier %d did not count the damaged datagram: %+v", id, pc)
 	}
-	if typ == wire.TypeRel {
-		if dc, ok := carrierOf(x.d.Status(), id); !ok || dc.Retransmits == 0 {
+	if typ == wire.TypeRel || typ == wire.TypeDetach {
+		if dc, ok := carrierOf(y.d.Status(), id); !ok || dc.Retransmits == 0 {
 			t.Fatalf("the damaged REL was not retransmitted: %+v", dc)
 		}
 	}
 	// Only the damaged datagram can be missing (a race member's copy
-	// covers it); the neighbours lose nothing.
-	if lost := up.lost(); lost > 1 || res.Unique == 0 {
-		t.Fatalf("load: %d lost of %d accepted (want at most the damaged one)", lost, up.accepted.Load())
+	// covers it); the neighbours lose nothing. On a MUX trunk the damaged
+	// DGRAM is the next one on the trunk, whichever session's it was (a
+	// datagram carries one 1000-byte DGRAM): one datagram of all of them.
+	if res.Unique == 0 {
+		t.Fatalf("load: nothing of %d accepted arrived", up.accepted.Load())
 	}
-	for _, f := range ups[1:] {
-		if f.integrity(t); f.lost() != 0 {
-			t.Fatalf("load: %s lost %d datagrams", f.name, f.lost())
+	var lost int64
+	for i, f := range ups {
+		if i > 0 {
+			f.integrity(t)
 		}
+		if k := f.lost(); k > 1 || k > 0 && i > 0 && !s.mux {
+			t.Fatalf("load: %s lost %d of %d datagrams (want at most the damaged one)", f.name, k, f.accepted.Load())
+		}
+		lost += f.lost()
+	}
+	if lost > 1 {
+		t.Fatalf("load: the sessions lost %d datagrams, want at most the damaged one", lost)
 	}
 	neighboursPacket(t, s, xs, 0, 0)
 	endPackets(t, xs[1:], ups[1:])
@@ -189,9 +240,14 @@ func deathsAre(t testing.TB, s setup, dst, pst func() rendr.SessionStatus, d uin
 	if s.mode == rendr.ModeSelector {
 		p = d
 	}
-	waitFor(t, 10*time.Second, fmt.Sprintf("Death migrations %d (dialer) and %d (passive)", d, p), func() bool {
-		return dst().Migrations.Death >= d && pst().Migrations.Death >= p
-	})
+	deadline := time.Now().Add(10 * time.Second)
+	for dst().Migrations.Death < d || pst().Migrations.Death < p {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out after 10s waiting for Death migrations %d (dialer) and %d (passive): dialer %+v, passive %+v",
+				d, p, dst().Migrations, pst().Migrations)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if dm, pm := dst().Migrations, pst().Migrations; dm.Death != d || pm.Death != p {
 		t.Fatalf("Death migrations: dialer %+v, passive %+v; want Death %d and %d", dm, pm, d, p)
 	}
