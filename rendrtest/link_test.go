@@ -442,6 +442,144 @@ func TestLinkBlackholeDropsAndDeadDials(t *testing.T) {
 	})
 }
 
+// TestLinkBlackholeHoldsCloses: in BlackholeCloses mode a carrier's close
+// does not cross a blackhole — the far end stays open, its writes vanish
+// (counted as Dropped) and its reads see nothing — until the blackhole is
+// lifted, the mode is set back to BlackholeBytes, or Kill ends the
+// carrier; then the far end reads EOF at that instant. ClosesHeld counts
+// each held carrier once (both ends closing included) and the carrier's
+// CarrierInfo.CloseHeld marks it; in the default mode
+// (BlackholeBytes) the close crosses the blackhole at once and nothing is
+// held. Rows run on fresh session carriers of one link.
+func TestLinkBlackholeHoldsCloses(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, LinkConfig{Name: "bh-close"})
+		defer h.l.Close()
+		h.l.SetDelay(5*time.Millisecond, 0)
+		held := func() Counts { return h.l.Stats().Session }
+
+		// open dials a session carrier, blackholes the link and closes the
+		// dialer's end (or the passive's): the surviving end and its reader.
+		open := func(closeDialer bool) (live net.Conn, ra *readAsync, seq int) {
+			t.Helper()
+			seq = h.l.NextSeq()
+			cli, srv := h.session()
+			gone, live := cli, srv
+			if !closeDialer {
+				gone, live = srv, cli
+			}
+			ra = readBackground(live)
+			h.l.SetBlackhole(true)
+			gone.Close()
+			synctest.Wait()
+			return live, ra, seq
+		}
+		// stillOpen checks that the close has not crossed after a while: the
+		// survivor's reader waits, its write vanishes, the carrier is open.
+		stillOpen := func(row string, live net.Conn, ra *readAsync, seq int) {
+			t.Helper()
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+			select {
+			case <-ra.done:
+				_, err := ra.result()
+				t.Fatalf("%s: the close crossed the blackhole: the far end's Read ended with %v", row, err)
+			default:
+			}
+			d0 := held().Dropped
+			if _, err := live.Write(make([]byte, 100)); err != nil {
+				t.Fatalf("%s: the far end's Write failed while the close was held: %v", row, err)
+			}
+			synctest.Wait()
+			if d := held().Dropped - d0; d != 100 {
+				t.Fatalf("%s: the far end's 100 bytes: %d dropped, want 100", row, d)
+			}
+			if ci := h.l.Carriers()[seq]; ci.Closed || !ci.CloseHeld {
+				t.Fatalf("%s: carrier %+v while its close is held, want open with CloseHeld", row, ci)
+			}
+		}
+		// crossed checks that the survivor read EOF at the release instant.
+		crossed := func(row string, live net.Conn, ra *readAsync, seq int, release time.Time) {
+			t.Helper()
+			synctest.Wait()
+			select {
+			case <-ra.done:
+			default:
+				t.Fatalf("%s: the held close did not cross at the release", row)
+			}
+			at := time.Now()
+			if _, err := ra.result(); err != io.EOF || !at.Equal(release) {
+				t.Fatalf("%s: the far end's Read ended with %v at release %+v, want io.EOF at once", row, err, at.Sub(release))
+			}
+			if !h.l.Carriers()[seq].Closed {
+				t.Fatalf("%s: the carrier is open after the release", row)
+			}
+			if _, err := live.Write([]byte{1}); err == nil {
+				t.Fatalf("%s: the far end's Write succeeded after the close crossed", row)
+			}
+		}
+
+		// The default mode: the close crosses the blackhole at once.
+		_, ra, seq0 := open(true)
+		select {
+		case <-ra.done:
+		default:
+			t.Fatal("BlackholeBytes: the dialer's close did not cross the blackhole")
+		}
+		if _, err := ra.result(); err != io.EOF {
+			t.Fatalf("BlackholeBytes: the far end's Read ended with %v, want io.EOF", err)
+		}
+		if n, ci := held().ClosesHeld, h.l.Carriers()[seq0]; n != 0 || ci.CloseHeld {
+			t.Fatalf("BlackholeBytes: ClosesHeld %d, carrier %+v; want 0 and no CloseHeld", n, ci)
+		}
+		h.l.SetBlackhole(false)
+
+		// The dialer's close, held until the blackhole is lifted.
+		h.l.SetBlackholeMode(BlackholeCloses)
+		live, ra, seq := open(true)
+		stillOpen("dialer close", live, ra, seq)
+		if n := held().ClosesHeld; n != 1 {
+			t.Fatalf("dialer close: ClosesHeld %d, want 1", n)
+		}
+		release := time.Now()
+		h.l.SetBlackhole(false)
+		crossed("dialer close / lift", live, ra, seq, release)
+
+		// The passive's close, held until the mode goes back to
+		// BlackholeBytes (the link stays blackholed).
+		live, ra, seq = open(false)
+		stillOpen("passive close", live, ra, seq)
+		release = time.Now()
+		h.l.SetBlackholeMode(BlackholeBytes)
+		crossed("passive close / mode", live, ra, seq, release)
+		h.l.SetBlackhole(false)
+		h.l.SetBlackholeMode(BlackholeCloses)
+
+		// Both ends close: one held carrier, counted once; Kill ends it.
+		live, ra, seq = open(true)
+		stillOpen("kill", live, ra, seq)
+		live.Close()
+		synctest.Wait()
+		if n := held().ClosesHeld; n != 3 {
+			t.Fatalf("both ends closed: ClosesHeld %d, want 3 (one per held carrier)", n)
+		}
+		if h.l.Carriers()[seq].Closed {
+			t.Fatal("both ends closed: the carrier closed while blackholed")
+		}
+		k0 := held().Killed
+		if n := h.l.Kill(); n != 1 || held().Killed != k0+1 {
+			t.Fatalf("Kill ended %d carriers (Killed %d → %d), want the held one", n, k0, held().Killed)
+		}
+		if !h.l.Carriers()[seq].Closed {
+			t.Fatal("Kill: the held carrier is still open")
+		}
+		h.l.SetBlackhole(false)
+		if _, err := ra.result(); err == nil {
+			t.Fatal("Kill: the far end's Read did not end")
+		}
+	})
+}
+
 // TestLinkCorruptNextFlipsOneChunk: CorruptNext damages exactly one byte of
 // the next chunk in its direction (M1a behaviour).
 func TestLinkCorruptNextFlipsOneChunk(t *testing.T) {
