@@ -25,7 +25,7 @@ import (
 //     race) moves 64 MiB (16 MiB under -race, the same timeline) over two
 //     shaped Links while a carrier of the session is killed every 10 s.
 //   - TestPacketRaceSmoke_CR: a packet race session at 10,000 datagrams
-//     per second (1,000 under -race) for 60 virtual seconds over the
+//     per second for 60 virtual seconds (1,000 for 30 s under -race) over the
 //     DatagramLink and the DatagramHub, a member closed every 10 s (the
 //     C-A smoke's runSmoke, which already runs selector and bond).
 //   - TestIdleSessionsPark_CR: 1,000 sessions (250 under -race) of the
@@ -291,7 +291,7 @@ func runStreamSmoke(t *testing.T, mode rendr.Mode, size int64) {
 
 // TestPacketRaceSmoke_CR: the C-A packet smoke (runSmoke) for a race
 // session over the DatagramLink and the DatagramHub: 60 virtual seconds
-// at 10,000 datagrams per second (1,000 under -race) and 1,000 back, a
+// at 10,000 datagrams per second (30 s at 1,000 under -race) and 1,000 back, a
 // member's carrier closed every 10 s in turn. On top of runSmoke's
 // checks (no corrupt, resized or application-duplicated datagram, losses
 // only near kills or counted, the counters adding up, nothing left after
@@ -299,9 +299,12 @@ func runStreamSmoke(t *testing.T, mode rendr.Mode, size int64) {
 // direction, the receiver counts the members' copies as Duplicates, and
 // the sender's copies as Race.Copies.
 func TestPacketRaceSmoke_CR(t *testing.T) {
-	rate := 10000
+	rate, duration := 10000, 60*time.Second
 	if loopbackRace {
-		rate = 1000
+		// R1-23's first lever (R2-37): the race lane runs 30 virtual
+		// seconds (two kills) at 1,000 datagrams per second, with the
+		// same criteria.
+		rate, duration = 1000, 30*time.Second
 	}
 	for _, tr := range []struct {
 		name string
@@ -312,7 +315,7 @@ func TestPacketRaceSmoke_CR(t *testing.T) {
 				live0, parked0 := testhooks.LiveSessions.Load(), testhooks.ParkedSessions.Load()
 				n := tr.net()
 				defer n.close()
-				runSmoke(t, n, smokeRun{mode: rendr.ModeRace, duration: 60 * time.Second, every: 10 * time.Second,
+				runSmoke(t, n, smokeRun{mode: rendr.ModeRace, duration: duration, every: 10 * time.Second,
 					rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				crRegistryBack(t, live0, parked0)
 			})
