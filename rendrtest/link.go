@@ -84,6 +84,29 @@ const (
 	BlockHard BlockMode = 2 // writes block and ignore deadlines and Close until Release (an abandoned call)
 )
 
+// BlackholeMode selects whether a blackhole also swallows carrier closes.
+type BlackholeMode uint8
+
+// Blackhole modes.
+const (
+	// BlackholeBytes (the default) swallows bytes only: an end that closes
+	// its conn while the link is blackholed still ends the far end's conn
+	// at once (it reads EOF, its writes fail), as if the close took
+	// another path.
+	BlackholeBytes BlackholeMode = 0
+	// BlackholeCloses also swallows closes, as an nft DROP of a TCP path
+	// does (no FIN, RST or ICMP passes): a carrier one end closes while the
+	// link is blackholed stays open at the far end — its writes keep
+	// vanishing, its reads see nothing — so the far end must reach its own
+	// verdict. The close is deferred, not dropped: when the blackhole is
+	// lifted (or the mode is set back to BlackholeBytes) it crosses at
+	// once, as the closing stack's retransmitted FIN, or its RST to the
+	// far end's next segment, does once the path passes packets again.
+	// Kill and Close still end such a carrier at once. Each carrier whose
+	// close was held back counts once as ClosesHeld.
+	BlackholeCloses BlackholeMode = 1
+)
+
 // WriteResult scripts the result of one conn Write, including results a
 // correct conn never returns (a count above len(p), (0, nil)), to test how
 // rendr handles them.
@@ -177,8 +200,9 @@ type Link struct {
 	jitter    time.Duration
 	rate      float64 // bytes/s per direction, 0 = unlimited
 	blackhole bool
+	bhMode    BlackholeMode
 	stalled   bool
-	ctl       chan struct{}    // closed and renewed on every rate, stall or blackhole change
+	ctl       chan struct{}    // closed and renewed on every rate, stall, blackhole or blackhole-mode change
 	bq        [2][]*chunk      // the bottleneck queue of each direction, in arrival order
 	txWork    [2]chan struct{} // cap 1: a chunk was queued at bottleneck i
 	rng       [2]*rand.Rand    // jitter per direction; seeded from the name (deterministic)
@@ -306,12 +330,51 @@ func (l *Link) SetRate(bytesPerSec float64) {
 // SetBlackhole makes bytes vanish without closing anything (counted as
 // Dropped): new bytes, bytes still queued at the bottleneck (they take no
 // bottleneck time) and bytes in flight when they would arrive. New dials
-// "open" but never answer.
+// "open" but never answer. Whether a carrier's close crosses a blackhole
+// is SetBlackholeMode's choice (by default it does).
 func (l *Link) SetBlackhole(on bool) {
 	l.smu.Lock()
 	l.blackhole = on
 	l.bumpCtl()
 	l.smu.Unlock()
+}
+
+// SetBlackholeMode sets what SetBlackhole swallows (BlackholeBytes by
+// default). Closes held back by BlackholeCloses cross as soon as the mode
+// is set back to BlackholeBytes.
+func (l *Link) SetBlackholeMode(m BlackholeMode) {
+	if m > BlackholeCloses {
+		panic("rendrtest: unknown BlackholeMode")
+	}
+	l.smu.Lock()
+	l.bhMode = m
+	l.bumpCtl()
+	l.smu.Unlock()
+}
+
+// endCarrier ends the carrier after one of its ends closed (or a write
+// into an end failed). While the link swallows closes (blackholed in
+// BlackholeCloses mode) the close is held back — the far end stays open —
+// until that ends or the carrier is shut otherwise (Kill, Close).
+func (f *flow) endCarrier() {
+	c, l := f.c, f.c.l
+	for {
+		l.smu.Lock()
+		hold, ctl := l.blackhole && l.bhMode == BlackholeCloses, l.ctl
+		l.smu.Unlock()
+		if !hold {
+			c.shut()
+			return
+		}
+		if c.closeHeld.CompareAndSwap(false, true) {
+			l.count(c.kind.Load(), cClosesHeld, 1)
+		}
+		select {
+		case <-ctl:
+		case <-c.done:
+			return
+		}
+	}
 }
 
 // SetStall holds bytes (not lost) until un-stalled (counted as Held, once
@@ -326,7 +389,8 @@ func (l *Link) SetStall(on bool) {
 	l.smu.Unlock()
 }
 
-// bumpCtl wakes everything waiting on a rate, stall or blackhole change.
+// bumpCtl wakes everything waiting on a rate, stall, blackhole or
+// blackhole-mode change.
 // l.smu held.
 func (l *Link) bumpCtl() {
 	close(l.ctl)
@@ -568,13 +632,14 @@ func (l *Link) Carriers() []CarrierInfo {
 	out := make([]CarrierInfo, len(l.history))
 	for i, c := range l.history {
 		out[i] = CarrierInfo{
-			Seq:     c.seq,
-			First:   FrameType(c.first.Load()),
-			Session: c.kind.Load() == kindSession,
-			Up:      c.up.Load(),
-			Down:    c.down.Load(),
-			Held:    c.held.Load(),
-			Closed:  c.closed.Load(),
+			Seq:       c.seq,
+			First:     FrameType(c.first.Load()),
+			Session:   c.kind.Load() == kindSession,
+			Up:        c.up.Load(),
+			Down:      c.down.Load(),
+			Held:      c.held.Load(),
+			Closed:    c.closed.Load(),
+			CloseHeld: c.closeHeld.Load(),
 		}
 	}
 	return out
@@ -629,6 +694,7 @@ type Counts struct {
 	WritePanics     int64         // Writes that panicked (PanicWrites)
 	OverReads       int64         // Reads that reported len(p)+1 (OverRead)
 	FramesCaptured  int64         // frames copied by CaptureNextFrame (counted after the copy reached its channel)
+	ClosesHeld      int64         // carriers whose close a BlackholeCloses blackhole held back (once per carrier)
 }
 
 // Stats are a link's counters: over all carriers, session carriers only,
@@ -642,12 +708,13 @@ type Stats struct {
 
 // CarrierInfo is a snapshot of one carrier for per-carrier assertions.
 type CarrierInfo struct {
-	Seq      int       // creation order on its link
-	First    FrameType // first frame type after the PREFACE (0 until it crossed)
-	Session  bool      // First is OPEN or JOIN
-	Up, Down int64     // bytes the far end has read in each direction (as Counts.Bytes)
-	Held     int64     // chunks held by a stall
-	Closed   bool
+	Seq       int       // creation order on its link
+	First     FrameType // first frame type after the PREFACE (0 until it crossed)
+	Session   bool      // First is OPEN or JOIN
+	Up, Down  int64     // bytes the far end has read in each direction (as Counts.Bytes)
+	Held      int64     // chunks held by a stall
+	Closed    bool
+	CloseHeld bool // a BlackholeCloses blackhole held its close back (as Counts.ClosesHeld)
 }
 
 // index maps a direction to its array index (Up 0, Down 1).
@@ -685,6 +752,7 @@ const (
 	cPanics
 	cOverReads
 	cCaptured
+	cClosesHeld
 	nCtr
 )
 
@@ -720,6 +788,7 @@ func (c *counters) snap() Counts {
 		WritePanics:     c[cPanics].Load(),
 		OverReads:       c[cOverReads].Load(),
 		FramesCaptured:  c[cCaptured].Load(),
+		ClosesHeld:      c[cClosesHeld].Load(),
 	}
 }
 

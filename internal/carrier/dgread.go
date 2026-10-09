@@ -165,11 +165,16 @@ func (c *Conn) dgPause(rd *dgReader, d time.Duration) bool {
 // new source also starts a challenge, R1-14 as amended by wave 4) and
 // dropped otherwise;
 // a frame that fails to decode drops the rest of the datagram (PA-1); a
-// window duplicate or late frame is dropped; after the peer's CLOSE every
-// later frame but a RACK or a REL is dropped (M2-D30). A ReadCandidate
-// datagram of which a frame was newly accepted starts a rebind challenge
-// (M2-D27), or retargets the one in flight unless it carried a challenge
-// answer that committed nothing. It reports whether the reader continues.
+// window duplicate or late frame is dropped; a frame a window or more ahead
+// moves the window only when its datagram proves it (dgJumpProof), and is
+// dropped otherwise (dgJumpClaim; m3 FSEQJUMP); after the peer's CLOSE
+// every later frame but a RACK or a REL is dropped (M2-D30). A
+// ReadCandidate datagram of which a frame was newly accepted starts a
+// rebind challenge (M2-D27), or retargets the one in flight unless it
+// carried a challenge answer that committed nothing; one whose frames were
+// only ahead may start one but never retargets (a jump with a NAT move
+// proves itself with the challenge's answer). It reports whether the
+// reader continues.
 func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) bool {
 	dg := c.dg
 	if wire.IsPreface(data) {
@@ -190,7 +195,8 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 		}
 		return true
 	}
-	advanced, committed, answered := false, false, false
+	advanced, committed, answered, claimed := false, false, false, false
+	proof := 0 // whether the datagram proves a jump: 0 not checked yet, 1 yes, -1 no
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
 		if err != nil || (!c.mux && !dedicatedOK(f.Type, f.Handle)) {
@@ -198,7 +204,23 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 			break
 		}
 		data = data[n:]
-		if dg.rwin.Accept(f.Fseq) != wire.WindowNew {
+		switch dg.rwin.Accept(f.Fseq) {
+		case wire.WindowNew:
+		case wire.WindowAhead:
+			if proof == 0 {
+				proof = -1
+				if c.dgJumpProof(&f, data, src, now) {
+					proof = 1
+				}
+			}
+			if proof < 0 {
+				c.dgDropped(1)
+				c.dgJumpClaim(&f, now)
+				claimed = true
+				continue
+			}
+			dg.rwin.Jump(f.Fseq)
+		default:
 			c.dgDropped(1)
 			continue
 		}
@@ -217,10 +239,102 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 		committed = committed || ans == chalCommitted
 		answered = answered || ans == chalRefused
 	}
-	if ev == ReadCandidate && advanced && !committed {
-		c.rebindCandidate(src, now, !answered)
+	if ev == ReadCandidate && (advanced || claimed) && !committed {
+		c.rebindCandidate(src, now, advanced && !answered)
 	}
 	return true
+}
+
+// dgJumpProof reports whether the datagram from src whose frame f is a
+// window or more ahead proves that it comes from this direction's sender:
+// f or a frame after it (rest) is a PONG only that sender sends — the
+// answer to a PING of this incarnation (id ≠ 0, nonce salt ^ id; L23) or to
+// the rebind challenge in flight (id 0, its nonce, from its candidate;
+// M2-D27). The sender jumps that far after an outage cost a window of
+// frames, and the PONG to the PING the outage left outstanding, retried at
+// the RTO, or asked for by dgJumpClaim, arrives within a round trip of its
+// end. A datagram of another carrier direction or session, whose fseqs
+// start elsewhere (§0.13 A6), lands ahead about half the time, but its
+// PONGs answer another salt or another challenge: it never moves the
+// window (m3 FSEQJUMP; §A9.1, R1-35).
+func (c *Conn) dgJumpProof(f *wire.Frame, rest []byte, src PeerKey, now time.Time) bool {
+	if c.dgProves(f.Type, f.Payload, src, now) {
+		return true
+	}
+	for len(rest) > 0 {
+		g, n, err := wire.DecodeFrame(rest)
+		if err != nil || (!c.mux && !dedicatedOK(g.Type, g.Handle)) {
+			return false
+		}
+		rest = rest[n:]
+		if c.dgProves(g.Type, g.Payload, src, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// dgProves reports whether a frame of type t with payload p from src is a
+// PONG of the kinds dgJumpProof names.
+func (c *Conn) dgProves(t wire.Type, p []byte, src PeerKey, now time.Time) bool {
+	if t != wire.TypePong {
+		return false
+	}
+	pg, err := wire.ParsePing(p)
+	switch {
+	case err != nil:
+		return false
+	case pg.ID != 0:
+		return pg.Nonce == c.salt^uint64(pg.ID)
+	}
+	c.mu.Lock()
+	ch := &c.dg.chal
+	ok := ch.active && !c.chalExpiredLocked(now) && pg.Nonce == ch.nonce && src == ch.cand
+	c.mu.Unlock()
+	return ok
+}
+
+// dgJumpClaim handles a frame a window or more ahead whose datagram proved
+// nothing (dgJumpProof; the caller drops and counts it). An outage costs
+// frames both ways, so the peer may have jumped as well and wait for the
+// same proof: a PING the frame carries is answered — a challenge PING in a
+// free challenge-PONG slot, any other in a free PONG slot, so a frame of
+// another carrier never displaces a genuine answer, and a PONG of ours
+// that answers another carrier's PING matches nothing at the peer — and a
+// PING of ours is asked for, at most one per RTO, whose PONG proves the
+// jump. Nothing else of the frame is applied.
+func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
+	var p wire.Ping
+	ping := false
+	if f.Type == wire.TypePing {
+		var err error
+		p, err = wire.ParsePing(f.Payload)
+		ping = err == nil
+	}
+	dg, st := c.dg, &c.st
+	wake := false
+	c.mu.Lock()
+	switch {
+	case !ping:
+	case p.ID == 0:
+		if ch := &dg.chal; !ch.pongDue {
+			ch.pong, ch.pongDue = p, true
+			ch.pong.Pad = 0
+			wake = true
+		}
+	case !st.pongDue:
+		st.pong, st.pongDue = p, true
+		wake = true
+	}
+	if dg.jumpPing.IsZero() || now.Sub(dg.jumpPing) >= c.relRTOLocked() {
+		dg.jumpPing = now
+		st.pingReq = true
+		wake = true
+	}
+	c.mu.Unlock()
+	if wake {
+		c.wakeWriter()
+	}
 }
 
 // chalAnswer is what one frame did to the rebind challenge (dgDispatch).

@@ -25,6 +25,8 @@ type carrier struct {
 	up      atomic.Int64
 	down    atomic.Int64
 	held    atomic.Int64
+	// closeHeld: a BlackholeCloses blackhole held its close back (counted).
+	closeHeld atomic.Bool
 }
 
 // chunk is a run of bytes in the link: first queued at the bottleneck of
@@ -443,7 +445,7 @@ func (f *flow) deliverLoop() {
 			end := f.eof && f.inTx == 0
 			f.mu.Unlock()
 			if end {
-				c.shut()
+				f.endCarrier()
 				return
 			}
 			select {
@@ -480,7 +482,7 @@ func (f *flow) deliverLoop() {
 		f.pop(n)
 		f.mu.Unlock()
 		if err != nil {
-			c.shut()
+			f.endCarrier()
 			return
 		}
 	}

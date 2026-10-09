@@ -223,20 +223,6 @@ func (w *world) registry() (live, parked int64) {
 // actors returns Status.Actors of both Runtimes.
 func (w *world) actors() (d, p int) { return w.d.Status().Actors, w.p.Status().Actors }
 
-// carriers returns the live carriers of the dialer's sessions (each is one
-// carrier per side).
-func carriers(ps []pair) int {
-	n := 0
-	for _, s := range ps {
-		for _, c := range s.d.Status().Carriers {
-			if c.State == rendr.CarrierActive || c.State == rendr.CarrierMember {
-				n++
-			}
-		}
-	}
-	return n
-}
-
 // shutdown closes the Peer, both Runtimes (the dialer first) and every
 // link (once; also the cleanup of a failed test).
 func (w *world) shutdown() {

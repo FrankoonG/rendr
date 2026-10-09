@@ -304,26 +304,13 @@ type fseqMode struct {
 }
 
 // fseqModes: "preset" (fseqPreset on both Runtimes) and "derived" (the
-// production starts, each carrier direction's own; derivedFseq).
+// production starts, each carrier direction's own: a replayed datagram
+// lands behind or ahead of the receiver's window by chance, and one ahead
+// by a window or more is dropped unless its datagram proves the jump, m3
+// FSEQJUMP).
 var fseqModes = []fseqMode{
 	{"preset", testhooks.Overrides{FirstFseq: fseqPreset}},
 	{"derived", testhooks.Overrides{}},
-}
-
-// derivedFseq skips a derived-fseq variant unless -adv.derived is given.
-// OPEN DEFECT (M3 WP14a report, for the carrier owner): wire.FseqWindow
-// accepts any forward jump (int32(f − top) > 0), so with derived starts a
-// datagram replayed from another carrier or session lands ahead of the
-// receiver's window about half the time, moves it up to 2^31 ahead, and
-// every later genuine frame of that carrier is late until ping_timeout —
-// against §A9.1 ("loses only the affected datagrams") and R1-35 ("counted
-// drops, no death"). The variants hold the expectations of the preset
-// ones and fail until the window or the design changes.
-func derivedFseq(t *testing.T, m fseqMode) {
-	t.Helper()
-	if m.ov.FirstFseq == 0 && !*advDerived {
-		t.Skip("open defect: a datagram replayed from another carrier or session moves the fseq window up to 2^31 ahead (no forward-jump bound) and black-holes the carrier until ping_timeout; -adv.derived runs it")
-	}
 }
 
 // TestAdvDatagramReplayAcrossCarriers_L43: datagrams of one carrier of a
@@ -356,11 +343,10 @@ func derivedFseq(t *testing.T, m fseqMode) {
 //     past the fseq window at all is chance, so the row has no derived
 //     variant.
 //
-// The derived variants of "dgram" and "flow" are skipped (derivedFseq).
+// The derived variants of "dgram" and "flow" hold the preset expectations.
 func TestAdvDatagramReplayAcrossCarriers_L43(t *testing.T) {
 	for _, m := range fseqModes {
 		t.Run(m.name, func(t *testing.T) {
-			derivedFseq(t, m)
 			t.Run("dgram", func(t *testing.T) {
 				eachSetup(t, func(t *testing.T, s setup) { replayAcrossCarriers(t, s, m.ov) })
 			})
@@ -615,11 +601,10 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 // exactly and lives, B's seq window never sees them, B's verifier sees no
 // foreign datagram, no flow or session appears, and A is unaffected. (The
 // MUX half adds the datagram MUX trunk and the stream MUX trunk, whose
-// carrier dies.) The derived variants are skipped (derivedFseq).
+// carrier dies.) The derived variants hold the preset expectations.
 func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 	for _, m := range fseqModes {
 		t.Run(m.name, func(t *testing.T) {
-			derivedFseq(t, m)
 			for _, hub := range []bool{false, true} {
 				name := "link"
 				if hub {

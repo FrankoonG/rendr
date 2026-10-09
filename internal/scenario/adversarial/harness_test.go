@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -38,10 +37,6 @@ import (
 // selector's carrier, race's ACK lane and the attacked member are on "a".
 // Everything is created inside the synctest bubble that uses it and closed
 // before the bubble ends.
-
-// advDerived runs the rows' derived-fseq variants, which are skipped by
-// default: they fail on an open defect (see derivedFseq).
-var advDerived = flag.Bool("adv.derived", false, "run the datagram replay rows with derived fseq starts (open defect)")
 
 // setup is one carrier setup a row runs against (§A9.3: "each row runs
 // against a dedicated carrier (selector, bond and race sessions) and a

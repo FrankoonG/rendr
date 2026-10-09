@@ -321,7 +321,10 @@ func TestIdleOutageWorstPhaseSurvives_L18(t *testing.T) {
 
 				waitFor(t, 2*pingIdle, time.Millisecond, "recovery", func() bool {
 					st := dc.Status()
-					return st.NoPathEpisodes == 1 && !st.InNoPath
+					// Events are delivered asynchronously: wait for the
+					// episode's end event too, not only the status (a
+					// premise flake of the Linux race lane).
+					return st.NoPathEpisodes == 1 && !st.InNoPath && len(e.dev.of(rendr.EventNoPathEnd)) > 0
 				})
 				// The PING at the worst phase was sent into the outage and lost.
 				lost := false
