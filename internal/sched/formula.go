@@ -89,18 +89,26 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 // delivered average, bounded by the estimate, because the estimate is a
 // decaying maximum that bulk both ways overestimates (ACK compression:
 // TestByteClockDuplexRateBounded_L32 bounds it at 3× the link and logs
-// peaks near 2×, TestDuplexKeepsBothDirections_L15 up to 2.6×): each
+// peaks near 2×, TestDuplexKeepsBothDirections_L15 up to about 3×): each
 // side's allowance is the other side's queue, so an overestimated
 // multiplier would feed the two queues into each other.
 //
 // Its price is latency. With bulk both ways over a bottleneck deeper than
-// the cap, a side's bytes in flight, rate·(minRTT + q_fwd + q_rev), equal
-// the cap 2·rate·(minRTT + pingBusy + 50 ms) + rate·q_rev, so each
-// direction's standing queue settles near minRTT + 2·pingBusy + 100 ms and
-// the round trip near 3·minRTT + 4·pingBusy + 200 ms (460 ms on a 20-ms
-// path with the default PingBusy, against about 240 ms for bulk one way),
-// less where the bottleneck's buffer or the window is smaller;
-// TestDuplexKeepsBothDirections_L15 holds it within 1.5× of that.
+// the cap, a side's bytes in flight, link·(minRTT + q_fwd + q_rev), equal
+// its cap 2·k·link·(minRTT + pingBusy + 50 ms) + link·q_rev, k its rate
+// estimate over the link rate, so its own direction's standing queue
+// settles near 2·k·(minRTT + pingBusy + 50 ms) − minRTT and the round trip
+// near 2·(k₁ + k₂)·(minRTT + pingBusy + 50 ms) − minRTT, plus up to a
+// chunk's serialization each way; less where the bottleneck's buffer or
+// the window is smaller. With an exact estimate (k = 1) that is
+// 3·minRTT + 4·pingBusy + 200 ms (460 ms on a 20-ms path with the default
+// PingBusy, against about 240 ms for bulk one way), but bulk both ways
+// overestimates the rate: k peaks at 1–3 in the carrier rows, and
+// round trips of 0.5–1.03 s were measured on 20-ms Links with 0.5–1 s
+// buffers at 1–16 MiB/s (TestDuplexKeepsBothDirections_L15 holds each
+// row to the bound with its measured k). A peer clock error adds the
+// floor's error (at most the forward queue): up to a quarter more at a
+// 0.5 % drift (TestDuplexPeerClockSkew_L15).
 func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float64, rev time.Duration, floor, ceil int64) int64 {
 	if minRTT <= 0 {
 		minRTT = capUnknownRTT
