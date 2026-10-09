@@ -2,7 +2,9 @@ package adversarial
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -17,16 +19,44 @@ import (
 // any endpoint sees the other carrier's payload; the sessions on both
 // carriers keep every byte.
 
-// twoSessions opens sessions X and Y on one Peer (each on carriers of its
-// own: dedicated) and starts n bytes dialer → passive on both; it returns
-// once both delivered a quarter.
-func twoSessions(t *testing.T, w *world, n int64) (x, y *pair, fx, fy *sflow) {
-	peer := w.streamPeer()
-	x, y = w.open(peer), w.open(peer)
-	fx, fy = startFlow(x.d, x.p, n, 4310), startFlow(y.d, y.p, n, 4311)
-	fx.reached(t, n/4, "a quarter of X")
-	fy.reached(t, n/4, "a quarter of Y")
-	return x, y, fx, fy
+// twoSessions opens the sessions X (xs) and Y (ys) — s.sessions each, on
+// a Peer each (dedicated: every session on carriers of its own; MUX: X's
+// on one trunk, Y's on another) — and starts n bytes dialer → passive on
+// every one; it returns once X's and Y's first sessions delivered a
+// quarter. The rows splice a carrier of xs[0] into one of ys[0].
+func twoSessions(t *testing.T, w *world, n int64) (xs, ys []*pair, fxs, fys []*sflow) {
+	xs, ys = w.openN(w.streamPeer()), w.openN(w.streamPeer())
+	for i, x := range xs {
+		fxs = append(fxs, startFlow(x.d, x.p, n, 4310+uint64(2*i)))
+	}
+	for i, y := range ys {
+		fys = append(fys, startFlow(y.d, y.p, n, 4311+uint64(2*i)))
+	}
+	fxs[0].reached(t, n/4, "a quarter of X")
+	fys[0].reached(t, n/4, "a quarter of Y")
+	return xs, ys, fxs, fys
+}
+
+// spliceEnd waits for every transfer of X and Y, requires X's sessions
+// untouched (X only lent its frames) and Y's first session's one Death
+// migration (and its neighbours'), and ends every session cleanly.
+func spliceEnd(t *testing.T, w *world, xs, ys []*pair, fxs, fys []*sflow) {
+	t.Helper()
+	for i, f := range fxs {
+		f.wait(t, 2*time.Minute, fmt.Sprintf("X's session %d", i))
+	}
+	for i, f := range fys {
+		f.wait(t, 2*time.Minute, fmt.Sprintf("Y's session %d, its carrier fed X's frames", i))
+	}
+	for i, x := range xs {
+		untouched(t, fmt.Sprintf("X's session %d", i), x)
+	}
+	ys[0].deathsAre(t, w.s, 1)
+	neighbours(t, w.s, ys, 0, 1)
+	for _, x := range slices.Concat(xs, ys) {
+		x.endClean(t)
+	}
+	w.close()
 }
 
 // untouched requires that session x lost no carrier and counted no
@@ -64,7 +94,8 @@ func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
 			eachSetup(t, func(t *testing.T, s setup) {
 				n := rowBytes()
 				w := newWorld(t, s, worldOpts{})
-				x, y, fx, fy := twoSessions(t, w, n)
+				xs, ys, fxs, fys := twoSessions(t, w, n)
+				x, y := xs[0], ys[0]
 				tx, ty := w.tamperOf(target(t, s, x.d.Status())), w.tamperOf(target(t, s, y.d.Status()))
 				want := []string{"fseq"}
 				if mid {
@@ -95,13 +126,7 @@ func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
 				if foreign == 0 || own == 0 {
 					t.Fatalf("stimulus: Y's carrier forwarded %d own and %d of X's frames", own, foreign)
 				}
-				fx.wait(t, 2*time.Minute, "X")
-				fy.wait(t, 2*time.Minute, "Y, with X's frames spliced into its carrier")
-				untouched(t, "X", x)
-				y.deathsAre(t, s, 1)
-				x.endClean(t)
-				y.endClean(t)
-				w.close()
+				spliceEnd(t, w, xs, ys, fxs, fys)
 			})
 		})
 	}
@@ -127,9 +152,13 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 		eachSetup(t, func(t *testing.T, s setup) {
 			n := rowBytes()
 			w := newWorld(t, s, worldOpts{})
-			x := w.open(w.streamPeer())
-			f := startFlow(x.d, x.p, n, 4320)
-			f.reached(t, n/4, "a quarter of the transfer")
+			xs := w.openN(w.streamPeer())
+			x := xs[0]
+			var fs []*sflow
+			for i, y := range xs {
+				fs = append(fs, startFlow(y.d, y.p, n, 4320+uint64(i)))
+			}
+			fs[0].reached(t, n/4, "a quarter of the transfer")
 			id := target(t, s, x.d.Status())
 			tm := w.tamperOf(id)
 			var lname string
@@ -164,10 +193,15 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 				t.Fatalf("the passive kept state from the fresh connection: sessions %+v (before %+v), backlog %v",
 					st.Sessions, before.Sessions, st.AcceptBacklog)
 			}
-			f.wait(t, 2*time.Minute, "the transfer across the relay's switch")
+			for i, f := range fs {
+				f.wait(t, 2*time.Minute, fmt.Sprintf("session %d's transfer across the relay's switch", i))
+			}
 			w.noViolation()
 			x.deathsAre(t, s, 1)
-			x.endClean(t)
+			neighbours(t, s, xs, 0, 1)
+			for _, y := range xs {
+				y.endClean(t)
+			}
 			w.close()
 		})
 	})
@@ -175,7 +209,8 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 		eachSetup(t, func(t *testing.T, s setup) {
 			n := rowBytes()
 			w := newWorld(t, s, worldOpts{})
-			x, y, fx, fy := twoSessions(t, w, n)
+			xs, ys, fxs, fys := twoSessions(t, w, n)
+			x, y := xs[0], ys[0]
 			tx, ty := w.tamperOf(target(t, s, x.d.Status())), w.tamperOf(target(t, s, y.d.Status()))
 			ty.Splice(rendrtest.Down, tx, 0)
 			waitFor(t, 5*time.Second, "X's frames forwarded into Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 })
@@ -184,13 +219,7 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 				t.Fatalf("the splice started on carrier %d, not Y's", hit.id)
 			}
 			violated(t, "Y's spliced carrier", endDead(t, "Y's dialer", y.d.Status, hit.id), "fseq")
-			fx.wait(t, 2*time.Minute, "X")
-			fy.wait(t, 2*time.Minute, "Y, fed X's frames")
-			untouched(t, "X", x)
-			y.deathsAre(t, s, 1)
-			x.endClean(t)
-			y.endClean(t)
-			w.close()
+			spliceEnd(t, w, xs, ys, fxs, fys)
 		})
 	})
 }

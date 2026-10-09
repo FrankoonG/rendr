@@ -361,6 +361,24 @@ func TestRecord(t *testing.T) {
 	}
 }
 
+// TestRecordReproducible: recording again gives the committed recordings
+// byte for byte, so `-update` never silently changes the seed corpus.
+func TestRecordReproducible(t *testing.T) {
+	for i, f := range recFiles {
+		want, err := os.ReadFile(filepath.Join("testdata", f.name))
+		if err != nil {
+			t.Fatalf("recordings: %v (go test -run TestRecord -update writes them)", err)
+		}
+		if got := recordTrunk(t, uint64(i), f.mux); !bytes.Equal(got, want) {
+			at := 0
+			for at < min(len(got), len(want)) && got[at] == want[at] {
+				at++
+			}
+			t.Fatalf("%s: recorded again, %d bytes differing from byte %d on (committed: %d bytes)", f.name, len(got), at, len(want))
+		}
+	}
+}
+
 // recConn records every byte written through it.
 type recConn struct {
 	net.Conn
@@ -384,8 +402,11 @@ func (c *recConn) bytes() []byte {
 // recordTrunk runs a dialer trunk against a passive one over net.Pipe in
 // a bubble and returns what the dialer wrote: dedicated, view 1; MUX,
 // views 1–3 (2 and 3 opened with OPEN on the live trunk); each view sends
-// eight rounds of DATA and then a FIN. The fseq start, the round sizes and
-// the DATA segment sizes come from a PRNG seeded with seed.
+// eight rounds of DATA and then a FIN. The fseq start, both trunks' PING
+// nonce salts, the round sizes and the DATA segment sizes come from a PRNG
+// seeded with seed, and every step — the start's PING exchange, each OPEN,
+// each view's round, each FIN — runs alone until the bubble is idle, so
+// the bytes are the same on every run (TestRecordReproducible).
 func recordTrunk(t *testing.T, seed uint64, mux bool) []byte {
 	var out []byte
 	synctest.Test(t, func(t *testing.T) {
@@ -397,18 +418,24 @@ func recordTrunk(t *testing.T, seed uint64, mux bool) []byte {
 		d := newMuxSide(t, muxEnv(mod), rc, true)
 		p := newMuxSide(t, muxEnv(mod), b, false)
 		d.c.mux, p.c.mux = mux, mux
+		// The salts are crypto/rand's in production: the PING nonces and
+		// the PONGs that echo them would differ on every run.
+		d.c.trunk.salt, p.c.trunk.salt = rng.Uint64(), rng.Uint64()
 		d.start()
+		synctest.Wait() // the dialer's first PING goes first, then the PONG to the passive's
 		p.start()
+		synctest.Wait()
 		views := []*mView{d.v1}
 		if mux {
 			for sid := byte(2); sid <= 3; sid++ {
 				mv, _ := d.open(t, wire.TypeOpen, sid)
 				views = append(views, mv)
+				synctest.Wait()
 			}
 		}
-		// Eight rounds: each view offers 1–13 KiB more in DATA segments of
-		// a size drawn per round, then all wait for the passive; a FIN
-		// closes each view's stream.
+		// Eight rounds: each view in turn offers 1–13 KiB more in DATA
+		// segments of a size drawn per round and waits for the passive; a
+		// FIN closes each view's stream.
 		totals := make([]uint64, len(views))
 		for range 8 {
 			for k, v := range views {
@@ -419,16 +446,16 @@ func recordTrunk(t *testing.T, seed uint64, mux bool) []byte {
 				v.src.offer(n)
 				v.c.Wake()
 				totals[k] += n
+				synctest.Wait()
 			}
-			synctest.Wait()
 		}
 		var total int64
 		for k, v := range views {
 			v.src.addCtl(hFrame{t: wire.TypeFin, payload: finInner(totals[k])})
 			v.c.Wake()
 			total += int64(totals[k])
+			synctest.Wait()
 		}
-		synctest.Wait()
 		var got int64
 		p.mu.Lock()
 		for _, v := range p.views {

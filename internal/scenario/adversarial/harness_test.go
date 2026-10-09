@@ -3,6 +3,7 @@ package adversarial
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -37,13 +38,20 @@ import (
 // Everything is created inside the synctest bubble that uses it and closed
 // before the bubble ends.
 
+// advDerived runs the rows' derived-fseq variants, which are skipped by
+// default: they fail on an open defect (see derivedFseq).
+var advDerived = flag.Bool("adv.derived", false, "run the datagram replay rows with derived fseq starts (open defect)")
+
 // setup is one carrier setup a row runs against (§A9.3: "each row runs
 // against a dedicated carrier (selector, bond and race sessions) and a
-// 4-session MUX trunk"). The rows open s.sessions sessions on one Peer and
-// attack a carrier of the first; with dedicated carriers every session has
-// carriers of its own (Props.CheapSubflow), on a MUX trunk the sessions
-// share the attacked carrier, and the expectations that differ (the
-// neighbours' migrations) branch on mux.
+// 4-session MUX trunk"). Every row opens s.sessions sessions on each Peer
+// it uses (openN, openPacketN), moves data on all of them and attacks a
+// carrier of the first; with dedicated carriers every session has carriers
+// of its own (Props.CheapSubflow), on a MUX trunk the sessions share the
+// attacked carrier. The expectations that differ — the neighbours' Death
+// migrations — branch on mux in neighbours and neighboursPacket; the rows
+// whose stimulus hits every carrier of a link (a Kill) expect the same of
+// every session either way.
 type setup struct {
 	name     string
 	mode     rendr.Mode
@@ -92,6 +100,9 @@ type worldOpts struct {
 	record bool
 	// links is the number of links ("a", "b", "c", ...; default 2).
 	links int
+	// hub adds a rendrtest.DatagramHub whose passive socket the Listener
+	// reads through rendr.FromPacketConn (raw-UDP flows; hubPeer).
+	hub bool
 }
 
 // world is one scenario's two Runtimes and links.
@@ -108,12 +119,15 @@ type world struct {
 	probes  []*rendrtest.Link
 	dlinks  []*rendrtest.DatagramLink
 	dprobes []*rendrtest.DatagramLink
+	hub     *rendrtest.DatagramHub // worldOpts.hub
 	flip    *dflip
 
 	mu      sync.Mutex
 	tampers []*tamperRec
 	onNew   func(tm *rendrtest.Tamper) // arms every new session tamper (armNew)
-	dconns  []*dflipConn
+	onSess  rendr.SessionID            // of this session only (zero: any)
+	dconns  []*dflipConn               // in dial order
+	hubs    int                        // hub clients dialled (the next one's index)
 	shut    sync.Once
 }
 
@@ -152,7 +166,15 @@ func newWorld(t testing.TB, s setup, o worldOpts) *world {
 	w.d = newRuntime(t, rendr.Config{OnEvent: w.dev.add}, &dov)
 	w.p = newRuntime(t, rendr.Config{OnEvent: w.pev.add}, &pov)
 	t.Cleanup(w.shutdown)
-	ln, err := w.p.Listen(rendr.ListenConfig{})
+	var lc rendr.ListenConfig
+	if o.hub {
+		w.hub = rendrtest.NewDatagramHub(rendrtest.DatagramHubConfig{Name: "hub", Queue: 16384})
+		for _, d := range bothDirs {
+			w.hub.SetDelay(d, 2*time.Millisecond, 0)
+		}
+		lc.Sources = []rendr.Source{rendr.FromPacketConn(w.hub.PacketConn())}
+	}
+	ln, err := w.p.Listen(lc)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -211,7 +233,7 @@ var bothDirs = []rendrtest.Dir{rendrtest.Up, rendrtest.Down}
 // acceptPacket hands the passive end of a datagram carrier to the
 // Listener through the passive side's flipping conn.
 func (w *world) acceptPacket(pc net.PacketConn, peer net.Addr) error {
-	return w.ln.HandlePacket(&dflipConn{PacketConn: pc, f: w.flip, dir: rendrtest.Down}, peer)
+	return w.ln.HandlePacket(&dflipConn{PacketConn: pc, f: w.flip, dir: rendrtest.Down, hub: -1}, peer)
 }
 
 // link returns the session stream link called name.
@@ -281,14 +303,55 @@ func (w *world) datagramPeer(names ...string) *rendr.Peer {
 			if ok && di.Probe {
 				return pl.Dial(ctx)
 			}
+			// latestOn's dial order is the link's carrier order: dial
+			// under w.mu.
+			w.mu.Lock()
+			defer w.mu.Unlock()
 			pc, a, err := l.Dial(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
-			c := &dflipConn{PacketConn: pc, f: w.flip, dir: rendrtest.Up, id: di.Carrier, link: name, record: w.o.record}
-			w.mu.Lock()
+			c := &dflipConn{PacketConn: pc, f: w.flip, dir: rendrtest.Up, id: di.Carrier, link: name, hub: -1, record: w.o.record}
 			w.dconns = append(w.dconns, c)
-			w.mu.Unlock()
+			return c, a, nil
+		}})
+	}
+	return w.newPeer(cs)
+}
+
+// hubPeer returns a dialer Peer of datagram factories called names whose
+// session carriers are clients of the hub (worldOpts.hub: raw-UDP flows
+// into the passive's FromPacketConn source; probes over the probe link of
+// the same name). Every session carrier's conn is a registered dflipConn
+// that knows its hub client index (DatagramHub.ReplayFlow).
+func (w *world) hubPeer(names ...string) *rendr.Peer {
+	w.t.Helper()
+	var cs []rendr.Carrier
+	for _, name := range names {
+		var pl *rendrtest.DatagramLink
+		for _, l := range w.dprobes {
+			if l.Name() == name+"-probe" {
+				pl = l
+			}
+		}
+		if pl == nil {
+			w.t.Fatalf("no probe link for %q", name)
+		}
+		cs = append(cs, rendr.DatagramCarrier{Name: name, MTU: dgMTU, Props: w.s.props, Dial: func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			di, ok := rendr.CarrierDialInfo(ctx)
+			if ok && di.Probe {
+				return pl.Dial(ctx)
+			}
+			// The hub numbers its clients in dial order: dial under w.mu.
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			pc, a, err := w.hub.Dial(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			c := &dflipConn{PacketConn: pc, f: w.flip, dir: rendrtest.Up, id: di.Carrier, link: name, hub: w.hubs, record: w.o.record}
+			w.hubs++
+			w.dconns = append(w.dconns, c)
 			return c, a, nil
 		}})
 	}
@@ -314,21 +377,24 @@ func (w *world) addTamper(r *tamperRec) {
 	w.mu.Lock()
 	w.tampers = append(w.tampers, r)
 	f := w.onNew
+	if w.onSess != (rendr.SessionID{}) && r.sess != w.onSess {
+		f = nil
+	}
 	w.mu.Unlock()
 	if f != nil {
 		f(r.tm)
 	}
 }
 
-// armNew makes f arm the tamper of every session carrier dialled from now
-// on, until disarm.
-func (w *world) armNew(f func(tm *rendrtest.Tamper)) {
+// armNew makes f arm the tamper of every carrier dialled from now on for
+// session sess (zero: any session), until disarm.
+func (w *world) armNew(sess rendr.SessionID, f func(tm *rendrtest.Tamper)) {
 	w.mu.Lock()
-	w.onNew = f
+	w.onNew, w.onSess = f, sess
 	w.mu.Unlock()
 }
 
-func (w *world) disarm() { w.armNew(nil) }
+func (w *world) disarm() { w.armNew(rendr.SessionID{}, nil) }
 
 // tamperOf returns the tamper of session carrier id.
 func (w *world) tamperOf(id rendr.CarrierID) *rendrtest.Tamper {
@@ -341,6 +407,51 @@ func (w *world) tamperOf(id rendr.CarrierID) *rendrtest.Tamper {
 		}
 	}
 	w.t.Fatalf("no tamper for carrier %d", id)
+	return nil
+}
+
+// latestOn returns the dialer's conn of the latest datagram session
+// carrier dialled on link name: the carrier DatagramLink.ReplayInto takes
+// its datagrams from and replays into (with several sessions on dedicated
+// carriers, not necessarily the first session's).
+func (w *world) latestOn(name string) *dflipConn {
+	w.t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := len(w.dconns) - 1; i >= 0; i-- {
+		if c := w.dconns[i]; c.link == name && c.hub < 0 {
+			return c
+		}
+	}
+	w.t.Fatalf("no datagram carrier on link %q", name)
+	return nil
+}
+
+// latestHub returns the dialer's conn of the latest hub client dialled by
+// factory name.
+func (w *world) latestHub(name string) *dflipConn {
+	w.t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := len(w.dconns) - 1; i >= 0; i-- {
+		if c := w.dconns[i]; c.link == name && c.hub >= 0 {
+			return c
+		}
+	}
+	w.t.Fatalf("no hub client of factory %q", name)
+	return nil
+}
+
+// ownerOf returns the session of xs that has carrier id (any of them on a
+// shared carrier).
+func ownerOf(t testing.TB, xs []*ppair, id rendr.CarrierID) *ppair {
+	t.Helper()
+	for _, x := range xs {
+		if _, ok := carrierOf(x.p.Status(), id); ok {
+			return x
+		}
+	}
+	t.Fatalf("no session has carrier %d", id)
 	return nil
 }
 
@@ -424,6 +535,64 @@ func (w *world) openPacket(p *rendr.Peer) *ppair {
 	return x
 }
 
+// openN opens the setup's s.sessions stream sessions over p; the rows
+// attack the first.
+func (w *world) openN(p *rendr.Peer) []*pair {
+	w.t.Helper()
+	xs := make([]*pair, w.s.sessions)
+	for i := range xs {
+		xs[i] = w.open(p)
+	}
+	return xs
+}
+
+// openPacketN opens the setup's s.sessions packet sessions over p; the
+// rows attack the first.
+func (w *world) openPacketN(p *rendr.Peer) []*ppair {
+	w.t.Helper()
+	xs := make([]*ppair, w.s.sessions)
+	for i := range xs {
+		xs[i] = w.openPacket(p)
+	}
+	return xs
+}
+
+// neighbours requires what an attack on a carrier of xs[0] did to the
+// other sessions of its Peer: own Death migrations each on dedicated
+// carriers (0, untouched, unless the stimulus killed a whole link), and
+// shared on a MUX trunk (the attacked session's own count when they shared
+// the carrier that died; 0 on a datagram trunk, which drops and lives).
+func neighbours(t testing.TB, s setup, xs []*pair, own, shared uint64) {
+	t.Helper()
+	d := own
+	if s.mux {
+		d = shared
+	}
+	for i, x := range xs[1:] {
+		if d > 0 {
+			x.deathsAre(t, s, d)
+			continue
+		}
+		untouched(t, fmt.Sprintf("neighbour session %d", i+1), x)
+	}
+}
+
+// neighboursPacket is neighbours for packet sessions.
+func neighboursPacket(t testing.TB, s setup, xs []*ppair, own, shared uint64) {
+	t.Helper()
+	d := own
+	if s.mux {
+		d = shared
+	}
+	for i, x := range xs[1:] {
+		if d > 0 {
+			deathsAre(t, s, x.d.Status, x.p.Status, d)
+			continue
+		}
+		untouchedPacket(t, fmt.Sprintf("neighbour session %d", i+1), x)
+	}
+}
+
 // shutdown closes both Runtimes (the dialer first), every tamper and every
 // link (once; also the cleanup of a failed test).
 func (w *world) shutdown() {
@@ -441,6 +610,9 @@ func (w *world) shutdown() {
 		}
 		for _, l := range slices.Concat(w.dlinks, w.dprobes) {
 			l.Close()
+		}
+		if w.hub != nil {
+			w.hub.Close()
 		}
 	})
 }
@@ -804,6 +976,24 @@ func startPacketFlow(t testing.TB, name string, wc, rc *rendr.PacketConn, seed u
 	return f
 }
 
+// startPacketFlows starts a flow dialer → passive on each session of xs
+// (seed, seed+1, ...; 1000-byte datagrams at rate).
+func startPacketFlows(t testing.TB, xs []*ppair, seed uint64, rate int) []*pflow {
+	fs := make([]*pflow, len(xs))
+	for i, x := range xs {
+		fs[i] = startPacketFlow(t, fmt.Sprintf("session %d", i), x.d, x.p, seed+uint64(i), rate, 0)
+	}
+	return fs
+}
+
+// endPackets ends every session of xs cleanly (endPacket with its flow).
+func endPackets(t testing.TB, xs []*ppair, fs []*pflow) {
+	t.Helper()
+	for i, x := range xs {
+		x.endPacket(t, fs[i])
+	}
+}
+
 // stopOnce tells the writer to stop (idempotent).
 func (f *pflow) stopOnce() {
 	f.once.Do(func() { close(f.stop) })
@@ -1035,7 +1225,8 @@ type dflipConn struct {
 	f      *dflip
 	dir    rendrtest.Dir // the direction this conn writes
 	id     rendr.CarrierID
-	link   string
+	link   string // the factory's link name
+	hub    int    // its hub client index (-1: a DatagramLink conn)
 	record bool
 
 	mu   sync.Mutex

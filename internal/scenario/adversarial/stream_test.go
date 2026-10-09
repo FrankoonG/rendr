@@ -81,22 +81,21 @@ func runStream(t *testing.T, s setup, a streamAttack) {
 		n = rowBytes()
 	}
 	w := newWorld(t, s, worldOpts{})
-	peer := w.streamPeer()
-	xs := make([]*pair, s.sessions)
-	fs := make([]*sflow, s.sessions)
-	for i := range xs {
-		xs[i] = w.open(peer)
-	}
+	xs := w.openN(w.streamPeer())
+	fs := make([]*sflow, len(xs))
 	for i, x := range xs {
 		fs[i] = startFlow(x.d, x.p, n, 4300+uint64(i))
 	}
 	x := xs[0]
 	fs[0].reached(t, n/4, "a quarter of the transfer")
-	deaths := uint64(1)
+	// The neighbours: untouched on dedicated carriers, the same deaths on
+	// a MUX trunk — except that the SCHED trigger's Kill takes their
+	// carrier on the killed link too (dedicated: that one Death).
+	deaths, own := uint64(1), uint64(0)
 	switch {
 	case a.sch:
 		schedTrigger(t, w, x, func(tm *rendrtest.Tamper) { a.arm(tm, x) })
-		deaths = 2
+		deaths, own = 2, 1
 	case a.typ == rendrtest.FrameAck:
 		a.arm(w.tamperOf(ackLane(t, w, x)), x)
 	default:
@@ -118,6 +117,7 @@ func runStream(t *testing.T, s setup, a streamAttack) {
 		t.Fatalf("the operation fired %d times, want once", k)
 	}
 	x.deathsAre(t, s, deaths)
+	neighbours(t, s, xs, own, deaths)
 	for _, x := range xs {
 		x.endClean(t)
 	}
@@ -181,7 +181,7 @@ func ackLane(t testing.TB, w *world, x *pair) rendr.CarrierID {
 // schedTrigger makes the dialer publish a SCHED on a carrier armed by arm.
 // Bond and race: the member on "a" is armed and the members on "b" are
 // killed (Link.Kill): the dialer publishes the shrunk member set on "a" at
-// once. Selector: every session carrier dialled from now on is armed and
+// once. Selector: every carrier dialled for x from now on is armed and
 // the active carrier's link is killed: the failover carrier's first SCHED
 // names it. Either way the attacked carrier is the second death of the
 // row.
@@ -200,7 +200,7 @@ func schedTrigger(t testing.TB, w *world, x *pair, arm func(tm *rendrtest.Tamper
 			act = c.Name
 		}
 	}
-	w.armNew(arm)
+	w.armNew(x.d.ID(), arm)
 	if act == "" || w.link(act).Kill() == 0 {
 		t.Fatalf("stimulus: no active carrier to kill (%q)", act)
 	}
@@ -314,9 +314,13 @@ func TestAdvWriterBufferMutation_L43(t *testing.T) {
 		}
 		var zeroed atomic.Int64
 		w := newWorld(t, s, worldOpts{wrap: func(_ string, c net.Conn) net.Conn { return &zeroingConn{Conn: c, zeroed: &zeroed} }})
-		x := w.open(w.streamPeer())
-		f := startFlow(x.d, x.p, n, 4303)
-		f.reached(t, n*4/10, "40% delivered")
+		xs := w.openN(w.streamPeer())
+		x := xs[0]
+		fs := make([]*sflow, len(xs))
+		for i, y := range xs {
+			fs[i] = startFlow(y.d, y.p, n, 4303+uint64(i))
+		}
+		fs[0].reached(t, n*4/10, "40% delivered")
 		cut, deaths := []string{"a"}, uint64(1)
 		switch s.mode {
 		case rendr.ModeSelector:
@@ -333,7 +337,9 @@ func TestAdvWriterBufferMutation_L43(t *testing.T) {
 				t.Fatalf("stimulus: no carrier on link %s to cut", name)
 			}
 		}
-		f.wait(t, 2*time.Minute, "the transfer across the cut")
+		for i, f := range fs {
+			f.wait(t, 2*time.Minute, fmt.Sprintf("session %d's transfer across the cut", i))
+		}
 		// The cut lost bytes in flight, and the stream still arrived
 		// whole: they were sent again. Selector and bond count that
 		// replay as retransmission; race re-places them on a new lane's
@@ -352,8 +358,14 @@ func TestAdvWriterBufferMutation_L43(t *testing.T) {
 			t.Fatalf("stimulus: the conns zeroed only %d bytes", zeroed.Load())
 		}
 		w.noViolation()
-		x.deathsAre(t, s, deaths)
-		x.endClean(t)
+		// The cut hit every carrier on the links, so every session counts
+		// the same deaths, dedicated or on a MUX trunk.
+		for _, y := range xs {
+			y.deathsAre(t, s, deaths)
+		}
+		for _, y := range xs {
+			y.endClean(t)
+		}
 		w.close()
 	})
 }

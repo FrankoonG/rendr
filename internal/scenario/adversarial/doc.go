@@ -2,8 +2,8 @@
 // §A9.3; plan:650; L41, L43, L69): a path or relay that damages, drops,
 // duplicates, replays or splices the frames of a carrier — a
 // rendrtest.Tamper between the two ends of every stream carrier, the
-// DatagramLink replay and splice controls, and a bit-flipping datagram
-// conn — kills only the carrier it attacked (stream) or loses only the
+// DatagramLink replay and splice controls, the DatagramHub's flow
+// replay, and a bit-flipping datagram conn — kills only the carrier it attacked (stream) or loses only the
 // datagrams it damaged (datagram), never corrupts or duplicates
 // application data, and never harms another session beyond a migration.
 //

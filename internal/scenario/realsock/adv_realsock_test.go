@@ -254,6 +254,36 @@ func advUntil(t testing.TB, what string, cond func() bool) {
 	}
 }
 
+// advReadRec is a relay's upstream conn that counts what it reads and
+// keeps the error that ended its reads.
+type advReadRec struct {
+	net.Conn
+	n   atomic.Int64
+	mu  sync.Mutex
+	err error
+}
+
+func (c *advReadRec) Read(p []byte) (int, error) {
+	k, err := c.Conn.Read(p)
+	c.n.Add(int64(k))
+	if err != nil {
+		c.mu.Lock()
+		if c.err == nil {
+			c.err = err
+		}
+		c.mu.Unlock()
+	}
+	return k, err
+}
+
+// result returns the bytes read and the error that ended the reads (nil
+// while they go on).
+func (c *advReadRec) result() (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n.Load(), c.err
+}
+
 // advDead waits until carrier id is dead in get's status and returns it.
 func advDead(t testing.TB, get func() rendr.SessionStatus, id rendr.CarrierID) rendr.CarrierStatus {
 	t.Helper()
@@ -362,14 +392,24 @@ func TestRelaySpliceRealTCP_L43(t *testing.T) {
 		f := advStart(dc, pc, size, 4)
 		advUntil(t, "a quarter of the transfer", func() bool { return f.got.Load() >= size/4 })
 		id, tm := n.tamperOf(dc)
-		var fresh net.Conn
+		var fresh *advReadRec
 		tm.SwitchUpstream(func() (net.Conn, error) {
 			c, err := net.Dial("tcp", n.pl.Addr().String())
-			fresh = c
-			return c, err
+			if err != nil {
+				return nil, err
+			}
+			fresh = &advReadRec{Conn: c}
+			return fresh, nil
 		})
 		if tm.Stats().Switched != 1 || fresh == nil {
 			t.Fatalf("stimulus: %+v", tm.Stats())
+		}
+		// The passive closed the fresh connection without a byte back (no
+		// PREFACE_ACK: its first bytes are not "RND2", L48): the relay's
+		// read of it ended in EOF or a reset, not in its own close.
+		advUntil(t, "the passive closing the fresh connection", func() bool { _, err := fresh.result(); return err != nil })
+		if k, err := fresh.result(); k != 0 || errors.Is(err, net.ErrClosed) {
+			t.Fatalf("the fresh connection: %d bytes back, then %v; want none, then the passive's close", k, err)
 		}
 		for _, get := range []func() rendr.SessionStatus{dc.Status, pc.Status} {
 			if c := advDead(t, get, id); c.DeathCause != rendr.CauseTransportError {
