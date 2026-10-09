@@ -45,3 +45,34 @@ func TestTrunkMuxFullMark(t *testing.T) {
 		}
 	})
 }
+
+// TestPoolStatsCountStartedFreshTrunk (M3-D49; I2): a fresh trunk whose
+// session started view 1 counts in the pool's Stats (Status.Mux) at once,
+// not only after its asynchronous publication: a session that just opened
+// on a shared carrier is never missing from Status.Mux (the race lane saw
+// Mux.Carriers 0 right after a Dial on a mux trunk returned).
+func TestPoolStatsCountStartedFreshTrunk(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pt := newPoolT(t, nil, nil)
+		est, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+		if err != nil || !est.Fresh || !isOK(est) {
+			t.Fatalf("attempt: %v", err)
+		}
+		if st := pt.p.Stats(); st.Carriers != 0 || st.Views != 0 {
+			t.Fatalf("stats %+v before the session started view 1, want nothing counted", st)
+		}
+		mv := &mView{c: est.Conn, ep: &dEP{}, src: newVSource(pt.env), bell: &hBell{}, done: &hBell{}}
+		mv.ep.fill = mv.src.fill
+		// Start without letting the publication goroutine run first.
+		pt.p.mu.Lock()
+		est.Conn.Start(mv.ep, mv.bell, StartOptions{})
+		pt.p.mu.Unlock()
+		if st := pt.p.Stats(); st.Carriers != 1 || st.Views != 1 {
+			t.Fatalf("stats %+v right after Start, want the started trunk with its view", st)
+		}
+		synctest.Wait()
+		if st := pt.p.Stats(); st.Carriers != 1 || st.Views != 1 {
+			t.Fatalf("stats %+v after the publication, want it counted once", st)
+		}
+	})
+}
