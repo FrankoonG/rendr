@@ -468,9 +468,10 @@ func p99(ds []time.Duration) time.Duration {
 // others; formerly TestMuxFairnessDefaultQuantum_L15); the echo — at least
 // 90 % of one sample per 100 ms, and its P99 round trip under load at most
 // base + Cap/rate + 2·RTT (Cap: the largest Cap either end of the shared
-// carrier reported during the run): DRR serves the echo's view in the
-// round after its wake, never behind the 4 × 8-MiB send backlog of its
-// direction; integrity — every echo verified and every bulk byte verified
+// carrier reported during the run): DRR serves the echo's view after at
+// most one turn of each bulk view of its direction (§A5.3's echo bound;
+// 4 × 64 KiB fit one 256-KiB batch, so the round after its wake), never
+// behind the 4 × 8-MiB send backlog of its direction; integrity — every echo verified and every bulk byte verified
 // with io.EOF after exactly what its sender wrote; a clean end and nothing
 // left after Runtime.Close.
 //

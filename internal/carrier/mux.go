@@ -74,7 +74,7 @@ type muxState struct {
 	relList  []*Conn  // views with relMarked (each once)
 	wakeList []*Conn  // views with a pending WakeAt (each once)
 	touched  uint64   // views a round visited (ready scratch and wake lists): the cost gate's count (L54)
-	turn     uint64   // the service clock: one tick per DRR call that placed payload (viewExt.served)
+	turn     uint64   // the service clock: one tick per DRR turn that ends (viewExt.served)
 	post     postList // the writer's
 	rpost    postList // the reader's
 }
@@ -126,7 +126,7 @@ type viewExt struct {
 	detCseq   uint32 // datagram trunks: the cseq of our REL{DETACH}
 	relMarked bool   // its last Fill found no REL room
 	served    uint64 // the service clock at the end of the view's latest DRR turn (0: none): rounds serve the least recently served first
-	resume    bool   // its last DRR call was cut short by the batch's end or the capacity cap: the next call finishes that turn
+	resume    bool   // its turn was cut short by the batch's end or the capacity cap: the next call finishes that turn
 }
 
 // lastFrame is a view's last session frame (WriteAndClose on a view).
@@ -744,18 +744,25 @@ func byService(a, b *Conn) int {
 // view it did not reach, whatever order wakes, PONGs and returns pushed
 // them onto the ready ring in (a fixed ring order with a rotating start
 // served one view several PONGs in a row while another waited,
-// TestMuxCapLimitedSharesFair). A view that was idle comes back at the
-// head: an interactive view's frame waits at most one round.
+// TestMuxCapLimitedSharesFair). The echo bound: a view that wakes is
+// served after the rest of the writer round in progress and at most one
+// turn (≤ 2·Quantum) of each ready view served less recently than it
+// (TestMuxDRREchoBound); that fits one batch only while those turns fit
+// BatchBudget.
 //
 // Deficit: a turn's quota is the deficit plus one quantum (at most two). A
-// call that places payload leaves the view q − used. A turn the shared
-// capacity cap or the batch's end cut short (the cap marked, or the batch
-// has less room than the turn has left) keeps its place and its deficit,
-// and the view's next call finishes it with a quota of that deficit (no new
-// quantum; if that rest is too small for what the view places next, the
-// turn ends and the view stays ready); a call the cap stopped before it
-// placed anything changes nothing. Any other call that places nothing
-// resets the deficit.
+// call that places payload leaves the view q − used. A turn cut short —
+// the shared capacity cap marked, or the batch ended (batchCut: no frame
+// slot left, or less byte room than the turn had left) — keeps its place
+// and its deficit, and the view's next call finishes it with a quota of
+// that deficit and no new quantum. A call that places nothing because the
+// cap stopped it or the batch had no room for its next frame changes
+// neither, and the view stays ready (R1-1: its endpoint marked itself idle
+// with payload queued). When the rest of a cut turn places nothing on a
+// batch with room for it, the rest was smaller than the view's next frame
+// (a datagram is never cut): the turn ends and the view's next turn starts
+// at once. Any other call that places nothing resets the deficit (the view
+// is idle).
 func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 	sc := t.ms.scratch[:n]
 	slices.SortFunc(sc, byService)
@@ -786,40 +793,7 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				v.ready.Store(false)
 				continue
 			}
-			q := min(v.deficit+quantum, 2*quantum)
-			if v.vx.resume {
-				q = v.deficit // the rest of a turn the batch or the cap cut
-			}
-			b.limit(q)
-			v.ready.Store(false) // R1-1 rule 3: cleared before the call
-			appended, used, capped := t.viewCall(v, b, rd, nowNs)
-			if hk := t.env.Hooks; hk != nil && hk.AfterViewFill != nil {
-				hk.AfterViewFill(t.id, v.handle)
-			}
-			ended := false // a cut turn's rest that placed nothing: the turn ends here
-			switch {
-			case used > 0:
-				v.deficit = max(q-used, 0)
-				// Cut short by the shared capacity or the batch's end (its
-				// room fell below what the turn had left): the view keeps
-				// its place and finishes the turn first in a later round.
-				v.vx.resume = v.deficit > 0 && (capped || b.budget-b.data < v.deficit)
-				if !v.vx.resume {
-					t.ms.turn++
-					v.vx.served = t.ms.turn
-				}
-			case appended == 0 && !capped:
-				if v.vx.resume {
-					// The rest of a cut turn was smaller than what the view
-					// places next (a datagram is never cut): the turn ends,
-					// and the view, which may have marked itself idle with
-					// payload queued, gets a whole turn in the next round.
-					ended = true
-					t.ms.turn++
-					v.vx.served = t.ms.turn
-				}
-				v.deficit, v.vx.resume = 0, false // nothing placed, and not for want of capacity
-			}
+			appended, used, stuck := t.drrTurn(v, b, rd, nowNs, quantum)
 			if appended == 0 && v.vx.retireQ.Load() {
 				t.mx.Lock()
 				t.retireDrainedLocked(v, b, rd, nowNs, &t.ms.post)
@@ -827,19 +801,19 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				t.runPost(&t.ms.post)
 			}
 			switch {
-			case appended == 0 && b.nearFull(), appended > 0 && used == 0, ended:
+			case stuck, appended > 0 && used == 0:
 				// The view stays ready for the next round, which the writer
 				// runs by itself (M2's self-continuation, per view; WP10):
 				// a call that placed control frames only, or nothing because
 				// the batch had no room left for what the view owes (a
-				// control frame that did not fit), did not decide that the
-				// view is idle — its endpoint marks itself idle only after a
-				// call that placed nothing, and its producers wake only idle
-				// lanes, so dropping it here lost its next data until an
-				// unrelated wakeup. It goes back onto the ring at once (not
-				// called again in this round): its next call is in the next
-				// round, whose control pass places what a producer added
-				// meanwhile before any payload (L16).
+				// control frame or a whole payload frame that did not fit),
+				// did not decide that the view is idle — its endpoint marks
+				// itself idle only after a call that placed nothing, and its
+				// producers wake only idle lanes, so dropping it here lost
+				// its next data until an unrelated wakeup. It goes back onto
+				// the ring at once (not called again in this round): its
+				// next call is in the next round, whose control pass places
+				// what a producer added meanwhile before any payload (L16).
 				sc[k] = nil
 				if v.ready.CompareAndSwap(false, true) {
 					t.mx.Lock()
@@ -863,6 +837,72 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 		}
 	}
 	b.limit(-1)
+}
+
+// drrTurn makes view v's DRR call under its quota and keeps its deficit,
+// cut-turn mark and service stamp (drrRound's rules). It returns the
+// frames and payload bytes the call appended, and stuck: the call placed
+// nothing because the batch had no room for the view's next frame (the
+// view stays ready). The rest of a cut turn that places nothing on a batch
+// with room for it ends the turn, and the view's next turn is called at
+// once (at most two calls).
+func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum int) (appended, used int, stuck bool) {
+	for {
+		q := min(v.deficit+quantum, 2*quantum)
+		resumed := v.vx.resume
+		if resumed {
+			q = v.deficit // the rest of a turn the batch or the cap cut
+		}
+		b.limit(q)
+		v.ready.Store(false) // R1-1 rule 3: cleared before the call
+		var capped bool
+		appended, used, capped = t.viewCall(v, b, rd, nowNs)
+		if hk := t.env.Hooks; hk != nil && hk.AfterViewFill != nil {
+			hk.AfterViewFill(t.id, v.handle)
+		}
+		short := batchCut(b, q-used)
+		switch {
+		case used > 0:
+			v.deficit = max(q-used, 0)
+			// Cut short by the shared capacity or the batch's end: the view
+			// keeps its place and finishes the turn first in a later round.
+			v.vx.resume = v.deficit > 0 && (capped || short)
+			if !v.vx.resume {
+				t.ms.turn++
+				v.vx.served = t.ms.turn
+			}
+			return appended, used, false
+		case appended > 0:
+			return appended, 0, false // control frames only: no change
+		case capped:
+			// The cap stopped it before it placed anything: no change (the
+			// PONG re-readies it); it stays ready when the batch may have
+			// refused a control frame (nearFull, as below).
+			return 0, 0, b.nearFull()
+		case short || b.nearFull():
+			return 0, 0, true // no room for its next frame: no change, and it stays ready
+		}
+		v.deficit, v.vx.resume = 0, false // nothing placed, and not for want of room
+		if !resumed {
+			return 0, 0, false // idle
+		}
+		// The rest of a cut turn was smaller than the view's next frame:
+		// the turn ends, and its next turn starts at once.
+		t.ms.turn++
+		v.vx.served = t.ms.turn
+	}
+}
+
+// batchCut reports that the batch, not the call's quota, may have ended a
+// view's call: no frame slot or control arena is left (Full), or the batch
+// already carries payload and has less byte room than the quota had left
+// (rest; a stream batch only — a datagram batch has no byte budget, and
+// an empty batch offers the next round nothing more). It cannot tell a
+// view that ran out of data at such a moment from one the batch stopped:
+// that view keeps its place for one more call (the rest of its turn, or a
+// call that places nothing), a bounded cost.
+func batchCut(b *Batch, rest int) bool {
+	return b.Full() || (b.data > 0 && b.budget-b.data < rest)
 }
 
 // viewCall makes one Fill call of view v (quota set by the caller) and

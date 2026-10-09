@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // WP DRR tests of the MUX writer's rotation and deficit rules (M3 design
@@ -20,26 +22,30 @@ import (
 // (the session's capacity line, Capacity − Inflight − Taken, M3-D11).
 type capPool struct {
 	chunk  *Buf
+	dgram  int // > 0: the rounds run on a datagram batch of that frame budget (SetDatagram)
 	left   int
 	calls  int              // payload calls in the round
 	order  []uint32         // the handles of the round's payload calls, in call order
+	placed []int            // the payload bytes of each of those calls
 	served map[uint32]int   // payload bytes placed per handle in the round
 	rooms  map[uint32][]int // Room at the start of each payload call, per handle
 }
 
 func (p *capPool) reset(left int) {
-	p.left, p.calls, p.order = left, 0, p.order[:0]
+	p.left, p.calls, p.order, p.placed = left, 0, p.order[:0], p.placed[:0]
 	p.served, p.rooms = map[uint32]int{}, map[uint32][]int{}
 }
 
 // capEP is one view's endpoint over a capPool; avail < 0 is a view that is
 // always backlogged. frame > 0 places whole frames of that size only (a
-// datagram is never cut).
+// datagram is never cut); dgram places them as DGRAMs (a packet session's
+// datagrams, on a stream or a datagram batch).
 type capEP struct {
 	hEP
 	pool  *capPool
 	avail int
 	frame int
+	dgram bool
 }
 
 func (e *capEP) Fill(c *Conn, b *Batch) {
@@ -50,6 +56,8 @@ func (e *capEP) Fill(c *Conn, b *Batch) {
 	p.calls++
 	p.order = append(p.order, h)
 	p.rooms[h] = append(p.rooms[h], b.Room())
+	before := p.served[h]
+	defer func() { p.placed = append(p.placed, p.served[h]-before) }()
 	for e.avail != 0 {
 		if p.left <= 0 {
 			b.MarkCapBlocked()
@@ -65,7 +73,14 @@ func (e *capEP) Fill(c *Conn, b *Batch) {
 		if e.avail > 0 {
 			n = min(n, e.avail)
 		}
-		if n <= 0 || !b.AddData(h, 0, p.chunk.B[:n], p.chunk, false) {
+		if n <= 0 {
+			return
+		}
+		if e.dgram {
+			if !b.AddDgram(h, 0, p.chunk.B[:n], p.chunk) {
+				return
+			}
+		} else if !b.AddData(h, 0, p.chunk.B[:n], p.chunk, false) {
 			return
 		}
 		p.left -= n
@@ -102,6 +117,9 @@ func capTrunk(n, budget int) (*Conn, []*Conn, []*capEP, *capPool, func(left int,
 			views[i].Wake()
 		}
 		b.Reset(time.Now())
+		if pool.dgram > 0 {
+			b.SetDatagram(pool.dgram, 0)
+		}
 		c.fillRound(b)
 		b.Reset(time.Time{})
 	}
@@ -214,11 +232,17 @@ func TestMuxDRRTurnCutByBatchEnd(t *testing.T) {
 // TestMuxDRRCutTurnTooSmallStaysReady (§A5.3 amended; R1-1): a view that
 // places whole 20-KiB frames (a datagram is never cut) on a batch of
 // 62 KiB places three per round, and its turn is cut with 4 KiB left —
-// less than a frame. PASS: the rest of the turn places nothing, the turn
-// ends there, and the view stays ready: without any further wake (its
-// session marked itself idle after the call that placed nothing, so its
-// producers would not wake it) it places three frames in each of the
-// next 8 rounds.
+// less than a frame. Its call in the round's next pass, and an idle
+// view's call after it, find the batch too short and place nothing. PASS:
+// both views stay ready; in the next round the rest of the cut turn places
+// nothing on the empty batch, so the turn ends there and the view's next
+// turn starts at once: without any further wake (its session marked
+// itself idle after the call that placed nothing, so its producers would
+// not wake it) it places three frames in each of the next 8 rounds. The
+// idle view, once called on an empty batch, leaves the ring: it is not
+// called after round 3. m3 (8a9b989) dropped the 20-KiB view after its
+// first call that placed nothing (the stall of R1-1); carrying the ended
+// turn's next turn to the next round halves its rate.
 func TestMuxDRRCutTurnTooSmallStaysReady(t *testing.T) {
 	_, _, eps, pool, round := capTrunk(2, 62<<10)
 	eps[0].frame = 20 << 10
@@ -228,14 +252,77 @@ func TestMuxDRRCutTurnTooSmallStaysReady(t *testing.T) {
 		if pool.served[1] != 60<<10 {
 			t.Fatalf("round %d: view 1 placed %d bytes, want three 20-KiB frames (it has data and no wake came)", r, pool.served[1])
 		}
+		if r > 3 && len(pool.rooms[2]) > 0 {
+			t.Fatalf("round %d: the idle view 2 was called %d times, want none after round 3 (an empty batch had room for its turn)", r, len(pool.rooms[2]))
+		}
 		round(1<<30, false)
 	}
 }
 
-// TestMuxDRREchoWithinOneRound (§A5.3 fairness bound: an interactive
-// view's frame waits at most one round of other views' payload; L15):
-// three backlogged views and an echo view share a trunk whose batch holds
-// two quanta. A producer writes 1 KiB to the echo view and wakes it during
+// TestMuxDRRCapStopNearFullStaysReady (§A5.3 amended; R1-1): view 1's
+// payload call fills the control arena with RSTs until the batch is
+// nearly full; meanwhile view 2's session queued an RST, which the batch
+// then refuses in view 2's payload call, and the shared capacity is
+// exhausted (the call marks the cap). PASS: view 2 stays ready, and the
+// next round's control pass places its RST without any PONG or wake. A
+// view the cap stopped waits on the cap list for the PONG, but a control
+// frame does not wait for capacity.
+func TestMuxDRRCapStopNearFullStaysReady(t *testing.T) {
+	_, views, _, _, round := capTrunk(2, 256<<10)
+	ctl := &capCtlEP{}
+	views[0].ep = &rstFillEP{fill: true, then: func() { ctl.pending = true }}
+	views[1].ep = ctl
+	round(1<<30, false, 0, 1)
+	if !ctl.pending || ctl.placed != 0 {
+		t.Fatalf("round 1: view 2's RST placed %d (pending %v), want it refused by the nearly full batch", ctl.placed, ctl.pending)
+	}
+	round(1<<30, false)
+	if ctl.placed != 1 {
+		t.Fatalf("round 2 (no PONG, no wake): view 2's RST placed %d times, want once (it stays ready)", ctl.placed)
+	}
+}
+
+// rstFillEP's first payload call runs then and places RSTs with full
+// messages until the batch is nearly full (its control arena).
+type rstFillEP struct {
+	hEP
+	fill bool
+	then func()
+}
+
+func (e *rstFillEP) Fill(c *Conn, b *Batch) {
+	if b.ControlOnly() || !e.fill {
+		return
+	}
+	e.fill = false
+	e.then()
+	r := &wire.Rst{Msg: make([]byte, wire.MaxMsg)}
+	for !b.nearFull() && b.AddRst(c.Handle(), r) {
+	}
+}
+
+// capCtlEP places a queued RST when the batch takes it, and marks every
+// payload call cap-blocked (its capacity is exhausted).
+type capCtlEP struct {
+	hEP
+	pending bool
+	placed  int
+}
+
+func (e *capCtlEP) Fill(c *Conn, b *Batch) {
+	if e.pending && b.AddRst(c.Handle(), &wire.Rst{Msg: make([]byte, wire.MaxMsg)}) {
+		e.pending = false
+		e.placed++
+	}
+	if !b.ControlOnly() {
+		b.MarkCapBlocked()
+	}
+}
+
+// TestMuxDRREchoWithinOneRound (§A5.3 echo bound where the turns of the
+// views ahead of the echo fit one batch; L15; the general bound is
+// TestMuxDRREchoBound): three backlogged views and an echo view share a
+// trunk whose batch holds two quanta. A producer writes 1 KiB to the echo view and wakes it during
 // a backlogged view's payload call (round r), at phases of the rotation
 // that vary. PASS: the echo's bytes leave by round r + 1, all 40 times
 // (in round r when the echo was still in the round's scratch, behind the
@@ -289,4 +376,157 @@ func (e *injectEP) Fill(c *Conn, b *Batch) {
 		f()
 	}
 	e.capEP.Fill(c, b)
+}
+
+// TestMuxDRRSmallFramesShareFair (§A5.3 amended; M3-D10, L15): backlogged
+// views that place 1200-B frames — a packet session's datagrams on a
+// stream or a datagram trunk, or small DATA frames — fill a batch's 64
+// frame slots (MaxBatchFrames) at about 1.2 quanta, long before its 256-KiB
+// budget, so every round's batch ends inside a view's turn. PASS: over 40
+// rounds every view's bytes are within [0.8, 1.25] of the views' mean, for
+// 2 and 4 views. When only the byte budget was read as the batch's end
+// (ea48075), the view the frame limit cut ended its turn, went behind the
+// first view of every round and got about a sixth of its bytes.
+func TestMuxDRRSmallFramesShareFair(t *testing.T) {
+	const frame, rounds = 1200, 40
+	kinds := []struct {
+		name   string
+		dgram  bool
+		budget int // > 0: a datagram batch of that frame budget
+	}{
+		{"DGRAM on a stream batch", true, 0},
+		{"DGRAM on a datagram batch", true, 1400},
+		{"DATA", false, 0},
+	}
+	for _, k := range kinds {
+		for _, n := range []int{2, 4} {
+			t.Run(fmt.Sprintf("%s, %d views", k.name, n), func(t *testing.T) {
+				_, _, eps, pool, round := capTrunk(n, 256<<10)
+				pool.dgram = k.budget
+				wake := make([]int, n)
+				for i, e := range eps {
+					e.frame, e.dgram, wake[i] = frame, k.dgram, i
+				}
+				total := map[uint32]int{}
+				for r := 0; r < rounds; r++ {
+					if r == 0 {
+						round(1<<30, false, wake...)
+					} else {
+						round(1<<30, false)
+					}
+					for h, x := range pool.served {
+						total[h] += x
+					}
+				}
+				sum := 0
+				for _, x := range total {
+					sum += x
+				}
+				mean := float64(sum) / float64(n)
+				t.Logf("bytes per view over %d rounds: %v (mean %.0f)", rounds, total, mean)
+				for h := uint32(1); h <= uint32(n); h++ {
+					if r := float64(total[h]) / mean; r < 0.8 || r > 1.25 {
+						t.Fatalf("over %d rounds the views placed %v bytes: view %d holds %.2f of the mean, want within [0.8, 1.25]", rounds, total, h, r)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestMuxDRRFreshTurnTooSmallStaysReady (§A5.3 amended; R1-1): on a 62-KiB
+// batch view 1 places its last 50 KiB, and view 2, whose whole 20-KiB
+// frames (a datagram is never cut) do not fit the 12 KiB the batch has
+// left, places nothing in its fresh turn. PASS: view 2 stays ready —
+// without any further wake (its session marked itself idle after the call
+// that placed nothing, so its producers would not wake it) it places three
+// frames in each of the next 8 rounds. On ea48075 and on m3 (8a9b989) the
+// call that found the batch too short dropped view 2 from the ring.
+func TestMuxDRRFreshTurnTooSmallStaysReady(t *testing.T) {
+	_, _, eps, pool, round := capTrunk(2, 62<<10)
+	eps[0].avail = 50 << 10
+	eps[1].frame = 20 << 10
+	round(1<<30, false, 0, 1)
+	if pool.served[1] != 50<<10 || pool.served[2] != 0 {
+		t.Fatalf("round 1 placed %v, want view 1's 50 KiB and nothing of view 2 (its 20-KiB frame does not fit the 12 KiB left)", pool.served)
+	}
+	for r := 2; r <= 9; r++ {
+		round(1<<30, false)
+		if pool.served[2] != 60<<10 {
+			t.Fatalf("round %d: view 2 placed %d bytes, want three 20-KiB frames (it has data and no wake came)", r, pool.served[2])
+		}
+	}
+}
+
+// TestMuxDRREchoBound (§A5.3 amended, the echo bound; L15): eight
+// backlogged views and an interactive view share a trunk whose batch holds
+// four quanta. The interactive view's producer alternates 1-KiB writes and
+// 100-KiB bursts; each write comes the round after the previous one left,
+// during view 1's payload call, so the view's last turn ended anywhere in
+// the rotation — between none and all of the backlogged views were served
+// less recently. PASS, for each of 120 writes: after the writer round in
+// progress, every other view places at most one turn (2·Quantum) before
+// the view's first frame. The wait spans more than one writer round when
+// the views ahead of it hold more than a batch (here up to 8 × 64 KiB
+// against 256 KiB): the bound is one DRR round of turns, not one batch.
+func TestMuxDRREchoBound(t *testing.T) {
+	const q, bulk, writes = defMuxQuantum, 8, 120
+	_, views, eps, pool, round := capTrunk(bulk+1, 4*q)
+	echo, eh := eps[bulk], uint32(bulk+1)
+	echo.avail = 0
+	prod := &injectEP{capEP: eps[0]}
+	views[0].ep = prod
+	all := make([]int, bulk)
+	for i := range all {
+		all[i] = i
+	}
+	round(1<<30, false, all...)
+	n, firedAt, first, cur, next := 0, -1, false, 0, 1
+	worstRounds, worstBytes := 0, 0
+	since := map[uint32]int{}
+	for r := 1; n < writes; r++ {
+		if r > 100*writes {
+			t.Fatalf("%d writes in %d rounds", n, r)
+		}
+		cur = r
+		if firedAt < 0 && prod.fn == nil && r >= next {
+			size := []int{1 << 10, 100 << 10}[n%2]
+			prod.fn = func() {
+				firedAt, first = cur, false
+				echo.avail = size
+				views[bulk].Wake()
+			}
+		}
+		round(1<<30, false)
+		if firedAt < 0 {
+			continue
+		}
+		if !first {
+			for i, h := range pool.order {
+				if h == eh && pool.placed[i] > 0 {
+					first = true
+					break
+				}
+				if h != eh && r > firedAt {
+					since[h] += pool.placed[i]
+				}
+			}
+			if r > firedAt {
+				worstRounds = max(worstRounds, r-firedAt)
+			}
+			sum := 0
+			for h, x := range since {
+				sum += x
+				if x > 2*q {
+					t.Fatalf("write %d (woken in round %d): view %d placed %d bytes after the round in progress and before the interactive view's first frame, want at most one turn (%d)", n, firedAt, h, x, 2*q)
+				}
+			}
+			worstBytes = max(worstBytes, sum)
+		}
+		if first && echo.avail == 0 {
+			n, firedAt, next = n+1, -1, r+1
+			clear(since)
+		}
+	}
+	t.Logf("%d writes; the longest wait after the wake's round: %d writer rounds, %d bytes of other views", writes, worstRounds, worstBytes)
 }
