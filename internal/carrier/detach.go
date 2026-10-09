@@ -611,8 +611,15 @@ func (t *trunk) onDetachLocked(d wire.Detach, una uint32, p *postList) string {
 		}
 	default:
 		// attached-pending, pending, joining, held: the view ends; we
-		// answer DETACH(ended) (R1-5, R1-9).
-		v.vx.needResp.Store(false)
+		// answer DETACH(ended) (R1-5, R1-9). A passive view that has not
+		// answered keeps needResp: its session's Fill may be placing its
+		// first response right now (the writer read needResp before this
+		// dispatch, or reads it after), and a refusal it places ends the
+		// handle — responsePlacedLocked then withdraws the queued DETACH,
+		// which the dialer, having ended the handle at the refusal, would
+		// take for a DETACH of an unknown handle and kill the trunk for
+		// (M3-D7; DEFECT A, TestPassiveResponseCrossesPeerDetach_R1_9).
+		// abandonLocked queues the DETACH, not a refusal: peerDet is set.
 		t.abandonLocked(v, wire.DetachEnded, p)
 	}
 	return ""
