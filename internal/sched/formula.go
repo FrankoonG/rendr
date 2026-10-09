@@ -63,10 +63,35 @@ func StallWindow(srtt time.Duration, batch int, rate float64, min, max time.Dura
 
 // Capacity is a carrier's in-flight cap (plan §4):
 // clamp(2·rate·(minRTT + pingBusy + 50 ms), floor, ceil); minRTT 0 counts as
-// 50 ms.
+// 50 ms. It is CapacityDuplex without a reverse-path allowance.
 //
 // When floor > ceil the ceiling wins: the cap never exceeds the window.
 func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) int64 {
+	return CapacityDuplex(rate, minRTT, pingBusy, 0, 0, floor, ceil)
+}
+
+// CapacityDuplex is the in-flight cap with an allowance for the reverse
+// path (M3 estimator amendment): clamp(2·rate·(minRTT + pingBusy + 50 ms) +
+// min(revRate, rate)·rev, floor, ceil), where rev is the queueing delay our
+// PONGs meet on their way back behind the peer's own DATA (bulk both ways
+// on one carrier) and revRate the rate this side delivered recently; a
+// non-positive (or NaN) rev, revRate or rate adds nothing.
+//
+// A byte is proven a forward trip, the reverse queue and the rest of the
+// return trip after it is written. A cap sized from minRTT alone leaves
+// the side whose PONGs wait behind the peer's queue capped below the link;
+// its rate samples, taken while the peer is BUSY, measure what it achieved
+// and lower the cap again, until the estimate settles near CapFloor/srtt
+// (TestMuxBulkBothWaysKeepsTheLink). Both sides see the same round trip, so
+// no function of it alone can tell the reverse queue from the forward one;
+// rev is measured one way (the carrier's noteOWD). The allowance counts
+// once: it covers a delay the writer does not cause. Its rate is the
+// delivered average, bounded by the estimate, because the estimate is a
+// decaying maximum that bulk both ways overestimates (ACK compression; up
+// to 3× in TestByteClockDuplexRateBounded_L32): each side's allowance is
+// the other side's queue, so an overestimated multiplier would feed the
+// two queues into each other.
+func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float64, rev time.Duration, floor, ceil int64) int64 {
 	if minRTT <= 0 {
 		minRTT = capUnknownRTT
 	}
@@ -79,6 +104,9 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 		// then one division: exact for every realistic rate, so table
 		// values do not drift by one byte.
 		c = 2 * rate * (float64(minRTT) + float64(pingBusy) + float64(capSlack)) / float64(time.Second)
+	}
+	if rev > 0 && revRate > 0 && rate > 0 { // also false for NaN
+		c += min(revRate, rate) * float64(rev) / float64(time.Second)
 	}
 	if c >= float64(ceil) { // also +Inf; the integer bound, as in clampNs
 		return ceil

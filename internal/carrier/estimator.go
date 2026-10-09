@@ -33,6 +33,10 @@ const (
 	// PINGs of a burst (endPing).
 	clockStepMin = 64 << 10
 	clockStepDiv = 8
+	// owdGain and owdCreep smooth the reverse queue and let its floor
+	// follow the peer's clock (noteOWD).
+	owdGain  = 8
+	owdCreep = 16
 )
 
 // pingRecord is one PING of this incarnation (design §4.10, D14).
@@ -74,6 +78,20 @@ type carrierState struct {
 	intervalStart time.Time
 	lastBusy      bool // the latest judged backlog state, carried by every PING sent since (Stats.Backlogged)
 	peerBusy      bool // the BUSY flag of the latest PING received (Stats.PeerBusy)
+
+	// The reverse path (revDelayLocked): the one-way delay of the peer's
+	// PINGs, read against their TS (the peer's clock, so with an unknown
+	// offset), its floor owdBase, and revQ, the smoothed excess over the
+	// floor: the queueing our PONGs meet behind the peer's DATA.
+	owdBase time.Duration
+	owdSeen bool
+	revQ    time.Duration
+	// The delivered rate (bytes/s): PONG-watermark progress over the last
+	// window of at least two smoothed RTTs (noteDelivered), an average, not
+	// a decaying max: the reverse-path allowance's rate.
+	dlvRate float64
+	dlvMark uint64
+	dlvAt   time.Time
 
 	// Carrier-level control.
 	pong       wire.Ping // latest PING received: answered by the next PONG (latest wins, L08)
@@ -421,6 +439,7 @@ func (t *trunk) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt tim
 		}
 		st.rateMark, st.rateAt, st.rateCommitAt = st.pongMark, now, rec.committedAt
 	}
+	st.noteDelivered(now)
 	rx := t.rxBytes.Load()
 	if dt := now.Sub(st.rxAt); dt >= minRateSample {
 		st.rxRate *= decay(dt)
@@ -478,6 +497,68 @@ func (st *carrierState) rateSpan() time.Duration {
 	return minRateSample
 }
 
+// noteOWD takes the one-way delay d of a PING the peer sent — our clock at
+// arrival minus the PING's TS, the peer's monotonic clock at encode, so d
+// carries the unknown offset of the two clocks — and busy, the BUSY flag it
+// carried. The floor owdBase is the smallest d seen: the path's propagation
+// plus the offset. The excess d − owdBase is what the PING waited in the
+// peer's socket and the path's queue towards us; our PONGs wait there too,
+// behind the same DATA. revQ follows a rising excess at once (a PONG is
+// late as soon as the queue grows) and a falling one with gain 1/8, as
+// srtt. A PING without BUSY moves the floor up by a sixteenth of its
+// excess: a peer without a backlog has no standing queue, so the floor
+// follows a peer clock that runs slow against ours (whose drift would
+// otherwise grow the excess for the life of the carrier) and returns at
+// once to a smaller d. While the peer stays BUSY the floor holds and
+// drifts at the clocks' relative rate (0.1 ms per second at 100 ppm);
+// revDelayLocked bounds what the capacity takes from it.
+func (st *carrierState) noteOWD(d time.Duration, busy bool) {
+	switch {
+	case !st.owdSeen || d < st.owdBase:
+		st.owdBase, st.owdSeen = d, true
+	case !busy:
+		st.owdBase += (d - st.owdBase) / owdCreep
+	}
+	if q := d - st.owdBase; q > st.revQ {
+		st.revQ = q
+	} else {
+		st.revQ += (q - st.revQ) / owdGain
+	}
+}
+
+// noteDelivered closes a delivered-rate window at a matched PONG once it
+// spans two smoothed RTTs: dlvRate is the PONG watermark's progress over
+// the window, an average where the rate estimate is a decaying maximum.
+// PONGs released together after waiting behind the peer's write or queue
+// prove at once bytes delivered over a longer time; over two RTTs such a
+// cluster weighs less than in one rate sample, and the allowance takes the
+// smaller of this and the rate estimate (sched.CapacityDuplex).
+func (st *carrierState) noteDelivered(now time.Time) {
+	if st.dlvAt.IsZero() {
+		st.dlvMark, st.dlvAt = st.pongMark, now
+		return
+	}
+	if dt := now.Sub(st.dlvAt); dt >= max(2*st.srtt, minRateSample) {
+		st.dlvRate = float64(st.pongMark-st.dlvMark) / dt.Seconds()
+		st.dlvMark, st.dlvAt = st.pongMark, now
+	}
+}
+
+// revDelayLocked is the reverse-path allowance of the capacity
+// (sched.CapacityDuplex): the smoothed queueing delay of the peer's PINGs
+// (noteOWD) while the peer reports BUSY, and nothing otherwise — a peer
+// without a backlog queues no DATA in front of our PONGs. It never exceeds
+// srtt − minRTT, the queueing that the round trips of our own PINGs measured
+// in both directions together: the reverse queue is part of it, so a wrong
+// TS (a peer clock that drifts, a peer that lies) adds at most what the
+// round trip already shows.
+func (st *carrierState) revDelayLocked() time.Duration {
+	if !st.peerBusy || !st.rttSeen {
+		return 0
+	}
+	return max(0, min(st.revQ, st.srtt-st.minRTT))
+}
+
 // onPing records a PING received at now: the next PONG answers it (latest
 // wins: a flood of PINGs behind a blocked write collapses into one PONG,
 // L08), its BUSY flag becomes Stats.PeerBusy, and it restarts the
@@ -487,6 +568,7 @@ func (t *trunk) onPing(busy bool, p *wire.Ping, now time.Time) {
 	st := &t.st
 	st.pong, st.pongDue = *p, true
 	st.lastPingRx = now
+	st.noteOWD(time.Duration(int64(now.Sub(t.base))-int64(p.TS)), busy)
 	if st.peerBusy != busy {
 		st.peerBusy = busy
 		t.gaugeUpdateLocked()

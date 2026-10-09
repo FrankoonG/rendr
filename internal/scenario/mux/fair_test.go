@@ -385,9 +385,13 @@ func p99(ds []time.Duration) time.Duration {
 // sessions (4 sending A → B, 4 B → A, open-ended) and 1 echo session share
 // the one carrier of a one-factory Peer over a Link of 20 ms RTT shaped to
 // 4 MiB/s per direction (under -race too, see fairness) with a bottleneck
-// queue of rate/16 (62.5 ms; rendrtest's default 2-MiB buffer is a 500-ms
-// queue at 4 MiB/s, and with it one direction of a carrier loaded both
-// ways collapses: TestMuxBulkBothWaysKeepsTheLink, DEFECT 2).
+// queue of rate/16 (62.5 ms). With rendrtest's default 2-MiB buffer (a
+// 500-ms queue at 4 MiB/s) the load holds since the capacity's
+// reverse-path allowance (DEFECT 2, TestMuxBulkBothWaysKeepsTheLink), but
+// the echo's round trip crosses both directions' standing queues (P99
+// 0.93–1.17 s against a limit of 0.72–0.93 s, which counts one Cap) and
+// the 1-s Jain windows fall to 0.59–0.95 (measured at -cpu 1, 2 and 4), so
+// the row keeps the short queue.
 //
 // Premise sizing (A11.5 rule 3; an amendment of A11.2 that needs the
 // owner's sign-off): fairness is measured as byte shares over 1-s windows,
@@ -420,11 +424,16 @@ func TestMuxFairness_L15(t *testing.T) {
 // with roundRobin every bulk session's 1-s window must also hold the
 // direction's mean ± 2 quanta (TestMuxFairnessDefaultQuantum_L15).
 func fairness(t *testing.T, quantum int, roundRobin bool) {
-	// 4 MiB/s under -race too (not R1-11's quarter): at 2 MiB/s one
-	// direction of the carrier, loaded both ways, falls to 0.55–0.85 of the
-	// link with any bottleneck queue from 64 to 512 KiB, with or without
-	// the race detector (DEFECT 2, TestMuxBulkBothWaysKeepsTheLink); the
-	// row returns to R1-11's size once that is fixed.
+	// 4 MiB/s under -race too (not R1-11's half). Before the capacity's
+	// reverse-path allowance (DEFECT 2, TestMuxBulkBothWaysKeepsTheLink) one
+	// direction of the carrier, loaded both ways at 2 MiB/s, fell to
+	// 0.55–0.85 of the link with any bottleneck queue from 64 to 512 KiB.
+	// With it this row at 2 MiB/s carries 0.89–0.94 per direction without
+	// the race detector, but 0.84–0.94 under it (1 of 8 runs below 0.85).
+	// The largest delay left in the traces of such a Link is a PONG waiting
+	// behind the peer's Write in progress (a 256-KiB batch into a 128-KiB
+	// queue at 2 MiB/s blocks for about 125 ms), which the allowance does
+	// not measure; the row returns to R1-11's size once that is addressed.
 	const rate = float64(4 << 20)
 	const oneWay, run = 10 * time.Millisecond, 10 * time.Second
 	ov := testhooks.Overrides{MuxQuantum: quantum}
