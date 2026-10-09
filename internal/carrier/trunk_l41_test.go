@@ -144,7 +144,10 @@ func (e *l41PacketEP) Datagram(c *Conn, seq uint64, p []byte, buf *Buf) error {
 	e.ackDue = true
 	e.mu.Unlock()
 	buf.Release()
-	c.Wake()
+	// No Wake here: the script wakes the writer once the whole peer
+	// datagram was dispatched. A wake per frame let the writer run between
+	// two frames of one datagram under load (an extra PACK), so the trace
+	// was not deterministic.
 	return nil
 }
 
@@ -296,8 +299,12 @@ func l41Dgram(t *testing.T) (wireBytes, rx []byte) {
 		time.Sleep(14 * time.Millisecond)
 		p.send(dgram(1, 300), dgram(2, 500))
 		synctest.Wait()
+		s.c.Wake() // one PACK for both (l41PacketEP.Datagram)
+		synctest.Wait()
 		time.Sleep(13 * time.Millisecond)
 		p.send(dgram(3, 1100))
+		synctest.Wait()
+		s.c.Wake()
 		synctest.Wait()
 		pong()
 		synctest.Wait()
