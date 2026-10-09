@@ -24,6 +24,26 @@ func (c *Conn) TrunkDone() <-chan struct{} {
 	return c.tdone
 }
 
+// OnTrunkDone registers f, run once on a goroutine of its own when
+// TrunkDone closes, or at once (on a goroutine) when it already closed: the
+// passive owner's bookkeeping at the trunk's end (M3-D22), which so keeps
+// no goroutine of its own beside a running trunk (F44: two goroutines per
+// carrier, its reader and its writer). One hook per trunk; a later call
+// replaces one that has not run. A no-op on a bare Conn or with a nil f.
+func (c *Conn) OnTrunkDone(f func()) {
+	if c.trunk == nil || f == nil {
+		return
+	}
+	c.jmu.Lock()
+	if c.join.doneClosed {
+		c.jmu.Unlock()
+		go f()
+		return
+	}
+	c.join.trunkDone = f
+	c.jmu.Unlock()
+}
+
 // Views returns the views of the trunk that are not gone (§A5.4: opening,
 // awaiting, attached-pending, live and retiring on the dialer; pending,
 // joining, held, live and retiring on the passive) — the count the close
