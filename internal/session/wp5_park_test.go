@@ -65,26 +65,38 @@ func wp5Lane(s *Session, i int) *lane {
 	return nil
 }
 
-// TestActorParksWhenIdle (M3-D42, M3-D44): both actors of an idle session
-// run right after the open and park once the default linger (1 s) passed
-// since their last step that did work — the dialer's exactly then: the
-// running-actor gauge (Status.Actors) drops to 0 and the parked gauge
-// counts both. Traffic restarts them and they park again; the session
-// stays open and intact.
+// TestActorParksWhenIdle (M3-D42, M3-D44, R1-22, R1-24): both actors of
+// an idle session run right after the open and park once the default
+// linger (1 s) passed since their last step that did work — the dialer's
+// exactly then: the running-actor gauge (Status.Actors) drops to 0 and the
+// parked gauge counts both. With no deadline armed a parked idle actor
+// stays parked: over ten lingers neither tries to park again (no restart),
+// and a transfer runs intact on the data path alone. A ring restarts each
+// actor: the parked gauge gives both back, they park again at once (the
+// step did no work), and the gauge again counts exactly the two; then they
+// stay parked.
 func TestActorParksWhenIdle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		var target atomic.Pointer[Session]
+		var sa, sb atomic.Pointer[Session]
 		var parkAt atomic.Pointer[time.Time]
+		var parksA, parksB atomic.Int64 // park attempts of each actor
 		hooks := &testhooks.Hooks{AtPark: func(id [16]byte) {
-			if s := target.Load(); s != nil && s.id == id && parkAt.Load() == nil {
-				now := time.Now()
-				parkAt.Store(&now)
+			if s := sa.Load(); s != nil && s.id == id {
+				parksA.Add(1)
+				if parkAt.Load() == nil {
+					now := time.Now()
+					parkAt.Store(&now)
+				}
+			}
+			if s := sb.Load(); s != nil && s.id == id {
+				parksB.Add(1)
 			}
 		}}
 		w := wp5NewWorld(t, hooks, 0)
 		defer w.teardown()
 		a, b := w.open(ModeSelector, nil, w.link("p1"))
-		target.Store(a)
+		sa.Store(a)
+		sb.Store(b)
 		synctest.Wait()
 		if ga, gb := w.ga.Load(), w.gb.Load(); ga != 1 || gb != 1 {
 			t.Fatalf("stimulus: %d and %d running actors right after the open, want 1 and 1", ga, gb)
@@ -110,6 +122,17 @@ func TestActorParksWhenIdle(t *testing.T) {
 		if d := testhooks.ParkedSessions.Load() - parked0; d != 2 {
 			t.Fatalf("ParkedSessions grew by %d, want 2", d)
 		}
+		for _, s := range []*Session{a, b} {
+			if act := s.mb.actor.Load(); !act.wakeAt.IsZero() {
+				t.Fatalf("stimulus: the parked %s actor has a deadline at %v, want none", wpsessRole(s), act.wakeAt)
+			}
+		}
+		// Idle: a parked actor without a deadline is never restarted.
+		time.Sleep(10 * defActorLinger)
+		synctest.Wait()
+		if pa, pb := parksA.Load(), parksB.Load(); pa != 1 || pb != 1 {
+			t.Fatalf("%d and %d park attempts over ten idle lingers since the open, want 1 and 1 (an idle parked actor restarted)", pa, pb)
+		}
 		if we, re := acTransfer(a, b, 256<<10, 21, false); we != nil || re != nil {
 			t.Fatalf("transfer after parking: %v %v", we, re)
 		}
@@ -118,8 +141,24 @@ func TestActorParksWhenIdle(t *testing.T) {
 		}
 		time.Sleep(2 * defActorLinger)
 		synctest.Wait()
+		pa, pb := parksA.Load(), parksB.Load()
+		a.ringActor()
+		b.ringActor()
+		synctest.Wait()
 		if ga, gb := w.ga.Load(), w.gb.Load(); ga != 0 || gb != 0 {
-			t.Fatalf("%d and %d actors running two lingers after the transfer, want 0", ga, gb)
+			t.Fatalf("%d and %d actors running after the rings, want 0 (parked again at once)", ga, gb)
+		}
+		if da, db := parksA.Load()-pa, parksB.Load()-pb; da != 1 || db != 1 {
+			t.Fatalf("stimulus: %d and %d park attempts after one ring each, want 1 and 1 (each ring restarted its actor)", da, db)
+		}
+		if d := testhooks.ParkedSessions.Load() - parked0; d != 2 {
+			t.Fatalf("ParkedSessions grew by %d after the restart and the second park, want 2 (a restart gives its count back)", d)
+		}
+		pa, pb = parksA.Load(), parksB.Load()
+		time.Sleep(10 * defActorLinger)
+		synctest.Wait()
+		if da, db := parksA.Load()-pa, parksB.Load()-pb; da != 0 || db != 0 {
+			t.Fatalf("%d and %d more park attempts over ten idle lingers after the transfer, want 0", da, db)
 		}
 	})
 }
@@ -188,12 +227,13 @@ func TestActorParkPostRace_L09(t *testing.T) {
 	})
 }
 
-// TestActorNeverConcurrent_L09 (M3-D42, L09): 1000 kicks and rings from 8
-// goroutines, in rounds that start together on a parked actor, while every
-// critical section of a step yields: at most one goroutine is ever inside
-// a step of the session, the running-actor gauge never exceeds 1 (no kick
-// starts a second goroutine), and the kicks restarted the parked actor in
-// every round.
+// TestActorNeverConcurrent_L09 (M3-D42, L09): 1000 kicks, rings and posts
+// from 8 goroutines, in rounds that start together on a parked actor,
+// while every critical section of a step yields: at most one goroutine is
+// ever inside a step of the session, the running-actor gauge never
+// exceeds 1 (no kick starts a second goroutine), the kicks restarted the
+// parked actor in every round, and no wakeup was lost: each round's posted
+// commands are handled within one virtual millisecond of the round.
 func TestActorNeverConcurrent_L09(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var parks atomic.Int64
@@ -231,22 +271,33 @@ func TestActorNeverConcurrent_L09(t *testing.T) {
 		afterUnlockHook.Store(&hook)
 		defer afterUnlockHook.CompareAndSwap(&hook, nil)
 		act := a.mb.actor.Load()
+		replies := make(chan bool, 8)
 		for round := range 125 {
 			go1 := make(chan struct{})
 			var wg sync.WaitGroup
 			for g := range 8 {
 				wg.Go(func() {
 					<-go1 // the 8 kicks of a round start together on the parked actor
-					if (g+round)%2 == 0 {
+					switch (g + round) % 4 {
+					case 0:
 						act.kick()
-					} else {
+					case 1:
 						a.ringActor()
+					default: // a post rings too, and its command must be handled
+						a.mb.post(&refuse{reply: replies})
 					}
 				})
 			}
 			runtime.Gosched()
 			close(go1)
 			wg.Wait()
+			for i := range 4 {
+				select {
+				case <-replies:
+				case <-time.After(time.Millisecond):
+					t.Fatalf("round %d: post %d of 4 not handled within 1 ms: lost wakeup", round, i)
+				}
+			}
 			time.Sleep(time.Millisecond) // the actor parks
 			synctest.Wait()
 		}

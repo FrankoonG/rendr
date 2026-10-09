@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
@@ -46,6 +47,34 @@ func wp5DeadIn(s *Session, id uint32) bool {
 		}
 	}
 	return false
+}
+
+// wp5EndWait is an AtPark hook that records, on the actor goroutine, at
+// each park attempt of session s, whether its end phase waits for carrier
+// c alone (no lane left; c the only carrier in gone). The test reads it
+// once the actor is parked: the actor's fields are read only by the
+// goroutine that owns them.
+type wp5EndWait struct {
+	s     atomic.Pointer[Session]
+	c     atomic.Pointer[carrier.Conn]
+	alone atomic.Bool
+}
+
+func (e *wp5EndWait) hooks() *testhooks.Hooks {
+	return &testhooks.Hooks{AtPark: func(id [16]byte) {
+		s, c := e.s.Load(), e.c.Load()
+		if s == nil || c == nil || s.id != id {
+			return
+		}
+		act := s.mb.actor.Load()
+		e.alone.Store(act.ending && len(act.gone) == 1 && act.gone[0] == c && len(s.lanes) == 0)
+	}}
+}
+
+// parkedAlone reports whether the end phase of e.s is parked waiting for
+// e.c alone.
+func (e *wp5EndWait) parkedAlone() bool {
+	return wp5State(e.s.Load()) == actorParked && e.alone.Load()
 }
 
 // TestParkedActorWakesOnDeath (R1-7): the only lane of a parked dialer
@@ -137,7 +166,8 @@ func TestParkedActorWakesOnPeerRst(t *testing.T) {
 // Conn.OnDone.
 func TestParkedEndPhaseJoinsUnstartedConn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		w := wp5NewWorld(t, nil, wp5Linger)
+		var ew wp5EndWait
+		w := wp5NewWorld(t, ew.hooks(), wp5Linger)
 		defer w.teardown()
 		a, _, _ := wp5OpenParked(t, w)
 
@@ -176,6 +206,8 @@ func TestParkedEndPhaseJoinsUnstartedConn(t *testing.T) {
 		// Hand x to a's exit join from its end phase (on the actor goroutine).
 		var injected atomic.Bool
 		act := a.mb.actor.Load()
+		ew.s.Store(a)
+		ew.c.Store(x)
 		hook := func(s *Session) {
 			if s == a && act.ending && injected.CompareAndSwap(false, true) {
 				act.dropConn(x)
@@ -185,10 +217,7 @@ func TestParkedEndPhaseJoinsUnstartedConn(t *testing.T) {
 		defer afterUnlockHook.CompareAndSwap(&hook, nil)
 		a.Shutdown()
 		acWaitFor(t, 5*time.Second, "the end phase waits for x alone, parked", func() bool {
-			if !injected.Load() || wp5State(a) != actorParked {
-				return false
-			}
-			return len(act.gone) == 1 && act.gone[0] == x && len(a.lanes) == 0 // parked: nothing runs the actor
+			return injected.Load() && ew.parkedAlone()
 		})
 		select {
 		case <-a.Done():
@@ -209,6 +238,64 @@ func TestParkedEndPhaseJoinsUnstartedConn(t *testing.T) {
 		}
 		if d := time.Since(joined); d != 0 {
 			t.Fatalf("Done %v after x's join, want at once", d)
+		}
+	})
+}
+
+// TestActorEndPhaseWakesOnLastJoinParked (M3 §A8.2, R1-7 rule 3, M3-D43;
+// the parked variant of TestActorEndPhaseWakesOnLastJoin, L52): Shutdown
+// while the dialer's only carrier is stuck in a Hard-blocked Write; the
+// close bound kills the lane, and the end phase waits for that started
+// carrier's Done alone (its writer is held; AbandonWait is long, so only
+// the write's return can finish it). The actor parks while it waits; the
+// write is then released, and the session's Done closes at the virtual
+// instant the carrier's Done does: the join rings through Conn.OnDone.
+func TestActorEndPhaseWakesOnLastJoinParked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var ew wp5EndWait
+		w := wp5NewWorld(t, ew.hooks(), wp5Linger)
+		defer w.teardown()
+		w.a.cenv.Timing.WriteStall = 2 * time.Second   // the stall watchdog fires after the close bound
+		w.a.cenv.Timing.AbandonWait = 30 * time.Second // the release ends the carrier, not its abandonment
+		a, _, l1 := wp5OpenParked(t, w)
+		stuck := wp5Lane(a, 0).c
+		ew.s.Store(a)
+		ew.c.Store(stuck)
+		l1.BlockWrites(rendrtest.Up, rendrtest.BlockHard)
+		a.Shutdown()
+		acWaitFor(t, 5*time.Second, "the end phase waits for the stuck carrier alone, parked", ew.parkedAlone)
+		if dead, cause, _, _ := stuck.Death(); !dead || cause != carrier.CauseLocalClose {
+			t.Fatalf("stimulus: the stuck carrier is not killed by the close bound (dead %v, %v)", dead, cause)
+		}
+		if st := l1.Stats().Session; st.WritesBlocked == 0 {
+			t.Fatal("stimulus: no write was blocked")
+		}
+		time.Sleep(10 * wp5Linger) // parked well past its linger
+		synctest.Wait()
+		select {
+		case <-stuck.Done():
+			t.Fatal("stimulus: the stuck carrier finished before the release")
+		case <-a.Done():
+			t.Fatal("the session is done before its stuck carrier was joined")
+		default:
+		}
+		if !ew.parkedAlone() {
+			t.Fatal("stimulus: the end-phase actor is not parked waiting for the stuck carrier before the release")
+		}
+		l1.Release() // the stuck Write returns: the carrier's last goroutine finishes now
+		select {
+		case <-stuck.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("stimulus: the released carrier is not done")
+		}
+		joined := time.Now()
+		select {
+		case <-a.Done():
+		case <-time.After(time.Millisecond):
+			t.Fatal("the parked end-phase actor did not exit when its last carrier's Done closed")
+		}
+		if d := time.Since(joined); d != 0 {
+			t.Fatalf("Done %v after the last carrier's join, want at once", d)
 		}
 	})
 }

@@ -8,9 +8,12 @@ import (
 	"runtime/metrics"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
 // Idle cost per session (design §0.14 B18, R16): goroutines, actor and
@@ -54,8 +57,12 @@ import (
 // M3 (M3-D42, §A8): an idle session's actor parks after its linger and
 // holds no goroutine, so a pair runs 2 goroutines fewer (4 and 12). The
 // block profile counts only the resumptions of a running actor; a parked
-// actor restarted by a kick is a new goroutine and is not counted here
-// (the timers scenario suite bounds those restarts, R1-22).
+// actor restarted by a kick is a new goroutine, which parks again at the
+// end of its run, so its restarts are counted as its park attempts (the
+// testhooks AtPark hook). Actor wakeups are the sum of both: still none
+// for the single-factory selector, and exactly one restart per probe
+// sample for the "-paths" cases (each one parks again at once: the health
+// step does no work, R1-22).
 type g5IdleCase struct {
 	name      string
 	mode      Mode
@@ -98,7 +105,7 @@ const g5WakeSlack = 1
 // g5Cost is the measured idle cost of one session pair (both ends).
 type g5Cost struct {
 	goroutines    float64 // rendr goroutines per pair
-	actorWakeups  float64 // session actor resumptions per pair per idle minute
+	actorWakeups  float64 // session actor resumptions and restarts (park attempts) per pair per idle minute
 	writerWakeups float64 // carrier writer resumptions per pair per idle minute
 	samples       float64 // probe samples of the Peer (every factory, loaded included) per idle minute
 	opening       float64 // actor resumptions per pair while the sessions opened (proves the counter works)
@@ -153,6 +160,7 @@ func g5Wakeups(fn string) int64 {
 type g5Snap struct {
 	goroutines            int
 	actor, writer         int64
+	parks                 int64    // park attempts of every session actor of both Runtimes so far
 	data, buffered        [2]int64 // dialer, passive
 	carriers              [2]int64 // live session carriers: dialer, passive
 	probes, sessionless   int      // the Peer's probe carriers; the passive's sessionless carriers (their far ends)
@@ -161,9 +169,9 @@ type g5Snap struct {
 }
 
 // g5Sample collects garbage (repeatedly, so that idle stacks shrink) and
-// samples e, the Peer and the sessions: dialed are the dialer ends, acc
-// holds the passive ends.
-func g5Sample(e *e2ePair, peer *Peer, dialed []*Conn, acc *acceptLog) g5Snap {
+// samples e (whose park attempts parks counts), the Peer and the sessions:
+// dialed are the dialer ends, acc holds the passive ends.
+func g5Sample(e *e2ePair, parks *atomic.Int64, peer *Peer, dialed []*Conn, acc *acceptLog) g5Snap {
 	for range 4 {
 		runtime.GC()
 	}
@@ -172,7 +180,7 @@ func g5Sample(e *e2ePair, peer *Peer, dialed []*Conn, acc *acceptLog) g5Snap {
 	scan := []metrics.Sample{{Name: "/gc/scan/stack:bytes"}}
 	metrics.Read(scan)
 	g, _ := rendrGoroutines()
-	s := g5Snap{goroutines: g, actor: g5Wakeups(g5ActorWait), writer: g5Wakeups(g5WriterWait),
+	s := g5Snap{goroutines: g, actor: g5Wakeups(g5ActorWait), writer: g5Wakeups(g5WriterWait), parks: parks.Load(),
 		heap: m.HeapAlloc, spans: m.StackInuse, stackUse: scan[0].Value.Uint64()}
 	for i, rt := range []*Runtime{e.d, e.p} {
 		s.data[i] = rt.budget.Used()
@@ -210,16 +218,18 @@ func g5PipeCarrier(name string, ln *Listener) StreamCarrier {
 	}}
 }
 
-// g5NewPair builds the two Runtimes of case c (default Config): for a
-// "-paths" case with one rendrtest Link per factory, each with its one-way
-// delay (create it inside the bubble that uses it).
-func g5NewPair(tb testing.TB, c g5IdleCase) *e2ePair {
+// g5NewPair builds the two Runtimes of case c (default Config, with an
+// AtPark hook that counts every park attempt of their session actors in
+// parks): for a "-paths" case with one rendrtest Link per factory, each
+// with its one-way delay (create it inside the bubble that uses it).
+func g5NewPair(tb testing.TB, c g5IdleCase, parks *atomic.Int64) *e2ePair {
 	tb.Helper()
 	var names []string
 	for i := range c.delays {
 		names = append(names, string(rune('a'+i)))
 	}
-	e := e2eNew(tb, Config{}, Config{}, nil, ListenConfig{}, names...)
+	ov := &testhooks.Overrides{Hooks: &testhooks.Hooks{AtPark: func([16]byte) { parks.Add(1) }}}
+	e := e2eNew(tb, Config{}, Config{}, ov, ListenConfig{}, names...)
 	for i, l := range e.links {
 		l.SetDelay(c.delays[i], 0)
 	}
@@ -234,9 +244,10 @@ func g5NewPair(tb testing.TB, c g5IdleCase) *e2ePair {
 // are counted during an idle period (idle, scaled to one minute) with all
 // n+1 sessions; writer wakeups also with the warm-up session alone, and
 // the difference excludes the writers of the Peer's probe carriers and of
-// their sessionless far ends. The block profile must be enabled already
-// (g5Wakeups).
-func g5MeasureIdle(t testing.TB, e *e2ePair, c g5IdleCase, n int, settleFor, idle time.Duration, settle func(), check func(when string, s g5Snap)) g5Cost {
+// their sessionless far ends. Actor wakeups add the park attempts that
+// parks counts (g5NewPair) to the block profile's resumptions. The block
+// profile must be enabled already (g5Wakeups).
+func g5MeasureIdle(t testing.TB, e *e2ePair, parks *atomic.Int64, c g5IdleCase, n int, settleFor, idle time.Duration, settle func(), check func(when string, s g5Snap)) g5Cost {
 	t.Helper()
 	acc := newAcceptLog(e.ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
 	defer acc.stop()
@@ -262,7 +273,7 @@ func g5MeasureIdle(t testing.TB, e *e2ePair, c g5IdleCase, n int, settleFor, idl
 	}
 	sample := func(when string) g5Snap {
 		settle()
-		s := g5Sample(e, peer, dialed, acc)
+		s := g5Sample(e, parks, peer, dialed, acc)
 		if check != nil {
 			check(when, s)
 		}
@@ -284,7 +295,7 @@ func g5MeasureIdle(t testing.TB, e *e2ePair, c g5IdleCase, n int, settleFor, idl
 	per := func(a, b int64) float64 { return float64(b-a) / float64(n) }
 	cost := g5Cost{
 		goroutines:    per(int64(base.goroutines), int64(open.goroutines)),
-		actorWakeups:  float64(end.actor-open.actor) / (float64(n+1) * idle.Minutes()),
+		actorWakeups:  float64((end.actor-open.actor)+(end.parks-open.parks)) / (float64(n+1) * idle.Minutes()),
 		writerWakeups: float64((end.writer-open.writer)-(base.writer-warm.writer)) / (float64(n) * idle.Minutes()),
 		samples:       float64(end.samples-open.samples) / idle.Minutes(),
 		opening:       per(base.actor, open.actor),
@@ -371,9 +382,10 @@ func TestG5IdleSessionCost_L52(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			g5EnableBlockProfile(t)
 			synctest.Test(t, func(t *testing.T) {
-				e := g5NewPair(t, c)
+				var parks atomic.Int64
+				e := g5NewPair(t, c, &parks)
 				check := func(when string, s g5Snap) { g5CheckAccounts(t, c, when, s) }
-				cost := g5MeasureIdle(t, e, c, c.n, 30*time.Second, time.Minute, synctest.Wait, check)
+				cost := g5MeasureIdle(t, e, &parks, c, c.n, 30*time.Second, time.Minute, synctest.Wait, check)
 				t.Logf("%s, %d sessions: %.2f goroutines, %.2f actor wakeups (%.2f probe samples) and %.2f writer wakeups per idle minute, data %.0f B and stages %.0f B per side, heap %.1f KiB, stack in use %.1f KiB (spans %+.1f KiB) per pair",
 					c.name, c.n, cost.goroutines, cost.actorWakeups, cost.samples, cost.writerWakeups, cost.data, cost.stages,
 					cost.heap/1024, cost.stackUsed/1024, cost.stackSpans/1024)
@@ -389,6 +401,10 @@ func TestG5IdleSessionCost_L52(t *testing.T) {
 				}
 				if cost.goroutines != c.goroutines {
 					t.Errorf("%.2f goroutines per pair, want %v", cost.goroutines, c.goroutines)
+				}
+				if c.factories == 1 && cost.actorWakeups != 0 {
+					t.Errorf("%.2f actor wakeups (resumptions and restarts) per pair per idle minute with no probe sample, want 0: an idle actor wakes",
+						cost.actorWakeups)
 				}
 				if cost.actorWakeups > cost.samples+g5WakeSlack || cost.writerWakeups > c.writerWakeups {
 					t.Errorf("%.2f actor and %.2f writer wakeups per pair per idle minute, want at most %.2f (one per probe sample, %.2f, + %d) and %v",
@@ -431,8 +447,9 @@ func BenchmarkIdleSessions(b *testing.B) {
 			g5EnableBlockProfile(b)
 			var cost g5Cost
 			for b.Loop() {
-				e := g5NewPair(b, c)
-				cost = g5MeasureIdle(b, e, c, g5BenchSessions, g5BenchSettle, g5BenchIdle, func() {}, nil)
+				var parks atomic.Int64
+				e := g5NewPair(b, c, &parks)
+				cost = g5MeasureIdle(b, e, &parks, c, g5BenchSessions, g5BenchSettle, g5BenchIdle, func() {}, nil)
 				e.close()
 			}
 			b.ReportMetric(0, "ns/op")
