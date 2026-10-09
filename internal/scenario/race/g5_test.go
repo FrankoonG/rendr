@@ -6,6 +6,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestG5RaceMiniature_L22: gold/G5-race (M3 design B1.8, plan:754–765) at
@@ -16,8 +17,10 @@ import (
 //
 // Stimulus: 5 s into the transfer p1 is blackholed in both directions (the
 // gold's DROP of path A) for 20 s, then restored (T_rm); the transfer runs
-// until T_rm + 15 s. The DROP must drop session bytes and kill the member
-// (ping_timeout or write_stall, as G4).
+// until T_rm + 15 s. The blackhole swallows carrier closes too
+// (BlackholeCloses, as an nft DROP; a held close crosses at T_rm). The
+// DROP must drop session bytes and kill the member on both ends, each with
+// ping_timeout or write_stall (as G4, droppedCause).
 //
 // G5Bound (plan:756–759) recomputed for the miniature: a dial made through
 // the blackhole "opens" and never answers, so an attempt in flight at T_rm
@@ -81,6 +84,7 @@ func g5(t *testing.T, rate float64) {
 	l := w.link("p1")
 	dropped0 := l.Stats().Session.Dropped
 	drop := time.Now()
+	l.SetBlackholeMode(rendrtest.BlackholeCloses) // an nft DROP: no close crosses either
 	l.SetBlackhole(true)
 	sleepUntil(drop.Add(g5Dropped))
 	if l.Stats().Session.Dropped == dropped0 {

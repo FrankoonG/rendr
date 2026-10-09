@@ -6,6 +6,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestG4RaceMiniature: gold/G4-race (M3 design B1.6, plan:746–751) at
@@ -19,8 +20,10 @@ import (
 //
 // Stimulus: when A has received 30 % of the bytes, p1 is blackholed in
 // both directions until the end (the gold's nft DROP: no RST, no ICMP;
-// bytes vanish and new dials never answer). Its member must have carried
-// data (TxBytes on the passive) and the link must drop session bytes.
+// bytes vanish, new dials never answer, and in BlackholeCloses mode an
+// end's close of its carrier does not cross either). Its member must have
+// carried data (TxBytes on the passive) and the link must drop session
+// bytes.
 // Premise: the bytes A still lacks at the DROP exceed the session Window
 // (8 MiB, the default), so a sender whose ACKs stop would exhaust it
 // within Window / rate (≈ 1 s) of the DROP, long before the death verdict.
@@ -32,11 +35,11 @@ import (
 // dropped member carried ahead of it reach A through its queue, which the
 // bulk transfer fills);
 // every byte verified, then io.EOF (the data written before the DROP
-// included); the dropped member recorded dead on both ends, the first
-// verdict ping_timeout or write_stall (droppedCause: the Link carries the
-// dead end's close across the blackhole, so the other end may record that
-// close as transport_error at or after the verdict); a clean end with
-// io.EOF on both ends and nothing left after Runtime.Close.
+// included); the dropped member recorded dead on both ends, each end's
+// cause ping_timeout or write_stall (droppedCause; B1.6: the close of the
+// end that decides first is swallowed, so the other end decides on its
+// own); a clean end with io.EOF on both ends and nothing left after
+// Runtime.Close.
 func TestG4RaceMiniature(t *testing.T) {
 	size, rate := int64(64<<20), float64(8<<20)
 	if raceEnabled {
@@ -69,6 +72,7 @@ func g4(t *testing.T, size int64, rate float64) {
 	l := w.link("p1")
 	dropped0 := l.Stats().Session.Dropped
 	drop := time.Now()
+	l.SetBlackholeMode(rendrtest.BlackholeCloses) // an nft DROP: no close crosses either
 	l.SetBlackhole(true)
 
 	down.wait(t, 2*time.Minute)

@@ -600,14 +600,13 @@ func finish(t testing.TB, dc, pc *rendr.Conn) {
 }
 
 // droppedCause requires the death records of carrier id, blackholed at
-// drop, on both ends (the gold's "cause ∈ {ping_timeout, write_stall} on
-// both ends"; it waits up to 10 s, the session living on its other
-// member). The end whose death verdict comes first records ping_timeout
-// or write_stall. A rendrtest Link delivers a carrier's close even while
-// it is blackholed (the close crosses the DROP, unlike an nft DROP), so
-// the other end may instead record transport_error, but only at or after
-// the first verdict: it then saw that verdict's close, not a failure of
-// its own.
+// drop, on both ends (it waits up to 10 s, the session living on its other
+// member), each with ping_timeout or write_stall: the gold's "the dropped
+// member's cause ∈ {ping_timeout, write_stall} on both ends" (B1.6, B1.8).
+// The test blackholes the link in BlackholeCloses mode, as an nft DROP:
+// the close of the end whose verdict comes first does not cross, so the
+// other end must reach a verdict of its own too — a transport_error there
+// would be the Link's close, not the end's detection.
 func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
 	var evs [2]rendr.Event
@@ -618,22 +617,18 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 			return ok
 		})
 	}
-	verdict := func(c rendr.Cause) bool { return c == rendr.CausePingTimeout || c == rendr.CauseWriteStall }
-	first := 0 // at equal times (the close crosses the link at once) the verdict comes first
-	if evs[1].Time.Before(evs[0].Time) || (evs[1].Time.Equal(evs[0].Time) && verdict(evs[1].Cause)) {
-		first = 1
-	}
-	if !verdict(evs[first].Cause) {
-		t.Fatalf("the %s's death record of the dropped carrier %d (the first): %+v, want ping_timeout or write_stall", side(first), id, evs[first])
-	}
-	if o := evs[1-first]; !verdict(o.Cause) && (o.Cause != rendr.CauseTransportError || o.Time.Before(evs[first].Time)) {
-		t.Fatalf("the %s's death record of the dropped carrier %d: %+v, want ping_timeout or write_stall (or the first verdict's close at or after %v)",
-			side(1-first), id, o, evs[first].Time.Sub(drop))
-	}
 	for i, c := range []*rendr.Conn{dc, pc} {
-		if cs, ok := carrierOf(c.Status(), id); !ok || cs.State != rendr.CarrierDead || cs.DeathCause != evs[i].Cause {
-			t.Fatalf("the %s's status of the dropped carrier %d: %+v (found %v), want dead with %v", side(i), id, cs, ok, evs[i].Cause)
+		ev := evs[i]
+		if ev.Cause != rendr.CausePingTimeout && ev.Cause != rendr.CauseWriteStall || ev.Time.Before(drop) {
+			t.Errorf("the %s's death record of the dropped carrier %d at DROP %+v: %+v, want ping_timeout or write_stall after the DROP",
+				side(i), id, ev.Time.Sub(drop), ev)
 		}
-		t.Logf("%s: the dropped carrier %d dead with %v at DROP +%v", side(i), id, evs[i].Cause, evs[i].Time.Sub(drop))
+		if cs, ok := carrierOf(c.Status(), id); !ok || cs.State != rendr.CarrierDead || cs.DeathCause != ev.Cause {
+			t.Errorf("the %s's status of the dropped carrier %d: %+v (found %v), want dead with %v", side(i), id, cs, ok, ev.Cause)
+		}
+		t.Logf("%s: the dropped carrier %d dead with %v at DROP +%v", side(i), id, ev.Cause, ev.Time.Sub(drop))
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 }

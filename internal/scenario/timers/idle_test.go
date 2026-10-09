@@ -7,6 +7,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
 // The actor linger (testhooks.Overrides.ActorLinger's default, M3-D42)
@@ -27,36 +28,124 @@ func population() int {
 	return 1000
 }
 
-// dedicated is a one-factory world whose factory has Props.CheapSubflow,
-// so every session dials its own carrier (M3-D2): the dedicated half of
-// the idle scenarios. The MUX half (n sessions over the ⌈n/256⌉ trunks of
-// one Peer, R1-15) belongs to WP12b.
-func dedicated(t testing.TB, n int) *world {
-	return newWorld(t, worldOpts{n: n}, linkSpec{name: "a", oneWay: oneWay, props: rendr.Props{CheapSubflow: true}})
+// muxCap is the views per stream MUX trunk of the MUX halves: the default
+// MuxMaxViews (256, no override) for the 1,000 sessions, so they need
+// ⌈1000/256⌉ = 4 trunks (R1-15); under -race the 250 sessions get a cap
+// of 64 (testhooks.Overrides.MuxMaxViews on both Runtimes), so that they
+// spread over 4 trunks too (R2-37: the same criteria, a smaller
+// population).
+func muxCap() int {
+	if raceEnabled {
+		return 64
+	}
+	return 256
 }
 
-// TestIdleSessionsHoldNoGoroutine (M3 design §A8.3, R1-15; plan:649, L52),
-// the dedicated half: n idle selector sessions (1,000; 250 under -race),
-// each on its own carrier (CheapSubflow), exchange one byte each way and
-// then stay idle. After 2 × the actor linger every actor on both ends is
-// parked: Status.Actors is 0 on both Runtimes, the registry counts 2n live
-// and 2n parked sessions, no actor goroutine runs, and the rendr
-// goroutines are at most the baseline (both Runtimes, the Listener and the
-// Peer before any session) + the carriers' goroutines (a reader and a
-// writer per carrier per side) + 10. The parked sessions still carry a
-// second byte each way; closing them and the Runtimes leaves nothing.
+// Goroutines a carrier runs while its sessions are parked: a dedicated
+// carrier its reader and writer on each side; a MUX trunk its reader and
+// writer on each side plus its owner's watcher on each side (the dialer
+// pool's, the passive Runtime's).
+const (
+	dedicatedGoroutines = 4
+	trunkGoroutines     = 6
+)
+
+// half is one half of the idle scenarios: n sessions on dedicated carriers
+// (Props.CheapSubflow, M3-D2: every session dials its own) or over the MUX
+// trunks of one Peer (default Props, the rendr mux; R1-15).
+type half struct {
+	name string
+	mux  bool
+}
+
+var halves = []half{{"dedicated", false}, {"mux", true}}
+
+// eachHalf runs body for each half in its own synctest bubble.
+func eachHalf(t *testing.T, body func(t *testing.T, h half)) {
+	for _, h := range halves {
+		t.Run(h.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { body(t, h) })
+		})
+	}
+}
+
+// world builds the half's one-factory world for n sessions.
+func (h half) world(t testing.TB, n int) *world {
+	if !h.mux {
+		return newWorld(t, worldOpts{n: n}, linkSpec{name: "a", oneWay: oneWay, props: rendr.Props{CheapSubflow: true}})
+	}
+	var ov testhooks.Overrides
+	if c := muxCap(); c != 256 {
+		ov.MuxMaxViews = c
+	}
+	return newWorld(t, worldOpts{n: n, dov: ov, pov: ov}, linkSpec{name: "a", oneWay: oneWay})
+}
+
+// carriers checks the half's carrier premise for the n open sessions ps
+// and returns the carriers per side and the goroutines they run (both
+// sides). Every session has exactly one live carrier on each end.
+// Dedicated: n carriers per side, none of them MUX trunks (Status.Mux
+// counts 0). MUX: Status.Mux.Carriers == ⌈n/cap⌉ on each side (4, R1-15)
+// with Views == n.
+func (h half) carriers(t testing.TB, w *world, ps []pair) (cs, goroutines int) {
+	t.Helper()
+	n := len(ps)
+	for i, s := range ps {
+		for j, c := range []*rendr.Conn{s.d, s.p} {
+			if k := live(c); k != 1 {
+				t.Fatalf("premise: session %d's %s lists %d live carriers, want 1", i, [2]string{"dialer", "passive"}[j], k)
+			}
+		}
+	}
+	dm, pm := w.d.Status().Mux, w.p.Status().Mux
+	if !h.mux {
+		if dm.Carriers != 0 || pm.Carriers != 0 {
+			t.Fatalf("premise: %d and %d MUX trunks under CheapSubflow, want 0 (dedicated carriers)", dm.Carriers, pm.Carriers)
+		}
+		return n, dedicatedGoroutines * n
+	}
+	trunks := (n + muxCap() - 1) / muxCap()
+	if dm.Carriers != trunks || pm.Carriers != trunks || dm.Views != n || pm.Views != n {
+		t.Fatalf("premise: Status.Mux dialer %+v, passive %+v; want %d trunks with %d views on each side (R1-15)", dm, pm, trunks, n)
+	}
+	return trunks, trunkGoroutines * trunks
+}
+
+// live counts a session end's live carriers (active or member).
+func live(c *rendr.Conn) int {
+	k := 0
+	for _, cs := range c.Status().Carriers {
+		if cs.State == rendr.CarrierActive || cs.State == rendr.CarrierMember {
+			k++
+		}
+	}
+	return k
+}
+
+// TestIdleSessionsHoldNoGoroutine (M3 design §A8.3, R1-15; plan:649, L52):
+// n idle selector sessions (1,000; 250 under -race) exchange one byte each
+// way and then stay idle, in two halves: each session on its own carrier
+// (dedicated: Props.CheapSubflow), and all of them over the MUX trunks of
+// one Peer at the default Props (mux: ⌈n/256⌉ = 4 trunks, Status.Mux.Carriers
+// == 4 on each side; under -race the cap is 64, again 4 trunks). After
+// 2 × the actor linger every actor on both ends is parked: Status.Actors
+// is 0 on both Runtimes, the registry counts 2n live and 2n parked
+// sessions, no actor goroutine runs, and the rendr goroutines are at most
+// the baseline (both Runtimes, the Listener and the Peer before any
+// session) + the carriers' goroutines (dedicated: a reader and a writer
+// per carrier per side; mux: those of the 4 trunks and their owners'
+// watchers) + 10 — a goroutine per parked session would exceed that by
+// hundreds. The parked sessions still carry a second byte each way;
+// closing them and the Runtimes leaves nothing.
 func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+	eachHalf(t, func(t *testing.T, h half) {
 		n := population()
-		w := dedicated(t, n)
+		w := h.world(t, n)
 		synctest.Wait()
 		base, _, _ := goroutines()
 		ps := w.openMany(n, func(int) rendr.Mode { return rendr.ModeSelector })
 		exchange(t, ps, 1)
-		cs := carriers(ps)
-		if cs != n {
-			t.Fatalf("premise: %d dialer carriers for %d dedicated sessions", cs, n)
-		}
+		cs, cg := h.carriers(t, w, ps)
 
 		time.Sleep(2 * linger)
 		synctest.Wait()
@@ -67,9 +156,9 @@ func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 			t.Fatalf("registry: %d live and %d parked sessions, want %d each", l, p, 2*n)
 		}
 		ours, actors, byTop := goroutines()
-		limit := base + 4*cs + 10 // a reader and a writer per carrier per side
-		t.Logf("%d idle sessions on %d carriers per side: %d rendr goroutines (baseline %d, limit %d), %d actors:%s",
-			n, cs, ours, base, limit, actors, histogram(byTop))
+		limit := base + cg + 10
+		t.Logf("%d idle sessions on %d carriers per side (%s): %d rendr goroutines (baseline %d, carriers' %d, limit %d), %d actors:%s",
+			n, cs, h.name, ours, base, cg, limit, actors, histogram(byTop))
 		if actors != 0 || ours > limit {
 			t.Fatalf("%d rendr goroutines (%d actors) for %d parked sessions, want 0 actors and ≤ %d", ours, actors, n, limit)
 		}
@@ -80,23 +169,26 @@ func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 	})
 }
 
-// TestParkedSessionsWakeForTraffic (M3 design §A8.3, R1-7; L09), the
-// dedicated half: n parked selector sessions (1,000; 250 under -race), each
-// on its own carrier; 10 of them, picked at random (fixed seed), get data
-// in turn, one byte from the dialer and its echo from the passive. The
-// links are unshaped with a 5-ms one-way delay, so a frame written at t0
-// reaches the far carrier at t0 + 5 ms of virtual time; each byte must be
-// read by the far application within 2 ms after that (a parked sender and
-// a parked receiver are both kicked by the traffic: the Write rings the
-// sender's actor, the frame the receiver's). Before each wake every actor
+// TestParkedSessionsWakeForTraffic (M3 design §A8.3, R1-7, R1-15; L09): n
+// parked selector sessions (1,000; 250 under -race), in the two halves of
+// TestIdleSessionsHoldNoGoroutine (dedicated carriers; the 4 MUX trunks of
+// one Peer); 10 of them, picked at random (fixed seed), get data in turn,
+// one byte from the dialer and its echo from the passive. The links are
+// unshaped with a 5-ms one-way delay, so a frame written at t0 reaches the
+// far carrier at t0 + 5 ms of virtual time; each byte must be read by the
+// far application within 2 ms after that (a parked sender and a parked
+// receiver are both kicked by the traffic: the Write rings the sender's
+// actor, the frame the receiver's — on a trunk, through the trunk's
+// reader, whose 999 other views stay parked). Before each wake every actor
 // is parked (Status.Actors 0, 2n parked in the registry); 2 × the linger
 // after the last one Status.Actors is back to 0 and every session parked.
 func TestParkedSessionsWakeForTraffic(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+	eachHalf(t, func(t *testing.T, h half) {
 		n := population()
-		w := dedicated(t, n)
+		w := h.world(t, n)
 		ps := w.openMany(n, func(int) rendr.Mode { return rendr.ModeSelector })
 		exchange(t, ps, 1)
+		h.carriers(t, w, ps)
 		time.Sleep(2 * linger)
 		synctest.Wait()
 
