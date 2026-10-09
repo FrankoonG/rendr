@@ -114,6 +114,10 @@ type DatagramLink struct {
 
 	done             chan struct{} // closed by Close: ends the SpliceFrom goroutines
 	replayed, splice atomic.Uint64 // datagrams ReplayInto and SpliceFrom delivered into this link
+
+	// afterCheck, tests only (nil otherwise), runs in an ordinary dial
+	// between its Refuse check and the carrier's creation.
+	afterCheck func()
 }
 
 // Datagrams of a carrier's dialer that ReplayInto can repeat: the first
@@ -267,7 +271,7 @@ func (l *DatagramLink) Dial(ctx context.Context) (net.PacketConn, net.Addr, erro
 	case DialLateSuccess:
 		<-rel
 	case DialNilAddr:
-		pc, _, err := l.open()
+		pc, _, err := l.open(false)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -277,18 +281,30 @@ func (l *DatagramLink) Dial(ctx context.Context) (net.PacketConn, net.Addr, erro
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
+		if h := l.afterCheck; h != nil {
+			h()
+		}
+		return l.open(true)
 	}
-	return l.open()
+	return l.open(false)
 }
 
-// open creates a carrier and starts its Accept call.
-func (l *DatagramLink) open() (net.PacketConn, net.Addr, error) {
+// open creates a carrier and starts its Accept call. refusable (an
+// ordinary dial) refuses it when Refuse came after the dial's check, under
+// the lock Kill snapshots the carriers with: "Refuse, then Kill" leaves no
+// carrier of a dial that raced them.
+func (l *DatagramLink) open(refusable bool) (net.PacketConn, net.Addr, error) {
 	n := l.n
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
 		n.dialFails.Add(1)
 		return nil, nil, net.ErrClosed
+	}
+	if refusable && l.refuse {
+		n.mu.Unlock()
+		n.dialFails.Add(1)
+		return nil, nil, errRefused
 	}
 	k := l.created
 	l.created++
