@@ -38,7 +38,8 @@ import (
 // included); the dropped member recorded dead on both ends, each end's
 // cause ping_timeout or write_stall (droppedCause; B1.6: the close of the
 // end that decides first is swallowed, so the other end decides on its
-// own); a clean end with io.EOF on both ends and nothing left after
+// own: the dropped member's Link carrier shows its close held, closeHeld);
+// a clean end with io.EOF on both ends and nothing left after
 // Runtime.Close.
 func TestG4RaceMiniature(t *testing.T) {
 	size, rate := int64(64<<20), float64(8<<20)
@@ -71,6 +72,7 @@ func g4(t *testing.T, size int64, rate float64) {
 	}
 	l := w.link("p1")
 	dropped0 := l.Stats().Session.Dropped
+	target := dropTarget(t, l)
 	drop := time.Now()
 	l.SetBlackholeMode(rendrtest.BlackholeCloses) // an nft DROP: no close crosses either
 	l.SetBlackhole(true)
@@ -89,6 +91,7 @@ func g4(t *testing.T, size int64, rate float64) {
 	t.Logf("DROP at +%v (p2's RTT on B %v); longest gap after it %v; transfer %v", drop.Sub(tx.start), om.SRTT, gap, down.end().Sub(tx.start))
 
 	droppedCause(t, w, dc, pc, victim.ID, drop)
+	closeHeld(t, l, target)
 	finish(t, dc, pc)
 	w.noViolation()
 	w.close()

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
-	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
 // The actor linger (testhooks.Overrides.ActorLinger's default, M3-D42)
@@ -20,7 +19,10 @@ const (
 // population is the idle population: 1,000 sessions; 250 under -race
 // (R2-37), whose detector stops the binary past 8,128 live goroutines —
 // 1,000 sessions over two factories run about 10,000 with the links'
-// pumps.
+// pumps. The size rule is about goroutines, so it binds only where the
+// sessions bring their own carriers: the MUX halves run their 1,000 parked
+// sessions over 4 trunks (a few dozen goroutines) in every lane, -race
+// included, at the default MuxMaxViews with no override (R1-15).
 func population() int {
 	if raceEnabled {
 		return 250
@@ -28,18 +30,12 @@ func population() int {
 	return 1000
 }
 
-// muxCap is the views per stream MUX trunk of the MUX halves: the default
-// MuxMaxViews (256, no override) for the 1,000 sessions, so they need
-// ⌈1000/256⌉ = 4 trunks (R1-15); under -race the 250 sessions get a cap
-// of 64 (testhooks.Overrides.MuxMaxViews on both Runtimes), so that they
-// spread over 4 trunks too (R2-37: the same criteria, a smaller
-// population).
-func muxCap() int {
-	if raceEnabled {
-		return 64
-	}
-	return 256
-}
+// muxPopulation and muxViews: the MUX halves' 1,000 sessions over trunks
+// of the default MuxMaxViews (256), ⌈1000/256⌉ = 4 trunks (R1-15).
+const (
+	muxPopulation = 1000
+	muxViews      = 256
+)
 
 // Goroutines a carrier runs while its sessions are parked: a dedicated
 // carrier its reader and writer on each side; a MUX trunk its reader and
@@ -69,23 +65,29 @@ func eachHalf(t *testing.T, body func(t *testing.T, h half)) {
 	}
 }
 
-// world builds the half's one-factory world for n sessions.
+// population is the half's session count: the dedicated half follows
+// population() (250 under -race), the MUX half is 1,000 in every lane.
+func (h half) population() int {
+	if h.mux {
+		return muxPopulation
+	}
+	return population()
+}
+
+// world builds the half's one-factory world for n sessions; the MUX half
+// at the default Props and no testhook override.
 func (h half) world(t testing.TB, n int) *world {
 	if !h.mux {
 		return newWorld(t, worldOpts{n: n}, linkSpec{name: "a", oneWay: oneWay, props: rendr.Props{CheapSubflow: true}})
 	}
-	var ov testhooks.Overrides
-	if c := muxCap(); c != 256 {
-		ov.MuxMaxViews = c
-	}
-	return newWorld(t, worldOpts{n: n, dov: ov, pov: ov}, linkSpec{name: "a", oneWay: oneWay})
+	return newWorld(t, worldOpts{n: n}, linkSpec{name: "a", oneWay: oneWay})
 }
 
 // carriers checks the half's carrier premise for the n open sessions ps
 // and returns the carriers per side and the goroutines they run (both
 // sides). Every session has exactly one live carrier on each end.
 // Dedicated: n carriers per side, none of them MUX trunks (Status.Mux
-// counts 0). MUX: Status.Mux.Carriers == ⌈n/cap⌉ on each side (4, R1-15)
+// counts 0). MUX: Status.Mux.Carriers == ⌈n/256⌉ on each side (4, R1-15)
 // with Views == n.
 func (h half) carriers(t testing.TB, w *world, ps []pair) (cs, goroutines int) {
 	t.Helper()
@@ -104,7 +106,7 @@ func (h half) carriers(t testing.TB, w *world, ps []pair) (cs, goroutines int) {
 		}
 		return n, dedicatedGoroutines * n
 	}
-	trunks := (n + muxCap() - 1) / muxCap()
+	trunks := (n + muxViews - 1) / muxViews
 	if dm.Carriers != trunks || pm.Carriers != trunks || dm.Views != n || pm.Views != n {
 		t.Fatalf("premise: Status.Mux dialer %+v, passive %+v; want %d trunks with %d views on each side (R1-15)", dm, pm, trunks, n)
 	}
@@ -123,11 +125,11 @@ func live(c *rendr.Conn) int {
 }
 
 // TestIdleSessionsHoldNoGoroutine (M3 design §A8.3, R1-15; plan:649, L52):
-// n idle selector sessions (1,000; 250 under -race) exchange one byte each
-// way and then stay idle, in two halves: each session on its own carrier
-// (dedicated: Props.CheapSubflow), and all of them over the MUX trunks of
-// one Peer at the default Props (mux: ⌈n/256⌉ = 4 trunks, Status.Mux.Carriers
-// == 4 on each side; under -race the cap is 64, again 4 trunks). After
+// n idle selector sessions exchange one byte each way and then stay idle,
+// in two halves: each session on its own carrier (dedicated:
+// Props.CheapSubflow; 1,000, 250 under -race), and 1,000 of them over the
+// MUX trunks of one Peer at the default Props and no override in every
+// lane (mux: ⌈1000/256⌉ = 4 trunks, Status.Mux.Carriers == 4 on each side). After
 // 2 × the actor linger every actor on both ends is parked: Status.Actors
 // is 0 on both Runtimes, the registry counts 2n live and 2n parked
 // sessions, no actor goroutine runs, and the rendr goroutines are at most
@@ -139,7 +141,7 @@ func live(c *rendr.Conn) int {
 // closing them and the Runtimes leaves nothing.
 func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 	eachHalf(t, func(t *testing.T, h half) {
-		n := population()
+		n := h.population()
 		w := h.world(t, n)
 		synctest.Wait()
 		base, _, _ := goroutines()
@@ -170,7 +172,7 @@ func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 }
 
 // TestParkedSessionsWakeForTraffic (M3 design §A8.3, R1-7, R1-15; L09): n
-// parked selector sessions (1,000; 250 under -race), in the two halves of
+// parked selector sessions, in the two halves (and sizes) of
 // TestIdleSessionsHoldNoGoroutine (dedicated carriers; the 4 MUX trunks of
 // one Peer); 10 of them, picked at random (fixed seed), get data in turn,
 // one byte from the dialer and its echo from the passive. The links are
@@ -184,7 +186,7 @@ func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 // after the last one Status.Actors is back to 0 and every session parked.
 func TestParkedSessionsWakeForTraffic(t *testing.T) {
 	eachHalf(t, func(t *testing.T, h half) {
-		n := population()
+		n := h.population()
 		w := h.world(t, n)
 		ps := w.openMany(n, func(int) rendr.Mode { return rendr.ModeSelector })
 		exchange(t, ps, 1)

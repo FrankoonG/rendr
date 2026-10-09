@@ -632,3 +632,37 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 		t.FailNow()
 	}
 }
+
+// dropTarget returns the Seq of the link's one open session carrier just
+// before the DROP: the carrier under the race member the DROP kills.
+func dropTarget(t testing.TB, l *rendrtest.Link) int {
+	t.Helper()
+	seq := -1
+	for _, ci := range l.Carriers() {
+		if !ci.Session || ci.Closed {
+			continue
+		}
+		if seq >= 0 {
+			t.Fatalf("premise: open session carriers %d and %d on the link at the DROP, want one (the dropped member's)", seq, ci.Seq)
+		}
+		seq = ci.Seq
+	}
+	if seq < 0 {
+		t.Fatalf("premise: no open session carrier on the link at the DROP: %+v", l.Carriers())
+	}
+	return seq
+}
+
+// closeHeld is the stimulus proof of BlackholeCloses (B1.6, B1.8): the
+// close of the end that decided first did not cross the blackhole — the
+// dropped member's carrier seq is held open (CloseHeld, counted in
+// ClosesHeld) while the link is still blackholed, so the other end's
+// verdict is its own.
+func closeHeld(t testing.TB, l *rendrtest.Link, seq int) {
+	t.Helper()
+	ci := l.Carriers()[seq]
+	if !ci.CloseHeld || ci.Closed || l.Stats().Session.ClosesHeld < 1 {
+		t.Fatalf("stimulus: the dropped member's carrier %+v (ClosesHeld %d), want its close held by the blackhole and the carrier still open",
+			ci, l.Stats().Session.ClosesHeld)
+	}
+}

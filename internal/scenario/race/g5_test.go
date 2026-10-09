@@ -19,8 +19,9 @@ import (
 // gold's DROP of path A) for 20 s, then restored (T_rm); the transfer runs
 // until T_rm + 15 s. The blackhole swallows carrier closes too
 // (BlackholeCloses, as an nft DROP; a held close crosses at T_rm). The
-// DROP must drop session bytes and kill the member on both ends, each with
-// ping_timeout or write_stall (as G4, droppedCause).
+// DROP must drop session bytes, hold the close of the dropped member's
+// carrier until T_rm (closeHeld) and kill the member on both ends, each
+// with ping_timeout or write_stall (as G4, droppedCause).
 //
 // G5Bound (plan:756–759) recomputed for the miniature: a dial made through
 // the blackhole "opens" and never answers, so an attempt in flight at T_rm
@@ -83,6 +84,7 @@ func g5(t *testing.T, rate float64) {
 	}
 	l := w.link("p1")
 	dropped0 := l.Stats().Session.Dropped
+	target := dropTarget(t, l)
 	drop := time.Now()
 	l.SetBlackholeMode(rendrtest.BlackholeCloses) // an nft DROP: no close crosses either
 	l.SetBlackhole(true)
@@ -93,6 +95,7 @@ func g5(t *testing.T, rate float64) {
 	if cs, ok := carrierOf(dc.Status(), victim.ID); !ok || cs.State != rendr.CarrierDead {
 		t.Fatalf("stimulus: p1's member %d is not dead after a %v DROP: %+v", victim.ID, g5Dropped, cs)
 	}
+	closeHeld(t, l, target)
 	rm := time.Now()
 	retx0 := pc.Status().RetransmittedBytes
 	l.SetBlackhole(false)

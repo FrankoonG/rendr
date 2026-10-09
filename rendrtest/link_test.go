@@ -447,7 +447,8 @@ func TestLinkBlackholeDropsAndDeadDials(t *testing.T) {
 // (counted as Dropped) and its reads see nothing — until the blackhole is
 // lifted, the mode is set back to BlackholeBytes, or Kill ends the
 // carrier; then the far end reads EOF at that instant. ClosesHeld counts
-// each held carrier once (both ends closing included); in the default mode
+// each held carrier once (both ends closing included) and the carrier's
+// CarrierInfo.CloseHeld marks it; in the default mode
 // (BlackholeBytes) the close crosses the blackhole at once and nothing is
 // held. Rows run on fresh session carriers of one link.
 func TestLinkBlackholeHoldsCloses(t *testing.T) {
@@ -493,8 +494,8 @@ func TestLinkBlackholeHoldsCloses(t *testing.T) {
 			if d := held().Dropped - d0; d != 100 {
 				t.Fatalf("%s: the far end's 100 bytes: %d dropped, want 100", row, d)
 			}
-			if h.l.Carriers()[seq].Closed {
-				t.Fatalf("%s: the carrier is closed while its close is held", row)
+			if ci := h.l.Carriers()[seq]; ci.Closed || !ci.CloseHeld {
+				t.Fatalf("%s: carrier %+v while its close is held, want open with CloseHeld", row, ci)
 			}
 		}
 		// crossed checks that the survivor read EOF at the release instant.
@@ -519,7 +520,7 @@ func TestLinkBlackholeHoldsCloses(t *testing.T) {
 		}
 
 		// The default mode: the close crosses the blackhole at once.
-		_, ra, _ := open(true)
+		_, ra, seq0 := open(true)
 		select {
 		case <-ra.done:
 		default:
@@ -528,8 +529,8 @@ func TestLinkBlackholeHoldsCloses(t *testing.T) {
 		if _, err := ra.result(); err != io.EOF {
 			t.Fatalf("BlackholeBytes: the far end's Read ended with %v, want io.EOF", err)
 		}
-		if n := held().ClosesHeld; n != 0 {
-			t.Fatalf("BlackholeBytes: ClosesHeld %d, want 0", n)
+		if n, ci := held().ClosesHeld, h.l.Carriers()[seq0]; n != 0 || ci.CloseHeld {
+			t.Fatalf("BlackholeBytes: ClosesHeld %d, carrier %+v; want 0 and no CloseHeld", n, ci)
 		}
 		h.l.SetBlackhole(false)
 

@@ -632,13 +632,14 @@ func (l *Link) Carriers() []CarrierInfo {
 	out := make([]CarrierInfo, len(l.history))
 	for i, c := range l.history {
 		out[i] = CarrierInfo{
-			Seq:     c.seq,
-			First:   FrameType(c.first.Load()),
-			Session: c.kind.Load() == kindSession,
-			Up:      c.up.Load(),
-			Down:    c.down.Load(),
-			Held:    c.held.Load(),
-			Closed:  c.closed.Load(),
+			Seq:       c.seq,
+			First:     FrameType(c.first.Load()),
+			Session:   c.kind.Load() == kindSession,
+			Up:        c.up.Load(),
+			Down:      c.down.Load(),
+			Held:      c.held.Load(),
+			Closed:    c.closed.Load(),
+			CloseHeld: c.closeHeld.Load(),
 		}
 	}
 	return out
@@ -707,12 +708,13 @@ type Stats struct {
 
 // CarrierInfo is a snapshot of one carrier for per-carrier assertions.
 type CarrierInfo struct {
-	Seq      int       // creation order on its link
-	First    FrameType // first frame type after the PREFACE (0 until it crossed)
-	Session  bool      // First is OPEN or JOIN
-	Up, Down int64     // bytes the far end has read in each direction (as Counts.Bytes)
-	Held     int64     // chunks held by a stall
-	Closed   bool
+	Seq       int       // creation order on its link
+	First     FrameType // first frame type after the PREFACE (0 until it crossed)
+	Session   bool      // First is OPEN or JOIN
+	Up, Down  int64     // bytes the far end has read in each direction (as Counts.Bytes)
+	Held      int64     // chunks held by a stall
+	Closed    bool
+	CloseHeld bool // a BlackholeCloses blackhole held its close back (as Counts.ClosesHeld)
 }
 
 // index maps a direction to its array index (Up 0, Down 1).
