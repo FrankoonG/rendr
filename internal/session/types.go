@@ -20,6 +20,12 @@ const (
 	ModeRace     Mode = 3 // every member carries every byte or datagram (M3-D28)
 )
 
+// members reports whether mode m keeps bond membership (M3-D29): bond and
+// race sessions keep one member per fate group up to MaxCarriers, redial a
+// dead member at once, list every member in SCHED and count deaths as bond
+// does; a selector keeps one active lane.
+func (m Mode) members() bool { return m == ModeBond || m == ModeRace }
+
 // Role is the session side (numerically equal to rendr.Role).
 type Role uint8
 
