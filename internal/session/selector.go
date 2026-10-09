@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -24,6 +25,24 @@ func (a *actor) selectorLocked(now time.Time) {
 		return
 	}
 	a.qualityLocked(now)
+}
+
+// startFailoverRaceLocked starts the selector's death failover race
+// (§7.3) after factory dead's carrier died: the ranking at now — the dead
+// factory ranks last (failed) but stays a candidate — stably partitioned
+// so that the factories outside dead's fate group come first
+// (sched.GroupFirst, M3-D38): members of one group fail together, so their
+// siblings are tried only after every independent path. A dead factory
+// with a group of its own (or −1, a loss that is no death) keeps M1's
+// ranking.
+func (a *actor) startFailoverRaceLocked(now time.Time, dead int) {
+	d := a.d
+	order := a.rankLocked(now)
+	if g := d.spec.group(dead); g != 0 {
+		order = sched.GroupFirst(order, d.spec.group, g, order)
+	}
+	d.race = sched.NewRace(order, orDefault(a.s.p.JoinStagger, defJoinStagger), now)
+	d.raceOn = true
 }
 
 // qualityLocked evaluates the quality rule when the health layer published

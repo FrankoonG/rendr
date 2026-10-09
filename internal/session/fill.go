@@ -103,7 +103,7 @@ func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 		// they are now (§7.6, §0.13 A3): every count changes together with
 		// a publication, so they belong to this epoch. Bond sends zero.
 		set := s.ctl.set
-		if s.p.Mode != ModeBond {
+		if !s.p.Mode.members() {
 			set.Death, set.Quality, set.Explicit = s.ctl.migDeath, s.ctl.migQuality, s.ctl.migExplicit
 		}
 		if b.AddSched(h, s.ctl.cause, &set) {

@@ -160,17 +160,21 @@ func (s *Session) ackDroppedLocked(l *lane) bool {
 // there before the CLOSE); else the first blocked one, preferring one that
 // is not leaving; nil if none qualifies. Writability comes first (§4.6: an
 // ACK never waits behind a blocked carrier while a writable lane
-// qualifies).
+// qualifies). A writable lane of a HoLCoupled fate group in which another
+// lane is write-blocked ranks after every other writable lane (M3-D39,
+// PA-30: it would stall with its sibling) and before the blocked ones.
 func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 	s.refreshOrderLocked(time.Now(), false)
 	var best *lane
-	bestRank := 4
+	bestRank := 6
 	for _, l := range s.st.order {
 		if l == skip || !s.ackQualifiesLocked(l) {
 			continue
 		}
 		rank := 0
 		if l.port.WriteBlocked() {
+			rank = 4
+		} else if s.holSiblingBlockedLocked(l) {
 			rank = 2
 		}
 		if s.ackLeavingLocked(l) {

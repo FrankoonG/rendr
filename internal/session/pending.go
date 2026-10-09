@@ -152,7 +152,7 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 		}
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: win}}
 		if s.aliveLocked(l) {
-			if s.p.Mode == ModeBond {
+			if s.p.Mode.members() {
 				l.data = true
 				l.state = LaneMember
 			} else if sender == nil {

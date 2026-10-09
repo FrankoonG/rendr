@@ -142,17 +142,37 @@ func (s *Session) applyRxNextLocked(rx uint64) error {
 // switch, passive SCHED move, retirement, peer CLOSE); laneGoneLocked does
 // the same on a lane's end. Acknowledged bytes are never requeued (L10). A
 // packet session retransmits nothing (plan D9): 0.
+//
+// A race session requeues nothing while another data lane lives (M3-D30):
+// every member carries every byte from its own cursor, so l's spans are
+// copies the others send or sent; they are dropped and their bytes are
+// still returned (the race death count, M3-D34). When l was the last data
+// lane they are requeued as M1 requeues them, and the next lane resends
+// them as retransmissions from sBase. Either way l's cursor goes back to
+// sBase: a lane that stays alive and is routed again later (the passive's
+// fallback, a later SCHED) starts there as a new data lane does (M3-D30,
+// raceAttachLocked), and never skips bytes it no longer holds in flight.
 func (s *Session) requeueLocked(l *lane) (bytes uint64) {
 	if s.pk != nil {
 		return 0
 	}
 	st := &s.st
 	l.infl.trimBelow(st.sBase)
+	keep := false
+	if s.p.Mode == ModeRace {
+		l.rnext = st.sBase
+		keep = s.raceOtherDataLaneLocked(l)
+	}
 	for _, sp := range l.infl.s {
-		st.retx.add(sp.off, sp.n)
+		if !keep {
+			st.retx.add(sp.off, sp.n)
+		}
 		bytes += sp.n
 	}
 	l.infl.reset()
+	if keep {
+		return bytes
+	}
 	if bytes > 0 && !st.ended {
 		s.wakeDataLocked(time.Now())
 	}
@@ -164,7 +184,8 @@ func (s *Session) requeueLocked(l *lane) (bytes uint64) {
 // same critical section (design §4.0 C1: a Fill of l that runs afterwards
 // appends nothing). It requeues l.infl (returning the bytes requeued),
 // clears fin.lane and l.finHere if our FIN went out on l (so the FIN is
-// re-sent at the same offset after the replay), removes l from st.order and
+// re-sent at the same offset after the replay; a race member resends it
+// from its own cursor), removes l from st.order and
 // from every duty (the ACK duty moves to another lane with a re-ACK bump,
 // §4.6), and wakes the surviving data lanes.
 //
@@ -399,6 +420,46 @@ func (s *Session) rescueHolderLocked() (holder *lane, sp span, ok bool) {
 func (s *Session) rescueSenderLocked(l *lane) bool {
 	st := &s.st
 	return l != st.rescue.holder || (st.interleaved && !s.otherDataLaneLocked(l))
+}
+
+// raceOtherDataLaneLocked reports whether a data lane other than l lives:
+// data-eligible and not dead by its lane state. A lane whose carrier ended
+// in the same instant but whose death step has not run yet still counts:
+// its own step then finds no other data lane and requeues its spans (the
+// bytes only l held are resent from sBase all the same, counted as copies).
+func (s *Session) raceOtherDataLaneLocked(l *lane) bool {
+	for _, o := range s.st.order {
+		if o != l && o.data && o.state != LaneDead {
+			return true
+		}
+	}
+	return false
+}
+
+// holSiblingBlockedLocked reports whether lane l shares a HoLCoupled fate
+// group with another lane whose writes are blocked (M3-D39, PA-30): the
+// ACK-duty move (chooseAckLaneLocked) and the SCHED-resend target
+// (resendLaneLocked) skip such a lane while another lane qualifies, since
+// it would stall with its blocked sibling. Only the dialer knows the
+// groups (DialSpec.Groups, .Coupled); on the passive, and for a lane of a
+// group of its own, it is false. Views of one MUX trunk need no flag: a
+// trunk's WriteBlocked moves every view's duties (M3-D14).
+func (s *Session) holSiblingBlockedLocked(l *lane) bool {
+	a := s.mb.actor.Load()
+	if a == nil || a.d == nil || l.factory < 0 {
+		return false
+	}
+	spec := &a.d.spec // immutable after Dial published the actor
+	if !spec.coupled(l.factory) {
+		return false
+	}
+	g := spec.group(l.factory)
+	for _, o := range s.st.order {
+		if o != l && o.factory >= 0 && o.state != LaneDead && spec.group(o.factory) == g && o.port.WriteBlocked() {
+			return true
+		}
+	}
+	return false
 }
 
 // otherDataLaneLocked reports whether a data lane other than l exists.

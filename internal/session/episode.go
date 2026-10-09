@@ -37,7 +37,7 @@ func (a *actor) episodeStartLocked(now, at time.Time) {
 	a.dirty = true
 	a.event(now, EventNoPathStart, 0, 0, 0, carrier.CauseNone, nil)
 	if d := a.d; d != nil {
-		if s.p.Mode == ModeBond {
+		if s.p.Mode.members() {
 			for i := range d.slots {
 				if d.slots[i].member {
 					d.slots[i].cad.Kick()
