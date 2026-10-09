@@ -21,7 +21,11 @@ import (
 // unchanged snapshot does no work (R1-22), so a kicked actor parks again
 // at once.
 //
-// After the exchange and 2 × the linger, for 10 ProbeIntervals: at every
+// The premise check is already part of this assertion: the probes run
+// from the start, so they ring the sessions during the 2 × linger after the
+// exchange too, and an actor that treats a quality-only step as work never
+// parks there (a mutant of R1-22 fails at the premise, not in the tick
+// loop). After the exchange and 2 × the linger, for 10 ProbeIntervals: at every
 // 100-ms tick, once every goroutine of the bubble is blocked
 // (synctest.Wait), Status.Actors is 0 on both Runtimes. Stimulus: the
 // probes published (the factories' Samples rose by at least 16 over the
