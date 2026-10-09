@@ -50,6 +50,12 @@ import (
 //     default 2 s Probe.Interval; also in real time), because every health
 //     publication rings every dialer session of the Peer, whatever its
 //     mode; 24–27 and 70–80 writer wakeups per idle minute.
+//
+// M3 (M3-D42, §A8): an idle session's actor parks after its linger and
+// holds no goroutine, so a pair runs 2 goroutines fewer (4 and 12). The
+// block profile counts only the resumptions of a running actor; a parked
+// actor restarted by a kick is a new goroutine and is not counted here
+// (the timers scenario suite bounds those restarts, R1-22).
 type g5IdleCase struct {
 	name      string
 	mode      Mode
@@ -57,7 +63,7 @@ type g5IdleCase struct {
 	n         int             // idle sessions measured by the test (the benchmark opens g5BenchSessions)
 	delays    []time.Duration // one-way delay of each factory's rendrtest Link; nil: net.Pipe carriers
 
-	goroutines    float64 // structural: actor + reader + writer per carrier, on each side
+	goroutines    float64 // structural: a reader and a writer per carrier, on each side (an idle session's actor is parked, M3-D42)
 	writerWakeups float64 // bound per idle minute
 	heap, stack   float64 // bounds in bytes (stack: in use, as scanned by the GC); 0: not bounded (Links)
 }
@@ -76,13 +82,13 @@ var g5PathDelays = []time.Duration{5 * time.Millisecond, 20 * time.Millisecond, 
 
 var g5IdleCases = []g5IdleCase{
 	{name: "selector", mode: ModeSelector, factories: 1, n: 16,
-		goroutines: 6, writerWakeups: 36, heap: 128 << 10, stack: 10 << 10},
+		goroutines: 4, writerWakeups: 36, heap: 128 << 10, stack: 10 << 10},
 	{name: "bond3", mode: ModeBond, factories: 3, n: 8,
-		goroutines: 14, writerWakeups: 100, heap: 320 << 10, stack: 24 << 10},
+		goroutines: 12, writerWakeups: 100, heap: 320 << 10, stack: 24 << 10},
 	{name: "selector3-paths", mode: ModeSelector, factories: 3, n: 8, delays: g5PathDelays,
-		goroutines: 6, writerWakeups: 36},
+		goroutines: 4, writerWakeups: 36},
 	{name: "bond3-paths", mode: ModeBond, factories: 3, n: 8, delays: g5PathDelays,
-		goroutines: 14, writerWakeups: 100},
+		goroutines: 12, writerWakeups: 100},
 }
 
 // g5WakeSlack is the bound's allowance per session pair and idle minute
@@ -345,9 +351,9 @@ func g5CheckAccounts(t testing.TB, c g5IdleCase, when string, s g5Snap) {
 
 // TestG5IdleSessionCost_L52 (design §0.14 B18, R16; L52): idle sessions cost
 // what was recorded, with headroom, per session pair (both ends) in a
-// virtual idle minute: a selector pair runs 6 goroutines and a 3-member
-// bond pair 14 (an actor, and a reader and a writer per carrier, on each
-// side). An actor wakes at most once per probe sample of its Peer
+// virtual idle minute: a selector pair runs 4 goroutines and a 3-member
+// bond pair 12 (a reader and a writer per carrier, on each side; the
+// actors are parked, M3-D42). An actor wakes at most once per probe sample of its Peer
 // (g5WakeSlack aside): a single-factory Peer has none, so its sessions
 // sleep; a multi-factory Peer publishes its health at every sample and
 // rings each of its dialer sessions, selector or bond. Writers wake for the

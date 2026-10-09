@@ -334,6 +334,11 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		OffsetLimit:       k.offsetLimit,
 		FirstEpoch:        k.firstEpoch,
 	}
+	if ov != nil {
+		// The parked actor's linger (M3-D42, M3-D50): internal, overridden
+		// by tests only; zero keeps the session's default (1 s).
+		e.params.ActorLinger = ov.ActorLinger
+	}
 	e.packet = session.PacketParams{
 		MaxPayload: c.Packet.MaxPayload,
 		Queue:      c.Packet.Queue,
