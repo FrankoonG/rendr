@@ -665,10 +665,11 @@ func (t *trunk) oneViewFill(b *Batch, rd *roundData) {
 		return
 	}
 	nb, pb, rb := b.n, b.payload(), b.retx
+	retiring := v.vx.retireQ.Load() // requested before the call (drrRound's rule)
 	v.ep.Fill(v, b)
 	v.exit()
 	t.countTx(v, b, nb, pb, rb)
-	if rd != nil && b.n == nb && v.vx.retireQ.Load() {
+	if rd != nil && b.n == nb && retiring && v.vx.retireQ.Load() {
 		t.mx.Lock()
 		t.retireDrainedLocked(v, b, rd, t.nsAt(b.Now()), &t.ms.post)
 		t.mx.Unlock()
@@ -793,8 +794,14 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				v.ready.Store(false)
 				continue
 			}
+			// A planned retirement follows a call that placed nothing and
+			// that started after it was requested (M2 reads the retirement
+			// before Fill) — not one the batch had no room for (stuck): the
+			// view's last frames are still due (TestRetireAfterNoRoomCall,
+			// TestRetireRequestedDuringCall).
+			retiring := v.vx.retireQ.Load()
 			appended, used, stuck := t.drrTurn(v, b, rd, nowNs, quantum)
-			if appended == 0 && v.vx.retireQ.Load() {
+			if appended == 0 && !stuck && retiring && v.vx.retireQ.Load() {
 				t.mx.Lock()
 				t.retireDrainedLocked(v, b, rd, nowNs, &t.ms.post)
 				t.mx.Unlock()
