@@ -93,6 +93,13 @@ func newDialWait(f int) *dialWait {
 	return &dialWait{done: make(chan struct{}), f: f, proven: make(chan struct{}), start: time.Now(), inEst: true}
 }
 
+// timedOut reports whether a dial failed by a timeout: its DialTimeout
+// (errDialTimeout) or a deadline on its handshake's reads or writes.
+func timedOut(err error) bool {
+	var t interface{ Timeout() bool }
+	return errors.As(err, &t) && t.Timeout()
+}
+
 // provenCheck wraps the claimant's check: a PREFACE_ACK it accepts proves
 // w's path (dialWait.proven).
 func (p *Pool) provenCheck(w *dialWait, check func(*wire.PrefaceAck) error) func(*wire.PrefaceAck) error {
@@ -177,7 +184,14 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // is a carrier refusal without penalty: the attempt continues with a dial
 // (or a wait, or another trunk) instead of returning the refusal. A
 // coalesced wait that outlasts Timing.DialTimeout fails like an attempt
-// that hit its DialTimeout (a path failure, L20). Close changes nothing
+// that hit its DialTimeout (a path failure, L20). A claimant's dial that
+// timed out counts for a waiter only when it began no earlier than the
+// waiter's attempt: the timeout of an older dial says how the path was
+// when that dial was sent (into an outage that may have ended since), not
+// how it is now, so it sends the waiter round again at once with a fresh
+// wait, as a dial of its own started with the attempt might have
+// attached (L22). Every other claimant failure — observed when it
+// happened — counts for every waiter. Close changes nothing
 // here: the sessions that survive Peer.Close keep their fast paths and
 // coalescing.
 func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr) (*Established, error) {
@@ -186,6 +200,7 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 		return Establish(ctx, p.env, fac, cid, kind, payload, check)
 	}
 	dk := sessionDataType(kind, payload)
+	begin := time.Now() // a claimant's dial timeout counts for this attempt only if the dial began no earlier
 	var (
 		skip       []*trunk    // trunks this attempt does not try again (openView failed, refused, died)
 		provenSeen *dialWait   // the dial in flight whose verdict grace this attempt already waited out
@@ -239,6 +254,14 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			case <-w.done:
 				if w.release || w.err == nil {
 					continue // published (it is usable now) or released: retry at once
+				}
+				if w.start.Before(begin) && timedOut(w.err) {
+					// A dial older than this attempt timed out: not this
+					// attempt's failure. Retry at once (a trunk, a newer
+					// dial, or a dial of its own) with a fresh wait.
+					timer.Stop()
+					timer = nil
+					continue
 				}
 				p.releaseCID(cid)
 				return nil, w.err
