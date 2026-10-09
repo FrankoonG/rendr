@@ -111,8 +111,12 @@ func (p *plane) Fill(c *carrier.Conn, b *carrier.Batch) {
 	l := (*lane)(p)
 	s := l.s
 	s.mu.Lock()
-	if s.muxFillLocked(l, b) {
+	if run, standIn := s.muxFillLocked(l, b); run {
+		n := b.Len()
 		s.fillPacketLocked(l, b)
+		if standIn && b.Len() == n {
+			s.placeStandInLocked(l, b)
+		}
 	}
 	s.mu.Unlock()
 }
