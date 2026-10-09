@@ -388,7 +388,7 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		check = newNonce()
 	}
 	var ab [wire.PrefaceLen]byte
-	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Instance: env.Local, CarrierID: h.pf.CarrierID})
+	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Opt: echoOpt(&h.pf), Instance: env.Local, CarrierID: h.pf.CarrierID})
 	afirst := env.Presets.fseqFrom(ab[:])
 	h2 := append(make([]byte, 0, wire.PrefaceLen+2*wire.FrameOverhead+wire.RackLen+wire.PingFixedLen), ab[:]...)
 	fcs := env.Presets.firstCseq()
@@ -409,6 +409,7 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		}
 	}
 	c := newDatagramConn(env, io, h.pf.CarrierID, h.pf.Instance, -1, "", false)
+	c.mux = passiveMux(&h.pf, h.first.Type)
 	dg := c.dg
 	dg.hs.pre = bytes.Clone(d[:wire.PrefaceLen])
 	dg.hs.h2b = h2

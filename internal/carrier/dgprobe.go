@@ -189,7 +189,7 @@ func (c *Conn) onChallengePing(p *wire.Ping) {
 	ch.pong, ch.pongDue = *p, true
 	ch.pong.Pad = 0
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // rebindCandidate starts a challenge to src at now (M2-D27, §A5.13): a
@@ -234,7 +234,7 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 			ch.sends = min(ch.sends, 1)
 		}
 		c.mu.Unlock()
-		c.Wake()
+		c.wakeWriter()
 		return
 	}
 	if !ch.last.IsZero() && now.Sub(ch.last) < max(c.relRTOLocked(), chalSpacingMin) {
@@ -247,7 +247,7 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 	}
 	ch.active, ch.cand, ch.nonce, ch.at, ch.moved, ch.sentAt, ch.sends, ch.last = true, src, newNonce(), now, false, time.Time{}, 0, now
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // newNonce returns a challenge nonce (≠ 0) from crypto/rand.

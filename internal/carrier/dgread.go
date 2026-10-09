@@ -181,7 +181,7 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 			// was released while H3 is still on its way (W4-REL-3).
 			early := dg.rel.una == c.env.Presets.firstCseq()
 			c.mu.Unlock()
-			c.Wake()
+			c.wakeWriter()
 			if ev == ReadCandidate && (early || dg.held.Load()) {
 				c.rebindCandidate(src, now, true) // a rebound handshake (R1-14)
 			}
@@ -276,13 +276,18 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 	case wire.TypeRack:
 		return c.relOnRack(f.Payload, now), chalNone
 	case wire.TypeDgram:
-		return c.dgOnDgram(f.Payload, now), chalNone
+		return c.dgOnDgram(f.Handle, f.Payload, now), chalNone
 	case wire.TypePack:
-		if c.ep == nil {
+		v := c.route(f.Handle) // a one-view trunk: a compare with view 1's handle
+		if v == nil {
+			c.violation("PACK for handle %d: no such view", f.Handle)
+			return false, chalNone
+		}
+		if v.ep == nil {
 			c.violation("PACK on a carrier without a session")
 			return false, chalNone
 		}
-		if err := c.ep.Control(c, f.Header, f.Payload); err != nil {
+		if err := v.ep.Control(v, f.Header, f.Payload); err != nil {
 			c.violation("PACK: %v", err)
 			return false, chalNone
 		}
@@ -295,20 +300,26 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 	return false, chalNone
 }
 
-// dgOnDgram hands one DGRAM to the packet endpoint (§A5.3): below BigData
+// dgOnDgram hands one DGRAM for handle h to the packet endpoint of its view
+// (route; §A5.3): below BigData
 // the payload is valid during the call (the session copies it); BigData or
 // more is copied first into a Buf of its own (TryGet against the Budget,
 // outside every lock; refused: the datagram is dropped and counted) whose
 // ownership moves to the endpoint. A DGRAM that makes an idle carrier
 // packet-active wakes the writer (PacketPing cadence, M2-D23).
-func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
+func (c *Conn) dgOnDgram(h uint32, p []byte, now time.Time) bool {
 	seq, data, err := wire.ParseDgram(p)
 	if err != nil {
 		c.violation("DGRAM: %v", err)
 		return false
 	}
-	if c.pep == nil {
-		if c.ep == nil {
+	v := c.route(h)
+	if v == nil {
+		c.violation("DGRAM for handle %d: no such view", h)
+		return false
+	}
+	if v.pep == nil {
+		if v.ep == nil {
 			c.violation("DGRAM on a carrier without a session")
 		} else {
 			c.violation("DGRAM on a stream session")
@@ -318,7 +329,7 @@ func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
 	active := c.packetActive(now)
 	c.dg.lastDgram.Store(c.dgSince(now))
 	if !active {
-		c.Wake()
+		c.wakeWriter()
 	}
 	c.rxBytes.Add(uint64(len(data)))
 	var buf *Buf
@@ -331,7 +342,7 @@ func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
 		n := copy(buf.B, data)
 		data = buf.B[:n]
 	}
-	if err := c.pep.Datagram(c, seq, data, buf); err != nil {
+	if err := v.pep.Datagram(v, seq, data, buf); err != nil {
 		c.violation("DGRAM: %v", err)
 		return false
 	}
