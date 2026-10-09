@@ -244,6 +244,14 @@ func mxExchange(t *testing.T, dcs, pcs []*rendr.Conn, size int64) {
 	t.Helper()
 	var wg sync.WaitGroup
 	errs := make(chan error, 4*len(dcs))
+	// The digests of every direction, compared only after every goroutine
+	// returned (a timeout fails without reading them).
+	type digests struct {
+		session    int
+		name       string
+		sent, read [32]byte
+	}
+	sums := make([]*digests, 0, 2*len(dcs))
 	for i := range dcs {
 		seed := uint64(10 + 2*i)
 		for _, dir := range []struct {
@@ -251,7 +259,9 @@ func mxExchange(t *testing.T, dcs, pcs []*rendr.Conn, size int64) {
 			seed uint64
 			name string
 		}{{dcs[i], pcs[i], seed, "up"}, {pcs[i], dcs[i], seed + 1, "back"}} {
-			var sent, read [32]byte
+			d := &digests{session: i, name: dir.name}
+			sums = append(sums, d)
+			sent, read := &d.sent, &d.read
 			wg.Go(func() {
 				h := sha256.New()
 				_, err := io.Copy(struct{ io.Writer }{dir.w}, io.TeeReader(io.LimitReader(rendrtest.PRNG(dir.seed), size), h))
@@ -271,11 +281,6 @@ func mxExchange(t *testing.T, dcs, pcs []*rendr.Conn, size int64) {
 					errs <- fmt.Errorf("session %d %s read: %w", i, dir.name, err)
 				}
 			})
-			defer func() {
-				if sent != read {
-					t.Errorf("session %d %s: SHA-256 %x sent, %x read", i, dir.name, sent[:8], read[:8])
-				}
-			}()
 		}
 	}
 	done := make(chan struct{})
@@ -284,6 +289,11 @@ func mxExchange(t *testing.T, dcs, pcs []*rendr.Conn, size int64) {
 	case <-done:
 	case <-time.After(30 * time.Second):
 		t.Fatal("the exchanges did not finish within 30 s")
+	}
+	for _, d := range sums {
+		if d.sent != d.read {
+			t.Errorf("session %d %s: SHA-256 %x sent, %x read", d.session, d.name, d.sent[:8], d.read[:8])
+		}
 	}
 	close(errs)
 	for err := range errs {

@@ -27,14 +27,18 @@ import (
 // allocation end to end. Two Runtimes over carrier/tcp on loopback
 // (default Props; rendr-owned TCP conns: vectored writes), driven only
 // through the public API. A round writes 16 KiB on each of the four
-// dialer conns — four views ready at once, so the trunk writer runs its
-// control pass and DRR rounds (M3-D10) — and then reads the 16 KiB of
-// each on the passive: the application copies, the trunk writer, the
-// passive trunk's dispatch to the views (M3-D4), the frame decode and the
-// ACK, PING and PONG traffic; the window must hold at least one DRR Fill
-// call per round (testhooks AfterViewFill, the stimulus). Over a window of at least 4,000 DATA and
-// control frames written by the dialer's views and at least 50 PING
-// intervals (PingBusy 10 ms), the raw number of heap allocations of every
+// dialer conns — four views with data at once, so the trunk writer runs
+// its view-table path, the control pass and the DRR rounds (M3-D10) — and
+// then reads the 16 KiB of each on the passive: the application copies,
+// the trunk writer, the passive trunk's dispatch to the views (M3-D4), the
+// frame decode and the ACK, PING and PONG traffic. Stimulus (the dialer's
+// testhooks only): the window holds at least one DRR Fill call per round
+// (AfterViewFill: the multi-view writer ran), and at least one physical
+// write per two rounds carries the Fill calls of two views or more
+// (AfterViewFill between two BeforeWrite calls: several views were ready
+// at once and were multiplexed into one write). Over a window of at least
+// 4,000 DATA and control frames written by the dialer's views and at least
+// 50 PING intervals (PingBusy 10 ms), the raw number of heap allocations of every
 // goroutine (runtime.MemStats.Mallocs, GC off, one P) is at most 40: an
 // allocation per frame, per round, per PING or per PONG alone exceeds it.
 // Asserted in the non-race lane; the race lane runs the same window
@@ -49,10 +53,30 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 		minFrames = 100 * maxAllocs
 	)
 	cfg := rendr.Config{PingBusy: 10 * time.Millisecond}
-	var drrFills atomic.Int64 // the trunk writers' DRR Fill calls (stimulus)
-	ov := &testhooks.Overrides{Hooks: &testhooks.Hooks{AfterViewFill: func(uint32, uint32) { drrFills.Add(1) }}}
+	// Stimulus counters, kept by the dialer's trunk writer (hooks on the
+	// dialer only; atomics, no allocation): its DRR Fill calls, the first
+	// handle filled since its last physical write, whether another one
+	// followed, and the writes that carried two views or more.
+	var drrFills, multiWrites atomic.Int64
+	var first atomic.Uint32
+	var since, other atomic.Bool
+	dov := &testhooks.Overrides{Hooks: &testhooks.Hooks{
+		AfterViewFill: func(_, h uint32) {
+			drrFills.Add(1)
+			if !since.Swap(true) {
+				first.Store(h)
+			} else if first.Load() != h {
+				other.Store(true)
+			}
+		},
+		BeforeWrite: func(uint32, int, int) {
+			if since.Swap(false) && other.Swap(false) {
+				multiWrites.Add(1)
+			}
+		},
+	}}
 	l := msTCPListen(t)
-	m := newMsPair(t, cfg, ov, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
+	m := newMsPairOv(t, cfg, dov, nil, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
 		[]rendr.Carrier{tcp.Carrier("direct", "tcp", l.Addr().String(), tcp.Options{})})
 	dcs, pcs := make([]*rendr.Conn, n), make([]*rendr.Conn, n)
 	for i := range n {
@@ -97,9 +121,9 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	}
 	minRounds, minWindow := int(float64(minFrames)/perRound*1.25)+1, 50*cfg.PingBusy
 	trunk := dcs[0].Status().Carriers[0].ID
-	f1, d1 := frames(), drrFills.Load()
+	f1, d1, w1 := frames(), drrFills.Load(), multiWrites.Load()
 	mallocs, rounds, el := msCountMallocs(minRounds, minWindow, round)
-	wrote, drr := frames()-f1, drrFills.Load()-d1
+	wrote, drr, multi := frames()-f1, drrFills.Load()-d1, multiWrites.Load()-w1
 	if string(rbuf) != string(wbuf) {
 		t.Fatal("the last round delivered other bytes")
 	}
@@ -112,12 +136,14 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	if wrote < minFrames || el < minWindow {
 		t.Fatalf("load: %d frames in %d rounds over %v, want ≥ %d frames and ≥ %v", wrote, rounds, el, minFrames, minWindow)
 	}
-	// Stimulus: the window ran the trunk writers' DRR rounds (several views
-	// ready at once), not one view at a time.
-	if drr < int64(rounds) {
-		t.Fatalf("stimulus: %d DRR Fill calls in %d rounds, want at least one per round", drr, rounds)
+	// Stimulus: the window ran the multi-view writer's DRR rounds (one
+	// Fill call per round at least), and several views were ready at once:
+	// writes that multiplexed two views or more, one per two rounds at
+	// least (measured: about one per round).
+	if drr < int64(rounds) || 2*multi < int64(rounds) {
+		t.Fatalf("stimulus: %d DRR Fill calls and %d writes of two views or more in %d rounds, want ≥ %d and ≥ %d", drr, multi, rounds, rounds, (rounds+1)/2)
 	}
-	t.Logf("%d allocations in %d rounds of %d × %d KiB (%v; the dialer's views wrote %d frames; %d DRR Fill calls)", mallocs, rounds, n, size>>10, el, wrote, drr)
+	t.Logf("%d allocations in %d rounds of %d × %d KiB (%v; the dialer's views wrote %d frames; %d DRR Fill calls; %d writes of two views or more)", mallocs, rounds, n, size>>10, el, wrote, drr, multi)
 	if msRace {
 		t.Logf("race lane: not asserted")
 	} else if mallocs > maxAllocs {
@@ -163,18 +189,25 @@ func msCountMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs
 // stream session over carrier/tcp (ActorLinger 5 ms, a testhooks
 // override) is let park on both ends. Each operation writes one byte on
 // the dialer: the Write that makes data outstanding rings a bond actor
-// (its rescue clock, W7), a kick of the parked actor; the clock stops once
-// the actor runs (the session registry's parked gauge drops), so ns/op is
-// the time from the Write to the running actor. The byte is read on the
-// passive outside the clock, and the next operation waits until both
-// actors parked again.
+// (its rescue clock, W7), a kick of the parked actor, whose step does no
+// work, so it parks again at once. The clock stops on that event, the
+// dialer actor's next park attempt (testhooks AtPark, installed on the
+// dialer only): ns/op is the time from the Write until the kicked actor
+// ran its step and parks again. Stopping on an event, not on a sample of
+// the parked gauge, holds at every GOMAXPROCS: the actor's run is too
+// short to be sampled reliably, and at one P it is never seen. The byte
+// is read on the passive outside the clock, and the next operation waits
+// until both actors parked again (the registry gauge against its value
+// before the session opened).
 func BenchmarkActorKick(b *testing.B) {
 	l := msTCPListen(b)
-	ov := &testhooks.Overrides{ActorLinger: 5 * time.Millisecond}
-	m := newMsPair(b, rendr.Config{}, ov, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
+	var parks atomic.Int64 // the dialer actor's park attempts
+	pov := &testhooks.Overrides{ActorLinger: 5 * time.Millisecond}
+	dov := &testhooks.Overrides{ActorLinger: pov.ActorLinger, Hooks: &testhooks.Hooks{AtPark: func([16]byte) { parks.Add(1) }}}
+	parked0 := testhooks.ParkedSessions.Load()
+	m := newMsPairOv(b, rendr.Config{}, dov, pov, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
 		[]rendr.Carrier{tcp.Carrier("direct", "tcp", l.Addr().String(), tcp.Options{})})
 	dc, pc := m.open(rendr.ModeBond)
-	parked0 := testhooks.ParkedSessions.Load()
 	bothParked := func() bool { return testhooks.ParkedSessions.Load()-parked0 == 2 }
 	one, got := []byte{1}, make([]byte, 1)
 	b.ReportAllocs()
@@ -182,11 +215,12 @@ func BenchmarkActorKick(b *testing.B) {
 	b.StopTimer()
 	for range b.N {
 		msUntil(b, 5*time.Second, "both actors parked", bothParked)
+		p0 := parks.Load() // AtPark runs before the gauge counts the park
 		b.StartTimer()
 		if _, err := dc.Write(one); err != nil {
 			b.Fatal(err)
 		}
-		for deadline := time.Now().Add(5 * time.Second); bothParked(); runtime.Gosched() {
+		for deadline := time.Now().Add(5 * time.Second); parks.Load() == p0; runtime.Gosched() {
 			if time.Now().After(deadline) {
 				b.Fatal("the Write did not kick the parked bond actor within 5 s")
 			}

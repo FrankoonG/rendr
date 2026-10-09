@@ -141,8 +141,15 @@ type msPair struct {
 // test leaves nothing behind for the next one.
 func newMsPair(t testing.TB, cfg rendr.Config, ov *testhooks.Overrides, lc rendr.ListenConfig, carriers []rendr.Carrier) *msPair {
 	t.Helper()
+	return newMsPairOv(t, cfg, ov, ov, lc, carriers)
+}
+
+// newMsPairOv is newMsPair with the dialer's overrides dov and the
+// passive's pov apart (a hook that must see one end only).
+func newMsPairOv(t testing.TB, cfg rendr.Config, dov, pov *testhooks.Overrides, lc rendr.ListenConfig, carriers []rendr.Carrier) *msPair {
+	t.Helper()
 	m := &msPair{t: t, live0: testhooks.LiveSessions.Load()}
-	build := func(cfg rendr.Config) *rendr.Runtime {
+	build := func(cfg rendr.Config, ov *testhooks.Overrides) *rendr.Runtime {
 		t.Helper()
 		if ov == nil {
 			rt, err := rendr.NewRuntime(cfg)
@@ -164,8 +171,8 @@ func newMsPair(t testing.TB, cfg rendr.Config, ov *testhooks.Overrides, lc rendr
 			m.downs.Add(1)
 		}
 	}
-	m.d = build(dcfg)
-	m.p = build(cfg)
+	m.d = build(dcfg, dov)
+	m.p = build(cfg, pov)
 	t.Cleanup(func() { m.d.Close(); m.p.Close() })
 	var err error
 	if m.ln, err = m.p.Listen(lc); err != nil {
@@ -671,11 +678,7 @@ func msPackets(t testing.TB, dcs, pcs []*rendr.PacketConn, rate, back int, run, 
 	close(stop)
 	gens.Wait()
 	// Drain: every datagram sent was received or lost, both ways.
-	drain := time.Second
-	if msRace {
-		drain = 2 * time.Second
-	}
-	time.Sleep(drain)
+	msDrain(t, dcs, pcs, ups, downs)
 	for i := range n {
 		if a, b := dcs[i].Status(), pcs[i].Status(); a.Err != nil || b.Err != nil {
 			t.Errorf("packet session %d failed before its Close: dialer %v, passive %v", i, a.Err, b.Err)
@@ -698,6 +701,64 @@ func msPackets(t testing.TB, dcs, pcs []*rendr.PacketConn, rate, back int, run, 
 		msJudge(t, fmt.Sprintf("P%d (%v) dialer → passive", i, ds.Mode), ups[i], rate, run, io.EOF, ds, ps, kills)
 		msJudge(t, fmt.Sprintf("P%d (%v) passive → dialer", i, ds.Mode), downs[i], back, run, net.ErrClosed, ps, ds, kills)
 	}
+}
+
+// msDrain waits until both directions of every packet session drained,
+// a gate in place of a fixed sleep: in each direction the sender's queue
+// is empty (WriteTo's accepted count equals Sent plus the send drops),
+// the newest datagram arrived (the verifier's Highest + 1 equals the
+// accepted count), the reader consumed what the session received (read
+// plus DropRecvQueue equals Received), and the receiver's Received and
+// Duplicates (a race member's late copies) did not move over a quiet
+// interval (50 ms; 200 ms under -race). It gives up after 2 s (4 s under
+// -race) and leaves the verdict to msJudge, which then reports what is
+// missing.
+func msDrain(t testing.TB, dcs, pcs []*rendr.PacketConn, ups, downs []*msSide) {
+	t.Helper()
+	quiet, limit := 50*time.Millisecond, 2*time.Second
+	if msRace {
+		quiet, limit = 200*time.Millisecond, 4*time.Second
+	}
+	type dir struct {
+		s      *msSide
+		tx, rx *rendr.PacketConn
+	}
+	var dirs []dir
+	for i := range dcs {
+		dirs = append(dirs, dir{ups[i], dcs[i], pcs[i]}, dir{downs[i], pcs[i], dcs[i]})
+	}
+	drained := func() (bool, uint64) {
+		var moved uint64 // a sum of the receive counters, to see them move
+		ok := true
+		for _, d := range dirs {
+			tp, rp := d.tx.Status().Packet, d.rx.Status().Packet
+			if tp == nil || rp == nil {
+				return false, 0
+			}
+			sent := d.s.accepted.Load()
+			ok = ok && tp.Sent+tp.DropQueue+tp.DropAge+tp.DropNoPath+tp.DropTooLarge == sent &&
+				(sent == 0 || d.s.v.Result().Highest+1 == sent) &&
+				d.s.read.Load()+rp.DropRecvQueue == rp.Received
+			moved += rp.Received + rp.Duplicates
+		}
+		return ok, moved
+	}
+	start := time.Now()
+	_, last := drained()
+	since := time.Now()
+	for time.Since(start) < limit {
+		time.Sleep(5 * time.Millisecond)
+		ok, now := drained()
+		if now != last || !ok {
+			last, since = now, time.Now()
+			continue
+		}
+		if time.Since(since) >= quiet {
+			t.Logf("drained in %v", time.Since(start).Round(time.Millisecond))
+			return
+		}
+	}
+	t.Logf("not drained within %v (the verdict follows)", limit)
 }
 
 // msDone waits for ch at most 30 s.
@@ -1130,25 +1191,34 @@ func msCPU() float64 {
 	return s[0].Value.Float64() - s[1].Value.Float64()
 }
 
-// msBulk moves count chunks of size bytes on every session dialer →
-// passive, each session with its own writer and reader, and returns when
-// every byte was read.
-func msBulk(tb testing.TB, dcs, pcs []*rendr.Conn, count, size int) {
+// msBufs returns a write and a read buffer of size bytes per session, made
+// once outside a benchmark's clock, so that B/op and allocs/op show
+// rendr's allocations and not the harness's.
+func msBufs(n, size int) (w, r [][]byte) {
+	w, r = make([][]byte, n), make([][]byte, n)
+	for i := range n {
+		w[i], r[i] = make([]byte, size), make([]byte, size)
+	}
+	return w, r
+}
+
+// msBulk moves count chunks of len(w[i]) bytes on every session i dialer →
+// passive, each session with its own writer (buffer w[i]) and reader
+// (buffer r[i]), and returns when every byte was read.
+func msBulk(tb testing.TB, dcs, pcs []*rendr.Conn, w, r [][]byte, count int) {
 	var wg sync.WaitGroup
 	for i := range dcs {
 		wg.Go(func() {
-			buf := make([]byte, size)
 			for range count {
-				if _, err := dcs[i].Write(buf); err != nil {
+				if _, err := dcs[i].Write(w[i]); err != nil {
 					tb.Errorf("session %d: Write: %v", i, err)
 					return
 				}
 			}
 		})
 		wg.Go(func() {
-			buf := make([]byte, size)
 			for range count {
-				if _, err := io.ReadFull(pcs[i], buf); err != nil {
+				if _, err := io.ReadFull(pcs[i], r[i]); err != nil {
 					tb.Errorf("session %d: Read: %v", i, err)
 					return
 				}
@@ -1179,12 +1249,13 @@ func BenchmarkMuxLoopback(b *testing.B) {
 			if mx := m.d.Status().Mux; mx.Carriers != 1 || mx.Views != n {
 				b.Fatalf("dialer Mux %+v, want %d views on one trunk", mx, n)
 			}
-			msBulk(b, dcs, pcs, 16, chunk) // warm-up: windows, pools, rings
+			w, r := msBufs(n, chunk)
+			msBulk(b, dcs, pcs, w, r, 16) // warm-up: windows, pools, rings
 			b.SetBytes(int64(n) * chunk)
 			b.ReportAllocs()
 			cpu0 := msCPU()
 			b.ResetTimer()
-			msBulk(b, dcs, pcs, b.N, chunk)
+			msBulk(b, dcs, pcs, w, r, b.N)
 			b.StopTimer()
 			b.ReportMetric((msCPU()-cpu0)/(float64(n)*float64(chunk)*float64(b.N)/(1<<30)), "cpu-s/GiB")
 			for i := range n {
@@ -1210,12 +1281,13 @@ func BenchmarkRaceLoopback(b *testing.B) {
 	dc, pc := m.open(rendr.ModeRace)
 	msUntil(b, 5*time.Second, "both race members live", func() bool { return msLive(dc.Status()) == 2 })
 	dcs, pcs := []*rendr.Conn{dc}, []*rendr.Conn{pc}
-	msBulk(b, dcs, pcs, 16, chunk)
+	w, r := msBufs(1, chunk)
+	msBulk(b, dcs, pcs, w, r, 16)
 	b.SetBytes(chunk)
 	b.ReportAllocs()
 	cpu0 := msCPU()
 	b.ResetTimer()
-	msBulk(b, dcs, pcs, b.N, chunk)
+	msBulk(b, dcs, pcs, w, r, b.N)
 	b.StopTimer()
 	b.ReportMetric((msCPU()-cpu0)/(float64(chunk)*float64(b.N)/(1<<30)), "cpu-s/GiB")
 	b.ReportMetric(float64(dc.Status().Race.CopyBytes)/float64(max(dc.Status().TxBytes, 1)), "copies/byte")
