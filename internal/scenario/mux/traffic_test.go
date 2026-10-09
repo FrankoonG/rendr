@@ -149,45 +149,63 @@ type receiver struct {
 // accepts io.EOF after any count (waitSent then compares the count with
 // the sender's).
 func startReceiver(name string, c *rendr.Conn, seed uint64, size int64) *receiver {
+	r := newReceiver(name, seed, size)
+	go r.run(c)
+	return r
+}
+
+// startPausedReceiver is startReceiver with the application paused before
+// its first Read (the gate is set before the reader starts, so a stalled
+// application never reads a byte); resume lets it read.
+func (w *world) startPausedReceiver(name string, c *rendr.Conn, seed uint64, size int64) *receiver {
+	r := newReceiver(name, seed, size)
+	w.pause(r)
+	go r.run(c)
+	return r
+}
+
+// newReceiver returns a receiver that is not reading yet.
+func newReceiver(name string, seed uint64, size int64) *receiver {
 	want := size
 	if size == openEnded {
 		want = math.MaxInt64
 	}
-	r := &receiver{name: name, v: rendrtest.NewVerifier(seed, want), size: size, start: time.Now(), done: make(chan struct{}), stop: make(chan struct{})}
-	go func() {
-		defer close(r.done)
-		buf := make([]byte, 64<<10)
-		for {
-			if g := r.gate.Load(); g != nil {
-				select { // channels, not a lock: synctest sees the wait as durable
-				case <-*g:
-				case <-r.stop:
-					r.err = fmt.Errorf("%s: stopped while paused", r.name)
-					return
-				}
-			}
-			n, err := c.Read(buf)
-			if n > 0 {
-				now := time.Now()
-				if _, werr := r.v.Write(buf[:n]); werr != nil {
-					r.err = r.v.Done(err)
-					return
-				}
-				got := r.got.Add(int64(n))
-				r.mu.Lock()
-				r.at = append(r.at, now)
-				r.cum = append(r.cum, got)
-				r.mu.Unlock()
-			}
-			if err != nil {
-				if r.size != openEnded || !errors.Is(err, io.EOF) {
-					r.err = r.v.Done(err)
-				}
+	return &receiver{name: name, v: rendrtest.NewVerifier(seed, want), size: size, start: time.Now(), done: make(chan struct{}), stop: make(chan struct{})}
+}
+
+// run is the receiver's reader.
+func (r *receiver) run(c *rendr.Conn) {
+	defer close(r.done)
+	buf := make([]byte, 64<<10)
+	for {
+		if g := r.gate.Load(); g != nil {
+			select { // channels, not a lock: synctest sees the wait as durable
+			case <-*g:
+			case <-r.stop:
+				r.err = fmt.Errorf("%s: stopped while paused", r.name)
 				return
 			}
 		}
-	}()
-	return r
+		n, err := c.Read(buf)
+		if n > 0 {
+			now := time.Now()
+			if _, werr := r.v.Write(buf[:n]); werr != nil {
+				r.err = r.v.Done(err)
+				return
+			}
+			got := r.got.Add(int64(n))
+			r.mu.Lock()
+			r.at = append(r.at, now)
+			r.cum = append(r.cum, got)
+			r.mu.Unlock()
+		}
+		if err != nil {
+			if r.size != openEnded || !errors.Is(err, io.EOF) {
+				r.err = r.v.Done(err)
+			}
+			return
+		}
+	}
 }
 
 // pause stops the reader's application before its next Read (a Read in

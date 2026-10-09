@@ -79,9 +79,11 @@ func TestMuxReaderNeverBlocks_L15(t *testing.T) {
 		var rx []*receiver
 		var tx []*sender
 		for i, s := range ps {
-			r := startReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
+			var r *receiver
 			if i == 0 {
-				w.pause(r)
+				r = w.startPausedReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
+			} else {
+				r = startReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
 			}
 			rx = append(rx, r)
 			tx = append(tx, w.startSender(s.d, uint64(1+i), openEnded, 0))
@@ -102,9 +104,7 @@ func TestMuxReaderNeverBlocks_L15(t *testing.T) {
 		for k := 0; k < 4; k++ {
 			time.Sleep(time.Second)
 			peakBuf = max(peakBuf, w.d.Status().BufferedBytes+w.p.Status().BufferedBytes)
-			if k == 1 {
-				peakHeap = heapInUse()
-			}
+			peakHeap = max(peakHeap, heapInUse()) // every second: one sample can miss the peak
 			if st := ps[0].p.Status(); st.RxBytes > window {
 				t.Fatalf("SA's passive holds %d bytes, more than its Window %d", st.RxBytes, window)
 			}
@@ -178,9 +178,11 @@ func TestMuxStalledReaderIsolation_L15_L16(t *testing.T) {
 		var tx []*sender
 		stallStart := time.Now()
 		for i, s := range ps {
-			r := startReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
+			var r *receiver
 			if i < 8 {
-				w.pause(r)
+				r = w.startPausedReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
+			} else {
+				r = startReceiver(s.key+" A → B", s.p, uint64(1+i), openEnded)
 			}
 			rx = append(rx, r)
 			tx = append(tx, w.startSender(s.d, uint64(1+i), openEnded, 0))
@@ -382,117 +384,140 @@ func p99(ds []time.Duration) time.Duration {
 // TestMuxFairness_L15 (M3 design §A11.2, §A5.3; L15, M3-D10 DRR): 8 bulk
 // sessions (4 sending A → B, 4 B → A, open-ended) and 1 echo session share
 // the one carrier of a one-factory Peer over a Link of 20 ms RTT shaped to
-// 4 MiB/s per direction (2 MiB/s under -race, R1-11).
+// 4 MiB/s per direction (under -race too, see fairness) with a bottleneck
+// queue of rate/16 (62.5 ms; rendrtest's default 2-MiB buffer is a 500-ms
+// queue at 4 MiB/s, and with it one direction of a carrier loaded both
+// ways collapses: TestMuxBulkBothWaysKeepsTheLink, DEFECT 2).
 //
-// Premise sizing (A11.5 rule 3): fairness is measured as byte shares over
-// 1-s windows, and a share is counted in DRR quanta; at the default 64-KiB
-// quantum a session's 1 MiB/s is 16 quanta per window, which a direction
-// that loses most of its rate (TestMuxBulkBothWaysKeepsTheLink) cuts to a
-// handful. The quantum is set to 8 KiB on both ends (testhooks
-// MuxQuantum) so that every window holds ≥ 25 quanta per session even
-// then; the default quantum's fairness bound is WP8's unit row
-// (TestMuxDRRFairness).
+// Premise sizing (A11.5 rule 3; an amendment of A11.2 that needs the
+// owner's sign-off): fairness is measured as byte shares over 1-s windows,
+// and a share is counted in DRR quanta; at the default 64-KiB quantum a
+// session's 1 MiB/s is 16 quanta per window, and the
+// writer's cap-limited rotation (TestMuxCapLimitedSharesFair, DEFECT 1)
+// rather than DRR's quota decides the shares and the echo's wait at that
+// granularity. The quantum is 8 KiB on both ends (testhooks MuxQuantum);
+// the same row at the default quantum is TestMuxFairnessDefaultQuantum_L15,
+// a failing row until DEFECT 1 is fixed.
 //
 // The echo session's dialer writes a 1-KiB request every 100 ms and times
 // its echo (pipelined, as G2's echo); its unloaded round trip (base) is
-// measured before the bulk starts. PASS: in every 1-s window from 1 s after
-// the bulk start to its end, Jain's index of the 4 bulk sessions' received
-// bytes is ≥ 0.95 in each direction; the echo's P99 round trip under load
-// is at most base + (Cap_A + BatchBudget)/rate + (Cap_B + BatchBudget)/rate
-// + 2·RTT — the request waits behind at most the dialer end's in-flight cap
-// and one writer round of the other sessions' payload (BatchBudget), the
-// echo behind the passive end's (Cap_X: the largest Cap end X reported
-// during the run): DRR keeps the echo a round away from the head, never
-// behind the 4 × 8-MiB send backlog of its direction; every echo verified
-// and every bulk byte verified with io.EOF after exactly what its sender
-// wrote; a clean end and nothing left after Runtime.Close.
+// measured before the bulk starts. PASS: load — each direction's 4 bulk
+// sessions carry ≥ 0.85 of the link over the run; fairness — in every 1-s
+// window from 1 s after the bulk start to its end, Jain's index of the 4
+// bulk sessions' received bytes is ≥ 0.95 in each direction; the echo —
+// at least 90 % of one sample per 100 ms, and its P99 round trip under
+// load at most base + Cap/rate + 2·RTT (Cap: the largest Cap either end
+// of the shared carrier reported during the run): DRR keeps the echo a
+// round away from the head, never behind the 4 × 8-MiB send backlog of its
+// direction; integrity — every echo verified and every bulk byte verified
+// with io.EOF after exactly what its sender wrote; a clean end and nothing
+// left after Runtime.Close.
 func TestMuxFairness_L15(t *testing.T) {
-	rate := float64(4 << 20)
-	if raceEnabled {
-		rate = 2 << 20 // R1-11
+	synctest.Test(t, func(t *testing.T) { fairness(t, 8<<10, false) })
+}
+
+// fairness runs TestMuxFairness_L15 with the DRR quantum on both ends;
+// with roundRobin every bulk session's 1-s window must also hold the
+// direction's mean ± 2 quanta (TestMuxFairnessDefaultQuantum_L15).
+func fairness(t *testing.T, quantum int, roundRobin bool) {
+	// 4 MiB/s under -race too (not R1-11's quarter): at 2 MiB/s one
+	// direction of the carrier, loaded both ways, falls to 0.55–0.85 of the
+	// link with any bottleneck queue from 64 to 512 KiB, with or without
+	// the race detector (DEFECT 2, TestMuxBulkBothWaysKeepsTheLink); the
+	// row returns to R1-11's size once that is fixed.
+	const rate = float64(4 << 20)
+	const oneWay, run = 10 * time.Millisecond, 10 * time.Second
+	ov := testhooks.Overrides{MuxQuantum: quantum}
+	w := newWorld(t, worldOpts{dov: ov, pov: ov}, linkSpec{name: "a", oneWay: oneWay, rate: rate, buffer: int(rate) / 16})
+	peer := w.peer("a")
+	ps := w.openMany(peer, "S", 9, func(int) rendr.Mode { return rendr.ModeSelector })
+	requireShared(t, ps)
+	es := ps[8]
+	e := w.startEchoer(es)
+	time.Sleep(2 * time.Second)
+	base := slices.Max(e.samples())
+
+	var rx []*receiver
+	var tx []*sender
+	for i, s := range ps[:8] {
+		from, to, dir := s.d, s.p, "A → B"
+		if i >= 4 {
+			from, to, dir = s.p, s.d, "B → A"
+		}
+		rx = append(rx, startReceiver(s.key+" "+dir, to, uint64(1+i), openEnded))
+		tx = append(tx, w.startSender(from, uint64(1+i), openEnded, 0))
+		startReceiver(s.key+" back", from, uint64(100+i), 0)
+		w.startSender(to, uint64(100+i), 0, 0)
 	}
-	synctest.Test(t, func(t *testing.T) {
-		const oneWay, run, quantum, batch = 10 * time.Millisecond, 10 * time.Second, 8 << 10, 256 << 10
-		ov := testhooks.Overrides{MuxQuantum: quantum}
-		w := newWorld(t, worldOpts{dov: ov, pov: ov}, linkSpec{name: "a", oneWay: oneWay, rate: rate})
-		peer := w.peer("a")
-		ps := w.openMany(peer, "S", 9, func(int) rendr.Mode { return rendr.ModeSelector })
-		requireShared(t, ps)
-		es := ps[8]
-		e := w.startEchoer(es)
-		time.Sleep(2 * time.Second)
-		base := slices.Max(e.samples())
+	n0 := len(e.samples())
+	start := time.Now()
+	var caps [2]int // the largest Cap each end of the shared carrier reported
+	for k := 1; k <= int(run/(100*time.Millisecond)); k++ {
+		sleepUntil(start.Add(time.Duration(k) * 100 * time.Millisecond))
+		for i, c := range []*rendr.Conn{es.d, es.p} {
+			if cs := liveOf(c.Status()); len(cs) == 1 {
+				caps[i] = max(caps[i], cs[0].Cap)
+			}
+		}
+	}
+	end := time.Now()
+	rtts := e.samples()[n0:]
+	for _, s := range tx {
+		s.end()
+	}
+	for i, r := range rx {
+		r.waitSent(t, tx[i], time.Minute)
+	}
+	e.halt(t, es)
 
-		var rx []*receiver
-		var tx []*sender
-		for i, s := range ps[:8] {
-			from, to, dir := s.d, s.p, "A → B"
-			if i >= 4 {
-				from, to, dir = s.p, s.d, "B → A"
-			}
-			rx = append(rx, startReceiver(s.key+" "+dir, to, uint64(1+i), openEnded))
-			tx = append(tx, w.startSender(from, uint64(1+i), openEnded, 0))
-			startReceiver(s.key+" back", from, uint64(100+i), 0)
-			w.startSender(to, uint64(100+i), 0, 0)
-		}
-		n0 := len(e.samples())
-		start := time.Now()
-		var caps [2]int // the largest Cap each end of the shared carrier reported
-		for k := 1; k <= int(run/(100*time.Millisecond)); k++ {
-			sleepUntil(start.Add(time.Duration(k) * 100 * time.Millisecond))
-			for i, c := range []*rendr.Conn{es.d, es.p} {
-				if cs := liveOf(c.Status()); len(cs) == 1 {
-					caps[i] = max(caps[i], cs[0].Cap)
-				}
-			}
-		}
-		end := time.Now()
-		rtts := e.samples()[n0:]
-		for _, s := range tx {
-			s.end()
-		}
-		for i, r := range rx {
-			r.waitSent(t, tx[i], time.Minute)
-		}
-		e.halt(t, es)
-
-		for d, set := range [][]*receiver{rx[:4], rx[4:]} {
-			var total int64
-			worst, least := 1.0, int64(math.MaxInt64)
-			for at := start.Add(time.Second); !at.Add(time.Second).After(end); at = at.Add(time.Second) {
-				var xs []float64
-				for _, r := range set {
-					n := r.bytesAt(at.Add(time.Second)) - r.bytesAt(at)
-					xs = append(xs, float64(n))
-					least = min(least, n)
-				}
-				j := jain(xs)
-				worst = min(worst, j)
-				if j < 0.95 {
-					t.Errorf("%s: Jain's index %.3f in the window at +%v (bytes %v), want ≥ 0.95", [2]string{"A → B", "B → A"}[d], j, at.Sub(start), xs)
-				}
-			}
+	for d, set := range [][]*receiver{rx[:4], rx[4:]} {
+		dir := [2]string{"A → B", "B → A"}[d]
+		var total int64
+		worst, least := 1.0, int64(math.MaxInt64)
+		for at := start.Add(time.Second); !at.Add(time.Second).After(end); at = at.Add(time.Second) {
+			var xs []float64
 			for _, r := range set {
-				total += r.bytesAt(end) - r.bytesAt(start)
+				n := r.bytesAt(at.Add(time.Second)) - r.bytesAt(at)
+				xs = append(xs, float64(n))
+				least = min(least, n)
 			}
-			t.Logf("%s: worst Jain's index %.4f; %.3f of the link; least session window %d bytes (%d quanta)",
-				[2]string{"A → B", "B → A"}[d], worst, float64(total)/(rate*run.Seconds()), least, least/quantum)
+			j := jain(xs)
+			worst = min(worst, j)
+			if j < 0.95 {
+				t.Errorf("%s: Jain's index %.3f in the window at +%v (bytes %v), want ≥ 0.95", dir, j, at.Sub(start), xs)
+			}
+			if roundRobin {
+				mean := (xs[0] + xs[1] + xs[2] + xs[3]) / 4
+				for i, x := range xs {
+					if math.Abs(x-mean) > float64(2*quantum) {
+						t.Errorf("%s: session %d received %.1f quanta in the window at +%v, want the mean %.1f ± 2 (a round robin)", dir, i, x/float64(quantum), at.Sub(start), mean/float64(quantum))
+					}
+				}
+			}
 		}
-		perSec := float64(time.Second) / rate
-		limit := base + time.Duration(float64(caps[0]+caps[1]+2*batch)*perSec) + 2*2*oneWay
-		got := p99(rtts)
-		t.Logf("echo: base %v, %d samples under load, P99 %v, max %v; Cap A %d, B %d; limit %v", base, len(rtts), got, slices.Max(rtts), caps[0], caps[1], limit)
-		if len(rtts) < int(run/(100*time.Millisecond))*9/10 {
-			t.Errorf("echo: %d samples under load in %v, want ≥ 90 %% of one per 100 ms", len(rtts), run)
+		for _, r := range set {
+			total += r.bytesAt(end) - r.bytesAt(start)
 		}
-		if got > limit {
-			t.Errorf("echo: P99 %v under load, want ≤ base + (Cap_A + Cap_B + 2·BatchBudget)/rate + 2·RTT = %v", got, limit)
+		load := float64(total) / (rate * end.Sub(start).Seconds())
+		t.Logf("%s: worst Jain's index %.4f; %.3f of the link; least session window %d bytes (%d quanta)",
+			dir, worst, load, least, least/int64(quantum))
+		if load < 0.85 {
+			t.Errorf("load: %s carried %.3f of the link over the run, want ≥ 0.85", dir, load)
 		}
-		if t.Failed() {
-			t.FailNow()
-		}
-		closeAll(t, ps)
-		w.noViolation()
-		w.close()
-	})
+	}
+	limit := base + time.Duration(float64(max(caps[0], caps[1]))/rate*float64(time.Second)) + 2*2*oneWay
+	got := p99(rtts)
+	t.Logf("echo: base %v, %d samples under load, P99 %v, max %v; Cap A %d, B %d; limit %v", base, len(rtts), got, slices.Max(rtts), caps[0], caps[1], limit)
+	if len(rtts) < int(run/(100*time.Millisecond))*9/10 {
+		t.Errorf("echo: %d samples under load in %v, want ≥ 90 %% of one per 100 ms", len(rtts), run)
+	}
+	if got > limit {
+		t.Errorf("echo: P99 %v under load, want ≤ base + Cap/rate + 2·RTT = %v", got, limit)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+	closeAll(t, ps)
+	w.noViolation()
+	w.close()
 }

@@ -220,7 +220,6 @@ func g5(t *testing.T, rate float64) {
 		before = 5 * time.Second
 		after  = 8 * time.Second
 	)
-	size := int64(rate * (before + g5Dropped + g5Bound + after).Seconds())
 	w := newWorld(t, worldOpts{dcfg: rendr.Config{DialTimeout: g5DialTimeout}},
 		linkSpec{name: "b", oneWay: oneWay, rate: link}, linkSpec{name: "a", oneWay: oneWay, rate: link})
 	if adj := w.d.Status().ConfigAdjustments; len(adj) != 0 {
@@ -228,7 +227,7 @@ func g5(t *testing.T, rate float64) {
 	}
 	peer := w.peer("b", "a")
 	ps := openGoldSessions(w, peer)
-	b := w.startBulk(ps, size, rate)
+	b := w.startBulk(ps, openEnded, rate) // paced; the senders half-close 8 s after the reset
 	start := time.Now()
 
 	// The DROP of path A for 20 s.
@@ -263,45 +262,76 @@ func g5(t *testing.T, rate float64) {
 	}
 	la.SetBlackhole(false)
 
-	// The bond sessions rejoin a within G5Bound, carrying data.
-	for i, s := range ps[2:] {
-		var joined rendr.CarrierStatus
-		waitFor(t, g5Bound-time.Since(rm), fmt.Sprintf("bond session %s's new member of a", s.key), func() bool {
-			var ok bool
-			joined, ok = liveNamed(s.d.Status(), "a")
-			return ok && joined.ID != victims[i]
-		})
-		listed := time.Now()
-		var tx0 uint64
-		if pm, ok := carrierOf(s.p.Status(), joined.ID); ok {
-			tx0 = pm.TxBytes
-		}
-		for k := 1; k <= 2; k++ {
-			sleepUntil(listed.Add(time.Duration(k) * g5Sample))
-			pm, ok := carrierOf(s.p.Status(), joined.ID)
-			if !ok || pm.TxBytes <= tx0 {
-				t.Fatalf("bond session %s: the rejoined member %d's TxBytes on B did not grow in sample %d: %d → %+v", s.key, joined.ID, k, tx0, pm)
+	// One loop watches both bond sessions' rejoins of a and samples each
+	// rejoined member's TxBytes on B at 1 s and 2 s after it was listed, and
+	// resets b at exactly T_rm + G5Bound whatever the samples' progress
+	// (samples after the reset still show the member carrying data). A
+	// rejoin not listed by then fails the case.
+	type rejoin struct {
+		id      rendr.CarrierID
+		listed  time.Time
+		tx      uint64
+		samples int
+	}
+	var (
+		rj      [2]rejoin
+		reset   time.Time
+		target  rendr.CarrierStatus
+		quality []uint64
+	)
+	for {
+		now := time.Now()
+		for i, s := range ps[2:] {
+			r := &rj[i]
+			if r.listed.IsZero() {
+				if m, ok := liveNamed(s.d.Status(), "a"); ok && m.ID != victims[i] {
+					r.id, r.listed = m.ID, now
+					if pm, ok := carrierOf(s.p.Status(), m.ID); ok {
+						r.tx = pm.TxBytes
+					}
+					t.Logf("bond session %s: member %d of a listed at T_rm +%v", s.key, m.ID, now.Sub(rm))
+				}
+				continue
 			}
-			tx0 = pm.TxBytes
+			if r.samples < 2 && !now.Before(r.listed.Add(time.Duration(r.samples+1)*g5Sample)) {
+				r.samples++
+				pm, ok := carrierOf(s.p.Status(), r.id)
+				if !ok || pm.TxBytes <= r.tx {
+					t.Fatalf("bond session %s: the rejoined member %d's TxBytes on B did not grow in sample %d: %d → %+v", s.key, r.id, r.samples, r.tx, pm)
+				}
+				r.tx = pm.TxBytes
+			}
 		}
-		t.Logf("bond session %s: member %d of a listed at T_rm +%v", s.key, joined.ID, listed.Sub(rm))
+		if reset.IsZero() && !now.Before(rm.Add(g5Bound)) {
+			for i, s := range ps[2:] {
+				if rj[i].listed.IsZero() {
+					t.Fatalf("bond session %s: no new member of a listed within G5Bound (%v) of T_rm", s.key, g5Bound)
+				}
+			}
+			// The reset of the selector sessions' shared carrier on b.
+			var name string
+			target, name = sharedTarget(t, ps, 4)
+			if name != "b" {
+				t.Fatalf("premise: the selector sessions are active on %s at T_rm + G5Bound, want b", name)
+			}
+			for _, s := range ps {
+				quality = append(quality, s.d.Status().Migrations.Quality)
+			}
+			lb := w.link("b")
+			reset = time.Now()
+			if lb.Kill(); lb.Stats().Session.Killed == 0 {
+				t.Fatal("stimulus: the reset of b ended no session carrier")
+			}
+		}
+		if !reset.IsZero() && rj[0].samples == 2 && rj[1].samples == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if late := reset.Sub(rm.Add(g5Bound)); late > time.Millisecond {
+		t.Fatalf("premise: the reset of b came %v after T_rm + G5Bound", late)
 	}
 
-	// The reset of the selector sessions' shared carrier on b.
-	sleepUntil(rm.Add(g5Bound))
-	target, name := sharedTarget(t, ps, 4)
-	if name != "b" {
-		t.Fatalf("premise: the selector sessions are active on %s at T_rm + G5Bound, want b", name)
-	}
-	var quality []uint64
-	for _, s := range ps {
-		quality = append(quality, s.d.Status().Migrations.Quality)
-	}
-	lb := w.link("b")
-	reset := time.Now()
-	if lb.Kill(); lb.Stats().Session.Killed == 0 {
-		t.Fatal("stimulus: the reset of b ended no session carrier")
-	}
 	// F41 is judged over the 5 s after the reset, while every session still
 	// sends (they half-close 8 s after it; a claimant's end would release
 	// its waiters to dials of their own, R1-8).
@@ -322,7 +352,16 @@ func g5(t *testing.T, rate float64) {
 			t.Errorf("selector session %s: the active carrier after the reset is %+v, want a's", s.key, na)
 		}
 	}
-	b.wait(t, 2*time.Minute)
+	sleepUntil(reset.Add(after))
+	for _, s := range b.tx {
+		s.end()
+	}
+	for i, r := range b.rx {
+		r.waitSent(t, b.tx[i], 2*time.Minute)
+	}
+	for _, r := range b.up {
+		r.wait(t, 2*time.Minute)
+	}
 	for i, s := range ps {
 		r := b.rx[i]
 		if s.mode == rendr.ModeSelector {

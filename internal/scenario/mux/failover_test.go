@@ -248,12 +248,25 @@ func TestMuxCoalescedFailover(t *testing.T) {
 		if l.Kill(); l.Stats().Session.Killed == 0 {
 			t.Fatal("stimulus: the kill of p1 ended no session carrier")
 		}
+		// One deadline for all 8: every session resumes within 1 virtual s of
+		// the kill (not one after the other, each within its own second).
+		waitFor(t, time.Second, "every session's first bytes after the kill", func() bool {
+			for _, r := range b.rx {
+				if r.firstAfter(killed).IsZero() {
+					return false
+				}
+			}
+			return true
+		})
+		var last time.Duration
 		for i, r := range b.rx {
-			waitFor(t, time.Second, fmt.Sprintf("session %s's first bytes after the kill", ps[i].key), func() bool {
-				return !r.firstAfter(killed).IsZero()
-			})
+			d := r.firstAfter(killed).Sub(killed)
+			if d > time.Second {
+				t.Fatalf("session %s: the first new bytes %v after the kill, want ≤ 1 s", ps[i].key, d)
+			}
+			last = max(last, d)
 		}
-		t.Logf("all 8 sessions received new bytes %v after the kill", time.Since(killed))
+		t.Logf("all 8 sessions received new bytes within %v of the kill", last)
 		if got := w.dialsIn("p2", killed, time.Now()); got != 1 {
 			t.Fatalf("%d session factory calls on p2 after the kill, want exactly 1 (coalesced)", got)
 		}

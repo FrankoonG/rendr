@@ -4,7 +4,8 @@
 // carrier's death requeues every session on it, also when a second
 // carrier dies during the requeue), L15 and L16 (a session whose
 // application stops reading never blocks the shared reader or its
-// neighbours' control frames), L22 (rejoin after a DROP), L39 and L40
+// neighbours' control frames), L22 (rejoin after a DROP, also for a
+// session that waited for another session's older dial), L39 and L40
 // (packet sessions on a shared datagram carrier), L52 (churn leaves
 // nothing behind) — the pool's fast path and coalescing, the close at the
 // last session, and the G4 and G5 gold criteria of the mux variants at
