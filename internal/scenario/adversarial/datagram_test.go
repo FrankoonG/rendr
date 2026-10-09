@@ -599,9 +599,12 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 // They fail B's fseq window (behind it: late or duplicate) or, the H1, are
 // no PREFACE B's carrier knows: B's carrier drops and counts each one
 // exactly and lives, B's seq window never sees them, B's verifier sees no
-// foreign datagram, no flow or session appears, and A is unaffected. (The
-// MUX half adds the datagram MUX trunk and the stream MUX trunk, whose
-// carrier dies.) The derived variants hold the preset expectations.
+// foreign datagram, no flow or session appears, and A is unaffected; so
+// on a datagram MUX trunk, where a replayed frame may also carry a handle
+// B's trunk never opened. The derived variants hold the preset
+// expectations. "stream" (replayAcrossStreamSessions) has its own
+// expectation: on stream carriers — a stream MUX trunk among them — B's
+// carrier dies.
 func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 	for _, m := range fseqModes {
 		t.Run(m.name, func(t *testing.T) {
@@ -624,8 +627,9 @@ func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 // replayAcrossStreamSessions is TestAdvDatagramReplayAcrossSessions_L43/
 // stream, its own expectation (R1-35): the packet sessions A and B, a Peer
 // each, on stream carriers — dedicated, or a stream MUX trunk per link
-// each — send 500 datagrams per second dialer → passive; then A's frames
-// are forwarded into B's attacked carrier from B's next frame boundary on
+// each — send 500 datagrams per second dialer → passive; then A's frames,
+// its DGRAMs among its ACKs, PINGs and SCHEDs, are forwarded into B's
+// attacked carrier from B's next frame boundary on
 // (Tamper.Splice: a stream relay that replays one session's datagrams into
 // another's carrier). B's passive kills that carrier (protocol_violation
 // "fseq": A's frames continue A's sequence) before any of A's datagrams
@@ -648,8 +652,8 @@ func replayAcrossStreamSessions(t *testing.T, s setup) {
 		t.Fatalf("the splice started on carrier %d, not B's", hit.id)
 	}
 	violated(t, "B's carrier", endDead(t, "B's passive", bs[0].p.Status, hit.id), "fseq")
-	if !hasDgram(tb.Log(rendrtest.Up)) {
-		t.Fatal("stimulus: none of A's DGRAMs was forwarded into B's carrier")
+	if !hasSpliced(tb.Log(rendrtest.Up)) {
+		t.Fatal("stimulus: none of A's frames was forwarded into B's carrier")
 	}
 	time.Sleep(time.Second)
 	fs := append(slices.Clone(fa), fb...)
@@ -676,11 +680,12 @@ func replayAcrossStreamSessions(t *testing.T, s setup) {
 	w.close()
 }
 
-// hasDgram reports whether a frame tap log holds a DGRAM forwarded from
-// another tamper (Spliced).
-func hasDgram(log []rendrtest.FrameRec) bool {
+// hasSpliced reports whether a frame tap log holds a frame forwarded from
+// another tamper (Spliced): A's DGRAMs mostly, and B's carrier dies at the
+// first of A's frames, whatever its type.
+func hasSpliced(log []rendrtest.FrameRec) bool {
 	for _, r := range log {
-		if r.Spliced && r.Type == rendrtest.FrameDgram {
+		if r.Spliced {
 			return true
 		}
 	}

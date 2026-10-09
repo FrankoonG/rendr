@@ -322,8 +322,8 @@ func (c *zeroingConn) Write(p []byte) (int, error) {
 
 // TestAdvWriterBufferMutation_L43: every session carrier conn zeroes the
 // buffer rendr passed to its Write right after the Write returned (the M1
-// row, here in selector, bond and race sessions; the MUX half re-runs it
-// on a shared trunk). At 40 % of the transfer the carriers that hold data
+// row, here in selector, bond and race sessions, dedicated and on a shared
+// trunk). At 40 % of the transfer the carriers that hold data
 // in flight are cut — selector: the active carrier's link; bond: the
 // member on "a"; race: both members, so that the session replays from the
 // ACK edge instead of relying on the other member's copies —: the replay

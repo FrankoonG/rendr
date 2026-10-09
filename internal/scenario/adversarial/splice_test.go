@@ -86,8 +86,8 @@ func untouched(t testing.TB, what string, x *pair) {
 func spliced(tm *rendrtest.Tamper) int { return tm.Stats().Spliced }
 
 // TestAdvSpliceTwoSessions_L41_L43: the dialer → passive bytes of session
-// X's carrier are spliced into session Y's carrier (dedicated pair; the
-// MUX half splices two trunks): "boundary" from Y's next frame boundary
+// X's carrier are spliced into session Y's carrier (a dedicated pair; on
+// MUX trunks, X's trunk into Y's): "boundary" from Y's next frame boundary
 // on, "midframe" 15 bytes into one of Y's frames (Y's tamper holds Up at a
 // frame boundary, so the cut point is known: inside the next frame's
 // header or payload, whatever its type). Y's passive kills Y's carrier at
