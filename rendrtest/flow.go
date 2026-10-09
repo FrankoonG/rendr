@@ -75,13 +75,22 @@ type deadOpen struct {
 
 // open creates a carrier (or, while blackholed, a dead open) and starts its
 // goroutines, and the link's bottlenecks with its first carrier. first
-// (owned) goes ahead of everything the dialer writes.
-func (l *Link) open(first []byte) (net.Conn, error) {
+// (owned) goes ahead of everything the dialer writes. refusable (an
+// ordinary dial) refuses it when SetRefuse came after the dial's check.
+func (l *Link) open(first []byte, refusable bool) (net.Conn, error) {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
 		l.dialFails.Add(1)
 		return nil, net.ErrClosed
+	}
+	if refusable && l.refuse {
+		// SetRefuse came after the dial's own check: refusing here, under
+		// the lock Kill snapshots the carriers with, keeps "SetRefuse, then
+		// Kill" from leaving a carrier of a dial that raced them.
+		l.mu.Unlock()
+		l.dialFails.Add(1)
+		return nil, errRefused
 	}
 	l.smu.Lock()
 	bh := l.blackhole

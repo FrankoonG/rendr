@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +16,9 @@ import (
 
 // WP3 (M3 design §A6.2–§A6.7, §A11.1): the stream race data plane — the
 // per-lane cursors over the one send ring, the receiver's duplicate rules,
-// the ACK duty on the fastest lane and the unique accounting. Sessions and
-// lanes are the stream harness's (fake ports, Fill and delivery by hand);
+// the ACK duty on the fastest lane (a copy on every member) and the unique
+// accounting. Sessions and lanes are the stream harness's (fake ports, Fill
+// and delivery by hand);
 // membership is set up as bond's (every lane a data member, M3-D29), which
 // WP4 wires into the actor. Helpers start with "rc".
 
@@ -418,11 +420,17 @@ func TestRaceBondAccountingProperty_L35(t *testing.T) {
 					}
 					moved += b.Len()
 					b.ReleaseRefs()
-					// The receiver reads what it can and acknowledges on this
-					// link; the sender frees capacity as the ACK arrives.
-					if k := stLocked(p.b, func(st *stream) uint64 { return st.rTail - st.rRead }); k > 0 {
-						stReadN(t, p.b, int(k))
-					}
+				}
+				// The receiver reads what it can and acknowledges on every
+				// link after the round (a race ACK leaves on every member,
+				// PA-33 as amended: acknowledged between two members' Fills,
+				// the front would pass the next member's cursor before it
+				// copied anything); the sender frees capacity as the ACKs
+				// arrive.
+				if k := stLocked(p.b, func(st *stream) uint64 { return st.rTail - st.rRead }); k > 0 {
+					stReadN(t, p.b, int(k))
+				}
+				for _, i := range rng.Perm(links) {
 					moved += p.stepAck(i)
 					p.ap[i].set(func(f *stPort) { f.inflight = 0 })
 				}
@@ -535,11 +543,17 @@ func TestRaceRetransmittedExcludesCopies(t *testing.T) {
 }
 
 // TestRaceAckOnFastest: a race receiver's ACK duty sits on the live lane
-// with the lowest SRTT (M3-D33), re-chosen at every ACK decision: with a
-// 5-ms and an 80-ms member the duty first lands on the 80-ms lane (SRTTs
-// unknown at attach) and moves to the 5-ms lane once the SRTTs are known;
-// after warm-up at least 95 % of the ACK frames leave on it. When it dies,
-// the next ACK leaves on the other lane in the next step.
+// with the lowest SRTT (M3-D33), re-chosen at every ACK decision, and every
+// other live data lane carries a copy of each ACK (PA-33 as amended by
+// RACEACK): with a 5-ms and an 80-ms member the duty first lands on lane 0
+// (SRTTs unknown at attach) and moves to the 5-ms lane once the SRTTs are
+// known; after warm-up both lanes carry the same ACK stream — every
+// delivered value the receiver acknowledged leaves on each lane, none
+// skipped on either, the last one the bytes read. When the fast lane dies,
+// the slow lane's copies already carried the latest value: the sender's
+// acknowledged front equals the bytes read with no further step (no step
+// in the ACK stream), and the death's urgent ACK leaves on the slow lane at
+// its next Fill.
 func TestRaceAckOnFastest(t *testing.T) {
 	p := rcPair(2, stOpt{ackEvery: 16 << 10}, stOpt{ackEvery: 16 << 10})
 	p.pump(true) // SRTTs unknown: the duty is on lane 0 (attach order)
@@ -548,7 +562,7 @@ func TestRaceAckOnFastest(t *testing.T) {
 	}
 	p.bp[0].set(func(f *stPort) { f.srtt = 80 * time.Millisecond })
 	p.bp[1].set(func(f *stPort) { f.srtt = 5 * time.Millisecond })
-	acks := [2]int{}
+	var acks [2][]uint64 // the Delivered values of the ACKs on each lane
 	off := 0
 	for round := range 40 {
 		rcWrite(t, p.a, stPattern(uint64(off), 32<<10))
@@ -560,17 +574,28 @@ func TestRaceAckOnFastest(t *testing.T) {
 		for i := range 2 {
 			before := len(p.traceBA)
 			p.step(i, false, time.Now())
-			if round >= 4 {
-				acks[i] += stCount(p.traceBA[before:], wire.TypeAck)
+			if round < 4 {
+				continue
+			}
+			for _, f := range p.traceBA[before:] {
+				if f.typ == wire.TypeAck {
+					acks[i] = append(acks[i], f.ack.Delivered)
+				}
 			}
 		}
 	}
-	if total := acks[0] + acks[1]; total == 0 || acks[1]*100 < 95*total {
-		t.Fatalf("ACK frames: %d on the 80-ms lane, %d on the 5-ms lane; want ≥ 95 %% on the 5-ms lane", acks[0], acks[1])
+	if l := stLocked(p.b, func(st *stream) *lane { return st.ackLane }); l != p.bl[1] {
+		t.Fatalf("after warm-up the duty is on lane %d, want the 5-ms lane", l.id)
 	}
-	// The fast lane dies: the next ACK leaves on the slow one.
+	if n := len(acks[1]); n < 36 || !slices.Equal(acks[0], acks[1]) || acks[1][n-1] != uint64(off) {
+		t.Fatalf("ACK streams: %v on the 80-ms lane, %v on the 5-ms lane; want the same stream on both, ending at %d", acks[0], acks[1], off)
+	}
+	// The fast lane dies: the slow lane already carried the latest ACK.
 	p.cut[1] = true
 	stKillLane(p.b, p.bl[1])
+	if base := rcStream(p.a)[0]; base != uint64(off) {
+		t.Fatalf("the sender's acknowledged front %d at the fast lane's death, want %d", base, off)
+	}
 	fs, b := stFill(p.bl[0], time.Now())
 	b.ReleaseRefs()
 	if stCount(fs, wire.TypeAck) == 0 {

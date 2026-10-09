@@ -211,6 +211,10 @@ type Link struct {
 	throttled atomic.Int64
 	dials     atomic.Int64
 	dialFails atomic.Int64
+
+	// afterCheck, tests only (nil otherwise), runs in an ordinary dial
+	// between its SetRefuse check and the carrier's creation.
+	afterCheck func()
 }
 
 // side holds the conn misbehaviours of one side.
@@ -305,8 +309,12 @@ func (l *Link) dial(ctx context.Context, first []byte) (net.Conn, error) {
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
+		if h := l.afterCheck; h != nil {
+			h()
+		}
+		return l.open(first, true)
 	}
-	return l.open(first)
+	return l.open(first, false)
 }
 
 // SetDelay sets the one-way delay and uniform jitter of both directions,

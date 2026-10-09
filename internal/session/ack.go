@@ -46,6 +46,7 @@ func (s *Session) bumpNowLocked() {
 		l.idle = false
 		l.port.Wake()
 	}
+	s.raceWakeAckLocked() // race: every live data lane carries a copy
 }
 
 // gapAckLocked runs after every Data call on lane l that started at offset
@@ -99,6 +100,7 @@ func (s *Session) ackCadenceLocked() {
 			l.idle = false
 			l.port.Wake()
 		}
+		s.raceWakeAckLocked() // race: each copy lane arms its own timer
 	}
 }
 
@@ -200,7 +202,10 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 // decision (bumps and the delivery cadence) and every lane attach and death
 // (their bumps): the duty sits on the fastest live lane
 // (raceAckLaneLocked, M3-D33, PA-33), and M1's choice applies only when no
-// lane qualifies there (every lane blocked or leaving).
+// lane qualifies there (every lane blocked or leaving). Every other live
+// data lane of a race session places each ACK as well (raceAckDutyLocked,
+// Fill step 4); the callers that wake the duty lane wake those too
+// (raceWakeAckLocked).
 func (s *Session) ensureAckLaneLocked() {
 	st := &s.st
 	if s.p.Mode == ModeRace {
@@ -248,6 +253,7 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 			st.ackGen++
 			st.ackBumped = st.rRead
 			st.ackDelayAt = time.Time{}
+			s.raceWakeAckLocked() // race: the copy lanes place it too
 		} else {
 			b.WakeAt(st.ackDelayAt)
 		}
