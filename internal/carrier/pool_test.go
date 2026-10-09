@@ -234,16 +234,26 @@ func TestPoolCoalescedFailure(t *testing.T) {
 			start := time.Now()
 			close(gate)
 			synctest.Wait()
-			first := collect(t, ch, 1)[0]
-			if first.err != nil || first.est.Fresh || isOK(first.est) {
+			// The refused claimant and the second claimant (a released
+			// waiter that dialled at once) both return before the remaining
+			// waiters, which coalesce on the second's fresh trunk until its
+			// Start; their results may reach the channel in either order.
+			var first, second poolRes
+			for _, r := range collect(t, ch, 2) {
+				if r.err == nil && r.est.Fresh && isOK(r.est) {
+					second = r
+				} else {
+					first = r
+				}
+			}
+			if first.err != nil || first.est == nil || first.est.Fresh || isOK(first.est) {
 				t.Fatalf("claimant: %v, want its REJECTED response", first.err)
 			}
 			first.est.Conn.Kill(CauseLocalClose, "refused") // the session drops a refused carrier
 			if d := pt.srv.dials.Load(); d != 2 || time.Since(start) != 0 {
 				t.Fatalf("%d factory calls %v after the refusal, want 2 at once", d, time.Since(start))
 			}
-			second := collect(t, ch, 1)[0]
-			if second.err != nil || !second.est.Fresh || !isOK(second.est) {
+			if second.est == nil {
 				t.Fatalf("second claimant: %v", second.err)
 			}
 			pt.attach(second.est)

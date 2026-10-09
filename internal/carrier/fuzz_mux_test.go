@@ -68,7 +68,13 @@ func (m *muxModel) illegal() fuzzOut {
 // step returns the outcome of frame (t, h) and applies it.
 func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 	if !m.mux {
-		// A dedicated carrier: handle 1 session frames only (M1/M2).
+		// A dedicated carrier: handle 1 session frames only (M1/M2). On a
+		// datagram carrier a bare frame of another handle is M2's framing
+		// error: the rest of its datagram is dropped and counted and the
+		// carrier lives (dedicatedOK, PA-1); inside REL it is a violation.
+		if m.dg && t == wire.TypeDgram && h != wire.SessionHandle {
+			return fzDrop
+		}
 		if t == wire.TypeDetach || isFirstType(t) || h != wire.SessionHandle {
 			return fzViolation
 		}

@@ -118,9 +118,10 @@ type lane struct {
 	idle         bool       // (S) the writer found nothing in its last Fill
 
 	// Race lanes only (M3 design §A6).
-	rnext  uint64 // (S) stream race: the next offset this lane sends; Fill clamps it to sBase (M3-D30)
-	rpos   uint64 // (S) packet race: this lane's position in the tx ring (M3-D32)
-	goOwed bool   // (S) a dialer lane on a view of a started MUX trunk: the go frame is not yet placed (M3-D8)
+	rnext     uint64 // (S) stream race: the next offset this lane sends; Fill clamps it to sBase (M3-D30)
+	rpos      uint64 // (S) packet race: this lane's position in the tx ring (M3-D32)
+	goOwed    bool   // (S) a dialer lane on a view of a started MUX trunk: the go frame is not yet placed (M3-D8)
+	goStandIn bool   // (S) the go frame's unreliable stand-in was placed (m3 DGMUX, L40; placeStandInLocked)
 
 	// Packet lanes only (M2).
 	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)

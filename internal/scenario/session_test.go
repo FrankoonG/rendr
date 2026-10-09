@@ -122,10 +122,14 @@ func TestSelectorCorruptActive(t *testing.T) {
 		func(s faultCounts) bool { return s.Corrupted > 0 })
 }
 
+// The paths' delays are far apart so that the probe ranking (p1 first)
+// holds under a loaded race lane: with 2 and 5 ms the measured order
+// flipped to p2 first in a Linux race-unit pass (M3 I2), as it did for
+// TestSelectorFailoverRacesPastStalledCandidate at I1.
 func TestSelectorMigratesOnDegradation(t *testing.T) {
 	f := newFixture(t, "p1", "p2")
-	f.link("p1").set(2*time.Millisecond, 0, 0)
-	f.link("p2").set(5*time.Millisecond, 0, 0)
+	f.link("p1").set(1*time.Millisecond, 0, 0)
+	f.link("p2").set(20*time.Millisecond, 0, 0)
 	c := f.mustDial(selector, dialOpts{target: echo()})
 	if p := activePath(c); p != "p1" {
 		t.Fatalf("initial active %q", p)
