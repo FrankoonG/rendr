@@ -2,6 +2,7 @@ package adversarial
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -67,14 +68,31 @@ func dedicatedSetups() []setup {
 	}
 }
 
-// setups are the setups every row runs against. The MUX half of the set
-// (the 4-session MUX trunk forms) appends its setups here.
-func setups() []setup { return dedicatedSetups() }
+// muxSetups are the 4-session MUX trunk setups: zero Props let the Runtime
+// share every carrier (the rendr mux is the default), so the four sessions
+// of a Peer ride one trunk per link and the attacked carrier is theirs.
+func muxSetups() []setup {
+	return []setup{
+		{name: "mux-selector", mode: rendr.ModeSelector, mux: true, sessions: 4, props: rendr.Props{}},
+		{name: "mux-bond", mode: rendr.ModeBond, mux: true, sessions: 4, props: rendr.Props{}},
+		{name: "mux-race", mode: rendr.ModeRace, mux: true, sessions: 4, props: rendr.Props{}},
+	}
+}
+
+// setups are the setups every row runs against: the dedicated carriers,
+// then the 4-session MUX trunks.
+func setups() []setup { return slices.Concat(dedicatedSetups(), muxSetups()) }
 
 // eachSetup runs body once per setup, each in a bubble of its own.
 func eachSetup(t *testing.T, body func(t *testing.T, s setup)) {
 	t.Helper()
-	for _, s := range setups() {
+	eachSetupOf(t, setups(), body)
+}
+
+// eachSetupOf runs body once per setup of ss, each in a bubble of its own.
+func eachSetupOf(t *testing.T, ss []setup, body func(t *testing.T, s setup)) {
+	t.Helper()
+	for _, s := range ss {
 		t.Run(s.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) { body(t, s) })
 		})
@@ -570,6 +588,136 @@ func neighbours(t testing.TB, s setup, xs []*pair, own, shared uint64) {
 		}
 		untouched(t, fmt.Sprintf("neighbour session %d", i+1), x)
 	}
+}
+
+// kill names the carrier an attack killed: its ID, the cause and which end
+// detected it (dialer: a Down attack; else the passive). A zero id names
+// no one carrier (a stimulus that cut whole links).
+type kill struct {
+	id     rendr.CarrierID
+	cause  rendr.Cause
+	dialer bool
+	// some: on a MUX trunk only some sessions of xs had the carrier (a
+	// selector's failover spreads them over the trunks of both links);
+	// the others count own.
+	some bool
+}
+
+// migrated requires what an attack that killed carrier k of xs[0] did to
+// the stream sessions xs: d Death migrations of the attacked session (the
+// row's deaths, k among them) and own of each neighbour on dedicated
+// carriers (neighbours).
+//
+// On a MUX trunk every session of xs had k (k.some: at least one): the
+// detecting end of each lists k dead with k's cause — the one trunk death
+// reached every view — and each counts its own migrations, d (own for a
+// session k.some left off the trunk). Selector sessions count exactly that
+// (a lost active carrier always counts). A bond or race member's death
+// counts only when it took unacknowledged spans with it (§7.6, M3-D34;
+// A6.6): with four sessions on one trunk whether a session's view held any
+// at the death instant is the other views' timing on the trunk, and a race
+// view's spans below the ACK edge its other member's copies moved are
+// trimmed (requeueLocked) — so each dialer counts at most that and its
+// passive none (it sent nothing of its own). Bond's data on the dead trunk
+// was its only copy: at least one session counts a death. Every bond or
+// race session gets two live members back on both ends.
+func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
+	t.Helper()
+	if !s.mux {
+		xs[0].deathsAre(t, s, d)
+		neighbours(t, s, xs, own, d)
+		return
+	}
+	want := make([]uint64, len(xs))
+	on := 0
+	for i, x := range xs {
+		want[i] = d
+		if k.id == 0 {
+			continue
+		}
+		end := x.p
+		if k.dialer {
+			end = x.d
+		}
+		if _, ok := carrierOf(end.Status(), k.id); !ok {
+			if !k.some {
+				t.Fatalf("session %d never had the shared carrier %d", i, k.id)
+			}
+			want[i] = own
+			continue
+		}
+		on++
+		c := endDead(t, fmt.Sprintf("session %d's detecting end", i), end.Status, k.id)
+		if c.DeathCause != k.cause {
+			t.Fatalf("session %d: trunk %d died of %v %q at the detecting end, want %v", i, k.id, c.DeathCause, c.DeathDetail, k.cause)
+		}
+	}
+	if k.id != 0 && on == 0 {
+		t.Fatalf("no session had carrier %d", k.id)
+	}
+	if !s.members() && !k.some {
+		for i, x := range xs {
+			x.deathsAre(t, s, want[i])
+		}
+		return
+	}
+	if !s.members() {
+		// A selector's failover race may leave a session with a view on
+		// the new trunk that is not its active carrier: losing it is no
+		// Death migration. A session on k counts own or d — d when k was
+		// its active carrier, as it was for the session whose SCHED the
+		// attack hit — and the passive follows the dialer's counts.
+		top := false
+		for i, x := range xs {
+			waitFor(t, 10*time.Second, fmt.Sprintf("session %d's Death migrations settled", i), func() bool {
+				dm, pm := x.d.Status().Migrations.Death, x.p.Status().Migrations.Death
+				return dm >= own && dm == pm
+			})
+			if dm := x.d.Status().Migrations.Death; dm > want[i] {
+				t.Fatalf("session %d: %d Death migrations, want %d to %d", i, dm, own, want[i])
+			} else if dm == d {
+				top = true
+			}
+		}
+		if !top {
+			t.Fatalf("no session counted the death of its active carrier %d", k.id)
+		}
+		return
+	}
+	var sum uint64
+	for i, x := range xs {
+		// Whatever the counts, each session replaced the member it lost
+		// on k: two live members again on both ends (liveOf excludes the
+		// dead trunk) — the load moved, not only finished on the survivor.
+		waitFor(t, 10*time.Second, fmt.Sprintf("session %d: two live members on both ends after the death of %d", i, k.id), func() bool {
+			return len(liveOf(x.d.Status())) == 2 && len(liveOf(x.p.Status())) == 2
+		})
+		dm, pm := x.d.Status().Migrations, x.p.Status().Migrations
+		if dm.Death > want[i] || pm.Death != 0 {
+			t.Fatalf("session %d: Death migrations: dialer %+v, passive %+v; want at most %d and 0", i, dm, pm, want[i])
+		}
+		sum += dm.Death
+	}
+	if s.mode == rendr.ModeBond && sum == 0 {
+		t.Fatal("no bond session counted the death of the trunk that carried their unacknowledged data")
+	}
+}
+
+// carrying returns the first session of xs whose end (the dialer's, else
+// the passive's) has or had carrier id.
+func carrying(t testing.TB, xs []*pair, id rendr.CarrierID, dialer bool) *pair {
+	t.Helper()
+	for _, x := range xs {
+		end := x.p
+		if dialer {
+			end = x.d
+		}
+		if _, ok := carrierOf(end.Status(), id); ok {
+			return x
+		}
+	}
+	t.Fatalf("no session has carrier %d", id)
+	return nil
 }
 
 // neighboursPacket is neighbours for packet sessions.
@@ -1117,12 +1265,27 @@ type dflip struct {
 	fired rendr.CarrierID // the conn the targeted flip hit
 	nfire int
 
-	rate  [2]float64 // random flips per datagram, per direction (Up, Down)
-	rng   *rand.Rand
+	// rw: a targeted handle rewrite with a recomputed CRC (a broken peer;
+	// rewrite).
+	rw      bool
+	rwTyp   wire.Type
+	rwH     uint32
+	rwOnly  rendr.CarrierID
+	rwFired rendr.CarrierID
+	rwN     int
+
+	rate [2]float64 // random flips per datagram, per direction (Up, Down)
+	// rng draws per direction: a direction's flips are a function of the
+	// number of datagrams it wrote, not of how the goroutines of the two
+	// directions interleave.
+	rng   [2]*rand.Rand
 	flips [2]int // random flips done per direction
+	draws [2]int // datagrams drawn for a random flip per direction
 }
 
-func newDflip() *dflip { return &dflip{rng: rand.New(rand.NewPCG(43, 41))} }
+func newDflip() *dflip {
+	return &dflip{rng: [2]*rand.Rand{rand.New(rand.NewPCG(43, 41)), rand.New(rand.NewPCG(41, 43))}}
+}
 
 // arm arms the targeted flip: bit of the first frame of type typ (counted
 // as in rendrtest.Tamper.FlipBit: 0 is the header's first bit, a negative
@@ -1132,6 +1295,25 @@ func (f *dflip) arm(typ wire.Type, bit int, only rendr.CarrierID) {
 	f.mu.Lock()
 	f.armed, f.typ, f.bit, f.only = true, typ, bit, only
 	f.mu.Unlock()
+}
+
+// rewrite arms a targeted handle rewrite with a recomputed CRC (a broken
+// peer, §A9.3's RewriteHandle on a datagram trunk) in the next datagram of
+// carrier only's conn (0: any dialer session conn) that carries a frame
+// of type typ: a DGRAM's header handle; the inner handle of the REL that
+// wraps an OPEN or JOIN (wire.TypeOpen: either); the handle a REL-wrapped
+// DETACH ends.
+func (f *dflip) rewrite(typ wire.Type, h uint32, only rendr.CarrierID) {
+	f.mu.Lock()
+	f.rw, f.rwTyp, f.rwH, f.rwOnly = true, typ, h, only
+	f.mu.Unlock()
+}
+
+// rewritten returns the conn the rewrite hit and how often it fired.
+func (f *dflip) rewritten() (rendr.CarrierID, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rwFired, f.rwN
 }
 
 // targeted returns the conn the targeted flip hit and how often it fired.
@@ -1148,11 +1330,12 @@ func (f *dflip) random(d rendrtest.Dir, share float64) {
 	f.mu.Unlock()
 }
 
-// randomFlips returns the random flips done in direction d.
-func (f *dflip) randomFlips(d rendrtest.Dir) int {
+// randomFlips returns the random flips done in direction d and the
+// datagrams drawn for them (written while its share was set).
+func (f *dflip) randomFlips(d rendrtest.Dir) (flips, draws int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.flips[dirIndex(d)]
+	return f.flips[dirIndex(d)], f.draws[dirIndex(d)]
 }
 
 func dirIndex(d rendrtest.Dir) int {
@@ -1170,6 +1353,13 @@ func (f *dflip) apply(c *dflipConn, p []byte) []byte {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.rw && c.dir == rendrtest.Up && (f.rwOnly == 0 || f.rwOnly == c.id) {
+		if q, ok := rewriteHandle(p, f.rwTyp, f.rwH); ok {
+			f.rw, f.rwFired = false, c.id
+			f.rwN++
+			return q
+		}
+	}
 	if f.armed && c.dir == rendrtest.Up && (f.only == 0 || f.only == c.id) {
 		if off, size, ok := frameOf(p, f.typ); ok {
 			b := f.bit
@@ -1183,18 +1373,23 @@ func (f *dflip) apply(c *dflipConn, p []byte) []byte {
 			return q
 		}
 	}
-	if r := f.rate[dirIndex(c.dir)]; r > 0 && f.rng.Float64() < r {
+	i := dirIndex(c.dir)
+	if f.rate[i] > 0 {
+		f.draws[i]++
+	}
+	if f.rate[i] > 0 && f.rng[i].Float64() < f.rate[i] {
 		q := slices.Clone(p)
-		b := f.rng.IntN(8 * len(q))
+		b := f.rng[i].IntN(8 * len(q))
 		q[b/8] ^= 0x80 >> (b % 8)
-		f.flips[dirIndex(c.dir)]++
+		f.flips[i]++
 		return q
 	}
 	return nil
 }
 
 // frameOf returns the offset and size of the first top-level frame of type
-// typ in datagram p.
+// typ in datagram p; for wire.TypeDetach, of the first REL that carries a
+// DETACH (a datagram trunk REL-wraps it, §A3.4).
 func frameOf(p []byte, typ wire.Type) (off, size int, ok bool) {
 	for off < len(p) {
 		h, err := wire.ParseHeader(p[off:])
@@ -1205,12 +1400,54 @@ func frameOf(p []byte, typ wire.Type) (off, size int, ok bool) {
 		if off+size > len(p) {
 			return 0, 0, false
 		}
-		if h.Type == typ {
+		if h.Type == typ || typ == wire.TypeDetach && h.Type == wire.TypeRel && size > wire.HeaderLen+4 &&
+			wire.Type(p[off+wire.HeaderLen+4]) == wire.TypeDetach { // the REL head's inner type
 			return off, size, true
 		}
 		off += size
 	}
 	return 0, 0, false
+}
+
+// rewriteHandle returns a copy of datagram p whose first frame of type typ
+// (see dflip.rewrite) names handle h, the frame's CRC recomputed; false
+// when p has none.
+func rewriteHandle(p []byte, typ wire.Type, h uint32) ([]byte, bool) {
+	for off := 0; off < len(p); {
+		hd, err := wire.ParseHeader(p[off:])
+		if err != nil {
+			return nil, false
+		}
+		size := wire.FrameOverhead + int(hd.Len)
+		if off+size > len(p) {
+			return nil, false
+		}
+		at := -1
+		switch {
+		case hd.Type == typ && typ == wire.TypeDgram:
+			at = off + 9 // the header's handle
+		case hd.Type == wire.TypeRel && size >= wire.FrameOverhead+wire.RelHeadLen && innerIs(wire.Type(p[off+wire.HeaderLen+4]), typ):
+			at = off + wire.HeaderLen + 6 // the REL head's inner handle
+			if typ == wire.TypeDetach && size >= wire.FrameOverhead+wire.RelHeadLen+4 {
+				at = off + wire.HeaderLen + wire.RelHeadLen // the handle the DETACH ends
+			}
+		}
+		if at >= 0 {
+			q := slices.Clone(p)
+			binary.BigEndian.PutUint32(q[at:at+4], h)
+			end := off + size - wire.TrailerLen
+			wire.PutTrailer(q[end:], wire.CRC(q[off:end]))
+			return q, true
+		}
+		off += size
+	}
+	return nil, false
+}
+
+// innerIs reports whether a REL's inner type is typ (wire.TypeOpen: an
+// OPEN or a JOIN).
+func innerIs(inner, typ wire.Type) bool {
+	return inner == typ || typ == wire.TypeOpen && inner == wire.TypeJoin
 }
 
 // dflipConn is a datagram carrier conn whose writes pass through a dflip;

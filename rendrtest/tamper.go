@@ -158,6 +158,11 @@ type FrameRec struct {
 }
 
 // TamperStats counts the operations that fired, one counter per operation.
+// An operation counts when it acts on its frame, whether or not the write
+// that forwards the result then succeeds: Flipped, Dropped, Duplicated and
+// Rewritten when their frame passes, Replayed when the copy's re-send is
+// attempted (a replay that kills the carrier often meets a receiver that
+// closed during the write; the frame tap logs only what went out).
 type TamperStats struct {
 	Flipped, Dropped, Duplicated, Replayed int
 	Spliced, Switched, Rewritten           int
@@ -279,7 +284,9 @@ func (t *Tamper) SwitchUpstream(dial func() (net.Conn, error)) {
 
 // RewriteHandle rewrites the handle of frame frameN of direction d to h,
 // recomputing the frame's CRC when recrc is true (a broken peer) and
-// leaving it stale otherwise (a damaged path).
+// leaving it stale otherwise (a damaged path). The handle of a DETACH is
+// the one it ends, in its payload (its header handle is 0, as every
+// carrier-level frame's): a DETACH for another handle.
 func (t *Tamper) RewriteHandle(d Dir, frameN int, h uint32, recrc bool) {
 	t.arm(d, tamperOp{kind: opRewrite, h: h, recrc: recrc}, frameN)
 }
@@ -578,7 +585,11 @@ func (t *Tamper) frame(d Dir, idx int, fb []byte) bool {
 				if &out[0] == &fb[0] {
 					out = slices.Clone(fb)
 				}
-				binary.BigEndian.PutUint32(out[9:13], op.h)
+				at := 9 // the header's handle
+				if typ == FrameDetach && len(out) >= wire.HeaderLen+4+wire.TrailerLen {
+					at = wire.HeaderLen // the handle the DETACH ends
+				}
+				binary.BigEndian.PutUint32(out[at:at+4], op.h)
 				if op.recrc {
 					end := len(out) - wire.TrailerLen
 					wire.PutTrailer(out[end:], wire.CRC(out[:end]))
@@ -628,15 +639,15 @@ func (t *Tamper) frame(d Dir, idx int, fb []byte) bool {
 		}
 	}
 	for _, r := range due {
+		t.mu.Lock()
+		t.stats.Replayed++ // the re-send is attempted (its write may fail)
+		t.mu.Unlock()
 		for _, s := range sinks {
 			s.push(r.b, r.rec)
 		}
 		if !t.emit(d, r.b, []FrameRec{r.rec}, false) {
 			return false
 		}
-		t.mu.Lock()
-		t.stats.Replayed++
-		t.mu.Unlock()
 	}
 	return true
 }

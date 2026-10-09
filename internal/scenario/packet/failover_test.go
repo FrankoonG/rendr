@@ -180,6 +180,13 @@ func packetFailover(t *testing.T, mode rendr.Mode) {
 	}
 	vl := w.link(victim.Name)
 	held0 := vl.Stats().Session.Held
+	// The TxBytes snapshots above are taken two one-way delays before the
+	// stall: what either end placed on the victim before them has crossed
+	// it when the stall starts, so every datagram the stall loses was
+	// placed after them and counts in the deltas checked below (a
+	// datagram placed just before a snapshot and still in flight was lost
+	// without counting: a premise flake of the Linux race lane).
+	time.Sleep(2 * oneWay)
 	vl.Refuse(true)
 	stall := time.Now()
 	for _, dir := range bothDirs {

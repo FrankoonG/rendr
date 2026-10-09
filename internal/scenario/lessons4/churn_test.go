@@ -99,14 +99,24 @@ func TestAttachKillChurnNoLeak_L52(t *testing.T) {
 			return id
 		}
 		id := settle("the first carrier on both ends", 0)
-		baseG := runtime.NumGoroutine()
+		// Goroutines are counted with both session actors parked (twice
+		// the default ActorLinger idle, M3-D42): a running actor is one
+		// goroutine more, so a count taken while one of them happens to run
+		// differs by one without a leak (a premise flake of the Linux race
+		// lane: 20 against a baseline of 21).
+		quietG := func() int {
+			time.Sleep(2 * time.Second)
+			synctest.Wait()
+			return runtime.NumGoroutine()
+		}
+		baseG := quietG()
 		for i := range cycles {
 			if l.Kill() != 1 {
 				t.Fatalf("cycle %d: the link had no live carrier to cut", i)
 			}
 			id = settle(fmt.Sprintf("the carrier of cycle %d", i+1), id)
 		}
-		if g := runtime.NumGoroutine(); g != baseG {
+		if g := quietG(); g != baseG {
 			buf := make([]byte, 1<<20)
 			t.Fatalf("goroutines %d after %d attach/kill cycles, want the baseline %d\n%s", g, cycles, baseG, buf[:runtime.Stack(buf, true)])
 		}
