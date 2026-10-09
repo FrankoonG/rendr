@@ -447,10 +447,22 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 // reads exactly the 1 MiB and EOF and closes. Every session ends cleanly
 // (io.EOF) on both ends without a carrier death, migration or redial, and
 // the relay sees every connection end in a FIN on both sides — no TCP RST
-// (ECONNRESET) at all.
+// (ECONNRESET) at all. Two variants: dedicated carriers (CheapSubflow,
+// M3-D2: each session's own carrier, so the relay carries exactly one
+// connection per round) and rendr mux (the default: a trunk closes at its
+// last view, M3-D20, and a round's session may open as a new view on the
+// previous round's trunk before that trunk closed, so the relay carries
+// between 1 and 200 connections — on a loaded race lane fewer than 200).
 func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
+	t.Run("dedicated", func(t *testing.T) {
+		loopCloseWithUnread(t, true, func(c *rendr.StreamCarrier) { c.Props.CheapSubflow = true })
+	})
+	t.Run("mux", func(t *testing.T) { loopCloseWithUnread(t, false) })
+}
+
+func loopCloseWithUnread(t *testing.T, dedicated bool, opts ...func(*rendr.StreamCarrier)) {
 	check := rendrtest.AssertNoLeak(t)
-	lp := newLoopPair(t, rendr.Config{})
+	lp := newLoopPair(t, rendr.Config{}, opts...)
 	const rounds, size = 200, 1 << 20
 	msg := make([]byte, size)
 	if _, err := io.ReadFull(rendrtest.PRNG(5), msg); err != nil {
@@ -489,9 +501,11 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 		}
 	}
 	lp.relay.idle(10 * time.Second) // every relayed connection ended
-	if n, c := lp.relay.errs.Load(), lp.relay.conns.Load(); n != 0 || c != rounds {
-		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d", n, c, lp.relay.lastEr.Load(), rounds)
+	n, c := lp.relay.errs.Load(), lp.relay.conns.Load()
+	if n != 0 || (dedicated && c != rounds) || c < 1 || c > rounds {
+		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d (dedicated %v)", n, c, lp.relay.lastEr.Load(), rounds, dedicated)
 	}
+	t.Logf("%d sessions on %d relayed connections", rounds, c)
 	lp.close(t)
 	check()
 }

@@ -138,7 +138,7 @@ func (p *Pool) waitVerdict(ctx context.Context, w *dialWait) bool {
 
 // PoolStats are a Pool's counters (rendr.Status.Mux, dialer side).
 type PoolStats struct {
-	Carriers  int    // published trunks that are not closed
+	Carriers  int    // live trunks that are published, or fresh with view 1 started (publication pending)
 	Views     int    // views on them that are not gone
 	FastPaths uint64 // OPENs and JOINs placed on a live trunk instead of dialling
 	Coalesced uint64 // attempts that waited for another attempt's dial of the same factory
@@ -618,13 +618,28 @@ func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := p.stats
-	for _, ts := range p.trunks {
-		for _, c := range ts {
-			if c.death.Load() != nil {
-				continue
-			}
+	count := func(c *Conn) {
+		if c.death.Load() == nil {
 			s.Carriers++
 			s.Views += c.viewCount()
+		}
+	}
+	for _, ts := range p.trunks {
+		for _, c := range ts {
+			count(c)
+		}
+	}
+	// A fresh trunk whose session started view 1 counts before its
+	// asynchronous publication (poolStarted), so a session that just opened
+	// on it is never missing from Status.Mux.
+	for _, w := range p.dialing {
+		if w != nil && w.fresh != nil && w.fresh.ms.started.Load() {
+			count(w.fresh)
+		}
+	}
+	for c, w := range p.extra {
+		if w.fresh == c && c.ms.started.Load() {
+			count(c)
 		}
 	}
 	return s
