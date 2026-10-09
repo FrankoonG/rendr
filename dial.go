@@ -137,7 +137,7 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
 	if packet {
-		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, spec.Params.Mode != session.ModeSelector))
+		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, everyMemberCarries(spec.Params.Mode)))
 	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
@@ -158,7 +158,7 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 	params := p.rt.eff.dialerParams(o.Mode, o.NoPathGrace)
 	eligible := p.streams
 	if packet {
-		params = p.rt.eff.packetParams(params, packetOffer(p.factories, params.Mode != session.ModeSelector, p.rt.eff.cfg.Packet.MaxPayload))
+		params = p.rt.eff.packetParams(params, packetOffer(p.factories, everyMemberCarries(params.Mode), p.rt.eff.cfg.Packet.MaxPayload))
 		eligible = 0 // every factory
 	} else if eligible == allFactories(len(p.factories)) {
 		eligible = 0 // every factory, as for every M1 session
@@ -265,6 +265,13 @@ func (f *openFit) tooSmall(meta int) bool {
 	}
 	return len(f.budget) > 0
 }
+
+// everyMemberCarries reports whether every member of a session in mode m
+// carries data — bond and race (M3-D32) — so that its packet MaxPayload
+// offer follows the bond rule of offerFromBudgets. Peer.spec (the offer)
+// and Peer.open (whether a datagram attempt lowers the OPEN's pmtu to its
+// carrier's budget) both take it from here, so the two cannot disagree.
+func everyMemberCarries(m session.Mode) bool { return m != session.ModeSelector }
 
 // packetOffer is a packet session's MaxPayload offer (M2-D49, M2 design
 // §A5.4): the smallest datagram payload budget (MTU − 25) over the Peer's

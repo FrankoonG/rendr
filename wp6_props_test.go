@@ -170,9 +170,10 @@ func TestModeRaceString(t *testing.T) {
 // TestStatusConvertM3 (§A10.2, M3-D35, M3-D49): the conversion copies the
 // receiver's DupBytes, the race sender's copies and each carrier's Handle
 // and Shared; a dialer's CarrierStatus.FateGroup comes from its Peer's
-// Props by factory name, the passive's stays empty. End to end, a live
-// unshared carrier reports Handle 1 and Shared 1 on both sides and its
-// factory's FateGroup on the dialer only.
+// Props by factory name, the passive's stays empty. End to end, for a
+// stream (Dial) and a packet (DialPacket) session, a live unshared carrier
+// reports Handle 1 and Shared 1 on both sides and its factory's FateGroup
+// on the dialer only.
 func TestStatusConvertM3(t *testing.T) {
 	in := session.Status{
 		Mode: session.ModeRace, DupBytes: 4096, Race: session.RaceCounters{CopyBytes: 8192, Copies: 3},
@@ -242,6 +243,33 @@ func TestStatusConvertM3(t *testing.T) {
 			t.Fatalf("ended session's carrier rows %+v, want its fate group kept", cs)
 		}
 		p.Close()
+
+		// A packet session (DialPacket) on a Peer of its own over the same
+		// factory: its dialer *PacketConn reports the factory's fate group
+		// as well, its passive none.
+		pp, err := e.d.NewPeer(PeerConfig{Carriers: []Carrier{c}})
+		if err != nil {
+			t.Fatalf("NewPeer: %v", err)
+		}
+		dpc, ppc := peOpen(t, pp, e.ln, DialOptions{})
+		peSend(t, dpc, 67, 0, 16, 200)
+		if r := peRecv(t, ppc, 67, 16, 10*time.Second).Result(); r.Unique != 16 || r.Duplicates != 0 || r.Corrupt != 0 {
+			t.Fatalf("packet integrity: %+v, want 16 unique datagrams", r)
+		}
+		for _, x := range []struct {
+			c     *PacketConn
+			group string
+		}{{dpc, "first-hop"}, {ppc, ""}} {
+			cs := peLive(x.c)
+			if len(cs) != 1 || cs[0].State != CarrierActive {
+				t.Fatalf("packet stimulus: carriers %+v, want one active", x.c.Status().Carriers)
+			}
+			if cs[0].Handle != 1 || cs[0].Shared != 1 || cs[0].FateGroup != x.group {
+				t.Fatalf("packet live carrier: Handle %d Shared %d FateGroup %q, want 1, 1 and %q", cs[0].Handle, cs[0].Shared, cs[0].FateGroup, x.group)
+			}
+		}
+		peEnd(t, dpc, ppc)
+		pp.Close()
 		e.close()
 	})
 }
@@ -378,8 +406,8 @@ func wp6Members(st SessionStatus) int {
 // both ends, takes both factories as members, and 1 MiB each way arrives
 // intact while both members carry copies (the dialer's CopyBytes and both
 // carriers' TxBytes grow, the session's TxBytes counts each byte once). A
-// packet race session (DialPacket) opens likewise and delivers its
-// datagrams exactly once.
+// packet race session (DialPacket) opens likewise, takes both members,
+// places copies on each and delivers its datagrams exactly once.
 func TestDialRaceE2E(t *testing.T) {
 	t.Run("stream", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -459,10 +487,28 @@ func TestDialRaceE2E(t *testing.T) {
 			if st := dc.Status(); st.Mode != ModeRace || st.Kind != KindPacket {
 				t.Fatalf("dialer: mode %v kind %v, want race and packet", st.Mode, st.Kind)
 			}
+			wp6Until(t, 10*time.Second, "two race members on both ends", func() bool {
+				return wp6Members(dc.Status()) == 2 && wp6Members(pc.Status()) == 2
+			})
 			peSend(t, dc, 73, 0, count, size)
 			r := peRecv(t, pc, 73, count, 10*time.Second).Result()
 			if r.Unique != count || r.Duplicates != 0 || r.Corrupt != 0 || r.BadSize != 0 {
 				t.Fatalf("integrity: %+v, want %d unique datagrams, none twice or damaged", r, count)
+			}
+			ds := dc.Status()
+			if ds.Packet == nil || ds.Packet.Sent != count {
+				t.Fatalf("unique accounting: dialer packet counters %+v, want %d sent", ds.Packet, count)
+			}
+			if ds.Race.Copies == 0 {
+				t.Fatalf("load: the dialer placed no race copies: %+v", ds.Race)
+			}
+			if wp6Members(ds) != 2 {
+				t.Fatalf("load: %d race members after the exchange, want 2: %+v", wp6Members(ds), ds.Carriers)
+			}
+			for _, c := range ds.Carriers {
+				if c.State == CarrierMember && c.TxBytes == 0 {
+					t.Fatalf("load: race member %d carried nothing: %+v", c.ID, ds.Carriers)
+				}
 			}
 			peEnd(t, dc, pc)
 			p.Close()

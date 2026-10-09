@@ -271,8 +271,9 @@ func liveCarriers(t *testing.T, side string, c *rendr.PacketConn, n int) []int {
 	}
 }
 
-// TestUDPClampedBondStreamOffer (wave-4 review G3): a bond session on a
-// Peer that has a stream factory offers its configured Packet.MaxPayload
+// TestUDPClampedBondStreamOffer (wave-4 review G3; M3-D32 for race): a
+// bond or race session — every member carries data — on a Peer that has a
+// stream factory offers its configured Packet.MaxPayload
 // (2,000 bytes) for the stream carriers to carry (M2-D49), also when its
 // OPEN goes out on a udp carrier clamped at Dial (factory MTU 3,991, socket
 // budget 1,463): only a session whose offer came from the datagram budgets
@@ -285,6 +286,13 @@ func liveCarriers(t *testing.T, side string, c *rendr.PacketConn, n int) []int {
 func TestUDPClampedBondStreamOffer(t *testing.T) {
 	defer wp5NoLeak(t)()
 	wp5Swap(t, &sysInterfaceTable, offerTable)
+	for _, mode := range []rendr.Mode{rendr.ModeBond, rendr.ModeRace} {
+		t.Run(mode.String(), func(t *testing.T) { clampedStreamOffer(t, mode) })
+	}
+}
+
+// clampedStreamOffer is TestUDPClampedBondStreamOffer for a session in mode.
+func clampedStreamOffer(t *testing.T, mode rendr.Mode) {
 	const maxPayload = 2000
 	d, err := rendr.NewRuntime(rendr.Config{Packet: rendr.PacketPolicy{MaxPayload: maxPayload}})
 	if err != nil {
@@ -337,7 +345,7 @@ func TestUDPClampedBondStreamOffer(t *testing.T) {
 	}
 	ch := make(chan dialed, 1)
 	go func() {
-		c, err := p.DialPacket(wp5Ctx(t), rendr.DialOptions{Mode: rendr.ModeBond})
+		c, err := p.DialPacket(wp5Ctx(t), rendr.DialOptions{Mode: mode})
 		ch <- dialed{c, err}
 	}()
 	pp, err := ln.AcceptPacket(wp5Ctx(t))
@@ -375,7 +383,7 @@ func TestUDPClampedBondStreamOffer(t *testing.T) {
 		c    *rendr.PacketConn
 	}{{"dialer", dc}, {"passive", pc}} {
 		if mp := s.c.MaxPayload(); mp != maxPayload {
-			t.Fatalf("%s: MaxPayload %d, want the configured %d (a bond session with a stream factory)", s.side, mp, maxPayload)
+			t.Fatalf("%s: MaxPayload %d, want the configured %d (a %v session with a stream factory)", s.side, mp, maxPayload, mode)
 		}
 		liveCarriers(t, s.side, s.c, 2)
 	}

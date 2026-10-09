@@ -11,10 +11,11 @@ rendr is a userspace session layer: session identity, byte offsets,
 acknowledgement = delivered to the receiving application, bounded
 retransmission and reordering, and the scheduling of a session over its
 carriers (one active carrier with failover and quality switching, all
-carriers bonded for throughput, or every byte raced over every carrier). Carriers are rendr-to-rendr connections
-that the embedder supplies as `net.Conn` or `net.PacketConn` factories —
-typically L7 tunnels — or the built-in plaintext TCP and UDP carriers, or
-the QUIC carriers of the nested module `github.com/FrankoonG/rendr/v2/quic`.
+carriers bonded for throughput, or every byte raced over every carrier).
+Carriers are rendr-to-rendr connections that the embedder supplies as
+`net.Conn` or `net.PacketConn` factories — typically L7 tunnels — or the
+built-in plaintext TCP and UDP carriers, or the QUIC carriers of the nested
+module `github.com/FrankoonG/rendr/v2/quic`.
 Besides byte-stream sessions (`net.Conn`), rendr carries packet sessions
 (`net.PacketConn`): datagrams delivered at most once, never retransmitted.
 
