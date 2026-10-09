@@ -21,7 +21,8 @@ type PacketConn struct {
 	s      *session.Session
 	local  Addr
 	remote Addr
-	raddr  net.Addr // remote boxed once: ReadFrom returns it without allocating
+	raddr  net.Addr   // remote boxed once: ReadFrom returns it without allocating
+	props  *peerProps // dialer: the Peer's Props (CarrierStatus.FateGroup); nil on the passive
 }
 
 var _ net.PacketConn = (*PacketConn)(nil)
@@ -130,7 +131,7 @@ func (c *PacketConn) Metadata() []byte { return c.s.Metadata() }
 func (c *PacketConn) MaxPayload() int { return c.s.MaxPayload() }
 
 // Status returns a snapshot of the session.
-func (c *PacketConn) Status() SessionStatus { return sessionStatusFrom(c.s.Status()) }
+func (c *PacketConn) Status() SessionStatus { return c.props.status(c.s.Status()) }
 
 // Done is closed when the session has ended and every carrier goroutine was
 // joined (or abandoned and counted).
@@ -140,8 +141,9 @@ func (c *PacketConn) Done() <-chan struct{} { return c.s.Done() }
 // datagrams: the same race, ranking, waiting and errors, with datagram
 // factories ranked before stream factories. The session's MaxPayload is
 // fixed by the OPEN exchange: the smallest datagram budget of the Peer's
-// datagram factories (bond with a stream factory: Packet.MaxPayload, the
-// stream members carrying what the datagram members cannot), bounded by
+// datagram factories (bond or race with a stream factory:
+// Packet.MaxPayload, the stream members carrying what the datagram members
+// cannot), bounded by
 // both sides' Packet.MaxPayload. Metadata that no factory able to carry an
 // OPEN can carry is refused at once with ErrMetadataTooLarge (a datagram
 // factory carries at most its MTU − 99 bytes of metadata). A carrier/udp
@@ -154,7 +156,9 @@ func (p *Peer) DialPacket(ctx context.Context, o DialOptions) (*PacketConn, erro
 	if err != nil {
 		return nil, err
 	}
-	return newPacketConn(p.rt, s), nil
+	c := newPacketConn(p.rt, s)
+	c.props = &p.props // CarrierStatus.FateGroup
+	return c, nil
 }
 
 // AcceptPacket returns the next pending packet session; Accept returns only

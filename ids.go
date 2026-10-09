@@ -65,8 +65,7 @@ type CarrierID uint32
 // Mode is the scheduling mode of a session, fixed at OPEN.
 type Mode uint8
 
-// Modes. The zero Mode in DialOptions selects ModeSelector. Race (3)
-// follows in milestone M3.
+// Modes. The zero Mode in DialOptions selects ModeSelector.
 const (
 	// ModeSelector: one active carrier at a time; quality switching by the
 	// probe evidence; racing failover on death.
@@ -85,18 +84,23 @@ const (
 	// per fate group (Props.FateGroup), up to MaxCarriersPerSession; a dead
 	// member is redialled at once. Throughput is the fastest member's, never
 	// the sum; the wire bytes and the sender's CPU grow with the member
-	// count. Dial and DialPacket refuse it with ErrProtocol until race is
-	// implemented.
+	// count. The session's counters count each byte or datagram once
+	// (SessionStatus.Race and DupBytes count the copies; CarrierStatus
+	// counts every copy its carrier moved). A passive without race (a
+	// rendr 2.0 build before M3) refuses it: Dial and DialPacket then fail
+	// with ErrProtocol.
 	ModeRace Mode = 3
 )
 
-// String returns "selector", "bond" or "mode(N)".
+// String returns "selector", "bond", "race" or "mode(N)".
 func (m Mode) String() string {
 	switch m {
 	case ModeSelector:
 		return "selector"
 	case ModeBond:
 		return "bond"
+	case ModeRace:
+		return "race"
 	}
 	return "mode(" + itoa(uint64(m)) + ")"
 }

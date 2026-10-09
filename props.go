@@ -1,5 +1,7 @@
 package rendr
 
+import "fmt"
+
 // Props describe a carrier factory to the scheduler (plan §3.2). The zero
 // value is a factory of its own fate group whose carriers the Peer's
 // sessions share (rendr mux).
@@ -38,7 +40,20 @@ const maxFateGroup = 64
 // HoLCoupled only with a FateGroup, and the factories of one FateGroup
 // agreeing on HoLCoupled. The error names the first offending factory.
 func validateProps(names []string, props []Props) error {
-	panic("unimplemented: M3")
+	for i, pr := range props {
+		switch {
+		case len(pr.FateGroup) > maxFateGroup:
+			return fmt.Errorf("rendr: NewPeer: carrier %q: Props.FateGroup is %d bytes, at most %d", names[i], len(pr.FateGroup), maxFateGroup)
+		case pr.HoLCoupled && pr.FateGroup == "":
+			return fmt.Errorf("rendr: NewPeer: carrier %q: Props.HoLCoupled requires a Props.FateGroup", names[i])
+		}
+		for j := range i {
+			if q := props[j]; q.FateGroup == pr.FateGroup && q.HoLCoupled != pr.HoLCoupled {
+				return fmt.Errorf("rendr: NewPeer: carrier %q: Props.HoLCoupled %v disagrees with carrier %q of fate group %q", names[i], pr.HoLCoupled, names[j], pr.FateGroup)
+			}
+		}
+	}
+	return nil
 }
 
 // internGroups gives every factory a fate-group index (M3-D36, §A7.1):
@@ -46,6 +61,30 @@ func validateProps(names []string, props []Props) error {
 // factory with an empty FateGroup gets index 0, which the scheduler reads
 // as a group of its own (session.DialSpec.Groups), and coupled has bit i
 // set when factory i's group is HoLCoupled.
+//
+// props holds at most maxFactories entries (NewPeer's limit) and has been
+// validated (validateProps), so the factories of one group agree on
+// HoLCoupled.
 func internGroups(props []Props) (groups [maxFactories]uint8, coupled uint16) {
-	panic("unimplemented: M3")
+	next := uint8(1)
+	for i, pr := range props {
+		if pr.FateGroup == "" {
+			continue // a group of its own: index 0, never coupled
+		}
+		g := next
+		for j := range i {
+			if props[j].FateGroup == pr.FateGroup {
+				g = groups[j]
+				break
+			}
+		}
+		if g == next {
+			next++
+		}
+		groups[i] = g
+		if pr.HoLCoupled {
+			coupled |= 1 << i
+		}
+	}
+	return groups, coupled
 }

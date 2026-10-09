@@ -35,7 +35,9 @@ func (p *Peer) Dial(ctx context.Context, o DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newConn(p.rt, s), nil
+	c := newConn(p.rt, s)
+	c.props = &p.props // CarrierStatus.FateGroup
+	return c, nil
 }
 
 // dial is Peer.Dial (packet false) and Peer.DialPacket (packet true): the
@@ -53,7 +55,7 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 	case !packet && p.streams == 0:
 		// M2-D46: a stream session never dials a datagram factory.
 		return nil, fmt.Errorf("rendr: Dial: no stream carrier factory: %w", ErrNoPath)
-	case o.Mode > ModeBond:
+	case o.Mode > ModeRace:
 		return nil, fmt.Errorf("rendr: %s: unknown %v: %w", name, o.Mode, ErrProtocol)
 	case len(o.Metadata) > m:
 		return nil, fmt.Errorf("rendr: %s: %d bytes of metadata, limit %d: %w", name, len(o.Metadata), m, ErrMetadataTooLarge)
@@ -135,7 +137,7 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
 	if packet {
-		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, spec.Params.Mode == session.ModeBond))
+		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, spec.Params.Mode != session.ModeSelector))
 	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
@@ -156,12 +158,12 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 	params := p.rt.eff.dialerParams(o.Mode, o.NoPathGrace)
 	eligible := p.streams
 	if packet {
-		params = p.rt.eff.packetParams(params, packetOffer(p.factories, params.Mode == session.ModeBond, p.rt.eff.cfg.Packet.MaxPayload))
+		params = p.rt.eff.packetParams(params, packetOffer(p.factories, params.Mode != session.ModeSelector, p.rt.eff.cfg.Packet.MaxPayload))
 		eligible = 0 // every factory
 	} else if eligible == allFactories(len(p.factories)) {
 		eligible = 0 // every factory, as for every M1 session
 	}
-	return session.DialSpec{
+	spec := session.DialSpec{
 		SID:        sid,
 		Params:     params,
 		Factories:  p.factories,
@@ -171,6 +173,8 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 		NoteGoAway: p.noteGoAway,
 		Eligible:   eligible,
 	}
+	p.props.dialProps(&spec) // fate groups and HoLCoupled (M3-D36)
+	return spec
 }
 
 // allFactories is the DialSpec.Eligible mask of n factories.
@@ -281,8 +285,9 @@ func packetOffer(fs []carrier.Factory, bond bool, maxPayload int) int {
 
 // offerFromBudgets reports whether a packet session's MaxPayload offer
 // comes from the datagram factories' budgets (M2-D49): a selector session
-// on a Peer with a datagram factory, or a bond session without a stream
-// factory to carry larger datagrams.
+// on a Peer with a datagram factory, or a bond or race session (bond true:
+// every member carries data) without a stream factory to carry larger
+// datagrams.
 func offerFromBudgets(fs []carrier.Factory, bond bool) bool {
 	hasDgram, hasStream := false, false
 	for i := range fs {

@@ -115,6 +115,11 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 			p.streams |= 1 << i
 		}
 	}
+	props, err := newPeerProps(cfg.Carriers, p.names)
+	if err != nil {
+		return nil, err
+	}
+	p.props = props
 	p.env = session.Env{
 		Carrier: &rt.cenv,
 		Events:  rt.ev, // a nil *eventQueue discards every event

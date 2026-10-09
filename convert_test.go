@@ -44,6 +44,7 @@ func TestSessionStatusFrom(t *testing.T) {
 			{ID: 3, Name: "a", Gen: 2, State: session.LaneActive, Stats: carrier.Stats{
 				SRTT: time.Millisecond, MinRTT: time.Microsecond, Rate: 1.5, RxRate: 2.5, Inflight: 100, Cap: 200,
 				Backlogged: true, PeerBusy: true, TxBytes: 1, RxBytes: 2, RetxBytes: 3, Frames: 4, LastRx: time.Unix(1, 0),
+				Handle: 7, Shared: 3,
 			}},
 			{ID: 4, Gen: 1, State: session.LaneDead, DeathCause: carrier.CausePingTimeout, DeathDetail: "pong late",
 				DeathAt: time.Unix(2, 0)},
@@ -57,7 +58,7 @@ func TestSessionStatusFrom(t *testing.T) {
 		Window: 1 << 20, PeerWindow: 1 << 19,
 		Carriers: []CarrierStatus{
 			{ID: 3, Name: "a", Kind: KindStream, Gen: 2, State: CarrierActive, SRTT: time.Millisecond, MinRTT: time.Microsecond,
-				Rate: 1.5, Inflight: 100, Cap: 200, TxBytes: 1, RxBytes: 2, RetxBytes: 3, Frames: 4},
+				Rate: 1.5, Inflight: 100, Cap: 200, TxBytes: 1, RxBytes: 2, RetxBytes: 3, Frames: 4, Handle: 7, Shared: 3},
 			{ID: 4, Kind: KindStream, Gen: 1, State: CarrierDead, DeathCause: CausePingTimeout, DeathDetail: "pong late"},
 		},
 	}

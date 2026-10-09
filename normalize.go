@@ -513,7 +513,7 @@ func (e *effective) passiveRetain(grace time.Duration) time.Duration {
 // clamped to 3 s–300 s when non-zero, the Runtime's NoPathGrace when zero;
 // BackoffMax = min(RejoinBackoffMax, grace/2) (constraint 3 per session);
 // Retain = PassiveRetain(grace). mode 0 selects ModeSelector; the caller
-// rejects modes other than 0, 1 and 2 before (ErrProtocol).
+// rejects modes other than 0 to 3 before (ErrProtocol).
 func (e *effective) dialerParams(mode Mode, grace time.Duration) session.Params {
 	g := e.cfg.NoPathGrace
 	if grace != 0 {

@@ -40,8 +40,9 @@ var (
 	ErrCapacity = session.ErrCapacity
 	// ErrVersion: the peer answered PREFACE_ACK VERSION or FEATURE.
 	ErrVersion = session.ErrVersion
-	// ErrProtocol: the peer answered BAD_REQUEST, or a local argument (such
-	// as an unknown Mode) would have caused one.
+	// ErrProtocol: the peer answered BAD_REQUEST — also a passive without
+	// race refusing ModeRace —, or a local argument (such as an unknown
+	// Mode) would have caused one.
 	ErrProtocol = session.ErrProtocol
 	// ErrMetadataTooLarge: DialOptions.Metadata exceeds the local or the
 	// peer's Handshake.MaxMetadata.

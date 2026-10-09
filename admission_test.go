@@ -105,7 +105,8 @@ func TestPassivePrefaceAnswers_L44_L48(t *testing.T) {
 // answered OPEN_ACK(BAD_REQUEST) with its reason code before any session
 // state exists (design §5.3, §6.2; L48): metadata over Handshake.MaxMetadata
 // is refused unread (CodeMetadataSize → ErrMetadataTooLarge at the dialer);
-// an unknown kind is CodeBadKind; mode 0 or race (M3) is CodeBadMode;
+// an unknown kind is CodeBadKind; mode 0 or a mode above race is
+// CodeBadMode;
 // reserved flags or PMTU, a zero session ID, an inconsistent metadata
 // length, a packet OPEN's pmtu or window out of range and a packet OPEN
 // that offers a datagram budget (window ≠ 0) on a stream carrier (M2
@@ -131,7 +132,7 @@ func TestOpenRefusedBeforeState_L44_L48(t *testing.T) {
 		{"packet pmtu 0", packetOpen(0, 0), wire.CodeBadValue},
 		{"packet window 536", packetOpen(536, 1127), wire.CodeBadValue},
 		{"unknown kind", func() []byte { b := wpOpen(sid, wire.KindStream, 1, nil); b[16] = 7; return b }(), wire.CodeBadKind},
-		{"race mode", wpOpen(sid, wire.KindStream, 3, nil), wire.CodeBadMode},
+		{"mode above race", wpOpen(sid, wire.KindStream, wire.MaxMode+1, nil), wire.CodeBadMode},
 		{"mode 0", wpOpen(sid, wire.KindStream, 0, nil), wire.CodeBadMode},
 		{"reserved flags", func() []byte { b := wpOpen(sid, wire.KindStream, 1, nil); b[19] = 1; return b }(), wire.CodeBadValue},
 		{"PMTU on a stream", func() []byte { b := wpOpen(sid, wire.KindStream, 1, nil); b[29] = 1; return b }(), wire.CodeBadValue},

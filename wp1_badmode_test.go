@@ -11,7 +11,7 @@ import (
 // wire.MaxMode (3) and rejects every larger mode byte with wire.ErrValue
 // (M3 design §A3.5); admission answers such an OPEN BAD_REQUEST CodeBadMode,
 // as in M2, before any session state exists (the M3 rows of
-// TestOpenRefusedBeforeState_L44_L48, which pins mode 0 and race).
+// TestOpenRefusedBeforeState_L44_L48, which pins mode 0 and mode 4).
 func TestOpenModeAboveMaxBadRequest_L44(t *testing.T) {
 	sid := wpSID(2)
 	for _, mode := range []uint8{wire.MaxMode + 1, 0xff} {
