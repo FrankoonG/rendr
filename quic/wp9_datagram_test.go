@@ -477,6 +477,15 @@ func TestQUICErrorsAreDeath_L01(t *testing.T) {
 		cli, srv, _ := dgramPair(t, Options{}, Options{})
 		_ = srv.qc.CloseWithError(7, "bye")
 		_, _, err := cli.ReadFrom(make([]byte, 64))
+		// quic-go may hand the close to ReceiveDatagram before it cancels
+		// the connection's context (the cause the adapter prefers once it
+		// is set): compare with the cause once it is set (a nil cause made
+		// the comparison panic on the Linux race lane, I3).
+		select {
+		case <-cli.qc.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("the connection's context was not cancelled within 5 s of the peer's close")
+		}
 		if ae := (*qgo.ApplicationError)(nil); !errors.As(err, &ae) || ae.ErrorCode != 7 || !ae.Remote ||
 			err.Error() != context.Cause(cli.qc.Context()).Error() {
 			t.Errorf("ReadFrom after the peer's close: %v (cause %v)", err, context.Cause(cli.qc.Context()))

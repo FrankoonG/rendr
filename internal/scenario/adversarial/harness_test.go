@@ -83,6 +83,30 @@ func muxSetups() []setup {
 // then the 4-session MUX trunks.
 func setups() []setup { return slices.Concat(dedicatedSetups(), muxSetups()) }
 
+// raceRows returns the setups function of one test's rows (R1-23 lever 1,
+// I3: the race lane's adversarial package took 214 s summed over three
+// passes at I2 and 144 s per pass at I3, the pass over its 5-minute
+// budget): it returns all of ss, and in the race lane a third of them,
+// rotating with the row (the k-th call), so that across consecutive rows
+// every setup still runs. Each row keeps its criteria; the non-race lane
+// and the pool's sweep lane run every setup of every row.
+func raceRows() func(ss []setup) []setup {
+	row := 0
+	return func(ss []setup) []setup {
+		row++
+		if !raceEnabled {
+			return ss
+		}
+		var out []setup
+		for j, s := range ss {
+			if (row+j)%3 == 0 {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+}
+
 // eachSetup runs body once per setup, each in a bubble of its own.
 func eachSetup(t *testing.T, body func(t *testing.T, s setup)) {
 	t.Helper()

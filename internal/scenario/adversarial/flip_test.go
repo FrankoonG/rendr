@@ -67,11 +67,7 @@ var regions = []region{
 // migrate); on a datagram trunk the REL that carries the first session's
 // DETACH is dropped, counted and retransmitted.
 func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
-	row := 0 // the row's index, which picks its setups in the race lane (flipSetups)
-	setupsOf := func(ss []setup) []setup {
-		row++
-		return flipSetups(ss, row)
-	}
+	setupsOf := raceRows() // a rotating third of each row's setups in the race lane
 	stream := []struct {
 		name string
 		dir  rendrtest.Dir
@@ -121,25 +117,6 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 			})
 		}
 	}
-}
-
-// flipSetups returns the setups row i of the bit-flip matrix runs against:
-// all of ss, and in the race lane a third of them (R1-23 lever 1, I3: the
-// matrix took 92 s of the Linux race-unit pass), rotating with the row so
-// that every setup meets every frame kind and, across the kinds, every
-// region. Each row keeps its criteria; the non-race lane and the pool's
-// sweep lane run the whole matrix.
-func flipSetups(ss []setup, i int) []setup {
-	if !raceEnabled {
-		return ss
-	}
-	var out []setup
-	for j, s := range ss {
-		if (i+j)%3 == 0 {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 // packetRate is the rows' packet rate (datagrams per second, 1000 bytes).

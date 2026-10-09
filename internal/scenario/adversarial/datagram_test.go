@@ -613,6 +613,7 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 // expectation: on stream carriers — a stream MUX trunk among them — B's
 // carrier dies.
 func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
+	setupsOf := raceRows() // a rotating third of each row's setups in the race lane
 	for _, m := range fseqModes {
 		t.Run(m.name, func(t *testing.T) {
 			for _, hub := range []bool{false, true} {
@@ -621,13 +622,13 @@ func TestAdvDatagramReplayAcrossSessions_L43(t *testing.T) {
 					name = "flow"
 				}
 				t.Run(name, func(t *testing.T) {
-					eachSetup(t, func(t *testing.T, s setup) { replayAcrossSessions(t, s, m.ov, hub) })
+					eachSetupOf(t, setupsOf(setups()), func(t *testing.T, s setup) { replayAcrossSessions(t, s, m.ov, hub) })
 				})
 			}
 		})
 	}
 	t.Run("stream", func(t *testing.T) {
-		eachSetup(t, replayAcrossStreamSessions)
+		eachSetupOf(t, setupsOf(setups()), replayAcrossStreamSessions)
 	})
 }
 

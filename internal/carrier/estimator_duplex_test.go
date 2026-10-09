@@ -194,6 +194,10 @@ func requireShares(t *testing.T, r duplexResult) {
 // 1.5 × (3·minRTT + 4·PingBusy + 200 ms), held over 6 s and fails on all
 // four 60-s rows: srtt up to 2.25 × the exact-estimate figure).
 //
+// Under -race (R1-23 lever 1, I3: the rows took 43 s of the Linux race
+// lane's carrier package) the three 6-s rows and the cheapest 60-s row
+// (1 MiB/s) run, with the same criteria; the non-race lanes run all seven.
+//
 // PASS: over the window after the warm-up, while both flows run, each
 // direction carries ≥ 0.85 of the link; the price of the allowance is
 // bounded: neither side's srtt exceeds latencyBound (the amendment's
@@ -211,15 +215,19 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 		rate float64
 		buf  int // the link's buffer per direction
 		span time.Duration
+		race bool // runs under -race too
 	}{
-		{20 * time.Millisecond, 4 << 20, 2 << 20, 6 * time.Second},
-		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second},
-		{100 * time.Millisecond, 16 << 20, 64 << 20, 6 * time.Second},
-		{20 * time.Millisecond, 4 << 20, 2 << 20, time.Minute},
-		{20 * time.Millisecond, 2 << 20, 2 << 20, time.Minute},
-		{20 * time.Millisecond, 1 << 20, 1 << 20, time.Minute},
-		{20 * time.Millisecond, 8 << 20, 8 << 20, time.Minute},
+		{20 * time.Millisecond, 4 << 20, 2 << 20, 6 * time.Second, true},
+		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second, true},
+		{100 * time.Millisecond, 16 << 20, 64 << 20, 6 * time.Second, true},
+		{20 * time.Millisecond, 4 << 20, 2 << 20, time.Minute, false},
+		{20 * time.Millisecond, 2 << 20, 2 << 20, time.Minute, false},
+		{20 * time.Millisecond, 1 << 20, 1 << 20, time.Minute, true},
+		{20 * time.Millisecond, 8 << 20, 8 << 20, time.Minute, false},
 	} {
+		if carrierRace && !tc.race {
+			continue
+		}
 		t.Run(fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span})
@@ -266,6 +274,10 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 // no-error bound (latencyBound); a 0.5 % drift at 2 MiB/s exceeds it by
 // about a quarter (srtt 1.28 s against 1.02 s, the floor 0.21 s short).
 //
+// Under -race (R1-23 lever 1, I3: the rows took 90 s of the Linux race
+// lane's carrier package) the 0.5 % drift and the 1-s step run, both at
+// 2 MiB/s and with the same criteria; the non-race lanes run all five.
+//
 // PASS: over the last 50 s each direction carries ≥ 0.85 of the link and
 // neither side's srtt exceeds latencyBound times the row's slack (1, or
 // 1.5 for the 0.5 % drift); both flows complete intact and in order;
@@ -277,13 +289,17 @@ func TestDuplexPeerClockSkew_L15(t *testing.T) {
 		drift float64       // the passive's clock runs slow by this fraction
 		step  time.Duration // and steps back by this much 10 s into the run
 		slack float64       // the srtt bound: latencyBound × slack
+		race  bool          // runs under -race too
 	}{
-		{"drift0.05%/2MiBps", 2 << 20, 0.0005, 0, 1},
-		{"drift0.5%/2MiBps", 2 << 20, 0.005, 0, 1.5},
-		{"drift1%/4MiBps", 4 << 20, 0.01, 0, 1},
-		{"step1s/2MiBps", 2 << 20, 0, time.Second, 1},
-		{"step6s/4MiBps", 4 << 20, 0, 6 * time.Second, 1}, // beyond DeadMax: the floor moves at once
+		{"drift0.05%/2MiBps", 2 << 20, 0.0005, 0, 1, false},
+		{"drift0.5%/2MiBps", 2 << 20, 0.005, 0, 1.5, true},
+		{"drift1%/4MiBps", 4 << 20, 0.01, 0, 1, false},
+		{"step1s/2MiBps", 2 << 20, 0, time.Second, 1, true},
+		{"step6s/4MiBps", 4 << 20, 0, 6 * time.Second, 1, false}, // beyond DeadMax: the floor moves at once
 	} {
+		if carrierRace && !tc.race {
+			continue
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				skew := func(ts uint64, since time.Duration) uint64 {
