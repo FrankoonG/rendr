@@ -2,7 +2,9 @@ package carrier
 
 import (
 	"context"
+	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -189,6 +191,29 @@ func TestPoolUsableRule(t *testing.T) {
 			}
 		})
 	})
+	t.Run("factory", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil) // factories p0 and p1 to one passive
+			est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, zero)
+			if err != nil || !est1.Fresh {
+				t.Fatalf("p0: %v", err)
+			}
+			pt.attach(est1)
+			est2, err := pt.attempt(context.Background(), 1, wire.TypeOpen, 2, zero)
+			if err != nil || !est2.Fresh || est2.Conn.trunk == est1.Conn.trunk {
+				t.Fatalf("p1 with a live p0 trunk: %v (fresh %v)", err, est2 != nil && est2.Fresh)
+			}
+			pt.attach(est2)
+			est3, err := pt.attempt(context.Background(), 1, wire.TypeOpen, 3, zero)
+			if err != nil || est3.Fresh || est3.Conn.trunk != est2.Conn.trunk {
+				t.Fatalf("p1's next attempt did not take p1's trunk: %v", err)
+			}
+			pt.attach(est3)
+			if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 2 || st.FastPaths != 1 || st.Carriers != 2 {
+				t.Fatalf("%d factory calls, stats %+v; want one trunk per factory", d, st)
+			}
+		})
+	})
 	t.Run("choice", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			a, _ := muxPair(t, nil)
@@ -252,11 +277,68 @@ func TestPoolBlockedNotUsable_L08(t *testing.T) {
 	})
 }
 
-// TestPoolPickThenDeath (E3): a listed trunk that died is skipped, and a
-// trunk that dies after its view's handle was allocated but before the
-// view's first frame was placed makes the attempt continue with a dial of
-// its own — no failure.
+// TestPoolPickThenDeath (E3): a listed trunk that died is skipped; a trunk
+// that dies between the pick and openView (openView fails ErrDead), or
+// after its view's handle was allocated but before the view's first frame
+// was placed — whether the view's own end or the trunk's Done comes
+// first — makes the attempt continue with a dial of its own, no failure.
 func TestPoolPickThenDeath(t *testing.T) {
+	t.Run("dead between the pick and openView", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pt.attach(est1)
+			killed := false
+			pt.p.afterPick = func(c *Conn) {
+				if c.trunk == est1.Conn.trunk {
+					killed = c.KillTrunk(CauseTransportError, "killed after the pick")
+				}
+			}
+			est2, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 2, [16]byte{})
+			if !killed {
+				t.Fatal("the attempt did not pick the live trunk")
+			}
+			if err != nil || !est2.Fresh || !isOK(est2) || est2.Conn.trunk == est1.Conn.trunk {
+				t.Fatalf("attempt whose trunk died before openView: %v", err)
+			}
+			pt.attach(est2)
+			if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 2 || st.FastPaths != 0 {
+				t.Fatalf("%d factory calls, stats %+v; want no fast path and a dial", d, st)
+			}
+		})
+	})
+	t.Run("trunk done before the first frame", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pt.attach(est1)
+			pt.env.Hooks = &testhooks.Hooks{BeforeOpenView: func(carrier, handle uint32) {
+				if carrier == est1.Conn.ID() {
+					est1.Conn.KillTrunk(CauseTransportError, "killed after the pick")
+					synctest.Wait() // the trunk's Done (finishAll: opening → dead) before the attempt looks
+					select {
+					case <-est1.Conn.trunk.tdone:
+					default:
+						t.Error("the killed trunk is not done before the attempt goes on")
+					}
+				}
+			}}
+			est2, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 2, [16]byte{})
+			if err != nil || !est2.Fresh || !isOK(est2) || est2.Conn.trunk == est1.Conn.trunk {
+				t.Fatalf("attempt whose trunk finished before its first frame: %v", err)
+			}
+			pt.attach(est2)
+			if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 2 || st.FastPaths != 1 {
+				t.Fatalf("%d factory calls, stats %+v; want the fast path then a dial", d, st)
+			}
+		})
+	})
 	t.Run("dead before the pick", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pt := newPoolT(t, nil, nil)
@@ -355,6 +437,40 @@ func TestPoolSealAtZero(t *testing.T) {
 				t.Fatalf("attempt after the close: %v", err)
 			}
 			pt.attach(est3)
+			if d := pt.srv.dials.Load(); d != 2 {
+				t.Fatalf("%d factory calls, want 2", d)
+			}
+		})
+	})
+	t.Run("views ended before the publication", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil || !est1.Fresh {
+				t.Fatalf("claimant: %v", err)
+			}
+			ch := make(chan poolRes, 1)
+			pt.goAttempt(context.Background(), wire.TypeOpen, 2, ch) // waits for the fresh trunk
+			synctest.Wait()
+			tr := est1.Conn.trunk
+			est1.Conn.Start(&dEP{}, &hBell{}, StartOptions{})
+			est1.Conn.Kill(CauseLocalClose, "session 1 ended") // its only view ends before the publication
+			waitDone(t, est1.Conn.Done(), "view 1")
+			synctest.Wait()
+			est1.Conn.poolStarted()
+			synctest.Wait()
+			if len(pt.p.listed(0)) != 0 || !tr.sealed {
+				t.Fatal("a trunk without views was published")
+			}
+			waitDone(t, tr.tdone, "the trunk without views")
+			if !tr.closeSent.Load() {
+				t.Fatal("the trunk without views closed without its CLOSE")
+			}
+			r := collect(t, ch, 1)[0]
+			if r.err != nil || !r.est.Fresh || r.est.Conn.trunk == tr {
+				t.Fatalf("the waiter: %v (fresh %v)", r.err, r.est != nil && r.est.Fresh)
+			}
+			pt.attach(r.est)
 			if d := pt.srv.dials.Load(); d != 2 {
 				t.Fatalf("%d factory calls, want 2", d)
 			}
@@ -548,30 +664,104 @@ func TestMuxHandleExhaustion_L14(t *testing.T) {
 	})
 }
 
-// TestPoolClose: after Close attempts dial dedicated carriers (no OptMux,
-// nothing published), while the trunks already published still close at
-// their last view.
+// TestPoolClose (§A2.3, §A4.5, L52; not a design row: the Close and Wait
+// behaviour of this pool): Close is idempotent and leaves the attempts of
+// the sessions that survive Peer.Close their fast paths; Wait returns only
+// once Close ran and every trunk the pool dialled is done — it blocks
+// while a trunk runs (and before Close on an empty pool) and returns nil
+// after the last view closed the trunk.
 func TestPoolClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pt := newPoolT(t, nil, nil)
+		short := func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			return pt.p.Wait(ctx)
+		}
+		if err := short(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Wait before Close: %v, want it blocked", err)
+		}
 		est1, _ := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
 		pt.attach(est1)
-		synctest.Wait()
 		pt.p.Close()
 		pt.p.Close()
 		est2, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 2, [16]byte{})
-		if err != nil || est2.Fresh || est2.Conn.Mux() || !isOK(est2) {
-			t.Fatalf("attempt after Close: %v (mux %v)", err, est2 != nil && est2.Conn.Mux())
+		if err != nil || est2.Fresh || est2.Conn.trunk != est1.Conn.trunk {
+			t.Fatalf("attempt after Close: %v (fresh %v), want a fast path", err, est2 != nil && est2.Fresh)
 		}
 		pt.attach(est2)
 		est1.Conn.poolStarted() // a second publication is a no-op
+		synctest.Wait()
 		if len(pt.p.listed(0)) != 1 {
 			t.Fatal("the published trunk was listed twice")
 		}
+		if err := short(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Wait with a running trunk: %v, want it blocked", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- pt.p.Wait(context.Background()) }()
+		tr := est1.Conn.trunk
 		est1.Conn.Kill(CauseLocalClose, "session 1 ended")
-		waitDone(t, est1.Conn.trunk.tdone, "the published trunk at its last view")
-		if d := pt.srv.dials.Load(); d != 2 {
-			t.Fatalf("%d factory calls, want 2", d)
+		est2.Conn.Kill(CauseLocalClose, "session 2 ended")
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+		case <-time.After(time.Minute):
+			t.Fatal("Wait did not return after the last view closed the trunk")
+		}
+		select {
+		case <-tr.tdone:
+		default:
+			t.Fatal("Wait returned before the trunk was done")
+		}
+		if !tr.closeSent.Load() {
+			t.Fatal("the trunk closed without its CLOSE")
+		}
+		if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 1 || st.FastPaths != 1 {
+			t.Fatalf("%d factory calls, stats %+v", d, st)
+		}
+	})
+}
+
+// TestPoolPublishOutsideLocks (§A4.2): Conn.Start may run under the
+// session's lock, which Pool.mu is never taken under, so poolStarted does
+// not take Pool.mu on its caller's goroutine: it returns while Pool.mu is
+// held, and the publication follows.
+func TestPoolPublishOutsideLocks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pt := newPoolT(t, nil, nil)
+		est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+		if err != nil || !est1.Fresh {
+			t.Fatalf("claimant: %v", err)
+		}
+		est1.Conn.Start(&dEP{}, &hBell{}, StartOptions{})
+		pt.p.mu.Lock()
+		returned := make(chan struct{})
+		go func() {
+			est1.Conn.poolStarted()
+			close(returned)
+		}()
+		// A goroutine blocked on a mutex is not durably blocked for the
+		// bubble, so the bound is a count of yields, not virtual time.
+		ok := false
+		for i := 0; i < 100000 && !ok; i++ {
+			select {
+			case <-returned:
+				ok = true
+			default:
+				runtime.Gosched()
+			}
+		}
+		pt.p.mu.Unlock()
+		if !ok {
+			<-returned
+			t.Fatal("poolStarted took Pool.mu on its caller's goroutine")
+		}
+		synctest.Wait()
+		if len(pt.p.listed(0)) != 1 || pt.p.inFlight(0) {
+			t.Fatal("the trunk was not published")
 		}
 	})
 }

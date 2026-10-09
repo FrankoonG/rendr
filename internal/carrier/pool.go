@@ -22,16 +22,19 @@ import (
 // Lifecycle of a trunk in the pool: the claimant's Establish returns view 1
 // of a fresh MUX trunk (Established.Fresh); the factory's dial stays "in
 // flight" for later attempts until the session starts view 1 (Conn.Start
-// calls poolStarted), which publishes the trunk in trunks[f] and releases
-// the waiters to open their views on it (M3-D19). A fresh trunk that dies
-// unstarted (the opening race was lost, a check failed, the session ended)
-// releases the waiters to retry at once. A published trunk leaves the pool
-// when its view count reaches zero: it is sealed and retired with CLOSE
-// (§A5.9); its other ends (a dead trunk) leave the same way, as each
-// view's Done closes.
+// calls poolStarted, which publishes asynchronously), which puts the trunk
+// in trunks[f] and releases the waiters to open their views on it
+// (M3-D19). A fresh trunk that dies unstarted (the opening race was lost,
+// a check failed, the session ended) releases the waiters to retry at
+// once. A published trunk leaves the pool when its view count reaches
+// zero: it is sealed and retired with CLOSE (§A5.9); its other ends (a
+// dead trunk) leave the same way, as each view's Done closes. The pool
+// tracks every fresh trunk until the trunk's Done (Wait joins them).
 //
 // Locks: mu is per Pool and never taken under a session lock, Conn.mu or
-// trunk.mx; it may take trunk.mx (Pool.mu → trunk.mx) to allocate a view.
+// trunk.mx; it may take the trunk's leaf locks trunk.mx (allocating a
+// view, sealing) and trunk.mu (the usable rule's retirement check; a death
+// in the test seam): Pool.mu → trunk.mx, Pool.mu → trunk.mu.
 type Pool struct {
 	env *Env
 	fs  []Factory // the Peer's factory snapshot; immutable
@@ -42,8 +45,14 @@ type Pool struct {
 	trunks  [][]*Conn       // per factory: view 1 of each published trunk, oldest first
 	dialing []*dialWait     // per factory: the dial in flight that later attempts wait for (nil: none)
 	full    map[*trunk]bool // published trunks that answered CAPACITY CodeMuxFull, until a view leaves (§A5.8)
+	live    int             // fresh trunks tracked until their Done (in flight, published, retiring, or dead and closing)
+	idle    chan struct{}   // Wait's: closed (and reset) once closed and live is 0
 	closed  bool
 	stats   PoolStats
+
+	// afterPick, tests only (nil in production), runs under mu between the
+	// pick and openView: the E3 window (TestPoolPickThenDeath).
+	afterPick func(c *Conn)
 }
 
 // dialWait is one factory's dial in flight: its waiters block on done; err
@@ -85,8 +94,10 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // path view on a usable trunk (M3-D17), a coalesced wait for the factory's
 // dial in flight (bounded by ctx, M3-D18), or its own Establish with
 // wire.OptMux, whose fresh trunk (Established.Fresh) the pool publishes
-// when the session starts view 1 (M3-D19). cid is the CarrierID reserved
-// for a dial (released when a fast path or a wait serves the attempt);
+// when the session starts view 1 (M3-D19). A fast path waits for its
+// response at most Timing.DialTimeout, like Establish. cid is the
+// CarrierID reserved for a dial (released when a fast path or a wait
+// serves the attempt);
 // kind and payload are the first frame (OPEN or JOIN); check verifies the
 // PREFACE_ACK as for Establish; inst is the session's bound instance for a
 // JOIN (zero for an OPEN); sess identifies the session (one unreaped view
@@ -99,8 +110,9 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // is a carrier refusal without penalty: the attempt continues with a dial
 // (or a wait, or another trunk) instead of returning the refusal. A
 // coalesced wait that outlasts Timing.DialTimeout fails like an attempt
-// that hit its DialTimeout (a path failure, L20). After Close every
-// attempt dials a dedicated carrier (no OptMux).
+// that hit its DialTimeout (a path failure, L20). Close changes nothing
+// here: the sessions that survive Peer.Close keep their fast paths and
+// coalescing.
 func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr) (*Established, error) {
 	fac := p.fs[f]
 	if !fac.Mux || (kind != wire.TypeOpen && kind != wire.TypeJoin) {
@@ -119,12 +131,10 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 	}()
 	for {
 		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			fac.Mux = false // no fresh MUX trunk once the pool stopped publishing
-			return Establish(ctx, p.env, fac, cid, kind, payload, check)
-		}
 		if c := p.pickLocked(f, dk, inst, sess, skip); c != nil {
+			if p.afterPick != nil {
+				p.afterPick(c)
+			}
 			v, err := c.openView(kind, payload, sess)
 			if err != nil {
 				// E3: the trunk died (or sealed, or filled) between the usable
@@ -135,8 +145,8 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			}
 			p.stats.FastPaths++
 			p.mu.Unlock()
-			est, err := v.awaitResponse(ctx, check)
-			if retry := p.fastPathRetry(ctx, v, est, err); retry {
+			est, retry, err := p.fastPath(ctx, v, check)
+			if retry {
 				skip = append(skip, c.trunk) // a refusal or a death: never the same trunk again in this attempt
 				continue
 			}
@@ -214,6 +224,24 @@ next:
 	return best
 }
 
+// fastPath waits for the response of view v, bounded like Establish by
+// Timing.DialTimeout (and a shorter deadline of ctx): its expiry while ctx
+// is alive is a path failure (stage response, CauseTransportError,
+// errDialTimeout), as Establish reports an attempt that hit its
+// DialTimeout. retry reports a result the attempt does not return
+// (fastPathRetry).
+func (p *Pool) fastPath(ctx context.Context, v *Conn, check func(*wire.PrefaceAck) error) (est *Established, retry bool, err error) {
+	actx, cancel := context.WithTimeout(ctx, p.dialTimeout)
+	est, err = v.awaitResponse(actx, check)
+	expired := err != nil && ctx.Err() == nil && actx.Err() != nil
+	cancel()
+	if expired {
+		return nil, false, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, Instance: v.trunk.peer,
+			Err: fmt.Errorf("%w (waiting for the view's response)", errDialTimeout)}
+	}
+	return est, p.fastPathRetry(ctx, v, est, err), err
+}
+
 // fastPathRetry classifies a fast path's result: true when the attempt
 // continues (a carrier refusal without penalty — CodeMuxFull, or
 // CodeListenerClosed for an OPEN, R1-10 — or a trunk that ended before the
@@ -246,10 +274,27 @@ func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err
 	if !errors.As(err, &ee) || ee.Cause != CauseTransportError {
 		return false // a check failure (the view ended, never the trunk) is the attempt's result
 	}
-	v.mx.Lock()
-	unplaced := v.state == viewGone && !v.vx.refused && !v.vx.respGot
-	v.mx.Unlock()
+	t := v.trunk
+	t.mx.Lock()
+	unplaced := t.firstUnplacedLocked(v)
+	t.mx.Unlock()
 	return unplaced
+}
+
+// firstUnplacedLocked reports whether dialer view v's first frame was never
+// placed, whichever end came first: the view is still in the opens FIFO
+// (the writer removes an entry only when it places it or drops an ended
+// one, and a dead trunk's writer removes nothing more), or the view ended
+// in state opening (gone without a response or a DETACH) and the writer
+// dropped it. Neither the view's own Kill nor the trunk's finishAll
+// (opening → dead) changes the answer.
+func (t *trunk) firstUnplacedLocked(v *Conn) bool {
+	for i := 0; i < t.ms.opN; i++ {
+		if t.opens[(t.ms.opHead+i)%len(t.opens)] == v {
+			return true
+		}
+	}
+	return v.state == viewGone && !v.vx.refused && !v.vx.respGot && !v.vx.detQ && !v.vx.detSent.Load()
 }
 
 // responseStatus returns the status and code of a response frame (OPEN_ACK
@@ -287,6 +332,7 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 			f := w.f
 			c.onViewDone(func(v *Conn) { p.viewGone(f, c, v) })
 			w.fresh = c
+			p.live++
 			p.mu.Unlock()
 			go p.watchFresh(w, c)
 			return
@@ -320,23 +366,31 @@ func claimantReleases(ctx context.Context, err error) bool {
 	return errors.As(err, &ee) && ee.Cause == CauseInstanceMismatch
 }
 
-// watchFresh settles a fresh trunk that dies before its session starts it
-// (M3-D19: discarded, its waiters retry at once). It returns once w is
-// settled either way.
+// watchFresh is the pool's goroutine of fresh trunk c (L52: owned by the
+// pool, joined by Wait, ends at the trunk's Done). It settles a trunk that
+// dies before its session starts it (M3-D19: discarded, its waiters retry
+// at once), then waits for the trunk's Done and stops tracking it.
 func (p *Pool) watchFresh(w *dialWait, c *Conn) {
 	select {
 	case <-w.done:
 	case <-c.dying:
 		p.settle(w, c)
 	}
+	<-c.tdone
+	p.mu.Lock()
+	p.live--
+	p.idleLocked()
+	p.mu.Unlock()
 }
 
 // poolStarted is called by Conn.Start on view 1 of a dialer trunk once the
-// trunk runs: the trunk's pool publishes it (M3-D19). A no-op on a trunk
-// no pool owns, and idempotent.
+// trunk runs: the trunk's pool publishes it (M3-D19). Start may run under
+// the session's lock, which Pool.mu is never taken under (§A4.2), so the
+// publication runs on a goroutine of its own (short-lived, owned by the
+// pool). A no-op on a trunk no pool owns, and idempotent.
 func (c *Conn) poolStarted() {
 	if c.trunk != nil && c.owner != nil {
-		c.owner.settle(nil, c)
+		go c.owner.settle(nil, c)
 	}
 }
 
@@ -362,6 +416,7 @@ func (p *Pool) settle(w *dialWait, c *Conn) {
 		p.dialing[w.f] = nil
 	}
 	w.fresh, w.release = nil, true
+	retire := false
 	if c.death.Load() == nil && c.ms.started.Load() {
 		if c.viewCount() > 0 {
 			p.trunks[w.f] = append(p.trunks[w.f], c)
@@ -369,11 +424,14 @@ func (p *Pool) settle(w *dialWait, c *Conn) {
 			// Every view ended before the publication (view 1 killed or
 			// retired right after its Start): close at zero (M3-D20).
 			c.seal()
-			c.retireTrunk(wire.CloseRetire)
+			retire = true
 		}
 	}
 	p.mu.Unlock()
 	close(w.done)
+	if retire {
+		c.retireTrunk(wire.CloseRetire)
+	}
 }
 
 // viewGone is the trunk's view hook (onViewDone): view v of trunk c (view
@@ -385,7 +443,6 @@ func (p *Pool) settle(w *dialWait, c *Conn) {
 // the trunk gone and dials.
 func (p *Pool) viewGone(f int, c, v *Conn) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	v.mx.Lock()
 	refused := v.vx.refused
 	v.mx.Unlock()
@@ -398,13 +455,15 @@ func (p *Pool) viewGone(f int, c, v *Conn) {
 		i++
 	}
 	if i == len(ts) || c.viewCount() > 0 {
+		p.mu.Unlock()
 		return // not published (still in flight, or discarded), or views remain
 	}
 	copy(ts[i:], ts[i+1:])
 	ts[len(ts)-1] = nil
 	p.trunks[f] = ts[:len(ts)-1]
 	delete(p.full, c.trunk)
-	c.seal()
+	c.seal() // under mu: no openView after this point
+	p.mu.Unlock()
 	c.retireTrunk(wire.CloseRetire)
 }
 
@@ -416,13 +475,47 @@ func (p *Pool) releaseCID(cid uint32) {
 	}
 }
 
-// Close stops publishing and fast paths (Peer.Close keeps the pool's
-// trunks until their last views end; Runtime.Close joins them).
-// Idempotent.
+// Close records that the pool's Peer closed (§A2.3, §A4.5). Attempts are
+// not affected: the sessions that survive Peer.Close keep fast paths,
+// coalescing and publication, and every trunk still closes at its last
+// view; Close lets Wait return once no trunk is left. Idempotent.
 func (p *Pool) Close() {
 	p.mu.Lock()
 	p.closed = true
+	p.idleLocked()
 	p.mu.Unlock()
+}
+
+// Wait joins the pool (Runtime.Close, L52): it returns nil once Close ran
+// and every trunk the pool dialled is done (its goroutines finished, the
+// pool's watcher of it gone), or context.Cause(ctx) when ctx ends first. A
+// trunk dialled after Close is waited for as well.
+func (p *Pool) Wait(ctx context.Context) error {
+	for {
+		p.mu.Lock()
+		if p.closed && p.live == 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		if p.idle == nil {
+			p.idle = make(chan struct{})
+		}
+		ch := p.idle
+		p.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+}
+
+// idleLocked wakes Wait once the pool is closed and tracks no trunk.
+func (p *Pool) idleLocked() {
+	if p.closed && p.live == 0 && p.idle != nil {
+		close(p.idle)
+		p.idle = nil
+	}
 }
 
 // Stats returns a snapshot of the pool's counters.

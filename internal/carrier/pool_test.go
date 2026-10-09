@@ -16,8 +16,55 @@ import (
 // TestPoolFastPath (M3-D16): once a trunk of the factory runs, an OPEN and
 // a JOIN of other sessions are new views on it — no factory call, the
 // trunk's CarrierID, handles 2 and 3 — and FastPaths counts them; the
-// CarrierIDs reserved for their dials are released.
+// CarrierIDs reserved for their dials are released. A fast path whose
+// response does not come is bounded by DialTimeout like Establish: a path
+// failure at exactly DialTimeout, the trunk left running.
 func TestPoolFastPath(t *testing.T) {
+	t.Run("views", testPoolFastPathViews)
+	t.Run("response bounded by DialTimeout", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pt := newPoolT(t, nil, nil)
+			est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
+			if err != nil || !est1.Fresh {
+				t.Fatalf("first attempt: %v", err)
+			}
+			pt.attach(est1)
+			pt.srv.mu.Lock()
+			pt.srv.holdViews = true // the passive admits the view and never answers it
+			pt.srv.mu.Unlock()
+			dt := pt.env.Timing.withDefaults().DialTimeout
+			ch := make(chan poolRes, 1)
+			start := time.Now()
+			pt.goAttempt(context.Background(), wire.TypeOpen, 2, ch)
+			synctest.Wait()
+			time.Sleep(dt - time.Millisecond)
+			synctest.Wait()
+			if n := pendingResults(ch); n != 0 || len(pt.srv.admitted()) != 1 {
+				t.Fatalf("%d results before DialTimeout, %d views admitted", n, len(pt.srv.admitted()))
+			}
+			r := collect(t, ch, 1)[0]
+			var ee *EstablishError
+			if !errors.As(r.err, &ee) || ee.Cause != CauseTransportError || ee.Stage != "response" || !errors.Is(r.err, errDialTimeout) {
+				t.Fatalf("fast path without a response: %v, want a DialTimeout path failure", r.err)
+			}
+			if d := r.at.Sub(start); d != dt {
+				t.Fatalf("the fast path failed after %v, want DialTimeout %v", d, dt)
+			}
+			synctest.Wait()
+			if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 1 || st.FastPaths != 1 || st.Carriers != 1 || st.Views != 1 {
+				t.Fatalf("%d factory calls, stats %+v; want the fast path only and the trunk kept", d, st)
+			}
+			if est1.Conn.trunk.death.Load() != nil {
+				t.Fatal("the trunk died with the unanswered view")
+			}
+			if n := pt.env.IDs.inUse(); n != 1 {
+				t.Fatalf("%d CarrierIDs in use, want the trunk's only", n)
+			}
+		})
+	})
+}
+
+func testPoolFastPathViews(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pt := newPoolT(t, nil, nil)
 		est1, err := pt.attempt(context.Background(), 0, wire.TypeOpen, 1, [16]byte{})
@@ -365,37 +412,92 @@ func TestPoolClaimantEnds(t *testing.T) {
 			}
 		})
 	})
-	t.Run("withdrawn while hung", func(t *testing.T) {
+	// The claimant's own session cancels it while its factory call hangs:
+	// by withdrawal (ErrWithdrawn), or by the session ending with a cause
+	// of its own (R1-8: any cancellation that is not a deadline).
+	for _, c := range []struct {
+		name  string
+		cause error
+	}{
+		{"withdrawn while hung", ErrWithdrawn},
+		{"session ended while hung", errors.New("rendr: session ended")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				pt := newPoolT(t, nil, nil)
+				pt.srv.honorHang = true // the first factory call waits for its context
+				ctx, cancel := context.WithCancelCause(context.Background())
+				ch := make(chan poolRes, 4)
+				pt.goAttempt(ctx, wire.TypeOpen, 1, ch)
+				synctest.Wait()
+				for i := 2; i <= 4; i++ {
+					pt.goAttempt(context.Background(), wire.TypeOpen, byte(i), ch)
+				}
+				synctest.Wait()
+				time.Sleep(time.Second)
+				start := time.Now()
+				cancel(c.cause)
+				claim := collect(t, ch, 1)[0]
+				if claim.sid != 1 || !errors.Is(claim.err, c.cause) {
+					t.Fatalf("claimant: sid %d, %v", claim.sid, claim.err)
+				}
+				synctest.Wait()
+				if d := pt.srv.dials.Load(); d != 2 || time.Since(start) > time.Millisecond {
+					t.Fatalf("%d factory calls %v after the cancellation, want 2 within 1 ms", d, time.Since(start))
+				}
+				next := collect(t, ch, 1)[0]
+				if next.err != nil || !next.est.Fresh {
+					t.Fatalf("next claimant %d: %v", next.sid, next.err)
+				}
+				pt.attach(next.est)
+				for _, r := range collect(t, ch, 2) {
+					if r.err != nil || !isOK(r.est) {
+						t.Fatalf("waiter %d: %v (a failure caused by another session's cancellation)", r.sid, r.err)
+					}
+				}
+				if d := pt.srv.dials.Load(); d != 2 {
+					t.Fatalf("%d factory calls, want 2", d)
+				}
+			})
+		})
+	}
+	// The claimant's own session check rejects the PREFACE_ACK (a bound
+	// instance or the gone-away set): a verdict of that session, not of the
+	// path, so the waiters retry at once — one new factory call, no failure.
+	t.Run("check rejects", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pt := newPoolT(t, nil, nil)
-			pt.srv.honorHang = true // the first factory call waits for its context
-			ctx, cancel := context.WithCancelCause(context.Background())
+			gate := make(chan struct{})
+			pt.srv.setGate(gate)
+			errBound := errors.New("bound to another instance")
 			ch := make(chan poolRes, 4)
-			pt.goAttempt(ctx, wire.TypeOpen, 1, ch)
+			go func() {
+				est, err := pt.attemptCheck(context.Background(), pt.p, 0, wire.TypeOpen, 1, [16]byte{}, func(*wire.PrefaceAck) error { return errBound })
+				ch <- poolRes{sid: 1, est: est, err: err, at: time.Now()}
+			}()
 			synctest.Wait()
 			for i := 2; i <= 4; i++ {
 				pt.goAttempt(context.Background(), wire.TypeOpen, byte(i), ch)
 			}
 			synctest.Wait()
-			time.Sleep(time.Second)
 			start := time.Now()
-			cancel(ErrWithdrawn)
-			claim := collect(t, ch, 1)[0]
-			if claim.sid != 1 || !errors.Is(claim.err, ErrWithdrawn) {
-				t.Fatalf("claimant: sid %d, %v", claim.sid, claim.err)
+			close(gate)
+			rs := collect(t, ch, 2)
+			if rs[0].sid != 1 {
+				rs[0], rs[1] = rs[1], rs[0]
 			}
-			synctest.Wait()
-			if d := pt.srv.dials.Load(); d != 2 || time.Since(start) > time.Millisecond {
-				t.Fatalf("%d factory calls %v after the withdrawal, want 2 within 1 ms", d, time.Since(start))
+			var ee *EstablishError
+			if rs[0].sid != 1 || !errors.As(rs[0].err, &ee) || ee.Cause != CauseInstanceMismatch || !errors.Is(rs[0].err, errBound) {
+				t.Fatalf("claimant: sid %d, %v", rs[0].sid, rs[0].err)
 			}
-			next := collect(t, ch, 1)[0]
-			if next.err != nil || !next.est.Fresh {
-				t.Fatalf("next claimant %d: %v", next.sid, next.err)
+			next := rs[1]
+			if next.err != nil || !next.est.Fresh || !isOK(next.est) || next.at != start {
+				t.Fatalf("next claimant %d: %v (after %v)", next.sid, next.err, next.at.Sub(start))
 			}
 			pt.attach(next.est)
 			for _, r := range collect(t, ch, 2) {
-				if r.err != nil || !isOK(r.est) {
-					t.Fatalf("waiter %d: %v (a failure caused by another session's withdrawal)", r.sid, r.err)
+				if r.err != nil || !isOK(r.est) || r.est.Conn.trunk != next.est.Conn.trunk {
+					t.Fatalf("waiter %d: %v (a failure caused by another session's check)", r.sid, r.err)
 				}
 			}
 			if d := pt.srv.dials.Load(); d != 2 {

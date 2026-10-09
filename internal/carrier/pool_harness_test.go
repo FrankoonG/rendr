@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -43,6 +44,9 @@ type poolServer struct {
 	wrap func(n int, nc net.Conn) net.Conn
 	// offer is the DATA every admitted view sends after its OK response.
 	offer uint64
+	// holdViews: admitted views are recorded but never started, so they
+	// never answer (a passive whose Accept does not come).
+	holdViews bool
 
 	trunks []*Conn  // passive view 1s, in accept order
 	views  []*mView // passive views admitted on started trunks
@@ -65,7 +69,11 @@ func newPoolServer(mod func(*Env)) *poolServer {
 		s.mu.Lock()
 		mv.src.offer(s.offer)
 		s.views = append(s.views, mv)
+		hold := s.holdViews
 		s.mu.Unlock()
+		if hold {
+			return
+		}
 		mv.ep.fill = mv.src.fill
 		v.OnDone(mv.done)
 		v.Start(mv.ep, mv.bell, StartOptions{})
@@ -92,7 +100,7 @@ func (s *poolServer) dial(ctx context.Context) (net.Conn, error) {
 	}
 	if honor {
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return nil, context.Cause(ctx)
 	}
 	if hang != nil {
 		<-hang
@@ -173,7 +181,7 @@ func newPoolT(t testing.TB, dmod, pmod func(*Env)) *poolT {
 	}
 	srv := newPoolServer(pmod)
 	pt := &poolT{t: t, env: env, srv: srv}
-	pt.p = NewPool(env, []Factory{srv.factory("p0", 0)})
+	pt.p = NewPool(env, []Factory{srv.factory("p0", 0), srv.factory("p1", 1)})
 	t.Cleanup(pt.close)
 	return pt
 }
@@ -216,7 +224,12 @@ func (pt *poolT) attempt(ctx context.Context, f int, kind wire.Type, sid byte, i
 }
 
 func (pt *poolT) attemptOn(ctx context.Context, p *Pool, f int, kind wire.Type, sid byte, inst [16]byte) (*Established, error) {
-	est, err := p.Attempt(ctx, f, pt.env.IDs.Next(), kind, poolPayload(kind, sid), nil, inst, uintptr(sid))
+	return pt.attemptCheck(ctx, p, f, kind, sid, inst, nil)
+}
+
+// attemptCheck is attemptOn with the session's PREFACE_ACK check.
+func (pt *poolT) attemptCheck(ctx context.Context, p *Pool, f int, kind wire.Type, sid byte, inst [16]byte, check func(*wire.PrefaceAck) error) (*Established, error) {
+	est, err := p.Attempt(ctx, f, pt.env.IDs.Next(), kind, poolPayload(kind, sid), check, inst, uintptr(sid))
 	if est != nil {
 		pt.mu.Lock()
 		pt.ests = append(pt.ests, est)
@@ -243,14 +256,17 @@ func (pt *poolT) goAttempt(ctx context.Context, kind wire.Type, sid byte, ch cha
 
 // attach starts an attempt's carrier as a session does: Start with an
 // endpoint, then — on view 1 of a fresh trunk — the publication hook
-// Conn.Start runs (poolStarted).
+// Conn.Start runs (poolStarted; see the WP9
+// contract note), whose asynchronous publication the bubble
+// settles. Must run inside a synctest bubble.
 func (pt *poolT) attach(est *Established) *mView {
 	mv := &mView{c: est.Conn, ep: &dEP{}, src: newVSource(pt.env), bell: &hBell{}, done: &hBell{}}
 	mv.ep.fill = mv.src.fill
 	est.Conn.OnDone(mv.done)
 	est.Conn.Start(mv.ep, mv.bell, StartOptions{})
 	if est.Fresh {
-		est.Conn.poolStarted()
+		est.Conn.poolStarted() // redundant (a no-op) once Conn.Start calls it: WP9 contract note
+		synctest.Wait()
 	}
 	return mv
 }
