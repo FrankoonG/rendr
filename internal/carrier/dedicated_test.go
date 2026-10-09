@@ -87,38 +87,24 @@ func TestDedicatedStreamRejectsDetachAndHandles_L43_L14(t *testing.T) {
 	})
 }
 
-// TestDedicatedDatagramDropsBadHandle_L14: on a datagram carrier a bare
-// session frame with a handle other than 1, and a bare DETACH, drop the
-// rest of their datagram and count it (M2's framing error, PA-1); the
+// TestDedicatedDatagramDropsBadHandle_L14: on a datagram carrier — the
+// dialer's and the passive's (the FuzzMuxDispatch_L43_L14 seed "$71": a
+// passive dedicated carrier and a DGRAM of handle 2) — a bare session
+// frame with a handle other than 1, and a bare DETACH, drop the rest of
+// their datagram and count it (M2's framing error, PA-1; dedicatedOK); the
 // carrier lives and a later DGRAM of handle 1 is delivered. A REL{FIN} of
 // handle 2 and a REL{DETACH} are violations ("REL: ...").
 func TestDedicatedDatagramDropsBadHandle_L14(t *testing.T) {
-	t.Run("bare frames dropped", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) {
-			s, p := rawPair(t, 1200, true)
-			s.start(StartOptions{})
-			synctest.Wait()
-			p.read()
-			bad := dgramFrame(1, 10)
-			bad.handle = 2
-			p.send(bad, dgramFrame(2, 10))
-			synctest.Wait()
-			p.send(rawFrame{t: wire.TypeDetach, payload: detachPayload(2, wire.DetachEnded)}, dgramFrame(3, 10))
-			synctest.Wait()
-			p.send(dgramFrame(4, 10))
-			synctest.Wait()
-			if dead, cause, detail, _ := s.c.Death(); dead {
-				t.Fatalf("carrier died: %v %q", cause, detail)
-			}
-			got := s.ep.datagrams()
-			if len(got) != 1 || got[0].seq != 4 {
-				t.Fatalf("datagrams %+v, want only seq 4", got)
-			}
-			if st := s.c.Stats(); st.Dropped != 2 {
-				t.Fatalf("dropped %d, want 2", st.Dropped)
-			}
+	for _, role := range []struct {
+		name   string
+		dialer bool
+	}{{"dialer", true}, {"passive", false}} {
+		t.Run("bare frames dropped/"+role.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				dedicatedBareDrops(t, role.dialer)
+			})
 		})
-	})
+	}
 	for _, tc := range []struct {
 		name    string
 		f       rawFrame
@@ -147,6 +133,36 @@ func TestDedicatedDatagramDropsBadHandle_L14(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// dedicatedBareDrops is the "bare frames dropped" row of
+// TestDedicatedDatagramDropsBadHandle_L14 on a dedicated datagram carrier
+// of the given role: a DGRAM of handle 2 drops the rest of its datagram (its
+// handle-1 DGRAM behind it too), a bare DETACH likewise, both counted; the
+// carrier lives and the next DGRAM of handle 1 is delivered.
+func dedicatedBareDrops(t *testing.T, dialer bool) {
+	s, p := rawPair(t, 1200, dialer)
+	s.start(StartOptions{})
+	synctest.Wait()
+	p.read()
+	bad := dgramFrame(1, 10)
+	bad.handle = 2
+	p.send(bad, dgramFrame(2, 10))
+	synctest.Wait()
+	p.send(rawFrame{t: wire.TypeDetach, payload: detachPayload(2, wire.DetachEnded)}, dgramFrame(3, 10))
+	synctest.Wait()
+	p.send(dgramFrame(4, 10))
+	synctest.Wait()
+	if dead, cause, detail, _ := s.c.Death(); dead {
+		t.Fatalf("carrier died: %v %q", cause, detail)
+	}
+	got := s.ep.datagrams()
+	if len(got) != 1 || got[0].seq != 4 {
+		t.Fatalf("datagrams %+v, want only seq 4", got)
+	}
+	if st := s.c.Stats(); st.Dropped != 2 {
+		t.Fatalf("dropped %d, want 2", st.Dropped)
 	}
 }
 

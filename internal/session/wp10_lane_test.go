@@ -14,10 +14,12 @@ import (
 // edge it already advertised for a stream session, a PACK of what it
 // received for a packet session: REL-wrapped on a datagram trunk, plain on
 // a stream trunk. It carries no flags, changes no ACK duty, is placed once
-// (the next Fill places none), and a Fill that cannot place it (no REL
-// room) places nothing else: the go frame is the view's first frame or
-// nothing is. The carrier half (the passive's hold until it, both trunk
-// kinds) is TestMuxResponseHold; end to end TestLaneGoFrameE2E.
+// (the next Fill places none), and a Fill whose batch is full places
+// nothing else. A datagram batch without REL room for it (m3 DGMUX, L40)
+// lets the lane's datagrams out at once and keeps the go frame owed: the
+// next Fill with REL room places it first. The carrier half (the passive's
+// hold until it, both trunk kinds) is TestMuxResponseHold; end to end
+// TestLaneGoFrameE2E and TestMuxDatagramGoFrameUnderLoss_L40.
 func TestLaneGoFrame(t *testing.T) {
 	t.Run("stream", func(t *testing.T) {
 		s := stSession(stOpt{})
@@ -83,7 +85,7 @@ func TestLaneGoFrame(t *testing.T) {
 			dpEnd(s, nil)
 		})
 	}
-	t.Run("no room: nothing else", func(t *testing.T) {
+	t.Run("no REL room: the datagrams leave, the go frame stays owed", func(t *testing.T) {
 		s := dpSession(dpOpt{})
 		l, fp := dpAddLane(s, 7, true, true)
 		s.mu.Lock()
@@ -93,13 +95,69 @@ func TestLaneGoFrame(t *testing.T) {
 		if _, err := s.WriteTo(make([]byte, 100)); err != nil {
 			t.Fatal(err)
 		}
-		if fs := dpFrames(dpFill(l, time.Now())); len(fs) != 0 {
-			t.Fatalf("a Fill without REL room placed %v, want nothing before the go frame", fs)
+		fs := dpFrames(dpFill(l, time.Now()))
+		if len(fs) == 0 || fs[len(fs)-1].typ != wire.TypeDgram {
+			t.Fatalf("a Fill without REL room placed %v, want the queued DGRAM", fs)
+		}
+		for _, f := range fs {
+			if f.rel {
+				t.Fatalf("a Fill without REL room placed %v: a REL frame", fs)
+			}
+		}
+		s.mu.Lock()
+		owed, sent := l.goOwed, s.pk.ctr.Sent
+		s.mu.Unlock()
+		if !owed || sent != 1 {
+			t.Fatalf("go frame owed %v, sent %d: want it still owed and the datagram sent", owed, sent)
+		}
+		if _, err := s.WriteTo(make([]byte, 100)); err != nil {
+			t.Fatal(err)
 		}
 		fp.set(func(f *dpPort) { f.relRoom = wire.RelWindow })
+		fs = dpFrames(dpFill(l, time.Now()))
+		if len(fs) < 2 || fs[0].typ != wire.TypePack || !fs[0].rel || fs[0].flags != 0 || fs[len(fs)-1].typ != wire.TypeDgram {
+			t.Fatalf("with REL room: %v, want the go frame first, then the queued DGRAM", fs)
+		}
+		s.mu.Lock()
+		owed = l.goOwed
+		s.mu.Unlock()
+		if owed {
+			t.Fatal("the go frame stayed owed after it was placed")
+		}
+		dpEnd(s, nil)
+	})
+	t.Run("full batch: nothing else", func(t *testing.T) {
+		s := dpSession(dpOpt{})
+		l, _ := dpAddLane(s, 7, true, true)
+		s.mu.Lock()
+		l.goOwed = true
+		s.mu.Unlock()
+		if _, err := s.WriteTo(make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		b := carrier.NewBatch(0)
+		b.Reset(time.Now())
+		b.SetDatagram(1400, wire.RelWindow)
+		for seq := uint64(0); !b.Full(); seq++ {
+			if !b.AddDgram(99, seq, nil, nil) {
+				t.Fatal("AddDgram refused before the batch was full")
+			}
+		}
+		n := b.Len()
+		(*plane)(l).Fill(nil, b)
+		if b.Len() != n {
+			t.Fatalf("a Fill on a full batch appended %d frames", b.Len()-n)
+		}
+		s.mu.Lock()
+		owed := l.goOwed
+		s.mu.Unlock()
+		if !owed {
+			t.Fatal("the go frame is no longer owed after a Fill on a full batch")
+		}
+		b.ReleaseRefs()
 		fs := dpFrames(dpFill(l, time.Now()))
 		if len(fs) < 2 || fs[0].typ != wire.TypePack || !fs[0].rel || fs[len(fs)-1].typ != wire.TypeDgram {
-			t.Fatalf("with REL room: %v, want the go frame, then the queued DGRAM", fs)
+			t.Fatalf("next Fill: %v, want the go frame first, then the queued DGRAM", fs)
 		}
 		dpEnd(s, nil)
 	})

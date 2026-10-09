@@ -46,8 +46,22 @@ func (l *lane) Handle() uint32 {
 // writer does not call it then; this is the lane's own guard); a dialer
 // lane that owes its go frame places it first — an ACK for a stream
 // session, a PACK for a packet session (REL-wrapped on a datagram trunk,
-// plain on a stream trunk, R1-12) — and nothing else in a call that could
-// not place it. A dedicated carrier and handle 1 of a trunk owe nothing.
+// plain on a stream trunk, R1-12) — and nothing else in a call whose
+// batch is full.
+//
+// A datagram batch without REL room for the go PACK is the exception (m3
+// DGMUX, L40): the REL window is the trunk's, shared by every view, and a
+// lost REL holds it for a REL RTO (RelRTOMin 200 ms at least), longer than
+// Packet.MaxAge. Holding the lane's datagrams behind the go frame then
+// dropped every datagram the application wrote right after DialPacket.
+// The lane's Fill runs instead: its datagrams (and anything else
+// unreliable) leave now, and any of them that arrives ends the passive's
+// hold as a first frame does; the go PACK stays owed and is placed first
+// by the next call with REL room (the refusal REL-marked the view, so the
+// RACK that frees room re-readies it). The go frame keeps its purpose —
+// one reliable frame that ends the hold although the dialer has nothing
+// else to send — and REL its bounds. A dedicated carrier and handle 1 of
+// a trunk owe nothing.
 func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) bool {
 	if l.c != nil && l.c.HeldAfterResponse() {
 		return false
@@ -59,7 +73,9 @@ func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) bool {
 		return false
 	}
 	if !s.placeGoLocked(l, b) {
-		return false // the batch is full or has no REL room: the go frame stays first
+		// The batch is full: the go frame stays first. A datagram batch
+		// that refused it for REL room only lets the lane's datagrams out.
+		return b.Datagram() && b.RelRoom() == 0 && !b.Full()
 	}
 	l.goOwed = false
 	return true
