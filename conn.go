@@ -15,6 +15,7 @@ type Conn struct {
 	s      *session.Session
 	local  Addr
 	remote Addr
+	props  *peerProps // dialer: the Peer's Props (CarrierStatus.FateGroup); nil on the passive
 }
 
 var _ net.Conn = (*Conn)(nil)
@@ -100,7 +101,7 @@ func (c *Conn) Metadata() []byte { return c.s.Metadata() }
 // test oracle). The control part is published by the session's scheduler
 // together with every routing change, so the reported active carrier always
 // equals the routed one.
-func (c *Conn) Status() SessionStatus { return sessionStatusFrom(c.s.Status()) }
+func (c *Conn) Status() SessionStatus { return c.props.status(c.s.Status()) }
 
 // Done returns a channel that is closed once the session has fully ended:
 // Status().State is StateEnded with its final Err (io.EOF after a clean

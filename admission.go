@@ -116,7 +116,8 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 // inconsistent lengths, a packet OPEN's pmtu or window out of range); a
 // stream OPEN on a datagram carrier is CodeBadKind; a packet OPEN whose
 // window (the carrier's cmtu offer) is non-zero on a stream carrier or zero
-// on a datagram carrier is CodeBadValue; mode race (M3) is CodeBadMode.
+// on a datagram carrier is CodeBadValue. Modes 1 to 3 (selector, bond and
+// race, M3-D28) are admitted.
 func openBadRequest(payload []byte, o *wire.Open, err error, carrierKind wire.CarrierKind) (code uint32, bad bool) {
 	if err != nil {
 		if errors.Is(err, wire.ErrValue) && len(payload) >= wire.OpenFixedLen {
@@ -135,7 +136,7 @@ func openBadRequest(payload []byte, o *wire.Open, err error, carrierKind wire.Ca
 		return wire.CodeBadKind, true
 	case o.Kind == wire.KindDatagram && (o.Window == 0) == dgCarrier:
 		return wire.CodeBadValue, true
-	case Mode(o.Mode) != ModeSelector && Mode(o.Mode) != ModeBond:
+	case Mode(o.Mode) < ModeSelector || Mode(o.Mode) > ModeRace:
 		return wire.CodeBadMode, true
 	}
 	return 0, false

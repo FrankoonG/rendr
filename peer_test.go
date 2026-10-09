@@ -168,8 +168,8 @@ func TestFactorySnapshotFrozen_L20(t *testing.T) {
 }
 
 // TestDialPrechecks: Peer.Dial refuses before any factory call, any
-// session and any held MaxSessions unit (design §6.6): an unknown Mode is
-// ErrProtocol, metadata over Handshake.MaxMetadata is ErrMetadataTooLarge,
+// session and any held MaxSessions unit (design §6.6): an unknown Mode
+// (above ModeRace since M3) is ErrProtocol, metadata over Handshake.MaxMetadata is ErrMetadataTooLarge,
 // a full abandoned-call pool is ErrCapacity wrapping carrier.ErrAbandonFull,
 // local MaxSessions is ErrCapacity, and a closed Peer or Runtime is
 // net.ErrClosed. Each error is a net.Error with Timeout false.
@@ -191,8 +191,8 @@ func TestDialPrechecks(t *testing.T) {
 			t.Fatalf("%s: %d factory calls, %d units, %d dials in flight", name, f.calls.Load(), rt.table.inUse(), rt.dial.running())
 		}
 	}
-	_, err = p.Dial(ctx, DialOptions{Mode: 3})
-	check("mode 3", err, ErrProtocol)
+	_, err = p.Dial(ctx, DialOptions{Mode: ModeRace + 1})
+	check("mode 4", err, ErrProtocol)
 	_, err = p.Dial(ctx, DialOptions{Metadata: make([]byte, 17)})
 	check("metadata", err, ErrMetadataTooLarge)
 	rt.abandon.Adopt()

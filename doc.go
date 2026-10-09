@@ -9,7 +9,8 @@
 // interruption, error or lost byte: rendr keeps byte offsets, acknowledges
 // only what was delivered to the peer application, retransmits from the
 // acknowledged front and moves the session to another carrier (selector
-// mode) or keeps every carrier busy (bond mode).
+// mode), keeps every carrier busy (bond mode) or sends every byte on every
+// carrier and keeps the first copy (race mode).
 //
 // Semantics:
 //   - Read returns io.EOF only when the peer's FIN reached the contiguous
@@ -40,6 +41,38 @@
 // and the datagrams this side holds were read; a carrier change is as
 // invisible as for a stream session.
 //
+// Race sessions (ModeRace) take their member carriers as bond sessions do
+// and send every byte or datagram on each of them; the receiver keeps the
+// first copy. Each byte or datagram arrives over whichever member delivers
+// it first, but throughput is the fastest member's, never the sum, and the
+// wire bytes and the sender's CPU grow with the member count. A session's counters count
+// each byte or datagram once; SessionStatus.Race, DupBytes and the
+// carriers' own counters show the copies.
+//
+// Carrier properties: each factory's Props tell the scheduler what its
+// carriers share. Factories with one FateGroup fail together (a shared first
+// hop, relay or transport connection): bond and race keep at most one
+// member per group, and selector failover tries other groups first.
+// HoLCoupled marks a group whose carriers share one in-order pipe, so a
+// stalled carrier's acknowledgement duty never moves onto a sibling.
+// NewPeer refuses a FateGroup longer than 64 bytes, HoLCoupled without a
+// FateGroup, and factories of one group that disagree on HoLCoupled.
+//
+// Shared carriers (rendr mux): unless a factory sets Props.CheapSubflow,
+// the sessions of one Peer share the live carriers of that factory. A new
+// session or a failover uses a live carrier instead of dialling one, and a
+// carrier closes when its last session ends; there is no idle retention.
+// Sessions on one carrier share its head-of-line blocking and its fate: its
+// death migrates each of them, as it would a session of its own. On a
+// carrier that was already live, the passive's first bytes for a session
+// leave about one round trip later than on a fresh carrier (the passive
+// waits for the dialer's first frame for that session). CheapSubflow
+// factories give every session its own carriers.
+//
+// Idle sessions hold no goroutine: a session's scheduler parks after about
+// a second without work and restarts at its next event or deadline
+// (Status.Actors counts the running ones).
+//
 // Security model: rendr provides no confidentiality and no authentication.
 // A rendr listener must only be reachable through an authenticated,
 // encrypted channel that the embedder controls (see examples/mtls). An
@@ -55,5 +88,8 @@
 // passive side keeps a session without carriers: the dialer's NoPathGrace +
 // PingIdle + DeadMax + 5 s (34 s with the defaults). Frame sequence numbers
 // (fseq), CRC32C and InstanceID checks kill a misbehaving carrier but do
-// not replace the contract.
+// not replace the contract: a relay or peer that re-frames the traffic and
+// recomputes CRC and fseq can inject plausible bytes into any session on
+// its carrier, and a race copy that differs from the first copy is
+// detected only while the first copy is still buffered.
 package rendr
