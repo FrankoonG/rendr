@@ -2,8 +2,12 @@ package carrier
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -16,23 +20,91 @@ import (
 // data path is the one-view case and a one-view trunk never builds the
 // view table.
 //
-// The trunk holds the mux state of a carrier that negotiated wire.OptMux
-// (a MUX trunk). The physical fields of a carrier still live in Conn,
-// shared by its one view; they move into trunk with the trunk/view split,
-// after which every view of a trunk reads them through the embedded
-// pointer. A Conn whose trunk is nil is a dedicated carrier (M2).
+// The trunk holds every physical field of a carrier — the embedder conn,
+// the reader and writer state, fseq, the estimator and PING records, the
+// death record, the joins, the datagram half — and the mux state of a
+// carrier that negotiated wire.OptMux (a MUX trunk). Every view of a trunk
+// reads the physical fields through the embedded pointer. Every carrier
+// built by the handshakes (Establish, ReadHello and the datagram
+// handshakes) is a trunk with its view 1 (newConn). A Conn whose trunk is
+// nil is a bare identity that no carrier code runs on (component tests of
+// the session build such Conns); its accessors report zero values.
+//
+// The reader and writer goroutines run as methods of view 1 but reach a
+// view's endpoint only through route (reader) and fillRound (writer), so a
+// one-view trunk is M2's data path with one handle compare.
 //
 // Locks: mx is a leaf (view table, ready ring, opens FIFO, last-hit cache
 // writes, view count, refusal ring). It is taken by Conn.Wake (often under
 // the session lock: Session.mu → trunk.mx), by the writer between
 // endpoint calls (never across an Endpoint.Fill), by the reader on a cache
 // miss and by view attach and detach; Pool.mu → trunk.mx when a view is
-// allocated. The estimator lock (Conn.mu) is another leaf: the two never
-// nest. admit releases mx before it calls Env.Admit (R1-17).
+// allocated. The estimator lock (mu, M2's Conn.mu) is another leaf: the
+// two never nest. admit releases mx before it calls Env.Admit (R1-17).
+//
+// Concurrency of the physical fields (M2): the death record, the write
+// state (generation and WriteBlocked), the peer CLOSE/GOAWAY and CLOSE-sent
+// flags and a few counters are atomics; the estimator, the PING records
+// and carrier-level control live under mu (a leaf lock: session.mu →
+// trunk.mu); the goroutine join bookkeeping lives under jmu (a leaf). The
+// reader and writer state is owned by those goroutines. No endpoint is
+// ever called with mu held.
 type trunk struct {
-	mux   bool          // OptMux negotiated: both PREFACE and PREFACE_ACK carried it (M3-D3); immutable after the handshake
-	tdone chan struct{} // closed when the physical carrier's goroutines finished (a view's Done is its own, M3-D13)
-	owner *Pool         // dialer MUX trunks: the pool that publishes and closes it; nil on the passive side
+	// Immutable from construction.
+	env     *Env
+	tm      Timing // env.Timing with defaults for zero fields
+	nc      net.Conn
+	ncClose closeOnce // closes nc (a datagram carrier: its dg.io, R1-7) exactly once: the closer, or the last resort of its abandonment (V2)
+	owned   *OwnedTCP // nc itself when it is rendr's ownership token (D3, L57); nil otherwise
+	id      uint32    // the CarrierID: every view of the trunk reports it (§A5.1)
+	peer    [16]byte
+	factory int    // -1 on the passive side
+	name    string // "" on the passive side
+	dialer  bool   // id was allocated from env.IDs and is released when Done closes
+	salt    uint64 // per-carrier random PING nonce salt (D14)
+	base    time.Time
+
+	wake  chan struct{} // cap 1: the writer's coalescing wakeup
+	dying chan struct{} // closed when the death record is set
+	tdone chan struct{} // closed when every goroutine of the carrier finished or was abandoned (view 1's Done; a view's Done is its own on a MUX trunk, M3-D13)
+
+	death      atomic.Pointer[deathRecord]
+	wstate     atomic.Uint64 // write generation << 1 | WriteBlocked (C6)
+	peerClosed atomic.Bool   // the peer's CLOSE (handle 0) arrived
+	peerGoAway atomic.Bool
+	closeSent  atomic.Bool // our CLOSE (handle 0) was written
+	capBlocked atomic.Bool // the writer's last round was cap-blocked (C5)
+	rxData     atomic.Bool // DATA arrived since the previous PING was encoded (P12)
+	rxBytes    atomic.Uint64
+	lastRx     atomic.Int64 // nanoseconds after base when the last frame arrived; 0 = none
+
+	// Set by view 1's Start under mu before the goroutines run; read by
+	// them.
+	opts StartOptions
+
+	mu sync.Mutex
+	st carrierState // guarded by mu
+
+	jmu  sync.Mutex
+	join joinState // guarded by jmu
+
+	rd reader // reader goroutine (and ReadHello before Start)
+	wr writer // writer goroutine (and the handshake writers before Start)
+
+	// dg is the datagram half of a datagram carrier (M2-D3), set by the
+	// datagram handshakes before the Conn is returned; nil on stream
+	// carriers.
+	dg *dgState
+
+	// Two-stage write watchdog (design §4.8, C6): reused AfterFunc timers
+	// whose callbacks act only for the write generation they were armed for.
+	wd1, wd2       *time.Timer
+	wd1Gen, wd2Gen atomic.Uint64
+	wd1At, wd2At   atomic.Int64 // nanoseconds after base when each stage is due
+
+	// The mux state (M3-D1 … M3-D13).
+	mux   bool  // OptMux negotiated: both PREFACE and PREFACE_ACK carried it (M3-D3); immutable after the handshake
+	owner *Pool // dialer MUX trunks: the pool that publishes and closes it; nil on the passive side
 
 	// last is the last-hit dispatch cache (M3-D9): the reader tries it
 	// before the view table. Written under mx, read lock-free.
@@ -40,7 +112,7 @@ type trunk struct {
 
 	mx        sync.Mutex
 	views     map[uint32]*Conn // live and retiring views by handle; built at the second view (a one-view trunk compares with view 1)
-	view1     *Conn            // the view of handle 1 (the handshake's)
+	view1     *Conn            // the view of handle 1 (the handshake's); immutable from newTrunk, read without mx (route, fillRound)
 	nviews    int              // views not yet gone (opening, awaiting, attached-pending, live, retiring; pending, joining, held on the passive)
 	next      uint32           // dialer: the next handle to allocate (from Presets.FirstHandle, never reused)
 	maxHandle uint32           // passive: the largest handle seen (a new handle must exceed it)
@@ -99,20 +171,82 @@ type Answer struct {
 	RxNext uint64
 }
 
-// route returns the view of handle h, or nil (M3-D9): the last-hit cache if
-// its handle is h, else the view table under mx; a one-view trunk compares
-// with view 1 only. The reader calls it for every session frame.
+// newTrunk returns the physical carrier over nc with its view 1 (handle
+// wire.SessionHandle), unstarted (§A5.1): the handshake code sets the first
+// fseq and PING id it used, and the datagram handshakes its dg half. View
+// 1's Done is the trunk's: a one-view trunk is M2's carrier. The view
+// table is not built (a one-view trunk never builds it, M3-D1).
+func newTrunk(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name string, dialer bool) *trunk {
+	t := &trunk{
+		env:     env,
+		tm:      env.Timing.withDefaults(),
+		nc:      nc,
+		ncClose: closeOnce{nc: nc},
+		id:      id,
+		peer:    peer,
+		factory: factory,
+		name:    name,
+		dialer:  dialer,
+		base:    time.Now(),
+		wake:    make(chan struct{}, 1),
+		dying:   make(chan struct{}),
+		tdone:   make(chan struct{}),
+		nviews:  1,
+	}
+	if o, ok := nc.(*OwnedTCP); ok { // the exact token type: a wrapper is never bypassed (L41, L57)
+		t.owned = o
+	}
+	var s [8]byte
+	_, _ = rand.Read(s[:]) // crypto/rand never fails (it crashes the program instead)
+	t.salt = binary.LittleEndian.Uint64(s[:])
+	first := env.Presets.firstFseq()
+	t.rd.fseq, t.wr.fseq = first, first
+	t.st.nextPingID = env.Presets.firstPingID()
+	t.view1 = &Conn{trunk: t, handle: wire.SessionHandle, done: t.tdone}
+	return t
+}
+
+// route returns the view of handle h, or nil (M3-D9). A one-view trunk
+// compares h with view 1's handle only: no view table, no last-hit cache,
+// no lock (M3-D1, TestTrunkOneViewHotPath). The multi-view case (the
+// last-hit cache, else the view table under mx) is WP8's. The reader calls
+// route for every session frame.
 func (t *trunk) route(h uint32) *Conn {
-	panic("unimplemented: M3")
+	if v := t.view1; v.handle == h {
+		return v
+	}
+	return nil
 }
 
 // fillRound appends one writer round of endpoint frames to b (M3-D10,
-// §A5.3): with one view, view 1's Fill without a quota (M2's path); with
-// several, the new-handle first frames from the opens FIFO, a control pass
+// §A5.3). With one view it is view 1's Fill without a quota (M2's path);
+// a carrier without a session (probe, sessionless) has no endpoint and
+// appends nothing. The multi-view round (the opens FIFO, the control pass
 // over the ready views with quota 0, then deficit round robin with a
-// payload quota per call over one shared capacity.
+// payload quota per call over one shared capacity) is WP8's.
 func (t *trunk) fillRound(b *Batch) {
-	panic("unimplemented: M3")
+	if v := t.view1; v.ep != nil {
+		v.ep.Fill(v, b)
+	}
+}
+
+// wakeWriter makes the writer run a round soon: the cap-1 coalescing
+// wakeup (M2's Conn.Wake). The trunk's own work — a PONG due, a PING
+// requested, CLOSE or GOAWAY queued, a death, capacity a PONG freed — wakes
+// the writer through it; a session's wakeup goes through Conn.Wake, which
+// on a view of a MUX trunk also readies the view (R1-1, WP8).
+func (t *trunk) wakeWriter() {
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
+}
+
+// ringViews rings the owner of every view of the trunk: its death, the
+// peer's CLOSE and GOAWAY concern all of them (§A4.3; M3-D14's fan-out on
+// a MUX trunk is WP8's). A one-view trunk rings view 1's doorbell.
+func (t *trunk) ringViews() {
+	t.view1.ring()
 }
 
 // admit handles an OPEN or JOIN for a new handle h on a started passive
@@ -145,7 +279,9 @@ func (t *trunk) viewCount() int {
 // seal makes the trunk take no new view (handle exhaustion, or the pool's
 // close at the last view). Idempotent.
 func (t *trunk) seal() {
-	panic("unimplemented: M3")
+	t.mx.Lock()
+	t.sealed = true
+	t.mx.Unlock()
 }
 
 // onViewDone registers the hook the trunk calls once for each view whose

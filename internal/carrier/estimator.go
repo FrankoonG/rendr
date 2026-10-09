@@ -45,7 +45,7 @@ type pingRecord struct {
 	early       bool      // a matching PONG raced the PING's own write: liveness proven, no sample (L23)
 }
 
-// carrierState is everything guarded by Conn.mu.
+// carrierState is everything guarded by trunk.mu (M2's Conn.mu).
 type carrierState struct {
 	// Estimator.
 	srtt, minRTT               time.Duration
@@ -138,25 +138,25 @@ func decay(dt time.Duration) float64 {
 // DATA byte of its batch, and its mark is what was submitted before the
 // batch; one appended after Fill (atEnd, endPing) follows every DATA byte
 // of its batch, and its mark includes them.
-func (c *Conn) encodePingLocked(w *writer, b *Batch, now time.Time, atEnd bool) {
-	c.encodePingPadLocked(w, b, now, atEnd, 0)
+func (t *trunk) encodePingLocked(w *writer, b *Batch, now time.Time, atEnd bool) {
+	t.encodePingPadLocked(w, b, now, atEnd, 0)
 }
 
 // encodePingPadLocked is encodePingLocked with pad zero bytes of padding
 // (an MTU probe of a datagram carrier, M2-D24). On a datagram carrier
 // PING ids skip 0 when the counter wraps: id 0 is the rebind challenge
 // (M2-D27, L14); stream carriers keep M1's plain wrap.
-func (c *Conn) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd bool, pad int) {
-	st := &c.st
+func (t *trunk) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd bool, pad int) {
+	st := &t.st
 	id := st.nextPingID
-	if id == 0 && c.dg != nil {
+	if id == 0 && t.dg != nil {
 		id = 1
 	}
 	busy, judged := st.lastBusy, now.Sub(st.intervalStart) >= minRateSample
 	if judged {
 		busy = w.backlogged(now, st.intervalStart)
 	}
-	p := wire.Ping{ID: id, TS: uint64(now.Sub(c.base)), Nonce: c.salt ^ uint64(id), Pad: pad}
+	p := wire.Ping{ID: id, TS: uint64(now.Sub(t.base)), Nonce: t.salt ^ uint64(id), Pad: pad}
 	if !b.addPing(busy, &p) {
 		return
 	}
@@ -168,10 +168,10 @@ func (c *Conn) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd boo
 	st.push(pingRecord{id: id, nonce: p.Nonce, mark: mark, busy: busy})
 	st.pingSent, st.pingReq = true, false
 	st.lastBusy = busy
-	c.rxData.Store(false)
+	t.rxData.Store(false)
 	w.ping, w.pingID, w.pingJudged, w.pingAtEnd = true, id, judged, atEnd
 	w.dataSincePing, w.clock, w.pingFirst = false, 0, false
-	c.gaugeUpdateLocked()
+	t.gaugeUpdateLocked()
 }
 
 // endPing appends, after the DATA Fill placed in b, the PING that ends the
@@ -236,7 +236,7 @@ func (c *Conn) encodePingPadLocked(w *writer, b *Batch, now time.Time, atEnd boo
 // ring past the cadence's share. The step was computed with the round's
 // carrier control (w.step), so the decision takes no lock and reads no
 // clock; the lock is taken only to encode the PING.
-func (c *Conn) endPing(w *writer, b *Batch, now time.Time) {
+func (t *trunk) endPing(w *writer, b *Batch, now time.Time) {
 	due := w.pingEnd
 	w.pingEnd = false
 	if !due {
@@ -251,19 +251,19 @@ func (c *Conn) endPing(w *writer, b *Batch, now time.Time) {
 		}
 		return
 	}
-	c.mu.Lock()
-	if !c.st.retiring && c.st.n < pingRingSize {
-		c.encodePingLocked(w, b, now, true)
+	t.mu.Lock()
+	if !t.st.retiring && t.st.n < pingRingSize {
+		t.encodePingLocked(w, b, now, true)
 	}
-	c.mu.Unlock()
+	t.mu.Unlock()
 }
 
 // clockStepLocked returns the byte clock's step, max(64 KiB, capacity/8),
 // or 0 while the clock is off: the path's bandwidth-delay product
 // (rate·minRTT) is below one step.
-func (c *Conn) clockStepLocked() int64 {
-	st := &c.st
-	step := max(clockStepMin, c.capacityLocked()/clockStepDiv)
+func (t *trunk) clockStepLocked() int64 {
+	st := &t.st
+	step := max(clockStepMin, t.capacityLocked()/clockStepDiv)
 	if st.rate*st.minRTT.Seconds() < float64(step) {
 		return 0
 	}
@@ -279,27 +279,27 @@ func (c *Conn) clockStepLocked() int64 {
 // all of its DATA already. A PONG that raced this write proved the bytes
 // before its PING; those of the batch itself count from here, now that
 // they are submitted (onPongLocked).
-func (c *Conn) commitLocked(w *writer, b *Batch, at time.Time) {
-	st := &c.st
+func (t *trunk) commitLocked(w *writer, b *Batch, at time.Time) {
+	st := &t.st
 	data := uint64(b.dataBytes())
 	st.submitted += data
 	st.txBytes += data
 	st.retxBytes += uint64(b.retxBytes())
 	st.frames += uint64(b.Len())
 	if w.ping {
-		c.commitPingLocked(w, at)
+		t.commitPingLocked(w, at)
 	}
 	if data > 0 && b.CapBlocked() && !w.pingAtEnd {
 		st.pingReq = true
 	}
-	c.gaugeUpdateLocked()
+	t.gaugeUpdateLocked()
 }
 
 // commitPingLocked commits the writer's PING at at, the return of the
 // write that carried it (L23): RTT counts from here; an early mark applies
 // its PONG watermark; a judged PING starts the next backlog interval.
-func (c *Conn) commitPingLocked(w *writer, at time.Time) {
-	st := &c.st
+func (t *trunk) commitPingLocked(w *writer, at time.Time) {
+	st := &t.st
 	if i := st.find(w.pingID); i >= 0 {
 		r := st.record(i)
 		r.committedAt = at
@@ -325,8 +325,8 @@ func (c *Conn) commitPingLocked(w *writer, at time.Time) {
 // the watermark advanced while the writer's last round was cap-blocked
 // (C5), or that the PONG freed the records a waiting PING needs
 // (ringFreed).
-func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time.Duration, wake bool) {
-	st := &c.st
+func (t *trunk) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time.Duration, wake bool) {
+	st := &t.st
 	i := st.find(p.ID)
 	if i < 0 {
 		return false, 0, false
@@ -356,12 +356,12 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		advanced := m > st.pongMark
 		if advanced {
 			st.pongMark = m
-			c.gaugeUpdateLocked()
+			t.gaugeUpdateLocked()
 		}
 		if i > 0 {
 			st.dropThrough(i - 1)
 		}
-		return false, 0, (advanced && c.capBlocked.Load()) || ringFreed(n0, st.n)
+		return false, 0, (advanced && t.capBlocked.Load()) || ringFreed(n0, st.n)
 	}
 	rec := *r
 	n0 := st.n
@@ -409,7 +409,7 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 				span = dc
 			}
 			s := float64(st.pongMark-st.rateMark) / span.Seconds()
-			if span < st.srtt/2 && c.capacityLocked() > c.tm.CapFloor {
+			if span < st.srtt/2 && t.capacityLocked() > t.tm.CapFloor {
 				// A sample shorter than half an RTT can be a cluster of
 				// PONGs released together: once the capacity left its
 				// floor, it may at most double the estimate (rateSpan).
@@ -421,7 +421,7 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		}
 		st.rateMark, st.rateAt, st.rateCommitAt = st.pongMark, now, rec.committedAt
 	}
-	rx := c.rxBytes.Load()
+	rx := t.rxBytes.Load()
 	if dt := now.Sub(st.rxAt); dt >= minRateSample {
 		st.rxRate *= decay(dt)
 		if s := float64(rx-st.rxMark) / dt.Seconds(); s > st.rxRate {
@@ -429,10 +429,10 @@ func (c *Conn) onPongLocked(p *wire.Ping, now time.Time) (matched bool, rtt time
 		}
 		st.rxMark, st.rxAt = rx, now
 	}
-	c.gaugeUpdateLocked()
+	t.gaugeUpdateLocked()
 	// A full ring, or the cadence's full share of it, deferred the next
 	// PING: the freed records let the writer send it.
-	return true, rtt, (advanced && c.capBlocked.Load()) || ringFreed(n0, st.n)
+	return true, rtt, (advanced && t.capBlocked.Load()) || ringFreed(n0, st.n)
 }
 
 // ringFreed reports whether dropping records took the ring from n0 to n
@@ -482,31 +482,31 @@ func (st *carrierState) rateSpan() time.Duration {
 // wins: a flood of PINGs behind a blocked write collapses into one PONG,
 // L08), its BUSY flag becomes Stats.PeerBusy, and it restarts the
 // sessionless idle clock.
-func (c *Conn) onPing(busy bool, p *wire.Ping, now time.Time) {
-	c.mu.Lock()
-	st := &c.st
+func (t *trunk) onPing(busy bool, p *wire.Ping, now time.Time) {
+	t.mu.Lock()
+	st := &t.st
 	st.pong, st.pongDue = *p, true
 	st.lastPingRx = now
 	if st.peerBusy != busy {
 		st.peerBusy = busy
-		c.gaugeUpdateLocked()
+		t.gaugeUpdateLocked()
 	}
-	c.mu.Unlock()
-	c.Wake()
+	t.mu.Unlock()
+	t.wakeWriter()
 }
 
 // deathDueLocked reports whether the oldest committed, unanswered PING has
 // reached the death deadline D = sched.DeathDeadline(srtt, inflight, rate,
 // DeadMin, DeadMax) (L25), when it will (zero if no PING is outstanding),
 // and how long it has waited.
-func (c *Conn) deathDueLocked(now time.Time) (due bool, at time.Time, waited time.Duration) {
-	st := &c.st
+func (t *trunk) deathDueLocked(now time.Time) (due bool, at time.Time, waited time.Duration) {
+	st := &t.st
 	for i := range st.n {
 		r := st.record(i)
 		if r.committedAt.IsZero() || r.early {
 			continue
 		}
-		d := sched.DeathDeadline(st.srtt, st.inflight(), st.rate, c.tm.DeadMin, c.tm.DeadMax)
+		d := sched.DeathDeadline(st.srtt, st.inflight(), st.rate, t.tm.DeadMin, t.tm.DeadMax)
 		at = r.committedAt.Add(d)
 		return !now.Before(at), at, now.Sub(r.committedAt)
 	}
@@ -522,9 +522,9 @@ func (c *Conn) deathDueLocked(now time.Time) (due bool, at time.Time, waited tim
 // share of it (pingCadenceMax) defers a cadence PING. Byte-clocked PINGs
 // are not scheduled here: they end batches that carry DATA (endPing).
 // Application silence never triggers anything (L30).
-func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
-	st := &c.st
-	if c.opts.Sessionless || st.n == pingRingSize {
+func (t *trunk) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
+	st := &t.st
+	if t.opts.Sessionless || st.n == pingRingSize {
 		return false, time.Time{}
 	}
 	if !st.pingSent || st.pingReq {
@@ -533,12 +533,12 @@ func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
 	if st.n >= pingCadenceMax {
 		return false, time.Time{}
 	}
-	iv := c.tm.PingIdle
+	iv := t.tm.PingIdle
 	switch {
-	case c.opts.Probe:
-		iv = c.tm.ProbeInterval
-	case c.busyCadenceLocked(now, w):
-		iv = c.tm.PingBusy
+	case t.opts.Probe:
+		iv = t.tm.ProbeInterval
+	case t.busyCadenceLocked(now, w):
+		iv = t.tm.PingBusy
 	}
 	at := st.lastCommit.Add(iv)
 	return !now.Before(at), at
@@ -550,9 +550,9 @@ func (c *Conn) pingDueLocked(now time.Time, w *writer) (bool, time.Time) {
 // within the G4 budget, F12/P12), or the current backlog interval disagrees
 // with the latest judged state (the peer learns a flip within PingBusy and
 // an RTT).
-func (c *Conn) busyCadenceLocked(now time.Time, w *writer) bool {
-	st := &c.st
-	return st.inflight() > 0 || !w.capSince.IsZero() || st.lastBusy || c.rxData.Load() ||
+func (t *trunk) busyCadenceLocked(now time.Time, w *writer) bool {
+	st := &t.st
+	return st.inflight() > 0 || !w.capSince.IsZero() || st.lastBusy || t.rxData.Load() ||
 		w.backlogged(now, st.intervalStart) != st.lastBusy
 }
 
@@ -565,14 +565,14 @@ func (c *Conn) busyCadenceLocked(now time.Time, w *writer) bool {
 // path whose bandwidth-delay product is below the floor, rxRate·srtt alone
 // hovered around LoadThreshold while the peer was saturated, and a probe
 // sample carrying the download's own queueing counted as unloaded.
-func (c *Conn) gaugeUpdateLocked() {
-	st := &c.st
+func (t *trunk) gaugeUpdateLocked() {
+	st := &t.st
 	if st.gauge == nil || st.gEnded {
 		return
 	}
 	rev := int64(st.rxRate * st.srtt.Seconds())
 	if st.peerBusy {
-		rev = max(rev, c.tm.CapFloor)
+		rev = max(rev, t.tm.CapFloor)
 	}
 	contrib := st.inflight() + rev
 	if d := contrib - st.gContrib; d != 0 {
@@ -590,8 +590,8 @@ func (c *Conn) gaugeUpdateLocked() {
 // Start runs before Start installs the gauge, and the reader may still
 // account frames until the closer's Close, so nothing may be contributed
 // afterwards.
-func (c *Conn) endGaugeLocked() {
-	st := &c.st
+func (t *trunk) endGaugeLocked() {
+	st := &t.st
 	if st.gEnded {
 		return
 	}

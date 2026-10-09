@@ -1,10 +1,7 @@
 package carrier
 
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,20 +102,24 @@ type StartOptions struct {
 	Sessionless bool
 }
 
-// Conn is one carrier incarnation: immutable from construction to death
-// (L42). It owns the embedder net.Conn, one reader goroutine, one writer
-// goroutine, the estimator and PING records, and the death record. Conns are
-// created unstarted by Establish (dialer) and ReadHello (passive).
+// Conn is one view of a carrier (M3 design §A5.1, M3-D1): one session's
+// part of a trunk — its handle, endpoint, doorbell, end record, lifecycle
+// state and Done. It embeds the *trunk, the physical carrier incarnation:
+// immutable from construction to death (L42), owning the embedder
+// net.Conn, one reader goroutine, one writer goroutine, the estimator and
+// PING records, and the death record. Conns are created unstarted by
+// Establish (dialer) and ReadHello (passive) as view 1 of a new trunk; on
+// a dedicated carrier — every carrier until mux is used — view 1 is the
+// carrier's only view and every accessor is M2's.
 //
-// Concurrency: the death record, the write state (generation and
-// WriteBlocked), the peer CLOSE/GOAWAY and CLOSE-sent flags and a few
-// counters are atomics; the estimator, the PING records and carrier-level
-// control live under mu (a leaf lock: session.mu → Conn.mu); the goroutine
-// join bookkeeping lives under jmu (a leaf). The reader and writer state is
-// owned by those goroutines. The Endpoint is never called with mu held.
+// Concurrency: see trunk. The view's endpoint is set by Start before the
+// goroutines run; its end record and flags are atomics; its lifecycle
+// state is guarded by trunk.mx. The Endpoint is never called with a
+// carrier lock held.
 type Conn struct {
-	// trunk is the mux state of a MUX trunk (M3-D1; trunk.go); nil on a
-	// dedicated carrier, whose one view this Conn is.
+	// trunk is the physical carrier (M3-D1; trunk.go). Every Conn the
+	// handshakes build has one; a zero Conn (a bare identity in component
+	// tests) has none and reports zero values.
 	*trunk
 
 	// The view (M3 design §A5.1): one session's part of the carrier. On a
@@ -141,59 +142,14 @@ type Conn struct {
 	// trunk-wide).
 	tx, rx, retx, frames atomic.Uint64
 
-	// Immutable from construction.
-	env     *Env
-	tm      Timing // env.Timing with defaults for zero fields
-	nc      net.Conn
-	ncClose closeOnce // closes nc (a datagram carrier: its dg.io, R1-7) exactly once: the closer, or the last resort of its abandonment (V2)
-	owned   *OwnedTCP // nc itself when it is rendr's ownership token (D3, L57); nil otherwise
-	id      uint32
-	peer    [16]byte
-	factory int    // -1 on the passive side
-	name    string // "" on the passive side
-	dialer  bool   // id was allocated from env.IDs and is released when Done closes
-	salt    uint64 // per-carrier random PING nonce salt (D14)
-	base    time.Time
+	done chan struct{}          // the view's Done: the trunk's tdone on view 1 (M3-D13)
+	bell atomic.Pointer[ringer] // the owner's doorbell (Start)
 
-	wake  chan struct{} // cap 1: the writer's coalescing wakeup
-	dying chan struct{} // closed when the death record is set
-	done  chan struct{} // closed when every goroutine of the carrier finished or was abandoned
-
-	death      atomic.Pointer[deathRecord]
-	wstate     atomic.Uint64 // write generation << 1 | WriteBlocked (C6)
-	peerClosed atomic.Bool
-	peerGoAway atomic.Bool
-	closeSent  atomic.Bool
-	capBlocked atomic.Bool // the writer's last round was cap-blocked (C5)
-	rxData     atomic.Bool // DATA arrived since the previous PING was encoded (P12)
-	rxBytes    atomic.Uint64
-	lastRx     atomic.Int64 // nanoseconds after base when the last frame arrived; 0 = none
-	bell       atomic.Pointer[ringer]
-
-	// Set by Start under mu before the goroutines run; read by them.
-	ep   Endpoint
-	pep  PacketEndpoint // ep when it is a packet session's (asserted once at Start, M2-D2); nil otherwise
-	opts StartOptions
-
-	mu sync.Mutex
-	st carrierState // guarded by mu
-
-	jmu  sync.Mutex
-	join joinState // guarded by jmu
-
-	rd reader // reader goroutine (and ReadHello before Start)
-	wr writer // writer goroutine (and the handshake writers before Start)
-
-	// dg is the datagram half of a datagram carrier (M2-D3), set by the
-	// datagram handshakes before the Conn is returned; nil on stream
-	// carriers.
-	dg *dgState
-
-	// Two-stage write watchdog (design §4.8, C6): reused AfterFunc timers
-	// whose callbacks act only for the write generation they were armed for.
-	wd1, wd2       *time.Timer
-	wd1Gen, wd2Gen atomic.Uint64
-	wd1At, wd2At   atomic.Int64 // nanoseconds after base when each stage is due
+	// Set by Start before the goroutines run; read by them (and by the
+	// watchdog). The endpoint of view 1 of a dedicated carrier never
+	// changes after Start.
+	ep  Endpoint
+	pep PacketEndpoint // ep when it is a packet session's (asserted once at Start, M2-D2); nil otherwise
 }
 
 // deathRecord is the first cause that ended the carrier.
@@ -231,44 +187,25 @@ type joinState struct {
 	onDone Doorbell
 }
 
-// newConn returns an unstarted carrier over nc. The handshake code sets the
-// first fseq and PING id it used.
+// newConn returns an unstarted carrier over nc: view 1 of a new trunk
+// (newTrunk). The handshake code sets the first fseq and PING id it used.
 func newConn(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name string, dialer bool) *Conn {
-	c := &Conn{
-		env:     env,
-		tm:      env.Timing.withDefaults(),
-		nc:      nc,
-		ncClose: closeOnce{nc: nc},
-		id:      id,
-		peer:    peer,
-		handle:  wire.SessionHandle,
-		factory: factory,
-		name:    name,
-		dialer:  dialer,
-		base:    time.Now(),
-		wake:    make(chan struct{}, 1),
-		dying:   make(chan struct{}),
-		done:    make(chan struct{}),
-	}
-	if o, ok := nc.(*OwnedTCP); ok { // the exact token type: a wrapper is never bypassed (L41, L57)
-		c.owned = o
-	}
-	var s [8]byte
-	_, _ = rand.Read(s[:]) // crypto/rand never fails (it crashes the program instead)
-	c.salt = binary.LittleEndian.Uint64(s[:])
-	first := env.Presets.firstFseq()
-	c.rd.fseq, c.wr.fseq = first, first
-	c.st.nextPingID = env.Presets.firstPingID()
-	return c
+	return newTrunk(env, nc, id, peer, factory, name, dialer).view1
 }
 
-// ID returns the CarrierID (dialer-assigned, echoed in PREFACE_ACK).
-func (c *Conn) ID() uint32 { return c.id }
+// ID returns the CarrierID (dialer-assigned, echoed in PREFACE_ACK); every
+// view of a trunk reports the trunk's (§A5.1).
+func (c *Conn) ID() uint32 {
+	if c.trunk == nil {
+		return 0
+	}
+	return c.id
+}
 
 // Kind returns the carrier kind: wire.KindDatagram for a datagram carrier,
 // else wire.KindStream. Immutable.
 func (c *Conn) Kind() wire.CarrierKind {
-	if c.dg != nil {
+	if c.trunk != nil && c.dg != nil {
 		return wire.KindDatagram
 	}
 	return wire.KindStream
@@ -279,7 +216,7 @@ func (c *Conn) Kind() wire.CarrierKind {
 // lowered (never raised) by wire.DatagramTooLargeError (M2-D25). 0 on
 // stream carriers. Lock-free.
 func (c *Conn) MTU() int {
-	if c.dg == nil {
+	if c.trunk == nil || c.dg == nil {
 		return 0
 	}
 	return int(c.dg.budget.Load())
@@ -288,7 +225,7 @@ func (c *Conn) MTU() int {
 // RecvLimit returns a datagram carrier's negotiated cmtu (its reader accepts
 // datagrams of up to that many rendr bytes); 0 on stream carriers.
 func (c *Conn) RecvLimit() int {
-	if c.dg == nil {
+	if c.trunk == nil || c.dg == nil {
 		return 0
 	}
 	return c.dg.recvLimit
@@ -299,7 +236,7 @@ func (c *Conn) RecvLimit() int {
 // when the transport does not know it, as HandlePacket's); 0 on stream
 // carriers.
 func (c *Conn) TransportLimit() int {
-	if c.dg == nil {
+	if c.trunk == nil || c.dg == nil {
 		return 0
 	}
 	return c.dg.io.Limit()
@@ -309,7 +246,7 @@ func (c *Conn) TransportLimit() int {
 // MTU() − wire.DgramOverhead on a datagram carrier, wire.MaxPacketPayload on
 // a stream carrier (a DGRAM is an ordinary frame there).
 func (c *Conn) DgramMax() int {
-	if c.dg == nil {
+	if c.trunk == nil || c.dg == nil {
 		return wire.MaxPacketPayload
 	}
 	return c.MTU() - wire.DgramOverhead
@@ -339,7 +276,12 @@ func (c *Conn) SetBudget(cmtu int) {
 }
 
 // PeerInstance returns the remote Runtime's InstanceID from the handshake.
-func (c *Conn) PeerInstance() [16]byte { return c.peer }
+func (c *Conn) PeerInstance() [16]byte {
+	if c.trunk == nil {
+		return [16]byte{}
+	}
+	return c.peer
+}
 
 // Handle returns the view's session handle: wire.SessionHandle (1) on a
 // dedicated carrier, the handle the dialer allocated on a MUX trunk.
@@ -347,13 +289,16 @@ func (c *Conn) PeerInstance() [16]byte { return c.peer }
 func (c *Conn) Handle() uint32 { return c.handle }
 
 // Shared returns the number of live views on the carrier: 1 on a dedicated
-// carrier, 0 once the view ended.
+// carrier, 0 once the view ended (and on a zero Conn).
 func (c *Conn) Shared() int {
+	if c.trunk == nil {
+		return 0
+	}
 	if dead, _, _, _ := c.Death(); dead {
 		return 0
 	}
-	if c.trunk == nil {
-		return 1
+	if !c.mux {
+		return 1 // a dedicated carrier never has another view
 	}
 	c.mx.Lock()
 	defer c.mx.Unlock()
@@ -393,7 +338,7 @@ func (c *Conn) KillTrunk(cause Cause, detail string) bool {
 // doorbell; a later call replaces one that has not rung. A nil b does
 // nothing.
 func (c *Conn) OnDone(b Doorbell) {
-	if b == nil {
+	if b == nil || c.trunk == nil { // a zero Conn's Done never closes
 		return
 	}
 	c.jmu.Lock()
@@ -415,10 +360,20 @@ func (c *Conn) Refuse(h uint32, a Answer) bool {
 }
 
 // Factory returns the dialer factory index (-1 on the passive side).
-func (c *Conn) Factory() int { return c.factory }
+func (c *Conn) Factory() int {
+	if c.trunk == nil {
+		return 0
+	}
+	return c.factory
+}
 
 // Name returns the factory name ("" on the passive side).
-func (c *Conn) Name() string { return c.name }
+func (c *Conn) Name() string {
+	if c.trunk == nil {
+		return ""
+	}
+	return c.name
+}
 
 // Start launches the reader and writer. ep is nil for probe and sessionless
 // carriers (any session frame is then a violation). bell is rung on death,
@@ -475,10 +430,10 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 // GOAWAY queued, Kill, and a matched PONG that advanced the PONG watermark
 // while the writer's last round was cap-blocked (design §3.5, §4.10).
 func (c *Conn) Wake() {
-	select {
-	case c.wake <- struct{}{}:
-	default:
+	if c.trunk == nil {
+		return
 	}
+	c.wakeWriter()
 }
 
 // RequestPing asks for one PING as soon as no other PING is queued and
@@ -487,7 +442,7 @@ func (c *Conn) RequestPing() {
 	c.mu.Lock()
 	c.st.pingReq = true
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // Kill records the first death cause (idempotent CAS: later calls return
@@ -516,11 +471,11 @@ func (c *Conn) setDeath(cause Cause, detail string) bool {
 		return false
 	}
 	close(c.dying)
-	c.Wake()
+	c.wakeWriter()
 	c.mu.Lock()
 	c.endGaugeLocked()
 	c.mu.Unlock()
-	c.ring()
+	c.ringViews()
 	return true
 }
 
@@ -551,7 +506,7 @@ func (c *Conn) Retire(reason wire.CloseReason) {
 	}
 	c.st.retiring, c.st.reason = true, reason
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // GoAway queues GOAWAY(shutdown) ahead of any further frame and then
@@ -563,7 +518,7 @@ func (c *Conn) GoAway() {
 		c.st.retiring, c.st.reason = true, wire.CloseRetire
 	}
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // Death returns the death record (lock-free): whether the carrier ended,
@@ -572,7 +527,7 @@ func (c *Conn) GoAway() {
 // and closed; R1-3) once it is set, else the carrier's.
 func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 	r := c.end.Load()
-	if r == nil {
+	if r == nil && c.trunk != nil {
 		r = c.death.Load()
 	}
 	if r == nil {
@@ -592,13 +547,13 @@ func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // PeerClosed reports that the peer sent CLOSE on this carrier.
-func (c *Conn) PeerClosed() bool { return c.peerClosed.Load() }
+func (c *Conn) PeerClosed() bool { return c.trunk != nil && c.peerClosed.Load() }
 
 // PeerGoAway reports that the peer sent GOAWAY on this carrier.
-func (c *Conn) PeerGoAway() bool { return c.peerGoAway.Load() }
+func (c *Conn) PeerGoAway() bool { return c.trunk != nil && c.peerGoAway.Load() }
 
 // CloseSent reports that this side has written CLOSE (no new frames follow).
-func (c *Conn) CloseSent() bool { return c.closeSent.Load() }
+func (c *Conn) CloseSent() bool { return c.trunk != nil && c.closeSent.Load() }
 
 // WriteBlocked reports that the current batch write has been in progress for
 // at least PingBusy (lock-free). The flag lives in one atomic word with the
@@ -606,10 +561,13 @@ func (c *Conn) CloseSent() bool { return c.closeSent.Load() }
 // the generation it was armed with, and the writer bumps the generation and
 // clears it when the write returns, so a late watchdog callback can never
 // leave it set on an idle carrier (design §4.8).
-func (c *Conn) WriteBlocked() bool { return c.wstate.Load()&1 != 0 }
+func (c *Conn) WriteBlocked() bool { return c.trunk != nil && c.wstate.Load()&1 != 0 }
 
 // SRTT returns the smoothed RTT (0 before the first PONG).
 func (c *Conn) SRTT() time.Duration {
+	if c.trunk == nil {
+		return 0
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.st.srtt
@@ -620,6 +578,9 @@ func (c *Conn) SRTT() time.Duration {
 // their batch returned: the batch being filled or written is not included
 // (Fill adds what it appended itself, see Endpoint.Fill).
 func (c *Conn) Inflight() int64 {
+	if c.trunk == nil {
+		return 0
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.st.inflight()
@@ -627,17 +588,23 @@ func (c *Conn) Inflight() int64 {
 
 // Capacity returns the current in-flight cap (sched.Capacity).
 func (c *Conn) Capacity() int64 {
+	if c.trunk == nil {
+		return 0
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capacityLocked()
 }
 
-func (c *Conn) capacityLocked() int64 {
-	return sched.Capacity(c.st.rate, c.st.minRTT, c.tm.PingBusy, c.tm.CapFloor, c.tm.Window)
+func (t *trunk) capacityLocked() int64 {
+	return sched.Capacity(t.st.rate, t.st.minRTT, t.tm.PingBusy, t.tm.CapFloor, t.tm.Window)
 }
 
 // Stats returns a point-in-time copy of the estimator and counters.
 func (c *Conn) Stats() Stats {
+	if c.trunk == nil {
+		return Stats{Kind: wire.KindStream, Handle: c.handle}
+	}
 	shared := c.Shared()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -915,7 +882,7 @@ func (c *Conn) maybeDoneLocked() {
 	if c.dialer && c.env.IDs != nil {
 		c.env.IDs.Release(c.id) // the allocator's lock is a leaf
 	}
-	close(c.done)
+	close(c.tdone) // view 1's Done (M3-D13: a view of a MUX trunk closes its own, WP8)
 	// The OnDone doorbell: non-blocking and lock-free, so it may ring under
 	// this leaf lock (M3-D43, R1-7). The Start doorbell does not ring here:
 	// it rings once per death (L01).

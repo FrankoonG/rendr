@@ -445,6 +445,9 @@ func (r *healthRun) attempt(i int, a *probeAttempt) {
 		close(a.done)
 	}()
 	id := h.env.IDs.Next()
+	// A probe carrier never offers wire.OptMux, whatever the factory's Mux
+	// (M3-D41: Establish sets it only for an OPEN or JOIN), never enters a
+	// pool and never carries a session.
 	est, err := Establish(r.ctx, h.env, h.facs[i], id, wire.TypePing, nil, nil)
 	h.mu.Lock()
 	keep := !r.ended

@@ -184,9 +184,7 @@ func (c *Conn) writeRound(w *writer) bool {
 	if w.held {
 		// The first frame on the wire is the endpoint's first response
 		// (OPEN_ACK or JOIN_ACK); PONGs and PINGs follow it.
-		if c.ep != nil {
-			c.ep.Fill(c, b)
-		}
+		c.fillRound(b)
 		if b.Len() > 0 {
 			w.held, epFrames = false, true
 		} else if !c.isRetiring() {
@@ -196,11 +194,9 @@ func (c *Conn) writeRound(w *writer) bool {
 		retiring, reason = c.appendCarrierControl(w, b, now)
 	} else {
 		retiring, reason = c.appendCarrierControl(w, b, now)
-		if c.ep != nil {
-			n := b.Len()
-			c.ep.Fill(c, b)
-			epFrames = b.Len() > n
-		}
+		n := b.Len()
+		c.fillRound(b) // the endpoint frames (nothing on a carrier without a session)
+		epFrames = b.Len() > n
 	}
 	c.capBlocked.Store(b.CapBlocked())
 	w.noteRound(b, now)
